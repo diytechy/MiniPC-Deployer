@@ -16,6 +16,8 @@ Services (all health-checked, all `restart: unless-stopped`):
 - **tracker** — the **NagLight** web container (`naglight:local`), multi-user via
   trusted headers (D3).
 - **Actual Budget** — finances on its own subdomain, behind `basic_auth`.
+- **Uptime-Kuma · Dozzle · (ntfy)** — auxiliary LAN-only observability
+  (WI-10.11); see §8.
 
 This directory is the **image pipeline**. It is self-contained and committed with
 placeholders only — no secrets. Copy `.env.example` → `.env` and fill it in;
@@ -205,6 +207,27 @@ a day or two, then pick the secondary DNS. Track:
   passes burn-in.
 
 ---
+
+## 8. Auxiliary observability (LAN-only, WI-10.11)
+
+Three optional management UIs, each **published bound to `LAN_IP` only** — they
+are reachable from the LAN but are **not** proxied through Caddy and **not**
+forwarded by the router. Do not add public Caddy sites for them.
+
+| Service | Default URL | Purpose |
+|---|---|---|
+| Uptime-Kuma | `http://<LAN_IP>:3001` | generic up-checks (can POST to NagLight `/api/feed`) |
+| Dozzle | `http://<LAN_IP>:8081` | live container log viewer (docker socket, read-only) |
+| ntfy | `http://<LAN_IP>:8090` | **optional** self-hosted push — opt-in |
+
+ntfy is behind a compose **profile**, so it starts only when asked:
+
+```sh
+docker compose --profile ntfy up -d
+```
+
+All ports are configurable in `.env` (`UPTIMEKUMA_PORT`, `DOZZLE_PORT`,
+`NTFY_PORT`); each has a healthcheck.
 
 ## Local validation status (honest)
 

@@ -132,4 +132,10 @@ PETER MANUAL STEP (Google OAuth client) in .env.example + stack/README. Redirect
 URI to register: `https://tracker.<domain>/oauth2/callback`. config-validate
 green (25 compose vars covered, 8 Caddy vars passed).
 
+### DRIVER — G1 — Round 1 — 2026-07-03 (WI-10.11 auxiliary containers)
+Added Uptime-Kuma, Dozzle, and optional ntfy (compose `profiles: [ntfy]`), all
+LAN-only (published bound to `LAN_IP`, never proxied publicly), all
+healthchecked, every knob in `.env.example`. config-validate green (31 compose
+vars covered).
+
 <!-- agent-setup --> Agent setup (2026-07-03): agents=`claude`; skills materialized: downstream-resync, gate-advance, registry-hygiene. AGENTS.md remains the canonical, agent-neutral guide (skills are opt-in accelerators, not a process gate).

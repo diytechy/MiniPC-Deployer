@@ -206,9 +206,75 @@ services:
       retries: 5
       start_period: 20s
 
+  # ── Auxiliary LAN-only observability (WI-10.11) ───────────────────────────────
+  # These management UIs are published bound to the box's LAN_IP only (not to
+  # 0.0.0.0), so they are reachable on the LAN but NOT proxied to the public
+  # internet and NOT forwarded by the router. Do NOT add Caddy sites for them.
+
+  # Uptime-Kuma — generic up-checks (can also POST to NagLight /api/feed).
+  uptime-kuma:
+    image: louislam/uptime-kuma:${UPTIMEKUMA_IMAGE_TAG}
+    container_name: uptime-kuma
+    volumes:
+      - uptimekuma_data:/app/data
+    ports:
+      - "${LAN_IP}:${UPTIMEKUMA_PORT}:3001"   # LAN-only: bound to the box's LAN IP
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3001/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Dozzle — live container log viewer (reads the docker socket read-only).
+  dozzle:
+    image: amir20/dozzle:${DOZZLE_IMAGE_TAG}
+    container_name: dozzle
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "${LAN_IP}:${DOZZLE_PORT}:8080"       # LAN-only: bound to the box's LAN IP
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthcheck || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ntfy — OPTIONAL self-hosted push notifications (currently external). Opt-in:
+  # starts only with `docker compose --profile ntfy up -d`. LAN-only like the rest.
+  ntfy:
+    image: binwiederhier/ntfy:${NTFY_IMAGE_TAG}
+    container_name: ntfy
+    profiles: ["ntfy"]
+    command: serve
+    environment:
+      NTFY_BASE_URL: http://${LAN_IP}:${NTFY_PORT}
+      NTFY_LISTEN_HTTP: ":80"
+      NTFY_BEHIND_PROXY: "false"
+    volumes:
+      - ntfy_data:/var/lib/ntfy
+      - ntfy_cache:/var/cache/ntfy
+    ports:
+      - "${LAN_IP}:${NTFY_PORT}:80"           # LAN-only: bound to the box's LAN IP
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/v1/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   technitium_config:
   caddy_data:
   caddy_config:
   tracker_data:
   actual_data:
+  uptimekuma_data:
+  ntfy_data:
+  ntfy_cache:

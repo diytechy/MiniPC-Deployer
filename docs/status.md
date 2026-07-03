@@ -20,7 +20,7 @@ last) — it is the record, not required reading for every pass.
       [stack/.env.example](../stack/.env.example)
     - OI-2 — **Reimage-over-LAN ladder** is HIGH-RISK; the memo presents options
       with checkboxes. Nothing destructive is implemented until Peter checks one
-      → `REMOTE_MANAGEMENT.md` (added in WI-10.12)
+      → [REMOTE_MANAGEMENT.md](../REMOTE_MANAGEMENT.md)
     - OI-3 — **Push** each commit (agents lack the SSH key) →
       this repo
   - **In flight** _(driver; no approval needed)_:
@@ -137,5 +137,15 @@ Added Uptime-Kuma, Dozzle, and optional ntfy (compose `profiles: [ntfy]`), all
 LAN-only (published bound to `LAN_IP`, never proxied publicly), all
 healthchecked, every knob in `.env.example`. config-validate green (31 compose
 vars covered).
+
+### DRIVER — G1 — Round 1 — 2026-07-03 (WI-10.12 LAN remote management)
+Implemented now, in the autoinstall: SSH **key-only** (allow-pw false, locked
+password, authorized-keys placeholder), **Cockpit** host package (LAN-only :9090,
+not proxied), and **unattended-upgrades**. Documented the remote `docker compose`
+ops workflow. Wrote `REMOTE_MANAGEMENT.md` — the reimage-over-LAN ladder as a
+decision memo with checkboxes (recommended: **B GRUB recovery partition** primary
++ **D smart-plug/USB** fallback). **HIGH-RISK line:** nothing destructive /
+reimage-related (no `storage:` recovery-partition change, no GRUB reinstall entry,
+no PXE) is implemented until Peter checks a box.
 
 <!-- agent-setup --> Agent setup (2026-07-03): agents=`claude`; skills materialized: downstream-resync, gate-advance, registry-hygiene. AGENTS.md remains the canonical, agent-neutral guide (skills are opt-in accelerators, not a process gate).

@@ -202,7 +202,9 @@ a day or two, then pick the secondary DNS. Track:
 - **Whole box:** the image pipeline is the recovery path — **re-flash the USB**
   and boot; data lives in named Docker volumes and, for the tracker, in the
   **remote data repo** (`TRACKER_DATA_REMOTE`). Back up the Docker volumes
-  (`technitium_config`, `actual_data`, `caddy_data`) for faster recovery.
+  (`technitium_config`, `actual_data`, `caddy_data`) for faster recovery. The
+  LAN reimage ladder (do it without visiting the box) is in
+  [../REMOTE_MANAGEMENT.md](../REMOTE_MANAGEMENT.md) (WI-10.12).
 - **Fall back:** keep any previous DNS/proxy setup untouched until this box
   passes burn-in.
 

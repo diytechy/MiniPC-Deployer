@@ -5,17 +5,19 @@
 # This is the `autoinstall` user-data consumed by the Ubuntu Server 24.04 LTS
 # live installer (Subiquity). It:
 #   1. Partitions the whole eMMC/SSD (LVM = simple whole-disk layout).
-#   2. Creates the operator user (SSH key optional but recommended).
-#   3. Installs Docker Engine + compose plugin + git via late-commands.
-#   4. Drops the stack/ tree, a placeholder .env, and a first-boot systemd unit
+#   2. Creates the operator user (SSH KEY-ONLY by default — WI-10.12).
+#   3. Installs Docker Engine + compose plugin + git + Cockpit via late-commands.
+#   4. Enables unattended-upgrades (WI-10.12) for hands-off OS security patching.
+#   5. Drops the stack/ tree, a placeholder .env, and a first-boot systemd unit
 #      onto the target, then enables the unit so the FIRST real boot runs
 #      provisioning + `docker compose up -d`.
 #
-# SECURITY: replace the identity block below (username/password hash + SSH key)
-# and DO NOT commit a filled-in copy — this template ships with placeholders.
-# Generate a password hash with:  mkpasswd --method=SHA-512
+# SECURITY: replace the identity block below (username + SSH PUBLIC key) and DO
+# NOT commit a filled-in copy — this template ships with placeholders. The box is
+# key-only; there is no usable password login.
 #
-# See ../README.md "Build the USB" for how to attach this file to the ISO.
+# See ../README.md "Build the USB" and ../../REMOTE_MANAGEMENT.md for how to
+# attach this file and how to manage the headless box over the LAN.
 
 autoinstall:
   version: 1
@@ -41,15 +43,21 @@ autoinstall:
     hostname: awow-core
     realname: "AWOW Core Operator"
     username: operator
-    # mkpasswd --method=SHA-512  → paste result here. Placeholder must be replaced.
-    password: "$6$REPLACE$WITH$A$REAL$SHA512$HASH"
+    # SSH KEY-ONLY box (WI-10.12): no usable password login. "!" is a locked
+    # hash — the account cannot be logged into with a password at all. Console/
+    # emergency access is via the physical console only. If you MUST allow a
+    # password (not recommended for a headless box) replace this with a real
+    # `mkpasswd --method=SHA-512` hash AND set ssh.allow-pw: true below.
+    password: "!"
 
+  # Remote management is KEY (WI-10.12): SSH on, KEY-ONLY. Paste your PUBLIC key.
   ssh:
     install-server: true
-    allow-pw: true
-    # Recommended: paste your public key and set allow-pw:false for a hardened box.
-    # authorized-keys:
-    #   - "ssh-ed25519 AAAA... you@host"
+    allow-pw: false
+    authorized-keys:
+      # REPLACE with your real public key(s). allow-pw:false above means the box
+      # is unreachable over SSH until at least one valid key is present here.
+      - "ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host"
 
   # Whole-disk automatic layout (LVM). The AK41 has a single eMMC/SSD.
   storage:
@@ -62,6 +70,8 @@ autoinstall:
     - git
     - dnsutils          # provides dig for the health check
     - apt-transport-https
+    - cockpit           # LAN web console (terminal/logs/updates/reboot) — WI-10.12
+    - unattended-upgrades  # hands-off OS security patching — WI-10.12
 
   # Everything site-specific happens in late-commands, which run in the installer
   # environment with the target mounted at /target. We write files INTO /target.
@@ -74,17 +84,26 @@ autoinstall:
     - curtin in-target --target=/target -- systemctl enable docker
     - curtin in-target --target=/target -- usermod -aG docker operator
 
-    # ---- 2. Place the stack ---------------------------------------------------
+    # ---- 2. Remote management: Cockpit + unattended-upgrades (WI-10.12) --------
+    # Cockpit web console on :9090 — LAN-only (do NOT proxy it through Caddy to
+    # the public internet). See ../../REMOTE_MANAGEMENT.md.
+    - curtin in-target --target=/target -- systemctl enable cockpit.socket
+    # Enable unattended security upgrades non-interactively.
+    - curtin in-target --target=/target -- bash -c 'echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections'
+    - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
+    - curtin in-target --target=/target -- systemctl enable unattended-upgrades
+
+    # ---- 3. Place the stack ---------------------------------------------------
     # The repo payload is copied by the USB-build step to /cdrom/deploy-payload
     # (a second CIDATA stick, or the remastered ISO) and picked up here into
     # /opt/awow-core/. The stack itself then lives at /opt/awow-core/stack/.
     - mkdir -p /target/opt/awow-core
     - cp -a /cdrom/deploy-payload/. /target/opt/awow-core/ 2>/dev/null || cp -a /media/deploy-payload/. /target/opt/awow-core/ 2>/dev/null || true
 
-    # ---- 3. Seed .env from the example if the operator did not pre-fill one ----
+    # ---- 4. Seed .env from the example if the operator did not pre-fill one ----
     - curtin in-target --target=/target -- bash -c '[ -f /opt/awow-core/stack/.env ] || cp /opt/awow-core/stack/.env.example /opt/awow-core/stack/.env'
 
-    # ---- 4. Install + enable the first-boot unit ------------------------------
+    # ---- 5. Install + enable the first-boot unit ------------------------------
     - cp /target/opt/awow-core/stack/autoinstall/awow-firstboot.service /target/etc/systemd/system/awow-firstboot.service
     - cp /target/opt/awow-core/stack/autoinstall/firstboot.sh /target/usr/local/sbin/awow-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/awow-firstboot.sh

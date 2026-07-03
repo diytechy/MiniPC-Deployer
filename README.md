@@ -27,7 +27,7 @@ Everything lives under [`stack/`](stack/) — start with
 | Uptime-Kuma · Dozzle · (ntfy) | LAN-only observability | LAN-only |
 
 Remote management of the headless box (SSH, Cockpit, the reimage ladder) is in
-`REMOTE_MANAGEMENT.md` (added in WI-10.12).
+[REMOTE_MANAGEMENT.md](REMOTE_MANAGEMENT.md).
 
 ## Run it
 

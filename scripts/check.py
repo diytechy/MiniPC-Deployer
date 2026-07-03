@@ -86,14 +86,17 @@ def _utf8_console():
 
 
 # ============================ EDIT FOR YOUR STACK ============================
-# The stack-specific knobs live here. For a non-Python project: point SRC/TESTS
-# at your layout, then swap the format/lint/tests commands in steps() (search
-# "EDIT FOR YOUR STACK" again) for your toolchain — or drop a step you don't
-# have. The traceability, design-flows, and arch-map steps are stdlib-only and
-# stack-agnostic; keep them as-is.
-SRC = "src"  # source root
-TESTS = "tests"  # test root
-COVERAGE_THRESHOLD = 80  # line-coverage %, enforced at full/release (process.md)
+# MiniPC-Deployer is a CONFIG/INFRA repo (compose, Caddy, autoinstall, shell) —
+# there is NO compiled product source in this repo, so the Python-reference
+# product steps (ruff format/lint, pytest+coverage) and the Python arch-map
+# generator do NOT apply and have been DROPPED here rather than left to pass
+# vacuously (ADOPTING.md §3 "don't fake the guarantee"). The product-layer check
+# for this repo is scripts/validate_config.py: static env/Caddy/file coverage of
+# the deploy stack, the honest substitute for runtime validation while no Docker
+# host exists (docs/status.md). The tracker binary's real tests live in NagLight.
+SRC = "src"  # unused here (no product source) — kept for the arch-map default
+TESTS = "tests"  # unused here
+COVERAGE_THRESHOLD = 80  # unused here (no unit tests in a config repo)
 # ============================================================================
 
 # Tier -> pytest marker expression. Tiers are cumulative, and the safe default
@@ -160,21 +163,18 @@ def steps(coverage, tier, gate, phase=None):
             trace_cmd += ["--phase", phase]
     return [
         # --- product checks: language-specific, wired to your stack -----------
+        # Config/infra repo: the "product" is the deploy stack, so the product
+        # check is static config validation (env/Caddy/file coverage + YAML
+        # parse) — the honest stand-in for runtime bring-up while no Docker host
+        # exists (docs/status.md). Runs from G1 (config is the deliverable here).
+        # requires=() because it degrades gracefully without PyYAML.
         (
-            "format",
-            ("ruff",),
-            [sys.executable, "-m", "ruff", "format", "--check", SRC, TESTS],
-            {"G3"},
+            "config-validate",
+            (),
+            [sys.executable, str(_SCRIPTS / "validate_config.py")],
+            {"G1", "G2", "G3"},
             "product",
         ),
-        (
-            "lint",
-            ("ruff",),
-            [sys.executable, "-m", "ruff", "check", SRC, TESTS],
-            {"G3"},
-            "product",
-        ),
-        ("tests+coverage", pytest_needs, pytest_cmd, {"G3"}, "product"),
         # Optional PRODUCT-layer detector, not wired into the required floor:
         # `scripts/check_stubs.py` is the Python-reference tripwire for the G3
         # no-stub / substance criterion (process.md §4). It is warn-first and
@@ -238,24 +238,11 @@ def steps(coverage, tier, gate, phase=None):
             {"G2", "G3"},
             "process",
         ),
-        # Add `--doc AGENTS.md` / `--doc CLAUDE.md` to route the map there too, and
-        # `--flow <entry>` to also check the generated high-level flow.
-        (
-            "arch-map",
-            (),
-            [
-                sys.executable,
-                str(_SCRIPTS / "gen_arch_map.py"),
-                "--check",
-                "--strict-parse",
-                "--src",
-                SRC,
-                "--doc",
-                "docs/architecture.md",
-            ],
-            {"G3"},
-            "process",
-        ),
+        # NOTE: the Python arch-map step (gen_arch_map.py --check) is DROPPED for
+        # this repo — there is no Python/compiled source to map, so it would pass
+        # vacuously (ADOPTING.md §3 "never leave it passing vacuously"). The
+        # hand-written architecture overview in docs/architecture.md is the source
+        # of truth for this config repo; docs/status.md records the drop.
     ]
 
 

@@ -1,0 +1,144 @@
+# AWOW AK41 always-on core — the whole stack (host layout).
+#
+# Four services, all health-checked, all restart:unless-stopped so a reboot or a
+# single crash self-heals with zero manual clicks (the WI-4.7 goal):
+#   technitium  — split-horizon LAN DNS + recursion + blocklists + HTTP API
+#   caddy       — reverse proxy + basic_auth + automatic TLS (valid on LAN via
+#                 split-horizon)
+#   tracker     — the NagLight web container (image naglight:local, WI-10.1/10.4)
+#   actual      — Actual Budget (finances)
+#
+# Every knob is in .env (copy .env.example -> .env). No secret or site-specific
+# value is baked into this file; it is safe to commit.
+#
+# Networking model:
+#   - Technitium binds host :53 (udp+tcp) so it is the LAN's DNS server, and
+#     :5380 for its HTTP API/console. Host network because a DNS server must see
+#     real client IPs for per-client rules and must own :53.
+#   - Caddy publishes :80/:443 to the host for the reverse proxy + ACME.
+#   - tracker and actual stay on the internal bridge; only Caddy reaches them.
+#
+# Provisioning (Technitium zero-touch) is done by provision/provision-technitium.sh,
+# invoked by the first-boot systemd unit AFTER `docker compose up -d` — not here,
+# because it talks to Technitium's HTTP API once the container is healthy.
+
+services:
+  technitium:
+    image: technitium/dns-server:${TECHNITIUM_IMAGE_TAG}
+    container_name: technitium
+    hostname: dns
+    # Host network: a resolver needs :53 on the LAN and the real client source IP.
+    network_mode: host
+    environment:
+      # Technitium reads this on FIRST start to set the initial admin password,
+      # so the box comes up already password-protected (no default-creds window).
+      # provision-technitium.sh is still idempotent if the box was pre-seeded.
+      DNS_SERVER_ADMIN_PASSWORD: ${TECHNITIUM_ADMIN_PASSWORD}
+      DNS_SERVER_DOMAIN: ${DNS_HOSTNAME}
+      # Bind the web console to all interfaces on :5380 (LAN-reachable for the API).
+      DNS_SERVER_WEB_SERVICE_HTTP_PORT: "5380"
+    volumes:
+      - technitium_config:/etc/dns
+    restart: unless-stopped
+    healthcheck:
+      # The login page on :5380 is the cheapest liveness probe that needs no token.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5380/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  caddy:
+    image: caddy:${CADDY_IMAGE_TAG}
+    container_name: caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Caddyfile is templated with these (see Caddyfile `{$VAR}` refs).
+      DOMAIN: ${DOMAIN}
+      LAN_IP: ${LAN_IP}
+      TRACKER_HOST: ${TRACKER_SUBDOMAIN}.${DOMAIN}
+      ACTUAL_HOST: ${ACTUAL_SUBDOMAIN}.${DOMAIN}
+      TRACKER_BASICAUTH_USER: ${TRACKER_BASICAUTH_USER}
+      TRACKER_BASICAUTH_HASH: ${TRACKER_BASICAUTH_HASH}
+      ACME_EMAIL: ${ACME_EMAIL}
+      MAIN_BOX_IP: ${MAIN_BOX_IP}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # certs + ACME account — persist so re-issue isn't needed on reboot
+      - caddy_config:/config
+    depends_on:
+      tracker:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # Caddy admin API on :2019 is always up when the process is; cheap liveness.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  tracker:
+    # NagLight is the canonical build now (its repo owns the Dockerfile, WI-10.4).
+    # LOCAL BUILD STEP (Q10.2: build locally, no registry yet). From a sibling
+    # NagLight checkout run:
+    #     docker build -t naglight:local ../NagLight
+    # then `docker compose up -d` here consumes that image.
+    image: naglight:${TRACKER_IMAGE_TAG}
+    # FALLBACK — let compose build the image from a sibling ../NagLight checkout
+    # instead of a pre-built tag. Uncomment if you'd rather `compose build` it.
+    # (The deprecated reference Dockerfile under ./tracker is kept only for
+    # history; NagLight's own Dockerfile is the source of truth.)
+    # build:
+    #   context: ../../NagLight
+    #   dockerfile: deploy/tracker/Dockerfile
+    container_name: tracker
+    environment:
+      DATA_DIR: /data
+      # If set, the entrypoint clones this remote into /data on first boot and
+      # `git pull --rebase` on subsequent boots (the "clone of the data repo").
+      # Leave blank to bind-mount a local data dir instead.
+      TRACKER_DATA_REMOTE: ${TRACKER_DATA_REMOTE}
+      TRACKER_GIT_NAME: ${TRACKER_GIT_NAME}
+      TRACKER_GIT_EMAIL: ${TRACKER_GIT_EMAIL}
+      # Passed to `tracker serve --commit` when true (nightly materialize commits).
+      TRACKER_COMMIT: ${TRACKER_COMMIT}
+    volumes:
+      - tracker_data:/data
+    expose:
+      - "8787"
+    restart: unless-stopped
+    healthcheck:
+      # /api/today is the JSON health surface; a 200 means the engine loaded the
+      # definitions and can score the day.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8787/api/today || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  actual:
+    image: actualbudget/actual-server:${ACTUAL_IMAGE_TAG}
+    container_name: actual
+    environment:
+      ACTUAL_PORT: "5006"
+    volumes:
+      - actual_data:/data
+    expose:
+      - "5006"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5006/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  technitium_config:
+  caddy_data:
+  caddy_config:
+  tracker_data:
+  actual_data:

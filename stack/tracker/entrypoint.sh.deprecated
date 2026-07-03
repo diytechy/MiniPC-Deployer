@@ -1,0 +1,51 @@
+#!/bin/sh
+# tracker container entrypoint. Idempotent, non-interactive (AGENTS.md
+# "automation-safe by default"): safe to run on every (re)start.
+#
+# Responsibilities, in order:
+#   1. Make /data a usable clone of the data repo (DESIGN.md §3.1):
+#      - if TRACKER_DATA_REMOTE is set and /data has no repo, clone it;
+#      - if /data already has a repo, `git pull --rebase` to fast-forward;
+#      - if no remote is set, use whatever is bind-mounted at /data as-is.
+#   2. Set the commit identity so nightly-materialize / check-off commits work.
+#   3. exec `tracker serve` (which runs its own internal midnight scheduler).
+#
+# Fails loudly (set -e) so an unhealthy clone surfaces via the healthcheck
+# instead of silently serving an empty tracker.
+set -eu
+
+DATA_DIR="${DATA_DIR:-/data}"
+
+git config --global --add safe.directory "$DATA_DIR" || true
+
+if [ -n "${TRACKER_DATA_REMOTE:-}" ]; then
+    if [ -d "$DATA_DIR/.git" ]; then
+        echo "entrypoint: existing data repo → git pull --rebase"
+        git -C "$DATA_DIR" pull --rebase --autostash || \
+            echo "entrypoint: WARN pull failed, serving local state"
+    else
+        echo "entrypoint: cloning data repo from \$TRACKER_DATA_REMOTE into $DATA_DIR"
+        # Clone into a temp dir then move contents, because /data is a mounted
+        # volume that may already exist (git clone refuses a non-empty target).
+        tmp="$(mktemp -d)"
+        git clone "$TRACKER_DATA_REMOTE" "$tmp/repo"
+        # Move including dotfiles (.git) into the volume.
+        cp -a "$tmp/repo/." "$DATA_DIR/"
+        rm -rf "$tmp"
+    fi
+else
+    echo "entrypoint: no TRACKER_DATA_REMOTE set — using bind-mounted $DATA_DIR as-is"
+fi
+
+# Commit identity for the engine's git commits (DESIGN.md §3.1 seam).
+git config --global user.name  "${TRACKER_GIT_NAME:-naglight bot}"
+git config --global user.email "${TRACKER_GIT_EMAIL:-tracker@localhost}"
+
+# --commit only when explicitly enabled (SR-015 keeps commits behind a flag).
+commit_flag=""
+if [ "${TRACKER_COMMIT:-false}" = "true" ]; then
+    commit_flag="--commit"
+fi
+
+echo "entrypoint: exec tracker serve (data=$DATA_DIR commit=${TRACKER_COMMIT:-false})"
+exec tracker serve --addr :8787 --data "$DATA_DIR" $commit_flag

@@ -1,0 +1,22 @@
+# First-boot oneshot: bring the whole stack up with zero manual steps (WI-4.7).
+# Runs AFTER docker is up and the network is online, exactly once — it stamps a
+# /opt/awow-core/.provisioned marker and becomes a no-op on later boots (the
+# script itself is idempotent regardless, so re-enabling is safe).
+[Unit]
+Description=AWOW always-on core first-boot bring-up (compose + Technitium provisioning)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/awow-firstboot.sh
+# Generous timeout: first boot pulls images + builds the tracker image.
+TimeoutStartSec=1800
+# Log to the journal so `journalctl -u awow-firstboot` shows what happened.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

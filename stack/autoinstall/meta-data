@@ -1,0 +1,4 @@
+# Empty NoCloud meta-data — required to sit beside user-data for the autoinstall
+# NoCloud datasource. instance-id lets cloud-init detect a fresh instance.
+instance-id: awow-core-001
+local-hostname: awow-core

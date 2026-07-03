@@ -1,98 +1,73 @@
 # Architecture (one page)
 
-Owned by the **Software Engineer** hat. The **overview** below is hand-written
-and must stay within one screen; the **module/function map** and the
-**dependency diagram** are **generated** by the check harness so they cannot
-drift (see [process.md §3/§7](process.md)).
+Owned by the **Software Engineer** hat. This is a **config/infra repo** — there
+is no compiled product source, so the kit's *generated* code-map / dependency
+diagram do not apply and the `arch-map` check is dropped (see
+[status.md](status.md) constraints; ADOPTING.md §3). The overview below is the
+hand-written source of truth for the deploy topology.
 
-## High-level flow
+Related requirements: [stakeholder-needs.md](requirements/stakeholder-needs.md)
+(SN-###) → [system-requirements.csv](requirements/system-requirements.csv)
+(SR-###).
 
-Hand-written and small. Diagrams are Mermaid fenced blocks — rendered natively
-by GitHub/GitLab and the VS Code Markdown preview, no toolchain needed (see
-process.md "Diagrams are text"). Replace this example with your data flow:
+## What this repo produces
+
+An **unattended deploy image** for the headless AWOW AK41 box: an Ubuntu
+autoinstall (`stack/autoinstall/`) that installs the OS + Docker, drops the
+stack, and enables a one-shot first-boot unit that brings everything up and
+provisions DNS — zero clicks (SR-001).
+
+## Topology
 
 ```mermaid
 graph LR
-    input([input]) --> stage1["stage 1<br/>(path/to/mod_a)"]
-    stage1 --> stage2["stage 2<br/>(path/to/mod_b)"]
-    stage2 --> output([output])
-```
-
-_Describe the data flow in a few nodes. Keep it readable at a glance._
-
-## Runtime flows (authored at G2)
-
-Hand-written **with the LLRs, before the G2 review** — these diagrams are how a
-human verifies *behavior* (ordering, concurrency, what blocks on what) without
-reverse-engineering it from registry rows. Required from G2 on and checked by
-`python scripts/check_flows.py` (wired into the harness): the section must
-exist, hold at least one Mermaid diagram, and every cited `SR-`/`LLR-` id must
-exist in the registries (so the flows stay traceable as requirements evolve).
-
-Author one sequence diagram per key user-visible scenario, and **always one for
-anything concurrent / asynchronous / non-blocking** — that's where reviewers
-misread CSVs. Participants are planned modules (the LLR `Module` column); cite
-the ids a diagram renders in its title or `Note`s. Replace this example:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant User
-    participant UI as ui/shell (LLR-000)
-    participant Worker as core/pipeline (LLR-000)
-    Note over UI,Worker: SR-000 — user acts on item 1 while items 2..N process
-    User->>UI: open first ready item
-    par background
-        Worker->>Worker: process items 2..N
-    and foreground
-        User->>UI: act on item 1
-        UI-->>User: done (never blocked on 2..N)
+    net([router / LAN]) -->|:80/:443| caddy["Caddy<br/>reverse proxy + TLS"]
+    net -->|:53 DNS| tech["Technitium<br/>split-horizon DNS"]
+    caddy -->|tracker host| oauth["oauth2-proxy<br/>Google sign-in"]
+    oauth --> tracker["tracker<br/>(NagLight naglight:local)"]
+    caddy -->|basic_auth| actual["Actual Budget"]
+    caddy -->|basic_auth| tech
+    subgraph observability [LAN-only]
+      kuma["Uptime-Kuma"]
+      dozzle["Dozzle"]
+      ntfy["ntfy (optional)"]
     end
 ```
 
-_Update a flow in the same change that alters its LLRs — a stale flow diagram
-is a design lie. Sequence diagrams for simpler, synchronous interactions are
-welcome here too._
+- **Ingress:** the router forwards :80/:443 to Caddy, which terminates TLS
+  (public cert, valid on-LAN via split-horizon) and routes per host.
+- **Auth split (D1/D2):** the tracker host goes through **oauth2-proxy** (Google
+  sign-in, allow-list) with **no** basic_auth; Actual and the DNS console keep
+  **basic_auth**. The tracker container is bridge-only (`expose`, never
+  host-published) so its only ingress is the proxy (SR-004).
+- **DNS:** Technitium owns :53 on the host network and serves split-horizon
+  records; `provision/provision-technitium.sh` configures it idempotently over
+  its HTTP API.
+- **Image ownership:** the tracker image (`naglight:local`) is built by the
+  **NagLight** repo (D1/WI-10.4); this repo consumes it. The migrated
+  `stack/tracker/*.deprecated` files are reference-only.
+- **Observability (WI-10.11):** Uptime-Kuma, Dozzle, and optional ntfy run
+  LAN-only.
+- **Remote management (WI-10.12):** SSH (key-only), Cockpit, and
+  unattended-upgrades are provisioned by the autoinstall;
+  `REMOTE_MANAGEMENT.md` is the ops + reimage-ladder memo.
 
-### Program flow (generated)
+## Layout
 
-The ordered steps of the entry/orchestrator function, generated from the code by
-`python scripts/gen_arch_map.py --flow <entry>` (wire `--flow` into the harness's
-map step). Keep the orchestrator thin so this reads as the high-level flow; the
-diagram above carries the control flow this list omits.
+| Path | Responsibility |
+|---|---|
+| `stack/docker-compose.yml` | service definitions, health-checks, restart policy |
+| `stack/caddy/Caddyfile` | reverse-proxy routing + auth model |
+| `stack/autoinstall/` | Ubuntu autoinstall + first-boot bring-up |
+| `stack/provision/` | idempotent Technitium provisioning + headless health check |
+| `stack/tracker/` | deprecated reference copies (NagLight owns the build) |
+| `scripts/validate_config.py` | config-coverage validation (the product-layer check here) |
+| `docs/` | the requirement spine, status ledger, and this overview |
 
-<!-- BEGIN GENERATED FLOW -->
-_(run `gen_arch_map.py --flow <entry>` to populate — e.g. `--flow run`)_
-<!-- END GENERATED FLOW -->
+## Validation model
 
-## Module responsibilities
-
-| Module | Responsibility | Key public items |
-|---|---|---|
-| `path/to/mod_a` | <one line> | |
-| `path/to/mod_b` | <one line> | |
-
-Design rules (reviewed): shared logic lives in one place (no duplication); pure,
-unit-testable cores are separated from I/O / network / GUI shells; functions stay
-small; each module has a single clear responsibility. The generated map and
-dependency diagram below make violations (duplication, a forbidden import edge)
-*visible* at a glance, but enforcing these rules is the reviewer's job, not the
-harness's — don't read "reviewed" as "machine-checked".
-
-## Module dependencies (generated)
-
-The internal-import graph, harvested from the AST — each arrow is an import, so
-a layering violation (e.g. an arrow from `common` into `engine`) is visible at
-a glance.
-
-<!-- BEGIN GENERATED DEPENDENCY DIAGRAM -->
-_Generated by `scripts/gen_arch_map.py` from the source tree (AST): each arrow is an internal import. Do not edit by hand; run the check harness to refresh._
-
-_(no source scanned)_
-<!-- END GENERATED DEPENDENCY DIAGRAM -->
-
-<!-- BEGIN GENERATED MODULE MAP -->
-_Generated by `scripts/gen_arch_map.py` from the source tree (AST). Do not edit by hand; run the check harness to refresh. Summaries and `Implements:` come from your docstrings/comments._
-
-_(no source scanned)_
-<!-- END GENERATED MODULE MAP -->
+No Docker on the dev machine (verified), so **runtime bring-up is not exercised
+here**. `scripts/validate_config.py` asserts config *coverage* (every compose
+`${VAR}` has an `.env.example` key; every Caddy `{$VAR}` is passed by the caddy
+service; referenced files exist; YAML parses). Runtime validation is PENDING the
+first Docker host — tracked honestly in [status.md](status.md).

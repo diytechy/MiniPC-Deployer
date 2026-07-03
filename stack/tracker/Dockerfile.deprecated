@@ -1,0 +1,48 @@
+# ⚠ DEPRECATED — REFERENCE ONLY. Do NOT build from this file.
+#
+# The canonical NagLight image is now built by the NagLight repo's own Dockerfile
+# (WI-10.4, decision D1: the web container is NagLight's release artifact). This
+# stack consumes that image as `naglight:local`:
+#
+#     docker build -t naglight:local ../NagLight     # from a sibling checkout
+#
+# (or uncomment the `build:` fallback in docker-compose.yml to build from
+# ../../NagLight directly). This copy is kept only so the migration history of
+# the original life-tracker/deploy/tracker/Dockerfile is legible in one place.
+# The entrypoint.sh beside it is likewise a reference copy — NagLight owns it now.
+# ---------------------------------------------------------------------------
+#
+# Multi-stage build of the NagLight Go binary (single static binary, stdlib
+# only). Build context was the REPO ROOT (life-tracker), so `go build
+# ./cmd/tracker` saw the whole module. Stage 1 compiles a static binary; stage 2
+# is a tiny runtime carrying git (the engine shells out to git for commits) and
+# CA certs (for HTTPS git remotes / pushes).
+
+# ── build stage ─────────────────────────────────────────────────────────────
+FROM golang:1.21-alpine AS build
+WORKDIR /src
+
+COPY go.mod ./
+COPY go.su[m] ./
+RUN go mod download || true
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" \
+        -o /out/tracker ./cmd/tracker
+
+# ── runtime stage ───────────────────────────────────────────────────────────
+FROM alpine:3.20
+RUN apk add --no-cache git ca-certificates tzdata wget \
+    && adduser -D -u 1000 tracker
+
+COPY --from=build /out/tracker /usr/local/bin/tracker
+COPY deploy/tracker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV DATA_DIR=/data
+VOLUME ["/data"]
+EXPOSE 8787
+
+USER tracker
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

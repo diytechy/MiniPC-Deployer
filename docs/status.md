@@ -8,39 +8,75 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-- **Active gate:** G1 — Requirements, UX & constraints _(mirror it in the
-  one-line `docs/gate` file — `check.py`/CI read that; see process.md §7)_
+- **Active gate:** G1 — Requirements, UX & constraints. This is a config/infra
+  repo delivered against a ratified brief (HOMELAB_RESTRUCTURE_PLAN.md); the
+  requirement spine is intentionally **high-level** (proportionality doctrine).
 - **Round:** 1
-- **Open items:** _(the few things blocking the current gate — **one bullet per
-  item, never inline-enumerated prose**. Give each a stable short id (OI-1,
-  OI-2, … — ids are never renumbered; closed items are removed or struck
-  through) so a human can cite it from memory; end every bullet with a link to
-  the artifact it concerns; keep the two sub-lists below. Any
-  deferrals/decisions list follows the same bullet discipline.)_
-  - **Needs <human>** _(state the decision wanted, per item)_:
-    - OI-1 — decide: keep or drop the legacy export flag →
-      [system-requirements.csv](requirements/system-requirements.csv)
+- **Open items:**
+  - **Needs Peter** _(ratification / manual steps — dial=HIGH)_:
+    - OI-1 — **Google OAuth client** must be created in Google Cloud (needs
+      Peter's account); redirect URI to register:
+      `https://tracker.<domain>/oauth2/callback` →
+      [stack/.env.example](../stack/.env.example)
+    - OI-2 — **Reimage-over-LAN ladder** is HIGH-RISK; the memo presents options
+      with checkboxes. Nothing destructive is implemented until Peter checks one
+      → `REMOTE_MANAGEMENT.md` (added in WI-10.12)
+    - OI-3 — **Push** each commit (agents lack the SSH key) →
+      this repo
   - **In flight** _(driver; no approval needed)_:
-    - OI-2 — pinning SR-000's acceptance predicate →
-      [system-requirements.csv](requirements/system-requirements.csv)
-- **Assumptions (unattended):** _(decisions taken without sign-off while running
-  unattended — each to confirm or revert at the next gate; see AGENTS.md "Ask,
-  don't assume")_
-- **Next action:** _(what happens next + who must approve)_
+    - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
+      [stack/docker-compose.yml](../stack/docker-compose.yml)
+- **Assumptions (unattended):** see the Assumptions log below.
+- **Next action:** Peter reviews + pushes; creates the Google OAuth client;
+  reacts to the reimage-ladder checkboxes. Runtime bring-up on the first Docker
+  host / the AWOW itself.
 
 ## Scope (restated from the brief)
 
-- **Goal:**
-- **Stakeholders / end user(s):** _(who or what the system serves — humans,
-  operators, or another system, represented by its owner)_
+- **Goal:** the deploy repo for the headless AWOW AK41 always-on box — an
+  unattended, self-healing Docker stack (DNS, reverse proxy + TLS, the NagLight
+  tracker behind Google sign-in, Actual Budget, LAN observability) plus an
+  Ubuntu autoinstall image and full LAN remote management. **Config only** — app
+  code lives in NagLight / Finance-Auditor / MinecraftKeeper.
+- **Stakeholders / end user(s):** Peter (homelab operator); the tracker's hosted
+  end-users reach it only through oauth2-proxy.
 - **Active hats:** Stakeholder, UX/Docs, System Engineer, Software Engineer, Test
-  Engineer _(+ any domain hats this scope needs, e.g. Network / Security / Data /
-  Hardware — see process.md §1)_
-- **Supported platforms:** _(Linux / macOS / Windows — drives which setup/check
-  launchers must exist)_
+  Engineer, **Network**, **Security/Ops** (the domain hats this infra scope
+  needs).
+- **Supported platforms:** the deploy target is **Linux** (Ubuntu 24.04 on the
+  AWOW box); authored on Windows. Not a launchable product.
 - **Constraints:**
-- **Non-goals:**
-- **Definition of done:**
+  - **No Docker on the dev machine (verified).** Validation is config-level only;
+    runtime bring-up is PENDING a Docker host (see the ledger below).
+  - **Public-facing repo (Q10.6):** only `*.example` templates tracked; no real
+    secret/hash/email/LAN detail/personal name. Local commit identity pinned to
+    `diytechy <diytechy@users.noreply.github.com>`.
+  - **Kit:** minimum profile, decision dial **HIGH** (secrets-adjacent infra).
+  - **No product source in this repo** → the Python `ruff`/`pytest`/arch-map
+    steps are dropped (not left passing vacuously, ADOPTING.md §3). The
+    product-layer check is `scripts/validate_config.py`.
+- **Non-goals:** a container registry / CI publishing (deferred, Q10.2 — local
+  builds for now); the NagLight app code and its multi-user engine (NagLight
+  repo, WI-10.4/10.5); the secret-handoff script (WI-10.3, Peter ratifies).
+- **Definition of done:** the repo's G1 gate is green (`check.py`), `.env.example`
+  enumerates every knob, config coverage validates, and the honest validation
+  ledger records what remains PENDING a Docker host.
+
+## Honest validation ledger (WI-4.7 note carried forward)
+
+| Check | State |
+|---|---|
+| `docker compose config` / live bring-up | **PENDING — no Docker on dev box (verified)** |
+| curl health endpoints, `dig`, OAuth round-trip, tear-down | **PENDING — Docker host / the AWOW** |
+| Shell scripts `bash -n` | PASS |
+| `docker-compose.yml`, `meta-data`, `user-data` YAML parse | PASS (PyYAML) |
+| Every compose `${VAR}` has an `.env.example` key | PASS (`validate_config.py`) |
+| Every Caddy `{$VAR}` passed by the caddy service env | PASS |
+| Bind-mount sources + autoinstall-referenced files exist | PASS |
+| `check.py` (G1: config-validate + registry-integrity + doc-navigability) | PASS |
+
+Runtime validation must be redone on the first Docker host before the burn-in
+checklist (stack/README §6) can be signed.
 
 ## Gate Sign-offs
 
@@ -61,7 +97,29 @@ deliverable.
 
 <!-- Append verdict blocks here per process.md §5. Newest at the bottom. -->
 
-### DRIVER — G1 — Round 1 — <YYYY-MM-DD>
+### DRIVER — G1 — Round 1 — 2026-07-03
 Scaffolding created. Starting G1.
+
+### Assumptions log (unattended, dial=HIGH — Peter to confirm/revert)
+- A1 — Layout: migrated `life-tracker/deploy/*` under `stack/` at the repo root
+  (kept the kit's `docs/`/`scripts/` roots). On-box path renamed `deploy/` →
+  `stack/` under `/opt/awow-core/`; the box hostname/opt-dir keep the `awow-core`
+  name (faithful to the source; Peter knows it).
+- A2 — This repo is treated as gate **G1** (requirements-agreed) — config is the
+  deliverable, there is no compiled source to carry to G2/G3. The Python
+  product/arch-map steps are dropped, not left vacuous.
+- A3 — oauth2-proxy image pinned to `v7.6.0`, Google provider, allow-list via
+  `authenticated-emails.txt` (Q10.5). Redirect URI `…/oauth2/callback`.
+- A4 — SSH is **key-only** by default in the autoinstall (locked password),
+  per WI-10.12 "key-only auth". Cockpit installed but **not** proxied publicly.
+- A5 — Kept the `TRACKER_DATA_REMOTE` clone/pull entrypoint behaviour from the
+  source; multi-user (D3) sets it blank + `TRACKER_COMMIT=false` (documented).
+
+### DRIVER — G1 — Round 1 — 2026-07-03 (migration + spine)
+Migrated the deploy stack, wired the tracker to `naglight:local`, authored the
+high-level SN/SR spine (8 SN, 11 SR), and added `scripts/validate_config.py` as
+the config-repo product check. `check.py` (G1) green; integrity 0. WI-10.2 (oauth
++ Caddy re-route), WI-10.11 (aux containers), WI-10.12 (remote mgmt) layered in
+subsequent commits.
 
 <!-- agent-setup --> Agent setup (2026-07-03): agents=`claude`; skills materialized: downstream-resync, gate-advance, registry-hygiene. AGENTS.md remains the canonical, agent-neutral guide (skills are opt-in accelerators, not a process gate).

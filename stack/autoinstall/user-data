@@ -1,0 +1,94 @@
+#cloud-config
+# Ubuntu Server autoinstall (cloud-init) for the AWOW AK41 always-on core.
+# Flash USB → boot → everything up, zero clicks.
+#
+# This is the `autoinstall` user-data consumed by the Ubuntu Server 24.04 LTS
+# live installer (Subiquity). It:
+#   1. Partitions the whole eMMC/SSD (LVM = simple whole-disk layout).
+#   2. Creates the operator user (SSH key optional but recommended).
+#   3. Installs Docker Engine + compose plugin + git via late-commands.
+#   4. Drops the stack/ tree, a placeholder .env, and a first-boot systemd unit
+#      onto the target, then enables the unit so the FIRST real boot runs
+#      provisioning + `docker compose up -d`.
+#
+# SECURITY: replace the identity block below (username/password hash + SSH key)
+# and DO NOT commit a filled-in copy — this template ships with placeholders.
+# Generate a password hash with:  mkpasswd --method=SHA-512
+#
+# See ../README.md "Build the USB" for how to attach this file to the ISO.
+
+autoinstall:
+  version: 1
+
+  # Non-interactive: never stop to ask. Any prompt would defeat "zero clicks".
+  interactive-sections: []
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # DHCP on the first NIC. Give the box a DHCP RESERVATION at your chosen LAN_IP
+  # on the router so it always lands where the split-horizon records point.
+  network:
+    version: 2
+    ethernets:
+      any-eth:
+        match:
+          name: "en*"
+        dhcp4: true
+
+  identity:
+    hostname: awow-core
+    realname: "AWOW Core Operator"
+    username: operator
+    # mkpasswd --method=SHA-512  → paste result here. Placeholder must be replaced.
+    password: "$6$REPLACE$WITH$A$REAL$SHA512$HASH"
+
+  ssh:
+    install-server: true
+    allow-pw: true
+    # Recommended: paste your public key and set allow-pw:false for a hardened box.
+    # authorized-keys:
+    #   - "ssh-ed25519 AAAA... you@host"
+
+  # Whole-disk automatic layout (LVM). The AK41 has a single eMMC/SSD.
+  storage:
+    layout:
+      name: lvm
+
+  packages:
+    - ca-certificates
+    - curl
+    - git
+    - dnsutils          # provides dig for the health check
+    - apt-transport-https
+
+  # Everything site-specific happens in late-commands, which run in the installer
+  # environment with the target mounted at /target. We write files INTO /target.
+  late-commands:
+    # ---- 1. Install Docker Engine from the official repo (inside the target) --
+    - curtin in-target --target=/target -- bash -c 'install -m 0755 -d /etc/apt/keyrings'
+    - curtin in-target --target=/target -- bash -c 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && chmod a+r /etc/apt/keyrings/docker.asc'
+    - curtin in-target --target=/target -- bash -c 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list'
+    - curtin in-target --target=/target -- bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
+    - curtin in-target --target=/target -- systemctl enable docker
+    - curtin in-target --target=/target -- usermod -aG docker operator
+
+    # ---- 2. Place the stack ---------------------------------------------------
+    # The repo payload is copied by the USB-build step to /cdrom/deploy-payload
+    # (a second CIDATA stick, or the remastered ISO) and picked up here into
+    # /opt/awow-core/. The stack itself then lives at /opt/awow-core/stack/.
+    - mkdir -p /target/opt/awow-core
+    - cp -a /cdrom/deploy-payload/. /target/opt/awow-core/ 2>/dev/null || cp -a /media/deploy-payload/. /target/opt/awow-core/ 2>/dev/null || true
+
+    # ---- 3. Seed .env from the example if the operator did not pre-fill one ----
+    - curtin in-target --target=/target -- bash -c '[ -f /opt/awow-core/stack/.env ] || cp /opt/awow-core/stack/.env.example /opt/awow-core/stack/.env'
+
+    # ---- 4. Install + enable the first-boot unit ------------------------------
+    - cp /target/opt/awow-core/stack/autoinstall/awow-firstboot.service /target/etc/systemd/system/awow-firstboot.service
+    - cp /target/opt/awow-core/stack/autoinstall/firstboot.sh /target/usr/local/sbin/awow-firstboot.sh
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/awow-firstboot.sh
+    - curtin in-target --target=/target -- systemctl enable awow-firstboot.service
+
+  # No reboot prompt — power-cycle straight into the running box.
+  shutdown: reboot

@@ -1,0 +1,60 @@
+# Caddyfile for the AWOW always-on core.
+#
+# Split-horizon: the SAME hostnames resolve to this box's LAN IP at home
+# (Technitium) and to the public IP away (public DNS + router forward). Because
+# the hostname never changes, the public cert Caddy obtains via ACME validates on
+# the LAN too — no cert warnings, no internal hostname.
+#
+# Env vars (set in docker-compose.yml from .env):
+#   {$DOMAIN} {$LAN_IP} {$TRACKER_HOST} {$ACTUAL_HOST}
+#   {$TRACKER_BASICAUTH_USER} {$TRACKER_BASICAUTH_HASH} {$ACME_EMAIL} {$MAIN_BOX_IP}
+
+{
+    # ACME account email for public certs (Let's Encrypt / ZeroSSL).
+    email {$ACME_EMAIL}
+}
+
+# ── shared snippet: basic_auth guard for the private services ─────────────────
+(protect) {
+    basic_auth {
+        {$TRACKER_BASICAUTH_USER} {$TRACKER_BASICAUTH_HASH}
+    }
+}
+
+# ── tracker.<domain> — the tracker (public via router forward; PROTECT it) ──────
+{$TRACKER_HOST} {
+    import protect
+    encode zstd gzip
+    reverse_proxy tracker:8787
+}
+
+# ── actual.<domain> — Actual Budget (finances; lock down like the tracker) ─────
+{$ACTUAL_HOST} {
+    import protect
+    encode zstd gzip
+    reverse_proxy actual:5006
+}
+
+# ── dns.<domain> — Technitium web console, proxied for convenience ────────────
+# Technitium binds :5380 on the host (host-network); proxy to the host gateway.
+dns.{$DOMAIN} {
+    import protect
+    encode zstd gzip
+    # host.docker.internal → the host where Technitium's :5380 lives.
+    reverse_proxy host.docker.internal:5380
+}
+
+# ── main-box services (BlueMap / Minecraft map etc.) — COMMENTED, opt-in ───────
+# A flaky MAIN box may host the heavy services. Uncomment + set MAIN_BOX_IP in
+# .env to have Caddy on THIS box reverse-proxy across the LAN to them.
+#
+# map.{$DOMAIN} {
+#     import protect
+#     encode zstd gzip
+#     reverse_proxy {$MAIN_BOX_IP}:8100   # BlueMap default web port
+# }
+
+# ── apex — bare domain answers on-LAN too ──────────────────────────────────────
+{$DOMAIN} {
+    respond "AWOW always-on core. Try https://{$TRACKER_HOST}" 200
+}

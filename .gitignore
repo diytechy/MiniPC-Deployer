@@ -24,3 +24,17 @@ docs/test/perf-metrics.json
 # No-stub / substance detector report (process.md §4 G3) — a regenerated
 # composite from scripts/check_stubs.py; review the code, not this list.
 docs/test/stub-report.md
+
+# ── Deploy stack secrets & runtime state (WI-10.1) — NEVER commit these ──────
+# Filled-in env, the Technitium API token, and the first-boot marker. Only the
+# *.example templates are tracked.
+stack/.env
+stack/provision/.token
+stack/.provisioned
+# A filled-in autoinstall user-data carries the real SSH key / password hash.
+stack/autoinstall/user-data.filled
+# Local compose overrides / bind-mounted runtime volumes.
+stack/docker-compose.override.yml
+stack/caddy_data/
+stack/caddy_config/
+

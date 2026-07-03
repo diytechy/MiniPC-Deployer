@@ -60,8 +60,12 @@ services:
       LAN_IP: ${LAN_IP}
       TRACKER_HOST: ${TRACKER_SUBDOMAIN}.${DOMAIN}
       ACTUAL_HOST: ${ACTUAL_SUBDOMAIN}.${DOMAIN}
-      TRACKER_BASICAUTH_USER: ${TRACKER_BASICAUTH_USER}
-      TRACKER_BASICAUTH_HASH: ${TRACKER_BASICAUTH_HASH}
+      # basic_auth guards the SINGLE-USER services (Actual, dns console) only.
+      # The tracker host is NOT basic_auth'd — oauth2-proxy owns its auth (D2).
+      ACTUAL_BASICAUTH_USER: ${ACTUAL_BASICAUTH_USER}
+      ACTUAL_BASICAUTH_HASH: ${ACTUAL_BASICAUTH_HASH}
+      DNS_BASICAUTH_USER: ${DNS_BASICAUTH_USER}
+      DNS_BASICAUTH_HASH: ${DNS_BASICAUTH_HASH}
       ACME_EMAIL: ${ACME_EMAIL}
       MAIN_BOX_IP: ${MAIN_BOX_IP}
     volumes:
@@ -69,12 +73,70 @@ services:
       - caddy_data:/data       # certs + ACME account — persist so re-issue isn't needed on reboot
       - caddy_config:/config
     depends_on:
-      tracker:
+      oauth2-proxy:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
       # Caddy admin API on :2019 is always up when the process is; cheap liveness.
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── oauth2-proxy — Google sign-in for the tracker subdomain (WI-10.2, D1/D2) ──
+  # Stock upstream image; NO code repo of its own (D1). Caddy forwards the tracker
+  # host here WITHOUT basic_auth; oauth2-proxy does the Google OAuth dance, then
+  # reverse-proxies to the tracker container, injecting the verified identity
+  # headers (X-Forwarded-Email / X-Forwarded-User) the tracker's trusted-header
+  # multi-user mode consumes (D3, NagLight WI-10.5).
+  #
+  # PETER MANUAL STEP (see README + .env.example): create a Google Cloud OAuth
+  # 2.0 client and register the redirect URI before this can start.
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:${OAUTH2_PROXY_IMAGE_TAG}
+    container_name: oauth2-proxy
+    environment:
+      # Provider + app credentials (from the Google Cloud OAuth client).
+      OAUTH2_PROXY_PROVIDER: google
+      OAUTH2_PROXY_CLIENT_ID: ${OAUTH2_PROXY_CLIENT_ID}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET}
+      # 32-byte cookie encryption seed. Generate:
+      #   openssl rand -base64 32 | tr -- '+/' '-_'
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET}
+      # Allow-list of Google accounts permitted through (Q10.5: explicit list to
+      # start; a remote-settable console is a deferred FUTURE knob, not built).
+      # The first-boot flow materializes this file from OAUTH2_PROXY_ALLOWED_EMAILS.
+      OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE: /etc/oauth2-proxy/authenticated-emails.txt
+      # Listen on all bridge interfaces so Caddy can reach it.
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      # The upstream oauth2-proxy protects and forwards to (the tracker container).
+      OAUTH2_PROXY_UPSTREAMS: http://tracker:8787
+      # Emit the identity headers to the upstream (D3 trusted-header mode).
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"       # X-Forwarded-User / -Email to upstream
+      OAUTH2_PROXY_SET_XAUTHREQUEST: "true"        # X-Auth-Request-* headers too
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
+      # Public URL of the tracker (used to build the redirect + cookie domain).
+      OAUTH2_PROXY_REDIRECT_URL: https://${TRACKER_SUBDOMAIN}.${DOMAIN}/oauth2/callback
+      OAUTH2_PROXY_COOKIE_DOMAINS: ${TRACKER_SUBDOMAIN}.${DOMAIN}
+      OAUTH2_PROXY_WHITELIST_DOMAINS: ${TRACKER_SUBDOMAIN}.${DOMAIN}
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      # Behind Caddy's TLS termination — trust the X-Forwarded-* Caddy sets.
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"              # gate on the allow-list file, not the domain
+    volumes:
+      # The allow-list file materialized from OAUTH2_PROXY_ALLOWED_EMAILS by the
+      # first-boot flow (real accounts kept out of git; see .env.example + README).
+      - ./oauth2-proxy/authenticated-emails.txt:/etc/oauth2-proxy/authenticated-emails.txt:ro
+    depends_on:
+      tracker:
+        condition: service_healthy
+    expose:
+      - "4180"
+    restart: unless-stopped
+    healthcheck:
+      # oauth2-proxy serves /ping unauthenticated for liveness.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4180/ping || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -104,9 +166,17 @@ services:
       TRACKER_GIT_NAME: ${TRACKER_GIT_NAME}
       TRACKER_GIT_EMAIL: ${TRACKER_GIT_EMAIL}
       # Passed to `tracker serve --commit` when true (nightly materialize commits).
+      # Disabled for hosted multi-user mode (D3) — leave false when MULTI_USER=true.
       TRACKER_COMMIT: ${TRACKER_COMMIT}
+      # Trusted-header multi-user opt-in (NagLight WI-10.5, D3). When true the
+      # tracker takes identity from oauth2-proxy's X-Forwarded-Email header ONLY
+      # and keys a per-user data dir off the Google `sub` claim.
+      TRACKER_MULTI_USER: ${TRACKER_MULTI_USER}
     volumes:
       - tracker_data:/data
+    # expose (bridge-only), NOT ports: the tracker must never be reachable except
+    # via oauth2-proxy (D2/WI-10.5 — trusted headers are forgeable if the port is
+    # open). No host publish.
     expose:
       - "8787"
     restart: unless-stopped

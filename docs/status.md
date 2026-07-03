@@ -122,4 +122,14 @@ the config-repo product check. `check.py` (G1) green; integrity 0. WI-10.2 (oaut
 + Caddy re-route), WI-10.11 (aux containers), WI-10.12 (remote mgmt) layered in
 subsequent commits.
 
+### DRIVER — G1 — Round 1 — 2026-07-03 (WI-10.2 oauth2-proxy + Caddy re-route)
+Added the oauth2-proxy service (Google provider, allow-list file, cookie secret,
+identity headers to the tracker). Re-routed the Caddyfile: tracker host →
+oauth2-proxy (no basic_auth); Actual + dns keep basic_auth (split into
+per-service snippets since Caddy resolves {$VAR} once at load). Firstboot now
+materializes the allow-list from `OAUTH2_PROXY_ALLOWED_EMAILS`. Documented the
+PETER MANUAL STEP (Google OAuth client) in .env.example + stack/README. Redirect
+URI to register: `https://tracker.<domain>/oauth2/callback`. config-validate
+green (25 compose vars covered, 8 Caddy vars passed).
+
 <!-- agent-setup --> Agent setup (2026-07-03): agents=`claude`; skills materialized: downstream-resync, gate-advance, registry-hygiene. AGENTS.md remains the canonical, agent-neutral guide (skills are opt-in accelerators, not a process gate).

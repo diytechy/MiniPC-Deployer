@@ -31,6 +31,8 @@ docs/test/stub-report.md
 stack/.env
 stack/provision/.token
 stack/.provisioned
+# oauth2-proxy allow-list holds real Google accounts — only the .example tracked.
+stack/oauth2-proxy/authenticated-emails.txt
 # A filled-in autoinstall user-data carries the real SSH key / password hash.
 stack/autoinstall/user-data.filled
 # Local compose overrides / bind-mounted runtime volumes.

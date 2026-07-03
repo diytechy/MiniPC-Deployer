@@ -1,0 +1,10 @@
+# oauth2-proxy allow-list (Q10.5) — EXAMPLE. One Google account e-mail per line.
+#
+# The real file `authenticated-emails.txt` is gitignored (it lists real accounts).
+# The first-boot flow materializes it from OAUTH2_PROXY_ALLOWED_EMAILS in .env:
+# each comma/space-separated entry becomes one line here. You may also edit it by
+# hand and `docker compose restart oauth2-proxy`.
+#
+# Placeholders only — replace with the accounts you actually permit:
+you@gmail.com
+other-allowed@gmail.com

@@ -9,10 +9,13 @@ Services (all health-checked, all `restart: unless-stopped`):
 
 - **Technitium DNS** — split-horizon LAN DNS + recursion + ad-blocklists; its
   HTTP API is the health/config surface.
-- **Caddy** — reverse proxy + `basic_auth` + automatic TLS (valid on the LAN via
-  split-horizon).
-- **tracker** — the **NagLight** web container (`naglight:local`).
-- **Actual Budget** — finances on its own subdomain.
+- **Caddy** — reverse proxy + automatic TLS (valid on the LAN via split-horizon).
+  `basic_auth` guards the single-user services (Actual, the DNS console) only.
+- **oauth2-proxy** — Google sign-in in front of the tracker subdomain (D1/D2);
+  forwards verified identity headers to the tracker container.
+- **tracker** — the **NagLight** web container (`naglight:local`), multi-user via
+  trusted headers (D3).
+- **Actual Budget** — finances on its own subdomain, behind `basic_auth`.
 
 This directory is the **image pipeline**. It is self-contained and committed with
 placeholders only — no secrets. Copy `.env.example` → `.env` and fill it in;
@@ -26,7 +29,9 @@ placeholders only — no secrets. Copy `.env.example` → `.env` and fill it in;
 stack/
   docker-compose.yml          the services, health-checked, restart:unless-stopped
   .env.example                every knob (domains, LAN IP, tokens, data-repo remote, image tags)
-  caddy/Caddyfile             reverse proxy + basic_auth, env-templated
+  caddy/Caddyfile             reverse proxy; oauth2-proxy for tracker, basic_auth for actual/dns
+  oauth2-proxy/
+    authenticated-emails.txt.example   allow-list template (real file gitignored)
   tracker/
     Dockerfile.deprecated     REFERENCE ONLY — NagLight owns the canonical build (WI-10.4)
     entrypoint.sh.deprecated  REFERENCE ONLY
@@ -68,9 +73,29 @@ Fill in at minimum:
 | `DOMAIN` | your public apex (e.g. `example.tld`) |
 | `LAN_IP` | the AWOW's LAN IP — **give it a DHCP reservation** at this address |
 | `ACME_EMAIL` | email for Let's Encrypt |
-| `TRACKER_BASICAUTH_HASH` | `docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpass'` |
+| `ACTUAL_BASICAUTH_HASH` / `DNS_BASICAUTH_HASH` | `docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpass'` |
 | `TECHNITIUM_ADMIN_PASSWORD` | strong password (set on Technitium's first start) |
-| `TRACKER_DATA_REMOTE` | git remote of your private **data** repo; blank = manage `/data` by hand |
+| `OAUTH2_PROXY_CLIENT_ID` / `_SECRET` | from your Google OAuth client (**Peter manual step**, below) |
+| `OAUTH2_PROXY_COOKIE_SECRET` | `openssl rand -base64 32 \| tr -- '+/' '-_'` |
+| `OAUTH2_PROXY_ALLOWED_EMAILS` | comma-separated Google accounts permitted into the tracker |
+| `TRACKER_DATA_REMOTE` | git remote of your private **data** repo (single-user); blank for multi-user |
+
+### PETER MANUAL STEP — Google OAuth client (required for the tracker)
+
+The tracker subdomain is gated by Google sign-in. Before first bring-up, create
+the OAuth client (needs Peter's Google account — an agent cannot):
+
+1. console.cloud.google.com → **APIs & Services → Credentials**.
+2. Configure the **OAuth consent screen** (External). While unverified, add each
+   allowed Google account as a **Test user** (or publish the app). Scopes:
+   `openid`, `email`, `profile` (the slacker-tracker pattern Peter trusts uses
+   `email profile`).
+3. **Create Credentials → OAuth client ID → Web application**.
+4. Register **Authorized redirect URI** exactly:
+   `https://tracker.<your-domain>/oauth2/callback`
+   (e.g. `https://tracker.example.tld/oauth2/callback`). No JavaScript origin
+   needed — this is a server-side flow.
+5. Paste the Client ID + secret into `.env`.
 
 ---
 
@@ -99,9 +124,9 @@ the stack up.
 4. **Boot the AWOW from USB #1.** It partitions, installs Ubuntu + Docker
    unattended, copies the repo, seeds `.env`, enables `awow-firstboot.service`,
    and reboots.
-5. **First real boot** runs `firstboot.sh`: `docker compose up -d`, wait for
-   Technitium, run `provision-technitium.sh`, and point the host resolver at
-   local DNS.
+5. **First real boot** runs `firstboot.sh`: materialize the oauth2-proxy
+   allow-list, `docker compose up -d`, wait for Technitium, run
+   `provision-technitium.sh`, and point the host resolver at local DNS.
 
 ### Manual bring-up (a box that already runs Docker)
 
@@ -159,6 +184,8 @@ a day or two, then pick the secondary DNS. Track:
       automatically (restart:unless-stopped) and DNS resolves within ~1 min.
 - [ ] **TLS on LAN** — from a LAN device using the box as DNS, open
       `https://tracker.<domain>` with **no cert warning**.
+- [ ] **OAuth round-trip** — sign in at `https://tracker.<domain>` with an
+      allowed Google account (success) and a non-allowed one (rejected).
 - [ ] **Then pick the secondary/failover DNS** so an AWOW outage degrades
       gracefully instead of killing LAN name resolution.
 

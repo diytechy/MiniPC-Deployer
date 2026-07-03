@@ -5,40 +5,63 @@
 # the hostname never changes, the public cert Caddy obtains via ACME validates on
 # the LAN too — no cert warnings, no internal hostname.
 #
+# AUTH MODEL (WI-10.2, decisions D1/D2):
+#   - tracker.<domain>  -> oauth2-proxy (Google sign-in). NO basic_auth on this
+#     host; oauth2-proxy is the gate and forwards verified identity headers
+#     (X-Forwarded-Email / X-Forwarded-User) to the tracker container.
+#   - actual.<domain>, dns.<domain>, map.<domain> -> KEEP basic_auth (Peter's
+#     single-user services; oauth2-proxy is only for the multi-user tracker).
+#
 # Env vars (set in docker-compose.yml from .env):
-#   {$DOMAIN} {$LAN_IP} {$TRACKER_HOST} {$ACTUAL_HOST}
-#   {$TRACKER_BASICAUTH_USER} {$TRACKER_BASICAUTH_HASH} {$ACME_EMAIL} {$MAIN_BOX_IP}
+#   {$DOMAIN} {$LAN_IP} {$TRACKER_HOST} {$ACTUAL_HOST} {$ACME_EMAIL} {$MAIN_BOX_IP}
+#   {$ACTUAL_BASICAUTH_USER} {$ACTUAL_BASICAUTH_HASH}
+#   {$DNS_BASICAUTH_USER} {$DNS_BASICAUTH_HASH}
 
 {
     # ACME account email for public certs (Let's Encrypt / ZeroSSL).
     email {$ACME_EMAIL}
 }
 
-# ── shared snippet: basic_auth guard for the private services ─────────────────
-(protect) {
+# ── shared snippets: one basic_auth guard per single-user service ─────────────
+# Caddy resolves {$VAR} at config-load, so a single (protect) snippet can't carry
+# two different credential pairs; give each guarded host its own snippet.
+(protect_actual) {
     basic_auth {
-        {$TRACKER_BASICAUTH_USER} {$TRACKER_BASICAUTH_HASH}
+        {$ACTUAL_BASICAUTH_USER} {$ACTUAL_BASICAUTH_HASH}
+    }
+}
+(protect_dns) {
+    basic_auth {
+        {$DNS_BASICAUTH_USER} {$DNS_BASICAUTH_HASH}
     }
 }
 
-# ── tracker.<domain> — the tracker (public via router forward; PROTECT it) ──────
+# ── tracker.<domain> — the NagLight tracker (multi-user via oauth2-proxy) ──────
+# D2: NO basic_auth here. Caddy hands the whole host to oauth2-proxy, which runs
+# the Google OAuth flow and reverse-proxies to the tracker container on success,
+# injecting the identity headers the tracker's trusted-header mode reads (D3).
+# The /oauth2/* callback + sign-in routes live inside oauth2-proxy too.
 {$TRACKER_HOST} {
-    import protect
     encode zstd gzip
-    reverse_proxy tracker:8787
+    reverse_proxy oauth2-proxy:4180 {
+        # oauth2-proxy needs the original host/scheme to build its redirect URL.
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+    }
 }
 
-# ── actual.<domain> — Actual Budget (finances; lock down like the tracker) ─────
+# ── actual.<domain> — Actual Budget (single-user; KEEP basic_auth) ─────────────
 {$ACTUAL_HOST} {
-    import protect
+    import protect_actual
     encode zstd gzip
     reverse_proxy actual:5006
 }
 
-# ── dns.<domain> — Technitium web console, proxied for convenience ────────────
+# ── dns.<domain> — Technitium web console (single-admin; KEEP basic_auth) ──────
 # Technitium binds :5380 on the host (host-network); proxy to the host gateway.
 dns.{$DOMAIN} {
-    import protect
+    import protect_dns
     encode zstd gzip
     # host.docker.internal → the host where Technitium's :5380 lives.
     reverse_proxy host.docker.internal:5380
@@ -46,10 +69,12 @@ dns.{$DOMAIN} {
 
 # ── main-box services (BlueMap / Minecraft map etc.) — COMMENTED, opt-in ───────
 # A flaky MAIN box may host the heavy services. Uncomment + set MAIN_BOX_IP in
-# .env to have Caddy on THIS box reverse-proxy across the LAN to them.
+# .env to have Caddy on THIS box reverse-proxy across the LAN to them. The
+# provisioning script already creates a `map.<domain>` split-horizon record when
+# MAIN_BOX_IP is set, so this just wires the proxy. KEEP basic_auth on these.
 #
 # map.{$DOMAIN} {
-#     import protect
+#     import protect_dns
 #     encode zstd gzip
 #     reverse_proxy {$MAIN_BOX_IP}:8100   # BlueMap default web port
 # }

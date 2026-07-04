@@ -30,6 +30,12 @@ last) — it is the record, not required reading for every pass.
 - **Next action:** Peter reviews + pushes; creates the Google OAuth client;
   reacts to the reimage-ladder checkboxes. Runtime bring-up on the first Docker
   host / the AWOW itself.
+- **UPDATE 2026-07-03 (WI-10.13):** the "no Docker on the dev machine" constraint
+  above is now LIFTED — WSL2 + Ubuntu 24.04 + docker-ce is installed on the dev
+  PC (Docker Desktop explicitly NOT installed, per Peter's pick). `naglight:local`
+  now builds for real and `docker compose config` resolves this stack's full
+  compose file. See audit log entry below for versions/detail. Wave 2 (V1
+  AWOW-sim, WI-10.14/10.15) is now unblocked.
 
 ## Scope (restated from the brief)
 
@@ -46,8 +52,11 @@ last) — it is the record, not required reading for every pass.
 - **Supported platforms:** the deploy target is **Linux** (Ubuntu 24.04 on the
   AWOW box); authored on Windows. Not a launchable product.
 - **Constraints:**
-  - **No Docker on the dev machine (verified).** Validation is config-level only;
-    runtime bring-up is PENDING a Docker host (see the ledger below).
+  - ~~No Docker on the dev machine~~ **SUPERSEDED 2026-07-03 (WI-10.13):** WSL2 +
+    Ubuntu + docker-ce now installed on the dev PC. `naglight:local` build and
+    `docker compose config` are now verified for real (see audit log). Full
+    runtime bring-up (containers actually running end-to-end) is still PENDING
+    the WI-10.14 AWOW-sim harness.
   - **Public-facing repo (Q10.6):** only `*.example` templates tracked; no real
     secret/hash/email/LAN detail/personal name. Local commit identity pinned to
     `diytechy <diytechy@users.noreply.github.com>`.
@@ -149,3 +158,60 @@ reimage-related (no `storage:` recovery-partition change, no GRUB reinstall entr
 no PXE) is implemented until Peter checks a box.
 
 <!-- agent-setup --> Agent setup (2026-07-03): agents=`claude`; skills materialized: downstream-resync, gate-advance, registry-hygiene. AGENTS.md remains the canonical, agent-neutral guide (skills are opt-in accelerators, not a process gate).
+
+### DRIVER — G1 — Round 1 — 2026-07-03 (WI-10.13 dev-PC container runtime)
+Peter picked **(a) WSL2 + docker engine inside Ubuntu**, explicitly over Docker
+Desktop (not installed; no other tooling touched). This closes Wave 1's
+unverified-image-build honesty gap for real.
+
+**Installed on the dev PC (machine-level, Peter-consented):**
+- WSL2 itself was already enabled/functional (a pre-existing
+  `podman-machine-default` WSL2 distro was running) — no VirtualMachinePlatform
+  enable + reboot was needed.
+- `Ubuntu` distro registered via the pre-existing `CanonicalGroupLimited.Ubuntu`
+  appx package (was installed but never first-run) — ran non-interactively via
+  `ubuntu.exe install --root`, avoiding the interactive username/password
+  prompt. Result: **Ubuntu 24.04.1 LTS (Noble)**, WSL version 2. Default WSL
+  user is `root` (a consequence of the `--root` non-interactive path). A
+  secondary non-root user `peter` was also created and added to the `docker` +
+  `sudo` groups for future interactive use, but is NOT the WSL default (no
+  extra restart was spent switching it — root already has full docker access).
+- `/etc/wsl.conf` → `[boot] systemd=true`; confirmed via `wsl --shutdown` +
+  relaunch that `systemd` is PID 1.
+- **docker-ce from Docker's official apt repo** (not `docker.io`, not Docker
+  Desktop): `docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+  docker-compose-plugin`. Versions: **Docker 29.6.1** (build 8900f1d),
+  **Docker Compose v5.3.0** (plugin). `docker.service` enabled + running under
+  systemd.
+
+**Verification, in order (all real, all honest):**
+1. `docker run --rm hello-world` → **PASS** (pulled + ran, full expected output).
+2. `docker build -t naglight:local /mnt/c/Projects/NagLight` → **PASS**. Built
+   clean: Go 1.26-alpine build stage → alpine:3.20 runtime stage, final image
+   `naglight:local` (14.1MB content, 47.8MB disk). No errors, no warnings beyond
+   Docker's own advisory notices. This closes NagLight's TC-044
+   unverified-build gap.
+3. `docker compose --env-file <scratchpad>/sim.env config` from `stack/` →
+   **PASS** (exit 0). Used a placeholder-but-syntactically-valid `.env`
+   (fictional domains/keys/tokens; generated fresh, kept in the agent's
+   scratchpad, never written into this repo). All 8 services resolved
+   correctly: `actual`, `caddy`, `ddns`, `dozzle`, `oauth2-proxy`, `technitium`,
+   `tracker` (confirmed `image: naglight:local` — the just-built image),
+   `uptime-kuma`. Volumes/networks/healthchecks all present in the rendered
+   config. Minor test-data artifact (not a stack bug): the placeholder bcrypt
+   hash values contained unescaped `$` characters, which docker compose's own
+   `.env` interpolation partially consumed (`$2a$14$...` truncated to `$2a$14`
+   in the rendered output) — a property of how I wrote the throwaway env file,
+   not of the compose file itself.
+
+**Tooling note for future sessions:** invoking `wsl.exe` through this agent's
+Bash/PowerShell tools silently mangles any `$VAR` in the command string (an
+outer shell layer pre-expands it before the real command runs) and Git Bash's
+MSYS layer rewrites leading `/mnt/c/...` paths unless `MSYS_NO_PATHCONV=1` is
+set. Workaround used throughout: write scripts to files (Write tool, no shell
+involved) and execute them via `wsl.exe -d Ubuntu -- bash /mnt/c/...script.sh`
+with `MSYS_NO_PATHCONV=1` set on any command touching `/mnt/c/...` paths
+directly.
+
+**Remaining for Peter:** none — no reboot, no interactive prompt was needed.
+Wave 2's V1 AWOW-sim (WI-10.14/10.15) is now unblocked.

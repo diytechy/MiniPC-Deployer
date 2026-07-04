@@ -48,6 +48,11 @@ python scripts/validate_config.py  # env/Caddy/file coverage + YAML parse
 > only**; runtime bring-up is PENDING the first Docker host — see the honest
 > ledger in [docs/status.md](docs/status.md).
 
+Three progressively-more-real gates precede flashing the real AWOW: [`sim/`](sim/)
+(V1 — the full stack on WSL/Docker against a mock OIDC provider), the
+V2 launcher gate (Personal repo), and [`vmtest/`](vmtest/) (V3 — the REAL
+autoinstall booted in a local Hyper-V VM, the last gate before real hardware).
+
 ## Development
 
 This repo follows a gated, requirement-traced process. The working brief is

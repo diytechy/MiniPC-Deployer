@@ -23,6 +23,17 @@ last) — it is the record, not required reading for every pass.
       → [REMOTE_MANAGEMENT.md](../REMOTE_MANAGEMENT.md)
     - OI-3 — **Push** each commit (agents lack the SSH key) →
       this repo
+    - OI-5 — **Run the V3 gate** (WI-10.18): enable Hyper-V (elevated,
+      machine-level, needs a reboot), create the VM, do the one-time GRUB
+      edit (light path), and confirm compose-up →
+      [vmtest/README.md](../vmtest/README.md). Nobody has booted a VM from
+      this yet — scripts delivered + partially smoke-tested, boot itself is
+      Peter's step (elevation + Hyper-V).
+    - OI-6 — **C: free space is tight (~9GB)** after this session's ISO
+      download/repack smoke test — WSL2's `ext4.vhdx` grew and does not
+      auto-shrink on file deletion (see vmtest/README.md §2 for the
+      reclaim-it steps: `wsl --shutdown` + `Optimize-VHD`/`diskpart compact`,
+      elevated). Not urgent, but worth doing before further large downloads.
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)
@@ -312,3 +323,87 @@ standalone with `sim/mini-serv-sim/run-backup-sim.sh --shares-only` (needs
 `sim/run-sim.sh` first for the shared `awow-sim_default` network); shares are
 `//mini-serv/{minecraft,satisfactory,icedrive}`, user `awow` / `simpass`,
 minecraft+satisfactory exported READ-ONLY (live-share-stays-read-only rule).
+
+### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.18 V3 gate — ISO/VM scripts)
+Built `vmtest/` (agent delivers scripts + docs; **the boot itself is Peter's** —
+needs an elevated PowerShell session + the Hyper-V Windows feature, both
+machine-level, neither touched here):
+
+- **`vmtest/build-seed.sh`** — LIGHT path (default): renders the REAL
+  `stack/autoinstall/user-data`+`meta-data` with SIM values (ephemeral
+  ed25519 keypair, random SIM console password, unchanged storage/late-
+  commands logic), copies the repo into a `deploy-payload/` tree with a SIM
+  `.env` (fictional domain/OAuth client, real-shaped throwaway oauth2-proxy
+  cookie secret + Technitium password, real Caddy bcrypt basic_auth hashes via
+  `docker run caddy hash-password`), and burns a small `CIDATA`-labeled seed
+  ISO with `genisoimage`/`xorriso`. No repack of the stock ISO — Ubuntu's
+  NoCloud datasource auto-detects any attached CIDATA-labeled media (same
+  mechanism `stack/README.md`'s "Second USB" already documents).
+- **`vmtest/build-repacked-iso.sh`** — HEAVIER fallback: same SIM rendering,
+  but bakes `autoinstall ds=nocloud;s=/cdrom/nocloud/` into a patched copy of
+  the stock ISO's `/boot/grub/grub.cfg` (via `xorriso -boot_image any
+  replay`, which reuses the ORIGINAL hybrid BIOS+UEFI El Torito boot catalog
+  rather than hand-rebuilding one) plus embedded `/nocloud/` +
+  `/deploy-payload/` — truly zero-keypress, at the cost of ~3.4GB
+  copied/rewritten per build.
+- **`vmtest/New-AwowVm.ps1`** / **`Remove-AwowVm.ps1`** — Hyper-V Gen2 VM
+  (4 vCPU/8GB static RAM stand-in for the AK41, 64GB dynamic VHDX,
+  `MicrosoftUEFICertificateAuthority` Secure Boot template for the Ubuntu
+  shim, Default Switch/NAT by default with a documented External-switch
+  option for real LAN exposure). Idempotent, `-WhatIf` support, elevation
+  asserted at the top. **Never run** (elevation + Hyper-V are Peter's call).
+- **`vmtest/README.md`** — the V3 runbook: ISO strategy write-up (why the
+  light path needs one manual GRUB keypress and the heavy path doesn't, with
+  the exact edit to make), the 24.04.4 download URL + SHA256 (verified for
+  real, see below), Hyper-V enable steps, run order, what "success" looks
+  like (tracker legitimately can't reach healthy without staging
+  `naglight:local` separately — a pre-existing gap, not new; documented which
+  `stack/README.md` §6 burn-in items do/don't apply in a VM), and the
+  VM-vs-hardware deltas (NAT vs LAN IP, no real ACME/OAuth/DDNS, no USB
+  backup drives, no thermal/storage checks).
+
+**RAN FOR REAL (honest ledger):**
+- `build-seed.sh` — run twice (fresh + idempotent re-run). Output validated:
+  `user-data` parses as YAML (`python3 -c 'yaml.safe_load(...)'`), the SSH
+  placeholder/password/hostname substitutions land correctly, `meta-data` gets
+  a fresh `instance-id`, the SIM `.env` renders correct values (spot-checked
+  `DOMAIN`, `LAN_IP`, `ACME_EMAIL`, real Caddy bcrypt hashes, cookie secret),
+  `isoinfo` confirms volume label `CIDATA` and the right files at the ISO
+  root. Idempotent re-run reused the SSH key + all SIM secrets unchanged
+  (verified byte-identical across runs) — this caught and fixed a real bug
+  (below).
+- `build-repacked-iso.sh` — downloaded the real
+  `ubuntu-24.04.4-live-server-amd64.iso` (SHA256
+  `e907d92eeec9df64163a7e454cbc8d7755e8ddc7ed42f99dbc80c40f1a138433`, verified
+  byte-for-byte against `releases.ubuntu.com/24.04/SHA256SUMS`) and ran the
+  full repack. Confirmed: `/boot/grub/grub.cfg` in the output carries
+  `autoinstall ds=nocloud;s=/cdrom/nocloud/` on both boot entries;
+  `xorriso -report_el_torito plain` shows BOTH a BIOS and a UEFI boot image
+  still present (the "replay" trick preserved the hybrid boot catalog);
+  `/nocloud/{user-data,meta-data}` and `/deploy-payload/` present and correct
+  inside the ISO.
+- `python scripts/check.py` / `validate_config.py` still PASS unchanged (G1
+  green) after adding `vmtest/`.
+
+**NOT run (honest gap, by design/scope):** `New-AwowVm.ps1`,
+`Remove-AwowVm.ps1` — need elevation + the Hyper-V feature, an agent doesn't
+make that call. **No VM has been booted from either ISO.** The GRUB-edit
+mechanism (light path) and the El-Torito-preserving repack (heavy path) are
+verified at the ISO-structure level only, not by an actual boot.
+
+**Real bug the smoke test caught + FIXED:** the shared secrets file
+(`vmtest/.out/secrets/creds.env`) was being re-read via `. "$creds_file"`
+(bash `source`) on idempotent re-runs; the SHA-512 password hash it holds
+contains `$6$...` crypt syntax, which bash tried to expand as positional
+parameters under `set -u`, aborting with `line 8: $6: unbound variable`.
+Fixed by extracting values with `grep`/`cut` instead of sourcing. Also folded
+what had been a per-call, unbounded-growth `>>` append of the Technitium
+password + oauth2-proxy cookie secret into the same once-generated,
+idempotently-reused block as the SSH key and console password.
+
+**Side effect flagged for Peter (OI-6 above):** downloading + repacking the
+~3.4GB ISO (even under a WSL-native path, not `/mnt/c`) grew WSL2's
+`ext4.vhdx` — which itself lives on `C:` — from ~21GB free down to ~9GB, and
+deleting the files afterward did **not** give the space back (a known WSL2
+quirk: the sparse vhdx doesn't auto-shrink). Reclaim steps are in
+`vmtest/README.md` §2.

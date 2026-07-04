@@ -40,3 +40,12 @@ stack/docker-compose.override.yml
 stack/caddy_data/
 stack/caddy_config/
 
+# ── V3 gate: local Hyper-V VM smoke-test harness (WI-10.18) ──────────────────
+# Everything build-seed.sh / build-repacked-iso.sh produce: the rendered
+# SIM user-data/meta-data/.env, the deploy-payload repo copy, the ephemeral
+# SSH keypair, the SIM console/Technitium/oauth2-proxy secrets, the seed ISO,
+# and (if downloaded/repacked for a smoke test) the multi-GB Ubuntu ISOs.
+# NONE of this is ever committed — regenerate with the vmtest/ scripts.
+vmtest/.out/
+vmtest/*.iso
+

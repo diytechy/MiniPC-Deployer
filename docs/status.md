@@ -215,3 +215,52 @@ directly.
 
 **Remaining for Peter:** none — no reboot, no interactive prompt was needed.
 Wave 2's V1 AWOW-sim (WI-10.14/10.15) is now unblocked.
+
+### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.14 AWOW-sim harness + V1 gate)
+Built `sim/` as a compose **overlay over the real `stack/docker-compose.yml`**
+(never a fork): `docker-compose.sim.yml` + `.env.sim` (all fictional), a mock
+**Dex** OIDC provider (2 static users) swapped in for Google, Caddy on an
+**internal CA**, Technitium moved to the bridge with an alt API port, ddns + aux
+containers neutralised, a `simclient` probe box, and multi-user fixture seed
+data. `sim/run-sim.sh` brings it up and provisions the Technitium split-horizon
+zone; `sim/validate-sim.sh` is the V1 gate. **RAN IT FOR REAL** on WSL2/docker
+29.6.1 — full gate output:
+
+```
+-- (1) service health --   technitium/caddy/tracker/actual healthy; init-perms exit=0;
+                           oauth2-proxy /ping=200 & dex discovery=200 (distroless, no HC)
+-- (2) split-horizon DNS -- dig @technitium {tracker,actual,apex}.homelab.sim -> 10.99.0.10
+-- (3) Caddy vhosts + auth -- tracker (internal CA) -> 302 to Dex; actual -> 401 no-auth, 200 w/ auth
+-- (4) oauth2-proxy + Dex -- FULL headless login (curl cookie-jar) -> authenticated tracker 200
+-- (5) multi-user isolation -- A/B see only own data; no-identity -> 403; A export = only A's items
+-- (6) /api/feed round-trip -- ok=true->done, ok=false->cleared, ok=true->done
+== V1 GATE: PASS (all checks green) ==
+```
+
+**Real bugs the sim caught in the wave-1 config (all FIXED in the base compose,
+never before RUN):**
+- **tracker healthcheck** was `/api/today` — returns **403** in multi-user mode
+  (the D3 default), so the container could never report healthy. Fixed to
+  `/healthz` (identity-free in both modes; matches the NagLight Dockerfile).
+- **oauth2-proxy healthcheck** used `wget` but the stock image is **distroless**
+  (no shell/wget) — the probe could never run and blocked Caddy. Removed the
+  container healthcheck (probe `/ping` from outside) and changed Caddy's
+  dependency to `service_started`.
+- **technitium + actual healthchecks** used `wget`, absent from both images
+  (they ship bash, not wget). Fixed to a tool-independent bash `/dev/tcp` probe.
+
+**FLAGGED FOR PETER (a NagLight repo fix, out of this repo's scope):** the
+`naglight:local` image runs as `USER tracker` (uid 1000) but the `tracker_data`
+named volume initialises **root-owned**, so multi-user `mkdir /data/<sub>` fails
+with EACCES and every request 500s. Correct fix = `mkdir -p /data && chown
+tracker:tracker /data` before `VOLUME` in NagLight's Dockerfile. The sim
+reproduces that end-state with an `init-perms` one-shot so the tracker still runs
+at uid 1000 (faithful to prod) — but the real image should be fixed.
+
+**Sim-vs-real deltas the sim cannot cover (for the hardware burn-in):** real
+Google OAuth consent; publicly-trusted ACME/TLS certs; Technitium binding the
+host's real `:53` (systemd-resolved owns loopback :53 on WSL, hence the bridge +
+alt-port approach — a split-horizon test still runs, `dig @technitium` from the
+client); the AWOW hardware. Aux containers (Kuma/Dozzle/ntfy) and ddns are
+disabled in the sim (LAN_IP binds / zero external calls) — config-validated in
+wave 1, out of the V1 gate scope. Full delta table in `sim/README.md`.

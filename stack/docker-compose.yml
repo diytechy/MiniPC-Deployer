@@ -43,8 +43,11 @@ services:
       - technitium_config:/etc/dns
     restart: unless-stopped
     healthcheck:
-      # The login page on :5380 is the cheapest liveness probe that needs no token.
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5380/ || exit 1"]
+      # The technitium/dns-server image ships bash but NO wget/curl (verified in
+      # the AWOW-sim, WI-10.14), so probe the :5380 console port with bash's
+      # /dev/tcp instead of wget — a tool-independent liveness check that only
+      # succeeds once Technitium is listening.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5380"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -76,7 +79,11 @@ services:
       - caddy_config:/config
     depends_on:
       oauth2-proxy:
-        condition: service_healthy
+        # service_started (not _healthy): oauth2-proxy is distroless and carries
+        # no container healthcheck (see its block). It waits for the tracker to be
+        # healthy before starting, so start-order is still correct; Caddy tolerates
+        # a brief 502 if it races ahead.
+        condition: service_started
     restart: unless-stopped
     healthcheck:
       # Caddy admin API on :2019 is always up when the process is; cheap liveness.
@@ -136,13 +143,13 @@ services:
     expose:
       - "4180"
     restart: unless-stopped
-    healthcheck:
-      # oauth2-proxy serves /ping unauthenticated for liveness.
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4180/ping || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+    # NO container healthcheck: the stock oauth2-proxy image is distroless — it
+    # ships no shell and no wget/curl, so a CMD/CMD-SHELL probe can never run
+    # (verified in the AWOW-sim, WI-10.14). /ping DOES serve an unauthenticated
+    # 200 for liveness; probe it from OUTSIDE the container (Caddy/Uptime-Kuma)
+    # rather than via a container healthcheck. Caddy therefore waits only for this
+    # service to START (below), and oauth2-proxy itself waits for the tracker to
+    # be healthy before it starts, so ordering is still correct.
 
   tracker:
     # NagLight is the canonical build now (its repo owns the Dockerfile, WI-10.4).
@@ -183,9 +190,13 @@ services:
       - "8787"
     restart: unless-stopped
     healthcheck:
-      # /api/today is the JSON health surface; a 200 means the engine loaded the
-      # definitions and can score the day.
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8787/api/today || exit 1"]
+      # /healthz is the identity-free liveness surface in BOTH single- and
+      # multi-user mode (matches the NagLight Dockerfile HEALTHCHECK). It must NOT
+      # be /api/today: in multi-user mode (TRACKER_MULTI_USER=true, the D3 hosted
+      # default) every /api/* route requires the oauth2-proxy X-Forwarded-User
+      # header, so a header-less probe to /api/today returns 403 and the container
+      # would never report healthy. Surfaced by the AWOW-sim (WI-10.14).
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8787/healthz || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -202,7 +213,9 @@ services:
       - "5006"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5006/ || exit 1"]
+      # The actual-server image ships bash but NO wget/curl (verified in the
+      # AWOW-sim, WI-10.14) — probe :5006 with bash's /dev/tcp instead of wget.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5006"]
       interval: 30s
       timeout: 5s
       retries: 5

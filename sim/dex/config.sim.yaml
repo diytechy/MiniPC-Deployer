@@ -1,0 +1,41 @@
+# Dex mock-OIDC config (WI-10.14) — stands in for Google in the sim ONLY.
+# Everything here is FICTIONAL and committable. The real deploy uses Google;
+# oauth2-proxy's provider is swapped to `oidc` pointing at this issuer by the
+# sim overlay (see sim/docker-compose.sim.yml).
+
+issuer: http://dex:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+# Static client for oauth2-proxy. id/secret MUST match OAUTH2_PROXY_CLIENT_ID /
+# OAUTH2_PROXY_CLIENT_SECRET in sim/.env.sim.
+staticClients:
+  - id: oauth2-proxy-sim
+    name: oauth2-proxy (sim)
+    secret: sim-oauth2-proxy-secret-fictional
+    redirectURIs:
+      - https://tracker.homelab.sim/oauth2/callback
+
+# Two fictional test users. `userID` becomes the OIDC `sub` claim, which
+# oauth2-proxy forwards as X-Forwarded-User — NagLight keys each user's isolated
+# data dir off it. Distinct userIDs => distinct data dirs (the isolation proof).
+# Passwords are the fictional "simpass123" (bcrypt below).
+enablePasswordDB: true
+staticPasswords:
+  - email: alice@homelab.sim
+    username: alice
+    userID: sim-user-alice-0001
+    hash: "$2a$14$4gZzgRhymdhAIS33mSrOruHtUUic2W6Osk5oCGtaNivwX8ahVmiFO"
+  - email: bob@homelab.sim
+    username: bob
+    userID: sim-user-bob-0002
+    hash: "$2a$14$4gZzgRhymdhAIS33mSrOruHtUUic2W6Osk5oCGtaNivwX8ahVmiFO"
+
+oauth2:
+  # Skip the "Grant access?" screen so the headless curl login flow (check 4)
+  # doesn't need to POST an approval — the redirect goes straight to the callback.
+  skipApprovalScreen: true

@@ -1,0 +1,127 @@
+# AWOW-sim overlay (WI-10.14) — a COMPOSE OVERLAY over the REAL stack, never a
+# fork. Bring up with:
+#
+#   docker compose -f stack/docker-compose.yml -f sim/docker-compose.sim.yml \
+#                  --env-file sim/.env.sim up -d
+#
+# (sim/run-sim.sh does exactly this.) The project directory is stack/ (the dir of
+# the FIRST -f file), so the base file's `./caddy/...` paths still resolve and
+# this overlay reaches the sim tree via `../sim/...`.
+#
+# What the overlay changes, and the exact REAL↔SIM delta for each (documented in
+# docs/status.md WI-10.14):
+#   technitium  host-net :53  ->  bridge + alt API port (systemd-resolved owns
+#                                 loopback :53 on WSL; can't share host :53)
+#   oauth2-proxy provider=google -> provider=oidc, issuer=Dex (mock Google)
+#   caddy       ACME public certs -> local_certs internal CA (Caddyfile.sim);
+#                                 gains network aliases so the client resolves
+#                                 the vhost names to Caddy
+#   ddns        real Cloudflare -> DISABLED (profile sim-disabled): zero calls
+#   aux (kuma/dozzle) LAN_IP binds -> DISABLED (out of V1 gate scope)
+#   + dex        NEW sim-only mock OIDC provider (2 static users)
+#   + simclient  NEW sim-only probe box (dig/curl/jq) the gate execs into
+
+services:
+  # ── Technitium: host-net -> bridge with an alt host-mapped API port ─────────
+  # !reset removes the base `network_mode: host` so the service can join the
+  # default bridge network (compose forbids network_mode + networks together).
+  # DNS stays on container :53 (the client queries it as `dig @technitium`); only
+  # the API is host-published so the provisioner can reach it from the WSL host.
+  technitium:
+    network_mode: !reset null
+    ports:
+      - "127.0.0.1:${SIM_TECHNITIUM_API_PORT}:5380"
+
+  # ── Dex: local mock OIDC provider standing in for Google (sim-only) ─────────
+  dex:
+    image: ${SIM_DEX_IMAGE}
+    container_name: dex
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ../sim/dex/config.sim.yaml:/etc/dex/config.yaml:ro
+    expose:
+      - "5556"
+    restart: unless-stopped
+    # NOTE: the upstream Dex image is distroless (no shell/wget) so it carries no
+    # compose healthcheck. oauth2-proxy performs OIDC discovery against it at
+    # startup, so oauth2-proxy becoming HEALTHY transitively proves Dex is up;
+    # the gate also asserts Dex's discovery endpoint from the client (check 4).
+
+  # ── oauth2-proxy: swap Google -> Dex OIDC. REAL deploy keeps provider=google ─
+  oauth2-proxy:
+    environment:
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_OIDC_ISSUER_URL: http://dex:5556/dex
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"          # straight to Dex, skip o2p's own page
+      OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL: "true"
+    depends_on:
+      dex:
+        condition: service_started
+    volumes: !override
+      - ../sim/oauth2-proxy/authenticated-emails.sim.txt:/etc/oauth2-proxy/authenticated-emails.txt:ro
+
+  # ── Caddy: internal CA + vhost aliases so the client resolves them to Caddy ──
+  caddy:
+    volumes: !override
+      - ../sim/caddy/Caddyfile.sim:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      default:
+        aliases:
+          - ${TRACKER_SUBDOMAIN}.${DOMAIN}
+          - ${ACTUAL_SUBDOMAIN}.${DOMAIN}
+          - dns.${DOMAIN}
+          - ${DOMAIN}
+
+  # ── init-perms: chown the tracker_data volume to the tracker uid (1000) ──────
+  # FINDING surfaced by the sim: the naglight:local image runs as USER tracker
+  # (uid 1000) but the named `tracker_data` volume initialises ROOT-owned, so in
+  # multi-user mode the engine's `mkdir /data/<sub>` fails with EACCES and every
+  # request 500s. The correct fix belongs in NagLight's Dockerfile
+  # (`mkdir -p /data && chown tracker:tracker /data` before VOLUME) — flagged for
+  # Peter. This one-shot reproduces that end-state so the sim can run the tracker
+  # AT uid 1000 (faithful to prod), rather than papering over it with user:root.
+  init-perms:
+    image: busybox:stable
+    container_name: sim-init-perms
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 1000:1000 /data && echo tracker_data perms fixed"]
+    volumes:
+      - tracker_data:/data
+    restart: "no"
+
+  # ── tracker: inject the sim API token + seed dir; probe /healthz (multi-user
+  # returns 403 on /api/today without an identity header, so /healthz is the only
+  # valid liveness probe in this mode — the base file is fixed to match). ───────
+  tracker:
+    depends_on:
+      init-perms:
+        condition: service_completed_successfully
+    environment:
+      TRACKER_API_TOKEN: ${SIM_API_TOKEN}
+      TRACKER_SEED_DIR: /seed
+    volumes: !override
+      - tracker_data:/data
+      - ../sim/tracker-seed:/seed:ro
+    healthcheck: !override
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8787/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # ── Client probe box: the gate execs dig/curl/jq in here ────────────────────
+  simclient:
+    image: ${SIM_CLIENT_IMAGE}
+    container_name: simclient
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+
+  # ── Neutralized in the sim ──────────────────────────────────────────────────
+  ddns:
+    profiles: ["sim-disabled"]
+  uptime-kuma:
+    profiles: ["sim-disabled"]
+  dozzle:
+    profiles: ["sim-disabled"]

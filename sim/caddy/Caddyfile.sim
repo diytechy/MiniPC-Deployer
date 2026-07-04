@@ -1,0 +1,55 @@
+# Caddyfile.sim — SIM variant of stack/caddy/Caddyfile (WI-10.14).
+#
+# Structurally IDENTICAL to the real Caddyfile (same vhosts, same auth model:
+# tracker -> oauth2-proxy with NO basic_auth; actual + dns -> basic_auth). Only
+# the two things the sim genuinely cannot reproduce differ, and each is a
+# documented REAL↔SIM delta:
+#
+#   1. TLS: `local_certs` (Caddy's internal CA) instead of public ACME — a local
+#      box cannot ACME a real public domain. vhost/auth structure is unchanged.
+#   2. dns vhost proxies to `technitium:5380` (a bridge service name here) rather
+#      than `host.docker.internal:5380` — in the sim Technitium is a bridge
+#      container, not host-networked.
+#   3. basic_auth credentials are inlined (fictional bcrypt of "simpass") instead
+#      of `{$VAR}` env indirection, so the sim needs no bcrypt-through-env-file
+#      escaping. The credential is a throwaway sim fixture.
+
+{
+    # Internal CA — self-signed roots minted locally; no ACME, no public domain.
+    local_certs
+}
+
+# ── tracker.<domain> — NagLight via oauth2-proxy (NO basic_auth) — IDENTICAL ──
+{$TRACKER_HOST} {
+    encode zstd gzip
+    reverse_proxy oauth2-proxy:4180 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+    }
+}
+
+# ── actual.<domain> — Actual Budget (KEEP basic_auth) — IDENTICAL structure ───
+{$ACTUAL_HOST} {
+    basic_auth {
+        simadmin $2a$14$Y4yRZbFveiGyoGAGNRPhruhFz7N1uIQBs6UI14hYblEEDLol92hj.
+    }
+    encode zstd gzip
+    reverse_proxy actual:5006
+}
+
+# ── dns.<domain> — Technitium console (KEEP basic_auth) ───────────────────────
+# DELTA: sim Technitium is a bridge container -> proxy to `technitium:5380`
+# (real Caddyfile uses host.docker.internal:5380 for the host-net container).
+dns.{$DOMAIN} {
+    basic_auth {
+        simadmin $2a$14$Y4yRZbFveiGyoGAGNRPhruhFz7N1uIQBs6UI14hYblEEDLol92hj.
+    }
+    encode zstd gzip
+    reverse_proxy technitium:5380
+}
+
+# ── apex — bare domain answers on-LAN too — IDENTICAL ─────────────────────────
+{$DOMAIN} {
+    respond "AWOW always-on core (SIM). Try https://{$TRACKER_HOST}" 200
+}

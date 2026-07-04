@@ -16,6 +16,11 @@ Services (all health-checked, all `restart: unless-stopped`):
 - **tracker** — the **NagLight** web container (`naglight:local`), multi-user via
   trusted headers (D3).
 - **Actual Budget** — finances on its own subdomain, behind `basic_auth`.
+- **ddns** — Cloudflare dynamic-DNS updater (qmcgaw/ddns-updater): keeps the
+  apex + wildcard A records pointed at the home IP, checked every
+  `DDNS_PERIOD` (default 5m). Replaces the legacy DDNS-Cloudflare-PowerShell
+  scripts on Mini-serv (WI-9 Q4). Needs a NEW scoped Cloudflare token — the
+  old share token is rotation-flagged (see `.env.example`).
 - **Uptime-Kuma · Dozzle · (ntfy)** — auxiliary LAN-only observability
   (WI-10.11); see §8.
 

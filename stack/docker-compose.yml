@@ -7,6 +7,8 @@
 #                 split-horizon)
 #   tracker     — the NagLight web container (image naglight:local, WI-10.1/10.4)
 #   actual      — Actual Budget (finances)
+#   ddns        — Cloudflare dynamic-DNS updater (apex + wildcard A records
+#                 follow the home IP; AWOW owns DDNS per WI-9 Q4)
 #
 # Every knob is in .env (copy .env.example -> .env). No secret or site-specific
 # value is baked into this file; it is safe to commit.
@@ -206,6 +208,32 @@ services:
       retries: 5
       start_period: 20s
 
+  # ── ddns — keep the public A records pointed at the home connection ──────────
+  # Gap Peter caught 2026-07-04: DDNS previously ran on Mini-serv as the legacy
+  # DDNS-Cloudflare-PowerShell scripts; per WI-9 Q4 the AWOW owns it now, and the
+  # stack had no updater at all. Without this, a home-IP change strands the whole
+  # external path (Caddy/ACME included).
+  # Updates the apex AND the wildcard record so every subdomain follows along.
+  # Healthcheck: inherited from the image (distroless; it ships its own
+  # HEALTHCHECK binary — do not add a CMD-SHELL probe, there is no shell).
+  # Web UI is deliberately NOT published; logs via `docker logs ddns` / Dozzle.
+  ddns:
+    image: qmcgaw/ddns-updater:${DDNS_IMAGE_TAG}
+    container_name: ddns
+    environment:
+      PERIOD: ${DDNS_PERIOD}
+      UPDATE_COOLDOWN_PERIOD: 5m
+      PUBLICIP_FETCHERS: all
+      LISTENING_ADDRESS: ":8000"
+      CONFIG: >-
+        {"settings":[
+        {"provider":"cloudflare","zone_identifier":"${CLOUDFLARE_ZONE_ID}","domain":"${DOMAIN}","ttl":300,"token":"${CLOUDFLARE_API_TOKEN}","ip_version":"ipv4"},
+        {"provider":"cloudflare","zone_identifier":"${CLOUDFLARE_ZONE_ID}","domain":"*.${DOMAIN}","ttl":300,"token":"${CLOUDFLARE_API_TOKEN}","ip_version":"ipv4"}
+        ]}
+    volumes:
+      - ddns_data:/updater/data
+    restart: unless-stopped
+
   # ── Auxiliary LAN-only observability (WI-10.11) ───────────────────────────────
   # These management UIs are published bound to the box's LAN_IP only (not to
   # 0.0.0.0), so they are reachable on the LAN but NOT proxied to the public
@@ -270,6 +298,7 @@ services:
       start_period: 10s
 
 volumes:
+  ddns_data:
   technitium_config:
   caddy_data:
   caddy_config:

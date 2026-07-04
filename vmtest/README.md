@@ -7,15 +7,56 @@ boot run is **Peter's** (needs an elevated PowerShell session and the Hyper-V
 Windows feature — machine-level changes an agent doesn't make unilaterally).
 
 **Honest status:** the scripts below were written and smoke-tested in WSL —
-`build-seed.sh` was run for real (twice, including its idempotent re-run path)
-and its output (user-data YAML, meta-data, deploy-payload, SIM `.env`) was
-inspected and validated. `build-repacked-iso.sh` was also run for real against
-an actual `ubuntu-24.04.4-live-server-amd64.iso` (SHA256-verified download) —
-the repacked ISO was confirmed to still carry both a BIOS and a UEFI El Torito
-boot image and to contain `/nocloud/` + `/deploy-payload/` correctly. **Nobody
-has booted a VM from either ISO** — `New-AwowVm.ps1` / `Remove-AwowVm.ps1` need
-elevation + the Hyper-V feature and were deliberately never run (see
-docs/status.md, WI-10.18 entry, for the full ledger).
+`build-seed.sh` was run for real (including with the Q10.9 B+ image payload; its
+output — user-data YAML, meta-data, deploy-payload, SIM `.env`, and the 9 baked
+image tars — was inspected and validated), and `export-images.sh` was run
+end-to-end (all 9 stack images docker-saved + docker-load-verified as idempotent
+no-ops). `build-repacked-iso.sh` was run for real in WI-10.18 against an actual
+`ubuntu-24.04.4-live-server-amd64.iso` (SHA256-verified) — the repacked ISO was
+confirmed to still carry both a BIOS and a UEFI El Torito boot image and to
+contain `/nocloud/` + `/deploy-payload/`; the Q10.9 B+ addition (images folded
+into `/deploy-payload/images/`) was separately verified via the exact `xorriso
+-map` codepath. **Nobody has booted a VM from either ISO** — `New-AwowVm.ps1` /
+`Remove-AwowVm.ps1` need elevation + the Hyper-V feature and were deliberately
+never run. The actual first-boot `docker load` run is part of the V3 boot
+(Peter's step). See docs/status.md for the full ledger.
+
+## 0. Q10.9 B+ — the image payload (bake EVERY container "from infancy")
+
+Per Peter's locked Q10.9 B+ decision, a freshly-imaged AWOW comes up with EVERY
+stack container image already present — **zero registry/internet dependency for
+container images at first boot**, versions pinned to exactly what the AWOW-sim
+validated. The flow:
+
+```
+vmtest/export-images.sh          # docker save every pinned image -> vmtest/.out/images/*.tar
+   │  (resolves the set from docker-compose.yml + the PINNED tags in .env.example)
+   ▼
+build-seed.sh / build-repacked-iso.sh
+   │  stage_images_into_payload() folds the tars into deploy-payload/images/
+   ▼
+seed.iso / repacked.iso          # /deploy-payload/images/*.tar rides on the ISO
+   ▼
+autoinstall late-commands        # cp -a /cdrom/deploy-payload/. -> /opt/awow-core/
+   ▼
+/opt/awow-core/images/*.tar
+   ▼
+firstboot.sh step 3              # docker load each tar (idempotent) BEFORE compose up
+```
+
+**Size:** the current pinned set is **9 images ≈ 470 MB of tars** (docker save
+already writes compressed layer blobs, so it is far smaller than the ~1–2 GB
+Peter estimated — a plain `.tar` per image, no zstd needed; see
+`export-images.sh` header for the measurement). The **light** seed ISO therefore
+grows from ~1 MB to **~470 MB** (still a small add-on to the unmodified stock
+ISO); the **repacked** ISO grows from ~3.4 GB to **~3.9 GB**. Both fit a USB with
+room to spare.
+
+**Build order:** run `export-images.sh` **before** `build-seed.sh` /
+`build-repacked-iso.sh`. If you skip it, the build still succeeds but warns
+loudly that the payload carries no images, and the VM falls back to pulling at
+first boot (needs internet — and `naglight:local` has no registry home, so the
+tracker would fail). Rebuild the payload whenever you bump a pinned tag.
 
 ---
 
@@ -122,9 +163,15 @@ vhdx on the host without an explicit compact). If `C:` is tight (check with
 
 cd /path/to/MiniPC-Deployer
 
+# STEP 0 (Q10.9 B+): bake every stack image into the payload FIRST.
+# Build naglight:local beforehand (it has no registry home):
+#   docker build -t naglight:local ../NagLight
+bash vmtest/export-images.sh
+# -> vmtest/.out/images/*.tar (9 images ≈ 470MB) + images.manifest.tsv
+
 # LIGHT path (default, recommended):
 bash vmtest/build-seed.sh
-# -> vmtest/.out/seed.iso
+# -> vmtest/.out/seed.iso   (now ~470MB — carries the image payload)
 
 # HEAVIER path (only if you need zero-keypress):
 bash vmtest/build-repacked-iso.sh --src-iso /mnt/d/iso/ubuntu-24.04.4-live-server-amd64.iso \
@@ -140,7 +187,10 @@ Both scripts:
   under `vmtest/.out/ssh/`, and a random SIM console password — see
   `vmtest/.out/secrets/creds.env`, gitignored, `chmod 600`).
 - Copy the whole repo into a `deploy-payload/` tree (what the real
-  `late-commands` expect at `/cdrom/deploy-payload/`), with a **SIM `.env`**
+  `late-commands` expect at `/cdrom/deploy-payload/`), **plus fold the
+  docker-save image tars from `export-images.sh` into `deploy-payload/images/`**
+  (Q10.9 B+ — hardlinked when the filesystem allows, to save C: space per OI-6),
+  with a **SIM `.env`**
   materialized from `stack/.env.example` — fictional domain, fictional Google
   OAuth client, a real-shaped (but throwaway) oauth2-proxy cookie secret, a
   random Technitium admin password, and real Caddy bcrypt basic_auth hashes
@@ -231,12 +281,16 @@ vmconnect localhost AWOW-VMTest
    (HEAVIER path: skip this, the repacked ISO already boots straight through.)
 3. Subiquity partitions the disk (whole-disk LVM), creates the `operator`
    user, installs Docker + Cockpit + unattended-upgrades, copies
-   `deploy-payload/` to `/opt/awow-core/`, seeds `.env` (already filled with
-   SIM values — no placeholder-seed step triggers), installs + enables
+   `deploy-payload/` to `/opt/awow-core/` (**including `images/` — the baked
+   container image tars, Q10.9 B+**), seeds `.env` (already filled with SIM
+   values — no placeholder-seed step triggers), installs + enables
    `awow-firstboot.service`, and reboots on its own (`shutdown: reboot` in
    `user-data` — no confirmation).
 4. On first real boot, `awow-firstboot.service` runs `firstboot.sh`
-   automatically (systemd `oneshot`, `TimeoutStartSec=1800`).
+   automatically (systemd `oneshot`, `TimeoutStartSec=1800`): it **`docker
+   load`s every tar from `/opt/awow-core/images/` (step 3 of firstboot) before
+   `docker compose up -d`**, so the stack starts entirely from the baked images
+   with no registry pulls.
 
 You can log in at the console at any point with user `operator` and either the
 SIM password from `vmtest/.out/secrets/creds.env`, or
@@ -257,25 +311,23 @@ docker compose -f /opt/awow-core/stack/docker-compose.yml ps
 
 **Minimum V3 success (the actual gate):**
 - `awow-firstboot.service` reports `SUCCESS` (`systemctl status
-  awow-firstboot` — oneshot, `RemainAfterExit=yes`).
-- `docker compose ps` shows **technitium**, **caddy**, and **actual**
-  `healthy` (their healthchecks don't depend on anything the VM can't
-  provide).
-- **tracker will legitimately fail to come up** — `docker-compose.yml`'s
-  `tracker` service is `image: naglight:local`, a purely local tag with no
-  registry. `deploy-payload/` only carries MiniPC-Deployer, not a NagLight
-  checkout (matches production: `stack/README.md` §1 already calls "Build the
-  NagLight image" a separate manual step done before bring-up). **This is
-  expected, not a VM-test failure.** To also get tracker green, before/after
-  first boot, on the VM:
-  ```sh
-  git clone https://github.com/<you>/NagLight /opt/NagLight   # or scp a checkout in
-  docker build -t naglight:local /opt/NagLight
-  cd /opt/awow-core/stack && docker compose up -d tracker oauth2-proxy caddy
-  ```
-  (or `docker save`/`docker load` the `naglight:local` image already built on
-  the dev PC's WSL per WI-10.13, if you'd rather not clone again inside the
-  VM).
+  awow-firstboot` — oneshot, `RemainAfterExit=yes`). Its log (`journalctl -u
+  awow-firstboot`) shows **"loading N baked image tar(s)"** and a `docker load`
+  line per image (Q10.9 B+) BEFORE `docker compose up -d`.
+- `docker compose ps` shows **technitium**, **caddy**, **actual**, AND
+  **tracker** `healthy` — every image (including `naglight:local`) was baked
+  into the payload and `docker load`ed at first boot, so nothing needs a
+  registry.
+- **Q10.9 B+ closed the old tracker gap.** Previously this doc warned that
+  tracker would "legitimately fail to come up" because `naglight:local` has no
+  registry and the payload didn't carry it. That gap is now **closed by
+  design**: `export-images.sh` docker-saves `naglight:local` (and every other
+  stack image) into `deploy-payload/images/`, and `firstboot.sh` docker-loads
+  them before compose up. No manual NagLight clone/build inside the VM is needed
+  anymore — provided you ran `export-images.sh` before building the ISO (with
+  `naglight:local` already built on the dev PC, WI-10.13). If you skip
+  `export-images.sh`, firstboot logs the loud no-payload fallback and tracker
+  reverts to the old failure mode.
 - **oauth2-proxy** has no container healthcheck (by design, see
   `docker-compose.yml` comment — the stock image is distroless); it should be
   `Up`, not crash-looping.
@@ -291,7 +343,7 @@ docker compose -f /opt/awow-core/stack/docker-compose.yml ps
 
 | Check | Applies in VM? |
 |---|---|
-| 48h uptime, no restarts | Yes (technitium/caddy/actual); tracker excluded per above |
+| 48h uptime, no restarts | Yes — technitium/caddy/actual/tracker all baked & loaded (Q10.9 B+) |
 | DNS under load (`dig`/`dnsperf`) | Yes, **from inside the VM** (`dig @127.0.0.1`) |
 | Thermals / throttling | **No** — no real hardware to thermal-throttle |
 | Storage health (`smartctl`) | **No** — virtual disk, not eMMC/SSD |
@@ -339,10 +391,12 @@ error.
 ```
 vmtest/
   README.md               this file
-  build-seed.sh           LIGHT path: stock ISO + small CIDATA seed ISO
-  build-repacked-iso.sh   HEAVIER path: one self-contained ISO (fallback)
-  lib/common.sh           shared rendering logic (sourced, not run directly)
+  export-images.sh        Q10.9 B+: docker save every pinned stack image -> .out/images/*.tar
+  build-seed.sh           LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
+  build-repacked-iso.sh   HEAVIER path: one self-contained ISO (fallback; folds in the payload)
+  lib/common.sh           shared rendering + stage_images_into_payload (sourced, not run directly)
   New-AwowVm.ps1          create the Hyper-V VM (elevation required; NOT run by an agent)
   Remove-AwowVm.ps1       companion teardown (elevation required; NOT run by an agent)
   .out/                   gitignored — everything the build scripts generate
+  .out/images/            gitignored — the docker-save image tars + manifest
 ```

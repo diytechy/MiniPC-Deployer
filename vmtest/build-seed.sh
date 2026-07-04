@@ -54,6 +54,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REPO_ROOT="$(repo_root)"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/vmtest/.out}"
+# Q10.9 B+: where export-images.sh put the docker-save tars (its default).
+IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -72,9 +74,16 @@ else
     die "need genisoimage or xorriso. Install with: sudo apt-get install -y genisoimage xorriso"
 fi
 
-require_free_gb "$(dirname "$OUT_DIR")" 1   # seed ISO + payload is small (<50MB); 1GB margin is generous
+# With the Q10.9 B+ ALL-IMAGES payload, the seed grows from ~1MB to ~1GB: size
+# the check for the staged payload copy + the resulting seed ISO (+ margin).
+# (Without an images payload the seed is still tiny; 4GB is just safe headroom.)
+require_free_gb "$(dirname "$OUT_DIR")" 4
 
 render_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-seed.sh"
+
+# Q10.9 B+ ALL-IMAGES: fold the docker-save tars into deploy-payload/images/ so
+# the CIDATA seed carries every container image (it just gets big — see README).
+stage_images_into_payload "$OUT_DIR" "$IMAGES_OUT"
 
 SEED_ISO="$OUT_DIR/seed.iso"
 log "building $SEED_ISO with $ISO_TOOL (volume label CIDATA)"

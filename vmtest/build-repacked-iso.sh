@@ -47,6 +47,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REPO_ROOT="$(repo_root)"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/vmtest/.out}"
+# Q10.9 B+: where export-images.sh put the docker-save tars (its default).
+IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
 SRC_ISO=""
 EXPECTED_SHA256=""
 
@@ -65,7 +67,7 @@ done
 
 require_cmd xorriso "Install with: sudo apt-get install -y xorriso"
 
-require_free_gb "$(dirname "$OUT_DIR")" 8   # source (~3.5GB) + output (~3.5GB) + margin
+require_free_gb "$(dirname "$OUT_DIR")" 10  # source (~3.5GB) + output (~3.5GB + ~1GB Q10.9 B+ images) + margin
 
 log "computing SHA256 of $SRC_ISO (this reads the whole ~3GB file, takes a bit)"
 ACTUAL_SHA256="$(sha256sum "$SRC_ISO" | awk '{print $1}')"
@@ -84,6 +86,11 @@ mkdir -p "$OUT_DIR"
 # ── 1. render the SIM user-data/meta-data/.env + deploy-payload (shared with
 #      build-seed.sh) ────────────────────────────────────────────────────────
 render_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
+
+# Q10.9 B+ ALL-IMAGES: fold the docker-save tars into deploy-payload/images/.
+# The `-map "$NOCLOUD_DIR/deploy-payload" /deploy-payload` below carries the whole
+# deploy-payload dir (images and all) into the ISO's /deploy-payload/ area.
+stage_images_into_payload "$OUT_DIR" "$IMAGES_OUT"
 
 # ── 2. stage a /nocloud directory (xorriso -map wants one disk dir per iso
 #      dir; iso-root/ from render_seed_tree already has user-data+meta-data

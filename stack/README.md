@@ -66,6 +66,36 @@ docker build -t naglight:local ../../NagLight   # adjust path to your checkout
 
 (or uncomment the `build:` fallback in `docker-compose.yml`).
 
+### Image delivery to the AWOW — Q10.9 B+ (ALL-IMAGES, baked into the ISO)
+
+The AWOW does **not** pull any image from a registry at first boot. Per Peter's
+locked **Q10.9 B+** decision, EVERY stack image — the locally-built
+`naglight:local` **and** every public image (technitium, caddy, oauth2-proxy,
+actual, ddns, uptime-kuma, dozzle, ntfy) — is `docker save`d into the ISO deploy
+payload and `docker load`ed at first boot. So a freshly-imaged box comes up "from
+infancy": **zero registry/internet dependency for container images**, versions
+pinned (in `.env.example`, see the "Image tags" block) to exactly what the
+AWOW-sim validated. What boots == what was validated; no drift from moving
+`latest` tags.
+
+Mechanism (see `../vmtest/`):
+
+```
+vmtest/export-images.sh   ->  docker save each pinned image -> deploy-payload/images/*.tar
+autoinstall late-commands ->  copy deploy-payload/ -> /opt/awow-core/ (images and all)
+autoinstall/firstboot.sh  ->  docker load /opt/awow-core/images/*.tar  BEFORE  compose up
+```
+
+The full pin set + registry digests are recorded in `../docs/status.md`. Bump a
+pin only deliberately, then re-run `export-images.sh` and rebuild the ISO.
+
+**GHCR stays additive-later** (Q10.9 option A): if day-2 update pain ever
+appears, a private registry can be layered on for `compose pull && up -d` over
+SSH — it does not replace the baked payload, which remains the first-boot path.
+`firstboot.sh` also **degrades gracefully**: if a seed is built without the image
+payload, it logs loudly and falls back to pulling public images at compose up
+(and `naglight:local` must then be staged some other way).
+
 ## 2. Prepare `.env`
 
 ```sh
@@ -117,12 +147,16 @@ the stack up.
    datasource:
    - **Second USB (simplest):** label a second stick `CIDATA`; put
      `autoinstall/user-data` and `autoinstall/meta-data` at its root. Copy the
-     whole repo to `deploy-payload/` on that stick (the autoinstall
-     `late-commands` copy `deploy-payload/` into `/opt/awow-core`, so the stack
-     lands at `/opt/awow-core/stack`).
+     whole repo to `deploy-payload/` on that stick, **plus the baked image tars
+     to `deploy-payload/images/`** (Q10.9 B+ — run `vmtest/export-images.sh`
+     first). The autoinstall `late-commands` copy `deploy-payload/` into
+     `/opt/awow-core`, so the stack lands at `/opt/awow-core/stack` and the
+     images at `/opt/awow-core/images` where first-boot `docker load`s them.
    - **One USB (remaster):** unpack the ISO, add `/nocloud/` with
      `user-data` + `meta-data`, add kernel arg
-     `autoinstall ds=nocloud;s=/cdrom/nocloud/`, repack with `xorriso`.
+     `autoinstall ds=nocloud;s=/cdrom/nocloud/`, add `/deploy-payload/` (repo +
+     `images/` tars), repack with `xorriso`. `vmtest/build-repacked-iso.sh`
+     automates exactly this.
 
    > Before writing, **replace the placeholders** in `user-data`: the SHA-512
    > password hash and, ideally, an SSH key (then set `allow-pw: false`). Do

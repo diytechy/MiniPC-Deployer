@@ -88,6 +88,7 @@ last) — it is the record, not required reading for every pass.
 |---|---|
 | `docker compose config` / live bring-up | **PENDING — no Docker on dev box (verified)** |
 | curl health endpoints, `dig`, OAuth round-trip, tear-down | **PENDING — Docker host / the AWOW** |
+| Q10.9 B+ image payload: `export-images.sh` save + `docker load` all 9 | PASS (WSL; loads idempotent) — first-boot load-at-VM awaits V3 |
 | Shell scripts `bash -n` | PASS |
 | `docker-compose.yml`, `meta-data`, `user-data` YAML parse | PASS (PyYAML) |
 | Every compose `${VAR}` has an `.env.example` key | PASS (`validate_config.py`) |
@@ -407,3 +408,101 @@ idempotently-reused block as the SSH key and console password.
 deleting the files afterward did **not** give the space back (a known WSL2
 quirk: the sparse vhdx doesn't auto-shrink). Reclaim steps are in
 `vmtest/README.md` §2.
+
+### DRIVER — G1 — Round 1 — 2026-07-04 (Q10.9 B+ ALL-IMAGES — bake every image into the ISO)
+
+Implemented Peter's locked **Q10.9 B+** decision (HOMELAB_RESTRUCTURE_PLAN.md):
+every stack image is `docker save`d into the ISO deploy payload and `docker
+load`ed at first boot, so a freshly-imaged AWOW comes up "from infancy" with
+**zero registry/internet dependency for container images**, versions pinned to
+exactly what the AWOW-sim validated.
+
+**What was built:**
+- `vmtest/export-images.sh` — resolves the full image set via `docker compose
+  config --images` (from `docker-compose.yml` + the PINNED tags in
+  `.env.example`, ntfy profile included), pulls any image not already local at
+  its pinned tag, and `docker save`s each into `vmtest/.out/images/*.tar` with an
+  `images.manifest.tsv` (ref/id/digest/file/bytes). Fails LOUDLY if any image is
+  missing/unpullable; `naglight:local` (no registry home, Q10.2) must be
+  pre-built or the script aborts — it is the one image the box can never fetch.
+- **Per-image plain `.tar`, no zstd** (measured, justified): `docker save` under
+  the containerd/OCI image store already writes compressed layer blobs — a 526MB
+  actual-server image saves to a ~106MB tar; a zstd pass buys ~nothing and would
+  add an `apt-get install zstd` dependency. Per-image (vs one combined tar) is
+  composable + idempotent and gives firstboot per-image load logging + graceful
+  per-image degrade. (`--zstd` remains available if ever wanted.)
+- `stack/autoinstall/firstboot.sh` — new **step 3**: before `docker compose up`,
+  `docker load` every tar found in `/opt/awow-core/images` (with fallbacks
+  `$STACK_DIR/images`, `/cdrom/deploy-payload/images`,
+  `/media/deploy-payload/images` so it works in either ISO layout). Idempotent;
+  per-tar failures warn-and-continue (compose can still pull). **Graceful
+  degrade:** no payload present → loud NOTICE + fall back to the pre-Q10.9
+  pull-at-compose-up behaviour.
+- Payload wired into **BOTH ISO paths** via a shared `stage_images_into_payload`
+  in `vmtest/lib/common.sh`: it folds `vmtest/.out/images/*.tar` into
+  `deploy-payload/images/` (hardlinked when the fs allows — saves ~470MB of C:,
+  OI-6). The **light** path (`build-seed.sh`) burns that into the CIDATA seed ISO
+  (~1MB → ~470MB); the **repacked** path (`build-repacked-iso.sh`) maps the same
+  `deploy-payload/` dir into the ISO's `/deploy-payload/` (~3.4GB → ~3.9GB).
+  Either way the tars land at `/opt/awow-core/images` for firstboot.
+
+**PIN SET (`latest`/floating → concrete, Q10.9 B+).** `latest` was fine for
+bring-up; B+ makes what-boots == what-was-validated, so floating tags are now
+wrong. Digest = registry index digest as saved (`docker save` under the
+containerd store; see `images.manifest.tsv`):
+
+| Service | `.env` var | was | pinned | registry digest |
+|---|---|---|---|---|
+| technitium | `TECHNITIUM_IMAGE_TAG` | `latest` | `15.2.0` | `sha256:23d3b63d959e997800b095fe93009b3fae271b5258234ff2ade8535cb33682c8` |
+| caddy | `CADDY_IMAGE_TAG` | `2-alpine` | `2.11.4-alpine` | `sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648` |
+| oauth2-proxy | `OAUTH2_PROXY_IMAGE_TAG` | `v7.6.0` | `v7.6.0` (already pinned) | `sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d` |
+| tracker | `TRACKER_IMAGE_TAG` | `local` | `local` (local build, no registry) | id `sha256:9a573d4367032a4d872736718f5dd68872bcf5b1d01d727359ff36413f8f4112` |
+| actual | `ACTUAL_IMAGE_TAG` | `latest` | `26.7.0` | `sha256:e18b7fbfec6157a368fad4146563f397502e9da70a120aeaeac63b4977405d1c` |
+| ddns | `DDNS_IMAGE_TAG` | `latest` | `v2.10.0` | `sha256:3e2aa558946b5a293def4d73008fa4651c072b2c12932cecd02126fb23979831` |
+| uptime-kuma | `UPTIMEKUMA_IMAGE_TAG` | `1` | `1.23.17` | `sha256:3d632903e6af34139a37f18055c4f1bfd9b7205ae1138f1e5e8940ddc1d176f9` |
+| dozzle | `DOZZLE_IMAGE_TAG` | `v8` | `v8.14.12` | `sha256:0df89c904da71e94a0c9ed3c89a890f01488321b5f10ac1e0c0bedcead9af6e4` |
+| ntfy | `NTFY_IMAGE_TAG` | `latest` | `v2.25.0` | `sha256:cfbbb1bac9196cb711e29ef0ac4adaeb033be6235f1df857705dc39c14384a1d` |
+
+**How the concrete tags were derived (honest):** the 5 **core** images ran in
+the V1 AWOW-sim; each concrete pin was verified to be the SAME image V1 ran —
+technitium `latest`'s linux/amd64 sub-manifest is byte-identical to `15.2.0`'s
+(`sha256:85c2cfd4…`), caddy `2-alpine` and actual `latest` share their exact
+index digest with `2.11.4-alpine` / `26.7.0`, oauth2-proxy was already `v7.6.0`,
+naglight is the locally-built `naglight:local`. The 4 **aux** images (ddns,
+uptime-kuma, dozzle, ntfy) were **disabled in the V1 sim** (LAN_IP binds / zero
+external calls), so they have no sim-validated version — they were pinned to
+their current newest concrete releases and exported now; **they are first
+validated at V3 boot / hardware burn-in.** (ddns note: Docker Hub's `latest`
+tag is a differently-built multi-arch index than `v2.10.0`; the named release
+`v2.10.0` was chosen for reproducibility.)
+
+**RAN FOR REAL (WSL2 / docker 29.6.1):**
+- `export-images.sh` end-to-end → pulled the 4 aux images at their pinned tags,
+  re-tagged the 3 core floating→concrete (layers already present, near-instant),
+  saved all 9. **Total payload = 469 MB** across 9 tars (well under Peter's
+  ~1–2GB estimate). Manifest written.
+- `docker load` of all 9 tars → each restored to its exact pinned `repo:tag`
+  and re-loading is an idempotent no-op (proves firstboot step 3's guarantee:
+  compose finds every image locally, no pull).
+- `docker compose config --images` with the pinned `.env.example` → lists
+  exactly the 9 concrete pinned refs (what compose asks for == what's baked).
+- `build-seed.sh` (light path) with the payload → 471 MB seed ISO, volume id
+  `CIDATA`; `isoinfo` confirms all 9 tars + manifest at
+  `/deploy-payload/images/`. Hardlink staging worked (link count 2 — no C: bloat).
+- Repacked path: the Q10.9 addition (images folded into `/deploy-payload/`) was
+  verified via the exact `xorriso -map <dir> /deploy-payload` codepath —
+  `xorriso -lsl` confirms all 9 tars land at `/deploy-payload/images/`. The full
+  3.4GB stock-ISO repack + El-Torito/GRUB handling was already verified in
+  WI-10.18; not re-downloaded (proportionality; C: had 16GB free but the
+  mechanism + trivial one-line addition were already covered).
+- `scripts/check.py` + `validate_config.py` → **PASS** (G1 green; 35 compose
+  vars covered).
+
+**AWAITS V3 (Peter's boot, unchanged):** the actual first-boot `docker load` +
+`compose up` run inside a booted VM/hardware. No VM has been booted. Everything
+above is the pre-boot smoke test the dev PC can run headlessly.
+
+**OI-6 update:** C: now shows ~16GB free (was ~9GB at the snapshot); the image
+tars + seed ISO were written to `vmtest/.out` on `/mnt/c` (real C: via 9p), which
+does **not** grow the WSL `ext4.vhdx`. Only the 4 aux-image pulls (~200MB into
+the docker store) touched the vhdx.

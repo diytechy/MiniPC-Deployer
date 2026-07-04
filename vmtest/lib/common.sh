@@ -162,6 +162,9 @@ render_seed_tree() {
     fi
 
     cp "$stack_env_example" "$sim_env"
+    # NOTE: the SIM .env pins the SAME image tags as .env.example (this is a copy
+    # of it), so the images baked by export-images.sh match what compose asks for.
+    # NOTE: delimiter is '|' throughout — several replacements carry an inline
     # NOTE: delimiter is '|' throughout — several replacements carry an inline
     # '#' YAML/dotenv comment, which would otherwise prematurely terminate a
     # '#'-delimited sed expression.
@@ -181,4 +184,50 @@ render_seed_tree() {
         -e "s|^CLOUDFLARE_ZONE_ID=.*|CLOUDFLARE_ZONE_ID=sim-zone-id-not-real|" \
         -e "s|^CLOUDFLARE_API_TOKEN=.*|CLOUDFLARE_API_TOKEN=sim-token-not-real   # ddns WILL fail auth in the VM - expected, no healthcheck gates it|" \
         "$sim_env"
+}
+
+# stage_images_into_payload OUT_DIR IMAGES_OUT
+#
+# Q10.9 B+ ALL-IMAGES: copy the docker-save image tars produced by
+# vmtest/export-images.sh into the deploy-payload's images/ subdir, so they ride
+# onto BOTH ISO paths and land at /opt/awow-core/images on the target, where
+# firstboot.sh docker-loads them before `docker compose up -d`. The tars live in
+# vmtest/.out/images by default — which render_seed_tree's repo copy EXCLUDES
+# (via --exclude=vmtest/.out) — so this is the one place they enter the payload.
+#
+# GRACEFUL: if the staging dir is empty/missing, warn LOUDLY and still build the
+# seed — the box will fall back to pulling at first boot (firstboot.sh handles
+# that path), except naglight:local which has no registry and would then fail.
+stage_images_into_payload() {
+    local out_dir="$1" images_out="$2"
+    local dest="$out_dir/iso-root/deploy-payload/images"
+    mkdir -p "$dest"
+
+    local had_nullglob=0
+    shopt -q nullglob && had_nullglob=1
+    shopt -s nullglob
+    local tars=("$images_out"/*.tar "$images_out"/*.tar.zst)
+
+    if [ "${#tars[@]}" -eq 0 ]; then
+        [ "$had_nullglob" -eq 1 ] || shopt -u nullglob
+        log "WARNING: no image tars found in $images_out — the payload will carry NO"
+        log "  container images. Run  bash vmtest/export-images.sh  first to bake the"
+        log "  Q10.9 B+ all-images payload, then rebuild. Without it the VM falls back"
+        log "  to pulling at first boot (needs internet; naglight:local has no registry"
+        log "  home and will fail to start)."
+        return 0
+    fi
+
+    log "staging ${#tars[@]} image tar(s) into deploy-payload/images/ (Q10.9 B+ ALL-IMAGES)"
+    local total=0 t
+    for t in "${tars[@]}"; do
+        # hardlink when the filesystem allows (saves ~1GB of C: — OI-6); else copy.
+        cp -l "$t" "$dest/" 2>/dev/null || cp -f "$t" "$dest/"
+        total=$(( total + $(stat -c%s "$t") ))
+    done
+    [ -f "$images_out/images.manifest.tsv" ] && cp -f "$images_out/images.manifest.tsv" "$dest/"
+    [ "$had_nullglob" -eq 1 ] || shopt -u nullglob
+
+    log "deploy-payload/images/ = $(( total / 1024 / 1024 )) MB across ${#tars[@]} tar(s)"
+    log "  -> lands at /opt/awow-core/images on the target; firstboot.sh docker-loads it."
 }

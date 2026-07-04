@@ -1,0 +1,12 @@
+[Unit]
+Description=Low-power auto-tune (powertop) with USB-storage autosuspend guard
+# Late in boot so devices are enumerated; oneshot, re-applied every boot
+# (powertop tunables do not persist across reboots).
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/powertune.sh
+
+[Install]
+WantedBy=multi-user.target

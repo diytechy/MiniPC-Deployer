@@ -72,6 +72,7 @@ autoinstall:
     - apt-transport-https
     - cockpit           # LAN web console (terminal/logs/updates/reboot) — WI-10.12
     - unattended-upgrades  # hands-off OS security patching — WI-10.12
+    - powertop          # low-power auto-tune, applied per boot by powertune.service
 
   # Everything site-specific happens in late-commands, which run in the installer
   # environment with the target mounted at /target. We write files INTO /target.
@@ -93,6 +94,12 @@ autoinstall:
     - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
     - curtin in-target --target=/target -- systemctl enable unattended-upgrades
 
+    # ---- 2b. Low-power lightening (Peter, 2026-07-04) --------------------------
+    # Nothing in the stack uses snaps; snapd costs RAM + background churn on a
+    # low-power box. Purge it. (powertop tuning is applied per-boot by
+    # powertune.service, installed in step 5 — auto-tune does not persist.)
+    - curtin in-target --target=/target -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd 2>/dev/null || true; apt-get autoremove -y --purge'
+
     # ---- 3. Place the stack ---------------------------------------------------
     # The repo payload is copied by the USB-build step to /cdrom/deploy-payload
     # (a second CIDATA stick, or the remastered ISO) and picked up here into
@@ -108,6 +115,11 @@ autoinstall:
     - cp /target/opt/awow-core/stack/autoinstall/firstboot.sh /target/usr/local/sbin/awow-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/awow-firstboot.sh
     - curtin in-target --target=/target -- systemctl enable awow-firstboot.service
+    # Low-power tune unit (per-boot powertop auto-tune + USB-storage guard).
+    - cp /target/opt/awow-core/stack/autoinstall/powertune.service /target/etc/systemd/system/powertune.service
+    - cp /target/opt/awow-core/stack/autoinstall/powertune.sh /target/usr/local/sbin/powertune.sh
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/powertune.sh
+    - curtin in-target --target=/target -- systemctl enable powertune.service
 
   # No reboot prompt — power-cycle straight into the running box.
   shutdown: reboot

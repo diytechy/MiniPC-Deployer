@@ -51,7 +51,16 @@ stack/
     meta-data                 NoCloud datasource companion
     awow-firstboot.service    systemd oneshot that runs the bring-up once
     firstboot.sh              compose up + provisioning + point host resolver at local DNS
+    powertune.{service,sh}    per-boot low-power auto-tune (powertop) + USB-storage guard
 ```
+
+> **Low-power units (per boot).** `user-data`'s `late-commands` also install two
+> oneshots that re-apply non-persistent power tuning on every boot: `powertune`
+> (powertop auto-tune, above) and — for the backup drive(s) — `backup-standby`
+> (a conservative `hdparm -S` spin-down default; the unit + script live under
+> [`stack/backup/`](backup/), WI-10.10 drive power). The package list adds
+> `hdparm`, which is **not** guaranteed on Ubuntu Server. `backup-standby` is a
+> clean no-op until `BACKUP_DRIVE_DEVICES` is set in the backup config.
 
 ---
 

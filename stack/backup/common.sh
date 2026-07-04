@@ -73,6 +73,79 @@ mount_cifs() {
 }
 umount_all() { local mp; for mp in "${MOUNTS[@]:-}"; do [ -n "$mp" ] && umount "$mp" 2>/dev/null || true; done; MOUNTS=(); }
 
+# ── drive power management (WI-10.10 DRIVE POWER DESIGN) ──────────────────────
+# The backup drive(s) are the box's biggest electrical lever (5–8 W each while
+# spinning ≈ the whole CPU). Policy = DYNAMIC standby: backup-standby.service
+# sets a conservative default spin-down timeout at boot, and the backup RUN
+# disables standby on its target drive(s) at start (drive_standby_set 0) then
+# RESTORES the configured timeout on exit via a trap (fires on failure/interrupt
+# too). These helpers are shared by backup.sh (the run) and backup-standby.sh
+# (the boot oneshot).
+#
+# hdparm -S <value> spin-down encoding — this is the notoriously confusing part,
+# so it lives here, documented once:
+#     0        standby DISABLED  (drive never auto-spins-down; used mid-run)
+#     1..240   value × 5 seconds        → 240 = 1200 s = 20 min
+#     241..251 (value − 240) × 30 min   → 241 = 30 min, 242 = 60 min … 251 = 5.5 h
+#     252..255 vendor/special           (avoid)
+# Recommended conservative default: 241 (= 30 min); 240 (= 20 min) is also fine.
+#
+# HARD RULE: power management must NEVER fail a backup. Every path below logs a
+# WARNING and returns 0 on any problem — hdparm not installed, device path
+# absent, or the enclosure rejecting the command. Many USB-SATA bridge chips
+# quietly ignore hdparm APM/standby (they swallow or fake the ioctl); when that
+# happens this is a harmless no-op. Per-drive behaviour is verified at hardware
+# burn-in with `hdparm -C /dev/disk/by-id/...` (shows active/idle vs standby).
+
+# standby_desc VALUE : human-readable text for an hdparm -S value (for logs).
+# Guarded so a non-numeric value never errors under errtrace.
+standby_desc() {
+    local v="$1"
+    case "$v" in
+        ''|*[!0-9]*) printf 'value %s' "$v"; return 0 ;;
+    esac
+    if   [ "$v" -eq 0 ];   then printf 'standby disabled'
+    elif [ "$v" -le 240 ]; then printf '%ss' "$(( v * 5 ))"
+    elif [ "$v" -le 251 ]; then printf '%smin' "$(( (v - 240) * 30 ))"
+    else printf 'value %s' "$v"; fi
+}
+
+# have_hdparm : true iff hdparm is on PATH; warns ONCE if missing. Never fails.
+_HDPARM_WARNED=0
+have_hdparm() {
+    command -v hdparm >/dev/null 2>&1 && return 0
+    if [ "$_HDPARM_WARNED" = 0 ]; then
+        warn "drive-power: hdparm not installed — spin-down management skipped (apt-get install hdparm)"
+        _HDPARM_WARNED=1
+    fi
+    return 1
+}
+
+# drive_standby_set VALUE DEVICE... : apply `hdparm -S VALUE` to each DEVICE.
+#   VALUE 0    → disable standby (run start, no mid-backup spin-down)
+#   VALUE 1..251 → the configured spin-down timeout (boot default / run exit)
+# NEVER fails: missing hdparm, absent device, or a rejecting enclosure → WARNING
+# and continue. Always returns 0 so it composes with backup.sh's ERR-trap /
+# never-silent-green machinery without ever tripping it.
+drive_standby_set() {
+    local val="$1"; shift
+    have_hdparm || return 0
+    local dev
+    for dev in "$@"; do
+        [ -n "$dev" ] || continue
+        if [ ! -e "$dev" ]; then
+            warn "drive-power: device not present, skipping: $dev"
+            continue
+        fi
+        if hdparm -S "$val" "$dev" >/dev/null 2>&1; then
+            log "drive-power: hdparm -S $val $dev ($(standby_desc "$val"))"
+        else
+            warn "drive-power: hdparm -S $val REJECTED on $dev — enclosure may ignore standby (verify at burn-in); continuing"
+        fi
+    done
+    return 0
+}
+
 # ── NagLight /api/feed reporting (step 6) — never-silent-green ────────────────
 # feed_naglight OK NOTE : POST {check,ok,note}. ok=false on ANY failure so a
 # broken backup is never a silent green. Uses the multi-user trust model (direct

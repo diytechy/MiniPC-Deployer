@@ -23,10 +23,42 @@ Samba fixtures in WI-10.15 (see `docs/status.md`).
 ```
 backup.sh            orchestrator (the six steps; --config, --dry-run)
 restore.sh           reconstruct + byte-verify a set from a run (the recovery half)
-common.sh            shared helpers (logging, cifs mount, compression policy, feed)
+common.sh            shared helpers (logging, cifs mount, compression policy, feed, drive power)
+backup-standby.sh    boot-time DEFAULT STANDBY oneshot (WI-10.10 drive power)
 backup.env.example   every knob
 systemd/awow-backup.{service,timer}   nightly root oneshot + persistent timer
+systemd/backup-standby.service        per-boot backup-drive spin-down default
 ```
+
+## Drive power / spin-down (WI-10.10 DRIVE POWER DESIGN)
+
+The backup drive(s) are the box's biggest electrical lever (5–8 W each spinning ≈
+the whole CPU), so the service manages their standby with a **dynamic** policy:
+
+- **At boot** — `backup-standby.service` (a per-boot oneshot; `hdparm -S` does not
+  persist across power cycles) sets a conservative default spin-down timeout on
+  each `BACKUP_DRIVE_DEVICES` entry using `BACKUP_DRIVE_STANDBY`.
+- **During a run** — `backup.sh` **disables** standby (`hdparm -S 0`) on its
+  target drive(s) at the start and **restores** the configured timeout on exit
+  via a shell trap that fires on **success, failure, or interrupt**. This avoids
+  both start/stop churn during long no-write phases (source hashing, verify) and
+  aggressive-timeout cycling.
+
+Knobs (`backup.env.example`): `BACKUP_DRIVE_DEVICES` (space-separated
+`/dev/disk/by-id/...` paths — **by-id, never `sdX`**, which the kernel renumbers)
+and `BACKUP_DRIVE_STANDBY` (default `241`). The `hdparm -S` encoding is
+notoriously confusing — `1..240` = value × 5 s (so `240` = 20 min) and
+`241..251` = (value − 240) × 30 min (so `241` = 30 min) — documented in
+`common.sh` and `backup.env.example`.
+
+**Power management NEVER fails a backup:** a missing `hdparm`, an absent device
+path, or an enclosure that rejects the command is logged as a WARNING and skipped.
+An **empty `BACKUP_DRIVE_DEVICES` is a clean no-op** (no boot standby, no run-time
+hold). **Caveat:** many USB-SATA enclosures ignore `hdparm` APM/standby entirely
+(the bridge chip swallows the command) — verify each drive at hardware burn-in
+with `hdparm -C /dev/disk/by-id/...`. The call contract + failure-path
+composition are proven in `sim/mini-serv-sim/run-drivepower-sim.sh` (mock-`hdparm`
+shim); the drive's physical response is a burn-in-only check.
 
 ## Recovery MANIFEST / state format
 
@@ -65,10 +97,16 @@ sudo cp systemd/awow-backup.{service,timer} /etc/systemd/system/
 sudo systemctl enable --now awow-backup.timer
 sudo systemctl start awow-backup.service     # run once now
 journalctl -u awow-backup.service -f
+# Boot-time drive standby (WI-10.10) — the autoinstall enables this for you; to
+# do it by hand (runs in place from this dir so it can source common.sh):
+sudo cp systemd/backup-standby.service /etc/systemd/system/
+sudo systemctl enable --now backup-standby.service
 ```
 
 ## Try it against the sim fixtures
 
 `sim/mini-serv-sim/run-backup-sim.sh` stands up the Samba fixtures + a privileged
-runner, runs a full cycle against them, and does the restore drill. See
-`sim/README.md`.
+runner, runs a full cycle against them, and does the restore drill.
+`sim/mini-serv-sim/run-drivepower-sim.sh` proves the WI-10.10 `hdparm` standby
+call contract (disable-at-start, restore-on-exit including the failure path, and
+the empty-device no-op) with a mock-`hdparm` shim. See `sim/README.md`.

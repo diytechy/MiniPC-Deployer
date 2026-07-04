@@ -43,6 +43,13 @@ STAGING="${BACKUP_STAGING:-/var/tmp/awow-backup/staging}"
 KEEP="${BACKUP_KEEP:-7}"
 ZL="${BACKUP_ZSTD_LEVEL:-10}"
 
+# ── drive power (WI-10.10 DRIVE POWER DESIGN) ────────────────────────────────
+# The configured backup drive(s) + their at-rest spin-down timeout. Empty device
+# list = the whole feature is a clean no-op. See common.sh drive_standby_set for
+# the hdparm -S encoding and the "power management NEVER fails a backup" contract.
+read -r -a BACKUP_DRIVES <<< "${BACKUP_DRIVE_DEVICES:-}" || true
+STANDBY_VALUE="${BACKUP_DRIVE_STANDBY:-241}"
+
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 RUN_DIR="$BACKUP_TARGET/run_$RUN_TS"
 MANIFEST="$RUN_DIR/MANIFEST.tsv"
@@ -62,6 +69,20 @@ on_err() {
 }
 trap 'on_err $LINENO' ERR
 set -o errtrace
+
+# ── drive-power RESTORE on exit (WI-10.10) ───────────────────────────────────
+# Re-arm the configured spin-down timeout on ANY exit — normal success, the ERR
+# trap's `exit 1`, an interrupt, or a `die`. The EXIT trap fires AFTER the ERR
+# trap, so it never disturbs the never-silent-green ok=false reporting path; it
+# only restores the drives' at-rest standby (the "restore on exit" half of the
+# dynamic-standby policy). No-op when no drives are configured. Never fails
+# (drive_standby_set always returns 0).
+drive_power_restore() {
+    [ "${#BACKUP_DRIVES[@]}" -gt 0 ] || return 0
+    log "drive-power: restoring standby timeout ($STANDBY_VALUE = $(standby_desc "$STANDBY_VALUE")) on exit"
+    drive_standby_set "$STANDBY_VALUE" "${BACKUP_DRIVES[@]}"
+}
+trap 'drive_power_restore' EXIT
 
 TOTAL_BYTES=0; TOTAL_FILES=0; SET_SUMMARY=""
 
@@ -85,6 +106,15 @@ SET_SUMMARY_JSON=""; OFFSITE_DONE="skipped"
 log "== AWOW backup run $RUN_TS =="
 log "config=$CONFIG target=$BACKUP_TARGET keep=$KEEP dry_run=$DRY_RUN"
 printf 'set\tsource\tarchive\talgo\tarchive_sha256\tfiles\tbytes\treason\n' >"$MANIFEST"
+
+# ── drive power: DISABLE standby for the whole run (WI-10.10) ─────────────────
+# Turn OFF spin-down on the target drive(s) at run start so long no-write phases
+# (source hashing, archive verify) can't spin the drive down mid-backup. Restored
+# by the EXIT trap above. No-op / never-fail when unconfigured or unsupported.
+if [ "${#BACKUP_DRIVES[@]}" -gt 0 ]; then
+    log "drive-power: disabling standby (hdparm -S 0) on ${#BACKUP_DRIVES[@]} target drive(s) for the run"
+    drive_standby_set 0 "${BACKUP_DRIVES[@]}"
+fi
 
 # ── steps 1-3 per source set ─────────────────────────────────────────────────
 while IFS= read -r line; do

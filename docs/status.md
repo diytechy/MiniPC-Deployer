@@ -506,3 +506,74 @@ above is the pre-boot smoke test the dev PC can run headlessly.
 tars + seed ISO were written to `vmtest/.out` on `/mnt/c` (real C: via 9p), which
 does **not** grow the WSL `ext4.vhdx`. Only the 4 aux-image pulls (~200MB into
 the docker store) touched the vhdx.
+
+### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.10 DRIVE POWER DESIGN — dynamic standby)
+
+Implemented Peter's ratified DRIVE POWER DESIGN in the bash backup service. The
+backup drives are the box's biggest electrical lever (5–8 W each spinning ≈ the
+whole CPU), so the policy is **dynamic standby**, two pieces:
+
+**What was built:**
+- **Boot-time default standby** — a per-boot oneshot
+  `stack/backup/backup-standby.service` + `backup-standby.sh` applies a
+  conservative `hdparm -S` spin-down timeout to each configured backup drive
+  (`hdparm -S` does not persist across power cycles, so it re-applies every boot,
+  like `powertune.service`). Shipped/enabled via autoinstall `late-commands`
+  exactly like powertune (runs in place from the stack dir so it can source
+  `common.sh`, matching `awow-backup.service`). Added `hdparm` to the autoinstall
+  packages list (NOT guaranteed on Ubuntu Server).
+- **Dynamic hold in the run** — `backup.sh` disables standby (`hdparm -S 0`) on
+  its target drive(s) at run start and **restores the configured timeout on any
+  exit via an `EXIT` trap** — fires on success, on the ERR-trap's `exit 1`, on a
+  `die`, and on interrupt. The EXIT trap fires AFTER the ERR trap, so it never
+  disturbs the never-silent-green `ok=false` reporting path; it only re-arms the
+  drives. Prevents both wear modes: no start/stop churn during long no-write
+  phases (hashing/verify), no aggressive-timeout cycling.
+- **Knobs** (`backup.env.example`, placeholders only): `BACKUP_DRIVE_DEVICES`
+  (space-separated `/dev/disk/by-id/...` paths — **by-id, never sdX** which
+  renumbers) and `BACKUP_DRIVE_STANDBY` (default `241` = 30 min). **Empty device
+  list = the whole feature is a clean no-op.** The confusing `hdparm -S` encoding
+  (`1..240` = n×5 s so 240 = 20 min; `241..251` = (n−240)×30 min so 241 = 30 min)
+  is documented once in `common.sh` and in `backup.env.example`.
+- **HARD RULE honored:** power management NEVER fails a backup — missing `hdparm`,
+  absent device path, or an enclosure rejecting the command → logged WARNING and
+  continue. `drive_standby_set` always returns 0 so it composes with the ERR-trap
+  machinery without tripping it. USB-enclosure caveat noted in comments +
+  `backup.env.example`; per-drive verification is a burn-in step (`hdparm -C`).
+
+**RAN FOR REAL (WSL2 / docker 29.6.1) — the CALL CONTRACT proven with mock shims**
+(platters can't spin in a container, but the sequence of `hdparm` calls can be
+asserted). New `sim/mini-serv-sim/run-drivepower-sim.sh` puts a mock `hdparm`
+(logs every invocation) and mock `curl` (captures each NagLight POST body) on
+PATH in the runner, uses fake by-id device files, and runs REAL backup cycles
+against the Samba fixtures. **All four assertions GREEN:**
+- **(a)** `-S 0` (standby disabled) issued to **each** configured device at run
+  start.
+- **(b)** the configured timeout (`-S 241`) re-issued to **each** device on
+  normal exit (exactly 4 calls; all disables precede all restores).
+- **(c)** on a FORCED mid-run failure (mock `rsync` exits 1) the restore **still
+  fires** via the EXIT trap AND the run **still posts `ok=false`** (mock curl
+  captured `"ok":false`; `on_err` ran → `BACKUP FAILED` + `RUN.json=failed`;
+  nonzero exit).
+- **(d)** with **no devices** configured: **zero** `hdparm` calls and an
+  unchanged green cycle.
+
+Also validated the boot oneshot directly (`docker run` throwaway, 5 cases):
+`-S 241`→"30min" and `-S 240`→"1200s" (=20 min) encoding correct; empty list =
+no-op; absent device = WARN + skip + exit 0; missing `hdparm` = WARN + exit 0
+(never fails boot).
+
+**No regression:** re-ran `run-backup-sim.sh` end-to-end — full six-step cycle +
+restore drill **PASS** (backup.env.sim has `BACKUP_DRIVE_DEVICES=""`, so the
+standard cycle logs zero drive-power lines — the clean no-op path). `bash -n`
+clean on all scripts; `scripts/check.py` (G1) + `validate_config.py` **PASS**
+(the file-presence check now also asserts the powertune + `backup-standby`
+unit/script exist, and `user-data` still parses as valid `#cloud-config` YAML).
+
+**HARDWARE-ONLY REMAINDER (honest):** whether the actual USB-SATA backup
+enclosure **honors** `hdparm` standby at all — many bridge chips swallow/fake the
+command — cannot be known in sim; it is a per-drive **burn-in** check
+(`hdparm -C /dev/disk/by-id/...` to read active/idle vs standby; `hdparm -y` to
+force a spin-down and confirm). The real electrical/spindle-wear benefit is
+likewise a hardware measurement. The sim proves the *call contract and its
+failure-path composition*, not the drive's physical response.

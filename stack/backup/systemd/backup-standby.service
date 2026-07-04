@@ -1,0 +1,26 @@
+# AWOW backup-drive DEFAULT STANDBY (WI-10.10 DRIVE POWER DESIGN). A per-boot
+# oneshot that applies a conservative hdparm -S spin-down timeout to the
+# configured backup drive(s) (BACKUP_DRIVE_DEVICES / BACKUP_DRIVE_STANDBY in
+# /etc/awow-backup/backup.env). hdparm -S does NOT persist across power cycles,
+# so this re-applies it every boot — like powertune.service.
+#
+# A no-op until the box is provisioned for backup (missing config / empty device
+# list). Power-management problems (no hdparm, absent device, enclosure ignoring
+# the command) are logged and skipped — this unit never fails boot.
+#
+# Runs from the stack dir (/opt/awow-core/stack/backup) so the script can source
+# common.sh, matching awow-backup.service. The backup RUN (awow-backup.service)
+# temporarily disables this standby and restores it on exit.
+[Unit]
+Description=AWOW backup-drive default standby (hdparm spin-down) — WI-10.10
+# Late in boot so the USB/SATA backup drives are enumerated; oneshot, re-applied
+# every boot (hdparm -S does not persist).
+After=multi-user.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/awow-core/stack/backup/backup-standby.sh
+
+[Install]
+WantedBy=multi-user.target

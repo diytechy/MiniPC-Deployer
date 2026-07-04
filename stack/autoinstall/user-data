@@ -73,6 +73,7 @@ autoinstall:
     - cockpit           # LAN web console (terminal/logs/updates/reboot) — WI-10.12
     - unattended-upgrades  # hands-off OS security patching — WI-10.12
     - powertop          # low-power auto-tune, applied per boot by powertune.service
+    - hdparm            # backup-drive spin-down (WI-10.10) — NOT guaranteed on Ubuntu Server
 
   # Everything site-specific happens in late-commands, which run in the installer
   # environment with the target mounted at /target. We write files INTO /target.
@@ -120,6 +121,13 @@ autoinstall:
     - cp /target/opt/awow-core/stack/autoinstall/powertune.sh /target/usr/local/sbin/powertune.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/powertune.sh
     - curtin in-target --target=/target -- systemctl enable powertune.service
+    # Backup-drive default standby unit (per-boot hdparm -S spin-down — WI-10.10).
+    # Runs from the stack dir (sources common.sh) like awow-backup.service, so we
+    # only install the unit + make the script executable; no cp to /usr/local/sbin.
+    # A no-op until BACKUP_DRIVE_DEVICES is set in /etc/awow-backup/backup.env.
+    - cp /target/opt/awow-core/stack/backup/systemd/backup-standby.service /target/etc/systemd/system/backup-standby.service
+    - curtin in-target --target=/target -- chmod +x /opt/awow-core/stack/backup/backup-standby.sh
+    - curtin in-target --target=/target -- systemctl enable backup-standby.service
 
   # No reboot prompt — power-cycle straight into the running box.
   shutdown: reboot

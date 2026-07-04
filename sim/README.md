@@ -72,8 +72,19 @@ shares plus a privileged runner that cifs-mounts them and runs the **real**
 
 ```bash
 sim/mini-serv-sim/run-backup-sim.sh        # full 6-step cycle + restore drill
+sim/mini-serv-sim/run-drivepower-sim.sh    # WI-10.10 hdparm standby CALL CONTRACT (mock shim)
 sim/mini-serv-sim/run-backup-sim.sh --down # tear down
 ```
+
+`run-drivepower-sim.sh` proves the WI-10.10 **drive power** contract without real
+spinning platters: it puts a mock `hdparm` (logs every call) and mock `curl`
+(captures each NagLight POST) on PATH in the runner and asserts the sequence —
+(a) `-S 0` disable to each device at run start; (b) the configured timeout
+re-issued to each device on normal exit; (c) on a FORCED mid-run failure the
+restore still fires via the EXIT trap AND the run still posts `ok=false`; (d) no
+devices → zero `hdparm` calls, unchanged green cycle. It cleans its shims up after
+so a subsequent `run-backup-sim.sh` sees the real tools. Whether a given USB
+enclosure actually *honors* `hdparm` standby is a hardware burn-in check.
 
 Requires the awow-sim stack up first (`sim/run-sim.sh`) — the runner feeds the
 sim NagLight tracker and shares its network. The run performs steps 1-6 of

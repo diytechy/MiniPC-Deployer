@@ -1,0 +1,20 @@
+# AWOW bash backup service (WI-10.10). Oneshot invoked by awow-backup.timer.
+# Runs as root: mount.cifs (source pulls + offsite push) needs it, and the timer
+# makes it periodic. Never-silent-green: a nonzero exit here is visible in
+# `systemctl status` / journal AND already reported to NagLight (ok=false).
+[Unit]
+Description=AWOW bash backup (cifs pull -> tar/zstd -> verify -> offsite -> NagLight)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+# Install path on the AWOW: /opt/awow-core/stack/backup (matches the repo layout).
+ExecStart=/opt/awow-core/stack/backup/backup.sh --config /etc/awow-backup/backup.env
+Nice=10
+IOSchedulingClass=idle
+# mount.cifs requires real mount privileges; keep it simple and run as root.
+User=root
+
+[Install]
+WantedBy=multi-user.target

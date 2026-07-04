@@ -1,0 +1,56 @@
+# mini-serv-sim (WI-10.15) — Mini-serv's stand-in: a Samba server exposing the
+# fixture shares, plus a privileged backup-runner (the AWOW host stand-in) that
+# cifs-mounts them and runs the REAL stack/backup service end to end.
+#
+# Joins the awow-sim project's network (external) so the runner can feed the sim
+# NagLight tracker. Bring up with sim/mini-serv-sim/run-backup-sim.sh (which
+# requires sim/run-sim.sh to have the awow-sim stack up first).
+#
+# Also usable STANDALONE for WI-10.16 (MinecraftKeeper --execute) — just the
+# samba service is needed; see run-backup-sim.sh --shares-only.
+
+networks:
+  awow:
+    external: true
+    name: awow-sim_default
+
+volumes:
+  icedrive_data:      # the IceDrive-synced target share (writable; starts empty)
+  backup_drive:       # the AWOW external backup drive (BACKUP_TARGET)
+
+services:
+  # ── Samba fixture host (Mini-serv stand-in) ─────────────────────────────────
+  samba:
+    image: dperson/samba
+    container_name: mini-serv
+    hostname: mini-serv
+    networks: [awow]
+    # dperson/samba: -u "user;pass"  -s "name;path;browse;readonly;guest;users"
+    command: >
+      -u "awow;simpass"
+      -s "minecraft;/share/minecraft;yes;yes;no;awow"
+      -s "satisfactory;/share/satisfactory;yes;yes;no;awow"
+      -s "icedrive;/share/icedrive;yes;no;no;awow"
+      -p
+    volumes:
+      - ./fixtures/minecraft:/share/minecraft:ro
+      - ./fixtures/satisfactory:/share/satisfactory:ro
+      - icedrive_data:/share/icedrive
+    restart: unless-stopped
+
+  # ── Backup runner (AWOW host stand-in) ──────────────────────────────────────
+  backup-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+    image: awow-backup-runner:sim
+    container_name: backup-runner
+    privileged: true            # mount.cifs needs real mount privileges
+    networks: [awow]
+    depends_on: [samba]
+    volumes:
+      - ../../stack/backup:/opt/awow-core/stack/backup:ro   # the REAL service, unmodified
+      - ./backup.env.sim:/etc/awow-backup/backup.env:ro
+      - backup_drive:/backup
+    command: ["sleep", "infinity"]
+    restart: unless-stopped

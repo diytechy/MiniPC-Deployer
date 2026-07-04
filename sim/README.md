@@ -64,9 +64,45 @@ docker compose -p awow-sim \
 real Google consent, publicly-trusted ACME certs, Technitium binding the host's
 real `:53`, and the AWOW hardware itself.
 
-## Fixtures for the follow-on session (WI-10.16)
+## mini-serv-sim — Samba fixtures + the bash backup service (WI-10.15)
 
-`mini-serv-sim/` (WI-10.15) exposes Samba fixture shares (a Minecraft-server
-tree, a Satisfactory-save tree, an icedrive-sync target). See the mini-serv-sim
-section below for how to start them standalone for the MinecraftKeeper
-`--execute` validation.
+`mini-serv-sim/` is Mini-serv's stand-in: a Samba server exposing three fixture
+shares plus a privileged runner that cifs-mounts them and runs the **real**
+`stack/backup` service end to end.
+
+```bash
+sim/mini-serv-sim/run-backup-sim.sh        # full 6-step cycle + restore drill
+sim/mini-serv-sim/run-backup-sim.sh --down # tear down
+```
+
+Requires the awow-sim stack up first (`sim/run-sim.sh`) — the runner feeds the
+sim NagLight tracker and shares its network. The run performs steps 1-6 of
+HOMELAB_TOPOLOGY.md (cifs pull → tar/zstd → hash+manifest → retention → offsite
+push → NagLight feed) and then the **restore drill**: reconstruct minecraft from
+the archive+manifest, `diff -r` byte-equality against the live share, delete the
+`plugins/` subtree and reconstruct again, and confirm the fixture "secret"
+(a fake rcon password) round-trips intact.
+
+The three shares (fictional, committed):
+- `//mini-serv/minecraft` — a Paper-server tree: `paper-1.20.4-435.jar`,
+  `plugins/` (3 valid jars with parseable `plugin.yml`), `server.properties`
+  (fake rcon password), `world/`.
+- `//mini-serv/satisfactory` — a save tree (`SaveGames/…/*.sav`).
+- `//mini-serv/icedrive` — the empty offsite target (writable).
+
+Regenerate the binary fixtures deterministically with
+`sim/mini-serv-sim/fixtures/generate-binaries.sh`.
+
+### Starting the fixture shares standalone (WI-10.16)
+
+MinecraftKeeper's `--execute` validation (WI-10.16) needs only the Samba shares:
+
+```bash
+sim/run-sim.sh                                   # once, for the shared network
+sim/mini-serv-sim/run-backup-sim.sh --shares-only
+# -> //mini-serv/{minecraft,satisfactory,icedrive}  user: awow  pass: simpass
+```
+
+The shares are reachable from any container on the `awow-sim_default` network as
+`//mini-serv/<share>`; the live tree stays read-only (minecraft/satisfactory
+are exported read-only), matching the "live share stays read-only" rule.

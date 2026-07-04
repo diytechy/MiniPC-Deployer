@@ -1,0 +1,10 @@
+# bukkit.yml (SIM FIXTURE — fictional)
+settings:
+  allow-end: true
+  warn-on-overload: true
+  connection-throttle: 4000
+spawn-limits:
+  monsters: 70
+  animals: 10
+chunk-gc:
+  period-in-ticks: 600

@@ -1,0 +1,9 @@
+# Backup-runner (WI-10.15 sim) — a stand-in for the AWOW host: the toolchain the
+# real bash backup service needs, so it can cifs-mount the Samba fixtures and run
+# stack/backup/*.sh end to end. Privileged at runtime (mount.cifs needs it). This
+# is SIM harness only; the real service runs on the AWOW host under systemd.
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash coreutils findutils tar zstd rsync cifs-utils curl gawk ca-certificates procps \
+    && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]

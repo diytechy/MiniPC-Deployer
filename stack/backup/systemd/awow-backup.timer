@@ -1,0 +1,13 @@
+# Nightly schedule for the AWOW bash backup (WI-10.10). Persistent so a missed
+# run (box asleep/off) fires on next boot — a backup should never silently skip.
+[Unit]
+Description=Nightly AWOW backup timer
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=awow-backup.service
+
+[Install]
+WantedBy=timers.target

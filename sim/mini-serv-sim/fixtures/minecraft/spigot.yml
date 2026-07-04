@@ -1,0 +1,10 @@
+# spigot.yml (SIM FIXTURE — fictional)
+settings:
+  bungeecord: false
+  restart-on-crash: true
+  restart-script: ./start.sh
+world-settings:
+  default:
+    view-distance: default
+    mob-spawn-range: 6
+    item-despawn-rate: 6000

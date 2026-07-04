@@ -264,3 +264,51 @@ alt-port approach — a split-horizon test still runs, `dig @technitium` from th
 client); the AWOW hardware. Aux containers (Kuma/Dozzle/ntfy) and ddns are
 disabled in the sim (LAN_IP binds / zero external calls) — config-validated in
 wave 1, out of the V1 gate scope. Full delta table in `sim/README.md`.
+
+### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.15 Mini-serv-sim + bash backup service)
+Built the **real bash backup service** at `stack/backup/` (ASSUMPTION confirmed
+in use: it lives in MiniPC-Deployer as box-plumbing, not its own repo) —
+`backup.sh` + `restore.sh` + `common.sh` + `backup.env.example` + systemd
+`.service`/`.timer`, implementing HOMELAB_TOPOLOGY.md's six steps in pure bash
+(no .bat/.ps1). Recovery MANIFEST format (the `*FilesHashTable.csv` successor):
+per run `MANIFEST.tsv` (one row/set: set·source·archive·algo·archive_sha256·
+files·bytes·reason) + `<set>.files.tsv` (sha256·size·mtime·relpath per file) +
+the `.tar`/`.tar.zst` archive + `RUN.json`. Auto-compression-where-applicable
+decides zstd-vs-plain-tar per set by already-compressed byte ratio (FileBackup
+exemption, lifted to archive granularity). Hash = **sha256** (coreutils-native)
+rather than FileBackup's xxHash128 — documented internal-integrity delta.
+
+Built `sim/mini-serv-sim/`: a `dperson/samba` container (Mini-serv stand-in)
+exposing three fictional committed shares — `minecraft` (Paper tree: realistic
+`paper-1.20.4-435.jar`, 3 plugin jars with **parseable** `plugin.yml`,
+`server.properties` with a fake rcon "secret", a `world/` tree), `satisfactory`
+(save tree), and an empty writable `icedrive` offsite target — plus a privileged
+`backup-runner` that cifs-mounts them and runs the REAL service.
+
+**RAN THE FULL CYCLE + RESTORE DRILL FOR REAL** (`run-backup-sim.sh`):
+```
+backup.sh: minecraft -> zstd (.tar.zst, 9% already-compressed < 60% threshold), 13 files
+           satisfactory -> plain .tar (98% already-compressed >= threshold), 3 files
+           total 16 files / 33429 bytes; retention keep=3
+step5 offsite: pushed 5 files into //mini-serv/icedrive/awow-backup/run_<ts>
+step6 feed: POST /api/feed ok=true -> HTTP 200; tracker /api/today shows
+            backup-files done=true (round-trip confirmed)
+RESTORE DRILL: reconstruct minecraft from archive+manifest -> RESTORE OK 13/13
+            byte-exact (sha256+size); diff -r vs live share IDENTICAL; delete
+            plugins/ subtree, reconstruct again -> IDENTICAL (recovered); fake
+            rcon.password round-tripped intact; 3 plugin jars restored.
+== BACKUP LEG: PASS (all checks green) ==
+```
+
+**Real bug the sim caught + FIXED in the service:** `compression_decision`
+`printf`'d without a trailing newline, so the `read` consuming it returned
+nonzero and (under `set -o errtrace`) tripped the never-silent-green ERR trap —
+every run failed at step 2 and correctly posted ok=false (proving the
+never-silent-green path works). Fixed by emitting the trailing newline; the
+next run went green end-to-end.
+
+**Fixture shares are UP for the WI-10.16 MinecraftKeeper session.** Start them
+standalone with `sim/mini-serv-sim/run-backup-sim.sh --shares-only` (needs
+`sim/run-sim.sh` first for the shared `awow-sim_default` network); shares are
+`//mini-serv/{minecraft,satisfactory,icedrive}`, user `awow` / `simpass`,
+minecraft+satisfactory exported READ-ONLY (live-share-stays-read-only rule).

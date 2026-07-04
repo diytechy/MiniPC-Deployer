@@ -1,0 +1,5 @@
+# The icedrive-sync target share starts EMPTY. The AWOW backup PUSHES selected
+# archive sets here (HOMELAB_TOPOLOGY.md step 5); IceDrive's native app (on the
+# real Windows box) then syncs this folder to the cloud. In the sim it is just a
+# writable Samba share the backup runner pushes into. Keep this file so git
+# tracks the otherwise-empty directory.

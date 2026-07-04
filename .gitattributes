@@ -17,3 +17,11 @@
 *.ps1 text eol=crlf
 *.cmd text eol=crlf
 *.bat text eol=crlf
+
+# sim/mini-serv-sim binary fixtures — never line-ending-normalise these (they are
+# real zip jars / opaque blobs; CRLF rewriting would corrupt them).
+*.jar binary
+*.sav binary
+*.mca binary
+*.dat binary
+*.lock binary

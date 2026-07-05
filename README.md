@@ -44,14 +44,36 @@ python scripts/check.py            # config-coverage + doc + registry gates (G1)
 python scripts/validate_config.py  # env/Caddy/file coverage + YAML parse
 ```
 
-> **No Docker on the dev machine (verified).** Validation here is **config-level
-> only**; runtime bring-up is PENDING the first Docker host — see the honest
-> ledger in [docs/status.md](docs/status.md).
+Three progressively-more-real gates precede flashing the real AWOW:
 
-Three progressively-more-real gates precede flashing the real AWOW: [`sim/`](sim/)
-(V1 — the full stack on WSL/Docker against a mock OIDC provider), the
-V2 launcher gate (Personal repo), and [`vmtest/`](vmtest/) (V3 — the REAL
-autoinstall booted in a local Hyper-V VM, the last gate before real hardware).
+| Gate | What | Status |
+|---|---|---|
+| V1 — [`sim/`](sim/) | full stack on WSL2/Docker vs. a mock OIDC provider (Dex stands in for Google); split-horizon DNS, multi-user isolation, and the bash backup service + restore drill all exercised for real | **GREEN** — all checks pass |
+| V2 — launcher (Personal repo, `MINI_PC_Setup/`) | the Mini-serv rebuild launcher validated in Windows Sandbox (real task-import/reg/share rungs) | **GREEN** |
+| V3 — [`vmtest/`](vmtest/) | the REAL autoinstall booted in a local Hyper-V VM — every container baked into the ISO payload (Q10.9 B+), zero registry pulls at first boot | scripted + smoke-tested; **the boot itself is Peter's step** (needs elevation + the Hyper-V feature) |
+
+Dev-box container runtime (WSL2 + docker-ce) is installed and verified — see
+[docs/status.md](docs/status.md) for the full ledger, including exactly which
+images are pinned and their digests.
+
+## Configuring the REAL box (not the sim)
+
+`vmtest/`'s scripts (`build-seed.sh`, etc.) are **VM-test-only** — they
+substitute throwaway SIM secrets and an ephemeral SSH key on purpose, so
+never flash `vmtest/.out/*.iso` onto real hardware. To build the actual
+deploy image:
+
+1. Fill in a real `stack/.env` from `.env.example` (every knob is documented
+   there and in [stack/README.md](stack/README.md) §2) and put your real SSH
+   public key into `stack/autoinstall/user-data` (§"Build the USB").
+2. Filling `.env` today is a **manual** step — the automated secret-handoff
+   script proposed in `Personal\SECRET_HANDOFF_PROPOSAL.md` (a sibling repo;
+   extends Peter's existing DPAPI credential pattern) is still an unratified
+   proposal, not implemented. Once ratified it would materialize `.env` from
+   Personal's credential store instead of hand-editing.
+3. Run `vmtest/export-images.sh` (it reads the real pinned tags in
+   `.env.example`, not sim values) so the real USB also carries every
+   container image baked in (Q10.9 B+) — see stack/README.md §3.
 
 ## Development
 

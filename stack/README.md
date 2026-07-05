@@ -125,6 +125,18 @@ Fill in at minimum:
 | `OAUTH2_PROXY_COOKIE_SECRET` | `openssl rand -base64 32 \| tr -- '+/' '-_'` |
 | `OAUTH2_PROXY_ALLOWED_EMAILS` | comma-separated Google accounts permitted into the tracker |
 | `TRACKER_DATA_REMOTE` | git remote of your private **data** repo (single-user); blank for multi-user |
+| `CLOUDFLARE_ZONE_ID` / `CLOUDFLARE_API_TOKEN` | dynamic DNS (`ddns` service) — a **new** scoped token (Zone→DNS→Edit, this zone only); never reuse the old plaintext token found on `\\Mini-serv\setup` |
+| `BACKUP_DRIVE_DEVICES` / `BACKUP_DRIVE_STANDBY` | backup-drive spin-down (WI-10.10) — space-separated `/dev/disk/by-id/...` paths (never `sdX`, it renumbers); empty = no-op |
+
+> **This table lists the knobs that need YOUR values filled in.** For the full
+> set including ones with sensible defaults, read `.env.example` top to bottom
+> — it's the source of truth and every entry is commented.
+
+**Filling these in today is a manual step.** An automated secret-handoff
+script is proposed (not yet built) in the sibling `Personal` repo's
+`SECRET_HANDOFF_PROPOSAL.md` — it would extend Peter's existing DPAPI
+credential pattern to materialize this `.env` instead of hand-editing. Still
+awaiting Peter's ratification checkboxes; hand-fill `.env` until then.
 
 ### PETER MANUAL STEP — Google OAuth client (required for the tracker)
 

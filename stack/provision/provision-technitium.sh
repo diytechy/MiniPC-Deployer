@@ -24,7 +24,7 @@
 #   provision-technitium.sh [--env PATH] [--host URL]
 # Env/.env keys consumed: DOMAIN, LAN_IP, TECHNITIUM_ADMIN_PASSWORD,
 #   TECHNITIUM_API_TOKEN_NAME, TECHNITIUM_FORWARDERS, TECHNITIUM_BLOCKLISTS,
-#   TRACKER_SUBDOMAIN, ACTUAL_SUBDOMAIN, MAIN_BOX_IP.
+#   TRACKER_SUBDOMAIN, ACTUAL_SUBDOMAIN, MAIN_BOX_IP, EXTRA_SUBDOMAINS (SR-012).
 #
 # Exit codes: 0 success; nonzero (with a message) on any API failure — so the
 # first-boot unit is marked failed and the operator can see it, rather than the
@@ -184,6 +184,14 @@ main() {
     # Optional: BlueMap / map on the MAIN box (only if MAIN_BOX_IP is set).
     if [ -n "${MAIN_BOX_IP:-}" ]; then
         add_a "$TOKEN" "map.${DOMAIN}" "$LAN_IP"   # served by Caddy on THIS box, proxied to main
+    fi
+    # Tier-2 opt-in subdomains (SR-012): bare labels from EXTRA_SUBDOMAINS in
+    # .env (space/comma-separated, e.g. "vault photos music"), one A record each
+    # → LAN_IP. Empty = no-op. Pairs with the commented Caddyfile sites.
+    if [ -n "${EXTRA_SUBDOMAINS:-}" ]; then
+        for sub in $(printf '%s' "$EXTRA_SUBDOMAINS" | tr ',' ' '); do
+            add_a "$TOKEN" "${sub}.${DOMAIN}" "$LAN_IP"
+        done
     fi
 
     echo "forwarders:"; set_forwarders "$TOKEN"

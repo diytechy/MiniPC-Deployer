@@ -77,6 +77,13 @@ services:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data       # certs + ACME account — persist so re-issue isn't needed on reboot
       - caddy_config:/config
+    extra_hosts:
+      # host.docker.internal is a Docker DESKTOP name — plain docker-ce (what the
+      # AWOW runs) does not provide it unless mapped to the host gateway here.
+      # Without this the dns.<domain> site (reverse_proxy host.docker.internal:5380)
+      # 502s on the real box. The AWOW-sim could not catch it: Caddyfile.sim
+      # deliberately proxies the bridge container name instead (review 2026-07-10).
+      - "host.docker.internal:host-gateway"
     depends_on:
       oauth2-proxy:
         # service_started (not _healthy): oauth2-proxy is distroless and carries
@@ -166,6 +173,10 @@ services:
     #   context: ../../NagLight
     #   dockerfile: deploy/tracker/Dockerfile
     container_name: tracker
+    labels:
+      # naglight:local has no registry home (Q10.2) — tell diun (tier-2 ops
+      # profile, SR-012) not to look it up; every other image is watchable.
+      - "diun.enable=false"
     environment:
       DATA_DIR: /data
       # If set, the entrypoint clones this remote into /data on first boot and
@@ -310,6 +321,308 @@ services:
       retries: 5
       start_period: 10s
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TIER-2 OPT-IN CATALOG (SR-012, review 2026-07-10) — everything below is OFF
+  # by default. Each service sits behind a compose profile (the ntfy pattern):
+  # nothing here starts, is health-gated, or is baked into the ISO payload unless
+  # its profile is enabled (COMPOSE_PROFILES in .env, or `--profile NAME up -d`).
+  #
+  # Ground rules for this tier:
+  #   - LAN-only UIs bind ${LAN_IP} (the WI-10.11 pattern); public exposure is a
+  #     deliberate second step: uncomment the matching Caddyfile site AND add the
+  #     label to EXTRA_SUBDOMAINS in .env (split-horizon record).
+  #   - Image pins are best-effort as of 2026-07 authoring and are NOT part of
+  #     the sim-validated set — VERIFY the tag at enable time; the diun profile
+  #     watches them afterwards.
+  #   - NO custom healthchecks yet: which probe tooling each image ships is
+  #     unverified (the WI-10.14 lesson — check empirically at enable time);
+  #     image-inherited HEALTHCHECKs still apply.
+  #   - Media libraries live under ${MEDIA_ROOT} on the HOST — bind mounts, not
+  #     named volumes, so libraries can sit on real storage. NOTE the tension:
+  #     serving media from the WI-10.10 backup drives would defeat their
+  #     spin-down policy; media wants its own always-on disk or a LAN share.
+  #   - RAM budget (8 GB box): the core uses ~1.5 GB. HA + Jellyfin + the small
+  #     services fit comfortably. Run AT MOST ONE photo stack; Immich's ML
+  #     container is a separate profile (immich-ml) — leave it off on the J4125.
+  #   - Tier-2 volumes are NOT yet covered by the backup service (open review
+  #     finding — stack volumes generally aren't; see docs/status.md).
+
+  # ── photos, option A: Immich (Google-Photos-style; mobile auto-backup) ───────
+  # Enable: profile `immich` (server+db+redis). Semantic search/face ML is the
+  # separate `immich-ml` profile — heavy; leave off on the J4125 or cap memory.
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:${IMMICH_IMAGE_TAG}
+    container_name: immich-server
+    profiles: ["immich"]
+    environment:
+      TZ: ${TIMEZONE}
+      DB_HOSTNAME: immich-db
+      DB_USERNAME: ${IMMICH_DB_USERNAME}
+      DB_PASSWORD: ${IMMICH_DB_PASSWORD}
+      DB_DATABASE_NAME: ${IMMICH_DB_DATABASE}
+      REDIS_HOSTNAME: immich-redis
+      # false unless the immich-ml profile is also enabled.
+      IMMICH_MACHINE_LEARNING_ENABLED: ${IMMICH_ML_ENABLED}
+    volumes:
+      - ${MEDIA_ROOT}/immich:/data
+    ports:
+      - "${LAN_IP}:${IMMICH_PORT}:2283"   # LAN UI/API; public = Caddyfile photos.* site
+    depends_on:
+      - immich-redis
+      - immich-db
+    restart: unless-stopped
+
+  # Name matches immich-server's built-in default ML URL (http://immich-machine-learning:3003).
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_IMAGE_TAG}
+    container_name: immich-machine-learning
+    profiles: ["immich-ml"]
+    volumes:
+      - immich_model_cache:/cache
+    restart: unless-stopped
+
+  immich-redis:
+    image: valkey/valkey:${IMMICH_REDIS_IMAGE_TAG}
+    container_name: immich-redis
+    profiles: ["immich"]
+    restart: unless-stopped
+
+  immich-db:
+    # Immich's own curated Postgres image (vectorchord) — tag must track the
+    # IMMICH_IMAGE_TAG line's release notes on bumps.
+    image: ghcr.io/immich-app/postgres:${IMMICH_DB_IMAGE_TAG}
+    container_name: immich-db
+    profiles: ["immich"]
+    environment:
+      POSTGRES_USER: ${IMMICH_DB_USERNAME}
+      POSTGRES_PASSWORD: ${IMMICH_DB_PASSWORD}
+      POSTGRES_DB: ${IMMICH_DB_DATABASE}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - immich_db:/var/lib/postgresql/data
+    shm_size: 128mb
+    restart: unless-stopped
+
+  # ── photos, option B: PhotoPrism (indexes-in-place; lighter; single-user free) ─
+  # Point it at an existing library: it indexes ${MEDIA_ROOT}/photos where it
+  # lives (no import). Pair with the syncthing profile for phone→box transfer.
+  photoprism:
+    image: photoprism/photoprism:${PHOTOPRISM_IMAGE_TAG}
+    container_name: photoprism
+    profiles: ["photoprism"]
+    environment:
+      PHOTOPRISM_ADMIN_PASSWORD: ${PHOTOPRISM_ADMIN_PASSWORD}
+      PHOTOPRISM_SITE_URL: http://${LAN_IP}:${PHOTOPRISM_PORT}/
+      PHOTOPRISM_DATABASE_DRIVER: mysql
+      PHOTOPRISM_DATABASE_SERVER: photoprism-db:3306
+      PHOTOPRISM_DATABASE_NAME: photoprism
+      PHOTOPRISM_DATABASE_USER: photoprism
+      PHOTOPRISM_DATABASE_PASSWORD: ${PHOTOPRISM_DB_PASSWORD}
+    volumes:
+      - ${MEDIA_ROOT}/photos:/photoprism/originals
+      - photoprism_storage:/photoprism/storage
+    ports:
+      - "${LAN_IP}:${PHOTOPRISM_PORT}:2342"
+    depends_on:
+      - photoprism-db
+    restart: unless-stopped
+
+  photoprism-db:
+    image: mariadb:${PHOTOPRISM_DB_IMAGE_TAG}
+    container_name: photoprism-db
+    profiles: ["photoprism"]
+    environment:
+      MARIADB_AUTO_UPGRADE: "1"
+      MARIADB_INITDB_SKIP_TZINFO: "1"
+      MARIADB_DATABASE: photoprism
+      MARIADB_USER: photoprism
+      MARIADB_PASSWORD: ${PHOTOPRISM_DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${PHOTOPRISM_DB_PASSWORD}
+    volumes:
+      - photoprism_db:/var/lib/mysql
+    restart: unless-stopped
+
+  # ── video: Jellyfin (movies/TV; music too if you skip Navidrome) ──────────────
+  jellyfin:
+    image: jellyfin/jellyfin:${JELLYFIN_IMAGE_TAG}
+    container_name: jellyfin
+    profiles: ["jellyfin"]
+    environment:
+      TZ: ${TIMEZONE}
+    volumes:
+      - jellyfin_config:/config
+      - jellyfin_cache:/cache
+      - ${MEDIA_ROOT}:/media:ro
+    # J4125 Quick Sync (VA-API) — good for 1080p transcodes. REQUIRES /dev/dri on
+    # the host; container creation FAILS without it (e.g. a Hyper-V test VM) —
+    # comment the devices: block out there. Prefer direct-play; this is no 4K box.
+    devices:
+      - /dev/dri:/dev/dri
+    ports:
+      - "${LAN_IP}:${JELLYFIN_PORT}:8096"
+    restart: unless-stopped
+
+  # ── music: Navidrome (Subsonic API — pick any client app) ────────────────────
+  navidrome:
+    image: deluan/navidrome:${NAVIDROME_IMAGE_TAG}
+    container_name: navidrome
+    profiles: ["navidrome"]
+    environment:
+      ND_MUSICFOLDER: /music
+    volumes:
+      - navidrome_data:/data
+      - ${MEDIA_ROOT}/music:/music:ro
+    ports:
+      - "${LAN_IP}:${NAVIDROME_PORT}:4533"
+    restart: unless-stopped
+
+  # ── podcasts + audiobooks: Audiobookshelf (subscribe/auto-download/track) ─────
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:${AUDIOBOOKSHELF_IMAGE_TAG}
+    container_name: audiobookshelf
+    profiles: ["audiobookshelf"]
+    environment:
+      TZ: ${TIMEZONE}
+    volumes:
+      - audiobookshelf_config:/config
+      - audiobookshelf_metadata:/metadata
+      - ${MEDIA_ROOT}/audiobooks:/audiobooks
+      - ${MEDIA_ROOT}/podcasts:/podcasts
+    ports:
+      - "${LAN_IP}:${AUDIOBOOKSHELF_PORT}:80"
+    restart: unless-stopped
+
+  # ── passwords: Vaultwarden (Bitwarden-compatible server) ─────────────────────
+  # Deliberately NO LAN port: the Bitwarden clients refuse plain HTTP, so the
+  # ONLY sane ingress is the Caddyfile vault.* site (TLS). Enabling this profile
+  # without uncommenting that site gives you a container nothing can reach.
+  vaultwarden:
+    image: vaultwarden/server:${VAULTWARDEN_IMAGE_TAG}
+    container_name: vaultwarden
+    profiles: ["vaultwarden"]
+    environment:
+      DOMAIN: https://vault.${DOMAIN}
+      SIGNUPS_ALLOWED: ${VAULTWARDEN_SIGNUPS_ALLOWED}
+      # ADMIN_TOKEN deliberately unset — the /admin panel stays disabled. Set it
+      # (argon2 hash, see vaultwarden wiki) only while you actively need it.
+    volumes:
+      - vaultwarden_data:/data
+    expose:
+      - "80"
+    restart: unless-stopped
+
+  # ── home automation: Home Assistant (container flavor) + Mosquitto (MQTT) ────
+  # Container flavor = NO supervisor/add-on store (that path is deprecated
+  # upstream anyway); companions run as sibling containers like mosquitto below.
+  # Host network (like technitium): HA's device discovery needs mDNS/SSDP
+  # broadcasts, so it binds :8123 on all interfaces — HA's own login is the gate.
+  # Public exposure later = Caddyfile home.* site + trusted_proxies in HA's config.
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:${HOMEASSISTANT_IMAGE_TAG}
+    container_name: homeassistant
+    profiles: ["homeassistant"]
+    network_mode: host
+    environment:
+      TZ: ${TIMEZONE}
+    volumes:
+      - homeassistant_config:/config
+    restart: unless-stopped
+
+  # Zigbee2MQTT is the natural third leg once a coordinator stick exists — not
+  # defined here (hardware-dependent; add it when the stick is real).
+  mosquitto:
+    image: eclipse-mosquitto:${MOSQUITTO_IMAGE_TAG}
+    container_name: mosquitto
+    profiles: ["mosquitto"]
+    volumes:
+      # Config is committed (no secrets). Mosquitto 2.x listens localhost-only
+      # without an explicit listener line — the file is required, not optional.
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+    ports:
+      - "${LAN_IP}:${MOSQUITTO_PORT}:1883"
+    restart: unless-stopped
+
+  # ── files: Syncthing (p2p sync — feeds ${MEDIA_ROOT} from phones/PCs) ─────────
+  syncthing:
+    image: syncthing/syncthing:${SYNCTHING_IMAGE_TAG}
+    container_name: syncthing
+    profiles: ["syncthing"]
+    volumes:
+      - syncthing_data:/var/syncthing
+      - ${MEDIA_ROOT}:/media
+    ports:
+      - "${LAN_IP}:${SYNCTHING_GUI_PORT}:8384"     # web UI (set a GUI password!)
+      - "${LAN_IP}:22000:22000/tcp"                # sync protocol
+      - "${LAN_IP}:22000:22000/udp"
+      - "${LAN_IP}:21027:21027/udp"                # local discovery
+    restart: unless-stopped
+
+  # ── quality-of-life: RSS, recipes, LAN dashboard ─────────────────────────────
+  freshrss:
+    image: freshrss/freshrss:${FRESHRSS_IMAGE_TAG}
+    container_name: freshrss
+    profiles: ["freshrss"]
+    environment:
+      TZ: ${TIMEZONE}
+      CRON_MIN: "13,43"     # built-in feed refresh (twice hourly)
+    volumes:
+      - freshrss_data:/var/www/FreshRSS/data
+    ports:
+      - "${LAN_IP}:${FRESHRSS_PORT}:80"
+    restart: unless-stopped
+
+  mealie:
+    image: ghcr.io/mealie-recipes/mealie:${MEALIE_IMAGE_TAG}
+    container_name: mealie
+    profiles: ["mealie"]
+    environment:
+      TZ: ${TIMEZONE}
+      BASE_URL: http://${LAN_IP}:${MEALIE_PORT}
+      ALLOW_SIGNUP: "false"
+    volumes:
+      - mealie_data:/app/data
+    ports:
+      - "${LAN_IP}:${MEALIE_PORT}:9000"
+    restart: unless-stopped
+
+  homepage:
+    image: ghcr.io/gethomepage/homepage:${HOMEPAGE_IMAGE_TAG}
+    container_name: homepage
+    profiles: ["homepage"]
+    environment:
+      # Required since v0.9.2 — requests with any other Host are rejected.
+      HOMEPAGE_ALLOWED_HOSTS: ${LAN_IP}:${HOMEPAGE_PORT}
+    volumes:
+      # Config lives in the volume (YAML, edited in place); no docker.sock on
+      # purpose — the discovery widgets aren't worth socket access here.
+      - homepage_config:/app/config
+    ports:
+      - "${LAN_IP}:${HOMEPAGE_PORT}:3000"
+    restart: unless-stopped
+
+  # ── ops: diun — pinned-image update NOTIFIER (closes the stale-pin gap) ───────
+  # The Q10.9 B+ flip side: pins never drift, but security patches never arrive
+  # unless someone looks (the oauth2-proxy v7.6.0 lesson, review 2026-07-10).
+  # diun watches every running container's registry tag and NOTIFIES (never
+  # auto-updates — Watchtower would violate the pin philosophy). Pair with the
+  # ntfy profile: notifications land on your own push channel.
+  diun:
+    image: crazymax/diun:${DIUN_IMAGE_TAG}
+    container_name: diun
+    profiles: ["diun"]
+    environment:
+      TZ: ${TIMEZONE}
+      DIUN_WATCH_SCHEDULE: "0 6 * * *"             # daily 06:00 check
+      DIUN_PROVIDERS_DOCKER: "true"
+      DIUN_PROVIDERS_DOCKER_WATCHBYDEFAULT: "true" # all containers unless diun.enable=false
+      DIUN_NOTIF_NTFY_ENDPOINT: ${DIUN_NTFY_ENDPOINT}
+      DIUN_NOTIF_NTFY_TOPIC: ${DIUN_NTFY_TOPIC}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - diun_data:/data
+    restart: unless-stopped
+
 volumes:
   ddns_data:
   technitium_config:
@@ -320,3 +633,21 @@ volumes:
   uptimekuma_data:
   ntfy_data:
   ntfy_cache:
+  # tier-2 opt-in volumes (SR-012) — created only when a profile first starts.
+  immich_db:
+  immich_model_cache:
+  photoprism_storage:
+  photoprism_db:
+  jellyfin_config:
+  jellyfin_cache:
+  navidrome_data:
+  audiobookshelf_config:
+  audiobookshelf_metadata:
+  vaultwarden_data:
+  homeassistant_config:
+  mosquitto_data:
+  syncthing_data:
+  freshrss_data:
+  mealie_data:
+  homepage_config:
+  diun_data:

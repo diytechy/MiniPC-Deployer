@@ -83,6 +83,11 @@ autoinstall:
     - curtin in-target --target=/target -- bash -c 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && chmod a+r /etc/apt/keyrings/docker.asc'
     - curtin in-target --target=/target -- bash -c 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list'
     - curtin in-target --target=/target -- bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
+    # Docker log rotation (review 2026-07-10): the default json-file driver grows
+    # unbounded — a slow disk-filler on an always-on box with small eMMC/SSD
+    # (Technitium/Caddy log every query/request). The "local" driver rotates by
+    # default (per-container cap), so one line prevents the failure mode.
+    - curtin in-target --target=/target -- bash -c 'mkdir -p /etc/docker && echo "{ \"log-driver\": \"local\" }" > /etc/docker/daemon.json'
     - curtin in-target --target=/target -- systemctl enable docker
     - curtin in-target --target=/target -- usermod -aG docker operator
 

@@ -23,6 +23,10 @@ Services (all health-checked, all `restart: unless-stopped`):
   old share token is rotation-flagged (see `.env.example`).
 - **Uptime-Kuma · Dozzle · (ntfy)** — auxiliary LAN-only observability
   (WI-10.11); see §8.
+- **Tier-2 opt-in catalog (SR-012)** — Immich / PhotoPrism, Jellyfin, Navidrome,
+  Audiobookshelf, Vaultwarden, Home Assistant + Mosquitto, Syncthing,
+  FreshRSS / Mealie / Homepage, diun — all behind compose **profiles**, OFF by
+  default and excluded from the baked ISO payload; see §9.
 
 This directory is the **image pipeline**. It is self-contained and committed with
 placeholders only — no secrets. Copy `.env.example` → `.env` and fill it in;
@@ -39,6 +43,8 @@ stack/
   caddy/Caddyfile             reverse proxy; oauth2-proxy for tracker, basic_auth for actual/dns
   oauth2-proxy/
     authenticated-emails.txt.example   allow-list template (real file gitignored)
+  mosquitto/
+    mosquitto.conf              MQTT broker config (tier-2 homeassistant/mosquitto profiles, §9)
   tracker/
     Dockerfile.deprecated     REFERENCE ONLY — NagLight owns the canonical build (WI-10.4)
     entrypoint.sh.deprecated  REFERENCE ONLY
@@ -290,6 +296,77 @@ docker compose --profile ntfy up -d
 
 All ports are configurable in `.env` (`UPTIMEKUMA_PORT`, `DOZZLE_PORT`,
 `NTFY_PORT`); each has a healthcheck.
+
+---
+
+## 9. Opt-in tier-2 catalog (SR-012)
+
+A second tier of self-hosted services rides in the same compose file behind
+**profiles** (the ntfy pattern) — **everything OFF by default**. The core stack,
+its validation, and the baked ISO payload are untouched until a profile is
+explicitly enabled.
+
+| Profile | Service | Access (default) | Purpose |
+|---|---|---|---|
+| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `http://<LAN_IP>:2283` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125 |
+| `photoprism` | PhotoPrism (+MariaDB) | `http://<LAN_IP>:2342` | photo library indexed in place (run at most ONE photo stack) |
+| `jellyfin` | Jellyfin | `http://<LAN_IP>:8096` | movies/TV; QSV transcode via `/dev/dri` |
+| `navidrome` | Navidrome | `http://<LAN_IP>:4533` | music, Subsonic API |
+| `audiobookshelf` | Audiobookshelf | `http://<LAN_IP>:13378` | podcasts + audiobooks |
+| `vaultwarden` | Vaultwarden | **Caddy site only** (HTTPS required) | Bitwarden-compatible passwords |
+| `homeassistant` | Home Assistant | `http://<LAN_IP>:8123` (host net) | home automation (container flavor — no add-on store) |
+| `mosquitto` | Mosquitto | `<LAN_IP>:1883` | MQTT bus for HA; config in `mosquitto/mosquitto.conf` |
+| `syncthing` | Syncthing | `http://<LAN_IP>:8384` | p2p file sync — feeds `MEDIA_ROOT` from phones/PCs |
+| `freshrss` / `mealie` / `homepage` | FreshRSS / Mealie / Homepage | LAN ports in `.env` | RSS · recipes · LAN dashboard |
+| `diun` | diun | logs / ntfy topic | update **notifier** for the pinned images (never auto-updates) |
+
+### Where everything is configured (the pre-build chain)
+
+All configuration happens in **this directory before the USB/ISO is built**, in
+four places — then the build scripts carry it onto the box:
+
+1. **`stack/.env`** (copy of `.env.example`) — THE knob file: secrets, ports,
+   pins, `MEDIA_ROOT`, and the enable switch **`COMPOSE_PROFILES`**. Compose
+   reads `COMPOSE_PROFILES` from `.env`, so firstboot's plain
+   `docker compose up -d` brings enabled profiles up at first boot.
+2. **`stack/caddy/Caddyfile`** — uncomment a tier-2 site block to publish that
+   service (each carries its own login; no basic_auth on them).
+3. **`stack/.env` → `EXTRA_SUBDOMAINS`** — one label per uncommented site;
+   provisioning adds the split-horizon A records.
+4. **`vmtest/export-images.sh`** — bakes core+ntfy images only. Tier-2 images
+   are **not baked** (pins are best-effort, not sim-validated); they pull at
+   enable time. To bake an enabled set into the ISO anyway:
+   `EXTRA_PROFILES="navidrome vaultwarden" bash vmtest/export-images.sh`.
+
+Then build as in §3: the USB payload carries your filled `.env` (autoinstall
+seeds from `.env.example` **only if you didn't pre-fill one**), the stack lands
+in `/opt/awow-core/stack`, and first boot brings up core + enabled profiles.
+
+### Enabling a service on a RUNNING box (no reflash)
+
+```sh
+ssh operator@<LAN_IP>
+cd /opt/awow-core/stack
+$EDITOR .env                       # add the profile to COMPOSE_PROFILES (+ its REPLACE_WITH knobs)
+docker compose up -d               # pulls the tier-2 image(s), starts them
+```
+
+`restart: unless-stopped` keeps them running across reboots from then on.
+Disable = remove the profile from `COMPOSE_PROFILES`, then
+`docker compose up -d --remove-orphans`.
+
+### Ground rules / caveats (read before enabling)
+
+- **RAM budget (8 GB):** core ≈ 1.5 GB. HA + Jellyfin + the small services fit;
+  run at most ONE photo stack; `immich-ml` is the heavy piece — leave it off or
+  give it a `mem_limit`.
+- **Media storage:** `MEDIA_ROOT` must point at real always-on storage — NOT
+  the WI-10.10 backup drives (streaming would defeat their spin-down policy).
+- **Tier-2 pins are NOT sim-validated** and carry no custom healthchecks yet
+  (probe tooling per image is unverified — the WI-10.14 lesson). Verify the
+  tag + behavior at enable time; the `diun` profile watches for updates after.
+- **Tier-2 volumes are NOT in the backup path** (open review finding 2026-07-10
+  — stack volumes generally aren't; see docs/status.md).
 
 ## Local validation status (honest)
 

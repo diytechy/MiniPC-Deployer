@@ -79,6 +79,46 @@ dns.{$DOMAIN} {
 #     reverse_proxy {$MAIN_BOX_IP}:8100   # BlueMap default web port
 # }
 
+# ── tier-2 opt-in public sites (SR-012) — COMMENTED, uncomment per service ─────
+# Publishing a tier-2 service is a deliberate THREE-step opt-in:
+#   1. enable its compose profile (COMPOSE_PROFILES in .env),
+#   2. uncomment its block here,
+#   3. add its label to EXTRA_SUBDOMAINS in .env (split-horizon record).
+# Every service below carries its OWN login — do NOT wrap them in basic_auth;
+# their mobile/desktop clients authenticate against the app's API directly and
+# a second auth layer breaks them. Most are also LAN-reachable on their LAN_IP
+# port bind (exception: Vaultwarden, which is HTTPS-only by design — this site
+# IS its ingress).
+#
+# vault.{$DOMAIN} {          # Vaultwarden — the Bitwarden clients point here
+#     encode zstd gzip
+#     reverse_proxy vaultwarden:80
+# }
+# photos.{$DOMAIN} {         # Immich — the mobile app needs this for away-from-home auto-backup
+#     encode zstd gzip
+#     reverse_proxy immich-server:2283
+# }
+# prism.{$DOMAIN} {          # PhotoPrism
+#     encode zstd gzip
+#     reverse_proxy photoprism:2342
+# }
+# jellyfin.{$DOMAIN} {       # Jellyfin
+#     encode zstd gzip
+#     reverse_proxy jellyfin:8096
+# }
+# music.{$DOMAIN} {          # Navidrome — Subsonic clients point here
+#     encode zstd gzip
+#     reverse_proxy navidrome:4533
+# }
+# audio.{$DOMAIN} {          # Audiobookshelf — its apps point here
+#     encode zstd gzip
+#     reverse_proxy audiobookshelf:80
+# }
+# home.{$DOMAIN} {           # Home Assistant — host-network, so proxy to the host.
+#     encode zstd gzip       # HA rejects proxied requests until Caddy is listed in
+#     reverse_proxy host.docker.internal:8123    # trusted_proxies in its config.
+# }
+
 # ── apex — bare domain answers on-LAN too ──────────────────────────────────────
 {$DOMAIN} {
     respond "AWOW always-on core. Try https://{$TRACKER_HOST}" 200

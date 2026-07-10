@@ -88,9 +88,17 @@ fi
 require_free_gb "$IMAGES_OUT" 3
 
 # ── 1. resolve the full pinned image set (compose is the source of truth) ─────
+# TIER-2 BOUNDARY (SR-012): opt-in profile services are EXCLUDED from the baked
+# payload by default — with their profiles off, `compose config --images` never
+# lists them, so the ISO stays core-sized and tier-2 images pull at enable time.
+# To bake an enabled opt-in set anyway (e.g. matching COMPOSE_PROFILES in the
+# real .env):  EXTRA_PROFILES="navidrome vaultwarden" bash vmtest/export-images.sh
+PROFILE_ARGS=(--profile ntfy)
+for p in ${EXTRA_PROFILES:-}; do PROFILE_ARGS+=(--profile "$p"); done
+
 log "resolving image set from $(basename "$COMPOSE_FILE") with pins from ${ENV_FILE#$REPO_ROOT/}"
 mapfile -t IMAGES < <(
-    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" --profile ntfy config --images \
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" config --images \
         | sed '/^\s*$/d' | sort -u
 )
 [ "${#IMAGES[@]}" -gt 0 ] || die "docker compose config --images returned nothing — is the env file complete?"

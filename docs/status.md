@@ -34,6 +34,20 @@ last) — it is the record, not required reading for every pass.
       auto-shrink on file deletion (see vmtest/README.md §2 for the
       reclaim-it steps: `wsl --shutdown` + `Optimize-VHD`/`diskpart compact`,
       elevated). Not urgent, but worth doing before further large downloads.
+    - OI-7 — **Tier-2 catalog ratifications (2026-07-10):** (a) confirm the
+      tier-2-NOT-baked ISO boundary (profiles excluded from the payload unless
+      `EXTRA_PROFILES` at export) as the standing Q10.9 B+ interpretation;
+      (b) decide where `MEDIA_ROOT` physically lives (must NOT be the WI-10.10
+      backup drives); (c) the oauth2-proxy **security pin bump** v7.6.0→v7.15.2
+      needs a V1 sim re-run + re-export before any real flash →
+      [stack/README.md §9](../stack/README.md)
+    - OI-8 — **Backup gap (review 2026-07-10):** the stack's own Docker volumes
+      (`actual_data` — the finances!, `technitium_config`, `tracker_data` in
+      multi-user mode, `caddy_data`, tier-2 volumes) are backed up by NOTHING;
+      README §7 advises it but no automation does it. Proposed: a local
+      volume-tar source step in `backup.sh` riding the existing
+      hash/manifest/offsite pipeline — deliberately NOT implemented inline
+      (WI-10.15-validated behavior; needs its own work item + sim assertions).
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)
@@ -455,7 +469,7 @@ containerd store; see `images.manifest.tsv`):
 |---|---|---|---|---|
 | technitium | `TECHNITIUM_IMAGE_TAG` | `latest` | `15.2.0` | `sha256:23d3b63d959e997800b095fe93009b3fae271b5258234ff2ade8535cb33682c8` |
 | caddy | `CADDY_IMAGE_TAG` | `2-alpine` | `2.11.4-alpine` | `sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648` |
-| oauth2-proxy | `OAUTH2_PROXY_IMAGE_TAG` | `v7.6.0` | `v7.6.0` (already pinned) | `sha256:dcb6ff8dd21bf3058f6a22c6fa385fa5b897a9cd3914c88a2cc2bb0a85f8065d` |
+| oauth2-proxy | `OAUTH2_PROXY_IMAGE_TAG` | `v7.6.0` | **`v7.15.2`** (SECURITY bump 2026-07-10 — auth-bypass CVEs fixed since v7.6.0; NOT yet sim-validated/exported — re-run V1 sim + export-images.sh; digest recorded at that export) | *(pending re-export; v7.6.0 was `sha256:dcb6ff8d…`)* |
 | tracker | `TRACKER_IMAGE_TAG` | `local` | `local` (local build, no registry) | id `sha256:9a573d4367032a4d872736718f5dd68872bcf5b1d01d727359ff36413f8f4112` |
 | actual | `ACTUAL_IMAGE_TAG` | `latest` | `26.7.0` | `sha256:e18b7fbfec6157a368fad4146563f397502e9da70a120aeaeac63b4977405d1c` |
 | ddns | `DDNS_IMAGE_TAG` | `latest` | `v2.10.0` | `sha256:3e2aa558946b5a293def4d73008fa4651c072b2c12932cecd02126fb23979831` |
@@ -577,3 +591,72 @@ command — cannot be known in sim; it is a per-drive **burn-in** check
 force a spin-down and confirm). The real electrical/spindle-wear benefit is
 likewise a hardware measurement. The sim proves the *call contract and its
 failure-path composition*, not the drive's physical response.
+
+### DRIVER — G1 — Round 1 — 2026-07-10 (STACK REVIEW + TIER-2 OPT-IN CATALOG — SN-009/SR-012)
+
+Peter asked for (a) a review of the deployer stack and (b) an opt-in catalog of
+additional self-hosted services (photos ×2, media, music, podcasts, home
+automation, passwords, etc.). Both delivered this session.
+
+**Review findings → fixes applied (config-only):**
+- **BUG (real-box): `dns.<domain>` would 502.** The Caddyfile proxies
+  `host.docker.internal:5380`, a Docker-DESKTOP-only name — plain docker-ce
+  never resolves it. Fixed with `extra_hosts: host.docker.internal:host-gateway`
+  on the caddy service. The V1 sim could not catch this: `Caddyfile.sim`
+  deliberately proxies the bridge container name instead. **Needs V3/hardware
+  verification.**
+- **SECURITY: oauth2-proxy pin bumped v7.6.0 → v7.15.2** (multiple 2026
+  auth-bypass advisories fixed in between: CVE-2026-34457, CVE-2026-40575,
+  GHSA-7x63-xv5r-3p2x, GHSA-pxq7-h93f-9jrg, GHSA-c5c4-8r6x-56w3 email-validation
+  — the last one weakens exactly our allow-list gate). NOT sim-validated at the
+  new tag yet — OI-7(c); pin-ledger row updated with digest PENDING re-export.
+- **Docker log rotation** was unconfigured (unbounded json-file on a small
+  eMMC) — autoinstall now writes `/etc/docker/daemon.json` with the `local`
+  driver (rotates by default).
+- **Backup gap recorded as OI-8** (stack volumes — incl. `actual_data` — backed
+  up by nothing); deliberately NOT fixed inline: `backup.sh` is
+  WI-10.15-validated behavior and a change there needs its own sim assertions.
+- Minor (recorded, not acted on): Dozzle has no auth (LAN-bind is the only
+  gate); ntfy topics are LAN-open by default; Technitium :5380 is cleartext
+  HTTP on the LAN; no mem_limits yet (matters as tier-2 services get enabled).
+
+**Tier-2 catalog added (SN-009/SR-012, all OFF by default, ntfy-profile
+pattern):** immich(+ml)/photoprism (photos — at most ONE), jellyfin (QSV via
+/dev/dri), navidrome (music), audiobookshelf (podcasts/audiobooks), vaultwarden
+(Caddy-site-only ingress by design), homeassistant+mosquitto (host-net HA;
+committed no-secret mosquitto.conf), syncthing, freshrss/mealie/homepage, diun
+(update NOTIFIER — closes the stale-pin gap within the pins-never-drift
+philosophy; `diun.enable=false` label on the registry-less naglight:local).
+Wiring: `COMPOSE_PROFILES` in `.env` is the enable switch (firstboot's plain
+`compose up -d` honors it); commented Caddyfile sites + `EXTRA_SUBDOMAINS`
+(provision script loop) for public exposure; `export-images.sh` gained
+`EXTRA_PROFILES` and its default behavior — tier-2 excluded from the baked
+payload — falls out of profiles being off (OI-7(a) to ratify). Docs:
+stack/README §9 (incl. the pre-build configuration chain + RAM/storage ground
+rules); root README table row.
+
+**Versions (honest):** Immich layout verified against the v3.0.2 release
+compose (server/ml `v3.0.2`, `ghcr.io/immich-app/postgres:14-vectorchord0.4.3-
+pgvectors0.2.0`, valkey `9`); PhotoPrism upstream publishes `latest` as its
+stable tag (documented exception). Remaining tier-2 pins are best-effort
+known-good tags, marked VERIFY-at-enable in `.env.example`; none are
+sim-validated and none carry custom healthchecks yet (WI-10.14 lesson — probe
+tooling per image is checked empirically at enable time).
+
+**Assumptions (unattended, to confirm at next gate):** tier-2-not-baked is the
+right Q10.9 B+ boundary (OI-7a); `MEDIA_ROOT=/srv/media` default pending the
+storage decision (OI-7b); FreshRSS chosen over Miniflux (single container +
+SQLite); Zigbee2MQTT deferred until a coordinator stick exists; subdomain
+labels fixed as vault/photos/prism/jellyfin/music/audio/home.
+
+**RAN FOR REAL (this session, dev box):** `validate_config.py` (72 compose vars
+covered, all PASS) + `check.py` G1 (config-validate, registry-integrity with
+SN=9/SR=12, doc-navigability) → **PASS**; `bash -n` clean on the two changed
+shell scripts; WSL-Ubuntu `docker compose config` — with **no profiles** it
+resolves exactly the original 8 core services (tier-2 exclusion proven for the
+export path), with **all 15 profiles** the config is VALID and lists the full
+26-image set; `docker manifest inspect` confirmed **every** tier-2 pin AND
+oauth2-proxy `v7.15.2` exists on its registry. **NOT run:** any container —
+tier-2 services have never been started anywhere (enable-time validation per
+README §9), and the core changes (extra_hosts, log rotation, oauth2-proxy tag)
+await the V1-sim re-run / V3 boot (OI-7c).

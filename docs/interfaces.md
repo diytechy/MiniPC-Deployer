@@ -9,6 +9,21 @@ shared contract gets one stable id, one home, and a link back into the same
 `SN→SR→LLR→TC` spine. The registry is `requirements/interfaces.csv`; this page
 is the thin, human-readable index over it.
 
+## Current interfaces (this repo ↔ NagLight)
+
+All three are `Consumes` from this repo's side — NagLight (private) owns the
+contracts; matching IF-IDs should be recorded there too:
+
+- **IF-001** — the `naglight:local` container image (NagLight owns the build,
+  D1/WI-10.4; resolved via `scripts/ensure-local-images.sh`, SR-006).
+- **IF-002** — the trusted-header identity contract: oauth2-proxy →
+  `X-Forwarded-Email`/`-User` → NagLight multi-user mode (D3/WI-10.5, SR-003).
+- **IF-003** — `POST /api/feed` `{check,ok,note}` + Bearer token — the backup
+  service's never-silent-green report and Uptime-Kuma pushes (SR-013).
+
+Finance-Auditor has **no interface yet** (no compose service consumes it);
+add its IF row alongside the resolver entry when its service lands.
+
 ---
 
 ## Why a separate registry

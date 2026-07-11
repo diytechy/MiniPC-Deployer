@@ -144,7 +144,11 @@ Fill in at minimum:
 
 > **This table lists the knobs that need YOUR values filled in.** For the full
 > set including ones with sensible defaults, read `.env.example` top to bottom
-> — it's the source of truth and every entry is commented.
+> — it's the source of truth and every entry is commented. Mind its **QUOTING
+> RULE** header (values with spaces must be double-quoted — the file is both a
+> compose env-file and shell-sourced by firstboot/provisioning). Tier-2 opt-in
+> knobs (`COMPOSE_PROFILES`, `MEDIA_ROOT`, `EXTRA_SUBDOMAINS`, per-service
+> pins/ports/passwords) live in the same file — see §9.
 
 **Filling these in today is a manual step.** An automated secret-handoff
 script is proposed (not yet built) in the sibling `Personal` repo's

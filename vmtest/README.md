@@ -58,6 +58,12 @@ loudly that the payload carries no images, and the VM falls back to pulling at
 first boot (needs internet — and `naglight:local` has no registry home, so the
 tracker would fail). Rebuild the payload whenever you bump a pinned tag.
 
+**Tier-2 boundary (SR-012):** "EVERY container" means the **core+ntfy set** —
+the opt-in tier-2 catalog (stack/README §9) sits behind compose profiles, so
+`export-images.sh` never sees those images by default and the ISO stays
+core-sized; enabled opt-ins pull at enable time instead. To bake an enabled set
+anyway: `EXTRA_PROFILES="navidrome vaultwarden" bash vmtest/export-images.sh`.
+
 ---
 
 ## 1. ISO strategy — LIGHT path (default) vs. HEAVIER path (fallback)

@@ -15,3 +15,7 @@ docker compose up -d                            # in ../ (the stack dir)
 
 Or uncomment the `build:` fallback in `../docker-compose.yml` to have compose
 build the image straight from a sibling `../../NagLight` checkout.
+
+Dev boxes can let `scripts/ensure-local-images.sh` (repo root) do this instead
+— it resolves `naglight:local` via present → sibling build → the declared
+`TRACKER_PUBLIC_IMAGE` fallback (SR-006), and fails loudly naming the fixes.

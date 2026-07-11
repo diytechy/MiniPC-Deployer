@@ -12,14 +12,26 @@ Project facts live in `docs/`; this file points at them.
 
 ---
 
-## Project (fill this in)
+## Project
 
-- **What this is / one-line purpose:**
-- **Primary users & their expertise level:**
-- **Stack & layout:** language(s); source in `src/`, tests in `tests/`.
-- **How to run the app / pipeline:**
-- **Non-goals (explicitly out of scope):**
-- **Sibling/linked projects (if any):** see `docs/interfaces.md`.
+- **What this is / one-line purpose:** the deploy repo for the headless AWOW
+  AK41 always-on homelab box — compose stack (DNS/proxy/tracker/budget/backup +
+  an off-by-default tier-2 catalog), Ubuntu autoinstall image, provisioning.
+  **Config only**; app code lives in sibling repos.
+- **Primary users & their expertise level:** Peter (expert homelab operator);
+  public-repo visitors who run the sim (Docker basics).
+- **Stack & layout:** bash + YAML/Caddyfile config. `stack/` = the deploy unit;
+  `sim/` = V1 full-stack sim (all fixtures fictional); `vmtest/` = V3 Hyper-V
+  boot; `scripts/` = check harness (python) + image resolver; `docs/` = spine.
+- **How to run the app / pipeline:** no app — `sim/run-sim.sh` +
+  `sim/validate-sim.sh` for the virtual stack; `python scripts/check.py` is the
+  gate bar; real deploy per `stack/README.md`.
+- **Non-goals (explicitly out of scope):** app code (NagLight/Finance-Auditor);
+  a container registry / CI publishing (Q10.2); the secret-handoff script
+  (WI-10.3, unratified).
+- **Sibling/linked projects:** NagLight, Finance-Auditor (both private),
+  Personal — contracts in [docs/interfaces.md](docs/interfaces.md) +
+  `docs/requirements/interfaces.csv`.
 
 ---
 

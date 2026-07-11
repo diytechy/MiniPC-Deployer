@@ -54,6 +54,11 @@ docker compose restart oauth2-proxy # after editing the allow-list
 
 # 4. Reconverge DNS / config after an .env edit (idempotent)
 sudo /usr/local/sbin/awow-firstboot.sh
+
+# 5. Enable / disable a tier-2 opt-in service (stack/README §9, SR-012)
+$EDITOR .env                        # add/remove the profile in COMPOSE_PROFILES
+docker compose up -d                # enable: pulls the image, starts it
+docker compose up -d --remove-orphans   # disable: removes de-profiled containers
 ```
 
 For anything a browser can do instead of a shell: **Cockpit** (system) and

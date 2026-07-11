@@ -78,6 +78,7 @@ shares plus a privileged runner that cifs-mounts them and runs the **real**
 ```bash
 sim/mini-serv-sim/run-backup-sim.sh        # full 6-step cycle + restore drill
 sim/mini-serv-sim/run-drivepower-sim.sh    # WI-10.10 hdparm standby CALL CONTRACT (mock shim)
+sim/mini-serv-sim/run-volume-sim.sh        # SR-013 volume:/quiesce CALL CONTRACT (mock-docker shim)
 sim/mini-serv-sim/run-backup-sim.sh --down # tear down
 ```
 

@@ -58,9 +58,11 @@ last) — it is the record, not required reading for every pass.
       ANY failure posts. Small fix (route `die` through the report once config
       is loaded); needs its own sim assertion.
 - **Assumptions (unattended):** see the Assumptions log below.
-- **Next action:** Peter reviews + pushes; creates the Google OAuth client;
-  reacts to the reimage-ladder checkboxes. Runtime bring-up on the first Docker
-  host / the AWOW itself.
+- **Next action:** Peter reviews + pushes; creates the Google OAuth client
+  (OI-1); runs the V3 boot (OI-5); ratifies the tier-2 decisions (OI-7) —
+  then the "V3.5 dress rehearsal" (real secrets in the VM: External vSwitch,
+  TLS decision, backup VHDX) discussed 2026-07-10 turns the sim-GREENs into
+  real evidence.
 - **UPDATE 2026-07-03 (WI-10.13):** the "no Docker on the dev machine" constraint
   above is now LIFTED — WSL2 + Ubuntu 24.04 + docker-ce is installed on the dev
   PC (Docker Desktop explicitly NOT installed, per Peter's pick). `naglight:local`
@@ -102,13 +104,15 @@ last) — it is the record, not required reading for every pass.
   enumerates every knob, config coverage validates, and the honest validation
   ledger records what remains PENDING a Docker host.
 
-## Honest validation ledger (WI-4.7 note carried forward)
+## Honest validation ledger (WI-4.7 note carried forward; updated 2026-07-11)
 
 | Check | State |
 |---|---|
-| `docker compose config` / live bring-up | **PENDING — no Docker on dev box (verified)** |
-| curl health endpoints, `dig`, OAuth round-trip, tear-down | **PENDING — Docker host / the AWOW** |
-| Q10.9 B+ image payload: `export-images.sh` save + `docker load` all 9 | PASS (WSL; loads idempotent) — first-boot load-at-VM awaits V3 |
+| `docker compose config` (core + all tier-2 profiles) | PASS (WSL docker-ce; core = the original 8 services with no profiles) |
+| Live bring-up + curl health + `dig` + OAuth round-trip + tear-down | **GREEN in the V1 sim** (vs Dex/internal-CA/fixtures — `validate-sim.sh` 6 checks); **real-Google/real-TLS/host-:53 PENDING V3 boot + hardware** |
+| Backup pipeline (cifs + offsite + feed + restore drill) | GREEN (`run-backup-sim.sh`); drive-power + volume-source call contracts GREEN (mock-shim legs) — drive spin-down physics + real-docker volume copy are V3/burn-in |
+| Q10.9 B+ image payload: `export-images.sh` save + `docker load` all 9 | PASS (WSL; loads idempotent) — first-boot load-at-VM awaits V3; **oauth2-proxy v7.15.2 pin bump needs a re-export + sim re-run (OI-7c)** |
+| Tier-2 pins exist on their registries (`docker manifest inspect`) | PASS — but tier-2 services have never been STARTED anywhere (enable-time validation, stack/README §9) |
 | Shell scripts `bash -n` | PASS |
 | `docker-compose.yml`, `meta-data`, `user-data` YAML parse | PASS (PyYAML) |
 | Every compose `${VAR}` has an `.env.example` key | PASS (`validate_config.py`) |
@@ -116,8 +120,10 @@ last) — it is the record, not required reading for every pass.
 | Bind-mount sources + autoinstall-referenced files exist | PASS |
 | `check.py` (G1: config-validate + registry-integrity + doc-navigability) | PASS |
 
-Runtime validation must be redone on the first Docker host before the burn-in
-checklist (stack/README §6) can be signed.
+What only V3/hardware can still prove: real Google consent, publicly-trusted
+ACME certs, Technitium on the host's real `:53`, the `extra_hosts` dns.<domain>
+fix, drive spin-down physics, thermals — then the burn-in checklist
+(stack/README §6) signs the box off.
 
 ## Gate Sign-offs
 
@@ -757,3 +763,39 @@ NagLight`; (3) no sibling + knob set → public pull+retag decision; (4) neither
 clean (was: `bot: command not found`, exit 127); `docker compose config`
 confirms quote-stripping (`TRACKER_GIT_NAME: naglight bot`). `bash -n` clean on
 all touched scripts; `check.py` G1 PASS.
+
+### DRIVER — G1 — Round 1 — 2026-07-11 (DOC CURRENCY PASS — Peter's ask)
+
+Peter asked for all docs to be brought current (the tier-2 catalog and other
+recent work were missing from the root README and elsewhere). Swept every doc
+against the repo's actual state:
+
+- **Root README:** intro now names the backup service + the tier-2 opt-in
+  catalog; "Run it" points at the SR-006 resolver and the zero-secrets sim
+  path; V1 gate row lists the drive-power + volume sim legs; "Configuring the
+  REAL box" adds the QUOTING RULE, `COMPOSE_PROFILES`, the backup `volume:`
+  lines, and the tier-2/EXTRA_PROFILES bake boundary.
+- **AGENTS.md:** the Project section (never filled since scaffolding) now
+  carries the one-line purpose, users, layout, run/check commands, non-goals,
+  and sibling repos.
+- **docs/architecture.md:** topology diagram gains ddns, the backup service,
+  and the tier-2 subgraph; new bullets for DDNS/backup/tier-2/resolver; layout
+  table adds stack/backup, stack/mosquitto, sim/, vmtest/, the resolver; the
+  STALE "no Docker on the dev machine" validation model replaced with the
+  three-tier static → V1 sim → V3/hardware model.
+- **docs/status.md:** the honest-validation ledger no longer claims
+  "PENDING — no Docker" (superseded 2026-07-03); rows now record what the V1
+  sim proved vs what V3/hardware still must; Next action refreshed.
+- **docs/requirements/interfaces.csv + docs/interfaces.md:** the EXAMPLE row
+  replaced with the three real NagLight contracts — IF-001 (naglight:local
+  image), IF-002 (trusted identity headers), IF-003 (/api/feed) — and a
+  human-readable index; matching IF-IDs still need recording on the NagLight
+  side. Clears the pre-existing check_docs orphan warning.
+- **vmtest/README:** Q10.9 "bake EVERY container" qualified with the SR-012
+  tier-2 boundary + EXTRA_PROFILES. **REMOTE_MANAGEMENT.md:** tier-2
+  enable/disable added to the day-2 compose workflow. **sim/README:**
+  run-volume-sim.sh listed. **stack/README §2:** QUOTING RULE + tier-2 knob
+  pointer. **stack/tracker/README:** resolver pointer.
+
+`check.py` G1 PASS (config-validate, registry-integrity, doc-navigability —
+now 0 warnings). Docs-only change; no config/script behavior touched.

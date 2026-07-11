@@ -3,10 +3,13 @@
 The deploy repository for Peter's headless homelab box (the **AWOW AK41
 always-on core**): a zero-touch, always-on Docker stack — split-horizon DNS
 (Technitium), reverse proxy + TLS (Caddy), the NagLight life-tracker behind
-Google sign-in (oauth2-proxy), Actual Budget, and LAN-only observability — with
-an unattended Ubuntu autoinstall image and full LAN remote management. This repo
-holds **configuration only** (compose, Caddy, autoinstall, provisioning); the
-application code lives in its own repos (NagLight, Finance-Auditor, …).
+Google sign-in (oauth2-proxy), Actual Budget, LAN-only observability, and the
+bash backup service — plus an **opt-in tier-2 catalog** (photos, media, music,
+podcasts, home automation, passwords, …) behind compose profiles, off by
+default — with an unattended Ubuntu autoinstall image and full LAN remote
+management. This repo holds **configuration only** (compose, Caddy, autoinstall,
+provisioning); the application code lives in its own repos (NagLight,
+Finance-Auditor, …).
 
 > **Public-facing repo (Q10.6):** only `*.example` templates are tracked. No real
 > secret, password, hash, email, or LAN detail is ever committed. Copy each
@@ -34,9 +37,14 @@ Remote management of the headless box (SSH, Cockpit, the reimage ladder) is in
 
 There is no single "run" command — this repo produces a **deploy image**, not an
 app. To bring the stack up on a Docker host, follow
-[stack/README.md](stack/README.md) (`docker build -t naglight:local ../NagLight`
-→ `docker compose up -d`). The root `run.{cmd,sh,command}` launchers are inert
-(this is not a launchable product).
+[stack/README.md](stack/README.md): resolve the tracker image with
+`scripts/ensure-local-images.sh` (SR-006 chain: present → sibling `../NagLight`
+build → declared `TRACKER_PUBLIC_IMAGE`) → `docker compose up -d`. To see the
+whole thing connect up **virtually with zero real secrets**, run the V1 sim
+([sim/README.md](sim/README.md)) — every external interface has a fictional,
+committed stand-in (Dex for Google, internal CA for ACME, Samba fixtures for
+Mini-serv). The root `run.{cmd,sh,command}` launchers are inert (this is not a
+launchable product).
 
 ## Validate it
 
@@ -49,7 +57,7 @@ Three progressively-more-real gates precede flashing the real AWOW:
 
 | Gate | What | Status |
 |---|---|---|
-| V1 — [`sim/`](sim/) | full stack on WSL2/Docker vs. a mock OIDC provider (Dex stands in for Google); split-horizon DNS, multi-user isolation, and the bash backup service + restore drill all exercised for real | **GREEN** — all checks pass |
+| V1 — [`sim/`](sim/) | full stack on WSL2/Docker vs. a mock OIDC provider (Dex stands in for Google); split-horizon DNS, multi-user isolation, and the bash backup service + restore drill all exercised for real — plus mock-shim call-contract legs for drive power (`run-drivepower-sim.sh`) and docker-volume sources (`run-volume-sim.sh`, SR-013) | **GREEN** — all checks pass |
 | V2 — launcher (Personal repo, `MINI_PC_Setup/`) | the Mini-serv rebuild launcher validated in Windows Sandbox (real task-import/reg/share rungs) | **GREEN** |
 | V3 — [`vmtest/`](vmtest/) | the REAL autoinstall booted in a local Hyper-V VM — every container baked into the ISO payload (Q10.9 B+), zero registry pulls at first boot | scripted + smoke-tested; **the boot itself is Peter's step** (needs elevation + the Hyper-V feature) |
 
@@ -65,16 +73,23 @@ never flash `vmtest/.out/*.iso` onto real hardware. To build the actual
 deploy image:
 
 1. Fill in a real `stack/.env` from `.env.example` (every knob is documented
-   there and in [stack/README.md](stack/README.md) §2) and put your real SSH
-   public key into `stack/autoinstall/user-data` (§"Build the USB").
+   there and in [stack/README.md](stack/README.md) §2 — mind the **QUOTING
+   RULE** in its header: values with spaces must be double-quoted) and put your
+   real SSH public key into `stack/autoinstall/user-data` (§"Build the USB").
+   Two opt-in decisions live here too: `COMPOSE_PROFILES` (which tier-2
+   services come up at first boot, stack/README §9) and the commented
+   `volume:` lines in the backup config (`stack/backup/backup.env.example`) so
+   the box's own state — the finances — joins the backup (SR-013).
 2. Filling `.env` today is a **manual** step — the automated secret-handoff
    script proposed in `Personal\SECRET_HANDOFF_PROPOSAL.md` (a sibling repo;
    extends Peter's existing DPAPI credential pattern) is still an unratified
    proposal, not implemented. Once ratified it would materialize `.env` from
    Personal's credential store instead of hand-editing.
 3. Run `vmtest/export-images.sh` (it reads the real pinned tags in
-   `.env.example`, not sim values) so the real USB also carries every
-   container image baked in (Q10.9 B+) — see stack/README.md §3.
+   `.env.example`, not sim values) so the real USB also carries every **core**
+   container image baked in (Q10.9 B+) — see stack/README.md §3. Tier-2 opt-in
+   images are **excluded** from the bake by default; pass
+   `EXTRA_PROFILES="…"` to include an enabled set (SR-012).
 
 ## Development
 

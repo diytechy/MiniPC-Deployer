@@ -27,6 +27,9 @@ if [[ "${1:-}" == "--down" ]]; then
     exit 0
 fi
 
+echo "== AWOW-sim: resolve locally-built images (present -> sibling -> public, SR-006) =="
+bash scripts/ensure-local-images.sh
+
 echo "== AWOW-sim: config sanity (real compose + overlay resolves) =="
 "${COMPOSE[@]}" config -q
 

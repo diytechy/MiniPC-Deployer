@@ -125,7 +125,8 @@ for ref in "${IMAGES[@]}"; do
         case "$ref" in
             naglight:*|*:local)
                 die "MISSING local-only image '$ref' — it has no registry home (Q10.2)." \
-                    "Build it first:  docker build -t naglight:local ../NagLight" \
+                    "Resolve it first:  bash scripts/ensure-local-images.sh" \
+                    "(present -> sibling build ../NagLight -> declared TRACKER_PUBLIC_IMAGE)" \
                     "then re-run this script. The AWOW cannot fetch this image anywhere," \
                     "so it MUST be baked into the payload."
                 ;;

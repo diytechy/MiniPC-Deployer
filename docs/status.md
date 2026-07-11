@@ -717,3 +717,43 @@ own sim assertion later.
 only by the call contract here; first real exercise happens on a Docker host /
 the AWOW with the volume lines uncommented. The sim shim answers `volume
 inspect` with a fixture dir by design.
+
+### DRIVER — G1 — Round 1 — 2026-07-10 (SR-006 resolver chain + .env QUOTING BUG fix)
+
+**Peter's ask:** NagLight and Finance-Auditor are private — the dev package
+should take each locally-built container from a sister folder of the same name,
+else grab a declared public one.
+
+**Built:** `scripts/ensure-local-images.sh` — resolves each locally-built image
+via **present → sibling build (`../NagLight`) → declared public image
+(`TRACKER_PUBLIC_IMAGE` in `.env`, empty until the app repo publishes) → loud
+failure naming all three fixes**. Downstream consumers are untouched: compose,
+the sim overlay, and export-images.sh keep consuming the same `naglight:local`
+ref regardless of which path supplied it (a public image is pulled + retagged).
+`sim/run-sim.sh` now calls the resolver before bring-up; export-images.sh's
+missing-tracker error points at it. Finance-Auditor has a ready-to-uncomment
+entry (no compose service consumes it yet — Actual Budget is the running
+finance app). `--rebuild` forces a sibling rebuild; `--dry-run` prints
+decisions; `SIBLING_ROOT` overrides the parent-dir convention (CI-friendly).
+SR-006 requirement/acceptance updated to cover the chain.
+
+**BUG FOUND AND FIXED while testing (real-box first-boot breaker):**
+`.env.example` carried `TRACKER_GIT_NAME=naglight bot` — an UNQUOTED space.
+The file is BOTH a compose env-file AND shell-sourced by `firstboot.sh` (step
+2) and `provision-technitium.sh`; sourcing that line executes `bot` as a
+command → command-not-found → `set -e` kills first boot before compose up.
+Never caught because the sim/seed substitute space-free values — the REAL
+hand-filled-.env path was the one that would break. Fixed: quoted
+`TRACKER_GIT_NAME`, quoted the space-separated knobs (`TECHNITIUM_FORWARDERS`,
+`TECHNITIUM_BLOCKLISTS`), added the QUOTING RULE to the file header (compose
+strips double quotes, so quoting is safe for both readers). The resolver
+itself now greps only the keys it needs instead of shell-sourcing the file
+(defense in depth).
+
+**RAN FOR REAL (WSL2 / docker):** all four resolver paths — (1) image present
+→ no-op; (2) `--rebuild --dry-run` → sibling build from `/mnt/c/Projects/
+NagLight`; (3) no sibling + knob set → public pull+retag decision; (4) neither
+→ loud failure, exit 1. Firstboot-style `set -a; . .env.example` now sources
+clean (was: `bot: command not found`, exit 127); `docker compose config`
+confirms quote-stripping (`TRACKER_GIT_NAME: naglight bot`). `bash -n` clean on
+all touched scripts; `check.py` G1 PASS.

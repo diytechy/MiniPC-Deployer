@@ -13,7 +13,12 @@ live only in the gitignored `stack/.env`.
 ## Prerequisites
 
 - A container runtime (WSL2 + docker-ce; WI-10.13).
-- The NagLight image built once: `docker build -t naglight:local ../NagLight`.
+- The NagLight image — resolved automatically by `run-sim.sh` via
+  `scripts/ensure-local-images.sh` (SR-006 chain: already present → built from a
+  sibling `../NagLight` checkout → pulled from `TRACKER_PUBLIC_IMAGE` if that
+  knob is set). NagLight is a private repo today, so until it publishes a public
+  image a checkout (or a pre-built `naglight:local`) is required; the resolver
+  fails loudly naming all three fixes.
 
 ## Run it
 

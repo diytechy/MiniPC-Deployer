@@ -81,6 +81,14 @@ docker build -t naglight:local ../../NagLight   # adjust path to your checkout
 
 (or uncomment the `build:` fallback in `docker-compose.yml`).
 
+**Dev boxes: use the resolver instead.** NagLight (and later Finance-Auditor)
+are private repos, so `scripts/ensure-local-images.sh` resolves each
+locally-built image permissively — already present → sibling-checkout build →
+a declared public image (`TRACKER_PUBLIC_IMAGE` in `.env`, empty until the app
+repo publishes) — and fails loudly naming all three fixes otherwise.
+`sim/run-sim.sh` calls it automatically; compose and export-images.sh keep
+consuming the same `naglight:local` ref regardless of which path supplied it.
+
 ### Image delivery to the AWOW — Q10.9 B+ (ALL-IMAGES, baked into the ISO)
 
 The AWOW does **not** pull any image from a registry at first boot. Per Peter's

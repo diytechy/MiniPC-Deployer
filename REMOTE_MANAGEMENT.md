@@ -65,6 +65,44 @@ For anything a browser can do instead of a shell: **Cockpit** (system) and
 **Dozzle** (logs) cover "navigate, read logs, accept updates, reboot" without a
 terminal.
 
+### State & credentials — what survives an update vs a reimage
+
+The question this answers: *"will updating containers trash my credentials?"*
+**No — no credential lives inside a container or image.** Containers are
+disposable code; everything stateful sits in exactly two places on the host:
+
+| Where | What lives there | container update (`compose pull` + `up -d`, or a pin bump) | reimage (USB re-flash) |
+|---|---|---|---|
+| **Named Docker volumes** | Actual's server password + **SimpleFIN bank-sync credential** + budget files (`actual_data`) · Technitium zones/settings (`technitium_config`) · Caddy certs + ACME account (`caddy_data`) · tracker user data (`tracker_data`) · Vaultwarden vault + other tier-2 state | **survives** — pull/up recreates containers *around* unchanged volumes | **wiped** — restore from the volume backups (the `volume:` lines in `backup.env`, SR-013 + `restore.sh`), or re-do the small set of one-time in-app auths |
+| **Host config files** | `/opt/awow-core/stack/.env` (OAuth client secret, Cloudflare token, Technitium admin password, basic_auth hashes) · `oauth2-proxy/authenticated-emails.txt` · `provision/.token` · `/etc/awow-backup/{backup.env,cifs.creds}` | survives | `.env` + the allow-list are **re-seeded from the USB payload** (carry your filled `.env` on the stick); `provision/.token` re-mints itself idempotently; `/etc/awow-backup/*` must be restored by hand |
+
+Consequences worth internalizing:
+
+- **Individual container updates are credential-safe by construction.** The §3
+  workflow above (`compose pull && up -d`, or bumping one `*_IMAGE_TAG` in
+  `.env`) never touches a volume — including Actual: the SimpleFIN link,
+  server password, and budgets all ride `actual_data` untouched.
+- **One-time in-app authentications live server-side in volumes, not `.env`:**
+  Actual's SimpleFIN credential is entered in Actual's own UI (stack/README §2
+  manual steps) and stored in `actual_data`. Volumes are portable — an
+  `actual_data` backed up from the V3.5 rehearsal VM restores onto the real
+  box, so "authenticate once" can genuinely mean once.
+- **A reimage is the deliberate destructive case** — the disk (volumes
+  included) is wiped. The recovery story is: the USB payload re-seeds `.env`,
+  the baked images re-load, and the volumes come back from the SR-013 backup
+  drive — which is exactly why the stack's own volumes belong in
+  `BACKUP_SOURCES`.
+
+### What runs where (containers vs host)
+
+On the AWOW, **every service is a container** except these host-level pieces:
+the **backup service** (pure bash + systemd timer — deliberately not a
+container, it mounts cifs and manages drives), the **powertune** and
+**backup-standby** per-boot oneshots, **Cockpit**, **sshd**,
+**unattended-upgrades**, and Docker itself. **Mini-serv** (the Windows box)
+runs nothing from this stack — it only serves the Samba shares and the
+IceDrive-synced folder that the backup service pulls from / pushes to.
+
 > **WireGuard is the later remote-access answer** (D5): once set up, the same LAN
 > workflow works from anywhere. Until then this is LAN / VPN-to-LAN only — do not
 > expose SSH, Cockpit, or the aux UIs to the public internet.

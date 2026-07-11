@@ -173,6 +173,19 @@ the OAuth client (needs Peter's Google account — an agent cannot):
    needed — this is a server-side flow.
 5. Paste the Client ID + secret into `.env`.
 
+### PETER MANUAL STEP — bank sync in Actual (SimpleFIN, one-time, in-app)
+
+Actual **owns the SimpleFIN relationship** (Finance-Auditor, when it lands,
+only *triggers* Actual's sync — it never talks to banks). After first
+bring-up: open `https://actual.<domain>`, set Actual's server password, then
+link SimpleFIN under its bank-sync settings. The credential is stored
+**server-side in the `actual_data` volume** — never in `.env`, never in git.
+It survives every container update and comes back from the SR-013 volume
+backup after a reimage (see REMOTE_MANAGEMENT.md "State & credentials").
+Not doable from the sim — the sim is hermetic, and a real bank credential
+must never enter a throwaway fictional volume; use the real box or the
+real-secrets rehearsal VM.
+
 ---
 
 ## 3. Build the USB (autoinstall)

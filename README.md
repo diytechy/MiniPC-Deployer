@@ -90,6 +90,13 @@ deploy image:
    container image baked in (Q10.9 B+) — see stack/README.md §3. Tier-2 opt-in
    images are **excluded** from the bake by default; pass
    `EXTRA_PROFILES="…"` to include an enabled set (SR-012).
+4. **After first boot, the one-time in-app authentications** (not `.env`
+   values): the Google OAuth client above is env-side, but Actual's
+   **SimpleFIN bank sync** is configured inside Actual's own UI and stored in
+   the `actual_data` volume (stack/README §2 manual steps). What survives a
+   container update vs a reimage — credentials never live in containers; they
+   live in volumes + `.env`, both recoverable — is spelled out in
+   [REMOTE_MANAGEMENT.md](REMOTE_MANAGEMENT.md) "State & credentials".
 
 ## Development
 

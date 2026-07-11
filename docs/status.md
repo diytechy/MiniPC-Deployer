@@ -799,3 +799,29 @@ against the repo's actual state:
 
 `check.py` G1 PASS (config-validate, registry-integrity, doc-navigability —
 now 0 warnings). Docs-only change; no config/script behavior touched.
+
+### DRIVER — G1 — Round 1 — 2026-07-11 (STATE & CREDENTIALS clarity — Peter's ask)
+
+Peter asked where credentials live across updates/reimages and how the budget
+app's bank feed wires in. Docs now say it in one place:
+
+- **REMOTE_MANAGEMENT.md "State & credentials"** — the survives-what table:
+  NO credential lives in a container/image; state = named volumes (Actual
+  server pw + SimpleFIN credential + budgets, Technitium config, Caddy certs,
+  tracker data, Vaultwarden) + host files (`.env`, allow-list, `.token`,
+  `/etc/awow-backup/*`). Container updates (`compose pull && up -d` / pin
+  bumps) are credential-safe by construction; a reimage wipes volumes → they
+  return via the SR-013 volume backups, `.env` re-seeds from the USB payload.
+  Plus "What runs where": on the AWOW everything is a container except the
+  backup service, powertune/backup-standby oneshots, Cockpit, sshd,
+  unattended-upgrades; Mini-serv runs nothing from this stack.
+- **stack/README §2** — new PETER MANUAL STEP: SimpleFIN bank sync is a
+  one-time, in-app Actual setup (Actual OWNS the SimpleFIN relationship;
+  Finance-Auditor will only trigger its sync). Stored server-side in
+  `actual_data`; not doable from the hermetic sim (a real bank credential must
+  never enter a throwaway fictional volume) — real box or the real-secrets
+  rehearsal VM, whose `actual_data` volume can be carried to hardware via the
+  backup/restore path ("authenticate once" literally once).
+- **Root README** — real-box step 4 points at both.
+
+`check.py` G1 PASS. Docs only.

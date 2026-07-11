@@ -41,16 +41,22 @@ last) — it is the record, not required reading for every pass.
       backup drives); (c) the oauth2-proxy **security pin bump** v7.6.0→v7.15.2
       needs a V1 sim re-run + re-export before any real flash →
       [stack/README.md §9](../stack/README.md)
-    - OI-8 — **Backup gap (review 2026-07-10):** the stack's own Docker volumes
-      (`actual_data` — the finances!, `technitium_config`, `tracker_data` in
-      multi-user mode, `caddy_data`, tier-2 volumes) are backed up by NOTHING;
-      README §7 advises it but no automation does it. Proposed: a local
-      volume-tar source step in `backup.sh` riding the existing
-      hash/manifest/offsite pipeline — deliberately NOT implemented inline
-      (WI-10.15-validated behavior; needs its own work item + sim assertions).
+    - OI-8 — **Backup gap — RESOLVED in-repo 2026-07-10 (SN-010/SR-013,
+      Peter-ratified single-table design):** `BACKUP_SOURCES` now accepts
+      `volume:VOL[@CONTAINER]` and `path:/dir` specs; sim-proven
+      (`run-volume-sim.sh` a–d GREEN + full `run-backup-sim.sh` regression
+      GREEN). **Remaining for Peter:** uncomment the volume lines in the real
+      `/etc/awow-backup/backup.env` (+ add `actual tracker` to `OFFSITE_SETS`)
+      when configuring the box — they ship commented in `backup.env.example`.
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)
+    - OI-9 — **never-silent-green gap in `die` paths (found 2026-07-10 during
+      the SR-013 red run):** a `die` (e.g. a cifs mount failure) exits 1
+      directly WITHOUT posting `ok=false` to NagLight — only ERR-trap failures
+      feed. The systemd unit still fails visibly, but the feed contract says
+      ANY failure posts. Small fix (route `die` through the report once config
+      is loaded); needs its own sim assertion.
 - **Assumptions (unattended):** see the Assumptions log below.
 - **Next action:** Peter reviews + pushes; creates the Google OAuth client;
   reacts to the reimage-ladder checkboxes. Runtime bring-up on the first Docker
@@ -660,3 +666,54 @@ oauth2-proxy `v7.15.2` exists on its registry. **NOT run:** any container —
 tier-2 services have never been started anywhere (enable-time validation per
 README §9), and the core changes (extra_hosts, log rotation, oauth2-proxy tag)
 await the V1-sim re-run / V3 boot (OI-7c).
+
+### DRIVER — G1 — Round 1 — 2026-07-10 (OI-8 → SN-010/SR-013: docker-volume sources in the ONE backup table)
+
+Peter ratified the single-table design ("multiple sources/destinations
+configured for a single backup execution sequence"): extend the existing
+`BACKUP_SOURCES` grammar rather than bolt on a second mechanism. Destinations
+stay as-is (one drive target + the `OFFSITE_SETS` subset selector).
+
+**What was built (TDD — sim first, red, then green):**
+- **Grammar (SR-013):** `name=SPEC` where SPEC is `//host/share` (cifs,
+  unchanged), `volume:VOL` (live copy from the volume's mountpoint via
+  `docker volume inspect` — no helper image needed, the service runs as root),
+  `volume:VOL@CONTAINER` (quiesce: stop → copy → restart immediately), or
+  `path:/abs/dir`. Comment lines in the table are skipped, so
+  `backup.env.example` ships ready-to-uncomment lines for `actual_data`,
+  `technitium_config`, `caddy_data`, `tracker_data`.
+- **Quiesce safety (the OI-8 hard case):** `QUIESCED` tracking + a
+  `quiesce_restore` EXIT trap (runs BEFORE drive-power restore) — no failure
+  path can leave a service stopped; an EXIT-trap restart failure warns LOUDLY
+  naming the manual command. Inline restart failure fails the run (a stopped
+  service is worse than a missed backup). Steps 2–6 untouched — volume sets
+  ride the same archive/hash/manifest/retention/offsite/report pipeline.
+- **New sim leg `sim/mini-serv-sim/run-volume-sim.sh`** (mock-`docker` +
+  mock-`curl` shims, the run-drivepower-sim.sh pattern; feed mocked so the leg
+  runs without the awow-sim tracker).
+
+**RAN FOR REAL (WSL2 / docker, this session):**
+- **RED first:** pre-implementation run — scenarios (a)–(c) failed exactly as
+  expected (volume: spec treated as a cifs UNC), (d) green. Then GREEN:
+  **all 15 checks PASS** — (a) volume set archived+hashed+in-manifest, restore
+  drill BYTE-EQUAL vs the fixture volume, zero stop/start without @container,
+  comment line skipped, ok=true; (b) exactly one stop + one start, stop
+  precedes start; (c) forced mid-copy failure (mock rsync) → container STILL
+  restarted via the EXIT trap, ok=false posted, nonzero exit, on_err logged;
+  (d) cifs-only table → ZERO docker calls.
+- **No-regression:** full `run-backup-sim.sh` re-run against the live awow-sim
+  tracker — **BACKUP LEG: PASS** (cycle, offsite push, real NagLight feed
+  round-trip, minecraft restore drill incl. post-loss reconstruct).
+- `bash -n` clean; `check.py` G1 re-run after the registry additions (SN=10,
+  SR=13) — see below.
+
+**FINDING logged as OI-9 (not fixed here — stay in lane):** the RED run exposed
+that `die` paths (e.g. cifs mount failure) exit 1 WITHOUT posting ok=false —
+only ERR-trap failures feed NagLight. Pre-existing; small targeted fix + its
+own sim assertion later.
+
+**HARDWARE-ONLY REMAINDER (honest):** real-docker semantics (an actual
+`docker stop` latency, a volume mountpoint under /var/lib/docker) are proven
+only by the call contract here; first real exercise happens on a Docker host /
+the AWOW with the volume lines uncommented. The sim shim answers `volume
+inspect` with a fixture dir by design.

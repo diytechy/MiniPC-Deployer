@@ -11,7 +11,7 @@ Samba fixtures in WI-10.15 (see `docs/status.md`).
 
 | # | Step | Where |
 |---|---|---|
-| 1 | **source pulls** — cifs-mount each LAN Samba share, `rsync` into staging | `backup.sh` |
+| 1 | **source pulls** — ONE `BACKUP_SOURCES` table, three source kinds (SR-013): `//host/share` (cifs-mount + `rsync`), `volume:VOL[@CONTAINER]` (rsync from the docker volume's mountpoint, optional stop→copy→restart quiesce), `path:/dir` (local rsync) | `backup.sh` + `source_kind` |
 | 2 | **archive + compress** — `tar` per set, `zstd` **where applicable** (already-compressed sets stored as plain `.tar`) | `backup.sh` + `compression_decision` |
 | 3 | **hash + verify + manifest** — per-file sha256 table + archive sha256 + integrity test; a recovery MANIFEST | `backup.sh` |
 | 4 | **external-drive target** — dated `run_<UTC>` snapshot with retention (`BACKUP_KEEP`) | `backup.sh` |
@@ -59,6 +59,29 @@ hold). **Caveat:** many USB-SATA enclosures ignore `hdparm` APM/standby entirely
 with `hdparm -C /dev/disk/by-id/...`. The call contract + failure-path
 composition are proven in `sim/mini-serv-sim/run-drivepower-sim.sh` (mock-`hdparm`
 shim); the drive's physical response is a burn-in-only check.
+
+## Docker-volume sources (SR-013 / OI-8)
+
+The box's OWN service state — `actual_data` (the finances), `technitium_config`,
+`caddy_data`, `tracker_data`, any tier-2 volume — rides the same table and
+pipeline as the LAN shares: add `name=volume:VOL` lines to `BACKUP_SOURCES`
+(commented examples in `backup.env.example`) and, for the important ones, the
+set names to `OFFSITE_SETS`.
+
+- **Quiesce (`volume:VOL@CONTAINER`)** — stops the container, copies, restarts
+  it immediately (downtime = the copy, seconds). Use it for volumes holding live
+  databases (actual, technitium); a live copy can catch a mid-write state. The
+  EXIT trap restarts any still-stopped container on **every** exit path — a
+  failed backup never leaves a service down — and a restart failure is a LOUD
+  warning naming the manual fix.
+- **Restoring a volume set:** `restore.sh` reconstructs to a directory as usual;
+  putting it back into a (stopped) volume is
+  `docker run --rm -v VOL:/dst -v <restored>:/src:ro alpine sh -c 'cp -a /src/. /dst/'`
+  — deliberate manual step, like all restores here.
+- Call contract + failure paths proven in `sim/mini-serv-sim/run-volume-sim.sh`
+  (mock-`docker` shim, same pattern as the drive-power leg): volume set archives
+  + restores byte-equal, stop-before-copy/start-after ordering, mid-copy failure
+  still restarts + posts `ok=false`, cifs-only config makes zero docker calls.
 
 ## Recovery MANIFEST / state format
 
@@ -109,4 +132,8 @@ sudo systemctl enable --now backup-standby.service
 runner, runs a full cycle against them, and does the restore drill.
 `sim/mini-serv-sim/run-drivepower-sim.sh` proves the WI-10.10 `hdparm` standby
 call contract (disable-at-start, restore-on-exit including the failure path, and
-the empty-device no-op) with a mock-`hdparm` shim. See `sim/README.md`.
+the empty-device no-op) with a mock-`hdparm` shim.
+`sim/mini-serv-sim/run-volume-sim.sh` proves the SR-013 volume-source contract
+(archive/restore byte-equality, quiesce ordering, failure-path restart +
+`ok=false`, cifs-only zero-docker no-op) with a mock-`docker` shim.
+See `sim/README.md`.

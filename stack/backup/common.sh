@@ -2,6 +2,8 @@
 # common.sh — shared helpers for the AWOW bash backup service (WI-10.10/10.15).
 # Sourced by backup.sh and restore.sh. Pure bash + coreutils/tar/zstd/rsync/
 # mount.cifs/curl — no PowerShell, no .bat (HOMELAB_TOPOLOGY.md "100% bash").
+# The docker CLI is additionally needed IF the sources table uses volume:
+# specs (SR-013) — a given on the AWOW, where docker runs the stack anyway.
 #
 # Behavioral spec = the FileBackup repo (hash tracking, auto-compression-where-
 # applicable, recovery/reconstruct). This is a reproduction in bash, not a port.
@@ -52,6 +54,68 @@ compression_decision() {
     else
         printf 'zstd\t%s\tzstd .tar.zst: %s%% already-compressed < %s%% threshold\n' "$ratio" "$ratio" "$threshold"
     fi
+}
+
+# ── source-spec parsing (SR-013) ──────────────────────────────────────────────
+# BACKUP_SOURCES line grammar: `name=SPEC`, one per line, where SPEC is
+#   //host/share            cifs pull over the LAN (the original form)
+#   volume:VOL              docker named volume on THIS box, copied live
+#   volume:VOL@CONTAINER    stop CONTAINER first, copy, restart right after
+#   path:/abs/dir           a local directory on this box
+# Lines starting with # are skipped by backup.sh, so the table can carry
+# commented-out entries. One table drives one execution sequence — every set,
+# whatever its source kind, flows through the same archive/hash/manifest/
+# retention/offsite/report pipeline.
+
+# source_kind SPEC : echoes cifs|volume|path|bad. Pure — no I/O, unit-greppable.
+source_kind() {
+    case "$1" in
+        //*)      echo cifs ;;
+        volume:*) echo volume ;;
+        path:/*)  echo path ;;
+        *)        echo bad ;;
+    esac
+}
+
+# volume_mountpoint VOL : echoes the volume's host mountpoint (empty + nonzero
+# on failure — the caller decides how loud to be). Reading the mountpoint
+# directly (the service runs as root) avoids depending on any helper image.
+volume_mountpoint() {
+    docker volume inspect -f '{{ .Mountpoint }}' "$1" 2>/dev/null
+}
+
+# ── container quiesce (SR-013: volume:VOL@CONTAINER) ──────────────────────────
+# Stop a container so its volume is copied at rest, restart it IMMEDIATELY after
+# the copy (not at run end — downtime is the copy, seconds not minutes).
+# QUIESCED tracks every container this run has stopped and not yet restarted;
+# quiesce_restore (wired into backup.sh's EXIT trap) restarts any survivor, so
+# no failure path can leave a service down. UNLIKE drive power, restart problems
+# are LOUD: quiesce_start propagates docker's status and the caller fails the
+# run (a stopped service is worse than a missed backup); the EXIT-trap pass can
+# only WARN (the exit status is already decided) and names the manual fix.
+QUIESCED=()
+quiesce_stop() {
+    local c="$1"
+    log "quiesce: docker stop $c"
+    docker stop "$c" >/dev/null || return 1
+    QUIESCED+=("$c")
+}
+quiesce_start() {
+    local c="$1" i left=()
+    log "quiesce: docker start $c"
+    docker start "$c" >/dev/null || return 1
+    for i in "${QUIESCED[@]:-}"; do [ -n "$i" ] && [ "$i" != "$c" ] && left+=("$i"); done
+    QUIESCED=("${left[@]:-}")
+}
+quiesce_restore() {
+    local c
+    for c in "${QUIESCED[@]:-}"; do
+        [ -n "$c" ] || continue
+        warn "quiesce: EXIT-trap restart of still-stopped container: $c"
+        docker start "$c" >/dev/null 2>&1 \
+            || warn "quiesce: RESTART FAILED for $c — start it manually: docker start $c"
+    done
+    QUIESCED=()
 }
 
 # ── cifs mount helpers (step 1 pulls / step 5 push) ──────────────────────────

@@ -2,7 +2,11 @@
 # backup.sh — the AWOW bash backup service (WI-10.10, built/validated in WI-10.15).
 #
 # Runs the explicit six-step pipeline from HOMELAB_TOPOLOGY.md, 100% bash:
-#   1. source pulls   — cifs-mount each Windows/Samba share, rsync into staging
+#   1. source pulls   — one BACKUP_SOURCES table, three source kinds (SR-013):
+#                        //host/share cifs-mount+rsync; volume:VOL[@CONTAINER]
+#                        rsync from the docker volume's mountpoint, optionally
+#                        quiescing @CONTAINER (stop→copy→restart, EXIT-trap
+#                        safety net); path:/dir local rsync
 #   2. archive+compress — tar per set, zstd WHERE APPLICABLE (already-compressed
 #                        sets stored as plain .tar — FileBackup spec)
 #   3. hash+verify+manifest — per-file sha256 table + archive sha256 + integrity
@@ -82,7 +86,8 @@ drive_power_restore() {
     log "drive-power: restoring standby timeout ($STANDBY_VALUE = $(standby_desc "$STANDBY_VALUE")) on exit"
     drive_standby_set "$STANDBY_VALUE" "${BACKUP_DRIVES[@]}"
 }
-trap 'drive_power_restore' EXIT
+# Containers first (a stopped service is the more urgent restore), drives second.
+trap 'quiesce_restore; drive_power_restore' EXIT
 
 TOTAL_BYTES=0; TOTAL_FILES=0; SET_SUMMARY=""
 
@@ -120,16 +125,50 @@ fi
 while IFS= read -r line; do
     line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$line" ] && continue
-    name="${line%%=*}"; unc="${line#*=}"
-    [ -n "$name" ] && [ -n "$unc" ] || die "bad BACKUP_SOURCES line: '$line' (want name=//host/share)"
+    case "$line" in \#*) continue ;; esac    # the table can carry commented-out entries
+    name="${line%%=*}"; src="${line#*=}"
+    [ -n "$name" ] && [ -n "$src" ] || die "bad BACKUP_SOURCES line: '$line' (want name=//host/share | name=volume:VOL[@CONTAINER] | name=path:/abs/dir)"
 
-    # 1. pull ------------------------------------------------------------------
-    mp="$(mktemp -d)"; stage="$STAGING/$name"
-    mount_cifs "$unc" "$mp" ro
+    # 1. pull — dispatch on the source kind (SR-013); every kind lands the set in
+    # $stage and everything downstream (archive→report) is kind-agnostic.
+    stage="$STAGING/$name"
     rm -rf "$stage"; mkdir -p "$stage"
-    log "[$name] rsync pull from $unc"
-    rsync -a --delete "$mp/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
-    umount_all
+    case "$(source_kind "$src")" in
+        cifs)
+            mp="$(mktemp -d)"
+            mount_cifs "$src" "$mp" ro
+            log "[$name] rsync pull from $src"
+            rsync -a --delete "$mp/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
+            umount_all
+            ;;
+        volume)
+            spec="${src#volume:}"; vol="${spec%%@*}"
+            qc=""; [ "$spec" != "$vol" ] && qc="${spec#*@}"
+            command -v docker >/dev/null 2>&1 || { FAIL_NOTE="volume source for $name needs the docker CLI"; false; }
+            vmp="$(volume_mountpoint "$vol")" || true
+            { [ -n "$vmp" ] && [ -d "$vmp" ]; } || { FAIL_NOTE="docker volume not found for $name: $vol"; false; }
+            # Quiesce (optional): stop the container so a live DB can't be caught
+            # mid-write; restarted right after the copy, and by the EXIT trap on
+            # any failure path in between.
+            if [ -n "$qc" ]; then
+                quiesce_stop "$qc" || { FAIL_NOTE="quiesce stop failed for $name: $qc"; false; }
+            fi
+            log "[$name] rsync pull from volume $vol ($vmp)${qc:+ [quiesced: $qc]}"
+            rsync -a --delete "$vmp/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
+            if [ -n "$qc" ]; then
+                quiesce_start "$qc" || { FAIL_NOTE="quiesce RESTART failed for $name — run: docker start $qc"; false; }
+            fi
+            ;;
+        path)
+            dir="${src#path:}"
+            [ -d "$dir" ] || { FAIL_NOTE="path source missing for $name: $dir"; false; }
+            log "[$name] rsync pull from local path $dir"
+            rsync -a --delete "$dir/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
+            ;;
+        *)
+            die "bad BACKUP_SOURCES spec for '$name': '$src' (want //host/share | volume:VOL[@CONTAINER] | path:/abs/dir)"
+            ;;
+    esac
 
     # 2. archive + compress (auto-compression-where-applicable) ----------------
     IFS=$'\t' read -r algo ratio reason < <(compression_decision "$stage")
@@ -159,7 +198,7 @@ while IFS= read -r line; do
     asha="$(sha256_of "$archive")"
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$name" "$unc" "$(basename "$archive")" "$algo" "$asha" "$set_files" "$set_bytes" "$reason" >>"$MANIFEST"
+        "$name" "$src" "$(basename "$archive")" "$algo" "$asha" "$set_files" "$set_bytes" "$reason" >>"$MANIFEST"
     log "[$name] archived $(basename "$archive") files=$set_files bytes=$set_bytes sha256=${asha:0:16}…"
     TOTAL_FILES=$(( TOTAL_FILES + set_files )); TOTAL_BYTES=$(( TOTAL_BYTES + set_bytes ))
     SET_SUMMARY_JSON="${SET_SUMMARY_JSON:+$SET_SUMMARY_JSON,}$(printf '{"set":"%s","algo":"%s","files":%s,"bytes":%s,"incompressible_pct":%s}' "$name" "$algo" "$set_files" "$set_bytes" "$ratio")"

@@ -268,7 +268,9 @@ a day or two, then pick the secondary DNS. Track:
 - **Whole box:** the image pipeline is the recovery path — **re-flash the USB**
   and boot; data lives in named Docker volumes and, for the tracker, in the
   **remote data repo** (`TRACKER_DATA_REMOTE`). Back up the Docker volumes
-  (`technitium_config`, `actual_data`, `caddy_data`) for faster recovery. The
+  (`technitium_config`, `actual_data`, `caddy_data`) — the backup service does
+  this once the `volume:` lines in `backup.env` are uncommented (SR-013,
+  [backup/README.md](backup/README.md)). The
   LAN reimage ladder (do it without visiting the box) is in
   [../REMOTE_MANAGEMENT.md](../REMOTE_MANAGEMENT.md) (WI-10.12).
 - **Fall back:** keep any previous DNS/proxy setup untouched until this box
@@ -365,8 +367,10 @@ Disable = remove the profile from `COMPOSE_PROFILES`, then
 - **Tier-2 pins are NOT sim-validated** and carry no custom healthchecks yet
   (probe tooling per image is unverified — the WI-10.14 lesson). Verify the
   tag + behavior at enable time; the `diun` profile watches for updates after.
-- **Tier-2 volumes are NOT in the backup path** (open review finding 2026-07-10
-  — stack volumes generally aren't; see docs/status.md).
+- **Back up what you enable:** stack volumes join the backup by adding
+  `name=volume:VOL[@container]` lines to the `BACKUP_SOURCES` table
+  (SR-013 — see [backup/README.md](backup/README.md) "Docker-volume sources");
+  commented starter lines ship in `backup.env.example`.
 
 ## Local validation status (honest)
 

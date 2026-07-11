@@ -825,3 +825,48 @@ app's bank feed wires in. Docs now say it in one place:
 - **Root README** — real-box step 4 points at both.
 
 `check.py` G1 PASS. Docs only.
+
+### DRIVER — G1 — Round 1 — 2026-07-11 (SN-011/SR-014: Finance-Auditor ingested, profile-gated)
+
+Peter confirmed FA's deploy artifacts landed (its commits bbea348/59d9f27:
+Dockerfile + deploy/compose.service.example.yml + the ACTUAL_API_VERSION
+build-arg). Verified ready and ingested per its IF-003 spec:
+
+- **Compose service `finance-auditor`** (profile `finance-auditor` — OPT-IN
+  until FA passes G-Release/G-Final, then promote to core + baked payload):
+  bridge-internal to actual:5006 + tracker:8787, finance_snapshots +
+  finance_actual_data volumes, FINANCE_* knobs in .env.example, TZ-honored
+  RUN_AT, no ports/healthcheck (FA's documented daemon design; the tracker's
+  automated-lane aging is the backstop).
+- **Resolver:** ensure_image grew optional docker-build args; the
+  finance-auditor entry is ACTIVE and pins
+  `--build-arg ACTUAL_API_VERSION=${ACTUAL_IMAGE_TAG}` — the IF-002 coupling
+  is now mechanical (bump the Actual pin → `--rebuild` rebuilds FA against it).
+- **Privacy (FA §3 firewall):** backup.env.example gained
+  `finance=volume:finance_snapshots@finance-auditor` (commented) + a LOUD
+  never-OFFSITE_SETS warning — raw finance data rides the LOCAL drive only,
+  never the IceDrive-synced share.
+- **Registries:** SN-011 + SR-014; IF-004 (↔ FA IF-003; ids are repo-local —
+  FA numbered first — each contract cites the counterpart id). Docs: stack +
+  root READMEs, architecture topology, interfaces.md index.
+
+**RAN FOR REAL (WSL2/docker):** validate_config.py + compose config PASS (core
+still exactly 8 services without the profile; finance-auditor appears with it);
+`ensure-local-images.sh` BUILT `finance-auditor:local` end-to-end (two-stage
+build, @actual-app/api@26.7.0 installed in the throwaway stage); `docker run`
+of the image boots under Node 24 native type-stripping and exits with the
+documented config-invalid fatal naming the missing key (trackerFeedUrl) —
+FA's startup contract observed. NOT run: a live pipeline cycle (that is FA's
+TC-033 G-Release Demonstration — the AWOW-sim's actual+tracker are a
+ready-made environment for it; sim runs Actual `latest`, so pin the sim to
+26.7.0 for a faithful rehearsal per FA's spec note).
+
+**NagLight cleanup (its repo, recorded not fixed):** /api/feed accepts only
+{check,ok,note} — FA posts {check,color,reason,at}; the color-lane extension
+FA's IF-001 calls "pending" is still unbuilt tracker-side (and a
+finance-audit item must exist in definitions or the post 400s). Also
+NagLight's IF registry still claims the deploy/caddy/technitium interfaces
+that migrated HERE (WI-10.1) — needs re-homing + counterpart ids; its G1
+human sign-off is still pending (process debt). FA multi-user note: its feed
+client sends bearer only, no X-Forwarded-User — fine single-user, a gap if
+the tracker runs multi-user (D3).

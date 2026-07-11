@@ -28,6 +28,7 @@ Everything lives under [`stack/`](stack/) — start with
 | tracker (NagLight) | the multi-user life tracker | via oauth2-proxy |
 | Actual Budget | finances | basic_auth |
 | Uptime-Kuma · Dozzle · (ntfy) | LAN-only observability | LAN-only |
+| Finance-Auditor | daily finance audit pipeline (triggers Actual's bank sync, posts de-identified status to the tracker) — profile-gated until its own G-Final | bridge-internal only |
 | tier-2 opt-in catalog | Immich/PhotoPrism · Jellyfin · Navidrome · Audiobookshelf · Vaultwarden · Home Assistant/Mosquitto · Syncthing · FreshRSS/Mealie/Homepage · diun — compose profiles, **off by default** ([stack/README.md](stack/README.md) §9) | per-service |
 
 Remote management of the headless box (SSH, Cockpit, the reimage ladder) is in

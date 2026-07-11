@@ -61,11 +61,17 @@ env_get() {
 }
 TRACKER_IMAGE_TAG="$(env_get TRACKER_IMAGE_TAG)"
 TRACKER_PUBLIC_IMAGE="${TRACKER_PUBLIC_IMAGE:-$(env_get TRACKER_PUBLIC_IMAGE)}"
+FINANCE_AUDITOR_IMAGE_TAG="$(env_get FINANCE_AUDITOR_IMAGE_TAG)"
+FINANCE_AUDITOR_PUBLIC_IMAGE="${FINANCE_AUDITOR_PUBLIC_IMAGE:-$(env_get FINANCE_AUDITOR_PUBLIC_IMAGE)}"
+ACTUAL_IMAGE_TAG="$(env_get ACTUAL_IMAGE_TAG)"
 
-# ensure_image REF SIBLING_DIR PUBLIC_REF : resolve one local image via the
-# present → sibling-build → declared-public chain; die loudly if none applies.
+# ensure_image REF SIBLING_DIR PUBLIC_REF [docker-build args...] : resolve one
+# local image via the present → sibling-build → declared-public chain; die
+# loudly if none applies. Extra args (e.g. --build-arg) go to the sibling build.
 ensure_image() {
     local ref="$1" sibling="$SIBLING_ROOT/$2" public="${3:-}"
+    shift 3 || shift $#
+    local build_args=("$@")
 
     if [ "$REBUILD" -eq 0 ] && docker image inspect "$ref" >/dev/null 2>&1; then
         log "present: $ref (skip; --rebuild to force)"
@@ -73,9 +79,9 @@ ensure_image() {
     fi
 
     if [ -d "$sibling" ]; then
-        log "sibling build: $ref  <-  $sibling"
+        log "sibling build: $ref  <-  $sibling ${build_args[*]:+(${build_args[*]})}"
         [ "$DRY_RUN" -eq 1 ] && { log "  (dry-run: would docker build)"; return 0; }
-        docker build -t "$ref" "$sibling" || die "sibling build failed for $ref ($sibling)"
+        docker build -t "$ref" "${build_args[@]}" "$sibling" || die "sibling build failed for $ref ($sibling)"
         return 0
     fi
 
@@ -98,9 +104,11 @@ ensure_image() {
 # NagLight — the tracker (SR-006). Tag follows TRACKER_IMAGE_TAG (default local).
 ensure_image "naglight:${TRACKER_IMAGE_TAG:-local}" "NagLight" "${TRACKER_PUBLIC_IMAGE:-}"
 
-# Finance-Auditor — FUTURE: no compose service consumes it yet (Actual Budget is
-# the running finance app). Uncomment when its service lands in the stack, and
-# add FINANCE_AUDITOR_PUBLIC_IMAGE= to .env.example alongside it.
-# ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Auditor" "${FINANCE_AUDITOR_PUBLIC_IMAGE:-}"
+# Finance-Auditor — the daily finance audit pipeline (SR-014, IF-004 ↔ FA
+# IF-003). The IF-002 coupling: @actual-app/api inside the image MUST match the
+# deployed actual-server, so the build arg is pinned to ACTUAL_IMAGE_TAG — when
+# that pin bumps, re-run with --rebuild to rebuild this image against it.
+ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Auditor" "${FINANCE_AUDITOR_PUBLIC_IMAGE:-}" \
+    --build-arg "ACTUAL_API_VERSION=${ACTUAL_IMAGE_TAG:?ACTUAL_IMAGE_TAG missing from env file}"
 
 log "all local images resolved."

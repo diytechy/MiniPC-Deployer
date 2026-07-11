@@ -21,8 +21,14 @@ contracts; matching IF-IDs should be recorded there too:
 - **IF-003** — `POST /api/feed` `{check,ok,note}` + Bearer token — the backup
   service's never-silent-green report and Uptime-Kuma pushes (SR-013).
 
-Finance-Auditor has **no interface yet** (no compose service consumes it);
-add its IF row alongside the resolver entry when its service lands.
+**This repo ↔ Finance-Auditor** (`Provides` — FA numbered its registry first,
+so ids are repo-local; each Contract cites the counterpart's id):
+
+- **IF-004** — the compose runtime for the `finance-auditor` service
+  (↔ FA IF-003): profile-gated service, the two finance volumes, `FINANCE_*`
+  knobs, and the resolver build pinning `ACTUAL_API_VERSION` to
+  `ACTUAL_IMAGE_TAG` (FA IF-002's coupling). The v2 Caddy detail-view route
+  (FA IF-004) is deliberately not provided yet.
 
 ---
 

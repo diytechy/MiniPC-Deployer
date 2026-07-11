@@ -232,6 +232,49 @@ services:
       retries: 5
       start_period: 20s
 
+  # ── finance-auditor — the daily finance audit pipeline (IF-004 ↔ FA IF-003) ──
+  # Consumes the Finance-Auditor image (private sibling repo; resolver SR-006:
+  #   bash scripts/ensure-local-images.sh   builds it with the ACTUAL_API_VERSION
+  # build-arg pinned to ACTUAL_IMAGE_TAG — the IF-002 coupling: REBUILD this image
+  # whenever the Actual pin bumps). Merged from FA's reference spec
+  # (deploy/compose.service.example.yml, DEC-19).
+  #
+  # PROFILE-GATED until Finance-Auditor passes its G-Release (live TC-033) and
+  # G-Final (7-day AWOW run) — then promote to core + the baked payload (SR-014).
+  # No ports and no healthcheck ON PURPOSE (scheduled daemon, no listening
+  # surface; "did today's status post" is the liveness signal and the tracker's
+  # automated-lane aging is the backstop — see FA's Dockerfile).
+  # PRIVACY (FA §3 firewall): raw finance data lives ONLY in the two volumes
+  # below; never bake secrets/snapshots into the image; snapshots must NEVER
+  # join OFFSITE_SETS (IceDrive is cloud) — LAN backup drive only.
+  finance-auditor:
+    image: finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG}
+    container_name: finance-auditor
+    profiles: ["finance-auditor"]
+    environment:
+      TZ: ${TIMEZONE}                  # RUN_AT is read as BOX-LOCAL time (FA SR-001)
+      RUN_AT: ${FINANCE_RUN_AT}
+      # Actual over the compose-internal bridge ONLY (FA IF-002/SR-003) — never
+      # the public actual.<domain> route.
+      ACTUAL_URL: http://actual:5006
+      ACTUAL_SYNC_ID: ${FINANCE_ACTUAL_SYNC_ID}
+      ACTUAL_PASSWORD: ${FINANCE_ACTUAL_PASSWORD}
+      # Tracker feed (FA IF-001) — bridge-internal, bearer-token'd. NOTE: in
+      # multi-user tracker mode (D3) direct /api/* posts also need an
+      # X-Forwarded-User header, which FA's feed client does not send yet —
+      # fine single-user; recorded as an FA gap for multi-user boxes.
+      TRACKER_FEED_URL: http://tracker:8787/api/feed
+      TRACKER_FEED_TOKEN: ${FINANCE_TRACKER_FEED_TOKEN}
+    volumes:
+      - finance_snapshots:/snapshots          # LAN-only audit artifacts (FA SR-005/006)
+      - finance_actual_data:/data/actual      # @actual-app/api cache — persist across restarts
+    depends_on:
+      actual:
+        condition: service_healthy
+      tracker:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ── ddns — keep the public A records pointed at the home connection ──────────
   # Gap Peter caught 2026-07-04: DDNS previously ran on Mini-serv as the legacy
   # DDNS-Cloudflare-PowerShell scripts; per WI-9 Q4 the AWOW owns it now, and the
@@ -633,6 +676,10 @@ volumes:
   uptimekuma_data:
   ntfy_data:
   ntfy_cache:
+  # finance-auditor (IF-004): snapshots are LAN-only PRIVATE finance data —
+  # back up via volume: source, NEVER offsite; the api cache is re-creatable.
+  finance_snapshots:
+  finance_actual_data:
   # tier-2 opt-in volumes (SR-012) — created only when a profile first starts.
   immich_db:
   immich_model_cache:

@@ -29,6 +29,8 @@ graph LR
     caddy -->|basic_auth| tech
     ddns["ddns<br/>(Cloudflare A records)"] -.->|follows home IP| net
     backup["bash backup service<br/>(systemd timer)"] -.->|cifs + volume: sources| net
+    fa["finance-auditor<br/>(profile until FA G-Final)"] -.->|triggers bank sync| actual
+    fa -.->|de-identified status| tracker
     subgraph observability [LAN-only]
       kuma["Uptime-Kuma"]
       dozzle["Dozzle"]

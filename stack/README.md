@@ -23,6 +23,14 @@ Services (all health-checked, all `restart: unless-stopped`):
   old share token is rotation-flagged (see `.env.example`).
 - **Uptime-Kuma · Dozzle · (ntfy)** — auxiliary LAN-only observability
   (WI-10.11); see §8.
+- **Finance-Auditor** — the daily finance audit pipeline (SR-014/IF-004):
+  triggers Actual's bank sync, runs the audit rules, posts a de-identified
+  status to the tracker. **Profile-gated** (`finance-auditor` in
+  `COMPOSE_PROFILES`) until it passes its own G-Release/G-Final, then promoted
+  to core. Image from the private sibling repo via the resolver, with
+  `@actual-app/api` pinned to `ACTUAL_IMAGE_TAG` (rebuild on Actual pin bumps).
+  Its snapshots volume is raw finance data: LOCAL backup only, **never**
+  `OFFSITE_SETS`.
 - **Tier-2 opt-in catalog (SR-012)** — Immich / PhotoPrism, Jellyfin, Navidrome,
   Audiobookshelf, Vaultwarden, Home Assistant + Mosquitto, Syncthing,
   FreshRSS / Mealie / Homepage, diun — all behind compose **profiles**, OFF by

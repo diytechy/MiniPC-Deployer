@@ -41,6 +41,16 @@ last) — it is the record, not required reading for every pass.
       backup drives); (c) the oauth2-proxy **security pin bump** v7.6.0→v7.15.2
       needs a V1 sim re-run + re-export before any real flash →
       [stack/README.md §9](../stack/README.md)
+    - OI-10 — **Disk encryption decision (2026-07-11):** the AWOW's disk is
+      UNENCRYPTED — physical theft/disposal exposes `.env` secrets + the
+      finance volumes. Proposed: autoinstall LUKS (Subiquity supports
+      `storage: layout: {name: lvm, password: …}`) + unattended unlock via
+      TPM2 enroll at first boot **if the AK41 BIOS exposes Intel PTT (Peter:
+      check BIOS)**, else dropbear-initramfs (SSH unlock over LAN — fits
+      headless). Touches the autoinstall `storage:` layout = the
+      REMOTE_MANAGEMENT **hard line**: not implemented until Peter ratifies.
+      Companion decision: LUKS on the backup drives too (finance snapshots
+      land there in plaintext otherwise).
     - OI-8 — **Backup gap — RESOLVED in-repo 2026-07-10 (SN-010/SR-013,
       Peter-ratified single-table design):** `BACKUP_SOURCES` now accepts
       `volume:VOL[@CONTAINER]` and `path:/dir` specs; sim-proven
@@ -870,3 +880,34 @@ that migrated HERE (WI-10.1) — needs re-homing + counterpart ids; its G1
 human sign-off is still pending (process debt). FA multi-user note: its feed
 client sends bearer only, no X-Forwarded-User — fine single-user, a gap if
 the tracker runs multi-user (D3).
+
+### DRIVER — G1 — Round 1 — 2026-07-11 (NagLight color lane VERIFIED end-to-end + sim interpolation fix)
+
+Peter said NagLight was updated; verified in its working tree (NOTE: that work
+is **UNCOMMITTED in NagLight** — Peter to commit there): /api/feed now takes
+three lanes ({check,ok,note} boolean; {check,color,reason,at} severity;
+{check,rgb,...}), field names pinned to FA's contract (NagLight IF-006 ↔ FA
+IF-001); its IF registry is re-homed with counterpart ids matching ours
+(their IF-004↔our IF-003, IF-005↔our IF-002); G1 human sign-off still pending
+(Peter's).
+
+**RAN FOR REAL (sim):** rebuilt `naglight:local` from the updated tree,
+recreated the sim tracker, added the fictional `finances.md` severity-item
+fixture to `sim/tracker-seed/` (mirrors NagLight's example-data), probed as a
+fresh sim user with FA's exact payload shape:
+`POST /api/feed {check:finance-audit, color:yellow, reason, at}` → **HTTP 200**,
+`/api/today` shows `reportColor/reportReason/reportAt`, and the day's
+aggregate flipped yellow with the de-identified reason in the overlay. The
+FA↔NagLight seam is proven in the sim. (Also learned: a color post to a
+boolean-lane item 400s by design — lanes are typed per item definition.)
+
+**REGRESSION found+fixed en route:** `docker compose up` with
+`--env-file sim/.env.sim` REFUSED to parse after the tier-2/finance additions
+— unset `${MEDIA_ROOT}` renders a volume spec `:/media` (compose interpolates
+the whole file before profile filtering; `config -q` tolerated it, `up` did
+not). Fixed: `sim/.env.sim` gained a fictional interpolation-defaults block
+for every tier-2/finance knob. Sim bring-up works again.
+
+**Follow-ons recorded:** `naglight:local` image id changed → the baked payload
+needs a re-export before any flash (folds into the OI-7c re-export); OI-10
+added (disk-encryption decision); USB-wipe note added to stack/README §3.

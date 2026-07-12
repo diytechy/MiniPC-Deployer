@@ -222,6 +222,16 @@ the stack up.
    > password hash and, ideally, an SSH key (then set `allow-pw: false`). Do
    > **not** commit a filled-in `user-data`.
 
+   > **The stick carries your secrets in PLAINTEXT** (the filled `.env`, the
+   > password hash). After a successful install, either **wipe it properly**
+   > (`diskpart clean all` / `dd if=/dev/zero` — a quick format does NOT scrub
+   > data) or lock it away as the reimage medium — a reimage re-seeds `.env`
+   > from this stick, so keeping one is useful, but treat it like the secrets
+   > it holds. The reimage-ladder Option D ("USB left in the box") inherits
+   > this trade-off. On-box protection today is SSH-key-only + LAN-only
+   > management; the DISK IS NOT ENCRYPTED — see OI-10 (docs/status.md) for
+   > the LUKS+TPM decision.
+
 4. **Boot the AWOW from USB #1.** It partitions, installs Ubuntu + Docker
    unattended, copies the repo, seeds `.env`, enables `awow-firstboot.service`,
    and reboots.

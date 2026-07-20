@@ -83,6 +83,7 @@ graph LR
 | `stack/provision/` | idempotent Technitium provisioning + headless health check |
 | `stack/backup/` | the bash backup service (six-step pipeline, restore, drive power) |
 | `stack/mosquitto/` | committed MQTT broker config (tier-2 home-automation profiles) |
+| `stack/remote-ui/` | OPT-IN light RDP layer for GUI-only vendor apps (IceDrive; SR-015) |
 | `stack/tracker/` | deprecated reference copies (NagLight owns the build) |
 | `sim/` | V1 AWOW-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
 | `vmtest/` | V3 — the real autoinstall ISO booted in Hyper-V (SIM secrets only) |

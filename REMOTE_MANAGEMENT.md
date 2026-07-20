@@ -99,9 +99,25 @@ On the AWOW, **every service is a container** except these host-level pieces:
 the **backup service** (pure bash + systemd timer — deliberately not a
 container, it mounts cifs and manages drives), the **powertune** and
 **backup-standby** per-boot oneshots, **Cockpit**, **sshd**,
-**unattended-upgrades**, and Docker itself. **Mini-serv** (the Windows box)
-runs nothing from this stack — it only serves the Samba shares and the
-IceDrive-synced folder that the backup service pulls from / pushes to.
+**unattended-upgrades**, and Docker itself — plus, **only if opted in**, the
+SR-015 light RDP layer below. **Mini-serv** (the Windows box) runs nothing
+from this stack — it only serves the Samba shares and the IceDrive-synced
+folder that the backup service pulls from / pushes to.
+
+### Opt-in: light remote desktop (RDP) for GUI-only vendor apps (SR-015)
+
+Some vendor apps have no headless mode — the current **IceDrive Mount & Sync**
+client is GUI-only (and IceDrive's WebDAV fallback began sunsetting in 2026).
+For those, `stack/remote-ui/setup-remote-ui.sh` installs an **off-by-default**
+xrdp + minimal-XFCE layer so the app can be launched and configured over RDP
+from the LAN — the sanctioned SN-001 exception: secondary services may need UI
+configuration, but it is always remote, and restricted/minimized. Nothing in
+the autoinstall/first-boot path references it; the core zero-click guarantee
+is untouched. **LAN-only like Cockpit** — never proxied through Caddy, never
+port-forwarded. What it deliberately does not self-heal (post-reboot
+one-RDP-touch to resume sync; GUI state lost on reimage) is documented in
+[stack/remote-ui/README.md](stack/remote-ui/README.md) — read it before
+relying on on-box IceDrive.
 
 > **WireGuard is the later remote-access answer** (D5): once set up, the same LAN
 > workflow works from anywhere. Until then this is LAN / VPN-to-LAN only — do not

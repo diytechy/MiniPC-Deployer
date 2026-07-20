@@ -58,6 +58,13 @@ last) — it is the record, not required reading for every pass.
       GREEN). **Remaining for Peter:** uncomment the volume lines in the real
       `/etc/awow-backup/backup.env` (+ add `actual tracker` to `OFFSITE_SETS`)
       when configuring the box — they ship commented in `backup.env.example`.
+    - OI-11 — **On-box offsite leg (2026-07-20):** the SN-012/SR-015 opt-in
+      RDP layer makes IceDrive *runnable* on the box, but `backup.sh` step 5
+      still only targets a cifs share (`OFFSITE_UNC`). If Peter wants the
+      offsite leg fully on-box (retiring Mini-serv's share), ratify a
+      local-path offsite target extension (small `backup.sh` change + sim
+      legs) — deliberately NOT built unasked. Until then Mini-serv stays the
+      offsite path and the opt-in is inert.
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)
@@ -171,6 +178,16 @@ Scaffolding created. Starting G1.
   per WI-10.12 "key-only auth". Cockpit installed but **not** proxied publicly.
 - A5 — Kept the `TRACKER_DATA_REMOTE` clone/pull entrypoint behaviour from the
   source; multi-user (D3) sets it blank + `TRACKER_COMMIT=false` (documented).
+- A6 — SN-012/SR-015 shape (2026-07-20, Peter asked for "opt-in light UI +
+  SN-001 rescope"; details decided unattended): xrdp + **minimal** XFCE
+  (`--no-install-recommends`, no desktop meta-package) rather than a full DE
+  or VNC; the script never downloads the AppImage (vendor URL churn on a
+  public repo — Peter scp's it, `ICEDRIVE_APPIMAGE=` path knob); sync-resume
+  is the documented post-reboot one-RDP-touch (NO autologin/virtual-display
+  hack — that would fake self-healing the vendor app can't honestly offer);
+  priority C, Verification=Inspection, no sim leg (a host-level GUI can't be
+  exercised in the compose sim; the V3.5 rehearsal VM is where it could be
+  tried for real). Revert any of these at the next gate if wrong.
 
 ### DRIVER — G1 — Round 1 — 2026-07-03 (migration + spine)
 Migrated the deploy stack, wired the tracker to `naglight:local`, authored the
@@ -911,3 +928,37 @@ for every tier-2/finance knob. Sim bring-up works again.
 **Follow-ons recorded:** `naglight:local` image id changed → the baked payload
 needs a re-export before any flash (folds into the OI-7c re-export); OI-10
 added (disk-encryption decision); USB-wipe note added to stack/README §3.
+
+### DRIVER — G1 — Round 1 — 2026-07-20 (SN-012/SR-015: opt-in remote light UI; SN-001 rescoped — Peter's ask)
+
+Peter asked (following the IceDrive-headless discussion — the current client is
+GUI-only, no daemon/CLI, WebDAV sunsetting since 2026-04) to make an on-box
+light UI an **opt-in option** and to rescope SN-001: zero-click is guaranteed
+for **core** services; opt-in secondary services may need UI/manual config —
+always remote, restricted/minimized.
+
+- **SN-001 rescoped** (need + acceptance intent now say "core"; opt-ins that
+  can't meet the bar must be OFF by default, document their manual steps and
+  what doesn't self-heal, and be fully set-up-able over the LAN).
+- **SN-012 + SR-015 added** (+3 SN-012 edge rows): opt-in, off-by-default
+  xrdp + minimal-XFCE layer solely for GUI-only vendor apps; first case
+  IceDrive Mount & Sync. Priority C, Verification=Inspection.
+- **`stack/remote-ui/`**: `setup-remote-ui.sh` (idempotent, non-interactive,
+  root-checked; installs xrdp+minimal XFCE+libfuse2t64, wires `~/.xsession`,
+  optional `ICEDRIVE_APPIMAGE=` install + autostart; referenced by NOTHING in
+  autoinstall/first-boot) + README (LAN-only rule, what does NOT self-heal:
+  post-reboot one-RDP-touch, GUI state lost on reimage + re-setup checklist,
+  uninstall steps). REMOTE_MANAGEMENT.md gained the opt-in section;
+  architecture layout table row added.
+- **Scope line held:** backup step 5 offsite stays cifs-only — pointing it at
+  an on-box synced folder is OI-11 (needs Peter; small backup.sh extension +
+  sim legs). A6 records the unattended shape decisions (minimal XFCE not full
+  DE; no AppImage auto-download; no autologin sync-resume hack).
+
+**RAN FOR REAL:** `check.py` G1 **PASS** (config-validate 77 vars,
+registry-integrity `SN=12 SR=15 orphans=21 integrity=0` — the +1 orphan line
+(20→21) is SR-015's standard pre-G2 "no TC" state, same as every SR
+(Inspection exempts it from the no-LLR finding);
+doc-navigability 48 links 0 broken); `bash -n` on the new script OK. NOT run:
+the script itself (needs the real box / rehearsal VM — host-level GUI is
+outside the compose sim; recorded in A6).

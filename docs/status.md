@@ -65,6 +65,31 @@ last) — it is the record, not required reading for every pass.
       local-path offsite target extension (small `backup.sh` change + sim
       legs) — deliberately NOT built unasked. Until then Mini-serv stays the
       offsite path and the opt-in is inert.
+    - OI-12 — **Second image target proposed (2026-07-25): the office wall
+      panel.** Peter is adding a wall-mounted ambient panel (Acer Aspire R 14,
+      chassis N15P6) showing NagLight + a Navidrome-fed music player + a family
+      photo/video frame. Brief: `Personal\OFFICEWALL_BOOTSTRAP.md`. It overlaps
+      this repo almost entirely at the image layer — autoinstall skeleton, ISO
+      assembly, payload bake, secret materialisation, SSH/unattended-upgrades
+      posture — so the **recommended** split (Peter's D-W0) is that the *image*
+      becomes a **second target in this repo** while the panel's *shell app*
+      lives in the `OfficeWallNaglight` repo and is consumed exactly as
+      `naglight:local` is (the IF-001 pattern), preserving this repo's
+      "no product source" constraint. **Nothing is built here yet.** Three
+      things would land in this repo if ratified:
+      (a) a `wall.<domain>` Caddy site that is panel-IP-restricted (`/32`,
+      not the LAN CIDR), **strips** any client-supplied `X-Forwarded-User`/
+      `-Email` before injecting the panel's identity, and `respond 403`s
+      everything else — note the DDNS wildcard already resolves that name
+      publicly, so the 403 default needs an explicit **off-LAN** test. This
+      deliberately bypasses oauth2-proxy (a keyboard-less panel cannot complete
+      an interactive OAuth consent) and is therefore a **security-relevant
+      change requiring ratification** — SR-004's "trusted headers are only
+      honoured from oauth2-proxy" premise gains a second injector;
+      (b) the graphical/kiosk autoinstall variant + its own SN/SR rows (the
+      panel's needs are not SN-001's headless zero-click needs);
+      (c) enabling the `navidrome` tier-2 profile, which re-raises **OI-7(b)**
+      — `MEDIA_ROOT`'s physical location — as a blocker rather than a nicety.
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)

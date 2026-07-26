@@ -32,7 +32,7 @@
 # throwaway placeholder generated fresh for this local, NAT-isolated VM. NONE
 # of it is a real production secret and NONE of it should be reused anywhere
 # else. Real materialization for the physical AWOW happens later via
-# SECRET_HANDOFF_PROPOSAL, once Peter ratifies it (WI-10.3, still open) — see
+# SECRET_HANDOFF (WI-10.3, RATIFIED 2026-07-25; tooling not yet written) — see
 # stack/README.md and docs/status.md OI list.
 #
 # Usage:

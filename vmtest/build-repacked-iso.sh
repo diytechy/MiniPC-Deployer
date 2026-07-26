@@ -28,7 +28,7 @@
 #
 # SECRETS: same policy as build-seed.sh — everything materialized is a
 # throwaway SIM placeholder for this local VM, never a real secret. Real
-# materialization happens later via SECRET_HANDOFF_PROPOSAL (WI-10.3, still
+# materialization happens later via SECRET_HANDOFF (WI-10.3, RATIFIED
 # open).
 #
 # Usage:

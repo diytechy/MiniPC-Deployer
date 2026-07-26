@@ -81,11 +81,12 @@ deploy image:
    services come up at first boot, stack/README §9) and the commented
    `volume:` lines in the backup config (`stack/backup/backup.env.example`) so
    the box's own state — the finances — joins the backup (SR-013).
-2. Filling `.env` today is a **manual** step — the automated secret-handoff
-   script proposed in `Personal\SECRET_HANDOFF_PROPOSAL.md` (a sibling repo;
-   extends Peter's existing DPAPI credential pattern) is still an unratified
-   proposal, not implemented. Once ratified it would materialize `.env` from
-   Personal's credential store instead of hand-editing.
+2. Filling `.env` today is still a **manual** step. The automated
+   secret-handoff design in `Personal\SECRET_HANDOFF.md` (a sibling repo;
+   extends Peter's existing DPAPI credential pattern) was **ratified
+   2026-07-25**, but the tooling is not written yet — so hand-fill for now.
+   Once built it materializes `.env` from Personal's credential store, and
+   pathing values come from `Personal\deploy\storage-map.md`.
 3. Run `vmtest/export-images.sh` (it reads the real pinned tags in
    `.env.example`, not sim values) so the real USB also carries every **core**
    container image baked in (Q10.9 B+) — see stack/README.md §3. Tier-2 opt-in

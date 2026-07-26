@@ -158,11 +158,12 @@ Fill in at minimum:
 > knobs (`COMPOSE_PROFILES`, `MEDIA_ROOT`, `EXTRA_SUBDOMAINS`, per-service
 > pins/ports/passwords) live in the same file — see §9.
 
-**Filling these in today is a manual step.** An automated secret-handoff
-script is proposed (not yet built) in the sibling `Personal` repo's
-`SECRET_HANDOFF_PROPOSAL.md` — it would extend Peter's existing DPAPI
-credential pattern to materialize this `.env` instead of hand-editing. Still
-awaiting Peter's ratification checkboxes; hand-fill `.env` until then.
+**Filling these in today is a manual step.** The automated secret-handoff
+design in the sibling `Personal` repo's `SECRET_HANDOFF.md` was **ratified
+2026-07-25** but is **not built yet**, so hand-fill `.env` until it exists.
+Once built it extends Peter's DPAPI credential pattern to materialize this
+file; path-shaped values (`MEDIA_ROOT`, the backup source/target table) come
+from `Personal\deploy\storage-map.md`, which is the pathing SSOT.
 
 ### PETER MANUAL STEP — Google OAuth client (required for the tracker)
 

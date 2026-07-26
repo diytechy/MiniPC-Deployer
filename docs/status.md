@@ -58,13 +58,18 @@ last) — it is the record, not required reading for every pass.
       GREEN). **Remaining for Peter:** uncomment the volume lines in the real
       `/etc/awow-backup/backup.env` (+ add `actual tracker` to `OFFSITE_SETS`)
       when configuring the box — they ship commented in `backup.env.example`.
-    - OI-11 — **On-box offsite leg (2026-07-20):** the SN-012/SR-015 opt-in
-      RDP layer makes IceDrive *runnable* on the box, but `backup.sh` step 5
-      still only targets a cifs share (`OFFSITE_UNC`). If Peter wants the
-      offsite leg fully on-box (retiring Mini-serv's share), ratify a
-      local-path offsite target extension (small `backup.sh` change + sim
-      legs) — deliberately NOT built unasked. Until then Mini-serv stays the
-      offsite path and the opt-in is inert.
+    - OI-11 — **On-box offsite leg — RATIFIED by Peter 2026-07-25; BUILD
+      OUTSTANDING.** The offsite leg moves fully onto this box: IceDrive runs
+      here (SN-012/SR-015 opt-in RDP layer) and syncs selected folders straight
+      to the cloud. **Mini-serv leaves the offsite path entirely.** What is
+      still needed: `backup.sh` step 5 is cifs-only (`OFFSITE_UNC`) and needs a
+      **local-path offsite target** plus its sim legs — the small change that
+      was deliberately not built unasked. Two things to carry into the design:
+      the IceDrive client is a GUI app, so **sync is down after every reboot
+      until an RDP session is opened** (SR-015 documents this and it does not
+      change), and the *which folders go offsite* answer now comes from
+      `Personal\deploy\storage-map.md` §4e rather than a hand-kept
+      `OFFSITE_SETS` list.
     - OI-12 — **Second image target proposed (2026-07-25): the office wall
       panel.** Peter is adding a wall-mounted ambient panel (Acer Aspire R 14,
       chassis N15P6) showing NagLight + a Navidrome-fed music player + a family

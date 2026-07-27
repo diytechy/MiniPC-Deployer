@@ -146,6 +146,17 @@ netboot into the installer and re-run autoinstall.
   disk; reusable for other machines.
 - **Cons:** needs a second always-on box + DHCP-proxy config (can fight the
   router's DHCP); BIOS must reliably attempt netboot; most setup effort.
+- **Firmware cost — priced in 2026-07-26.** This is the only option that
+  depends on a **firmware** setting (the UEFI network stack / PXE), and
+  firmware is the one layer no remote path can reach: there is no vendor tool
+  to change this box's BIOS from Linux, and the generic alternatives are a good
+  way to brick a mini PC. So if the network stack is ever disabled, re-enabling
+  it for this option costs a physical visit — which is precisely what the
+  ladder exists to avoid. **Also note the circularity here:** the "second
+  always-on LAN box" serving TFTP would have to be something *other* than the
+  target, and in this homelab the target IS the always-on box; the remaining
+  candidates are the legacy machine being retired and a panel that sleeps
+  half the day. Options B–D depend on no firmware settings at all.
 - [ ] **Build Option A.**
 
 ### Option B — GRUB "reinstall" entry seeded from a recovery partition  ★ recommended primary
@@ -191,6 +202,25 @@ that works even when B's assumptions (intact GRUB, healthy disk) fail, at the
 cost of one USB left in the box. Together they cover "software-broken" (B) and
 "deeply broken / B's preconditions gone" (D) without the standing infrastructure
 of A or the complexity of C.
+
+### Where the remote/physical boundary actually sits
+Everything **above** the firmware is remotely manageable once the OS boots:
+config, packages, containers, upgrades — and a full reimage too, since a
+healthy OS can arm Option B's entry with `grub-reboot` and reboot into it. What
+no rung can reach is the **firmware itself**: BIOS settings need a keyboard at
+the machine. Two consequences worth designing around:
+
+1. **Batch firmware work into one visit.** Anything firmware-level — boot
+   order, Secure Boot state, the UEFI network stack, TPM/PCR-bank settings —
+   should be settled while someone is physically there, because the next
+   chance is another trip. (TPM PCR banks especially: changing them
+   invalidates anything already sealed, so they must be right *before* disk
+   encryption is enrolled, not after.)
+2. **Every rung here assumes the OS boots and is reachable.** That is the
+   real precondition, not any firmware setting. Auto-unlocking disk
+   encryption preserves it after an unattended reboot or power cut; a setup
+   that needs a passphrase typed at boot does not, and pushes recovery down
+   the ladder every time the power blips.
 
 ### The hard line (do not cross unattended)
 - No change to the autoinstall **`storage:`** layout (recovery partition) is made

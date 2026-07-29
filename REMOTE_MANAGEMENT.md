@@ -101,11 +101,13 @@ container, it mounts cifs and manages drives), the **powertune** and
 **backup-standby** per-boot oneshots, **Cockpit**, **sshd**,
 **unattended-upgrades**, and Docker itself — plus, **only if opted in**, the
 SR-015 light RDP layer below. **Mini-serv** (the Windows box) runs nothing
-from this stack — it serves **one** Samba share that the backup service pulls
-from, and it is allowed to **sleep**: the backup wakes it over the LAN
-(Wake-on-LAN) and fails loudly if it does not come up. It has **no offsite
-role** any more — since OI-11 (ratified 2026-07-25) the IceDrive client runs
-here, in the opt-in RDP session, syncing a local folder.
+from this stack — it serves **one** Samba share that the backup service
+**ingests** (mirrors into this box's library tree, ratified 2026-07-29), and it is
+allowed to **sleep**: the backup wakes it over the LAN (Wake-on-LAN) and fails
+loudly if it does not come up. It has **no offsite role** any more — the IceDrive
+client runs here, in the opt-in desktop session, pointed straight at chosen
+library paths (Owner 2026-07-29, correcting OI-11: the backup service stages
+nothing for it).
 
 ### Opt-in: light remote desktop (RDP) for GUI-only vendor apps (SR-015)
 

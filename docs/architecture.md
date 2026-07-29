@@ -28,8 +28,9 @@ graph LR
     caddy -->|basic_auth| actual["Actual Budget"]
     caddy -->|basic_auth| tech
     ddns["ddns<br/>(Cloudflare A records)"] -.->|follows home IP| net
-    backup["bash backup service<br/>(systemd timer)"] -.->|"wake (WoL) then cifs pull + volume: sources"| net
-    backup -.->|"offsite: stage into a LOCAL folder"| ice["IceDrive client<br/>(on-box, SR-015 RDP session)"]
+    backup["bash backup service<br/>(systemd timer)"] -.->|"wake (WoL) then cifs INGEST + volume: sources"| net
+    backup -.->|"mirror network shares into"| lib[("library tree<br/>(on-box)")]
+    lib -.->|"the client is pointed at chosen paths"| ice["IceDrive client<br/>(on-box, SR-015 session)"]
     ice -.->|syncs| cloud([IceDrive cloud])
     fa["finance-auditor<br/>(profile until FA G-Final)"] -.->|triggers bank sync| actual
     fa -.->|de-identified status| tracker
@@ -63,16 +64,20 @@ graph LR
 - **Observability (WI-10.11):** Uptime-Kuma, Dozzle, and optional ntfy run
   LAN-only.
 - **Backup (WI-10.10/SR-013):** the bash backup service (systemd timer, not a
-  container) **wakes then pulls** — a source box that is allowed to sleep gets a
-  Wake-on-LAN packet and must answer tcp/445 before the run touches it (a wake
-  timeout fails the run loudly) — across one `BACKUP_SOURCES` table of LAN cifs
-  shares AND the stack's own docker volumes (`volume:VOL[@container]` quiesce),
-  through archive/hash/manifest/retention/offsite/report. The **offsite leg is
-  local** (OI-11): the run stages selected sets into an on-box folder that the
-  IceDrive client — in the SR-015 opt-in RDP session — syncs to the cloud;
-  `OFFSITE_UNC` (cifs push to a remote share) survives only as the legacy form.
-  Never-silent-green into the tracker's `/api/feed`, on **every** failure path
-  including `die` (OI-9).
+  container) **wakes, ingests, then archives** — a source box that is allowed to
+  sleep gets a Wake-on-LAN packet and must answer tcp/445 before the run touches
+  it (a wake timeout fails the run loudly); each `INGEST_SOURCES` network share is
+  then **mirrored into the library tree** (`rsync -a --delete`, so deletions
+  propagate — ratified 2026-07-29), and one `BACKUP_SOURCES` table covers those
+  library folders (`path:`), any share pulled directly, AND the stack's own docker
+  volumes (`volume:VOL[@container]` quiesce) through
+  archive/hash/manifest/retention/report — minus the `BACKUP_EXCLUDE` /
+  `name.exclude=` patterns, which are logged, listed per run and recorded in the
+  MANIFEST. There is **no offsite step in the target state** (Owner, 2026-07-29,
+  correcting OI-11): the IceDrive client is pointed at chosen **library** paths in
+  its own GUI and syncs them itself, so `OFFSITE_ENABLED=false` and both
+  `OFFSITE_PATH`/`OFFSITE_UNC` are legacy. Never-silent-green into the tracker's
+  `/api/feed`, on **every** failure path including `die` (OI-9).
 - **Tier-2 opt-in catalog (SN-009/SR-012):** additional self-hosted services
   behind compose profiles — OFF by default, LAN_IP-bound or Caddy-site-only,
   excluded from the baked ISO payload unless exported with `EXTRA_PROFILES`.

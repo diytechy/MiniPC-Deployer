@@ -39,9 +39,9 @@ is running inside a session**:
   disconnected session. This is the **accepted** one-touch deviation from
   SN-001 — it was weighed and ratified with OI-11, not left open.
 - **A crashed/logged-off session stops sync silently on the IceDrive side.**
-  The backup pipeline's own offsite step still fails loudly if its target is
-  missing (never-silent-green), but IceDrive's cloud upload has no watchdog
-  here.
+  IceDrive's cloud upload has no watchdog here, and since the backup service no
+  longer has an offsite step (2026-07-29 correction) it cannot notice either —
+  the backup can be green while the cloud copy is hours behind.
 - **GUI-configured state is not reproducible from this repo.** The IceDrive
   login and sync pairs live in the operator's home directory; a reimage wipes
   them. Re-setup checklist after a reimage: re-run the script → RDP in →
@@ -54,23 +54,28 @@ LAN-only, exactly like Cockpit (SN-005): **never** proxy RDP through Caddy,
 future WireGuard path (D5). The script adds no user, no password auth surface
 beyond the existing operator account.
 
-## The backup offsite leg — on-box is the target state
+## The offsite leg — the client syncs library paths, the backup stages nothing
 
-**The switch is decided** (OI-11, ratified 2026-07-25): the offsite leg runs
-here. IceDrive runs on this box in the RDP session and syncs a **local** folder
-straight to the cloud; the Windows box leaves the offsite path entirely.
+**The corrected model (Owner, 2026-07-29)**: IceDrive runs here and is pointed
+**directly at chosen library paths in its own GUI**. The backup service performs
+**no offsite staging at all** — its step 5 is retired
+(`OFFSITE_ENABLED=false`), which is also why the backup **ingests** network
+shares into the library in the first place (there is one current copy, and the
+client syncs it). The Windows box leaves the offsite path entirely.
 
-`backup.sh` step 5 supports that target: set `OFFSITE_PATH=/abs/dir` to the
-folder IceDrive syncs and the run lands the selected sets there (the upload is
-the client's job). The old `OFFSITE_UNC` cifs push to a remote synced share
-still works — it is the **legacy** form for a box not yet migrated — but only
-one of the two may be set. See
-[../backup/README.md](../backup/README.md) "Offsite target".
+So the sync pairs you create in step 3 above **are** the offsite configuration.
+Choose them from `Personal\deploy\storage-map.md` §4e, and never point one at a
+library path holding raw finance data (that data stays on the LAN).
+
+`backup.sh` step 5 still *works* if a box is configured the old way
+(`OFFSITE_PATH` local dir, or the older `OFFSITE_UNC` cifs push; exactly one) —
+legacy only. See [../backup/README.md](../backup/README.md) "Offsite (step 5) —
+retired from the target state".
 
 The one-touch caveat above is the price of this arrangement and does not go
-away: after a reboot nothing uploads until an RDP session is opened, so the
-backup's own step 5 can be green (files staged locally) while the cloud copy is
-hours behind.
+away: after a reboot nothing uploads until a session is opened. With no offsite
+step in the pipeline, **the backup's NagLight report cannot see that staleness at
+all** — a green backup says nothing about the cloud copy.
 
 ## Disable / remove
 

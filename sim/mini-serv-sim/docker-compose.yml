@@ -17,6 +17,9 @@ networks:
 volumes:
   icedrive_data:      # the IceDrive-synced target share (writable; starts empty)
   backup_drive:       # the AWOW external backup drive (BACKUP_TARGET)
+  empty_share:        # a share that is INTENTIONALLY always empty — the fixture
+                      # for the ingest mirror-safety check (a share that mounts
+                      # but holds nothing must not mirror-delete the library copy)
 
 services:
   # ── Samba fixture host (Mini-serv stand-in) ─────────────────────────────────
@@ -31,11 +34,13 @@ services:
       -s "minecraft;/share/minecraft;yes;yes;no;awow"
       -s "satisfactory;/share/satisfactory;yes;yes;no;awow"
       -s "icedrive;/share/icedrive;yes;no;no;awow"
+      -s "empty;/share/empty;yes;yes;no;awow"
       -p
     volumes:
       - ./fixtures/minecraft:/share/minecraft:ro
       - ./fixtures/satisfactory:/share/satisfactory:ro
       - icedrive_data:/share/icedrive
+      - empty_share:/share/empty
     restart: unless-stopped
 
   # ── Backup runner (AWOW host stand-in) ──────────────────────────────────────

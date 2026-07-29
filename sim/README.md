@@ -71,7 +71,7 @@ real `:53`, and the AWOW hardware itself.
 
 ## mini-serv-sim — Samba fixtures + the bash backup service (WI-10.15)
 
-`mini-serv-sim/` is Mini-serv's stand-in: a Samba server exposing three fixture
+`mini-serv-sim/` is Mini-serv's stand-in: a Samba server exposing four fixture
 shares plus a privileged runner that cifs-mounts them and runs the **real**
 `stack/backup` service end to end.
 
@@ -79,8 +79,22 @@ shares plus a privileged runner that cifs-mounts them and runs the **real**
 sim/mini-serv-sim/run-backup-sim.sh        # full 6-step cycle + restore drill
 sim/mini-serv-sim/run-drivepower-sim.sh    # WI-10.10 hdparm standby CALL CONTRACT (mock shim)
 sim/mini-serv-sim/run-volume-sim.sh        # SR-013 volume:/quiesce CALL CONTRACT (mock-docker shim)
+sim/mini-serv-sim/run-ingest-sim.sh        # INGEST (library mirror) + EXCLUSIONS, real cifs
 sim/mini-serv-sim/run-backup-sim.sh --down # tear down
 ```
+
+`run-ingest-sim.sh` covers the two steps ratified 2026-07-29, over the REAL cifs
+path (only the feed is mocked, so the awow-sim stack is not needed): (a) an
+`INGEST_SOURCES` mirror of `//mini-serv/minecraft` into `/srv/library/...` is
+byte-identical to the live share and the `path:` set over it restores byte-equal;
+(b) library-only files are DELETED by the next mirror (`--delete` semantics
+asserted, not trusted); (c) `BACKUP_EXCLUDE` + `docs.exclude=` keep the excluded
+paths out of both the archive and `<set>.files.tsv` while naming every one of them
+in the log, in `<set>.excluded.log` and in the MANIFEST — and `restore.sh` flags
+the set as a FILTERED copy; (d) a share that mounts EMPTY may not mirror-delete a
+good library copy (loud `ok=false`; `INGEST_ALLOW_EMPTY=true` overrides);
+(e) three loud config failures (malformed ingest line, exclude line for an
+unknown set, missing library parent) each post `ok=false`.
 
 `run-drivepower-sim.sh` proves the WI-10.10 **drive power** contract without real
 spinning platters: it puts a mock `hdparm` (logs every call) and mock `curl`
@@ -100,12 +114,15 @@ the archive+manifest, `diff -r` byte-equality against the live share, delete the
 `plugins/` subtree and reconstruct again, and confirm the fixture "secret"
 (a fake rcon password) round-trips intact.
 
-The three shares (fictional, committed):
+The four shares (fictional, committed):
 - `//mini-serv/minecraft` — a Paper-server tree: `paper-1.20.4-435.jar`,
   `plugins/` (3 valid jars with parseable `plugin.yml`), `server.properties`
   (fake rcon password), `world/`.
 - `//mini-serv/satisfactory` — a save tree (`SaveGames/…/*.sav`).
-- `//mini-serv/icedrive` — the empty offsite target (writable).
+- `//mini-serv/icedrive` — the legacy offsite target (writable; starts empty).
+- `//mini-serv/empty` — a share that is **intentionally always empty**: the
+  fixture for the ingest mirror-safety check (a share that mounts but holds
+  nothing must never mirror-delete the library copy).
 
 Regenerate the binary fixtures deterministically with
 `sim/mini-serv-sim/fixtures/generate-binaries.sh`.
@@ -117,7 +134,7 @@ MinecraftKeeper's `--execute` validation (WI-10.16) needs only the Samba shares:
 ```bash
 sim/run-sim.sh                                   # once, for the shared network
 sim/mini-serv-sim/run-backup-sim.sh --shares-only
-# -> //mini-serv/{minecraft,satisfactory,icedrive}  user: awow  pass: simpass
+# -> //mini-serv/{minecraft,satisfactory,icedrive,empty}  user: awow  pass: simpass
 ```
 
 The shares are reachable from any container on the `awow-sim_default` network as

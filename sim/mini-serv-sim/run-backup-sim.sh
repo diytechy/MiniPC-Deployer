@@ -28,7 +28,7 @@ fi
 if [ "${1:-}" = "--shares-only" ]; then
     echo "== bringing up the Samba fixture shares only (WI-10.16) =="
     "${CO[@]}" up -d samba
-    echo "Shares up on 'mini-serv': //mini-serv/minecraft, //mini-serv/satisfactory, //mini-serv/icedrive (user awow / simpass)."
+    echo "Shares up on 'mini-serv': //mini-serv/minecraft, //mini-serv/satisfactory, //mini-serv/icedrive, //mini-serv/empty (user awow / simpass)."
     exit 0
 fi
 

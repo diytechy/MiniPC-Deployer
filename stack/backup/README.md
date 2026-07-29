@@ -7,15 +7,17 @@ tracking, auto-compression-where-applicable, recovery/reconstruct), not code to
 port. It was built and validated end-to-end against the `sim/mini-serv-sim`
 Samba fixtures in WI-10.15 (see `docs/status.md`).
 
-## The six steps (HOMELAB_TOPOLOGY.md)
+## The pipeline — the six steps (HOMELAB_TOPOLOGY.md), 1 in three parts
 
 | # | Step | Where |
 |---|---|---|
-| 1 | **source pulls** — an optional **Wake-on-LAN pre-step** for a source box that is allowed to sleep (`BACKUP_WAKE_MAC`; wait for tcp/445, LOUD failure on timeout), then ONE `BACKUP_SOURCES` table, three source kinds (SR-013): `//host/share` (cifs-mount + `rsync`), `volume:VOL[@CONTAINER]` (rsync from the docker volume's mountpoint, optional stop→copy→restart quiesce), `path:/dir` (local rsync) | `backup.sh` + `wake_and_wait` + `source_kind` |
-| 2 | **archive + compress** — `tar` per set, `zstd` **where applicable** (already-compressed sets stored as plain `.tar`) | `backup.sh` + `compression_decision` |
+| 1a | **wake** (optional) — a **Wake-on-LAN pre-step** for a source box that is allowed to sleep (`BACKUP_WAKE_MAC`; wait for tcp/445, LOUD failure on timeout) | `backup.sh` + `wake_and_wait` |
+| 1b | **ingest** (ratified 2026-07-29) — mirror each `INGEST_SOURCES` network share **into the library tree** (`name=//host/share -> /abs/library/dest`: cifs-mount ro → `rsync -a --delete` → unmount), so the library holds the current copy and the flows below cover it like any other folder. **Mirror: source deletions propagate** | `backup.sh` + `ingest_parse` |
+| 1c | **source pulls** — ONE `BACKUP_SOURCES` table, three source kinds (SR-013): `path:/dir` (local rsync — including the library folders just ingested, the intended pattern), `//host/share` (cifs-mount + `rsync`, the original direct form), `volume:VOL[@CONTAINER]` (rsync from the docker volume's mountpoint, optional stop→copy→restart quiesce) | `backup.sh` + `source_kind` |
+| 2 | **archive + compress** — `tar` per set, `zstd` **where applicable** (already-compressed sets stored as plain `.tar`), minus the **excluded** patterns (`BACKUP_EXCLUDE` + per-set `name.exclude=`), which are logged, listed in `<set>.excluded.log` and recorded in the MANIFEST | `backup.sh` + `compression_decision` + `rsync_pull` |
 | 3 | **hash + verify + manifest** — per-file sha256 table + archive sha256 + integrity test; a recovery MANIFEST | `backup.sh` |
 | 4 | **external-drive target** — dated `run_<UTC>` snapshot with retention (`BACKUP_KEEP`) | `backup.sh` |
-| 5 | **offsite** — copy selected sets into the IceDrive-synced folder: `OFFSITE_PATH=/abs/dir`, a **local** dir the on-box IceDrive client syncs (primary — OI-11), or the legacy `OFFSITE_UNC` cifs push to a remote share | `backup.sh` `offsite_stage` |
+| 5 | **offsite** — **legacy/optional; the target state uses no offsite step** — the IceDrive client syncs library paths directly (`OFFSITE_ENABLED=false`, Owner 2026-07-29). Kept working: `OFFSITE_PATH=/abs/dir` (local dir a sync client uploads) or `OFFSITE_UNC` (cifs push) | `backup.sh` `offsite_stage` |
 | 6 | **report** — POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9) | `common.sh` `feed_naglight` |
 
 ## Files
@@ -54,20 +56,83 @@ the packet every 15 s.
   Packet" enabled on the wired adapter and **Fast Startup off** — hybrid
   shutdown leaves the NIC unable to wake.
 
-## Offsite target (step 5) — local folder, or the legacy remote share
+## Ingest (step 1b) — the library holds the current copy
 
-`OFFSITE_PATH=/abs/dir` is the primary form (**OI-11, ratified 2026-07-25**): a
-**local** directory that the IceDrive client — running on *this* box in the
-SR-015 opt-in RDP session — syncs to the cloud. The backup only lands the
-files; the upload is the client's job. The directory must already exist, so a
-typo'd path can't report green with the files sitting where nothing syncs.
-Before relying on it, read [../remote-ui/README.md](../remote-ui/README.md): the
-client is a GUI app, so **sync is down after every reboot until one RDP session
-is opened**.
+**Ratified 2026-07-29.** A source on another box is not pulled straight into a
+tarball any more: it is first **mirrored into the library tree**, and the library
+folder is then backed up as an ordinary `path:` set. One line per source:
 
-`OFFSITE_UNC=//host/share` (cifs push to another host's synced share) is the
-**legacy** form, still supported for a box not yet migrated and used by the sim.
-Setting **both is a config error**, caught at run start.
+```
+INGEST_SOURCES="gamebox=//mini-serv/mini-pc-share -> /srv/library/NonDocs/MiniServ"
+BACKUP_SOURCES="gamebox=path:/srv/library/NonDocs/MiniServ"
+```
+
+- **Why:** the library becomes the single current copy of that data — usable,
+  browsable and syncable (the IceDrive client points at library paths, step 5) —
+  while the archive flow stays exactly one flow for every folder.
+- **Mirror semantics (`rsync -a --delete`):** the library copy is made to
+  **match** the share, so **a file deleted on the share disappears from the
+  library** on the next run. History is the dated run snapshots under
+  `BACKUP_TARGET` (`BACKUP_KEEP` of them), **not** the library.
+- **Mirror safety:** if a share *mounts* but holds **no files** while the library
+  copy does (wrong share name, a host that booted with its data drive unmounted),
+  the run **refuses and fails loudly** rather than let `--delete` erase a good
+  copy. `INGEST_ALLOW_EMPTY=true` is the explicit override.
+- **Destination discipline:** the leaf directory is created on first ingest, but a
+  **missing parent is fatal** — that is a typo or an unmounted library
+  filesystem, and mirroring into a stray directory while the `path:` set keeps
+  archiving the stale folder would be green and wrong.
+- The **wake** pre-step (1a) runs first, so a sleeping source box is awake before
+  the first mount; ingest reuses it rather than owning a second wake.
+- Pulling a share **directly** (`name=//host/share` in `BACKUP_SOURCES`) is still
+  fully supported — it just leaves no current copy in the library.
+- `--dry-run` passes `--dry-run` to the mirror too: a dry run never writes to the
+  library.
+
+## Exclusions (step 2) — and why nothing is excluded silently
+
+Two knobs, both space-separated glob lists with rsync's semantics (a pattern with
+no `/` matches that name at **any** depth):
+
+- **`BACKUP_EXCLUDE`** in `backup.env` — global, applies to every set
+  (`BACKUP_EXCLUDE="*.bak"`).
+- **`name.exclude=PATTERN …`** — extra lines *inside* the `BACKUP_SOURCES` table,
+  adding to the global list for that one set. This is where a **named very-large
+  folder** belongs. A `name.exclude=` line naming a set that does not exist
+  **fails the run** (a filter that silently excludes nothing is worse than none).
+
+The patterns go to `rsync` at pull time (so the copy is never made — that is what
+saves the time and space) **and** to `tar` (so the archive cannot contain them).
+Visibility is the requirement, so every run:
+
+- logs the **effective pattern list per set** (`[docs] exclude patterns: *.bak Downloads`);
+- logs each path the patterns actually hid — the first few inline, **all** of them
+  in **`<set>.excluded.log`** next to the archive (rsync's own `--debug=FILTER`
+  decisions: `hiding file sub/deep.bak because of pattern *.bak`);
+- records the patterns in the MANIFEST's **`excludes`** column;
+- makes `restore.sh` state plainly that such a set is a **FILTERED copy** of its
+  source, so a missing file after a restore is explained, never a mystery.
+
+## Offsite (step 5) — retired from the target state
+
+**The Owner's corrected model (2026-07-29): the backup service performs no
+offsite staging at all.** The IceDrive client (the SR-015 opt-in desktop
+session) is pointed **directly at chosen library paths in its own GUI** and syncs
+them itself — which is also why step 1b puts the current copy *in the library* in
+the first place. The target state is therefore **`OFFSITE_ENABLED=false`**, and
+the step logs a skip.
+
+Two consequences to keep in mind: *which* folders reach the cloud is configured
+in the client (authoritative list: `Personal\deploy\storage-map.md` §4e), and the
+client is a GUI app — **sync is down after every reboot until one desktop session
+is opened** ([../remote-ui/README.md](../remote-ui/README.md)) — a staleness this
+service's NagLight report cannot see.
+
+The step-5 code is **kept working** for a box still configured the old way:
+`OFFSITE_PATH=/abs/dir` (a local directory a sync client uploads — the OI-11
+build, now harmless legacy; it must already exist) or `OFFSITE_UNC=//host/share`
+(cifs push to another host's share, which the sim still uses as its regression
+net). Setting **both is a config error**, caught at run start.
 
 ## Drive power / spin-down (WI-10.10 DRIVE POWER DESIGN)
 
@@ -128,11 +193,16 @@ The legacy `*FilesHashTable.csv` files (FileBackup's own hash-tracking state,
 INVENTORY.md) are the prior art. Per run, under `BACKUP_TARGET/run_<UTC>/`:
 
 - **`MANIFEST.tsv`** — one row per set:
-  `set · source · archive · algo · archive_sha256 · files · bytes · reason`
+  `set · source · archive · algo · archive_sha256 · files · bytes · reason · excludes`
+  (`excludes` is `-` when nothing was filtered; runs written before exclusions
+  existed simply have no such column and restore fine).
 - **`<set>.files.tsv`** — the per-file hash table (the `*FilesHashTable.csv`
   successor): `sha256 · size · mtime_epoch · relpath` for every file in the set.
 - **`<set>.tar` / `<set>.tar.zst`** — the archive (algo per step 2).
-- **`RUN.json`** — run summary (status, totals, offsite, per-set sizes).
+- **`<set>.excluded.log`** — only when the set had exclude patterns: one line per
+  path the patterns hid, with the pattern that hid it.
+- **`RUN.json`** — run summary (status, ingest, totals, offsite, per-set sizes +
+  per-set `excludes`).
 - **`backup.log`** — the run log.
 
 `restore.sh --run <run_dir> --set <name> --target <dir>` verifies the archive's
@@ -175,6 +245,10 @@ the empty-device no-op) with a mock-`hdparm` shim.
 `sim/mini-serv-sim/run-volume-sim.sh` proves the SR-013 volume-source contract
 (archive/restore byte-equality, quiesce ordering, failure-path restart +
 `ok=false`, cifs-only zero-docker no-op) with a mock-`docker` shim.
+`sim/mini-serv-sim/run-ingest-sim.sh` proves the **ingest** and **exclusion**
+steps against the real Samba fixtures (mirror byte-equality + restore,
+deletion propagation, global/per-set exclusions and their visibility, the
+empty-share refusal + its override, and three loud config failures).
 See `sim/README.md`.
 
 **Honest gap:** those legs still drive the **legacy** `OFFSITE_UNC` offsite form

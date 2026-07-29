@@ -1380,3 +1380,7 @@ listed as **A8** and the things only the Owner can supply are **OI-14**.
   data is not being synced. The `.example`, the backup README and the remote-ui
   README now say so in words, which is all a config repo can do.
 - Left alone on purpose: OI-12 (wall panel) — nothing built.
+
+### DRIVER — G1 — Round 1 — 2026-07-29 (SR-013/SR-015 wording currency — the Owner's sanction)
+
+The two stale ratified wordings flagged above are now current per the Owner's 2026-07-29 sanction (SR-013 flow drops offsite → README step 5 legacy; SR-015's deferred offsite question marked settled; SN-010/SN-012 sentences matched) — wording only, nothing ran; `scripts/check.py` PASS.

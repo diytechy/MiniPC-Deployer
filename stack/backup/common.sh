@@ -48,6 +48,12 @@ die() {
     exit 1
 }
 
+# ── text helpers ─────────────────────────────────────────────────────────────
+# str_trim S : S without leading/trailing whitespace. Every table in backup.env is
+# one-entry-per-line and hand-edited, so trimming is the first thing done to every
+# line (BACKUP_SOURCES, INGEST_SOURCES, the per-set exclude lines).
+str_trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
 # ── config ───────────────────────────────────────────────────────────────────
 # load_config PATH : source a backup.env (KEY=VALUE). Values are literal — do NOT
 # put unescaped $ in secrets here; a cifs credentials file is the safer home.
@@ -111,6 +117,59 @@ source_kind() {
 # directly (the service runs as root) avoids depending on any helper image.
 volume_mountpoint() {
     docker volume inspect -f '{{ .Mountpoint }}' "$1" 2>/dev/null
+}
+
+# ── INGEST-spec parsing (step 1b, ratified 2026-07-29) ────────────────────────
+# INGEST_SOURCES line grammar — one per line, same hand-edited style as
+# BACKUP_SOURCES, but with a DESTINATION because ingest writes into the library:
+#
+#   name=//host/share -> /abs/library/dest
+#
+# `name` names the ingest in the log (it is NOT a backup set name — the library
+# folder is covered by an ordinary `path:` BACKUP_SOURCES entry afterwards).
+# Whitespace around `=` and `->` is free.
+#
+# ingest_parse LINE : echoes "name<TAB>src<TAB>dest"; returns 1 (silently) on
+# anything malformed. Callers MUST test the status (`x="$(ingest_parse "$l")" ||
+# die …`): a tested command substitution does not trip backup.sh's ERR trap, so
+# the caller owns the error message.
+ingest_parse() {
+    local line="$1" lhs rhs name src dest
+    case "$line" in *'->'*) ;; *) return 1 ;; esac
+    lhs="${line%%->*}"; rhs="${line#*->}"
+    case "$lhs" in *=*) ;; *) return 1 ;; esac
+    name="$(str_trim "${lhs%%=*}")"
+    src="$(str_trim "${lhs#*=}")"
+    dest="$(str_trim "$rhs")"
+    # The source is a UNC share (that is what "network source" means here) and the
+    # destination is an ABSOLUTE library path — a relative dest would resolve
+    # against whatever cwd systemd handed us, which is nobody's intent.
+    case "$src"  in //?*/?*) ;; *) return 1 ;; esac
+    case "$dest" in /?*)     ;; *) return 1 ;; esac
+    printf '%s\t%s\t%s' "$name" "$src" "$dest"
+}
+
+# dir_has_files DIR : 0 iff DIR contains at least one regular file (at any depth).
+# Used by the ingest MIRROR SAFETY guard — `rsync --delete` from a share that
+# mounted but came up EMPTY would otherwise erase the library copy.
+dir_has_files() { [ -n "$(find "$1" -type f -print -quit 2>/dev/null)" ]; }
+
+# ── per-set exclude lines (step 2 exclusions) ─────────────────────────────────
+# Exclusions live in the SAME BACKUP_SOURCES table as the sources they filter —
+# one table, one place to look (the SR-013 doctrine) — as extra lines:
+#
+#   name.exclude=PATTERN [PATTERN …]
+#
+# exclude_line_name LINE : echoes the SET NAME for such a line, or NOTHING when
+# LINE is an ordinary `name=SPEC` source. Pure, and never nonzero — the caller
+# branches on the emptiness, so this composes inside a `while read` loop without
+# any ERR-trap interaction. (A set name may therefore not END in `.exclude`.)
+# Anchored on the FIRST `=` so a source spec that merely contains the text
+# (`name=path:/srv/x.exclude=y`) can never be mistaken for an exclude line.
+exclude_line_name() {
+    local lhs
+    case "$1" in *=*) lhs="${1%%=*}" ;; *) return 0 ;; esac
+    case "$lhs" in *.exclude) printf '%s' "${lhs%.exclude}" ;; esac
 }
 
 # ── container quiesce (SR-013: volume:VOL@CONTAINER) ──────────────────────────

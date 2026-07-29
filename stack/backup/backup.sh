@@ -2,24 +2,34 @@
 # backup.sh — the AWOW bash backup service (WI-10.10, built/validated in WI-10.15).
 #
 # Runs the explicit six-step pipeline from HOMELAB_TOPOLOGY.md, 100% bash:
-#   1. source pulls   — optional WAKE-ON-LAN pre-step for a source box that is
+#   1a. wake          — optional WAKE-ON-LAN pre-step for a source box that is
 #                        allowed to sleep (BACKUP_WAKE_MAC; wait for tcp/445,
-#                        LOUD failure on timeout), then one BACKUP_SOURCES
-#                        table, three source kinds (SR-013):
+#                        LOUD failure on timeout)
+#   1b. INGEST        — mirror the configured network share(s) INTO the library
+#                        tree (INGEST_SOURCES: name=//host/share -> /abs/dest;
+#                        cifs-mount + `rsync -a --delete` + unmount), so the
+#                        library holds the CURRENT copy and the ordinary archive
+#                        flows below cover it like any other folder
+#                        (ratified 2026-07-29). MIRROR: deletions propagate.
+#   1c. source pulls  — one BACKUP_SOURCES table, three source kinds (SR-013):
 #                        //host/share cifs-mount+rsync; volume:VOL[@CONTAINER]
 #                        rsync from the docker volume's mountpoint, optionally
 #                        quiescing @CONTAINER (stop→copy→restart, EXIT-trap
 #                        safety net); path:/dir local rsync
 #   2. archive+compress — tar per set, zstd WHERE APPLICABLE (already-compressed
-#                        sets stored as plain .tar — FileBackup spec)
+#                        sets stored as plain .tar — FileBackup spec), minus the
+#                        EXCLUDED patterns (BACKUP_EXCLUDE globally + per-set
+#                        `name.exclude=` lines) — every exclusion is logged and
+#                        recorded in the MANIFEST, never silent
 #   3. hash+verify+manifest — per-file sha256 table + archive sha256 + integrity
 #                        test; a recovery MANIFEST that restore.sh reconstructs from
 #   4. external-drive target — dated run snapshot under BACKUP_TARGET, with
 #                        retention/rotation (keep last BACKUP_KEEP)
-#   5. offsite        — copy selected sets into the IceDrive-synced folder:
-#                        OFFSITE_PATH=/abs/dir (LOCAL dir synced by the on-box
-#                        IceDrive client — the ratified target, OI-11) or the
-#                        legacy OFFSITE_UNC cifs push to a remote share
+#   5. offsite        — LEGACY/OPTIONAL. The target state (Owner, 2026-07-29) is
+#                        OFFSITE_ENABLED=false: the IceDrive client is pointed at
+#                        library paths in its OWN GUI and this service does no
+#                        offsite staging. Kept working for boxes still using it —
+#                        OFFSITE_PATH=/abs/dir (local dir) or OFFSITE_UNC (cifs).
 #   6. report         — POST NagLight /api/feed; NEVER-SILENT-GREEN: any failure
 #                        posts ok=false and exits nonzero — the ERR trap AND
 #                        every `die` path (OI-9)
@@ -37,7 +47,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --config) CONFIG="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
         *) die "unknown arg: $1" ;;
     esac
 done
@@ -70,6 +80,7 @@ LOG_FILE="$RUN_DIR/backup.log"
 # Run totals + the report fields, initialised BEFORE the failure machinery below
 # so the very first failure can already write a complete RUN.json.
 TOTAL_BYTES=0; TOTAL_FILES=0; SET_SUMMARY=""; SET_SUMMARY_JSON=""; OFFSITE_DONE="skipped"
+INGEST_SUMMARY="none"
 
 write_run_json() {
     local status="$1" note="$2"
@@ -78,6 +89,7 @@ write_run_json() {
   "run": "$RUN_TS",
   "status": "$status",
   "finished_utc": "$(date -u +%FT%TZ)",
+  "ingest": "$INGEST_SUMMARY",
   "sets": [$SET_SUMMARY_JSON],
   "total_files": $TOTAL_FILES,
   "total_bytes": $TOTAL_BYTES,
@@ -119,12 +131,13 @@ set -o errtrace
 # wake timeout — posts ok=false before exiting 1.
 DIE_REPORTER=report_failure
 
-# ── offsite target: exactly ONE form (OI-11, ratified 2026-07-25) ─────────────
+# ── offsite target: exactly ONE form (legacy step — see step 5) ───────────────
 # Validated HERE, at run start, so a config mistake fails in seconds instead of
-# after an hour of archiving. OFFSITE_PATH (a LOCAL directory the on-box
-# IceDrive client syncs to the cloud) is the target state; OFFSITE_UNC (cifs
-# push to another host's share) is the legacy form, still supported. Both set is
-# a config error, not a precedence puzzle.
+# after an hour of archiving. Both forms are LEGACY as of the Owner's 2026-07-29
+# correction (target state: OFFSITE_ENABLED=false, the IceDrive client syncs
+# library paths itself). OFFSITE_PATH = a local dir an on-box sync client
+# uploads (OI-11 build); OFFSITE_UNC = the older cifs push to another host's
+# share. Both set is a config error, not a precedence puzzle.
 if [ -n "${OFFSITE_PATH:-}" ] && [ -n "${OFFSITE_UNC:-}" ]; then
     die "config: OFFSITE_PATH and OFFSITE_UNC are both set — set exactly one (OFFSITE_PATH = the on-box IceDrive-synced dir; OFFSITE_UNC = the legacy remote cifs share)"
 fi
@@ -149,7 +162,7 @@ trap 'quiesce_restore; drive_power_restore' EXIT
 
 log "== AWOW backup run $RUN_TS =="
 log "config=$CONFIG target=$BACKUP_TARGET keep=$KEEP dry_run=$DRY_RUN"
-printf 'set\tsource\tarchive\talgo\tarchive_sha256\tfiles\tbytes\treason\n' >"$MANIFEST"
+printf 'set\tsource\tarchive\talgo\tarchive_sha256\tfiles\tbytes\treason\texcludes\n' >"$MANIFEST"
 
 # ── drive power: DISABLE standby for the whole run (WI-10.10) ─────────────────
 # Turn OFF spin-down on the target drive(s) at run start so long no-write phases
@@ -175,13 +188,143 @@ if [ -n "${BACKUP_WAKE_MAC:-}" ]; then
         || die "wake-on-LAN TIMEOUT: $BACKUP_WAKE_HOST did not answer tcp/445 within ${WAKE_TIMEOUT}s — the source box did not wake, so this run copied NOTHING from it (check the box's WoL/fast-startup settings, or that the magic packet reaches its subnet)"
 fi
 
-# ── steps 1-3 per source set ─────────────────────────────────────────────────
+# ── 1b. INGEST — mirror the network share(s) INTO the library tree ─────────────
+# Ratified 2026-07-29. The library (not this service's staging area) is where the
+# current copy of a network source LIVES: each INGEST_SOURCES entry mirror-syncs
+# //host/share into an absolute library path, and the library folder is then
+# backed up by an ordinary `path:` BACKUP_SOURCES entry — so one archive flow
+# covers ingested folders and native ones identically.
+#
+# MIRROR SEMANTICS (`rsync -a --delete`): the library copy is made to MATCH the
+# share, so a file deleted on the share is deleted from the library on the next
+# run. History lives in the dated run snapshots under BACKUP_TARGET (BACKUP_KEEP),
+# NOT in the library. Every failure here is loud (OI-9 die reporting).
+#
+# The wake pre-step above already ran, so a source box that sleeps is awake by
+# now — ingest deliberately reuses it rather than owning a second wake.
+if [ -n "${INGEST_SOURCES:-}" ]; then
+    log "== ingest (step 1b): mirroring network source(s) into the library tree =="
+    INGEST_SUMMARY=""
+    while IFS= read -r iline; do
+        iline="$(str_trim "$iline")"
+        [ -z "$iline" ] && continue
+        case "$iline" in \#*) continue ;; esac   # the table can carry commented-out entries
+        iparsed="$(ingest_parse "$iline")" \
+            || die "bad INGEST_SOURCES line: '$iline' (want name=//host/share -> /abs/library/dest; the source must be a //host/share UNC and the destination an ABSOLUTE path)"
+        IFS=$'\t' read -r iname isrc idest <<< "$iparsed"
+
+        # The library destination must be REAL. A typo would otherwise mirror the
+        # share into a stray directory while the BACKUP_SOURCES entry keeps
+        # archiving the stale library folder — green, and wrong. So: create the
+        # LEAF on first ingest, but never a missing parent (that is the typo, or
+        # a library volume that is not mounted).
+        if [ ! -d "$idest" ]; then
+            iparent="$(dirname "$idest")"
+            [ -d "$iparent" ] \
+                || die "ingest[$iname]: the library destination's parent does not exist: $iparent (typo in INGEST_SOURCES, or the library filesystem is not mounted)"
+            mkdir -p "$idest" || { FAIL_NOTE="ingest[$iname]: cannot create library destination $idest"; false; }
+            log "ingest[$iname]: created library destination $idest (first ingest)"
+        fi
+
+        imp="$(mktemp -d)"
+        mount_cifs "$isrc" "$imp" ro          # dies loudly (and reports) if refused
+        # MIRROR SAFETY: a share that mounts but comes up EMPTY (wrong share name,
+        # a host that rebooted with its drive unmounted) would have `--delete`
+        # erase a good library copy. Refuse, loudly, unless told this is intended.
+        # (the die path unmounts for us — report_failure calls umount_all)
+        if ! dir_has_files "$imp" && dir_has_files "$idest"; then
+            [ "${INGEST_ALLOW_EMPTY:-false}" = "true" ] \
+                || die "ingest[$iname]: $isrc mounted but contains NO files, while $idest does — REFUSING to mirror-delete the library copy (if the share really is empty on purpose, set INGEST_ALLOW_EMPTY=true)"
+            log "ingest[$iname]: source is empty and INGEST_ALLOW_EMPTY=true — mirroring the emptiness (the library copy WILL be cleared)"
+        fi
+        # --dry-run must not mirror-delete anything either: it reports, no writes.
+        IDRY=(); inote=""
+        if [ "$DRY_RUN" = 1 ]; then IDRY=(--dry-run); inote=" [DRY-RUN: reporting only, no library writes]"; fi
+        log "ingest[$iname]: mirror $isrc -> $idest (rsync -a --delete — source deletions PROPAGATE)$inote"
+        rsync -a --delete ${IDRY[@]+"${IDRY[@]}"} "$imp/" "$idest/" \
+            || { FAIL_NOTE="ingest[$iname]: rsync mirror failed: $isrc -> $idest"; false; }
+        umount_all
+        ifiles="$(find "$idest" -type f 2>/dev/null | wc -l)"
+        ibytes="$(du -sb "$idest" 2>/dev/null | awk '{print $1}')"
+        log "ingest[$iname]: library copy is now $ifiles file(s), ${ibytes:-?} byte(s) at $idest"
+        INGEST_SUMMARY="${INGEST_SUMMARY:+$INGEST_SUMMARY; }$iname($ifiles files -> $idest)"
+    done <<< "$INGEST_SOURCES"
+    : "${INGEST_SUMMARY:=none}"
+    log "ingest: done — ${INGEST_SUMMARY}"
+else
+    log "ingest: no INGEST_SOURCES configured — skipping step 1b (sources are pulled directly)"
+fi
+
+# ── exclusions (step 2) — collected BEFORE the loop so they can be validated ───
+# The one BACKUP_SOURCES table carries both sources (`name=SPEC`) and their
+# filters (`name.exclude=PATTERN …`); BACKUP_EXCLUDE applies to every set. Split
+# them here so a `name.exclude=` line naming a set that does not exist FAILS the
+# run instead of silently doing nothing — a mistyped filter that quietly backs up
+# 200 GB it was meant to skip is exactly the silent mystery this must not be.
+declare -A SET_EXCLUDE=()
+SOURCE_LINES=()
 while IFS= read -r line; do
-    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    line="$(str_trim "$line")"
     [ -z "$line" ] && continue
     case "$line" in \#*) continue ;; esac    # the table can carry commented-out entries
+    xname="$(exclude_line_name "$line")"
+    if [ -n "$xname" ]; then
+        SET_EXCLUDE["$xname"]="$(str_trim "${line#*=}")"
+        continue
+    fi
+    SOURCE_LINES+=("$line")
+done <<< "$BACKUP_SOURCES"
+[ "${#SOURCE_LINES[@]}" -gt 0 ] || die "BACKUP_SOURCES contains no source lines (only comments/exclude lines?)"
+for xname in "${!SET_EXCLUDE[@]}"; do
+    found=0
+    for line in "${SOURCE_LINES[@]}"; do [ "${line%%=*}" = "$xname" ] && found=1; done
+    [ "$found" = 1 ] \
+        || die "BACKUP_SOURCES has '$xname.exclude=…' but no source set named '$xname' — fix the name (a filter for a set that does not exist would silently exclude nothing)"
+done
+log "exclusions: global BACKUP_EXCLUDE='${BACKUP_EXCLUDE:-}'${SET_EXCLUDE[*]:+ + per-set lines for: ${!SET_EXCLUDE[*]}}"
+
+# rsync_pull SRC/ STAGE/ : the ONE pull command for all three source kinds —
+# `rsync -a --delete` plus this set's exclude patterns. When patterns are in play
+# it runs with `--debug=FILTER`, which makes rsync print one line per path its
+# patterns hid ("[sender] hiding file world/x.bak because of pattern *.bak");
+# those lines are kept as <set>.excluded.log next to the archive so an excluded
+# path is auditable, never a silent mystery. Returns rsync's status.
+rsync_pull() {
+    local src="$1" dst="$2" rc=0 hidden
+    if [ "${#EX_ARGS[@]}" -eq 0 ]; then
+        rsync -a --delete "$src" "$dst"
+        return $?
+    fi
+    rsync -a --delete "${EX_ARGS[@]}" --debug=FILTER "$src" "$dst" >"$EX_RAW" 2>&1 || rc=$?
+    grep -E '^\[sender\] hiding ' "$EX_RAW" | sed 's/^\[sender\] //' >"$EX_LOG" || true
+    hidden="$(grep -c . "$EX_LOG" || true)"
+    if [ "${hidden:-0}" -gt 0 ]; then
+        log "[$SET_NAME] EXCLUDED $hidden path(s) by pattern — full list: $(basename "$EX_LOG")"
+        sed -n '1,5p' "$EX_LOG" | while IFS= read -r h; do log "[$SET_NAME]   excluded: $h"; done
+        [ "$hidden" -gt 5 ] && log "[$SET_NAME]   … $(( hidden - 5 )) more in $(basename "$EX_LOG")"
+    else
+        log "[$SET_NAME] exclude patterns matched nothing in this source"
+    fi
+    [ "$rc" -eq 0 ] || { warn "[$SET_NAME] rsync failed (rc=$rc); its output:"; sed -n '1,20p' "$EX_RAW" | while IFS= read -r l; do warn "  $l"; done; }
+    return "$rc"
+}
+
+# ── steps 1c-3 per source set ────────────────────────────────────────────────
+for line in "${SOURCE_LINES[@]}"; do
     name="${line%%=*}"; src="${line#*=}"
     [ -n "$name" ] && [ -n "$src" ] || die "bad BACKUP_SOURCES line: '$line' (want name=//host/share | name=volume:VOL[@CONTAINER] | name=path:/abs/dir)"
+
+    # This set's effective exclude patterns: the global list first, then its own
+    # `name.exclude=` line. `read -a` splits on whitespace WITHOUT pathname
+    # expansion — a pattern like `*.bak` must never glob against the cwd.
+    SET_NAME="$name"; EX_ARGS=(); EX_PATS=""
+    EX_LOG="$RUN_DIR/$name.excluded.log"; EX_RAW="$STAGING/$name.rsync.out"
+    read -r -a ex_pats <<< "${BACKUP_EXCLUDE:-} ${SET_EXCLUDE[$name]:-}" || true
+    for pat in "${ex_pats[@]:-}"; do
+        [ -n "$pat" ] || continue
+        EX_ARGS+=(--exclude "$pat"); EX_PATS="${EX_PATS:+$EX_PATS }$pat"
+    done
+    log "[$name] exclude patterns: ${EX_PATS:-(none)}"
 
     # 1. pull — dispatch on the source kind (SR-013); every kind lands the set in
     # $stage and everything downstream (archive→report) is kind-agnostic.
@@ -192,7 +335,7 @@ while IFS= read -r line; do
             mp="$(mktemp -d)"
             mount_cifs "$src" "$mp" ro
             log "[$name] rsync pull from $src"
-            rsync -a --delete "$mp/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
+            rsync_pull "$mp/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
             umount_all
             ;;
         volume)
@@ -208,7 +351,7 @@ while IFS= read -r line; do
                 quiesce_stop "$qc" || { FAIL_NOTE="quiesce stop failed for $name: $qc"; false; }
             fi
             log "[$name] rsync pull from volume $vol ($vmp)${qc:+ [quiesced: $qc]}"
-            rsync -a --delete "$vmp/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
+            rsync_pull "$vmp/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
             if [ -n "$qc" ]; then
                 quiesce_start "$qc" || { FAIL_NOTE="quiesce RESTART failed for $name — run: docker start $qc"; false; }
             fi
@@ -217,7 +360,7 @@ while IFS= read -r line; do
             dir="${src#path:}"
             [ -d "$dir" ] || { FAIL_NOTE="path source missing for $name: $dir"; false; }
             log "[$name] rsync pull from local path $dir"
-            rsync -a --delete "$dir/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
+            rsync_pull "$dir/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
             ;;
         *)
             die "bad BACKUP_SOURCES spec for '$name': '$src' (want //host/share | volume:VOL[@CONTAINER] | path:/abs/dir)"
@@ -229,10 +372,14 @@ while IFS= read -r line; do
     if [ "$algo" = "zstd" ]; then archive="$RUN_DIR/$name.tar.zst"; else archive="$RUN_DIR/$name.tar"; fi
     log "[$name] compression: $reason"
     if [ "$DRY_RUN" = 1 ]; then log "[$name] dry-run: skip archive"; continue; fi
+    # The patterns are handed to tar as well: the pull above already left them out
+    # of $stage (that is what saves the copy), and this is the belt-and-braces
+    # half — the ARCHIVE step is where the exclusion is contractually promised.
+    # `${arr[@]+"${arr[@]}"}` is the empty-array-safe expansion under `set -u`.
     if [ "$algo" = "zstd" ]; then
-        tar -C "$stage" -cf - . | zstd -q -"$ZL" -T0 -o "$archive" -f || { FAIL_NOTE="archive(zstd) failed for $name"; false; }
+        tar -C "$stage" ${EX_ARGS[@]+"${EX_ARGS[@]}"} -cf - . | zstd -q -"$ZL" -T0 -o "$archive" -f || { FAIL_NOTE="archive(zstd) failed for $name"; false; }
     else
-        tar -C "$stage" -cf "$archive" . || { FAIL_NOTE="archive(tar) failed for $name"; false; }
+        tar -C "$stage" ${EX_ARGS[@]+"${EX_ARGS[@]}"} -cf "$archive" . || { FAIL_NOTE="archive(tar) failed for $name"; false; }
     fi
 
     # 3. hash + verify + manifest ---------------------------------------------
@@ -251,13 +398,16 @@ while IFS= read -r line; do
     else tar -tf "$archive" >/dev/null || { FAIL_NOTE="tar integrity test failed for $name"; false; }; fi
     asha="$(sha256_of "$archive")"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$name" "$src" "$(basename "$archive")" "$algo" "$asha" "$set_files" "$set_bytes" "$reason" >>"$MANIFEST"
+    # The MANIFEST records the EXCLUDES with the set: whoever restores it must be
+    # able to see that the archive is a FILTERED copy of its source, not a
+    # complete one (restore.sh says so out loud).
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "$src" "$(basename "$archive")" "$algo" "$asha" "$set_files" "$set_bytes" "$reason" "${EX_PATS:--}" >>"$MANIFEST"
     log "[$name] archived $(basename "$archive") files=$set_files bytes=$set_bytes sha256=${asha:0:16}…"
     TOTAL_FILES=$(( TOTAL_FILES + set_files )); TOTAL_BYTES=$(( TOTAL_BYTES + set_bytes ))
-    SET_SUMMARY_JSON="${SET_SUMMARY_JSON:+$SET_SUMMARY_JSON,}$(printf '{"set":"%s","algo":"%s","files":%s,"bytes":%s,"incompressible_pct":%s}' "$name" "$algo" "$set_files" "$set_bytes" "$ratio")"
+    SET_SUMMARY_JSON="${SET_SUMMARY_JSON:+$SET_SUMMARY_JSON,}$(printf '{"set":"%s","algo":"%s","files":%s,"bytes":%s,"incompressible_pct":%s,"excludes":"%s"}' "$name" "$algo" "$set_files" "$set_bytes" "$ratio" "$EX_PATS")"
     SET_SUMMARY="${SET_SUMMARY:+$SET_SUMMARY, }$name($set_files/${set_bytes}B/$algo)"
-done <<< "$BACKUP_SOURCES"
+done
 
 [ "$DRY_RUN" = 1 ] && { log "dry-run complete (no archives written)"; trap - ERR; exit 0; }
 
@@ -271,12 +421,19 @@ if (( prune > 0 )); then
     done
 fi
 
-# ── 5. offsite — into the IceDrive-synced folder ──────────────────────────────
-# Two target forms, ONE staging routine (the file selection is a single fact):
-#   OFFSITE_PATH  a LOCAL directory the on-box IceDrive client syncs to the
-#                 cloud — the ratified target state (OI-11). The upload is the
-#                 client's job; this step only has to LAND the files.
-#   OFFSITE_UNC   the legacy cifs push to another host's synced share.
+# ── 5. offsite — LEGACY/OPTIONAL (retired from the target state 2026-07-29) ────
+# The Owner's corrected model: the IceDrive client (SR-015 desktop session) is
+# pointed DIRECTLY at the chosen library paths in its own GUI, so the backup
+# service performs NO offsite staging at all. The target state is therefore
+# OFFSITE_ENABLED=false and this whole step is a logged skip.
+#
+# The code below stays functional for a box still configured the old way — two
+# target forms, ONE staging routine (the file selection is a single fact):
+#   OFFSITE_PATH  a LOCAL directory an on-box sync client uploads (the OI-11
+#                 build; superseded as a DESIGN by the correction above, kept as
+#                 harmless legacy). The upload was the client's job; this step
+#                 only ever had to LAND the files.
+#   OFFSITE_UNC   the older cifs push to another host's synced share.
 # Exactly one may be set; that is validated at run start.
 
 # offsite_stage DEST : copy the selected sets' archives + per-file hash tables
@@ -299,7 +456,8 @@ offsite_stage() {
 }
 
 if [ "${OFFSITE_ENABLED:-false}" != "true" ]; then
-    log "offsite: disabled (OFFSITE_ENABLED!=true)"
+    log "offsite: disabled (OFFSITE_ENABLED!=true) — the target state: the IceDrive client syncs library paths itself, this service stages nothing"
+    OFFSITE_DONE="disabled (client syncs library paths directly)"
 elif [ -n "${OFFSITE_PATH:-}" ]; then
     # Local target. The directory must ALREADY exist — creating it silently
     # would hide a mistyped path or an IceDrive folder that never got set up,

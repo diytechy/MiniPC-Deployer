@@ -34,11 +34,16 @@ FTAB="$RUN_DIR/$SET.files.tsv"
 # Pull the set's row from the manifest.
 row="$(awk -F'\t' -v s="$SET" 'NR>1 && $1==s {print; exit}' "$MANIFEST")"
 [ -n "$row" ] || die "set '$SET' not found in $MANIFEST"
-IFS=$'\t' read -r m_set m_src m_arch m_algo m_sha m_files m_bytes m_reason <<< "$row"
+# The last column (`excludes`) is absent from runs written before exclusions
+# existed; an empty/`-` value simply means "nothing was filtered out".
+IFS=$'\t' read -r m_set m_src m_arch m_algo m_sha m_files m_bytes m_reason m_excl <<< "$row"
 ARCHIVE="$RUN_DIR/$m_arch"
 [ -f "$ARCHIVE" ] || die "archive missing: $ARCHIVE"
 
 log "restore set '$SET' from $m_arch (algo=$m_algo, files=$m_files) -> $TARGET"
+if [ -n "${m_excl:-}" ] && [ "${m_excl:-}" != "-" ]; then
+    log "NOTE: this set was archived WITH exclusions ($m_excl) — it is a FILTERED copy of its source, so a byte-for-byte diff against the live source will show those paths missing. See $SET.excluded.log in the run dir."
+fi
 
 # 1. verify the archive's own integrity (sha256 recorded at backup time).
 have_sha="$(sha256_of "$ARCHIVE")"

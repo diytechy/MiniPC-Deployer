@@ -28,7 +28,9 @@ graph LR
     caddy -->|basic_auth| actual["Actual Budget"]
     caddy -->|basic_auth| tech
     ddns["ddns<br/>(Cloudflare A records)"] -.->|follows home IP| net
-    backup["bash backup service<br/>(systemd timer)"] -.->|cifs + volume: sources| net
+    backup["bash backup service<br/>(systemd timer)"] -.->|"wake (WoL) then cifs pull + volume: sources"| net
+    backup -.->|"offsite: stage into a LOCAL folder"| ice["IceDrive client<br/>(on-box, SR-015 RDP session)"]
+    ice -.->|syncs| cloud([IceDrive cloud])
     fa["finance-auditor<br/>(profile until FA G-Final)"] -.->|triggers bank sync| actual
     fa -.->|de-identified status| tracker
     subgraph observability [LAN-only]
@@ -61,10 +63,16 @@ graph LR
 - **Observability (WI-10.11):** Uptime-Kuma, Dozzle, and optional ntfy run
   LAN-only.
 - **Backup (WI-10.10/SR-013):** the bash backup service (systemd timer, not a
-  container) pulls one `BACKUP_SOURCES` table — LAN cifs shares AND the stack's
-  own docker volumes (`volume:VOL[@container]` quiesce) — through
-  archive/hash/manifest/retention/offsite/report; never-silent-green into the
-  tracker's `/api/feed`.
+  container) **wakes then pulls** — a source box that is allowed to sleep gets a
+  Wake-on-LAN packet and must answer tcp/445 before the run touches it (a wake
+  timeout fails the run loudly) — across one `BACKUP_SOURCES` table of LAN cifs
+  shares AND the stack's own docker volumes (`volume:VOL[@container]` quiesce),
+  through archive/hash/manifest/retention/offsite/report. The **offsite leg is
+  local** (OI-11): the run stages selected sets into an on-box folder that the
+  IceDrive client — in the SR-015 opt-in RDP session — syncs to the cloud;
+  `OFFSITE_UNC` (cifs push to a remote share) survives only as the legacy form.
+  Never-silent-green into the tracker's `/api/feed`, on **every** failure path
+  including `die` (OI-9).
 - **Tier-2 opt-in catalog (SN-009/SR-012):** additional self-hosted services
   behind compose profiles — OFF by default, LAN_IP-bound or Caddy-site-only,
   excluded from the baked ISO payload unless exported with `EXTRA_PROFILES`.

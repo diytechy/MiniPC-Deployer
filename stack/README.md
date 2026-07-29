@@ -147,7 +147,7 @@ Fill in at minimum:
 | `OAUTH2_PROXY_COOKIE_SECRET` | `openssl rand -base64 32 \| tr -- '+/' '-_'` |
 | `OAUTH2_PROXY_ALLOWED_EMAILS` | comma-separated Google accounts permitted into the tracker |
 | `TRACKER_DATA_REMOTE` | git remote of your private **data** repo (single-user); blank for multi-user |
-| `CLOUDFLARE_ZONE_ID` / `CLOUDFLARE_API_TOKEN` | dynamic DNS (`ddns` service) — a **new** scoped token (Zone→DNS→Edit, this zone only); never reuse the old plaintext token found on `\\Mini-serv\setup` |
+| `CLOUDFLARE_ZONE_ID` / `CLOUDFLARE_API_TOKEN` | dynamic DNS (`ddns` service) — a **new** scoped token (Zone→DNS→Edit, this zone only); never reuse the old plaintext token that sat on the legacy Windows box's setup share |
 | `BACKUP_DRIVE_DEVICES` / `BACKUP_DRIVE_STANDBY` | backup-drive spin-down (WI-10.10) — space-separated `/dev/disk/by-id/...` paths (never `sdX`, it renumbers); empty = no-op |
 
 > **This table lists the knobs that need YOUR values filled in.** For the full
@@ -418,12 +418,17 @@ Disable = remove the profile from `COMPOSE_PROFILES`, then
 
 ## Local validation status (honest)
 
-- **`docker compose config` / live bring-up:** **PENDING — no Docker on the
-  build machine** (Windows dev box; `docker`/`docker compose` not installed,
-  verified). The runtime path (compose up, curl the health endpoints, `dig`,
-  tear down) **could not be exercised here** and must be run on a Docker host /
-  the AWOW itself.
-- **What WAS validated locally:** all shell scripts pass `bash -n`; `meta-data`
+- **`docker compose config` / live bring-up:** the old "no Docker on the build
+  machine" constraint was **LIFTED 2026-07-03 (WI-10.13)** — the dev PC runs
+  WSL2 + Ubuntu + docker-ce (Docker Desktop deliberately not installed).
+  `docker compose config` resolves the full stack (core + every tier-2 profile)
+  and the whole stack **runs GREEN in the V1 sim** (`sim/run-sim.sh` +
+  `sim/validate-sim.sh`) against fictional stand-ins — Dex for Google, an
+  internal CA for ACME, Samba fixtures for the LAN shares. What the sim still
+  **cannot** prove is the hardware-and-real-world layer: real Google consent,
+  publicly-trusted ACME certs, Technitium on the host's real `:53`, drive
+  spin-down physics, thermals. Those wait for the V3 VM boot and the box itself.
+- **What is validated statically:** all shell scripts pass `bash -n`; `meta-data`
   and `docker-compose.yml` parse; `user-data` is valid `#cloud-config` YAML;
   every `${VAR}` in compose has a matching key in `.env.example`
   (`scripts/validate_config.py`); every `{$VAR}` in the Caddyfile is passed by

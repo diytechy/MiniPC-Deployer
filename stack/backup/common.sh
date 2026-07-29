@@ -4,6 +4,9 @@
 # mount.cifs/curl — no PowerShell, no .bat (HOMELAB_TOPOLOGY.md "100% bash").
 # The docker CLI is additionally needed IF the sources table uses volume:
 # specs (SR-013) — a given on the AWOW, where docker runs the stack anyway.
+# Wake-on-LAN (a source box that may sleep) also needs nothing new: the magic
+# packet goes out over bash's /dev/udp, with wakeonlan/etherwake used only if
+# the kernel refuses that socket a broadcast destination (see wol_send).
 #
 # Behavioral spec = the FileBackup repo (hash tracking, auto-compression-where-
 # applicable, recovery/reconstruct). This is a reproduction in bash, not a port.
@@ -17,7 +20,33 @@ set -uo pipefail
 LOG_FILE="${LOG_FILE:-}"
 log()  { local m="$*"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$m"; [ -n "$LOG_FILE" ] && printf '%s %s\n' "$(date -u +%FT%TZ)" "$m" >>"$LOG_FILE"; }
 warn() { log "WARN: $*"; }
-die()  { log "ERROR: $*"; exit 1; }
+
+# ── die + the failure-report hook (OI-9: never-silent-green on `die` paths) ────
+# `die` is shared by backup.sh, restore.sh and backup-standby.sh, so it cannot
+# assume a NagLight feed exists. Instead a caller that HAS a feed contract
+# registers the NAME of a reporter function in DIE_REPORTER; die invokes it once,
+# best-effort, immediately before exiting. Before OI-9 a `die` (bad config, a
+# failed cifs mount, a wake timeout) exited 1 with NOTHING posted, so only
+# ERR-trap failures fed the tracker — a silent-ish failure the feed contract
+# forbids.
+#
+# Two guards, because a failing report must NEVER mask the original failure:
+#   - the reporter's own non-zero status is swallowed into a WARNING;
+#   - _DIE_REPORTING blocks re-entry, so a `die` raised *inside* the reporter
+#     cannot loop or overwrite the first verdict.
+# An unset DIE_REPORTER (restore.sh, backup-standby.sh, or backup.sh before its
+# run dir exists) is a clean no-op — exactly the old behaviour.
+DIE_REPORTER=""
+_DIE_REPORTING=0
+die() {
+    log "ERROR: $*"
+    if [ -n "$DIE_REPORTER" ] && [ "$_DIE_REPORTING" = 0 ]; then
+        _DIE_REPORTING=1
+        "$DIE_REPORTER" "$*" \
+            || warn "die: the failure report itself failed — the ERROR above is the real one"
+    fi
+    exit 1
+}
 
 # ── config ───────────────────────────────────────────────────────────────────
 # load_config PATH : source a backup.env (KEY=VALUE). Values are literal — do NOT
@@ -116,6 +145,115 @@ quiesce_restore() {
             || warn "quiesce: RESTART FAILED for $c — start it manually: docker start $c"
     done
     QUIESCED=()
+}
+
+# ── Wake-on-LAN pre-step (step 1: a source box that is ALLOWED TO SLEEP) ──────
+# The Windows game box exposes its one share but may be ASLEEP when the nightly
+# timer fires, so the backup wakes it over the LAN and waits for its SMB port
+# before mounting anything.
+#
+# CONTRACT (never-silent-green): the magic packet is best-effort — the WAIT is
+# the truth. The run proceeds only once the host actually answers tcp/445; on
+# timeout the caller MUST die, because a source that failed to WAKE must never
+# be mistaken for a source with nothing new to copy.
+#
+# Config (backup.env): BACKUP_WAKE_MAC (empty = feature off), BACKUP_WAKE_HOST,
+# BACKUP_WAKE_TIMEOUT (seconds), BACKUP_WAKE_BROADCAST (optional override).
+WOL_UDP_PORT=9              # the conventional discard/WoL port (7 is also seen)
+WOL_RESEND_SECONDS=15       # a sleeping NIC can miss one packet; re-send while waiting
+WAKE_PROBE_PORT=445         # SMB — the port we actually need, so it is what we probe
+WAKE_PROBE_TIMEOUT=3        # per-attempt TCP connect timeout, seconds
+
+# wol_mac_hex MAC : normalise `aa:bb:cc:dd:ee:ff` / `AA-BB-…` / `aabbccddeeff`
+# to 12 lowercase hex chars on stdout; returns 1 (quietly) on anything else.
+# Pure — no I/O — so the parsing can be reasoned about (and tested) on its own.
+wol_mac_hex() {
+    local hex
+    hex="$(printf '%s' "$1" | tr -d ':.-' | tr '[:upper:]' '[:lower:]')"
+    { [ "${#hex}" -eq 12 ] && [ -z "${hex//[0-9a-f]/}" ]; } || return 1
+    printf '%s' "$hex"
+}
+
+# wol_magic_packet_escapes HEX12 : the magic packet as `printf '%b'` escapes —
+# 6 sync bytes of 0xFF followed by the target MAC repeated 16 times (the AMD
+# Magic Packet layout). Pure; split out so the byte layout is readable without
+# reading the socket code. `%b` (not a computed format string) keeps the NUL
+# bytes of MACs containing 00 intact and keeps shellcheck quiet.
+wol_magic_packet_escapes() {
+    local hex="$1" mac_esc="" rep="" i
+    for (( i = 0; i < 12; i += 2 )); do mac_esc="$mac_esc\\x${hex:i:2}"; done
+    for (( i = 0; i < 16; i++ )); do rep="$rep$mac_esc"; done
+    printf '%s' "\\xff\\xff\\xff\\xff\\xff\\xff$rep"
+}
+
+# wol_send MAC : broadcast one magic packet. Best-effort by design — returns 0
+# if some method reported success, 1 if none did, and the CALLER must not treat
+# either as the verdict (the tcp probe decides).
+#
+# Method order — no new dependency first, packaged tools as the documented
+# fallback:
+#   1. bash's own /dev/udp — zero dependencies. GOTCHA: bash cannot set
+#      SO_BROADCAST on that socket, so some kernels refuse a broadcast
+#      destination with EACCES. That is precisely why 2/3 exist.
+#   2. `wakeonlan` (apt: wakeonlan) — the portable choice; sets SO_BROADCAST.
+#   3. `etherwake` (apt: etherwake) — raw layer-2, needs root and uses its own
+#      default interface unless BACKUP_WAKE_IFACE names one.
+wol_send() {
+    local mac="$1" hex pkt bcast="${BACKUP_WAKE_BROADCAST:-255.255.255.255}"
+    hex="$(wol_mac_hex "$mac")" || { warn "wake: BACKUP_WAKE_MAC is not a MAC address: '$mac'"; return 1; }
+    pkt="$(wol_magic_packet_escapes "$hex")"
+    if ( exec 3<>"/dev/udp/$bcast/$WOL_UDP_PORT" && printf '%b' "$pkt" >&3 ) 2>/dev/null; then
+        log "wake: magic packet -> $bcast:$WOL_UDP_PORT (bash /dev/udp, no dependency)"
+        return 0
+    fi
+    if command -v wakeonlan >/dev/null 2>&1 && wakeonlan -i "$bcast" "$mac" >/dev/null 2>&1; then
+        log "wake: magic packet -> $bcast (wakeonlan)"
+        return 0
+    fi
+    if command -v etherwake >/dev/null 2>&1 \
+       && etherwake ${BACKUP_WAKE_IFACE:+-i "$BACKUP_WAKE_IFACE"} "$mac" >/dev/null 2>&1; then
+        log "wake: magic packet -> layer 2 (etherwake${BACKUP_WAKE_IFACE:+ on $BACKUP_WAKE_IFACE})"
+        return 0
+    fi
+    return 1
+}
+
+# tcp_port_open HOST PORT [TIMEOUT_S] : true iff a TCP connect succeeds within
+# TIMEOUT_S. Pure bash /dev/tcp + coreutils `timeout` — no nc/nmap dependency.
+# HOST/PORT are passed as ARGUMENTS to the inner shell, never interpolated into
+# its script text.
+tcp_port_open() {
+    local host="$1" port="$2" t="${3:-$WAKE_PROBE_TIMEOUT}"
+    timeout "$t" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null
+}
+
+# wake_and_wait MAC HOST TIMEOUT_S : wake HOST and BLOCK until it answers
+# tcp/445, re-sending the packet every WOL_RESEND_SECONDS. Returns 0 as soon as
+# the port answers (immediately, if the box was never asleep), 1 on timeout —
+# and 1 MUST be fatal for the caller (see the contract above).
+wake_and_wait() {
+    local mac="$1" host="$2" timeout_s="$3" start next_send
+    if tcp_port_open "$host" "$WAKE_PROBE_PORT"; then
+        log "wake: $host already awake (tcp/$WAKE_PROBE_PORT answering) — no packet needed"
+        return 0
+    fi
+    log "wake: $host is not answering tcp/$WAKE_PROBE_PORT — sending Wake-on-LAN, waiting up to ${timeout_s}s"
+    wol_send "$mac" \
+        || warn "wake: no working magic-packet method (bash /dev/udp refused; wakeonlan/etherwake not installed) — still waiting in case the box is already coming up"
+    start=$SECONDS
+    next_send=$(( SECONDS + WOL_RESEND_SECONDS ))
+    while [ $(( SECONDS - start )) -lt "$timeout_s" ]; do
+        if tcp_port_open "$host" "$WAKE_PROBE_PORT"; then
+            log "wake: $host answered tcp/$WAKE_PROBE_PORT after $(( SECONDS - start ))s"
+            return 0
+        fi
+        if [ "$SECONDS" -ge "$next_send" ]; then
+            wol_send "$mac" || true
+            next_send=$(( SECONDS + WOL_RESEND_SECONDS ))
+        fi
+        sleep 2
+    done
+    return 1
 }
 
 # ── cifs mount helpers (step 1 pulls / step 5 push) ──────────────────────────

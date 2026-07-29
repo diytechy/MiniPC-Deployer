@@ -58,18 +58,37 @@ last) — it is the record, not required reading for every pass.
       GREEN). **Remaining for Peter:** uncomment the volume lines in the real
       `/etc/awow-backup/backup.env` (+ add `actual tracker` to `OFFSITE_SETS`)
       when configuring the box — they ship commented in `backup.env.example`.
-    - OI-11 — **On-box offsite leg — RATIFIED by Peter 2026-07-25; BUILD
-      OUTSTANDING.** The offsite leg moves fully onto this box: IceDrive runs
-      here (SN-012/SR-015 opt-in RDP layer) and syncs selected folders straight
-      to the cloud. **Mini-serv leaves the offsite path entirely.** What is
-      still needed: `backup.sh` step 5 is cifs-only (`OFFSITE_UNC`) and needs a
-      **local-path offsite target** plus its sim legs — the small change that
-      was deliberately not built unasked. Two things to carry into the design:
-      the IceDrive client is a GUI app, so **sync is down after every reboot
-      until an RDP session is opened** (SR-015 documents this and it does not
-      change), and the *which folders go offsite* answer now comes from
-      `Personal\deploy\storage-map.md` §4e rather than a hand-kept
-      `OFFSITE_SETS` list.
+    - OI-11 — **On-box offsite leg — RATIFIED by Peter 2026-07-25; BUILD HALF
+      DONE 2026-07-29.** The offsite leg moves fully onto this box: IceDrive
+      runs here (SN-012/SR-015 opt-in RDP layer) and syncs selected folders
+      straight to the cloud. **Mini-serv leaves the offsite path entirely.**
+      **Built:** `backup.sh` step 5 now takes `OFFSITE_PATH=/abs/dir` (local
+      target, primary) with `OFFSITE_UNC` kept as the legacy cifs form; exactly
+      one may be set, checked at run start; both forms share one staging
+      routine. Exercised for real end-to-end (see the 2026-07-29 audit entry).
+      **Still outstanding:** (a) **sim legs** — the committed sim still drives
+      the LEGACY `OFFSITE_UNC` form (it is the regression net for it); a
+      local-target leg + a wake leg belong in `sim/mini-serv-sim/`;
+      (b) **Peter:** stand the IceDrive client up on-box per
+      `stack/remote-ui/README.md`, then set `OFFSITE_PATH` in the real
+      `/etc/awow-backup/backup.env` to the folder it syncs (the run FAILS if
+      that directory does not exist — deliberate) and comment `OFFSITE_UNC`
+      out. Unchanged: the IceDrive client is a GUI app, so **sync is down after
+      every reboot until an RDP session is opened** (SR-015), and the *which
+      folders go offsite* answer comes from `Personal\deploy\storage-map.md`
+      §4e rather than a hand-kept `OFFSITE_SETS` list.
+    - OI-13 — **Wake-on-LAN needs the real values + the Windows-side
+      settings (2026-07-29, PETER):** the backup now wakes the sleeping game box
+      before pulling and fails the run loudly on a wake timeout, but it is OFF
+      until `BACKUP_WAKE_MAC` is filled in (with `BACKUP_WAKE_HOST` /
+      `BACKUP_WAKE_TIMEOUT`) in the real `/etc/awow-backup/backup.env` — the
+      repo ships placeholders only (SN-007). On the **Windows** side: enable
+      "Wake on Magic Packet" + "Allow this device to wake the computer" on the
+      WIRED adapter and turn **Fast Startup OFF** (hybrid shutdown leaves the
+      NIC unable to wake). Worth verifying at the same time whether the AWOW's
+      `/dev/udp` broadcast is accepted or whether `apt-get install wakeonlan` is
+      needed for the fallback — bash cannot set `SO_BROADCAST`, and the WSL
+      kernel used for this session's testing REFUSED it.
     - OI-12 — **Second image target proposed (2026-07-25): the office wall
       panel.** Peter is adding a wall-mounted ambient panel (Acer Aspire R 14,
       chassis N15P6) showing NagLight + a Navidrome-fed music player + a family
@@ -98,14 +117,20 @@ last) — it is the record, not required reading for every pass.
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)
-    - OI-9 — **never-silent-green gap in `die` paths (found 2026-07-10 during
-      the SR-013 red run):** a `die` (e.g. a cifs mount failure) exits 1
-      directly WITHOUT posting `ok=false` to NagLight — only ERR-trap failures
-      feed. The systemd unit still fails visibly, but the feed contract says
-      ANY failure posts. Small fix (route `die` through the report once config
-      is loaded); needs its own sim assertion.
+    - OI-9 — **RESOLVED 2026-07-29.** (Found 2026-07-10 during the SR-013 red
+      run: a `die` — e.g. a cifs mount failure — exited 1 WITHOUT posting
+      `ok=false`, so only ERR-trap failures fed the tracker.) `die` now calls a
+      registered reporter (`DIE_REPORTER`) before exiting; `backup.sh` registers
+      `report_failure`, the single idempotent failure path shared with the ERR
+      trap. A failing report is swallowed into a WARNING so it can never mask
+      the original error, and an unset `DIE_REPORTER` (restore.sh,
+      backup-standby.sh) is a clean no-op. Verified for real on four die paths
+      — see the 2026-07-29 audit entry. Still owed: an assertion inside the
+      committed sim legs (they exercise ERR-trap failures, not `die`).
 - **Assumptions (unattended):** see the Assumptions log below.
-- **Next action:** Peter reviews + pushes; creates the Google OAuth client
+- **Next action:** Peter reviews + pushes; fills in the wake values + the
+  Windows-side WoL settings (OI-13) and points `OFFSITE_PATH` at the on-box
+  IceDrive folder (OI-11b); creates the Google OAuth client
   (OI-1); runs the V3 boot (OI-5); ratifies the tier-2 decisions (OI-7) —
   then the "V3.5 dress rehearsal" (real secrets in the VM: External vSwitch,
   TLS decision, backup VHDX) discussed 2026-07-10 turns the sim-GREENs into
@@ -157,7 +182,8 @@ last) — it is the record, not required reading for every pass.
 |---|---|
 | `docker compose config` (core + all tier-2 profiles) | PASS (WSL docker-ce; core = the original 8 services with no profiles) |
 | Live bring-up + curl health + `dig` + OAuth round-trip + tear-down | **GREEN in the V1 sim** (vs Dex/internal-CA/fixtures — `validate-sim.sh` 6 checks); **real-Google/real-TLS/host-:53 PENDING V3 boot + hardware** |
-| Backup pipeline (cifs + offsite + feed + restore drill) | GREEN (`run-backup-sim.sh`); drive-power + volume-source call contracts GREEN (mock-shim legs) — drive spin-down physics + real-docker volume copy are V3/burn-in |
+| Backup pipeline (cifs + offsite + feed + restore drill) | GREEN (`run-backup-sim.sh`, re-run 2026-07-29 after the wake/offsite/OI-9 change); drive-power + volume-source call contracts GREEN (mock-shim legs) — drive spin-down physics + real-docker volume copy are V3/burn-in |
+| Wake-on-LAN pre-step + `OFFSITE_PATH` local target + OI-9 `die` reporting | **Exercised for real on WSL2 (2026-07-29)** — magic-packet bytes, probe, timeout-dies-loudly, local offsite staging, four `die` paths posting `ok=false` — but from a THROWAWAY harness, **not a committed sim leg** (OI-11a). A real magic packet has never woken a real box (V3/hardware) |
 | Q10.9 B+ image payload: `export-images.sh` save + `docker load` all 9 | PASS (WSL; loads idempotent) — first-boot load-at-VM awaits V3; **oauth2-proxy v7.15.2 pin bump needs a re-export + sim re-run (OI-7c)** |
 | Tier-2 pins exist on their registries (`docker manifest inspect`) | PASS — but tier-2 services have never been STARTED anywhere (enable-time validation, stack/README §9) |
 | Shell scripts `bash -n` | PASS |
@@ -218,6 +244,19 @@ Scaffolding created. Starting G1.
   priority C, Verification=Inspection, no sim leg (a host-level GUI can't be
   exercised in the compose sim; the V3.5 rehearsal VM is where it could be
   tried for real). Revert any of these at the next gate if wrong.
+- A7 — Wake/offsite shape (2026-07-29; the decisions themselves were ratified,
+  these mechanics were not): the wake probe targets **tcp/445** because SMB is
+  the port the pull actually needs — "awake" is defined as "can serve the
+  share", not "answers ping"; `BACKUP_WAKE_TIMEOUT` defaults to **120 s** and
+  the packet is re-sent every 15 s while waiting (a sleeping NIC can miss one);
+  the timeout is a **budget, not a deadline** — a run can overshoot it by up to
+  one probe+sleep cycle (~5 s); two OPTIONAL knobs beyond the three asked for
+  (`BACKUP_WAKE_BROADCAST`, `BACKUP_WAKE_IFACE`) exist only because the
+  no-dependency `/dev/udp` send cannot set `SO_BROADCAST` and the fallbacks
+  need somewhere to read a subnet/interface from; `OFFSITE_PATH` must **already
+  exist** (the run fails rather than creating it — a typo'd path would
+  otherwise report green with the files where nothing syncs). Revert any of
+  these at the next gate if wrong.
 
 ### DRIVER — G1 — Round 1 — 2026-07-03 (migration + spine)
 Migrated the deploy stack, wired the tracker to `naglight:local`, authored the
@@ -992,3 +1031,100 @@ registry-integrity `SN=12 SR=15 orphans=21 integrity=0` — the +1 orphan line
 doc-navigability 48 links 0 broken); `bash -n` on the new script OK. NOT run:
 the script itself (needs the real box / rehearsal VM — host-level GUI is
 outside the compose sim; recorded in A6).
+
+### DRIVER — G1 — Round 1 — 2026-07-29 (WoL wake pre-step, local-path offsite (OI-11 build), OI-9 closed + staleness sweep)
+
+Absorbed three ratified decisions this repo had not caught up with, plus the
+driver-side OI-9 fix. No new decisions were taken; two things that would need
+one are named at the bottom.
+
+**What was built**
+
+- **Wake-on-LAN pre-step (step 1).** The Windows game box now exposes ONE share
+  and is allowed to SLEEP, so `backup.sh` wakes it and waits for **tcp/445**
+  before the first cifs mount. `BACKUP_WAKE_MAC` (empty = feature off),
+  `BACKUP_WAKE_HOST`, `BACKUP_WAKE_TIMEOUT` (+ optional `BACKUP_WAKE_BROADCAST`
+  / `BACKUP_WAKE_IFACE`, A7). The packet is best-effort; the **wait is the
+  truth**, and a timeout is a LOUD failure — never-silent-green means a source
+  that failed to wake must never look like a source with nothing new. No new
+  dependency: the magic packet goes out over bash's `/dev/udp`, with
+  `wakeonlan`/`etherwake` as the documented fallback.
+- **OI-11 build half — `OFFSITE_PATH`.** Step 5 takes a LOCAL directory (the
+  folder the on-box IceDrive client syncs) as the primary offsite target;
+  `OFFSITE_UNC` survives as the legacy cifs push. Exactly one may be set —
+  both is a config error caught at run start, not a precedence puzzle — and one
+  staging routine serves both, so "which files go offsite" stays one fact.
+- **OI-9 closed.** `die` now invokes a registered `DIE_REPORTER` before exiting.
+  `backup.sh` registers `report_failure`: the single, idempotent failure path
+  shared with the ERR trap, so whichever fires first owns the verdict. A failing
+  report degrades to a WARNING (it must never mask the original error) and an
+  unset reporter is a clean no-op, so `restore.sh` / `backup-standby.sh` are
+  untouched.
+- **Docs currency:** backup README (wake contract, offsite target choice, step
+  table); `backup.env.example` (single-share example, wake section incl. the
+  Windows-side settings, OFFSITE_PATH-primary offsite section);
+  REMOTE_MANAGEMENT (one share, sleeps, no IceDrive role); remote-ui README
+  ("nothing forces a switch" → the switch IS ratified); architecture (backup
+  bullet + topology diagram: wake-then-pull, local offsite folder → on-box
+  IceDrive → cloud); stack/README "Local validation status" and SN-008/SR-011
+  (the "no Docker on the build machine" premise died 2026-07-03, WI-10.13);
+  the two committed `\<box>\setup` references reworded so the token-rotation
+  warning survives without the literal UNC path.
+
+**RAN FOR REAL (WSL2 Ubuntu + docker-ce, Windows dev PC)**
+
+- `python scripts/check.py` — **G1 PASS** (config-validate 77 vars;
+  registry-integrity `SN=12 SR=15 orphans=21 integrity=0`; doc-navigability
+  48 links 0 broken). `bash -n` clean on all four backup scripts.
+- **`sim/mini-serv-sim/run-backup-sim.sh` — PASS, all checks green**, run
+  against the changed service (the runner bind-mounts `stack/backup` live):
+  full six-step cycle over the Samba fixtures, offsite push landed 20 files,
+  NagLight feed round-trip visible in `/api/today`, restore drill byte-equal
+  including the post-loss reconstruct. This is the regression net for the
+  **legacy** `OFFSITE_UNC` leg — it still works.
+- **`run-drivepower-sim.sh` — PASS (a–d)** and **`run-volume-sim.sh` — PASS
+  (a–d)**, i.e. the forced-mid-run-failure scenarios still post `ok=false`,
+  still restore drive standby, and still restart a quiesced container after the
+  `report_failure` refactor.
+- **A throwaway Linux harness** (scratch, not committed) drove the new paths
+  with `path:` sources and a stub feed endpoint: happy run with `OFFSITE_PATH`
+  → files staged under `<OFFSITE_PATH>/awow-backup/run_<ts>` + `ok=true` +
+  restore byte-identical; `OFFSITE_ENABLED=false` still a clean skip; legacy
+  `OFFSITE_UNC` branch still selected and failing loudly when the share is
+  unreachable; `--dry-run` unchanged. **Four `die` paths each POSTED
+  `ok=false`** before exit 1 (both offsite forms set; enabled-with-no-target;
+  wake timeout; unreachable cifs share) — the OI-9 contract, observed rather
+  than asserted. Wake helpers checked byte-level: magic packet 102 bytes,
+  `ff*6` + MAC ×16, NULs intact for MACs containing `00`; MAC parser accepts
+  `:`/`-`/bare and rejects short/non-hex; probe true/false/timeout correct;
+  already-awake fast path skips the packet; timeout path dies loudly.
+
+**NOT run (honest gap)**
+
+- **No real box was woken.** Every wake test used a loopback listener or a
+  blackhole address. Whether a magic packet actually resumes the game box —
+  and whether its adapter/Fast-Startup settings allow it — is V3/hardware
+  (OI-13).
+- **The `/dev/udp` broadcast send was REFUSED by the WSL kernel** (bash cannot
+  set `SO_BROADCAST`), so only the fallback *decision path* was observed, never
+  a successful send. `wakeonlan`/`etherwake` are not installed here either.
+  Which method the AWOW ends up using is unknown until the box is tried.
+- **No sim leg was added** for either new path. `OFFSITE_PATH` and the wake
+  step were exercised from a throwaway harness that is not in the repo; the
+  committed sim still drives `OFFSITE_UNC`. Recorded as OI-11(a).
+- **shellcheck is not installed** on this machine (Windows) or in the WSL
+  Ubuntu — not run, not claimed. `bash -n` is all the static shell checking
+  that happened.
+- The V1 stack sim was already up from a previous session and was **reused**,
+  not rebuilt from scratch; `sim/run-sim.sh` itself was not re-run.
+
+**For Peter / next gate**
+
+- **OI-13** (new): the wake feature is inert until the real MAC lands in
+  `/etc/awow-backup/backup.env`, and it needs two Windows-side settings.
+- **OI-11(b)**: set `OFFSITE_PATH` once IceDrive is running on-box; the run
+  fails if that directory is missing, deliberately.
+- **A7** records the mechanics decided unattended (probe port, default timeout,
+  re-send interval, must-already-exist rule, the two optional knobs).
+- Left alone on purpose: OI-12 (wall panel) — nothing built, no wall site or
+  image lane created.

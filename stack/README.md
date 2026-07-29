@@ -99,7 +99,7 @@ consuming the same `naglight:local` ref regardless of which path supplied it.
 
 ### Image delivery to the AWOW — Q10.9 B+ (ALL-IMAGES, baked into the ISO)
 
-The AWOW does **not** pull any image from a registry at first boot. Per Peter's
+The AWOW does **not** pull any image from a registry at first boot. Per the Owner's
 locked **Q10.9 B+** decision, EVERY stack image — the locally-built
 `naglight:local` **and** every public image (technitium, caddy, oauth2-proxy,
 actual, ddns, uptime-kuma, dozzle, ntfy) — is `docker save`d into the ISO deploy
@@ -143,7 +143,7 @@ Fill in at minimum:
 | `ACME_EMAIL` | email for Let's Encrypt |
 | `ACTUAL_BASICAUTH_HASH` / `DNS_BASICAUTH_HASH` | `docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpass'` |
 | `TECHNITIUM_ADMIN_PASSWORD` | strong password (set on Technitium's first start) |
-| `OAUTH2_PROXY_CLIENT_ID` / `_SECRET` | from your Google OAuth client (**Peter manual step**, below) |
+| `OAUTH2_PROXY_CLIENT_ID` / `_SECRET` | from your Google OAuth client (**Owner manual step**, below) |
 | `OAUTH2_PROXY_COOKIE_SECRET` | `openssl rand -base64 32 \| tr -- '+/' '-_'` |
 | `OAUTH2_PROXY_ALLOWED_EMAILS` | comma-separated Google accounts permitted into the tracker |
 | `TRACKER_DATA_REMOTE` | git remote of your private **data** repo (single-user); blank for multi-user |
@@ -161,19 +161,19 @@ Fill in at minimum:
 **Filling these in today is a manual step.** The automated secret-handoff
 design in the sibling `Personal` repo's `SECRET_HANDOFF.md` was **ratified
 2026-07-25** but is **not built yet**, so hand-fill `.env` until it exists.
-Once built it extends Peter's DPAPI credential pattern to materialize this
+Once built it extends the Owner's DPAPI credential pattern to materialize this
 file; path-shaped values (`MEDIA_ROOT`, the backup source/target table) come
 from `Personal\deploy\storage-map.md`, which is the pathing SSOT.
 
-### PETER MANUAL STEP — Google OAuth client (required for the tracker)
+### OWNER MANUAL STEP — Google OAuth client (required for the tracker)
 
 The tracker subdomain is gated by Google sign-in. Before first bring-up, create
-the OAuth client (needs Peter's Google account — an agent cannot):
+the OAuth client (needs the Owner's Google account — an agent cannot):
 
 1. console.cloud.google.com → **APIs & Services → Credentials**.
 2. Configure the **OAuth consent screen** (External). While unverified, add each
    allowed Google account as a **Test user** (or publish the app). Scopes:
-   `openid`, `email`, `profile` (the slacker-tracker pattern Peter trusts uses
+   `openid`, `email`, `profile` (the slacker-tracker pattern the Owner trusts uses
    `email profile`).
 3. **Create Credentials → OAuth client ID → Web application**.
 4. Register **Authorized redirect URI** exactly:
@@ -182,7 +182,7 @@ the OAuth client (needs Peter's Google account — an agent cannot):
    needed — this is a server-side flow.
 5. Paste the Client ID + secret into `.env`.
 
-### PETER MANUAL STEP — bank sync in Actual (SimpleFIN, one-time, in-app)
+### OWNER MANUAL STEP — bank sync in Actual (SimpleFIN, one-time, in-app)
 
 Actual **owns the SimpleFIN relationship** (Finance-Auditor, when it lands,
 only *triggers* Actual's sync — it never talks to banks). After first

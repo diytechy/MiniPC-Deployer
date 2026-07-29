@@ -1,7 +1,7 @@
 # AWOW bash backup service (WI-10.10)
 
 The homelab's main backup, running on the AWOW box as **pure bash + systemd** —
-zero `.bat`/`.ps1` anywhere in the pipeline (Peter's rule, HOMELAB_TOPOLOGY.md).
+zero `.bat`/`.ps1` anywhere in the pipeline (the Owner's rule, HOMELAB_TOPOLOGY.md).
 The rewritten **FileBackup** repo is the behavioral *spec* this reproduces (hash
 tracking, auto-compression-where-applicable, recovery/reconstruct), not code to
 port. It was built and validated end-to-end against the `sim/mini-serv-sim`

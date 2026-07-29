@@ -80,7 +80,7 @@ services:
   # multi-user mode the engine's `mkdir /data/<sub>` fails with EACCES and every
   # request 500s. The correct fix belongs in NagLight's Dockerfile
   # (`mkdir -p /data && chown tracker:tracker /data` before VOLUME) — flagged for
-  # Peter. This one-shot reproduces that end-state so the sim can run the tracker
+  # the Owner. This one-shot reproduces that end-state so the sim can run the tracker
   # AT uid 1000 (faithful to prod), rather than papering over it with user:root.
   init-perms:
     image: busybox:stable

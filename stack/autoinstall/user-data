@@ -100,7 +100,7 @@ autoinstall:
     - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
     - curtin in-target --target=/target -- systemctl enable unattended-upgrades
 
-    # ---- 2b. Low-power lightening (Peter, 2026-07-04) --------------------------
+    # ---- 2b. Low-power lightening (Owner, 2026-07-04) --------------------------
     # Nothing in the stack uses snaps; snapd costs RAM + background churn on a
     # low-power box. Purge it. (powertop tuning is applied per-boot by
     # powertune.service, installed in step 5 — auto-tune does not persist.)

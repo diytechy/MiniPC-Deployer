@@ -1,6 +1,6 @@
 #!/bin/bash
 # Low-power tuning for the AWOW box — runs once per boot via powertune.service.
-# (Peter direction 2026-07-04: this is a low-power machine; squeeze the idle
+# (Owner direction 2026-07-04: this is a low-power machine; squeeze the idle
 # watts the OS can control.)
 #
 # `powertop --auto-tune` flips every tunable to its powersave setting (deep

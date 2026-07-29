@@ -18,7 +18,7 @@ Project facts live in `docs/`; this file points at them.
   AK41 always-on homelab box — compose stack (DNS/proxy/tracker/budget/backup +
   an off-by-default tier-2 catalog), Ubuntu autoinstall image, provisioning.
   **Config only**; app code lives in sibling repos.
-- **Primary users & their expertise level:** Peter (expert homelab operator);
+- **Primary users & their expertise level:** the Owner (expert homelab operator);
   public-repo visitors who run the sim (Docker basics).
 - **Stack & layout:** bash + YAML/Caddyfile config. `stack/` = the deploy unit;
   `sim/` = V1 full-stack sim (all fixtures fictional); `vmtest/` = V3 Hyper-V

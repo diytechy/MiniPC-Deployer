@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OPT-IN remote light UI for GUI-only vendor apps (first case: IceDrive
 # Mount & Sync). NOT part of the core zero-click path: nothing in autoinstall
-# or first-boot references this script — Peter runs it over SSH, once, on
+# or first-boot references this script — the Owner runs it over SSH, once, on
 # purpose (SN-001 scopes zero-click to the core; SN-012 is this deviation,
 # minimized and documented).
 #

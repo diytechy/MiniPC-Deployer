@@ -9,7 +9,7 @@
 #   - tracker.<domain>  -> oauth2-proxy (Google sign-in). NO basic_auth on this
 #     host; oauth2-proxy is the gate and forwards verified identity headers
 #     (X-Forwarded-Email / X-Forwarded-User) to the tracker container.
-#   - actual.<domain>, dns.<domain>, map.<domain> -> KEEP basic_auth (Peter's
+#   - actual.<domain>, dns.<domain>, map.<domain> -> KEEP basic_auth (the Owner's
 #     single-user services; oauth2-proxy is only for the multi-user tracker).
 #
 # Env vars (set in docker-compose.yml from .env):

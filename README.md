@@ -1,6 +1,6 @@
 # MiniPC-Deployer
 
-The deploy repository for Peter's headless homelab box (the **AWOW AK41
+The deploy repository for the Owner's headless homelab box (the **AWOW AK41
 always-on core**): a zero-touch, always-on Docker stack — split-horizon DNS
 (Technitium), reverse proxy + TLS (Caddy), the NagLight life-tracker behind
 Google sign-in (oauth2-proxy), Actual Budget, LAN-only observability, and the
@@ -60,7 +60,7 @@ Three progressively-more-real gates precede flashing the real AWOW:
 |---|---|---|
 | V1 — [`sim/`](sim/) | full stack on WSL2/Docker vs. a mock OIDC provider (Dex stands in for Google); split-horizon DNS, multi-user isolation, and the bash backup service + restore drill all exercised for real — plus mock-shim call-contract legs for drive power (`run-drivepower-sim.sh`) and docker-volume sources (`run-volume-sim.sh`, SR-013) | **GREEN** — all checks pass |
 | V2 — launcher (Personal repo, `MINI_PC_Setup/`) | the Mini-serv rebuild launcher validated in Windows Sandbox (real task-import/reg/share rungs) | **GREEN** |
-| V3 — [`vmtest/`](vmtest/) | the REAL autoinstall booted in a local Hyper-V VM — every container baked into the ISO payload (Q10.9 B+), zero registry pulls at first boot | scripted + smoke-tested; **the boot itself is Peter's step** (needs elevation + the Hyper-V feature) |
+| V3 — [`vmtest/`](vmtest/) | the REAL autoinstall booted in a local Hyper-V VM — every container baked into the ISO payload (Q10.9 B+), zero registry pulls at first boot | scripted + smoke-tested; **the boot itself is the Owner's step** (needs elevation + the Hyper-V feature) |
 
 Dev-box container runtime (WSL2 + docker-ce) is installed and verified — see
 [docs/status.md](docs/status.md) for the full ledger, including exactly which
@@ -83,7 +83,7 @@ deploy image:
    the box's own state — the finances — joins the backup (SR-013).
 2. Filling `.env` today is still a **manual** step. The automated
    secret-handoff design in `Personal\SECRET_HANDOFF.md` (a sibling repo;
-   extends Peter's existing DPAPI credential pattern) was **ratified
+   extends the Owner's existing DPAPI credential pattern) was **ratified
    2026-07-25**, but the tooling is not written yet — so hand-fill for now.
    Once built it materializes `.env` from Personal's credential store, and
    pathing values come from `Personal\deploy\storage-map.md`.

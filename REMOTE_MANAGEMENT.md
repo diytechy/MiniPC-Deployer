@@ -1,6 +1,6 @@
 # Remote management of the headless AWOW box (WI-10.12)
 
-The AWOW AK41 is **headless** and Peter never wants to physically visit it
+The AWOW AK41 is **headless** and the Owner never wants to physically visit it
 (Q10.7 + the 2026-07-03 requirement: "trivial remote debugging/resolution is a
 KEY PIECE, not a nicety"). This memo has two parts:
 
@@ -9,7 +9,7 @@ KEY PIECE, not a nicety"). This memo has two parts:
    needed; it ships in the autoinstall.
 2. **A decision memo** — the **reimage-over-LAN ladder** for the worst case (a
    box too broken to fix over SSH). Every option is presented with a checkbox.
-   **Nothing destructive / reimage-related is implemented until Peter checks a
+   **Nothing destructive / reimage-related is implemented until the Owner checks a
    box** — that is the high-risk line this repo will not cross unattended.
 
 ---
@@ -33,7 +33,7 @@ Provisioned by `stack/autoinstall/user-data`:
   browser, no SSH needed. **Uptime-Kuma** on `http://<LAN_IP>:3001` watches the
   services and can alert.
 
-### The remote workflow (from Peter's workstation, over the LAN)
+### The remote workflow (from the Owner's workstation, over the LAN)
 
 ```sh
 # 1. Get on the box
@@ -128,10 +128,10 @@ relying on on-box IceDrive.
 
 ---
 
-## Part 2 — DECISION MEMO: reimage-over-LAN ladder (Peter checks one)
+## Part 2 — DECISION MEMO: reimage-over-LAN ladder (the Owner checks one)
 
 **The scenario:** the box is so broken that SSH/Cockpit can't fix it (bad kernel
-update, corrupted rootfs, botched change) — but Peter still doesn't want to drive
+update, corrupted rootfs, botched change) — but the Owner still doesn't want to drive
 to it. How do we re-lay-down the known-good autoinstall image **without physical
 presence**? Reimaging **wipes the box**, so this is the high-risk line.
 
@@ -237,7 +237,7 @@ the machine. Two consequences worth designing around:
 
 ---
 
-### Peter's decision
+### The Owner's decision
 
 - Primary reimage path: [ ] A  [ ] **B**  [ ] C  [ ] D  [ ] none yet
 - Fallback: [ ] **D**  [ ] other: ______

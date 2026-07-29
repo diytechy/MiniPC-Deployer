@@ -5,7 +5,7 @@
 # so a freshly-imaged AWOW comes up with every container "from infancy": zero
 # registry/internet dependency for container images at first boot, versions
 # pinned to exactly what the AWOW-sim validated (Q10.9 B+ ALL-IMAGES, LOCKED IN
-# by Peter 2026-07-04, see HOMELAB_RESTRUCTURE_PLAN.md).
+# by the Owner 2026-07-04, see HOMELAB_RESTRUCTURE_PLAN.md).
 #
 # WHAT IT DOES
 #   1. Resolves the full image set from stack/docker-compose.yml + the PINNED

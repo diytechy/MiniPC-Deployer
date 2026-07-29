@@ -7,7 +7,7 @@
 
 .DESCRIPTION
     DELIVERED, NOT RUN. This script requires an elevated PowerShell session and
-    the Hyper-V Windows feature — both machine-level changes that are Peter's
+    the Hyper-V Windows feature — both machine-level changes that are the Owner's
     call, not an agent's. Nobody has executed this script; see docs/status.md
     (WI-10.18) and vmtest/README.md for the exact honest status and the
     step-by-step runbook.
@@ -64,7 +64,7 @@
     to test split-horizon DNS from an actual LAN client. That switch must
     already exist; this script does not create External switches (that's a
     host-networking change with more blast radius than a VM-local NAT switch,
-    left to Peter's judgement).
+    left to the Owner's judgement).
 
 .PARAMETER SecureBootTemplate
     Gen2 VMs need Secure Boot set to a Linux-trusted template to boot the

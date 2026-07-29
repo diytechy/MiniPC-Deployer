@@ -3,7 +3,7 @@
     WI-10.18 V3 gate — companion teardown for New-AwowVm.ps1.
 
 .DESCRIPTION
-    DELIVERED, NOT RUN (same as New-AwowVm.ps1 — elevation + Hyper-V, Peter's
+    DELIVERED, NOT RUN (same as New-AwowVm.ps1 — elevation + Hyper-V, the Owner's
     call). Stops and removes the named Hyper-V VM. Idempotent: if the VM
     doesn't exist, reports so and exits 0 rather than erroring. Supports
     -WhatIf / -Confirm.

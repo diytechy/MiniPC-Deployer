@@ -107,7 +107,7 @@ services:
   # headers (X-Forwarded-Email / X-Forwarded-User) the tracker's trusted-header
   # multi-user mode consumes (D3, NagLight WI-10.5).
   #
-  # PETER MANUAL STEP (see README + .env.example): create a Google Cloud OAuth
+  # OWNER MANUAL STEP (see README + .env.example): create a Google Cloud OAuth
   # 2.0 client and register the redirect URI before this can start.
   oauth2-proxy:
     image: quay.io/oauth2-proxy/oauth2-proxy:${OAUTH2_PROXY_IMAGE_TAG}
@@ -276,7 +276,7 @@ services:
     restart: unless-stopped
 
   # ── ddns — keep the public A records pointed at the home connection ──────────
-  # Gap Peter caught 2026-07-04: DDNS previously ran on Mini-serv as the legacy
+  # Gap the Owner caught 2026-07-04: DDNS previously ran on Mini-serv as the legacy
   # DDNS-Cloudflare-PowerShell scripts; per WI-9 Q4 the AWOW owns it now, and the
   # stack had no updater at all. Without this, a home-IP change strands the whole
   # external path (Caddy/ACME included).

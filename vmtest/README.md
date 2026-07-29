@@ -3,7 +3,7 @@
 The last gate before flashing the real AWOW: boot the REAL `stack/autoinstall/`
 in a disposable local Hyper-V VM and reach `docker compose up -d` with the core
 healthchecks green. This directory holds the **scripts + docs**; the actual
-boot run is **Peter's** (needs an elevated PowerShell session and the Hyper-V
+boot run is **the Owner's** (needs an elevated PowerShell session and the Hyper-V
 Windows feature — machine-level changes an agent doesn't make unilaterally).
 
 **Honest status:** the scripts below were written and smoke-tested in WSL —
@@ -19,11 +19,11 @@ into `/deploy-payload/images/`) was separately verified via the exact `xorriso
 -map` codepath. **Nobody has booted a VM from either ISO** — `New-AwowVm.ps1` /
 `Remove-AwowVm.ps1` need elevation + the Hyper-V feature and were deliberately
 never run. The actual first-boot `docker load` run is part of the V3 boot
-(Peter's step). See docs/status.md for the full ledger.
+(the Owner's step). See docs/status.md for the full ledger.
 
 ## 0. Q10.9 B+ — the image payload (bake EVERY container "from infancy")
 
-Per Peter's locked Q10.9 B+ decision, a freshly-imaged AWOW comes up with EVERY
+Per the Owner's locked Q10.9 B+ decision, a freshly-imaged AWOW comes up with EVERY
 stack container image already present — **zero registry/internet dependency for
 container images at first boot**, versions pinned to exactly what the AWOW-sim
 validated. The flow:
@@ -46,7 +46,7 @@ firstboot.sh step 3              # docker load each tar (idempotent) BEFORE comp
 
 **Size:** the current pinned set is **9 images ≈ 470 MB of tars** (docker save
 already writes compressed layer blobs, so it is far smaller than the ~1–2 GB
-Peter estimated — a plain `.tar` per image, no zstd needed; see
+The Owner estimated — a plain `.tar` per image, no zstd needed; see
 `export-images.sh` header for the measurement). The **light** seed ISO therefore
 grows from ~1 MB to **~470 MB** (still a small add-on to the unmodified stock
 ISO); the **repacked** ISO grows from ~3.4 GB to **~3.9 GB**. Both fit a USB with
@@ -214,7 +214,7 @@ If `C:` is tight (see §2), point the output elsewhere:
 
 ---
 
-## 4. Enable Hyper-V (machine-level — Peter's consent, one-time)
+## 4. Enable Hyper-V (machine-level — the Owner's consent, one-time)
 
 Skip if already enabled (`Get-Command Get-VM` succeeds in PowerShell).
 

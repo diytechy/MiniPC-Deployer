@@ -13,13 +13,13 @@ last) — it is the record, not required reading for every pass.
   requirement spine is intentionally **high-level** (proportionality doctrine).
 - **Round:** 1
 - **Open items:**
-  - **Needs Peter** _(ratification / manual steps — dial=HIGH)_:
+  - **Needs the Owner** _(ratification / manual steps — dial=HIGH)_:
     - OI-1 — **Google OAuth client** must be created in Google Cloud (needs
-      Peter's account); redirect URI to register:
+      the Owner's account); redirect URI to register:
       `https://tracker.<domain>/oauth2/callback` →
       [stack/.env.example](../stack/.env.example)
     - OI-2 — **Reimage-over-LAN ladder** is HIGH-RISK; the memo presents options
-      with checkboxes. Nothing destructive is implemented until Peter checks one
+      with checkboxes. Nothing destructive is implemented until the Owner checks one
       → [REMOTE_MANAGEMENT.md](../REMOTE_MANAGEMENT.md)
     - OI-3 — **Push** each commit (agents lack the SSH key) →
       this repo
@@ -28,7 +28,7 @@ last) — it is the record, not required reading for every pass.
       edit (light path), and confirm compose-up →
       [vmtest/README.md](../vmtest/README.md). Nobody has booted a VM from
       this yet — scripts delivered + partially smoke-tested, boot itself is
-      Peter's step (elevation + Hyper-V).
+      the Owner's step (elevation + Hyper-V).
     - OI-6 — **C: free space is tight (~9GB)** after this session's ISO
       download/repack smoke test — WSL2's `ext4.vhdx` grew and does not
       auto-shrink on file deletion (see vmtest/README.md §2 for the
@@ -45,20 +45,20 @@ last) — it is the record, not required reading for every pass.
       UNENCRYPTED — physical theft/disposal exposes `.env` secrets + the
       finance volumes. Proposed: autoinstall LUKS (Subiquity supports
       `storage: layout: {name: lvm, password: …}`) + unattended unlock via
-      TPM2 enroll at first boot **if the AK41 BIOS exposes Intel PTT (Peter:
+      TPM2 enroll at first boot **if the AK41 BIOS exposes Intel PTT (Owner:
       check BIOS)**, else dropbear-initramfs (SSH unlock over LAN — fits
       headless). Touches the autoinstall `storage:` layout = the
-      REMOTE_MANAGEMENT **hard line**: not implemented until Peter ratifies.
+      REMOTE_MANAGEMENT **hard line**: not implemented until the Owner ratifies.
       Companion decision: LUKS on the backup drives too (finance snapshots
       land there in plaintext otherwise).
     - OI-8 — **Backup gap — RESOLVED in-repo 2026-07-10 (SN-010/SR-013,
-      Peter-ratified single-table design):** `BACKUP_SOURCES` now accepts
+      Owner-ratified single-table design):** `BACKUP_SOURCES` now accepts
       `volume:VOL[@CONTAINER]` and `path:/dir` specs; sim-proven
       (`run-volume-sim.sh` a–d GREEN + full `run-backup-sim.sh` regression
-      GREEN). **Remaining for Peter:** uncomment the volume lines in the real
+      GREEN). **Remaining for the Owner:** uncomment the volume lines in the real
       `/etc/awow-backup/backup.env` (+ add `actual tracker` to `OFFSITE_SETS`)
       when configuring the box — they ship commented in `backup.env.example`.
-    - OI-11 — **On-box offsite leg — RATIFIED by Peter 2026-07-25; BUILD HALF
+    - OI-11 — **On-box offsite leg — RATIFIED by the Owner 2026-07-25; BUILD HALF
       DONE 2026-07-29.** The offsite leg moves fully onto this box: IceDrive
       runs here (SN-012/SR-015 opt-in RDP layer) and syncs selected folders
       straight to the cloud. **Mini-serv leaves the offsite path entirely.**
@@ -69,7 +69,7 @@ last) — it is the record, not required reading for every pass.
       **Still outstanding:** (a) **sim legs** — the committed sim still drives
       the LEGACY `OFFSITE_UNC` form (it is the regression net for it); a
       local-target leg + a wake leg belong in `sim/mini-serv-sim/`;
-      (b) **Peter:** stand the IceDrive client up on-box per
+      (b) **Owner:** stand the IceDrive client up on-box per
       `stack/remote-ui/README.md`, then set `OFFSITE_PATH` in the real
       `/etc/awow-backup/backup.env` to the folder it syncs (the run FAILS if
       that directory does not exist — deliberate) and comment `OFFSITE_UNC`
@@ -78,7 +78,7 @@ last) — it is the record, not required reading for every pass.
       folders go offsite* answer comes from `Personal\deploy\storage-map.md`
       §4e rather than a hand-kept `OFFSITE_SETS` list.
     - OI-13 — **Wake-on-LAN needs the real values + the Windows-side
-      settings (2026-07-29, PETER):** the backup now wakes the sleeping game box
+      settings (2026-07-29, OWNER):** the backup now wakes the sleeping game box
       before pulling and fails the run loudly on a wake timeout, but it is OFF
       until `BACKUP_WAKE_MAC` is filled in (with `BACKUP_WAKE_HOST` /
       `BACKUP_WAKE_TIMEOUT`) in the real `/etc/awow-backup/backup.env` — the
@@ -90,12 +90,12 @@ last) — it is the record, not required reading for every pass.
       needed for the fallback — bash cannot set `SO_BROADCAST`, and the WSL
       kernel used for this session's testing REFUSED it.
     - OI-12 — **Second image target proposed (2026-07-25): the office wall
-      panel.** Peter is adding a wall-mounted ambient panel (Acer Aspire R 14,
+      panel.** The Owner is adding a wall-mounted ambient panel (Acer Aspire R 14,
       chassis N15P6) showing NagLight + a Navidrome-fed music player + a family
       photo/video frame. Brief: `Personal\OFFICEWALL_BOOTSTRAP.md`. It overlaps
       this repo almost entirely at the image layer — autoinstall skeleton, ISO
       assembly, payload bake, secret materialisation, SSH/unattended-upgrades
-      posture — so the **recommended** split (Peter's D-W0) is that the *image*
+      posture — so the **recommended** split (the Owner's D-W0) is that the *image*
       becomes a **second target in this repo** while the panel's *shell app*
       lives in the `OfficeWallNaglight` repo and is consumed exactly as
       `naglight:local` is (the IF-001 pattern), preserving this repo's
@@ -128,7 +128,7 @@ last) — it is the record, not required reading for every pass.
       — see the 2026-07-29 audit entry. Still owed: an assertion inside the
       committed sim legs (they exercise ERR-trap failures, not `die`).
 - **Assumptions (unattended):** see the Assumptions log below.
-- **Next action:** Peter reviews + pushes; fills in the wake values + the
+- **Next action:** the Owner reviews + pushes; fills in the wake values + the
   Windows-side WoL settings (OI-13) and points `OFFSITE_PATH` at the on-box
   IceDrive folder (OI-11b); creates the Google OAuth client
   (OI-1); runs the V3 boot (OI-5); ratifies the tier-2 decisions (OI-7) —
@@ -137,7 +137,7 @@ last) — it is the record, not required reading for every pass.
   real evidence.
 - **UPDATE 2026-07-03 (WI-10.13):** the "no Docker on the dev machine" constraint
   above is now LIFTED — WSL2 + Ubuntu 24.04 + docker-ce is installed on the dev
-  PC (Docker Desktop explicitly NOT installed, per Peter's pick). `naglight:local`
+  PC (Docker Desktop explicitly NOT installed, per the Owner's pick). `naglight:local`
   now builds for real and `docker compose config` resolves this stack's full
   compose file. See audit log entry below for versions/detail. Wave 2 (V1
   AWOW-sim, WI-10.14/10.15) is now unblocked.
@@ -149,7 +149,7 @@ last) — it is the record, not required reading for every pass.
   tracker behind Google sign-in, Actual Budget, LAN observability) plus an
   Ubuntu autoinstall image and full LAN remote management. **Config only** — app
   code lives in NagLight / Finance-Auditor / MinecraftKeeper.
-- **Stakeholders / end user(s):** Peter (homelab operator); the tracker's hosted
+- **Stakeholders / end user(s):** the Owner (homelab operator); the tracker's hosted
   end-users reach it only through oauth2-proxy.
 - **Active hats:** Stakeholder, UX/Docs, System Engineer, Software Engineer, Test
   Engineer, **Network**, **Security/Ops** (the domain hats this infra scope
@@ -171,7 +171,7 @@ last) — it is the record, not required reading for every pass.
     product-layer check is `scripts/validate_config.py`.
 - **Non-goals:** a container registry / CI publishing (deferred, Q10.2 — local
   builds for now); the NagLight app code and its multi-user engine (NagLight
-  repo, WI-10.4/10.5); the secret-handoff script (WI-10.3, Peter ratifies).
+  repo, WI-10.4/10.5); the secret-handoff script (WI-10.3, the Owner ratifies).
 - **Definition of done:** the repo's G1 gate is green (`check.py`), `.env.example`
   enumerates every knob, config coverage validates, and the honest validation
   ledger records what remains PENDING a Docker host.
@@ -220,11 +220,11 @@ deliverable.
 ### DRIVER — G1 — Round 1 — 2026-07-03
 Scaffolding created. Starting G1.
 
-### Assumptions log (unattended, dial=HIGH — Peter to confirm/revert)
+### Assumptions log (unattended, dial=HIGH — the Owner to confirm/revert)
 - A1 — Layout: migrated `life-tracker/deploy/*` under `stack/` at the repo root
   (kept the kit's `docs/`/`scripts/` roots). On-box path renamed `deploy/` →
   `stack/` under `/opt/awow-core/`; the box hostname/opt-dir keep the `awow-core`
-  name (faithful to the source; Peter knows it).
+  name (faithful to the source; the Owner knows it).
 - A2 — This repo is treated as gate **G1** (requirements-agreed) — config is the
   deliverable, there is no compiled source to carry to G2/G3. The Python
   product/arch-map steps are dropped, not left vacuous.
@@ -234,11 +234,11 @@ Scaffolding created. Starting G1.
   per WI-10.12 "key-only auth". Cockpit installed but **not** proxied publicly.
 - A5 — Kept the `TRACKER_DATA_REMOTE` clone/pull entrypoint behaviour from the
   source; multi-user (D3) sets it blank + `TRACKER_COMMIT=false` (documented).
-- A6 — SN-012/SR-015 shape (2026-07-20, Peter asked for "opt-in light UI +
+- A6 — SN-012/SR-015 shape (2026-07-20, the Owner asked for "opt-in light UI +
   SN-001 rescope"; details decided unattended): xrdp + **minimal** XFCE
   (`--no-install-recommends`, no desktop meta-package) rather than a full DE
   or VNC; the script never downloads the AppImage (vendor URL churn on a
-  public repo — Peter scp's it, `ICEDRIVE_APPIMAGE=` path knob); sync-resume
+  public repo — the Owner scp's it, `ICEDRIVE_APPIMAGE=` path knob); sync-resume
   is the documented post-reboot one-RDP-touch (NO autologin/virtual-display
   hack — that would fake self-healing the vendor app can't honestly offer);
   priority C, Verification=Inspection, no sim leg (a host-level GUI can't be
@@ -271,7 +271,7 @@ identity headers to the tracker). Re-routed the Caddyfile: tracker host →
 oauth2-proxy (no basic_auth); Actual + dns keep basic_auth (split into
 per-service snippets since Caddy resolves {$VAR} once at load). Firstboot now
 materializes the allow-list from `OAUTH2_PROXY_ALLOWED_EMAILS`. Documented the
-PETER MANUAL STEP (Google OAuth client) in .env.example + stack/README. Redirect
+OWNER MANUAL STEP (Google OAuth client) in .env.example + stack/README. Redirect
 URI to register: `https://tracker.<domain>/oauth2/callback`. config-validate
 green (25 compose vars covered, 8 Caddy vars passed).
 
@@ -289,16 +289,16 @@ ops workflow. Wrote `REMOTE_MANAGEMENT.md` — the reimage-over-LAN ladder as a
 decision memo with checkboxes (recommended: **B GRUB recovery partition** primary
 + **D smart-plug/USB** fallback). **HIGH-RISK line:** nothing destructive /
 reimage-related (no `storage:` recovery-partition change, no GRUB reinstall entry,
-no PXE) is implemented until Peter checks a box.
+no PXE) is implemented until the Owner checks a box.
 
 <!-- agent-setup --> Agent setup (2026-07-03): agents=`claude`; skills materialized: downstream-resync, gate-advance, registry-hygiene. AGENTS.md remains the canonical, agent-neutral guide (skills are opt-in accelerators, not a process gate).
 
 ### DRIVER — G1 — Round 1 — 2026-07-03 (WI-10.13 dev-PC container runtime)
-Peter picked **(a) WSL2 + docker engine inside Ubuntu**, explicitly over Docker
+The Owner picked **(a) WSL2 + docker engine inside Ubuntu**, explicitly over Docker
 Desktop (not installed; no other tooling touched). This closes Wave 1's
 unverified-image-build honesty gap for real.
 
-**Installed on the dev PC (machine-level, Peter-consented):**
+**Installed on the dev PC (machine-level, Owner-consented):**
 - WSL2 itself was already enabled/functional (a pre-existing
   `podman-machine-default` WSL2 distro was running) — no VirtualMachinePlatform
   enable + reboot was needed.
@@ -307,7 +307,8 @@ unverified-image-build honesty gap for real.
   `ubuntu.exe install --root`, avoiding the interactive username/password
   prompt. Result: **Ubuntu 24.04.1 LTS (Noble)**, WSL version 2. Default WSL
   user is `root` (a consequence of the `--root` non-interactive path). A
-  secondary non-root user `peter` was also created and added to the `docker` +
+  secondary non-root user `<owner>` (placeholder — the real login name is
+  redacted per SR-010) was also created and added to the `docker` +
   `sudo` groups for future interactive use, but is NOT the WSL default (no
   extra restart was spent switching it — root already has full docker access).
 - `/etc/wsl.conf` → `[boot] systemd=true`; confirmed via `wsl --shutdown` +
@@ -347,7 +348,7 @@ involved) and execute them via `wsl.exe -d Ubuntu -- bash /mnt/c/...script.sh`
 with `MSYS_NO_PATHCONV=1` set on any command touching `/mnt/c/...` paths
 directly.
 
-**Remaining for Peter:** none — no reboot, no interactive prompt was needed.
+**Remaining for the Owner:** none — no reboot, no interactive prompt was needed.
 Wave 2's V1 AWOW-sim (WI-10.14/10.15) is now unblocked.
 
 ### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.14 AWOW-sim harness + V1 gate)
@@ -383,7 +384,7 @@ never before RUN):**
 - **technitium + actual healthchecks** used `wget`, absent from both images
   (they ship bash, not wget). Fixed to a tool-independent bash `/dev/tcp` probe.
 
-**FLAGGED FOR PETER (a NagLight repo fix, out of this repo's scope):** the
+**FLAGGED FOR OWNER (a NagLight repo fix, out of this repo's scope):** the
 `naglight:local` image runs as `USER tracker` (uid 1000) but the `tracker_data`
 named volume initialises **root-owned**, so multi-user `mkdir /data/<sub>` fails
 with EACCES and every request 500s. Correct fix = `mkdir -p /data && chown
@@ -448,7 +449,7 @@ standalone with `sim/mini-serv-sim/run-backup-sim.sh --shares-only` (needs
 minecraft+satisfactory exported READ-ONLY (live-share-stays-read-only rule).
 
 ### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.18 V3 gate — ISO/VM scripts)
-Built `vmtest/` (agent delivers scripts + docs; **the boot itself is Peter's** —
+Built `vmtest/` (agent delivers scripts + docs; **the boot itself is the Owner's** —
 needs an elevated PowerShell session + the Hyper-V Windows feature, both
 machine-level, neither touched here):
 
@@ -474,7 +475,7 @@ machine-level, neither touched here):
   `MicrosoftUEFICertificateAuthority` Secure Boot template for the Ubuntu
   shim, Default Switch/NAT by default with a documented External-switch
   option for real LAN exposure). Idempotent, `-WhatIf` support, elevation
-  asserted at the top. **Never run** (elevation + Hyper-V are Peter's call).
+  asserted at the top. **Never run** (elevation + Hyper-V are the Owner's call).
 - **`vmtest/README.md`** — the V3 runbook: ISO strategy write-up (why the
   light path needs one manual GRUB keypress and the heavy path doesn't, with
   the exact edit to make), the 24.04.4 download URL + SHA256 (verified for
@@ -524,7 +525,7 @@ what had been a per-call, unbounded-growth `>>` append of the Technitium
 password + oauth2-proxy cookie secret into the same once-generated,
 idempotently-reused block as the SSH key and console password.
 
-**Side effect flagged for Peter (OI-6 above):** downloading + repacking the
+**Side effect flagged for the Owner (OI-6 above):** downloading + repacking the
 ~3.4GB ISO (even under a WSL-native path, not `/mnt/c`) grew WSL2's
 `ext4.vhdx` — which itself lives on `C:` — from ~21GB free down to ~9GB, and
 deleting the files afterward did **not** give the space back (a known WSL2
@@ -533,7 +534,7 @@ quirk: the sparse vhdx doesn't auto-shrink). Reclaim steps are in
 
 ### DRIVER — G1 — Round 1 — 2026-07-04 (Q10.9 B+ ALL-IMAGES — bake every image into the ISO)
 
-Implemented Peter's locked **Q10.9 B+** decision (HOMELAB_RESTRUCTURE_PLAN.md):
+Implemented the Owner's locked **Q10.9 B+** decision (HOMELAB_RESTRUCTURE_PLAN.md):
 every stack image is `docker save`d into the ISO deploy payload and `docker
 load`ed at first boot, so a freshly-imaged AWOW comes up "from infancy" with
 **zero registry/internet dependency for container images**, versions pinned to
@@ -601,7 +602,7 @@ tag is a differently-built multi-arch index than `v2.10.0`; the named release
 **RAN FOR REAL (WSL2 / docker 29.6.1):**
 - `export-images.sh` end-to-end → pulled the 4 aux images at their pinned tags,
   re-tagged the 3 core floating→concrete (layers already present, near-instant),
-  saved all 9. **Total payload = 469 MB** across 9 tars (well under Peter's
+  saved all 9. **Total payload = 469 MB** across 9 tars (well under the Owner's
   ~1–2GB estimate). Manifest written.
 - `docker load` of all 9 tars → each restored to its exact pinned `repo:tag`
   and re-loading is an idempotent no-op (proves firstboot step 3's guarantee:
@@ -620,7 +621,7 @@ tag is a differently-built multi-arch index than `v2.10.0`; the named release
 - `scripts/check.py` + `validate_config.py` → **PASS** (G1 green; 35 compose
   vars covered).
 
-**AWAITS V3 (Peter's boot, unchanged):** the actual first-boot `docker load` +
+**AWAITS V3 (the Owner's boot, unchanged):** the actual first-boot `docker load` +
 `compose up` run inside a booted VM/hardware. No VM has been booted. Everything
 above is the pre-boot smoke test the dev PC can run headlessly.
 
@@ -631,7 +632,7 @@ the docker store) touched the vhdx.
 
 ### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.10 DRIVE POWER DESIGN — dynamic standby)
 
-Implemented Peter's ratified DRIVE POWER DESIGN in the bash backup service. The
+Implemented the Owner's ratified DRIVE POWER DESIGN in the bash backup service. The
 backup drives are the box's biggest electrical lever (5–8 W each spinning ≈ the
 whole CPU), so the policy is **dynamic standby**, two pieces:
 
@@ -702,7 +703,7 @@ failure-path composition*, not the drive's physical response.
 
 ### DRIVER — G1 — Round 1 — 2026-07-10 (STACK REVIEW + TIER-2 OPT-IN CATALOG — SN-009/SR-012)
 
-Peter asked for (a) a review of the deployer stack and (b) an opt-in catalog of
+The Owner asked for (a) a review of the deployer stack and (b) an opt-in catalog of
 additional self-hosted services (photos ×2, media, music, podcasts, home
 automation, passwords, etc.). Both delivered this session.
 
@@ -771,7 +772,7 @@ await the V1-sim re-run / V3 boot (OI-7c).
 
 ### DRIVER — G1 — Round 1 — 2026-07-10 (OI-8 → SN-010/SR-013: docker-volume sources in the ONE backup table)
 
-Peter ratified the single-table design ("multiple sources/destinations
+The Owner ratified the single-table design ("multiple sources/destinations
 configured for a single backup execution sequence"): extend the existing
 `BACKUP_SOURCES` grammar rather than bolt on a second mechanism. Destinations
 stay as-is (one drive target + the `OFFSITE_SETS` subset selector).
@@ -822,7 +823,7 @@ inspect` with a fixture dir by design.
 
 ### DRIVER — G1 — Round 1 — 2026-07-10 (SR-006 resolver chain + .env QUOTING BUG fix)
 
-**Peter's ask:** NagLight and Finance-Auditor are private — the dev package
+**The Owner's ask:** NagLight and Finance-Auditor are private — the dev package
 should take each locally-built container from a sister folder of the same name,
 else grab a declared public one.
 
@@ -860,9 +861,9 @@ clean (was: `bot: command not found`, exit 127); `docker compose config`
 confirms quote-stripping (`TRACKER_GIT_NAME: naglight bot`). `bash -n` clean on
 all touched scripts; `check.py` G1 PASS.
 
-### DRIVER — G1 — Round 1 — 2026-07-11 (DOC CURRENCY PASS — Peter's ask)
+### DRIVER — G1 — Round 1 — 2026-07-11 (DOC CURRENCY PASS — the Owner's ask)
 
-Peter asked for all docs to be brought current (the tier-2 catalog and other
+The Owner asked for all docs to be brought current (the tier-2 catalog and other
 recent work were missing from the root README and elsewhere). Swept every doc
 against the repo's actual state:
 
@@ -896,9 +897,9 @@ against the repo's actual state:
 `check.py` G1 PASS (config-validate, registry-integrity, doc-navigability —
 now 0 warnings). Docs-only change; no config/script behavior touched.
 
-### DRIVER — G1 — Round 1 — 2026-07-11 (STATE & CREDENTIALS clarity — Peter's ask)
+### DRIVER — G1 — Round 1 — 2026-07-11 (STATE & CREDENTIALS clarity — the Owner's ask)
 
-Peter asked where credentials live across updates/reimages and how the budget
+The Owner asked where credentials live across updates/reimages and how the budget
 app's bank feed wires in. Docs now say it in one place:
 
 - **REMOTE_MANAGEMENT.md "State & credentials"** — the survives-what table:
@@ -911,7 +912,7 @@ app's bank feed wires in. Docs now say it in one place:
   Plus "What runs where": on the AWOW everything is a container except the
   backup service, powertune/backup-standby oneshots, Cockpit, sshd,
   unattended-upgrades; Mini-serv runs nothing from this stack.
-- **stack/README §2** — new PETER MANUAL STEP: SimpleFIN bank sync is a
+- **stack/README §2** — new OWNER MANUAL STEP: SimpleFIN bank sync is a
   one-time, in-app Actual setup (Actual OWNS the SimpleFIN relationship;
   Finance-Auditor will only trigger its sync). Stored server-side in
   `actual_data`; not doable from the hermetic sim (a real bank credential must
@@ -924,7 +925,7 @@ app's bank feed wires in. Docs now say it in one place:
 
 ### DRIVER — G1 — Round 1 — 2026-07-11 (SN-011/SR-014: Finance-Auditor ingested, profile-gated)
 
-Peter confirmed FA's deploy artifacts landed (its commits bbea348/59d9f27:
+The Owner confirmed FA's deploy artifacts landed (its commits bbea348/59d9f27:
 Dockerfile + deploy/compose.service.example.yml + the ACTUAL_API_VERSION
 build-arg). Verified ready and ingested per its IF-003 spec:
 
@@ -969,13 +970,13 @@ the tracker runs multi-user (D3).
 
 ### DRIVER — G1 — Round 1 — 2026-07-11 (NagLight color lane VERIFIED end-to-end + sim interpolation fix)
 
-Peter said NagLight was updated; verified in its working tree (NOTE: that work
-is **UNCOMMITTED in NagLight** — Peter to commit there): /api/feed now takes
+The Owner said NagLight was updated; verified in its working tree (NOTE: that work
+is **UNCOMMITTED in NagLight** — the Owner to commit there): /api/feed now takes
 three lanes ({check,ok,note} boolean; {check,color,reason,at} severity;
 {check,rgb,...}), field names pinned to FA's contract (NagLight IF-006 ↔ FA
 IF-001); its IF registry is re-homed with counterpart ids matching ours
 (their IF-004↔our IF-003, IF-005↔our IF-002); G1 human sign-off still pending
-(Peter's).
+(the Owner's).
 
 **RAN FOR REAL (sim):** rebuilt `naglight:local` from the updated tree,
 recreated the sim tracker, added the fictional `finances.md` severity-item
@@ -998,9 +999,9 @@ for every tier-2/finance knob. Sim bring-up works again.
 needs a re-export before any flash (folds into the OI-7c re-export); OI-10
 added (disk-encryption decision); USB-wipe note added to stack/README §3.
 
-### DRIVER — G1 — Round 1 — 2026-07-20 (SN-012/SR-015: opt-in remote light UI; SN-001 rescoped — Peter's ask)
+### DRIVER — G1 — Round 1 — 2026-07-20 (SN-012/SR-015: opt-in remote light UI; SN-001 rescoped — the Owner's ask)
 
-Peter asked (following the IceDrive-headless discussion — the current client is
+The Owner asked (following the IceDrive-headless discussion — the current client is
 GUI-only, no daemon/CLI, WebDAV sunsetting since 2026-04) to make an on-box
 light UI an **opt-in option** and to rescope SN-001: zero-click is guaranteed
 for **core** services; opt-in secondary services may need UI/manual config —
@@ -1020,7 +1021,7 @@ always remote, restricted/minimized.
   uninstall steps). REMOTE_MANAGEMENT.md gained the opt-in section;
   architecture layout table row added.
 - **Scope line held:** backup step 5 offsite stays cifs-only — pointing it at
-  an on-box synced folder is OI-11 (needs Peter; small backup.sh extension +
+  an on-box synced folder is OI-11 (needs the Owner; small backup.sh extension +
   sim legs). A6 records the unattended shape decisions (minimal XFCE not full
   DE; no AppImage auto-download; no autologin sync-resume hack).
 
@@ -1118,7 +1119,7 @@ one are named at the bottom.
 - The V1 stack sim was already up from a previous session and was **reused**,
   not rebuilt from scratch; `sim/run-sim.sh` itself was not re-run.
 
-**For Peter / next gate**
+**For the Owner / next gate**
 
 - **OI-13** (new): the wake feature is inert until the real MAC lands in
   `/etc/awow-backup/backup.env`, and it needs two Windows-side settings.
@@ -1128,3 +1129,54 @@ one are named at the bottom.
   re-send interval, must-already-exist rule, the two optional knobs).
 - Left alone on purpose: OI-12 (wall panel) — nothing built, no wall site or
   image lane created.
+
+---
+
+### DRIVER — G1 — Round 1 — 2026-07-29 (SR-010 enforcement — personal name swept out of every tracked file)
+
+The Owner sanctioned (2026-07-29) replacing the personal first name in tracked
+files with the generic role term, closing the last gap against **SR-010** /
+**SN-007** ("no ... personal-name in any tracked file"). Name tokens only —
+no decision IDs, dates, semantics, or surrounding wording were changed, and no
+git history was rewritten.
+
+- **21 tracked files** swept (docs, requirements CSVs, READMEs, `AGENTS.md`,
+  `REMOTE_MANAGEMENT.md`, compose/sim YAML, `Caddyfile`, `.env.example`,
+  autoinstall + backup + remote-ui shell, `vmtest/*`) — plus this log, which the
+  Owner explicitly sanctioned despite its append-only rule.
+- Mapping used: possessive → "the Owner's"; sentence subject → "the Owner";
+  table-cell/label/attribution forms → "Owner"/"Owner:"; the all-caps banner
+  became **`OWNER MANUAL STEP`** (same 5-character name token, so the
+  `.env.example` ASCII box border needed no re-drawing); hyphenated compounds
+  → `Owner-gated`/`Owner-ratified`/`Owner-consented`.
+- **Two conflicts, handled deliberately:**
+  - The `.env.example` OAuth box had one comment line that no longer fit the
+    76-column border once the name expanded; that sentence was re-wrapped across
+    its existing two lines. Box width and content are otherwise identical.
+  - The 2026-07-03 WI-10.13 WSL2 entry recorded a real *Linux login name* (a
+    literal system identifier, not prose). Renaming it to a role phrase would
+    have falsified the record, so it is now the placeholder `` `<owner>` ``
+    with an inline note that the real login name is redacted per SR-010. The
+    account itself is unchanged on the dev PC.
+- The pseudonym `diytechy`, the `AuroLeap` org, hostnames (`mini-serv`,
+  `awow-core`), and all `Co-Authored-By` trailers were left untouched.
+
+**RAN FOR REAL**
+
+- A case-insensitive `git grep` for the name over tracked files: **102 hits
+  across 21 files → 0 hits**.
+- CSV structure re-parsed with Python `csv` before/after: `interfaces.csv`
+  6 rows and `system-requirements.csv` 16 rows, **every row's column count
+  identical** — the edits touched cell text only, never a delimiter or quote.
+- `python scripts/check.py` — **G1 PASS** (config-validate: 77 compose vars vs
+  `.env.example`, 8 Caddyfile vars, all bind-mounts/autoinstall files present,
+  YAML parses; registry-integrity `SN=12 SR=15 orphans=21 integrity=0`;
+  doc-navigability 11 docs / 48 links / 0 broken). Identical to the previous
+  round's numbers, i.e. the rename moved no requirement and broke no link.
+
+**NOT run (honest gap)**
+
+- No sim, no container, no box. This pass is text-only; nothing executable
+  changed behavior, so only the static gate was exercised.
+- Commit metadata was **not** rewritten. Author identity was already `diytechy`
+  (verified via `git config user.name`), and history rewriting was out of scope.

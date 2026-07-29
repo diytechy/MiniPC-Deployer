@@ -18,7 +18,7 @@
 # repacked ISO still reports BOTH a BIOS and a UEFI El Torito boot image
 # (`xorriso -report_el_torito plain`), and /boot/grub/grub.cfg, /nocloud/,
 # /deploy-payload/ are all present and correct in the output. NOT boot-tested
-# (that needs a VM — Peter's step, see vmtest/README.md).
+# (that needs a VM — the Owner's step, see vmtest/README.md).
 #
 # Since everything (OS + seed + payload) is in ONE ISO here, attach only this
 # ISO to the VM (New-AwowVm.ps1 -SkipSecondDvd, same path for both

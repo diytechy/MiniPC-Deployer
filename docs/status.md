@@ -58,25 +58,42 @@ last) — it is the record, not required reading for every pass.
       GREEN). **Remaining for the Owner:** uncomment the volume lines in the real
       `/etc/awow-backup/backup.env` (+ add `actual tracker` to `OFFSITE_SETS`)
       when configuring the box — they ship commented in `backup.env.example`.
-    - OI-11 — **On-box offsite leg — RATIFIED by the Owner 2026-07-25; BUILD HALF
-      DONE 2026-07-29.** The offsite leg moves fully onto this box: IceDrive
-      runs here (SN-012/SR-015 opt-in RDP layer) and syncs selected folders
-      straight to the cloud. **Mini-serv leaves the offsite path entirely.**
-      **Built:** `backup.sh` step 5 now takes `OFFSITE_PATH=/abs/dir` (local
-      target, primary) with `OFFSITE_UNC` kept as the legacy cifs form; exactly
-      one may be set, checked at run start; both forms share one staging
-      routine. Exercised for real end-to-end (see the 2026-07-29 audit entry).
-      **Still outstanding:** (a) **sim legs** — the committed sim still drives
-      the LEGACY `OFFSITE_UNC` form (it is the regression net for it); a
-      local-target leg + a wake leg belong in `sim/mini-serv-sim/`;
-      (b) **Owner:** stand the IceDrive client up on-box per
-      `stack/remote-ui/README.md`, then set `OFFSITE_PATH` in the real
-      `/etc/awow-backup/backup.env` to the folder it syncs (the run FAILS if
-      that directory does not exist — deliberate) and comment `OFFSITE_UNC`
-      out. Unchanged: the IceDrive client is a GUI app, so **sync is down after
-      every reboot until an RDP session is opened** (SR-015), and the *which
-      folders go offsite* answer comes from `Personal\deploy\storage-map.md`
-      §4e rather than a hand-kept `OFFSITE_SETS` list.
+    - OI-11 — **Offsite leg — the Owner CORRECTED the model on 2026-07-29: the
+      backup service has NO offsite step in the target state.** The IceDrive
+      client (SN-012/SR-015 opt-in desktop session) is pointed **directly at
+      chosen library paths in its own GUI** and syncs them itself; the service
+      stages, copies and prunes nothing for it. `OFFSITE_ENABLED=false` is now
+      the documented target state (`backup.env.example`), the step-5 code is
+      kept working as legacy, and the pipeline instead **ingests** network
+      shares into the library so there is one current copy for the client to
+      sync (see the 2026-07-29 ingest entry). **Mini-serv leaves the offsite
+      path entirely** (unchanged from the 2026-07-25 ratification).
+      **What this makes MOOT:** the "local-path target" build half done earlier
+      on 2026-07-29 (`OFFSITE_PATH`) — it stays in the tree as harmless legacy,
+      needs no sim leg, and there is no `OFFSITE_PATH` for the Owner to set;
+      likewise the old OI-11(a) "a local-target sim leg is owed".
+      **Still outstanding for the Owner:** stand the IceDrive client up on-box
+      per `stack/remote-ui/README.md` and create its sync pairs against the
+      library paths named in `Personal\deploy\storage-map.md` §4e — never one
+      holding raw finance data. **Two consequences to accept:** the client is a
+      GUI app, so **sync is down after every reboot until a session is opened**
+      (SR-015), and with no offsite step the backup's NagLight report **cannot
+      see** a stale cloud copy at all — a green backup says nothing about
+      IceDrive.
+    - OI-14 — **Ingest + exclusions need the Owner's real values
+      (2026-07-29, OWNER):** the ratified INGEST step is inert until
+      `INGEST_SOURCES` in the real `/etc/awow-backup/backup.env` names the real
+      share and the real library destination, and the `BACKUP_SOURCES` `path:`
+      entry points at that library folder — the repo ships the fictional
+      `mini-serv` / `/srv/library/NonDocs/MiniServ` placeholders only (SN-007).
+      The **authoritative** library paths come from
+      `Personal\deploy\storage-map.md`, not from the example. Same for
+      exclusions: `BACKUP_EXCLUDE="*.bak"` ships as the Owner's stated default,
+      but the **named very-large folders** he wants skipped are per-set
+      (`name.exclude=` lines) and only he knows their names. Note the mirror
+      contract before filling it in: `rsync -a --delete` means a file deleted on
+      the share is deleted from the library copy on the next run (history lives
+      in the dated run snapshots, `BACKUP_KEEP`).
     - OI-13 — **Wake-on-LAN needs the real values + the Windows-side
       settings (2026-07-29, OWNER):** the backup now wakes the sleeping game box
       before pulling and fails the run loudly on a wake timeout, but it is OFF
@@ -129,8 +146,9 @@ last) — it is the record, not required reading for every pass.
       committed sim legs (they exercise ERR-trap failures, not `die`).
 - **Assumptions (unattended):** see the Assumptions log below.
 - **Next action:** the Owner reviews + pushes; fills in the wake values + the
-  Windows-side WoL settings (OI-13) and points `OFFSITE_PATH` at the on-box
-  IceDrive folder (OI-11b); creates the Google OAuth client
+  Windows-side WoL settings (OI-13) and the real ingest/exclusion values
+  (OI-14); points the on-box IceDrive client at the chosen library paths
+  (OI-11); creates the Google OAuth client
   (OI-1); runs the V3 boot (OI-5); ratifies the tier-2 decisions (OI-7) —
   then the "V3.5 dress rehearsal" (real secrets in the VM: External vSwitch,
   TLS decision, backup VHDX) discussed 2026-07-10 turns the sim-GREENs into
@@ -182,8 +200,9 @@ last) — it is the record, not required reading for every pass.
 |---|---|
 | `docker compose config` (core + all tier-2 profiles) | PASS (WSL docker-ce; core = the original 8 services with no profiles) |
 | Live bring-up + curl health + `dig` + OAuth round-trip + tear-down | **GREEN in the V1 sim** (vs Dex/internal-CA/fixtures — `validate-sim.sh` 6 checks); **real-Google/real-TLS/host-:53 PENDING V3 boot + hardware** |
-| Backup pipeline (cifs + offsite + feed + restore drill) | GREEN (`run-backup-sim.sh`, re-run 2026-07-29 after the wake/offsite/OI-9 change); drive-power + volume-source call contracts GREEN (mock-shim legs) — drive spin-down physics + real-docker volume copy are V3/burn-in |
-| Wake-on-LAN pre-step + `OFFSITE_PATH` local target + OI-9 `die` reporting | **Exercised for real on WSL2 (2026-07-29)** — magic-packet bytes, probe, timeout-dies-loudly, local offsite staging, four `die` paths posting `ok=false` — but from a THROWAWAY harness, **not a committed sim leg** (OI-11a). A real magic packet has never woken a real box (V3/hardware) |
+| Backup pipeline (cifs + offsite + feed + restore drill) | GREEN (`run-backup-sim.sh`, re-run 2026-07-29 after the ingest/exclusion change); drive-power + volume-source call contracts GREEN (mock-shim legs) — drive spin-down physics + real-docker volume copy are V3/burn-in |
+| **INGEST step (library mirror) + EXCLUSIONS** | **GREEN — committed sim leg `run-ingest-sim.sh` (2026-07-29), 28 checks over the REAL cifs path:** mirror byte-identical to the live share + restore byte-equal, `--delete` deletion propagation asserted, global+per-set patterns kept out of archive AND `files.tsv` while every excluded path is named in the log/`<set>.excluded.log`/MANIFEST, empty-share refusal + its override, 3 loud config failures each posting `ok=false`. Untested by anything: a real Windows share as the ingest source, and real library-scale volumes (V3/burn-in) |
+| Wake-on-LAN pre-step + OI-9 `die` reporting | **Exercised for real on WSL2 (2026-07-29)** — magic-packet bytes, probe, timeout-dies-loudly, `die` paths posting `ok=false` — the wake half from a THROWAWAY harness, **not a committed sim leg**; the `die`-reports-`ok=false` contract is now asserted for real in `run-ingest-sim.sh` (e1–e3, plus the empty-share refusal). A real magic packet has never woken a real box (V3/hardware). `OFFSITE_PATH` needs no leg — the offsite step is retired (OI-11) |
 | Q10.9 B+ image payload: `export-images.sh` save + `docker load` all 9 | PASS (WSL; loads idempotent) — first-boot load-at-VM awaits V3; **oauth2-proxy v7.15.2 pin bump needs a re-export + sim re-run (OI-7c)** |
 | Tier-2 pins exist on their registries (`docker manifest inspect`) | PASS — but tier-2 services have never been STARTED anywhere (enable-time validation, stack/README §9) |
 | Shell scripts `bash -n` | PASS |
@@ -257,6 +276,28 @@ Scaffolding created. Starting G1.
   exist** (the run fails rather than creating it — a typo'd path would
   otherwise report green with the files where nothing syncs). Revert any of
   these at the next gate if wrong.
+- A8 — Ingest/exclusion shape (2026-07-29; the two steps themselves were
+  ratified, these mechanics were not): the ingest table is its own knob
+  (`INGEST_SOURCES`) rather than a fourth `BACKUP_SOURCES` spec kind, because an
+  ingest entry needs a DESTINATION and is not a backup set; the grammar is
+  `name=//host/share -> /abs/dest` with the arrow, and both a non-UNC source and
+  a relative destination are rejected; the destination **leaf** is created on
+  first ingest but a **missing parent is fatal** (that is a typo or an unmounted
+  library filesystem); a share that mounts but holds **no files** while the
+  library copy does **refuses to mirror** — new knob `INGEST_ALLOW_EMPTY=false`
+  is the explicit override (this is the one guard that exists purely because
+  `--delete` is irreversible); `--dry-run` passes `--dry-run` to the mirror too;
+  ingest reuses the existing wake pre-step rather than owning a second one, and
+  exclusions deliberately do **not** apply to ingest (they filter the BACKUP,
+  not the library). Per-set exclusions are `name.exclude=` lines **inside the
+  one `BACKUP_SOURCES` table** (one table, one place to look — the SR-013
+  doctrine), which costs one rule: a set name may not end in `.exclude`; a
+  `name.exclude=` line naming a set that does not exist **fails the run**;
+  patterns go to rsync (saves the copy) AND tar (the archive-level promise), and
+  visibility is implemented with rsync's own `--debug=FILTER` decisions
+  (`<set>.excluded.log`) plus a new `excludes` MANIFEST column — the column is
+  additive, so runs written before it restore unchanged. Revert any of these at
+  the next gate if wrong.
 
 ### DRIVER — G1 — Round 1 — 2026-07-03 (migration + spine)
 Migrated the deploy stack, wired the tracker to `naglight:local`, authored the
@@ -1180,3 +1221,162 @@ git history was rewritten.
   changed behavior, so only the static gate was exercised.
 - Commit metadata was **not** rewritten. Author identity was already `diytechy`
   (verified via `git config user.name`), and history rewriting was out of scope.
+
+---
+
+### DRIVER — G1 — Round 1 — 2026-07-29 (three Owner rulings: INGEST step, archive EXCLUSIONS, OFFSITE retired)
+
+Implemented the Owner's three rulings of 2026-07-29 in `stack/backup/`. Two are
+new pipeline capability; the third **removes** a design half-built earlier the
+same day. No new decisions were taken — the mechanics decided unattended are
+listed as **A8** and the things only the Owner can supply are **OI-14**.
+
+**What was built**
+
+- **INGEST (step 1b) — ratified.** A new `INGEST_SOURCES` table
+  (`name=//host/share -> /abs/library/dest`, one per line, same hand-edited style
+  as `BACKUP_SOURCES`) mirror-syncs each network source **into the library tree**
+  BEFORE any archiving: wake (the existing `wake_and_wait`, unchanged) → cifs
+  mount ro → `rsync -a --delete` → unmount. The library folder is then covered by
+  an ordinary `path:` `BACKUP_SOURCES` entry, so one archive flow serves ingested
+  and native folders identically. **Mirror semantics are documented loudly in
+  three places** (`.example`, README, the run log itself): source deletions
+  PROPAGATE, and history lives in the dated run snapshots, not the library.
+  Failures are loud per OI-9 — a refused mount, an rsync error, a malformed line
+  and a missing library parent each post `ok=false` and exit nonzero. One guard
+  exists purely because `--delete` is irreversible: a share that **mounts but
+  holds no files** while the library copy does **refuses to mirror**
+  (`INGEST_ALLOW_EMPTY=true` overrides). The old pattern (a `//host/share`
+  straight in `BACKUP_SOURCES`) still works; the `.example` now presents the
+  ingest pair as the intended one.
+- **EXCLUSIONS (step 2) — new requirement.** `BACKUP_EXCLUDE` (global,
+  space-separated globs, ships as the Owner's `"*.bak"`) plus per-set
+  `name.exclude=PATTERN …` lines **inside the one `BACKUP_SOURCES` table** — one
+  table, one place to look. Patterns go to `rsync` at pull time (so the copy is
+  never made) and to `tar` (so the archive cannot contain them). **Nothing is
+  excluded silently:** the run logs the effective pattern list per set, logs each
+  path the patterns actually hid (first five inline, all of them in a new
+  `<set>.excluded.log` next to the archive — rsync's own `--debug=FILTER`
+  decisions), records the patterns in a new MANIFEST `excludes` column and in
+  `RUN.json`, and `restore.sh` states plainly that such a set is a **FILTERED
+  copy** of its source. A `name.exclude=` line naming a set that does not exist
+  **fails the run** rather than quietly filtering nothing.
+- **OFFSITE (step 5) — RETIRED from the target state.** The Owner's corrected
+  model: the IceDrive client is pointed **directly at library paths in its own
+  GUI**, the service stages nothing. `backup.env.example` now documents
+  `OFFSITE_ENABLED=false` as the target state with the corrected model spelled
+  out and both target knobs demoted to commented legacy; step 5's code is
+  unchanged and still works. Docs reworded: backup README (step-5 table row plus
+  a rewritten "Offsite — retired from the target state" section), architecture
+  (topology diagram now shows *backup → library → IceDrive client → cloud*, and
+  the backup bullet says there is no offsite step), REMOTE_MANAGEMENT (Mini-serv
+  is ingested, not staged-for), remote-ui README (the sync pairs the Owner
+  creates ARE the offsite configuration).
+- **New sim leg `sim/mini-serv-sim/run-ingest-sim.sh`** — the ingest/exclusion
+  regression net, over the REAL cifs path (only the NagLight feed is mocked, so
+  it needs no awow-sim stack). The compose file gains one fixture: the
+  intentionally always-empty share `//mini-serv/empty`, needed to prove an empty
+  share cannot mirror-delete a good library copy.
+
+**RAN FOR REAL (WSL2 Ubuntu + docker-ce, Windows dev PC)**
+
+- `python scripts/check.py` — **G1 PASS** (config-validate 77 compose vars + 8
+  Caddyfile vars, bind-mounts/autoinstall files present, YAML parses;
+  registry-integrity `SN=12 SR=15 orphans=21 integrity=0`; doc-navigability
+  11 docs / 48 links / **0 broken**). Same numbers as the previous round.
+- `bash -n` clean on all four `stack/backup` scripts **and** all four sim legs
+  (bash 5.2.21, rsync 3.2.7, GNU tar 1.35).
+- **`sim/mini-serv-sim/run-ingest-sim.sh` — INGEST LEG: PASS, 28/28 checks**,
+  first run of the new leg against the real service: (a) the mirror of
+  `//mini-serv/minecraft` into `/srv/library/NonDocs/MiniServ` created the leaf,
+  came out **byte-identical to the live share** (`diff -r`), was archived by the
+  ordinary `path:` flow and **restored byte-equal**, and is recorded in
+  `RUN.json`; (b) a planted library-only file **and** folder were **deleted** by
+  the next mirror — the `--delete` contract asserted, not trusted; (c) `*.bak`
+  globally + `docs.exclude=Downloads` kept 3 paths out of both the archive and
+  `docs.files.tsv` while the keepers stayed, the **source still holds** the
+  excluded files, both pattern lists appear in the log, every excluded path is
+  named in the log and in `docs.excluded.log`, the MANIFEST `excludes` column
+  carries them, a set with no per-set line still got the global pattern, and
+  `restore.sh` flagged the FILTERED copy; (d) the empty-share refusal fired
+  (library survived at 13 files, `ok=false` posted) and `INGEST_ALLOW_EMPTY=true`
+  then cleared it as instructed; (e) three loud config failures (malformed
+  ingest line, exclude line for an unknown set, missing library parent) each
+  died nonzero **and posted `ok=false`**.
+- **Regression, all re-run against the changed service:**
+  `run-backup-sim.sh` — **PASS** (full cycle over the Samba fixtures, legacy
+  `OFFSITE_UNC` push landed 5 files, NagLight round-trip visible in
+  `/api/today`, restore drill byte-equal including the post-loss reconstruct);
+  `run-volume-sim.sh` — **PASS (a–d)**; `run-drivepower-sim.sh` — **PASS (a–d)**.
+  So the loop restructure (the sources table is now parsed in a pre-pass) and the
+  new MANIFEST column broke nothing.
+- **A throwaway WSL harness** (scratch, not committed) drove the paths the sim
+  cannot reach cheaply: **glob safety** — a decoy `*.bak` in the working
+  directory does NOT hijack the pattern list (patterns are split with `read -a`,
+  never pathname-expanded); `--dry-run` still writes no archive and no library
+  change; the `MANIFEST` / `RUN.json` / `restore.sh` fields verified by eye on a
+  plain `.tar` set; the exclude-unknown-set and malformed-ingest `die`s each
+  posted `ok=false` through a mock `curl`.
+- **Checked the bash semantics the new code leans on** rather than assuming them:
+  with `errtrace`, the ERR trap does **not** fire for a failing command
+  substitution whose status is tested (`x="$(f)" || die`) but **does** for a bare
+  assignment — which is why `ingest_parse` may return 1 while
+  `exclude_line_name` never does. `rsync --debug=FILTER`'s exact output
+  (`[sender] hiding file X because of pattern Y`) was probed before being made
+  the visibility mechanism.
+
+**NOT run (honest gap)**
+
+- **No real box, no real share.** Every ingest test used the sim's Samba
+  container as the network source; the sleeping Windows box was never woken and
+  its share was never mirrored. Real-share behaviour (SMB quirks, permissions,
+  file names Linux dislikes) is V3/hardware.
+- **Library-scale data was never involved.** Fixtures are kilobytes, so mirror
+  duration, the effect of excluding a genuinely very-large folder, and the
+  interaction with the drive spin-down policy at that size are burn-in checks.
+- **`zstd` is not installed on the WSL host**, so the throwaway harness ran the
+  plain-`.tar` path only; the `.tar.zst` path was exercised inside the sim runner
+  container (which has zstd) by the ingest + backup legs.
+- **shellcheck is still not installed** on this machine or in the WSL Ubuntu —
+  not run, not claimed. `bash -n` is the only static shell checking done.
+- The V1 stack sim was **already up from a previous session and reused**;
+  `sim/run-sim.sh` was not re-run.
+- **The offsite target state is documented, not demonstrated.** Nobody pointed an
+  IceDrive client at a library path — that is Owner-side GUI work this repo
+  cannot exercise (SR-015).
+- **No requirement-registry rows were added or edited** (`SN=12 SR=15`
+  unchanged), following the precedent of this morning's wake/offsite change.
+  See the two stale wordings flagged below.
+
+**For the Owner / next gate**
+
+- **OI-14** (new): ingest + exclusions are inert until the real share, the real
+  library destination and the real "very large folder" names land in
+  `/etc/awow-backup/backup.env`; the authoritative paths are in
+  `Personal\deploy\storage-map.md`, and the mirror deletes whatever the share
+  deletes.
+- **OI-11 rewritten** for the corrected model; the `OFFSITE_PATH` build half is
+  recorded as **moot** (harmless legacy, no sim leg owed).
+- **A8** records the mechanics decided unattended (the arrow grammar, the
+  leaf-created/parent-fatal rule, `INGEST_ALLOW_EMPTY`, exclusions living in the
+  sources table and the `.exclude` name restriction, the additive MANIFEST
+  column).
+- **Two now-stale requirement wordings, left for the Owner** because editing
+  ratified rows is his call: SR-013's text still says sets flow "through
+  archive/hash/manifest/retention/**offsite**/report", and SR-015's acceptance
+  criteria still contains the parenthetical "backup.sh offsite is cifs-only
+  today - a local-path offsite target is a separate ratified change". Both
+  describe a step that is now retired.
+- **A monitoring hole worth a decision:** with no offsite step, the backup's
+  never-silent-green report **cannot** see a stale cloud copy — after a reboot
+  IceDrive is down until someone opens a session, and the backup will still post
+  `ok=true`. If that should be watched it needs its own check (something that
+  looks at the client/cloud and feeds NagLight); that is a new decision, not
+  built here.
+- **A privacy-posture change worth noticing:** the Finance-Auditor §3 firewall
+  used to be enforceable by config review (`finance` must not appear in
+  `OFFSITE_SETS` — a line in a file). In the corrected model the cloud selection
+  lives in the IceDrive **GUI**, so nothing in this repo can prove raw finance
+  data is not being synced. The `.example`, the backup README and the remote-ui
+  README now say so in words, which is all a config repo can do.
+- Left alone on purpose: OI-12 (wall panel) — nothing built.

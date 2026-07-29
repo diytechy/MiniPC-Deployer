@@ -11,24 +11,63 @@ Samba fixtures in WI-10.15 (see `docs/status.md`).
 
 | # | Step | Where |
 |---|---|---|
-| 1 | **source pulls** — ONE `BACKUP_SOURCES` table, three source kinds (SR-013): `//host/share` (cifs-mount + `rsync`), `volume:VOL[@CONTAINER]` (rsync from the docker volume's mountpoint, optional stop→copy→restart quiesce), `path:/dir` (local rsync) | `backup.sh` + `source_kind` |
+| 1 | **source pulls** — an optional **Wake-on-LAN pre-step** for a source box that is allowed to sleep (`BACKUP_WAKE_MAC`; wait for tcp/445, LOUD failure on timeout), then ONE `BACKUP_SOURCES` table, three source kinds (SR-013): `//host/share` (cifs-mount + `rsync`), `volume:VOL[@CONTAINER]` (rsync from the docker volume's mountpoint, optional stop→copy→restart quiesce), `path:/dir` (local rsync) | `backup.sh` + `wake_and_wait` + `source_kind` |
 | 2 | **archive + compress** — `tar` per set, `zstd` **where applicable** (already-compressed sets stored as plain `.tar`) | `backup.sh` + `compression_decision` |
 | 3 | **hash + verify + manifest** — per-file sha256 table + archive sha256 + integrity test; a recovery MANIFEST | `backup.sh` |
 | 4 | **external-drive target** — dated `run_<UTC>` snapshot with retention (`BACKUP_KEEP`) | `backup.sh` |
-| 5 | **offsite push** — cifs-mount the IceDrive-synced share, push selected sets | `backup.sh` |
-| 6 | **report** — POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) | `common.sh` `feed_naglight` |
+| 5 | **offsite** — copy selected sets into the IceDrive-synced folder: `OFFSITE_PATH=/abs/dir`, a **local** dir the on-box IceDrive client syncs (primary — OI-11), or the legacy `OFFSITE_UNC` cifs push to a remote share | `backup.sh` `offsite_stage` |
+| 6 | **report** — POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9) | `common.sh` `feed_naglight` |
 
 ## Files
 
 ```
 backup.sh            orchestrator (the six steps; --config, --dry-run)
 restore.sh           reconstruct + byte-verify a set from a run (the recovery half)
-common.sh            shared helpers (logging, cifs mount, compression policy, feed, drive power)
+common.sh            shared helpers (logging + die/report hook, wake-on-LAN, cifs mount,
+                     compression policy, feed, drive power)
 backup-standby.sh    boot-time DEFAULT STANDBY oneshot (WI-10.10 drive power)
 backup.env.example   every knob
 systemd/awow-backup.{service,timer}   nightly root oneshot + persistent timer
 systemd/backup-standby.service        per-boot backup-drive spin-down default
 ```
+
+## Waking a source box that sleeps (step 1 pre-step)
+
+The Windows game box exposes **one** share and is allowed to **sleep**, so the
+run wakes it before pulling: send a Wake-on-LAN magic packet, then block until
+the host answers **tcp/445** (the SMB port the pull actually needs), re-sending
+the packet every 15 s.
+
+- **The packet is best-effort; the wait is the truth.** The run proceeds only
+  once the port answers. If the box was never asleep the probe short-circuits
+  and no packet is sent.
+- **A wake timeout FAILS THE RUN, loudly** — `ok=false` to the feed and a
+  nonzero exit. Never-silent-green means a source that failed to *wake* must
+  never be mistaken for a source with nothing new to copy.
+- **No new dependency:** the packet goes out over bash's own `/dev/udp`.
+  Bash cannot set `SO_BROADCAST` on that socket, so some kernels refuse a
+  broadcast destination — `wakeonlan` (or `etherwake`) is then used
+  automatically if installed, and the log says plainly when neither worked.
+- Knobs: `BACKUP_WAKE_MAC` (**empty = the feature is off**), `BACKUP_WAKE_HOST`,
+  `BACKUP_WAKE_TIMEOUT` (default 120 s), plus optional `BACKUP_WAKE_BROADCAST` /
+  `BACKUP_WAKE_IFACE`. The **Windows side** must also have "Wake on Magic
+  Packet" enabled on the wired adapter and **Fast Startup off** — hybrid
+  shutdown leaves the NIC unable to wake.
+
+## Offsite target (step 5) — local folder, or the legacy remote share
+
+`OFFSITE_PATH=/abs/dir` is the primary form (**OI-11, ratified 2026-07-25**): a
+**local** directory that the IceDrive client — running on *this* box in the
+SR-015 opt-in RDP session — syncs to the cloud. The backup only lands the
+files; the upload is the client's job. The directory must already exist, so a
+typo'd path can't report green with the files sitting where nothing syncs.
+Before relying on it, read [../remote-ui/README.md](../remote-ui/README.md): the
+client is a GUI app, so **sync is down after every reboot until one RDP session
+is opened**.
+
+`OFFSITE_UNC=//host/share` (cifs push to another host's synced share) is the
+**legacy** form, still supported for a box not yet migrated and used by the sim.
+Setting **both is a config error**, caught at run start.
 
 ## Drive power / spin-down (WI-10.10 DRIVE POWER DESIGN)
 
@@ -137,3 +176,8 @@ the empty-device no-op) with a mock-`hdparm` shim.
 (archive/restore byte-equality, quiesce ordering, failure-path restart +
 `ok=false`, cifs-only zero-docker no-op) with a mock-`docker` shim.
 See `sim/README.md`.
+
+**Honest gap:** those legs still drive the **legacy** `OFFSITE_UNC` offsite form
+(they are the regression net for it) — the `OFFSITE_PATH` local target and the
+wake pre-step do **not** have sim legs yet; see `docs/status.md` for what was
+exercised instead.

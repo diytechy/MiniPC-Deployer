@@ -132,10 +132,15 @@ render_seed_tree() {
     if [ -n "${SITE_DIR:-}" ] && [ -f "$SITE_DIR/user-data.filled" ]; then
         log "PRODUCTION: using $SITE_DIR/user-data.filled (real key + hash; no sim substitution)"
         cp "$SITE_DIR/user-data.filled" "$user_data_out"
-        grep -q "REPLACE_WITH" "$user_data_out" && \
-            die "user-data.filled still contains a REPLACE_WITH placeholder — re-run Materialize-Deploy.ps1 and fix what it names."
-        grep -q "allow-pw: true" "$user_data_out" && \
-            die "user-data.filled has allow-pw: true — production is SSH-key-only (WI-10.12). Refusing to bake it."
+        # Both guards are ANCHORED to an active YAML setting, not a substring.
+        # The stock user-data carries instructional COMMENTS mentioning both
+        # "allow-pw: true" and "REPLACE with your real public key(s)", so a
+        # naive grep refuses a perfectly good production build (caught
+        # 2026-07-30 the first time a real user-data.filled was produced).
+        grep -Eq '^[[:space:]]*[A-Za-z_-]+:.*REPLACE_WITH' "$user_data_out" && \
+            die "user-data.filled has an active setting still holding a REPLACE_WITH placeholder — re-run Materialize-Deploy.ps1 and fix what it names."
+        grep -Eq '^[[:space:]]*allow-pw:[[:space:]]*true' "$user_data_out" && \
+            die "user-data.filled sets allow-pw: true — production is SSH-key-only (WI-10.12). Refusing to bake it."
     else
     sed \
         -e "s#- \"ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host\"#- \"$ssh_pubkey\"#" \

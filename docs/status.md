@@ -106,31 +106,44 @@ last) — it is the record, not required reading for every pass.
       `/dev/udp` broadcast is accepted or whether `apt-get install wakeonlan` is
       needed for the fallback — bash cannot set `SO_BROADCAST`, and the WSL
       kernel used for this session's testing REFUSED it.
-    - OI-12 — **Second image target proposed (2026-07-25): the office wall
-      panel.** The Owner is adding a wall-mounted ambient panel (Acer Aspire R 14,
-      chassis N15P6) showing NagLight + a Navidrome-fed music player + a family
-      photo/video frame. Brief: `Personal\OFFICEWALL_BOOTSTRAP.md`. It overlaps
-      this repo almost entirely at the image layer — autoinstall skeleton, ISO
-      assembly, payload bake, secret materialisation, SSH/unattended-upgrades
-      posture — so the **recommended** split (the Owner's D-W0) is that the *image*
-      becomes a **second target in this repo** while the panel's *shell app*
-      lives in the `OfficeWallNaglight` repo and is consumed exactly as
-      `naglight:local` is (the IF-001 pattern), preserving this repo's
-      "no product source" constraint. **Nothing is built here yet.** Three
-      things would land in this repo if ratified:
-      (a) a `wall.<domain>` Caddy site that is panel-IP-restricted (`/32`,
-      not the LAN CIDR), **strips** any client-supplied `X-Forwarded-User`/
-      `-Email` before injecting the panel's identity, and `respond 403`s
-      everything else — note the DDNS wildcard already resolves that name
-      publicly, so the 403 default needs an explicit **off-LAN** test. This
-      deliberately bypasses oauth2-proxy (a keyboard-less panel cannot complete
-      an interactive OAuth consent) and is therefore a **security-relevant
-      change requiring ratification** — SR-004's "trusted headers are only
-      honoured from oauth2-proxy" premise gains a second injector;
-      (b) the graphical/kiosk autoinstall variant + its own SN/SR rows (the
-      panel's needs are not SN-001's headless zero-click needs);
-      (c) enabling the `navidrome` tier-2 profile, which re-raises **OI-7(b)**
-      — `MEDIA_ROOT`'s physical location — as a blocker rather than a nicety.
+    - OI-12 — **RATIFIED 2026-07-29 (the Owner) — the wall-panel image lane is
+      GO**, in the belt-and-braces variant he chose: the kiosk auth site on a
+      **LAN-bound alternate port the router never forwards, PLUS the `/32`
+      allow-list** (not either one alone). Proposed 2026-07-25; brief:
+      `Personal\homelab\OFFICEWALL_BOOTSTRAP.md`. **BUILT 2026-07-29** — see the
+      audit entry below. The D-W0 split holds: the *image* is now a second target
+      in this repo (`stack/autoinstall/wall/`), the panel's *shell app* stays in
+      `OfficeWallNaglight` and is consumed as a built artifact (IF-005), so the
+      "no product source" constraint is intact. What landed, against the three
+      things this item said would:
+      (a) the kiosk site — DONE (SR-016), and the forged-header strip + the 403
+      default are **sim-proven** (`validate-sim.sh` checks 7-8). The **off-LAN**
+      403 from a real WAN vantage remains the documented hardware test;
+      (b) the graphical autoinstall variant + its own spine rows — DONE
+      (SR-017, SN-013 per OI-12b: lighter gates, the panel is disposable);
+      (c) `navidrome` is **no longer a gate** — D-W8's rider has the panel playing
+      from its local synced copy, so streaming is optional, and `MEDIA_ROOT`'s
+      ratification (2026-07-29) closed OI-7(b) anyway. The Caddyfile ships the
+      `/music` proxy commented.
+      **Still needing the Owner:** the values (`WALL_HOST`, `PANEL_IP`,
+      `PANEL_USER_SUB`, `WIFI_*` — all T1/T3, placeholders only in this repo per
+      SN-007), the panel's **DHCP reservation on its hardware MAC**, the
+      `EXTRA_SUBDOMAINS` label, registering the wall templates in
+      `Personal\homelab\deploy\FieldSchema.psd1` (see the audit entry for the
+      exact snippet and two cross-repo consequences), and the whole of
+      `stack/autoinstall/wall/WALL-BURN-IN.md`.
+    - OI-15 — **`/media/*` has no origin, and it is a real decision
+      (2026-07-29, NEW):** the panel's shell resolves its local-library manifest
+      and frame playlist as `/media/…` relative paths, which must be on the
+      shell's OWN origin (NagLight sends no CORS headers). But the ratified design
+      has that media on the **panel's** disposable cache, and the origin is a Caddy
+      site on the **AWOW**. So the kiosk site structurally cannot serve it. The
+      likely answer is panel-side — the Electron container intercepting `/media/*`
+      for its local cache — which is `OfficeWallNaglight`'s call, not the image's;
+      the AWOW-side alternative (a `file_server` over `MEDIA_ROOT`) is *streaming*,
+      which is what D-W8 chose against. Marked `TODO(OI-15)` in
+      `stack/caddy/Caddyfile` with the commented stub, deliberately not decided
+      here.
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)
@@ -145,7 +158,14 @@ last) — it is the record, not required reading for every pass.
       — see the 2026-07-29 audit entry. Still owed: an assertion inside the
       committed sim legs (they exercise ERR-trap failures, not `die`).
 - **Assumptions (unattended):** see the Assumptions log below.
-- **Next action:** the Owner reviews + pushes; fills in the wake values + the
+- **Next action:** the Owner reviews + pushes; **for the newly-built wall lane
+  (OI-12): fills in `WALL_HOST`/`PANEL_IP`/`PANEL_USER_SUB`/`WIFI_*`, gives the
+  panel a DHCP reservation on its hardware MAC, confirms the router forwards
+  :80/:443 and NOTHING else, registers the two wall templates in
+  `Personal\homelab\deploy\FieldSchema.psd1`, and works
+  `stack/autoinstall/wall/WALL-BURN-IN.md` on a desk before the panel is
+  mounted**; decides OI-15 (`/media/*`'s origin) with the OfficeWallNaglight
+  side; fills in the wake values + the
   Windows-side WoL settings (OI-13) and the real ingest/exclusion values
   (OI-14); points the on-box IceDrive client at the chosen library paths
   (OI-11); creates the Google OAuth client
@@ -203,6 +223,8 @@ last) — it is the record, not required reading for every pass.
 | Backup pipeline (cifs + offsite + feed + restore drill) | GREEN (`run-backup-sim.sh`, re-run 2026-07-29 after the ingest/exclusion change); drive-power + volume-source call contracts GREEN (mock-shim legs) — drive spin-down physics + real-docker volume copy are V3/burn-in |
 | **INGEST step (library mirror) + EXCLUSIONS** | **GREEN — committed sim leg `run-ingest-sim.sh` (2026-07-29), 28 checks over the REAL cifs path:** mirror byte-identical to the live share + restore byte-equal, `--delete` deletion propagation asserted, global+per-set patterns kept out of archive AND `files.tsv` while every excluded path is named in the log/`<set>.excluded.log`/MANIFEST, empty-share refusal + its override, 3 loud config failures each posting `ok=false`. Untested by anything: a real Windows share as the ingest source, and real library-scale volumes (V3/burn-in) |
 | Wake-on-LAN pre-step + OI-9 `die` reporting | **Exercised for real on WSL2 (2026-07-29)** — magic-packet bytes, probe, timeout-dies-loudly, `die` paths posting `ok=false` — the wake half from a THROWAWAY harness, **not a committed sim leg**; the `die`-reports-`ok=false` contract is now asserted for real in `run-ingest-sim.sh` (e1–e3, plus the empty-share refusal). A real magic packet has never woken a real box (V3/hardware). `OFFSITE_PATH` needs no leg — the offsite step is retired (OI-11) |
+| **Wall kiosk site (SR-016) — the identity swap + the 403 default** | **GREEN — committed sim legs, `validate-sim.sh` checks 7-8 (2026-07-29):** a FORGED `X-Forwarded-User` arriving from the panel's `/32` reaches the tracker as `PANEL_USER_SUB` (read back off `/api/export`'s filename, so the identity the tracker actually saw is asserted, not inspected); the panel's `/api/today` is 200 and `/` serves the shell build without swallowing `/api/*`; the same two requests from a NON-panel source address get 403 with **Caddy's own body**, proving refusal at the edge rather than at the tracker. Untested by anything below hardware: the **off-LAN** 403 from a real WAN vantage, and whether Docker's port publish preserves the panel's source IP on the real box (it fails CLOSED if not) |
+| **Wall panel image (SR-017)** | **CONFIG-LEVEL ONLY, and that is all it claims.** A throwaway container harness ran `wall-firstboot.sh` twice against a bare `ubuntu:24.04` root with stub `systemctl`/`udevadm`/`netplan` — 27 assertions PASS on what it writes (lid conf, iio mask, the udev rule from both piped names + its re-enable hint, NM powersave/MAC pinning, netplan rendered 0600 with no `@@TOKEN@@` left, both timers re-rendered from a changed schedule, tty1-only autologin, mem_sleep reporting) — **not a committed sim leg.** NOTHING physical has run: no graphical session, no `cage`, no Wi-Fi association, no suspend/resume, no quirk verified against the actual panel. `WALL-BURN-IN.md` is the list |
 | Q10.9 B+ image payload: `export-images.sh` save + `docker load` all 9 | PASS (WSL; loads idempotent) — first-boot load-at-VM awaits V3; **oauth2-proxy v7.15.2 pin bump needs a re-export + sim re-run (OI-7c)** |
 | Tier-2 pins exist on their registries (`docker manifest inspect`) | PASS — but tier-2 services have never been STARTED anywhere (enable-time validation, stack/README §9) |
 | Shell scripts `bash -n` | PASS |
@@ -215,7 +237,9 @@ last) — it is the record, not required reading for every pass.
 What only V3/hardware can still prove: real Google consent, publicly-trusted
 ACME certs, Technitium on the host's real `:53`, the `extra_hosts` dns.<domain>
 fix, drive spin-down physics, thermals — then the burn-in checklist
-(stack/README §6) signs the box off.
+(stack/README §6) signs the box off. For the **panel**, add: the off-LAN 403, the
+graphical session, Wi-Fi, S3 suspend/resume, and all six hardware quirks
+(`stack/autoinstall/wall/WALL-BURN-IN.md`).
 
 ## Gate Sign-offs
 
@@ -297,6 +321,32 @@ Scaffolding created. Starting G1.
   visibility is implemented with rsync's own `--debug=FILTER` decisions
   (`<set>.excluded.log`) plus a new `excludes` MANIFEST column — the column is
   additive, so runs written before it restore unchanged. Revert any of these at
+  the next gate if wrong.
+
+- A9 — Wall-lane shape (2026-07-29; OI-12 and the LAN-port+/32 variant were
+  ratified, these mechanics were not): `WALL_PORT` defaults to **8443** and is a
+  **T0** knob (no FieldSchema entry — the default is the public value); the site
+  address carries no `bind` directive because `LAN_IP` is not an address the caddy
+  container owns, so the LAN-binding is the compose **publish** instead; the 403
+  body is the distinct string `wall: panel only` **specifically so the sim can tell
+  an edge refusal from the tracker's own no-identity 403**; the shell's document
+  root lives at `stack/wall-shell/` (i.e. `/opt/awow-core/stack/wall-shell` on the
+  box) rather than a sibling of the stack dir, so the existing bind-mount coverage
+  check applies to it; `/api/*` is the only proxied prefix (`/drill` is left to the
+  shell, which renders its own from `items[]`); the panel's payload lands at
+  **`/opt/wall-panel/`** and its env file at `/etc/wall-panel/wall.env` (0600),
+  mirroring the AWOW's layout without sharing it; `PANEL_USER_SUB` is deliberately
+  **absent** from `wall.env.example` (the panel never learns its own identity — the
+  site injects it) and `NAVIDROME_*`/`PANDORA_*` ship **commented**, because
+  un-commenting them makes the household emitter demand store keys for an optional
+  feature; the kiosk session is reached by a **tty1 autologin + profile hook**
+  rather than a system unit, because `cage` needs a logind seat (with `seatd`
+  installed as the documented fallback); `SLEEP_RTC_WAKE` is a new knob beyond the
+  ratified two, and if the RTC alarm cannot be armed the panel **refuses to
+  suspend** and degrades to backlight-off for that window (a reachable panel beats
+  a dark one); `mem_sleep_default=deep` is **reported, never silently written** to
+  the kernel cmdline; the quirk-3 udev rule is generated from a **pipe-separated**
+  knob and is not written at all when that knob is empty. Revert any of these at
   the next gate if wrong.
 
 ### DRIVER — G1 — Round 1 — 2026-07-03 (migration + spine)
@@ -1384,3 +1434,162 @@ listed as **A8** and the things only the Owner can supply are **OI-14**.
 ### DRIVER — G1 — Round 1 — 2026-07-29 (SR-013/SR-015 wording currency — the Owner's sanction)
 
 The two stale ratified wordings flagged above are now current per the Owner's 2026-07-29 sanction (SR-013 flow drops offsite → README step 5 legacy; SR-015's deferred offsite question marked settled; SN-010/SN-012 sentences matched) — wording only, nothing ran; `scripts/check.py` PASS.
+
+### DRIVER — G1 — Round 1 — 2026-07-29 (OI-12 RATIFIED: the wall-panel image lane, built)
+
+The Owner ratified OI-12 with a specific, stronger variant than either option on
+the table: the kiosk auth site sits on a **LAN-bound alternate port the router
+never forwards, PLUS the `/32` allow-list** — belt and braces, not either alone.
+Built here. New decisions taken unattended are recorded as **A9**; the things only
+the Owner can supply are folded into OI-12 above, and one genuine cross-repo
+decision surfaced and was deliberately NOT taken (**OI-15**).
+
+**What was built**
+
+- **The kiosk site (SR-016)** — `{$WALL_HOST}:{$WALL_PORT}` in
+  `stack/caddy/Caddyfile`. Four guards, each independent and each documented as
+  load-bearing in the block's own banner: the injected `X-Forwarded-User`
+  **replaces** any client-supplied identity; `remote_ip {$PANEL_IP}/32` (one
+  address, never the LAN CIDR — guest Wi-Fi, IoT gear and an inbound-facing
+  Minecraft server share that network); the port published bound to `{$LAN_IP}`
+  with the router forwarding only :80/:443; and `respond 403` for everything else.
+  Inside, it serves the shell's static build from `stack/wall-shell/` **and**
+  proxies `/api/*` to `tracker:8787` — the same origin, because NagLight sends no
+  CORS headers (OfficeWallNaglight needs doc §3.2). `/music` ships as a commented
+  Navidrome stub. **The Caddyfile deliberately carries no `bind` directive:**
+  `LAN_IP` is not an address the container owns, so `bind` there would fail to
+  listen at all — the LAN-binding is the compose publish.
+- **The wall autoinstall variant (SR-017)** — `stack/autoinstall/wall/`: graphical
+  target (`cage` + tty1 autologin, no display manager), Wi-Fi-only netplan
+  rendered from placeholders, **no Docker and no Cockpit**, and every §3 quirk
+  expressed as config: logind lid ignore (1), `iio-sensor-proxy` masked (2), a
+  udev rule generated from `WALL_DISABLE_INPUT` (3), NM powersave-off +
+  `cloned-mac-address=permanent` (5). D-W4 is `SLEEP_MODE=suspend|backlight`
+  sharing ONE schedule, with the RTC alarm armed **before** suspending and a
+  per-boot unit re-enabling the ACPI `XHC` + USB device wakeup flags that do not
+  persist. Quirks 4b and 6 are not config at all (mount geometry, vent clearance,
+  a measured thermal baseline) and say so.
+- **The spine** — SN-013 + 8 edge rows, SR-016 (Demonstration) and SR-017
+  (Inspection), IF-005 `Planned` → **`Partial`** with the four remaining gaps
+  named. `validate_config.py` gained check 5: every namespaced knob a wall script
+  reads must be declared in `wall.env.example` (compose cannot see an
+  env-file-configured image), plus the wall variant's files and YAML.
+- **Docs** — architecture ("two images from one pipeline", the third auth model),
+  `stack/README` §10 (enable steps, the guards as a table, the cert analysis),
+  `REMOTE_MANAGEMENT` (the panel is reimage-not-repair), and
+  `WALL-BURN-IN.md` for everything only the hardware can settle.
+
+**RAN FOR REAL (WSL2 Ubuntu + docker-ce, Windows dev PC)**
+
+- **`sim/validate-sim.sh` — V1 GATE PASS, all 8 checks**, including the two new
+  wall legs. The stack was brought up fresh (`sim/run-sim.sh`) because the overlay
+  now adds a network. The wall legs reach the site from two source addresses out
+  of ONE container: `simclient` sits on both the default network and a new
+  sim-only `simlan` (fixed subnet, static leases), so dialling Caddy's `simlan`
+  address arrives as `PANEL_IP` and dialling its default-network address does not.
+  Asserted: `forged X-Forwarded-User=sim-user-attacker-9999 from the panel /32
+  reached the tracker as sim-user-wallpanel-0003`; panel `/api/today` → 200;
+  panel `/` → the shell fixture and `/config.json` → 200; and both `/` and
+  `/api/today` from the non-panel route → **403 with Caddy's own body** (which is
+  what distinguishes an edge refusal from the tracker's own no-identity 403).
+- **THE SIM CAUGHT A REAL BUG ON ITS FIRST RUN, and it was the important one.**
+  The design brief's literal "strip then inject" — `header_up -X-Forwarded-User`
+  followed by a set of the same field — **does not work in Caddy**: header ops are
+  applied in a fixed order (add → set → **delete** → replace) regardless of the
+  order written, so the delete erased the injected identity, the tracker saw no
+  identity, and every panel request 403'd. Verified by reading the adapted JSON
+  (`caddy adapt` showed both a `delete` and a `set` of the same field) rather than
+  guessed. The site failed **closed**, which is the right direction — but it would
+  never have worked, and on hardware this would have looked like a panel fault.
+  Fixed by relying on set-replaces-all (asserted with the forged header, not
+  trusted) and a DO-NOT-ADD banner so it cannot come back.
+- **`caddy validate`** on the real (not sim) Caddyfile with placeholder env:
+  **Valid configuration** — and it confirmed automatic HTTPS treats the
+  alternate-port site as a normal HTTPS server (`srv1`, redirects enabled).
+- **A throwaway container harness** (scratch, not committed) ran
+  `wall-firstboot.sh` **twice** against a bare `ubuntu:24.04` root with stub
+  `systemctl`/`udevadm`/`netplan` on PATH — the mock-shim pattern this repo
+  already uses for `hdparm`/`docker`. **27 assertions PASS**, and it caught two
+  real bugs, both fixed: `printf '%s'` without a trailing newline made `read` skip
+  the **last** piped device name (the touchpad would have kept working), and a
+  redirect into a missing `/etc/udev/rules.d` / `/etc/netplan` aborted the whole
+  script on a minimal root. It also proves the honest-degradation paths: the
+  shipped placeholder template exits 0 while announcing that quirk 3 and netplan
+  were skipped, and writes no udev rule from nothing.
+- **The new config-validate check was negative-tested**: an undeclared
+  `${WALL_BOGUS_KNOB}` added to a wall script makes the run FAIL, so check 5 is
+  not vacuous.
+- **`python scripts/check.py` — G1 PASS**: config-validate (81 compose vars, 12
+  Caddyfile vars, 10 wall knobs, both `user-data` files parse), registry-integrity
+  `SN=13 SR=17 orphans=24 integrity=0`, doc-navigability 11 docs / 48 links /
+  **0 broken**.
+- **The certificate claim was verified against Caddy's docs AND source, not
+  assumed** (the ask was explicit about honesty here): automatic HTTPS activates on
+  the *hostname*, not the port, so a `:8443` site still gets a publicly-trusted
+  cert; ACME CAs **never** contact non-standard ports (HTTP-01 is always :80,
+  TLS-ALPN-01 always :443); and Caddy's ACME challenge handler runs in every HTTP
+  server ahead of route matching, dispatching on the requested hostname
+  process-wide — so the existing :80 listener answers for a name that has no
+  port-80 site block. **That last point is clear in Caddy's source but is NOT
+  stated in its documentation**, and `stack/README` §10 says exactly that rather
+  than presenting it as documented. The dependency it creates (inbound :80 must
+  stay forwarded, or renewal for this name breaks) is written down, with DNS-01
+  named as the fallback since a Cloudflare token already exists for DDNS.
+
+**NOT run (honest gap)**
+
+- **No panel, no hardware, nothing physical.** `cage` has never been started, no
+  Wi-Fi has been associated, no suspend or resume has happened, no lid has been
+  folded, no udev rule has been applied to a real input device, no backlight has
+  been dimmed and no RTC alarm has woken anything. Every §3 quirk fix is
+  *asserted as written config*, never as observed behaviour.
+- **The off-LAN 403 is still an assumption.** Every wall-site probe came from
+  inside a docker network. Nobody has curled the panel's hostname from cellular,
+  and nobody has confirmed the router's forward list. This is the single test the
+  design brief itself called out as load-bearing, and it remains owed.
+- **Docker's source-IP preservation is unproven on the real box.** The `/32` match
+  relies on the panel's real address reaching Caddy through the port publish. In
+  the sim the probes are on the same bridge, so this is untested; if it fails, the
+  site 403s the panel (fails closed, not open).
+- **The wall image harness is a throwaway, not a committed sim leg.** A graphical
+  kiosk session cannot be exercised in a compose sim, so unlike the wall *site*
+  there is no permanent regression net for the wall *image* — the same honesty
+  position as SR-015's opt-in RDP layer.
+- **IF-005 has no artifact**, so `WALL_APP_CMD` points at a placeholder and the
+  kiosk shows an explicit "not installed" screen. Nothing has ever run under
+  `cage`, including a stand-in.
+- **The payload-bake path was not extended to the wall image.** The wall variant is
+  not yet wired into `vmtest/export-images.sh` or the ISO builders; the panel needs
+  no container images, but which files a wall USB carries has not been implemented
+  or tested.
+- **shellcheck is still not installed** on this machine or in the WSL Ubuntu — not
+  run, not claimed. `bash -n` (clean on all four wall scripts) is the only static
+  shell checking done.
+
+**For the Owner / next gate**
+
+- **OI-12 rewritten as RATIFIED + BUILT**, with what still needs him listed there:
+  the four T1/T3 values, the panel's DHCP reservation on its hardware MAC, the
+  `EXTRA_SUBDOMAINS` label, the FieldSchema registration, and the burn-in.
+- **OI-15 (new) — `/media/*` has no origin.** A genuine decision, left untaken:
+  the shell's manifest paths must be same-origin, but the media is on the panel's
+  cache while the origin is a site on the AWOW. Marked `TODO(OI-15)` in the
+  Caddyfile with a commented stub. The likely answer is panel-side (Electron
+  intercepting `/media/*`), which belongs to OfficeWallNaglight.
+- **Two cross-repo consequences of registering the wall templates** in
+  `Personal\homelab\deploy\FieldSchema.psd1` (Personal is not edited from here —
+  reported instead): (i) `WALL_HOST`, `PANEL_IP` and `PANEL_USER_SUB` now appear in
+  the **AWOW's** `.env.example` too, because the kiosk site runs on the AWOW — so
+  they must move from `config.wall.psd1` to `config.common.psd1`, or the `awow`
+  image's completeness rule will refuse to emit; (ii) the wall `user-data` needs
+  the SSID and PSK substituted, but the emitter's `userdata` format substitutes
+  only the password hash and the SSH key — the placeholders were named
+  `REPLACE_WITH_WIFI_SSID` / `REPLACE_WITH_WIFI_PSK` so a generic
+  `REPLACE_WITH_<KNOB>` pass is a small change rather than a new format.
+- **A note on the panel-down alert:** it is required, not optional (quirk 4b), and
+  it is **not** in this repo — it is an Uptime-Kuma push monitor plus a Kuma→ntfy
+  notifier, configured in Kuma's UI, and its maintenance window must be taught the
+  sleep window or it will cry wolf every single night.
+- **`WALL_PORT` is a new T0 knob** (public default, `8443`) and needs no
+  FieldSchema entry; unlisted knobs are T0 by that schema's own rule.
+- Left alone on purpose: the ISO/payload wiring for the wall image, and OI-15.

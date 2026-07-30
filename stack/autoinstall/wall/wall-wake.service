@@ -1,0 +1,19 @@
+# Leave the wall panel's sleep window (D-W4). Triggered by wall-wake.timer, whose
+# OnCalendar is RENDERED by wall-firstboot.sh from SLEEP_END.
+#
+# In SLEEP_MODE=suspend the machine is already awake by the time this runs — the
+# RTC alarm armed at suspend time is the PRIMARY wake, and this unit only restores
+# the screen and leaves a journal line marking the boundary. In
+# SLEEP_MODE=backlight it is what turns the screen back on.
+#
+# Deliberately harmless in both modes: it must be safe to fire on a panel that
+# never slept (a mains blip during the window means it may have rebooted instead —
+# quirk 4b, no battery, no UPS — and Persistent=true will fire a missed boundary).
+[Unit]
+Description=Wall panel: leave the sleep window
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wall-sleep.sh end
+StandardOutput=journal
+StandardError=journal

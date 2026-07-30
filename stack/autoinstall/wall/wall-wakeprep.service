@@ -1,0 +1,19 @@
+# Per-boot wake-source enablement for the wall panel (D-W4).
+#
+# This is NOT a first-boot job: ACPI wake sources (/proc/acpi/wakeup) and USB
+# device wakeup flags do NOT persist across a reboot, so they must be re-applied
+# every single boot or the mouse silently stops being able to wake the panel.
+[Unit]
+Description=Enable the wall panel's wake sources (ACPI USB controller + USB devices)
+# Late enough that USB devices are enumerated — the flags are per-device.
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wall-wakeprep.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

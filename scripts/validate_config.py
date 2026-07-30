@@ -12,7 +12,12 @@ Checks (each prints PASS/FAIL; nonzero exit if any FAIL):
      hands it).
   3. Every host path in a compose bind-mount (`./x:...`) exists in the repo
      (an .example stand-in counts, since the real file is gitignored/seeded).
-  4. Files referenced by autoinstall late-commands under the stack exist.
+  4. Files referenced by autoinstall late-commands under the stack exist — for
+     BOTH image targets (the AWOW core and the wall panel variant).
+  5. Every knob the wall panel's scripts read has a key in wall.env.example.
+     The wall variant is configured by a shell-sourced env file rather than by
+     compose, so check 1 cannot see it: without this, adding a `$WALL_FOO` read
+     to a script would ship a silently-unset knob.
 
 Stdlib only; regex-based (no PyYAML on the dev box). It does not claim to parse
 YAML fully — it validates variable/file *coverage*, which is what a config repo
@@ -88,6 +93,55 @@ def caddy_env_passed(compose_text):
             if m:
                 passed.add(m.group(1))
     return passed
+
+
+# The wall panel variant is configured by a shell-sourced env file, not by
+# compose, so its knobs live in these NAMESPACES by convention. A reference to
+# `${WALL_...}`/`${WIFI_...}`/`${SLEEP_...}`/`${NAVIDROME_...}`/`${PANDORA_...}`
+# in a wall script is therefore a KNOB and must be declared in wall.env.example;
+# anything else (ENV_FILE, MARKER, loop variables) is a local and is ignored. The
+# namespace rule is what keeps this check free of false positives as the scripts
+# grow — add a namespace here if a genuinely new family of knobs appears.
+WALL_KNOB_NAMESPACES = ("WALL_", "WIFI_", "SLEEP_", "NAVIDROME_", "PANDORA_")
+
+
+def is_wall_knob(name):
+    return name.startswith(WALL_KNOB_NAMESPACES)
+
+
+def wall_env_keys(text):
+    """Knob names declared in wall.env.example, INCLUDING commented-out ones.
+
+    A commented `# NAVIDROME_USER=…` is a deliberate declaration of an optional
+    knob (un-commenting it makes the household secret tooling demand its store
+    key), so it counts as declared — the check is "is this knob documented",
+    not "is this knob active"."""
+    keys = set()
+    for line in text.splitlines():
+        m = re.match(r"#?\s*([A-Za-z_][A-Za-z0-9_]*)=", line.strip())
+        if m:
+            keys.add(m.group(1))
+    return keys
+
+
+def wall_knob_refs(paths):
+    """Every namespaced knob a wall script/template/user-data actually reads.
+
+    Covers the three substitution mechanisms the wall variant uses: shell
+    `${KNOB}` / `$KNOB` reads, `@@KNOB@@` template placeholders (netplan), and
+    `REPLACE_WITH_KNOB` tokens in the autoinstall user-data (which the household
+    materialiser substitutes)."""
+    refs = set()
+    for p in paths:
+        text = load(p)
+        if not text:
+            continue
+        found = re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", text)
+        found += re.findall(r"\$([A-Z][A-Z0-9_]*)", text)
+        found += re.findall(r"@@([A-Za-z_][A-Za-z0-9_]*)@@", text)
+        found += re.findall(r"\bREPLACE_WITH_([A-Z][A-Z0-9_]*)", text)
+        refs.update(n for n in found if is_wall_knob(n))
+    return refs
 
 
 def bind_mount_paths(compose_text, stack):
@@ -166,11 +220,51 @@ def main():
         "autoinstall/powertune.sh",
         "backup/systemd/backup-standby.service",
         "backup/backup-standby.sh",
+        # The WALL panel variant (SR-016/SR-017): a second image target with its
+        # own late-commands, so it needs its own coverage. Every file below is
+        # cp'd or enabled by autoinstall/wall/user-data.
+        "autoinstall/wall/meta-data",
+        "autoinstall/wall/wall.env.example",
+        "autoinstall/wall/wall-firstboot.service",
+        "autoinstall/wall/wall-firstboot.sh",
+        "autoinstall/wall/wall-wakeprep.service",
+        "autoinstall/wall/wall-wakeprep.sh",
+        "autoinstall/wall/wall-sleep.service",
+        "autoinstall/wall/wall-wake.service",
+        "autoinstall/wall/wall-sleep.sh",
+        "autoinstall/wall/wall-kiosk.sh",
+        # Read by wall-firstboot.sh rather than by user-data, but just as fatal
+        # if absent — a panel with no netplan has no network at all (no RJ45).
+        "autoinstall/wall/netplan-wifi.yaml.template",
     ):
         check(
             (stack / ref).exists(),
             "autoinstall file present: stack/{}".format(ref),
             "autoinstall file missing: stack/{}".format(ref),
+        )
+
+    # 5. wall-panel knob coverage (the .env-example equivalent for image 2).
+    wall_dir = stack / "autoinstall" / "wall"
+    wall_env = wall_dir / "wall.env.example"
+    if wall_env.exists():
+        declared = wall_env_keys(load(wall_env))
+        consumers = [
+            wall_dir / "wall-firstboot.sh",
+            wall_dir / "wall-sleep.sh",
+            wall_dir / "wall-wakeprep.sh",
+            wall_dir / "wall-kiosk.sh",
+            wall_dir / "netplan-wifi.yaml.template",
+            wall_dir / "user-data",
+        ]
+        used = wall_knob_refs(consumers)
+        undeclared = sorted(used - declared)
+        check(
+            not undeclared,
+            "every wall-panel knob is declared in wall.env.example ({} knobs)".format(
+                len(used)
+            ),
+            "wall knobs read but NOT declared in wall.env.example: "
+            + ", ".join(undeclared),
         )
 
     # 5. YAML parse (optional — needs PyYAML; SKIP cleanly if absent so this stays
@@ -183,6 +277,9 @@ def main():
             "docker-compose.yml",
             "autoinstall/meta-data",
             "autoinstall/user-data",
+            # Image target 2 — the wall panel. Same #cloud-config YAML contract.
+            "autoinstall/wall/meta-data",
+            "autoinstall/wall/user-data",
         ):
             f = stack / rel
             if f.exists():

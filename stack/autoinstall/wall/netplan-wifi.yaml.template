@@ -1,0 +1,40 @@
+# TEMPLATE — rendered to /etc/netplan/60-wall-wifi.yaml (mode 0600) by
+# wall-firstboot.sh, which substitutes @@WIFI_SSID@@ / @@WIFI_PSK@@ from
+# /etc/wall-panel/wall.env. This file is tracked; the RENDERED one never is.
+#
+# The panel is Wi-Fi ONLY — the Aspire R5-471T has no RJ45 (hardware baseline
+# 2026-07-26), so this is the panel's single path to the LAN. Two settings here
+# are quirk 5, and both matter more than they look:
+#
+#   macaddress: permanent
+#     Use the hardware MAC, never a randomized one. The panel needs a DHCP
+#     RESERVATION, and the kiosk site's /32 allow-list is keyed to the address
+#     that reservation hands out — so MAC randomization does not merely change an
+#     address, it silently locks the panel out of NagLight.
+#
+#   powersave is NOT set here
+#     Wi-Fi power-save is a NetworkManager setting, not a netplan one; it is
+#     disabled in /etc/NetworkManager/conf.d/99-wall-wifi.conf.
+#
+# `renderer: NetworkManager` because the same daemon owns the powersave setting;
+# mixing renderers on one interface is how you get a panel that is up but
+# unreachable.
+network:
+  version: 2
+  renderer: NetworkManager
+  wifis:
+    wlan0:
+      match:
+        name: "wl*"
+      set-name: wlan0
+      dhcp4: true
+      dhcp4-overrides:
+        # Take DNS from the AWOW box via DHCP: the kiosk hostname resolves to the
+        # AWOW's LAN IP only through its split-horizon zone. A hard-coded public
+        # resolver here would send the panel out to the WAN address instead — and
+        # the wall port is not forwarded there, so the panel would 403 itself.
+        use-dns: true
+      access-points:
+        "@@WIFI_SSID@@":
+          password: "@@WIFI_PSK@@"
+      macaddress: permanent

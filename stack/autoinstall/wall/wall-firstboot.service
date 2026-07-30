@@ -1,0 +1,22 @@
+# First-boot oneshot for the OFFICE WALL PANEL: render every config file the §3
+# hardware quirks and the D-W4 sleep window need. Runs after the network is up,
+# stamps /opt/wall-panel/.provisioned, and is idempotent — re-running it after
+# editing /etc/wall-panel/wall.env is the SUPPORTED way to change the panel's
+# configuration (that is why it is not gated on the marker).
+[Unit]
+Description=Office wall panel first-boot configuration (quirk fixes, Wi-Fi, sleep window, kiosk autologin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wall-firstboot.sh
+# Short: this writes files, it does not pull or build anything (unlike the AWOW's
+# first boot, which loads a container payload).
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

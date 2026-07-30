@@ -1,0 +1,173 @@
+#cloud-config
+# Ubuntu Server autoinstall (cloud-init) for the OFFICE WALL PANEL — the second
+# image target of this repo (OI-12 / D-W0, ratified 2026-07-29).
+#
+# HOW THIS DIFFERS FROM ../user-data (the AWOW always-on core), and why:
+#   - GRAPHICAL, not headless: the deliverable is one fullscreen app on a wall,
+#     so this image installs a Wayland kiosk compositor (`cage`) and autologs a
+#     single unprivileged user into it. No desktop environment, no display
+#     manager, no login screen.
+#   - NO DOCKER, NO STACK: the panel is a thin client that holds nothing but a
+#     disposable cache. It runs no containers and hosts no services, so none of
+#     the AWOW's docker/compose/Technitium machinery is installed here.
+#   - Wi-Fi, not ethernet: the R5-471T has no RJ45 (hardware baseline,
+#     2026-07-26). Credentials come from wall.env (see wall-firstboot.sh).
+#   - LIGHTER GATES (OI-12b): the panel's needs are SN-013, not SN-001's
+#     headless zero-click bar. A panel that fails is REIMAGED, not repaired
+#     (REMOTE_MANAGEMENT.md) — nothing on it is precious.
+#   - Its own hardware quirk fixes: a wall-mounted convertible is a hostile
+#     configuration for default Linux power/input behaviour. Six quirks, each
+#     with a config-level fix, are applied by wall-firstboot.sh.
+#
+# SECURITY: this template ships with PLACEHOLDERS. The identity block (username +
+# SSH PUBLIC key) is materialised by the household secret tooling; never commit a
+# filled-in copy. The panel is SSH key-only, exactly like the AWOW.
+#
+# See ./README.md for the payload contract and ./WALL-BURN-IN.md for everything
+# only the real hardware can settle.
+
+autoinstall:
+  version: 1
+
+  # Non-interactive: the installer must never stop to ask. A panel being imaged
+  # is usually on a bench with no keyboard attached.
+  interactive-sections: []
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # ── Network: Wi-Fi only ─────────────────────────────────────────────────────
+  # The installer needs the network for apt, so the SSID/PSK are substituted into
+  # THIS block too (the same wall.env values wall-firstboot.sh renders netplan
+  # from). Two hardware-driven settings, both from quirk 5:
+  #   - `wifis` + a DHCP lease that must be RESERVED on the panel's HARDWARE MAC.
+  #     The kiosk site's /32 allow-list depends on that address never moving.
+  #   - MAC randomization OFF. The live boot showed it ON by default, which
+  #     silently breaks a reservation keyed to the real MAC.
+  # NetworkManager's powersave-off (also quirk 5) is applied post-install by
+  # wall-firstboot.sh — it is a NetworkManager setting, not a netplan one.
+  network:
+    version: 2
+    wifis:
+      wlan0:
+        match:
+          name: "wl*"
+        set-name: wlan0
+        dhcp4: true
+        # Never a random MAC: the DHCP reservation and the /32 both key off the
+        # permanent hardware address.
+        macaddress: permanent
+        access-points:
+          "REPLACE_WITH_WIFI_SSID":
+            password: "REPLACE_WITH_WIFI_PSK"
+
+  identity:
+    hostname: wall-panel
+    realname: "Office Wall Panel"
+    username: panel
+    # SSH KEY-ONLY (same posture as the AWOW): "!" is a locked hash, so there is
+    # no usable password login. The kiosk session is reached by AUTOLOGIN on tty1
+    # (wall-firstboot.sh writes the getty drop-in), which needs no password.
+    password: "!"
+
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      # REPLACE with your real public key(s). allow-pw:false means the panel is
+      # unreachable over SSH until at least one valid key is here — and while it
+      # is asleep (D-W4) it is unreachable regardless. See WALL-BURN-IN.md.
+      - "ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host"
+
+  # Whole-disk automatic layout (LVM), same shape as the AWOW image. The panel's
+  # disk is a 256 GB M.2 SATA (hardware baseline 2026-07-26; the machine shipped
+  # with no disk at all). Nothing here is precious — quirk 4b makes unclean
+  # power-cuts routine, which is survivable precisely because the panel is a
+  # cache. See WALL-BURN-IN.md for the fsck-must-not-block check.
+  storage:
+    layout:
+      name: lvm
+
+  packages:
+    - ca-certificates
+    - curl
+    - cage                 # single-surface Wayland kiosk compositor (the session)
+    - seatd                # seat management fallback if the logind seat path fails
+    - xdg-utils
+    - fonts-dejavu-core
+    - util-linux           # rtcwake — the PRIMARY wake source (D-W4)
+    - network-manager      # quirk 5: powersave off, and the netplan renderer
+    - alsa-utils           # audio sink pinning (WSN-012 lives in the app's runbook)
+    - pulseaudio-utils
+    - va-driver-all        # VA-API decode; quirk 6 says PROVE it is engaged
+    - vainfo
+    - unattended-upgrades  # same hands-off patching posture as the AWOW
+    - openssh-server
+
+  late-commands:
+    # ---- 1. Remote management (lighter than the AWOW's: no Cockpit) -----------
+    # A panel is reimage-not-repair, so it gets SSH + unattended-upgrades and
+    # deliberately NOT Cockpit — one less always-listening web surface on a box
+    # that is asleep half the time anyway.
+    - curtin in-target --target=/target -- bash -c 'echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections'
+    - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
+    - curtin in-target --target=/target -- systemctl enable unattended-upgrades
+
+    # ---- 2. Lighten the image ------------------------------------------------
+    # Nothing here uses snaps, and this is a 2016 U-class machine behind a wall.
+    - curtin in-target --target=/target -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd 2>/dev/null || true; apt-get autoremove -y --purge'
+
+    # ---- 3. Place the payload ------------------------------------------------
+    # Same mechanism as the AWOW image: the USB-build step copies the repo tree
+    # (plus the shell artifact) to /cdrom/deploy-payload and it lands under
+    # /opt/wall-panel/. The wall variant's files are then at
+    # /opt/wall-panel/stack/autoinstall/wall/.
+    - mkdir -p /target/opt/wall-panel
+    - cp -a /cdrom/deploy-payload/. /target/opt/wall-panel/ 2>/dev/null || cp -a /media/deploy-payload/. /target/opt/wall-panel/ 2>/dev/null || true
+
+    # ---- 4. Seed wall.env from the example if not pre-filled ------------------
+    # Root-only: it carries the Wi-Fi PSK and (if enabled) music credentials.
+    - curtin in-target --target=/target -- bash -c '[ -f /etc/wall-panel/wall.env ] || { mkdir -p /etc/wall-panel && cp /opt/wall-panel/stack/autoinstall/wall/wall.env.example /etc/wall-panel/wall.env && chmod 0600 /etc/wall-panel/wall.env; }'
+
+    # ---- 5. First-boot + per-boot units --------------------------------------
+    # wall-firstboot   — once: renders every config file the quirks need.
+    # wall-wakeprep    — EVERY boot: ACPI/USB wake enablement does not persist.
+    # wall-sleep/-wake — the D-W4 sleep window; their .timer files are RENDERED
+    #                    by firstboot from SLEEP_START/SLEEP_END (systemd cannot
+    #                    interpolate an env var into OnCalendar).
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.service /target/etc/systemd/system/wall-firstboot.service
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh /target/usr/local/sbin/wall-firstboot.sh
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-firstboot.sh
+    - curtin in-target --target=/target -- systemctl enable wall-firstboot.service
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.service /target/etc/systemd/system/wall-wakeprep.service
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.sh /target/usr/local/sbin/wall-wakeprep.sh
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-wakeprep.sh
+    - curtin in-target --target=/target -- systemctl enable wall-wakeprep.service
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sleep.service /target/etc/systemd/system/wall-sleep.service
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-wake.service /target/etc/systemd/system/wall-wake.service
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sleep.sh /target/usr/local/sbin/wall-sleep.sh
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sleep.sh
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-kiosk.sh /target/usr/local/bin/wall-kiosk.sh
+    - curtin in-target --target=/target -- chmod +x /usr/local/bin/wall-kiosk.sh
+    # Seat access for the kiosk user (cage needs the DRM/input devices).
+    - curtin in-target --target=/target -- usermod -aG video,input,render panel
+
+    # ---- 6. mem_sleep_default=deep — NOTE, deliberately NOT applied ----------
+    # D-W4 wants S3 ("deep"), not s2idle: on this hardware generation s2idle
+    # often saves little more than backlight-off, which would defeat L2 entirely.
+    # The 2026-07-26 baseline confirmed `deep` is SUPPORTED and a full
+    # suspend/resume cycle PASSED — but whether `deep` is the RUNNING DEFAULT is
+    # read off /sys/power/mem_sleep, which no one can do from here.
+    # wall-firstboot.sh therefore READS it and warns loudly if it shows
+    # `[s2idle] deep`. Editing the kernel cmdline is left as this ONE explicit
+    # command rather than done silently, because a bad cmdline on a wall-mounted
+    # machine with no keyboard is an unpleasant recovery:
+    #
+    #   sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 mem_sleep_default=deep"/' /etc/default/grub && update-grub
+    #
+    # Run it over SSH after the first boot IF firstboot reported s2idle, then
+    # re-run the suspend/resume test (WALL-BURN-IN.md §4).
+
+  # No reboot prompt — straight into the panel.
+  shutdown: reboot

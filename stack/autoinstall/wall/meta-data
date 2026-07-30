@@ -1,0 +1,6 @@
+# Empty NoCloud meta-data — required to sit beside the wall variant's user-data
+# for the autoinstall NoCloud datasource. A DISTINCT instance-id from the AWOW
+# image so cloud-init treats a panel as a fresh instance even if the same builder
+# stick was used for both.
+instance-id: wall-panel-001
+local-hostname: wall-panel

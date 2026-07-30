@@ -1,0 +1,18 @@
+# Enter the wall panel's sleep window (D-W4). Triggered by wall-sleep.timer,
+# whose OnCalendar is RENDERED by wall-firstboot.sh from SLEEP_START — systemd
+# cannot interpolate an env var into a timer, so the .timer file is generated
+# rather than tracked.
+#
+# Both SLEEP_MODEs share this one unit: the script decides whether "sleep" means
+# S3 suspend (arm the RTC alarm first, then suspend) or backlight-off, which is
+# what makes falling back to L1 a one-line config change.
+[Unit]
+Description=Wall panel: enter the sleep window
+# Do not fight a manual suspend/resume in progress.
+Conflicts=sleep.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wall-sleep.sh start
+StandardOutput=journal
+StandardError=journal

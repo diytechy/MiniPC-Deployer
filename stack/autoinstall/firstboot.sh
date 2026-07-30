@@ -13,7 +13,9 @@
 #   4. `docker compose up -d` — starts all services (images already loaded in step
 #      3; any not baked are pulled here) with restart:unless-stopped.
 #   5. Wait for Technitium to be healthy, then run provision-technitium.sh
-#      (zero-touch DNS: zone, split-horizon records, forwarders, blocklists).
+#      (zero-touch DNS: zone, split-horizon records, forwarders, blocklists);
+#      then provision-actual.sh (A9d: set the minted Actual server password
+#      on the un-bootstrapped server — idempotent no-op afterwards).
 #   6. Point the HOST resolver at the local Technitium so the box itself uses it.
 #   7. Stamp .provisioned.
 #
@@ -129,6 +131,13 @@ for i in $(seq 1 60); do
 done
 log "provisioning Technitium (zone + split-horizon + forwarders + blocklists)…"
 bash "$STACK_DIR/provision/provision-technitium.sh" --env "$STACK_DIR/.env"
+
+# ── 5b. Actual zero-touch bootstrap (A9d) ────────────────────────────────────
+# Sets the minted server password on the un-bootstrapped Actual so no UI step
+# stands between first boot and a working Finance-Auditor. Idempotent: an
+# already-bootstrapped server is a logged no-op.
+log "bootstrapping Actual (server password from FINANCE_ACTUAL_PASSWORD)…"
+bash "$STACK_DIR/provision/provision-actual.sh" --env "$STACK_DIR/.env"
 
 # ── 6. make the host itself use local DNS ────────────────────────────────────
 # systemd-resolved: point it at 127.0.0.1 so the box resolves its own zone.

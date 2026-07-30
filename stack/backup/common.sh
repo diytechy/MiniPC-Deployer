@@ -413,15 +413,37 @@ drive_standby_set() {
 # to the tracker with X-Forwarded-User) when NAGLIGHT_USER is set; single-user
 # otherwise. A reporting failure is logged but does not mask the backup's own
 # exit status.
+#
+# Transport: the tracker is BRIDGE-ONLY by design (D2/WI-10.5 — no host
+# publish, or the trusted headers would be forgeable from the LAN). A host-side
+# curl therefore cannot reach it, and the public tracker.<domain> route would
+# bounce through oauth2-proxy and overwrite X-Forwarded-User (defect found
+# 2026-07-30, Personal A9). When NAGLIGHT_FEED_CONTAINER is set the POST runs
+# INSIDE that container via docker exec + its busybox wget (present — the
+# healthcheck uses it), keeping the port closed; unset = direct curl (sim /
+# single-user setups where the URL is host-reachable).
 feed_naglight() {
     local ok="$1" note="$2"
     [ -n "${NAGLIGHT_FEED_URL:-}" ] || { log "feed: NAGLIGHT_FEED_URL unset — skipping report"; return 0; }
     local check="${NAGLIGHT_FEED_CHECK:-backup}"
     note="${note//\"/\'}"                                   # keep the JSON valid
     local body; body="$(printf '{"check":"%s","ok":%s,"note":"%s"}' "$check" "$ok" "$note")"
-    local hdr=(-H "Content-Type: application/json")
-    [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(-H "Authorization: Bearer ${NAGLIGHT_TOKEN}")
-    [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(-H "X-Forwarded-User: ${NAGLIGHT_USER}")
-    local code; code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null || echo 000)"
+    local code
+    if [ -n "${NAGLIGHT_FEED_CONTAINER:-}" ]; then
+        local whdr=(--header "Content-Type: application/json")
+        [ -n "${NAGLIGHT_TOKEN:-}" ] && whdr+=(--header "Authorization: Bearer ${NAGLIGHT_TOKEN}")
+        [ -n "${NAGLIGHT_USER:-}" ]  && whdr+=(--header "X-Forwarded-User: ${NAGLIGHT_USER}")
+        if docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -O /dev/null "${whdr[@]}" \
+                --post-data "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null; then
+            code=200                       # busybox wget: exit 0 == HTTP 2xx
+        else
+            code=000
+        fi
+    else
+        local hdr=(-H "Content-Type: application/json")
+        [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(-H "Authorization: Bearer ${NAGLIGHT_TOKEN}")
+        [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(-H "X-Forwarded-User: ${NAGLIGHT_USER}")
+        code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null || echo 000)"
+    fi
     if [ "$code" = "200" ]; then log "feed: reported ok=$ok (HTTP 200)"; else warn "feed: report ok=$ok got HTTP $code"; fi
 }

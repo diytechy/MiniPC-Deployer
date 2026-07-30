@@ -1900,3 +1900,47 @@ wake behaves like a boot for freshness. Zero new knobs, one new file.
   start wall-sync.service` was run in between. Music added during the panel's
   awake hours still needs the on-demand command (or waits for tomorrow's
   resume); that is the shape of option (a), stated rather than hidden.
+
+---
+
+### 2026-07-30 — Owner-directed automation sweep (Personal open-items A9) + feed-transport defect fix
+
+Four changes landed this pass, driven by the Owner's ruling that box/LAN-local
+configuration should self-configure wherever the trust model allows:
+
+- **`FINANCE_ACTUAL_SYNC_ID` is now optional** (`stack/.env.example`): empty =
+  finance-auditor auto-discovers the sole budget file at startup (its own repo
+  change, `getBudgets()`/`cloudFileId` verified against the pinned
+  `@actual-app/api` 26.7.0 types); several files = fatal naming them.
+- **Backup feeder transport fixed** (`stack/backup/common.sh feed_naglight` +
+  `backup.env.example`): the shipped example URL pointed at the public
+  tracker route, which oauth2-proxy would bounce and whose `X-Forwarded-User`
+  it would overwrite — and the tracker is deliberately bridge-only (D2), so a
+  host-side curl cannot reach it at all. New `NAGLIGHT_FEED_CONTAINER` knob
+  (default `tracker`): the POST runs inside the tracker container via
+  `docker exec` + its busybox wget (the same binary its healthcheck proves)
+  against its own loopback. Port stays closed. **Sim-untested**: `bash -n`
+  clean; the AWOW-sim backup lane is the gate.
+- **`provision/provision-actual.sh` (NEW) + firstboot step 5b**: sets the
+  dev-PC-minted Actual server password on the un-bootstrapped server
+  (`POST /account/bootstrap`, checked via `GET /account/needs-bootstrap`
+  first; idempotent — an already-bootstrapped server is a logged no-op, with
+  mismatch guidance). Runs inside the `actual` container via
+  `docker exec node -e` + fetch (image ships no curl/wget, WI-10.14; password
+  via exec env, never argv). **HONEST STATE: the endpoint shape is from
+  actual-server source reading, NOT yet exercised against the pinned
+  `ACTUAL_IMAGE_TAG` in the sim — that sim run is the acceptance gate for
+  this script.** `bash -n` clean.
+- **`provision/list-tracker-users.sh` (NEW, read-only)**: prints the per-user
+  dir names (= Google `sub` values) under the tracker volume so the Owner can
+  fill `NAGLIGHT_USER`/`PANEL_USER_SUB` without spelunking. Deliberately NOT
+  auto-discovery for `PANEL_USER_SUB` — that is the unauthenticated identity
+  the kiosk injects (security-critical per the Caddyfile banner); the ruling
+  is the human matches sub → person. `bash -n` clean.
+
+Companion changes in `Personal\homelab\deploy\` (same pass): basic-auth
+plaintexts + Technitium/Actual server passwords are now machine-minted
+(`GeneratedPassword`), the two Caddy bcrypt hashes derive automatically at
+prep time (WSL python3-bcrypt — the `docker run caddy hash-password`
+instruction printed here was unrunnable on the dev PC, no docker), and a new
+`Show-DeploySecret.ps1` reads one key back for browser prompts.

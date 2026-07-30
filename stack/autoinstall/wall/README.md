@@ -33,6 +33,8 @@ Cockpit, and nothing that would make the panel precious.
 | `wall-wakeprep.{sh,service}` | EVERY BOOT: ACPI + USB wake enablement (it does not persist) |
 | `wall-sleep.sh` + `wall-sleep.service` + `wall-wake.service` | the D-W4 window; the two `.timer` files are **generated** by firstboot from `SLEEP_START`/`SLEEP_END` (systemd cannot interpolate env into `OnCalendar`) |
 | `wall-kiosk.sh` | `cage` + the app, with a restart loop and a visible failure screen |
+| `wall-sync.{sh,service}` | **the media pull (OI-15)** — mirror the library share's `Music/` + `FrameVideos/` into the panel's cache. Boot-once + on-demand; **no timer** |
+| `wall-media-manifest.py` | the sync's post-step: emits the shell's `music/index.json` and `frame/playlist.json` into that cache |
 | `netplan-wifi.yaml.template` | rendered to `/etc/netplan/60-wall-wifi.yaml` (0600) |
 | `WALL-BURN-IN.md` | everything only the real hardware can settle — **read it before drilling** |
 
@@ -74,11 +76,54 @@ it as a **built artifact**, exactly as the tracker consumes `naglight:local`
    origin for `HEARTBEAT_URL`, `SUBSONIC`, `LOCAL_LIBRARY` and friends. That file
    is served from the AWOW side, but several of its values are panel-side secrets.
    Nothing renders it today.
-4. **`/media/*` has no home** — see the `TODO(OI-15)` in `stack/caddy/Caddyfile`.
-   The manifest and frame playlist must be on the shell's own origin, but the
-   media itself is on the *panel's* disposable cache, which a document root on the
-   AWOW cannot serve. This is an open cross-repo decision, not an omission.
+4. ~~`/media/*` has no home~~ — **RESOLVED by the Owner 2026-07-29 (OI-15)**, and
+   built: see "The media pull" below. `/media/*` is served **panel-locally** by
+   the shell's Electron host; the kiosk site on the AWOW serves no `/media` route
+   at all. What is still owed here is the *other* side of that ruling — the
+   Electron host mapping `/media/*` onto the cache directory — which is
+   OfficeWallNaglight's half, not this repo's.
 
 Until those land, this variant is a **complete image with a missing payload** —
 which is the intended half-built state at this gate, and is stated as such rather
 than papered over.
+
+## The media pull (OI-15, ruled by the Owner 2026-07-29)
+
+> The panel's media is a network share on the AWOW; the **panel pulls** — once
+> after boot and on demand — with **mirror semantics**; `/media/*` is then served
+> panel-locally by the shell's Electron host.
+
+`wall-sync.sh` mounts `MEDIA_SHARE_UNC` read-only over cifs, `rsync -a --delete`s
+**only** the share's `Music/` and `FrameVideos/` subtrees into
+`WALL_MEDIA_CACHE/{music,frame}` (default `/var/cache/wall-media`), unmounts, and
+then regenerates the shell's two contracts inside that cache —
+`music/index.json` (`LocalLibraryProvider`'s manifest) and `frame/playlist.json`.
+
+**The dedicated on-demand command — this is the whole interface:**
+
+```bash
+sudo systemctl start wall-sync.service      # sync now; journalctl -u wall-sync for the log
+```
+
+Things worth knowing before trusting it:
+
+- **Mirror semantics are the ruling.** Content removed from the LAN source
+  disappears from the panel on the next sync. `--delete` is irreversible from the
+  panel's side — which is fine, because the cache is disposable and the library is
+  the copy that matters.
+- **It refuses to mirror an empty source over a populated cache** (the backup
+  service's ingest step learned this the hard way): an empty *or absent* `Music/`
+  or `FrameVideos/` fails the run loudly rather than erasing the cache.
+  `WALL_SYNC_ALLOW_EMPTY=true` is the deliberate override.
+- **A freshly imaged panel shows `wall-sync.service` FAILED**, because
+  `MEDIA_SHARE_UNC` ships as a placeholder. That is intentional: an empty wall
+  with a green unit would be a lie.
+- **No timer, by the ruling** — boot + on demand. Note the consequence: a resume
+  from the D-W4 sleep window is *not* a boot, so between reboots the cache is
+  exactly as fresh as the last on-demand run (OI-16 asks the Owner whether a
+  post-resume sync should be added).
+- **The manifests are the contract, and this repo is the producer.** Their shapes
+  are documented in `OfficeWallNaglight/js/music/local.js` (music) and its
+  `docs/config-reference.md` (frame). One asymmetry matters: music `path` values
+  are **raw** (the shell percent-encodes them itself), frame `url` values are
+  **already encoded** (the shell assigns them straight to `video.src`).

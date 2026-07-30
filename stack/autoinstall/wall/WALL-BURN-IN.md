@@ -159,3 +159,64 @@ cat /sys/class/input/event*/device/name
       so if it did not issue, look at port 80 reachability — not at `WALL_PORT`.
       `docker exec caddy caddy list-certificates` on the AWOW, or just load the
       site and check for a trusted padlock from the panel.
+
+## 8. The media pull (OI-15) — the half that needs the real share
+
+The mirror, its guards and the manifest generation were exercised for real against
+a local fixture library (WSL, via the script's `MEDIA_SOURCE_OVERRIDE` bench hook),
+and the emitted manifest was fed to the shell's real `normalizeManifest()`. What
+that could **not** touch is the cifs half, the Wi-Fi half, and library-scale data.
+
+- [ ] **Fill in `MEDIA_SHARE_UNC` and the credentials** in
+      `/etc/wall-panel/wall.env`, and put the password in a root-only
+      `MEDIA_CIFS_CREDENTIALS` file (`username=` / `password=` lines, `chmod 0600`)
+      rather than inline. Until this is done `wall-sync.service` **fails on every
+      boot by design** — confirm you see exactly that, and that the message names
+      the fix:
+      ```bash
+      systemctl status wall-sync.service; journalctl -u wall-sync -b
+      ```
+- [ ] **Prove the mount** from the panel, by hand, before trusting the unit —
+      a cifs failure and a credentials failure look the same in a service log:
+      ```bash
+      sudo mount -t cifs //host/share /mnt -o credentials=/etc/wall-panel/cifs.creds,ro,vers=3.0
+      ls /mnt        # Music/ and FrameVideos/ must be AT THE ROOT of the share
+      sudo umount /mnt
+      ```
+- [ ] **Run the first sync on demand and watch it** — this is the run that copies
+      the whole library over 802.11 from a 2016 radio, so it is also the honest
+      measurement of how long a re-image costs:
+      ```bash
+      time sudo systemctl start wall-sync.service; journalctl -u wall-sync -b
+      du -sh /var/cache/wall-media/music /var/cache/wall-media/frame
+      ```
+      Confirm the logged file counts match the share, and that the panel's disk has
+      room for the library (256 GB total — a big `FrameVideos/` is the risk).
+- [ ] **Confirm the manifests are valid and non-empty**, since everything the shell
+      shows depends on them:
+      ```bash
+      python3 -m json.tool /var/cache/wall-media/music/index.json  | head -20
+      python3 -m json.tool /var/cache/wall-media/frame/playlist.json | head
+      ```
+- [ ] **Confirm the kiosk user can actually READ the cache** — the sync runs as
+      root, the shell does not:
+      ```bash
+      sudo -u panel find /var/cache/wall-media -type f ! -readable | head
+      ```
+      (Empty output is the pass.)
+- [ ] **Prove the mirror-delete on the real share, deliberately, once.** Remove one
+      file from the share, sync, and confirm it is gone from the panel and from
+      `index.json`. This is the ruling's dangerous half; see it work rather than
+      discover it later.
+- [ ] **Prove the empty-source refusal on the real share, once.** Point
+      `MEDIA_SHARE_UNC` at a share with no `Music/` (or an empty one), sync, and
+      confirm the run FAILS and the cache is untouched. If this guard is broken, one
+      bad mount erases the panel's library copy silently.
+- [ ] **Then play it**: the shell must show the local library as a station and the
+      frame mode must play a video. That is the end-to-end proof that this repo's
+      manifests and OfficeWallNaglight's `/media/*` mapping agree — and it is the
+      first point at which the *other* half of OI-15 (the Electron host serving
+      `/media/*` from the cache) is exercised at all.
+- [ ] **Decide the freshness question (OI-16)**: with `SLEEP_MODE=suspend` the
+      panel may not boot for weeks, and a resume does not trigger a sync. Either
+      accept "on demand" as the answer, or ask for a post-resume/periodic sync.

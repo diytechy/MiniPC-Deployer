@@ -100,7 +100,8 @@ the **backup service** (pure bash + systemd timer — deliberately not a
 container, it mounts cifs and manages drives), the **powertune** and
 **backup-standby** per-boot oneshots, **Cockpit**, **sshd**,
 **unattended-upgrades**, and Docker itself — plus, **only if opted in**, the
-SR-015 light RDP layer below. **Mini-serv** (the Windows box) runs nothing
+SR-015 light RDP layer below. The **wall panel** runs no containers at all (see
+"reimage-not-repair" below). **Mini-serv** (the Windows box) runs nothing
 from this stack — it serves **one** Samba share that the backup service
 **ingests** (mirrors into this box's library tree, ratified 2026-07-29), and it is
 allowed to **sleep**: the backup wakes it over the LAN (Wake-on-LAN) and fails
@@ -127,6 +128,34 @@ relying on on-box IceDrive.
 > **WireGuard is the later remote-access answer** (D5): once set up, the same LAN
 > workflow works from anywhere. Until then this is LAN / VPN-to-LAN only — do not
 > expose SSH, Cockpit, or the aux UIs to the public internet.
+
+### The wall panel is REIMAGE-NOT-REPAIR (SN-013/SR-017, 2026-07-29)
+
+Everything above is about the AWOW box, which holds state worth protecting. The
+**office wall panel** — this repo's second image target — is the opposite, and
+the difference is deliberate rather than an oversight:
+
+- **It holds nothing.** A thin client with a disposable media cache. There is no
+  volume to back up, and it is not in `BACKUP_SOURCES`.
+- **So the recovery ladder is one rung: reflash it.** Do not spend time repairing
+  a panel. Rebuild the USB, reimage, restore the one-time Pandora sign-in from
+  its runbook, done. That is why the reimage-over-LAN decision memo below —
+  written for a headless box you cannot afford to lose — does not need to grow a
+  panel column.
+- **It gets a lighter management surface on purpose:** SSH (key-only) and
+  unattended-upgrades, but **no Cockpit** — one less always-listening web surface
+  on a box that is asleep for part of the day anyway.
+- **It is unreachable while it sleeps.** `SLEEP_MODE=suspend` means no LAN
+  presence at all during the window: no SSH, no fixing it, until the RTC alarm
+  fires. That is the accepted cost of L2 (D-W4), and the RTC alarm is what bounds
+  the worst case. If you need it reachable overnight, `SLEEP_MODE=backlight` keeps
+  the machine up.
+- **After a mains blip it may simply stay off.** No battery (D-W5) means no UPS,
+  and this BIOS has no AC-recovery setting — a smart plug restores power but
+  cannot press the power button. Recovery is a **physical press**, which is why
+  the panel-down alert (an Uptime-Kuma push monitor, configured server-side) is
+  required rather than optional, and why the mount must leave the power button
+  reachable.
 
 ---
 

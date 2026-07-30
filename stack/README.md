@@ -66,6 +66,16 @@ stack/
     awow-firstboot.service    systemd oneshot that runs the bring-up once
     firstboot.sh              compose up + provisioning + point host resolver at local DNS
     powertune.{service,sh}    per-boot low-power auto-tune (powertop) + USB-storage guard
+    wall/                     IMAGE TARGET 2 — the office wall panel (§10)
+      user-data / meta-data     graphical autoinstall: cage kiosk, Wi-Fi, no Docker
+      wall.env.example          the panel's knobs (seeded to /etc/wall-panel/wall.env)
+      wall-firstboot.{service,sh}  hardware-quirk fixes, netplan, sleep timers, autologin
+      wall-wakeprep.{service,sh}   per-boot ACPI/USB wake enablement (does not persist)
+      wall-sleep.sh + wall-{sleep,wake}.service   the D-W4 nightly window
+      wall-kiosk.sh             cage + the shell app, with a visible failure screen
+      netplan-wifi.yaml.template   rendered to /etc/netplan/60-wall-wifi.yaml (0600)
+      WALL-BURN-IN.md           what only the real panel can settle — read before drilling
+  wall-shell/                 document root the kiosk site serves (the shell build; IF-005)
 ```
 
 > **Low-power units (per boot).** `user-data`'s `late-commands` also install two
@@ -416,6 +426,87 @@ Disable = remove the profile from `COMPOSE_PROFILES`, then
   (SR-013 — see [backup/README.md](backup/README.md) "Docker-volume sources");
   commented starter lines ship in `backup.env.example`.
 
+## 10. The office wall panel — image target 2 (SR-016/SR-017, OI-12)
+
+Ratified by the Owner on **2026-07-29** (the belt-and-braces "LAN port + `/32`"
+variant). Two pieces land on the AWOW side, and a whole second image lands in
+[`autoinstall/wall/`](autoinstall/wall/README.md) — read that README for the
+panel itself and `WALL-BURN-IN.md` before mounting anything.
+
+### What the AWOW box gains
+
+A Caddy site, `{$WALL_HOST}:{$WALL_PORT}`, that gives a keyboard-less panel the
+Owner's NagLight view **with no sign-in step**. It deliberately bypasses
+oauth2-proxy — a wall panel cannot complete an interactive Google consent, so
+every session expiry would otherwise leave a login screen on the office wall.
+
+That makes it the **second** injector of the tracker's trusted identity headers,
+which is why it needed ratification rather than a commit. Four guards, all
+load-bearing:
+
+| Guard | Where | If you remove it |
+|---|---|---|
+| The injected `X-Forwarded-User` **replaces** any client-supplied one | Caddyfile `header_up` | anyone who can reach the site is anyone they like |
+| `remote_ip {$PANEL_IP}/32` — one address, not the LAN CIDR | Caddyfile matcher | guest Wi-Fi, IoT gear and an inbound-facing Minecraft server all become the Owner |
+| The port is published bound to `{$LAN_IP}` **and the router never forwards it** | `docker-compose.yml` `ports:` + your router | the site is on the internet |
+| `respond 403` default | Caddyfile | a miss becomes a fall-through instead of a refusal |
+
+**Do NOT add a router forward for `WALL_PORT`.** The hostname resolves publicly
+the day it exists (the DDNS updater maintains a wildcard record), so structural
+unreachability is doing real work here.
+
+Enabling it: fill `WALL_HOST`, `WALL_PORT`, `PANEL_IP`, `PANEL_USER_SUB` in
+`.env`, add the host's bare label to `EXTRA_SUBDOMAINS` (so provisioning creates
+the split-horizon record and the panel reaches the box directly rather than
+hairpinning), give the panel a **DHCP reservation on its hardware MAC**, and
+`docker compose up -d`.
+
+### One gotcha worth knowing before you edit that block
+
+Caddy applies request-header operations in a **fixed order — add, set, delete,
+replace — regardless of the order you write them**. So the intuitive
+"strip then inject" pair (`header_up -X-Forwarded-User` followed by a set of the
+same field) deletes the value it just injected: the tracker sees no identity and
+every panel request 403s. This was found for real in the V1 sim on the first run,
+and the Caddyfile carries a DO-NOT-ADD banner so it does not come back. The strip
+is not lost — `header_up <Name> <value>` is a *set*, which replaces every existing
+value of that field — and the sim asserts exactly that with a forged header rather
+than trusting it.
+
+### The certificate for `{$WALL_HOST}` — verified, not assumed
+
+**It issues normally, over the existing `:80`/`:443` listeners. The alternate port
+is never involved in validation.** Checked against Caddy's docs and source
+(2026-07-29) rather than hoped for:
+
+- **Automatic HTTPS activates on the hostname, not the port.** The documented list
+  of things that disable it does not include a non-standard port — only an
+  `http://` prefix, listening exclusively on the HTTP port, no hostnames at all,
+  manually-loaded certs, or an explicit opt-out. So Caddy manages a
+  publicly-trusted cert for `{$WALL_HOST}` even though the site is served on
+  `{$WALL_PORT}`.
+- **ACME CAs never contact non-standard ports.** HTTP-01 is *always* validated on
+  80 and TLS-ALPN-01 *always* on 443. There is therefore nothing to forward for
+  `{$WALL_PORT}`, and no way for the challenge to arrive there.
+- **The existing port-80 listener answers for this name even though no site block
+  serves it on 80.** Caddy's ACME challenge handler runs in every HTTP server
+  ahead of route matching and dispatches on the requested hostname
+  process-wide — not per site block, not per port. *Honesty note: this last point
+  is clear in Caddy's source but is **not stated in the documentation**, so treat
+  it as verified-by-code, and confirm the cert actually issued on the real box
+  (`WALL-BURN-IN.md` §7) rather than assuming.*
+- **The dependency this creates:** inbound TCP/80 must stay forwarded to Caddy. If
+  port 80 ever closes, renewal for this name breaks — and the symptom will look
+  like a wall-panel problem. TLS-ALPN-01 on 443 is a weak backstop (it needs a
+  connection policy matching this SNI). If you ever want the panel independent of
+  WAN-reachable 80/443, the clean answer is a DNS-01 challenge, which needs no
+  open ports at all — you already run a Cloudflare API token for DDNS.
+- **One cosmetic consequence:** automatic HTTPS also creates a port-80 route for
+  this name that 301s to `https://{$WALL_HOST}:{$WALL_PORT}`. From the LAN that is
+  correct; from the WAN it is a redirect to a port nobody can reach, which
+  advertises the port number without exposing it. Harmless, and left alone rather
+  than "fixed" with an extra site block on a security-critical host.
+
 ## Local validation status (honest)
 
 - **`docker compose config` / live bring-up:** the old "no Docker on the build
@@ -428,8 +519,19 @@ Disable = remove the profile from `COMPOSE_PROFILES`, then
   **cannot** prove is the hardware-and-real-world layer: real Google consent,
   publicly-trusted ACME certs, Technitium on the host's real `:53`, drive
   spin-down physics, thermals. Those wait for the V3 VM boot and the box itself.
+- **The wall panel (§10):** the kiosk site is **GREEN in the V1 sim** — the
+  forged-header identity swap and the 403-for-everyone-else default are both
+  asserted end to end (`validate-sim.sh` checks 7-8). The **image** has only
+  been exercised as config: a throwaway container run of `wall-firstboot.sh`
+  against stub `systemctl`/`udevadm`/`netplan` proved what it writes. Everything
+  physical — the graphical session, Wi-Fi association, suspend/resume, every
+  hardware quirk's real effect, and the **off-LAN 403** — is a hardware
+  remainder, enumerated in
+  [`autoinstall/wall/WALL-BURN-IN.md`](autoinstall/wall/WALL-BURN-IN.md).
 - **What is validated statically:** all shell scripts pass `bash -n`; `meta-data`
-  and `docker-compose.yml` parse; `user-data` is valid `#cloud-config` YAML;
+  and `docker-compose.yml` parse; both `user-data` files (core + wall) are valid
+  `#cloud-config` YAML; every wall knob a panel script reads is declared in
+  `wall.env.example`;
   every `${VAR}` in compose has a matching key in `.env.example`
   (`scripts/validate_config.py`); every `{$VAR}` in the Caddyfile is passed by
   the caddy service's environment; all files referenced by compose/autoinstall

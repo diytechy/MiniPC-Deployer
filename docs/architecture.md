@@ -12,10 +12,20 @@ Related requirements: [stakeholder-needs.md](requirements/stakeholder-needs.md)
 
 ## What this repo produces
 
-An **unattended deploy image** for the headless AWOW AK41 box: an Ubuntu
-autoinstall (`stack/autoinstall/`) that installs the OS + Docker, drops the
-stack, and enables a one-shot first-boot unit that brings everything up and
-provisions DNS — zero clicks (SR-001).
+**Two images from one pipeline** (OI-12 / D-W0, ratified 2026-07-29):
+
+1. The **AWOW AK41 always-on core** — an Ubuntu autoinstall
+   (`stack/autoinstall/`) that installs the OS + Docker, drops the stack, and
+   enables a one-shot first-boot unit that brings everything up and provisions
+   DNS — zero clicks (SR-001).
+2. The **office wall panel** — a graphical variant of the same autoinstall
+   (`stack/autoinstall/wall/`) that boots into one fullscreen app under a Wayland
+   kiosk compositor, with no Docker, no login, and a nightly sleep window
+   (SR-017). It is a **disposable thin client**: reimage-not-repair, held to
+   SN-013's lighter bar rather than SN-001's zero-click always-on guarantee.
+
+The pipeline (ISO assembly, payload bake, secret materialisation, SSH posture) is
+shared; only the target and its `user-data` differ.
 
 ## Topology
 
@@ -25,6 +35,8 @@ graph LR
     net -->|:53 DNS| tech["Technitium<br/>split-horizon DNS"]
     caddy -->|tracker host| oauth["oauth2-proxy<br/>Google sign-in"]
     oauth --> tracker["tracker<br/>(NagLight naglight:local)"]
+    panel["wall panel<br/>(2nd image · cage kiosk)"] -->|"LAN only :WALL_PORT"| caddy
+    caddy -->|"wall host: /32 + identity injected<br/>(NO oauth2-proxy)"| tracker
     caddy -->|basic_auth| actual["Actual Budget"]
     caddy -->|basic_auth| tech
     ddns["ddns<br/>(Cloudflare A records)"] -.->|follows home IP| net
@@ -49,7 +61,19 @@ graph LR
 - **Auth split (D1/D2):** the tracker host goes through **oauth2-proxy** (Google
   sign-in, allow-list) with **no** basic_auth; Actual and the DNS console keep
   **basic_auth**. The tracker container is bridge-only (`expose`, never
-  host-published) so its only ingress is the proxy (SR-004).
+  host-published) so its only ingress is a Caddy site (SR-004).
+- **A THIRD auth model — the wall kiosk site (SR-016, ratified 2026-07-29):** a
+  keyboard-less panel cannot complete an OAuth consent, so
+  `{$WALL_HOST}:{$WALL_PORT}` **bypasses oauth2-proxy** and injects the panel's
+  identity itself. This makes the tracker's trusted headers have a *second*
+  injector, which is why it needed ratification. Four independent guards, all
+  load-bearing: the injected `X-Forwarded-User` **replaces** any client-supplied
+  one (a delete of that field would be applied *after* the set and erase it —
+  see the Caddyfile banner); the source must match `{$PANEL_IP}/32`, not the LAN
+  CIDR; the port is published bound to `LAN_IP` and the router forwards only
+  :80/:443, so a WAN packet cannot arrive; and everything else gets `403` at the
+  edge. The same site serves the shell's static build, because NagLight sends no
+  CORS headers and the app's `/api/*` calls must be same-origin.
 - **DNS:** Technitium owns :53 on the host network and serves split-horizon
   records; `provision/provision-technitium.sh` configures it idempotently over
   its HTTP API.
@@ -92,7 +116,9 @@ graph LR
 |---|---|
 | `stack/docker-compose.yml` | service definitions (core + profile-gated tier-2), health-checks, restart policy |
 | `stack/caddy/Caddyfile` | reverse-proxy routing + auth model (+ commented tier-2 sites) |
-| `stack/autoinstall/` | Ubuntu autoinstall + first-boot bring-up |
+| `stack/autoinstall/` | Ubuntu autoinstall + first-boot bring-up (the AWOW core) |
+| `stack/autoinstall/wall/` | image target 2 — the wall panel: graphical variant, hardware-quirk fixes, sleep window, burn-in checklist |
+| `stack/wall-shell/` | payload dir the kiosk site serves as its document root (the OfficeWallNaglight build; IF-005) |
 | `stack/provision/` | idempotent Technitium provisioning + headless health check |
 | `stack/backup/` | the bash backup service (six-step pipeline, restore, drive power) |
 | `stack/mosquitto/` | committed MQTT broker config (tier-2 home-automation profiles) |

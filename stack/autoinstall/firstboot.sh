@@ -139,18 +139,33 @@ bash "$STACK_DIR/provision/provision-technitium.sh" --env "$STACK_DIR/.env"
 log "bootstrapping Actual (server password from FINANCE_ACTUAL_PASSWORD)…"
 bash "$STACK_DIR/provision/provision-actual.sh" --env "$STACK_DIR/.env"
 
-# ── 5c. Samba household accounts (A13) ───────────────────────────────────────
-# One Unix+Samba identity per storage-map §2 entry, each with ITS OWN password
-# from the store — the thing that makes §3's per-share ACLs real rather than
-# decorative. A no-op when the creds file was never shipped; loud when Samba
-# itself is missing (see Personal open-items A14 — the share-serving lane is
-# NOT yet built, so this currently has nothing to add users to on a stock box).
-if [ -f /etc/awow-samba/samba-users.creds ]; then
-    log "provisioning Samba household accounts…"
-    bash "$STACK_DIR/provision/provision-samba-users.sh" || \
-        log "WARN: Samba account provisioning failed — private shares will be unreachable"
+# ── 5c. Data drives, then the Samba file server (A14 + A13) ──────────────────
+# ORDER IS LOAD-BEARING:
+#   mounts  -> the library must be a real mountpoint before anything exports a
+#              path inside it, or Samba serves an empty dir on the eMMC and
+#              silently accepts writes to the system disk.
+#   samba   -> assembles smb.conf (tracked [global] + generated share stanzas)
+#              and starts smbd. Creates the Samba databases smbpasswd needs.
+#   users   -> one identity per storage-map §2 entry, each with its OWN
+#              password, which is what makes §3's per-share ACLs real.
+# All three are no-ops when their site files were not shipped (sim/vmtest).
+log "mounting storage-map data drives…"
+bash "$STACK_DIR/provision/provision-mounts.sh" || \
+    log "WARN: drive mounting reported a problem — see above"
+
+if [ -f /etc/awow-samba/smb.conf.fragment ]; then
+    log "bringing up the Samba file server…"
+    if bash "$STACK_DIR/provision/provision-samba.sh"; then
+        log "provisioning Samba household accounts…"
+        bash "$STACK_DIR/provision/provision-samba-users.sh" || \
+            log "WARN: Samba account provisioning failed — private shares will be unreachable"
+    else
+        log "WARN: Samba server did not come up — every §3 share is unreachable. Accounts skipped."
+    fi
 else
-    log "no /etc/awow-samba/samba-users.creds — skipping Samba accounts (A13/A14)"
+    log "no /etc/awow-samba/smb.conf.fragment — skipping the file server (A14)."
+    log "  Expected on a sim/vmtest build. On a real box it means the USB payload"
+    log "  carried no site/ directory: rebuild the stick with Build-VentoyStick.ps1."
 fi
 
 # ── 6. make the host itself use local DNS ────────────────────────────────────

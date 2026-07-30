@@ -74,6 +74,8 @@ autoinstall:
     - unattended-upgrades  # hands-off OS security patching — WI-10.12
     - powertop          # low-power auto-tune, applied per boot by powertune.service
     - hdparm            # backup-drive spin-down (WI-10.10) — NOT guaranteed on Ubuntu Server
+    - samba             # household file server (A14) — shares come from storage-map §3
+    - samba-common-bin  # provides smbpasswd/pdbedit for the per-account passwords (A13)
 
   # Everything site-specific happens in late-commands, which run in the installer
   # environment with the target mounted at /target. We write files INTO /target.
@@ -115,6 +117,19 @@ autoinstall:
 
     # ---- 4. Seed .env from the example if the operator did not pre-fill one ----
     - curtin in-target --target=/target -- bash -c '[ -f /opt/awow-core/stack/.env ] || cp /opt/awow-core/stack/.env.example /opt/awow-core/stack/.env'
+
+    # ---- 4b. SITE payload: real materialized config + secrets (A14) ------------
+    # deploy-payload/site/ is written by Build-VentoyStick.ps1 from
+    # Personal\homelab\deploy\out\ — the REAL values, not the sim placeholders
+    # the vmtest builders bake. Absent on a sim/vmtest build, hence `|| true`
+    # throughout: this whole block is a no-op there.
+    #
+    # Modes matter: every file here is a secret artifact. .env and the *.creds
+    # files carry live credentials, so they are installed 0600 root-owned. The
+    # smb.conf fragment and fstab are not secret but are still root-only to
+    # keep the whole site/ tree consistent.
+    - mkdir -p /target/etc/awow-samba /target/etc/awow-backup
+    - bash -c 'S=/cdrom/deploy-payload/site; [ -d "$S" ] || S=/media/deploy-payload/site; [ -d "$S" ] || exit 0; install -m600 -o root -g root "$S/.env" /target/opt/awow-core/stack/.env 2>/dev/null || true; install -m600 -o root -g root "$S/backup.env" /target/etc/awow-backup/backup.env 2>/dev/null || true; install -m600 -o root -g root "$S/cifs.creds" /target/etc/awow-backup/cifs.creds 2>/dev/null || true; install -m600 -o root -g root "$S/samba-users.creds" /target/etc/awow-samba/samba-users.creds 2>/dev/null || true; install -m600 -o root -g root "$S/smb.conf.fragment" /target/etc/awow-samba/smb.conf.fragment 2>/dev/null || true; install -m600 -o root -g root "$S/library-mounts.fstab" /target/etc/awow-samba/library-mounts.fstab 2>/dev/null || true'
 
     # ---- 5. Install + enable the first-boot unit ------------------------------
     - cp /target/opt/awow-core/stack/autoinstall/awow-firstboot.service /target/etc/systemd/system/awow-firstboot.service

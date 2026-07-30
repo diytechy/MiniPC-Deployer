@@ -120,7 +120,23 @@ render_seed_tree() {
     # operator user: SSH key-only in production (WI-10.12); for this disposable
     # VM we ALSO allow password login at the console for convenience — never
     # do this on the real AWOW (stack/README.md's runbook keeps allow-pw:false).
+    # PRODUCTION SEAM (A14, 2026-07-30): when SITE_DIR points at a materialized
+    # Personal\homelab\deploy\out\awow directory, this is a REAL build — take
+    # its user-data.filled verbatim and skip every sim substitution below. That
+    # file already has the operator's real SSH key and login hash patched in by
+    # Materialize-Deploy.ps1, and it keeps `allow-pw: false` (key-only), which
+    # is precisely what the sim path overrides. Mixing the two would be the
+    # dangerous outcome: a production stick that quietly accepts a password
+    # login with a known sim hash.
     local user_data_out="$out_dir/iso-root/user-data"
+    if [ -n "${SITE_DIR:-}" ] && [ -f "$SITE_DIR/user-data.filled" ]; then
+        log "PRODUCTION: using $SITE_DIR/user-data.filled (real key + hash; no sim substitution)"
+        cp "$SITE_DIR/user-data.filled" "$user_data_out"
+        grep -q "REPLACE_WITH" "$user_data_out" && \
+            die "user-data.filled still contains a REPLACE_WITH placeholder — re-run Materialize-Deploy.ps1 and fix what it names."
+        grep -q "allow-pw: true" "$user_data_out" && \
+            die "user-data.filled has allow-pw: true — production is SSH-key-only (WI-10.12). Refusing to bake it."
+    else
     sed \
         -e "s#- \"ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host\"#- \"$ssh_pubkey\"#" \
         -e 's/allow-pw: false/allow-pw: true   # VMTEST ONLY - production keeps this false (key-only)/' \
@@ -129,6 +145,7 @@ render_seed_tree() {
         -e 's/realname: "AWOW Core Operator"/realname: "AWOW VM Test Operator"/' \
         "$autoinstall_src/user-data" > "$user_data_out"
     grep -q "REPLACE_WITH_YOUR_PUBLIC_KEY" "$user_data_out" && die "SSH placeholder substitution failed"
+    fi
 
     # ── meta-data: fresh instance-id per build, vmtest hostname ──────────────
     sed \
@@ -148,6 +165,30 @@ render_seed_tree() {
     #    `docker compose up -d` can actually run. See vmtest/README.md "what
     #    success looks like" for which services this does/doesn't get to
     #    healthy (the tracker image is a KNOWN gap, documented there). ────────
+    # PRODUCTION SEAM (A14): a real build stages the materialized site files
+    # into deploy-payload/site/ and returns before the sim .env block. The
+    # autoinstall late-command 4b installs them into /etc/awow-samba,
+    # /etc/awow-backup and stack/.env on the target.
+    if [ -n "${SITE_DIR:-}" ] && [ -d "$SITE_DIR" ]; then
+        local site_out="$payload_dir/site"
+        mkdir -p "$site_out"
+        local staged=0
+        for f in .env backup.env cifs.creds samba-users.creds user-data.filled \
+                 smb.conf.fragment library-mounts.fstab; do
+            if [ -f "$SITE_DIR/$f" ]; then
+                install -m 600 "$SITE_DIR/$f" "$site_out/$f"
+                log "  site/ += $f"
+                staged=$((staged + 1))
+            fi
+        done
+        [ "$staged" -gt 0 ] || die "SITE_DIR=$SITE_DIR contained none of the expected files — nothing to bake."
+        # stack/.env inside the payload is what late-command 4 would otherwise
+        # seed from .env.example; overwrite it with the real one.
+        [ -f "$SITE_DIR/.env" ] && install -m 600 "$SITE_DIR/.env" "$payload_dir/stack/.env"
+        log "PRODUCTION build: $staged site file(s) staged; sim .env generation SKIPPED"
+        return 0
+    fi
+
     local sim_env="$payload_dir/stack/.env"
     local basicauth_hash_actual="REPLACE_WITH_caddy_hash-password_OUTPUT"
     local basicauth_hash_dns="REPLACE_WITH_caddy_hash-password_OUTPUT"

@@ -1,0 +1,82 @@
+# smb.conf [global] for the AWOW household file server (Personal A14).
+#
+# TRACKED, T0 — nothing site-specific lives here. The share stanzas are
+# GENERATED from Personal\homelab\deploy\storage-map.md §3 by
+# Generate-FromStorageMap.ps1 and land beside this file as smb.conf.fragment;
+# provision-samba.sh concatenates global + fragment into /etc/samba/smb.conf.
+# Do not add a share stanza here — it would be a second source of truth for
+# pathing, which storage-map exists to prevent.
+#
+# THE ONE THING THIS FILE IS LOAD-BEARING FOR: D5 says these shares are
+# LAN-only, never WAN-exposed, no router forward. The `hosts allow` line below
+# is the enforcement of that at the daemon, not just a promise in a document.
+[global]
+   workgroup = WORKGROUP
+   server string = HOME-HUB
+   netbios name = HOME-HUB
+
+   # ── access model ─────────────────────────────────────────────────────────
+   security = user
+   # `Shared` is the one share readable without an account (storage-map Q-S5).
+   # "Bad User" maps an unknown username to the guest account instead of
+   # rejecting it, which is what makes `guest ok = yes` work on that share.
+   # Known usernames still must authenticate — a wrong password is NOT
+   # silently downgraded to guest.
+   map to guest = Bad User
+   guest account = nobody
+
+   # ── LAN-only enforcement (D5) ────────────────────────────────────────────
+   # Deny by default, allow the house subnet and loopback. If the LAN is ever
+   # renumbered this line must change with it; a wrong value fails CLOSED
+   # (nobody can reach the shares), which is the safe direction.
+   hosts allow = 192.168.117.0/24 127.0.0.1
+   hosts deny = 0.0.0.0/0
+   # Never answer on anything but the LAN NIC and loopback.
+   bind interfaces only = yes
+   interfaces = lo eno1
+
+   # ── protocol hygiene ─────────────────────────────────────────────────────
+   # SMB1 is off: it is the vulnerable, deprecated dialect (EternalBlue et al)
+   # and nothing in this house needs it. Windows 10/11 and Linux cifs both
+   # speak SMB3 by default.
+   server min protocol = SMB2
+   client min protocol = SMB2
+   # Signing available but not required: required signing costs throughput on
+   # a low-power box and the threat it stops (LAN MITM) is out of D5's model.
+   server signing = auto
+
+   # ── no printers ──────────────────────────────────────────────────────────
+   # Ubuntu's stock smb.conf shares printers and print$ by default. This box
+   # has no printer and every unnecessary share is attack surface.
+   load printers = no
+   printing = bsd
+   printcap name = /dev/null
+   disable spoolss = yes
+   show add printer wizard = no
+
+   # ── no [homes] ───────────────────────────────────────────────────────────
+   # Deliberately absent. [homes] auto-exports every Unix account's home
+   # directory, which would hand each household member a share the storage map
+   # never described — and the accounts are created with NO home (-M) anyway.
+
+   # ── logging ──────────────────────────────────────────────────────────────
+   log file = /var/log/samba/log.%m
+   max log size = 1000
+   logging = file
+   log level = 1
+
+   # ── behaviour ────────────────────────────────────────────────────────────
+   # Unix extensions off + wide links off: do not follow symlinks outside a
+   # share, so a stray symlink in the library cannot escape its ACL.
+   unix extensions = no
+   wide links = no
+   follow symlinks = yes
+
+   # Recycle bin is NOT enabled: the archive flows in storage-map §4b are the
+   # recovery story, and a hidden .recycle tree inside the library would be
+   # copied by them.
+
+   # New files inherit sane group perms; the per-share write list is what
+   # actually gates writing (see the generated fragment).
+   create mask = 0664
+   directory mask = 0775

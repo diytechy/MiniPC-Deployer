@@ -63,11 +63,52 @@ while IFS= read -r line; do
     elif mount "$mnt" 2>/dev/null; then
         log "mounted $mnt"
     else
-        log "WARN: mount $mnt FAILED. If the drive is NTFS from its Windows life, the"
-        log "      kernel may lack a driver for it, or it needs fsck after an unclean"
-        log "      Windows removal. See open-items A15 — the filesystem decision is open,"
-        log "      and NTFS would also break the per-user Samba ACLs."
+        log "WARN: mount $mnt FAILED."
+        log "      If this drive is NTFS and Windows left it dirty (Fast Startup, or an"
+        log "      unclean removal), ntfs3 refuses it by design. Fix it by attaching the"
+        log "      drive to Windows, disabling Fast Startup, and doing a clean eject —"
+        log "      or run chkdsk on it there. Linux has no trustworthy NTFS repair tool."
+        rc=1
+        continue
     fi
+
+    # ── never-silent-green: a READ-ONLY mount is the dangerous success ───────
+    # ntfs3 silently falls back to read-only when the NTFS dirty bit is set
+    # (hibernation, Fast Startup, an unclean unplug). Everything then LOOKS
+    # mounted: Samba serves the shares, the library is browsable, reads work —
+    # and every write and every backup run fails, or worse, is skipped quietly.
+    # This must be loud.
+    opts="$(findmnt -no OPTIONS --target "$mnt" 2>/dev/null || echo '')"
+    case ",$opts," in
+        *,ro,*)
+            log "FATAL: $mnt mounted READ-ONLY."
+            log "       Reads and share browsing will look completely normal while every"
+            log "       write silently fails. For NTFS this almost always means the dirty"
+            log "       bit is set — clear it from Windows (chkdsk, Fast Startup OFF,"
+            log "       clean eject). Not continuing as if this were healthy."
+            rc=1
+            continue ;;
+    esac
+
+    # ── NTFS needs ownership options or Samba cannot write ──────────────────
+    # ntfs3 has no POSIX ownership: every file reports the uid/gid fixed at
+    # MOUNT time, defaulting to root:root with a restrictive umask. Samba
+    # writes as the connecting user, so without uid/gid/umask here the private
+    # trees are read-only in practice no matter what the share ACLs say.
+    fstype="$(findmnt -no FSTYPE --target "$mnt" 2>/dev/null || echo '')"
+    case "$fstype" in
+        ntfs|ntfs3|fuseblk)
+            log "note: $mnt is $fstype"
+            case "$opts" in
+                *uid=*) : ;;
+                *)
+                    log "WARN: $mnt is NTFS but mounted without uid=/gid=. Every file will be"
+                    log "      owned by root and Samba writes from household accounts will FAIL."
+                    log "      Add to its /etc/fstab line:  uid=0,gid=$(getent group sambashare >/dev/null 2>&1 && echo sambashare || echo users),umask=0002"
+                    log "      then: mount -o remount $mnt   (see open-items A15)"
+                    rc=1 ;;
+            esac ;;
+    esac
 done < "$FSTAB_FRAGMENT"
 
 [ "$added" -gt 0 ] && systemctl daemon-reload || true

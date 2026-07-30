@@ -249,6 +249,9 @@ def main():
         "autoinstall/wall/wall-sync.service",
         "autoinstall/wall/wall-sync.sh",
         "autoinstall/wall/wall-media-manifest.py",
+        # OI-16a — the resume hook (WantedBy=suspend.target): without it a panel
+        # on SLEEP_MODE=suspend syncs only at boot, which in practice is ~never.
+        "autoinstall/wall/wall-sync-resume.service",
         # Read by wall-firstboot.sh rather than by user-data, but just as fatal
         # if absent — a panel with no netplan has no network at all (no RJ45).
         "autoinstall/wall/netplan-wifi.yaml.template",

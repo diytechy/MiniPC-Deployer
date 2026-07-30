@@ -142,9 +142,12 @@ autoinstall:
     # wall-sleep/-wake — the D-W4 sleep window; their .timer files are RENDERED
     #                    by firstboot from SLEEP_START/SLEEP_END (systemd cannot
     #                    interpolate an env var into OnCalendar).
-    # wall-sync        — ONCE AFTER BOOT, and on demand over SSH: mirror the
-    #                    library share's Music/ + FrameVideos/ into the panel's
-    #                    media cache (OI-15). No timer, by the ruling.
+    # wall-sync        — ONCE AFTER BOOT, ON EVERY RESUME, and on demand over
+    #                    SSH: mirror the library share's Music/ + FrameVideos/
+    #                    into the panel's media cache (OI-15). No timer, by the
+    #                    ruling. The resume trigger is wall-sync-resume.service
+    #                    (OI-16a): the panel suspends nightly and a resume is not
+    #                    a boot, so boot-only would go weeks stale.
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.service /target/etc/systemd/system/wall-firstboot.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh /target/usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-firstboot.sh
@@ -167,6 +170,12 @@ autoinstall:
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-media-manifest.py /target/usr/local/sbin/wall-media-manifest.py
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sync.sh /usr/local/sbin/wall-media-manifest.py
     - curtin in-target --target=/target -- systemctl enable wall-sync.service
+    # wall-sync-resume — the OI-16a hook: WantedBy=suspend.target, so every wake
+    # from the D-W4 nightly suspend re-triggers wall-sync (detached, --no-block —
+    # the wake is never delayed). Enabling it is what plants the suspend.target
+    # symlink; without that the hook exists but never fires.
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-resume.service /target/etc/systemd/system/wall-sync-resume.service
+    - curtin in-target --target=/target -- systemctl enable wall-sync-resume.service
     # Seat access for the kiosk user (cage needs the DRM/input devices).
     - curtin in-target --target=/target -- usermod -aG video,input,render panel
 

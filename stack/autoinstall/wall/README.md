@@ -33,7 +33,8 @@ Cockpit, and nothing that would make the panel precious.
 | `wall-wakeprep.{sh,service}` | EVERY BOOT: ACPI + USB wake enablement (it does not persist) |
 | `wall-sleep.sh` + `wall-sleep.service` + `wall-wake.service` | the D-W4 window; the two `.timer` files are **generated** by firstboot from `SLEEP_START`/`SLEEP_END` (systemd cannot interpolate env into `OnCalendar`) |
 | `wall-kiosk.sh` | `cage` + the app, with a restart loop and a visible failure screen |
-| `wall-sync.{sh,service}` | **the media pull (OI-15)** — mirror the library share's `Music/` + `FrameVideos/` into the panel's cache. Boot-once + on-demand; **no timer** |
+| `wall-sync.{sh,service}` | **the media pull (OI-15)** — mirror the library share's `Music/` + `FrameVideos/` into the panel's cache. Boot-once + every resume + on-demand; **no timer** |
+| `wall-sync-resume.service` | **the resume hook (OI-16a)** — `WantedBy=suspend.target`, fires on every wake from the nightly suspend and `--no-block`-starts `wall-sync.service`, detached, so the wake is never delayed |
 | `wall-media-manifest.py` | the sync's post-step: emits the shell's `music/index.json` and `frame/playlist.json` into that cache |
 | `netplan-wifi.yaml.template` | rendered to `/etc/netplan/60-wall-wifi.yaml` (0600) |
 | `WALL-BURN-IN.md` | everything only the real hardware can settle — **read it before drilling** |
@@ -118,10 +119,20 @@ Things worth knowing before trusting it:
 - **A freshly imaged panel shows `wall-sync.service` FAILED**, because
   `MEDIA_SHARE_UNC` ships as a placeholder. That is intentional: an empty wall
   with a green unit would be a lie.
-- **No timer, by the ruling** — boot + on demand. Note the consequence: a resume
-  from the D-W4 sleep window is *not* a boot, so between reboots the cache is
-  exactly as fresh as the last on-demand run (OI-16 asks the Owner whether a
-  post-resume sync should be added).
+- **No timer, and a resume DOES sync (OI-16a, the Owner, 2026-07-29).** The
+  ruling's "once after boot" went stale in practice because a resume from the
+  D-W4 window is *not* a boot — with `SLEEP_MODE=suspend` the panel can run for
+  weeks without booting. The Owner chose option (a): `wall-sync-resume.service`
+  (`After=suspend.target` + `WantedBy=suspend.target`, the standard systemd
+  resume hook) fires on every wake and runs `systemctl start --no-block
+  wall-sync.service`. `--no-block` is load-bearing: the hook runs *inside* the
+  resume transaction, and a blocking start could hold it open for up to an hour
+  (a first full mirror's timeout) — enqueue-and-return keeps the wake
+  imperceptible and lets the sync run detached with its own journal and
+  pass/fail. Wi-Fi wrinkle: `network-online.target` is not re-evaluated on
+  resume, so `wall-sync.sh` does its own bounded `nm-online` wait (30 s cap,
+  non-fatal) before mounting; if the radio still is not up, the mount fails
+  loudly and the retry is the on-demand command.
 - **The manifests are the contract, and this repo is the producer.** Their shapes
   are documented in `OfficeWallNaglight/js/music/local.js` (music) and its
   `docs/config-reference.md` (frame). One asymmetry matters: music `path` values

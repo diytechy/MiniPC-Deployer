@@ -1,16 +1,20 @@
 # Pull the panel's media cache from the library share (OI-15, ruled 2026-07-29).
 #
-# TWO TRIGGERS, AND DELIBERATELY NO TIMER:
+# THREE TRIGGERS, AND DELIBERATELY NO TIMER:
 #   * ONCE AFTER BOOT — this unit, WantedBy=multi-user.target, ordered after the
 #     network is actually up (the panel is Wi-Fi-only, so "network-online" is not
 #     a formality here: an rsync started before association just fails).
+#   * ON EVERY RESUME — wall-sync-resume.service (OI-16, the Owner chose (a),
+#     2026-07-29): the D-W4 window suspends the panel nightly and a resume is not
+#     a boot, so the resume hook `systemctl start --no-block`s THIS unit. Same
+#     unit, same journal, no second code path.
 #   * ON DEMAND — `sudo systemctl start wall-sync.service`. That IS the dedicated
 #     SSH-invocable command the ruling calls for: starting a oneshot again re-runs
 #     it, so there is nothing else to install and no second entry point that could
 #     drift from the boot path.
-# The ruling says boot + on demand, so NO .timer file is shipped. Note the
-# consequence: a resume from the D-W4 sleep window is not a boot, so between
-# reboots the cache is as fresh as the last on-demand run.
+# The ruling (as amended by OI-16a) is boot + resume + on demand, so NO .timer
+# file is shipped. Resume wrinkle: network-online.target is not re-evaluated on
+# wake, so wall-sync.sh does its own short bounded nm-online wait before mounting.
 [Unit]
 Description=Wall panel: mirror the library share's Music/ + FrameVideos/ into the local media cache
 Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md

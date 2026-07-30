@@ -25,13 +25,20 @@
 #
 # WHEN IT RUNS
 #   * once after boot   — wall-sync.service, After=network-online.target;
+#   * ON EVERY RESUME   — wall-sync-resume.service (OI-16a, ruled 2026-07-29):
+#     with SLEEP_MODE=suspend the panel resumes every morning WITHOUT booting,
+#     so a resume triggers the same unit, detached (`systemctl start --no-block`)
+#     so the wake is never delayed;
 #   * ON DEMAND         — `sudo systemctl start wall-sync.service`. That IS the
 #     dedicated SSH-invocable command the ruling asks for; there is nothing else
 #     to invoke and no second entry point to keep in step.
-# There is deliberately NO periodic timer (the ruling is boot + on demand). The
-# consequence is real and worth knowing: with SLEEP_MODE=suspend the panel can
-# run for weeks without a boot, and a resume is NOT a boot — so between reboots
-# the cache is exactly as fresh as the last on-demand run.
+# There is deliberately NO periodic timer (the ruling is boot + resume + on
+# demand). The resume path has one wrinkle the boot path does not: Wi-Fi
+# re-association takes a few seconds after wake and network-online.target is NOT
+# re-evaluated on resume, so this script does its own short bounded wait (below)
+# before touching the network. If the network still is not up, the mount fails
+# loudly — a failed unit, not a silent skip — and the retry is the on-demand
+# command.
 #
 # GUARDS — the backup service's INGEST step learned these the expensive way
 # (stack/backup/backup.sh §1b); they are transplanted rather than reinvented:
@@ -127,6 +134,23 @@ else
         *)
             die "MEDIA_SHARE_UNC='$MEDIA_SHARE_UNC' is not a //host/share UNC" ;;
     esac
+
+    # Short BOUNDED network wait — for the resume path (OI-16a). After a wake
+    # from S3 the Wi-Fi radio takes a few seconds to re-associate, and
+    # network-online.target (reached at boot) is NOT re-evaluated on resume, so
+    # unit ordering cannot cover this. `nm-online` exits 0 the moment
+    # NetworkManager reports a connection (immediately when already up — boot and
+    # on-demand runs lose nothing) and nonzero at the 30 s cap. NON-FATAL either
+    # way: the mount below is the real arbiter and fails loudly on its own; this
+    # wait just stops the common case (a healthy Wi-Fi that needs 3 seconds) from
+    # burning the run. Only on the real-mount path — the bench hook touches no
+    # network.
+    if command -v nm-online >/dev/null 2>&1; then
+        nm-online -q --timeout=30 \
+            || warn "network still not up after 30s (nm-online) — trying the mount anyway; if it fails, re-run once the panel is back on Wi-Fi: sudo systemctl start wall-sync.service"
+    else
+        warn "nm-online not found (network-manager is in the wall image) — skipping the post-resume network wait; the mount will be the arbiter"
+    fi
 
     # Same option shape and credential precedence as the backup service's
     # mount_cifs (stack/backup/common.sh): a root-only credentials FILE is the

@@ -25,6 +25,8 @@
 #   7. Autologin the kiosk user on tty1 so cage gets a real logind SEAT.
 #   8. OI-15 — the media cache + the pull unit: create the cache dir, make sure
 #      wall-sync.service is enabled, and REPORT whether the share is configured.
+#      Plus OI-16a: wall-sync-resume.service enabled, so every wake from the
+#      nightly suspend re-triggers the sync (a resume is not a boot).
 #   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
@@ -243,6 +245,19 @@ else
     warn "wall-sync.service is not installed (the autoinstall late-commands place it)."
     warn "Without it the panel will never pull media. Re-image, or copy it from"
     warn "$PAYLOAD/wall-sync.service by hand."
+fi
+# OI-16a (the Owner, 2026-07-29): the resume hook. Enabling is what plants the
+# suspend.target wants-symlink — an installed-but-disabled hook never fires, and
+# a panel on SLEEP_MODE=suspend would then sync only at boot, i.e. ~never.
+if [ -f /etc/systemd/system/wall-sync-resume.service ]; then
+    systemctl enable wall-sync-resume.service >/dev/null 2>&1 \
+        || warn "could not enable wall-sync-resume.service — check: systemctl status wall-sync-resume.service"
+    log "OI-16a: wall-sync-resume.service enabled — every resume from suspend re-triggers the media sync"
+else
+    warn "wall-sync-resume.service is not installed (the autoinstall late-commands place it)."
+    warn "Without it a resume does NOT refresh the media cache — with SLEEP_MODE=suspend"
+    warn "the panel can then run for weeks on a stale cache. Copy it from"
+    warn "$PAYLOAD/wall-sync-resume.service and: systemctl enable wall-sync-resume.service"
 fi
 case "${MEDIA_SHARE_UNC:-}" in
     ''|*REPLACE_WITH*)

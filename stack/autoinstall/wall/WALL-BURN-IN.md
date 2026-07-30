@@ -217,6 +217,24 @@ that could **not** touch is the cifs half, the Wi-Fi half, and library-scale dat
       manifests and OfficeWallNaglight's `/media/*` mapping agree — and it is the
       first point at which the *other* half of OI-15 (the Electron host serving
       `/media/*` from the cache) is exercised at all.
-- [ ] **Decide the freshness question (OI-16)**: with `SLEEP_MODE=suspend` the
-      panel may not boot for weeks, and a resume does not trigger a sync. Either
-      accept "on demand" as the answer, or ask for a post-resume/periodic sync.
+- [ ] **Prove the resume hook fires (OI-16a — the Owner chose "wall-sync on
+      resume", 2026-07-29).** No harness can suspend real firmware, so this one
+      is hardware-only: suspend, wake, and watch the sync fire *after* the wake —
+      ```bash
+      sudo rtcwake -m mem -l -s 90        # suspend; the RTC wakes it in ~90 s
+      # after it wakes:
+      journalctl -u wall-sync-resume -b   # the hook ran, at the wake timestamp
+      journalctl -u wall-sync -b          # a NEW sync run STARTED after the wake
+      ```
+      Two things to confirm while you are there: (a) the wake itself was not
+      perceptibly delayed — the hook only enqueues (`--no-block`) and must finish
+      in milliseconds; (b) the sync run *succeeded* despite Wi-Fi re-association
+      (the script waits up to 30 s via `nm-online`). If the sync failed with a
+      mount error timed within seconds of the wake, the radio took longer than
+      the wait — the honest retry is `sudo systemctl start wall-sync.service`,
+      and if it happens routinely on this hardware, say so rather than tuning
+      silently.
+- [ ] **Prove it fires from the real nightly path too**: run
+      `sudo /usr/local/sbin/wall-sleep.sh start` with `SLEEP_END` a few minutes
+      out (the same test as §4's RTC check) and confirm the morning-style resume
+      also triggered a sync — the D-W4 window is the wake this hook exists for.

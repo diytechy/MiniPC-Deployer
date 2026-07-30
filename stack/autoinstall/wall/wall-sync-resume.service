@@ -1,0 +1,45 @@
+# Refresh the panel's media cache after a RESUME from suspend (OI-16, the Owner
+# chose option (a) 2026-07-29): with SLEEP_MODE=suspend the panel suspends every
+# night and resumes every morning WITHOUT booting, so a boot-only sync goes stale
+# for weeks. This hook makes every resume behave like a boot for freshness.
+#
+# HOW THE HOOK WORKS — the standard systemd resume pattern:
+#   WantedBy=suspend.target pulls this unit into the suspend transaction;
+#   After=suspend.target orders it after that target is REACHED — and
+#   suspend.target is only reached when systemd-suspend.service completes, i.e.
+#   when the machine has already WOKEN. So this unit starts at resume, never at
+#   suspend time. Type=oneshot with no RemainAfterExit means it falls back to
+#   inactive immediately, so every later suspend/resume cycle fires it again.
+#
+# WHY `--no-block` IS LOAD-BEARING, not a flourish: this unit runs INSIDE the
+# resume transaction. A plain `systemctl start` waits for the started job to
+# finish, and a first full mirror over 802.11 is allowed up to an hour
+# (TimeoutStartSec in wall-sync.service) — that wait would hold the resume
+# transaction open for the whole sync. `--no-block` only ENQUEUES the job and
+# returns at once: this hook is done in milliseconds, the wake is never delayed,
+# and wall-sync.service then runs detached as its own job with its own journal,
+# its own timeout and its own pass/fail status (`journalctl -u wall-sync`).
+#
+# THE Wi-Fi RACE, honestly: network-online.target was reached at BOOT and stays
+# active across suspend, so no ordering here can wait for the radio to
+# re-associate — that takes a few seconds after wake. wall-sync.sh therefore does
+# its own short bounded wait (nm-online, 30 s cap) before mounting; if the network
+# is still not up after that, the mount fails LOUDLY (failed unit + journal) and
+# the retry is the documented on-demand command: sudo systemctl start wall-sync.
+#
+# Only suspend.target: the panel's one sleep path is `systemctl suspend` from
+# wall-sleep.sh (SLEEP_MODE=suspend). It never hibernates — no hibernate/
+# hybrid-sleep targets are listed because no code path can reach them.
+[Unit]
+Description=Wall panel: refresh the media cache after resume (OI-16a)
+Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
+After=suspend.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl start --no-block wall-sync.service
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=suspend.target

@@ -132,18 +132,33 @@ last) — it is the record, not required reading for every pass.
       `Personal\homelab\deploy\FieldSchema.psd1` (see the audit entry for the
       exact snippet and two cross-repo consequences), and the whole of
       `stack/autoinstall/wall/WALL-BURN-IN.md`.
-    - OI-15 — **`/media/*` has no origin, and it is a real decision
-      (2026-07-29, NEW):** the panel's shell resolves its local-library manifest
-      and frame playlist as `/media/…` relative paths, which must be on the
-      shell's OWN origin (NagLight sends no CORS headers). But the ratified design
-      has that media on the **panel's** disposable cache, and the origin is a Caddy
-      site on the **AWOW**. So the kiosk site structurally cannot serve it. The
-      likely answer is panel-side — the Electron container intercepting `/media/*`
-      for its local cache — which is `OfficeWallNaglight`'s call, not the image's;
-      the AWOW-side alternative (a `file_server` over `MEDIA_ROOT`) is *streaming*,
-      which is what D-W8 chose against. Marked `TODO(OI-15)` in
-      `stack/caddy/Caddyfile` with the commented stub, deliberately not decided
-      here.
+    - OI-15 — **RESOLVED 2026-07-29 (the Owner), and BUILT the same evening.**
+      The ruling: *panel media is an AWOW network share; the **panel PULLS** —
+      once after boot and on demand via a dedicated SSH-invocable command — with
+      **MIRROR semantics** (`--delete`: content removed from the LAN source
+      disappears from the panel cache); `/media/*` is then served **panel-locally**
+      by the shell's Electron host.* So the question the item asked ("which origin
+      serves `/media/*`?") is answered *panel-side*, and this repo owes the pull,
+      not a route: the `TODO(OI-15)` stub is gone from `stack/caddy/Caddyfile`,
+      replaced by a one-line statement that the kiosk site serves no `/media`
+      route. Built here: `stack/autoinstall/wall/wall-sync.{sh,service}` (cifs
+      mount → `rsync -a --delete` of ONLY `Music/` + `FrameVideos/` →unmount) plus
+      `wall-media-manifest.py`, which emits the shell's two contracts
+      (`music/index.json`, `frame/playlist.json`) into the cache as the sync's
+      post-step. The dedicated command is `sudo systemctl start
+      wall-sync.service`; there is deliberately **no timer**. See the audit entry
+      below for what ran for real. **Still owed by the OTHER side** (not this
+      repo): the Electron host actually mapping `/media/*` onto the cache dir —
+      OfficeWallNaglight's half of the same ruling.
+    - OI-16 — **a freshness question the ruling leaves open (2026-07-29, NEW):**
+      "once after boot" is implemented exactly as ruled, but with
+      `SLEEP_MODE=suspend` the panel resumes from S3 every morning **without
+      booting**, so it can run for weeks between syncs and a resume triggers
+      nothing. Options, none of them taken unattended: accept on-demand-only (the
+      Owner runs the command when he adds music); hang the sync off
+      `wall-wake.service` so every morning's resume refreshes it; or a cheap daily
+      timer inside the awake window. This is a one-line decision, but it is a
+      decision — the ruling said boot + on demand and that is what shipped.
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)
@@ -164,8 +179,10 @@ last) — it is the record, not required reading for every pass.
   :80/:443 and NOTHING else, registers the two wall templates in
   `Personal\homelab\deploy\FieldSchema.psd1`, and works
   `stack/autoinstall/wall/WALL-BURN-IN.md` on a desk before the panel is
-  mounted**; decides OI-15 (`/media/*`'s origin) with the OfficeWallNaglight
-  side; fills in the wake values + the
+  mounted** — which now includes filling in `MEDIA_SHARE_UNC` + the share
+  credentials and working `WALL-BURN-IN.md` §8, since an unconfigured panel fails
+  `wall-sync.service` on every boot by design; answers OI-16 (does a resume also
+  sync?); fills in the wake values + the
   Windows-side WoL settings (OI-13) and the real ingest/exclusion values
   (OI-14); points the on-box IceDrive client at the chosen library paths
   (OI-11); creates the Google OAuth client
@@ -225,6 +242,7 @@ last) — it is the record, not required reading for every pass.
 | Wake-on-LAN pre-step + OI-9 `die` reporting | **Exercised for real on WSL2 (2026-07-29)** — magic-packet bytes, probe, timeout-dies-loudly, `die` paths posting `ok=false` — the wake half from a THROWAWAY harness, **not a committed sim leg**; the `die`-reports-`ok=false` contract is now asserted for real in `run-ingest-sim.sh` (e1–e3, plus the empty-share refusal). A real magic packet has never woken a real box (V3/hardware). `OFFSITE_PATH` needs no leg — the offsite step is retired (OI-11) |
 | **Wall kiosk site (SR-016) — the identity swap + the 403 default** | **GREEN — committed sim legs, `validate-sim.sh` checks 7-8 (2026-07-29):** a FORGED `X-Forwarded-User` arriving from the panel's `/32` reaches the tracker as `PANEL_USER_SUB` (read back off `/api/export`'s filename, so the identity the tracker actually saw is asserted, not inspected); the panel's `/api/today` is 200 and `/` serves the shell build without swallowing `/api/*`; the same two requests from a NON-panel source address get 403 with **Caddy's own body**, proving refusal at the edge rather than at the tracker. Untested by anything below hardware: the **off-LAN** 403 from a real WAN vantage, and whether Docker's port publish preserves the panel's source IP on the real box (it fails CLOSED if not) |
 | **Wall panel image (SR-017)** | **CONFIG-LEVEL ONLY, and that is all it claims.** A throwaway container harness ran `wall-firstboot.sh` twice against a bare `ubuntu:24.04` root with stub `systemctl`/`udevadm`/`netplan` — 27 assertions PASS on what it writes (lid conf, iio mask, the udev rule from both piped names + its re-enable hint, NM powersave/MAC pinning, netplan rendered 0600 with no `@@TOKEN@@` left, both timers re-rendered from a changed schedule, tty1-only autologin, mem_sleep reporting) — **not a committed sim leg.** NOTHING physical has run: no graphical session, no `cage`, no Wi-Fi association, no suspend/resume, no quirk verified against the actual panel. `WALL-BURN-IN.md` is the list |
+| **Wall media pull + manifests (OI-15)** | **Exercised FOR REAL on WSL2 Ubuntu (2026-07-29) — 67 assertions PASS from a THROWAWAY harness, not a committed sim leg.** The real `wall-sync.sh` ran via its supported `MEDIA_SOURCE_OVERRIDE` bench hook (a local fixture library instead of a cifs mount; everything after the mount is the production path): first sync, idempotent re-run, `--delete` propagation, the empty-subtree and missing-subtree REFUSALS with the cache proven untouched, the `WALL_SYNC_ALLOW_EMPTY` override clearing the cache, a non-UTF-8 filename skipped-and-counted, and 5 loud config guards. Both manifests pass `python3 -m json.tool`, and the emitted `index.json` was fed to **OfficeWallNaglight's real `normalizeManifest()` under node** (20 more assertions: stations, once-only URL encoding, quotes/`&`/`#`/non-ASCII round-tripping). **NOT tested by anything:** the cifs mount itself, Wi-Fi, library-scale volumes, the kiosk user reading the cache on a real box, and the *other* half of the ruling (the Electron host serving `/media/*`) — `WALL-BURN-IN.md` §8 is the list |
 | Q10.9 B+ image payload: `export-images.sh` save + `docker load` all 9 | PASS (WSL; loads idempotent) — first-boot load-at-VM awaits V3; **oauth2-proxy v7.15.2 pin bump needs a re-export + sim re-run (OI-7c)** |
 | Tier-2 pins exist on their registries (`docker manifest inspect`) | PASS — but tier-2 services have never been STARTED anywhere (enable-time validation, stack/README §9) |
 | Shell scripts `bash -n` | PASS |
@@ -1593,3 +1611,185 @@ decision surfaced and was deliberately NOT taken (**OI-15**).
 - **`WALL_PORT` is a new T0 knob** (public default, `8443`) and needs no
   FieldSchema entry; unlisted knobs are T0 by that schema's own rule.
 - Left alone on purpose: the ISO/payload wiring for the wall image, and OI-15.
+
+### DRIVER — G1 — Round 1 — 2026-07-29 (OI-15 RESOLVED by the Owner: the panel PULLS its media — built)
+
+The Owner ruled OI-15 the same evening it was opened, and the ruling is narrower
+and better than the "which origin serves `/media/*`" framing it answered:
+
+> Panel media is an AWOW network share; **the panel PULLS** — once after boot and
+> on demand via a dedicated SSH-invocable command — with **MIRROR semantics**
+> (`--delete`: content removed from the LAN source disappears from the panel
+> cache). `/media/*` is then served panel-locally by the shell's Electron host.
+
+So there is no `/media` route to design on the AWOW at all, and this repo owes the
+**pull**. Built here; the shell-side half (Electron mapping `/media/*` onto the
+cache) stays OfficeWallNaglight's.
+
+**What was built**
+
+- **`stack/autoinstall/wall/wall-sync.sh`** — mount `MEDIA_SHARE_UNC` read-only
+  over cifs (same option shape and credentials-file-first precedence as
+  `stack/backup/common.sh`'s `mount_cifs`), `rsync -a --delete` **only** the
+  share's `Music/` and `FrameVideos/` subtrees into
+  `WALL_MEDIA_CACHE/{music,frame}` (default `/var/cache/wall-media`), unmount via
+  an EXIT trap so no failure path leaves a mount behind. The subtree map is a
+  constant, not a knob: widening what the panel pulls is a decision, and a knob
+  would let a typo widen it silently onto a 256 GB disk.
+- **The guards are the ingest step's lessons, transplanted** (that code learned
+  them the expensive way): an **empty** source subtree, and separately an
+  **absent** one, does not get to mirror-delete a populated cache — the run
+  refuses, names the override, and leaves the cache untouched;
+  `WALL_SYNC_ALLOW_EMPTY=true` is the deliberate escape hatch and mirrors the
+  emptiness *through the same rsync* (an empty temp dir as the source) rather than
+  through a second deletion mechanism. Every failure is fatal and nonzero: the
+  panel has no NagLight feed of its own, so "loud" means a failed unit plus
+  journal lines.
+- **`wall-media-manifest.py`** — the sync's post-step, and the reason the
+  generator is Python rather than a bash JSON writer: the one thing that must not
+  be got wrong is string escaping, and a real library is full of quotes,
+  ampersands, `#` and non-ASCII. It emits `music/index.json` in
+  `LocalLibraryProvider`'s documented shape (albums from folders, `Artist/Album`
+  giving artist + album, `cover.jpg` as art, a leading track number parsed off the
+  title, root-level files as the documented **flat** `tracks` form) and
+  `frame/playlist.json` as `[{url,title}]`.
+- **THE ASYMMETRY THAT WOULD HAVE BITTEN**, found by reading both consumers rather
+  than assuming they matched: music `path` values must be **RAW** (`local.js`'s
+  `joinUrl()` percent-encodes every segment itself, so encoding here would
+  double-encode every space), while frame `url` values must be **ALREADY ENCODED**
+  (`frame.js` assigns them straight to `video.src`). Both are asserted, in both
+  directions.
+- `ensure_ascii=True` on both manifests, so a non-ASCII filename ships as `\uXXXX`
+  and cannot depend on the Electron host guessing a charset; a filename whose
+  bytes are not valid UTF-8 (a Windows library will produce one eventually) is
+  **skipped and counted** rather than emitted as a lone surrogate that would break
+  the whole manifest for one bad name.
+- **`wall-sync.service`** — `Type=oneshot`, `After=network-online.target` (the
+  panel is Wi-Fi-only, so that is load-bearing, not decorative) and
+  `After=wall-firstboot.service`, `WantedBy=multi-user.target`,
+  `TimeoutStartSec=3600` for the first full copy over 802.11,
+  `IOSchedulingClass=idle` so a sync cannot make the wall stutter. **No `.timer`**
+  — the ruling is boot + on demand, and re-`start`ing a oneshot IS the on-demand
+  path, so `sudo systemctl start wall-sync.service` is the whole documented
+  interface.
+- **The Caddyfile `TODO(OI-15)` stub is gone**, replaced by the one line the ruling
+  makes true: `/media/*` is panel-local, this site serves no `/media` route.
+- **Knobs + coverage**: `MEDIA_SHARE_UNC`, `WALL_MEDIA_CACHE`,
+  `WALL_SYNC_ALLOW_EMPTY`, `MEDIA_CIFS_CREDENTIALS`/`_USER`/`_PASS`/`_EXTRA` and
+  the commented `MEDIA_SOURCE_OVERRIDE` bench hook in `wall.env.example` (10 → 18
+  declared wall knobs); `validate_config.py` gained the `MEDIA_` namespace, the
+  three new files in its autoinstall-file list, and `wall-sync.sh` as a knob
+  consumer. `wall-firstboot.sh` gained a step 8 that creates the cache dirs,
+  enables the unit, and reports whether the share is configured; the wall
+  `user-data` grew `cifs-utils`, `rsync` and (explicitly) `python3`, plus the
+  late-commands that install the three files.
+
+**RAN FOR REAL (WSL2 Ubuntu + node on the Windows host, 2026-07-29)**
+
+- **A THROWAWAY harness — 67 assertions PASS, and it caught two real bugs.** The
+  harness drives the REAL `wall-sync.sh` through its `MEDIA_SOURCE_OVERRIDE` bench
+  hook against a fixture library with deliberately nasty filenames (apostrophe,
+  double quotes, `&`, `#`, non-ASCII, spaces), under `env -i` so nothing ambient
+  props it up. Covered: first sync into an empty cache; **`--delete` propagation**
+  (a file removed from the source disappears from the cache AND from
+  `index.json`); an idempotent no-op re-run; the **empty-subtree refusal** and the
+  **missing-subtree refusal**, each with the cache asserted file-count-unchanged
+  afterwards; `WALL_SYNC_ALLOW_EMPTY=true` clearing the cache and still emitting
+  valid JSON (`[]`); the non-UTF-8 filename skipped-and-counted; five loud config
+  guards (unset share, the shipped placeholder, a non-UNC share, a relative cache
+  path, a bogus override); and the generator-not-found path failing instead of
+  leaving synced media unlisted.
+- **THE HARNESS'S FIRST RUN FOUND THE BUG THAT MATTERED**, and it was a
+  self-inflicted one: the manifests live *inside* the directories the mirror
+  refreshes, so `--delete` removed them on every run and the file counts included
+  them — a no-op re-run therefore logged "1 file(s) were DELETED" and the
+  cache-clearing message was off by one. Both were fixed properly rather than by
+  adjusting the message: the mirror now `--exclude`s the top-level manifest
+  (anchored, so a same-named file inside an album is still mirrored) and every
+  logged count is a MEDIA count. The side benefit is real — a run that dies before
+  the post-step now leaves the last complete manifest in place instead of nothing.
+- **The emitted manifest was validated against the REAL CONSUMER, not against my
+  reading of it**: `node` importing `normalizeManifest`/`joinUrl` straight out of
+  `OfficeWallNaglight/js/music/local.js` (read-only; nothing in that repo was
+  touched) — **20 assertions PASS**: 4 tracks / 2 albums / 3 stations with the
+  endless shuffle first, `artUrl` and every track URL encoded exactly once
+  (`%2520` asserted absent), quotes/`&`/`#`/`Å` round-tripping into playable URLs,
+  album+artist inherited by tracks, and the flat form resolving. The frame playlist
+  was checked segment-by-segment and by `new URL(...)` resolution back to the real
+  filenames.
+- **`python3 -m json.tool` on both manifests**, in three states: populated, empty
+  (`[]`), and after the non-UTF-8 skip. All valid.
+- **`wall-firstboot.sh` was re-checked for real after gaining step 8** — a second
+  throwaway container harness (bare `ubuntu:24.04`, stub
+  `systemctl`/`udevadm`/`netplan`), **12 assertions PASS**: the shipped placeholder
+  template still exits 0, the cache dirs are created, the unit is enabled, the
+  placeholder share is warned about *with its consequence stated*, a filled share
+  is reported instead, and a missing `wall-sync.service` is called out rather than
+  silently skipped.
+- **`caddy validate` on the real Caddyfile after removing the `TODO(OI-15)` stub**
+  (pinned `caddy:2.11.4-alpine`, placeholder env + a valid bcrypt so provisioning
+  gets that far): **Valid configuration**, both servers still adapting.
+- **`bash -n` clean** on all five wall scripts; `py_compile` clean on the
+  generator (it is written to run on Python 3.8+, though the panel has 3.12).
+- **The new config-validate coverage was negative-tested**: an undeclared
+  `${MEDIA_BOGUS_KNOB}` in `wall-sync.sh` makes the run FAIL with exactly that
+  name, so the `MEDIA_` namespace is not vacuous.
+- **`python scripts/check.py` — G1 PASS**: config-validate (18 wall knobs, both
+  `user-data` files parse), registry-integrity `SN=13 SR=17 orphans=24
+  integrity=0`, doc-navigability 11 docs / 48 links / **0 broken**.
+
+**NOT run (honest gap)**
+
+- **No cifs mount was performed by any of this.** Every real run used the bench
+  hook, so `mount -t cifs`, the credentials file, `vers=3.0`, and the behaviour of
+  a share that vanishes mid-rsync are all untested here. The backup service's
+  ingest leg exercises the same `mount_cifs` shape against a real Samba container,
+  which is evidence for the *pattern* but not for this script.
+- **No panel, no Wi-Fi, no library-scale data.** Fixtures are kilobytes on ext4;
+  the first-sync duration over 802.11, the 256 GB disk budget with a real
+  `FrameVideos/`, and the interaction with the D-W4 sleep window are hardware.
+- **Nothing has ever read these manifests in the shell.** The consumer check ran
+  `normalizeManifest` in node, not the Electron host — and the *other half* of the
+  ruling (mapping `/media/*` onto the cache) does not exist yet in
+  OfficeWallNaglight, so end-to-end playback is unproven by construction.
+- **The kiosk user has never read the cache.** `--chmod=D755,F644` is asserted as
+  written config, not as an observed `sudo -u panel` read (burn-in §8 has the
+  check).
+- **Throwaway, not a committed sim leg** — same position as the wall image
+  harness: a cifs + Wi-Fi + graphical path cannot be exercised in the compose sim,
+  and a leg that only re-ran the bench hook would test the hook, not the pull.
+- **shellcheck is still not installed** on this machine or in the WSL Ubuntu — not
+  run, not claimed.
+- **No requirement-registry rows were added or edited** (`SN=13 SR=17` unchanged),
+  following this lane's precedent: the pull is the mechanism of an already-ratified
+  need (SR-017 / D-W8 rider / OWN-D5), not a new one. If the Owner wants the media
+  pull to carry its own SR row with its own verification method, that is a spine
+  edit for him.
+
+**For the Owner / next gate**
+
+- **OI-15 is closed on this side and half-open on the other.** The panel pulls; the
+  Electron host must serve `/media/*` from `WALL_MEDIA_CACHE`. That is one line in
+  `IF-005`'s contract and it is now the *only* `/media` question left.
+- **OI-16 (new) — does a RESUME also sync?** Implemented exactly as ruled (boot +
+  on demand), but `SLEEP_MODE=suspend` means the panel may not boot for weeks, so
+  in practice the cache is as fresh as the last SSH command. Three options are
+  written up in the item; none was taken unattended.
+- **A freshly imaged panel FAILS `wall-sync.service` on every boot** until
+  `MEDIA_SHARE_UNC` and the credentials are filled in. That is deliberate (a green
+  unit on a music-less wall would be a lie), but it is a thing to expect rather
+  than to debug — and it means `MEDIA_SHARE_UNC` + a root-only
+  `/etc/wall-panel/cifs.creds` join the panel's fill-in list, with the share's
+  identity coming from `Personal\deploy\storage-map.md`, not from a guess here.
+- **The share must have `Music/` and `FrameVideos/` AT ITS ROOT.** If the household
+  library's layout puts them somewhere else, that is a one-line change (a subpath
+  knob, or a different share) — say which, rather than letting the sync refuse.
+- **FieldSchema consequence:** `MEDIA_SHARE_UNC` is a T1-ish value and the share
+  password is T3. If the wall templates are registered as planned, the password
+  belongs in the secret store, not in `wall.env` — the script prefers a credentials
+  FILE for exactly that reason and warns when it falls back to inline.
+- **A disk-space question nobody has answered:** mirroring the whole `Music/` +
+  `FrameVideos/` tree onto a 256 GB panel disk is fine for music and possibly not
+  fine for video. If `FrameVideos/` is large, the honest fix is a curated subfolder
+  on the share rather than a filter here — that is the Owner's call about what the
+  wall should show.

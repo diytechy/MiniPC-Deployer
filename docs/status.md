@@ -150,15 +150,22 @@ last) — it is the record, not required reading for every pass.
       below for what ran for real. **Still owed by the OTHER side** (not this
       repo): the Electron host actually mapping `/media/*` onto the cache dir —
       OfficeWallNaglight's half of the same ruling.
-    - OI-16 — **a freshness question the ruling leaves open (2026-07-29, NEW):**
-      "once after boot" is implemented exactly as ruled, but with
-      `SLEEP_MODE=suspend` the panel resumes from S3 every morning **without
-      booting**, so it can run for weeks between syncs and a resume triggers
-      nothing. Options, none of them taken unattended: accept on-demand-only (the
-      Owner runs the command when he adds music); hang the sync off
-      `wall-wake.service` so every morning's resume refreshes it; or a cheap daily
-      timer inside the awake window. This is a one-line decision, but it is a
-      decision — the ruling said boot + on demand and that is what shipped.
+    - OI-16 — **RESOLVED 2026-07-29 (evening, the Owner): option (a) — the
+      wall-sync also fires on RESUME from suspend.** The panel suspends nightly
+      (`SLEEP_MODE=suspend`) and resumes without booting, so boot-only sync went
+      stale by design; now every wake behaves like a boot for freshness. Built
+      the same evening: `stack/autoinstall/wall/wall-sync-resume.service` — the
+      standard systemd resume hook (`After=suspend.target` +
+      `WantedBy=suspend.target`, so it starts when the suspend transaction
+      completes, i.e. at WAKE) running `systemctl start --no-block
+      wall-sync.service`. `--no-block` is what keeps the wake imperceptible: the
+      hook only enqueues and exits, and the sync runs detached with its own
+      journal/timeout/failure status. Wi-Fi wrinkle handled in `wall-sync.sh`:
+      `network-online.target` is not re-evaluated on resume, so the script does
+      a bounded non-fatal `nm-online` wait (30 s) before mounting; a still-down
+      network fails the mount loudly and the retry is the on-demand command.
+      Zero new knobs. See the audit entry below; the real suspend→wake firing is
+      hardware-only (WALL-BURN-IN.md §8).
   - **In flight** _(driver; no approval needed)_:
     - OI-4 — layering WI-10.2/10.11/10.12 onto the migrated base →
       [stack/docker-compose.yml](../stack/docker-compose.yml)
@@ -181,8 +188,9 @@ last) — it is the record, not required reading for every pass.
   `stack/autoinstall/wall/WALL-BURN-IN.md` on a desk before the panel is
   mounted** — which now includes filling in `MEDIA_SHARE_UNC` + the share
   credentials and working `WALL-BURN-IN.md` §8, since an unconfigured panel fails
-  `wall-sync.service` on every boot by design; answers OI-16 (does a resume also
-  sync?); fills in the wake values + the
+  `wall-sync.service` on every boot by design — §8 now also carries the OI-16a
+  hardware proof (suspend, wake, watch `journalctl -u wall-sync-resume -b` show
+  the sync fired); fills in the wake values + the
   Windows-side WoL settings (OI-13) and the real ingest/exclusion values
   (OI-14); points the on-box IceDrive client at the chosen library paths
   (OI-11); creates the Google OAuth client
@@ -1793,3 +1801,102 @@ cache) stays OfficeWallNaglight's.
   fine for video. If `FrameVideos/` is large, the honest fix is a curated subfolder
   on the share rather than a filter here — that is the Owner's call about what the
   wall should show.
+
+### DRIVER — G1 — Round 1 — 2026-07-29 (OI-16 RESOLVED by the Owner: wall-sync also fires on RESUME — built)
+
+The Owner decided OI-16 the same evening it was opened: **option (a)** — the
+media sync also fires on resume from suspend. The reasoning the item stated
+holds: with `SLEEP_MODE=suspend` the panel suspends nightly and resumes without
+booting, so "once after boot" was, in practice, "approximately never". Now every
+wake behaves like a boot for freshness. Zero new knobs, one new file.
+
+**What was built**
+
+- **`stack/autoinstall/wall/wall-sync-resume.service`** — the standard systemd
+  resume hook: `WantedBy=suspend.target` pulls it into the suspend transaction,
+  `After=suspend.target` orders it after that target is *reached* — which only
+  happens when `systemd-suspend.service` completes, i.e. **at wake**. So it
+  starts on resume, never at suspend time; `Type=oneshot` with no
+  `RemainAfterExit` drops it back to inactive so every later cycle fires again.
+- **`ExecStart=/usr/bin/systemctl start --no-block wall-sync.service`** — and
+  `--no-block` is load-bearing, not a flourish: the hook runs *inside* the
+  resume transaction, a plain `start` waits for the started job, and a first
+  full mirror is allowed up to an hour (`TimeoutStartSec=3600`). Blocking would
+  hold the resume transaction open for the whole sync; `--no-block` only
+  enqueues the job and returns, so the hook finishes in milliseconds, the wake
+  is never perceptibly delayed, and the sync runs detached as its own job with
+  its own journal, timeout and pass/fail (`journalctl -u wall-sync`). Same
+  unit, same code path as boot and on-demand — no second entry point to drift.
+- **The Wi-Fi race, handled where ordering cannot reach:**
+  `network-online.target` was reached at boot and is NOT re-evaluated on
+  resume, while re-association takes a few seconds after wake — so no unit
+  ordering can cover it. `wall-sync.sh` therefore gained a short **bounded**
+  wait before the real mount: `nm-online -q --timeout=30` (network-manager is
+  already in the wall image), **non-fatal in every branch** — success proceeds
+  silently, timeout warns and proceeds, a missing `nm-online` warns and
+  proceeds. The cifs mount remains the loud arbiter, and the documented retry
+  is the on-demand command. Boot/on-demand runs lose nothing (`nm-online`
+  returns immediately when the network is already up); the bench-hook path
+  skips the wait entirely (it touches no network).
+- **Only `suspend.target`** — the panel's one sleep path is `systemctl suspend`
+  from `wall-sleep.sh`; no code path can reach hibernate/hybrid-sleep, so those
+  targets are deliberately not listed rather than cargo-culted in.
+- **Wiring, consistent with wall-sync's own install:** the wall `user-data`
+  late-commands cp the unit and `systemctl enable` it (enabling is what plants
+  the `suspend.target.wants` symlink — an installed-but-disabled hook never
+  fires); `wall-firstboot.sh` step 8 re-enables it idempotently and warns, with
+  the consequence stated, if the file is missing. `validate_config.py`'s
+  autoinstall-file list gained the one new file; no knobs were added so the
+  knob coverage is unchanged (18 declared, still all accounted for).
+- **Docs:** `wall/README.md` (table row + the "no timer" bullet rewritten to
+  "a resume DOES sync", with the `--no-block` and Wi-Fi reasoning);
+  `WALL-BURN-IN.md` §8's "decide OI-16" checkbox replaced by the two hardware
+  proofs (an `rtcwake` suspend→wake with `journalctl -u wall-sync-resume -b`
+  showing the sync fired after the wake, and the same via the real
+  `wall-sleep.sh start` nightly path); the OI-16 item above → RESOLVED.
+
+**RAN FOR REAL (this machine + WSL, 2026-07-29)**
+
+- **`systemd-analyze verify` on the new unit** (systemd 255 in WSL): exit 0.
+  (The one warning — "marked executable" — is an artifact of the drvfs copy,
+  not of the unit.)
+- **`bash -n`** clean on both edited scripts (`wall-sync.sh`,
+  `wall-firstboot.sh`).
+- **The edited `wall-sync.sh` re-run end-to-end in WSL Ubuntu** through the
+  `MEDIA_SOURCE_OVERRIDE` bench hook under `env -i`: mirror + both manifests
+  regenerated, `python3 -m json.tool` valid on both, exit 0.
+- **All three nm-online branches exercised for real** with a stub on `PATH`:
+  called with exactly `-q --timeout=30`; exit-0 proceeds silently; exit-1
+  prints the "network still not up after 30s" warning and proceeds; absent
+  binary prints the skip warning. In each case the run still died LOUDLY at the
+  refused cifs mount (exit 1, cache untouched) — the arbiter is unchanged.
+- **`python scripts/check.py` — G1 PASS**: config-validate (the new file
+  present, 18 wall knobs, both `user-data` files still parse as YAML),
+  registry-integrity `SN=13 SR=17 orphans=24 integrity=0`, doc-navigability
+  11 docs / 48 links / 0 broken.
+
+**NOT run (honest gap)**
+
+- **No real suspend/resume fired this hook.** WSL cannot suspend, so
+  `WantedBy=suspend.target` actually triggering at wake — the entire point —
+  is asserted from the documented systemd semantics, not observed. Burn-in §8
+  now carries the two-step hardware proof.
+- **No real Wi-Fi re-association raced the sync.** The 30 s `nm-online` cap is
+  a judgment, not a measurement; if this radio routinely takes longer, burn-in
+  says to report it rather than tune silently.
+- **`--no-block`'s "wake never delayed" claim** is by construction (enqueue and
+  return), verified only as unit semantics — the perceptibility check is on the
+  burn-in list, on the panel.
+- **shellcheck is still not installed** on this machine or in the WSL Ubuntu —
+  not run, not claimed.
+
+**For the Owner / next gate**
+
+- OI-16 is **closed**: boot + resume + on demand, still no timer. The only
+  remainders are hardware (burn-in §8): see the hook fire after a real
+  suspend→wake, and once from the real nightly `wall-sleep.sh` path.
+- Freshness statement, updated and honest: the cache is now as fresh as the
+  **last wake or boot**, whichever is later — plus whatever `sudo systemctl
+  start wall-sync.service` was run in between. Music added during the panel's
+  awake hours still needs the on-demand command (or waits for tomorrow's
+  resume); that is the shape of option (a), stated rather than hidden.

@@ -59,10 +59,37 @@ autoinstall:
       # is unreachable over SSH until at least one valid key is present here.
       - "ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host"
 
-  # Whole-disk automatic layout (LVM). The AK41 has a single eMMC/SSD.
+  # Whole-disk automatic layout (LVM) — DESTRUCTIVE, and pinned on purpose.
+  #
+  # !! READ THIS BEFORE CHANGING IT !!
+  # `layout:` wipes the disk it selects, unattended, with no confirmation:
+  # `interactive-sections: []` above means the installer NEVER stops to ask,
+  # and the repacked ISO puts `autoinstall` on the kernel command line so it
+  # begins immediately at boot. There is NO machine validation step and no
+  # "are you sure" — first power-on IS the install.
+  #
+  # Without a `match:` the installer picks a disk by its own heuristic, and
+  # EVERY attached disk is a candidate — including the USB library and backup
+  # drives. On this box those are 4 TB and 8 TB, i.e. far larger than the
+  # internal disk, so a size-based heuristic would choose exactly the drive
+  # holding the family's data. Pinning the path removes that entire class of
+  # accident.
+  #
+  # The AK41's internal disk is an NVMe (FORESEE P900F128GBH, 119.2 GB) — the
+  # 2026-07-26 hardware baseline confirms `nvme0n1`; earlier comments in this
+  # repo called it eMMC, which was wrong. The library/backup drives enumerate
+  # as USB `sd*`, so the nvme path also distinguishes by bus, not just name.
+  #
+  # DIFFERENT HARDWARE? Change this path (or switch to `serial:`/`model:` —
+  # a serial is more precise but is device-identifying, so keep real serials
+  # out of this public repo and materialize them from Personal if wanted).
+  # STILL RECOMMENDED regardless: physically detach the USB data drives before
+  # imaging. Defence in depth costs nothing here.
   storage:
     layout:
       name: lvm
+      match:
+        path: /dev/nvme0n1
 
   packages:
     - ca-certificates

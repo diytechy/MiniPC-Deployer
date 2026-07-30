@@ -85,9 +85,21 @@ autoinstall:
   # with no disk at all). Nothing here is precious — quirk 4b makes unclean
   # power-cuts routine, which is survivable precisely because the panel is a
   # cache. See WALL-BURN-IN.md for the fsck-must-not-block check.
+  # DESTRUCTIVE and unattended — same warning as the AWOW variant. Without a
+  # `match:` the installer picks a disk by its own heuristic and every attached
+  # disk is a candidate.
+  #
+  # Pinned by MODEL rather than path: the panel's internal disk is SATA
+  # (KINGSTON RBU-SNS8152S3256GG2, 238.5 GB — 2026-07-26 baseline) and so
+  # enumerates as `sd*`, exactly like the USB install stick. A `path:` match
+  # would therefore be a coin flip on enumeration order, and losing it means
+  # imaging the stick you booted from. The model string is stable and, unlike a
+  # serial, is not device-identifying, so it is safe in this public repo.
   storage:
     layout:
       name: lvm
+      match:
+        model: KINGSTON RBU-SNS8152S3256GG2
 
   packages:
     - ca-certificates

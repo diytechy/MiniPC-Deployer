@@ -102,10 +102,13 @@ while IFS= read -r line; do
             case "$opts" in
                 *uid=*) : ;;
                 *)
-                    log "WARN: $mnt is NTFS but mounted without uid=/gid=. Every file will be"
-                    log "      owned by root and Samba writes from household accounts will FAIL."
-                    log "      Add to its /etc/fstab line:  uid=0,gid=$(getent group sambashare >/dev/null 2>&1 && echo sambashare || echo users),umask=0002"
-                    log "      then: mount -o remount $mnt   (see open-items A15)"
+                    log "WARN: $mnt is NTFS but mounted without uid=/gid=. ntfs3 synthesizes"
+                    log "      ownership from the MOUNT options, so every file is root-owned and"
+                    log "      Samba writes from household accounts will FAIL regardless of the"
+                    log "      share ACLs. Expected options for the library:"
+                    log "        uid=0,gid=3000,umask=0002    (gid 3000 = the household group)"
+                    log "      Re-generate the fstab fragment (Generate-FromStorageMap.ps1) rather"
+                    log "      than hand-editing, then: mount -o remount $mnt   (open-items A15)"
                     rc=1 ;;
             esac ;;
     esac

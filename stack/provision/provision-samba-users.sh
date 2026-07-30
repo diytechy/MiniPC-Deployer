@@ -66,6 +66,34 @@ if [ "$perms" != "600" ] && [ "$perms" != "400" ]; then
     chmod 0600 "$CREDS"
 fi
 
+# ── the household group (A15) ────────────────────────────────────────────────
+# The library is NTFS, and ntfs3 synthesizes ownership from the MOUNT options
+# rather than storing it per file. Every file on that volume therefore reports
+# gid=HOUSEHOLD_GID, and a household account can only WRITE if it is in that
+# group. This is not the access-control boundary — Samba's per-share
+# `valid users` is, and it gates the connection before any file is touched.
+# This group only makes the write mechanically possible.
+#
+# GID is fixed and numeric to match the generated fstab: ntfs3's options are
+# parsed in the kernel, which cannot resolve a group name.
+HOUSEHOLD_GROUP="household"
+HOUSEHOLD_GID=3000
+if getent group "$HOUSEHOLD_GID" >/dev/null 2>&1; then
+    existing="$(getent group "$HOUSEHOLD_GID" | cut -d: -f1)"
+    if [ "$existing" != "$HOUSEHOLD_GROUP" ]; then
+        log "FATAL: gid $HOUSEHOLD_GID is already group '$existing', not '$HOUSEHOLD_GROUP'."
+        log "  The generated fstab pins gid=$HOUSEHOLD_GID for the library mount, so this"
+        log "  collision would silently give '$existing' write access to the whole library."
+        exit 1
+    fi
+    log "group $HOUSEHOLD_GROUP (gid $HOUSEHOLD_GID) exists"
+elif groupadd -g "$HOUSEHOLD_GID" "$HOUSEHOLD_GROUP"; then
+    log "group $HOUSEHOLD_GROUP created (gid $HOUSEHOLD_GID)"
+else
+    log "FATAL: could not create group $HOUSEHOLD_GROUP — household accounts would be unable to write to the NTFS library."
+    exit 1
+fi
+
 rc=0
 created=0; updated=0
 while IFS= read -r line || [ -n "$line" ]; do
@@ -88,6 +116,17 @@ while IFS= read -r line || [ -n "$line" ]; do
         else
             log "ERROR: useradd failed for '$account'"; rc=1; continue
         fi
+    fi
+
+    # Membership in the household group is what lets this account WRITE to the
+    # NTFS library (see the group block above). Idempotent.
+    if id -nG "$account" 2>/dev/null | tr ' ' '\n' | grep -qxF "$HOUSEHOLD_GROUP"; then
+        :
+    elif usermod -aG "$HOUSEHOLD_GROUP" "$account"; then
+        log "  '$account' added to $HOUSEHOLD_GROUP"
+    else
+        log "  ERROR: could not add '$account' to $HOUSEHOLD_GROUP — its writes to the library will fail"
+        rc=1
     fi
 
     # -s reads two newline-separated copies from stdin; the password never

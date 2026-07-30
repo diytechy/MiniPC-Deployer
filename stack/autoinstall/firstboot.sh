@@ -139,6 +139,20 @@ bash "$STACK_DIR/provision/provision-technitium.sh" --env "$STACK_DIR/.env"
 log "bootstrapping Actual (server password from FINANCE_ACTUAL_PASSWORD)…"
 bash "$STACK_DIR/provision/provision-actual.sh" --env "$STACK_DIR/.env"
 
+# ── 5c. Samba household accounts (A13) ───────────────────────────────────────
+# One Unix+Samba identity per storage-map §2 entry, each with ITS OWN password
+# from the store — the thing that makes §3's per-share ACLs real rather than
+# decorative. A no-op when the creds file was never shipped; loud when Samba
+# itself is missing (see Personal open-items A14 — the share-serving lane is
+# NOT yet built, so this currently has nothing to add users to on a stock box).
+if [ -f /etc/awow-samba/samba-users.creds ]; then
+    log "provisioning Samba household accounts…"
+    bash "$STACK_DIR/provision/provision-samba-users.sh" || \
+        log "WARN: Samba account provisioning failed — private shares will be unreachable"
+else
+    log "no /etc/awow-samba/samba-users.creds — skipping Samba accounts (A13/A14)"
+fi
+
 # ── 6. make the host itself use local DNS ────────────────────────────────────
 # systemd-resolved: point it at 127.0.0.1 so the box resolves its own zone.
 if systemctl is-active --quiet systemd-resolved; then

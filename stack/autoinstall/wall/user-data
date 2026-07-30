@@ -98,6 +98,12 @@ autoinstall:
     - fonts-dejavu-core
     - util-linux           # rtcwake — the PRIMARY wake source (D-W4)
     - network-manager      # quirk 5: powersave off, and the netplan renderer
+    # ---- the media sync (OI-15): the panel PULLS, so it needs a cifs client ---
+    - cifs-utils           # mount.cifs — the read-only mount of the media share
+    - rsync                # the mirror itself (`rsync -a --delete`)
+    - python3              # wall-media-manifest.py (JSON escaping, not bash).
+                           # Present anyway (cloud-init needs it); listed so the
+                           # dependency is explicit rather than inherited by luck.
     - alsa-utils           # audio sink pinning (WSN-012 lives in the app's runbook)
     - pulseaudio-utils
     - va-driver-all        # VA-API decode; quirk 6 says PROVE it is engaged
@@ -136,6 +142,9 @@ autoinstall:
     # wall-sleep/-wake — the D-W4 sleep window; their .timer files are RENDERED
     #                    by firstboot from SLEEP_START/SLEEP_END (systemd cannot
     #                    interpolate an env var into OnCalendar).
+    # wall-sync        — ONCE AFTER BOOT, and on demand over SSH: mirror the
+    #                    library share's Music/ + FrameVideos/ into the panel's
+    #                    media cache (OI-15). No timer, by the ruling.
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.service /target/etc/systemd/system/wall-firstboot.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh /target/usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-firstboot.sh
@@ -150,6 +159,14 @@ autoinstall:
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sleep.sh
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-kiosk.sh /target/usr/local/bin/wall-kiosk.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/bin/wall-kiosk.sh
+    # wall-sync — the media pull (OI-15). Boot-once + on-demand oneshot; NO timer,
+    # by the ruling. The manifest generator is installed NEXT TO the script because
+    # wall-sync.sh looks for it there first (and in the payload dir as a fallback).
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync.service /target/etc/systemd/system/wall-sync.service
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync.sh /target/usr/local/sbin/wall-sync.sh
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-media-manifest.py /target/usr/local/sbin/wall-media-manifest.py
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sync.sh /usr/local/sbin/wall-media-manifest.py
+    - curtin in-target --target=/target -- systemctl enable wall-sync.service
     # Seat access for the kiosk user (cage needs the DRM/input devices).
     - curtin in-target --target=/target -- usermod -aG video,input,render panel
 

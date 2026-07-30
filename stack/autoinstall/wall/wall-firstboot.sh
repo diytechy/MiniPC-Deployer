@@ -23,7 +23,9 @@
 #      report what /sys/power/mem_sleep actually says (the mem_sleep_default=deep
 #      decision — see user-data §6).
 #   7. Autologin the kiosk user on tty1 so cage gets a real logind SEAT.
-#   8. Stamp the marker.
+#   8. OI-15 — the media cache + the pull unit: create the cache dir, make sure
+#      wall-sync.service is enabled, and REPORT whether the share is configured.
+#   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
 # the running hardware can supply (input device names, the backlight interface,
@@ -225,7 +227,36 @@ EOF
 systemctl daemon-reload
 log "kiosk: tty1 autologin + profile hook installed (session starts on next boot)"
 
-# ── 8. done ──────────────────────────────────────────────────────────────────
+# ── 8. OI-15 — the media cache and the pull unit ─────────────────────────────
+# The panel PULLS its media (the Owner's ruling, 2026-07-29): wall-sync.service
+# mirrors the share's Music/ + FrameVideos/ into WALL_MEDIA_CACHE at boot and on
+# demand. Firstboot's job here is only to make the destination exist and the unit
+# be enabled — the sync itself is NOT run from here, because a first sync can be
+# the whole library over Wi-Fi and firstboot must not block on it.
+: "${WALL_MEDIA_CACHE:=/var/cache/wall-media}"
+install -d -m 0755 "$WALL_MEDIA_CACHE" "$WALL_MEDIA_CACHE/music" "$WALL_MEDIA_CACHE/frame"
+log "OI-15: media cache ready at $WALL_MEDIA_CACHE (music/ + frame/)"
+if [ -f /etc/systemd/system/wall-sync.service ]; then
+    systemctl enable wall-sync.service >/dev/null 2>&1 \
+        || warn "could not enable wall-sync.service — check: systemctl status wall-sync.service"
+else
+    warn "wall-sync.service is not installed (the autoinstall late-commands place it)."
+    warn "Without it the panel will never pull media. Re-image, or copy it from"
+    warn "$PAYLOAD/wall-sync.service by hand."
+fi
+case "${MEDIA_SHARE_UNC:-}" in
+    ''|*REPLACE_WITH*)
+        warn "OI-15: MEDIA_SHARE_UNC is unset/placeholder — the panel has NO media source."
+        warn "wall-sync.service will FAIL loudly at boot until it is filled in (that is"
+        warn "deliberate: a wall with no music and a green unit would be a lie)."
+        ;;
+    *)
+        log "OI-15: media source is $MEDIA_SHARE_UNC (mirror: Music/ + FrameVideos/, --delete)"
+        log "OI-15: sync now, or any time, with: sudo systemctl start wall-sync.service"
+        ;;
+esac
+
+# ── 9. done ──────────────────────────────────────────────────────────────────
 install -d -m 0755 "$(dirname "$MARKER")"
 date > "$MARKER"
 log "panel configuration complete. Remaining checks are hardware-only:"

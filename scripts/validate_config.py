@@ -97,12 +97,21 @@ def caddy_env_passed(compose_text):
 
 # The wall panel variant is configured by a shell-sourced env file, not by
 # compose, so its knobs live in these NAMESPACES by convention. A reference to
-# `${WALL_...}`/`${WIFI_...}`/`${SLEEP_...}`/`${NAVIDROME_...}`/`${PANDORA_...}`
-# in a wall script is therefore a KNOB and must be declared in wall.env.example;
-# anything else (ENV_FILE, MARKER, loop variables) is a local and is ignored. The
-# namespace rule is what keeps this check free of false positives as the scripts
-# grow — add a namespace here if a genuinely new family of knobs appears.
-WALL_KNOB_NAMESPACES = ("WALL_", "WIFI_", "SLEEP_", "NAVIDROME_", "PANDORA_")
+# `${WALL_...}`/`${WIFI_...}`/`${SLEEP_...}`/`${MEDIA_...}`/`${NAVIDROME_...}`/
+# `${PANDORA_...}` in a wall script is therefore a KNOB and must be declared in
+# wall.env.example; anything else (ENV_FILE, MARKER, loop variables) is a local
+# and is ignored. The namespace rule is what keeps this check free of false
+# positives as the scripts grow — add a namespace here if a genuinely new family
+# of knobs appears. `MEDIA_` was added by OI-15 (the panel's media pull:
+# MEDIA_SHARE_UNC, the cifs credential knobs, and the bench override).
+WALL_KNOB_NAMESPACES = (
+    "WALL_",
+    "WIFI_",
+    "SLEEP_",
+    "MEDIA_",
+    "NAVIDROME_",
+    "PANDORA_",
+)
 
 
 def is_wall_knob(name):
@@ -233,6 +242,13 @@ def main():
         "autoinstall/wall/wall-wake.service",
         "autoinstall/wall/wall-sleep.sh",
         "autoinstall/wall/wall-kiosk.sh",
+        # OI-15 — the media pull. The unit + the script + the manifest generator
+        # the script invokes as its post-step (a synced cache with no manifest is
+        # a panel that shows no music at all, so the generator is as load-bearing
+        # as the sync itself).
+        "autoinstall/wall/wall-sync.service",
+        "autoinstall/wall/wall-sync.sh",
+        "autoinstall/wall/wall-media-manifest.py",
         # Read by wall-firstboot.sh rather than by user-data, but just as fatal
         # if absent — a panel with no netplan has no network at all (no RJ45).
         "autoinstall/wall/netplan-wifi.yaml.template",
@@ -253,6 +269,7 @@ def main():
             wall_dir / "wall-sleep.sh",
             wall_dir / "wall-wakeprep.sh",
             wall_dir / "wall-kiosk.sh",
+            wall_dir / "wall-sync.sh",
             wall_dir / "netplan-wifi.yaml.template",
             wall_dir / "user-data",
         ]

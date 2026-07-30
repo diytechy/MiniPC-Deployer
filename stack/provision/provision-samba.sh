@@ -41,6 +41,17 @@ while [ $# -gt 0 ]; do
 done
 log() { echo "[provision-samba] $*"; }
 
+# Every generated share stanza names this binary as `root preexec` with
+# `close = yes`. If it is absent, Samba treats "cannot run" as failure and
+# EVERY share refuses EVERY connection with an opaque error. firstboot installs
+# it first, but this script is also the documented standalone re-run path.
+if [ ! -x /usr/local/sbin/awow-library-guard ]; then
+    log "FATAL: /usr/local/sbin/awow-library-guard is missing or not executable."
+    log "  Every share stanza references it as root preexec, so smbd would refuse"
+    log "  every connection. Install it:  install -m0755 $STACK_DIR/samba/library-guard.sh /usr/local/sbin/awow-library-guard"
+    exit 1
+fi
+
 if ! command -v smbd >/dev/null 2>&1; then
     log "FATAL: smbd not installed. The autoinstall package list should carry 'samba'."
     exit 1
@@ -100,8 +111,18 @@ log "installed /etc/samba/smb.conf (global + $(grep -c '^\[' "$FRAGMENT") share 
 while IFS= read -r p; do
     [ -n "$p" ] || continue
     if [ ! -d "$p" ]; then
-        log "creating missing share path $p"
-        install -d -m 0775 "$p"
+        # LOUD, not quiet. The library IS mounted at this point (checked above),
+        # so a missing share path means the storage map disagrees with the
+        # disk — and ntfs3 is case-sensitive, so `NonDocs` vs `Nondocs` lands
+        # here. Creating it silently would serve a brand-new EMPTY share next
+        # to the real data with nothing reporting a problem (open-items C15).
+        log "WARNING: share path does not exist on the mounted library: $p"
+        log "         The storage map and the disk disagree. Creating it, but the"
+        log "         share will be EMPTY — verify the real folder name (case matters)."
+        # mkdir, not `install -d`: install -d also chmods, which returns
+        # EOPNOTSUPP on ntfs3 and under `set -e` would abort this script AFTER
+        # smb.conf was already written, skipping account provisioning entirely.
+        mkdir -p "$p" 2>/dev/null || log "         ERROR: could not create $p"
     fi
 done < <(awk -F'=' '/^[[:space:]]*path[[:space:]]*=/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2 }' "$FRAGMENT")
 

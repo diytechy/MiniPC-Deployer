@@ -156,7 +156,6 @@ install -m 0755 "$STACK_DIR/samba/library-guard.sh" /usr/local/sbin/awow-library
 install -m 0644 "$STACK_DIR/samba/awow-library-health.service" /etc/systemd/system/awow-library-health.service
 install -m 0644 "$STACK_DIR/samba/awow-library-health.timer"   /etc/systemd/system/awow-library-health.timer
 systemctl daemon-reload
-systemctl enable --now awow-library-health.timer >/dev/null 2>&1 ||     log "WARN: could not enable awow-library-health.timer — a vanished drive would go unreported"
 
 log "mounting storage-map data drives…"
 bash "$STACK_DIR/provision/provision-mounts.sh" || \
@@ -171,11 +170,22 @@ if [ -f /etc/awow-samba/smb.conf.fragment ]; then
     else
         log "WARN: Samba server did not come up — every §3 share is unreachable. Accounts skipped."
     fi
+elif [ -f /etc/awow-samba/.site-present ]; then
+    # The USB DID carry a site/ payload, but the fragment did not survive the
+    # install. That is a broken production stick, not a sim build - and the
+    # reassuring "expected on sim builds" message below would be a lie.
+    log "FATAL: site payload was present but /etc/awow-samba/smb.conf.fragment is missing."
+    log "  Every §3 share is unreachable. The late-command copy failed or the"
+    log "  payload was incomplete. Rebuild with Build-VentoyStick.ps1 and re-image."
 else
-    log "no /etc/awow-samba/smb.conf.fragment — skipping the file server (A14)."
-    log "  Expected on a sim/vmtest build. On a real box it means the USB payload"
-    log "  carried no site/ directory: rebuild the stick with Build-VentoyStick.ps1."
+    log "no /etc/awow-samba/smb.conf.fragment and no site payload marker —"
+    log "  skipping the file server (A14). Expected ONLY on a sim/vmtest build."
 fi
+
+# Enable the health timer AFTER mounting, not before: OnBootSec=3min has long
+# elapsed by the time firstboot runs, so `enable --now` fires immediately and
+# would post a spurious library-mounted ok=false against an unmounted library.
+systemctl enable --now awow-library-health.timer >/dev/null 2>&1 ||     log "WARN: could not enable awow-library-health.timer — a vanished drive would go unreported"
 
 # ── 6. make the host itself use local DNS ────────────────────────────────────
 # systemd-resolved: point it at 127.0.0.1 so the box resolves its own zone.

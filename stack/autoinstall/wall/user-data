@@ -99,7 +99,7 @@ autoinstall:
     layout:
       name: lvm
       match:
-        model: KINGSTON RBU-SNS8152S3256GG2
+        model: KINGSTON*RBU-SNS8152S3256GG2
 
   packages:
     - ca-certificates

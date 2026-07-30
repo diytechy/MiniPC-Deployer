@@ -141,6 +141,16 @@ render_seed_tree() {
             die "user-data.filled has an active setting still holding a REPLACE_WITH placeholder — re-run Materialize-Deploy.ps1 and fix what it names."
         grep -Eq '^[[:space:]]*allow-pw:[[:space:]]*true' "$user_data_out" && \
             die "user-data.filled sets allow-pw: true — production is SSH-key-only (WI-10.12). Refusing to bake it."
+        # THE MOST DESTRUCTIVE LINE IN THE PROJECT WAS THE ONLY UNGUARDED ONE.
+        # `storage: layout:` wipes whatever disk Subiquity selects, unattended.
+        # Without a `match:` it picks by heuristic and EVERY attached disk is a
+        # candidate — including the 4 TB library and 8 TB backup drives, both an
+        # order of magnitude larger than the 128 GB internal NVMe. A `match:`
+        # that matches nothing HALTS the install (fail-safe); an absent one does
+        # not. Caught by review 2026-07-30 against a real staged payload that
+        # predated the pinning fix by 46 minutes.
+        grep -Eq '^[[:space:]]+(path|serial|model|wwn):' "$user_data_out" || \
+            die "user-data.filled has no storage.layout match: — the unattended wipe would pick a disk by heuristic and the library/backup drives are candidates. Re-run Materialize-Deploy.ps1 (its out\\ tree is stale)."
     else
     sed \
         -e "s#- \"ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host\"#- \"$ssh_pubkey\"#" \
@@ -174,6 +184,13 @@ render_seed_tree() {
     # into deploy-payload/site/ and returns before the sim .env block. The
     # autoinstall late-command 4b installs them into /etc/awow-samba,
     # /etc/awow-backup and stack/.env on the target.
+    # SITE_DIR set but no user-data.filled would be a SILENT DOWNGRADE: the
+    # site/ files (real secrets) would still be staged while user-data fell
+    # through to the sim sed above — producing a "production" stick with
+    # allow-pw: true and a known sim password hash. Refuse instead of mixing.
+    if [ -n "${SITE_DIR:-}" ] && [ ! -f "$SITE_DIR/user-data.filled" ]; then
+        die "SITE_DIR=$SITE_DIR is set but has no user-data.filled — refusing to stage real secrets onto a SIM-substituted user-data (allow-pw would be true). Run Materialize-Deploy.ps1 -Image awow."
+    fi
     if [ -n "${SITE_DIR:-}" ] && [ -d "$SITE_DIR" ]; then
         local site_out="$payload_dir/site"
         mkdir -p "$site_out"

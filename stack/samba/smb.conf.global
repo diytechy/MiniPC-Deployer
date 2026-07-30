@@ -31,9 +31,17 @@
    # (nobody can reach the shares), which is the safe direction.
    hosts allow = 192.168.117.0/24 127.0.0.1
    hosts deny = 0.0.0.0/0
-   # Never answer on anything but the LAN NIC and loopback.
+   # Never answer on anything but the LAN and loopback.
+   #
+   # Written as a NETWORK, not a NIC name. Samba resolves a network to whichever
+   # interface holds it, so this survives a NIC rename (eno1 -> enp2s0 after a
+   # kernel or firmware change). With `bind interfaces only = yes`, an interface
+   # name that does not exist makes smbd bind loopback ONLY — it still starts,
+   # testparm still passes, provisioning still reports "serving 8 shares", and
+   # nobody on the LAN can connect, with nothing saying why. Exactly the silent
+   # failure this project forbids. (Review finding, 2026-07-30.)
    bind interfaces only = yes
-   interfaces = lo eno1
+   interfaces = lo 192.168.117.0/24
 
    # ── protocol hygiene ─────────────────────────────────────────────────────
    # SMB1 is off: it is the vulnerable, deprecated dialect (EternalBlue et al)

@@ -34,7 +34,9 @@ if [ ! -f "$FSTAB_FRAGMENT" ]; then
 fi
 
 added=0
-while IFS= read -r line; do
+rc=0        # was never initialised and never read — every failure below was
+            # reported as success and firstboot's `|| log WARN` could not fire.
+while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|\#*) continue ;; esac
     dev="$(printf '%s' "$line"  | awk '{print $1}')"
     mnt="$(printf '%s' "$line"  | awk '{print $2}')"
@@ -61,11 +63,16 @@ while IFS= read -r line; do
     # This is deliberately independent of the Samba preexec guard: config can
     # drift, a fragment can be regenerated wrong, someone can add a share by
     # hand. A 000 directory needs no configuration to be correct.
-    if [ -d "$mnt" ] && ! mountpoint -q "$mnt"; then
+    # NEVER touch a MOUNTED filesystem. firstboot runs on EVERY boot (its unit
+    # has no ConditionPathExists and the script never reads its own marker), so
+    # on boot 2+ the drive is already mounted here — and `install -d` chmods an
+    # existing directory, which would have tried to chmod the root of the ntfs3
+    # volume, and on ext4 would have succeeded and dropped the group-write bit
+    # that household writes depend on. (Review finding, 2026-07-30.)
+    if [ ! -e "$mnt" ]; then
+        install -d -m 000 "$mnt"
+    elif ! mountpoint -q "$mnt"; then
         chmod 000 "$mnt" 2>/dev/null || true
-    else
-        install -d "$mnt" 2>/dev/null || true
-        mountpoint -q "$mnt" || chmod 000 "$mnt" 2>/dev/null || true
     fi
 
     if [ ! -e "$dev" ]; then
@@ -131,4 +138,7 @@ done < "$FSTAB_FRAGMENT"
 
 [ "$added" -gt 0 ] && systemctl daemon-reload || true
 log "done: $added fstab entry/entries added."
-exit 0
+if [ "$rc" -ne 0 ]; then
+    log "FAILURES ABOVE — at least one drive is missing, read-only, or wrongly mounted."
+fi
+exit "$rc"

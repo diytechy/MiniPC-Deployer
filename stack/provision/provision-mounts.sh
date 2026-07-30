@@ -51,7 +51,22 @@ while IFS= read -r line; do
         added=$((added + 1))
     fi
 
-    install -d -m 0775 "$mnt"
+    # BELT AND BRACES: the BARE mountpoint (the directory on the eMMC that the
+    # real disk mounts over) is chmod 000. While the drive IS mounted this is
+    # invisible — the mount's own uid/gid/umask apply, and ntfs3 ignores the
+    # underlying inode entirely. The moment the drive is absent, that empty
+    # directory becomes unreadable to everything, so nothing can quietly serve
+    # it or write into it and fill the system disk.
+    #
+    # This is deliberately independent of the Samba preexec guard: config can
+    # drift, a fragment can be regenerated wrong, someone can add a share by
+    # hand. A 000 directory needs no configuration to be correct.
+    if [ -d "$mnt" ] && ! mountpoint -q "$mnt"; then
+        chmod 000 "$mnt" 2>/dev/null || true
+    else
+        install -d "$mnt" 2>/dev/null || true
+        mountpoint -q "$mnt" || chmod 000 "$mnt" 2>/dev/null || true
+    fi
 
     if [ ! -e "$dev" ]; then
         log "WARN: $dev is not present — $mnt will stay empty until the drive is attached."

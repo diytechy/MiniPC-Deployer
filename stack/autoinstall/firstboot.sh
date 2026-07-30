@@ -149,6 +149,15 @@ bash "$STACK_DIR/provision/provision-actual.sh" --env "$STACK_DIR/.env"
 #   users   -> one identity per storage-map §2 entry, each with its OWN
 #              password, which is what makes §3's per-share ACLs real.
 # All three are no-ops when their site files were not shipped (sim/vmtest).
+# The mount guard must exist BEFORE the shares reference it: every share
+# stanza names it as `root preexec`, and a missing guard would make Samba
+# refuse every connection (preexec close = yes treats "cannot run" as failure).
+install -m 0755 "$STACK_DIR/samba/library-guard.sh" /usr/local/sbin/awow-library-guard
+install -m 0644 "$STACK_DIR/samba/awow-library-health.service" /etc/systemd/system/awow-library-health.service
+install -m 0644 "$STACK_DIR/samba/awow-library-health.timer"   /etc/systemd/system/awow-library-health.timer
+systemctl daemon-reload
+systemctl enable --now awow-library-health.timer >/dev/null 2>&1 ||     log "WARN: could not enable awow-library-health.timer — a vanished drive would go unreported"
+
 log "mounting storage-map data drives…"
 bash "$STACK_DIR/provision/provision-mounts.sh" || \
     log "WARN: drive mounting reported a problem — see above"

@@ -31,9 +31,11 @@ Nothing in this repo builds, vendors, or vendors-in the shell.
 
 ## Two things NOT served from here
 
-- **`/media/*`** — the panel's music/frame cache. It lives on the *panel's* disk
-  (D-W8 rider: music plays from the local copy), so a document root on the AWOW
-  cannot serve it. See the `TODO(OI-15)` in the Caddyfile: this is an open
-  cross-repo decision, not an omission.
+- **`/media/*`** — the panel's music/frame cache. **Settled by the Owner
+  2026-07-29 (OI-15): it is PANEL-LOCAL.** The panel pulls the media itself
+  (`stack/autoinstall/wall/wall-sync.sh`, mirror semantics) and the shell's
+  Electron host serves `/media/*` from that cache, so this site has no `/media`
+  route and never will — an AWOW-served fallback would be streaming, which is what
+  D-W8 chose against.
 - **`/music`** — optional Navidrome streaming, a commented `handle_path` stub in
   the Caddyfile gated on the `navidrome` tier-2 profile.

@@ -151,21 +151,7 @@
         #     reverse_proxy navidrome:4533
         # }
         #
-        # ---- TODO(OI-15) — where /media/* is served from is NOT decided --------
-        # The shell's local-library manifest defaults to `/media/music/index.json`
-        # and the frame playlist to `/media/frame/playlist.json`, and both must be
-        # on the SHELL'S OWN ORIGIN. But the ratified design (D-W8 rider, OWN-D5)
-        # has that media on the PANEL's disposable cache — which this site, running
-        # on the AWOW box, cannot serve. The likely resolution is panel-side (the
-        # Electron container intercepting /media/* for its local cache), which is
-        # OfficeWallNaglight's call, not the image's. An AWOW-served fallback
-        # would be a plain file_server over MEDIA_ROOT — but that is STREAMING,
-        # which is the thing D-W8 chose against, so it is left commented and
-        # unratified rather than quietly enabled:
-        # handle_path /media/* {
-        #     root * /srv/media
-        #     file_server
-        # }
+        # ---- /media/* is PANEL-LOCAL by ruling (OI-15, 2026-07-29) — no route here.
     }
 
     # Everything else — including every WAN packet if one ever arrives. A second

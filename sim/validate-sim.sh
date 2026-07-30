@@ -15,6 +15,11 @@
 #   5  multi-user isolation over HTTP: X-Forwarded-User A vs B see only their own
 #      data, and A's /api/export contains only A's items
 #   6  /api/feed round-trip appears in /api/today
+#   7  wall kiosk site (SR-016): a FORGED X-Forwarded-User from the panel's /32 is
+#      stripped and replaced with PANEL_USER_SUB before the tracker sees it; the
+#      static shell is served from the same origin without swallowing /api/*
+#   8  wall kiosk site: the 403 default — the same requests from a NON-panel
+#      address get Caddy's 403 and never reach the tracker at all
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -162,6 +167,80 @@ if [ "$f1" = "200" ] && [ "$d1" = "true" ] && [ "$d2" = "false" ] && [ "$d3" = "
     pass "feed ok=true->done=true, ok=false->done=false, ok=true->done=true (round-trip both ways)"
 else
     fail "feed round-trip codes=$f1/$f2/$f3 done=$d1/$d2/$d3"
+fi
+
+# ── Checks 7+8 — the office-wall kiosk site (SR-016 / OI-12) ──────────────────
+# This is the security-relevant half of the wall lane: a site that hands out the
+# Owner's NagLight identity with NO interactive login, gated only by the source
+# address. Both legs below therefore assert the DANGEROUS direction, not the happy
+# path: that a forged identity header cannot survive the hop, and that a
+# non-panel address gets nothing at all.
+#
+# How one container reaches the site from two different source addresses: simclient
+# is on BOTH the project's default network and the sim-only `simlan` (fixed subnet,
+# static leases — see sim/docker-compose.sim.yml). Dialling Caddy's simlan address
+# routes out of the simlan interface, so the source IS $PANEL_IP; dialling Caddy's
+# default-network address sources from simclient's default-network lease instead.
+# `--resolve` pins the name to the chosen address while keeping Host + SNI correct.
+WALL_HOST="${WALL_HOST:?}"; WALL_PORT="${WALL_PORT:?}"
+PANEL_SUB="${PANEL_USER_SUB:?}"; PANEL_IP="${PANEL_IP:?}"
+CADDY_PANEL_IP="${SIM_WALL_CADDY_IP:?}"
+FORGED_SUB="sim-user-attacker-9999"
+
+# Caddy's address on the DEFAULT network — the non-panel vantage. Discovered at
+# runtime (docker picks that subnet), which is fine: it is only a dial target,
+# never a matcher value.
+CADDY_OTHER_IP="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}}{{"\n"}}{{end}}' caddy 2>/dev/null \
+                  | grep -v simlan | grep -oE '=[0-9.]+' | tr -d '=' | head -n1)"
+
+# wcurl <dial-ip> <curl args…> — one request to the wall site via a chosen route.
+wcurl() { local ip="$1"; shift; sc curl -sS --cacert "$CA" --resolve "$WALL_HOST:$WALL_PORT:$ip" "$@"; }
+
+echo "-- (7) wall kiosk site: forged header stripped, identity injected --"
+if [ -z "$CADDY_OTHER_IP" ]; then
+    fail "could not resolve caddy's default-network address (wall checks need both vantages)"
+else
+    # (a) THE ONE THAT MATTERS: a request carrying an attacker-chosen identity,
+    # arriving from the panel's /32, must reach the tracker as the PANEL's sub.
+    # /api/export is the read-back: NagLight names the zip after the identity it
+    # actually saw, so the filename is a direct assertion of the swap.
+    wdisp="$(wcurl "$CADDY_PANEL_IP" -D - -o /dev/null \
+        -H "X-Forwarded-User: $FORGED_SUB" -H "X-Forwarded-Email: attacker@evil.sim" \
+        "https://$WALL_HOST:$WALL_PORT/api/export" 2>/dev/null | grep -i '^content-disposition:' | tr -d '\r')"
+    if printf '%s' "$wdisp" | grep -q "naglight-$PANEL_SUB.zip" \
+       && ! printf '%s' "$wdisp" | grep -q "$FORGED_SUB"; then
+        pass "forged X-Forwarded-User=$FORGED_SUB from the panel /32 reached the tracker as $PANEL_SUB"
+    else
+        fail "HEADER FORGERY NOT STRIPPED: content-disposition='$wdisp' (want naglight-$PANEL_SUB.zip)"
+    fi
+    # (b) the ordinary poll the shell actually makes works at all (the injected
+    # identity is accepted, not merely different).
+    wtoday="$(wcurl "$CADDY_PANEL_IP" -o /dev/null -w '%{http_code}' "https://$WALL_HOST:$WALL_PORT/api/today" 2>/dev/null)"
+    [ "$wtoday" = "200" ] && pass "panel /api/today -> 200 (injected identity accepted by the tracker)" \
+        || fail "panel /api/today -> $wtoday (want 200)"
+    # (c) same origin serves the shell build, and doing so does NOT swallow /api/*.
+    wroot="$(wcurl "$CADDY_PANEL_IP" "https://$WALL_HOST:$WALL_PORT/" 2>/dev/null)"
+    wcfg="$(wcurl "$CADDY_PANEL_IP" -o /dev/null -w '%{http_code}' "https://$WALL_HOST:$WALL_PORT/config.json" 2>/dev/null)"
+    if printf '%s' "$wroot" | grep -q 'SIM-WALL-SHELL-FIXTURE' && [ "$wcfg" = "200" ]; then
+        pass "panel / -> the shell build, /config.json -> 200 (same-origin serving intact)"
+    else
+        fail "panel static root: / marker missing or /config.json=$wcfg"
+    fi
+
+    echo "-- (8) wall kiosk site: 403 default from a non-panel address --"
+    # The 403 body is Caddy's own, which is how this leg proves the request was
+    # refused AT THE EDGE rather than by the tracker (whose no-identity answer is
+    # also 403 — see check 5). Same request, same site, different source address.
+    for path in "/" "/api/today"; do
+        obody="$(wcurl "$CADDY_OTHER_IP" -w '\n%{http_code}' \
+            -H "X-Forwarded-User: $FORGED_SUB" "https://$WALL_HOST:$WALL_PORT$path" 2>/dev/null)"
+        ocode="$(printf '%s' "$obody" | tail -n1)"
+        if [ "$ocode" = "403" ] && printf '%s' "$obody" | grep -q 'wall: panel only'; then
+            pass "non-panel ($CADDY_OTHER_IP route) $path -> 403 at the edge (Caddy's body, tracker never reached)"
+        else
+            fail "non-panel $path -> code=$ocode body='$(printf '%s' "$obody" | head -n1)' (want 403 + Caddy's body)"
+        fi
+    done
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

@@ -59,12 +59,28 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      # The office-wall kiosk site (SR-016). Published bound to LAN_IP — NOT
+      # 0.0.0.0 — so the port does not exist on the WAN side even if someone
+      # later adds a router forward by mistake. This is half of the OI-12
+      # "LAN port + /32" ratification; the other half is the Caddyfile's
+      # remote_ip /32 matcher. Caddy inside the container listens on
+      # 0.0.0.0:${WALL_PORT}; the LAN-binding is THIS publish, which is why the
+      # Caddyfile carries no `bind` directive (LAN_IP is not an address the
+      # container owns, so `bind` there would fail to listen at all).
+      - "${LAN_IP}:${WALL_PORT}:${WALL_PORT}"
     environment:
       # Caddyfile is templated with these (see Caddyfile `{$VAR}` refs).
       DOMAIN: ${DOMAIN}
       LAN_IP: ${LAN_IP}
       TRACKER_HOST: ${TRACKER_SUBDOMAIN}.${DOMAIN}
       ACTUAL_HOST: ${ACTUAL_SUBDOMAIN}.${DOMAIN}
+      # Office-wall kiosk site (SR-016). WALL_HOST is a T1 private name in the
+      # real .env; PANEL_IP is the panel's DHCP-reserved address (/32 allow-list)
+      # and PANEL_USER_SUB the NagLight identity this site injects.
+      WALL_HOST: ${WALL_HOST}
+      WALL_PORT: ${WALL_PORT}
+      PANEL_IP: ${PANEL_IP}
+      PANEL_USER_SUB: ${PANEL_USER_SUB}
       # basic_auth guards the SINGLE-USER services (Actual, dns console) only.
       # The tracker host is NOT basic_auth'd — oauth2-proxy owns its auth (D2).
       ACTUAL_BASICAUTH_USER: ${ACTUAL_BASICAUTH_USER}
@@ -75,6 +91,10 @@ services:
       MAIN_BOX_IP: ${MAIN_BOX_IP}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # The wall shell's static build (SR-016 / IF-005). Read-only: Caddy serves
+      # it, nothing writes it — the IMAGE populates the directory. Ships empty
+      # (README only) until the OfficeWallNaglight artifact contract lands.
+      - ./wall-shell:/srv/wall-shell:ro
       - caddy_data:/data       # certs + ACME account — persist so re-issue isn't needed on reboot
       - caddy_config:/config
     extra_hosts:

@@ -12,10 +12,15 @@
 #   - actual.<domain>, dns.<domain>, map.<domain> -> KEEP basic_auth (the Owner's
 #     single-user services; oauth2-proxy is only for the multi-user tracker).
 #
+#   - {$WALL_HOST}:{$WALL_PORT} -> the office-wall kiosk site (SR-016). A THIRD
+#     auth model: no interactive login at all, identity injected by source IP.
+#     Read the block's own banner before touching it — it is security-critical.
+#
 # Env vars (set in docker-compose.yml from .env):
 #   {$DOMAIN} {$LAN_IP} {$TRACKER_HOST} {$ACTUAL_HOST} {$ACME_EMAIL} {$MAIN_BOX_IP}
 #   {$ACTUAL_BASICAUTH_USER} {$ACTUAL_BASICAUTH_HASH}
 #   {$DNS_BASICAUTH_USER} {$DNS_BASICAUTH_HASH}
+#   {$WALL_HOST} {$WALL_PORT} {$PANEL_IP} {$PANEL_USER_SUB}
 
 {
     # ACME account email for public certs (Let's Encrypt / ZeroSSL).
@@ -48,6 +53,126 @@
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-Proto {scheme}
         header_up X-Forwarded-Host {host}
+    }
+}
+
+# ── {$WALL_HOST}:{$WALL_PORT} — the office-wall kiosk site (SR-016, OI-12) ─────
+# RATIFIED 2026-07-29 (the Owner; the belt-and-braces "LAN port + /32" variant).
+#
+# WHY THIS EXISTS: the office wall panel is a keyboard-less ambient display, so it
+# cannot complete an interactive Google consent — every session expiry would end
+# with the office wall showing a Google login screen indefinitely. This site
+# therefore BYPASSES oauth2-proxy and becomes a SECOND injector of the tracker's
+# trusted identity headers. That is exactly why it needed ratification: IF-002's
+# premise ("trusted headers only ever come from oauth2-proxy") now has a second
+# source, and NagLight's trusted-header mode has no header HMAC in v1.
+#
+# FOUR THINGS MAKE IT SAFE. All four are load-bearing; do not "simplify" any of
+# them without re-ratifying:
+#   1. STRIP BEFORE SET. The `header_up -X-Forwarded-…` lines come FIRST so any
+#      client-supplied identity header is DELETED before ours is injected.
+#      Asserted with a forged header in the V1 sim (validate-sim.sh check 7) —
+#      Caddy's defaults are not trusted for this.
+#   2. /32, NOT THE LAN CIDR. "anything on the LAN is the Owner" is far weaker
+#      than it sounds once guest Wi-Fi, IoT gear, and a Minecraft server that
+#      accepts inbound connections share the network. The panel's DHCP
+#      reservation (on its hardware MAC — see the wall autoinstall) is what makes
+#      a single-address match enforceable. `remote_ip` matches the REAL peer
+#      address; never switch it to `client_ip`, which trusts X-Forwarded-For and
+#      would hand the allow-list to any client willing to forge a header.
+#   3. A LAN-ONLY PORT THE ROUTER NEVER FORWARDS ({$WALL_PORT}). The name
+#      resolves publicly (the DDNS wildcard), so structural unreachability is
+#      worth more than a rule: the router forwards :80/:443 only, and compose
+#      publishes this port bound to {$LAN_IP} — not 0.0.0.0. Two independent
+#      reasons a WAN packet cannot arrive. **Do NOT add a port-forward for
+#      {$WALL_PORT} on the router.**
+#   4. THE 403 DEFAULT. Anything that is not the panel — LAN or WAN — gets 403
+#      before it can reach a handler. The distinct body makes the sim able to
+#      tell Caddy's 403 apart from the tracker's own no-identity 403.
+#
+# CERTIFICATE: see stack/README.md §10 — the name is publicly resolvable via the
+# DDNS wildcard, and Caddy solves the ACME challenge over the EXISTING :80/:443
+# listeners, not over {$WALL_PORT}.
+{$WALL_HOST}:{$WALL_PORT} {
+    encode zstd gzip
+
+    # The one address allowed to be the panel. /32 = exactly one host.
+    @panel remote_ip {$PANEL_IP}/32
+
+    handle @panel {
+        # ---- the tracker API, same-origin (OfficeWallNaglight needs doc §3.2) --
+        # NagLight sends no CORS headers, so the shell's fetch("/api/today") only
+        # works if the shell and the API share an origin. This site is that origin.
+        handle /api/* {
+            reverse_proxy tracker:8787 {
+                # +---------------------------------------------------------+
+                # | DO NOT ADD `header_up -X-Forwarded-User` HERE.          |
+                # +---------------------------------------------------------+
+                # It reads like the right thing (strip, then inject) and it is
+                # how the design brief wrote it — but Caddy applies header ops
+                # in a FIXED order regardless of the order you write them:
+                # add -> set -> DELETE -> replace. A delete of the same field
+                # therefore runs AFTER the set and erases the injected identity,
+                # the tracker sees no identity at all, and every panel request
+                # 403s. Found for real in the V1 sim, 2026-07-29 (the site failed
+                # CLOSED, which is the correct direction, but it never works).
+                #
+                # The strip is not lost: `header_up <Name> <value>` is a SET, and
+                # a set REPLACES every existing value of that field — a
+                # client-supplied X-Forwarded-User (even repeated) cannot
+                # survive it. That is a behaviour a reader cannot see, so it is
+                # asserted with a forged header in validate-sim.sh check 7 rather
+                # than trusted. X-Forwarded-Email has no injected value, so it
+                # takes the plain delete.
+                header_up -X-Forwarded-Email
+                # The panel is the Owner (D-W7: full view, no per-view filter),
+                # so panel check-offs appear as him.
+                header_up X-Forwarded-User {$PANEL_USER_SUB}
+            }
+        }
+
+        # ---- the shell's static build ------------------------------------------
+        # Payload dir the IMAGE populates from the OfficeWallNaglight built
+        # artifact (IF-005 — the packaging contract is still Planned, so the dir
+        # ships with a README and nothing else). Bind-mounted read-only into the
+        # caddy container; see docker-compose.yml.
+        handle {
+            root * /srv/wall-shell
+            file_server
+        }
+
+        # ---- OPTIONAL: Subsonic streaming (Navidrome tier-2 profile) -----------
+        # The panel plays music from its own synced copy (D-W8 rider), so this is
+        # opt-in extra, not a dependency. Enabling it is the usual tier-2 dance:
+        # add `navidrome` to COMPOSE_PROFILES, then uncomment. handle_path strips
+        # the prefix so the shell's relative `SUBSONIC.url=/music` reaches
+        # Navidrome's /rest/* API with no hostname baked into the app.
+        # handle_path /music/* {
+        #     reverse_proxy navidrome:4533
+        # }
+        #
+        # ---- TODO(OI-15) — where /media/* is served from is NOT decided --------
+        # The shell's local-library manifest defaults to `/media/music/index.json`
+        # and the frame playlist to `/media/frame/playlist.json`, and both must be
+        # on the SHELL'S OWN ORIGIN. But the ratified design (D-W8 rider, OWN-D5)
+        # has that media on the PANEL's disposable cache — which this site, running
+        # on the AWOW box, cannot serve. The likely resolution is panel-side (the
+        # Electron container intercepting /media/* for its local cache), which is
+        # OfficeWallNaglight's call, not the image's. An AWOW-served fallback
+        # would be a plain file_server over MEDIA_ROOT — but that is STREAMING,
+        # which is the thing D-W8 chose against, so it is left commented and
+        # unratified rather than quietly enabled:
+        # handle_path /media/* {
+        #     root * /srv/media
+        #     file_server
+        # }
+    }
+
+    # Everything else — including every WAN packet if one ever arrives. A second
+    # `handle` (not a bare `respond`) so the mutual exclusion is explicit and
+    # cannot depend on directive-ordering subtleties.
+    handle {
+        respond "wall: panel only" 403
     }
 }
 

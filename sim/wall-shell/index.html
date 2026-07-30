@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!--
+  SIM FIXTURE — a fictional stand-in for the OfficeWallNaglight static build.
+  Committable (Q10.6): nothing here is real, and no product source lives in this
+  repo. The V1 gate serves this through the wall kiosk site to prove three things
+  the real build would need and this fixture is enough to prove:
+    1. the site's document root is served at all (the shell would load),
+    2. it is served ONLY to the panel's /32 (the same origin 403s everyone else),
+    3. serving static files at `/` does not swallow `/api/*`, which must still
+       reach the tracker container.
+  The marker string below is what sim/validate-sim.sh asserts on.
+-->
+<meta charset="utf-8">
+<title>wall shell (sim fixture)</title>
+<h1>SIM-WALL-SHELL-FIXTURE</h1>
+<p>Stand-in for the OfficeWallNaglight built shell (IF-005, not yet packaged).</p>

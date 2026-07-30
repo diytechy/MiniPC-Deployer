@@ -13,6 +13,9 @@
 #   3. basic_auth credentials are inlined (fictional bcrypt of "simpass") instead
 #      of `{$VAR}` env indirection, so the sim needs no bcrypt-through-env-file
 #      escaping. The credential is a throwaway sim fixture.
+#   4. the wall kiosk site is NOT host-published (the real stack binds it to
+#      LAN_IP, which is fictional here and unbindable on the WSL host). The gate's
+#      probes reach it over the compose network instead — see the site's banner.
 
 {
     # Internal CA — self-signed roots minted locally; no ACME, no public domain.
@@ -26,6 +29,46 @@
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-Proto {scheme}
         header_up X-Forwarded-Host {host}
+    }
+}
+
+# ── {$WALL_HOST}:{$WALL_PORT} — office-wall kiosk site — IDENTICAL structure ───
+# The security-critical site (SR-016). Byte-for-byte the same handler shape as the
+# real Caddyfile: the /32 remote_ip matcher, strip-then-inject on /api/*, the
+# static shell root, and the 403 default. Read the real file's banner for WHY.
+#
+# The ONLY sim deltas, both unavoidable and neither touching the security model:
+#   - PANEL_IP is the simclient's STATIC address on the sim-only `simlan` network
+#     (sim/docker-compose.sim.yml), because a /32 allow-list needs an address that
+#     is known before Caddy loads its config. The gate then reaches this site
+#     twice: over `simlan` (source == PANEL_IP -> the panel) and over the default
+#     network (source != PANEL_IP -> must 403). That is how the off-panel leg is
+#     exercised without a second box.
+#   - the document root is a fictional stand-in for the OfficeWallNaglight build
+#     (../sim/wall-shell), since IF-005's artifact contract does not exist yet.
+{$WALL_HOST}:{$WALL_PORT} {
+    encode zstd gzip
+
+    @panel remote_ip {$PANEL_IP}/32
+
+    handle @panel {
+        handle /api/* {
+            reverse_proxy tracker:8787 {
+                # No `-X-Forwarded-User` delete — Caddy applies deletes AFTER
+                # sets, so it would erase the injection (the real Caddyfile
+                # carries the full explanation; this leg is what caught it).
+                header_up -X-Forwarded-Email
+                header_up X-Forwarded-User {$PANEL_USER_SUB}
+            }
+        }
+        handle {
+            root * /srv/wall-shell
+            file_server
+        }
+    }
+
+    handle {
+        respond "wall: panel only" 403
     }
 }
 

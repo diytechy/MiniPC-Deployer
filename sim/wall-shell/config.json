@@ -1,0 +1,7 @@
+{
+  "_comment": "SIM FIXTURE. The real shell fetches ./config.json from its own origin at boot (OfficeWallNaglight docs/config-reference.md). Present here only to prove the kiosk site serves a sibling file from the document root; every value is fictional.",
+  "API_BASE": "",
+  "HEARTBEAT_URL": "",
+  "SUBSONIC": { "url": "/music" },
+  "LOCAL_LIBRARY": { "manifest": "/media/music/index.json" }
+}

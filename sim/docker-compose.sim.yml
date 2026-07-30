@@ -62,8 +62,17 @@ services:
 
   # ── Caddy: internal CA + vhost aliases so the client resolves them to Caddy ──
   caddy:
+    # The real stack publishes the wall kiosk port bound to LAN_IP; that address
+    # is fictional here and unbindable on the WSL host, so drop the publish. The
+    # gate's probes reach the site over the compose network instead (the wall
+    # site's banner in Caddyfile.sim records this delta).
+    ports: !override
+      - "80:80"
+      - "443:443"
     volumes: !override
       - ../sim/caddy/Caddyfile.sim:/etc/caddy/Caddyfile:ro
+      # Fictional stand-in for the OfficeWallNaglight static build (IF-005).
+      - ../sim/wall-shell:/srv/wall-shell:ro
       - caddy_data:/data
       - caddy_config:/config
     networks:
@@ -73,6 +82,10 @@ services:
           - ${ACTUAL_SUBDOMAIN}.${DOMAIN}
           - dns.${DOMAIN}
           - ${DOMAIN}
+      # Second leg on the fixed-subnet network, so the gate can dial Caddy from a
+      # KNOWN source address (see the simlan network comment at the bottom).
+      simlan:
+        ipv4_address: ${SIM_WALL_CADDY_IP}
 
   # ── init-perms: chown the tracker_data volume to the tracker uid (1000) ──────
   # FINDING surfaced by the sim: the naglight:local image runs as USER tracker
@@ -112,11 +125,20 @@ services:
       start_period: 15s
 
   # ── Client probe box: the gate execs dig/curl/jq in here ────────────────────
+  # It sits on BOTH networks on purpose, and that dual homing is what makes the
+  # wall-site checks (7/8) possible from a single container: the kernel picks the
+  # source address from the route, so dialling Caddy's `simlan` address sources
+  # from PANEL_IP (the panel), and dialling Caddy's default-network address
+  # sources from a different address (everyone else, who must get 403).
   simclient:
     image: ${SIM_CLIENT_IMAGE}
     container_name: simclient
     command: ["sleep", "infinity"]
     restart: unless-stopped
+    networks:
+      default: {}
+      simlan:
+        ipv4_address: ${PANEL_IP}
 
   # ── Neutralized in the sim ──────────────────────────────────────────────────
   ddns:
@@ -125,3 +147,22 @@ services:
     profiles: ["sim-disabled"]
   dozzle:
     profiles: ["sim-disabled"]
+
+# ── simlan: a sim-only network with a FIXED subnet (wall-site checks) ──────────
+# The kiosk site's allow-list is a /32, so the sim needs an address it knows
+# BEFORE Caddy loads its config — and Docker's default network hands out
+# addresses on a subnet it chooses at creation time. A dedicated network with an
+# explicit `ipam` subnet is the smallest way to get static addresses, and it
+# leaves the project's `default` network (and everything attached to it,
+# including mini-serv-sim) completely untouched.
+#
+# The subnet is deliberately obscure to avoid colliding with a real docker
+# network on the dev box. NOTE this is NOT a REAL↔SIM delta in the security
+# model: on the box the panel is a LAN host with a DHCP reservation; here it is a
+# container with a static lease. Both are "one known address", which is the
+# property the /32 depends on.
+networks:
+  simlan:
+    ipam:
+      config:
+        - subnet: ${SIM_WALL_SUBNET}

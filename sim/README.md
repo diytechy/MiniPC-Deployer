@@ -24,7 +24,7 @@ live only in the gitignored `stack/.env`.
 
 ```bash
 sim/run-sim.sh          # brings the overlay up + provisions the Technitium zone
-sim/validate-sim.sh     # the V1 GATE: 6 checks, PASS/FAIL, nonzero exit on fail
+sim/validate-sim.sh     # the V1 GATE: 8 checks, PASS/FAIL, nonzero exit on fail
 sim/run-sim.sh --down   # tear down (removes volumes)
 ```
 
@@ -52,6 +52,26 @@ docker compose -p awow-sim \
    403; A's `/api/export` zip is named for A and contains only A's items.
 6. **/api/feed round-trip** — a feed POST flips the item in `/api/today`
    (ok=true→done, ok=false→cleared).
+7. **wall kiosk site — the identity swap** (SR-016): a request carrying a
+   *forged* `X-Forwarded-User` **from the panel's `/32`** must reach the tracker
+   as `PANEL_USER_SUB`. The assertion reads the identity back off
+   `/api/export`'s `Content-Disposition` filename, which NagLight names after
+   the identity it actually saw — so the swap is proven end to end, not
+   inspected. Plus: the panel's ordinary `/api/today` poll is 200, and the
+   static shell build is served from the same origin at `/` without swallowing
+   `/api/*`.
+8. **wall kiosk site — the 403 default**: the same two requests from a
+   **non-panel address** get `403` with *Caddy's own* body, which is what proves
+   the refusal happened at the edge rather than at the tracker (whose
+   no-identity answer is also 403 — check 5).
+
+Checks 7/8 reach the site from two different **source addresses** out of one
+container: `simclient` sits on both the project's default network and a sim-only
+`simlan` (fixed subnet, static leases), so dialling Caddy's `simlan` address
+arrives as `PANEL_IP` and dialling its default-network address does not.
+`curl --resolve` pins the name to the chosen route while keeping Host and SNI
+correct. What this still cannot prove is the **off-LAN** 403 from a real WAN
+vantage — that stays a hardware/V3 remainder.
 
 ## What the overlay changes, and the REAL↔SIM deltas
 
@@ -64,10 +84,16 @@ docker compose -p awow-sim \
 | ddns | Cloudflare updater | disabled (`profile: sim-disabled`) | zero real Cloudflare calls |
 | aux (Kuma/Dozzle) | LAN_IP-bound | disabled | they bind a fictional LAN_IP; out of the V1 gate scope |
 | tracker data perms | (needs NagLight Dockerfile chown — see status.md) | `init-perms` one-shot chowns the volume to uid 1000 | surfaced a real NagLight bug; the sim reproduces the fixed end-state |
+| wall kiosk port | published bound to `LAN_IP` (the router never forwards it) | not host-published at all; probes reach it over the compose network | `LAN_IP` is fictional here and unbindable on the WSL host |
+| wall panel identity | a LAN host with a DHCP reservation on its hardware MAC | a container with a static lease on the sim-only `simlan` | both are "one known address" — the property the `/32` needs |
+| wall shell build | the OfficeWallNaglight artifact the image bakes (IF-005) | `sim/wall-shell/` fixture (an `index.html` marker + `config.json`) | IF-005's packaging contract does not exist yet |
 
 **Deltas the sim genuinely cannot cover** (documented, for the hardware burn-in):
 real Google consent, publicly-trusted ACME certs, Technitium binding the host's
-real `:53`, and the AWOW hardware itself.
+real `:53`, the wall kiosk site's **off-LAN 403** from a real WAN vantage (and
+whether Docker's port publish preserves the panel's source IP well enough for the
+`/32` to match on the real box), the wall panel's graphical session, and the AWOW
+hardware itself.
 
 ## mini-serv-sim — Samba fixtures + the bash backup service (WI-10.15)
 

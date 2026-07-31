@@ -61,8 +61,20 @@ fi
 # Read that one literally. Bonus: no longer exports every secret in the file
 # into this process's environment as a side effect.
 env_value() {
-    sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" .env | tail -n1 \
-        | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+    local __v
+    __v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" .env | tail -n1)
+    case "$__v" in
+        \"*\") __v=${__v#\"}; __v=${__v%\"} ;;
+        \'*\') __v=${__v#\'}; __v=${__v%\'} ;;
+        # UNQUOTED: strip a trailing ` # comment`, as shell sourcing and
+        # compose's own .env parser both do. `.env` documents values inline
+        # (LAN_IP=0.0.0.0   # VMTEST: …), and keeping the comment made the
+        # value unusable. A `#` with no space before it stays — it may be
+        # part of a password.
+        *) __v=${__v%%[[:space:]]#*}
+           __v=${__v%"${__v##*[![:space:]]}"} ;;
+    esac
+    printf '%s' "$__v"
 }
 
 ALLOWED_EMAILS="$(env_value OAUTH2_PROXY_ALLOWED_EMAILS)"

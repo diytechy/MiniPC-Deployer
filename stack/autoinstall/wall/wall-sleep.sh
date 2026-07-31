@@ -52,6 +52,14 @@ load_env_file() {
         case "$__v" in
             \"*\") __v=${__v#\"}; __v=${__v%\"} ;;
             \'*\') __v=${__v#\'}; __v=${__v%\'} ;;
+            # UNQUOTED: strip a trailing ` # comment`, exactly as shell
+            # sourcing and docker compose's own .env parser both do. Without
+            # this, LAN_IP=0.0.0.0 followed by an explanatory comment reached
+            # Technitium's API as part of the address and curl rejected the
+            # URL. A `#` with no space before it is kept — it may be part of a
+            # password.
+            *) __v=${__v%%[[:space:]]#*}
+               __v=${__v%"${__v##*[![:space:]]}"} ;;
         esac
         printf -v "$__k" '%s' "$__v" 2>/dev/null && export "$__k"
     done < "$__f"

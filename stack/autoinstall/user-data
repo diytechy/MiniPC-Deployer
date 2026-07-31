@@ -116,7 +116,17 @@ autoinstall:
     # unbounded — a slow disk-filler on an always-on box with small eMMC/SSD
     # (Technitium/Caddy log every query/request). The "local" driver rotates by
     # default (per-container cap), so one line prevents the failure mode.
-    - curtin in-target --target=/target -- bash -c 'mkdir -p /etc/docker && echo "{ \"log-driver\": \"local\" }" > /etc/docker/daemon.json'
+    # YAML: this entry is a FOLDED BLOCK SCALAR (>-), not a plain scalar like
+    # its neighbours, and it has to stay one. The JSON below contains ": "
+    # (colon-space); inside a PLAIN scalar YAML reads that as a mapping key, so
+    # the list item parses as a dict instead of a string and Subiquity rejects
+    # the entire section with "Malformed autoinstall in 'late-commands'
+    # section" — the install dies before it starts. Block scalars take their
+    # content literally, so the colon is harmless. The neighbouring entries get
+    # away with plain scalars only because their colons are in "://" (no
+    # following space). Caught on the first real boot of the V3 gate.
+    - >-
+      curtin in-target --target=/target -- bash -c 'mkdir -p /etc/docker && echo "{ \"log-driver\": \"local\" }" > /etc/docker/daemon.json'
     - curtin in-target --target=/target -- systemctl enable docker
     - curtin in-target --target=/target -- usermod -aG docker operator
 

@@ -9,6 +9,64 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found. $2"
 }
 
+# validate_autoinstall_yaml FILE — parse the rendered user-data the way
+# Subiquity will and refuse to bake a file it would reject.
+#
+# WHY THIS EXISTS: on the first real boot of the V3 gate the install died at
+# "Malformed autoinstall in 'late-commands' section". The cause was one entry
+# whose JSON contained ": " (colon-space) — inside a PLAIN YAML scalar that
+# parses as a mapping, so the list item became a dict instead of a string.
+# Every structural check we had passed, because the text was all PRESENT and
+# the file was valid YAML; it was the SHAPE Subiquity wanted that was wrong.
+# A whole boot cycle to learn one character of punctuation. Never again:
+# parse it here, where it costs a second.
+validate_autoinstall_yaml() {
+    local f="$1"
+    require_cmd python3 "Install it with: sudo apt-get install -y python3 python3-yaml"
+    python3 - "$f" <<'PY' || die "autoinstall validation FAILED for $f (see above) — refusing to bake an ISO Subiquity would reject."
+import sys, yaml
+
+path = sys.argv[1]
+try:
+    doc = yaml.safe_load(open(path))
+except ImportError:
+    sys.exit("PyYAML missing. Install it with: sudo apt-get install -y python3-yaml")
+except yaml.YAMLError as e:
+    sys.exit(f"user-data is not valid YAML: {e}")
+
+ai = doc.get("autoinstall", doc)
+if not isinstance(ai, dict):
+    sys.exit("no autoinstall mapping found")
+
+rc = 0
+# Subiquity wants each command to be a string, or a list of strings (argv
+# form). A dict here is the colon-space bug and kills the whole install.
+for sec in ("early-commands", "late-commands", "error-commands"):
+    items = ai.get(sec)
+    if not items:
+        continue
+    for i, item in enumerate(items):
+        if isinstance(item, str):
+            continue
+        if isinstance(item, list) and all(isinstance(x, str) for x in item):
+            continue
+        rc = 1
+        print(f"{sec}[{i}] is a {type(item).__name__}, not a string.", file=sys.stderr)
+        if isinstance(item, dict):
+            for k in item:
+                print(f"    YAML split it at a ': ' here -> {k!r}", file=sys.stderr)
+            print("    Fix: make that entry a block scalar (- >-) or quote it.",
+                  file=sys.stderr)
+
+if ai.get("version") != 1:
+    print(f"autoinstall version is {ai.get('version')!r}, expected 1", file=sys.stderr)
+    rc = 1
+
+sys.exit(rc)
+PY
+    log "autoinstall YAML validated: command sections are well-formed"
+}
+
 # require_free_gb DIR GB — abort if the filesystem holding DIR has less than
 # GB gigabytes free. Creates DIR first (mkdir -p) so a not-yet-existing output
 # dir can still be statted.
@@ -188,6 +246,10 @@ render_seed_tree() {
     grep -Eq '^[[:space:]]+(path|serial|wwn):' "$user_data_out" && \
         die "the sim user-data still carries a real-hardware disk match (path/serial/wwn) — a sim ISO must only ever be able to select a virtual disk. Refusing to build."
     fi
+
+    # ── Does Subiquity actually ACCEPT this file? ────────────────────────────
+    # Applies to BOTH branches: production user-data.filled and the sim render.
+    validate_autoinstall_yaml "$user_data_out"
 
     # ── meta-data: fresh instance-id per build, vmtest hostname ──────────────
     sed \

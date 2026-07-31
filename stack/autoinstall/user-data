@@ -31,12 +31,26 @@ autoinstall:
 
   # DHCP on the first NIC. Give the box a DHCP RESERVATION at your chosen LAN_IP
   # on the router so it always lands where the split-horizon records point.
+  # MATCH `e*`, NOT `en*` — this cost a whole install cycle to learn.
+  # `en*` covers systemd's predictable names (eno1 on the AK41's Realtek,
+  # enp2s0, enx<mac>) but NOT the plain `eth0` that a VMBus/virtio NIC gets,
+  # because predictable naming does not apply to those. In Hyper-V the NIC
+  # comes up as `eth0`, so `en*` matched nothing, netplan configured nothing,
+  # DHCP never ran, and the install died fetching `cockpit` with apt exit 100
+  # — network failure surfacing as a package error, three steps downstream.
+  # `e*` is a strict superset: everything `en*` matched, plus eth*. There is no
+  # case where `en*` is right and `e*` is wrong, and the failure mode it
+  # prevents is an UNATTENDED box that installs with no network at all. That
+  # matters beyond the VM: swap the mini PC for anything presenting eth0 and
+  # `en*` would strand the replacement exactly the same way.
+  # Keeping ONE match for both production and the VM is deliberate — it means
+  # the V3 gate actually exercises the config that ships.
   network:
     version: 2
     ethernets:
       any-eth:
         match:
-          name: "en*"
+          name: "e*"
         dhcp4: true
 
   identity:

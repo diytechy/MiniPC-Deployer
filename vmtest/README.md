@@ -306,7 +306,7 @@ vmconnect localhost AWOW-VMTest
    > own, which is the entire reason the light path works without a repack
    > (see `build-seed.sh`'s header). The bare `autoinstall` is only there to
    > skip the "Continue with autoinstall?" confirmation prompt.
-3. Subiquity partitions the disk (whole-disk LVM), creates the `operator`
+3. Subiquity partitions the disk (whole-disk LVM), creates the `hub`
    user, installs Docker + Cockpit + unattended-upgrades, copies
    `deploy-payload/` to `/opt/awow-core/` (**including `images/` — the baked
    container image tars, Q10.9 B+**), seeds `.env` (already filled with SIM
@@ -319,9 +319,9 @@ vmconnect localhost AWOW-VMTest
    `docker compose up -d`**, so the stack starts entirely from the baked images
    with no registry pulls.
 
-You can log in at the console at any point with user `operator` and either the
+You can log in at the console at any point with user `hub` and either the
 SIM password from `vmtest/.out/secrets/creds.env`, or
-`ssh -i vmtest/.out/ssh/awow-vmtest-ed25519 operator@<vm-ip>` once networking
+`ssh -i vmtest/.out/ssh/awow-vmtest-ed25519 hub@<vm-ip>` once networking
 is up (find the IP via the console: `ip -4 addr show` or Hyper-V Manager's
 VM summary pane — Default Switch NAT hands out a `172.x`-range address).
 

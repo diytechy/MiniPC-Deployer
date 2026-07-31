@@ -293,7 +293,7 @@ echo   so GRUB boots straight through and Subiquity installs unattended.
 echo.
 
 :msg_common
-echo   Console login: operator
+echo   Console login: hub
 echo   Password:      %VMTEST_DIR%\.out\secrets\creds.env
 echo.
 echo   Then watch it come up:

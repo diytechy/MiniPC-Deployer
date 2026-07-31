@@ -16,13 +16,13 @@ graphical session to launch and configure it in.
 
 ```sh
 # 1. On your workstation: download the Linux AppImage from icedrive.net, then
-scp Icedrive.AppImage operator@<LAN_IP>:~
+scp Icedrive.AppImage hub@<LAN_IP>:~
 
 # 2. On the box:
 sudo ICEDRIVE_APPIMAGE=~/Icedrive.AppImage bash /opt/awow-core/stack/remote-ui/setup-remote-ui.sh
 
 # 3. From your workstation: RDP to <LAN_IP>:3389 (mstsc / Remmina) as the
-#    operator user; IceDrive autostarts in the session — sign in, set the
+#    hub user; IceDrive autostarts in the session — sign in, set the
 #    sync-pair folder(s), verify a test file syncs.
 ```
 
@@ -43,7 +43,7 @@ is running inside a session**:
   longer has an offsite step (2026-07-29 correction) it cannot notice either —
   the backup can be green while the cloud copy is hours behind.
 - **GUI-configured state is not reproducible from this repo.** The IceDrive
-  login and sync pairs live in the operator's home directory; a reimage wipes
+  login and sync pairs live in the hub account's home directory; a reimage wipes
   them. Re-setup checklist after a reimage: re-run the script → RDP in →
   sign in → re-create sync pairs → test file round-trip.
 
@@ -52,7 +52,7 @@ is running inside a session**:
 LAN-only, exactly like Cockpit (SN-005): **never** proxy RDP through Caddy,
 **never** port-forward tcp/3389 at the router. Remote use goes through the
 future WireGuard path (D5). The script adds no user, no password auth surface
-beyond the existing operator account.
+beyond the existing hub account.
 
 ## The offsite leg — the client syncs library paths, the backup stages nothing
 
@@ -82,5 +82,5 @@ all** — a green backup says nothing about the cloud copy.
 ```sh
 sudo systemctl disable --now xrdp
 sudo apt-get remove --autoremove xrdp xorgxrdp xfce4-session   # pulls the rest
-sudo rm -rf /opt/icedrive ~operator/.config/autostart/icedrive.desktop
+sudo rm -rf /opt/icedrive ~hub/.config/autostart/icedrive.desktop
 ```

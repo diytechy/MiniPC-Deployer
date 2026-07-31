@@ -5,7 +5,7 @@
 # This is the `autoinstall` user-data consumed by the Ubuntu Server 24.04 LTS
 # live installer (Subiquity). It:
 #   1. Partitions the whole eMMC/SSD (LVM = simple whole-disk layout).
-#   2. Creates the operator user (SSH KEY-ONLY by default — WI-10.12).
+#   2. Creates the hub user (SSH KEY-ONLY by default — WI-10.12).
 #   3. Installs Docker Engine + compose plugin + git + Cockpit via late-commands.
 #   4. Enables unattended-upgrades (WI-10.12) for hands-off OS security patching.
 #   5. Drops the stack/ tree, a placeholder .env, and a first-boot systemd unit
@@ -41,8 +41,23 @@ autoinstall:
 
   identity:
     hostname: awow-core
-    realname: "AWOW Core Operator"
-    username: operator
+    realname: "Home Hub Operator"
+    # ACCOUNT NAME - do not use a name Ubuntu already ships as a USER OR GROUP.
+    # This was `operator` until the first real install, which died at
+    #   useradd 'operator' ... returned non-zero exit status 9
+    # Debian/Ubuntu ship a system GROUP called `operator` (GID 37, straight out
+    # of base-passwd's group.master). useradd creates a primary group named
+    # after the user, hit the existing one, and exited 9 = "username or group
+    # name already in use". It would have failed identically on real hardware —
+    # nothing about this was VM-specific.
+    # Unusable names, i.e. every group Ubuntu ships: root daemon bin sys adm tty
+    # disk lp mail news uucp man proxy kmem dialout fax voice cdrom floppy tape
+    # sudo audio dip www-data backup operator list irc src shadow utmp video
+    # sasl plugdev staff games users nogroup. render_seed_tree() now refuses to
+    # build if this name collides with any of them.
+    # `hub` is the ROLE, deliberately not the hardware: AWOW is just the box
+    # that happens to run it today.
+    username: hub
     # SSH KEY-ONLY box (WI-10.12): no usable password login. "!" is a locked
     # hash — the account cannot be logged into with a password at all. Console/
     # emergency access is via the physical console only. If you MUST allow a
@@ -128,7 +143,7 @@ autoinstall:
     - >-
       curtin in-target --target=/target -- bash -c 'mkdir -p /etc/docker && echo "{ \"log-driver\": \"local\" }" > /etc/docker/daemon.json'
     - curtin in-target --target=/target -- systemctl enable docker
-    - curtin in-target --target=/target -- usermod -aG docker operator
+    - curtin in-target --target=/target -- usermod -aG docker hub
 
     # ---- 2. Remote management: Cockpit + unattended-upgrades (WI-10.12) --------
     # Cockpit web console on :9090 — LAN-only (do NOT proxy it through Caddy to

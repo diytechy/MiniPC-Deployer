@@ -401,7 +401,7 @@ in `/opt/awow-core/stack`, and first boot brings up core + enabled profiles.
 ### Enabling a service on a RUNNING box (no reflash)
 
 ```sh
-ssh operator@<LAN_IP>
+ssh hub@<LAN_IP>
 cd /opt/awow-core/stack
 $EDITOR .env                       # add the profile to COMPOSE_PROFILES (+ its REPLACE_WITH knobs)
 docker compose up -d               # pulls the tier-2 image(s), starts them

@@ -38,7 +38,7 @@ die() { log "FATAL: $*"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run with sudo (needs apt + systemctl)"
 RDP_USER="${SUDO_USER:-}"
-[ -n "$RDP_USER" ] && [ "$RDP_USER" != "root" ] || die "run via sudo from the operator account (needs a non-root user for the RDP session)"
+[ -n "$RDP_USER" ] && [ "$RDP_USER" != "root" ] || die "run via sudo from the hub account (needs a non-root user for the RDP session)"
 RDP_HOME="$(getent passwd "$RDP_USER" | cut -d: -f6)"
 [ -d "$RDP_HOME" ] || die "home dir for $RDP_USER not found"
 

@@ -37,7 +37,7 @@ Provisioned by `stack/autoinstall/user-data`:
 
 ```sh
 # 1. Get on the box
-ssh operator@<LAN_IP>              # key-only
+ssh hub@<LAN_IP>              # key-only
 
 # 2. Inspect
 cd /opt/awow-core/stack

@@ -39,6 +39,36 @@ if not isinstance(ai, dict):
     sys.exit("no autoinstall mapping found")
 
 rc = 0
+
+# identity.username must not collide with a user OR GROUP the base system
+# already ships. Subiquity runs a bare `useradd <name>`, which creates a
+# primary group of the same name; if that group exists useradd exits 9 and the
+# install dies in postinstall, AFTER partitioning and installing - i.e. you
+# find out late, on real hardware. `operator` cost us exactly that: it is a
+# system group (GID 37) on every Debian/Ubuntu box.
+SHIPPED = set("""root daemon bin sys adm tty disk lp mail news uucp man proxy
+kmem dialout fax voice cdrom floppy tape sudo audio dip www-data backup
+operator list irc src shadow utmp video sasl plugdev staff games users
+nogroup""".split())
+# Prefer the authoritative files when this is a Debian-ish build host.
+for f, idx in (("/usr/share/base-passwd/group.master", 0),
+               ("/usr/share/base-passwd/passwd.master", 0)):
+    try:
+        with open(f) as fh:
+            SHIPPED |= {ln.split(":")[idx] for ln in fh if ":" in ln}
+    except OSError:
+        pass
+
+user = (ai.get("identity") or {}).get("username")
+if user in SHIPPED:
+    print(f"identity.username {user!r} is a user/group the base system already "
+          f"ships - `useradd {user}` will exit 9 and the install will die in "
+          f"postinstall. Choose a name that is not one of: "
+          f"{' '.join(sorted(SHIPPED))}", file=sys.stderr)
+    rc = 1
+elif not user:
+    print("identity.username is missing", file=sys.stderr)
+    rc = 1
 # Subiquity wants each command to be a string, or a list of strings (argv
 # form). A dict here is the colon-space bug and kills the whole install.
 for sec in ("early-commands", "late-commands", "error-commands"):
@@ -175,7 +205,7 @@ render_seed_tree() {
     fi
 
     # ── render user-data: SSH placeholder + password + hostname ──────────────
-    # operator user: SSH key-only in production (WI-10.12); for this disposable
+    # hub user: SSH key-only in production (WI-10.12); for this disposable
     # VM we ALSO allow password login at the console for convenience — never
     # do this on the real AWOW (stack/README.md's runbook keeps allow-pw:false).
     # PRODUCTION SEAM (A14, 2026-07-30): when SITE_DIR points at a materialized
@@ -215,7 +245,7 @@ render_seed_tree() {
         -e 's/allow-pw: false/allow-pw: true   # VMTEST ONLY - production keeps this false (key-only)/' \
         -e "s|password: \"!\"|password: \"$sim_password_hash\"   # VMTEST ONLY sim password, see vmtest/.out/secrets/creds.env|" \
         -e 's/hostname: awow-core/hostname: awow-vmtest/' \
-        -e 's/realname: "AWOW Core Operator"/realname: "AWOW VM Test Operator"/' \
+        -e 's/realname: "Home Hub Operator"/realname: "Home Hub VM Test"/' \
         -e 's|^\([[:space:]]*\)path: /dev/nvme0n1|\1model: Virtual_Disk|' \
         "$autoinstall_src/user-data" > "$user_data_out"
     grep -q "REPLACE_WITH_YOUR_PUBLIC_KEY" "$user_data_out" && die "SSH placeholder substitution failed"

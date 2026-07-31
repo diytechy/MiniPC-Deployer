@@ -16,7 +16,33 @@ while [ $# -gt 0 ]; do case "$1" in
     --env) ENV_FILE="$2"; shift 2;; --dns) DNS_HOST="$2"; shift 2;;
     --api-host) API="$2"; shift 2;; *) echo "unknown arg $1" >&2; exit 2;; esac; done
 # shellcheck disable=SC1090
-[ -f "$ENV_FILE" ] && set -a && . "$ENV_FILE" && set +a
+# load_env_file FILE — export every KEY=VALUE in FILE **literally**.
+#
+# NEVER `source` a compose .env. Its values are literal text, and every
+# basic_auth hash in this project is bcrypt — `$2a$14$…`. Sourcing makes bash
+# expand them: under `set -u` it aborts on the unbound `$2` (which is exactly
+# how first boot died), and WITHOUT `set -u` it is worse — `$2`/`$1` expand to
+# nothing, the hash is silently corrupted, and auth then fails with nothing
+# anywhere explaining why.
+load_env_file() {
+    local __f="$1" __line __k __v
+    [ -f "$__f" ] || return 0
+    while IFS= read -r __line || [ -n "$__line" ]; do
+        case "$__line" in ''|'#'*) continue ;; esac
+        case "$__line" in *=*) ;; *) continue ;; esac
+        __k=${__line%%=*}
+        __v=${__line#*=}
+        __k=${__k#"${__k%%[![:space:]]*}"}
+        __k=${__k%"${__k##*[![:space:]]}"}
+        case "$__k" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+        case "$__v" in
+            \"*\") __v=${__v#\"}; __v=${__v%\"} ;;
+            \'*\') __v=${__v#\'}; __v=${__v%\'} ;;
+        esac
+        printf -v "$__k" '%s' "$__v" 2>/dev/null && export "$__k"
+    done < "$__f"
+}
+load_env_file "$ENV_FILE"
 : "${DOMAIN:?DOMAIN not set}"; : "${LAN_IP:?LAN_IP not set}"
 TRACKER_SUBDOMAIN="${TRACKER_SUBDOMAIN:-tracker}"; ACTUAL_SUBDOMAIN="${ACTUAL_SUBDOMAIN:-actual}"
 fails=0

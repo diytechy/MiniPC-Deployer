@@ -97,6 +97,49 @@ PY
     log "autoinstall YAML validated: command sections are well-formed"
 }
 
+# compose_escape VALUE — encode VALUE for a compose `.env`, printed on stdout.
+#
+# Docker Compose interpolates `$VAR` inside .env VALUES, not just in the compose
+# file. A bcrypt hash is `$2a$14$<salt><digest>`: `$2a` and `$14` start with
+# digits so compose leaves them, but if the salt starts with a LETTER then
+# `$<salt><digest>` is a valid identifier and compose replaces the whole thing
+# with an empty string. Caddy then gets `$2a$14` and rejects every login, with
+# nothing but a "variable is not set" warning to explain it.
+#
+# Bcrypt salts are base64 `./A-Za-z0-9`, so 52 of 64 possible first characters
+# are letters: about 81% of generated hashes break, and WHICH ones changes every
+# time they are regenerated. The V3 gate passed once purely because both salts
+# happened to start with digits.
+#
+# Doubling `$` is the fix. Compose collapses `$$` back to one `$`, verified
+# end-to-end against `caddy hash-password` output. Single-quoting also works
+# UNTIL a value contains a single quote: compose's dotenv parser rejects the
+# POSIX `'\''` escape and then fails to read the whole file. `$$` has no such
+# hole, so it is used for every value. Also tested and REJECTED: `env_file:`
+# (interpolates too) and double quotes (interpolate too).
+# NOTE: done with sed, not `${1//$/$$}`. In a bash parameter-expansion
+# REPLACEMENT, `$$` expands to the shell's PID — that first draft turned
+# `$2a$14$x` into `16892a1689141689x`. In a sed replacement `$` is literal.
+compose_escape() {
+    printf '%s' "$1" | sed 's/[$]/$$/g'
+}
+
+# assert_env_interpolation_safe FILE — refuse to ship a .env compose would eat.
+# Text-only, so it needs no docker and runs anywhere: flags any value with a
+# `$` that is followed by a letter or underscore and is NOT part of a `$$`.
+assert_env_interpolation_safe() {
+    local f="$1" bad
+    bad=$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" \
+          | sed 's/\$\$//g' \
+          | grep -E '\$[A-Za-z_]' || true)
+    if [ -n "$bad" ]; then
+        die "generated .env has value(s) docker compose will silently EAT — a '\$' followed by a letter is read as a variable reference and replaced with nothing:" \
+            "$(printf '%s' "$bad" | cut -d= -f1 | tr '\n' ' ')" \
+            "Escape them with compose_escape (doubles every \$)."
+    fi
+    log ".env interpolation-safe: no unescaped \$VAR in any value"
+}
+
 # require_writable_output FILE — fail FAST if FILE exists but cannot be
 # rewritten.
 #
@@ -394,8 +437,8 @@ render_seed_tree() {
         -e "s|^MAIN_BOX_IP=.*|MAIN_BOX_IP=|" \
         -e "s|^DNS_HOSTNAME=.*|DNS_HOSTNAME=dns.vmtest.sim.invalid|" \
         -e "s|^ACME_EMAIL=.*|ACME_EMAIL=vmtest@example.invalid   # no real ACME in a VM, see vmtest/README.md|" \
-        -e "s|^ACTUAL_BASICAUTH_HASH=.*|ACTUAL_BASICAUTH_HASH=$basicauth_hash_actual|" \
-        -e "s|^DNS_BASICAUTH_HASH=.*|DNS_BASICAUTH_HASH=$basicauth_hash_dns|" \
+        -e "s|^ACTUAL_BASICAUTH_HASH=.*|ACTUAL_BASICAUTH_HASH=$(compose_escape "$basicauth_hash_actual")|" \
+        -e "s|^DNS_BASICAUTH_HASH=.*|DNS_BASICAUTH_HASH=$(compose_escape "$basicauth_hash_dns")|" \
         -e "s|^OAUTH2_PROXY_CLIENT_ID=.*|OAUTH2_PROXY_CLIENT_ID=sim-client-id.apps.googleusercontent.com|" \
         -e "s|^OAUTH2_PROXY_CLIENT_SECRET=.*|OAUTH2_PROXY_CLIENT_SECRET=sim-client-secret-not-real|" \
         -e "s|^OAUTH2_PROXY_COOKIE_SECRET=.*|OAUTH2_PROXY_COOKIE_SECRET=$cookie_secret|" \
@@ -404,6 +447,8 @@ render_seed_tree() {
         -e "s|^CLOUDFLARE_ZONE_ID=.*|CLOUDFLARE_ZONE_ID=sim-zone-id-not-real|" \
         -e "s|^CLOUDFLARE_API_TOKEN=.*|CLOUDFLARE_API_TOKEN=sim-token-not-real   # ddns WILL fail auth in the VM - expected, no healthcheck gates it|" \
         "$sim_env"
+
+    assert_env_interpolation_safe "$sim_env"
 }
 
 # stage_images_into_payload OUT_DIR IMAGES_OUT

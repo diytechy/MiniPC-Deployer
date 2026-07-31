@@ -74,6 +74,9 @@ env_value() {
         *) __v=${__v%%[[:space:]]#*}
            __v=${__v%"${__v##*[![:space:]]}"} ;;
     esac
+    # Compose stores a literal '$' as '$$' because it interpolates .env values.
+    # Collapse it back so this script sees what the containers receive.
+    __v=${__v//\$\$/\$}
     printf '%s' "$__v"
 }
 

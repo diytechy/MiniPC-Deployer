@@ -47,6 +47,10 @@ load_env_file() {
             *) __v=${__v%%[[:space:]]#*}
                __v=${__v%"${__v##*[![:space:]]}"} ;;
         esac
+        # Compose stores a literal '$' as '$$' (see compose_escape) because it
+        # interpolates .env values. Collapse it back, so a script reading this
+        # file sees exactly what the containers receive.
+        __v=${__v//\$\$/\$}
         printf -v "$__k" '%s' "$__v" 2>/dev/null && export "$__k"
     done < "$__f"
 }

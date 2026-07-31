@@ -244,11 +244,19 @@ render_seed_tree() {
         -e "s#- \"ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host\"#- \"$ssh_pubkey\"#" \
         -e 's/allow-pw: false/allow-pw: true   # VMTEST ONLY - production keeps this false (key-only)/' \
         -e "s|password: \"!\"|password: \"$sim_password_hash\"   # VMTEST ONLY sim password, see vmtest/.out/secrets/creds.env|" \
-        -e 's/hostname: awow-core/hostname: awow-vmtest/' \
+        -e 's/hostname: homehub/hostname: homehub-vmtest/' \
         -e 's/realname: "Home Hub Operator"/realname: "Home Hub VM Test"/' \
         -e 's|^\([[:space:]]*\)path: /dev/nvme0n1|\1model: Virtual_Disk|' \
         "$autoinstall_src/user-data" > "$user_data_out"
     grep -q "REPLACE_WITH_YOUR_PUBLIC_KEY" "$user_data_out" && die "SSH placeholder substitution failed"
+
+    # Every sed above is a SILENT no-op if the source string moves, and the
+    # result still builds — that is how the sim VM would quietly come up
+    # claiming to be the production box. Assert the two that identify it.
+    grep -Eq '^[[:space:]]*hostname: homehub-vmtest$' "$user_data_out" || \
+        die "hostname substitution did not apply — stack/autoinstall/user-data no longer says 'hostname: homehub'. The sim ISO would boot claiming the PRODUCTION hostname. Update the sed above."
+    grep -Eq '^[[:space:]]*realname: "Home Hub VM Test"$' "$user_data_out" || \
+        die "realname substitution did not apply — stack/autoinstall/user-data no longer says 'realname: \"Home Hub Operator\"'. Update the sed above."
 
     # ── VMTEST storage pin: CONTAINMENT, not convenience ─────────────────────
     # Production pins `path: /dev/nvme0n1` (the AK41's internal NVMe). Hyper-V
@@ -283,9 +291,16 @@ render_seed_tree() {
 
     # ── meta-data: fresh instance-id per build, vmtest hostname ──────────────
     sed \
-        -e "s/instance-id: awow-core-001/instance-id: awow-vmtest-$(date +%Y%m%d%H%M%S)/" \
-        -e 's/local-hostname: awow-core/local-hostname: awow-vmtest/' \
+        -e "s/instance-id: homehub-001/instance-id: homehub-vmtest-$(date +%Y%m%d%H%M%S)/" \
+        -e 's/local-hostname: homehub/local-hostname: homehub-vmtest/' \
         "$autoinstall_src/meta-data" > "$out_dir/iso-root/meta-data"
+    # Same silent-no-op hazard as the user-data seds. A stale instance-id is
+    # worse than cosmetic: cloud-init uses it to decide whether this is a FRESH
+    # instance, so a repeated one can make it skip first-boot work entirely.
+    grep -Eq '^local-hostname: homehub-vmtest$' "$out_dir/iso-root/meta-data" || \
+        die "meta-data local-hostname substitution did not apply — stack/autoinstall/meta-data no longer says 'local-hostname: homehub'. Update the sed above."
+    grep -Eq '^instance-id: homehub-vmtest-[0-9]+$' "$out_dir/iso-root/meta-data" || \
+        die "meta-data instance-id substitution did not apply — stack/autoinstall/meta-data no longer says 'instance-id: homehub-001'. cloud-init could treat this as a repeat instance and skip first-boot work. Update the sed above."
 
     # ── deploy-payload/ = a copy of the whole repo (late-commands expects
     #    deploy-payload/stack/... at its root) ────────────────────────────────

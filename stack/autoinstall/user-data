@@ -40,7 +40,14 @@ autoinstall:
         dhcp4: true
 
   identity:
-    hostname: awow-core
+    # HOSTNAME is the ROLE, not the hardware (Owner's ruling, same reasoning as
+    # the account name below). AWOW is the box that happens to run it today; if
+    # it is replaced tomorrow the name should still be right. `awow` stays in
+    # documentation, where it describes the machine, and out of anything the
+    # running system answers to.
+    # NOTE: the install PATH is still /opt/awow-core — a separate rename with
+    # its own blast radius across firstboot, the systemd units and the sim.
+    hostname: homehub
     realname: "Home Hub Operator"
     # ACCOUNT NAME - do not use a name Ubuntu already ships as a USER OR GROUP.
     # This was `operator` until the first real install, which died at

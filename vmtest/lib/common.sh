@@ -97,6 +97,29 @@ PY
     log "autoinstall YAML validated: command sections are well-formed"
 }
 
+# require_writable_output FILE — fail FAST if FILE exists but cannot be
+# rewritten.
+#
+# WHY: on Windows a RUNNING Hyper-V VM holds its attached ISO open, and WSL
+# then cannot unlink it. Without this check the build stages the entire
+# ~500 MB payload first and only dies four minutes later at `rm -f`, one line
+# that scrolls past under xorriso output — so the run looks finished, the ISO
+# on disk is silently the OLD one, and the next boot "inexplicably" reproduces
+# a bug you just fixed. That happened; hence this.
+#
+# Opening for append is the discriminator: verified DENIED on a VM-held ISO
+# and OK on a free one. It does not truncate, so an aborted build leaves the
+# previous ISO intact.
+require_writable_output() {
+    local f="$1"
+    [ -e "$f" ] || return 0
+    ( exec 3>>"$f" ) 2>/dev/null && return 0
+    die "cannot rewrite $f — another process holds it open." \
+        "On Windows this is almost always a RUNNING Hyper-V VM with this ISO still attached." \
+        "Turn it off first (elevated):  Stop-VM -Name HomeHub-VMTest -TurnOff -Force" \
+        "or build somewhere else:  OUT_DIR=/mnt/d/somewhere-else bash vmtest/build-repacked-iso.sh ..."
+}
+
 # require_free_gb DIR GB — abort if the filesystem holding DIR has less than
 # GB gigabytes free. Creates DIR first (mkdir -p) so a not-yet-existing output
 # dir can still be statted.

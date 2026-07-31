@@ -68,6 +68,7 @@ done
 require_cmd xorriso "Install with: sudo apt-get install -y xorriso"
 
 require_free_gb "$(dirname "$OUT_DIR")" 10  # source (~3.5GB) + output (~3.5GB + ~1GB Q10.9 B+ images) + margin
+require_writable_output "$OUT_DIR/repacked.iso"
 
 log "computing SHA256 of $SRC_ISO (this reads the whole ~3GB file, takes a bit)"
 ACTUAL_SHA256="$(sha256sum "$SRC_ISO" | awk '{print $1}')"

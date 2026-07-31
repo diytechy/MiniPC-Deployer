@@ -41,12 +41,35 @@ fi
 # ── 2. oauth2-proxy allow-list (Q10.5) ───────────────────────────────────────
 # Materialize authenticated-emails.txt (one account per line) from the
 # comma/space-separated OAUTH2_PROXY_ALLOWED_EMAILS in .env. Gitignored output.
-# shellcheck disable=SC1091
-set -a; . ./.env; set +a
+# DO NOT `source` .env. This used to be `set -a; . ./.env; set +a` and it is
+# how the first successful install died, one second into first boot:
+#
+#     ./.env: line 43: $2: unbound variable
+#
+# .env is a docker-compose env file, NOT a shell script — every value is
+# literal text. Sourcing it makes bash expand that text, and EVERY basic_auth
+# hash here is bcrypt, i.e. starts with `$2a$14$`. Under `set -u` (line 23)
+# the unbound `$2` aborts the script outright.
+#
+# Turning off `set -u` would be the WRONG fix and strictly more dangerous:
+# `$2` and `$1` would expand to nothing, the hash would be SILENTLY corrupted,
+# Caddy would reject every login, and nothing anywhere would say why. The hard
+# failure was the good outcome.
+#
+# Compose reads .env itself, without shell expansion, so nothing else in this
+# script needs it — OAUTH2_PROXY_ALLOWED_EMAILS is the only value used here.
+# Read that one literally. Bonus: no longer exports every secret in the file
+# into this process's environment as a side effect.
+env_value() {
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" .env | tail -n1 \
+        | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+ALLOWED_EMAILS="$(env_value OAUTH2_PROXY_ALLOWED_EMAILS)"
 EMAILS_FILE="$STACK_DIR/oauth2-proxy/authenticated-emails.txt"
-if [ -n "${OAUTH2_PROXY_ALLOWED_EMAILS:-}" ]; then
+if [ -n "$ALLOWED_EMAILS" ]; then
     mkdir -p "$STACK_DIR/oauth2-proxy"
-    printf '%s' "$OAUTH2_PROXY_ALLOWED_EMAILS" | tr ', ' '\n\n' | sed '/^$/d' > "$EMAILS_FILE"
+    printf '%s' "$ALLOWED_EMAILS" | tr ', ' '\n\n' | sed '/^$/d' > "$EMAILS_FILE"
     log "oauth2-proxy allow-list written ($(wc -l < "$EMAILS_FILE") account(s))"
 elif [ ! -f "$EMAILS_FILE" ]; then
     log "WARNING: no OAUTH2_PROXY_ALLOWED_EMAILS set and no allow-list file — the"

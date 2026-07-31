@@ -78,6 +78,7 @@ fi
 # the check for the staged payload copy + the resulting seed ISO (+ margin).
 # (Without an images payload the seed is still tiny; 4GB is just safe headroom.)
 require_free_gb "$(dirname "$OUT_DIR")" 4
+require_writable_output "$OUT_DIR/seed.iso"
 
 render_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-seed.sh"
 

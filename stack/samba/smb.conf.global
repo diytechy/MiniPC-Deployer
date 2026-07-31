@@ -12,8 +12,13 @@
 # is the enforcement of that at the daemon, not just a promise in a document.
 [global]
    workgroup = WORKGROUP
-   server string = HOME-HUB
-   netbios name = HOME-HUB
+   # ONE spelling everywhere (Owner, A11(vi)): OS hostname `homehub`, DNS
+   # `homehub`, netbios `HOMEHUB`. A11 originally wrote it HOME-HUB; the
+   # hyphen was dropped so the SMB name, the hostname, DNS, mDNS and the
+   # /opt/homehub paths cannot drift apart. Nothing was deployed under the
+   # hyphenated name, so no share shortcut is broken by this.
+   server string = HOMEHUB
+   netbios name = HOMEHUB
 
    # ── access model ─────────────────────────────────────────────────────────
    security = user

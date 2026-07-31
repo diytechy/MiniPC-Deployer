@@ -56,7 +56,7 @@ last) — it is the record, not required reading for every pass.
       `volume:VOL[@CONTAINER]` and `path:/dir` specs; sim-proven
       (`run-volume-sim.sh` a–d GREEN + full `run-backup-sim.sh` regression
       GREEN). **Remaining for the Owner:** uncomment the volume lines in the real
-      `/etc/awow-backup/backup.env` (+ add `actual tracker` to `OFFSITE_SETS`)
+      `/etc/homehub-backup/backup.env` (+ add `actual tracker` to `OFFSITE_SETS`)
       when configuring the box — they ship commented in `backup.env.example`.
     - OI-11 — **Offsite leg — the Owner CORRECTED the model on 2026-07-29: the
       backup service has NO offsite step in the target state.** The IceDrive
@@ -82,7 +82,7 @@ last) — it is the record, not required reading for every pass.
       IceDrive.
     - OI-14 — **Ingest + exclusions need the Owner's real values
       (2026-07-29, OWNER):** the ratified INGEST step is inert until
-      `INGEST_SOURCES` in the real `/etc/awow-backup/backup.env` names the real
+      `INGEST_SOURCES` in the real `/etc/homehub-backup/backup.env` names the real
       share and the real library destination, and the `BACKUP_SOURCES` `path:`
       entry points at that library folder — the repo ships the fictional
       `mini-serv` / `/srv/library/NonDocs/MiniServ` placeholders only (SN-007).
@@ -98,7 +98,7 @@ last) — it is the record, not required reading for every pass.
       settings (2026-07-29, OWNER):** the backup now wakes the sleeping game box
       before pulling and fails the run loudly on a wake timeout, but it is OFF
       until `BACKUP_WAKE_MAC` is filled in (with `BACKUP_WAKE_HOST` /
-      `BACKUP_WAKE_TIMEOUT`) in the real `/etc/awow-backup/backup.env` — the
+      `BACKUP_WAKE_TIMEOUT`) in the real `/etc/homehub-backup/backup.env` — the
       repo ships placeholders only (SN-007). On the **Windows** side: enable
       "Wake on Magic Packet" + "Allow this device to wake the computer" on the
       WIRED adapter and turn **Fast Startup OFF** (hybrid shutdown leaves the
@@ -203,7 +203,7 @@ last) — it is the record, not required reading for every pass.
   PC (Docker Desktop explicitly NOT installed, per the Owner's pick). `naglight:local`
   now builds for real and `docker compose config` resolves this stack's full
   compose file. See audit log entry below for versions/detail. Wave 2 (V1
-  AWOW-sim, WI-10.14/10.15) is now unblocked.
+  homehub-sim, WI-10.14/10.15) is now unblocked.
 
 ## Scope (restated from the brief)
 
@@ -224,7 +224,7 @@ last) — it is the record, not required reading for every pass.
     Ubuntu + docker-ce now installed on the dev PC. `naglight:local` build and
     `docker compose config` are now verified for real (see audit log). Full
     runtime bring-up (containers actually running end-to-end) is still PENDING
-    the WI-10.14 AWOW-sim harness.
+    the WI-10.14 homehub-sim harness.
   - **Public-facing repo (Q10.6):** only `*.example` templates tracked; no real
     secret/hash/email/LAN detail/personal name. Local commit identity pinned to
     `diytechy <diytechy@users.noreply.github.com>`.
@@ -292,7 +292,7 @@ Scaffolding created. Starting G1.
 ### Assumptions log (unattended, dial=HIGH — the Owner to confirm/revert)
 - A1 — Layout: migrated `life-tracker/deploy/*` under `stack/` at the repo root
   (kept the kit's `docs/`/`scripts/` roots). On-box path renamed `deploy/` →
-  `stack/` under `/opt/awow-core/`; the box hostname/opt-dir keep the `awow-core`
+  `stack/` under `/opt/homehub/`; the box hostname/opt-dir keep the `homehub`
   name (faithful to the source; the Owner knows it).
 - A2 — This repo is treated as gate **G1** (requirements-agreed) — config is the
   deliverable, there is no compiled source to carry to G2/G3. The Python
@@ -356,7 +356,7 @@ Scaffolding created. Starting G1.
   container owns, so the LAN-binding is the compose **publish** instead; the 403
   body is the distinct string `wall: panel only` **specifically so the sim can tell
   an edge refusal from the tracker's own no-identity 403**; the shell's document
-  root lives at `stack/wall-shell/` (i.e. `/opt/awow-core/stack/wall-shell` on the
+  root lives at `stack/wall-shell/` (i.e. `/opt/homehub/stack/wall-shell` on the
   box) rather than a sibling of the stack dir, so the existing bind-mount coverage
   check applies to it; `/api/*` is the only proxied prefix (`/drill` is left to the
   shell, which renders its own from `items[]`); the panel's payload lands at
@@ -466,9 +466,9 @@ with `MSYS_NO_PATHCONV=1` set on any command touching `/mnt/c/...` paths
 directly.
 
 **Remaining for the Owner:** none — no reboot, no interactive prompt was needed.
-Wave 2's V1 AWOW-sim (WI-10.14/10.15) is now unblocked.
+Wave 2's V1 homehub-sim (WI-10.14/10.15) is now unblocked.
 
-### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.14 AWOW-sim harness + V1 gate)
+### DRIVER — G1 — Round 1 — 2026-07-04 (WI-10.14 homehub-sim harness + V1 gate)
 Built `sim/` as a compose **overlay over the real `stack/docker-compose.yml`**
 (never a fork): `docker-compose.sim.yml` + `.env.sim` (all fictional), a mock
 **Dex** OIDC provider (2 static users) swapped in for Google, Caddy on an
@@ -542,7 +542,7 @@ exposing three fictional committed shares — `minecraft` (Paper tree: realistic
 backup.sh: minecraft -> zstd (.tar.zst, 9% already-compressed < 60% threshold), 13 files
            satisfactory -> plain .tar (98% already-compressed >= threshold), 3 files
            total 16 files / 33429 bytes; retention keep=3
-step5 offsite: pushed 5 files into //mini-serv/icedrive/awow-backup/run_<ts>
+step5 offsite: pushed 5 files into //mini-serv/icedrive/homehub-backup/run_<ts>
 step6 feed: POST /api/feed ok=true -> HTTP 200; tracker /api/today shows
             backup-files done=true (round-trip confirmed)
 RESTORE DRILL: reconstruct minecraft from archive+manifest -> RESTORE OK 13/13
@@ -561,7 +561,7 @@ next run went green end-to-end.
 
 **Fixture shares are UP for the WI-10.16 MinecraftKeeper session.** Start them
 standalone with `sim/mini-serv-sim/run-backup-sim.sh --shares-only` (needs
-`sim/run-sim.sh` first for the shared `awow-sim_default` network); shares are
+`sim/run-sim.sh` first for the shared `homehub-sim_default` network); shares are
 `//mini-serv/{minecraft,satisfactory,icedrive}`, user `awow` / `simpass`,
 minecraft+satisfactory exported READ-ONLY (live-share-stays-read-only rule).
 
@@ -587,7 +587,7 @@ machine-level, neither touched here):
   rather than hand-rebuilding one) plus embedded `/nocloud/` +
   `/deploy-payload/` — truly zero-keypress, at the cost of ~3.4GB
   copied/rewritten per build.
-- **`vmtest/New-AwowVm.ps1`** / **`Remove-AwowVm.ps1`** — Hyper-V Gen2 VM
+- **`vmtest/New-HomeHubVm.ps1`** / **`Remove-HomeHubVm.ps1`** — Hyper-V Gen2 VM
   (4 vCPU/8GB static RAM stand-in for the AK41, 64GB dynamic VHDX,
   `MicrosoftUEFICertificateAuthority` Secure Boot template for the Ubuntu
   shim, Default Switch/NAT by default with a documented External-switch
@@ -626,8 +626,8 @@ machine-level, neither touched here):
 - `python scripts/check.py` / `validate_config.py` still PASS unchanged (G1
   green) after adding `vmtest/`.
 
-**NOT run (honest gap, by design/scope):** `New-AwowVm.ps1`,
-`Remove-AwowVm.ps1` — need elevation + the Hyper-V feature, an agent doesn't
+**NOT run (honest gap, by design/scope):** `New-HomeHubVm.ps1`,
+`Remove-HomeHubVm.ps1` — need elevation + the Hyper-V feature, an agent doesn't
 make that call. **No VM has been booted from either ISO.** The GRUB-edit
 mechanism (light path) and the El-Torito-preserving repack (heavy path) are
 verified at the ISO-structure level only, not by an actual boot.
@@ -655,7 +655,7 @@ Implemented the Owner's locked **Q10.9 B+** decision (HOMELAB_RESTRUCTURE_PLAN.m
 every stack image is `docker save`d into the ISO deploy payload and `docker
 load`ed at first boot, so a freshly-imaged AWOW comes up "from infancy" with
 **zero registry/internet dependency for container images**, versions pinned to
-exactly what the AWOW-sim validated.
+exactly what the homehub-sim validated.
 
 **What was built:**
 - `vmtest/export-images.sh` — resolves the full image set via `docker compose
@@ -672,7 +672,7 @@ exactly what the AWOW-sim validated.
   composable + idempotent and gives firstboot per-image load logging + graceful
   per-image degrade. (`--zstd` remains available if ever wanted.)
 - `stack/autoinstall/firstboot.sh` — new **step 3**: before `docker compose up`,
-  `docker load` every tar found in `/opt/awow-core/images` (with fallbacks
+  `docker load` every tar found in `/opt/homehub/images` (with fallbacks
   `$STACK_DIR/images`, `/cdrom/deploy-payload/images`,
   `/media/deploy-payload/images` so it works in either ISO layout). Idempotent;
   per-tar failures warn-and-continue (compose can still pull). **Graceful
@@ -684,7 +684,7 @@ exactly what the AWOW-sim validated.
   OI-6). The **light** path (`build-seed.sh`) burns that into the CIDATA seed ISO
   (~1MB → ~470MB); the **repacked** path (`build-repacked-iso.sh`) maps the same
   `deploy-payload/` dir into the ISO's `/deploy-payload/` (~3.4GB → ~3.9GB).
-  Either way the tars land at `/opt/awow-core/images` for firstboot.
+  Either way the tars land at `/opt/homehub/images` for firstboot.
 
 **PIN SET (`latest`/floating → concrete, Q10.9 B+).** `latest` was fine for
 bring-up; B+ makes what-boots == what-was-validated, so floating tags are now
@@ -704,7 +704,7 @@ containerd store; see `images.manifest.tsv`):
 | ntfy | `NTFY_IMAGE_TAG` | `latest` | `v2.25.0` | `sha256:cfbbb1bac9196cb711e29ef0ac4adaeb033be6235f1df857705dc39c14384a1d` |
 
 **How the concrete tags were derived (honest):** the 5 **core** images ran in
-the V1 AWOW-sim; each concrete pin was verified to be the SAME image V1 ran —
+the V1 homehub-sim; each concrete pin was verified to be the SAME image V1 ran —
 technitium `latest`'s linux/amd64 sub-manifest is byte-identical to `15.2.0`'s
 (`sha256:85c2cfd4…`), caddy `2-alpine` and actual `latest` share their exact
 index digest with `2.11.4-alpine` / `26.7.0`, oauth2-proxy was already `v7.6.0`,
@@ -760,7 +760,7 @@ whole CPU), so the policy is **dynamic standby**, two pieces:
   (`hdparm -S` does not persist across power cycles, so it re-applies every boot,
   like `powertune.service`). Shipped/enabled via autoinstall `late-commands`
   exactly like powertune (runs in place from the stack dir so it can source
-  `common.sh`, matching `awow-backup.service`). Added `hdparm` to the autoinstall
+  `common.sh`, matching `homehub-backup.service`). Added `hdparm` to the autoinstall
   packages list (NOT guaranteed on Ubuntu Server).
 - **Dynamic hold in the run** — `backup.sh` disables standby (`hdparm -S 0`) on
   its target drive(s) at run start and **restores the configured timeout on any
@@ -910,7 +910,7 @@ stay as-is (one drive target + the `OFFSITE_SETS` subset selector).
   ride the same archive/hash/manifest/retention/offsite/report pipeline.
 - **New sim leg `sim/mini-serv-sim/run-volume-sim.sh`** (mock-`docker` +
   mock-`curl` shims, the run-drivepower-sim.sh pattern; feed mocked so the leg
-  runs without the awow-sim tracker).
+  runs without the homehub-sim tracker).
 
 **RAN FOR REAL (WSL2 / docker, this session):**
 - **RED first:** pre-implementation run — scenarios (a)–(c) failed exactly as
@@ -921,7 +921,7 @@ stay as-is (one drive target + the `OFFSITE_SETS` subset selector).
   precedes start; (c) forced mid-copy failure (mock rsync) → container STILL
   restarted via the EXIT trap, ok=false posted, nonzero exit, on_err logged;
   (d) cifs-only table → ZERO docker calls.
-- **No-regression:** full `run-backup-sim.sh` re-run against the live awow-sim
+- **No-regression:** full `run-backup-sim.sh` re-run against the live homehub-sim
   tracker — **BACKUP LEG: PASS** (cycle, offsite push, real NagLight feed
   round-trip, minecraft restore drill incl. post-loss reconstruct).
 - `bash -n` clean; `check.py` G1 re-run after the registry additions (SN=10,
@@ -1023,7 +1023,7 @@ app's bank feed wires in. Docs now say it in one place:
   NO credential lives in a container/image; state = named volumes (Actual
   server pw + SimpleFIN credential + budgets, Technitium config, Caddy certs,
   tracker data, Vaultwarden) + host files (`.env`, allow-list, `.token`,
-  `/etc/awow-backup/*`). Container updates (`compose pull && up -d` / pin
+  `/etc/homehub-backup/*`). Container updates (`compose pull && up -d` / pin
   bumps) are credential-safe by construction; a reimage wipes volumes → they
   return via the SR-013 volume backups, `.env` re-seeds from the USB payload.
   Plus "What runs where": on the AWOW everything is a container except the
@@ -1071,7 +1071,7 @@ build, @actual-app/api@26.7.0 installed in the throwaway stage); `docker run`
 of the image boots under Node 24 native type-stripping and exits with the
 documented config-invalid fatal naming the missing key (trackerFeedUrl) —
 FA's startup contract observed. NOT run: a live pipeline cycle (that is FA's
-TC-033 G-Release Demonstration — the AWOW-sim's actual+tracker are a
+TC-033 G-Release Demonstration — the homehub-sim's actual+tracker are a
 ready-made environment for it; sim runs Actual `latest`, so pin the sim to
 26.7.0 for a faithful rehearsal per FA's spec note).
 
@@ -1206,7 +1206,7 @@ one are named at the bottom.
   `report_failure` refactor.
 - **A throwaway Linux harness** (scratch, not committed) drove the new paths
   with `path:` sources and a stub feed endpoint: happy run with `OFFSITE_PATH`
-  → files staged under `<OFFSITE_PATH>/awow-backup/run_<ts>` + `ok=true` +
+  → files staged under `<OFFSITE_PATH>/homehub-backup/run_<ts>` + `ok=true` +
   restore byte-identical; `OFFSITE_ENABLED=false` still a clean skip; legacy
   `OFFSITE_UNC` branch still selected and failing loudly when the share is
   unreachable; `--dry-run` unchanged. **Four `die` paths each POSTED
@@ -1239,7 +1239,7 @@ one are named at the bottom.
 **For the Owner / next gate**
 
 - **OI-13** (new): the wake feature is inert until the real MAC lands in
-  `/etc/awow-backup/backup.env`, and it needs two Windows-side settings.
+  `/etc/homehub-backup/backup.env`, and it needs two Windows-side settings.
 - **OI-11(b)**: set `OFFSITE_PATH` once IceDrive is running on-box; the run
   fails if that directory is missing, deliberately.
 - **A7** records the mechanics decided unattended (probe port, default timeout,
@@ -1276,7 +1276,7 @@ git history was rewritten.
     with an inline note that the real login name is redacted per SR-010. The
     account itself is unchanged on the dev PC.
 - The pseudonym `diytechy`, the `AuroLeap` org, hostnames (`mini-serv`,
-  `awow-core`), and all `Co-Authored-By` trailers were left untouched.
+  `homehub`), and all `Co-Authored-By` trailers were left untouched.
 
 **RAN FOR REAL**
 
@@ -1350,7 +1350,7 @@ listed as **A8** and the things only the Owner can supply are **OI-14**.
   creates ARE the offsite configuration).
 - **New sim leg `sim/mini-serv-sim/run-ingest-sim.sh`** — the ingest/exclusion
   regression net, over the REAL cifs path (only the NagLight feed is mocked, so
-  it needs no awow-sim stack). The compose file gains one fixture: the
+  it needs no homehub-sim stack). The compose file gains one fixture: the
   intentionally always-empty share `//mini-serv/empty`, needed to prove an empty
   share cannot mirror-delete a good library copy.
 
@@ -1428,7 +1428,7 @@ listed as **A8** and the things only the Owner can supply are **OI-14**.
 
 - **OI-14** (new): ingest + exclusions are inert until the real share, the real
   library destination and the real "very large folder" names land in
-  `/etc/awow-backup/backup.env`; the authoritative paths are in
+  `/etc/homehub-backup/backup.env`; the authoritative paths are in
   `Personal\deploy\storage-map.md`, and the mirror deletes whatever the share
   deletes.
 - **OI-11 rewritten** for the corrected model; the `OFFSITE_PATH` build half is
@@ -1920,7 +1920,7 @@ configuration should self-configure wherever the trust model allows:
   (default `tracker`): the POST runs inside the tracker container via
   `docker exec` + its busybox wget (the same binary its healthcheck proves)
   against its own loopback. Port stays closed. **Sim-untested**: `bash -n`
-  clean; the AWOW-sim backup lane is the gate.
+  clean; the homehub-sim backup lane is the gate.
 - **`provision/provision-actual.sh` (NEW) + firstboot step 5b**: sets the
   dev-PC-minted Actual server password on the un-bootstrapped server
   (`POST /account/bootstrap`, checked via `GET /account/needs-bootstrap`

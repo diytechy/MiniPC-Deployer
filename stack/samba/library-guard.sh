@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# awow-library-guard — refuse to serve, and report, when the library drive is
+# homehub-library-guard — refuse to serve, and report, when the library drive is
 # not really there. (Peter's ask 2026-07-30: "can you make the shares fail in
 # some way if the drive is not available? Or report something in some other
 # way?" — the answer is both.)
@@ -25,7 +25,7 @@
 set -uo pipefail
 
 LIBRARY_ROOT="${LIBRARY_ROOT:-/srv/library}"
-ENV_FILE="${ENV_FILE:-/etc/awow-backup/backup.env}"
+ENV_FILE="${ENV_FILE:-/etc/homehub-backup/backup.env}"
 MODE="--check"
 SHARE=""
 while [ $# -gt 0 ]; do
@@ -75,8 +75,8 @@ if [ "$MODE" = "--check" ]; then
     if [ -n "$fail_reason" ]; then
         # Samba logs preexec output; keep it to one line so the reason is
         # visible in the client's connection failure context.
-        echo "awow-library-guard: REFUSING share '${SHARE:-?}': $fail_reason" >&2
-        logger -t awow-library-guard -p daemon.err "refused share '${SHARE:-?}': $fail_reason" 2>/dev/null || true
+        echo "homehub-library-guard: REFUSING share '${SHARE:-?}': $fail_reason" >&2
+        logger -t homehub-library-guard -p daemon.err "refused share '${SHARE:-?}': $fail_reason" 2>/dev/null || true
         exit 1
     fi
     exit 0
@@ -87,7 +87,7 @@ log() { echo "[library-guard] $*"; }
 
 if [ -n "$fail_reason" ]; then
     log "UNHEALTHY: $fail_reason"
-    logger -t awow-library-guard -p daemon.err "$fail_reason" 2>/dev/null || true
+    logger -t homehub-library-guard -p daemon.err "$fail_reason" 2>/dev/null || true
 else
     log "healthy: $LIBRARY_ROOT mounted read-write"
 fi

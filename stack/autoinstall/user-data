@@ -45,7 +45,7 @@ autoinstall:
     # it is replaced tomorrow the name should still be right. `awow` stays in
     # documentation, where it describes the machine, and out of anything the
     # running system answers to.
-    # NOTE: the install PATH is still /opt/awow-core — a separate rename with
+    # NOTE: the install PATH is still /opt/homehub — a separate rename with
     # its own blast radius across firstboot, the systemd units and the sim.
     hostname: homehub
     realname: "Home Hub Operator"
@@ -170,12 +170,12 @@ autoinstall:
     # ---- 3. Place the stack ---------------------------------------------------
     # The repo payload is copied by the USB-build step to /cdrom/deploy-payload
     # (a second CIDATA stick, or the remastered ISO) and picked up here into
-    # /opt/awow-core/. The stack itself then lives at /opt/awow-core/stack/.
-    - mkdir -p /target/opt/awow-core
-    - cp -a /cdrom/deploy-payload/. /target/opt/awow-core/ 2>/dev/null || cp -a /media/deploy-payload/. /target/opt/awow-core/ 2>/dev/null || true
+    # /opt/homehub/. The stack itself then lives at /opt/homehub/stack/.
+    - mkdir -p /target/opt/homehub
+    - cp -a /cdrom/deploy-payload/. /target/opt/homehub/ 2>/dev/null || cp -a /media/deploy-payload/. /target/opt/homehub/ 2>/dev/null || true
 
     # ---- 4. Seed .env from the example if the operator did not pre-fill one ----
-    - curtin in-target --target=/target -- bash -c '[ -f /opt/awow-core/stack/.env ] || cp /opt/awow-core/stack/.env.example /opt/awow-core/stack/.env'
+    - curtin in-target --target=/target -- bash -c '[ -f /opt/homehub/stack/.env ] || cp /opt/homehub/stack/.env.example /opt/homehub/stack/.env'
 
     # ---- 4b. SITE payload: real materialized config + secrets (A14) ------------
     # deploy-payload/site/ is written by Build-VentoyStick.ps1 from
@@ -187,25 +187,25 @@ autoinstall:
     # files carry live credentials, so they are installed 0600 root-owned. The
     # smb.conf fragment and fstab are not secret but are still root-only to
     # keep the whole site/ tree consistent.
-    - mkdir -p /target/etc/awow-samba /target/etc/awow-backup
-    - bash -c 'S=/cdrom/deploy-payload/site; [ -d "$S" ] || S=/media/deploy-payload/site; [ -d "$S" ] || exit 0; install -m600 -o root -g root "$S/.env" /target/opt/awow-core/stack/.env 2>/dev/null || true; install -m600 -o root -g root "$S/backup.env" /target/etc/awow-backup/backup.env 2>/dev/null || true; install -m600 -o root -g root "$S/cifs.creds" /target/etc/awow-backup/cifs.creds 2>/dev/null || true; install -m600 -o root -g root "$S/samba-users.creds" /target/etc/awow-samba/samba-users.creds 2>/dev/null || true; install -m600 -o root -g root "$S/smb.conf.fragment" /target/etc/awow-samba/smb.conf.fragment 2>/dev/null || true; install -m600 -o root -g root "$S/library-mounts.fstab" /target/etc/awow-samba/library-mounts.fstab 2>/dev/null || true; touch /target/etc/awow-samba/.site-present'
+    - mkdir -p /target/etc/homehub-samba /target/etc/homehub-backup
+    - bash -c 'S=/cdrom/deploy-payload/site; [ -d "$S" ] || S=/media/deploy-payload/site; [ -d "$S" ] || exit 0; install -m600 -o root -g root "$S/.env" /target/opt/homehub/stack/.env 2>/dev/null || true; install -m600 -o root -g root "$S/backup.env" /target/etc/homehub-backup/backup.env 2>/dev/null || true; install -m600 -o root -g root "$S/cifs.creds" /target/etc/homehub-backup/cifs.creds 2>/dev/null || true; install -m600 -o root -g root "$S/samba-users.creds" /target/etc/homehub-samba/samba-users.creds 2>/dev/null || true; install -m600 -o root -g root "$S/smb.conf.fragment" /target/etc/homehub-samba/smb.conf.fragment 2>/dev/null || true; install -m600 -o root -g root "$S/library-mounts.fstab" /target/etc/homehub-samba/library-mounts.fstab 2>/dev/null || true; touch /target/etc/homehub-samba/.site-present'
 
     # ---- 5. Install + enable the first-boot unit ------------------------------
-    - cp /target/opt/awow-core/stack/autoinstall/awow-firstboot.service /target/etc/systemd/system/awow-firstboot.service
-    - cp /target/opt/awow-core/stack/autoinstall/firstboot.sh /target/usr/local/sbin/awow-firstboot.sh
-    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/awow-firstboot.sh
-    - curtin in-target --target=/target -- systemctl enable awow-firstboot.service
+    - cp /target/opt/homehub/stack/autoinstall/homehub-firstboot.service /target/etc/systemd/system/homehub-firstboot.service
+    - cp /target/opt/homehub/stack/autoinstall/firstboot.sh /target/usr/local/sbin/homehub-firstboot.sh
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/homehub-firstboot.sh
+    - curtin in-target --target=/target -- systemctl enable homehub-firstboot.service
     # Low-power tune unit (per-boot powertop auto-tune + USB-storage guard).
-    - cp /target/opt/awow-core/stack/autoinstall/powertune.service /target/etc/systemd/system/powertune.service
-    - cp /target/opt/awow-core/stack/autoinstall/powertune.sh /target/usr/local/sbin/powertune.sh
+    - cp /target/opt/homehub/stack/autoinstall/powertune.service /target/etc/systemd/system/powertune.service
+    - cp /target/opt/homehub/stack/autoinstall/powertune.sh /target/usr/local/sbin/powertune.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/powertune.sh
     - curtin in-target --target=/target -- systemctl enable powertune.service
     # Backup-drive default standby unit (per-boot hdparm -S spin-down — WI-10.10).
-    # Runs from the stack dir (sources common.sh) like awow-backup.service, so we
+    # Runs from the stack dir (sources common.sh) like homehub-backup.service, so we
     # only install the unit + make the script executable; no cp to /usr/local/sbin.
-    # A no-op until BACKUP_DRIVE_DEVICES is set in /etc/awow-backup/backup.env.
-    - cp /target/opt/awow-core/stack/backup/systemd/backup-standby.service /target/etc/systemd/system/backup-standby.service
-    - curtin in-target --target=/target -- chmod +x /opt/awow-core/stack/backup/backup-standby.sh
+    # A no-op until BACKUP_DRIVE_DEVICES is set in /etc/homehub-backup/backup.env.
+    - cp /target/opt/homehub/stack/backup/systemd/backup-standby.service /target/etc/systemd/system/backup-standby.service
+    - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/backup-standby.sh
     - curtin in-target --target=/target -- systemctl enable backup-standby.service
 
   # No reboot prompt — power-cycle straight into the running box.

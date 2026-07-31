@@ -3,8 +3,8 @@
 **This directory is deliberately empty of product code.** It is the mount point
 the `{$WALL_HOST}:{$WALL_PORT}` kiosk site serves as its document root
 (`stack/caddy/Caddyfile`, SR-016), bind-mounted read-only into the caddy
-container as `/srv/wall-shell`. On the AWOW box it is
-`/opt/awow-core/stack/wall-shell/`.
+container as `/srv/wall-shell`. On the hub box it is
+`/opt/homehub/stack/wall-shell/`.
 
 Why it exists at all: NagLight sends **no CORS headers**, so the panel's shell
 can only call `/api/*` if it is served from the **same origin** that proxies the
@@ -35,7 +35,7 @@ Nothing in this repo builds, vendors, or vendors-in the shell.
   2026-07-29 (OI-15): it is PANEL-LOCAL.** The panel pulls the media itself
   (`stack/autoinstall/wall/wall-sync.sh`, mirror semantics) and the shell's
   Electron host serves `/media/*` from that cache, so this site has no `/media`
-  route and never will — an AWOW-served fallback would be streaming, which is what
+  route and never will — a hub-served fallback would be streaming, which is what
   D-W8 chose against.
 - **`/music`** — optional Navidrome streaming, a commented `handle_path` stub in
   the Caddyfile gated on the `navidrome` tier-2 profile.

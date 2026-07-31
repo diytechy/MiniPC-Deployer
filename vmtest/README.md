@@ -16,8 +16,8 @@ no-ops). `build-repacked-iso.sh` was run for real in WI-10.18 against an actual
 confirmed to still carry both a BIOS and a UEFI El Torito boot image and to
 contain `/nocloud/` + `/deploy-payload/`; the Q10.9 B+ addition (images folded
 into `/deploy-payload/images/`) was separately verified via the exact `xorriso
--map` codepath. **Nobody has booted a VM from either ISO** — `New-AwowVm.ps1` /
-`Remove-AwowVm.ps1` need elevation + the Hyper-V feature and were deliberately
+-map` codepath. **Nobody has booted a VM from either ISO** — `New-HomeHubVm.ps1` /
+`Remove-HomeHubVm.ps1` need elevation + the Hyper-V feature and were deliberately
 never run. The actual first-boot `docker load` run is part of the V3 boot
 (the Owner's step). See docs/status.md for the full ledger.
 
@@ -25,7 +25,7 @@ never run. The actual first-boot `docker load` run is part of the V3 boot
 
 Per the Owner's locked Q10.9 B+ decision, a freshly-imaged AWOW comes up with EVERY
 stack container image already present — **zero registry/internet dependency for
-container images at first boot**, versions pinned to exactly what the AWOW-sim
+container images at first boot**, versions pinned to exactly what the homehub-sim
 validated. The flow:
 
 ```
@@ -37,9 +37,9 @@ build-seed.sh / build-repacked-iso.sh
    ▼
 seed.iso / repacked.iso          # /deploy-payload/images/*.tar rides on the ISO
    ▼
-autoinstall late-commands        # cp -a /cdrom/deploy-payload/. -> /opt/awow-core/
+autoinstall late-commands        # cp -a /cdrom/deploy-payload/. -> /opt/homehub/
    ▼
-/opt/awow-core/images/*.tar
+/opt/homehub/images/*.tar
    ▼
 firstboot.sh step 3              # docker load each tar (idempotent) BEFORE compose up
 ```
@@ -236,7 +236,7 @@ wraps everything below — checks elevation (and re-launches itself through UAC 
 you merely double-clicked), verifies both ISOs exist and that Hyper-V answers,
 creates + starts the VM, prints the one-time GRUB edit from §6, and opens
 `vmconnect`. Defaults: stock ISO from `D:\iso\`, seed from `.out\seed.iso`, VHDX
-to `D:\HyperV\AWOW-VMTest` (**D: on purpose — C: is the tight drive**). Optional
+to `D:\HyperV\HomeHub-VMTest` (**D: on purpose — C: is the tight drive**). Optional
 switches: `/force` (delete an existing VM **and its VHDX** first), `/whatif`
 (preview only), `/noconn` (skip `vmconnect`); an explicit ISO path can be passed
 as the first argument. The manual equivalent:
@@ -245,23 +245,23 @@ as the first argument. The manual equivalent:
 # Elevated PowerShell, from the MiniPC-Deployer checkout
 
 # LIGHT path:
-.\vmtest\New-AwowVm.ps1 `
+.\vmtest\New-HomeHubVm.ps1 `
     -UbuntuIsoPath D:\iso\ubuntu-24.04.4-live-server-amd64.iso `
     -SeedIsoPath   .\vmtest\.out\seed.iso
 
 # HEAVIER path (single ISO carries everything):
-.\vmtest\New-AwowVm.ps1 `
+.\vmtest\New-HomeHubVm.ps1 `
     -UbuntuIsoPath .\vmtest\.out\repacked.iso `
     -SeedIsoPath   .\vmtest\.out\repacked.iso `
     -SkipSecondDvd
 ```
 
-Defaults: `AWOW-VMTest`, Gen2, 4 vCPU / 8GB static RAM (a reasonable stand-in
+Defaults: `HomeHub-VMTest`, Gen2, 4 vCPU / 8GB static RAM (a reasonable stand-in
 for the AK41's Celeron J4125 / 8GB — not an exact clone), 64GB dynamic VHDX,
 **Default Switch** (Windows' built-in NAT), Secure Boot ON with the
 `MicrosoftUEFICertificateAuthority` template (the template Microsoft ships
 specifically for signed Linux bootloaders — Ubuntu's `shimx64` needs this, not
-the Windows-only default template). See `Get-Help .\vmtest\New-AwowVm.ps1
+the Windows-only default template). See `Get-Help .\vmtest\New-HomeHubVm.ps1
 -Full` for every parameter (RAM/CPU/disk size, `-DynamicMemory`,
 `-DisableSecureBoot`, `-Force` to recreate, `-KeepDisk`, `-Start`). Supports
 `-WhatIf` — run that first if you want to preview without creating anything.
@@ -275,7 +275,7 @@ deliberately does not create one (a host-networking change with more blast
 radius than a VM-local NAT switch).
 
 The VM is created **stopped**. Start it yourself (`-Start`, or `Start-VM
--Name AWOW-VMTest`, or via Hyper-V Manager) once you're ready to watch the
+-Name HomeHub-VMTest`, or via Hyper-V Manager) once you're ready to watch the
 console for §6.
 
 ---
@@ -283,8 +283,8 @@ console for §6.
 ## 6. Boot it — connect + (LIGHT path only) the one-time GRUB edit
 
 ```powershell
-Start-VM -Name AWOW-VMTest
-vmconnect localhost AWOW-VMTest
+Start-VM -Name HomeHub-VMTest
+vmconnect localhost HomeHub-VMTest
 ```
 
 1. GRUB menu appears ("Try or Install Ubuntu Server" highlighted).
@@ -308,20 +308,20 @@ vmconnect localhost AWOW-VMTest
    > skip the "Continue with autoinstall?" confirmation prompt.
 3. Subiquity partitions the disk (whole-disk LVM), creates the `hub`
    user, installs Docker + Cockpit + unattended-upgrades, copies
-   `deploy-payload/` to `/opt/awow-core/` (**including `images/` — the baked
+   `deploy-payload/` to `/opt/homehub/` (**including `images/` — the baked
    container image tars, Q10.9 B+**), seeds `.env` (already filled with SIM
    values — no placeholder-seed step triggers), installs + enables
-   `awow-firstboot.service`, and reboots on its own (`shutdown: reboot` in
+   `homehub-firstboot.service`, and reboots on its own (`shutdown: reboot` in
    `user-data` — no confirmation).
-4. On first real boot, `awow-firstboot.service` runs `firstboot.sh`
+4. On first real boot, `homehub-firstboot.service` runs `firstboot.sh`
    automatically (systemd `oneshot`, `TimeoutStartSec=1800`): it **`docker
-   load`s every tar from `/opt/awow-core/images/` (step 3 of firstboot) before
+   load`s every tar from `/opt/homehub/images/` (step 3 of firstboot) before
    `docker compose up -d`**, so the stack starts entirely from the baked images
    with no registry pulls.
 
 You can log in at the console at any point with user `hub` and either the
 SIM password from `vmtest/.out/secrets/creds.env`, or
-`ssh -i vmtest/.out/ssh/awow-vmtest-ed25519 hub@<vm-ip>` once networking
+`ssh -i vmtest/.out/ssh/homehub-vmtest-ed25519 hub@<vm-ip>` once networking
 is up (find the IP via the console: `ip -4 addr show` or Hyper-V Manager's
 VM summary pane — Default Switch NAT hands out a `172.x`-range address).
 
@@ -332,14 +332,14 @@ VM summary pane — Default Switch NAT hands out a `172.x`-range address).
 Watch first-boot bring-up:
 
 ```sh
-journalctl -u awow-firstboot -f      # follow the oneshot's log
-docker compose -f /opt/awow-core/stack/docker-compose.yml ps
+journalctl -u homehub-firstboot -f      # follow the oneshot's log
+docker compose -f /opt/homehub/stack/docker-compose.yml ps
 ```
 
 **Minimum V3 success (the actual gate):**
-- `awow-firstboot.service` reports `SUCCESS` (`systemctl status
-  awow-firstboot` — oneshot, `RemainAfterExit=yes`). Its log (`journalctl -u
-  awow-firstboot`) shows **"loading N baked image tar(s)"** and a `docker load`
+- `homehub-firstboot.service` reports `SUCCESS` (`systemctl status
+  homehub-firstboot` — oneshot, `RemainAfterExit=yes`). Its log (`journalctl -u
+  homehub-firstboot`) shows **"loading N baked image tar(s)"** and a `docker load`
   line per image (Q10.9 B+) BEFORE `docker compose up -d`.
 - `docker compose ps` shows **technitium**, **caddy**, **actual**, AND
   **tracker** `healthy` — every image (including `naglight:local`) was baked
@@ -420,9 +420,9 @@ docker compose -f /opt/awow-core/stack/docker-compose.yml ps
 ## 9. Teardown
 
 ```powershell
-.\vmtest\Remove-AwowVm.ps1                 # stop + remove VM + delete its VHDX
-.\vmtest\Remove-AwowVm.ps1 -KeepDisk        # keep the VHDX (e.g. to re-attach later)
-.\vmtest\Remove-AwowVm.ps1 -WhatIf          # preview only
+.\vmtest\Remove-HomeHubVm.ps1                 # stop + remove VM + delete its VHDX
+.\vmtest\Remove-HomeHubVm.ps1 -KeepDisk        # keep the VHDX (e.g. to re-attach later)
+.\vmtest\Remove-HomeHubVm.ps1 -WhatIf          # preview only
 ```
 
 Idempotent — running it against a VM that doesn't exist is a no-op, not an
@@ -439,9 +439,9 @@ vmtest/
   build-seed.sh           LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
   build-repacked-iso.sh   HEAVIER path: one self-contained ISO (fallback; folds in the payload)
   lib/common.sh           shared rendering + stage_images_into_payload (sourced, not run directly)
-  Run-V3Gate.cmd          right-click "Run as administrator" wrapper for New-AwowVm.ps1
-  New-AwowVm.ps1          create the Hyper-V VM (elevation required; NOT run by an agent)
-  Remove-AwowVm.ps1       companion teardown (elevation required; NOT run by an agent)
+  Run-V3Gate.cmd          right-click "Run as administrator" wrapper for New-HomeHubVm.ps1
+  New-HomeHubVm.ps1          create the Hyper-V VM (elevation required; NOT run by an agent)
+  Remove-HomeHubVm.ps1       companion teardown (elevation required; NOT run by an agent)
   .out/                   gitignored — everything the build scripts generate
   .out/images/            gitignored — the docker-save image tars + manifest
 ```

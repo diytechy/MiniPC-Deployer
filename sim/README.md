@@ -1,6 +1,6 @@
-# AWOW-sim — local V1 simulation of the whole stack
+# homehub-sim — local V1 simulation of the whole stack
 
-This directory is the **V1 "AWOW-sim"** (WI-10.14/10.15): the full container
+This directory is the **V1 "homehub-sim"** (WI-10.14/10.15): the full container
 collection runs locally and proves itself against a fictional fixture world,
 *before* any hardware. It is a compose **overlay over the real stack**, never a
 fork — the sim must exercise `stack/docker-compose.yml`, so a bug there is a bug
@@ -31,7 +31,7 @@ sim/run-sim.sh --down   # tear down (removes volumes)
 `run-sim.sh` is:
 
 ```
-docker compose -p awow-sim \
+docker compose -p homehub-sim \
   -f stack/docker-compose.yml -f sim/docker-compose.sim.yml \
   --env-file sim/.env.sim up -d
 ```
@@ -92,7 +92,7 @@ vantage — that stays a hardware/V3 remainder.
 real Google consent, publicly-trusted ACME certs, Technitium binding the host's
 real `:53`, the wall kiosk site's **off-LAN 403** from a real WAN vantage (and
 whether Docker's port publish preserves the panel's source IP well enough for the
-`/32` to match on the real box), the wall panel's graphical session, and the AWOW
+`/32` to match on the real box), the wall panel's graphical session, and the hub
 hardware itself.
 
 ## mini-serv-sim — Samba fixtures + the bash backup service (WI-10.15)
@@ -110,7 +110,7 @@ sim/mini-serv-sim/run-backup-sim.sh --down # tear down
 ```
 
 `run-ingest-sim.sh` covers the two steps ratified 2026-07-29, over the REAL cifs
-path (only the feed is mocked, so the awow-sim stack is not needed): (a) an
+path (only the feed is mocked, so the homehub-sim stack is not needed): (a) an
 `INGEST_SOURCES` mirror of `//mini-serv/minecraft` into `/srv/library/...` is
 byte-identical to the live share and the `path:` set over it restores byte-equal;
 (b) library-only files are DELETED by the next mirror (`--delete` semantics
@@ -132,7 +132,7 @@ devices → zero `hdparm` calls, unchanged green cycle. It cleans its shims up a
 so a subsequent `run-backup-sim.sh` sees the real tools. Whether a given USB
 enclosure actually *honors* `hdparm` standby is a hardware burn-in check.
 
-Requires the awow-sim stack up first (`sim/run-sim.sh`) — the runner feeds the
+Requires the homehub-sim stack up first (`sim/run-sim.sh`) — the runner feeds the
 sim NagLight tracker and shares its network. The run performs steps 1-6 of
 HOMELAB_TOPOLOGY.md (cifs pull → tar/zstd → hash+manifest → retention → offsite
 push → NagLight feed) and then the **restore drill**: reconstruct minecraft from
@@ -160,9 +160,9 @@ MinecraftKeeper's `--execute` validation (WI-10.16) needs only the Samba shares:
 ```bash
 sim/run-sim.sh                                   # once, for the shared network
 sim/mini-serv-sim/run-backup-sim.sh --shares-only
-# -> //mini-serv/{minecraft,satisfactory,icedrive,empty}  user: awow  pass: simpass
+# -> //mini-serv/{minecraft,satisfactory,icedrive,empty}  user: homehub  pass: simpass
 ```
 
-The shares are reachable from any container on the `awow-sim_default` network as
+The shares are reachable from any container on the `homehub-sim_default` network as
 `//mini-serv/<share>`; the live tree stays read-only (minecraft/satisfactory
 are exported read-only), matching the "live share stays read-only" rule.

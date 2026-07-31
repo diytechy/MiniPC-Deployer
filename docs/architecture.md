@@ -124,7 +124,7 @@ graph LR
 | `stack/mosquitto/` | committed MQTT broker config (tier-2 home-automation profiles) |
 | `stack/remote-ui/` | OPT-IN light RDP layer for GUI-only vendor apps (IceDrive; SR-015) |
 | `stack/tracker/` | deprecated reference copies (NagLight owns the build) |
-| `sim/` | V1 AWOW-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
+| `sim/` | V1 homehub-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
 | `vmtest/` | V3 — the real autoinstall ISO booted in Hyper-V (SIM secrets only) |
 | `scripts/validate_config.py` | config-coverage validation (the product-layer check here) |
 | `scripts/ensure-local-images.sh` | SR-006 resolver for private-repo images (present → sibling → public) |

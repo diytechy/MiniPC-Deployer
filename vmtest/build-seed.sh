@@ -99,4 +99,4 @@ esac
 log "OK — seed ISO ready: $SEED_ISO"
 log "SSH:     ssh -i $SSH_KEY hub@<vm-ip>   (fingerprint: $(ssh-keygen -lf "$SSH_KEY.pub"))"
 log "Console: user 'hub', SIM password in $CREDS_FILE"
-log "Next: vmtest/README.md — attach $SEED_ISO as the VM's 2nd DVD via New-AwowVm.ps1"
+log "Next: vmtest/README.md — attach $SEED_ISO as the VM's 2nd DVD via New-HomeHubVm.ps1"

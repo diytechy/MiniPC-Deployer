@@ -14,7 +14,7 @@
 # anyone holding it could authenticate as any identity, including `admin`
 # (implicit full read/write everywhere). Peter's ruling: one password each.
 #
-# INPUT  /etc/awow-samba/samba-users.creds  — `account:password` per line,
+# INPUT  /etc/homehub-samba/samba-users.creds  — `account:password` per line,
 #        emitted by Materialize-Deploy.ps1, root-only (0600). Colon-delimited
 #        and NOT shell-sourced on purpose: these passwords are human-chosen and
 #        may contain $ ` " and spaces, which `. file` would execute or mangle.
@@ -32,7 +32,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CREDS="/etc/awow-samba/samba-users.creds"
+CREDS="/etc/homehub-samba/samba-users.creds"
 while [ $# -gt 0 ]; do
     case "$1" in
         --creds) CREDS="$2"; shift 2 ;;
@@ -43,7 +43,7 @@ log() { echo "[provision-samba-users] $*"; }
 
 if [ ! -f "$CREDS" ]; then
     log "no credentials file at $CREDS — skipping."
-    log "  (Materialize-Deploy.ps1 emits out/awow/samba-users.creds; it is carried"
+    log "  (Materialize-Deploy.ps1 emits out/homehub/samba-users.creds; it is carried"
     log "   on the USB payload and installed here. Without it there are no"
     log "   household accounts and every §3 private share is unreachable.)"
     exit 0

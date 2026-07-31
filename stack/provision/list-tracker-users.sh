@@ -5,7 +5,7 @@
 # Multi-user NagLight keys one data dir per user off the Google `sub` claim,
 # directly under the tracker volume's root (NagLight web.DataRoot; each real
 # user dir contains definitions/). The `sub` IS the dir name — this prints
-# them so the owner can copy the right one into config.awow.psd1
+# them so the owner can copy the right one into config.homehub.psd1
 # (NAGLIGHT_USER) and config.common.psd1 (PANEL_USER_SUB).
 #
 # DELIBERATELY NOT auto-discovery for PANEL_USER_SUB: that value is the

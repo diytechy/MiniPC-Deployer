@@ -37,7 +37,7 @@
 # leg's fixtures are touched.
 #
 # Prereq: only the mini-serv-sim samba fixtures. The feed is MOCKED, so — like
-# run-volume-sim.sh — the awow-sim stack is not needed; the shared network is
+# run-volume-sim.sh — the homehub-sim stack is not needed; the shared network is
 # created standalone if absent.
 #
 # Usage:
@@ -47,17 +47,17 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 CO=(docker compose -p mini-serv-sim -f docker-compose.yml)
-BACKUP=/opt/awow-core/stack/backup/backup.sh
-RESTORE=/opt/awow-core/stack/backup/restore.sh
+BACKUP=/opt/homehub/stack/backup/backup.sh
+RESTORE=/opt/homehub/stack/backup/restore.sh
 LIB=/srv/library/NonDocs/MiniServ
 
 case "${1:-}" in
     --down) "${CO[@]}" down -v; exit 0 ;;
 esac
 
-if ! docker network inspect awow-sim_default >/dev/null 2>&1; then
-    echo "NOTE: awow-sim_default not found — creating it standalone (feed is mocked; tracker not needed)."
-    docker network create awow-sim_default >/dev/null
+if ! docker network inspect homehub-sim_default >/dev/null 2>&1; then
+    echo "NOTE: homehub-sim_default not found — creating it standalone (feed is mocked; tracker not needed)."
+    docker network create homehub-sim_default >/dev/null
 fi
 
 FAILS=0
@@ -70,7 +70,7 @@ echo "== build + up mini-serv-sim (samba + privileged runner) =="
 "${CO[@]}" up -d --build
 
 echo "== wait for Samba to accept a cifs mount AND serve a fixture file =="
-if rex 'for i in $(seq 1 30); do mkdir -p /mnt/probe; if mount -t cifs //mini-serv/minecraft /mnt/probe -o username=awow,password=simpass,ro,vers=3.0 2>/dev/null; then if [ -s /mnt/probe/server.properties ]; then umount /mnt/probe; echo ready; exit 0; fi; umount /mnt/probe; fi; sleep 2; done; exit 1'; then
+if rex 'for i in $(seq 1 30); do mkdir -p /mnt/probe; if mount -t cifs //mini-serv/minecraft /mnt/probe -o username=homehub,password=simpass,ro,vers=3.0 2>/dev/null; then if [ -s /mnt/probe/server.properties ]; then umount /mnt/probe; echo ready; exit 0; fi; umount /mnt/probe; fi; sleep 2; done; exit 1'; then
     pass "Samba share mountable"
 else
     fail "Samba never became mountable"; echo "== summary =="; echo "INGEST LEG: FAIL"; exit 1
@@ -115,9 +115,9 @@ echo 'second big file'        > /srv/library/Docs/Downloads/huge2.bin
 # Shared config tail (everything but the sources/exclude knobs).
 cat > /tmp/ing/env.tail <<'ENV'
 BACKUP_TARGET=/backup
-BACKUP_STAGING=/var/tmp/awow-backup/staging
+BACKUP_STAGING=/var/tmp/homehub-backup/staging
 BACKUP_KEEP=3
-BACKUP_CIFS_USER=awow
+BACKUP_CIFS_USER=homehub
 BACKUP_CIFS_PASS=simpass
 BACKUP_CIFS_EXTRA=vers=3.0
 BACKUP_ZSTD_LEVEL=10
@@ -182,7 +182,7 @@ if has "$loga" 'source deletions PROPAGATE'; then
 else
     fail "(a) the run log does not state the mirror contract"
 fi
-if rex "mkdir -p /mnt/orig && mount -t cifs //mini-serv/minecraft /mnt/orig -o username=awow,password=simpass,ro,vers=3.0 && diff -r '$LIB' /mnt/orig >/tmp/ing/diff_a.txt 2>&1; d=\$?; umount /mnt/orig; exit \$d"; then
+if rex "mkdir -p /mnt/orig && mount -t cifs //mini-serv/minecraft /mnt/orig -o username=homehub,password=simpass,ro,vers=3.0 && diff -r '$LIB' /mnt/orig >/tmp/ing/diff_a.txt 2>&1; d=\$?; umount /mnt/orig; exit \$d"; then
     pass "(a) library copy is byte-identical to the live share"
 else
     fail "(a) library copy differs from the share"; rex 'sed "s/^/      /" /tmp/ing/diff_a.txt' || true

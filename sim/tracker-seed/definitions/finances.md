@@ -10,7 +10,7 @@ items:
     horizon: daily
     notes: Color-lane automated item — the finance-auditor container reports a
       daily severity band with a terse de-identified reason. Sim fixture
-      mirroring NagLight's example-data/definitions/finances.md so the AWOW-sim
+      mirroring NagLight's example-data/definitions/finances.md so the homehub-sim
       exercises the severity-report seam end to end (a boolean-lane post to a
       color item, or vice versa, is a 400 by design).
 ---

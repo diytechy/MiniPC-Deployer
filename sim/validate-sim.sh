@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# validate-sim.sh — the V1 "AWOW-sim" GATE (WI-10.14). Six checks, each printing
+# validate-sim.sh — the V1 "homehub-sim" GATE (WI-10.14). Six checks, each printing
 # [PASS]/[FAIL]; a summary; and a NONZERO exit if any check fails. Run after
 # sim/run-sim.sh has the overlay up:
 #
@@ -32,7 +32,7 @@ TRK="${TRACKER_SUBDOMAIN}.${DOMAIN}"; ACT="${ACTUAL_SUBDOMAIN}.${DOMAIN}"
 A="sim-user-alice-0001"; B="sim-user-bob-0002"
 TRACKER_DIRECT="http://tracker:8787"   # documented trust model: direct-to-tracker is legit here
 
-COMPOSE=(docker compose -p awow-sim
+COMPOSE=(docker compose -p homehub-sim
          -f "$REPO_ROOT/stack/docker-compose.yml"
          -f "$REPO_ROOT/sim/docker-compose.sim.yml"
          --env-file "$SCRIPT_DIR/.env.sim")
@@ -62,7 +62,7 @@ wait_ready() {
     return 1
 }
 
-echo "== AWOW-sim V1 gate =="
+echo "== homehub-sim V1 gate =="
 echo "-- readiness --"
 if wait_ready; then pass "stack serving (tracker/ -> 302)"; else fail "stack not serving a redirect after 60s"; fi
 

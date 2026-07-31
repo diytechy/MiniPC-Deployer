@@ -22,7 +22,7 @@
 #
 # Prereq: only the mini-serv-sim samba fixtures (scenario a pulls one cifs set
 # alongside the volume set). The NagLight feed is MOCKED, so unlike
-# run-backup-sim.sh this leg does NOT need the awow-sim stack — if the shared
+# run-backup-sim.sh this leg does NOT need the homehub-sim stack — if the shared
 # network is absent we create it standalone.
 #
 # Usage:
@@ -32,19 +32,19 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 CO=(docker compose -p mini-serv-sim -f docker-compose.yml)
-BACKUP=/opt/awow-core/stack/backup/backup.sh
-RESTORE=/opt/awow-core/stack/backup/restore.sh
+BACKUP=/opt/homehub/stack/backup/backup.sh
+RESTORE=/opt/homehub/stack/backup/restore.sh
 
 case "${1:-}" in
     --down) "${CO[@]}" down -v; exit 0 ;;
 esac
 
 # The feed is mocked here, so the tracker isn't needed — create the shared
-# network standalone if the awow-sim stack isn't up (deviation from siblings,
+# network standalone if the homehub-sim stack isn't up (deviation from siblings,
 # on purpose).
-if ! docker network inspect awow-sim_default >/dev/null 2>&1; then
-    echo "NOTE: awow-sim_default not found — creating it standalone (feed is mocked; tracker not needed)."
-    docker network create awow-sim_default >/dev/null
+if ! docker network inspect homehub-sim_default >/dev/null 2>&1; then
+    echo "NOTE: homehub-sim_default not found — creating it standalone (feed is mocked; tracker not needed)."
+    docker network create homehub-sim_default >/dev/null
 fi
 
 FAILS=0
@@ -57,7 +57,7 @@ echo "== build + up mini-serv-sim (samba + privileged runner) =="
 "${CO[@]}" up -d --build
 
 echo "== wait for Samba to accept a cifs mount AND serve a fixture file =="
-if rex 'for i in $(seq 1 30); do mkdir -p /mnt/probe; if mount -t cifs //mini-serv/minecraft /mnt/probe -o username=awow,password=simpass,ro,vers=3.0 2>/dev/null; then if [ -s /mnt/probe/server.properties ]; then umount /mnt/probe; echo ready; exit 0; fi; umount /mnt/probe; fi; sleep 2; done; exit 1'; then
+if rex 'for i in $(seq 1 30); do mkdir -p /mnt/probe; if mount -t cifs //mini-serv/minecraft /mnt/probe -o username=homehub,password=simpass,ro,vers=3.0 2>/dev/null; then if [ -s /mnt/probe/server.properties ]; then umount /mnt/probe; echo ready; exit 0; fi; umount /mnt/probe; fi; sleep 2; done; exit 1'; then
     pass "Samba share mountable"
 else
     fail "Samba never became mountable"; echo "== summary =="; echo "VOLUME LEG: FAIL"; exit 1
@@ -123,12 +123,12 @@ chmod +x /tmp/vp/rsync.mock
 # (a) cifs set + live volume set + a comment line that must be SKIPPED.
 cat > /tmp/vp/backup.env.a <<'ENV'
 BACKUP_TARGET=/backup
-BACKUP_STAGING=/var/tmp/awow-backup/staging
+BACKUP_STAGING=/var/tmp/homehub-backup/staging
 BACKUP_KEEP=3
 BACKUP_SOURCES="minecraft=//mini-serv/minecraft
 # commented=//mini-serv/minecraft
 actual=volume:actual_data"
-BACKUP_CIFS_USER=awow
+BACKUP_CIFS_USER=homehub
 BACKUP_CIFS_PASS=simpass
 BACKUP_CIFS_EXTRA=vers=3.0
 BACKUP_ZSTD_LEVEL=10
@@ -144,7 +144,7 @@ ENV
 
 # Shared tail for the b/c/d configs (everything but BACKUP_SOURCES).
 cat > /tmp/vp/env.tail <<'ENV'
-BACKUP_CIFS_USER=awow
+BACKUP_CIFS_USER=homehub
 BACKUP_CIFS_PASS=simpass
 BACKUP_CIFS_EXTRA=vers=3.0
 BACKUP_ZSTD_LEVEL=10
@@ -157,7 +157,7 @@ NAGLIGHT_USER=sim-user-alice-0001
 BACKUP_DRIVE_DEVICES=""
 BACKUP_DRIVE_STANDBY=241
 ENV
-common_head() { printf 'BACKUP_TARGET=/backup\nBACKUP_STAGING=/var/tmp/awow-backup/staging\nBACKUP_KEEP=3\n'; }
+common_head() { printf 'BACKUP_TARGET=/backup\nBACKUP_STAGING=/var/tmp/homehub-backup/staging\nBACKUP_KEEP=3\n'; }
 
 # (b) cifs + live volume + a QUIESCED volume set (@tracker).
 { common_head

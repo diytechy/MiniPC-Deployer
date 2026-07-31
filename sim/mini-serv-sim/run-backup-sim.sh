@@ -4,7 +4,7 @@
 # cycle against the fixtures, then do the RESTORE DRILL (delete a subtree,
 # reconstruct from archive+manifest, diff-verify byte equality).
 #
-# Requires the awow-sim stack up first (sim/run-sim.sh) for the NagLight feed +
+# Requires the homehub-sim stack up first (sim/run-sim.sh) for the NagLight feed +
 # the shared network.
 #
 # Usage:
@@ -20,15 +20,15 @@ case "${1:-}" in
     --down) "${CO[@]}" down -v; exit 0 ;;
 esac
 
-if ! docker network inspect awow-sim_default >/dev/null 2>&1; then
-    echo "ERROR: network awow-sim_default not found — run sim/run-sim.sh first." >&2
+if ! docker network inspect homehub-sim_default >/dev/null 2>&1; then
+    echo "ERROR: network homehub-sim_default not found — run sim/run-sim.sh first." >&2
     exit 2
 fi
 
 if [ "${1:-}" = "--shares-only" ]; then
     echo "== bringing up the Samba fixture shares only (WI-10.16) =="
     "${CO[@]}" up -d samba
-    echo "Shares up on 'mini-serv': //mini-serv/minecraft, //mini-serv/satisfactory, //mini-serv/icedrive, //mini-serv/empty (user awow / simpass)."
+    echo "Shares up on 'mini-serv': //mini-serv/minecraft, //mini-serv/satisfactory, //mini-serv/icedrive, //mini-serv/empty (user homehub / simpass)."
     exit 0
 fi
 
@@ -41,14 +41,14 @@ echo "== build + up mini-serv-sim (samba + privileged runner) =="
 "${CO[@]}" up -d --build
 
 echo "== wait for Samba to accept a cifs mount AND serve a fixture file =="
-if rex 'for i in $(seq 1 30); do mkdir -p /mnt/probe; if mount -t cifs //mini-serv/minecraft /mnt/probe -o username=awow,password=simpass,ro,vers=3.0 2>/dev/null; then if [ -s /mnt/probe/server.properties ] && [ -s /mnt/probe/plugins/SimGreeter.jar ]; then umount /mnt/probe; echo ready; exit 0; fi; umount /mnt/probe; fi; sleep 2; done; exit 1'; then
+if rex 'for i in $(seq 1 30); do mkdir -p /mnt/probe; if mount -t cifs //mini-serv/minecraft /mnt/probe -o username=homehub,password=simpass,ro,vers=3.0 2>/dev/null; then if [ -s /mnt/probe/server.properties ] && [ -s /mnt/probe/plugins/SimGreeter.jar ]; then umount /mnt/probe; echo ready; exit 0; fi; umount /mnt/probe; fi; sleep 2; done; exit 1'; then
     pass "Samba share mountable"
 else
     fail "Samba never became mountable"; echo "== summary =="; echo "BACKUP LEG: FAIL"; exit 1
 fi
 
 echo "== (cycle) run the REAL backup service end-to-end =="
-if rex 'bash /opt/awow-core/stack/backup/backup.sh --config /etc/awow-backup/backup.env'; then
+if rex 'bash /opt/homehub/stack/backup/backup.sh --config /etc/homehub-backup/backup.env'; then
     pass "backup.sh completed (exit 0)"
 else
     fail "backup.sh failed"
@@ -62,7 +62,7 @@ echo "  --- RUN.json ---";     rex "cat '$RUN_DIR/RUN.json' | sed 's/^/    /'"
 echo "  --- sizes ---";        rex "du -sh '$RUN_DIR'/* 2>/dev/null | sed 's/^/    /'"
 
 echo "== (step 5) verify offsite push landed in the IceDrive share =="
-off="$(rex 'mkdir -p /mnt/ice; mount -t cifs //mini-serv/icedrive /mnt/ice -o username=awow,password=simpass,rw,vers=3.0 2>/dev/null && find /mnt/ice/awow-backup -type f 2>/dev/null | wc -l && umount /mnt/ice' | tr -d "\r")"
+off="$(rex 'mkdir -p /mnt/ice; mount -t cifs //mini-serv/icedrive /mnt/ice -o username=homehub,password=simpass,rw,vers=3.0 2>/dev/null && find /mnt/ice/homehub-backup -type f 2>/dev/null | wc -l && umount /mnt/ice' | tr -d "\r")"
 if [ "${off:-0}" -ge 1 ]; then pass "offsite share holds $off pushed file(s)"; else fail "offsite share empty"; fi
 
 echo "== (step 6) verify the NagLight feed round-trip landed =="
@@ -75,11 +75,11 @@ set -uo pipefail
 RUN_DIR="$1"
 rc=0
 mkdir -p /mnt/orig /tmp/restore
-mount -t cifs //mini-serv/minecraft /mnt/orig -o username=awow,password=simpass,ro,vers=3.0
+mount -t cifs //mini-serv/minecraft /mnt/orig -o username=homehub,password=simpass,ro,vers=3.0
 
 echo "  [drill] initial reconstruct + verify"
 rm -rf /tmp/restore; mkdir -p /tmp/restore
-bash /opt/awow-core/stack/backup/restore.sh --run "$RUN_DIR" --set minecraft --target /tmp/restore || rc=1
+bash /opt/homehub/stack/backup/restore.sh --run "$RUN_DIR" --set minecraft --target /tmp/restore || rc=1
 # restore.sh extracts a tar of '.' so contents land under /tmp/restore/./ -> normalize
 RDIR=/tmp/restore
 if diff -r "$RDIR" /mnt/orig >/tmp/diff1.txt 2>&1; then
@@ -90,7 +90,7 @@ fi
 
 echo "  [drill] simulate loss: delete the plugins/ subtree, then reconstruct again"
 rm -rf "$RDIR/plugins"
-bash /opt/awow-core/stack/backup/restore.sh --run "$RUN_DIR" --set minecraft --target /tmp/restore || rc=1
+bash /opt/homehub/stack/backup/restore.sh --run "$RUN_DIR" --set minecraft --target /tmp/restore || rc=1
 if diff -r "$RDIR" /mnt/orig >/tmp/diff2.txt 2>&1; then
     echo "  [drill] post-loss reconstruct diff: IDENTICAL (plugins recovered)"
 else

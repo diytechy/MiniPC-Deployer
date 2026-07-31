@@ -5,12 +5,12 @@
 # nobody is looking, so a drive that drops at 3am shows up as a red check in
 # the morning instead of being discovered by a backup that quietly did nothing.
 Description=AWOW library mount health report
-Documentation=file:/opt/awow-core/stack/samba/library-guard.sh
+Documentation=file:/opt/homehub/stack/samba/library-guard.sh
 After=network-online.target docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/awow-library-guard --report
+ExecStart=/usr/local/sbin/homehub-library-guard --report
 # A failing report must not put the unit in a permanent failed state that
 # masks later recoveries — the REPORT is the signal, not the exit code.
 SuccessExitStatus=0 1

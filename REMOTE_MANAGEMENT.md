@@ -1,4 +1,4 @@
-# Remote management of the headless AWOW box (WI-10.12)
+# Remote management of the headless hub box (WI-10.12)
 
 The AWOW AK41 is **headless** and the Owner never wants to physically visit it
 (Q10.7 + the 2026-07-03 requirement: "trivial remote debugging/resolution is a
@@ -40,20 +40,20 @@ Provisioned by `stack/autoinstall/user-data`:
 ssh hub@<LAN_IP>              # key-only
 
 # 2. Inspect
-cd /opt/awow-core/stack
+cd /opt/homehub/stack
 docker compose ps                  # health of every service
 docker compose logs -f caddy       # or use Dozzle in a browser
 bash provision/healthcheck.sh --env .env
 
 # 3. Update / restart the stack
-git -C /opt/awow-core pull          # if the box carries a repo checkout
+git -C /opt/homehub pull          # if the box carries a repo checkout
 docker build -t naglight:local ../NagLight   # if updating the tracker image
 docker compose pull                 # refresh the stock images
 docker compose up -d                # apply — restart:unless-stopped keeps them up
 docker compose restart oauth2-proxy # after editing the allow-list
 
 # 4. Reconverge DNS / config after an .env edit (idempotent)
-sudo /usr/local/sbin/awow-firstboot.sh
+sudo /usr/local/sbin/homehub-firstboot.sh
 
 # 5. Enable / disable a tier-2 opt-in service (stack/README §9, SR-012)
 $EDITOR .env                        # add/remove the profile in COMPOSE_PROFILES
@@ -74,7 +74,7 @@ disposable code; everything stateful sits in exactly two places on the host:
 | Where | What lives there | container update (`compose pull` + `up -d`, or a pin bump) | reimage (USB re-flash) |
 |---|---|---|---|
 | **Named Docker volumes** | Actual's server password + **SimpleFIN bank-sync credential** + budget files (`actual_data`) · Technitium zones/settings (`technitium_config`) · Caddy certs + ACME account (`caddy_data`) · tracker user data (`tracker_data`) · Vaultwarden vault + other tier-2 state | **survives** — pull/up recreates containers *around* unchanged volumes | **wiped** — restore from the volume backups (the `volume:` lines in `backup.env`, SR-013 + `restore.sh`), or re-do the small set of one-time in-app auths |
-| **Host config files** | `/opt/awow-core/stack/.env` (OAuth client secret, Cloudflare token, Technitium admin password, basic_auth hashes) · `oauth2-proxy/authenticated-emails.txt` · `provision/.token` · `/etc/awow-backup/{backup.env,cifs.creds}` | survives | `.env` + the allow-list are **re-seeded from the USB payload** (carry your filled `.env` on the stick); `provision/.token` re-mints itself idempotently; `/etc/awow-backup/*` must be restored by hand |
+| **Host config files** | `/opt/homehub/stack/.env` (OAuth client secret, Cloudflare token, Technitium admin password, basic_auth hashes) · `oauth2-proxy/authenticated-emails.txt` · `provision/.token` · `/etc/homehub-backup/{backup.env,cifs.creds}` | survives | `.env` + the allow-list are **re-seeded from the USB payload** (carry your filled `.env` on the stick); `provision/.token` re-mints itself idempotently; `/etc/homehub-backup/*` must be restored by hand |
 
 Consequences worth internalizing:
 
@@ -95,7 +95,7 @@ Consequences worth internalizing:
 
 ### What runs where (containers vs host)
 
-On the AWOW, **every service is a container** except these host-level pieces:
+On the hub, **every service is a container** except these host-level pieces:
 the **backup service** (pure bash + systemd timer — deliberately not a
 container, it mounts cifs and manages drives), the **powertune** and
 **backup-standby** per-boot oneshots, **Cockpit**, **sshd**,
@@ -131,7 +131,7 @@ relying on on-box IceDrive.
 
 ### The wall panel is REIMAGE-NOT-REPAIR (SN-013/SR-017, 2026-07-29)
 
-Everything above is about the AWOW box, which holds state worth protecting. The
+Everything above is about the hub box, which holds state worth protecting. The
 **office wall panel** — this repo's second image target — is the opposite, and
 the difference is deliberate rather than an oversight:
 
@@ -174,9 +174,9 @@ nothing more.**
 
 ### Option A — PXE / netboot.xyz from another LAN box
 Stand up a PXE/TFTP+DHCP-proxy (or run [`netboot.xyz`](https://netboot.xyz)) on
-another always-on LAN machine; set the AWOW to network-boot first; on failure,
+another always-on LAN machine; set the hub to network-boot first; on failure,
 netboot into the installer and re-run autoinstall.
-- **Pros:** nothing stored on the AWOW itself; re-imageable even with a wiped
+- **Pros:** nothing stored on the hub itself; re-imageable even with a wiped
   disk; reusable for other machines.
 - **Cons:** needs a second always-on box + DHCP-proxy config (can fight the
   router's DHCP); BIOS must reliably attempt netboot; most setup effort.
@@ -197,7 +197,7 @@ netboot into the installer and re-run autoinstall.
 Carve a small **recovery partition**, store the Ubuntu autoinstall ISO +
 `user-data` there, and add a **custom GRUB menu entry** that boots it and runs
 the unattended install against the main disk.
-- **Pros:** entirely self-contained on the AWOW (no second box); triggered
+- **Pros:** entirely self-contained on the hub (no second box); triggered
   remotely by `grub-reboot "Reinstall"` + `reboot` over SSH; survives a trashed
   root as long as GRUB + the recovery partition are intact.
 - **Cons:** the storage layout (currently whole-disk LVM) must reserve the

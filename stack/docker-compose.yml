@@ -44,7 +44,7 @@ services:
     restart: unless-stopped
     healthcheck:
       # The technitium/dns-server image ships bash but NO wget/curl (verified in
-      # the AWOW-sim, WI-10.14), so probe the :5380 console port with bash's
+      # the homehub-sim, WI-10.14), so probe the :5380 console port with bash's
       # /dev/tcp instead of wget — a tool-independent liveness check that only
       # succeeds once Technitium is listening.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5380"]
@@ -101,7 +101,7 @@ services:
       # host.docker.internal is a Docker DESKTOP name — plain docker-ce (what the
       # AWOW runs) does not provide it unless mapped to the host gateway here.
       # Without this the dns.<domain> site (reverse_proxy host.docker.internal:5380)
-      # 502s on the real box. The AWOW-sim could not catch it: Caddyfile.sim
+      # 502s on the real box. The homehub-sim could not catch it: Caddyfile.sim
       # deliberately proxies the bridge container name instead (review 2026-07-10).
       - "host.docker.internal:host-gateway"
     depends_on:
@@ -172,7 +172,7 @@ services:
     restart: unless-stopped
     # NO container healthcheck: the stock oauth2-proxy image is distroless — it
     # ships no shell and no wget/curl, so a CMD/CMD-SHELL probe can never run
-    # (verified in the AWOW-sim, WI-10.14). /ping DOES serve an unauthenticated
+    # (verified in the homehub-sim, WI-10.14). /ping DOES serve an unauthenticated
     # 200 for liveness; probe it from OUTSIDE the container (Caddy/Uptime-Kuma)
     # rather than via a container healthcheck. Caddy therefore waits only for this
     # service to START (below), and oauth2-proxy itself waits for the tracker to
@@ -226,7 +226,7 @@ services:
       # be /api/today: in multi-user mode (TRACKER_MULTI_USER=true, the D3 hosted
       # default) every /api/* route requires the oauth2-proxy X-Forwarded-User
       # header, so a header-less probe to /api/today returns 403 and the container
-      # would never report healthy. Surfaced by the AWOW-sim (WI-10.14).
+      # would never report healthy. Surfaced by the homehub-sim (WI-10.14).
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8787/healthz || exit 1"]
       interval: 30s
       timeout: 5s
@@ -245,7 +245,7 @@ services:
     restart: unless-stopped
     healthcheck:
       # The actual-server image ships bash but NO wget/curl (verified in the
-      # AWOW-sim, WI-10.14) — probe :5006 with bash's /dev/tcp instead of wget.
+      # homehub-sim, WI-10.14) — probe :5006 with bash's /dev/tcp instead of wget.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5006"]
       interval: 30s
       timeout: 5s

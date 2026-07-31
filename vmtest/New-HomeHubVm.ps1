@@ -22,11 +22,11 @@
     hold compose-up.
 
 .PARAMETER VMName
-    Hyper-V VM name. Default: AWOW-VMTest.
+    Hyper-V VM name. Default: HomeHub-VMTest.
 
 .PARAMETER VMPath
     Directory that holds the VM's config + VHDX. Default:
-    $env:USERPROFILE\HyperV\AWOW-VMTest (created if missing).
+    $env:USERPROFILE\HyperV\HomeHub-VMTest (created if missing).
 
 .PARAMETER UbuntuIsoPath
     Path to the STOCK Ubuntu Server LTS ISO (unmodified). See
@@ -100,28 +100,28 @@
 
 .EXAMPLE
     # LIGHT path (default): stock ISO + separate CIDATA seed ISO
-    .\New-AwowVm.ps1 -UbuntuIsoPath D:\iso\ubuntu-24.04.4-live-server-amd64.iso `
+    .\New-HomeHubVm.ps1 -UbuntuIsoPath D:\iso\ubuntu-24.04.4-live-server-amd64.iso `
                      -SeedIsoPath   C:\Projects\MiniPC-Deployer\vmtest\.out\seed.iso
 
 .EXAMPLE
     # HEAVIER path: single repacked ISO carries both the OS and the seed
-    .\New-AwowVm.ps1 -UbuntuIsoPath C:\Projects\MiniPC-Deployer\vmtest\.out\repacked.iso `
+    .\New-HomeHubVm.ps1 -UbuntuIsoPath C:\Projects\MiniPC-Deployer\vmtest\.out\repacked.iso `
                      -SeedIsoPath   C:\Projects\MiniPC-Deployer\vmtest\.out\repacked.iso `
                      -SkipSecondDvd
 
 .EXAMPLE
     # Preview only, no changes
-    .\New-AwowVm.ps1 -UbuntuIsoPath D:\iso\ubuntu.iso -SeedIsoPath .\vmtest\.out\seed.iso -WhatIf
+    .\New-HomeHubVm.ps1 -UbuntuIsoPath D:\iso\ubuntu.iso -SeedIsoPath .\vmtest\.out\seed.iso -WhatIf
 
 .NOTES
-    Companion teardown: .\Remove-AwowVm.ps1
+    Companion teardown: .\Remove-HomeHubVm.ps1
     Full runbook (Hyper-V enable, ISO download+SHA256, GRUB one-time edit,
     what "success" looks like, VM-vs-hardware deltas): vmtest/README.md
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [string]$VMName = 'AWOW-VMTest',
-    [string]$VMPath = (Join-Path $env:USERPROFILE 'HyperV\AWOW-VMTest'),
+    [string]$VMName = 'HomeHub-VMTest',
+    [string]$VMPath = (Join-Path $env:USERPROFILE 'HyperV\HomeHub-VMTest'),
 
     [Parameter(Mandatory = $true)]
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]

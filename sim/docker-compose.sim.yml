@@ -1,4 +1,4 @@
-# AWOW-sim overlay (WI-10.14) — a COMPOSE OVERLAY over the REAL stack, never a
+# homehub-sim overlay (WI-10.14) — a COMPOSE OVERLAY over the REAL stack, never a
 # fork. Bring up with:
 #
 #   docker compose -f stack/docker-compose.yml -f sim/docker-compose.sim.yml \

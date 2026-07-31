@@ -1,6 +1,6 @@
 # AWOW bash backup service (WI-10.10)
 
-The homelab's main backup, running on the AWOW box as **pure bash + systemd** —
+The homelab's main backup, running on the hub box as **pure bash + systemd** —
 zero `.bat`/`.ps1` anywhere in the pipeline (the Owner's rule, HOMELAB_TOPOLOGY.md).
 The rewritten **FileBackup** repo is the behavioral *spec* this reproduces (hash
 tracking, auto-compression-where-applicable, recovery/reconstruct), not code to
@@ -29,7 +29,7 @@ common.sh            shared helpers (logging + die/report hook, wake-on-LAN, cif
                      compression policy, feed, drive power)
 backup-standby.sh    boot-time DEFAULT STANDBY oneshot (WI-10.10 drive power)
 backup.env.example   every knob
-systemd/awow-backup.{service,timer}   nightly root oneshot + persistent timer
+systemd/homehub-backup.{service,timer}   nightly root oneshot + persistent timer
 systemd/backup-standby.service        per-boot backup-drive spin-down default
 ```
 
@@ -214,21 +214,21 @@ restore exits 0.
 ## Hash-algorithm delta vs FileBackup
 
 FileBackup uses **xxHash128** (speed). This service uses **sha256** — coreutils-
-native, so the AWOW needs no extra hashing dependency. The hash is an internal
+native, so the hub needs no extra hashing dependency. The hash is an internal
 integrity/dedup choice for a self-contained backup+restore leg; both give
 byte-exact verification. (The FileBackup *restore* format — `bash/reconstruct.sh`
 + `MANIFEST.csv` — is a different, content-addressed layout; this service is the
 tar-archive pipeline the topology's six steps describe, not that layout.)
 
-## Run on the AWOW
+## Run on the hub
 
 ```bash
-sudo cp backup.env.example /etc/awow-backup/backup.env   # then edit
-sudo install -m600 /dev/stdin /etc/awow-backup/cifs.creds <<< $'username=awow\npassword=…'
-sudo cp systemd/awow-backup.{service,timer} /etc/systemd/system/
-sudo systemctl enable --now awow-backup.timer
-sudo systemctl start awow-backup.service     # run once now
-journalctl -u awow-backup.service -f
+sudo cp backup.env.example /etc/homehub-backup/backup.env   # then edit
+sudo install -m600 /dev/stdin /etc/homehub-backup/cifs.creds <<< $'username=awow\npassword=…'
+sudo cp systemd/homehub-backup.{service,timer} /etc/systemd/system/
+sudo systemctl enable --now homehub-backup.timer
+sudo systemctl start homehub-backup.service     # run once now
+journalctl -u homehub-backup.service -f
 # Boot-time drive standby (WI-10.10) — the autoinstall enables this for you; to
 # do it by hand (runs in place from this dir so it can source common.sh):
 sudo cp systemd/backup-standby.service /etc/systemd/system/

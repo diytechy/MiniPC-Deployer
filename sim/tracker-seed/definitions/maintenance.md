@@ -9,7 +9,7 @@ items:
     check: backup           # the AWOW bash backup service POSTs here (/api/feed)
     horizon: daily
     notes: Automated item — the WI-10.15 backup service POSTs ok=true/false to
-      /api/feed with this check id; the row is read-only in the UI. The AWOW-sim
+      /api/feed with this check id; the row is read-only in the UI. The homehub-sim
       feed round-trip check (check 6) exercises this path.
 ---
 

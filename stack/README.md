@@ -1,7 +1,7 @@
 # AWOW AK41 always-on core — deploy stack
 
 Zero-manual-config, always-on box image for the **AWOW AK41** (Celeron J4125,
-8 GB, x86). Flash a USB → boot the AWOW → the whole stack comes up on its own.
+8 GB, x86). Flash a USB → boot the hub → the whole stack comes up on its own.
 Migrated from `life-tracker/deploy/` (WI-10.1); NagLight is now the source of the
 tracker image.
 
@@ -63,7 +63,7 @@ stack/
   autoinstall/
     user-data                 Ubuntu autoinstall: partition, user, docker, drop stack, first-boot unit
     meta-data                 NoCloud datasource companion
-    awow-firstboot.service    systemd oneshot that runs the bring-up once
+    homehub-firstboot.service    systemd oneshot that runs the bring-up once
     firstboot.sh              compose up + provisioning + point host resolver at local DNS
     powertune.{service,sh}    per-boot low-power auto-tune (powertop) + USB-storage guard
     wall/                     IMAGE TARGET 2 — the office wall panel (§10)
@@ -107,24 +107,24 @@ repo publishes) — and fails loudly naming all three fixes otherwise.
 `sim/run-sim.sh` calls it automatically; compose and export-images.sh keep
 consuming the same `naglight:local` ref regardless of which path supplied it.
 
-### Image delivery to the AWOW — Q10.9 B+ (ALL-IMAGES, baked into the ISO)
+### Image delivery to the hub — Q10.9 B+ (ALL-IMAGES, baked into the ISO)
 
-The AWOW does **not** pull any image from a registry at first boot. Per the Owner's
+The hub does **not** pull any image from a registry at first boot. Per the Owner's
 locked **Q10.9 B+** decision, EVERY stack image — the locally-built
 `naglight:local` **and** every public image (technitium, caddy, oauth2-proxy,
 actual, ddns, uptime-kuma, dozzle, ntfy) — is `docker save`d into the ISO deploy
 payload and `docker load`ed at first boot. So a freshly-imaged box comes up "from
 infancy": **zero registry/internet dependency for container images**, versions
 pinned (in `.env.example`, see the "Image tags" block) to exactly what the
-AWOW-sim validated. What boots == what was validated; no drift from moving
+homehub-sim validated. What boots == what was validated; no drift from moving
 `latest` tags.
 
 Mechanism (see `../vmtest/`):
 
 ```
 vmtest/export-images.sh   ->  docker save each pinned image -> deploy-payload/images/*.tar
-autoinstall late-commands ->  copy deploy-payload/ -> /opt/awow-core/ (images and all)
-autoinstall/firstboot.sh  ->  docker load /opt/awow-core/images/*.tar  BEFORE  compose up
+autoinstall late-commands ->  copy deploy-payload/ -> /opt/homehub/ (images and all)
+autoinstall/firstboot.sh  ->  docker load /opt/homehub/images/*.tar  BEFORE  compose up
 ```
 
 The full pin set + registry digests are recorded in `../docs/status.md`. Bump a
@@ -149,7 +149,7 @@ Fill in at minimum:
 | Key | What |
 |---|---|
 | `DOMAIN` | your public apex (e.g. `example.tld`) |
-| `LAN_IP` | the AWOW's LAN IP — **give it a DHCP reservation** at this address |
+| `LAN_IP` | the hub's LAN IP — **give it a DHCP reservation** at this address |
 | `ACME_EMAIL` | email for Let's Encrypt |
 | `ACTUAL_BASICAUTH_HASH` / `DNS_BASICAUTH_HASH` | `docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpass'` |
 | `TECHNITIUM_ADMIN_PASSWORD` | strong password (set on Technitium's first start) |
@@ -209,7 +209,7 @@ real-secrets rehearsal VM.
 
 ## 3. Build the USB (autoinstall)
 
-The AWOW installs **Ubuntu Server 24.04 LTS** unattended, then first-boot brings
+The hub installs **Ubuntu Server 24.04 LTS** unattended, then first-boot brings
 the stack up.
 
 1. **Download** the Ubuntu Server 24.04 LTS live ISO from ubuntu.com.
@@ -221,8 +221,8 @@ the stack up.
      whole repo to `deploy-payload/` on that stick, **plus the baked image tars
      to `deploy-payload/images/`** (Q10.9 B+ — run `vmtest/export-images.sh`
      first). The autoinstall `late-commands` copy `deploy-payload/` into
-     `/opt/awow-core`, so the stack lands at `/opt/awow-core/stack` and the
-     images at `/opt/awow-core/images` where first-boot `docker load`s them.
+     `/opt/homehub`, so the stack lands at `/opt/homehub/stack` and the
+     images at `/opt/homehub/images` where first-boot `docker load`s them.
    - **One USB (remaster):** unpack the ISO, add `/nocloud/` with
      `user-data` + `meta-data`, add kernel arg
      `autoinstall ds=nocloud;s=/cdrom/nocloud/`, add `/deploy-payload/` (repo +
@@ -243,8 +243,8 @@ the stack up.
    > management; the DISK IS NOT ENCRYPTED — see OI-10 (docs/status.md) for
    > the LUKS+TPM decision.
 
-4. **Boot the AWOW from USB #1.** It partitions, installs Ubuntu + Docker
-   unattended, copies the repo, seeds `.env`, enables `awow-firstboot.service`,
+4. **Boot the hub from USB #1.** It partitions, installs Ubuntu + Docker
+   unattended, copies the repo, seeds `.env`, enables `homehub-firstboot.service`,
    and reboots.
 5. **First real boot** runs `firstboot.sh`: materialize the oauth2-proxy
    allow-list, `docker compose up -d`, wait for Technitium, run
@@ -282,14 +282,14 @@ bash provision/healthcheck.sh --env .env
 ## 5. Verify from another machine
 
 ```sh
-dig @<AWOW_LAN_IP> tracker.<domain> +short          # expect the AWOW's LAN IP
-curl -s "http://<AWOW_LAN_IP>:5380/api/dashboard/stats/get?token=<TOKEN>" | head
+dig @<HOMEHUB_LAN_IP> tracker.<domain> +short          # expect the hub's LAN IP
+curl -s "http://<HOMEHUB_LAN_IP>:5380/api/dashboard/stats/get?token=<TOKEN>" | head
 bash provision/healthcheck.sh --env .env            # all-in-one from the box
 ```
 
 ---
 
-## 6. Burn-in checklist ("prove the AWOW is stable")
+## 6. Burn-in checklist ("prove the hub is stable")
 
 "Unused ≠ reliable." Before depending on this box, burn it in **under load** for
 a day or two, then pick the secondary DNS. Track:
@@ -308,7 +308,7 @@ a day or two, then pick the secondary DNS. Track:
       `https://tracker.<domain>` with **no cert warning**.
 - [ ] **OAuth round-trip** — sign in at `https://tracker.<domain>` with an
       allowed Google account (success) and a non-allowed one (rejected).
-- [ ] **Then pick the secondary/failover DNS** so an AWOW outage degrades
+- [ ] **Then pick the secondary/failover DNS** so a hub outage degrades
       gracefully instead of killing LAN name resolution.
 
 ---
@@ -396,13 +396,13 @@ four places — then the build scripts carry it onto the box:
 
 Then build as in §3: the USB payload carries your filled `.env` (autoinstall
 seeds from `.env.example` **only if you didn't pre-fill one**), the stack lands
-in `/opt/awow-core/stack`, and first boot brings up core + enabled profiles.
+in `/opt/homehub/stack`, and first boot brings up core + enabled profiles.
 
 ### Enabling a service on a RUNNING box (no reflash)
 
 ```sh
 ssh hub@<LAN_IP>
-cd /opt/awow-core/stack
+cd /opt/homehub/stack
 $EDITOR .env                       # add the profile to COMPOSE_PROFILES (+ its REPLACE_WITH knobs)
 docker compose up -d               # pulls the tier-2 image(s), starts them
 ```
@@ -429,11 +429,11 @@ Disable = remove the profile from `COMPOSE_PROFILES`, then
 ## 10. The office wall panel — image target 2 (SR-016/SR-017, OI-12)
 
 Ratified by the Owner on **2026-07-29** (the belt-and-braces "LAN port + `/32`"
-variant). Two pieces land on the AWOW side, and a whole second image lands in
+variant). Two pieces land on the hub side, and a whole second image lands in
 [`autoinstall/wall/`](autoinstall/wall/README.md) — read that README for the
 panel itself and `WALL-BURN-IN.md` before mounting anything.
 
-### What the AWOW box gains
+### What the hub box gains
 
 A Caddy site, `{$WALL_HOST}:{$WALL_PORT}`, that gives a keyboard-less panel the
 Owner's NagLight view **with no sign-in step**. It deliberately bypasses

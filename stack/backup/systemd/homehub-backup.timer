@@ -7,7 +7,7 @@ Description=Nightly AWOW backup timer
 OnCalendar=*-*-* 03:30:00
 Persistent=true
 RandomizedDelaySec=600
-Unit=awow-backup.service
+Unit=homehub-backup.service
 
 [Install]
 WantedBy=timers.target

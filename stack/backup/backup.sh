@@ -35,7 +35,7 @@
 #                        every `die` path (OI-9)
 #
 # Usage: backup.sh [--config PATH] [--dry-run]
-#   --config  path to backup.env (default: /etc/awow-backup/backup.env, else the
+#   --config  path to backup.env (default: /etc/homehub-backup/backup.env, else the
 #             backup.env next to this script)
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,15 +52,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 if [ -z "$CONFIG" ]; then
-    if   [ -f /etc/awow-backup/backup.env ]; then CONFIG=/etc/awow-backup/backup.env
+    if   [ -f /etc/homehub-backup/backup.env ]; then CONFIG=/etc/homehub-backup/backup.env
     elif [ -f "$HERE/backup.env" ];         then CONFIG="$HERE/backup.env"
-    else die "no config: pass --config or create /etc/awow-backup/backup.env"; fi
+    else die "no config: pass --config or create /etc/homehub-backup/backup.env"; fi
 fi
 load_config "$CONFIG"
 
 : "${BACKUP_TARGET:?BACKUP_TARGET not set}"
 : "${BACKUP_SOURCES:?BACKUP_SOURCES not set (name=//host/share lines)}"
-STAGING="${BACKUP_STAGING:-/var/tmp/awow-backup/staging}"
+STAGING="${BACKUP_STAGING:-/var/tmp/homehub-backup/staging}"
 KEEP="${BACKUP_KEEP:-7}"
 ZL="${BACKUP_ZSTD_LEVEL:-10}"
 
@@ -463,14 +463,14 @@ elif [ -n "${OFFSITE_PATH:-}" ]; then
     # would hide a mistyped path or an IceDrive folder that never got set up,
     # and the files would then sit in a folder nothing syncs.
     [ -d "$OFFSITE_PATH" ] || { FAIL_NOTE="offsite: OFFSITE_PATH is not a directory: $OFFSITE_PATH (is the on-box IceDrive sync folder set up?)"; false; }
-    dest="$OFFSITE_PATH/awow-backup/run_$RUN_TS"
+    dest="$OFFSITE_PATH/homehub-backup/run_$RUN_TS"
     offsite_stage "$dest" || { FAIL_NOTE="offsite: copy into $dest failed"; false; }
     OFFSITE_DONE="staged run_$RUN_TS in $OFFSITE_PATH (on-box IceDrive client uploads it)"
     log "offsite: $OFFSITE_DONE"
 else
     # Legacy remote share (superseded by OFFSITE_PATH; kept working).
     omp="$(mktemp -d)"; mount_cifs "$OFFSITE_UNC" "$omp" rw
-    offsite_stage "$omp/awow-backup/run_$RUN_TS" || { FAIL_NOTE="offsite: push to $OFFSITE_UNC failed"; false; }
+    offsite_stage "$omp/homehub-backup/run_$RUN_TS" || { FAIL_NOTE="offsite: push to $OFFSITE_UNC failed"; false; }
     umount_all
     OFFSITE_DONE="pushed run_$RUN_TS ($OFFSITE_UNC)"
     log "offsite: $OFFSITE_DONE"

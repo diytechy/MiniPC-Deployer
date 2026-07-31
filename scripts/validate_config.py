@@ -221,9 +221,9 @@ def main():
     # 4. autoinstall referenced files exist (files the late-commands cp/enable).
     # Kept in step with user-data: firstboot, the per-boot powertune unit, and the
     # WI-10.10 backup-drive standby unit + its script (which lives under stack/
-    # backup/ and is run in place from the stack dir, like awow-backup.service).
+    # backup/ and is run in place from the stack dir, like homehub-backup.service).
     for ref in (
-        "autoinstall/awow-firstboot.service",
+        "autoinstall/homehub-firstboot.service",
         "autoinstall/firstboot.sh",
         "autoinstall/powertune.service",
         "autoinstall/powertune.sh",

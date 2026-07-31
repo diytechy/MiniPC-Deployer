@@ -28,7 +28,7 @@ STACK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GLOBAL_CONF="$STACK_DIR/samba/smb.conf.global"
 # The generated fragment is site data: it arrives on the USB payload at
 # site/smb.conf.fragment and is installed here by the autoinstall late-command.
-FRAGMENT="/etc/awow-samba/smb.conf.fragment"
+FRAGMENT="/etc/homehub-samba/smb.conf.fragment"
 LIBRARY_ROOT="/srv/library"
 
 while [ $# -gt 0 ]; do
@@ -45,10 +45,10 @@ log() { echo "[provision-samba] $*"; }
 # `close = yes`. If it is absent, Samba treats "cannot run" as failure and
 # EVERY share refuses EVERY connection with an opaque error. firstboot installs
 # it first, but this script is also the documented standalone re-run path.
-if [ ! -x /usr/local/sbin/awow-library-guard ]; then
-    log "FATAL: /usr/local/sbin/awow-library-guard is missing or not executable."
+if [ ! -x /usr/local/sbin/homehub-library-guard ]; then
+    log "FATAL: /usr/local/sbin/homehub-library-guard is missing or not executable."
     log "  Every share stanza references it as root preexec, so smbd would refuse"
-    log "  every connection. Install it:  install -m0755 $STACK_DIR/samba/library-guard.sh /usr/local/sbin/awow-library-guard"
+    log "  every connection. Install it:  install -m0755 $STACK_DIR/samba/library-guard.sh /usr/local/sbin/homehub-library-guard"
     exit 1
 fi
 

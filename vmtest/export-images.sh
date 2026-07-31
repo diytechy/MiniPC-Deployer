@@ -4,7 +4,7 @@
 # docker-save EVERY stack image into the gitignored deploy-payload staging area
 # so a freshly-imaged AWOW comes up with every container "from infancy": zero
 # registry/internet dependency for container images at first boot, versions
-# pinned to exactly what the AWOW-sim validated (Q10.9 B+ ALL-IMAGES, LOCKED IN
+# pinned to exactly what the homehub-sim validated (Q10.9 B+ ALL-IMAGES, LOCKED IN
 # by the Owner 2026-07-04, see HOMELAB_RESTRUCTURE_PLAN.md).
 #
 # WHAT IT DOES
@@ -39,7 +39,7 @@
 # Usage:
 #   bash vmtest/export-images.sh                 # -> vmtest/.out/images/*.tar
 #   ENV_FILE=stack/.env bash vmtest/export-images.sh   # pin from the real .env
-#   IMAGES_OUT=/mnt/d/awow-images bash vmtest/export-images.sh
+#   IMAGES_OUT=/mnt/d/homehub-images bash vmtest/export-images.sh
 #   bash vmtest/export-images.sh --force         # re-save even if a tar exists
 #   bash vmtest/export-images.sh --zstd          # compress (only if zstd present)
 #

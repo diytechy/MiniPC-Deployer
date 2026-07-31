@@ -20,7 +20,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # provisioned for backup yet — that must NOT fail boot, so we no-op instead of
 # calling load_config's die().
 CONFIG=""
-if   [ -f /etc/awow-backup/backup.env ]; then CONFIG=/etc/awow-backup/backup.env
+if   [ -f /etc/homehub-backup/backup.env ]; then CONFIG=/etc/homehub-backup/backup.env
 elif [ -f "$HERE/backup.env" ];         then CONFIG="$HERE/backup.env"
 fi
 if [ -z "$CONFIG" ]; then

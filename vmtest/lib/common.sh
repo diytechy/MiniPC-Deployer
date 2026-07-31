@@ -162,10 +162,10 @@ render_seed_tree() {
     chmod 700 "$out_dir/ssh" "$out_dir/secrets"
 
     # ── ephemeral SSH keypair (disposable, VM-test only) ─────────────────────
-    local ssh_key="$out_dir/ssh/awow-vmtest-ed25519"
+    local ssh_key="$out_dir/ssh/homehub-vmtest-ed25519"
     if [ ! -f "$ssh_key" ]; then
         log "generating ephemeral SSH keypair for the test VM (not reused anywhere else)"
-        ssh-keygen -q -t ed25519 -N "" -C "awow-vmtest (disposable, WI-10.18 V3 gate)" -f "$ssh_key"
+        ssh-keygen -q -t ed25519 -N "" -C "homehub-vmtest (disposable, WI-10.18 V3 gate)" -f "$ssh_key"
     else
         log "reusing existing ephemeral SSH keypair at $ssh_key (pass --clean to regenerate)"
     fi
@@ -316,14 +316,14 @@ render_seed_tree() {
     #    healthy (the tracker image is a KNOWN gap, documented there). ────────
     # PRODUCTION SEAM (A14): a real build stages the materialized site files
     # into deploy-payload/site/ and returns before the sim .env block. The
-    # autoinstall late-command 4b installs them into /etc/awow-samba,
-    # /etc/awow-backup and stack/.env on the target.
+    # autoinstall late-command 4b installs them into /etc/homehub-samba,
+    # /etc/homehub-backup and stack/.env on the target.
     # SITE_DIR set but no user-data.filled would be a SILENT DOWNGRADE: the
     # site/ files (real secrets) would still be staged while user-data fell
     # through to the sim sed above — producing a "production" stick with
     # allow-pw: true and a known sim password hash. Refuse instead of mixing.
     if [ -n "${SITE_DIR:-}" ] && [ ! -f "$SITE_DIR/user-data.filled" ]; then
-        die "SITE_DIR=$SITE_DIR is set but has no user-data.filled — refusing to stage real secrets onto a SIM-substituted user-data (allow-pw would be true). Run Materialize-Deploy.ps1 -Image awow."
+        die "SITE_DIR=$SITE_DIR is set but has no user-data.filled — refusing to stage real secrets onto a SIM-substituted user-data (allow-pw would be true). Run Materialize-Deploy.ps1 -Image homehub."
     fi
     if [ -n "${SITE_DIR:-}" ] && [ -d "$SITE_DIR" ]; then
         local site_out="$payload_dir/site"
@@ -387,7 +387,7 @@ render_seed_tree() {
 #
 # Q10.9 B+ ALL-IMAGES: copy the docker-save image tars produced by
 # vmtest/export-images.sh into the deploy-payload's images/ subdir, so they ride
-# onto BOTH ISO paths and land at /opt/awow-core/images on the target, where
+# onto BOTH ISO paths and land at /opt/homehub/images on the target, where
 # firstboot.sh docker-loads them before `docker compose up -d`. The tars live in
 # vmtest/.out/images by default — which render_seed_tree's repo copy EXCLUDES
 # (via --exclude=vmtest/.out) — so this is the one place they enter the payload.
@@ -426,5 +426,5 @@ stage_images_into_payload() {
     [ "$had_nullglob" -eq 1 ] || shopt -u nullglob
 
     log "deploy-payload/images/ = $(( total / 1024 / 1024 )) MB across ${#tars[@]} tar(s)"
-    log "  -> lands at /opt/awow-core/images on the target; firstboot.sh docker-loads it."
+    log "  -> lands at /opt/homehub/images on the target; firstboot.sh docker-loads it."
 }

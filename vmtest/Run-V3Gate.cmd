@@ -3,7 +3,7 @@ setlocal EnableExtensions
 
 REM ===========================================================================
 REM  Run-V3Gate.cmd - right-click "Run as administrator" launcher for the V3
-REM  gate VM. Wraps New-AwowVm.ps1, which needs an elevated session because
+REM  gate VM. Wraps New-HomeHubVm.ps1, which needs an elevated session because
 REM  Hyper-V's WMI namespace refuses non-admin callers.
 REM
 REM  Usage:  right-click -> Run as administrator      (or just double-click:
@@ -14,7 +14,7 @@ REM    /repacked ZERO-KEYPRESS: boot .out\repacked.iso, which already carries
 REM              "autoinstall ds=nocloud;s=/cdrom/nocloud/" in its grub.cfg.
 REM              No GRUB edit, nothing to type. Build it first with:
 REM                bash vmtest/build-repacked-iso.sh --src-iso <stock.iso>
-REM    /force    delete an existing AWOW-VMTest VM *and its VHDX* first.
+REM    /force    delete an existing HomeHub-VMTest VM *and its VHDX* first.
 REM              PROMPTS before destroying anything - add /yes to skip that.
 REM    /yes      answer the /force confirmation automatically (scripted runs)
 REM    /whatif   preview only - creates nothing
@@ -29,7 +29,7 @@ REM  mid-install. When it is done it returns you to your shell; if it had to
 REM  elevate itself into a new window, it leaves that window at an elevated
 REM  prompt instead of closing, so you can keep issuing commands there.
 REM
-REM  NOTE ON EXISTING VMs: New-AwowVm.ps1 is deliberately idempotent - if the
+REM  NOTE ON EXISTING VMs: New-HomeHubVm.ps1 is deliberately idempotent - if the
 REM  VM already exists it prints a notice, returns, and does NOT start it, with
 REM  exit code 0. So checking errorlevel alone is not enough to know the VM is
 REM  actually running: this script queries the VM state before and after, and
@@ -82,8 +82,8 @@ goto :parseargs
 
 REM -- 3. defaults ------------------------------------------------------------
 REM VHDX goes to D: on purpose - C: is the tight drive on this box.
-if "%VM_NAME%"=="" set "VM_NAME=AWOW-VMTest"
-if "%VM_PATH%"=="" set "VM_PATH=D:\HyperV\AWOW-VMTest"
+if "%VM_NAME%"=="" set "VM_NAME=HomeHub-VMTest"
+if "%VM_PATH%"=="" set "VM_PATH=D:\HyperV\HomeHub-VMTest"
 if "%SEED_ISO%"=="" set "SEED_ISO=%VMTEST_DIR%\.out\seed.iso"
 
 set "ISO_FROM_DEFAULT="
@@ -123,9 +123,9 @@ echo ======================================================================
 echo.
 
 REM -- 4. pre-flight ----------------------------------------------------------
-if not exist "%VMTEST_DIR%\New-AwowVm.ps1" (
-    echo ERROR: New-AwowVm.ps1 not found next to this file.
-    echo        Expected: %VMTEST_DIR%\New-AwowVm.ps1
+if not exist "%VMTEST_DIR%\New-HomeHubVm.ps1" (
+    echo ERROR: New-HomeHubVm.ps1 not found next to this file.
+    echo        Expected: %VMTEST_DIR%\New-HomeHubVm.ps1
     goto :fail
 )
 if defined DO_REPACKED if not exist "%UBUNTU_ISO%" (
@@ -188,7 +188,7 @@ if /i not "%ANSWER%"=="y" (
 )
 goto :createvm
 
-REM VM exists and no /force: New-AwowVm.ps1 would no-op WITHOUT starting it,
+REM VM exists and no /force: New-HomeHubVm.ps1 would no-op WITHOUT starting it,
 REM so handle the existing VM here instead of pretending we created one.
 :existing
 REM
@@ -228,14 +228,14 @@ if errorlevel 1 (
 goto :verify
 
 :createvm
-powershell -NoProfile -ExecutionPolicy Bypass -File "%VMTEST_DIR%\New-AwowVm.ps1" ^
+powershell -NoProfile -ExecutionPolicy Bypass -File "%VMTEST_DIR%\New-HomeHubVm.ps1" ^
     -UbuntuIsoPath "%UBUNTU_ISO%" ^
     -SeedIsoPath   "%SEED_ISO%" ^
     -VMPath        "%VM_PATH%" ^
     -Start%EXTRA_ARGS%
 if errorlevel 1 (
     echo.
-    echo ERROR: New-AwowVm.ps1 failed - see the message above.
+    echo ERROR: New-HomeHubVm.ps1 failed - see the message above.
     goto :fail
 )
 if defined DO_WHATIF (
@@ -297,9 +297,9 @@ echo   Console login: hub
 echo   Password:      %VMTEST_DIR%\.out\secrets\creds.env
 echo.
 echo   Then watch it come up:
-echo     journalctl -u awow-firstboot -f
+echo     journalctl -u homehub-firstboot -f
 echo.
-echo   Teardown when done:  vmtest\Remove-AwowVm.ps1
+echo   Teardown when done:  vmtest\Remove-HomeHubVm.ps1
 echo ======================================================================
 echo.
 
@@ -326,7 +326,7 @@ echo ----------------------------------------------------------------------
 echo   Press a key for an elevated prompt in this folder. Useful next steps:
 echo     Get-VM %VM_NAME% ^| Format-List Name,State,Uptime
 echo     vmconnect localhost %VM_NAME%
-echo     powershell -File .\Remove-AwowVm.ps1
+echo     powershell -File .\Remove-HomeHubVm.ps1
 echo   Type  exit  to close this window. The VM keeps running either way.
 echo ----------------------------------------------------------------------
 pause

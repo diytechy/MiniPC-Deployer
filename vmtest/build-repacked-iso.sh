@@ -21,7 +21,7 @@
 # (that needs a VM — the Owner's step, see vmtest/README.md).
 #
 # Since everything (OS + seed + payload) is in ONE ISO here, attach only this
-# ISO to the VM (New-AwowVm.ps1 -SkipSecondDvd, same path for both
+# ISO to the VM (New-HomeHubVm.ps1 -SkipSecondDvd, same path for both
 # -UbuntuIsoPath and -SeedIsoPath).
 #
 # Run in WSL (Ubuntu). Requires: xorriso, openssl, ssh-keygen.
@@ -164,5 +164,5 @@ xorriso -indev "$REPACKED_ISO" -find /deploy-payload >/dev/null 2>&1 \
 log "OK — repacked ISO ready: $REPACKED_ISO (BIOS + UEFI boot images intact, /nocloud + /deploy-payload present)"
 log "SSH:     ssh -i $SSH_KEY hub@<vm-ip>"
 log "Console: user 'hub', SIM password in $CREDS_FILE"
-log "Next: vmtest/README.md — New-AwowVm.ps1 -UbuntuIsoPath $REPACKED_ISO -SeedIsoPath $REPACKED_ISO -SkipSecondDvd"
+log "Next: vmtest/README.md — New-HomeHubVm.ps1 -UbuntuIsoPath $REPACKED_ISO -SeedIsoPath $REPACKED_ISO -SkipSecondDvd"
 log "NOT boot-tested here (needs a VM) — this only verifies the ISO's on-disk structure."

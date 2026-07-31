@@ -2,17 +2,17 @@
 # fixture shares, plus a privileged backup-runner (the AWOW host stand-in) that
 # cifs-mounts them and runs the REAL stack/backup service end to end.
 #
-# Joins the awow-sim project's network (external) so the runner can feed the sim
+# Joins the homehub-sim project's network (external) so the runner can feed the sim
 # NagLight tracker. Bring up with sim/mini-serv-sim/run-backup-sim.sh (which
-# requires sim/run-sim.sh to have the awow-sim stack up first).
+# requires sim/run-sim.sh to have the homehub-sim stack up first).
 #
 # Also usable STANDALONE for WI-10.16 (MinecraftKeeper --execute) — just the
 # samba service is needed; see run-backup-sim.sh --shares-only.
 
 networks:
-  awow:
+  homehub:
     external: true
-    name: awow-sim_default
+    name: homehub-sim_default
 
 volumes:
   icedrive_data:      # the IceDrive-synced target share (writable; starts empty)
@@ -27,14 +27,14 @@ services:
     image: dperson/samba
     container_name: mini-serv
     hostname: mini-serv
-    networks: [awow]
+    networks: [homehub]
     # dperson/samba: -u "user;pass"  -s "name;path;browse;readonly;guest;users"
     command: >
-      -u "awow;simpass"
-      -s "minecraft;/share/minecraft;yes;yes;no;awow"
-      -s "satisfactory;/share/satisfactory;yes;yes;no;awow"
-      -s "icedrive;/share/icedrive;yes;no;no;awow"
-      -s "empty;/share/empty;yes;yes;no;awow"
+      -u "homehub;simpass"
+      -s "minecraft;/share/minecraft;yes;yes;no;homehub"
+      -s "satisfactory;/share/satisfactory;yes;yes;no;homehub"
+      -s "icedrive;/share/icedrive;yes;no;no;homehub"
+      -s "empty;/share/empty;yes;yes;no;homehub"
       -p
     volumes:
       - ./fixtures/minecraft:/share/minecraft:ro
@@ -48,14 +48,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.runner
-    image: awow-backup-runner:sim
+    image: homehub-backup-runner:sim
     container_name: backup-runner
     privileged: true            # mount.cifs needs real mount privileges
-    networks: [awow]
+    networks: [homehub]
     depends_on: [samba]
     volumes:
-      - ../../stack/backup:/opt/awow-core/stack/backup:ro   # the REAL service, unmodified
-      - ./backup.env.sim:/etc/awow-backup/backup.env:ro
+      - ../../stack/backup:/opt/homehub/stack/backup:ro   # the REAL service, unmodified
+      - ./backup.env.sim:/etc/homehub-backup/backup.env:ro
       - backup_drive:/backup
     command: ["sleep", "infinity"]
     restart: unless-stopped

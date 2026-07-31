@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-    WI-10.18 V3 gate — companion teardown for New-AwowVm.ps1.
+    WI-10.18 V3 gate — companion teardown for New-HomeHubVm.ps1.
 
 .DESCRIPTION
-    DELIVERED, NOT RUN (same as New-AwowVm.ps1 — elevation + Hyper-V, the Owner's
+    DELIVERED, NOT RUN (same as New-HomeHubVm.ps1 — elevation + Hyper-V, the Owner's
     call). Stops and removes the named Hyper-V VM. Idempotent: if the VM
     doesn't exist, reports so and exits 0 rather than erroring. Supports
     -WhatIf / -Confirm.
 
 .PARAMETER VMName
-    Hyper-V VM name. Default: AWOW-VMTest (matches New-AwowVm.ps1's default).
+    Hyper-V VM name. Default: HomeHub-VMTest (matches New-HomeHubVm.ps1's default).
 
 .PARAMETER KeepDisk
     Detach and keep the VHDX file instead of deleting it.
@@ -17,18 +17,18 @@
 .PARAMETER VMPath
     Only used to report where the VHDX lived if it's being deleted; the
     script reads the actual disk path from the VM itself, not from this.
-    Default: $env:USERPROFILE\HyperV\AWOW-VMTest.
+    Default: $env:USERPROFILE\HyperV\HomeHub-VMTest.
 
 .EXAMPLE
-    .\Remove-AwowVm.ps1
+    .\Remove-HomeHubVm.ps1
 .EXAMPLE
-    .\Remove-AwowVm.ps1 -KeepDisk -WhatIf
+    .\Remove-HomeHubVm.ps1 -KeepDisk -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
-    [string]$VMName = 'AWOW-VMTest',
+    [string]$VMName = 'HomeHub-VMTest',
     [switch]$KeepDisk,
-    [string]$VMPath = (Join-Path $env:USERPROFILE 'HyperV\AWOW-VMTest')
+    [string]$VMPath = (Join-Path $env:USERPROFILE 'HyperV\HomeHub-VMTest')
 )
 
 $ErrorActionPreference = 'Stop'

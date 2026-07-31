@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-sim.sh — bring up the AWOW-sim (WI-10.14): the REAL stack compose file
+# run-sim.sh — bring up the homehub-sim (WI-10.14): the REAL stack compose file
 # plus the sim overlay, then provision Technitium (the split-horizon zone) the
 # same way the autoinstall firstboot does on the real box.
 #
@@ -16,24 +16,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-COMPOSE=(docker compose -p awow-sim
+COMPOSE=(docker compose -p homehub-sim
          -f stack/docker-compose.yml
          -f sim/docker-compose.sim.yml
          --env-file sim/.env.sim)
 
 if [[ "${1:-}" == "--down" ]]; then
-    echo "== tearing down AWOW-sim =="
+    echo "== tearing down homehub-sim =="
     "${COMPOSE[@]}" down -v --remove-orphans
     exit 0
 fi
 
-echo "== AWOW-sim: resolve locally-built images (present -> sibling -> public, SR-006) =="
+echo "== homehub-sim: resolve locally-built images (present -> sibling -> public, SR-006) =="
 bash scripts/ensure-local-images.sh
 
-echo "== AWOW-sim: config sanity (real compose + overlay resolves) =="
+echo "== homehub-sim: config sanity (real compose + overlay resolves) =="
 "${COMPOSE[@]}" config -q
 
-echo "== AWOW-sim: bringing the stack up =="
+echo "== homehub-sim: bringing the stack up =="
 "${COMPOSE[@]}" up -d "$@"
 
 # Wait for Technitium to answer before provisioning its zone.
@@ -61,5 +61,5 @@ bash stack/provision/provision-technitium.sh \
     --host "http://127.0.0.1:${SIM_TECHNITIUM_API_PORT:-5381}" \
     --env  "$REPO_ROOT/sim/.env.sim"
 
-echo "== AWOW-sim up. Run sim/validate-sim.sh for the V1 gate. =="
+echo "== homehub-sim up. Run sim/validate-sim.sh for the V1 gate. =="
 "${COMPOSE[@]}" ps

@@ -8,7 +8,7 @@
 # consumer downstream — Samba shares, MEDIA_ROOT, the backup source paths —
 # was pointing at nothing.
 #
-# INPUT  /etc/awow-samba/library-mounts.fstab  (generated from storage-map §1,
+# INPUT  /etc/homehub-samba/library-mounts.fstab  (generated from storage-map §1,
 #        carried on the USB payload as site/library-mounts.fstab)
 #
 # IDEMPOTENT: a line whose mountpoint is already in /etc/fstab is left alone.
@@ -19,7 +19,7 @@
 # rather than drop to an emergency shell. This script reports loudly instead.
 set -euo pipefail
 
-FSTAB_FRAGMENT="/etc/awow-samba/library-mounts.fstab"
+FSTAB_FRAGMENT="/etc/homehub-samba/library-mounts.fstab"
 while [ $# -gt 0 ]; do
     case "$1" in
         --fragment) FSTAB_FRAGMENT="$2"; shift 2 ;;

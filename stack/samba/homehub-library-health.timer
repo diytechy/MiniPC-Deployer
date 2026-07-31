@@ -1,6 +1,6 @@
 [Unit]
 Description=Run the AWOW library mount health report every 10 minutes
-Documentation=file:/opt/awow-core/stack/samba/library-guard.sh
+Documentation=file:/opt/homehub/stack/samba/library-guard.sh
 
 [Timer]
 # Soon after boot so a drive that failed to mount is reported without waiting

@@ -14,7 +14,7 @@
 #       via the EXIT trap AND the run STILL posts ok=false (never-silent-green);
 #   (d) with NO devices configured, ZERO hdparm calls and an unchanged green run.
 #
-# Prereqs (same as run-backup-sim.sh): the awow-sim stack up (sim/run-sim.sh) for
+# Prereqs (same as run-backup-sim.sh): the homehub-sim stack up (sim/run-sim.sh) for
 # the shared network, and this repo's stack/backup mounted into the runner.
 #
 # Usage:
@@ -24,14 +24,14 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 CO=(docker compose -p mini-serv-sim -f docker-compose.yml)
-BACKUP=/opt/awow-core/stack/backup/backup.sh
+BACKUP=/opt/homehub/stack/backup/backup.sh
 
 case "${1:-}" in
     --down) "${CO[@]}" down -v; exit 0 ;;
 esac
 
-if ! docker network inspect awow-sim_default >/dev/null 2>&1; then
-    echo "ERROR: network awow-sim_default not found — run sim/run-sim.sh first." >&2
+if ! docker network inspect homehub-sim_default >/dev/null 2>&1; then
+    echo "ERROR: network homehub-sim_default not found — run sim/run-sim.sh first." >&2
     exit 2
 fi
 
@@ -46,7 +46,7 @@ echo "== build + up mini-serv-sim (samba + privileged runner) =="
 "${CO[@]}" up -d --build
 
 echo "== wait for Samba to accept a cifs mount AND serve a fixture file =="
-if rex 'for i in $(seq 1 30); do mkdir -p /mnt/probe; if mount -t cifs //mini-serv/minecraft /mnt/probe -o username=awow,password=simpass,ro,vers=3.0 2>/dev/null; then if [ -s /mnt/probe/server.properties ]; then umount /mnt/probe; echo ready; exit 0; fi; umount /mnt/probe; fi; sleep 2; done; exit 1'; then
+if rex 'for i in $(seq 1 30); do mkdir -p /mnt/probe; if mount -t cifs //mini-serv/minecraft /mnt/probe -o username=homehub,password=simpass,ro,vers=3.0 2>/dev/null; then if [ -s /mnt/probe/server.properties ]; then umount /mnt/probe; echo ready; exit 0; fi; umount /mnt/probe; fi; sleep 2; done; exit 1'; then
     pass "Samba share mountable"
 else
     fail "Samba never became mountable"; echo "== summary =="; echo "DRIVE-POWER LEG: FAIL"; exit 1
@@ -99,11 +99,11 @@ chmod +x /tmp/dp/rsync.mock
 # Test config WITH devices (offsite disabled — this leg tests power, not push).
 cat > /tmp/dp/backup.env <<'ENV'
 BACKUP_TARGET=/backup
-BACKUP_STAGING=/var/tmp/awow-backup/staging
+BACKUP_STAGING=/var/tmp/homehub-backup/staging
 BACKUP_KEEP=3
 BACKUP_SOURCES="minecraft=//mini-serv/minecraft
 satisfactory=//mini-serv/satisfactory"
-BACKUP_CIFS_USER=awow
+BACKUP_CIFS_USER=homehub
 BACKUP_CIFS_PASS=simpass
 BACKUP_CIFS_EXTRA=vers=3.0
 BACKUP_ZSTD_LEVEL=10

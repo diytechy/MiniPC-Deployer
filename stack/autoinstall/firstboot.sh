@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # First-boot bring-up for the AWOW always-on core. Invoked once by
-# awow-firstboot.service after docker + network are up. Idempotent and loud.
+# homehub-firstboot.service after docker + network are up. Idempotent and loud.
 #
 # Steps ("flash → boot → everything up, zero clicks"):
 #   1. Sanity: stack dir + .env exist and .env has been filled (not placeholders).
@@ -22,8 +22,8 @@
 # Re-running is safe: compose is declarative, provisioning is idempotent.
 set -euo pipefail
 
-STACK_DIR="/opt/awow-core/stack"
-MARKER="/opt/awow-core/.provisioned"
+STACK_DIR="/opt/homehub/stack"
+MARKER="/opt/homehub/.provisioned"
 log() { echo "[firstboot] $*"; }
 
 cd "$STACK_DIR" || { log "FATAL: $STACK_DIR missing"; exit 1; }
@@ -35,7 +35,7 @@ fi
 if grep -q "REPLACE_WITH" .env; then
     log "WARNING: .env still contains REPLACE_WITH placeholders."
     log "The stack will start but TLS/auth/DNS may be wrong until you edit .env"
-    log "and re-run: sudo /usr/local/sbin/awow-firstboot.sh"
+    log "and re-run: sudo /usr/local/sbin/homehub-firstboot.sh"
 fi
 
 # ── 2. oauth2-proxy allow-list (Q10.5) ───────────────────────────────────────
@@ -67,7 +67,7 @@ fi
 shopt -s nullglob
 IMAGES_DIR=""
 for cand in \
-    /opt/awow-core/images \
+    /opt/homehub/images \
     "$STACK_DIR/images" \
     /cdrom/deploy-payload/images \
     /media/deploy-payload/images; do
@@ -106,7 +106,7 @@ if [ -n "$IMAGES_DIR" ]; then
     done
     log "image payload: $loaded of ${#tars[@]} tar(s) loaded from $IMAGES_DIR"
 else
-    log "NOTICE: no baked image payload found (looked in /opt/awow-core/images,"
+    log "NOTICE: no baked image payload found (looked in /opt/homehub/images,"
     log "  $STACK_DIR/images, /cdrom/deploy-payload/images, /media/deploy-payload/images)."
     log "  Falling back to PULL-AT-COMPOSE-UP — 'docker compose up -d' fetches each image"
     log "  from its registry (needs internet). Pre-Q10.9-B+ behaviour; expected ONLY for a"
@@ -152,16 +152,16 @@ bash "$STACK_DIR/provision/provision-actual.sh" --env "$STACK_DIR/.env"
 # The mount guard must exist BEFORE the shares reference it: every share
 # stanza names it as `root preexec`, and a missing guard would make Samba
 # refuse every connection (preexec close = yes treats "cannot run" as failure).
-install -m 0755 "$STACK_DIR/samba/library-guard.sh" /usr/local/sbin/awow-library-guard
-install -m 0644 "$STACK_DIR/samba/awow-library-health.service" /etc/systemd/system/awow-library-health.service
-install -m 0644 "$STACK_DIR/samba/awow-library-health.timer"   /etc/systemd/system/awow-library-health.timer
+install -m 0755 "$STACK_DIR/samba/library-guard.sh" /usr/local/sbin/homehub-library-guard
+install -m 0644 "$STACK_DIR/samba/homehub-library-health.service" /etc/systemd/system/homehub-library-health.service
+install -m 0644 "$STACK_DIR/samba/homehub-library-health.timer"   /etc/systemd/system/homehub-library-health.timer
 systemctl daemon-reload
 
 log "mounting storage-map data drives…"
 bash "$STACK_DIR/provision/provision-mounts.sh" || \
     log "WARN: drive mounting reported a problem — see above"
 
-if [ -f /etc/awow-samba/smb.conf.fragment ]; then
+if [ -f /etc/homehub-samba/smb.conf.fragment ]; then
     log "bringing up the Samba file server…"
     if bash "$STACK_DIR/provision/provision-samba.sh"; then
         log "provisioning Samba household accounts…"
@@ -170,28 +170,28 @@ if [ -f /etc/awow-samba/smb.conf.fragment ]; then
     else
         log "WARN: Samba server did not come up — every §3 share is unreachable. Accounts skipped."
     fi
-elif [ -f /etc/awow-samba/.site-present ]; then
+elif [ -f /etc/homehub-samba/.site-present ]; then
     # The USB DID carry a site/ payload, but the fragment did not survive the
     # install. That is a broken production stick, not a sim build - and the
     # reassuring "expected on sim builds" message below would be a lie.
-    log "FATAL: site payload was present but /etc/awow-samba/smb.conf.fragment is missing."
+    log "FATAL: site payload was present but /etc/homehub-samba/smb.conf.fragment is missing."
     log "  Every §3 share is unreachable. The late-command copy failed or the"
     log "  payload was incomplete. Rebuild with Build-VentoyStick.ps1 and re-image."
 else
-    log "no /etc/awow-samba/smb.conf.fragment and no site payload marker —"
+    log "no /etc/homehub-samba/smb.conf.fragment and no site payload marker —"
     log "  skipping the file server (A14). Expected ONLY on a sim/vmtest build."
 fi
 
 # Enable the health timer AFTER mounting, not before: OnBootSec=3min has long
 # elapsed by the time firstboot runs, so `enable --now` fires immediately and
 # would post a spurious library-mounted ok=false against an unmounted library.
-systemctl enable --now awow-library-health.timer >/dev/null 2>&1 ||     log "WARN: could not enable awow-library-health.timer — a vanished drive would go unreported"
+systemctl enable --now homehub-library-health.timer >/dev/null 2>&1 ||     log "WARN: could not enable homehub-library-health.timer — a vanished drive would go unreported"
 
 # ── 6. make the host itself use local DNS ────────────────────────────────────
 # systemd-resolved: point it at 127.0.0.1 so the box resolves its own zone.
 if systemctl is-active --quiet systemd-resolved; then
     mkdir -p /etc/systemd/resolved.conf.d
-    cat > /etc/systemd/resolved.conf.d/awow.conf <<'EOF'
+    cat > /etc/systemd/resolved.conf.d/homehub.conf <<'EOF'
 [Resolve]
 DNS=127.0.0.1
 Domains=~.

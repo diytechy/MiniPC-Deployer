@@ -19,7 +19,7 @@ graphical session to launch and configure it in.
 scp Icedrive.AppImage hub@<LAN_IP>:~
 
 # 2. On the box:
-sudo ICEDRIVE_APPIMAGE=~/Icedrive.AppImage bash /opt/awow-core/stack/remote-ui/setup-remote-ui.sh
+sudo ICEDRIVE_APPIMAGE=~/Icedrive.AppImage bash /opt/homehub/stack/remote-ui/setup-remote-ui.sh
 
 # 3. From your workstation: RDP to <LAN_IP>:3389 (mstsc / Remmina) as the
 #    hub user; IceDrive autostarts in the session — sign in, set the

@@ -2,7 +2,7 @@
 
 This directory is the **wall panel variant** of this repo's autoinstall image
 (OI-12 / D-W0, ratified by the Owner 2026-07-29). It is a *separate* image, not a
-profile of the AWOW one: same ISO/payload/secret toolchain, different machine,
+profile of the hub one: same ISO/payload/secret toolchain, different machine,
 different job, **lighter gates**.
 
 The requirement it serves is **SN-013 / SR-016 / SR-017**, not SN-001. SN-001's
@@ -70,16 +70,16 @@ it as a **built artifact**, exactly as the tracker consumes `naglight:local`
    filename, and nowhere to fetch it from — so `WALL_APP_CMD` is a placeholder
    path and `wall-kiosk.sh` shows an explicit "artifact not installed" screen
    rather than a black wall.
-2. **Two halves, one contract.** The *static* build is served by the AWOW's kiosk
+2. **Two halves, one contract.** The *static* build is served by the hub's kiosk
    site (`stack/wall-shell/`); the *Electron* half runs here. Whether they ship as
    one artifact or two is undecided.
 3. **Who renders `config.json`.** The shell reads `./config.json` from its own
    origin for `HEARTBEAT_URL`, `SUBSONIC`, `LOCAL_LIBRARY` and friends. That file
-   is served from the AWOW side, but several of its values are panel-side secrets.
+   is served from the hub side, but several of its values are panel-side secrets.
    Nothing renders it today.
 4. ~~`/media/*` has no home~~ — **RESOLVED by the Owner 2026-07-29 (OI-15)**, and
    built: see "The media pull" below. `/media/*` is served **panel-locally** by
-   the shell's Electron host; the kiosk site on the AWOW serves no `/media` route
+   the shell's Electron host; the kiosk site on the hub serves no `/media` route
    at all. What is still owed here is the *other* side of that ruling — the
    Electron host mapping `/media/*` onto the cache directory — which is
    OfficeWallNaglight's half, not this repo's.
@@ -90,7 +90,7 @@ than papered over.
 
 ## The media pull (OI-15, ruled by the Owner 2026-07-29)
 
-> The panel's media is a network share on the AWOW; the **panel pulls** — once
+> The panel's media is a network share on the hub; the **panel pulls** — once
 > after boot and on demand — with **mirror semantics**; `/media/*` is then served
 > panel-locally by the shell's Electron host.
 

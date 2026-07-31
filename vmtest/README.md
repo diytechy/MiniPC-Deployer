@@ -231,6 +231,16 @@ hypervisor) — no need to disable WSL2 first.
 
 ## 5. Create the VM
 
+**Easiest: right-click `vmtest\Run-V3Gate.cmd` → "Run as administrator".** It
+wraps everything below — checks elevation (and re-launches itself through UAC if
+you merely double-clicked), verifies both ISOs exist and that Hyper-V answers,
+creates + starts the VM, prints the one-time GRUB edit from §6, and opens
+`vmconnect`. Defaults: stock ISO from `D:\iso\`, seed from `.out\seed.iso`, VHDX
+to `D:\HyperV\AWOW-VMTest` (**D: on purpose — C: is the tight drive**). Optional
+switches: `/force` (delete an existing VM **and its VHDX** first), `/whatif`
+(preview only), `/noconn` (skip `vmconnect`); an explicit ISO path can be passed
+as the first argument. The manual equivalent:
+
 ```powershell
 # Elevated PowerShell, from the MiniPC-Deployer checkout
 
@@ -279,13 +289,23 @@ vmconnect localhost AWOW-VMTest
 
 1. GRUB menu appears ("Try or Install Ubuntu Server" highlighted).
 2. **LIGHT path only:** press **`e`** to edit. Find the line starting
-   `linux	/casper/vmlinuz` (ends in ` ---`). Click into it and type
-   `autoinstall ds=nocloud;s=/cdrom/nocloud/` right before the trailing `---`,
-   so it reads:
-   `linux	/casper/vmlinuz  autoinstall ds=nocloud;s=/cdrom/nocloud/ ---`
+   `linux	/casper/vmlinuz` (ends in ` ---`). Click into it and type the single
+   word `autoinstall` right before the trailing `---`, so it reads:
+   `linux	/casper/vmlinuz  autoinstall ---`
    Then press **Ctrl+X** (or F10) to boot with the edited line. **This is the
    only manual step in the whole gate** — nothing else needs typing.
    (HEAVIER path: skip this, the repacked ISO already boots straight through.)
+
+   > **Type `autoinstall` and NOTHING else on the light path.** This step used
+   > to read `autoinstall ds=nocloud;s=/cdrom/nocloud/` — copied from the
+   > repacked path, where it is correct. On the light path it is wrong:
+   > `/cdrom` is the *stock* ISO, which has no `/nocloud/` directory (only
+   > `build-repacked-iso.sh` creates one), so that argument points cloud-init
+   > at a path that does not exist. The seed does not need it — `seed.iso` is
+   > labelled **CIDATA** and the NoCloud datasource finds it by label on its
+   > own, which is the entire reason the light path works without a repack
+   > (see `build-seed.sh`'s header). The bare `autoinstall` is only there to
+   > skip the "Continue with autoinstall?" confirmation prompt.
 3. Subiquity partitions the disk (whole-disk LVM), creates the `operator`
    user, installs Docker + Cockpit + unattended-upgrades, copies
    `deploy-payload/` to `/opt/awow-core/` (**including `images/` — the baked
@@ -363,6 +383,23 @@ docker compose -f /opt/awow-core/stack/docker-compose.yml ps
 
 ## 8. Known VM-vs-hardware deltas (don't mistake these for bugs)
 
+- **The install target disk is pinned differently in the VM — deliberately.**
+  Production pins `storage.layout.match.path: /dev/nvme0n1` (the AK41's
+  internal NVMe). Hyper-V Gen2 has no NVMe controller — the VHDX hangs off the
+  synthetic SCSI controller as `/dev/sda` — so the production pin matches
+  nothing in a VM and the install **halts**. `lib/common.sh`'s sim branch
+  therefore rewrites the match to `model: Virtual_Disk` for vmtest builds only.
+  That value is the udev `ID_MODEL` of a Hyper-V synthetic disk (note the
+  UNDERSCORE — Subiquity matches `ID_MODEL` via probert, not the prettified
+  `ID_MODEL_ENC` that `lsblk` prints as "Virtual Disk").
+  **Why not simply `path: /dev/sda`:** `/dev/sda` is a REAL disk on real
+  hardware, so a sim ISO that ever met a physical machine — or a USB stick
+  someone wrote it to — would wipe it unattended. `model: Virtual_Disk` can
+  only ever select a virtual disk; on real hardware it matches nothing and the
+  install fail-safe halts. The containment holds even if the sim ISO escapes
+  the VM. The production `user-data` is **not** modified by any of this, and
+  the build refuses to proceed if the substitution silently no-ops or if any
+  `path:`/`serial:`/`wwn:` match survives into the sim user-data.
 - **No real LAN `:53` client test** — Default Switch is NAT; another physical
   device can't `dig` this VM. Use an External switch (§5) if you need that.
 - **No USB backup drives** — `stack/backup/` (WI-10.15) targets real
@@ -402,6 +439,7 @@ vmtest/
   build-seed.sh           LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
   build-repacked-iso.sh   HEAVIER path: one self-contained ISO (fallback; folds in the payload)
   lib/common.sh           shared rendering + stage_images_into_payload (sourced, not run directly)
+  Run-V3Gate.cmd          right-click "Run as administrator" wrapper for New-AwowVm.ps1
   New-AwowVm.ps1          create the Hyper-V VM (elevation required; NOT run by an agent)
   Remove-AwowVm.ps1       companion teardown (elevation required; NOT run by an agent)
   .out/                   gitignored — everything the build scripts generate

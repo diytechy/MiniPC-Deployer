@@ -105,17 +105,35 @@ log "extracting /boot/grub/grub.cfg from $SRC_ISO"
 xorriso -osirrox on -indev "$SRC_ISO" -extract /boot/grub/grub.cfg "$GRUB_ORIG" >/dev/null 2>&1 \
     || die "couldn't extract /boot/grub/grub.cfg - is this a standard Ubuntu Server live ISO?"
 
-# Inject "autoinstall ds=nocloud;s=/cdrom/nocloud/" onto every /casper/*vmlinuz
+# Inject autoinstall + the NoCloud seed location onto every /casper/*vmlinuz
 # boot line (the default "Try or Install Ubuntu Server" entry and the HWE
 # kernel variant), and shorten the menu timeout. Idempotent: if the args are
 # already present (re-run on an already-modified file), sed just no-ops.
+#
+# THE QUOTES AROUND ds=... ARE LOAD-BEARING. GRUB's config language uses `;`
+# as a COMMAND SEPARATOR, exactly like a shell. Unquoted, GRUB splits
+#     linux /casper/vmlinuz autoinstall ds=nocloud;s=/cdrom/nocloud/ ---
+# into two commands: a `linux` that silently loses the seed location, and a
+# bogus `s=/cdrom/nocloud/` that errors with "can't find command". The kernel
+# then boots with `autoinstall` but no seedfrom, cloud-init finds no CIDATA
+# volume (this ISO is labelled "Ubuntu-Server ...", and the repacked path
+# attaches no second DVD), and Subiquity drops to the INTERACTIVE installer —
+# a language-selection menu instead of an unattended install. Found 2026-07-30
+# on the first real boot of this ISO; the old structural check passed happily
+# because it only grepped that the string was PRESENT, never that GRUB could
+# parse it. Quoting makes GRUB pass the whole thing as one kernel argument.
 sed \
-    -e "s#\(linux[[:space:]]*/casper/[a-z-]*vmlinuz\)\( \)\+---#\1 autoinstall ds=nocloud;s=/cdrom/nocloud/ ---#" \
+    -e "s#\(linux[[:space:]]*/casper/[a-z-]*vmlinuz\)\( \)\+---#\1 autoinstall \"ds=nocloud;s=/cdrom/nocloud/\" ---#" \
     -e "s/^set timeout=.*/set timeout=5/" \
     "$GRUB_ORIG" > "$GRUB_MOD"
 
-grep -q "autoinstall ds=nocloud" "$GRUB_MOD" || die "grub.cfg injection failed - Ubuntu changed its grub.cfg layout, update the sed pattern above"
-log "grub.cfg patched: $(grep -c 'autoinstall ds=nocloud' "$GRUB_MOD") boot entr(y/ies) now carry autoinstall ds=nocloud"
+# Verify the PARSEABLE form, not just the presence of the substring: the seed
+# argument must be quoted, or GRUB will split it on the semicolon.
+grep -q 'autoinstall "ds=nocloud;s=/cdrom/nocloud/"' "$GRUB_MOD" \
+    || die "grub.cfg injection failed - Ubuntu changed its grub.cfg layout, update the sed pattern above"
+grep -qE 'linux[[:space:]]*/casper/[a-z-]*vmlinuz[^"]*ds=nocloud;' "$GRUB_MOD" \
+    && die "grub.cfg carries an UNQUOTED ds=nocloud;s=... — GRUB would split it on the ';' and boot without a seed location, dropping Subiquity to the interactive installer. Refusing to build."
+log "grub.cfg patched: $(grep -c 'autoinstall "ds=nocloud' "$GRUB_MOD") boot entr(y/ies) now carry a QUOTED autoinstall ds=nocloud"
 
 # ── 4. repack: reuse the ORIGINAL El Torito boot catalog + hybrid MBR/GPT via
 #      "-boot_image any replay" instead of hand-building a new one — this is

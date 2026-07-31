@@ -158,8 +158,35 @@ render_seed_tree() {
         -e "s|password: \"!\"|password: \"$sim_password_hash\"   # VMTEST ONLY sim password, see vmtest/.out/secrets/creds.env|" \
         -e 's/hostname: awow-core/hostname: awow-vmtest/' \
         -e 's/realname: "AWOW Core Operator"/realname: "AWOW VM Test Operator"/' \
+        -e 's|^\([[:space:]]*\)path: /dev/nvme0n1|\1model: Virtual_Disk|' \
         "$autoinstall_src/user-data" > "$user_data_out"
     grep -q "REPLACE_WITH_YOUR_PUBLIC_KEY" "$user_data_out" && die "SSH placeholder substitution failed"
+
+    # ── VMTEST storage pin: CONTAINMENT, not convenience ─────────────────────
+    # Production pins `path: /dev/nvme0n1` (the AK41's internal NVMe). Hyper-V
+    # Gen2 has no NVMe controller — the VHDX hangs off the synthetic SCSI
+    # controller and enumerates as /dev/sda — so the production pin matches
+    # NOTHING in a VM and the install halts. That halt is the fail-safe working,
+    # but it also means the V3 gate can never complete.
+    #
+    # The naive fix (`path: /dev/sda`) is the WRONG one and must never be made:
+    # /dev/sda is a REAL disk on real hardware, so a sim ISO that ever met a
+    # physical machine — or a USB stick someone wrote it to — would wipe it
+    # unattended. The whole point of the pin is that it cannot do that.
+    #
+    # So pin to something ONLY a virtual disk can satisfy. Hyper-V synthetic
+    # disks report udev ID_MODEL=Virtual_Disk / ID_VENDOR=Msft (verified on this
+    # dev box: WSL2 is itself a Hyper-V guest and its disks report exactly
+    # that). Subiquity matches `model:` against udev's ID_MODEL via probert's
+    # StorageInfo, which reads ID_MODEL — NOT ID_MODEL_ENC — so the value is the
+    # UNDERSCORE form `Virtual_Disk`; `lsblk`'s prettified "Virtual Disk" would
+    # match nothing. On real hardware the disk reports its true model
+    # (FORESEE P900F128GBH, etc.), so this pin matches nothing and the install
+    # fail-safe halts. Containment holds even if the sim ISO escapes the VM.
+    grep -Eq '^[[:space:]]+model: Virtual_Disk$' "$user_data_out" || \
+        die "vmtest storage pin was NOT applied — stack/autoinstall/user-data's storage match is no longer 'path: /dev/nvme0n1', so the sed above silently did nothing. Refusing to build a sim ISO whose disk pin is unreviewed: re-check the storage stanza and update this substitution."
+    grep -Eq '^[[:space:]]+(path|serial|wwn):' "$user_data_out" && \
+        die "the sim user-data still carries a real-hardware disk match (path/serial/wwn) — a sim ISO must only ever be able to select a virtual disk. Refusing to build."
     fi
 
     # ── meta-data: fresh instance-id per build, vmtest hostname ──────────────

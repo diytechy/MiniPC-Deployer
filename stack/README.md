@@ -351,7 +351,13 @@ docker compose --profile ntfy up -d
 ```
 
 All ports are configurable in `.env` (`UPTIMEKUMA_PORT`, `DOZZLE_PORT`,
-`NTFY_PORT`); each has a healthcheck.
+`NTFY_PORT`); each has a healthcheck that has been **run against its pinned
+image** (2026-08-01). Do not "simplify" the Uptime-Kuma or Dozzle probes back
+into a `wget`/`CMD-SHELL` one-liner: kuma ships no `wget` and Dozzle is
+distroless (no shell at all), which is exactly why both sat permanently red
+until 2026-08-01. Each now runs the probe binary its own image provides — see
+`docs/status.md`, entry "2026-08-01". The WI-10.14 lesson generalises: check
+what a probe tool actually exists in the image before writing a healthcheck.
 
 ---
 

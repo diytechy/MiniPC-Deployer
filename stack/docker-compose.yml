@@ -336,7 +336,15 @@ services:
       - "${LAN_IP}:${UPTIMEKUMA_PORT}:3001"   # LAN-only: bound to the box's LAN IP
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3001/ || exit 1"]
+      # The uptime-kuma image ships NO wget (it has curl + bash; verified against
+      # the pinned 1.23.17 image, 2026-08-01) — the old wget probe could never
+      # run, so the container sat permanently unhealthy. The image already
+      # declares its own HEALTHCHECK, `CMD-SHELL extra/healthcheck`, a compiled
+      # Go binary at /app/extra/healthcheck that GETs http://127.0.0.1:3001 and
+      # exits 0 on a 200. Use that same binary in exec form (absolute path, so it
+      # does not depend on WorkingDir) and keep this stack's house cadence rather
+      # than the image's slower 60s/180s defaults.
+      test: ["CMD", "/app/extra/healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -354,7 +362,16 @@ services:
       - "${LAN_IP}:${DOZZLE_PORT}:8080"       # LAN-only: bound to the box's LAN IP
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthcheck || exit 1"]
+      # The dozzle image is DISTROLESS — no /bin/sh, no wget (verified against the
+      # pinned v8.14.12 image, 2026-08-01), so the old CMD-SHELL probe could never
+      # run and the container sat permanently unhealthy. Unlike uptime-kuma the
+      # image declares no HEALTHCHECK of its own, so we must supply one: the
+      # dozzle binary ships a `healthcheck` subcommand that requests its own
+      # /healthcheck endpoint and exits 0/1. CMD (exec) form is mandatory here —
+      # any CMD-SHELL variant needs a shell this image does not have. Bonus: the
+      # subcommand reads the same DOZZLE_ADDR config as the server, so it follows
+      # the listen port automatically instead of hardcoding 8080.
+      test: ["CMD", "/dozzle", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 5

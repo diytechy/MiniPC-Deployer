@@ -1944,3 +1944,56 @@ plaintexts + Technitium/Actual server passwords are now machine-minted
 prep time (WSL python3-bcrypt — the `docker run caddy hash-password`
 instruction printed here was unrunnable on the dev PC, no docker), and a new
 `Show-DeploySecret.ps1` reads one key back for browser prompts.
+
+---
+
+### 2026-08-01 — dozzle + uptime-kuma healthchecks fixed (V3_GATE_HANDOFF §5 item 1)
+
+The last two never-passable healthchecks — the same class of bug the homehub-sim
+caught for tracker/oauth2-proxy/technitium/actual in WI-10.14, but in the aux
+containers the V1 sim never ran (LAN_IP binds), so nothing had ever executed
+them. Both sat permanently red. **Verified against the PINNED images, not
+assumed** — `amir20/dozzle:v8.14.12` and `louislam/uptime-kuma:1.23.17`:
+
+- **uptime-kuma** ships **no wget** (it has curl + bash), so
+  `CMD-SHELL wget …:3001/` could never run. The image already declares its own
+  `HEALTHCHECK CMD-SHELL extra/healthcheck` — a 6.8 MB compiled Go binary at
+  `/app/extra/healthcheck` (source `extra/healthcheck.go` sits beside it) that
+  GETs `http://127.0.0.1:3001` and exits 0 on 200. Now
+  `test: ["CMD", "/app/extra/healthcheck"]` — the image's own probe, absolute
+  path so it does not depend on WorkingDir, keeping this stack's 30s cadence
+  rather than the image's slower 60s/180s defaults.
+- **dozzle** is **distroless** — no `/bin/sh`, so *any* `CMD-SHELL` form is
+  unrunnable. Unlike kuma it declares **no HEALTHCHECK of its own**, so one had
+  to be supplied: the binary ships a `healthcheck` subcommand ("checks if the
+  server is running") that requests its own `/healthcheck` endpoint. Now
+  `test: ["CMD", "/dozzle", "healthcheck"]` — exec form is mandatory here.
+  Bonus: the subcommand reads the same `DOZZLE_ADDR` config as the server, so it
+  follows the listen port instead of hardcoding 8080.
+
+**RAN FOR REAL (WSL, podman 5.3.1 — this dev PC no longer has the Docker Engine
+of WI-10.13):** pulled both pinned images; confirmed the missing/​present tooling
+above by exec; ran each probe as a **container-runtime healthcheck**
+(`podman healthcheck run`) → **both report healthy**, and unhealthy when the
+service is down (dozzle's negative case checked with no server running).
+`scripts/validate_config.py` → ALL CONFIG CHECKS PASSED. Compose YAML re-parsed
+in a throwaway python container (the validator's own YAML step SKIPs here — no
+PyYAML on this interpreter): 27 services, both `test:` arrays as intended.
+
+Two test artifacts worth recording so the next person does not re-chase them:
+**dozzle exits 1 without a docker socket**, so a socket-less test container is
+dead, not unhealthy — the passing run mounts the socket like production does;
+and podman's `--health-cmd` does **not** parse a JSON-array string (it stored
+`[["CMD",…]]` and tried to exec that literally) — its `CMD …` prefix form is the
+CLI equivalent of compose's `test:` list. Neither affects the compose file.
+
+**Also checked, and NOT broken:** `ntfy` v2.25.0 — its `CMD-SHELL wget …
+/v1/health` probe is fine (image has wget + sh; ran it, `{"healthy":true}`).
+Worth confirming because the 2026-07-29 telemetry ruling made ntfy load-bearing
+for the Kuma→ntfy notifier. `caddy` was already proven healthy in the V1 gate.
+`ddns` defines no healthcheck by design. That closes the audit of every
+healthcheck in the stack.
+
+Still hardware-gated: these two aux images remain otherwise first-validated at
+V3 boot / burn-in (image *behaviour* under the real LAN_IP binds is unchanged by
+this fix).

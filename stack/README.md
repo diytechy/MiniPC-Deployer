@@ -370,9 +370,9 @@ explicitly enabled.
 
 | Profile | Service | Access (default) | Purpose |
 |---|---|---|---|
-| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `http://<LAN_IP>:2283` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125 |
+| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `http://<LAN_IP>:2283` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125, or cap it with `IMMICH_ML_MEM_LIMIT` |
 | `photoprism` | PhotoPrism (+MariaDB) | `http://<LAN_IP>:2342` | photo library indexed in place (run at most ONE photo stack) |
-| `jellyfin` | Jellyfin | `http://<LAN_IP>:8096` | movies/TV; QSV transcode via `/dev/dri` |
+| `jellyfin` | Jellyfin | `http://<LAN_IP>:8096` | movies/TV; library path via `JELLYFIN_LIBRARY_DIR`; QSV `/dev/dri` wired up by firstboot when an iGPU is present |
 | `navidrome` | Navidrome | `http://<LAN_IP>:4533` | music, Subsonic API |
 | `audiobookshelf` | Audiobookshelf | `http://<LAN_IP>:13378` | podcasts + audiobooks |
 | `vaultwarden` | Vaultwarden | **Caddy site only** (HTTPS required) | Bitwarden-compatible passwords |
@@ -420,10 +420,32 @@ Disable = remove the profile from `COMPOSE_PROFILES`, then
 ### Ground rules / caveats (read before enabling)
 
 - **RAM budget (8 GB):** core ≈ 1.5 GB. HA + Jellyfin + the small services fit;
-  run at most ONE photo stack; `immich-ml` is the heavy piece — leave it off or
-  give it a `mem_limit`.
+  run at most ONE photo stack; `immich-ml` is the heavy piece — leave it off, or
+  set `IMMICH_ML_MEM_LIMIT` (e.g. `2g`) so an OOM kills only that container and
+  the core stack stays up. `immich` + `immich-ml` + `jellyfin` together land
+  around 4–5 GB on top of the core.
 - **Media storage:** `MEDIA_ROOT` must point at real always-on storage — NOT
   the WI-10.10 backup drives (streaming would defeat their spin-down policy).
+- **A `MEDIA_ROOT` on a mounted drive must be mounted BEFORE compose starts.**
+  Docker creates a missing bind-mount source itself, on whatever filesystem is
+  there at container-start time — so a late mount shadows the directory the
+  container is already writing to, and the data lands on the system disk where
+  nothing can see it. `firstboot.sh` step 3b mounts the storage-map drives ahead
+  of `docker compose up -d` for exactly this reason; keep that order.
+- **Subdirectory casing is exact.** The documented subdirs are lowercase
+  (`music/`, `photos/`, …) and both ntfs3 and ext4 are case-sensitive: pointing
+  at a library whose folders are `Music`/`Movies` with a lowercase bind path
+  gets you a silently-created empty directory, not an error.
+- **Hardware passthrough is not in `docker-compose.yml`.** Jellyfin's Quick Sync
+  needs `/dev/dri`, and a `devices:` entry for an absent node fails container
+  creation — which fails the entire `docker compose up -d`, not just that
+  service. `provision-compose-overrides.sh` (firstboot step 3c) generates
+  `docker-compose.override.yml` with the device on boxes that have an iGPU and
+  removes it on boxes that do not. Compose auto-loads that file, so a later
+  manual `docker compose up -d` over SSH keeps the same behaviour.
+- **`JELLYFIN_LIBRARY_DIR`** narrows what Jellyfin sees to a subtree of the media
+  root (empty = the whole root). Inside the container the path is always
+  `/media` — that is what you type when adding the library in Jellyfin's UI.
 - **Tier-2 pins are NOT sim-validated** and carry no custom healthchecks yet
   (probe tooling per image is unverified — the WI-10.14 lesson). Verify the
   tag + behavior at enable time; the `diun` profile watches for updates after.

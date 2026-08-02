@@ -153,6 +153,42 @@ else
 fi
 shopt -u nullglob
 
+# ── 3b. mount the storage-map data drives BEFORE anything bind-mounts into them ─
+# ORDER IS LOAD-BEARING — this used to sit in step 5c, AFTER `docker compose
+# up -d`, and that was a latent data-loss bug the moment any container bind-
+# mounted a path under /srv/library:
+#   docker CREATES a missing bind-mount source directory, on whatever filesystem
+#   is there at container-start time. With the library unmounted that is the
+#   SYSTEM disk; ntfs3 then mounts over /srv/library and SHADOWS it. The
+#   container keeps writing to the now-invisible directory on the 119 GB system
+#   disk, and every read through the share sees an empty library. Silent, and it
+#   only surfaces when the system disk fills.
+# It was harmless while MEDIA_ROOT defaulted to /srv/media and nothing mounted
+# inside the library; enabling the media profiles (immich writes ${MEDIA_ROOT}/
+# immich, jellyfin reads the video library) makes it live. Same reasoning the
+# Samba block below already states for `root preexec` — it just has to happen
+# before compose, not after.
+#
+# Not fatal when a drive is absent: `nofail` in the generated fstab options, and
+# provision-mounts.sh exits 0 with a loud log on a sim/vmtest build that carries
+# no fragment at all.
+log "mounting storage-map data drives (before compose — bind sources must be real)…"
+bash "$STACK_DIR/provision/provision-mounts.sh" || \
+    log "WARN: drive mounting reported a problem — see above"
+
+# ── 3c. hardware-conditional compose overrides ───────────────────────────────
+# Jellyfin's Quick Sync passthrough needs /dev/dri, and a `devices:` entry for a
+# node that does not exist makes container CREATION fail outright — which would
+# take the whole `docker compose up -d` down with it on any box without an iGPU.
+# Generated here instead of being hardcoded in docker-compose.yml, so one stack
+# file works on every box.
+#   Note (measured 2026-08-01): a Hyper-V VM is NOT such a box — hyperv_drm
+#   gives it /dev/dri with a card node but no renderD*, so the override is
+#   written there too and simply has no VA-API to offer. Do not read "the gate
+#   VM passed" as proof the no-device branch works; that has its own test.
+bash "$STACK_DIR/provision/provision-compose-overrides.sh" || \
+    log "WARN: compose override generation failed — Jellyfin (if enabled) runs without QSV"
+
 # ── 4. bring the stack up ────────────────────────────────────────────────────
 # Images were loaded from the payload in step 3 (Q10.9 B+). compose finds each
 # pinned tag locally and starts it without a pull; anything NOT baked (or a
@@ -177,11 +213,13 @@ bash "$STACK_DIR/provision/provision-technitium.sh" --env "$STACK_DIR/.env"
 log "bootstrapping Actual (server password from FINANCE_ACTUAL_PASSWORD)…"
 bash "$STACK_DIR/provision/provision-actual.sh" --env "$STACK_DIR/.env"
 
-# ── 5c. Data drives, then the Samba file server (A14 + A13) ──────────────────
+# ── 5c. The Samba file server (A14 + A13) ────────────────────────────────────
 # ORDER IS LOAD-BEARING:
 #   mounts  -> the library must be a real mountpoint before anything exports a
 #              path inside it, or Samba serves an empty dir on the eMMC and
-#              silently accepts writes to the system disk.
+#              silently accepts writes to the system disk. MOVED UP to step 3b:
+#              docker bind mounts need the same guarantee and compose runs in
+#              step 4, so mounting here was already too late for them.
 #   samba   -> assembles smb.conf (tracked [global] + generated share stanzas)
 #              and starts smbd. Creates the Samba databases smbpasswd needs.
 #   users   -> one identity per storage-map §2 entry, each with its OWN
@@ -193,11 +231,12 @@ bash "$STACK_DIR/provision/provision-actual.sh" --env "$STACK_DIR/.env"
 install -m 0755 "$STACK_DIR/samba/library-guard.sh" /usr/local/sbin/homehub-library-guard
 install -m 0644 "$STACK_DIR/samba/homehub-library-health.service" /etc/systemd/system/homehub-library-health.service
 install -m 0644 "$STACK_DIR/samba/homehub-library-health.timer"   /etc/systemd/system/homehub-library-health.timer
+# Same guard, second drive (A21): the backup target had no presence check at all
+# — it was looked at once a night by the backup run, which (fstab `nofail`) could
+# not tell an absent drive from an empty directory on the system disk.
+install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.service" /etc/systemd/system/homehub-backup-drive-health.service
+install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.timer"   /etc/systemd/system/homehub-backup-drive-health.timer
 systemctl daemon-reload
-
-log "mounting storage-map data drives…"
-bash "$STACK_DIR/provision/provision-mounts.sh" || \
-    log "WARN: drive mounting reported a problem — see above"
 
 if [ -f /etc/homehub-samba/smb.conf.fragment ]; then
     log "bringing up the Samba file server…"
@@ -224,6 +263,8 @@ fi
 # elapsed by the time firstboot runs, so `enable --now` fires immediately and
 # would post a spurious library-mounted ok=false against an unmounted library.
 systemctl enable --now homehub-library-health.timer >/dev/null 2>&1 ||     log "WARN: could not enable homehub-library-health.timer — a vanished drive would go unreported"
+systemctl enable --now homehub-backup-drive-health.timer >/dev/null 2>&1 || \
+    log "WARN: could not enable homehub-backup-drive-health.timer — an absent backup drive would go unreported until the nightly run"
 
 # ── 6. make the host itself use local DNS ────────────────────────────────────
 # systemd-resolved: point it at 127.0.0.1 so the box resolves its own zone.

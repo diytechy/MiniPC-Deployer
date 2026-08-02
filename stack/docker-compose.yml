@@ -423,7 +423,14 @@ services:
   #     spin-down policy; media wants its own always-on disk or a LAN share.
   #   - RAM budget (8 GB box): the core uses ~1.5 GB. HA + Jellyfin + the small
   #     services fit comfortably. Run AT MOST ONE photo stack; Immich's ML
-  #     container is a separate profile (immich-ml) — leave it off on the J4125.
+  #     container is a separate profile (immich-ml) — leave it off on the J4125,
+  #     or run it with IMMICH_ML_MEM_LIMIT set so it can only OOM itself. The
+  #     full immich+immich-ml+jellyfin set lands around 4-5 GB on top of the
+  #     core: it fits 7.6 GB usable, with little headroom for a library scan.
+  #   - HARDWARE-CONDITIONAL BITS DO NOT BELONG IN THIS FILE. A `devices:` entry
+  #     for a node that is absent fails container creation and takes the whole
+  #     `compose up` with it. provision-compose-overrides.sh (firstboot 3c)
+  #     generates docker-compose.override.yml from what the box actually has.
   #   - Tier-2 volumes are NOT yet covered by the backup service (open review
   #     finding — stack volumes generally aren't; see docs/status.md).
 
@@ -453,10 +460,18 @@ services:
     restart: unless-stopped
 
   # Name matches immich-server's built-in default ML URL (http://immich-machine-learning:3003).
+  # MEMORY CAP (IMMICH_ML_MEM_LIMIT) — this is the one tier-2 container that can
+  # realistically OOM an 8 GB box: CLIP + face recognition hold their models
+  # resident, and an initial library scan is the worst case. The cap is what the
+  # tier-2 banner means by "or cap memory": the kernel OOM-kills THIS container
+  # instead of letting the kernel pick a victim from the core stack, and
+  # `restart: unless-stopped` brings it back. Smart search degrades; DNS, Caddy
+  # and the tracker do not go down with it. Empty = no limit.
   immich-machine-learning:
     image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_IMAGE_TAG}
     container_name: immich-machine-learning
     profiles: ["immich-ml"]
+    mem_limit: ${IMMICH_ML_MEM_LIMIT:-0}
     volumes:
       - immich_model_cache:/cache
     restart: unless-stopped
@@ -523,6 +538,10 @@ services:
     restart: unless-stopped
 
   # ── video: Jellyfin (movies/TV; music too if you skip Navidrome) ──────────────
+  # LIBRARY PATH: JELLYFIN_LIBRARY_DIR lets a box hand Jellyfin the video subtree
+  # instead of the whole media root — least privilege, and it makes the in-app
+  # library path unambiguous (it is always /media). Unset/empty = the whole
+  # ${MEDIA_ROOT}, which is the generic default.
   jellyfin:
     image: jellyfin/jellyfin:${JELLYFIN_IMAGE_TAG}
     container_name: jellyfin
@@ -532,12 +551,15 @@ services:
     volumes:
       - jellyfin_config:/config
       - jellyfin_cache:/cache
-      - ${MEDIA_ROOT}:/media:ro
-    # J4125 Quick Sync (VA-API) — good for 1080p transcodes. REQUIRES /dev/dri on
-    # the host; container creation FAILS without it (e.g. a Hyper-V test VM) —
-    # comment the devices: block out there. Prefer direct-play; this is no 4K box.
-    devices:
-      - /dev/dri:/dev/dri
+      - ${JELLYFIN_LIBRARY_DIR:-${MEDIA_ROOT}}:/media:ro
+    # NO `devices:` BLOCK HERE ON PURPOSE. Quick Sync (VA-API) needs /dev/dri,
+    # and a devices: entry for a node that does not exist fails container
+    # CREATION — which fails the whole `docker compose up -d`, not just Jellyfin.
+    # provision-compose-overrides.sh (firstboot step 3c) writes a
+    # docker-compose.override.yml adding /dev/dri on boxes that HAVE an iGPU
+    # (the AWOW's J4125 does, via i915) and removes it on boxes that do not
+    # (Hyper-V VMs). Compose auto-loads that file, so nothing else changes.
+    # Prefer direct-play regardless; this is no 4K transcoding box.
     ports:
       - "${LAN_IP}:${JELLYFIN_PORT}:8096"
     restart: unless-stopped

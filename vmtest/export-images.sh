@@ -118,9 +118,79 @@ saved_count=0
 pulled_count=0
 
 # ── 2. ensure each image is present locally (pull at the PINNED tag if not) ────
+# sibling_repo_for REF — the app repo a locally-built image is built from, or ''.
+# Same pairs scripts/ensure-local-images.sh declares; keep them in step.
+sibling_repo_for() {
+    case "${1%%:*}" in
+        naglight)        echo "NagLight" ;;
+        finance-auditor) echo "Finance-Auditor" ;;
+        *)               echo "" ;;
+    esac
+}
+
+# assert_local_image_fresh REF — refuse to bake an app image older than its source.
+#
+# THE TRAP THIS CLOSES (found by the 2026-08-01 V3 gate): a `*:local` image has no
+# registry and no version in its tag, and every resolver in this repo treats
+# "present" as "done" — ensure-local-images.sh skips it, this script saves it. So
+# whatever vintage happens to sit in the dev PC's docker cache is what gets baked
+# into an ISO you then flash and keep for months. That gate booted a
+# finance-auditor image 19 days older than its repo HEAD, from BEFORE the A8
+# auto-discovery work, and it crash-looped on a knob the current source does not
+# even require. Nothing anywhere said the image was stale.
+#
+# COMPARES COMMIT SHAs, NOT TIMESTAMPS. The first cut of this check compared
+# .Created against the sibling's HEAD date and was wrong: a cache-identical
+# rebuild reuses the existing image record and keeps its ORIGINAL .Created, so a
+# freshly rebuilt image still reported as stale. ensure-local-images.sh now
+# stamps homehub.source.revision at build time; that is exact.
+#
+# Skipped (with a note) when the sibling checkout is absent — a public-image or
+# no-checkout run is legitimate. An UNSTAMPED image (hand-built with plain
+# `docker build`) warns loudly rather than failing: it may well be current, but
+# nothing can prove it, and silence would be the very failure being fixed.
+assert_local_image_fresh() {
+    local ref="$1"
+    local repo; repo="$(sibling_repo_for "$ref")"
+    [ -n "$repo" ] || return 0
+    local dir="$REPO_ROOT/../$repo"
+    if [ ! -d "$dir/.git" ]; then
+        log "  (no $repo checkout beside this repo — cannot verify $ref against its source)"
+        return 0
+    fi
+
+    local stamped head
+    stamped="$(docker image inspect "$ref" --format '{{index .Config.Labels "homehub.source.revision"}}' 2>/dev/null)"
+    head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo '')"
+
+    if [ -z "$stamped" ] || [ "$stamped" = "<no value>" ]; then
+        log "  WARNING: $ref carries no homehub.source.revision label — cannot prove it matches $repo."
+        log "           It was built by hand rather than through scripts/ensure-local-images.sh."
+        log "           Rebuild through the resolver to make this verifiable:"
+        log "             bash scripts/ensure-local-images.sh --rebuild"
+        return 0
+    fi
+    case "$stamped" in
+        *'+dirty')
+            log "  NOTE: $ref was built from a DIRTY $repo tree (${stamped%+dirty} + uncommitted changes)."
+            log "        Baking it is fine for a gate run; commit before a real flash so the box is reproducible."
+            return 0 ;;
+    esac
+    if [ -n "$head" ] && [ "$stamped" != "$head" ]; then
+        die "STALE local image '$ref' — built from ${stamped:0:12}, but $repo HEAD is ${head:0:12}." \
+            "  HEAD: $(git -C "$dir" log -1 --format='%h %cs %s' 2>/dev/null)" \
+            "This image has no registry and no version in its tag, so nothing else will ever notice." \
+            "Baking it means flashing a box with an app build older than its source." \
+            "Rebuild first:  bash scripts/ensure-local-images.sh --rebuild" \
+            "(Deliberately shipping an older build? Export with ALLOW_STALE_LOCAL=1.)"
+    fi
+    log "  source-check OK: $ref built from $repo ${stamped:0:12} (= HEAD)"
+}
+
 for ref in "${IMAGES[@]}"; do
     if docker image inspect "$ref" >/dev/null 2>&1; then
         log "present locally: $ref"
+        [ "${ALLOW_STALE_LOCAL:-0}" = "1" ] || assert_local_image_fresh "$ref"
     else
         case "$ref" in
             naglight:*|*:local)
@@ -149,9 +219,19 @@ for ref in "${IMAGES[@]}"; do
         out="$IMAGES_OUT/$base.tar"
     fi
 
-    if [ -f "$out" ] && [ "$FORCE" -eq 0 ]; then
+    # A tar is reusable only when its filename pins the content. For a registry
+    # image the tag does that. For a `*:local` build it does NOT — the tag is
+    # constant across every rebuild, so "already saved" would keep shipping the
+    # tar from whichever build happened first, even after the source-check above
+    # confirms the IMAGE is current. Same 2026-08-01 stale-payload trap, one
+    # layer down: re-save these every run (they are the two smallest images).
+    local_only=0
+    case "$ref" in *:local|naglight:*) local_only=1 ;; esac
+
+    if [ -f "$out" ] && [ "$FORCE" -eq 0 ] && [ "$local_only" -eq 0 ]; then
         log "skip (already saved, --force to redo): $(basename "$out")"
     else
+        [ "$local_only" -eq 1 ] && [ -f "$out" ] && log "re-saving locally-built $ref (its tag pins no content)"
         log "docker save $ref -> $(basename "$out")"
         if [ "$USE_ZSTD" -eq 1 ]; then
             docker save "$ref" | zstd -q -3 -f -o "$out"

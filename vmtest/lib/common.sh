@@ -448,7 +448,52 @@ render_seed_tree() {
         -e "s|^CLOUDFLARE_API_TOKEN=.*|CLOUDFLARE_API_TOKEN=sim-token-not-real   # ddns WILL fail auth in the VM - expected, no healthcheck gates it|" \
         "$sim_env"
 
+    apply_sim_env_overrides "$sim_env"
     assert_env_interpolation_safe "$sim_env"
+}
+
+# apply_sim_env_overrides FILE — fold $SIM_ENV_OVERRIDES into the SIM .env.
+#
+# WHY: the sim .env is a copy of stack/.env.example, i.e. the GENERIC defaults —
+# tier-2 profiles off, MEDIA_ROOT=/srv/media. That is the right default for the
+# gate, but it means the gate cannot exercise the profile set a REAL image will
+# boot with (the AWOW's lives in Personal's config.homehub.psd1, which never
+# comes near this repo). Baking those values into .env.example instead would
+# change the public default for everyone — wrong knob.
+#
+# So: an explicit, opt-in list of KEY=VALUE pairs, newline- or semicolon-
+# separated, applied after every sed above. Example — boot the gate with the
+# homehub image's opt-in set:
+#
+#   SIM_ENV_OVERRIDES='COMPOSE_PROFILES=ntfy,immich,immich-ml,jellyfin
+#   IMMICH_ML_ENABLED=true
+#   IMMICH_ML_MEM_LIMIT=2g' bash vmtest/build-seed.sh
+#
+# FAILS LOUDLY on a key that is not already in the file: a typo'd knob would
+# otherwise append a line compose ignores, and the gate would quietly test the
+# default set while reporting success — the exact silent-no-op failure mode the
+# hostname/storage-pin assertions elsewhere in this file exist to prevent.
+apply_sim_env_overrides() {
+    local f="$1"
+    [ -n "${SIM_ENV_OVERRIDES:-}" ] || return 0
+
+    local pair key val
+    # Split on newlines and semicolons; ignore blanks and comments.
+    while IFS= read -r pair; do
+        pair="${pair#"${pair%%[![:space:]]*}"}"     # ltrim
+        pair="${pair%"${pair##*[![:space:]]}"}"     # rtrim
+        case "$pair" in ''|\#*) continue ;; esac
+        case "$pair" in *=*) : ;; *) die "SIM_ENV_OVERRIDES entry '$pair' is not KEY=VALUE" ;; esac
+        key="${pair%%=*}"
+        val="${pair#*=}"
+        grep -qE "^$key=" "$f" \
+            || die "SIM_ENV_OVERRIDES names '$key', which is not a knob in stack/.env.example." \
+                   "Appending it would be a silent no-op — compose reads only knobs the stack asks for." \
+                   "Check the spelling, or add the knob to .env.example first."
+        # '|' delimiter + compose_escape, same rules as the seds above.
+        sed -i -e "s|^$key=.*|$key=$(compose_escape "$val")   # VMTEST override (SIM_ENV_OVERRIDES)|" "$f"
+        log "  sim .env override: $key=$val"
+    done < <(printf '%s\n' "$SIM_ENV_OVERRIDES" | tr ';' '\n')
 }
 
 # stage_images_into_payload OUT_DIR IMAGES_OUT

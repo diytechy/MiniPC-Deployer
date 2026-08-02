@@ -64,6 +64,36 @@ the opt-in tier-2 catalog (stack/README §9) sits behind compose profiles, so
 core-sized; enabled opt-ins pull at enable time instead. To bake an enabled set
 anyway: `EXTRA_PROFILES="navidrome vaultwarden" bash vmtest/export-images.sh`.
 
+### Gating an image whose profile set is NOT the default
+
+A real image's opt-in set lives in its own config (the AWOW's is Personal's
+`config.homehub.psd1`), which never comes near this repo — the sim `.env` is a
+copy of `stack/.env.example`, i.e. the generic defaults with every tier-2
+profile off. Two env vars make the gate boot the set the real box will boot,
+without changing the public default and without staging real secrets:
+
+```sh
+# 1. bake the extra images into the payload
+EXTRA_PROFILES="immich immich-ml jellyfin finance-auditor" \
+  IMAGES_OUT=/mnt/d/vmtest-out/images bash vmtest/export-images.sh
+
+# 2. turn the same set on in the SIM .env
+SIM_ENV_OVERRIDES='COMPOSE_PROFILES=ntfy,immich,immich-ml,jellyfin,finance-auditor
+IMMICH_ML_ENABLED=true
+IMMICH_ML_MEM_LIMIT=2g' bash vmtest/build-seed.sh
+```
+
+`SIM_ENV_OVERRIDES` takes newline- or semicolon-separated `KEY=VALUE` pairs and
+**fails the build** if a key is not already a knob in `.env.example` — a typo
+would otherwise append a line compose ignores, and the gate would test the
+default set while reporting success.
+
+**Payload size scales with what you bake.** The core+ntfy set is 9 images
+≈ 470 MB; adding immich + immich-ml + jellyfin + finance-auditor takes it to
+15 images and roughly **2.5–3 GB**, so the light `seed.iso` grows to about that
+and the repacked ISO to ~6 GB. Build with `OUT_DIR=/mnt/d/...` unless `C:` has
+room to spare (§2's disk-space gotcha, now much easier to hit).
+
 ---
 
 ## 1. ISO strategy — LIGHT path (default) vs. HEAVIER path (fallback)
@@ -414,6 +444,20 @@ docker compose -f /opt/homehub/stack/docker-compose.yml ps
   but nobody can actually complete a Google sign-in against them.
 - **No real Cloudflare DDNS** — the SIM token fails auth; `ddns` sits
   restarting (no healthcheck, doesn't gate the V3 result).
+- **A DRM node exists, but it cannot transcode.** Measured 2026-08-01, and it
+  contradicts what this repo previously assumed: Hyper-V's synthetic
+  `hyperv_drm` driver DOES create `/dev/dri`, but with **`card1` only and no
+  `renderD*` node**. So firstboot step 3c writes the QSV override here and
+  Jellyfin gets the device — while VA-API has nothing to bind to. The AWOW is
+  the opposite shape (`i915`, `/dev/dri/renderD128`, confirmed in
+  `baselines/awow/`), which is where transcoding actually works.
+  Consequence for this gate: the **no-`/dev/dri`** branch of
+  `provision-compose-overrides.sh` is NOT exercised by a Hyper-V run — it is
+  covered by that script's own direct tests instead (`RENDER_NODE=` override).
+- **No data drives** — `provision-mounts.sh` finds no fstab fragment on a sim
+  build and skips, so `MEDIA_ROOT` is a plain directory on the VM's system disk.
+  The mount-before-compose ordering (step 3b) is therefore exercised only as a
+  no-op here; the shadowing failure it prevents needs real drives to reproduce.
 
 ---
 

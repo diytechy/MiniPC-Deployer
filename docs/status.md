@@ -1997,3 +1997,214 @@ healthcheck in the stack.
 Still hardware-gated: these two aux images remain otherwise first-validated at
 V3 boot / burn-in (image *behaviour* under the real LAN_IP binds is unchanged by
 this fix).
+
+---
+
+### DRIVER — G1 — Round 1 — 2026-08-01 (TIER-2 PROMOTED TO THE HOMEHUB DEFAULT SET — SR-012)
+
+Owner's call: `immich` (+`immich-ml`), `jellyfin` and `finance-auditor` become
+the **default** opt-in set for the AWOW image, opt-out-able. Nothing is promoted
+to core here — `docker-compose.yml` still ships every tier-2 service profiled
+OFF and `.env.example` still enables none. The image's set lives in Personal's
+`config.homehub.psd1`, so the public default is untouched and disabling one is
+still a word removed from `COMPOSE_PROFILES` + `docker compose up -d
+--remove-orphans`.
+
+**Three defects the change surfaced — all latent, none introduced by it:**
+
+1. **`MEDIA_ROOT` was ratified and never wired.** D-W8/OI-7b settled it on
+   2026-07-29 (`/srv/library/NonDocs/Media`); the generator emitted
+   `media-root.txt` saying "nothing consumes this file until then", and the
+   materialised `.env` kept the template's `/srv/media` — a directory on the
+   119 GB system disk that no fstab line mounts. Every media profile would have
+   served an empty library and written photos to the wrong drive. Wired now
+   (Personal side); this closes the pathing half of **OI-7(b)**.
+
+2. **Drives mounted AFTER `docker compose up -d`** (firstboot step 5c vs step 4).
+   Docker creates a missing bind-mount source itself, on whatever filesystem is
+   present at container-start time; the ntfs3 mount then lands on top and
+   **shadows** it. The container keeps writing to an invisible directory on the
+   system disk while every read through the share sees an empty library — silent
+   until the system disk fills. Harmless while nothing bind-mounted inside
+   `/srv/library`; live the moment a media profile is on. Mounting moved to a new
+   **step 3b**, ahead of compose. The comment block at 5c already argued exactly
+   this ordering for Samba — it just had not been applied to containers.
+
+3. **`devices: /dev/dri` cannot live in a shared compose file.** A device entry
+   for an absent node fails container *creation*, and compose reports that as a
+   failed `up` for the whole run — so the file as written took the entire stack
+   down on any box without an iGPU, the V3 gate VM included. New
+   `provision-compose-overrides.sh` (**step 3c**) generates
+   `docker-compose.override.yml` with the device when `/dev/dri` exists and
+   removes it when it does not; compose auto-loads that filename, so a later
+   manual `docker compose up -d` over SSH behaves the same. It refuses to touch
+   an override lacking its generated header.
+
+**Also in this pass:**
+- `JELLYFIN_LIBRARY_DIR` — hand Jellyfin a subtree instead of the whole media
+  root (empty = whole root, the generic default). The AWOW gets
+  `NonDocs/Media/Movies` per storage-map §3 row 3; music stays Navidrome's and
+  the panel's. In-container path is always `/media`.
+- `IMMICH_ML_MEM_LIMIT` — the tier-2 banner's "or cap memory", made real. On
+  7.6 GiB usable the ML container is the one that can OOM the box; capped, the
+  kernel kills it rather than picking a victim from the core stack, and compose
+  restarts it. AWOW starts at `2g`.
+- `SIM_ENV_OVERRIDES` (`vmtest/lib/common.sh`) — lets the V3 gate boot a real
+  image's profile set without changing `.env.example` or staging real secrets.
+  Fails the build on a key that is not already a knob, so a typo cannot make the
+  gate silently test the default set and report success.
+- Docs: tier-2 caveats gained the mount-ordering rule, the case-sensitivity trap
+  (`Music` ≠ `music` on ntfs3/ext4 — docker creates an empty sibling, no error),
+  and the hardware-passthrough rule.
+
+**Verified (WSL, Docker 29.6.1 — the Engine is back on this dev PC):** all five
+new pinned tags resolve on the registry (immich-server/ML `v3.0.2`, immich
+postgres `14-vectorchord0.4.3-pgvectors0.2.0`, `valkey:9`, `jellyfin:10.10.7`);
+`docker compose config` against the real materialised homehub `.env` resolves 15
+services with the bind at `/srv/library/NonDocs/Media/Movies -> /media` read-only
+and **no** `devices:` key; the same file against `.env.example` still falls back
+to `/srv/media` with no `mem_limit`, i.e. the public default is byte-for-byte
+unchanged in behaviour. `scripts/check.sh` → PASS (config-validate,
+registry-integrity, doc-navigability).
+
+**Owner-carried risk, recorded not resolved** (Personal `open-items.md` **A17**):
+Finance-Auditor is enabled *before* its own G-Release/G-Final, and its tracker
+feed cannot authenticate on this box — D3's multi-user tracker wants an
+`X-Forwarded-User` its feed client does not send, so the daily status post is
+lost while the audit runs fine. FA carries no healthcheck *because* that post is
+its liveness signal, so this fails silently and looks healthy. Immich's photo
+store also has no `arch-` row in storage-map §4b, where absence-of-row is the
+documented way to say "not backed up".
+
+### DRIVER — G1 — Round 1 — 2026-08-01 (V3 GATE RE-RUN — booted, and it found three more)
+
+Ran the full gate against the tier-2 default set: repacked ISO (5.59 GB, 15
+baked images / 2473 MB payload), zero-keypress boot, hands-off install, first
+boot, verified over SSH. **`homehub-firstboot` → SUCCESS.**
+
+| Service | Result |
+|---|---|
+| technitium / caddy / actual / tracker | **healthy** (the four gate criteria) |
+| jellyfin | **healthy**, `/health` → 200 |
+| immich-server | **healthy**, `/api/server/ping` → 200 — but see (1) |
+| immich-db / immich-machine-learning | **healthy** |
+| ntfy / dozzle / uptime-kuma | healthy |
+| oauth2-proxy / immich-redis | Up, no healthcheck by design |
+| ddns | unhealthy — expected, SIM Cloudflare token |
+| finance-auditor | **restart loop** — see (2) and (3) |
+
+Bind path resolved to `/srv/library/NonDocs/Media/Movies -> /media` read-only;
+`IMMICH_ML_MEM_LIMIT` landed as exactly 2147483648 bytes; step 3b mounted before
+compose; step 3c wrote the override. **Memory with all 15 up: 2.4 GiB used of
+7.8, 5.3 GiB available** — the 8 GB budget holds with room, though the AWOW will
+also be serving Samba and running backups.
+
+**Three findings, none of them the thing the run was aimed at:**
+
+1. **`/dev/dri` EXISTS in Hyper-V** — `hyperv_drm` publishes `card1` (no
+   `renderD*`). This repo's compose comment asserted the opposite ("container
+   creation FAILS ... e.g. a Hyper-V test VM"). Corrected in three places. The
+   override is still right — it just means the gate VM does **not** exercise the
+   no-device branch, which is covered by direct tests instead.
+
+2. **A stale locally-built image was baked into the ISO and nothing noticed.**
+   `finance-auditor:local` in the payload was built 2026-07-11 — **19 days older
+   than its repo HEAD**, from before the A8 auto-discovery work — and crash-
+   looped on `ACTUAL_SYNC_ID is required`, a knob the current source does not
+   require. `naglight:local` was stale too (missing 75b3e3a, the `/api/feed`
+   severity colour lane), which means **the 2026-07-31 gate that PASSED was also
+   running a stale tracker.** Root cause: a `*:local` image has no registry and
+   no version in its tag, and every resolver treats "present" as "done" —
+   `ensure-local-images.sh` skips it, `export-images.sh` saves it.
+   **Fixed, and the fix took two passes.** `ensure-local-images.sh` now stamps
+   `homehub.source.revision` at build time and `export-images.sh` refuses to bake
+   an image whose stamp ≠ sibling HEAD (unstamped → loud warning, dirty tree →
+   note, `ALLOW_STALE_LOCAL=1` to override). The **first** cut compared
+   `.Created` against the sibling's HEAD date and was WRONG: a cache-identical
+   rebuild reuses the image record and keeps its original `.Created`, so a
+   just-rebuilt image still reported stale. Commit shas are exact; timestamps
+   are not. A second layer of the same bug: `export-images.sh` skipped re-saving
+   a tar that already existed — fine when the tag pins content, useless for
+   `*:local`, so those are now re-saved every run.
+
+3. **finance-auditor cannot start on a fresh box, by design, and will restart
+   forever.** With the current image the error becomes the intended one:
+   `ACTUAL_SYNC_ID is unset and the server has 0 budget files — cannot
+   auto-pick`. Auto-discovery works; there is simply nothing to discover until
+   somebody creates a budget in Actual's UI. `provision-actual.sh` sets the
+   server password but no budget. So on the real AWOW this profile will sit in
+   `restart: unless-stopped` backoff from first boot until that manual step
+   happens — visible in `compose ps` and Uptime-Kuma as a broken service.
+   Recorded, not fixed: the durable answer is FA treating "no budget yet" as
+   wait-and-retry rather than fatal.
+
+**Method note for the next session:** `Get-VMNetworkAdapter | IPAddresses` never
+reported an address for this guest — Ubuntu Server does not run the Hyper-V KVP
+daemon by default — so an automated runner must read the IP from the console
+thumbnail or scan the Default Switch subnet, not from the Hyper-V integration
+data. Verification was done over SSH from the host (WSL2 cannot route to the
+Default Switch subnet; use Windows-side `ssh`/`scp`). The `hub` account is in the
+`docker` group, so none of the verification needs `sudo`.
+
+### DRIVER — G1 — Round 1 — 2026-08-01 (BACKUP DRIVE: FALSE-GREEN CLOSED — Owner question)
+
+The Owner asked whether a disconnected **backup** drive produced a NagLight
+report, or whether the only check was "did the backup run". Answer: neither, and
+the gap was worse than unreported.
+
+There were exactly two check ids in the system — `library-mounted`
+(`samba/library-guard.sh`, `/srv/library`, on a 10-minute timer AND as `root
+preexec` on every Samba connect) and `backup` (posted by a run). The backup
+drive had **no presence check at all**: the only thing that ever looked at it was
+the 03:30 run.
+
+**And the run could not tell an absent drive from an empty directory.** The
+generated fstab uses `nofail` (mandatory — a missing USB disk must not hold up
+`local-fs.target` on a headless box), so with the drive unplugged
+`BACKUP_TARGET=/mnt/backup-drive` is an ordinary empty directory on the system
+disk. `mkdir -p "$RUN_DIR"` succeeded there, rsync copied into it, verification
+passed (the files genuinely were present), retention pruned, and step 6 posted
+**`ok=true`** — a green backup lane writing the household's backups to the 119 GB
+system disk until it filled. Grep confirmed no `mountpoint`/`findmnt`/mountinfo
+check against `BACKUP_TARGET` and no `RequiresMountsFor=` on the unit.
+
+That is the exact silent-green shape `library-guard.sh`'s own header forbids for
+the library. The guard had simply never been pointed at the second drive, while
+`Generate-FromStorageMap.ps1` emits fstab lines for both.
+
+**Fixed, in two halves:**
+- **backup.sh step 0 — target preflight.** Refuses to run unless `BACKUP_TARGET`
+  is a real mountpoint, and refuses on a `ro` mount (ntfs3's dirty-bit
+  fallback). Posts `ok=false` first, exits 1. Placed BEFORE the `mkdir`, which is
+  the whole point. NOT implemented as `RequiresMountsFor=`: systemd would refuse
+  to start the unit, so nothing would reach NagLight at all — an unreported
+  non-run is worse than a red one. Escape hatch `BACKUP_TARGET_REQUIRE_MOUNT=false`
+  for a target that is deliberately a plain directory, which then warns loudly
+  every run.
+- **`homehub-backup-drive-health.timer`** — check id `backup-drive-mounted`, the
+  twin of `library-mounted`, every 10 minutes. Reuses `library-guard.sh` via its
+  existing `--library` plus a new `--label` (so a red check names the right
+  drive); the library's own wording and check id are byte-identical to before.
+  The unit reads `BACKUP_TARGET` out of `backup.env` rather than hardcoding a
+  site path, and no-ops cleanly on an unprovisioned/sim box.
+
+**Why a 10-minute cadence is safe on a parked drive:** the only probe is
+`/proc/self/mountinfo`, a kernel pseudo-file. The answer comes from the VFS mount
+table and **no request reaches the device**, so the check cannot wake a
+spun-down disk — `df`/`stat`/`ls`/touch-tests all can, and none are used. That is
+what makes this compatible with WI-10.10's `hdparm -S` policy. Factored into
+`common.sh mount_options_for` so backup.sh and the guard share one implementation.
+
+**Verified on the running V3 VM**, not just locally: units installed and enabled,
+timer registered and firing; report **UNHEALTHY** with the path unmounted →
+**healthy** after mounting a tmpfs there → UNHEALTHY again after unmount, with
+`library-mounted` unaffected throughout; `backup.sh` preflight passes on the
+mounted path, and on the unmounted one exits **1** with nothing created under the
+target. Also unit-tested in WSL: the three preflight branches, the guard's
+label/check-id wiring, and the unit's `BACKUP_TARGET` parsing (inline comment,
+quoted value, missing file, unset key).
+
+*Method note:* the VM's Default Switch lease moved mid-session (WSL recreated its
+virtual network on a new range), so the gate VM is now at a different address —
+find it by scanning the current `vEthernet (Default Switch)` subnet for port 22
+rather than trusting a recorded IP.

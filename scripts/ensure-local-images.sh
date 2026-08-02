@@ -81,7 +81,23 @@ ensure_image() {
     if [ -d "$sibling" ]; then
         log "sibling build: $ref  <-  $sibling ${build_args[*]:+(${build_args[*]})}"
         [ "$DRY_RUN" -eq 1 ] && { log "  (dry-run: would docker build)"; return 0; }
-        docker build -t "$ref" "${build_args[@]}" "$sibling" || die "sibling build failed for $ref ($sibling)"
+        # SOURCE STAMP (2026-08-01): label the image with the commit it was built
+        # from, so vmtest/export-images.sh can refuse to bake a build older than
+        # its source. A `*:local` image has no registry and no version in its
+        # tag, so without this there is NOTHING that distinguishes a current
+        # build from one three weeks old — and the V3 gate booted exactly that.
+        # Timestamps do NOT work here: a cache-identical rebuild reuses the
+        # existing image record and keeps its original .Created, so an image that
+        # was just rebuilt still looks stale. The commit sha is exact.
+        local rev='unknown' dirty=''
+        if [ -d "$sibling/.git" ]; then
+            rev="$(git -C "$sibling" rev-parse HEAD 2>/dev/null || echo unknown)"
+            git -C "$sibling" diff --quiet HEAD 2>/dev/null || dirty='+dirty'
+        fi
+        docker build -t "$ref" \
+            --label "homehub.source.revision=${rev}${dirty}" \
+            "${build_args[@]}" "$sibling" || die "sibling build failed for $ref ($sibling)"
+        log "  stamped homehub.source.revision=${rev:0:12}${dirty}"
         return 0
     fi
 

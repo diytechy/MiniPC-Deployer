@@ -18,6 +18,7 @@ Samba fixtures in WI-10.15 (see `docs/status.md`).
 | 3 | **hash + verify + manifest** — per-file sha256 table + archive sha256 + integrity test; a recovery MANIFEST | `backup.sh` |
 | 4 | **external-drive target** — dated `run_<UTC>` snapshot with retention (`BACKUP_KEEP`) | `backup.sh` |
 | 5 | **offsite** — **legacy/optional; the target state uses no offsite step** — the IceDrive client syncs library paths directly (`OFFSITE_ENABLED=false`, Owner 2026-07-29). Kept working: `OFFSITE_PATH=/abs/dir` (local dir a sync client uploads) or `OFFSITE_UNC` (cifs push) | `backup.sh` `offsite_stage` |
+| 0 | **target preflight** — refuse to run unless `BACKUP_TARGET` is a real mountpoint (and not `ro`); posts `ok=false` and exits 1 if not. Zero disk I/O, so it never wakes a parked drive | `backup.sh` + `common.sh` `mount_options_for` |
 | 6 | **report** — POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9) | `common.sh` `feed_naglight` |
 
 ## Files
@@ -154,6 +155,30 @@ and `BACKUP_DRIVE_STANDBY` (default `241`). The `hdparm -S` encoding is
 notoriously confusing — `1..240` = value × 5 s (so `240` = 20 min) and
 `241..251` = (value − 240) × 30 min (so `241` = 30 min) — documented in
 `common.sh` and `backup.env.example`.
+
+### The target must be a mountpoint (step 0, added 2026-08-01)
+
+`nofail` in the generated fstab is mandatory — a missing USB disk must not hold
+up `local-fs.target` and drop a headless box to an emergency shell. Its cost is
+that an **unplugged backup drive leaves `BACKUP_TARGET` as an ordinary empty
+directory on the system disk**. Before step 0 existed, a run in that state
+created its dated folder there, copied into it, verified it (the files really
+were present), pruned old runs, and posted **`ok=true`** — a green lane writing
+the household's backups to the wrong disk until that disk filled.
+
+Step 0 refuses instead, and reports `ok=false`. Deliberately NOT done as
+`RequiresMountsFor=` on the unit: systemd would refuse to *start* the service, so
+**nothing** would reach NagLight — an unreported non-run, which is worse than a
+red one. Escape hatch for a target that is legitimately a plain directory:
+`BACKUP_TARGET_REQUIRE_MOUNT=false` (the run then warns loudly every time).
+
+The presence of the drive is *also* now watched independently of the run, by
+`homehub-backup-drive-health.timer` every 10 minutes — check id
+**`backup-drive-mounted`**, the backup-drive twin of `library-mounted`. Both use
+`samba/library-guard.sh`, whose only probe is `/proc/self/mountinfo`: the answer
+comes from the kernel's mount table and **no request ever reaches the device**,
+so a 10-minute cadence cannot fight the spin-down policy below. Before this, an
+absent backup drive was invisible until 03:30 the next morning.
 
 **Power management NEVER fails a backup:** a missing `hdparm`, an absent device
 path, or an enclosure that rejects the command is logged as a WARNING and skipped.

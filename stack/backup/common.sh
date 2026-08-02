@@ -445,6 +445,28 @@ drive_standby_set() {
     return 0
 }
 
+# ── mount presence (zero disk I/O — safe on a spun-down drive) ────────────────
+# mount_options_for PATH : echo PATH's mount options, or nothing if PATH is not
+# a mountpoint. Nonzero when it is not mounted.
+#
+# WHY IT READS /proc/self/mountinfo AND NOTHING ELSE: the backup drive is
+# deliberately parked (hdparm -S, WI-10.10), and the whole point of that policy
+# is that a 3.5" platter drive is not woken to answer questions. mountinfo is a
+# kernel-generated pseudo-file — the answer comes from the VFS mount table, with
+# no request ever reaching the device. `df`, `stat`, `ls` and a touch-test all
+# CAN reach the platters; none of them are used here. That makes this check
+# cheap enough to run every 10 minutes against a sleeping drive, forever.
+#
+# Same parsing as samba/library-guard.sh (mountinfo field 5 = mountpoint,
+# field 6 = options; last match wins because a path can be mounted over).
+mount_options_for() {
+    local path="$1" opts
+    [ -r /proc/self/mountinfo ] || return 2
+    opts="$(awk -v p="$path" '$5 == p { o = $6 } END { print o }' /proc/self/mountinfo)"
+    [ -n "$opts" ] || return 1
+    printf '%s' "$opts"
+}
+
 # ── NagLight /api/feed reporting (step 6) — never-silent-green ────────────────
 # feed_naglight OK NOTE : POST {check,ok,note}. ok=false on ANY failure so a
 # broken backup is never a silent green. Uses the multi-user trust model (direct

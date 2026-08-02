@@ -71,6 +71,51 @@ ZL="${BACKUP_ZSTD_LEVEL:-10}"
 read -r -a BACKUP_DRIVES <<< "${BACKUP_DRIVE_DEVICES:-}" || true
 STANDBY_VALUE="${BACKUP_DRIVE_STANDBY:-241}"
 
+# ── 0. TARGET PREFLIGHT — the drive must actually be there ───────────────────
+# THIS MUST RUN BEFORE THE mkdir BELOW, and that ordering is the entire point.
+#
+# The failure it prevents (found 2026-08-01): the generated fstab mounts the
+# backup drive with `nofail` — mandatory, or a missing USB disk holds up
+# local-fs.target and a headless box drops to an emergency shell. The cost is
+# that with the drive unplugged, $BACKUP_TARGET is still a perfectly good empty
+# DIRECTORY on the system disk. `mkdir -p "$RUN_DIR"` then succeeds, rsync
+# copies into it, verification passes (the files really are there), retention
+# prunes happily, and step 6 posts **ok=true**. A green backup lane, onto the
+# 119 GB system disk, until it fills.
+#
+# That is the same silent-green shape samba/library-guard.sh was written to
+# forbid on the library drive; the guard simply never got pointed at this one.
+#
+# NOT done as `RequiresMountsFor=` on the unit, deliberately: systemd would
+# refuse to START the service, which means NO report reaches NagLight at all —
+# an unreported non-run, which is the failure mode this project cares most about.
+# Failing HERE posts ok=false through the normal never-silent-green path.
+#
+# Zero disk I/O (mount_options_for reads /proc/self/mountinfo), so this is safe
+# against a spun-down drive and never wakes it just to check.
+if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
+    if target_opts="$(mount_options_for "$BACKUP_TARGET")"; then
+        case ",$target_opts," in
+            *,ro,*)
+                # ntfs3 falls back to read-only on a dirty NTFS bit (Windows Fast
+                # Startup, unclean eject). Reads look fine, every write fails.
+                feed_naglight false "backup target $BACKUP_TARGET is mounted READ-ONLY — refusing to run (NTFS dirty bit? clear it from Windows)"
+                die "backup target $BACKUP_TARGET is mounted READ-ONLY — refusing to run. Nothing was written." ;;
+        esac
+        log "target preflight: $BACKUP_TARGET is a real mountpoint (rw)"
+    else
+        feed_naglight false "backup target $BACKUP_TARGET is NOT MOUNTED — the backup drive is absent or failed to mount; refusing to run so nothing lands on the system disk"
+        die "backup target $BACKUP_TARGET is NOT MOUNTED — the backup drive is absent or failed to mount." \
+            "Refusing to run: with nofail in fstab this path is an empty directory on the SYSTEM disk," \
+            "so a run would look green while writing the household's backups to the wrong drive." \
+            "Check the drive is plugged in and powered, then: systemctl start homehub-backup.service" \
+            "(Backing up to a plain directory on purpose? Set BACKUP_TARGET_REQUIRE_MOUNT=false in backup.env.)"
+    fi
+else
+    warn "BACKUP_TARGET_REQUIRE_MOUNT=false — not checking that $BACKUP_TARGET is a mountpoint."
+    warn "  A missing drive will be backed up to the system disk and reported GREEN."
+fi
+
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 RUN_DIR="$BACKUP_TARGET/run_$RUN_TS"
 MANIFEST="$RUN_DIR/MANIFEST.tsv"

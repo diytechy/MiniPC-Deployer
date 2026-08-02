@@ -26,6 +26,11 @@ set -uo pipefail
 
 LIBRARY_ROOT="${LIBRARY_ROOT:-/srv/library}"
 ENV_FILE="${ENV_FILE:-/etc/homehub-backup/backup.env}"
+# What to call this drive in messages. The guard serves TWO drives now (A21,
+# 2026-08-01): the library, and the backup target — same zero-I/O check, and
+# the wording has to name the right one or a red check sends you to the wrong
+# cupboard. Default keeps every existing message byte-identical.
+DRIVE_LABEL="${DRIVE_LABEL:-library}"
 MODE="--check"
 SHARE=""
 while [ $# -gt 0 ]; do
@@ -33,6 +38,7 @@ while [ $# -gt 0 ]; do
         --check)   MODE="--check";  shift; [ $# -gt 0 ] && { SHARE="$1"; shift; } ;;
         --report)  MODE="--report"; shift ;;
         --library) LIBRARY_ROOT="$2"; shift 2 ;;
+        --label)   DRIVE_LABEL="$2";  shift 2 ;;
         *) shift ;;
     esac
 done
@@ -58,7 +64,7 @@ else
     # Last match wins: a path can be mounted over more than once.
     mnt_opts="$(awk -v p="$LIBRARY_ROOT" '$5 == p { o = $6 } END { print o }' "$mountinfo")"
     if [ -z "$mnt_opts" ]; then
-        fail_reason="$LIBRARY_ROOT is NOT MOUNTED — the library drive is absent or failed to mount"
+        fail_reason="$LIBRARY_ROOT is NOT MOUNTED — the $DRIVE_LABEL drive is absent or failed to mount"
     else
         case ",$mnt_opts," in
             *,ro,*)

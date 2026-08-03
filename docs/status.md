@@ -2571,3 +2571,81 @@ changing it untested in a wall session is exactly what AGENTS.md warns against):
 absent. On the light path a PRODUCTION hub would therefore install **none** of
 its real secrets and come up on `.env.example` values — silently. Same one-line
 shape of fix; needs a hub install to verify.
+
+### DRIVER — G1 — Round 1 — 2026-08-03 (§2's GATE CRITERION MET — and three more defects only a real panel could show)
+
+**`journalctl -t wall-kiosk` shows `starting: cage -- /opt/wall-panel/app/wall-shell`.**
+That is §2's stated bar, on a real boot, from an image built by the tracked
+scripts. The panel does not yet render anything, which is §3's gate, not this
+one — but getting here found three defects that no amount of container testing
+could have.
+
+**Proven on the panel, in addition to yesterday's list:**
+
+- the payload fix works — `/opt/wall-panel/` carries the repo, `site/wall.env`
+  and `wall-app/`, and the **SIM `wall.env` landed** (not the example);
+- the artifact installed: `-rwxr-xr-x root root app/wall-shell`, and
+  **`chrome-sandbox` is still `4755 root:root`** after NTFS → ISO → tar → ext4;
+- `wall-firstboot` reports **`IF-005: ldd resolves every library the Electron
+  runtime needs`** — the package list is sufficient on the real machine;
+- tty1 autologin works and the kiosk starts on the **first** boot (the
+  `getty@tty1` restart fix), captured from `/dev/fb0`;
+- the wrapper picks Wayland from a real `WAYLAND_DISPLAY=wayland-0`, and bridges
+  `MEDIA_CACHE_DIR` from `WALL_MEDIA_CACHE`;
+- Electron runs and reaches `net::ERR_NAME_NOT_RESOLVED` for
+  `wall.vmtest.sim.invalid` — **the correct failure**: that host is deliberately
+  unresolvable and there is no hub yet.
+
+**Defect 1 — THE FAILURE SCREENS NEVER RENDERED.** Both of them, for the whole
+life of `wall-kiosk.sh`. They ran `cage -- /bin/sh -c 'printf …'`, and `cage`
+displays exactly one **Wayland client**; a shell running `printf` is not one. It
+writes to stdout, cage shows an empty surface, and because cage does the KMS
+modeset it *also hides the text console underneath*. Measured both ways — `grim`
+inside the session and Hyper-V's thumbnail — uniform black while the message sat
+in the journal. **So "a dead panel must be a visible event, not silence" was
+false in both directions**, and the crash-loop screen added earlier the same day
+inherited the bug. It survived testing because a stand-in `cage` that simply
+execs its client makes the text appear on stdout and everything look right; it
+needed a compositor to expose. Fixed without any new package —
+`wall-kiosk.sh` **is** the tty1 session leader, so its stdout is the console, and
+with no compositor running the console is what the panel scans out. **Verified by
+capturing `/dev/fb0`: the NOT INSTALLED screen renders, clean and readable, for
+the first time ever.**
+
+**Defect 2 — the kiosk could not read its own configuration.**
+`/etc/wall-panel/wall.env` is `0600 root:root` (it holds the Wi-Fi PSK); the
+kiosk runs as `panel`. `load_env_file` treats unreadable exactly like absent, so
+it read **nothing** and every value fell back to a default: the panel logged
+`PANEL_URL=https://:8443/` — an empty `WALL_HOST` — and silently dropped the
+flags configured in `WALL_APP_CMD`. **On real hardware that is a panel that can
+never reach its hub, with nothing anywhere saying why.** Not fixed by loosening
+`wall.env`: `wall-firstboot.sh` now renders the four non-secret knobs into
+`/etc/wall-panel/kiosk.env` (0644) and the PSK stays exactly where it was.
+
+**Defect 3 — `cage` refuses to start without a GPU.** wlroots requires
+`WLR_RENDERER_ALLOW_SOFTWARE=1` when EGL lands on llvmpipe:
+`[render/egl.c:320] Software rendering detected`. Hyper-V's `hyperv_drm` gives
+`/dev/dri/card1` and **no `renderD*`**, so this is every VM. Set **only** when
+there is genuinely no render node — a panel whose iGPU regressed must still fail
+loudly rather than quietly cook itself on CPU rendering inside a sealed wall
+mount (quirk 6).
+
+**How to see the panel's screen — §3 needs this and the plan's method is
+incomplete.** Three capture routes, and they do not show the same thing:
+
+| route | shows | needs |
+|---|---|---|
+| Hyper-V thumbnail (RGB565 → PNG) | whatever is scanned out, incl. a cage session | **elevation**; VM only |
+| `/dev/fb0` (dd + convert) | the **text console** — invisible once cage takes over KMS | ssh + sudo |
+| **`grim`** (wlr-screencopy, now installed) | **what cage is actually showing** | ssh + the session's `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY` |
+
+On **real hardware there is no thumbnail API at all**, so `grim` is the only
+route that works on the panel itself:
+`sudo -u panel env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 grim /tmp/panel.png`
+
+**NOT PROVEN: the shell has never painted anything.** It starts, runs, and
+correctly fails to resolve its origin. Nothing has rendered the tracker's UI on
+a panel, and it cannot until a hub serves the kiosk site — that is A19/§3. Also
+still unproven: the fixes above are verified **on the running VM** (scripts
+pushed and re-run); a clean rebuild proving the IMAGE delivers them has not been
+done.

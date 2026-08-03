@@ -29,16 +29,24 @@ last) — it is the record, not required reading for every pass.
       [vmtest/README.md](../vmtest/README.md). **The HUB half is DONE** — the
       gate ran 2026-07-31 and again 2026-08-01 (see the audit entries; the
       first one PASSED while running a three-week-stale tracker image).
-    - OI-17 — **Boot the WALL ISO** (2026-08-02, new): `build-wall-seed.sh`
-      produces `vmtest/.out-wall/wall-seed.iso` and nobody has booted it →
-      [vmtest/README.md §11](../vmtest/README.md). The bar is
-      `journalctl -t wall-kiosk` showing `starting: cage -- …` rather than the
-      NOT INSTALLED screen. What is verified is the FLOOR, and only that:
-      `vmtest/test-wall-artifact.sh` installs the image's own package list into
-      a bare `ubuntu:24.04`, unpacks the artifact as root, and shows `ldd`
-      resolving and Electron reaching Ozone init. **Nothing above that has ever
-      run** — not Subiquity, not `apt` on a real system, not the late-commands
-      under curtin, not `getty@tty1`, not `cage`. The gate is the whole point.
+    - OI-17 — **Boot the WALL ISO** (2026-08-02; ATTEMPTED 2026-08-03):
+      the ISO was booted for the first time and got as far as `late-command_9`
+      before dying on the light path's missing payload (see that day's entry —
+      it was a real defect in BOTH images, now fixed). **Subiquity, the disk
+      pin and all 40 packages including the 23 Electron libraries are now
+      PROVEN on a real install.** What is still unproven is everything after
+      the late-commands: `wall-firstboot`, `getty@tty1`, `cage`, and whether
+      the shell paints. A repacked (zero-keypress) wall ISO is built at
+      `D:\vmtest-out-wall\wall-repacked.iso` and `Wall-VMTest` exists; the
+      re-run needs **one elevated approval** →
+      [vmtest/README.md §11](../vmtest/README.md).
+    - OI-19 — **The hub's site-staging late-command has the same `/cdrom`
+      bug** (2026-08-03, new): it reads `/cdrom/deploy-payload/site` and
+      `exit 0`s when absent, so a PRODUCTION hub built on the LIGHT path
+      installs **none** of its real secrets and comes up on `.env.example`
+      values, silently. The payload-copy instance of this bug is fixed; this
+      one is not, because verifying it needs a hub install and it was found
+      during a wall session. Same one-line shape of fix.
     - OI-18 — **The wall production seam has one missing input**
       (2026-08-02, new): `WALL_SITE_DIR` now builds a real panel image from
       Personal's `Materialize-Deploy.ps1 -Image wall` output, behind five
@@ -2480,3 +2488,75 @@ There is no production path for a wall image: `WALL_SITE_DIR` is refused because
 half a production build — real secrets on a sim-substituted `user-data` — is the
 silent downgrade the hub's guards exist to prevent. A real panel is still imaged
 by hand.
+
+### DRIVER — G1 — Round 1 — 2026-08-03 (THE WALL ISO WAS BOOTED, AND IT FOUND A REAL ONE)
+
+**First boot of the wall image, ever.** It did not reach the kiosk. It found a
+defect that had been latent in **both** images since the light path existed, and
+that is worth more than a pass would have been.
+
+**What the boot proved** (all of it new — nothing above the build had ever run):
+
+1. **Subiquity accepts the sim `user-data`.** No parse error, no interactive
+   drop-out; the repacked path booted hands-off and the light path needed only
+   the documented single GRUB keypress.
+2. **The disk pin works in the direction it must.** Subiquity partitioned
+   `lvm_volgroup-0` on the *virtual* disk — `model: Virtual_Disk` matched exactly
+   what it is meant to match and nothing else.
+3. **THE PACKAGE LIST IS REAL.** All 40 `packages:` entries installed on noble,
+   including every one of the 23 Electron runtime libraries and all six `t64`
+   renames (`libasound2t64`, `libatk1.0-0t64`, `libatk-bridge2.0-0t64`,
+   `libatspi2.0-0t64`, `libcups2t64`, `libglib2.0-0t64`). The static check said
+   they were declared; apt has now said they exist.
+4. **Cost, for §3's planning:** Subiquity installs each `packages:` entry as its
+   own `curtin system-install`, so the 23 extra libraries add roughly 20 minutes.
+   A wall install is ~45-60 minutes, not the hub's ~20.
+
+**What it found.** The install died at `late-command_9` — the **pre-existing**
+"seed `wall.env` from the example" step — unable to read `wall.env.example` out
+of a payload that was not there:
+
+> **`/cdrom` is not the seed.** On the REPACKED path `/cdrom` is the combined
+> ISO and carries `/deploy-payload`. On the **LIGHT** path — *the one this repo
+> recommends by default* — `/cdrom` is the STOCK Ubuntu ISO, which has no such
+> directory, and the CIDATA seed that does is mounted only transiently by
+> cloud-init to read `user-data`. The payload rode along and **nothing ever read
+> it.**
+
+Every V3 gate has used the repacked ISO (2026-08-01: *"repacked ISO (5.59 GB)"*),
+so the hub never exercised the light path's payload — and could not have
+noticed if it had: `firstboot.sh` logs *"no baked image payload found"* and pulls
+from registries instead, which reads as a slow first boot rather than a bug.
+**~470 MB of baked container images have been going along for the ride unused.**
+The wall cannot degrade that way — its units, its scripts and `wall.env.example`
+all live in the payload — so it crashed, four commands downstream of the cause,
+naming none of it.
+
+**Diagnosed without a shell**, because Hyper-V needs elevation and none was
+available: the installer's `command_N` numbering aligns exactly with the
+`late-commands` list, so `command_9` is identifiable as the `wall.env.example`
+step, and *both* halves of its `||` are explained only by a missing payload.
+
+**Fixed.** Both images now try `/cdrom`, `/media`, `/run/media/*`, then mount the
+CIDATA volume **by label**. The wall FAILS LOUDLY when none of that works; the
+hub keeps its documented degraded mode but says so instead of `|| true`. All
+three branches were exercised against fakes before rebuilding.
+`build-repacked-iso.sh` also gained `--target wall`, so the wall gets the
+zero-keypress path — and there `/deploy-payload` is simply present, which is the
+branch that has actually been exercised. The repacked wall ISO is built (3.3 GB,
+BIOS+UEFI intact, `/nocloud` + `/deploy-payload/wall-app/` verified present).
+
+**STILL NOT PROVEN — the fixed image has not been booted.** `cage` has still
+never started, the shell has never painted, and the crash-loop screen and the
+`journalctl -t wall-kiosk` tag have still only been exercised against a fake
+`cage` in a container. The VM is created and one UAC approval away; OI-17 stays
+open, and it is now a *narrower* gap than it was this morning rather than a
+closed one.
+
+**A third instance of the same bug, NOT fixed** (hub production path, and
+changing it untested in a wall session is exactly what AGENTS.md warns against):
+`stack/autoinstall/user-data`'s **site-staging** late-command reads
+`/cdrom/deploy-payload/site` with the same assumption and `exit 0`s when it is
+absent. On the light path a PRODUCTION hub would therefore install **none** of
+its real secrets and come up on `.env.example` values — silently. Same one-line
+shape of fix; needs a hub install to verify.

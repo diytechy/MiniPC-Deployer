@@ -189,6 +189,53 @@ bash "$STACK_DIR/provision/provision-mounts.sh" || \
 bash "$STACK_DIR/provision/provision-compose-overrides.sh" || \
     log "WARN: compose override generation failed — Jellyfin (if enabled) runs without QSV"
 
+# ── 3d. unpack the wall kiosk site's document root (IF-005 / PKG-1) ──────────
+# `stack/wall-shell/` is empty in the repo by design — the "no product source"
+# constraint — but caddy bind-mounts it read-only as /srv/wall-shell and serves
+# it as the {$WALL_HOST}:{$WALL_PORT} site's document root (SR-016). The panel's
+# renderer therefore has to ARRIVE, the way naglight:local does: as a built
+# artifact in the payload.
+#
+# BEFORE compose up, deliberately. The mount is read-only from caddy's side, so
+# unpacking afterwards would work — but a caddy that starts against an empty
+# docroot serves 404 at / for however long that takes, and "the panel showed
+# nothing" is a symptom with too many possible causes to want an extra one.
+#
+# Absent is FINE and expected on a public checkout (OfficeWallNaglight is
+# private): the site then serves 404 at / while /api/* works, which is the
+# documented half-built state. It is NOT fine for the A19 panel gate, so say so.
+WALL_SITE_TARBALL=""
+shopt -s nullglob
+for cand in /opt/homehub/wall-site "$STACK_DIR/wall-site" /cdrom/deploy-payload/wall-site; do
+    if [ -z "$WALL_SITE_TARBALL" ]; then
+        for t in "$cand"/officewall-site-*.tar.gz; do WALL_SITE_TARBALL="$t"; break; done
+    fi
+done
+shopt -u nullglob
+if [ -n "$WALL_SITE_TARBALL" ]; then
+    # --strip-components=1 drops the archive's leading site/ (packaging.md §4).
+    log "unpacking the wall kiosk site: $(basename "$WALL_SITE_TARBALL") -> $STACK_DIR/wall-shell/"
+    install -d -m 0755 "$STACK_DIR/wall-shell"
+    if tar -xzf "$WALL_SITE_TARBALL" -C "$STACK_DIR/wall-shell" --strip-components=1; then
+        [ -f "$STACK_DIR/wall-shell/index.html" ] || \
+            log "WARN: the site payload unpacked but has no index.html — the kiosk site will 404 at /"
+        if [ -f "$STACK_DIR/wall-shell/build-info.json" ]; then
+            # The stamp both halves share: a hub and a panel whose revisions
+            # differ are a mismatched deploy (packaging.md §2.1), and this is
+            # the line that makes that visible instead of invisible.
+            log "  wall site build: $(sed -n 's/.*"revision"[^"]*"\([0-9a-f]\{12\}\).*/\1/p' "$STACK_DIR/wall-shell/build-info.json" | head -n1)"
+        fi
+    else
+        log "WARN: could not unpack $WALL_SITE_TARBALL — the kiosk site keeps serving 404 at /"
+    fi
+else
+    log "NOTICE: no wall kiosk site payload found (looked in /opt/homehub/wall-site,"
+    log "  $STACK_DIR/wall-site, /cdrom/deploy-payload/wall-site). The {\$WALL_HOST} site"
+    log "  will serve 404 at / while its /api/* proxy works — the documented half-built"
+    log "  state on a checkout without OfficeWallNaglight. A wall PANEL pointed at this"
+    log "  hub would render nothing, so the A19 gate needs an image built WITH it."
+fi
+
 # ── 4. bring the stack up ────────────────────────────────────────────────────
 # Images were loaded from the payload in step 3 (Q10.9 B+). compose finds each
 # pinned tag locally and starts it without a pull; anything NOT baked (or a

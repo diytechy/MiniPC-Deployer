@@ -122,6 +122,41 @@ autoinstall:
     - vainfo
     - unattended-upgrades  # same hands-off patching posture as the AWOW
     - openssh-server
+    # ---- the Electron runtime's shared libraries (IF-005 / PKG-1) -----------
+    # The shell artifact ships its own Electron binary but NOT the ~24 system
+    # libraries it links against — those are the image's job. Every name below
+    # is derived from the shipped binary's own DT_NEEDED list and is enforced:
+    # ./electron-runtime-deps.tsv maps soname -> package, and the wall builder
+    # (vmtest/lib/common.sh assert_electron_runtime_deps) refuses to bake an
+    # artifact whose dependencies are not all covered here. Do not prune this
+    # list by eye — a missing library is a BLACK WALL, not an error message:
+    # Electron exits before painting, wall-kiosk.sh restarts it every 3 s, and
+    # `[ -x ]` stays true so the NOT INSTALLED screen never fires either.
+    # The `t64` suffixes are 24.04's 64-bit-time_t renames; the old names do
+    # not exist in noble and apt would fail the install outright.
+    - libx11-6
+    - libxcomposite1
+    - libxdamage1
+    - libxext6
+    - libxfixes3
+    - libxrandr2
+    - libasound2t64
+    - libatk1.0-0t64
+    - libatk-bridge2.0-0t64
+    - libatspi2.0-0t64
+    - libcairo2
+    - libcups2t64
+    - libdbus-1-3
+    - libexpat1
+    - libgbm1
+    - libglib2.0-0t64
+    - libgtk-3-0t64
+    - libnspr4
+    - libnss3
+    - libpango-1.0-0
+    - libudev1
+    - libxcb1
+    - libxkbcommon0
 
   late-commands:
     # ---- 1. Remote management (lighter than the AWOW's: no Cockpit) -----------
@@ -143,6 +178,52 @@ autoinstall:
     # /opt/wall-panel/stack/autoinstall/wall/.
     - mkdir -p /target/opt/wall-panel
     - cp -a /cdrom/deploy-payload/. /target/opt/wall-panel/ 2>/dev/null || cp -a /media/deploy-payload/. /target/opt/wall-panel/ 2>/dev/null || true
+
+    # ---- 3b. Unpack the shell artifact (IF-005 / PKG-1) ----------------------
+    # The payload carries OfficeWallNaglight's panel tarball at
+    # /opt/wall-panel/wall-app/officewall-shell-*-linux-x64.tar.gz (staged by
+    # vmtest/lib/common.sh stage_wall_shell_into_payload). Unpacking it here
+    # produces /opt/wall-panel/app/, so WALL_APP_CMD=/opt/wall-panel/app/wall-shell
+    # is executable and cage runs THE app instead of the "NOT INSTALLED" screen.
+    #
+    # `tar`, AS ROOT, IS NOT A FORMALITY — and it is why this is a tar and not a
+    # directory in the payload. app/runtime/chrome-sandbox must arrive
+    # root:root 4755: Ubuntu 24.04 sets
+    # kernel.apparmor_restrict_unprivileged_userns=1, which closes the namespace
+    # sandbox, so the SUID helper is Electron's only remaining route and it
+    # refuses to start without it. A `cp`, an unzip or an rsync from an unpacked
+    # tree drops the bit silently; tar carries mode+uid+gid inside the archive.
+    # This runs in the INSTALLER (root, /target mounted), not in-target, because
+    # the archive is a whole self-contained runtime and needs no chroot.
+    #
+    # ABSENT IS TOLERATED, BROKEN IS NOT. A real-hardware image may legitimately
+    # be built without the artifact (the panel then shows the explicit
+    # NOT INSTALLED screen — a visible event, by design). But a tarball that is
+    # present and fails to unpack must kill the install: the alternative is a
+    # panel that crash-loops silently, which is the one failure mode with no
+    # symptom on the screen at all.
+    - >-
+      bash -c 'set -e;
+      t=$(ls -1 /target/opt/wall-panel/wall-app/officewall-shell-*-linux-x64.tar.gz 2>/dev/null | head -n1);
+      if [ -z "$t" ]; then echo "wall: no shell artifact in the payload - the panel will show the NOT INSTALLED screen"; exit 0; fi;
+      echo "wall: unpacking $t into /target/opt/wall-panel";
+      tar -xzf "$t" -C /target/opt/wall-panel;
+      [ -x /target/opt/wall-panel/app/wall-shell ] || { echo "wall: FATAL - unpacked but app/wall-shell is not executable"; exit 1; };
+      [ -u /target/opt/wall-panel/app/runtime/chrome-sandbox ] || { echo "wall: FATAL - chrome-sandbox lost its setuid bit; Electron will refuse to start"; exit 1; };
+      echo "wall: shell installed - $(cat /target/opt/wall-panel/app/VERSION 2>/dev/null)"'
+
+    # ---- 4a. Install a pre-filled wall.env if the payload carries one --------
+    # The PRODUCTION/SIM seam, same shape as the hub image's site/ directory:
+    # a build that materialised the panel's config puts it at
+    # deploy-payload/site/wall.env and it lands here 0600. The wall builder
+    # writes a SIM one (vmtest/lib/common.sh render_sim_wall_env); nothing
+    # emits a production one yet, and the builder refuses to pretend otherwise.
+    # Step 4 below then no-ops, because the file already exists.
+    # `install -m 0600` and not `cp`: the payload copy's mode comes from whatever
+    # filesystem the ISO was staged on, and a build run under WSL on /mnt/c
+    # produces 0777 — the file carries the Wi-Fi PSK. The payload copy is
+    # tightened for the same reason.
+    - curtin in-target --target=/target -- bash -c '[ -f /opt/wall-panel/site/wall.env ] && { install -d -m 0755 /etc/wall-panel && install -m 0600 /opt/wall-panel/site/wall.env /etc/wall-panel/wall.env && chmod 0600 /opt/wall-panel/site/wall.env; } || true'
 
     # ---- 4. Seed wall.env from the example if not pre-filled ------------------
     # Root-only: it carries the Wi-Fi PSK and (if enabled) music credentials.

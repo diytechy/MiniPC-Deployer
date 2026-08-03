@@ -1,0 +1,67 @@
+# electron-runtime-deps.tsv — every shared library the OfficeWallNaglight shell
+# artifact's Electron binary loads, and where the wall image gets it from.
+#
+# WHY THIS FILE EXISTS. A missing shared library is a BLACK WALL: Electron exits
+# before it paints, `wall-kiosk.sh` restarts it every 3 s, and `[ -x ]` is still
+# true so the "NOT INSTALLED" screen never fires either. The only diagnosis is
+# `ldd /opt/wall-panel/app/runtime/electron | grep 'not found'`, on the panel,
+# after someone has walked over to it. Measured 2026-08-02 on a correct install
+# with none of these packages present: Electron stops at
+# "libnspr4.so: cannot open shared object file". The list is load-bearing, not
+# precautionary.
+#
+# HOW IT IS ENFORCED. vmtest/lib/common.sh's assert_electron_runtime_deps reads
+# the DT_NEEDED list out of the binary that is about to be baked, and refuses to
+# build if any soname is missing from this table, or if any `image-packages` row
+# names a package the wall user-data does not install. So an Electron bump that
+# adds a dependency fails the BUILD, with the soname named — it cannot reach the
+# wall as a dark screen.
+#
+# COLUMNS (tab-separated):
+#   1  soname          exactly as DT_NEEDED spells it
+#   2  package         the Ubuntu 24.04 (noble) package that provides it
+#   3  where           image-packages = must be in wall/user-data's packages:
+#                      base           = in the base system, never listed
+#                      bundled        = ships inside the artifact itself
+#
+# Package names verified against the noble archive 2026-08-02 (`apt-cache
+# policy`); the soname -> package mapping was resolved with `dpkg -S`, not
+# guessed. Note the `t64` suffixes: 24.04's 64-bit-time_t transition renamed
+# libasound2, libatk*, libatspi, libcups and libglib, and the OLD names do not
+# exist — an install would die at apt with "unable to locate package".
+#
+soname	package	where
+ld-linux-x86-64.so.2	libc6	base
+libc.so.6	libc6	base
+libdl.so.2	libc6	base
+libm.so.6	libc6	base
+libpthread.so.0	libc6	base
+libgcc_s.so.1	libgcc-s1	base
+libffmpeg.so	(shipped in app/runtime/)	bundled
+libX11.so.6	libx11-6	image-packages
+libXcomposite.so.1	libxcomposite1	image-packages
+libXdamage.so.1	libxdamage1	image-packages
+libXext.so.6	libxext6	image-packages
+libXfixes.so.3	libxfixes3	image-packages
+libXrandr.so.2	libxrandr2	image-packages
+libasound.so.2	libasound2t64	image-packages
+libatk-1.0.so.0	libatk1.0-0t64	image-packages
+libatk-bridge-2.0.so.0	libatk-bridge2.0-0t64	image-packages
+libatspi.so.0	libatspi2.0-0t64	image-packages
+libcairo.so.2	libcairo2	image-packages
+libcups.so.2	libcups2t64	image-packages
+libdbus-1.so.3	libdbus-1-3	image-packages
+libexpat.so.1	libexpat1	image-packages
+libgbm.so.1	libgbm1	image-packages
+libgio-2.0.so.0	libglib2.0-0t64	image-packages
+libglib-2.0.so.0	libglib2.0-0t64	image-packages
+libgobject-2.0.so.0	libglib2.0-0t64	image-packages
+libgtk-3.so.0	libgtk-3-0t64	image-packages
+libnspr4.so	libnspr4	image-packages
+libnss3.so	libnss3	image-packages
+libnssutil3.so	libnss3	image-packages
+libpango-1.0.so.0	libpango-1.0-0	image-packages
+libsmime3.so	libnss3	image-packages
+libudev.so.1	libudev1	image-packages
+libxcb.so.1	libxcb1	image-packages
+libxkbcommon.so.0	libxkbcommon0	image-packages

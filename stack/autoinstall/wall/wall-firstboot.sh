@@ -309,6 +309,55 @@ case "${MEDIA_SHARE_UNC:-}" in
         ;;
 esac
 
+# ── 8b. IF-005 — is the shell artifact actually there, and can it load? ──────
+# The autoinstall unpacks the artifact (user-data late-command 3b); this reports
+# whether it worked, on the ONE boot where somebody is watching the journal.
+#
+# Two failures, and only one of them is visible from across the office:
+#   - NOT INSTALLED — `[ -x ]` is false, wall-kiosk.sh paints the explicit
+#     refusal screen. Loud by design.
+#   - INSTALLED BUT DYING — `[ -x ]` is true, so no refusal screen; Electron
+#     exits at load time and cage restarts it every 3 s behind a black
+#     rectangle. The overwhelmingly likely cause is a missing shared library,
+#     and `ldd` is the only thing that says so. Run it here, once, while the
+#     answer is still in the journal next to everything else.
+# `:-` first: wall.env may not declare WALL_APP_CMD at all and this script runs
+# under `set -u`. `%% *` then drops any flags (the sim appends --disable-gpu),
+# exactly as wall-kiosk.sh's own `[ -x "${WALL_APP_CMD%% *}" ]` does.
+APP_BIN="${WALL_APP_CMD:-}"
+APP_BIN="${APP_BIN%% *}"
+: "${APP_BIN:=/opt/wall-panel/app/wall-shell}"
+if [ -x "$APP_BIN" ]; then
+    log "IF-005: shell artifact present at $APP_BIN"
+    [ -r "$(dirname "$APP_BIN")/VERSION" ] && \
+        log "IF-005: build = $(cat "$(dirname "$APP_BIN")/VERSION")"
+    ELECTRON_BIN="$(dirname "$APP_BIN")/runtime/electron"
+    if [ -x "$ELECTRON_BIN" ] && command -v ldd >/dev/null 2>&1; then
+        MISSING="$(ldd "$ELECTRON_BIN" 2>/dev/null | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')"
+        if [ -n "$MISSING" ]; then
+            warn "IF-005: the Electron runtime is MISSING shared libraries: $MISSING"
+            warn "The panel will show a BLACK screen, not the NOT INSTALLED screen — cage"
+            warn "restarts a client that dies at load time, forever, with no message."
+            warn "Fix: apt-get install the packages naming those sonames, then reboot."
+            warn "The image's declared set is in"
+            warn "  $PAYLOAD/electron-runtime-deps.tsv"
+            warn "and every name there should already be in the image; a NEW one means the"
+            warn "artifact was rebuilt against a newer Electron than this image was wired for."
+        else
+            log "IF-005: ldd resolves every library the Electron runtime needs"
+        fi
+    else
+        warn "IF-005: could not run ldd against $ELECTRON_BIN — the runtime layout is not"
+        warn "what packaging.md §4 describes, or ldd is absent. The library check did NOT run."
+    fi
+else
+    warn "IF-005: NO shell artifact at $APP_BIN."
+    warn "The panel will show the explicit 'NOT INSTALLED' screen — which is correct"
+    warn "behaviour, not a crash. The image was built without the OfficeWallNaglight"
+    warn "payload (nothing at /opt/wall-panel/wall-app/), or the unpack failed."
+    warn "Rebuild the image with the artifact staged: see vmtest/build-wall-seed.sh."
+fi
+
 # ── 9. done ──────────────────────────────────────────────────────────────────
 install -d -m 0755 "$(dirname "$MARKER")"
 date > "$MARKER"

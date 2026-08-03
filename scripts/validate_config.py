@@ -153,6 +153,28 @@ def wall_knob_refs(paths):
     return refs
 
 
+def autoinstall_packages(user_data_text):
+    """Package names from an autoinstall user-data's top-level `packages:` list.
+
+    Read textually rather than with a YAML parser so this check stays runnable
+    on a stdlib-only box (PyYAML is optional here — see the YAML step below).
+    The list is a flat sequence of scalars at a fixed indent, which is the one
+    shape this needs to handle.
+    """
+    names, in_pkgs = set(), False
+    for line in user_data_text.splitlines():
+        if re.match(r"^  packages:\s*$", line):
+            in_pkgs = True
+            continue
+        if in_pkgs:
+            if re.match(r"^  \S", line):  # next key at the autoinstall: level
+                break
+            m = re.match(r"^\s*-\s+([^\s#]+)", line)
+            if m:
+                names.add(m.group(1))
+    return names
+
+
 def bind_mount_paths(compose_text, stack):
     """Host paths from `./x:...` bind mounts, resolved under the stack dir."""
     paths = []
@@ -255,6 +277,11 @@ def main():
         # Read by wall-firstboot.sh rather than by user-data, but just as fatal
         # if absent — a panel with no netplan has no network at all (no RJ45).
         "autoinstall/wall/netplan-wifi.yaml.template",
+        # IF-005 — the soname -> package map the wall builder asserts against
+        # (vmtest/lib/common.sh assert_electron_runtime_deps). Without it the
+        # builder cannot tell whether the image installs what the shell's
+        # Electron runtime loads, and a missing library is a black wall.
+        "autoinstall/wall/electron-runtime-deps.tsv",
     ):
         check(
             (stack / ref).exists(),
@@ -285,6 +312,41 @@ def main():
             ),
             "wall knobs read but NOT declared in wall.env.example: "
             + ", ".join(undeclared),
+        )
+
+    # 6. Electron runtime deps: every soname the shell artifact loads maps to a
+    #    package this image installs (IF-005 / PKG-1).
+    #
+    #    The wall builder makes the STRONGER version of this check — it reads
+    #    DT_NEEDED out of the binary about to be baked, so a new dependency
+    #    fails the build. That check needs the artifact, which a public checkout
+    #    does not have. This one needs only tracked files, so it runs on every
+    #    commit and catches the other direction: a row added to the table
+    #    without the matching package reaching the image. A missing shared
+    #    library is a black wall with no message on it.
+    deps_tsv = wall_dir / "electron-runtime-deps.tsv"
+    wall_user_data = wall_dir / "user-data"
+    if deps_tsv.exists() and wall_user_data.exists():
+        needed, soname_count = {}, 0
+        for line in load(deps_tsv).splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) < 3 or cols[0] == "soname":
+                continue
+            if cols[2].strip() == "image-packages":
+                soname_count += 1
+                # Several sonames share one package (libnss3 provides three).
+                needed.setdefault(cols[1].strip(), cols[0].strip())
+        installed = autoinstall_packages(load(wall_user_data))
+        absent = sorted(p for p in needed if p not in installed)
+        check(
+            not absent,
+            "every Electron runtime package is in the wall image ({} sonames -> {} packages)".format(
+                soname_count, len(needed)
+            ),
+            "electron-runtime-deps.tsv names package(s) the wall user-data does NOT install: "
+            + ", ".join("{} (for {})".format(p, needed[p]) for p in absent),
         )
 
     # 5. YAML parse (optional — needs PyYAML; SKIP cleanly if absent so this stays

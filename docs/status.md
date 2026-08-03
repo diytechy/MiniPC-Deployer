@@ -30,27 +30,26 @@ last) — it is the record, not required reading for every pass.
       gate ran 2026-07-31 and again 2026-08-01 (see the audit entries; the
       first one PASSED while running a three-week-stale tracker image).
     - OI-17 — **Boot the WALL ISO** (2026-08-02, new): `build-wall-seed.sh`
-      produces `vmtest/.out/wall/wall-seed.iso` and nobody has booted it →
+      produces `vmtest/.out-wall/wall-seed.iso` and nobody has booted it →
       [vmtest/README.md §11](../vmtest/README.md). The bar is
       `journalctl -t wall-kiosk` showing `starting: cage -- …` rather than the
-      NOT INSTALLED screen. Everything short of a display is verified (the
-      artifact unpacks with its setuid bit, `ldd` resolves, Electron reaches
-      Ozone init in a bare 24.04) — **whether it paints under `cage` is not**,
-      and it is the whole point of the A19 two-VM gate.
-    - OI-18 — **No production path for the wall image** (2026-08-02, new):
-      `build-wall-seed.sh` emits SIM images only and refuses `WALL_SITE_DIR`
-      outright, because a real panel image needs a materialised
-      `user-data.filled` (real key, the panel's REAL disk pin) *and* a real
-      `wall.env` (the Wi-Fi PSK), and Personal's materialiser emits neither.
-      Half of that would put real secrets on a sim-substituted `user-data` —
-      the silent downgrade the hub's `SITE_DIR` guards exist to prevent. Until
-      it exists, a real panel is imaged by hand. Owner's call whether that is
-      worth building for one machine.
-    - OI-6 — **C: free space is tight (~9GB)** after this session's ISO
-      download/repack smoke test — WSL2's `ext4.vhdx` grew and does not
-      auto-shrink on file deletion (see vmtest/README.md §2 for the
-      reclaim-it steps: `wsl --shutdown` + `Optimize-VHD`/`diskpart compact`,
-      elevated). Not urgent, but worth doing before further large downloads.
+      NOT INSTALLED screen. What is verified is the FLOOR, and only that:
+      `vmtest/test-wall-artifact.sh` installs the image's own package list into
+      a bare `ubuntu:24.04`, unpacks the artifact as root, and shows `ldd`
+      resolving and Electron reaching Ozone init. **Nothing above that has ever
+      run** — not Subiquity, not `apt` on a real system, not the late-commands
+      under curtin, not `getty@tty1`, not `cage`. The gate is the whole point.
+    - OI-18 — **The wall production seam has one missing input**
+      (2026-08-02, new): `WALL_SITE_DIR` now builds a real panel image from
+      Personal's `Materialize-Deploy.ps1 -Image wall` output, behind five
+      refusals. But that emitter writes `cifs.creds` for the **hub image only**
+      (`if ($img -eq 'homehub')`), even though the **2026-08-01 ruling
+      (A11(v)/A10(v))** gave both machines the same read-only `share` account
+      and the panel's `MEDIA_CIFS_CREDENTIALS` points at
+      `/etc/wall-panel/cifs.creds`. Consequence: a production panel mounts
+      nothing, `wall-sync.service` fails loudly, and there is no music or frame
+      video. **Personal's fix, not this repo's** — the builder stages the file
+      when it is there and says so when it is not.
     - OI-7 — **Tier-2 catalog ratifications (2026-07-10):** (a) confirm the
       tier-2-NOT-baked ISO boundary (profiles excluded from the payload unless
       `EXTRA_PROFILES` at export) as the standing Q10.9 B+ interpretation;
@@ -2331,14 +2330,20 @@ image, and OfficeWallNaglight had — since 2026-08-02, PKG-1 — an artifact th
 
 **What landed.**
 
-1. **`vmtest/build-wall-seed.sh`** — the second image target's seed ISO
-   (~112 MB; it carries the 111 MB shell tarball). Built for real, twice.
-2. **Reuse, not a fork.** The mechanism both targets share — CIDATA discovery,
+1. **`vmtest/build-wall-seed.sh`** — the second image target's **seed** ISO
+   (~112 MB; it carries the 111 MB shell tarball). Not a bootable ISO: it is the
+   light path's CIDATA seed, attached as a second DVD beside the stock Ubuntu
+   ISO, exactly like the hub's. The heavier one-ISO repack path is hub-only.
+2. **Shared mechanism, separate renderers — deliberately.** What both targets share — CIDATA discovery,
    the ephemeral SSH key, the repo-into-payload copy, the assert-every-
    substitution discipline — moved into `lib/common.sh` helpers that
-   `build-seed.sh` now calls too. The hub ISO rebuilt with no behaviour change.
-   A `--wall` flag was rejected deliberately: one code path with two sets of
-   load-bearing assertions is how one of them quietly stops biting.
+   `build-seed.sh` now calls too. `render_seed_tree` and `render_wall_seed_tree`
+   stay separate implementations and a `--wall` flag was rejected deliberately:
+   one code path with two sets of load-bearing assertions is how one of them
+   quietly stops biting. **The hub did change**, in three ways, and "no behaviour
+   change" would have been false: its payload gained `wall-site/`, its firstboot
+   gained step 3d, and its payload copy now carries **tracked files only** (see
+   the review section below — that one is a fix, not a side effect).
 3. **The panel installs the app.** Wall `user-data` late-command 3b untars the
    payload's shell tarball into `/opt/wall-panel/app`. **As root, with `tar`** —
    `chrome-sandbox` must arrive `4755 root:root` or Electron refuses to start
@@ -2374,10 +2379,14 @@ package list, plus the installer's own late-commands run verbatim against a fake
 - run as an unprivileged user the wrapper execs and Electron reaches **Ozone
   platform init**, stopping only for want of a display.
 
-**Seven refusals, each verified to bite** (never-silent-green — an assertion
-nobody has seen fire is a comment): missing artifact; `-dirty` artifact; two
-candidate artifacts; an unmapped soname; a mapped package the image does not
-install; `WALL_SITE_DIR` (there is no production path); and the disk-pin guard.
+**Twelve refusals, and a suite that re-runs them.** They were exercised by hand
+first, and an adversarial review made the obvious objection: a transcript in this
+ledger is not a check. `vmtest/test-wall-builder.sh` now runs all twelve — the
+artifact gate (absent, `-dirty`, ambiguous, and the documented
+`ALLOW_MISSING_SHELL=1` way past it), the dependency gate, the five production
+guards, and the `--clean` brake — in about a minute, and reports skips as skips
+rather than quietly shrinking. `vmtest/test-wall-artifact.sh` does the same for
+the `ldd` claim below.
 
 **Containment, the hub's rule applied to the panel.** The sim rewrites the disk
 match to `model: Virtual_Disk` and refuses to build if that `sed` no-ops or if
@@ -2389,7 +2398,15 @@ setting, which is the same lesson `user-data.filled`'s guards learned on
 2026-07-30.)
 
 **NOT PROVEN, and it is the whole of the next gate.** Nobody has booted the wall
-ISO. Nothing has watched Electron come up under `cage` on a display; the
+ISO, so nothing below the build has ever executed: Subiquity has not run, `apt`
+has not installed those packages on a real system, the late-commands have not
+run under curtin, no systemd unit has been enabled, `getty@tty1` has not
+autologged anyone in, and `cage` has never started. What IS verified is the
+floor underneath all of that — the archive's contents and modes, the extraction
+as root, the predicate, `ldd` against the real package list, and Electron
+reaching Ozone init in a container. An earlier draft of this entry said
+"everything short of a display is verified", which was the largest false-green
+sentence in it. Nothing has watched Electron come up under `cage` on a display; the
 container run above stops at "Missing X server or $DISPLAY", and it did so via
 X11 — with no `WAYLAND_DISPLAY` set, `--ozone-platform-hint=auto` chose X11,
 which is consistent with the concern that made PKG-1's wrapper force
@@ -2409,7 +2426,56 @@ gives `card1` with no `renderD*`); Wi-Fi values filled but unused;
 `WALL_DISABLE_INPUT` empty (quirk 3 would disable the synthetic keyboard and
 mouse — the console needed for the GRUB edit).
 
-**Open after this.** `config.json` is IF-005's last gap and nobody renders it.
+**TWO ADVERSARIAL PASSES, and they were worth more than the build was.**
+Read-only, OpenAI CLI: a diff review and a claim-by-claim refutation attempt.
+Twelve findings, all triaged. The six that were real are fixed and are in the
+commit; three of them were defects this session introduced, and three were
+older:
+
+1. **The payload carried gitignored secrets.** `copy_repo_into_payload` archived
+   the whole worktree — so `stack/provision/.token` (64 bytes, non-expiring) was
+   found *inside a built payload*, and any dev box that has run the real stack
+   also has `stack/.env` sitting there. Pre-dates this session and shipped on
+   every hub ISO ever built here. Now `git ls-files`: tracked files only.
+2. **A freshly imaged panel did not enter the kiosk on its first boot.**
+   `wall-firstboot` writes the tty1 autologin drop-in but runs
+   `After=network-online.target`, by which time `getty@tty1` is already up —
+   and `daemon-reload` does not restart a running unit. The panel showed a login
+   prompt on a machine whose account password is **locked**. It would have read
+   as a failed image at the A19 gate.
+3. **A real Wi-Fi PSK could break or corrupt first boot.** SSID and PSK went
+   straight into a `sed` replacement: a `|` aborts firstboot *before* the
+   autologin is installed; an `&` silently writes the wrong network. Both
+   unreachable on a Wi-Fi-only box. The sim's values contain neither character,
+   so no amount of VM testing would have found it.
+4. **Four false greens in this session's own checks** — the worst kind, since
+   each one passes hardest when it can see least: `readelf` failing inside a
+   here-doc produced an empty dependency list and logged OK; `-dirty` was judged
+   from the filename while the message claimed to have read `build-info.json`;
+   rows marked `bundled` were taken on trust; and the disk pin was a `grep`, so
+   a decoy `model: Virtual_Disk` anywhere in the document satisfied it (now
+   parsed structurally: `autoinstall.storage.layout.match` must be *exactly*
+   that mapping for a sim, and must *not* be it for production).
+5. **`tar … | grep -q` under `pipefail`** reports failure when grep finds its
+   match early and SIGPIPEs tar — so the check failed on a *correct* site
+   tarball. Found by it actually happening. Fixed in both places with that shape.
+6. **`--clean` was `rm -rf $OUT_DIR`** on an environment variable the README
+   tells you to set; `OUT_DIR=/mnt/d … --clean` aimed a recursive delete at a
+   drive. It now refuses any directory this builder did not create. The wall
+   output also moved to `.out-wall`, a **sibling**: nested under `.out`, an
+   ordinary hub `--clean` deleted the wall ISO, its SSH key and its credentials.
+
+The rest were overclaims in the writeup rather than defects, and this entry has
+been corrected for them rather than left standing.
+
+**A correction found while writing this, not by the reviewers:** the first draft
+refused `WALL_SITE_DIR` outright on the grounds that "Personal's materialiser
+covers the hub only". That was **wrong** — `FieldSchema.psd1` registers both
+`wall.env` and `user-data.filled` for `-Image wall`, and has since 2026-07-29.
+The production seam is built instead, with the hub's guards adapted.
+
+**Open after this.** `config.json` is IF-005's last **shell-configuration** gap
+and nobody renders it — it is not the last gap overall; the unbooted ISO is.
 There is no production path for a wall image: `WALL_SITE_DIR` is refused because
 half a production build — real secrets on a sim-substituted `user-data` — is the
 silent downgrade the hub's guards exist to prevent. A real panel is still imaged

@@ -492,6 +492,8 @@ vmtest/
   build-seed.sh           HUB, LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
   build-repacked-iso.sh   HUB, HEAVIER path: one self-contained ISO (fallback; folds in the payload)
   build-wall-seed.sh      WALL PANEL seed ISO (§11) — the second image target, SR-017
+  test-wall-builder.sh    do the wall builder's 12 refusals actually bite? (§11)
+  test-wall-artifact.sh   is the image's package list SUFFICIENT for the shell? (§11, needs docker)
   lib/common.sh           shared rendering + the payload stagers (sourced, not run directly)
   Run-V3Gate.cmd          right-click "Run as administrator" wrapper for New-HomeHubVm.ps1
   New-HomeHubVm.ps1          create the Hyper-V VM (elevation required; NOT run by an agent)
@@ -557,14 +559,25 @@ journalctl -u wall-firstboot      # the quirk config + the IF-005 report
   identity and render path and proves NOTHING about the Wi-Fi path** — not
   `macaddress: permanent`, not powersave-off, not the DHCP reservation the
   kiosk site's `/32` allow-list is keyed to. Those stay hardware-only (C7).
-- **The SIM `wall.env` is deliberate, in four places.** `SLEEP_MODE=backlight`
+- **`WALL_HOST` defaults to something that cannot resolve** —
+  `wall.vmtest.sim.invalid`, on purpose, so a sim panel can never accidentally
+  point at a real host. It also means **the default build cannot reach any hub**:
+  the A19 gate MUST override it with a name the hub's Technitium answers for.
+  That is not optional polish, it is the difference between a panel that renders
+  and a panel that shows a connection error.
+- **Three more SIM `wall.env` values are deliberate.** `SLEEP_MODE=backlight`
   (a VM that suspends itself at 22:00 is indistinguishable from a VM that
   died — and with no `/sys/class/backlight` in a guest, backlight mode is inert
   and the screen stays up for a capture); `WALL_APP_CMD=… --disable-gpu`
   (`hyperv_drm` gives `/dev/dri/card1` with no `renderD*`, so hardware GL has
-  nothing to bind to); `WIFI_*` filled but unused; `WALL_DISABLE_INPUT` **empty**
-  (quirk 3 would disable the synthetic keyboard and mouse, i.e. the console you
-  need for the GRUB edit).
+  nothing to bind to); `WALL_DISABLE_INPUT` **empty** (quirk 3 would disable the
+  synthetic keyboard and mouse, i.e. the console you need for the GRUB edit).
+- **The `WIFI_*` values are filled but pointless — not "unused".** They are
+  non-placeholder so `wall-firstboot.sh` does not warn about `REPLACE_WITH`, and
+  firstboot then *does* render `/etc/netplan/60-wall-wifi.yaml` from them, for a
+  `wl*` device that does not exist in a VM. It is inert (firstboot does not
+  `netplan apply`, and NetworkManager simply never activates a missing
+  interface), but it is a file on the box, so do not be surprised by it.
 - **`wall-sync.service` FAILS at boot.** `MEDIA_SHARE_UNC` points at an
   obviously-invalid host because sim hub builds skip Samba. Frame video and the
   local music library are **out of scope** for this gate — a green sync unit
@@ -592,11 +605,46 @@ Same discipline as `SIM_ENV_OVERRIDES`: a key that is not already in
 reads. `WALL_SHELL_DIST=` points at a `dist/` elsewhere;
 `ALLOW_MISSING_SHELL=1` builds the image layer alone, loudly.
 
-### There is no production path here
+### Building a REAL panel image
 
-`WALL_SITE_DIR` is **refused outright**. A production panel image needs a
-materialised `user-data.filled` (real SSH key, the panel's REAL disk pin) and a
-real `wall.env` (the Wi-Fi PSK), and nothing emits either — Personal's
-materialiser covers the hub only. Half of that would mix real secrets into a
-sim-substituted `user-data`, which is the silent downgrade the hub's `SITE_DIR`
-guards exist to prevent. Until it exists, a real panel is imaged by hand.
+Personal's `Materialize-Deploy.ps1 -Image wall` writes `user-data.filled` and
+`wall.env` into `homelab\deploy\out\wall`. Point the builder at that directory
+and it takes them verbatim instead of substituting anything:
+
+```sh
+WALL_SITE_DIR=/mnt/c/Projects/Personal/homelab/deploy/out/wall \
+  bash vmtest/build-wall-seed.sh
+```
+
+The result **carries the real Wi-Fi PSK and the panel's real disk pin — treat
+the ISO as a secret artifact, and note that it WILL wipe a disk matching that
+pin.** Five guards stand between you and a bad one, and all five refuse rather
+than warn: a `WALL_SITE_DIR` with no `user-data.filled` (staging the real
+`wall.env` onto a sim-substituted `user-data` is the silent downgrade — a
+"production" stick with `allow-pw: true` and a known sim password); no
+`wall.env`; `allow-pw: true`; a `storage.layout.match` of `model: Virtual_Disk`
+(the SIM pin — on the real panel it matches nothing and every install halts with
+nothing on screen); and a network block with no `wifis:` (the panel has no RJ45,
+so that image would come up unreachable).
+
+**One gap, and it is Personal's:** `Materialize-Deploy.ps1` emits `cifs.creds`
+for the **hub image only**, even though the 2026-08-01 ruling gave both machines
+the same read-only `share` account and `MEDIA_CIFS_CREDENTIALS` points straight
+at `/etc/wall-panel/cifs.creds`. Without it a production panel mounts nothing and
+`wall-sync.service` fails loudly. The builder stages `cifs.creds` when it is
+there and says so when it is not.
+
+### Testing the builder itself
+
+```sh
+bash vmtest/test-wall-builder.sh    # 12 refusals — do they actually bite?
+bash vmtest/test-wall-artifact.sh   # needs docker: is the package list SUFFICIENT?
+```
+
+The second one is the interesting one. It reads the package list out of the wall
+`user-data`, installs exactly that into a bare `ubuntu:24.04`, unpacks the
+artifact **as root with tar**, and checks that `chrome-sandbox` is still
+`4755 root:root`, that `[ -x …/wall-shell ]` holds, and that `ldd` resolves every
+library. Neither is wired into `scripts/check.py` — both need WSL plus docker,
+which the Windows harness does not have. Run them by hand when the artifact,
+the package list, or the dependency table changes.

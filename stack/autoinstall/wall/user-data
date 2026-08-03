@@ -172,12 +172,40 @@ autoinstall:
     - curtin in-target --target=/target -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd 2>/dev/null || true; apt-get autoremove -y --purge'
 
     # ---- 3. Place the payload ------------------------------------------------
-    # Same mechanism as the AWOW image: the USB-build step copies the repo tree
-    # (plus the shell artifact) to /cdrom/deploy-payload and it lands under
-    # /opt/wall-panel/. The wall variant's files are then at
-    # /opt/wall-panel/stack/autoinstall/wall/.
+    # The build step copies the repo tree (plus the shell artifact) into
+    # deploy-payload/, and it must land under /opt/wall-panel/ — the wall
+    # variant's files are then at /opt/wall-panel/stack/autoinstall/wall/, which
+    # is where every later late-command copies its units from.
+    #
+    # /cdrom IS NOT ENOUGH, and finding that out cost a whole install cycle
+    # (2026-08-03). On the REPACKED path /cdrom is the combined ISO and carries
+    # /deploy-payload, so this worked. On the LIGHT path — the one this repo
+    # recommends by default — /cdrom is the STOCK Ubuntu ISO, which has no such
+    # directory, and the CIDATA seed that does is mounted only transiently by
+    # cloud-init to read user-data. So the payload rode along on the seed and
+    # NOTHING EVER READ IT. The old line ended in `|| true`, so the install
+    # sailed past it and died four commands later on a missing wall.env.example,
+    # naming nothing useful. Mount the seed by its label instead.
+    #
+    # AND FAIL LOUDLY. Unlike the hub — which has a documented degraded mode
+    # where firstboot pulls images instead — a wall image without its payload
+    # cannot work at all: the units, the scripts and wall.env.example all come
+    # from it. Better to stop here, saying so, than to install a panel that
+    # cannot boot into anything.
     - mkdir -p /target/opt/wall-panel
-    - cp -a /cdrom/deploy-payload/. /target/opt/wall-panel/ 2>/dev/null || cp -a /media/deploy-payload/. /target/opt/wall-panel/ 2>/dev/null || true
+    - >-
+      bash -c 'set -e;
+      for d in /cdrom /media /media/* /run/media/*; do
+      if [ -d "$d/deploy-payload" ]; then cp -a "$d/deploy-payload/." /target/opt/wall-panel/; echo "wall: payload copied from $d/deploy-payload"; exit 0; fi;
+      done;
+      dev=$(blkid -L CIDATA 2>/dev/null || true);
+      if [ -n "$dev" ]; then m=$(mktemp -d);
+      if mount -o ro "$dev" "$m" 2>/dev/null; then
+      if [ -d "$m/deploy-payload" ]; then cp -a "$m/deploy-payload/." /target/opt/wall-panel/; echo "wall: payload copied from the CIDATA seed at $dev"; umount "$m"; exit 0; fi;
+      umount "$m"; fi; fi;
+      echo "wall: FATAL - no deploy-payload found. Looked under /cdrom, /media, /run/media/* and on the CIDATA volume ($dev).";
+      echo "wall: the seed ISO carries it at its root; on the light path nothing mounts that volume for you.";
+      exit 1'
 
     # ---- 3b. Unpack the shell artifact (IF-005 / PKG-1) ----------------------
     # The payload carries OfficeWallNaglight's panel tarball at

@@ -33,11 +33,13 @@
 #
 # Usage:
 #   bash vmtest/build-repacked-iso.sh --src-iso /path/to/ubuntu-24.04.x-live-server-amd64.iso
+#   bash vmtest/build-repacked-iso.sh --target wall --src-iso ...   # the WALL panel image
 #   bash vmtest/build-repacked-iso.sh --src-iso ... --expected-sha256 <hash from releases.ubuntu.com/24.04/SHA256SUMS>
 #   OUT_DIR=/mnt/d/vmtest-out bash vmtest/build-repacked-iso.sh --src-iso ...
 #
 # Output (gitignored, see ../.gitignore):
-#   $OUT_DIR/repacked.iso    the single ISO to attach to the VM
+#   $OUT_DIR/repacked.iso        (hub)  the single ISO to attach to the VM
+#   $OUT_DIR/wall-repacked.iso   (wall, --target wall)
 
 set -euo pipefail
 
@@ -46,21 +48,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 REPO_ROOT="$(repo_root)"
-OUT_DIR="${OUT_DIR:-$REPO_ROOT/vmtest/.out}"
-# Q10.9 B+: where export-images.sh put the docker-save tars (its default).
-IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
 SRC_ISO=""
 EXPECTED_SHA256=""
+# WHICH IMAGE. Both targets need the identical El Torito / hybrid-MBR replay
+# below — re-solving that is how you get a subtly unbootable ISO — so the target
+# only chooses which user-data is rendered and which payload is staged.
+#
+# For the WALL this path is not merely the "heavier fallback" it is for the hub:
+# on the light path /cdrom is the STOCK Ubuntu ISO, so `/cdrom/deploy-payload`
+# does not exist and the payload has to be recovered by mounting the CIDATA
+# volume (see the wall user-data's late-command 3). Here it is simply present,
+# which is the branch that has actually been exercised.
+TARGET="hub"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --src-iso) SRC_ISO="$2"; shift 2 ;;
         --expected-sha256) EXPECTED_SHA256="$2"; shift 2 ;;
+        --target) TARGET="$2"; shift 2 ;;
         --clean) CLEAN=1; shift ;;
         -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
         *) die "unknown argument '$1' (try --help)" ;;
     esac
 done
+case "$TARGET" in
+    hub)  DEFAULT_OUT="$REPO_ROOT/vmtest/.out";      ISO_NAME="repacked.iso" ;;
+    wall) DEFAULT_OUT="$REPO_ROOT/vmtest/.out-wall"; ISO_NAME="wall-repacked.iso" ;;
+    *)    die "--target must be 'hub' or 'wall' (got '$TARGET')" ;;
+esac
+OUT_DIR="${OUT_DIR:-$DEFAULT_OUT}"
+# Q10.9 B+: where export-images.sh put the docker-save tars (its default).
+IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
 
 [ -n "$SRC_ISO" ] || die "need --src-iso /path/to/ubuntu-24.04.x-live-server-amd64.iso (see vmtest/README.md for the download URL + SHA256)"
 [ -f "$SRC_ISO" ] || die "not found: $SRC_ISO"
@@ -68,7 +86,7 @@ done
 require_cmd xorriso "Install with: sudo apt-get install -y xorriso"
 
 require_free_gb "$(dirname "$OUT_DIR")" 10  # source (~3.5GB) + output (~3.5GB + ~1GB Q10.9 B+ images) + margin
-require_writable_output "$OUT_DIR/repacked.iso"
+require_writable_output "$OUT_DIR/$ISO_NAME"
 
 log "computing SHA256 of $SRC_ISO (this reads the whole ~3GB file, takes a bit)"
 ACTUAL_SHA256="$(sha256sum "$SRC_ISO" | awk '{print $1}')"
@@ -86,16 +104,19 @@ mkdir -p "$OUT_DIR"
 
 # ── 1. render the SIM user-data/meta-data/.env + deploy-payload (shared with
 #      build-seed.sh) ────────────────────────────────────────────────────────
-render_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
-
-# Q10.9 B+ ALL-IMAGES: fold the docker-save tars into deploy-payload/images/.
-# The `-map "$NOCLOUD_DIR/deploy-payload" /deploy-payload` below carries the whole
-# deploy-payload dir (images and all) into the ISO's /deploy-payload/ area.
-stage_images_into_payload "$OUT_DIR" "$IMAGES_OUT"
-
-# IF-005: the wall kiosk site's document root rides in the same payload dir, so
-# the `-map .../deploy-payload /deploy-payload` below carries it too.
-stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
+if [ "$TARGET" = "wall" ]; then
+    render_wall_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
+    # IF-005: the panel's own half of the shell build.
+    stage_wall_shell_into_payload "$OUT_DIR" "$REPO_ROOT"
+else
+    render_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
+    # Q10.9 B+ ALL-IMAGES: fold the docker-save tars into deploy-payload/images/.
+    # The `-map "$NOCLOUD_DIR/deploy-payload" /deploy-payload` below carries the
+    # whole deploy-payload dir (images and all) into the ISO's /deploy-payload/.
+    stage_images_into_payload "$OUT_DIR" "$IMAGES_OUT"
+    # IF-005: the wall kiosk site's document root rides in the same payload dir.
+    stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
+fi
 
 # ── 2. stage a /nocloud directory (xorriso -map wants one disk dir per iso
 #      dir; iso-root/ from render_seed_tree already has user-data+meta-data
@@ -144,7 +165,7 @@ log "grub.cfg patched: $(grep -c 'autoinstall "ds=nocloud' "$GRUB_MOD") boot ent
 #      "-boot_image any replay" instead of hand-building a new one — this is
 #      what keeps BOTH BIOS and UEFI boot working without re-deriving Ubuntu's
 #      boot images ourselves. ─────────────────────────────────────────────────
-REPACKED_ISO="$OUT_DIR/repacked.iso"
+REPACKED_ISO="$OUT_DIR/$ISO_NAME"
 rm -f "$REPACKED_ISO"
 log "repacking -> $REPACKED_ISO (a few minutes; copies ~3GB)"
 xorriso -indev "$SRC_ISO" -outdev "$REPACKED_ISO" \
@@ -167,7 +188,15 @@ xorriso -indev "$REPACKED_ISO" -find /deploy-payload >/dev/null 2>&1 \
     || die "repacked ISO is missing /deploy-payload - do not use this ISO"
 
 log "OK — repacked ISO ready: $REPACKED_ISO (BIOS + UEFI boot images intact, /nocloud + /deploy-payload present)"
-log "SSH:     ssh -i $SSH_KEY hub@<vm-ip>"
-log "Console: user 'hub', SIM password in $CREDS_FILE"
+# The account and the console story differ per target — the wall autologins
+# into the kiosk on tty1, so a shell there means Ctrl+Alt+F2.
+if [ "$TARGET" = "wall" ]; then
+    log "SSH:     ssh -i $SSH_KEY panel@<vm-ip>"
+    log "Console: tty1 runs the KIOSK — use Ctrl+Alt+F2 for a shell, user 'panel',"
+    log "         SIM password in $CREDS_FILE"
+else
+    log "SSH:     ssh -i $SSH_KEY hub@<vm-ip>"
+    log "Console: user 'hub', SIM password in $CREDS_FILE"
+fi
 log "Next: vmtest/README.md — New-HomeHubVm.ps1 -UbuntuIsoPath $REPACKED_ISO -SeedIsoPath $REPACKED_ISO -SkipSecondDvd"
 log "NOT boot-tested here (needs a VM) — this only verifies the ISO's on-disk structure."

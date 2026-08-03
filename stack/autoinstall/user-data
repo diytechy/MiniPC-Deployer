@@ -186,7 +186,33 @@ autoinstall:
     # (a second CIDATA stick, or the remastered ISO) and picked up here into
     # /opt/homehub/. The stack itself then lives at /opt/homehub/stack/.
     - mkdir -p /target/opt/homehub
-    - cp -a /cdrom/deploy-payload/. /target/opt/homehub/ 2>/dev/null || cp -a /media/deploy-payload/. /target/opt/homehub/ 2>/dev/null || true
+    # /cdrom IS NOT ENOUGH on the LIGHT path, and this was silent for months.
+    # On the REPACKED path /cdrom is the combined ISO and carries
+    # /deploy-payload — which is the path every V3 gate has actually used, so
+    # nothing ever noticed. On the light path /cdrom is the STOCK Ubuntu ISO,
+    # which has no such directory, and the CIDATA seed that does is mounted only
+    # transiently by cloud-init to read user-data. The ~470 MB of baked container
+    # images the light path carefully stages therefore NEVER REACHED THE BOX:
+    # firstboot logged its "no baked image payload found" fallback and pulled
+    # from registries instead, which looks like a slow first boot rather than a
+    # bug. Found 2026-08-03 by the wall image, which cannot degrade that way.
+    # Mount the seed by label as a fallback.
+    #
+    # STILL NON-FATAL, deliberately, unlike the wall's copy of this: a hub with
+    # no payload has a documented degraded mode (firstboot.sh step 3 pulls at
+    # compose-up). Say so loudly rather than halting an install that can recover.
+    - >-
+      bash -c 'for d in /cdrom /media /media/* /run/media/*; do
+      if [ -d "$d/deploy-payload" ]; then cp -a "$d/deploy-payload/." /target/opt/homehub/ && echo "homehub: payload copied from $d/deploy-payload"; exit 0; fi;
+      done;
+      dev=$(blkid -L CIDATA 2>/dev/null || true);
+      if [ -n "$dev" ]; then m=$(mktemp -d);
+      if mount -o ro "$dev" "$m" 2>/dev/null; then
+      if [ -d "$m/deploy-payload" ]; then cp -a "$m/deploy-payload/." /target/opt/homehub/ && echo "homehub: payload copied from the CIDATA seed at $dev"; umount "$m"; exit 0; fi;
+      umount "$m"; fi; fi;
+      echo "homehub: WARNING - no deploy-payload found under /cdrom, /media, /run/media/* or on the CIDATA volume.";
+      echo "homehub: first boot will PULL every container image from its registry (needs internet), and naglight:local has no registry home.";
+      exit 0'
 
     # ---- 4. Seed .env from the example if the operator did not pre-fill one ----
     - curtin in-target --target=/target -- bash -c '[ -f /opt/homehub/stack/.env ] || cp /opt/homehub/stack/.env.example /opt/homehub/stack/.env'

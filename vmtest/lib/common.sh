@@ -396,7 +396,7 @@ render_seed_tree() {
         mkdir -p "$site_out"
         local staged=0
         for f in .env backup.env cifs.creds samba-users.creds user-data.filled \
-                 smb.conf.fragment library-mounts.fstab; do
+                 smb.conf.fragment library-mounts.fstab drive-identity.conf; do
             if [ -f "$SITE_DIR/$f" ]; then
                 install -m 600 "$SITE_DIR/$f" "$site_out/$f"
                 log "  site/ += $f"

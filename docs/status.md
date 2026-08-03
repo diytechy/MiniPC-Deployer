@@ -2208,3 +2208,58 @@ quoted value, missing file, unset key).
 virtual network on a new range), so the gate VM is now at a different address —
 find it by scanning the current `vEthernet (Default Switch)` subnet for port 22
 rather than trusting a recorded IP.
+
+### DRIVER — G1 — Round 1 — 2026-08-01 (MOUNT BY LABEL, VERIFY BY SERIAL — three-state drive health)
+
+Owner's requirement: run the first days of service on **plain flash drives**, to
+prove the backup, the mounts and the shares before 12 TB of real disk is
+committed to them — and have that state read as **yellow**, not green, until the
+real drives go in.
+
+That is not achievable with one identifier. A by-id serial is unforgeable but a
+stand-in can never carry it; a label a stand-in CAN carry proves nothing about
+which disk answered to it. So the two are now split:
+
+- **fstab mounts by `LABEL=`** (`Library`, `PriBackup`), fstype **`auto`** —
+  flash drives are usually exFAT/FAT32, and `uid`/`gid`/`umask` are honoured by
+  ntfs3, exfat and vfat alike, so the ownership Samba depends on is identical
+  whichever turns up.
+- **`drive-identity.conf`** (new generator emission) carries the expected by-id
+  serial per mountpoint, and `library-guard.sh` asserts it separately.
+
+**Three states replace the old boolean:** `green` = mounted rw + expected serial ·
+`yellow` = mounted rw, right label, **wrong disk** ("stand-in drive") · `red` =
+not mounted or read-only. Posted via NagLight's severity lane (`color`, one of
+green|yellow|orange|red) rather than `ok`, because a boolean cannot say "working,
+but on the wrong disk" — which is the entire state this exists to surface. Note
+that lane arrived in NagLight `75b3e3a`, the commit the stale `naglight:local`
+was missing: this only works because that image got rebuilt earlier today.
+
+**The identity check does no disk I/O.** mountinfo field 3 gives the mounted
+device's major:minor; `/sys/class/block/*/dev` and `readlink` on
+`/dev/disk/by-id/*` resolve it to a stable name. Nothing opens the block device,
+so the 10-minute cadence still cannot wake a parked drive — `blkid`/`lsblk -f`
+would have read the superblock and could have.
+
+**Tested on real block devices**, not mocks: two loopback filesystems both
+labelled `Library` with distinct fabricated by-id names → red with neither
+mounted, **yellow** with the stand-in mounted (naming both the expected and the
+actual serial), **green** with the real one, and green-with-the-gap-named when
+no identity file exists. Degradation is graceful throughout: no
+`drive-identity.conf` = presence-only reporting, and the check says so in its own
+note rather than going quiet.
+
+`backup.sh` logs a NOTICE when the archive is landing on a stand-in but does NOT
+refuse — proving the backup on a cheap disk is the point of the period. The
+composite signal is the honest one: `backup` green (the run worked) +
+`backup-drive-mounted` yellow (on a substitute).
+
+**Flagged to the Owner, unresolved** (Personal `storage-map.md` §1, open-items
+**A23**): the map's `dev-pc` row lists its volume labels as `Library`,
+`PriBackup`, `LPBackup` and says they are "**not** the hub's main-library /
+backup-drive — do not conflate them" — but those are now exactly the two labels
+the hub mounts by. Either they are the same physical drives and that note is
+wrong, or two volumes share each name and label mounting is ambiguous. Also
+carried: the legacy FileBackup PowerShell on the dev PC matches volumes with
+`-like "*<label>*"`, so a stand-in stick labelled `Library` must not be plugged
+into the dev PC while it exists.

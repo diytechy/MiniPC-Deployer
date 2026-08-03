@@ -234,6 +234,15 @@ install -m 0644 "$STACK_DIR/samba/homehub-library-health.timer"   /etc/systemd/s
 # Same guard, second drive (A21): the backup target had no presence check at all
 # — it was looked at once a night by the backup run, which (fstab `nofail`) could
 # not tell an absent drive from an empty directory on the system disk.
+# A23: the serials the guard asserts. Carried on the USB as site/, copied to
+# /etc/homehub-samba/ beside the fstab fragment it pairs with. Absent = the
+# guard still reports, it just cannot distinguish a stand-in from the real disk
+# and names that gap in the check note.
+if [ -f /etc/homehub-samba/drive-identity.conf ]; then
+    log "drive identity assertions present — health checks will flag stand-in drives"
+else
+    log "no /etc/homehub-samba/drive-identity.conf — health checks report presence only (a stand-in drive will read as healthy)"
+fi
 install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.service" /etc/systemd/system/homehub-backup-drive-health.service
 install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.timer"   /etc/systemd/system/homehub-backup-drive-health.timer
 systemctl daemon-reload

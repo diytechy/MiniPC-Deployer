@@ -31,6 +31,9 @@ ENV_FILE="${ENV_FILE:-/etc/homehub-backup/backup.env}"
 # the wording has to name the right one or a red check sends you to the wrong
 # cupboard. Default keeps every existing message byte-identical.
 DRIVE_LABEL="${DRIVE_LABEL:-library}"
+# A23: mountpoint<TAB>expected-by-id<TAB>label, generated from storage-map §1.
+# Absent = identity is not asserted and the old two-state behaviour stands.
+IDENTITY_FILE="${IDENTITY_FILE:-/etc/homehub-samba/drive-identity.conf}"
 MODE="--check"
 SHARE=""
 while [ $# -gt 0 ]; do
@@ -39,6 +42,7 @@ while [ $# -gt 0 ]; do
         --report)  MODE="--report"; shift ;;
         --library) LIBRARY_ROOT="$2"; shift 2 ;;
         --label)   DRIVE_LABEL="$2";  shift 2 ;;
+        --expect)  IDENTITY_FILE="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -77,6 +81,69 @@ else
     fi
 fi
 
+# ── identity: is the mounted device the drive the storage-map names? (A23) ────
+# fstab mounts by LABEL so a stand-in flash drive can substitute during
+# bring-up. A label proves nothing about WHICH disk answered to it, so the
+# serial is checked separately here, and a mismatch is YELLOW rather than red:
+# running on substitutes is the intended state for the first few days, and the
+# thing that must never happen is being unable to TELL.
+#
+# ZERO DISK I/O, same contract as the mount check above. mountinfo field 3 is
+# the device's major:minor; /sys/dev/block/<maj>:<min> resolves it to a kernel
+# object, and /dev/disk/by-id/* are symlinks whose targets are read with
+# readlink. Nothing opens the block device, so a parked drive stays parked —
+# `blkid`/`lsblk -f` would have read the superblock and could have spun it up.
+#
+# Sets: identity_state = match | mismatch | unknown, and identity_note.
+identity_state="unknown"
+identity_note=""
+resolve_identity() {
+    [ -f "$IDENTITY_FILE" ] || { identity_note="no $IDENTITY_FILE — identity not asserted"; return; }
+
+    local expected="" want_label=""
+    while IFS=$'	' read -r mnt exp lbl; do
+        case "$mnt" in ''|\#*) continue ;; esac
+        [ "$mnt" = "$LIBRARY_ROOT" ] || continue
+        expected="$exp"; want_label="$lbl"
+    done < "$IDENTITY_FILE"
+    [ -n "$expected" ] || { identity_note="no entry for $LIBRARY_ROOT in $IDENTITY_FILE"; return; }
+
+    # major:minor of whatever is mounted there (mountinfo field 3).
+    local majmin
+    majmin="$(awk -v p="$LIBRARY_ROOT" '$5 == p { d = $3 } END { print d }' /proc/self/mountinfo)"
+    [ -n "$majmin" ] || { identity_note="could not read the mounted device number"; return; }
+
+    # Walk by-id symlinks and find the one pointing at this major:minor.
+    # Partitions resolve to their own node, so compare against the device the
+    # symlink actually names rather than assuming a whole-disk match.
+    local found="" link target dev
+    for link in /dev/disk/by-id/*; do
+        [ -e "$link" ] || continue
+        target="$(readlink -f "$link" 2>/dev/null)" || continue
+        dev="${target#/dev/}"
+        [ -r "/sys/class/block/$dev/dev" ] || continue
+        if [ "$(cat "/sys/class/block/$dev/dev" 2>/dev/null)" = "$majmin" ]; then
+            case "${link##*/}" in
+                "$expected") found="$expected"; break ;;
+                *) [ -n "$found" ] || found="${link##*/}" ;;
+            esac
+        fi
+    done
+
+    if [ -z "$found" ]; then
+        identity_note="mounted device $majmin has no /dev/disk/by-id name to compare"
+        return
+    fi
+    if [ "$found" = "$expected" ]; then
+        identity_state="match"
+        identity_note="$expected"
+    else
+        identity_state="mismatch"
+        identity_note="expected '$expected' (label $want_label) but the mounted device is '$found' — a STAND-IN drive, not the real $DRIVE_LABEL disk"
+    fi
+}
+[ -n "$fail_reason" ] || resolve_identity
+
 if [ "$MODE" = "--check" ]; then
     if [ -n "$fail_reason" ]; then
         # Samba logs preexec output; keep it to one line so the reason is
@@ -91,11 +158,31 @@ fi
 # ── --report ────────────────────────────────────────────────────────────────
 log() { echo "[library-guard] $*"; }
 
+# Three states (A23), not two:
+#   red    - not mounted, or read-only. Nothing works.
+#   yellow - mounted and writable, but the disk is NOT the one the map names.
+#            The intended state while running on stand-in flash drives during
+#            bring-up; the point is that it is VISIBLY not the finished article,
+#            so nobody later mistakes a 32 GB stick for the 8 TB archive.
+#   green  - mounted, writable, and the expected serial.
 if [ -n "$fail_reason" ]; then
+    band="red";    verdict="$fail_reason"
     log "UNHEALTHY: $fail_reason"
     logger -t homehub-library-guard -p daemon.err "$fail_reason" 2>/dev/null || true
+elif [ "$identity_state" = "mismatch" ]; then
+    band="yellow"; verdict="stand-in drive: $identity_note"
+    log "DEGRADED: $LIBRARY_ROOT mounted read-write, but $identity_note"
+    logger -t homehub-library-guard -p daemon.warning "stand-in drive at $LIBRARY_ROOT: $identity_note" 2>/dev/null || true
+elif [ "$identity_state" = "match" ]; then
+    band="green";  verdict="mounted read-write; drive identity confirmed ($identity_note)"
+    log "healthy: $LIBRARY_ROOT mounted read-write, drive identity confirmed ($identity_note)"
 else
-    log "healthy: $LIBRARY_ROOT mounted read-write"
+    # Mounted and writable, but identity could not be asserted at all (no
+    # identity file, no entry for this mountpoint, or an unresolvable device).
+    # Green on the facts that WERE checked, with the gap named in the note
+    # rather than left implied.
+    band="green";  verdict="mounted read-write; identity NOT asserted ($identity_note)"
+    log "healthy: $LIBRARY_ROOT mounted read-write (identity not asserted: $identity_note)"
 fi
 
 # Report through the SAME path the backup feeder uses, so there is one way of
@@ -145,25 +232,29 @@ load_env_file() {
 fi
 if [ -n "${NAGLIGHT_FEED_URL:-}" ]; then
     check_id="${LIBRARY_FEED_CHECK:-library-mounted}"
-    if [ -n "$fail_reason" ]; then ok=false; note="$fail_reason"; else ok=true; note="mounted read-write"; fi
-    note="${note//\"/\'}"
-    body="$(printf '{"check":"%s","ok":%s,"note":"%s"}' "$check_id" "$ok" "$note")"
+    note="${verdict//\"/\'}"
+    # The severity lane (NagLight 75b3e3a): exactly one of ok|color|rgb.
+    # `color` is used rather than `ok` because a boolean cannot express
+    # "working, but on the wrong disk" — the entire state this check exists
+    # to surface. A feed that only knew true/false would have to call a
+    # stand-in drive either fine or broken, and it is neither.
+    body="$(printf '{"check":"%s","color":"%s","reason":"%s"}' "$check_id" "$band" "$note")"
     if [ -n "${NAGLIGHT_FEED_CONTAINER:-}" ]; then
         hdr=(--header "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(--header "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(--header "X-Forwarded-User: ${NAGLIGHT_USER}")
         docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -O /dev/null "${hdr[@]}" \
             --post-data "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null \
-            && log "feed: reported ok=$ok" || log "feed: report FAILED (tracker unreachable?)"
+            && log "feed: reported $band" || log "feed: report FAILED (tracker unreachable?)"
     else
         hdr=(-H "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(-H "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(-H "X-Forwarded-User: ${NAGLIGHT_USER}")
         code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null || echo 000)"
-        [ "$code" = "200" ] && log "feed: reported ok=$ok" || log "feed: report got HTTP $code"
+        [ "$code" = "200" ] && log "feed: reported $band" || log "feed: report got HTTP $code"
     fi
 else
-    log "NAGLIGHT_FEED_URL unset — journal only (check id would be '${LIBRARY_FEED_CHECK:-library-mounted}')"
+    log "NAGLIGHT_FEED_URL unset — journal only ($band; check id would be '${LIBRARY_FEED_CHECK:-library-mounted}')"
 fi
 
 [ -z "$fail_reason" ]

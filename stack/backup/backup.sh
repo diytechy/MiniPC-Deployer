@@ -103,6 +103,28 @@ if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
                 die "backup target $BACKUP_TARGET is mounted READ-ONLY — refusing to run. Nothing was written." ;;
         esac
         log "target preflight: $BACKUP_TARGET is a real mountpoint (rw)"
+        # A23: say so when the archive is landing on a stand-in drive. This does
+        # NOT stop the run — proving the backup works on a cheap disk before
+        # committing 8 TB to it is the whole point of the bring-up period — but
+        # it must not be invisible either. The composite signal is the honest
+        # one: `backup` green (the run worked) + `backup-drive-mounted` yellow
+        # (on a substitute). Identity itself is asserted by the health timer;
+        # this is only the line in the run log that stops "the backup is green"
+        # from being read as "the backup is on the real drive".
+        if [ -f /etc/homehub-samba/drive-identity.conf ]; then
+            _expect="$(awk -F'\t' -v p="$BACKUP_TARGET" '$1 == p { print $2 }' /etc/homehub-samba/drive-identity.conf)"
+            if [ -n "$_expect" ] && [ -e "/dev/disk/by-id/$_expect" ]; then
+                _want="$(readlink -f "/dev/disk/by-id/$_expect" 2>/dev/null)"
+                _have="$(awk -v p="$BACKUP_TARGET" '$5 == p { d = $3 } END { print d }' /proc/self/mountinfo)"
+                _wantmm=""
+                [ -n "$_want" ] && [ -r "/sys/class/block/${_want#/dev/}/dev" ] &&
+                    _wantmm="$(cat "/sys/class/block/${_want#/dev/}/dev")"
+                if [ -n "$_wantmm" ] && [ "$_wantmm" != "$_have" ]; then
+                    log "NOTICE: this archive is landing on a STAND-IN drive, not $_expect."
+                    log "  Fine during bring-up; check backup-drive-mounted is yellow, not green."
+                fi
+            fi
+        fi
     else
         feed_naglight false "backup target $BACKUP_TARGET is NOT MOUNTED — the backup drive is absent or failed to mount; refusing to run so nothing lands on the system disk"
         die "backup target $BACKUP_TARGET is NOT MOUNTED — the backup drive is absent or failed to mount." \

@@ -10,7 +10,7 @@ After=network-online.target docker.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/homehub-library-guard --report
+ExecStart=/usr/local/sbin/homehub-library-guard --report --label library
 # A failing report must not put the unit in a permanent failed state that
 # masks later recoveries — the REPORT is the signal, not the exit code.
 SuccessExitStatus=0 1

@@ -120,6 +120,14 @@ autoinstall:
     - pulseaudio-utils
     - va-driver-all        # VA-API decode; quirk 6 says PROVE it is engaged
     - vainfo
+    # grim — screenshot the RUNNING kiosk over SSH, from inside the compositor:
+    #   sudo -u panel env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 grim /tmp/panel.png
+    # The panel is on a wall, often asleep, and hard to photograph; "send me a
+    # picture of what it is showing" is otherwise a trip across the office. It is
+    # also the ONLY way to see a cage session on real hardware — /dev/fb0 is the
+    # text console underneath and shows nothing once cage takes over KMS, and
+    # Hyper-V's thumbnail API does not exist off a VM. ~50 KB, wlr-screencopy.
+    - grim
     - unattended-upgrades  # same hands-off patching posture as the AWOW
     - openssh-server
     # ---- the Electron runtime's shared libraries (IF-005 / PKG-1) -----------

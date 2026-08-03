@@ -41,12 +41,23 @@ last) — it is the record, not required reading for every pass.
       re-run needs **one elevated approval** →
       [vmtest/README.md §11](../vmtest/README.md).
     - OI-19 — **The hub's site-staging late-command has the same `/cdrom`
-      bug** (2026-08-03, new): it reads `/cdrom/deploy-payload/site` and
-      `exit 0`s when absent, so a PRODUCTION hub built on the LIGHT path
-      installs **none** of its real secrets and comes up on `.env.example`
-      values, silently. The payload-copy instance of this bug is fixed; this
-      one is not, because verifying it needs a hub install and it was found
-      during a wall session. Same one-line shape of fix.
+      bug** (2026-08-03, new): `stack/autoinstall/user-data`'s site step reads
+      `/cdrom/deploy-payload/site`, falls back to `/media/...`, and then
+      `[ -d "$S" ] || exit 0` — a **silent success**. On the LIGHT path neither
+      exists (that is the defect fixed for the payload copy the same day), so a
+      PRODUCTION hub would install **none** of its six real files: `.env`,
+      `backup.env`, `cifs.creds`, `samba-users.creds`, `smb.conf.fragment`,
+      `library-mounts.fstab`. Severity, precisely: `.env` is the only one with a
+      downstream check, and `firstboot.sh` step 1 only **WARNs** on
+      `REPLACE_WITH` before bringing the stack up anyway — on a headless box
+      that warning is in the journal and nowhere else. The other five have no
+      check at all, so the drives would not mount and Samba/backup would be
+      unconfigured; the box would come up looking exactly like a SIM build
+      while believing it is production. Not fixed here: verifying it needs a
+      hub install and it was found during a wall session. Same one-line shape
+      of fix as the payload copy (mount the CIDATA volume by label), plus the
+      `exit 0` should arguably become a refusal when a production build is what
+      was asked for.
     - OI-18 — **The wall production seam has one missing input**
       (2026-08-02, new): `WALL_SITE_DIR` now builds a real panel image from
       Personal's `Materialize-Deploy.ps1 -Image wall` output, behind five

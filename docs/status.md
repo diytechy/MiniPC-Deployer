@@ -2263,3 +2263,43 @@ wrong, or two volumes share each name and label mounting is ambiguous. Also
 carried: the legacy FileBackup PowerShell on the dev PC matches volumes with
 `-like "*<label>*"`, so a stand-in stick labelled `Library` must not be plugged
 into the dev PC while it exists.
+
+### DRIVER — G1 — Round 1 — 2026-08-01 (THE DRIVE CHECKS HAD NO CHECK DEFINITIONS)
+
+Owner asked which project owns drive-presence reporting. Four do, and the fourth
+link was missing:
+
+1. **this repo** — sensing + reporting (`stack/samba/library-guard.sh`, both
+   `homehub-*-health` units, `backup/common.sh`, `backup.sh` step 0, firstboot)
+2. **Personal `homelab/deploy`** — the facts (storage-map §1 → generator →
+   `library-mounts.fstab` + `drive-identity.conf` → USB)
+3. **NagLight** — transport + rendering (`/api/feed`, the severity lane, auth)
+4. **Personal `tracker/definitions`** — the check registry ← **was empty of these**
+
+`/api/feed` rejects a POST whose `check` matches no automated item with
+`400 unknown feeder check id`, and only `backup`, `video-stub` and `mc-update`
+were ever defined. So **`library-mounted` had been posting into the void since
+2026-07-30**, and `backup-drive-mounted` would have too. Silently: the reporter
+logs the HTTP code and continues — right, because a reporting failure must not
+mask the drive's real state, but the consequence is that a vanished drive would
+be red in the journal and ABSENT from the tracker. Fixed Personal-side
+(`library-drive-present` / `backup-drive-present`), verified end to end against a
+running tracker: an undefined id 400s, both new ids record their colour report,
+and the day's ambient colour follows.
+
+**`tracker healthy` is one of the four V3 gate criteria and it does not mean the
+tracker works.** The container healthcheck probes `/healthz`, which is
+deliberately identity-free and data-free (SR-040 — a probe must not provision a
+phantom user dir). Measured in the gate VM: tracker `healthy` for hours with an
+EMPTY `/data`, its nightly run failing every night —
+`scheduler: nightly run failed … reading definitions dir "/data/definitions"`.
+Nothing in the gate noticed, because nothing looks. Recorded as Personal
+**A24(ii)**; changing it is the Owner's call, since any data-bearing probe makes
+a freshly-imaged box unhealthy until definitions exist.
+
+Third, NagLight-side (**A24(iii)**): with `TRACKER_COMMIT=true` and a `/data`
+that is not a git repo, a feed POST **records the report and then returns 500**
+because the git commit fails afterwards. A feeder reads 500 as failure and, under
+never-silent-green, reports red or retries — for data that was stored. The
+homehub image is not exposed (D3 forces `TRACKER_COMMIT=false`), but the sim runs
+in exactly that configuration, which is how it was found.

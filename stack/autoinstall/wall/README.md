@@ -59,24 +59,28 @@ loudly and `WALL-BURN-IN.md` carries the procedure. **Nothing here guesses.**
 | 5 | Wi-Fi power-save + MAC randomization make the panel unreachable / break its DHCP reservation | `NetworkManager/conf.d/99-wall-wifi.conf` + `macaddress: permanent` in netplan (firstboot §5) |
 | 6 | Thermals in a sealed mount; sustained video is the load case | Not config: vent clearance + a measured baseline. Burn-in §6 |
 
-## What IF-005 still owes
+## IF-005 — what landed, and the one thing still owed
 
 The kiosk session runs **one app** — the OfficeWallNaglight shell — and consumes
 it as a **built artifact**, exactly as the tracker consumes `naglight:local`
-(the IF-001 pattern). `IF-005` is still `Planned`, and this is the gap:
+(the IF-001 pattern).
 
-1. **No artifact.** That repo ships source and a `package.json`, not an installer
-   or a release tarball. There is no build command to invoke, no versioned
-   filename, and nowhere to fetch it from — so `WALL_APP_CMD` is a placeholder
-   path and `wall-kiosk.sh` shows an explicit "artifact not installed" screen
-   rather than a black wall.
-2. **Two halves, one contract.** The *static* build is served by the hub's kiosk
-   site (`stack/wall-shell/`); the *Electron* half runs here. Whether they ship as
-   one artifact or two is undecided.
-3. **Who renders `config.json`.** The shell reads `./config.json` from its own
-   origin for `HEARTBEAT_URL`, `SUBSONIC`, `LOCAL_LIBRARY` and friends. That file
-   is served from the hub side, but several of its values are panel-side secrets.
-   Nothing renders it today.
+1. ~~No artifact~~ — **RESOLVED 2026-08-02 (PKG-1**, `OfficeWallNaglight
+   docs/design/packaging.md`**).** `npm run dist` in that repo emits **one build
+   as two payloads**, both stamped with the same source commit:
+   `officewall-shell-<ver>-g<sha7>-linux-x64.tar.gz` (this machine) and
+   `officewall-site-<ver>-g<sha7>.tar.gz` (the hub's kiosk site).
+2. ~~Two halves, one contract~~ — **answered by the same decision.** Two
+   payloads, because NagLight sends no CORS headers and the renderer must
+   therefore be served by the origin that proxies `/api/*` (the hub), while the
+   Electron container is a process on the panel. One build and one stamp is what
+   makes a mismatch visible with `cat` instead of invisible.
+3. **Who renders `config.json` — STILL OPEN, and it is now the only gap.** The
+   shell reads `./config.json` from its own origin for `HEARTBEAT_URL`,
+   `SUBSONIC`, `LOCAL_LIBRARY` and friends. That file is served from the hub
+   side, but several of its values are panel-side secrets. The build ships
+   `config.example.json` and deliberately refuses to pack a file named
+   `config.json` at all. Nothing renders it today; it is deploy-time work.
 4. ~~`/media/*` has no home~~ — **RESOLVED by the Owner 2026-07-29 (OI-15)**, and
    built: see "The media pull" below. `/media/*` is served **panel-locally** by
    the shell's Electron host; the kiosk site on the hub serves no `/media` route

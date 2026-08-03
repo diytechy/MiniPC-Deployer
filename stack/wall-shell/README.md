@@ -18,16 +18,30 @@ The **built** static shell from `OfficeWallNaglight` — `index.html`, `css/`,
 `js/`, and a filled `config.json`. It is consumed as a built artifact exactly as
 `naglight:local` is (the IF-001 pattern), registered as **IF-005**.
 
-**IF-005 is still `Planned`, and this is what remains:** OfficeWallNaglight ships
-source plus a `package.json`, *not* an installer or a release tarball, so there
-is no agreed artifact yet — no build command to invoke, no versioned filename, no
-place to fetch it from, and no answer to whether the *Electron* half (which runs
-on the panel, not here) is packaged in the same artifact as these static files.
-Until that contract is written down in `docs/requirements/interfaces.csv`, this
-directory stays empty and the kiosk site serves 404s at `/` while `/api/*`
-already works. That is the intended half-built state, not a bug.
+**The question this file used to ask out loud is answered.** It asked "whether
+the *Electron* half is packaged in the same artifact as these static files".
+**PKG-1 (2026-08-02, `OfficeWallNaglight docs/design/packaging.md`): one build,
+two payloads, one source-commit stamp.**
 
-Nothing in this repo builds, vendors, or vendors-in the shell.
+```
+officewall-site-<ver>-g<sha7>.tar.gz            -> HERE  (tar --strip-components=1)
+officewall-shell-<ver>-g<sha7>-linux-x64.tar.gz -> the panel, /opt/wall-panel/app
+```
+
+Nothing in this repo builds, vendors, or vendors-in the shell — it is **staged**:
+
+- `vmtest/build-seed.sh` folds the **site** tarball into
+  `deploy-payload/wall-site/` (`stage_wall_site_into_payload`), and
+  `stack/autoinstall/firstboot.sh` step 3d unpacks it into **this directory**
+  before `docker compose up -d`, so caddy's read-only bind mount has a real
+  document root.
+- Absent, it degrades exactly as before: the kiosk site serves 404 at `/` while
+  `/api/*` works. That is expected on a checkout without the private sibling
+  (this repo is public), and the build says so rather than failing.
+
+**Still owed by IF-005:** nothing renders `config.json` — the shell reads it from
+this origin and several values are secrets, so only `config.example.json` ships.
+That is deploy-time work, and it is the last open half of the interface.
 
 ## Two things NOT served from here
 

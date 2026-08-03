@@ -16,10 +16,19 @@ no-ops). `build-repacked-iso.sh` was run for real in WI-10.18 against an actual
 confirmed to still carry both a BIOS and a UEFI El Torito boot image and to
 contain `/nocloud/` + `/deploy-payload/`; the Q10.9 B+ addition (images folded
 into `/deploy-payload/images/`) was separately verified via the exact `xorriso
--map` codepath. **Nobody has booted a VM from either ISO** — `New-HomeHubVm.ps1` /
-`Remove-HomeHubVm.ps1` need elevation + the Hyper-V feature and were deliberately
-never run. The actual first-boot `docker load` run is part of the V3 boot
-(the Owner's step). See docs/status.md for the full ledger.
+-map` codepath. The **hub** ISO has since been booted for real — the V3 gate ran
+on 2026-07-31 and again on 2026-08-01, and both runs are in docs/status.md
+(including what the first one got wrong while reporting PASS).
+
+**The WALL ISO (§11) has never been booted.** Its builder was written and run
+for real on 2026-08-02 — the ISO, the rendered sim `user-data`, the SIM
+`wall.env` and the staged 111 MB shell artifact were all inspected, the
+installer's own late-commands were executed verbatim against a fake `/target`
+(the artifact unpacks, `chrome-sandbox` keeps 4755 root:root, `[ -x
+WALL_APP_CMD ]` is true), and the shell was run in a bare `ubuntu:24.04`
+carrying exactly this image's package list, where `ldd` resolves everything and
+Electron reaches Ozone init. **Nothing has watched it come up under `cage` on a
+display.** That is the A19 gate's job. See docs/status.md for the full ledger.
 
 ## 0. Q10.9 B+ — the image payload (bake EVERY container "from infancy")
 
@@ -480,12 +489,114 @@ error.
 vmtest/
   README.md               this file
   export-images.sh        Q10.9 B+: docker save every pinned stack image -> .out/images/*.tar
-  build-seed.sh           LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
-  build-repacked-iso.sh   HEAVIER path: one self-contained ISO (fallback; folds in the payload)
-  lib/common.sh           shared rendering + stage_images_into_payload (sourced, not run directly)
+  build-seed.sh           HUB, LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
+  build-repacked-iso.sh   HUB, HEAVIER path: one self-contained ISO (fallback; folds in the payload)
+  build-wall-seed.sh      WALL PANEL seed ISO (§11) — the second image target, SR-017
+  lib/common.sh           shared rendering + the payload stagers (sourced, not run directly)
   Run-V3Gate.cmd          right-click "Run as administrator" wrapper for New-HomeHubVm.ps1
   New-HomeHubVm.ps1          create the Hyper-V VM (elevation required; NOT run by an agent)
   Remove-HomeHubVm.ps1       companion teardown (elevation required; NOT run by an agent)
-  .out/                   gitignored — everything the build scripts generate
+  .out/                   gitignored — everything the HUB build scripts generate
   .out/images/            gitignored — the docker-save image tars + manifest
+  .out/wall/              gitignored — everything the WALL builder generates
 ```
+
+---
+
+## 11. The WALL PANEL image (SR-017 / E0)
+
+The repo builds **two** images. Everything above is the hub. This is the
+office wall panel: one fullscreen app under `cage`, no Docker, no stack.
+
+```sh
+# in WSL (Ubuntu). Needs the OfficeWallNaglight artifact to exist first:
+#   cd ../OfficeWallNaglight && npm install && npm run dist
+bash vmtest/build-wall-seed.sh
+# -> vmtest/.out/wall/wall-seed.iso  (~112 MB — it carries the 111 MB shell tarball)
+```
+
+Then the same VM script as the hub, with a different name and disk (it is fully
+parameterised — there is no separate wall VM script, and there should not be):
+
+```powershell
+# Elevated PowerShell
+.\vmtest\New-HomeHubVm.ps1 -VMName Wall-VMTest `
+    -VMPath D:\HyperV\Wall-VMTest `
+    -UbuntuIsoPath D:\iso\ubuntu-24.04.4-live-server-amd64.iso `
+    -SeedIsoPath   .\vmtest\.out\wall\wall-seed.iso `
+    -MemoryGB 4 -CPUCount 2 -DiskGB 32
+```
+
+The GRUB one-time edit (§6) applies identically — type the single word
+`autoinstall`, nothing else.
+
+> **`wall-seed.iso` is named that way for a reason.** Both targets' seeds are
+> labelled `CIDATA` — they have to be; that label is how cloud-init finds them —
+> so the label cannot tell them apart. Attach `seed.iso` to the panel VM and you
+> will install a hub. The filename is the only thing between you and that.
+
+### What "success" looks like on the panel
+
+```sh
+journalctl -t wall-kiosk          # the kiosk session
+journalctl -u wall-firstboot      # the quirk config + the IF-005 report
+```
+
+- `wall-kiosk` shows **`starting: cage -- /opt/wall-panel/app/wall-shell --disable-gpu`**
+  and **not** the `NOT INSTALLED` screen.
+- `wall-firstboot` shows `IF-005: shell artifact present` and
+  `IF-005: ldd resolves every library the Electron runtime needs`.
+- `wall-sync.service` is **FAILED**, and that is correct — see the deltas below.
+
+### Wall-specific deltas (do not mistake these for bugs)
+
+- **No Wi-Fi, by substitution.** The shipped `user-data` declares `wifis:`
+  because the R5-471T has no RJ45. Hyper-V cannot emulate a radio and the
+  *installer* needs the network for apt, so the sim swaps the whole block for
+  the hub's `e*` ethernet matcher. **A gate run this way proves the kiosk,
+  identity and render path and proves NOTHING about the Wi-Fi path** — not
+  `macaddress: permanent`, not powersave-off, not the DHCP reservation the
+  kiosk site's `/32` allow-list is keyed to. Those stay hardware-only (C7).
+- **The SIM `wall.env` is deliberate, in four places.** `SLEEP_MODE=backlight`
+  (a VM that suspends itself at 22:00 is indistinguishable from a VM that
+  died — and with no `/sys/class/backlight` in a guest, backlight mode is inert
+  and the screen stays up for a capture); `WALL_APP_CMD=… --disable-gpu`
+  (`hyperv_drm` gives `/dev/dri/card1` with no `renderD*`, so hardware GL has
+  nothing to bind to); `WIFI_*` filled but unused; `WALL_DISABLE_INPUT` **empty**
+  (quirk 3 would disable the synthetic keyboard and mouse, i.e. the console you
+  need for the GRUB edit).
+- **`wall-sync.service` FAILS at boot.** `MEDIA_SHARE_UNC` points at an
+  obviously-invalid host because sim hub builds skip Samba. Frame video and the
+  local music library are **out of scope** for this gate — a green sync unit
+  with no media would be a lie.
+- **The panel needs a hub to render anything.** The renderer is served by the
+  hub's kiosk site (same-origin: NagLight sends no CORS headers), so the hub ISO
+  must have been built **with** the site payload — `build-seed.sh` logs
+  `deploy-payload/wall-site/ = …` when it was. Both halves carry the same source
+  commit; a hub and a panel whose stamps differ are a mismatched deploy.
+- **Networking for the A19 two-VM gate is not the Default Switch.** The kiosk
+  site's guard is `remote_ip {$PANEL_IP}/32`, which needs a known panel address,
+  and the Internal switch has no DHCP. That is the next session's work — note
+  that the *installer* still needs internet, so the panel VM wants the Default
+  Switch attached during the install or a second adapter.
+
+### Override the SIM values
+
+```sh
+WALL_ENV_OVERRIDES='WALL_HOST=wall.home.arpa
+WALL_PORT=8443' bash vmtest/build-wall-seed.sh
+```
+
+Same discipline as `SIM_ENV_OVERRIDES`: a key that is not already in
+`wall.env.example` **fails the build** rather than appending a line nothing
+reads. `WALL_SHELL_DIST=` points at a `dist/` elsewhere;
+`ALLOW_MISSING_SHELL=1` builds the image layer alone, loudly.
+
+### There is no production path here
+
+`WALL_SITE_DIR` is **refused outright**. A production panel image needs a
+materialised `user-data.filled` (real SSH key, the panel's REAL disk pin) and a
+real `wall.env` (the Wi-Fi PSK), and nothing emits either — Personal's
+materialiser covers the hub only. Half of that would mix real secrets into a
+sim-substituted `user-data`, which is the silent downgrade the hub's `SITE_DIR`
+guards exist to prevent. Until it exists, a real panel is imaged by hand.

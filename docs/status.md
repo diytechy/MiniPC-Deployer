@@ -26,9 +26,26 @@ last) — it is the record, not required reading for every pass.
     - OI-5 — **Run the V3 gate** (WI-10.18): enable Hyper-V (elevated,
       machine-level, needs a reboot), create the VM, do the one-time GRUB
       edit (light path), and confirm compose-up →
-      [vmtest/README.md](../vmtest/README.md). Nobody has booted a VM from
-      this yet — scripts delivered + partially smoke-tested, boot itself is
-      the Owner's step (elevation + Hyper-V).
+      [vmtest/README.md](../vmtest/README.md). **The HUB half is DONE** — the
+      gate ran 2026-07-31 and again 2026-08-01 (see the audit entries; the
+      first one PASSED while running a three-week-stale tracker image).
+    - OI-17 — **Boot the WALL ISO** (2026-08-02, new): `build-wall-seed.sh`
+      produces `vmtest/.out/wall/wall-seed.iso` and nobody has booted it →
+      [vmtest/README.md §11](../vmtest/README.md). The bar is
+      `journalctl -t wall-kiosk` showing `starting: cage -- …` rather than the
+      NOT INSTALLED screen. Everything short of a display is verified (the
+      artifact unpacks with its setuid bit, `ldd` resolves, Electron reaches
+      Ozone init in a bare 24.04) — **whether it paints under `cage` is not**,
+      and it is the whole point of the A19 two-VM gate.
+    - OI-18 — **No production path for the wall image** (2026-08-02, new):
+      `build-wall-seed.sh` emits SIM images only and refuses `WALL_SITE_DIR`
+      outright, because a real panel image needs a materialised
+      `user-data.filled` (real key, the panel's REAL disk pin) *and* a real
+      `wall.env` (the Wi-Fi PSK), and Personal's materialiser emits neither.
+      Half of that would put real secrets on a sim-substituted `user-data` —
+      the silent downgrade the hub's `SITE_DIR` guards exist to prevent. Until
+      it exists, a real panel is imaged by hand. Owner's call whether that is
+      worth building for one machine.
     - OI-6 — **C: free space is tight (~9GB)** after this session's ISO
       download/repack smoke test — WSL2's `ext4.vhdx` grew and does not
       auto-shrink on file deletion (see vmtest/README.md §2 for the
@@ -2303,3 +2320,97 @@ because the git commit fails afterwards. A feeder reads 500 as failure and, unde
 never-silent-green, reports red or retries — for data that was stored. The
 homehub image is not exposed (D3 forces `TRACKER_COMMIT=false`), but the sim runs
 in exactly that configuration, which is how it was found.
+
+### DRIVER — G1 — Round 1 — 2026-08-02 (E0's WIRING HALF — THE WALL IMAGE NOW EXISTS)
+
+`grep -rln "wall" vmtest/*.sh vmtest/*.ps1` returned **nothing** before this
+session. The repo had a complete, sim-validated wall autoinstall
+(`stack/autoinstall/wall/`, SR-016/017) and no way to turn it into a bootable
+image, and OfficeWallNaglight had — since 2026-08-02, PKG-1 — an artifact that
+**nothing took**. Two halves of E0, neither connected to the other.
+
+**What landed.**
+
+1. **`vmtest/build-wall-seed.sh`** — the second image target's seed ISO
+   (~112 MB; it carries the 111 MB shell tarball). Built for real, twice.
+2. **Reuse, not a fork.** The mechanism both targets share — CIDATA discovery,
+   the ephemeral SSH key, the repo-into-payload copy, the assert-every-
+   substitution discipline — moved into `lib/common.sh` helpers that
+   `build-seed.sh` now calls too. The hub ISO rebuilt with no behaviour change.
+   A `--wall` flag was rejected deliberately: one code path with two sets of
+   load-bearing assertions is how one of them quietly stops biting.
+3. **The panel installs the app.** Wall `user-data` late-command 3b untars the
+   payload's shell tarball into `/opt/wall-panel/app`. **As root, with `tar`** —
+   `chrome-sandbox` must arrive `4755 root:root` or Electron refuses to start
+   (24.04's `apparmor_restrict_unprivileged_userns=1` closed the alternative),
+   and a `cp`/unzip/rsync drops the bit silently.
+4. **The hub serves the renderer.** `firstboot.sh` step 3d unpacks the site
+   tarball into `stack/wall-shell/` before compose up, so the kiosk site has a
+   real document root instead of 404ing at `/`. Two payloads exist at all
+   because NagLight sends no CORS headers; both carry the same source commit, so
+   a mismatched deploy is now visible with `cat`.
+5. **A SIM `wall.env`**, installed 0600 by late-command 4a — the same `site/`
+   seam shape the hub image uses.
+
+**The `ldd` check, moved to where it can still be acted on.** A missing shared
+library is a **black wall**: Electron exits before painting, `wall-kiosk.sh`
+restarts it every 3 s, and `[ -x ]` stays true so the NOT INSTALLED screen never
+fires either. `stack/autoinstall/wall/electron-runtime-deps.tsv` maps every
+soname the shipped binary declares to its noble package (resolved with `dpkg -S`
+and `apt-cache policy`, not guessed — note the `t64` renames), the builder reads
+`DT_NEEDED` out of the artifact it is about to bake and refuses to build if
+anything is unmapped or uninstalled, and `validate_config.py` keeps the table and
+the `packages:` list in step on every commit.
+
+**Measured, not reasoned** (a bare `ubuntu:24.04` with exactly this image's
+package list, plus the installer's own late-commands run verbatim against a fake
+`/target`):
+
+- the artifact unpacks, `chrome-sandbox` is `4755 root:root`, `[ -x
+  /opt/wall-panel/app/wall-shell ]` is **true**;
+- `ldd` on the Electron runtime resolves **everything** — the package list is
+  sufficient, not merely declared (without it, it stops at `libnspr4.so`, which
+  is exactly where PKG-1's session left it);
+- run as an unprivileged user the wrapper execs and Electron reaches **Ozone
+  platform init**, stopping only for want of a display.
+
+**Seven refusals, each verified to bite** (never-silent-green — an assertion
+nobody has seen fire is a comment): missing artifact; `-dirty` artifact; two
+candidate artifacts; an unmapped soname; a mapped package the image does not
+install; `WALL_SITE_DIR` (there is no production path); and the disk-pin guard.
+
+**Containment, the hub's rule applied to the panel.** The sim rewrites the disk
+match to `model: Virtual_Disk` and refuses to build if that `sed` no-ops or if
+the panel's real `KINGSTON` model survives in an active setting. A sim ISO
+written to a USB stick cannot wipe the real panel. (The first version of that
+guard was a plain substring grep and refused a good build — the user-data
+*explains* the pin in a comment naming the disk. Anchored to an active YAML
+setting, which is the same lesson `user-data.filled`'s guards learned on
+2026-07-30.)
+
+**NOT PROVEN, and it is the whole of the next gate.** Nobody has booted the wall
+ISO. Nothing has watched Electron come up under `cage` on a display; the
+container run above stops at "Missing X server or $DISPLAY", and it did so via
+X11 — with no `WAYLAND_DISPLAY` set, `--ozone-platform-hint=auto` chose X11,
+which is consistent with the concern that made PKG-1's wrapper force
+`--ozone-platform=wayland` outright. Also unproven: the panel's Wi-Fi path,
+which the sim **removes** (Hyper-V cannot emulate a radio and the installer needs
+apt, so the wall's `wifis:` block is swapped for the hub's `e*` ethernet
+matcher). A gate run this way proves the kiosk/identity/render path and nothing
+about `macaddress: permanent`, powersave-off, or the DHCP reservation the `/32`
+allow-list is keyed to. Those stay hardware-only (C7).
+
+**Assumptions recorded** (AGENTS.md "running unattended"), all four in the SIM
+`wall.env` and all four reversible with `WALL_ENV_OVERRIDES`:
+`SLEEP_MODE=backlight` (a VM that suspends at 22:00 looks identical to a VM that
+died; with no `/sys/class/backlight` in a guest it is additionally inert, so the
+screen stays up for a capture); `--disable-gpu` on `WALL_APP_CMD` (`hyperv_drm`
+gives `card1` with no `renderD*`); Wi-Fi values filled but unused;
+`WALL_DISABLE_INPUT` empty (quirk 3 would disable the synthetic keyboard and
+mouse — the console needed for the GRUB edit).
+
+**Open after this.** `config.json` is IF-005's last gap and nobody renders it.
+There is no production path for a wall image: `WALL_SITE_DIR` is refused because
+half a production build — real secrets on a sim-substituted `user-data` — is the
+silent downgrade the hub's guards exist to prevent. A real panel is still imaged
+by hand.

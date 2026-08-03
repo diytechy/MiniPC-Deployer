@@ -65,14 +65,7 @@ for arg in "$@"; do
     esac
 done
 
-ISO_TOOL=""
-if command -v genisoimage >/dev/null 2>&1; then
-    ISO_TOOL="genisoimage"
-elif command -v xorriso >/dev/null 2>&1; then
-    ISO_TOOL="xorriso"
-else
-    die "need genisoimage or xorriso. Install with: sudo apt-get install -y genisoimage xorriso"
-fi
+require_iso_tool
 
 # With the Q10.9 B+ ALL-IMAGES payload, the seed grows from ~1MB to ~1GB: size
 # the check for the staged payload copy + the resulting seed ISO (+ margin).
@@ -86,16 +79,15 @@ render_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-seed.sh"
 # the CIDATA seed carries every container image (it just gets big — see README).
 stage_images_into_payload "$OUT_DIR" "$IMAGES_OUT"
 
+# IF-005: the wall kiosk site's document root. The hub is the ORIGIN the panel's
+# renderer is served from (NagLight sends no CORS headers, so the renderer and
+# the /api/* proxy must share an origin) — so the site half of
+# OfficeWallNaglight's build belongs in THIS image, not the panel's. Absent is
+# tolerated: a checkout without that private sibling still builds a hub.
+stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
+
 SEED_ISO="$OUT_DIR/seed.iso"
-log "building $SEED_ISO with $ISO_TOOL (volume label CIDATA)"
-case "$ISO_TOOL" in
-    genisoimage)
-        genisoimage -output "$SEED_ISO" -volid CIDATA -joliet -rock "$OUT_DIR/iso-root" >/dev/null
-        ;;
-    xorriso)
-        xorriso -as genisoimage -output "$SEED_ISO" -volid CIDATA -joliet -rock "$OUT_DIR/iso-root" >/dev/null
-        ;;
-esac
+write_seed_iso "$OUT_DIR/iso-root" "$SEED_ISO"
 
 log "OK — seed ISO ready: $SEED_ISO"
 log "SSH:     ssh -i $SSH_KEY hub@<vm-ip>   (fingerprint: $(ssh-keygen -lf "$SSH_KEY.pub"))"

@@ -93,6 +93,10 @@ render_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
 # deploy-payload dir (images and all) into the ISO's /deploy-payload/ area.
 stage_images_into_payload "$OUT_DIR" "$IMAGES_OUT"
 
+# IF-005: the wall kiosk site's document root rides in the same payload dir, so
+# the `-map .../deploy-payload /deploy-payload` below carries it too.
+stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
+
 # ── 2. stage a /nocloud directory (xorriso -map wants one disk dir per iso
 #      dir; iso-root/ from render_seed_tree already has user-data+meta-data
 #      side by side, so just point -map at it directly under /nocloud) ──────

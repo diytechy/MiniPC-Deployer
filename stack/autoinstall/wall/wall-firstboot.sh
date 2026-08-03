@@ -183,8 +183,25 @@ log "quirk 5: Wi-Fi powersave disabled, MAC randomization pinned off"
 # netplan: rendered from wall.env so the PSK lives in exactly one place.
 if [ -n "${WIFI_SSID:-}" ] && [ "${WIFI_SSID}" != "REPLACE_WITH_WIFI_SSID" ]; then
     NETPLAN=/etc/netplan/60-wall-wifi.yaml
-    sed -e "s|@@WIFI_SSID@@|${WIFI_SSID}|g" -e "s|@@WIFI_PSK@@|${WIFI_PSK:-}|g" \
-        "$PAYLOAD/netplan-wifi.yaml.template" > "$NETPLAN"
+    # BASH SUBSTITUTION, NOT sed — and this is a correctness fix, not a style
+    # one. These two values are a real SSID and a real Wi-Fi PSK, i.e. arbitrary
+    # user text, and they used to be pasted straight into a `s|…|…|` expression:
+    #   PSK containing '|'  -> sed errors, and under `set -e` firstboot dies
+    #                          HERE, before installing the tty1 autologin, so the
+    #                          panel never enters the kiosk at all;
+    #   SSID containing '&' -> sed expands it to the whole match and the netplan
+    #                          silently names the WRONG network;
+    #   backslashes         -> same class, silently.
+    # On a machine whose only link is Wi-Fi and whose console account is locked,
+    # either outcome is a panel nobody can reach. `${var//pat/repl}` treats the
+    # replacement as literal text, so nothing needs escaping and nothing can be
+    # re-interpreted.
+    NETPLAN_BODY="$(cat "$PAYLOAD/netplan-wifi.yaml.template")"
+    NETPLAN_BODY="${NETPLAN_BODY//@@WIFI_SSID@@/$WIFI_SSID}"
+    NETPLAN_BODY="${NETPLAN_BODY//@@WIFI_PSK@@/${WIFI_PSK:-}}"
+    printf '%s\n' "$NETPLAN_BODY" > "$NETPLAN"
+    grep -q '@@WIFI_' "$NETPLAN" && \
+        warn "netplan still holds an @@WIFI_*@@ placeholder — the template gained a knob wall-firstboot.sh does not fill."
     # 0600 or netplan refuses to read it (and it holds the PSK).
     chmod 0600 "$NETPLAN"
     netplan generate >/dev/null 2>&1 || warn "netplan generate failed — check $NETPLAN"
@@ -265,7 +282,23 @@ if [ "$(tty)" = "/dev/tty1" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
 fi
 EOF
 systemctl daemon-reload
-log "kiosk: tty1 autologin + profile hook installed (session starts on next boot)"
+# RESTART getty@tty1, or the panel does not enter the kiosk until a SECOND
+# reboot. wall-firstboot.service runs After=network-online.target, by which time
+# getty@tty1 is already up with its ORIGINAL configuration — and
+# `daemon-reload` does not restart a running unit. So the first boot of a
+# freshly imaged panel showed a plain login prompt on a machine whose account
+# has a LOCKED password: no kiosk, and no way to log in at the console either.
+# It looked exactly like a failed image. Restarting is also what makes
+# `sudo /usr/local/sbin/wall-firstboot.sh` the documented way to apply a
+# wall.env change: the kiosk comes back with the new values.
+#
+# `--no-block` because the drop-in sets `Type=idle`, which waits for the run
+# queue to drain — and this script IS a job in that queue. A blocking restart
+# would sit there until systemd's 5 s idle timeout gave up. Enqueue and return;
+# the kiosk comes up a moment later either way.
+systemctl restart --no-block getty@tty1.service >/dev/null 2>&1 \
+    || warn "could not enqueue a getty@tty1 restart — the kiosk starts on the next reboot instead"
+log "kiosk: tty1 autologin + profile hook installed, getty@tty1 restart enqueued (the session starts now, not next boot)"
 
 # ── 8. OI-15 — the media cache and the pull unit ─────────────────────────────
 # The panel PULLS its media (the Owner's ruling, 2026-07-29): wall-sync.service

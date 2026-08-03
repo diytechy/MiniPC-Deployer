@@ -27,14 +27,19 @@
 # and booted on the real panel, cannot wipe it. The build refuses to proceed if
 # that substitution silently no-ops or if the panel's real disk model survives.
 #
-# SECRETS: every value materialized here is a throwaway SIM placeholder for a
-# local VM. There is NO production path — this builder refuses WALL_SITE_DIR
-# outright (see render_wall_seed_tree), because nothing materialises a real
-# panel wall.env yet and half a production build is worse than none.
+# SECRETS: by default every value materialized here is a throwaway SIM
+# placeholder for a local VM. With WALL_SITE_DIR pointing at Personal's
+# `homelab\deploy\out\wall` this is a REAL build instead — the ISO then carries
+# the panel's real Wi-Fi PSK and its real disk pin, and is a secret artifact.
+# The two are never mixed: WALL_SITE_DIR without a `user-data.filled` is refused
+# rather than half-applied (that would put real secrets on a sim-substituted
+# user-data — allow-pw: true and a known sim hash).
 #
 # Usage:
 #   bash vmtest/build-wall-seed.sh
 #   bash vmtest/build-wall-seed.sh --clean          # regen SSH key + SIM secrets
+#   WALL_SITE_DIR=C:/Projects/Personal/homelab/deploy/out/wall \
+#     bash vmtest/build-wall-seed.sh                # PRODUCTION (see above)
 #   OUT_DIR=/mnt/d/vmtest-out bash vmtest/build-wall-seed.sh
 #   WALL_SHELL_DIST=/path/to/OfficeWallNaglight/dist bash vmtest/build-wall-seed.sh
 #   WALL_ENV_OVERRIDES='WALL_HOST=wall.home.arpa
@@ -59,10 +64,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 REPO_ROOT="$(repo_root)"
-# Under vmtest/.out/ so the hub builder's --exclude=vmtest/.out keeps this
-# build's output (including a 111 MB tarball) out of the HUB's payload — and
-# vice versa. Separate subdirectories because each holds its own iso-root/.
-OUT_DIR="${OUT_DIR:-$REPO_ROOT/vmtest/.out/wall}"
+# A SIBLING of the hub's vmtest/.out, not a child. The first draft nested it,
+# which meant an ordinary `build-seed.sh --clean` — whose whole job is
+# `rm -rf $OUT_DIR` — silently deleted this build's ISO, SSH key and SIM
+# credentials. Both are gitignored, so neither ends up in the other's payload.
+OUT_DIR="${OUT_DIR:-$REPO_ROOT/vmtest/.out-wall}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -90,8 +96,15 @@ WALL_SEED_ISO="$OUT_DIR/wall-seed.iso"
 write_seed_iso "$OUT_DIR/iso-root" "$WALL_SEED_ISO"
 
 log "OK — wall seed ISO ready: $WALL_SEED_ISO ($(( $(stat -c%s "$WALL_SEED_ISO") / 1024 / 1024 )) MB)"
-log "SSH:     ssh -i $SSH_KEY panel@<vm-ip>   (fingerprint: $(ssh-keygen -lf "$SSH_KEY.pub"))"
-log "Console: tty1 runs the KIOSK. For a shell use Ctrl+Alt+F2, user 'panel',"
-log "         SIM password in $CREDS_FILE"
+if [ "$WALL_BUILD_KIND" = "production" ]; then
+    log "*** PRODUCTION IMAGE — it carries the REAL Wi-Fi PSK and the panel's REAL disk pin."
+    log "    It is SSH-key-only with a locked console password: the key in"
+    log "    $WALL_SITE_DIR/user-data.filled is the ONLY way in, and tty1 runs the kiosk."
+    log "    Treat this ISO as a secret artifact. It WILL wipe a disk matching the pin."
+else
+    log "SSH:     ssh -i $SSH_KEY panel@<vm-ip>   (fingerprint: $(ssh-keygen -lf "$SSH_KEY.pub"))"
+    log "Console: tty1 runs the KIOSK. For a shell use Ctrl+Alt+F2, user 'panel',"
+    log "         SIM password in $CREDS_FILE"
+fi
 log "Next: vmtest/README.md §11 — New-HomeHubVm.ps1 with -VMName Wall-VMTest and"
 log "      -SeedIsoPath $WALL_SEED_ISO"

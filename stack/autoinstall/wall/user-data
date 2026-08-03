@@ -224,6 +224,11 @@ autoinstall:
     # produces 0777 — the file carries the Wi-Fi PSK. The payload copy is
     # tightened for the same reason.
     - curtin in-target --target=/target -- bash -c '[ -f /opt/wall-panel/site/wall.env ] && { install -d -m 0755 /etc/wall-panel && install -m 0600 /opt/wall-panel/site/wall.env /etc/wall-panel/wall.env && chmod 0600 /opt/wall-panel/site/wall.env; } || true'
+    # cifs.creds, when a production build staged one: MEDIA_CIFS_CREDENTIALS
+    # defaults to exactly this path, and wall-sync.sh mounts the media share
+    # with it. Absent, the sync fails loudly at boot — which is intended, not a
+    # silent degrade (a wall with no music and a green unit would be a lie).
+    - curtin in-target --target=/target -- bash -c '[ -f /opt/wall-panel/site/cifs.creds ] && { install -d -m 0755 /etc/wall-panel && install -m 0600 /opt/wall-panel/site/cifs.creds /etc/wall-panel/cifs.creds && chmod 0600 /opt/wall-panel/site/cifs.creds; } || true'
 
     # ---- 4. Seed wall.env from the example if not pre-filled ------------------
     # Root-only: it carries the Wi-Fi PSK and (if enabled) music credentials.

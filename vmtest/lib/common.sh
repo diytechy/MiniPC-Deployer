@@ -106,6 +106,66 @@ PY
     log "autoinstall YAML validated: command sections are well-formed"
 }
 
+# assert_storage_pin FILE sim|production — check the disk match STRUCTURALLY.
+#
+# The grep guards elsewhere in this file read LINES. That was enough while the
+# only question was "did the sed bite", and it is not enough for the question
+# that actually matters: *what disk will this unattended install wipe?* A
+# `model: Virtual_Disk` anywhere in the document — a comment's example, a
+# future second storage stanza, a `network:` key that happens to be indented the
+# same — satisfies a line-based positive assertion while the REAL pin says
+# something else entirely. An adversarial review made exactly that point.
+#
+# So parse it, walk to autoinstall.storage.layout.match, and judge THAT mapping:
+#   sim         -> must be exactly {model: Virtual_Disk}. Only a Hyper-V
+#                  synthetic disk reports ID_MODEL=Virtual_Disk, so on real
+#                  hardware this matches nothing and the install HALTS. A match
+#                  that matches nothing is fail-safe; an ABSENT match is not —
+#                  Subiquity then picks by heuristic, and every attached disk,
+#                  including a 4 TB library drive, is a candidate.
+#   production  -> must have a match, and must NOT be the sim's. A production
+#                  stick pinned to Virtual_Disk halts on the real panel with
+#                  nothing on screen saying why.
+assert_storage_pin() {
+    local f="$1" mode="$2"
+    require_cmd python3 "Install it with: sudo apt-get install -y python3 python3-yaml"
+    python3 - "$f" "$mode" <<'PY' || die "storage pin check FAILED for $f (see above) — refusing to bake an unattended installer whose disk selection is not what this build intends."
+import sys, yaml
+
+path, mode = sys.argv[1], sys.argv[2]
+ai = yaml.safe_load(open(path))
+ai = ai.get("autoinstall", ai)
+
+layout = ((ai.get("storage") or {}).get("layout") or {})
+match = layout.get("match")
+
+if not isinstance(match, dict) or not match:
+    sys.exit(
+        "storage.layout has no `match:` mapping. Subiquity would pick the install\n"
+        "disk by heuristic and wipe it, unattended — every attached disk is a\n"
+        "candidate, including the library and backup drives.")
+
+if mode == "sim":
+    if match != {"model": "Virtual_Disk"}:
+        sys.exit(
+            f"the SIM storage match is {match!r}, expected exactly "
+            "{'model': 'Virtual_Disk'}.\n"
+            "A sim ISO must be able to select NOTHING BUT a virtual disk: it may end\n"
+            "up on a USB stick, and the real panel is one boot away from it.")
+elif mode == "production":
+    if match.get("model") == "Virtual_Disk":
+        sys.exit(
+            "a PRODUCTION image is pinned to model: Virtual_Disk — the SIM pin.\n"
+            "On the real panel it matches nothing and every install halts with no\n"
+            "explanation. This artifact was materialised from a sim source.")
+else:
+    sys.exit(f"unknown mode {mode!r}")
+
+print(f"storage pin OK ({mode}): storage.layout.match = {match}")
+PY
+    log "storage pin validated structurally ($mode) — not by grep"
+}
+
 # compose_escape VALUE — encode VALUE for a compose `.env`, printed on stdout.
 #
 # Docker Compose interpolates `$VAR` inside .env VALUES, not just in the compose
@@ -266,16 +326,42 @@ ensure_sim_ssh_key() {
 # copy_repo_into_payload REPO_ROOT PAYLOAD_DIR — materialize the deploy payload.
 #
 # Both images' late-commands expect the repo tree at the payload root
-# (deploy-payload/stack/...). vmtest/.out is excluded because it holds the
-# build's own multi-hundred-MB output — including, since the wall target
-# landed, the OfficeWallNaglight tarballs, which are staged into the payload
-# deliberately by stage_wall_*_into_payload rather than swept in by this copy.
+# (deploy-payload/stack/...).
+#
+# TRACKED FILES ONLY, VIA `git ls-files`. This used to be `tar --exclude=.git
+# --exclude=vmtest/.out .`, i.e. the whole worktree — which quietly baked every
+# GITIGNORED file into an image that is then written to a USB stick. That is not
+# theoretical: a review found `stack/provision/.token` (64 bytes, documented as
+# non-expiring) inside a freshly built payload, and a dev box that has ever run
+# the real stack also has a real `stack/.env` sitting right there. Both would
+# have shipped. Ignored means "not part of the deploy unit", and the payload is
+# a deploy unit.
+#
+# Nothing the images need is untracked: the SIM `.env`, the materialised `site/`
+# files, the container image tars and the OfficeWallNaglight tarballs are all
+# staged into the payload AFTER this call, deliberately and one at a time.
+#
+# The whole-worktree copy stays as a fallback for a non-git export (a source
+# tarball), and says loudly what it cannot promise.
 copy_repo_into_payload() {
     local repo_root="$1" payload_dir="$2"
     rm -rf "$payload_dir"
     mkdir -p "$payload_dir"
-    log "copying repo into deploy-payload/ (excludes .git, vmtest/.out)"
-    ( cd "$repo_root" && tar -c --exclude=.git --exclude=vmtest/.out . ) | ( cd "$payload_dir" && tar -x )
+
+    if command -v git >/dev/null 2>&1 && git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
+        local n
+        n=$(git -C "$repo_root" ls-files | wc -l)
+        [ "$n" -gt 0 ] || die "git ls-files returned nothing in $repo_root — refusing to build an empty payload."
+        log "copying $n TRACKED file(s) into deploy-payload/ (gitignored files are NOT baked)"
+        # -z + --null: paths with spaces are ordinary here (docs/, stack/samba/).
+        ( cd "$repo_root" && git ls-files -z | tar -c --null -T - ) | ( cd "$payload_dir" && tar -x )
+    else
+        log "WARNING: $repo_root is not a git checkout (or git is absent) — falling back to a"
+        log "  WHOLE-WORKTREE copy. Anything gitignored and present will be BAKED INTO THE"
+        log "  IMAGE, including stack/.env and stack/provision/.token if they exist here."
+        ( cd "$repo_root" && tar -c --exclude=.git --exclude=vmtest/.out --exclude=vmtest/.out-wall . ) \
+            | ( cd "$payload_dir" && tar -x )
+    fi
 }
 
 # set_env_key FILE KEY VALUE — rewrite an EXISTING KEY= line, then PROVE it.
@@ -287,6 +373,41 @@ copy_repo_into_payload() {
 # helper refuses to ADD a key (a typo'd knob would otherwise append a line the
 # consumer never reads) and re-reads the file afterwards to confirm the value
 # landed byte-for-byte.
+
+# wipe_build_dir DIR — what `--clean` actually does, with a brake on it.
+#
+# `CLEAN=1` means `rm -rf $OUT_DIR`, and OUT_DIR is an environment variable the
+# README tells you to set (`OUT_DIR=/mnt/d/vmtest-out …`). One typo —
+# `OUT_DIR=/mnt/d bash vmtest/build-seed.sh --clean` — and the recursive delete
+# is aimed at a whole drive. Nothing about the rest of the build needs that
+# power, so take it away: only ever wipe a directory THIS BUILDER made, proven
+# by a marker it drops itself. Anything else is refused with the manual command,
+# so the operator deletes it deliberately or not at all.
+wipe_build_dir() {
+    local dir="$1"
+    [ -d "$dir" ] || return 0
+    case "$dir" in
+        ''|/|/root|/home|/tmp|/mnt|/mnt/*/|"$HOME") die "refusing to wipe '$dir'" ;;
+    esac
+    if [ -e "$dir/.vmtest-build-dir" ] || [ -e "$dir/iso-root" ]; then
+        log "CLEAN=1: wiping previous $dir"
+        rm -rf "$dir"
+        return 0
+    fi
+    die "refusing to 'rm -rf $dir' — it does not look like a vmtest build directory" \
+        "(no .vmtest-build-dir marker and no iso-root/ inside it)." \
+        "OUT_DIR is an env var and --clean is a recursive delete; a typo there is a" \
+        "very bad afternoon. If you really meant that path, empty it yourself first."
+}
+
+# mark_build_dir DIR — drop the marker wipe_build_dir looks for.
+mark_build_dir() {
+    mkdir -p "$1"
+    printf '%s\n' \
+        "# Written by vmtest/lib/common.sh. Its presence is what allows --clean to" \
+        "# 'rm -rf' this directory. Everything here is generated; nothing is precious." \
+        > "$1/.vmtest-build-dir"
+}
 
 # sed_delim TEXT — print a sed delimiter character TEXT does not contain.
 #
@@ -340,10 +461,8 @@ render_seed_tree() {
     require_cmd openssl "Install with: sudo apt-get install -y openssl"
     require_cmd ssh-keygen "Install with: sudo apt-get install -y openssh-client"
 
-    if [ "${CLEAN:-0}" -eq 1 ] && [ -d "$out_dir" ]; then
-        log "CLEAN=1: wiping previous $out_dir"
-        rm -rf "$out_dir"
-    fi
+    [ "${CLEAN:-0}" -eq 1 ] && wipe_build_dir "$out_dir"
+    mark_build_dir "$out_dir"
 
     mkdir -p "$out_dir/ssh" "$out_dir/iso-root/deploy-payload" "$out_dir/secrets"
     chmod 700 "$out_dir/ssh" "$out_dir/secrets"
@@ -710,11 +829,13 @@ find_wall_artifact() {
             "$(printf '%s ' "${matches[@]##*/}")" \
             "Which one would ship is a coin flip. Clear the stale ones (npm run dist --clean) and rebuild."
     fi
-    case "${matches[0]}" in
+    # BASENAME, not the whole path: `WALL_SHELL_DIST=/builds/pr-dirty-fix/dist`
+    # is a directory name, not a claim about the artifact.
+    case "${matches[0]##*/}" in
         *-dirty*)
-            die "refusing to bake ${matches[0]##*/} — it was built from an UNCOMMITTED tree." \
-                "Its build-info.json says \"dirty\": true, so the commit it names does not describe" \
-                "what is inside it and the image could never be reproduced from its own stamp." \
+            die "refusing to bake ${matches[0]##*/} — its filename says it was built from an" \
+                "UNCOMMITTED tree, so the commit it names does not describe what is inside it" \
+                "and the image could never be reproduced from its own stamp." \
                 "Commit in OfficeWallNaglight, then re-run: npm run dist"
             ;;
     esac
@@ -740,6 +861,48 @@ find_wall_artifact() {
 #
 # 1 and 2 are read out of the ARCHIVE, not out of an extracted tree, because the
 # extraction is exactly where the bits get lost.
+
+# artifact_sha7 PATH — the g<sha7> stamp out of an artifact's filename.
+artifact_sha7() {
+    printf '%s' "$1" | sed -n 's/.*-g\([0-9a-f]\{7,\}\)\(-dirty\)\?\(-linux-x64\)\?\.tar\.gz$/\1/p'
+}
+
+# assert_payload_stamps_agree DIST_DIR KIND SHA7 — the mismatch nobody can see.
+#
+# PKG-1's whole argument for two payloads is that ONE build emits both with ONE
+# source stamp, so a hub and a panel that disagree are visible rather than
+# invisible. That argument is worth nothing if the builders never look. A review
+# pointed out that each stager staged its own artifact and neither compared —
+# so a shell tarball from one commit and a site tarball from another would both
+# stage happily, and the "visible mismatch" would be two files nobody read.
+#
+# Checked here, where both are on the same disk, because it is the LAST moment
+# they are: after this they ride different ISOs onto different machines.
+assert_payload_stamps_agree() {
+    local dist_dir="$1" kind="$2" sha7="$3" other other_sha7 other_glob
+    [ -n "$sha7" ] || return 0
+    case "$kind" in
+        shell) other_glob='officewall-site-*.tar.gz' ;;
+        site)  other_glob='officewall-shell-*-linux-x64.tar.gz' ;;
+    esac
+    local had_nullglob=0
+    shopt -q nullglob && had_nullglob=1
+    shopt -s nullglob
+    local others=("$dist_dir"/$other_glob)
+    [ "$had_nullglob" -eq 1 ] || shopt -u nullglob
+    [ "${#others[@]}" -eq 1 ] || return 0     # absent or ambiguous: not this check's business
+
+    other="${others[0]}"
+    other_sha7="$(artifact_sha7 "$other")"
+    [ -n "$other_sha7" ] || return 0
+    [ "$sha7" = "$other_sha7" ] && return 0
+    die "the two payloads of 'one build' come from DIFFERENT commits:" \
+        "  staged here: g$sha7   other half: g$other_sha7 ($(basename "$other"))" \
+        "The panel's container and the hub's renderer have to agree about /api/*," \
+        "/media/* and the config shape, and a shared source stamp is the only thing" \
+        "that proves they do. Rebuild both together: npm run dist  (it emits both)."
+}
+
 assert_wall_artifact_contract() {
     local repo_root="$1" tarball="$2" probe="$3" listing sandbox_line
     require_cmd tar "Install with: sudo apt-get install -y tar"
@@ -752,6 +915,19 @@ assert_wall_artifact_contract() {
         die "$(basename "$tarball") has no executable app/wall-shell." \
             "WALL_APP_CMD=/opt/wall-panel/app/wall-shell is the contract wall-kiosk.sh tests with [ -x ]." \
             "Listing says: $(grep -E ' app/wall-shell$' "$listing" || echo '<absent>')"
+
+    # The wrapper is only the front door. `[ -x wall-shell ]` can be true while
+    # the two things it execs are broken — and BOTH of those failures are
+    # invisible: the panel restarts every 3 s with nothing on screen, because
+    # `[ -x ]` never becomes false. Assert what the wrapper itself requires.
+    grep -qE '^-rwx.* app/runtime/electron$' "$listing" || \
+        die "$(basename "$tarball")'s app/runtime/electron is not executable." \
+            "The wrapper execs it; a non-executable runtime is a permanently dark panel." \
+            "Listing says: $(grep -E ' app/runtime/electron$' "$listing" || echo '<absent>')"
+    grep -qE ' app/runtime/resources/app/index\.html$' "$listing" || \
+        die "$(basename "$tarball") has no app/runtime/resources/app/index.html — the application" \
+            "bundle is missing, so Electron starts and has nothing to load. Rebuild in" \
+            "OfficeWallNaglight (npm run dist); do not repack by hand."
 
     sandbox_line="$(grep -E ' app/runtime/chrome-sandbox$' "$listing" || true)"
     [ -n "$sandbox_line" ] || die "$(basename "$tarball") has no app/runtime/chrome-sandbox — Electron cannot start without it."
@@ -790,7 +966,9 @@ assert_electron_runtime_deps() {
     local table="$repo_root/stack/autoinstall/wall/electron-runtime-deps.tsv"
     local user_data="$repo_root/stack/autoinstall/wall/user-data"
     [ -f "$table" ] || die "not found: $table (the soname -> package map this check reads)"
+    [ -f "$probe/tar-listing.txt" ] || die "internal: assert_wall_artifact_contract must run first (it writes the listing this check reads)"
     require_cmd readelf "Install with: sudo apt-get install -y binutils"
+    require_cmd python3 "Install it with: sudo apt-get install -y python3"
 
     mkdir -p "$probe"
     log "  reading the shipped binary's DT_NEEDED list (decompresses the archive once)"
@@ -798,8 +976,23 @@ assert_electron_runtime_deps() {
         || die "$(basename "$tarball") is missing one of app/runtime/electron, app/build-info.json, app/VERSION" \
                "— that is not the packaging.md §4 layout this image is wired against."
 
+    # THE STAMP, READ FROM THE ARCHIVE. The filename check in find_wall_artifact
+    # is a convention; this is the fact. A review pointed out that the refusal
+    # message claimed to have read build-info.json when nothing had opened it —
+    # a clean-looking filename around a dirty build would have sailed through.
+    python3 - "$probe/app/build-info.json" <<'PY' || die "the artifact's own build-info.json says it was built from an UNCOMMITTED tree, whatever its filename says. Commit in OfficeWallNaglight and re-run: npm run dist"
+import json, sys
+info = json.load(open(sys.argv[1]))
+sys.exit(1 if (info.get("source") or {}).get("dirty") else 0)
+PY
+
     # The packages: list of the wall user-data, one name per line, comments off.
-    local declared
+    # Written to a FILE, then grepped — never `printf … | grep -q`. Under
+    # pipefail an early-exiting grep SIGPIPEs the writer and the pipeline
+    # reports failure, i.e. the check reports "package missing" precisely when
+    # it FOUND the package. The same shape cost a good site tarball a refusal
+    # ten lines below; once is enough.
+    local declared declared_file="$probe/declared-packages.txt"
     declared="$(awk '
         /^  packages:/            { inpkgs = 1; next }
         inpkgs && /^  [^ ]/       { inpkgs = 0 }
@@ -807,6 +1000,26 @@ assert_electron_runtime_deps() {
             sub(/^[[:space:]]*-[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); print
         }' "$user_data")"
     [ -n "$declared" ] || die "could not read a packages: list out of $user_data"
+    printf '%s\n' "$declared" > "$declared_file"
+
+    # READELF INTO A FILE, AND CHECK IT WORKED. This used to be a here-document
+    # wrapping a command substitution: if `readelf` failed — wrong binutils, a
+    # truncated extraction, an architecture it does not know — the substitution
+    # produced an EMPTY dependency list, the loop below ran zero times, and the
+    # function logged "runtime deps OK". A check that passes hardest when it
+    # cannot see anything is worse than no check, and a review found this one.
+    local needed_list="$probe/dt-needed.txt"
+    readelf -d "$probe/app/runtime/electron" > "$probe/readelf.txt" 2>&1 || \
+        die "readelf could not read app/runtime/electron out of $(basename "$tarball"):" \
+            "$(tail -n 3 "$probe/readelf.txt")" \
+            "Without its DT_NEEDED list this build cannot tell whether the image installs" \
+            "what the shell needs, and a missing library is a black wall. Refusing to guess."
+    sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' "$probe/readelf.txt" | sort -u > "$needed_list"
+    [ -s "$needed_list" ] || \
+        die "app/runtime/electron declares NO shared library dependencies at all." \
+            "A dynamically-linked Electron binary has ~34 of them, so this is not a lucky" \
+            "static build — it is a readelf that parsed something else, or a truncated" \
+            "extraction. Refusing to record a pass this check did not earn."
 
     local soname pkg where missing_map="" missing_pkg=""
     while IFS= read -r soname; do
@@ -820,11 +1033,19 @@ assert_electron_runtime_deps() {
         fi
         pkg="${row%%$'\t'*}"
         where="${row#*$'\t'}"
+        # `bundled` means "the artifact carries it" — so CHECK that it does,
+        # rather than taking the table's word for it. A row marked bundled is
+        # otherwise a hole straight through this whole check.
+        if [ "$where" = "bundled" ]; then
+            grep -qE " app/runtime/$soname\$" "$probe/tar-listing.txt" || \
+                die "$table marks $soname as bundled with the artifact, but the artifact does" \
+                    "not contain app/runtime/$soname. Either the packaging changed or the" \
+                    "table is lying; both end as a black wall."
+            continue
+        fi
         [ "$where" = "image-packages" ] || continue
-        printf '%s\n' "$declared" | grep -qxF "$pkg" || missing_pkg="$missing_pkg $pkg($soname)"
-    done <<EOF
-$(readelf -d "$probe/app/runtime/electron" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | sort -u)
-EOF
+        grep -qxF "$pkg" "$declared_file" || missing_pkg="$missing_pkg $pkg($soname)"
+    done < "$needed_list"
 
     [ -z "$missing_map" ] || \
         die "the shell artifact needs shared library(s) this repo has never heard of:$missing_map" \
@@ -878,6 +1099,7 @@ stage_wall_shell_into_payload() {
     rm -rf "$probe"
     assert_wall_artifact_contract "$repo_root" "$tarball" "$probe"
     assert_electron_runtime_deps "$repo_root" "$tarball" "$probe"
+    assert_payload_stamps_agree "$dist_dir" shell "$(artifact_sha7 "$tarball")"
 
     mkdir -p "$dest"
     # hardlink when the filesystem allows (saves ~110MB of C: — OI-6); else copy.
@@ -919,10 +1141,33 @@ stage_wall_site_into_payload() {
         return 0
     fi
 
+    # OPEN IT. The panel half is checked member-by-member; this one used to be
+    # checked by FILENAME ALONE, so a truncated download or a tar with the wrong
+    # internal layout sailed through the build, and firstboot's unpack failure
+    # is only a WARNING (correct — a hub with no kiosk site is still a working
+    # hub) which then gets stamped `.provisioned` and never retried. The symptom
+    # would surface a session later, as a panel showing nothing.
+    # Listing to a FILE first, not `tar … | grep -q`. Under `set -o pipefail`
+    # (which both hub builders set) grep -q exits at the first match, tar takes
+    # SIGPIPE, and the pipeline reports 141 — so the check fails hardest when
+    # the file is CORRECT. Caught by exactly that: a good site tarball was
+    # refused for having no site/index.html, which it did have.
+    local site_listing="$out_dir/.site-listing.txt"
+    tar -tzf "$tarball" > "$site_listing" 2>/dev/null || \
+        die "$(basename "$tarball") is not a readable gzip — truncated download or a partial write." \
+            "Rebuild it in OfficeWallNaglight (npm run dist)."
+    grep -qx 'site/index.html' "$site_listing" || \
+        die "$(basename "$tarball") has no site/index.html at its root." \
+            "firstboot unpacks it with --strip-components=1 into the kiosk site's document" \
+            "root (packaging.md §4), so the wrong layout means the site 404s at / with" \
+            "nothing failing loudly anywhere. Rebuild it; do not repack by hand."
+
+    assert_payload_stamps_agree "$dist_dir" site "$(artifact_sha7 "$tarball")"
+
     mkdir -p "$dest"
     cp -f "$tarball" "$dest/"
     [ -f "$dist_dir/build-info.json" ] && cp -f "$dist_dir/build-info.json" "$dest/build-info.json"
-    log "deploy-payload/wall-site/ = $(basename "$tarball") ($(( $(stat -c%s "$tarball") / 1024 )) KB)"
+    log "deploy-payload/wall-site/ = $(basename "$tarball") ($(( $(stat -c%s "$tarball") / 1024 )) KB, site/index.html present)"
     log "  -> lands at /opt/homehub/wall-site/; firstboot.sh unpacks it into stack/wall-shell/."
 }
 
@@ -933,19 +1178,21 @@ stage_wall_site_into_payload() {
 # stack/autoinstall/wall/ files with SIM values substituted, plus a filled SIM
 # wall.env in deploy-payload/site/.
 #
-# SIM-ONLY, ON PURPOSE. The hub renderer carries a production seam (SITE_DIR +
-# user-data.filled from Personal's materialiser, A14). The wall has no
-# materialiser output yet, so rather than build a seam nothing feeds — and risk
-# the exact silent downgrade the hub's guards exist to prevent — this refuses a
-# production build outright and says what would have to exist first.
+# TWO PATHS, AND MIXING THEM IS THE DANGEROUS OUTCOME. Same seam as the hub's
+# (A14): with WALL_SITE_DIR pointing at Personal's materialised
+# `homelab\deploy\out\wall`, this is a REAL build — take `user-data.filled`
+# verbatim, stage the real `wall.env`, and skip every sim substitution. Without
+# it, everything is a throwaway placeholder for a local VM.
 #
-# Containment is identical to the hub's and is the reason a sim ISO is safe to
-# have lying around: the disk pin is rewritten to `model: Virtual_Disk`, which
-# ONLY a Hyper-V synthetic disk reports. On real hardware it matches nothing and
-# the unattended install HALTS (a match: that matches nothing is fail-safe; an
+# Containment for the sim path is the reason a sim ISO is safe to have lying
+# around: the disk pin is rewritten to `model: Virtual_Disk`, which ONLY a
+# Hyper-V synthetic disk reports. On real hardware it matches nothing and the
+# unattended install HALTS (a match: that matches nothing is fail-safe; an
 # absent one is not). The panel's own pin — `model: KINGSTON*RBU-SNS8152S3256GG2`
 # — must not survive into a sim image, because a sim ISO written to a USB stick
-# would then be able to wipe the real panel.
+# would then be able to wipe the real panel. The production path has the mirror
+# containment: it refuses a `Virtual_Disk` pin, which on real hardware would
+# halt every install with nothing explaining why.
 render_wall_seed_tree() {
     local repo_root="$1" out_dir="$2" caller="$3"
     local src="$repo_root/stack/autoinstall/wall"
@@ -955,23 +1202,57 @@ render_wall_seed_tree() {
     [ -f "$src/wall.env.example" ] || die "not found: $src/wall.env.example"
     require_cmd openssl "Install with: sudo apt-get install -y openssl"
 
+    # WALL_SITE_DIR set but no user-data.filled would be a SILENT DOWNGRADE, the
+    # hub's exact lesson: the real wall.env (with the Wi-Fi PSK) would still be
+    # staged while user-data fell through to the sim seds below — producing a
+    # "production" stick with allow-pw: true, a known sim password hash, and a
+    # disk pin that matches nothing on the panel. Refuse instead of mixing.
+    WALL_BUILD_KIND=sim   # exported for the caller's summary
     if [ -n "${WALL_SITE_DIR:-}" ]; then
-        die "WALL_SITE_DIR is set, but there is no production path for the wall image yet." \
-            "This builder emits SIM images ONLY. A production panel image needs (a) a" \
-            "materialised user-data.filled carrying the real SSH key and the panel's REAL" \
-            "disk pin, and (b) a real wall.env with the Wi-Fi PSK — neither of which any" \
-            "tool emits today (Personal's materialiser covers the hub only). Building one" \
-            "half of that would mix real secrets into a sim-substituted user-data, which is" \
-            "precisely the silent downgrade the hub's SITE_DIR guards exist to prevent."
+        [ -d "$WALL_SITE_DIR" ] || die "WALL_SITE_DIR=$WALL_SITE_DIR is not a directory"
+        [ -f "$WALL_SITE_DIR/user-data.filled" ] || \
+            die "WALL_SITE_DIR=$WALL_SITE_DIR has no user-data.filled — refusing to stage the real" \
+                "wall.env (it carries the Wi-Fi PSK) onto a SIM-substituted user-data." \
+                "Run:  pwsh Materialize-Deploy.ps1 -Image wall   (Personal\\homelab\\deploy)"
+        WALL_BUILD_KIND=production
     fi
 
-    if [ "${CLEAN:-0}" -eq 1 ] && [ -d "$out_dir" ]; then
-        log "CLEAN=1: wiping previous $out_dir"
-        rm -rf "$out_dir"
-    fi
+    [ "${CLEAN:-0}" -eq 1 ] && wipe_build_dir "$out_dir"
+    mark_build_dir "$out_dir"
 
     mkdir -p "$out_dir/ssh" "$out_dir/iso-root/deploy-payload" "$out_dir/secrets"
     chmod 700 "$out_dir/ssh" "$out_dir/secrets"
+
+    local user_data_out="$out_dir/iso-root/user-data"
+
+    if [ "$WALL_BUILD_KIND" = "production" ]; then
+        log "PRODUCTION: using $WALL_SITE_DIR/user-data.filled (real key + real disk pin; no sim substitution)"
+        SSH_KEY=""; CREDS_FILE=""
+        cp "$WALL_SITE_DIR/user-data.filled" "$user_data_out"
+
+        # Every guard is ANCHORED TO AN ACTIVE SETTING, never to a substring:
+        # this file is the tracked user-data with placeholders filled, and the
+        # tracked user-data explains each of these things in a COMMENT that
+        # quotes the placeholder. A naive grep refuses a perfectly good
+        # production build — which is exactly what happened to the hub's
+        # equivalent guards on 2026-07-30.
+        grep -Eq '^[[:space:]]*[A-Za-z_-]+:.*REPLACE_WITH' "$user_data_out" && \
+            die "user-data.filled has an ACTIVE setting still holding a REPLACE_WITH placeholder — re-run Materialize-Deploy.ps1 -Image wall and fix what it names."
+        grep -Eq '^[[:space:]]*allow-pw:[[:space:]]*true' "$user_data_out" && \
+            die "user-data.filled sets allow-pw: true — the panel is SSH-key-only, same posture as the hub. Refusing to bake it."
+        # THE MOST DESTRUCTIVE LINE IN THE PROJECT IS THE UNGUARDED ONE.
+        # `storage: layout:` wipes whatever Subiquity selects, unattended, and
+        # without a `match:` it picks by heuristic.
+        grep -Eq '^[[:space:]]+(path|serial|model|wwn):' "$user_data_out" || \
+            die "user-data.filled has no storage.layout match: — the unattended wipe would pick a disk by heuristic. Re-run Materialize-Deploy.ps1 -Image wall (its out\\ tree is stale)."
+        grep -Eq '^[[:space:]]+model:[[:space:]]*Virtual_Disk' "$user_data_out" && \
+            die "user-data.filled pins model: Virtual_Disk — that is the SIM pin, and only a Hyper-V synthetic disk reports it. On the real panel it would match nothing and every install would halt with nothing on screen explaining why. This stick was built from a sim artifact; re-run Materialize-Deploy.ps1 -Image wall."
+        # The panel has NO RJ45 (hardware baseline 2026-07-26). A production
+        # image whose network block lost its `wifis:` stanza has no network at
+        # all — and no way to tell you, because telling you needs the network.
+        grep -Eq '^[[:space:]]*wifis:' "$user_data_out" || \
+            die "user-data.filled declares no wifis: — the panel has no ethernet port, so this image would come up with NO network and no way to reach it. Refusing to bake it."
+    else
 
     ensure_sim_ssh_key "$out_dir"
     local ssh_pubkey; ssh_pubkey="$(cat "$SSH_KEY.pub")"
@@ -1002,7 +1283,6 @@ render_wall_seed_tree() {
     fi
 
     # ── user-data: identity + console + disk pin ─────────────────────────────
-    local user_data_out="$out_dir/iso-root/user-data"
     sed \
         -e "s#- \"ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host\"#- \"$ssh_pubkey\"#" \
         -e 's/allow-pw: false/allow-pw: true   # VMTEST ONLY - the real panel is key-only/' \
@@ -1062,23 +1342,78 @@ render_wall_seed_tree() {
         die "the sim user-data still declares Wi-Fi — Hyper-V cannot emulate a radio and the installer would have no network. The awk above did not consume the whole block."
     grep -q 'REPLACE_WITH_WIFI' "$user_data_out" && \
         die "the sim user-data still carries Wi-Fi placeholders. The awk above did not consume the whole block."
+    fi
 
-    # Does Subiquity actually ACCEPT this file? (Same parse, same reasons.)
+    # Does Subiquity actually ACCEPT this file, and WHICH DISK will it wipe?
+    # Both apply to BOTH branches — the production one most of all, since nobody
+    # re-reads a generated file.
     validate_autoinstall_yaml "$user_data_out"
+    assert_storage_pin "$user_data_out" "$WALL_BUILD_KIND"
 
-    # ── meta-data: fresh instance-id per build, vmtest hostname ──────────────
-    sed \
-        -e "s/instance-id: wall-panel-001/instance-id: wall-panel-vmtest-$(date +%Y%m%d%H%M%S)/" \
-        -e 's/local-hostname: wall-panel/local-hostname: wall-panel-vmtest/' \
+    # ── meta-data: a FRESH instance-id per build, always ─────────────────────
+    # cloud-init uses instance-id to decide whether this is a new instance, so a
+    # repeated one can make it skip first-boot work entirely. The hostname is
+    # marked only on the sim path — a production panel must answer to
+    # `wall-panel`, which is what the kiosk site's records point at.
+    local iid="wall-panel-$(date +%Y%m%d%H%M%S)" hostname_sed='' expect_host='wall-panel'
+    if [ "$WALL_BUILD_KIND" = "sim" ]; then
+        iid="wall-panel-vmtest-$(date +%Y%m%d%H%M%S)"
+        hostname_sed='s/local-hostname: wall-panel/local-hostname: wall-panel-vmtest/'
+        expect_host='wall-panel-vmtest'
+    fi
+    sed -e "s/instance-id: wall-panel-001/instance-id: $iid/" \
+        ${hostname_sed:+-e "$hostname_sed"} \
         "$src/meta-data" > "$out_dir/iso-root/meta-data"
-    grep -Eq '^local-hostname: wall-panel-vmtest$' "$out_dir/iso-root/meta-data" || \
-        die "meta-data local-hostname substitution did not apply — update the sed above."
-    grep -Eq '^instance-id: wall-panel-vmtest-[0-9]+$' "$out_dir/iso-root/meta-data" || \
-        die "meta-data instance-id substitution did not apply. cloud-init could treat this as a repeat instance and skip first-boot work. Update the sed above."
+    grep -Eq "^local-hostname: ${expect_host}\$" "$out_dir/iso-root/meta-data" || \
+        die "meta-data local-hostname is not '$expect_host' — stack/autoinstall/wall/meta-data changed shape. Update the sed above."
+    grep -Eq '^instance-id: wall-panel-(vmtest-)?[0-9]+$' "$out_dir/iso-root/meta-data" || \
+        die "meta-data instance-id substitution did not apply — cloud-init could treat this as a repeat instance and skip first-boot work. Update the sed above."
 
     copy_repo_into_payload "$repo_root" "$out_dir/iso-root/deploy-payload"
 
-    render_sim_wall_env "$repo_root" "$out_dir/iso-root/deploy-payload" "$caller"
+    if [ "$WALL_BUILD_KIND" = "production" ]; then
+        stage_wall_site_files "$WALL_SITE_DIR" "$out_dir/iso-root/deploy-payload"
+    else
+        render_sim_wall_env "$repo_root" "$out_dir/iso-root/deploy-payload" "$caller"
+    fi
+}
+
+# stage_wall_site_files SITE_DIR PAYLOAD_DIR — the PRODUCTION config payload.
+#
+# Personal's `Materialize-Deploy.ps1 -Image wall` writes `wall.env` and
+# `user-data.filled` into `homelab\deploy\out\wall`. The first lands here (and
+# then at /etc/wall-panel/wall.env, 0600, via late-command 4a); the second was
+# already consumed above.
+#
+# `cifs.creds` is staged IF PRESENT and is deliberately not required: the
+# materialiser emits it for the hub only today, even though the ruling of
+# 2026-08-01 gave BOTH machines the same read-only `share` account and the
+# panel's MEDIA_CIFS_CREDENTIALS points straight at /etc/wall-panel/cifs.creds.
+# Until that is fixed on the Personal side, a production panel mounts nothing
+# and `wall-sync.service` fails loudly — which is the honest state, but it is a
+# gap, so say so here rather than let a silent absence read as "not needed".
+stage_wall_site_files() {
+    local site_dir="$1" payload_dir="$2"
+    local site_out="$payload_dir/site" staged=0 f
+    mkdir -p "$site_out"
+    for f in wall.env cifs.creds; do
+        if [ -f "$site_dir/$f" ]; then
+            install -m 600 "$site_dir/$f" "$site_out/$f"
+            log "  site/ += $f"
+            staged=$((staged + 1))
+        fi
+    done
+    [ -f "$site_out/wall.env" ] || \
+        die "$site_dir has user-data.filled but no wall.env — the panel would fall back to" \
+            "wall.env.example, i.e. REPLACE_WITH placeholders for the Wi-Fi SSID/PSK and the" \
+            "kiosk host, and come up with no network and no origin. Re-run" \
+            "Materialize-Deploy.ps1 -Image wall."
+    [ -f "$site_out/cifs.creds" ] || \
+        log "NOTE: no cifs.creds in $site_dir — the panel will not be able to mount" \
+            "MEDIA_SHARE_UNC, so wall-sync.service fails and there is no music or frame" \
+            "video. Materialize-Deploy.ps1 emits cifs.creds for the hub image only; the" \
+            "2026-08-01 ruling gave both machines the same read-only 'share' account."
+    log "PRODUCTION build: $staged wall config file(s) staged; sim wall.env generation SKIPPED"
 }
 
 # render_sim_wall_env REPO_ROOT PAYLOAD_DIR CALLER — the SIM /etc/wall-panel/wall.env.

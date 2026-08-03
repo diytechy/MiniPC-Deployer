@@ -48,5 +48,9 @@ stack/caddy_config/
 # seed ISO, and (if downloaded/repacked for a smoke test) the multi-GB Ubuntu
 # ISOs. NONE of this is ever committed — regenerate with the vmtest/ scripts.
 vmtest/.out/
+# build-wall-seed.sh's output. A SIBLING of .out/, not a child, deliberately:
+# the hub's `--clean` does `rm -rf $OUT_DIR`, and nesting made an ordinary hub
+# rebuild silently delete the wall ISO, its SSH key and its SIM credentials.
+vmtest/.out-wall/
 vmtest/*.iso
 

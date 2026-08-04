@@ -38,11 +38,24 @@ After=wall-firstboot.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/wall-sync.sh
-# The FIRST sync copies the whole music library plus the frame set over 802.11
-# from a 2016 laptop's radio; later ones are deltas. Generous, because the failure
-# mode of a too-short timeout is a half-mirrored cache with a red unit every boot.
-# (The every-minute frame unit is capped far lower — it can never have a whole
-# music library to fetch.)
+# THIS UNIT'S TIMEOUT IS A BACKSTOP, NOT THE THING THAT BOUNDS EITHER FLOW.
+# It used to be the only bound, and that made the two flows' hangs dependent:
+# music runs first, and a music mount or rsync wedged on a half-dead Wi-Fi link
+# would burn the whole hour, after which systemd killed the process — so the
+# frame flow never ran at all, in a unit whose header promises that one flow's
+# trouble does not cancel the other. wall-sync.sh now gives each flow its own
+# mount/rsync/unmount budget (flow_spec's F_MOUNT_TIMEOUT / F_RSYNC_TIMEOUT) and
+# aggregates the verdicts, so a wedged music mirror fails ITSELF, by name, and
+# the frame flow still runs in the same pass.
+#
+# The arithmetic this number has to cover:
+#   music  mount 60 s + rsync 3000 s + unmount 30 s   = 3090 s
+#   frame  probe 4 s + mount 20 s + rsync 90 s + unmount 30 s = 144 s
+#   total worst case                                  = 3234 s
+# 3600 s leaves headroom for the manifest walks and the nm-online wait. The FIRST
+# sync copies the whole music library plus the frame set over 802.11 from a 2016
+# laptop's radio; later ones are deltas. Generous, because the failure mode of a
+# too-short timeout is a half-mirrored cache with a red unit every boot.
 TimeoutStartSec=3600
 # Bounded IO priority: the panel is drawing a UI and (once synced) playing music
 # while this runs, and a full first sync should not make the wall stutter.

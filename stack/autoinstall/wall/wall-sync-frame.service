@@ -36,13 +36,19 @@ After=wall-firstboot.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/wall-sync.sh --only frame
-# Bounded well inside the timer's period. The frame set is a handful of rendered
-# videos, not a music library, and the reachability probe is capped at 4 s — so a
-# run that is still going after two minutes is stuck, not busy, and letting it
-# stack up behind a one-minute timer is how a panel ends up with fifty queued
-# jobs. (wall-sync.service keeps its own 3600 s: the FIRST music mirror really
-# can take that long.)
-TimeoutStartSec=120
+# A BACKSTOP, NOT THE PRIMARY BOUND. wall-sync.sh now carries the frame flow's
+# OWN budget and the arithmetic is: probe 4 s + mount 20 s + rsync 90 s +
+# unmount 30 s = 144 s worst case, so this is set above that. The script hitting
+# its own budget produces a NAMED failure ("rsync ... exceeded its 90s budget");
+# systemd hitting this one produces a SIGTERM and no explanation, which is why
+# the script must always get there first.
+#
+# It matters that this is bounded at all: the frame set is a handful of rendered
+# videos, not a music library, so a run still going after two minutes is stuck,
+# not busy, and letting it stack up behind a one-minute timer is how a panel ends
+# up with fifty queued jobs. (wall-sync.service keeps its own 3600 s: the FIRST
+# music mirror really can take that long.)
+TimeoutStartSec=180
 # Same politeness as the boot sync: the panel is drawing a UI and playing music
 # while this runs, and this one runs sixty times an hour.
 IOSchedulingClass=idle

@@ -9,10 +9,15 @@
 # storage map had already put on a one-minute clock before OI-18 made two mounts
 # possible at all.
 #
-# OnUnitActiveSec, not OnCalendar: the period is "a minute after the last run
-# FINISHED", so a slow run cannot make the next one start on top of it. (The
-# per-flow lock in wall-sync.sh is the belt to this braces — systemd will not run
-# two instances of one unit, but wall-sync.service mirrors the frame flow too.)
+# OnUnitInactiveSec, not OnCalendar and NOT OnUnitActiveSec: the period is "a
+# minute after the last run FINISHED". OnUnitActiveSec was wrong for that claim
+# and the comment here used to assert it anyway — it measures from ACTIVATION, so
+# a run that takes longer than a minute re-fires the moment it exits, and a run
+# that consistently takes 90 s would have this timer permanently at zero delay.
+# OnUnitInactiveSec measures from DEACTIVATION, which is what the storage map's
+# "check every minute" means for a job whose duration is not fixed. (The per-flow
+# lock in wall-sync.sh is the belt to this braces — systemd will not run two
+# instances of one unit, but wall-sync.service mirrors the frame flow too.)
 #
 # Persistent= is deliberately ABSENT. It would fire a catch-up run at boot for
 # every minute the panel spent suspended overnight — systemd coalesces that into
@@ -26,7 +31,7 @@ Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=1min
+OnUnitInactiveSec=1min
 AccuracySec=10s
 Unit=wall-sync-frame.service
 

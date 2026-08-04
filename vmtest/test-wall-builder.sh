@@ -14,15 +14,45 @@
 # wall — plus, since OI-18, that the two media flows really do behave DIFFERENTLY
 # where the ruling says they must.
 #
-# THREE SECTIONS:
+# TWO THINGS THE 2026-08-04 REVIEW CHANGED ABOUT THE SUITE ITSELF, and both are
+# about the suite lying rather than about the code:
+#
+#  1. IT MUTATED THE TRACKED TREE. The knob-name cases rewrote
+#     `stack/autoinstall/wall/wall.env.example`, and the dependency-gate cases
+#     rewrote `electron-runtime-deps.tsv` and `user-data`, restoring them from a
+#     backup afterwards — with an EXIT trap that removed only the temp dir. An
+#     interrupt at the wrong moment left the repo damaged. Everything now runs
+#     against an ISOLATED SANDBOX CHECKOUT (`git ls-files` -> `tar` -> `git
+#     init`), the same pattern test-hub-seed.sh already uses, so no case can
+#     touch a tracked file.
+#
+#  2. TWENTY-SIX CASES, AND A SUITE THAT PASSED WITH THE CODE DELETED. All eight
+#     wall-sync assertions SKIPPED on a non-root run or an occupied loopback 445,
+#     and a skip is not a failure — so `wall-sync.sh` could be deleted, or left
+#     unparseable, and this exited zero. There is now a STATIC GATE that always
+#     runs and always FAILS: the scripts must exist and parse, the unit files
+#     must parse and say what the design says they say, and the autoinstall must
+#     actually install and enable them. The root-only cases still skip, but they
+#     are no longer the only thing standing between a deleted file and a green
+#     suite.
+#
+# SECTIONS:
+#   0.   the STATIC gate — always runs, never skips (scripts parse; units parse
+#        and match the design; user-data installs and enables them; firstboot
+#        judges the enable instead of claiming it)
 #   1-3. the builder's guards (the original suite)
 #   4.   the OI-18 production seam — two credential files, staged and reported
-#        individually, and the retired single one refused
-#   5.   wall-sync.sh's TWO FLOWS, exercised through the bench hooks: the frame
-#        share's content is at its share ROOT while music sits under a subdir,
-#        and an unreachable frame source is a SKIP while an unreachable music
-#        source is an ALERT. Section 5 needs root (it takes a lock under /run and
-#        calls mount); without it the cases SKIP loudly rather than vanishing.
+#        individually, the payload copies removed, and the retired single one
+#        refused
+#   5.   cross-repo knob names
+#   6.   wall-sync.sh's TWO FLOWS and the knob-containment property, exercised
+#        through the bench fixture mode: the frame share's content is at its
+#        share ROOT while music sits under a subdir; an unreachable frame source
+#        is a SKIP while an unreachable music source is an ALERT; and nothing in
+#        wall.env can move the subtree, the destination or the flow set.
+#        Section 6 needs root (it takes a lock under /run, calls mount, and
+#        stages fixtures under /var/lib/wall-sync/bench); without it the cases
+#        SKIP loudly rather than vanishing.
 #
 # Usage (WSL/Linux, from a MiniPC-Deployer checkout):
 #   bash vmtest/test-wall-builder.sh
@@ -37,13 +67,79 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILD="bash $SCRIPT_DIR/build-wall-seed.sh"
 WORK="${TMPDIR:-/tmp}/wall-builder-test.$$"
+SANDBOX="$WORK/repo"           # the isolated checkout every case runs against
 DIST_REAL="${WALL_SHELL_DIST:-$(cd "$REPO_ROOT/.." && pwd)/OfficeWallNaglight/dist}"
+# wall-sync.sh's fixture root is a CONSTANT in the script (a debug hook must not
+# be aimable at /etc/wall-panel), so the suite has to stage its fixtures there.
+BENCH_ROOT="/var/lib/wall-sync/bench"
 
 pass=0; fail=0; skip=0
 mkdir -p "$WORK"
-trap 'rm -rf "$WORK"' EXIT
+cleanup_all() {
+    rm -rf "$WORK"
+    # Only ever remove the fixtures this suite created, and only the ones it
+    # named — never $BENCH_ROOT itself, which an operator may be using.
+    rm -rf "$BENCH_ROOT/tc-music" "$BENCH_ROOT/tc-frame" "$BENCH_ROOT/tc-empty" \
+           "$BENCH_ROOT/tc-manifest-only" 2>/dev/null || true
+}
+trap cleanup_all EXIT
+
+# ── the sandbox ──────────────────────────────────────────────────────────────
+# `git ls-files` so the copy is exactly the TRACKED tree (no vmtest/.out, no
+# .git), then `git init` + one commit inside it because copy_repo_into_payload
+# prefers `git ls-files` and warns loudly on a non-checkout.
+build_sandbox() {
+    mkdir -p "$SANDBOX"
+    # `-c safe.directory='*'`: a checkout owned by someone other than the caller
+    # makes git refuse to list it, and a SILENTLY EMPTY sandbox would turn every
+    # case below into a failure with a misleading reason. The post-condition
+    # below is the belt to that braces — this must never fail quietly.
+    ( cd "$REPO_ROOT" && git -c safe.directory='*' ls-files -z | tar -c --null -T - ) \
+        | ( cd "$SANDBOX" && tar -x )
+    git -C "$SANDBOX" init -q
+    git -C "$SANDBOX" config core.autocrlf false
+    git -C "$SANDBOX" config core.safecrlf false
+    git -C "$SANDBOX" add -A
+    git -C "$SANDBOX" -c user.email=vmtest@invalid -c user.name=vmtest \
+        commit -qm "sandbox" >/dev/null
+    if [ ! -f "$SANDBOX/vmtest/build-wall-seed.sh" ] || [ ! -d "$SANDBOX/stack/autoinstall/wall" ]; then
+        printf 'FATAL: the sandbox checkout under %s is empty or incomplete.\n' "$SANDBOX" >&2
+        printf 'Nothing was tested. Is %s a git checkout, and is it readable by this user?\n' "$REPO_ROOT" >&2
+        exit 2
+    fi
+}
+build_sandbox
+
+WALL_DIR="$SANDBOX/stack/autoinstall/wall"
+SYNC="$WALL_DIR/wall-sync.sh"
+BUILDER="$SANDBOX/vmtest/build-wall-seed.sh"
+
+skip_case() { printf 'SKIP  %s\n      %s\n' "$1" "$2"; skip=$((skip + 1)); }
+pass_case() { printf 'ok    %s\n' "$1"; pass=$((pass + 1)); }
+fail_case() { printf 'FAIL  %s\n      %s\n' "$1" "$2"; fail=$((fail + 1)); }
+
+# assert_file_matches NAME FILE PATTERN [--absent] : one grep -E, judged.
+assert_file_matches() {
+    local name="$1" file="$2" pat="$3" mode="${4:-present}"
+    if [ ! -f "$file" ]; then
+        fail_case "$name" "no such file: $file"
+        return
+    fi
+    if grep -Eq -- "$pat" "$file"; then
+        if [ "$mode" = "--absent" ]; then
+            fail_case "$name" "the file still matches /$pat/, and it must not"
+        else
+            pass_case "$name"
+        fi
+    else
+        if [ "$mode" = "--absent" ]; then
+            pass_case "$name"
+        else
+            fail_case "$name" "$file does not match /$pat/"
+        fi
+    fi
+}
 
 # expect_refusal NAME EXPECTED_SUBSTRING -- env... -- : the build must exit
 # non-zero AND say why. Both halves matter: a guard that fires with the wrong
@@ -52,7 +148,7 @@ expect_refusal() {
     local name="$1" needle="$2"; shift 2
     [ "$1" = "--" ] && shift
     local out="$WORK/out.txt"
-    if env "$@" OUT_DIR="$WORK/out-dir" bash "$SCRIPT_DIR/build-wall-seed.sh" >"$out" 2>&1; then
+    if env "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1; then
         printf 'FAIL  %s\n      the build SUCCEEDED; it was supposed to refuse\n' "$name"
         fail=$((fail + 1)); return
     fi
@@ -70,7 +166,7 @@ expect_success() {
     local name="$1" needle="$2"; shift 2
     [ "$1" = "--" ] && shift
     local out="$WORK/out.txt"
-    if env "$@" OUT_DIR="$WORK/out-dir" bash "$SCRIPT_DIR/build-wall-seed.sh" >"$out" 2>&1 \
+    if env "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1 \
        && grep -qF "$needle" "$out"; then
         printf 'ok    %s\n' "$name"
         pass=$((pass + 1))
@@ -80,11 +176,133 @@ expect_success() {
     fi
 }
 
-skip_case() { printf 'SKIP  %s\n      %s\n' "$1" "$2"; skip=$((skip + 1)); }
-pass_case() { printf 'ok    %s\n' "$1"; pass=$((pass + 1)); }
-fail_case() { printf 'FAIL  %s\n      %s\n' "$1" "$2"; fail=$((fail + 1)); }
+# expect_absent NAME NEEDLE -- env... : the build must SUCCEED and must NOT say
+# NEEDLE. The asymmetric half of expect_success — without it, "names the MUSIC
+# source as the casualty" and "names the FRAME source as the casualty" were run
+# against the identical both-absent state and a predicate that always fired for
+# both would have passed them both.
+expect_absent() {
+    local name="$1" needle="$2"; shift 2
+    [ "$1" = "--" ] && shift
+    local out="$WORK/out.txt"
+    if ! env "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1; then
+        fail_case "$name" "the build FAILED; it was supposed to succeed. $(grep -m1 FATAL "$out" | cut -c1-160)"
+        return
+    fi
+    if grep -qF "$needle" "$out"; then
+        fail_case "$name" "the build still said: $needle"
+    else
+        pass_case "$name"
+    fi
+}
 
-echo "=== the artifact gate ==="
+echo "=== 0. the static gate (never skips) ==="
+# THE POINT OF THIS SECTION: it needs no root, no loopback port and no shell
+# artifact, so it runs on every invocation. Before it existed, deleting
+# wall-sync.sh left this suite exiting zero.
+
+for f in wall-sync.sh wall-firstboot.sh wall-kiosk.sh wall-sleep.sh; do
+    if [ -f "$WALL_DIR/$f" ] && bash -n "$WALL_DIR/$f" 2>/dev/null; then
+        pass_case "$f exists and parses (bash -n)"
+    else
+        fail_case "$f exists and parses (bash -n)" "missing, or bash -n refused it"
+    fi
+done
+if [ -f "$WALL_DIR/wall-media-manifest.py" ] \
+   && python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' \
+        "$WALL_DIR/wall-media-manifest.py" 2>/dev/null; then
+    pass_case "wall-media-manifest.py exists and parses"
+else
+    fail_case "wall-media-manifest.py exists and parses" "missing, or it does not compile"
+fi
+
+# The unit files. `systemd-analyze verify` is the real parser; it is not on every
+# box, so it is used when present and the exact-content assertions below stand on
+# their own either way. Its exit status is unusable here (it also complains that
+# ExecStart's target is absent on a build host), so the FATAL classes are matched
+# out of its output instead.
+UNITS="wall-sync.service wall-sync-frame.service wall-sync-frame.timer wall-sync-resume.service wall-firstboot.service"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    UV="$WORK/unitverify.txt"
+    ( cd "$WALL_DIR" && systemd-analyze verify $(for u in $UNITS; do printf './%s ' "$u"; done) ) >"$UV" 2>&1 || true
+    if grep -Eiq 'Unknown key|Failed to parse|Invalid (section|value|setting)|Unknown section|syntax error' "$UV"; then
+        fail_case "systemd-analyze verify accepts every wall unit" \
+            "$(grep -Eim2 'Unknown key|Failed to parse|Invalid |Unknown section|syntax error' "$UV" | tr '\n' ' ' | cut -c1-200)"
+    else
+        pass_case "systemd-analyze verify accepts every wall unit"
+    fi
+else
+    skip_case "systemd-analyze verify accepts every wall unit" \
+        "systemd-analyze is not installed on this host; the exact-content assertions below still run"
+fi
+
+# The frame flow's cadence, spelled out. Nothing used to read these files at all:
+# they could have been EMPTY and every case in this suite still passed.
+assert_file_matches "wall-sync-frame.service runs the sync with EXACTLY --only frame" \
+    "$WALL_DIR/wall-sync-frame.service" '^ExecStart=/usr/local/sbin/wall-sync\.sh --only frame$'
+assert_file_matches "wall-sync-frame.service is bounded (TimeoutStartSec)" \
+    "$WALL_DIR/wall-sync-frame.service" '^TimeoutStartSec=[0-9]+$'
+assert_file_matches "wall-sync-frame.timer fires a minute after the run FINISHES" \
+    "$WALL_DIR/wall-sync-frame.timer" '^OnUnitInactiveSec=1min$'
+# OnUnitActiveSec measures from ACTIVATION, so a run longer than the period
+# re-fires immediately — and the file used to claim, in a comment, that it meant
+# "after the last run finished".
+assert_file_matches "wall-sync-frame.timer does NOT use OnUnitActiveSec" \
+    "$WALL_DIR/wall-sync-frame.timer" '^OnUnitActiveSec=' --absent
+assert_file_matches "wall-sync-frame.timer triggers the frame service" \
+    "$WALL_DIR/wall-sync-frame.timer" '^Unit=wall-sync-frame\.service$'
+assert_file_matches "wall-sync.service still syncs BOTH flows (no --only)" \
+    "$WALL_DIR/wall-sync.service" '^ExecStart=/usr/local/sbin/wall-sync\.sh$'
+
+# The autoinstall half: units that exist in the repo but are never copied or
+# enabled are units the panel does not have.
+UD="$WALL_DIR/user-data"
+assert_file_matches "user-data installs wall-sync-frame.service" "$UD" \
+    'cp .*wall/wall-sync-frame\.service /target/etc/systemd/system/wall-sync-frame\.service'
+assert_file_matches "user-data installs wall-sync-frame.timer" "$UD" \
+    'cp .*wall/wall-sync-frame\.timer /target/etc/systemd/system/wall-sync-frame\.timer'
+assert_file_matches "user-data enables the frame TIMER (not the service)" "$UD" \
+    'systemctl enable wall-sync-frame\.timer'
+assert_file_matches "user-data does NOT enable wall-sync-frame.service itself" "$UD" \
+    'systemctl enable wall-sync-frame\.service' --absent
+assert_file_matches "user-data installs both credentials 0600 root:root" "$UD" \
+    'install -m 0600 -o root -g root'
+# The on-box exposure the review found: staged credentials are 0600 but owned by
+# the BUILDER's uid, Rock Ridge (`-rock`) preserves it, `cp -a` carries it into
+# /opt/wall-panel/site, and the ordinary builder uid and the panel's `panel` user
+# are both 1000. A chmod does not fix an owner; deleting the copy does.
+assert_file_matches "user-data REMOVES the staged credential copies from the payload" "$UD" \
+    'rm -f "\$s"'
+assert_file_matches "user-data no longer merely chmods the staged copies" "$UD" \
+    '^[^#]*chmod 0600 "\$s"' --absent
+
+# firstboot must JUDGE the enable, not claim it. This is the repo's signature
+# bug: `systemctl enable … || warn` followed by an unconditional "enabled" line.
+FB="$WALL_DIR/wall-firstboot.sh"
+assert_file_matches "wall-firstboot.sh enables the frame timer through the judged helper" \
+    "$FB" '^\s*enable_unit "OI-18: wall-sync-frame\.timer enabled'
+assert_file_matches "wall-firstboot.sh has no 'systemctl enable … || warn' left" \
+    "$FB" 'systemctl enable.*\|\|' --absent
+assert_file_matches "wall-firstboot.sh withholds the marker when a step failed" \
+    "$FB" 'PROVISION_FAILED.*-ne 0'
+
+# The knob-containment property, asserted statically as well as behaviourally
+# (section 6): the allowlist must exist and must not carry the retired knobs.
+assert_file_matches "wall-sync.sh has a configuration ALLOWLIST" \
+    "$SYNC" '^CONFIG_KEYS='
+assert_file_matches "the allowlist does not include the retired MEDIA_CIFS_EXTRA" \
+    "$SYNC" '^CONFIG_KEYS=.*MEDIA_CIFS_EXTRA' --absent
+assert_file_matches "the allowlist does not include the retired bench overrides" \
+    "$SYNC" '^CONFIG_KEYS=.*SOURCE_OVERRIDE' --absent
+assert_file_matches "wall.env.example declares MEDIA_CIFS_VERS" \
+    "$WALL_DIR/wall.env.example" '^MEDIA_CIFS_VERS='
+assert_file_matches "wall.env.example no longer offers MEDIA_CIFS_EXTRA as a knob" \
+    "$WALL_DIR/wall.env.example" '^MEDIA_CIFS_EXTRA=' --absent
+assert_file_matches "wall.env.example no longer offers the bench overrides as knobs" \
+    "$WALL_DIR/wall.env.example" '^# *MEDIA_(MUSIC|FRAME)_SOURCE_OVERRIDE=' --absent
+
+echo
+echo "=== 1. the artifact gate ==="
 EMPTY="$WORK/empty-dist"; mkdir -p "$EMPTY"
 expect_refusal "an absent shell artifact stops the build" \
     "no OfficeWallNaglight shell artifact" -- "WALL_SHELL_DIST=$EMPTY"
@@ -107,39 +325,39 @@ if [ -n "$(ls "$DIST_REAL"/officewall-shell-*-linux-x64.tar.gz 2>/dev/null)" ]; 
         "more than one artifact matches" -- "WALL_SHELL_DIST=$A"
 
     echo
-    echo "=== the runtime-dependency gate ==="
-    T="$REPO_ROOT/stack/autoinstall/wall/electron-runtime-deps.tsv"
-    U="$REPO_ROOT/stack/autoinstall/wall/user-data"
-    cp "$T" "$WORK/tsv.bak"; cp "$U" "$WORK/ud.bak"
+    echo "=== 2. the runtime-dependency gate ==="
+    # Mutating the SANDBOX, never the checkout.
+    T="$WALL_DIR/electron-runtime-deps.tsv"
+    cp "$T" "$WORK/tsv.bak"; cp "$UD" "$WORK/ud.bak"
 
     grep -v '^libnspr4.so' "$WORK/tsv.bak" > "$T"
     expect_refusal "a soname the table has never heard of is refused" \
         "this repo has never heard of" --
     cp "$WORK/tsv.bak" "$T"
 
-    grep -v '^    - libnspr4$' "$WORK/ud.bak" > "$U"
+    grep -v '^    - libnspr4$' "$WORK/ud.bak" > "$UD"
     expect_refusal "a mapped package the image does not install is refused" \
         "does not install package(s)" --
-    cp "$WORK/ud.bak" "$U"
+    cp "$WORK/ud.bak" "$UD"
 else
     skip_case "-dirty / ambiguous / dependency-gate cases" \
         "no shell artifact at $DIST_REAL — build one with 'npm run dist' in OfficeWallNaglight"
 fi
 
 echo
-echo "=== the production seam ==="
+echo "=== 3. the production seam ==="
 S="$WORK/site"; mkdir -p "$S"
 expect_refusal "WALL_SITE_DIR with no user-data.filled is refused, not half-applied" \
     "has no user-data.filled" -- "WALL_SITE_DIR=$S"
 
 sed -e 's/REPLACE_WITH_WIFI_SSID/TestNet/' -e 's/REPLACE_WITH_WIFI_PSK/testpsk123/' \
     -e 's#- "ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host"#- "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey t@t"#' \
-    "$REPO_ROOT/stack/autoinstall/wall/user-data" > "$S/user-data.filled"
+    "$UD" > "$S/user-data.filled"
 expect_refusal "a production build with no wall.env is refused (the panel would have no origin)" \
     "no wall.env" -- "WALL_SITE_DIR=$S"
 
 sed 's/^WALL_HOST=.*/WALL_HOST=wall.test.invalid/' \
-    "$REPO_ROOT/stack/autoinstall/wall/wall.env.example" > "$S/wall.env"
+    "$WALL_DIR/wall.env.example" > "$S/wall.env"
 sed -i 's/model: KINGSTON.*/model: Virtual_Disk/' "$S/user-data.filled"
 expect_refusal "a production image pinned to the SIM disk is refused" \
     "Virtual_Disk" -- "WALL_SITE_DIR=$S"
@@ -154,7 +372,7 @@ expect_refusal "a production image with no Wi-Fi is refused (the panel has no RJ
     "no ethernet port" -- "WALL_SITE_DIR=$S"
 
 echo
-echo "=== the OI-18 production seam: TWO credentials, on TWO hosts ==="
+echo "=== 4. the OI-18 production seam: TWO credentials, on TWO hosts ==="
 # The last case above rewrote `wifis:` away to prove the no-Wi-Fi refusal; put it
 # back, or every case below refuses for that reason instead of the one it tests.
 sed -i 's/^    ethernets:/    wifis:/' "$S/user-data.filled"
@@ -163,15 +381,30 @@ sed -i 's/^    ethernets:/    wifis:/' "$S/user-data.filled"
 # thing to build — but they must be reported per SOURCE, because "one of two" is a
 # panel with half its media and which half decides what is dead. A single "no
 # credentials" line would have been true of neither.
+#
+# THE STATES ARE ASYMMETRIC ON PURPOSE. Both cases used to run against the same
+# both-absent state and only assert PRESENCE, so a predicate that reported both
+# sources whenever either was missing — or reported the wrong one — passed. Each
+# case now stages the OTHER credential and asserts the other message is ABSENT.
+printf 'username=testframe\npassword=notarealpassword\n' > "$S/cifs-frame.creds"
 expect_success "a missing cifs-music.creds names the MUSIC source as the casualty" \
     "cannot mount its MUSIC share" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
-expect_success "a missing cifs-frame.creds names the FRAME source as the casualty" \
+expect_absent "…and does NOT also blame the FRAME source, which IS staged" \
     "cannot mount its FRAME VIDEO share" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 
-# The values are fictional and local to this suite: the point is the STAGING, not
-# the secret. Never put a real credential in a test fixture.
+rm -f "$S/cifs-frame.creds"
 printf 'username=testmusic\npassword=notarealpassword\n' > "$S/cifs-music.creds"
+expect_success "a missing cifs-frame.creds names the FRAME source as the casualty" \
+    "cannot mount its FRAME VIDEO share" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+expect_absent "…and does NOT also blame the MUSIC source, which IS staged" \
+    "cannot mount its MUSIC share" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+
+# "3 files staged" was a COUNT, which any three files satisfy. Name them.
 printf 'username=testframe\npassword=notarealpassword\n' > "$S/cifs-frame.creds"
+expect_success "the MUSIC credential is staged BY NAME" \
+    "site/ += cifs-music.creds" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+expect_success "the FRAME credential is staged BY NAME" \
+    "site/ += cifs-frame.creds" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 expect_success "both credential files are staged when both are present" \
     "PRODUCTION build: 3 wall config file(s) staged" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 
@@ -185,13 +418,13 @@ expect_refusal "a stale PRE-OI-18 single cifs.creds is refused, not silently ign
 rm -f "$S/cifs.creds"
 
 echo
-echo "=== cross-repo knob names: the sim renderer must fill BOTH UNCs ==="
+echo "=== 5. cross-repo knob names: the sim renderer must fill BOTH UNCs ==="
 # THE SINGLE BIGGEST RISK IN OI-18 IS A KNOB NAME DRIFTING BETWEEN THE REPOS.
 # `set_env_key` already refuses to append a key wall.env.example does not declare
 # (a knob the consumer never reads is a silent no-op). These two cases prove that
 # guard is actually wired to BOTH of the new names — delete either `set_env_key`
 # call from render_sim_wall_env and the corresponding case stops refusing.
-WEX="$REPO_ROOT/stack/autoinstall/wall/wall.env.example"
+WEX="$WALL_DIR/wall.env.example"
 cp "$WEX" "$WORK/wallenv.bak"
 for knob in MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC; do
     grep -v "^${knob}=" "$WORK/wallenv.bak" > "$WEX"
@@ -200,27 +433,56 @@ for knob in MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC; do
     cp "$WORK/wallenv.bak" "$WEX"
 done
 
-echo
-echo "=== OI-18: wall-sync.sh's two flows are NOT the same flow ==="
-# Exercised through the documented bench hooks (MEDIA_{MUSIC,FRAME}_SOURCE_OVERRIDE)
-# and, for the two policy cases, against 127.0.0.1 — which answers nothing on 445,
-# so no packet leaves the machine and no real host is involved.
-SYNC="$REPO_ROOT/stack/autoinstall/wall/wall-sync.sh"
+# THE OTHER HALF OF THE CROSS-REPO RISK, which nothing in this repo could see:
+# these cases only ever inspected THIS repo, so Personal could rename or delete
+# the knobs and both would still pass. If the sibling checkout is present, assert
+# the names line up END TO END. If it is not, SKIP loudly — an assertion that
+# silently evaporates on a machine without the sibling is the same false green.
+PERSONAL="${PERSONAL_REPO:-$(cd "$REPO_ROOT/.." 2>/dev/null && pwd)/Personal}"
+if [ -d "$PERSONAL/homelab/deploy" ]; then
+    for token in MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC cifs-music.creds cifs-frame.creds; do
+        if grep -rqF -- "$token" "$PERSONAL/homelab/deploy" 2>/dev/null; then
+            pass_case "Personal's deploy half still names '$token'"
+        else
+            fail_case "Personal's deploy half still names '$token'" \
+                "nothing under $PERSONAL/homelab/deploy mentions it — the two repos have drifted, and the panel would get an unset knob or an unstaged credential"
+        fi
+    done
+else
+    skip_case "cross-repo name agreement with Personal (4 cases)" \
+        "no sibling checkout at $PERSONAL/homelab/deploy (set PERSONAL_REPO=… to point at one). This repo's half is still asserted above."
+fi
 
-# run_sync NAME MODE NEEDLE ONLY -- env... : run wall-sync.sh and judge it.
+echo
+echo "=== 6. OI-18: wall-sync.sh's two flows, and the knob-containment property ==="
+# Exercised through the bench fixture mode (--bench-source FLOW=DIR, fixtures
+# under $BENCH_ROOT) and, for the policy cases, against 127.0.0.1 and
+# 192.0.2.1 (TEST-NET-1) — neither of which is a real host, so no packet reaches
+# anything on the LAN.
+#
+# run_sync NAME MODE NEEDLE ONLY -- items... : run wall-sync.sh, judge it.
 #   MODE  ok   = must exit 0      fail = must exit non-zero
 #   ONLY  both = no --only flag,  otherwise passed as `--only <flow>`
+#   items       `ARG:x` is a command-line ARGUMENT (the prefix is stripped);
+#               anything else is a KEY=VALUE for `env`. The explicit prefix is
+#               deliberate: the bench fixtures are passed as `--bench-source`
+#               plus a `FLOW=DIR` value, and a value containing `=` is
+#               indistinguishable from an environment assignment without it.
 # Both halves are judged, exactly as expect_refusal does: an exit status with the
 # wrong explanation costs the next person the same hour it was meant to save.
 run_sync() {
     local name="$1" mode="$2" needle="$3" only="$4"; shift 4
     [ "$1" = "--" ] && shift
-    local out="$WORK/sync.txt" rc=0 onlyflag=""
-    [ "$only" != "both" ] && onlyflag="--only $only"
-    # $onlyflag is deliberately unquoted — it is either empty or two literal
-    # words, both from this file, never from input.
-    # shellcheck disable=SC2086
-    env "$@" bash "$SYNC" $onlyflag >"$out" 2>&1 || rc=$?
+    local out="$WORK/sync.txt" rc=0 a
+    local -a envs=() args=()
+    [ "$only" != "both" ] && args+=(--only "$only")
+    for a in "$@"; do
+        case "$a" in
+            ARG:*) args+=("${a#ARG:}") ;;
+            *)     envs+=("$a") ;;
+        esac
+    done
+    env "${envs[@]}" bash "$SYNC" "${args[@]}" >"$out" 2>&1 || rc=$?
     if [ "$mode" = ok ] && [ "$rc" -ne 0 ]; then
         fail_case "$name" "exited $rc; it was supposed to succeed. $(grep -m1 ERROR "$out" | cut -c1-160)"
         return
@@ -230,36 +492,51 @@ run_sync() {
         return
     fi
     if grep -qF "$needle" "$out"; then pass_case "$name"
-    else fail_case "$name" "right status, wrong reason. Wanted: $needle | Got: $(tail -n 2 "$out" | tr '\n' ' ' | cut -c1-160)"; fi
+    else fail_case "$name" "right status, wrong reason. Wanted: $needle | Got: $(tail -n 3 "$out" | tr '\n' ' ' | cut -c1-200)"; fi
 }
 
+SYNC_CASES=35
 if [ "$(id -u)" -ne 0 ]; then
-    skip_case "wall-sync two-flow cases (6)" \
-        "need root: wall-sync.sh takes its per-flow lock under /run and calls mount(8). Re-run with sudo."
+    skip_case "wall-sync flow + knob-containment cases ($SYNC_CASES)" \
+        "need root: wall-sync.sh takes its per-flow lock under /run, calls mount(8), and its bench fixtures live under $BENCH_ROOT. Re-run with sudo."
 elif timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/445' 2>/dev/null; then
-    skip_case "wall-sync two-flow cases (6)" \
-        "something IS listening on 127.0.0.1:445 here, so 'the source is asleep' cannot be simulated on loopback."
+    skip_case "wall-sync flow + knob-containment cases ($SYNC_CASES)" \
+        "something IS listening on 127.0.0.1:445 here, so the reachability cases cannot be simulated on loopback."
 else
     C="$WORK/cache"
-    MSRC="$WORK/src-music"
-    FSRC="$WORK/src-frame"
     CRED="$WORK/fake.creds"
-    printf 'username=test\npassword=notarealpassword\n' > "$CRED"; chmod 600 "$CRED"
+    printf 'username=test\npassword=notarealpassword\n' > "$CRED"
+    chown 0:0 "$CRED"; chmod 600 "$CRED"
+
+    # The fixtures live where the script insists they live: a root-owned
+    # directory under $BENCH_ROOT. That constraint IS one of the things under
+    # test — the hook used to be a wall.env knob that could name any directory.
+    install -d -m 0700 "$BENCH_ROOT"
+    MSRC="$BENCH_ROOT/tc-music"
+    FSRC="$BENCH_ROOT/tc-frame"
+    ESRC="$BENCH_ROOT/tc-empty"
+    NSRC="$BENCH_ROOT/tc-manifest-only"
+    rm -rf "$MSRC" "$FSRC" "$ESRC" "$NSRC"
     # The music source is shaped like the REAL one: storage-map §3 row 2 reaches
     # `NonDocs\Media\Music` THROUGH the `Media` share, so the mount root holds
     # other media too and only `Music/` may be copied. `decoy.mp3` at the root is
     # the Movies-sized tree this must not drag onto a 256 GB disk.
-    mkdir -p "$MSRC/Music/Album" "$FSRC"
+    install -d -m 0755 "$MSRC/Music/Album" "$FSRC" "$ESRC/Music" "$NSRC/Music"
     : > "$MSRC/decoy.mp3"
     : > "$MSRC/Music/Album/01 Track.mp3"
     # The frame source is shaped like ITS real one: PictureFrameVideos is a
     # DEDICATED share (§3b), so the content is at the share root, no subdir.
     : > "$FSRC/clip.mp4"
+    # A source holding ONLY the file rsync then excludes. It is not empty to
+    # `find`, and it used to pass the emptiness guard — after which rsync copied
+    # nothing and --delete emptied the cache.
+    : > "$NSRC/Music/index.json"
 
-    # The needle is the whole SUMMARY line, not just "sync complete": a run that
-    # silently mirrored only one flow would still say "complete".
+    # The needle is the whole SUMMARY line WITH ITS COUNTS, not just "sync
+    # complete": a run that silently mirrored only one flow would still say
+    # "complete", and one that mirrored the wrong subtree would still say "both".
     run_sync "a full run mirrors both flows" ok "sync complete — music(1 files); frame(1 files)" both -- \
-        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SOURCE_OVERRIDE=$MSRC" "MEDIA_FRAME_SOURCE_OVERRIDE=$FSRC"
+        "WALL_MEDIA_CACHE=$C" "ARG:--bench-source" "ARG:music=$MSRC" "ARG:--bench-source" "ARG:frame=$FSRC"
 
     if [ -f "$C/music/Album/01 Track.mp3" ] && [ ! -e "$C/music/decoy.mp3" ]; then
         pass_case "music is taken from the Music/ subdir UNDER the mount, not from the share root"
@@ -279,20 +556,40 @@ else
     # every minute and the music flow's first mirror can take an hour, so the two
     # DO overlap, and a frame run regenerating music/index.json from a half-filled
     # music cache is exactly the partial manifest the "written LAST" rule forbids.
+    #
+    # THE SOURCE IS MUTATED FIRST. This case used to re-run an unchanged fixture,
+    # so a mirror that did nothing at all passed it.
     printf 'SENTINEL-NOT-A-MANIFEST\n' > "$C/music/index.json"
-    run_sync "--only frame refreshes the frame flow" ok "frame: manifest" frame -- \
-        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SOURCE_OVERRIDE=$MSRC" "MEDIA_FRAME_SOURCE_OVERRIDE=$FSRC"
+    : > "$FSRC/second-clip.mp4"
+    run_sync "--only frame actually re-mirrors NEW frame content" ok "frame: manifest" frame -- \
+        "WALL_MEDIA_CACHE=$C" "ARG:--bench-source" "ARG:frame=$FSRC"
+    if [ -f "$C/frame/second-clip.mp4" ] && grep -q 'second-clip.mp4' "$C/frame/playlist.json" 2>/dev/null; then
+        pass_case "the new frame file reached both the cache and the playlist"
+    else
+        fail_case "the new frame file reached both the cache and the playlist" \
+            "cache holds: $(find "$C/frame" -type f -printf '%P ' 2>/dev/null)"
+    fi
     if grep -q 'SENTINEL-NOT-A-MANIFEST' "$C/music/index.json"; then
         pass_case "--only frame leaves music/index.json alone"
     else
         fail_case "--only frame leaves music/index.json alone" "the frame run rewrote the music manifest"
     fi
 
-    # THE FAILURE-POLICY FORK. Same unreachable address, same credentials file,
-    # opposite verdicts — because storage-map §4d says Mini-serv may sleep and the
-    # AWOW may not.
-    run_sync "an unreachable FRAME source is a silent skip that still exits 0" ok \
-        "Skipping, and NOT waking it" frame -- \
+    # THE FAILURE-POLICY FORK. storage-map §4d says Mini-serv may sleep and the
+    # AWOW may not — but the probe now says THREE things, not two, and only one
+    # of them is "asleep".
+    run_sync "a frame source that answers NOTHING is the designed silent skip (exit 0)" ok \
+        "The source is ASLEEP or off. Skipping, and NOT waking it" frame -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//192.0.2.1/PictureFrameVideos" \
+        "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    # 127.0.0.1 sends an RST: a box that answers is AWAKE, and reporting that as
+    # "asleep" is what let a wrong credential hide behind a failing probe forever.
+    run_sync "a frame source that REFUSES the connection is INDETERMINATE, not asleep" ok \
+        "is INDETERMINATE" frame -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/PictureFrameVideos" \
+        "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    run_sync "…and it still exits 0 without ever claiming the box is asleep" ok \
+        "WITHOUT claiming the source is asleep" frame -- \
         "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/PictureFrameVideos" \
         "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
     run_sync "an unreachable MUSIC source is an ALERT: the unit FAILS" fail \
@@ -300,18 +597,272 @@ else
         "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media" \
         "MEDIA_MUSIC_CIFS_CREDENTIALS=$CRED"
 
-    # The transplanted ingest guard, re-proved in the two-flow shape: an empty
-    # source must not mirror-delete a populated cache.
-    mkdir -p "$WORK/src-empty/Music"
+    # THE CASE THE SUITE EXPLICITLY SKIPPED: 445 ANSWERS, AND THE MOUNT IS THEN
+    # REFUSED. This is the ONLY path that can ever expose a wrong frame
+    # credential, and it was never exercised — the whole section bailed out
+    # whenever anything was listening. Listen on purpose instead, for one case.
+    LISTENER="$WORK/listen.py"
+    cat > "$LISTENER" <<'PYEOF'
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(8)
+sys.stderr.write("listening\n"); sys.stderr.flush()
+time.sleep(180)
+PYEOF
+    LPID=""
+    start_listener() {   # PORT -> 0 iff something now answers there
+        local port="$1" i
+        python3 "$LISTENER" "$port" 2>"$WORK/listen.err" &
+        LPID=$!
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/"$1"' _ "$port" 2>/dev/null && return 0
+            sleep 0.3
+        done
+        return 1
+    }
+    stop_listener() {
+        [ -n "$LPID" ] && kill "$LPID" 2>/dev/null
+        wait "$LPID" 2>/dev/null || true
+        LPID=""
+    }
+
+    if start_listener 445; then
+        run_sync "445 ANSWERS and the frame mount is then refused: that is FATAL, not a skip" fail \
+            "WHICH IS AWAKE" frame -- \
+            "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/PictureFrameVideos" \
+            "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    else
+        fail_case "445 ANSWERS and the frame mount is then refused: that is FATAL, not a skip" \
+            "could not bring up the loopback listener this case needs: $(tr '\n' ' ' < "$WORK/listen.err" 2>/dev/null | cut -c1-160)"
+    fi
+    stop_listener
+
+    # PER-FLOW AGGREGATION. Nothing used to exercise it: the only two-flow case
+    # had both flows succeed, and every failure case used --only, so an
+    # abort-on-first-error orchestration passed the suite. Music must FAIL, the
+    # run must exit non-zero, AND frame must still have been mirrored.
+    rm -f "$C/frame/agg.mp4"
+    : > "$FSRC/agg.mp4"
+    run_sync "one flow's failure does not cancel the other (the run still fails)" fail \
+        "sync FINISHED WITH FAILURES" both -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media" \
+        "MEDIA_MUSIC_CIFS_CREDENTIALS=$CRED" "ARG:--bench-source" "ARG:frame=$FSRC"
+    if [ -f "$C/frame/agg.mp4" ]; then
+        pass_case "…and the FRAME flow ran anyway, after the music flow failed"
+    else
+        fail_case "…and the FRAME flow ran anyway, after the music flow failed" \
+            "the frame content added before the run never reached $C/frame"
+    fi
+
+    # The transplanted ingest guard, in the two-flow shape: an empty source must
+    # not mirror-delete a populated cache.
     run_sync "an EMPTY music source still refuses to mirror-delete a populated cache" fail \
         "REFUSING to mirror-delete" music -- \
-        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SOURCE_OVERRIDE=$WORK/src-empty"
+        "WALL_MEDIA_CACHE=$C" "ARG:--bench-source" "ARG:music=$ESRC"
+    # …and the sharper version: a source holding ONLY the file rsync excludes.
+    # `find`-based emptiness said "has data"; rsync then copied nothing and
+    # --delete emptied the cache with WALL_SYNC_ALLOW_EMPTY=false.
+    run_sync "a source holding ONLY the excluded manifest counts as EMPTY" fail \
+        "REFUSING to mirror-delete" music -- \
+        "WALL_MEDIA_CACHE=$C" "ARG:--bench-source" "ARG:music=$NSRC"
+    if [ -f "$C/music/Album/01 Track.mp3" ]; then
+        pass_case "…and the populated music cache survived both refusals"
+    else
+        fail_case "…and the populated music cache survived both refusals" "the cache was emptied anyway"
+    fi
+
+    # THE CACHE COUNT MUST MATCH RSYNC'S EXCLUSIONS EXACTLY. `! -name index.json`
+    # hid a same-named file at EVERY depth, so a cache holding only
+    # `Album/index.json` — a real mirrored file — counted as ZERO and the
+    # "refusing to mirror-delete a populated cache" guard never fired.
+    C9="$WORK/cache9"
+    install -d -m 0755 "$C9/music/Album"
+    : > "$C9/music/Album/index.json"
+    run_sync "a cache whose only file is Album/index.json still counts as POPULATED" fail \
+        "REFUSING to mirror-delete" music -- \
+        "WALL_MEDIA_CACHE=$C9" "ARG:--bench-source" "ARG:music=$ESRC"
+
+    # THE STALENESS LADDER MUST NOT BE THE THING THAT CRASHES. It is the one path
+    # whose whole job is to stay calm, and "all digits" was not a safe test for
+    # bash arithmetic: `08` is all digits and is an invalid OCTAL literal.
+    printf '08\n' > "$C/.wall-sync-frame.stamp"
+    run_sync "an octal-looking last-sync stamp still produces a staleness line" ok \
+        "content on the wall is" frame -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//192.0.2.1/PictureFrameVideos" \
+        "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    # A stamp in the FUTURE used to be clamped to zero, i.e. reported as "0h old"
+    # for as long as the clock stayed behind it: a cache that is never stale.
+    printf '%s\n' "$(( $(date +%s) + 86400 ))" > "$C/.wall-sync-frame.stamp"
+    run_sync "a FUTURE last-sync stamp is reported as UNKNOWN, not as fresh" ok \
+        "in the FUTURE" frame -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//192.0.2.1/PictureFrameVideos" \
+        "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    rm -f "$C/.wall-sync-frame.stamp"
+
+    # ── THE KNOB-CONTAINMENT PROPERTY ────────────────────────────────────────
+    # "Only the UNCs, the credentials files and the SMB version are knobs" is the
+    # thesis of this design, and it used to be only a comment: load_env_file
+    # exported EVERY valid identifier, over names the script had already set.
+    # THE ALLOWLIST ITSELF, DRIVEN THROUGH A REAL wall.env. The script reads a
+    # FIXED path (/etc/wall-panel/wall.env — that it is not a knob is part of the
+    # property), so the only honest way to test it is to give the process its own
+    # mount namespace with a fixture bind-mounted there. `unshare -m` costs
+    # nothing and touches nothing outside the child. If /etc/wall-panel already
+    # exists this is a REAL PANEL and the cases skip rather than mount over an
+    # operator's configuration.
+    FAKE_ETC="$WORK/fake-etc"; mkdir -p "$FAKE_ETC"
+    run_sync_envfile() {   # NAME MODE NEEDLE ONLY ENVFILE_BODY -- items...
+        local name="$1" mode="$2" needle="$3" only="$4" body="$5"; shift 5
+        printf '%s\n' "$body" > "$FAKE_ETC/wall.env"
+        chmod 600 "$FAKE_ETC/wall.env"
+        local out="$WORK/sync.txt" rc=0 a
+        local -a envs=() args=()
+        [ "$only" != "both" ] && args+=(--only "$only")
+        [ "${1:-}" = "--" ] && shift
+        for a in "$@"; do
+            case "$a" in
+                ARG:*) args+=("${a#ARG:}") ;;
+                *)     envs+=("$a") ;;
+            esac
+        done
+        unshare -m env "${envs[@]}" bash -c '
+            mount --bind "$1" /etc/wall-panel || exit 70
+            shift
+            exec bash "$@"' _ "$FAKE_ETC" "$SYNC" "${args[@]}" >"$out" 2>&1 || rc=$?
+        if [ "$rc" = 70 ]; then
+            fail_case "$name" "could not bind-mount the fixture over /etc/wall-panel"
+            return
+        fi
+        if [ "$mode" = ok ] && [ "$rc" -ne 0 ]; then
+            fail_case "$name" "exited $rc; it was supposed to succeed. $(grep -m1 ERROR "$out" | cut -c1-160)"
+            return
+        fi
+        if [ "$mode" = fail ] && [ "$rc" -eq 0 ]; then
+            fail_case "$name" "exited 0; it was supposed to fail"
+            return
+        fi
+        if grep -qF "$needle" "$out"; then pass_case "$name"
+        else fail_case "$name" "right status, wrong reason. Wanted: $needle | Got: $(tail -n 3 "$out" | tr '\n' ' ' | cut -c1-200)"; fi
+    }
+
+    if [ -d /etc/wall-panel ] || ! command -v unshare >/dev/null 2>&1; then
+        skip_case "wall.env allowlist cases (4)" \
+            "/etc/wall-panel already exists (this looks like a real panel) or unshare(1) is absent — refusing to bind-mount over a live configuration."
+    else
+        mkdir -p /etc/wall-panel
+        # FLOWS=music in wall.env used to drop the frame flow out of every
+        # boot/resume run: one typo, and the wall goes blank with a green unit.
+        run_sync_envfile "wall.env cannot redefine the flow set (FLOWS is not a knob)" ok \
+            "sync complete — music(1 files); frame(" both \
+            "FLOWS=music" -- \
+            "WALL_MEDIA_CACHE=$C" "ARG:--bench-source" "ARG:music=$MSRC" "ARG:--bench-source" "ARG:frame=$FSRC"
+        # PROBE_PORT decides which port "is the source awake?" is asked on, so a
+        # wall.env key for it could point the question at a port that always
+        # answers (making a dead share look awake) or one that never does
+        # (switching the every-minute flow off forever, silently). The fixture
+        # names a port that DOES answer: if the key were honoured the probe would
+        # succeed and the run would go on to a FATAL mount refusal, so "still
+        # INDETERMINATE, still exit 0" is only possible if it was ignored.
+        if start_listener 9999; then
+            run_sync_envfile "wall.env cannot move the reachability probe's port" ok \
+                "is INDETERMINATE" frame \
+                "PROBE_PORT=9999
+MEDIA_FRAME_SHARE_UNC=//127.0.0.1/PictureFrameVideos
+MEDIA_FRAME_CIFS_CREDENTIALS=$CRED" -- \
+                "WALL_MEDIA_CACHE=$C"
+        else
+            fail_case "wall.env cannot move the reachability probe's port" \
+                "could not bring up the loopback listener on 9999 this case needs"
+        fi
+        stop_listener
+        # RUNDIR=/tmp/… used to move the lock (and the mountpoint) somewhere any
+        # user can pre-create.
+        run_sync_envfile "wall.env cannot move RUNDIR, the lock/mountpoint root" ok \
+            "sync complete — frame(" frame \
+            "RUNDIR=$WORK/hijacked-rundir" -- \
+            "WALL_MEDIA_CACHE=$C" "ARG:--bench-source" "ARG:frame=$FSRC"
+        if [ -e "$WORK/hijacked-rundir" ]; then
+            fail_case "…and RUNDIR really did not move" "the run created $WORK/hijacked-rundir"
+        else
+            pass_case "…and RUNDIR really did not move"
+        fi
+        rmdir /etc/wall-panel 2>/dev/null || true
+    fi
+
+    run_sync "the retired MEDIA_CIFS_EXTRA is REFUSED, not silently ignored" fail \
+        "NO LONGER READ" both -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_CIFS_EXTRA=prefixpath=Movies,rw" \
+        "ARG:--bench-source" "ARG:music=$MSRC" "ARG:--bench-source" "ARG:frame=$FSRC"
+    run_sync "the retired bench-hook KNOB is REFUSED, not silently ignored" fail \
+        "NO LONGER READ" both -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SOURCE_OVERRIDE=/etc" \
+        "ARG:--bench-source" "ARG:frame=$FSRC"
+    run_sync "MEDIA_CIFS_VERS is an ENUM, not a free-text option string" fail \
+        "not one of the supported SMB dialects" both -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_CIFS_VERS=3.0,prefixpath=Movies" \
+        "ARG:--bench-source" "ARG:music=$MSRC" "ARG:--bench-source" "ARG:frame=$FSRC"
+    run_sync "a bench fixture OUTSIDE the fixture root is refused" fail \
+        "is not under $BENCH_ROOT" frame -- \
+        "WALL_MEDIA_CACHE=$C" "ARG:--bench-source" "ARG:frame=/etc"
+    run_sync "the bench mode is refused when systemd is the caller" fail \
+        "BENCH-ONLY mode" frame -- \
+        "WALL_MEDIA_CACHE=$C" "INVOCATION_ID=deadbeef" "ARG:--bench-source" "ARG:frame=$FSRC"
+    # The frame flow consumes the SHARE ROOT, so a typo'd UNC is a way to widen
+    # the mirror: //MINI-SERV/NetworkShare passed the old //?*/?* check.
+    run_sync "a frame UNC with a PATH TAIL is refused (the subtree is code)" fail \
+        "names a PATH INSIDE a share" frame -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/Media/PictureFrameVideos" \
+        "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    # Both accounts are called `share` (ruled 2026-08-04), so two UNCs on one host
+    # means one credential could satisfy both mounts.
+    run_sync "two UNCs on the SAME host are refused (one credential must not serve both)" fail \
+        "both name the host" both -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media" \
+        "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/PictureFrameVideos" \
+        "MEDIA_MUSIC_CIFS_CREDENTIALS=$CRED" "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    # "root-only 0600" was claimed by the error message and never checked.
+    LOOSE="$WORK/loose.creds"
+    printf 'username=test\npassword=notarealpassword\n' > "$LOOSE"; chmod 644 "$LOOSE"
+    run_sync "a 0644 credentials file is refused (the claim and the check now agree)" fail \
+        "must be mode 0600 owned root:root" music -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media" \
+        "MEDIA_MUSIC_CIFS_CREDENTIALS=$LOOSE"
+    # rsync FOLLOWS a symlinked destination, so a symlinked cache leaf redirects
+    # both the copy AND the --delete.
+    VICTIM="$WORK/victim"; mkdir -p "$VICTIM"; : > "$VICTIM/precious"
+    SYMC="$WORK/symcache"; mkdir -p "$SYMC"; ln -sfn "$VICTIM" "$SYMC/music"
+    run_sync "a SYMLINKED cache leaf is refused (rsync --delete would follow it)" fail \
+        "is a SYMLINK" music -- \
+        "WALL_MEDIA_CACHE=$SYMC" "ARG:--bench-source" "ARG:music=$MSRC"
+    if [ -f "$VICTIM/precious" ]; then
+        pass_case "…and the directory the symlink pointed at was untouched"
+    else
+        fail_case "…and the directory the symlink pointed at was untouched" "the mirror deleted through the symlink"
+    fi
+
+    # THE MANIFEST WRITER MUST NOT FOLLOW A SYMLINK. A crafted source containing
+    # `playlist.json.tmp -> <target>` used to make this root process truncate,
+    # rewrite and chmod 0644 that target.
+    TRAP="$WORK/shadow-decoy"; printf 'DO-NOT-CLOBBER\n' > "$TRAP"
+    ln -sfn "$TRAP" "$FSRC/playlist.json.tmp"
+    run_sync "a source symlink named like the manifest temp file is not followed" ok \
+        "frame: manifest" frame -- \
+        "WALL_MEDIA_CACHE=$C" "ARG:--bench-source" "ARG:frame=$FSRC"
+    if [ "$(cat "$TRAP")" = "DO-NOT-CLOBBER" ]; then
+        pass_case "…and the file it pointed at still holds its own content"
+    else
+        fail_case "…and the file it pointed at still holds its own content" \
+            "the manifest writer wrote through the symlink: $(head -c 80 "$TRAP")"
+    fi
+    rm -f "$FSRC/playlist.json.tmp"
 fi
 
 echo
-echo "=== the --clean brake ==="
+echo "=== 7. the --clean brake ==="
 NOTOURS="$WORK/not-a-build-dir"; mkdir -p "$NOTOURS/precious"
-if CLEAN=1 OUT_DIR="$NOTOURS" bash "$SCRIPT_DIR/build-wall-seed.sh" >"$WORK/out.txt" 2>&1; then
+if CLEAN=1 OUT_DIR="$NOTOURS" bash "$BUILDER" >"$WORK/out.txt" 2>&1; then
     printf 'FAIL  --clean wiped a directory it did not create\n'; fail=$((fail + 1))
 elif [ -d "$NOTOURS/precious" ] && grep -q "does not look like a vmtest build directory" "$WORK/out.txt"; then
     printf 'ok    --clean refuses a directory this builder did not create\n'; pass=$((pass + 1))

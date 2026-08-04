@@ -104,8 +104,12 @@ def caddy_env_passed(compose_text):
 # positives as the scripts grow — add a namespace here if a genuinely new family
 # of knobs appears. `MEDIA_` was added by OI-15 (the panel's media pull) and
 # OI-18 doubled its membership: MEDIA_{MUSIC,FRAME}_SHARE_UNC,
-# MEDIA_{MUSIC,FRAME}_CIFS_CREDENTIALS, MEDIA_{MUSIC,FRAME}_SOURCE_OVERRIDE and
-# the shared MEDIA_CIFS_EXTRA.
+# MEDIA_{MUSIC,FRAME}_CIFS_CREDENTIALS and the shared MEDIA_CIFS_VERS.
+# The OI-18 review (2026-08-04) then SHRANK it: the free-text MEDIA_CIFS_EXTRA
+# became the enum MEDIA_CIFS_VERS, and MEDIA_{MUSIC,FRAME}_SOURCE_OVERRIDE
+# stopped being configuration at all (it is `--bench-source FLOW=DIR` now). Both
+# retired names are still NAMED in wall-sync.sh — as literals in its refusal
+# list, without a `$`, so they are correctly not counted as reads here.
 WALL_KNOB_NAMESPACES = (
     "WALL_",
     "WIFI_",

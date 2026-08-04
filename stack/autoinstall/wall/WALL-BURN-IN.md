@@ -163,8 +163,10 @@ cat /sys/class/input/event*/device/name
 ## 8. The media pull (OI-15 / OI-18) — the half that needs the real shares
 
 The mirror, its guards and the manifest generation were exercised for real against
-local fixture libraries (WSL, via the script's per-flow `MEDIA_*_SOURCE_OVERRIDE`
-bench hooks), and the emitted manifest was fed to the shell's real
+local fixture libraries (WSL, via the script's per-flow `--bench-source FLOW=DIR`
+command-line mode — fixtures under `/var/lib/wall-sync/bench`, and the mode is
+refused when systemd is the caller), and the emitted manifest was fed to the
+shell's real
 `normalizeManifest()`. What that could **not** touch is the cifs half, the Wi-Fi
 half, and library-scale data.
 

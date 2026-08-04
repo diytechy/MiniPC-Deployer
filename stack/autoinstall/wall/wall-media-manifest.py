@@ -65,11 +65,18 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 MANIFEST_VERSION = 1
+
+# The prefix every manifest temp file gets. It is shared knowledge with
+# `wall-sync.sh`, which excludes `/.wall-manifest.*` from the mirror so a crashed
+# run's leftover is never shipped to the shell as content. Keep the two in step.
+TMP_PREFIX = ".wall-manifest."
 
 # Extensions the panel's Chromium/Electron host can actually play. Anything else
 # in the cache (playlists, .nfo, stray archives) is not a track and is counted as
@@ -221,15 +228,59 @@ def walk_frame(root, base_url):
 
 
 def write_atomic(path, payload):
-    """Write PAYLOAD as JSON to PATH atomically, 0644 (the kiosk user reads it)."""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=True, indent=1, sort_keys=False)
-        fh.write("\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
+    """Write PAYLOAD as JSON to PATH atomically, 0644 (the kiosk user reads it).
+
+    THE TEMP FILE IS UNPREDICTABLE AND IS NEVER FOLLOWED, and that is the whole
+    point of this function's shape. It used to write `<path>.tmp` with a plain
+    `open(..., "w")`: a PREDICTABLE name, in a directory whose contents come
+    straight off a network share, opened by root, following symlinks. A source
+    containing `playlist.json.tmp -> /etc/shadow` was enough to make this process
+    truncate that file, write JSON into it and chmod it 0644 — and the name was
+    not among the mirror's exclusions, so the share could put it there. Now:
+
+      * `mkstemp` opens with O_CREAT|O_EXCL|O_NOFOLLOW semantics under a RANDOM
+        name, so a pre-placed file or symlink cannot be the thing we open;
+      * `lstat` on the descriptor's path confirms a plain, single-linked regular
+        file before anything is written;
+      * `os.replace` renames ONTO the destination, which replaces a symlink
+        sitting at `path` rather than writing through it;
+      * a failure anywhere unlinks the temp file instead of leaving litter that
+        the next mirror would have to reason about.
+
+    Contract:
+      Inputs:  path: str (absolute; inside the cache leaf the mirror just wrote)
+               payload: JSON-serialisable
+      Outputs: none; PATH is replaced atomically, mode 0644
+      Raises:  OSError if the temp file is not a plain regular file, or if any
+               of the create/write/rename steps fail (the caller lets this
+               propagate — wall-sync.sh treats a failed manifest write as FATAL)
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=TMP_PREFIX, dir=directory)
+    try:
+        st = os.lstat(tmp)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError(
+                "refusing to write {}: the freshly created temp file {} is not a"
+                " plain single-linked regular file".format(path, tmp)
+            )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None  # fdopen owns it now; the finally block must not double-close
+            json.dump(payload, fh, ensure_ascii=True, indent=1, sort_keys=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def main():

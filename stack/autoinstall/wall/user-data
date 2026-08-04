@@ -255,11 +255,25 @@ autoinstall:
     # writes a SIM one (vmtest/lib/common.sh render_sim_wall_env); nothing
     # emits a production one yet, and the builder refuses to pretend otherwise.
     # Step 4 below then no-ops, because the file already exists.
-    # `install -m 0600` and not `cp`: the payload copy's mode comes from whatever
-    # filesystem the ISO was staged on, and a build run under WSL on /mnt/c
-    # produces 0777 — the file carries the Wi-Fi PSK. The payload copy is
-    # tightened for the same reason.
-    - curtin in-target --target=/target -- bash -c '[ -f /opt/wall-panel/site/wall.env ] && { install -d -m 0755 /etc/wall-panel && install -m 0600 /opt/wall-panel/site/wall.env /etc/wall-panel/wall.env && chmod 0600 /opt/wall-panel/site/wall.env; } || true'
+    # `install -m 0600 -o root -g root` and not `cp`: the payload copy's mode AND
+    # OWNERSHIP come from whatever filesystem the ISO was staged on.
+    #
+    # AND THE PAYLOAD COPY IS DELETED, NOT MERELY CHMODDED. It used to be
+    # `chmod 0600 <payload copy>`, which fixes the mode and leaves the OWNER
+    # alone — and the owner is the builder's uid, carried through Rock Ridge
+    # (`-rock`, which preserves uid/gid) and then through `cp -a` in late-command
+    # 3. On the ordinary single-user Linux/WSL builder that uid is 1000, and the
+    # panel's `panel` user is ALSO 1000, so `/opt/wall-panel/site/wall.env`
+    # (Wi-Fi PSK) stayed readable by the kiosk user for the life of the install.
+    # There is no reason to keep a second copy once /etc has the real one.
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      s=/opt/wall-panel/site/wall.env;
+      if [ ! -f "$s" ]; then echo "wall: no site/wall.env in the payload - step 4 seeds from wall.env.example"; exit 0; fi;
+      install -d -m 0755 /etc/wall-panel;
+      install -m 0600 -o root -g root "$s" /etc/wall-panel/wall.env;
+      rm -f "$s";
+      echo "wall: installed /etc/wall-panel/wall.env (0600 root:root); payload copy REMOVED"'
     # TWO credential files, when a production build staged them (OI-18 exit (b),
     # ruled by the Owner 2026-08-03). The panel has TWO media sources on TWO
     # hosts and mounts each with its OWN credential:
@@ -274,9 +288,25 @@ autoinstall:
     #
     # `install -m 0600 -o root -g root` and not `cp`: the payload copy's mode and
     # ownership come from whatever filesystem the ISO was staged on, and a build
-    # run under WSL on /mnt/c produces 0777. The payload copies are tightened for
-    # the same reason. Loud per file — "one of two installed" is a panel with
-    # half its media and is worth a journal line saying which half.
+    # run under WSL on /mnt/c produces 0777. Loud per file — "one of two
+    # installed" is a panel with half its media and is worth a journal line
+    # saying which half.
+    #
+    # THE PAYLOAD COPIES ARE DELETED, NOT CHMODDED — this was a real on-box
+    # credential exposure. `vmtest/lib/common.sh stage_wall_site_files` writes
+    # them 0600, but owned by whoever ran the build; the ISO is written with
+    # `-rock`, which PRESERVES uid/gid; late-command 3's `cp -a` carries that uid
+    # into /opt/wall-panel/site. The old `chmod 0600 "$s"` therefore fixed a mode
+    # that was already right and left the ownership alone, so on a builder with
+    # the ordinary uid 1000 — the same uid the panel gives `panel` — the kiosk
+    # user could read BOTH Samba passwords out of /opt/wall-panel/site for the
+    # life of the install. /etc/wall-panel now holds the only copies.
+    #
+    # NOTE the two credentials are for two accounts on TWO DIFFERENT HOSTS that
+    # happen to share the username `share` (ruled 2026-08-04): cifs-music.creds
+    # is the HOMEHUB account, cifs-frame.creds the MINI-SERV one. They are not
+    # interchangeable and wall-sync.sh refuses a config that points both flows at
+    # one file.
     - >-
       curtin in-target --target=/target -- bash -c 'set -e;
       install -d -m 0755 /etc/wall-panel;
@@ -285,13 +315,14 @@ autoinstall:
       s=/opt/wall-panel/site/$f;
       if [ -f "$s" ]; then
       install -m 0600 -o root -g root "$s" "/etc/wall-panel/$f";
-      chmod 0600 "$s";
+      rm -f "$s";
       n=$((n + 1));
-      echo "wall: installed /etc/wall-panel/$f (0600 root:root)";
+      echo "wall: installed /etc/wall-panel/$f (0600 root:root); payload copy REMOVED";
       else
       echo "wall: NO site/$f - that media source cannot be mounted and wall-sync will FAIL loudly until it is placed by hand";
       fi;
       done;
+      rmdir /opt/wall-panel/site 2>/dev/null || true;
       echo "wall: $n of 2 cifs credential file(s) installed"'
 
     # ---- 4. Seed wall.env from the example if not pre-filled ------------------

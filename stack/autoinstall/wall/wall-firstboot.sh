@@ -43,6 +43,49 @@ MARKER="/opt/wall-panel/.provisioned"
 log() { echo "[wall-firstboot] $*"; }
 warn() { echo "[wall-firstboot] WARNING: $*" >&2; }
 
+# ── did anything we were ASKED to do actually fail? ──────────────────────────
+# THIS SCRIPT'S SIGNATURE BUG, found twice now: a `systemctl enable` whose
+# failure was swallowed by `|| warn`, followed by an UNCONDITIONAL "…enabled" log
+# line and, at the end, the provisioning marker. A panel whose frame timer failed
+# to enable therefore reported a GREEN first boot that explicitly claimed a
+# cadence which did not exist — "the frame share is re-checked every minute",
+# except it never is, and nothing anywhere says so. That is precisely the
+# silent-green this repo forbids, in the one place a human is watching.
+#
+# So enabling goes through ONE helper: the success line is printed only on
+# success, a failure is an ERROR (not a warning), and any failure makes the unit
+# RED and WITHHOLDS the marker, because a partially provisioned panel is not
+# provisioned.
+PROVISION_FAILED=0
+fail_step() {   # MESSAGE...
+    PROVISION_FAILED=1
+    echo "[wall-firstboot] ERROR: $*" >&2
+}
+
+# enable_unit SUCCESS_LINE UNIT... — enable units and JUDGE the result.
+# The success line is the caller's, because only the caller knows what the
+# enablement means on the wall; it is printed if and only if enable succeeded.
+enable_unit() {
+    local ok_line="$1"; shift
+    if systemctl enable "$@" >/dev/null 2>&1; then
+        log "$ok_line"
+        return 0
+    fi
+    fail_step "systemctl enable FAILED for: $*. The panel will boot WITHOUT it, so do not read the absence of a complaint later as the feature working. Check: systemctl status $1 ; then: systemctl enable $*"
+    return 1
+}
+
+# enable_unit_now — same, but starts the units as well (`--now`).
+enable_unit_now() {
+    local ok_line="$1"; shift
+    if systemctl enable --now "$@" >/dev/null 2>&1; then
+        log "$ok_line"
+        return 0
+    fi
+    fail_step "systemctl enable --now FAILED for: $*. The panel will boot WITHOUT it. Check: systemctl status $1 ; then: systemctl enable --now $*"
+    return 1
+}
+
 # ── 1. sanity ────────────────────────────────────────────────────────────────
 if [ ! -f "$ENV_FILE" ]; then
     log "FATAL: $ENV_FILE missing (autoinstall should have seeded it from wall.env.example)"
@@ -237,9 +280,8 @@ EOF
 render_timer wall-sleep "$SLEEP_START" "Enter the wall panel's sleep window (SLEEP_MODE=$SLEEP_MODE)"
 render_timer wall-wake  "$SLEEP_END"   "Leave the wall panel's sleep window"
 systemctl daemon-reload
-systemctl enable --now wall-sleep.timer wall-wake.timer >/dev/null 2>&1 || \
-    warn "could not enable the sleep-window timers — check: systemctl status wall-sleep.timer"
-log "D-W4: sleep window ${SLEEP_START}-${SLEEP_END}, SLEEP_MODE=$SLEEP_MODE, RTC wake=$SLEEP_RTC_WAKE"
+enable_unit_now "D-W4: sleep window ${SLEEP_START}-${SLEEP_END}, SLEEP_MODE=$SLEEP_MODE, RTC wake=$SLEEP_RTC_WAKE" \
+    wall-sleep.timer wall-wake.timer
 
 # The mem_sleep_default decision (user-data §6): report, never silently rewrite
 # the kernel cmdline on a keyboard-less wall-mounted machine.
@@ -346,38 +388,29 @@ log "kiosk: tty1 autologin + profile hook installed, getty@tty1 restart enqueued
 install -d -m 0755 "$WALL_MEDIA_CACHE" "$WALL_MEDIA_CACHE/music" "$WALL_MEDIA_CACHE/frame"
 log "OI-15: media cache ready at $WALL_MEDIA_CACHE (music/ + frame/)"
 if [ -f /etc/systemd/system/wall-sync.service ]; then
-    systemctl enable wall-sync.service >/dev/null 2>&1 \
-        || warn "could not enable wall-sync.service — check: systemctl status wall-sync.service"
+    enable_unit "OI-15: wall-sync.service enabled — both media flows are mirrored once after boot" \
+        wall-sync.service
 else
-    warn "wall-sync.service is not installed (the autoinstall late-commands place it)."
-    warn "Without it the panel will never pull media. Re-image, or copy it from"
-    warn "$PAYLOAD/wall-sync.service by hand."
+    fail_step "wall-sync.service is not installed (the autoinstall late-commands place it). Without it the panel will NEVER pull media — no music and no frame video, on a unit nothing will ever mark red. Re-image, or copy it from $PAYLOAD/wall-sync.service by hand and enable it."
 fi
 # OI-16a (the Owner, 2026-07-29): the resume hook. Enabling is what plants the
 # suspend.target wants-symlink — an installed-but-disabled hook never fires, and
 # a panel on SLEEP_MODE=suspend would then sync only at boot, i.e. ~never.
 if [ -f /etc/systemd/system/wall-sync-resume.service ]; then
-    systemctl enable wall-sync-resume.service >/dev/null 2>&1 \
-        || warn "could not enable wall-sync-resume.service — check: systemctl status wall-sync-resume.service"
-    log "OI-16a: wall-sync-resume.service enabled — every resume from suspend re-triggers the media sync"
+    enable_unit "OI-16a: wall-sync-resume.service enabled — every resume from suspend re-triggers the media sync" \
+        wall-sync-resume.service
 else
-    warn "wall-sync-resume.service is not installed (the autoinstall late-commands place it)."
-    warn "Without it a resume does NOT refresh the media cache — with SLEEP_MODE=suspend"
-    warn "the panel can then run for weeks on a stale cache. Copy it from"
-    warn "$PAYLOAD/wall-sync-resume.service and: systemctl enable wall-sync-resume.service"
+    fail_step "wall-sync-resume.service is not installed (the autoinstall late-commands place it). Without it a resume does NOT refresh the media cache — with SLEEP_MODE=suspend the panel can then run for weeks on a stale cache. Copy it from $PAYLOAD/wall-sync-resume.service and: systemctl enable wall-sync-resume.service"
 fi
 # OI-18: the frame flow has its OWN cadence — every minute, per storage-map §4d
 # — so it has its own unit and timer. Enabling the TIMER is what matters; the
 # service it triggers is deliberately not enabled on its own (nothing should
 # start it at boot; wall-sync.service already covers the boot pass).
 if [ -f /etc/systemd/system/wall-sync-frame.timer ]; then
-    systemctl enable wall-sync-frame.timer >/dev/null 2>&1 \
-        || warn "could not enable wall-sync-frame.timer — check: systemctl status wall-sync-frame.timer"
-    log "OI-18: wall-sync-frame.timer enabled — the frame share is re-checked every minute (skipped silently while Mini-serv sleeps)"
+    enable_unit "OI-18: wall-sync-frame.timer enabled — the frame share is re-checked every minute (skipped while Mini-serv sleeps)" \
+        wall-sync-frame.timer
 else
-    warn "wall-sync-frame.timer is not installed (the autoinstall late-commands place it)."
-    warn "Without it the frame videos refresh only at boot/resume, not every minute."
-    warn "Copy it from $PAYLOAD/ and: systemctl enable --now wall-sync-frame.timer"
+    fail_step "wall-sync-frame.timer is not installed (the autoinstall late-commands place it). Without it the frame videos refresh only at boot/resume, not every minute — and the frame flow's whole design is that its silence is normal, so nothing would ever look wrong. Copy it from $PAYLOAD/ and: systemctl enable --now wall-sync-frame.timer"
 fi
 
 # Report BOTH sources. Reported separately and named individually because they
@@ -449,7 +482,19 @@ else
     warn "Rebuild the image with the artifact staged: see vmtest/build-wall-seed.sh."
 fi
 
-# ── 9. done ──────────────────────────────────────────────────────────────────
+# ── 9. done — but only if it IS done ─────────────────────────────────────────
+# The marker means "this panel is provisioned", and units, scripts and humans all
+# read it that way. It is therefore written ONLY when every step that could fail
+# did not: a panel with, say, no frame timer is not provisioned, and stamping it
+# as such is how the missing cadence stays invisible for a month.
+if [ "$PROVISION_FAILED" -ne 0 ]; then
+    warn "panel configuration FAILED — see the ERROR line(s) above."
+    warn "The provisioning marker $MARKER was NOT written and this unit is RED on"
+    warn "purpose: something the panel needs is not in place, and a green firstboot"
+    warn "claiming otherwise is the failure this check exists to prevent."
+    warn "Fix the cause, then re-run: sudo /usr/local/sbin/wall-firstboot.sh"
+    exit 1
+fi
 install -d -m 0755 "$(dirname "$MARKER")"
 date > "$MARKER"
 log "panel configuration complete. Remaining checks are hardware-only:"

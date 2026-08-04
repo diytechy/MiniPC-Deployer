@@ -238,6 +238,51 @@ autoinstall:
       echo "homehub: first boot will PULL every container image from its registry (needs internet), and naglight:local has no registry home.";
       exit 0'
 
+    # ---- 3b. Decide the deploy unit's PERMISSIONS ------------------------------
+    # FOUND BY BOOTING, 2026-08-04. The installed gate VM had `drwxrwxrwx
+    # root:root /opt/homehub`, `-rwxrwxrwx stack/.env`, `-rwxrwxrwx
+    # docker-compose.yml` and 230 world-writable paths beneath it — and an
+    # unprivileged account could READ every credential in .env and WRITE the
+    # compose file that root brings up on the next boot. Nothing was
+    # malfunctioning: a WSL build stages the payload on an NTFS mount, DrvFs
+    # reports 0777 for every path there, Rock Ridge records that honestly and the
+    # `cp -a` above copies it honestly. The mode was never DECIDED by anyone.
+    #
+    # It is decided in TWO places on purpose. vmtest/lib/common.sh
+    # (normalize_payload_modes) is the primary fix and gives the payload a real
+    # policy — 0755 dirs, 0644 files, 0755 for anything with a `#!`, 0600
+    # secrets. This step is the floor underneath it, and it is not merely belt
+    # and braces: on the DEFAULT build host the staging filesystem discards
+    # chmod outright, so a payload can still arrive here from a build route that
+    # never applied the policy. What this asserts is the property that made the
+    # finding a security defect rather than untidiness — root-owned, and NOTHING
+    # group- or world-writable — and it refuses the install if it cannot get it.
+    #
+    # `chown -R 0:0` is the OI-18 lesson generalised: `-rock` preserves the
+    # BUILDER's uid, which on an ordinary single-user Linux/WSL builder is 1000 —
+    # the same uid this image gives `hub`. Ownership, not just mode.
+    #
+    # It runs BEFORE step 4/4b deliberately: 4b installs the real site files
+    # 0600 root:root and tightens what it leaves behind, so this narrows the
+    # window rather than fighting it, and the two agree about site/ being 0700.
+    - >-
+      bash -c 'R=/target/opt/homehub;
+      if [ ! -d "$R" ]; then echo "homehub: no /opt/homehub to normalise - step 3 found no payload"; exit 0; fi;
+      chown -R 0:0 "$R" || { echo "homehub: FATAL - could not take ownership of $R"; exit 1; };
+      chmod -R go-w "$R" || { echo "homehub: FATAL - could not clear group/world write on $R"; exit 1; };
+      chmod 0755 "$R";
+      if [ -d "$R/site" ]; then chmod 0700 "$R/site"; find "$R/site" -type f -exec chmod 0600 {} +; fi;
+      if [ -f "$R/stack/.env" ]; then chmod 0600 "$R/stack/.env"; fi;
+      find "$R" -type f -name "*.creds" -exec chmod 0600 {} + ;
+      bad=$(find "$R" -perm /022 | head -n 5);
+      if [ -n "$bad" ]; then
+      echo "homehub: FATAL - $R is STILL group- or world-writable after normalisation:";
+      echo "$bad";
+      echo "homehub: a writable docker-compose.yml on a box that runs it as root is a local privilege escalation. Refusing to finish an install that leaves one.";
+      exit 1;
+      fi;
+      echo "homehub: /opt/homehub normalised - root-owned, nothing group- or world-writable"'
+
     # ---- 4. Seed .env from the example if the operator did not pre-fill one ----
     - curtin in-target --target=/target -- bash -c '[ -f /opt/homehub/stack/.env ] || cp /opt/homehub/stack/.env.example /opt/homehub/stack/.env'
 

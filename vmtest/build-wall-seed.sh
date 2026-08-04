@@ -92,8 +92,18 @@ render_wall_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-wall-seed.sh"
 # right on real hardware and useless as a gate.
 stage_wall_shell_into_payload "$OUT_DIR" "$REPO_ROOT"
 
+# The panel's payload has the SAME exposure the hub's did (2026-08-04):
+# /opt/wall-panel is populated by the same `cp -a` out of the same kind of
+# staging tree. It compounds OI-18, which found the staged credentials readable
+# by `panel` through a uid-1000 collision — at 0777 they are readable by
+# everyone. This tightens them one step earlier than late-command 4a's delete,
+# and does not fight it: 4a still removes the payload copies outright.
+normalize_payload_modes "$OUT_DIR/iso-root/deploy-payload"
+assert_payload_modes "$OUT_DIR/iso-root/deploy-payload"
+
 WALL_SEED_ISO="$OUT_DIR/wall-seed.iso"
 write_seed_iso "$OUT_DIR/iso-root" "$WALL_SEED_ISO"
+assert_iso_payload_modes "$WALL_SEED_ISO" /deploy-payload
 
 log "OK — wall seed ISO ready: $WALL_SEED_ISO ($(( $(stat -c%s "$WALL_SEED_ISO") / 1024 / 1024 )) MB)"
 if [ "$WALL_BUILD_KIND" = "production" ]; then

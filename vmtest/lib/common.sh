@@ -378,16 +378,35 @@ require_iso_tool() {
 # why each builder writes a DIFFERENTLY-NAMED file — attaching the wrong seed to
 # a VM would install the other machine's image, and the label cannot tell them
 # apart.
+#
+# `-rock` vs `-r`, AND WHY THE CHOICE IS NOT COSMETIC (2026-08-04, found by
+# BOOTING). Rock Ridge records the staged tree's modes verbatim, and the
+# late-command's `cp -a` then reproduces them on /target. That is correct
+# behaviour and it is exactly how every hub ISO ever built here shipped
+# `/opt/homehub` world-writable: a WSL build stages onto /mnt/c, DrvFs reports
+# 0777 for every path on an NTFS mount, `-rock` honestly recorded 0777 and
+# `cp -a` honestly copied it. `-r` (rational rock) is mkisofs's answer to the
+# same problem — uid/gid 0, read bits set, execute bits normalised and EVERY
+# WRITE BIT CLEARED — so it is used exactly when the staging filesystem has
+# proven it cannot hold the mode policy normalize_payload_modes applied
+# (PAYLOAD_MODE_FIX_AT_ISO, set there). On a filesystem that CAN hold it, `-r`
+# would be the wrong tool: it would flatten the 0600 on a staged secret to 0444.
 write_seed_iso() {
-    local src_dir="$1" out_iso="$2"
+    local src_dir="$1" out_iso="$2" rock_opt="-rock"
     require_iso_tool
-    log "building $out_iso with $ISO_TOOL (volume label CIDATA)"
+    if [ "${PAYLOAD_MODE_FIX_AT_ISO:-0}" -eq 1 ]; then
+        rock_opt="-r"
+        log "  mode policy imposed by the ISO writer: -r (rational rock) — uid/gid 0," \
+            "no write bit anywhere. The staging filesystem discards chmod, so the tree" \
+            "it was burned from cannot carry the policy."
+    fi
+    log "building $out_iso with $ISO_TOOL (volume label CIDATA, $rock_opt)"
     case "$ISO_TOOL" in
         genisoimage)
-            genisoimage -output "$out_iso" -volid CIDATA -joliet -rock "$src_dir" >/dev/null
+            genisoimage -output "$out_iso" -volid CIDATA -joliet "$rock_opt" "$src_dir" >/dev/null
             ;;
         xorriso)
-            xorriso -as genisoimage -output "$out_iso" -volid CIDATA -joliet -rock "$src_dir" >/dev/null
+            xorriso -as genisoimage -output "$out_iso" -volid CIDATA -joliet "$rock_opt" "$src_dir" >/dev/null
             ;;
     esac
 }
@@ -449,6 +468,229 @@ copy_repo_into_payload() {
         ( cd "$repo_root" && tar -c --exclude=.git --exclude=vmtest/.out --exclude=vmtest/.out-wall . ) \
             | ( cd "$payload_dir" && tar -x )
     fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PAYLOAD MODES — the deploy unit's permissions are a BUILD OUTPUT, not
+#  whatever the build host's filesystem happened to say.
+#
+#  FOUND BY BOOTING THE HUB GATE VM, 2026-08-04. The installed box had:
+#      drwxrwxrwx root:root /opt/homehub          (and stack/, images/)
+#      -rwxrwxrwx root:root /opt/homehub/stack/.env
+#      -rwxrwxrwx root:root /opt/homehub/stack/docker-compose.yml
+#      230 world-writable paths under /opt/homehub
+#  and `sudo -u nobody` could READ `stack/.env` — OAUTH2_PROXY_CLIENT_SECRET,
+#  TECHNITIUM_ADMIN_PASSWORD, FINANCE_*, CLOUDFLARE_API_TOKEN — and WRITE
+#  `docker-compose.yml`, which root runs on the next bring-up. That is a local
+#  privilege escalation reachable by any local account or any compromised
+#  container with a host bind-mount.
+#
+#  NOTHING WAS MALFUNCTIONING, which is why it survived every static test, every
+#  sim run and every ISO build: DrvFs reports 0777 for every path on an NTFS
+#  mount, `git ls-files | tar` preserves that, `-rock` records it honestly and
+#  `cp -a` copies it honestly. The mode was simply never DECIDED anywhere in the
+#  chain. It is decided here.
+#
+#  THE POLICY — one table, applied by normalize_payload_modes and judged by
+#  assert_payload_modes. The precedent for stating modes as a table and then
+#  asserting them is assert_wall_artifact_contract, which reads `-rwxr-xr-x
+#  app/wall-shell` and `4755 root:root chrome-sandbox` straight out of the shell
+#  tarball rather than trusting the extraction.
+#
+#      directories                       0755
+#      files beginning `#!`              0755   (see below)
+#      every other ordinary file         0644
+#      site/  (materialised config)      0700, and every file in it 0600
+#      stack/.env, any *.creds           0600
+#
+#  WHY A SHEBANG AND NOT THE GIT INDEX. The obvious source for "is this
+#  executable" is git's own mode bit, and it is WRONG here: `core.filemode` is
+#  false on this Windows checkout, so only 10 of the repo's 58 scripts are
+#  recorded 100755 — `stack/provision/*.sh`, `stack/samba/library-guard.sh` and
+#  `stack/autoinstall/firstboot.sh` are all 100644 in the index. Keying off the
+#  index would have shipped them non-executable, which is the mirror of the bug
+#  being fixed. The `#!` line is the property that actually decides whether a
+#  file can be exec'd, it is in the file's own content, and it cannot drift out
+#  of step with a checkout's filemode setting. A new script gets the bit for
+#  free; a data file can never accidentally acquire it.
+#
+#  NOTHING IN THE PAYLOAD IS SETUID. The one setuid file either image ships
+#  (app/runtime/chrome-sandbox, 4755) rides INSIDE the shell tarball, which this
+#  never opens — that is the whole reason it is a tarball (see
+#  stage_wall_shell_into_payload). If that ever changes, this policy has to be
+#  told about it explicitly rather than silently clearing the bit.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# payload_fs_carries_modes DIR — can this filesystem hold a chmod AT ALL?
+#
+# The question is not academic and it is the reason this file has two enforcement
+# layers instead of one. WSL mounts a Windows drive as 9p/DrvFs without metadata,
+# so `chmod 0600 f` SUCCEEDS, reports nothing, and `stat` still says 0777 —
+# verified on this dev box. OUT_DIR defaults to vmtest/.out (on C:) and the
+# README recommends /mnt/d, so the DEFAULT build path is one where a staged mode
+# cannot be stored. A normaliser that assumed otherwise would log a tidy summary
+# and change nothing.
+payload_fs_carries_modes() {
+    local probe="$1/.payload-mode-probe.$$" mode
+    mkdir -p "$1" || return 1
+    : > "$probe" 2>/dev/null || return 1
+    chmod 0600 "$probe" 2>/dev/null
+    mode="$(stat -c%a "$probe" 2>/dev/null)"
+    rm -f "$probe"
+    [ "$mode" = "600" ]
+}
+
+# normalize_payload_modes PAYLOAD_DIR — apply the table above to the whole
+# staged payload. Call it AFTER every stager has run and BEFORE the ISO is
+# written; the assertion below is what makes that ordering enforceable.
+#
+# Exports PAYLOAD_MODE_FIX_AT_ISO=1 when the staging filesystem discarded the
+# chmods, which is what tells write_seed_iso to use `-r` and build-repacked-iso
+# to chmod inside the image. The variable is the HANDOFF between the two layers,
+# not a "we tried" flag: assert_payload_modes refuses to pass a tree it could not
+# judge unless the handoff happened.
+#
+# Contract:
+#   Inputs:  payload_dir: str (an existing staged deploy-payload/)
+#   Outputs: nothing; mutates modes under payload_dir
+#   Exports: PAYLOAD_MODE_FIX_AT_ISO=0|1
+#   Raises:  dies if payload_dir does not exist
+normalize_payload_modes() {
+    local dir="$1" f execs=0
+    [ -d "$dir" ] || die "normalize_payload_modes: $dir is not a directory"
+
+    if payload_fs_carries_modes "$dir"; then
+        PAYLOAD_MODE_FIX_AT_ISO=0
+    else
+        PAYLOAD_MODE_FIX_AT_ISO=1
+    fi
+
+    find "$dir" -type d -exec chmod 0755 {} +
+    # NOTE: the image tars and the shell tarball are HARDLINKED into the payload
+    # when the filesystem allows it (stage_images_into_payload,
+    # stage_wall_shell_into_payload), so this chmod is felt by the original in
+    # vmtest/.out/images or OfficeWallNaglight/dist too. 0644 is what a plain
+    # `cp` would have given them, so it takes nothing away — but it IS a write
+    # through a hardlink, and worth knowing before adding a mode here that isn't.
+    find "$dir" -type f -exec chmod 0644 {} +
+
+    # Executables: the `#!` files, read two bytes at a time rather than grepped,
+    # because a payload carrying ~1 GB of container-image tars would otherwise be
+    # scanned end to end to prove that a tar is not a script.
+    # `tr -d '\0'` is not decoration: a command substitution that captures a NUL
+    # byte makes bash print "warning: ignored null byte in input" for every
+    # binary file in the payload, which on a build carrying container-image tars
+    # is a screenful of noise over a check that worked fine.
+    while IFS= read -r -d '' f; do
+        if [ "$(head -c2 "$f" 2>/dev/null | tr -d '\0')" = '#!' ]; then
+            chmod 0755 "$f"
+            execs=$((execs + 1))
+        fi
+    done < <(find "$dir" -type f -print0)
+
+    # Secrets: RESTRICTIVE, not merely non-world-writable. site/ is the
+    # materialised-config seam on both images (real .env, backup.env, the *.creds
+    # files, wall.env with the Wi-Fi PSK); the install-time steps already install
+    # each one 0600 root:root and then delete or tighten the payload copy, and
+    # this is the same posture one step earlier, in the artifact itself.
+    if [ -d "$dir/site" ]; then
+        chmod 0700 "$dir/site"
+        find "$dir/site" -type f -exec chmod 0600 {} +
+    fi
+    if [ -f "$dir/stack/.env" ]; then chmod 0600 "$dir/stack/.env"; fi
+    find "$dir" -type f -name '*.creds' -exec chmod 0600 {} +
+
+    log "payload modes normalised: dirs 0755, files 0644, $execs executable (#!), secrets 0600"
+    if [ "$PAYLOAD_MODE_FIX_AT_ISO" -eq 1 ]; then
+        log "  NOTE: the staging filesystem DISCARDS chmod (a Windows drive under WSL/DrvFs" \
+            "reports 0777 for everything). The tree on disk is therefore NOT the policy," \
+            "and the ISO writer imposes it instead — see write_seed_iso's -r branch."
+    fi
+}
+
+# assert_payload_modes PAYLOAD_DIR — FAIL THE BUILD on a group- or
+# world-writable path. This is the check whose absence let the defect ship: every
+# other assertion in this file reads text, and a mode is not text.
+#
+# TWO OUTCOMES, NEVER A SILENT THIRD:
+#   - the staging filesystem carries modes -> judge the tree; any violation dies.
+#   - it does not -> the tree is NOT EVIDENCE about anything, so this refuses to
+#     call it a pass and instead requires that the other layer is armed
+#     (PAYLOAD_MODE_FIX_AT_ISO=1, i.e. normalize_payload_modes ran and said so).
+#     Unarmed means nobody is enforcing the policy, and that dies too.
+assert_payload_modes() {
+    local dir="$1" n bad total report
+    [ -d "$dir" ] || die "assert_payload_modes: $dir is not a directory"
+
+    if ! payload_fs_carries_modes "$dir"; then
+        [ "${PAYLOAD_MODE_FIX_AT_ISO:-0}" -eq 1 ] || die \
+            "the staged payload's modes cannot be judged ($dir is on a filesystem that discards chmod)" \
+            "and normalize_payload_modes has NOT run, so nothing is imposing the mode policy on this build." \
+            "Call normalize_payload_modes before assert_payload_modes. Every hub ISO built before" \
+            "2026-08-04 shipped /opt/homehub world-writable exactly because no layer owned this."
+        log "payload modes: not judged on disk (staging filesystem discards chmod) —" \
+            "the ISO writer imposes the policy and assert_iso_payload_modes judges the RESULT."
+        return 0
+    fi
+
+    total=$(find "$dir" | wc -l)
+    # COUNT AND SAMPLE IN ONE awk PASS, never `find … | head`. The callers all
+    # run under `set -o pipefail`, and an early-exiting `head` SIGPIPEs `find`,
+    # so the pipeline returns 141 and `set -e` kills the build BEFORE die() can
+    # say why — i.e. the refusal fires hardest as an unexplained exit. This
+    # repo has paid for that shape twice already (assert_electron_runtime_deps,
+    # stage_wall_site_into_payload) and the mode guard's own bite proof caught
+    # it a third time.
+    report="$(find "$dir" -perm /022 -printf '%M %p\n' 2>/dev/null | awk '
+        { c++; if (c <= 10) buf = buf "  " $0 "\n" }
+        END { printf "%d\n%s", c + 0, buf }')"
+    n="${report%%$'\n'*}"
+    bad="${report#*$'\n'}"
+    if [ "$n" -ne 0 ]; then
+        die "the staged deploy payload has $n group- or world-writable path(s) out of $total:" \
+            "$bad" \
+            "A world-writable docker-compose.yml on a box that runs it as root is a local privilege" \
+            "escalation, and a world-readable stack/.env hands over every credential in it." \
+            "This is what booting the gate VM found on 2026-08-04. Fix the staging, not this check."
+    fi
+    log "payload modes OK: 0 of $total staged paths are group- or world-writable"
+}
+
+# assert_iso_payload_modes ISO [ISO_PATH] — judge the ARTIFACT, not the tree.
+#
+# The tree cannot answer on the default build host (see payload_fs_carries_modes),
+# and the ISO is what gets written to a stick and `cp -a`'d onto /target. So the
+# property is proven where it is actually true or false: in the recorded Rock
+# Ridge modes. Cheap — this walks directory records, not file content.
+#
+# xorriso, not isoinfo, because it prints whole paths: naming the offender is
+# most of the value of a refusal, and this repo has paid for messages that said
+# only "something is wrong" before.
+assert_iso_payload_modes() {
+    local iso="$1" iso_path="${2:-/}" listing bad n report
+    require_cmd xorriso "Install with: sudo apt-get install -y xorriso"
+    listing="$(xorriso -indev "$iso" -find "$iso_path" -exec lsdl -- 2>/dev/null)" \
+        || die "could not list $iso_path inside $iso to check its modes — refusing to report a pass this check did not earn."
+    [ -n "$listing" ] || die \
+        "listing $iso_path inside $iso produced NOTHING, so the mode check below would pass vacuously." \
+        "Either the path is absent from the image or xorriso could not read it."
+    # Columns: mode owner group size date... 'path'. Group write is char 6 of the
+    # mode string, other write char 9. One awk pass counts AND samples — see
+    # assert_payload_modes on why `… | head` is not used under pipefail.
+    report="$(printf '%s\n' "$listing" | awk '
+        /^[-dl]/ { m = substr($1, 1, 10)
+                   if (substr(m, 6, 1) == "w" || substr(m, 9, 1) == "w") {
+                       c++; if (c <= 10) buf = buf "  " $0 "\n" } }
+        END { printf "%d\n%s", c + 0, buf }')"
+    n="${report%%$'\n'*}"
+    bad="${report#*$'\n'}"
+    if [ "$n" -ne 0 ]; then
+        die "$iso records $n group- or world-writable path(s) under $iso_path:" \
+            "$bad" \
+            "late-command 3 copies this tree onto /target with 'cp -a', which preserves exactly" \
+            "these bits — this is the 2026-08-04 defect, in the artifact, before it boots."
+    fi
+    log "ISO modes OK: nothing under $iso_path in $(basename "$iso") is group- or world-writable"
 }
 
 # set_env_key FILE KEY VALUE — rewrite an EXISTING KEY= line, then PROVE it.

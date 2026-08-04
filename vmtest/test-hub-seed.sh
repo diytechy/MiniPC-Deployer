@@ -339,6 +339,97 @@ else
 fi
 
 echo
+echo "=== the payload's MODES (found by BOOTING, 2026-08-04) ==="
+# WHY THIS SECTION EXISTS. Every hub ISO ever built on the dev box installed
+# /opt/homehub world-writable: `drwxrwxrwx root:root`, `-rwxrwxrwx stack/.env`,
+# `-rwxrwxrwx docker-compose.yml`, 230 world-writable paths, and `sudo -u nobody`
+# could read every credential in .env and WRITE the compose file root brings up.
+# It survived every static test, every sim run and multiple ISO builds for one
+# reason: NOTHING IN THIS REPO HAD EVER LOOKED AT A MODE. Every other assertion
+# reads text, and a mode is not text. It took an install to find it.
+#
+# The property is asserted on the STAGED TREE here because this suite stages
+# under $TMPDIR (a real Linux filesystem). The builder ALSO asserts the ISO it
+# writes, which is the only layer that can speak on the default build host —
+# there OUT_DIR is a Windows drive, DrvFs reports 0777 for everything and
+# discards chmod outright.
+if build_seed "SITE_DIR=$SITE"; then
+    P="$OUT/iso-root/deploy-payload"
+    nbad=$(find "$P" -perm /022 | wc -l)
+    ntotal=$(find "$P" | wc -l)
+    if [ "$nbad" -eq 0 ]; then
+        ok "no group- or world-writable path anywhere in the staged payload ($ntotal paths)"
+    else
+        bad "payload modes" "$nbad of $ntotal staged paths are group- or world-writable, e.g. $(find "$P" -perm /022 -printf '%M %P\n' | head -n 3 | tr '\n' ' ')"
+    fi
+
+    # THE POLICY, FILE BY FILE — not a count. A single stat'd file was exactly
+    # how the site-install check used to claim "all seven are 0600" while only
+    # ever looking at .env. Each row is here because it is a DIFFERENT class:
+    # a directory, a data file, two scripts git records as 100644 (core.filemode
+    # is false on the Windows checkout, so the index cannot be the source of the
+    # executable bit), the materialised-config directory and its secrets.
+    wrong=""
+    check_mode() {
+        local got; got="$(stat -c%a "$P/$1" 2>/dev/null)"
+        [ "$got" = "$2" ] || wrong="$wrong $1=${got:-ABSENT}(want $2)"
+    }
+    check_mode stack                                  755
+    check_mode stack/docker-compose.yml               644
+    check_mode stack/autoinstall/user-data            644
+    check_mode stack/provision/provision-samba.sh     755
+    check_mode stack/autoinstall/firstboot.sh         755
+    check_mode stack/samba/library-guard.sh           755
+    check_mode site                                   700
+    check_mode site/.env                              600
+    check_mode site/cifs.creds                        600
+    check_mode site/config.json                       600
+    check_mode stack/.env                             600
+    if [ -z "$wrong" ]; then
+        ok "the mode policy holds per file: dirs 0755, data 0644, #! scripts 0755, site/ 0700 with 0600 secrets, stack/.env 0600"
+    else
+        bad "the mode policy" "$wrong"
+    fi
+
+    # AND IN THE ARTIFACT. The staged tree is not what boots; the ISO is, and
+    # `cp -a` reproduces exactly what Rock Ridge recorded.
+    if [ -f "$OUT/seed.iso" ] && command -v xorriso >/dev/null 2>&1; then
+        isobad=$(xorriso -indev "$OUT/seed.iso" -find /deploy-payload -exec lsdl -- 2>/dev/null \
+                 | awk '/^[-dl]/ { m = substr($1,1,10); if (substr(m,6,1)=="w" || substr(m,9,1)=="w") c++ } END { print c+0 }')
+        if [ "$isobad" = "0" ]; then
+            ok "the SEED ISO records no group- or world-writable path under /deploy-payload (this is what cp -a copies)"
+        else
+            bad "ISO modes" "$isobad group/world-writable entries under /deploy-payload in seed.iso"
+        fi
+    else
+        skip_case "the seed ISO's recorded modes" "no seed.iso or no xorriso — the artifact half of the mode check could not be read, and that is not a pass"
+    fi
+else
+    bad "the build for the mode cases" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+# ── DOES THE GUARD BITE? ─────────────────────────────────────────────────────
+# The repo's recent history is full of tests that passed whether or not the code
+# was there, so prove this one fails when the normalisation is taken away. The
+# STUB goes into the sandbox's copy of common.sh (a later definition wins over
+# the earlier one), never into the checkout — and it still sets
+# PAYLOAD_MODE_FIX_AT_ISO, so what is being removed is the mode policy alone and
+# not the handshake between the two enforcement layers.
+cat >> "$SANDBOX/vmtest/lib/common.sh" <<'STUB'
+
+# ── STUB appended by vmtest/test-hub-seed.sh, in the SANDBOX copy only ──
+normalize_payload_modes() { PAYLOAD_MODE_FIX_AT_ISO=0; log "STUB: normalisation disabled"; }
+STUB
+expect_refusal "with normalize_payload_modes STUBBED OUT the build REFUSES (the guard bites)" \
+    "group- or world-writable path(s)" -- "SITE_DIR=$SITE"
+cp "$REPO_ROOT/vmtest/lib/common.sh" "$SANDBOX/vmtest/lib/common.sh"
+if build_seed "SITE_DIR=$SITE"; then
+    ok "…and builds green again once it is restored (so the refusal was the stub, not the suite)"
+else
+    bad "restore after the bite proof" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+echo
 echo "=== the substitution assertions (a silent no-op must fail the build) ==="
 grep -v 'BUILD_PROFILE=production' "$PRISTINE_UD" > "$USER_DATA"
 expect_refusal "a user-data that lost BUILD_PROFILE=production fails the sim build" \
@@ -585,6 +676,56 @@ else
                 bad "light path (CIDATA)" "step3 rc=$rc3, 4b rc=$rc, problems:${problems:-none}, step3 said: $(head -n1 "$WORK/lc3.txt")"
             fi
             losetup -d "$LOOPDEV" 2>/dev/null; LOOPDEV=""
+        fi
+    fi
+
+    # ── LATE-COMMAND 3b, EXECUTED: the install-time floor under the mode policy ─
+    # The builder is the primary fix, but on the default build host the staging
+    # filesystem discards chmod, so a payload can still arrive here with the
+    # modes the 2026-08-04 boot found. This step is what makes that unable to
+    # survive an install — and it is executed, not grepped, against a fake
+    # /target deliberately staged the way DrvFs leaves one: 0777 everywhere.
+    CMD3B="$WORK/cmd-3b.sh"
+    if extract_late_command "$USER_DATA" "normalised - root-owned" "extracting late-command 3b (mode normalisation)" "$WORK/3b.raw"; then
+        T="$WORK/t-modes-$RANDOM"
+        mkdir -p "$T/opt/homehub/stack" "$T/opt/homehub/site"
+        printf 'services:\n' > "$T/opt/homehub/stack/docker-compose.yml"
+        printf 'OAUTH2_PROXY_CLIENT_SECRET=x\n' > "$T/opt/homehub/stack/.env"
+        printf 'username=share\npassword=x\n' > "$T/opt/homehub/site/cifs.creds"
+        chmod -R 0777 "$T/opt/homehub"
+        runnable_body "$WORK/3b.raw" "$CMD3B" "$T"
+        rc=$(bash "$CMD3B" >"$WORK/lc3b.txt" 2>&1; echo $?)
+        left=$(find "$T/opt/homehub" -perm /022 | wc -l)
+        m_env="$(stat -c '%a:%U' "$T/opt/homehub/stack/.env")"
+        m_site="$(stat -c%a "$T/opt/homehub/site")"
+        m_creds="$(stat -c%a "$T/opt/homehub/site/cifs.creds")"
+        m_compose="$(stat -c%a "$T/opt/homehub/stack/docker-compose.yml")"
+        if [ "$rc" -eq 0 ] && [ "$left" -eq 0 ] && [ "$m_env" = "600:root" ] \
+           && [ "$m_site" = "700" ] && [ "$m_creds" = "600" ] && [ "$m_compose" = "755" ]; then
+            ok "3b RUN: a 0777 payload is normalised in place — 0 writable paths left, .env 600:root, site/ 0700, *.creds 0600"
+        else
+            bad "3b execution" "rc=$rc writable-left=$left .env=$m_env site=$m_site creds=$m_creds compose=$m_compose"
+        fi
+
+        # AND IT REFUSES rather than reporting a normalisation it did not get.
+        # An immutable file is the cheapest way to make chmod fail for real; if
+        # chattr is unavailable this is a SKIP, not a pass.
+        T="$WORK/t-modes-fail-$RANDOM"
+        mkdir -p "$T/opt/homehub/stack"
+        : > "$T/opt/homehub/stack/stuck"
+        chmod 0666 "$T/opt/homehub/stack/stuck"
+        if chattr +i "$T/opt/homehub/stack/stuck" 2>/dev/null; then
+            runnable_body "$WORK/3b.raw" "$CMD3B" "$T"
+            rc=$(bash "$CMD3B" >"$WORK/lc3b.txt" 2>&1; echo $?)
+            chattr -i "$T/opt/homehub/stack/stuck" 2>/dev/null
+            if [ "$rc" -ne 0 ]; then
+                ok "3b RUN: a path it could NOT tighten halts the install instead of logging success"
+            else
+                bad "3b refusal" "rc=0 with a file it could not chmod: $(head -n2 "$WORK/lc3b.txt" | tr '\n' ' ')"
+            fi
+        else
+            skip_case "3b's refusal when a path cannot be tightened" \
+                "chattr +i is unavailable here, so chmod cannot be made to fail for real — the refusal branch is UNTESTED, which is not a pass"
         fi
     fi
 

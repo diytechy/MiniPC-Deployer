@@ -86,8 +86,21 @@ stage_images_into_payload "$OUT_DIR" "$IMAGES_OUT"
 # tolerated: a checkout without that private sibling still builds a hub.
 stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
 
+# LAST, after every stager: the payload's permissions are decided here, not
+# inherited from whatever filesystem this ran on. Booting the gate VM on
+# 2026-08-04 found /opt/homehub 0777 with 230 world-writable paths under it,
+# straight off a DrvFs staging tree that reports 0777 for everything. The
+# assertion is the half that cannot be skipped — nothing else in this repo has
+# ever looked at a mode.
+normalize_payload_modes "$OUT_DIR/iso-root/deploy-payload"
+assert_payload_modes "$OUT_DIR/iso-root/deploy-payload"
+
 SEED_ISO="$OUT_DIR/seed.iso"
 write_seed_iso "$OUT_DIR/iso-root" "$SEED_ISO"
+# And judge the ARTIFACT. On the default build host (WSL, OUT_DIR on a Windows
+# drive) the staged tree cannot carry modes at all, so the ISO is the only place
+# the property is observable — and the ISO is what `cp -a` reads.
+assert_iso_payload_modes "$SEED_ISO" /deploy-payload
 
 log "OK — seed ISO ready: $SEED_ISO"
 log "SSH:     ssh -i $SSH_KEY hub@<vm-ip>   (fingerprint: $(ssh-keygen -lf "$SSH_KEY.pub"))"

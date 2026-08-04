@@ -215,6 +215,45 @@ autoinstall:
       echo "wall: the seed ISO carries it at its root; on the light path nothing mounts that volume for you.";
       exit 1'
 
+    # ---- 3a. Decide the payload's PERMISSIONS --------------------------------
+    # THE HUB'S 2026-08-04 DEFECT IS THIS IMAGE'S DEFECT TOO. Booting the hub
+    # gate VM found /opt/homehub and 230 paths under it world-writable, because
+    # a WSL build stages onto an NTFS mount where DrvFs reports 0777, Rock Ridge
+    # records that faithfully and the `cp -a` above copies it faithfully.
+    # /opt/wall-panel is populated by the identical mechanism, so it arrived the
+    # identical way — and here it compounds OI-18, which found the staged
+    # credentials readable by `panel` through a uid-1000 collision. At 0777 they
+    # were readable by everyone, collision or not.
+    #
+    # ORDER IS LOAD-BEARING: this runs BEFORE step 3b, which untars the shell
+    # artifact. `app/runtime/chrome-sandbox` must land 4755 root:root or Electron
+    # refuses to start (Ubuntu 24.04 closes the unprivileged-userns sandbox), and
+    # a recursive chmod AFTER the untar would strip the setuid bit and leave a
+    # permanently dark panel with `[ -x ]` still true — the one failure mode with
+    # no symptom on the screen. Nothing under app/ exists yet at this point.
+    #
+    # `chown -R 0:0` is OI-18's ownership lesson generalised: `-rock` preserves
+    # the BUILDER's uid, and on an ordinary single-user builder that is 1000 —
+    # which is `panel` on this machine. Late-command 4a/4b still DELETE the
+    # staged credential copies outright; this only narrows the window before
+    # they run, and the two agree about site/ being 0700.
+    - >-
+      bash -c 'R=/target/opt/wall-panel;
+      if [ ! -d "$R" ]; then echo "wall: FATAL - no $R to normalise, though step 3 reported a copy"; exit 1; fi;
+      chown -R 0:0 "$R" || { echo "wall: FATAL - could not take ownership of $R"; exit 1; };
+      chmod -R go-w "$R" || { echo "wall: FATAL - could not clear group/world write on $R"; exit 1; };
+      chmod 0755 "$R";
+      if [ -d "$R/site" ]; then chmod 0700 "$R/site"; find "$R/site" -type f -exec chmod 0600 {} +; fi;
+      find "$R" -type f -name "*.creds" -exec chmod 0600 {} + ;
+      bad=$(find "$R" -perm /022 | head -n 5);
+      if [ -n "$bad" ]; then
+      echo "wall: FATAL - $R is STILL group- or world-writable after normalisation:";
+      echo "$bad";
+      echo "wall: a writable payload on a box whose units run as root is a local privilege escalation, and the panel autologins a kiosk user. Refusing to finish that install.";
+      exit 1;
+      fi;
+      echo "wall: /opt/wall-panel normalised - root-owned, nothing group- or world-writable"'
+
     # ---- 3b. Unpack the shell artifact (IF-005 / PKG-1) ----------------------
     # The payload carries OfficeWallNaglight's panel tarball at
     # /opt/wall-panel/wall-app/officewall-shell-*-linux-x64.tar.gz (staged by

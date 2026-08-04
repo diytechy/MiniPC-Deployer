@@ -118,6 +118,15 @@ else
     stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
 fi
 
+# ── 1b. decide the payload's permissions (2026-08-04) ───────────────────────
+# Both targets, after every stager. See vmtest/lib/common.sh "PAYLOAD MODES":
+# booting the hub gate VM found /opt/homehub and everything under it 0777,
+# because DrvFs reports 0777, Rock Ridge records that faithfully and `cp -a`
+# copies it faithfully. The `-chmod_r`/`-chown_r` below is this path's half of
+# the same fix — the seed path gets it via write_seed_iso's -r branch.
+normalize_payload_modes "$OUT_DIR/iso-root/deploy-payload"
+assert_payload_modes "$OUT_DIR/iso-root/deploy-payload"
+
 # ── 2. stage a /nocloud directory (xorriso -map wants one disk dir per iso
 #      dir; iso-root/ from render_seed_tree already has user-data+meta-data
 #      side by side, so just point -map at it directly under /nocloud) ──────
@@ -168,11 +177,22 @@ log "grub.cfg patched: $(grep -c 'autoinstall "ds=nocloud' "$GRUB_MOD") boot ent
 REPACKED_ISO="$OUT_DIR/$ISO_NAME"
 rm -f "$REPACKED_ISO"
 log "repacking -> $REPACKED_ISO (a few minutes; copies ~3GB)"
+# THE THREE MODE COMMANDS ARE PART OF THE MAP, not decoration. `-map` records
+# whatever the staging filesystem reported, and on a WSL build that is 0777 with
+# the builder's uid — which late-command 3's `cp -a` then reproduces on /target,
+# world-writable and owned by uid 1000 (the hub's `hub` / the panel's `panel`).
+# `go-w` is SUBTRACTIVE, so it is safe to run unconditionally: it can only ever
+# remove a group/other write bit, never widen anything, and it leaves a staged
+# 0600 secret at 0600. `-chown_r`/`-chgrp_r` are scoped to /deploy-payload so
+# nothing about Ubuntu's own files in the repacked ISO changes.
 xorriso -indev "$SRC_ISO" -outdev "$REPACKED_ISO" \
     -map "$GRUB_MOD" /boot/grub/grub.cfg \
     -map "$NOCLOUD_DIR/user-data" /nocloud/user-data \
     -map "$NOCLOUD_DIR/meta-data" /nocloud/meta-data \
     -map "$NOCLOUD_DIR/deploy-payload" /deploy-payload \
+    -chmod_r go-w /deploy-payload -- \
+    -chown_r 0 /deploy-payload -- \
+    -chgrp_r 0 /deploy-payload -- \
     -boot_image any replay \
     >/dev/null
 
@@ -186,6 +206,8 @@ xorriso -indev "$REPACKED_ISO" -find /nocloud >/dev/null 2>&1 \
     || die "repacked ISO is missing /nocloud - do not use this ISO"
 xorriso -indev "$REPACKED_ISO" -find /deploy-payload >/dev/null 2>&1 \
     || die "repacked ISO is missing /deploy-payload - do not use this ISO"
+# And the modes it will hand to `cp -a` (2026-08-04).
+assert_iso_payload_modes "$REPACKED_ISO" /deploy-payload
 
 log "OK — repacked ISO ready: $REPACKED_ISO (BIOS + UEFI boot images intact, /nocloud + /deploy-payload present)"
 # The account and the console story differ per target — the wall autologins

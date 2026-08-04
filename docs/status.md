@@ -137,6 +137,24 @@ last) — it is the record, not required reading for every pass.
       different owners. **Consequence to expect:** until Personal's half lands,
       a `Build-VentoyStick.ps1` run whose `out\` tree has no `config.json` now
       FAILS instead of quietly producing a stick without one.
+    - OI-21 — **`/opt/homehub` installed WORLD-WRITABLE — every hub ISO ever
+      built here. FIXED 2026-08-04, NOT YET REBUILT.** Found by BOOTING the hub
+      gate VM, not by review: `drwxrwxrwx root:root /opt/homehub` (and `stack/`,
+      `images/`), `-rwxrwxrwx stack/.env`, `-rwxrwxrwx docker-compose.yml`, 230
+      world-writable paths, with `sudo -u nobody` able to READ every credential
+      in `.env` and WRITE the compose file root brings up on the next boot — a
+      straightforward local privilege escalation. The chain was three honest
+      links: DrvFs reports 0777 for everything on an NTFS mount, `-rock` records
+      that faithfully, `cp -a` copies it faithfully; **nobody ever decided the
+      mode.** Now decided in the builder (`normalize_payload_modes` +
+      `assert_payload_modes`, which FAILS the build), imposed by the ISO writer
+      when the staging filesystem cannot hold it, and asserted again at install
+      time (hub late-command 3b, wall 3a). **What the Owner owes:** nothing to
+      rule — but **no ISO has been rebuilt**, so the fix is proven on staged
+      trees, on a freshly-written seed ISO and on executed late-commands, and
+      **not** on an installed box. The next hub/wall install is what closes it.
+      Same family as OI-19 and the gitignored-payload leak: a latent defect in
+      every artifact, invisible to every static check, surfaced by an install.
     - OI-18 — **RULED (b) 2026-08-03, BUILT THE SAME DAY, and HARDENED 2026-08-04
       after an adversarial review refuted its headline claim;
       INSTALL-UNVERIFIED — NOTHING HAS EVER BEEN MOUNTED.** The panel has **two**
@@ -3633,3 +3651,170 @@ not make:**
    ruled to be `share`, but its §2 status (a real §2 identity with a
    `Samba<Name>Password` key, or a panel-only account made by hand at the box) is
    still unruled.
+
+---
+
+### DRIVER — G1 — Round 1 — 2026-08-04 (`/opt/homehub` installed WORLD-WRITABLE — in every hub ISO ever built here, and only an install could see it)
+
+**A boot found it, and nothing else could have.** The hub gate VM, installed from
+a built ISO, was measured on 2026-08-04:
+
+```
+drwxrwxrwx root:root /opt/homehub
+drwxrwxrwx root:root /opt/homehub/stack
+drwxrwxrwx root:root /opt/homehub/images
+-rwxrwxrwx root:root /opt/homehub/stack/.env
+-rwxrwxrwx root:root /opt/homehub/stack/docker-compose.yml
+230 world-writable paths under /opt/homehub
+```
+
+and confirmed from an unprivileged account on the box: `sudo -u nobody test -r
+/opt/homehub/stack/.env` **readable**, `sudo -u nobody test -w
+/opt/homehub/stack/docker-compose.yml` **writable**. `stack/.env` carries
+`OAUTH2_PROXY_CLIENT_SECRET`, `TECHNITIUM_ADMIN_PASSWORD`,
+`FINANCE_ACTUAL_PASSWORD`, `FINANCE_TRACKER_FEED_TOKEN`, `CLOUDFLARE_API_TOKEN`
+and more; a writable `docker-compose.yml` on a box that runs it as root is a
+straightforward **local privilege escalation** — any local account, or any
+compromised container with a host bind-mount, can add a privileged service or a
+host mount and own the machine at the next bring-up.
+
+**THIS IS THE SAME FAMILY AS OI-19 AND THE GITIGNORED-PAYLOAD LEAK: a latent
+defect present in every artifact this repo has ever produced, invisible to every
+static check, surfaced by an install.** It is worth saying plainly why it
+survived: **nothing in this repo had ever looked at a mode.** Every assertion
+here reads text — a substituted hostname, a disk pin, a `BUILD_PROFILE` marker,
+a soname table — and a permission bit is not text. Three suites, a full sim and
+multiple ISO builds all passed over it.
+
+**NOTHING WAS MALFUNCTIONING.** The chain is three honest links:
+
+| link | what it does | what it therefore records |
+|---|---|---|
+| the worktree, as WSL sees it | DrvFs/9p has no metadata for an NTFS mount | `-rwxrwxrwx` for **every** file on `/mnt/c` |
+| `git ls-files` -> `tar` -> `genisoimage -rock` | Rock Ridge preserves mode/uid/gid faithfully | 311 group- or world-writable entries in the ISO payload |
+| late-command 3's `cp -a` | preserves mode/uid/gid faithfully | `/opt/homehub` exactly as the ISO said |
+
+The mode was never **decided** anywhere. It is decided now, in three places,
+each with a job the others cannot do.
+
+**1. THE BUILDER — `normalize_payload_modes` (`vmtest/lib/common.sh`), the
+primary fix.** One table, applied to the whole staged payload after every stager
+and before the ISO is written, on both images:
+
+```
+directories                 0755      site/  (materialised config)  0700
+files beginning `#!`        0755      every file in site/           0600
+every other ordinary file   0644      stack/.env, any *.creds       0600
+```
+
+**The executable bit comes from the `#!` line, not from git's index, and that is
+a deliberate refusal of the obvious source.** `core.filemode` is **false** on
+this Windows checkout, so only **10 of the repo's 58 scripts** are recorded
+`100755` — `stack/provision/*.sh`, `stack/samba/library-guard.sh` and
+`stack/autoinstall/firstboot.sh` are all `100644` in the index. Keying off it
+would have shipped them non-executable: the mirror of the bug being fixed. A
+shebang is in the file's own content, cannot drift out of step with a checkout
+setting, and gives a new script the bit for free. The precedent for stating modes
+as a table and then asserting them is `assert_wall_artifact_contract`, which
+reads `-rwxr-xr-x app/wall-shell` and `4755 root:root chrome-sandbox` straight
+out of the shell tarball rather than trusting the extraction.
+
+**2. THE ISO WRITER — because on the default build host the builder fix CANNOT
+BIND, and that is the finding underneath the finding.** WSL mounts a Windows
+drive without metadata, so `chmod 0600 f` **succeeds, reports nothing, and
+changes nothing** — verified here. `OUT_DIR` defaults to `vmtest/.out` (on C:)
+and the README recommends `/mnt/d`, so the **default and recommended build paths
+are both ones where a staged mode cannot be stored at all.** A normaliser that
+assumed otherwise would print a tidy summary and ship the same ISO. So
+`normalize_payload_modes` **probes** the staging filesystem and hands enforcement
+on: `write_seed_iso` switches `-rock` to **`-r` (rational rock: uid/gid 0, read
+bits set, execute bits normalised, every write bit cleared)**, and
+`build-repacked-iso.sh` adds `-chmod_r go-w` + `-chown_r 0` + `-chgrp_r 0` scoped
+to `/deploy-payload` (subtractive, so it is unconditional and can only ever
+remove a bit). `assert_iso_payload_modes` then judges **the artifact**, which is
+the only layer that can speak on this host.
+
+**3. INSTALL TIME — hub late-command 3b, wall late-command 3a.** Not merely
+defence in depth, given (2): a payload can still arrive from a build route that
+never applied the policy. Both take ownership (`chown -R 0:0` — `-rock` preserves
+the **builder's** uid, and the ordinary builder uid 1000 is the hub's `hub` and
+the panel's `panel`; this is OI-18's ownership lesson generalised), clear
+group/other write, tighten `site/` to 0700 and its files plus `stack/.env` and
+any `*.creds` to 0600, and then **re-check and refuse the install** if anything
+group- or world-writable survives. **The wall's step is ordered BEFORE the shell
+untar on purpose:** a recursive chmod after it would strip `chrome-sandbox`'s
+setuid bit and leave a permanently dark panel whose `[ -x ]` is still true.
+It does not fight OI-18 or 4b — 4a/4b still delete or reinstall the staged
+credential copies; this narrows the window before they run and agrees with them
+about `site/` being 0700.
+
+**THE GUARD THAT WOULD HAVE CAUGHT IT.** `assert_payload_modes` **fails the
+build** on any group- or world-writable staged path, and has exactly two
+outcomes, never a silent third: judge the tree, or — when the filesystem cannot
+carry modes — require that the ISO layer is armed and let
+`assert_iso_payload_modes` judge the result. New cases in
+`vmtest/test-hub-seed.sh` (5) and `vmtest/test-wall-builder.sh` (8, three of them
+static, including that the wall's chmod is ordered before the untar).
+
+**PROVEN TO BITE, and it bit its own author first.** With
+`normalize_payload_modes` stubbed out in the sandbox checkout the hub build now
+refuses — *"the staged deploy payload has 168 group- or world-writable path(s)
+out of 218"* — and goes green again when it is restored; the wall does the same.
+The first version of that stub run exited **141 with no message at all**:
+`find … | head -n 10` under `set -o pipefail` SIGPIPEs `find`, so the refusal
+fired hardest as an unexplained exit. That is the third time this exact shape has
+cost this repo something (`assert_electron_runtime_deps`,
+`stage_wall_site_into_payload`); both mode checks now count and sample in one
+`awk` pass.
+
+**MEASURED, before and after, on a payload staged the way a build stages one:**
+
+| | before | after |
+|---|---|---|
+| staged tree (ext4) | 172 of 220 paths group/world-writable | **0 of 220** |
+| `stack/docker-compose.yml` | 0777 | 0644 |
+| `stack/provision/provision-samba.sh` | 0777 | 0755 |
+| `site/` | 0777 | 0700 |
+| `site/.env`, `site/cifs.creds`, `stack/.env` | 0777 | 0600 |
+| seed ISO built from a **DrvFs** tree | 311 group/world-writable entries | **0** (`-r`; `dr-xr-xr-x` / `-r-xr-xr-x`, uid/gid 0) |
+
+**WHAT IS PROVEN AND WHAT IS NOT.** Proven: the staged-tree policy, the
+assertion (by stub), the recorded modes of a freshly written seed ISO on the real
+DrvFs path, and both install-time steps **executed** against a fake `/target`
+deliberately staged 0777 (0 writable paths left, `.env` `600:root`, `site/` 0700,
+`*.creds` 0600 — plus the refusal, forced with `chattr +i`). **Not proven: no ISO
+has been rebuilt and no box has been installed since the fix** — the Owner runs
+the verification build. Suites: `test-hub-seed.sh` **35 passed, 0 failed, 0
+skipped**; `test-wall-builder.sh` **97 passed, 0 failed, 0 skipped**;
+`python scripts/check.py` PASS; `scripts/validate_config.py` ALL PASSED.
+
+**ONE OUT-OF-LANE FIX, recorded rather than smuggled.** `test-wall-builder.sh`
+section 2 (the Electron dependency gate) invoked the builder with **no
+`WALL_SHELL_DIST`**, so it resolved the sibling repo relative to the temp
+sandbox, found nothing, and refused for *"no shell artifact"* instead of the
+reason under test. On a machine without the private sibling the whole section
+SKIPS; on one with it, both cases **FAIL — at HEAD `718b092`, before this
+change** (reproduced: 83 passed, 2 failed). So that gate — *an Electron bump that
+needs a library this image does not install* — was unexercised on both kinds of
+machine. Fixed by passing `WALL_SHELL_DIST=$DIST_REAL`.
+
+**FOR THE OWNER — three consequences, none needing a ruling but all worth
+knowing:**
+
+1. **`vmtest/build-seed.sh` and `build-wall-seed.sh` now require `xorriso`**, not
+   just one of `genisoimage`/`xorriso`, because `assert_iso_payload_modes` reads
+   the burned image with it (it is the only lister that prints whole paths, and
+   naming the offender is most of a refusal's value). Both are already in this
+   repo's documented install line.
+2. **On the DrvFs build path secrets arrive `0444` in the ISO, not `0600`** —
+   `-r` sets all read bits. That is not a regression (they were `0777`), the
+   install-time steps tighten them to `0600 root:root` immediately after the
+   copy, and late-command 4b then installs the real ones `0600 root:root`
+   anyway. A build staged on a Linux filesystem keeps the precise `0600` end to
+   end. The clean way to get that on Windows is `[automount] options="metadata"`
+   in `/etc/wsl.conf` — a host setting, deliberately not something the builder
+   demands.
+3. **`/opt/homehub/stack/.env` is now `0600 root:root` on a SIM box too.** A
+   production box already had that (4b installs it so), so this only makes the
+   sim match production — but `docker compose` in `/opt/homehub/stack` must now
+   be run as root there, as it always had to be on the real hub.

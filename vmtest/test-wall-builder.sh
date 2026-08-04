@@ -275,6 +275,20 @@ assert_file_matches "user-data REMOVES the staged credential copies from the pay
     'rm -f "\$s"'
 assert_file_matches "user-data no longer merely chmods the staged copies" "$UD" \
     '^[^#]*chmod 0600 "\$s"' --absent
+# 2026-08-04: the payload's own permissions, normalised at install time as the
+# floor under the builder's policy — and ORDERED BEFORE the shell untar, because
+# a recursive chmod after it would strip chrome-sandbox's setuid bit and leave a
+# permanently dark panel whose `[ -x ]` is still true.
+assert_file_matches "user-data normalises the payload's modes at install time" "$UD" \
+    'chmod -R go-w "\$R"'
+assert_file_matches "…and takes ownership rather than only fixing the mode (the OI-18 uid lesson)" "$UD" \
+    'chown -R 0:0 "\$R"'
+if awk '/chmod -R go-w/ { norm = NR } /tar -xzf "\$t" -C \/target\/opt\/wall-panel/ { untar = NR }
+        END { exit !(norm && untar && norm < untar) }' "$UD"; then
+    pass_case "the mode normalisation runs BEFORE the shell untar (chrome-sandbox keeps its 4755)"
+else
+    fail_case "late-command order" "the recursive chmod is not ordered before the tar -xzf of the shell artifact — it would strip the setuid bit"
+fi
 
 # firstboot must JUDGE the enable, not claim it. This is the repo's signature
 # bug: `systemctl enable … || warn` followed by an unconditional "enabled" line.
@@ -330,14 +344,23 @@ if [ -n "$(ls "$DIST_REAL"/officewall-shell-*-linux-x64.tar.gz 2>/dev/null)" ]; 
     T="$WALL_DIR/electron-runtime-deps.tsv"
     cp "$T" "$WORK/tsv.bak"; cp "$UD" "$WORK/ud.bak"
 
+    # WALL_SHELL_DIST IS NOT OPTIONAL HERE (fixed 2026-08-04, out of the mode
+    # pass). Both cases used to invoke the builder with no dist at all, so it
+    # resolved OfficeWallNaglight as a sibling of the SANDBOX — which is a temp
+    # directory with no sibling — and refused for "no shell artifact" instead of
+    # for the dependency reason under test. On a machine with the sibling absent
+    # the whole section SKIPS and nobody noticed; on one where it is present
+    # these two cases FAIL, at HEAD, before this change. The gate they guard —
+    # an Electron bump that needs a library this image does not install — was
+    # therefore unexercised on both kinds of machine.
     grep -v '^libnspr4.so' "$WORK/tsv.bak" > "$T"
     expect_refusal "a soname the table has never heard of is refused" \
-        "this repo has never heard of" --
+        "this repo has never heard of" -- "WALL_SHELL_DIST=$DIST_REAL"
     cp "$WORK/tsv.bak" "$T"
 
     grep -v '^    - libnspr4$' "$WORK/ud.bak" > "$UD"
     expect_refusal "a mapped package the image does not install is refused" \
-        "does not install package(s)" --
+        "does not install package(s)" -- "WALL_SHELL_DIST=$DIST_REAL"
     cp "$WORK/ud.bak" "$UD"
 else
     skip_case "-dirty / ambiguous / dependency-gate cases" \
@@ -416,6 +439,76 @@ printf 'username=stale\npassword=notarealpassword\n' > "$S/cifs.creds"
 expect_refusal "a stale PRE-OI-18 single cifs.creds is refused, not silently ignored" \
     "PRE-OI-18 shape" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 rm -f "$S/cifs.creds"
+
+echo
+echo "=== 4b. the payload's MODES (the hub's 2026-08-04 defect is this image's too) ==="
+# Booting the HUB gate VM found /opt/homehub and 230 paths under it 0777, with
+# an unprivileged account able to read every credential and write the compose
+# file root runs. /opt/wall-panel is populated by the identical `cp -a` out of
+# the identical kind of staging tree, so it arrived the identical way — and here
+# it COMPOUNDS OI-18, which found the staged credentials readable by `panel`
+# through a uid-1000 collision. At 0777 they were readable by everyone.
+#
+# Nothing in this repo had ever asserted a mode until now; every other check
+# reads text. That is why an install found it and three suites did not.
+if env "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 \
+       OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$WORK/out.txt" 2>&1; then
+    P="$WORK/out-dir/iso-root/deploy-payload"
+    nbad=$(find "$P" -perm /022 | wc -l)
+    ntotal=$(find "$P" | wc -l)
+    if [ "$nbad" -eq 0 ]; then
+        pass_case "no group- or world-writable path anywhere in the staged wall payload ($ntotal paths)"
+    else
+        fail_case "wall payload modes" "$nbad of $ntotal paths are group- or world-writable, e.g. $(find "$P" -perm /022 -printf '%M %P\n' | head -n 3 | tr '\n' ' ')"
+    fi
+
+    wrong=""
+    check_mode() {
+        local got; got="$(stat -c%a "$P/$1" 2>/dev/null)"
+        [ "$got" = "$2" ] || wrong="$wrong $1=${got:-ABSENT}(want $2)"
+    }
+    check_mode stack/autoinstall/wall                    755
+    check_mode stack/autoinstall/wall/wall.env.example   644
+    check_mode stack/autoinstall/wall/wall-sync.sh       755
+    check_mode stack/autoinstall/wall/wall-kiosk.sh      755
+    check_mode site                                      700
+    check_mode site/wall.env                             600
+    check_mode site/cifs-music.creds                     600
+    check_mode site/cifs-frame.creds                     600
+    if [ -z "$wrong" ]; then
+        pass_case "the mode policy holds per file: dirs 0755, data 0644, #! scripts 0755, site/ 0700 with 0600 credentials"
+    else
+        fail_case "the wall mode policy" "$wrong"
+    fi
+
+    if [ -f "$WORK/out-dir/wall-seed.iso" ] && command -v xorriso >/dev/null 2>&1; then
+        isobad=$(xorriso -indev "$WORK/out-dir/wall-seed.iso" -find /deploy-payload -exec lsdl -- 2>/dev/null \
+                 | awk '/^[-dl]/ { m = substr($1,1,10); if (substr(m,6,1)=="w" || substr(m,9,1)=="w") c++ } END { print c+0 }')
+        if [ "$isobad" = "0" ]; then
+            pass_case "the WALL SEED ISO records no group- or world-writable path under /deploy-payload"
+        else
+            fail_case "wall ISO modes" "$isobad group/world-writable entries under /deploy-payload"
+        fi
+    else
+        skip_case "the wall seed ISO's recorded modes" "no wall-seed.iso or no xorriso — the artifact half could not be read, and that is not a pass"
+    fi
+else
+    fail_case "the build for the wall mode cases" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+# DOES IT BITE? Stub the normalisation out in the SANDBOX's common.sh (a later
+# definition wins) and the build must refuse. This suite's whole 2026-08-04
+# lesson was a section that exited zero with the code it guarded disabled.
+cat >> "$SANDBOX/vmtest/lib/common.sh" <<'STUB'
+
+# ── STUB appended by vmtest/test-wall-builder.sh, in the SANDBOX copy only ──
+normalize_payload_modes() { PAYLOAD_MODE_FIX_AT_ISO=0; log "STUB: normalisation disabled"; }
+STUB
+expect_refusal "with normalize_payload_modes STUBBED OUT the wall build REFUSES (the guard bites)" \
+    "group- or world-writable path(s)" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+cp "$REPO_ROOT/vmtest/lib/common.sh" "$SANDBOX/vmtest/lib/common.sh"
+expect_success "…and builds green again once it is restored (so the refusal was the stub, not the suite)" \
+    "payload modes OK" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 
 echo
 echo "=== 5. cross-repo knob names: the sim renderer must fill BOTH UNCs ==="

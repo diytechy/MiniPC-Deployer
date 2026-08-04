@@ -166,6 +166,63 @@ PY
     log "storage pin validated structurally ($mode) — not by grep"
 }
 
+# assert_build_profile FILE sim|production WHY — check the marker STRUCTURALLY.
+#
+# BUILD_PROFILE is what late-command 4b reads to decide whether a hub whose
+# payload lost its site/ files may finish installing. Both sides of that decision
+# used to be checked with `grep -q 'BUILD_PROFILE=production' FILE` — a substring
+# search over the WHOLE file, comments included. The tracked user-data explains
+# the marker in four lines of prose directly above it, and a hand-edited or
+# hand-merged `user-data.filled` can keep every one of those comments while the
+# ACTIVE assignment says something else. The production guard would then accept a
+# file whose late-command runs as `sim`, and 4b would silently permit exactly the
+# missing site/ the guard exists to refuse. (The sim guard has the mirror hole:
+# a comment mentioning the production marker refuses a perfectly good sim build.)
+# Same lesson, same shape, as assert_storage_pin and autoinstall_hostname: parse
+# the document, judge the ACTIVE setting, and require there to be exactly one.
+#
+# WHY YAML PARSING IS THE WHOLE FIX: yaml.safe_load discards YAML comments
+# outright, so what comes back from `late-commands` is only what a shell will
+# actually execute. A stray `BUILD_PROFILE=` inside one of those command bodies
+# would still be counted — deliberately, because two assignments means the last
+# one wins and nobody reading the file can tell which that is.
+assert_build_profile() {
+    local f="$1" want="$2" why="$3"
+    require_cmd python3 "Install it with: sudo apt-get install -y python3 python3-yaml"
+    python3 - "$f" "$want" <<'PY' || die "$why"
+import re, sys, yaml
+
+path, want = sys.argv[1], sys.argv[2]
+ai = yaml.safe_load(open(path))
+ai = ai.get("autoinstall", ai)
+
+found = []
+for cmd in (ai.get("late-commands") or []):
+    if isinstance(cmd, list):
+        cmd = " ".join(str(x) for x in cmd)
+    if not isinstance(cmd, str):
+        continue
+    found += re.findall(r"(?<![A-Za-z0-9_])BUILD_PROFILE=([A-Za-z0-9._-]*)", cmd)
+
+if len(found) != 1:
+    sys.exit(
+        f"expected exactly ONE active BUILD_PROFILE= assignment in "
+        f"autoinstall.late-commands; found {len(found)}: {found!r}.\n"
+        "Zero means late-command 4b will read an unset variable and its "
+        "production refusal cannot fire.\nMore than one means the last "
+        "assignment wins and the file no longer says what it does.\n"
+        "(Comments do not count and never did — this is the parsed document.)")
+
+if found[0] != want:
+    sys.exit(
+        f"the ACTIVE BUILD_PROFILE assignment is {found[0]!r}, expected {want!r}.\n"
+        "Comments elsewhere in the file that say otherwise are not what runs.")
+
+print(f"BUILD_PROFILE OK ({want}): exactly one active assignment, in late-commands")
+PY
+    log "BUILD_PROFILE validated structurally ($want) — parsed, not grepped"
+}
+
 # autoinstall_hostname FILE — echo autoinstall.identity.hostname from FILE.
 #
 # PARSED, not grepped, for the same reason assert_storage_pin is: the shipped
@@ -603,8 +660,8 @@ render_seed_tree() {
         # marker arrives for free — unless the out\ tree predates the fix, in
         # which case this stick would carry the OLD silent-exit-0 late-command
         # and nothing downstream would ever say so.
-        grep -q 'BUILD_PROFILE=production' "$user_data_out" || \
-            die "user-data.filled carries no 'BUILD_PROFILE=production' marker — it was materialised from a stack/autoinstall/user-data older than the OI-19 fix, so its site-staging late-command still exits 0 SILENTLY when the payload has no site/. A production hub built from it can come up on .env.example placeholders believing it is production. Re-run Materialize-Deploy.ps1 -Image homehub (its out\\ tree is stale)."
+        assert_build_profile "$user_data_out" production \
+            "user-data.filled carries no ACTIVE 'BUILD_PROFILE=production' assignment in its late-commands (see above). Either it was materialised from a stack/autoinstall/user-data older than the OI-19 fix — so its site-staging late-command still exits 0 SILENTLY when the payload has no site/ — or it was hand-edited to sim while keeping the production comments. A production hub built from it can come up on .env.example placeholders believing it is production. Re-run Materialize-Deploy.ps1 -Image homehub (its out\\ tree is stale)."
     else
     sed \
         -e "s#- \"ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host\"#- \"$ssh_pubkey\"#" \
@@ -622,12 +679,13 @@ render_seed_tree() {
     # (safe by default — a real stick materialised from this file inherits it),
     # so the SIM path is the one that must opt out, and a no-op here would make
     # every vmtest image halt at late-command 4b for want of secrets it is not
-    # supposed to have. Assert BOTH directions: the marker says sim, and no
-    # `production` marker survived anywhere in the file.
-    grep -q 'BUILD_PROFILE=sim' "$user_data_out" || \
-        die "the BUILD_PROFILE substitution did not apply — stack/autoinstall/user-data no longer contains 'BUILD_PROFILE=production'. A SIM image would then REFUSE to install (late-command 4b halts a production build that has no site/ payload, and this build has none). Update the sed above."
-    grep -q 'BUILD_PROFILE=production' "$user_data_out" && \
-        die "a 'BUILD_PROFILE=production' marker survived into the SIM user-data — there is now more than one, and the sed above only rewrote the first. Every occurrence must be rewritten or a sim install halts at late-command 4b."
+    # supposed to have. ONE structural check covers both directions the two
+    # greps here used to cover separately: exactly one active assignment, and it
+    # says sim. A surviving second `production` marker is now a count failure
+    # rather than a substring hit, so a COMMENT mentioning either value neither
+    # satisfies nor breaks this.
+    assert_build_profile "$user_data_out" sim \
+        "the BUILD_PROFILE substitution did not apply as intended (see above) — either stack/autoinstall/user-data no longer carries a single active 'BUILD_PROFILE=production' assignment for the sed to rewrite, or the sed rewrote only some of them. A SIM image whose marker is not 'sim' REFUSES to install: late-command 4b halts a production build that has no site/ payload, and this build has none. Update the sed above."
 
     # Every sed above is a SILENT no-op if the source string moves, and the
     # result still builds — that is how the sim VM would quietly come up
@@ -719,28 +777,67 @@ render_seed_tree() {
     if [ "$HUB_BUILD_KIND" = "production" ]; then
         local site_out="$payload_dir/site"
         mkdir -p "$site_out"
+
+        # THE TWO LISTS, cross-referenced with late-command 4b's install table.
+        # `required` here is 4b's `required` (.env, backup.env,
+        # smb.conf.fragment, library-mounts.fstab) PLUS config.json;
+        # `optional` is 4b's `optional`, the three Build-VentoyStick.ps1 marks
+        # Required=$false — a household legitimately may have no CIFS backup
+        # target, no Samba accounts and no recorded drive serials.
+        #
+        # config.json is the odd one out twice over. It is the WALL SHELL's
+        # runtime config and it belongs to the HUB, because the shell fetches
+        # `./config.json` relative to its own origin (js/config.js loadConfig)
+        # and that origin is Caddy's kiosk site, document root
+        # /opt/homehub/stack/wall-shell/. And unlike the other seven it is NOT
+        # installed by a late-command: firstboot.sh step 3d untars the site
+        # tarball OVER that directory, so the copy has to happen after it (step
+        # 3e). It is REQUIRED here anyway, and that is deliberate and
+        # independent of the other half of the same problem: Personal's
+        # Build-VentoyStick.ps1 has to put it in the stick's site/ in the first
+        # place. Two repos, two guards, on purpose — supplying it and refusing
+        # to build without it are different failures with different owners, and
+        # a hub that ships without one degrades to js/config.js defaults in
+        # total silence (loadConfig never throws). OI-20.
+        local site_required=".env backup.env smb.conf.fragment library-mounts.fstab config.json"
+        local site_optional="cifs.creds samba-users.creds drive-identity.conf"
+
+        # REFUSE BEFORE STAGING, on the FILES rather than on a count.
+        # This used to be `staged > 0` over a list that INCLUDED
+        # user-data.filled — which render_seed_tree has already made mandatory
+        # thirty lines above. So a SITE_DIR holding nothing but that one file
+        # counted as one staged site file, built a clean production ISO, created
+        # deploy-payload/site/, and thereby walked straight past late-command
+        # 4b's missing-directory refusal — which only ever asked whether the
+        # DIRECTORY was there. The install then logged every required file
+        # missing and exited 0. That is OI-19's outcome with a different cause,
+        # and it is why user-data.filled is no longer staged into site/ at all:
+        # it is the seed's own user-data, nothing on the target reads a copy of
+        # it, and its only effect here was to make an empty payload look full.
+        local f missing=""
+        for f in $site_required; do
+            [ -f "$SITE_DIR/$f" ] || missing="$missing $f"
+        done
+        [ -z "$missing" ] || die \
+            "SITE_DIR=$SITE_DIR is missing required site file(s):$missing" \
+            "A PRODUCTION image must carry all of: $site_required." \
+            "Without them the installed hub comes up on .env.example placeholders while believing it is production (OI-19), and the wall panel runs on js/config.js defaults (OI-20) — neither with any symptom on a headless box." \
+            "Re-run Materialize-Deploy.ps1 -Image homehub, and check Build-VentoyStick.ps1's site\\ list carries config.json."
+
         local staged=0
-        # config.json is the odd one out and is deliberately in this list anyway:
-        # it is the WALL SHELL's runtime config, and it belongs to the HUB
-        # because the shell fetches `./config.json` relative to its own origin
-        # (js/config.js loadConfig) and that origin is Caddy's kiosk site, whose
-        # document root is /opt/homehub/stack/wall-shell/. Unlike the other
-        # seven it is NOT installed by a late-command: `firstboot.sh` step 3d
-        # untars the site tarball OVER that directory, so the copy has to happen
-        # after it (step 3e). See stack/autoinstall/user-data late-command 4b.
-        for f in .env backup.env cifs.creds samba-users.creds user-data.filled \
-                 smb.conf.fragment library-mounts.fstab drive-identity.conf \
-                 config.json; do
+        for f in $site_required $site_optional; do
             if [ -f "$SITE_DIR/$f" ]; then
                 install -m 600 "$SITE_DIR/$f" "$site_out/$f"
                 log "  site/ += $f"
                 staged=$((staged + 1))
+            else
+                log "  site/ -- $f absent (optional — late-command 4b will name it and continue)"
             fi
         done
-        [ "$staged" -gt 0 ] || die "SITE_DIR=$SITE_DIR contained none of the expected files — nothing to bake."
         # stack/.env inside the payload is what late-command 4 would otherwise
-        # seed from .env.example; overwrite it with the real one.
-        [ -f "$SITE_DIR/.env" ] && install -m 600 "$SITE_DIR/.env" "$payload_dir/stack/.env"
+        # seed from .env.example; overwrite it with the real one. Unconditional:
+        # .env is in the required set, so it is here.
+        install -m 600 "$SITE_DIR/.env" "$payload_dir/stack/.env"
         log "PRODUCTION build: $staged site file(s) staged; sim .env generation SKIPPED"
         return 0
     fi

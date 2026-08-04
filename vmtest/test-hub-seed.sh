@@ -65,6 +65,29 @@ for c in yaml.safe_load(open(sys.argv[1]))["autoinstall"]["late-commands"]:
 PY
 }
 
+# active_build_profile FILE — the ACTIVE BUILD_PROFILE value(s) in FILE's
+# late-commands, one per line, empty if there are none.
+#
+# Parsed, not grepped, and this test file is the reason the builder is too: a
+# `grep -q BUILD_PROFILE=production` over the raw file matches the four lines of
+# COMMENT above the marker just as happily as the assignment, so the assertion
+# below used to pass on a user-data whose late-command actually runs as `sim`.
+# yaml.safe_load throws comments away, so what comes back is only what a shell
+# would execute.
+active_build_profile() {
+    python3 - "$1" <<'PY'
+import re, sys, yaml
+ai = yaml.safe_load(open(sys.argv[1]))
+ai = ai.get("autoinstall", ai)
+for c in (ai.get("late-commands") or []):
+    if isinstance(c, list):
+        c = " ".join(str(x) for x in c)
+    if isinstance(c, str):
+        for m in re.findall(r"(?<![A-Za-z0-9_])BUILD_PROFILE=([A-Za-z0-9._-]*)", c):
+            print(m)
+PY
+}
+
 # build_seed [env...] — one hub seed build into a FRESH $OUT. Output in $WORK/out.txt.
 build_seed() {
     rm -rf "$OUT"
@@ -117,20 +140,50 @@ make_site_files
 # A materialised tree built BEFORE the OI-19 fix carries the old late-command,
 # which exits 0 silently when the payload has no site/. The stick would look
 # fine and the box would come up on placeholders.
-sed 's/BUILD_PROFILE=production/BUILD_PROFILE=legacy/' "$SITE/user-data.filled" > "$SITE/ud.stale"
+sed 's/BUILD_PROFILE=production;/BUILD_PROFILE=legacy;/' "$SITE/user-data.filled" > "$SITE/ud.stale"
 mv "$SITE/ud.stale" "$SITE/user-data.filled"
 expect_refusal "a user-data.filled predating the OI-19 fix is refused (stale out\\ tree)" \
-    "BUILD_PROFILE=production" -- "SITE_DIR=$SITE"
+    "expected 'production'" -- "SITE_DIR=$SITE"
 make_site_filled
+
+# THE CASE THE OLD grep COULD NOT SEE. Same file, comments untouched — only the
+# ACTIVE assignment flipped to sim. `grep -q BUILD_PROFILE=production` matched
+# the comment four lines above it and passed the build; the resulting stick then
+# installs with 4b in sim mode, which SILENTLY PERMITS a missing site/ on a
+# machine whose meta-data, hostname and disk pin all say production.
+awk 'NR==1 {print; print "# NOTE (a comment, not a setting): rendered with BUILD_PROFILE=production."; next} {print}' \
+    "$SITE/user-data.filled" > "$SITE/ud.commented"
+sed -i 's/BUILD_PROFILE=production;/BUILD_PROFILE=sim;/' "$SITE/ud.commented"
+mv "$SITE/ud.commented" "$SITE/user-data.filled"
+expect_refusal "a user-data.filled whose COMMENTS say production but whose ACTIVE marker says sim is refused" \
+    "the ACTIVE BUILD_PROFILE assignment is 'sim'" -- "SITE_DIR=$SITE"
+make_site_filled
+
+# THE BUILDER HALF of the defect the late-command half is tested for at the end
+# of this file. user-data.filled is MANDATORY (refused above if absent) and used
+# to be counted as a staged site file — so a SITE_DIR holding nothing else
+# satisfied `staged > 0`, built a clean production ISO, and produced a
+# deploy-payload/site/ whose only content was the seed's own user-data. 4b then
+# found the DIRECTORY it was looking for and installed nothing.
+SITE_MIN="$WORK/site-min"; mkdir -p "$SITE_MIN"
+cp "$SITE/user-data.filled" "$SITE_MIN/user-data.filled"
+expect_refusal "a SITE_DIR holding ONLY user-data.filled is refused (it used to build a production ISO)" \
+    "is missing required site file(s): .env" -- "SITE_DIR=$SITE_MIN"
+
+# config.json is required INDEPENDENTLY of Personal's Build-VentoyStick.ps1
+# putting it in the stick's site/ — two repos, two guards, on purpose.
+mv "$SITE/config.json" "$SITE/config.json.away"
+expect_refusal "a production build with no site/config.json is refused (the panel would run on js/config.js defaults, silently)" \
+    "missing required site file(s): config.json" -- "SITE_DIR=$SITE"
+mv "$SITE/config.json.away" "$SITE/config.json"
 
 echo
 echo "=== the SIM build ==="
 if build_seed; then
     U="$OUT/iso-root/user-data"; M="$OUT/iso-root/meta-data"
-    grep -q 'BUILD_PROFILE=sim' "$U" \
-        && ! grep -q 'BUILD_PROFILE=production' "$U" \
-        && ok "a sim image is marked BUILD_PROFILE=sim (so its install does not demand secrets)" \
-        || bad "sim BUILD_PROFILE marker" "$(grep -o 'BUILD_PROFILE=[a-z]*' "$U" | tr '\n' ' ')"
+    [ "$(active_build_profile "$U")" = sim ] \
+        && ok "a sim image's ACTIVE marker is BUILD_PROFILE=sim, and there is exactly one (so its install does not demand secrets)" \
+        || bad "sim BUILD_PROFILE marker" "active assignments: $(active_build_profile "$U" | tr '\n' ' ')"
     grep -Fxq 'local-hostname: homehub-vmtest' "$M" \
         && ok "a sim seed's meta-data still says homehub-vmtest" \
         || bad "sim meta-data hostname" "$(grep local-hostname "$M")"
@@ -148,9 +201,9 @@ if build_seed "SITE_DIR=$SITE"; then
     grep -Eq '^instance-id: homehub-[0-9]+$' "$M" \
         && ok "a production seed's instance-id is homehub-<ts>, not homehub-vmtest-<ts>" \
         || bad "production instance-id" "$(grep instance-id "$M")"
-    grep -q 'BUILD_PROFILE=production' "$U" \
-        && ok "a production image keeps BUILD_PROFILE=production (its install refuses to lose site/)" \
-        || bad "production BUILD_PROFILE marker" "no marker in the baked user-data"
+    [ "$(active_build_profile "$U")" = production ] \
+        && ok "a production image's ACTIVE marker is BUILD_PROFILE=production (its install refuses to lose site/)" \
+        || bad "production BUILD_PROFILE marker" "active assignments: $(active_build_profile "$U" | tr '\n' ' ')"
     [ -f "$OUT/iso-root/deploy-payload/site/.env" ] \
         && ok "the real site/ files ride the payload (where late-command 4b now reads them)" \
         || bad "site staging" "no deploy-payload/site/.env"

@@ -10,59 +10,148 @@
 # would install none of them and come up on `.env.example` placeholders while
 # believing it was production. Nothing anywhere would have said so.
 #
-# TWO LAYERS, because the defect spanned both:
+# THREE LAYERS, because the defect spanned all of them:
 #   1. the BUILDER's guards (vmtest/lib/common.sh render_seed_tree) — including
 #      the substitution assertions, which are the repo's standing habit: a `sed`
 #      that silently no-ops must fail the build, never ship.
-#   2. the LATE-COMMAND ITSELF, extracted from the user-data this build actually
-#      produced and run against a fake `/target`. That is the only layer where
-#      the refusal can be seen to fire, since Subiquity is what normally runs it.
+#   2. the LATE-COMMANDS THEMSELVES, extracted from the user-data a build
+#      actually produced and EXECUTED against a fake `/target` — step 3 (find
+#      and copy the payload) followed by step 4b (install site/ out of it), in
+#      that order, against a real staged payload and a real loop-mounted CIDATA
+#      seed image. That is the only layer where the refusals can be seen to fire,
+#      since Subiquity is what normally runs them.
+#   3. firstboot.sh steps 3d/3e, carved out and RUN, because the property that
+#      matters there (ordering, mode, and a collision notice that is not true on
+#      every reboot) cannot be read off the source with grep.
 #
-# WHAT THIS SUITE CANNOT DO — and the reason OI-19 stays FIXED-BUT-UNVERIFIED:
-# it never installs anything. Nothing here proves Subiquity runs these commands
-# in this order, that `curtin` leaves /target where they expect it, or that the
-# CIDATA-by-label mount in late-command 3 works on a real installer. That needs
-# a hub install, which no agent has.
+# THE RULE THIS SUITE IS HELD TO, after a 2026-08-03 adversarial review found it
+# breaking its own rule in four places: A CASE THAT DID NOT RUN IS NOT A PASS.
+#   - Extraction that finds no command, or more than one, FAILS. It used to
+#     succeed silently, so both negative assertions below passed if the
+#     late-command was reverted to a version with no BUILD_PROFILE in it at all.
+#   - SKIPPED cases make the whole suite exit non-zero. Root is needed for
+#     `install -o root -g root`, loop mounts and a real /media entry; without it
+#     the interesting half cannot run, and a green that means "we did not look"
+#     is the exact failure this file exists to prevent.
+#   - Nothing mutates the repository. The builders run against an ISOLATED COPY
+#     of the tracked tree; the deliberately-corrupted templates the substitution
+#     assertions need never touch a file git is watching. Before this, a kill at
+#     the wrong moment left a broken `user-data` in the checkout — or worse, a
+#     concurrent ISO build consumed one.
 #
-# Usage (WSL/Linux, from a MiniPC-Deployer checkout):
-#   bash vmtest/test-hub-seed.sh
+# WHAT THIS SUITE STILL CANNOT DO — and the reason OI-19 stays FIXED-BUT-
+# UNVERIFIED: it never installs anything. Nothing here proves Subiquity runs
+# these commands in this order or that `curtin` leaves /target where they expect
+# it. That needs a hub install, which no agent has.
 #
-# Needs root for the install-as-root cases (the installer runs as root); they
-# are SKIPPED, loudly and counted, otherwise — a suite that quietly shrinks when
-# it cannot run is the same false green it exists to prevent.
+# Usage (WSL/Linux, from a MiniPC-Deployer checkout, AS ROOT):
+#   sudo bash vmtest/test-hub-seed.sh
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-USER_DATA="$REPO_ROOT/stack/autoinstall/user-data"
-META_DATA="$REPO_ROOT/stack/autoinstall/meta-data"
 WORK="${TMPDIR:-/tmp}/hub-seed-test.$$"
 # Never the repo's own .out/: a V3 gate ISO may be sitting there, and --clean is
 # a recursive delete. Everything this suite writes is disposable.
 OUT="$WORK/out-dir"
+SANDBOX="$WORK/repo"          # the isolated checkout the builders run against
+MEDIA_DIR=""                  # a real /media entry, created only while needed
+LOOPDEV=""                    # a real loop device, attached only while needed
 
 pass=0; fail=0; skip=0
 mkdir -p "$WORK"
-trap 'rm -rf "$WORK"; cp -f "$WORK.ud.bak" "$USER_DATA" 2>/dev/null; cp -f "$WORK.md.bak" "$META_DATA" 2>/dev/null; rm -f "$WORK.ud.bak" "$WORK.md.bak"' EXIT
-cp "$USER_DATA" "$WORK.ud.bak"
-cp "$META_DATA" "$WORK.md.bak"
+
+cleanup() {
+    [ -n "$LOOPDEV" ] && losetup -d "$LOOPDEV" 2>/dev/null
+    [ -n "$MEDIA_DIR" ] && rm -rf "$MEDIA_DIR"
+    rm -rf "$WORK"
+    return 0
+}
+trap cleanup EXIT
 
 ok()   { printf 'ok    %s\n' "$1"; pass=$((pass + 1)); }
 bad()  { printf 'FAIL  %s\n      %s\n' "$1" "$2"; fail=$((fail + 1)); }
 skip_case() { printf 'SKIP  %s\n      %s\n' "$1" "$2"; skip=$((skip + 1)); }
 
-# extract_4b FILE — the site-staging late-command, as it stands in FILE.
-# Taken from the user-data a build actually PRODUCED, so what the behavioural
-# cases below run is the artifact, not a paraphrase of it.
-extract_4b() {
-    python3 - "$1" <<'PY'
+# ── the isolated tree ────────────────────────────────────────────────────────
+# The substitution assertions can only be tested by handing the builder a BROKEN
+# user-data/meta-data, and this suite used to do that by overwriting the
+# repository's own tracked files and restoring them from an EXIT trap. A trap is
+# not a transaction: a SIGKILL, a full disk or a panic leaves the corrupted
+# template in the checkout, and a concurrent `build-seed.sh` in another terminal
+# would happily bake it onto an ISO. Copy the tracked tree instead and corrupt
+# the copy. `git init` + one commit inside it because copy_repo_into_payload
+# prefers `git ls-files` and warns loudly on a non-checkout — the copy should
+# take the SAME path the real build takes, not the fallback.
+build_sandbox() {
+    mkdir -p "$SANDBOX"
+    if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+        ( cd "$REPO_ROOT" && git ls-files -z | tar -c --null -T - ) | ( cd "$SANDBOX" && tar -x )
+        git -C "$SANDBOX" init -q
+        # Byte-for-byte: the sandbox must hold exactly what the checkout holds,
+        # and on a Windows checkout an autocrlf round-trip would rewrite the very
+        # files under test (and bury the run in conversion warnings).
+        git -C "$SANDBOX" config core.autocrlf false
+        git -C "$SANDBOX" add -A
+        git -C "$SANDBOX" -c user.email=vmtest@invalid -c user.name=vmtest \
+            commit -q -m "isolated copy under test"
+    else
+        printf 'NOTE: %s is not a git checkout — copying the whole worktree instead.\n' "$REPO_ROOT"
+        ( cd "$REPO_ROOT" && tar -c --exclude=.git --exclude=vmtest/.out --exclude=vmtest/.out-wall . ) \
+            | ( cd "$SANDBOX" && tar -x )
+    fi
+}
+build_sandbox
+USER_DATA="$SANDBOX/stack/autoinstall/user-data"
+META_DATA="$SANDBOX/stack/autoinstall/meta-data"
+FB="$SANDBOX/stack/autoinstall/firstboot.sh"
+# The pristine originals, read-only, used to restore the sandbox between cases.
+PRISTINE_UD="$REPO_ROOT/stack/autoinstall/user-data"
+PRISTINE_MD="$REPO_ROOT/stack/autoinstall/meta-data"
+for f in "$USER_DATA" "$META_DATA" "$FB"; do
+    [ -f "$f" ] || { printf 'FAIL  isolated tree\n      %s did not survive the copy\n' "$f"; exit 1; }
+done
+
+# ── extracting the artifacts under test ──────────────────────────────────────
+# extract_late_command FILE NEEDLE LABEL OUTFILE — the ONE late-command in FILE
+# containing NEEDLE, written to OUTFILE. Non-zero (and a counted FAIL) if there
+# is not exactly one.
+#
+# "Exactly one" is the whole point. The old version broke out of a `for` loop on
+# the first hit and printed nothing when there were none — exiting 0 either way.
+# So both negative assertions built on it ("no /cdrom left", "no config.json in
+# 4b") passed when the command was MISSING, which is precisely the state a
+# reverted OI-19 fix leaves behind: an old 4b with no BUILD_PROFILE in it at all
+# matched nothing, printed nothing, and every grep over that nothing said "clean".
+extract_late_command() {
+    local f="$1" needle="$2" label="$3" outfile="$4" err
+    err="$(python3 - "$f" "$needle" "$outfile" <<'PY' 2>&1
 import sys, yaml
-for c in yaml.safe_load(open(sys.argv[1]))["autoinstall"]["late-commands"]:
-    if isinstance(c, str) and "BUILD_PROFILE" in c:
-        print(c)
-        break
+path, needle, outfile = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    doc = yaml.safe_load(open(path))
+except Exception as e:                      # noqa: BLE001 - report anything
+    sys.exit(f"could not parse {path}: {e}")
+cmds = ((doc or {}).get("autoinstall", doc) or {}).get("late-commands") or []
+hits = [c for c in cmds if isinstance(c, str) and needle in c]
+if len(hits) != 1:
+    sys.exit(f"expected exactly ONE late-command containing {needle!r} in {path}, "
+             f"found {len(hits)}. Zero means the command under test is GONE "
+             f"(reverted, renamed, or never rendered) and every assertion about "
+             f"it below would be vacuous; more than one means the wrong body "
+             f"could be picked.")
+open(outfile, "w").write(hits[0])
 PY
+)" || { bad "$label" "$err"; return 1; }
+    [ -s "$outfile" ] || { bad "$label" "extraction produced an empty command body"; return 1; }
+    return 0
+}
+
+# runnable_body SRC DEST TARGET_ROOT — turn an extracted `bash -c '…'` entry into
+# a script, with /target redirected at a fake root this suite owns.
+runnable_body() {
+    sed -e "s#^bash -c '##" -e "s#'\$##" -e "s#/target#$3#g" "$1" > "$2"
 }
 
 # active_build_profile FILE — the ACTIVE BUILD_PROFILE value(s) in FILE's
@@ -88,11 +177,12 @@ for c in (ai.get("late-commands") or []):
 PY
 }
 
-# build_seed [env...] — one hub seed build into a FRESH $OUT. Output in $WORK/out.txt.
+# build_seed [env...] — one hub seed build into a FRESH $OUT, from the SANDBOX.
+# Output in $WORK/out.txt.
 build_seed() {
     rm -rf "$OUT"
     env "$@" OUT_DIR="$OUT" IMAGES_OUT="$WORK/no-images" \
-        bash "$SCRIPT_DIR/build-seed.sh" >"$WORK/out.txt" 2>&1
+        bash "$SANDBOX/vmtest/build-seed.sh" >"$WORK/out.txt" 2>&1
 }
 
 # expect_refusal NAME NEEDLE -- env... : the build must exit non-zero AND say
@@ -118,7 +208,7 @@ expect_refusal() {
 SITE="$WORK/site"; mkdir -p "$SITE"
 make_site_filled() {
     sed -e 's#- "ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host"#- "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey t@t"#' \
-        "$WORK.ud.bak" > "$SITE/user-data.filled"
+        "$PRISTINE_UD" > "$SITE/user-data.filled"
 }
 make_site_files() {
     printf 'DOMAIN=house.invalid\n'          > "$SITE/.env"
@@ -129,6 +219,30 @@ make_site_files() {
     printf 'LABEL=Library /srv/library ext4 nofail 0 2\n' > "$SITE/library-mounts.fstab"
     printf '/srv/library\tSERIAL123\n'       > "$SITE/drive-identity.conf"
     printf '{ "FEED_TOKEN": "sim-not-a-real-token" }\n' > "$SITE/config.json"
+}
+
+# THE SEVEN DESTINATIONS late-command 4b installs to, and the posture each must
+# land in. Every one is stat'd individually: the old check stat'd `.env` alone
+# and called it "all seven files 0600", so a widened drive-identity.conf — the
+# one carrying disk serials, and the one nothing had ever installed before
+# 2026-08-03 — or any later chmod regression passed unnoticed.
+SITE_DESTS="/opt/homehub/stack/.env
+/etc/homehub-backup/backup.env
+/etc/homehub-backup/cifs.creds
+/etc/homehub-samba/samba-users.creds
+/etc/homehub-samba/smb.conf.fragment
+/etc/homehub-samba/library-mounts.fstab
+/etc/homehub-samba/drive-identity.conf"
+site_install_problems() {
+    local t="$1" d p problems=""
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if [ ! -f "$t$d" ]; then problems="$problems $d=ABSENT"; continue; fi
+        p="$(stat -c '%a:%U:%G' "$t$d" 2>/dev/null)"
+        [ "$p" = "600:root:root" ] || problems="$problems $d=$p"
+    done <<< "$SITE_DESTS"
+    [ -f "$t/etc/homehub-samba/.site-present" ] || problems="$problems /etc/homehub-samba/.site-present=ABSENT"
+    printf '%s' "$problems"
 }
 
 echo "=== the production seam (builder) ==="
@@ -181,6 +295,7 @@ echo
 echo "=== the SIM build ==="
 if build_seed; then
     U="$OUT/iso-root/user-data"; M="$OUT/iso-root/meta-data"
+    cp "$U" "$WORK/sim-user-data"
     [ "$(active_build_profile "$U")" = sim ] \
         && ok "a sim image's ACTIVE marker is BUILD_PROFILE=sim, and there is exactly one (so its install does not demand secrets)" \
         || bad "sim BUILD_PROFILE marker" "active assignments: $(active_build_profile "$U" | tr '\n' ' ')"
@@ -193,6 +308,7 @@ fi
 
 echo
 echo "=== the PRODUCTION build (OI-19's companion: the sim identity leaked into it) ==="
+PROD_SEED=""
 if build_seed "SITE_DIR=$SITE"; then
     U="$OUT/iso-root/user-data"; M="$OUT/iso-root/meta-data"
     grep -Fxq 'local-hostname: homehub' "$M" \
@@ -210,160 +326,311 @@ if build_seed "SITE_DIR=$SITE"; then
     [ -f "$OUT/iso-root/deploy-payload/site/config.json" ] \
         && ok "site/config.json rides the payload too (the kiosk shell's runtime config)" \
         || bad "config.json staging" "no deploy-payload/site/config.json"
+    # Keep this seed ISO: the CIDATA case below mounts it for real.
+    if [ -f "$OUT/seed.iso" ]; then
+        PROD_SEED="$WORK/production-seed.iso"
+        cp "$OUT/seed.iso" "$PROD_SEED"
+    fi
 else
     bad "the production build itself" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
 fi
 
 echo
-echo "=== config.json — a HUB artifact, installed AFTER the site tarball ==="
-# Ordering is the whole property: firstboot step 3d untars the site tarball OVER
-# stack/wall-shell/, so the config copy has to come after it. Asserted on line
-# order in the script rather than trusted to a comment.
-FB="$REPO_ROOT/stack/autoinstall/firstboot.sh"
-untar_ln=$(grep -n 'tar -xzf "\$WALL_SITE_TARBALL"' "$FB" | head -n1 | cut -d: -f1)
-cfg_ln=$(grep -n 'install -m 0600 -o root -g root "\$WALL_SITE_CONFIG"' "$FB" | head -n1 | cut -d: -f1)
-if [ -n "$untar_ln" ] && [ -n "$cfg_ln" ] && [ "$cfg_ln" -gt "$untar_ln" ]; then
-    ok "firstboot installs config.json AFTER untarring the site tarball (line $cfg_ln > $untar_ln)"
-else
-    bad "config.json ordering" "untar at line '${untar_ln:-?}', config install at '${cfg_ln:-?}'"
-fi
-if grep -q 'install -m 0600 -o root -g root "\$WALL_SITE_CONFIG"' "$FB"; then
-    ok "config.json is installed 0600 root:root — not widened for a web root (mode owed a ruling)"
-else
-    bad "config.json mode" "not installed with -m 0600 -o root -g root"
-fi
-if extract_4b "$USER_DATA" | grep -q 'config.json'; then
-    bad "config.json is not in late-command 4b" "it is — and 3d would overwrite it"
-else
-    ok "config.json is NOT in late-command 4b's table (its destination is the web root)"
-fi
-
-echo
 echo "=== the substitution assertions (a silent no-op must fail the build) ==="
-grep -v 'BUILD_PROFILE=production' "$WORK.ud.bak" > "$USER_DATA"
+grep -v 'BUILD_PROFILE=production' "$PRISTINE_UD" > "$USER_DATA"
 expect_refusal "a user-data that lost BUILD_PROFILE=production fails the sim build" \
     "BUILD_PROFILE substitution did not apply" --
-cp "$WORK.ud.bak" "$USER_DATA"
+cp "$PRISTINE_UD" "$USER_DATA"
 
-grep -v '^local-hostname:' "$WORK.md.bak" > "$META_DATA"
+grep -v '^local-hostname:' "$PRISTINE_MD" > "$META_DATA"
 expect_refusal "a meta-data that lost local-hostname: fails the build" \
     "meta-data local-hostname is not" --
-cp "$WORK.md.bak" "$META_DATA"
+cp "$PRISTINE_MD" "$META_DATA"
 
 echo
-echo "=== the site-staging late-command itself (OI-19) ==="
-# fake_target KIND -> sets T (a fake /target) and CMD (the late-command to run).
-fake_target() {
-    local kind="$1" src
-    T="$WORK/t-$kind-$RANDOM"
-    case "$kind" in
-        production) src="$USER_DATA" ;;                 # the tracked template
-        sim)        src="$WORK/sim-user-data" ;;        # as the builder rendered it
-    esac
-    mkdir -p "$T/opt/homehub/stack" "$T/etc/homehub-samba" "$T/etc/homehub-backup"
-    CMD="$WORK/cmd.sh"
-    extract_4b "$src" | sed -e "s#^bash -c '##" -e "s#'\$##" -e "s#/target#$T#g" > "$CMD"
-    [ -s "$CMD" ] || { bad "extracting late-command 4b" "nothing matched in $src"; return 1; }
-}
-
-run_4b() { bash "$CMD" >"$WORK/lc.txt" 2>&1; echo $?; }
-
-# The static half of the OI-19 fix: the boot-medium assumption is GONE. Step 3
-# is the one place that searches (/cdrom, /media, /media/*, /run/media/*, then
-# the CIDATA volume by label) and it copies site/ along with everything else.
-if extract_4b "$USER_DATA" | grep -qE '/cdrom|/media'; then
-    bad "the site step no longer reads the boot medium" "it still names /cdrom or /media"
-else
-    ok "the site step no longer reads the boot medium (one discovery path, in step 3)"
+echo "=== what the late-commands say (structure) ==="
+# The static half of the OI-19 fix: the boot-medium assumption is GONE from the
+# SITE step. Step 3 is the one place that searches (/cdrom, /media, /media/*,
+# /run/media/*, then the CIDATA volume by label) and it copies site/ along with
+# everything else. Both of these run through extract_late_command, so a missing
+# command is a FAIL rather than a vacuous pass.
+if extract_late_command "$USER_DATA" "BUILD_PROFILE" "extracting late-command 4b" "$WORK/4b.raw"; then
+    if grep -qE '/cdrom|/media' "$WORK/4b.raw"; then
+        bad "the site step no longer reads the boot medium" "it still names /cdrom or /media"
+    else
+        ok "the site step no longer reads the boot medium (one discovery path, in step 3)"
+    fi
+    # config.json's destination is a WEB ROOT that firstboot step 3d untars over,
+    # so it must NOT be in 4b's table — firstboot step 3e owns it.
+    if grep -q 'config.json' "$WORK/4b.raw"; then
+        bad "config.json is not in late-command 4b" "it is — and 3d would overwrite it"
+    else
+        ok "config.json is NOT in late-command 4b's table (its destination is the web root)"
+    fi
 fi
 
-build_seed && cp "$OUT/iso-root/user-data" "$WORK/sim-user-data"
-
-if [ "$(id -u)" -ne 0 ]; then
-    skip_case "the late-command's five behavioural cases" \
-        "not root — 'install -o root -g root' is what the installer does and cannot be faked here"
+echo
+echo "=== firstboot steps 3d/3e, EXECUTED (not grepped) ==="
+# Ordering, mode and the collision notice were all previously asserted by
+# grepping firstboot.sh for line numbers and literal strings — which proves the
+# source contains some text, not that the code runs, is reachable, or does what
+# the text implies. Carve the region out and run it.
+H="$WORK/fb3de"
+mkdir -p "$H/stack/wall-site" "$H/site" "$H/src/site"
+awk '/3d\. unpack the wall kiosk site/{f=1} /4\. bring the stack up/{f=0} f' "$FB" > "$H/body.sh"
+if ! grep -q 'tar -xzf "\$WALL_SITE_TARBALL"' "$H/body.sh" || ! grep -q 'WALL_SITE_CONFIG' "$H/body.sh"; then
+    bad "carving firstboot steps 3d/3e out" \
+        "the region between the '3d. unpack…' and '4. bring the stack up' markers does not contain both the untar and WALL_SITE_CONFIG — the markers moved, so nothing below would be testing what it claims"
 else
-    fake_target production
-    rc=$(run_4b)
-    if [ "$rc" -ne 0 ] && grep -q "FATAL - this is a PRODUCTION image" "$WORK/lc.txt"; then
-        ok "PRODUCTION + no site/ payload REFUSES the install (was: silent exit 0)"
+    {
+        printf '%s\n' '#!/usr/bin/env bash' \
+                      '# Carved out of stack/autoinstall/firstboot.sh by test-hub-seed.sh.' \
+                      'set -euo pipefail' \
+                      "STACK_DIR=\"$H/stack\"" \
+                      'log() { echo "[firstboot] $*"; }'
+        sed -e "s#/opt/homehub/site/config.json#$H/site/config.json#" \
+            -e "s#/opt/homehub/wall-site#$H/absent-a#" \
+            -e "s#/cdrom/deploy-payload/wall-site#$H/absent-b#" \
+            "$H/body.sh"
+    } > "$H/run.sh"
+
+    printf '<html>SIM-WALL-SHELL-FIXTURE</html>\n' > "$H/src/site/index.html"
+    printf '{"revision":"0123456789ab"}\n'         > "$H/src/site/build-info.json"
+    printf '{"FEED_TOKEN":"materialised-not-a-real-token"}\n' > "$H/site/config.json"
+    make_tarball() {  # make_tarball WITH_CONFIG(yes|no)
+        rm -f "$H/src/site/config.json"
+        [ "$1" = yes ] && printf '{"FEED_TOKEN":"PLACEHOLDER-FROM-THE-TARBALL"}\n' > "$H/src/site/config.json"
+        rm -f "$H"/stack/wall-site/officewall-site-*.tar.gz
+        tar -czf "$H/stack/wall-site/officewall-site-test.tar.gz" -C "$H/src" site
+    }
+    run_3de() { rm -rf "$H/stack/wall-shell"; bash "$H/run.sh" >"$H/log.txt" 2>&1; echo $?; }
+    run_3de_again() { bash "$H/run.sh" >"$H/log.txt" 2>&1; echo $?; }
+
+    # (a) the ordinary production case: the tarball has no config.json of its
+    #     own, the materialised one is installed over the unpacked docroot.
+    make_tarball no
+    rc=$(run_3de)
+    cfg="$H/stack/wall-shell/config.json"
+    modes="$(stat -c '%a:%U:%G' "$cfg" 2>/dev/null)"
+    if [ "$rc" -eq 0 ] && [ -f "$H/stack/wall-shell/index.html" ] && [ "$modes" = "600:root:root" ] \
+       && grep -q 'materialised-not-a-real-token' "$cfg"; then
+        ok "3d/3e RUN: the site unpacks and the materialised config.json lands on top of it, 600:root:root"
     else
-        bad "production refusal" "rc=$rc $(head -n1 "$WORK/lc.txt")"
+        bad "3d/3e execution" "rc=$rc mode=${modes:-none} index=$([ -f "$H/stack/wall-shell/index.html" ] && echo yes || echo no)"
+    fi
+    if grep -q 'shipped its own config.json' "$H/log.txt"; then
+        bad "collision notice on a clean run" "it claimed the tarball shipped a config.json when the tarball has none"
+    else
+        ok "3d/3e RUN: no collision notice when the tarball ships no config.json"
     fi
 
-    fake_target sim
-    rc=$(run_4b)
-    if [ "$rc" -eq 0 ] && grep -q "SIM build" "$WORK/lc.txt"; then
-        ok "SIM + no site/ payload is a clean, LOUD no-op (a vmtest image has no secrets)"
+    # (b) THE RERUN. homehub-firstboot.service has no marker guard and no
+    #     ConditionPath*, so it runs again after every reboot. The old check
+    #     asked `[ -f wall-shell/config.json ]` AFTER the untar — which on run
+    #     two finds the file run one installed, and shouted "the tarball shipped
+    #     its own config.json" on every hub, forever.
+    rc=$(run_3de_again)
+    if [ "$rc" -eq 0 ] && ! grep -q 'shipped its own config.json' "$H/log.txt"; then
+        ok "3d/3e RERUN (no fresh install): still no collision notice — it is answered from the ARCHIVE, not from its own output"
     else
-        bad "sim no-op" "rc=$rc $(head -n1 "$WORK/lc.txt")"
+        bad "collision notice on rerun" "rc=$rc — the notice fired on a second run with the same tarball"
     fi
 
-    # The light path, as late-command 3 leaves it: the payload (site/ included)
-    # copied to /target/opt/homehub, and NOTHING mounted at /cdrom. This is the
-    # exact case that used to install nothing at all.
-    fake_target production
-    mkdir -p "$T/opt/homehub/site"
-    make_site_files
-    for f in .env backup.env cifs.creds samba-users.creds smb.conf.fragment \
-             library-mounts.fstab drive-identity.conf; do
-        cp "$SITE/$f" "$T/opt/homehub/site/$f"
-    done
-    rc=$(run_4b)
-    missing=""
-    for f in "$T/opt/homehub/stack/.env" "$T/etc/homehub-backup/backup.env" \
-             "$T/etc/homehub-backup/cifs.creds" "$T/etc/homehub-samba/samba-users.creds" \
-             "$T/etc/homehub-samba/smb.conf.fragment" "$T/etc/homehub-samba/library-mounts.fstab" \
-             "$T/etc/homehub-samba/drive-identity.conf" "$T/etc/homehub-samba/.site-present"; do
-        [ -f "$f" ] || missing="$missing ${f#$T}"
-    done
-    modes="$(stat -c%a "$T/opt/homehub/stack/.env" 2>/dev/null)"
-    if [ "$rc" -eq 0 ] && [ -z "$missing" ] && [ "$modes" = "600" ]; then
-        ok "PRODUCTION + a payload-borne site/ installs all seven files 0600 (the light-path case)"
+    # (c) the collision that IS real must still be reported.
+    make_tarball yes
+    rc=$(run_3de)
+    if [ "$rc" -eq 0 ] && grep -q 'shipped its own config.json' "$H/log.txt" \
+       && grep -q 'materialised-not-a-real-token' "$H/stack/wall-shell/config.json"; then
+        ok "3d/3e RUN: a tarball that DOES ship a config.json is reported, and the materialised one still wins"
     else
-        bad "production install" "rc=$rc missing:$missing mode=$modes"
+        bad "real collision" "rc=$rc notice=$(grep -c 'shipped its own' "$H/log.txt") content=$(head -c 60 "$H/stack/wall-shell/config.json" 2>/dev/null)"
+    fi
+fi
+
+echo
+echo "=== the late-commands, EXECUTED against a fake /target (OI-19) ==="
+if [ "$(id -u)" -ne 0 ]; then
+    skip_case "every behavioural case (late-commands 3 and 4b)" \
+        "not root — 'install -o root -g root', loop mounts and a real /media entry are what the installer does and cannot be faked here. Re-run with sudo."
+else
+    # fake_target KIND -> sets T (a fake /target) and CMD4B (4b, ready to run).
+    fake_target() {
+        local kind="$1" src
+        T="$WORK/t-$kind-$RANDOM"
+        case "$kind" in
+            production) src="$USER_DATA" ;;                 # the tracked template
+            sim)        src="$WORK/sim-user-data" ;;        # as the builder rendered it
+        esac
+        mkdir -p "$T/opt/homehub/stack" "$T/etc/homehub-samba" "$T/etc/homehub-backup"
+        CMD4B="$WORK/cmd-4b.sh"
+        extract_late_command "$src" "BUILD_PROFILE" "extracting late-command 4b from $kind" "$WORK/4b.raw" || return 1
+        runnable_body "$WORK/4b.raw" "$CMD4B" "$T"
+    }
+    run_4b() { bash "$CMD4B" >"$WORK/lc.txt" 2>&1; echo $?; }
+
+    # Step 3 is the payload copy — the one OI-19 was actually about, and the one
+    # nothing had ever executed. Extract it once, here.
+    CMD3_SRC="$WORK/lc3.raw"
+    HAVE_LC3=no
+    extract_late_command "$USER_DATA" 'blkid -L CIDATA' "extracting late-command 3 (the payload copy)" "$CMD3_SRC" \
+        && HAVE_LC3=yes
+    run_lc3() {  # run_lc3 TARGET_ROOT -> rc, output in $WORK/lc3.txt
+        runnable_body "$CMD3_SRC" "$WORK/cmd-3.sh" "$1"
+        bash "$WORK/cmd-3.sh" >"$WORK/lc3.txt" 2>&1; echo $?
+    }
+    stage_payload() {  # stage_payload DIR — a deploy-payload/ as the builder makes one
+        mkdir -p "$1/deploy-payload/stack" "$1/deploy-payload/site"
+        printf 'DOMAIN=example.invalid\n' > "$1/deploy-payload/stack/.env.example"
+        local f
+        for f in .env backup.env cifs.creds samba-users.creds smb.conf.fragment \
+                 library-mounts.fstab drive-identity.conf; do
+            cp "$SITE/$f" "$1/deploy-payload/site/$f"
+        done
+    }
+
+    fake_target production && {
+        rc=$(run_4b)
+        if [ "$rc" -ne 0 ] && grep -q "FATAL - this is a PRODUCTION image" "$WORK/lc.txt"; then
+            ok "PRODUCTION + no site/ payload REFUSES the install (was: silent exit 0)"
+        else
+            bad "production refusal" "rc=$rc $(head -n1 "$WORK/lc.txt")"
+        fi
+    }
+
+    fake_target sim && {
+        rc=$(run_4b)
+        if [ "$rc" -eq 0 ] && grep -q "SIM build" "$WORK/lc.txt"; then
+            ok "SIM + no site/ payload is a clean, LOUD no-op (a vmtest image has no secrets)"
+        else
+            bad "sim no-op" "rc=$rc $(head -n1 "$WORK/lc.txt")"
+        fi
+    }
+
+    # ── THE LIGHT PATH, END TO END: step 3 then step 4b ──────────────────────
+    # This is the case OI-19 was raised about, and until 2026-08-03 the case
+    # "testing" it hand-created /target/opt/homehub/site and ran 4b alone — so it
+    # passed with late-command 3 reverted, stubbed, or deleted. Nothing here
+    # creates that directory: step 3 has to find the payload and copy it.
+    if [ "$HAVE_LC3" = no ]; then
+        skip_case "the light path (steps 3 -> 4b)" "late-command 3 could not be extracted (see the FAIL above)"
+    else
+        MEDIA_DIR="/media/hub-seed-test.$$"
+        if [ -e "$MEDIA_DIR" ] || ! mkdir -p "$MEDIA_DIR" 2>/dev/null; then
+            MEDIA_DIR=""
+            skip_case "the light path via a mounted directory (step 3 -> 4b)" \
+                "could not create a real /media entry — step 3's directory search cannot be exercised as written"
+        else
+            stage_payload "$MEDIA_DIR"
+            T="$WORK/t-light-$RANDOM"
+            mkdir -p "$T/opt/homehub" "$T/etc/homehub-samba" "$T/etc/homehub-backup"
+            rc3=$(run_lc3 "$T")
+            CMD4B="$WORK/cmd-4b.sh"
+            runnable_body "$WORK/4b.raw" "$CMD4B" "$T"
+            rc=$(run_4b)
+            problems="$(site_install_problems "$T")"
+            if [ "$rc3" -eq 0 ] && [ "$rc" -eq 0 ] && [ -z "$problems" ] \
+               && grep -q "payload copied from $MEDIA_DIR/deploy-payload" "$WORK/lc3.txt"; then
+                ok "LIGHT PATH: step 3 found the payload under /media and copied it, then 4b installed all seven files 600:root:root"
+            else
+                bad "light path (media)" "step3 rc=$rc3, 4b rc=$rc, problems:${problems:-none}, step3 said: $(head -n1 "$WORK/lc3.txt")"
+            fi
+
+            # FORCED cp FAILURE. Both copy branches used to read
+            # `cp -a … && echo …; exit 0` — the `exit 0` a separate command, so
+            # it ran whether or not the copy worked, and a half-copied payload
+            # reported success. A regular file where the directory must be makes
+            # `cp -a src/. dest/` fail deterministically.
+            T="$WORK/t-cpfail-$RANDOM"
+            mkdir -p "$T/opt"
+            : > "$T/opt/homehub"
+            rc3=$(run_lc3 "$T")
+            if [ "$rc3" -ne 0 ] && grep -q "cp -a FAILED partway" "$WORK/lc3.txt"; then
+                ok "a FAILED payload copy halts the install instead of reporting success (a partial deploy unit looks installed)"
+            else
+                bad "cp failure is fatal" "rc=$rc3 $(head -n2 "$WORK/lc3.txt" | tr '\n' ' ')"
+            fi
+
+            rm -rf "$MEDIA_DIR"; MEDIA_DIR=""
+        fi
+
+        # ── THE CIDATA SEED, FOR REAL ───────────────────────────────────────
+        # The branch the light path actually takes on a hub: no /cdrom, no
+        # /media entry, so step 3 falls through to `blkid -L CIDATA`, mounts the
+        # seed read-only and copies out of it. This mounts THE ISO THIS SUITE
+        # JUST BUILT, so the label, the layout and the mount all have to be real.
+        if [ -z "$PROD_SEED" ]; then
+            skip_case "the CIDATA-seed path (step 3 -> 4b)" "the production build produced no seed.iso to mount"
+        elif ! command -v losetup >/dev/null 2>&1 || ! LOOPDEV="$(losetup --find --show "$PROD_SEED" 2>/dev/null)"; then
+            LOOPDEV=""
+            skip_case "the CIDATA-seed path (step 3 -> 4b)" \
+                "no usable loop device — a genuine loopback mount is not possible here, so step 3's blkid+mount branch is UNTESTED. It is not a pass."
+        elif [ "$(blkid -L CIDATA 2>/dev/null)" != "$LOOPDEV" ]; then
+            skip_case "the CIDATA-seed path (step 3 -> 4b)" \
+                "blkid -L CIDATA resolves to '$(blkid -L CIDATA 2>/dev/null)', not our loop device $LOOPDEV — another CIDATA volume is attached and step 3 would read that one"
+        else
+            T="$WORK/t-cidata-$RANDOM"
+            mkdir -p "$T/opt/homehub" "$T/etc/homehub-samba" "$T/etc/homehub-backup"
+            rc3=$(run_lc3 "$T")
+            CMD4B="$WORK/cmd-4b.sh"
+            runnable_body "$WORK/4b.raw" "$CMD4B" "$T"
+            rc=$(run_4b)
+            problems="$(site_install_problems "$T")"
+            if [ "$rc3" -eq 0 ] && [ "$rc" -eq 0 ] && [ -z "$problems" ] \
+               && grep -q "payload copied from the CIDATA seed" "$WORK/lc3.txt"; then
+                ok "CIDATA SEED: step 3 found the seed by label, mounted it read-only and copied the payload; 4b then installed all seven files 600:root:root"
+            else
+                bad "light path (CIDATA)" "step3 rc=$rc3, 4b rc=$rc, problems:${problems:-none}, step3 said: $(head -n1 "$WORK/lc3.txt")"
+            fi
+            losetup -d "$LOOPDEV" 2>/dev/null; LOOPDEV=""
+        fi
     fi
 
-    fake_target production
-    mkdir -p "$T/opt/homehub/site"
-    cp "$SITE"/.env "$SITE/backup.env" "$SITE/smb.conf.fragment" "$SITE/library-mounts.fstab" "$T/opt/homehub/site/"
-    rc=$(run_4b)
-    if [ "$rc" -eq 0 ] && grep -q "optional site file MISSING - site/cifs.creds" "$WORK/lc.txt"; then
-        ok "an absent OPTIONAL site file is named and not fatal (Build-VentoyStick marks three optional)"
-    else
-        bad "optional file handling" "rc=$rc $(grep -c MISSING "$WORK/lc.txt") missing lines"
-    fi
+    fake_target production && {
+        mkdir -p "$T/opt/homehub/site"
+        cp "$SITE"/.env "$SITE/backup.env" "$SITE/smb.conf.fragment" "$SITE/library-mounts.fstab" "$T/opt/homehub/site/"
+        rc=$(run_4b)
+        if [ "$rc" -eq 0 ] && grep -q "optional site file MISSING - site/cifs.creds" "$WORK/lc.txt"; then
+            ok "an absent OPTIONAL site file is named and not fatal (Build-VentoyStick marks three optional)"
+        else
+            bad "optional file handling" "rc=$rc $(grep -c MISSING "$WORK/lc.txt") missing lines"
+        fi
+    }
 
-    fake_target production
-    mkdir -p "$T/opt/homehub/site"
-    cp "$SITE/backup.env" "$SITE/smb.conf.fragment" "$SITE/library-mounts.fstab" "$T/opt/homehub/site/"
-    rc=$(run_4b)
-    if [ "$rc" -ne 0 ] && grep -q "required site file MISSING - site/.env" "$WORK/lc.txt"; then
-        ok "an absent REQUIRED site file HALTS the production install (OI-19's second head: a site/ that exists but is empty of what matters)"
-    else
-        bad "required file handling" "rc=$rc $(head -n1 "$WORK/lc.txt")"
-    fi
+    fake_target production && {
+        mkdir -p "$T/opt/homehub/site"
+        cp "$SITE/backup.env" "$SITE/smb.conf.fragment" "$SITE/library-mounts.fstab" "$T/opt/homehub/site/"
+        rc=$(run_4b)
+        if [ "$rc" -ne 0 ] && grep -q "required site file MISSING - site/.env" "$WORK/lc.txt"; then
+            ok "an absent REQUIRED site file HALTS the production install (OI-19's second head: a site/ that exists but is empty of what matters)"
+        else
+            bad "required file handling" "rc=$rc $(head -n1 "$WORK/lc.txt")"
+        fi
+    }
 
     # The finding underneath the finding: a site/ holding ONLY the mandatory
     # user-data.filled used to build, pass 4b's directory check, log six MISSING
     # lines and exit 0 — the OI-19 outcome by a different road.
-    fake_target production
-    mkdir -p "$T/opt/homehub/site"
-    make_site_filled
-    cp "$SITE/user-data.filled" "$T/opt/homehub/site/user-data.filled"
-    rc=$(run_4b)
-    if [ "$rc" -ne 0 ]; then
-        ok "a site/ carrying ONLY user-data.filled REFUSES (the directory existing was never the property worth checking)"
-    else
-        bad "empty-but-present site/" "rc=$rc — it exited 0 with every required file missing"
-    fi
+    fake_target production && {
+        mkdir -p "$T/opt/homehub/site"
+        make_site_filled
+        cp "$SITE/user-data.filled" "$T/opt/homehub/site/user-data.filled"
+        rc=$(run_4b)
+        if [ "$rc" -ne 0 ]; then
+            ok "a site/ carrying ONLY user-data.filled REFUSES (the directory existing was never the property worth checking)"
+        else
+            bad "empty-but-present site/" "rc=$rc — it exited 0 with every required file missing"
+        fi
+    }
 fi
 
 echo
 printf '%s\n' "----------------------------------------"
 printf 'hub seed guards: %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
-[ "$skip" -eq 0 ] || printf 'NOTE: skipped cases are NOT passes — see the SKIP lines above.\n'
+if [ "$skip" -ne 0 ]; then
+    printf 'SKIPPED CASES ARE NOT PASSES, and this suite exits NON-ZERO because of them.\n'
+    printf 'A green that means "we could not look" is the false green this file exists to prevent.\n'
+fi
 printf 'NOTE: nothing here has installed anything. The late-commands are exercised\n'
 printf '      against a fake /target, never under Subiquity — OI-19 stays UNVERIFIED\n'
 printf '      until a hub is installed from a built ISO.\n'
-[ "$fail" -eq 0 ] || exit 1
+[ "$fail" -eq 0 ] && [ "$skip" -eq 0 ] || exit 1

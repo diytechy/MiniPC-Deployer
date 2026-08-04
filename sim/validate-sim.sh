@@ -15,6 +15,10 @@
 #   5  multi-user isolation over HTTP: X-Forwarded-User A vs B see only their own
 #      data, and A's /api/export contains only A's items
 #   6  /api/feed round-trip appears in /api/today
+#   6b the two DRIVE-PRESENCE colour lanes (A19): a color report against each of
+#      library-mounted / backup-drive-mounted lands as reportColor on
+#      library-drive-present / backup-drive-present. Per ITEM, not the ambient
+#      band — Aggregate is a max, so a red screen proves nothing about a lane.
 #   7  wall kiosk site (SR-016): a FORGED X-Forwarded-User from the panel's /32 is
 #      stripped and replaced with PANEL_USER_SUB before the tracker sees it; the
 #      static shell is served from the same origin without swallowing /api/*
@@ -168,6 +172,61 @@ if [ "$f1" = "200" ] && [ "$d1" = "true" ] && [ "$d2" = "false" ] && [ "$d3" = "
 else
     fail "feed round-trip codes=$f1/$f2/$f3 done=$d1/$d2/$d3"
 fi
+
+# ── Check 6b — the two DRIVE-PRESENCE colour lanes (A19) ──────────────────────
+# The A19 two-VM gate is built on these two lanes showing red on a hub with no
+# data drives attached, and until now the sim never posted to either one. It
+# would therefore have passed with sim/tracker-seed/definitions/drives.md DELETED
+# OUTRIGHT — which is not hypothetical: those two check ids posted into the void
+# from 2026-07-30 to 2026-08-03 precisely because no item declared them (A24(i)),
+# and a feed post naming an id no item declares is a 400 that the reporter logs
+# and nobody reads.
+#
+# THE CRITERION IS PER-ITEM reportColor, NOT THE AMBIENT BAND, and that is a
+# measured fact about NagLight rather than a stylistic preference: engine.Aggregate
+# is a MAX over lane scores, so ONE red report reaches red on its own and the
+# color_weight only orders the offenders named in the overlay text. The corollary
+# is what matters here — a red screen does NOT prove these two lanes are red,
+# because any stale habit reddens it too. So assert the lanes.
+#
+# BOTH DIRECTIONS, for the same reason check 6 posts ok=false in the middle: an
+# assertion that only ever sees the expected value cannot tell "the report
+# landed" from "the field says red for some other reason".
+echo "-- (6b) drive-presence colour lanes (A19) --"
+feed_color() { sc curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -H "X-Forwarded-User: $A" -H "Authorization: Bearer $TOKEN" \
+    -d "{\"check\":\"$1\",\"color\":\"$2\",\"reason\":\"sim gate: $3\"}" "$TRACKER_DIRECT/api/feed"; }
+report_color_of() { sc curl -s -H "X-Forwarded-User: $A" "$TRACKER_DIRECT/api/today" \
+    | docker exec -i simclient jq -r --arg id "$1" '.items[]|select(.id==$id)|.reportColor // "<none>"'; }
+
+rl1="$(feed_color library-mounted     red "library not mounted")"
+rb1="$(feed_color backup-drive-mounted red "backup drive absent")"
+cl1="$(report_color_of library-drive-present)"
+cb1="$(report_color_of backup-drive-present)"
+if [ "$cl1" = "red" ] && [ "$cb1" = "red" ]; then
+    pass "library-drive-present and backup-drive-present both carry reportColor=red (the A19 criterion, per item)"
+else
+    fail "drive lanes red: library-drive-present=$cl1 backup-drive-present=$cb1 (want red/red; POST codes $rl1/$rb1 — '<none>' means the report never landed, i.e. the check id matches no item)"
+fi
+# Flip ONE lane and leave the other alone: proves the field tracks the report
+# rather than merely being present, and that the two ids are not the same item.
+rl2="$(feed_color library-mounted green "library mounted, identity confirmed")"
+cl2="$(report_color_of library-drive-present)"
+cb2="$(report_color_of backup-drive-present)"
+if [ "$cl2" = "green" ] && [ "$cb2" = "red" ]; then
+    pass "a green report moves library-drive-present only — backup-drive-present stays red (distinct lanes, live values)"
+else
+    fail "drive lane independence: library=$cl2 (want green) backup=$cb2 (want red) [POST code $rl2]"
+fi
+# Leave the gate in the state A19 documents: both red.
+feed_color library-mounted red "library not mounted" >/dev/null
+# The POST codes are reported, not asserted: with TRACKER_COMMIT=true on a
+# non-git /data a feed post STORES the report and THEN returns 500 (A24(iii)).
+# sim/.env.sim sets TRACKER_COMMIT=false so 200 is expected here — but the
+# criterion above is the stored reportColor either way, so that quirk can
+# neither redden this check falsely nor hide a lane that never landed.
+[ "$rl1" = "200" ] && [ "$rb1" = "200" ] || \
+    printf '  [NOTE] feed POST codes were %s/%s, not 200/200 — see A24(iii); the assertions above read the STORED value.\n' "$rl1" "$rb1"
 
 # ── Checks 7+8 — the office-wall kiosk site (SR-016 / OI-12) ──────────────────
 # This is the security-relevant half of the wall lane: a site that hands out the

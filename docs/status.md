@@ -137,17 +137,46 @@ last) — it is the record, not required reading for every pass.
       different owners. **Consequence to expect:** until Personal's half lands,
       a `Build-VentoyStick.ps1` run whose `out\` tree has no `config.json` now
       FAILS instead of quietly producing a stick without one.
-    - OI-18 — **The wall production seam has one missing input**
-      (2026-08-02, new): `WALL_SITE_DIR` now builds a real panel image from
-      Personal's `Materialize-Deploy.ps1 -Image wall` output, behind five
-      refusals. But that emitter writes `cifs.creds` for the **hub image only**
-      (`if ($img -eq 'homehub')`), even though the **2026-08-01 ruling
-      (A11(v)/A10(v))** gave both machines the same read-only `share` account
-      and the panel's `MEDIA_CIFS_CREDENTIALS` points at
-      `/etc/wall-panel/cifs.creds`. Consequence: a production panel mounts
-      nothing, `wall-sync.service` fails loudly, and there is no music or frame
-      video. **Personal's fix, not this repo's** — the builder stages the file
-      when it is there and says so when it is not.
+    - OI-18 — **RULED (b) 2026-08-03 and BUILT ACROSS BOTH REPOS THE SAME DAY;
+      INSTALL-UNVERIFIED; blocked on one Owner decision.** The panel has **two**
+      media sources on **two** hosts (storage-map §3 rows 1-2, §3b, §4d) and one
+      credential cannot authenticate on both, so no set of values made a
+      production panel work. The Owner ruled **exit (b) — two UNC/credential
+      pairs** (exit (a), consolidating behind one host, would have re-opened
+      HOMELAB_TOPOLOGY.md decision 2). What now exists:
+      - `wall-sync.sh` carries a **flow map** (`flow_spec()`) with two flows:
+        music from HOMEHUB via `MEDIA_MUSIC_SHARE_UNC` + the `Music` subdir
+        **under** the mount, frame video from Mini-serv via
+        `MEDIA_FRAME_SHARE_UNC` at the **share root**. Addresses and credentials
+        are knobs; the subtree/leaf/manifest/policy map is **not** — the
+        pre-existing "a knob would silently widen the mirror" property is kept.
+      - **Two failure policies.** Music: a refused mount FAILS the unit. Frame:
+        445 is probed first — nothing answering means Mini-serv is asleep and the
+        flow is **skipped silently, never woken** (§4d), while a box that
+        *answers* and then refuses the mount is **fatal**, because that is a wrong
+        share or a wrong credential and `mount.cifs` cannot tell you which.
+      - **Two cadences, two units.** `wall-sync.service` keeps boot + resume +
+        on-demand and syncs BOTH flows; `wall-sync-frame.{service,timer}` runs
+        `--only frame` **every minute**, per §4d. Per-flow `flock` so the two
+        can never rsync into the same directory at once.
+      - **Two credential files**: `/etc/wall-panel/cifs-{music,frame}.creds`,
+        both `0600 root:root`, installed by wall late-command 4a. The inline
+        `MEDIA_CIFS_USER`/`_PASS` fallback is **retired** — one inline pair
+        cannot serve two hosts.
+      - A **staleness ladder** that measures and reports (a stamp at the cache
+        root, `WALL_FRAME_STALE_WARN_HOURS`, default 24) but deliberately
+        **never escalates a skip into a failed unit**. See the Assumption below.
+      - Personal's half: store key `PanelMusicCifsCredential`, two UNCs in
+        `config.wall.psd1`, and `Materialize-Deploy.ps1 -Image wall` emitting
+        **four files for the first time in the project's life**.
+      **STILL FOR THE OWNER, and it is the only blocker:** *what is the HOMEHUB
+      music account called?* storage-map §2 has no panel identity and `everyone`
+      read still needs a real Samba account. Until that key is filled,
+      `-Image wall` refuses with exactly one violation naming it. Also unruled:
+      whether that account is a §2 identity (which would need a §2 row + a
+      `Samba<Name>Password` key) or a panel-only account made by hand at the box.
+      **Nothing here has been mounted** — "emits successfully" is not "mounts
+      successfully".
     - OI-7 — **Tier-2 catalog ratifications (2026-07-10):** (a) confirm the
       tier-2-NOT-baked ISO boundary (profiles excluded from the payload unless
       `EXTRA_PROFILES` at export) as the standing Q10.9 B+ interpretation;
@@ -509,6 +538,43 @@ Scaffolding created. Starting G1.
   installed at all, which it never was: both stagers emit it, three consumers
   read `/etc/homehub-samba/drive-identity.conf`, and no late-command ever put
   it there. Revert any of these at the next gate if wrong.
+- A11 — OI-18 shape (2026-08-03; the Owner ruled **exit (b), two UNC/credential
+  pairs**, and the storage map already fixed the addresses, shapes, cadences and
+  failure policies — these six mechanics were still ours to choose, and each is
+  a place a different agent would reasonably have chosen differently):
+  (i) **the frame skip is gated on a REACHABILITY PROBE, not on the mount's
+  return code** — a 4 s TCP connect to 445 before mounting. `mount.cifs` returns
+  the same rc for "asleep" and "wrong password", so inferring the state from the
+  failure would have made a wrong credential permanently invisible on a share
+  that is *designed* to fail quietly. A box that answers and then refuses is
+  therefore FATAL; only "nothing answering" is a skip.
+  (ii) **configuration defects are fatal for BOTH flows** — an unset or
+  placeholder UNC, or a missing/unreadable credentials file, is not a sleeping
+  box, and the frame flow's licence to be quiet does not extend to "nobody
+  filled this in".
+  (iii) **two units, not one, and not two scripts** — `wall-sync.service` keeps
+  OI-15/OI-16a's boot+resume+on-demand and now syncs both flows;
+  `wall-sync-frame.{service,timer}` is the same script with `--only frame` on
+  §4d's one-minute clock. One script keeps the `--delete` guards in one place;
+  two units are unavoidable because the cadences and the timeouts differ by an
+  order of magnitude (3600 s vs 120 s). A per-flow `flock` and a per-flow
+  `--only` on the manifest generator stop the two from colliding.
+  (iv) **the staleness ladder MEASURES but never ESCALATES** — a stamp at the
+  cache root and a journal line that becomes a WARNING past
+  `WALL_FRAME_STALE_WARN_HOURS` (default 24), but never a failed unit however
+  old the content gets. "Mini-serv has been off for a week" is an allowed state
+  per §4d and at what age it stops being allowed is a ruling nobody has made.
+  **Whether it should ever alert, and whether it should post to the tracker, is
+  the Owner's.**
+  (v) **the inline `MEDIA_CIFS_USER`/`MEDIA_CIFS_PASS` fallback is RETIRED** —
+  one inline pair cannot serve two hosts, and duplicating it per flow would have
+  added four knobs whose only purpose is to hold a password somewhere less safe
+  than the credentials file that already exists. A root-only credentials file is
+  now the only supported form.
+  (vi) **`MEDIA_CIFS_EXTRA` stays ONE knob** shared by both mounts — it is a
+  protocol choice and both hosts speak SMB3. Split it only if a real box turns
+  out to need two versions.
+  Revert any of these at the next gate if wrong.
 
 ### DRIVER — G1 — Round 1 — 2026-07-03 (migration + spine)
 Migrated the deploy stack, wired the tracker to `naglight:local`, authored the
@@ -3133,3 +3199,160 @@ now been EXECUTED — by this suite, as root, against a fake `/target`, a real
 That is a strictly larger claim than yesterday's and still a strictly smaller
 one than an install. OI-19 closes on a hub install; OI-20's mode ruling, and the
 A10(a) refuse-direction decision made here, are the Owner's.
+
+### DRIVER — G1 — Round 1 — 2026-08-03 (OI-18 ruled (b): the panel gets two mounts, two credentials and two failure policies)
+
+The Owner ruled **exit (b)** — two UNC/credential pairs — and this is the half
+of it that lives here. Exit (a), consolidating both trees behind one host, was
+rejected because it would have re-opened `HOMELAB_TOPOLOGY.md` decision 2 ("the
+panel pulls frame videos from Mini-serv directly").
+
+**The contract was implemented against `Personal\homelab\deploy\storage-map.md`,
+not against the old `SUBTREES` string, and the map was re-read first to confirm
+the derived table in `WALL_GATE_HANDOFF.md` §5 rather than trusted.** It agreed
+on every row, and `Generate-FromStorageMap.ps1 -Preview` independently derives
+the same two flows from the same map — `sync-frame-videos
+mini-serv://mini-serv/PictureFrameVideos -> wall-frame-pc:frame/` and
+`sync-music main-library:/srv/library/NonDocs/Media/Music ->
+wall-frame-pc:music/ (via //<AWOW>/Media)`. No edit to the map was needed and
+none was made.
+
+**THE TWO THINGS A SYMMETRIC IMPLEMENTATION GETS WRONG, and how each landed.**
+
+*They are not the same shape.* Music is reached **through** the `Media` share
+(§3 row 1 exports `NonDocs\Media`; §3 row 2 puts the music at
+`NonDocs\Media\Music`), so the mirror descends into a `Music` subdirectory under
+the mount. `PictureFrameVideos` is a **dedicated** share (§3b) whose content is
+at its **root**, with no subdirectory at all. `flow_spec()` carries an empty
+`F_SUBDIR` for frame and the mirror uses the mountpoint directly. Give frame a
+subdirectory it does not have and the mirror looks one level too deep and finds
+nothing — which, but for GUARD 1, would have mirrored emptiness over the cache.
+The suite proves both directions: a stub that gives music no subdir and a stub
+that gives frame the retired `FrameVideos/` one each turn a case red.
+
+*They have different FAILURE POLICIES.* §4d: Mini-serv may sleep and is never
+woken for this, so an unreachable frame share is skipped; the AWOW is always-on,
+so a refused music mount is an alert. The old script had exactly one policy and
+it was the music one.
+
+**The decision that mattered most here is HOW the skip is decided.**
+`mount.cifs` returns the same rc for "the box is asleep" and "the password is
+wrong", so inferring the state from the mount failure would have made a wrong
+credential permanently invisible on the one share designed to fail quietly.
+`wall-sync.sh` therefore **probes 445 with a 4 s bounded TCP connect before
+mounting**: nothing answering is a skip; a box that ANSWERS and then refuses the
+mount is **fatal**, and says so in those words. Configuration defects — an unset
+or placeholder UNC, a missing or unreadable credentials file — are fatal for
+**both** flows. The frame flow's licence to be quiet does not extend to "nobody
+filled this in".
+
+**The silent skip still owes a consequence, so it reports one.** Every
+successful flow stamps its finish time at the cache **root** — outside the
+mirrored leaf, where `--delete` cannot remove it and the manifest walker cannot
+see it — and every skip logs how old the cached content now is: a log line below
+`WALL_FRAME_STALE_WARN_HOURS` (default 24), a WARNING above it, and "this panel
+has NEVER completed a frame sync" when there is no stamp at all. It **never**
+escalates into a failed unit however old the content gets: "Mini-serv has been
+off for a week" is an allowed state per §4d, and at what age it stops being
+allowed is a ruling nobody has made. Recorded as **A11(iv)** — whether it should
+ever alert, and whether it should post to the tracker, is the Owner's.
+
+**TWO UNITS, ONE SCRIPT, and that split was made deliberately rather than by
+default.** §4d puts the frame flow on a one-minute accessibility-checked timer;
+OI-15 gave the music pull boot + resume + on demand and *no* timer. One unit
+cannot carry both — re-walking a music library over 802.11 sixty times an hour
+is absurd, and the first music sync is allowed a full hour while a frame run
+that is still going after two minutes is stuck. So `wall-sync.service` keeps its
+three triggers and now syncs BOTH flows (the documented on-demand command means
+exactly what it always meant), and `wall-sync-frame.{service,timer}` is the same
+script with `--only frame`. One script, because every `--delete` guard is
+identical between the flows and a second script is a second place for them to
+drift. Two collision guards, because the units genuinely overlap: a per-flow
+`flock`, and a new `--only` on `wall-media-manifest.py` so the every-minute
+frame run cannot rewrite `music/index.json` from a music cache the boot run is
+still filling.
+
+**One flow's failure no longer cancels the other.** Each flow is attempted, each
+gets its own verdict, and the exit status is non-zero if any failed — so a
+HOMEHUB outage cannot also stop the frame videos refreshing in the same run.
+
+**`SUBTREES` is gone as a string but kept as a property.** The comment at its
+old line said a knob there would let a typo silently widen the mirror onto a
+256 GB laptop disk. The map is now a `case` in `flow_spec()` with seven fields
+per flow; only the UNC, the credentials file and the bench hook name knobs — the
+subtree, cache leaf, manifest and failure policy are code. A `case` rather than
+a longer colon-delimited string because two of the seven fields are prose.
+
+**Retired, and each for a reason rather than for tidiness:** `MEDIA_SHARE_UNC`
+and `MEDIA_CIFS_CREDENTIALS` (one address and one credential cannot reach two
+hosts — that IS OI-18); the inline `MEDIA_CIFS_USER`/`MEDIA_CIFS_PASS` fallback
+(same reason, and duplicating it per flow would have added four knobs whose only
+purpose is to keep a password somewhere less safe than the file that already
+exists); and the single `MEDIA_SOURCE_OVERRIDE` bench hook, now one per flow
+because one directory cannot be both "has `Music/` under it" and "is the
+content". `MEDIA_CIFS_EXTRA` stays **one** knob shared by both mounts: it is a
+protocol choice and both hosts speak SMB3.
+
+**The image half.** Wall late-command 4a now installs **two** credential files,
+`0600 root:root`, naming each absence individually — "one of two" is a panel
+with half its media, and which half decides whether the wall is silent or blank.
+The new units are cp'd and the **timer** (not the service) is enabled;
+`wall-firstboot.sh` enables it too and reports **both** sources separately.
+`validate_config.py`'s referenced-file list grew the two units, because a frame
+timer that is missing looks — from the journal — exactly like a frame flow whose
+source is asleep, which is the state it is designed to be quiet in.
+
+**COVERAGE, AND IT WAS PROVEN THE HARD WAY.** `vmtest/test-wall-builder.sh` goes
+from 12 cases to **26**, and the 14 new ones were each verified to BITE by
+breaking the code they watch and re-running the whole suite:
+
+| stub | case that turned red |
+|---|---|
+| silence the missing-music-creds NOTE | names the MUSIC source as the casualty |
+| silence the missing-frame-creds NOTE | names the FRAME source as the casualty |
+| drop `cifs-frame.creds` from the staging loop | both credential files are staged |
+| disable the stale-`cifs.creds` refusal | a stale PRE-OI-18 `cifs.creds` is refused |
+| stop filling `MEDIA_MUSIC_SHARE_UNC` in the sim env | sim build refuses if the example loses it |
+| stop filling `MEDIA_FRAME_SHARE_UNC` in the sim env | sim build refuses if the example loses it |
+| give music no subdir | music comes from `Music/` UNDER the mount |
+| give frame the retired `FrameVideos/` subdir | frame comes from the share ROOT |
+| make the manifest generator ignore `--only` | `--only frame` leaves `music/index.json` alone |
+| give frame the ALERT policy | an unreachable frame source is a silent skip |
+| give music the SILENT-SKIP policy | an unreachable music source is an ALERT |
+| remove both mirror-delete refusals | an EMPTY music source still refuses |
+| drop the frame flow from `FLOWS` | a full run mirrors BOTH flows |
+| make `--only` always select music | `--only frame` refreshes the frame flow |
+
+The first pass at that verification is worth recording because it is the same
+trap this suite exists for: three of the stubs were line-range deletes that also
+ate a line-continuation backslash and an `fi`, so `common.sh` stopped parsing
+and *every* case went red. The target case failed, but it proved nothing — a
+broken file is not a disabled guard. They were re-run surgically (one anchored
+replacement each, `bash -n` asserted before the run) and each then produced
+exactly **one** FAIL line. A fourth stub renamed the frame flow's cache leaf,
+which leaves the `frame: manifest` log line intact and therefore never touched
+the case it was aimed at; it was replaced with one that makes `--only` always
+select music.
+
+**Two of the new sections need root** (the script takes a `/run` lock and calls
+`mount`) and one needs 445 closed on loopback; both are `skip_case`d loudly and
+counted, per this file's existing "a suite that quietly shrinks is the same
+false green" rule.
+
+**Verification, all real output:** `test-wall-builder.sh` 26 passed / 0 failed /
+0 skipped; `test-hub-seed.sh` 28 passed / 0 failed / 0 skipped;
+`python scripts/check.py` PASS (config-validate, registry-integrity,
+doc-navigability); `validate_config.py` ALL CONFIG CHECKS PASSED with 16 wall
+knobs declared; `bash -n` + `dash -n` clean on `wall-sync.sh` (it is now
+dash-PARSEABLE, having lost its herestring, though it stays a bash script —
+`${!var}` and `printf -v` are bash) and on `test-wall-builder.sh`; all **35**
+wall late-commands `dash -n` clean as the outer shell sees them, and every
+`bash -c` body `bash -n` clean. `wall-firstboot.sh` and `vmtest/lib/common.sh`
+still fail `dash -n`, on pre-existing process substitutions this change did not
+touch and that never run under dash.
+
+**WHAT IS NOT PROVEN. Nothing here has mounted anything.** No ISO was built from
+this, no panel was installed, and neither credential has ever authenticated
+against a real Samba service. The two policy tests use 127.0.0.1, which answers
+nothing on 445 — they prove the *decision*, not the mount. Read "emits" and
+"refuses" literally; neither is "works".

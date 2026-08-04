@@ -492,7 +492,7 @@ vmtest/
   build-seed.sh           HUB, LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
   build-repacked-iso.sh   HUB, HEAVIER path: one self-contained ISO (fallback; folds in the payload)
   build-wall-seed.sh      WALL PANEL seed ISO (§11) — the second image target, SR-017
-  test-wall-builder.sh    do the wall builder's 12 refusals actually bite? (§11)
+  test-wall-builder.sh    do the wall builder's 26 guards actually bite? (§11)
   test-wall-artifact.sh   is the image's package list SUFFICIENT for the shell? (§11, needs docker)
   lib/common.sh           shared rendering + the payload stagers (sourced, not run directly)
   Run-V3Gate.cmd          right-click "Run as administrator" wrapper for New-HomeHubVm.ps1
@@ -578,10 +578,14 @@ journalctl -u wall-firstboot      # the quirk config + the IF-005 report
   `wl*` device that does not exist in a VM. It is inert (firstboot does not
   `netplan apply`, and NetworkManager simply never activates a missing
   interface), but it is a file on the box, so do not be surprised by it.
-- **`wall-sync.service` FAILS at boot.** `MEDIA_SHARE_UNC` points at an
-  obviously-invalid host because sim hub builds skip Samba. Frame video and the
-  local music library are **out of scope** for this gate — a green sync unit
-  with no media would be a lie.
+- **`wall-sync.service` FAILS at boot.** BOTH `MEDIA_MUSIC_SHARE_UNC` and
+  `MEDIA_FRAME_SHARE_UNC` point at obviously-invalid `.invalid` hosts because sim
+  hub builds skip Samba. Frame video and the local music library are **out of
+  scope** for this gate — a green sync unit with no media would be a lie. Note
+  the two flows fail differently even here: the music mount is refused and the
+  unit fails, while the frame flow's reachability probe finds nothing answering
+  and *skips* — reporting that the panel has never completed a frame sync, which
+  is the staleness ladder doing its job (OI-18).
 - **The panel needs a hub to render anything.** The renderer is served by the
   hub's kiosk site (same-origin: NagLight sends no CORS headers), so the hub ISO
   must have been built **with** the site payload — `build-seed.sh` logs
@@ -607,9 +611,10 @@ reads. `WALL_SHELL_DIST=` points at a `dist/` elsewhere;
 
 ### Building a REAL panel image
 
-Personal's `Materialize-Deploy.ps1 -Image wall` writes `user-data.filled` and
-`wall.env` into `homelab\deploy\out\wall`. Point the builder at that directory
-and it takes them verbatim instead of substituting anything:
+Personal's `Materialize-Deploy.ps1 -Image wall` writes `user-data.filled`,
+`wall.env`, `cifs-music.creds` and `cifs-frame.creds` into
+`homelab\deploy\out\wall`. Point the builder at that directory and it takes them
+verbatim instead of substituting anything:
 
 ```sh
 WALL_SITE_DIR=/mnt/c/Projects/Personal/homelab/deploy/out/wall \
@@ -627,17 +632,28 @@ than warn: a `WALL_SITE_DIR` with no `user-data.filled` (staging the real
 nothing on screen); and a network block with no `wifis:` (the panel has no RJ45,
 so that image would come up unreachable).
 
-**One gap, and it is Personal's:** `Materialize-Deploy.ps1` emits `cifs.creds`
-for the **hub image only**, even though the 2026-08-01 ruling gave both machines
-the same read-only `share` account and `MEDIA_CIFS_CREDENTIALS` points straight
-at `/etc/wall-panel/cifs.creds`. Without it a production panel mounts nothing and
-`wall-sync.service` fails loudly. The builder stages `cifs.creds` when it is
-there and says so when it is not.
+**TWO credential files since OI-18 exit (b) (2026-08-03), and a stale single one
+is REFUSED.** The panel mounts two media sources on two hosts, so
+`Materialize-Deploy.ps1 -Image wall` emits `cifs-music.creds` (a HOMEHUB Samba
+identity) and `cifs-frame.creds` (the Mini-serv `share` account). The builder
+stages both when they are there and names each absence individually — "one of
+two" is a panel with half its media, and which half decides whether the wall is
+silent or blank. An `out\wall\` that still carries the pre-OI-18 single
+`cifs.creds` is a **stale materialisation** and the builder refuses it rather
+than staging nothing and logging two absences: one credential cannot
+authenticate on two hosts. Re-run the emitter.
+
+**The remaining gap is Personal's, and it is a decision, not code:** the store
+key `PanelMusicCifsCredential` has no value, because nobody has ruled what the
+HOMEHUB music account is called. Until it does, `-Image wall` refuses with
+exactly one violation naming that key.
 
 ### Testing the builder itself
 
 ```sh
-bash vmtest/test-wall-builder.sh    # 12 refusals — do they actually bite?
+bash vmtest/test-wall-builder.sh    # 26 cases — do the guards actually bite?
+sudo bash vmtest/test-wall-builder.sh   # …including the 6 wall-sync flow cases
+                                        #   (they take a /run lock and call mount)
 bash vmtest/test-wall-artifact.sh   # needs docker: is the package list SUFFICIENT?
 ```
 

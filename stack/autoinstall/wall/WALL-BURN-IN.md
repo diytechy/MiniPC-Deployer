@@ -160,29 +160,55 @@ cat /sys/class/input/event*/device/name
       `docker exec caddy caddy list-certificates` on the AWOW, or just load the
       site and check for a trusted padlock from the panel.
 
-## 8. The media pull (OI-15) — the half that needs the real share
+## 8. The media pull (OI-15 / OI-18) — the half that needs the real shares
 
 The mirror, its guards and the manifest generation were exercised for real against
-a local fixture library (WSL, via the script's `MEDIA_SOURCE_OVERRIDE` bench hook),
-and the emitted manifest was fed to the shell's real `normalizeManifest()`. What
-that could **not** touch is the cifs half, the Wi-Fi half, and library-scale data.
+local fixture libraries (WSL, via the script's per-flow `MEDIA_*_SOURCE_OVERRIDE`
+bench hooks), and the emitted manifest was fed to the shell's real
+`normalizeManifest()`. What that could **not** touch is the cifs half, the Wi-Fi
+half, and library-scale data.
 
-- [ ] **Fill in `MEDIA_SHARE_UNC` and the credentials** in
-      `/etc/wall-panel/wall.env`, and put the password in a root-only
-      `MEDIA_CIFS_CREDENTIALS` file (`username=` / `password=` lines, `chmod 0600`)
-      rather than inline. Until this is done `wall-sync.service` **fails on every
-      boot by design** — confirm you see exactly that, and that the message names
-      the fix:
+**THERE ARE TWO SOURCES ON TWO HOSTS (OI-18 exit (b), ruled 2026-08-03), and they
+are not the same shape.** Music comes from HOMEHUB's `Media` share and lives in a
+`Music/` subdirectory **under** the mount; frame video comes from Mini-serv's
+dedicated `PictureFrameVideos` share and lives at the share **root**. Everything
+below has to be done twice, with the right shape each time.
+
+- [ ] **Fill in BOTH UNCs and BOTH credentials** in `/etc/wall-panel/wall.env`:
+      `MEDIA_MUSIC_SHARE_UNC` + `MEDIA_MUSIC_CIFS_CREDENTIALS` and
+      `MEDIA_FRAME_SHARE_UNC` + `MEDIA_FRAME_CIFS_CREDENTIALS`. Each credentials
+      file is root-only `0600` with `username=` / `password=` lines; there is no
+      inline fallback any more. A production image installs both from the
+      materialised site payload. Until the music half is done `wall-sync.service`
+      **fails on every boot by design** — confirm you see exactly that, and that
+      the message names the fix:
       ```bash
       systemctl status wall-sync.service; journalctl -u wall-sync -b
       ```
-- [ ] **Prove the mount** from the panel, by hand, before trusting the unit —
+- [ ] **Prove BOTH mounts** from the panel, by hand, before trusting the units —
       a cifs failure and a credentials failure look the same in a service log:
       ```bash
-      sudo mount -t cifs //host/share /mnt -o credentials=/etc/wall-panel/cifs.creds,ro,vers=3.0
-      ls /mnt        # Music/ and FrameVideos/ must be AT THE ROOT of the share
+      sudo mount -t cifs //homehub/Media /mnt -o credentials=/etc/wall-panel/cifs-music.creds,ro,vers=3.0
+      ls /mnt/Music     # the music must be UNDER the mount, in Music/
+      sudo umount /mnt
+      sudo mount -t cifs //MINI-SERV/PictureFrameVideos /mnt -o credentials=/etc/wall-panel/cifs-frame.creds,ro,vers=3.0
+      ls /mnt           # the videos must be AT THE ROOT — no subdirectory
       sudo umount /mnt
       ```
+- [ ] **Prove the frame flow's SILENT SKIP against a really-sleeping Mini-serv.**
+      This is the one place the never-silent-green rule bends, so watch it bend
+      correctly rather than assume it: with that box asleep, the unit must exit
+      **0**, log that it is skipping and NOT waking it, and report the age of the
+      cached content. Then wake the box by hand (not by the panel — the panel must
+      never wake it) and confirm the next tick mirrors.
+      ```bash
+      sudo systemctl start wall-sync-frame.service; journalctl -u wall-sync-frame -b
+      systemctl list-timers wall-sync-frame.timer
+      ```
+- [ ] **Prove the frame flow's OTHER half: awake-and-refused is FATAL.** With
+      Mini-serv awake, put a wrong password in `cifs-frame.creds` for one run. The
+      unit must FAIL and say the box answered on 445 — if this comes out as a
+      silent skip, a wrong credential would be invisible forever.
 - [ ] **Run the first sync on demand and watch it** — this is the run that copies
       the whole library over 802.11 from a 2016 radio, so it is also the honest
       measurement of how long a re-image costs:
@@ -208,10 +234,13 @@ that could **not** touch is the cifs half, the Wi-Fi half, and library-scale dat
       file from the share, sync, and confirm it is gone from the panel and from
       `index.json`. This is the ruling's dangerous half; see it work rather than
       discover it later.
-- [ ] **Prove the empty-source refusal on the real share, once.** Point
-      `MEDIA_SHARE_UNC` at a share with no `Music/` (or an empty one), sync, and
-      confirm the run FAILS and the cache is untouched. If this guard is broken, one
-      bad mount erases the panel's library copy silently.
+- [ ] **Prove the empty-source refusal on a real share, once.** Point
+      `MEDIA_MUSIC_SHARE_UNC` at a share with no `Music/` (or an empty one), sync,
+      and confirm the run FAILS and the cache is untouched. If this guard is
+      broken, one bad mount erases the panel's library copy silently. Worth doing
+      on the frame side too: there the guard is the ONLY thing standing between an
+      empty share and a wiped cache, because the frame flow has no missing-subdir
+      case at all — its content is the mount root, which always exists.
 - [ ] **Then play it**: the shell must show the local library as a station and the
       frame mode must play a video. That is the end-to-end proof that this repo's
       manifests and OfficeWallNaglight's `/media/*` mapping agree — and it is the

@@ -33,9 +33,10 @@ Cockpit, and nothing that would make the panel precious.
 | `wall-wakeprep.{sh,service}` | EVERY BOOT: ACPI + USB wake enablement (it does not persist) |
 | `wall-sleep.sh` + `wall-sleep.service` + `wall-wake.service` | the D-W4 window; the two `.timer` files are **generated** by firstboot from `SLEEP_START`/`SLEEP_END` (systemd cannot interpolate env into `OnCalendar`) |
 | `wall-kiosk.sh` | `cage` + the app, with a restart loop and a visible failure screen |
-| `wall-sync.{sh,service}` | **the media pull (OI-15)** — mirror the library share's `Music/` + `FrameVideos/` into the panel's cache. Boot-once + every resume + on-demand; **no timer** |
+| `wall-sync.{sh,service}` | **the media pull (OI-15; TWO sources since OI-18)** — mirror the HOMEHUB music share and the Mini-serv frame-video share into the panel's cache. Boot-once + every resume + on-demand; **no timer on this unit** |
 | `wall-sync-resume.service` | **the resume hook (OI-16a)** — `WantedBy=suspend.target`, fires on every wake from the nightly suspend and `--no-block`-starts `wall-sync.service`, detached, so the wake is never delayed |
-| `wall-media-manifest.py` | the sync's post-step: emits the shell's `music/index.json` and `frame/playlist.json` into that cache |
+| `wall-sync-frame.{service,timer}` | **the frame flow's own cadence (OI-18)** — `wall-sync.sh --only frame`, every minute, per storage-map §4d. Same script, same guards; a different address, credential, shape and failure policy |
+| `wall-media-manifest.py` | the sync's post-step: emits the shell's `music/index.json` and `frame/playlist.json` into that cache (`--only <flow>` so one flow cannot rewrite the other's manifest) |
 | `netplan-wifi.yaml.template` | rendered to `/etc/netplan/60-wall-wifi.yaml` (0600) |
 | `WALL-BURN-IN.md` | everything only the real hardware can settle — **read it before drilling** |
 
@@ -92,38 +93,83 @@ Until those land, this variant is a **complete image with a missing payload** �
 which is the intended half-built state at this gate, and is stated as such rather
 than papered over.
 
-## The media pull (OI-15, ruled by the Owner 2026-07-29)
+## The media pull (OI-15, ruled by the Owner 2026-07-29; TWO sources since OI-18, ruled 2026-08-03)
 
-> The panel's media is a network share on the hub; the **panel pulls** — once
-> after boot and on demand — with **mirror semantics**; `/media/*` is then served
-> panel-locally by the shell's Electron host.
+> The panel's media lives on network shares; the **panel pulls** — once after
+> boot, on every resume, and on demand — with **mirror semantics**; `/media/*` is
+> then served panel-locally by the shell's Electron host.
+>
+> **OI-18 exit (b):** there are **two** sources, on **two** hosts, and the panel
+> mounts each with its **own** credential. Consolidating them behind one host was
+> rejected — it would re-open `HOMELAB_TOPOLOGY.md` decision 2, "the panel pulls
+> frame videos from Mini-serv directly".
 
-`wall-sync.sh` mounts `MEDIA_SHARE_UNC` read-only over cifs, `rsync -a --delete`s
-**only** the share's `Music/` and `FrameVideos/` subtrees into
-`WALL_MEDIA_CACHE/{music,frame}` (default `/var/cache/wall-media`), unmounts, and
-then regenerates the shell's two contracts inside that cache —
-`music/index.json` (`LocalLibraryProvider`'s manifest) and `frame/playlist.json`.
+| | music | frame videos |
+|---|---|---|
+| flow (storage-map §4d) | `sync-music` | `sync-frame-videos` |
+| host | **HOMEHUB** (the AWOW) | **Mini-serv** |
+| UNC knob | `MEDIA_MUSIC_SHARE_UNC` | `MEDIA_FRAME_SHARE_UNC` |
+| shape | the `Media` share, mirroring the **`Music/` subdir under the mount** (§3 rows 1-2) | a **dedicated** share, mirroring the **share root** — no subdir (§3b) |
+| cache leaf | `music` | `frame` |
+| manifest | `index.json` | `playlist.json` |
+| credential file | `/etc/wall-panel/cifs-music.creds` | `/etc/wall-panel/cifs-frame.creds` |
+| cadence | boot / resume / on demand | **every minute** (`wall-sync-frame.timer`) |
+| may the source sleep? | **no** — always-on | **yes**, by design |
+| mount refused | **fails the unit** — a real alert | 445 probed first: **no answer = silent skip**; answered-and-refused = **fails** |
 
-**The dedicated on-demand command — this is the whole interface:**
+`wall-sync.sh` mounts each UNC read-only over cifs with that flow's credentials,
+`rsync -a --delete`s that flow's source into `WALL_MEDIA_CACHE/{music,frame}`
+(default `/var/cache/wall-media`), unmounts, and regenerates **that flow's**
+contract inside the cache — `music/index.json` (`LocalLibraryProvider`'s
+manifest) or `frame/playlist.json`.
+
+**The dedicated on-demand command — unchanged, and it still means "everything":**
 
 ```bash
-sudo systemctl start wall-sync.service      # sync now; journalctl -u wall-sync for the log
+sudo systemctl start wall-sync.service      # BOTH flows; journalctl -u wall-sync
+journalctl -u wall-sync-frame               # the every-minute frame flow
 ```
 
 Things worth knowing before trusting it:
 
+- **The two mounts are not the same shape.** Music is reached *through* the
+  `Media` share and needs the `Music` subdirectory under the mount; the frame
+  share's content is at its **root**. Treat them uniformly and the frame mirror
+  looks one directory too deep. That map is fixed in `flow_spec()` and is
+  **deliberately not a knob** — a knob there would let a typo silently widen the
+  mirror onto a 2016 laptop's 256 GB disk. The *addresses* and *credentials* are
+  knobs; the subtree/leaf/manifest/policy map is not.
+- **The two sources have different FAILURE POLICIES**, and that is a ruling
+  (storage-map §4d, A0/A10), not a setting. HOMEHUB is always-on, so a refused
+  music mount is an alert. Mini-serv may sleep and is never woken, so an
+  unreachable frame share is skipped. **The skip is gated on a reachability
+  probe, not on the mount's return code** — `mount.cifs` returns the same rc for
+  "asleep" and "wrong password", so a box that *answers* on 445 and then refuses
+  the mount is a wrong share or a wrong credential and it is **fatal**.
+- **A silent skip still reports the consequence.** Every successful flow stamps
+  its finish time at the cache root; every skip logs how old the cached content
+  is, at WARNING level past `WALL_FRAME_STALE_WARN_HOURS` (default 24). It never
+  escalates to a failed unit however old the content gets — "Mini-serv has been
+  off for a week" is an allowed state, and at what age it stops being allowed is
+  a decision nobody has made.
+- **Configuration defects are fatal for both flows.** An unset or placeholder
+  UNC, or a missing/unreadable credentials file, is not a sleeping box; the frame
+  flow's licence to be quiet does not extend to "nobody filled this in".
 - **Mirror semantics are the ruling.** Content removed from the LAN source
   disappears from the panel on the next sync. `--delete` is irreversible from the
   panel's side — which is fine, because the cache is disposable and the library is
   the copy that matters.
 - **It refuses to mirror an empty source over a populated cache** (the backup
-  service's ingest step learned this the hard way): an empty *or absent* `Music/`
-  or `FrameVideos/` fails the run loudly rather than erasing the cache.
+  service's ingest step learned this the hard way): an empty *or absent* source
+  fails the run loudly rather than erasing the cache.
   `WALL_SYNC_ALLOW_EMPTY=true` is the deliberate override.
-- **A freshly imaged panel shows `wall-sync.service` FAILED**, because
-  `MEDIA_SHARE_UNC` ships as a placeholder. That is intentional: an empty wall
-  with a green unit would be a lie.
-- **No timer, and a resume DOES sync (OI-16a, the Owner, 2026-07-29).** The
+- **A freshly imaged panel shows `wall-sync.service` FAILED**, because both UNCs
+  ship as placeholders. That is intentional: an empty wall with a green unit
+  would be a lie.
+- **One flow's failure does not cancel the other.** Each is attempted, each gets
+  its own verdict, and the exit status is non-zero if any failed — so a HOMEHUB
+  outage cannot also stop the frame videos refreshing in the same run.
+- **No timer on `wall-sync.service`, and a resume DOES sync (OI-16a, the Owner, 2026-07-29).** The
   ruling's "once after boot" went stale in practice because a resume from the
   D-W4 window is *not* a boot — with `SLEEP_MODE=suspend` the panel can run for
   weeks without booting. The Owner chose option (a): `wall-sync-resume.service`

@@ -198,18 +198,42 @@ autoinstall:
     # bug. Found 2026-08-03 by the wall image, which cannot degrade that way.
     # Mount the seed by label as a fallback.
     #
-    # STILL NON-FATAL, deliberately, unlike the wall's copy of this: a hub with
-    # no payload has a documented degraded mode (firstboot.sh step 3 pulls at
-    # compose-up). Say so loudly rather than halting an install that can recover.
+    # NOT FINDING A PAYLOAD IS STILL NON-FATAL, deliberately, unlike the wall's
+    # copy of this: a hub with no payload has a documented degraded mode
+    # (firstboot.sh step 3 pulls at compose-up). Say so loudly rather than
+    # halting an install that can recover.
+    #
+    # FINDING ONE AND FAILING TO COPY IT IS FATAL, and that is NOT the same
+    # thing. Both branches used to read `cp -a … && echo …; exit 0` — and the
+    # `exit 0` is a SEPARATE command after the `;`, so it ran whether or not the
+    # copy worked. One I/O error partway through ~470 MB of baked images left a
+    # HALF-COPIED /target/opt/homehub, reported success, and handed 4b a site/
+    # holding only the files that made it across before the error; firstboot
+    # then ran on whatever else survived. "No payload" is a recoverable state
+    # the box knows how to describe; "some of the payload" is not a state at
+    # all. Refuse it, and let Subiquity halt where the operator can see why.
+    # (Found by an adversarial review 2026-08-03, alongside OI-19's second head.)
     - >-
-      bash -c 'for d in /cdrom /media /media/* /run/media/*; do
-      if [ -d "$d/deploy-payload" ]; then cp -a "$d/deploy-payload/." /target/opt/homehub/ && echo "homehub: payload copied from $d/deploy-payload"; exit 0; fi;
+      bash -c 'fail_partial() {
+      echo "homehub: FATAL - $1";
+      echo "homehub: /target/opt/homehub now holds a PARTIAL copy of the deploy unit. Late-command 4b would install only the site files that made it across, and firstboot would run on whatever else survived.";
+      echo "homehub: a truncated deploy unit is worse than no deploy unit - it looks installed. Refusing to continue.";
+      exit 1; };
+      for d in /cdrom /media /media/* /run/media/*; do
+      [ -d "$d/deploy-payload" ] || continue;
+      cp -a "$d/deploy-payload/." /target/opt/homehub/ || fail_partial "found $d/deploy-payload but cp -a FAILED partway";
+      echo "homehub: payload copied from $d/deploy-payload";
+      exit 0;
       done;
       dev=$(blkid -L CIDATA 2>/dev/null || true);
       if [ -n "$dev" ]; then m=$(mktemp -d);
       if mount -o ro "$dev" "$m" 2>/dev/null; then
-      if [ -d "$m/deploy-payload" ]; then cp -a "$m/deploy-payload/." /target/opt/homehub/ && echo "homehub: payload copied from the CIDATA seed at $dev"; umount "$m"; exit 0; fi;
-      umount "$m"; fi; fi;
+      if [ -d "$m/deploy-payload" ]; then
+      cp -a "$m/deploy-payload/." /target/opt/homehub/ || { umount "$m" || true; fail_partial "found deploy-payload on the CIDATA seed at $dev but cp -a FAILED partway"; };
+      umount "$m" || { echo "homehub: FATAL - the payload copied from the CIDATA seed at $dev but the seed would NOT unmount."; echo "homehub: the install is about to reboot with the boot medium still busy, and nothing else here can tell whether the copy was flushed. Refusing to guess."; exit 1; };
+      echo "homehub: payload copied from the CIDATA seed at $dev";
+      exit 0; fi;
+      umount "$m" || true; fi; fi;
       echo "homehub: WARNING - no deploy-payload found under /cdrom, /media, /run/media/* or on the CIDATA volume.";
       echo "homehub: first boot will PULL every container image from its registry (needs internet), and naglight:local has no registry home.";
       exit 0'
@@ -255,12 +279,26 @@ autoinstall:
     # silence" doctrine, applied to a headless box where the only screen is the
     # journal.
     #
-    # Per-file absence is LOUD BUT NOT FATAL, on purpose: Build-VentoyStick.ps1
-    # marks cifs.creds, samba-users.creds and drive-identity.conf optional
-    # (Required=$false), so refusing the install over one of them would refuse
-    # legitimate households. Whether a production build missing .env
-    # specifically should halt is an OPEN RATIFICATION, not a decision made
-    # here (docs/status.md OI-19).
+    # AN ABSENT `optional` FILE IS LOUD BUT NOT FATAL, on purpose:
+    # Build-VentoyStick.ps1 marks cifs.creds, samba-users.creds and
+    # drive-identity.conf optional (Required=$false), so refusing the install
+    # over one of them would refuse legitimate households.
+    #
+    # AN ABSENT `required` FILE NOW HALTS THE INSTALL (rc=1). It used to only
+    # print and `continue`, and that was OI-19 wearing a second hat: a payload
+    # whose site/ directory EXISTS but is empty of everything that matters
+    # sailed past the missing-directory refusal above, logged six MISSING lines
+    # nobody reads on a headless box, touched .site-present so firstboot's own
+    # "broken production stick" branch stayed quiet, and exited 0. The outcome
+    # was byte-for-byte the outcome OI-19 was raised about — a production hub on
+    # .env.example placeholders believing it is production — reached by a
+    # different road. The directory's existence was never the property worth
+    # checking; the FILES are.
+    # NOTE FOR RATIFICATION (docs/status.md OI-19/A10): this closes that open
+    # ruling in the REFUSE direction. It is the same call the missing-directory
+    # branch above already makes, and the same call the wall image makes; it is
+    # recorded rather than assumed, and the Owner can reverse it by moving a
+    # file from `required` to `optional` in the table below.
     #
     # site/config.json IS NOT IN THIS TABLE, and that is deliberate. It is the
     # kiosk shell's runtime config and its destination is a WEB ROOT
@@ -303,7 +341,12 @@ autoinstall:
       "drive-identity.conf:/target/etc/homehub-samba/drive-identity.conf:optional"; do
       f=${spec%%:*}; rest=${spec#*:}; d=${rest%:*}; kind=${rest##*:};
       if [ ! -f "$S/$f" ]; then
-      echo "homehub: $kind site file MISSING - site/$f is not in the payload, so nothing was installed at $d";
+      if [ "$kind" = required ]; then
+      echo "homehub: FATAL - required site file MISSING - site/$f is not in the payload, so nothing was installed at $d";
+      rc=1;
+      else
+      echo "homehub: optional site file MISSING - site/$f is not in the payload, so nothing was installed at $d";
+      fi;
       continue;
       fi;
       if install -m600 -o root -g root "$S/$f" "$d"; then
@@ -315,6 +358,10 @@ autoinstall:
       fi;
       done;
       touch /target/etc/homehub-samba/.site-present;
+      if [ "$rc" -ne 0 ]; then
+      echo "homehub: REFUSING to finish a PRODUCTION install whose site/ payload is incomplete - the box would come up on .env.example placeholders while believing it is production, and nothing on a headless machine would say so.";
+      echo "homehub: the site/ directory existed, so the check above passed; what is missing are the files named FATAL over it.";
+      fi;
       exit $rc'
 
     # ---- 5. Install + enable the first-boot unit ------------------------------

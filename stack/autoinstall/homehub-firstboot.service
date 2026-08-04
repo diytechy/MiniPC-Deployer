@@ -1,7 +1,14 @@
 # First-boot oneshot: bring the whole stack up with zero manual steps (WI-4.7).
-# Runs AFTER docker is up and the network is online, exactly once — it stamps a
-# /opt/homehub/.provisioned marker and becomes a no-op on later boots (the
-# script itself is idempotent regardless, so re-enabling is safe).
+# Runs AFTER docker is up and the network is online.
+#
+# IT RUNS ON EVERY BOOT, and this comment used to claim otherwise ("becomes a
+# no-op on later boots"). `RemainAfterExit=yes` only prevents a second start
+# within the SAME boot; there is no ConditionPathExists= here, and the
+# /opt/homehub/.provisioned stamp the script writes is read by nothing. That is
+# deliberate — the script is idempotent and re-running it is the documented
+# repair — but it means any step asking "has this already happened?" must ask it
+# of an INPUT, never of its own output. Getting that backwards is how step 3e's
+# collision warning came to fire on every reboot (2026-08-03).
 [Unit]
 Description=AWOW always-on core first-boot bring-up (compose + Technitium provisioning)
 After=network-online.target docker.service

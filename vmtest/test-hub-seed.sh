@@ -285,10 +285,24 @@ else
     mkdir -p "$T/opt/homehub/site"
     cp "$SITE/backup.env" "$SITE/smb.conf.fragment" "$SITE/library-mounts.fstab" "$T/opt/homehub/site/"
     rc=$(run_4b)
-    if [ "$rc" -eq 0 ] && grep -q "required site file MISSING - site/.env" "$WORK/lc.txt"; then
-        ok "an absent REQUIRED site file is named LOUDLY but does not halt — the documented, UNRATIFIED line (OI-19)"
+    if [ "$rc" -ne 0 ] && grep -q "required site file MISSING - site/.env" "$WORK/lc.txt"; then
+        ok "an absent REQUIRED site file HALTS the production install (OI-19's second head: a site/ that exists but is empty of what matters)"
     else
         bad "required file handling" "rc=$rc $(head -n1 "$WORK/lc.txt")"
+    fi
+
+    # The finding underneath the finding: a site/ holding ONLY the mandatory
+    # user-data.filled used to build, pass 4b's directory check, log six MISSING
+    # lines and exit 0 — the OI-19 outcome by a different road.
+    fake_target production
+    mkdir -p "$T/opt/homehub/site"
+    make_site_filled
+    cp "$SITE/user-data.filled" "$T/opt/homehub/site/user-data.filled"
+    rc=$(run_4b)
+    if [ "$rc" -ne 0 ]; then
+        ok "a site/ carrying ONLY user-data.filled REFUSES (the directory existing was never the property worth checking)"
+    else
+        bad "empty-but-present site/" "rc=$rc — it exited 0 with every required file missing"
     fi
 fi
 

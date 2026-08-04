@@ -11,7 +11,8 @@
 #      docker load is idempotent. If no payload is present, fall back LOUDLY to
 #      the old pull-at-compose-up behaviour.
 #   4. `docker compose up -d` — starts all services (images already loaded in step
-#      3; any not baked are pulled here) with restart:unless-stopped.
+#      3; any not baked are pulled here) with restart:unless-stopped, then
+#      (4b) assert caddy can actually READ the kiosk config it is about to serve.
 #   5. Wait for Technitium to be healthy, then run provision-technitium.sh
 #      (zero-touch DNS: zone, split-horizon records, forwarders, blocklists);
 #      then provision-actual.sh (A9d: set the minted Actual server password
@@ -20,6 +21,12 @@
 #   7. Stamp .provisioned.
 #
 # Re-running is safe: compose is declarative, provisioning is idempotent.
+# AND IT DOES RE-RUN. `RemainAfterExit=yes` only stops a second start within ONE
+# boot; the unit is WantedBy=multi-user.target, so it runs again after every
+# reboot, and the runbook tells the operator to re-run it by hand. /opt/homehub/
+# .provisioned is a STAMP, not a guard — nothing reads it. Any step that asks
+# "was this already here?" must therefore ask it of an input, never of its own
+# output, or the answer is yes from the second boot onward (step 3e, 2026-08-03).
 set -euo pipefail
 
 STACK_DIR="/opt/homehub/stack"
@@ -205,6 +212,10 @@ bash "$STACK_DIR/provision/provision-compose-overrides.sh" || \
 # private): the site then serves 404 at / while /api/* works, which is the
 # documented half-built state. It is NOT fine for the A19 panel gate, so say so.
 WALL_SITE_TARBALL=""
+# Does the ARCHIVE carry a config.json of its own? Answered from the archive's
+# LISTING, before anything is extracted — see step 3e, which is where the answer
+# is used and where the reason it must be asked here is written out.
+WALL_TARBALL_SHIPS_CONFIG=no
 shopt -s nullglob
 for cand in /opt/homehub/wall-site "$STACK_DIR/wall-site" /cdrom/deploy-payload/wall-site; do
     if [ -z "$WALL_SITE_TARBALL" ]; then
@@ -213,6 +224,23 @@ for cand in /opt/homehub/wall-site "$STACK_DIR/wall-site" /cdrom/deploy-payload/
 done
 shopt -u nullglob
 if [ -n "$WALL_SITE_TARBALL" ]; then
+    # NOT `tar -tzf … | grep -q`. This script runs under `set -o pipefail`
+    # (line 23): `grep -q` exits at the FIRST match, `tar` then dies of SIGPIPE
+    # (141), and the pipeline's status is that failure — so the pipeline reports
+    # FAILURE exactly when the answer is YES, and `set -e` kills the script on
+    # the good path. This repo has been bitten by that shape before. Write the
+    # listing to a file, then grep the file: one command, no pipe, no ambiguity.
+    # The member we care about is `<top>/config.json`, because the untar below
+    # passes --strip-components=1 and only that depth lands on wall-shell/.
+    _wall_listing="$(mktemp)"
+    if tar -tzf "$WALL_SITE_TARBALL" > "$_wall_listing" 2>/dev/null; then
+        if grep -Eq '^(\./)?[^/]+/config\.json$' "$_wall_listing"; then
+            WALL_TARBALL_SHIPS_CONFIG=yes
+        fi
+    else
+        log "WARN: could not list $WALL_SITE_TARBALL — cannot tell whether it ships a config.json of its own"
+    fi
+    rm -f "$_wall_listing"
     # --strip-components=1 drops the archive's leading site/ (packaging.md §4).
     log "unpacking the wall kiosk site: $(basename "$WALL_SITE_TARBALL") -> $STACK_DIR/wall-shell/"
     install -d -m 0755 "$STACK_DIR/wall-shell"
@@ -271,9 +299,23 @@ fi
 # detail. If caddy ever gains a `user:` the file becomes unreadable and the
 # panel degrades to defaults SILENTLY — which is exactly the failure this
 # comment exists to make findable.
+#
+# THE COLLISION IS DETECTED FROM THE ARCHIVE, NOT FROM THE DESTINATION. This
+# block used to ask `[ -f "$STACK_DIR/wall-shell/config.json" ]` AFTER the
+# untar, which answers a different question than the one it claimed to: this
+# service has no marker guard and no ConditionPath* (homehub-firstboot.service
+# is a RemainAfterExit oneshot, which only stops it re-running within ONE boot —
+# the unit is WantedBy=multi-user.target and starts again after every reboot,
+# and the script is documented as safe to re-run by hand). On the second run the
+# config.json sitting there is the one THIS STEP installed on the first run, so
+# the test was true every time and the NOTE below cried "the tarball shipped its
+# own config.json" on every reboot of every hub, forever, whether or not it ever
+# had. A warning that is always on is a warning nobody reads — which is how the
+# real collision, the one this exists to catch, would have gone past unnoticed.
+# Step 3d now records the answer from `tar -tzf` before extracting.
 WALL_SITE_CONFIG="/opt/homehub/site/config.json"
 if [ -f "$WALL_SITE_CONFIG" ]; then
-    if [ -f "$STACK_DIR/wall-shell/config.json" ]; then
+    if [ "$WALL_TARBALL_SHIPS_CONFIG" = yes ]; then
         log "NOTE: the site tarball shipped its own config.json — replacing it with the"
         log "  materialised one. If that was a real file rather than a placeholder, the"
         log "  two are now competing: check OfficeWallNaglight's release contents."
@@ -298,6 +340,46 @@ fi
 # Q10.2) means it must have been built/staged first.
 log "docker compose up -d…"
 docker compose up -d
+
+# ── 4b. CAN CADDY ACTUALLY READ THE KIOSK CONFIG? (OI-20) ────────────────────
+# Installing a 0600 root-owned file into a bind mount is not the same as the
+# server being able to open it, and NOTHING here checked the difference. The
+# caddy healthcheck probes the admin API on :2019, which is up whenever the
+# process is — so an unreadable config.json leaves caddy `healthy`, the site
+# answers 403/404 for /config.json, and `loadConfig` NEVER THROWS: the panel
+# paints on js/config.js DEFAULTS with no FEED_TOKEN, no heartbeat and no music
+# credentials, and nothing anywhere says so. Exactly the failure the 0600 ruling
+# (OI-20) is owed a decision about, and the one step 3e's comment predicts.
+#
+# It reads today because the pinned caddy:2.11.4-alpine declares no USER,
+# docker-compose.yml sets no `user:` for caddy, and the daemon has no
+# userns-remap — so the container is uid 0. Any ONE of those changing breaks it
+# silently. `:ro` and `read_only:` would NOT: both restrict WRITES, and this is
+# a read. So assert the read itself, and do it AS THE CONTAINER: `docker exec`
+# inherits the service's user, so this fails precisely when caddy would fail.
+#
+# Only asserted when the PRODUCTION source exists. A sim/vmtest hub legitimately
+# has no site/config.json; step 3e's NOTICE already covers that case.
+KIOSK_CONFIG_UNREADABLE=0
+if [ -f "$WALL_SITE_CONFIG" ]; then
+    for _i in $(seq 1 30); do
+        [ "$(docker inspect -f '{{.State.Running}}' caddy 2>/dev/null || true)" = "true" ] && break
+        sleep 2
+    done
+    if docker exec caddy sh -c 'head -c 1 /srv/wall-shell/config.json > /dev/null 2>&1'; then
+        log "kiosk config readable INSIDE the caddy container ($(docker exec caddy id -u 2>/dev/null || echo '?') = the uid it serves as)"
+    else
+        KIOSK_CONFIG_UNREADABLE=1
+        log "ERROR: caddy CANNOT read /srv/wall-shell/config.json."
+        log "  The file is installed 0600 root:root and the container is running as"
+        log "  uid $(docker exec caddy id -u 2>/dev/null || echo '?') — a 'user:' in docker-compose.yml, a USER in a newer caddy"
+        log "  image, or daemon userns-remap will each do this. The kiosk site will"
+        log "  serve 403/404 for /config.json, loadConfig will NOT throw, and the panel"
+        log "  will paint on js/config.js DEFAULTS: no FEED_TOKEN (its feed posts are"
+        log "  unattributed), no heartbeat, no music credentials. Fix the ownership/mode"
+        log "  to match the uid above, or give caddy back uid 0. See OI-20."
+    fi
+fi
 
 # ── 5. Technitium zero-touch provisioning ────────────────────────────────────
 log "waiting for Technitium API on :5380…"
@@ -392,4 +474,15 @@ fi
 
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
+# A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO
+# EXIT: everything else still ran (the stack is up, DNS is provisioned, the
+# shares are mounted), but `systemctl status homehub-firstboot` must be RED and
+# `systemctl is-failed` must say so. On a headless box the unit's state is the
+# only surface a defect can appear on that is not a line in a scrolling journal.
+if [ "$KIOSK_CONFIG_UNREADABLE" -ne 0 ]; then
+    log "FATAL: bring-up finished, but the wall panel WILL run on js/config.js defaults"
+    log "  (see the step 4b ERROR above). Exiting non-zero so this unit reports FAILED"
+    log "  rather than letting a silently-degraded panel look like a clean first boot."
+    exit 1
+fi
 log "bring-up complete. Verify with: bash $STACK_DIR/provision/healthcheck.sh"

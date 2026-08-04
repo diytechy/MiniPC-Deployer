@@ -114,6 +114,16 @@ services:
     restart: unless-stopped
     healthcheck:
       # Caddy admin API on :2019 is always up when the process is; cheap liveness.
+      # LIVENESS ONLY — it says nothing about what this container can SERVE, and
+      # in particular nothing about whether it can READ /srv/wall-shell/config.json
+      # (installed 0600 root:root; readable only because there is no `user:` here,
+      # no USER in the pinned image and no daemon userns-remap). Add any of those
+      # three and caddy stays `healthy` while the panel degrades to js/config.js
+      # defaults in silence — `loadConfig` never throws. Note `:ro` above is NOT
+      # the risk: it restricts writes, and this is a read. The readability
+      # assertion lives in firstboot.sh step 4b, where the production source is
+      # known to exist; a sim hub has no config.json and must stay healthy without
+      # one, which is why it cannot be a condition in this healthcheck. See OI-20.
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
       interval: 30s
       timeout: 5s

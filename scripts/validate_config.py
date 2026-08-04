@@ -102,8 +102,10 @@ def caddy_env_passed(compose_text):
 # wall.env.example; anything else (ENV_FILE, MARKER, loop variables) is a local
 # and is ignored. The namespace rule is what keeps this check free of false
 # positives as the scripts grow — add a namespace here if a genuinely new family
-# of knobs appears. `MEDIA_` was added by OI-15 (the panel's media pull:
-# MEDIA_SHARE_UNC, the cifs credential knobs, and the bench override).
+# of knobs appears. `MEDIA_` was added by OI-15 (the panel's media pull) and
+# OI-18 doubled its membership: MEDIA_{MUSIC,FRAME}_SHARE_UNC,
+# MEDIA_{MUSIC,FRAME}_CIFS_CREDENTIALS, MEDIA_{MUSIC,FRAME}_SOURCE_OVERRIDE and
+# the shared MEDIA_CIFS_EXTRA.
 WALL_KNOB_NAMESPACES = (
     "WALL_",
     "WIFI_",
@@ -274,6 +276,15 @@ def main():
         # OI-16a — the resume hook (WantedBy=suspend.target): without it a panel
         # on SLEEP_MODE=suspend syncs only at boot, which in practice is ~never.
         "autoinstall/wall/wall-sync-resume.service",
+        # OI-18 — the frame flow's own cadence. storage-map §4d puts the
+        # frame-video share on a ONE-MINUTE accessibility-checked timer while the
+        # music pull stays boot/resume/on-demand, so the two flows cannot share a
+        # unit. Without the .timer the frame videos refresh only at boot, and
+        # nothing on the panel would say so — the flow is designed to be quiet
+        # when its source is asleep, which is exactly what "never runs" looks
+        # like from the journal.
+        "autoinstall/wall/wall-sync-frame.service",
+        "autoinstall/wall/wall-sync-frame.timer",
         # Read by wall-firstboot.sh rather than by user-data, but just as fatal
         # if absent — a panel with no netplan has no network at all (no RJ45).
         "autoinstall/wall/netplan-wifi.yaml.template",

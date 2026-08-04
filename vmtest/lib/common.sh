@@ -1586,18 +1586,24 @@ render_wall_seed_tree() {
 # then at /etc/wall-panel/wall.env, 0600, via late-command 4a); the second was
 # already consumed above.
 #
-# `cifs.creds` is staged IF PRESENT and is deliberately not required: the
-# materialiser emits it for the hub only today, even though the ruling of
-# 2026-08-01 gave BOTH machines the same read-only `share` account and the
-# panel's MEDIA_CIFS_CREDENTIALS points straight at /etc/wall-panel/cifs.creds.
-# Until that is fixed on the Personal side, a production panel mounts nothing
-# and `wall-sync.service` fails loudly — which is the honest state, but it is a
-# gap, so say so here rather than let a silent absence read as "not needed".
+# TWO CREDENTIAL FILES since OI-18 exit (b) (the Owner, 2026-08-03): the panel
+# has two media sources on two hosts and mounts each with its own credential —
+#   cifs-music.creds  a HOMEHUB Samba identity  -> MEDIA_MUSIC_CIFS_CREDENTIALS
+#   cifs-frame.creds  the Mini-serv `share` acct -> MEDIA_FRAME_CIFS_CREDENTIALS
+# Both are staged IF PRESENT and reported INDIVIDUALLY when absent, because
+# "one of two" is a panel with half its media and the half matters: no music is a
+# dead music player, no frame video is a blank wall.
+#
+# THE RETIRED SINGLE `cifs.creds` IS REFUSED RATHER THAN IGNORED. Before OI-18 the
+# materialiser wrote one file of that name for the wall image. A stale out\wall\
+# from that era would stage nothing under the new names, log two absences, and
+# produce a panel with no media at all — the failure looking like "Personal never
+# emitted anything" rather than "you are baking a stale directory". Name it.
 stage_wall_site_files() {
     local site_dir="$1" payload_dir="$2"
     local site_out="$payload_dir/site" staged=0 f
     mkdir -p "$site_out"
-    for f in wall.env cifs.creds; do
+    for f in wall.env cifs-music.creds cifs-frame.creds; do
         if [ -f "$site_dir/$f" ]; then
             install -m 600 "$site_dir/$f" "$site_out/$f"
             log "  site/ += $f"
@@ -1609,11 +1615,22 @@ stage_wall_site_files() {
             "wall.env.example, i.e. REPLACE_WITH placeholders for the Wi-Fi SSID/PSK and the" \
             "kiosk host, and come up with no network and no origin. Re-run" \
             "Materialize-Deploy.ps1 -Image wall."
-    [ -f "$site_out/cifs.creds" ] || \
-        log "NOTE: no cifs.creds in $site_dir — the panel will not be able to mount" \
-            "MEDIA_SHARE_UNC, so wall-sync.service fails and there is no music or frame" \
-            "video. Materialize-Deploy.ps1 emits cifs.creds for the hub image only; the" \
-            "2026-08-01 ruling gave both machines the same read-only 'share' account."
+    if [ -f "$site_dir/cifs.creds" ]; then
+        die "$site_dir carries a single 'cifs.creds' — that is the PRE-OI-18 shape, and it is" \
+            "a stale materialisation, not a valid one. The panel now mounts TWO sources with" \
+            "TWO credentials (cifs-music.creds for HOMEHUB, cifs-frame.creds for Mini-serv)" \
+            "and one file cannot authenticate on both hosts. Re-run:" \
+            "pwsh Materialize-Deploy.ps1 -Image wall   (Personal\\homelab\\deploy)"
+    fi
+    [ -f "$site_out/cifs-music.creds" ] || \
+        log "NOTE: no cifs-music.creds in $site_dir — the panel cannot mount its MUSIC share" \
+            "(HOMEHUB), so wall-sync FAILS on every boot and resume and the panel's PRIMARY" \
+            "music source is empty. It comes from the household store key" \
+            "'PanelMusicCifsCredential'."
+    [ -f "$site_out/cifs-frame.creds" ] || \
+        log "NOTE: no cifs-frame.creds in $site_dir — the panel cannot mount its FRAME VIDEO" \
+            "share (Mini-serv), so the wall shows no picture-frame content. It comes from the" \
+            "household store key 'CifsCredential' (the 'share' account, A11(v)/A10(v))."
     log "PRODUCTION build: $staged wall config file(s) staged; sim wall.env generation SKIPPED"
 }
 
@@ -1658,12 +1675,22 @@ render_sim_wall_env() {
     set_env_key "$env_out" SLEEP_RTC_WAKE "false"
 
     # MEDIA: sim builds skip Samba (no smb.conf.fragment), so there is nothing
-    # to mount. Left obviously-invalid rather than plausible: wall-sync.service
-    # will FAIL loudly at boot, which is the honest state — a green sync unit
-    # with no media would be a lie (and is exactly what the panel's own docs
-    # promise). Frame video and the local music library are OUT OF SCOPE for
-    # the A19 gate; that is a stated delta, not a failure.
-    set_env_key "$env_out" MEDIA_SHARE_UNC "//vmtest-no-samba.invalid/library"
+    # to mount. BOTH sources are left obviously-invalid rather than plausible:
+    # wall-sync.service will FAIL loudly at boot, which is the honest state — a
+    # green sync unit with no media would be a lie (and is exactly what the
+    # panel's own docs promise). Frame video and the local music library are OUT
+    # OF SCOPE for the A19 gate; that is a stated delta, not a failure.
+    #
+    # BOTH, and named for their real hosts (OI-18 exit (b), 2026-08-03): the
+    # panel mounts two shares on two machines, and a sim env that filled only one
+    # would leave the other at its REPLACE_WITH placeholder — which fails with a
+    # DIFFERENT message ("still the shipped placeholder") and would have read, in
+    # a gate journal, as the sim renderer having missed a key.
+    #
+    # `.invalid` is reserved by RFC 6761 and can never resolve, so neither of
+    # these can accidentally reach a real box on someone's LAN.
+    set_env_key "$env_out" MEDIA_MUSIC_SHARE_UNC "//vmtest-no-samba.invalid/Media"
+    set_env_key "$env_out" MEDIA_FRAME_SHARE_UNC "//vmtest-no-miniserv.invalid/PictureFrameVideos"
 
     # THE KIOSK COMMAND. `--disable-gpu` is the sim delta: Hyper-V's hyperv_drm
     # exposes /dev/dri/card1 with NO renderD* node, so hardware GL has nothing

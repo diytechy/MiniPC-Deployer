@@ -260,11 +260,39 @@ autoinstall:
     # produces 0777 — the file carries the Wi-Fi PSK. The payload copy is
     # tightened for the same reason.
     - curtin in-target --target=/target -- bash -c '[ -f /opt/wall-panel/site/wall.env ] && { install -d -m 0755 /etc/wall-panel && install -m 0600 /opt/wall-panel/site/wall.env /etc/wall-panel/wall.env && chmod 0600 /opt/wall-panel/site/wall.env; } || true'
-    # cifs.creds, when a production build staged one: MEDIA_CIFS_CREDENTIALS
-    # defaults to exactly this path, and wall-sync.sh mounts the media share
-    # with it. Absent, the sync fails loudly at boot — which is intended, not a
-    # silent degrade (a wall with no music and a green unit would be a lie).
-    - curtin in-target --target=/target -- bash -c '[ -f /opt/wall-panel/site/cifs.creds ] && { install -d -m 0755 /etc/wall-panel && install -m 0600 /opt/wall-panel/site/cifs.creds /etc/wall-panel/cifs.creds && chmod 0600 /opt/wall-panel/site/cifs.creds; } || true'
+    # TWO credential files, when a production build staged them (OI-18 exit (b),
+    # ruled by the Owner 2026-08-03). The panel has TWO media sources on TWO
+    # hosts and mounts each with its OWN credential:
+    #   cifs-music.creds -> MEDIA_MUSIC_CIFS_CREDENTIALS, a HOMEHUB Samba identity
+    #   cifs-frame.creds -> MEDIA_FRAME_CIFS_CREDENTIALS, the Mini-serv `share`
+    #                       account (A11(v)/A10(v))
+    # Both wall.env defaults point at exactly these paths. Absent, wall-sync
+    # fails loudly — which is intended, not a silent degrade (a wall with no
+    # music and a green unit would be a lie); note that this is a CONFIGURATION
+    # defect and is fatal for BOTH flows, unlike the frame flow's designed
+    # "Mini-serv is asleep" skip.
+    #
+    # `install -m 0600 -o root -g root` and not `cp`: the payload copy's mode and
+    # ownership come from whatever filesystem the ISO was staged on, and a build
+    # run under WSL on /mnt/c produces 0777. The payload copies are tightened for
+    # the same reason. Loud per file — "one of two installed" is a panel with
+    # half its media and is worth a journal line saying which half.
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      install -d -m 0755 /etc/wall-panel;
+      n=0;
+      for f in cifs-music.creds cifs-frame.creds; do
+      s=/opt/wall-panel/site/$f;
+      if [ -f "$s" ]; then
+      install -m 0600 -o root -g root "$s" "/etc/wall-panel/$f";
+      chmod 0600 "$s";
+      n=$((n + 1));
+      echo "wall: installed /etc/wall-panel/$f (0600 root:root)";
+      else
+      echo "wall: NO site/$f - that media source cannot be mounted and wall-sync will FAIL loudly until it is placed by hand";
+      fi;
+      done;
+      echo "wall: $n of 2 cifs credential file(s) installed"'
 
     # ---- 4. Seed wall.env from the example if not pre-filled ------------------
     # Root-only: it carries the Wi-Fi PSK and (if enabled) music credentials.
@@ -277,11 +305,15 @@ autoinstall:
     #                    by firstboot from SLEEP_START/SLEEP_END (systemd cannot
     #                    interpolate an env var into OnCalendar).
     # wall-sync        — ONCE AFTER BOOT, ON EVERY RESUME, and on demand over
-    #                    SSH: mirror the library share's Music/ + FrameVideos/
-    #                    into the panel's media cache (OI-15). No timer, by the
-    #                    ruling. The resume trigger is wall-sync-resume.service
-    #                    (OI-16a): the panel suspends nightly and a resume is not
-    #                    a boot, so boot-only would go weeks stale.
+    #                    SSH: mirror BOTH media shares into the panel's cache
+    #                    (OI-15; two sources since OI-18). No timer on THIS unit,
+    #                    by the ruling. The resume trigger is
+    #                    wall-sync-resume.service (OI-16a): the panel suspends
+    #                    nightly and a resume is not a boot, so boot-only would go
+    #                    weeks stale.
+    # wall-sync-frame  — EVERY MINUTE (a .timer): the frame flow only, because
+    #                    storage-map §4d gives it that cadence and the music flow
+    #                    a different one. Same script, `--only frame`.
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.service /target/etc/systemd/system/wall-firstboot.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh /target/usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-firstboot.sh
@@ -296,14 +328,21 @@ autoinstall:
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sleep.sh
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-kiosk.sh /target/usr/local/bin/wall-kiosk.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/bin/wall-kiosk.sh
-    # wall-sync — the media pull (OI-15). Boot-once + on-demand oneshot; NO timer,
-    # by the ruling. The manifest generator is installed NEXT TO the script because
-    # wall-sync.sh looks for it there first (and in the payload dir as a fallback).
+    # wall-sync — the media pull (OI-15). Boot-once + on-demand oneshot; NO timer
+    # on this unit, by the ruling. The manifest generator is installed NEXT TO the
+    # script because wall-sync.sh looks for it there first (and in the payload dir
+    # as a fallback).
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync.service /target/etc/systemd/system/wall-sync.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync.sh /target/usr/local/sbin/wall-sync.sh
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-media-manifest.py /target/usr/local/sbin/wall-media-manifest.py
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sync.sh /usr/local/sbin/wall-media-manifest.py
     - curtin in-target --target=/target -- systemctl enable wall-sync.service
+    # wall-sync-frame — the frame flow's every-minute cadence (OI-18 exit (b),
+    # storage-map §4d). Only the TIMER is enabled: nothing should start the
+    # service at boot, because wall-sync.service already mirrors both flows there.
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-frame.service /target/etc/systemd/system/wall-sync-frame.service
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-frame.timer /target/etc/systemd/system/wall-sync-frame.timer
+    - curtin in-target --target=/target -- systemctl enable wall-sync-frame.timer
     # wall-sync-resume — the OI-16a hook: WantedBy=suspend.target, so every wake
     # from the D-W4 nightly suspend re-triggers wall-sync (detached, --no-block —
     # the wake is never delayed). Enabling it is what plants the suspend.target

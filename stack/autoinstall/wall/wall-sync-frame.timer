@@ -1,0 +1,34 @@
+# The frame flow's one-minute cadence (storage-map §4d `sync-frame-videos`:
+# "The panel checks EVERY MINUTE: share reachable? new content? -> fetch/mirror;
+# unreachable (box asleep) = skip silently, never wake").
+#
+# THE FIRST TIMER THIS PANEL HAS EVER SHIPPED, and that is a deliberate exception
+# rather than a reversal: OI-15's "there is deliberately NO periodic timer" is
+# about the MUSIC pull it was written for, whose source is always-on and whose
+# first sync is the whole library. It does not describe the frame flow, which the
+# storage map had already put on a one-minute clock before OI-18 made two mounts
+# possible at all.
+#
+# OnUnitActiveSec, not OnCalendar: the period is "a minute after the last run
+# FINISHED", so a slow run cannot make the next one start on top of it. (The
+# per-flow lock in wall-sync.sh is the belt to this braces — systemd will not run
+# two instances of one unit, but wall-sync.service mirrors the frame flow too.)
+#
+# Persistent= is deliberately ABSENT. It would fire a catch-up run at boot for
+# every minute the panel spent suspended overnight — systemd coalesces that into
+# ONE run, so it is not a storm, but it is also pointless: wall-sync.service
+# already mirrors both flows at boot and wall-sync-resume.service does it again
+# on every wake. OnBootSec below is the only start-up trigger this needs, and it
+# is late enough not to race the boot sync for the lock.
+[Unit]
+Description=Wall panel: check the frame-video share every minute (OI-18 / storage-map 4d)
+Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=wall-sync-frame.service
+
+[Install]
+WantedBy=timers.target

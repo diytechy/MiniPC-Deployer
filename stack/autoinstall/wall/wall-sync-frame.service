@@ -1,0 +1,51 @@
+# Wall panel: re-mirror the FRAME VIDEO share only (OI-18 exit (b), the Owner,
+# 2026-08-03; cadence from Personal\homelab\deploy\storage-map.md §4d).
+#
+# WHY THIS EXISTS AS A SECOND UNIT AT ALL — the decision, stated once:
+# the panel's two media sources have DIFFERENT CADENCES, and one unit cannot
+# carry both. §4d gives `sync-frame-videos` a ONE-MINUTE accessibility-checked
+# timer; `sync-music` has no such cadence and OI-15 deliberately gave the music
+# pull boot + resume + on demand and NO timer. Running the pair together every
+# minute would re-walk the whole music library over 802.11 from a 2016 laptop's
+# radio sixty times an hour, and the first music sync alone is allowed up to an
+# hour (wall-sync.service's TimeoutStartSec). So: one script, one code path, two
+# units — this one passes `--only frame`.
+#
+# ONE SCRIPT, NOT TWO. Everything about the mirror, the --delete guards and the
+# manifest contract is identical between the flows; only the address, the
+# credential, the subdirectory shape and the failure policy differ, and those are
+# in wall-sync.sh's flow map. A second script would be a second place for the
+# guards to drift out of.
+#
+# IT IS NOT ENABLED ITSELF — wall-sync-frame.timer is. Nothing should start this
+# at boot: wall-sync.service already mirrors both flows on the boot pass, and two
+# frame mirrors racing at boot is exactly what the per-flow lock exists to stop
+# (it would take the lock, log, and do nothing — correct, but noise).
+#
+# NORMAL OPERATION INCLUDES DOING NOTHING. Mini-serv is allowed to sleep and is
+# never woken for this, so an unreachable share is a SKIP, not a failure, and
+# this unit exits 0. What it does NOT do is go quiet: every skip logs the AGE of
+# the cached content, and a mount that is REFUSED BY AN AWAKE BOX still fails.
+[Unit]
+Description=Wall panel: mirror the Mini-serv frame-video share into the local media cache (every minute)
+Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
+After=network-online.target
+Wants=network-online.target
+After=wall-firstboot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wall-sync.sh --only frame
+# Bounded well inside the timer's period. The frame set is a handful of rendered
+# videos, not a music library, and the reachability probe is capped at 4 s — so a
+# run that is still going after two minutes is stuck, not busy, and letting it
+# stack up behind a one-minute timer is how a panel ends up with fifty queued
+# jobs. (wall-sync.service keeps its own 3600 s: the FIRST music mirror really
+# can take that long.)
+TimeoutStartSec=120
+# Same politeness as the boot sync: the panel is drawing a UI and playing music
+# while this runs, and this one runs sixty times an hour.
+IOSchedulingClass=idle
+Nice=10
+StandardOutput=journal
+StandardError=journal

@@ -1,6 +1,15 @@
-# Pull the panel's media cache from the library share (OI-15, ruled 2026-07-29).
+# Pull the panel's media cache from BOTH media shares (OI-15, ruled 2026-07-29;
+# two sources since OI-18 exit (b), ruled 2026-08-03).
 #
-# THREE TRIGGERS, AND DELIBERATELY NO TIMER:
+# THIS UNIT SYNCS BOTH FLOWS — music (from HOMEHUB) and frame video (from
+# Mini-serv). The bare script with no `--only` is the "everything, now" run, so
+# the dedicated on-demand command below means exactly what it always meant.
+# The frame flow ALSO has its own every-minute cadence, which is a separate unit
+# and timer (wall-sync-frame.{service,timer}) because storage-map §4d gives the
+# two flows different cadences and this one's timeout is sized for a full music
+# library over Wi-Fi. See that service file for the decision in full.
+#
+# THREE TRIGGERS FOR THIS UNIT, AND DELIBERATELY NO TIMER ON IT:
 #   * ONCE AFTER BOOT — this unit, WantedBy=multi-user.target, ordered after the
 #     network is actually up (the panel is Wi-Fi-only, so "network-online" is not
 #     a formality here: an rsync started before association just fails).
@@ -12,11 +21,12 @@
 #     SSH-invocable command the ruling calls for: starting a oneshot again re-runs
 #     it, so there is nothing else to install and no second entry point that could
 #     drift from the boot path.
-# The ruling (as amended by OI-16a) is boot + resume + on demand, so NO .timer
-# file is shipped. Resume wrinkle: network-online.target is not re-evaluated on
-# wake, so wall-sync.sh does its own short bounded nm-online wait before mounting.
+# The ruling (as amended by OI-16a) is boot + resume + on demand for the MUSIC
+# pull it was written for, so no .timer is attached to THIS unit. Resume wrinkle:
+# network-online.target is not re-evaluated on wake, so wall-sync.sh does its own
+# short bounded nm-online wait before mounting.
 [Unit]
-Description=Wall panel: mirror the library share's Music/ + FrameVideos/ into the local media cache
+Description=Wall panel: mirror both media shares (HOMEHUB music + Mini-serv frame video) into the local cache
 Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
 After=network-online.target
 Wants=network-online.target
@@ -28,9 +38,11 @@ After=wall-firstboot.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/wall-sync.sh
-# The FIRST sync copies the whole Music/ + FrameVideos/ tree over 802.11 from a
-# 2016 laptop's radio; later ones are deltas. Generous, because the failure mode
-# of a too-short timeout is a half-mirrored cache with a red unit every boot.
+# The FIRST sync copies the whole music library plus the frame set over 802.11
+# from a 2016 laptop's radio; later ones are deltas. Generous, because the failure
+# mode of a too-short timeout is a half-mirrored cache with a red unit every boot.
+# (The every-minute frame unit is capped far lower — it can never have a whole
+# music library to fetch.)
 TimeoutStartSec=3600
 # Bounded IO priority: the panel is drawing a UI and (once synced) playing music
 # while this runs, and a full first sync should not make the wall stutter.

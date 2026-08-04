@@ -23,10 +23,12 @@
 #      report what /sys/power/mem_sleep actually says (the mem_sleep_default=deep
 #      decision — see user-data §6).
 #   7. Autologin the kiosk user on tty1 so cage gets a real logind SEAT.
-#   8. OI-15 — the media cache + the pull unit: create the cache dir, make sure
-#      wall-sync.service is enabled, and REPORT whether the share is configured.
+#   8. OI-15/OI-18 — the media cache + the pull units: create the cache dir, make
+#      sure wall-sync.service is enabled, and REPORT whether BOTH shares are
+#      configured (there are two sources on two hosts since OI-18 exit (b)).
 #      Plus OI-16a: wall-sync-resume.service enabled, so every wake from the
-#      nightly suspend re-triggers the sync (a resume is not a boot).
+#      nightly suspend re-triggers the sync (a resume is not a boot); and
+#      wall-sync-frame.timer enabled, the frame flow's every-minute cadence.
 #   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
@@ -332,12 +334,14 @@ systemctl restart --no-block getty@tty1.service >/dev/null 2>&1 \
     || warn "could not enqueue a getty@tty1 restart — the kiosk starts on the next reboot instead"
 log "kiosk: tty1 autologin + profile hook installed, getty@tty1 restart enqueued (the session starts now, not next boot)"
 
-# ── 8. OI-15 — the media cache and the pull unit ─────────────────────────────
-# The panel PULLS its media (the Owner's ruling, 2026-07-29): wall-sync.service
-# mirrors the share's Music/ + FrameVideos/ into WALL_MEDIA_CACHE at boot and on
-# demand. Firstboot's job here is only to make the destination exist and the unit
-# be enabled — the sync itself is NOT run from here, because a first sync can be
-# the whole library over Wi-Fi and firstboot must not block on it.
+# ── 8. OI-15/OI-18 — the media cache and the pull units ──────────────────────
+# The panel PULLS its media (the Owner's ruling, 2026-07-29), from TWO hosts
+# since OI-18 exit (b) (2026-08-03): wall-sync.service mirrors BOTH flows at boot
+# and on resume, and wall-sync-frame.timer re-mirrors the frame flow every minute
+# (storage-map §4d). Firstboot's job here is only to make the destinations exist
+# and the units be enabled — the sync itself is NOT run from here, because a
+# first sync can be the whole music library over Wi-Fi and firstboot must not
+# block on it.
 : "${WALL_MEDIA_CACHE:=/var/cache/wall-media}"
 install -d -m 0755 "$WALL_MEDIA_CACHE" "$WALL_MEDIA_CACHE/music" "$WALL_MEDIA_CACHE/frame"
 log "OI-15: media cache ready at $WALL_MEDIA_CACHE (music/ + frame/)"
@@ -362,17 +366,39 @@ else
     warn "the panel can then run for weeks on a stale cache. Copy it from"
     warn "$PAYLOAD/wall-sync-resume.service and: systemctl enable wall-sync-resume.service"
 fi
-case "${MEDIA_SHARE_UNC:-}" in
-    ''|*REPLACE_WITH*)
-        warn "OI-15: MEDIA_SHARE_UNC is unset/placeholder — the panel has NO media source."
-        warn "wall-sync.service will FAIL loudly at boot until it is filled in (that is"
-        warn "deliberate: a wall with no music and a green unit would be a lie)."
-        ;;
-    *)
-        log "OI-15: media source is $MEDIA_SHARE_UNC (mirror: Music/ + FrameVideos/, --delete)"
-        log "OI-15: sync now, or any time, with: sudo systemctl start wall-sync.service"
-        ;;
-esac
+# OI-18: the frame flow has its OWN cadence — every minute, per storage-map §4d
+# — so it has its own unit and timer. Enabling the TIMER is what matters; the
+# service it triggers is deliberately not enabled on its own (nothing should
+# start it at boot; wall-sync.service already covers the boot pass).
+if [ -f /etc/systemd/system/wall-sync-frame.timer ]; then
+    systemctl enable wall-sync-frame.timer >/dev/null 2>&1 \
+        || warn "could not enable wall-sync-frame.timer — check: systemctl status wall-sync-frame.timer"
+    log "OI-18: wall-sync-frame.timer enabled — the frame share is re-checked every minute (skipped silently while Mini-serv sleeps)"
+else
+    warn "wall-sync-frame.timer is not installed (the autoinstall late-commands place it)."
+    warn "Without it the frame videos refresh only at boot/resume, not every minute."
+    warn "Copy it from $PAYLOAD/ and: systemctl enable --now wall-sync-frame.timer"
+fi
+
+# Report BOTH sources. Reported separately and named individually because they
+# are two different machines with two different failure policies: an unset music
+# UNC is a dead music player, an unset frame UNC is a blank wall, and a message
+# naming only "the media source" would have been true of neither.
+report_media_source() {   # LABEL UNC EXTRA
+    case "${2:-}" in
+        ''|*REPLACE_WITH*)
+            warn "OI-18: $1 is unset/placeholder — the panel has NO $1 source."
+            warn "wall-sync will FAIL loudly until it is filled in (that is deliberate:"
+            warn "a wall with no media and a green unit would be a lie)."
+            ;;
+        *) log "OI-18: $1 source is $2 ($3)" ;;
+    esac
+}
+report_media_source MEDIA_MUSIC_SHARE_UNC "${MEDIA_MUSIC_SHARE_UNC:-}" \
+    "HOMEHUB; mirrors the Music/ subdir UNDER the mount, --delete"
+report_media_source MEDIA_FRAME_SHARE_UNC "${MEDIA_FRAME_SHARE_UNC:-}" \
+    "Mini-serv; mirrors the share ROOT, --delete; skipped silently while that box sleeps"
+log "OI-15: sync now, or any time, with: sudo systemctl start wall-sync.service"
 
 # ── 8b. IF-005 — is the shell artifact actually there, and can it load? ──────
 # The autoinstall unpacks the artifact (user-data late-command 3b); this reports

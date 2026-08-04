@@ -45,8 +45,20 @@ Also deliberate:
     album/artist come from the directory layout and title/track from the
     filename. Nothing here shells out to ffprobe.
 
-Usage (wall-sync.sh calls exactly this):
-    wall-media-manifest.py --cache /var/cache/wall-media
+ONE FLOW AT A TIME (`--only`, added by OI-18 2026-08-03). The panel now pulls
+its two media sets from two different hosts on two different cadences — music on
+boot/resume/on-demand from HOMEHUB, frame videos every minute from Mini-serv —
+so the runs OVERLAP. Regenerating both manifests from either run would let the
+every-minute frame run rewrite `music/index.json` from a music cache that a
+boot-time mirror is still halfway through filling: a manifest describing a
+partial library, which is exactly what "written LAST, after the media" exists to
+prevent. `--only` keeps each flow's post-step to its own contract. The default is
+still `both`, which is what a hand-run invocation wants.
+
+Usage (wall-sync.sh calls exactly this, once per flow):
+    wall-media-manifest.py --cache /var/cache/wall-media --only music
+    wall-media-manifest.py --cache /var/cache/wall-media --only frame
+    wall-media-manifest.py --cache /var/cache/wall-media          # both
 """
 
 import argparse
@@ -226,40 +238,53 @@ def main():
     ap.add_argument("--url-base", default="/media", help="the URL prefix the Electron host maps to --cache (default: /media)")
     ap.add_argument("--music-subdir", default="music")
     ap.add_argument("--frame-subdir", default="frame")
+    ap.add_argument(
+        "--only",
+        choices=("both", "music", "frame"),
+        default="both",
+        help="regenerate only this flow's manifest (default: both). wall-sync.sh"
+        " passes one flow per run so a frame sync cannot rewrite a music manifest"
+        " a concurrent music sync is still filling.",
+    )
     args = ap.parse_args()
 
     cache = os.path.abspath(args.cache)
     url_base = args.url_base.rstrip("/")
     music_root = os.path.join(cache, args.music_subdir)
     frame_root = os.path.join(cache, args.frame_subdir)
+    do_music = args.only in ("both", "music")
+    do_frame = args.only in ("both", "frame")
 
-    # The sync creates both dirs before calling this, so an absent one means the
-    # caller is not wall-sync.sh (or someone deleted the cache mid-run). Say so
-    # rather than writing a manifest into thin air.
-    for d in (music_root, frame_root):
-        if not os.path.isdir(d):
+    # The sync creates the flow's dir before calling this, so an absent one means
+    # the caller is not wall-sync.sh (or someone deleted the cache mid-run). Say
+    # so rather than writing a manifest into thin air. Only the SELECTED flows
+    # are required to exist: with --only frame, a panel that has never completed
+    # a music sync is a normal state, not an error.
+    for want, d in ((do_music, music_root), (do_frame, frame_root)):
+        if want and not os.path.isdir(d):
             sys.stderr.write("wall-media-manifest: not a directory: {}\n".format(d))
             return 1
 
-    manifest, n_tracks, music_skipped = walk_music(
-        music_root, "{}/{}/".format(url_base, args.music_subdir)
-    )
-    items, frame_skipped = walk_frame(
-        frame_root, "{}/{}/".format(url_base, args.frame_subdir)
-    )
-
-    write_atomic(os.path.join(music_root, "index.json"), manifest)
-    write_atomic(os.path.join(frame_root, "playlist.json"), items)
-
-    print(
-        "wall-media-manifest: music/index.json = {} track(s) in {} album(s)"
-        " (+{} loose); frame/playlist.json = {} video(s)".format(
-            n_tracks,
-            len(manifest["albums"]),
-            len(manifest.get("tracks", [])),
-            len(items),
+    parts = []
+    music_skipped = frame_skipped = 0
+    if do_music:
+        manifest, n_tracks, music_skipped = walk_music(
+            music_root, "{}/{}/".format(url_base, args.music_subdir)
         )
-    )
+        write_atomic(os.path.join(music_root, "index.json"), manifest)
+        parts.append(
+            "music/index.json = {} track(s) in {} album(s) (+{} loose)".format(
+                n_tracks, len(manifest["albums"]), len(manifest.get("tracks", []))
+            )
+        )
+    if do_frame:
+        items, frame_skipped = walk_frame(
+            frame_root, "{}/{}/".format(url_base, args.frame_subdir)
+        )
+        write_atomic(os.path.join(frame_root, "playlist.json"), items)
+        parts.append("frame/playlist.json = {} video(s)".format(len(items)))
+
+    print("wall-media-manifest: " + "; ".join(parts))
     if music_skipped or frame_skipped:
         # Not a failure — but never silent. A name that cannot be represented in
         # JSON is a real file the panel will not play, and the operator should be

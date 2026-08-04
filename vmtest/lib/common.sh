@@ -166,6 +166,36 @@ PY
     log "storage pin validated structurally ($mode) — not by grep"
 }
 
+# autoinstall_hostname FILE — echo autoinstall.identity.hostname from FILE.
+#
+# PARSED, not grepped, for the same reason assert_storage_pin is: the shipped
+# user-data explains the hostname choice in a COMMENT four lines above the
+# setting ("HOSTNAME is the ROLE, not the hardware"), and any line-based read is
+# one comment edit away from picking up the wrong string. The seed's meta-data
+# is written from this value, so a wrong answer means the seed and the installed
+# box disagree about what the machine is called.
+#
+# Dies if the name is missing or is not a plausible hostname — it is about to be
+# interpolated into a sed replacement, and a name carrying a delimiter or a `&`
+# would corrupt the meta-data silently.
+autoinstall_hostname() {
+    local f="$1" name
+    require_cmd python3 "Install it with: sudo apt-get install -y python3 python3-yaml"
+    name="$(python3 - "$f" <<'PY'
+import sys, yaml
+ai = yaml.safe_load(open(sys.argv[1]))
+ai = ai.get("autoinstall", ai)
+print(((ai.get("identity") or {}).get("hostname") or "").strip())
+PY
+)" || die "could not parse $f while reading identity.hostname"
+    case "$name" in
+        ''|*[!A-Za-z0-9.-]*)
+            die "identity.hostname in $f is '$name', which is not a usable hostname." \
+                "The seed's meta-data local-hostname/instance-id are written from it." ;;
+    esac
+    printf '%s' "$name"
+}
+
 # compose_escape VALUE — encode VALUE for a compose `.env`, printed on stdout.
 #
 # Docker Compose interpolates `$VAR` inside .env VALUES, not just in the compose
@@ -638,18 +668,36 @@ render_seed_tree() {
     # Applies to BOTH branches: production user-data.filled and the sim render.
     validate_autoinstall_yaml "$user_data_out"
 
-    # ── meta-data: fresh instance-id per build, vmtest hostname ──────────────
+    # ── meta-data: fresh instance-id per build, and the hostname of THIS build ─
+    #
+    # THE HOSTNAME IS TAKEN FROM THE user-data WE JUST RENDERED, not from a
+    # constant. Both seds here used to be unconditional, so a PRODUCTION build —
+    # whose identity block says `homehub` — got `local-hostname: homehub-vmtest`
+    # and `instance-id: homehub-vmtest-…` in its meta-data anyway. Cosmetic, in
+    # that Subiquity's `identity.hostname` is what the installed box actually
+    # answers to, and deliberately left alone during a wall session; wrong all
+    # the same, and the kind of wrong that gets quoted back as evidence ("the
+    # seed says vmtest, so this must be the sim stick"). Reading it back off the
+    # rendered file makes the two agree BY CONSTRUCTION in both modes, and it
+    # survives a production user-data.filled that names some other host.
+    local seed_host
+    seed_host="$(autoinstall_hostname "$user_data_out")"
+    local iid="${seed_host}-$(date +%Y%m%d%H%M%S)"
     sed \
-        -e "s/instance-id: homehub-001/instance-id: homehub-vmtest-$(date +%Y%m%d%H%M%S)/" \
-        -e 's/local-hostname: homehub/local-hostname: homehub-vmtest/' \
+        -e "s/^instance-id: .*/instance-id: $iid/" \
+        -e "s/^local-hostname: .*/local-hostname: $seed_host/" \
         "$autoinstall_src/meta-data" > "$out_dir/iso-root/meta-data"
-    # Same silent-no-op hazard as the user-data seds. A stale instance-id is
-    # worse than cosmetic: cloud-init uses it to decide whether this is a FRESH
-    # instance, so a repeated one can make it skip first-boot work entirely.
-    grep -Eq '^local-hostname: homehub-vmtest$' "$out_dir/iso-root/meta-data" || \
-        die "meta-data local-hostname substitution did not apply — stack/autoinstall/meta-data no longer says 'local-hostname: homehub'. Update the sed above."
-    grep -Eq '^instance-id: homehub-vmtest-[0-9]+$' "$out_dir/iso-root/meta-data" || \
-        die "meta-data instance-id substitution did not apply — stack/autoinstall/meta-data no longer says 'instance-id: homehub-001'. cloud-init could treat this as a repeat instance and skip first-boot work. Update the sed above."
+    # Same silent-no-op hazard as the user-data seds — if either key is renamed
+    # or dropped from stack/autoinstall/meta-data the sed matches nothing and
+    # says nothing, so assert the RESULT rather than trusting the substitution.
+    # A stale instance-id is worse than cosmetic: cloud-init uses it to decide
+    # whether this is a FRESH instance, so a repeated one can make it skip
+    # first-boot work entirely.
+    grep -Fxq "local-hostname: $seed_host" "$out_dir/iso-root/meta-data" || \
+        die "meta-data local-hostname is not '$seed_host' — stack/autoinstall/meta-data no longer carries a 'local-hostname:' line for the sed above to rewrite. Update it."
+    grep -Eq "^instance-id: ${seed_host}-[0-9]+\$" "$out_dir/iso-root/meta-data" || \
+        die "meta-data instance-id substitution did not apply — stack/autoinstall/meta-data no longer carries an 'instance-id:' line. cloud-init could treat this as a repeat instance and skip first-boot work. Update the sed above."
+    log "meta-data: local-hostname=$seed_host instance-id=$iid ($HUB_BUILD_KIND build)"
 
     # ── deploy-payload/ = a copy of the whole repo (late-commands expects
     #    deploy-payload/stack/... at its root) ────────────────────────────────

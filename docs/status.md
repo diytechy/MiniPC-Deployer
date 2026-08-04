@@ -2800,3 +2800,46 @@ has been exercised on the WALL image only, and on the repacked path where
 touched. The refusal is proven to fire **in bash, against a directory named
 `/target` that this suite created**. OI-19 is FIXED-BUT-UNVERIFIED; it closes on
 a hub install, not before.
+
+### DRIVER — G1 — Round 1 — 2026-08-03 (the hub's production meta-data was stamped `homehub-vmtest`)
+
+The wall handoff's §5 item 7, closed. `render_seed_tree` applied **both**
+meta-data seds unconditionally, so a `SITE_DIR` (production) build got
+`local-hostname: homehub-vmtest` and `instance-id: homehub-vmtest-<ts>` in the
+seed it burns onto a real stick. Cosmetic — Subiquity's `identity.hostname` is
+what the installed box answers to, and that was always `homehub` — but wrong,
+and wrong in the direction that gets quoted back later as evidence ("the seed
+says vmtest, so this must be the sim stick"). The wall builder had already
+learned this (`render_wall_seed_tree` marks the hostname on the sim path only);
+the hub had not, and it was deliberately left alone in a wall session.
+
+**Fixed by reading the answer off the file we just rendered**, rather than by
+adding a second constant: `autoinstall_hostname` parses `identity.hostname` out
+of the rendered user-data — **structurally, with PyYAML**, because the shipped
+user-data explains the hostname choice in a comment four lines above the setting
+and any line-based read is one comment edit away from the wrong string — and
+both meta-data values are written from it. Sim and production now agree BY
+CONSTRUCTION in both modes, and a production `user-data.filled` that named some
+other host would carry that name through instead of being overwritten with
+either constant.
+
+**The assertion habit is kept, and strengthened.** The old seds were anchored to
+the literal source strings (`instance-id: homehub-001`, `local-hostname:
+homehub`) and the result was asserted against the literal `homehub-vmtest`. The
+new ones rewrite the KEYS and assert the RESULT equals the hostname this build
+intends — so a renamed or deleted key in `stack/autoinstall/meta-data` still
+fails the build loudly, which is the failure the old assertion existed for.
+`autoinstall_hostname` additionally refuses a name that is empty or carries
+anything outside `[A-Za-z0-9.-]`, since it is interpolated into a `sed`
+replacement.
+
+**Run:** `vmtest/test-hub-seed.sh` → **16 passed, 0 failed, 0 skipped** (the
+13 from the OI-19 entry above plus three new: a production seed's
+`local-hostname` is `homehub`, its `instance-id` is `homehub-<ts>`, and a
+`meta-data` with its `local-hostname:` line deleted fails the build).
+`vmtest/test-wall-builder.sh` 12/12 unchanged, `scripts/check.py` PASS,
+`bash -n` clean.
+
+**Not proven:** the same thing as everything else on this page — no ISO was
+built and nothing was installed. What is asserted is the content of a rendered
+`meta-data` file on disk.

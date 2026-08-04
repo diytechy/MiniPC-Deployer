@@ -125,9 +125,15 @@ else
 fi
 
 echo
-echo "=== the PRODUCTION build ==="
+echo "=== the PRODUCTION build (OI-19's companion: the sim identity leaked into it) ==="
 if build_seed "SITE_DIR=$SITE"; then
-    U="$OUT/iso-root/user-data"
+    U="$OUT/iso-root/user-data"; M="$OUT/iso-root/meta-data"
+    grep -Fxq 'local-hostname: homehub' "$M" \
+        && ok "a production seed's meta-data says homehub, NOT homehub-vmtest" \
+        || bad "production meta-data hostname" "$(grep local-hostname "$M")"
+    grep -Eq '^instance-id: homehub-[0-9]+$' "$M" \
+        && ok "a production seed's instance-id is homehub-<ts>, not homehub-vmtest-<ts>" \
+        || bad "production instance-id" "$(grep instance-id "$M")"
     grep -q 'BUILD_PROFILE=production' "$U" \
         && ok "a production image keeps BUILD_PROFILE=production (its install refuses to lose site/)" \
         || bad "production BUILD_PROFILE marker" "no marker in the baked user-data"
@@ -144,6 +150,11 @@ grep -v 'BUILD_PROFILE=production' "$WORK.ud.bak" > "$USER_DATA"
 expect_refusal "a user-data that lost BUILD_PROFILE=production fails the sim build" \
     "BUILD_PROFILE substitution did not apply" --
 cp "$WORK.ud.bak" "$USER_DATA"
+
+grep -v '^local-hostname:' "$WORK.md.bak" > "$META_DATA"
+expect_refusal "a meta-data that lost local-hostname: fails the build" \
+    "meta-data local-hostname is not" --
+cp "$WORK.md.bak" "$META_DATA"
 
 echo
 echo "=== the site-staging late-command itself (OI-19) ==="

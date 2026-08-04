@@ -169,7 +169,14 @@ switch ($Stage) {
         }
     }
     if ($hubAddr) {
-        if (Test-Connection -TargetName $hubAddr -Count 2 -Quiet -ErrorAction SilentlyContinue) {
+        # .NET Ping rather than Test-Connection: the parameter that names the
+        # target was renamed between Windows PowerShell 5.1 (-ComputerName) and
+        # PowerShell 7 (-TargetName), and this script has to run under both.
+        $reachable = $false
+        try {
+            $reachable = (New-Object System.Net.NetworkInformation.Ping).Send($hubAddr, 1500).Status -eq 'Success'
+        } catch { $reachable = $false }
+        if ($reachable) {
             Write-Host "  hub at $hubAddr answers ICMP." -ForegroundColor Green
         } else {
             Write-Host "WARNING: the hub at $hubAddr does not answer on '$SwitchName'." -ForegroundColor Yellow

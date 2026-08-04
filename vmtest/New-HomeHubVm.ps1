@@ -192,7 +192,10 @@ Assert-HyperV
 # whole exercise exists to avoid: the VM comes up, installs cleanly, and simply
 # has no address on the switch the gate runs over — which reads as "the hub is
 # down" from the panel and as nothing at all from the host.
-$labKnobs = @($LabSwitchName, $WanMac, $LabMac) | Where-Object { $_ }
+# The @(...) around the pipeline is load-bearing in Windows PowerShell 5.1:
+# Where-Object matching nothing yields $null, and $null.Count is $null, not 0 —
+# which would make the -notin test below fire on a build that asked for no lab.
+$labKnobs = @(@($LabSwitchName, $WanMac, $LabMac) | Where-Object { $_ })
 if ($labKnobs.Count -notin @(0, 3)) {
     throw "-LabSwitchName, -WanMac and -LabMac must be given together (got $($labKnobs.Count) of 3). " +
           "A lab leg with no MAC cannot be matched by the guest's netplan, and a MAC with no lab switch " +

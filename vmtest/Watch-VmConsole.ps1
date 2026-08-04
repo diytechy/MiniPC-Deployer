@@ -82,18 +82,35 @@ Remove-Item -Force $stopFile -ErrorAction SilentlyContinue
 
 Add-Type -AssemblyName System.Drawing
 
+# WMI FIRST, CIM ONLY AS A FALLBACK, and the order is deliberate. The WMI call
+# is the one that has actually produced usable PNGs of a booting installer on
+# this machine; the CIM form is equivalent on paper and has never been run here.
+# `Get-WmiObject` exists in Windows PowerShell 5.1 and NOT in PowerShell 7, and
+# Start-A19Gate.ps1 launches this under `powershell.exe` (5.1) for exactly that
+# reason — so the proven path is the one that normally runs, and the fallback
+# only matters if you start it by hand from pwsh.
 function Save-VmScreenshot {
     param([string]$Name, [string]$Path, [int]$W, [int]$H)
-    $vm = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ComputerSystem `
-            -Filter "ElementName='$Name'"
-    if (-not $vm) { return 'no such VM' }
-    $vsd = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VirtualSystemSettingData |
-             Select-Object -First 1
-    $svc = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_VirtualSystemManagementService
-    $res = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage -Arguments @{
-        TargetSystem = [ciminstance]$vsd
-        WidthPixels  = [uint16]$W
-        HeightPixels = [uint16]$H
+
+    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+        $vm = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem `
+                -Filter "ElementName='$Name'"
+        if (-not $vm) { return 'no such VM' }
+        $vsd = ($vm.GetRelated('Msvm_VirtualSystemSettingData') | Select-Object -First 1)
+        $svc = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
+        $res = $svc.GetVirtualSystemThumbnailImage($vsd, $W, $H)
+    } else {
+        $vm = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ComputerSystem `
+                -Filter "ElementName='$Name'"
+        if (-not $vm) { return 'no such VM' }
+        $vsd = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VirtualSystemSettingData |
+                 Select-Object -First 1
+        $svc = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_VirtualSystemManagementService
+        $res = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage -Arguments @{
+            TargetSystem = [ciminstance]$vsd
+            WidthPixels  = [uint16]$W
+            HeightPixels = [uint16]$H
+        }
     }
     if ($res.ReturnValue -ne 0 -or -not $res.ImageData) { return "thumbnail rc=$($res.ReturnValue)" }
 

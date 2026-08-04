@@ -69,20 +69,39 @@ last) — it is the record, not required reading for every pass.
       `BUILD_PROFILE=production` and `render_seed_tree` rewrites it to `sim` for
       a vmtest image, so a production image whose payload lost `site/` fails the
       install loudly instead of exiting 0.
-      **PROVEN — static/structural only:** `vmtest/test-hub-seed.sh` (13 checks,
-      all green) builds real sim and production seeds and runs the late-command
-      **extracted from the user-data each build produced** against a fake
-      `/target`. **NOT PROVEN: nothing has been installed from any of it.**
-      Subiquity has never run this late-command, the CIDATA-by-label mount it
-      depends on has never run on a hub, and no ISO was built or booted here.
-      OI-19 is FIXED-BUT-UNVERIFIED, not closed; it closes on a hub install.
-      **NEEDS THE OWNER (two rulings):** (a) a production build whose `site/`
-      arrives but is **missing a required file** is currently LOUD-BUT-NOT-FATAL
-      — should a missing `.env` halt the install too? (b) `drive-identity.conf`
-      is now installed with the other six: the builder and
-      `Build-VentoyStick.ps1` both stage it and **nothing ever installed it**,
-      so the drive-identity file has never reached a box. Both are recorded as
-      **A10** in the Assumptions log below.
+      **A SECOND HEAD, found by adversarial review 2026-08-03 and fixed the
+      same day:** the refusal only ever asked whether `site/` was a DIRECTORY.
+      A payload whose `site/` existed but held nothing that mattered — the
+      builder counted the mandatory `user-data.filled` as a staged site file,
+      so a `SITE_DIR` containing only that built a clean production ISO —
+      walked past it, logged six MISSING lines nobody reads on a headless box,
+      touched `.site-present` so `firstboot.sh`'s own "broken production stick"
+      branch stayed quiet, and exited 0. Byte for byte the outcome above, by a
+      different road. Measured, not reasoned: the build succeeded and 4b
+      returned 0. Now the FILES are checked, in both places — the builder
+      refuses to stage, and a missing `required` file makes 4b exit 1.
+      **PROVEN — behavioural, still never installed:** `vmtest/test-hub-seed.sh`
+      (**28 checks, 0 failed, 0 skipped**, as root in WSL2) builds real sim and
+      production seeds and then RUNS the late-commands extracted from the
+      user-data each build produced — step 3 (find and copy the payload)
+      followed by 4b, against a real payload under a real `/media` entry, a
+      real loop-mounted CIDATA seed ISO, and a forced `cp` failure. Until
+      2026-08-03 the case advertised as "the light path" hand-created
+      `/target/opt/homehub/site` and never ran step 3 at all.
+      **NOT PROVEN: nothing has been installed from any of it.** Subiquity has
+      never run these late-commands, `curtin` has never placed `/target` for
+      them, and no ISO was built or booted here. OI-19 is FIXED-BUT-UNVERIFIED,
+      not closed; it closes on a hub install.
+      **NEEDS THE OWNER (one ruling now, one decision to ratify):**
+      (a) **DECIDED IN THE REFUSE DIRECTION, 2026-08-03, pending ratification:**
+      a production build whose `site/` arrives but is missing a `required` file
+      now HALTS the install (it was LOUD-BUT-NOT-FATAL). Same call the
+      missing-directory branch and the wall image already make. The lever to
+      reverse it is moving a file from `required` to `optional` in 4b's own
+      table. (b) `drive-identity.conf` is now installed with the other six: the
+      builder and `Build-VentoyStick.ps1` both stage it and **nothing ever
+      installed it**, so the drive-identity file has never reached a box. Both
+      are recorded as **A10** in the Assumptions log below.
     - OI-20 — **`config.json` now has a path onto the hub — and its MODE needs
       a ruling** (2026-08-03, new): Personal's `Materialize-Deploy.ps1` emits
       `out\homehub\config.json` (the kiosk shell's runtime config: `FEED_TOKEN`,
@@ -98,13 +117,26 @@ last) — it is the record, not required reading for every pass.
       0644. What the Owner should rule on is the **posture**, not the digits: a
       file carrying live credentials is now **served over HTTP** — behind the
       kiosk site's `remote_ip {$PANEL_IP}/32` matcher, so not open to the LAN,
-      but that is an allow-list, not a secret store. And if caddy ever gains a
-      `user:`, the panel degrades to `js/config.js` defaults **silently**
-      (`loadConfig` never throws).
-      **Also owed, and NOT this repo's to fix:** `Build-VentoyStick.ps1`
-      assembles `out\site\` from a hardcoded `$wanted` list that does **not**
-      include `config.json`, so the real Ventoy stick will not carry one until
-      Personal adds it — `SITE_DIR=<dir with config.json>` builds do.
+      but that is an allow-list, not a secret store.
+      **The silent-degradation half is now closed (2026-08-03, adversarial
+      review):** nothing verified that caddy could actually READ the file. Its
+      healthcheck probes the admin API, which is up whenever the process is, so
+      a `user:`, a `USER` in a newer image or daemon userns-remap would leave
+      caddy `healthy` while the site 403/404s and `loadConfig` — which never
+      throws — falls back to defaults. (`:ro`/`read_only:` are NOT the risk:
+      they restrict writes, and this is a read.) `firstboot.sh` **step 4b** now
+      asserts the read **as the container** (`docker exec` inherits the
+      service's user) whenever the production source exists, and a failure makes
+      the whole unit exit non-zero so `systemctl status homehub-firstboot` is
+      RED. **UNPROVEN: step 4b has never run** — no hub, no compose bring-up.
+      **The stick half is now guarded from this side too:** a production build
+      with no `site/config.json` is REFUSED by `render_seed_tree`. Personal's
+      `Build-VentoyStick.ps1` still assembles `out\site\` from a hardcoded
+      `$wanted` list; the two halves are deliberately independent — supplying
+      the file and refusing to build without it are different failures with
+      different owners. **Consequence to expect:** until Personal's half lands,
+      a `Build-VentoyStick.ps1` run whose `out\` tree has no `config.json` now
+      FAILS instead of quietly producing a stick without one.
     - OI-18 — **The wall production seam has one missing input**
       (2026-08-02, new): `WALL_SITE_DIR` now builds a real panel image from
       Personal's `Materialize-Deploy.ps1 -Image wall` output, behind five
@@ -2932,3 +2964,172 @@ late-command 4b's table). `test-wall-builder.sh` 12/12, `scripts/check.py` PASS,
 **Not proven:** `firstboot.sh` step 3e has never run. Nothing has served this
 file, no panel has fetched it, and the uid finding is from the image on this dev
 box — not from the AWOW.
+
+### DRIVER — G1 — Round 1 — 2026-08-03 (an adversarial review of yesterday's fixes: eleven findings, ten real)
+
+An independent read-only reviewer (OpenAI CLI) was pointed at the four commits
+that fixed OI-19, the production meta-data hostname, `config.json` staging and
+the A19 sim fixture, and asked the question this repo asks of everything: *would
+it notice?* Ten times the answer was no. Four of those were tests that report
+success while proving nothing — and those are the reason the other six survived
+a green run, so they were fixed with the same weight.
+
+**OI-19 HAD A SECOND HEAD, and it was the same head.** The refusal added
+yesterday asks whether the payload's `site/` is a DIRECTORY. `render_seed_tree`'s
+staging loop counted `user-data.filled` — which it has already made MANDATORY
+thirty lines earlier — as a staged site file. So a `SITE_DIR` holding nothing
+else satisfied `staged > 0`, built a clean production ISO, created
+`deploy-payload/site/`, and handed 4b exactly the directory it was looking for.
+4b then logged every required file missing (they only printed and `continue`d),
+touched `.site-present` so `firstboot.sh`'s "site payload was present but the
+fragment is missing" branch stayed quiet, and exited 0. Measured on this box
+before touching anything: build rc=0, `site/` holding one file, 4b rc=0,
+`.site-present` created. The directory's existence was never the property worth
+checking. Both ends now check the FILES: the builder refuses to stage a
+production image missing any of `.env`, `backup.env`, `smb.conf.fragment`,
+`library-mounts.fstab`, `config.json`, and a missing `required` file makes 4b
+exit 1. **That last one closes A10(a) in the REFUSE direction** — recorded, not
+assumed; the lever to reverse it is moving a file from `required` to `optional`
+in 4b's own table.
+
+**`exit 0` AFTER A FAILED COPY.** Late-command 3's two payload branches read
+`cp -a … && echo …; exit 0`, and `exit 0` is a separate command after the `;` —
+it ran whether or not the copy worked. One I/O error partway through ~470 MB of
+baked images left a half-copied `/target/opt/homehub`, printed "payload copied",
+and handed 4b a `site/` holding whatever made it across before the error. "No
+payload" is a recoverable state the box knows how to describe and says so
+loudly; "some of the payload" is not a state at all. Now fatal, along with a
+CIDATA seed that will not unmount after a successful copy.
+
+**BUILD_PROFILE WAS A SUBSTRING SEARCH.** `grep -q BUILD_PROFILE=production`
+over the whole file matches the four lines of comment that explain the marker as
+happily as the assignment. A hand-edited `user-data.filled` could keep every
+comment while the ACTIVE assignment said `sim` — the guard accepts it, and 4b
+then silently permits a missing `site/` on a machine whose meta-data, hostname
+and disk pin all say production. `assert_build_profile` parses the document
+(`yaml.safe_load` discards comments outright), looks only at `late-commands`,
+and requires EXACTLY ONE assignment with the expected value: zero means 4b reads
+an unset variable and cannot refuse anything; two means the last one wins and
+the file no longer says what it does. Third member of the family that already
+holds `assert_storage_pin` and `autoinstall_hostname`, and for the third time
+the reason is the same — a line-based read is one comment edit from the wrong
+answer.
+
+**NOTHING CHECKED THAT CADDY CAN READ THE FILE IT SERVES (OI-20).** The
+healthcheck probes the admin API on :2019, which is up whenever the process is.
+So the 0600 root-owned `config.json` becoming unreadable — a `user:` in
+`docker-compose.yml`, a `USER` in a newer caddy image, daemon userns-remap —
+leaves caddy `healthy`, the kiosk site 403/404s on `/config.json`, and
+`loadConfig` NEVER THROWS: the panel paints on `js/config.js` defaults with no
+`FEED_TOKEN`, no heartbeat, no music credentials. `:ro` and `read_only:` are
+explicitly not the risk; both restrict writes and this is a read. `firstboot.sh`
+gains **step 4b**: whenever the production source exists, assert the read AS THE
+CONTAINER (`docker exec` inherits the service's user, so it fails precisely when
+caddy would), and carry a failure to a non-zero exit at step 7 so the unit shows
+FAILED rather than letting a silently-degraded panel look like a clean boot.
+
+**A COLLISION WARNING THAT WAS TRUE ON EVERY REBOOT.** `firstboot.sh` step 3e
+detected "the site tarball shipped its own `config.json`" by testing the
+DESTINATION after the untar. `homehub-firstboot.service` has no marker guard and
+no `ConditionPath*`; `RemainAfterExit=yes` only stops a second start within one
+boot, and the unit is `WantedBy=multi-user.target`. So from the second boot
+onward the file it found was the one IT had installed, and the warning fired
+forever, on every hub, whether or not a tarball ever carried one — which is how
+the real collision would have gone past. Answered from `tar -tzf` before
+extracting now, written to a FILE first because `tar | grep -q` under `pipefail`
+reports failure exactly when grep FINDS the match. The unit file's "becomes a
+no-op on later boots" comment was simply false and is corrected.
+
+**FOUR TESTS THAT PASSED WHETHER OR NOT THE CODE WAS THERE.** This is the part
+that matters most, because it is why the above survived yesterday's green run.
+
+- The suite **edited the repository's own tracked `user-data` and `meta-data`**
+  and restored them from an EXIT trap. A trap is not a transaction: a kill at
+  the wrong moment leaves a deliberately-corrupted template in the checkout, and
+  a concurrent `build-seed.sh` would bake it. The builders now run against an
+  ISOLATED COPY (`git ls-files` → `tar` → `git init`, so the payload copy takes
+  the same `git ls-files` path a real build takes rather than the loud
+  whole-worktree fallback) and the corruption happens there.
+- **`extract_4b` exited 0 when it found no command.** So both negative
+  assertions built on it — "no `/cdrom` left in the site step", "no
+  `config.json` in 4b's table" — passed when the command was MISSING, which is
+  exactly what a reverted OI-19 fix leaves behind. Extraction now demands
+  exactly one match. **PROVEN by stubbing:** with 4b reverted to a pre-OI-19
+  body the suite goes 28/0/0 → **7 passed, 14 FAILED, 1 skipped, exit 1**.
+- **The case advertised as "the light-path case" never ran the light path.** It
+  hand-created `/target/opt/homehub/site` and ran 4b alone — no late-command 3,
+  no discovery, no mount, no copy. The light path is what OI-19 was about, so
+  this was the test that most needed to bite and the one that structurally
+  could not. It now runs EXTRACTED STEP 3 then 4b, three ways: a real payload
+  under a real `/media` entry; a FORCED `cp` failure (a regular file where the
+  directory must be); and the CIDATA branch **for real** — `losetup` the seed
+  ISO this suite just built, `blkid -L CIDATA`, the command's own
+  `mount -o ro`. Loop mounts, `/media` and `install -o root` need root, so a
+  non-root run SKIPS them — and **skips now make the suite exit non-zero**,
+  because "we could not look" is not a pass. **PROVEN by stubbing:** with step 3
+  replaced by `exit 0` the suite reports **25 passed, 3 FAILED** (media path,
+  cp-failure, CIDATA path); with only the `cp`-failure fatality removed,
+  **27 passed, 1 FAILED**, and the failure line shows the command printing
+  "payload copied" immediately after `cp` said "Not a directory".
+- **Config installation was checked by line number and grep**, and "all seven
+  files 0600" stat'd `.env` alone — so unreachable code, a widened
+  `drive-identity.conf` (the file carrying disk serials, which nothing installed
+  at all before yesterday) or any later chmod regression all passed.
+  `firstboot.sh`'s 3d/3e region is now CARVED OUT AND EXECUTED against a scratch
+  tree under `set -euo pipefail` (so the `tar | grep -q` trap is real), in three
+  cases: a clean run, **the rerun**, and a tarball that really does ship a
+  `config.json`. Every one of the seven destinations is `stat`'d for
+  `600:root:root` individually.
+
+**THE SIM PASSED WITH THE A19 FIXTURE DELETED.** `sim/validate-sim.sh` never
+posted to `library-mounted` or `backup-drive-mounted`, so deleting
+`sim/tracker-seed/definitions/drives.md` outright left the gate green — the same
+defect the fixture exists to close, one level up. New **check 6b** posts a colour
+report for both ids and asserts per-ITEM `reportColor` on
+`library-drive-present` / `backup-drive-present`. Per item, not the ambient band,
+and that is a measured fact rather than a preference: `engine.Aggregate` is a MAX
+over lane scores, so one red report reaches red alone and `color_weight` only
+orders the overlay's offenders — meaning **a red screen does not prove these two
+lanes are red**. It then flips ONE lane green and asserts the other stays red, so
+the assertion cannot be satisfied by a field that merely exists. Feed POST codes
+are reported, not asserted, because with `TRACKER_COMMIT=true` on a non-git
+`/data` a post stores the report and THEN returns 500 (A24(iii)).
+
+**Runs (all real output, WSL2/Ubuntu as root):**
+`vmtest/test-hub-seed.sh` → **28 passed, 0 failed, 0 skipped** (up from 20; the
+new ones are the comment-vs-active BUILD_PROFILE case, the `SITE_DIR` holding
+only `user-data.filled`, the missing `config.json`, three executed 3d/3e cases,
+the light path via `/media`, the forced `cp` failure, the CIDATA seed, and the
+`site/`-with-only-`user-data.filled` refusal).
+`vmtest/test-wall-builder.sh` → **12 passed, 0 failed, 0 skipped**, unchanged.
+`python scripts/check.py` → **RESULT: PASS** (config-validate, registry-integrity,
+doc-navigability). `scripts/validate_config.py` → **ALL CONFIG CHECKS PASSED**.
+`bash -n` on every shell file touched; `bash -n` AND `dash -n` on both inline
+late-command bodies extracted from the rendered `user-data` — they run under
+`sh` via curtin, not bash.
+`sim/validate-sim.sh` → check 6b PASS on both cases against the RUNNING sim, i.e.
+against NagLight's real loader and engine; **and PROVEN to bite**: with
+`drives.md` deleted both cases FAIL with POST 400/400 and no `reportColor` on
+either id, and pass again when it is restored. Checks 2-8 green. **Check 1's five
+failures in that run are a stale environment, not a regression** — the containers
+on this box were created before commit `85401f6` renamed the compose project
+`awow-sim` → `homehub-sim`, so `docker compose -p homehub-sim ps -q` finds
+nothing while `docker ps` shows every one of them healthy. A `sim/run-sim.sh`
+recreate clears it.
+
+**The reviewer's list of SURVIVORS was re-checked rather than taken on trust**
+and holds: the hostname is parsed off the rendered file after substitution,
+PyYAML's absence hard-fails during validation, multi-document input is rejected,
+late-command 3 does precede 4b and does copy `site/`, `drive-identity.conf`
+lands 0600 root-owned, `drives.md` parses under NagLight's YAML subset, and all
+four seed files' item ids are unique. Nothing was changed on account of them.
+
+**Not proven, and the list has not got shorter in the way that counts:** nothing
+here has been installed. `firstboot.sh` step 4b has never run — no hub, no
+compose bring-up — so the caddy-readability assertion is asserted-in-source
+only. Subiquity has never run either late-command; what IS new is that they have
+now been EXECUTED — by this suite, as root, against a fake `/target`, a real
+`/media` entry and a real loop-mounted copy of the seed ISO this repo builds.
+That is a strictly larger claim than yesterday's and still a strictly smaller
+one than an install. OI-19 closes on a hub install; OI-20's mode ruling, and the
+A10(a) refuse-direction decision made here, are the Owner's.

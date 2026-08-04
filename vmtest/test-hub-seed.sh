@@ -91,8 +91,11 @@ build_sandbox() {
         git -C "$SANDBOX" init -q
         # Byte-for-byte: the sandbox must hold exactly what the checkout holds,
         # and on a Windows checkout an autocrlf round-trip would rewrite the very
-        # files under test (and bury the run in conversion warnings).
+        # files under test. safecrlf off as well — its warning is about a
+        # round-trip this throwaway index will never make, and five lines of it
+        # per run is noise across the output that matters.
         git -C "$SANDBOX" config core.autocrlf false
+        git -C "$SANDBOX" config core.safecrlf false
         git -C "$SANDBOX" add -A
         git -C "$SANDBOX" -c user.email=vmtest@invalid -c user.name=vmtest \
             commit -q -m "isolated copy under test"

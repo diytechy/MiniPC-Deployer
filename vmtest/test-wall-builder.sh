@@ -440,6 +440,55 @@ expect_refusal "a stale PRE-OI-18 single cifs.creds is refused, not silently ign
     "PRE-OI-18 shape" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 rm -f "$S/cifs.creds"
 
+# THE SIM'S TLS ESCAPE HATCH, ON A PRODUCTION PANEL. The A19 gate hub serves the
+# kiosk site from Caddy's internal CA, so the sim WALL_APP_CMD carries
+# --ignore-certificate-errors. The only way that reaches a real wall.env is a
+# copy-paste from a sim one — and the origin it would stop validating is the one
+# that injects this household's identity header.
+cp "$S/wall.env" "$WORK/wallenv-prod.bak"
+sed -i 's|^WALL_APP_CMD=.*|WALL_APP_CMD=/opt/wall-panel/app/wall-shell --ignore-certificate-errors|' "$S/wall.env"
+expect_refusal "a PRODUCTION wall.env carrying the sim's --ignore-certificate-errors is refused" \
+    "SIM-ONLY" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+cp "$WORK/wallenv-prod.bak" "$S/wall.env"
+
+expect_refusal "SIM_LAB_* on a PRODUCTION wall build is refused rather than silently discarded" \
+    "sim-only rewrite" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 \
+    "SIM_LAB_WAN_MAC=00:15:5D:A1:90:50" "SIM_LAB_MAC=00:15:5D:A1:91:50" "SIM_LAB_ADDR=10.99.7.50/24"
+
+echo
+echo "=== 4c. the A19 two-VM lab, and the panel's TLS delta (sim only) ==="
+if env "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DIR="$WORK/out-dir" \
+        bash "$BUILDER" >"$WORK/out.txt" 2>&1; then
+    assert_file_matches "with no SIM_LAB_* the shipped e* DHCP matcher survives (the wall gate builds the image it always built)" \
+        "$WORK/out-dir/iso-root/user-data" '^[[:space:]]*name: "e\*"'
+    assert_file_matches "the SIM panel ignores certificate errors, because the gate hub mints its own root and no image can carry it" \
+        "$WORK/out-dir/iso-root/deploy-payload/site/wall.env" '^WALL_APP_CMD=.*--ignore-certificate-errors'
+    assert_file_matches "…and still disables the GPU (a second flag must not displace the first)" \
+        "$WORK/out-dir/iso-root/deploy-payload/site/wall.env" '^WALL_APP_CMD=.*--disable-gpu'
+else
+    fail_case "the plain sim wall build (4c baseline)" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+if env "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DIR="$WORK/out-dir" \
+        SIM_LAB_WAN_MAC=00:15:5D:A1:90:50 SIM_LAB_MAC=00:15:5D:A1:91:50 \
+        SIM_LAB_ADDR=10.99.7.50/24 SIM_LAB_DNS=10.99.7.10 SIM_LAB_SEARCH=vmtest.sim.invalid \
+        bash "$BUILDER" >"$WORK/out.txt" 2>&1; then
+    U="$WORK/out-dir/iso-root/user-data"
+    assert_file_matches "the panel's lab leg is pinned by MAC, not by name" "$U" 'macaddress: "00:15:5D:A1:91:50"'
+    assert_file_matches "the panel's lab leg is static" "$U" 'addresses:'
+    assert_file_matches "the e* matcher is CONSUMED — it would otherwise match both legs and race the pinned stanzas" \
+        "$U" '^[[:space:]]*name: "e\*"' --absent
+    # The scoped resolver is the whole reason the panel can use the hub's
+    # Technitium without sending `archive.ubuntu.com` to a box that does not
+    # exist during the install.
+    assert_file_matches "the lab nameserver is SCOPED by a search domain (resolved routes only lab names there)" \
+        "$U" 'search:'
+    assert_file_matches "…and the wall image still declares no Wi-Fi after the second rewrite" \
+        "$U" '^[[:space:]]*(wifis|access-points):' --absent
+else
+    fail_case "the A19 lab wall build" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
 echo
 echo "=== 4b. the payload's MODES (the hub's 2026-08-04 defect is this image's too) ==="
 # Booting the HUB gate VM found /opt/homehub and 230 paths under it 0777, with

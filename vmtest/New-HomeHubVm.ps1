@@ -144,6 +144,21 @@ param(
 
     [string]$SwitchName = 'Default Switch',
 
+    # ── A19 two-VM lab (optional; omit all three and nothing below changes) ────
+    # The gate needs BOTH VMs on one switch at KNOWN addresses, because the kiosk
+    # site's guard is `remote_ip {$PANEL_IP}/32`. An Internal switch has no DHCP,
+    # so the guest configures the lab leg statically — and it can only tell the
+    # two legs apart by MAC, because both come up as eth0/eth1 in an order VMBus
+    # decides. These MACs are therefore not cosmetic: they must match the
+    # SIM_LAB_WAN_MAC / SIM_LAB_MAC the ISO was built with, or the installed box
+    # has no address on the switch the gate runs over.
+    #
+    # The Default Switch leg stays, and stays first: the Internal switch has no
+    # internet and the installer still has to fetch 40 packages.
+    [string]$LabSwitchName,
+    [string]$WanMac,
+    [string]$LabMac,
+
     [string]$SecureBootTemplate = 'MicrosoftUEFICertificateAuthority',
     [switch]$DisableSecureBoot,
     [switch]$DynamicMemory,
@@ -172,6 +187,31 @@ function Assert-HyperV {
 
 Assert-Elevated
 Assert-HyperV
+
+# The lab knobs are all-or-nothing. A half-specified lab is the failure this
+# whole exercise exists to avoid: the VM comes up, installs cleanly, and simply
+# has no address on the switch the gate runs over — which reads as "the hub is
+# down" from the panel and as nothing at all from the host.
+$labKnobs = @($LabSwitchName, $WanMac, $LabMac) | Where-Object { $_ }
+if ($labKnobs.Count -notin @(0, 3)) {
+    throw "-LabSwitchName, -WanMac and -LabMac must be given together (got $($labKnobs.Count) of 3). " +
+          "A lab leg with no MAC cannot be matched by the guest's netplan, and a MAC with no lab switch " +
+          "pins an adapter that is not there."
+}
+$LabMode = $labKnobs.Count -eq 3
+if ($LabMode) {
+    foreach ($m in @($WanMac, $LabMac)) {
+        if ($m -notmatch '^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$') {
+            throw "'$m' is not a MAC address. Use the same form the ISO was built with (e.g. 00:15:5D:A1:90:10)."
+        }
+    }
+    if (($WanMac -replace '[:-]','') -eq ($LabMac -replace '[:-]','')) {
+        throw "-WanMac and -LabMac are the same address. The guest's netplan matches on them; identical MACs make both stanzas claim both NICs."
+    }
+    if (-not (Get-VMSwitch -Name $LabSwitchName -ErrorAction SilentlyContinue)) {
+        throw "No Hyper-V switch named '$LabSwitchName'. Create it first: .\vmtest\New-A19Lab.ps1"
+    }
+}
 
 $UbuntuIsoPath = (Resolve-Path -LiteralPath $UbuntuIsoPath).Path
 $SeedIsoPath   = (Resolve-Path -LiteralPath $SeedIsoPath).Path
@@ -247,6 +287,16 @@ if ($PSCmdlet.ShouldProcess($VMName, "Create Gen2 VM (${CPUCount} vCPU / ${Memor
     # production-style checkpoints just burn disk for no benefit here.
     Set-VM -VMName $VMName -AutomaticCheckpointsEnabled $false -WhatIf:$WhatIfPreference
 
+    if ($LabMode) {
+        # Pin the WAN leg's MAC (Hyper-V hands out a dynamic one otherwise, and
+        # a dynamic MAC changes on recreate — so the netplan that matched it
+        # yesterday matches nothing today), then add the lab leg.
+        Get-VMNetworkAdapter -VMName $VMName |
+            Set-VMNetworkAdapter -StaticMacAddress ($WanMac -replace '[:-]','') -WhatIf:$WhatIfPreference
+        Add-VMNetworkAdapter -VMName $VMName -Name 'lab' -SwitchName $LabSwitchName `
+            -StaticMacAddress ($LabMac -replace '[:-]','') -WhatIf:$WhatIfPreference
+    }
+
     $ubuntuDvd = Add-VMDvdDrive -VMName $VMName -Path $UbuntuIsoPath -Passthru -WhatIf:$WhatIfPreference
     if (-not $SkipSecondDvd) {
         Add-VMDvdDrive -VMName $VMName -Path $SeedIsoPath -WhatIf:$WhatIfPreference | Out-Null
@@ -261,6 +311,10 @@ if ($PSCmdlet.ShouldProcess($VMName, "Create Gen2 VM (${CPUCount} vCPU / ${Memor
     Write-Host "  vCPU/RAM:  $CPUCount / ${MemoryGB}GB $(if ($DynamicMemory) { '(dynamic)' } else { '(static)' })" -ForegroundColor Green
     Write-Host "  Disk:      $vhdPath (dynamic, ${DiskGB}GB cap)" -ForegroundColor Green
     Write-Host "  Switch:    $SwitchName" -ForegroundColor Green
+    if ($LabMode) {
+        Write-Host "  NIC 1 (wan): $WanMac on '$SwitchName' (DHCP; the installer's apt path)" -ForegroundColor Green
+        Write-Host "  NIC 2 (lab): $LabMac on '$LabSwitchName' (static, configured by the ISO's netplan)" -ForegroundColor Green
+    }
     Write-Host "  Secure Boot: $(if ($DisableSecureBoot) { 'OFF' } else { "ON ($SecureBootTemplate)" })" -ForegroundColor Green
     Write-Host "  DVD 1 (Ubuntu): $UbuntuIsoPath" -ForegroundColor Green
     if (-not $SkipSecondDvd) {

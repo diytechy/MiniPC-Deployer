@@ -771,6 +771,185 @@ set_env_key() {
         die "substitution for '$key' did not apply as written: expected '$val', file now has '$actual'"
 }
 
+# apply_sim_lab_netplan USER_DATA ROLE — the A19 two-VM lab's network, SIM ONLY.
+#
+# A19 asks for two VMs on ONE switch with KNOWN addresses, because the kiosk
+# site's guard is `remote_ip {$PANEL_IP}/32` and Hyper-V's Default Switch is NAT
+# with quasi-random leases. An Internal switch has no DHCP server, so static is
+# required rather than merely preferred.
+#
+# BOTH images ship the SAME network block — `ethernets: any-eth: match: name:
+# "e*"` with dhcp4 — and that is deliberate (the V3 gate exercises the config
+# that ships). It cannot express the lab: two NICs both match `e*`, so netplan
+# would DHCP the Internal leg too, where nothing answers.
+#
+# So this REPLACES the block, on the sim path only, with two stanzas matched by
+# MAC ADDRESS — the only property the operator can pin from the Hyper-V side
+# before the guest has ever booted. Interface NAMES cannot do it: both legs come
+# up as eth0/eth1 in an order the VMBus decides.
+#
+#   wan-eth   the Default Switch leg — DHCP, the default route, and the ONLY
+#             reason it exists is that the installer must fetch packages. §3
+#             calls for a switch with no internet; apt still needs one, and
+#             finding that out at `apt exit 100` costs an install cycle.
+#   lab-eth   the Internal switch leg — static, NO gateway (the default route
+#             belongs to wan-eth), `optional: true` so a lab switch that is not
+#             there yet cannot hang boot.
+#
+# THE PANEL'S NAMESERVER IS SCOPED, NOT GLOBAL, and that is the subtle part. The
+# panel must resolve WALL_HOST through the hub's Technitium, but pointing it at
+# the hub for EVERY name would send `archive.ubuntu.com` there too — a resolver
+# that does not exist during the install, and 40 packages' worth of timeouts.
+# systemd-resolved uses a link's search domains as ROUTING domains, so
+# `search: [<domain>]` sends exactly the lab's names to the hub and leaves
+# everything else on the NAT leg. Set SIM_LAB_DNS/SIM_LAB_SEARCH together.
+#
+# NO-OP UNLESS SIM_LAB_ADDR IS SET, so an ordinary V3/wall gate builds exactly
+# the image it built before this existed.
+apply_sim_lab_netplan() {
+    local f="$1" role="$2"
+    # $f is $OUT_DIR/iso-root/user-data — two levels up is the build directory.
+    local out_dir; out_dir="$(dirname "$(dirname "$f")")"
+    # A manifest left by an EARLIER lab build in this OUT_DIR would outlive the
+    # ISO it describes and hand Start-A19Gate.ps1 MACs the current image does not
+    # match. Clear it first, unconditionally.
+    rm -f "$out_dir/a19-lab.env"
+    [ -n "${SIM_LAB_ADDR:-}" ] || return 0
+
+    [ -n "${SIM_LAB_WAN_MAC:-}" ] || \
+        die "SIM_LAB_ADDR is set but SIM_LAB_WAN_MAC is not. Both legs must be pinned by MAC:" \
+            "with only one stanza matched, the OTHER NIC is left unconfigured, and which of the" \
+            "two Hyper-V hands you as eth0 is not decidable from inside the guest."
+    [ -n "${SIM_LAB_MAC:-}" ] || \
+        die "SIM_LAB_ADDR is set but SIM_LAB_MAC is not — see SIM_LAB_WAN_MAC above."
+    case "$SIM_LAB_ADDR" in
+        */*) : ;;
+        *) die "SIM_LAB_ADDR='$SIM_LAB_ADDR' has no prefix length. netplan's addresses: takes CIDR (e.g. 10.99.7.10/24); a bare address is a parse error the installer reports as an unusable network." ;;
+    esac
+    if [ -n "${SIM_LAB_DNS:-}" ] && [ -z "${SIM_LAB_SEARCH:-}" ]; then
+        die "SIM_LAB_DNS is set but SIM_LAB_SEARCH is not. An unscoped nameserver on the lab leg" \
+            "is used for EVERY name, including the ones apt needs, against a resolver that does" \
+            "not exist yet. Set SIM_LAB_SEARCH to the lab's domain so resolved routes only those" \
+            "names there."
+    fi
+
+    # One block, and only one. Two would mean the rewrite below silently edits
+    # whichever came first and leaves the real one alone.
+    local blocks
+    blocks="$(grep -cE '^    ethernets:$' "$f" || true)"
+    [ "$blocks" = "1" ] || \
+        die "expected exactly ONE 'ethernets:' block in $(basename "$f") to replace with the A19 lab" \
+            "network; found $blocks. The image's network stanza changed shape — update" \
+            "apply_sim_lab_netplan rather than shipping a VM with no lab leg."
+
+    local ns=''
+    if [ -n "${SIM_LAB_DNS:-}" ]; then
+        ns="        nameservers:
+          addresses:
+            - \"$SIM_LAB_DNS\"
+          search:
+            - \"$SIM_LAB_SEARCH\"
+"
+    fi
+
+    awk -v wan="$SIM_LAB_WAN_MAC" -v lab="$SIM_LAB_MAC" -v addr="$SIM_LAB_ADDR" -v ns="$ns" '
+        /^    ethernets:$/ {
+            print "    ethernets:"
+            print "      # A19 LAB (sim only) — see apply_sim_lab_netplan in vmtest/lib/common.sh."
+            print "      wan-eth:"
+            print "        match:"
+            print "          macaddress: \"" wan "\""
+            print "        dhcp4: true"
+            print "      lab-eth:"
+            print "        match:"
+            print "          macaddress: \"" lab "\""
+            print "        dhcp4: false"
+            print "        optional: true"
+            print "        addresses:"
+            print "          - \"" addr "\""
+            if (ns != "") printf "%s", ns
+            skip = 1
+            next
+        }
+        skip && /^  [^ ]/ { skip = 0 }
+        !skip
+    ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+
+    # Assert the RESULT, not the substitution — a no-op here ships a VM that
+    # installs fine and then has no address on the switch the gate runs over,
+    # which reads as "the hub is down" from the panel and as nothing at all from
+    # the host.
+    grep -qF "$SIM_LAB_WAN_MAC" "$f" || die "the A19 lab netplan rewrite did not apply (no WAN MAC in $(basename "$f"))"
+    grep -qF "$SIM_LAB_MAC" "$f" || die "the A19 lab netplan rewrite did not apply (no lab MAC in $(basename "$f"))"
+    grep -qF "$SIM_LAB_ADDR" "$f" || die "the A19 lab netplan rewrite did not apply (no lab address in $(basename "$f"))"
+    grep -qE '^[[:space:]]*name: "e\*"' "$f" && \
+        die "the A19 lab netplan rewrite left the original 'name: \"e*\"' matcher behind — it would match BOTH legs and race the MAC-pinned stanzas. The awk did not consume the whole block."
+    # THE MANIFEST IS THE POINT OF NOT RETYPING THESE. The guest matches on the
+    # MACs; Hyper-V assigns them. Two places holding the same three values by
+    # hand is the drift that produces a VM which installs perfectly and has no
+    # address on the gate's switch. Start-A19Gate.ps1 reads this file instead of
+    # taking them as parameters, so the ISO decides and the VM follows.
+    {
+        sim_banner "apply_sim_lab_netplan"
+        echo "A19_ROLE=$role"
+        echo "A19_WAN_MAC=$SIM_LAB_WAN_MAC"
+        echo "A19_LAB_MAC=$SIM_LAB_MAC"
+        echo "A19_LAB_ADDR=$SIM_LAB_ADDR"
+        echo "A19_LAB_DNS=${SIM_LAB_DNS:-}"
+        echo "A19_LAB_SEARCH=${SIM_LAB_SEARCH:-}"
+    } > "$out_dir/a19-lab.env"
+
+    log "A19 lab netplan ($role): wan=$SIM_LAB_WAN_MAC(dhcp) lab=$SIM_LAB_MAC($SIM_LAB_ADDR)${SIM_LAB_DNS:+ dns=$SIM_LAB_DNS via $SIM_LAB_SEARCH}"
+    log "  -> $out_dir/a19-lab.env (Start-A19Gate.ps1 reads the MACs from here)"
+}
+
+# apply_sim_caddy_local_certs PAYLOAD_DIR — the sim hub's TLS, SIM ONLY.
+#
+# THE KIOSK SITE HAS NEVER SERVED TLS ON A GATE VM, and nothing said so. The
+# real Caddyfile's only global option is `email {$ACME_EMAIL}`, so every site —
+# including {$WALL_HOST}:{$WALL_PORT} — is issued by public ACME. The sim
+# DOMAIN is `vmtest.sim.invalid`: `.invalid` is reserved by RFC 6761 and can
+# never be validated, so Caddy retries forever and the TLS handshake fails with
+# no certificate. The V3 gate never noticed because it only ever asserted that
+# containers were healthy, and Caddy IS healthy — it is serving nothing.
+#
+# A19 is the first gate that needs a client to complete a handshake, so the sim
+# payload's Caddyfile gains `local_certs` (Caddy's own internal CA) — the SAME
+# delta sim/caddy/Caddyfile.sim has carried since WI-10.14, applied here to the
+# real file rather than by forking it. The container sim proved the shape; the
+# installed hub never inherited it.
+#
+# THE PANEL STILL DOES NOT TRUST THAT ROOT, and that is handled on the panel
+# side (render_sim_wall_env's WALL_SIM_APP_FLAGS) rather than by shipping a CA
+# into an image that is built before the CA exists.
+apply_sim_caddy_local_certs() {
+    local payload_dir="$1"
+    local cf="$payload_dir/stack/caddy/Caddyfile"
+    [ -f "$cf" ] || die "not found: $cf — the payload copy has no Caddyfile, so the sim TLS delta cannot be applied."
+
+    grep -qE '^[[:space:]]*local_certs[[:space:]]*$' "$cf" && \
+        die "$cf already declares local_certs. The TRACKED Caddyfile must keep public ACME — a hub" \
+            "that mints its own certs for a publicly-resolvable name is a browser warning on every" \
+            "household device. Remove it there; this rewrite is the sim's business."
+
+    sed -i -e 's|^\([[:space:]]*\)email {\$ACME_EMAIL}$|\1email {$ACME_EMAIL}\n\1# VMTEST: internal CA instead of public ACME — the sim DOMAIN ends in .invalid\n\1# (RFC 6761), which no ACME challenge can ever validate. Without this every\n\1# site, including the kiosk site A19 renders from, fails the handshake.\n\1local_certs|' "$cf"
+
+    local n; n="$(grep -cE '^[[:space:]]*local_certs[[:space:]]*$' "$cf" || true)"
+    [ "$n" = "1" ] || \
+        die "the sim local_certs rewrite did not apply (found $n occurrences, expected 1) —" \
+            "stack/caddy/Caddyfile no longer carries 'email {\$ACME_EMAIL}' in its global block." \
+            "Without it the gate's kiosk site serves no certificate and the panel fails the" \
+            "handshake, four layers away from the cause. Update apply_sim_caddy_local_certs."
+    # Inside the GLOBAL block, not inside a site — a stray `local_certs` in a
+    # site body is a Caddy parse error, and the container would restart-loop.
+    local lc_line first_site
+    lc_line="$(grep -nE '^[[:space:]]*local_certs[[:space:]]*$' "$cf" | cut -d: -f1)"
+    first_site="$(grep -nE '^\(protect_actual\)' "$cf" | cut -d: -f1)"
+    [ -n "$first_site" ] && [ "$lc_line" -lt "$first_site" ] || \
+        die "local_certs landed at line $lc_line, outside the Caddyfile's global block. Caddy would refuse the config."
+    log "SIM TLS: stack/caddy/Caddyfile -> local_certs (internal CA; the tracked file keeps public ACME)"
+}
+
 # render_seed_tree REPO_ROOT OUT_DIR CALLER_NAME
 #
 # Shared by build-seed.sh and build-repacked-iso.sh: materializes
@@ -962,6 +1141,18 @@ render_seed_tree() {
         die "vmtest storage pin was NOT applied — stack/autoinstall/user-data's storage match is no longer 'path: /dev/nvme0n1', so the sed above silently did nothing. Refusing to build a sim ISO whose disk pin is unreviewed: re-check the storage stanza and update this substitution."
     grep -Eq '^[[:space:]]+(path|serial|wwn):' "$user_data_out" && \
         die "the sim user-data still carries a real-hardware disk match (path/serial/wwn) — a sim ISO must only ever be able to select a virtual disk. Refusing to build."
+
+    apply_sim_lab_netplan "$user_data_out" hub
+    fi
+
+    # A PRODUCTION hub must never carry the lab's addressing. The knobs are
+    # ignored above (the production branch copies user-data.filled verbatim), so
+    # a build that sets them is asking for something it is not getting — say so
+    # rather than hand back a stick that looks like an A19 image and is not.
+    if [ "$HUB_BUILD_KIND" = "production" ] && [ -n "${SIM_LAB_ADDR:-}" ]; then
+        die "SIM_LAB_* is set on a PRODUCTION build (SITE_DIR=$SITE_DIR). The A19 lab network is a" \
+            "sim-only rewrite and production user-data.filled is taken verbatim, so these knobs" \
+            "would be silently discarded. Unset them, or drop SITE_DIR to build the sim image."
     fi
 
     # ── Does Subiquity actually ACCEPT this file? ────────────────────────────
@@ -1123,6 +1314,8 @@ render_seed_tree() {
 
     apply_sim_env_overrides "$sim_env"
     assert_env_interpolation_safe "$sim_env"
+
+    apply_sim_caddy_local_certs "$payload_dir"
 }
 
 # apply_sim_env_overrides FILE [OVERRIDES] [VAR_NAME] — fold KEY=VALUE pairs in.
@@ -1785,6 +1978,16 @@ render_wall_seed_tree() {
         die "the sim user-data still declares Wi-Fi — Hyper-V cannot emulate a radio and the installer would have no network. The awk above did not consume the whole block."
     grep -q 'REPLACE_WITH_WIFI' "$user_data_out" && \
         die "the sim user-data still carries Wi-Fi placeholders. The awk above did not consume the whole block."
+
+    apply_sim_lab_netplan "$user_data_out" panel
+    fi
+
+    # See the hub's equivalent: production takes user-data.filled verbatim, so
+    # the lab knobs would be accepted and discarded.
+    if [ "$WALL_BUILD_KIND" = "production" ] && [ -n "${SIM_LAB_ADDR:-}" ]; then
+        die "SIM_LAB_* is set on a PRODUCTION wall build (WALL_SITE_DIR=$WALL_SITE_DIR). The A19 lab" \
+            "network is a sim-only rewrite and production user-data.filled is taken verbatim, so" \
+            "these knobs would be silently discarded. Unset them, or drop WALL_SITE_DIR."
     fi
 
     # Does Subiquity actually ACCEPT this file, and WHICH DISK will it wipe?
@@ -1864,6 +2067,19 @@ stage_wall_site_files() {
             "and one file cannot authenticate on both hosts. Re-run:" \
             "pwsh Materialize-Deploy.ps1 -Image wall   (Personal\\homelab\\deploy)"
     fi
+    # THE SIM'S TLS ESCAPE HATCH MUST NEVER REACH A WALL. render_sim_wall_env
+    # puts --ignore-certificate-errors in the sim WALL_APP_CMD because the gate
+    # hub mints its own certs; a real panel talks to a real hub with a real
+    # public cert, and a panel that ignores certificate errors would accept any
+    # interception of the ONE origin that carries the household's identity
+    # header. A materialised wall.env can only carry it by being copied from a
+    # sim one, which is exactly the mistake worth naming.
+    grep -qE '^WALL_APP_CMD=.*--ignore-certificate-errors' "$site_out/wall.env" && \
+        die "$site_dir/wall.env sets WALL_APP_CMD with --ignore-certificate-errors. That is a SIM-ONLY" \
+            "flag (the gate hub serves the kiosk site from Caddy's internal CA) and it disables" \
+            "certificate validation for the origin that injects this household's identity header." \
+            "Remove it and re-run Materialize-Deploy.ps1 -Image wall."
+
     [ -f "$site_out/cifs-music.creds" ] || \
         log "NOTE: no cifs-music.creds in $site_dir — the panel cannot mount its MUSIC share" \
             "(HOMEHUB), so wall-sync FAILS on every boot and resume and the panel's PRIMARY" \
@@ -1934,12 +2150,29 @@ render_sim_wall_env() {
     set_env_key "$env_out" MEDIA_MUSIC_SHARE_UNC "//vmtest-no-samba.invalid/Media"
     set_env_key "$env_out" MEDIA_FRAME_SHARE_UNC "//vmtest-no-miniserv.invalid/PictureFrameVideos"
 
-    # THE KIOSK COMMAND. `--disable-gpu` is the sim delta: Hyper-V's hyperv_drm
-    # exposes /dev/dri/card1 with NO renderD* node, so hardware GL has nothing
-    # to bind to. wall-kiosk.sh word-splits WALL_APP_CMD and tests only its
-    # FIRST word with [ -x ], so flags ride along without a second knob and
-    # without repackaging (packaging.md §2.3).
-    set_env_key "$env_out" WALL_APP_CMD "/opt/wall-panel/app/wall-shell ${WALL_SIM_APP_FLAGS:---disable-gpu}"
+    # THE KIOSK COMMAND, and TWO sim deltas ride in it. wall-kiosk.sh
+    # word-splits WALL_APP_CMD and tests only its FIRST word with [ -x ], so
+    # flags ride along without a second knob and without repackaging
+    # (packaging.md §2.3).
+    #
+    #   --disable-gpu                Hyper-V's hyperv_drm exposes /dev/dri/card1
+    #                                with NO renderD* node, so hardware GL has
+    #                                nothing to bind to.
+    #   --ignore-certificate-errors  The sim hub serves the kiosk site from
+    #                                Caddy's INTERNAL CA (apply_sim_caddy_local_
+    #                                certs) — public ACME cannot validate a
+    #                                `.invalid` name. Nothing can put that root
+    #                                into this image: it does not exist until
+    #                                the hub's first boot, which is after this
+    #                                ISO is written.
+    #
+    # THIS GATE THEREFORE PROVES NOTHING ABOUT TLS TRUST, and that belongs in
+    # the writeup beside the Wi-Fi delta, not in a footnote. A sim panel can
+    # only ever be pointed at a `.invalid` host (WALL_HOST's default and the
+    # refusal below), so the flag cannot reach anything real — and a PRODUCTION
+    # wall build carrying it is refused outright in stage_wall_site_files.
+    set_env_key "$env_out" WALL_APP_CMD \
+        "/opt/wall-panel/app/wall-shell ${WALL_SIM_APP_FLAGS:---disable-gpu --ignore-certificate-errors}"
 
     # WALL_DISABLE_INPUT: EMPTY, deliberately. Quirk 3 disables the internal
     # keyboard/touchpad because they face the wall mount. A VM's synthetic

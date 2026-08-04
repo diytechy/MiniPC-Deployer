@@ -155,6 +155,26 @@ last) — it is the record, not required reading for every pass.
       **not** on an installed box. The next hub/wall install is what closes it.
       Same family as OI-19 and the gitignored-payload leak: a latent defect in
       every artifact, invisible to every static check, surfaced by an install.
+      **2026-08-04 (later): BOTH ISOs HAVE NOW BEEN REBUILT** from the fixed
+      builder, into `D:\vmtest-out-hub-a19` and `D:\vmtest-out-wall-a19`, and
+      `assert_iso_payload_modes` passed on both artifacts. Still not an
+      installed box — that is the A19 run (OI-22).
+    - OI-22 — **RUN THE A19 TWO-VM GATE** (2026-08-04). Everything it needs is
+      now built and no decision is outstanding; it needs elevation and about
+      three hours of wall-clock, which is why it is the Owner's. Three
+      commands, in order, from an elevated shell in the MiniPC-Deployer
+      checkout:
+      `.\vmtest\Start-A19Gate.ps1 -Stage Lab`, then `-Stage Hub -Force -Watch`,
+      then — only once the hub answers — `-Stage Panel -Force -Watch`. The two
+      installs must not overlap (two VMs on one host and one disk turned a
+      45-60 minute wall install into ~2h10m on 2026-08-04). See
+      [vmtest/README.md](../vmtest/README.md) §12 for the addressing plan and
+      the three sim deltas it introduces, and Personal's
+      `WALL_PANEL_BRINGUP_PLAN.md` §3 for what to assert once both are up.
+      **This single run is what closes OI-17 (the shell has never painted),
+      OI-19, OI-20, OI-21 and the hostname fix — all five are code-complete and
+      INSTALL-UNVERIFIED, and an install is the only thing that can speak to
+      any of them.**
     - OI-18 — **RULED (b) 2026-08-03, BUILT THE SAME DAY, and HARDENED 2026-08-04
       after an adversarial review refuted its headline claim;
       INSTALL-UNVERIFIED — NOTHING HAS EVER BEEN MOUNTED.** The panel has **two**
@@ -3818,3 +3838,123 @@ knowing:**
    production box already had that (4b installs it so), so this only makes the
    sim match production — but `docker compose` in `/opt/homehub/stack` must now
    be run as root there, as it always had to be on the real hub.
+
+---
+
+### DRIVER — G1 — Round 1 — 2026-08-04 (A19 is buildable at last, and finding out what it needed found two more defects)
+
+**WHAT THIS ENTRY IS.** The wall gate's §5 said A19 was blocked on "wiring
+between the two VMs: the Internal switch, static addresses, `WALL_HOST`
+overridden, `PANEL_IP` set, and the sim tracker definitions seeded". Every item
+on that list is now delivered *by the ISOs and by tracked scripts*. Working out
+what each one actually required surfaced **two defects that no amount of review
+would have found**, because neither is reachable until a client has to talk to a
+gate hub — and nothing ever had.
+
+**DEFECT: THE KIOSK SITE HAS NEVER SERVED TLS, ON ANY GATE VM, AND CADDY WAS
+HEALTHY THE WHOLE TIME.** The sim `DOMAIN` is `vmtest.sim.invalid`. `.invalid`
+is reserved by RFC 6761 precisely so that it can never resolve publicly, which
+also means no ACME challenge over it can ever be validated. The real Caddyfile's
+only global option is `email {$ACME_EMAIL}`, so **every** site on a gate VM —
+including `{$WALL_HOST}:{$WALL_PORT}`, the one A19 exists to render — has been
+retrying a certificate it can never get, and failing every handshake for want of
+one.
+
+Nothing noticed because **every V3 gate asserted container health**, and Caddy is
+genuinely healthy: the process is up, its config loaded, its healthcheck passes.
+It is serving nothing. That is the same shape as `/healthz` on the tracker and
+`exit 0` after a failed copy — a green that answers a question nobody was asking.
+
+The fix was sitting in the repo. `sim/caddy/Caddyfile.sim` has carried
+`local_certs` since WI-10.14 as a documented REAL-vs-SIM delta; the **installed**
+hub simply never inherited it, because the sim compose file forks the Caddyfile
+and `render_seed_tree` does not. `apply_sim_caddy_local_certs` now applies that
+one delta to the payload copy on the sim path, asserts it landed **inside the
+global block** (a stray `local_certs` in a site body is a parse error and a
+restart loop), and refuses if the tracked file ever declares it — a hub minting
+its own certs for a publicly-resolvable name is a browser warning on every
+household device.
+
+**AND THE CONSEQUENCE IS A STATED NON-PROOF, NOT A SECOND FIX.** Nothing can put
+that internal root into the wall image: it does not exist until the hub's first
+boot, which is after the panel's ISO is written. So the sim `WALL_APP_CMD` gains
+`--ignore-certificate-errors` beside `--disable-gpu`, **this gate proves nothing
+about TLS trust**, and the builder now **refuses** a production `wall.env`
+carrying that flag — the only way it reaches a real panel is a copy-paste from a
+sim one, and the origin it would stop validating is the one that injects this
+household's identity header.
+
+**DEFECT: THE GATE HUB'S TRACKER HAS NO ITEMS, AND A WALL CANNOT SHOW THE
+DIFFERENCE.** A19's whole assertion is that `library-mounted` and
+`backup-drive-mounted` report RED **on the panel's screen**.
+`sim/tracker-seed/definitions/drives.md` is the only committable thing that
+declares those two ids — and it was mounted only by `docker-compose.sim.yml`,
+the *container* sim. An installed hub runs `stack/docker-compose.yml`, whose
+tracker had no seed at all. Against an empty `/data` there is nothing to be red;
+the container still reports healthy because the healthcheck probes `/healthz`,
+which is data-free by design (SR-040); and on a wall **"no red drive check" and
+"the drive check is green" are the same picture.** Measured 2026-08-01 in a
+different guise: the gate VM's tracker ran healthy for hours with an empty
+`/data` and its nightly run failing every night.
+
+`TRACKER_SEED_DIR` + `TRACKER_SEED_SRC` are now knobs, and both are **inert by
+default**: blank `_DIR` means the entrypoint passes no `--seed`, and the default
+`_SRC` (`stack/tracker-seed/`) ships a README and deliberately **no
+`definitions/`**, so a box that sets the env var by mistake still seeds nothing.
+A real household's definitions arrive with the person, not from a fixture.
+
+**THE LAB ITSELF — `apply_sim_lab_netplan`, and the three things that make a
+second NIC harder than it sounds.** Both images ship one network stanza,
+`ethernets: any-eth: match: name: "e*"` with DHCP, and keeping ONE match for
+production and the VM is deliberate. It cannot express the lab: two NICs both
+match `e*`, so netplan would DHCP the Internal leg too, where nothing answers.
+
+1. **The legs can only be told apart by MAC.** Both come up as `eth0`/`eth1` in
+   an order VMBus decides, so both stanzas match on `macaddress:` and
+   `New-HomeHubVm.ps1` sets those MACs **statically** — a dynamic MAC changes on
+   recreate, so the netplan that matched it yesterday matches nothing today.
+   That is two places holding the same three values, which is drift waiting to
+   happen, so the builder writes `$OUT_DIR/a19-lab.env` and `Start-A19Gate.ps1`
+   reads it. Nobody retypes a MAC. A build with no lab knobs **deletes** any
+   stale manifest rather than leaving one that outlives the ISO it describes.
+2. **The Internal switch has no internet and the installer needs one.** Each VM
+   keeps a Default Switch leg purely so `apt` can fetch 40 packages; the lab leg
+   carries **no gateway**, so the default route stays where the packages are.
+3. **An unscoped nameserver on the lab leg breaks the install.** The panel must
+   resolve `WALL_HOST` through the hub's Technitium — but pointing it there for
+   *every* name sends `archive.ubuntu.com` to a box that does not exist yet.
+   `nameservers.search` makes it a **routing** domain in systemd-resolved, so
+   only lab names go to the hub. `SIM_LAB_DNS` without `SIM_LAB_SEARCH` is
+   refused rather than accepted.
+
+**NO OVERRIDE WAS NEEDED FOR `WALL_HOST`, and that is worth recording** because
+both the plan and the handoff said one was. The panel's sim default is
+`wall.vmtest.sim.invalid` and the hub's sim `DOMAIN` is `vmtest.sim.invalid`, so
+`EXTRA_SUBDOMAINS=wall` makes Technitium authoritative for exactly that name.
+The containment property is *stronger* than overriding to `wall.home.arpa`: an
+`.invalid` name can resolve inside the lab and nowhere else, so a sim panel still
+cannot reach anything real.
+
+**PROVEN, AND WHAT IS NOT.** Both ISOs were **rebuilt** — the first build from
+`79f4ed5`, which closes the "no ISO has been rebuilt" half of OI-21 for the
+*artifact*: `assert_iso_payload_modes` passed on both, "nothing under
+/deploy-payload is group- or world-writable". The rendered netplan, the staged
+`.env`, the `local_certs` placement, the seed fixture in the payload and the
+panel's two flags were all read back off the built trees. Suites:
+`test-hub-seed.sh` 35 to **47 passed, 0 failed, 0 skipped**;
+`test-wall-builder.sh` 97 to **107 passed, 0 failed, 0 skipped**;
+`scripts/check.py` PASS; `scripts/validate_config.py` ALL PASSED.
+
+**NOT proven: nothing has been installed.** No VM has booted either ISO. Both
+new defects are fixed the way the last three were — in the builder, with a
+refusal — and both stay INSTALL-UNVERIFIED until OI-22 runs. That run is the
+Owner's: it needs elevation and about three hours, and it is the single thing
+that speaks to OI-17, OI-19, OI-20, OI-21 and the hostname fix at once.
+
+**ALSO CLOSED, AND SMALL:** the screenshot watcher. The scratch
+`watch-wall-vm.ps1` had a hard 90-minute deadline against a ~2h10m install,
+exited quietly, and left a console that simply stopped updating — silence
+indistinguishable from a hung VM, from a process an unelevated session cannot
+restart. `vmtest/Watch-VmConsole.ps1` is tracked, budgeted in hours,
+`-UntilOff`-capable, and **every** exit path writes why it stopped, including
+"the install may STILL BE RUNNING; this is not evidence of a hung VM".

@@ -310,6 +310,82 @@ else
 fi
 
 echo
+echo "=== the A19 two-VM lab (sim only) ==="
+
+# THE DEFAULT MUST NOT MOVE. Every V3 gate to date built the `e*` DHCP block,
+# and a lab rewrite that fired without being asked would change what the hub
+# gate covers without anyone choosing that.
+if build_seed; then
+    grep -qE '^[[:space:]]*name: "e\*"' "$OUT/iso-root/user-data" \
+        && ok "with no SIM_LAB_* set the shipped e* DHCP matcher is untouched (the V3 gate builds the image it always built)" \
+        || bad "lab netplan default" "the e* matcher is gone from a build that asked for no lab"
+else
+    bad "the sim build itself (lab default case)" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+LAB_ENV=("SIM_LAB_WAN_MAC=00:15:5D:A1:90:10" "SIM_LAB_MAC=00:15:5D:A1:91:10" "SIM_LAB_ADDR=10.99.7.10/24")
+if build_seed "${LAB_ENV[@]}"; then
+    U="$OUT/iso-root/user-data"
+    probs=""
+    grep -q '00:15:5D:A1:90:10' "$U" || probs="$probs no-wan-mac"
+    grep -q '00:15:5D:A1:91:10' "$U" || probs="$probs no-lab-mac"
+    grep -q '10.99.7.10/24'     "$U" || probs="$probs no-lab-addr"
+    grep -qE '^[[:space:]]*name: "e\*"' "$U" && probs="$probs e*-matcher-survived"
+    [ -z "$probs" ] \
+        && ok "SIM_LAB_* rewrites the network block into two MAC-pinned legs and consumes the e* matcher" \
+        || bad "A19 lab netplan" "$probs"
+    # It still has to be a file Subiquity accepts — the builder validates the
+    # YAML, so a build that got this far already proved it, but the SHAPE is
+    # what a hand-edit would break: a lab leg with a default route would send
+    # the installer's apt traffic into a switch with no internet.
+    grep -qE '^[[:space:]]*(gateway4|via):' "$U" \
+        && bad "A19 lab netplan" "the lab leg carries a gateway — the default route belongs to the DHCP leg" \
+        || ok "the lab leg carries NO gateway (apt keeps the NAT leg's default route)"
+else
+    bad "the A19 lab build" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+expect_refusal "a lab address with no WAN MAC is refused (one unpinned NIC is an undecidable eth0)" \
+    "SIM_LAB_WAN_MAC is not" -- "SIM_LAB_ADDR=10.99.7.10/24" "SIM_LAB_MAC=00:15:5D:A1:91:10"
+expect_refusal "a lab address with no prefix length is refused (netplan needs CIDR)" \
+    "has no prefix length" -- "SIM_LAB_ADDR=10.99.7.10" "${LAB_ENV[1]}" "${LAB_ENV[0]}"
+expect_refusal "an UNSCOPED lab nameserver is refused (apt would resolve through a hub that does not exist yet)" \
+    "SIM_LAB_SEARCH is not" -- "${LAB_ENV[@]}" "SIM_LAB_DNS=10.99.7.10"
+make_site_filled
+make_site_files
+expect_refusal "SIM_LAB_* on a PRODUCTION build is refused rather than silently discarded" \
+    "sim-only rewrite" -- "SITE_DIR=$SITE" "${LAB_ENV[@]}"
+
+echo
+echo "=== the sim hub's TLS, and the tracker seed seam ==="
+
+# The kiosk site has never served TLS on a gate VM: the sim DOMAIN ends in
+# .invalid, which no ACME challenge can validate. A19 is the first gate with a
+# client that has to complete a handshake.
+if build_seed; then
+    CF="$OUT/iso-root/deploy-payload/stack/caddy/Caddyfile"
+    grep -qE '^[[:space:]]*local_certs[[:space:]]*$' "$CF" \
+        && ok "the SIM payload's Caddyfile issues from Caddy's internal CA (public ACME cannot validate a .invalid name)" \
+        || bad "sim TLS delta" "no local_certs in the staged Caddyfile — the panel would get no certificate"
+    grep -qE '^[[:space:]]*local_certs[[:space:]]*$' "$REPO_ROOT/stack/caddy/Caddyfile" \
+        && bad "sim TLS delta" "the TRACKED Caddyfile declares local_certs — that is the sim's business, and on a real hub it is a browser warning on every household device" \
+        || ok "the TRACKED Caddyfile still uses public ACME (the delta lives in the builder, not in the file)"
+    E="$OUT/iso-root/deploy-payload/stack/.env"
+    grep -qE '^TRACKER_SEED_DIR=' "$E" && grep -qE '^TRACKER_SEED_SRC=' "$E" \
+        && ok "the seed-source knobs exist in the staged .env, so SIM_ENV_OVERRIDES can point the gate hub at sim/tracker-seed" \
+        || bad "tracker seed knobs" "TRACKER_SEED_DIR/_SRC missing from the staged .env — an override naming them would be refused"
+    grep -qE '^TRACKER_SEED_DIR=[^[:space:]]' "$E" \
+        && bad "tracker seed default" "the staged .env SEEDS BY DEFAULT — a real household's first user would be given a fixture's definitions" \
+        || ok "seeding is OFF by default (blank TRACKER_SEED_DIR = the entrypoint passes no --seed)"
+    [ -d "$OUT/iso-root/deploy-payload/stack/tracker-seed" ] && \
+    [ ! -d "$OUT/iso-root/deploy-payload/stack/tracker-seed/definitions" ] \
+        && ok "the DEFAULT seed source ships with no definitions/, so the bind mount is inert even if the env var is set by mistake" \
+        || bad "default seed source" "stack/tracker-seed is absent, or carries a definitions/ dir it must not have"
+else
+    bad "the sim build itself (TLS/seed case)" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+echo
 echo "=== the PRODUCTION build (OI-19's companion: the sim identity leaked into it) ==="
 PROD_SEED=""
 if build_seed "SITE_DIR=$SITE"; then

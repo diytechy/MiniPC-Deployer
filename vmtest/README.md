@@ -494,10 +494,14 @@ vmtest/
   build-wall-seed.sh      WALL PANEL seed ISO (§11) — the second image target, SR-017
   test-wall-builder.sh    do the wall builder's 26 guards actually bite? (§11)
   test-wall-artifact.sh   is the image's package list SUFFICIENT for the shell? (§11, needs docker)
+  test-hub-seed.sh        do the HUB seed's refusals actually bite? (needs root)
   lib/common.sh           shared rendering + the payload stagers (sourced, not run directly)
   Run-V3Gate.cmd          right-click "Run as administrator" wrapper for New-HomeHubVm.ps1
   New-HomeHubVm.ps1          create the Hyper-V VM (elevation required; NOT run by an agent)
   Remove-HomeHubVm.ps1       companion teardown (elevation required; NOT run by an agent)
+  New-A19Lab.ps1             §12: the A19 Internal switch + the host's address on it
+  Start-A19Gate.ps1          §12: the three-stage two-VM gate (Lab -> Hub -> Panel)
+  Watch-VmConsole.ps1        console capture on a loop, budgeted in hours, never silent
   .out/                   gitignored — everything the HUB build scripts generate
   .out/images/            gitignored — the docker-save image tars + manifest
   .out/wall/              gitignored — everything the WALL builder generates
@@ -664,3 +668,109 @@ artifact **as root with tar**, and checks that `chrome-sandbox` is still
 library. Neither is wired into `scripts/check.py` — both need WSL plus docker,
 which the Windows harness does not have. Run them by hand when the artifact,
 the package list, or the dependency table changes.
+
+---
+
+## 12. The A19 two-VM lab — hub and panel on one switch
+
+Everything above builds and boots **one** VM at a time. A19 is the gate where
+both run together: the hub serves the kiosk site, the panel renders it, and the
+assertion is that two RED drive checks are visible **on the panel's screen**.
+
+Three things make that not-just-boot-two-VMs, and each has a knob here.
+
+### 12.1 The addressing plan (one place; everything else reads it)
+
+| | address | wan MAC (Default Switch) | lab MAC (`A19-Lab`) |
+|---|---|---|---|
+| host (Windows) | `10.99.7.1/24` | — | — |
+| hub | `10.99.7.10/24` | `00:15:5D:A1:90:10` | `00:15:5D:A1:91:10` |
+| panel | `10.99.7.50/24` | `00:15:5D:A1:90:50` | `00:15:5D:A1:91:50` |
+
+`10.99.7.50` is `PANEL_IP`, and the kiosk site's `remote_ip {$PANEL_IP}/32`
+guard is why static addressing is required rather than merely tidy: the Default
+Switch is NAT with quasi-random leases, and a `/32` allow-list keyed to a lease
+that moves is not a guard at all.
+
+**Every VM keeps a Default Switch leg.** `A19-Lab` is Internal — no uplink, no
+DHCP server, no route off it, which is what §3 asks for — but the *installer*
+still has to fetch 40 packages. Two NICs, planned before the VM is created, not
+after apt exits 100.
+
+**The guest can only tell the legs apart by MAC.** Both come up as `eth0`/`eth1`
+in an order VMBus decides, so the sim netplan matches on `macaddress:` and
+Hyper-V is told to use exactly those. That is two places holding the same three
+values, so the builder writes `$OUT_DIR/a19-lab.env` and `Start-A19Gate.ps1`
+reads it — nobody retypes a MAC.
+
+### 12.2 Build the two ISOs
+
+```sh
+# HUB. LAN_IP is the hub's lab address (compose binds WALL_PORT to it, and
+# Technitium's split-horizon A records point at it). EXTRA_SUBDOMAINS=wall is
+# what makes wall.vmtest.sim.invalid resolve — the panel's WALL_HOST default
+# already IS that name, so nothing has to be overridden on the panel side.
+OUT_DIR=/mnt/d/vmtest-out-hub-a19 \
+SIM_LAB_WAN_MAC=00:15:5D:A1:90:10 SIM_LAB_MAC=00:15:5D:A1:91:10 \
+SIM_LAB_ADDR=10.99.7.10/24 \
+SIM_ENV_OVERRIDES='LAN_IP=10.99.7.10
+WALL_HOST=wall.vmtest.sim.invalid
+WALL_PORT=8443
+PANEL_IP=10.99.7.50
+PANEL_USER_SUB=sim-user-wallpanel-0003
+EXTRA_SUBDOMAINS=wall
+TRACKER_MULTI_USER=true
+TRACKER_COMMIT=false
+TRACKER_SEED_DIR=/seed
+TRACKER_SEED_SRC=../sim/tracker-seed' \
+bash vmtest/build-repacked-iso.sh --src-iso /mnt/d/iso/ubuntu-24.04.4-live-server-amd64.iso
+
+# PANEL. SIM_LAB_DNS/SEARCH point the panel at the hub's Technitium — SCOPED by
+# a search domain, so `archive.ubuntu.com` still resolves over the NAT leg
+# during the install and only lab names go to a box that does not exist yet.
+OUT_DIR=/mnt/d/vmtest-out-wall-a19 \
+SIM_LAB_WAN_MAC=00:15:5D:A1:90:50 SIM_LAB_MAC=00:15:5D:A1:91:50 \
+SIM_LAB_ADDR=10.99.7.50/24 \
+SIM_LAB_DNS=10.99.7.10 SIM_LAB_SEARCH=vmtest.sim.invalid \
+WALL_SHELL_DIST=/mnt/c/Projects/OfficeWallNaglight/dist \
+bash vmtest/build-repacked-iso.sh --target wall --src-iso /mnt/d/iso/ubuntu-24.04.4-live-server-amd64.iso
+```
+
+### 12.3 Run it — three stages, in order
+
+```powershell
+# Elevated PowerShell, from the MiniPC-Deployer checkout
+.\vmtest\Start-A19Gate.ps1 -Stage Lab                 # the Internal switch + the host's address
+.\vmtest\Start-A19Gate.ps1 -Stage Hub   -Force -Watch # ~20-30 min
+# …wait for the hub to answer ssh and its containers to come up…
+.\vmtest\Start-A19Gate.ps1 -Stage Panel -Force -Watch # ~45-60 min
+```
+
+**Do not overlap the two installs.** Measured 2026-08-04: two VMs on one host
+and one disk turned a 45-60 minute wall install into ~2h10m. They are
+independent in logic, not in cost.
+
+`-Watch` opens `Watch-VmConsole.ps1` on the VM being installed. Its budget is
+hours and every exit path says why it stopped — the scratch watcher it replaces
+gave up silently at 90 minutes during a 2h10m install, and silence looked
+exactly like a hung VM.
+
+### 12.4 Three sim deltas this gate introduces, all stated rather than hidden
+
+- **TLS is an internal CA.** The sim `DOMAIN` ends in `.invalid` (RFC 6761), so
+  public ACME can never validate it and the kiosk site has never served TLS on a
+  gate VM — Caddy was healthy and serving nothing. The sim payload's Caddyfile
+  now gets `local_certs`; the tracked file keeps public ACME.
+- **The panel therefore ignores certificate errors.** Nothing can put that root
+  into the panel image: it does not exist until the hub's first boot, which is
+  after the ISO is written. So the sim `WALL_APP_CMD` carries
+  `--ignore-certificate-errors`, **this gate proves nothing about TLS trust**,
+  and a production `wall.env` carrying that flag is refused by the builder.
+- **The tracker is seeded from a fixture.** `sim/tracker-seed/definitions/` is
+  the only committable thing that declares `library-mounted` and
+  `backup-drive-mounted`. Without it the gate hub reports `healthy` with an
+  empty `/data` (the healthcheck probes `/healthz`, which is data-free by
+  design), and the panel renders a tracker with no items — where "no red drive
+  check" and "the drive check is green" look identical on a wall. Seeding is
+  **off** by default; `TRACKER_SEED_DIR` blank means the entrypoint passes no
+  `--seed` at all.

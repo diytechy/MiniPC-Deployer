@@ -222,8 +222,17 @@ services:
       # tracker takes identity from oauth2-proxy's X-Forwarded-Email header ONLY
       # and keys a per-user data dir off the Google `sub` claim.
       TRACKER_MULTI_USER: ${TRACKER_MULTI_USER}
+      # Multi-user only: seed a brand-new user's definitions/ from this path.
+      # BLANK in production (the entrypoint then passes no --seed at all) — see
+      # .env.example. Set by the A19 gate so the two drive lanes the panel is
+      # asserted on exist before the panel ever asks for them.
+      TRACKER_SEED_DIR: ${TRACKER_SEED_DIR}
     volumes:
       - tracker_data:/data
+      # Read-only, and inert unless TRACKER_SEED_DIR names it. The default
+      # source (./tracker-seed) ships with no definitions/ subdirectory, so
+      # mounting it can seed nothing even if the env var is set by mistake.
+      - ${TRACKER_SEED_SRC:-./tracker-seed}:/seed:ro
     # expose (bridge-only), NOT ports: the tracker must never be reachable except
     # via oauth2-proxy (D2/WI-10.5 — trusted headers are forgeable if the port is
     # open). No host publish.

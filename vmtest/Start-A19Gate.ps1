@@ -56,7 +56,12 @@ param(
     # Launch Watch-VmConsole.ps1 in its own window for this stage's VM. Worth
     # having: the install is unattended and has no network for most of its life,
     # so the thumbnail is the only view of it.
-    [switch]$Watch
+    [switch]$Watch,
+
+    # Last resort, and a RECORDED DELTA rather than a convenience: the guest
+    # then boots unverified. Only reach for it if the Microsoft UEFI CA template
+    # cannot be set by name or by id — see New-HomeHubVm.ps1's firmware block.
+    [switch]$DisableSecureBoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -138,7 +143,7 @@ switch ($Stage) {
         -MemoryGB 8 -CPUCount 4 -DiskGB 64 `
         -SwitchName 'Default Switch' `
         -LabSwitchName $SwitchName -WanMac $m['A19_WAN_MAC'] -LabMac $m['A19_LAB_MAC'] `
-        -Force:$Force -WhatIf:$WhatIfPreference
+        -Force:$Force -DisableSecureBoot:$DisableSecureBoot -WhatIf:$WhatIfPreference
 
     if ($WhatIfPreference) { return }
     if ($PSCmdlet.ShouldProcess('HomeHub-VMTest', 'Start')) { Start-VM -Name 'HomeHub-VMTest' }
@@ -192,7 +197,7 @@ switch ($Stage) {
         -MemoryGB 4 -CPUCount 2 -DiskGB 32 `
         -SwitchName 'Default Switch' `
         -LabSwitchName $SwitchName -WanMac $m['A19_WAN_MAC'] -LabMac $m['A19_LAB_MAC'] `
-        -Force:$Force -WhatIf:$WhatIfPreference
+        -Force:$Force -DisableSecureBoot:$DisableSecureBoot -WhatIf:$WhatIfPreference
 
     if ($WhatIfPreference) { return }
     if ($PSCmdlet.ShouldProcess('Wall-VMTest', 'Start')) { Start-VM -Name 'Wall-VMTest' }

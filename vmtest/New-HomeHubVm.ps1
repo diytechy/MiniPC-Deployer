@@ -280,10 +280,38 @@ if ($PSCmdlet.ShouldProcess($VMName, "Create Gen2 VM (${CPUCount} vCPU / ${Memor
     # Secure Boot: Gen2 default template is Windows-only and will refuse to
     # boot the Ubuntu shim. MicrosoftUEFICertificateAuthority is the template
     # Microsoft documents for signed non-Windows (incl. Ubuntu) bootloaders.
+    #
+    # BY NAME FIRST, BY ID IF THE NAME WILL NOT RESOLVE. Observed 2026-08-04:
+    # the identical call set the template on one VM and, twenty minutes later on
+    # the same host, failed on the next with "'MicrosoftUEFICertificateAuthority'
+    # matches none of the secure boot templates". Nothing about the host had
+    # changed, so the name lookup — not the template — is the flaky part. The ID
+    # is the same template addressed a way that needs no lookup, so this is one
+    # thing tried two ways, NOT a fallback to different behaviour; it still says
+    # out loud when it takes the second route.
     if ($DisableSecureBoot) {
         Set-VMFirmware -VMName $VMName -EnableSecureBoot Off -WhatIf:$WhatIfPreference
     } else {
-        Set-VMFirmware -VMName $VMName -EnableSecureBoot On -SecureBootTemplate $SecureBootTemplate -WhatIf:$WhatIfPreference
+        try {
+            Set-VMFirmware -VMName $VMName -EnableSecureBoot On `
+                -SecureBootTemplate $SecureBootTemplate -WhatIf:$WhatIfPreference -ErrorAction Stop
+        } catch {
+            if ($SecureBootTemplate -ne 'MicrosoftUEFICertificateAuthority') { throw }
+            Write-Host "  Secure Boot template '$SecureBootTemplate' would not resolve by NAME; retrying by ID." -ForegroundColor Yellow
+            Write-Host "    ($($_.Exception.Message))" -ForegroundColor DarkGray
+            try {
+                Set-VMFirmware -VMName $VMName -EnableSecureBoot On `
+                    -SecureBootTemplateId '272e7447-90a4-4563-a4b9-8e4ab00526ce' `
+                    -WhatIf:$WhatIfPreference -ErrorAction Stop
+                Write-Host "  Secure Boot template set by ID (same template: Microsoft UEFI Certificate Authority)." -ForegroundColor Yellow
+            } catch {
+                throw "Could not set the Microsoft UEFI CA secure boot template by name OR by id. " +
+                      "Ubuntu's shim will not verify under the Windows-only default, so this VM would " +
+                      "not boot. Re-run with -DisableSecureBoot to proceed (a recorded delta: the guest " +
+                      "then boots unverified), or check `Get-VMHost` on this machine. Underlying error: " +
+                      $_.Exception.Message
+            }
+        }
     }
 
     # Automatic checkpoints off: this is a disposable smoke-test VM, and

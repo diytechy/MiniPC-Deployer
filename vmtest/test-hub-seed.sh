@@ -52,6 +52,19 @@ ok()   { printf 'ok    %s\n' "$1"; pass=$((pass + 1)); }
 bad()  { printf 'FAIL  %s\n      %s\n' "$1" "$2"; fail=$((fail + 1)); }
 skip_case() { printf 'SKIP  %s\n      %s\n' "$1" "$2"; skip=$((skip + 1)); }
 
+# extract_4b FILE — the site-staging late-command, as it stands in FILE.
+# Taken from the user-data a build actually PRODUCED, so what the behavioural
+# cases below run is the artifact, not a paraphrase of it.
+extract_4b() {
+    python3 - "$1" <<'PY'
+import sys, yaml
+for c in yaml.safe_load(open(sys.argv[1]))["autoinstall"]["late-commands"]:
+    if isinstance(c, str) and "BUILD_PROFILE" in c:
+        print(c)
+        break
+PY
+}
+
 # build_seed [env...] — one hub seed build into a FRESH $OUT. Output in $WORK/out.txt.
 build_seed() {
     rm -rf "$OUT"
@@ -92,6 +105,7 @@ make_site_files() {
     printf '[library]\n  path = /srv/library\n' > "$SITE/smb.conf.fragment"
     printf 'LABEL=Library /srv/library ext4 nofail 0 2\n' > "$SITE/library-mounts.fstab"
     printf '/srv/library\tSERIAL123\n'       > "$SITE/drive-identity.conf"
+    printf '{ "FEED_TOKEN": "sim-not-a-real-token" }\n' > "$SITE/config.json"
 }
 
 echo "=== the production seam (builder) ==="
@@ -140,8 +154,35 @@ if build_seed "SITE_DIR=$SITE"; then
     [ -f "$OUT/iso-root/deploy-payload/site/.env" ] \
         && ok "the real site/ files ride the payload (where late-command 4b now reads them)" \
         || bad "site staging" "no deploy-payload/site/.env"
+    [ -f "$OUT/iso-root/deploy-payload/site/config.json" ] \
+        && ok "site/config.json rides the payload too (the kiosk shell's runtime config)" \
+        || bad "config.json staging" "no deploy-payload/site/config.json"
 else
     bad "the production build itself" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+echo
+echo "=== config.json — a HUB artifact, installed AFTER the site tarball ==="
+# Ordering is the whole property: firstboot step 3d untars the site tarball OVER
+# stack/wall-shell/, so the config copy has to come after it. Asserted on line
+# order in the script rather than trusted to a comment.
+FB="$REPO_ROOT/stack/autoinstall/firstboot.sh"
+untar_ln=$(grep -n 'tar -xzf "\$WALL_SITE_TARBALL"' "$FB" | head -n1 | cut -d: -f1)
+cfg_ln=$(grep -n 'install -m 0600 -o root -g root "\$WALL_SITE_CONFIG"' "$FB" | head -n1 | cut -d: -f1)
+if [ -n "$untar_ln" ] && [ -n "$cfg_ln" ] && [ "$cfg_ln" -gt "$untar_ln" ]; then
+    ok "firstboot installs config.json AFTER untarring the site tarball (line $cfg_ln > $untar_ln)"
+else
+    bad "config.json ordering" "untar at line '${untar_ln:-?}', config install at '${cfg_ln:-?}'"
+fi
+if grep -q 'install -m 0600 -o root -g root "\$WALL_SITE_CONFIG"' "$FB"; then
+    ok "config.json is installed 0600 root:root — not widened for a web root (mode owed a ruling)"
+else
+    bad "config.json mode" "not installed with -m 0600 -o root -g root"
+fi
+if extract_4b "$USER_DATA" | grep -q 'config.json'; then
+    bad "config.json is not in late-command 4b" "it is — and 3d would overwrite it"
+else
+    ok "config.json is NOT in late-command 4b's table (its destination is the web root)"
 fi
 
 echo
@@ -158,19 +199,6 @@ cp "$WORK.md.bak" "$META_DATA"
 
 echo
 echo "=== the site-staging late-command itself (OI-19) ==="
-# Extracted from the user-data each build PRODUCED, so what runs here is what
-# would run on the box — not a paraphrase of it. /target is redirected into the
-# work dir; nothing else about the command is altered.
-extract_4b() {
-    python3 - "$1" <<'PY'
-import sys, yaml
-for c in yaml.safe_load(open(sys.argv[1]))["autoinstall"]["late-commands"]:
-    if isinstance(c, str) and "BUILD_PROFILE" in c:
-        print(c)
-        break
-PY
-}
-
 # fake_target KIND -> sets T (a fake /target) and CMD (the late-command to run).
 fake_target() {
     local kind="$1" src

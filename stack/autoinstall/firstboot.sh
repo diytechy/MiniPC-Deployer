@@ -236,6 +236,61 @@ else
     log "  hub would render nothing, so the A19 gate needs an image built WITH it."
 fi
 
+# ── 3e. the kiosk site's RUNTIME CONFIG (config.json) — AFTER the untar ───────
+# The shell fetches `./config.json` RELATIVE TO ITS OWN ORIGIN (js/config.js
+# loadConfig), and that origin is this hub: Caddy's {$WALL_HOST}:{$WALL_PORT}
+# site serves `root * /srv/wall-shell`, bind-mounted from the directory step 3d
+# just filled. The panel's Electron host intercepts /media/* and nothing else,
+# so a copy on the panel's disk would never be read. It is a HUB artifact.
+#
+# AFTER step 3d, DELIBERATELY, and this is the whole reason it is not a
+# late-command like the other seven site files. `tar -xzf … -C wall-shell/`
+# above writes over that directory; today's site tarball ships no config.json,
+# so the ordering is benign — but "benign today" is a promise about a private
+# sibling repo's future releases, and one that starts shipping a
+# config.example.json-shaped config.json would silently overwrite the real
+# credentials with placeholders. Copying afterwards makes the ordering correct
+# by construction rather than by agreement, and the collision (if it ever
+# happens) is reported rather than assumed away.
+#
+# WHY LOSING IT IS SILENT, which is why this block is loud: loadConfig NEVER
+# THROWS. A 404 or a parse error yields the js/config.js DEFAULTS plus a
+# console.warn nobody on a wall can see — so the panel comes up looking like it
+# works, with no FEED_TOKEN (its feed posts are unattributed), no heartbeat, and
+# no music credentials.
+#
+# MODE: 0600 root:root — the same posture as the other site files, and it works
+# because the caddy container runs as uid 0 (measured on the pinned
+# caddy:2.11.4-alpine: no USER in the image, no 'user:' in docker-compose.yml,
+# no userns-remap), so the read-only bind mount reaches it as root. It is the
+# most restrictive mode that serves. THE MODE IS OWED A RULING (docs/status.md
+# OI-20): this file carries FEED_TOKEN, a Kuma push token and the Subsonic
+# password onto an HTTP surface — one guarded by the kiosk site's
+# `remote_ip {$PANEL_IP}/32` matcher, so it is not open to the LAN, but "a
+# secret is served over HTTP behind an IP allow-list" is a posture, not a
+# detail. If caddy ever gains a `user:` the file becomes unreadable and the
+# panel degrades to defaults SILENTLY — which is exactly the failure this
+# comment exists to make findable.
+WALL_SITE_CONFIG="/opt/homehub/site/config.json"
+if [ -f "$WALL_SITE_CONFIG" ]; then
+    if [ -f "$STACK_DIR/wall-shell/config.json" ]; then
+        log "NOTE: the site tarball shipped its own config.json — replacing it with the"
+        log "  materialised one. If that was a real file rather than a placeholder, the"
+        log "  two are now competing: check OfficeWallNaglight's release contents."
+    fi
+    install -d -m 0755 "$STACK_DIR/wall-shell"
+    install -m 0600 -o root -g root "$WALL_SITE_CONFIG" "$STACK_DIR/wall-shell/config.json"
+    log "kiosk site config installed: $STACK_DIR/wall-shell/config.json (0600 root:root,"
+    log "  served over HTTP to the panel only — carries FEED_TOKEN; mode owed a ruling)"
+elif [ -n "$WALL_SITE_TARBALL" ]; then
+    log "NOTICE: the kiosk site is installed but there is no site/config.json in the"
+    log "  payload, so the site will 404 on it and the panel runs on js/config.js"
+    log "  DEFAULTS — no FEED_TOKEN, no heartbeat, no music credentials, and nothing"
+    log "  on the wall saying so. Expected on a SIM build. On a PRODUCTION hub it means"
+    log "  Materialize-Deploy.ps1 -Image homehub has not been re-run since config.json"
+    log "  was added, or Build-VentoyStick.ps1's site\\ list does not carry it yet."
+fi
+
 # ── 4. bring the stack up ────────────────────────────────────────────────────
 # Images were loaded from the payload in step 3 (Q10.9 B+). compose finds each
 # pinned tag locally and starts it without a pull; anything NOT baked (or a

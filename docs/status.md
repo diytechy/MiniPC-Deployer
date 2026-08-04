@@ -83,6 +83,28 @@ last) — it is the record, not required reading for every pass.
       `Build-VentoyStick.ps1` both stage it and **nothing ever installed it**,
       so the drive-identity file has never reached a box. Both are recorded as
       **A10** in the Assumptions log below.
+    - OI-20 — **`config.json` now has a path onto the hub — and its MODE needs
+      a ruling** (2026-08-03, new): Personal's `Materialize-Deploy.ps1` emits
+      `out\homehub\config.json` (the kiosk shell's runtime config: `FEED_TOKEN`,
+      a Kuma push token, the Subsonic password). It is a **hub** artifact — the
+      shell fetches `./config.json` relative to its own origin, and that origin
+      is Caddy's kiosk site, document root `/opt/homehub/stack/wall-shell/`.
+      This repo now stages it (`render_seed_tree`) and installs it
+      (`firstboot.sh` step 3e, **after** step 3d's untar). **The ruling owed:**
+      it is installed **0600 root:root**, the most restrictive mode that
+      actually serves — measured, not assumed: the pinned `caddy:2.11.4-alpine`
+      declares no `USER`, `docker-compose.yml` sets no `user:`, so the container
+      is uid 0 and reads the read-only bind mount as root. It was NOT widened to
+      0644. What the Owner should rule on is the **posture**, not the digits: a
+      file carrying live credentials is now **served over HTTP** — behind the
+      kiosk site's `remote_ip {$PANEL_IP}/32` matcher, so not open to the LAN,
+      but that is an allow-list, not a secret store. And if caddy ever gains a
+      `user:`, the panel degrades to `js/config.js` defaults **silently**
+      (`loadConfig` never throws).
+      **Also owed, and NOT this repo's to fix:** `Build-VentoyStick.ps1`
+      assembles `out\site\` from a hardcoded `$wanted` list that does **not**
+      include `config.json`, so the real Ventoy stick will not carry one until
+      Personal adds it — `SITE_DIR=<dir with config.json>` builds do.
     - OI-18 — **The wall production seam has one missing input**
       (2026-08-02, new): `WALL_SITE_DIR` now builds a real panel image from
       Personal's `Materialize-Deploy.ps1 -Image wall` output, behind five
@@ -2843,3 +2865,70 @@ replacement.
 **Not proven:** the same thing as everything else on this page — no ISO was
 built and nothing was installed. What is asserted is the content of a rendered
 `meta-data` file on disk.
+
+### DRIVER — G1 — Round 1 — 2026-08-03 (`config.json` — nothing staged the panel's credentials, and nothing said so)
+
+Personal's `Materialize-Deploy.ps1` started emitting `out\homehub\config.json`
+(its commit `bdf9aba`) and **this repo had nowhere to put it.** The hub's
+site-file list is hand-maintained in two places — the staging loop in
+`vmtest/lib/common.sh` and the install table in `user-data` late-command 4b —
+and `config.json` was in neither, so it rode nothing and reached nothing.
+
+**It is a HUB artifact, not a panel one**, and that is the non-obvious part:
+`js/config.js` `loadConfig` fetches `./config.json` **relative to the page
+origin**, and the origin is Caddy's `{$WALL_HOST}:{$WALL_PORT}` site
+(`root * /srv/wall-shell` ← `/opt/homehub/stack/wall-shell/`, filled by
+`firstboot.sh` step 3d). The panel's Electron host intercepts `/media/*` and
+nothing else, so a copy on the panel's disk would never be read.
+
+**Why the gap was invisible, and would have stayed so:** `loadConfig` never
+throws. A 404 or a parse error returns the `js/config.js` DEFAULTS plus a
+`console.warn` — on a wall, in a browser nobody has a console for. The panel
+comes up looking like it works, with no `FEED_TOKEN` (its feed posts are
+unattributed), no heartbeat, and no music credentials. Same family as the
+2026-08-03 failure screens: the absence has no symptom.
+
+**Staged in the builder, installed by firstboot — and the ordering is the
+design decision.** `config.json` joins `render_seed_tree`'s staging loop, so it
+rides the payload like the other site files. It does **not** join late-command
+4b: its destination is a **web root**, not `/etc`, and step 3d untars the site
+tarball **over** that directory hours later. Of the two options — copy after the
+untar, or assert the tarball can never contain one — this took the first:
+`firstboot.sh` gains **step 3e**, immediately after 3d. "Today's site tarball
+ships no config.json" is a promise about a private sibling repo's future
+releases, and a release that started shipping a `config.example.json`-shaped one
+would silently overwrite real credentials with placeholders. Copying afterwards
+makes the ordering correct **by construction**; the collision, if it ever
+happens, is logged rather than assumed away. Both site-file lists now
+cross-reference each other in comments, because they are hand-maintained and
+drifting apart is exactly how this file went missing.
+
+**MODE — 0600 root:root, and OWED A RULING (OI-20 above).** Worked out, not
+guessed: `docker image inspect caddy:2.11.4-alpine` shows no `USER`,
+`docker-compose.yml` sets no `user:` for caddy, and `docker run --entrypoint id`
+on the pinned image reports `uid=0(root)`. So the container reads the read-only
+bind mount as root and the most restrictive mode that serves is the same 0600
+the other site files get. **It was not widened to 0644.** What needs the Owner
+is the posture rather than the digits: this file carries `FEED_TOKEN`, a Kuma
+push token and the Subsonic password, and it is now **served over HTTP** —
+behind the kiosk site's `remote_ip {$PANEL_IP}/32` matcher, so not open to the
+LAN, but an allow-list is not a secret store. Two consequences to accept: a
+`user:` added to caddy later makes the file unreadable and the panel degrades to
+defaults **silently**, and anything that can spoof the panel's source address
+gets the token.
+
+**Flagged, not fixed (Personal's, and that repo is clean):**
+`Build-VentoyStick.ps1` assembles `out\site\` from a hardcoded `$wanted` list
+that does not include `config.json`. So a real Ventoy stick still will not carry
+one; `SITE_DIR=<a directory containing it>` builds now do.
+
+**Run:** `vmtest/test-hub-seed.sh` → **20 passed, 0 failed, 0 skipped** (4 new:
+`config.json` rides the payload; firstboot installs it at a line strictly AFTER
+the untar; it is installed `-m 0600 -o root -g root`; and it is NOT in
+late-command 4b's table). `test-wall-builder.sh` 12/12, `scripts/check.py` PASS,
+`validate_config.py` ALL PASSED, `bash -n` on all three files touched plus
+`dash -n` on the late-command bodies.
+
+**Not proven:** `firstboot.sh` step 3e has never run. Nothing has served this
+file, no panel has fetched it, and the uid finding is from the image on this dev
+box — not from the AWOW.

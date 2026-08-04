@@ -720,8 +720,17 @@ render_seed_tree() {
         local site_out="$payload_dir/site"
         mkdir -p "$site_out"
         local staged=0
+        # config.json is the odd one out and is deliberately in this list anyway:
+        # it is the WALL SHELL's runtime config, and it belongs to the HUB
+        # because the shell fetches `./config.json` relative to its own origin
+        # (js/config.js loadConfig) and that origin is Caddy's kiosk site, whose
+        # document root is /opt/homehub/stack/wall-shell/. Unlike the other
+        # seven it is NOT installed by a late-command: `firstboot.sh` step 3d
+        # untars the site tarball OVER that directory, so the copy has to happen
+        # after it (step 3e). See stack/autoinstall/user-data late-command 4b.
         for f in .env backup.env cifs.creds samba-users.creds user-data.filled \
-                 smb.conf.fragment library-mounts.fstab drive-identity.conf; do
+                 smb.conf.fragment library-mounts.fstab drive-identity.conf \
+                 config.json; do
             if [ -f "$SITE_DIR/$f" ]; then
                 install -m 600 "$SITE_DIR/$f" "$site_out/$f"
                 log "  site/ += $f"

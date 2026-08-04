@@ -262,6 +262,15 @@ autoinstall:
     # specifically should halt is an OPEN RATIFICATION, not a decision made
     # here (docs/status.md OI-19).
     #
+    # site/config.json IS NOT IN THIS TABLE, and that is deliberate. It is the
+    # kiosk shell's runtime config and its destination is a WEB ROOT
+    # (/opt/homehub/stack/wall-shell/), not /etc — and firstboot.sh step 3d
+    # untars the site tarball OVER that directory, so anything this step wrote
+    # there could be overwritten hours later. firstboot.sh step 3e installs it
+    # instead, after the untar. The two site-file lists (here and
+    # vmtest/lib/common.sh's staging loop) are cross-referenced from both ends
+    # for exactly this reason: they are hand-maintained and they must not drift.
+    #
     # Modes matter: every file here is a secret artifact. .env and the *.creds
     # files carry live credentials, so they are installed 0600 root-owned. The
     # smb.conf fragment and fstab are not secret but are still root-only to

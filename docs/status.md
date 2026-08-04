@@ -40,9 +40,10 @@ last) — it is the record, not required reading for every pass.
       `D:\vmtest-out-wall\wall-repacked.iso` and `Wall-VMTest` exists; the
       re-run needs **one elevated approval** →
       [vmtest/README.md §11](../vmtest/README.md).
-    - OI-19 — **The hub's site-staging late-command has the same `/cdrom`
-      bug** (2026-08-03, new): `stack/autoinstall/user-data`'s site step reads
-      `/cdrom/deploy-payload/site`, falls back to `/media/...`, and then
+    - OI-19 — **The hub's site-staging late-command had the same `/cdrom`
+      bug — FIXED 2026-08-03, and NEVER INSTALLED FROM.** The defect:
+      `stack/autoinstall/user-data`'s site step read
+      `/cdrom/deploy-payload/site`, fell back to `/media/...`, and then
       `[ -d "$S" ] || exit 0` — a **silent success**. On the LIGHT path neither
       exists (that is the defect fixed for the payload copy the same day), so a
       PRODUCTION hub would install **none** of its six real files: `.env`,
@@ -53,11 +54,35 @@ last) — it is the record, not required reading for every pass.
       that warning is in the journal and nowhere else. The other five have no
       check at all, so the drives would not mount and Samba/backup would be
       unconfigured; the box would come up looking exactly like a SIM build
-      while believing it is production. Not fixed here: verifying it needs a
-      hub install and it was found during a wall session. Same one-line shape
-      of fix as the payload copy (mount the CIDATA volume by label), plus the
-      `exit 0` should arguably become a refusal when a production build is what
-      was asked for.
+      while believing it is production. **Exposure, stated exactly:**
+      `Build-VentoyStick.ps1` — the only wired production path — calls
+      `build-repacked-iso.sh`, where `/cdrom` IS the combined ISO and does carry
+      `/deploy-payload`, so no stick ever built has been bitten. What was one
+      command away from it is the equally supported
+      `SITE_DIR=… bash vmtest/build-seed.sh`.
+      **The fix (see the audit entry):** the step no longer searches at all — it
+      reads `/target/opt/homehub/site`, the payload late-command 3 has already
+      copied, so there stays exactly ONE discovery mechanism (the `/cdrom`,
+      `/media`, `/media/*`, `/run/media/*`, then CIDATA-by-label search) and it
+      is the one that was fixed and exercised. Same shape as the wall image's
+      late-command 4a. It also **refuses** now: the tracked user-data carries
+      `BUILD_PROFILE=production` and `render_seed_tree` rewrites it to `sim` for
+      a vmtest image, so a production image whose payload lost `site/` fails the
+      install loudly instead of exiting 0.
+      **PROVEN — static/structural only:** `vmtest/test-hub-seed.sh` (13 checks,
+      all green) builds real sim and production seeds and runs the late-command
+      **extracted from the user-data each build produced** against a fake
+      `/target`. **NOT PROVEN: nothing has been installed from any of it.**
+      Subiquity has never run this late-command, the CIDATA-by-label mount it
+      depends on has never run on a hub, and no ISO was built or booted here.
+      OI-19 is FIXED-BUT-UNVERIFIED, not closed; it closes on a hub install.
+      **NEEDS THE OWNER (two rulings):** (a) a production build whose `site/`
+      arrives but is **missing a required file** is currently LOUD-BUT-NOT-FATAL
+      — should a missing `.env` halt the install too? (b) `drive-identity.conf`
+      is now installed with the other six: the builder and
+      `Build-VentoyStick.ps1` both stage it and **nothing ever installed it**,
+      so the drive-identity file has never reached a box. Both are recorded as
+      **A10** in the Assumptions log below.
     - OI-18 — **The wall production seam has one missing input**
       (2026-08-02, new): `WALL_SITE_DIR` now builds a real panel image from
       Personal's `Materialize-Deploy.ps1 -Image wall` output, behind five
@@ -409,6 +434,27 @@ Scaffolding created. Starting G1.
   the kernel cmdline; the quirk-3 udev rule is generated from a **pipe-separated**
   knob and is not written at all when that knob is empty. Revert any of these at
   the next gate if wrong.
+
+- A10 — OI-19 shape (2026-08-03; the `/cdrom` defect and the "refuse a
+  production build that lost its secrets" doctrine were both stated in the
+  brief, these three mechanics were not): (i) the site step **does not search
+  for the payload at all** — it reads `/target/opt/homehub/site`, which
+  late-command 3 has already copied, so the CIDATA-by-label search exists in
+  exactly one place rather than two that can drift (the wall image's
+  late-command 4a already worked this way); (ii) a build declares itself with
+  `BUILD_PROFILE=production` **inside the user-data**, defaulting to the SAFE
+  value so the SIM path is the one that must opt out and a silent no-op there
+  is caught by an assertion — it lives in user-data rather than the payload
+  precisely because a payload that went missing would take a payload-borne
+  marker with it; (iii) a required site file that is **absent** is loud but not
+  fatal, because `Build-VentoyStick.ps1` marks `cifs.creds`,
+  `samba-users.creds` and `drive-identity.conf` `Required=$false` and halting a
+  household's install over an optional file would be worse — but a file that is
+  PRESENT and fails to install IS fatal. Whether a missing `.env` specifically
+  should halt is the Owner's call, and (iv) `drive-identity.conf` is now
+  installed at all, which it never was: both stagers emit it, three consumers
+  read `/etc/homehub-samba/drive-identity.conf`, and no late-command ever put
+  it there. Revert any of these at the next gate if wrong.
 
 ### DRIVER — G1 — Round 1 — 2026-07-03 (migration + spine)
 Migrated the deploy stack, wired the tracker to `naglight:local`, authored the
@@ -2649,3 +2695,108 @@ a panel, and it cannot until a hub serves the kiosk site — that is A19/§3. Al
 still unproven: the fixes above are verified **on the running VM** (scripts
 pushed and re-run); a clean rebuild proving the IMAGE delivers them has not been
 done.
+
+### DRIVER — G1 — Round 1 — 2026-08-03 (OI-19 — THE THIRD `/cdrom`, AND THE FIRST REFUSAL THE HUB HAS)
+
+**Fixed, and NOT verified.** Everything below is static and structural. No ISO
+was built, no VM was created, nothing was installed — and the whole defect lives
+in a late-command that only Subiquity runs. Read the last paragraph before
+quoting any of this as evidence.
+
+**The defect.** `stack/autoinstall/user-data`'s site-staging step read
+`/cdrom/deploy-payload/site`, fell back to `/media/...`, and then
+`[ -d "$S" ] || exit 0`. That is the same wrong assumption the wall boot
+exposed this morning — **`/cdrom` is the boot medium, not the seed** — with a
+worse ending: the wall crashed, the hub exits 0. On the light path a PRODUCTION
+hub would install **none** of `.env`, `backup.env`, `cifs.creds`,
+`samba-users.creds`, `smb.conf.fragment`, `library-mounts.fstab`, and come up on
+`.env.example` placeholders. `firstboot.sh` would then log
+*"no smb.conf.fragment and no site payload marker — expected ONLY on a
+sim/vmtest build"*, which on a real box is a **false statement in the journal**,
+not a warning.
+
+**How exposed it actually was, stated exactly** (the honest half): the only
+wired production path, `Build-VentoyStick.ps1`, calls `build-repacked-iso.sh` —
+and on the repacked ISO `/cdrom` really is the combined image and really does
+carry `/deploy-payload`. **No stick ever built has been bitten by this.** What
+sits one command away is `SITE_DIR=… bash vmtest/build-seed.sh`, which is an
+equally supported way to build a production hub and is the path the README
+recommends by default.
+
+**Two halves to the fix.**
+
+1. **The search is gone, not duplicated.** Late-command 3 already tries
+   `/cdrom`, `/media`, `/media/*`, `/run/media/*` and then mounts the CIDATA
+   volume **by label** — and it copies the WHOLE payload, `site/` included, to
+   `/target/opt/homehub/`. So the site step now reads
+   `/target/opt/homehub/site` and searches for nothing. One discovery
+   mechanism, one place it can rot; a second copy of that loop is how one of
+   them quietly stops matching the other. This is exactly the shape the wall
+   image already uses (its late-command 4a reads
+   `/opt/wall-panel/site/wall.env` rather than searching again).
+2. **`exit 0` became a refusal — for production builds only.** The tracked
+   user-data carries `BUILD_PROFILE=production`; `render_seed_tree` rewrites it
+   to `sim` for a vmtest image and **asserts the rewrite applied**, both
+   directions. The safe value is therefore the default and the SIM path is the
+   one that has to opt out — a sim build legitimately has no `site/` and must
+   stay a clean no-op, while a production image that lost its secrets now halts
+   the install saying so. `Materialize-Deploy.ps1` renders `user-data.filled`
+   from this very file (`FieldSchema.psd1` Images.homehub), so the marker
+   arrives on a real stick for free — and a materialised tree that predates
+   this change carries the OLD silent late-command, so the builder refuses it
+   by name and tells you to re-run the materialiser.
+
+**A seventh file, which was never installed at all.** `drive-identity.conf` is
+staged into `site/` by both `render_seed_tree` and `Build-VentoyStick.ps1`, and
+three consumers read `/etc/homehub-samba/drive-identity.conf` (`firstboot.sh`,
+`backup.sh` step 0, `library-guard.sh`). No late-command ever copied it there.
+The degrade is graceful and says so — "health checks report presence only (a
+stand-in drive will read as healthy)" — which is precisely why nobody noticed
+that the honest-sounding message was the ONLY outcome available. It is in the
+install table now.
+
+**Per-file absence is loud but not fatal, and that line is UNRATIFIED.**
+`Build-VentoyStick.ps1` marks `cifs.creds`, `samba-users.creds` and
+`drive-identity.conf` `Required=$false`, so halting a household's install over
+one of them would refuse legitimate builds. A file that is PRESENT and fails to
+install IS fatal. Whether a **missing `.env`** should halt as well is the
+Owner's call (A10, above) — not decided here.
+
+**What was run, and its output.** `vmtest/test-hub-seed.sh` is new, in the shape
+`test-wall-builder.sh` established: negative paths, refusals that must bite,
+skips counted as skips. It builds real sim and production seeds and then
+**extracts late-command 4b from the user-data each build produced** and runs it
+against a fake `/target` — so what is exercised is the artifact, not a
+paraphrase of it.
+
+```
+=== the production seam (builder) ===        SITE_DIR w/o user-data.filled refused
+                                             a pre-OI-19 user-data.filled refused
+=== the SIM build ===                        BUILD_PROFILE=sim; meta-data homehub-vmtest
+=== the PRODUCTION build ===                 BUILD_PROFILE=production kept; site/ staged
+=== the substitution assertions ===          a user-data that lost the marker fails the build
+=== the late-command itself (OI-19) ===      no /cdrom or /media left in it
+                                             PRODUCTION + no site/  -> REFUSES (was exit 0)
+                                             SIM + no site/         -> clean, loud no-op
+                                             PRODUCTION + payload-borne site/ -> all seven
+                                                                     files installed 0600
+                                             absent OPTIONAL file -> named, not fatal
+                                             absent REQUIRED file -> named, not fatal (A10)
+hub seed guards: 13 passed, 0 failed, 0 skipped
+```
+
+Also green, unchanged: `python scripts/check.py` → PASS (config-validate,
+registry-integrity, doc-navigability), `scripts/validate_config.py` → ALL CONFIG
+CHECKS PASSED, `vmtest/test-wall-builder.sh` → 12 passed / 0 failed / 0 skipped.
+`bash -n` on every shell file touched, plus `bash -n` **and `dash -n`** on all
+four inline late-command bodies in both images' user-data, plus a PyYAML parse
+of all four autoinstall files.
+
+**NOT PROVEN — and this is the whole of what OI-19 still is.** Nothing here has
+installed anything. Subiquity has never executed this late-command; `curtin` has
+never mounted a `/target` for it; the CIDATA-by-label mount it now depends on
+has been exercised on the WALL image only, and on the repacked path where
+`/cdrom` was present anyway. No ISO was built in this session and no VM was
+touched. The refusal is proven to fire **in bash, against a directory named
+`/target` that this suite created**. OI-19 is FIXED-BUT-UNVERIFIED; it closes on
+a hub install, not before.

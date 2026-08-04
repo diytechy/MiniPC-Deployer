@@ -451,6 +451,12 @@ set_env_key() {
 # Idempotent: reuses an existing SSH key / SIM password across calls (pass
 # CLEAN=1 in the environment to force fresh ones). Never touches the stock
 # Ubuntu ISO — that only happens in build-repacked-iso.sh, after this returns.
+#
+# TWO MODES, decided once and exported as HUB_BUILD_KIND (sim|production):
+# SITE_DIR pointing at a materialised Personal\homelab\deploy\out\site makes
+# this a REAL build — user-data.filled verbatim, the real site/ files staged,
+# every sim substitution skipped, and the meta-data identity taken from the
+# production user-data rather than stamped `homehub-vmtest`.
 render_seed_tree() {
     local repo_root="$1" out_dir="$2" caller="$3"
     local autoinstall_src="$repo_root/stack/autoinstall"
@@ -460,6 +466,27 @@ render_seed_tree() {
     [ -f "$stack_env_example" ] || die "not found: $stack_env_example"
     require_cmd openssl "Install with: sudo apt-get install -y openssl"
     require_cmd ssh-keygen "Install with: sudo apt-get install -y openssh-client"
+
+    # WHICH KIND OF IMAGE IS THIS? Decided ONCE, here, and read by everything
+    # below — the user-data render, the meta-data identity and the site/ staging.
+    # It used to be re-derived at each of those points from `[ -n "$SITE_DIR" ]
+    # && [ -f "$SITE_DIR/user-data.filled" ]`, which is how the meta-data step
+    # came to apply the SIM hostname to a PRODUCTION build (OI-19's companion,
+    # fixed 2026-08-03): a condition spelled out three times is a condition that
+    # will eventually disagree with itself. Same shape as render_wall_seed_tree's
+    # WALL_BUILD_KIND.
+    #
+    # SITE_DIR set but no user-data.filled is a SILENT DOWNGRADE and is refused
+    # HERE, before anything is staged: the site/ files (real secrets) would
+    # otherwise be baked onto a SIM-substituted user-data, producing a
+    # "production" stick with allow-pw: true and a known sim password hash.
+    HUB_BUILD_KIND=sim   # exported for the caller's summary
+    if [ -n "${SITE_DIR:-}" ]; then
+        [ -d "$SITE_DIR" ] || die "SITE_DIR=$SITE_DIR is not a directory"
+        [ -f "$SITE_DIR/user-data.filled" ] || \
+            die "SITE_DIR=$SITE_DIR is set but has no user-data.filled — refusing to stage real secrets onto a SIM-substituted user-data (allow-pw would be true). Run Materialize-Deploy.ps1 -Image homehub."
+        HUB_BUILD_KIND=production
+    fi
 
     [ "${CLEAN:-0}" -eq 1 ] && wipe_build_dir "$out_dir"
     mark_build_dir "$out_dir"
@@ -516,7 +543,7 @@ render_seed_tree() {
     # dangerous outcome: a production stick that quietly accepts a password
     # login with a known sim hash.
     local user_data_out="$out_dir/iso-root/user-data"
-    if [ -n "${SITE_DIR:-}" ] && [ -f "$SITE_DIR/user-data.filled" ]; then
+    if [ "$HUB_BUILD_KIND" = "production" ]; then
         log "PRODUCTION: using $SITE_DIR/user-data.filled (real key + hash; no sim substitution)"
         cp "$SITE_DIR/user-data.filled" "$user_data_out"
         # Both guards are ANCHORED to an active YAML setting, not a substring.
@@ -538,6 +565,16 @@ render_seed_tree() {
         # predated the pinning fix by 46 minutes.
         grep -Eq '^[[:space:]]+(path|serial|model|wwn):' "$user_data_out" || \
             die "user-data.filled has no storage.layout match: — the unattended wipe would pick a disk by heuristic and the library/backup drives are candidates. Re-run Materialize-Deploy.ps1 (its out\\ tree is stale)."
+        # OI-19: late-command 4b refuses to install a PRODUCTION box whose
+        # payload lost its site/ directory, and it decides that from the
+        # BUILD_PROFILE=production marker carried in this very file. Materialize
+        # -Deploy.ps1 renders user-data.filled FROM the tracked
+        # stack/autoinstall/user-data (FieldSchema.psd1 Images.homehub), so the
+        # marker arrives for free — unless the out\ tree predates the fix, in
+        # which case this stick would carry the OLD silent-exit-0 late-command
+        # and nothing downstream would ever say so.
+        grep -q 'BUILD_PROFILE=production' "$user_data_out" || \
+            die "user-data.filled carries no 'BUILD_PROFILE=production' marker — it was materialised from a stack/autoinstall/user-data older than the OI-19 fix, so its site-staging late-command still exits 0 SILENTLY when the payload has no site/. A production hub built from it can come up on .env.example placeholders believing it is production. Re-run Materialize-Deploy.ps1 -Image homehub (its out\\ tree is stale)."
     else
     sed \
         -e "s#- \"ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host\"#- \"$ssh_pubkey\"#" \
@@ -546,8 +583,21 @@ render_seed_tree() {
         -e 's/hostname: homehub/hostname: homehub-vmtest/' \
         -e 's/realname: "Home Hub Operator"/realname: "Home Hub VM Test"/' \
         -e 's|^\([[:space:]]*\)path: /dev/nvme0n1|\1model: Virtual_Disk|' \
+        -e 's|BUILD_PROFILE=production|BUILD_PROFILE=sim|' \
         "$autoinstall_src/user-data" > "$user_data_out"
     grep -q "REPLACE_WITH_YOUR_PUBLIC_KEY" "$user_data_out" && die "SSH placeholder substitution failed"
+
+    # OI-19: the site-staging late-command REFUSES the install when a production
+    # image arrives with no site/ payload. `production` is the tracked default
+    # (safe by default — a real stick materialised from this file inherits it),
+    # so the SIM path is the one that must opt out, and a no-op here would make
+    # every vmtest image halt at late-command 4b for want of secrets it is not
+    # supposed to have. Assert BOTH directions: the marker says sim, and no
+    # `production` marker survived anywhere in the file.
+    grep -q 'BUILD_PROFILE=sim' "$user_data_out" || \
+        die "the BUILD_PROFILE substitution did not apply — stack/autoinstall/user-data no longer contains 'BUILD_PROFILE=production'. A SIM image would then REFUSE to install (late-command 4b halts a production build that has no site/ payload, and this build has none). Update the sed above."
+    grep -q 'BUILD_PROFILE=production' "$user_data_out" && \
+        die "a 'BUILD_PROFILE=production' marker survived into the SIM user-data — there is now more than one, and the sed above only rewrote the first. Every occurrence must be rewritten or a sim install halts at late-command 4b."
 
     # Every sed above is a SILENT no-op if the source string moves, and the
     # result still builds — that is how the sim VM would quietly come up
@@ -612,16 +662,13 @@ render_seed_tree() {
     #    healthy (the tracker image is a KNOWN gap, documented there). ────────
     # PRODUCTION SEAM (A14): a real build stages the materialized site files
     # into deploy-payload/site/ and returns before the sim .env block. The
-    # autoinstall late-command 4b installs them into /etc/homehub-samba,
-    # /etc/homehub-backup and stack/.env on the target.
-    # SITE_DIR set but no user-data.filled would be a SILENT DOWNGRADE: the
-    # site/ files (real secrets) would still be staged while user-data fell
-    # through to the sim sed above — producing a "production" stick with
-    # allow-pw: true and a known sim password hash. Refuse instead of mixing.
-    if [ -n "${SITE_DIR:-}" ] && [ ! -f "$SITE_DIR/user-data.filled" ]; then
-        die "SITE_DIR=$SITE_DIR is set but has no user-data.filled — refusing to stage real secrets onto a SIM-substituted user-data (allow-pw would be true). Run Materialize-Deploy.ps1 -Image homehub."
-    fi
-    if [ -n "${SITE_DIR:-}" ] && [ -d "$SITE_DIR" ]; then
+    # autoinstall late-command 4b then installs them into /etc/homehub-samba,
+    # /etc/homehub-backup and stack/.env on the target — reading them out of the
+    # payload copy at /target/opt/homehub/site, which is why they must ride the
+    # payload rather than be looked for on the boot medium (OI-19).
+    # The SITE_DIR-without-user-data.filled downgrade is refused at the top of
+    # this function, before anything is staged.
+    if [ "$HUB_BUILD_KIND" = "production" ]; then
         local site_out="$payload_dir/site"
         mkdir -p "$site_out"
         local staged=0

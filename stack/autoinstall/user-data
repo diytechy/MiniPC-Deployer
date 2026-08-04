@@ -220,15 +220,93 @@ autoinstall:
     # ---- 4b. SITE payload: real materialized config + secrets (A14) ------------
     # deploy-payload/site/ is written by Build-VentoyStick.ps1 from
     # Personal\homelab\deploy\out\ — the REAL values, not the sim placeholders
-    # the vmtest builders bake. Absent on a sim/vmtest build, hence `|| true`
-    # throughout: this whole block is a no-op there.
+    # the vmtest builders bake. A sim/vmtest build legitimately has no site/ at
+    # all, and on that path this whole block is a documented no-op.
+    #
+    # IT READS THE PAYLOAD STEP 3 ALREADY COPIED, not the boot medium (OI-19).
+    # This used to start `S=/cdrom/deploy-payload/site` with a `/media/...`
+    # fallback and then `[ -d "$S" ] || exit 0` — a SILENT SUCCESS built on the
+    # same wrong assumption that cost an install cycle on 2026-08-03: /cdrom is
+    # the BOOT MEDIUM, not the seed. On the repacked path (the one
+    # Build-VentoyStick.ps1 uses today) /cdrom is the combined ISO and does
+    # carry /deploy-payload, so this worked. On the LIGHT path — the one this
+    # repo recommends by default, and a supported way to build a production hub
+    # (SITE_DIR=… bash vmtest/build-seed.sh) — /cdrom is the STOCK Ubuntu ISO
+    # and the CIDATA seed carrying the payload is mounted only transiently by
+    # cloud-init. A production hub would then install NONE of its six real
+    # files and come up on .env.example placeholders while believing it is
+    # production.
+    #
+    # The fix deliberately adds NO second search. Step 3 above already tries
+    # /cdrom, /media, /media/*, /run/media/* and finally mounts the CIDATA
+    # volume by label, and it copies the WHOLE payload — site/ included — to
+    # /target/opt/homehub/. One discovery mechanism, one place it can rot. This
+    # is the same shape the wall image uses (its late-command 4a reads
+    # /opt/wall-panel/site/wall.env rather than searching again).
+    #
+    # AND IT REFUSES, when a PRODUCTION image is what was asked for. BUILD_PROFILE
+    # below is `production` in the tracked template — which is what
+    # Materialize-Deploy.ps1 renders user-data.filled from — and
+    # vmtest/lib/common.sh rewrites it to `sim` on the sim path (asserting the
+    # rewrite applied, so a silent no-op cannot make a sim image refuse). The
+    # safe value is therefore the default and the sim build has to opt out of it.
+    # A production box that quietly degrades to sim config is the failure mode
+    # this exists to prevent: the "a dead panel must be a visible event, not
+    # silence" doctrine, applied to a headless box where the only screen is the
+    # journal.
+    #
+    # Per-file absence is LOUD BUT NOT FATAL, on purpose: Build-VentoyStick.ps1
+    # marks cifs.creds, samba-users.creds and drive-identity.conf optional
+    # (Required=$false), so refusing the install over one of them would refuse
+    # legitimate households. Whether a production build missing .env
+    # specifically should halt is an OPEN RATIFICATION, not a decision made
+    # here (docs/status.md OI-19).
     #
     # Modes matter: every file here is a secret artifact. .env and the *.creds
     # files carry live credentials, so they are installed 0600 root-owned. The
     # smb.conf fragment and fstab are not secret but are still root-only to
-    # keep the whole site/ tree consistent.
+    # keep the whole site/ tree consistent. The payload COPY of site/ is
+    # tightened too — its modes come from whatever filesystem the ISO was
+    # staged on, and a build run under WSL on /mnt/c produces 0777.
     - mkdir -p /target/etc/homehub-samba /target/etc/homehub-backup
-    - bash -c 'S=/cdrom/deploy-payload/site; [ -d "$S" ] || S=/media/deploy-payload/site; [ -d "$S" ] || exit 0; install -m600 -o root -g root "$S/.env" /target/opt/homehub/stack/.env 2>/dev/null || true; install -m600 -o root -g root "$S/backup.env" /target/etc/homehub-backup/backup.env 2>/dev/null || true; install -m600 -o root -g root "$S/cifs.creds" /target/etc/homehub-backup/cifs.creds 2>/dev/null || true; install -m600 -o root -g root "$S/samba-users.creds" /target/etc/homehub-samba/samba-users.creds 2>/dev/null || true; install -m600 -o root -g root "$S/smb.conf.fragment" /target/etc/homehub-samba/smb.conf.fragment 2>/dev/null || true; install -m600 -o root -g root "$S/library-mounts.fstab" /target/etc/homehub-samba/library-mounts.fstab 2>/dev/null || true; touch /target/etc/homehub-samba/.site-present'
+    - >-
+      bash -c 'BUILD_PROFILE=production;
+      S=/target/opt/homehub/site;
+      if [ ! -d "$S" ]; then
+      if [ "$BUILD_PROFILE" = production ]; then
+      echo "homehub: FATAL - this is a PRODUCTION image and the deploy payload carried no site/ directory.";
+      echo "homehub: none of .env, backup.env, cifs.creds, samba-users.creds, smb.conf.fragment or library-mounts.fstab would be installed,";
+      echo "homehub: so the box would come up on .env.example placeholders while believing it is production. Refusing to install that.";
+      echo "homehub: step 3 above reports where the payload was found; site/ is staged into it by vmtest/lib/common.sh from SITE_DIR.";
+      exit 1;
+      fi;
+      echo "homehub: no site/ in the payload - SIM build, so the stack runs on .env.example placeholders (expected for a vmtest image).";
+      exit 0;
+      fi;
+      chmod 0700 "$S" || true;
+      rc=0;
+      for spec in ".env:/target/opt/homehub/stack/.env:required"
+      "backup.env:/target/etc/homehub-backup/backup.env:required"
+      "cifs.creds:/target/etc/homehub-backup/cifs.creds:optional"
+      "samba-users.creds:/target/etc/homehub-samba/samba-users.creds:optional"
+      "smb.conf.fragment:/target/etc/homehub-samba/smb.conf.fragment:required"
+      "library-mounts.fstab:/target/etc/homehub-samba/library-mounts.fstab:required"
+      "drive-identity.conf:/target/etc/homehub-samba/drive-identity.conf:optional"; do
+      f=${spec%%:*}; rest=${spec#*:}; d=${rest%:*}; kind=${rest##*:};
+      if [ ! -f "$S/$f" ]; then
+      echo "homehub: $kind site file MISSING - site/$f is not in the payload, so nothing was installed at $d";
+      continue;
+      fi;
+      if install -m600 -o root -g root "$S/$f" "$d"; then
+      chmod 600 "$S/$f" || true;
+      echo "homehub: installed site/$f -> $d";
+      else
+      echo "homehub: FATAL - site/$f is present but could not be installed to $d";
+      rc=1;
+      fi;
+      done;
+      touch /target/etc/homehub-samba/.site-present;
+      exit $rc'
 
     # ---- 5. Install + enable the first-boot unit ------------------------------
     - cp /target/opt/homehub/stack/autoinstall/homehub-firstboot.service /target/etc/systemd/system/homehub-firstboot.service

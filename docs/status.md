@@ -29,7 +29,11 @@ last) — it is the record, not required reading for every pass.
       [vmtest/README.md](../vmtest/README.md). **The HUB half is DONE** — the
       gate ran 2026-07-31 and again 2026-08-01 (see the audit entries; the
       first one PASSED while running a three-week-stale tracker image).
-    - OI-17 — **Boot the WALL ISO** (2026-08-02; ATTEMPTED 2026-08-03):
+    - OI-17 — ~~**Boot the WALL ISO**~~ **CLOSED 2026-08-05.** The A19 gate
+      booted it and **the shell painted** — the narrow point this item stayed
+      open on. See the 2026-08-05 audit entry. Original text follows.
+
+      OI-17 (as written 2026-08-02; ATTEMPTED 2026-08-03):
       the ISO was booted for the first time and got as far as `late-command_9`
       before dying on the light path's missing payload (see that day's entry —
       it was a real defect in BOTH images, now fixed). **Subiquity, the disk
@@ -137,7 +141,12 @@ last) — it is the record, not required reading for every pass.
       different owners. **Consequence to expect:** until Personal's half lands,
       a `Build-VentoyStick.ps1` run whose `out\` tree has no `config.json` now
       FAILS instead of quietly producing a stick without one.
-    - OI-21 — **`/opt/homehub` installed WORLD-WRITABLE — every hub ISO ever
+    - OI-21 — ~~**`/opt/homehub` installed WORLD-WRITABLE**~~ **CLOSED
+      2026-08-05:** measured on two freshly installed boxes — 0 group- or
+      world-writable paths under `/opt/homehub` (was 230) and `/opt/wall-panel`
+      (was 215), `stack/.env` `0600 root:root`. Original text follows.
+
+      OI-21 (as written) — **`/opt/homehub` installed WORLD-WRITABLE — every hub ISO ever
       built here. FIXED 2026-08-04, NOT YET REBUILT.** Found by BOOTING the hub
       gate VM, not by review: `drwxrwxrwx root:root /opt/homehub` (and `stack/`,
       `images/`), `-rwxrwxrwx stack/.env`, `-rwxrwxrwx docker-compose.yml`, 230
@@ -159,7 +168,19 @@ last) — it is the record, not required reading for every pass.
       builder, into `D:\vmtest-out-hub-a19` and `D:\vmtest-out-wall-a19`, and
       `assert_iso_payload_modes` passed on both artifacts. Still not an
       installed box — that is the A19 run (OI-22).
-    - OI-22 — **RUN THE A19 TWO-VM GATE** (2026-08-04). Everything it needs is
+    - OI-22 — ~~**RUN THE A19 TWO-VM GATE**~~ **CLOSED 2026-08-05 — PASSED,
+      UNAIDED.** Every §3 "Done when" row met with no hand-patching: the panel
+      painted red with both drive lanes named, the per-ITEM colours agreed, and
+      all three ratified guards held (403 to a non-panel, a forged
+      `X-Forwarded-User` replaced — including when sent twice — and `WALL_PORT`
+      bound to the LAN leg only). Capture:
+      `D:mtest-out-wall-a19\panel-a19-GATE.png`. **It closes OI-17 and OI-21
+      as well — but NOT OI-19, OI-20 or the hostname fix, which need a
+      PRODUCTION build and are therefore blocked on C17.** See the 2026-08-05
+      audit entry, which corrects an earlier claim that one install would close
+      all five. The original text follows.
+
+      OI-22 (as written 2026-08-04). Everything it needs is
       now built and no decision is outstanding; it needs elevation and about
       three hours of wall-clock, which is why it is the Owner's. Three
       commands, in order, from an elevated shell in the MiniPC-Deployer
@@ -4119,3 +4140,101 @@ lesson.
 rebuild is booted — that the two fixes above are delivered by the image rather
 than by hand. `wall-sync` and `wall-sync-frame` failed on the panel, which is
 correct: both UNCs are `.invalid` and media is out of scope for this gate.
+
+---
+
+### DRIVER — G1 — Round 1 — 2026-08-05 (A19 PASSED, unaided, and three open items close — not five)
+
+**EVERY "Done when" ROW IS MET, WITH NO HAND-PATCHING.** The re-run booted both
+ISOs built from the committed tree at `0c735f2` and needed nothing done to
+either box.
+
+| §3 Done when | |
+|---|---|
+| Two VMs boot from tracked-script ISOs, **no hand-patching** | **YES.** `/etc/hosts` on the panel is clean; `/etc/homehub-backup/backup.env` was installed by firstboot, which logged that it did. |
+| A screen capture of the **panel** shows both drive checks **red** | **YES** — `D:\vmtest-out-wall-a19\panel-a19-GATE.png`, captured with `grim` from inside the cage session. |
+| The three guard assertions | **ALL THREE.** See below. |
+| The record | this entry. |
+
+**DEFECT #16 IS FIXED IN THE IMAGE, and the measurement is the one that matters
+— through the STUB, not against the server:**
+
+```
+resolvectl query wall.vmtest.sim   ->  10.99.7.10   -- link: eth1
+getent hosts wall.vmtest.sim       ->  10.99.7.10 wall.vmtest.sim
+GET /            -> 200
+GET /api/today   -> 200
+```
+
+`-- link: eth1` is the part worth reading: the answer came back over the **lab
+leg**, via the scoped search domain, exactly as `apply_sim_lab_netplan` intends.
+The previous run's `ERR_NAME_NOT_RESOLVED` is gone and no line replaced it.
+
+**DEFECT #17 IS FIXED IN THE IMAGE.** `firstboot` logged *"SIM GATE: installed a
+test backup.env so the two drive-presence lanes REPORT"*, the file is
+`-rw------- root:root`, and both lanes posted without being asked. `/api/today`
+carried, per ITEM:
+
+```
+ambient: red   score: 100
+  library-drive-present      red    Library drive mounted
+  backup-drive-present       red    Backup drive mounted
+```
+
+**THE THREE GUARDS (§3 step 7), the half that matters because it was ratified as
+security-critical:**
+
+| assertion | result |
+|---|---|
+| a request from an address that is not `PANEL_IP` gets 403 | **PASS** — `403 wall: panel only` from the hub itself; `200` from the panel |
+| a client-supplied `X-Forwarded-User` is **replaced**, not honoured | **PASS** — a forged sub returns byte-identical data to the baseline, so the injected identity won. Repeated the test with the header sent **twice**, which is the shape a single `delete` would miss: also identical. `X-Forwarded-Email` (plain delete, no injected value): identical. |
+| `WALL_PORT` reachable only on the LAN leg | **PASS** — `ss -ltn` shows `10.99.7.10:8443`, not `0.0.0.0:8443` |
+
+The forgery test is a real measurement of a behaviour a reader cannot see: Caddy
+applies header ops in a fixed order regardless of writing order, and
+`header_up <Name> <value>` is a SET, which replaces every existing value. That
+reasoning has been in the Caddyfile's banner since WI-10.14 and has now been
+checked against a live panel rather than against the source.
+
+**DEFECT #13 ON BOTH INSTALLED BOXES:** 0 group- or world-writable paths under
+`/opt/homehub` (was 230) and `/opt/wall-panel` (was 215); `stack/.env`
+`-rw------- root:root`; `/opt/homehub/sim-gate` `drwx------ root:root` and
+unreadable to the unprivileged user, which is `0c735f2` proven on a box.
+`chrome-sandbox` survives `-rwsr-xr-x` after NTFS → ISO → tar → ext4.
+
+---
+
+#### A CORRECTION: this run closes THREE open items, not five
+
+Earlier entries — and the handoff — said one install would speak to OI-17,
+OI-19, OI-20, OI-21 and the hostname fix at once. **That was wrong, and the
+reason is structural rather than incidental: three of those five can only be
+exercised by a PRODUCTION build, and A19 is a SIM gate.**
+
+| item | status after this run |
+|---|---|
+| **OI-17** — the wall ISO boots and the shell paints | **CLOSED.** It painted, unaided. |
+| **OI-21** — `/opt/homehub` world-writable | **CLOSED.** Measured on two installed boxes. |
+| **OI-22** — run the A19 gate | **CLOSED.** |
+| **OI-19** — the hub's site-staging late-command | **STILL OPEN.** A sim build has no `site/`, so 4b took its documented no-op branch. The *refusal* path — a `production` marker with no `site/` — remains unexercised on real media, which is exactly what OI-19 is. |
+| **OI-20** — the caddy-readability assertion on `config.json` | **STILL OPEN**, and for the same reason: the check is conditional on a production `config.json`, and a sim build ships none. |
+| the production meta-data hostname fix | **STILL UNVERIFIED** — the sim path stamps `homehub-vmtest` by design, so this run says nothing about the production branch. |
+
+**What actually closes those three is a PRODUCTION build**, which needs
+Personal's materialiser to emit a full `site/` — and that is blocked on
+**C17**, one `smbpasswd -a share` at the AWOW. Not a design gap; a task at a box.
+
+---
+
+**STILL NOT PROVEN, and every one of them deliberate:**
+
+- **TLS trust.** The panel runs `--ignore-certificate-errors` because the hub
+  serves from an internal CA whose root cannot exist before the panel's ISO is
+  written. The gate proves the render path, not the trust path.
+- **Wi-Fi** — `macaddress: permanent`, powersave-off, and the DHCP reservation
+  the `/32` is keyed to. Hardware-only (C7), by construction.
+- **Either CIFS mount.** `wall-sync.service` and `wall-sync-frame.service` are
+  both `failed` on the panel, which is **correct**: both UNCs are `.invalid` and
+  media is out of scope for this gate. Nothing has ever been mounted with either
+  credential; that is OI-18's standing gap and this run does not touch it.
+- **A production panel or hub.** Everything here is a sim image.

@@ -599,6 +599,16 @@ normalize_payload_modes() {
     fi
     if [ -f "$dir/stack/.env" ]; then chmod 0600 "$dir/stack/.env"; fi
     find "$dir" -type f -name '*.creds' -exec chmod 0600 {} +
+    # sim-gate/ is site/'s equivalent for a GATE build: generated, never
+    # tracked, and its backup.env carries the tracker's bearer token. The token
+    # is a sim one, but the whole point of a mode TABLE is that nobody has to
+    # decide per file which secrets are worth protecting — the file's kind
+    # decides. Caught by the suite: without this the normaliser, correctly
+    # applying "every other ordinary file 0644", widened it right back.
+    if [ -d "$dir/sim-gate" ]; then
+        chmod 0700 "$dir/sim-gate"
+        find "$dir/sim-gate" -type f -exec chmod 0600 {} +
+    fi
 
     log "payload modes normalised: dirs 0755, files 0644, $execs executable (#!), secrets 0600"
     if [ "$PAYLOAD_MODE_FIX_AT_ISO" -eq 1 ]; then
@@ -826,6 +836,10 @@ apply_sim_lab_netplan() {
         */*) : ;;
         *) die "SIM_LAB_ADDR='$SIM_LAB_ADDR' has no prefix length. netplan's addresses: takes CIDR (e.g. 10.99.7.10/24); a bare address is a parse error the installer reports as an unusable network." ;;
     esac
+    # A lab leg that carries a resolver is a lab that expects names to resolve
+    # THROUGH it. Judge the search domain before it is baked, not after a
+    # two-hour install ends at ERR_NAME_NOT_RESOLVED.
+    [ -n "${SIM_LAB_SEARCH:-}" ] && assert_stub_resolvable "$SIM_LAB_SEARCH" "SIM_LAB_SEARCH"
     if [ -n "${SIM_LAB_DNS:-}" ] && [ -z "${SIM_LAB_SEARCH:-}" ]; then
         die "SIM_LAB_DNS is set but SIM_LAB_SEARCH is not. An unscoped nameserver on the lab leg" \
             "is used for EVERY name, including the ones apt needs, against a resolver that does" \
@@ -901,6 +915,43 @@ apply_sim_lab_netplan() {
 
     log "A19 lab netplan ($role): wan=$SIM_LAB_WAN_MAC(dhcp) lab=$SIM_LAB_MAC($SIM_LAB_ADDR)${SIM_LAB_DNS:+ dns=$SIM_LAB_DNS via $SIM_LAB_SEARCH}"
     log "  -> $out_dir/a19-lab.env (Start-A19Gate.ps1 reads the MACs from here)"
+}
+
+# assert_stub_resolvable NAME WHAT — refuse a lab name no stub resolver will ask about.
+#
+# FOUND BY BOOTING, 2026-08-04, and it is the most expensive kind of wrong: the
+# name was RIGHT everywhere except at the one hop that matters.
+#
+# The A19 lab was built on `wall.vmtest.sim.invalid`, on the reasoning that
+# `.invalid` can never resolve publicly (true, RFC 6761) and that Technitium
+# being authoritative for it inside the lab was therefore stronger containment
+# (also true). Technitium answered correctly — `dig @10.99.7.10` returned the
+# address. The panel still failed with ERR_NAME_NOT_RESOLVED, because
+# **systemd-resolved implements RFC 6761 §6.4 and synthesises NXDOMAIN for
+# anything under `invalid` without ever querying the link's DNS server.** The
+# server is not the problem; the stub refuses to ask.
+#
+# So the property that makes `.invalid` safe as a sim default — nothing will
+# ever resolve it — is exactly what makes it unusable as a lab name. Both are
+# consequences of the same sentence in the RFC, which is why the reasoning felt
+# sound and was not.
+#
+# `.localhost` and `.local` are here for the same reason: resolved answers the
+# first itself and routes the second to mDNS. `.sim` is what sim/.env.sim
+# already uses, is delegated to nobody, and resolves normally over a link's DNS.
+assert_stub_resolvable() {
+    local name="$1" what="$2" tld="${1##*.}"
+    case "$tld" in
+        invalid|localhost|local)
+            die "$what is '$name', whose top-level domain '.$tld' is SPECIAL-USE:" \
+                "systemd-resolved answers it locally (NXDOMAIN for .invalid, itself for" \
+                ".localhost, mDNS for .local) and NEVER queries the link's DNS server. The hub's" \
+                "Technitium would answer correctly and the panel would still fail with" \
+                "ERR_NAME_NOT_RESOLVED — measured on a real boot, 2026-08-04. Use a name under a" \
+                "non-delegated TLD instead; sim/.env.sim already uses '.sim' (e.g." \
+                "wall.vmtest.sim), which resolves over a link's DNS and still cannot reach" \
+                "anything real." ;;
+    esac
 }
 
 # apply_sim_caddy_local_certs PAYLOAD_DIR — the sim hub's TLS, SIM ONLY.
@@ -1316,6 +1367,77 @@ render_seed_tree() {
     assert_env_interpolation_safe "$sim_env"
 
     apply_sim_caddy_local_certs "$payload_dir"
+    render_sim_gate_backup_env "$payload_dir" "$sim_env" "$caller"
+}
+
+# render_sim_gate_backup_env PAYLOAD_DIR SIM_ENV CALLER — make the drive lanes REPORT.
+#
+# A19's whole assertion is that `library-mounted` and `backup-drive-mounted`
+# report RED and that the red is visible on the panel. Booting it on 2026-08-04
+# showed neither lane reporting anything at all, and both for the same reason:
+# `library-guard.sh --report` takes its feed configuration from
+# /etc/homehub-backup/backup.env, and a SIM build installs none.
+#
+#   library lane:  detects correctly, then logs
+#                  "NAGLIGHT_FEED_URL unset — journal only (red; check id would
+#                  be 'library-mounted')" and posts nothing.
+#   backup lane:   exits before it checks — "no backup.env, nothing to check".
+#
+# NEITHER IS A PRODUCT DEFECT. Both are the right behaviour for an unprovisioned
+# box, and on a real hub Personal materialises backup.env with
+# NAGLIGHT_FEED_CONTAINER=tracker, which posts via `docker exec` against the
+# tracker's own loopback (the tracker is bridge-only by ratification — D2, no
+# host publish — so a host unit genuinely cannot dial it directly). What was
+# missing is a SIM equivalent, so the gate could never exercise the one path it
+# exists to assert. Measured: with this file in place, both lanes log
+# "feed: reported red" and /api/today carries reportColor=red on both items.
+#
+# LAB BUILDS ONLY. An ordinary V3 hub gate is left exactly as it was — a
+# reporting path that switches itself on would change what that gate covers
+# without anyone choosing it.
+render_sim_gate_backup_env() {
+    local payload_dir="$1" sim_env="$2" caller="$3"
+    [ -n "${SIM_LAB_ADDR:-}" ] || return 0
+
+    local out_dir="$payload_dir/sim-gate"
+    local out="$out_dir/backup.env"
+    mkdir -p "$out_dir"
+
+    # Read back from the RENDERED sim .env, not from the overrides: whatever
+    # docker compose ends up with is what the tracker will check against, and
+    # the two must not be able to disagree.
+    local token sub
+    token="$(sed -n 's/^FINANCE_TRACKER_FEED_TOKEN=//p' "$sim_env" | sed 's/[[:space:]]*#.*$//' | tail -n1)"
+    sub="$(sed -n 's/^PANEL_USER_SUB=//p' "$sim_env" | sed 's/[[:space:]]*#.*$//' | tail -n1)"
+
+    # THE SUB IS LOAD-BEARING. The tracker is in multi-user mode, so a report
+    # attributed to anyone else lands in a different user's data directory and
+    # the panel — which reads as PANEL_USER_SUB — never sees it. A red lane
+    # posted to the wrong user is indistinguishable from no lane at all.
+    [ -n "$sub" ] || die "the sim .env has no PANEL_USER_SUB, so a drive report would be attributed to nobody and the panel would never see it. Set it in SIM_ENV_OVERRIDES."
+
+    {
+        sim_banner "$caller"
+        echo "# The A19 gate's feed configuration for the two DRIVE-PRESENCE lanes."
+        echo "# Installed by firstboot to /etc/homehub-backup/backup.env (0600 root:root)."
+        echo "# A production hub gets this file from Personal's materialiser instead;"
+        echo "# this one exists so a SIM hub can report at all. See render_sim_gate_backup_env."
+        echo
+        echo "# Deliberately a path nothing will ever mount, so the lane is RED for a"
+        echo "# REAL reason rather than a simulated one (A19: no data drives attached)."
+        echo "BACKUP_TARGET=/mnt/backup-drive"
+        echo "BACKUP_TARGET_REQUIRE_MOUNT=true"
+        echo
+        echo "# The tracker is bridge-only (D2), so the POST runs INSIDE the container"
+        echo "# against its own loopback. Same shape as the documented production form."
+        echo "NAGLIGHT_FEED_URL=http://127.0.0.1:8787/api/feed"
+        echo "NAGLIGHT_FEED_CONTAINER=tracker"
+        echo "NAGLIGHT_TOKEN=$token"
+        echo "NAGLIGHT_USER=$sub"
+    } > "$out"
+    chmod 600 "$out"
+    log "SIM gate backup.env rendered -> deploy-payload/sim-gate/backup.env (0600)"
+    log "  the two drive lanes will REPORT (as $sub), instead of logging 'journal only'"
 }
 
 # apply_sim_env_overrides FILE [OVERRIDES] [VAR_NAME] — fold KEY=VALUE pairs in.
@@ -2114,6 +2236,16 @@ render_sim_wall_env() {
     # §3 sets it to a name the hub's Technitium answers for.
     set_env_key "$env_out" WALL_HOST "${WALL_SIM_HOST:-wall.vmtest.sim.invalid}"
     set_env_key "$env_out" WALL_PORT "${WALL_SIM_PORT:-8443}"
+
+    # THE DEFAULT STAYS `.invalid` ON PURPOSE — an ordinary sim panel must never
+    # be able to reach a real host, and a name nothing will resolve is the
+    # strongest form of that. But a LAB panel is one that has to reach the hub,
+    # so in that case the same property is fatal: see assert_stub_resolvable.
+    # Judged only when SIM_LAB_ADDR says this is a lab build.
+    if [ -n "${SIM_LAB_ADDR:-}" ]; then
+        assert_stub_resolvable "${WALL_SIM_HOST:-wall.vmtest.sim.invalid}" \
+            "WALL_HOST on an A19 lab build (set WALL_SIM_HOST=…)"
+    fi
 
     # Wi-Fi: FILLED, and never used. The sim user-data installs an ethernet
     # netplan (see render_wall_seed_tree), so wall-firstboot.sh would render a

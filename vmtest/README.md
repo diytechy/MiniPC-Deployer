@@ -708,13 +708,20 @@ reads it — nobody retypes a MAC.
 ```sh
 # HUB. LAN_IP is the hub's lab address (compose binds WALL_PORT to it, and
 # Technitium's split-horizon A records point at it). EXTRA_SUBDOMAINS=wall is
-# what makes wall.vmtest.sim.invalid resolve — the panel's WALL_HOST default
-# already IS that name, so nothing has to be overridden on the panel side.
+# what makes wall.vmtest.sim resolve.
+#
+# `.sim`, NOT the sim default `.invalid`, and the difference is not cosmetic:
+# systemd-resolved synthesises NXDOMAIN for anything under `invalid` (RFC 6761
+# §6.4) WITHOUT ever querying the link's DNS server. Technitium answers
+# correctly and the panel still fails — measured on a real boot, 2026-08-04.
+# The builder now REFUSES a lab build under .invalid / .localhost / .local.
 OUT_DIR=/mnt/d/vmtest-out-hub-a19 \
 SIM_LAB_WAN_MAC=00:15:5D:A1:90:10 SIM_LAB_MAC=00:15:5D:A1:91:10 \
 SIM_LAB_ADDR=10.99.7.10/24 \
-SIM_ENV_OVERRIDES='LAN_IP=10.99.7.10
-WALL_HOST=wall.vmtest.sim.invalid
+SIM_ENV_OVERRIDES='DOMAIN=vmtest.sim
+DNS_HOSTNAME=dns.vmtest.sim
+LAN_IP=10.99.7.10
+WALL_HOST=wall.vmtest.sim
 WALL_PORT=8443
 PANEL_IP=10.99.7.50
 PANEL_USER_SUB=sim-user-wallpanel-0003
@@ -731,7 +738,8 @@ bash vmtest/build-repacked-iso.sh --src-iso /mnt/d/iso/ubuntu-24.04.4-live-serve
 OUT_DIR=/mnt/d/vmtest-out-wall-a19 \
 SIM_LAB_WAN_MAC=00:15:5D:A1:90:50 SIM_LAB_MAC=00:15:5D:A1:91:50 \
 SIM_LAB_ADDR=10.99.7.50/24 \
-SIM_LAB_DNS=10.99.7.10 SIM_LAB_SEARCH=vmtest.sim.invalid \
+SIM_LAB_DNS=10.99.7.10 SIM_LAB_SEARCH=vmtest.sim \
+WALL_SIM_HOST=wall.vmtest.sim \
 WALL_SHELL_DIST=/mnt/c/Projects/OfficeWallNaglight/dist \
 bash vmtest/build-repacked-iso.sh --target wall --src-iso /mnt/d/iso/ubuntu-24.04.4-live-server-amd64.iso
 ```

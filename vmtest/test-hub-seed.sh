@@ -351,6 +351,57 @@ expect_refusal "a lab address with no prefix length is refused (netplan needs CI
     "has no prefix length" -- "SIM_LAB_ADDR=10.99.7.10" "${LAB_ENV[1]}" "${LAB_ENV[0]}"
 expect_refusal "an UNSCOPED lab nameserver is refused (apt would resolve through a hub that does not exist yet)" \
     "SIM_LAB_SEARCH is not" -- "${LAB_ENV[@]}" "SIM_LAB_DNS=10.99.7.10"
+
+# THE ONE THAT COST A TWO-HOUR INSTALL. The name was correct everywhere except
+# at the stub: systemd-resolved synthesises NXDOMAIN for .invalid without ever
+# querying the link's DNS server, so Technitium answered and the panel still
+# failed. Every special-use TLD resolved handles itself must be refused, and the
+# message has to say WHY or the next person picks another one.
+for bad in vmtest.sim.invalid lab.localhost gate.local; do
+    expect_refusal "a lab search domain under '.${bad##*.}' is refused (resolved answers it itself and never asks the hub)" \
+        "SPECIAL-USE" -- "${LAB_ENV[@]}" "SIM_LAB_DNS=10.99.7.10" "SIM_LAB_SEARCH=$bad"
+done
+if build_seed "${LAB_ENV[@]}" "SIM_LAB_DNS=10.99.7.10" "SIM_LAB_SEARCH=vmtest.sim"; then
+    ok "…and a '.sim' search domain builds (the convention sim/.env.sim already uses)"
+else
+    bad "a resolvable lab search domain" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+echo
+echo "=== the A19 gate's drive-lane feed (defect #17) ==="
+LAB_FEED=("${LAB_ENV[@]}" "SIM_ENV_OVERRIDES=PANEL_USER_SUB=sim-user-wallpanel-0003")
+if build_seed "${LAB_FEED[@]}"; then
+    B="$OUT/iso-root/deploy-payload/sim-gate/backup.env"
+    if [ -f "$B" ]; then
+        probs=""
+        grep -q '^NAGLIGHT_FEED_CONTAINER=tracker' "$B" || probs="$probs no-container-route"
+        grep -q '^NAGLIGHT_USER=sim-user-wallpanel-0003' "$B" || probs="$probs sub-not-the-panels"
+        grep -qE '^BACKUP_TARGET=/' "$B" || probs="$probs no-backup-target"
+        [ "$(stat -c '%a' "$B")" = "600" ] || probs="$probs mode=$(stat -c '%a' "$B")"
+        [ -z "$probs" ] \
+            && ok "a lab build renders sim-gate/backup.env 0600, posting via the tracker container, attributed to the PANEL's sub" \
+            || bad "sim gate backup.env" "$probs"
+    else
+        bad "sim gate backup.env" "no sim-gate/backup.env — both drive lanes would log 'journal only' and A19 could not see red"
+    fi
+else
+    bad "the lab feed build" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+# The sub is what makes the report land where the panel reads. Attributed to
+# anyone else it is invisible, and invisible is what A19 already looked like.
+expect_refusal "a lab build whose sim .env has no PANEL_USER_SUB is refused (the report would go to nobody)" \
+    "attributed to nobody" -- "${LAB_ENV[@]}" "SIM_ENV_OVERRIDES=PANEL_USER_SUB="
+
+# An ORDINARY hub gate must be untouched — a reporting path that switches itself
+# on would change what the V3 gate covers without anyone choosing it.
+if build_seed; then
+    [ ! -e "$OUT/iso-root/deploy-payload/sim-gate" ] \
+        && ok "a NON-lab hub build stages no sim-gate/ (the V3 gate still covers exactly what it did)" \
+        || bad "sim gate scope" "sim-gate/ was staged on a build that asked for no lab"
+else
+    bad "the plain sim build (scope case)" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
 make_site_filled
 make_site_files
 expect_refusal "SIM_LAB_* on a PRODUCTION build is refused rather than silently discarded" \

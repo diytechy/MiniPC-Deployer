@@ -3958,3 +3958,164 @@ indistinguishable from a hung VM, from a process an unelevated session cannot
 restart. `vmtest/Watch-VmConsole.ps1` is tracked, budgeted in hours,
 `-UntilOff`-capable, and **every** exit path writes why it stopped, including
 "the install may STILL BE RUNNING; this is not evidence of a hung VM".
+
+---
+
+### DRIVER — G1 — Round 1 — 2026-08-04 (A19 RAN: the shell painted, and it took two hand-patches to get there)
+
+**THE PANEL PAINTED.** A red wall reading `100%`, with an overlay naming both
+drive lanes by their real reasons — *"Library drive mounted: /srv/library is NOT
+MOUNTED … · Backup drive mounted: /mnt/backup-drive is NOT MOUNTED …"*. Captured
+with `grim` from inside the cage session and saved to
+`D:\vmtest-out-wall-a19\panel-a19.png`. Nothing has ever rendered the tracker's
+UI on a panel before; OI-17's narrow point is answered.
+
+**AND IT IS THE STRONG FORM OF THE ASSERTION, not just a red screen.** `140785e`
+warned that a red screen proves nothing on its own, because any stale habit
+reddens it. `/api/today` carried the per-ITEM colours at the same moment:
+
+```
+ambient: red   score: 100
+  library-drive-present        red      Library drive mounted
+  backup-drive-present         red      Backup drive mounted
+```
+
+**PROVEN BY THE IMAGE, no patching, on two clean installs:**
+
+- two VMs on ONE Internal switch at static, MAC-pinned addresses — the lab leg
+  came up during the *installer* phase, which is the first real-boot evidence
+  `apply_sim_lab_netplan` has;
+- **the kiosk site served TLS** — cert issued by `CN = Caddy Local Authority -
+  ECC Intermediate`, `SAN: DNS:wall.vmtest.sim.invalid`. That site has never
+  served a byte on a gate VM before (this session's earlier entry, defect #14);
+- **the `/32` guard**, answering `403 wall: panel only` to the hub itself and
+  `200` to the panel — §3 step 7's first assertion, and its third too:
+  `ss -ltn` shows `10.99.7.10:8443`, not `0.0.0.0:8443`;
+- **the tracker seeded itself from the fixture** on the panel's FIRST request —
+  defect #15's fix, working end to end;
+- `cage -d -- /opt/wall-panel/app/wall-shell --disable-gpu
+  --ignore-certificate-errors`, Electron 38.8.6 up with its zygotes and
+  `chrome-sandbox`, `IF-005: ldd resolves every library`;
+- **defect #13 on BOTH images, on installed boxes at last: 0 group- or
+  world-writable paths** under `/opt/homehub` (was 230) and `/opt/wall-panel`
+  (was 215); `stack/.env` `-rw------- root:root`.
+
+**NOT PROVEN — two hand-patches, and the gate does not pass until they are
+gone.** Same posture as 2026-08-03's defects 10-12: this proves the FIXES, not
+the IMAGE.
+
+---
+
+#### DEFECT: `.invalid` is unresolvable BY DESIGN, and the design is CLIENT-SIDE
+
+The A19 lab was built on `wall.vmtest.sim.invalid` on the reasoning that
+`.invalid` can never resolve publicly (true), that Technitium authoritative for
+it inside the lab therefore resolves it locally (also true — `dig @10.99.7.10`
+returned the address), and that this was *stronger* containment than a
+real-looking name (true as well). The panel still died on
+`ERR_NAME_NOT_RESOLVED`.
+
+**systemd-resolved implements RFC 6761 §6.4 and synthesises NXDOMAIN for
+anything under `invalid` without ever querying the link's DNS server.** The
+server was never the problem; the stub refuses to ask. Measured on the panel:
+
+```
+dig wall.vmtest.sim.invalid @10.99.7.10   -> 10.99.7.10      (Technitium: correct)
+dig wall.vmtest.sim.invalid @127.0.0.53   -> (empty)         (the stub the shell uses)
+curl --resolve …                          -> 200 + real JSON (DNS bypassed)
+```
+
+So the property that makes `.invalid` safe as a sim default — nothing will ever
+resolve it — is precisely what makes it unusable as a lab name. Both follow from
+the same sentence in the RFC, which is why the reasoning felt sound and was not.
+**And the plan had said so:** *"`WALL_HOST` MUST be overridden — the sim default
+is deliberately unresolvable."* That instruction was overridden on the strength
+of an argument about the server, in a failure that lives in the client.
+
+Fixed as `assert_stub_resolvable`, which refuses a lab build whose search domain
+or `WALL_HOST` sits under `.invalid`, `.localhost` or `.local`, and names
+resolved and the RFC in the message — a refusal that only says "no" trains the
+next person to try `.local`. **The non-lab default stays `.invalid`:** a lone sim
+panel must still be unable to reach anything real, and only a lab has a reason
+to give that up. `.sim` is the replacement, which is what `sim/.env.sim` has used
+since WI-10.14.
+
+---
+
+#### DEFECT: a SIM hub cannot report either drive lane, so A19's assertion was unreachable
+
+Both lanes detected the fault perfectly and told nobody:
+
+```
+[library-guard] UNHEALTHY: /srv/library is NOT MOUNTED — the library drive is absent…
+[library-guard] NAGLIGHT_FEED_URL unset — journal only (red; check id would be 'library-mounted')
+[backup-drive-health] no /etc/homehub-backup/backup.env — backup not provisioned, nothing to check
+```
+
+`library-guard.sh --report` takes its feed configuration from
+`/etc/homehub-backup/backup.env`, and a **sim** build installs none — it is a
+production `site/` file. The library lane therefore logs the right band and the
+right check id into a journal nobody reads; the backup lane exits before it
+checks at all.
+
+**NEITHER IS A PRODUCT DEFECT, and this entry nearly said they were.** Both are
+correct for an unprovisioned box, and on a real hub the materialised
+`backup.env` carries `NAGLIGHT_FEED_CONTAINER=tracker`, which runs the POST
+*inside* the container against its own loopback — necessary because the tracker
+is bridge-only by ratification (D2: no host publish, since trusted headers are
+forgeable if the port is open). Measured on the gate hub, confirming that design
+rather than contradicting it: from the host, `127.0.0.1:8787` is refused,
+`tracker:8787` does not resolve, `docker port tracker` is empty. The mechanism
+was already right; only a SIM equivalent was missing.
+
+`render_sim_gate_backup_env` renders one into `deploy-payload/sim-gate/` on lab
+builds only, and firstboot installs it `0600 root:root` — **refusing outright if
+a real `backup.env` already exists**, because a gate fixture on a provisioned hub
+would repoint a household's drive reports at a test identity.
+
+**`NAGLIGHT_USER` is the load-bearing field.** The tracker runs multi-user, so a
+report attributed to anyone but `PANEL_USER_SUB` lands in a different user's data
+directory and the panel never sees it — a red lane posted to the wrong user is
+indistinguishable from no lane at all, which is the exact failure being fixed.
+The value is read back out of the RENDERED sim `.env` rather than from the
+overrides, so the two cannot disagree, and a lab build with no `PANEL_USER_SUB`
+is refused.
+
+---
+
+#### THE GUARD THAT WAS DROPPED, AND COST AN INSTALL THE SAME NIGHT
+
+`recreate-hub-vm.ps1` **refused to boot an ISO older than the newest commit** —
+"the mechanised form of *verify the artifact, never the exit code*".
+`Start-A19Gate.ps1` replaced it and only **printed** the build timestamp. Hours
+later, with the builder fixed and the ISO not yet rebuilt, `-Stage Hub` booted
+the pre-fix image and began a 25-minute install of the defect it was meant to
+test. A timestamp a human is expected to read and compare is not a check.
+
+Restored, and judged against the newest commit touching **`vmtest/` or
+`stack/`** rather than any commit — a docs-only change does not invalidate an
+ISO, and refusing on one would train the operator to pass `-AllowStaleIso` every
+time, which is how a guard becomes a keystroke.
+
+**Also:** `Set-VMFirmware -SecureBootTemplate MicrosoftUEFICertificateAuthority`
+succeeded on one VM and, twenty minutes later on the same host with the same
+parameters, failed on the next with *"matches none of the secure boot
+templates"*. The NAME LOOKUP is the flaky part, not the template, so the call is
+now tried by name and then by the same template's well-known id — one thing
+attempted two ways, announced when it takes the second route. Secure Boot stayed
+ON for the panel (`shim-signed` and `grub-efi-amd64-signed` were installed), so
+there is no `-DisableSecureBoot` delta to record.
+
+---
+
+**SUITES:** `test-hub-seed.sh` 47 → **54 passed, 0 failed, 0 skipped**;
+`test-wall-builder.sh` 107 → **110 passed, 0 failed, 0 skipped**. One existing
+wall case had to be corrected rather than the guard: section 4c asked for a lab
+build on the `.invalid` default, which is now refused — the case predated the
+lesson.
+
+**WHAT THIS RUN STILL DOES NOT PROVE:** TLS trust (the panel runs with
+`--ignore-certificate-errors`), Wi-Fi, either CIFS mount, and — until the
+rebuild is booted — that the two fixes above are delivered by the image rather
+than by hand. `wall-sync` and `wall-sync-frame` failed on the panel, which is
+correct: both UNCs are `.invalid` and media is out of scope for this gate.

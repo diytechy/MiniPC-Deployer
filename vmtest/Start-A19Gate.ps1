@@ -61,7 +61,12 @@ param(
     # Last resort, and a RECORDED DELTA rather than a convenience: the guest
     # then boots unverified. Only reach for it if the Microsoft UEFI CA template
     # cannot be set by name or by id — see New-HomeHubVm.ps1's firmware block.
-    [switch]$DisableSecureBoot
+    [switch]$DisableSecureBoot,
+
+    # Boot an ISO older than the newest vmtest/ or stack/ commit. Deliberate
+    # only — the default refusal exists because on 2026-08-04 this script booted
+    # a pre-fix ISO and spent an install reproducing the defect it was testing.
+    [switch]$AllowStaleIso
 )
 
 $ErrorActionPreference = 'Stop'
@@ -111,6 +116,19 @@ function Start-Watcher {
     Write-Host "  watcher: $watchDir\latest.png  (status: $watchDir\watch-status.txt)" -ForegroundColor Cyan
 }
 
+# Assert-Iso PATH — the ISO exists, and it is NOT OLDER THAN THE CODE.
+#
+# THE SECOND HALF IS THE POINT, and this script shipped without it. The
+# superseded recreate-hub-vm.ps1 refused to boot an ISO older than the newest
+# commit — the mechanised form of "verify the artifact, never the exit code".
+# This one merely PRINTED the build time, and on 2026-08-04 that cost a full
+# install: the builder had been fixed, the ISO had not been rebuilt, and the
+# gate booted the defect it was meant to test. A timestamp a human is expected
+# to read and compare is not a check.
+#
+# Judged against the newest commit that touches what goes INTO an image —
+# vmtest/ and stack/. A docs-only commit does not invalidate an ISO, and
+# refusing on one would train you to pass -AllowStaleIso every time.
 function Assert-Iso {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -118,6 +136,28 @@ function Assert-Iso {
     }
     $iso = Get-Item -LiteralPath $Path
     Write-Host ("  ISO: {0}  ({1:N1} GB, built {2})" -f $iso.FullName, ($iso.Length / 1GB), $iso.LastWriteTime) -ForegroundColor Cyan
+
+    $repo = Split-Path -Parent $here
+    $stamp = & git -C $repo log -1 --format=%cI -- vmtest stack 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $stamp) {
+        Write-Host "  (could not read git history here - ISO freshness NOT checked)" -ForegroundColor Yellow
+        return $iso.FullName
+    }
+    $commitTime = [datetimeoffset]::Parse($stamp).LocalDateTime
+    if ($iso.LastWriteTime -lt $commitTime) {
+        $msg = "STALE ISO. $Path was built $($iso.LastWriteTime), but vmtest/ or stack/ " +
+               "changed at $commitTime. Booting it would test the code as it was BEFORE the " +
+               "newest change - which is how a gate reports green against a defect that was " +
+               "already fixed, or reproduces one that was. Rebuild it (vmtest/README.md §12.2), " +
+               "or pass -AllowStaleIso if you deliberately want the older image."
+        if ($AllowStaleIso) {
+            Write-Host "  OVERRIDDEN (-AllowStaleIso): $msg" -ForegroundColor Yellow
+        } else {
+            throw $msg
+        }
+    } else {
+        Write-Host "  ISO is newer than the last vmtest/ or stack/ commit ($commitTime)." -ForegroundColor Green
+    }
     return $iso.FullName
 }
 

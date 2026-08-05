@@ -469,9 +469,13 @@ else
     fail_case "the plain sim wall build (4c baseline)" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
 fi
 
+# WALL_SIM_HOST is not decoration here: a lab build is refused without a
+# resolvable name (see the .invalid cases below), which is the whole lesson of
+# 2026-08-04. This case predated that guard and asked for the impossible.
 if env "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DIR="$WORK/out-dir" \
+        WALL_SIM_HOST=wall.vmtest.sim \
         SIM_LAB_WAN_MAC=00:15:5D:A1:90:50 SIM_LAB_MAC=00:15:5D:A1:91:50 \
-        SIM_LAB_ADDR=10.99.7.50/24 SIM_LAB_DNS=10.99.7.10 SIM_LAB_SEARCH=vmtest.sim.invalid \
+        SIM_LAB_ADDR=10.99.7.50/24 SIM_LAB_DNS=10.99.7.10 SIM_LAB_SEARCH=vmtest.sim \
         bash "$BUILDER" >"$WORK/out.txt" 2>&1; then
     U="$WORK/out-dir/iso-root/user-data"
     assert_file_matches "the panel's lab leg is pinned by MAC, not by name" "$U" 'macaddress: "00:15:5D:A1:91:50"'
@@ -488,6 +492,22 @@ if env "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DIR="$WORK/out-dir" \
 else
     fail_case "the A19 lab wall build" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
 fi
+
+# THE PANEL'S HALF OF THE .invalid LESSON. WALL_HOST's sim default is
+# deliberately unresolvable, which is right for a lone panel and fatal for a lab
+# one — measured 2026-08-04, when Technitium answered correctly and the panel
+# still ended at ERR_NAME_NOT_RESOLVED because resolved never asked it.
+expect_refusal "a LAB wall build keeping the unresolvable .invalid WALL_HOST default is refused" \
+    "SPECIAL-USE" -- "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 \
+    "SIM_LAB_WAN_MAC=00:15:5D:A1:90:50" "SIM_LAB_MAC=00:15:5D:A1:91:50" "SIM_LAB_ADDR=10.99.7.50/24"
+expect_success "…and the same build with a '.sim' WALL_HOST succeeds" \
+    "WALL_HOST=wall.vmtest.sim" -- "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 \
+    "WALL_SIM_HOST=wall.vmtest.sim" \
+    "SIM_LAB_WAN_MAC=00:15:5D:A1:90:50" "SIM_LAB_MAC=00:15:5D:A1:91:50" "SIM_LAB_ADDR=10.99.7.50/24"
+# A NON-lab wall build must keep the unresolvable default: that is the
+# containment property, and only the lab case has a reason to give it up.
+expect_success "a NON-lab wall build still gets the deliberately unresolvable .invalid default" \
+    "WALL_HOST=wall.vmtest.sim.invalid" -- "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 
 echo
 echo "=== 4b. the payload's MODES (the hub's 2026-08-04 defect is this image's too) ==="

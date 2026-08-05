@@ -265,6 +265,16 @@ autoinstall:
     # It runs BEFORE step 4/4b deliberately: 4b installs the real site files
     # 0600 root:root and tightens what it leaves behind, so this narrows the
     # window rather than fighting it, and the two agree about site/ being 0700.
+    #
+    # sim-gate/ gets site/'s treatment for site/'s reason: it is the GATE's
+    # equivalent seam (generated, never tracked) and its backup.env carries the
+    # tracker's bearer token. Added 2026-08-04 after reading the modes actually
+    # recorded in a built ISO rather than the ones the staging tree reported —
+    # on the DrvFs build path `-chmod_r go-w` is SUBTRACTIVE, so it clears the
+    # write bits and leaves `-rwxr-xr-x`, world-READABLE. `stack/.env` has
+    # always been in exactly that state on the ISO and has always been tightened
+    # here; sim-gate/ was the new seam nobody had told this step about, which is
+    # the same sentence as defect #13's.
     - >-
       bash -c 'R=/target/opt/homehub;
       if [ ! -d "$R" ]; then echo "homehub: no /opt/homehub to normalise - step 3 found no payload"; exit 0; fi;
@@ -272,6 +282,7 @@ autoinstall:
       chmod -R go-w "$R" || { echo "homehub: FATAL - could not clear group/world write on $R"; exit 1; };
       chmod 0755 "$R";
       if [ -d "$R/site" ]; then chmod 0700 "$R/site"; find "$R/site" -type f -exec chmod 0600 {} +; fi;
+      if [ -d "$R/sim-gate" ]; then chmod 0700 "$R/sim-gate"; find "$R/sim-gate" -type f -exec chmod 0600 {} +; fi;
       if [ -f "$R/stack/.env" ]; then chmod 0600 "$R/stack/.env"; fi;
       find "$R" -type f -name "*.creds" -exec chmod 0600 {} + ;
       bad=$(find "$R" -perm /022 | head -n 5);

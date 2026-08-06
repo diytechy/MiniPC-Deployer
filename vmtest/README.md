@@ -178,6 +178,17 @@ than the storage selector and `interactive-sections`, so the unpinned entry can
 never quietly become a *different install* — same user, same payload, same
 late-commands, only the disk choice moves.
 
+**The ISO carries its own volume label** (`--volid`, default `HOMEHUB` /
+`WALLPANEL`; HomeHub passes its `ImageSpec.StickLabel` so the two cannot drift).
+This matters for the raw-written stick, not the VM: a hybrid ISO written to USB
+exposes a large **read-only ISO9660** partition — the one Windows letters and
+shows you, and which therefore *cannot* be relabelled afterwards — plus a ~5 MB
+EFI System Partition that is writable but which Windows hides. A post-write
+relabel had, at best, a partition nobody ever sees. Baking the label into the
+Primary Volume Descriptor puts it on the partition you actually look at, and it
+survives the raw write with no post-hoc step. The build reads the volume id back
+off the finished ISO and fails if it isn't what was asked for.
+
 It does **not** rebuild the ISO's boot catalog from scratch (which is fiddly
 and easy to get subtly wrong for a hybrid BIOS+UEFI ISO). Instead it uses
 `xorriso`'s `-boot_image any replay`, which reuses the **original** El Torito

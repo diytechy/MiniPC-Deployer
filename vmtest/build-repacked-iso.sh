@@ -37,6 +37,7 @@
 #   bash vmtest/build-repacked-iso.sh --src-iso /path/to/ubuntu-24.04.x-live-server-amd64.iso
 #   bash vmtest/build-repacked-iso.sh --target wall --src-iso ...   # the WALL panel image
 #   bash vmtest/build-repacked-iso.sh --src-iso ... --expected-sha256 <hash from releases.ubuntu.com/24.04/SHA256SUMS>
+#   bash vmtest/build-repacked-iso.sh --src-iso ... --volid HOMEHUB   # ISO volume label
 #   OUT_DIR=/mnt/d/vmtest-out bash vmtest/build-repacked-iso.sh --src-iso ...
 #
 # Output (gitignored, see ../.gitignore):
@@ -68,16 +69,47 @@ while [ $# -gt 0 ]; do
         --src-iso) SRC_ISO="$2"; shift 2 ;;
         --expected-sha256) EXPECTED_SHA256="$2"; shift 2 ;;
         --target) TARGET="$2"; shift 2 ;;
+        --volid) VOLID="$2"; shift 2 ;;
         --clean) CLEAN=1; shift ;;
         -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
         *) die "unknown argument '$1' (try --help)" ;;
     esac
 done
 case "$TARGET" in
-    hub)  DEFAULT_OUT="$REPO_ROOT/vmtest/.out";      ISO_NAME="repacked.iso" ;;
-    wall) DEFAULT_OUT="$REPO_ROOT/vmtest/.out-wall"; ISO_NAME="wall-repacked.iso" ;;
+    hub)  DEFAULT_OUT="$REPO_ROOT/vmtest/.out";      ISO_NAME="repacked.iso";      DEFAULT_VOLID="HOMEHUB" ;;
+    wall) DEFAULT_OUT="$REPO_ROOT/vmtest/.out-wall"; ISO_NAME="wall-repacked.iso"; DEFAULT_VOLID="WALLPANEL" ;;
     *)    die "--target must be 'hub' or 'wall' (got '$TARGET')" ;;
 esac
+
+# ── the ISO's own volume label (2026-08-06) ─────────────────────────────────
+# WHY THE IMAGE CARRIES IT rather than the writer applying it afterwards. A
+# raw-written hybrid ISO exposes exactly two partitions: a 3.9 GB ISO9660 one,
+# which is the volume Windows letters and shows in Explorer but CANNOT be
+# relabelled because ISO9660 is read-only, and a 5 MB EFI System Partition,
+# which is writable but which Windows hides by design. So the post-write
+# relabel that HomeHub's Build-BootableUsb does had, at best, the ESP to write
+# to — a partition the operator never sees — and at worst nothing at all.
+# Result: a stick that boots fine and looks unlabelled, on a flow where the
+# label IS the consent marker the next run resolves the target by.
+#
+# -volid puts it in the Primary Volume Descriptor instead, so it survives the
+# raw write with no post-hoc step and appears on the big partition. Match it to
+# the label the writer looks for; HomeHub passes --volid from its ImageSpec so
+# that stays one source of truth, and these defaults only apply to a standalone
+# run of this script.
+#
+# UPPERCASED, NOT REWRITTEN. Strict ISO9660 volume ids are A-Z 0-9 _ and at
+# most 32 characters. Uppercasing is safe because the consumer compares with
+# PowerShell -eq, which is case-insensitive; anything else would be this script
+# quietly deciding the label does not have to match what the writer searches
+# for, which is the whole failure being fixed. So other characters are refused.
+VOLID="${VOLID:-$DEFAULT_VOLID}"
+VOLID="$(printf '%s' "$VOLID" | tr '[:lower:]' '[:upper:]')"
+case "$VOLID" in
+    *[!A-Z0-9_]*) die "--volid '$VOLID' has characters outside A-Z 0-9 _ , which strict ISO9660 does not allow. Rewriting it here would produce a stick whose label no longer matches the one the writer looks for. Choose a label in that set." ;;
+esac
+[ "${#VOLID}" -le 32 ] || die "--volid '$VOLID' is ${#VOLID} characters; ISO9660 allows at most 32"
+[ -n "$VOLID" ]        || die "--volid is empty"
 OUT_DIR="${OUT_DIR:-$DEFAULT_OUT}"
 # Q10.9 B+: where export-images.sh put the docker-save tars (its default).
 IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
@@ -325,6 +357,7 @@ log "repacking -> $REPACKED_ISO (a few minutes; copies ~3GB)"
 # 0600 secret at 0600. `-chown_r`/`-chgrp_r` are scoped to /deploy-payload so
 # nothing about Ubuntu's own files in the repacked ISO changes.
 xorriso -indev "$SRC_ISO" -outdev "$REPACKED_ISO" \
+    -volid "$VOLID" \
     -map "$GRUB_MOD" /boot/grub/grub.cfg \
     -map "$NOCLOUD_DIR/user-data" /nocloud/user-data \
     -map "$NOCLOUD_DIR/meta-data" /nocloud/meta-data \
@@ -354,6 +387,18 @@ xorriso -indev "$REPACKED_ISO" -find /deploy-payload >/dev/null 2>&1 \
     || die "repacked ISO is missing /deploy-payload - do not use this ISO"
 # And the modes it will hand to `cp -a` (2026-08-04).
 assert_iso_payload_modes "$REPACKED_ISO" /deploy-payload
+
+# The volume label, read back off the built ISO rather than trusted from the
+# command line. `-volid` is one option among several xorriso accepts that can
+# be overridden by a later one (`-boot_image any replay` replays a great deal
+# from the source image), and a silently-inherited "Ubuntu-Server 24.04.x LTS
+# amd64" is exactly the unlabelled-looking stick this is meant to prevent —
+# only now it would also have passed a build that claimed to set it.
+ACTUAL_VOLID="$(xorriso -indev "$REPACKED_ISO" -pvd_info 2>/dev/null \
+    | sed -n 's/^Volume Id[[:space:]]*:[[:space:]]*//p' | head -n1)"
+[ "$ACTUAL_VOLID" = "$VOLID" ] \
+    || die "repacked ISO reports volume id '$ACTUAL_VOLID', expected '$VOLID' - the stick would mount unlabelled and the writer would not find it by name. Do not use this ISO"
+log "volume label: $VOLID (in the ISO itself; survives the raw write)"
 
 log "OK — repacked ISO ready: $REPACKED_ISO (BIOS + UEFI boot images intact, /nocloud + /deploy-payload present)"
 # The account and the console story differ per target — the wall autologins

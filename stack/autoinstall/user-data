@@ -437,6 +437,37 @@ autoinstall:
     - cp /target/opt/homehub/stack/backup/systemd/backup-standby.service /target/etc/systemd/system/backup-standby.service
     - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/backup-standby.sh
     - curtin in-target --target=/target -- systemctl enable backup-standby.service
+    # ---- 6. REFUSE TO FINISH AN INSTALL THAT DID NOT PRODUCE ITS ARTIFACTS ----
+    # 2026-08-06. An install reported success and produced a box with no
+    # /opt/homehub, no openssh-server, no docker and no cockpit - i.e. a bare
+    # Ubuntu wearing the right hostname, unreachable because the console
+    # account is password-locked and sshd was never installed. Every stage
+    # above had "succeeded" in the sense of not stopping.
+    #
+    # So the last thing the install does is check its own work. `exit 1` here
+    # makes Subiquity fail visibly and run error-commands, which now preserves
+    # the logs - rather than rebooting into a machine whose emptiness is
+    # discovered an hour away from the toolchain.
+    #
+    # THIS CANNOT CATCH EVERYTHING, and the limit is worth stating: if the
+    # failure happens BEFORE late-commands run, this block never executes and
+    # the install still reboots green. That case is caught after boot instead,
+    # by vmtest/assert-installed.sh. The two layers exist because neither
+    # covers the other.
+    - |
+      curtin in-target --target=/target -- bash -c '
+        missing=""
+        for p in /opt/homehub /usr/sbin/sshd /usr/bin/docker \
+                 /etc/systemd/system/homehub-firstboot.service; do
+          [ -e "$p" ] || missing="$missing $p"
+        done
+        if [ -n "$missing" ]; then
+          echo "homehub: FATAL - the install is incomplete. Missing:$missing" >&2
+          echo "homehub: refusing to reboot into a box that looks installed and is not." >&2
+          exit 1
+        fi
+        echo "homehub: install completeness check passed."
+      '
 
   # ── If the install does not run, SAY WHY, on the console (2026-08-06) ──────
   # The `match:` above halts by design on any machine it does not recognise.
@@ -461,8 +492,51 @@ autoinstall:
       {
         echo
         echo "=============================================================="
-        echo " INSTALL DID NOT RUN.  Nothing was written to any disk."
+        echo " THE INSTALL FAILED."
         echo "=============================================================="
+        echo
+        # WAS ANYTHING WRITTEN? DETERMINE IT, NEVER ASSUME IT.
+        #
+        # This banner used to assert "Nothing was written to any disk"
+        # unconditionally, because it was written assuming the only way to
+        # reach error-commands was the storage-pin halt, where nothing has been
+        # touched yet. On 2026-08-06 it printed exactly that over a disk that
+        # had already been partitioned and imaged - the failure was a LATER
+        # stage - and the operator reasonably believed the disk was untouched.
+        # A confident wrong answer about whether a disk was written is worse
+        # than no answer at all.
+        #
+        # /proc/mounts rather than mountpoint(1): always present, no package.
+        if grep -q ' /target ' /proc/mounts 2>/dev/null; then
+          TARGET_MOUNTED=yes
+          echo "STATE: /target IS MOUNTED - the target disk HAS been written."
+          echo "       This is NOT the storage-pin halt. A PARTIAL INSTALL exists"
+          echo "       on the disk below, and it may well boot while being"
+          echo "       incomplete. Do not assume the machine is untouched."
+        else
+          TARGET_MOUNTED=no
+          echo "STATE: /target is not mounted."
+          echo "       Most likely nothing was written by THIS run - but that is"
+          echo "       an inference from what is visible now, not a guarantee."
+        fi
+        echo
+        # PRESERVE THE EVIDENCE. Subiquity copies /var/log/installer to the
+        # target only on SUCCESS, so a failed install's logs die with the live
+        # system at the reboot that follows. On 2026-08-06 that is precisely
+        # what happened, and the post-mortem had nothing to read: the installed
+        # disk carried only the live medium's casper files.
+        if [ "$TARGET_MOUNTED" = yes ] && cp -a /var/log/installer /target/var/log/installer-failed 2>/dev/null; then
+          echo "LOGS: saved to /var/log/installer-failed/ ON THE TARGET DISK."
+          echo "      They survive the reboot - read them from the installed system."
+        else
+          echo "LOGS: could NOT be saved to the target. They are at"
+          echo "      /var/log/installer on this LIVE system and die at reboot."
+          echo "      Copy them off NOW if you need them."
+        fi
+        echo
+        echo "-- the tail of the installer's own log --"
+        tail -n 25 /var/log/installer/subiquity-server-debug.log 2>/dev/null \
+          || echo "   (no subiquity-server-debug.log - the failure was very early)"
         echo
         echo "-- the disk this image expects (its pin, read back from the seed) --"
         for f in /autoinstall.yaml /cdrom/nocloud/user-data; do
@@ -479,16 +553,26 @@ autoinstall:
           echo "   $d  $(udevadm info --query=property --name="$d" 2>/dev/null | sed -n 's/^ID_SERIAL=//p')"
         done
         echo
-        echo "If a disk above IS this machine's internal disk, the pin is most"
-        echo "likely the SHORT serial. Subiquity matches udev ID_SERIAL, usually"
-        echo "MODEL_SERIAL_LUN - not the bare serial on the sticker or in lsblk."
-        echo
-        echo "TO INSTALL ON THIS MACHINE ANYWAY, now, without rebuilding the ISO:"
-        echo "  reboot, and at the GRUB menu (5 second timeout) choose"
-        echo "    Install - choose target disk manually (unpinned)"
-        echo "  It stops at the storage screen for you to pick and confirm a disk."
-        echo
-        echo "TO LOOK AROUND FIRST: choose 'Diagnostic Shell (no autoinstall)'."
+        # The advice DIFFERS by state, because the wrong advice here costs an
+        # evening. The GRUB entries solve a pin that matched nothing; they solve
+        # nothing at all once curtin has written the disk.
+        if [ "$TARGET_MOUNTED" = yes ]; then
+          echo "THE DISK WAS ALREADY WRITTEN, so this is NOT the pin halting and"
+          echo "the unpinned GRUB entry will not help. The cause is in the log"
+          echo "above and in /var/log/installer-failed/ on the installed system."
+          echo "Expect a machine that boots and is INCOMPLETE."
+        else
+          echo "If a disk above IS this machine's internal disk, the pin is most"
+          echo "likely the SHORT serial. Subiquity matches udev ID_SERIAL, usually"
+          echo "MODEL_SERIAL_LUN - not the bare serial on the sticker or in lsblk."
+          echo
+          echo "TO INSTALL ON THIS MACHINE ANYWAY, now, without rebuilding the ISO:"
+          echo "  reboot, and at the GRUB menu (10 second timeout) choose"
+          echo "    Install - choose target disk manually (unpinned)"
+          echo "  It stops at the storage screen for you to pick and confirm a disk."
+          echo
+          echo "TO LOOK AROUND FIRST: choose 'Diagnostic Shell (no autoinstall)'."
+        fi
         echo "=============================================================="
         echo
       } > /dev/console 2>&1

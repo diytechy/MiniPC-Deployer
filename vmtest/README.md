@@ -419,6 +419,40 @@ VM summary pane — Default Switch NAT hands out a `172.x`-range address).
 
 ## 7. What "success" looks like
 
+> **The A19/V3 gates below are SIM gates, and everything in them is read by a
+> human.** They build with `SITE_DIR` unset, so `common.sh` emits a sim image —
+> a different user-data, a different disk pin, a different `.env` — and nothing
+> is checked after `Start-VM`. A green run means "two VMs were created and are
+> Running".
+>
+> **`Start-InstallGate.ps1` is the automated counterpart, and it boots the
+> PRODUCTION image.** Added 2026-08-06, after a production stick installed a bare
+> Ubuntu onto the real hub and reported success: no `/opt/homehub`, no
+> `openssh-server`, no Docker, and no way in. Every check in the repo passed,
+> because all of them run before the ISO is written.
+>
+> ```powershell
+> .\vmtest\Start-InstallGate.ps1 -IsoPath D:\vmtest-out-hub-prod\repacked.iso
+> ```
+>
+> Two runs of the same image, asserting opposite properties:
+>
+> - **Run A — containment.** Boot the shipped ISO untouched. The disk pin must
+>   refuse this machine, and **nothing may be written** — measured on the VHDX,
+>   because the installer's own claim about whether it wrote is the thing under
+>   test.
+> - **Run B — completeness.** Boot the gate ISO from `make-gate-iso.sh` (same
+>   payload, one extra unattended-unpinned entry, equivalence asserted at build
+>   time), install, find the guest by MAC in the host's neighbour table (no KVP
+>   daemon on these guests), SSH in, and run `assert-installed.sh` then
+>   `stack/provision/healthcheck.sh`.
+>
+> The VHDX carries materialised credentials once Run B finishes and is destroyed
+> on every exit path unless `-KeepVhdxForDebug`, which says so and names the
+> file. The gate ISO installs unattended to any disk it finds and **must never be
+> written to physical media** — that is exactly why the shipped image does not
+> carry such an entry.
+
 Watch first-boot bring-up:
 
 ```sh

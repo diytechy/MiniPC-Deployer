@@ -439,6 +439,26 @@ autoinstall:
     # Run it over SSH after the first boot IF firstboot reported s2idle, then
     # re-run the suspend/resume test (WALL-BURN-IN.md §4).
 
+    # ---- 7. REFUSE TO FINISH AN INSTALL THAT DID NOT PRODUCE ITS ARTIFACTS ----
+    # Same reasoning and same limits as the hub's step 6 - see that file. It
+    # matters more here, not less: this machine is wall-mounted with no
+    # keyboard, so "boots but is incomplete" is the most expensive possible
+    # outcome. Caught before the reboot, or not at all until it is on a wall.
+    - |
+      curtin in-target --target=/target -- bash -c '
+        missing=""
+        for p in /opt/homehub /usr/sbin/sshd \
+                 /etc/systemd/system/wall-firstboot.service; do
+          [ -e "$p" ] || missing="$missing $p"
+        done
+        if [ -n "$missing" ]; then
+          echo "wall: FATAL - the install is incomplete. Missing:$missing" >&2
+          echo "wall: refusing to reboot into a panel that looks installed and is not." >&2
+          exit 1
+        fi
+        echo "wall: install completeness check passed."
+      '
+
   # ── If the install does not run, SAY WHY, on the console (2026-08-06) ──────
   # Identical in purpose to the AWOW variant's block, and identical in text on
   # purpose — the operator standing at a halted machine should not have to
@@ -454,8 +474,34 @@ autoinstall:
       {
         echo
         echo "=============================================================="
-        echo " INSTALL DID NOT RUN.  Nothing was written to any disk."
+        echo " THE INSTALL FAILED."
         echo "=============================================================="
+        echo
+        # See the hub's user-data for why this is DETERMINED rather than
+        # asserted: the earlier version of this banner claimed "Nothing was
+        # written to any disk" unconditionally and, on 2026-08-06, said so over
+        # a disk that had already been imaged.
+        if grep -q ' /target ' /proc/mounts 2>/dev/null; then
+          TARGET_MOUNTED=yes
+          echo "STATE: /target IS MOUNTED - the target disk HAS been written."
+          echo "       This is NOT the storage-pin halt. A PARTIAL INSTALL exists."
+        else
+          TARGET_MOUNTED=no
+          echo "STATE: /target is not mounted."
+          echo "       Most likely nothing was written by THIS run - but that is"
+          echo "       an inference from what is visible now, not a guarantee."
+        fi
+        echo
+        if [ "$TARGET_MOUNTED" = yes ] && cp -a /var/log/installer /target/var/log/installer-failed 2>/dev/null; then
+          echo "LOGS: saved to /var/log/installer-failed/ ON THE TARGET DISK."
+        else
+          echo "LOGS: could NOT be saved to the target. They are at"
+          echo "      /var/log/installer here and die at reboot. Copy them now."
+        fi
+        echo
+        echo "-- the tail of the installer's own log --"
+        tail -n 25 /var/log/installer/subiquity-server-debug.log 2>/dev/null \
+          || echo "   (no subiquity-server-debug.log - the failure was very early)"
         echo
         echo "-- the disk this image expects (its pin, read back from the seed) --"
         for f in /autoinstall.yaml /cdrom/nocloud/user-data; do
@@ -472,18 +518,24 @@ autoinstall:
           echo "   $d  $(udevadm info --query=property --name="$d" 2>/dev/null | sed -n 's/^ID_SERIAL=//p')"
         done
         echo
-        echo "If a disk above IS this machine's internal disk, the pin is most"
-        echo "likely the SHORT serial. Subiquity matches udev ID_SERIAL, usually"
-        echo "MODEL_SERIAL_LUN - not the bare serial on the sticker or in lsblk."
-        echo "NOTE: on this panel the internal disk is SATA and enumerates as"
-        echo "sd*, exactly like the USB stick you booted from. Read the sizes."
-        echo
-        echo "TO INSTALL ON THIS MACHINE ANYWAY, now, without rebuilding the ISO:"
-        echo "  reboot, and at the GRUB menu (5 second timeout) choose"
-        echo "    Install - choose target disk manually (unpinned)"
-        echo "  It stops at the storage screen for you to pick and confirm a disk."
-        echo
-        echo "TO LOOK AROUND FIRST: choose 'Diagnostic Shell (no autoinstall)'."
+        if [ "$TARGET_MOUNTED" = yes ]; then
+          echo "THE DISK WAS ALREADY WRITTEN, so this is NOT the pin halting and"
+          echo "the unpinned GRUB entry will not help. The cause is in the log"
+          echo "above and in /var/log/installer-failed/ on the installed system."
+        else
+          echo "If a disk above IS this machine's internal disk, the pin is most"
+          echo "likely the SHORT serial. Subiquity matches udev ID_SERIAL, usually"
+          echo "MODEL_SERIAL_LUN - not the bare serial on the sticker or in lsblk."
+          echo "NOTE: on this panel the internal disk is SATA and enumerates as"
+          echo "sd*, exactly like the USB stick you booted from. Read the sizes."
+          echo
+          echo "TO INSTALL ON THIS MACHINE ANYWAY, now, without rebuilding the ISO:"
+          echo "  reboot, and at the GRUB menu (10 second timeout) choose"
+          echo "    Install - choose target disk manually (unpinned)"
+          echo "  It stops at the storage screen for you to pick and confirm a disk."
+          echo
+          echo "TO LOOK AROUND FIRST: choose 'Diagnostic Shell (no autoinstall)'."
+        fi
         echo "=============================================================="
         echo
       } > /dev/console 2>&1

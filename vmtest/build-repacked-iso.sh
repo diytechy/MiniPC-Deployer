@@ -246,6 +246,14 @@ xorriso -osirrox on -indev "$SRC_ISO" -extract /boot/grub/grub.cfg "$GRUB_ORIG" 
 # kernel variant), and shorten the menu timeout. Idempotent: if the args are
 # already present (re-run on an already-modified file), sed just no-ops.
 #
+# TIMEOUT 10, not 5 (2026-08-06). Ubuntu's own default is 30; 5 was chosen when
+# the menu held nothing worth choosing. It now carries the diagnostic shell and
+# the unpinned installer, which are reached under pressure — a halted machine,
+# an operator who has just watched a reboot — and 5 seconds is not enough to
+# read three entries and decide. It is also the window Start-InstallGate.ps1
+# types into, and a gate that races a 5-second timer is a flaky gate. The cost
+# is 5 seconds per unattended boot, which nobody is watching anyway.
+#
 # THE QUOTES AROUND ds=... ARE LOAD-BEARING. GRUB's config language uses `;`
 # as a COMMAND SEPARATOR, exactly like a shell. Unquoted, GRUB splits
 #     linux /casper/vmlinuz autoinstall ds=nocloud;s=/cdrom/nocloud/ ---
@@ -260,7 +268,7 @@ xorriso -osirrox on -indev "$SRC_ISO" -extract /boot/grub/grub.cfg "$GRUB_ORIG" 
 # parse it. Quoting makes GRUB pass the whole thing as one kernel argument.
 sed \
     -e "s#\(linux[[:space:]]*/casper/[a-z-]*vmlinuz\)\( \)\+---#\1 autoinstall \"ds=nocloud;s=/cdrom/nocloud/\" ---#" \
-    -e "s/^set timeout=.*/set timeout=5/" \
+    -e "s/^set timeout=.*/set timeout=10/" \
     "$GRUB_ORIG" > "$GRUB_MOD"
 
 # Verify the PARSEABLE form, not just the presence of the substring: the seed

@@ -176,21 +176,24 @@ are not the same shape.** Music comes from HOMEHUB's `Media` share and lives in 
 dedicated `PictureFrameVideos` share and lives at the share **root**. Everything
 below has to be done twice, with the right shape each time.
 
-- [ ] **Fill in BOTH UNCs and BOTH credentials** in `/etc/wall-panel/wall.env`:
-      `MEDIA_MUSIC_SHARE_UNC` + `MEDIA_MUSIC_CIFS_CREDENTIALS` and
-      `MEDIA_FRAME_SHARE_UNC` + `MEDIA_FRAME_CIFS_CREDENTIALS`. Each credentials
-      file is root-only `0600` with `username=` / `password=` lines; there is no
-      inline fallback any more. A production image installs both from the
-      materialised site payload. Until the music half is done `wall-sync.service`
-      **fails on every boot by design** — confirm you see exactly that, and that
-      the message names the fix:
+- [ ] **Fill in BOTH UNCs, and the ONE credential** in `/etc/wall-panel/wall.env`:
+      `MEDIA_MUSIC_SHARE_UNC`, `MEDIA_FRAME_SHARE_UNC` and
+      `MEDIA_FRAME_CIFS_CREDENTIALS`. **There is no music credential** — since
+      2026-08-05 (storage-map Q-S7) `//homehub/Media` is an anonymous read-only
+      share and the music mount presents nothing. `MEDIA_MUSIC_CIFS_CREDENTIALS`
+      is REFUSED by name if a carried-over wall.env still sets it. The frame
+      credentials file is root-only `0600` with `username=` / `password=` lines;
+      there is no inline fallback any more, and a production image installs it
+      from the materialised site payload. Until the UNCs are filled
+      `wall-sync.service` **fails on every boot by design** — confirm you see
+      exactly that, and that the message names the fix:
       ```bash
       systemctl status wall-sync.service; journalctl -u wall-sync -b
       ```
 - [ ] **Prove BOTH mounts** from the panel, by hand, before trusting the units —
       a cifs failure and a credentials failure look the same in a service log:
       ```bash
-      sudo mount -t cifs //homehub/Media /mnt -o credentials=/etc/wall-panel/cifs-music.creds,ro,vers=3.0
+      sudo mount -t cifs //homehub/Media /mnt -o guest,ro,vers=3.0   # anonymous - no credential
       ls /mnt/Music     # the music must be UNDER the mount, in Music/
       sudo umount /mnt
       sudo mount -t cifs //MINI-SERV/PictureFrameVideos /mnt -o credentials=/etc/wall-panel/cifs-frame.creds,ro,vers=3.0

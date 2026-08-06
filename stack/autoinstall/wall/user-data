@@ -313,23 +313,24 @@ autoinstall:
       install -m 0600 -o root -g root "$s" /etc/wall-panel/wall.env;
       rm -f "$s";
       echo "wall: installed /etc/wall-panel/wall.env (0600 root:root); payload copy REMOVED"'
-    # TWO credential files, when a production build staged them (OI-18 exit (b),
-    # ruled by the Owner 2026-08-03). The panel has TWO media sources on TWO
-    # hosts and mounts each with its OWN credential:
-    #   cifs-music.creds -> MEDIA_MUSIC_CIFS_CREDENTIALS, a HOMEHUB Samba identity
+    # ONE credential file, when a production build staged it (Q-S7, the Owner,
+    # 2026-08-05). The panel has TWO media sources on TWO hosts, but only the
+    # frame one authenticates:
     #   cifs-frame.creds -> MEDIA_FRAME_CIFS_CREDENTIALS, the Mini-serv `share`
     #                       account (A11(v)/A10(v))
-    # Both wall.env defaults point at exactly these paths. Absent, wall-sync
-    # fails loudly — which is intended, not a silent degrade (a wall with no
-    # music and a green unit would be a lie); note that this is a CONFIGURATION
-    # defect and is fatal for BOTH flows, unlike the frame flow's designed
-    # "Mini-serv is asleep" skip.
+    #   (music)          -> NOTHING. //homehub/Media is an anonymous read-only
+    #                       share, so wall-sync mounts it with `guest`.
+    # The wall.env default points at exactly this path. Absent, wall-sync fails
+    # loudly — which is intended, not a silent degrade (a blank picture frame
+    # with a green unit would be a lie); note that this is a CONFIGURATION
+    # defect and is fatal, unlike the frame flow's designed "Mini-serv is
+    # asleep" skip.
     #
     # `install -m 0600 -o root -g root` and not `cp`: the payload copy's mode and
     # ownership come from whatever filesystem the ISO was staged on, and a build
-    # run under WSL on /mnt/c produces 0777. Loud per file — "one of two
-    # installed" is a panel with half its media and is worth a journal line
-    # saying which half.
+    # run under WSL on /mnt/c produces 0777. Still loud per file, and still a
+    # loop, because the count in the journal line is what an operator reads to
+    # know the image was staged as intended.
     #
     # THE PAYLOAD COPIES ARE DELETED, NOT CHMODDED — this was a real on-box
     # credential exposure. `vmtest/lib/common.sh stage_wall_site_files` writes
@@ -338,19 +339,19 @@ autoinstall:
     # into /opt/wall-panel/site. The old `chmod 0600 "$s"` therefore fixed a mode
     # that was already right and left the ownership alone, so on a builder with
     # the ordinary uid 1000 — the same uid the panel gives `panel` — the kiosk
-    # user could read BOTH Samba passwords out of /opt/wall-panel/site for the
-    # life of the install. /etc/wall-panel now holds the only copies.
+    # user could read the Samba passwords out of /opt/wall-panel/site for the
+    # life of the install. /etc/wall-panel now holds the only copy.
     #
-    # NOTE the two credentials are for two accounts on TWO DIFFERENT HOSTS that
-    # happen to share the username `share` (ruled 2026-08-04): cifs-music.creds
-    # is the HOMEHUB account, cifs-frame.creds the MINI-SERV one. They are not
-    # interchangeable and wall-sync.sh refuses a config that points both flows at
-    # one file.
+    # NOTE there is no `cifs-music.creds` to install since Q-S7 (2026-08-05):
+    # the music mount is anonymous. A stale one is refused by the BUILDER
+    # (stage_wall_site_files), so it never reaches the payload and this loop
+    # never sees it — the refusal belongs upstream, where the operator can act
+    # on it, not on a panel three hours into an install.
     - >-
       curtin in-target --target=/target -- bash -c 'set -e;
       install -d -m 0755 /etc/wall-panel;
       n=0;
-      for f in cifs-music.creds cifs-frame.creds; do
+      for f in cifs-frame.creds; do
       s=/opt/wall-panel/site/$f;
       if [ -f "$s" ]; then
       install -m 0600 -o root -g root "$s" "/etc/wall-panel/$f";
@@ -362,7 +363,7 @@ autoinstall:
       fi;
       done;
       rmdir /opt/wall-panel/site 2>/dev/null || true;
-      echo "wall: $n of 2 cifs credential file(s) installed"'
+      echo "wall: $n of 1 cifs credential file(s) installed (music mounts anonymously - Q-S7)"'
 
     # ---- 4. Seed wall.env from the example if not pre-filled ------------------
     # Root-only: it carries the Wi-Fi PSK and (if enabled) music credentials.

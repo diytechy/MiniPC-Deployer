@@ -112,7 +112,7 @@ than papered over.
 | shape | the `Media` share, mirroring the **`Music/` subdir under the mount** (§3 rows 1-2) | a **dedicated** share, mirroring the **share root** — no subdir (§3b) |
 | cache leaf | `music` | `frame` |
 | manifest | `index.json` | `playlist.json` |
-| credential file | `/etc/wall-panel/cifs-music.creds` | `/etc/wall-panel/cifs-frame.creds` |
+| credential file | **none** — anonymous `guest` mount (storage-map Q-S7, 2026-08-05) | `/etc/wall-panel/cifs-frame.creds` |
 | cadence | boot / resume / on demand | **every minute** (`wall-sync-frame.timer`) |
 | may the source sleep? | **no** — always-on | **yes**, by design |
 | mount refused | **fails the unit** — a real alert | 445 probed first: **no answer = silent skip**; answered-and-refused = **fails** |

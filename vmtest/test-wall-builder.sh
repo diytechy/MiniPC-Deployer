@@ -395,41 +395,43 @@ expect_refusal "a production image with no Wi-Fi is refused (the panel has no RJ
     "no ethernet port" -- "WALL_SITE_DIR=$S"
 
 echo
-echo "=== 4. the OI-18 production seam: TWO credentials, on TWO hosts ==="
+echo "=== 4. the production seam: TWO hosts, ONE credential (Q-S7) ==="
 # The last case above rewrote `wifis:` away to prove the no-Wi-Fi refusal; put it
 # back, or every case below refuses for that reason instead of the one it tests.
 sed -i 's/^    ethernets:/    wifis:/' "$S/user-data.filled"
 
-# Absent credential files are NOT a build refusal — a bench panel is a legitimate
-# thing to build — but they must be reported per SOURCE, because "one of two" is a
-# panel with half its media and which half decides what is dead. A single "no
-# credentials" line would have been true of neither.
-#
-# THE STATES ARE ASYMMETRIC ON PURPOSE. Both cases used to run against the same
-# both-absent state and only assert PRESENCE, so a predicate that reported both
-# sources whenever either was missing — or reported the wrong one — passed. Each
-# case now stages the OTHER credential and asserts the other message is ABSENT.
-printf 'username=testframe\npassword=notarealpassword\n' > "$S/cifs-frame.creds"
-expect_success "a missing cifs-music.creds names the MUSIC source as the casualty" \
-    "cannot mount its MUSIC share" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
-expect_absent "…and does NOT also blame the FRAME source, which IS staged" \
-    "cannot mount its FRAME VIDEO share" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
-
-rm -f "$S/cifs-frame.creds"
-printf 'username=testmusic\npassword=notarealpassword\n' > "$S/cifs-music.creds"
+# THE PANEL NOW HOLDS EXACTLY ONE CREDENTIAL (Q-S7, the Owner, 2026-08-05).
+# //homehub/Media went anonymous, so the music mount authenticates with nothing
+# and cifs-music.creds was retired outright. What used to be a symmetric
+# two-credential seam is now asymmetric BY DESIGN, and both halves need proving:
+# the frame credential is still reported when missing, and the music one is
+# REFUSED when present rather than quietly ignored.
+rm -f "$S/cifs-music.creds"
 expect_success "a missing cifs-frame.creds names the FRAME source as the casualty" \
     "cannot mount its FRAME VIDEO share" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
-expect_absent "…and does NOT also blame the MUSIC source, which IS staged" \
+
+# THE MUSIC SOURCE MUST NEVER BE BLAMED AGAIN. A panel with no HOMEHUB
+# credential is fully configured, so any surviving "cannot mount its MUSIC
+# share" note would send the operator off to recreate an account that Q-S7
+# deleted — the exact loop this change exists to end.
+expect_absent "…and never blames the MUSIC source, which needs no credential at all" \
     "cannot mount its MUSIC share" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 
-# "3 files staged" was a COUNT, which any three files satisfy. Name them.
 printf 'username=testframe\npassword=notarealpassword\n' > "$S/cifs-frame.creds"
-expect_success "the MUSIC credential is staged BY NAME" \
-    "site/ += cifs-music.creds" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
 expect_success "the FRAME credential is staged BY NAME" \
     "site/ += cifs-frame.creds" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
-expect_success "both credential files are staged when both are present" \
-    "PRODUCTION build: 3 wall config file(s) staged" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+expect_absent "no music credential is staged, because none is emitted any more" \
+    "site/ += cifs-music.creds" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+expect_success "a fully-configured production panel stages exactly wall.env + cifs-frame.creds" \
+    "PRODUCTION build: 2 wall config file(s) staged" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+
+# A STALE cifs-music.creds IS A REFUSAL, not a skip. It is a HOMEHUB Samba
+# password, and the whole point of Q-S7 is that a wall-mounted panel no longer
+# carries one; staging it silently would put it back and nothing would say so.
+printf 'username=testmusic\npassword=notarealpassword\n' > "$S/cifs-music.creds"
+expect_refusal "a stale cifs-music.creds is REFUSED, naming it as a pre-Q-S7 materialisation" \
+    "STALE materialisation" -- "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1
+rm -f "$S/cifs-music.creds"
 
 # A stale out\wall\ from before OI-18 carries ONE file called cifs.creds. Staged
 # silently it would produce a panel with no media at all, and the failure would
@@ -542,7 +544,6 @@ if env "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 \
     check_mode stack/autoinstall/wall/wall-kiosk.sh      755
     check_mode site                                      700
     check_mode site/wall.env                             600
-    check_mode site/cifs-music.creds                     600
     check_mode site/cifs-frame.creds                     600
     if [ -z "$wrong" ]; then
         pass_case "the mode policy holds per file: dirs 0755, data 0644, #! scripts 0755, site/ 0700 with 0600 credentials"
@@ -602,7 +603,7 @@ done
 # silently evaporates on a machine without the sibling is the same false green.
 PERSONAL="${PERSONAL_REPO:-$(cd "$REPO_ROOT/.." 2>/dev/null && pwd)/Personal}"
 if [ -d "$PERSONAL/homelab/deploy" ]; then
-    for token in MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC cifs-music.creds cifs-frame.creds; do
+    for token in MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC cifs-frame.creds; do
         if grep -rqF -- "$token" "$PERSONAL/homelab/deploy" 2>/dev/null; then
             pass_case "Personal's deploy half still names '$token'"
         else
@@ -754,8 +755,20 @@ else
         "WITHOUT claiming the source is asleep" frame -- \
         "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/PictureFrameVideos" \
         "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    # NO CREDENTIAL KNOB FOR MUSIC (Q-S7): the mount is anonymous, so this case
+    # also proves the flow gets as far as mounting without one.
     run_sync "an unreachable MUSIC source is an ALERT: the unit FAILS" fail \
         "cifs mount REFUSED" music -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media"
+    run_sync "…and says the mount is ANONYMOUS, so nobody goes hunting for a password" fail \
+        "This mount is ANONYMOUS" music -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media"
+
+    # THE RETIRED KEY IS REFUSED BY NAME. A wall.env carried over from before
+    # 2026-08-05 still sets it, and ignoring it silently is how the panel would
+    # look configured while the operator kept a dead HOMEHUB account alive.
+    run_sync "a wall.env still setting MEDIA_MUSIC_CIFS_CREDENTIALS is REFUSED, not ignored" fail \
+        "NO LONGER READ" music -- \
         "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media" \
         "MEDIA_MUSIC_CIFS_CREDENTIALS=$CRED"
 
@@ -810,7 +823,7 @@ PYEOF
     run_sync "one flow's failure does not cancel the other (the run still fails)" fail \
         "sync FINISHED WITH FAILURES" both -- \
         "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media" \
-        "MEDIA_MUSIC_CIFS_CREDENTIALS=$CRED" "ARG:--bench-source" "ARG:frame=$FSRC"
+        "ARG:--bench-source" "ARG:frame=$FSRC"
     if [ -f "$C/frame/agg.mp4" ]; then
         pass_case "…and the FRAME flow ran anyway, after the music flow failed"
     else
@@ -977,20 +990,24 @@ MEDIA_FRAME_CIFS_CREDENTIALS=$CRED" -- \
         "names a PATH INSIDE a share" frame -- \
         "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/Media/PictureFrameVideos" \
         "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
-    # Both accounts are called `share` (ruled 2026-08-04), so two UNCs on one host
-    # means one credential could satisfy both mounts.
-    run_sync "two UNCs on the SAME host are refused (one credential must not serve both)" fail \
+    # The two flows now differ in AUTH MODE (Q-S7): music mounts anonymously,
+    # frame presents the Mini-serv credential. One host for both would mean one
+    # of the two is using the wrong mode for the box it is talking to.
+    run_sync "two UNCs on the SAME host are refused (the flows authenticate differently)" fail \
         "both name the host" both -- \
         "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media" \
         "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/PictureFrameVideos" \
-        "MEDIA_MUSIC_CIFS_CREDENTIALS=$CRED" "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
-    # "root-only 0600" was claimed by the error message and never checked.
+        "MEDIA_FRAME_CIFS_CREDENTIALS=$CRED"
+    # "root-only 0600" was claimed by the error message and never checked. Runs
+    # on FRAME since Q-S7 — it is the only flow with a credentials file left,
+    # and the check still happens before the reachability probe, so the frame
+    # flow's licence to skip a sleeping box does not swallow the refusal.
     LOOSE="$WORK/loose.creds"
     printf 'username=test\npassword=notarealpassword\n' > "$LOOSE"; chmod 644 "$LOOSE"
     run_sync "a 0644 credentials file is refused (the claim and the check now agree)" fail \
-        "must be mode 0600 owned root:root" music -- \
-        "WALL_MEDIA_CACHE=$C" "MEDIA_MUSIC_SHARE_UNC=//127.0.0.1/Media" \
-        "MEDIA_MUSIC_CIFS_CREDENTIALS=$LOOSE"
+        "must be mode 0600 owned root:root" frame -- \
+        "WALL_MEDIA_CACHE=$C" "MEDIA_FRAME_SHARE_UNC=//127.0.0.1/PictureFrameVideos" \
+        "MEDIA_FRAME_CIFS_CREDENTIALS=$LOOSE"
     # rsync FOLLOWS a symlinked destination, so a symlinked cache leaf redirects
     # both the copy AND the --delete.
     VICTIM="$WORK/victim"; mkdir -p "$VICTIM"; : > "$VICTIM/precious"

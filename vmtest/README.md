@@ -616,8 +616,7 @@ reads. `WALL_SHELL_DIST=` points at a `dist/` elsewhere;
 ### Building a REAL panel image
 
 Personal's `Materialize-Deploy.ps1 -Image wall` writes `user-data.filled`,
-`wall.env`, `cifs-music.creds` and `cifs-frame.creds` into
-`homelab\deploy\out\wall`. Point the builder at that directory and it takes them
+`wall.env` and `cifs-frame.creds` into `homelab\deploy\out\wall`. Point the builder at that directory and it takes them
 verbatim instead of substituting anything:
 
 ```sh
@@ -636,21 +635,33 @@ than warn: a `WALL_SITE_DIR` with no `user-data.filled` (staging the real
 nothing on screen); and a network block with no `wifis:` (the panel has no RJ45,
 so that image would come up unreachable).
 
-**TWO credential files since OI-18 exit (b) (2026-08-03), and a stale single one
-is REFUSED.** The panel mounts two media sources on two hosts, so
-`Materialize-Deploy.ps1 -Image wall` emits `cifs-music.creds` (a HOMEHUB Samba
-identity) and `cifs-frame.creds` (the Mini-serv `share` account). The builder
-stages both when they are there and names each absence individually — "one of
-two" is a panel with half its media, and which half decides whether the wall is
-silent or blank. An `out\wall\` that still carries the pre-OI-18 single
-`cifs.creds` is a **stale materialisation** and the builder refuses it rather
-than staging nothing and logging two absences: one credential cannot
-authenticate on two hosts. Re-run the emitter.
+**ONE credential file since Q-S7 (2026-08-05), and both a stale single
+`cifs.creds` AND a stale `cifs-music.creds` are REFUSED.** The panel mounts two
+media sources on two hosts, but only one of them asks it to authenticate:
+`cifs-frame.creds` is the Mini-serv `share` account, and the music mount reads
+`//homehub/Media`, which is now an ANONYMOUS read-only share — it presents no
+credential and no file is emitted for it. The builder stages the frame
+credential when it is there and names its absence.
 
-**The remaining gap is Personal's, and it is a decision, not code:** the store
-key `PanelMusicCifsCredential` has no value, because nobody has ruled what the
-HOMEHUB music account is called. Until it does, `-Image wall` refuses with
-exactly one violation naming that key.
+Two stale shapes are refused rather than quietly worked around, because both
+would produce a wrong image without saying so:
+
+* a pre-OI-18 single `cifs.creds` — one credential cannot authenticate on two
+  hosts, and staging nothing while logging an absence hides that the directory
+  is stale rather than incomplete;
+* a pre-Q-S7 `cifs-music.creds` — that file is a HOMEHUB Samba password, and
+  baking it would put a credential for the box holding the private document
+  trees onto a wall-mounted panel, to authenticate a mount that no longer asks
+  for one.
+
+Re-run the emitter in either case.
+
+**There is no remaining gap on Personal's side.** Until 2026-08-05 this section
+recorded one: the store key `PanelMusicCifsCredential` had no value and
+`-Image wall` refused with exactly one violation naming it. The Owner ruled the
+`Media` share anonymous (storage-map Q-S7), which removed the need for the
+account rather than filling it. The key is retired and `-Image wall` resolves
+every knob.
 
 ### Testing the builder itself
 

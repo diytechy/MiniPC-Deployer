@@ -6,10 +6,23 @@
 # Electron host. That ruling still stands in full.
 #
 # OI-18 exit (b) (the Owner, 2026-08-03) is what this file's shape now encodes:
-# THE PANEL HAS TWO MEDIA SOURCES ON TWO HOSTS, and mounts each with its OWN
-# credential. Consolidating them behind one host — exit (a) — was rejected
-# because it would re-open HOMELAB_TOPOLOGY.md decision 2 ("the panel pulls
-# frame videos from Mini-serv directly").
+# THE PANEL HAS TWO MEDIA SOURCES ON TWO HOSTS. Consolidating them behind one
+# host — exit (a) — was rejected because it would re-open HOMELAB_TOPOLOGY.md
+# decision 2 ("the panel pulls frame videos from Mini-serv directly").
+#
+# THE TWO MOUNTS AUTHENTICATE DIFFERENTLY (Q-S7, the Owner, 2026-08-05). The
+# hub's `Media` share became an ANONYMOUS read-only share, so the MUSIC mount
+# now presents NO CREDENTIAL AT ALL and the HOMEHUB account it used to need was
+# retired outright. The FRAME mount is unchanged: Mini-serv is a Windows box
+# whose shares are "read-only to everyone", which still means "once you have
+# authenticated", so it keeps the MINI-SERV `share` credential.
+#
+# THIS IS A SECURITY PROPERTY, NOT AN INCIDENTAL ONE. The panel hangs on a wall
+# in a semi-public part of the house and it now holds exactly one Samba
+# password instead of two, and NONE for the hub — the box with the private
+# document trees on it. Anything that would put a HOMEHUB credential back onto
+# the panel is a regression, and `MEDIA_MUSIC_CIFS_CREDENTIALS` is refused by
+# name in RETIRED_KEYS so it cannot come back quietly.
 #
 # THE CONTRACT, derived from Personal\homelab\deploy\storage-map.md §3 row 2,
 # §3b and §4d. That map is the SSOT; this table is a restatement of it, and if
@@ -26,21 +39,22 @@
 #   |                | the `Media` share)        |                              |
 #   | cache leaf     | music                     | frame                        |
 #   | manifest       | index.json                | playlist.json                |
-#   | credential     | the HOMEHUB Samba account | the MINI-SERV `share`        |
-#   |                | (its own store key)       | account (A11(v)/A10(v))      |
+#   | credential     | NONE — anonymous guest    | the MINI-SERV `share`        |
+#   |                | mount (Q-S7, 2026-08-05)  | account (A11(v)/A10(v))      |
 #   | cadence        | boot / resume / on demand | EVERY MINUTE                 |
 #   | source sleeps? | NO — the AWOW is always-on| YES, by design               |
 #   | mount refused  | an ALERT (failed unit)    | see the failure policy below |
 #
-# TWO ACCOUNTS SHARE ONE USERNAME, AND THAT IS A HAZARD, NOT A CONVENIENCE.
-# RULED 2026-08-04 (the Owner): the HOMEHUB music account is ALSO called
-# `share` — two different accounts, on two different hosts, with two different
-# passwords, created by hand at each box. So NOTHING in this project may say
-# "the `share` account" without naming its HOST, and anything that would let one
-# credential satisfy both mounts is a DEFECT. That is why `assert_two_distinct_
-# sources` below refuses two UNCs on the same host and two flows pointed at the
-# same credentials file: with a shared username, a mis-set pair would otherwise
-# authenticate and mirror the WRONG share with no error anywhere.
+# THERE IS NOW EXACTLY ONE `share` ACCOUNT, AND IT IS ON MINI-SERV. From
+# 2026-08-03 to 2026-08-05 there were two accounts of that name on two hosts —
+# ruled 2026-08-04 and treated here as a hazard, since a mis-set pair could
+# authenticate against the wrong box and mirror the wrong share silently. Q-S7
+# removed the HOMEHUB half rather than living with the collision, so the rule
+# that survives is simpler: `share` means the MINI-SERV account, and the panel
+# holds no HOMEHUB credential to confuse it with. `assert_two_distinct_sources`
+# below still refuses two UNCs on the same host, because the two flows now
+# differ in AUTH MODE and one host for both would mean one of them is using the
+# wrong one.
 #
 # THE TWO MOUNTS ARE NOT THE SAME SHAPE, and treating them uniformly is the
 # first way this goes wrong: music is reached THROUGH the `Media` share and
@@ -201,20 +215,26 @@ FLOWS="music frame"
 # knobs (Wi-Fi, the sleep window, the kiosk command) that belong to other
 # scripts; those are IGNORED here without comment, which is the whole point —
 # nothing outside this list can reach this script's variables.
-CONFIG_KEYS="WALL_MEDIA_CACHE WALL_SYNC_ALLOW_EMPTY WALL_FRAME_STALE_WARN_HOURS MEDIA_CIFS_VERS MEDIA_MUSIC_SHARE_UNC MEDIA_MUSIC_CIFS_CREDENTIALS MEDIA_FRAME_SHARE_UNC MEDIA_FRAME_CIFS_CREDENTIALS"
+CONFIG_KEYS="WALL_MEDIA_CACHE WALL_SYNC_ALLOW_EMPTY WALL_FRAME_STALE_WARN_HOURS MEDIA_CIFS_VERS MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC MEDIA_FRAME_CIFS_CREDENTIALS"
 
 # Keys this script USED to honour and now refuses, loudly, rather than ignoring:
 # a panel whose wall.env still sets one of these was configured against the old
 # contract, and silently dropping the setting is exactly the kind of no-op that
 # takes a day to find. Each is named with what replaced it.
-RETIRED_KEYS="MEDIA_CIFS_EXTRA MEDIA_CIFS_USER MEDIA_CIFS_PASS MEDIA_SOURCE_OVERRIDE MEDIA_MUSIC_SOURCE_OVERRIDE MEDIA_FRAME_SOURCE_OVERRIDE"
+RETIRED_KEYS="MEDIA_CIFS_EXTRA MEDIA_CIFS_USER MEDIA_CIFS_PASS MEDIA_SOURCE_OVERRIDE MEDIA_MUSIC_SOURCE_OVERRIDE MEDIA_FRAME_SOURCE_OVERRIDE MEDIA_MUSIC_CIFS_CREDENTIALS"
 
 retired_key_help() {
     case "$1" in
         MEDIA_CIFS_EXTRA)
             printf '%s' "replaced by MEDIA_CIFS_VERS, a validated enum. It was an unrestricted option string appended AFTER the code-built options, so 'prefixpath=Movies', 'ip=…', 'rw' or a second 'credentials=' could override the fixed subtree, the host, the read-only policy or the credential — i.e. it was a second, undeclared way to widen the mirror. Set MEDIA_CIFS_VERS=3.0 (or 3.1.1/2.1) instead" ;;
         MEDIA_CIFS_USER|MEDIA_CIFS_PASS)
-            printf '%s' "retired by OI-18: one inline pair cannot serve two hosts. Use the per-flow root-only credentials files (MEDIA_MUSIC_CIFS_CREDENTIALS / MEDIA_FRAME_CIFS_CREDENTIALS)" ;;
+            printf '%s' "retired by OI-18: one inline pair cannot serve two hosts. The frame flow uses a root-only credentials file (MEDIA_FRAME_CIFS_CREDENTIALS); the music flow authenticates with nothing at all (see MEDIA_MUSIC_CIFS_CREDENTIALS below)" ;;
+        MEDIA_MUSIC_CIFS_CREDENTIALS)
+            # The music flow is the ONLY unauthenticated mount in this script,
+            # and it must stay that way by construction: if this key still had
+            # meaning, a panel could quietly go back to shipping a HOMEHUB
+            # password on a wall-mounted box.
+            printf '%s' "retired 2026-08-05: //homehub/Media is now an ANONYMOUS read-only share (storage-map Q-S7), so the music mount presents no credential and the HOMEHUB 'share' account it named no longer exists. The panel is credential-free for music by design — do not recreate the account to satisfy this line. Remove the line; MEDIA_FRAME_CIFS_CREDENTIALS (Mini-serv) is unaffected" ;;
         *SOURCE_OVERRIDE)
             printf '%s' "the bench hook is no longer a configuration key. It is now the command-line option '--bench-source FLOW=DIR', it refuses to run under systemd, and the directory must live under $BENCH_ROOT. As a config key it was an unrestricted PRODUCTION setting: pointing it at /etc/wall-panel copied wall.env and BOTH credential files into the kiosk-readable cache at 0644" ;;
         *)  printf '%s' "no longer read by this script" ;;
@@ -300,7 +320,10 @@ flow_spec() {
     case "$FLOW" in
         music)
             F_UNC_VAR=MEDIA_MUSIC_SHARE_UNC
-            F_CREDS_VAR=MEDIA_MUSIC_CIFS_CREDENTIALS
+            # NO CREDENTIAL — //homehub/Media is an anonymous read-only share
+            # (storage-map Q-S7, ruled 2026-08-05). See F_AUTH below.
+            F_CREDS_VAR=""
+            F_AUTH="guest"
             F_SUBDIR="Music"
             F_LEAF="music"
             F_MANIFEST="index.json"
@@ -316,6 +339,10 @@ flow_spec() {
         frame)
             F_UNC_VAR=MEDIA_FRAME_SHARE_UNC
             F_CREDS_VAR=MEDIA_FRAME_CIFS_CREDENTIALS
+            # Mini-serv's shares are read-only to EVERYONE, which on Windows
+            # still means "after you authenticate" (storage-map §3b). This flow
+            # keeps its credential; only the HOMEHUB side went anonymous.
+            F_AUTH="credentials"
             F_SUBDIR=""
             F_LEAF="frame"
             F_MANIFEST="playlist.json"
@@ -431,25 +458,32 @@ assert_unc_shape() {   # VARNAME VALUE
     esac
 }
 
-# THE TWO SOURCES MUST BE TWO SOURCES. RULED 2026-08-04: the HOMEHUB music
-# account is ALSO named `share`, so the two credentials differ only by host and
-# password. If both UNCs named the same host, or both flows pointed at the same
-# credentials file, ONE credential could satisfy BOTH mounts and the panel would
-# happily mirror the wrong share with nothing failing anywhere. Refuse it here,
-# once, at config time — not per flow, because a `--only frame` run must also
-# refuse a wall.env that has collapsed the two sources into one.
+# THE TWO SOURCES MUST BE TWO SOURCES. OI-18 exit (b) is two sources on two
+# hosts: HOMEHUB for music, Mini-serv for frame video. They also now differ in
+# AUTH MODE — music is anonymous (storage-map Q-S7, 2026-08-05), frame presents
+# the Mini-serv `share` credential — and that is precisely why collapsing them
+# onto one host is worth refusing here rather than letting the mounts sort it
+# out. Pointing the frame UNC at HOMEHUB would mount it anonymously-or-not
+# depending on which flow got there first; pointing the music UNC at Mini-serv
+# would send no credential to a box that requires one and report it as an
+# ALERT-policy failure, which reads like an outage rather than a config error.
+#
+# The credentials-file collision check that used to live here is GONE with the
+# key it compared: there is only one credentials file left, so two of them
+# cannot be the same file. MEDIA_MUSIC_CIFS_CREDENTIALS is now in RETIRED_KEYS
+# and is refused by name, which covers the stale-config case far more directly
+# than an equality test would have.
+#
+# Refused here, once, at config time — not per flow, because a `--only frame`
+# run must also refuse a wall.env that has collapsed the two sources into one.
 assert_two_distinct_sources() {
     local mu="${MEDIA_MUSIC_SHARE_UNC:-}" fu="${MEDIA_FRAME_SHARE_UNC:-}"
-    local mc="${MEDIA_MUSIC_CIFS_CREDENTIALS:-}" fc="${MEDIA_FRAME_CIFS_CREDENTIALS:-}"
     local mh fh
     if [ -n "$mu" ] && [ -n "$fu" ]; then
         case "$mu$fu" in *REPLACE_WITH*) return 0 ;; esac
         mh="$(unc_host "$mu" | tr 'A-Z' 'a-z')"
         fh="$(unc_host "$fu" | tr 'A-Z' 'a-z')"
-        [ "$mh" != "$fh" ] || die "MEDIA_MUSIC_SHARE_UNC and MEDIA_FRAME_SHARE_UNC both name the host '$mh'. OI-18 exit (b) is TWO sources on TWO hosts (HOMEHUB for music, Mini-serv for frame video), and — because both Samba accounts are called 'share' (ruled 2026-08-04, two accounts, two hosts, two passwords) — one host for both means ONE credential could satisfy BOTH mounts and mirror the wrong share silently. Fix the UNCs, or re-open OI-18 with the Owner."
-    fi
-    if [ -n "$mc" ] && [ -n "$fc" ] && [ "$mc" = "$fc" ]; then
-        die "MEDIA_MUSIC_CIFS_CREDENTIALS and MEDIA_FRAME_CIFS_CREDENTIALS are the SAME file ('$mc'). They are two accounts on two machines that happen to share the username 'share'; one file cannot hold both passwords, and pointing both flows at one is how a panel ends up authenticating one host with the other's secret."
+        [ "$mh" != "$fh" ] || die "MEDIA_MUSIC_SHARE_UNC and MEDIA_FRAME_SHARE_UNC both name the host '$mh'. OI-18 exit (b) is TWO sources on TWO hosts (HOMEHUB for music, Mini-serv for frame video), and they authenticate differently: music mounts ANONYMOUSLY (//homehub/Media is a guest read-only share, storage-map Q-S7) while frame presents the Mini-serv 'share' credential. One host for both means one of those two mounts is using the wrong auth mode for the box it is talking to. Fix the UNCs, or re-open OI-18 with the Owner."
     fi
 }
 
@@ -876,7 +910,13 @@ sync_flow() {
         log "$FLOW: BENCH FIXTURE ACTIVE: the mirror, the guards and the manifests are the real code path."
     else
         unc="${!F_UNC_VAR:-}"
-        creds="${!F_CREDS_VAR:-}"
+        # GUARDED ON F_CREDS_VAR BEING NON-EMPTY, not merely on the value it
+        # names: the music flow has no credentials KNOB at all, and `${!x}` with
+        # an empty x is a hard "invalid variable name" error under `set -u`, not
+        # an empty string. `creds` then stays "" for the guest flow, which is
+        # what the F_AUTH branches below expect.
+        creds=""
+        [ -z "$F_CREDS_VAR" ] || creds="${!F_CREDS_VAR:-}"
 
         # CONFIGURATION DEFECTS ARE FATAL FOR BOTH FLOWS. An unset UNC is not a
         # sleeping box, and the frame flow's licence to be quiet does not extend
@@ -893,16 +933,25 @@ sync_flow() {
         # caller cannot reach the mount without it.
         assert_unc_shape "$F_UNC_VAR" "$unc"
 
-        # A ROOT-ONLY CREDENTIALS FILE IS THE ONLY SUPPORTED FORM (changed by
-        # OI-18, 2026-08-03). The inline MEDIA_CIFS_USER/MEDIA_CIFS_PASS fallback
-        # is retired: one inline pair cannot serve two hosts, and duplicating it
-        # per flow would have added four knobs whose only purpose is to put a
-        # password somewhere less safe than the file that already exists.
-        if [ -z "$creds" ]; then
-            err "$F_CREDS_VAR is not set in $ENV_FILE — a root-only credentials file is the ONLY supported way to authenticate a $FLOW mount (the inline user/pass fallback was retired by OI-18). Set it to the 0600 file the image installed, e.g. /etc/wall-panel/cifs-$FLOW.creds"
-            return 1
+        # WHERE A FLOW AUTHENTICATES AT ALL, A ROOT-ONLY CREDENTIALS FILE IS THE
+        # ONLY SUPPORTED FORM (changed by OI-18, 2026-08-03). The inline
+        # MEDIA_CIFS_USER/MEDIA_CIFS_PASS fallback is retired: one inline pair
+        # cannot serve two hosts, and duplicating it per flow would have added
+        # four knobs whose only purpose is to put a password somewhere less safe
+        # than the file that already exists.
+        #
+        # `guest` is NOT a fallback for a missing credential — it is the music
+        # flow's declared auth mode, fixed in flow_spec() and not configurable.
+        # A flow cannot silently degrade into it: F_AUTH is set in code per
+        # flow, so an unreadable frame credential still fails the frame mount
+        # rather than retrying anonymously against Mini-serv.
+        if [ "$F_AUTH" = "credentials" ]; then
+            if [ -z "$creds" ]; then
+                err "$F_CREDS_VAR is not set in $ENV_FILE — a root-only credentials file is the ONLY supported way to authenticate a $FLOW mount (the inline user/pass fallback was retired by OI-18). Set it to the 0600 file the image installed, e.g. /etc/wall-panel/cifs-$FLOW.creds"
+                return 1
+            fi
+            assert_creds_file "$F_CREDS_VAR" "$creds" "$FLOW" || return 1
         fi
-        assert_creds_file "$F_CREDS_VAR" "$creds" "$FLOW" || return 1
 
         wait_for_network
 
@@ -925,9 +974,19 @@ sync_flow() {
 
         # EVERY MOUNT OPTION IS BUILT HERE, IN CODE. The only knob is the SMB
         # dialect, and it is an enum validated at startup. `ro` is the mirror's
-        # read-only guarantee, `credentials=` is the flow's OWN file, and
+        # read-only guarantee, the auth clause comes from F_AUTH (the flow's OWN
+        # credentials file, or `guest` for the anonymous HOMEHUB share), and
         # nosuid/nodev/noexec are free on a media share.
-        opts="credentials=${creds},ro,nosuid,nodev,noexec,iocharset=utf8,vers=${MEDIA_CIFS_VERS}"
+        #
+        # `guest` sends a null username and password. It is not the same as
+        # omitting the clause: without it mount.cifs would PROMPT, which under
+        # systemd means the unit hangs until F_MOUNT_TIMEOUT rather than failing
+        # with a reason.
+        if [ "$F_AUTH" = "guest" ]; then
+            opts="guest,ro,nosuid,nodev,noexec,iocharset=utf8,vers=${MEDIA_CIFS_VERS}"
+        else
+            opts="credentials=${creds},ro,nosuid,nodev,noexec,iocharset=utf8,vers=${MEDIA_CIFS_VERS}"
+        fi
         MP="$RUNDIR/$FLOW"
         if ! install -d -m 0700 "$MP"; then
             err "$FLOW: cannot create the mountpoint $MP — nothing was mirrored."
@@ -941,11 +1000,16 @@ sync_flow() {
                 # just proved something is listening — so this is a wrong share
                 # name or a wrong credential, and it is exactly the class of
                 # fault a silent skip would hide forever. NOTE the credential is
-                # the MINI-SERV `share` account, which is NOT the HOMEHUB account
-                # that is also called `share` (ruled 2026-08-04).
-                err "$FLOW: cifs mount REFUSED by $unc, WHICH IS AWAKE (it answered on ${PROBE_PORT}/tcp moments ago). This is NOT the designed 'source asleep' state: the share name is wrong, or the credentials in $creds are (that file must hold the MINI-SERV 'share' account — NOT the HOMEHUB account of the same name). Nothing was touched in $to."
+                # the MINI-SERV `share` account. It is now the ONLY Samba
+                # credential the panel holds — the HOMEHUB account that was also
+                # called `share` was retired 2026-08-05 when //homehub/Media
+                # went anonymous (storage-map Q-S7).
+                err "$FLOW: cifs mount REFUSED by $unc, WHICH IS AWAKE (it answered on ${PROBE_PORT}/tcp moments ago). This is NOT the designed 'source asleep' state: the share name is wrong, or the credentials in $creds are (that file must hold the MINI-SERV 'share' account). Nothing was touched in $to."
             else
-                err "$FLOW: cifs mount REFUSED: $unc ($F_SOURCE). The source box or its Samba service is down, the share name is wrong, or the credentials in $creds are (that file must hold the HOMEHUB Samba account — NOT the MINI-SERV account of the same name). Nothing was touched in $to — the existing cache is still whatever the last good sync left."
+                # The music flow presents NO credential, so a refusal here is
+                # never a wrong password — it is the share, the box, or guest
+                # access having been turned off on the hub.
+                err "$FLOW: cifs mount REFUSED: $unc ($F_SOURCE). This mount is ANONYMOUS — no credential is involved, so this is not a password fault. Either the source box or its Samba service is down, the share name is wrong, or //homehub/Media has stopped accepting guests (check 'guest ok = yes' on the share and 'map to guest' in the hub's smb.conf [global] — storage-map Q-S7 requires both). Nothing was touched in $to — the existing cache is still whatever the last good sync left."
             fi
             MP=""
             return 1

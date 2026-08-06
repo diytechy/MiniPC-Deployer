@@ -2153,13 +2153,15 @@ render_wall_seed_tree() {
 # then at /etc/wall-panel/wall.env, 0600, via late-command 4a); the second was
 # already consumed above.
 #
-# TWO CREDENTIAL FILES since OI-18 exit (b) (the Owner, 2026-08-03): the panel
-# has two media sources on two hosts and mounts each with its own credential —
-#   cifs-music.creds  a HOMEHUB Samba identity  -> MEDIA_MUSIC_CIFS_CREDENTIALS
-#   cifs-frame.creds  the Mini-serv `share` acct -> MEDIA_FRAME_CIFS_CREDENTIALS
-# Both are staged IF PRESENT and reported INDIVIDUALLY when absent, because
-# "one of two" is a panel with half its media and the half matters: no music is a
-# dead music player, no frame video is a blank wall.
+# ONE CREDENTIAL FILE since Q-S7 (the Owner, 2026-08-05). The panel still has
+# two media sources on two hosts, but they no longer authenticate the same way:
+#   music  //homehub/Media       ANONYMOUS — an unauthenticated guest mount, so
+#                                there is NO credential file and none is wanted
+#   frame  //MINI-SERV/Picture…  cifs-frame.creds, the Mini-serv `share` account
+#                                -> MEDIA_FRAME_CIFS_CREDENTIALS
+# The frame credential is staged IF PRESENT and reported when absent, because a
+# missing one is a blank wall. There is nothing to report for music: a panel
+# with no HOMEHUB credential is the DESIGNED state, not a half-configured one.
 #
 # THE RETIRED SINGLE `cifs.creds` IS REFUSED RATHER THAN IGNORED. Before OI-18 the
 # materialiser wrote one file of that name for the wall image. A stale out\wall\
@@ -2170,7 +2172,7 @@ stage_wall_site_files() {
     local site_dir="$1" payload_dir="$2"
     local site_out="$payload_dir/site" staged=0 f
     mkdir -p "$site_out"
-    for f in wall.env cifs-music.creds cifs-frame.creds; do
+    for f in wall.env cifs-frame.creds; do
         if [ -f "$site_dir/$f" ]; then
             install -m 600 "$site_dir/$f" "$site_out/$f"
             log "  site/ += $f"
@@ -2184,9 +2186,23 @@ stage_wall_site_files() {
             "Materialize-Deploy.ps1 -Image wall."
     if [ -f "$site_dir/cifs.creds" ]; then
         die "$site_dir carries a single 'cifs.creds' — that is the PRE-OI-18 shape, and it is" \
-            "a stale materialisation, not a valid one. The panel now mounts TWO sources with" \
-            "TWO credentials (cifs-music.creds for HOMEHUB, cifs-frame.creds for Mini-serv)" \
-            "and one file cannot authenticate on both hosts. Re-run:" \
+            "a stale materialisation, not a valid one. The panel mounts two sources: music from" \
+            "HOMEHUB ANONYMOUSLY (no credential at all, Q-S7) and frame video from Mini-serv with" \
+            "cifs-frame.creds. Re-run:" \
+            "pwsh Materialize-Deploy.ps1 -Image wall   (Personal\\homelab\\deploy)"
+    fi
+    # A STALE MUSIC CREDENTIAL IS REFUSED, NOT SKIPPED — same reasoning as the
+    # pre-OI-18 file above, with a sharper edge: this one is a HOMEHUB Samba
+    # password, and baking it would put a credential for the box that holds the
+    # private document trees onto a wall-mounted panel. Q-S7 removed the reason
+    # for it to exist; silently not staging it would leave the operator thinking
+    # the file still mattered and the account still had to be kept alive.
+    if [ -f "$site_dir/cifs-music.creds" ]; then
+        die "$site_dir carries 'cifs-music.creds', which is a STALE materialisation from before" \
+            "2026-08-05. //homehub/Media is now an ANONYMOUS read-only share (storage-map Q-S7)," \
+            "the music mount presents no credential, and the HOMEHUB 'share' account that file" \
+            "holds has been retired — baking it would ship a HOMEHUB password to a wall-mounted" \
+            "panel for nothing. Delete it and re-run:" \
             "pwsh Materialize-Deploy.ps1 -Image wall   (Personal\\homelab\\deploy)"
     fi
     # THE SIM'S TLS ESCAPE HATCH MUST NEVER REACH A WALL. render_sim_wall_env
@@ -2202,11 +2218,6 @@ stage_wall_site_files() {
             "certificate validation for the origin that injects this household's identity header." \
             "Remove it and re-run Materialize-Deploy.ps1 -Image wall."
 
-    [ -f "$site_out/cifs-music.creds" ] || \
-        log "NOTE: no cifs-music.creds in $site_dir — the panel cannot mount its MUSIC share" \
-            "(HOMEHUB), so wall-sync FAILS on every boot and resume and the panel's PRIMARY" \
-            "music source is empty. It comes from the household store key" \
-            "'PanelMusicCifsCredential'."
     [ -f "$site_out/cifs-frame.creds" ] || \
         log "NOTE: no cifs-frame.creds in $site_dir — the panel cannot mount its FRAME VIDEO" \
             "share (Mini-serv), so the wall shows no picture-frame content. It comes from the" \

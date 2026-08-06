@@ -115,6 +115,31 @@ WALL_DIR="$SANDBOX/stack/autoinstall/wall"
 SYNC="$WALL_DIR/wall-sync.sh"
 BUILDER="$SANDBOX/vmtest/build-wall-seed.sh"
 
+# ── a STAND-IN for the baked apt repo (2026-08-06) ───────────────────────────
+# `packages:` is empty, so stage_apt_into_payload REFUSES a build with no
+# offline repo — every case below needs one. Baking the real thing costs docker,
+# a network and ~130 MB per run, and none of that is what this suite tests: what
+# it tests is the STAGER and its stamp guard. So, the shape the stager judges —
+# a non-empty Packages index, a *.deb, and a packages.baked.list DERIVED from
+# the tracked packages.list, so the stamp check runs for real. Not
+# ALLOW_MISSING_APT=1, which would make every case skip the stager entirely.
+fake_apt_repo() {
+    local dir="$1" list="${2:-$WALL_DIR/packages.list}"
+    rm -rf "$dir"; mkdir -p "$dir"
+    printf 'Package: vmtest-stand-in\nVersion: 0\nArchitecture: all\n\n' > "$dir/Packages"
+    : > "$dir/vmtest-stand-in_0_all.deb"
+    awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if (length($0)) print }' "$list" \
+        > "$dir/packages.baked.list"
+}
+FAKE_APT="$WORK/apt"
+fake_apt_repo "$FAKE_APT"
+
+# refresh_fake_apt — re-derive the stamp after a case has edited packages.list.
+# The dependency-gate cases below REMOVE a package from the list to prove the
+# refusal; without this the stager would then refuse first, for drift, and the
+# case would report the wrong reason.
+refresh_fake_apt() { fake_apt_repo "$FAKE_APT"; }
+
 skip_case() { printf 'SKIP  %s\n      %s\n' "$1" "$2"; skip=$((skip + 1)); }
 pass_case() { printf 'ok    %s\n' "$1"; pass=$((pass + 1)); }
 fail_case() { printf 'FAIL  %s\n      %s\n' "$1" "$2"; fail=$((fail + 1)); }
@@ -148,7 +173,10 @@ expect_refusal() {
     local name="$1" needle="$2"; shift 2
     [ "$1" = "--" ] && shift
     local out="$WORK/out.txt"
-    if env "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1; then
+    # APT_OUT FIRST so a case can override it (env takes the last assignment
+    # of a name); OUT_DIR stays last because no case may redirect where this
+    # suite deletes.
+    if env APT_OUT="$FAKE_APT" "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1; then
         printf 'FAIL  %s\n      the build SUCCEEDED; it was supposed to refuse\n' "$name"
         fail=$((fail + 1)); return
     fi
@@ -166,7 +194,7 @@ expect_success() {
     local name="$1" needle="$2"; shift 2
     [ "$1" = "--" ] && shift
     local out="$WORK/out.txt"
-    if env "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1 \
+    if env APT_OUT="$FAKE_APT" "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1 \
        && grep -qF "$needle" "$out"; then
         printf 'ok    %s\n' "$name"
         pass=$((pass + 1))
@@ -185,7 +213,7 @@ expect_absent() {
     local name="$1" needle="$2"; shift 2
     [ "$1" = "--" ] && shift
     local out="$WORK/out.txt"
-    if ! env "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1; then
+    if ! env APT_OUT="$FAKE_APT" "$@" OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$out" 2>&1; then
         fail_case "$name" "the build FAILED; it was supposed to succeed. $(grep -m1 FATAL "$out" | cut -c1-160)"
         return
     fi
@@ -342,7 +370,12 @@ if [ -n "$(ls "$DIST_REAL"/officewall-shell-*-linux-x64.tar.gz 2>/dev/null)" ]; 
     echo "=== 2. the runtime-dependency gate ==="
     # Mutating the SANDBOX, never the checkout.
     T="$WALL_DIR/electron-runtime-deps.tsv"
-    cp "$T" "$WORK/tsv.bak"; cp "$UD" "$WORK/ud.bak"
+    # THE LIST MOVED (2026-08-06): the packages the gate judges are in
+    # packages.list now, not in the user-data's `packages:` (which is empty —
+    # it runs before any late-command and so cannot be served by the baked
+    # offline repo). The case below removes a name from THAT file.
+    PL="$WALL_DIR/packages.list"
+    cp "$T" "$WORK/tsv.bak"; cp "$PL" "$WORK/pkglist.bak"
 
     # WALL_SHELL_DIST IS NOT OPTIONAL HERE (fixed 2026-08-04, out of the mode
     # pass). Both cases used to invoke the builder with no dist at all, so it
@@ -358,10 +391,15 @@ if [ -n "$(ls "$DIST_REAL"/officewall-shell-*-linux-x64.tar.gz 2>/dev/null)" ]; 
         "this repo has never heard of" -- "WALL_SHELL_DIST=$DIST_REAL"
     cp "$WORK/tsv.bak" "$T"
 
-    grep -v '^    - libnspr4$' "$WORK/ud.bak" > "$UD"
+    # Drop libnspr4 from the LIST, and re-derive the fake repo's stamp from the
+    # edited list — otherwise stage_apt_into_payload refuses first, for drift,
+    # and the case reports a reason that is not the one under test.
+    grep -v '^libnspr4$' "$WORK/pkglist.bak" > "$PL"
+    refresh_fake_apt
     expect_refusal "a mapped package the image does not install is refused" \
         "does not install package(s)" -- "WALL_SHELL_DIST=$DIST_REAL"
-    cp "$WORK/ud.bak" "$UD"
+    cp "$WORK/pkglist.bak" "$PL"
+    refresh_fake_apt
 else
     skip_case "-dirty / ambiguous / dependency-gate cases" \
         "no shell artifact at $DIST_REAL — build one with 'npm run dist' in OfficeWallNaglight"
@@ -373,9 +411,22 @@ S="$WORK/site"; mkdir -p "$S"
 expect_refusal "WALL_SITE_DIR with no user-data.filled is refused, not half-applied" \
     "has no user-data.filled" -- "WALL_SITE_DIR=$S"
 
+# EVERY placeholder the tracked template carries, not the three this fixture was
+# written against. The panel became STATICALLY addressed on 2026-08-06 (the
+# Owner: hold the address on the panel, keep it outside the DHCP pool), which
+# added REPLACE_WITH_PANEL_CIDR, _LAN_GATEWAY and _HUB_IP — and left every case
+# in this section refusing for "an ACTIVE setting still holds a REPLACE_WITH"
+# instead of for the reason it names. A fixture that stops resembling what
+# Materialize-Deploy emits stops testing the guards downstream of it.
 sed -e 's/REPLACE_WITH_WIFI_SSID/TestNet/' -e 's/REPLACE_WITH_WIFI_PSK/testpsk123/' \
+    -e 's/REPLACE_WITH_PANEL_CIDR/10.0.0.50\/24/' \
+    -e 's/REPLACE_WITH_LAN_GATEWAY/10.0.0.1/' \
+    -e 's/REPLACE_WITH_HUB_IP/10.0.0.2/' \
     -e 's#- "ssh-ed25519 AAAA_REPLACE_WITH_YOUR_PUBLIC_KEY you@host"#- "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey t@t"#' \
     "$UD" > "$S/user-data.filled"
+grep -Eq '^[[:space:]]*[A-Za-z_-]+:.*REPLACE_WITH' "$S/user-data.filled" && \
+    fail_case "the production fixture is placeholder-free" \
+        "the sed above no longer covers every REPLACE_WITH in the tracked wall user-data; every case in sections 3 and 4 will refuse for that instead of for its own reason"
 expect_refusal "a production build with no wall.env is refused (the panel would have no origin)" \
     "no wall.env" -- "WALL_SITE_DIR=$S"
 
@@ -459,7 +510,7 @@ expect_refusal "SIM_LAB_* on a PRODUCTION wall build is refused rather than sile
 
 echo
 echo "=== 4c. the A19 two-VM lab, and the panel's TLS delta (sim only) ==="
-if env "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DIR="$WORK/out-dir" \
+if env APT_OUT="$FAKE_APT" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DIR="$WORK/out-dir" \
         bash "$BUILDER" >"$WORK/out.txt" 2>&1; then
     assert_file_matches "with no SIM_LAB_* the shipped e* DHCP matcher survives (the wall gate builds the image it always built)" \
         "$WORK/out-dir/iso-root/user-data" '^[[:space:]]*name: "e\*"'
@@ -474,7 +525,7 @@ fi
 # WALL_SIM_HOST is not decoration here: a lab build is refused without a
 # resolvable name (see the .invalid cases below), which is the whole lesson of
 # 2026-08-04. This case predated that guard and asked for the impossible.
-if env "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DIR="$WORK/out-dir" \
+if env APT_OUT="$FAKE_APT" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DIR="$WORK/out-dir" \
         WALL_SIM_HOST=wall.vmtest.sim \
         SIM_LAB_WAN_MAC=00:15:5D:A1:90:50 SIM_LAB_MAC=00:15:5D:A1:91:50 \
         SIM_LAB_ADDR=10.99.7.50/24 SIM_LAB_DNS=10.99.7.10 SIM_LAB_SEARCH=vmtest.sim \
@@ -522,7 +573,7 @@ echo "=== 4b. the payload's MODES (the hub's 2026-08-04 defect is this image's t
 #
 # Nothing in this repo had ever asserted a mode until now; every other check
 # reads text. That is why an install found it and three suites did not.
-if env "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 \
+if env APT_OUT="$FAKE_APT" "WALL_SITE_DIR=$S" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 \
        OUT_DIR="$WORK/out-dir" bash "$BUILDER" >"$WORK/out.txt" 2>&1; then
     P="$WORK/out-dir/iso-root/deploy-payload"
     nbad=$(find "$P" -perm /022 | wc -l)

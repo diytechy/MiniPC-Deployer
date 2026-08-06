@@ -159,25 +159,26 @@ def wall_knob_refs(paths):
     return refs
 
 
-def autoinstall_packages(user_data_text):
-    """Package names from an autoinstall user-data's top-level `packages:` list.
+def image_packages(packages_list_text):
+    """Package names from a stack/autoinstall[/wall]/packages.list.
 
-    Read textually rather than with a YAML parser so this check stays runnable
-    on a stdlib-only box (PyYAML is optional here — see the YAML step below).
-    The list is a flat sequence of scalars at a fixed indent, which is the one
-    shape this needs to handle.
+    THE LIST MOVED OUT OF THE user-data ON 2026-08-06. `packages:` runs during
+    curtin's install step, before any late-command, so no local apt source can
+    serve it — and the whole point of the offline work is that the install
+    fetches nothing. Both images now ship `packages: []` and install from a repo
+    of frozen .debs on the payload, driven by this file.
+
+    Three rules, the same three vmtest/lib/common.sh read_packages_list, the
+    user-data late-command and vmtest/assert-installed.sh implement: strip from
+    `#` to end of line, strip all whitespace (a package name contains none),
+    drop what is left if empty. Deliberately parseable in awk, sed, bash and
+    Python, which is why it is not YAML.
     """
-    names, in_pkgs = set(), False
-    for line in user_data_text.splitlines():
-        if re.match(r"^  packages:\s*$", line):
-            in_pkgs = True
-            continue
-        if in_pkgs:
-            if re.match(r"^  \S", line):  # next key at the autoinstall: level
-                break
-            m = re.match(r"^\s*-\s+([^\s#]+)", line)
-            if m:
-                names.add(m.group(1))
+    names = set()
+    for line in packages_list_text.splitlines():
+        name = re.sub(r"#.*", "", line).strip()
+        if name:
+            names.add(name)
     return names
 
 
@@ -340,8 +341,8 @@ def main():
     #    without the matching package reaching the image. A missing shared
     #    library is a black wall with no message on it.
     deps_tsv = wall_dir / "electron-runtime-deps.tsv"
-    wall_user_data = wall_dir / "user-data"
-    if deps_tsv.exists() and wall_user_data.exists():
+    wall_packages = wall_dir / "packages.list"
+    if deps_tsv.exists() and wall_packages.exists():
         needed, soname_count = {}, 0
         for line in load(deps_tsv).splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
@@ -353,15 +354,55 @@ def main():
                 soname_count += 1
                 # Several sonames share one package (libnss3 provides three).
                 needed.setdefault(cols[1].strip(), cols[0].strip())
-        installed = autoinstall_packages(load(wall_user_data))
+        installed = image_packages(load(wall_packages))
         absent = sorted(p for p in needed if p not in installed)
         check(
             not absent,
             "every Electron runtime package is in the wall image ({} sonames -> {} packages)".format(
                 soname_count, len(needed)
             ),
-            "electron-runtime-deps.tsv names package(s) the wall user-data does NOT install: "
+            "electron-runtime-deps.tsv names package(s) missing from "
+            "stack/autoinstall/wall/packages.list: "
             + ", ".join("{} (for {})".format(p, needed[p]) for p in absent),
+        )
+
+    # 6b. `packages:` must STAY EMPTY on both images (2026-08-06).
+    #
+    #     The one-line summary of the whole offline change, asserted rather than
+    #     documented: that key runs during curtin's install step, before any
+    #     late-command, so no local apt source can serve it. A single name put
+    #     back reaches for the Ubuntu archive, and reaching for the archive at
+    #     all is the failure that produced a bare Ubuntu on the real hub. It is
+    #     also an entry NO other check covers — export-apt.sh, the install-time
+    #     apt run, assert-installed.sh and stage_apt_into_payload all read
+    #     packages.list and none of them would ever see it.
+    for rel in ("autoinstall/user-data", "autoinstall/wall/user-data"):
+        text = load(stack / rel)
+        if not text:
+            continue
+        # Textual on purpose: the same stdlib-only constraint as everything above
+        # this line, and the shape being refused is a LIST under `packages:`.
+        entries = []
+        in_pkgs = False
+        for line in text.splitlines():
+            if re.match(r"^  packages:\s*$", line):
+                in_pkgs = True
+                continue
+            if in_pkgs:
+                if re.match(r"^  \S", line):
+                    break
+                m = re.match(r"^\s*-\s+([^\s#]+)", line)
+                if m:
+                    entries.append(m.group(1))
+        check(
+            not entries,
+            "{}: packages: is empty — the install fetches nothing".format(rel),
+            "{}: packages: lists {} entry(s) ({}). That key runs BEFORE any "
+            "late-command, so the baked offline repo cannot serve it and the "
+            "install would reach for the Ubuntu archive — the 2026-08-06 "
+            "failure. Move them to the sibling packages.list.".format(
+                rel, len(entries), ", ".join(entries[:5])
+            ),
         )
 
     # 5. YAML parse (optional — needs PyYAML; SKIP cleanly if absent so this stays

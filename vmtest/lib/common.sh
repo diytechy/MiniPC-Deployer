@@ -1542,6 +1542,123 @@ stage_images_into_payload() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  THE BAKED APT REPO — an install that needs no network at all (2026-08-06)
+#
+#  autoinstall's `packages:` runs during curtin's install step, BEFORE any
+#  late-command, so no local apt source a late-command could add is available to
+#  it. Both images therefore ship `packages: []` and install everything from a
+#  repo of frozen .debs carried on the payload — see the header of
+#  stack/autoinstall/packages.list for the failure that forced it.
+#
+#  THREE PIECES, and they must agree:
+#    stack/autoinstall[/wall]/packages.list   the names (tracked, the SSOT)
+#    vmtest/export-apt.sh                     the debs, resolved + proven offline
+#    late-command 3c                          reads the SAME list off the payload
+#  packages_list_path/read_packages_list are the shared halves of the first;
+#  stage_apt_into_payload is where the second is checked against it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# packages_list_path REPO_ROOT hub|wall — where THAT image's list lives.
+packages_list_path() {
+    case "$2" in
+        hub)  printf '%s' "$1/stack/autoinstall/packages.list" ;;
+        wall) printf '%s' "$1/stack/autoinstall/wall/packages.list" ;;
+        *)    die "packages_list_path: target must be hub or wall (got '$2')" ;;
+    esac
+}
+
+# read_packages_list FILE — one package name per line, comments and blanks off.
+#
+# THREE RULES, and they are stated here because four languages implement them:
+# this function (the builders), a bash one-liner in each user-data's
+# late-command 3c, `sed` in vmtest/assert-installed.sh, and Python in
+# scripts/validate_config.py. Strip from `#` to end of line; strip all
+# whitespace (a package name can contain none); drop what is left if empty.
+# Anything more expressive would be a format only one of those four could read.
+read_packages_list() {
+    [ -f "$1" ] || die "read_packages_list: not found: $1"
+    awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if (length($0)) print }' "$1"
+}
+
+# stage_apt_into_payload OUT_DIR APT_OUT TARGET
+#
+# Fold the repo vmtest/export-apt.sh produced into deploy-payload/apt/, so it
+# rides both ISO paths and lands at <payload root>/apt on the target — where
+# late-command 3c points a `deb [trusted=yes] file:///…` source at it and
+# installs the whole list with no network.
+#
+# FATAL WHEN ABSENT, unlike stage_images_into_payload's graceful degrade, and
+# the difference is the whole point. A hub with no baked IMAGES has a documented
+# recovery: firstboot pulls at compose-up. A box with no baked PACKAGES has
+# none — `packages:` is empty, so it installs nothing at all: no sshd, no
+# docker, no cockpit. That is byte-for-byte the machine 2026-08-06 produced, and
+# the install-completeness late-command would (correctly) refuse to finish,
+# making the ISO a guaranteed-broken artifact. Refuse to build one instead.
+# ALLOW_MISSING_APT=1 opts out, loudly, for exercising the seed machinery alone.
+#
+# AND THE STAMP IS CHECKED. The debs are frozen at export time; the names are
+# read from the tracked list at INSTALL time. Export the repo, add a package,
+# build the ISO, and the payload asks for something the repo has never heard of
+# — an install that dies on a dead network, which is exactly the coupling being
+# removed. export-apt.sh writes packages.baked.list beside the debs; this
+# compares it to the list about to ride the same ISO and refuses a mismatch.
+stage_apt_into_payload() {
+    local out_dir="$1" apt_out="$2" target="$3"
+    local dest="$out_dir/iso-root/deploy-payload/apt"
+    local repo; repo="$(repo_root)"
+    local list; list="$(packages_list_path "$repo" "$target")"
+
+    if [ ! -f "$apt_out/Packages" ]; then
+        if [ "${ALLOW_MISSING_APT:-0}" -eq 1 ]; then
+            log "WARNING: ALLOW_MISSING_APT=1 — building a $target ISO with NO baked apt repo."
+            log "  packages: is empty, so this image installs NOTHING: no sshd, no docker, no"
+            log "  cockpit. The install-completeness late-command will refuse to finish it."
+            log "  This image can exercise the seed/payload machinery and nothing else."
+            return 0
+        fi
+        die "no baked apt repo at $apt_out (no Packages index there)" \
+            "Both images ship 'packages: []' and install everything from this repo, so an ISO" \
+            "built without it installs NOTHING — no sshd, no docker, no cockpit — which is the" \
+            "2026-08-06 machine exactly. Bake it first:" \
+            "  bash vmtest/export-apt.sh --target $target --out $apt_out" \
+            "Deliberately without it: ALLOW_MISSING_APT=1 <this build command>"
+    fi
+
+    # Sorted, because --list can be pointed elsewhere and file order is not the
+    # property under test — membership is. diff on the sorted sets names both
+    # directions, which is what an operator needs to know which end is stale.
+    local drift
+    drift="$(diff <(read_packages_list "$list" | sort -u) \
+                  <(read_packages_list "$apt_out/packages.baked.list" | sort -u) || true)"
+    [ -z "$drift" ] || die \
+        "the baked apt repo and $target's package list DISAGREE:" \
+        "$drift" \
+        "('<' is in ${list#"$repo"/} but NOT baked — the install would ask apt for a package that" \
+        " is not in the repo and, with no network, die there. '>' is baked but no longer asked" \
+        " for — harmless, but it means the repo predates the list.)" \
+        "Re-bake it:  bash vmtest/export-apt.sh --target $target --out $apt_out"
+
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    local n total=0 f
+    for f in "$apt_out"/*.deb "$apt_out"/Packages "$apt_out"/Packages.gz; do
+        [ -f "$f" ] || continue
+        # hardlink when the filesystem allows (saves ~180MB of C: — OI-6); else copy.
+        cp -l "$f" "$dest/" 2>/dev/null || cp -f "$f" "$dest/"
+        total=$(( total + $(stat -c%s "$f") ))
+    done
+    n="$(find "$dest" -name '*.deb' | wc -l)"
+    [ "$n" -gt 0 ] || die "staged 0 .deb files from $apt_out — the repo directory has an index and no packages. Re-run vmtest/export-apt.sh."
+    # The list travels with the debs as well as in the repo copy: late-command 3c
+    # reads the payload's tracked stack/autoinstall copy, and this one is what an
+    # operator standing at a half-installed box can read to see what was MEANT.
+    cp -f "$apt_out/packages.baked.list" "$dest/packages.baked.list"
+
+    log "deploy-payload/apt/ = $(( total / 1024 / 1024 )) MB across $n .deb(s), Packages index included"
+    log "  -> lands at <payload>/apt on the target; late-command 3c installs the whole list from it, offline."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  IF-005 — the OfficeWallNaglight shell artifact (PKG-1)
 #
 #  That repo's `npm run dist` emits ONE build as TWO payloads, both stamped
@@ -1712,7 +1829,7 @@ assert_wall_artifact_contract() {
 #
 #     every DT_NEEDED soname in the shipped binary
 #       -> is mapped in stack/autoinstall/wall/electron-runtime-deps.tsv
-#       -> whose package is in the wall user-data's `packages:` list
+#       -> whose package is in stack/autoinstall/wall/packages.list
 #
 # That closes the loop the doc alone leaves open: a Electron bump that adds a
 # dependency now fails THIS build with the soname named, instead of producing a
@@ -1722,8 +1839,16 @@ assert_wall_artifact_contract() {
 assert_electron_runtime_deps() {
     local repo_root="$1" tarball="$2" probe="$3"
     local table="$repo_root/stack/autoinstall/wall/electron-runtime-deps.tsv"
-    local user_data="$repo_root/stack/autoinstall/wall/user-data"
+    # THE LIST, NOT THE user-data. `packages:` is empty on both images since
+    # 2026-08-06 (it runs before any late-command, so a baked repo cannot serve
+    # it); the names live in packages.list, which is also what export-apt.sh
+    # resolves and what late-command 3c installs. Reading the user-data here
+    # would now find nothing and this check would pass vacuously — a check that
+    # passes hardest when it can see nothing is the shape this file keeps
+    # deleting.
+    local pkg_list; pkg_list="$(packages_list_path "$repo_root" wall)"
     [ -f "$table" ] || die "not found: $table (the soname -> package map this check reads)"
+    [ -f "$pkg_list" ] || die "not found: $pkg_list (the package list this check judges the map against)"
     [ -f "$probe/tar-listing.txt" ] || die "internal: assert_wall_artifact_contract must run first (it writes the listing this check reads)"
     require_cmd readelf "Install with: sudo apt-get install -y binutils"
     require_cmd python3 "Install it with: sudo apt-get install -y python3"
@@ -1744,20 +1869,15 @@ info = json.load(open(sys.argv[1]))
 sys.exit(1 if (info.get("source") or {}).get("dirty") else 0)
 PY
 
-    # The packages: list of the wall user-data, one name per line, comments off.
+    # The wall image's package list, one name per line, comments off.
     # Written to a FILE, then grepped — never `printf … | grep -q`. Under
     # pipefail an early-exiting grep SIGPIPEs the writer and the pipeline
     # reports failure, i.e. the check reports "package missing" precisely when
     # it FOUND the package. The same shape cost a good site tarball a refusal
     # ten lines below; once is enough.
     local declared declared_file="$probe/declared-packages.txt"
-    declared="$(awk '
-        /^  packages:/            { inpkgs = 1; next }
-        inpkgs && /^  [^ ]/       { inpkgs = 0 }
-        inpkgs && /^[[:space:]]*-[[:space:]]/ {
-            sub(/^[[:space:]]*-[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); print
-        }' "$user_data")"
-    [ -n "$declared" ] || die "could not read a packages: list out of $user_data"
+    declared="$(read_packages_list "$pkg_list")"
+    [ -n "$declared" ] || die "no package names could be parsed out of $pkg_list"
     printf '%s\n' "$declared" > "$declared_file"
 
     # READELF INTO A FILE, AND CHECK IT WORKED. This used to be a here-document
@@ -1809,13 +1929,14 @@ PY
         die "the shell artifact needs shared library(s) this repo has never heard of:$missing_map" \
             "A missing library is a BLACK WALL whose only diagnosis is ldd on the panel." \
             "Add each soname to $table with the Ubuntu package that provides it" \
-            "(dpkg -S /usr/lib/x86_64-linux-gnu/<soname>), then add that package to the" \
-            "packages: list in $user_data."
+            "(dpkg -S /usr/lib/x86_64-linux-gnu/<soname>), then add that package to" \
+            "$pkg_list."
     [ -z "$missing_pkg" ] || \
         die "the wall image does not install package(s) the shell artifact needs:$missing_pkg" \
-            "Add them to the packages: list in $user_data. Without them Electron exits at" \
-            "load time and the panel crash-loops with nothing on screen — [ -x ] is still" \
-            "true, so the NOT INSTALLED screen never fires either."
+            "Add them to $pkg_list, then re-bake the offline repo:" \
+            "  bash vmtest/export-apt.sh --target wall --out vmtest/.out-wall/apt" \
+            "Without them Electron exits at load time and the panel crash-loops with nothing" \
+            "on screen — [ -x ] is still true, so the NOT INSTALLED screen never fires either."
     log "  runtime deps OK: every DT_NEEDED soname maps to a package the wall image installs"
 }
 

@@ -180,11 +180,41 @@ for c in (ai.get("late-commands") or []):
 PY
 }
 
+# ── a STAND-IN for the baked apt repo ────────────────────────────────────────
+# Since 2026-08-06 `packages:` is empty and stage_apt_into_payload REFUSES a
+# build with no offline repo, so every case below needs one. Baking the real
+# thing costs docker, a network and ~180 MB per run, and none of that is what
+# this suite is testing — what it tests is the STAGER and its stamp guard.
+#
+# So: a directory with the shape the stager judges — a non-empty Packages index,
+# at least one *.deb, and a packages.baked.list. The list is DERIVED from the
+# tracked packages.list with the same three rules everything else uses, so the
+# stamp check is exercised for real rather than sidestepped; fake_apt_repo takes
+# a list path precisely so the drift case can hand it a different one.
+#
+# NOT ALLOW_MISSING_APT=1, deliberately. That would make every case below skip
+# the stager entirely and the suite would stop covering the newest thing in the
+# build chain — a green meaning "we did not look", which is what this file's
+# header argues against.
+fake_apt_repo() {
+    local dir="$1" list="${2:-$SANDBOX/stack/autoinstall/packages.list}"
+    rm -rf "$dir"; mkdir -p "$dir"
+    printf 'Package: vmtest-stand-in\nVersion: 0\nArchitecture: all\n\n' > "$dir/Packages"
+    : > "$dir/vmtest-stand-in_0_all.deb"
+    awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if (length($0)) print }' "$list" \
+        > "$dir/packages.baked.list"
+}
+FAKE_APT="$WORK/apt"
+fake_apt_repo "$FAKE_APT"
+
 # build_seed [env...] — one hub seed build into a FRESH $OUT, from the SANDBOX.
 # Output in $WORK/out.txt.
+# APT_OUT comes FIRST so a case can override it (env takes the last assignment
+# of a name); OUT_DIR and IMAGES_OUT stay last because no case may redirect
+# where this suite deletes.
 build_seed() {
     rm -rf "$OUT"
-    env "$@" OUT_DIR="$OUT" IMAGES_OUT="$WORK/no-images" \
+    env APT_OUT="$FAKE_APT" "$@" OUT_DIR="$OUT" IMAGES_OUT="$WORK/no-images" \
         bash "$SANDBOX/vmtest/build-seed.sh" >"$WORK/out.txt" 2>&1
 }
 
@@ -554,6 +584,48 @@ if build_seed "SITE_DIR=$SITE"; then
     ok "…and builds green again once it is restored (so the refusal was the stub, not the suite)"
 else
     bad "restore after the bite proof" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+echo
+echo "=== the OFFLINE apt repo (2026-08-06) ==="
+# `packages:` is empty, so the baked repo is not an optimisation — it is the only
+# thing that installs anything. Both ways it can be wrong end in the same place:
+# a box that boots, answers pings and has no sshd. Both must stop the BUILD.
+expect_refusal "a build with NO baked apt repo REFUSES (an ISO that installs nothing)" \
+    "no baked apt repo" -- APT_OUT="$WORK/apt-absent"
+
+# THE STAMP. The debs are frozen when export-apt.sh runs; the names are read
+# from the tracked list when the box installs. Add a package, rebuild the ISO
+# without re-baking, and the install asks apt for something the repo has never
+# heard of — on a dead network, which is the whole failure being removed.
+cp "$SANDBOX/stack/autoinstall/packages.list" "$WORK/list-drifted"
+printf '\nvmtest-package-that-was-never-baked\n' >> "$WORK/list-drifted"
+fake_apt_repo "$WORK/apt-stale" "$SANDBOX/stack/autoinstall/packages.list"
+cp "$WORK/list-drifted" "$SANDBOX/stack/autoinstall/packages.list"
+expect_refusal "a baked repo that DISAGREES with packages.list REFUSES" \
+    "DISAGREE" -- APT_OUT="$WORK/apt-stale"
+cp "$REPO_ROOT/stack/autoinstall/packages.list" "$SANDBOX/stack/autoinstall/packages.list"
+
+# And the artifact itself: the repo has to be ON the ISO, not merely resolved.
+if build_seed; then
+    if [ -s "$OUT/iso-root/deploy-payload/apt/Packages" ] \
+       && [ -s "$OUT/iso-root/deploy-payload/apt/packages.baked.list" ] \
+       && [ -n "$(find "$OUT/iso-root/deploy-payload/apt" -name '*.deb' -print -quit)" ]; then
+        ok "the baked repo lands at deploy-payload/apt/ (index, list and .deb(s))"
+    else
+        bad "the baked repo lands at deploy-payload/apt/" \
+            "staged: $(ls -1 "$OUT/iso-root/deploy-payload/apt" 2>/dev/null | tr '\n' ' ')"
+    fi
+    # The payload's own copy of the tracked list is what late-command 3c's
+    # sibling checks read; if the repo copy lost it, nothing on the box can say
+    # what the install was supposed to contain.
+    if [ -s "$OUT/iso-root/deploy-payload/stack/autoinstall/packages.list" ]; then
+        ok "the tracked packages.list rides the payload too (assert-installed.sh's cross-check)"
+    else
+        bad "the tracked packages.list rides the payload" "absent from deploy-payload/stack/autoinstall/"
+    fi
+else
+    bad "the baked repo lands at deploy-payload/apt/" "$(tail -3 "$WORK/out.txt" | tr '\n' ' ')"
 fi
 
 echo

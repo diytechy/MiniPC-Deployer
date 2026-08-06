@@ -1,0 +1,95 @@
+# stack/autoinstall/wall/packages.list — every package the WALL PANEL installs.
+#
+# The hub's ../packages.list carries the full argument for why this list lives
+# in a file instead of in the user-data's `packages:`. The short version: that
+# key runs BEFORE any late-command, so nothing a late-command adds can help it,
+# and a single entry left there is enough to make the install reach for the
+# archive and die there when the network is not up.
+#
+# Five things read this file and none of them retypes it:
+#
+#   vmtest/export-apt.sh                     bakes the closure into an apt repo
+#   wall/user-data late-command 3c           installs FROM that repo, reading
+#                                            this file off the payload
+#   vmtest/assert-installed.sh               asserts each name on the booted panel
+#   vmtest/lib/common.sh (assert_electron_runtime_deps)
+#                                            refuses to bake a shell artifact
+#                                            whose DT_NEEDED list is not covered
+#   vmtest/test-wall-artifact.sh             installs exactly this list in a
+#                                            container and runs ldd against it
+#
+# FORMAT: one package per line, `#` comments to end of line, blank lines ignored.
+#
+# REBUILD THE BAKED REPO WHEN YOU CHANGE THIS FILE:
+#   bash vmtest/export-apt.sh --target wall --out .out-wall/apt
+
+ca-certificates
+curl
+cage                   # single-surface Wayland kiosk compositor (the session)
+seatd                  # seat management fallback if the logind seat path fails
+xdg-utils
+fonts-dejavu-core
+util-linux             # rtcwake — the PRIMARY wake source (D-W4)
+network-manager        # quirk 5: powersave off, and the netplan renderer
+
+# ── the media sync (OI-15): the panel PULLS, so it needs a cifs client ───────
+cifs-utils             # mount.cifs — the read-only mount of the media share
+rsync                  # the mirror itself (`rsync -a --delete`)
+python3                # wall-media-manifest.py (JSON escaping, not bash).
+                       # Present anyway (cloud-init needs it); listed so the
+                       # dependency is explicit rather than inherited by luck.
+alsa-utils             # audio sink pinning (WSN-012 lives in the app's runbook)
+pulseaudio-utils
+va-driver-all          # VA-API decode; quirk 6 says PROVE it is engaged
+vainfo
+
+# grim — screenshot the RUNNING kiosk over SSH, from inside the compositor:
+#   sudo -u panel env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 grim /tmp/panel.png
+# The panel is on a wall, often asleep, and hard to photograph; "send me a
+# picture of what it is showing" is otherwise a trip across the office. It is
+# also the ONLY way to see a cage session on real hardware — /dev/fb0 is the
+# text console underneath and shows nothing once cage takes over KMS, and
+# Hyper-V's thumbnail API does not exist off a VM. ~50 KB, wlr-screencopy.
+grim
+
+unattended-upgrades    # same hands-off patching posture as the hub
+# Explicit here for the same reason it is explicit on the hub: `ssh:
+# install-server` is an apt install at the pre-late-command moment and is now
+# `false`. This line is the panel's only door once it is on a wall.
+openssh-server
+
+# ── the Electron runtime's shared libraries (IF-005 / PKG-1) ────────────────
+# The shell artifact ships its own Electron binary but NOT the ~24 system
+# libraries it links against — those are the image's job. Every name below is
+# derived from the shipped binary's own DT_NEEDED list and is enforced:
+# ./electron-runtime-deps.tsv maps soname -> package, and the wall builder
+# (vmtest/lib/common.sh assert_electron_runtime_deps) refuses to bake an
+# artifact whose dependencies are not all covered here. Do not prune this list
+# by eye — a missing library is a BLACK WALL, not an error message: Electron
+# exits before painting, wall-kiosk.sh restarts it every 3 s, and `[ -x ]` stays
+# true so the NOT INSTALLED screen never fires either.
+# The `t64` suffixes are 24.04's 64-bit-time_t renames; the old names do not
+# exist in noble and apt would fail the install outright.
+libx11-6
+libxcomposite1
+libxdamage1
+libxext6
+libxfixes3
+libxrandr2
+libasound2t64
+libatk1.0-0t64
+libatk-bridge2.0-0t64
+libatspi2.0-0t64
+libcairo2
+libcups2t64
+libdbus-1-3
+libexpat1
+libgbm1
+libglib2.0-0t64
+libgtk-3-0t64
+libnspr4
+libnss3
+libpango-1.0-0
+libudev1
+libxcb1
+libxkbcommon0

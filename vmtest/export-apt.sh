@@ -4,7 +4,7 @@
 # WHY. The ISO already carries every Docker IMAGE (Q10.9 B+, export-images.sh)
 # so the stack starts with no registry. It carried no PACKAGES, so the install
 # still needed the Ubuntu archive AND download.docker.com to be reachable — and
-# the very first thing it does with the network is `packages:`, which is apt.
+# the very first thing it did with the network was `packages:`, which is apt.
 #
 # This repo already wrote down what that costs, at stack/autoinstall/user-data:
 #
@@ -27,13 +27,17 @@
 # produce a repo with holes exactly where the host happens to be provisioned.
 # A clean container has the same package set the target will have: nothing.
 #
-# THE PACKAGE LIST IS READ OUT OF THE user-data, never retyped — the same
-# discipline as test-wall-artifact.sh, and for the same reason: a hand-copied
-# list stops testing whatever was added to the image last week.
+# THE PACKAGE LIST IS READ OUT OF stack/autoinstall/packages.list (the wall's
+# is stack/autoinstall/wall/packages.list), never retyped. That file is the SSOT
+# the INSTALLER reads too — late-command 3c runs `apt-get install` against the
+# very same file, carried on the payload — so the repo this script bakes and the
+# list the box installs cannot drift apart by construction. See the header of
+# stack/autoinstall/packages.list for why the list is no longer `packages:`.
 #
 # Usage:
-#   bash vmtest/export-apt.sh --seed stack/autoinstall/user-data --out .out/apt
-#   bash vmtest/export-apt.sh --seed <wall user-data> --out .out-wall/apt --target wall
+#   bash vmtest/export-apt.sh --target hub  --out .out/apt
+#   bash vmtest/export-apt.sh --target wall --out .out-wall/apt
+#   bash vmtest/export-apt.sh --target hub --list some/other/packages.list --out ...
 
 set -euo pipefail
 
@@ -41,53 +45,62 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-SEED=""
+REPO_ROOT="$(repo_root)"
+LIST=""
 OUT=""
 TARGET="hub"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --seed)   SEED="$2";   shift 2 ;;
+        --list)   LIST="$2";   shift 2 ;;
         --out)    OUT="$2";    shift 2 ;;
         --target) TARGET="$2"; shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        # Accepted and REFUSED rather than ignored. The first cut of this script
+        # parsed `packages:` out of a user-data; that list has moved to a file
+        # both this script and the installer read, and a --seed silently doing
+        # nothing would bake a repo from the wrong source while reporting
+        # success — which is the exact shape of failure this whole change exists
+        # to remove.
+        --seed)   die "--seed is gone: the package list moved out of the user-data's 'packages:' and into stack/autoinstall[/wall]/packages.list (which the installer reads too). Use --target hub|wall, or --list <path>." ;;
+        -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
         *) die "unknown argument '$1' (try --help)" ;;
     esac
 done
-[ -n "$SEED" ] || die "need --seed <path to a user-data>"
-[ -f "$SEED" ] || die "not found: $SEED"
-[ -n "$OUT" ]  || die "need --out <directory>"
-case "$TARGET" in hub|wall) ;; *) die "--target must be hub or wall" ;; esac
+case "$TARGET" in
+    hub)  : ;;
+    wall) : ;;
+    *) die "--target must be hub or wall" ;;
+esac
+[ -n "$OUT" ] || die "need --out <directory>"
+[ -n "$LIST" ] || LIST="$(packages_list_path "$REPO_ROOT" "$TARGET")"
+[ -f "$LIST" ] || die "not found: $LIST"
 
 require_cmd docker "Install Docker in WSL, or run this where docker is available"
 
 # ── 1. what does this image ask for? ───────────────────────────────────────
-PKGS="$(sed -n '/^  packages:/,/^  [a-z_-]*:/p' "$SEED" \
-        | sed -n 's/^    -[[:space:]]*\([a-zA-Z0-9][a-zA-Z0-9.+-]*\).*/\1/p' | tr '\n' ' ')"
-[ -n "$PKGS" ] || die "no packages: list could be parsed out of $SEED"
+# ONE parser, defined in lib/common.sh, shared with the stagers and the tests.
+PKGS="$(read_packages_list "$LIST" | tr '\n' ' ')"
+[ -n "$PKGS" ] || die "no package names could be parsed out of $LIST — refusing to bake an empty repo, which would pass the offline check below vacuously."
 
-# openssh-server is NOT in packages: — it comes from `ssh: install-server: true`,
-# which is also an apt install and also failed on 2026-08-06, leaving a box with
-# no way in. Baking it is the whole point, so it is added explicitly here.
-PKGS="$PKGS openssh-server"
+# THE DOCKER SOURCE IS DERIVED FROM THE LIST, not from --target. The engine's
+# packages come from download.docker.com rather than the Ubuntu archive, so the
+# resolver container needs that source configured — but which image wants them
+# is the LIST's business, not this script's. Keying it off `docker-ce` means a
+# list that stops asking for Docker stops fetching Docker's key, with nothing
+# here to remember to change.
+NEED_DOCKER_SRC=0
+case " $PKGS " in *" docker-ce "*) NEED_DOCKER_SRC=1 ;; esac
 
-# The hub additionally installs the Docker engine from download.docker.com in a
-# late-command. Same treatment: baked, so first boot needs neither the archive
-# nor Docker's CDN.
-DOCKER_PKGS=""
-if [ "$TARGET" = hub ]; then
-    DOCKER_PKGS="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
-fi
-
-log "resolving for $TARGET: $PKGS $DOCKER_PKGS"
+log "resolving for $TARGET from ${LIST#"$REPO_ROOT"/}: $PKGS"
+[ "$NEED_DOCKER_SRC" -eq 1 ] && log "  (the list names docker-ce, so download.docker.com is added to the resolver)"
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
 OUT_ABS="$(cd "$OUT" && pwd)"
 
 # ── 2. resolve + download the closure in a clean noble container ───────────
-# --no-install-recommends matches what apt does in the target for these lists;
-# taking recommends here would bloat the payload with things the install will
-# never ask for, and MISSING a dependency is caught by the smoke test below
+# --no-install-recommends matches what the install does in the target for these
+# lists; taking recommends here would bloat the payload with things the install
+# will never ask for, and MISSING a dependency is caught by the smoke test below
 # rather than by hoping the flags line up.
 docker run --rm -v "$OUT_ABS:/out" ubuntu:24.04 bash -c "
     set -euo pipefail
@@ -95,7 +108,7 @@ docker run --rm -v "$OUT_ABS:/out" ubuntu:24.04 bash -c "
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg dpkg-dev >/dev/null
 
-    if [ -n '$DOCKER_PKGS' ]; then
+    if [ '$NEED_DOCKER_SRC' = '1' ]; then
         install -m 0755 -d /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
         chmod a+r /etc/apt/keyrings/docker.asc
@@ -113,7 +126,7 @@ docker run --rm -v "$OUT_ABS:/out" ubuntu:24.04 bash -c "
     apt-get install -y --download-only --no-install-recommends \
         -o Dir::Cache::archives=/debs \
         -o Dir::State::status=/dev/null \
-        $PKGS $DOCKER_PKGS
+        $PKGS
     cp /debs/*.deb /out/ 2>/dev/null || true
 
     cd /out
@@ -142,7 +155,19 @@ docker run --rm --network none -v "$OUT_ABS:/repo:ro" ubuntu:24.04 bash -c "
     rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
     echo 'deb [trusted=yes] file:/repo ./' > /etc/apt/sources.list.d/baked.list
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends --simulate $PKGS $DOCKER_PKGS >/dev/null
+    apt-get install -y -qq --no-install-recommends --simulate $PKGS >/dev/null
 " || die "the baked repo CANNOT satisfy the package list offline - the install would fail exactly where it failed on 2026-08-06. Refusing to ship it."
 
+# ── 4. record WHICH list this repo was baked from ─────────────────────────
+# The debs are FROZEN at this moment; the names the installer asks for are read
+# from the tracked packages.list at INSTALL time. Those two are the same file
+# today and can silently stop being: export the repo, add a package, build the
+# ISO, and the payload asks for something the baked repo has never heard of —
+# an install that dies on a dead network, which is the whole failure being
+# removed here. So the resolved list is written beside the debs and
+# stage_apt_into_payload refuses to stage a repo whose stamp disagrees with the
+# list about to ride the same ISO.
+printf '%s\n' $PKGS > "$OUT_ABS/packages.baked.list"
+
 log "OK - the baked repo resolves $TARGET's package list with no network at all"
+log "     stamped $OUT_ABS/packages.baked.list ($(printf '%s\n' $PKGS | wc -l) names) — stage_apt_into_payload checks it against $LIST"

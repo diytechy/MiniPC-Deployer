@@ -30,7 +30,70 @@ carrying exactly this image's package list, where `ldd` resolves everything and
 Electron reaches Ozone init. **Nothing has watched it come up under `cage` on a
 display.** That is the A19 gate's job. See docs/status.md for the full ledger.
 
-## 0. Q10.9 B+ — the image payload (bake EVERY container "from infancy")
+## 0a. The offline install — bake every PACKAGE too (2026-08-06)
+
+§0b below makes the *stack* independent of a registry. This makes the *install*
+independent of the Ubuntu archive, and it is the newer and sharper of the two:
+on 2026-08-06 a production stick installed a **bare Ubuntu** onto the real hub
+and reported success — no `/opt/homehub`, no `openssh-server`, no Docker, no
+Cockpit, and a password-locked console account, so no way in at all. One cause,
+five symptoms, three steps apart: the install had no working network when apt
+ran, `packages:` died on `cockpit` with exit 100, subiquity errored, and every
+late-command after it never ran.
+
+`packages:` runs **before** any late-command, so no local apt source could ever
+have rescued it. Making the network more reliable is not the fix; removing the
+dependency is.
+
+```
+stack/autoinstall[/wall]/packages.list      the ONE list. Nothing retypes it.
+   │
+   ├─► vmtest/export-apt.sh                 resolve the closure in a clean
+   │      │                                 ubuntu:24.04 container, then PROVE it
+   │      │                                 in a second one: --network none,
+   │      │                                 every archive source deleted. Refuses
+   │      ▼                                 to ship a repo that cannot resolve.
+   │   .out/apt/{*.deb, Packages, packages.baked.list}
+   │      │
+   │      ▼  stage_apt_into_payload() — and it checks the baked stamp against
+   │         packages.list, so the repo and the list cannot describe different
+   │         installs
+   │   deploy-payload/apt/
+   │      ▼
+   │   autoinstall late-command 3  copies the whole payload to <root>/apt
+   └─► autoinstall late-command 3c `deb [trusted=yes] file:///<root>/apt ./`
+                                   + `xargs -a packages.baked.list apt-get install`
+```
+
+Both images ship `packages: []` and `ssh: install-server: false`. Measured:
+**hub 224 debs / 176 MB**, **wall 340 debs / 129 MB** — both offline-verified,
+and the hub ISO is 3.9 GB on an 8 GB stick.
+
+- **The repo is a local path INSIDE the target**, never `file:///cdrom/...`.
+  Whether `/cdrom` is visible in the chroot during curtin's package phase is
+  Ubuntu's business; by late-commands the payload is already on `/target`, so
+  the question does not arise. Do not reintroduce a `/cdrom` apt source.
+- **Nothing is written to `/etc/apt`.** The source line and an empty parts
+  directory live in `/run` for the duration of the command and apt is pointed at
+  them with `-o Dir::Etc::*`. The target's `ubuntu.sources` is never moved,
+  disabled or restored, so `unattended-upgrades` tracks the archive normally
+  from first boot.
+- **Frozen debs.** You install the set you tested, not whatever the archive
+  holds that day. Re-bake when you rebuild the image; a stale repo is a refused
+  BUILD, not a bad box.
+- **Build order:** `export-apt.sh` before any `build-*.sh`. Unlike the image
+  payload this is not a warning — the build REFUSES, because `packages:` is
+  empty and an ISO without the repo installs nothing at all. `ALLOW_MISSING_APT=1`
+  opts out, loudly, for exercising the seed machinery alone.
+
+```sh
+bash vmtest/export-apt.sh --target hub  --out vmtest/.out/apt
+bash vmtest/export-apt.sh --target wall --out vmtest/.out-wall/apt
+```
+
+---
+
+## 0b. Q10.9 B+ — the image payload (bake EVERY container "from infancy")
 
 Per the Owner's locked Q10.9 B+ decision, a freshly-imaged AWOW comes up with EVERY
 stack container image already present — **zero registry/internet dependency for
@@ -454,6 +517,19 @@ VM summary pane — Default Switch NAT hands out a `172.x`-range address).
 > file. The gate ISO installs unattended to any disk it finds and **must never be
 > written to physical media** — that is exactly why the shipped image does not
 > carry such an entry.
+>
+> **THE INSTALL ITSELF NEEDS NO NETWORK (2026-08-06), and the gate is where you
+> prove it.** Both images ship `packages: []` and `ssh: install-server: false`;
+> every package comes from `deploy-payload/apt/`, a repo of frozen `.deb` files
+> `export-apt.sh` resolves and then verifies in a container with `--network
+> none`. Run the install phase **with the vSwitch disconnected** — if it
+> completes with no link at all, the goal is met, and nothing weaker proves it.
+> `assert-installed.sh` checks every name in the baked list is installed, so a
+> partial offline install fails the gate rather than looking green.
+>
+> Reconnect the switch before the stack comes up: offline covers the *install*,
+> not first-boot service bring-up (ACME, DDNS, OAuth, Cloudflare all need the
+> internet), and `healthcheck.sh` is asking a different question.
 
 Watch first-boot bring-up:
 
@@ -576,6 +652,7 @@ error.
 vmtest/
   README.md               this file
   export-images.sh        Q10.9 B+: docker save every pinned stack image -> .out/images/*.tar
+  export-apt.sh           §0a: every .deb the image installs -> .out[-wall]/apt/, proven offline
   build-seed.sh           HUB, LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
   build-repacked-iso.sh   HUB, HEAVIER path: one self-contained ISO (fallback; folds in the payload)
   build-wall-seed.sh      WALL PANEL seed ISO (§11) — the second image target, SR-017

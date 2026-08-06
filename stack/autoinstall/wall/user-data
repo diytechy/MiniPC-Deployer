@@ -38,9 +38,16 @@ autoinstall:
     layout: us
 
   # ── Network: Wi-Fi only ─────────────────────────────────────────────────────
-  # The installer needs the network for apt, so the SSID/PSK are substituted into
-  # THIS block too (the same wall.env values wall-firstboot.sh renders netplan
-  # from). Two hardware-driven settings, both from quirk 5:
+  # THE INSTALLER NO LONGER NEEDS THIS (2026-08-06). It used to: apt ran against
+  # the Ubuntu archive during `packages:`, so a panel whose Wi-Fi did not
+  # associate installed nothing and said so three steps downstream. `packages:`
+  # is now empty and every deb comes off the payload (see ./packages.list and
+  # late-command 3c), so this block exists for the RUNNING panel — the kiosk
+  # origin, the media shares, SSH — and an install can complete on a bench with
+  # no AP in range. The SSID/PSK are still substituted here because the panel
+  # needs them the moment it reboots.
+  #
+  # Two hardware-driven settings, both from quirk 5:
   #   - `wifis`, because the panel has no Ethernet port.
   #   - MAC randomization OFF. The live boot showed it ON by default, which
   #     breaks anything keyed to the real MAC — including AP-side filtering.
@@ -98,8 +105,15 @@ autoinstall:
     # (wall-firstboot.sh writes the getty drop-in), which needs no password.
     password: "!"
 
+  # install-server: FALSE, AND SSHD IS STILL INSTALLED — the hub's user-data
+  # carries the full argument. In short: `install-server: true` adds
+  # openssh-server to the SAME pre-late-command apt run `packages:` uses, which
+  # is the run that has no baked repo to draw on. openssh-server is in
+  # ./packages.list and is installed offline by late-command 3c, which also
+  # enables ssh.service. authorized-keys and allow-pw are unaffected: subiquity
+  # applies both through the target's cloud-init user config.
   ssh:
-    install-server: true
+    install-server: false
     allow-pw: false
     authorized-keys:
       # REPLACE with your real public key(s). allow-pw:false means the panel is
@@ -128,84 +142,31 @@ autoinstall:
       match:
         model: KINGSTON*RBU-SNS8152S3256GG2
 
-  packages:
-    - ca-certificates
-    - curl
-    - cage                 # single-surface Wayland kiosk compositor (the session)
-    - seatd                # seat management fallback if the logind seat path fails
-    - xdg-utils
-    - fonts-dejavu-core
-    - util-linux           # rtcwake — the PRIMARY wake source (D-W4)
-    - network-manager      # quirk 5: powersave off, and the netplan renderer
-    # ---- the media sync (OI-15): the panel PULLS, so it needs a cifs client ---
-    - cifs-utils           # mount.cifs — the read-only mount of the media share
-    - rsync                # the mirror itself (`rsync -a --delete`)
-    - python3              # wall-media-manifest.py (JSON escaping, not bash).
-                           # Present anyway (cloud-init needs it); listed so the
-                           # dependency is explicit rather than inherited by luck.
-    - alsa-utils           # audio sink pinning (WSN-012 lives in the app's runbook)
-    - pulseaudio-utils
-    - va-driver-all        # VA-API decode; quirk 6 says PROVE it is engaged
-    - vainfo
-    # grim — screenshot the RUNNING kiosk over SSH, from inside the compositor:
-    #   sudo -u panel env XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 grim /tmp/panel.png
-    # The panel is on a wall, often asleep, and hard to photograph; "send me a
-    # picture of what it is showing" is otherwise a trip across the office. It is
-    # also the ONLY way to see a cage session on real hardware — /dev/fb0 is the
-    # text console underneath and shows nothing once cage takes over KMS, and
-    # Hyper-V's thumbnail API does not exist off a VM. ~50 KB, wlr-screencopy.
-    - grim
-    - unattended-upgrades  # same hands-off patching posture as the AWOW
-    - openssh-server
-    # ---- the Electron runtime's shared libraries (IF-005 / PKG-1) -----------
-    # The shell artifact ships its own Electron binary but NOT the ~24 system
-    # libraries it links against — those are the image's job. Every name below
-    # is derived from the shipped binary's own DT_NEEDED list and is enforced:
-    # ./electron-runtime-deps.tsv maps soname -> package, and the wall builder
-    # (vmtest/lib/common.sh assert_electron_runtime_deps) refuses to bake an
-    # artifact whose dependencies are not all covered here. Do not prune this
-    # list by eye — a missing library is a BLACK WALL, not an error message:
-    # Electron exits before painting, wall-kiosk.sh restarts it every 3 s, and
-    # `[ -x ]` stays true so the NOT INSTALLED screen never fires either.
-    # The `t64` suffixes are 24.04's 64-bit-time_t renames; the old names do
-    # not exist in noble and apt would fail the install outright.
-    - libx11-6
-    - libxcomposite1
-    - libxdamage1
-    - libxext6
-    - libxfixes3
-    - libxrandr2
-    - libasound2t64
-    - libatk1.0-0t64
-    - libatk-bridge2.0-0t64
-    - libatspi2.0-0t64
-    - libcairo2
-    - libcups2t64
-    - libdbus-1-3
-    - libexpat1
-    - libgbm1
-    - libglib2.0-0t64
-    - libgtk-3-0t64
-    - libnspr4
-    - libnss3
-    - libpango-1.0-0
-    - libudev1
-    - libxcb1
-    - libxkbcommon0
+  # EMPTY, DELIBERATELY AND PERMANENTLY (2026-08-06). The list moved to
+  # ./packages.list; late-command 3c installs it from a repo of frozen .debs
+  # carried on the payload, so the install needs no network at all — which on
+  # this image also means it needs no ASSOCIATED Wi-Fi.
+  #
+  # The hub's ../user-data carries the full argument for why not one name may
+  # stay here. Short version: `packages:` runs during curtin's install step,
+  # before any late-command, so no local apt source can serve it; every entry is
+  # one more thing the install fetches from the archive, and fetching from the
+  # archive at all is the failure. On this image it would additionally be the
+  # ONE thing that still made an install depend on a radio.
+  #
+  # The Electron runtime's ~24 shared libraries moved with the rest, and the
+  # checks that guard them moved too: assert_electron_runtime_deps and
+  # test-wall-artifact.sh both read packages.list now. A soname that maps to a
+  # package missing from that file still fails the BUILD, with the soname named.
+  packages: []
 
+  # THE ORDER CHANGED ON 2026-08-06, for the reason the hub's did: sections 1
+  # and 2 configured packages that had not been installed yet under the new
+  # scheme. Everything that needs an installed package now runs after 3c, which
+  # installs from the repo the payload carries — so it cannot run before step 3
+  # has put the payload on the target. Sections 1 and 2 are gone rather than
+  # renumbered, so 3, 3a, 3b, 4a, 4, 5 and 7 keep their identities.
   late-commands:
-    # ---- 1. Remote management (lighter than the AWOW's: no Cockpit) -----------
-    # A panel is reimage-not-repair, so it gets SSH + unattended-upgrades and
-    # deliberately NOT Cockpit — one less always-listening web surface on a box
-    # that is asleep half the time anyway.
-    - curtin in-target --target=/target -- bash -c 'echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections'
-    - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
-    - curtin in-target --target=/target -- systemctl enable unattended-upgrades
-
-    # ---- 2. Lighten the image ------------------------------------------------
-    # Nothing here uses snaps, and this is a 2016 U-class machine behind a wall.
-    - curtin in-target --target=/target -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd 2>/dev/null || true; apt-get autoremove -y --purge'
-
     # ---- 3. Place the payload ------------------------------------------------
     # The build step copies the repo tree (plus the shell artifact) into
     # deploy-payload/, and it must land under /opt/wall-panel/ — the wall
@@ -240,6 +201,7 @@ autoinstall:
       umount "$m"; fi; fi;
       echo "wall: FATAL - no deploy-payload found. Looked under /cdrom, /media, /run/media/* and on the CIDATA volume ($dev).";
       echo "wall: the seed ISO carries it at its root; on the light path nothing mounts that volume for you.";
+      echo "wall: since 2026-08-06 the payload also carries the BAKED APT REPO - packages: is empty, so without it this panel installs no openssh-server and no cage.";
       exit 1'
 
     # ---- 3a. Decide the payload's PERMISSIONS --------------------------------
@@ -313,6 +275,51 @@ autoinstall:
       [ -x /target/opt/wall-panel/app/wall-shell ] || { echo "wall: FATAL - unpacked but app/wall-shell is not executable"; exit 1; };
       [ -u /target/opt/wall-panel/app/runtime/chrome-sandbox ] || { echo "wall: FATAL - chrome-sandbox lost its setuid bit; Electron will refuse to start"; exit 1; };
       echo "wall: shell installed - $(cat /target/opt/wall-panel/app/VERSION 2>/dev/null)"'
+
+    # ---- 3c. INSTALL EVERY PACKAGE, FROM THE PAYLOAD, WITH NO NETWORK --------
+    # Identical in mechanism to the hub's 3c and identical in wording where it
+    # can be — see ../user-data for the full reasoning (why the repo is a local
+    # path inside the target, why the list is the exporter's own record, and why
+    # nothing is written to /etc/apt). What differs is only the payload root.
+    #
+    # IT MATTERS MORE HERE. The panel's ONLY network was Wi-Fi, and a Wi-Fi
+    # association at install time is the least reliable thing in this project —
+    # it is also the one thing the VM lab can never test (Hyper-V has no
+    # synthetic 802.11 device). An install that needs no network needs no radio,
+    # so the gap between what the lab proves and what the bench does just closed
+    # by the width of the whole apt phase.
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      R=/opt/wall-panel;
+      [ -s "$R/apt/Packages" ] || { echo "wall: FATAL - no baked apt repo at $R/apt (no Packages index)."; echo "wall: packages: is empty by design, so this install would produce a panel with no cage, no shell libraries and no sshd. Refusing."; exit 1; };
+      [ -s "$R/apt/packages.baked.list" ] || { echo "wall: FATAL - $R/apt carries no packages.baked.list, so nothing here knows what to install."; exit 1; };
+      mkdir -p /run/baked-apt/parts;
+      echo "deb [trusted=yes] file://$R/apt ./" > /run/baked-apt/sources.list;
+      APT="-o Dir::Etc::sourcelist=/run/baked-apt/sources.list -o Dir::Etc::sourceparts=/run/baked-apt/parts -o APT::Get::List-Cleanup=0";
+      export DEBIAN_FRONTEND=noninteractive;
+      apt-get $APT update;
+      xargs -a "$R/apt/packages.baked.list" apt-get $APT install -y --no-install-recommends;
+      echo "wall: installed $(wc -l < "$R/apt/packages.baked.list") package(s) from the baked repo, with no network at all"'
+    # sshd is the panel's ONLY door once it is on a wall: tty1 autologins into
+    # cage, the console password is locked, and the machine is out of reach. A
+    # unit that is installed but not enabled is a service that does not exist,
+    # and curtin runs the chroot behind a policy-rc.d, so this is explicit.
+    - curtin in-target --target=/target -- systemctl enable ssh
+
+    # ---- 3d. Remote management (lighter than the AWOW's: no Cockpit) ---------
+    # A panel is reimage-not-repair, so it gets SSH + unattended-upgrades and
+    # deliberately NOT Cockpit — one less always-listening web surface on a box
+    # that is asleep half the time anyway. unattended-upgrades is also what
+    # catches the panel up on whatever the frozen debs are behind on, the first
+    # time it associates.
+    - curtin in-target --target=/target -- bash -c 'echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections'
+    - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
+    - curtin in-target --target=/target -- systemctl enable unattended-upgrades
+
+    # ---- 3e. Lighten the image ----------------------------------------------
+    # Nothing here uses snaps, and this is a 2016 U-class machine behind a wall.
+    # Purge and autoremove are local dpkg/apt operations and need no network.
+    - curtin in-target --target=/target -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd 2>/dev/null || true; apt-get autoremove -y --purge'
 
     # ---- 4a. Install a pre-filled wall.env if the payload carries one --------
     # The PRODUCTION/SIM seam, same shape as the hub image's site/ directory:
@@ -471,10 +478,23 @@ autoinstall:
     # matters more here, not less: this machine is wall-mounted with no
     # keyboard, so "boots but is incomplete" is the most expensive possible
     # outcome. Caught before the reboot, or not at all until it is on a wall.
+    #
+    # THE PAYLOAD ROOT IS /opt/wall-panel, and this block said /opt/homehub
+    # until 2026-08-06 - copied from the hub's step 6 and never re-read. A path
+    # this image NEVER creates cannot be missing on purpose, so the check could
+    # only ever fail; it had not been reached yet because the failure it guards
+    # comes after a payload copy that has never run on real panel hardware. Both
+    # heads of the same copy-paste are fixed together: vmtest/assert-installed.sh
+    # asked for the same wrong path.
+    #
+    # The package loop is the hub's, for the hub's reason: cage, the ~24 Electron
+    # libraries and openssh-server are the panel's whole reason to exist, and a
+    # missing one of them is a black wall or a locked-out machine rather than an
+    # error message.
     - |
       curtin in-target --target=/target -- bash -c '
         missing=""
-        for p in /opt/homehub /usr/sbin/sshd \
+        for p in /opt/wall-panel /usr/sbin/sshd \
                  /etc/systemd/system/wall-firstboot.service; do
           [ -e "$p" ] || missing="$missing $p"
         done
@@ -483,7 +503,24 @@ autoinstall:
           echo "wall: refusing to reboot into a panel that looks installed and is not." >&2
           exit 1
         fi
-        echo "wall: install completeness check passed."
+        L=/opt/wall-panel/apt/packages.baked.list
+        if [ ! -s "$L" ]; then
+          echo "wall: FATAL - $L is absent, so late-command 3c cannot have installed anything." >&2
+          exit 1
+        fi
+        notinst=""
+        while read -r pkg; do
+          [ -n "$pkg" ] || continue
+          dpkg-query -W -f=\${Status} "$pkg" 2>/dev/null | grep -q "^install ok installed$" \
+            || notinst="$notinst $pkg"
+        done < "$L"
+        if [ -n "$notinst" ]; then
+          echo "wall: FATAL - the baked repo did not install:$notinst" >&2
+          echo "wall: a missing Electron library is a BLACK WALL with no message on it, and a missing" >&2
+          echo "wall: openssh-server is a wall-mounted machine with no way in. Refusing to reboot." >&2
+          exit 1
+        fi
+        echo "wall: install completeness check passed ($(wc -l < "$L") baked package(s) installed)."
       '
 
   # ── If the install does not run, SAY WHY, on the console (2026-08-06) ──────

@@ -69,6 +69,8 @@ REPO_ROOT="$(repo_root)"
 # `rm -rf $OUT_DIR` — silently deleted this build's ISO, SSH key and SIM
 # credentials. Both are gitignored, so neither ends up in the other's payload.
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/vmtest/.out-wall}"
+# 2026-08-06: where export-apt.sh put the baked .debs (its default for wall).
+APT_OUT="${APT_OUT:-$REPO_ROOT/vmtest/.out-wall/apt}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -91,6 +93,14 @@ render_wall_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-wall-seed.sh"
 # is absent — an image without it boots to the NOT INSTALLED screen, which is
 # right on real hardware and useless as a gate.
 stage_wall_shell_into_payload "$OUT_DIR" "$REPO_ROOT"
+
+# 2026-08-06: the baked apt repo. `packages:` is empty in the shipped user-data,
+# so this is where cage, the Electron runtime libraries and openssh-server come
+# from. It also means a panel install needs no ASSOCIATED Wi-Fi — the one thing
+# on this image that could never be tested in a VM. REFUSES rather than warns;
+# ALLOW_MISSING_APT=1 opts out, loudly.
+#   bash vmtest/export-apt.sh --target wall --out vmtest/.out-wall/apt
+stage_apt_into_payload "$OUT_DIR" "$APT_OUT" wall
 
 # The panel's payload has the SAME exposure the hub's did (2026-08-04):
 # /opt/wall-panel is populated by the same `cp -a` out of the same kind of

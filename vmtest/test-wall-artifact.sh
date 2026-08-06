@@ -52,13 +52,16 @@ ls "$DIST"/officewall-shell-*-linux-x64.tar.gz >/dev/null 2>&1 || {
 # The package list is READ OUT OF THE IMAGE DEFINITION, never retyped here.
 # A copy would drift, and a drifted copy would prove the wrong thing while
 # looking like proof.
-PKGS="$(awk '
-    /^  packages:/            { inpkgs = 1; next }
-    inpkgs && /^  [^ ]/       { inpkgs = 0 }
-    inpkgs && /^[[:space:]]*-[[:space:]]/ {
-        sub(/^[[:space:]]*-[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); print
-    }' "$REPO_ROOT/stack/autoinstall/wall/user-data" | tr '\n' ' ')"
-[ -n "$PKGS" ] || { echo "could not read a packages: list out of the wall user-data" >&2; exit 1; }
+#
+# THE DEFINITION MOVED ON 2026-08-06: `packages:` in the user-data is empty (it
+# runs before any late-command, so the baked offline repo cannot serve it) and
+# the names live in stack/autoinstall/wall/packages.list, which export-apt.sh
+# resolves and late-command 3c installs. Parsing the user-data here would now
+# find nothing and this check would install nothing and pass.
+PKG_LIST="$REPO_ROOT/stack/autoinstall/wall/packages.list"
+[ -f "$PKG_LIST" ] || { echo "not found: $PKG_LIST" >&2; exit 1; }
+PKGS="$(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if (length($0)) print }' "$PKG_LIST" | tr '\n' ' ')"
+[ -n "$PKGS" ] || { echo "no package names could be parsed out of $PKG_LIST" >&2; exit 1; }
 
 echo "base image: $IMAGE"
 echo "artifact:   $(basename "$(ls "$DIST"/officewall-shell-*-linux-x64.tar.gz | head -n1)")"
@@ -101,8 +104,9 @@ echo "--- ldd on the Electron runtime ---"
 missing=$(ldd /opt/wall-panel/app/runtime/electron 2>/dev/null | awk "/not found/ {print \$1}" | sort -u)
 if [ -n "$missing" ]; then
     echo "FAIL  the package list is INCOMPLETE. Missing:"; printf "        %s\n" $missing
-    echo "      Add each to stack/autoinstall/wall/electron-runtime-deps.tsv and the"
-    echo "      packages: list in stack/autoinstall/wall/user-data."
+    echo "      Add each to stack/autoinstall/wall/electron-runtime-deps.tsv and to"
+    echo "      stack/autoinstall/wall/packages.list, then re-bake the offline repo:"
+    echo "        bash vmtest/export-apt.sh --target wall --out vmtest/.out-wall/apt"
     rc=1
 else
     echo "ok    every library the Electron runtime needs resolves"

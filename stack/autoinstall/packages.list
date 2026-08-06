@@ -1,0 +1,78 @@
+# stack/autoinstall/packages.list — every package the HUB image installs.
+#
+# THIS FILE IS THE ONE PLACE THE LIST EXISTS. Four things read it and none of
+# them retypes it:
+#
+#   vmtest/export-apt.sh          resolves this closure into a baked apt repo
+#   user-data late-command 3c     `apt-get install` reads THIS FILE off the
+#                                 payload at /opt/homehub/stack/autoinstall/
+#   vmtest/assert-installed.sh    asserts every name here is installed, ON the
+#                                 booted box
+#   scripts/validate_config.py    cross-checks the runtime-dependency tables
+#
+# WHY IT IS NOT `packages:` ANY MORE (2026-08-06). autoinstall's `packages:`
+# runs during curtin's install step, BEFORE any late-command — so no local apt
+# source a late-command could add is available to it, and every entry left
+# there is one more thing the install reaches for the archive to satisfy. On
+# 2026-08-06 that killed a production install on the real hub: no network when
+# apt ran, `cockpit` died with exit 100, subiquity errored, late-commands never
+# ran, and the box rebooted as a bare Ubuntu with no sshd and a locked console
+# account. Recovery took `init=/bin/bash` from GRUB.
+#
+# `packages:` is now EMPTY, deliberately and permanently, and everything below
+# is installed from the repo baked into the payload. Putting even ONE name back
+# there reintroduces the whole failure: the install would reach for the archive
+# again, and it would die there first, before any of this ran.
+#
+# FORMAT: one package per line. `#` starts a comment, to end of line. Blank
+# lines ignored. Nothing else — every reader parses it with the same three
+# rules, in awk, sed, bash and python respectively.
+#
+# REBUILD THE BAKED REPO WHEN YOU CHANGE THIS FILE. The debs are frozen at
+# export time (`bash vmtest/export-apt.sh --target hub --out .out/apt`), and a
+# name added here without a re-export is a name the offline install cannot
+# resolve. export-apt.sh proves the closure offline before it ships it, so the
+# failure is a refused build rather than a refused install.
+
+# ── the base the stack and the operator need ────────────────────────────────
+ca-certificates
+curl
+git
+dnsutils              # provides dig for the health check
+apt-transport-https
+
+# ── remote management (WI-10.12) ────────────────────────────────────────────
+# openssh-server USED TO COME FROM `ssh: install-server: true`, which is also an
+# apt install and also died on 2026-08-06 — leaving a box with a locked console
+# password and no sshd, i.e. no way in at all. install-server is now `false` and
+# this is the explicit, baked replacement. Do not put it back: install-server
+# runs at the same pre-late-command moment `packages:` does.
+openssh-server
+cockpit               # LAN web console (terminal/logs/updates/reboot)
+unattended-upgrades   # hands-off OS security patching
+
+# ── power and disks ─────────────────────────────────────────────────────────
+powertop              # low-power auto-tune, applied per boot by powertune.service
+hdparm                # backup-drive spin-down (WI-10.10)
+
+# ── the household file server (A14) — shares come from storage-map §3 ───────
+samba
+samba-common-bin      # smbpasswd/pdbedit for the per-account passwords (A13)
+
+# ── the Docker engine ───────────────────────────────────────────────────────
+# THESE COME FROM download.docker.com, NOT THE UBUNTU ARCHIVE, and that is the
+# one thing about this list a reader has to know. export-apt.sh notices
+# `docker-ce` here and adds Docker's apt source to its resolver container for
+# the duration of the resolve; the resulting debs are baked exactly like the
+# archive ones, so the INSTALL needs neither the archive nor Docker's CDN.
+#
+# They used to be installed by three late-commands that fetched Docker's GPG key
+# and wrote /etc/apt/sources.list.d/docker.list on the target. Those are gone.
+# The absence of /etc/apt/keyrings/docker.asc on the 2026-08-06 box is what
+# located that failure EARLIER than late-commands — a diagnosis this list makes
+# permanently unavailable, because the key is no longer part of an install.
+docker-ce
+docker-ce-cli
+containerd.io
+docker-buildx-plugin
+docker-compose-plugin

@@ -26,23 +26,31 @@
 # Output: one PASS/FAIL line per check, non-zero exit if any FAILed. Same shape
 # as healthcheck.sh so a caller can treat them identically.
 #
-# Usage:  assert-installed.sh [--target hub|wall] [--seed PATH]
-#   --seed  the user-data to read the expected package list out of. Defaults to
-#           the copy subiquity saved on the target. Explained at check 3.
+# Usage:  assert-installed.sh [--target hub|wall] [--packages PATH]
+#   --packages  the list of package names to assert. Defaults to the one the
+#               install itself used, on the payload. Explained at check 3.
 
 set -uo pipefail
 
 TARGET="hub"
-SEED=""
+PKG_LIST=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --target) TARGET="$2"; shift 2 ;;
-        --seed)   SEED="$2";   shift 2 ;;
+        --target)   TARGET="$2";   shift 2 ;;
+        --packages) PKG_LIST="$2"; shift 2 ;;
+        # Refused, not ignored — see check 3. A --seed that silently did nothing
+        # would turn "every package is installed" into a check of nothing.
+        --seed) echo "--seed is gone: the package list moved out of the user-data's 'packages:' (empty since 2026-08-06) and into the baked repo's packages.baked.list. Use --packages <path>." >&2; exit 2 ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown argument '$1'" >&2; exit 2 ;;
     esac
 done
 case "$TARGET" in hub|wall) ;; *) echo "--target must be hub or wall" >&2; exit 2 ;; esac
+
+# The payload root differs by image, and getting it wrong is not hypothetical:
+# this script asked for /opt/homehub on a WALL panel until 2026-08-06 — copied
+# from the hub branch, and a path the wall image never creates.
+if [ "$TARGET" = wall ]; then PAYLOAD_ROOT=/opt/wall-panel; else PAYLOAD_ROOT=/opt/homehub; fi
 
 FAILED=0
 pass() { printf 'PASS  %s\n' "$*"; }
@@ -74,26 +82,38 @@ fi
 
 # ── 2. the artifacts the install is supposed to leave ───────────────────────
 if [ "$TARGET" = wall ]; then
-    REQUIRED="/opt/homehub /usr/sbin/sshd /etc/systemd/system/wall-firstboot.service"
+    REQUIRED="$PAYLOAD_ROOT /usr/sbin/sshd /etc/systemd/system/wall-firstboot.service"
 else
-    REQUIRED="/opt/homehub /usr/sbin/sshd /usr/bin/docker /etc/systemd/system/homehub-firstboot.service"
+    REQUIRED="$PAYLOAD_ROOT /usr/sbin/sshd /usr/bin/docker /etc/systemd/system/homehub-firstboot.service"
 fi
 for p in $REQUIRED; do
     if [ -e "$p" ]; then pass "present: $p"; else fail "MISSING: $p"; fi
 done
 
 # ── 3. every package the image asked for ────────────────────────────────────
-# READ OUT OF THE SEED, NEVER RETYPED. The same discipline as
-# test-wall-artifact.sh, and for the same reason: a hand-copied list silently
-# stops testing whatever was added to the image last week. If the seed is gone
-# check 1 has already failed and said why, so this degrades to a note rather
-# than piling a second failure onto one cause.
-[ -n "$SEED" ] || SEED=/var/log/installer/autoinstall-user-data
-if [ -f "$SEED" ]; then
-    PKGS="$(sed -n '/^  packages:/,/^  [a-z_-]*:/p' "$SEED" \
-            | sed -n 's/^    -[[:space:]]*\([a-zA-Z0-9][a-zA-Z0-9.+-]*\).*/\1/p')"
+# READ OFF THE BOX, NEVER RETYPED. Same discipline as before and the same
+# reason — a hand-copied list silently stops testing whatever was added to the
+# image last week — but the SOURCE changed on 2026-08-06.
+#
+# It used to parse `packages:` out of the seed subiquity saved at
+# /var/log/installer/autoinstall-user-data. That key is now empty on both
+# images: it runs before any late-command, so a baked apt repo cannot serve it,
+# and every entry left there is one more thing the install fetches from the
+# archive. Parsing it now would find nothing and this check would pass while
+# asserting NOTHING — the shape this whole file exists to argue against.
+#
+# packages.baked.list is the exporter's own record of what it resolved into the
+# repo the install used, it rides the payload beside the .debs, and
+# stage_apt_into_payload refuses to build an ISO whose copy disagrees with the
+# tracked stack/autoinstall[/wall]/packages.list. So it is both what was MEANT
+# and what was ASKED FOR, on the machine, with nothing retyped.
+[ -n "$PKG_LIST" ] || PKG_LIST="$PAYLOAD_ROOT/apt/packages.baked.list"
+if [ -f "$PKG_LIST" ]; then
+    # The same three rules the builders and the late-command use: strip from
+    # `#`, strip whitespace, drop what is left if empty.
+    PKGS="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$PKG_LIST" | grep -v '^$')"
     if [ -z "$PKGS" ]; then
-        fail "no packages: list could be parsed out of $SEED"
+        fail "no package names could be parsed out of $PKG_LIST"
     else
         for pkg in $PKGS; do
             if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
@@ -104,7 +124,13 @@ if [ -f "$SEED" ]; then
         done
     fi
 else
-    note "skipped package check: no seed at $SEED (check 1 already reports why)"
+    # NOT a note. The old version degraded to a note when the seed was missing,
+    # because check 1 had already failed and named the cause. This file's absence
+    # has a different meaning: the payload — and therefore the apt repo the whole
+    # install depends on — never landed, so NOTHING was installed. That is the
+    # 2026-08-06 machine, and it must not read as "check skipped".
+    fail "no baked package list at $PKG_LIST"
+    note "the payload carries it beside the .debs; without it the install had no repo to install from"
 fi
 
 # ── 4. the container images the box is supposed to run offline ─────────────
@@ -120,8 +146,8 @@ if [ "$TARGET" = hub ]; then
             fail "docker is installed but holds NO images — nothing was loaded from the payload"
         fi
         # Compare against what shipped, when the payload is still there to ask.
-        if [ -d /opt/homehub/images ]; then
-            TARS="$(find /opt/homehub/images -name '*.tar' 2>/dev/null | wc -l)"
+        if [ -d "$PAYLOAD_ROOT/images" ]; then
+            TARS="$(find "$PAYLOAD_ROOT/images" -name '*.tar' 2>/dev/null | wc -l)"
             if [ "$TARS" -gt 0 ] && [ "$COUNT" -lt "$TARS" ]; then
                 fail "$TARS image tar(s) shipped but only $COUNT loaded"
             fi
@@ -165,10 +191,19 @@ fi
 # is indistinguishable from the drive check is green on a wall". The kiosk
 # session is checked here; whether it PAINTS is still a human looking at it.
 if [ "$TARGET" = wall ]; then
-    if [ -x /opt/wall-shell/wall-shell ] || [ -x /opt/homehub/wall-shell/wall-shell ]; then
-        pass "the panel shell binary is installed"
+    # /opt/wall-panel/app/wall-shell — the path late-command 3b untars it to and
+    # the path WALL_APP_CMD names in wall.env, which is the predicate
+    # wall-kiosk.sh tests with [ -x ]. This looked for /opt/wall-shell and
+    # /opt/homehub/wall-shell until 2026-08-06: two paths the wall image has
+    # never created, so the check could only ever fail. Same copy-paste family
+    # as the /opt/homehub in check 2 and in the image's own step 7.
+    if [ -x /opt/wall-panel/app/wall-shell ]; then
+        pass "the panel shell binary is installed (/opt/wall-panel/app/wall-shell)"
+    elif [ -e /opt/wall-panel/wall-app ]; then
+        fail "the shell tarball reached the panel but was never unpacked — late-command 3b did not run"
     else
-        fail "no wall-shell binary — the panel would boot to a blank tty"
+        fail "no wall-shell binary — the panel would boot to the NOT INSTALLED screen"
+        note "an image built with ALLOW_MISSING_SHELL=1 is expected to fail this"
     fi
     if systemctl is-active --quiet wall-kiosk 2>/dev/null || pgrep -f 'cage|wall-shell' >/dev/null 2>&1; then
         pass "a kiosk session is running"

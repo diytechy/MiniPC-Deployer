@@ -39,12 +39,19 @@ autoinstall:
   # DHCP never ran, and the install died fetching `cockpit` with apt exit 100
   # — network failure surfacing as a package error, three steps downstream.
   # `e*` is a strict superset: everything `en*` matched, plus eth*. There is no
-  # case where `en*` is right and `e*` is wrong, and the failure mode it
-  # prevents is an UNATTENDED box that installs with no network at all. That
-  # matters beyond the VM: swap the mini PC for anything presenting eth0 and
-  # `en*` would strand the replacement exactly the same way.
+  # case where `en*` is right and `e*` is wrong.
   # Keeping ONE match for both production and the VM is deliberate — it means
   # the V3 gate actually exercises the config that ships.
+  #
+  # THE COUPLING THAT MADE THAT BUG EXPENSIVE IS GONE (2026-08-06). "netplan
+  # matched nothing" and "the box is empty" were the same event, because the
+  # install fetched every package over this link. It no longer fetches
+  # anything: `packages:` is empty and everything is installed from a repo of
+  # frozen .debs on the payload (see packages.list and late-command 3c). This
+  # match is still worth getting right — a hub nobody can reach is a hub nobody
+  # can reach — but it is no longer load-bearing for the INSTALL, and a
+  # netplan failure now surfaces as a machine with no address rather than as a
+  # bare Ubuntu that reported success.
   network:
     version: 2
     ethernets:
@@ -87,8 +94,24 @@ autoinstall:
     password: "!"
 
   # Remote management is KEY (WI-10.12): SSH on, KEY-ONLY. Paste your PUBLIC key.
+  #
+  # install-server: FALSE, AND SSHD IS STILL INSTALLED — read this before
+  # "fixing" it. `install-server: true` is not a switch that turns sshd on; it
+  # adds `openssh-server` to the SAME apt run `packages:` uses, which happens
+  # during curtin's install step, BEFORE any late-command. On 2026-08-06 that
+  # run had no network, so it died, and the box came up with no sshd AND a
+  # password-locked console account — no way in at all, recovered with
+  # `init=/bin/bash` from GRUB. openssh-server is now in packages.list and is
+  # installed from the baked offline repo by late-command 3c, which also
+  # enables ssh.service.
+  #
+  # authorized-keys AND allow-pw STAY, and they still work: subiquity applies
+  # them through the target's cloud-init user config (99-installer.cfg), which
+  # is independent of install-server. This is the only reason it is safe to
+  # turn install-server off — the keys would otherwise go nowhere and a
+  # key-only box would be unreachable by construction.
   ssh:
-    install-server: true
+    install-server: false
     allow-pw: false
     authorized-keys:
       # REPLACE with your real public key(s). allow-pw:false above means the box
@@ -127,60 +150,38 @@ autoinstall:
       match:
         path: /dev/nvme0n1
 
-  packages:
-    - ca-certificates
-    - curl
-    - git
-    - dnsutils          # provides dig for the health check
-    - apt-transport-https
-    - cockpit           # LAN web console (terminal/logs/updates/reboot) — WI-10.12
-    - unattended-upgrades  # hands-off OS security patching — WI-10.12
-    - powertop          # low-power auto-tune, applied per boot by powertune.service
-    - hdparm            # backup-drive spin-down (WI-10.10) — NOT guaranteed on Ubuntu Server
-    - samba             # household file server (A14) — shares come from storage-map §3
-    - samba-common-bin  # provides smbpasswd/pdbedit for the per-account passwords (A13)
+  # EMPTY, DELIBERATELY AND PERMANENTLY (2026-08-06). The list moved to
+  # ./packages.list; late-command 3c installs it from a repo of frozen .debs
+  # carried on the payload, so the install needs no network at all.
+  #
+  # WHY IT CANNOT BE "EMPTY EXCEPT FOR A COUPLE OF SAFE ONES": `packages:` runs
+  # during curtin's install step, which is BEFORE the first late-command. No
+  # apt source a late-command adds can serve it, so every name left here is one
+  # more thing this install reaches for the Ubuntu archive to satisfy — and
+  # reaching for the archive at all is the failure. On 2026-08-06 the first
+  # casualty was `cockpit` (apt exit 100); subiquity errored, late-commands
+  # never ran, and the real hub rebooted as a bare Ubuntu that reported
+  # success. One entry here is enough to reproduce that exactly.
+  #
+  # ANYTHING ADDED HERE ALSO BYPASSES EVERY GUARD. export-apt.sh resolves
+  # packages.list, assert-installed.sh asserts packages.list, and
+  # stage_apt_into_payload refuses a baked repo that disagrees with
+  # packages.list. A name here is in none of those.
+  packages: []
 
   # Everything site-specific happens in late-commands, which run in the installer
   # environment with the target mounted at /target. We write files INTO /target.
+  #
+  # THE ORDER CHANGED ON 2026-08-06, and the reason is the whole offline change.
+  # Installing packages used to be steps 1 and 2, at the very top, from
+  # download.docker.com and the Ubuntu archive. It is now step 3c, and it CANNOT
+  # move back up: it installs from a repo of .debs that arrives with the payload,
+  # so it has to run after step 3 has put the payload on the target. Everything
+  # that needs an installed package — the Docker config, Cockpit,
+  # unattended-upgrades — moved down with it. Sections 1 and 2 are gone rather
+  # than renumbered so that 3, 3b, 4, 4b, 5 and 6 keep the identities the rest of
+  # this repo refers to them by.
   late-commands:
-    # ---- 1. Install Docker Engine from the official repo (inside the target) --
-    - curtin in-target --target=/target -- bash -c 'install -m 0755 -d /etc/apt/keyrings'
-    - curtin in-target --target=/target -- bash -c 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && chmod a+r /etc/apt/keyrings/docker.asc'
-    - curtin in-target --target=/target -- bash -c 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list'
-    - curtin in-target --target=/target -- bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
-    # Docker log rotation (review 2026-07-10): the default json-file driver grows
-    # unbounded — a slow disk-filler on an always-on box with small eMMC/SSD
-    # (Technitium/Caddy log every query/request). The "local" driver rotates by
-    # default (per-container cap), so one line prevents the failure mode.
-    # YAML: this entry is a FOLDED BLOCK SCALAR (>-), not a plain scalar like
-    # its neighbours, and it has to stay one. The JSON below contains ": "
-    # (colon-space); inside a PLAIN scalar YAML reads that as a mapping key, so
-    # the list item parses as a dict instead of a string and Subiquity rejects
-    # the entire section with "Malformed autoinstall in 'late-commands'
-    # section" — the install dies before it starts. Block scalars take their
-    # content literally, so the colon is harmless. The neighbouring entries get
-    # away with plain scalars only because their colons are in "://" (no
-    # following space). Caught on the first real boot of the V3 gate.
-    - >-
-      curtin in-target --target=/target -- bash -c 'mkdir -p /etc/docker && echo "{ \"log-driver\": \"local\" }" > /etc/docker/daemon.json'
-    - curtin in-target --target=/target -- systemctl enable docker
-    - curtin in-target --target=/target -- usermod -aG docker hub
-
-    # ---- 2. Remote management: Cockpit + unattended-upgrades (WI-10.12) --------
-    # Cockpit web console on :9090 — LAN-only (do NOT proxy it through Caddy to
-    # the public internet). See ../../REMOTE_MANAGEMENT.md.
-    - curtin in-target --target=/target -- systemctl enable cockpit.socket
-    # Enable unattended security upgrades non-interactively.
-    - curtin in-target --target=/target -- bash -c 'echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections'
-    - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
-    - curtin in-target --target=/target -- systemctl enable unattended-upgrades
-
-    # ---- 2b. Low-power lightening (Owner, 2026-07-04) --------------------------
-    # Nothing in the stack uses snaps; snapd costs RAM + background churn on a
-    # low-power box. Purge it. (powertop tuning is applied per-boot by
-    # powertune.service, installed in step 5 — auto-tune does not persist.)
-    - curtin in-target --target=/target -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd 2>/dev/null || true; apt-get autoremove -y --purge'
-
     # ---- 3. Place the stack ---------------------------------------------------
     # The repo payload is copied by the USB-build step to /cdrom/deploy-payload
     # (a second CIDATA stick, or the remastered ISO) and picked up here into
@@ -198,10 +199,19 @@ autoinstall:
     # bug. Found 2026-08-03 by the wall image, which cannot degrade that way.
     # Mount the seed by label as a fallback.
     #
-    # NOT FINDING A PAYLOAD IS STILL NON-FATAL, deliberately, unlike the wall's
-    # copy of this: a hub with no payload has a documented degraded mode
-    # (firstboot.sh step 3 pulls at compose-up). Say so loudly rather than
-    # halting an install that can recover.
+    # NOT FINDING A PAYLOAD IS NOW FATAL, and it was not before 2026-08-06.
+    # The old comment here read: "a hub with no payload has a documented
+    # degraded mode (firstboot.sh step 3 pulls at compose-up), so say so loudly
+    # rather than halting an install that can recover." That was true when the
+    # payload carried only the stack and the container images. It is not true
+    # now: the payload also carries the APT REPO, and `packages:` is empty, so a
+    # box that reaches this point with no payload installs no sshd, no docker
+    # and no cockpit. There is no degraded mode for that — it is precisely the
+    # 2026-08-06 machine, and the only thing that could "recover" it needs a
+    # network to fetch the tools with.
+    #
+    # Step 6 would refuse the install anyway, three steps later, naming four
+    # missing paths and not the cause. Refusing here names the cause.
     #
     # FINDING ONE AND FAILING TO COPY IT IS FATAL, and that is NOT the same
     # thing. Both branches used to read `cp -a … && echo …; exit 0` — and the
@@ -234,9 +244,12 @@ autoinstall:
       echo "homehub: payload copied from the CIDATA seed at $dev";
       exit 0; fi;
       umount "$m" || true; fi; fi;
-      echo "homehub: WARNING - no deploy-payload found under /cdrom, /media, /run/media/* or on the CIDATA volume.";
-      echo "homehub: first boot will PULL every container image from its registry (needs internet), and naglight:local has no registry home.";
-      exit 0'
+      echo "homehub: FATAL - no deploy-payload found under /cdrom, /media, /run/media/* or on the CIDATA volume.";
+      echo "homehub: the payload carries the BAKED APT REPO this image installs every package from - packages: is empty by design (2026-08-06).";
+      echo "homehub: without it late-command 3c installs NOTHING: no openssh-server, no docker, no cockpit. That is the 2026-08-06 machine exactly:";
+      echo "homehub: a box that boots, answers pings, and has no way in. There is no degraded mode for it, and fixing it needs a network to fetch the tools with.";
+      echo "homehub: the seed ISO carries the payload at its root; on the light path nothing mounts that volume for you. Refusing to install.";
+      exit 1'
 
     # ---- 3b. Decide the deploy unit's PERMISSIONS ------------------------------
     # FOUND BY BOOTING, 2026-08-04. The installed gate VM had `drwxrwxrwx
@@ -277,7 +290,7 @@ autoinstall:
     # the same sentence as defect #13's.
     - >-
       bash -c 'R=/target/opt/homehub;
-      if [ ! -d "$R" ]; then echo "homehub: no /opt/homehub to normalise - step 3 found no payload"; exit 0; fi;
+      if [ ! -d "$R" ]; then echo "homehub: FATAL - no $R to normalise, though step 3 reported a copy"; exit 1; fi;
       chown -R 0:0 "$R" || { echo "homehub: FATAL - could not take ownership of $R"; exit 1; };
       chmod -R go-w "$R" || { echo "homehub: FATAL - could not clear group/world write on $R"; exit 1; };
       chmod 0755 "$R";
@@ -293,6 +306,112 @@ autoinstall:
       exit 1;
       fi;
       echo "homehub: /opt/homehub normalised - root-owned, nothing group- or world-writable"'
+
+    # ---- 3c. INSTALL EVERY PACKAGE, FROM THE PAYLOAD, WITH NO NETWORK ---------
+    # THE STEP THIS WHOLE IMAGE WAS REARRANGED FOR (2026-08-06). `packages:` is
+    # empty and `ssh: install-server` is false, so this is where openssh-server,
+    # cockpit, docker-ce, samba and the rest actually arrive. The .debs came in
+    # with the payload at /opt/homehub/apt, resolved and PROVEN offline at build
+    # time by vmtest/export-apt.sh (a second container, --network none, every
+    # archive source deleted, the real list simulated).
+    #
+    # WHY THE REPO IS A LOCAL PATH INSIDE THE TARGET, and not file:///cdrom/...:
+    # whether /cdrom is visible inside the chroot during curtin's package phase
+    # is Ubuntu's business, not ours, and this image is not in a position to
+    # find out on someone's hardware. By late-commands the target filesystem
+    # exists and step 3 has already put the repo INSIDE it, so the question does
+    # not arise. Do not "save the copy" by pointing apt at the boot medium.
+    #
+    # THE LIST IS packages.baked.list, WRITTEN BY THE EXPORTER, and that is
+    # deliberate rather than lazy. It is the exporter's own record of what it
+    # resolved, so this can never ask apt for a name the repo does not carry;
+    # and vmtest/lib/common.sh stage_apt_into_payload refuses to build an ISO
+    # whose baked list disagrees with the tracked stack/autoinstall/packages.list
+    # riding the same payload. Two files, one meaning, checked at build time
+    # where a human can act on it. It also means no comment-stripping parser has
+    # to be written a fourth time, in a folded YAML scalar, in single quotes.
+    #
+    # NOTHING IS WRITTEN TO /etc/apt, and the "what should baked.list look like
+    # afterwards?" question is therefore answered by not creating the problem:
+    # the source line and an empty parts directory live in /run for the duration
+    # of this command, and apt is pointed at them with -o Dir::Etc::*. The
+    # target's own ubuntu.sources is never moved, never disabled and never
+    # restored, so unattended-upgrades tracks the archive normally from first
+    # boot — while THIS apt run cannot touch the network even if there is one.
+    # (Verified in a container: scoped, the update reads only file:/repo and
+    # returns instantly with --network none; unscoped it hangs on DNS.)
+    # APT::Get::List-Cleanup=0 keeps curtin's archive lists, which a scoped
+    # update would otherwise prune as "sources no longer configured".
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      R=/opt/homehub;
+      [ -s "$R/apt/Packages" ] || { echo "homehub: FATAL - no baked apt repo at $R/apt (no Packages index)."; echo "homehub: packages: is empty by design, so this install would produce a bare Ubuntu with no sshd. Refusing."; exit 1; };
+      [ -s "$R/apt/packages.baked.list" ] || { echo "homehub: FATAL - $R/apt carries no packages.baked.list, so nothing here knows what to install."; exit 1; };
+      mkdir -p /run/baked-apt/parts;
+      echo "deb [trusted=yes] file://$R/apt ./" > /run/baked-apt/sources.list;
+      APT="-o Dir::Etc::sourcelist=/run/baked-apt/sources.list -o Dir::Etc::sourceparts=/run/baked-apt/parts -o APT::Get::List-Cleanup=0";
+      export DEBIAN_FRONTEND=noninteractive;
+      apt-get $APT update;
+      xargs -a "$R/apt/packages.baked.list" apt-get $APT install -y --no-install-recommends;
+      echo "homehub: installed $(wc -l < "$R/apt/packages.baked.list") package(s) from the baked repo, with no network at all"'
+    # ENABLE THEM EXPLICITLY. Every one of these is enabled by its own postinst
+    # in an ordinary install, and none of them can be RELIED on to be: curtin
+    # runs the chroot behind a policy-rc.d, and a unit that is merely "installed"
+    # on a headless box is a service that does not exist. sshd most of all —
+    # this account has a locked password, so a box that boots with ssh.service
+    # not enabled has no way in, which is the 2026-08-06 failure reproduced by a
+    # different road.
+    - curtin in-target --target=/target -- systemctl enable ssh
+    # Cockpit web console on :9090 — LAN-only (do NOT proxy it through Caddy to
+    # the public internet). See ../../REMOTE_MANAGEMENT.md.
+    - curtin in-target --target=/target -- systemctl enable cockpit.socket
+
+    # ---- 3d. Docker configuration (the engine came from 3c) -------------------
+    # The three late-commands that used to live at the top of this file — fetch
+    # Docker's GPG key, write /etc/apt/sources.list.d/docker.list, apt-get
+    # install docker-ce — are GONE. docker-ce and its four companions are in
+    # packages.list, export-apt.sh notices them and adds download.docker.com to
+    # its resolver, and the .debs ride the payload like everything else. That
+    # removes the last install-time dependency on Docker's CDN.
+    #
+    # It also removes a diagnostic: /etc/apt/keyrings/docker.asc being ABSENT is
+    # what located the 2026-08-06 failure as earlier than late-commands. Nothing
+    # writes that file any more, so its absence means nothing; assert-installed.sh
+    # and step 6 are what answer that question now.
+    #
+    # Docker log rotation (review 2026-07-10): the default json-file driver grows
+    # unbounded — a slow disk-filler on an always-on box with small eMMC/SSD
+    # (Technitium/Caddy log every query/request). The "local" driver rotates by
+    # default (per-container cap), so one line prevents the failure mode.
+    # YAML: this entry is a FOLDED BLOCK SCALAR (>-), not a plain scalar like
+    # its neighbours, and it has to stay one. The JSON below contains ": "
+    # (colon-space); inside a PLAIN scalar YAML reads that as a mapping key, so
+    # the list item parses as a dict instead of a string and Subiquity rejects
+    # the entire section with "Malformed autoinstall in 'late-commands'
+    # section" — the install dies before it starts. Block scalars take their
+    # content literally, so the colon is harmless. The neighbouring entries get
+    # away with plain scalars only because their colons are in "://" (no
+    # following space). Caught on the first real boot of the V3 gate.
+    - >-
+      curtin in-target --target=/target -- bash -c 'mkdir -p /etc/docker && echo "{ \"log-driver\": \"local\" }" > /etc/docker/daemon.json'
+    - curtin in-target --target=/target -- systemctl enable docker
+    - curtin in-target --target=/target -- usermod -aG docker hub
+
+    # ---- 3e. unattended-upgrades (WI-10.12) -----------------------------------
+    # Enable unattended security upgrades non-interactively. This is also what
+    # catches the box up on everything the FROZEN debs are behind on, the first
+    # time it sees a network — which is the accepted cost of baking them.
+    - curtin in-target --target=/target -- bash -c 'echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections'
+    - curtin in-target --target=/target -- dpkg-reconfigure -f noninteractive unattended-upgrades
+    - curtin in-target --target=/target -- systemctl enable unattended-upgrades
+
+    # ---- 3f. Low-power lightening (Owner, 2026-07-04) -------------------------
+    # Nothing in the stack uses snaps; snapd costs RAM + background churn on a
+    # low-power box. Purge it. (powertop tuning is applied per-boot by
+    # powertune.service, installed in step 5 — auto-tune does not persist.)
+    # Purge and autoremove are local dpkg/apt operations and need no network,
+    # which is why this can stay where it always was in the sequence.
+    - curtin in-target --target=/target -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get purge -y snapd 2>/dev/null || true; apt-get autoremove -y --purge'
 
     # ---- 4. Seed .env from the example if the operator did not pre-fill one ----
     - curtin in-target --target=/target -- bash -c '[ -f /opt/homehub/stack/.env ] || cp /opt/homehub/stack/.env.example /opt/homehub/stack/.env'
@@ -454,6 +573,14 @@ autoinstall:
     # the install still reboots green. That case is caught after boot instead,
     # by vmtest/assert-installed.sh. The two layers exist because neither
     # covers the other.
+    #
+    # IT NOW CHECKS THE PACKAGES TOO, one dpkg-query per name in the baked list,
+    # and that is not redundant with the four paths above. Those four are a
+    # sample chosen because they were the visible casualties; the list is the
+    # actual claim the offline install makes. A repo missing one deb installs
+    # everything else and leaves, say, `hdparm` absent — invisible in a path
+    # check, invisible on a headless box, and a build-time refusal is no longer
+    # available because the ISO is already written. Cheap: ~40 dpkg-query calls.
     - |
       curtin in-target --target=/target -- bash -c '
         missing=""
@@ -466,7 +593,24 @@ autoinstall:
           echo "homehub: refusing to reboot into a box that looks installed and is not." >&2
           exit 1
         fi
-        echo "homehub: install completeness check passed."
+        L=/opt/homehub/apt/packages.baked.list
+        if [ ! -s "$L" ]; then
+          echo "homehub: FATAL - $L is absent, so late-command 3c cannot have installed anything." >&2
+          exit 1
+        fi
+        notinst=""
+        while read -r pkg; do
+          [ -n "$pkg" ] || continue
+          dpkg-query -W -f=\${Status} "$pkg" 2>/dev/null | grep -q "^install ok installed$" \
+            || notinst="$notinst $pkg"
+        done < "$L"
+        if [ -n "$notinst" ]; then
+          echo "homehub: FATAL - the baked repo did not install:$notinst" >&2
+          echo "homehub: every one of those is in packages.list and was proven resolvable offline at build time," >&2
+          echo "homehub: so the payload and the repo that was baked have drifted apart. Refusing to reboot." >&2
+          exit 1
+        fi
+        echo "homehub: install completeness check passed ($(wc -l < "$L") baked package(s) installed)."
       '
 
   # ── If the install does not run, SAY WHY, on the console (2026-08-06) ──────

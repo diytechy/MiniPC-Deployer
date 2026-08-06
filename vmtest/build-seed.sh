@@ -56,6 +56,8 @@ REPO_ROOT="$(repo_root)"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/vmtest/.out}"
 # Q10.9 B+: where export-images.sh put the docker-save tars (its default).
 IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
+# 2026-08-06: where export-apt.sh put the baked .debs (its default for hub).
+APT_OUT="${APT_OUT:-$REPO_ROOT/vmtest/.out/apt}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -85,6 +87,14 @@ stage_images_into_payload "$OUT_DIR" "$IMAGES_OUT"
 # OfficeWallNaglight's build belongs in THIS image, not the panel's. Absent is
 # tolerated: a checkout without that private sibling still builds a hub.
 stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
+
+# 2026-08-06: the baked apt repo. `packages:` is empty in the shipped user-data,
+# so this is where openssh-server, cockpit, docker-ce and the rest come from —
+# and a seed built without it produces the 2026-08-06 machine exactly. Unlike
+# the images stager this REFUSES rather than warns; ALLOW_MISSING_APT=1 opts
+# out, loudly, for exercising the seed machinery alone.
+#   bash vmtest/export-apt.sh --target hub --out vmtest/.out/apt
+stage_apt_into_payload "$OUT_DIR" "$APT_OUT" hub
 
 # LAST, after every stager: the payload's permissions are decided here, not
 # inherited from whatever filesystem this ran on. Booting the gate VM on

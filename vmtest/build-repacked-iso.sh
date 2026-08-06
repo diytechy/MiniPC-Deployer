@@ -76,8 +76,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 case "$TARGET" in
-    hub)  DEFAULT_OUT="$REPO_ROOT/vmtest/.out";      ISO_NAME="repacked.iso";      DEFAULT_VOLID="HOMEHUB" ;;
-    wall) DEFAULT_OUT="$REPO_ROOT/vmtest/.out-wall"; ISO_NAME="wall-repacked.iso"; DEFAULT_VOLID="WALLPANEL" ;;
+    hub)  DEFAULT_OUT="$REPO_ROOT/vmtest/.out";      ISO_NAME="repacked.iso";      DEFAULT_VOLID="HOMEHUB";  DEFAULT_APT_OUT="$REPO_ROOT/vmtest/.out/apt" ;;
+    wall) DEFAULT_OUT="$REPO_ROOT/vmtest/.out-wall"; ISO_NAME="wall-repacked.iso"; DEFAULT_VOLID="WALLPANEL"; DEFAULT_APT_OUT="$REPO_ROOT/vmtest/.out-wall/apt" ;;
     *)    die "--target must be 'hub' or 'wall' (got '$TARGET')" ;;
 esac
 
@@ -113,13 +113,25 @@ esac
 OUT_DIR="${OUT_DIR:-$DEFAULT_OUT}"
 # Q10.9 B+: where export-images.sh put the docker-save tars (its default).
 IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
+# 2026-08-06: where export-apt.sh put the baked .debs (its documented default,
+# per target). NOT under $OUT_DIR: a production build points OUT_DIR at
+# D:\vmtest-out-hub-prod, and the repo is an INPUT to that build, not an output
+# of it — resolving it there would re-bake ~180 MB of debs for every ISO.
+APT_OUT="${APT_OUT:-$DEFAULT_APT_OUT}"
 
 [ -n "$SRC_ISO" ] || die "need --src-iso /path/to/ubuntu-24.04.x-live-server-amd64.iso (see vmtest/README.md for the download URL + SHA256)"
 [ -f "$SRC_ISO" ] || die "not found: $SRC_ISO"
 
 require_cmd xorriso "Install with: sudo apt-get install -y xorriso"
 
-require_free_gb "$(dirname "$OUT_DIR")" 10  # source (~3.5GB) + output (~3.5GB + ~1GB Q10.9 B+ images) + margin
+# source (~3.5GB) + output (~3.5GB + ~1GB Q10.9 B+ images + ~0.2GB baked debs)
+# + margin. CONFIRMED rather than assumed when the apt repo was added
+# (2026-08-06): measured 224 debs / 176 MB for the hub and 340 / 129 MB for the
+# wall, staged once into deploy-payload and once into the ISO, so ~0.4 GB of the
+# ~2 GB margin. It still fits, which is why this number did not move — but the
+# margin is now ~1.6 GB and the next payload addition has to be counted, not
+# waved through.
+require_free_gb "$(dirname "$OUT_DIR")" 10
 require_writable_output "$OUT_DIR/$ISO_NAME"
 
 log "computing SHA256 of $SRC_ISO (this reads the whole ~3GB file, takes a bit)"
@@ -151,6 +163,13 @@ else
     # IF-005: the wall kiosk site's document root rides in the same payload dir.
     stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
 fi
+# BOTH TARGETS, and this one is not optional (2026-08-06). `packages:` is empty
+# in both images, so an ISO without the baked apt repo installs nothing at all.
+# stage_apt_into_payload refuses rather than warns, and it also checks the baked
+# repo's stamp against the packages.list riding the same payload — the two must
+# not be able to describe different installs. The same `-map .../deploy-payload`
+# below carries it onto the ISO with no change here.
+stage_apt_into_payload "$OUT_DIR" "$APT_OUT" "$TARGET"
 
 # ── 1b. decide the payload's permissions (2026-08-04) ───────────────────────
 # Both targets, after every stager. See vmtest/lib/common.sh "PAYLOAD MODES":

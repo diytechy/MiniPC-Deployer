@@ -439,5 +439,54 @@ autoinstall:
     # Run it over SSH after the first boot IF firstboot reported s2idle, then
     # re-run the suspend/resume test (WALL-BURN-IN.md §4).
 
+  # ── If the install does not run, SAY WHY, on the console (2026-08-06) ──────
+  # Identical in purpose to the AWOW variant's block, and identical in text on
+  # purpose — the operator standing at a halted machine should not have to
+  # notice which image they booted to read the same diagnosis. See the hub's
+  # user-data for the full reasoning; the short version is that Subiquity's
+  # `Failed to find matching device for {...}` does not say what THIS machine
+  # reports, and the shell it offers cannot be accepted before the box reboots.
+  #
+  # The panel's pin is materialised to a serial from Personal, same as the hub,
+  # so it is read back from the seed rather than written into this public file.
+  error-commands:
+    - |
+      {
+        echo
+        echo "=============================================================="
+        echo " INSTALL DID NOT RUN.  Nothing was written to any disk."
+        echo "=============================================================="
+        echo
+        echo "-- the disk this image expects (its pin, read back from the seed) --"
+        for f in /autoinstall.yaml /cdrom/nocloud/user-data; do
+          [ -f "$f" ] || continue
+          sed -n '/^  storage:/,/^  [a-z]/p' "$f" | grep -E '^ +(serial|model|path|wwn):' && break
+        done
+        echo
+        echo "-- the disks this machine actually reports --"
+        lsblk -dn -o NAME,SIZE,MODEL,SERIAL 2>/dev/null
+        echo
+        echo "-- udev ID_SERIAL per disk (THIS is what 'match: serial' compares) --"
+        for d in /dev/sd? /dev/nvme?n? /dev/mmcblk?; do
+          [ -b "$d" ] || continue
+          echo "   $d  $(udevadm info --query=property --name="$d" 2>/dev/null | sed -n 's/^ID_SERIAL=//p')"
+        done
+        echo
+        echo "If a disk above IS this machine's internal disk, the pin is most"
+        echo "likely the SHORT serial. Subiquity matches udev ID_SERIAL, usually"
+        echo "MODEL_SERIAL_LUN - not the bare serial on the sticker or in lsblk."
+        echo "NOTE: on this panel the internal disk is SATA and enumerates as"
+        echo "sd*, exactly like the USB stick you booted from. Read the sizes."
+        echo
+        echo "TO INSTALL ON THIS MACHINE ANYWAY, now, without rebuilding the ISO:"
+        echo "  reboot, and at the GRUB menu (5 second timeout) choose"
+        echo "    Install - choose target disk manually (unpinned)"
+        echo "  It stops at the storage screen for you to pick and confirm a disk."
+        echo
+        echo "TO LOOK AROUND FIRST: choose 'Diagnostic Shell (no autoinstall)'."
+        echo "=============================================================="
+        echo
+      } > /dev/console 2>&1
+
   # No reboot prompt — straight into the panel.
   shutdown: reboot

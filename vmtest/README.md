@@ -138,6 +138,46 @@ new `/nocloud/` directory (user-data + meta-data) and `/deploy-payload/`
 (the repo copy) added at the ISO root. This is genuinely hands-off from
 power-on — no GRUB edit needed.
 
+**There is one entry that does not autoinstall: `Diagnostic Shell (no
+autoinstall)`, appended last in the menu.** It boots the stock live installer
+with no `autoinstall` and no seed, so nothing is written to disk; from it, Help
+→ *Enter shell*, or Ctrl+Alt+F2, gives you a console. It exists because an
+autoinstall that halts — most often a `storage: match:` disk pin that finds no
+such device — offers "press enter to start a shell" and then reboots out from
+under you before you can answer, leaving no way to ask the machine what it
+actually has. The unattended entry is still index 0 and still what boots when
+nobody touches the keyboard (`set default=0`, asserted at build time); the
+5-second timeout is your window to choose otherwise. First things to run:
+
+```sh
+lsblk -o NAME,SIZE,MODEL,SERIAL
+udevadm info --query=property --name=/dev/nvme0n1 | grep ID_SERIAL
+```
+
+**And one that installs, but asks first: `Install - choose target disk manually
+(unpinned)`.** It boots the same payload and the same credentials from a second
+seed (`/nocloud-confirm/`, generated from the pinned one at build time) whose
+storage section is interactive and carries no `match:`. Subiquity stops at its
+guided-storage screen — every disk with model, serial and size, explicit
+selection, then its own destructive-action confirmation — instead of choosing
+for you. This is the escape hatch for "I am standing at the right machine and
+the pin is wrong": no rebuild, no hand-edited kernel line.
+
+> **It changes what the pin guarantees.** Before, the stick physically could not
+> install anywhere but the pinned machine. Now it can, given one deliberate menu
+> choice inside a 5-second window. That is judged acceptable because the pin was
+> never protecting the *secrets* — the payload is readable by anyone who mounts
+> the ISO — it protects against destroying the wrong machine's disk, which an
+> interactive storage screen addresses directly. If you want the hard lock back,
+> delete the `menuentry` and the `/nocloud-confirm` mapping in
+> `build-repacked-iso.sh`; the build asserts they are consistent, so removing
+> one without the other fails loudly rather than shipping a dead menu line.
+
+The build refuses to produce an ISO where the two seeds differ by anything other
+than the storage selector and `interactive-sections`, so the unpinned entry can
+never quietly become a *different install* — same user, same payload, same
+late-commands, only the disk choice moves.
+
 It does **not** rebuild the ISO's boot catalog from scratch (which is fiddly
 and easy to get subtly wrong for a hybrid BIOS+UEFI ISO). Instead it uses
 `xorriso`'s `-boot_image any replay`, which reuses the **original** El Torito

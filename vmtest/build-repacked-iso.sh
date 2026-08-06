@@ -9,7 +9,9 @@
 # This produces a SINGLE self-contained ISO: it takes the stock Ubuntu Server
 # ISO and, WITHOUT fully unpacking/rebuilding it, replaces just
 # /boot/grub/grub.cfg (adding the "autoinstall ds=nocloud;s=/cdrom/nocloud/"
-# kernel args to the default boot entries) and adds two new top-level
+# kernel args to the default boot entries, plus a last-position "Diagnostic
+# Shell (no autoinstall)" entry that deliberately carries neither) and adds two
+# new top-level
 # directories — /nocloud/ (user-data + meta-data, SIM values, same as
 # build-seed.sh) and /deploy-payload/ (the repo copy) — using xorriso's
 # "-boot_image any replay" trick, which reuses the ORIGINAL ISO's El Torito
@@ -132,6 +134,73 @@ assert_payload_modes "$OUT_DIR/iso-root/deploy-payload"
 #      side by side, so just point -map at it directly under /nocloud) ──────
 NOCLOUD_DIR="$OUT_DIR/iso-root"   # contains user-data + meta-data (+ deploy-payload/, mapped separately below)
 
+# ── 2b. a SECOND seed that stops and asks (2026-08-06) ──────────────────────
+# The pinned seed is deliberately unforgiving: a `storage: match:` that matches
+# nothing HALTS, and does not fall back to a heuristic. That is right as the
+# default — it is what stops an unattended wipe of the wrong machine — but it
+# also meant an operator standing at the keyboard, looking at the correct box,
+# could not overrule it without baking a new ISO. Rebuilding a ~3.4GB image to
+# answer a question a human is already present to answer is the wrong shape.
+#
+# So: same payload, same credentials, one extra seed whose storage section is
+# INTERACTIVE. The GRUB entry that boots it (added below) is the confirmation —
+# a menu choice inside a 5-second window is not something that happens
+# unattended — and Subiquity then shows its own storage screen, which already
+# lists every disk with model, serial and size and makes you select one, then
+# confirms the destructive action. Hand-rolling a `type CONFIRM` prompt would
+# be a worse copy of a screen the installer already draws.
+#
+# WHAT THIS COSTS, said plainly: the stick can now install anywhere, given one
+# deliberate keypress. The pin stops being a lock and becomes a speed bump. The
+# judgement (2026-08-06) is that this is an acceptable trade because the pin was
+# never protecting the SECRETS — anyone who can mount the ISO reads them
+# already — it protects against destroying the wrong machine's disk, and an
+# interactive storage screen addresses that directly.
+#
+# The match: block is DROPPED rather than kept-as-a-default on purpose: left in
+# place it would still be applied and could still halt, which would defeat the
+# entire point of this entry on the machine that needed it.
+CONFIRM_DIR="$OUT_DIR/iso-root-confirm"
+rm -rf "$CONFIRM_DIR"
+mkdir -p "$CONFIRM_DIR"
+cp "$NOCLOUD_DIR/meta-data" "$CONFIRM_DIR/meta-data"
+
+# Scoped to the storage: block by STATE, not by indentation. `match:` also
+# appears under network: (at a different indent), and an indentation-only rule
+# is one reformat away from silently unpinning — or worse, silently editing —
+# the wrong section.
+awk '
+  /^  storage:/                 { in_storage = 1; print; next }
+  in_storage && /^  [a-z_-]+:/  { in_storage = 0 }
+  in_storage && dropping        { if ($0 ~ /^        /) next; dropping = 0 }
+  in_storage && /^      match:[[:space:]]*$/ { dropping = 1; next }
+  /^  interactive-sections:/    { print "  interactive-sections: [storage]"; next }
+                                { print }
+' "$NOCLOUD_DIR/user-data" > "$CONFIRM_DIR/user-data"
+
+# Three assertions, because every way this can go wrong is silent and lands on
+# a machine holding someone's data.
+grep -q '^  interactive-sections: \[storage\]' "$CONFIRM_DIR/user-data" \
+    || die "the confirm seed is not interactive - it would wipe a disk of Subiquity's choosing with no prompt at all. Refusing to build."
+awk '/^  storage:/{s=1} s && /^  [a-z_-]+:/ && !/^  storage:/{s=0} s && /^      match:/{found=1} END{exit !found}' "$CONFIRM_DIR/user-data" \
+    && die "the confirm seed still carries a storage match: - it can still halt on the very machine this entry exists to rescue. Refusing to build."
+cmp -s "$NOCLOUD_DIR/user-data" "$CONFIRM_DIR/user-data" \
+    && die "the confirm seed is byte-identical to the pinned seed - the awk transform matched nothing (did the template's indentation change?). Refusing to build."
+
+# And the drift guard: the two seeds must differ ONLY in the storage selector
+# and the interactive-sections line. Anything else means the second seed has
+# quietly become a second SOURCE OF TRUTH — a different user, a different
+# late-command, a different payload path — which is exactly how two-file
+# configs rot. Generated from the first, allowed to differ in named ways only.
+SEED_DRIFT="$(diff "$NOCLOUD_DIR/user-data" "$CONFIRM_DIR/user-data" \
+    | grep -E '^[<>]' \
+    | grep -vE '^[<>][[:space:]]+(interactive-sections|match|serial|path|model|wwn|size|ssd):' || true)"
+[ -z "$SEED_DRIFT" ] \
+    || die "confirm seed differs from the pinned seed beyond the storage selector:
+$SEED_DRIFT
+Both seeds must stay the same install. Refusing to build."
+log "confirm seed staged: same payload, storage section INTERACTIVE, no disk pin"
+
 # ── 3. extract the original grub.cfg, inject the autoinstall kernel args ────
 GRUB_ORIG="$OUT_DIR/grub-orig.cfg"
 GRUB_MOD="$OUT_DIR/grub-mod.cfg"
@@ -170,6 +239,76 @@ grep -qE 'linux[[:space:]]*/casper/[a-z-]*vmlinuz[^"]*ds=nocloud;' "$GRUB_MOD" \
     && die "grub.cfg carries an UNQUOTED ds=nocloud;s=... — GRUB would split it on the ';' and boot without a seed location, dropping Subiquity to the interactive installer. Refusing to build."
 log "grub.cfg patched: $(grep -c 'autoinstall "ds=nocloud' "$GRUB_MOD") boot entr(y/ies) now carry a QUOTED autoinstall ds=nocloud"
 
+# ── 3b. append an entry that autoinstalls NOTHING ───────────────────────────
+# The sed above rewrites EVERY /casper/*vmlinuz line, which is correct for the
+# zero-keypress goal and leaves the image with no way to look at the machine.
+# That gap is not hypothetical: the storage `match:` in both targets' user-data
+# is a containment pin, and a pin that does not match is DESIGNED to halt. When
+# it halts, Subiquity prints "press enter to start a shell" and then the
+# non-interactive path (interactive-sections: [], shutdown: reboot) takes the
+# box down before anyone can answer it — so the one question worth asking at
+# that moment ("what disks does this machine actually report?") had to be
+# answered by hand-editing the GRUB line at the console.
+#
+# The entry is built from the ORIGINAL, unpatched linux/initrd lines rather
+# than written out literally, so it tracks Ubuntu's kernel paths instead of
+# pinning /casper/vmlinuz here as a second place to update. It boots the stock
+# live installer: Help -> "Enter shell", or Ctrl+Alt+F2 for a console.
+#
+# APPENDED LAST ON PURPOSE. GRUB's default is entry 0, so position IS the
+# default-boot guarantee — the unattended install stays what happens when
+# nobody touches the keyboard. `set default=0` makes that explicit rather than
+# leaving it as an artifact of ordering; grub.cfg is fully sourced before the
+# menu is drawn, so setting it here applies to entries declared above.
+#
+# Named for the job, not the machine: both targets repack through this script.
+DIAG_LINUX="$(grep -m1 -E '^[[:space:]]*linux[[:space:]]+/casper/[a-z-]*vmlinuz' "$GRUB_ORIG" || true)"
+DIAG_INITRD="$(grep -m1 -E '^[[:space:]]*initrd[[:space:]]+/casper/[a-z-]*initrd' "$GRUB_ORIG" || true)"
+[ -n "$DIAG_LINUX" ] && [ -n "$DIAG_INITRD" ] \
+    || die "couldn't find a /casper/vmlinuz + /casper/initrd pair in grub.cfg to base the diagnostic entry on - Ubuntu changed its grub.cfg layout, update the patterns above"
+
+# The unpinned installer entry (2026-08-06) — same kernel line, but seeded from
+# /nocloud-confirm/ (staged in 2b), whose storage section is interactive. Built
+# by running the SAME sed as the pinned entries over the original line, so the
+# quoting rule that cost a boot on 2026-07-30 is applied here too rather than
+# re-typed by hand and re-learned the same way.
+CONFIRM_LINUX="$(printf '%s\n' "$DIAG_LINUX" | sed -e "s#\(linux[[:space:]]*/casper/[a-z-]*vmlinuz\)\( \)\+---#\1 autoinstall \"ds=nocloud;s=/cdrom/nocloud-confirm/\" ---#")"
+[ "$CONFIRM_LINUX" != "$DIAG_LINUX" ] \
+    || die "couldn't inject the confirm seed onto the kernel line - it would boot the unpinned entry with no seed at all, dropping to a bare interactive installer with no payload. Refusing to build."
+
+cat >> "$GRUB_MOD" <<EOF
+
+menuentry "Diagnostic Shell (no autoinstall)" {
+	set gfxpayload=keep
+$DIAG_LINUX
+$DIAG_INITRD
+}
+menuentry "Install - choose target disk manually (unpinned)" {
+	set gfxpayload=keep
+$CONFIRM_LINUX
+$DIAG_INITRD
+}
+set default=0
+EOF
+
+# The whole point of the entry is the absence of one string. Assert it, because
+# a future change to the sed above (a pattern that matches the appended block
+# too, say) would silently turn the escape hatch back into an unattended wipe —
+# and it would look identical in the menu.
+#
+# Grep the KERNEL LINE, not the whole block: the entry's own title contains the
+# word "autoinstall" ("no autoinstall"), so a block-wide grep matches its own
+# label and this guard fails every build. Found by running it.
+awk '/^menuentry "Diagnostic Shell/,/^}/' "$GRUB_MOD" | grep -E '^[[:space:]]*linux' | grep -q 'autoinstall' \
+    && die "the 'Diagnostic Shell' entry carries 'autoinstall' on its kernel line - it would wipe the disk instead of giving you a shell. Refusing to build."
+grep -q '^set default=0' "$GRUB_MOD" \
+    || die "grub.cfg lost 'set default=0' - the unattended entry may no longer be the default boot. Refusing to build."
+# Same quoting rule as the pinned entries, asserted the same way: unquoted, GRUB
+# splits on the ';' and this entry boots with no seed and no payload.
+grep -q 'autoinstall "ds=nocloud;s=/cdrom/nocloud-confirm/"' "$GRUB_MOD" \
+    || die "the unpinned install entry lost its QUOTED confirm-seed argument. Refusing to build."
+log "grub.cfg: added 'Diagnostic Shell (no autoinstall)' + 'Install - choose target disk manually (unpinned)'; default stays entry 0 (pinned, unattended)"
+
 # ── 4. repack: reuse the ORIGINAL El Torito boot catalog + hybrid MBR/GPT via
 #      "-boot_image any replay" instead of hand-building a new one — this is
 #      what keeps BOTH BIOS and UEFI boot working without re-deriving Ubuntu's
@@ -189,6 +328,8 @@ xorriso -indev "$SRC_ISO" -outdev "$REPACKED_ISO" \
     -map "$GRUB_MOD" /boot/grub/grub.cfg \
     -map "$NOCLOUD_DIR/user-data" /nocloud/user-data \
     -map "$NOCLOUD_DIR/meta-data" /nocloud/meta-data \
+    -map "$CONFIRM_DIR/user-data" /nocloud-confirm/user-data \
+    -map "$CONFIRM_DIR/meta-data" /nocloud-confirm/meta-data \
     -map "$NOCLOUD_DIR/deploy-payload" /deploy-payload \
     -chmod_r go-w /deploy-payload -- \
     -chown_r 0 /deploy-payload -- \
@@ -204,6 +345,11 @@ echo "$EL_TORITO_REPORT" | grep -q "BIOS" || die "repacked ISO lost its BIOS boo
 echo "$EL_TORITO_REPORT" | grep -q "UEFI" || die "repacked ISO lost its UEFI boot image - do not use this ISO"
 xorriso -indev "$REPACKED_ISO" -find /nocloud >/dev/null 2>&1 \
     || die "repacked ISO is missing /nocloud - do not use this ISO"
+# A menu entry pointing at a seed that is not on the ISO boots to a bare
+# interactive installer with no payload and no credentials — it LOOKS like a
+# working escape hatch right up until it hands you a useless install.
+xorriso -indev "$REPACKED_ISO" -find /nocloud-confirm/user-data >/dev/null 2>&1 \
+    || die "repacked ISO is missing /nocloud-confirm/user-data, but the GRUB menu offers the unpinned entry that boots from it - do not use this ISO"
 xorriso -indev "$REPACKED_ISO" -find /deploy-payload >/dev/null 2>&1 \
     || die "repacked ISO is missing /deploy-payload - do not use this ISO"
 # And the modes it will hand to `cp -a` (2026-08-04).
@@ -220,5 +366,10 @@ else
     log "SSH:     ssh -i $SSH_KEY hub@<vm-ip>"
     log "Console: user 'hub', SIM password in $CREDS_FILE"
 fi
+log "If the install HALTS (e.g. the storage match: pin finds no such disk): reboot,"
+log "         pick 'Diagnostic Shell (no autoinstall)' from the GRUB menu (5s timeout),"
+log "         then Help -> 'Enter shell' or Ctrl+Alt+F2, and run:"
+log "           lsblk -o NAME,SIZE,MODEL,SERIAL"
+log "           udevadm info --query=property --name=/dev/nvme0n1 | grep ID_SERIAL"
 log "Next: vmtest/README.md — New-HomeHubVm.ps1 -UbuntuIsoPath $REPACKED_ISO -SeedIsoPath $REPACKED_ISO -SkipSecondDvd"
 log "NOT boot-tested here (needs a VM) — this only verifies the ISO's on-disk structure."

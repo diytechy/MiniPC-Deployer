@@ -518,18 +518,30 @@ VM summary pane — Default Switch NAT hands out a `172.x`-range address).
 > written to physical media** — that is exactly why the shipped image does not
 > carry such an entry.
 >
-> **THE INSTALL ITSELF NEEDS NO NETWORK (2026-08-06), and the gate is where you
-> prove it.** Both images ship `packages: []` and `ssh: install-server: false`;
-> every package comes from `deploy-payload/apt/`, a repo of frozen `.deb` files
-> `export-apt.sh` resolves and then verifies in a container with `--network
-> none`. Run the install phase **with the vSwitch disconnected** — if it
-> completes with no link at all, the goal is met, and nothing weaker proves it.
-> `assert-installed.sh` checks every name in the baked list is installed, so a
-> partial offline install fails the gate rather than looking green.
+> **THE INSTALL ITSELF NEEDS NO NETWORK (2026-08-06), and the gate proves it
+> without being asked.** Both images ship `packages: []` and `ssh:
+> install-server: false`; every package comes from `deploy-payload/apt/`, a repo
+> of frozen `.deb` files `export-apt.sh` resolves and then verifies in a
+> container with `--network none`.
 >
-> Reconnect the switch before the stack comes up: offline covers the *install*,
-> not first-boot service bring-up (ACME, DDNS, OAuth, Cloudflare all need the
-> internet), and `healthcheck.sh` is asking a different question.
+> Stages 5–7 **disconnect the VM's network adapter before the VM is started** and
+> reconnect it once the install is done. Not the vSwitch — that is External with
+> `-AllowManagementOS`, so disconnecting it would take the host's networking and
+> the other VM with it; a per-VM adapter disconnect is exactly "someone unplugged
+> the Ethernet from this machine".
+>
+> Knowing *when* the install finished, with no channel to ask over, is a
+> heuristic — a heartbeat cycle through the guest's reboot, or the VHDX going
+> quiet, floored and ceilinged. **The verdict does not depend on it.** After the
+> reconnect the launcher reads `/var/log/installer/`'s newest timestamp off the
+> installed box and compares it with the moment the cable went back in: earlier
+> means the install completed with no link, later is a named FAILURE. An early
+> reconnect cannot produce a pass. `-OnlineInstall` opts out and says so in the
+> summary.
+>
+> The link is restored before the stack comes up, deliberately: offline covers
+> the *install*, not first-boot service bring-up (ACME, DDNS, OAuth, Cloudflare
+> all need the internet), and `healthcheck.sh` is asking a different question.
 
 Watch first-boot bring-up:
 

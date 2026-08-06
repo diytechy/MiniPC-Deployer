@@ -250,7 +250,7 @@ xorriso -osirrox on -indev "$SRC_ISO" -extract /boot/grub/grub.cfg "$GRUB_ORIG" 
 # the menu held nothing worth choosing. It now carries the diagnostic shell and
 # the unpinned installer, which are reached under pressure — a halted machine,
 # an operator who has just watched a reboot — and 5 seconds is not enough to
-# read three entries and decide. It is also the window Start-InstallGate.ps1
+# read three entries and decide. It is also the window the lab gate
 # types into, and a gate that races a 5-second timer is a flaky gate. The cost
 # is 5 seconds per unattended boot, which nobody is watching anyway.
 #

@@ -2,7 +2,7 @@
 # vmtest/assert-installed.sh — did the install actually PRODUCE anything?
 #
 # Runs ON THE INSTALLED GUEST, over SSH, after it has booted. Copied there and
-# executed by Start-InstallGate.ps1; also runnable by hand on a real box, which
+# executed by HomeHub's Start-VirtualHomeHub.ps1; also runnable by hand on a real box, which
 # is the point — the same script that gates a VM can answer "is this hub
 # actually finished?" while you are standing in front of one.
 #
@@ -157,6 +157,24 @@ if systemctl list-unit-files "$UNIT" >/dev/null 2>&1 && [ -e "/etc/systemd/syste
     fi
 else
     fail "$UNIT is not installed"
+fi
+
+# ── 5b. the panel's own reason to exist ────────────────────────────────────
+# A wall panel that installed perfectly and shows nothing is the failure this
+# project keeps circling: WALL_GATE_HANDOFF.md defect #15, "no red drive check
+# is indistinguishable from the drive check is green on a wall". The kiosk
+# session is checked here; whether it PAINTS is still a human looking at it.
+if [ "$TARGET" = wall ]; then
+    if [ -x /opt/wall-shell/wall-shell ] || [ -x /opt/homehub/wall-shell/wall-shell ]; then
+        pass "the panel shell binary is installed"
+    else
+        fail "no wall-shell binary — the panel would boot to a blank tty"
+    fi
+    if systemctl is-active --quiet wall-kiosk 2>/dev/null || pgrep -f 'cage|wall-shell' >/dev/null 2>&1; then
+        pass "a kiosk session is running"
+    else
+        fail "no kiosk session (wall-kiosk inactive and no cage/wall-shell process)"
+    fi
 fi
 
 # ── 6. can anyone get back in? ─────────────────────────────────────────────

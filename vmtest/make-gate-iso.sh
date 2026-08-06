@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # vmtest/make-gate-iso.sh — derive a VM-gate ISO from a production ISO.
 #
-# WHY THIS EXISTS. Start-InstallGate.ps1 needs the production image to install
+# WHY THIS EXISTS. The lab gate (HomeHub Start-VirtualHomeHub.ps1) needs the
+# production image to install
 # to completion in a VM, unattended. The shipped ISO cannot: its default entry
 # is pinned to a disk serial no virtual disk reports, and its unpinned entry is
 # INTERACTIVE at storage by design — a human picks and confirms the disk.
@@ -44,14 +45,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SRC_ISO=""
 OUT_ISO=""
+TARGET="hub"
 while [ $# -gt 0 ]; do
     case "$1" in
         --src-iso) SRC_ISO="$2"; shift 2 ;;
         --out)     OUT_ISO="$2"; shift 2 ;;
+        --target)  TARGET="$2"; shift 2 ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) die "unknown argument '$1' (try --help)" ;;
     esac
 done
+case "$TARGET" in hub|wall) ;; *) die "--target must be hub or wall (got '$TARGET')" ;; esac
 
 [ -n "$SRC_ISO" ] || die "need --src-iso /path/to/repacked.iso"
 [ -f "$SRC_ISO" ] || die "not found: $SRC_ISO"
@@ -80,18 +84,71 @@ GRUB_ORIG="$WORK/grub.cfg.grub"
 GATE_UD="$WORK/gate-user-data"
 sed -e 's/^  interactive-sections:.*/  interactive-sections: []/' "$CONFIRM_UD" > "$GATE_UD"
 
+# ── 2a. WALL ONLY: Wi-Fi cannot be virtualised ─────────────────────────────
+# THE ONE DIVERGENCE THAT CANNOT BE DESIGNED AWAY. Hyper-V has no synthetic
+# 802.11 device - a guest always sees an Ethernet NIC - and Gen2 VMs support no
+# USB passthrough, while DDA (the PCIe route) is not available on Windows 11
+# Pro. So the panel's `wifis:` block, which matches wl*, matches nothing in a
+# VM and the panel comes up with no network at all.
+#
+# The gate therefore rewrites the block to `ethernets:` matching e*, keeping
+# `set-name: wlan0` so every downstream reference to the interface name still
+# resolves. THE GATE PROVES NOTHING ABOUT THE Wi-Fi PATH - not the SSID, not
+# the PSK, not roaming, not the driver. That was true of the old sim gate too;
+# it is stated here because this ISO is otherwise the production artifact and
+# the temptation to read a pass as covering everything is correspondingly
+# stronger.
+#
+# A side benefit worth naming: dropping access-points means the gate ISO does
+# not carry the Wi-Fi PSK, so of the two ISOs on the disk only the shippable
+# one holds it.
+if [ "$TARGET" = wall ]; then
+    awk '
+      dropping { if ($0 ~ /^          /) next; dropping = 0 }
+      /^    wifis:[[:space:]]*$/            { print "    ethernets:"; next }
+      /^        access-points:[[:space:]]*$/ { dropping = 1; next }
+      /^        macaddress:/                { print "        # (gate ISO) macaddress dropped: the VM adapter carries the reservation MAC."; next }
+      /^          name: "wl\*"/             { print "          name: \"e*\""; next }
+                                            { print }
+    ' "$GATE_UD" > "$GATE_UD.net" && mv "$GATE_UD.net" "$GATE_UD"
+
+    grep -q '^    ethernets:' "$GATE_UD" \
+        || die "the wall gate seed still has no ethernets: block - the panel would boot with no network. Refusing to build."
+    grep -qE '^\s*(wifis:|access-points:)' "$GATE_UD" \
+        && die "the wall gate seed still carries wifis:/access-points: - it would match no interface in a VM. Refusing to build."
+    grep -q 'name: "e\*"' "$GATE_UD" \
+        || die "the wall gate seed does not match e* - it would find no interface. Refusing to build."
+fi
+
 grep -q '^  interactive-sections: \[\]' "$GATE_UD" \
     || die "the gate seed is still interactive - it would stop at the storage screen and the gate would hang waiting for a human. Refusing to build."
 awk '/^  storage:/{s=1} s && /^  [a-z_-]+:/ && !/^  storage:/{s=0} s && /^      match:/{found=1} END{exit !found}' "$GATE_UD" \
     && die "the gate seed carries a storage match: - it would halt in a VM exactly like the shipped default does. Refusing to build."
 
 # THE EQUIVALENCE ASSERTION. This is what lets a passing gate say anything about
-# the shipped image: the two seeds must differ ONLY in interactive-sections. If
-# anything else drifts - a different user, a different late-command, a different
-# payload path - then the gate is testing a different install and its result is
-# worthless while still looking green.
-DRIFT="$(diff "$CONFIRM_UD" "$GATE_UD" | grep -E '^[<>]' | grep -vE '^[<>][[:space:]]+interactive-sections:' || true)"
-[ -z "$DRIFT" ] || die "the gate seed differs from the shipped seed beyond interactive-sections:
+# the shipped image: outside the two divergences named above, the seeds must be
+# identical. If anything else drifts - a different user, a different
+# late-command, a different payload path - the gate is testing a different
+# install and its result is worthless while still looking green.
+#
+# The network: block is EXCISED from both sides rather than allow-listed line by
+# line. A list of permitted line prefixes would also have permitted, say, a
+# changed `dhcp4:` or a different `set-name:` - it grows loose exactly where it
+# needs to be tight. Cutting the whole block out and diffing the remainder means
+# the guard cannot be weakened by adding lines to it, and the block's own
+# correctness is asserted separately above.
+strip_network() {
+    awk '
+      /^  network:/            { in_net = 1; next }
+      in_net && /^  [a-z_-]+:/ { in_net = 0 }
+      in_net                   { next }
+                               { print }
+    ' "$1"
+}
+strip_network "$CONFIRM_UD" > "$WORK/a.stripped"
+strip_network "$GATE_UD"    > "$WORK/b.stripped"
+DRIFT="$(diff "$WORK/a.stripped" "$WORK/b.stripped" | grep -E '^[<>]' | grep -vE '^[<>][[:space:]]+interactive-sections:' || true)"
+[ -z "$DRIFT" ] || die "the gate seed differs from the shipped seed beyond interactive-sections and network::
 $DRIFT
 The gate would not be testing the image you ship. Refusing to build."
 log "gate seed: unattended, unpinned, and otherwise identical to the shipped seed"

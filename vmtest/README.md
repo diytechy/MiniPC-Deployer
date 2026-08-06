@@ -425,15 +425,17 @@ VM summary pane — Default Switch NAT hands out a `172.x`-range address).
 > is checked after `Start-VM`. A green run means "two VMs were created and are
 > Running".
 >
-> **`Start-InstallGate.ps1` is the automated counterpart, and it boots the
-> PRODUCTION image.** Added 2026-08-06, after a production stick installed a bare
-> Ubuntu onto the real hub and reported success: no `/opt/homehub`, no
-> `openssh-server`, no Docker, and no way in. Every check in the repo passed,
-> because all of them run before the ISO is written.
+> **HomeHub's `VirtualHomeHub.cmd` is the automated counterpart, and it boots the
+> PRODUCTION images on the REAL LAN.** Added 2026-08-06, after a production stick
+> installed a bare Ubuntu onto the real hub and reported success: no
+> `/opt/homehub`, no `openssh-server`, no Docker, and no way in. Every check in
+> the repo passed, because all of them run before the ISO is written.
 >
-> ```powershell
-> .\vmtest\Start-InstallGate.ps1 -IsoPath D:\vmtest-out-hub-prod\repacked.iso
-> ```
+> It uses this directory's pieces — `make-gate-iso.sh`, `Send-VmConsoleKeys.ps1`,
+> `assert-installed.sh`, `New-HomeHubVm.ps1` — but owns the sequencing itself, on
+> an **external** switch with the VMs carrying the real machines' MAC addresses
+> so DHCP hands them the production reservations. It refuses to start while the
+> real hub or panel is powered on.
 >
 > Two runs of the same image, asserting opposite properties:
 >

@@ -46,17 +46,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_ISO=""
 OUT_ISO=""
 TARGET="hub"
-STATIC_ADDR=""
-GATEWAY=""
-NAMESERVER=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --src-iso) SRC_ISO="$2"; shift 2 ;;
         --out)     OUT_ISO="$2"; shift 2 ;;
         --target)  TARGET="$2"; shift 2 ;;
-        --static-addr) STATIC_ADDR="$2"; shift 2 ;;
-        --gateway)     GATEWAY="$2";     shift 2 ;;
-        --nameserver)  NAMESERVER="$2";  shift 2 ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) die "unknown argument '$1' (try --help)" ;;
     esac
@@ -125,49 +119,17 @@ if [ "$TARGET" = wall ]; then
     grep -q 'name: "e\*"' "$GATE_UD" \
         || die "the wall gate seed does not match e* - it would find no interface. Refusing to build."
 
-    # ── static address, when we cannot borrow the panel's MAC ──────────────
-    # The panel's address is a DHCP RESERVATION keyed on its permanent Wi-Fi
-    # MAC - that is why the shipped config pins `macaddress: permanent`. The VM
-    # can inherit the reservation by wearing the same MAC, and that is the
-    # zero-divergence route, but the MAC is not in the identity store.
-    #
-    # A static address is the alternative, and here it is nearly free: this
-    # block is ALREADY being rewritten because Wi-Fi cannot be virtualised, so
-    # pinning the address adds nothing to the divergence surface. The same
-    # argument does NOT hold for the hub, whose network block is untouched -
-    # there the MAC is worth having precisely because it changes no config.
-    #
-    # THE ADDRESS ITSELF IS NOT NEGOTIABLE either way: the hub's Caddy allows a
-    # /32, so a panel on any other address is answered 403 and the wall is
-    # blank. Static or reservation, it must land on the same IP.
-    #
-    # Nameserver is the HUB, not the router, matching what the panel's DHCP
-    # lease hands it in the house: split-horizon means the kiosk hostname must
-    # resolve through Technitium or it resolves to the public address instead.
-    # That makes the panel stage depend on the hub already being up, which the
-    # stage ordering guarantees anyway.
-    if [ -n "$STATIC_ADDR" ]; then
-        [ -n "$GATEWAY" ]    || die "--static-addr needs --gateway"
-        [ -n "$NAMESERVER" ] || die "--static-addr needs --nameserver"
-        awk -v addr="$STATIC_ADDR" -v gw="$GATEWAY" -v ns="$NAMESERVER" '
-          /^        dhcp4:/ {
-              print "        addresses: [" addr "]"
-              print "        routes:"
-              print "          - to: default"
-              print "            via: " gw
-              print "        nameservers:"
-              print "          addresses: [" ns "]"
-              next
-          }
-          { print }
-        ' "$GATE_UD" > "$GATE_UD.static" && mv "$GATE_UD.static" "$GATE_UD"
-
-        grep -qF "addresses: [$STATIC_ADDR]" "$GATE_UD" \
-            || die "the static address did not land in the wall gate seed. Refusing to build."
-        grep -q '^        dhcp4:' "$GATE_UD" \
-            && die "the wall gate seed still asks for DHCP alongside a static address - it would take whatever lease it is offered and the hub would answer it 403. Refusing to build."
-        log "wall gate seed: static $STATIC_ADDR via $GATEWAY, DNS $NAMESERVER"
-    fi
+    # The static address, the default route and the nameservers are CARRIED
+    # THROUGH from the shipped seed, not injected here. The panel is statically
+    # addressed in production as of 2026-08-06 (the Owner: hold the address on
+    # the panel, keep it outside the DHCP pool), so the gate inherits the real
+    # values and this rewrite is reduced to the one thing Hyper-V forces —
+    # swapping the radio for a wire. There was an --static-addr path here for a
+    # day; it existed only to work around the panel's address living in the
+    # router, and deleting it is the point of the change rather than a side
+    # effect of it.
+    grep -q '^        addresses: \[' "$GATE_UD" \
+        || die "the wall gate seed has no static address - the panel would come up with no address at all, since the DHCP that used to fill this in was removed from the shipped image. Refusing to build."
 fi
 
 grep -q '^  interactive-sections: \[\]' "$GATE_UD" \

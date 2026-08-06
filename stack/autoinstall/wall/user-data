@@ -41,12 +41,33 @@ autoinstall:
   # The installer needs the network for apt, so the SSID/PSK are substituted into
   # THIS block too (the same wall.env values wall-firstboot.sh renders netplan
   # from). Two hardware-driven settings, both from quirk 5:
-  #   - `wifis` + a DHCP lease that must be RESERVED on the panel's HARDWARE MAC.
-  #     The kiosk site's /32 allow-list depends on that address never moving.
+  #   - `wifis`, because the panel has no Ethernet port.
   #   - MAC randomization OFF. The live boot showed it ON by default, which
-  #     silently breaks a reservation keyed to the real MAC.
+  #     breaks anything keyed to the real MAC — including AP-side filtering.
   # NetworkManager's powersave-off (also quirk 5) is applied post-install by
   # wall-firstboot.sh — it is a NetworkManager setting, not a netplan one.
+  #
+  # STATIC, NOT A DHCP RESERVATION (the Owner, 2026-08-06). The kiosk site's /32
+  # allow-list means this address can never move, and it used to be held by a
+  # reservation on the panel's hardware MAC. Three things were wrong with that:
+  #
+  #   * The address lived in the ROUTER. A router reset or replacement loses the
+  #     reservation, the panel silently takes a dynamic lease, and Caddy answers
+  #     it 403 — a blank wall whose cause is two devices away from the symptom.
+  #   * It made the panel's address depend on a MAC nobody had written down,
+  #     which blocked the VM lab from reproducing it at all.
+  #   * Caddy matches the SOURCE IP, never the MAC. The reservation was a long
+  #     way round to a value the panel can simply assert.
+  #
+  # Set it here and keep the address OUTSIDE the router's DHCP pool. The panel
+  # now carries its own identity, the lab reproduces it exactly, and nothing has
+  # to agree with the router.
+  #
+  # NAMESERVER IS THE HUB, deliberately: split-horizon means the kiosk hostname
+  # must resolve through Technitium or it resolves to the public address. The
+  # panel is useless without the hub anyway, so this adds no dependency that
+  # was not already there — but it does mean a panel INSTALL needs the hub
+  # serving DNS, which is why the lab installs them in that order.
   network:
     version: 2
     wifis:
@@ -54,9 +75,15 @@ autoinstall:
         match:
           name: "wl*"
         set-name: wlan0
-        dhcp4: true
-        # Never a random MAC: the DHCP reservation and the /32 both key off the
-        # permanent hardware address.
+        addresses: [REPLACE_WITH_PANEL_CIDR]
+        routes:
+          - to: default
+            via: REPLACE_WITH_LAN_GATEWAY
+        nameservers:
+          addresses: [REPLACE_WITH_HUB_IP]
+        # Still pinned: a randomized MAC breaks AP-side filtering and makes the
+        # panel unrecognisable in the router's client list, even though nothing
+        # now depends on it for addressing.
         macaddress: permanent
         access-points:
           "REPLACE_WITH_WIFI_SSID":

@@ -165,10 +165,11 @@ $DRIFT
 The gate would not be testing the image you ship. Refusing to build."
 log "gate seed: unattended, unpinned, and otherwise identical to the shipped seed"
 
-# ── 3. one extra menuentry, LAST ───────────────────────────────────────────
-# Last so the shipped entries keep their positions and `set default=0` still
-# means the pinned unattended install - Run A of the gate boots this same ISO
-# untouched and must still see the containment behaviour.
+# ── 3. one extra menuentry, LAST, and made the default ─────────────────────
+# Last so the shipped entries keep their positions - the containment stage boots
+# the SHIPPED ISO untouched and its entry 0 must stay the pinned install. This
+# ISO's own default is then pointed at the gate entry by title (see below).
+GATE_TITLE="GATE - unattended, unpinned (VM ONLY)"
 GATE_GRUB="$WORK/gate-grub.cfg"
 DIAG_LINUX="$(grep -m1 -E '^[[:space:]]*linux[[:space:]]+/casper/[a-z-]*vmlinuz' "$GRUB_ORIG" || true)"
 DIAG_INITRD="$(grep -m1 -E '^[[:space:]]*initrd[[:space:]]+/casper/[a-z-]*initrd' "$GRUB_ORIG" || true)"
@@ -187,39 +188,50 @@ printf '%s' "$GATE_LINUX" | grep -q 'autoinstall "ds=nocloud;s=/cdrom/nocloud-ga
 printf '%s' "$GATE_LINUX" | grep -qE 'nocloud/|nocloud-confirm/' \
     && die "the gate kernel line still references another seed: $GATE_LINUX"
 
-# A LONG MENU TIMEOUT, ON THIS ARTIFACT ONLY (2026-08-06).
-#
-# The shipped image uses 10 seconds, raised from 5 because "a gate that races a
-# 5-second timer is a flaky gate". The gate ISO races it harder than anything
-# else does: Start-VirtualHomeHub.ps1 sends UP+ENTER twelve seconds after
-# Start-VM, so the keypress has to land inside a 10-second window that opens
-# whenever the VM's firmware finishes POST — a quantity nothing in this chain
-# controls or measures. Lose that race and GRUB boots entry 0, the PINNED
-# unattended install, which in a VM matches no disk and halts; the launcher then
-# waits its full install timeout for a box that was never going to appear, and
-# an hour is spent to learn that the menu drew two seconds late.
-#
-# 90 seconds turns the race into a non-race. It costs nothing: the only thing
-# that ever boots this ISO is a script that presses a key within twelve seconds,
-# and the entry it selects is the LAST one, so the timeout only ever expires on
-# a run where the keypress failed — where waiting longer is not the problem.
-#
-# NOT on the shipped image, where 10 is a human reading three entries under
-# pressure, and not by making the gate entry the DEFAULT, which would delete the
-# one deliberate keypress standing between this ISO and any disk it ever meets.
-sed -i 's/^set timeout=.*/set timeout=90/' "$GRUB_ORIG"
-grep -q '^set timeout=90' "$GRUB_ORIG" \
-    || die "could not raise the gate ISO's GRUB timeout - the source grub.cfg has no 'set timeout=' line. The launcher's console keypress would then race a 10-second window it cannot see. Refusing to build."
-
 cp "$GRUB_ORIG" "$GATE_GRUB"
 cat >> "$GATE_GRUB" <<EOF
 
-menuentry "GATE - unattended, unpinned (VM ONLY)" {
+menuentry "$GATE_TITLE" {
 	set gfxpayload=keep
 $GATE_LINUX
 $DIAG_INITRD
 }
+set default="$GATE_TITLE"
 EOF
+
+# THE GATE ENTRY IS THE DEFAULT, AND NO KEY IS PRESSED (2026-08-06).
+#
+# It was selected by console keystrokes until this failed twice on real runs.
+# Start-VirtualHomeHub.ps1 sent UP+ENTER on the reasoning that "UP from entry 0
+# WRAPS to the last entry, which is count-independent" — a claim written in a
+# comment, never verified, and exercised by nothing else in this repo (the A19
+# gate drove no menu at all). GRUB2's wrap behaviour is not something to bet an
+# install cycle on, and the failure it produces is expensive and mute: the
+# selection stays on entry 0, GRUB boots the PINNED unattended install, that
+# matches no disk in a VM and halts at "An error occurred. Press enter to start
+# a shell", nothing is ever written, and the launcher waits its full install
+# timeout for a box that was never going to appear. Measured twice: 0.0 GB.
+#
+# `set default=` BY TITLE removes every moving part at once — the wrap question,
+# the entry count, and the race between a fixed sleep and however long this VM's
+# firmware takes to draw a menu. It comes AFTER the shipped `set default=0`, and
+# grub.cfg is sourced top to bottom, so the later assignment is the one that
+# stands.
+#
+# WHAT THIS COSTS, PLAINLY: the one deliberate keypress that used to stand
+# between this ISO and any disk it met is gone. This artifact already installs
+# unattended to whatever disk it finds — that is what it is FOR, and the
+# launcher already prints "NEVER write this to physical media" — so what is
+# actually lost is the few seconds a person would have had to notice their
+# mistake. The judgement is that a gate which silently tests nothing is the
+# worse hazard of the two, and that the media rule is the control that matters.
+# The timeout is left at the shipped value: with the default correct, it only
+# governs how long a human gets to intervene.
+grep -qF "set default=\"$GATE_TITLE\"" "$GATE_GRUB" \
+    || die "the gate grub.cfg has no 'set default' naming the gate entry - it would boot the PINNED entry, halt in the VM, and write nothing. Refusing to build."
+[ "$(grep -c '^set default=' "$GATE_GRUB")" -ge 2 ] \
+    || die "expected the shipped 'set default=0' AND the gate override in the gate grub.cfg; found fewer. The shipped image's layout changed - re-read this block. Refusing to build."
+log "gate entry is GRUB's default - the gate needs no console keypress at all"
 
 # ── 4. repack ──────────────────────────────────────────────────────────────
 log "repacking -> $OUT_ISO (copies ~3.9GB, a few minutes)"

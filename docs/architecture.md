@@ -103,12 +103,22 @@ graph LR
   `OFFSITE_PATH`/`OFFSITE_UNC` are legacy. Never-silent-green into the tracker's
   `/api/feed`, on **every** failure path including `die` (OI-9).
 - **Tier-2 opt-in catalog (SN-009/SR-012):** additional self-hosted services
-  behind compose profiles — OFF by default, LAN_IP-bound or Caddy-site-only,
-  excluded from the baked ISO payload unless exported with `EXTRA_PROFILES`.
+  behind compose profiles — OFF by default, LAN_IP-bound or Caddy-site-only.
   `COMPOSE_PROFILES` in `.env` is the enable switch; see stack/README §9.
-- **Remote management (WI-10.12):** SSH (key-only), Cockpit, and
-  unattended-upgrades are provisioned by the autoinstall;
-  `REMOTE_MANAGEMENT.md` is the ops + reimage-ladder memo.
+  **Whatever it enables is BAKED (corrected 2026-08-07).** `export-images.sh`
+  reads that key from the `.env` it is bundling and resolves the image set for
+  exactly those profiles, so an enabled service whose image cannot be resolved
+  is a refused *build*. It used to hardcode `--profile ntfy`, which meant a box
+  configured for five profiles shipped with nine images and went to the registry
+  on first boot for the rest — defeating the offline install one step past the
+  install itself. `EXTRA_PROFILES` still adds profiles the `.env` does not
+  enable.
+- **Remote management (WI-10.12):** SSH (key-only), **passwordless `sudo`**,
+  Cockpit, and unattended-upgrades are provisioned by the autoinstall. The sudo
+  drop-in is the third leg of the key-only design, not a separate concession —
+  a locked password makes `sudo` unsatisfiable, so without it the box is
+  read-only over SSH. `REMOTE_MANAGEMENT.md` is the ops + reimage-ladder memo
+  and carries the full argument.
 
 ## Layout
 

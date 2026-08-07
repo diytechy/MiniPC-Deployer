@@ -267,13 +267,21 @@ last) — it is the record, not required reading for every pass.
       than OI-18 said in words). **Nothing here has been mounted** — "emits
       successfully" is not "mounts successfully", and the reachability tests use
       `127.0.0.1`/`192.0.2.1`, which prove the decision, not the mount.
-    - OI-7 — **Tier-2 catalog ratifications (2026-07-10):** (a) confirm the
+    - OI-7 — **Tier-2 catalog ratifications (2026-07-10):** ~~(a) confirm the
       tier-2-NOT-baked ISO boundary (profiles excluded from the payload unless
-      `EXTRA_PROFILES` at export) as the standing Q10.9 B+ interpretation;
-      (b) decide where `MEDIA_ROOT` physically lives (must NOT be the WI-10.10
-      backup drives); (c) the oauth2-proxy **security pin bump** v7.6.0→v7.15.2
-      needs a V1 sim re-run + re-export before any real flash →
-      [stack/README.md §9](../stack/README.md)
+      `EXTRA_PROFILES` at export) as the standing Q10.9 B+ interpretation;~~
+      **(a) is CLOSED, and answered the other way, 2026-08-07.** Running it
+      settled it: that interpretation is incompatible with Q10.9 B+ itself. A
+      hub whose `.env` enabled five profiles shipped with 9 of the 15 images it
+      needed, so first boot went to the registry — and because `compose up -d`
+      is all-or-nothing, one unreachable **optional** image took the whole core
+      stack down with it. `export-images.sh` now derives the bake set from
+      `COMPOSE_PROFILES` in the `.env` it is bundling: what is enabled is baked,
+      and an unresolvable tag is a refused build. The boundary is the profile
+      switch, not the bake. (b) decide where `MEDIA_ROOT` physically lives (must
+      NOT be the WI-10.10 backup drives); (c) the oauth2-proxy **security pin
+      bump** v7.6.0→v7.15.2 needs a V1 sim re-run + re-export before any real
+      flash → [stack/README.md §9](../stack/README.md)
     - OI-10 — **Disk encryption decision (2026-07-11):** the AWOW's disk is
       UNENCRYPTED — physical theft/disposal exposes `.env` secrets + the
       finance volumes. Proposed: autoinstall LUKS (Subiquity supports
@@ -4238,3 +4246,68 @@ Personal's materialiser to emit a full `site/` — and that is blocked on
   media is out of scope for this gate. Nothing has ever been mounted with either
   credential; that is OI-18's standing gap and this run does not touch it.
 - **A production panel or hub.** Everything here is a sim image.
+
+### DRIVER — G1 — Round 1 — 2026-08-07 (an installed hub, interrogated: sudo could never have worked, and the offline install stopped at the install)
+
+**The first lab run whose VM outlived it.** HomeHub's endpoint gained a
+`Hub-Keep` variant, so for the first time an installed hub was still running
+when the launcher finished and could be asked questions instead of being
+destroyed with its evidence. Three defects came out of one box, and none of them
+was reachable by review.
+
+**1. `sudo` could never have succeeded, on either image.** `identity.password`
+is `"!"` — a locked hash, correct for a key-only box — and neither image ever
+created a sudoers drop-in. So `sudo` demanded a password that cannot exist:
+
+```
+sudo: a password is required
+```
+
+No `apt`, no `systemctl`, no `/etc` edit, and `healthcheck.sh` could not read
+its own root-only `.env`. Cockpit and the console were dead for the same reason,
+both being PAM against the same locked hash. **This is the standard cloud-image
+posture with one of its three parts missing** — Ubuntu's `cloud.cfg` ships
+`lock_passwd: True` *together with* `sudo: ["ALL=(ALL) NOPASSWD:ALL"]`, and
+subiquity's `identity:` block has no way to express the second, so adopting the
+posture silently dropped it. Fixed in both images at late-command 3c-bis,
+validated with `visudo -cf` before installing because a malformed sudoers file
+on a locked-password box is the no-way-in state that cost a GRUB rescue on
+2026-08-06.
+
+Worth recording plainly: **on the hub this changed no exposure.** `hub` is in
+the `docker` group, and the docker socket is root by design — demonstrated on
+the live box by reading the 0600 root:root `.env` from a container as uid 0,
+with no password. What the drop-in adds is auditability, since `sudo` journals
+every command and `docker run` does not. On the **panel**, which has no docker
+group and no Cockpit, it is the difference between maintainable and
+reimage-only: `systemctl reboot` — the one action unattended-upgrades
+periodically requires — was not remotely performable at all.
+
+**2. The offline install was defeated by configuration, one step past the
+install.** `export-images.sh` hardcoded `PROFILE_ARGS=(--profile ntfy)` while
+the materialised hub `.env` carried
+`COMPOSE_PROFILES=ntfy,immich,immich-ml,jellyfin,finance-auditor`. Nine images
+baked; fifteen needed. First boot went to `registry-1.docker.io`, the
+`jellyfin` pull failed, `compose up -d` is all-or-nothing, and
+`homehub-firstboot.service` exited 1 — so **DNS, Caddy, the tracker and Actual
+never started because one OPTIONAL image was unreachable.** Confirmed from
+outside: `:5380`, `:3001` and `:8081` all refused.
+
+Note what was *not* wrong: the refusal machinery was sound and always had been
+(a missing local-only image and an unpullable tag are both `die`, not warnings).
+It was being asked the wrong question. It now derives the profile set from the
+`.env` it is bundling, so drift is a refused build. This closes OI-7(a) against
+its original interpretation.
+
+**3. `Wait-GuestAddress` reported failure about a box that was up** (HomeHub's
+launcher; recorded here because it is what made 1 and 2 look like a dead
+install). It watched only the host neighbour table for the VM's MAC — an
+ARP cache that fills when the host *talks* to the guest, and nothing was talking
+to it. Sixty minutes of nothing, about a hub answering ping and ssh at its
+reservation throughout. It now probes tcp/22 at the expected address first
+(15 ms, measured) and keeps the neighbour scan as the fallback it should always
+have been, for the DHCP-gave-a-different-address case.
+
+**What this run did prove**, and it is the assertion the whole 2026-08-06 effort
+was for: **8004 MB installed with the network adapter disconnected**, and SSH
+accepting the operator key unattended afterwards.

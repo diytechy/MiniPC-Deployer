@@ -88,13 +88,46 @@ fi
 require_free_gb "$IMAGES_OUT" 3
 
 # ── 1. resolve the full pinned image set (compose is the source of truth) ─────
-# TIER-2 BOUNDARY (SR-012): opt-in profile services are EXCLUDED from the baked
-# payload by default — with their profiles off, `compose config --images` never
-# lists them, so the ISO stays core-sized and tier-2 images pull at enable time.
-# To bake an enabled opt-in set anyway (e.g. matching COMPOSE_PROFILES in the
-# real .env):  EXTRA_PROFILES="navidrome vaultwarden" bash vmtest/export-images.sh
+# THE PROFILES ARE READ FROM THE .env BEING BAKED. They used to be hardcoded as
+# `(--profile ntfy)`, and that one line defeated the whole offline install.
+#
+# WHAT HAPPENED, 2026-08-07. The materialised hub .env carries
+#     COMPOSE_PROFILES=ntfy,immich,immich-ml,jellyfin,finance-auditor
+# so the box starts five profiles' worth of services. This script asked compose
+# "which images do I need with ONLY the ntfy profile on?", got 9, baked 9, and
+# shipped. On first boot `docker compose up -d` therefore needed six images that
+# were never on the stick — immich-server, immich-ml, immich-db, valkey,
+# jellyfin, finance-auditor — and went to registry-1.docker.io for them.
+#
+# The 2026-08-06 work exists to make an install need NO NETWORK. This made the
+# BRING-UP need one, which is the same promise broken one step later. And it was
+# not a graceful degrade: `compose up -d` is all-or-nothing, so the failed
+# jellyfin pull took the whole command down, homehub-firstboot.service exited 1,
+# and DNS, Caddy, the tracker and Actual never started at all. One unreachable
+# OPTIONAL image stopped the entire core stack.
+#
+# NOTE WHAT WAS NOT WRONG. The refusal machinery below is sound and always was —
+# a missing local-only image and an unpullable tag are both `die`, not warnings.
+# It was being asked the wrong question. Deriving the answer from the same file
+# the box will use means drift is now a REFUSED BUILD, where someone can act on
+# it, rather than a failed first boot on a machine that may be on a wall.
+#
+# EXTRA_PROFILES still adds to the set, for baking something the .env does not
+# yet enable. ntfy stays in unconditionally: it is the historical default and
+# omitting it would silently shrink an ISO whose .env predates this change.
 PROFILE_ARGS=(--profile ntfy)
-for p in ${EXTRA_PROFILES:-}; do PROFILE_ARGS+=(--profile "$p"); done
+ENV_PROFILES="$(sed -n 's/^[[:space:]]*COMPOSE_PROFILES[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" \
+                | tail -n1 | tr -d '"'\''' | tr ',' ' ')"
+for p in $ENV_PROFILES ${EXTRA_PROFILES:-}; do
+    case " ${PROFILE_ARGS[*]} " in *" $p "*) continue ;; esac
+    PROFILE_ARGS+=(--profile "$p")
+done
+if [ -n "$ENV_PROFILES" ]; then
+    log "COMPOSE_PROFILES in ${ENV_FILE##*/} enables: $ENV_PROFILES"
+    log "  every one of them is baked; a profile whose image cannot be resolved is a REFUSED BUILD"
+else
+    log "COMPOSE_PROFILES is empty in ${ENV_FILE##*/} — baking the core set plus ntfy only"
+fi
 
 log "resolving image set from $(basename "$COMPOSE_FILE") with pins from ${ENV_FILE#$REPO_ROOT/}"
 mapfile -t IMAGES < <(

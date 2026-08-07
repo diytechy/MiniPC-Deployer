@@ -88,10 +88,13 @@ deploy image:
    Once built it materializes `.env` from Personal's credential store, and
    pathing values come from `Personal\deploy\storage-map.md`.
 3. Run `vmtest/export-images.sh` (it reads the real pinned tags in
-   `.env.example`, not sim values) so the real USB also carries every **core**
-   container image baked in (Q10.9 B+) — see stack/README.md §3. Tier-2 opt-in
-   images are **excluded** from the bake by default; pass
-   `EXTRA_PROFILES="…"` to include an enabled set (SR-012).
+   `.env.example`, not sim values) so the real USB carries every container image
+   baked in (Q10.9 B+) — see stack/README.md §3. That means the **core** set
+   **plus every tier-2 profile `COMPOSE_PROFILES` enables in the `.env` being
+   bundled** (corrected 2026-08-07: it used to bake core+ntfy regardless, so an
+   enabled profile pulled from the registry on first boot and took the whole
+   stack down when it could not). `EXTRA_PROFILES="…"` adds profiles the `.env`
+   does not enable (SR-012).
 4. **After first boot, the one-time in-app authentications** (not `.env`
    values): the Google OAuth client above is env-side, but Actual's
    **SimpleFIN bank sync** is configured inside Actual's own UI and stored in

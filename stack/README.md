@@ -34,7 +34,9 @@ Services (all health-checked, all `restart: unless-stopped`):
 - **Tier-2 opt-in catalog (SR-012)** — Immich / PhotoPrism, Jellyfin, Navidrome,
   Audiobookshelf, Vaultwarden, Home Assistant + Mosquitto, Syncthing,
   FreshRSS / Mealie / Homepage, diun — all behind compose **profiles**, OFF by
-  default and excluded from the baked ISO payload; see §9.
+  default; see §9. **What `COMPOSE_PROFILES` enables IS baked** into the ISO
+  payload (corrected 2026-08-07) — the boundary is the profile switch, not the
+  bake.
 
 This directory is the **image pipeline**. It is self-contained and committed with
 placeholders only — no secrets. Copy `.env.example` → `.env` and fill it in;
@@ -395,10 +397,23 @@ four places — then the build scripts carry it onto the box:
    service (each carries its own login; no basic_auth on them).
 3. **`stack/.env` → `EXTRA_SUBDOMAINS`** — one label per uncommented site;
    provisioning adds the split-horizon A records.
-4. **`vmtest/export-images.sh`** — bakes core+ntfy images only. Tier-2 images
-   are **not baked** (pins are best-effort, not sim-validated); they pull at
-   enable time. To bake an enabled set into the ISO anyway:
-   `EXTRA_PROFILES="navidrome vaultwarden" bash vmtest/export-images.sh`.
+4. **`vmtest/export-images.sh`** — bakes core+ntfy **plus every profile
+   `COMPOSE_PROFILES` names in the `.env` being bundled**. Nothing extra is
+   needed: enable a profile and its image is baked on the next build, or the
+   build is refused because the tag cannot be resolved. `EXTRA_PROFILES="…"`
+   still adds profiles the `.env` does not enable.
+
+   > **Corrected 2026-08-07, and it mattered.** This used to bake core+ntfy and
+   > nothing else, whatever the `.env` said. A hub configured with
+   > `COMPOSE_PROFILES=ntfy,immich,immich-ml,jellyfin,finance-auditor` therefore
+   > shipped with 9 images and needed 15, so first boot went to
+   > `registry-1.docker.io` for the rest — the offline-install promise broken one
+   > step past the install. Worse, `docker compose up -d` is all-or-nothing: the
+   > failed pull of one **optional** image took the whole command down,
+   > `homehub-firstboot.service` exited 1, and DNS, Caddy, the tracker and Actual
+   > never started. Tier-2 pins are still best-effort rather than sim-validated,
+   > so verify a tag when you enable its profile — but an unresolvable one is now
+   > a refused build, where someone can act on it.
 
 Then build as in §3: the USB payload carries your filled `.env` (autoinstall
 seeds from `.env.example` **only if you didn't pre-fill one**), the stack lands

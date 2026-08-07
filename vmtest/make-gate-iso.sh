@@ -187,6 +187,30 @@ printf '%s' "$GATE_LINUX" | grep -q 'autoinstall "ds=nocloud;s=/cdrom/nocloud-ga
 printf '%s' "$GATE_LINUX" | grep -qE 'nocloud/|nocloud-confirm/' \
     && die "the gate kernel line still references another seed: $GATE_LINUX"
 
+# A LONG MENU TIMEOUT, ON THIS ARTIFACT ONLY (2026-08-06).
+#
+# The shipped image uses 10 seconds, raised from 5 because "a gate that races a
+# 5-second timer is a flaky gate". The gate ISO races it harder than anything
+# else does: Start-VirtualHomeHub.ps1 sends UP+ENTER twelve seconds after
+# Start-VM, so the keypress has to land inside a 10-second window that opens
+# whenever the VM's firmware finishes POST — a quantity nothing in this chain
+# controls or measures. Lose that race and GRUB boots entry 0, the PINNED
+# unattended install, which in a VM matches no disk and halts; the launcher then
+# waits its full install timeout for a box that was never going to appear, and
+# an hour is spent to learn that the menu drew two seconds late.
+#
+# 90 seconds turns the race into a non-race. It costs nothing: the only thing
+# that ever boots this ISO is a script that presses a key within twelve seconds,
+# and the entry it selects is the LAST one, so the timeout only ever expires on
+# a run where the keypress failed — where waiting longer is not the problem.
+#
+# NOT on the shipped image, where 10 is a human reading three entries under
+# pressure, and not by making the gate entry the DEFAULT, which would delete the
+# one deliberate keypress standing between this ISO and any disk it ever meets.
+sed -i 's/^set timeout=.*/set timeout=90/' "$GRUB_ORIG"
+grep -q '^set timeout=90' "$GRUB_ORIG" \
+    || die "could not raise the gate ISO's GRUB timeout - the source grub.cfg has no 'set timeout=' line. The launcher's console keypress would then race a 10-second window it cannot see. Refusing to build."
+
 cp "$GRUB_ORIG" "$GATE_GRUB"
 cat >> "$GATE_GRUB" <<EOF
 

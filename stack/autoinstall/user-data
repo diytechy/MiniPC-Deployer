@@ -366,6 +366,57 @@ autoinstall:
     # the public internet). See ../../REMOTE_MANAGEMENT.md.
     - curtin in-target --target=/target -- systemctl enable cockpit.socket
 
+    # ---- 3c-bis. THE PIECE THE LOCKED PASSWORD REQUIRES ----------------------
+    # WITHOUT THIS THE BOX IS UNMAINTAINABLE OVER SSH, and that was true from the
+    # first image until 2026-08-07. `hub` is in the sudo group, but `password:
+    # "!"` above is a LOCKED hash, so `sudo` demanded a password that cannot
+    # exist:
+    #     sudo: a password is required
+    # No apt, no /etc edits, no systemctl, and healthcheck.sh could not even read
+    # its own .env. Cockpit was dead for the same reason — its login is PAM
+    # against the same locked password — and so was the console. Measured on an
+    # installed lab hub, not inferred.
+    #
+    # THIS IS THE STANDARD CLOUD-IMAGE POSTURE AND THE IMAGE HAD TWO OF ITS THREE
+    # PARTS. Ubuntu's own /etc/cloud/cloud.cfg ships:
+    #     default_user: { lock_passwd: True, sudo: ["ALL=(ALL) NOPASSWD:ALL"] }
+    # and AWS, GCP, Azure, DigitalOcean and Hetzner all image that way. Key-only
+    # SSH plus a locked password plus passwordless sudo is one design, not three
+    # choices: the SSH KEY IS THE CREDENTIAL, and a password behind it protects
+    # nothing from anyone already holding the key. We had the first two and not
+    # the third, because subiquity's `identity:` block has no way to express a
+    # sudoers rule — its `password:` is meant to be a real hash, so adopting the
+    # cloud posture there silently drops cloud-init's compensating drop-in.
+    #
+    # ALL, NOT AN ALLOWLIST, and that is a considered choice rather than
+    # laziness. On the hub it changes no exposure whatsoever: `hub` is in the
+    # `docker` group, and the docker socket is root by design — `docker run
+    # -v /:/host` reads and writes anything, with no password, today. What this
+    # adds is AUDITABILITY: sudo journals every command it runs, while the docker
+    # path logs only that a container started. An allowlist would also need
+    # extending for every new workflow, which is how allowlists become ALL with
+    # extra steps.
+    #
+    # VALIDATED BEFORE IT IS INSTALLED, and that is not ceremony. A malformed
+    # sudoers file breaks sudo for EVERY user, on a box whose only account has a
+    # locked password — precisely the no-way-in state that cost a GRUB rescue via
+    # init=/bin/bash on 2026-08-06. So it is written to a temp path, checked with
+    # `visudo -cf`, and only then moved into place; a failed check leaves the box
+    # exactly as it was and fails the install loudly instead.
+    - |
+      curtin in-target --target=/target -- bash -c '
+      set -e
+      T=$(mktemp)
+      printf "%s\n" \
+        "# Managed by the HomeHub autoinstall. See stack/autoinstall/user-data 3c-bis." \
+        "# The SSH key is the credential: this account has a LOCKED password, so" \
+        "# without this line sudo can never succeed and the box cannot be maintained." \
+        "hub ALL=(ALL) NOPASSWD:ALL" > "$T"
+      visudo -cf "$T"
+      install -o root -g root -m 0440 "$T" /etc/sudoers.d/90-homehub-ops
+      rm -f "$T"
+      echo "homehub: /etc/sudoers.d/90-homehub-ops installed and validated"'
+
     # ---- 3d. Docker configuration (the engine came from 3c) -------------------
     # The three late-commands that used to live at the top of this file — fetch
     # Docker's GPG key, write /etc/apt/sources.list.d/docker.list, apt-get

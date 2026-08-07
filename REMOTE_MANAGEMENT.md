@@ -22,6 +22,37 @@ Provisioned by `stack/autoinstall/user-data`:
   account's password is locked (`"!"`). No password login surface at all.
   - Fill your public key into `user-data` before flashing (the box is
     unreachable over SSH until a valid key is present — that is deliberate).
+- **Passwordless `sudo`**, and it is the third leg of the same design rather
+  than a separate concession. `/etc/sudoers.d/90-homehub-ops` grants
+  `hub ALL=(ALL) NOPASSWD:ALL`; the wall image installs the equivalent for
+  `panel`. **Added 2026-08-07 — until then it was missing, and both boxes were
+  read-only over SSH.** A locked password means `sudo` asks for something that
+  cannot exist, so `apt`, `systemctl`, every `/etc` edit and even
+  `healthcheck.sh` (it must read a root-only `.env`) all failed with
+  *"sudo: a password is required"*. Cockpit and the console were dead for the
+  same reason — both are PAM against that same locked hash.
+  - **This is the standard cloud-image posture, and the image had two of its
+    three parts.** Ubuntu's own `/etc/cloud/cloud.cfg` ships
+    `lock_passwd: True` together with `sudo: ["ALL=(ALL) NOPASSWD:ALL"]`, and
+    AWS, GCP, Azure, DigitalOcean and Hetzner all image that way. Key-only SSH,
+    a locked password and passwordless sudo are one design: **the SSH key is
+    the credential**, and a password behind it protects nothing from anyone who
+    already holds the key — while making unattended maintenance impossible.
+    Subiquity's `identity:` block cannot express a sudoers rule, which is how
+    the third part got dropped without anyone choosing to drop it.
+  - **On the hub this changed no exposure.** `hub` is in the `docker` group and
+    the docker socket is root by design — `docker run -v /:/host` already read
+    and wrote anything, with no password. What it adds is **auditability**:
+    `sudo` journals every command, where the docker path logs only that a
+    container started. On the **panel** it is the difference between
+    maintainable and reimage-only: no docker group, no Cockpit, so its previous
+    only root path was a keyboard at the wall and `init=/bin/bash` at GRUB —
+    which meant `systemctl reboot`, the one action unattended-upgrades
+    periodically requires, could not be performed remotely at all.
+  - The drop-in is validated with `visudo -cf` **before** it is installed. A
+    malformed sudoers file breaks `sudo` for every user on a box whose only
+    account has a locked password, which is exactly the no-way-in state that
+    cost a GRUB rescue on 2026-08-06.
 - **Cockpit web console** (host package, not a container — the plan's preferred
   form) on `https://<LAN_IP>:9090`: terminal, logs, service control, updates,
   reboot, metrics. **LAN-only** — it is *not* proxied through Caddy to the

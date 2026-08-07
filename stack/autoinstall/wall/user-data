@@ -306,6 +306,42 @@ autoinstall:
     # and curtin runs the chroot behind a policy-rc.d, so this is explicit.
     - curtin in-target --target=/target -- systemctl enable ssh
 
+    # ---- 3c-bis. AND THE PANEL NEEDS THIS MORE THAN THE HUB DOES -------------
+    # Same defect, same fix, worse consequence. `panel` is in the sudo group and
+    # `password: "!"` is a locked hash, so sudo demanded a password that cannot
+    # exist. On the hub that still left an undocumented escape — the `docker`
+    # group, whose socket is root by design. THE PANEL HAS NO DOCKER, no Cockpit
+    # (deliberately, see 3d below) and a console that autologins into cage. So
+    # its only root path was a keyboard at the wall and init=/bin/bash at GRUB.
+    #
+    # WHAT THAT ACTUALLY COST: unattended-upgrades runs here and stages kernel
+    # patches that need a reboot, and `systemctl reboot` needs root — so the one
+    # action the panel periodically requires could not be performed remotely at
+    # all. Suspend/resume reuses the same kernel, so the pending-reboot state
+    # never cleared itself either. A panel is reimage-not-repair (SN-013), but
+    # that ruling is about not spending time REPAIRING one; it was never meant to
+    # mean a reboot needs a trip across the office.
+    #
+    # The full argument for the ALL and for validating first is on the hub image,
+    # at the same step. The short version: this is the cloud-image posture
+    # (locked password + key-only SSH + NOPASSWD sudo, exactly what Ubuntu's own
+    # cloud.cfg ships), and a malformed sudoers file on a box with a locked
+    # password is the no-way-in state, so it is checked before it is installed.
+    - |
+      curtin in-target --target=/target -- bash -c '
+      set -e
+      T=$(mktemp)
+      printf "%s\n" \
+        "# Managed by the WallPanel autoinstall. See wall/user-data 3c-bis." \
+        "# The SSH key is the credential: this account has a LOCKED password, and" \
+        "# this panel has no docker group and no Cockpit, so without this line" \
+        "# there is NO root path at all short of a keyboard at the wall." \
+        "panel ALL=(ALL) NOPASSWD:ALL" > "$T"
+      visudo -cf "$T"
+      install -o root -g root -m 0440 "$T" /etc/sudoers.d/90-wallpanel-ops
+      rm -f "$T"
+      echo "wall: /etc/sudoers.d/90-wallpanel-ops installed and validated"'
+
     # ---- 3d. Remote management (lighter than the AWOW's: no Cockpit) ---------
     # A panel is reimage-not-repair, so it gets SSH + unattended-upgrades and
     # deliberately NOT Cockpit — one less always-listening web surface on a box

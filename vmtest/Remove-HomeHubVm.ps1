@@ -55,14 +55,28 @@ if (-not $vm) {
 
 $disks = (Get-VMHardDiskDrive -VMName $VMName -ErrorAction SilentlyContinue).Path
 
+# `-Force` AND `-Confirm:$false`, ON THE HYPER-V CMDLETS, and the belt is not the
+# same as the braces. `-Confirm:$false` sets $ConfirmPreference for THIS scope;
+# `-Force` is the Hyper-V module's own "do not ask" parameter.
+#
+# The difference showed up on 2026-08-06. This script was called with
+# -Confirm:$false, which correctly silenced its own ShouldProcess above — and
+# then Remove-VM prompted anyway, with its own wording ("Are you sure you want
+# to remove virtual machine ..."), stopping an unattended run dead. Under
+# PowerShell 7 the Hyper-V module is loaded through the Windows PowerShell
+# compatibility session, and a preference variable set in the local scope does
+# not cross that boundary; -Force is a real parameter that travels with the call.
+#
+# -Force also makes Stop-VM valid on a SAVED VM, which -TurnOff alone is not on
+# every Hyper-V build — the state a suspended gate VM is left in.
 if ($vm.State -ne 'Off') {
     if ($PSCmdlet.ShouldProcess($VMName, 'Stop VM (TurnOff)')) {
-        Stop-VM -Name $VMName -TurnOff -Confirm:$false -WhatIf:$WhatIfPreference
+        Stop-VM -Name $VMName -TurnOff -Force -Confirm:$false -WhatIf:$WhatIfPreference
     }
 }
 
 if ($PSCmdlet.ShouldProcess($VMName, 'Remove VM')) {
-    Remove-VM -Name $VMName -Confirm:$false -WhatIf:$WhatIfPreference
+    Remove-VM -Name $VMName -Force -Confirm:$false -WhatIf:$WhatIfPreference
     Write-Host "VM '$VMName' removed." -ForegroundColor Green
 }
 

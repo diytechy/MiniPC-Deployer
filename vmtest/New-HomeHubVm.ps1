@@ -228,14 +228,18 @@ if ($existing -and -not $Force) {
 
 if ($existing -and $Force) {
     if ($PSCmdlet.ShouldProcess($VMName, 'Stop + remove existing VM (recreate, -Force)')) {
+        # -Force as well as -Confirm:$false — see Remove-HomeHubVm.ps1 for why
+        # they are not the same thing under PowerShell 7. Without it this path
+        # stops an unattended -Force recreate to ask a question, which is the
+        # one thing -Force said it would not do.
         if ($existing.State -ne 'Off') {
-            Stop-VM -Name $VMName -TurnOff -Confirm:$false -WhatIf:$WhatIfPreference
+            Stop-VM -Name $VMName -TurnOff -Force -Confirm:$false -WhatIf:$WhatIfPreference
         }
         $existingDisks = @()
         if (-not $KeepDisk) {
             $existingDisks = (Get-VMHardDiskDrive -VMName $VMName -ErrorAction SilentlyContinue).Path
         }
-        Remove-VM -Name $VMName -Confirm:$false -WhatIf:$WhatIfPreference
+        Remove-VM -Name $VMName -Force -Confirm:$false -WhatIf:$WhatIfPreference
         foreach ($d in $existingDisks) {
             if (Test-Path -LiteralPath $d) {
                 Remove-Item -LiteralPath $d -Force -WhatIf:$WhatIfPreference

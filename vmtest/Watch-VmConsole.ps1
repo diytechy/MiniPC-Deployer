@@ -82,35 +82,45 @@ Remove-Item -Force $stopFile -ErrorAction SilentlyContinue
 
 Add-Type -AssemblyName System.Drawing
 
-# WMI FIRST, CIM ONLY AS A FALLBACK, and the order is deliberate. The WMI call
-# is the one that has actually produced usable PNGs of a booting installer on
-# this machine; the CIM form is equivalent on paper and has never been run here.
-# `Get-WmiObject` exists in Windows PowerShell 5.1 and NOT in PowerShell 7, and
-# Start-A19Gate.ps1 launches this under `powershell.exe` (5.1) for exactly that
-# reason — so the proven path is the one that normally runs, and the fallback
-# only matters if you start it by hand from pwsh.
+# CIM ONLY. There was a `Get-WmiObject` branch here, preferred because it was
+# the form that had actually produced usable PNGs, and guarded by
+# `if (Get-Command Get-WmiObject)` on the stated belief that the cmdlet "exists
+# in Windows PowerShell 5.1 and NOT in PowerShell 7".
+#
+# THAT BELIEF IS WRONG, and it cost a lab run on 2026-08-06 through the same
+# mechanism in Send-VmConsoleKeys.ps1. PS7 removed the WMI cmdlets, but the name
+# still RESOLVES: auto-loading finds it in Windows PowerShell's own
+# Microsoft.PowerShell.Management and imports that module through the Windows
+# PowerShell compatibility session. So `Get-Command Get-WmiObject` succeeds under
+# pwsh, this took the WMI branch, and everything crossing that session boundary
+# comes back SERIALISED — a property bag with the data and none of the methods.
+# `$vm.GetRelated(...)` then fails with "does not contain a method named
+# 'GetRelated'". A fallback selected by a test that is always true is not a
+# fallback.
+#
+# CIM is native to 5.1 and 7 alike, crosses no compatibility boundary, and has
+# no methods on the object to lose. Said plainly: this path had never been run
+# here when it was written as the fallback, and it is now the only one.
 function Save-VmScreenshot {
     param([string]$Name, [string]$Path, [int]$W, [int]$H)
 
-    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
-        $vm = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_ComputerSystem `
-                -Filter "ElementName='$Name'"
-        if (-not $vm) { return 'no such VM' }
-        $vsd = ($vm.GetRelated('Msvm_VirtualSystemSettingData') | Select-Object -First 1)
-        $svc = Get-WmiObject -Namespace root\virtualization\v2 -Class Msvm_VirtualSystemManagementService
-        $res = $svc.GetVirtualSystemThumbnailImage($vsd, $W, $H)
-    } else {
-        $vm = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ComputerSystem `
-                -Filter "ElementName='$Name'"
-        if (-not $vm) { return 'no such VM' }
-        $vsd = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VirtualSystemSettingData |
-                 Select-Object -First 1
-        $svc = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_VirtualSystemManagementService
-        $res = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage -Arguments @{
-            TargetSystem = [ciminstance]$vsd
-            WidthPixels  = [uint16]$W
-            HeightPixels = [uint16]$H
-        }
+    # Caption='Virtual Machine' because Msvm_ComputerSystem also describes the
+    # HOST; Msvm_SettingsDefineState because a VM with checkpoints has several
+    # Msvm_VirtualSystemSettingData and only one of them is the running state.
+    $vm = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ComputerSystem `
+            -Filter "ElementName='$Name' and Caption='Virtual Machine'" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    if (-not $vm) { return 'no such VM' }
+    $vsd = Get-CimAssociatedInstance -InputObject $vm -Association Msvm_SettingsDefineState `
+             -ResultClassName Msvm_VirtualSystemSettingData -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+    if (-not $vsd) { return 'no virtual system settings' }
+    $svc = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_VirtualSystemManagementService |
+             Select-Object -First 1
+    $res = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage -Arguments @{
+        TargetSystem = [ciminstance]$vsd
+        WidthPixels  = [uint16]$W
+        HeightPixels = [uint16]$H
     }
     if ($res.ReturnValue -ne 0 -or -not $res.ImageData) { return "thumbnail rc=$($res.ReturnValue)" }
 

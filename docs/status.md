@@ -1156,7 +1156,12 @@ Wiring: `COMPOSE_PROFILES` in `.env` is the enable switch (firstboot's plain
 `compose up -d` honors it); commented Caddyfile sites + `EXTRA_SUBDOMAINS`
 (provision script loop) for public exposure; `export-images.sh` gained
 `EXTRA_PROFILES` and its default behavior — tier-2 excluded from the baked
-payload — falls out of profiles being off (OI-7(a) to ratify). Docs:
+payload — falls out of profiles being off (OI-7(a) to ratify).
+**[SUPERSEDED 2026-08-07 — see the last entry in this log.** That default was
+ratified the other way, by running it: a box whose `.env` enabled five profiles
+shipped 9 of the 15 images it needed. `export-images.sh` now bakes what
+`COMPOSE_PROFILES` enables. Left in place because this entry records what was
+decided on 2026-07-10, and rewriting it would falsify the log.] Docs:
 stack/README §9 (incl. the pre-build configuration chain + RAM/storage ground
 rules); root README table row.
 

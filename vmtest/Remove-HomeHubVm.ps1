@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     WI-10.18 V3 gate — companion teardown for New-HomeHubVm.ps1.
 

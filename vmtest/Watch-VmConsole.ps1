@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Capture a Hyper-V VM's console (thumbnail API -> PNG) on a loop, for as long
     as the install actually takes, and say out loud why it stops.

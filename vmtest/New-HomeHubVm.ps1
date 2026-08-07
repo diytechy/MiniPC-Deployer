@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     WI-10.18 V3 gate — create a local Hyper-V Gen2 VM standing in for the AWOW
     AK41, boot the real Ubuntu Server autoinstall ISO + the CIDATA seed ISO

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Bring up the A19 two-VM gate: the hub serving the kiosk site, the panel
     rendering it, both on one Internal switch at known addresses.

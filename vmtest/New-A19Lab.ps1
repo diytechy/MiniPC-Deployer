@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Create (or remove) the A19 gate's Internal Hyper-V switch and give the host
     an address on it.

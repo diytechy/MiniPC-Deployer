@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   Type into a Hyper-V VM's console through the synthetic keyboard, for guests
@@ -108,7 +108,7 @@ if (-not $kb) {
            'a stopped VM has no synthetic keyboard to attach to.')
 }
 
-# send_key NAME ARGS — one Msvm_Keyboard call, and its ReturnValue JUDGED.
+# Invoke-Keyboard METHOD ARGS WHAT — one Msvm_Keyboard call, ReturnValue JUDGED.
 #
 # The old code discarded every result with `$null =`. The header is right that
 # sending a key is not proof it was received — nothing here can read the screen

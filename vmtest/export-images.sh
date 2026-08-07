@@ -139,6 +139,27 @@ mapfile -t IMAGES < <(
 log "the AWOW will ship these ${#IMAGES[@]} images from infancy (Q10.9 B+):"
 for ref in "${IMAGES[@]}"; do log "    - $ref"; done
 
+# ── the disk check, AGAIN, now that we know how many ─────────────────────────
+# THE 3 GB FLOOR ABOVE WAS SIZED FOR THE CORE SET, whose saved tars "sum to
+# ~1GB" per this file's own comment. That was true while the bake was core+ntfy.
+# Since the profile fix it is core+ntfy PLUS whatever COMPOSE_PROFILES enables,
+# and the tier-2 catalog contains genuinely large images — immich-machine-
+# learning carries resident CLIP and face-recognition models and is multiple GB
+# on its own. A hub configured with immich+immich-ml+jellyfin can therefore
+# resolve an image set several times the size of the one the floor was chosen
+# for, and the failure mode of getting this wrong is a `docker save` that fills
+# the volume partway through a long build.
+#
+# So re-check with a floor that scales. 1.5 GB per image is an ESTIMATE and is
+# labelled as one — it is generous for the core set and roughly right for the
+# heavy tier-2 ones. The point is not to predict the number precisely; it is to
+# stop a five-profile bake from running headlong into a floor chosen when the
+# answer was always nine.
+NEED_GB=$(( ${#IMAGES[@]} * 3 / 2 ))
+[ "$NEED_GB" -lt 3 ] && NEED_GB=3
+log "re-checking free space for ${#IMAGES[@]} images (~1.5GB each, estimated)"
+require_free_gb "$IMAGES_OUT" "$NEED_GB"
+
 mkdir -p "$IMAGES_OUT"
 MANIFEST="$IMAGES_OUT/images.manifest.tsv"
 printf 'repo_tag\timage_id\trepo_digest\tsaved_file\tbytes\n' > "$MANIFEST"

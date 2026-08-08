@@ -362,8 +362,84 @@ if ! grep -qE '^CLOUDFLARE_API_TOKEN=.+' "$STACK_DIR/.env" 2>/dev/null; then
     log "  Fix: put the scoped Zone->DNS->Edit token in .env, then re-run this script."
 fi
 
+# ── 4a-pre-2. CREATE THE BIND-MOUNT SOURCES ON THE DATA DRIVES ───────────────
+# FOUND 2026-08-08, and it took the whole stack down on a box that had installed
+# perfectly:
+#
+#   Error response from daemon: error while creating mount source path
+#   '/srv/library/NonDocs/Media/Movies': chown ...: operation not permitted
+#
+# Docker creates a missing bind-mount source directory and then CHOWNS it. The
+# data drives are exfat (A23 chose LABEL mounts so the first days of service can
+# run on plain flash drives, and those are FAT-family filesystems with no
+# ownership at all), so the chown returns EPERM and `docker compose up -d`
+# ABORTS — leaving eight containers in `created`, Caddy among them, and firstboot
+# dead before it provisioned DNS, Samba or anything else. Every downstream
+# failure that run traced back to this one line.
+#
+# THE FIX IS ORDERING, NOT PERMISSIONS. Docker only chowns a path it had to
+# create; a directory that already exists is left exactly alone. Proven on the
+# live box: pre-create, re-run `up`, and all fifteen containers start.
+#
+# NOT A LAB ARTIFACT. The fstab options for these mounts are uid/gid/umask —
+# which only exist on filesystems without native ownership — so the real drives
+# are the same family. A first install onto an empty drive hits this identically;
+# the lab's stand-in just gets there first because it has no directories at all.
+#
+# SOURCED FROM COMPOSE ITSELF rather than a list retyped here. `docker compose
+# config` resolves every variable and prints bind mounts in long form, so this
+# cannot drift from the file it is protecting — the rule packages.list follows.
+# Restricted to the data mounts on purpose: creating an arbitrary missing bind
+# source would paper over a genuinely absent Caddyfile or allow-list.
+log "ensuring bind-mount sources exist on the data drives (docker cannot chown them into being)…"
+_created=0
+while read -r _src; do
+    case "$_src" in
+        /srv/library/*|/mnt/backup-drive/*)
+            if [ ! -d "$_src" ]; then
+                mkdir -p "$_src" && _created=$((_created + 1))
+                log "  created $_src"
+            fi ;;
+    esac
+done <<EOF
+$(docker compose config 2>/dev/null | awk '/^ *source: \//{print $2}' | sort -u)
+EOF
+log "  bind-mount sources checked; $_created created"
+
 log "docker compose up -d…"
 docker compose up -d
+
+# ── 4a-post. DID THEY ACTUALLY STAY UP? ──────────────────────────────────────
+# `docker compose up -d` returns 0 once containers are STARTED. A container that
+# starts and then dies on its own configuration exits 0 here and restart-loops
+# quietly afterwards — which is exactly what a bad ACME provider token did on
+# 2026-08-08: Caddy refused its own config, `up` reported success, and the box
+# came up with every web surface dead and nothing in firstboot's log about it.
+#
+# So: give them a moment to fall over, then name any that did. This catches the
+# whole class — a bad token, a missing bind source, an image that will not run on
+# this kernel — rather than the one instance that prompted it.
+#
+# NOT FATAL, deliberately. The box is reachable, the data is mounted, and the
+# rest of provisioning is still worth doing; a named WARN in the journal and a
+# non-zero unit at the end serve better than refusing to finish.
+sleep 15
+_notrunning=""
+for _c in $(docker compose ps --services 2>/dev/null); do
+    _st="$(docker inspect -f '{{.State.Status}}' "$_c" 2>/dev/null || echo missing)"
+    case "$_st" in
+        running|exited) ;;   # exited is correct for one-shot services
+        *) _notrunning="$_notrunning $_c($_st)" ;;
+    esac
+done
+if [ -n "$_notrunning" ]; then
+    log "WARN: container(s) did not reach a running state:$_notrunning"
+    log "  'docker compose up -d' returned success — it reports STARTED, not STAYED UP."
+    log "  A container that rejects its own configuration looks exactly like this."
+    log "  Read:  docker logs <name> --tail 30"
+else
+    log "every compose service reached a running state"
+fi
 
 # ── 4b. CAN CADDY ACTUALLY READ THE KIOSK CONFIG? (OI-20) ────────────────────
 # Installing a 0600 root-owned file into a bind mount is not the same as the

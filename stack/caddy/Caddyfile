@@ -50,7 +50,55 @@
     # NEEDS THE PLUGIN, which is why stack/caddy/Dockerfile exists: Caddy's DNS
     # providers are compiled in and the stock image has none. The token is the
     # same Zone:DNS:Edit one the ddns updater already uses.
-    acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
+    #
+    # THE ISSUER IS CONFIGURED PER SITE, NOT HERE, and that is not a style
+    # choice — see the (acme_cloudflare) snippet below. A global
+    # `acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}` works and was what shipped
+    # first, but it takes no `resolvers`, and without those the challenge can
+    # never complete on this box. The block form that would carry them
+    # (`acme_dns cloudflare <token> { resolvers ... }`) does not adapt at all —
+    # measured, not assumed.
+}
+
+# ── ACME dns-01 against Cloudflare, with PUBLIC resolvers ────────────────────
+# ADDED 2026-08-08, after the challenge hung on a live hub with no error at all.
+#
+# WHAT HAPPENS WITHOUT `resolvers`. Caddy writes the _acme-challenge TXT record
+# through the Cloudflare API — that part works, and was verified at Cloudflare —
+# and then polls DNS until it can see the record itself before telling the CA to
+# validate. That poll uses the system resolver, which on this box is Technitium:
+# AUTHORITATIVE for {$DOMAIN} and holding no _acme-challenge record, so it does
+# not forward the query, it answers NXDOMAIN. Authoritatively. Forever.
+#
+# The result is a challenge stuck at "trying to solve" with nothing logged as an
+# error, no certificate, and every HTTPS site serving a TLS handshake failure.
+#
+# IT IS THE SAME SHAPE AS THE ddns HEALTHCHECK (docker-compose.yml), found the
+# same day: a component that must see the PUBLIC view of DNS, pointed by default
+# at a resolver built to answer with the private one. Split-horizon is correct
+# and so is each component; what is wrong is letting them share a resolver.
+#
+# WHY NOT JUST GIVE THE CONTAINER `dns: 1.1.1.1` the way ddns has? Because Caddy
+# resolves its upstreams by CONTAINER NAME — `reverse_proxy tracker:8787`,
+# `oauth2-proxy:4180`, `actual:5006` — and those only work through Docker's
+# embedded resolver at 127.0.0.11. Overriding the container's DNS would fix the
+# challenge and break every proxied site. This scopes the public resolvers to
+# the ACME challenge and nothing else.
+#
+# IMPORTED BY EVERY SITE. The global acme_dns was deliberately removed rather
+# than left as a fallback: a site that forgets this import now fails fast on
+# http-01 (connection refused, in seconds) instead of hanging on a poll that
+# cannot terminate. Fast and loud beats quiet and stuck.
+(acme_cloudflare) {
+    tls {
+        dns cloudflare {$CLOUDFLARE_API_TOKEN}
+        # Public resolvers, deliberately NOT this box's.
+        resolvers 1.1.1.1 1.0.0.1
+        # Cloudflare publishes in seconds; the default 2m has no headroom for a
+        # slow propagation and the failure it produces is indistinguishable from
+        # the one above.
+        propagation_timeout 5m
+    }
 }
 
 # ── shared snippets: one basic_auth guard per single-user service ─────────────
@@ -73,6 +121,7 @@
 # injecting the identity headers the tracker's trusted-header mode reads (D3).
 # The /oauth2/* callback + sign-in routes live inside oauth2-proxy too.
 {$TRACKER_HOST} {
+    import acme_cloudflare
     encode zstd gzip
     reverse_proxy oauth2-proxy:4180 {
         # oauth2-proxy needs the original host/scheme to build its redirect URL.
@@ -120,6 +169,7 @@
 # DDNS wildcard, and Caddy solves the ACME challenge over the EXISTING :80/:443
 # listeners, not over {$WALL_PORT}.
 {$WALL_HOST}:{$WALL_PORT} {
+    import acme_cloudflare
     encode zstd gzip
 
     # The one address allowed to be the panel. /32 = exactly one host.
@@ -190,6 +240,7 @@
 
 # ── actual.<domain> — Actual Budget (single-user; KEEP basic_auth) ─────────────
 {$ACTUAL_HOST} {
+    import acme_cloudflare
     import protect_actual
     encode zstd gzip
     reverse_proxy actual:5006
@@ -198,6 +249,7 @@
 # ── dns.<domain> — Technitium web console (single-admin; KEEP basic_auth) ──────
 # Technitium binds :5380 on the host (host-network); proxy to the host gateway.
 dns.{$DOMAIN} {
+    import acme_cloudflare
     import protect_dns
     encode zstd gzip
     # host.docker.internal → the host where Technitium's :5380 lives.
@@ -258,5 +310,6 @@ dns.{$DOMAIN} {
 
 # ── apex — bare domain answers on-LAN too ──────────────────────────────────────
 {$DOMAIN} {
+    import acme_cloudflare
     respond "AWOW always-on core. Try https://{$TRACKER_HOST}" 200
 }

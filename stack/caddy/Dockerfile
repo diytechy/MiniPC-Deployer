@@ -48,7 +48,30 @@ FROM caddy:${CADDY_VERSION}-builder AS builder
 # Pinned. An unpinned plugin means the image content changes under a tag that
 # does not, which breaks the one thing the bake depends on: that what was
 # validated is what ships.
-ARG CLOUDFLARE_PLUGIN_VERSION=v0.2.1
+#
+# v0.2.4, NOT v0.2.1, AND THE REASON IS A LESSON RATHER THAN A VERSION BUMP.
+# This shipped as v0.2.1, validated against a made-up token, and passed. On the
+# first real box Caddy then refused to load its config AT ALL and crash-looped:
+#
+#   provision dns.providers.cloudflare: API token '...' appears invalid;
+#   ensure it's correctly entered and not wrapped in braces nor quotes
+#
+# The token was fine. Cloudflare issues User API Tokens with a `cfut_` prefix
+# now, and the libdns/cloudflare bundled in v0.2.1 validates a length its own
+# provider had outgrown. Measured across both versions with dummy tokens of
+# several shapes: v0.2.1 accepts up to 49 characters and rejects 53; v0.2.4
+# (libdns/cloudflare v0.2.2) accepts 53. The real token is 53.
+#
+# WHY THE PRE-SHIP VALIDATION MISSED IT: it was run with a placeholder. That is
+# the same trap this project already documents for the identity store - "never
+# point HOMEHUB_IDENTITY at the example file, it would report clean no matter
+# what real data sat in the tree". A credential-shaped check against a fake
+# credential proves the plumbing and nothing about the credential.
+#
+# Bumping this again is fine; validating it against a REAL token before shipping
+# is the part that is not optional. The cost of getting it wrong is not "no
+# certificates" - it is no Caddy at all, and every web surface with it.
+ARG CLOUDFLARE_PLUGIN_VERSION=v0.2.4
 RUN xcaddy build \
     --with github.com/caddy-dns/cloudflare@${CLOUDFLARE_PLUGIN_VERSION}
 

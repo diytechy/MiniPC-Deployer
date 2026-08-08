@@ -4316,3 +4316,62 @@ have been, for the DHCP-gave-a-different-address case.
 **What this run did prove**, and it is the assertion the whole 2026-08-06 effort
 was for: **8004 MB installed with the network adapter disconnected**, and SSH
 accepting the operator key unattended afterwards.
+
+### DRIVER — G1 — Round 1 — 2026-08-08 (the panel installs at last; and the mount check could never have passed)
+
+**Three lab runs, both machines installed offline, five defects.** The
+2026-08-07 entry above covers the first two; this one closes the day.
+
+**THE PANEL INSTALLED, END TO END, FOR THE FIRST TIME.** `wall-firstboot.service`
+Result=success, the shell artifact present at `/opt/wall-panel/app/wall-shell`, a
+kiosk session running, sshd enabled — and it did it with the VM's network adapter
+disconnected, finishing **4.8 minutes** before the cable went back in. The hub
+did the same with 1.1–1.2 minutes of margin. `Assert-OfflineInstall` has now
+returned PASS on both targets, which it had never done for either.
+
+**AND `sudo` WORKS**, verified on a rebuilt image: `SUDO-OK: the drop-in landed`.
+Both boxes are remotely maintainable rather than merely readable.
+
+**DEFECT: `provision-mounts.sh` could never find a data drive.** It tested
+`[ -e "$dev" ]` where `$dev` is the fstab line's FIRST FIELD — `LABEL=Library`, a
+mount spec, not a path. Always false. So the mount below it was never attempted,
+and `provision-samba` — which refuses to export an unmounted path, correctly —
+killed firstboot with a FATAL. **Every first boot, on every box, since the fstab
+moved to `LABEL=` for A23.** Measured both directions on a live hub:
+`[ -e "LABEL=Library" ]` false, `blkid -L Library` → `/dev/sdb2`, and
+`mount /srv/library` succeeded instantly by hand.
+
+It hid because systemd's fstab-generator mounts these on the NEXT boot anyway, so
+the drives are up by the time anyone logs in — only firstboot, the one pass that
+provisions Samba, ever saw them missing. **A lab run that reconnected LATE saw
+mounted drives and passed; the run that reconnected promptly did not.** The
+defect was masked by the timing of the observer, and fixing the heartbeat is what
+exposed it. `resolve_mount_spec` now handles LABEL=/UUID=/PARTLABEL=/PARTUUID=
+and bare paths, via `blkid` (which probes devices rather than waiting on udev's
+symlinks) with a bounded wait — the real hub's drives are USB and slow, which the
+fstab already admits with `x-systemd.device-timeout=15s`.
+
+**DEFECT: the image bake read the wrong .env, twice.** First the profile list was
+hardcoded `--profile ntfy` here; then, once that was fixed, `Build-VentoyStick.ps1`
+called this script with no `--env-file` at all, so it resolved against
+`stack/.env.example` (COMPOSE_PROFILES empty) while the ISO shipped a
+materialised `.env` enabling five. Nine images baked, fifteen needed, and the six
+missing were exactly the six that failed to pull. `docker compose up -d` is
+all-or-nothing, so one unreachable OPTIONAL image stopped DNS, Caddy, the tracker
+and Actual from starting at all.
+
+Twice in one day, **the thing that DECIDED the image set was not the thing that
+RAN the box.** `export-images.sh` now writes `profiles.stamp` recording which
+`.env` it was asked about, and `stage_images_into_payload` compares it against
+the `.env` staged beside it, naming any enabled-but-unbaked profile. It warns
+where the apt stager dies, deliberately: a short image set has a degraded mode
+and refusing would break every deliberately-narrow bake (the sim, the wall
+target, `EXTRA_PROFILES`). What it must never be is silent, which it was.
+
+Consequence to weigh, recorded for the Owner: the hub ISO went from 3.8 GB to
+**5.8 GB**, because `immich`, `immich-ml`, `jellyfin` and `finance-auditor` are
+genuinely enabled in `config.homehub.psd1` and are now genuinely baked. That was
+always the configuration; it simply never shipped.
+
+**NOT YET RUN:** the `provision-mounts` fix has never executed inside a firstboot.
+The next `-Stage All` is what settles it.

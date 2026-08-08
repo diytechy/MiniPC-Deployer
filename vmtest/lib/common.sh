@@ -1535,6 +1535,49 @@ stage_images_into_payload() {
         total=$(( total + $(stat -c%s "$t") ))
     done
     [ -f "$images_out/images.manifest.tsv" ] && cp -f "$images_out/images.manifest.tsv" "$dest/"
+    [ -f "$images_out/profiles.stamp" ] && cp -f "$images_out/profiles.stamp" "$dest/"
+
+    # ── DOES THIS BAKE MATCH THE .env THIS ISO IS ABOUT TO SHIP? ──────────────
+    # THE CHECK THAT WOULD HAVE CAUGHT BOTH 2026-08-07 DEFECTS, and it is the
+    # discipline stage_apt_into_payload has had all along: refuse a payload whose
+    # baked half disagrees with its configured half, so drift is a refused BUILD
+    # where someone can act on it rather than a first boot reaching for a
+    # registry on a machine that may be on a wall.
+    #
+    # Both failures had the same shape and neither was visible afterwards: the
+    # profile list was hardcoded here, then the caller passed no --env-file at
+    # all. Each time the payload looked complete. The stamp records which .env
+    # decided the set; this compares it against the one being staged beside it.
+    #
+    # WARNS RATHER THAN DIES, and that asymmetry with the apt side is deliberate.
+    # A missing apt repo installs NOTHING — no sshd, no docker — and there is no
+    # degraded mode. A short image set has one: firstboot pulls what it lacks, on
+    # a box with a network. Refusing the build would also break every legitimate
+    # caller that bakes deliberately narrow (the sim, the wall target, an
+    # EXTRA_PROFILES bake). What it must never do is be SILENT, which is what it
+    # was.
+    local shipped_env="$out_dir/iso-root/deploy-payload/site/.env"
+    [ -f "$shipped_env" ] || shipped_env="$out_dir/iso-root/deploy-payload/.env"
+    if [ -f "$shipped_env" ] && [ -f "$images_out/profiles.stamp" ]; then
+        local want got missing p
+        want="$(sed -n 's/^[[:space:]]*COMPOSE_PROFILES[[:space:]]*=[[:space:]]*//p' "$shipped_env" \
+                | tail -n1 | tr -d '"'\''' | tr ',' ' ')"
+        got="$(awk -F'\t' '$1=="profiles"{print $2}' "$images_out/profiles.stamp")"
+        missing=""
+        for p in $want; do
+            case " $got " in *" $p "*) ;; *) missing="$missing $p" ;; esac
+        done
+        if [ -n "$missing" ]; then
+            log "WARNING: the .env on this ISO enables profile(s) that were NOT baked:$missing"
+            log "  baked for: '${got:-<none>}'   shipping: '${want}'"
+            log "  Those services will PULL from a registry at first boot, and \`docker compose"
+            log "  up -d\` is all-or-nothing — one unreachable image stops the ENTIRE core stack"
+            log "  (DNS, Caddy, tracker, Actual). Measured 2026-08-07."
+            log "  Fix: bash vmtest/export-images.sh --env-file <the .env this ISO ships>"
+        else
+            log "image bake matches the shipped .env (profiles: '${want:-<none>}')"
+        fi
+    fi
     [ "$had_nullglob" -eq 1 ] || shopt -u nullglob
 
     log "deploy-payload/images/ = $(( total / 1024 / 1024 )) MB across ${#tars[@]} tar(s)"

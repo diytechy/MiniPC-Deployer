@@ -48,6 +48,29 @@ dnsutils              # provides dig for the health check
 # that drop-in and does nothing with it, silently. An implicit dependency that
 # load-bearing should be explicit.
 systemd-resolved      # firstboot step 6 configures it; :53 belongs to Technitium
+# THE THREE BELOW ARE THE PRICE OF THE ONE ABOVE, and leaving them out cost a
+# whole lab run (2026-08-08). Every binary package built from the systemd source
+# Depends on systemd (= ${binary:Version}) — an EXACT match, not a floor. Naming
+# systemd-resolved made export-apt.sh bake systemd 255.4-1ubuntu8.16, because
+# that is what the archive had; the ISO's base system carries 8.12. apt then had
+# to reconcile an 8.16 systemd with an 8.12 udev, and its only move was to
+# REMOVE udev — taking initramfs-tools, cloud-init, netplan.io, mdadm,
+# multipath-tools, ubuntu-minimal and ubuntu-server with it.
+#
+# The box came up with no /dev/disk/by-uuid/* (that is udev's
+# 60-persistent-storage.rules), so /boot and /boot/efi never appeared,
+# local-fs.target failed, and it reached emergency.target on every boot with no
+# network at all. It looked exactly like "the hub never appeared on the network".
+#
+# So the rule this leaves behind: NAMING ONE PACKAGE OF A SOURCE PACKAGE'S
+# BINARY FAMILY DRAGS THE WHOLE FAMILY'S VERSION, and every sibling the base
+# system already has must be named beside it or apt will delete it. These three
+# are the siblings Ubuntu Server installs by default. late-command 3c now passes
+# --no-remove, so if this list ever falls short again the install FAILS with the
+# package named instead of producing a machine that boots to a rescue prompt.
+udev                  # /dev/disk/by-uuid/* — without it local-fs.target cannot resolve
+systemd-timesyncd     # base-installed sibling; strict-versioned against systemd
+libnss-systemd        # base-installed sibling; strict-versioned against systemd
 apt-transport-https
 
 # ── remote management (WI-10.12) ────────────────────────────────────────────

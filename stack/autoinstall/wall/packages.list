@@ -49,6 +49,25 @@ network-manager        # quirk 5: powersave off, and the netplan renderer
 # transitively; the panel's deliberately lean one does not. Neither list named
 # it, so neither install was actually asking for it — the hub was lucky.
 systemd-resolved       # /etc/resolv.conf; without it the panel resolves NOTHING
+# AND ITS SIBLINGS, for the reason the hub's list now spells out at length:
+# every binary from the systemd source Depends on systemd (= ${binary:Version})
+# EXACTLY, so naming one drags the whole family to the archive's version and apt
+# DELETES any sibling the baked repo cannot match.
+#
+# MEASURED ON THIS PANEL, 2026-08-08, after it installed and came up looking
+# perfectly healthy: `udev` survived at 8.16 (the wall's heavier set happened to
+# carry it), but `libnss-systemd` and `systemd-timesyncd` were both left
+# `deinstall ok config-files` at 8.12 — REMOVED. The hub, whose list did not
+# drag udev, lost udev too and reached emergency.target on every boot.
+#
+# So the panel has been running with NO TIME SYNCHRONISATION, on a device whose
+# entire job is to display a wall clock and honour a sleep window. Nothing
+# reported it: the box boots, the kiosk paints, and the clock is simply wrong by
+# however far the RTC has drifted. That is the failure mode this repo keeps
+# meeting — a machine that looks healthy while missing something load-bearing.
+udev                   # /dev/disk/by-uuid/* — local-fs.target cannot resolve without it
+systemd-timesyncd      # the wall shows a CLOCK; it was being removed at install
+libnss-systemd         # base-installed sibling; strict-versioned against systemd
 
 # ── the media sync (OI-15): the panel PULLS, so it needs a cifs client ───────
 cifs-utils             # mount.cifs — the read-only mount of the media share

@@ -293,6 +293,14 @@ autoinstall:
     # synthetic 802.11 device). An install that needs no network needs no radio,
     # so the gap between what the lab proves and what the bench does just closed
     # by the width of the whole apt phase.
+    #
+    # --no-remove for the reason ../user-data spells out in full: naming one
+    # binary of the systemd source family drags the whole family's version, and
+    # apt will happily DELETE a sibling the baked repo cannot match rather than
+    # fail. Measured on this very image (2026-08-08): libnss-systemd and
+    # systemd-timesyncd were both removed at install and nobody noticed, because
+    # a panel with no time synchronisation still boots and still paints. This
+    # install may upgrade and install; it may not remove.
     - >-
       curtin in-target --target=/target -- bash -c 'set -e;
       R=/opt/wall-panel;
@@ -303,7 +311,7 @@ autoinstall:
       APT="-o Dir::Etc::sourcelist=/run/baked-apt/sources.list -o Dir::Etc::sourceparts=/run/baked-apt/parts -o APT::Get::List-Cleanup=0";
       export DEBIAN_FRONTEND=noninteractive;
       apt-get $APT update;
-      xargs -a "$R/apt/packages.baked.list" apt-get $APT install -y --no-install-recommends;
+      xargs -a "$R/apt/packages.baked.list" apt-get $APT install -y --no-install-recommends --no-remove;
       echo "wall: installed $(wc -l < "$R/apt/packages.baked.list") package(s) from the baked repo, with no network at all"'
     # sshd is the panel's ONLY door once it is on a wall: tty1 autologins into
     # cage, the console password is locked, and the machine is out of reach. A

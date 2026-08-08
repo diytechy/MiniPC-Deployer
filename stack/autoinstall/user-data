@@ -353,6 +353,45 @@ autoinstall:
     # returns instantly with --network none; unscoped it hangs on DNS.)
     # APT::Get::List-Cleanup=0 keeps curtin's archive lists, which a scoped
     # update would otherwise prune as "sources no longer configured".
+    #
+    # --no-remove IS LOAD-BEARING, AND IT IS HERE BECAUSE THIS STEP ONCE BRICKED
+    # THE HUB SILENTLY (2026-08-08). packages.list gained one name —
+    # `systemd-resolved`, so the resolver would stop being an implicit
+    # dependency — and export-apt.sh duly baked systemd 255.4-1ubuntu8.16 to
+    # satisfy it. The ISO's base system carries 8.12, and `udev` Depends on
+    # systemd (= ${binary:Version}) EXACTLY. `udev` was not a named package, so
+    # no 8.16 of it was ever fetched, and apt found the only resolution it had:
+    #
+    #     Remove: udev, initramfs-tools, busybox-initramfs, cloud-init,
+    #             netplan.io, netplan-generator, mdadm, multipath-tools,
+    #             open-iscsi, plymouth, snapd, ubuntu-minimal, ubuntu-server
+    #
+    # It removed the boot infrastructure to install a resolver. No udev means no
+    # /dev/disk/by-uuid/* symlinks; the .device units for /boot and /boot/efi
+    # (which curtin writes as by-uuid PATHS, and which carry no nofail) never
+    # appear; local-fs.target fails; and the box reaches emergency.target on
+    # EVERY boot. No netplan.io means no network was ever configured, so it was
+    # not merely broken, it was unreachable — and the run reported it as "the hub
+    # never appeared on the network within 60 minutes", which reads like the lab.
+    #
+    # -y ANSWERED THE QUESTION A HUMAN WOULD HAVE STOPPED AT. Interactive apt
+    # prints "the following packages will be REMOVED" and waits. Unattended, it
+    # just did it.
+    #
+    # So: this install may UPGRADE and it may INSTALL, and it may never REMOVE.
+    # With --no-remove apt exits non-zero instead, `set -e` fails the
+    # late-command, and the install stops with the offending package named —
+    # which is the difference between a build someone can fix and a machine that
+    # boots to a maintenance prompt on a wall.
+    #
+    # NOTE WHAT DID NOT CATCH THIS. export-apt.sh proves the closure resolves
+    # offline, in a throwaway ubuntu:24.04 CONTAINER — which ships no udev, no
+    # initramfs-tools and no cloud-init, so the resolution it proved is not the
+    # one that runs in /target. And a REMOVAL IS A VALID RESOLUTION: it asked
+    # "can apt satisfy this list with no network?", got yes, and never asked
+    # what the answer cost. Same shape as the caddy plugin validated with a
+    # placeholder token: the check proved the plumbing and nothing about the
+    # outcome.
     - >-
       curtin in-target --target=/target -- bash -c 'set -e;
       R=/opt/homehub;
@@ -363,7 +402,7 @@ autoinstall:
       APT="-o Dir::Etc::sourcelist=/run/baked-apt/sources.list -o Dir::Etc::sourceparts=/run/baked-apt/parts -o APT::Get::List-Cleanup=0";
       export DEBIAN_FRONTEND=noninteractive;
       apt-get $APT update;
-      xargs -a "$R/apt/packages.baked.list" apt-get $APT install -y --no-install-recommends;
+      xargs -a "$R/apt/packages.baked.list" apt-get $APT install -y --no-install-recommends --no-remove;
       echo "homehub: installed $(wc -l < "$R/apt/packages.baked.list") package(s) from the baked repo, with no network at all"'
     # ENABLE THEM EXPLICITLY. Every one of these is enabled by its own postinst
     # in an ordinary install, and none of them can be RELIED on to be: curtin

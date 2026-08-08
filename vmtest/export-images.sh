@@ -272,6 +272,22 @@ for ref in "${IMAGES[@]}"; do
         [ "${ALLOW_STALE_LOCAL:-0}" = "1" ] || assert_local_image_fresh "$ref"
     else
         case "$ref" in
+            caddy-cloudflare:*)
+                # NOT PULLABLE, AND THE TAG LOOKS LIKE IT SHOULD BE — which is the
+                # whole reason this arm exists ahead of the `*:local` one. It is a
+                # normal-looking version tag on an image that has no registry
+                # anywhere: Caddy compiles its DNS providers in, so the plugin
+                # build has to be local. Without this case the `docker pull`
+                # below would fail with "manifest unknown" and send someone
+                # hunting for a tag typo.
+                die "MISSING locally-built image '$ref' — no registry publishes it." \
+                    "Caddy's DNS providers are compiled INTO the binary, so the Cloudflare" \
+                    "provider only exists in an image built from stack/caddy/Dockerfile." \
+                    "Build it:  bash scripts/ensure-local-images.sh" \
+                    "Without it Caddy cannot answer a dns-01 challenge, and with no inbound" \
+                    ":80 that means no certificate at all — every HTTPS site down, including" \
+                    "the LAN-only kiosk site the wall panel displays."
+                ;;
             naglight:*|*:local)
                 die "MISSING local-only image '$ref' — it has no registry home (Q10.2)." \
                     "Resolve it first:  bash scripts/ensure-local-images.sh" \

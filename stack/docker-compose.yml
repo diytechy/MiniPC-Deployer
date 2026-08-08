@@ -54,7 +54,12 @@ services:
       start_period: 40s
 
   caddy:
-    image: caddy:${CADDY_IMAGE_TAG}
+    # NOT the stock caddy image — see stack/caddy/Dockerfile for why. Caddy's DNS
+    # providers are compiled in, and this stack needs the Cloudflare one so ACME
+    # can use dns-01 and stop depending on an inbound :80 that the router does
+    # not forward. Built by scripts/ensure-local-images.sh, baked by
+    # vmtest/export-images.sh like every other image.
+    image: caddy-cloudflare:${CADDY_IMAGE_TAG}
     container_name: caddy
     ports:
       - "80:80"
@@ -88,6 +93,12 @@ services:
       DNS_BASICAUTH_USER: ${DNS_BASICAUTH_USER}
       DNS_BASICAUTH_HASH: ${DNS_BASICAUTH_HASH}
       ACME_EMAIL: ${ACME_EMAIL}
+      # THE dns-01 CREDENTIAL. The Caddyfile's global `acme_dns cloudflare`
+      # reads it; without it every issuance falls back to http-01 and needs a
+      # router forward. Same token the ddns service uses (Zone:DNS:Edit), so
+      # this adds no secret — but it does put it in a second container's
+      # environment, which is worth knowing rather than discovering.
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
       MAIN_BOX_IP: ${MAIN_BOX_IP}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
@@ -336,6 +347,28 @@ services:
         {"provider":"cloudflare","zone_identifier":"${CLOUDFLARE_ZONE_ID}","domain":"${DOMAIN}","ttl":300,"token":"${CLOUDFLARE_API_TOKEN}","ip_version":"ipv4"},
         {"provider":"cloudflare","zone_identifier":"${CLOUDFLARE_ZONE_ID}","domain":"*.${DOMAIN}","ttl":300,"token":"${CLOUDFLARE_API_TOKEN}","ip_version":"ipv4"}
         ]}
+    # RESOLVE THROUGH A PUBLIC RESOLVER, NOT THIS BOX'S. Added 2026-08-08 after
+    # the container sat `unhealthy` with a FailingStreak of 37 while doing its
+    # job perfectly.
+    #
+    # ddns-updater's healthcheck resolves ${DOMAIN} and compares the answer with
+    # the public IP it just pushed. By default that lookup goes through the
+    # host's resolver — which is Technitium, which is SPLIT-HORIZON and answers
+    # with the LAN address by design. So the check compared the LAN IP against
+    # the WAN IP, found them different, and reported unhealthy forever:
+    #     lookup IP addresses do not match: <lan ip> instead of <wan ip>
+    # The updates themselves were landing at Cloudflare every ten minutes
+    # throughout. The split-horizon design and the healthcheck's assumption are
+    # each correct and cannot both be satisfied from the same resolver.
+    #
+    # Pointing it outward makes the check MEAN something instead of merely
+    # passing: it becomes "the public record matches this connection's public
+    # IP", which is TC-H-I02 in docs/LAB_TEST_PLAN.md, asserted continuously by
+    # the container itself. A stale public record is exactly the failure a DDNS
+    # updater exists to prevent and the only one it could not previously see.
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
     volumes:
       - ddns_data:/updater/data
     restart: unless-stopped

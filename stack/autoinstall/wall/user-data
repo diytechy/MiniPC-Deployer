@@ -110,8 +110,13 @@ autoinstall:
   # openssh-server to the SAME pre-late-command apt run `packages:` uses, which
   # is the run that has no baked repo to draw on. openssh-server is in
   # ./packages.list and is installed offline by late-command 3c, which also
-  # enables ssh.service. authorized-keys and allow-pw are unaffected: subiquity
-  # applies both through the target's cloud-init user config.
+  # enables ssh.service.
+  #
+  # authorized-keys is unaffected — subiquity applies it through the target's
+  # cloud-init user config. allow-pw is NOT, and this comment used to say both
+  # were. Measured on an installed box: sshd -T reports `passwordauthentication
+  # yes` and sshd_config.d is empty. Late-command 3c-ter installs the drop-in
+  # that enforces what this line declares.
   ssh:
     install-server: false
     allow-pw: false
@@ -341,6 +346,57 @@ autoinstall:
       install -o root -g root -m 0440 "$T" /etc/sudoers.d/90-wallpanel-ops
       rm -f "$T"
       echo "wall: /etc/sudoers.d/90-wallpanel-ops installed and validated"'
+
+    # ---- 3c-ter. THE HARDENING `allow-pw: false` NEVER APPLIED ----------------
+    # The hub's user-data carries the full argument at the same step; it was
+    # measured there, on an installed box, and this image renders the ssh: block
+    # exactly the same way, so it has the same hole. In short: allow-pw is
+    # applied by cloud-init's set_passwords during the in-target pass that
+    # `install-server: false` turns off, so the KEYS land and the HARDENING does
+    # not — sshd -T reports `passwordauthentication yes` on a machine whose
+    # documented posture is key-only.
+    #
+    # ON THE PANEL IT MATTERS MORE. This box hangs on a wall in a room, its only
+    # door is sshd, and it is invisible: there is no Cockpit, no console anyone
+    # can reach past the cage autologin, and nothing that would ever surface the
+    # fact that password authentication is quietly accepted from the whole LAN.
+    #
+    # Validated DIFFERENTIALLY, exactly as on the hub and for the reason spelled
+    # out there: inside curtin's chroot `sshd -t` can fail over missing host keys
+    # no matter what the config says, so it is run with the drop-in and then
+    # without. Failing both ways is the chroot's fault and the file is kept;
+    # failing only with it means the file is broken and the install stops. A
+    # panel with a broken sshd_config is a panel that has to come off the wall.
+    - |
+      curtin in-target --target=/target -- bash -c '
+      set -e
+      D=/etc/ssh/sshd_config.d
+      mkdir -p "$D"
+      F="$D/90-wallpanel-hardening.conf"
+      printf "%s\n" \
+        "# Managed by the WallPanel autoinstall. See wall/user-data 3c-ter." \
+        "# autoinstall ssh.allow-pw: false does NOT survive install-server: false." \
+        "# sshd is this panel ONLY door; assert-installed.sh checks sshd -T." \
+        "PasswordAuthentication no" \
+        "KbdInteractiveAuthentication no" \
+        "PermitRootLogin no" \
+        "PubkeyAuthentication yes" > "$F"
+      chmod 0644 "$F"
+      if sshd -t 2>/tmp/sshd-t.with; then
+        echo "wall: $F installed and validated (sshd -t)"
+      else
+        mv "$F" /tmp/90-wallpanel-hardening.conf
+        if sshd -t 2>/dev/null; then
+          echo "wall: FATAL - the sshd hardening drop-in does not parse:" >&2
+          cat /tmp/sshd-t.with >&2
+          echo "wall: removed it. sshd is the only door this panel has." >&2
+          exit 1
+        fi
+        install -o root -g root -m 0644 /tmp/90-wallpanel-hardening.conf "$F"
+        echo "wall: WARN - sshd -t cannot run in this chroot (it fails with and without" >&2
+        echo "wall: the drop-in). Keeping it; assert-installed.sh checks sshd -T on the box." >&2
+        cat /tmp/sshd-t.with >&2
+      fi'
 
     # ---- 3d. Remote management (lighter than the AWOW's: no Cockpit) ---------
     # A panel is reimage-not-repair, so it gets SSH + unattended-upgrades and

@@ -127,4 +127,42 @@ ensure_image "naglight:${TRACKER_IMAGE_TAG:-local}" "NagLight" "${TRACKER_PUBLIC
 ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Auditor" "${FINANCE_AUDITOR_PUBLIC_IMAGE:-}" \
     --build-arg "ACTUAL_API_VERSION=${ACTUAL_IMAGE_TAG:?ACTUAL_IMAGE_TAG missing from env file}"
 
+# ── caddy-cloudflare: a local image that is NOT an app repo ───────────────────
+# The two above resolve from SIBLING repos, because they are our applications.
+# This one is built from a Dockerfile inside THIS repo, so ensure_image's
+# present → sibling → public chain does not fit: there is no sibling to find and
+# no public image to fall back to. Caddy's DNS providers are compiled into the
+# binary and no official image ships the Cloudflare one, so building it is the
+# only way to have it at all.
+#
+# WHY THE STACK NEEDS IT: stock Caddy can only answer ACME's http-01/tls-alpn-01
+# challenges, both of which need Let's Encrypt to reach this box from the public
+# internet. It cannot, so nothing was ever issued and every HTTPS interface —
+# including the LAN-only kiosk site the wall panel displays — was down at once.
+# The full argument is at the top of stack/caddy/Dockerfile.
+#
+# NO SOURCE STAMP, and that is not an oversight. The freshness trap
+# assert_local_image_fresh guards against is a `*:local` tag whose SOURCE moved
+# in a sibling repo nobody rebuilt. This image's inputs are its own Dockerfile
+# and two pinned upstream versions, all of them in this repo and all of them
+# visible in the tag or the build args — so `--rebuild` after editing the
+# Dockerfile is the whole discipline, and the Dockerfile's own `caddy
+# list-modules` check refuses to produce a plugin-less binary regardless.
+CADDY_IMAGE_TAG="$(env_get CADDY_IMAGE_TAG)"
+CADDY_REF="caddy-cloudflare:${CADDY_IMAGE_TAG:-2.11.4-alpine}"
+if [ "$REBUILD" -eq 0 ] && docker image inspect "$CADDY_REF" >/dev/null 2>&1; then
+    log "present: $CADDY_REF (skip; --rebuild to force)"
+elif [ "$DRY_RUN" -eq 1 ]; then
+    log "would build: $CADDY_REF  <-  $REPO_ROOT/stack/caddy/Dockerfile"
+else
+    # The runtime tag carries a variant suffix (2.11.4-alpine) and the Dockerfile
+    # needs the bare version for the -builder stage, which has no -alpine form.
+    CADDY_VERSION="${CADDY_IMAGE_TAG%%-*}"
+    log "local build: $CADDY_REF  <-  stack/caddy/Dockerfile (caddy ${CADDY_VERSION:-2.11.4} + caddy-dns/cloudflare)"
+    docker build -t "$CADDY_REF" \
+        --build-arg "CADDY_VERSION=${CADDY_VERSION:-2.11.4}" \
+        -f "$REPO_ROOT/stack/caddy/Dockerfile" "$REPO_ROOT/stack/caddy" \
+        || die "could not build $CADDY_REF — without it Caddy cannot answer a dns-01 challenge, and with no inbound :80 that means NO certificate at all"
+fi
+
 log "all local images resolved."

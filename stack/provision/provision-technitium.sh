@@ -24,7 +24,8 @@
 #   provision-technitium.sh [--env PATH] [--host URL]
 # Env/.env keys consumed: DOMAIN, LAN_IP, TECHNITIUM_ADMIN_PASSWORD,
 #   TECHNITIUM_API_TOKEN_NAME, TECHNITIUM_FORWARDERS, TECHNITIUM_BLOCKLISTS,
-#   TRACKER_SUBDOMAIN, ACTUAL_SUBDOMAIN, MAIN_BOX_IP, EXTRA_SUBDOMAINS (SR-012).
+#   TRACKER_SUBDOMAIN, ACTUAL_SUBDOMAIN, MAIN_BOX_IP, EXTRA_SUBDOMAINS (SR-012),
+#   WALL_HOST (the kiosk site — the panel resolves it through this box).
 #
 # Exit codes: 0 success; nonzero (with a message) on any API failure — so the
 # first-boot unit is marked failed and the operator can see it, rather than the
@@ -222,6 +223,33 @@ main() {
     # Optional: BlueMap / map on the MAIN box (only if MAIN_BOX_IP is set).
     if [ -n "${MAIN_BOX_IP:-}" ]; then
         add_a "$TOKEN" "map.${DOMAIN}" "$LAN_IP"   # served by Caddy on THIS box, proxied to main
+    fi
+    # THE KIOSK HOST, MISSING UNTIL 2026-08-08. Every other name Caddy serves got
+    # a record here and WALL_HOST did not, so `dig wall.<domain>` returned
+    # NXDOMAIN on a box that was otherwise a correct split-horizon resolver.
+    #
+    # WHY NOBODY NOTICED: the DDNS updater keeps a wildcard `*.<domain>` at
+    # Cloudflare, so the name resolves perfectly from anywhere that is NOT using
+    # this resolver — including the workstation anyone would test from. It fails
+    # in exactly one place: on the LAN, through the hub, which is the only place
+    # it is ever used. The panel points at this box for DNS (TC-P-C05) and the
+    # kiosk site is its entire reason to exist, so this record is the first link
+    # in the chain the wall hangs off, and the lab had never got far enough to
+    # reach it (the interconnect stage has never once been arrived at).
+    #
+    # Guarded on WALL_HOST being set and inside the zone: a panel-less build
+    # leaves it unset, and a WALL_HOST pointing somewhere else entirely is a
+    # configuration this script has no business inventing a record for.
+    if [ -n "${WALL_HOST:-}" ]; then
+        case "$WALL_HOST" in
+            "$DOMAIN"|*".$DOMAIN")
+                add_a "$TOKEN" "$WALL_HOST" "$LAN_IP" ;;
+            *)
+                echo "  WARN: WALL_HOST='$WALL_HOST' is outside zone '${DOMAIN}' — no record added."
+                echo "        The panel resolves through this box, so it will not find the kiosk site." ;;
+        esac
+    else
+        echo "  note: WALL_HOST is unset — no kiosk record. Correct only for a hub with no panel."
     fi
     # Tier-2 opt-in subdomains (SR-012): bare labels from EXTRA_SUBDOMAINS in
     # .env (space/comma-separated, e.g. "vault photos music"), one A record each

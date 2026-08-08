@@ -105,11 +105,22 @@ autoinstall:
   # installed from the baked offline repo by late-command 3c, which also
   # enables ssh.service.
   #
-  # authorized-keys AND allow-pw STAY, and they still work: subiquity applies
-  # them through the target's cloud-init user config (99-installer.cfg), which
-  # is independent of install-server. This is the only reason it is safe to
-  # turn install-server off — the keys would otherwise go nowhere and a
-  # key-only box would be unreachable by construction.
+  # authorized-keys STAYS AND WORKS. subiquity applies it through the target's
+  # cloud-init user config (99-installer.cfg), which is independent of
+  # install-server — that is the only reason it is safe to turn install-server
+  # off, since the keys would otherwise go nowhere and a key-only box would be
+  # unreachable by construction.
+  #
+  # allow-pw DOES NOT. This comment used to claim both survived; the second half
+  # was wrong and nothing had ever checked it. `sshd -T` on an installed lab hub
+  # reported `passwordauthentication yes` and `permitrootlogin without-password`
+  # with an EMPTY /etc/ssh/sshd_config.d/ — allow-pw is rendered by cloud-init's
+  # set_passwords module during the in-target pass install-server governs, so it
+  # went away with it on 2026-08-06 and nobody noticed for two days.
+  #
+  # It is kept here as the declaration of intent, and late-command 3c-ter now
+  # installs the drop-in that actually enforces it. Do not delete either one:
+  # this line is what a reader looks for, that one is what sshd reads.
   ssh:
     install-server: false
     allow-pw: false
@@ -416,6 +427,80 @@ autoinstall:
       install -o root -g root -m 0440 "$T" /etc/sudoers.d/90-homehub-ops
       rm -f "$T"
       echo "homehub: /etc/sudoers.d/90-homehub-ops installed and validated"'
+
+    # ---- 3c-ter. THE OTHER HALF OF KEY-ONLY, WHICH `allow-pw: false` DID NOT DO -
+    # MEASURED ON AN INSTALLED LAB HUB, 2026-08-07. `sshd -T` on a box built from
+    # this file reports:
+    #     passwordauthentication yes
+    #     permitrootlogin without-password
+    # and /etc/ssh/sshd_config.d/ is EMPTY. The `ssh:` block above sets
+    # `allow-pw: false`, and the comment beside it asserts that authorized-keys
+    # and allow-pw are "unaffected" by `install-server: false`. Half of that is
+    # true: the KEYS land, which is why anyone can log in at all. The hardening
+    # does not. subiquity renders allow-pw through cloud-init's set_passwords
+    # module, which writes its drop-in during the same in-target pass that
+    # `install-server` governs — so turning install-server off on 2026-08-06 to
+    # make the offline install work silently took the hardening with it.
+    #
+    # IT IS A CLAIM NOTHING EVER CHECKED, which is the shape of nearly every
+    # defect this project has found by booting the thing. assert-installed.sh
+    # now asserts the EFFECTIVE policy out of `sshd -T`, so it cannot go quiet
+    # again.
+    #
+    # WHAT IT COSTS TODAY: nothing visible, and that is exactly why it survived.
+    # Both accounts carry `password: "!"`, a locked hash no password can satisfy,
+    # so there is no credential to guess and the box is key-only in practice. It
+    # is key-only by ACCIDENT rather than by CONFIGURATION — one `passwd hub` (an
+    # explicit instruction in this repo's own handoff, for console recovery) turns
+    # a locked box into a password-authenticating one reachable from the whole
+    # LAN, with nothing anywhere reporting the change.
+    #
+    # VALIDATED BEFORE IT COUNTS, and DIFFERENTIALLY, which is the part worth
+    # reading. A broken sshd_config stops sshd starting at all, on a headless box
+    # whose only other door is a locked console — so the file has to be checked.
+    # But the naive check (`sshd -t || exit 1`) would BRICK EVERY BUILD for a
+    # reason that has nothing to do with this file: inside curtin's chroot the
+    # target may have no host keys yet, and `sshd -t` fails with "no hostkeys
+    # available" regardless of what the config says. An install that refuses over
+    # that is worse than the defect being fixed.
+    #
+    # So: run it with the drop-in, and if that fails, run it WITHOUT. If it fails
+    # both ways the fault is the chroot's and the file is kept with a warning; if
+    # it fails only with the file, the file is the fault and the install stops.
+    # The test therefore measures OUR change and nothing else.
+    - |
+      curtin in-target --target=/target -- bash -c '
+      set -e
+      D=/etc/ssh/sshd_config.d
+      mkdir -p "$D"
+      F="$D/90-homehub-hardening.conf"
+      printf "%s\n" \
+        "# Managed by the HomeHub autoinstall. See stack/autoinstall/user-data 3c-ter." \
+        "# autoinstall ssh.allow-pw: false does NOT survive install-server: false." \
+        "# Measured 2026-08-07: sshd -T said passwordauthentication yes and this" \
+        "# directory was empty. assert-installed.sh checks the effective policy." \
+        "PasswordAuthentication no" \
+        "KbdInteractiveAuthentication no" \
+        "PermitRootLogin no" \
+        "PubkeyAuthentication yes" > "$F"
+      chmod 0644 "$F"
+      if sshd -t 2>/tmp/sshd-t.with; then
+        echo "homehub: $F installed and validated (sshd -t)"
+      else
+        mv "$F" /tmp/90-homehub-hardening.conf
+        if sshd -t 2>/dev/null; then
+          echo "homehub: FATAL - the sshd hardening drop-in does not parse:" >&2
+          cat /tmp/sshd-t.with >&2
+          echo "homehub: removed it. A box that boots with a broken sshd_config has NO" >&2
+          echo "homehub: door: the console password is locked and there is no other way in." >&2
+          exit 1
+        fi
+        install -o root -g root -m 0644 /tmp/90-homehub-hardening.conf "$F"
+        echo "homehub: WARN - sshd -t cannot run in this chroot (it fails with and without" >&2
+        echo "homehub: the drop-in, so the drop-in is not the cause). Keeping it; the boot-time" >&2
+        echo "homehub: check is assert-installed.sh reading sshd -T on the running box." >&2
+        cat /tmp/sshd-t.with >&2
+      fi'
 
     # ---- 3d. Docker configuration (the engine came from 3c) -------------------
     # The three late-commands that used to live at the top of this file — fetch

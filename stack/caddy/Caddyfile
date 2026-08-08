@@ -25,6 +25,32 @@
 {
     # ACME account email for public certs (Let's Encrypt / ZeroSSL).
     email {$ACME_EMAIL}
+
+    # dns-01, NOT http-01 — CHANGED 2026-08-08, and it is a correctness fix
+    # rather than a preference.
+    #
+    # The default challenge needs Let's Encrypt to reach this box on :80 from the
+    # public internet. It could not, so NOTHING was ever issued and Caddy served
+    # no certificate at all — a TLS handshake that dies with `internal error`,
+    # which is why the verification run saw HTTP 000 from the tracker, Actual,
+    # the DNS console, the apex AND the kiosk site simultaneously. One missing
+    # router forward, every HTTPS interface down, and no fallback: Caddy will not
+    # quietly drop to its internal CA.
+    #
+    # The kiosk site is the part that makes this a design fault and not just a
+    # firewall gap. It is LAN-only by ratification (OI-12) — published on LAN_IP,
+    # /32 allow-list, 403 default — and it still could not get a certificate
+    # without a WAN path. The panel's entire surface hung off the internet.
+    #
+    # dns-01 proves domain control by writing a TXT record through Cloudflare's
+    # API. Nothing has to reach this box, it works for names that resolve to a
+    # private address (which split-horizon makes all of these on the LAN), and it
+    # can issue for the apex and a wildcard alike.
+    #
+    # NEEDS THE PLUGIN, which is why stack/caddy/Dockerfile exists: Caddy's DNS
+    # providers are compiled in and the stock image has none. The token is the
+    # same Zone:DNS:Edit one the ddns updater already uses.
+    acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
 }
 
 # ── shared snippets: one basic_auth guard per single-user service ─────────────

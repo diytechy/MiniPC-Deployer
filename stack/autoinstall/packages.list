@@ -58,6 +58,19 @@ hdparm                # backup-drive spin-down (WI-10.10)
 # ── the household file server (A14) — shares come from storage-map §3 ───────
 samba
 samba-common-bin      # smbpasswd/pdbedit for the per-account passwords (A13)
+# smbclient IS NOT IN samba-common-bin, and that one wrong assumption meant the
+# hub's Samba surface could not be tested at all. verify-hub.sh section 7 is the
+# only thing that has ever asserted the NEGATIVES here — anonymous cannot write
+# to Media or Shared, anonymous cannot enter a Private tree — and every one of
+# those checks skipped with "smbclient is not installed" on 2026-08-07. Two
+# shares are readable with NO ACCOUNT AT ALL by ruling (Q-S5, Q-S7); the whole
+# safety of that rests on the LAN-only rule and on `nobody` being in no write
+# list, and the second is only a claim until something tries it.
+#
+# A client on a server is a fair question. The answer is that this box is the
+# sole host of every storage-map section 3 share, so it is also the only place
+# from which those shares can be probed with no other machine involved.
+smbclient             # smbclient(1): the only way to TEST the shares this box serves
 
 # ── the Docker engine ───────────────────────────────────────────────────────
 # THESE COME FROM download.docker.com, NOT THE UBUNTU ARCHIVE, and that is the

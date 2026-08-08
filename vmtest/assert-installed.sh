@@ -235,6 +235,50 @@ if [ "$SSH_OK" != yes ] && [ "$CONSOLE_OK" != yes ]; then
     fail "NO WAY IN: sshd absent and '$ACCT' has a locked password. Recovery needs GRUB."
 fi
 
+# ── 6b. is the door KEY-ONLY, as both images claim? ─────────────────────────
+# ADDED 2026-08-08, after a lab hub built from these files answered:
+#     passwordauthentication yes
+#     permitrootlogin without-password
+# with an EMPTY /etc/ssh/sshd_config.d/. Both user-data files set
+# `ssh: allow-pw: false` and both carried a comment asserting it survived
+# `install-server: false`. It does not — allow-pw is rendered by cloud-init's
+# set_passwords during the in-target pass install-server governs, so the offline
+# install silently took the hardening with it on 2026-08-06.
+#
+# WHY IT LOOKED FINE FOR TWO DAYS: `password: "!"` is a locked hash, so there is
+# no password to accept and the box behaves key-only. It is key-only by ACCIDENT.
+# One `passwd hub` — which this project's own handoff instructs for console
+# recovery — converts it into a box that accepts passwords from the whole LAN,
+# with nothing anywhere reporting it.
+#
+# ASSERTED FROM `sshd -T`, NOT FROM A FILE. The effective policy is the resolved
+# merge of sshd_config and every drop-in; grepping the drop-in would pass on a
+# box where an Include ordering change had overridden it. Needs root, so it is a
+# SKIP rather than a silent pass when this account cannot escalate — the same
+# rule the rest of this file follows.
+SSHD_T=""
+if [ "$(id -u)" -eq 0 ]; then
+    SSHD_T="$(sshd -T 2>/dev/null)"
+elif sudo -n true 2>/dev/null; then
+    SSHD_T="$(sudo -n sshd -T 2>/dev/null)"
+fi
+if [ -z "$SSHD_T" ]; then
+    note "SKIP: the effective sshd policy — reading it needs root and this account cannot escalate"
+else
+    if printf '%s\n' "$SSHD_T" | grep -qix 'passwordauthentication no'; then
+        pass "sshd is key-only: password authentication refused"
+    else
+        fail "PASSWORD AUTHENTICATION IS ENABLED — both images declare ssh.allow-pw: false"
+        note "late-command 3c-ter installs the drop-in that enforces it; check it ran"
+    fi
+    if printf '%s\n' "$SSHD_T" | grep -qix 'permitrootlogin no'; then
+        pass "sshd refuses root login outright"
+    else
+        got="$(printf '%s\n' "$SSHD_T" | awk '/^permitrootlogin/{print $2}')"
+        fail "PermitRootLogin is '${got:-unset}' (want no)"
+    fi
+fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then
     echo "== install completeness: ALL CHECKS PASSED =="

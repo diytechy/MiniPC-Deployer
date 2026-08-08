@@ -338,6 +338,30 @@ fi
 # pinned tag locally and starts it without a pull; anything NOT baked (or a
 # no-payload fallback) is pulled here — which for naglight:local (no registry,
 # Q10.2) means it must have been built/staged first.
+# ── 4a-pre. THE ONE .env VALUE THAT NOW STOPS CADDY FROM STARTING AT ALL ──────
+# Since the switch to dns-01 (2026-08-08), the Caddyfile's global block carries
+#     acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
+# and Caddy REFUSES TO ADAPT ITS CONFIG when that value is empty:
+#     Error: parsing caddyfile tokens for 'acme_dns': missing API token
+# Measured, not guessed — run against the built image before this shipped.
+#
+# That is a worse failure than the one dns-01 fixes if it is allowed to surface
+# as "caddy keeps restarting": no tracker, no Actual, no DNS console, no kiosk
+# site, and a container log nobody reads on a headless box. The materialiser
+# cannot produce this state (CLOUDFLARE_API_TOKEN is a T3 store key and a missing
+# one is a hard build failure), so the only route here is a hand-edited .env —
+# which is exactly the case that deserves a sentence rather than a crash loop.
+#
+# NOT FATAL. The rest of the stack is fine without Caddy and the box stays
+# reachable; saying so precisely beats refusing to boot.
+if ! grep -qE '^CLOUDFLARE_API_TOKEN=.+' "$STACK_DIR/.env" 2>/dev/null; then
+    log "WARN: CLOUDFLARE_API_TOKEN is empty or absent in .env."
+    log "  Caddy will FAIL TO START — the Caddyfile uses the dns-01 ACME challenge and"
+    log "  the provider needs that token. Every HTTPS site goes with it: the tracker,"
+    log "  Actual, the DNS console, the apex and the kiosk site the wall panel displays."
+    log "  Fix: put the scoped Zone->DNS->Edit token in .env, then re-run this script."
+fi
+
 log "docker compose up -d…"
 docker compose up -d
 
@@ -485,17 +509,65 @@ systemctl enable --now homehub-library-health.timer >/dev/null 2>&1 ||     log "
 systemctl enable --now homehub-backup-drive-health.timer >/dev/null 2>&1 || \
     log "WARN: could not enable homehub-backup-drive-health.timer — an absent backup drive would go unreported until the nightly run"
 
-# ── 6. make the host itself use local DNS ────────────────────────────────────
-# systemd-resolved: point it at 127.0.0.1 so the box resolves its own zone.
+# ── 6. make the host itself use local DNS, and give Technitium the whole port ─
+#
+# DNSStubListener=no IS THE LOAD-BEARING LINE, and it was missing until
+# 2026-08-08. Without it systemd-resolved keeps its stub on 127.0.0.53:53 —
+# TCP AND UDP — and it is already running when docker starts Technitium. A TCP
+# bind of 0.0.0.0:53 conflicts with any specific-address bind on the same port,
+# so Technitium's IPv4 TCP listener FAILED. Its UDP sockets carry SO_REUSEADDR
+# and bound fine, and it logged nothing at all about the half that did not.
+#
+# WHAT THAT LOOKED LIKE, on a box everyone would have called healthy:
+#     dig  @<lan ip> tracker.<domain>          -> answers
+#     dig +tcp @<lan ip> tracker.<domain>      -> connection refused
+# i.e. every response over 512 bytes fails, plus every deliberate TCP query,
+# on a resolver that passes every casual test. MEASURED, then fixed and
+# re-measured on the same running box: with the stub off and Technitium
+# restarted, 0.0.0.0:53/tcp appeared and dig +tcp answered immediately.
+# verify-hub.sh's TC-H-C01 is the assertion that keeps it honest.
+#
+# THE STUB IS WHAT /etc/resolv.conf POINTS AT, so turning it off has to be paid
+# for: resolved regenerates stub-resolv.conf listing the configured servers
+# instead, which is 127.0.0.1 — Technitium itself, which is what this step
+# claims to be arranging anyway. Verified on the box: /etc/resolv.conf came back
+# as `nameserver 127.0.0.1` and getent kept resolving.
 if systemctl is-active --quiet systemd-resolved; then
     mkdir -p /etc/systemd/resolved.conf.d
     cat > /etc/systemd/resolved.conf.d/homehub.conf <<'EOF'
 [Resolve]
 DNS=127.0.0.1
 Domains=~.
+# Technitium owns :53 on this box. Leaving the stub up costs the IPv4 TCP
+# listener, silently — see firstboot.sh step 6.
+DNSStubListener=no
 EOF
     systemctl restart systemd-resolved || true
-    log "host resolver pointed at local Technitium"
+    log "host resolver pointed at local Technitium (resolved stub off — :53 is Technitium's)"
+
+    # THE STUB WAS UP WHILE TECHNITIUM STARTED, so on THIS boot the container is
+    # already missing its IPv4 TCP socket; freeing the port does not retroactively
+    # bind it. Every later boot is fine (resolved reads the drop-in before docker
+    # starts), which is exactly the shape of bug that hides — the box is correct
+    # the second time anyone looks. So: check, remediate once, and say which.
+    if command -v docker >/dev/null 2>&1 && docker inspect technitium >/dev/null 2>&1; then
+        tcp53_ok() { (exec 3<>/dev/tcp/127.0.0.1/53) 2>/dev/null; }
+        if tcp53_ok; then
+            log "DNS answers on :53/tcp"
+        else
+            log "restarting Technitium so it can claim :53/tcp (the resolved stub held it until just now)"
+            docker restart technitium >/dev/null 2>&1 || true
+            for _ in 1 2 3 4 5 6 7 8 9 10; do tcp53_ok && break; sleep 2; done
+            if tcp53_ok; then
+                log "DNS answers on :53/tcp"
+            else
+                log "WARN: :53/tcp still refuses after restarting Technitium."
+                log "  UDP works, so this box LOOKS like a healthy resolver — but every"
+                log "  response over 512 bytes and every TCP query will fail. Check what"
+                log "  else holds the port:  ss -ltnp '( sport = :53 )'"
+            fi
+        fi
+    fi
 fi
 
 # ── 7. done ──────────────────────────────────────────────────────────────────

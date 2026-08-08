@@ -258,6 +258,15 @@ def main():
         "autoinstall/powertune.sh",
         "backup/systemd/backup-standby.service",
         "backup/backup-standby.sh",
+        # The backup service proper. Added 2026-08-08, when verify-hub.sh found
+        # `homehub-backup.timer` NOT-FOUND on a healthy hub: these two shipped in
+        # every payload ever built and no late-command ever copied them, so the
+        # nightly backup had never fired on any machine. Check 4b below is the
+        # generalisation that would have caught it.
+        "backup/systemd/homehub-backup.service",
+        "backup/systemd/homehub-backup.timer",
+        "backup/backup.sh",
+        "backup/restore.sh",
         # The WALL panel variant (SR-016/SR-017): a second image target with its
         # own late-commands, so it needs its own coverage. Every file below is
         # cp'd or enabled by autoinstall/wall/user-data.
@@ -304,6 +313,62 @@ def main():
             "autoinstall file present: stack/{}".format(ref),
             "autoinstall file missing: stack/{}".format(ref),
         )
+
+    # 4b. EVERY SHIPPED SYSTEMD UNIT IS ACTUALLY INSTALLED BY SOMETHING.
+    #
+    # Check 4 asks "does the file this list names exist?", which is the wrong
+    # direction: it can only catch a reference to a missing file, never a file
+    # that nothing references. On 2026-08-08 that was the gap — stack/backup/
+    # systemd/ held three units, user-data copied one, and homehub-backup.service
+    # and .timer rode along in every payload without being installed anywhere
+    # systemd would look. `systemctl is-enabled homehub-backup.timer` answered
+    # NOT-FOUND on a hub that had been "working" for months. Nothing in this
+    # repo could have noticed, because a unit file that exists and is never
+    # referenced is indistinguishable from one that is deliberately optional.
+    #
+    # So: enumerate the units on disk and require each to be named by a
+    # late-command or by firstboot. A deliberately-unused unit is fine; it just
+    # has to be listed here, which makes leaving it out a decision.
+    #
+    # MATCHED ON INSTALL LINES ONLY, not on the whole file, and the first draft of
+    # this check got that wrong. Both missing units were named in the pre-fix
+    # tree — but homehub-backup.service was named in a COMMENT ("runs from the
+    # stack dir like homehub-backup.service"), so a plain substring search over
+    # the file counted the prose as evidence and reported only the .timer. A
+    # check that a comment can satisfy is a check that rewards writing about the
+    # work instead of doing it. An installation is a line that puts the unit
+    # under /etc/systemd/system or hands its name to `systemctl enable`.
+    unit_install_lines = [
+        line
+        for p in (
+            stack / "autoinstall" / "user-data",
+            stack / "autoinstall" / "firstboot.sh",
+            stack / "autoinstall" / "wall" / "user-data",
+            stack / "autoinstall" / "wall" / "wall-firstboot.sh",
+        )
+        if p.exists()
+        for line in load(p).splitlines()
+        if "/etc/systemd/system" in line or "systemctl enable" in line
+    ]
+    unit_installers = "\n".join(unit_install_lines)
+    # Units that exist on purpose without being installed by an image. Empty
+    # today; an entry here is a claim someone has to defend.
+    unit_exemptions = set()
+    orphan_units = []
+    for unit_dir in (stack / "backup" / "systemd", stack / "samba", stack / "autoinstall"):
+        if not unit_dir.is_dir():
+            continue
+        for unit in sorted(unit_dir.glob("*.service")) + sorted(unit_dir.glob("*.timer")):
+            if unit.name in unit_exemptions:
+                continue
+            if unit.name not in unit_installers:
+                orphan_units.append(str(unit.relative_to(stack)))
+    check(
+        not orphan_units,
+        "every shipped systemd unit is referenced by an installer",
+        "unit file(s) shipped but installed by NOTHING - they reach the box and "
+        "systemd never sees them: " + ", ".join(orphan_units),
+    )
 
     # 5. wall-panel knob coverage (the .env-example equivalent for image 2).
     wall_dir = stack / "autoinstall" / "wall"

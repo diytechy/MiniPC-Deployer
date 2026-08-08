@@ -692,6 +692,36 @@ autoinstall:
     - cp /target/opt/homehub/stack/backup/systemd/backup-standby.service /target/etc/systemd/system/backup-standby.service
     - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/backup-standby.sh
     - curtin in-target --target=/target -- systemctl enable backup-standby.service
+    # ---- 5b. THE BACKUP SERVICE ITSELF, WHICH WAS NEVER INSTALLED ------------
+    # FOUND 2026-08-08 by verify-hub.sh section 9, on a hub that was otherwise
+    # healthy: `systemctl is-enabled homehub-backup.timer` answered NOT-FOUND.
+    # Not disabled — ABSENT. stack/backup/systemd/ carries three units and the
+    # line above copied exactly one of them, so homehub-backup.service and
+    # homehub-backup.timer shipped in the payload to every box ever built and
+    # were never put anywhere systemd would look.
+    #
+    # WHAT THAT MEANS, PLAINLY: the backup has never run, on any machine, ever.
+    # Not "ran and failed" — never fired. The whole storage-map §4b/§4c contract
+    # (wake Mini-serv, ingest, pull, archive, hash, report, retain) is code that
+    # has been carried around and never executed, and `restore.sh` is the
+    # recovery half of a contract with no forward half.
+    #
+    # WHY NOTHING NOTICED, and it is the same shape as the sshd finding above.
+    # backup-standby.service — the spin-down unit from the SAME directory — was
+    # installed, so `systemctl | grep backup` looked populated. The two
+    # drive-health timers firstboot installs are also named ...backup..., and
+    # they DO run. Three units answering to the name, one of them the one that
+    # matters, absent. The docs never claimed it worked; nothing had ever asked.
+    #
+    # The timer is enabled, not started: OnCalendar fires it. backup.sh refuses
+    # loudly when the target is not a mountpoint (measured — it is the one part
+    # of this that has been exercised), so a first boot with no drive attached
+    # is a named failure rather than a backup written to the system disk.
+    - cp /target/opt/homehub/stack/backup/systemd/homehub-backup.service /target/etc/systemd/system/homehub-backup.service
+    - cp /target/opt/homehub/stack/backup/systemd/homehub-backup.timer /target/etc/systemd/system/homehub-backup.timer
+    - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/backup.sh
+    - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/restore.sh
+    - curtin in-target --target=/target -- systemctl enable homehub-backup.timer
     # ---- 6. REFUSE TO FINISH AN INSTALL THAT DID NOT PRODUCE ITS ARTIFACTS ----
     # 2026-08-06. An install reported success and produced a box with no
     # /opt/homehub, no openssh-server, no docker and no cockpit - i.e. a bare

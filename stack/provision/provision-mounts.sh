@@ -33,6 +33,44 @@ if [ ! -f "$FSTAB_FRAGMENT" ]; then
     exit 0
 fi
 
+# resolve_mount_spec SPEC — print the device an fstab first-field names, or
+# nothing. Understands the forms fstab actually uses; a bare path is passed
+# through so nothing that worked before stops working.
+#
+# blkid rather than the /dev/disk/by-label symlink, deliberately: blkid PROBES
+# the devices, so it answers correctly even when udev has not finished creating
+# the symlink — which is the exact window firstboot runs in.
+resolve_mount_spec() {
+    case "$1" in
+        LABEL=*)      blkid -L "${1#LABEL=}" 2>/dev/null ;;
+        UUID=*)       blkid -U "${1#UUID=}" 2>/dev/null ;;
+        PARTLABEL=*)  readlink -e "/dev/disk/by-partlabel/${1#PARTLABEL=}" 2>/dev/null ;;
+        PARTUUID=*)   readlink -e "/dev/disk/by-partuuid/${1#PARTUUID=}" 2>/dev/null ;;
+        /*)           [ -e "$1" ] && printf '%s' "$1" ;;
+        *)            : ;;   # none/tmpfs/swap and friends — not a device
+    esac
+}
+
+# wait_for_mount_spec SPEC SECONDS — the same, with a bounded wait.
+#
+# A SINGLE udevadm settle FIRST, then poll. settle alone is not enough: it
+# returns when the CURRENT queue drains, and a USB disk that has not been
+# enumerated yet has nothing in the queue to wait for. Polling alone is slower
+# than it needs to be on the common path. Together they cover both.
+wait_for_mount_spec() {
+    spec="$1"; secs="${2:-20}"; i=0; found=''
+    found="$(resolve_mount_spec "$spec")"
+    if [ -n "$found" ]; then printf '%s' "$found"; return 0; fi
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=5 >/dev/null 2>&1
+    while [ "$i" -lt "$secs" ]; do
+        found="$(resolve_mount_spec "$spec")"
+        if [ -n "$found" ]; then printf '%s' "$found"; return 0; fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
 added=0
 rc=0        # was never initialised and never read — every failure below was
             # reported as success and firstboot's `|| log WARN` could not fire.
@@ -75,11 +113,41 @@ while IFS= read -r line || [ -n "$line" ]; do
         chmod 000 "$mnt" 2>/dev/null || true
     fi
 
-    if [ ! -e "$dev" ]; then
-        log "WARN: $dev is not present — $mnt will stay empty until the drive is attached."
+    # ── IS THE DRIVE ACTUALLY THERE? ────────────────────────────────────────
+    #
+    # THIS WAS `[ ! -e "$dev" ]`, AND IT COULD NEVER BE TRUE FOR THE FSTAB THIS
+    # PROJECT GENERATES. $dev is the first field of the fstab line, which for
+    # every data drive is `LABEL=Library` — a MOUNT SPEC, not a path. So the
+    # test asked whether a file literally named "LABEL=Library" existed, which
+    # it never does, and every drive was reported absent:
+    #
+    #     [provision-mounts] WARN: LABEL=Library is not present — /srv/library
+    #                              will stay empty until the drive is attached.
+    #
+    # while lsblk showed it attached, labelled and healthy, and `mount
+    # /srv/library` succeeded instantly by hand. The mount below was therefore
+    # never reached, and provision-samba — which runs seconds later in the same
+    # firstboot and REFUSES to export an unmounted path, correctly — killed
+    # firstboot with a FATAL. Every first boot, on every box, since the fstab
+    # moved to LABEL= for A23.
+    #
+    # It looked like it worked because it eventually does: systemd's
+    # fstab-generator mounts these on the NEXT boot regardless. So the drives are
+    # up by the time anyone logs in, and only firstboot — the one pass that
+    # provisions Samba — ever saw them missing.
+    #
+    # Resolve the spec properly, and WAIT, because the wait is not padding. The
+    # fstab entries already carry x-systemd.device-timeout=15s, which is the
+    # same admission in systemd's language: these are USB drives on the real hub
+    # and they enumerate slowly. firstboot runs early enough that udev may still
+    # be settling.
+    resolved="$(wait_for_mount_spec "$dev" 20)"
+    if [ -z "$resolved" ]; then
+        log "WARN: $dev did not appear within 20s — $mnt will stay empty until the drive is attached."
         log "      (nofail keeps this from blocking boot, which is deliberate.)"
         continue
     fi
+    log "$dev resolved to $resolved"
     if mountpoint -q "$mnt"; then
         log "$mnt already mounted"
     elif mount "$mnt" 2>/dev/null; then

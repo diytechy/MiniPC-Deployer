@@ -406,6 +406,34 @@ $(docker compose config 2>/dev/null | awk '/^ *source: \//{print $2}' | sort -u)
 EOF
 log "  bind-mount sources checked; $_created created"
 
+# ── 4a-pre-3. DOES THE KIOSK SITE HAVE AN IDENTITY TO INJECT? ────────────────
+# PANEL_USER_SUB empty is a DELIBERATE fail-closed state, not a bug:
+# Materialize-Deploy.ps1 blanks the REPLACE_WITH_… placeholder on purpose,
+# because NagLight rejects only an EMPTY trusted-identity header — a non-empty
+# placeholder would be accepted as a perfectly valid user id and mint a phantom
+# identity on an unauthenticated trust path. That reasoning is right.
+#
+# WHAT IS WRONG IS THE SILENCE. Measured on a live panel 2026-08-08: the kiosk
+# site serves `/` and `/config.json` with a 200, the shell loads and paints, and
+# then EVERY `/api/*` call returns 403 because Caddy injected an empty
+# X-Forwarded-User. The wall shows its frame with no data in it, forever, and
+# nothing on the hub, the panel or the wall says why. It also makes the
+# highest-value security test in the plan (TC-H-G05, the forged-header strip)
+# unreachable — there is no identity to compare a forged one against.
+#
+# So: fail closed, and SAY SO. Not fatal — a hub with no panel is a legitimate
+# configuration, and this is the wrong place to refuse a boot over it.
+if grep -qE '^WALL_HOST=.+' "$STACK_DIR/.env" 2>/dev/null \
+   && ! grep -qE '^PANEL_USER_SUB=.+' "$STACK_DIR/.env" 2>/dev/null; then
+    log "WARN: WALL_HOST is configured but PANEL_USER_SUB is EMPTY."
+    log "  The kiosk site will serve the shell and then 403 every /api/* request:"
+    log "  Caddy injects X-Forwarded-User from this value, and the tracker refuses"
+    log "  an empty identity (correctly — that is what makes 'optional' fail closed)."
+    log "  The wall will paint, and show no data, and nothing else will report it."
+    log "  Fix: put the Owner's Google 'sub' in config.common.psd1's PANEL_USER_SUB"
+    log "  and re-materialise. It cannot be invented here; it is an Owner value."
+fi
+
 log "docker compose up -d…"
 docker compose up -d
 

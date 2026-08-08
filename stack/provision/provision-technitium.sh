@@ -251,6 +251,27 @@ main() {
     else
         echo "  note: WALL_HOST is unset — no kiosk record. Correct only for a hub with no panel."
     fi
+    # THE BOX'S OWN HOSTNAME, MISSING UNTIL 2026-08-08. Every service name had a
+    # record and the machine itself did not, so nothing on the LAN could reach
+    # this box by the name it answers to.
+    #
+    # WHERE THAT BIT: the panel's music mount is `//<hostname>/Media` (storage-map
+    # §4a). `mount.cifs` resolves that through getaddrinfo like anything else, so
+    # with no record it fails with "could not resolve address for <hostname>" —
+    # which reads as a Samba or share-permission fault and is neither. The share
+    # was serving anonymously and correctly the whole time.
+    #
+    # A short name still needs a search domain to become this FQDN; that half is
+    # the panel's resolver configuration and, if the storage map is to keep using
+    # the short form, an Owner decision. This half is unambiguous: the hub should
+    # be findable by name in its own zone.
+    _hostname="$(hostname -s 2>/dev/null || hostname 2>/dev/null)"
+    if [ -n "${_hostname:-}" ]; then
+        add_a "$TOKEN" "${_hostname}.${DOMAIN}" "$LAN_IP"
+    else
+        echo "  WARN: could not determine this box's hostname — no self record added."
+    fi
+
     # Tier-2 opt-in subdomains (SR-012): bare labels from EXTRA_SUBDOMAINS in
     # .env (space/comma-separated, e.g. "vault photos music"), one A record each
     # → LAN_IP. Empty = no-op. Pairs with the commented Caddyfile sites.

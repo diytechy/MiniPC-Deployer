@@ -482,6 +482,47 @@ else
     warn "Rebuild the image with the artifact staged: see vmtest/build-wall-seed.sh."
 fi
 
+# ── 8c. CAN THIS PANEL RESOLVE A NAME AT ALL? ────────────────────────────────
+# ADDED 2026-08-08, after a panel that had installed perfectly came up unable to
+# resolve anything. `systemctl is-active systemd-resolved` said `not-found` — the
+# package was never in wall/packages.list — so /etc/resolv.conf was a DANGLING
+# symlink into a directory that does not exist, and glibc had nowhere to ask.
+# networkd had the nameserver the whole time and nothing to write it into.
+#
+# THE SYMPTOM WAS A DARK WALL AND NOTHING ELSE. Electron failed the kiosk URL
+# with ERR_NAME_NOT_RESOLVED, wall-sync could not resolve the hub for the music
+# mount or Mini-serv for the frame pull, and both manifests were therefore
+# absent. Four different-looking faults, one cause, and the only thing visible
+# from the room was a blank screen.
+#
+# ASSERTED AS A RESOLUTION, NOT AS A PACKAGE OR A FILE. `dpkg -l` would go green
+# on a box whose resolv.conf still pointed nowhere, and `[ -e /etc/resolv.conf ]`
+# is TRUE for a dangling symlink — it was true on the broken panel. The only
+# check that cannot be satisfied by the broken state is actually resolving
+# something, so that is the check. WALL_HOST specifically: it is the name this
+# machine exists to fetch, and the one whose absence blanks the wall.
+#
+# FAILS THE UNIT. The panel's whole failure mode is silence (SN-013), and this
+# is the difference between "reimage it" and a week of looking at a dark screen.
+if command -v getent >/dev/null 2>&1; then
+    _resolve_target="${WALL_HOST:-}"
+    if [ -z "$_resolve_target" ]; then
+        warn "WALL_HOST is unset, so name resolution could not be checked against the name that matters."
+    elif getent hosts "$_resolve_target" >/dev/null 2>&1; then
+        log "name resolution works ($_resolve_target resolves)"
+    else
+        fail_step "THIS PANEL CANNOT RESOLVE NAMES. '$_resolve_target' does not resolve."
+        warn "  Everything this box does over the network is by name, so the visible"
+        warn "  symptom is a BLANK WALL and nothing else: the kiosk URL fails with"
+        warn "  ERR_NAME_NOT_RESOLVED, the music mount cannot find the hub, and the"
+        warn "  frame pull cannot find Mini-serv."
+        warn "  Check, in this order:"
+        warn "    systemctl is-active systemd-resolved   (not-found = the package is missing)"
+        warn "    ls -l /etc/resolv.conf                 (a DANGLING symlink still passes -e)"
+        warn "    networkctl status                      (networkd may know the DNS already)"
+    fi
+fi
+
 # ── 9. done — but only if it IS done ─────────────────────────────────────────
 # The marker means "this panel is provisioned", and units, scripts and humans all
 # read it that way. It is therefore written ONLY when every step that could fail

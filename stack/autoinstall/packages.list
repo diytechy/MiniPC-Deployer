@@ -39,6 +39,15 @@ ca-certificates
 curl
 git
 dnsutils              # provides dig for the health check
+# NAMED, NOT INHERITED. The hub has had systemd-resolved all along only because
+# something heavier in this list drags it in — no line here ever asked for it.
+# The wall image, with a leaner set, therefore shipped with NO RESOLVER AT ALL
+# and nobody noticed until 2026-08-08 (see wall/packages.list for what that
+# looked like). firstboot step 6 writes a resolved drop-in and turns its stub
+# listener off so Technitium can own :53; a box where resolved is absent takes
+# that drop-in and does nothing with it, silently. An implicit dependency that
+# load-bearing should be explicit.
+systemd-resolved      # firstboot step 6 configures it; :53 belongs to Technitium
 apt-transport-https
 
 # ── remote management (WI-10.12) ────────────────────────────────────────────

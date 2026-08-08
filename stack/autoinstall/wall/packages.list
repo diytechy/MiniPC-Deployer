@@ -31,6 +31,24 @@ xdg-utils
 fonts-dejavu-core
 util-linux             # rtcwake — the PRIMARY wake source (D-W4)
 network-manager        # quirk 5: powersave off, and the netplan renderer
+# THE PANEL HAD NO RESOLVER AT ALL UNTIL 2026-08-08, and nothing said so.
+# `systemctl is-active systemd-resolved` answered `not-found`: the package was
+# never installed, so /etc/resolv.conf sat as a DANGLING symlink to
+# ../run/systemd/resolve/stub-resolv.conf and glibc had nowhere to ask. networkd
+# knew the nameserver perfectly well — `networkctl status` printed
+# `DNS: <hub>` — it just had nothing to write it into.
+#
+# HOW IT PRESENTED, and this is why it belongs in a package list with a
+# paragraph attached: the wall went BLANK. Electron failed the kiosk URL with
+# ERR_NAME_NOT_RESOLVED, wall-sync could not resolve the hub for the music mount
+# or Mini-serv for the frame pull, both manifests were therefore missing, and the
+# only visible symptom on a wall-mounted display was a dark screen. Every one of
+# those looks like a different fault and all of them were this.
+#
+# The hub never showed it because its heavier package set pulls resolved in
+# transitively; the panel's deliberately lean one does not. Neither list named
+# it, so neither install was actually asking for it — the hub was lucky.
+systemd-resolved       # /etc/resolv.conf; without it the panel resolves NOTHING
 
 # ── the media sync (OI-15): the panel PULLS, so it needs a cifs client ───────
 cifs-utils             # mount.cifs — the read-only mount of the media share

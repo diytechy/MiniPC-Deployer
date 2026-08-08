@@ -469,10 +469,28 @@ fi
 # survive being written inside a command substitution.
 __lan_ip="$(sed -n 's/^LAN_IP=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 \
             | sed 's/[[:space:]]*#.*$//' | tr -d '\042\047[:space:]')"
+# HOW LONG TO WAIT, MEASURED RATHER THAN GUESSED. The first cut of this waited
+# 180s and still failed, on a box that was perfectly healthy. From that run's
+# own journal:
+#
+#     21:43:38  boot
+#     21:47:12  firstboot starts waiting for the address
+#     21:50:13  gives up after 180s
+#     21:52:20  eth0: Gained carrier / DHCPv4 address … acquired   (+308s)
+#
+# DHCP answered in the SAME SECOND as carrier — the wait was never about DHCP
+# being slow, it was about the link being physically absent until +308s. In the
+# lab that is the offline-install mechanism: the adapter stays disconnected for
+# the whole install and is reconnected only once the runner's "VHDX quiet for
+# 4 minutes" heuristic fires, which can land several minutes after firstboot has
+# already started. 600s covers the observed 308s with room, and is still a sane
+# bound on real hardware: a box with no address ten minutes after boot has a
+# problem a longer timeout would only hide.
+__addr_wait_max=600
 if [ -n "$__lan_ip" ] && [ "$__lan_ip" != "0.0.0.0" ]; then
     __waited=0
     while ! ip -4 -o addr show 2>/dev/null | grep -qwF "$__lan_ip"; do
-        if [ "$__waited" -ge 180 ]; then
+        if [ "$__waited" -ge "$__addr_wait_max" ]; then
             log "FATAL: $__lan_ip is not held by any interface after ${__waited}s."
             log "  Every published port in docker-compose.yml binds to that address, and"
             log "  'docker compose up -d' is all-or-nothing — it would fail with"
@@ -482,6 +500,10 @@ if [ -n "$__lan_ip" ] && [ "$__lan_ip" != "0.0.0.0" ]; then
             exit 1
         fi
         [ "$__waited" -eq 0 ] && log "waiting for $__lan_ip to appear on an interface (compose publishes to it)…"
+        # A ten-minute silent wait is indistinguishable from a hang to anyone
+        # watching the console, which is the only vantage a box in this state has.
+        [ "$__waited" -gt 0 ] && [ $((__waited % 60)) -eq 0 ] \
+            && log "  still waiting for $__lan_ip … ${__waited}s of ${__addr_wait_max}s"
         sleep 5
         __waited=$((__waited + 5))
     done

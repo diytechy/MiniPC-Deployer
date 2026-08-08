@@ -266,11 +266,39 @@ assert_local_image_fresh() {
     log "  source-check OK: $ref built from $repo ${stamped:0:12} (= HEAD)"
 }
 
+# is_local_only REF — true when REF has NO registry anywhere, so (a) it can never
+# be pulled and (b) its TAG PINS NO CONTENT: every rebuild reuses the same ref,
+# which makes a previously-saved tar unsafe to reuse.
+#
+# ONE PREDICATE, TWO CALLERS, and the split between them is what broke. The pull
+# path below has always known caddy-cloudflare is local-only — its `die` arm even
+# says so ("NOT PULLABLE, AND THE TAG LOOKS LIKE IT SHOULD BE"). The save path
+# further down had its own, SHORTER list (`*:local|naglight:*`), and a tag like
+# `2.11.4-alpine` matches neither pattern.
+#
+# WHAT THAT COST, measured 2026-08-08. Defect 25 was the pinned caddy-dns plugin
+# rejecting Cloudflare's `cfut_` tokens; the fix bumps it to v0.2.4 in
+# stack/caddy/Dockerfile and rebuilds the image. The rebuild happened (the local
+# image carries caddy-dns/cloudflare v0.2.4, built 22:22). The tar beside it was
+# saved at 21:45 — 37 minutes earlier, from the v0.2.1 build — and this script
+# would have logged "skip (already saved)" and baked it. The run whose entire
+# purpose was to prove defect 25's fix would have shipped defect 25, and the only
+# visible symptom would have been Caddy crash-looping on a box three hours later.
+#
+# So the answer to "is this ref reusable from disk?" must come from the same
+# place as "can this ref be pulled?", because they are the same question.
+is_local_only() {
+    case "$1" in
+        caddy-cloudflare:*|naglight:*|*:local) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 for ref in "${IMAGES[@]}"; do
     if docker image inspect "$ref" >/dev/null 2>&1; then
         log "present locally: $ref"
         [ "${ALLOW_STALE_LOCAL:-0}" = "1" ] || assert_local_image_fresh "$ref"
-    else
+    elif is_local_only "$ref"; then
         case "$ref" in
             caddy-cloudflare:*)
                 # NOT PULLABLE, AND THE TAG LOOKS LIKE IT SHOULD BE — which is the
@@ -295,7 +323,17 @@ for ref in "${IMAGES[@]}"; do
                     "then re-run this script. The AWOW cannot fetch this image anywhere," \
                     "so it MUST be baked into the payload."
                 ;;
+            *)
+                # Unreachable while is_local_only and these arms agree — which is
+                # the point of having it. Adding a ref to that predicate without a
+                # message here would otherwise fall through to a `docker pull` of
+                # something that has no registry, and the operator would get
+                # "manifest unknown" about an image nobody publishes.
+                die "MISSING local-only image '$ref' — it has no registry home." \
+                    "Resolve it first:  bash scripts/ensure-local-images.sh"
+                ;;
         esac
+    else
         log "pulling (not local yet) at the pinned tag: $ref"
         docker pull "$ref" >/dev/null 2>&1 \
             || die "docker pull FAILED for '$ref' — unpullable/missing tag." \
@@ -315,13 +353,18 @@ for ref in "${IMAGES[@]}"; do
     fi
 
     # A tar is reusable only when its filename pins the content. For a registry
-    # image the tag does that. For a `*:local` build it does NOT — the tag is
+    # image the tag does that. For a locally-built one it does NOT — the tag is
     # constant across every rebuild, so "already saved" would keep shipping the
     # tar from whichever build happened first, even after the source-check above
     # confirms the IMAGE is current. Same 2026-08-01 stale-payload trap, one
-    # layer down: re-save these every run (they are the two smallest images).
+    # layer down: re-save these every run (they are the smallest images).
+    #
+    # THE LIST USED TO BE SPELLED OUT HERE AND IT WAS SHORT BY ONE. It read
+    # `*:local|naglight:*`, which is every locally-built image EXCEPT the one
+    # whose tag looks most like a registry tag — caddy-cloudflare:2.11.4-alpine.
+    # See is_local_only above for what that omission would have shipped.
     local_only=0
-    case "$ref" in *:local|naglight:*) local_only=1 ;; esac
+    is_local_only "$ref" && local_only=1
 
     if [ -f "$out" ] && [ "$FORCE" -eq 0 ] && [ "$local_only" -eq 0 ]; then
         log "skip (already saved, --force to redo): $(basename "$out")"

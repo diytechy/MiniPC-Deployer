@@ -434,6 +434,60 @@ if grep -qE '^WALL_HOST=.+' "$STACK_DIR/.env" 2>/dev/null \
     log "  and re-materialise. It cannot be invented here; it is an Owner value."
 fi
 
+# ── 4a-pre-4. IS THE ADDRESS COMPOSE PUBLISHES TO ACTUALLY ON THIS BOX YET? ──
+# EVERY PUBLISHED PORT IN docker-compose.yml IS BOUND TO ${LAN_IP}, NOT TO
+# 0.0.0.0 — that is deliberate (D5: the tier-2 surfaces must be structurally
+# unreachable from the WAN, not merely firewalled). The cost of that choice is
+# that `docker compose up -d` CANNOT START AT ALL until the address exists:
+#
+#     failed to bind host port <lan ip>:8096/tcp: cannot assign requested address
+#
+# and because `up -d` is all-or-nothing, ONE unbindable port leaves the whole
+# stack in `created`. Measured 2026-08-08: eight containers stranded, Caddy
+# among them, so no DNS, no certificates, no kiosk site — from one missing
+# address.
+#
+# THIS IS NOT A LAB ARTIFACT, though the lab is where it was found. The lab
+# installs with the adapter disconnected and reconnects afterwards, so firstboot
+# began with no carrier at all. On real hardware the same window exists whenever
+# the box finishes booting before DHCP hands out its lease — a slow switch, a
+# port coming out of STP learning, an AP that has not finished associating. The
+# unit already orders itself After=network-online.target and that is NOT enough:
+# systemd-networkd-wait-online TIMES OUT after its deadline and boot proceeds,
+# so network-online.target is "reached" with no address on the interface. Seen
+# in the same journal: "Timeout occurred while waiting for network connectivity."
+#
+# So wait for the thing we actually depend on — the ADDRESS, not the target —
+# and if it never arrives, say which address was missing. A named failure here
+# is worth far more than the opaque docker bind error it replaces, because that
+# error names a container (jellyfin) that has nothing to do with the cause.
+#
+# LAN_IP=0.0.0.0 is a legitimate configuration (the sim/vmtest overlay sets it
+# to publish on every interface); there is nothing to wait for in that case.
+# \042 is a double quote and \047 a single one, given in octal so this line
+# needs no nested quoting of its own — the obvious spelling of it does not
+# survive being written inside a command substitution.
+__lan_ip="$(sed -n 's/^LAN_IP=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 \
+            | sed 's/[[:space:]]*#.*$//' | tr -d '\042\047[:space:]')"
+if [ -n "$__lan_ip" ] && [ "$__lan_ip" != "0.0.0.0" ]; then
+    __waited=0
+    while ! ip -4 -o addr show 2>/dev/null | grep -qwF "$__lan_ip"; do
+        if [ "$__waited" -ge 180 ]; then
+            log "FATAL: $__lan_ip is not held by any interface after ${__waited}s."
+            log "  Every published port in docker-compose.yml binds to that address, and"
+            log "  'docker compose up -d' is all-or-nothing — it would fail with"
+            log "  'cannot assign requested address' naming an arbitrary container."
+            log "  The box has no LAN address, so this is a DHCP/link problem, not a"
+            log "  stack problem. Check:  ip -4 addr ; networkctl status ; the cable."
+            exit 1
+        fi
+        [ "$__waited" -eq 0 ] && log "waiting for $__lan_ip to appear on an interface (compose publishes to it)…"
+        sleep 5
+        __waited=$((__waited + 5))
+    done
+    [ "$__waited" -gt 0 ] && log "  $__lan_ip appeared after ${__waited}s"
+fi
+
 log "docker compose up -d…"
 docker compose up -d
 

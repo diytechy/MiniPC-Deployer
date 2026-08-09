@@ -4375,3 +4375,153 @@ always the configuration; it simply never shipped.
 
 **NOT YET RUN:** the `provision-mounts` fix has never executed inside a firstboot.
 The next `-Stage All` is what settles it.
+
+### 2026-08-09 — three defects from lab run `20260809-145118`, and a static guard
+
+The run failed **6 checks of 13**. Two defects, both in `firstboot`, plus a
+third found while diagnosing them. All three fixed here; all three proven on the
+live lab hub before any rebuild.
+
+**1. `homehub-firstboot.service` SIGTERMed itself at step 1b.**
+
+```
+20:21:17  1b: carving /var/lib/docker onto its own LV (15993 free extents)
+20:21:17  Logical volume "docker-data" created
+20:21:18  Main process exited, code=killed, status=15/TERM
+```
+
+The unit declared `Requires=docker.service`, and step 1b must
+`systemctl stop docker` to move `/var/lib/docker`. systemd propagates stops
+across `Requires=`, so the unit ordered its own death. **Two files each correct
+in isolation; the pair fatal** — which is why no reader caught it.
+
+Everything else followed: 0 of 15 image tars loaded → no stack → no Technitium →
+no LAN DNS → the panel's firstboot failed too (it resolves everything by name) →
+both kiosk interconnect checks failed → `/srv/library` and `/mnt/backup-drive`
+never mounted, because the generated fstab is written later in the same script.
+**One cause, six failing checks.** Fix: `Wants=` + `After=`. `After=` was always
+what delivered "runs after docker is up"; `Requires=` only added "and dies with
+it".
+
+**2. The step could not repair itself, which was worse.** Its idempotence guard
+asked *"does the LV exist"* — its own output. The kill left a formatted,
+unmounted LV, so every later boot said "already exists — nothing to do" and
+returned. `homehub-firstboot.service`'s own header warns that a step must ask of
+an INPUT, never of its own output; this was that warning made flesh. Re-running
+the script — the documented repair for every other step — was the one thing that
+could never work. The guard now asks the END STATE (*is `/var/lib/docker`
+mounted from that LV*) and **resumes** from wherever the last attempt stopped,
+re-running `mkfs` only if the volume has no filesystem.
+
+**3. The hub had no `cifs-utils`.** `packages.list` gave it `samba` (serve) and
+`smbclient` (test) but never `mount.cifs` (**mount**). The kernel module ships
+in the stock image, so `mount -t cifs` exists and fails misleadingly:
+`credentials=<file>` is parsed by mount.cifs, not the kernel, so no credential is
+sent (`STATUS_ACCESS_DENIED`); and kernel-side name resolution needs the same
+helper's upcall, so a resolvable FQDN gives `Unable to determine destination
+address` — printed as **`No route to host`**. HomeHub had spent two runs
+concluding that a Mini-serv share was missing, while `smbclient` on the same box
+read that share throughout. Same class as the 2026-08-07 `smbclient`-is-not-in-
+`samba-common-bin` miss.
+
+**A static guard, so this class fails the build instead of a three-hour run.**
+`validate_config.py` check **5b**: no firstboot script may `systemctl stop` a
+unit its own unit `Requires=`. Verified both directions — restoring `Requires=`
+makes it FAIL with the explanation, the fixed tree PASSes.
+
+**Verified first-hand:**
+
+- `bash -n stack/autoinstall/firstboot.sh` clean; `python scripts/check.py`
+  (gate G1) **PASS** — config-validate, registry-integrity, doc-navigability.
+- **On the live lab hub, in its broken state:** the repaired unit + script
+  resumed correctly — `1b: ubuntu-vg/docker-data exists but /var/lib/docker is
+  not mounted from it — finishing the move`, then `1b: /var/lib/docker is now
+  36.6G, separate from root`. firstboot ran to `Result=success`, **15 of 15
+  images loaded**, the full stack came up healthy, and fstab gained all three
+  mounts. After `cifs-utils`, the previously failing
+  `mount -t cifs //mini-serv.<domain>/Snapshots -o credentials=…` **mounts**, and
+  `backup.sh --dry-run` reaches `ingest: done`.
+- HomeHub's `Invoke-LabVerify.ps1 -IncludeExternal` then reported **3 failures
+  of 146** (from 5), all three lab-fixture limits rather than product defects.
+- The **panel's** media-cache LV (unchanged this round) proved its purpose: the
+  43 GB frame overflow that filled run 2's ROOT filesystem now lands in the
+  cache LV — root 47%, cache 97%. Contained.
+
+**NOT proven:** none of this has been through a clean image build. The lab hub
+was patched in place, so what is demonstrated is *the fixes work*, not *a fresh
+install produces them*. The next full lab run is what closes that.
+
+**Also this date, unrelated to the run:** compose + `.env.example` plumbing for
+NagLight's one-way traceability mirror (`TRACKER_MIRROR_*`), shipping blank/OFF.
+See HomeHub `DECISIONS_RATIFIED.md` → *Ratified 2026-08-09*.
+
+### 2026-08-09 (later) — the nightly backup had never worked: four stacked defects
+
+Chasing one missing directory found four independent faults, **each of which
+alone produces the identical error line** `path source missing for …`. The Owner
+ruled the behaviour first: *"the setup should include all folders, but tests
+should also verify this exact item. A missing folder shouldn't block the backup
+of other folders."*
+
+1. **CRLF in the emitted config** (HomeHub `Materialize-Deploy.ps1`). Its comment
+   promised LF — *"CRLF or a BOM breaks both on the box"* — and nothing ever
+   converted anything; output was LF only because the templates were. A
+   multi-line knob value from a CRLF `.psd1` carried `\r\n` through, so
+   `backup.env` had exactly 13 CR bytes (the internal breaks of the 14-line
+   `BACKUP_SOURCES`) while `.env` and `cifs.creds` had none — which is why it
+   read as backup-specific. Every path ended in `\r`, and **`\r` is invisible in
+   a log**, so the error named a path that looked correct.
+2. **`load_env_file` read only the FIRST of fourteen sets** (`common.sh`). It is
+   line-based on purpose (sourcing would expand bcrypt `$2a$14$…`), and stripped
+   quotes only when a value opened and closed on one line. Line 1 kept its
+   opening quote — naming the set `"media-music`, which also stopped its
+   `.exclude=` line matching — and every later line was rejected as a malformed
+   key and skipped **silently**, because `continue` on a bad key is correct for
+   comments and indistinguishable from this. Now supports multi-line quoted
+   values; the bcrypt-literal property is preserved and unit-tested.
+3. **No `volume:` source ever resolved** (`volume_mountpoint`). They name compose
+   volumes unprefixed (`actual_data`); docker's are project-prefixed
+   (`stack_actual_data`). Only visible once (2) let them be read. Resolved via
+   compose's own `com.docker.compose.volume` label — **not** a suffix match,
+   which was the first attempt and matched both `stack_actual_data` and
+   `stack_finance_actual_data`: it would have backed up a finance volume as the
+   budget one, silently. A second bug hid here too: `docker volume inspect -f` on
+   a missing volume writes an empty line to stdout, so echoing the probe through
+   produced `"\n/var/lib/docker/…"` and failed `[ -d ]` for volumes that HAD been
+   found.
+4. **`NonDocs/Media/Music` was created by nothing.** Step 4a-pre-2 pre-creates
+   library dirs only for Docker bind-mount sources; nothing containerised serves
+   music (Samba + CIFS to the panel), so no bind mount names it. New step
+   **4a-pre-2b** pre-creates every `BACKUP_SOURCES` path, **gated on
+   `/srv/library` being a real mountpoint** — it mounts `nofail`, so an
+   ungated `mkdir -p` would build a convincing fake library on the system disk
+   and hide a missing drive.
+
+**Behaviour change (`backup.sh`), per the ruling.** A missing source now SKIPS
+its own set and the run continues; it still posts `ok=false`, still exits
+non-zero and still names the set — after protecting the data it could reach.
+Previously the first absent path ended the run, so **one directory cost every
+other set, including all five Private trees**. Deliberately narrow: only
+"source absent" is tolerated; rsync/archive/integrity failures still abort,
+because those mean the machinery is broken rather than an input being absent.
+
+**Verified first-hand on the live lab hub, in sequence:**
+
+| | sets seen | verdict |
+|---|---|---|
+| before | 1 of 14 (`"media-music`) | abort |
+| after CRLF fix | 9 path sources, names clean | abort at volumes |
+| after parser + volume fix | **14 of 14** | skips `media-music`, archives 13, exits 1 |
+| after creating `Music` | 14 of 14 | **dry-run exits 0** |
+
+`bash -n` clean on `backup.sh`, `common.sh`, `firstboot.sh`; the multi-line
+parser unit-tested (multi-line value, parsing resumes after it, bcrypt stays
+literal, comment-stripping intact). HomeHub's hub suite now reports
+**ALL CHECKS PASSED — 92 passed, 9 not proven, 0 failed**, including the new
+`every backup source exists: 14 of 14 reachable (TC-H-M10)`.
+
+**Tests added** (HomeHub `verify-hub.sh` + `LAB_TEST_PLAN.md`): **TC-H-M10**
+reports a COUNT (`N of N`) rather than stopping at the first failure — it would
+have shown "1 of 14" immediately — and **TC-H-M11** covers skip-one-not-all.
+
+**NOT proven:** none of this has been through a clean image build.

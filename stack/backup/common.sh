@@ -81,7 +81,47 @@ load_env_file() {
         __k=${__k%"${__k##*[![:space:]]}"}
         case "$__k" in ''|*[!A-Za-z0-9_]*) continue ;; esac
         case "$__v" in
-            \"*\") __v=${__v#\"}; __v=${__v%\"} ;;
+            # ── QUOTED, POSSIBLY ACROSS SEVERAL LINES ──────────────────────
+            # THE OPENING QUOTE IS THE SIGNAL; THE CLOSING ONE MAY BE PAGES
+            # AWAY. This used to be a single `\"*\"` pattern, which matches
+            # only a value that opens AND closes on one line — and the failure
+            # on anything else was total and silent:
+            #
+            #   BACKUP_SOURCES="media-music=path:/srv/library/…/Music
+            #   media-movies=path:/srv/library/…/Movies
+            #   …twelve more…
+            #   finance=volume:finance_snapshots@finance-auditor"
+            #
+            # Line 1 kept its leading `"` (no closing quote to match), so the
+            # first set was named `"media-music` — which also stopped its
+            # `media-music.exclude=` line from ever matching. Every LATER line
+            # was then read as its own KEY=VALUE, rejected as a malformed key
+            # (`media-movies` has a hyphen), and CONTINUED PAST. So the backup
+            # silently saw ONE source instead of fourteen, and the thirteen it
+            # dropped included every Private tree.
+            #
+            # Nothing reported it: `continue` on a bad key is correct for
+            # comments and prose, and indistinguishable from this.
+            # Measured 2026-08-09 on the lab hub.
+            \"*)
+                __v=${__v#\"}
+                # Read on until a line ends with the closing quote. The outer
+                # loop's `< "$__f"` redirect covers this read too, so it
+                # consumes the continuation lines and they are never re-parsed
+                # as keys of their own.
+                until case "$__v" in *\") true ;; *) false ;; esac; do
+                    IFS= read -r __more || {
+                        # EOF with the quote still open: the file is malformed.
+                        # Say so — a truncated BACKUP_SOURCES is exactly the
+                        # silent partial this whole block exists to stop.
+                        printf '%s\n' "load_env_file: WARNING: unterminated quote in $__f for key '$__k' — value truncated at EOF" >&2
+                        break
+                    }
+                    __v="$__v
+$__more"
+                done
+                __v=${__v%\"}
+                ;;
             \'*\') __v=${__v#\'}; __v=${__v%\'} ;;
             # UNQUOTED: strip a trailing ` # comment`, exactly as shell
             # sourcing and docker compose's own .env parser both do. Without
@@ -154,7 +194,43 @@ source_kind() {
 # on failure — the caller decides how loud to be). Reading the mountpoint
 # directly (the service runs as root) avoids depending on any helper image.
 volume_mountpoint() {
-    docker volume inspect -f '{{ .Mountpoint }}' "$1" 2>/dev/null
+    # THE NAME IN BACKUP_SOURCES IS THE COMPOSE NAME; DOCKER'S IS PREFIXED.
+    # `volumes: actual_data:` in docker-compose.yml becomes the real volume
+    # `stack_actual_data`, because compose namespaces by PROJECT and the project
+    # defaults to the directory name (`stack/`). BACKUP_SOURCES is written
+    # against the compose file — that is the name a human reads and the one the
+    # storage map uses — so a bare inspect misses every volume set.
+    #
+    # Found 2026-08-09, and only visible once the multi-line parser fix let the
+    # volume entries be READ at all: all five (actual, tracker, technitium,
+    # caddy, finance) failed identically.
+    #
+    # Literal first: an operator who writes the real prefixed name, or renames
+    # the project, must keep working.
+    #
+    # CAPTURED, NOT ECHOED DIRECTLY. `docker volume inspect -f` on a MISSING
+    # volume still writes an empty line to stdout before failing, and echoing
+    # that through made the mountpoint "\n/var/lib/docker/…" — which then failed
+    # `[ -d "$vmp" ]` and reported "volume not found" for volumes that had just
+    # been found. Two bugs wearing one error message.
+    local mp name
+    mp="$(docker volume inspect -f '{{ .Mountpoint }}' "$1" 2>/dev/null)" || mp=""
+    if [ -n "$mp" ]; then printf '%s\n' "$mp"; return 0; fi
+
+    # Then ask COMPOSE, which records the mapping itself: every volume it
+    # creates carries `com.docker.compose.volume=<name as written in the compose
+    # file>`, which is exactly the name BACKUP_SOURCES uses. No prefix to guess
+    # and no string surgery.
+    #
+    # NOT A SUFFIX MATCH, which was the first attempt and was wrong: `_actual_data`
+    # matches BOTH `stack_actual_data` and `stack_finance_actual_data`, so the
+    # backup would have had to choose between a budget volume and a finance
+    # auditor's — silently, and wrongly half the time. The label is exact.
+    name="$(docker volume ls -q --filter "label=com.docker.compose.volume=$1" 2>/dev/null)"
+    [ "$(printf '%s\n' "$name" | grep -c .)" = "1" ] || return 1
+    mp="$(docker volume inspect -f '{{ .Mountpoint }}' "$name" 2>/dev/null)" || return 1
+    [ -n "$mp" ] || return 1
+    printf '%s\n' "$mp"
 }
 
 # ── INGEST-spec parsing (step 1b, ratified 2026-07-29) ────────────────────────

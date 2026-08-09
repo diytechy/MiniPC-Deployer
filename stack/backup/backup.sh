@@ -170,6 +170,12 @@ JSON
 FAIL_NOTE=""
 REPORTED_FAILURE=0
 
+# Sets skipped because their source directory was absent. Collected rather than
+# aborted on (see the `path)` branch), and settled at the very end: the run does
+# all the work it can, then finishes RED naming every set it could not reach.
+# Empty is the only green state — a partial backup NEVER reports ok.
+MISSING_SETS=""
+
 # report_failure NOTE : the ONE failure path — unmount, post ok=false, write the
 # failed RUN.json, log. Idempotent: whichever of the ERR trap and `die` gets
 # there first owns the verdict, so a die raised inside the trap (or vice versa)
@@ -425,7 +431,35 @@ for line in "${SOURCE_LINES[@]}"; do
             ;;
         path)
             dir="${src#path:}"
-            [ -d "$dir" ] || { FAIL_NOTE="path source missing for $name: $dir"; false; }
+            # A MISSING SOURCE DIRECTORY SKIPS ITS SET — IT DOES NOT ABORT THE RUN
+            # (the Owner, 2026-08-09: "a missing folder shouldn't block the backup
+            # of other folders").
+            #
+            # This used to `false` into the ERR trap, which ended the whole run at
+            # the FIRST absent path. Measured cost on 2026-08-09: a hub whose
+            # library drive had no NonDocs/Media/Music — one directory that
+            # nothing creates — backed up NOTHING AT ALL. Thirteen healthy sets,
+            # including every Private tree, were lost to the absence of one.
+            # "Never silently skip" is the rule, and it does NOT require aborting:
+            # the run is still red, still posts ok=false, still exits non-zero and
+            # still names the set — it just does so AFTER protecting the data it
+            # could reach. Losing tonight's backup of everything is the worse
+            # failure, and it is the one that used to happen.
+            #
+            # DELIBERATELY NARROW. Only "the source is not there" is tolerated.
+            # An rsync/archive/integrity failure below still aborts, because those
+            # mean the machinery is broken rather than one input being absent, and
+            # a half-written run should not be tidied past. The `volume` branch's
+            # equivalent (docker volume not found) is UNCHANGED and still fatal —
+            # see open-items A26; making that consistent is a separate call.
+            if [ ! -d "$dir" ]; then
+                log "[$name] WARN: SOURCE MISSING, SET SKIPPED: $dir"
+                log "[$name]   The run continues and will finish RED naming this set."
+                log "[$name]   Nothing about this set is archived, so the previous run's copy is"
+                log "[$name]   the newest one that exists — treat it as stale from now on."
+                MISSING_SETS="${MISSING_SETS:+$MISSING_SETS, }$name($dir)"
+                continue
+            fi
             log "[$name] rsync pull from local path $dir"
             rsync_pull "$dir/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
             ;;
@@ -476,7 +510,18 @@ for line in "${SOURCE_LINES[@]}"; do
     SET_SUMMARY="${SET_SUMMARY:+$SET_SUMMARY, }$name($set_files/${set_bytes}B/$algo)"
 done
 
-[ "$DRY_RUN" = 1 ] && { log "dry-run complete (no archives written)"; trap - ERR; exit 0; }
+# A dry run reports a missing source exactly as a real run does. It is what
+# verify-hub.sh asserts on (TC-H-M02/M10), so letting it exit 0 with sets missing
+# would make the check green on a box that cannot fully back up — the precise
+# shape of silent green this file exists to refuse.
+if [ "$DRY_RUN" = 1 ]; then
+    if [ -n "$MISSING_SETS" ]; then
+        trap - ERR
+        report_failure "source directory missing for: $MISSING_SETS — every OTHER set was planned normally; create the path(s) or remove the set from BACKUP_SOURCES"
+        exit 1
+    fi
+    log "dry-run complete (no archives written)"; trap - ERR; exit 0
+fi
 
 # ── 4. retention / rotation on the external drive ────────────────────────────
 log "retention: keep last $KEEP run(s) under $BACKUP_TARGET"
@@ -543,8 +588,22 @@ else
     log "offsite: $OFFSITE_DONE"
 fi
 
-# ── 6. report success (never-silent-green: this only runs if all steps passed) ─
+# ── 6. report (never-silent-green: OK only if every set was reached) ─────────
 trap - ERR
+
+# A PARTIAL RUN IS A RED RUN, and it reaches here having done real work. The
+# archives, manifest, hashes and retention above are all complete for the sets
+# whose sources existed — that data is on the drive and restorable, which is the
+# entire point of continuing past a missing source. What must NOT happen is this
+# reporting ok: a run that protected 13 of 14 sets is a run with a hole in it,
+# and the operator has to be told every night until it is fixed.
+if [ -n "$MISSING_SETS" ]; then
+    report_failure "source directory missing for: $MISSING_SETS — the other set(s) WERE archived to run_$RUN_TS (${SET_SUMMARY:-none}); create the path(s) or remove the set from BACKUP_SOURCES"
+    log "  the archived sets are complete and restorable; only the named set(s) are absent"
+    log "  manifest: $MANIFEST"
+    exit 1
+fi
+
 write_run_json "ok" "sets: ${SET_SUMMARY:-none}; offsite: $OFFSITE_DONE"
 feed_naglight true "backup ok $RUN_TS — ${SET_SUMMARY:-no sets}; offsite: $OFFSITE_DONE"
 log "== backup OK: $TOTAL_FILES file(s), $TOTAL_BYTES byte(s) across sets =="

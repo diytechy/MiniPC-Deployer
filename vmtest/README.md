@@ -50,9 +50,12 @@ stack/autoinstall[/wall]/packages.list      the ONE list. Nothing retypes it.
    │
    ├─► vmtest/export-apt.sh                 resolve the closure in a clean
    │      │                                 ubuntu:24.04 container, then PROVE it
-   │      │                                 in a second one: --network none,
-   │      │                                 every archive source deleted. Refuses
-   │      ▼                                 to ship a repo that cannot resolve.
+   │      │                                 in a second one: --network none, every
+   │      │                                 archive source deleted, seeded with the
+   │      │                                 ISO's OWN install base (--src-iso), and
+   │      │                                 --no-remove. Refuses to ship a repo that
+   │      ▼                                 cannot resolve OR that resolves by
+   │                                        DELETING something (defect 31).
    │   .out/apt/{*.deb, Packages, packages.baked.list}
    │      │
    │      ▼  stage_apt_into_payload() — and it checks the baked stamp against
@@ -665,6 +668,7 @@ vmtest/
   README.md               this file
   export-images.sh        Q10.9 B+: docker save every pinned stack image -> .out/images/*.tar
   export-apt.sh           §0a: every .deb the image installs -> .out[-wall]/apt/, proven offline
+                          against the ISO's install base (--src-iso) and with --no-remove
   build-seed.sh           HUB, LIGHT path: stock ISO + CIDATA seed ISO (folds in the image payload)
   build-repacked-iso.sh   HUB, HEAVIER path: one self-contained ISO (fallback; folds in the payload)
   build-wall-seed.sh      WALL PANEL seed ISO (§11) — the second image target, SR-017

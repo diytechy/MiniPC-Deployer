@@ -34,9 +34,18 @@
 # list the box installs cannot drift apart by construction. See the header of
 # stack/autoinstall/packages.list for why the list is no longer `packages:`.
 #
+# THE PROOF RUNS AGAINST THE ISO'S OWN INSTALL BASE when --src-iso is given, and
+# it should always be given. The download above happens in an EMPTY root on
+# purpose (see -o Dir::State::status=/dev/null); the PROOF is the opposite
+# question — "can apt reach this list from the machine the install actually
+# starts on, without deleting anything" — and answering it in a bare container
+# is what let defect 31 ship a repo that removed the boot path. Step 3 says so
+# at length. Without --src-iso the script still runs and says, in the log, that
+# it is proving something weaker.
+#
 # Usage:
-#   bash vmtest/export-apt.sh --target hub  --out .out/apt
-#   bash vmtest/export-apt.sh --target wall --out .out-wall/apt
+#   bash vmtest/export-apt.sh --target hub  --out .out/apt --src-iso /path/to/ubuntu-24.04.x-live-server-amd64.iso
+#   bash vmtest/export-apt.sh --target wall --out .out-wall/apt --src-iso ...
 #   bash vmtest/export-apt.sh --target hub --list some/other/packages.list --out ...
 
 set -euo pipefail
@@ -49,11 +58,16 @@ REPO_ROOT="$(repo_root)"
 LIST=""
 OUT=""
 TARGET="hub"
+SRC_ISO=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --list)   LIST="$2";   shift 2 ;;
-        --out)    OUT="$2";    shift 2 ;;
-        --target) TARGET="$2"; shift 2 ;;
+        --list)    LIST="$2";    shift 2 ;;
+        --out)     OUT="$2";     shift 2 ;;
+        --target)  TARGET="$2";  shift 2 ;;
+        # THE BASE THE PROOF RESOLVES AGAINST. See step 3: without it the offline
+        # check runs on a bare ubuntu:24.04 container, which is NOT the machine
+        # the install runs on, and the difference is what let defect 31 ship.
+        --src-iso) SRC_ISO="$2"; shift 2 ;;
         # Accepted and REFUSED rather than ignored. The first cut of this script
         # parsed `packages:` out of a user-data; that list has moved to a file
         # both this script and the installer read, and a --seed silently doing
@@ -143,20 +157,87 @@ rm -f "$OUT_ABS/.count"
 SIZE="$(du -sh "$OUT_ABS" | awk '{print $1}')"
 log "baked $COUNT .deb(s), $SIZE, indexed at $OUT_ABS"
 
-# ── 3. prove the repo can actually satisfy the list, OFFLINE ──────────────
+# ── 3. prove the repo can satisfy the list OFFLINE, ON THE RIGHT BASE ─────
 # THE ARTIFACT, NOT THE EXIT CODE. A directory of .debs and a Packages file is
 # not evidence that apt can resolve the list from it with no network — which is
-# the entire claim being made. So: a fresh container, no archive sources at all,
-# only this repo, --network none, and a real (simulated) install.
+# the entire claim being made. So: no archive sources at all, only this repo,
+# --network none, and a real (simulated) install.
+#
+# TWO THINGS THIS ASKED WRONGLY UNTIL 2026-08-09, AND DEFECT 31 WENT THROUGH THE
+# GAP BETWEEN THEM.
+#
+# 1. IT RESOLVED AGAINST THE WRONG MACHINE. A bare ubuntu:24.04 container ships
+#    no udev, no initramfs-tools, no cloud-init, no netplan.io — subiquity's
+#    /target has all of them. A conflict that can only appear when those are
+#    ALREADY INSTALLED cannot appear in a container that has never had them, so
+#    the resolution being proved was never the resolution that would run.
+#
+# 2. A REMOVAL IS A VALID RESOLUTION. It asked whether apt COULD satisfy the
+#    list with no network, got yes, and never asked what the answer cost. Naming
+#    systemd-resolved pulled systemd 8.16 while the ISO base carries 8.12; every
+#    binary of that source depends on its own exact version; udev was unnamed, so
+#    no 8.16 of it was ever fetched, and apt resolved by REMOVING udev,
+#    initramfs-tools, cloud-init, netplan.io, ubuntu-server and the rest of the
+#    boot path. `-y` answered the question a human would have stopped at.
+#
+# Both are fixed here, and they only work together: --no-remove on a container
+# with nothing to remove refuses nothing. Measured 2026-08-09 against the real
+# defect-31 repo — removals allowed, apt happily deletes ubuntu-server-minimal,
+# cloud-init and cryptsetup-initramfs and exits 0; with the ISO base and
+# --no-remove it exits 100 saying "Packages need to be removed but remove is
+# disabled". That is the same flag the two late-commands pass, so the question
+# asked here is now the question the installer will ask.
+STATUS_ARG=""
+STATUS_MOUNT=""
+if [ -n "$SRC_ISO" ]; then
+    [ -f "$SRC_ISO" ] || die "--src-iso not found: $SRC_ISO"
+    require_cmd xorriso    "Install with: sudo apt-get install -y xorriso"
+    require_cmd unsquashfs "Install with: sudo apt-get install -y squashfs-tools"
+
+    # THE ISO'S OWN dpkg STATUS, NOT A LIST OF NAMES. The casper manifests give
+    # name+version and nothing else, and a synthetic status built from them is
+    # WORSE THAN USELESS HERE: with no Depends: fields apt sees no conflict, the
+    # proof passes, and it passes for a reason that has nothing to do with the
+    # question. The squashfs carries the real /var/lib/dpkg/status — 602 stanzas
+    # with full dependency metadata at the exact versions the target will have.
+    # unsquashfs extracts that one path without unpacking the image.
+    SQ_NAME="casper/ubuntu-server-minimal.ubuntu-server.squashfs"
+    SQ_TMP="$(mktemp -d)"
+    trap 'rm -rf "$SQ_TMP"' EXIT
+    log "reading the install base from $SRC_ISO ($SQ_NAME)"
+    xorriso -osirrox on -indev "$SRC_ISO" -extract "/$SQ_NAME" "$SQ_TMP/base.squashfs" >/dev/null 2>&1 \
+        || die "could not extract /$SQ_NAME from $SRC_ISO. It is the layer subiquity copies to /target; a server ISO that does not carry it is not the image this build targets. Inspect with: xorriso -indev '$SRC_ISO' -find /casper -name '*.squashfs'"
+    unsquashfs -q -n -f -d "$SQ_TMP/x" "$SQ_TMP/base.squashfs" /var/lib/dpkg/status >/dev/null 2>&1 \
+        || die "could not read /var/lib/dpkg/status out of $SQ_NAME"
+    STATUS_FILE="$SQ_TMP/x/var/lib/dpkg/status"
+    [ -s "$STATUS_FILE" ] || die "the status file extracted from $SQ_NAME is empty"
+    BASE_N="$(grep -c '^Package: ' "$STATUS_FILE" || echo 0)"
+    [ "$BASE_N" -gt 100 ] || die "only $BASE_N packages in the install base — that is not a server root filesystem, and a proof against it would be as empty as the container one it replaces"
+    log "  install base: $BASE_N packages (this is what /target looks like before late-command 3c)"
+    STATUS_MOUNT="-v $STATUS_FILE:/status:ro"
+    STATUS_ARG="cat /status > /var/lib/dpkg/status;"
+else
+    # SAID OUT LOUD, because a weaker proof that looks identical in the log is
+    # how this defect survived. Not fatal: --no-remove below still catches the
+    # subset of removals a bare container can see, and the ISO is not always to
+    # hand (test fixtures, a repo re-bake).
+    log "WARNING: no --src-iso, so this resolves against a BARE ubuntu:24.04 container, which"
+    log "  has no udev, initramfs-tools, cloud-init or netplan.io — a conflict that only appears"
+    log "  when those are installed CANNOT be seen here. This is the WEAKER proof; pass"
+    log "  --src-iso <ubuntu-server.iso> to run it against the set the install starts from."
+fi
+
 log "verifying the repo resolves with NO network"
-docker run --rm --network none -v "$OUT_ABS:/repo:ro" ubuntu:24.04 bash -c "
+# shellcheck disable=SC2086
+docker run --rm --network none -v "$OUT_ABS:/repo:ro" $STATUS_MOUNT ubuntu:24.04 bash -c "
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
     rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
     echo 'deb [trusted=yes] file:/repo ./' > /etc/apt/sources.list.d/baked.list
+    $STATUS_ARG
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends --simulate $PKGS >/dev/null
-" || die "the baked repo CANNOT satisfy the package list offline - the install would fail exactly where it failed on 2026-08-06. Refusing to ship it."
+    apt-get install -y --no-install-recommends --no-remove --simulate $PKGS >/dev/null
+" || die "the baked repo CANNOT satisfy the package list offline WITHOUT REMOVING SOMETHING. Either a dependency is missing (the install would fail exactly where it failed on 2026-08-06), or resolving this list costs the removal of packages the target already has (defect 31: that is how naming one package deleted the boot path). Re-run without --no-remove to see which, and read any 'Remv' line as a package the install would delete: docker run --rm --network none -v '$OUT_ABS:/repo:ro' ubuntu:24.04 bash -c \"rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; echo 'deb [trusted=yes] file:/repo ./' > /etc/apt/sources.list.d/baked.list; apt-get update -qq; apt-get install -y --no-install-recommends --simulate $PKGS\" . The fix is to NAME the packages apt wants to remove in packages.list, so a matching version is fetched too. Refusing to ship it."
 
 # ── 4. record WHICH list this repo was baked from ─────────────────────────
 # The debs are FROZEN at this moment; the names the installer asks for are read

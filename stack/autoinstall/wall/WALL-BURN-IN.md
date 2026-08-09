@@ -192,8 +192,14 @@ below has to be done twice, with the right shape each time.
       ```
 - [ ] **Prove BOTH mounts** from the panel, by hand, before trusting the units —
       a cifs failure and a credentials failure look the same in a service log:
+      **Use the hub's FQDN, not the short name** (storage-map §1 A11(vii),
+      2026-08-09). `//homehub/Media` fails here with `could not resolve address`:
+      the panel's `search` is `.`, and systemd-resolved does not resolve
+      single-label names over unicast DNS. That failure reads as a Samba or
+      permission fault and is neither — so typing the short form at this step
+      sends you to debug a share that is serving correctly.
       ```bash
-      sudo mount -t cifs //homehub/Media /mnt -o guest,ro,vers=3.0   # anonymous - no credential
+      sudo mount -t cifs //homehub.<domain>/Media /mnt -o guest,ro,vers=3.0   # anonymous - no credential
       ls /mnt/Music     # the music must be UNDER the mount, in Music/
       sudo umount /mnt
       sudo mount -t cifs //MINI-SERV/PictureFrameVideos /mnt -o credentials=/etc/wall-panel/cifs-frame.creds,ro,vers=3.0

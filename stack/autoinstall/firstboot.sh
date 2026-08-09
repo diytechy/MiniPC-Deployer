@@ -45,6 +45,102 @@ if grep -q "REPLACE_WITH" .env; then
     log "and re-run: sudo /usr/local/sbin/homehub-firstboot.sh"
 fi
 
+# ── 1b. give /var/lib/docker its own LV, out of the space the installer left ──
+#
+# WHY THIS EXISTS. Subiquity's guided LVM ("layout: name: lvm", no
+# sizing-policy) gives the root LV about HALF the volume group and leaves the
+# rest unallocated — 62 GB of a 125 GB disk on this box, measured 2026-08-09.
+# Nothing had ever claimed it, so half the SSD sat idle while everything shared
+# one filesystem.
+#
+# WHAT IT BUYS, and it is not the space. Docker is the one path here that grows
+# without bound: images, layers, volumes, and the tier-2 profiles (immich,
+# immich-ml, jellyfin) are exactly the things that grow. On one filesystem, a
+# runaway pull fills ROOT — and a full root on the box that serves this LAN's
+# DNS does not degrade, it fails: journald stops, sshd cannot write, and
+# recovery needs the console. Measured on the panel the same day: its media sync
+# took / to 100% and the box stayed up only because nothing else needed to write.
+# On its own LV, docker fills ITS filesystem, compose reports a disk error, and
+# the rest of the box keeps running.
+#
+# PROPORTIONAL, NEVER ABSOLUTE. `-l 60%FREE` is 60% of what is unallocated, so
+# the same line is correct on the 128 GB production NVMe and on a small lab
+# VHDX. A literal `-L 60G` would simply fail on the smaller disk, and would do
+# it here, at firstboot, on a box with no console.
+#
+# THE REMAINING 40% IS LEFT UNALLOCATED ON PURPOSE. ext4 grows online in seconds
+# (`lvextend -r`); it shrinks only unmounted, which for / means rescue media. So
+# space committed to the wrong LV is expensive and space left in the VG is free
+# to direct later. This split is a guess, and the reserve is what makes a wrong
+# guess cheap.
+#
+# IDEMPOTENT, and asked of an INPUT rather than of its own output — the header
+# above is explicit that this script re-runs on every boot. The question is "does
+# this LV exist", which is false exactly once.
+setup_docker_lv() {
+    command -v lvs >/dev/null 2>&1 || { log "1b: no LVM tooling — skipping the docker LV"; return 0; }
+
+    # ASKED OF THE ROOT DEVICE, not of "the first VG on the box". A box with a
+    # second volume group — a data disk, a leftover — must not have its docker
+    # LV carved out of the wrong one. If / is not an LV at all, lvs fails, $vg is
+    # empty, and this returns without touching anything.
+    local rootdev vg
+    rootdev="$(findmnt -no SOURCE / 2>/dev/null)"
+    vg="$(lvs --noheadings -o vg_name "$rootdev" 2>/dev/null | awk '{$1=$1;print}')"
+    [ -n "$vg" ] || { log "1b: / is not on LVM — skipping the docker LV (nothing to carve)"; return 0; }
+
+    if lvs "$vg/docker-data" >/dev/null 2>&1; then
+        log "1b: $vg/docker-data already exists — nothing to do"
+        return 0
+    fi
+
+    # Free extents, not free bytes: 0 means the installer already used the whole
+    # VG (sizing-policy: all, or a hand-built layout). That is a legitimate
+    # configuration and must not be an error.
+    local freeext
+    freeext="$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')"
+    if [ -z "$freeext" ] || [ "$freeext" -lt 256 ]; then
+        log "1b: $vg has no meaningful free space (${freeext:-0} extents) — leaving /var/lib/docker on root"
+        return 0
+    fi
+
+    log "1b: carving /var/lib/docker onto its own LV from $vg (${freeext} free extents)"
+    lvcreate -y -l 60%FREE -n docker-data "$vg" || { log "1b: WARNING lvcreate failed — leaving docker on root"; return 0; }
+    mkfs.ext4 -q -L docker-data "/dev/$vg/docker-data" || { log "1b: WARNING mkfs failed — leaving docker on root"; return 0; }
+
+    # STOP DOCKER BEFORE MOVING ITS STATE. On a fresh install this directory is
+    # nearly empty, but "nearly" is not "empty" — the daemon creates its storage
+    # driver tree at first boot, and mounting over live state would hide it from
+    # a running daemon rather than move it.
+    systemctl stop docker.socket docker 2>/dev/null || true
+
+    local tmp; tmp="$(mktemp -d)"
+    mount "/dev/$vg/docker-data" "$tmp"
+    if [ -d /var/lib/docker ] && [ -n "$(ls -A /var/lib/docker 2>/dev/null)" ]; then
+        cp -a /var/lib/docker/. "$tmp"/ || { log "1b: WARNING could not copy existing docker state — leaving it on root"; umount "$tmp"; rmdir "$tmp"; systemctl start docker 2>/dev/null || true; return 0; }
+        rm -rf /var/lib/docker/* /var/lib/docker/.[!.]* 2>/dev/null || true
+    fi
+    umount "$tmp"; rmdir "$tmp"
+    mkdir -p /var/lib/docker
+
+    # BY UUID, not by /dev/<vg>/<lv>. A device-mapper path depends on the VG name
+    # surviving; a UUID does not, and fstab is read before anything can fix it.
+    #
+    # nofail, because the failure modes are not symmetric. If this mount is ever
+    # unsatisfiable, `nofail` means the box boots with docker back on root — the
+    # behaviour it had before this step existed. Without it, systemd drops to
+    # emergency.target on a headless machine, which is the 2026-08-06 signature
+    # this project has already paid for once.
+    local uuid; uuid="$(blkid -s UUID -o value "/dev/$vg/docker-data")"
+    if ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
+        printf 'UUID=%s /var/lib/docker ext4 defaults,nofail 0 2\n' "$uuid" >> /etc/fstab
+    fi
+    mount /var/lib/docker
+    systemctl start docker 2>/dev/null || true
+    log "1b: /var/lib/docker is now $(findmnt -no SIZE /var/lib/docker 2>/dev/null), separate from root"
+}
+setup_docker_lv
+
 # ── 2. oauth2-proxy allow-list (Q10.5) ───────────────────────────────────────
 # Materialize authenticated-emails.txt (one account per line) from the
 # comma/space-separated OAUTH2_PROXY_ALLOWED_EMAILS in .env. Gitignored output.

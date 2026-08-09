@@ -385,6 +385,77 @@ log "kiosk: tty1 autologin + profile hook installed, getty@tty1 restart enqueued
 # first sync can be the whole music library over Wi-Fi and firstboot must not
 # block on it.
 : "${WALL_MEDIA_CACHE:=/var/cache/wall-media}"
+
+# GIVE THE MEDIA CACHE ITS OWN LV, BEFORE ANYTHING SYNCS INTO IT — 2026-08-09.
+#
+# THE FAILURE THIS PREVENTS WAS MEASURED, not imagined. On 2026-08-09 the frame
+# sync mirrored 7.7 GB of a 43 GB share into this cache and took / to 100% —
+# `/dev/mapper/ubuntu--vg-ubuntu--lv 15G 14G 0 100% /`. wall-sync failed, and it
+# failed in the worst available way: a full ROOT filesystem, on a box whose only
+# door is sshd, which then cannot write. The cache is the one path here that is
+# sized by SOMEONE ELSE'S share — the frame source can grow at any time and this
+# panel has no say in it.
+#
+# On its own LV, the same overfill fills the CACHE and stops. wall-sync reports a
+# disk error, the shell keeps serving whatever it already mirrored, and the box
+# stays reachable. That is the difference between a failed sync and a failed
+# panel.
+#
+# The installer leaves about half the volume group unallocated (guided LVM, no
+# sizing-policy), which is where this comes from — nothing had ever claimed it.
+# `-l 60%FREE` rather than a literal size, so one line is right on the 238.5 GB
+# production SSD and on a small lab VHDX; a fixed -L would fail outright on the
+# smaller disk, at firstboot, on a box mounted on a wall. The remaining 40% is
+# left unallocated deliberately: ext4 grows online in seconds and shrinks only
+# unmounted, so an over-committed LV is expensive and a reserve is not.
+setup_media_cache_lv() {
+    command -v lvs >/dev/null 2>&1 || { log "media cache: no LVM tooling — leaving it on root"; return 0; }
+
+    local rootdev vg
+    rootdev="$(findmnt -no SOURCE / 2>/dev/null)"
+    vg="$(lvs --noheadings -o vg_name "$rootdev" 2>/dev/null | awk '{$1=$1;print}')"
+    [ -n "$vg" ] || { log "media cache: / is not on LVM — leaving it on root"; return 0; }
+
+    # Asked of an input (does the LV exist), never of this script's own output —
+    # wall-firstboot re-runs on every boot.
+    if lvs "$vg/wall-cache" >/dev/null 2>&1; then
+        log "media cache: $vg/wall-cache already exists — nothing to do"
+        return 0
+    fi
+
+    local freeext
+    freeext="$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')"
+    if [ -z "$freeext" ] || [ "$freeext" -lt 256 ]; then
+        log "media cache: $vg has no meaningful free space (${freeext:-0} extents) — leaving the cache on root"
+        return 0
+    fi
+
+    log "media cache: carving $WALL_MEDIA_CACHE onto its own LV from $vg (${freeext} free extents)"
+    lvcreate -y -l 60%FREE -n wall-cache "$vg" || { warn "lvcreate failed — leaving the media cache on root"; return 0; }
+    mkfs.ext4 -q -L wall-cache "/dev/$vg/wall-cache"  || { warn "mkfs failed — leaving the media cache on root"; return 0; }
+
+    # Preserve anything already mirrored. A re-image starts empty, but a box that
+    # reached this line with a populated cache must not silently lose it behind a
+    # new mount.
+    install -d -m 0755 "$WALL_MEDIA_CACHE"
+    local tmp; tmp="$(mktemp -d)"
+    mount "/dev/$vg/wall-cache" "$tmp"
+    if [ -n "$(ls -A "$WALL_MEDIA_CACHE" 2>/dev/null)" ]; then
+        cp -a "$WALL_MEDIA_CACHE"/. "$tmp"/ 2>/dev/null || warn "could not copy the existing cache forward — it will be re-synced"
+        rm -rf "${WALL_MEDIA_CACHE:?}"/* 2>/dev/null || true
+    fi
+    umount "$tmp"; rmdir "$tmp"
+
+    # By UUID: fstab is read before anything could repair a stale device path.
+    local uuid; uuid="$(blkid -s UUID -o value "/dev/$vg/wall-cache")"
+    if ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
+        printf 'UUID=%s %s ext4 defaults,nofail 0 2\n' "$uuid" "$WALL_MEDIA_CACHE" >> /etc/fstab
+    fi
+    mount "$WALL_MEDIA_CACHE" 2>/dev/null || warn "could not mount $WALL_MEDIA_CACHE — the cache stays on root this boot"
+    log "media cache: $WALL_MEDIA_CACHE is now $(findmnt -no SIZE "$WALL_MEDIA_CACHE" 2>/dev/null), separate from root"
+}
+setup_media_cache_lv
+
 install -d -m 0755 "$WALL_MEDIA_CACHE" "$WALL_MEDIA_CACHE/music" "$WALL_MEDIA_CACHE/frame"
 log "OI-15: media cache ready at $WALL_MEDIA_CACHE (music/ + frame/)"
 if [ -f /etc/systemd/system/wall-sync.service ]; then

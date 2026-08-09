@@ -12,6 +12,31 @@ the WebDAV fallback began sunsetting in April 2026 — so hosting the offsite
 sync on the box (which is where it now lives, OI-11) requires a minimal
 graphical session to launch and configure it in.
 
+## What IS and IS NOT on the install media (verified 2026-08-09)
+
+Do not assume this arrives with the image, because two thirds of it does not:
+
+| | on the USB / on the box after install |
+|---|---|
+| `setup-remote-ui.sh` + this README | **yes** — staged to `/opt/homehub/stack/remote-ui/` |
+| `xrdp`, `xorgxrdp`, `dbus-x11`, `xfce4-session`, `libfuse2t64` | **no** — not in `packages.list`, so not in the baked offline apt repo |
+| the IceDrive AppImage | **no** — never bundled; vendor URLs churn, so it is fetched by hand |
+
+The packages being absent is **deliberate** (SN-012: *"nothing from it is
+installed or running unless explicitly opted in"*), and it has a consequence
+worth knowing before you need it:
+
+> **THIS SCRIPT NEEDS WORKING INTERNET AT THE MOMENT YOU RUN IT.** It does
+> `apt-get update && apt-get install`, the packages are not in the baked repo,
+> and the baked repo is install-time only — `/run/baked-apt` is gone once the
+> box is up. So on a hub that installed offline and has no route out, the opt-in
+> **cannot be completed at all**. Verified on a live hub: none of the five
+> packages are present, and `xrdp` is `not-found`.
+
+If offline opt-in is ever needed, the fix is to bake those packages into the
+offline repo *without installing them* and retain it on the box as an apt
+source — which is a change to the install, not to this script.
+
 ## Enable (one-time, over SSH)
 
 ```sh
@@ -46,6 +71,22 @@ is running inside a session**:
   login and sync pairs live in the hub account's home directory; a reimage wipes
   them. Re-setup checklist after a reimage: re-run the script → RDP in →
   sign in → re-create sync pairs → test file round-trip.
+
+## The IceDrive account credential is NOT a deploy secret
+
+**Ruled by the Owner, 2026-08-09.** It is typed into the client's GUI over RDP
+and nowhere else, so it is deliberately absent from the DPAPI store and from
+`FieldSchema.psd1`.
+
+The reasoning is worth keeping, because "it is a credential, so it belongs in
+the vault" is the obvious wrong answer here: **nothing in this repo can act on
+it.** There is no CLI and no API to hand it to (see the GUI-only note above), so
+storing it would buy no automation — it would only add a plaintext-at-rest
+secret, a rotation obligation, and a store key that looks like an unfinished
+task. That is exactly the shape `DataRepoDeployKey` had before it was retired:
+collectable, and consumed by nothing.
+
+Treat it like any other personal login — password manager, not deploy store.
 
 ## Security stance
 

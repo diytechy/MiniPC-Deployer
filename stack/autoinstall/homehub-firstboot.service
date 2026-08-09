@@ -9,11 +9,31 @@
 # repair — but it means any step asking "has this already happened?" must ask it
 # of an INPUT, never of its own output. Getting that backwards is how step 3e's
 # collision warning came to fire on every reboot (2026-08-03).
+#
+# WANTS, NOT REQUIRES, ON DOCKER — AND THE DIFFERENCE COST A WHOLE LAB RUN
+# (20260809-145118, fixed 2026-08-09). `Requires=` propagates STOPS: stopping
+# docker.service stops every unit that Requires it. Step 1b has to stop docker
+# to move /var/lib/docker onto its own LV, so this unit was ordering its own
+# execution:
+#
+#   20:21:17  1b: carving /var/lib/docker onto its own LV
+#   20:21:17  Logical volume "docker-data" created
+#   20:21:18  Main process exited, code=killed, status=15/TERM
+#
+# It SIGTERMed itself one second in, having created and formatted the LV but
+# not mounted it. Nothing after step 1b ran: 0 of 15 image tars loaded, no
+# compose stack, no Technitium — so the hub served no DNS, and the panel then
+# failed too because it resolves everything by name. Six failing checks, one
+# cause.
+#
+# `After=` is what actually delivers "runs after docker is up"; `Requires=`
+# only added "and dies with it". If docker genuinely fails to start, this unit
+# now runs anyway and fails loudly at `docker load` — which is the better of
+# the two silences.
 [Unit]
 Description=AWOW always-on core first-boot bring-up (compose + Technitium provisioning)
 After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
+Wants=network-online.target docker.service
 
 [Service]
 Type=oneshot

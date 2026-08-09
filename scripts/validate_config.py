@@ -395,6 +395,53 @@ def main():
             + ", ".join(undeclared),
         )
 
+    # 5b. No firstboot script may stop a unit its OWN unit `Requires=`.
+    #
+    #     THE RUN THIS EXISTS BECAUSE OF: 20260809-145118. firstboot.sh step 1b
+    #     runs `systemctl stop docker.socket docker` to move /var/lib/docker onto
+    #     its own LV, and homehub-firstboot.service said `Requires=docker.service`.
+    #     systemd propagates STOPS across Requires=, so the script SIGTERMed
+    #     itself one second in — LV created and formatted, never mounted, and
+    #     every step after it skipped. 0 of 15 image tars loaded, no stack, no
+    #     DNS, and the panel failed too because it resolves everything by name.
+    #     Six failing checks, one cause, three hours to find out.
+    #
+    #     This is a two-file bug: each file is correct alone and the pair is
+    #     fatal, which is exactly the shape a static check catches and a reader
+    #     does not. `Wants=` + `After=` gives the ordering without the coupling.
+    for unit_rel, script_rel in (
+        ("autoinstall/homehub-firstboot.service", "autoinstall/firstboot.sh"),
+        ("autoinstall/wall/wall-firstboot.service", "autoinstall/wall/wall-firstboot.sh"),
+    ):
+        unit_text, script_text = load(stack / unit_rel), load(stack / script_rel)
+        if not unit_text or not script_text:
+            continue
+        required = set()
+        for line in unit_text.splitlines():
+            line = line.strip()
+            if line.startswith("Requires="):
+                for dep in line.split("=", 1)[1].split():
+                    # Compare on the bare name so `docker` and `docker.service`
+                    # are the same unit — the stop line writes it either way.
+                    required.add(dep.rsplit(".", 1)[0] if "." in dep else dep)
+        stopped = set()
+        for m in re.finditer(r"^\s*systemctl\s+stop\s+([^\n|&;]+)", script_text, re.M):
+            for unit in m.group(1).split():
+                if unit.startswith("-"):
+                    continue  # a flag, not a unit
+                stopped.add(unit.rsplit(".", 1)[0] if "." in unit else unit)
+        clash = sorted(required & stopped)
+        check(
+            not clash,
+            "{} stops no unit it Requires= ({} required, {} stopped)".format(
+                Path(script_rel).name, len(required), len(stopped)
+            ),
+            "{} stops {} which {} declares Requires= — systemd will propagate the "
+            "stop back and SIGTERM the script mid-run. Use Wants= + After=.".format(
+                Path(script_rel).name, "/".join(clash), Path(unit_rel).name
+            ),
+        )
+
     # 6. Electron runtime deps: every soname the shell artifact loads maps to a
     #    package this image installs (IF-005 / PKG-1).
     #

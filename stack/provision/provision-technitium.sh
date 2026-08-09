@@ -272,6 +272,37 @@ main() {
         echo "  WARN: could not determine this box's hostname — no self record added."
     fi
 
+    # MINI-SERV, THE OTHER BOX ON THIS LAN THAT ANYTHING MOUNTS — added
+    # 2026-08-09, and it is the same defect as the two above, one machine over.
+    #
+    # It is NOT this box's to name, but it IS this box's to RESOLVE: everything
+    # that mounts it (the panel's frame-video sync, this box's own backup ingest)
+    # asks this resolver, and Mini-serv is a Windows box that publishes no DNS
+    # record of its own anywhere.
+    #
+    # MEASURED 2026-08-09, and the two boxes fail differently, which is why a
+    # short name cannot be left to chance:
+    #   panel:  `resolvectl query MINI-SERV` -> "No appropriate name servers or
+    #           networks for name found". systemd-resolved will not send a
+    #           single label to unicast DNS, so the frame flow never even tried.
+    #   hub:    the cifs mount failed with "No route to host" rather than a
+    #           resolution error — consistent with a multicast answer carrying
+    #           only a link-local IPv6 address (fe80::…), which cifs cannot use
+    #           without a scope id.
+    #
+    # One record fixes both, because both boxes resolve through here. The
+    # consumers then name it `mini-serv.<domain>`, exactly as they name this box.
+    #
+    # MAIN_BOX_IP is Mini-serv's address (storage-map §1 `mini-serv`; the knob
+    # predates this use and already carries @identity:miniserv.LanIp). Guarded:
+    # a deployment without that box set leaves it empty and gets no record,
+    # rather than an A record pointing at nothing.
+    if [ -n "${MAIN_BOX_IP:-}" ]; then
+        add_a "$TOKEN" "mini-serv.${DOMAIN}" "$MAIN_BOX_IP"
+    else
+        echo "  note: MAIN_BOX_IP is unset — no mini-serv record. Correct only for a hub with no Mini-serv."
+    fi
+
     # Tier-2 opt-in subdomains (SR-012): bare labels from EXTRA_SUBDOMAINS in
     # .env (space/comma-separated, e.g. "vault photos music"), one A record each
     # → LAN_IP. Empty = no-op. Pairs with the commented Caddyfile sites.

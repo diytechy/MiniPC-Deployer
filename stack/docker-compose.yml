@@ -238,6 +238,31 @@ services:
       # .env.example. Set by the A19 gate so the two drive lanes the panel is
       # asserted on exist before the panel ever asks for them.
       TRACKER_SEED_DIR: ${TRACKER_SEED_DIR}
+      # ── One-way traceability mirror (NagLight SN-024, the Owner 2026-08-09) ──
+      # Commits ONE identity's data dir hourly and pushes it to a private repo,
+      # so there is a record of how items changed. It is one-way BY
+      # CONSTRUCTION: the remote's history is fetched once, its CONTENT never
+      # is, and a diverged remote is reported rather than force-pushed or
+      # pulled. The upstream service stays the source of truth.
+      #
+      # NOT THE SAME KNOB AS TRACKER_DATA_REMOTE ABOVE, and the two point in
+      # OPPOSITE directions: that one clones/pulls the remote INTO /data
+      # (single-user only). Setting both would be incoherent.
+      #
+      # BLANK = OFF, which is what ships. TRACKER_MIRROR_USER is REQUIRED
+      # alongside the remote in multi-user mode: with no id the mirror refuses
+      # to start rather than defaulting to the data root, because that default
+      # would push every household member's private data into one repo.
+      TRACKER_MIRROR_REMOTE: ${TRACKER_MIRROR_REMOTE}
+      TRACKER_MIRROR_USER: ${TRACKER_MIRROR_USER}
+      TRACKER_MIRROR_BRANCH: ${TRACKER_MIRROR_BRANCH}
+      TRACKER_MIRROR_INTERVAL: ${TRACKER_MIRROR_INTERVAL}
+      # The repo token. NagLight also reads TRACKER_MIRROR_TOKEN_FILE, which is
+      # the stronger form (a 0400 mount is not in `docker inspect`) — the env
+      # var is used here because it is what every other secret on this box
+      # already does, so the file would add a mechanism without changing the
+      # box's actual exposure. Revisit together with the others, not alone.
+      TRACKER_MIRROR_TOKEN: ${TRACKER_MIRROR_TOKEN}
     volumes:
       - tracker_data:/data
       # Read-only, and inert unless TRACKER_SEED_DIR names it. The default

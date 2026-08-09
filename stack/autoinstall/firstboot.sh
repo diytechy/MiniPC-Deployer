@@ -74,9 +74,22 @@ fi
 # to direct later. This split is a guess, and the reserve is what makes a wrong
 # guess cheap.
 #
-# IDEMPOTENT, and asked of an INPUT rather than of its own output — the header
-# above is explicit that this script re-runs on every boot. The question is "does
-# this LV exist", which is false exactly once.
+# IDEMPOTENT, and the question it asks is "IS /var/lib/docker ALREADY ON ITS OWN
+# LV" — the END STATE — not "does the LV exist".
+#
+# IT USED TO ASK THE SECOND, AND THAT WAS THE BUG (found 2026-08-09, run
+# 20260809-145118). The LV is this step's OWN OUTPUT, and the unit header is
+# explicit that a step must never ask "has this already happened?" of its own
+# output. It cost exactly what that warning predicts: the run was SIGTERMed
+# between `mkfs` and `mount` (see homehub-firstboot.service — a self-inflicted
+# stop, now fixed), leaving a formatted LV that nothing mounted. On the next
+# boot `lvs` found it, said "already exists — nothing to do", and returned. So
+# the box could never finish the job, and "re-run the script" — the DOCUMENTED
+# repair for every other step here — was the one thing that could not work.
+#
+# A half-done storage change that cannot self-repair is worse than one that
+# never started, so the guard now checks the mount and resumes from wherever the
+# previous attempt stopped.
 setup_docker_lv() {
     command -v lvs >/dev/null 2>&1 || { log "1b: no LVM tooling — skipping the docker LV"; return 0; }
 
@@ -89,29 +102,50 @@ setup_docker_lv() {
     vg="$(lvs --noheadings -o vg_name "$rootdev" 2>/dev/null | awk '{$1=$1;print}')"
     [ -n "$vg" ] || { log "1b: / is not on LVM — skipping the docker LV (nothing to carve)"; return 0; }
 
+    # THE END-STATE QUESTION. Already mounted from our LV = the work is done,
+    # on this boot and every later one.
+    if [ "$(findmnt -no SOURCE /var/lib/docker 2>/dev/null)" = "/dev/mapper/${vg//-/--}-docker--data" ]; then
+        log "1b: /var/lib/docker is already on $vg/docker-data — nothing to do"
+        return 0
+    fi
+
     if lvs "$vg/docker-data" >/dev/null 2>&1; then
-        log "1b: $vg/docker-data already exists — nothing to do"
-        return 0
-    fi
+        # The LV is there but the mount is not, so a previous attempt died
+        # part-way. Resume rather than return: skip the carve, keep every step
+        # after it. mkfs is re-run only if the volume has no filesystem, which
+        # is the one case where the previous attempt stopped even earlier.
+        log "1b: $vg/docker-data exists but /var/lib/docker is not mounted from it — finishing the move"
+        if ! blkid -s TYPE -o value "/dev/$vg/docker-data" >/dev/null 2>&1; then
+            log "1b: the volume has no filesystem — making one"
+            mkfs.ext4 -q -L docker-data "/dev/$vg/docker-data" || { log "1b: WARNING mkfs failed — leaving docker on root"; return 0; }
+        fi
+    else
+        # Free extents, not free bytes: 0 means the installer already used the
+        # whole VG (sizing-policy: all, or a hand-built layout). That is a
+        # legitimate configuration and must not be an error.
+        local freeext
+        freeext="$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')"
+        if [ -z "$freeext" ] || [ "$freeext" -lt 256 ]; then
+            log "1b: $vg has no meaningful free space (${freeext:-0} extents) — leaving /var/lib/docker on root"
+            return 0
+        fi
 
-    # Free extents, not free bytes: 0 means the installer already used the whole
-    # VG (sizing-policy: all, or a hand-built layout). That is a legitimate
-    # configuration and must not be an error.
-    local freeext
-    freeext="$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')"
-    if [ -z "$freeext" ] || [ "$freeext" -lt 256 ]; then
-        log "1b: $vg has no meaningful free space (${freeext:-0} extents) — leaving /var/lib/docker on root"
-        return 0
+        log "1b: carving /var/lib/docker onto its own LV from $vg (${freeext} free extents)"
+        lvcreate -y -l 60%FREE -n docker-data "$vg" || { log "1b: WARNING lvcreate failed — leaving docker on root"; return 0; }
+        mkfs.ext4 -q -L docker-data "/dev/$vg/docker-data" || { log "1b: WARNING mkfs failed — leaving docker on root"; return 0; }
     fi
-
-    log "1b: carving /var/lib/docker onto its own LV from $vg (${freeext} free extents)"
-    lvcreate -y -l 60%FREE -n docker-data "$vg" || { log "1b: WARNING lvcreate failed — leaving docker on root"; return 0; }
-    mkfs.ext4 -q -L docker-data "/dev/$vg/docker-data" || { log "1b: WARNING mkfs failed — leaving docker on root"; return 0; }
 
     # STOP DOCKER BEFORE MOVING ITS STATE. On a fresh install this directory is
     # nearly empty, but "nearly" is not "empty" — the daemon creates its storage
     # driver tree at first boot, and mounting over live state would hide it from
     # a running daemon rather than move it.
+    #
+    # THIS LINE IS ONLY SURVIVABLE BECAUSE homehub-firstboot.service SAYS
+    # `Wants=docker.service`, NOT `Requires=`. Under Requires=, systemd
+    # propagates the stop back to this very unit and SIGTERMs the script here,
+    # mid-move — which is exactly what happened on 2026-08-09. If you ever
+    # restore Requires=, this step will kill itself again; check_docker_lv_stop
+    # in scripts/validate_config.py fails the build if you do.
     systemctl stop docker.socket docker 2>/dev/null || true
 
     local tmp; tmp="$(mktemp -d)"
@@ -501,6 +535,67 @@ done <<EOF
 $(docker compose config 2>/dev/null | awk '/^ *source: \//{print $2}' | sort -u)
 EOF
 log "  bind-mount sources checked; $_created created"
+
+# ── 4a-pre-2b. AND THE BACKUP'S OWN PATH SOURCES, WHICH NO BIND MOUNT NAMES ──
+# The step above is sourced from `docker compose config`, so it only ever creates
+# directories some CONTAINER binds. That is the right rule for its own purpose
+# and it leaves a hole: the library tree this box is responsible for is defined
+# by BACKUP_SOURCES, not by the compose file, and the two do not agree.
+#
+# MEASURED 2026-08-09, and it is the whole reason this block exists. Eight of the
+# nine path sources existed — Media/Movies (jellyfin binds it), Media/immich
+# (immich does), every Private/* tree, Shared, Snapshots. `Media/Music` did NOT,
+# because NOTHING CONTAINERISED SERVES MUSIC: the hub exposes it through the
+# Samba `Media` share and the wall panel pulls it over CIFS, so no bind mount
+# ever names it. One directory, absent on every hub with a fresh library drive,
+# and it took the ENTIRE nightly backup down with it (backup.sh has since been
+# changed to skip the set rather than abort — but a set that is skipped is a set
+# that is not protected, so creating the directory is still the actual fix).
+#
+# GATED ON THE LIBRARY ACTUALLY BEING MOUNTED. /srv/library is a `nofail` mount:
+# if the drive is absent the path still exists as an empty directory on the root
+# filesystem, and a `mkdir -p` there would manufacture a plausible-looking
+# library on the system disk — masking a missing drive AND giving the backup
+# somewhere harmless-looking to write. Refusing to create is the honest answer;
+# library-mounted already reports the missing drive.
+if mountpoint -q /srv/library 2>/dev/null; then
+    _made=0
+    while read -r _p; do
+        [ -n "$_p" ] || continue
+        case "$_p" in
+            /srv/library/*|/mnt/backup-drive/*)
+                if [ ! -d "$_p" ]; then
+                    mkdir -p "$_p" && _made=$((_made + 1))
+                    log "  created backup path source $_p"
+                fi ;;
+            *) log "  NOT creating $_p — outside the data drives, so an absent one is a real fault" ;;
+        esac
+    done <<EOF
+$(
+    # READ IT THE WAY backup.sh DOES — by sourcing. BACKUP_SOURCES is a
+    # multi-line QUOTED value, so every line-oriented tool (grep, sed -n 's///p')
+    # sees only its first entry and silently agrees that everything else is fine.
+    # That is not hypothetical: the first cut of this block used `grep -oP` and
+    # "checked" exactly one of the nine sources. Sourcing hands the parsing to
+    # the shell, which is the thing that defined the format.
+    # Subshell + a `set -a`-free scope so nothing here leaks into firstboot's
+    # own environment.
+    if [ -r /etc/homehub-backup/backup.env ]; then
+        . /etc/homehub-backup/backup.env 2>/dev/null || true
+        printf '%s\n' "${BACKUP_SOURCES:-}" | while IFS= read -r _line; do
+            case "$_line" in
+                *=path:*) printf '%s\n' "${_line#*=path:}" ;;
+            esac
+        done
+    fi
+)
+EOF
+    log "  backup path sources checked; $_made created"
+else
+    log "  SKIPPED the backup path sources: /srv/library is NOT a mountpoint."
+    log "    Creating them now would build a fake library on the system disk and hide"
+    log "    the missing drive. Fix the mount, then re-run this script."
+fi
 
 # ── 4a-pre-3. DOES THE KIOSK SITE HAVE AN IDENTITY TO INJECT? ────────────────
 # PANEL_USER_SUB empty is a DELIBERATE fail-closed state, not a bug:

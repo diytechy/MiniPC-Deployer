@@ -103,6 +103,32 @@ samba-common-bin      # smbpasswd/pdbedit for the per-account passwords (A13)
 # sole host of every storage-map section 3 share, so it is also the only place
 # from which those shares can be probed with no other machine involved.
 smbclient             # smbclient(1): the only way to TEST the shares this box serves
+# AND cifs-utils IS NOT IN smbclient — the same shape of assumption as the one
+# above, made again, and it cost two full lab runs of misdiagnosis.
+#
+# smbclient is a USERSPACE client. Mounting is a KERNEL filesystem, and the
+# `credentials=` and name-resolution halves of it are handled by the userspace
+# helper /sbin/mount.cifs, which ships in cifs-utils and NOTHING ELSE pulls in.
+# Without it `mount -t cifs` still exists (the kernel module is in the stock
+# image), so the failure is not "command not found" — it is far worse:
+#
+#   * `credentials=<file>` is never parsed, so NO credential reaches the server
+#     and the session setup returns STATUS_ACCESS_DENIED;
+#   * kernel-side name resolution has no upcall, so a perfectly resolvable FQDN
+#     yields "Unable to determine destination address", which mount(8) prints as
+#     >>> No route to host <<<.
+#
+# That sentence is why this took so long. "No route to host" reads as a NETWORK
+# fault, and this project spent two runs and a whole handoff section concluding
+# that Mini-serv's `Snapshots` share did not exist — while smbclient, sitting
+# right here, could list the share and read its files the entire time. The share
+# was genuinely missing at first, which made the wrong diagnosis fit; when the
+# Owner created it the symptom did not move, because it had a second cause.
+#
+# The hub SERVES shares (samba) and TESTS them (smbclient); it must also MOUNT
+# them, because storage-map §4a ingest pulls //mini-serv/Snapshots into the
+# library tree and backup.sh step 1b is the only consumer of that flow.
+cifs-utils            # mount.cifs: the hub MOUNTS Mini-serv's shares (storage-map §4a ingest)
 
 # ── the Docker engine ───────────────────────────────────────────────────────
 # THESE COME FROM download.docker.com, NOT THE UBUNTU ARCHIVE, and that is the

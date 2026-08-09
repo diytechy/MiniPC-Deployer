@@ -76,10 +76,46 @@ if command -v dig >/dev/null 2>&1; then
 else echo "SKIP dig not installed"; fi
 
 # 3. tracker
-if curl -fsS -o /dev/null "http://${LAN_IP}:8787/api/today" 2>/dev/null \
-   || curl -fksS -o /dev/null "https://${TRACKER_SUBDOMAIN}.${DOMAIN}/api/today" 2>/dev/null; then
-    ok "tracker /api/today responds"
-else bad "tracker /api/today unreachable"; fi
+#
+# THIS CHECK COULD NOT PASS ON A CORRECTLY BUILT HUB, and it spent every run
+# saying the tracker was broken while the tracker was fine. Both probes it used
+# are refused BY DESIGN, and each refusal is something another check asserts as
+# a PASS:
+#
+#   http://LAN_IP:8787/api/today
+#       :8787 is bridge-only and deliberately NOT published on the host (D2).
+#       verify-hub.sh asserts exactly that: "tracker :8787 is not published on
+#       the host (bridge-only, as D2 requires)". Connection refused is the
+#       CORRECT result, so this probe can never succeed.
+#
+#   https://tracker.DOMAIN/api/today
+#       goes through Caddy to oauth2-proxy, which answers an unauthenticated
+#       request with 403 and its own sign-in page. `curl -f` treats 403 as a
+#       failure. verify-hub.sh asserts that 403 as a PASS too — it is the
+#       authentication gate doing its job.
+#
+# So the composite was `impossible OR impossible`, and hardening either layer
+# made it worse. Measured 2026-08-09: run 20260809-011324 and 20260809-111037
+# both reported "tracker /api/today unreachable" while `docker ps` showed
+# `tracker Up (healthy)` and the full verify suite reported every container
+# green. It was read as a firstboot-with-no-network symptom for two runs; the
+# second run had a network throughout and failed identically, which is what
+# ruled that out.
+#
+# ASK THE QUESTION THAT IS ANSWERABLE. Docker already probes this container's
+# own /api/today on the bridge network — that is what its healthcheck does, from
+# inside, where the port is reachable and no auth gate stands in front. Read that
+# verdict rather than inventing a second probe from a vantage point the design
+# forbids. Falls back to `running` for an image that declares no healthcheck, so
+# this reports "up but unprobed" instead of silently passing.
+_tracker_state="$(docker inspect -f '{{.State.Health.Status}}' tracker 2>/dev/null || true)"
+if [ "$_tracker_state" = "healthy" ]; then
+    ok "tracker is healthy (docker's own /api/today probe, on the bridge network)"
+elif [ -z "$_tracker_state" ] || [ "$_tracker_state" = "<no value>" ]; then
+    if [ "$(docker inspect -f '{{.State.Running}}' tracker 2>/dev/null || echo false)" = "true" ]; then
+        echo "WARN tracker is running but declares no healthcheck — not probed"
+    else bad "tracker is not running"; fi
+else bad "tracker healthcheck is '${_tracker_state}' (docker probes /api/today from inside the bridge network)"; fi
 
 # 4. actual (behind Caddy)
 if curl -fksS -o /dev/null "https://${ACTUAL_SUBDOMAIN}.${DOMAIN}/" 2>/dev/null; then

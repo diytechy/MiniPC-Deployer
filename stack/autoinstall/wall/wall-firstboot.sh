@@ -416,23 +416,49 @@ setup_media_cache_lv() {
     vg="$(lvs --noheadings -o vg_name "$rootdev" 2>/dev/null | awk '{$1=$1;print}')"
     [ -n "$vg" ] || { log "media cache: / is not on LVM — leaving it on root"; return 0; }
 
-    # Asked of an input (does the LV exist), never of this script's own output —
-    # wall-firstboot re-runs on every boot.
+    # THE END-STATE QUESTION. Already mounted from our LV = the work is done, on
+    # this boot and every later one.
+    #
+    # THIS GUARD USED TO ASK `lvs "$vg/wall-cache"` — THE LV THIS FUNCTION
+    # CREATES TWENTY LINES BELOW — under a comment asserting it asked an input.
+    # It is the same defect that cost run 3 on the hub (firstboot ordered its own
+    # death at step 1b, then could never repair because its guard tested its own
+    # output), fixed there by 527cebe and 15ea81d and never ported here. The
+    # wrong comment made it worse than an unnoticed instance: anyone auditing for
+    # the class read it and moved on.
+    #
+    # Five steps run AFTER the lvcreate — mkfs, carrying an existing cache
+    # forward, the fstab entry, the mount. A death anywhere in there left the LV
+    # present and nothing else done, and every later boot then said "already
+    # exists, nothing to do". "Re-run the script", the documented repair for
+    # every other step, was the one thing that could not work.
+    if [ "$(findmnt -no SOURCE "$WALL_MEDIA_CACHE" 2>/dev/null)" = "/dev/mapper/${vg//-/--}-wall--cache" ]; then
+        log "media cache: $WALL_MEDIA_CACHE is already on $vg/wall-cache — nothing to do"
+        return 0
+    fi
+
     if lvs "$vg/wall-cache" >/dev/null 2>&1; then
-        log "media cache: $vg/wall-cache already exists — nothing to do"
-        return 0
-    fi
+        # The LV is there but the mount is not, so a previous attempt died
+        # part-way. RESUME rather than return: skip the carve, keep every step
+        # after it. mkfs is re-run only if the volume has no filesystem, which is
+        # the one case where the previous attempt stopped even earlier.
+        log "media cache: $vg/wall-cache exists but $WALL_MEDIA_CACHE is not mounted from it — finishing the move"
+        if ! blkid -s TYPE -o value "/dev/$vg/wall-cache" >/dev/null 2>&1; then
+            log "media cache: the volume has no filesystem — making one"
+            mkfs.ext4 -q -L wall-cache "/dev/$vg/wall-cache" || { warn "mkfs failed — leaving the media cache on root"; return 0; }
+        fi
+    else
+        local freeext
+        freeext="$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')"
+        if [ -z "$freeext" ] || [ "$freeext" -lt 256 ]; then
+            log "media cache: $vg has no meaningful free space (${freeext:-0} extents) — leaving the cache on root"
+            return 0
+        fi
 
-    local freeext
-    freeext="$(vgs --noheadings -o vg_free_count "$vg" 2>/dev/null | tr -d ' ')"
-    if [ -z "$freeext" ] || [ "$freeext" -lt 256 ]; then
-        log "media cache: $vg has no meaningful free space (${freeext:-0} extents) — leaving the cache on root"
-        return 0
+        log "media cache: carving $WALL_MEDIA_CACHE onto its own LV from $vg (${freeext} free extents)"
+        lvcreate -y -l 60%FREE -n wall-cache "$vg" || { warn "lvcreate failed — leaving the media cache on root"; return 0; }
+        mkfs.ext4 -q -L wall-cache "/dev/$vg/wall-cache"  || { warn "mkfs failed — leaving the media cache on root"; return 0; }
     fi
-
-    log "media cache: carving $WALL_MEDIA_CACHE onto its own LV from $vg (${freeext} free extents)"
-    lvcreate -y -l 60%FREE -n wall-cache "$vg" || { warn "lvcreate failed — leaving the media cache on root"; return 0; }
-    mkfs.ext4 -q -L wall-cache "/dev/$vg/wall-cache"  || { warn "mkfs failed — leaving the media cache on root"; return 0; }
 
     # Preserve anything already mirrored. A re-image starts empty, but a box that
     # reached this line with a populated cache must not silently lose it behind a

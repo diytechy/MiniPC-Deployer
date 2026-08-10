@@ -442,6 +442,61 @@ def main():
             ),
         )
 
+    # 5c. No firstboot step may use `lvs VG/LV` as its idempotence guard when the
+    #     same script CREATES that LV. Ask the END state instead.
+    #
+    #     ONE INSTANCE BEING FIXED IS NOT THE CLASS BEING GONE, which is the only
+    #     reason this check exists. Run 20260809-145118 died at the hub's step 1b
+    #     with the LV created and nothing after it done; the guard asked "does the
+    #     LV exist" — its own output — so every later boot said "already exists,
+    #     nothing to do" and "re-run the script", the documented repair for every
+    #     other step, was the one thing that could never work. 527cebe fixed the
+    #     hub. It did not touch the panel, and wall-firstboot.sh carried the
+    #     identical guard for another day UNDER A COMMENT ASSERTING IT ASKED AN
+    #     INPUT — which is worse than an unnoticed instance, because a reader
+    #     auditing for the class reads that and moves on. A human audit already
+    #     missed it once; this does not.
+    #
+    #     The safe pattern is the hub's: compare `findmnt -no SOURCE <mountpoint>`
+    #     against the device-mapper name, then treat "LV exists but is not
+    #     mounted" as RESUME rather than done.
+    for script_rel in ("autoinstall/firstboot.sh", "autoinstall/wall/wall-firstboot.sh"):
+        script_text = load(stack / script_rel)
+        if not script_text:
+            continue
+        created = set(re.findall(r"lvcreate[^\n]*?-n\s+([A-Za-z0-9_.-]+)", script_text))
+        guarded = set()
+        for m in re.finditer(r'^\s*if\s+lvs\s+"?\$\{?vg\}?/([A-Za-z0-9_.-]+)', script_text, re.M):
+            guarded.add(m.group(1))
+        # A guard is only wrong when nothing asks the END state for THAT LV, so
+        # this is per-LV, not per-file. Resuming from the same `lvs` test is
+        # correct and both scripts do it — what makes it safe is the findmnt
+        # comparison in front of it.
+        #
+        # ASKED SPECIFICALLY, because the loose version passed the bug: both
+        # scripts contain `findmnt -no SOURCE /` to find the root device, so
+        # "does this file mention findmnt" is true even for a script with no
+        # end-state guard at all. The real signal is a comparison against the
+        # device-mapper name, where an LV's hyphens are doubled.
+        bad = []
+        for lv in sorted(created & guarded):
+            dm = lv.replace("-", "--")
+            if not re.search(r"/dev/mapper/[^\s\"']*" + re.escape(dm), script_text):
+                bad.append(lv)
+        check(
+            not bad,
+            "{} guards its LV work on the END state, not on the LV it creates".format(
+                Path(script_rel).name
+            ),
+            "{} uses `lvs $vg/{}` as its idempotence guard for an LV it creates itself, "
+            "and never asks findmnt whether the filesystem is actually mounted. A step "
+            "that dies after lvcreate can then never repair: every later boot reads "
+            "'already exists, nothing to do'. Compare findmnt -no SOURCE <mountpoint> "
+            "against /dev/mapper/<vg>-<lv> and resume.".format(
+                Path(script_rel).name, "/".join(bad)
+            ),
+        )
+
     # 6. Electron runtime deps: every soname the shell artifact loads maps to a
     #    package this image installs (IF-005 / PKG-1).
     #

@@ -509,6 +509,41 @@ fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 echo
+echo "== S11: the capacity preflight must REFUSE before writing, not discover mid-run =="
+# BACKUP_STAGING defaults under /var/tmp — the SYSTEM disk — and every set is
+# copied there in full before it is archived. A library larger than the root
+# filesystem therefore fills root, and a full root stops Docker, Caddy and every
+# service volume: the backup does not merely fail, the box does. Nothing checked
+# free space at all until 2026-08-09.
+#
+# The estimate comes from the previous run's RUN.json, so the scenario doctors
+# one to claim a run far larger than any disk here and asserts the next run
+# refuses BEFORE creating a run directory. A check that only ever runs on a
+# passing case is not a check.
+write_env /srv/simtargets/t11 3 'docs=path:/srv/simlib/docs'
+run_backup >/dev/null
+R11="$(rex 'ls -d /srv/simtargets/t11/run_* | sort | tail -1' | tr -d '\r')"
+before="$(rex 'ls -d /srv/simtargets/t11/run_* | wc -l' | tr -d '\r')"
+
+# 900 TB, which no filesystem in this container can satisfy.
+rex "sed -i 's/\"total_bytes\": [0-9]*/\"total_bytes\": 900000000000000/; s/\"bytes\":[0-9]*/\"bytes\":900000000000000/' '$R11/RUN.json'" >/dev/null
+sleep 1
+rc="$(run_backup)"
+after="$(rex 'ls -d /srv/simtargets/t11/run_* | wc -l' | tr -d '\r')"
+info "exit: $rc   run dirs before=$before after=$after"
+if [ "$rc" = "RC=1" ] && rex 'grep -q "not enough room" /tmp/cycle.out'; then
+    pass "the run REFUSED on capacity: $(rex 'grep -o "not enough room[^.]*" /tmp/cycle.out | head -1' | tr -d '\r' | cut -c1-72)…"
+else
+    fail "a run that cannot fit was allowed to start (rc=$rc)"
+fi
+[ "$after" = "$before" ] && pass "and it refused BEFORE creating a run directory — no phantom run" \
+                         || fail "it created a run directory before refusing ($before -> $after)"
+if rex 'grep -q "SYSTEM DISK" /tmp/cycle.out'; then
+    pass "the staging refusal says why it matters more than the target's"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+echo
 echo "== summary =="
 echo "  $((CHECKS - FAILS)) of $CHECKS checks passed"
 if [ "$FAILS" -eq 0 ]; then echo "BACKUP CYCLE LEG: PASS"; exit 0; fi

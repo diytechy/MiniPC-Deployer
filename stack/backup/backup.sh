@@ -147,6 +147,57 @@ else
     warn "  A missing drive will be backed up to the system disk and reported GREEN."
 fi
 
+# ── 0b. CAPACITY PREFLIGHT — will this run FIT, on both disks ────────────────
+# Step 0 above asks whether the target is PRESENT. It never asked whether there
+# is room, and that gap is bigger than it sounds because the two disks fail
+# differently:
+#
+#   BACKUP_TARGET full  — the run dies part-way through tar. Bad, recoverable.
+#   BACKUP_STAGING full — staging defaults under /var/tmp, i.e. THE SYSTEM DISK.
+#                         Every set is copied there in full before it is
+#                         archived, so a library larger than the root filesystem
+#                         fills root, and a full root takes Docker, Caddy and
+#                         every service volume down with it. The backup does not
+#                         merely fail; the box does.
+#
+# THE ESTIMATE COMES FROM THE LAST RUN, deliberately. Measuring the sources costs
+# a full metadata walk of the library before the run has done anything useful,
+# while the previous RUN.json already records exactly what this run is about to
+# write — total_bytes for the target, and the largest per-set bytes for staging
+# (one set at a time now that staging is released after each archive). A first
+# run has no such record and is allowed to proceed with a warning: refusing a
+# backup that has never run is worse than the risk.
+free_bytes_at() { df -PB1 "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
+# The staging directory must EXIST before df can be asked about it, and a df
+# that fails returns nothing — which would skip the guard silently, the exact
+# shape this check exists to refuse. Creating it here is harmless (it is an
+# empty directory) and it happens before any RUN_DIR is made, so a refusal
+# below leaves no phantom run behind.
+mkdir -p "$STAGING" 2>/dev/null || true
+_prev="$(find "$BACKUP_TARGET" -mindepth 2 -maxdepth 2 -name RUN.json 2>/dev/null | sort | tail -1)"
+if [ -n "$_prev" ] && [ -r "$_prev" ]; then
+    _need_t="$(grep -o '"total_bytes": *[0-9]*' "$_prev" | grep -o '[0-9]*' | tail -1)"
+    _need_s="$(grep -o '"bytes":[0-9]*' "$_prev" | grep -o '[0-9]*' | sort -n | tail -1)"
+    _have_t="$(free_bytes_at "$BACKUP_TARGET")"
+    _have_s="$(free_bytes_at "$(dirname "$STAGING")")"
+    # 15% headroom: the estimate is last night's, and tonight's library is bigger.
+    if [ -n "${_need_t:-}" ] && [ -n "${_have_t:-}" ] && [ "$_have_t" -lt $(( _need_t * 115 / 100 )) ]; then
+        feed_naglight false "backup target $BACKUP_TARGET has $(( _have_t / 1000000000 )) GB free but the last run wrote $(( _need_t / 1000000000 )) GB — refusing to start a run that cannot fit"
+        die "not enough room on $BACKUP_TARGET: $(( _have_t / 1000000000 )) GB free, last run wrote $(( _need_t / 1000000000 )) GB (+15% headroom required)." \
+            "Nothing was written. Lower BACKUP_KEEP, or give the archive a bigger drive."
+    fi
+    if [ -n "${_need_s:-}" ] && [ -n "${_have_s:-}" ] && [ "$_have_s" -lt $(( _need_s * 115 / 100 )) ]; then
+        feed_naglight false "backup staging $STAGING has $(( _have_s / 1000000000 )) GB free but the largest set needs $(( _need_s / 1000000000 )) GB — refusing, because filling this filesystem takes the whole box down"
+        die "not enough room for STAGING at $STAGING: $(( _have_s / 1000000000 )) GB free, the largest set needs $(( _need_s / 1000000000 )) GB." \
+            "This filesystem is usually the SYSTEM DISK — filling it stops Docker and every service, not just the backup." \
+            "Point BACKUP_STAGING at the backup drive, or shrink the largest set."
+    fi
+    log "capacity preflight: target $(( _have_t / 1000000000 )) GB free (last run wrote $(( _need_t / 1000000000 )) GB), staging $(( _have_s / 1000000000 )) GB free (largest set $(( _need_s / 1000000000 )) GB)"
+else
+    warn "capacity preflight: no previous RUN.json under $BACKUP_TARGET — cannot estimate, proceeding."
+    warn "  If this library is larger than the filesystem holding $STAGING, this run will fill it."
+fi
+
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 RUN_DIR="$BACKUP_TARGET/run_$RUN_TS"
 MANIFEST="$RUN_DIR/MANIFEST.tsv"
@@ -559,6 +610,14 @@ for line in "${SOURCE_LINES[@]}"; do
     # complete one (restore.sh says so out loud).
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$name" "$src" "$(basename "$archive")" "$algo" "$asha" "$set_files" "$set_bytes" "$reason" "${EX_PATS:--}" >>"$MANIFEST"
+    # RELEASE THE STAGING COPY NOW THAT THE ARCHIVE EXISTS AND IS VERIFIED.
+    # It used to be removed only at the start of this set's OWN next turn, so at
+    # the end of every run all fourteen staging trees were still on disk — a
+    # permanent, uncompressed SECOND COPY OF THE WHOLE LIBRARY, on the 119 GB
+    # system NVMe, because BACKUP_STAGING defaults under /var/tmp. Everything
+    # above has already read what it needs: the archive is written, integrity
+    # tested, hashed, and the per-file table is built.
+    rm -rf "$stage"
     log "[$name] archived $(basename "$archive") files=$set_files bytes=$set_bytes sha256=${asha:0:16}…"
     TOTAL_FILES=$(( TOTAL_FILES + set_files )); TOTAL_BYTES=$(( TOTAL_BYTES + set_bytes ))
     SET_SUMMARY_JSON="${SET_SUMMARY_JSON:+$SET_SUMMARY_JSON,}$(printf '{"set":"%s","algo":"%s","files":%s,"bytes":%s,"incompressible_pct":%s,"excludes":"%s"}' "$name" "$algo" "$set_files" "$set_bytes" "$ratio" "$EX_PATS")"

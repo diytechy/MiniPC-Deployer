@@ -130,6 +130,30 @@ smbclient             # smbclient(1): the only way to TEST the shares this box s
 # library tree and backup.sh step 1b is the only consumer of that flow.
 cifs-utils            # mount.cifs: the hub MOUNTS Mini-serv's shares (storage-map §4a ingest)
 
+# ── what backup.sh actually EXECUTES ─────────────────────────────────────────
+# THE THIRD PACKAGE OF THIS EXACT SHAPE, added 2026-08-09 before it could be the
+# third outage. `smbclient` was assumed to come with samba-common-bin (2026-08-07);
+# `cifs-utils` was assumed to come with samba (A25, above). Both were capabilities
+# taken for granted because a neighbouring package was present.
+#
+# rsync and zstd are the same assumption one layer up: they are not *near* a
+# listed package, they are simply the binaries the backup service runs, and
+# nothing had ever checked that the box has them. backup.sh calls both with no
+# `command -v` guard —
+#     rsync   every source kind and the step-1b ingest (backup.sh :317 :368
+#             :411 :427 :464). Nothing backs up without it.
+#     zstd    the compressed-archive path and its integrity test (:480 :497),
+#             and restore.sh's extract. The baked repo carries libzstd1 as a
+#             transitive dependency, which is the LIBRARY, not the CLI.
+#
+# WHY THIS WAS INVISIBLE UNTIL NOW: every backup run to date has been
+# `--dry-run`, and a dry run returns before the archive step, so `zstd` had
+# never been invoked on the hub even once. The first REAL backup — which is the
+# next thing planned — is where it would have surfaced, on a box with no route
+# to the archive to fix itself.
+rsync                 # the transport for every backup source kind, and for ingest
+zstd                  # the .tar.zst archive path, its integrity test, and restore
+
 # ── the Docker engine ───────────────────────────────────────────────────────
 # THESE COME FROM download.docker.com, NOT THE UBUNTU ARCHIVE, and that is the
 # one thing about this list a reader has to know. export-apt.sh notices

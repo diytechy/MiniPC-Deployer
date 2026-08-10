@@ -449,6 +449,66 @@ fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 echo
+echo "== S10: a TRUNCATED hash table must not restore 3 of N and say RESTORE OK =="
+# restore.sh verified every file its table LISTED and nothing else, so the table
+# was both the work list and the definition of done — damaging it made the check
+# SMALLER rather than making it fail. Three witnesses now have to agree:
+# MANIFEST columns 6/7, the table's row count, and a census of the archive.
+#
+# (c) IS THE LOAD-BEARING CHECK. It doctors the MANIFEST to agree with the
+# truncated table, which removes the easy witness and leaves only the archive.
+# If the reconciliation were circular — two records of the same counter — (c)
+# would pass and the restore would still be lying.
+rex 'rm -rf /srv/simlib/bulk && mkdir -p /srv/simlib/bulk
+     for i in $(seq 1 11); do printf "bulk file %s\n%.0s" "$i" $(seq 1 12) > /srv/simlib/bulk/f$i.txt; done' >/dev/null
+write_env /srv/simtargets/t10 3 'bulk=path:/srv/simlib/bulk'
+rc="$(run_backup)"
+R10="$(rex 'ls -d /srv/simtargets/t10/run_* | sort | tail -1' | tr -d '\r')"
+[ "$rc" = "RC=0" ] && pass "baseline run archived the 11-file set" || fail "baseline $rc"
+
+# (a) FALSE-POSITIVE GUARD FIRST. A reconciliation that fires on a healthy
+#     restore is a reconciliation someone deletes in six months.
+out="$(rex "rm -rf /tmp/s10a && bash /opt/homehub/stack/backup/restore.sh --run '$R10' --set bulk --target /tmp/s10a 2>&1; echo RC=\$?" | tr -d '\r')"
+if printf '%s' "$out" | grep -q 'RC=0' && printf '%s' "$out" | grep -q 'all agree on 11'; then
+    pass "(a) an undamaged restore still passes, and says all three witnesses agree"
+else
+    fail "(a) the reconciliation fires on a healthy restore"; info "$out"
+fi
+
+# (b) the original defect: cut the table to 3 of 11 rows.
+rex "head -n4 '$R10/bulk.files.tsv' > /tmp/cut && cp /tmp/cut '$R10/bulk.files.tsv'" >/dev/null
+out="$(rex "rm -rf /tmp/s10b && bash /opt/homehub/stack/backup/restore.sh --run '$R10' --set bulk --target /tmp/s10b 2>&1; echo RC=\$?" | tr -d '\r')"
+if printf '%s' "$out" | grep -q 'RC=1'; then
+    pass "(b) a table cut to 3 of 11 now FAILS: $(printf '%s' "$out" | grep -o 'COUNT MISMATCH[^,]*' | head -1)"
+else
+    fail "(b) a truncated table still reported success"; info "$out"
+fi
+
+# (c) THE NON-CIRCULARITY PROOF: make the manifest agree with the short table.
+rex "awk -F'\t' 'BEGIN{OFS=\"\t\"} NR==1{print;next} \$1==\"bulk\"{\$6=3;\$7=1;print;next} {print}' '$R10/MANIFEST.tsv' > /tmp/m2 && cp /tmp/m2 '$R10/MANIFEST.tsv'" >/dev/null
+out="$(rex "rm -rf /tmp/s10c && bash /opt/homehub/stack/backup/restore.sh --run '$R10' --set bulk --target /tmp/s10c 2>&1; echo RC=\$?" | tr -d '\r')"
+if printf '%s' "$out" | grep -q 'RC=1' && printf '%s' "$out" | grep -q 'archive vs table'; then
+    pass "(c) with the manifest doctored to match, the ARCHIVE still catches it — the check is not circular"
+else
+    fail "(c) doctoring the manifest defeated the reconciliation — it is only comparing two copies of one counter"
+    info "$out"
+fi
+
+# (d) a set the run SKIPPED must not report like a typo. Distinct exit codes.
+write_env /srv/simtargets/t10d 3 'bulk=path:/srv/simlib/bulk
+absent=path:/srv/simlib/not-there'
+run_backup >/dev/null
+R10D="$(rex 'ls -d /srv/simtargets/t10d/run_* | sort | tail -1' | tr -d '\r')"
+skipped="$(rex "bash /opt/homehub/stack/backup/restore.sh --run '$R10D' --set absent --target /tmp/s10d >/dev/null 2>&1; echo \$?" | tr -d '\r')"
+typo="$(rex "bash /opt/homehub/stack/backup/restore.sh --run '$R10D' --set blukk --target /tmp/s10e >/dev/null 2>&1; echo \$?" | tr -d '\r')"
+if [ "$skipped" = "3" ] && [ "$typo" = "4" ]; then
+    pass "(d) a SKIPPED set exits 3 and a mistyped name exits 4 — one status per cause"
+else
+    fail "(d) skipped=$skipped typo=$typo; expected 3 and 4 (they used to share one message)"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+echo
 echo "== summary =="
 echo "  $((CHECKS - FAILS)) of $CHECKS checks passed"
 if [ "$FAILS" -eq 0 ]; then echo "BACKUP CYCLE LEG: PASS"; exit 0; fi

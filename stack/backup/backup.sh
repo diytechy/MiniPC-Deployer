@@ -25,11 +25,10 @@
 #                        test; a recovery MANIFEST that restore.sh reconstructs from
 #   4. external-drive target — dated run snapshot under BACKUP_TARGET, with
 #                        retention/rotation (keep last BACKUP_KEEP)
-#   5. offsite        — LEGACY/OPTIONAL. The target state (Owner, 2026-07-29) is
-#                        OFFSITE_ENABLED=false: the IceDrive client is pointed at
-#                        library paths in its OWN GUI and this service does no
-#                        offsite staging. Kept working for boxes still using it —
-#                        OFFSITE_PATH=/abs/dir (local dir) or OFFSITE_UNC (cifs).
+#   (there is no step 5. The offsite step was retired as a design on 2026-07-29
+#    and the code DELETED on 2026-08-09: the IceDrive client on the box is
+#    pointed at library paths in its own GUI, and this service stages nothing.
+#    Any surviving OFFSITE_* knob is REFUSED at run start rather than ignored.)
 #   6. report         — POST NagLight /api/feed; NEVER-SILENT-GREEN: any failure
 #                        posts ok=false and exits nonzero — the ERR trap AND
 #                        every `die` path (OI-9)
@@ -62,6 +61,16 @@ load_config "$CONFIG"
 : "${BACKUP_SOURCES:?BACKUP_SOURCES not set (name=//host/share lines)}"
 STAGING="${BACKUP_STAGING:-/var/tmp/homehub-backup/staging}"
 KEEP="${BACKUP_KEEP:-7}"
+# VALIDATED IN THE FIRST SECOND, because both bad values are silent until late.
+# BACKUP_KEEP=0 is legal shell and means "keep nothing": retention deleted the
+# run it had just written, and the run then died naming the LOGGER, because
+# LOG_FILE lived in the directory that had just been removed (S9). A non-numeric
+# value reached the arithmetic in retention and killed the run there — after an
+# hour of archiving, with no report posted at all.
+case "$KEEP" in
+    ''|*[!0-9]*) die "config: BACKUP_KEEP='$KEEP' is not a number (it is how many dated runs to keep on the backup drive)" ;;
+    0)           die "config: BACKUP_KEEP=0 means 'keep no runs at all', so this run would archive the household and then delete the archive. Set it to 1 or more." ;;
+esac
 ZL="${BACKUP_ZSTD_LEVEL:-10}"
 
 # ── drive power (WI-10.10 DRIVE POWER DESIGN) ────────────────────────────────
@@ -146,7 +155,7 @@ LOG_FILE="$RUN_DIR/backup.log"
 
 # Run totals + the report fields, initialised BEFORE the failure machinery below
 # so the very first failure can already write a complete RUN.json.
-TOTAL_BYTES=0; TOTAL_FILES=0; SET_SUMMARY=""; SET_SUMMARY_JSON=""; OFFSITE_DONE="skipped"
+TOTAL_BYTES=0; TOTAL_FILES=0; SET_SUMMARY=""; SET_SUMMARY_JSON=""
 INGEST_SUMMARY="none"
 
 write_run_json() {
@@ -160,7 +169,6 @@ write_run_json() {
   "sets": [$SET_SUMMARY_JSON],
   "total_files": $TOTAL_FILES,
   "total_bytes": $TOTAL_BYTES,
-  "offsite": "${OFFSITE_DONE:-skipped}",
   "note": "$note"
 }
 JSON
@@ -204,18 +212,32 @@ set -o errtrace
 # wake timeout — posts ok=false before exiting 1.
 DIE_REPORTER=report_failure
 
-# ── offsite target: exactly ONE form (legacy step — see step 5) ───────────────
-# Validated HERE, at run start, so a config mistake fails in seconds instead of
-# after an hour of archiving. Both forms are LEGACY as of the Owner's 2026-07-29
-# correction (target state: OFFSITE_ENABLED=false, the IceDrive client syncs
-# library paths itself). OFFSITE_PATH = a local dir an on-box sync client
-# uploads (OI-11 build); OFFSITE_UNC = the older cifs push to another host's
-# share. Both set is a config error, not a precedence puzzle.
-if [ -n "${OFFSITE_PATH:-}" ] && [ -n "${OFFSITE_UNC:-}" ]; then
-    die "config: OFFSITE_PATH and OFFSITE_UNC are both set — set exactly one (OFFSITE_PATH = the on-box IceDrive-synced dir; OFFSITE_UNC = the legacy remote cifs share)"
-fi
-if [ "${OFFSITE_ENABLED:-false}" = "true" ] && [ -z "${OFFSITE_PATH:-}" ] && [ -z "${OFFSITE_UNC:-}" ]; then
-    die "config: OFFSITE_ENABLED=true but neither OFFSITE_PATH nor OFFSITE_UNC is set"
+# ── the offsite step is GONE (removed 2026-08-09, Owner) ─────────────────────
+# It was retired as a DESIGN on 2026-07-29 — the IceDrive client is pointed at
+# library paths in its own GUI, so this service was never going to stage
+# anything again — and the code was then carried for another six weeks as
+# "legacy, still functional". This deletes it.
+#
+# THE REFUSAL BELOW IS THE WHOLE REASON THIS IS SAFE TO DELETE. A box whose
+# backup.env still asks for an offsite push must NOT be quietly given a backup
+# that has no offsite step: that is a config silently ignored, which is the same
+# family as a green run that wrote nothing. So the knobs remain RECOGNISED, and
+# recognised means refused with an explanation rather than skipped.
+#
+# OFFSITE_ENABLED=false stays legal and inert: it is what every current config
+# says, and failing those would be noise.
+for _o in OFFSITE_PATH OFFSITE_UNC OFFSITE_SETS; do
+    if [ -n "$(eval "printf '%s' \"\${$_o:-}\"")" ]; then
+        die "config: $_o is set, but the offsite step was REMOVED on 2026-08-09." \
+            "The backup service performs no offsite staging at all (ratified 2026-07-29): the IceDrive" \
+            "client on the box syncs the chosen library paths itself, from its own GUI." \
+            "Delete $_o (and any other OFFSITE_* line) from this config. Nothing replaces it here —" \
+            "if the cloud copy matters, check it in the IceDrive client, not in this run's report."
+    fi
+done
+if [ "${OFFSITE_ENABLED:-false}" = "true" ]; then
+    die "config: OFFSITE_ENABLED=true, but the offsite step was REMOVED on 2026-08-09." \
+        "Set OFFSITE_ENABLED=false or delete the line. See the note above."
 fi
 
 # ── drive-power RESTORE on exit (WI-10.10) ───────────────────────────────────
@@ -415,8 +437,34 @@ for line in "${SOURCE_LINES[@]}"; do
             spec="${src#volume:}"; vol="${spec%%@*}"
             qc=""; [ "$spec" != "$vol" ] && qc="${spec#*@}"
             command -v docker >/dev/null 2>&1 || { FAIL_NOTE="volume source for $name needs the docker CLI"; false; }
-            vmp="$(volume_mountpoint "$vol")" || true
-            { [ -n "$vmp" ] && [ -d "$vmp" ]; } || { FAIL_NOTE="docker volume not found for $name: $vol"; false; }
+            # A MISSING VOLUME SKIPS ITS SET, EXACTLY AS A MISSING PATH DOES
+            # (the Owner, 2026-08-09 — the ruling always covered both kinds; only
+            # the path branch had been changed, and open-items A26 left this as a
+            # separate call). The `|| vrc=$?` form is mandatory: a bare failing
+            # assignment is the last command of its list and WOULD trip the ERR
+            # trap before this case could run.
+            #
+            # ONLY status 1 SKIPS. 2 and 3 stay fatal and that is the whole point
+            # of splitting them out — "absent" is one input missing, while an
+            # ambiguous label match is a choice between two volumes nobody should
+            # make silently, and an unreachable daemon means we did not find out
+            # anything at all. Skipping either of those would turn one broken box
+            # into five quietly-unarchived volumes.
+            vrc=0; vmp="$(volume_mountpoint "$vol")" || vrc=$?
+            case "$vrc" in
+                0) [ -d "$vmp" ] || { FAIL_NOTE="docker volume $vol for $name resolved to '$vmp', which is not a directory"; false; } ;;
+                1) # THE SKIP MUST STAY ABOVE quiesce_stop. The EXIT trap fires on
+                   # process exit, not on `continue`, so a skip taken after a stop
+                   # would leave the container down for the rest of the run.
+                   log "[$name] WARN: SOURCE MISSING, SET SKIPPED: docker volume '$vol' does not exist"
+                   log "[$name]   The run continues and will finish RED naming this set."
+                   log "[$name]   Nothing about this set is archived, so the previous run's copy is"
+                   log "[$name]   the newest one that exists — treat it as stale from now on."
+                   MISSING_SETS="${MISSING_SETS:+$MISSING_SETS, }$name(volume:$vol)"
+                   continue ;;
+                2) FAIL_NOTE="docker volume name '$vol' ($name) is AMBIGUOUS — more than one volume carries that compose label, and archiving the wrong one is worse than not running"; false ;;
+                3) FAIL_NOTE="cannot reach the docker daemon to resolve volume '$vol' ($name) — refusing to treat 'could not ask' as 'not there'"; false ;;
+            esac
             # Quiesce (optional): stop the container so a live DB can't be caught
             # mid-write; restarted right after the copy, and by the EXIT trap on
             # any failure path in between.
@@ -449,9 +497,16 @@ for line in "${SOURCE_LINES[@]}"; do
             # DELIBERATELY NARROW. Only "the source is not there" is tolerated.
             # An rsync/archive/integrity failure below still aborts, because those
             # mean the machinery is broken rather than one input being absent, and
-            # a half-written run should not be tidied past. The `volume` branch's
-            # equivalent (docker volume not found) is UNCHANGED and still fatal —
-            # see open-items A26; making that consistent is a separate call.
+            # a half-written run should not be tidied past.
+            #
+            # THE `volume` BRANCH NOW MATCHES (Owner, 2026-08-09 — the ruling had
+            # always covered both kinds; A26 deferred the second half). Getting
+            # there needed `volume_mountpoint` to stop returning one status for
+            # three causes, so that only a genuinely absent volume skips while an
+            # ambiguous label match and an unreachable daemon stay fatal. `cifs:`
+            # is the third kind and is NOT changed: it aborts via mount_cifs's
+            # die, and it has no empty-share guard, so skipping there would trade
+            # an abort for a silent-green empty archive.
             if [ ! -d "$dir" ]; then
                 log "[$name] WARN: SOURCE MISSING, SET SKIPPED: $dir"
                 log "[$name]   The run continues and will finish RED naming this set."
@@ -523,71 +578,6 @@ if [ "$DRY_RUN" = 1 ]; then
     log "dry-run complete (no archives written)"; trap - ERR; exit 0
 fi
 
-# ── 4. retention / rotation on the external drive ────────────────────────────
-log "retention: keep last $KEEP run(s) under $BACKUP_TARGET"
-mapfile -t runs < <(find "$BACKUP_TARGET" -mindepth 1 -maxdepth 1 -type d -name 'run_*' -printf '%f\n' | sort)
-prune=$(( ${#runs[@]} - KEEP ))
-if (( prune > 0 )); then
-    for i in $(seq 0 $(( prune - 1 ))); do
-        log "  prune old run ${runs[$i]}"; rm -rf "${BACKUP_TARGET:?}/${runs[$i]}"
-    done
-fi
-
-# ── 5. offsite — LEGACY/OPTIONAL (retired from the target state 2026-07-29) ────
-# The Owner's corrected model: the IceDrive client (SR-015 desktop session) is
-# pointed DIRECTLY at the chosen library paths in its own GUI, so the backup
-# service performs NO offsite staging at all. The target state is therefore
-# OFFSITE_ENABLED=false and this whole step is a logged skip.
-#
-# The code below stays functional for a box still configured the old way — two
-# target forms, ONE staging routine (the file selection is a single fact):
-#   OFFSITE_PATH  a LOCAL directory an on-box sync client uploads (the OI-11
-#                 build; superseded as a DESIGN by the correction above, kept as
-#                 harmless legacy). The upload was the client's job; this step
-#                 only ever had to LAND the files.
-#   OFFSITE_UNC   the older cifs push to another host's synced share.
-# Exactly one may be set; that is validated at run start.
-
-# offsite_stage DEST : copy the selected sets' archives + per-file hash tables
-# plus the run metadata into DEST. Returns non-zero if a copy fails, so both
-# callers can fail the run identically.
-offsite_stage() {
-    local dest="$1" set f
-    mkdir -p "$dest" || return 1
-    for set in ${OFFSITE_SETS:-}; do
-        for f in "$RUN_DIR/$set".tar "$RUN_DIR/$set".tar.zst "$RUN_DIR/$set.files.tsv"; do
-            [ -f "$f" ] || continue
-            rsync -a "$f" "$dest/" || return 1
-            log "offsite: copied $(basename "$f")"
-        done
-    done
-    # RUN.json is written by step 6, so it only exists here on a re-run — copy
-    # it opportunistically, never fail for it.
-    rsync -a "$MANIFEST" "$RUN_DIR/RUN.json" "$dest/" 2>/dev/null || true
-    return 0
-}
-
-if [ "${OFFSITE_ENABLED:-false}" != "true" ]; then
-    log "offsite: disabled (OFFSITE_ENABLED!=true) — the target state: the IceDrive client syncs library paths itself, this service stages nothing"
-    OFFSITE_DONE="disabled (client syncs library paths directly)"
-elif [ -n "${OFFSITE_PATH:-}" ]; then
-    # Local target. The directory must ALREADY exist — creating it silently
-    # would hide a mistyped path or an IceDrive folder that never got set up,
-    # and the files would then sit in a folder nothing syncs.
-    [ -d "$OFFSITE_PATH" ] || { FAIL_NOTE="offsite: OFFSITE_PATH is not a directory: $OFFSITE_PATH (is the on-box IceDrive sync folder set up?)"; false; }
-    dest="$OFFSITE_PATH/homehub-backup/run_$RUN_TS"
-    offsite_stage "$dest" || { FAIL_NOTE="offsite: copy into $dest failed"; false; }
-    OFFSITE_DONE="staged run_$RUN_TS in $OFFSITE_PATH (on-box IceDrive client uploads it)"
-    log "offsite: $OFFSITE_DONE"
-else
-    # Legacy remote share (superseded by OFFSITE_PATH; kept working).
-    omp="$(mktemp -d)"; mount_cifs "$OFFSITE_UNC" "$omp" rw
-    offsite_stage "$omp/homehub-backup/run_$RUN_TS" || { FAIL_NOTE="offsite: push to $OFFSITE_UNC failed"; false; }
-    umount_all
-    OFFSITE_DONE="pushed run_$RUN_TS ($OFFSITE_UNC)"
-    log "offsite: $OFFSITE_DONE"
-fi
-
 # ── 6. report (never-silent-green: OK only if every set was reached) ─────────
 trap - ERR
 
@@ -604,8 +594,60 @@ if [ -n "$MISSING_SETS" ]; then
     exit 1
 fi
 
-write_run_json "ok" "sets: ${SET_SUMMARY:-none}; offsite: $OFFSITE_DONE"
-feed_naglight true "backup ok $RUN_TS — ${SET_SUMMARY:-no sets}; offsite: $OFFSITE_DONE"
+# ── 4. retention / rotation — LAST, and only on a run that is actually good ──
+# THIS USED TO RUN BEFORE THE VERDICT, AND IT COST THE ARCHIVES (found 2026-08-09,
+# reproduced as run-backup-cycle-sim.sh S8).
+#
+# It sat at step 4, between archiving and reporting, and pruned on directory
+# NAMES alone — so it could not know whether the run it had just written held
+# anything. That was survivable only by accident: while a missing source
+# ABORTED, the run died in the ERR trap and never reached this code. Making a
+# missing source SKIP its set (A26, the same day, and correct) removed the
+# accident. A library drive that stops mounting then writes one empty run_
+# directory per night, each counts as a keeper, and after BACKUP_KEEP nights
+# every good archive has been rotated out by runs that backed up nothing.
+# Measured: 2 good runs + 2 sourceless runs at KEEP=2 left
+# "2 run dir(s), 0 of them holding an archive".
+#
+# The fix is an ordering and a definition:
+#   * ORDERING — retention runs AFTER the verdict, so a RED run prunes NOTHING.
+#     A night that failed does not get to rotate away the nights that worked.
+#   * DEFINITION — a "run" for retention is one whose RUN.json says status ok.
+#     Failed directories are pruned on their own budget, so they cannot grow
+#     without bound either, and never at the expense of a good one.
+# The run being written right now is excluded from both passes: it has no
+# RUN.json yet, and deleting the archive you just made is exactly what
+# BACKUP_KEEP=0 did.
+retention_prune() {
+    local d good=() bad=() i
+    while IFS= read -r d; do
+        [ "$d" = "run_$RUN_TS" ] && continue                 # never the current run
+        if grep -q '"status": "ok"' "$BACKUP_TARGET/$d/RUN.json" 2>/dev/null; then
+            good+=("$d")
+        else
+            bad+=("$d")
+        fi
+    done < <(find "$BACKUP_TARGET" -mindepth 1 -maxdepth 1 -type d -name 'run_*' -printf '%f
+' | sort)
+
+    # This run counts toward KEEP, so keep KEEP-1 of the older good ones.
+    local keep_old=$(( KEEP - 1 ))
+    (( keep_old < 0 )) && keep_old=0
+    log "retention: ${#good[@]} older good run(s) + this one, ${#bad[@]} failed; keeping $KEEP"
+    for (( i = 0; i < ${#good[@]} - keep_old; i++ )); do
+        log "  prune old run ${good[$i]}"; rm -rf "${BACKUP_TARGET:?}/${good[$i]}"
+    done
+    # Failed directories are small (a header-only manifest and a log) and they
+    # are EVIDENCE while the fault is live, so they are kept to the same depth
+    # rather than deleted eagerly.
+    for (( i = 0; i < ${#bad[@]} - KEEP; i++ )); do
+        log "  prune old FAILED run ${bad[$i]}"; rm -rf "${BACKUP_TARGET:?}/${bad[$i]}"
+    done
+}
+retention_prune
+
+write_run_json "ok" "sets: ${SET_SUMMARY:-none}"
+feed_naglight true "backup ok $RUN_TS — ${SET_SUMMARY:-no sets}"
 log "== backup OK: $TOTAL_FILES file(s), $TOTAL_BYTES byte(s) across sets =="
 log "manifest: $MANIFEST"
 exit 0

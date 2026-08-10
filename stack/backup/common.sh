@@ -18,7 +18,21 @@ set -uo pipefail
 
 # ── logging ──────────────────────────────────────────────────────────────────
 LOG_FILE="${LOG_FILE:-}"
-log()  { local m="$*"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$m"; [ -n "$LOG_FILE" ] && printf '%s %s\n' "$(date -u +%FT%TZ)" "$m" >>"$LOG_FILE"; }
+# ALWAYS RETURNS 0, and that is load-bearing rather than tidy. Without the final
+# `return 0` the function's status is the `[ -n "$LOG_FILE" ]` test, so `log`
+# reported FAILURE on every call made before the run directory exists — which is
+# every call in restore.sh (it never sets LOG_FILE at all) and every call in
+# backup.sh before line ~145.
+#
+# THE RETURN STATUS IS ONLY HALF OF IT, and the other half is not fixable here.
+# backup.sh runs `set -o errtrace`, which makes the ERR trap fire on a failing
+# command INSIDE a function — so if $LOG_FILE ever becomes unwritable the
+# `printf >>` trips the trap directly, whatever this function returns. That is
+# not hypothetical: with BACKUP_KEEP=0 retention deletes the very run directory
+# the log lives in, and the run then dies reporting `backup failed at line 30`,
+# naming this logger for a fault three steps upstream in retention. See
+# run-backup-cycle-sim.sh S9, which asserts exactly that misdirection.
+log()  { local m="$*"; printf '%s %s\n' "$(date -u +%FT%TZ)" "$m"; [ -n "$LOG_FILE" ] && printf '%s %s\n' "$(date -u +%FT%TZ)" "$m" >>"$LOG_FILE"; return 0; }
 warn() { log "WARN: $*"; }
 
 # ── die + the failure-report hook (OI-9: never-silent-green on `die` paths) ────
@@ -213,7 +227,28 @@ volume_mountpoint() {
     # that through made the mountpoint "\n/var/lib/docker/…" — which then failed
     # `[ -d "$vmp" ]` and reported "volume not found" for volumes that had just
     # been found. Two bugs wearing one error message.
-    local mp name
+    # ── FOUR OUTCOMES, NOT TWO (2026-08-09) ──────────────────────────────────
+    #   0  resolved — the mountpoint is on stdout
+    #   1  the volume is genuinely ABSENT (the daemon answered; there is no such
+    #      volume by literal name and no compose label matches)
+    #   2  AMBIGUOUS — the compose label matched more than one volume
+    #   3  could not ASK — the docker daemon did not answer
+    #
+    # This used to return 1 for all three failures, and that is why the caller
+    # could not act on any of them. The Owner's ruling (a missing source must not
+    # block the other sets) needs "absent" to be separable from the other two,
+    # because they are not the same event and must not have the same outcome:
+    #
+    #   * a dead daemon returning "absent" would SKIP all five volume sets in one
+    #     night, under five log lines each saying the volume does not exist;
+    #   * an ambiguous match returning "absent" would skip the very case the
+    #     label lookup exists to refuse — `_actual_data` matching both
+    #     `stack_actual_data` and `stack_finance_actual_data`, i.e. the choice
+    #     between a budget volume and a finance auditor's.
+    #
+    # Same shape as the four faults behind one "path source missing" line: one
+    # status for several causes is one message for several causes.
+    local mp name count
     mp="$(docker volume inspect -f '{{ .Mountpoint }}' "$1" 2>/dev/null)" || mp=""
     if [ -n "$mp" ]; then printf '%s\n' "$mp"; return 0; fi
 
@@ -226,8 +261,16 @@ volume_mountpoint() {
     # matches BOTH `stack_actual_data` and `stack_finance_actual_data`, so the
     # backup would have had to choose between a budget volume and a finance
     # auditor's — silently, and wrongly half the time. The label is exact.
-    name="$(docker volume ls -q --filter "label=com.docker.compose.volume=$1" 2>/dev/null)"
-    [ "$(printf '%s\n' "$name" | grep -c .)" = "1" ] || return 1
+    #
+    # The `if !` form is required, not stylistic: backup.sh runs with an ERR trap
+    # and `set -o errtrace`, so a bare failing assignment here would abort the
+    # whole run instead of letting the caller decide.
+    if ! name="$(docker volume ls -q --filter "label=com.docker.compose.volume=$1" 2>/dev/null)"; then
+        return 3                      # the daemon did not answer — we cannot tell
+    fi
+    count="$(printf '%s\n' "$name" | grep -c . || true)"
+    [ "${count:-0}" -le 1 ] || return 2                      # more than one match
+    [ "${count:-0}" -eq 1 ] || return 1                      # daemon answered: absent
     mp="$(docker volume inspect -f '{{ .Mountpoint }}' "$name" 2>/dev/null)" || return 1
     [ -n "$mp" ] || return 1
     printf '%s\n' "$mp"
@@ -579,7 +622,15 @@ feed_naglight() {
         local hdr=(-H "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(-H "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(-H "X-Forwarded-User: ${NAGLIGHT_USER}")
-        code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null || echo 000)"
+        # `|| echo 000` was WRONG and printed `000000` (seen 2026-08-09): on a
+        # connection failure curl writes its own `000` from -w AND exits 7, so
+        # the fallback APPENDED to it. The logged "HTTP 000000" then looked like
+        # a transport oddity rather than "nothing answered" — a diagnostic number
+        # that pointed away from the fault. Take curl's status separately.
+        if ! code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null)"; then
+            code=""
+        fi
+        [ -n "$code" ] || code=000
     fi
     if [ "$code" = "200" ]; then log "feed: reported ok=$ok (HTTP 200)"; else warn "feed: report ok=$ok got HTTP $code"; fi
 }

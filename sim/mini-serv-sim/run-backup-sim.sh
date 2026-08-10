@@ -61,9 +61,15 @@ echo "  --- MANIFEST.tsv ---"; rex "cat '$RUN_DIR/MANIFEST.tsv' | sed 's/^/    /
 echo "  --- RUN.json ---";     rex "cat '$RUN_DIR/RUN.json' | sed 's/^/    /'"
 echo "  --- sizes ---";        rex "du -sh '$RUN_DIR'/* 2>/dev/null | sed 's/^/    /'"
 
-echo "== (step 5) verify offsite push landed in the IceDrive share =="
-off="$(rex 'mkdir -p /mnt/ice; mount -t cifs //mini-serv/icedrive /mnt/ice -o username=homehub,password=simpass,rw,vers=3.0 2>/dev/null && find /mnt/ice/homehub-backup -type f 2>/dev/null | wc -l && umount /mnt/ice' | tr -d "\r")"
-if [ "${off:-0}" -ge 1 ]; then pass "offsite share holds $off pushed file(s)"; else fail "offsite share empty"; fi
+echo "== (no step 5) the offsite step was DELETED — assert the service refuses to be asked =="
+# Ruled 2026-08-09. This used to assert that an offsite push LANDED. The step is
+# gone, so the thing worth proving is the opposite and it is the more important
+# property: a backup.env that still asks for a push must be REFUSED, not quietly
+# given a run with no offsite step. A deleted feature whose config is silently
+# ignored is the same family as a green run that wrote nothing.
+ref="$(rex 'sed "s|^BACKUP_TARGET=|OFFSITE_UNC=//mini-serv/icedrive\nBACKUP_TARGET=|" /etc/homehub-backup/backup.env > /tmp/legacy.env
+            bash /opt/homehub/stack/backup/backup.sh --config /tmp/legacy.env 2>&1 | grep -c "was REMOVED on 2026-08-09"' | tr -d "\r")"
+if [ "${ref:-0}" -ge 1 ]; then pass "a config still setting OFFSITE_UNC is refused by name"; else fail "a legacy OFFSITE_UNC config was silently accepted"; fi
 
 echo "== (step 6) verify the NagLight feed round-trip landed =="
 fed="$(rex "curl -s -H 'X-Forwarded-User: sim-user-alice-0001' http://tracker:8787/api/today | grep -o '\"id\":\"backup-files\"[^}]*\"done\":true' | head -n1")"

@@ -17,7 +17,7 @@ Samba fixtures in WI-10.15 (see `docs/status.md`).
 | 2 | **archive + compress** — `tar` per set, `zstd` **where applicable** (already-compressed sets stored as plain `.tar`), minus the **excluded** patterns (`BACKUP_EXCLUDE` + per-set `name.exclude=`), which are logged, listed in `<set>.excluded.log` and recorded in the MANIFEST | `backup.sh` + `compression_decision` + `rsync_pull` |
 | 3 | **hash + verify + manifest** — per-file sha256 table + archive sha256 + integrity test; a recovery MANIFEST | `backup.sh` |
 | 4 | **external-drive target** — dated `run_<UTC>` snapshot with retention (`BACKUP_KEEP`) | `backup.sh` |
-| 5 | **offsite** — **legacy/optional; the target state uses no offsite step** — the IceDrive client syncs library paths directly (`OFFSITE_ENABLED=false`, Owner 2026-07-29). Kept working: `OFFSITE_PATH=/abs/dir` (local dir a sync client uploads) or `OFFSITE_UNC` (cifs push) | `backup.sh` `offsite_stage` |
+| ~~5~~ | **offsite — DELETED 2026-08-09.** The service stages nothing offsite; the IceDrive client syncs library paths directly. `OFFSITE_PATH` / `OFFSITE_UNC` / `OFFSITE_SETS` are still recognised and now **refuse the run** rather than being ignored | — |
 | 0 | **target preflight** — refuse to run unless `BACKUP_TARGET` is a real mountpoint (and not `ro`); posts `ok=false` and exits 1 if not. Zero disk I/O, so it never wakes a parked drive | `backup.sh` + `common.sh` `mount_options_for` |
 | 6 | **report** — POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9) | `common.sh` `feed_naglight` |
 
@@ -114,14 +114,21 @@ Visibility is the requirement, so every run:
 - makes `restore.sh` state plainly that such a set is a **FILTERED copy** of its
   source, so a missing file after a restore is explained, never a mystery.
 
-## Offsite (step 5) — retired from the target state
+## Offsite — retired 2026-07-29, deleted 2026-08-09
 
-**The Owner's corrected model (2026-07-29): the backup service performs no
-offsite staging at all.** The IceDrive client (the SR-015 opt-in desktop
+**The backup service performs no offsite staging at all**, and as of 2026-08-09
+there is no code that could.** The IceDrive client (the SR-015 opt-in desktop
 session) is pointed **directly at chosen library paths in its own GUI** and syncs
 them itself — which is also why step 1b puts the current copy *in the library* in
-the first place. The target state is therefore **`OFFSITE_ENABLED=false`**, and
-the step logs a skip.
+the first place. The target state is therefore **`OFFSITE_ENABLED=false`**, which is
+now the only legal value.
+
+The step was carried as "legacy, still functional" for six weeks after the design
+changed; the Owner ruled to delete it. **The knobs remain recognised on purpose:**
+setting `OFFSITE_PATH`, `OFFSITE_UNC` or `OFFSITE_SETS` fails the run at start
+with a message naming the knob. A box whose config asks for an offsite copy must
+not silently receive a backup that has none — a config quietly ignored is the
+same family of fault as a green run that wrote nothing.
 
 Two consequences to keep in mind: *which* folders reach the cloud is configured
 in the client (authoritative list: `Personal\deploy\storage-map.md` §4e), and the
@@ -129,11 +136,10 @@ client is a GUI app — **sync is down after every reboot until one desktop sess
 is opened** ([../remote-ui/README.md](../remote-ui/README.md)) — a staleness this
 service's NagLight report cannot see.
 
-The step-5 code is **kept working** for a box still configured the old way:
-`OFFSITE_PATH=/abs/dir` (a local directory a sync client uploads — the OI-11
-build, now harmless legacy; it must already exist) or `OFFSITE_UNC=//host/share`
-(cifs push to another host's share, which the sim still uses as its regression
-net). Setting **both is a config error**, caught at run start.
+**And it cannot come back by accident.** There is no offsite code path left to
+re-enable — `OFFSITE_ENABLED=true` is itself refused. If an offsite step is ever
+wanted again it has to be written deliberately, which is the correct cost for
+re-adding a second copy of the household's data.
 
 ## Drive power / spin-down (WI-10.10 DRIVE POWER DESIGN)
 
@@ -226,7 +232,7 @@ INVENTORY.md) are the prior art. Per run, under `BACKUP_TARGET/run_<UTC>/`:
 - **`<set>.tar` / `<set>.tar.zst`** — the archive (algo per step 2).
 - **`<set>.excluded.log`** — only when the set had exclude patterns: one line per
   path the patterns hid, with the pattern that hid it.
-- **`RUN.json`** — run summary (status, ingest, totals, offsite, per-set sizes +
+- **`RUN.json`** — run summary (status, ingest, totals, per-set sizes +
   per-set `excludes`).
 - **`backup.log`** — the run log.
 
@@ -276,7 +282,11 @@ deletion propagation, global/per-set exclusions and their visibility, the
 empty-share refusal + its override, and three loud config failures).
 See `sim/README.md`.
 
-**Honest gap:** those legs still drive the **legacy** `OFFSITE_UNC` offsite form
-(they are the regression net for it) — the `OFFSITE_PATH` local target and the
-wake pre-step do **not** have sim legs yet; see `docs/status.md` for what was
-exercised instead.
+The **cycle leg** (`run-backup-cycle-sim.sh`) covers what only exists across runs:
+a second run after files are added/deleted/modified (and the previous run still
+holding the deletion), retention pruning the oldest, a missing `path:` and a
+missing `volume:` source each skipping only their own set, and the two volume
+failures that must stay fatal — an ambiguous compose-label match and an
+unreachable daemon.
+
+**Honest gap:** the wake pre-step has no sim leg; see `docs/status.md`.

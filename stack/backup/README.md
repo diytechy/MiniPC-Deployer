@@ -1,11 +1,27 @@
 # AWOW bash backup service (WI-10.10)
 
-The homelab's main backup, running on the hub box as **pure bash + systemd** —
-zero `.bat`/`.ps1` anywhere in the pipeline (the Owner's rule, HOMELAB_TOPOLOGY.md).
-The rewritten **FileBackup** repo is the behavioral *spec* this reproduces (hash
-tracking, auto-compression-where-applicable, recovery/reconstruct), not code to
-port. It was built and validated end-to-end against the `sim/mini-serv-sim`
-Samba fixtures in WI-10.15 (see `docs/status.md`).
+The homelab's main backup, running on the hub box as **pure bash + systemd**.
+This service has no `.bat`/`.ps1` in it and is not going to grow any — but note
+the rule it was written under **changed on 2026-08-09**: HOMELAB_TOPOLOGY.md
+item 3 said "no `.bat`/`.ps1` anywhere in the pipeline" and now says they are
+**avoided where possible**, because the absolute form also forbade a
+*containerised* runner where nothing on the host is PowerShell. The host still
+grows no PowerShell dependency and bash is still the default; the change is that
+a container is no longer excluded on the letter of it.
+
+That matters here because the direction of travel is toward one. The rewritten
+**FileBackup** repo has been the behavioral *spec* this reproduces (hash
+tracking, auto-compression-where-applicable, recovery/reconstruct) rather than
+code to port — and the Owner has now directed that it be brought back and folded
+in, because **this service copied its hash tracking and its restore contract but
+not the storage model that made it fit on a disk**: it writes a full copy of
+every set every night with no deduplication. See
+`FileBackup/docs/homehub-integration.md` and item 0 of
+`HomeHub/LOOP_TESTING_HANDOFF.md`.
+
+It was built and validated end-to-end against the `sim/mini-serv-sim` Samba
+fixtures in WI-10.15 (see `docs/status.md`), and the `run-backup-cycle-sim.sh`
+leg added 2026-08-09 covers what only exists across runs.
 
 ## The pipeline — the six steps (HOMELAB_TOPOLOGY.md), 1 in three parts
 

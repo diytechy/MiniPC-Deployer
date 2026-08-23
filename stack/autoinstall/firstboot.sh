@@ -309,6 +309,17 @@ shopt -u nullglob
 # Not fatal when a drive is absent: `nofail` in the generated fstab options, and
 # provision-mounts.sh exits 0 with a loud log on a sim/vmtest build that carries
 # no fragment at all.
+# ── 3a½. name the backup principal (Q-FB5, 2026-08-23) ───────────────────────
+# The backup drive now mounts uid=65532 so the FileBackup container can write
+# it without running as root. The fstab option is numeric, so the mount works
+# either way — this only gives the uid a name (`filebackup`) for `ls -l` and
+# the library-backup wrapper. FATAL inside the script (uid already taken =
+# someone else owns the archives) is a real finding; it must not stop bring-up
+# here, so it is a WARN at this boundary like the mounts below.
+log "naming the backup principal (filebackup, uid 65532)…"
+bash "$STACK_DIR/provision/provision-backup-principal.sh" || \
+    log "WARN: backup principal provisioning reported a problem — see above"
+
 log "mounting storage-map data drives (before compose — bind sources must be real)…"
 bash "$STACK_DIR/provision/provision-mounts.sh" || \
     log "WARN: drive mounting reported a problem — see above"

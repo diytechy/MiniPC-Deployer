@@ -756,8 +756,14 @@ autoinstall:
     # loudly when the target is not a mountpoint (measured — it is the one part
     # of this that has been exercised), so a first boot with no drive attached
     # is a named failure rather than a backup written to the system disk.
-    - cp /target/opt/homehub/stack/backup/systemd/homehub-backup.service /target/etc/systemd/system/homehub-backup.service
-    - cp /target/opt/homehub/stack/backup/systemd/homehub-backup.timer /target/etc/systemd/system/homehub-backup.timer
+    # install -m0644, NOT cp — found 2026-08-23, the expensive way. The payload
+    # rode in on ISO9660, where every file is mode r-xr-xr-x, and cp preserves
+    # that bit. systemd then warns "Configuration file ... is marked executable.
+    # Proceeding anyway." on every is-enabled — cosmetic on every box ever
+    # built, until the 5d assertion below captured stderr and read the warning
+    # as a bad enable state, refusing the install. Kill the bit at the source.
+    - install -m0644 /target/opt/homehub/stack/backup/systemd/homehub-backup.service /target/etc/systemd/system/homehub-backup.service
+    - install -m0644 /target/opt/homehub/stack/backup/systemd/homehub-backup.timer /target/etc/systemd/system/homehub-backup.timer
     - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/backup.sh
     - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/restore.sh
     - curtin in-target --target=/target -- systemctl enable homehub-backup.timer
@@ -776,8 +782,9 @@ autoinstall:
     # like the mosquitto config. Hence 0644 root (readable, since the container
     # binds it read-only) rather than the 0600 the site secrets get.
     - install -m0644 -o root -g root /target/opt/homehub/stack/backup/filebackup.json /target/etc/homehub-backup/filebackup.json
-    - cp /target/opt/homehub/stack/backup/systemd/homehub-library-backup.service /target/etc/systemd/system/homehub-library-backup.service
-    - cp /target/opt/homehub/stack/backup/systemd/homehub-library-backup.timer /target/etc/systemd/system/homehub-library-backup.timer
+    # install -m0644 for the same ISO9660-executable-bit reason as 5b above.
+    - install -m0644 /target/opt/homehub/stack/backup/systemd/homehub-library-backup.service /target/etc/systemd/system/homehub-library-backup.service
+    - install -m0644 /target/opt/homehub/stack/backup/systemd/homehub-library-backup.timer /target/etc/systemd/system/homehub-library-backup.timer
     - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/library-backup.sh
     - curtin in-target --target=/target -- systemctl enable homehub-library-backup.timer
     # ---- 5d. ASSERT THE TIMER IS ACTUALLY THERE (the defect-22 lesson) --------
@@ -810,7 +817,10 @@ autoinstall:
             rc=1
             continue
           fi
-          state="$(systemctl is-enabled "$u" 2>&1 || true)"
+          # stdout ONLY: is-enabled prints warnings (e.g. the executable-bit
+          # one) on stderr, and folding them in turned a cosmetic warning into
+          # a refused install on 2026-08-23. The verdict word is stdout.
+          state="$(systemctl is-enabled "$u" 2>/dev/null || true)"
           if [ "$state" != "enabled" ]; then
             echo "homehub: FATAL - $u is present but is-enabled says \"$state\" (want: enabled)." >&2
             rc=1

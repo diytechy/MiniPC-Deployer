@@ -398,7 +398,12 @@ log "== library backup starting (wrapper log: $LOG_FILE) =="
 # fstab stays numeric because the kernel resolves no names. setpriv covers a box
 # where that provisioning has not run.
 probe_write() {
-    local dir="$1" probe="$dir/.filebackup-writeprobe.$$" rc=0
+    # Three lines, not one: bash expands the whole `local` command BEFORE it
+    # runs, so `probe="$dir/..."` on the same line reads the OUTER (unset)
+    # dir and set -u kills the run — measured on the first real lab run.
+    local dir="$1"
+    local probe="$dir/.filebackup-writeprobe.$$"
+    local rc=0
     if command -v runuser >/dev/null 2>&1 && id -u "$FB_USER" >/dev/null 2>&1; then
         runuser -u "$FB_USER" -- touch "$probe" >/dev/null 2>&1 || rc=$?
     elif command -v setpriv >/dev/null 2>&1; then

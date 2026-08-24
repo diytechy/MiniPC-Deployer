@@ -761,6 +761,74 @@ autoinstall:
     - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/backup.sh
     - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/restore.sh
     - curtin in-target --target=/target -- systemctl enable homehub-backup.timer
+    # ---- 5c. THE LIBRARY BACKUP — the FileBackup container's host side (E2) ---
+    # The SECOND backup unit, and not a replacement for the one above: that one
+    # keeps cifs ingest, the volume: sets, the Mini-serv set and WoL; this one
+    # takes the nine library path: sets, with dedup and Snapshot_<date> history
+    # instead of the eight full copies they would otherwise need. Both units
+    # have to exist for the household to be covered.
+    #
+    # THE CONFIG IS NOT A SITE ARTIFACT, which is why it is installed from the
+    # payload here rather than from site/ in step 4. Every path inside
+    # filebackup.json is a container-internal mount target fixed by
+    # docker-compose.yml — /source, /state, /backup, /changes — so it carries no
+    # secret, no serial and nothing site-specific, and it is tracked in the repo
+    # like the mosquitto config. Hence 0644 root (readable, since the container
+    # binds it read-only) rather than the 0600 the site secrets get.
+    - install -m0644 -o root -g root /target/opt/homehub/stack/backup/filebackup.json /target/etc/homehub-backup/filebackup.json
+    - cp /target/opt/homehub/stack/backup/systemd/homehub-library-backup.service /target/etc/systemd/system/homehub-library-backup.service
+    - cp /target/opt/homehub/stack/backup/systemd/homehub-library-backup.timer /target/etc/systemd/system/homehub-library-backup.timer
+    - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/library-backup.sh
+    - curtin in-target --target=/target -- systemctl enable homehub-library-backup.timer
+    # ---- 5d. ASSERT THE TIMER IS ACTUALLY THERE (the defect-22 lesson) --------
+    # Defect 22 is the reason this block exists at all: stack/backup/systemd/
+    # held three units, a late-command copied exactly ONE of them, and
+    # `systemctl is-enabled homehub-backup.timer` answered NOT-FOUND on every
+    # box ever built. Not disabled — ABSENT. The nightly backup had never fired
+    # on any machine, and nothing in the install noticed because the copy that
+    # was missing succeeded at being missing.
+    #
+    # So the new units check their own installation, at the moment of it. The
+    # cost of getting this wrong is not a failed install; it is a box that looks
+    # installed and never backs its library up.
+    #
+    # `is-enabled`, NOT `list-timers`, AND THAT IS A LIMIT WORTH NAMING.
+    # `systemctl list-timers` needs a RUNNING systemd to ask, and this runs in a
+    # curtin chroot where there is none — it would fail on the bus every time,
+    # which means it could never distinguish a missing timer from a chroot. What
+    # IS answerable offline is whether the unit files landed and whether
+    # `enable` created its symlink, and that is precisely the state defect 22
+    # found wrong. The real `list-timers` assertion (next-elapse in the future)
+    # lives in firstboot.sh step 6b, on a booted box where the question has an
+    # answer; docs/LAB_TEST_PLAN.md TC-H-M13 is the third layer.
+    - |
+      curtin in-target --target=/target -- bash -c '
+        rc=0
+        for u in homehub-backup.timer homehub-library-backup.timer; do
+          if [ ! -f "/etc/systemd/system/$u" ]; then
+            echo "homehub: FATAL - $u was never copied to /etc/systemd/system." >&2
+            rc=1
+            continue
+          fi
+          state="$(systemctl is-enabled "$u" 2>&1 || true)"
+          if [ "$state" != "enabled" ]; then
+            echo "homehub: FATAL - $u is present but is-enabled says \"$state\" (want: enabled)." >&2
+            rc=1
+            continue
+          fi
+          echo "homehub: $u installed and enabled."
+        done
+        for f in /etc/homehub-backup/filebackup.json \
+                 /opt/homehub/stack/backup/library-backup.sh; do
+          [ -s "$f" ] || { echo "homehub: FATAL - $f is missing or empty." >&2; rc=1; }
+        done
+        if [ "$rc" -ne 0 ]; then
+          echo "homehub: refusing to finish an install whose backup timers are not installed." >&2
+          echo "homehub: a box that looks installed and never backs up is exactly defect 22, and it" >&2
+          echo "homehub: went unnoticed for months because nothing ever asked this question." >&2
+          exit 1
+        fi
+      '
     # ---- 6. REFUSE TO FINISH AN INSTALL THAT DID NOT PRODUCE ITS ARTIFACTS ----
     # 2026-08-06. An install reported success and produced a box with no
     # /opt/homehub, no openssh-server, no docker and no cockpit - i.e. a bare

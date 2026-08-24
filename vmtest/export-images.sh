@@ -115,7 +115,16 @@ require_free_gb "$IMAGES_OUT" 3
 # EXTRA_PROFILES still adds to the set, for baking something the .env does not
 # yet enable. ntfy stays in unconditionally: it is the historical default and
 # omitting it would silently shrink an ISO whose .env predates this change.
-PROFILE_ARGS=(--profile ntfy)
+#
+# `filebackup` IS UNCONDITIONAL FOR THE SAME REASON, ARRIVED AT FROM THE OTHER
+# DIRECTION (E2 / P1.5). Its profile is not in any .env and never will be — a
+# profiled-in backup service would run on firstboot's `up -d` — so the bake can
+# only learn about the image from here. The alternative was `EXTRA_PROFILES=
+# filebackup` on every caller, which means the HomeHub launcher: a per-caller
+# opt-in for an image the box cannot pull, in a repo this one does not own, is
+# exactly the shape that ships a stick with a missing tar. Baking it costs one
+# image; leaving it out costs a wrapper run that exits on `No such image`.
+PROFILE_ARGS=(--profile ntfy --profile filebackup)
 ENV_PROFILES="$(sed -n 's/^[[:space:]]*COMPOSE_PROFILES[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" \
                 | tail -n1 | tr -d '"'\''' | tr ',' ' ')"
 for p in $ENV_PROFILES ${EXTRA_PROFILES:-}; do
@@ -203,6 +212,7 @@ sibling_repo_for() {
     case "${1%%:*}" in
         naglight)        echo "NagLight" ;;
         finance-auditor) echo "Finance-Auditor" ;;
+        filebackup)      echo "FileBackup" ;;
         *)               echo "" ;;
     esac
 }

@@ -1,0 +1,33 @@
+# Schedule for the library backup (E2 / Phase 2).
+#
+# 21:30 IS THE Q-FB6 DEFAULT AND THE OWNER MAY MOVE IT. The constraint it is
+# chosen against is the OTHER backup: homehub-backup.timer fires at 03:30 with
+# RandomizedDelaySec=600, so it owns the drive from 03:30 to roughly 04:00 plus
+# however long the archive takes. Both services touch /mnt/backup-drive, and
+# both hold it awake with hdparm while they run — contending for one USB spindle
+# makes each slower and neither safer. 21:30 puts six clear hours in front of
+# the nightly archive on an evening the household is usually done with the
+# library for the day.
+#
+# THE OFFSET IS A COURTESY, NOT A GUARANTEE, and it is worth being honest about
+# which: the FIRST real run of a ~2 TiB library takes DAYS, so it will overlap
+# 03:30 no matter which slot it starts in. What actually prevents damage is that
+# the two services write different trees, plus the wrapper's flock (which stops
+# THIS one stacking on itself). The slot is what keeps the steady-state nightly
+# runs out of each other's way once the first one is behind us.
+[Unit]
+Description=HomeHub library backup timer (FileBackup container)
+
+[Timer]
+OnCalendar=*-*-* 21:30:00
+# A missed run (box off, or asleep) fires on the next boot. A backup should
+# never silently skip — the same reasoning as homehub-backup.timer.
+Persistent=true
+# Small, unlike the nightly's 600s: nothing else contends for this slot, and the
+# jitter here is only to avoid a thundering-herd start with anything else that
+# happens to like round half-hours.
+RandomizedDelaySec=300
+Unit=homehub-library-backup.service
+
+[Install]
+WantedBy=timers.target

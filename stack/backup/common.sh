@@ -601,8 +601,18 @@ mount_options_for() {
 # INSIDE that container via docker exec + its busybox wget (present — the
 # healthcheck uses it), keeping the port closed; unset = direct curl (sim /
 # single-user setups where the URL is host-reachable).
+#
+# FEED_LAST_CODE carries the outcome of the LAST post — the HTTP code, `000`
+# when nothing answered, or `skipped` when no URL is configured. Added for
+# library-backup.sh, whose contract makes a failed POST a failure of the RUN
+# (a backup nobody was told about is not a backup that reported). The return
+# STATUS is deliberately still always 0: backup.sh and restore.sh call this from
+# inside their own failure reporting, and a reporting error must never be able
+# to invent a second failure or mask the first one there.
+FEED_LAST_CODE=""
 feed_naglight() {
     local ok="$1" note="$2"
+    FEED_LAST_CODE="skipped"
     [ -n "${NAGLIGHT_FEED_URL:-}" ] || { log "feed: NAGLIGHT_FEED_URL unset — skipping report"; return 0; }
     local check="${NAGLIGHT_FEED_CHECK:-backup}"
     note="${note//\"/\'}"                                   # keep the JSON valid
@@ -632,5 +642,6 @@ feed_naglight() {
         fi
         [ -n "$code" ] || code=000
     fi
+    FEED_LAST_CODE="$code"
     if [ "$code" = "200" ]; then log "feed: reported ok=$ok (HTTP 200)"; else warn "feed: report ok=$ok got HTTP $code"; fi
 }

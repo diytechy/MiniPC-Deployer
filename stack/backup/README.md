@@ -1,3 +1,32 @@
+# The hub's backups — two services, one drive
+
+**There are two backup services on this box and neither replaces the other.**
+That is the first thing to know before reading anything below, because almost
+every question here ("which timer? which check id? which one prunes?") is really
+a question about which of the two you are looking at.
+
+| | `homehub-backup` (bash) | `homehub-library-backup` (container) |
+|---|---|---|
+| **What it protects** | cifs **ingest** from Mini-serv, the five `volume:` sets (Actual, Technitium, Caddy, tracker, finance), the Mini-serv `path:` set | the **nine library `path:` sets** — the ~4 TB tree that had no archive at all |
+| **How** | `tar` + `zstd` per set into a dated `run_<UTC>` folder | **FileBackup** in a container: per-file dedup, a browsable **mirror**, `Snapshot_<date>` history |
+| **Storage cost** | a **full copy per run**, `BACKUP_KEEP` of them | one mirror + deltas; growth is bounded by **change rate**, not run count |
+| **Runs** | `homehub-backup.timer`, 03:30 | `homehub-library-backup.timer`, 21:30 (**Q-FB6**, the Owner may move it) |
+| **Feed lane** | `backup` | `library-backup` |
+| **Retention** | `BACKUP_KEEP`, pruned after a good run | **none — nothing prunes.** See below |
+| **Entry point** | `backup.sh` | `library-backup.sh` (host) → one `docker compose run` |
+| **Wake-on-LAN, drive power, ingest** | yes | reuses the same `common.sh` drive-power helpers; no WoL, no ingest |
+
+A **merge, not a swap** (the Owner, `HomeHub/LOOP_TESTING_HANDOFF.md`). The bash
+service's coverage is unchanged by the container's arrival. What the container
+**dissolves** is the NVMe staging bomb for the library sets specifically:
+FileBackup reads the source in place, so those nine sets stage nothing. Ingest
+and the `volume:` sets still stage.
+
+The rest of this document is the bash service; the container's half is
+[the library backup](#the-library-backup-filebackup-in-a-container) near the end.
+
+---
+
 # AWOW bash backup service (WI-10.10)
 
 The homelab's main backup, running on the hub box as **pure bash + systemd**.
@@ -306,3 +335,173 @@ failures that must stay fatal — an ambiguous compose-label match and an
 unreachable daemon.
 
 **Honest gap:** the wake pre-step has no sim leg; see `docs/status.md`.
+
+---
+
+## The library backup — FileBackup in a container
+
+The second service. `library-backup.sh` is a **host** wrapper around exactly one
+`docker compose run`; everything else in it is proof that the run should happen.
+
+```
+library-backup.sh                        the host side (bash, root, one-shot)
+filebackup.json                          the container's config — TRACKED, installed
+                                         to /etc/homehub-backup/filebackup.json 0644
+systemd/homehub-library-backup.service   Type=oneshot, TimeoutStartSec=infinity
+systemd/homehub-library-backup.timer     21:30 (Q-FB6 default), Persistent=true
+```
+
+The image is `filebackup:${FILEBACKUP_IMAGE_TAG}`, built from a sibling
+`../FileBackup` checkout by `scripts/ensure-local-images.sh` (**always with
+`--rebuild`** — the resolver skips an image that already exists, and a
+hand-tagged one carries no `homehub.source.revision` stamp) and baked into the
+ISO payload by `vmtest/export-images.sh`, which enables the `filebackup` profile
+unconditionally for the bake.
+
+### The profile is deliberately not in `COMPOSE_PROFILES`
+
+`filebackup` must never be added to `COMPOSE_PROFILES` in any `.env`. Firstboot
+runs a plain `docker compose up -d`, and a profiled-in backup service would
+launch a **multi-day library backup on a box that was imaged ten minutes ago**.
+`compose run` enables the profile implicitly, which is why the wrapper does not
+need it enabled anywhere. The image still reaches the payload because the bake
+asks for the profile itself.
+
+### What the wrapper does before it starts anything
+
+| Step | Refuses when | Why it exists |
+|---|---|---|
+| 1. `flock` | another run holds the lock | the first real run is a **multi-day** job; the nightly timer would otherwise stack a second container into one `/state` and one `/backup`. A held lock **posts nothing** — the lane belongs to the run that is still going — but exits non-zero |
+| 2. mount identity | `/srv/library` or the backup drive is absent or read-only | `nofail` in the fstab means an absent drive leaves an ordinary empty **directory on the system disk**. Reuses `samba/library-guard.sh`, cross-checked against the generated fstab and `drive-identity.conf`; a **stand-in drive is yellow**, carried into the summary, not a refusal |
+| 3. capacity | free space below `BACKUP_LIBRARY_MIN_FREE_GB` (or the state/logs floor) | there is **no retention** — this floor is the whole space policy |
+| 4. pre-create | — | docker **chowns** a bind source it had to create, and that is `EPERM` on the FAT-family data drives, which takes the *entire* compose command down. The config file and the library source are asserted, never created |
+| 5. write-probe | uid 65532 cannot write `/backup` or `/changes` | NTFS/exFAT ownership is synthesized from mount options, so only the fstab's `uid=65532,gid=65532` grants access (**Q-FB5**). A regression must fail in the first seconds, not at hour eight |
+
+Then it holds the drive awake (`hdparm -S 0`, restored on every exit path),
+runs the container, applies the verify gate, and posts to NagLight.
+
+`library-backup.sh --preflight-only` runs steps 1–5 and stops without creating
+or starting anything.
+
+### Exit codes — two different tables
+
+The **backup** action (`SR-043`), which has no code 3:
+
+| | |
+|---|---|
+| **0** | complete |
+| **1** | a set failed — a data/IO problem; read `Backup_Global.log` |
+| **2** | the configuration could not be loaded, or violates the contract. **Retrying will not help** |
+
+The **verify** action uses the restore-side table (`SR-040`), shared with
+`reconstruct.sh` — **0** complete · **1** incomplete (content) · **2** usage or
+precondition · **3** manifest-witness mismatch · **4** incomplete (host,
+retriable); precedence **2 > 3 > 4 > 1**. Each maps to its own message, because
+one generic "backup failed" puts a human in the container log every time.
+
+### Retention: none, by ruling — and the manual prune
+
+**Q-FB2 (the Owner, 2026-08-23): retention is NONE for now.** Snapshots are kept
+indefinitely and **the wrapper prunes nothing**. Growth is bounded by *change
+rate*, not run count — a run that supersedes nothing creates no snapshot at all —
+which is why unbounded-by-policy is tolerable here and would not be for the eight
+full copies this replaces.
+
+The burden therefore falls entirely on **loud space surfacing**: the capacity
+floor is a hard refusal posted **red**, and every successful run's summary
+carries the drive's **fill percentage**, so the trend is visible long before the
+floor is near.
+
+When the Owner does want space back, the procedure is manual and in this order:
+
+```bash
+cd /opt/homehub/stack
+# 1. list what exists. The output is line-framed JSON: take exactly the [ .. ]
+#    block by line — never a greedy regex. Empty is `[]`.
+docker compose --profile filebackup run --rm -T filebackup snapshots
+# 2. DRY RUN the removal first.
+FILEBACKUP_DRY_RUN=1 docker compose --profile filebackup run --rm -T filebackup \
+    prune -Snapshot Snapshot_2026-08-23
+# 3. then for real.
+docker compose --profile filebackup run --rm -T filebackup prune -Snapshot Snapshot_2026-08-23
+```
+
+**Never delete a `Snapshot_*` folder by hand.** It is the only copy of the states
+it holds, and the manifests that make the rest reconstructable refer into it.
+These actions use the **restore-side** code table above, not the backup one.
+
+### Rollback
+
+The container can be taken out of service without touching the bash service or
+the data:
+
+1. **Stop it running.** `systemctl disable --now homehub-library-backup.timer`,
+   and `systemctl mask homehub-library-backup.timer` if it must not come back
+   through a later `enable`.
+2. **The image stays and never runs.** It is behind the `filebackup` profile,
+   which is in no `.env`, so `docker compose up -d` cannot start it — leaving the
+   image in place costs a few hundred MB and keeps the rollback reversible. To
+   remove it from future ISOs as well, drop `--profile filebackup` from
+   `PROFILE_ARGS` in `vmtest/export-images.sh`.
+3. **Reclaim the space by hand.** `rm -rf /mnt/backup-drive/library
+   /mnt/backup-drive/library-changes`. Mirror mode (`PreserveFolderTree: true`,
+   **Q-FB1**) means the backup root is an **ordinary browsable file tree** plus
+   manifests — deleting it needs no tooling and leaves nothing dangling. The
+   manifest cache at `/var/lib/homehub-filebackup/state` and the logs at
+   `/var/log/homehub-filebackup` go the same way.
+4. **The bash service is unaffected.** Its sets, its timer, its `backup` lane and
+   its retention are all independent of any of the above. What you lose is the
+   library coverage, which is what there was before this shipped.
+
+### The config file
+
+`filebackup.json` is **tracked** and installed to
+`/etc/homehub-backup/filebackup.json` at 0644 root by autoinstall late-command
+5c — not through the `site/` payload the secrets take. Every path in it
+(`/source`, `/state`, `/backup`, `/changes`) is a **container-internal mount
+target** fixed by `docker-compose.yml`; it derives from the storage map not at
+all and carries no secret, no serial and nothing site-specific. The host paths it
+pairs with are the `FILEBACKUP_*` knobs in `stack/.env`.
+
+JSON carries no comments and the schema is **closed** (`additionalProperties:
+false` — an extra key is a contract violation, exit 2), so the settled choices
+are recorded here instead:
+
+- `HashRecalcFreq: "W"` — production. The reconstruction drill overrides it to
+  `"A"` in a drill-local copy, never this file: under `"W"` a same-length
+  in-place edit whose mtime lands in the same coarse exFAT tick is silently
+  skipped, and that state would be unreconstructable.
+- `CompressEnabled: true` (**Q-FB4**). FileBackup's own
+  `NonCompressibleExtensions` list already contains the union of both services'
+  exemptions, so already-compressed content is skipped for us.
+- `PreserveFolderTree: true` (**Q-FB1**, ruled) — *Mirror*. The backup root is a
+  browsable mirror of the library, which is the strongest available answer to
+  "must the backup be readable without its own tool". Dedup and snapshot-delta
+  storage apply either way.
+- `AllowEmptySource` is **absent**, and that absence is load-bearing: the default
+  is `false`, which refuses to empty a populated backup when the source comes up
+  empty — the safety net for a library drive that failed to mount.
+- No `Tools` block: the image sets `FILEBACKUP_7ZIP_PATH=/usr/bin/7z` itself.
+- No `Secrets` block: containerized runs are `-NoMail`, and JSON cannot carry a
+  `PSCredential` anyway.
+
+Validate any edit against `FileBackup/container/FileBackup.schema.json`.
+
+### Restoring without the container
+
+The three packages `xxhash`, `gawk` and `p7zip-full` are in
+`autoinstall/packages.list` for the **restore** side, not the backup: every
+snapshot ships `bash/reconstruct.sh`, which runs on coreutils plus those. `gawk`
+is named separately because Ubuntu Server ships **mawk**, and `reconstruct.sh`
+parses the manifest with `FPAT` — a GNU extension that mawk does not merely lack
+but mis-splits silently.
+
+```bash
+bash reconstruct.sh --target-root /var/tmp/restore --from <snapshot-or-backup-root> \
+    --backup-root /mnt/backup-drive/library --change-root /mnt/backup-drive/library-changes \
+    --require-witness
+```
+
+**`--require-witness` on every restore** — without it a missing manifest sidecar
+only warns. The explicit root flags exist for exactly this split-mount shape; on
+a rescue machine, `cd` onto the drive and pass `--from` alone and it auto-detects.

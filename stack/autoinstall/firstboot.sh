@@ -952,6 +952,35 @@ EOF
     fi
 fi
 
+# ── 6b. ARE THE BACKUP TIMERS ACTUALLY ARMED? (defect 22, asked properly) ────
+# The install already refuses if a unit file did not land or `enable` did not
+# create its symlink (late-command 5d). That check runs in a curtin chroot,
+# where there is no running systemd to ask, so it can only see the FILES.
+#
+# THIS is where the question has a real answer: a booted box, with the manager
+# up, where `systemctl list-timers` can say whether the timer is loaded AND when
+# it will next fire. Defect 22 was `is-enabled` answering NOT-FOUND on a hub
+# everyone called healthy for months — the two halves of that (the file, and the
+# armed timer) fail independently, so they are checked independently.
+#
+# A WARNING, NOT A FATAL. By this point the stack is up, DNS is provisioned and
+# the shares are mounted; refusing the whole first boot over a timer would trade
+# a working box for a broken one. The line is loud, it names the fix, and
+# verify-hub.sh / LAB_TEST_PLAN TC-H-M13 assert it afterwards from outside.
+for _t in homehub-backup.timer homehub-library-backup.timer; do
+    # -F (fixed string): the unit names carry a `.` and neither is a substring
+    # of the other, so a literal match is both sufficient and unambiguous.
+    if systemctl list-timers --all --no-pager --no-legend 2>/dev/null | grep -qF "$_t"; then
+        log "timer armed: $_t (next: $(systemctl show -p NextElapseUSecRealtime --value "$_t" 2>/dev/null))"
+    else
+        log "WARN: $_t is NOT in \`systemctl list-timers\` — it will never fire."
+        log "  This is the defect-22 shape: the unit can be present and enabled and still"
+        log "  not be armed (a bad OnCalendar, or a failed daemon-reload). Nothing else on"
+        log "  this box will notice a backup that simply never runs."
+        log "  Check:  systemctl status $_t ; systemctl list-timers --all | grep ${_t%.timer}"
+    fi
+done
+
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
 # A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO

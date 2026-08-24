@@ -1,0 +1,41 @@
+# The LIBRARY backup (E2 / Phase 2) — a one-shot that drives the FileBackup
+# container. Triggered by homehub-library-backup.timer.
+#
+# This is the SECOND backup unit on the box and it is not a replacement for the
+# first: homehub-backup.service keeps cifs ingest, the volume: sets, the
+# Mini-serv set and WoL; this one takes the nine library path: sets with dedup
+# and snapshot history. Both must exist for the household to be covered.
+#
+# Runs as root: it drives docker, reads /proc/self/mountinfo, holds the drive
+# awake with hdparm and write-probes as uid 65532 via runuser. The CONTAINER is
+# non-root (65532) and read-only — none of that privilege reaches the backup
+# itself.
+[Unit]
+Description=HomeHub library backup (FileBackup container, one-shot)
+Documentation=file:///opt/homehub/stack/backup/README.md
+Wants=network-online.target
+After=network-online.target docker.service
+# NOT RequiresMountsFor= on the data drives, and that is the same deliberate
+# call homehub-backup.service makes: systemd would refuse to START the unit, so
+# NOTHING would reach NagLight — an unreported non-run, which is worse than a
+# red one. The wrapper's step 2 refuses instead, loudly, through the feed.
+
+[Service]
+Type=oneshot
+ExecStart=/opt/homehub/stack/backup/library-backup.sh
+User=root
+# THE FIRST REAL RUN IS A MULTI-DAY JOB. ~2 TiB over USB, hashed per file. The
+# systemd default is DefaultTimeoutStartSec=90s, and for a Type=oneshot that
+# ceiling applies to the whole ExecStart — so without this line the very first
+# library backup would be SIGTERM'd ninety seconds in, every night, forever,
+# leaving a half-written manifest behind each time. Later incremental runs are
+# minutes; the first one is not, and this unit has to survive it.
+TimeoutStartSec=infinity
+# Politeness, not throttling: the hub serves DNS, the kiosk site and the shares
+# while this runs, and a multi-day IO-heavy job must not be what makes the panel
+# stutter. `idle` yields to every other IO on the box.
+Nice=15
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

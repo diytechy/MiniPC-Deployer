@@ -267,6 +267,16 @@ def main():
         "backup/systemd/homehub-backup.timer",
         "backup/backup.sh",
         "backup/restore.sh",
+        # The LIBRARY backup (E2) — the FileBackup container's host side. Same
+        # three-part shape as the pair above (unit + timer + script) plus the
+        # container's own config, which late-command 5c installs to
+        # /etc/homehub-backup/filebackup.json. That JSON is tracked rather than
+        # site-seeded because every path in it is container-internal: no secret,
+        # no serial, nothing site-specific.
+        "backup/systemd/homehub-library-backup.service",
+        "backup/systemd/homehub-library-backup.timer",
+        "backup/library-backup.sh",
+        "backup/filebackup.json",
         # The WALL panel variant (SR-016/SR-017): a second image target with its
         # own late-commands, so it needs its own coverage. Every file below is
         # cp'd or enabled by autoinstall/wall/user-data.

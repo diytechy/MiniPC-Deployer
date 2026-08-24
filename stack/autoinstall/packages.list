@@ -154,6 +154,24 @@ cifs-utils            # mount.cifs: the hub MOUNTS Mini-serv's shares (storage-m
 rsync                 # the transport for every backup source kind, and for ingest
 zstd                  # the .tar.zst archive path, its integrity test, and restore
 
+# ── what a FileBackup RESTORE needs, on a box with no FileBackup ─────────────
+# These three are not for the backup — the container carries everything the
+# backup run uses. They are for the RECONSTRUCTION, and that is the whole point
+# of naming them here (E2 / P1.6): the standing premise of the "avoided where
+# possible" ruling is that the archive stays restorable WITHOUT its own runtime.
+# `bash/reconstruct.sh` ships inside every snapshot and runs on plain coreutils
+# plus these; if they are absent, the recovery half of the contract needs the
+# very container whose absence is the likely reason someone is reconstructing.
+#
+# GAWK IS NAMED SEPARATELY BECAUSE UBUNTU SERVER SHIPS MAWK. reconstruct.sh
+# parses MANIFEST.csv with `FPAT`, which is a GNU awk extension: under mawk the
+# field splitting is simply wrong on any quoted field containing a comma — it
+# does not error, it restores the wrong paths. An alternative that silently
+# mis-parses is worse than one that is missing.
+xxhash                # xxh128sum: the manifest's hash algorithm (verify + drill oracles)
+gawk                  # reconstruct.sh needs FPAT — Ubuntu's default awk is MAWK
+p7zip-full            # 7z: extracts the compressed data files reconstruct.sh finds
+
 # ── the Docker engine ───────────────────────────────────────────────────────
 # THESE COME FROM download.docker.com, NOT THE UBUNTU ARCHIVE, and that is the
 # one thing about this list a reader has to know. export-apt.sh notices

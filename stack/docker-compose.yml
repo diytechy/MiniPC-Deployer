@@ -350,6 +350,80 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── filebackup — the LIBRARY backup, as a ONE-SHOT container (E2 / P1.1) ─────
+  # The bash service in stack/backup/ keeps cifs ingest, the volume: sets, the
+  # Mini-serv set, WoL and drive power. THIS takes the nine library `path:` sets
+  # — the 4 TB tree that is not archived at all today — with per-file dedup and
+  # Snapshot_<date> history instead of eight full copies. A merge, not a swap.
+  #
+  # IT IS NEVER STARTED BY `docker compose up -d`, AND THAT IS THE POINT. The
+  # `filebackup` profile is deliberately absent from COMPOSE_PROFILES in
+  # .env.example and must stay absent from every materialised .env: firstboot
+  # runs a plain `up -d`, and a profiled-in backup service would launch a
+  # multi-day library backup on a box that was imaged ten minutes ago. The only
+  # thing that ever starts it is stack/backup/library-backup.sh:
+  #     docker compose --profile filebackup run --rm -T filebackup backup
+  # (`-T` because a systemd oneshot has no TTY). The image still reaches the ISO
+  # payload — vmtest/export-images.sh enables this profile unconditionally for
+  # the bake, exactly as it already does for ntfy.
+  #
+  # NO `container_name:` and NO `restart:`, both deliberate. `compose run` mints
+  # its own throwaway container name, and a fixed one would collide with it; a
+  # restart policy on a one-shot would re-run the backup forever.
+  #
+  # HARDENING IS FileBackup's OWN (compose.example.yaml at its HEAD): non-root
+  # 65532 (the uid Q-FB5 grants the backup drive via the fstab's uid=/gid=), a
+  # read-only rootfs with a tmpfs /tmp, no network at all, and no capabilities.
+  # `network_mode: none` is why reporting cannot live inside this container —
+  # the wrapper posts to NagLight after it exits.
+  #
+  # EVERY HOST PATH CARRIES ITS DEFAULT INLINE, unlike MEDIA_ROOT above. An
+  # unset knob would interpolate to empty and leave `:/source:ro`, which is not
+  # a legal bind — and that does not merely break this service, it makes the
+  # WHOLE FILE unparseable, taking `docker compose config` down with it. Two
+  # things depend on that command succeeding: firstboot's bind-source
+  # pre-creation (step 4a-pre-2) and export-images.sh's image resolution. So a
+  # materialised .env that predates these knobs degrades to the documented
+  # defaults instead of bricking bring-up. The knobs are still declared in
+  # .env.example (and in HomeHub's FieldSchema) — the defaults are the floor,
+  # not the interface.
+  filebackup:
+    image: filebackup:${FILEBACKUP_IMAGE_TAG}
+    profiles: ["filebackup"]
+    user: "65532:65532"
+    read_only: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # Both are already ENV in the image; naming them here keeps the contract
+      # visible at the seam rather than one `docker image inspect` away.
+      FILEBACKUP_CONFIG_PATH: /config/FileBackup.json
+      FILEBACKUP_LOG_PATH: /logs/Backup_Global.log
+    volumes:
+      # The set definition — container-internal paths only, no secret and no
+      # site identity, so it is a TRACKED template (stack/backup/filebackup.json)
+      # installed to /etc by autoinstall late-command 5c, not a site artifact.
+      - /etc/homehub-backup/filebackup.json:/config/FileBackup.json:ro
+      # The library, READ-ONLY. FileBackup reads the source in place — there is
+      # no staging copy for these sets, which is the NVMe staging bomb that this
+      # service's arrival dissolves.
+      - ${FILEBACKUP_SOURCE:-/srv/library}:/source:ro
+      # Manifest/hash cache. On the SYSTEM disk on purpose: it is small, and it
+      # must survive a backup drive being unplugged.
+      - ${FILEBACKUP_STATE:-/var/lib/homehub-filebackup/state}:/state
+      # The mirror (Q-FB1: PreserveFolderTree) and the snapshot history, both on
+      # the backup drive.
+      - ${FILEBACKUP_BACKUP:-/mnt/backup-drive/library}:/backup
+      - ${FILEBACKUP_CHANGES:-/mnt/backup-drive/library-changes}:/changes
+      - ${FILEBACKUP_LOGS:-/var/log/homehub-filebackup}:/logs
+    tmpfs:
+      # read_only: true leaves the process no writable scratch at all; pwsh
+      # needs one. noexec/nosuid/nodev so it cannot become a foothold.
+      - /tmp:rw,noexec,nosuid,nodev
+
   # ── ddns — keep the public A records pointed at the home connection ──────────
   # Gap the Owner caught 2026-07-04: DDNS previously ran on Mini-serv as the legacy
   # DDNS-Cloudflare-PowerShell scripts; per WI-9 Q4 the AWOW owns it now, and the

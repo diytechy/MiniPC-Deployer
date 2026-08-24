@@ -64,6 +64,7 @@ TRACKER_PUBLIC_IMAGE="${TRACKER_PUBLIC_IMAGE:-$(env_get TRACKER_PUBLIC_IMAGE)}"
 FINANCE_AUDITOR_IMAGE_TAG="$(env_get FINANCE_AUDITOR_IMAGE_TAG)"
 FINANCE_AUDITOR_PUBLIC_IMAGE="${FINANCE_AUDITOR_PUBLIC_IMAGE:-$(env_get FINANCE_AUDITOR_PUBLIC_IMAGE)}"
 ACTUAL_IMAGE_TAG="$(env_get ACTUAL_IMAGE_TAG)"
+FILEBACKUP_IMAGE_TAG="$(env_get FILEBACKUP_IMAGE_TAG)"
 
 # ensure_image REF SIBLING_DIR PUBLIC_REF [docker-build args...] : resolve one
 # local image via the present → sibling-build → declared-public chain; die
@@ -126,6 +127,21 @@ ensure_image "naglight:${TRACKER_IMAGE_TAG:-local}" "NagLight" "${TRACKER_PUBLIC
 # that pin bumps, re-run with --rebuild to rebuild this image against it.
 ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Auditor" "${FINANCE_AUDITOR_PUBLIC_IMAGE:-}" \
     --build-arg "ACTUAL_API_VERSION=${ACTUAL_IMAGE_TAG:?ACTUAL_IMAGE_TAG missing from env file}"
+
+# FileBackup — the LIBRARY backup container (E2 / P1.5). Dockerfile at the repo
+# ROOT (unlike Finance-Auditor's), so the plain sibling-build arm fits with no
+# extra args. NO PUBLIC FALLBACK: nothing publishes this image anywhere, so an
+# absent ../FileBackup checkout is a loud failure naming the clone — which is
+# the right answer, because the AWOW can never fetch it either.
+#
+# BUILD IT WITH --rebuild, ALWAYS (P0.3). Two reasons, and both have bitten:
+#   * this resolver SKIPS any ref that already exists, so a pre-existing image
+#     short-circuits the build and ships whatever vintage is in the cache;
+#   * FileBackup's own .artifacts/*.tar was exported by PODMAN and loads as
+#     `localhost/filebackup:local`. Never load it, never hand-tag from it — a
+#     hand-tagged image carries no homehub.source.revision, and the freshness
+#     check in export-images.sh only WARNS on an unstamped image.
+ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" ""
 
 # ── caddy-cloudflare: a local image that is NOT an app repo ───────────────────
 # The two above resolve from SIBLING repos, because they are our applications.

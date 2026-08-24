@@ -5,11 +5,13 @@
 # Steps ("flash → boot → everything up, zero clicks"):
 #   1. Sanity: stack dir + .env exist and .env has been filled (not placeholders).
 #   2. Materialize the oauth2-proxy allow-list from OAUTH2_PROXY_ALLOWED_EMAILS.
-#   3. Q10.9 B+ ALL-IMAGES: docker-load EVERY stack image from the baked deploy
-#      payload (deploy-payload/images/*.tar) so the box comes up "from infancy"
-#      with zero registry dependency, versions pinned to the sim-validated set.
-#      docker load is idempotent. If no payload is present, fall back LOUDLY to
-#      the old pull-at-compose-up behaviour.
+#   3. Q10.9 B+ ALL-IMAGES: docker-load every stack image from the baked deploy
+#      payload (deploy-payload/images/*.tar) THAT IS NOT ALREADY PRESENT, so the
+#      box comes up "from infancy" with zero registry dependency, versions pinned
+#      to the sim-validated set. `docker load` is NOT idempotent in the way this
+#      line used to claim — it RE-POINTS an existing tag — so the step asks the
+#      tar whether its repo:tag is already here. If no payload is present, fall
+#      back LOUDLY to the old pull-at-compose-up behaviour.
 #   4. `docker compose up -d` — starts all services (images already loaded in step
 #      3; any not baked are pulled here) with restart:unless-stopped, then
 #      (4b) assert caddy can actually READ the kiosk config it is about to serve.
@@ -234,8 +236,7 @@ fi
 # deploy payload (built by vmtest/export-images.sh, versions pinned to the
 # sim-validated set), so first boot needs ZERO registry/internet access for
 # container images — including naglight:local, which has no registry home at all
-# (Q10.2). `docker load` is idempotent: loading an image that already exists is a
-# no-op. The tars ride inside deploy-payload/, so they land wherever the payload
+# (Q10.2). The tars ride inside deploy-payload/, so they land wherever the payload
 # lands; check every layout the light + repacked ISO paths can produce.
 # GRACEFUL DEGRADE: if NO payload is present (e.g. a seed built without images),
 # log loudly and fall through to the pre-Q10.9 pull-at-compose-up behaviour.
@@ -252,12 +253,109 @@ for cand in \
     fi
 done
 
+# ── WHAT A TAR WOULD INSTALL, ASKED OF THE TAR ───────────────────────────────
+# Prints the repo:tag(s) a `docker load` of this archive would (re)point, one per
+# line, or nothing when they cannot be determined — and "nothing" must always
+# mean LOAD IT, because refusing to load on a parse failure would silently strand
+# a box with no images at all.
+#
+# Two sources, cheapest first. images.manifest.tsv is written beside the tars by
+# vmtest/export-images.sh (ref / id / digest / file / bytes) and is exact, so a
+# normal payload never has to open an archive. A tar with no row — a payload
+# built before the manifest existed, or one staged by hand — is asked directly:
+# `docker save` puts a manifest.json at the archive root whose RepoTags carry the
+# same answer. No jq: it is not in packages.list and this must work on a box with
+# nothing but the base system.
+tar_repo_tags() {
+    local tar="$1" base tags="" json=""
+    base="$(basename "$tar")"
+    if [ -f "$IMAGES_DIR/images.manifest.tsv" ]; then
+        tags="$(awk -F'\t' -v f="$base" '$4 == f { print $1 }' "$IMAGES_DIR/images.manifest.tsv" 2>/dev/null || true)"
+    fi
+    if [ -z "$tags" ]; then
+        case "$tar" in
+            *.tar.zst)
+                command -v zstd >/dev/null 2>&1 && \
+                    json="$(zstd -dc "$tar" 2>/dev/null | tar -xO manifest.json 2>/dev/null || true)" ;;
+            *)  json="$(tar -xOf "$tar" manifest.json 2>/dev/null || true)" ;;
+        esac
+        # One archive can carry several images, each with several tags, so pull
+        # every "RepoTags":[…] block and then every string inside it. A null
+        # RepoTags (an untagged save) matches nothing and correctly yields "".
+        tags="$(printf '%s' "$json" \
+                | grep -o '"RepoTags":\[[^]]*\]' 2>/dev/null \
+                | sed 's/"RepoTags":\[//; s/\]//' | tr ',' '\n' | tr -d '"' || true)"
+    fi
+    printf '%s\n' "$tags" | sed '/^$/d'
+}
+
 if [ -n "$IMAGES_DIR" ]; then
     tars=("$IMAGES_DIR"/*.tar "$IMAGES_DIR"/*.tar.zst)
     log "loading ${#tars[@]} baked image tar(s) from $IMAGES_DIR (Q10.9 B+ — zero-registry first boot)"
     loaded=0
+    skipped=0
     for tar in "${tars[@]}"; do
         name="$(basename "$tar")"
+
+        # ── SKIP A TAR WHOSE repo:tag IS ALREADY HERE (found 2026-08-24) ──────
+        # `docker load` IS NOT A NO-OP FOR AN EXISTING TAG. It is a no-op for an
+        # existing IMAGE — identical content re-loads to the same id and nothing
+        # changes — and the two were conflated in this step's comment since it was
+        # written. What load actually does is (re)bind the tag in the archive to
+        # the archive's image, whatever the tag pointed at a moment earlier.
+        #
+        # MEASURED ON THE LAB HUB, drill 2026-08-24, filebackup:local:
+        #     baked                    sha256:932791f9…
+        #     after a remote update    sha256:d26a9df6…   (the operator's build)
+        #     after `docker load` of the baked tar
+        #                              sha256:932791f9…   ← silently back
+        # and the operator's image was left dangling with no tag on it at all.
+        #
+        # WHY THAT IS A REAL BUG AND NOT A LAB CURIOSITY. This script re-runs on
+        # EVERY boot (see the header: RemainAfterExit only stops a second start
+        # within one boot). The documented way to ship a fix to a running hub is
+        # build → scp → `docker load` → `compose up -d`, and for the four images
+        # with no registry home — naglight, finance-auditor, filebackup,
+        # caddy-cloudflare — that is the ONLY way. So every such update was living
+        # on borrowed time: it worked, it was verified, and the next reboot threw
+        # it away and put the ISO's vintage back, with nothing in any log saying a
+        # rollback had happened. A hub reverting a security fix on a power cut is
+        # the failure this closes.
+        #
+        # THE QUESTION IS ASKED OF THE INPUTS, per the header's rule. The tar says
+        # which repo:tag it would bind; docker says what that tag holds now. It is
+        # the step 1b shape ("is the END STATE already true?"), not the 3e shape
+        # ("did I already run?") — nothing here consults a marker this step wrote.
+        # A fresh reimage has an empty docker state, so nothing matches, and every
+        # tar loads exactly as before: the zero-registry first boot is untouched.
+        #
+        # THE COST, stated because it is real: a payload whose TAR was replaced
+        # in place under a tag the box already has will now be skipped. That is
+        # the same lever inverted, and it stays available — a deliberate rollback
+        # or re-flash of one image is `docker load -i <tar>` by hand, which still
+        # re-points the tag exactly as it always did. Automatic and irreversible
+        # was the wrong default; manual and explicit is the right one.
+        _tags=()
+        mapfile -t _tags < <(tar_repo_tags "$tar")
+        if [ "${#_tags[@]}" -gt 0 ]; then
+            _missing=""
+            for _t in "${_tags[@]}"; do
+                docker image inspect "$_t" >/dev/null 2>&1 || _missing="$_missing $_t"
+            done
+            if [ -z "$_missing" ]; then
+                # One line per skipped tag, naming the id that is being KEPT, so
+                # a rollback that does not happen is as visible in the journal as
+                # one that does.
+                for _t in "${_tags[@]}"; do
+                    log "  SKIP $name: $_t is already present as $(docker image inspect "$_t" --format '{{.Id}}' 2>/dev/null || echo '?') — keeping it"
+                done
+                log "    (loading would re-point that tag at the baked image and discard any"
+                log "     update made since the flash. Deliberate rollback: docker load -i $tar)"
+                skipped=$((skipped + 1))
+                continue
+            fi
+        fi
+
         case "$tar" in
             *.tar.zst)
                 if command -v zstd >/dev/null 2>&1; then
@@ -279,7 +377,7 @@ if [ -n "$IMAGES_DIR" ]; then
                 ;;
         esac
     done
-    log "image payload: $loaded of ${#tars[@]} tar(s) loaded from $IMAGES_DIR"
+    log "image payload: $loaded of ${#tars[@]} tar(s) loaded from $IMAGES_DIR ($skipped already present, left alone)"
 else
     log "NOTICE: no baked image payload found (looked in /opt/homehub/images,"
     log "  $STACK_DIR/images, /cdrom/deploy-payload/images, /media/deploy-payload/images)."

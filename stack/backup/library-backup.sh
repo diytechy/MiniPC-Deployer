@@ -378,6 +378,16 @@ for _d in "$FB_STATE" "$FB_BACKUP" "$FB_CHANGES" "$FB_LOGS"; do
         log "created bind path $_d"
     fi
 done
+# /state and /logs are on the SYSTEM disk (ext4), where ownership is real and
+# a root-created directory is unwritable to the container — the first lab run
+# died on exactly that ('/logs/Backup_Global.log' Access denied). chown works
+# there and is the fix. The two drive paths are NOT chowned: NTFS/exFAT
+# ownership comes from the mount options alone (Q-FB5) and chown is a no-op
+# or an error there — the write-probe below is what proves those.
+for _d in "$FB_STATE" "$FB_LOGS"; do
+    chown "$FB_UID:$FB_UID" "$_d" \
+        || refuse "cannot chown $_d to uid $FB_UID — the container cannot write its state/logs without it."
+done
 # The wrapper's own log lands beside the container's, now that the directory is
 # known to exist. Everything above this line is journal-only, which is correct:
 # a refusal that could not create a log directory must still be readable.
@@ -425,6 +435,10 @@ probe_write() {
 }
 probe_write "$FB_BACKUP"
 probe_write "$FB_CHANGES"
+# The ext4 pair too: a probe is cheaper than the container failing on its
+# first log line, and it catches a future provisioner re-owning them.
+probe_write "$FB_STATE"
+probe_write "$FB_LOGS"
 
 if [ "$PREFLIGHT_ONLY" = 1 ]; then
     log "--preflight-only: every check passed and NOTHING was started."

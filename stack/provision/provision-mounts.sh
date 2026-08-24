@@ -49,6 +49,14 @@ resolve_mount_spec() {
         /*)           [ -e "$1" ] && printf '%s' "$1" ;;
         *)            : ;;   # none/tmpfs/swap and friends — not a device
     esac
+    # ALWAYS 0: this helper's contract is "print the device, or print nothing".
+    # Absence is reported by EMPTY OUTPUT, never by exit status — but `blkid`
+    # and `readlink -e` both exit non-zero when they find nothing, and that
+    # status was leaking out as the function's own. Under this script's
+    # `set -euo pipefail` that made every caller's plain assignment
+    # (`found="$(resolve_mount_spec …)"`) a script-killer on the absent-drive
+    # path — the same defect as the `|| true` below, one level up.
+    return 0
 }
 
 # wait_for_mount_spec SPEC SECONDS — the same, with a bounded wait.
@@ -141,7 +149,25 @@ while IFS= read -r line || [ -n "$line" ]; do
     # same admission in systemd's language: these are USB drives on the real hub
     # and they enumerate slowly. firstboot runs early enough that udev may still
     # be settling.
-    resolved="$(wait_for_mount_spec "$dev" 20)"
+    # `|| true` IS LOAD-BEARING, and its absence was a silent, total defect
+    # (found on the first real bench install, 2026-08-24). This script runs
+    # under `set -euo pipefail`, and wait_for_mount_spec RETURNS 1 when the
+    # drive never appears — which, in a command-substitution assignment, kills
+    # the script on the spot. So the entire absent-drive path below (the WARN,
+    # the "nofail keeps this from blocking boot" note, the `continue` to the
+    # NEXT fragment line) was unreachable, and the loop died inside its first
+    # iteration.
+    #
+    # THE COST WAS THE SECOND DRIVE. With no drives attached — a bench install,
+    # exactly what the ISO is for — the library line was appended to /etc/fstab
+    # and the backup-drive line NEVER WAS. Attaching both drives later then
+    # mounts the library and silently leaves /mnt/backup-drive absent, with no
+    # fstab entry to explain why and nothing having said a word.
+    #
+    # THE LAB COULD NOT SEE THIS: its VHDX stand-ins are always attached and
+    # labelled, so the wait always succeeded and both lines were always written.
+    # Absent-drive is a bench-install-only path.
+    resolved="$(wait_for_mount_spec "$dev" 20 || true)"
     if [ -z "$resolved" ]; then
         log "WARN: $dev did not appear within 20s — $mnt will stay empty until the drive is attached."
         log "      (nofail keeps this from blocking boot, which is deliberate.)"

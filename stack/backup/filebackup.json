@@ -1,5 +1,5 @@
 {
-  "ConfigVersion": 1,
+  "ConfigVersion": 2,
   "BackupSets": [
     {
       "Name": "library",
@@ -8,8 +8,7 @@
       "BackupPath": "/backup",
       "ChangePath": "/changes",
       "HashRecalcFreq": "W",
-      "CompressEnabled": true,
-      "PreserveFolderTree": true
+      "CompressEnabled": true
     }
   ]
 }

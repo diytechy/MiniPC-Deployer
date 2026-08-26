@@ -86,11 +86,25 @@ autoinstall:
     # `hub` is the ROLE, deliberately not the hardware: AWOW is just the box
     # that happens to run it today.
     username: hub
-    # SSH KEY-ONLY box (WI-10.12): no usable password login. "!" is a locked
-    # hash — the account cannot be logged into with a password at all. Console/
-    # emergency access is via the physical console only. If you MUST allow a
-    # password (not recommended for a headless box) replace this with a real
-    # `mkpasswd --method=SHA-512` hash AND set ssh.allow-pw: true below.
+    # SSH IS STILL KEY-ONLY (WI-10.12) — THIS LINE DOES NOT CHANGE THAT.
+    # `ssh.allow-pw` stays false and sshd carries `passwordauthentication no`,
+    # so a password here grants the PHYSICAL CONSOLE and (where the SR-015
+    # opt-in is installed) LAN xrdp, and nothing remote.
+    #
+    # "!" IS THE TRACKED PLACEHOLDER, NOT WHAT SHIPS. Materialize-Deploy.ps1
+    # replaces this whole line with AUTOINSTALL_PASSWORD_HASH — sha512-crypt,
+    # derived from OperatorPassword in the deploy store. A locked "!" survives
+    # only when the store has no hash, which since 2026-08-26 means someone has
+    # not run PrepDeploySecrets.ps1.
+    #
+    # IT USED TO SHIP LOCKED, and that had a cost nobody had connected: the hub
+    # account had NO console login at all, so a box that lost its network was
+    # recoverable only with `init=/bin/bash` from GRUB (which is exactly how the
+    # 2026-08-06 install was rescued), and the SR-015 xrdp opt-in installed
+    # perfectly and then refused every login, because xrdp authenticates through
+    # PAM against this. B20 called locked "the safer default"; on a box whose
+    # sudo is already passwordless and whose SSH refuses passwords, it mostly
+    # removed a recovery path. The Owner ruled it always-minted 2026-08-26.
     password: "!"
 
   # Remote management is KEY (WI-10.12): SSH on, KEY-ONLY. Paste your PUBLIC key.

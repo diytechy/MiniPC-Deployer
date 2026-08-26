@@ -303,13 +303,13 @@ preflight_mount "$FB_SOURCE" library
 BACKUP_MOUNT="$(mount_of "$FB_BACKUP")"
 [ -n "$BACKUP_MOUNT" ] && [ "$BACKUP_MOUNT" != "/" ] \
     || refuse "the backup destination $FB_BACKUP resolves to the ROOT filesystem ('${BACKUP_MOUNT:-?}') — the backup drive is not mounted." \
-              "Writing there would put the library's mirror and its whole snapshot history on the system disk."
+              "Writing there would put the library's whole backup store and snapshot history on the system disk."
 preflight_mount "$BACKUP_MOUNT" backup-drive
 
 CHANGES_MOUNT="$(mount_of "$FB_CHANGES")"
 [ "$CHANGES_MOUNT" = "$BACKUP_MOUNT" ] \
-    || refuse "the snapshot tree $FB_CHANGES is on '$CHANGES_MOUNT' but the mirror $FB_BACKUP is on '$BACKUP_MOUNT'." \
-              "They must share one filesystem: a snapshot is made by MOVING superseded files out of the mirror, and" \
+    || refuse "the snapshot tree $FB_CHANGES is on '$CHANGES_MOUNT' but the backup store $FB_BACKUP is on '$BACKUP_MOUNT'." \
+              "They must share one filesystem: a snapshot is made by MOVING superseded objects out of the store, and" \
               "a cross-filesystem move is a copy — which would silently double the space every run costs."
 
 # ── 3. CAPACITY PREFLIGHT — the whole of Q-FB2's space burden ─────────────────

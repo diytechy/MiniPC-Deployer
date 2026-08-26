@@ -444,11 +444,16 @@ the data:
    remove it from future ISOs as well, drop `--profile filebackup` from
    `PROFILE_ARGS` in `vmtest/export-images.sh`.
 3. **Reclaim the space by hand.** `rm -rf /mnt/backup-drive/library
-   /mnt/backup-drive/library-changes`. Mirror mode (`PreserveFolderTree: true`,
-   **Q-FB1**) means the backup root is an **ordinary browsable file tree** plus
-   manifests — deleting it needs no tooling and leaves nothing dangling. The
-   manifest cache at `/var/lib/homehub-filebackup/state` and the logs at
+   /mnt/backup-drive/library-changes`. Both trees are self-contained, so deleting
+   them needs no tooling and leaves nothing dangling. The manifest cache at
+   `/var/lib/homehub-filebackup/state` and the logs at
    `/var/log/homehub-filebackup` go the same way.
+
+   > **This deletes the only copy of every state it holds.** Since WP9 the backup
+   > root is content-addressed, not a browsable mirror (Q-FB1 withdrawn
+   > 2026-08-26), so you cannot eyeball what you are about to lose — the file
+   > names are opaque hashes. Take an inventory first:
+   > `docker compose --profile filebackup run --rm -T filebackup snapshots`.
 4. **The bash service is unaffected.** Its sets, its timer, its `backup` lane and
    its retention are all independent of any of the above. What you lose is the
    library coverage, which is what there was before this shipped.
@@ -474,10 +479,18 @@ are recorded here instead:
 - `CompressEnabled: true` (**Q-FB4**). FileBackup's own
   `NonCompressibleExtensions` list already contains the union of both services'
   exemptions, so already-compressed content is skipped for us.
-- `PreserveFolderTree: true` (**Q-FB1**, ruled) — *Mirror*. The backup root is a
-  browsable mirror of the library, which is the strongest available answer to
-  "must the backup be readable without its own tool". Dedup and snapshot-delta
-  storage apply either way.
+- `PreserveFolderTree` — **REMOVED. Do not add it back.** It selected *Mirror*
+  mode (**Q-FB1**, ruled 2026-08-23), which made the backup root a browsable
+  mirror of the library. FileBackup's WP9 deleted Mirror outright: storage is
+  always content-addressed now, and a config still carrying this key is
+  **refused by name** before anything runs. Q-FB1 was withdrawn by the Owner on
+  2026-08-26 — there is no longer a mode to choose.
+
+  **What this changes for recovery:** the backup root is a flat directory of
+  opaque hash-named objects. `ls` tells you nothing and neither does a file
+  manager; the manifest is the index and `reconstruct.sh` is the reader. The
+  restore kit still ships **inside** the backup, so a rescue machine still needs
+  no tooling installed — see "Restoring without the container" below.
 - `AllowEmptySource` is **absent**, and that absence is load-bearing: the default
   is `false`, which refuses to empty a populated backup when the source comes up
   empty — the safety net for a library drive that failed to mount.

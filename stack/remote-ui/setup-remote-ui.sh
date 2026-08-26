@@ -67,9 +67,43 @@ fi
 # xrdp's TLS uses the snakeoil key readable only by group ssl-cert.
 adduser --quiet xrdp ssl-cert || true
 
-# ── 3. enable + start ────────────────────────────────────────────────────────
-systemctl enable --now xrdp
+# ── 3. enable + RESTART ──────────────────────────────────────────────────────
+# RESTART, NOT `enable --now`, AND THAT IS THE WHOLE POINT OF THIS COMMENT.
+# `apt-get install xrdp` starts the service from its postinst — so by the time
+# we get here xrdp is ALREADY RUNNING, `enable --now` is a no-op, and the
+# `adduser xrdp ssl-cert` above has not reached the running process. A process
+# does not gain a group by being added to it; it inherits its groups at exec.
+#
+# The result is a box where everything reports healthy and TLS is quietly dead:
+#
+#   [ERROR] Cannot read private key file /etc/xrdp/key.pem: Permission denied
+#   [WARN ] Cannot accept TLS connections because certificate or private key
+#           file is not readable
+#   [INFO ] Security protocol: configured [RDP], requested [RDP], selected [RDP]
+#
+# AND IT BREAKS THE LOGIN, not just the encryption, which is why this cost an
+# evening. With no TLS the client cannot verify the server, so Windows refuses
+# to hand over a saved credential — mstsc sends the username with an EMPTY
+# password, xrdp passes that to PAM, and the operator gets "Login failed" for a
+# password that is provably correct on both sides. Measured on the bench box
+# 2026-08-26: /proc/<xrdp>/status showed `Groups: 113` while `id xrdp` showed
+# `113(xrdp),112(ssl-cert)`.
+#
+# A reboot would also fix it, which is exactly why it survives a lab run and
+# surfaces on someone's first real connection.
+systemctl enable xrdp
+systemctl restart xrdp
 systemctl is-active --quiet xrdp || die "xrdp failed to start (journalctl -u xrdp)"
+
+# PROVE the group actually took, rather than trusting the restart. This is a
+# one-line check for a failure whose only other symptom is a login that refuses
+# a correct password.
+if ! sudo -u xrdp test -r /etc/ssl/private/ssl-cert-snakeoil.key; then
+    log "WARNING: the xrdp user still cannot read the TLS private key, so this"
+    log "  server will fall back to unencrypted RDP and Windows clients will NOT"
+    log "  send saved credentials (you will get 'Login failed' for a correct"
+    log "  password). Check:  id xrdp   and   ls -l /etc/ssl/private/"
+fi
 log "xrdp active — connect with any RDP client to <LAN_IP>:3389 as $RDP_USER"
 log "LAN-ONLY: never proxy this through Caddy or port-forward 3389 (SN-005/SN-012)"
 

@@ -73,6 +73,53 @@ systemctl is-active --quiet xrdp || die "xrdp failed to start (journalctl -u xrd
 log "xrdp active — connect with any RDP client to <LAN_IP>:3389 as $RDP_USER"
 log "LAN-ONLY: never proxy this through Caddy or port-forward 3389 (SN-005/SN-012)"
 
+# ── 3b. the account password xrdp authenticates against ──────────────────────
+# WITHOUT THIS THE WHOLE LAYER INSTALLS AND THEN REFUSES EVERY LOGIN. `hub` is
+# key-only for SSH, so `password: "!"` from the autoinstall has never been
+# replaced and `passwd -S` reports `L` (locked). xrdp authenticates through PAM
+# against exactly that, so a perfect install lands on a login box that rejects
+# every credential the operator owns and says only "Login failed" — with nothing
+# in any log connecting the two. Measured on the bench box 2026-08-26.
+#
+# THE VALUE IS MINTED ON THE DEV PC, not invented here: RemoteUiPassword
+# (GeneratedPassword) in the DPAPI store, emitted to .env as REMOTE_UI_PASSWORD
+# by Materialize-Deploy.ps1. Same shape as FINANCE_ACTUAL_PASSWORD, which
+# provision-actual.sh consumes the same way.
+#
+# IT IS NOT AN SSH CREDENTIAL. sshd carries `passwordauthentication no`, so this
+# grants the physical console and LAN xrdp and nothing remote.
+#
+# SILENT-SKIP IS DELIBERATE AND LOUD. If REMOTE_UI_PASSWORD is absent the script
+# does NOT invent one — an unpredictable password nobody has recorded is worse
+# than none — it says so and leaves the account as it found it.
+ENV_FILE="${ENV_FILE:-/opt/homehub/stack/.env}"
+if [ -r "$ENV_FILE" ]; then
+    # Read ONLY the one key, and never `source` the file: .env holds every
+    # secret the stack has, and sourcing it into this shell would put all of
+    # them in this process's environment for anything it later execs.
+    REMOTE_UI_PASSWORD="$(sed -n 's/^REMOTE_UI_PASSWORD=//p' "$ENV_FILE" | head -1)"
+else
+    REMOTE_UI_PASSWORD=""
+    log "NOTE: no readable $ENV_FILE — cannot set the RDP password from it"
+fi
+
+if [ -n "$REMOTE_UI_PASSWORD" ]; then
+    # STDIN, never argv: a command line is world-readable in /proc for the
+    # lifetime of the process.
+    printf '%s:%s\n' "$RDP_USER" "$REMOTE_UI_PASSWORD" | chpasswd \
+        || die "chpasswd failed for $RDP_USER"
+    STATE="$(passwd -S "$RDP_USER" 2>/dev/null | awk '{print $2}')"
+    [ "$STATE" = "P" ] || die "password set but passwd -S still reports '$STATE' for $RDP_USER (expected P)"
+    log "password set for $RDP_USER from REMOTE_UI_PASSWORD — xrdp can authenticate it"
+    log "  (SSH is unaffected: sshd refuses password auth. This is console + LAN xrdp only.)"
+else
+    log "WARNING: REMOTE_UI_PASSWORD is not set in $ENV_FILE, so $RDP_USER still has"
+    log "  no usable password and XRDP WILL REFUSE EVERY LOGIN. Nothing here invents"
+    log "  one. Fix: add RemoteUiPassword to the deploy store (PrepDeploySecrets.ps1),"
+    log "  re-materialize .env, and re-run this script — or set it by hand:"
+    log "      sudo passwd $RDP_USER"
+fi
+
 # ── 4. optional: install the IceDrive AppImage + autostart ───────────────────
 if [ -n "${ICEDRIVE_APPIMAGE:-}" ]; then
     [ -f "$ICEDRIVE_APPIMAGE" ] || die "ICEDRIVE_APPIMAGE=$ICEDRIVE_APPIMAGE not found"

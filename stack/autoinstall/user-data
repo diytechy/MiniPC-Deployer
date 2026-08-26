@@ -411,6 +411,35 @@ autoinstall:
     # this account has a locked password, so a box that boots with ssh.service
     # not enabled has no way in, which is the 2026-08-06 failure reproduced by a
     # different road.
+    # ---- 3c-keep. KEEP THE BAKED REPO USABLE AFTER INSTALL DAY ----------------
+    # The repo at /opt/homehub/apt survives the install (183 MB, measured on the
+    # live hub) but nothing referenced it once late-command 3c was done, so it
+    # was inert weight. packages.optional.list bakes the SR-015 opt-in's
+    # packages into it deliberately WITHOUT installing them — and that is only
+    # useful if apt can still see the repo when someone opts in, possibly months
+    # later, possibly on a box with no internet. This is the second half of that
+    # fix (open-items E1(ii)); baking alone leaves a repo nothing can read.
+    #
+    # [trusted=yes] because the debs are unsigned by construction — they were
+    # copied out of a resolver container, not mirrored with their Release
+    # signatures. That is the same trust decision late-command 3c already makes;
+    # the file is root-owned on a LAN-only box and its contents shipped on the
+    # same ISO as the rest of the system.
+    #
+    # IT IS NOT A PRIORITY PIN. An ordinary `apt upgrade` still prefers the
+    # Ubuntu archive when the box is online, because these versions are frozen
+    # at export time and will age. The repo is a FLOOR — what you can still
+    # install with no network — not a source of truth about versions.
+    - >-
+      curtin in-target --target=/target -- bash -c 'set -e;
+      R=/opt/homehub;
+      if [ -s "$R/apt/Packages" ]; then
+      echo "deb [trusted=yes] file://$R/apt ./" > /etc/apt/sources.list.d/homehub-baked.list;
+      echo "homehub: retained the baked repo as an apt source ($(ls "$R"/apt/*.deb 2>/dev/null | wc -l) debs) - the SR-015 opt-in can install with no network";
+      else
+      echo "homehub: no baked repo to retain (nothing to do)";
+      fi'
+
     - curtin in-target --target=/target -- systemctl enable ssh
     # Cockpit web console on :9090 — LAN-only (do NOT proxy it through Caddy to
     # the public internet). See ../../REMOTE_MANAGEMENT.md.

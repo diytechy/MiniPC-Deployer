@@ -1610,6 +1610,22 @@ packages_list_path() {
     esac
 }
 
+# optional_packages_list_path REPO_ROOT hub|wall — the BAKE-BUT-DO-NOT-INSTALL
+# list, or empty when that image has none.
+#
+# Returns a path only if the file EXISTS: this list is optional by design, so a
+# caller can bake it when present and behave exactly as before when it is not.
+# The wall has no opt-in layer today and therefore no such file.
+optional_packages_list_path() {
+    local f
+    case "$2" in
+        hub)  f="$1/stack/autoinstall/packages.optional.list" ;;
+        wall) f="$1/stack/autoinstall/wall/packages.optional.list" ;;
+        *)    die "optional_packages_list_path: target must be hub or wall (got '$2')" ;;
+    esac
+    [ -f "$f" ] && printf '%s' "$f"
+}
+
 # read_packages_list FILE — one package name per line, comments and blanks off.
 #
 # THREE RULES, and they are stated here because four languages implement them:

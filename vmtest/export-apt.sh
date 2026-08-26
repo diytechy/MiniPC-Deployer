@@ -95,6 +95,26 @@ require_cmd docker "Install Docker in WSL, or run this where docker is available
 PKGS="$(read_packages_list "$LIST" | tr '\n' ' ')"
 [ -n "$PKGS" ] || die "no package names could be parsed out of $LIST — refusing to bake an empty repo, which would pass the offline check below vacuously."
 
+# ── 1b. the BAKE-BUT-DO-NOT-INSTALL half (packages.optional.list) ───────────
+# These are resolved and downloaded into the SAME repo, and then deliberately
+# left out of packages.baked.list — which is the only thing late-command 3c
+# installs. So they ride the image without being installed, and the SN-012
+# opt-in that wants them resolves offline instead of needing the archive at the
+# moment it runs (open-items E1(ii)).
+#
+# RESOLVED IN ONE CLOSURE WITH THE BASE LIST, not separately, and that is not a
+# convenience. apt picks versions per invocation; two resolves can choose
+# different versions of a shared dependency, and the second would overwrite the
+# first's deb in a flat repo — leaving a Packages index naming a version that is
+# no longer there. One resolve cannot disagree with itself.
+OPT_LIST="$(optional_packages_list_path "$REPO_ROOT" "$TARGET" || true)"
+OPT_PKGS=""
+if [ -n "$OPT_LIST" ]; then
+    OPT_PKGS="$(read_packages_list "$OPT_LIST" | tr '\n' ' ')"
+    [ -n "$OPT_PKGS" ] || die "$OPT_LIST exists but parses to no package names — delete the file or fix it; a silently-empty optional list is how an offline opt-in stops working with nothing saying so."
+fi
+ALL_PKGS="$PKGS $OPT_PKGS"
+
 # THE DOCKER SOURCE IS DERIVED FROM THE LIST, not from --target. The engine's
 # packages come from download.docker.com rather than the Ubuntu archive, so the
 # resolver container needs that source configured — but which image wants them
@@ -102,9 +122,10 @@ PKGS="$(read_packages_list "$LIST" | tr '\n' ' ')"
 # list that stops asking for Docker stops fetching Docker's key, with nothing
 # here to remember to change.
 NEED_DOCKER_SRC=0
-case " $PKGS " in *" docker-ce "*) NEED_DOCKER_SRC=1 ;; esac
+case " $ALL_PKGS " in *" docker-ce "*) NEED_DOCKER_SRC=1 ;; esac
 
 log "resolving for $TARGET from ${LIST#"$REPO_ROOT"/}: $PKGS"
+[ -n "$OPT_PKGS" ] && log "  + bake-only from ${OPT_LIST#"$REPO_ROOT"/} (downloaded, NOT installed): $OPT_PKGS"
 [ "$NEED_DOCKER_SRC" -eq 1 ] && log "  (the list names docker-ce, so download.docker.com is added to the resolver)"
 
 rm -rf "$OUT"
@@ -140,7 +161,7 @@ docker run --rm -v "$OUT_ABS:/out" ubuntu:24.04 bash -c "
     apt-get install -y --download-only --no-install-recommends \
         -o Dir::Cache::archives=/debs \
         -o Dir::State::status=/dev/null \
-        $PKGS
+        $ALL_PKGS
     cp /debs/*.deb /out/ 2>/dev/null || true
 
     cd /out
@@ -238,6 +259,32 @@ docker run --rm --network none -v "$OUT_ABS:/repo:ro" $STATUS_MOUNT ubuntu:24.04
     apt-get update -qq
     apt-get install -y --no-install-recommends --no-remove --simulate $PKGS >/dev/null
 " || die "the baked repo CANNOT satisfy the package list offline WITHOUT REMOVING SOMETHING. Either a dependency is missing (the install would fail exactly where it failed on 2026-08-06), or resolving this list costs the removal of packages the target already has (defect 31: that is how naming one package deleted the boot path). Re-run without --no-remove to see which, and read any 'Remv' line as a package the install would delete: docker run --rm --network none -v '$OUT_ABS:/repo:ro' ubuntu:24.04 bash -c \"rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; echo 'deb [trusted=yes] file:/repo ./' > /etc/apt/sources.list.d/baked.list; apt-get update -qq; apt-get install -y --no-install-recommends --simulate $PKGS\" . The fix is to NAME the packages apt wants to remove in packages.list, so a matching version is fetched too. Refusing to ship it."
+
+# ── 3b. prove the BAKE-ONLY set resolves offline too ───────────────────────
+# The whole point of packages.optional.list is that the opt-in works on a box
+# with no internet. If that is not proven here it is not proven anywhere: the
+# opt-in runs months later, by hand, on a box that may well be offline, and
+# discovering a hole then means discovering it with no way to fill it.
+#
+# --no-remove for the same reason as above: a resolution that REMOVES something
+# is a valid apt answer and a catastrophic install (defect 31). Simulated
+# against the base list as well, because that is the state the box is actually
+# in when someone opts in — proving it against a bare container would prove the
+# wrong question.
+if [ -n "$OPT_PKGS" ]; then
+    log "verifying the BAKE-ONLY set also resolves with NO network"
+    # shellcheck disable=SC2086
+    docker run --rm --network none -v "$OUT_ABS:/repo:ro" $STATUS_MOUNT ubuntu:24.04 bash -c "
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
+        echo 'deb [trusted=yes] file:/repo ./' > /etc/apt/sources.list.d/baked.list
+        $STATUS_ARG
+        apt-get update -qq
+        apt-get install -y --no-install-recommends --no-remove --simulate $ALL_PKGS >/dev/null
+    " || die "the baked repo cannot satisfy packages.optional.list offline without removing something. The OPT-IN would then need the internet at the moment it runs, which is the thing this file exists to fix (open-items E1(ii)). Name whatever apt wants to remove, re-export, and try again."
+fi
+
 
 # ── 4. record WHICH list this repo was baked from ─────────────────────────
 # The debs are FROZEN at this moment; the names the installer asks for are read

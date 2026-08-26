@@ -1,0 +1,62 @@
+# stack/autoinstall/packages.optional.list — BAKED INTO THE IMAGE, NEVER INSTALLED.
+#
+# THE ONE THING TO UNDERSTAND ABOUT THIS FILE: it is the opposite of
+# packages.list. Everything in packages.list is downloaded AND installed by
+# late-command 3c. Everything HERE is downloaded into the same offline repo and
+# then left alone, so it is sitting on the box the moment someone opts in — with
+# no network, no archive, no CDN.
+#
+# WHY THE SPLIT EXISTS. SN-012 rules that the graphical layer is installed only
+# when the Owner opts in, so these names cannot go in packages.list — that file
+# IS the install list. But the opt-in then needed the internet at the exact
+# moment it ran, because `apt-get install xrdp` had nothing local to resolve
+# against. Measured on the live hub 2026-08-26: the baked repo persists at
+# /opt/homehub/apt (238 debs, 183 MB) and carries none of these, and it was not
+# even registered as an apt source, so it was inert weight after install day.
+#
+# That is open-items E1(ii), which named this exact fix: bake them WITHOUT
+# installing them, and retain the repo as an apt source on the box. Both halves
+# are needed — baking alone leaves a repo nothing can see.
+#
+# So the opt-in is now offline-capable and the posture is unchanged: nothing
+# here is installed until setup-remote-ui.sh is run on purpose.
+#
+# THE COST IS IMAGE SIZE, and that is the whole trade. These pull a minimal X
+# stack; expect the payload to grow by roughly 150-250 MB. If that ever matters
+# more than an offline opt-in, delete this file — export-apt.sh treats it as
+# optional and bakes only packages.list when it is absent.
+#
+# FORMAT: identical to packages.list — one name per line, `#` to end of line,
+# blanks ignored. The same parser reads both (read_packages_list).
+#
+# REBUILD THE BAKED REPO WHEN YOU CHANGE THIS FILE, exactly as for packages.list:
+#   bash vmtest/export-apt.sh --target hub --out .out/apt --src-iso <ubuntu iso>
+# A name added here without a re-export is a name the offline opt-in cannot
+# resolve — and it will fail on the box, not in the build.
+
+# ── the SR-015 opt-in remote UI (SN-012) ────────────────────────────────────
+# This set is NOT retyped from anywhere: it is exactly what
+# stack/remote-ui/setup-remote-ui.sh apt-installs, and the two must agree or the
+# opt-in reaches for the network for whatever is missing. vmtest has a check
+# that diffs them, so drift is a failed build rather than a failed opt-in.
+#
+# --no-install-recommends is what the opt-in uses, and export-apt.sh resolves
+# with the same flag, so the closure baked here is the closure installed there.
+xrdp                  # the RDP server itself
+xorgxrdp              # the Xorg driver xrdp drives; without it sessions are black
+dbus-x11              # dbus-launch — an XFCE session will not come up without it
+
+# A MINIMAL XFCE, NOT A DESKTOP. Deliberately not xubuntu-desktop or
+# xfce4 (the meta-package): the session exists to run one vendor GUI, so it gets
+# a window manager, a panel, a terminal and a file manager and nothing else.
+xfce4-session         # the session manager ~/.xsession starts
+xfwm4                 # window manager
+xfce4-panel           # panel
+xfce4-terminal        # a terminal inside the session
+thunar                # file manager
+
+# The AppImage FUSE shim. Ubuntu 24.04 ships libfuse3; the IceDrive client (the
+# first and so far only reason this layer exists) is an AppImage built against
+# FUSE 2 and exits immediately without it, with a message about libfuse.so.2
+# that reads like a corrupt download.
+libfuse2t64

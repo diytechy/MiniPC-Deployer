@@ -36,25 +36,27 @@ last) — it is the record, not required reading for every pass.
 > the eleven missing runtime libraries. Any ONE of them alone made *"RDP in and
 > sign in to IceDrive"* impossible. Full account: the last audit entry here.
 >
-> **THE IMAGES NOW BOOT AND CONVERGE — the gate PASSED 2026-08-27 afternoon.**
-> `Start-LabRun -Stage All` (triggered unelevated through the JEA endpoint) ran
-> 54 minutes and ended **PASSED, 13 assertions**: both images rebuilt from
-> source, both machines installed **offline**, firstboot green, 16 images
-> loaded, Technitium and the tracker healthy, the panel's kiosk serving and its
-> `403` refusal holding — and the shipped image REFUSED the wrong machine
-> (0 MB written, the disk pin). Three of the night's fixes are proven on a real
-> install: `systemd-sysv`/`libpam-systemd` installed, the AppImage reaching the
-> payload at the right path, and step 6b firing inside the real pipeline for the
-> first time. Full account: the last audit entry.
+> **A FLASHABLE ISO IS READY, AND IT IS NOT THE ONE THE GATE BUILT.**
+> `Z:\vmtest-out-hub-flash\repacked.iso`, 6.1 GiB, built from MiniPC-Deployer
+> `39fab45` / HomeHub `380245d`, **asserted 14/14**, carrying today's FileBackup
+> container and pinned to the real hub's disk serial. The gate's 13:09 ISO
+> predates four fixes made after it (the 22-package install list, `enable` vs
+> `start`, the root-owned `~/.config` that killed the whole session, and the
+> xrdp restart that orphaned it) — all five changes were verified **inside this
+> ISO's payload**, not merely in the working tree.
 >
-> **THE ONE THING IT DID NOT PROVE is the night's headline feature.** The extras
-> were carried and **never exercised**: after build time the words `icedrive`,
-> `xrdp` and `appimage` do not appear again in the run, because
-> `assert-installed.sh` asserts only the CORE package list. Whether firstboot
-> step 6c installs the desktop and starts the AppImage is still unknown — the
-> one run that could have answered it was never asked the question, and
-> `-Stage All` destroyed the box afterwards. **Next: an activation assertion,
-> and `All-Keep` so there is a box left to inspect.**
+> **THE WHOLE FEATURE NOW WORKS, END TO END AND UNATTENDED**, on the lab box:
+> boot → a desktop session with nobody connected → IceDrive autostarts → it
+> authenticates from its stored token with **no 2FA prompt** → restores its sync
+> pair → and a new file is encrypted and uploaded within seconds. The backup path
+> ran for the first time too, and a restore driven by the backup drive's **own**
+> `reconstruct.sh` came back **byte-identical**.
+>
+> **THE ONE THING NEVER DONE: no box has been installed from THIS image.** Every
+> fix above was demonstrated by hand-patching a running VM. `assert-installed.sh`
+> section 5c would catch a regression, but it has only ever run against a
+> repaired box. **Next: `Clear-LabVms` (the VMs hold the hub's DHCP reservation
+> and their gate ISOs open), re-run the gate against this ISO, then flash.**
 >
 > **Two things are flagged for the Owner rather than fixed** (both in HomeHub's
 > `open-items.md`): the wall image gets its version-locked systemd siblings
@@ -5287,3 +5289,51 @@ close **C18**, which is about physical stand-ins and then the real 4 TB + 8 TB
 disks on the real hub — USB enclosures, `hdparm` standby and multi-day runs are
 untouched here. The `drive-power` step even said so on exit: *"device not
 present, skipping"*.
+
+### 2026-08-27 (late) — a flashable ISO that actually contains the day's fixes
+
+The ISO the lab gate built at **13:09** does not contain most of what was fixed
+afterwards, and that mattered enough to rebuild before anything is flashed:
+
+| fix | committed |
+|---|---|
+| install the whole `packages.optional.list`, not a hardcoded nine | 14:48 |
+| `enable` is not `start` for the session unit | 14:48 |
+| `~/.config` owned at every level (the failsafe-session dialog) | 16:05 |
+| xrdp restart made conditional + `After=homehub-firstboot.service` | 16:50 |
+
+**Everything proven on the VM yesterday evening was proven by hand-patching a
+running box.** Flashing the 13:09 image would have reproduced all four defects on
+hardware, where they are far more expensive to diagnose.
+
+**Built:** `Z:\vmtest-out-hub-flash\repacked.iso`, 6.1 GiB, from
+MiniPC-Deployer `39fab45` / HomeHub `380245d`, both clean.
+
+**Asserted 14/14** by step 6b — which now runs because it is wired correctly and
+mandatory: payload root, `.env` activation coherent
+(`REMOTE_UI_ENABLED=true`, `ICEDRIVE_MODE=appimage`), `OPERATOR_PASSWORD` set,
+the AppImage aboard matching its pin with the travelling `.sha256` agreeing, the
+CLI correctly absent, **all 22** bake-only packages in the repo and none
+install-listed, and the systemd lockstep siblings present at matching versions.
+
+**And the fixes were confirmed INSIDE the ISO**, not merely in the working tree —
+`setup-remote-ui.sh` and `homehub-desktop-session.service` extracted straight out
+of `/deploy-payload` and checked for all five changes. That is the distinction
+the 13:09 ISO failed, so it is the one worth making explicitly.
+
+**Carries today's FileBackup container** (`filebackup:local` stamped
+`680136bc35f3`, the `+dirty` being the known WSL CRLF false positive), and the
+image is **pinned to the real hub's disk serial** — it installs on no other
+machine.
+
+**WHAT IS STILL NOT PROVEN, and it is the honest headline.** No box has ever been
+installed from THIS image. The four fixes above were demonstrated by patching a
+running VM; a clean install exercising them through firstboot's step 6c has not
+happened. `vmtest/assert-installed.sh` section 5c is written and would catch a
+regression, but it has only ever run against a hand-repaired box, never against
+one built from this ISO.
+
+**The order that follows from that:** `Clear-LabVms` (the running VMs hold the
+hub's DHCP reservation and their gate ISOs open), re-run the gate against this
+image so the fixes are proven from a clean install, and only then flash. Flashing
+first is defensible but skips the one test that has never been run.

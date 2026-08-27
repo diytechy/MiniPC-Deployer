@@ -46,14 +46,29 @@ ExecStopPost=-/bin/fusermount -u /srv/icedrive
 Restart=on-failure
 RestartSec=120
 
-# The vendor binary gets no more of the box than it needs. FUSE rules out
-# PrivateDevices/ProtectHome, so this is the honest subset rather than a
-# hardening block copied from somewhere it fits better.
-NoNewPrivileges=yes
-ProtectSystem=full
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
+# NO SANDBOXING DIRECTIVES, AND THAT IS THE WHOLE POINT OF THIS COMMENT.
+#
+# An earlier version of this unit carried ProtectSystem=full,
+# ProtectKernelTunables, ProtectControlGroups, NoNewPrivileges and
+# RestrictSUIDSGID. Every one of those makes systemd put the service in its own
+# MOUNT NAMESPACE, and a FUSE mount made inside a private namespace does not
+# propagate out. Measured on the bench box 2026-08-27, and it is the worst
+# possible failure shape:
+#
+#     systemctl is-active homehub-icedrive   ->  active
+#     mount | grep /srv/icedrive             ->  nothing
+#
+# The service is healthy, the app has genuinely mounted, and the mount exists
+# for nobody but the service itself. Nothing anywhere reports a fault. That is
+# exactly the class of green-but-empty failure this project has been bitten by
+# before, so it is written down rather than quietly deleted.
+#
+# NoNewPrivileges is separately wrong here: fusermount is setuid root, and an
+# unprivileged user cannot mount without it.
+#
+# What is left instead of sandboxing is scope: the service runs as an
+# unprivileged account, and the only thing it can reach is that account's own
+# files and its mount point.
 
 [Install]
 WantedBy=multi-user.target

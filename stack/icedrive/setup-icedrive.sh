@@ -26,14 +26,21 @@
 # not a finding for living where the deployment mechanism already puts it.
 # THE ONE CONDITION THAT INVALIDATES IT: a second interactive account.
 #
-# AND IT IS A ONE-TIME EXPOSURE, not a per-boot one - IF the session persists.
-# The app writes ~/.config/Icedrive/Icedrive.conf and the binary carries an
-# `icedrive_stored_cred` key that it encrypts and decrypts itself, so the design
-# intent is plainly "sign in once". THIS IS NOT YET PROVEN, because proving it
-# needs a real account: see README.md, "What one login session would settle".
-# The mount unit therefore carries NO password. If the session does not persist,
-# the unit fails with a message that says exactly that, which is the honest
-# failure rather than a silent per-boot credential on argv.
+# AND IT IS A ONE-TIME EXPOSURE, not a per-boot one. PROVEN on the bench box
+# 2026-08-27: after one `-login`/`-password` run, a second run with NO
+# credentials at all authenticated and mounted. The login writes two keys into
+# ~/.config/Icedrive/Icedrive.conf - `icedrive_login` and `icedrivet` (the
+# token) - and those are what a later run reads.
+#
+# IT IS **NOT** `icedrive_stored_cred`, which is what the first version of this
+# script guarded on, from reading the binary rather than running it. That key
+# belongs to the GUI "save my password" checkbox and is never written here, so
+# the guard reported failure after a login that had provably succeeded - the run
+# mounted the drive and read the account's storage stats. Guarding on a key the
+# app does not use is indistinguishable from the layer being broken.
+#
+# The mount unit therefore carries NO password, and that is now a measured
+# claim rather than a hope.
 #
 # SHIPPED OFF. With ICEDRIVE_USER/ICEDRIVE_PASSWORD absent from .env - the
 # default - this installs the binary and stops. It does not log in, does not
@@ -112,8 +119,19 @@ fi
 # ── 2. the mount point ──────────────────────────────────────────────────────
 # Created here rather than by the service, so a box with no credential still has
 # an obvious, empty, correctly-owned directory rather than a surprise.
-install -d -m 0755 -o "$HUB_USER" -g "$(id -gn "$HUB_USER")" "$MOUNTPOINT"
-log "mount point $MOUNTPOINT ready (owned by $HUB_USER)"
+#
+# ASK WHETHER IT IS ALREADY A MOUNT FIRST, because once the service is up this
+# path is a live FUSE filesystem that ROOT CANNOT TOUCH - and `install -d` on it
+# fails with "cannot change owner and permissions of /srv/icedrive: Permission
+# denied", killing a re-run of an otherwise idempotent script. Measured
+# 2026-08-27: the script provisioned the box, then could not be run again on the
+# box it had just provisioned.
+if findmnt -rn "$MOUNTPOINT" >/dev/null 2>&1; then
+    log "mount point $MOUNTPOINT is already a live mount - leaving it alone"
+else
+    install -d -m 0755 -o "$HUB_USER" -g "$(id -gn "$HUB_USER")" "$MOUNTPOINT"
+    log "mount point $MOUNTPOINT ready (owned by $HUB_USER)"
+fi
 
 # ── 3. the one-time sign-in ─────────────────────────────────────────────────
 # Read ONLY the two keys, and never `source` the file: .env holds every secret
@@ -130,7 +148,12 @@ else
 fi
 
 CONF="$HUB_HOME/.config/Icedrive/Icedrive.conf"
-signed_in() { grep -q "^icedrive_stored_cred=" "$CONF" 2>/dev/null; }
+# BOTH KEYS, because either alone is ambiguous. `icedrive_sessId` is NOT one of
+# them: it is written even after a login that FAILED, so it proves nothing.
+signed_in() {
+    grep -q "^icedrivet=."      "$CONF" 2>/dev/null &&
+    grep -q "^icedrive_login=." "$CONF" 2>/dev/null
+}
 
 if [ -z "$ICEDRIVE_USER" ] || [ -z "$ICEDRIVE_PASSWORD" ]; then
     log "NO CREDENTIAL IN $ENV_FILE - installed the binary and stopped. THIS IS THE"
@@ -145,7 +168,7 @@ if signed_in; then
     # credential is the thing the login exists to produce, so its presence is
     # what makes a second login unnecessary. (firstboot step 1b was killed by
     # exactly the opposite mistake - a guard that asked about its own output.)
-    log "$HUB_USER is already signed in (icedrive_stored_cred present) - not signing in again"
+    log "$HUB_USER is already signed in (session token present) - not signing in again"
 else
     log "signing in as $ICEDRIVE_USER (once; the password is on argv for ~2s - see the header)"
     # `timeout` because a SUCCESSFUL login continues straight into the mount and
@@ -171,24 +194,53 @@ else
 fi
 
 if signed_in; then
-    log "signed in - the credential is stored in $CONF"
+    log "signed in - the session token is stored in $CONF, so later runs need no password"
 else
-    log "WARNING: the login left no stored credential behind."
-    log "  That is the open question this layer has (README.md): if the session"
-    log "  does NOT persist, the mount unit cannot start without a password of"
-    log "  its own, and it deliberately does not carry one. Not enabling it."
+    log "WARNING: the login left no session token behind (no icedrivet/icedrive_login)."
+    log "  The mount unit cannot start without a password of its own, and it"
+    log "  deliberately does not carry one. Not enabling it. Check the app's own"
+    log "  log for the reason:  sudo tail $HUB_HOME/.local/share/Icedrive/logdata.txt"
     log "  Everything else on this box is unaffected."
     exit 1
 fi
 
 # ── 4. the mount unit ───────────────────────────────────────────────────────
 if [ -f "$HERE/homehub-icedrive.service" ]; then
-    install -m0644 -o root -g root "$HERE/homehub-icedrive.service" \
-        /etc/systemd/system/homehub-icedrive.service
+    # SUBSTITUTE THE OPERATOR ACCOUNT rather than shipping `hub` spelled a second
+    # time. See the comment beside User= in the unit. Getting this wrong is not
+    # subtle but it is opaque: systemd fails the unit with 217/USER and the
+    # journal says only "Failed to determine user credentials: No such process",
+    # which names neither the unit's User= line nor the account it wanted.
+    sed "s/__HUB_USER__/$HUB_USER/g" "$HERE/homehub-icedrive.service" \
+        > /etc/systemd/system/homehub-icedrive.service
+    chown root:root /etc/systemd/system/homehub-icedrive.service
+    chmod 0644      /etc/systemd/system/homehub-icedrive.service
+    grep -q "^User=$HUB_USER$" /etc/systemd/system/homehub-icedrive.service \
+        || die "the unit still carries an unsubstituted User= after install"
     systemctl daemon-reload
     systemctl enable --now homehub-icedrive.service || true
-    if systemctl is-active --quiet homehub-icedrive.service; then
-        log "homehub-icedrive.service is active - the cloud is mounted at $MOUNTPOINT"
+    # ACTIVE IS NOT MOUNTED, AND ASKING ONLY systemd IS HOW THIS GOES WRONG.
+    # With any sandboxing directive set, systemd gives the service its own mount
+    # namespace and a FUSE mount made inside it does not propagate out: the unit
+    # reports active, the app has genuinely mounted, and `mount` from anywhere
+    # else on the box shows nothing. Measured 2026-08-27. The unit no longer
+    # carries those directives - and this asks the END STATE anyway, from
+    # outside the service, because that is the only question worth asking.
+    for _ in $(seq 1 10); do
+        findmnt -rn "$MOUNTPOINT" >/dev/null 2>&1 && break
+        sleep 1
+    done
+    if systemctl is-active --quiet homehub-icedrive.service && findmnt -rn "$MOUNTPOINT" >/dev/null 2>&1; then
+        log "homehub-icedrive.service is active AND $MOUNTPOINT is mounted system-wide"
+        log "  ($(runuser -u "$HUB_USER" -- ls -1 "$MOUNTPOINT" 2>/dev/null | wc -l) entries visible to $HUB_USER)"
+        log "  NOTE: root CANNOT read this mount. FUSE grants the mounting user only,"
+        log "    and this binary offers no way to pass -o allow_other. Anything that"
+        log "    needs to write the offsite copy must run as $HUB_USER."
+    elif systemctl is-active --quiet homehub-icedrive.service; then
+        log "WARNING: the unit is ACTIVE but $MOUNTPOINT is NOT mounted system-wide."
+        log "  That is the mount-namespace failure described in the unit file: some"
+        log "  sandboxing directive has come back. Check the unit for ProtectSystem,"
+        log "  ProtectKernelTunables, ProtectControlGroups or NoNewPrivileges."
     else
         log "WARNING: homehub-icedrive.service did not come up. Check:"
         log "    systemctl status homehub-icedrive ; journalctl -u homehub-icedrive"

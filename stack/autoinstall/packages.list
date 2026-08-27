@@ -190,6 +190,55 @@ containerd.io
 docker-buildx-plugin
 docker-compose-plugin
 
+# -- systemd-sysv + libpam-systemd: NAMED, or the upgrade deletes the box -----
+# THIS IS NOT A PACKAGE THE HUB NEEDS INSTALLING - the install base already has
+# it. It is named so that a MATCHING VERSION IS ALWAYS FETCHED into the baked
+# repo, and that is a subtler requirement than it looks.
+#
+# WHY. `systemd-resolved` and `systemd-timesyncd` (above) depend on
+# `systemd (= <exact version>)`, so every bake pulls the archive's CURRENT
+# systemd - today 255.4-1ubuntu8.17, while the 24.04.4 ISO base carries
+# 255.4-1ubuntu8.12. Upgrading systemd obliges apt to upgrade `systemd-sysv` in
+# lockstep, and `init` PRE-depends on `systemd-sysv`. If the repo has the new
+# systemd but not the new systemd-sysv, the offline resolve dies with:
+#
+#     init : PreDepends: systemd-sysv but it is not going to be installed
+#     E: Error, pkgProblemResolver::Resolve generated breaks
+#
+# WHAT MAKES IT WORTH A COMMENT THIS LONG: whether apt downloads systemd-sysv
+# DEPENDS ON WHAT ELSE IS IN THE CLOSURE. Measured 2026-08-27 - baking the core
+# list alone fetched it (238 debs, resolve OK); adding the 22 optional packages
+# to the same closure did NOT (430 debs, resolve BROKEN), with identical systemd
+# versions in both. Nothing about the core list changed; apt simply picked a
+# different plan once it had 195 more packages to choose from.
+#
+# So a dependency that arrives only IMPLICITLY can vanish when an unrelated
+# feature is switched on, and the failure surfaces at image-build time in a
+# message that names neither the feature nor the missing package.
+#
+# libpam-systemd IS THE SAME PROBLEM WITH TEETH. It is version-locked to systemd
+# the same way, it was NOT in the repo, and apt's answer to that is not to fail -
+# it is to REMOVE it. Measured, against the real install base:
+#
+#     Remv libpam-systemd  ->  Remv dbus-user-session, polkitd, packagekit,
+#     modemmanager, software-properties-common, snapd, ubuntu-standard,
+#     ubuntu-server, ubuntu-server-minimal
+#
+# That is defect 31 in one line: naming one package deletes the boot path. The
+# --no-remove guard in export-apt.sh is what stands between that plan and an
+# ISO, and it earned its keep here.
+#
+# THE INVARIANT, stated once so the next person can check it in one command:
+# every package the INSTALL BASE already has that carries a strict
+# `systemd (= <version>)` or `libsystemd-shared (= <version>)` dependency MUST be
+# in the baked repo. On 24.04.4 that set is exactly: libnss-systemd,
+# libpam-systemd, systemd, systemd-resolved, systemd-sysv, systemd-timesyncd.
+# Four arrive via the core list already; these two are the ones that have to be
+# said out loud.
+systemd-sysv
+libpam-systemd
+
+
 # ── NOTHING FOR THE DESKTOP OR ICEDRIVE LIVES HERE ──────────────────────────
 # RULED BY THE OWNER 2026-08-27: this repo ships them OFF. "Deployer I'm okay
 # with as long as it defaults IceDrive and remote desktop to off from its side,

@@ -41,6 +41,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$ISO" ] || { echo "need --iso <path>" >&2; exit 2; }
+# EVERY VALUE THAT IS NOT "hub" USED TO SELECT THE WALL CHECKS, so `--target hubb`
+# quietly ran the five weak assertions against a hub ISO and called it clean. A
+# typo must not be able to downgrade the check it was asked for.
+case "$TARGET" in
+    hub|wall) ;;
+    *) echo "unknown --target '$TARGET' (expected hub or wall)" >&2; exit 2 ;;
+esac
 [ -f "$ISO" ] || { echo "not found: $ISO" >&2; exit 2; }
 command -v xorriso >/dev/null || { echo "xorriso is required" >&2; exit 2; }
 
@@ -77,10 +84,20 @@ if [ "$TARGET" = "hub" ]; then
         ok "deploy-payload/stack/.env is on the ISO"
         REMOTE_UI="$(sed -n 's/^REMOTE_UI_ENABLED=//p' "$ENVF" | head -1 | tr -d '\r')"
         ICE_MODE="$(sed -n 's/^ICEDRIVE_MODE=//p'     "$ENVF" | head -1 | tr -d '\r')"
-        : "${REMOTE_UI:=false}"; : "${ICE_MODE:=off}"
-        echo "        REMOTE_UI_ENABLED=$REMOTE_UI   ICEDRIVE_MODE=$ICE_MODE"
+        # DO NOT DEFAULT A MISSING KNOB. This block used to read
+        #     : "${REMOTE_UI:=false}"; : "${ICE_MODE:=off}"
+        # which turned "the .env never mentioned it" into "the feature is
+        # off" - and a payload carrying neither client then PASSED by
+        # expecting nothing. That is precisely the vacuous green this file
+        # exists to abolish, and it falsified the claim that reading the
+        # payload own .env means the check cannot be handed the wrong
+        # expectation. An absent knob is now a FAILURE.
+        [ -n "$REMOTE_UI" ] || bad "REMOTE_UI_ENABLED is absent from the payload .env - the expected state is unknowable, not off"
+        [ -n "$ICE_MODE" ]  || bad "ICEDRIVE_MODE is absent from the payload .env - the expected state is unknowable, not off"
+        echo "        REMOTE_UI_ENABLED=${REMOTE_UI:-<absent>}   ICEDRIVE_MODE=${ICE_MODE:-<absent>}"
         case "$ICE_MODE" in
             off|appimage|cli) ok "ICEDRIVE_MODE is a known value" ;;
+            "") ;;  # already reported absent above; do not also call it unknown
             *) bad "ICEDRIVE_MODE='$ICE_MODE' is not off/appimage/cli" ;;
         esac
         # THE ONE COMBINATION THAT CANNOT WORK, asserted on the artifact as well
@@ -152,15 +169,37 @@ if [ -s "$BAKED" ]; then
     # THE DISTINCTION THIS FILE EXISTS FOR: a bake-only package must be in the
     # repo and NOT in the install list. Getting that backwards installs a
     # desktop on a headless box.
-    if [ "$TARGET" = "hub" ] && [ "$REMOTE_UI" = "true" ]; then
-        for p in xrdp xfce4-session libxcb-icccm4 libfuse2t64; do
-            if grep -qx "$p" "$BAKED"; then bad "$p is INSTALL-listed — it should be bake-only"
-            elif xorriso -indev "$ISO" -find /deploy-payload/apt -name "${p}_*.deb" 2>/dev/null | grep -q .; then
-                ok "$p: in the repo, not install-listed (bake-only, correct)"
-            else
-                bad "$p: REMOTE_UI_ENABLED=true but its .deb is not in the baked repo"
-            fi
-        done
+    # WHICH NAMES: read the optional list OFF THE ISO, do not hardcode a sample.
+    # This used to spot-check four names out of twenty-two and report a clean
+    # result, so an ISO missing xorgxrdp or dbus-x11 passed with 17/17 - the
+    # count looked exhaustive and was not. The repo is copied into the payload,
+    # so the authoritative list travels with the artifact being judged.
+    #
+    # WHEN: whenever ANY extra is active, not only the remote desktop.
+    # ICEDRIVE_MODE=cli with REMOTE_UI_ENABLED=false is a supported headless
+    # combination, and libfuse2t64 - which the CLI links directly - lives in the
+    # very list that used to go unchecked in exactly that case.
+    OPTL="$TMP/optional"
+    iso_get /deploy-payload/stack/autoinstall/packages.optional.list "$OPTL"
+    if [ "$TARGET" = "hub" ] && { [ "$REMOTE_UI" = "true" ] || { [ -n "$ICE_MODE" ] && [ "$ICE_MODE" != "off" ]; }; }; then
+        if [ -s "$OPTL" ]; then
+            # STRIP INLINE COMMENTS AND TAKE FIELD 1. The list is annotated
+            # ("xrdp   # the RDP server"), so a naive word-split turns prose into
+            # package names and invents dozens of failures.
+            names="$(sed 's/#.*//' "$OPTL" | awk 'NF{print $1}' | tr -d '')"
+            n_opt=0; n_bad=0
+            for p in $names; do
+                n_opt=$((n_opt+1))
+                if grep -qx "$p" "$BAKED"; then
+                    bad "$p is INSTALL-listed - it should be bake-only"; n_bad=$((n_bad+1))
+                elif ! xorriso -indev "$ISO" -find /deploy-payload/apt -name "${p}_*.deb" 2>/dev/null | grep -q .; then
+                    bad "$p: an extra is active but its .deb is not in the baked repo"; n_bad=$((n_bad+1))
+                fi
+            done
+            [ "$n_bad" -eq 0 ] && ok "all $n_opt bake-only packages are in the repo and none is install-listed"
+        else
+            bad "an extra is active but packages.optional.list is not on the ISO - the bake-only set cannot be checked"
+        fi
     fi
     # -- the systemd lockstep invariant --------------------------------------
     # THE INVARIANT IS REPO MEMBERSHIP, NOT INSTALL-LISTING, and the difference
@@ -175,14 +214,33 @@ if [ -s "$BAKED" ]; then
     # apt plan for the missing one is to REMOVE it, and removing libpam-systemd
     # takes snapd, polkitd and ubuntu-server with it.
     PKGIDX="$TMP/Packages"; iso_get /deploy-payload/apt/Packages "$PKGIDX"
-    if [ -s "$PKGIDX" ] && grep -qx "Package: systemd" "$PKGIDX"; then
+    # A MISSING INDEX IS A FAILURE, NOT A CLEAN BILL. This branch used to end in
+    # `ok "the repo carries no systemd upgrade"`, so an ISO that had LOST its
+    # Packages index - the file late-command 3c resolves against - reported the
+    # cascade as impossible and could exit 0. Not being able to look is not the
+    # same as having looked, and that conflation is the whole failure mode this
+    # file was written for.
+    if [ ! -s "$PKGIDX" ]; then
+        bad "deploy-payload/apt/Packages is absent or empty - the offline repo has no index to resolve against, and the systemd lockstep cannot be checked at all"
+    elif grep -qx "Package: systemd" "$PKGIDX"; then
         sysver="$(awk '/^Package: systemd$/{f=1} f&&/^Version: /{print $2; exit}' "$PKGIDX")"
         echo "        repo carries systemd $sysver, so its lockstep siblings must be here too"
         for p in systemd-sysv libpam-systemd libnss-systemd; do
             if grep -qx "Package: $p" "$PKGIDX"; then
                 how="transitively"
                 grep -qx "$p" "$BAKED" && how="named in packages.list"
-                ok "$p is in the baked repo ($how)"
+                # NAME PRESENCE IS NOT ENOUGH: the dependency is `systemd (= exact
+                # version)`, so a sibling pinned at the OLD version satisfies the
+                # grep and still breaks the resolve. Compare the versions, and
+                # confirm a .deb actually backs the index entry.
+                pver="$(awk -v pkg="Package: $p" '$0==pkg{f=1} f&&/^Version: /{print $2; exit}' "$PKGIDX")"
+                if [ "$pver" != "$sysver" ]; then
+                    bad "$p is in the repo at $pver but systemd is $sysver - a strict-versioned sibling at the wrong version breaks the resolve exactly as an absent one does"
+                elif ! xorriso -indev "$ISO" -find /deploy-payload/apt -name "${p}_*.deb" 2>/dev/null | grep -q .; then
+                    bad "$p is listed in Packages at $pver but no .deb for it is on the ISO"
+                else
+                    ok "$p is in the baked repo at $pver ($how)"
+                fi
             else
                 bad "$p is MISSING from a repo that upgrades systemd - the offline resolve will plan to REMOVE it"
             fi

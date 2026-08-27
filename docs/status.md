@@ -20,14 +20,14 @@ last) — it is the record, not required reading for every pass.
 >
 > | | ISO | payload assertions |
 > |---|---|---|
-> | hub  | `vmtest/.out/repacked.iso` — 6.13 GiB | **17 / 17** |
+> | hub  | `vmtest/.out/repacked.iso` — 6.13 GiB | **14 / 14** |
 > | wall | `vmtest/.out-wall/wall-repacked.iso` — 3.41 GiB | **5 / 5** |
 >
 > The wall build is notable on its own: **no production wall ISO had ever been
 > built before**, and it built clean on the shared code. On the hub ISO the
 > IceDrive AppImage is present, its sha256 matches the pin, the travelling
-> `.sha256` beside it agrees, the CLI is absent (one client only), and the 22
-> optional packages are in the repo and **not** install-listed. The wall's five
+> `.sha256` beside it agrees, the CLI is absent (one client only), and **all 22**
+> bake-only packages are in the repo and none is install-listed. The wall's five
 > are the payload root plus repo membership — IceDrive is a hub-only concern and
 > the wall run does not assert on it.
 >
@@ -215,7 +215,7 @@ last) — it is the record, not required reading for every pass.
       all three ratified guards held (403 to a non-panel, a forged
       `X-Forwarded-User` replaced — including when sent twice — and `WALL_PORT`
       bound to the LAN leg only). Capture:
-      `D:mtest-out-wall-a19\panel-a19-GATE.png`. **It closes OI-17 and OI-21
+      `D:\vmtest-out-wall-a19\panel-a19-GATE.png`. **It closes OI-17 and OI-21
       as well — but NOT OI-19, OI-20 or the hostname fix, which need a
       PRODUCTION build and are therefore blocked on C17.** See the 2026-08-05
       audit entry, which corrects an earlier claim that one install would close
@@ -4791,7 +4791,7 @@ log that reported success at every step.
 
 | | ISO | assertions |
 |---|---|---|
-| hub  | `vmtest/.out/repacked.iso` — 6.13 GiB | **17 / 17** |
+| hub  | `vmtest/.out/repacked.iso` — 6.13 GiB | **14 / 14** |
 | wall | `vmtest/.out-wall/wall-repacked.iso` — 3.41 GiB | **5 / 5** |
 
 **The wall ISO had never been built in production form before.** It built clean
@@ -4874,7 +4874,7 @@ here.
 
 **Verified first-hand tonight (re-run independently of the build):**
 
-- `assert-iso-payload.sh` against both finished ISOs: **hub 17/17, wall 5/5**,
+- `assert-iso-payload.sh` against both finished ISOs: **hub 14/14, wall 5/5**,
   exit 0 both times, run under `wsl -d Ubuntu`.
 - `BAKE_OPTIONAL=1` bakes 432 debs (262 M) and **both** offline proofs pass —
   the core list and, for the first time, the bake-only optional set.
@@ -4885,7 +4885,7 @@ never have fired.** The committed file carried a literal **BEL byte (0x07)**
 where `\a` had been intended, so the guard read
 `Join-Path $DeployerRepo 'vmtest<BEL>ssert-iso-payload.sh'`; `Test-Path` was
 always false and the step silently took its else-branch, printing a note that
-the ISO is not verified. The 17/17 and 5/5 above came from running the script by
+the ISO is not verified. The counts above came from running the script by
 hand — **the wiring had never executed.** Exactly the failure mode the whole
 day was about: a guard that reports success by not running. Fixed in HomeHub
 (two lines); `Test-Path` now resolves True and the file still parses clean.
@@ -4898,3 +4898,71 @@ gap and the one an agent cannot run here.
 
 **Also still not proven:** IceDrive has **zero test cases** at any tier, the
 largest single coverage gap in HomeHub's app table.
+
+### 2026-08-27 (night, later) — an adversarial review of the new guard, and what it broke
+
+The ISO checker written earlier this night was put through an adversarial review
+(OpenAI `gpt-5.6-sol`, medium effort, read-only) with one instruction: refute,
+do not praise. It landed. **A guard written to abolish vacuous green had four
+vacuous-green paths of its own**, and the checker's own caller treated it as
+optional.
+
+**Findings acted on, in severity order:**
+
+1. **The production build treated the checker as optional.** `$needed`
+   (preflight) never listed `assert-iso-payload.sh`, and step 6b's else-branch
+   printed a note and carried on. So a deployer checkout without the script
+   built an ISO, skipped verification entirely, and step 7 copied it to the
+   stick — **the same skip-quietly shape as the BEL byte fixed an hour
+   earlier, one level up.** The file is now named in preflight (the run stops
+   before building) and an absent checker **throws**.
+2. **A supported configuration shipped a client that could not work.**
+   `ICEDRIVE_MODE='cli'` with `REMOTE_UI_ENABLED='false'` is a shape
+   `Materialize-Deploy` offers by name, but `BAKE_OPTIONAL` was derived from
+   `REMOTE_UI_ENABLED` alone — and `libfuse2t64`, which the CLI links directly
+   for its mount, lives in `packages.optional.list`. That combination baked no
+   optional set at all. Carriage now follows **any** active extra.
+3. **A missing activation knob was read as "the feature is off."**
+   `: "${ICE_MODE:=off}"` turned "the .env never said" into "off", so a payload
+   carrying neither client passed by expecting nothing — which **falsified this
+   file's own claim** that reading the payload's `.env` means the check cannot
+   be handed the wrong expectation. An absent knob is now a failure.
+4. **A missing apt index was reported as proof no systemd upgrade existed.**
+   If `Packages` could not be extracted, the script emitted
+   `PASS the repo carries no systemd upgrade` — not being able to look, scored
+   as having looked. Now a failure.
+5. **The lockstep check compared names, not versions.** The dependency is
+   `systemd (= exact version)`, so a sibling pinned at the *old* version
+   satisfied `grep -qx` and still breaks the resolve. Versions are now compared
+   against systemd's, and a `.deb` must back the index entry.
+6. **`--target` accepted any string**, and everything that was not exactly `hub`
+   selected the weaker wall checks — so `--target hubb` ran five assertions
+   against a hub ISO and called it clean. Now validated.
+7. **"The bake-only packages are present" was a four-name spot check** out of
+   twenty-two, reported as `17/17`. The count read as exhaustive and was not.
+   The checker now reads `packages.optional.list` **off the ISO** — the repo is
+   copied into the payload, so the authoritative list travels with the artifact
+   being judged — and checks **all 22**.
+
+**Two claims the review made that did NOT survive checking**, recorded because
+the checking is the point: it reported another mangled-backslash byte in this
+file (true — fixed) but characterised the exit-code path as sound *and* the
+docs as claiming more than the code did. On the first it was right and I had
+briefly doubted it: a nested-quoting artifact in my own test harness made the
+script look like it exited 0 on 65 failures. Measured through the process exit
+code instead, it returns **65**, and `Invoke-Wsl` throws on it. The guard was
+never broken; my measurement was.
+
+**Verified after every change** (re-run against the same two finished ISOs):
+
+- hub **14 / 14**, wall **5 / 5**, both exit 0; a typo target is rejected with
+  exit 2. The hub count fell from 17 to 14 because four per-package lines
+  collapsed into one aggregate — **coverage rose from 4 packages to 22** and
+  gained version comparison.
+- `bash -n` clean; `Build-VentoyStick.ps1` parses clean.
+
+**The honest scorecard:** of the nine findings, seven were real defects in code
+written the same night, one was a real stale byte, and one was a doc/code
+mismatch that the fixes themselves resolved. The lesson is not subtle — the
+guard against unverified artifacts was itself unverified, and it took an
+adversary to say so.

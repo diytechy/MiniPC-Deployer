@@ -75,7 +75,10 @@ die() { log "FATAL: $*"; exit 1; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 STACK_DIR="${STACK_DIR:-/opt/homehub/stack}"
 ENV_FILE="${ENV_FILE:-$STACK_DIR/.env}"
-MOUNTPOINT="${ICEDRIVE_MOUNTPOINT:-/srv/icedrive}"
+# Read from .env like every other knob, so the mount point the box uses and the
+# one HomeHub declared cannot disagree. The env var still wins for a hand-run.
+MOUNTPOINT="${ICEDRIVE_MOUNTPOINT:-$(sed -n 's/^ICEDRIVE_MOUNTPOINT=//p' "$ENV_FILE" 2>/dev/null | head -1 | tr -d '\r')}"
+MOUNTPOINT="${MOUNTPOINT:-/srv/icedrive}"
 DEST=/opt/icedrive/icedrive
 
 # The operator account by UID, not by the name `hub` spelled again here. The

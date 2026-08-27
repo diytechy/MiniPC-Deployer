@@ -1079,42 +1079,92 @@ for _t in homehub-backup.timer homehub-library-backup.timer; do
     fi
 done
 
-# ── 6c. IceDrive, headless (the graphical session is GONE) ───────────────────
-# RULED BY THE OWNER 2026-08-27: "GUI can be removed... from the image and from
-# the box, along with the auto-desktop startup." This step used to install an
-# xrdp/XFCE session and an AppImage that autostarted inside it, plus a unit that
-# logged a session in at boot so that app would run with nobody connected.
+# ── 6c. the two OPTIONAL FEATURES: remote desktop, and IceDrive ─────────────
+# ACTIVATED BY .env, CARRIED BY THE BUILD, AND NEITHER DECIDED HERE. This repo
+# ships both OFF (the Owner, 2026-08-27); HomeHub's config.homehub.psd1 `Extras`
+# block turns them on, and the SAME declaration decides what the image carries.
 #
-# ALL OF THAT EXISTED FOR ONE APP, AND THE APP NEVER NEEDED IT. IcedriveCLI is a
-# headless native ELF - no X, non-interactive login, FUSE mount. The premise
-# ("the client is GUI-only") was inherited and repeated for a month without ever
-# being checked, in a project whose rules say to measure. It was measured on
-# 2026-08-27 and it was false: stack/icedrive/README.md.
+# WHY THE TWO HALVES ARE TIED TOGETHER AT SOURCE. They used to be independent,
+# and they silently disagreed for a month: every version of this project told
+# operators to "RDP in and sign in to IceDrive" while ELEVEN of the AppImage's
+# runtime libraries were in no image at all - so the instruction could not have
+# been followed on any hub this repo ever built. Nothing noticed, because
+# nothing had ever launched the thing. Materialize-Deploy now refuses to emit an
+# activation whose carriage is absent; this step's job is only to obey.
 #
-# The graphical layer is not deleted, it is DE-INSTALLED: the nine packages moved
-# to packages.optional.list, so they are baked into the offline repo and
-# setup-remote-ui.sh (or HomeHub's HomeHubDesktop.cmd) can still turn a desktop
-# on later, on a box with no internet. Nothing here starts one.
-#
-# NON-FATAL BY DESIGN, unchanged. A hub with no offsite client is degraded, not
-# broken: the stack, the shares, the local backups and SSH are all unaffected. So
-# this logs loudly and carries on rather than failing the unit, which is reserved
-# for things that make the box wrong rather than incomplete.
-#
-# AND IT IS A NO-OP ON THE SHIPPED DEFAULT. With no IcedriveCredential in the
-# deploy store, .env carries no ICEDRIVE_USER/ICEDRIVE_PASSWORD, so the script
-# installs the binary and stops: no sign-in, no mount, no unit enabled.
-log "provisioning IceDrive (headless CLI)..."
-if [ -x "$STACK_DIR/icedrive/setup-icedrive.sh" ] || [ -f "$STACK_DIR/icedrive/setup-icedrive.sh" ]; then
-    if bash "$STACK_DIR/icedrive/setup-icedrive.sh" 2>&1 | sed 's/^/  /'; then
-        log "  IceDrive step complete (see the lines above for what it actually did)"
+# NON-FATAL BY DESIGN. A hub with no desktop and no offsite client is degraded,
+# not broken: the stack, the shares, the local backups and SSH are unaffected.
+# So this logs loudly and carries on rather than failing the unit, which is
+# reserved for things that make the box wrong rather than incomplete.
+_env_val() { sed -n "s/^$1=//p" "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d ''; }
+REMOTE_UI_ENABLED="$(_env_val REMOTE_UI_ENABLED)"
+ICEDRIVE_MODE="$(_env_val ICEDRIVE_MODE)"
+: "${ICEDRIVE_MODE:=off}"
+
+# THE ONE COMBINATION THAT CANNOT WORK, refused here as well as in
+# Materialize-Deploy: the AppImage is a GUI app and has no display without the
+# session. Belt and braces on purpose - this file is also reached by a payload
+# edited by hand, which no dev-PC gate can see.
+if [ "$ICEDRIVE_MODE" = "appimage" ] && [ "$REMOTE_UI_ENABLED" != "true" ]; then
+    log "WARNING: ICEDRIVE_MODE=appimage needs REMOTE_UI_ENABLED=true - the GUI client"
+    log "  cannot run without a display. Treating IceDrive as OFF for this boot."
+    ICEDRIVE_MODE=off
+fi
+
+if [ "$REMOTE_UI_ENABLED" = "true" ]; then
+    log "provisioning the graphical session (SR-015, activated by .env)…"
+    HUB_USER="$(getent passwd 1000 | cut -d: -f1)"
+    [ -n "$HUB_USER" ] || HUB_USER="hub"
+    _rui_env=""
+    if [ "$ICEDRIVE_MODE" = "appimage" ]; then
+        ICEDRIVE_SRC="$STACK_DIR/remote-ui/Icedrive.AppImage"
+        if [ -f "$ICEDRIVE_SRC" ] && [ -f "$ICEDRIVE_SRC.sha256" ]; then
+            # RE-CHECK THE HASH ON THE BOX. An ISO can be re-burned and a payload
+            # can be edited; "we verified it at build time" is not the same claim
+            # as "these bytes are pinned".
+            _want="$(tr -d '[:space:]' < "$ICEDRIVE_SRC.sha256")"
+            _got="$(sha256sum "$ICEDRIVE_SRC" | cut -d' ' -f1)"
+            if [ "$_want" = "$_got" ]; then
+                _rui_env="ICEDRIVE_APPIMAGE=$ICEDRIVE_SRC"
+                log "  IceDrive AppImage present and matches its pinned sha256"
+            else
+                log "  WARNING: the AppImage does NOT match its pin - session only."
+                log "    pinned=$_want actual=$_got"
+            fi
+        else
+            log "  WARNING: ICEDRIVE_MODE=appimage but no verified AppImage rode the"
+            log "    payload. Installing the session without it. This is the carriage/"
+            log "    activation split that Materialize-Deploy exists to prevent."
+        fi
+    fi
+    if runuser -u "$HUB_USER" -- sudo -n env $_rui_env bash "$STACK_DIR/remote-ui/setup-remote-ui.sh" 2>&1 | sed 's/^/  /'; then
+        log "  graphical session ready - RDP to this box on :3389 as $HUB_USER"
+        [ -n "$_rui_env" ] && log "  IceDrive autostarts in that session; sign in once over RDP."
     else
-        log "  WARNING: setup-icedrive.sh failed - this box has NO offsite client."
-        log "    Everything else is unaffected. Re-run by hand once fixed:"
-        log "      sudo bash $STACK_DIR/icedrive/setup-icedrive.sh"
+        log "  WARNING: setup-remote-ui.sh failed - the box has NO graphical session."
+        log "    Everything else is unaffected. Re-run by hand:"
+        log "      sudo bash $STACK_DIR/remote-ui/setup-remote-ui.sh"
     fi
 else
-    log "  no $STACK_DIR/icedrive/setup-icedrive.sh on the payload - skipping"
+    log "REMOTE_UI_ENABLED is not true - no desktop, no xrdp, nothing on tcp/3389."
+fi
+
+if [ "$ICEDRIVE_MODE" = "cli" ]; then
+    log "provisioning IceDrive (headless CLI, activated by .env)…"
+    if [ -f "$STACK_DIR/icedrive/setup-icedrive.sh" ]; then
+        if bash "$STACK_DIR/icedrive/setup-icedrive.sh" 2>&1 | sed 's/^/  /'; then
+            log "  IceDrive CLI step complete (see the lines above for what it did)"
+        else
+            log "  WARNING: setup-icedrive.sh failed - this box has NO offsite client."
+            log "    Everything else is unaffected. Re-run by hand once fixed:"
+            log "      sudo bash $STACK_DIR/icedrive/setup-icedrive.sh"
+        fi
+    else
+        log "  WARNING: ICEDRIVE_MODE=cli but no $STACK_DIR/icedrive/setup-icedrive.sh"
+        log "    on the payload - carriage missing for an activated feature."
+    fi
+elif [ "$ICEDRIVE_MODE" = "off" ]; then
+    log "ICEDRIVE_MODE=off - no IceDrive client of either kind on this box."
 fi
 
 # ── 7. done ──────────────────────────────────────────────────────────────────

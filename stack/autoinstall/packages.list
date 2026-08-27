@@ -190,68 +190,25 @@ containerd.io
 docker-buildx-plugin
 docker-compose-plugin
 
-# ── the IceDrive GUI AppImage's RUNTIME DEPENDENCIES ────────────────────────
-# THE APPIMAGE COULD NEVER HAVE RUN ON A STOCK HUB, and nobody had found out
-# because it had never been launched on one. Measured on the bench box
-# 2026-08-27 by installing it and following the failures one at a time:
+# ── NOTHING FOR THE DESKTOP OR ICEDRIVE LIVES HERE ──────────────────────────
+# RULED BY THE OWNER 2026-08-27: this repo ships them OFF. "Deployer I'm okay
+# with as long as it defaults IceDrive and remote desktop to off from its side,
+# and gets configured to active from the HomeHub."
 #
-#   libwebpmux.so.3      -> the binary aborts before Qt starts
-#   libwebpdemux.so.2       "
-#   libXss.so.1             "
-#   libxcb-icccm.so.4    -> "Could not load the Qt platform plugin xcb ...
-#   libxcb-image.so.0        even though it was found", then a core dump.
-#   libxcb-keysyms.so.1      Eight more, one per launch, each hidden behind
-#   libxcb-render-util.so.0  the one in front of it.
-#   libxcb-shape.so.0
-#   libxcb-xinerama.so.0
-#   libxcb-xkb.so.1
-#   libxkbcommon-x11.so.0
+# So the twenty-one names those two features need are in packages.optional.list,
+# which is BAKED ONLY WHEN ASKED (export-apt.sh, BAKE_OPTIONAL=1) and installed
+# by nothing. A hub built straight from this repo has no X, no RDP, no FUSE shim
+# and no IceDrive, and firstboot activates none of it.
 #
-# The AppImage bundles Qt but NOT the system libraries Qt's xcb platform plugin
-# links against, and the failure names a plugin rather than a package - so it
-# reads like a corrupt download rather than a missing dependency.
+# TURNING THEM ON IS HOMEHUB'S JOB, in one place: the `Extras` block in
+# scripts/deploy/config.homehub.psd1. That single declaration drives BOTH halves
+# - what the build carries onto the USB, and what firstboot activates through
+# REMOTE_UI_ENABLED / ICEDRIVE_MODE in .env. Splitting those two decisions is
+# what let the AppImage be "installed" for a month while eleven of its runtime
+# libraries were missing from every image.
 #
-# THIS IS THE SAME CLASS THE WALL IMAGE ALREADY GUARDS: validate_config.py
-# checks "every Electron runtime package is in the wall image (27 sonames ->
-# 23 packages)". The hub had no equivalent check for its one AppImage, which is
-# why an untested claim survived. Adding one is open work.
-libwebpmux3
-libwebpdemux2
-libxss1
-libxcb-icccm4
-libxcb-image0
-libxcb-keysyms1
-libxcb-render-util0
-libxcb-shape0
-libxcb-xinerama0
-libxcb-xkb1
-libxkbcommon-x11-0
+# libfuse2t64 IS IN THAT OPTIONAL SET TOO, and it is the one people put back
+# here by reflex. Both IceDrive builds need libfuse.so.2 - the AppImage as its
+# own shim, the CLI for its mount - and neither is present by default, so
+# neither is it.
 
-# ── the FUSE 2 shim, for the IceDrive CLI ───────────────────────────────────
-# Ubuntu 24.04 ships libfuse3; IcedriveCLI is a native ELF linked against
-# libfuse.so.2 and will not start without this. Measured 2026-08-27: `ldd` on
-# the CLI reports `libfuse.so.2 => not found` on a stock 24.04 and resolves
-# once this package is present.
-#
-# THIS USED TO BE HERE FOR THE APPIMAGE, and the AppImage is gone (see below).
-# It stays because the CLI — the thing that replaced it — needs the same shim
-# for its FUSE mount. Do not remove it with the rest of the graphical set.
-libfuse2t64
-
-# ── the graphical session (SR-015) IS NOT INSTALLED — see packages.optional.list
-# RULED BY THE OWNER 2026-08-27: remove the GUI from the image and from the box,
-# along with the boot-time desktop session. The nine names that used to be
-# listed here moved to packages.optional.list, which bakes them into the offline
-# repo WITHOUT installing them — so `HomeHubDesktop.cmd` can still turn a desktop
-# on later, on a box with no internet, and nothing here starts one.
-#
-# WHY IT WENT. The layer existed for exactly one app: IceDrive, believed to be
-# GUI-only. It is not — `IcedriveCLI` is a headless native ELF that logs in
-# non-interactively and FUSE-mounts the cloud with no X server at all (measured
-# 2026-08-27; see stack/icedrive/README.md). With its only tenant gone, an
-# always-listening tcp/3389, an XFCE session and an unattended auto-login
-# session were cost without a purpose.
-#
-# This supersedes the 2026-08-26 ruling that defaulted the layer ON, and
-# restores SN-012's shape — an opt-in nobody has turned on — with SN-001's
-# zero-click core no longer carrying any exception at all.

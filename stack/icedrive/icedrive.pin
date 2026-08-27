@@ -1,50 +1,60 @@
-# stack/icedrive/icedrive.pin — WHICH IceDrive binary this image ships.
+# stack/icedrive/icedrive.pin — WHICH IceDrive binaries this image may carry.
 #
-# THIS PINS THE CLI, NOT THE APPIMAGE (changed 2026-08-27). The 118 MB
-# `IcedriveMounted-*.AppImage` is the GUI client and is no longer shipped or
-# wanted: the graphical layer it needed was removed from the image the same day.
-# `IcedriveCLI` is a 9.8 MB native ELF that does the same job headlessly.
+# TWO ARTIFACTS, TWO PINS, because there are two clients and they are not
+# interchangeable:
 #
-# THE BINARY IS NOT IN THIS REPO AND IS NOT FETCHED BY THE BUILD. It is supplied
-# ONCE by the operator, verified against the SHA256 below, and cached. Every
-# build after that is reproducible and needs no network and no vendor at all.
+#   APPIMAGE_*  the 118 MB GUI client. Needs a display, so it needs the SR-015
+#               graphical session. Its credential is typed into its own GUI over
+#               RDP and cannot be handed to it from here. This is the direction
+#               the Owner chose on 2026-08-27.
+#   CLI_*       the 9.8 MB headless native ELF. No X at all, non-interactive
+#               login, FUSE mount. Proven working on the bench box, but it is a
+#               MOUNT client and not a SYNC client — see README.md before
+#               choosing it.
 #
-# WHY NOT FETCH IT AT BUILD TIME: icedrive.net is behind Cloudflare and answers
-# 403 to anything that is not a browser. That applies to the CLI installer too —
-# `https://icedrive.net/download/linux/cli/install.sh` returns 403 and a
-# `<title>Just a moment...</title>` challenge page, so the one-liner the vendor
-# and every forum post quotes,
+# WHICH ONE RIDES THE USB IS NOT DECIDED HERE. HomeHub's config.homehub.psd1
+# `Extras.IceDrive` picks `off` / `appimage` / `cli`, and that one declaration
+# drives both the carriage (which artifact export-icedrive.sh stages) and the
+# activation (ICEDRIVE_MODE in .env). A pin with no matching Extras entry is
+# simply unused; an Extras entry with no matching pin is REFUSED by
+# Materialize-Deploy, because activation without carriage is an instruction
+# nobody can follow.
+#
+# NEITHER BINARY IS IN THIS REPO AND NEITHER IS FETCHED BY THE BUILD.
+# icedrive.net is behind Cloudflare and answers 403 to anything that is not a
+# browser — including for the CLI installer, so the widely-quoted
 #     curl -s https://icedrive.net/download/linux/cli/install.sh | bash
-# PIPES AN HTML CHALLENGE PAGE INTO BASH. Do not use it. Measured 2026-08-26
-# and re-confirmed 2026-08-27.
+# PIPES AN HTML CHALLENGE PAGE INTO BASH. Do not use it. Each file is supplied
+# once by the operator, verified against the SHA256 below, and cached, so every
+# build after that is reproducible and needs no vendor at all.
 #
-# WHY NOT COMMIT THE BINARY: ~10 MB of git history per version bump, forever,
-# for a vendor artifact this project does not own. (Less painful than the
-# AppImage's ~100 MB, but the same argument.)
+# WHY NOT COMMIT THEM: ~118 MB of git history per version bump, forever, for
+# vendor artifacts this project does not own.
 #
-# HOW TO SET OR BUMP THIS:
-#   1. Download the Linux CLI from icedrive.net in a browser.
-#   2. bash vmtest/export-icedrive.sh --print-hash --from ~/Downloads/IcedriveCLI-v3.62
-#   3. Put the version and that hash below.
-#   4. bash vmtest/export-icedrive.sh --out vmtest/.out/icedrive --from <file>
-#      It verifies the hash, caches the file, and stages it into the payload.
-#      Later builds reuse the cache; --from is only needed again when this
-#      file changes.
+# HOW TO SET OR BUMP EITHER:
+#   1. Download it from icedrive.net in a browser.
+#   2. bash vmtest/export-icedrive.sh --print-hash --from ~/Downloads/<file>
+#   3. Put the version and that hash below, in the matching pair.
+#   4. bash vmtest/export-icedrive.sh --out vmtest/.out/icedrive \
+#          --artifact appimage --from ~/Downloads/<file>
+#      It verifies, caches and stages it. Later builds reuse the cache.
 #
-# UNSET IS A VALID STATE: the ISO carries no IceDrive at all and firstboot says
-# so. export-icedrive.sh reports it rather than failing.
+# AN UNSET PAIR IS A VALID, SHIPPED STATE: that artifact is simply not carried.
+# Both unset is this repo's default posture — the deployer ships IceDrive OFF.
 #
 # FORMAT: KEY=VALUE, one per line. `#` starts a comment. Blank lines ignored.
 
-# The vendor's version string, for the record. Informational — nothing keys off
-# it; the SHA256 is the identity.
-VERSION=3.62
+# ── the GUI client (Icedrive Mount & Sync, AppImage) ────────────────────────
+# Version strings are informational; the SHA256 is the identity.
+APPIMAGE_VERSION=3.62
+APPIMAGE_SHA256=091d7ec7fab8e230f4714558b4a5953cddb7d418144b3b0c869a002e0c496194
 
-# The SHA256 of the CLI binary. THIS is what makes a build reproducible.
-# Measured on the operator's downloaded copy, 2026-08-27.
-SHA256=341eccb27046452bcfc63a081d605a933e583a3db4757e8c98647921d0cb68b3
+# ── the headless CLI ────────────────────────────────────────────────────────
+CLI_VERSION=3.62
+CLI_SHA256=341eccb27046452bcfc63a081d605a933e583a3db4757e8c98647921d0cb68b3
 
-# Optional. If the vendor ever serves a direct, non-Cloudflared URL, put it here
-# and export-icedrive.sh will try it before asking for --from. Left empty
-# because no such URL exists today (see the 403 note above).
-URL=
+# Optional, per artifact. If the vendor ever serves a direct, non-Cloudflared
+# URL, put it here and export-icedrive.sh will try it before asking for --from.
+# Left empty because no such URL exists today (see the 403 note above).
+APPIMAGE_URL=
+CLI_URL=

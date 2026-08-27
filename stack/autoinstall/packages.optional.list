@@ -1,28 +1,26 @@
-# packages.optional.list — BAKED INTO THE OFFLINE REPO, NEVER INSTALLED.
+# packages.optional.list - BAKED ONLY WHEN ASKED, INSTALLED BY NOTHING.
 #
 # WHAT THIS FILE IS. export-apt.sh resolves these names into the same baked repo
-# as packages.list, in ONE closure with it (two resolves can pick different
-# versions of a shared dependency, and the second would overwrite the first's
-# deb in a flat repo). Late-command 3c installs ONLY packages.baked.list, so
-# nothing here is ever installed by an image. Late-command 3c-keep leaves
-# /opt/homehub/apt registered as a `[trusted=yes]` apt source on the target, so
-# these remain installable months later on a box that has never had internet.
+# as packages.list - but ONLY when BAKE_OPTIONAL=1, which this repo never sets.
+# They are resolved in ONE closure with the core list, because two resolves can
+# pick different versions of a shared dependency and the second would overwrite
+# the first's deb in a flat repo. Late-command 3c installs only
+# packages.baked.list, so nothing here is ever installed by an image, and
+# late-command 3c-keep leaves /opt/homehub/apt registered as a `[trusted=yes]`
+# apt source so these stay installable months later on a box that has never had
+# internet.
 #
-# WHY THE SET BELOW IS HERE. The graphical session (SR-015) was removed from the
-# image on 2026-08-27 (the Owner: "GUI can be removed... from the image and from
-# the box, along with the auto-desktop startup"). It is not deleted, because the
-# opt-in still has a front door — HomeHub's `HomeHubDesktop.cmd` — and the whole
-# point of that front door is that it works on an OFFLINE hub. Packages that are
-# not baked cannot be installed by it: `apt-get install` would reach for the
-# archive at the moment you run it, which is the exact defect fixed on
-# 2026-08-26 (open-items E1(ii)).
+# TWO DECISIONS, NOT ONE, AND THEY LIVE IN HOMEHUB. Whether these packages RIDE
+# the USB is a BUILD decision; whether the box TURNS THEM ON is an INSTALL
+# decision. Both are derived from one `Extras` declaration in HomeHub's
+# scripts/deploy/config.homehub.psd1, and Materialize-Deploy refuses to emit an
+# activation whose carriage is absent.
 #
-# So: nothing here runs, listens, or starts. This costs ~150-250 MB of image and
-# buys the ability to change your mind without a reflash.
-#
-# THE ONE NAME THAT DID NOT MOVE HERE is libfuse2t64. It stayed in
-# packages.list because the IceDrive CLI — which is why the GUI could go — needs
-# libfuse.so.2 for its mount. It is not part of this set.
+# THAT GATE IS THE POINT OF THE WHOLE ARRANGEMENT. Before it existed the two
+# halves could disagree silently, and they did: the project told operators to
+# "RDP in and sign in to IceDrive" for a month while ELEVEN of the AppImage's
+# runtime libraries were in no image at all. The instruction could not have been
+# followed on any hub this repo has ever built.
 #
 # FORMAT: identical to packages.list (read_packages_list): strip from `#` to end
 # of line, strip all whitespace, drop what is left if empty.
@@ -50,3 +48,44 @@ thunar                # file manager
 # exists to prevent.
 xvfb                  # scratch display for a loopback RDP client
 freerdp2-x11          # xfreerdp: connects to loopback to make a session exist
+
+# ── the IceDrive GUI AppImage's RUNTIME DEPENDENCIES ────────────────────────
+# NOT OPTIONAL IF THE APPIMAGE IS CARRIED - the app does not start without every
+# one of them. Measured on the bench box 2026-08-27 by installing it and
+# following the failures one at a time, because each hides behind the one in
+# front of it:
+#
+#   libwebpmux.so.3          the binary aborts before Qt starts
+#   libwebpdemux.so.2         "
+#   libXss.so.1               "
+#   libxcb-icccm.so.4        "Could not load the Qt platform plugin xcb ...
+#   libxcb-image.so.0         even though it was found", then a core dump.
+#   libxcb-keysyms.so.1       Eight more, one per launch.
+#   libxcb-render-util.so.0
+#   libxcb-shape.so.0
+#   libxcb-xinerama.so.0
+#   libxcb-xkb.so.1
+#   libxkbcommon-x11.so.0
+#
+# The AppImage bundles Qt but NOT the system libraries Qt's xcb platform plugin
+# links against, and the failure names a PLUGIN rather than a PACKAGE - so it
+# reads like a corrupt download and sent this project looking in the wrong place
+# for a month.
+libwebpmux3
+libwebpdemux2
+libxss1
+libxcb-icccm4
+libxcb-image0
+libxcb-keysyms1
+libxcb-render-util0
+libxcb-shape0
+libxcb-xinerama0
+libxcb-xkb1
+libxkbcommon-x11-0
+
+# ── the FUSE 2 shim - needed by BOTH IceDrive builds ────────────────────────
+# Ubuntu 24.04 ships libfuse3. The AppImage is built against FUSE 2 and exits
+# with a libfuse.so.2 message that reads like a corrupt download; the CLI links
+# it directly for its mount. Neither IceDrive build is present by default, so
+# neither is this.
+libfuse2t64

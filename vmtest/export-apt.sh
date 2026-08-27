@@ -107,11 +107,26 @@ PKGS="$(read_packages_list "$LIST" | tr '\n' ' ')"
 # different versions of a shared dependency, and the second would overwrite the
 # first's deb in a flat repo — leaving a Packages index naming a version that is
 # no longer there. One resolve cannot disagree with itself.
+#
+# OFF BY DEFAULT SINCE 2026-08-27, and that is the Owner's ruling on where this
+# decision belongs: "Deployer I'm okay with as long as it defaults IceDrive and
+# remote desktop to off from its side, and gets configured to active from the
+# HomeHub." So this repo bakes NOTHING optional on its own. HomeHub's build
+# passes BAKE_OPTIONAL=1 when its `Extras` block asks for a feature that needs
+# these packages, and HomeHub's Materialize-Deploy refuses to ACTIVATE a feature
+# whose carriage was never requested. Carriage and activation come from one
+# declaration so they cannot disagree - which they silently did for a month.
+BAKE_OPTIONAL="${BAKE_OPTIONAL:-0}"
 OPT_LIST="$(optional_packages_list_path "$REPO_ROOT" "$TARGET" || true)"
 OPT_PKGS=""
-if [ -n "$OPT_LIST" ]; then
+if [ "$BAKE_OPTIONAL" = "1" ] && [ -n "$OPT_LIST" ]; then
     OPT_PKGS="$(read_packages_list "$OPT_LIST" | tr '\n' ' ')"
     [ -n "$OPT_PKGS" ] || die "$OPT_LIST exists but parses to no package names — delete the file or fix it; a silently-empty optional list is how an offline opt-in stops working with nothing saying so."
+    log "BAKE_OPTIONAL=1 - carrying $(printf %s "$OPT_PKGS" | wc -w) optional package(s) into the repo (installed by nothing)"
+elif [ -n "$OPT_LIST" ]; then
+    log "BAKE_OPTIONAL is not 1 - NOT baking $(read_packages_list "$OPT_LIST" | wc -l) optional package(s)."
+    log "  A hub from this image has no desktop and no IceDrive, and cannot gain one offline."
+    log "  HomeHub sets BAKE_OPTIONAL=1 when config.homehub.psd1 Extras ask for them."
 fi
 ALL_PKGS="$PKGS $OPT_PKGS"
 

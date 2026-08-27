@@ -1,51 +1,62 @@
 #!/usr/bin/env bash
 # Remote light UI for GUI-only vendor apps (first case: IceDrive Mount & Sync).
 #
-# NO LONGER OPT-IN (the Owner, 2026-08-26): firstboot step 6c calls this, and
-# packages.list carries the packages, so a fresh hub comes up with the session
-# already wired. That AMENDS SN-012, which had the Owner running this over SSH
-# once, deliberately.
+# ACTIVATED BY .env, NOT BY THIS REPO (the Owner, 2026-08-27): MiniPC-Deployer
+# defaults the remote desktop OFF and HomeHub turns it on. firstboot step 6c
+# calls this ONLY when REMOTE_UI_ENABLED=true, which comes from HomeHub's
+# config.homehub.psd1. On a hub built straight from this repo, nothing here runs
+# and tcp/3389 never listens.
 #
-# THIS SCRIPT DID NOT CHANGE SHAPE, and that is deliberate: it is still safe and
-# useful to run by hand on a running box. Everything it does is idempotent, so
-# on a box firstboot already provisioned it re-asserts rather than redoes — and
-# it remains the way to install an AppImage onto a hub whose image shipped
-# without one. The apt step is simply a no-op now that the names are installed.
+# ITS PACKAGES ARE CARRIED THE SAME WAY. The 22 names this needs - the RDP/XFCE
+# set, the eleven Qt/xcb libraries the AppImage links against, and libfuse2t64 -
+# are in packages.optional.list, which export-apt.sh bakes only when the build
+# passes BAKE_OPTIONAL=1. Same declaration, same source of truth, so the apt-get
+# below resolves offline when the feature is on and would need the archive when
+# it is not.
 #
-# SN-001's zero-click exception is NARROWER now, not gone: what still needs a
-# human is the IceDrive SIGN-IN and its sync pairs (see README, "What does NOT
-# self-heal"), not the layer itself.
+# ELEVEN OF THOSE LIBRARIES WERE MISSING FOR A MONTH, and that is why the two
+# halves are now tied together at source. The project told operators to "RDP in
+# and sign in to IceDrive" while the AppImage could not start on any hub this
+# repo had ever built: it aborts on libwebpmux/libwebpdemux/libXss, then dies
+# with "Could not load the Qt platform plugin xcb ... even though it was found"
+# and a core dump. The message names a plugin rather than a package, so it reads
+# like a corrupt download. Nothing noticed because nothing had ever launched it.
+#
+# THIS SCRIPT IS ALSO THE MANUAL DOOR, unchanged and idempotent: HomeHub's
+# HomeHubDesktop.cmd runs it over SSH, and running it by hand on a provisioned
+# box is a no-op plus a re-assert.
 #
 # What it does (idempotent, non-interactive, loud):
 #   1. apt-installs xrdp + a MINIMAL XFCE session (no full desktop meta-package)
-#      + libfuse2t64 (the AppImage FUSE shim the IceDrive client still needs
-#      on Ubuntu 24.04).
+#      + the AppImage's runtime libraries.
 #   2. Points the invoking user's RDP session at XFCE (~/.xsession) and lets
 #      xrdp read the TLS snakeoil key (ssl-cert group).
-#   3. Enables + starts xrdp.
-#   4. If ICEDRIVE_APPIMAGE (a path to an already-downloaded AppImage) is set,
-#      installs it to /opt/icedrive/ and writes an XFCE autostart entry so the
-#      client launches whenever the RDP session starts.
+#   3. Enables + RESTARTS xrdp, and sets the account password from
+#      OPERATOR_PASSWORD so PAM has something to authenticate.
+#   4. If ICEDRIVE_APPIMAGE is set (firstboot passes it after re-checking the
+#      pinned sha256), installs it to /opt/icedrive/ and writes an XFCE autostart
+#      entry so the client launches whenever the session starts.
+#   5. Installs the boot-time session unit, so that autostarted client runs with
+#      nobody connected.
 #
 # What it deliberately does NOT do:
 #   - download the AppImage. icedrive.net is behind Cloudflare and answers 403
 #     to anything that is not a browser, so nothing here or in the build can
-#     fetch it. It arrives one of two ways: pinned into the image (see
-#     stack/remote-ui/icedrive.pin, which firstboot passes in), or by hand -
-#     download it, scp it over, pass ICEDRIVE_APPIMAGE=/path/to/it;
-#   - configure the IceDrive account/sync pairs (GUI-only, done over RDP —
-#     see README.md, including what does NOT self-heal);
+#     fetch it. It arrives pinned into the image (stack/icedrive/icedrive.pin)
+#     or by hand: scp it over and pass ICEDRIVE_APPIMAGE=/path/to/it;
+#   - configure the IceDrive account or its sync pairs. That is GUI-only and is
+#     the one remaining hands-on step after a reimage;
 #   - expose anything off-LAN (like Cockpit: never proxy through Caddy, never
 #     port-forward tcp/3389 at the router).
 #
 # Contract:
-#   Inputs:  env ICEDRIVE_APPIMAGE (optional): path to the downloaded AppImage.
+#   Inputs:  env ICEDRIVE_APPIMAGE (optional): path to a verified AppImage.
 #            Must run as root (sudo); the RDP user is $SUDO_USER.
-#   Outputs: xrdp enabled+running; ~/.xsession for the RDP user; optionally
-#            /opt/icedrive/Icedrive.AppImage + the user's autostart entry.
+#   Outputs: xrdp enabled+running; ~/.xsession for the RDP user; that account's
+#            UNIX password set from OPERATOR_PASSWORD; optionally
+#            /opt/icedrive/Icedrive.AppImage + autostart + the session unit.
 #   Raises:  nonzero exit with a FATAL line on any failed step (fail loudly).
-# Implements: SR-015 (SN-012 AMENDED 2026-08-26 - no longer opt-in; SN-001's
-#             exception narrowed to the IceDrive sign-in; SN-005 LAN-only)
+# Implements: SR-015 (activation moved to HomeHub 2026-08-27; SN-005 LAN-only)
 set -euo pipefail
 
 log() { echo "[remote-ui] $*"; }

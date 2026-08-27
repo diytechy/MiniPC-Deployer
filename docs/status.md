@@ -37,10 +37,27 @@ last) — it is the record, not required reading for every pass.
 > sign in to IceDrive"* impossible. Full account: the last audit entry here.
 >
 > **The gap that is left, stated plainly:** everything above proves what the
-> images CONTAIN. **None of it proves they boot and converge.** `Get-VM` refuses
-> without elevation, so that test needs the Owner at the keyboard —
-> `VirtualHomeHub.cmd`, one UAC prompt. It is the only thing that closes the gap
-> and the one test an agent cannot run here.
+> images CONTAIN. **None of it proves they boot and converge.**
+>
+> **This does NOT need the Owner at the keyboard, and an earlier version of this
+> header said it did.** `Get-VM` refuses without elevation, but the lab does not
+> go through `Get-VM`: HomeHub's **HomeHubLab JEA endpoint**
+> (`scripts\lab\Connect-LabJea.ps1`, installed and live on this machine) exposes
+> `Start-VM`/`Stop-VM` pinned to `^(HomeHub|WallPanel)-Lab$` plus
+> `Start-LabRun`, `Get-LabRunLog`, `Reset-LabVm` and the console-watch trio, to
+> an **ordinary unelevated session**. Verified 2026-08-27: connected with no
+> prompt and `Get-LabStatus` returned live state. `Start-LabRun` triggers a
+> **pre-registered** elevated task — an action the operator selected at install
+> time, never one an agent composes.
+>
+> **What is genuinely open is which image the lab boots.** It reads
+> `Z:\vmtest-out-hub-prod` / `Z:\vmtest-out-wall-prod`, and those hold **hub
+> 2026-08-23** and **wall 2026-08-09** — older than everything above. The
+> registered `Hub` key is `-SkipBuild`, so triggering it as-is proves nothing
+> about tonight. Either rebuild into the lab directories (`-Stage All`) or copy
+> tonight's asserted ISOs there first. That is a decision about what is being
+> proven, so it is recorded as **C19** in HomeHub's `open-items.md` rather than
+> taken here.
 >
 > **Two things are flagged for the Owner rather than fixed** (both in HomeHub's
 > `open-items.md`): the wall image gets its version-locked systemd siblings

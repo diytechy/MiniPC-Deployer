@@ -36,28 +36,25 @@ last) — it is the record, not required reading for every pass.
 > the eleven missing runtime libraries. Any ONE of them alone made *"RDP in and
 > sign in to IceDrive"* impossible. Full account: the last audit entry here.
 >
-> **The gap that is left, stated plainly:** everything above proves what the
-> images CONTAIN. **None of it proves they boot and converge.**
+> **THE IMAGES NOW BOOT AND CONVERGE — the gate PASSED 2026-08-27 afternoon.**
+> `Start-LabRun -Stage All` (triggered unelevated through the JEA endpoint) ran
+> 54 minutes and ended **PASSED, 13 assertions**: both images rebuilt from
+> source, both machines installed **offline**, firstboot green, 16 images
+> loaded, Technitium and the tracker healthy, the panel's kiosk serving and its
+> `403` refusal holding — and the shipped image REFUSED the wrong machine
+> (0 MB written, the disk pin). Three of the night's fixes are proven on a real
+> install: `systemd-sysv`/`libpam-systemd` installed, the AppImage reaching the
+> payload at the right path, and step 6b firing inside the real pipeline for the
+> first time. Full account: the last audit entry.
 >
-> **This does NOT need the Owner at the keyboard, and an earlier version of this
-> header said it did.** `Get-VM` refuses without elevation, but the lab does not
-> go through `Get-VM`: HomeHub's **HomeHubLab JEA endpoint**
-> (`scripts\lab\Connect-LabJea.ps1`, installed and live on this machine) exposes
-> `Start-VM`/`Stop-VM` pinned to `^(HomeHub|WallPanel)-Lab$` plus
-> `Start-LabRun`, `Get-LabRunLog`, `Reset-LabVm` and the console-watch trio, to
-> an **ordinary unelevated session**. Verified 2026-08-27: connected with no
-> prompt and `Get-LabStatus` returned live state. `Start-LabRun` triggers a
-> **pre-registered** elevated task — an action the operator selected at install
-> time, never one an agent composes.
->
-> **What is genuinely open is which image the lab boots.** It reads
-> `Z:\vmtest-out-hub-prod` / `Z:\vmtest-out-wall-prod`, and those hold **hub
-> 2026-08-23** and **wall 2026-08-09** — older than everything above. The
-> registered `Hub` key is `-SkipBuild`, so triggering it as-is proves nothing
-> about tonight. Either rebuild into the lab directories (`-Stage All`) or copy
-> tonight's asserted ISOs there first. That is a decision about what is being
-> proven, so it is recorded as **C19** in HomeHub's `open-items.md` rather than
-> taken here.
+> **THE ONE THING IT DID NOT PROVE is the night's headline feature.** The extras
+> were carried and **never exercised**: after build time the words `icedrive`,
+> `xrdp` and `appimage` do not appear again in the run, because
+> `assert-installed.sh` asserts only the CORE package list. Whether firstboot
+> step 6c installs the desktop and starts the AppImage is still unknown — the
+> one run that could have answered it was never asked the question, and
+> `-Stage All` destroyed the box afterwards. **Next: an activation assertion,
+> and `All-Keep` so there is a box left to inspect.**
 >
 > **Two things are flagged for the Owner rather than fixed** (both in HomeHub's
 > `open-items.md`): the wall image gets its version-locked systemd siblings
@@ -4983,3 +4980,77 @@ written the same night, one was a real stale byte, and one was a doc/code
 mismatch that the fixes themselves resolved. The lesson is not subtle — the
 guard against unverified artifacts was itself unverified, and it took an
 adversary to say so.
+
+### 2026-08-27 (afternoon) — the gate PASSED, and three of the night's fixes are now proven on a real install
+
+`Start-LabRun -Stage All` was triggered through the JEA endpoint (unelevated) and
+ran **54 minutes, 12:54 → 13:48**, ending **PASSED — 13 assertions**. Both images
+were rebuilt from source into the lab directories, both machines installed
+unattended and offline, and both were torn down afterwards.
+
+**What this proves that nothing before it did.** Everything up to now was
+carriage: what the ISO CONTAINS. This is the install path executing.
+
+- **The systemd cascade fix is real.** `PASS package installed: systemd-sysv`
+  and `PASS package installed: libpam-systemd` on the installed box. That is the
+  defect whose other branch was an apt plan to delete `snapd`, `polkitd` and
+  `ubuntu-server` — now proven resolved offline, on a box, from the baked repo.
+- **The IceDrive staging-path fix is real.**
+  `deploy-payload/stack/remote-ui/Icedrive.AppImage = 112 MB (+ its pinned
+  sha256)` in the build log. The artifact reached the payload at the path the
+  ISO is built from — the bug that had the AppImage writing one directory above
+  it, silently, since `ef826bc`.
+- **Step 6b fired, for the first time ever, on both builds.**
+  `[6b/7] Asserting the ISO payload` → `the ISO carries what the build declared`,
+  hub and wall. Until this morning the step could not run at all (the BEL byte)
+  and then could be skipped (the optional checker). It is now wired, mandatory,
+  and exercised inside the real build pipeline rather than by hand.
+- **The disk pin held.** Stage 5 booted the SHIPPED image at the lab VM and
+  `PASS nothing was written (0 MB)` — the containment property that keeps a
+  production stick from installing on the wrong machine.
+- **The install genuinely had no network:** `hub INSTALLED WITH NO NETWORK — the
+  install finished 9.0 min before the cable went back in`, then
+  `homehub-firstboot.service is active (Result=success)`, `docker holds 16
+  image(s)`, Technitium answering, tracker healthy.
+- **The panel installed and the interconnect works:** `wall-firstboot.service
+  completed`, a kiosk session running, `200 from https://wall.<domain>:8443/`
+  for the panel and `403` for a non-panel address.
+
+**The FileBackup container was refreshed first, and the reason matters.** The
+`filebackup:local` sitting in the cache carried an EMPTY
+`homehub.source.revision` label and dated from 2026-08-26 — the signature of a
+hand-loaded Podman export, which `export-images.sh` only WARNS about. It would
+have baked silently stale. Rebuilt through `scripts/ensure-local-images.sh
+--rebuild`, it now stamps `680136bc35f3`, and the box carries it. The `+dirty`
+suffix is the known WSL false positive: WSL git reports 28,713 insertions and
+28,713 deletions — identical counts, pure CRLF/LF noise — while Windows git
+reports the tree clean.
+
+**WHAT THIS RUN DID NOT PROVE, and it is exactly the night's headline feature.**
+The extras were **carried and never exercised**. The build log shows the whole
+carriage half working — `extras: remote desktop = ON; IceDrive = appimage;
+optional set = BAKED (22 packages)`, the AppImage staged and placed — and then
+**after build time the words `icedrive`, `xrdp`, `remote-ui` and `appimage` do
+not appear again anywhere in the run.** `assert-installed.sh` asserts the CORE
+package list and nothing else, so whether firstboot step 6c actually installed
+the desktop, started the boot-time session and launched the AppImage is still
+unknown. The gate passed without ever looking.
+
+That is the "IceDrive has zero test cases at any tier" gap, now with a sharper
+edge: **the one run that could have answered it wasn't asked the question.** And
+because `-Stage All` tears the VMs down on every exit path, the box that could
+have been inspected no longer exists. `All-Keep` is the key that would have left
+it standing.
+
+**Two caveats to read the result with:**
+
+- **The heartbeat did not fire on either VM.** The link came back on the LATE
+  signal (VHDX quiet for 4 minutes) rather than on the reboot signal, so the
+  stack came up with no network and ACME/DDNS retried into that. The launcher
+  says to read a health failure after this as that rather than as an image
+  defect — and `WARN Actual not reachable via https://actual.<domain>/` is the
+  one health warning, consistent with exactly that.
+- **These are not the ISOs that were asserted 14/14 and 5/5.** `-Stage All`
+  rebuilt them, so the booted images include today's FileBackup container and
+  the eleven other changed inputs. The invariants held on both, but the bytes
+  differ.

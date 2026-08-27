@@ -178,3 +178,80 @@ sudo systemctl disable --now xrdp
 sudo apt-get remove --autoremove xrdp xorgxrdp xfce4-session   # pulls the rest
 sudo rm -rf /opt/icedrive ~hub/.config/autostart/icedrive.desktop
 ```
+
+
+---
+
+## There IS a Linux CLI, and it changes what this layer is for (2026-08-27)
+
+This document and open-items E1 both asserted the client is **"GUI-only — no
+headless daemon, no CLI"**. That is **no longer true**, and it is not clear it
+was ever checked rather than inherited. `IcedriveCLI-v3.62` exists and was
+tested on the bench box.
+
+**What it is, measured — not from documentation, which barely exists:**
+
+| | |
+|---|---|
+| form | a **native Linux ELF**, 9.8 MB — not an AppImage (the GUI is a separate 118 MB `IcedriveMounted-v3.62-x86_64.AppImage`) |
+| headless | **yes** — `--help` and a no-credential run both work with no X server at all |
+| auth | `-login <username> -password <password>`, **non-interactive** |
+| session | **persists** — `~/.config/Icedrive/Icedrive.conf` holds `icedrive_sessId`, so the password is needed ONCE, not per run. `-logout` clears it |
+| mount | FUSE (links `libfuse.so.2` — already covered by `libfuse2t64`). Defaults to `~/Icedrive`; `-mp <path>` overrides |
+| upload | a trailing `<file/folder list>` uploads those paths to the cloud |
+| other | `-crypto` / `-lockcrypto` (Encrypted folder), `-clearcache`, `-verbose` |
+
+Its full option list, verbatim:
+
+```
+-login <username>   -password <password>   -crypto      -clearcache
+-lockcrypto         -logout                -verbose     -mp <path>
+<file/folder list>: upload specified files and folders to the cloud
+```
+
+**NOT CONFIRMED, and do not build on it until it is:** whether the CLI performs
+**continuous two-way sync** unattended. A no-credential run prints a `Sync:`
+block with local/remote deletion policies, so sync exists as a concept — but
+that shows *settings*, not that the CLI drives them, and nothing testable
+without an account. Everything above was reachable without credentials;
+everything about sync was not.
+
+### What this changes
+
+1. **The desktop is no longer load-bearing for IceDrive.** A mount needs no X.
+   SR-015 remains right for GUI-only vendor apps in general — and the
+   boot-session work stands on its own — but IceDrive may not need any of it.
+2. **The "not a deploy secret" ruling (2026-08-09) has lost its reasoning.**
+   That ruling turned entirely on *"there is no CLI or API to hand it to, so
+   storing it buys no automation"*. `-login`/`-password` is exactly that API.
+   Because the session persists, the credential would be consumed **once** at
+   provisioning and never again — which is the shape every other minted secret
+   here already has. **This needs a fresh ruling from the Owner; it is not
+   reopened unilaterally.**
+3. **A better offsite leg becomes possible.** `backup.sh`'s retired step 5 still
+   supports `OFFSITE_PATH` as a local directory. Pointed at an IceDrive mount,
+   the offsite copy becomes ordered after the backup, scriptable, and **visible
+   to NagLight** — closing the gap this file already admits: *"a green backup
+   says nothing about the cloud copy."* The GUI path can never report that.
+
+### What it does NOT change
+
+**Acquisition is still manual.** The CLI is behind the same Cloudflare wall as
+the AppImage: `https://icedrive.net/download/linux/cli/install.sh` returns
+**HTTP 403** and a `<title>Just a moment...</title>` challenge page to any
+non-browser client. So the widely-quoted one-liner
+
+```sh
+curl -s https://icedrive.net/download/linux/cli/install.sh | bash    # DO NOT
+```
+
+**pipes an HTML challenge page into bash.** Both binaries come down a browser,
+once, and are pinned by SHA256 exactly as `icedrive.pin` already does.
+
+### Next step to settle it
+
+Log in on the bench box with a real account and answer, in one sitting: does the
+mount survive with no session; can sync pairs be defined without the GUI; does
+`backup.sh` write into the mount cleanly; and what does `-logout`/re-login do to
+a running mount. That is an hour of testing and it decides whether IceDrive uses
+this layer at all.

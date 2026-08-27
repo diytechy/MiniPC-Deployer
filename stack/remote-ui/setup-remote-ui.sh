@@ -254,7 +254,27 @@ if [ -n "${ICEDRIVE_APPIMAGE:-}" ]; then
     install -d /opt/icedrive
     install -m 0755 "$ICEDRIVE_APPIMAGE" /opt/icedrive/Icedrive.AppImage
     AUTOSTART_DIR="$RDP_HOME/.config/autostart"
-    install -d -o "$RDP_USER" -g "$(id -gn "$RDP_USER")" "$AUTOSTART_DIR"
+    # OWN EVERY LEVEL, NOT JUST THE LEAF. `install -d -o user a/b/c` creates the
+    # parents as ROOT and applies -o/-g only to the final component, so this
+    # line used to leave ~/.config owned by root:root with ~/.config/autostart
+    # owned by the operator. That one wrong owner broke the entire desktop:
+    #
+    #   xfconfd (running as the operator) could not create its config dir, so
+    #   it started NO backends; xfce4-session could then not read
+    #   FailsafeSessionName and died with "Unable to load a failsafe session";
+    #   and because no session ever came up, the autostart entry written two
+    #   lines below NEVER RAN - which is precisely why IceDrive was installed,
+    #   pinned, autostart-registered and still not running.
+    #
+    # Measured on a real box 2026-08-27: `chown hub:hub ~/.config` alone took
+    # xfconf-query from "No backends could be started" to listing the session
+    # channel. Unconditional, so a box provisioned by the old code is repaired
+    # the next time this runs.
+    RDP_GROUP="$(id -gn "$RDP_USER")"
+    for _d in "$RDP_HOME/.config" "$AUTOSTART_DIR"; do
+        install -d -o "$RDP_USER" -g "$RDP_GROUP" "$_d"
+        chown "$RDP_USER:$RDP_GROUP" "$_d"
+    done
     cat > "$AUTOSTART_DIR/icedrive.desktop" <<'EOF'
 [Desktop Entry]
 Type=Application

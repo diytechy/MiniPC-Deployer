@@ -45,10 +45,12 @@ Run against the real binary, with no account:
   attempts will result in a 30 minute block (1)"}`.
 - **There is no way to keep the password off argv.** Three were tried and all
   three fail with `cli: no password given`: a pipe on stdin, a pty (via
-  `script`), and omitting `-password` so it prompts. Pre-seeding the config is
-  not available either — the stored credential is encrypted by the app with a
-  key we do not hold. See `setup-icedrive.sh` for why argv is acceptable *here*
-  and the one condition that would change that.
+  `script`), and omitting `-password` so it prompts. The pty attempt was re-run
+  later with a delay, to rule out a race, and still failed — which matters,
+  because the *crypto* prompt in the same binary **does** accept a pty (see
+  below). Pre-seeding the config is not available either. See
+  `setup-icedrive.sh` for why argv is acceptable *here* and the one condition
+  that would change that.
 - **`icedrive_sessId` is NOT the persisted session.** The remote-ui README said
   it was, and that the password is therefore needed once. The conf file gets a
   fresh `icedrive_sessId` after a login that **failed**, so it cannot be an
@@ -88,7 +90,7 @@ the bench box, against the Owner's real account (3.91 TB of 5.00 TB used).
 | Does the session persist, so the password is needed once? | **YES.** After one `-login`/`-password` run, a second run with **no credentials at all** authenticated and mounted |
 | Does the mount work with no session and no human? | **YES.** `homehub-icedrive.service` mounts it at boot, as `hub`, with nobody connected |
 | Can `root` (so `backup.sh`) traverse the mount? | **NO** — and this is the one blocker left. See below |
-| Does the CLI act on the account's sync pairs? | **No sign of it.** See below |
+| Does the CLI act on the account's sync pairs? | **No sign of it** — and the reason is structural. See "So what IS the CLI for?" |
 | What is the persisted credential actually called? | `icedrivet` (the token) + `icedrive_login`. **Not** `icedrive_stored_cred` |
 
 **The credential key was wrong in the first version of this layer, and the way
@@ -177,32 +179,86 @@ client, not a SYNC client** — the 118 MB GUI AppImage is what runs sync.
 > exist on this account distinguishes "the CLI ignores them" from "there was
 > nothing to fetch". Nothing else about this layer depends on the answer.
 
-**The Encrypted folder is a separate credential, and it cannot be automated on
-this version.** IceDrive's Encrypted ("Crypto") storage has its own passphrase,
-and the binary prompts for it interactively (`Enter crypto passphrase: `,
-`cli: no passphrase given`). Its own error message names a flag for it —
-`Unable to access Encrypted folder: the -passphrase parameter was not
-specified` — **but that flag does not exist in this build.** Searched the raw
-binary for NUL-terminated argument literals: `-login`, `-password`, `-mp`,
-`-crypto` and `-newsync` each appear exactly once as a real literal;
-`-passphrase` appears **zero** times as a literal and only once as a substring,
-inside that very error message. The message references a parameter the parser
-does not implement.
+## The Encrypted folder — no flag, but the prompt IS drivable
 
-Consequences, if anything is ever kept in the Encrypted folder:
+IceDrive's Encrypted ("Crypto") storage has a **second, separate passphrase**,
+and it is client-side by design: the key is derived on the device and never
+reaches the vendor.
 
-- `-crypto` (unlock on mount) cannot be driven non-interactively;
-- the encrypted tree is not readable through the mount without it
-  (`no crypto credentials set!`);
-- and `pair_list: no encryption key set!` means even the sync-pair list is
-  gated on it for encrypted pairs.
+**There is no flag for it, and that is now proven rather than inferred.** Every
+NUL-terminated argument literal in the binary was enumerated; the real CLI flag
+set is `login password crypto mp verbose hash help clearcache clearsettings dir
+download history logout lockcrypto mount newsync publink quit requestfiles share
+startup sync` (each in both `-x` and `/x` form), plus `-no-ecocaching`,
+`-disable-sandbox`, `-advanced-logging` and the Qt/OpenGL options. **No
+`passphrase` among them.** The only match anywhere is `-it-revPassphrase`, which
+is an OpenSSL PKIX OID name, not an argument.
 
-The passphrase does appear to be **stored after first validation**
-(`got stored credentials...` / `no stored encryption credentials; running
-validation now...`), so the likely shape is a one-time interactive unlock over
-SSH rather than an impossibility — **untested**, because nothing on the hub uses
-the Encrypted folder today. Do not add a `IcedriveCryptoPassphrase` store key
-until something can consume it; that is the `DataRepoDeployKey` shape.
+The app's own error message names one anyway — *"Unable to access Encrypted
+folder: the `-passphrase` parameter was not specified"* — so the message
+references a parameter this build does not implement. And `-crypto` does **not**
+take it as an argument either: given `-crypto SOMETHING`, the app logs
+`! file/folder "SOMETHING" doesn't exist !` — it fell through to the trailing
+upload-path list — and then says `cli: no passphrase given`.
+
+**But the interactive prompt can be driven, and that is the useful finding.**
+Fed through a pty (`script`, or `expect`), `Enter crypto passphrase:` is read,
+and the app takes it seriously — a deliberately wrong value produced a real
+`crypto-auth` request and `passphrase NOT validated..`. So the Encrypted folder
+**is** automatable; it just needs a pty rather than an argument.
+
+> **This page said the opposite on its first pass, and the correction is the
+> point.** "It cannot be automated on this version" was written from the flag
+> enumeration alone, without trying the prompt. The flag half was right and the
+> conclusion was wrong.
+
+**And the asymmetry is real: the same trick does NOT work for the account
+password.** Fed the same way, with a delay to rule out a race, the password
+prompt still answers `cli: no password given`. Password: argv only. Passphrase:
+prompt only. Two credentials, two opposite injection paths, in one binary.
+
+Nothing on the hub uses the Encrypted folder today, so **no store key exists for
+the passphrase** — adding one before something consumes it is the
+`DataRepoDeployKey` shape. If that changes, the shape to build is a one-time
+pty-driven unlock at provisioning, mirroring the login. Whether the passphrase
+persists afterwards is **untested**; the binary has `store-crypto-hash` and logs
+`no stored encryption credentials; running validation now...`, which suggests it
+does.
+
+Note also `pair_list: no encryption key set!` — the sync-pair list is itself
+gated on the crypto key for encrypted pairs.
+
+## So what IS the CLI for?
+
+Worth stating plainly, because "it can log in but cannot make a sync pair" reads
+like a half-finished tool. It is not: **it is the GUI application compiled
+without its toolkit, shipped for machines that have no desktop.** Its purpose is
+the FUSE mount.
+
+That explains every observation on this page. The sync engine is *in* the binary
+(`runSyncThreads`, `processSyncPairList`, `sync-pair-add`) because it is the same
+codebase — but the only thing that ever calls the create path is a dialog, and
+this build links no widget library. The `-newsync`, `-sync`, `-share`,
+`-publink`, `-history` and `-requestfiles` flags are the desktop build's
+tray and file-manager context-menu actions; in the CLI they message a running
+instance which then tries to open a window it does not have. They are vestigial,
+not broken.
+
+What survives is exactly what needs no window: **sign in, mount, upload, hash,
+logout, cache control** — and crypto, which survives because it falls back to a
+terminal prompt.
+
+**Vendor documentation does not exist.** The community has one thread asking for
+a list of command-line options with no staff reply, and one user running
+IcedriveCLI on a headless Debian server purely as a mount. The 2024 "all-new
+Mount & Sync" announcement covers Windows/Mac/Linux GUI and never mentions a CLI
+build at all. The CLI *is* maintained — a November 2024 bug report that v3.22
+lacked an eco-cache flag is answered by `-no-ecocaching` existing in v3.62 — it
+is simply undocumented.
+
+**For HomeHub this is fine, and arguably better than sync.** A mount plus a
+copy step driven by `backup.sh` is ordered, scriptable and visible to NagLight;
+vendor sync running on its own schedule is none of those things.
 
 ## What this buys, beyond deleting a desktop
 

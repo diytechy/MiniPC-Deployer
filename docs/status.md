@@ -5117,3 +5117,56 @@ feature has a carriage half and an activation half, and this project keeps
 proving the first and assuming the second. Carriage was asserted on the ISO;
 activation was asserted nowhere; three green gates ran over a feature that had
 never once functioned. The assertion that found it took twenty minutes to write.
+
+### 2026-08-27 (late) — signed in once, rebooted, and it came back by itself
+
+The Owner signed IceDrive in over RDP — with 2FA, interactively, exactly the
+SN-001 step this feature has always carried — and the box was then rebooted to
+settle the question that has been open since the feature was designed: **does the
+sign-in survive, or is it a step per reboot?**
+
+**It survives, and it is not a partial result.** Ten seconds after boot, with
+**nobody connected to the box**, IceDrive's own log records:
+
+```
+start login sequence (2)
+login set; showing main tab...
+request: auth;   ->   auth request finished
+Storage statistics: usage = <real> ; quota = <real>
+{"error":false,"count":0,"pairs":[]}
+```
+
+It authenticated **non-interactively against the live account** and read back the
+real quota figures. No 2FA prompt, no window, no human. The whole chain came up
+on its own: `homehub-desktop-session` active, Xorg running, `xfce4-session`
+running, the AppImage running.
+
+**Which keys carried it, measured rather than assumed:** `icedrive_login` and
+`icedrivet` (the token) were present before and after; **`icedrive_stored_cred`
+was ABSENT throughout** — the "remember my password" key was never written. So
+persistence rests on the token pair, which is exactly the pair the CLI writes.
+That is the first independent confirmation of the 2026-08-27 bench finding, now
+on a GUI-only sign-in with 2FA, where the CLI could not have been used at all.
+
+**`vmtest/assert-installed.sh` section 5c: ALL CHECKS PASSED (12/12)** after the
+reboot — 22/22 optional packages, xrdp enabled + active, tcp/3389 listening, the
+session unit active, an Xorg session with nobody connected, the AppImage matching
+its pin, and **IceDrive RUNNING with nobody connected**.
+
+**What this settles, and it is the whole feature:** *"RDP in and sign in to
+IceDrive"* is a **one-time step per reimage**, not per reboot. The claim this
+project repeated for a month — and which was false the entire time, because the
+app could not start at all — is now true and asserted.
+
+**What is still open, and it is small and new:** `"pairs":[]` — the account has
+**no sync pairs**, so the client is authenticated and syncing nothing. Creating a
+pair needs the GUI dialog (the CLI cannot: `showSyncDialog` has no toolkit), so
+it is a second hands-on step, and nobody has done it yet. Until then the offsite
+copy exists as an authenticated client and no data movement.
+
+**The 2FA question is settled too, in the other direction.** The Owner asked
+whether the CLI could seed the GUI's credential to remove the manual step. It
+cannot, for an account with 2FA: the binary carries
+`2FA method isn't supported in CLI` and prompts interactively for the codes it
+does support. So the manual sign-in is not an unfixed gap — it is the deliberate
+price of 2FA on the account, and worth it.

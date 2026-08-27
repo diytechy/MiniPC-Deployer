@@ -1,10 +1,20 @@
-# Opt-in remote light UI (RDP) — for GUI-only vendor apps
+# Remote light UI (RDP) — for GUI-only vendor apps
 
-**Implements: SR-015 (SN-012).** OFF by default. Nothing in the autoinstall or
-first-boot path touches this directory — the core "flash → boot → zero clicks"
-guarantee (SN-001) is unchanged. This is the sanctioned, *minimized* exception
-SN-001 allows: a secondary service that needs a UI, set up entirely over the
-LAN, never in person.
+**Implements: SR-015.** **ON by default since 2026-08-26** (the Owner: ship the
+UI and IceDrive by default "now that the form of this Hub is becoming more
+concrete"). This AMENDS SN-012, which made the layer an opt-in enabled by hand
+over SSH.
+
+`packages.list` carries the nine packages, so late-command 3c installs them from
+the baked offline repo; **firstboot step 6c** runs `setup-remote-ui.sh` to wire
+the session and install the AppImage if one rode along. The script itself is
+unchanged and still works standalone — it is idempotent, and running it by hand
+on an already-provisioned box is a no-op plus a re-assert.
+
+**What this did NOT change: SN-001's zero-click core still has an exception, it
+is just a narrower one.** It used to be the whole layer; now it is only the
+IceDrive *sign-in* — see "What does NOT self-heal" below, which is unchanged and
+is the reason defaulting this removes an errand rather than a limitation.
 
 **First (and so far only) case:** the **IceDrive Mount & Sync** client.
 IceDrive's current Linux client is GUI-only — no headless daemon, no CLI, and
@@ -19,40 +29,59 @@ Do not assume this arrives with the image, because two thirds of it does not:
 | | on the USB / on the box after install |
 |---|---|
 | `setup-remote-ui.sh` + this README | **yes** — staged to `/opt/homehub/stack/remote-ui/` |
-| `xrdp`, `xorgxrdp`, `dbus-x11`, `xfce4-session`, `libfuse2t64` | **no** — not in `packages.list`, so not in the baked offline apt repo |
-| the IceDrive AppImage | **no** — never bundled; vendor URLs churn, so it is fetched by hand |
+| `xrdp`, `xorgxrdp`, `dbus-x11`, the minimal XFCE, `libfuse2t64` | **yes, and INSTALLED** — in `packages.list` since 2026-08-26, so they come from the baked offline repo like everything else |
+| the IceDrive AppImage | **only if pinned** — see `icedrive.pin`. Unset (the shipped default) means no AppImage and a session without it |
 
-The packages being absent is **deliberate** (SN-012: *"nothing from it is
-installed or running unless explicitly opted in"*), and it has a consequence
-worth knowing before you need it:
+**This used to need working internet and no longer does.** The packages were
+absent from the baked repo, so `apt-get install` reached for the archive at the
+moment you ran the script — meaning on a hub that installed offline the opt-in
+*could not be completed at all*. Fixed 2026-08-26 in two halves, both required:
+the packages are baked, and late-command **3c-keep** retains `/opt/homehub/apt`
+as an apt source so the box can still see them months later. (The repo always
+survived the install; nothing had ever pointed apt at it.)
 
-> **THIS SCRIPT NEEDS WORKING INTERNET AT THE MOMENT YOU RUN IT.** It does
-> `apt-get update && apt-get install`, the packages are not in the baked repo,
-> and the baked repo is install-time only — `/run/baked-apt` is gone once the
-> box is up. So on a hub that installed offline and has no route out, the opt-in
-> **cannot be completed at all**. Verified on a live hub: none of the five
-> packages are present, and `xrdp` is `not-found`.
+## Shipping the IceDrive AppImage (once per version)
 
-If offline opt-in is ever needed, the fix is to bake those packages into the
-offline repo *without installing them* and retain it on the box as an apt
-source — which is a change to the install, not to this script.
+The binary is **not in this repo and is not fetched by the build**. It is
+supplied once, verified against a pinned SHA256, and cached — so every build
+after that is reproducible and needs no vendor at all.
 
-## Enable (one-time, over SSH)
+**Why not fetch it at build time**, which was the first choice: icedrive.net is
+behind Cloudflare and answers **403 to anything that is not a browser**
+(measured 2026-08-26 — the download page and four candidate asset paths all
+refused `curl` with a browser user-agent). A build that curls the vendor would
+fail on a machine with perfectly good internet, which is worse than asking for
+the file once. **Why not commit it:** ~100 MB of git history per version bump,
+forever, for an artifact this project does not own.
 
 ```sh
-# 1. On your workstation: download the Linux AppImage from icedrive.net, then
-scp Icedrive.AppImage hub@<LAN_IP>:~
-
-# 2. On the box:
-sudo ICEDRIVE_APPIMAGE=~/Icedrive.AppImage bash /opt/homehub/stack/remote-ui/setup-remote-ui.sh
-
-# 3. From your workstation: RDP to <LAN_IP>:3389 (mstsc / Remmina) as the
-#    hub user; IceDrive autostarts in the session — sign in, set the
-#    sync-pair folder(s), verify a test file syncs.
+# 1. Download the Linux AppImage from icedrive.net in a browser.
+# 2. Get the line to paste:
+bash vmtest/export-icedrive.sh --print-hash --from ~/Downloads/Icedrive.AppImage
+# 3. Put VERSION= and SHA256= into stack/remote-ui/icedrive.pin
+# 4. Verify, cache and stage it:
+bash vmtest/export-icedrive.sh --out vmtest/.out/icedrive --from ~/Downloads/Icedrive.AppImage
+# 5. Build the ISO as usual — later builds reuse the cache; --from is only
+#    needed again when the pin changes.
 ```
 
-Re-running the script is safe (idempotent). Without `ICEDRIVE_APPIMAGE` it
-installs just the RDP/XFCE layer and tells you the next step.
+An **unset pin is a valid, shipped default**: the image carries no AppImage and
+the hub installs the session without it, saying so in the firstboot log. The
+hash travels beside the binary onto the payload and **firstboot re-checks it
+before installing** — an ISO can be re-burned and a payload can be edited, so
+"we verified it at build time" is not the same claim as "these bytes are pinned".
+
+## Connecting
+
+From the dev PC, `HomeHubDesktop.cmd` (in HomeHub) opens the session and signs
+in using the minted `OperatorPassword`. Or point any RDP client at
+`<LAN_IP>:3389` as the hub user.
+
+Then, once per reimage: **sign in to IceDrive and re-create the sync pairs.**
+That is still manual and cannot be automated from here — see the next section.
+
+Running `setup-remote-ui.sh` by hand is still safe (idempotent) if you need to
+re-assert the wiring or install an AppImage onto a running box.
 
 ## What does NOT self-heal (read this before relying on it)
 

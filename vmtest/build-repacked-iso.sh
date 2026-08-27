@@ -118,6 +118,8 @@ IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
 # D:\vmtest-out-hub-prod, and the repo is an INPUT to that build, not an output
 # of it — resolving it there would re-bake ~180 MB of debs for every ISO.
 APT_OUT="${APT_OUT:-$DEFAULT_APT_OUT}"
+# hub only; the wall never had a graphical opt-in.
+ICEDRIVE_OUT="${ICEDRIVE_OUT:-$REPO_ROOT/vmtest/.out/icedrive}"
 
 [ -n "$SRC_ISO" ] || die "need --src-iso /path/to/ubuntu-24.04.x-live-server-amd64.iso (see vmtest/README.md for the download URL + SHA256)"
 [ -f "$SRC_ISO" ] || die "not found: $SRC_ISO"
@@ -170,6 +172,9 @@ fi
 # not be able to describe different installs. The same `-map .../deploy-payload`
 # below carries it onto the ISO with no change here.
 stage_apt_into_payload "$OUT_DIR" "$APT_OUT" "$TARGET"
+
+# HUB ONLY: the wall has no graphical opt-in and never had one.
+[ "$TARGET" = "hub" ] && stage_icedrive_into_payload "$OUT_DIR" "$ICEDRIVE_OUT"
 
 # ── 1b. decide the payload's permissions (2026-08-04) ───────────────────────
 # Both targets, after every stager. See vmtest/lib/common.sh "PAYLOAD MODES":

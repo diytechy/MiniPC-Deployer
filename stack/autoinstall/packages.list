@@ -189,3 +189,38 @@ docker-ce-cli
 containerd.io
 docker-buildx-plugin
 docker-compose-plugin
+
+# ── the graphical session (SR-015), NO LONGER OPT-IN ────────────────────────
+# RULED BY THE OWNER 2026-08-26: the remote UI and the IceDrive client it exists
+# for now ship by default, "now that the form of this Hub is becoming more
+# concrete". This AMENDS SN-012, which made the graphical layer an opt-in the
+# Owner enabled deliberately, and narrows SN-001's zero-click core exception to
+# the IceDrive SIGN-IN rather than the whole layer.
+#
+# These names moved here from packages.optional.list, which existed for exactly
+# one day (2026-08-26) to bake them WITHOUT installing them. That file is gone;
+# the bake-but-do-not-install machinery in export-apt.sh remains and is simply
+# unused, which costs nothing and is there if a future set needs it.
+#
+# WHAT DEFAULTING THIS DOES NOT BUY, and it is the thing to keep straight:
+# tcp/3389 now listens on every box, but IceDrive still only syncs while its GUI
+# runs inside a session. After every reboot the cloud copy is stale until
+# someone opens one RDP session (open-items E1; the remote-ui README's
+# "What does NOT self-heal"). Installing it by default removes an errand, not
+# that limitation.
+#
+# --no-install-recommends applies here as everywhere, so this stays a minimal
+# session - a window manager, a panel, a terminal and a file manager - and not
+# a desktop. Do not add xubuntu-desktop or the xfce4 meta-package.
+xrdp                  # the RDP server itself
+xorgxrdp              # the Xorg driver xrdp drives; without it sessions are black
+dbus-x11              # dbus-launch - an XFCE session will not come up without it
+xfce4-session         # the session manager ~/.xsession starts
+xfwm4                 # window manager
+xfce4-panel           # panel
+xfce4-terminal        # a terminal inside the session
+thunar                # file manager
+# The AppImage FUSE shim. Ubuntu 24.04 ships libfuse3; the IceDrive client is an
+# AppImage built against FUSE 2 and exits immediately without this, with a
+# libfuse.so.2 message that reads like a corrupt download.
+libfuse2t64

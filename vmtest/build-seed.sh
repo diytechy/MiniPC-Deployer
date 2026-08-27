@@ -58,6 +58,7 @@ OUT_DIR="${OUT_DIR:-$REPO_ROOT/vmtest/.out}"
 IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
 # 2026-08-06: where export-apt.sh put the baked .debs (its default for hub).
 APT_OUT="${APT_OUT:-$REPO_ROOT/vmtest/.out/apt}"
+ICEDRIVE_OUT="${ICEDRIVE_OUT:-$REPO_ROOT/vmtest/.out/icedrive}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -95,6 +96,12 @@ stage_wall_site_into_payload "$OUT_DIR" "$REPO_ROOT"
 # out, loudly, for exercising the seed machinery alone.
 #   bash vmtest/export-apt.sh --target hub --out vmtest/.out/apt
 stage_apt_into_payload "$OUT_DIR" "$APT_OUT" hub
+
+# SR-015 is no longer opt-in (the Owner, 2026-08-26), so the app that layer
+# exists for rides along too. Absent is tolerated and logged: the pin starts
+# unset, and a hub with no AppImage still gets its graphical session.
+#   bash vmtest/export-icedrive.sh --out vmtest/.out/icedrive --from <file>
+stage_icedrive_into_payload "$OUT_DIR" "$ICEDRIVE_OUT"
 
 # LAST, after every stager: the payload's permissions are decided here, not
 # inherited from whatever filesystem this ran on. Booting the gate VM on

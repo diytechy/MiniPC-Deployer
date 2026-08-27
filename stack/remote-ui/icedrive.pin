@@ -1,0 +1,43 @@
+# stack/remote-ui/icedrive.pin — WHICH IceDrive AppImage this image ships.
+#
+# THE BINARY IS NOT IN THIS REPO AND IS NOT FETCHED BY THE BUILD. It is supplied
+# ONCE by the operator, verified against the SHA256 below, and cached. Every
+# build after that is reproducible and needs no network and no vendor at all.
+#
+# WHY NOT FETCH IT AT BUILD TIME, which was the first choice: icedrive.net is
+# behind Cloudflare and answers 403 to anything that is not a browser. Measured
+# 2026-08-26 — the download page and four candidate asset paths all returned
+# 403 to curl with a browser user-agent. A build that curls the vendor would
+# therefore fail on a machine that has perfectly good internet, which is a worse
+# failure than asking for the file once.
+#
+# WHY NOT COMMIT THE BINARY: ~100 MB of git history per version bump, forever,
+# for a vendor artifact this project does not own.
+#
+# HOW TO SET OR BUMP THIS:
+#   1. Download the Linux AppImage from icedrive.net in a browser.
+#   2. sha256sum ~/Downloads/Icedrive.AppImage
+#   3. Put the version and that hash below.
+#   4. bash vmtest/export-icedrive.sh --from ~/Downloads/Icedrive.AppImage
+#      It verifies the hash, caches the file, and stages it into the payload.
+#      Later builds reuse the cache; --from is only needed again when this
+#      file changes.
+#
+# UNSET IS A VALID STATE and it is the shipped default: the ISO simply carries
+# no AppImage and the hub installs the RDP/XFCE session without it. That is the
+# pre-2026-08-26 behaviour, and export-icedrive.sh says so rather than failing.
+#
+# FORMAT: KEY=VALUE, one per line. `#` starts a comment. Blank lines ignored.
+
+# The vendor's version string, for the record. Informational — nothing keys off
+# it; the SHA256 is the identity.
+VERSION=
+
+# The SHA256 of the AppImage. THIS is what makes a build reproducible: the same
+# hash always yields the same image, and a different file is refused by name.
+SHA256=
+
+# Optional. If the vendor ever serves a direct, non-Cloudflared URL, put it here
+# and export-icedrive.sh will try it before asking for --from. Left empty
+# because no such URL exists today (see the 403 note above).
+URL=

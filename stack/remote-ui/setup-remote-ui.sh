@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
-# OPT-IN remote light UI for GUI-only vendor apps (first case: IceDrive
-# Mount & Sync). NOT part of the core zero-click path: nothing in autoinstall
-# or first-boot references this script — the Owner runs it over SSH, once, on
-# purpose (SN-001 scopes zero-click to the core; SN-012 is this deviation,
-# minimized and documented).
+# Remote light UI for GUI-only vendor apps (first case: IceDrive Mount & Sync).
+#
+# NO LONGER OPT-IN (the Owner, 2026-08-26): firstboot step 6c calls this, and
+# packages.list carries the packages, so a fresh hub comes up with the session
+# already wired. That AMENDS SN-012, which had the Owner running this over SSH
+# once, deliberately.
+#
+# THIS SCRIPT DID NOT CHANGE SHAPE, and that is deliberate: it is still safe and
+# useful to run by hand on a running box. Everything it does is idempotent, so
+# on a box firstboot already provisioned it re-asserts rather than redoes — and
+# it remains the way to install an AppImage onto a hub whose image shipped
+# without one. The apt step is simply a no-op now that the names are installed.
+#
+# SN-001's zero-click exception is NARROWER now, not gone: what still needs a
+# human is the IceDrive SIGN-IN and its sync pairs (see README, "What does NOT
+# self-heal"), not the layer itself.
 #
 # What it does (idempotent, non-interactive, loud):
 #   1. apt-installs xrdp + a MINIMAL XFCE session (no full desktop meta-package)

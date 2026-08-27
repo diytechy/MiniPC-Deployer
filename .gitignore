@@ -53,4 +53,9 @@ vmtest/.out/
 # rebuild silently delete the wall ISO, its SSH key and its SIM credentials.
 vmtest/.out-wall/
 vmtest/*.iso
+# The verified IceDrive AppImage, cached so a rebuild needs neither the vendor
+# nor the operator's Downloads folder. NEVER COMMITTED: it is ~100 MB of vendor
+# binary this project does not own, and keeping it out of git is the entire
+# reason stack/remote-ui/icedrive.pin stores a hash instead of the file.
+vmtest/.cache/
 

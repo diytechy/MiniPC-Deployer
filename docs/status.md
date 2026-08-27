@@ -8,62 +8,78 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-> **RESUMING FROM A COLD SESSION? START HERE (2026-08-27, night).**
-> The bench box is **powered off** for a physical move; the stack was stopped
-> cleanly. Branch on BOTH repos: **`IceDrive-DesktopDirection`** (MiniPC-Deployer
-> and HomeHub — they were finally cut in parallel this date).
+> **RESUMING FROM A COLD SESSION? THIS BLOCK IS THE WHOLE HANDOVER (2026-08-27, end of day).**
 >
-> **What changed tonight: the carriage path has now been EXECUTED.** The
-> previous header's "first thing to do next" is done. Both images were built
-> from the new light-core arrangement and then **interrogated** rather than
-> trusted:
+> ### 1. DO NOT FLASH ANYTHING YET
 >
-> | | ISO | payload assertions |
-> |---|---|---|
-> | hub  | `vmtest/.out/repacked.iso` — 6.13 GiB | **14 / 14** |
-> | wall | `vmtest/.out-wall/wall-repacked.iso` — 3.41 GiB | **5 / 5** |
+> `Z:\vmtest-out-hub-flash\repacked.iso` **exists, is asserted 14/14, and must NOT
+> be written to a stick.** It carries a `setup-remote-ui.sh` that **deadlocks the
+> boot**: a blocking `systemctl start` inside firstboot, on a unit ordered
+> `After=homehub-firstboot.service`. On a clean install firstboot sat in
+> `activating` for 18 minutes with `multi-user.target start waiting`. The fix is
+> committed (`545b920`, `--no-block`) and **is in no image**.
+> `Z:\vmtest-out-hub-prod\repacked.iso` is the same bad bytes;
+> `repacked-gate.iso` is derived from them; `repacked.iso.pre-fixes` is the older
+> 13:09 image and is worse.
 >
-> The wall build is notable on its own: **no production wall ISO had ever been
-> built before**, and it built clean on the shared code. On the hub ISO the
-> IceDrive AppImage is present, its sha256 matches the pin, the travelling
-> `.sha256` beside it agrees, the CLI is absent (one client only), and **all 22**
-> bake-only packages are in the repo and none is install-listed. The wall's five
-> are the payload root plus repo membership — IceDrive is a hub-only concern and
-> the wall run does not assert on it.
+> ### 2. THE EXACT NEXT STEPS, IN ORDER
 >
-> **Three defects, every one of them in a code path that had never run** — the
-> systemd cascade, the AppImage that never reached the ISO, and (that morning)
-> the eleven missing runtime libraries. Any ONE of them alone made *"RDP in and
-> sign in to IceDrive"* impossible. Full account: the last audit entry here.
+> ```
+> # a. tear down the lab (HomeHub-Lab is RUNNING and hand-patched; it holds the
+> #    hub's DHCP reservation and its gate ISO open)
+> $s = C:\Projects\HomeHub\scripts\lab\Connect-LabJea.ps1
+> Invoke-Command $s { Clear-LabVms -Confirm:$false }
 >
-> **A FLASHABLE ISO IS READY, AND IT IS NOT THE ONE THE GATE BUILT.**
-> `Z:\vmtest-out-hub-flash\repacked.iso`, 6.1 GiB, built from MiniPC-Deployer
-> `39fab45` / HomeHub `380245d`, **asserted 14/14**, carrying today's FileBackup
-> container and pinned to the real hub's disk serial. The gate's 13:09 ISO
-> predates four fixes made after it (the 22-package install list, `enable` vs
-> `start`, the root-owned `~/.config` that killed the whole session, and the
-> xrdp restart that orphaned it) — all five changes were verified **inside this
-> ISO's payload**, not merely in the working tree.
+> # b. rebuild the ISO (~45 min) - this is what puts 545b920 into an image
+> pwsh -File C:\Projects\HomeHub\scripts\deploy\Build-VentoyStick.ps1 -Target hub `
+>      -UbuntuIso Z:\iso\ubuntu-24.04.4-live-server-amd64.iso `
+>      -BuildOutDir Z:\vmtest-out-hub-flash -StageOnly
 >
-> **THE WHOLE FEATURE NOW WORKS, END TO END AND UNATTENDED**, on the lab box:
-> boot → a desktop session with nobody connected → IceDrive autostarts → it
-> authenticates from its stored token with **no 2FA prompt** → restores its sync
-> pair → and a new file is encrypted and uploaded within seconds. The backup path
-> ran for the first time too, and a restore driven by the backup drive's **own**
-> `reconstruct.sh` came back **byte-identical**.
+> # c. put it where the lab reads, and re-derive the gate ISO from it
+> Copy-Item Z:\vmtest-out-hub-flash\repacked.iso Z:\vmtest-out-hub-prod\repacked.iso -Force
+> wsl -d Ubuntu -- bash -c "cd /mnt/c/Projects/MiniPC-Deployer && \
+>   bash vmtest/make-gate-iso.sh --target hub --src-iso /mnt/z/vmtest-out-hub-prod/repacked.iso"
 >
-> **THE ONE THING NEVER DONE: no box has been installed from THIS image.** Every
-> fix above was demonstrated by hand-patching a running VM. `assert-installed.sh`
-> section 5c would catch a regression, but it has only ever run against a
-> repaired box. **Next: `Clear-LabVms` (the VMs hold the hub's DHCP reservation
-> and their gate ISOs open), re-run the gate against this ISO, then flash.**
+> # d. re-run the gate (~40 min, hub only, leaves the box up)
+> Invoke-Command $s { Start-LabRun -Stage Hub-Keep -Confirm:$false }
+> ```
 >
-> **Two things are flagged for the Owner rather than fixed** (both in HomeHub's
-> `open-items.md`): the wall image gets its version-locked systemd siblings
-> **transitively** — the assertion prints exactly that word — so it is one
-> dependency change away from the identical break the hub just had (**A27**;
-> naming two packages costs nothing and removes the risk). And IceDrive still
-> has **zero test cases** at any tier.
+> **Pass condition:** `assert-installed.sh` section 5c reports **ALL CHECKS
+> PASSED** (12 checks) including `IceDrive is RUNNING with nobody connected`, on
+> a box nobody has touched. That has never happened - every green result so far
+> came from a box repaired by hand. Only then is C2 (flash the real HOMEHUB)
+> reasonable.
+>
+> ### 3. WHAT IS ACTUALLY TRUE NOW
+>
+> The feature works end to end, unattended, and was watched doing it: boot -> a
+> desktop session with **nobody connected** -> IceDrive autostarts -> it
+> authenticates from its stored token with **no 2FA prompt** -> restores its sync
+> pair -> and a new file is **encrypted and uploaded within seconds**. The backup
+> path also ran for the first time, and a restore driven by the backup drive's
+> **own** `reconstruct.sh` came back **byte-identical**.
+>
+> **But every one of those was demonstrated on a hand-patched box.** The gap
+> between "the code is right" and "the image produces it" is the whole of step 2.
+>
+> ### 4. STATE OF THE MACHINES
+>
+> - **HomeHub-Lab: RUNNING**, hand-patched, passing 12/12. It holds the hub's
+>   DHCP reservation, so **the real hub must not be powered on until it is gone**.
+>   Its VHDX carries materialised credentials.
+> - **WallPanel-Lab: absent.** The wall lane was not touched today.
+> - **The real HOMEHUB is powered off**, USB drives attached, not yet moved. Its
+>   image predates everything here.
+> - Branch on both repos: **`IceDrive-DesktopDirection`**. HomeHub `d6feb61`,
+>   MiniPC-Deployer `545b920`, both clean. **13 and 12 commits unpushed** - the
+>   Owner pushes.
+>
+> ### 5. THE TWO HANDS-ON STEPS THAT ARE PERMANENT
+>
+> Per reimage, not per reboot, and neither is a gap to be closed: **sign in to
+> IceDrive** (2FA makes it unavoidable - the CLI carries
+> `2FA method isn't supported in CLI`) and **create the sync pair** (the CLI
+> cannot draw the dialog).
 
 - **Active gate:** G1 — Requirements, UX & constraints. This is a config/infra
   repo delivered against a ratified brief (HOMELAB_RESTRUCTURE_PLAN.md); the
@@ -5337,3 +5353,58 @@ one built from this ISO.
 hub's DHCP reservation and their gate ISOs open), re-run the gate against this
 image so the fixes are proven from a clean install, and only then flash. Flashing
 first is defensible but skips the one test that has never been run.
+
+### 2026-08-27 (end of day) — the gate caught a deadlock the whole day had hidden
+
+The rebuilt ISO was put through the gate, and it **failed 3 checks**. Not a
+regression in what they assert — **a boot-wedging deadlock introduced by two
+fixes that are each correct alone.**
+
+**The cycle.** `setup-remote-ui.sh` runs INSIDE `homehub-firstboot.service`, and
+earlier that day it gained `systemctl start homehub-desktop-session.service`.
+The same day that unit gained `After=homehub-firstboot.service`. A blocking
+`systemctl start` therefore waits for a unit that cannot begin until this
+script's own service finishes — and that service is waiting on the call.
+
+Measured on a clean install, and it is not ambiguous:
+
+```
+10932  systemctl start homehub-desktop-session.service   <- blocked
+ 6684  bash .../setup-remote-ui.sh                        <- waiting on it
+    2  multi-user.target  start waiting                   <- the boot itself
+```
+
+firstboot sat in `activating` for **18 minutes**; the session unit never started,
+no Xorg existed, and `/opt/icedrive` was absent because the AppImage install
+comes later in the same blocked script. All three gate failures were downstream
+of that one cycle.
+
+**Fixed with `--no-block`**, which enqueues the start and returns, so systemd
+runs it the moment ordering allows — exactly when firstboot completes. The
+ordering guarantee is kept and the cycle cannot form. Verified after a reboot:
+firstboot **active** (it had never once completed), **zero** queued jobs, session
+active, Xorg up with nobody connected, AppImage installed, IceDrive running, and
+section 5c **ALL CHECKS PASSED**.
+
+**THE LESSON, AND IT IS THE DAY'S SECOND-BEST ONE.** Neither fix could have
+revealed this alone; only running the pair on a clean boot could. Every green
+result before this came from a box repaired by hand, and a hand-repaired box has
+already passed the step where the deadlock lives. **That is exactly why the
+"rebuild and re-gate before flashing" step existed, and it paid for itself the
+first time it ran.**
+
+**Two false readings, corrected, because both cost time.** `pgrep -f
+Icedrive.AppImage` matches firstboot's own `ICEDRIVE_APPIMAGE=…` command line, so
+"IceDrive RUNNING" was the grep seeing itself — twice. The real check is
+`pgrep -f "[I]cedrive.AppImage"`. And earlier, `pkill -f Icedrive.AppImage` over
+SSH killed its own session for the same reason.
+
+**Also worth recording as a guard that worked:** the first attempt at this run
+refused in 7 seconds — *"the hub gate ISO is STALE (the production ISO it is
+derived from is newer) and -Stage Hub does not re-derive it"* — rather than
+quietly booting the old image and reporting a pass that meant nothing.
+
+**Where this leaves the artifact:** `Z:\vmtest-out-hub-flash\repacked.iso` is
+asserted 14/14 and **must not be flashed** — it carries the deadlocking script.
+The fix is committed and in no image. The Current State header at the top of this
+file carries the exact commands to rebuild, re-derive and re-gate.

@@ -1,13 +1,22 @@
-# IceDrive on the hub — the headless CLI
+# IceDrive on the hub — the CLI, and why the GUI was chosen anyway
 
-**Replaced the GUI client and the whole graphical layer on 2026-08-27.** The
-Owner: *"GUI can be removed… from the image and from the box, along with the
-auto-desktop startup."* What made that possible is that the premise the
-graphical layer was built on turned out to be false.
+**DIRECTION SETTLED 2026-08-27: the hub runs the GUI AppImage
+(`ICEDRIVE_MODE='appimage'`), not this CLI.** The CLI is real, it works, and it
+stays available as `ICEDRIVE_MODE='cli'` — everything below is what one session
+with a live account established about it. It was not chosen because it is a
+**mount** client rather than a **sync** client, and because the vendor documents
+it essentially not at all. The Owner: *"if there is no documentation of this,
+it's likely safest just to drop back to the desktop."*
 
-Everything on this page below the first section was **measured**, on
-`IcedriveCLI-v3.62`, on 2026-08-27 — not read from vendor documentation, which
-barely exists. Where something is unproven it says so in those words.
+This page is therefore two things: the record of a road not taken, and the
+reference for anyone who takes it later. Everything here was **measured** on
+`IcedriveCLI-v3.62` on 2026-08-27 — not read from documentation, which barely
+exists. Where something is unproven it says so in those words.
+
+**Neither client is on by default.** MiniPC-Deployer ships IceDrive off;
+HomeHub's `config.homehub.psd1` selects `off` / `appimage` / `cli`, and that one
+declaration drives both what the USB carries and what firstboot activates. See
+[../remote-ui/README.md](../remote-ui/README.md), "The two halves".
 
 ---
 

@@ -1,102 +1,145 @@
-# Remote light UI (RDP) — an opt-in that nothing turns on
+# Remote light UI (RDP) — shipped OFF here, activated by HomeHub
 
-**Implements: SR-015.** **REMOVED FROM THE IMAGE AND FROM THE BOX 2026-08-27**
-(the Owner: *"GUI can be removed… from the image and from the box, along with
-the auto-desktop startup"*). This reverts the 2026-08-26 ruling that shipped the
-layer on by default, and restores SN-012's original shape — an opt-in a human
-runs deliberately.
+**Implements: SR-015.** **This repo defaults it OFF** (the Owner, 2026-08-27:
+*"Deployer I'm okay with as long as it defaults IceDrive and remote desktop to
+off from its side, and gets configured to active from the HomeHub"*). A hub
+built straight from MiniPC-Deployer has no X, no XFCE and nothing on tcp/3389.
 
-**SN-001's zero-click core now has no exception at all.** It used to be the
-whole layer; then it was narrowed to the IceDrive sign-in; now that sign-in is a
-non-interactive CLI call at provisioning and there is nothing left to except.
+HomeHub turns it on with `REMOTE_UI_ENABLED = 'true'` in
+`scripts/deploy/config.homehub.psd1`, and **that same declaration decides what
+the USB carries.** See "The two halves" below — it is the part of this design
+worth understanding before changing anything.
 
-## Why the layer lost its only tenant
+## What this layer is for
 
-It existed for exactly one app: the **IceDrive Mount & Sync** client, believed
-to be GUI-only. **It is not.** `IcedriveCLI` is a 9.8 MB headless native ELF —
-no X server, non-interactive `-login`/`-password`, FUSE mount. Measured
-2026-08-27; the whole account is in **[../icedrive/README.md](../icedrive/README.md)**,
-which is where IceDrive lives now.
+The **IceDrive Mount & Sync** GUI client. IceDrive does also ship a headless CLI
+— it works, and it is a selectable mode — but it is a *mount* client rather than
+a *sync* client and the vendor documents it almost not at all, so the Owner
+chose the supported client: *"if there is no documentation of this, it's likely
+safest just to drop back to the desktop."* Full account of what the CLI is and
+is not: [../icedrive/README.md](../icedrive/README.md).
 
-With that tenant gone, this layer was an always-listening tcp/3389, an XFCE
-session, and a systemd unit that logged a desktop in at boot — none of it in
-service of anything.
+The session also exists **at boot, with nobody connected**
+(`homehub-desktop-session.service`), which is what lets a GUI-only app run
+unattended. That mechanism is explained in `homehub-desktop-session.sh` and was
+measured across a real reboot.
 
-**Three claims that were on this page turned out to be wrong**, and they are
-listed here rather than quietly deleted, because the pattern is the point: all
-three were inherited and repeated rather than measured.
+## The two halves: carriage and activation
 
-| the claim | what is actually true |
-|---|---|
-| "the client is GUI-only — no headless daemon, no CLI" | there is a CLI, and there was one the whole time |
-| "after every reboot sync is DOWN until you open one RDP session" | corrected 2026-08-27 — the app needs a *display*, not a *client* — and now moot |
-| "`icedrive_sessId` holds the persisted session, so the password is needed once" | that key is written after a login that **failed**. The one that matters is `icedrive_stored_cred` |
+An optional feature has two decisions that happen at different times, in
+different repos:
 
-## What IS and IS NOT on the install media (2026-08-27)
+| | **Carriage** (build time, dev PC) | **Activation** (first boot, on the box) |
+|---|---|---|
+| desktop | the 22 names in `packages.optional.list`, baked only when `BAKE_OPTIONAL=1` | `REMOTE_UI_ENABLED=true` in `.env` → firstboot step 6c runs `setup-remote-ui.sh` |
+| IceDrive | `icedrive.pin` + `export-icedrive.sh --artifact appimage` | `ICEDRIVE_MODE=appimage` → the AppImage is installed and autostarted |
+
+Both are derived from **one declaration** in HomeHub, and
+`Materialize-Deploy.ps1` **refuses to emit an activation whose carriage is
+absent.**
+
+> **Why that gate exists, in one paragraph.** The two halves used to be
+> independent, and they disagreed for a month with nothing noticing: this
+> project told operators to *"RDP in and sign in to IceDrive"* while **eleven of
+> the AppImage's runtime libraries were in no image at all.** The app aborts on
+> `libwebpmux`/`libwebpdemux`/`libXss`, then dies with `Could not load the Qt
+> platform plugin "xcb" ... even though it was found` and a core dump — a
+> message that names a *plugin* rather than a *package*, so it reads like a
+> corrupt download. Only `libfuse2t64` was ever listed. **The instruction could
+> not have been carried out on any hub this repo had ever built**, and nothing
+> reported it because nothing had ever launched the app. All eleven are now in
+> `packages.optional.list`, carried with the feature.
+
+## What arrives on the media, and when
 
 | | on the USB / on the box after install |
 |---|---|
-| `setup-remote-ui.sh` + this README | **yes** — staged to `/opt/homehub/stack/remote-ui/` |
-| `xrdp`, `xorgxrdp`, `dbus-x11`, the minimal XFCE, `xvfb`, `freerdp2-x11` | **baked, NOT installed** — moved to `packages.optional.list`. They ride in `/opt/homehub/apt` and install offline whenever someone opts in |
-| `libfuse2t64` | **installed** — it did not move. The IceDrive **CLI** needs `libfuse.so.2` for its mount |
-| `homehub-desktop-session.service` | **deleted.** It existed to keep a GUI app running with nobody connected |
-| the IceDrive AppImage | **never again.** The pin now names the CLI: `../icedrive/icedrive.pin` |
+| `setup-remote-ui.sh`, `homehub-desktop-session.{sh,service}`, this README | **always** — staged to `/opt/homehub/stack/remote-ui/` |
+| the 22 desktop + AppImage-runtime packages | **only if `REMOTE_UI_ENABLED='true'`** — baked into `/opt/homehub/apt`, installed by late-command 3c only when activated |
+| the IceDrive AppImage | **only if `ICEDRIVE_MODE='appimage'`** and `APPIMAGE_SHA256` is pinned |
+| an installed, running desktop | **only if activated.** Otherwise nothing here runs |
 
-**The offline opt-in is deliberately preserved.** Packages that are not baked
-cannot be installed on a hub with no internet — `apt-get install` would reach for
-the archive at the moment you run it. That was fixed on 2026-08-26 (open-items
-E1(ii)) and removing the GUI does not undo it. It costs ~150–250 MB of image and
-buys the ability to change your mind without a reflash.
+Late-command **3c-keep** registers `/opt/homehub/apt` as a `[trusted=yes]` apt
+source on the target, so a box whose image carried the packages can still
+install them months later with no internet.
 
-## Turning it on, if some future vendor app needs a desktop
+## Connecting
 
-```sh
-sudo bash /opt/homehub/stack/remote-ui/setup-remote-ui.sh
-```
+From the dev PC, HomeHub's `HomeHubDesktop.cmd` opens the session and signs in
+with the minted `OperatorPassword`. Or point any RDP client at `<LAN_IP>:3389`
+as the hub user.
 
-Idempotent, non-interactive, and safe to re-run. It installs the packages from
-the baked repo, points `~/.xsession` at XFCE, joins `xrdp` to `ssl-cert`,
-restarts (**not** `enable --now` — see the long comment in the script; that
-distinction once cost an evening), and sets the account's UNIX password from
-`OPERATOR_PASSWORD` so PAM has something to authenticate.
+**It reconnects to the session that is already running** rather than making a
+second one — measured: `++ reconnected session: username hub, display :10.0`.
 
-From the dev PC, HomeHub's `HomeHubDesktop.cmd` does the same thing and then
-opens the session. **It is no longer required for anything** and its header says
-so.
+> **Geometry matters.** sesman's `Policy=Default` keys a session on
+> `<user, bit-depth, screen size>`, so a client arriving at a *different*
+> geometry gets a SECOND session — and IceDrive would autostart there too,
+> leaving two clients syncing the same folders. The unit and
+> `HomeHubDesktop.cmd` both use 1600x900x24 deliberately. **`-FullScreen`
+> changes the geometry and will spawn a second session.**
 
-**A session now exists only while someone is connected** — the pre-2026-08-27
-behaviour. If you ever need one at boot again, the mechanism is recorded in
-git history (`homehub-desktop-session.sh`, deleted 2026-08-27): an `xfreerdp`
-pointed at loopback under a throwaway `Xvfb`, with the client then dropped.
-`xvfb` and `freerdp2-x11` stay in the bake for exactly that possibility.
+## What this session is, and is not
 
-> **Geometry still matters if you do.** sesman's `Policy=Default` keys a session
-> on `<user, bit-depth, screen size>`, so a client arriving at a *different*
-> geometry gets a SECOND session. `HomeHubDesktop.cmd` uses 1600x900x24
-> deliberately; `-FullScreen` changes the geometry.
+It is deliberately minimal: a window manager, a panel, a terminal and Thunar.
+**`xfdesktop` is not installed**, so there is no desktop surface at all — no
+wallpaper, no desktop icons, no right-click desktop menu. `~/Desktop` exists and
+nothing renders it. There is no Applications-menu entry for IceDrive either; the
+app reaches you through the **panel's system tray**, where it registers itself.
+
+That is a deliberate trade (SR-015 says *light* UI), not an oversight. Adding a
+launcher is a `.desktop` file in `/usr/share/applications`; adding a real
+desktop means putting `xfdesktop4` into the carriage set.
+
+## What does NOT self-heal
+
+- **A crashed or logged-off session stops the client silently.** IceDrive's
+  cloud upload has no watchdog here, and since the backup service has no offsite
+  step (2026-07-29) it cannot notice either — the backup can be green while the
+  cloud copy is hours behind.
+- **GUI-configured state lives in the hub account's home directory.** A reimage
+  wipes it. **But probably less than was long assumed:** sync pairs live in the
+  *account*, not on the box (`sync-list-pairs` carries `path_local`,
+  `path_remote`, `folder_id`), so they should return with the login rather than
+  needing to be re-created. The long-standing "re-create sync pairs after every
+  reimage" checklist is very likely wrong about that, and it has not been
+  re-tested since the finding.
+- **The sign-in may not be needed at all after a CLI login.** Both clients share
+  `~/.config/Icedrive/Icedrive.conf`, and the GUI came up **already
+  authenticated and mounted** on a box where the CLI had signed in earlier
+  (observed 2026-08-27). The GUI also writes `icedrive_stored_cred`, which the
+  CLI never does. On a genuinely fresh box the one-touch sign-in still applies.
 
 ## Security stance
 
 LAN-only, exactly like Cockpit (SN-005): **never** proxy RDP through Caddy,
 **never** port-forward tcp/3389 at the router. Remote use goes through the
 future WireGuard path (D5). The script adds no user and no password auth surface
-beyond the existing hub account.
+beyond the existing hub account. On a hub with the feature off, tcp/3389 does
+not listen at all — a smaller surface than any amount of documented discipline.
 
-Now that nothing installs it, tcp/3389 does not listen on a stock hub at all —
-which is a smaller surface than any amount of documented discipline.
+## The offsite leg
 
-## The offsite leg has moved
+IceDrive runs here and is pointed at chosen library paths in its own GUI; the
+backup service performs **no offsite staging at all** (`OFFSITE_ENABLED=false`,
+and `true` is refused). That is also why the backup *ingests* network shares
+into the library: there is one current copy, and the client syncs it. Choose
+those paths from `Personal\deploy\storage-map.md` §4e, and never point one at a
+library path holding raw finance data.
 
-The old arrangement — IceDrive's GUI pointed at library paths from inside an RDP
-session, with `backup.sh` doing no offsite staging at all (`OFFSITE_ENABLED=false`)
-— is superseded. See [../icedrive/README.md](../icedrive/README.md), including
-what a single login session still has to settle before the mount can carry the
-offsite copy.
+The price is unchanged and is written down in
+[../backup/README.md](../backup/README.md): **a green backup says nothing about
+the cloud copy.** The only route that could ever close that gap is the CLI's
+FUSE mount plus `OFFSITE_PATH` — and it has its own blocker (root cannot read a
+`hub`-owned FUSE mount). See [../icedrive/README.md](../icedrive/README.md).
 
 ## Disable / remove (on a box that had it installed)
 
 ```sh
-sudo systemctl disable --now xrdp
+sudo systemctl disable --now homehub-desktop-session xrdp
 sudo apt-get remove --autoremove xrdp xorgxrdp xfce4-session   # pulls the rest
-sudo rm -f ~hub/.xsession
+sudo rm -rf /opt/icedrive ~hub/.config/autostart/icedrive.desktop ~hub/.xsession
 ```
+
+Then set `REMOTE_UI_ENABLED = 'false'` in HomeHub's `config.homehub.psd1` so the
+next image does not put it back.

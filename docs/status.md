@@ -8,6 +8,26 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+> **RESUMING FROM A COLD SESSION? START HERE (2026-08-27).**
+> The bench box is **powered off** for a physical move; the stack was stopped
+> cleanly. Branch on BOTH repos: **`IceDrive-DesktopDirection`** (MiniPC-Deployer
+> and HomeHub — they were finally cut in parallel this date).
+>
+> **The state of the day's work:** the remote desktop + IceDrive GUI are the
+> chosen direction; this repo ships both **OFF** and HomeHub activates them from
+> one declaration (`Extras` knobs in `scripts/deploy/config.homehub.psd1`).
+> Core is 28 packages; the 22 optional ones bake only on `BAKE_OPTIONAL=1`.
+>
+> **The single most useful thing to know:** the IceDrive AppImage **could never
+> have started on any hub this repo has ever built** — eleven runtime libraries
+> were missing from every image. Fixed, and the carriage/activation gate that
+> would have caught it now exists.
+>
+> **First thing to do next:** none of the new carriage path has been executed —
+> the box was restored **by hand from the Ubuntu archive**. A clean image build
+> is what proves `BAKE_OPTIONAL=1`, the offline optional resolve, and firstboot's
+> knob routing. Full account: the last audit entry in this file.
+
 - **Active gate:** G1 — Requirements, UX & constraints. This is a config/infra
   repo delivered against a ratified brief (HOMELAB_RESTRUCTURE_PLAN.md); the
   requirement spine is intentionally **high-level** (proportionality doctrine).
@@ -4628,3 +4648,112 @@ credential** - they ship inert, and the icedrive README names the five questions
 one login session would settle.
 
 **Also NOT proven:** none of this has been through a clean image build.
+
+### 2026-08-27 (later) — the GUI comes back, and the deployer gets a light core
+
+The morning's direction was reversed the same day, and the reversal is more
+useful than either endpoint.
+
+**The reversal.** IceDrive's headless CLI works — proven on the bench box with a
+live account: signed in non-interactively, the session persists so the password
+is needed exactly once, and it FUSE-mounts with no display at all. It was still
+rejected. It is a **mount** client, not a **sync** client (on a live
+authenticated session it made no sync request whatsoever), and the vendor
+documents it essentially not at all: one unanswered community thread asking for
+the option list, and a release announcement that never mentions a CLI build. The
+Owner: *"if there is no documentation of this, it's likely safest just to drop
+back to the desktop."* The supported client over the clever one. The CLI stays
+as `ICEDRIVE_MODE='cli'` rather than being deleted.
+
+**THE FINDING THAT MADE THE WHOLE DAY WORTH IT.** Restoring the desktop meant
+launching the AppImage, which nobody had ever done on a hub. **It does not
+start.** Eleven runtime libraries are missing from every image this repo has
+ever produced:
+
+```
+libwebpmux.so.3 / libwebpdemux.so.2 / libXss.so.1      -> aborts before Qt starts
+libxcb-icccm.so.4  libxcb-image.so.0  libxcb-keysyms.so.1
+libxcb-render-util.so.0  libxcb-shape.so.0  libxcb-xinerama.so.0
+libxcb-xkb.so.1  libxkbcommon-x11.so.0
+    -> "Could not load the Qt platform plugin xcb ... even though it was found",
+       then a core dump
+```
+
+Each hides behind the one in front of it, one per launch. The AppImage bundles
+Qt but not the system libraries Qt's xcb plugin links against, and the failure
+names a PLUGIN rather than a PACKAGE - so it reads like a corrupt download.
+Only `libfuse2t64` was ever listed. **Every version of this project that said
+"RDP in, sign in to IceDrive, create sync pairs" was describing a step that
+could not have completed**, and nothing reported it because nothing had ever
+launched the app. Same class as the wall image's Electron soname check, which
+already exists and which the hub has no equivalent of - that check is open work.
+
+**The structural change (the Owner):** *"Deployer I'm okay with as long as it
+defaults IceDrive and remote desktop to off from its side, and gets configured
+to active from the HomeHub."* An optional feature has TWO halves that happen at
+different times in different repos, and they used to be independent:
+
+|  | carriage (build, dev PC) | activation (first boot, box) |
+|---|---|---|
+| desktop | `packages.optional.list`, baked only when `BAKE_OPTIONAL=1` | `REMOTE_UI_ENABLED=true` |
+| IceDrive | `icedrive.pin` + `export-icedrive.sh --artifact` | `ICEDRIVE_MODE=appimage\|cli` |
+
+Both now derive from ONE declaration in HomeHub's `config.homehub.psd1`, and
+`Materialize-Deploy.ps1` refuses to emit an activation whose carriage is absent.
+
+**Changed here:**
+
+- `packages.list` is **28 core names** - no X, no RDP, no FUSE shim, no
+  IceDrive. `packages.optional.list` carries **22**: the RDP/XFCE set, the
+  eleven Qt/xcb libraries, and `libfuse2t64`.
+- `export-apt.sh` bakes the optional set only on `BAKE_OPTIONAL=1`, which this
+  repo never sets.
+- `.env.example`: `REMOTE_UI_ENABLED=false`, `ICEDRIVE_MODE=off`,
+  `ICEDRIVE_MOUNTPOINT=/srv/icedrive`.
+- firstboot step 6c reads both knobs, does nothing when off, and itself refuses
+  `appimage` without a display (a payload can be edited by hand where no dev-PC
+  gate can see).
+- `icedrive.pin` pins BOTH artifacts (`APPIMAGE_*`, `CLI_*`);
+  `export-icedrive.sh --artifact appimage|cli|off` stages exactly one and writes
+  `artifact.kind`, so `stage_icedrive_into_payload` picks the payload directory
+  by KIND rather than by sniffing a filename.
+- `homehub-desktop-session.{sh,service}` restored from history; the
+  AppImage-installing `setup-remote-ui.sh` restored and its header rewritten for
+  the new model.
+
+**Verified first-hand:**
+
+- gate G1 **PASS** (config-validate, registry-integrity, doc-navigability);
+  `bash -n` clean across firstboot, both setup scripts, the session script and
+  all three `vmtest` scripts.
+- `export-icedrive.sh` staged `off`, `appimage` and `cli` correctly, each with
+  the right `artifact.kind`.
+- HomeHub's `Materialize-Deploy -Preview` resolves every knob with the extras
+  on, and **refuses all three bad shapes**: an unknown mode; `appimage` without
+  `REMOTE_UI_ENABLED`; `appimage` with `APPIMAGE_SHA256` blank.
+- **On the bench box:** desktop reinstalled, the eleven libraries resolved one
+  at a time until Qt initialised (8 plugins load, no missing sonames), the
+  AppImage autostarted inside the boot-time session with nobody connected, and
+  the CLI mount stopped and disabled so two clients could never run together.
+  Final state before shutdown: xrdp active+enabled, desktop-session
+  active+enabled, IceDrive GUI running, 15 containers up, 0 unhealthy, 0 failed
+  units.
+- **The GUI inherited the CLI's login.** Both clients share
+  `~/.config/Icedrive/Icedrive.conf`; the GUI came up already authenticated and
+  mounted, listing real cloud content, on a box where only the CLI had signed
+  in. It also writes `icedrive_stored_cred`, which the CLI never does - the key
+  this layer originally guarded on, wrongly.
+
+**NOT PROVEN, and it is the first thing to do next:** no clean image build has
+been through the new carriage path. The bench box was restored **by hand from
+the Ubuntu archive**, not from a baked repo - its `/opt/homehub/apt` still holds
+238 debs with none of the GUI set, and no apt source was ever registered for it
+(that box predates 3c-keep). So `BAKE_OPTIONAL=1`, the optional-set offline
+resolve, and firstboot's knob routing have all been reasoned about and none has
+been executed end to end.
+
+**Also not proven:** IceDrive has **zero test cases** at any tier - the largest
+single coverage gap in HomeHub's app table.
+
+**The box is powered off** (2026-08-27 04:53 UTC), stack stopped cleanly, for a
+physical move.

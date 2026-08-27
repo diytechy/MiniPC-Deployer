@@ -212,6 +212,185 @@ if [ "$TARGET" = wall ]; then
     fi
 fi
 
+# ── 5c. the OPTIONAL EXTRAS: was activation actually EXECUTED? ───────────────
+# WHY THIS EXISTS, and it is the same argument as every other check in this
+# file. On 2026-08-27 the full lab gate PASSED while never once looking at the
+# extras. The BUILD log proved carriage — 22 optional packages baked, the
+# AppImage staged and placed on the ISO — and then the words `icedrive`, `xrdp`
+# and `appimage` did not appear again anywhere in the run. Section 3 asserts the
+# CORE package list, and the optional set is deliberately NOT in it, so nothing
+# here had an opinion. Carriage was proven twice over; activation never once.
+#
+# IT IS NOT A THEORETICAL GAP. firstboot step 6c only WARNs when
+# setup-remote-ui.sh fails — deliberately, because a box with no graphical
+# session is degraded rather than broken. The consequence is that a hub whose
+# desktop never installed reports a GREEN firstboot and a GREEN gate, which is
+# precisely the shape this file exists to refuse.
+#
+# READ THE DECLARATION OFF THE BOX, NEVER FROM A FLAG. Same discipline as
+# assert-iso-payload.sh: the .env firstboot actually routed on is the only thing
+# that can say what SHOULD be here, so this cannot be handed the wrong
+# expectation. That file is 0600 root-owned, so without root this is a SKIP —
+# never a silent pass.
+if [ "$TARGET" = hub ]; then
+    ENV_ON_BOX="$PAYLOAD_ROOT/stack/.env"
+    _envcat=""
+    if [ "$(id -u)" -eq 0 ]; then
+        _envcat="$(cat "$ENV_ON_BOX" 2>/dev/null)"
+    elif sudo -n true 2>/dev/null; then
+        _envcat="$(sudo -n cat "$ENV_ON_BOX" 2>/dev/null)"
+    fi
+
+    if [ -z "$_envcat" ]; then
+        note "SKIP: the extras — reading $ENV_ON_BOX needs root and this account cannot escalate"
+    else
+        _v() { printf '%s\n' "$_envcat" | sed -n "s/^$1=//p" | head -1 | tr -d '\r' | sed 's/^"\(.*\)"$/\1/'; }
+        RUI="$(_v REMOTE_UI_ENABLED)"
+        ICE="$(_v ICEDRIVE_MODE)"
+        note "the box declares REMOTE_UI_ENABLED=${RUI:-<absent>}  ICEDRIVE_MODE=${ICE:-<absent>}"
+
+        # An absent knob is not "off" — it is an unanswerable question. Same
+        # correction the ISO checker took on 2026-08-27, for the same reason.
+        [ -n "$RUI" ] || fail "REMOTE_UI_ENABLED is absent from $ENV_ON_BOX — what SHOULD be installed is unknowable, not off"
+        [ -n "$ICE" ] || fail "ICEDRIVE_MODE is absent from $ENV_ON_BOX — what SHOULD be installed is unknowable, not off"
+
+        if [ "$RUI" = true ]; then
+            # (a) the packages the feature needs. Read the list off the payload
+            # rather than retyping it — the same rule section 3 follows, and the
+            # reason eleven Qt/xcb libraries went missing for months is that
+            # nobody had a list to check them against.
+            OPTL="$PAYLOAD_ROOT/stack/autoinstall/packages.optional.list"
+            if [ -s "$OPTL" ]; then
+                _missing=0
+                _n=0
+                for p in $(sed 's/#.*//' "$OPTL" | awk 'NF{print $1}'); do
+                    _n=$((_n + 1))
+                    if ! dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed"; then
+                        fail "optional package NOT installed: $p"
+                        _missing=$((_missing + 1))
+                    fi
+                done
+                if [ "$_missing" -eq 0 ]; then
+                    pass "all $_n optional packages are installed (REMOTE_UI_ENABLED=true)"
+                fi
+            else
+                fail "REMOTE_UI_ENABLED=true but $OPTL is not on the box — the optional set cannot be checked"
+            fi
+
+            # (b) xrdp: the door itself.
+            if systemctl is-enabled --quiet xrdp 2>/dev/null; then
+                pass "xrdp is enabled (starts on boot)"
+            else
+                fail "xrdp is NOT enabled"
+            fi
+            if systemctl is-active --quiet xrdp 2>/dev/null; then
+                pass "xrdp is active"
+            else
+                fail "xrdp is NOT active"
+            fi
+            if command -v ss >/dev/null 2>&1; then
+                if ss -ltn 2>/dev/null | grep -q ':3389 '; then
+                    pass "tcp/3389 is listening"
+                else
+                    fail "nothing is listening on tcp/3389"
+                fi
+            fi
+
+            # (c) THE AUTO-LOGIN SESSION — the point of SR-015. A GUI-only vendor
+            # app has to run with NOBODY CONNECTED, so the session is created at
+            # boot rather than when someone dials in. The unit is oneshot +
+            # RemainAfterExit, so is-active means its ExecStart SUCCEEDED.
+            if systemctl is-enabled --quiet homehub-desktop-session.service 2>/dev/null; then
+                pass "homehub-desktop-session is enabled (the session is created at boot)"
+            else
+                fail "homehub-desktop-session is NOT enabled — no session unless a human connects"
+            fi
+            if systemctl is-active --quiet homehub-desktop-session.service 2>/dev/null; then
+                pass "homehub-desktop-session succeeded (RemainAfterExit=yes)"
+            else
+                fail "homehub-desktop-session is NOT active — the boot-time session did not come up"
+            fi
+
+            # (d) AND THE SESSION REALLY EXISTS. The unit reporting success is
+            # its own claim; an Xorg spawned by sesman is the independent fact.
+            # These are different questions, and the gap between them is exactly
+            # where a "green but no desktop" box lives.
+            if pgrep -x Xorg >/dev/null 2>&1; then
+                pass "an Xorg session is running with nobody connected (auto-login worked)"
+            else
+                fail "NO Xorg process — the unit may be green but no graphical session exists"
+                note "this is the state in which a GUI-only app silently never starts"
+            fi
+        else
+            # THE NEGATIVE IS WORTH ASSERTING TOO: a headless box that quietly
+            # grew an RDP port is the other half of the same promise.
+            if command -v ss >/dev/null 2>&1; then
+                if ss -ltn 2>/dev/null | grep -q ':3389 '; then
+                    fail "REMOTE_UI_ENABLED is not true but tcp/3389 IS listening"
+                else
+                    pass "no RDP port on a box that declares no desktop"
+                fi
+            fi
+        fi
+
+        # (e) IceDrive, keyed to the mode the box itself declares.
+        ICE_APP=/opt/icedrive/Icedrive.AppImage
+        case "$ICE" in
+          appimage)
+            if [ -x "$ICE_APP" ]; then
+                pass "the IceDrive AppImage is installed and executable ($ICE_APP)"
+                PIN="$PAYLOAD_ROOT/stack/icedrive/icedrive.pin"
+                want="$(sed 's/#.*//' "$PIN" 2>/dev/null | awk -F= '$1 ~ /^[[:space:]]*APPIMAGE_SHA256[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2; exit}')"
+                got="$(sha256sum "$ICE_APP" 2>/dev/null | cut -d' ' -f1)"
+                if [ -n "$want" ] && [ "$want" = "$got" ]; then
+                    pass "the installed AppImage matches the pin ON THE BOX"
+                else
+                    fail "installed AppImage sha256 mismatch: box=$got pin=${want:-<unset>}"
+                fi
+                # The autostart entry is what brings it up inside the session.
+                if ls /home/*/.config/autostart/icedrive.desktop >/dev/null 2>&1; then
+                    pass "the IceDrive autostart entry is in place"
+                else
+                    fail "no ~/.config/autostart/icedrive.desktop — the app would never start itself"
+                fi
+                # AND IS IT ACTUALLY RUNNING. Everything above is about things
+                # being PLACED; this is the only line that says the app STARTED —
+                # the claim this project made for months while eleven runtime
+                # libraries were missing and it could not launch at all.
+                if pgrep -f 'Icedrive.AppImage' >/dev/null 2>&1; then
+                    pass "IceDrive is RUNNING with nobody connected"
+                else
+                    fail "IceDrive is NOT running — installed and autostarted, but no process"
+                    note "this is the pre-2026-08-27 failure exactly: it aborts on a missing"
+                    note "runtime library and names a Qt PLUGIN rather than a package"
+                fi
+            else
+                fail "ICEDRIVE_MODE=appimage but $ICE_APP is absent — ACTIVATION WITHOUT INSTALL"
+            fi
+            ;;
+          cli)
+            if [ -x /usr/local/bin/icedrive ] || [ -x /opt/icedrive/IcedriveCLI ]; then
+                pass "the IceDrive CLI is installed"
+            else
+                fail "ICEDRIVE_MODE=cli but no CLI binary is on the box"
+            fi
+            if [ -e "$ICE_APP" ]; then
+                fail "ICEDRIVE_MODE=cli but the AppImage is installed too — two clients fight over one account"
+            else
+                pass "no AppImage (mode is cli)"
+            fi
+            ;;
+          off)
+            if [ -e "$ICE_APP" ]; then
+                fail "ICEDRIVE_MODE=off but $ICE_APP is installed anyway"
+            else
+                pass "no IceDrive client (mode is off)"
+            fi
+            ;;
+        esac
+    fi
+fi
+
 # ── 6. can anyone get back in? ─────────────────────────────────────────────
 # The 2026-08-06 box was unreachable by every path at once: sshd absent AND the
 # console account password-locked. Either alone is survivable; together they

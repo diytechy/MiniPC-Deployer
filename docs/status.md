@@ -5226,3 +5226,64 @@ content and nothing here will remove it.
 **Still true and unchanged:** this is the LAB VM, not the real hub. Its VHDX
 carries these credentials and the pair, and `Clear-LabVms` destroys it. The
 sequence above is what a real hub will do; it is not the real hub having done it.
+
+### 2026-08-27 (late) — the backup path ran for the first time, and a restore came back identical
+
+The Owner asked whether the Library and PriBackup drives could be virtualised and
+tested. They were already virtualised — the gate formats two 8 GB exFAT stand-ins
+and mounts them **by label** (`Library` → `/srv/library`, `PriBackup` →
+`/mnt/backup-drive`) — but nothing had ever run **through** them. That is C18, and
+this is the first time the container has moved a byte.
+
+**Why they were invisible in the desktop, since it is a fair question:** they
+mount from the generated fstab at `/srv/library` and `/mnt/backup-drive`, not
+under `/media`, so a file manager sidebar never lists them; and `/mnt/backup-drive`
+is `uid=65532,dmask=0077`, i.e. **deliberately unreadable to the operator
+account** — it belongs to the backup service, not the person.
+
+**The preflight refused first, correctly.** 8 GB free against a 100 GB floor:
+*"REFUSING TO RUN: the backup drive is below its floor… THERE IS NO AUTOMATIC
+RETENTION (Q-FB2) — nothing here deletes a snapshot, so this will not clear
+itself."* It also reported the drive-identity mismatch as a visible NOTE rather
+than a stop — the designed stand-in verdict. Floor lowered to 1 GB **on the box
+only**; the repo default stays 100.
+
+**Then it ran.** 10 files (four seeded, six pre-existing `.immich` markers),
+stored as content-addressed 7z objects with per-file dedup, a `DIRECTORIES.csv`
+sidecar for empty directories, and `MANIFEST.csv` + its `.meta` witness. Container
+**exit 0**, `Backup set 'library' completed`, 8.8 MB on the drive.
+
+**AND THE RESTORE CAME BACK BYTE-IDENTICAL.** The drive carries its own restore
+tooling (`reconstruct.sh`, `RECONSTRUCT.ps1`, `.bat`, the module and the hashing
+DLL), so the test used the ON-DRIVE script, not the repo:
+
+```
+Manifest verified against its witness (version 2, rows=10, bytes=1754).
+Directory sidecar: 10 row(s), 10 directory(ies) created.
+Reconstruction complete: 10 file(s).
+```
+
+`diff -r` between `/srv/library` and the restored tree: **no differences.** The
+8 MB random blob's sha256 matches exactly. Exit 0.
+
+**THE ONE FAILURE, AND IT IS THE CONTRACT WORKING.** The wrapper exited
+**non-zero** even though the backup succeeded, because the NagLight POST returned
+HTTP 000:
+
+> *the library backup itself succeeded, but the NagLight POST did not land.
+> Exiting non-zero so this unit reports FAILED. A backup nobody was told about is
+> not a backup that reported — from outside this box it looks exactly like a run
+> that never happened.*
+
+NagLight is not reachable from this lab VM, so that is an environment artifact
+rather than a defect — but it is worth recording that the never-silent-green
+contract fired exactly as written, and that it distinguishes "the backup failed"
+from "the backup worked and could not be reported".
+
+**What this does and does not close.** It proves the CODE PATH end to end:
+preflight, capacity floor, mount identity, the container, dedup, the manifest
+witness, and a byte-identical restore from the drive's own tooling. It does NOT
+close **C18**, which is about physical stand-ins and then the real 4 TB + 8 TB
+disks on the real hub — USB enclosures, `hdparm` standby and multi-day runs are
+untouched here. The `drive-power` step even said so on exit: *"device not
+present, skipping"*.

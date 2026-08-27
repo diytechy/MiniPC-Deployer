@@ -261,12 +261,28 @@ if [ -f "$(dirname "$0")/homehub-desktop-session.service" ]; then
     # claim was corrected in f783ff3), so the measured result on 2026-08-27 was
     # a unit sitting "enabled, inactive (dead)" with NO journal entries at all,
     # and a freshly installed box with no desktop and no running GUI app.
-    if systemctl start homehub-desktop-session.service >/dev/null 2>&1; then
-        log "boot-time session unit enabled AND started — a session exists now,"
-        log "  with nobody connected, and again after every reboot"
+    # --no-block IS LOAD-BEARING, and leaving it out DEADLOCKS THE BOOT.
+    # This script runs INSIDE homehub-firstboot.service, and the unit it is
+    # starting is ordered `After=homehub-firstboot.service`. A blocking
+    # `systemctl start` therefore waits for a unit that cannot begin until this
+    # script's own service finishes - and it never will, because it is waiting
+    # here. Measured 2026-08-27 on a clean install: firstboot sat in
+    # `activating` for 18 minutes with `systemctl start` blocked, the session
+    # unit inactive, and `multi-user.target start waiting` in the job queue.
+    # The whole boot was wedged by two fixes that were each correct alone.
+    #
+    # --no-block ENQUEUES the job and returns. systemd runs it as soon as the
+    # ordering allows, i.e. the moment firstboot completes. So the ordering
+    # guarantee is kept and the deadlock is not possible.
+    if systemctl start --no-block homehub-desktop-session.service >/dev/null 2>&1; then
+        log "boot-time session unit enabled, and its start QUEUED (--no-block)"
+        log "  systemd runs it the moment firstboot finishes - it cannot run"
+        log "  sooner, because the unit is ordered After=homehub-firstboot"
+        log "  check it afterwards with:"
+        log "    systemctl is-active homehub-desktop-session.service"
     else
-        log "  WARNING: the session unit is enabled but would not START now."
-        log "    This box has no desktop until it reboots. Diagnose with:"
+        log "  WARNING: could not queue the session unit start."
+        log "    This box will have no desktop until it reboots. Diagnose with:"
         log "      systemctl status homehub-desktop-session.service"
         log "      journalctl -u homehub-desktop-session.service"
     fi

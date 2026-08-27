@@ -138,7 +138,13 @@ if [ -r "$ENV_FILE" ]; then
     # Read ONLY the one key, and never `source` the file: .env holds every
     # secret the stack has, and sourcing it into this shell would put all of
     # them in this process's environment for anything it later execs.
-    OPERATOR_PASSWORD="$(sed -n 's/^OPERATOR_PASSWORD=//p' "$ENV_FILE" | head -1)"
+    # tr -d '\r' because a value that reaches .env with a CR would set a
+    # password nobody can type. The emitter writes LF only, so this is defence
+    # in depth rather than a known defect - but the HomeHub launcher hit exactly
+    # this shape once (PowerShell's pipeline appended CRLF to a chpasswd line,
+    # and the account then rejected the real secret from every direction while
+    # nothing anywhere reported a fault), so it is worth one cheap guard.
+    OPERATOR_PASSWORD="$(sed -n 's/^OPERATOR_PASSWORD=//p' "$ENV_FILE" | head -1 | tr -d '\r')"
 else
     OPERATOR_PASSWORD=""
     log "NOTE: no readable $ENV_FILE — cannot set the RDP password from it"

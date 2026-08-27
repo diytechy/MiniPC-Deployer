@@ -190,6 +190,43 @@ containerd.io
 docker-buildx-plugin
 docker-compose-plugin
 
+# ── the IceDrive GUI AppImage's RUNTIME DEPENDENCIES ────────────────────────
+# THE APPIMAGE COULD NEVER HAVE RUN ON A STOCK HUB, and nobody had found out
+# because it had never been launched on one. Measured on the bench box
+# 2026-08-27 by installing it and following the failures one at a time:
+#
+#   libwebpmux.so.3      -> the binary aborts before Qt starts
+#   libwebpdemux.so.2       "
+#   libXss.so.1             "
+#   libxcb-icccm.so.4    -> "Could not load the Qt platform plugin xcb ...
+#   libxcb-image.so.0        even though it was found", then a core dump.
+#   libxcb-keysyms.so.1      Eight more, one per launch, each hidden behind
+#   libxcb-render-util.so.0  the one in front of it.
+#   libxcb-shape.so.0
+#   libxcb-xinerama.so.0
+#   libxcb-xkb.so.1
+#   libxkbcommon-x11.so.0
+#
+# The AppImage bundles Qt but NOT the system libraries Qt's xcb platform plugin
+# links against, and the failure names a plugin rather than a package - so it
+# reads like a corrupt download rather than a missing dependency.
+#
+# THIS IS THE SAME CLASS THE WALL IMAGE ALREADY GUARDS: validate_config.py
+# checks "every Electron runtime package is in the wall image (27 sonames ->
+# 23 packages)". The hub had no equivalent check for its one AppImage, which is
+# why an untested claim survived. Adding one is open work.
+libwebpmux3
+libwebpdemux2
+libxss1
+libxcb-icccm4
+libxcb-image0
+libxcb-keysyms1
+libxcb-render-util0
+libxcb-shape0
+libxcb-xinerama0
+libxcb-xkb1
+libxkbcommon-x11-0
+
 # ── the FUSE 2 shim, for the IceDrive CLI ───────────────────────────────────
 # Ubuntu 24.04 ships libfuse3; IcedriveCLI is a native ELF linked against
 # libfuse.so.2 and will not start without this. Measured 2026-08-27: `ldd` on

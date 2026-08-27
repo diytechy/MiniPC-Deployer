@@ -1670,11 +1670,26 @@ stage_icedrive_into_payload() {
     }
     kind="$(tr -d '[:space:]' < "$ice_out/artifact.kind")"
     case "$kind" in
-        appimage) dest="$out_dir/deploy-payload/stack/remote-ui"; name="Icedrive.AppImage" ;;
-        cli)      dest="$out_dir/deploy-payload/stack/icedrive";  name="IcedriveCLI" ;;
+        appimage) dest="$out_dir/iso-root/deploy-payload/stack/remote-ui"; name="Icedrive.AppImage" ;;
+        cli)      dest="$out_dir/iso-root/deploy-payload/stack/icedrive";  name="IcedriveCLI" ;;
         *) die "stage_icedrive_into_payload: unknown artifact kind '$kind' in $ice_out/artifact.kind" ;;
     esac
 
+    # THE PAYLOAD ROOT IS ASSERTED, and this guard exists because its absence is
+    # exactly how this function was broken from the day it was written.
+    #
+    # `iso-root/` was missing from both destinations between 2026-08-26 and
+    # 2026-08-27. The staged binary went to $out_dir/deploy-payload/... - a
+    # directory nothing reads - while the ISO is built from
+    # $out_dir/iso-root/deploy-payload. mkdir -p happily created the wrong tree,
+    # install succeeded, the log said "staged", and the ISO carried nothing.
+    #
+    # It was never noticed because icedrive.pin was unset until 2026-08-27, so
+    # the function always returned at the "nothing to stage" branch above. The
+    # first build that actually had an artifact to place is the build that found
+    # it. mkdir -p can create any path you ask for, so the only way to catch a
+    # wrong one is to require that the parent ALREADY exists.
+    [ -d "$out_dir/iso-root/deploy-payload" ] || die "stage_icedrive_into_payload: $out_dir/iso-root/deploy-payload does not exist, so this would silently create a payload tree nothing reads. The repo copy runs before this; if it has not, the caller is out of order."
     [ -f "$ice_out/$name" ] || die "stage_icedrive_into_payload: artifact.kind says '$kind' but $ice_out/$name is missing. Re-run vmtest/export-icedrive.sh."
     [ -f "$ice_out/$name.sha256" ] || die "stage_icedrive_into_payload: $ice_out has a binary but no .sha256 beside it. The box refuses to install an unverified vendor binary, so this would ship a file it will not use."
 

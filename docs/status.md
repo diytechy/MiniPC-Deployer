@@ -5054,3 +5054,66 @@ it standing.
   rebuilt them, so the booted images include today's FileBackup container and
   the eleven other changed inputs. The invariants held on both, but the bytes
   differ.
+
+### 2026-08-27 (evening) — the activation assertion found the feature never worked
+
+The extras assertion (section 5c) was added and the gate re-run with `All-Keep`.
+It **FAILED — 16 checks**, and every failure was real. The headline feature of
+the last two days had never worked on a real box, and three gates had passed
+over it.
+
+**What the assertion found, and then what the box confirmed directly:**
+
+1. **Thirteen of the twenty-two optional packages were NEVER INSTALLED** — all
+   eleven Qt/xcb runtime libraries, plus `xvfb` and `freerdp2-x11`. They were
+   baked into the offline repo and asserted present on the ISO; nothing ever
+   installed them. `setup-remote-ui.sh` carried a **hardcoded list of nine
+   names** — exactly the nine that passed — and it was never updated when the
+   eleven were added to `packages.optional.list` on 2026-08-27.
+2. **The AppImage still could not start.** Run by hand on the box:
+   `libwebpmux.so.3: cannot open shared object file`. That is the FIRST library
+   in the original chain. The 2026-08-27 fix was **carriage-only**; the defect it
+   was written to fix was never actually fixed, and the docs said it was.
+3. **`xvfb`/`freerdp2-x11` missing meant the boot-time session could not run**,
+   so there was no desktop at all. `setup-remote-ui.sh` even WARNED about this —
+   into a firstboot log nobody reads — and the warning was itself stale, saying
+   "they are in packages.list" when they are in `packages.optional.list`.
+4. **`enable` is not `start`.** The session unit was `enabled, inactive (dead)`
+   with **no journal entries at all**. It is `WantedBy=multi-user.target`, which
+   the box passed long before firstboot reached it, so a fresh install got a
+   session scheduled for the NEXT boot and none at the time. The comment
+   justifying that cited "the reboot that usually follows" — a claim already
+   corrected in `f783ff3`, because there is no such reboot.
+
+**Fixed here, and both fixes verified on the live box:**
+
+- `setup-remote-ui.sh` now **reads `packages.optional.list`** instead of a
+  hardcoded list, and refuses rather than falling back to a built-in default —
+  a silent default is precisely what drifted. Measured after the change:
+  `22 package(s) from packages.optional.list`, installed **offline from the
+  baked repo**, which also proves the carriage half was right all along.
+- The session unit is now **started as well as enabled**, with a WARNING that
+  names the diagnosis if it will not start.
+
+**Proven on the box after a clean reboot:** all 22 optional packages installed,
+`xrdp` enabled + active, tcp/3389 listening, the session unit enabled AND
+active, and **an Xorg session running with nobody connected** — the SR-015
+auto-login working, unattended, for the first time. Launched into that display
+the AppImage **starts and stays up** (banner: `Icedrive Mount/Sync App`,
+version 3.62, alive past 45 s). The ALSA errors it prints are a VM with no sound
+device.
+
+**STILL OPEN, and it is a DIFFERENT defect from the one fixed.** After a clean
+reboot the XFCE autostart entry does **not** produce a running IceDrive:
+`~/.config/autostart/icedrive.desktop` is present and correct,
+`xfce4-session` is running, `.xsession-errors` says nothing, and the same binary
+launched by hand into the same display works. So this is an **autostart
+mechanism** problem, not the missing-library problem. The assertion stays RED on
+it, which is exactly what it is for. `~/.config/Icedrive/` does not exist, so the
+app has still never been signed in — the SN-001 hands-on step.
+
+**The lesson, stated plainly, because it has now repeated three times:** a
+feature has a carriage half and an activation half, and this project keeps
+proving the first and assuming the second. Carriage was asserted on the ISO;
+activation was asserted nowhere; three green gates ran over a feature that had
+never once functioned. The assertion that found it took twenty minutes to write.

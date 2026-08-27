@@ -71,13 +71,35 @@ RDP_HOME="$(getent passwd "$RDP_USER" | cut -d: -f6)"
 # ── 1. packages: xrdp + minimal XFCE + AppImage FUSE shim ────────────────────
 # --no-install-recommends keeps this a LIGHT UI (no office suite, no full
 # xubuntu set) — the session only exists to run a vendor GUI.
-log "installing xrdp + minimal XFCE session (apt, non-interactive)"
+# READ THE LIST, NEVER RETYPE IT - and this file is why that rule exists.
+# Until 2026-08-27 the names were HARDCODED here, and on that date eleven
+# Qt/xcb runtime libraries plus xvfb and freerdp2-x11 were added to
+# packages.optional.list so the image would CARRY them. This line was never
+# updated. Measured on a real box the same day:
+#
+#   * all 22 were baked into the offline repo and asserted present on the ISO;
+#   * exactly the 9 named here were installed;
+#   * the AppImage still died on "libwebpmux.so.3: cannot open shared object
+#     file" - the identical defect the eleven were added to fix; and
+#   * Xvfb and xfreerdp were absent, so the boot-time session could not run.
+#
+# The feature was carried, verified, and non-functional. Nothing reported it,
+# because carriage and installation were TWO lists and only one was checked.
+# So there is now ONE list, and it is the one the bake already used.
+log "installing the optional feature set (apt, non-interactive, from the baked repo)"
 export DEBIAN_FRONTEND=noninteractive
+OPT_LIST="${OPT_LIST:-/opt/homehub/stack/autoinstall/packages.optional.list}"
+[ -f "$OPT_LIST" ] || OPT_LIST="$(dirname "$0")/../autoinstall/packages.optional.list"
+# NO SILENT FALLBACK TO A BUILT-IN LIST. A hardcoded default is precisely what
+# drifted, invisibly, for the whole life of the feature.
+[ -f "$OPT_LIST" ] || die "packages.optional.list not found (looked in /opt/homehub/stack/autoinstall/ and beside this script). It is the list export-apt.sh baked; without it there is no way to know what this feature needs."
+OPT_PKGS="$(sed 's/#.*//' "$OPT_LIST" | awk 'NF{print $1}' | tr '
+' ' ')"
+[ -n "$OPT_PKGS" ] || die "$OPT_LIST parses to no package names - refusing to install nothing and call it success."
+log "  $(printf '%s' "$OPT_PKGS" | wc -w) package(s) from $(basename "$OPT_LIST")"
 apt-get update -q
-apt-get install -y -q --no-install-recommends \
-    xrdp xorgxrdp dbus-x11 \
-    xfce4-session xfwm4 xfce4-panel xfce4-terminal thunar \
-    libfuse2t64
+# shellcheck disable=SC2086
+apt-get install -y -q --no-install-recommends $OPT_PKGS
 
 # ── 2. session wiring for the RDP user ───────────────────────────────────────
 # xrdp starts whatever ~/.xsession says; without it the login lands in a black
@@ -204,11 +226,22 @@ if [ -f "$(dirname "$0")/homehub-desktop-session.service" ]; then
     install -m0644 -o root -g root "$(dirname "$0")/homehub-desktop-session.service"         /etc/systemd/system/homehub-desktop-session.service
     systemctl daemon-reload
     systemctl enable homehub-desktop-session.service >/dev/null 2>&1
-    log "boot-time session unit enabled — after every reboot a session exists with"
-    log "  nobody connected, so a GUI app autostarted in it keeps running"
-    if ! command -v Xvfb >/dev/null || ! command -v xfreerdp >/dev/null; then
-        log "  WARNING: xvfb and/or freerdp2-x11 are missing, so that unit will FAIL."
-        log "    They are in packages.list; on a box predating that: apt-get install xvfb freerdp2-x11"
+    # ENABLE IS NOT START, and on a FIRST INSTALL that difference is the whole
+    # feature. This unit is WantedBy=multi-user.target, which the box passed
+    # long before firstboot reached here, so enabling it schedules a session for
+    # the NEXT boot and creates none now. An earlier comment justified that with
+    # "the reboot that usually follows anyway" — there is no such reboot (that
+    # claim was corrected in f783ff3), so the measured result on 2026-08-27 was
+    # a unit sitting "enabled, inactive (dead)" with NO journal entries at all,
+    # and a freshly installed box with no desktop and no running GUI app.
+    if systemctl start homehub-desktop-session.service >/dev/null 2>&1; then
+        log "boot-time session unit enabled AND started — a session exists now,"
+        log "  with nobody connected, and again after every reboot"
+    else
+        log "  WARNING: the session unit is enabled but would not START now."
+        log "    This box has no desktop until it reboots. Diagnose with:"
+        log "      systemctl status homehub-desktop-session.service"
+        log "      journalctl -u homehub-desktop-session.service"
     fi
 else
     log "NOTE: no homehub-desktop-session.service beside this script — the session"

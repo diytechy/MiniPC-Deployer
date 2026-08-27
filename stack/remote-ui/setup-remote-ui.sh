@@ -28,8 +28,11 @@
 #      client launches whenever the RDP session starts.
 #
 # What it deliberately does NOT do:
-#   - download the AppImage (vendor URLs churn; fetch it from icedrive.net on
-#     your workstation, scp it over, pass ICEDRIVE_APPIMAGE=/path/to/it);
+#   - download the AppImage. icedrive.net is behind Cloudflare and answers 403
+#     to anything that is not a browser, so nothing here or in the build can
+#     fetch it. It arrives one of two ways: pinned into the image (see
+#     stack/remote-ui/icedrive.pin, which firstboot passes in), or by hand -
+#     download it, scp it over, pass ICEDRIVE_APPIMAGE=/path/to/it;
 #   - configure the IceDrive account/sync pairs (GUI-only, done over RDP —
 #     see README.md, including what does NOT self-heal);
 #   - expose anything off-LAN (like Cockpit: never proxy through Caddy, never
@@ -41,7 +44,8 @@
 #   Outputs: xrdp enabled+running; ~/.xsession for the RDP user; optionally
 #            /opt/icedrive/Icedrive.AppImage + the user's autostart entry.
 #   Raises:  nonzero exit with a FATAL line on any failed step (fail loudly).
-# Implements: SR-015 (SN-012; SN-001 opt-in exception; SN-005 LAN-only)
+# Implements: SR-015 (SN-012 AMENDED 2026-08-26 - no longer opt-in; SN-001's
+#             exception narrowed to the IceDrive sign-in; SN-005 LAN-only)
 set -euo pipefail
 
 log() { echo "[remote-ui] $*"; }
@@ -116,7 +120,7 @@ if ! sudo -u xrdp test -r /etc/ssl/private/ssl-cert-snakeoil.key; then
     log "  password). Check:  id xrdp   and   ls -l /etc/ssl/private/"
 fi
 log "xrdp active — connect with any RDP client to <LAN_IP>:3389 as $RDP_USER"
-log "LAN-ONLY: never proxy this through Caddy or port-forward 3389 (SN-005/SN-012)"
+log "LAN-ONLY: never proxy this through Caddy or port-forward 3389 (SN-005)"
 
 # ── 3b. the account password xrdp authenticates against ──────────────────────
 # WITHOUT THIS THE WHOLE LAYER INSTALLS AND THEN REFUSES EVERY LOGIN. `hub` is

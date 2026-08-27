@@ -8,25 +8,46 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-> **RESUMING FROM A COLD SESSION? START HERE (2026-08-27).**
+> **RESUMING FROM A COLD SESSION? START HERE (2026-08-27, night).**
 > The bench box is **powered off** for a physical move; the stack was stopped
 > cleanly. Branch on BOTH repos: **`IceDrive-DesktopDirection`** (MiniPC-Deployer
 > and HomeHub — they were finally cut in parallel this date).
 >
-> **The state of the day's work:** the remote desktop + IceDrive GUI are the
-> chosen direction; this repo ships both **OFF** and HomeHub activates them from
-> one declaration (`Extras` knobs in `scripts/deploy/config.homehub.psd1`).
-> Core is 28 packages; the 22 optional ones bake only on `BAKE_OPTIONAL=1`.
+> **What changed tonight: the carriage path has now been EXECUTED.** The
+> previous header's "first thing to do next" is done. Both images were built
+> from the new light-core arrangement and then **interrogated** rather than
+> trusted:
 >
-> **The single most useful thing to know:** the IceDrive AppImage **could never
-> have started on any hub this repo has ever built** — eleven runtime libraries
-> were missing from every image. Fixed, and the carriage/activation gate that
-> would have caught it now exists.
+> | | ISO | payload assertions |
+> |---|---|---|
+> | hub  | `vmtest/.out/repacked.iso` — 6.13 GiB | **17 / 17** |
+> | wall | `vmtest/.out-wall/wall-repacked.iso` — 3.41 GiB | **5 / 5** |
 >
-> **First thing to do next:** none of the new carriage path has been executed —
-> the box was restored **by hand from the Ubuntu archive**. A clean image build
-> is what proves `BAKE_OPTIONAL=1`, the offline optional resolve, and firstboot's
-> knob routing. Full account: the last audit entry in this file.
+> The wall build is notable on its own: **no production wall ISO had ever been
+> built before**, and it built clean on the shared code. On the hub ISO the
+> IceDrive AppImage is present, its sha256 matches the pin, the travelling
+> `.sha256` beside it agrees, the CLI is absent (one client only), and the 22
+> optional packages are in the repo and **not** install-listed. The wall's five
+> are the payload root plus repo membership — IceDrive is a hub-only concern and
+> the wall run does not assert on it.
+>
+> **Three defects, every one of them in a code path that had never run** — the
+> systemd cascade, the AppImage that never reached the ISO, and (that morning)
+> the eleven missing runtime libraries. Any ONE of them alone made *"RDP in and
+> sign in to IceDrive"* impossible. Full account: the last audit entry here.
+>
+> **The gap that is left, stated plainly:** everything above proves what the
+> images CONTAIN. **None of it proves they boot and converge.** `Get-VM` refuses
+> without elevation, so that test needs the Owner at the keyboard —
+> `VirtualHomeHub.cmd`, one UAC prompt. It is the only thing that closes the gap
+> and the one test an agent cannot run here.
+>
+> **Two things are flagged for the Owner rather than fixed** (both in HomeHub's
+> `open-items.md`): the wall image gets its version-locked systemd siblings
+> **transitively** — the assertion prints exactly that word — so it is one
+> dependency change away from the identical break the hub just had (**A27**;
+> naming two packages costs nothing and removes the risk). And IceDrive still
+> has **zero test cases** at any tier.
 
 - **Active gate:** G1 — Requirements, UX & constraints. This is a config/infra
   repo delivered against a ratified brief (HOMELAB_RESTRUCTURE_PLAN.md); the
@@ -4757,3 +4778,123 @@ single coverage gap in HomeHub's app table.
 
 **The box is powered off** (2026-08-27 04:53 UTC), stack stopped cleanly, for a
 physical move.
+
+### 2026-08-27 (night) — both images built, and the artifact is now interrogated
+
+The morning's work was reasoned about; tonight it was **run**. Both ISOs were
+built from the light-core arrangement and then asserted. Three defects fell out,
+and the thing they have in common is the point of the entry: **every one lived
+in a code path that had never executed**, and every one was invisible to a build
+log that reported success at every step.
+
+**What was built, and what it proves:**
+
+| | ISO | assertions |
+|---|---|---|
+| hub  | `vmtest/.out/repacked.iso` — 6.13 GiB | **17 / 17** |
+| wall | `vmtest/.out-wall/wall-repacked.iso` — 3.41 GiB | **5 / 5** |
+
+**The wall ISO had never been built in production form before.** It built clean
+on the shared code, which is what the carriage split was supposed to buy and had
+never been shown to.
+
+**Defect 1 — baking the optional set silently dropped two systemd packages, and
+apt's proposed fix was to delete the box.** `systemd-resolved` and
+`systemd-timesyncd` depend on `systemd (= <exact version>)`, so every bake pulls
+the archive's current systemd (255.4-1ubuntu8.17) against the 24.04.4 base's
+8.12 — which obliges apt to upgrade the version-locked siblings in lockstep. Two
+were not in the repo, and the two failures look nothing alike:
+
+- `systemd-sysv` absent → `init : PreDepends: systemd-sysv but it is not going
+  to be installed`, and the offline resolve simply dies.
+- `libpam-systemd` absent → **apt does not fail.** It plans to REMOVE it, and
+  that cascades into `dbus-user-session`, `polkitd`, `packagekit`,
+  `modemmanager`, `software-properties-common`, `snapd`, `ubuntu-standard`,
+  `ubuntu-server`, `ubuntu-server-minimal`. Naming one package deletes the boot
+  path. `export-apt.sh`'s `--no-remove` guard is the only thing between that
+  plan and an ISO, and it earned its keep.
+
+**The part worth carrying forward:** whether apt downloads a transitive
+dependency **depends on what else is in the closure**. Measured both ways with
+identical systemd versions — the core list alone fetched `systemd-sysv` (238
+debs, resolve OK); the same core list plus the 22 optional packages did not (430
+debs, resolve BROKEN). Nothing about the core list changed. So switching on an
+unrelated feature can silently remove a core dependency, and it surfaces in a
+message naming neither. Rather than iterate on error messages, the complete set
+was derived from the ISO's own dpkg status — every base package carrying a
+strict `systemd (=)` or `libsystemd-shared (=)` dependency — and written into
+`packages.list` as a re-checkable invariant.
+
+**Defect 2 — the AppImage never reached the ISO.**
+`stage_icedrive_into_payload` wrote to `$out_dir/deploy-payload/…` while its four
+sibling stagers all write to `$out_dir/`**`iso-root`**`/deploy-payload/…`. So the
+118 MB AppImage was installed into a stray tree, `mkdir -p` created it without
+complaint, `install` succeeded, the log said "staged", and the ISO carried
+nothing. **Every signal was green.** Pre-existing from `ef826bc` and faithfully
+preserved through the later rewrite; it survived because `icedrive.pin` was
+unset, so the function always returned at its "nothing to stage" branch. **The
+first build with an artifact to place is the build that found it.** The fix adds
+the guard that would have caught it instantly: the payload ROOT must already
+exist before anything stages into it, because `mkdir -p` will create any path
+you ask for.
+
+**Defect 3 — (that morning) the eleven missing runtime libraries.** Recorded in
+the previous entry. The app could not have started even if it had arrived.
+
+Any ONE of the three alone made *"RDP in and sign in to IceDrive"* impossible.
+
+**What was added so this cannot recur quietly.** `vmtest/assert-iso-payload.sh`
+(new) asks the **artifact**, not the build log — the house rule applied to the
+one output that actually gets flashed. It asserts the payload root; that
+`ICEDRIVE_MODE` is known and coherent with `REMOTE_UI_ENABLED`; that the
+artifact the mode names is present, matches `icedrive.pin`, and agrees with its
+travelling `.sha256`; that the OTHER client is absent; that the bake-only
+packages are in the repo and NOT in `packages.baked.list`; and that
+`OPERATOR_PASSWORD` is non-empty. It reads the expected state out of **the
+payload's own `.env`**, so it cannot be pointed at the wrong expectation.
+
+**One assertion was wrong the first time, and the correction is the more useful
+half.** It required `systemd-sysv`/`libpam-systemd` to be **install-listed** —
+the hub's fix — and so failed a wall ISO that was perfectly correct. The real
+invariant is **repo membership**: if the repo carries a systemd newer than the
+install base, every version-locked sibling must be present, *however it got
+there*. The check now reports which, and the distinction is itself the finding:
+
+- **hub** — named in `packages.list`. Robust.
+- **wall** — **transitively**, via the graphical closure. It works today.
+
+**A LIVE FRAGILITY, DELIBERATELY NOT FIXED.** The wall is one dependency change
+away from the identical break the hub just had, and defect 1 is the proof that
+transitive inclusion is not a property you can rely on — it changed under the
+hub when an unrelated feature was switched on. Naming the two packages in the
+wall list would cost nothing (they are already downloaded). It is left alone
+because panel work is scoped to "next" and the wall build currently passes;
+raised as **A27** in HomeHub's `open-items.md` for the Owner rather than decided
+here.
+
+**Verified first-hand tonight (re-run independently of the build):**
+
+- `assert-iso-payload.sh` against both finished ISOs: **hub 17/17, wall 5/5**,
+  exit 0 both times, run under `wsl -d Ubuntu`.
+- `BAKE_OPTIONAL=1` bakes 432 debs (262 M) and **both** offline proofs pass —
+  the core list and, for the first time, the bake-only optional set.
+
+**A defect found in the wiring itself, and fixed here (2026-08-27, night).** The
+assertion was wired into `Build-VentoyStick.ps1` as step 6b — and **it could
+never have fired.** The committed file carried a literal **BEL byte (0x07)**
+where `\a` had been intended, so the guard read
+`Join-Path $DeployerRepo 'vmtest<BEL>ssert-iso-payload.sh'`; `Test-Path` was
+always false and the step silently took its else-branch, printing a note that
+the ISO is not verified. The 17/17 and 5/5 above came from running the script by
+hand — **the wiring had never executed.** Exactly the failure mode the whole
+day was about: a guard that reports success by not running. Fixed in HomeHub
+(two lines); `Test-Path` now resolves True and the file still parses clean.
+
+**NOT PROVEN, and it is the whole remaining question:** all of this proves what
+the images **contain**. **None of it proves they boot and converge.** No ISO
+built tonight has been booted. `Get-VM` refuses without elevation, so
+`VirtualHomeHub.cmd` needs the Owner's UAC prompt — the one test that closes the
+gap and the one an agent cannot run here.
+
+**Also still not proven:** IceDrive has **zero test cases** at any tier, the
+largest single coverage gap in HomeHub's app table.

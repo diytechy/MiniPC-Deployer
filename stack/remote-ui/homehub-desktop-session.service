@@ -7,6 +7,20 @@ Documentation=file:///opt/homehub/stack/remote-ui/README.md
 # xrdp must be listening before anything can connect to it, and sesman is what
 # actually spawns the session.
 After=network-online.target xrdp.service xrdp-sesman.service
+# AND AFTER FIRSTBOOT, which is not obvious and is the whole reason the
+# boot-time session did not survive a reboot. homehub-firstboot.service runs on
+# EVERY boot (oneshot + RemainAfterExit, no condition guard) and its step 6c
+# calls setup-remote-ui.sh. That used to restart xrdp unconditionally, which
+# wipes sesman's in-memory session list and ORPHANS whatever session this unit
+# had just created - after which every RDP connection starts a second session
+# that collides with the orphan and dies in one second.
+#
+# setup-remote-ui.sh now only restarts xrdp when the ssl-cert group is actually
+# missing, so the collision should not arise; this ordering is the structural
+# half of the same fix. Creating the session AFTER firstboot has finished also
+# means it is created once, in a settled state, rather than racing the thing
+# most likely to restart its dependencies.
+After=homehub-firstboot.service
 Wants=network-online.target
 Requires=xrdp.service xrdp-sesman.service
 # Nothing to do on a box where the layer was never provisioned.

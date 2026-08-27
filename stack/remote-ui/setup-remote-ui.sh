@@ -139,8 +139,35 @@ adduser --quiet xrdp ssl-cert || true
 #
 # A reboot would also fix it, which is exactly why it survives a lab run and
 # surfaces on someone's first real connection.
+# RESTART ONLY WHEN THE GROUP IS ACTUALLY MISSING (2026-08-27). Everything
+# above stays true, but an UNCONDITIONAL restart here has a second effect that
+# cost the same evening back again: firstboot runs step 6c on EVERY boot, so
+# this restarted xrdp roughly 35 s after homehub-desktop-session.service had
+# just created the boot-time session. Restarting xrdp destroys sesman's
+# in-memory session list, which ORPHANS that session: the Xorg keeps running,
+# sesman no longer knows about it, and every later RDP connection therefore
+# starts a SECOND session whose xfce4-session collides with the orphan and
+# exits after one second. Measured on the box: session created 21:25:12,
+# sesman restarted 21:25:47, and every connection after that died in 1 s with
+# 'Window manager exited quickly'.
+#
+# So ask whether the restart is NEEDED rather than doing it every time. The
+# condition is the exact thing the restart exists to fix: does the RUNNING
+# xrdp process carry the ssl-cert gid?
 systemctl enable xrdp
-systemctl restart xrdp
+SSLCERT_GID="$(getent group ssl-cert | cut -d: -f3)"
+XRDP_PID="$(systemctl show -p MainPID --value xrdp 2>/dev/null)"
+_need_restart=1
+if [ -n "$SSLCERT_GID" ] && [ -n "$XRDP_PID" ] && [ "$XRDP_PID" != 0 ] \n   && awk -v g="$SSLCERT_GID" '/^Groups:/{for(i=2;i<=NF;i++) if($i==g) f=1} END{exit !f}' \n        "/proc/$XRDP_PID/status" 2>/dev/null; then
+    _need_restart=0
+fi
+if [ "$_need_restart" -eq 1 ]; then
+    log "restarting xrdp so the ssl-cert group takes effect"
+    systemctl restart xrdp
+else
+    log "xrdp already runs with the ssl-cert group - NOT restarting"
+    log "  (a restart here would orphan a boot-time session that already exists)"
+fi
 systemctl is-active --quiet xrdp || die "xrdp failed to start (journalctl -u xrdp)"
 
 # PROVE the group actually took, rather than trusting the restart. This is a

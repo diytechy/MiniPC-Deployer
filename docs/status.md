@@ -5170,3 +5170,59 @@ cannot, for an account with 2FA: the binary carries
 `2FA method isn't supported in CLI` and prompts interactively for the codes it
 does support. So the manual sign-in is not an unfixed gap — it is the deliberate
 price of 2FA on the account, and worth it.
+
+### 2026-08-27 (night) — the offsite copy is real: a pair, a reboot, and a file that arrived
+
+The Owner created a sync pair over RDP and the box was rebooted. This is the
+last unproven link in the chain, and it holds.
+
+**After the reboot, with nobody connected**, IceDrive's own log:
+
+```
+{"error":false,"count":1,"pairs":[{"id":63501,"type":"sync","crypto":1,
+                                   "ini_done":1,"folder_id":79889533, ...}]}
+run sync threads (1)
+starting sync thread for syncId 63501
+localScan:: localPath: /home/hub/Documents; remote path: /2DEL_BACKUP_Repo/TestT
+start watch on "/home/hub/Documents" id: 63501
+waiting for events
+```
+
+The pair came back, the sync thread started, and the filesystem watcher armed
+itself — none of it touched by a human.
+
+**Then data actually moved.** A file written into the watched directory over SSH
+was uploaded **six seconds later**, unattended:
+
+```
+rec:add: "/home/hub/Documents/reboot-sync-proof.txt"
+sync: pending upload: "/2DEL_BACKUP_Repo/TestT/reboot-sync-proof.txt"
+uploading crypto chunk 1 / 1
+response OK: {"error":false,"message":"Upload Successful","id":682011607, ... "crypto":1}
+File upload complete (sync)
+```
+
+`crypto: 1` throughout: the pair is an **Encrypted-folder** pair, so the payload
+and the filename are encrypted client-side before they leave the box. That is
+the arrangement the 2026-08-27 CLI investigation said was automatable, now
+demonstrated on the GUI client.
+
+**What the whole chain now proves, end to end and unattended:** boot → the
+session unit creates a desktop with nobody connected → XFCE starts → the
+autostart entry launches the AppImage → it authenticates from the stored token
+(no 2FA prompt) → it restores the pair → it watches the directory → a new file is
+encrypted and uploaded. Every link was broken at some point today, and every one
+is now asserted rather than believed.
+
+**The remaining hands-on steps are exactly two, both once per REIMAGE**: sign in
+(2FA makes this unavoidable — the CLI cannot authenticate a 2FA account) and
+create the pair (the CLI cannot draw the dialog). Neither is per-reboot.
+
+**Housekeeping the Owner may want:** the proof file
+`reboot-sync-proof.txt` is now in the account under
+`2DEL_BACKUP_Repo/TestT` — a test area by its own name, but it is real cloud
+content and nothing here will remove it.
+
+**Still true and unchanged:** this is the LAB VM, not the real hub. Its VHDX
+carries these credentials and the pair, and `Clear-LabVms` destroys it. The
+sequence above is what a real hub will do; it is not the real hub having done it.

@@ -132,7 +132,8 @@ graph LR
 | `stack/provision/` | idempotent Technitium provisioning + headless health check |
 | `stack/backup/` | the bash backup service (six-step pipeline, restore, drive power) |
 | `stack/mosquitto/` | committed MQTT broker config (tier-2 home-automation profiles) |
-| `stack/remote-ui/` | OPT-IN light RDP layer for GUI-only vendor apps (IceDrive; SR-015) |
+| `stack/remote-ui/` | OPT-IN light RDP layer for GUI-only vendor apps (SR-015). **Nothing installs or calls it since 2026-08-27** — its only tenant moved to `stack/icedrive/` |
+| `stack/icedrive/` | the headless IceDrive CLI: pinned binary, one-time non-interactive sign-in, FUSE mount unit |
 | `stack/tracker/` | deprecated reference copies (NagLight owns the build) |
 | `sim/` | V1 homehub-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
 | `vmtest/` | V3 — the real autoinstall ISO booted in Hyper-V (SIM secrets only) |

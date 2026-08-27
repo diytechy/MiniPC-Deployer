@@ -4525,3 +4525,106 @@ reports a COUNT (`N of N`) rather than stopping at the first failure — it woul
 have shown "1 of 14" immediately — and **TC-H-M11** covers skip-one-not-all.
 
 **NOT proven:** none of this has been through a clean image build.
+
+### 2026-08-27 — the GUI is removed, because IceDrive never needed it
+
+The Owner: *"GUI can be removed... from the image and from the box, along with
+the auto-desktop startup. The HomeHubDesktop can stay with clear comments that
+this is no longer required."* And, on the credential: *"ideally that just
+becomes another secret pair"* — the fresh ruling open-items E1 asked for.
+
+**The whole graphical layer existed for one app, and the premise was never
+checked.** `stack/remote-ui/README.md`, open-items E1 and SR-015 all asserted
+that IceDrive's Linux client is "GUI-only - no headless daemon, no CLI". Three
+things were built on that: nine packages in `packages.list` (defaulted ON only
+the day before, 2026-08-26), an AppImage pin, and
+`homehub-desktop-session.service`, which logged a desktop in at boot so the GUI
+client would keep syncing with nobody connected. E1's own text records why
+nobody found out: *"Nothing can be built until there is a live client to
+inspect."*
+
+**Measured on the real binary this date, with no account needed:**
+
+- `IcedriveCLI-v3.62` links **no** X11, xcb, Wayland or Qt GUI library at all -
+  only `libfuse.so.2`, `libz`, `libglib-2.0`, `libstdc++`, `libm`, `libgcc_s`,
+  `libc`. It behaves identically with `DISPLAY` unset, dead, or live.
+- `-login <user> -password <pw>` is fully non-interactive: with stdin closed it
+  reaches the vendor API and returns a real verdict (`code 1005`, invalid email
+  or password).
+- **The password cannot be kept off argv.** Three routes tried, all three answer
+  `cli: no password given`: a pipe on stdin, a pty via `script`, and omitting
+  `-password` so it prompts. Pre-seeding is not available either - the stored
+  credential is encrypted by the app itself.
+- **`icedrive_sessId` is NOT the persisted session**, contradicting what the
+  remote-ui README claimed on 2026-08-27's own predecessor commit: the conf gets
+  a fresh one after a login that FAILED. The key that matters is
+  `icedrive_stored_cred`.
+- **`--help` is not the option list.** The binary also parses `-hash`,
+  `-clearsettings`, `-newsync`, `-sync`, `-share`, `-publink`, `-history`,
+  `-requestfiles`, `-mount`, `-quit`, `-dir`, `-startup` and more. Most are IPC
+  to a running instance and no-op without one (verified: `-newsync` with no
+  instance falls straight through to the username prompt).
+- **Sync pairs live in the ACCOUNT**, not on the box: `sync-list-pairs` carries
+  `path_local`, `path_remote`, `folder_id`, `syncId`, `time_last`, `ini_done`,
+  with `processSyncPairList` and `runSyncThreads` behind it. So a reimaged box
+  fetches the list rather than starting empty - which contradicts the re-setup
+  checklist this project has been carrying. **Creating** a pair from the CLI is
+  not supported: the path is `showSyncDialog -> ... -> sync-pair-add`, and this
+  binary has no toolkit to draw a dialog with.
+- **2FA is a hard stop**: `2FA method isn't supported in CLI`.
+
+**Changed, in this repo:**
+
+- `packages.list`: the nine names moved to a re-created
+  `packages.optional.list` - baked into `/opt/homehub/apt`, installed by
+  nothing, so `HomeHubDesktop.cmd` still works on an offline hub.
+  `libfuse2t64` deliberately STAYED installed: the CLI needs `libfuse.so.2`.
+- `stack/remote-ui/`: `homehub-desktop-session.{sh,service}` **deleted**;
+  `setup-remote-ui.sh` reverted to a pure manual opt-in that installs no vendor
+  app and creates no boot session; README rewritten, listing the three claims
+  that turned out to be wrong rather than quietly deleting them.
+- `stack/icedrive/` (new): the pinned CLI, `setup-icedrive.sh` (install, ONE
+  non-interactive sign-in, mount unit), `homehub-icedrive.service`, and a README
+  that separates what was measured from what is still unproven.
+- `icedrive.pin` now pins the **CLI** (9.5 MB) instead of the 118 MB AppImage;
+  `export-icedrive.sh` and `stage_icedrive_into_payload` follow it.
+- firstboot step 6c provisions IceDrive instead of a desktop, and is a no-op
+  with no credential.
+- `.env.example` gains `ICEDRIVE_USER`/`ICEDRIVE_PASSWORD` **and
+  `OPERATOR_PASSWORD`** - see below.
+
+**A defect found on the way, and it is the useful kind.** `OPERATOR_PASSWORD`
+had **never been emitted by the pipeline**. HomeHub's `FieldSchema.psd1` had the
+knob, `setup-remote-ui.sh` and the deleted session script both read it, and
+`stack/.env.example` never carried the KEY - and the env emitter only fills keys
+a template already names. So the row was inert, nothing reported it, and the
+value on the bench box had been put there by hand during a bench session. **A
+knob with no template line is emitted by nothing and reported by nothing.**
+
+**Verified first-hand:**
+
+- `bash -n` clean on `firstboot.sh`, `setup-remote-ui.sh`, `setup-icedrive.sh`,
+  `export-icedrive.sh`, `lib/common.sh`; `python3 scripts/check.py` (gate G1)
+  **PASS** - config-validate, registry-integrity, doc-navigability.
+- `export-icedrive.sh --from` verified, cached and staged the CLI (9.5 M,
+  version 3.62) against the new pin.
+- HomeHub `Materialize-Deploy.ps1 -Preview` reports **all knobs resolve**, with
+  `OPERATOR_PASSWORD` now sourced `store` and the two `ICEDRIVE_*` knobs
+  resolving blank from the template (the shipped OFF state).
+- **On the live bench box:** units disabled, `xrdp xorgxrdp xfce4-session xfwm4
+  xfce4-panel xfce4-terminal thunar xvfb freerdp2-x11` removed with
+  `--autoremove`, the running session killed, session detritus cleaned, the
+  stale `xrdp-sesman` failed unit reset. Afterwards: **tcp/3389 does not listen,
+  no Xorg process exists, `libfuse2t64` is still installed, 15 containers
+  running with none unhealthy, and `systemctl --failed` is empty.**
+
+**NOT PROVEN, and it is the whole remaining question:** nobody has ever signed
+the CLI in. Whether the session persists (so the mount unit can carry no
+password), whether the mount survives a reboot, whether the CLI acts on the
+pairs it can list, and whether root can traverse a `hub`-owned FUSE mount are
+all open. None of it was testable without an account. `setup-icedrive.sh` and
+the mount unit are therefore written but **have never run against a real
+credential** - they ship inert, and the icedrive README names the five questions
+one login session would settle.
+
+**Also NOT proven:** none of this has been through a clean image build.

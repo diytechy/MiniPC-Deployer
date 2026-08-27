@@ -1641,35 +1641,39 @@ read_packages_list() {
 
 # stage_icedrive_into_payload OUT_DIR ICEDRIVE_OUT
 #
-# Fold what export-icedrive.sh produced into deploy-payload/stack/remote-ui/, so
-# the AppImage lands beside the script that installs it and firstboot step 6c
+# Fold what export-icedrive.sh produced into deploy-payload/stack/icedrive/, so
+# the binary lands beside the script that installs it and firstboot step 6c
 # finds it with no path knowledge of its own.
 #
+# THE CLI, NOT THE APPIMAGE, since 2026-08-27 - the GUI client and the whole
+# graphical layer were removed that day, and the destination moved from
+# stack/remote-ui/ to stack/icedrive/ with it.
+#
 # THE HASH TRAVELS WITH IT, deliberately. export-icedrive.sh already verified the
-# bytes, but an ISO can be re-burned and a payload can be edited, so firstboot
+# bytes, but an ISO can be re-burned and a payload can be edited, so the box
 # re-checks before installing rather than trusting a claim made three steps
 # earlier in a different process.
 #
-# ABSENT IS FINE AND SILENT-ISH, unlike the apt repo. A hub with no AppImage
-# still gets its graphical session and is merely missing one vendor app; a hub
-# with no baked apt repo is a bare Ubuntu with no sshd. Different stakes,
-# different reaction: this logs and continues.
+# ABSENT IS FINE AND SILENT-ISH, unlike the apt repo. A hub with no IceDrive is
+# a hub with no offsite client and nothing else wrong; a hub with no baked apt
+# repo is a bare Ubuntu with no sshd. Different stakes, different reaction: this
+# logs and continues.
 stage_icedrive_into_payload() {
     local out_dir="$1" ice_out="$2"
-    local dest="$out_dir/deploy-payload/stack/remote-ui"
+    local dest="$out_dir/deploy-payload/stack/icedrive"
 
-    if [ ! -f "$ice_out/Icedrive.AppImage" ]; then
-        log "no IceDrive AppImage to stage (icedrive.pin unset) — the image ships the session without it"
+    if [ ! -f "$ice_out/IcedriveCLI" ]; then
+        log "no IceDrive CLI to stage (icedrive.pin unset) - the image ships without it"
         return 0
     fi
-    [ -f "$ice_out/Icedrive.AppImage.sha256" ]         || die "stage_icedrive_into_payload: $ice_out has an AppImage but no .sha256 beside it. firstboot refuses to install an unverified vendor binary, so this would ship a file the box will not use."
+    [ -f "$ice_out/IcedriveCLI.sha256" ] || die "stage_icedrive_into_payload: $ice_out has a binary but no .sha256 beside it. setup-icedrive.sh refuses to install an unverified vendor binary, so this would ship a file the box will not use."
 
     mkdir -p "$dest"
-    install -m 0755 "$ice_out/Icedrive.AppImage"        "$dest/Icedrive.AppImage"
-    install -m 0644 "$ice_out/Icedrive.AppImage.sha256" "$dest/Icedrive.AppImage.sha256"
-    [ -f "$ice_out/Icedrive.AppImage.version" ]         && install -m 0644 "$ice_out/Icedrive.AppImage.version" "$dest/Icedrive.AppImage.version"
+    install -m 0755 "$ice_out/IcedriveCLI"        "$dest/IcedriveCLI"
+    install -m 0644 "$ice_out/IcedriveCLI.sha256" "$dest/IcedriveCLI.sha256"
+    [ -f "$ice_out/IcedriveCLI.version" ]          && install -m 0644 "$ice_out/IcedriveCLI.version" "$dest/IcedriveCLI.version"
 
-    log "deploy-payload/stack/remote-ui/Icedrive.AppImage = $(( $(stat -c%s "$dest/Icedrive.AppImage") / 1024 / 1024 )) MB (+ its pinned sha256)"
+    log "deploy-payload/stack/icedrive/IcedriveCLI = $(( $(stat -c%s "$dest/IcedriveCLI") / 1024 / 1024 )) MB (+ its pinned sha256)"
 }
 
 # stage_apt_into_payload OUT_DIR APT_OUT TARGET

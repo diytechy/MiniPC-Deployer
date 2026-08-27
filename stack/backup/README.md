@@ -176,10 +176,17 @@ not silently receive a backup that has none — a config quietly ignored is the
 same family of fault as a green run that wrote nothing.
 
 Two consequences to keep in mind: *which* folders reach the cloud is configured
-in the client (authoritative list: `Personal\deploy\storage-map.md` §4e), and the
-client is a GUI app — **sync is down after every reboot until one desktop session
-is opened** ([../remote-ui/README.md](../remote-ui/README.md)) — a staleness this
-service's NagLight report cannot see.
+in the client (authoritative list: `Personal\deploy\storage-map.md` §4e), and
+this service's NagLight report cannot see that copy's staleness at all.
+
+> **The second half of this used to say the client is a GUI app and "sync is
+> down after every reboot until one desktop session is opened". Both halves were
+> wrong** and are corrected as of 2026-08-27: there is a headless CLI
+> ([../icedrive/README.md](../icedrive/README.md)), and the reboot claim was
+> never measured. The *reporting* gap above is real and unchanged — but it now
+> has a plausible fix, because a CLI FUSE mount at `OFFSITE_PATH` would put the
+> offsite copy back inside this pipeline where NagLight can see it. Not wired up
+> yet; it depends on questions the icedrive README lists.
 
 **And it cannot come back by accident.** There is no offsite code path left to
 re-enable — `OFFSITE_ENABLED=true` is itself refused. If an offsite step is ever

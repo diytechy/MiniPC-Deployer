@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# vmtest/export-icedrive.sh — put the IceDrive AppImage on the payload, verified.
+# vmtest/export-icedrive.sh - put the IceDrive CLI on the payload, verified.
 #
-# WHY THIS EXISTS. IceDrive's Linux client is GUI-only and is the whole reason
-# the SR-015 graphical session exists. Until 2026-08-26 the binary was never
-# shipped: the operator downloaded it, scp'd it to the box, and passed
-# ICEDRIVE_APPIMAGE= to setup-remote-ui.sh by hand. With the UI no longer
-# optional, the app that justifies it should not still be a manual errand.
+# THIS STAGES THE CLI, NOT THE APPIMAGE (changed 2026-08-27). The GUI client and
+# the graphical session it needed were removed from the image that day; the
+# 9.8 MB headless `IcedriveCLI` does the same job with no X server. See
+# stack/icedrive/README.md for what was measured to establish that.
 #
 # WHY IT IS NOT FETCHED FROM THE VENDOR. That was the intended design and it
 # does not work: icedrive.net is behind Cloudflare and answers 403 to anything
-# that is not a browser. Measured 2026-08-26 — the download page and four
-# candidate asset paths all returned 403 to curl with a browser user-agent. A
-# build that curls the vendor would fail on a machine with perfectly good
-# internet, which is a worse failure than asking for the file once.
+# that is not a browser - the download page, the asset paths, and the CLI
+# installer script alike. `curl .../install.sh | bash` pipes an HTML challenge
+# page into bash. A build that curled the vendor would fail on a machine with
+# perfectly good internet, which is a worse failure than asking for the file
+# once.
 #
 # SO THE MODEL IS: the operator supplies it ONCE, this verifies it against the
-# SHA256 pinned in stack/remote-ui/icedrive.pin, and caches it under
+# SHA256 pinned in stack/icedrive/icedrive.pin, and caches it under
 # vmtest/.cache/. Every build after that is reproducible, offline, and needs no
 # vendor at all. Bumping the version is: edit the pin, re-run with --from.
 #
-# UNSET PIN IS NOT AN ERROR. With no SHA256 pinned, the ISO carries no AppImage
-# and the hub installs the session without it — the pre-2026-08-26 behaviour.
-# This says so and exits 0, because a half-configured opt-in should not block
-# someone building an image for unrelated reasons.
+# UNSET PIN IS NOT AN ERROR. With no SHA256 pinned the ISO carries no IceDrive
+# at all and setup-icedrive.sh says so on the box. This reports it and exits 0,
+# because a half-configured optional layer should not block someone building an
+# image for unrelated reasons.
 #
 # Usage:
 #   bash vmtest/export-icedrive.sh --out .out/icedrive
-#   bash vmtest/export-icedrive.sh --out .out/icedrive --from ~/Downloads/Icedrive.AppImage
-#   bash vmtest/export-icedrive.sh --print-hash --from ~/Downloads/Icedrive.AppImage
+#   bash vmtest/export-icedrive.sh --out .out/icedrive --from ~/Downloads/IcedriveCLI-v3.62
+#   bash vmtest/export-icedrive.sh --print-hash --from ~/Downloads/IcedriveCLI-v3.62
 
 set -euo pipefail
 
@@ -36,7 +36,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 REPO_ROOT="$(repo_root)"
-PIN="$REPO_ROOT/stack/remote-ui/icedrive.pin"
+PIN="$REPO_ROOT/stack/icedrive/icedrive.pin"
 CACHE_DIR="$REPO_ROOT/vmtest/.cache"
 OUT=""
 FROM=""
@@ -55,7 +55,7 @@ done
 # --print-hash is the helper for step 2 of setting the pin. It deliberately
 # works with no pin set at all, which is the state you are in when you need it.
 if [ "$PRINT_HASH" -eq 1 ]; then
-    [ -n "$FROM" ] || die "--print-hash needs --from <path to the AppImage>"
+    [ -n "$FROM" ] || die "--print-hash needs --from <path to the CLI binary>"
     [ -f "$FROM" ] || die "not found: $FROM"
     printf 'SHA256=%s\n' "$(sha256sum "$FROM" | cut -d' ' -f1)"
     exit 0
@@ -80,15 +80,15 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 
 if [ -z "$WANT_SHA" ]; then
-    log "no SHA256 pinned in ${PIN#"$REPO_ROOT"/} — this image will carry NO IceDrive AppImage."
-    log "  The hub still installs the RDP/XFCE session; IceDrive stays a manual step."
-    log "  To ship it: download the AppImage, then"
+    log "no SHA256 pinned in ${PIN#"$REPO_ROOT"/} - this image will carry NO IceDrive at all."
+    log "  Everything else on the hub is unaffected; there is simply no offsite client."
+    log "  To ship it: download the Linux CLI in a browser, then"
     log "    bash vmtest/export-icedrive.sh --print-hash --from <file>   # gives you the line"
     log "    (put VERSION= and SHA256= in the pin, then re-run with --from)"
     exit 0
 fi
 
-CACHED="$CACHE_DIR/Icedrive-$WANT_SHA.AppImage"
+CACHED="$CACHE_DIR/IcedriveCLI-$WANT_SHA"
 
 # ── resolve the artifact: cache, then --from, then the optional pinned URL ───
 verify() {  # verify FILE — exits nonzero and names both hashes on mismatch
@@ -105,7 +105,7 @@ verify() {  # verify FILE — exits nonzero and names both hashes on mismatch
 }
 
 if [ -f "$CACHED" ] && verify "$CACHED" 2>/dev/null; then
-    log "using the cached AppImage (sha256 matches the pin)"
+    log "using the cached CLI binary (sha256 matches the pin)"
 elif [ -n "$FROM" ]; then
     [ -f "$FROM" ] || die "not found: $FROM"
     verify "$FROM" || die "the supplied file does not match the pin (see above)."
@@ -122,14 +122,14 @@ elif [ -n "$PIN_URL" ]; then
     log "fetched, verified and cached"
 else
     die "the pin names SHA256=$WANT_SHA but the file is not cached and no --from was given.
-  Download the Linux AppImage from icedrive.net in a browser, then:
+  Download the Linux CLI from icedrive.net in a browser, then:
       bash vmtest/export-icedrive.sh --out $OUT --from <path to it>
   It is verified against the pin and cached, so this is once per version bump."
 fi
 
-install -m 0755 "$CACHED" "$OUT/Icedrive.AppImage"
-printf '%s\n' "$WANT_SHA" > "$OUT/Icedrive.AppImage.sha256"
-[ -n "$PIN_VER" ] && printf '%s\n' "$PIN_VER" > "$OUT/Icedrive.AppImage.version"
+install -m 0755 "$CACHED" "$OUT/IcedriveCLI"
+printf '%s\n' "$WANT_SHA" > "$OUT/IcedriveCLI.sha256"
+[ -n "$PIN_VER" ] && printf '%s\n' "$PIN_VER" > "$OUT/IcedriveCLI.version"
 
-log "OK - staged $OUT/Icedrive.AppImage ($(du -h "$OUT/Icedrive.AppImage" | cut -f1)${PIN_VER:+, version $PIN_VER})"
-log "     the hash travels beside it, and firstboot re-checks it before installing"
+log "OK - staged $OUT/IcedriveCLI ($(du -h "$OUT/IcedriveCLI" | cut -f1)${PIN_VER:+, version $PIN_VER})"
+log "     the hash travels beside it, and setup-icedrive.sh re-checks it on the box"

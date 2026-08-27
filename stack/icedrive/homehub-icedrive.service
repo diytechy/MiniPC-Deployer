@@ -1,0 +1,59 @@
+[Unit]
+# Mount the IceDrive cloud over FUSE, headlessly. See setup-icedrive.sh for the
+# measurements this rests on and for why it carries no password.
+Description=IceDrive cloud mount (headless CLI)
+Documentation=file:///opt/homehub/stack/icedrive/README.md
+After=network-online.target
+Wants=network-online.target
+# Nothing to do on a box where the binary was never installed.
+#
+# NOT ALSO gated on the stored credential, and %h would be the wrong way to
+# express it anyway: in a SYSTEM unit %h is the manager home (/root), not the
+# User= home, so such a condition would silently test a path that never exists.
+# setup-icedrive.sh only enables this unit after it has confirmed a sign-in, so
+# the gate lives there, where it can explain itself.
+ConditionPathExists=/opt/icedrive/icedrive
+
+[Service]
+# THE CLI IS THE MOUNT. It does not fork a daemon and hand back control - it
+# prints "Press Ctrl-C to unmount and quit" and stays in the foreground for as
+# long as the filesystem is mounted. So this is a simple long-running service,
+# not a oneshot, and stopping the unit is what unmounts.
+Type=simple
+# __HUB_USER__ IS SUBSTITUTED AT INSTALL TIME by setup-icedrive.sh, from uid
+# 1000. The account name is chosen once by the autoinstall, and this file must
+# not become a second place that has to agree with it.
+User=__HUB_USER__
+Group=__HUB_USER__
+
+# NO CREDENTIAL HERE, DELIBERATELY. The password reaches this app exactly once,
+# from setup-icedrive.sh at provisioning time, and the app is expected to keep
+# an encrypted credential in its own config afterwards (icedrive_stored_cred).
+# If that expectation is wrong this unit fails to authenticate and says so -
+# which is the failure we want, because the alternative is a vendor password on
+# a world-readable argv at every single boot.
+ExecStart=/opt/icedrive/icedrive -mp /srv/icedrive
+
+# A dirty stop leaves the mount point wedged ("Transport endpoint is not
+# connected") and the next start then fails on a non-empty target. Unmount on
+# the way out, and never let the unit's own failure be the reason it can never
+# start again.
+ExecStopPost=-/bin/fusermount -u /srv/icedrive
+
+# A box with no cloud mount is DEGRADED, not broken: the stack, the shares, the
+# local backups and SSH are all unaffected. Retry with a wide gap - the usual
+# cause is the network or the vendor, and neither is fixed by hammering.
+Restart=on-failure
+RestartSec=120
+
+# The vendor binary gets no more of the box than it needs. FUSE rules out
+# PrivateDevices/ProtectHome, so this is the honest subset rather than a
+# hardening block copied from somewhere it fits better.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

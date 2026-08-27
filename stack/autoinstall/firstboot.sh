@@ -1079,70 +1079,42 @@ for _t in homehub-backup.timer homehub-library-backup.timer; do
     fi
 done
 
-# ── 6c. the graphical session + IceDrive (SR-015, no longer opt-in) ──────────
-# RULED BY THE OWNER 2026-08-26. This used to be a manual errand over SSH
-# (SN-012's opt-in). The packages now install with everything else from the
-# baked repo, so all that is left here is the session wiring and the AppImage.
+# ── 6c. IceDrive, headless (the graphical session is GONE) ───────────────────
+# RULED BY THE OWNER 2026-08-27: "GUI can be removed... from the image and from
+# the box, along with the auto-desktop startup." This step used to install an
+# xrdp/XFCE session and an AppImage that autostarted inside it, plus a unit that
+# logged a session in at boot so that app would run with nobody connected.
 #
-# setup-remote-ui.sh IS THE SAME SCRIPT the opt-in always used, and it is
-# idempotent by contract - its apt step is a no-op now that packages.list
-# carries those names, and the rest (the ~/.xsession, the ssl-cert group, the
-# xrdp restart, the account password from OPERATOR_PASSWORD) is exactly the
-# wiring this step needs. Calling it beats reimplementing it here and letting
-# the two drift.
+# ALL OF THAT EXISTED FOR ONE APP, AND THE APP NEVER NEEDED IT. IcedriveCLI is a
+# headless native ELF - no X, non-interactive login, FUSE mount. The premise
+# ("the client is GUI-only") was inherited and repeated for a month without ever
+# being checked, in a project whose rules say to measure. It was measured on
+# 2026-08-27 and it was false: stack/icedrive/README.md.
 #
-# RUN AS THE HUB ACCOUNT VIA sudo, not as root directly: the script writes
-# ~/.xsession and the autostart entry for $SUDO_USER, and refuses to run
-# without one. `runuser -u hub -- sudo -n` gives it the SUDO_USER it needs.
+# The graphical layer is not deleted, it is DE-INSTALLED: the nine packages moved
+# to packages.optional.list, so they are baked into the offline repo and
+# setup-remote-ui.sh (or HomeHub's HomeHubDesktop.cmd) can still turn a desktop
+# on later, on a box with no internet. Nothing here starts one.
 #
-# NON-FATAL BY DESIGN. A hub with no graphical session is degraded, not broken:
-# the stack, the shares, the backups and SSH are all unaffected. So this logs
-# loudly and carries on rather than failing the unit, which is reserved for
-# things that make the box wrong rather than incomplete.
-log "provisioning the graphical session (SR-015) + IceDrive…"
-# The operator account by UID, not by the name `hub` spelled again here. The
-# autoinstall names it once and this file should not be a second place that has
-# to agree; uid 1000 is what subiquity creates and what /etc/fstab's uid= and
-# the samba provisioning already key off.
-HUB_USER="$(getent passwd 1000 | cut -d: -f1)"
-[ -n "$HUB_USER" ] || HUB_USER="hub"
-ICEDRIVE_SRC="$STACK_DIR/remote-ui/Icedrive.AppImage"
-_rui_env=""
-if [ -f "$ICEDRIVE_SRC" ]; then
-    # RE-CHECK THE HASH ON THE BOX, not just at build time. The sha256 travelled
-    # beside the binary on the payload; an ISO can be re-burned, a payload can be
-    # edited, and "we verified it three steps ago" is not the same claim as "the
-    # bytes about to be installed are the pinned ones".
-    if [ -f "$ICEDRIVE_SRC.sha256" ]; then
-        _want="$(cat "$ICEDRIVE_SRC.sha256")"
-        _got="$(sha256sum "$ICEDRIVE_SRC" | cut -d' ' -f1)"
-        if [ "$_want" = "$_got" ]; then
-            _rui_env="ICEDRIVE_APPIMAGE=$ICEDRIVE_SRC"
-            log "  IceDrive AppImage present and matches its pinned sha256"
-        else
-            log "  WARNING: the IceDrive AppImage on the payload does NOT match its pinned"
-            log "    sha256 - installing the session WITHOUT it. pinned=$_want actual=$_got"
-        fi
+# NON-FATAL BY DESIGN, unchanged. A hub with no offsite client is degraded, not
+# broken: the stack, the shares, the local backups and SSH are all unaffected. So
+# this logs loudly and carries on rather than failing the unit, which is reserved
+# for things that make the box wrong rather than incomplete.
+#
+# AND IT IS A NO-OP ON THE SHIPPED DEFAULT. With no IcedriveCredential in the
+# deploy store, .env carries no ICEDRIVE_USER/ICEDRIVE_PASSWORD, so the script
+# installs the binary and stops: no sign-in, no mount, no unit enabled.
+log "provisioning IceDrive (headless CLI)..."
+if [ -x "$STACK_DIR/icedrive/setup-icedrive.sh" ] || [ -f "$STACK_DIR/icedrive/setup-icedrive.sh" ]; then
+    if bash "$STACK_DIR/icedrive/setup-icedrive.sh" 2>&1 | sed 's/^/  /'; then
+        log "  IceDrive step complete (see the lines above for what it actually did)"
     else
-        log "  WARNING: the IceDrive AppImage carries no .sha256 beside it - refusing to"
-        log "    install an unverified vendor binary. The session is installed without it."
+        log "  WARNING: setup-icedrive.sh failed - this box has NO offsite client."
+        log "    Everything else is unaffected. Re-run by hand once fixed:"
+        log "      sudo bash $STACK_DIR/icedrive/setup-icedrive.sh"
     fi
 else
-    log "  no IceDrive AppImage on the payload (icedrive.pin unset at build time) -"
-    log "    installing the session only. See stack/remote-ui/README.md to add it."
-fi
-
-if runuser -u "$HUB_USER" -- sudo -n env $_rui_env bash "$STACK_DIR/remote-ui/setup-remote-ui.sh" 2>&1 | sed 's/^/  /'; then
-    log "  graphical session ready - RDP to this box on :3389 as $HUB_USER"
-    if [ -n "$_rui_env" ]; then
-        log "  IceDrive autostarts IN that session. It does NOT run without one:"
-        log "  after every reboot the cloud copy is stale until someone opens one"
-        log "  RDP session (open-items E1). Sign-in and sync pairs are still manual."
-    fi
-else
-    log "  WARNING: setup-remote-ui.sh failed - the box has NO graphical session."
-    log "    Everything else is unaffected. Re-run by hand:"
-    log "      sudo bash $STACK_DIR/remote-ui/setup-remote-ui.sh"
+    log "  no $STACK_DIR/icedrive/setup-icedrive.sh on the payload - skipping"
 fi
 
 # ── 7. done ──────────────────────────────────────────────────────────────────

@@ -143,18 +143,25 @@ nothing for it).
 
 ### Opt-in: light remote desktop (RDP) for GUI-only vendor apps (SR-015)
 
-Some vendor apps have no headless mode — the current **IceDrive Mount & Sync**
-client is GUI-only (and IceDrive's WebDAV fallback began sunsetting in 2026).
-For those, `stack/remote-ui/setup-remote-ui.sh` installs an **off-by-default**
-xrdp + minimal-XFCE layer so the app can be launched and configured over RDP
-from the LAN — the sanctioned SN-001 exception: secondary services may need UI
-configuration, but it is always remote, and restricted/minimized. Nothing in
-the autoinstall/first-boot path references it; the core zero-click guarantee
-is untouched. **LAN-only like Cockpit** — never proxied through Caddy, never
-port-forwarded. What it deliberately does not self-heal (post-reboot
-one-RDP-touch to resume sync; GUI state lost on reimage) is documented in
-[stack/remote-ui/README.md](stack/remote-ui/README.md) — read it before
-relying on on-box IceDrive.
+**IT HAS NO TENANT, AND NOTHING INSTALLS IT (2026-08-27).** This layer existed
+for the **IceDrive Mount & Sync** client, believed to be GUI-only. That was
+never checked and it is false: `IcedriveCLI` is a headless native ELF with a
+non-interactive login and a FUSE mount. The Owner removed the GUI from the image
+and from the box, along with the boot-time desktop session, the same day.
+IceDrive now lives in [stack/icedrive/](stack/icedrive/README.md) and needs no
+session at all.
+
+The layer is **kept as an opt-in, not deleted**, for a future vendor app that is
+genuinely GUI-only: `stack/remote-ui/setup-remote-ui.sh` installs an
+**off-by-default** xrdp + minimal-XFCE layer over the LAN — the sanctioned
+SN-001 exception: secondary services may need UI configuration, but it is always
+remote, and restricted/minimized. Its packages are baked into the offline apt
+repo without being installed (`packages.optional.list`), so the opt-in still
+works on a hub with no internet. Nothing in the autoinstall/first-boot path
+references it, and **SN-001's zero-click core now carries no exception at all**.
+**LAN-only like Cockpit** — never proxied through Caddy, never port-forwarded.
+See [stack/remote-ui/README.md](stack/remote-ui/README.md), which also lists the
+three claims about IceDrive that turned out to be wrong.
 
 > **WireGuard is the later remote-access answer** (D5): once set up, the same LAN
 > workflow works from anywhere. Until then this is LAN / VPN-to-LAN only — do not

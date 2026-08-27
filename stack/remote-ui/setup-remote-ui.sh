@@ -1,51 +1,50 @@
 #!/usr/bin/env bash
-# Remote light UI for GUI-only vendor apps (first case: IceDrive Mount & Sync).
+# Remote light UI for GUI-only vendor apps - A MANUAL OPT-IN THAT NOTHING RUNS.
 #
-# NO LONGER OPT-IN (the Owner, 2026-08-26): firstboot step 6c calls this, and
-# packages.list carries the packages, so a fresh hub comes up with the session
-# already wired. That AMENDS SN-012, which had the Owner running this over SSH
-# once, deliberately.
+# NOT INSTALLED BY ANY IMAGE (the Owner, 2026-08-27): "GUI can be removed... from
+# the image and from the box, along with the auto-desktop startup". firstboot no
+# longer calls this, packages.list no longer carries the packages, and the
+# boot-time session unit is deleted. This file is the opt-in itself, kept
+# deliberately and reachable two ways: HomeHub's `HomeHubDesktop.cmd`, or by
+# hand over SSH. That restores SN-012's original shape and leaves SN-001's
+# zero-click core with NO exception at all.
 #
-# THIS SCRIPT DID NOT CHANGE SHAPE, and that is deliberate: it is still safe and
-# useful to run by hand on a running box. Everything it does is idempotent, so
-# on a box firstboot already provisioned it re-asserts rather than redoes — and
-# it remains the way to install an AppImage onto a hub whose image shipped
-# without one. The apt step is simply a no-op now that the names are installed.
+# WHY THE LAYER LOST ITS TENANT. It existed for exactly one app - the IceDrive
+# Mount & Sync client, believed to be GUI-only. It is not. `IcedriveCLI` is a
+# headless native ELF: no X, no session, non-interactive login, FUSE mount
+# (measured 2026-08-27 - see ../icedrive/README.md, which is where IceDrive now
+# lives). Nothing on the hub needs a desktop today.
 #
-# SN-001's zero-click exception is NARROWER now, not gone: what still needs a
-# human is the IceDrive SIGN-IN and its sync pairs (see README, "What does NOT
-# self-heal"), not the layer itself.
+# IT STILL WORKS OFFLINE, and that is on purpose. The nine packages are in
+# packages.optional.list, so they are baked into /opt/homehub/apt without being
+# installed and late-command 3c-keep leaves that repo registered as an apt
+# source. `apt-get install` below therefore succeeds on a hub that has never had
+# internet - the exact defect fixed on 2026-08-26 and deliberately not undone.
 #
 # What it does (idempotent, non-interactive, loud):
-#   1. apt-installs xrdp + a MINIMAL XFCE session (no full desktop meta-package)
-#      + libfuse2t64 (the AppImage FUSE shim the IceDrive client still needs
-#      on Ubuntu 24.04).
+#   1. apt-installs xrdp + a MINIMAL XFCE session (no full desktop meta-package).
 #   2. Points the invoking user's RDP session at XFCE (~/.xsession) and lets
 #      xrdp read the TLS snakeoil key (ssl-cert group).
-#   3. Enables + starts xrdp.
-#   4. If ICEDRIVE_APPIMAGE (a path to an already-downloaded AppImage) is set,
-#      installs it to /opt/icedrive/ and writes an XFCE autostart entry so the
-#      client launches whenever the RDP session starts.
+#   3. Enables + RESTARTS xrdp, and sets the account password from
+#      OPERATOR_PASSWORD so PAM has something to authenticate.
 #
 # What it deliberately does NOT do:
-#   - download the AppImage. icedrive.net is behind Cloudflare and answers 403
-#     to anything that is not a browser, so nothing here or in the build can
-#     fetch it. It arrives one of two ways: pinned into the image (see
-#     stack/remote-ui/icedrive.pin, which firstboot passes in), or by hand -
-#     download it, scp it over, pass ICEDRIVE_APPIMAGE=/path/to/it;
-#   - configure the IceDrive account/sync pairs (GUI-only, done over RDP —
-#     see README.md, including what does NOT self-heal);
+#   - install IceDrive, or any vendor app. The AppImage path was removed
+#     2026-08-27 with the GUI; IceDrive is a CLI now (../icedrive/);
+#   - create a session at boot. `homehub-desktop-session.service` existed to
+#     keep the GUI IceDrive client running with nobody connected; with no GUI
+#     tenant it was pure attack surface and is deleted. A session now exists
+#     only while someone is connected, which is the pre-2026-08-27 behaviour;
 #   - expose anything off-LAN (like Cockpit: never proxy through Caddy, never
 #     port-forward tcp/3389 at the router).
 #
 # Contract:
-#   Inputs:  env ICEDRIVE_APPIMAGE (optional): path to the downloaded AppImage.
-#            Must run as root (sudo); the RDP user is $SUDO_USER.
-#   Outputs: xrdp enabled+running; ~/.xsession for the RDP user; optionally
-#            /opt/icedrive/Icedrive.AppImage + the user's autostart entry.
+#   Inputs:  must run as root (sudo); the RDP user is $SUDO_USER.
+#   Outputs: xrdp enabled+running; ~/.xsession for the RDP user; that account's
+#            UNIX password set from OPERATOR_PASSWORD in the stack .env.
 #   Raises:  nonzero exit with a FATAL line on any failed step (fail loudly).
-# Implements: SR-015 (SN-012 AMENDED 2026-08-26 - no longer opt-in; SN-001's
-#             exception narrowed to the IceDrive sign-in; SN-005 LAN-only)
+# Implements: SR-015 (SN-012 RESTORED 2026-08-27 - opt-in again, and not
+#             installed; SN-005 LAN-only)
 set -euo pipefail
 
 log() { echo "[remote-ui] $*"; }
@@ -182,50 +181,17 @@ else
     log "      sudo passwd $RDP_USER"
 fi
 
-# ── 3c. the boot-time session, so the GUI app runs with nobody connected ─────
-# THIS IS WHAT MAKES ICEDRIVE UNATTENDED. Installing the unit is all that is
-# needed; homehub-desktop-session.sh explains the mechanism and what was
-# measured to establish it. Enabled but NOT started here - firstboot is still
-# provisioning at this point, and a session created now would be torn down by
-# the reboot that usually follows anyway.
-if [ -f "$(dirname "$0")/homehub-desktop-session.service" ]; then
-    install -m0755 -o root -g root "$(dirname "$0")/homehub-desktop-session.sh"         /opt/homehub/stack/remote-ui/homehub-desktop-session.sh 2>/dev/null || true
-    install -m0644 -o root -g root "$(dirname "$0")/homehub-desktop-session.service"         /etc/systemd/system/homehub-desktop-session.service
-    systemctl daemon-reload
-    systemctl enable homehub-desktop-session.service >/dev/null 2>&1
-    log "boot-time session unit enabled — after every reboot a session exists with"
-    log "  nobody connected, so a GUI app autostarted in it keeps running"
-    if ! command -v Xvfb >/dev/null || ! command -v xfreerdp >/dev/null; then
-        log "  WARNING: xvfb and/or freerdp2-x11 are missing, so that unit will FAIL."
-        log "    They are in packages.list; on a box predating that: apt-get install xvfb freerdp2-x11"
-    fi
-else
-    log "NOTE: no homehub-desktop-session.service beside this script — the session"
-    log "  will exist only while someone is connected (the pre-2026-08-27 behaviour)"
-fi
-
-# ── 4. optional: install the IceDrive AppImage + autostart ───────────────────
+# ── 4. IceDrive is NOT installed here any more ─────────────────────────
+# This script used to take ICEDRIVE_APPIMAGE=<path>, drop the AppImage in
+# /opt/icedrive/ and write an XFCE autostart entry so the client launched with
+# the session. All of that is gone: the client that needed a session has been
+# replaced by a headless CLI. If you set ICEDRIVE_APPIMAGE expecting the old
+# behaviour, say so rather than silently ignoring it.
 if [ -n "${ICEDRIVE_APPIMAGE:-}" ]; then
-    [ -f "$ICEDRIVE_APPIMAGE" ] || die "ICEDRIVE_APPIMAGE=$ICEDRIVE_APPIMAGE not found"
-    install -d /opt/icedrive
-    install -m 0755 "$ICEDRIVE_APPIMAGE" /opt/icedrive/Icedrive.AppImage
-    AUTOSTART_DIR="$RDP_HOME/.config/autostart"
-    install -d -o "$RDP_USER" -g "$(id -gn "$RDP_USER")" "$AUTOSTART_DIR"
-    cat > "$AUTOSTART_DIR/icedrive.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=Icedrive
-Exec=/opt/icedrive/Icedrive.AppImage
-X-GNOME-Autostart-enabled=true
-EOF
-    chown "$RDP_USER:" "$AUTOSTART_DIR/icedrive.desktop"
-    log "IceDrive installed to /opt/icedrive/ + autostart entry written"
-    log "NEXT (GUI, over RDP): sign in + configure sync pairs — see README.md,"
-    log "including the post-reboot one-RDP-touch limitation."
-else
-    log "ICEDRIVE_APPIMAGE not set — skipped app install. Download the Linux"
-    log "AppImage from icedrive.net on your workstation, scp it to the box, then:"
-    log "  sudo ICEDRIVE_APPIMAGE=/home/$RDP_USER/Icedrive.AppImage bash $0"
+    log "NOTE: ICEDRIVE_APPIMAGE is set and is IGNORED. The GUI IceDrive client"
+    log "  was removed on 2026-08-27 - it is a headless CLI now, provisioned by"
+    log "  /opt/homehub/stack/icedrive/setup-icedrive.sh and needing no session."
+    log "  Nothing was installed into this session."
 fi
 
 log "done (re-running is safe: apt/systemctl/file writes are all idempotent)"

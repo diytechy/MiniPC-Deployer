@@ -1,0 +1,52 @@
+# packages.optional.list — BAKED INTO THE OFFLINE REPO, NEVER INSTALLED.
+#
+# WHAT THIS FILE IS. export-apt.sh resolves these names into the same baked repo
+# as packages.list, in ONE closure with it (two resolves can pick different
+# versions of a shared dependency, and the second would overwrite the first's
+# deb in a flat repo). Late-command 3c installs ONLY packages.baked.list, so
+# nothing here is ever installed by an image. Late-command 3c-keep leaves
+# /opt/homehub/apt registered as a `[trusted=yes]` apt source on the target, so
+# these remain installable months later on a box that has never had internet.
+#
+# WHY THE SET BELOW IS HERE. The graphical session (SR-015) was removed from the
+# image on 2026-08-27 (the Owner: "GUI can be removed... from the image and from
+# the box, along with the auto-desktop startup"). It is not deleted, because the
+# opt-in still has a front door — HomeHub's `HomeHubDesktop.cmd` — and the whole
+# point of that front door is that it works on an OFFLINE hub. Packages that are
+# not baked cannot be installed by it: `apt-get install` would reach for the
+# archive at the moment you run it, which is the exact defect fixed on
+# 2026-08-26 (open-items E1(ii)).
+#
+# So: nothing here runs, listens, or starts. This costs ~150-250 MB of image and
+# buys the ability to change your mind without a reflash.
+#
+# THE ONE NAME THAT DID NOT MOVE HERE is libfuse2t64. It stayed in
+# packages.list because the IceDrive CLI — which is why the GUI could go — needs
+# libfuse.so.2 for its mount. It is not part of this set.
+#
+# FORMAT: identical to packages.list (read_packages_list): strip from `#` to end
+# of line, strip all whitespace, drop what is left if empty.
+
+# ── the RDP server and a MINIMAL XFCE session ───────────────────────────────
+# --no-install-recommends applies here as everywhere, so this stays a window
+# manager, a panel, a terminal and a file manager - not a desktop. Do not add
+# xubuntu-desktop or the xfce4 meta-package.
+xrdp                  # the RDP server itself
+xorgxrdp              # the Xorg driver xrdp drives; without it sessions are black
+dbus-x11              # dbus-launch - an XFCE session will not come up without it
+xfce4-session         # the session manager ~/.xsession starts
+xfwm4                 # window manager
+xfce4-panel           # panel
+xfce4-terminal        # a terminal inside the session
+thunar                # file manager
+
+# ── the unattended-session pair — RETIRED, and kept only to be installable ──
+# These existed so a session could be created AT BOOT with nobody connected, to
+# keep the GUI IceDrive client syncing (homehub-desktop-session.service). That
+# unit is deleted: the CLI needs no session at all. They stay in the bake
+# because setup-remote-ui.sh still refers to the mechanism for anyone who
+# deliberately wants an unattended desktop for some FUTURE GUI-only app, and
+# discovering the packages are missing at that point is the failure this file
+# exists to prevent.
+xvfb                  # scratch display for a loopback RDP client
+freerdp2-x11          # xfreerdp: connects to loopback to make a session exist

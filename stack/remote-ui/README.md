@@ -85,13 +85,37 @@ re-assert the wiring or install an AppImage onto a running box.
 
 ## What does NOT self-heal (read this before relying on it)
 
-The RDP layer restarts on boot, but **the sync only runs while the GUI client
-is running inside a session**:
+The sync only runs while the GUI client is running **inside a session** — but
+a session no longer requires a human.
 
-- **After every reboot, sync is DOWN until you open one RDP session.** The app
-  autostarts in it; disconnect (don't log off) and it keeps running in the
-  disconnected session. This is the **accepted** one-touch deviation from
-  SN-001 — it was weighed and ratified with OI-11, not left open.
+- **~~After every reboot, sync is DOWN until you open one RDP session.~~
+  CORRECTED 2026-08-27 — this was never measured, and it is false.** The claim
+  was inherited from OI-11 and repeated as fact in three places; open-items E1
+  admits the work was blocked because *"Nothing can be built until there is a
+  live client to inspect"*, so it was written with nothing to observe.
+
+  What the app needs is a **display**, not a **client**. `homehub-desktop-session.service`
+  creates a session at boot by pointing an RDP client at loopback (under a
+  throwaway Xvfb, since an RDP client is itself an X app) and then dropping it.
+  sesman ships `KillDisconnected=false` / `DisconnectedTimeLimit=0`, so the
+  session and everything in it persist indefinitely.
+
+  **Measured on the bench box, including across a real reboot:** every session
+  killed → one created headlessly → client dropped entirely → session and its
+  app survived; the box rebooted with nobody connected and came up with a live
+  session on `:10`; and mstsc from the dev PC then **reconnected to that same
+  session** rather than spawning a second one — sesman logged
+  `++ reconnected session: username hub, display :10.0`.
+
+  So SN-001's one-touch deviation is now only the **first** sign-in, not every
+  reboot.
+
+  > **Geometry matters.** `Policy=Default` keys a session on
+  > `<user, bit-depth, screen size>`, so a client arriving at a *different*
+  > geometry gets a SECOND session — and IceDrive would autostart there too,
+  > leaving two clients syncing the same folders. The unit and
+  > `HomeHubDesktop.cmd` both use 1600x900x24 deliberately. `-FullScreen`
+  > changes the geometry and will spawn a second session.
 - **A crashed/logged-off session stops sync silently on the IceDrive side.**
   IceDrive's cloud upload has no watchdog here, and since the backup service no
   longer has an offsite step (2026-07-29 correction) it cannot notice either —

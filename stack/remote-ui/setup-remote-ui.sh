@@ -182,6 +182,28 @@ else
     log "      sudo passwd $RDP_USER"
 fi
 
+# ── 3c. the boot-time session, so the GUI app runs with nobody connected ─────
+# THIS IS WHAT MAKES ICEDRIVE UNATTENDED. Installing the unit is all that is
+# needed; homehub-desktop-session.sh explains the mechanism and what was
+# measured to establish it. Enabled but NOT started here - firstboot is still
+# provisioning at this point, and a session created now would be torn down by
+# the reboot that usually follows anyway.
+if [ -f "$(dirname "$0")/homehub-desktop-session.service" ]; then
+    install -m0755 -o root -g root "$(dirname "$0")/homehub-desktop-session.sh"         /opt/homehub/stack/remote-ui/homehub-desktop-session.sh 2>/dev/null || true
+    install -m0644 -o root -g root "$(dirname "$0")/homehub-desktop-session.service"         /etc/systemd/system/homehub-desktop-session.service
+    systemctl daemon-reload
+    systemctl enable homehub-desktop-session.service >/dev/null 2>&1
+    log "boot-time session unit enabled — after every reboot a session exists with"
+    log "  nobody connected, so a GUI app autostarted in it keeps running"
+    if ! command -v Xvfb >/dev/null || ! command -v xfreerdp >/dev/null; then
+        log "  WARNING: xvfb and/or freerdp2-x11 are missing, so that unit will FAIL."
+        log "    They are in packages.list; on a box predating that: apt-get install xvfb freerdp2-x11"
+    fi
+else
+    log "NOTE: no homehub-desktop-session.service beside this script — the session"
+    log "  will exist only while someone is connected (the pre-2026-08-27 behaviour)"
+fi
+
 # ── 4. optional: install the IceDrive AppImage + autostart ───────────────────
 if [ -n "${ICEDRIVE_APPIMAGE:-}" ]; then
     [ -f "$ICEDRIVE_APPIMAGE" ] || die "ICEDRIVE_APPIMAGE=$ICEDRIVE_APPIMAGE not found"

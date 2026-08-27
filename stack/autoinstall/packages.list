@@ -224,3 +224,15 @@ thunar                # file manager
 # AppImage built against FUSE 2 and exits immediately without this, with a
 # libfuse.so.2 message that reads like a corrupt download.
 libfuse2t64
+# THE UNATTENDED-SESSION PAIR. These exist so the graphical session can be
+# CREATED AT BOOT with nobody connected, which is what makes IceDrive sync
+# without a human. An RDP client is itself an X application, so it needs a
+# throwaway display to draw into while it establishes the session; Xvfb is that
+# display, for about fifteen seconds, and both are discarded afterwards.
+#
+# This replaced a belief, not a gap: the project recorded "after every reboot
+# sync is DOWN until you open one RDP session" in three places and never
+# measured it. Measured 2026-08-27 and it is false - see
+# stack/remote-ui/homehub-desktop-session.sh.
+xvfb                  # scratch display for the loopback RDP client
+freerdp2-x11          # xfreerdp: connects to loopback to make the session exist

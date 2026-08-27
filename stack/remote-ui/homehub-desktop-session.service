@@ -1,0 +1,39 @@
+[Unit]
+# Create the operator's graphical session at boot so GUI-only vendor apps
+# (IceDrive) run unattended. See homehub-desktop-session.sh for why this works
+# and what was measured to establish it.
+Description=HomeHub operator desktop session (SR-015, for GUI-only vendor apps)
+Documentation=file:///opt/homehub/stack/remote-ui/README.md
+# xrdp must be listening before anything can connect to it, and sesman is what
+# actually spawns the session.
+After=network-online.target xrdp.service xrdp-sesman.service
+Wants=network-online.target
+Requires=xrdp.service xrdp-sesman.service
+# Nothing to do on a box where the layer was never provisioned.
+ConditionPathExists=/opt/homehub/stack/.env
+
+[Service]
+Type=oneshot
+# The session must OUTLIVE this unit, and it does so WITHOUT KillMode=none —
+# which systemd deprecates and warns about, and which was in an earlier draft of
+# this file on a wrong assumption. The session's Xorg is spawned by SESMAN, so it
+# lives in /system.slice/xrdp-sesman.service's cgroup, not this unit's (verified
+# on the box). This unit's cgroup only ever holds the throwaway Xvfb and RDP
+# client, and the script kills those itself. So the default KillMode is correct
+# and there is nothing here for systemd to reap that we wanted kept.
+RemainAfterExit=yes
+ExecStart=/opt/homehub/stack/remote-ui/homehub-desktop-session.sh
+# Reads OPERATOR_PASSWORD out of the 0600 root-owned .env, and pipes it to the
+# client on stdin so it never reaches argv.
+User=root
+TimeoutStartSec=180
+
+# A box with no graphical session is DEGRADED, not broken: the stack, the
+# shares, the backups and SSH are all unaffected. Retry a couple of times in
+# case xrdp was still settling, then give up quietly rather than blocking boot.
+Restart=on-failure
+RestartSec=20
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target

@@ -834,7 +834,28 @@ rm -f "$__acme_flag"
 (
     . /etc/homehub-backup/backup.env 2>/dev/null || exit 0
     . "$STACK_DIR/backup/common.sh"  2>/dev/null || exit 0
-    [ -n "${BACKUP_TARGET:-}" ] && [ -d "$BACKUP_TARGET" ] || exit 0
+    [ -n "${BACKUP_TARGET:-}" ] || exit 0
+    # THE FSTAB ENTRY CARRIES `nofail` BY DESIGN - a missing USB disk must not
+    # hold up local-fs.target - so systemd does not wait for this drive and
+    # neither does this unit (After=network-online.target docker.service). A
+    # drive that is PRESENT BUT SLOW TO ENUMERATE would therefore read as "no
+    # backup drive" and cost the exact issuances this step exists to save.
+    # Bounded wait, and only when fstab says this box is meant to have one, so a
+    # box with no backup drive is not delayed at all. Same shape as the LAN-IP
+    # wait in 4a-pre-4.
+    if grep -qs "[[:space:]]${BACKUP_TARGET}[[:space:]]" /etc/fstab; then
+        __bw=0
+        while [ "$__bw" -lt 60 ] && ! mountpoint -q "$BACKUP_TARGET"; do
+            [ "$__bw" -eq 0 ] && log "  waiting up to 60s for $BACKUP_TARGET (fstab lists it, and nofail means nothing else waits)…"
+            sleep 2; __bw=$((__bw + 2))
+        done
+        if mountpoint -q "$BACKUP_TARGET" && [ "$__bw" -gt 0 ]; then
+            log "  $BACKUP_TARGET appeared after ${__bw}s"
+        fi
+    fi
+    # mountpoint, NOT -d: the directory exists whether or not the drive is on it,
+    # and an unmounted empty dir would read as "no runs archived".
+    mountpoint -q "$BACKUP_TARGET" || exit 0
     run="$(newest_run_with_set "$BACKUP_TARGET" caddy)" || exit 0
     [ -n "$run" ] || exit 0
     # COMPOSE creates the volume, not us: that way it gets the project-prefixed

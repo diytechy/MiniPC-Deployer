@@ -349,6 +349,23 @@ and reserves nothing.
     the very next call. **The rule is: reboot, then jump once.** 6.8.0-100 was
     reliable across several loads. This will bite again after a kernel upgrade,
     and it presents as a bare `Killed` with no explanation unless you read dmesg.
+
+    **AND THE FAULT POISONS THE WHOLE BOOT, WHICH IS WORSE THAN THE SIGKILL.**
+    The faulting task dies **holding `kexec_lock`** (`note: kexec[...] exited
+    with irqs disabled`), so every kexec operation for the rest of that boot
+    returns **`EBUSY`** rather than faulting - a different symptom, and a
+    misleading one. `kexec_loaded` still reads `0`, so this script's own step 1
+    "not already armed" check passes, and the run gets all the way through the
+    mount and the 88 MB stage before failing at the load with `Device or
+    resource busy` over a trace that names IMA rather than the lock. Measured on
+    the hub 2026-08-28: one load succeeded, the very next faulted, and every
+    attempt after that - across two launcher runs and a third by hand - returned
+    EBUSY until a reboot. **Only a reboot clears it.**
+
+    **The exact probe is `cat /sys/kernel/kexec_crash_size`.** It takes the same
+    mutex, so it returns a number on a healthy boot and `Device or resource busy`
+    on a poisoned one; it costs one round trip and arms nothing. Worth checking
+    BEFORE a run rather than diagnosing after one.
   - **THE CONSOLE GOES DARK AND STAYS DARK.** kexec skips firmware POST, so the
     kernel never re-inits the GPU. `nomodeset` did **not** recover it on the
     AK41 (tried). The initramfs writes `casper.log` and never gets to persist it,
@@ -406,9 +423,11 @@ first and installed offline from there; do not trade that property away quietly.
 - [x] **Build Option E. BUILT AND PROVEN 2026-08-28.** `remote-reimage/` holds
       the initrd builder and the SSH-triggered script. `kexec-tools` is baked
       into the hub image (`stack/autoinstall/packages.list`), so a hub can always
-      start its own reimage. Still owed: the share is currently hand-made -
-      it needs documenting as standing infrastructure, and its credential
-      rotating off the placeholder it was created with.
+      start its own reimage. **The credential is no longer a placeholder
+      (2026-08-28):** `HubIsoSharePassword` is a HomeHub `FieldSchema.psd1`
+      entry, minted into the DPAPI store, and the `hubread` account is set to
+      it - so the whole path runs unattended. The share itself is still
+      hand-made and still wants documenting as standing infrastructure.
 
 ### Why B primary + D fallback
 

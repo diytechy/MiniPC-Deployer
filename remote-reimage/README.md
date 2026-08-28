@@ -51,6 +51,11 @@ sudo CIFSPASS=... bash kexec-reimage.sh --go
 - **Reboot, then jump once.** `kexec_file_load` faults in `ima_add_kexec_buffer`
   on 6.8.0-138 once the IMA measurement list grows — cumulative, not random. It
   presents as a bare `Killed`; the reason is only in `dmesg`.
+- **A failed load poisons the boot, not just that attempt.** The faulting task
+  dies holding `kexec_lock`, so every later kexec returns `EBUSY` — while
+  `kexec_loaded` still reads `0`, so step 1 here cannot see it and you find out
+  at step 5. Probe with `cat /sys/kernel/kexec_crash_size`: a number means
+  healthy, `Device or resource busy` means reboot before trying again.
 - **The console goes dark after the jump and `nomodeset` does not recover it.**
   A failed netboot leaves no evidence on headless hardware. Reproduce in the lab,
   whose watcher screenshots the VM console, rather than debugging on the box.

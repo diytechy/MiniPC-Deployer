@@ -36,12 +36,25 @@ EOF
 SZ=$(stat -c %s extra.cpio); PAD=$(( (4 - SZ % 4) % 4 ))
 cp extra.cpio head.img
 [ "$PAD" -gt 0 ] && head -c "$PAD" /dev/zero >> head.img
-cat head.img $TREE/casper/initrd > initrd-e
+cat head.img "$TREE/casper/initrd" > initrd-e
 echo "extra=$SZ pad=$PAD result=$(stat -c %s initrd-e)"
 
 echo "--- verify (prepend = the supported early-cpio layout) ---"
 rm -rf verify; mkdir verify; cd verify
-unmkinitramfs ../initrd-e . >/dev/null 2>&1 && echo "  unmkinitramfs OK" || echo "  unmkinitramfs warned"
-echo -n "  param.conf: "; find . -name param.conf | head -1
-echo -n "  casper script still present: "; find . -name casper -path '*scripts*' | head -1
-echo -n "  uuid.conf preserved: "; cat $(find . -name uuid.conf | head -1) 2>/dev/null
+# VERIFICATION MUST FAIL THE BUILD. The first attempt at this appended the extra
+# segment AFTER the compressed main archive; unmkinitramfs could not read it back
+# and the check printed "warned" and carried on. A build that cannot be unpacked
+# is a box that will not boot, so anything short of all three assertions is fatal.
+unmkinitramfs ../initrd-e . >/dev/null 2>&1     || { echo "  FAIL: unmkinitramfs cannot read the result back"; exit 1; }
+echo "  unmkinitramfs OK"
+P=$(find . -name param.conf | head -1)
+C=$(find . -name casper -path '*scripts*' | head -1)
+U=$(find . -name uuid.conf | head -1)
+[ -n "$P" ] || { echo "  FAIL: param.conf is not in the rebuilt initrd"; exit 1; }
+[ -n "$C" ] || { echo "  FAIL: scripts/casper missing - the base image was damaged"; exit 1; }
+[ -n "$U" ] || { echo "  FAIL: conf/uuid.conf missing - matches_uuid would reject the medium"; exit 1; }
+grep -q 'cifsopts=' "$P" || { echo "  FAIL: param.conf does not read cifsopts="; exit 1; }
+echo "  param.conf:   $P"
+echo "  casper:       $C"
+echo "  medium uuid:  $(cat "$U")"
+echo "BUILD OK - copy ebuild/initrd-e to <tree>/casper/initrd-e"

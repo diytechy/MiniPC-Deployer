@@ -158,6 +158,64 @@ fi
 # ── --report ────────────────────────────────────────────────────────────────
 log() { echo "[library-guard] $*"; }
 
+# ── REATTACH: try to put a dropped drive back before reporting it red ────────
+# ADDED 2026-08-28, after a stand-in USB dropped off the bus SEVEN times in 46
+# minutes and every one of them left the mountpoint down until a human ran
+# `mount` by hand. The fstab entries mount by LABEL with `nofail`, which is right
+# for boot — it must never block — but it means a drive that RETURNS mid-session
+# is not mounted either. /srv/library silently reverts to a bare directory on the
+# system disk, which is precisely the silent-green shape the top of this file
+# exists to prevent: shares connect, appear empty, and writes land on the eMMC.
+#
+# WHY HERE AND NOT IN --check: --check is wired into every share stanza as
+# `root preexec` and runs on EVERY client connect. It must stay fast and quiet,
+# and mounting a filesystem underneath a connecting client is not either of
+# those. --report runs on a timer, which is exactly the "notice when nobody is
+# looking" path this belongs to.
+#
+# WHAT IT WILL AND WILL NOT DO. It runs `mount <mountpoint>` and nothing else,
+# so the ONLY thing it can mount is what fstab already declares for that path -
+# no device guessing, no label matching of its own, nothing that could attach the
+# wrong disk. If fstab has no entry, it does not act. The drive-identity check
+# below still runs afterwards, so a stand-in that reattaches still reports
+# YELLOW rather than being quietly blessed.
+#
+# AND IT CAN BE INHIBITED, because a timer that fights an operator is worse than
+# one that does nothing: `touch /run/homehub-no-remount` while you fsck or swap a
+# drive, and this stands down and says so.
+if [ -n "$fail_reason" ] && [ "${GUARD_REATTACH:-1}" = "1" ] && ! mountpoint -q "$LIBRARY_ROOT" 2>/dev/null; then
+    if [ -e /run/homehub-no-remount ]; then
+        log "NOT reattaching $LIBRARY_ROOT: /run/homehub-no-remount exists (deliberate maintenance)"
+    elif ! findmnt -sn --target "$LIBRARY_ROOT" >/dev/null 2>&1 \
+         && ! awk -v m="$LIBRARY_ROOT" '$1 !~ /^#/ && $2 == m {found=1} END{exit !found}' /etc/fstab 2>/dev/null; then
+        log "NOT reattaching $LIBRARY_ROOT: no fstab entry declares it, and this never guesses a device"
+    else
+        log "REATTACH: $LIBRARY_ROOT is not mounted; trying 'mount $LIBRARY_ROOT' (fstab entry only)"
+        if mount "$LIBRARY_ROOT" >/dev/null 2>&1 && mountpoint -q "$LIBRARY_ROOT" 2>/dev/null; then
+            log "REATTACH: SUCCEEDED - $LIBRARY_ROOT is mounted again ($(findmnt -no SOURCE,FSTYPE "$LIBRARY_ROOT" 2>/dev/null))"
+            logger -t homehub-library-guard -p daemon.warning \
+                "reattached $LIBRARY_ROOT after it dropped - the drive returned and nothing else would have remounted it" 2>/dev/null || true
+            # RE-ASSESS AGAINST THE NEW REALITY. Reporting the verdict computed
+            # while the drive was down would say "NOT MOUNTED" about a drive this
+            # function just mounted — the report has to describe the box as it is
+            # when the report is written. Same two questions as the inline block
+            # above (mounted? writable?), then identity.
+            fail_reason=""; identity_state=""; identity_note=""
+            mnt_opts="$(awk -v p="$LIBRARY_ROOT" '$5 == p { o = $6 } END { print o }' "$mountinfo")"
+            if [ -z "$mnt_opts" ]; then
+                fail_reason="$LIBRARY_ROOT is NOT MOUNTED — the $DRIVE_LABEL drive is absent or failed to mount"
+            else
+                case ",$mnt_opts," in
+                    *,ro,*) fail_reason="$LIBRARY_ROOT is mounted READ-ONLY — writes will fail (NTFS dirty bit? clear it from Windows)" ;;
+                esac
+            fi
+            [ -n "$fail_reason" ] || resolve_identity
+        else
+            log "REATTACH: FAILED - 'mount $LIBRARY_ROOT' did not take; the drive is absent, or the filesystem refused"
+        fi
+    fi
+fi
+
 # Three states (A23), not two:
 #   red    - not mounted, or read-only. Nothing works.
 #   yellow - mounted and writable, but the disk is NOT the one the map names.

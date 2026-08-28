@@ -126,6 +126,41 @@ kexec-tools           # Option E: reimage over the LAN — no media, no reserved
 powertop              # low-power auto-tune, applied per boot by powertune.service
 hdparm                # backup-drive spin-down (WI-10.10)
 
+# THREE ADDED 2026-08-28, each because the box could not do a job it is designed
+# to do. All three are the same shape as `cifs-utils` below: a capability the
+# scripts NAME and the image never carried.
+#
+# wakeonlan — LOAD-BEARING ON THIS HARDWARE, and measured, not assumed.
+#   common.sh's wol_send tries three methods in order and documents why:
+#     1. bash /dev/udp   - zero dependency, but bash CANNOT set SO_BROADCAST,
+#                          "so some kernels refuse a broadcast destination with
+#                          EACCES. That is precisely why 2/3 exist."
+#     2. wakeonlan       - the portable choice; sets SO_BROADCAST
+#     3. etherwake       - raw layer 2, needs root and an interface
+#   On the real hub (6.8.0-138) method 1 FAILS, to 255.255.255.255 and to the
+#   subnet-directed address alike. With 2 and 3 both absent, wol_send sends
+#   NOTHING, wake_and_wait then polls tcp/445 to its timeout, and backup.sh dies
+#   with "the source box did not wake, so this run copied NOTHING from it".
+#   The Mini-serv ingest could never have worked while Mini-serv was asleep.
+#   TC-H-M04 covers exactly this and is skipped by default (it needs Mini-serv
+#   asleep to mean anything), which is why nothing caught it.
+wakeonlan             # WoL magic packet - bash /dev/udp is refused on this kernel
+
+# exfatprogs — the backup drive is exFAT and asks for a fsck this box cannot run.
+#   Every unclean mount logs "Volume was not properly unmounted. Some data may be
+#   corrupt. Please run fsck." and fsck.exfat was not installed, so that
+#   instruction was un-actionable. BENCH_BRINGUP_HANDOFF has carried "and
+#   fsck.exfat has NOT been run" as an open note; the reason was never a decision,
+#   it was a missing package. (ntfs-3g already brings ntfsfix for the library.)
+exfatprogs            # fsck.exfat / exfatlabel for the backup drive's filesystem
+
+# smartmontools — nothing on this box could read a drive's health. The design
+#   runs two drive-health timers and C3 asks whether the USB enclosures honour
+#   hdparm standby; none of that can see reallocated sectors, pending sectors or
+#   a drive's own self-assessment. It matters most exactly where the stand-ins
+#   stop and the real 8 TB spindle starts.
+smartmontools         # smartctl - drive health for the library/backup spindles
+
 # ── the household file server (A14) — shares come from storage-map §3 ───────
 samba
 samba-common-bin      # smbpasswd/pdbedit for the per-account passwords (A13)

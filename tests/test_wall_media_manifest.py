@@ -52,7 +52,7 @@ def _library(root: Path) -> None:
 
 
 def _build(root: Path):
-    manifest, _n, _skipped = wmm.walk_music(str(root), "/media/music/")
+    manifest, _n, _skipped, _unresolved = wmm.walk_music(str(root), "/media/music/")
     return manifest
 
 
@@ -107,7 +107,7 @@ def test_traversal_is_refused(tmp_path):
               "../../../outside.mp3\n01 One.mp3\n")
 
     planted = {"Artist/Album/01 One.mp3", "../outside.mp3", "../../outside.mp3"}
-    pls = wmm.read_playlists(str(tmp_path), planted)
+    pls, _unresolved = wmm.read_playlists(str(tmp_path), planted)
 
     assert pls[0]["tracks"] == ["Artist/Album/01 One.mp3"]
 
@@ -169,3 +169,88 @@ def test_playlist_files_are_not_mistaken_for_tracks(tmp_path):
     ] + [t["id"] for t in manifest.get("tracks", [])]
 
     assert not any(tid.endswith(".m3u") for tid in every_track)
+    # AND the playlist must actually have been PRODUCED. Without this line the
+    # assertion above passes with every scrap of playlist support deleted -
+    # `.m3u` was never in AUDIO_EXT - so it proved only the old behaviour while
+    # calling itself a regression test for the new. Adversarial review,
+    # 2026-08-28.
+    assert [p["id"] for p in manifest["playlists"]] == ["Artist/Album/Mix.m3u"]
+
+
+def test_a_bom_does_not_silently_empty_the_playlist(tmp_path):
+    # A Windows-written .m3u8 routinely carries a UTF-8 BOM. Read as plain
+    # utf-8 it stays glued to the FIRST entry, which then matches no track -
+    # and because every entry after it reads fine, the failure looks like
+    # "this playlist has one bad line" rather than "the file was misdecoded".
+    # With a single-entry playlist it vanishes entirely and says nothing.
+    _library(tmp_path)
+    (tmp_path / "Artist" / "Album" / "Bom.m3u8").write_bytes(
+        b"\xef\xbb\xbf01 One.mp3\n")
+
+    pls = _build(tmp_path)["playlists"]
+
+    assert pls[0]["tracks"] == ["Artist/Album/01 One.mp3"]
+
+
+def test_a_legacy_cp1252_playlist_resolves(tmp_path):
+    # `.m3u` is whatever machine wrote it; `.m3u8` is UTF-8 by definition, and
+    # that split is why both extensions exist. Decoded as utf-8 with
+    # errors="replace", an accented filename became U+FFFD and matched nothing.
+    (tmp_path / "A").mkdir()
+    name = "Caf\u00e9.mp3"
+    (tmp_path / "A" / name).write_bytes(b"\0")
+    (tmp_path / "A" / "Legacy.m3u").write_bytes(name.encode("cp1252"))
+
+    pls = _build(tmp_path)["playlists"]
+
+    assert pls[0]["tracks"] == ["A/" + name]
+
+
+def test_playlist_files_that_resolve_to_nothing_are_counted(tmp_path):
+    # THE SILENCE THAT HID BOTH ENCODING DEFECTS. A playlist resolving to
+    # nothing is indistinguishable from a library that has no playlists unless
+    # something counts it, so the count is the test.
+    _library(tmp_path)
+    _playlist(tmp_path, "Artist/Album/Dead.m3u", "Gone.mp3\n")
+    _playlist(tmp_path, "Artist/Album/Good.m3u", "01 One.mp3\n")
+
+    manifest, _n, _skipped, unresolved = wmm.walk_music(
+        str(tmp_path), "/media/music/")
+
+    assert len(manifest["playlists"]) == 1
+    assert unresolved == 1
+
+
+def test_a_symlinked_playlist_is_refused(tmp_path):
+    # `rsync -a` preserves links from a share the panel does not own, so a
+    # `loop.m3u -> /dev/zero` arrives intact. Following it hangs or OOM-kills
+    # the sync unit.
+    _library(tmp_path)
+    target = tmp_path / "Artist" / "Album" / "Real.m3u"
+    target.write_text("01 One.mp3\n", encoding="utf-8")
+    link = tmp_path / "Artist" / "Album" / "Link.m3u"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("this platform will not create symlinks unprivileged")
+
+    names = [p["name"] for p in _build(tmp_path)["playlists"]]
+
+    assert names == ["Real"]
+
+
+def test_an_oversized_playlist_is_refused_whole(tmp_path):
+    # Refused rather than truncated: half a playlist is a playlist that has
+    # silently lost tracks, which is the failure this file keeps designing out.
+    _library(tmp_path)
+    body = "01 One.mp3\n" * 8
+    padding = "# " + ("x" * (wmm.MAX_PLAYLIST_BYTES)) + "\n"
+    _playlist(tmp_path, "Artist/Album/Huge.m3u", body + padding)
+    _playlist(tmp_path, "Artist/Album/Small.m3u", "02 Two.mp3\n")
+
+    manifest, _n, _skipped, unresolved = wmm.walk_music(
+        str(tmp_path), "/media/music/")
+
+    assert [p["name"] for p in manifest["playlists"]] == ["Small"]
+    assert unresolved == 1

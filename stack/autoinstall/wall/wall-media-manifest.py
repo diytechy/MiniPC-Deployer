@@ -88,6 +88,10 @@ AUDIO_EXT = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus", ".wav"}
 # a playlist is a FILE in the music tree, so `rsync -a --delete` already brings
 # it down and it needs no server, no credential and no second sync path.
 PLAYLIST_EXT = {".m3u", ".m3u8"}
+# A ceiling, because the file arrives from a share this panel does not own. At
+# roughly 40 bytes a line this is ~100k entries: far past any real playlist and
+# far short of anything that can hurt a 4 GB panel.
+MAX_PLAYLIST_BYTES = 4 * 1024 * 1024
 VIDEO_EXT = {".mp4", ".m4v", ".webm", ".mov", ".mkv"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 # Cover art, best first. Anything else in IMAGE_EXT is the fallback.
@@ -156,6 +160,7 @@ def read_playlists(root, track_ids):
     remaining tracks.
     """
     playlists = []
+    unresolved = 0
     root_abs = os.path.abspath(root)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
@@ -165,13 +170,45 @@ def read_playlists(root, track_ids):
             if not json_safe(name):
                 continue
             full = os.path.join(dirpath, name)
+            # A SYMLINK IS NOT A PLAYLIST. `rsync -a` preserves links, so a
+            # source-controlled `loop.m3u -> /dev/zero` arrives in the cache
+            # intact and open() follows it. os.walk already refuses to DESCEND
+            # into symlinked directories (followlinks=False); this is the same
+            # rule for the files. Adversarial review, 2026-08-28.
+            if os.path.islink(full):
+                unresolved += 1
+                continue
             try:
-                with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                    lines = fh.read().splitlines()
-            except OSError:
+                with open(full, "rb") as fh:
+                    # Bounded read: an unbounded one on a character device or a
+                    # pathological file exhausts memory and takes the sync unit
+                    # with it. One byte over the cap is enough to know.
+                    raw = fh.read(MAX_PLAYLIST_BYTES + 1)
+                    if len(raw) > MAX_PLAYLIST_BYTES:
+                        # Refused whole, not truncated: half a playlist is a
+                        # playlist that silently lost tracks.
+                        raise ValueError("playlist exceeds MAX_PLAYLIST_BYTES")
+            except (OSError, ValueError):
                 # A playlist we cannot read is not fatal: the tracks it names are
                 # still in the manifest and still playable by album.
+                unresolved += 1
                 continue
+            # `.m3u8` IS UTF-8 BY DEFINITION AND `.m3u` IS WHATEVER WROTE IT —
+            # that split is the entire reason both extensions exist, and getting
+            # it wrong is silent. Measured 2026-08-28 against the first version
+            # of this function, which used plain utf-8 with errors="replace":
+            #   * a BOM (routine in a Windows-written .m3u8) stayed glued to the
+            #     first entry, so it matched no track;
+            #   * a cp1252 .m3u naming an accented file decoded to U+FFFD, so it
+            #     matched no track either.
+            # In both cases every entry failed, the playlist emitted nothing, and
+            # NOTHING SAID SO. utf-8-sig strips the BOM; cp1252 decodes every
+            # byte, so the legacy file resolves instead of vanishing.
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = raw.decode("cp1252", errors="replace")
+            lines = text.splitlines()
             tracks = []
             seen = set()
             for line in lines:
@@ -196,6 +233,10 @@ def read_playlists(root, track_ids):
                     seen.add(tid)
                     tracks.append(tid)
             if not tracks:
+                # Loud, because this is exactly how the encoding defects above
+                # hid: a playlist that resolves to nothing looks identical to a
+                # library with no playlists.
+                unresolved += 1
                 continue
             playlists.append({
                 # Path-as-id, the same shape albums and tracks already use, so
@@ -206,13 +247,14 @@ def read_playlists(root, track_ids):
                 "tracks": tracks,
             })
     playlists.sort(key=lambda p: p["id"])
-    return playlists
+    return playlists, unresolved
 
 
 def walk_music(root, base_url):
     """Build the manifest body: albums (folders) + flat tracks (root files).
 
-    Returns (manifest_dict, n_tracks, n_skipped). Every directory holding audio
+    Returns (manifest_dict, n_tracks, n_skipped, n_playlists_unresolved). Every
+    directory holding audio
     files becomes ONE album whose id is its cache-relative path — so
     `Artist/Album/` yields artist + album, a flat `Album/` yields just the album
     name, and files sitting directly in `music/` become the manifest's top-level
@@ -284,10 +326,10 @@ def walk_music(root, base_url):
     # Emitted only when there is something to emit: `local.js` treats a missing
     # key and an empty array alike, and an absent key keeps the manifest of a
     # library with no playlists byte-identical to what it was before.
-    playlists = read_playlists(root, track_ids)
+    playlists, unresolved = read_playlists(root, track_ids)
     if playlists:
         manifest["playlists"] = playlists
-    return manifest, n_tracks, skipped
+    return manifest, n_tracks, skipped, unresolved
 
 
 def walk_frame(root, base_url):
@@ -411,16 +453,18 @@ def main():
     parts = []
     music_skipped = frame_skipped = 0
     if do_music:
-        manifest, n_tracks, music_skipped = walk_music(
+        manifest, n_tracks, music_skipped, pl_unresolved = walk_music(
             music_root, "{}/{}/".format(url_base, args.music_subdir)
         )
         write_atomic(os.path.join(music_root, "index.json"), manifest)
         parts.append(
-            "music/index.json = {} track(s) in {} album(s) (+{} loose, {} playlist(s))".format(
+            "music/index.json = {} track(s) in {} album(s) (+{} loose, "
+            "{} playlist(s), {} playlist file(s) resolved to nothing)".format(
                 n_tracks,
                 len(manifest["albums"]),
                 len(manifest.get("tracks", [])),
                 len(manifest.get("playlists", [])),
+                pl_unresolved,
             )
         )
     if do_frame:

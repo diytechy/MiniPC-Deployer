@@ -57,18 +57,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # scripting against in an emergency. Same shape, caller picks the status.
 bail() { local c="$1"; shift; local m; for m in "$@"; do log "ERROR: $m"; done; exit "$c"; }
 
-# newest_run_with_set BASE SET : the newest sibling run directory whose MANIFEST
-# actually lists SET, or nothing. Run names are run_%Y%m%d_%H%M%S so a plain
-# sort is chronological (the same assumption retention makes). Read-only; used
-# only to point somewhere useful when THIS run has no copy of the set.
-newest_run_with_set() {
-    local base="$1" s="$2" d
-    while IFS= read -r d; do
-        [ -f "$d/MANIFEST.tsv" ] || continue
-        awk -F'\t' -v s="$s" 'NR>1 && $1==s {found=1} END {exit !found}' "$d/MANIFEST.tsv" || continue
-        printf '%s\n' "$d"
-    done < <(find "$base" -mindepth 1 -maxdepth 1 -type d -name 'run_*' 2>/dev/null | sort) | tail -1
-}
+# newest_run_with_set moved to common.sh on 2026-08-28 — firstboot's ACME
+# restore asks the same question, and two copies of it would drift.
 
 RUN_DIR=""; SET=""; TARGET=""
 while [ $# -gt 0 ]; do

@@ -810,6 +810,56 @@ if [ -n "$__lan_ip" ] && [ "$__lan_ip" != "0.0.0.0" ]; then
     [ "$__waited" -gt 0 ] && log "  $__lan_ip appeared after ${__waited}s"
 fi
 
+# ── 4a-pre-5. GIVE CADDY ITS CERTIFICATES BACK BEFORE IT ASKS FOR NEW ONES ───
+# A reimage wipes the named volumes, so caddy starts against an empty caddy_data
+# and immediately asks Let's Encrypt for every hostname. LE's duplicate-
+# certificate limit is FIVE per exact set of identifiers per 168h, so two or
+# three reinstalls in a week exhaust it. MEASURED ON THIS BOX 2026-08-28: one
+# reimage spent the week's allowance for all five vhosts, logged 122 rate-limit
+# refusals, and the apex certificate did not land until 2h40m after boot.
+#
+# Restoring the volume FIRST means caddy comes up already holding valid material
+# and never calls ACME — the same "before compose up" reasoning as the wall site
+# in step 3e, for the same reason: doing it afterwards works, but only after a
+# window of visibly broken service.
+#
+# IT FAILS OPEN, ALWAYS, AND THAT IS THE WHOLE CONTRACT. No drive, no run, no
+# archived set, a failed verify, no docker, a volume that already has content —
+# every one of them leaves things exactly as they were and lets caddy issue
+# normally. This step can only ever SAVE issuances; it must never be able to
+# withhold a boot, so it runs in a subshell, reports through a flag file, and
+# nothing in it is fatal.
+__acme_flag=/run/homehub-acme-restored
+rm -f "$__acme_flag"
+(
+    . /etc/homehub-backup/backup.env 2>/dev/null || exit 0
+    . "$STACK_DIR/backup/common.sh"  2>/dev/null || exit 0
+    [ -n "${BACKUP_TARGET:-}" ] && [ -d "$BACKUP_TARGET" ] || exit 0
+    run="$(newest_run_with_set "$BACKUP_TARGET" caddy)" || exit 0
+    [ -n "$run" ] || exit 0
+    # COMPOSE creates the volume, not us: that way it gets the project-prefixed
+    # name and the labels compose looks for later, instead of a hand-built name
+    # this script would have to keep in step with the project directory.
+    # `create` makes the containers and their volumes without starting anything.
+    docker compose create caddy >/dev/null 2>&1 || exit 0
+    vmp="$(volume_mountpoint caddy_data)" || exit 0
+    [ -n "$vmp" ] && [ -d "$vmp" ] || exit 0
+    # ONLY INTO AN EMPTY VOLUME. Anything already there means this is not the
+    # fresh install this step is for, and the on-disk material wins.
+    [ -z "$(ls -A "$vmp" 2>/dev/null)" ] || exit 0
+    bash "$STACK_DIR/backup/restore.sh" --run "$run" --set caddy --target "$vmp" >/dev/null 2>&1 || exit 0
+    : > "$__acme_flag"
+) || true
+if [ -e "$__acme_flag" ]; then
+    log "restored caddy_data from the backup drive — caddy starts holding its certificates and will not call ACME"
+    rm -f "$__acme_flag"
+else
+    log "no caddy_data restore (no drive, no archived 'caddy' set, or the volume is not empty)"
+    log "  caddy will obtain certificates normally. Let's Encrypt allows 5 per exact"
+    log "  identifier set per 168h and a reimage spends one of each, so expect the"
+    log "  last hostname to take a while if this box has been reinstalled recently."
+fi
+
 log "docker compose up -d…"
 docker compose up -d
 

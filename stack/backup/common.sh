@@ -204,6 +204,23 @@ source_kind() {
     esac
 }
 
+# newest_run_with_set BASE SET : the newest sibling run directory whose MANIFEST
+# actually lists SET, or nothing. Run names are run_%Y%m%d_%H%M%S so a plain
+# sort is chronological (the same assumption retention makes). Read-only.
+#
+# LIVES HERE, NOT IN restore.sh, since 2026-08-28: firstboot's ACME restore needs
+# the identical question answered, and two copies of "which run actually has this
+# set" is exactly the kind of drift that makes one of them quietly wrong.
+newest_run_with_set() {
+    local base="$1" s="$2" d
+    while IFS= read -r d; do
+        [ -f "$d/MANIFEST.tsv" ] || continue
+        awk -F'\t' -v s="$s" 'NR>1 && $1==s {found=1} END {exit !found}' "$d/MANIFEST.tsv" || continue
+        printf '%s\n' "$d"
+    done < <(find "$base" -mindepth 1 -maxdepth 1 -type d -name 'run_*' 2>/dev/null | sort) | tail -1
+}
+
+
 # volume_mountpoint VOL : echoes the volume's host mountpoint (empty + nonzero
 # on failure — the caller decides how loud to be). Reading the mountpoint
 # directly (the service runs as root) avoids depending on any helper image.

@@ -8,69 +8,135 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-> **RESUMING FROM A COLD SESSION? THIS BLOCK IS THE WHOLE HANDOVER (2026-08-28, late).**
+> **RESUMING FROM A COLD SESSION? THIS BLOCK IS THE WHOLE HANDOVER (2026-08-28, midday).**
 >
-> ### 1. THE REAL HUB IS REIMAGED AND GREEN
+> ### 0. THE HUB IS POWERED OFF ON PURPOSE — IT IS BEING MOVED
 >
-> HOMEHUB is running the new image. `assert-installed.sh` section 5c reports
-> **ALL CHECKS PASSED** on it - including `IceDrive is RUNNING with nobody
-> connected` - on a box **nobody hand-patched**. `/srv/library` and
-> `/mnt/backup-drive` mounted by label and intact; the pinned NVMe
-> (`FORESEE_P900F128GBH_K03299J008486_1`) was the only disk wiped.
+> Shut down cleanly over SSH at **2026-08-28 14:00 UTC** at the Owner's request,
+> to be physically relocated. **This is not a fault and nothing is broken.** Its
+> state in the last second before poweroff:
 >
-> **It was installed over Ethernet, not from a stick** - REMOTE_MANAGEMENT.md
-> Option E, triggered from an SSH session. Jump 23:06:46, green 23:24:07.
+>     system running · 0 failed units · 15 containers · IceDrive RUNNING
+>     xrdp active / session active · no reboot owed · uptime 7h54m
 >
-> ### 2. WHAT IS OWED — THERE IS A PLAN, START THERE
+> **BEFORE POWERING IT ON AT THE NEW LOCATION, CONFIRM A WIRED ETHERNET DROP.**
+> The hub is `eno1`-only — netplan carries no wifi and no access-points, and the
+> `MacWifi` value in the identity table is not configured. No wired drop means
+> SSH, Cockpit, Samba, the panel's kiosk fetch and Option E all disappear in one
+> move, and the way back is a keyboard and monitor at the box. Full detail in
+> HomeHub's **C2**.
 >
-> **[plan-post-reimage.md](plan-post-reimage.md) is written to be picked up cold.**
-> It carries both open tasks in full, plus the six things that will waste a day if
-> you rediscover them. Summary:
+> ### 1. WHAT HAPPENED OVERNIGHT: THE TEST SUITE ROUGHLY DOUBLED
 >
-> - **C2's 48-hour burn-in has not started.** The box has not been physically
->   moved either, and doing the burn-in on both sides of a move is work done twice.
-> - **`finance-auditor` is in a restart loop.** It did this on the OLD image too,
->   so it predates the reimage and is not a regression - but it is the one thing
->   on the box that is not green.
-> - **The ISO tree must be deleted once an install is confirmed** (Owner, 2026-08-28)
->   — plan Task 1. The share itself stays; it is standing infrastructure. The
->   credential is explicitly NOT a concern (private machine, private network).
->   **Do not naively delete on "install finished":** the share is the LIVE ROOT for
->   the whole install, and both `ping` and tcp/22 answer while it is still running.
-> - **C2's burn-in checklist does not exist** — plan Task 2. C2 requires a 48-hour
->   burn-in and points at a checklist; the only one in the repo is the wall
->   panel's `WALL-BURN-IN.md`. The reference is dangling.
-> - **The wall lane is untouched** since 2026-08-27.
+> `scripts/verify/` went from **103 checks to 156** against the real hub. Three
+> new areas, because the night's boot failures were invisible to every checker
+> the project had:
 >
-> ### 3. OPTION E - THE THREE THINGS THAT WILL BITE AGAIN
+> - **R — boot integrity.** Ordering cycles, a boot-time budget, units stuck
+>   `activating`, `systemd-analyze verify`. **R03 is the one that matters:**
+>   systemd does not refuse to boot on a cycle, it *deletes a job* and carries
+>   on, so the box comes up, the deleted unit never runs, and the only evidence
+>   is one journal line nobody reads on a headless machine.
+> - **S — the graphical layer and IceDrive.** Both had **zero** test cases while
+>   being the two things most recently chosen and the two that broke most often.
+> - **T — the tier-2 catalogue.** `config.homehub.psd1` is now the **oracle**;
+>   deriving expectations from the box is how five running profiles stayed
+>   documented as "off" for four weeks.
 >
-> All measured 2026-08-28; details in REMOTE_MANAGEMENT.md and remote-reimage/.
+> Plus **D11** (per-vhost certificate coverage) and **J05** (restart loops), and
+> real checks for E01/E02/H01/H02 — which the README called implemented and which
+> nothing asserted.
 >
-> 1. **casper has no `nfsopts=` parameter.** It ignores CIFS credentials from the
->    cmdline and uses `-ouser=root,password=`, which Windows refuses. The fix is a
->    2 KB prepended cpio segment adding `/conf/param.conf`. **A stock initrd will
->    never work against an authenticated share.**
-> 2. **`kexec_file_load` faults on 6.8.0-138** in `ima_add_kexec_buffer` once the
->    IMA measurement list grows - cumulative, not random. **Reboot, then jump
->    once.** It presents as a bare `Killed`; only dmesg says why.
-> 3. **The console dies at the jump and `nomodeset` does not save it.** A failed
->    netboot leaves no evidence on headless hardware. Reproduce in the lab, whose
->    watcher screenshots the console - that is what finally found cause (1).
+> **The boot question is answered.** The 2026-08-27/28 boot took 10m42s and
+> nothing measured it. **458 s of that was `docker load` on sixteen baked image
+> tars** — a zero-registry offline *first* boot doing exactly what it is for. A
+> deliberate reboot measured the steady state at **74 s userspace, firstboot 49 s
+> (66%)**, inside budget, no failed units, no ordering cycle. Slow once, for a
+> reason; not slow now.
 >
-> ### 4. STATE OF THE MACHINES
+> **The graphical lane is proven end to end for the first time.** All four
+> defects that broke it (the 9-vs-22 package list, enable-is-not-start, the
+> sesman restart that orphaned the boot session, the `~/.config` owner) survived
+> a real reboot on real hardware, with IceDrive RUNNING and nobody connected.
 >
-> - **The real HOMEHUB: UP**, new image, 12/12, running the stack.
-> - **HomeHub-Lab / WallPanel-Lab: absent.** Destroyed. **A leftover lab VM holds
->   the hub's DHCP reservation as well as its ISO** - `-KeepVms` costs both, and
->   forgetting it once nearly put two machines on `.117`.
-> - Branch on both repos: **`IceDrive-DesktopDirection`**. The Owner pushes (OI-3).
+> ### 2. THREE OPEN CAUSES, AND ONLY ONE NEEDS A DECISION
+>
+> The last full run was **156 checks, 11 failures**, and every failure traces to
+> one of three causes:
+>
+> | Cause | Failures | What to do |
+> |---|---|---|
+> | **C22** — Let's Encrypt rate limit | 7 | **Nothing.** Retry-after is 2026-08-29 04:12 UTC. Three of five vhosts hold no certificate; the ACME path itself is proven working for the two that do |
+> | **C21** — `finance-auditor` restart loop | 2 | One browser visit: create a budget in Actual, or drop the profile. `ACTUAL_SYNC_ID` unset with 0 budget files |
+> | **A15** — `/srv/library` mount options | 1 | ntfs-3g is not honouring `gid=3000` with `uid=0`. Long-standing |
+>
+> **Re-run after 04:12 UTC on 2026-08-29 and 11 should become 3**, with no work:
+>
+>     .\scripts\verify\Invoke-LabVerify.ps1 -Target hub -ExpectDriveIdentity yellow -IncludeExternal
+>
+> Unelevated (elevating can lose the ssh-agent), pwsh 7, and `-IncludeExternal`
+> is safe against production — it gates four reads and nothing that writes.
+>
+> ### 3. OPTION E IS NOT A RESCUE PATH — BE PRECISE ABOUT THIS
+>
+> REMOTE_MANAGEMENT.md states its precondition plainly: **"the OS must boot and
+> be reachable."** So it cannot recover a box that will not boot, which is the
+> case a reimage is usually wanted for. It is an excellent *reimage-without-
+> walking-over-there* tool and nothing more. Its three standing bite-me's are
+> unchanged (§ below), and two are worth repeating here:
+>
+> - **The kernel is still `6.8.0-138-generic`** — `kexec_file_load` faults
+>   cumulatively in `ima_add_kexec_buffer`. **Reboot, then jump once.**
+> - **The CIFS share is hand-made**, undocumented as standing infrastructure,
+>   with its credential still the placeholder it was created with.
+>
+> **A verified USB stick now exists as the fallback (HomeHub C23).** Rebuilt
+> 2026-08-28, first medium carrying the `install -m 0644` unit-mode fix, write
+> verified by SHA-256 readback. **It has not been BOOTED** — the one thing
+> neither path establishes.
+>
+> ### 4. STILL OWED
+>
+> - **C2's 48-hour burn-in has not started, and its checklist does not exist.**
+>   Draft it (Task 2 of [plan-post-reimage.md](plan-post-reimage.md)) — the only
+>   burn-in doc in the repo is the wall panel's. Do it **after** the move; either
+>   side of a relocation is work done twice.
+> - **The ISO tree deletion is now safe and still owed** (Task 1). The install is
+>   long confirmed and the box is off, so the "do not naively delete while it is
+>   still the LIVE ROOT" caution no longer applies. The share itself stays.
+> - **The wall lane is untouched** since 2026-08-27. A `WallPanel-Lab` install ran
+>   2026-08-28 and installed cleanly, then failed to fetch its kiosk site with a
+>   TLS internal-error alert — the kiosk serves on the `wall` certificate, one of
+>   the three C22 killed. That is C22 confirmed from the far end, not a separate
+>   defect. Re-run it after the rate limit clears.
+> - **Push both repos** (OI-3). Agents commit locally.
 >
 > ### 5. THE TWO HANDS-ON STEPS THAT ARE PERMANENT
 >
 > Per reimage, not per reboot, and neither is a gap to be closed: **sign in to
-> IceDrive** (2FA makes it unavoidable - the CLI carries
-> `2FA method isn't supported in CLI`) and **create the sync pair** (the CLI
-> cannot draw the dialog).
+> IceDrive** (2FA makes it unavoidable) and **create the sync pair** (the CLI
+> cannot draw the dialog). Both survive reboots — proven again 2026-08-28.
+>
+> ### 6. STATE OF THE MACHINES
+>
+> - **The real HOMEHUB: POWERED OFF**, deliberately, mid-relocation. Green when
+>   it went down.
+> - **HomeHub-Lab / WallPanel-Lab: absent.** Destroyed. A leftover lab VM holds
+>   the hub's DHCP reservation as well as its ISO — `-KeepVms` costs both.
+> - Branch on both repos: **`IceDrive-DesktopDirection`**. The Owner pushes (OI-3).
+>
+> ### 7. THE HABIT THIS WEEK KEEPS REWARDING
+>
+> **Four documentation drifts were found in one session, and every one surfaced
+> by RUNNING something rather than by reading it:** the tier-2 catalogue
+> described as off while five profiles ran; Samba K04/K05 called "written only"
+> while they had been passing all along; ratified decision #1 describing a
+> relabel that stopped happening on 2026-08-06 (**C24**); and a stale
+> "HomeHub-Lab is RUNNING" hazard notice in two separate homes. An adversarial
+> review then found **18 ways the new checks themselves could lie** — including a
+> `curl … || echo 000` that yields `000000` and passes, reproduced at a shell.
+> If you find yourself reasoning about whether something works instead of
+> executing it, that is the habit this project keeps punishing.
 
 - **Active gate:** G1 — Requirements, UX & constraints. This is a config/infra
   repo delivered against a ratified brief (HOMELAB_RESTRUCTURE_PLAN.md); the

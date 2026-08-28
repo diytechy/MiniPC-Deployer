@@ -519,16 +519,23 @@ autoinstall:
     # wall-sync-frame  — EVERY MINUTE (a .timer): the frame flow only, because
     #                    storage-map §4d gives it that cadence and the music flow
     #                    a different one. Same script, `--only frame`.
-    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.service /target/etc/systemd/system/wall-firstboot.service
+    # `install -m 0644`, NOT `cp`, for every unit below - same defect the hub's
+    # user-data carried, found the same day (2026-08-28) by TC-H-R07. The payload
+    # is staged from a Windows checkout through a DrvFs mount that hands every
+    # file mode 0777, and `cp` PRESERVES that, so every one of these units landed
+    # on the panel executable. systemd loads them anyway and prints "marked
+    # executable ... Proceeding anyway" into a journal nobody reads on a wall-
+    # mounted box with no keyboard. Nothing fails, which is why it survived.
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.service /target/etc/systemd/system/wall-firstboot.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh /target/usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- systemctl enable wall-firstboot.service
-    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.service /target/etc/systemd/system/wall-wakeprep.service
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.service /target/etc/systemd/system/wall-wakeprep.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.sh /target/usr/local/sbin/wall-wakeprep.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-wakeprep.sh
     - curtin in-target --target=/target -- systemctl enable wall-wakeprep.service
-    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sleep.service /target/etc/systemd/system/wall-sleep.service
-    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-wake.service /target/etc/systemd/system/wall-wake.service
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sleep.service /target/etc/systemd/system/wall-sleep.service
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-wake.service /target/etc/systemd/system/wall-wake.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sleep.sh /target/usr/local/sbin/wall-sleep.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sleep.sh
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-kiosk.sh /target/usr/local/bin/wall-kiosk.sh
@@ -537,7 +544,7 @@ autoinstall:
     # on this unit, by the ruling. The manifest generator is installed NEXT TO the
     # script because wall-sync.sh looks for it there first (and in the payload dir
     # as a fallback).
-    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync.service /target/etc/systemd/system/wall-sync.service
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sync.service /target/etc/systemd/system/wall-sync.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync.sh /target/usr/local/sbin/wall-sync.sh
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-media-manifest.py /target/usr/local/sbin/wall-media-manifest.py
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sync.sh /usr/local/sbin/wall-media-manifest.py
@@ -545,14 +552,14 @@ autoinstall:
     # wall-sync-frame — the frame flow's every-minute cadence (OI-18 exit (b),
     # storage-map §4d). Only the TIMER is enabled: nothing should start the
     # service at boot, because wall-sync.service already mirrors both flows there.
-    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-frame.service /target/etc/systemd/system/wall-sync-frame.service
-    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-frame.timer /target/etc/systemd/system/wall-sync-frame.timer
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-frame.service /target/etc/systemd/system/wall-sync-frame.service
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-frame.timer /target/etc/systemd/system/wall-sync-frame.timer
     - curtin in-target --target=/target -- systemctl enable wall-sync-frame.timer
     # wall-sync-resume — the OI-16a hook: WantedBy=suspend.target, so every wake
     # from the D-W4 nightly suspend re-triggers wall-sync (detached, --no-block —
     # the wake is never delayed). Enabling it is what plants the suspend.target
     # symlink; without that the hook exists but never fires.
-    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-resume.service /target/etc/systemd/system/wall-sync-resume.service
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-resume.service /target/etc/systemd/system/wall-sync-resume.service
     - curtin in-target --target=/target -- systemctl enable wall-sync-resume.service
     # Seat access for the kiosk user (cage needs the DRM/input devices).
     - curtin in-target --target=/target -- usermod -aG video,input,render panel

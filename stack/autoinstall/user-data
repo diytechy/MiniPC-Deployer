@@ -758,12 +758,22 @@ autoinstall:
       exit $rc'
 
     # ---- 5. Install + enable the first-boot unit ------------------------------
-    - cp /target/opt/homehub/stack/autoinstall/homehub-firstboot.service /target/etc/systemd/system/homehub-firstboot.service
+    # `install -m 0644`, NOT `cp`, and that is the whole point of these three
+    # lines. The payload is staged from a Windows checkout through a DrvFs mount,
+    # which hands every file mode 0777; a plain `cp` PRESERVES that, so all three
+    # units landed on the box executable. systemd loads them anyway - it prints
+    # "Configuration file ... is marked executable. Please remove executable
+    # permission bits. Proceeding anyway." - which is exactly why this survived:
+    # nothing failed, and the warning goes to a journal nobody reads on a headless
+    # box. Found 2026-08-28 by TC-H-R07 (`systemd-analyze verify`), which is in
+    # HomeHub's verify-hub.sh. The health units two files over already used
+    # `install -m 0644` and were clean, which is what made the diff obvious.
+    - install -m 0644 /target/opt/homehub/stack/autoinstall/homehub-firstboot.service /target/etc/systemd/system/homehub-firstboot.service
     - cp /target/opt/homehub/stack/autoinstall/firstboot.sh /target/usr/local/sbin/homehub-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/homehub-firstboot.sh
     - curtin in-target --target=/target -- systemctl enable homehub-firstboot.service
     # Low-power tune unit (per-boot powertop auto-tune + USB-storage guard).
-    - cp /target/opt/homehub/stack/autoinstall/powertune.service /target/etc/systemd/system/powertune.service
+    - install -m 0644 /target/opt/homehub/stack/autoinstall/powertune.service /target/etc/systemd/system/powertune.service
     - cp /target/opt/homehub/stack/autoinstall/powertune.sh /target/usr/local/sbin/powertune.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/powertune.sh
     - curtin in-target --target=/target -- systemctl enable powertune.service
@@ -771,7 +781,7 @@ autoinstall:
     # Runs from the stack dir (sources common.sh) like homehub-backup.service, so we
     # only install the unit + make the script executable; no cp to /usr/local/sbin.
     # A no-op until BACKUP_DRIVE_DEVICES is set in /etc/homehub-backup/backup.env.
-    - cp /target/opt/homehub/stack/backup/systemd/backup-standby.service /target/etc/systemd/system/backup-standby.service
+    - install -m 0644 /target/opt/homehub/stack/backup/systemd/backup-standby.service /target/etc/systemd/system/backup-standby.service
     - curtin in-target --target=/target -- chmod +x /opt/homehub/stack/backup/backup-standby.sh
     - curtin in-target --target=/target -- systemctl enable backup-standby.service
     # ---- 5b. THE BACKUP SERVICE ITSELF, WHICH WAS NEVER INSTALLED ------------

@@ -79,9 +79,15 @@ MANIFEST_VERSION = 1
 TMP_PREFIX = ".wall-manifest."
 
 # Extensions the panel's Chromium/Electron host can actually play. Anything else
-# in the cache (playlists, .nfo, stray archives) is not a track and is counted as
-# skipped rather than emitted as an unplayable entry.
+# in the cache (.nfo, stray archives) is not a track and is counted as skipped
+# rather than emitted as an unplayable entry. PLAYLISTS ARE NO LONGER IN THAT
+# LIST: they are read by read_playlists() below and become the manifest's third
+# contract, so a file that used to be counted as skipped now carries meaning.
 AUDIO_EXT = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".oga", ".opus", ".wav"}
+# The library is the source of truth for playlists, exactly as it is for tracks:
+# a playlist is a FILE in the music tree, so `rsync -a --delete` already brings
+# it down and it needs no server, no credential and no second sync path.
+PLAYLIST_EXT = {".m3u", ".m3u8"}
 VIDEO_EXT = {".mp4", ".m4v", ".webm", ".mov", ".mkv"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 # Cover art, best first. Anything else in IMAGE_EXT is the fallback.
@@ -127,6 +133,82 @@ def pick_art(root, dirpath, names):
     return rel_posix(root, os.path.join(dirpath, images[0]))
 
 
+def read_playlists(root, track_ids):
+    """Playlists from the .m3u/.m3u8 files already in the cache.
+
+    WHY THIS EXISTS. `js/music/local.js` has consumed a `playlists` array since
+    it was written - shell-architecture.md §5 specifies it and
+    `local-library.test.mjs` pins it from the consuming side, DANGLING IDS
+    INCLUDED - but nothing ever produced the key. The panel therefore showed
+    albums and tracks and no playlists, and the gap read as "streaming is
+    required for playlists" when the real answer was that the producer skipped
+    the files the sync had already delivered.
+
+    ENTRIES RESOLVE RELATIVE TO THE PLAYLIST'S OWN DIRECTORY, which is the .m3u
+    convention, and survive only if they name a track THIS RUN emitted. An id
+    the shell cannot resolve is worse than an absent playlist: it renders as a
+    row that plays nothing.
+
+    TRAVERSAL IS REFUSED, NOT CLAMPED. These files arrive over a network mount
+    from a share this panel does not own, so they are untrusted input - the same
+    argument write_atomic() makes about the frame playlist's temp file. An entry
+    resolving outside the cache root is dropped and the playlist keeps its
+    remaining tracks.
+    """
+    playlists = []
+    root_abs = os.path.abspath(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if os.path.splitext(name)[1].lower() not in PLAYLIST_EXT:
+                continue
+            if not json_safe(name):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    lines = fh.read().splitlines()
+            except OSError:
+                # A playlist we cannot read is not fatal: the tracks it names are
+                # still in the manifest and still playable by album.
+                continue
+            tracks = []
+            seen = set()
+            for line in lines:
+                entry = line.strip()
+                # `#EXTM3U`, `#EXTINF:` and friends are metadata. Titles come
+                # from the manifest's own track rows, so these are read past
+                # rather than parsed - one less thing to get wrong about an
+                # encoding this file does not control.
+                if not entry or entry.startswith("#"):
+                    continue
+                # A URL is a streaming entry: out of scope for a local library,
+                # and silently dropping it is better than emitting a track id
+                # that resolves to nothing.
+                if "://" in entry or os.path.isabs(entry) or entry.startswith("\\"):
+                    continue
+                cand = os.path.abspath(
+                    os.path.join(dirpath, entry.replace("\\", "/")))
+                if cand != root_abs and not cand.startswith(root_abs + os.sep):
+                    continue
+                tid = rel_posix(root, cand)
+                if tid in track_ids and tid not in seen:
+                    seen.add(tid)
+                    tracks.append(tid)
+            if not tracks:
+                continue
+            playlists.append({
+                # Path-as-id, the same shape albums and tracks already use, so
+                # two playlists of the same name in different folders stay
+                # distinct and the id is stable across runs.
+                "id": rel_posix(root, full),
+                "name": os.path.splitext(name)[0],
+                "tracks": tracks,
+            })
+    playlists.sort(key=lambda p: p["id"])
+    return playlists
+
+
 def walk_music(root, base_url):
     """Build the manifest body: albums (folders) + flat tracks (root files).
 
@@ -140,6 +222,9 @@ def walk_music(root, base_url):
     flat = []
     skipped = 0
     n_tracks = 0
+    # Every id this run emits, so a playlist entry can be checked against what
+    # the shell will actually be able to resolve rather than against the disk.
+    track_ids = set()
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
@@ -161,6 +246,7 @@ def walk_music(root, base_url):
             num, title = split_track(os.path.splitext(n)[0])
             # `path` is RAW here on purpose — the shell encodes it (joinUrl).
             t = {"id": path, "title": title, "path": path}
+            track_ids.add(path)
             if num:
                 t["track"] = num
             tracks.append(t)
@@ -195,6 +281,12 @@ def walk_music(root, base_url):
     }
     if flat:
         manifest["tracks"] = flat
+    # Emitted only when there is something to emit: `local.js` treats a missing
+    # key and an empty array alike, and an absent key keeps the manifest of a
+    # library with no playlists byte-identical to what it was before.
+    playlists = read_playlists(root, track_ids)
+    if playlists:
+        manifest["playlists"] = playlists
     return manifest, n_tracks, skipped
 
 
@@ -324,8 +416,11 @@ def main():
         )
         write_atomic(os.path.join(music_root, "index.json"), manifest)
         parts.append(
-            "music/index.json = {} track(s) in {} album(s) (+{} loose)".format(
-                n_tracks, len(manifest["albums"]), len(manifest.get("tracks", []))
+            "music/index.json = {} track(s) in {} album(s) (+{} loose, {} playlist(s))".format(
+                n_tracks,
+                len(manifest["albums"]),
+                len(manifest.get("tracks", [])),
+                len(manifest.get("playlists", [])),
             )
         )
     if do_frame:

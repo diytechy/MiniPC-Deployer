@@ -123,6 +123,16 @@ than papered over.
 contract inside the cache — `music/index.json` (`LocalLibraryProvider`'s
 manifest) or `frame/playlist.json`.
 
+**Playlists ride the mirror, not a server.** `index.json` carries a `playlists`
+array built from the `.m3u`/`.m3u8` files already in the music tree: the hub's
+library is the source of truth for them exactly as it is for tracks, so they
+arrive on the same `rsync` and need no Navidrome, no credential and no second
+sync path. Entries resolve relative to the playlist's own directory and survive
+only if they name a track the same run emitted; anything escaping the cache is
+refused rather than clamped. **Added 2026-08-28** — `js/music/local.js` had
+consumed the key since it was written and nothing had ever produced it, which
+made "the panel has no playlists" look like an argument for streaming.
+
 **The dedicated on-demand command — unchanged, and it still means "everything":**
 
 ```bash

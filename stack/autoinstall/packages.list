@@ -83,6 +83,45 @@ openssh-server
 cockpit               # LAN web console (terminal/logs/updates/reboot)
 unattended-upgrades   # hands-off OS security patching
 
+# ── remote reimage without media (REMOTE_MANAGEMENT.md Option E) ────────────
+# SO A REIMAGE NEVER AGAIN NEEDS SOMEONE STANDING AT THE BOX. Option E loads the
+# installer's kernel and initrd straight into RAM (`kexec`) and jumps into them:
+# no reboot through firmware, nothing read from the system disk, and therefore
+# nothing reserved on it. The recovery partition Option B would have cost is not
+# needed — the disk is free to be wiped whole, because the installer is already
+# in memory by the time anything touches it.
+#
+# THE SECURE BOOT HALF IS SETTLED, and it was the half expected to kill this.
+# Measured 2026-08-28 on a lab hub, Secure Boot ON, lockdown=[integrity]: the
+# ISO's own signed /casper/vmlinuz loads (`kexec -s -l` -> exit 0), and the SAME
+# kernel with four bytes flipped is refused —
+#
+#     kexec_file_load failed: Key was rejected by service
+#
+# The tamper probe is what makes the first result mean anything: verification is
+# genuinely enforced, so the signed kernel passing is a real signature success
+# and not a check that is switched off. (kexec-tools 2.0.28 routes plain `-l`
+# through kexec_file_load too, so a bare `-l` success is NOT evidence that
+# lockdown is inactive — both were refused identically on the tampered kernel.)
+#
+# WHY BAKED, RATHER THAN apt-installed AT THE MOMENT IT IS WANTED. Option E's
+# scenario is a box too broken to fix over SSH, and that is frequently a box
+# whose package management is part of what is broken; needing an apt round-trip
+# to BEGIN the recovery makes the recovery depend on the thing being recovered.
+# Measured 2026-08-28: a freshly installed hub had no `kexec` binary at all, so
+# the first real reimage was done from a USB stick with someone at the machine —
+# the exact visit this ladder exists to avoid.
+#
+# IT ARMS NOTHING, and that is worth stating because "install kexec-tools" reads
+# like it might change how the box reboots. Measured on the hub immediately
+# after installing it, 2026-08-28: `kexec-load.service` DOES NOT EXIST on 24.04
+# (`systemctl is-enabled` -> not-found), there is no LOAD_KEXEC in
+# /etc/default/kexec, its single debconf answer is
+# `kexec-tools/use_grub_config: false`, and /sys/kernel/kexec_loaded stays 0.
+# `reboot` remains an ordinary firmware reboot. The binary is simply present,
+# and Option E stays something a person triggers deliberately.
+kexec-tools           # Option E: reimage over the LAN — no media, no reserved partition
+
 # ── power and disks ─────────────────────────────────────────────────────────
 powertop              # low-power auto-tune, applied per boot by powertune.service
 hdparm                # backup-drive spin-down (WI-10.10)

@@ -273,7 +273,153 @@ after a successful install so it doesn't loop.
 - [ ] **Build Option D** (document the smart-plug + USB procedure; optionally a
       small helper to prep the USB).
 
+### Option E — `kexec` straight into the installer, nothing staged on the target disk
+**PROVEN ON THE REAL HUB, 2026-08-28.** The AK41 was reimaged end to end over
+Ethernet - triggered from an SSH session, no boot media, no reserved partition,
+nothing staged on the disk being wiped. Jump at 23:06:46, installed and
+answering on the operator key at 23:24:07 (17 minutes), `assert-installed.sh`
+section 5c **ALL CHECKS PASSED**, `/srv/library` and `/mnt/backup-drive` intact.
+
+**IT DOES NOT WORK WITH THE STOCK INITRD, AND THE REASON IS ONE LINE OF SHELL.**
+casper parses `nfsroot=`, `netboot=`, `ip=`, `uuid=`, `toram=` and friends off the
+kernel command line - and has **no `nfsopts=` case at all**. So `do_cifsmount`
+always takes its hardcoded fallback,
+
+    CIFSOPTS="-ouser=root,password="
+
+a Windows share answers `STATUS_LOGON_FAILURE`, casper falls through to NFS,
+finds no server, and panics with *"Unable to find a live file system on the
+network"*. Every attempt before the fix failed exactly there, identically on real
+hardware and in a VM - which is the signature of a configuration cause rather
+than a hardware one. Measured from the lab VM's console:
+
+```
+Trying mount.cifs //192.168.117.243/HubISO /cdrom -ouser=root,password= ...
+CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE
+mount error(13): Permission denied
+Trying nfsmount ... nfsmount: need a server        (x40)
+```
+
+**THE FIX IS 2 KB AND CARRIES NO SECRET.** `scripts/functions run_scripts()`
+SOURCES the hook directory's `ORDER`, and `ORDER` sources `/conf/param.conf`
+after each hook - casper's own channel for a hook to set variables in its scope,
+running inside `mountroot()` before the netboot block. A prepended cpio segment
+adds that file; it copies `cifsopts=` off the command line into `NFSOPTS`. The
+credential still rides the cmdline, where it already had to live.
+See [remote-reimage/](remote-reimage/) for the builder and the trigger.
+
+The rung this ladder was missing, and the one that answers "reimage without
+repartitioning" directly. The **running OS** loads the installer's kernel and
+initrd into RAM and jumps into them (`kexec -l` / `kexec -e`) — no reboot
+through firmware, and **nothing read from the disk**. Subiquity is then free to
+wipe the whole disk, including where the kernel came from, because it is already
+in RAM.
+
+**The framing that makes this work:** the requirement was never *a partition*.
+It is that **the installer's root must not live on the disk being written**.
+Exactly four things can satisfy that — RAM, the network, another device, or a
+reserved region. Options A/D/B/C pick three of them; this picks the first two
+and reserves nothing.
+
+- **Pros:**
+  - **No `storage:` change.** Nothing reserved, nothing to preserve — the
+    single highest-risk edit on this ladder is avoided entirely.
+  - **No firmware dependency, which is the whole objection to Option A.** The
+    UEFI network stack is never used; the *running OS* does the netboot. It
+    also dodges A's circularity — no always-on TFTP box, since the source can
+    be any machine that is up at the moment you trigger it.
+  - **Fully SSH-triggerable**, like B, with no fiddly GRUB entry that can wipe
+    the box on an ordinary reboot.
+  - **Retest is a loop you would actually use:** drop a new ISO on the source
+    host, run one command over SSH, wait.
+
+- **Cons, as measured rather than predicted:**
+  - **THE SHARE IS THE LIVE ROOT FOR THE WHOLE INSTALL.** casper does not copy
+    the medium into RAM - it loop-mounts the layered squashfs stack straight off
+    the share and runs from it. Measured on the server side mid-install: four
+    open handles on `casper/ubuntu-server-minimal*.squashfs`. **So the machine
+    serving the share must stay awake for the entire run.** If it sleeps or the
+    switch drops after partitioning has begun, that is the one path to a
+    genuinely half-wiped disk. Everything else fails safe.
+  - **`kexec_file_load` faults on 6.8.0-138 once the IMA measurement list grows.**
+    The oops is `ima_measurements_show -> ima_dump_measurement_list ->
+    ima_add_kexec_buffer`, and `kexec` is SIGKILLed. It is **cumulative, not
+    random**: a fresh boot loads fine, and each load grows the list until it
+    faults - measured 2026-08-28 succeeding on a 1-minute-old boot and failing on
+    the very next call. **The rule is: reboot, then jump once.** 6.8.0-100 was
+    reliable across several loads. This will bite again after a kernel upgrade,
+    and it presents as a bare `Killed` with no explanation unless you read dmesg.
+  - **THE CONSOLE GOES DARK AND STAYS DARK.** kexec skips firmware POST, so the
+    kernel never re-inits the GPU. `nomodeset` did **not** recover it on the
+    AK41 (tried). The initramfs writes `casper.log` and never gets to persist it,
+    so a failed netboot leaves no evidence anywhere. Diagnosing this cost most of
+    an evening; the fix was to reproduce in a lab VM, whose console the lab
+    watcher screenshots. **Do not attempt to debug Option E on headless hardware.**
+  - **Same precondition as B:** the OS must boot and be reachable. E is a peer of
+    B, not a rung below it - it does not cover "deeply broken".
+
+#### Does this change the ISO? No — provided the whole ISO tree is the medium.
+The question is worth answering exactly, because the cheap-looking shortcut is
+the one that breaks it. Measured from `repacked-gate.iso` on 2026-08-28, every
+autoinstall entry seeds from a path **on the mounted medium**:
+
+```
+linux  /casper/vmlinuz autoinstall "ds=nocloud;s=/cdrom/nocloud/" ---
+initrd /casper/initrd
+```
+
+and `/deploy-payload` is found by the same `/cdrom`-first search OI-19
+deliberately consolidated to **one** discovery mechanism. Both facts point the
+same way:
+
+- **Deliver the whole ISO as the installer's medium** — NFS root, or an
+  HTTP-fetched ISO — and `/cdrom` is populated exactly as it is when booting
+  from a stick. The seed resolves, the payload search finds `/deploy-payload`
+  on its first try, and **the ISO is byte-identical to the one you flash
+  today**. `/casper/vmlinuz` and `/casper/initrd` are already on it; E only
+  extracts them. The delta is entirely **one kernel cmdline parameter naming
+  the medium**, plus a script on the hub and a file server. *On 8 GB, NFS is
+  the viable half of this: it streams, where a fetched ISO must fit in RAM.*
+- **Do NOT take the `fetch=…/filesystem.squashfs` shortcut.** It pulls only the
+  squashfs, so `/cdrom` is never populated — `ds=nocloud;s=/cdrom/nocloud/`
+  fails to resolve **and** the payload search misses. That variant *would*
+  force a redesign of both the seed reference and the payload discovery, i.e.
+  the one part of this repo that was hardest to get right.
+
+**ONE CORRECTION, measured after the above was first written:** the image needs
+**`kexec-tools` baked in**. A freshly installed hub has no `kexec` binary, and E
+cannot depend on apt-installing it at the moment it is needed — the whole
+scenario is a box too broken to fix normally, quite possibly with no working
+package management. That is a one-line addition to the baked package list, and
+it is a **real, if small, change to the image**. It changes no seed path, no
+payload discovery, and no partition layout.
+
+So: **E is a deployment mechanism, not an image redesign** — one extra package
+baked in, and otherwise the same ISO you flash today. The only thing that
+would push a change back into the build is wanting a *RAM-resident* (atomic,
+blip-proof) install, which on 8 GB needs a much slimmer ISO — and slimming it
+by fetching packages over the network would forfeit the **offline-install
+property the gate deliberately tests** (the runner unplugs the adapter before
+every install). If that is ever wanted, the payload must be pulled into RAM
+first and installed offline from there; do not trade that property away quietly.
+
+- [x] **Build Option E. BUILT AND PROVEN 2026-08-28.** `remote-reimage/` holds
+      the initrd builder and the SSH-triggered script. `kexec-tools` is baked
+      into the hub image (`stack/autoinstall/packages.list`), so a hub can always
+      start its own reimage. Still owed: the share is currently hand-made -
+      it needs documenting as standing infrastructure, and its credential
+      rotating off the placeholder it was created with.
+
 ### Why B primary + D fallback
+
+**E changes this calculus, and its Secure Boot prerequisite now holds.** E covers
+what B covers (software-broken, SSH-triggerable, no extra hardware) **without**
+the `storage:` change that is the riskiest edit here — so the pairing to
+consider is **E primary + D fallback, and no B at all**. What B keeps that E
+gives up is a medium that cannot fail mid-install; what E keeps that B gives up
+is a disk layout nobody had to redesign. D is unchanged either way, and remains
+the only rung that survives a dead GRUB and a wiped disk.
+
 B needs no extra hardware and is fully SSH-triggerable, matching "never visit the
 box" best — **once** the recovery partition exists. D is the pragmatic safety net
 that works even when B's assumptions (intact GRUB, healthy disk) fail, at the
@@ -314,6 +460,8 @@ the machine. Two consequences worth designing around:
 
 ### The Owner's decision
 
-- Primary reimage path: [ ] A  [ ] **B**  [ ] C  [ ] D  [ ] none yet
-- Fallback: [ ] **D**  [ ] other: ______
+- Primary reimage path: [ ] A  [ ] B  [ ] C  [ ] D  [x] **E** (chosen and proven 2026-08-28)
+- Fallback: [x] **D** - a written USB stick. Keep one: E's precondition is a
+  booting, reachable OS, and nothing on this ladder covers a dead GRUB or a
+  wiped disk.
 - Notes / constraints: _______________________________________________

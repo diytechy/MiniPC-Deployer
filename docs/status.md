@@ -8,71 +8,55 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-> **RESUMING FROM A COLD SESSION? THIS BLOCK IS THE WHOLE HANDOVER (2026-08-27, end of day).**
+> **RESUMING FROM A COLD SESSION? THIS BLOCK IS THE WHOLE HANDOVER (2026-08-28, late).**
 >
-> ### 1. DO NOT FLASH ANYTHING YET
+> ### 1. THE REAL HUB IS REIMAGED AND GREEN
 >
-> `Z:\vmtest-out-hub-flash\repacked.iso` **exists, is asserted 14/14, and must NOT
-> be written to a stick.** It carries a `setup-remote-ui.sh` that **deadlocks the
-> boot**: a blocking `systemctl start` inside firstboot, on a unit ordered
-> `After=homehub-firstboot.service`. On a clean install firstboot sat in
-> `activating` for 18 minutes with `multi-user.target start waiting`. The fix is
-> committed (`545b920`, `--no-block`) and **is in no image**.
-> `Z:\vmtest-out-hub-prod\repacked.iso` is the same bad bytes;
-> `repacked-gate.iso` is derived from them; `repacked.iso.pre-fixes` is the older
-> 13:09 image and is worse.
+> HOMEHUB is running the new image. `assert-installed.sh` section 5c reports
+> **ALL CHECKS PASSED** on it - including `IceDrive is RUNNING with nobody
+> connected` - on a box **nobody hand-patched**. `/srv/library` and
+> `/mnt/backup-drive` mounted by label and intact; the pinned NVMe
+> (`FORESEE_P900F128GBH_K03299J008486_1`) was the only disk wiped.
 >
-> ### 2. THE EXACT NEXT STEPS, IN ORDER
+> **It was installed over Ethernet, not from a stick** - REMOTE_MANAGEMENT.md
+> Option E, triggered from an SSH session. Jump 23:06:46, green 23:24:07.
 >
-> ```
-> # a. tear down the lab (HomeHub-Lab is RUNNING and hand-patched; it holds the
-> #    hub's DHCP reservation and its gate ISO open)
-> $s = C:\Projects\HomeHub\scripts\lab\Connect-LabJea.ps1
-> Invoke-Command $s { Clear-LabVms -Confirm:$false }
+> ### 2. WHAT IS OWED
 >
-> # b. rebuild the ISO (~45 min) - this is what puts 545b920 into an image
-> pwsh -File C:\Projects\HomeHub\scripts\deploy\Build-VentoyStick.ps1 -Target hub `
->      -UbuntuIso Z:\iso\ubuntu-24.04.4-live-server-amd64.iso `
->      -BuildOutDir Z:\vmtest-out-hub-flash -StageOnly
+> - **C2's 48-hour burn-in has not started.** The box has not been physically
+>   moved either, and doing the burn-in on both sides of a move is work done twice.
+> - **`finance-auditor` is in a restart loop.** It did this on the OLD image too,
+>   so it predates the reimage and is not a regression - but it is the one thing
+>   on the box that is not green.
+> - **The SMB share is hand-made and its credential is a placeholder.** `hubread`
+>   on the desktop, share `HubISO` -> `Z:\hub-isotree`. The Owner wants it
+>   permanent, so it needs writing up as standing infrastructure and the password
+>   rotating. A stale tree there is a real hazard: it is what a future reimage
+>   would install, with nothing checking it is current.
+> - **The wall lane is untouched** since 2026-08-27.
 >
-> # c. put it where the lab reads, and re-derive the gate ISO from it
-> Copy-Item Z:\vmtest-out-hub-flash\repacked.iso Z:\vmtest-out-hub-prod\repacked.iso -Force
-> wsl -d Ubuntu -- bash -c "cd /mnt/c/Projects/MiniPC-Deployer && \
->   bash vmtest/make-gate-iso.sh --target hub --src-iso /mnt/z/vmtest-out-hub-prod/repacked.iso"
+> ### 3. OPTION E - THE THREE THINGS THAT WILL BITE AGAIN
 >
-> # d. re-run the gate (~40 min, hub only, leaves the box up)
-> Invoke-Command $s { Start-LabRun -Stage Hub-Keep -Confirm:$false }
-> ```
+> All measured 2026-08-28; details in REMOTE_MANAGEMENT.md and remote-reimage/.
 >
-> **Pass condition:** `assert-installed.sh` section 5c reports **ALL CHECKS
-> PASSED** (12 checks) including `IceDrive is RUNNING with nobody connected`, on
-> a box nobody has touched. That has never happened - every green result so far
-> came from a box repaired by hand. Only then is C2 (flash the real HOMEHUB)
-> reasonable.
->
-> ### 3. WHAT IS ACTUALLY TRUE NOW
->
-> The feature works end to end, unattended, and was watched doing it: boot -> a
-> desktop session with **nobody connected** -> IceDrive autostarts -> it
-> authenticates from its stored token with **no 2FA prompt** -> restores its sync
-> pair -> and a new file is **encrypted and uploaded within seconds**. The backup
-> path also ran for the first time, and a restore driven by the backup drive's
-> **own** `reconstruct.sh` came back **byte-identical**.
->
-> **But every one of those was demonstrated on a hand-patched box.** The gap
-> between "the code is right" and "the image produces it" is the whole of step 2.
+> 1. **casper has no `nfsopts=` parameter.** It ignores CIFS credentials from the
+>    cmdline and uses `-ouser=root,password=`, which Windows refuses. The fix is a
+>    2 KB prepended cpio segment adding `/conf/param.conf`. **A stock initrd will
+>    never work against an authenticated share.**
+> 2. **`kexec_file_load` faults on 6.8.0-138** in `ima_add_kexec_buffer` once the
+>    IMA measurement list grows - cumulative, not random. **Reboot, then jump
+>    once.** It presents as a bare `Killed`; only dmesg says why.
+> 3. **The console dies at the jump and `nomodeset` does not save it.** A failed
+>    netboot leaves no evidence on headless hardware. Reproduce in the lab, whose
+>    watcher screenshots the console - that is what finally found cause (1).
 >
 > ### 4. STATE OF THE MACHINES
 >
-> - **HomeHub-Lab: RUNNING**, hand-patched, passing 12/12. It holds the hub's
->   DHCP reservation, so **the real hub must not be powered on until it is gone**.
->   Its VHDX carries materialised credentials.
-> - **WallPanel-Lab: absent.** The wall lane was not touched today.
-> - **The real HOMEHUB is powered off**, USB drives attached, not yet moved. Its
->   image predates everything here.
-> - Branch on both repos: **`IceDrive-DesktopDirection`**. HomeHub `d6feb61`,
->   MiniPC-Deployer `545b920`, both clean. **13 and 12 commits unpushed** - the
->   Owner pushes.
+> - **The real HOMEHUB: UP**, new image, 12/12, running the stack.
+> - **HomeHub-Lab / WallPanel-Lab: absent.** Destroyed. **A leftover lab VM holds
+>   the hub's DHCP reservation as well as its ISO** - `-KeepVms` costs both, and
+>   forgetting it once nearly put two machines on `.117`.
+> - Branch on both repos: **`IceDrive-DesktopDirection`**. The Owner pushes (OI-3).
 >
 > ### 5. THE TWO HANDS-ON STEPS THAT ARE PERMANENT
 >

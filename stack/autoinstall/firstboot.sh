@@ -830,7 +830,13 @@ fi
 # withhold a boot, so it runs in a subshell, reports through a flag file, and
 # nothing in it is fatal.
 __acme_flag=/run/homehub-acme-restored
-rm -f "$__acme_flag"
+# `|| true` ON BOTH rm CALLS. These sit OUTSIDE the fail-open subshell and run
+# under `set -e`, so if that path ever exists as a DIRECTORY - a stale mount, a
+# name collision - `rm -f` returns nonzero and aborts firstboot before
+# `docker compose up -d`. A step whose entire contract is "can only save
+# issuances, never withhold a boot" must not have a cleanup that can withhold a
+# boot. Adversarial review, 2026-08-28.
+rm -f "$__acme_flag" || true
 (
     . /etc/homehub-backup/backup.env 2>/dev/null || exit 0
     . "$STACK_DIR/backup/common.sh"  2>/dev/null || exit 0
@@ -843,7 +849,14 @@ rm -f "$__acme_flag"
     # Bounded wait, and only when fstab says this box is meant to have one, so a
     # box with no backup drive is not delayed at all. Same shape as the LAN-IP
     # wait in 4a-pre-4.
-    if grep -qs "[[:space:]]${BACKUP_TARGET}[[:space:]]" /etc/fstab; then
+    # awk ON FIELD 2, not grep on a pattern: BACKUP_TARGET went into a BRE
+    # unescaped, so a path holding `.` could match a DIFFERENT mount (and impose
+    # a pointless 60s boot delay), while one holding `[...]` would be read as a
+    # character class and match nothing - skipping the wait on exactly the box
+    # that needed it. A mount point is a field, so compare it as one.
+    # Adversarial review, 2026-08-28.
+    if awk -v t="$BACKUP_TARGET" '$0 !~ /^[[:space:]]*#/ && $2 == t { found = 1 }
+                                  END { exit !found }' /etc/fstab 2>/dev/null; then
         __bw=0
         while [ "$__bw" -lt 60 ] && ! mountpoint -q "$BACKUP_TARGET"; do
             [ "$__bw" -eq 0 ] && log "  waiting up to 60s for $BACKUP_TARGET (fstab lists it, and nofail means nothing else waits)…"
@@ -873,7 +886,7 @@ rm -f "$__acme_flag"
 ) || true
 if [ -e "$__acme_flag" ]; then
     log "restored caddy_data from the backup drive — caddy starts holding its certificates and will not call ACME"
-    rm -f "$__acme_flag"
+    rm -f "$__acme_flag" || true
 else
     log "no caddy_data restore (no drive, no archived 'caddy' set, or the volume is not empty)"
     log "  caddy will obtain certificates normally. Let's Encrypt allows 5 per exact"

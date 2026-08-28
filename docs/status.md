@@ -21,18 +21,25 @@ last) — it is the record, not required reading for every pass.
 > **It was installed over Ethernet, not from a stick** - REMOTE_MANAGEMENT.md
 > Option E, triggered from an SSH session. Jump 23:06:46, green 23:24:07.
 >
-> ### 2. WHAT IS OWED
+> ### 2. WHAT IS OWED — THERE IS A PLAN, START THERE
+>
+> **[plan-post-reimage.md](plan-post-reimage.md) is written to be picked up cold.**
+> It carries both open tasks in full, plus the six things that will waste a day if
+> you rediscover them. Summary:
 >
 > - **C2's 48-hour burn-in has not started.** The box has not been physically
 >   moved either, and doing the burn-in on both sides of a move is work done twice.
 > - **`finance-auditor` is in a restart loop.** It did this on the OLD image too,
 >   so it predates the reimage and is not a regression - but it is the one thing
 >   on the box that is not green.
-> - **The SMB share is hand-made and its credential is a placeholder.** `hubread`
->   on the desktop, share `HubISO` -> `Z:\hub-isotree`. The Owner wants it
->   permanent, so it needs writing up as standing infrastructure and the password
->   rotating. A stale tree there is a real hazard: it is what a future reimage
->   would install, with nothing checking it is current.
+> - **The ISO tree must be deleted once an install is confirmed** (Owner, 2026-08-28)
+>   — plan Task 1. The share itself stays; it is standing infrastructure. The
+>   credential is explicitly NOT a concern (private machine, private network).
+>   **Do not naively delete on "install finished":** the share is the LIVE ROOT for
+>   the whole install, and both `ping` and tcp/22 answer while it is still running.
+> - **C2's burn-in checklist does not exist** — plan Task 2. C2 requires a 48-hour
+>   burn-in and points at a checklist; the only one in the repo is the wall
+>   panel's `WALL-BURN-IN.md`. The reference is dangling.
 > - **The wall lane is untouched** since 2026-08-27.
 >
 > ### 3. OPTION E - THE THREE THINGS THAT WILL BITE AGAIN

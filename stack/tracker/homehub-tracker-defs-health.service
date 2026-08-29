@@ -1,0 +1,24 @@
+[Unit]
+# "How many definitions is the tracker using, and when did that last change?"
+#
+# The tracker's alerting mechanism is its own item definitions, so it cannot
+# raise an alarm about them being deleted — the alarm would be deleted with
+# them. This unit is the outside observer: it reads the definition files off the
+# docker volume (not through the API, so a stopped container is still assessable)
+# and writes a verdict to /var/lib/homehub/tracker-defs.state, which
+# verify-hub.sh asserts on without the tracker being involved at all.
+#
+# Measured 2026-08-29: /api/today returned {"items":null} and the panel rendered
+# GREEN with score 0. Green because empty is indistinguishable, on a wall, from
+# green because all is well.
+Description=HomeHub tracker definition inventory health report
+Documentation=file:/opt/homehub/stack/tracker/tracker-defs-guard.sh
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/homehub-tracker-defs-guard --report
+# 0 green, 2 yellow, 1 red — all three are a SUCCESSFUL report. The report is
+# the signal, not the exit code; a unit stuck in `failed` would mask the next
+# recovery. Same contract as homehub-library-health.service.
+SuccessExitStatus=0 1 2

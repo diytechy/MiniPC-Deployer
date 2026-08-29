@@ -1,0 +1,21 @@
+[Unit]
+Description=Check the tracker definition inventory every 30 minutes
+Documentation=file:/opt/homehub/stack/tracker/tracker-defs-guard.sh
+
+[Timer]
+# 5 minutes after boot rather than 3: the tracker container has to be up for the
+# feed half to land, and a fresh boot spends its first minutes loading images.
+# The CHECK half does not need the container at all, so an early miss costs
+# nothing — but a spurious "cannot reach the tracker" line in the journal on
+# every boot would train the reader to ignore this unit's output.
+OnBootSec=5min
+# Slower than the drive guard's 10 minutes, deliberately. A drive drops off the
+# bus on its own; definitions only change when a person changes them, so a
+# half-hour cadence is the honest resolution and it keeps 48 log lines a day
+# from becoming noise nobody reads.
+OnUnitActiveSec=30min
+RandomizedDelaySec=60s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

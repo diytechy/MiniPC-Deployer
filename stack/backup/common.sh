@@ -208,6 +208,13 @@ source_kind() {
 # actually lists SET, or nothing. Run names are run_%Y%m%d_%H%M%S so a plain
 # sort is chronological (the same assumption retention makes). Read-only.
 #
+# `run_*` EXCLUDES PLAN DIRECTORIES BY CONSTRUCTION since 2026-08-29 (Q1), which
+# is a real strengthening and not just tidiness: a plan run writes a header-only
+# MANIFEST.tsv, so before the rename this function relied on the awk row-match
+# failing to reject one. It still does - belt and braces - but the glob now
+# cannot even offer a plan directory as a candidate, and firstboot ACME restore
+# is the caller that would have paid for a mistake here.
+#
 # LIVES HERE, NOT IN restore.sh, since 2026-08-28: firstboot's ACME restore needs
 # the identical question answered, and two copies of "which run actually has this
 # set" is exactly the kind of drift that makes one of them quietly wrong.

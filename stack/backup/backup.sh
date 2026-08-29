@@ -39,14 +39,21 @@
 #   --plan    plan the run and report on it; write no ARCHIVES. It was called
 #             `--dry-run` until 2026-08-29, and that name was retired because it
 #             was not true (C25, the Owner's ruling: the behaviour is fine, the
-#             word was not). `--dry-run` is still accepted so an older caller
-#             keeps working, and prints a one-line notice.
+#             word was not). The alias was REMOVED 2026-08-29 (Q3, the Owner) once
+#             both repos were swept and nothing called it — `--dry-run` now dies
+#             on `unknown arg`, naming `--plan`, rather than working silently.
 #
 #             WHAT A PLAN RUN STILL DOES, in full — none of it is new, all of it
 #             was always true, and the name is what changed:
-#               * CREATES $BACKUP_TARGET/run_<ts>/ ON THE BACKUP DRIVE and
+#               * CREATES $BACKUP_TARGET/plan_<ts>/ ON THE BACKUP DRIVE and
 #                 writes backup.log, a header-only MANIFEST.tsv, and one
-#                 <set>.excluded.log per set into it (~16 files);
+#                 <set>.excluded.log per set into it (~16 files). The `plan_`
+#                 prefix (Q1, 2026-08-29) is what makes that directory
+#                 self-describing: it was `run_<ts>`, identical to a real
+#                 archive run, and twelve of them on a stick is how C25 was
+#                 found. It carries its OWN retention budget (BACKUP_PLAN_KEEP),
+#                 pruned by plan runs themselves, so plan litter can never be
+#                 bounded by the health of the nightly;
 #               * MOUNTS every cifs source read-only, and unmounts it again;
 #               * ISSUES `hdparm -S 0` against BACKUP_DRIVE_DEVICES to hold
 #                 standby off, restoring the timeout on exit — so on a box with
@@ -60,17 +67,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "$HERE/common.sh"
 
-CONFIG=""; PLAN_ONLY=0; PLAN_FLAG_USED="--plan"
+CONFIG=""; PLAN_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --config) CONFIG="$2"; shift 2 ;;
         --plan) PLAN_ONLY=1; shift ;;
-        # THE OLD NAME, KEPT DELIBERATELY. verify-hub.sh (TC-H-M02) and any hand
-        # habit call this, and a box can be running an older payload than the
-        # repo — refusing it would turn a rename into an outage of the one check
-        # that notices a set vanishing from BACKUP_SOURCES.
-        --dry-run) PLAN_ONLY=1; PLAN_FLAG_USED="--dry-run"; shift ;;
-        -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
+        # `--dry-run` WAS an accepted alias for --plan between 2026-08-29 morning
+        # and 2026-08-29 evening. It is GONE (Q3, the Owner's ruling), after a
+        # sweep of both repos found no caller left: verify-hub.sh asks the
+        # DEPLOYED script which name it knows and picks accordingly, so it works
+        # against a box on either payload without the alias existing here.
+        #
+        # It dies with a NAMED replacement rather than a bare "unknown arg",
+        # because the one caller that could still send it is a human hand and a
+        # backup that refused to run should say what to type instead.
+        --dry-run) die "--dry-run was retired on 2026-08-29 and removed: it was not dry (C25 — it writes a plan directory to the backup drive, mounts cifs and holds drive standby off). Use --plan." ;;
+        -h|--help) sed -n '2,70p' "$0"; exit 0 ;;
         *) die "unknown arg: $1" ;;
     esac
 done
@@ -95,6 +107,18 @@ case "$KEEP" in
     ''|*[!0-9]*) die "config: BACKUP_KEEP='$KEEP' is not a number (it is how many dated runs to keep on the backup drive)" ;;
     0)           die "config: BACKUP_KEEP=0 means 'keep no runs at all', so this run would archive the household and then delete the archive. Set it to 1 or more." ;;
 esac
+# How many PLAN directories to keep. Separate from BACKUP_KEEP because they are
+# produced on a completely different clock: BACKUP_KEEP counts nights, while plan
+# runs come from verify-hub.sh and a human hand, twelve in one day on 2026-08-28.
+# Defaults to BACKUP_KEEP so an untouched backup.env behaves sensibly.
+PLAN_KEEP="${BACKUP_PLAN_KEEP:-$KEEP}"
+case "$PLAN_KEEP" in
+    ''|*[!0-9]*) die "config: BACKUP_PLAN_KEEP='$PLAN_KEEP' is not a number (it is how many plan_<ts> directories to keep on the backup drive)" ;;
+esac
+# 0 IS LEGAL HERE, unlike BACKUP_KEEP. A plan directory holds logs and nothing
+# else, so "keep none" destroys no data — it just means each plan run tidies up
+# after the ones before it. BACKUP_KEEP=0 is refused because it would delete the
+# household's archive; this cannot.
 ZL="${BACKUP_ZSTD_LEVEL:-10}"
 
 # ── drive power (WI-10.10 DRIVE POWER DESIGN) ────────────────────────────────
@@ -223,7 +247,19 @@ else
 fi
 
 RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
-RUN_DIR="$BACKUP_TARGET/run_$RUN_TS"
+# THE PREFIX IS THE WHOLE POINT OF Q1. A plan run writes a directory to the
+# backup drive — that was never in doubt, C25 measured it — and until 2026-08-29
+# it was named `run_<ts>`, byte-identical in shape to a real archive run. Twelve
+# of them sat on the stick looking like twelve backups. `plan_` makes the litter
+# say what it is to anyone holding the drive, with no log to read.
+#
+# Everything that GLOBS these directories was changed with it, and the list is
+# short on purpose: retention_prune (here), newest_run_with_set (common.sh, which
+# now cannot pick a plan directory at all), and restore.sh. Nothing else in
+# either repo matches on the prefix — swept 2026-08-29.
+if [ "$PLAN_ONLY" = 1 ]; then RUN_PREFIX=plan; else RUN_PREFIX=run; fi
+RUN_NAME="${RUN_PREFIX}_$RUN_TS"
+RUN_DIR="$BACKUP_TARGET/$RUN_NAME"
 MANIFEST="$RUN_DIR/MANIFEST.tsv"
 mkdir -p "$RUN_DIR" "$STAGING"
 LOG_FILE="$RUN_DIR/backup.log"
@@ -334,12 +370,10 @@ log "== AWOW backup run $RUN_TS =="
 if [ "$PLAN_ONLY" = 1 ]; then RUN_MODE=plan; else RUN_MODE=full; fi
 # `mode=` REPLACED `dry_run=` on 2026-08-29 (C25). restore.sh reads this line to
 # tell a plan run from a real one and accepts BOTH spellings, because the run
-# directories already on the drive carry the old one.
+# directories already on the drive carry the old one. Since Q1 it does not have
+# to read a log at all in the common case - the directory NAME carries it.
 log "config=$CONFIG target=$BACKUP_TARGET keep=$KEEP mode=$RUN_MODE"
 if [ "$PLAN_ONLY" = 1 ]; then
-    if [ "$PLAN_FLAG_USED" = "--dry-run" ]; then
-        log "NOTE: --dry-run is the retired name for --plan and still works. It was retired because it was not true (C25)."
-    fi
     # SAID AT THE START, not only at the end. A plan run that dies half way
     # through has still written this directory, and the operator who later finds
     # it on the drive should be able to read why from the run's own log.
@@ -666,6 +700,61 @@ for line in "${SOURCE_LINES[@]}"; do
     SET_SUMMARY="${SET_SUMMARY:+$SET_SUMMARY, }$name($set_files/${set_bytes}B/$algo)"
 done
 
+# ── plan-litter retention (Q1) ───────────────────────────────────────────────
+# Plan directories now have their own prefix, so they can have their own budget,
+# and this is where the second half of Q1 is paid for: WHO prunes them.
+#
+# The obvious answer — let retention_prune do it at the end of a nightly — is the
+# wrong one, and the reason is the failure that was actually observed. Plan runs
+# are produced by verify-hub.sh, twelve in one day on 2026-08-28, while
+# retention_prune runs ONLY after a green full run (an ordering fixed on
+# 2026-08-09, and correct: a red night must not rotate away good nights). So
+# under the obvious answer, plan litter is bounded by the NIGHTLY's health — a
+# box whose backup is failing accumulates plan directories forever, on exactly
+# the drive whose free space the failure may be about.
+#
+# So a plan run prunes plan directories itself. It is safe in a way retention is
+# not: this only ever removes directories matching plan_* that hold no RUN.json
+# and no archive, i.e. log-only litter of the same kind this very run just
+# created. It CANNOT touch run_*, and the refusal below is not decoration — if a
+# plan_ directory ever holds an archive, something is wrong and deleting the
+# evidence is the worst available move.
+# NOTE ON THE ERR TRAP: this function is called on the plan path with the trap
+# DISARMED by its caller, deliberately. Arithmetic like `(( x < 0 ))` returns 1
+# when false, which is enough to fire `trap ... ERR` and turn a successful plan
+# run into a reported failure — the existing retention_prune only gets away with
+# the same expression because it runs after step 6's `trap - ERR`. Written with
+# `if` rather than `&&` here so it is safe either way, and the caller disarms
+# anyway. Two belts, because the cost of being wrong is a false red backup.
+prune_plan_dirs() {
+    local d n_dir n=0 kept=0 skipped=0 older i
+    while IFS= read -r n_dir; do
+        [ "$n_dir" = "$RUN_NAME" ] && continue            # never the current run
+        n=$(( n + 1 ))
+    done < <(find "$BACKUP_TARGET" -mindepth 1 -maxdepth 1 -type d -name 'plan_*' -printf '%f
+' 2>/dev/null | sort)
+    # Second pass with the count known: keep the newest $PLAN_KEEP, prune the rest.
+    older=$(( n - PLAN_KEEP )); i=0
+    if [ "$older" -lt 0 ]; then older=0; fi
+    log "plan retention: $n other plan director(ies) on $BACKUP_TARGET, keeping $PLAN_KEEP"
+    while IFS= read -r n_dir; do
+        d="$BACKUP_TARGET/$n_dir"
+        [ "$n_dir" = "$RUN_NAME" ] && continue
+        i=$(( i + 1 ))
+        if [ "$i" -gt "$older" ]; then kept=$(( kept + 1 )); continue; fi
+        # REFUSE ON ANYTHING THAT IS NOT LITTER. A plan directory holds logs and
+        # a header-only manifest; a RUN.json or an archive in one means the
+        # assumption behind this whole function is broken.
+        if [ -e "$d/RUN.json" ] || compgen -G "$d/*.tar" >/dev/null || compgen -G "$d/*.tar.zst" >/dev/null; then
+            warn "plan retention: REFUSING to prune $n_dir — it holds an archive or a RUN.json, which a plan run never writes. Left in place; look at it."
+            skipped=$(( skipped + 1 )); continue
+        fi
+        log "  prune old plan run $n_dir"; rm -rf "${BACKUP_TARGET:?}/$n_dir"
+    done < <(find "$BACKUP_TARGET" -mindepth 1 -maxdepth 1 -type d -name 'plan_*' -printf '%f
+' 2>/dev/null | sort)
+    [ "$skipped" -eq 0 ] || warn "plan retention: $skipped director(ies) refused as above"
+}
+
 # A plan run reports a missing source exactly as a real run does. It is what
 # verify-hub.sh asserts on (TC-H-M02/M10), so letting it exit 0 with sets missing
 # would make the check green on a box that cannot fully back up — the precise
@@ -681,9 +770,12 @@ if [ "$PLAN_ONLY" = 1 ]; then
     # "nothing was written". Sixteen files were. It now names what it wrote and
     # where, so the answer is in the run's own log rather than on the stick.
     log "plan complete: no archives written — and this run DID write $(find "$RUN_DIR" -type f 2>/dev/null | wc -l) file(s) to $RUN_DIR"
-    log "  the directory stays on $BACKUP_TARGET as the plan's evidence; it holds logs only, and"
-    log "  retention prunes it like any other run without a RUN.json (BACKUP_KEEP=$KEEP deep)."
-    trap - ERR; exit 0
+    log "  the directory stays on $BACKUP_TARGET as the plan's evidence; it holds logs only, and it"
+    log "  is named plan_ so it cannot be mistaken for an archive run (Q1). Plan directories carry"
+    log "  their own budget — BACKUP_PLAN_KEEP=$PLAN_KEEP — pruned by plan runs, not by the nightly."
+    trap - ERR
+    prune_plan_dirs
+    exit 0
 fi
 
 # ── 6. report (never-silent-green: OK only if every set was reached) ─────────
@@ -696,7 +788,7 @@ trap - ERR
 # reporting ok: a run that protected 13 of 14 sets is a run with a hole in it,
 # and the operator has to be told every night until it is fixed.
 if [ -n "$MISSING_SETS" ]; then
-    report_failure "source directory missing for: $MISSING_SETS — the other set(s) WERE archived to run_$RUN_TS (${SET_SUMMARY:-none}); create the path(s) or remove the set from BACKUP_SOURCES"
+    report_failure "source directory missing for: $MISSING_SETS — the other set(s) WERE archived to $RUN_NAME (${SET_SUMMARY:-none}); create the path(s) or remove the set from BACKUP_SOURCES"
     log "  the archived sets are complete and restorable; only the named set(s) are absent"
     log "  manifest: $MANIFEST"
     exit 1
@@ -726,10 +818,15 @@ fi
 # The run being written right now is excluded from both passes: it has no
 # RUN.json yet, and deleting the archive you just made is exactly what
 # BACKUP_KEEP=0 did.
+# `run_*` HERE IS NOW EXACT, NOT APPROXIMATE. Before Q1 this glob also caught
+# every plan directory, which landed them in `bad` and made the log call them
+# "failed" runs — mis-COUNTED, as C25 recorded, even though they were pruned
+# correctly. With the plan prefix split off, `bad` means what it says: a real
+# archive run that did not finish ok.
 retention_prune() {
     local d good=() bad=() i
     while IFS= read -r d; do
-        [ "$d" = "run_$RUN_TS" ] && continue                 # never the current run
+        [ "$d" = "$RUN_NAME" ] && continue                   # never the current run
         if grep -q '"status": "ok"' "$BACKUP_TARGET/$d/RUN.json" 2>/dev/null; then
             good+=("$d")
         else
@@ -751,6 +848,10 @@ retention_prune() {
     for (( i = 0; i < ${#bad[@]} - KEEP; i++ )); do
         log "  prune old FAILED run ${bad[$i]}"; rm -rf "${BACKUP_TARGET:?}/${bad[$i]}"
     done
+    # A green nightly also tidies plan litter. Not because it has to — plan runs
+    # prune their own — but because a box where verify is run once and then never
+    # again would otherwise keep that one plan directory forever.
+    prune_plan_dirs
 }
 retention_prune
 

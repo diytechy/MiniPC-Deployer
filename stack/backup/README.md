@@ -61,7 +61,7 @@ leg added 2026-08-09 covers what only exists across runs.
 | 1c | **source pulls** — ONE `BACKUP_SOURCES` table, three source kinds (SR-013): `path:/dir` (local rsync — including the library folders just ingested, the intended pattern), `//host/share` (cifs-mount + `rsync`, the original direct form), `volume:VOL[@CONTAINER]` (rsync from the docker volume's mountpoint, optional stop→copy→restart quiesce) | `backup.sh` + `source_kind` |
 | 2 | **archive + compress** — `tar` per set, `zstd` **where applicable** (already-compressed sets stored as plain `.tar`), minus the **excluded** patterns (`BACKUP_EXCLUDE` + per-set `name.exclude=`), which are logged, listed in `<set>.excluded.log` and recorded in the MANIFEST | `backup.sh` + `compression_decision` + `rsync_pull` |
 | 3 | **hash + verify + manifest** — per-file sha256 table + archive sha256 + integrity test; a recovery MANIFEST | `backup.sh` |
-| 4 | **external-drive target** — dated `run_<UTC>` snapshot with retention (`BACKUP_KEEP`) | `backup.sh` |
+| 4 | **external-drive target** — dated `run_<UTC>` snapshot with retention (`BACKUP_KEEP`). A `--plan` run writes `plan_<UTC>` instead, on its own `BACKUP_PLAN_KEEP` budget | `backup.sh` |
 | ~~5~~ | **offsite — DELETED 2026-08-09.** The service stages nothing offsite; the IceDrive client syncs library paths directly. `OFFSITE_PATH` / `OFFSITE_UNC` / `OFFSITE_SETS` are still recognised and now **refuse the run** rather than being ignored | — |
 | 0 | **target preflight** — refuse to run unless `BACKUP_TARGET` is a real mountpoint (and not `ro`); posts `ok=false` and exits 1 if not. Zero disk I/O, so it never wakes a parked drive | `backup.sh` + `common.sh` `mount_options_for` |
 | 6 | **report** — POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9) | `common.sh` `feed_naglight` |
@@ -132,11 +132,11 @@ BACKUP_SOURCES="gamebox=path:/srv/library/NonDocs/MiniServ"
   the first mount; ingest reuses it rather than owning a second wake.
 - Pulling a share **directly** (`name=//host/share` in `BACKUP_SOURCES`) is still
   fully supported — it just leaves no current copy in the library.
-- `--plan` passes `--dry-run` to the mirror too: a plan run never writes to the
+- `--plan` passes rsync its own `--dry-run` for the mirror: a plan run never writes to the
   library. (rsync's `--dry-run` genuinely writes nothing, which is exactly the
   promise this script's own mode could not keep — see `--plan` below.)
 
-### `--plan` — what it does and does not do (C25)
+### `--plan` — what it does and does not do (C25, Q1, Q3)
 
 `--plan` plans the run, reports on it, and writes **no archives**. It was called
 `--dry-run` until 2026-08-29 and that name was retired, because it was not true:
@@ -144,27 +144,65 @@ the mode was found writing to the backup drive on every invocation, and it was
 found the only way it could be — the Owner pulled the USB stick and looked. The
 Owner then ruled: **the behaviour is acceptable, the word was not.**
 
-`--dry-run` is still accepted (an older caller, a box on an older payload) and
-prints a one-line notice saying so.
+**`--dry-run` no longer exists.** It survived the morning of 2026-08-29 as an
+accepted alias and was **removed the same evening** (Q3), once a sweep of both
+repos found nothing calling it: `verify-hub.sh` asks the *deployed* `backup.sh`
+which name it knows and picks accordingly, so it works against a box on either
+payload without the alias existing here. Passing it now **fails the run** with a
+message naming `--plan` — deliberately, rather than a bare `unknown arg`, because
+the only caller left is a human hand and a backup that refuses to run should say
+what to type instead.
 
 What a plan run still does, in full:
 
 | | |
 |---|---|
-| writes `$BACKUP_TARGET/run_<ts>/` | `backup.log`, a header-only `MANIFEST.tsv`, one `<set>.excluded.log` per set — ~16 files on the **backup drive** |
+| writes `$BACKUP_TARGET/plan_<ts>/` | `backup.log`, a header-only `MANIFEST.tsv`, one `<set>.excluded.log` per set — ~16 files on the **backup drive** |
 | mounts every cifs source | read-only, and unmounts again |
 | issues `hdparm -S 0` | on `BACKUP_DRIVE_DEVICES`, restoring the timeout on exit — **on a box with the real archive drive attached, a plan run spins it up** |
-| writes no archive, no hash table, no `RUN.json` | which is why retention treats the directory like any run that never finished, and prunes it `BACKUP_KEEP` deep |
+| writes no archive, no hash table, no `RUN.json` | so nothing it leaves behind can ever be mistaken for a restorable run |
+| prunes older `plan_*` directories | to `BACKUP_PLAN_KEEP` (default `BACKUP_KEEP`) — see below |
 
 It is therefore safe to point at production, and it is **not read-only**. Both
 halves of that sentence matter. The run says all of this in its own log, at the
 start and again at the end, naming the file count and the path — so the next
 person to find one of these directories on the drive can read why it is there.
 
+#### The directory is `plan_<ts>`, not `run_<ts>` (Q1)
+
+Until 2026-08-29 a plan run wrote `run_<ts>/`, shaped exactly like a real archive
+run. **That is how C25 stayed invisible**: twelve of them on the stick looked
+like twelve backups, and only opening one and reading `dry_run=1` said otherwise.
+The prefix now carries the answer, with no log to read.
+
+Renaming it needed retention to grow a budget for the new prefix, and **who**
+pays that budget is the part worth knowing:
+
+- **A plan run prunes plan directories itself**, to `BACKUP_PLAN_KEEP`. The
+  obvious alternative — let the nightly's `retention_prune` do it — is wrong,
+  because retention only executes after a **green** full run (fixed 2026-08-09,
+  and correct: a red night must not rotate away good nights). Under that design
+  plan litter would be bounded by the *nightly's health*, so a box whose backup
+  is failing would accumulate log directories on exactly the drive whose free
+  space the failure may be about.
+- **A green nightly prunes them too**, so a box that is verified once and never
+  again does not keep that one directory forever.
+- The pruner **refuses** any `plan_*` directory that holds a `RUN.json` or an
+  archive, and says so loudly. It cannot touch `run_*` at all.
+- `BACKUP_PLAN_KEEP=0` is legal (a plan directory holds only logs, so keeping
+  none destroys nothing). `BACKUP_KEEP=0` is still refused.
+
+`newest_run_with_set` — the lookup behind `restore.sh` and firstboot's ACME
+restore — globs `run_*`, so it can no longer even *offer* a plan directory as a
+candidate.
+
 `restore.sh` recognises a plan run and exits **3** ("this run holds no copy of
 this set, and that is recorded, not damage") rather than reporting damage. It
-matches `mode=plan` **and** the legacy `dry_run=1`, because every run directory
-already on the drive was written by the older code.
+reads three spellings: the `plan_` **prefix** (which needs no log at all, so a
+plan run that died before writing one is still identified), `mode=plan` in the
+log, and the legacy `dry_run=1`. The last two are about **data already on the
+drive**, not about the removed flag — twelve such directories are on the
+household's stick right now.
 
 ## Exclusions (step 2) — and why nothing is excluded silently
 

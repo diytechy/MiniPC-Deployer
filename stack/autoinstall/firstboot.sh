@@ -829,14 +829,19 @@ fi
 # normally. This step can only ever SAVE issuances; it must never be able to
 # withhold a boot, so it runs in a subshell, reports through a flag file, and
 # nothing in it is fatal.
-__acme_flag=/run/homehub-acme-restored
+# ONE LINE PER SET, written from inside the fail-open subshell. A subshell cannot
+# hand a variable back to its parent, and this step now restores four volumes
+# rather than one - so the parent needs a per-set RECORD, not the single boolean
+# flag file (/run/homehub-acme-restored) this used to carry. That flag is gone
+# with the single-set shape; nothing else ever read it.
+__restore_log=/run/homehub-volume-restore.log
 # `|| true` ON BOTH rm CALLS. These sit OUTSIDE the fail-open subshell and run
 # under `set -e`, so if that path ever exists as a DIRECTORY - a stale mount, a
 # name collision - `rm -f` returns nonzero and aborts firstboot before
 # `docker compose up -d`. A step whose entire contract is "can only save
 # issuances, never withhold a boot" must not have a cleanup that can withhold a
 # boot. Adversarial review, 2026-08-28.
-rm -f "$__acme_flag" || true
+rm -f "$__restore_log" || true
 (
     . /etc/homehub-backup/backup.env 2>/dev/null || exit 0
     . "$STACK_DIR/backup/common.sh"  2>/dev/null || exit 0
@@ -938,32 +943,53 @@ rm -f "$__acme_flag" || true
     # mountpoint, NOT -d: the directory exists whether or not the drive is on it,
     # and an unmounted empty dir would read as "no runs archived".
     mountpoint -q "$__src" || exit 0
-    run="$(newest_run_with_set "$__src" caddy)" || exit 0
-    [ -n "$run" ] || exit 0
-    # COMPOSE creates the volume, not us: that way it gets the project-prefixed
-    # name and the labels compose looks for later, instead of a hand-built name
-    # this script would have to keep in step with the project directory.
-    # `create` makes the containers and their volumes without starting anything.
-    docker compose create caddy >/dev/null 2>&1 || exit 0
-    vmp="$(volume_mountpoint caddy_data)" || exit 0
-    [ -n "$vmp" ] && [ -d "$vmp" ] || exit 0
-    # ONLY INTO AN EMPTY VOLUME. Anything already there means this is not the
-    # fresh install this step is for, and the on-disk material wins.
-    [ -z "$(ls -A "$vmp" 2>/dev/null)" ] || exit 0
-    bash "$STACK_DIR/backup/restore.sh" --run "$run" --set caddy --target "$vmp" >/dev/null 2>&1 || exit 0
-    : > "$__acme_flag"
+
+    # ── GENERALISED 2026-08-29: four volumes, not one ────────────────────────
+    #
+    # This step was written for caddy_data alone, and REIMAGE_PERSISTENCE_PLAN.md
+    # said plainly why nothing else was hung off it: "Generalising a step that has
+    # never once run would be building on an unproven foundation. Fix it, watch it
+    # fire, then generalise it." C32 fixed it and the bench run proved it — 21
+    # files, ACME account key and certificates included — so this is the "then".
+    #
+    # THE LOOP LIVES IN ITS OWN FILE, and that is the whole point. Inline, it
+    # could only be tested by reimaging a box; as provision/restore-volumes.sh it
+    # takes a mock `docker` on PATH and a temp directory, which is what
+    # stack/provision/tests/restore-volumes.test.sh does. A restore path that has
+    # never been executed is precisely how C22 happened.
+    #
+    # ORDERING IS ALREADY RIGHT AND IS WORTH SAYING OUT LOUD: this runs before
+    # `docker compose up -d`, which is before provision-technitium and
+    # provision-actual. So a restored actual_data is in place BEFORE the bootstrap
+    # step looks at it — and that step is idempotent, so it finds an
+    # already-bootstrapped server and no-ops (C21 stops recurring per reimage).
+    # Moving this step later would silently invert that.
+    STACK_DIR="$STACK_DIR" bash "$STACK_DIR/provision/restore-volumes.sh" "$__src" "$__restore_log" || true
+    # The last command in the subshell must not decide its exit status by
+    # accident; the parent reads the LOG, and the subshell is followed by || true.
+    true
 ) || true
-if [ -e "$__acme_flag" ]; then
-    log "restored caddy_data from the backup drive — caddy starts holding its certificates and will not call ACME"
-    rm -f "$__acme_flag" || true
+if [ -s "$__restore_log" ]; then
+    while IFS= read -r __rl; do
+        case "$__rl" in
+            ok\ caddy*) log "restored caddy_data from the backup drive — caddy starts holding its certificates and will not call ACME" ;;
+            ok\ *)      log "restored ${__rl#ok }" ;;
+            FAIL\ *)    log "WARN: volume restore FAILED — ${__rl#FAIL }" ;;
+            skip\ *)    log "  no restore: ${__rl#skip }" ;;
+        esac
+    done <"$__restore_log"
 else
-    log "no caddy_data restore (no drive, no archived 'caddy' set, or the volume is not empty)"
+    log "no volume restore at all (no drive, or the backup drive could not be read)"
+fi
+if ! grep -q '^ok caddy' "$__restore_log" 2>/dev/null; then
+    log "  caddy_data was NOT restored, so caddy will obtain certificates normally."
     log "  since C32 this step also MOUNTS the backup drive itself when fstab does not"
     log "  list it yet, so 'no drive' now means the disk was genuinely not there."
-    log "  caddy will obtain certificates normally. Let's Encrypt allows 5 per exact"
-    log "  identifier set per 168h and a reimage spends one of each, so expect the"
-    log "  last hostname to take a while if this box has been reinstalled recently."
+    log "  Let's Encrypt allows 5 per exact identifier set per 168h and a reimage"
+    log "  spends one of each, so expect the last hostname to take a while if this"
+    log "  box has been reinstalled recently."
 fi
+rm -f "$__restore_log" || true
 
 log "docker compose up -d…"
 docker compose up -d
@@ -1089,6 +1115,21 @@ fi
 install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.service" /etc/systemd/system/homehub-backup-drive-health.service
 install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.timer"   /etc/systemd/system/homehub-backup-drive-health.timer
 
+# ── the tracker's own definitions, watched from OUTSIDE the tracker ──────────
+# The third guard, added 2026-08-29 after /api/today was measured returning
+# {"items":null} while the panel rendered GREEN with score 0. A tracker with no
+# items is green because there is nothing to be late for, and on a wall that is
+# indistinguishable from a tracker where everything is fine.
+#
+# It cannot be an item in the tracker, because the alarm would be deleted by the
+# same `rm` as everything else. So it reads the definition FILES off the docker
+# volume — which also means a stopped tracker is still assessable — and leaves a
+# verdict in /var/lib/homehub/tracker-defs.state for verify-hub.sh.
+install -d -m 0755 /var/lib/homehub
+install -m 0755 "$STACK_DIR/tracker/tracker-defs-guard.sh" /usr/local/sbin/homehub-tracker-defs-guard
+install -m 0644 "$STACK_DIR/tracker/homehub-tracker-defs-health.service" /etc/systemd/system/homehub-tracker-defs-health.service
+install -m 0644 "$STACK_DIR/tracker/homehub-tracker-defs-health.timer"   /etc/systemd/system/homehub-tracker-defs-health.timer
+
 # ── the A19 GATE's feed configuration, and only ever a gate's ────────────────
 # Both drive lanes take their feed settings from backup.env. A production hub
 # gets that file from the household materialiser (late-command 4b); a SIM hub
@@ -1143,6 +1184,14 @@ fi
 systemctl enable --now homehub-library-health.timer >/dev/null 2>&1 ||     log "WARN: could not enable homehub-library-health.timer — a vanished drive would go unreported"
 systemctl enable --now homehub-backup-drive-health.timer >/dev/null 2>&1 || \
     log "WARN: could not enable homehub-backup-drive-health.timer — an absent backup drive would go unreported until the nightly run"
+# The definition-inventory guard (2026-08-29). Its FIRST run on a fresh box will
+# be YELLOW and should be: there is no baseline yet, and recording one
+# automatically is exactly what would make a later deletion invisible. Taking the
+# baseline is a deliberate act, once the definitions are what the household
+# wants:
+#     sudo homehub-tracker-defs-guard --baseline
+systemctl enable --now homehub-tracker-defs-health.timer >/dev/null 2>&1 || \
+    log "WARN: could not enable homehub-tracker-defs-health.timer — a tracker whose definitions were deleted would render green with score 0 and nothing would say so"
 
 # ── 6. make the host itself use local DNS, and give Technitium the whole port ─
 #
@@ -1251,7 +1300,8 @@ done
 # not broken: the stack, the shares, the local backups and SSH are unaffected.
 # So this logs loudly and carries on rather than failing the unit, which is
 # reserved for things that make the box wrong rather than incomplete.
-_env_val() { sed -n "s/^$1=//p" "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d ''; }
+_env_val() { sed -n "s/^$1=//p" "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d '
+'; }
 REMOTE_UI_ENABLED="$(_env_val REMOTE_UI_ENABLED)"
 ICEDRIVE_MODE="$(_env_val ICEDRIVE_MODE)"
 : "${ICEDRIVE_MODE:=off}"

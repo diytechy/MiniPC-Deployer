@@ -42,7 +42,8 @@
 #   1  NOT TRUSTWORTHY — a file failed verification, and/or the counts disagree
 #   2  usage / bad arguments
 #   3  this run holds NO copy of this set, and that is recorded, not damage:
-#      its source was missing, or the run was a --plan run. Use an older run.
+#      its source was missing, or the directory is a plan_<ts> (--plan) run,
+#      which writes logs and no archives at all. Use an older run.
 #   4  this run has never heard of this set — a typo, or the wrong run directory
 #   5  the run directory itself is unusable
 #
@@ -73,6 +74,25 @@ done
 [ -n "$RUN_DIR" ] && [ -n "$SET" ] && [ -n "$TARGET" ] || bail 2 "usage: restore.sh --run RUN_DIR --set NAME --target DIR"
 MANIFEST="$RUN_DIR/MANIFEST.tsv"
 FTAB="$RUN_DIR/$SET.files.tsv"
+
+# ── plan_ FIRST, BEFORE THE MANIFEST CHECK, and the ordering is the point ─────
+# A plan directory holds no data for ANY set, whatever else is or is not in it.
+# Asking "is there a MANIFEST.tsv" first gives the honest-but-wrong answer 5
+# ("that is not a run directory, or the run died before step 3") for a plan run
+# that died early — and 5 reads as DAMAGE. 3 is the truth: this directory holds
+# no copy of this set, and that is recorded, not damage.
+#
+# Measured, not reasoned about: the hermetic suite's P9 removes the log from a
+# plan directory and asserts 3. It got 5 until this check moved up here.
+case "$(basename "$RUN_DIR")" in
+    plan_*)
+        prev="$(newest_run_with_set "$(dirname "$RUN_DIR")" "$SET")"
+        if [ -n "$prev" ]; then hint="the newest run that DOES hold '$SET' is $prev — restore from there"
+        else hint="no run under $(dirname "$RUN_DIR") holds '$SET'"; fi
+        bail 3 "run $(basename "$RUN_DIR") is a PLAN directory (backup.sh --plan): it writes logs and a" \
+               "header-only MANIFEST, and no archives at all, so it holds no data for '$SET' or for" \
+               "anything else. $hint." ;;
+esac
 [ -f "$MANIFEST" ] || bail 5 "no MANIFEST.tsv in $RUN_DIR — that is not a run directory, or the run died before step 3"
 
 # ── is this set in this run at all, and if not, WHY NOT ──────────────────────
@@ -94,18 +114,27 @@ if [ -z "$row" ]; then
                "This is not damage. The run finished RED and named the set (see RUN.json)." \
                "$hint."
     fi
-    # BOTH SPELLINGS, AND THAT IS NOT BELT-AND-BRACES. backup.sh's mode line
-    # became `mode=plan` on 2026-08-29 (C25 - `--dry-run` was retired because
-    # it was not dry), but every run directory ALREADY on the backup drive was
-    # written by the old code and says `dry_run=1`. Reading only the new token
-    # would make this tool call those runs REAL and then report them as DAMAGED
-    # (exit 1, an archive the manifest promised is missing) instead of
-    # empty-by-design (exit 3) - the wrong answer, in an emergency, about the
-    # majority of what is on the drive today. Read both; the old token can go
-    # when no drive carries a pre-2026-08-29 run.
+    # THREE SPELLINGS, AND THE OLDEST TWO ARE ABOUT DATA, NOT ABOUT FLAGS.
+    #
+    #   plan_<ts> directory name  - since 2026-08-29 evening (Q1), and checked
+    #                               ABOVE, before the manifest: it needs no log
+    #                               at all, so a plan run that died before
+    #                               writing one is still identified correctly.
+    #   mode=plan   in backup.log - 2026-08-29 morning (C25).
+    #   dry_run=1   in backup.log - everything written before that.
+    #
+    # The `--dry-run` FLAG was removed from backup.sh on 2026-08-29 (Q3). These
+    # tokens are NOT that flag: they are what is already written on the drive,
+    # and twelve such directories are sitting on the household's backup stick
+    # right now. Reading only the newest spelling would make this tool call those
+    # runs REAL and then report them as DAMAGED (exit 1, an archive the manifest
+    # promised is missing) instead of empty-by-design (exit 3) - the wrong
+    # answer, in an emergency, about the majority of what is on the drive today.
+    # The log tokens can go when no drive carries a pre-2026-08-29 run; the
+    # prefix check is permanent.
     if grep -Eq 'mode=plan|dry_run=1' "$RUN_DIR/backup.log" 2>/dev/null; then
-        bail 3 "run $(basename "$RUN_DIR") was a PLAN run (--plan, or the retired --dry-run): it wrote a" \
-               "MANIFEST header and no archives at all, so it holds no data for '$SET' or for" \
+        bail 3 "run $(basename "$RUN_DIR") was a PLAN run (--plan, or the pre-2026-08-29 --dry-run): it" \
+               "wrote a MANIFEST header and no archives at all, so it holds no data for '$SET' or for" \
                "anything else. $hint."
     fi
     bail 4 "set '$SET' is not in $MANIFEST — this run never archived a set by that name." \

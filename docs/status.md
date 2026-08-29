@@ -8,6 +8,98 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+> **RESUMING FROM A COLD SESSION? THIS BLOCK IS THE WHOLE HANDOVER (2026-08-29, evening).**
+>
+> ### 0. THE ONE THING THAT NEEDS A HUMAN
+>
+> **IceDrive is STOPPED and will not start on its own, deliberately.** The
+> FileBackup permutation drill clears `/srv/library` (its own header says "do not
+> point it at anything you care about"), and it took two things with it: the
+> local half of IceDrive sync pair 63605 — `/srv/library/permtest`, which is in no
+> backup set, so the CLOUD SIDE IS THE ONLY COPY — and `/srv/library/.homehub-library`,
+> the marker the gate now requires.
+>
+> The gate refusing is the guard working. A two-way pair whose local path does
+> not exist may propagate a mass delete, and which way IceDrive jumps is
+> unmeasured. Decide about the pair, then:
+>
+>     sudo touch /srv/library/.homehub-library   # bless the volume
+>     sudo systemctl restart homehub-desktop-session
+>
+> Everything else on the box is up. The library tree was recreated after the
+> drill; `verify-hub.sh` reports **16 of 16 backup sources reachable**. The only
+> other red is **C21** (`finance-auditor` restart-looping on an unset
+> `ACTUAL_SYNC_ID`), which is unchanged and needs one browser visit.
+>
+> ### 1. WHAT LANDED, AND WHY IT IS SAFE TO BUILD ON
+>
+> Four Owner rulings, built and exercised:
+>
+> | | |
+> |---|---|
+> | **Q1** | A `--plan` run writes `plan_<ts>/`, not `run_<ts>/`, with its own retention budget (`BACKUP_PLAN_KEEP`) paid by PLAN runs — hanging it off the nightly would bound the litter by the nightly's health |
+> | **Q2** | `uptimekuma_data` is a backup set, quiesced like `actual` |
+> | **Q3** | `--dry-run` is gone. The `dry_run=1` LOG token in `restore.sh` stays: that is not the flag, it is what is written on the drive |
+> | **Q4** | The changed-host-key path has nine Pester cases, lifted out of the shipped launcher by AST |
+>
+> **The reimage restore covers five sets, not one** — `caddy`, `tracker`,
+> `actual`, `uptimekuma` and the encrypted IceDrive profile. The loop lives in
+> `provision/restore-volumes.sh` rather than inline in firstboot, because inline
+> it could only be tested by reimaging a box, and a restore path that has never
+> executed is exactly how C22 happened.
+>
+> **A third guard watches the tracker's definitions from OUTSIDE the tracker.**
+> `/api/today` was measured returning `{"items":null}` while the panel rendered
+> GREEN with score 0. The tracker cannot raise that alarm — the item that would
+> carry it is deleted by the same `rm` — so the guard reads the files off the
+> volume and writes a verdict to a state file `verify-hub.sh` asserts on.
+>
+> ### 2. THE TESTS, WHICH ARE THE POINT
+>
+>     158 hermetic assertions   stack/run-hermetic-tests.sh   green in WSL AND on the hub
+>     160 Pester tests          scripts/lab/tests/            green
+>      58 PASS / 0 FAIL / 2 SKIP   FileBackup permutation drill, production wrapper
+>      19 PASS / 0 FAIL         reimage-recovery-drill.sh — the archives really do reconstruct
+>
+> The hermetic suites need bash, tar, gzip, zstd, rsync, sha256sum, gpg and awk —
+> **no docker, no VM, no drive**. That is deliberate: every other suite here is
+> expensive, which is why the cheap properties went unasserted for months.
+> `tests/test_hermetic_shell_suites.py` drives them from pytest so CI gates on
+> them, and `scripts/check.py` now has a `unit-tests` step — **it never ran pytest
+> at all before**, so `tests/` had been in the tree unexecuted by any gate.
+>
+> ### 3. WHAT THE ADVERSARIAL REVIEW FOUND
+>
+> Four passes through `codex exec -m gpt-5.6-sol` (medium), files inlined rather
+> than explored. **Twenty-six findings, twenty-four real.** The three worst were
+> a tar member-NAME validation that ignored link targets in a restore running as
+> root into a home directory; `restore.sh` verifying counts rather than
+> membership; and `retention_prune` classifying runs by an unanchored grep over a
+> file whose `note` is free text. Writing the tests for those fixes found four
+> more, including `exec 9>FILE 2>/dev/null` silencing every later warn and die.
+>
+> Two findings were REJECTED and are written up in HomeHub's
+> `DECISIONS_FOR_REVIEW_2026-08-29.md`: making the drive-identity guard fatal
+> would stop IceDrive on the stand-in drives, and closing the gate's unmount race
+> needs a systemd mount binding rather than another check.
+>
+> ### 4. THE BOX IS AHEAD OF ITS IMAGE
+>
+> Everything above is committed here, so the next image carries it — but it was
+> installed by hand on the hub to be tested against reality. The running box and
+> the last-built ISO disagree until you rebuild. See HomeHub's
+> `REIMAGE_PERSISTENCE_PLAN.md` for the list.
+>
+> ### 5. THE HABIT, AGAIN
+>
+> Every defect above was found by RUNNING something. The `PLAN_FLAG_USED`
+> reference that killed every plan run, the `DISPLAY=:0` restart that left the
+> cloud sync down while logging success, the `pgrep` that matched its own ssh
+> command line, the state write that failed on every ordinary run: none was
+> visible to a reader, and all four were visible in the first execution.
+
+<details><summary>The previous handover (2026-08-28, afternoon) — kept because two of its open items are still open</summary>
+
 > **RESUMING FROM A COLD SESSION? THIS BLOCK IS THE WHOLE HANDOVER (2026-08-28, afternoon).**
 >
 > ### 0. THE HUB IS UP, GREEN, AND NOT YET MOVED
@@ -119,6 +211,9 @@ last) — it is the record, not required reading for every pass.
 > Windows PowerShell 5.1 because it carried non-ASCII with no BOM. If you find
 > yourself reasoning about whether something works instead of executing it, that
 > is the habit this project keeps punishing.
+
+
+</details>
 
 - **Active gate:** G1 — Requirements, UX & constraints. This is a config/infra
   repo delivered against a ratified brief (HOMELAB_RESTRUCTURE_PLAN.md); the

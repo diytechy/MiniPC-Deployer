@@ -42,7 +42,7 @@
 #   1  NOT TRUSTWORTHY — a file failed verification, and/or the counts disagree
 #   2  usage / bad arguments
 #   3  this run holds NO copy of this set, and that is recorded, not damage:
-#      its source was missing, or the run was a --dry-run. Use an older run.
+#      its source was missing, or the run was a --plan run. Use an older run.
 #   4  this run has never heard of this set — a typo, or the wrong run directory
 #   5  the run directory itself is unusable
 #
@@ -94,9 +94,19 @@ if [ -z "$row" ]; then
                "This is not damage. The run finished RED and named the set (see RUN.json)." \
                "$hint."
     fi
-    if grep -q 'dry_run=1' "$RUN_DIR/backup.log" 2>/dev/null; then
-        bail 3 "run $(basename "$RUN_DIR") was a --dry-run: it wrote a MANIFEST header and no archives at all," \
-               "so it holds no data for '$SET' or for anything else. $hint."
+    # BOTH SPELLINGS, AND THAT IS NOT BELT-AND-BRACES. backup.sh's mode line
+    # became `mode=plan` on 2026-08-29 (C25 - `--dry-run` was retired because
+    # it was not dry), but every run directory ALREADY on the backup drive was
+    # written by the old code and says `dry_run=1`. Reading only the new token
+    # would make this tool call those runs REAL and then report them as DAMAGED
+    # (exit 1, an archive the manifest promised is missing) instead of
+    # empty-by-design (exit 3) - the wrong answer, in an emergency, about the
+    # majority of what is on the drive today. Read both; the old token can go
+    # when no drive carries a pre-2026-08-29 run.
+    if grep -Eq 'mode=plan|dry_run=1' "$RUN_DIR/backup.log" 2>/dev/null; then
+        bail 3 "run $(basename "$RUN_DIR") was a PLAN run (--plan, or the retired --dry-run): it wrote a" \
+               "MANIFEST header and no archives at all, so it holds no data for '$SET' or for" \
+               "anything else. $hint."
     fi
     bail 4 "set '$SET' is not in $MANIFEST — this run never archived a set by that name." \
            "Sets in this run: $(awk -F'\t' 'NR>1 {printf "%s ", $1}' "$MANIFEST")" \

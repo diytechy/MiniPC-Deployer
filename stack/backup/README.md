@@ -69,7 +69,7 @@ leg added 2026-08-09 covers what only exists across runs.
 ## Files
 
 ```
-backup.sh            orchestrator (the six steps; --config, --dry-run)
+backup.sh            orchestrator (the six steps; --config, --plan)
 restore.sh           reconstruct + byte-verify a set from a run (the recovery half)
 common.sh            shared helpers (logging + die/report hook, wake-on-LAN, cifs mount,
                      compression policy, feed, drive power)
@@ -132,8 +132,39 @@ BACKUP_SOURCES="gamebox=path:/srv/library/NonDocs/MiniServ"
   the first mount; ingest reuses it rather than owning a second wake.
 - Pulling a share **directly** (`name=//host/share` in `BACKUP_SOURCES`) is still
   fully supported — it just leaves no current copy in the library.
-- `--dry-run` passes `--dry-run` to the mirror too: a dry run never writes to the
-  library.
+- `--plan` passes `--dry-run` to the mirror too: a plan run never writes to the
+  library. (rsync's `--dry-run` genuinely writes nothing, which is exactly the
+  promise this script's own mode could not keep — see `--plan` below.)
+
+### `--plan` — what it does and does not do (C25)
+
+`--plan` plans the run, reports on it, and writes **no archives**. It was called
+`--dry-run` until 2026-08-29 and that name was retired, because it was not true:
+the mode was found writing to the backup drive on every invocation, and it was
+found the only way it could be — the Owner pulled the USB stick and looked. The
+Owner then ruled: **the behaviour is acceptable, the word was not.**
+
+`--dry-run` is still accepted (an older caller, a box on an older payload) and
+prints a one-line notice saying so.
+
+What a plan run still does, in full:
+
+| | |
+|---|---|
+| writes `$BACKUP_TARGET/run_<ts>/` | `backup.log`, a header-only `MANIFEST.tsv`, one `<set>.excluded.log` per set — ~16 files on the **backup drive** |
+| mounts every cifs source | read-only, and unmounts again |
+| issues `hdparm -S 0` | on `BACKUP_DRIVE_DEVICES`, restoring the timeout on exit — **on a box with the real archive drive attached, a plan run spins it up** |
+| writes no archive, no hash table, no `RUN.json` | which is why retention treats the directory like any run that never finished, and prunes it `BACKUP_KEEP` deep |
+
+It is therefore safe to point at production, and it is **not read-only**. Both
+halves of that sentence matter. The run says all of this in its own log, at the
+start and again at the end, naming the file count and the path — so the next
+person to find one of these directories on the drive can read why it is there.
+
+`restore.sh` recognises a plan run and exits **3** ("this run holds no copy of
+this set, and that is recorded, not damage") rather than reporting damage. It
+matches `mode=plan` **and** the legacy `dry_run=1`, because every run directory
+already on the drive was written by the older code.
 
 ## Exclusions (step 2) — and why nothing is excluded silently
 

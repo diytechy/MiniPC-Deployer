@@ -33,20 +33,44 @@
 #                        posts ok=false and exits nonzero — the ERR trap AND
 #                        every `die` path (OI-9)
 #
-# Usage: backup.sh [--config PATH] [--dry-run]
+# Usage: backup.sh [--config PATH] [--plan]
 #   --config  path to backup.env (default: /etc/homehub-backup/backup.env, else the
 #             backup.env next to this script)
+#   --plan    plan the run and report on it; write no ARCHIVES. It was called
+#             `--dry-run` until 2026-08-29, and that name was retired because it
+#             was not true (C25, the Owner's ruling: the behaviour is fine, the
+#             word was not). `--dry-run` is still accepted so an older caller
+#             keeps working, and prints a one-line notice.
+#
+#             WHAT A PLAN RUN STILL DOES, in full — none of it is new, all of it
+#             was always true, and the name is what changed:
+#               * CREATES $BACKUP_TARGET/run_<ts>/ ON THE BACKUP DRIVE and
+#                 writes backup.log, a header-only MANIFEST.tsv, and one
+#                 <set>.excluded.log per set into it (~16 files);
+#               * MOUNTS every cifs source read-only, and unmounts it again;
+#               * ISSUES `hdparm -S 0` against BACKUP_DRIVE_DEVICES to hold
+#                 standby off, restoring the timeout on exit — so on a box with
+#                 the real archive drive attached, a plan run SPINS IT UP;
+#               * MIRRORS NOTHING (rsync gets its own --dry-run) and writes no
+#                 archive, no hash table and no RUN.json.
+#             It is therefore safe to point at production, and it is NOT
+#             read-only. Both halves of that sentence matter.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "$HERE/common.sh"
 
-CONFIG=""; DRY_RUN=0
+CONFIG=""; PLAN_ONLY=0; PLAN_FLAG_USED="--plan"
 while [ $# -gt 0 ]; do
     case "$1" in
         --config) CONFIG="$2"; shift 2 ;;
-        --dry-run) DRY_RUN=1; shift ;;
-        -h|--help) sed -n '2,39p' "$0"; exit 0 ;;
+        --plan) PLAN_ONLY=1; shift ;;
+        # THE OLD NAME, KEPT DELIBERATELY. verify-hub.sh (TC-H-M02) and any hand
+        # habit call this, and a box can be running an older payload than the
+        # repo — refusing it would turn a rename into an outage of the one check
+        # that notices a set vanishing from BACKUP_SOURCES.
+        --dry-run) PLAN_ONLY=1; PLAN_FLAG_USED="--dry-run"; shift ;;
+        -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
         *) die "unknown arg: $1" ;;
     esac
 done
@@ -307,7 +331,22 @@ drive_power_restore() {
 trap 'quiesce_restore; drive_power_restore' EXIT
 
 log "== AWOW backup run $RUN_TS =="
-log "config=$CONFIG target=$BACKUP_TARGET keep=$KEEP dry_run=$DRY_RUN"
+if [ "$PLAN_ONLY" = 1 ]; then RUN_MODE=plan; else RUN_MODE=full; fi
+# `mode=` REPLACED `dry_run=` on 2026-08-29 (C25). restore.sh reads this line to
+# tell a plan run from a real one and accepts BOTH spellings, because the run
+# directories already on the drive carry the old one.
+log "config=$CONFIG target=$BACKUP_TARGET keep=$KEEP mode=$RUN_MODE"
+if [ "$PLAN_ONLY" = 1 ]; then
+    if [ "$PLAN_FLAG_USED" = "--dry-run" ]; then
+        log "NOTE: --dry-run is the retired name for --plan and still works. It was retired because it was not true (C25)."
+    fi
+    # SAID AT THE START, not only at the end. A plan run that dies half way
+    # through has still written this directory, and the operator who later finds
+    # it on the drive should be able to read why from the run's own log.
+    log "PLAN RUN: no archives will be written. This run DOES write $RUN_DIR on $BACKUP_TARGET"
+    log "  (backup.log, a header-only MANIFEST.tsv, one <set>.excluded.log per set), mounts any"
+    log "  cifs source read-only, and holds drive standby OFF for its duration. Not read-only."
+fi
 printf 'set\tsource\tarchive\talgo\tarchive_sha256\tfiles\tbytes\treason\texcludes\n' >"$MANIFEST"
 
 # ── drive power: DISABLE standby for the whole run (WI-10.10) ─────────────────
@@ -383,9 +422,12 @@ if [ -n "${INGEST_SOURCES:-}" ]; then
                 || die "ingest[$iname]: $isrc mounted but contains NO files, while $idest does — REFUSING to mirror-delete the library copy (if the share really is empty on purpose, set INGEST_ALLOW_EMPTY=true)"
             log "ingest[$iname]: source is empty and INGEST_ALLOW_EMPTY=true — mirroring the emptiness (the library copy WILL be cleared)"
         fi
-        # --dry-run must not mirror-delete anything either: it reports, no writes.
+        # A plan run must not mirror-delete anything either: it reports, no
+        # writes. rsync's own --dry-run is the flag being passed here, and that
+        # one IS literally dry — which is exactly the promise this script's own
+        # mode could not keep, and why it is no longer called that (C25).
         IDRY=(); inote=""
-        if [ "$DRY_RUN" = 1 ]; then IDRY=(--dry-run); inote=" [DRY-RUN: reporting only, no library writes]"; fi
+        if [ "$PLAN_ONLY" = 1 ]; then IDRY=(--dry-run); inote=" [PLAN: reporting only, no library writes]"; fi
         log "ingest[$iname]: mirror $isrc -> $idest (rsync -a --delete — source deletions PROPAGATE)$inote"
         rsync -a --delete ${IDRY[@]+"${IDRY[@]}"} "$imp/" "$idest/" \
             || { FAIL_NOTE="ingest[$iname]: rsync mirror failed: $isrc -> $idest"; false; }
@@ -578,7 +620,7 @@ for line in "${SOURCE_LINES[@]}"; do
     IFS=$'\t' read -r algo ratio reason < <(compression_decision "$stage")
     if [ "$algo" = "zstd" ]; then archive="$RUN_DIR/$name.tar.zst"; else archive="$RUN_DIR/$name.tar"; fi
     log "[$name] compression: $reason"
-    if [ "$DRY_RUN" = 1 ]; then log "[$name] dry-run: skip archive"; continue; fi
+    if [ "$PLAN_ONLY" = 1 ]; then log "[$name] plan: skip archive"; continue; fi
     # The patterns are handed to tar as well: the pull above already left them out
     # of $stage (that is what saves the copy), and this is the belt-and-braces
     # half — the ARCHIVE step is where the exclusion is contractually promised.
@@ -624,17 +666,24 @@ for line in "${SOURCE_LINES[@]}"; do
     SET_SUMMARY="${SET_SUMMARY:+$SET_SUMMARY, }$name($set_files/${set_bytes}B/$algo)"
 done
 
-# A dry run reports a missing source exactly as a real run does. It is what
+# A plan run reports a missing source exactly as a real run does. It is what
 # verify-hub.sh asserts on (TC-H-M02/M10), so letting it exit 0 with sets missing
 # would make the check green on a box that cannot fully back up — the precise
 # shape of silent green this file exists to refuse.
-if [ "$DRY_RUN" = 1 ]; then
+if [ "$PLAN_ONLY" = 1 ]; then
     if [ -n "$MISSING_SETS" ]; then
         trap - ERR
         report_failure "source directory missing for: $MISSING_SETS — every OTHER set was planned normally; create the path(s) or remove the set from BACKUP_SOURCES"
         exit 1
     fi
-    log "dry-run complete (no archives written)"; trap - ERR; exit 0
+    # THE CLOSING LINE WAS THE WHOLE TRAP (C25). It said "dry-run complete (no
+    # archives written)" — precisely, narrowly true, and read by everyone as
+    # "nothing was written". Sixteen files were. It now names what it wrote and
+    # where, so the answer is in the run's own log rather than on the stick.
+    log "plan complete: no archives written — and this run DID write $(find "$RUN_DIR" -type f 2>/dev/null | wc -l) file(s) to $RUN_DIR"
+    log "  the directory stays on $BACKUP_TARGET as the plan's evidence; it holds logs only, and"
+    log "  retention prunes it like any other run without a RUN.json (BACKUP_KEEP=$KEEP deep)."
+    trap - ERR; exit 0
 fi
 
 # ── 6. report (never-silent-green: OK only if every set was reached) ─────────

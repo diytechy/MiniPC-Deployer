@@ -69,6 +69,35 @@ udev                   # /dev/disk/by-uuid/* — local-fs.target cannot resolve 
 systemd-timesyncd      # the wall shows a CLOCK; it was being removed at install
 libnss-systemd         # base-installed sibling; strict-versioned against systemd
 
+# -- systemd-sysv + libpam-systemd: NAMED, not left to the graphical closure --
+# A27, ruled by the Owner 2026-08-29. NEITHER IS A PACKAGE THE WALL NEEDS
+# INSTALLING - the install base already has both. They are named so a MATCHING
+# VERSION is always fetched into the baked repo, which is a different guarantee
+# from "something already pulls them in".
+#
+# WHY IT WAS NOT SAFE TO LEAVE THEM TRANSITIVE, and this is measured on the HUB
+# rather than argued: both images bake a systemd newer than the 24.04.4 base
+# (255.4-1ubuntu8.17 vs 8.12), because systemd-resolved and systemd-timesyncd
+# depend on `systemd (= <exact version>)`. That obliges apt to move the
+# version-locked siblings in lockstep. On the hub, with IDENTICAL systemd
+# versions, the core list alone fetched systemd-sysv (238 debs, resolve OK) and
+# the same list plus 22 optional packages did NOT (430 debs, resolve BROKEN).
+# Nothing about the core list changed - apt simply picked a different plan once
+# it had more packages to choose from.
+#
+# So "the wall build passes today" was never evidence about tomorrow: switching
+# on an unrelated wall feature could evaporate a transitive dependency, and the
+# failure would name neither the feature nor the package. The two outcomes are
+# an offline resolve dying on `init : PreDepends: systemd-sysv`, or - worse, for
+# libpam-systemd - apt NOT FAILING AT ALL and planning a removal that cascades
+# into snapd, polkitd, ubuntu-server and the boot path, with only
+# export-apt.sh's --no-remove guard between that plan and an ISO.
+#
+# They are already downloaded, so the ISO does not grow. The full derivation is
+# in ../packages.list lines 193-239; this is the wall half of it.
+systemd-sysv           # init PRE-depends on it; must match the baked systemd
+libpam-systemd         # base-installed sibling; a silent removal cascades
+
 # ── the media sync (OI-15): the panel PULLS, so it needs a cifs client ───────
 cifs-utils             # mount.cifs — the read-only mount of the media share
 rsync                  # the mirror itself (`rsync -a --delete`)

@@ -143,6 +143,37 @@ while IFS= read -r line || [ -n "$line" ]; do
     smbpasswd -e "$account" >/dev/null 2>&1 || true
 done < "$CREDS"
 
+# ── the OPERATOR account also needs the household group (2026-08-29) ─────────
+# NOT a Samba identity, and that is exactly why it is here rather than in the
+# creds file: it has no share, no smbpasswd entry and no §2 row. What it has is
+# the IceDrive client, which runs as this account inside the RDP session — and
+# on 2026-08-29 the Owner ruled the offsite sync TWO-WAY, so a change made in
+# the cloud has to be able to land in /srv/library.
+#
+# READ ALREADY WORKED BY ACCIDENT: the library mounts `umask=0002`, which grants
+# world r-x. WRITE needs group membership and nothing else — no fstab change, no
+# chown (ownership on NTFS/exFAT is synthesized per-mount and cannot be chowned).
+#
+# WHY THIS LINE HAS TO EXIST AT ALL. A group membership lives in /etc/group and
+# in NO generated artifact — not fstab, not smb.conf, not the ISO. Doing it by
+# hand on a live box is precisely the change a reimage discards without a word,
+# which is the carriage-vs-activation failure this project keeps re-finding.
+# HomeHub's TC-H-S12 asserts the outcome; this is what makes it true.
+#
+# Failure is a WARNING, not fatal: the household accounts above are what this
+# script exists for, and offsite sync being read-only is a degraded feature, not
+# an unreachable share.
+OPERATOR_USER="${REMOTE_UI_USER:-hub}"
+if ! id -u "$OPERATOR_USER" >/dev/null 2>&1; then
+    log "operator account '$OPERATOR_USER' does not exist — skipping its $HOUSEHOLD_GROUP membership"
+elif id -nG "$OPERATOR_USER" 2>/dev/null | tr ' ' '\n' | grep -qxF "$HOUSEHOLD_GROUP"; then
+    log "operator '$OPERATOR_USER' is already in $HOUSEHOLD_GROUP"
+elif usermod -aG "$HOUSEHOLD_GROUP" "$OPERATOR_USER"; then
+    log "operator '$OPERATOR_USER' added to $HOUSEHOLD_GROUP (two-way offsite sync needs write on the library)"
+else
+    log "WARN: could not add '$OPERATOR_USER' to $HOUSEHOLD_GROUP — offsite sync will be read-only (TC-H-S12 will fail)"
+fi
+
 log "done: $created account(s) created, $updated password(s) set."
 if [ "$rc" -ne 0 ]; then
     log "FATAL: at least one account failed — the shares those identities own are unreachable."

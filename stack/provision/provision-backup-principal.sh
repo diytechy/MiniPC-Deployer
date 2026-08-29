@@ -2,14 +2,21 @@
 # provision-backup-principal.sh — name the FileBackup container's uid on the host.
 #
 # Q-FB5 (the Owner, 2026-08-23): the backup drive mounts
-# uid=65532,gid=65532,umask=0077 so the FileBackup container — which ships as
+# uid=65532,gid=65532,umask=0027 so the FileBackup container — which ships as
 # 65532:65532, the conventional "nonroot" uid — can write it WITHOUT running as
 # root. NTFS/exFAT ownership is synthesized from the mount options, and those
-# options are NUMERIC (the kernel resolves no names), so NOTHING here is
-# load-bearing for access: the mount and the container both work if this
-# script never ran. It exists for legibility and for the library-backup
-# wrapper — `ls -l /mnt/backup-drive` shows `filebackup` instead of a bare
-# number, and the wrapper can assert against a name that means something.
+# options are NUMERIC (the kernel resolves no names), so the WRITE half of this
+# script is not load-bearing: the mount and the container both work if it never
+# ran. That half exists for legibility and for the library-backup wrapper —
+# `ls -l /mnt/backup-drive` shows `filebackup` instead of a bare number, and the
+# wrapper can assert against a name that means something.
+#
+# THAT CHANGED ON 2026-08-29 AND THE OLD HEADER IS NO LONGER TRUE. The mask went
+# 0077 -> 0027 (the Owner) so the RDP operator account can READ the drive in its
+# session. A numeric mount option cannot express "and this other account too" —
+# that takes GROUP MEMBERSHIP, which is made at the bottom of this file. So this
+# script IS now load-bearing, for read, and skipping it leaves a drive the
+# operator cannot open. HomeHub's TC-H-L07 asserts the outcome.
 #
 # What IS load-bearing is the refusal below: if uid/gid 65532 already belongs
 # to some other account, that account silently owns every archive of the
@@ -62,6 +69,33 @@ elif useradd -M -N -u "$FB_UID" -g "$FB_GID" -s /usr/sbin/nologin "$FB_NAME"; th
 else
     log "FATAL: useradd failed for $FB_NAME"
     exit 1
+fi
+
+# ── the OPERATOR account reads the drive (2026-08-29, the Owner) ─────────────
+# READ ONLY, and deliberately: the Owner asked to see both drives in the RDP
+# session, with the backup drive read-only there. `umask=0027` gives the group
+# r-x on directories and r-- on files, so membership in this group is exactly
+# "may look, may not change" — the write bit is still the OWNER's alone, which
+# is Q-FB5 untouched.
+#
+# WHY IT CANNOT BE A MOUNT OPTION. uid=/gid= name ONE account and ONE group. A
+# second principal with different rights can only be expressed by putting it in
+# the group, which lives in /etc/group and therefore in NO generated artifact —
+# the same class of state as the household membership in provision-samba-users.sh,
+# and the same reason it must be provisioned rather than done by hand: a reimage
+# discards it in silence and the operator quietly loses the drive.
+#
+# WARNING, not fatal. The container's write access does not depend on this, and
+# the backup is the thing this box exists to do.
+OPERATOR_USER="${REMOTE_UI_USER:-hub}"
+if ! id -u "$OPERATOR_USER" >/dev/null 2>&1; then
+    log "operator account '$OPERATOR_USER' does not exist — skipping its $FB_NAME membership"
+elif id -nG "$OPERATOR_USER" 2>/dev/null | tr ' ' '\n' | grep -qxF "$FB_NAME"; then
+    log "operator '$OPERATOR_USER' is already in $FB_NAME"
+elif usermod -aG "$FB_NAME" "$OPERATOR_USER"; then
+    log "operator '$OPERATOR_USER' added to $FB_NAME (read-only sight of the backup drive)"
+else
+    log "WARN: could not add '$OPERATOR_USER' to $FB_NAME — the backup drive will be invisible in the RDP session (TC-H-L07 will fail)"
 fi
 
 exit 0

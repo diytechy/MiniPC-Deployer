@@ -4,12 +4,22 @@
 # measurements that justify this unit existing at all.
 Description=Block the Gun Master 3 relay subnet from addressing this host
 Documentation=file:///opt/homehub/stack/game-isolation/game-isolation.sh
-# AFTER docker, because the rule names a subnet whose bridge docker creates. The
-# rule itself does not depend on the bridge existing - iptables happily holds a
-# rule for a subnet with no interface - but ordering it here means the window
-# between "relay can run" and "relay is fenced" is never open.
-After=docker.service
-Requires=docker.service
+# BEFORE docker, and this was WRONG in the first version. It said After=docker,
+# reasoning that the rule names a subnet whose bridge docker creates. But the
+# rule does NOT need the bridge to exist - iptables holds a rule for a subnet
+# with no interface quite happily - and ordering after docker means that on every
+# reboot the relay (restart: unless-stopped) is started by docker BEFORE this
+# unit runs. That window is exactly when an already-compromised relay would
+# reach the host, and it recurs on every single boot.
+#
+# Before=docker.service closes it: the fence is up before anything can be
+# started behind it. Requires= is deliberately absent - this must run even if
+# docker is masked or broken, because a rule with no containers is harmless and
+# a container with no rule is the failure this exists to prevent.
+Before=docker.service
+DefaultDependencies=no
+After=network-pre.target
+Wants=network-pre.target
 
 [Service]
 Type=oneshot

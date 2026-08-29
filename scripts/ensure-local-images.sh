@@ -119,7 +119,14 @@ ensure_image() {
             # whole repo: an edit to FinnsGame's game code does not make the
             # relay image stale, and flagging it would train people to ignore
             # the marker.
-            git -C "$sibling" diff --quiet HEAD -- "$sibling" 2>/dev/null || dirty='+dirty'
+            # `status --porcelain -- .` not `diff --quiet HEAD -- <abs path>`.
+            # With -C already inside the context, the absolute pathspec matched
+            # NO TRACKED FILES, so the check always said clean and a modified
+            # tree was stamped with a clean HEAD (review finding 4). `-- .` is
+            # relative to -C and therefore correct for both shapes, and status
+            # also sees UNTRACKED files - which `diff` never does and which are
+            # build inputs like any other.
+            [ -z "$(git -C "$sibling" status --porcelain --untracked-files=normal -- . 2>/dev/null)" ] || dirty='+dirty'
         fi
         docker build -t "$ref" \
             --label "homehub.source.revision=${rev}${dirty}" \

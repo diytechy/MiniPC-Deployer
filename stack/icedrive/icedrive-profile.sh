@@ -366,6 +366,31 @@ start_client() {
     local desktop="$HOMEDIR/.config/autostart/icedrive.desktop" exec_line="" w=0
     local applog="$HOMEDIR/.local/share/Icedrive/logdata.txt" log_start=0
     local ready_timeout=60
+    # How long the client must keep running AFTER it first looks healthy. The
+    # observed death was at ~5s; 15 clears it with room and still keeps the
+    # nightly capture well under a minute.
+    local STABILISE_S=15
+
+    # _icd_newlog - the bytes THIS run wrote, and nothing else.
+    #
+    # RESETS ITSELF IF THE LOG SHRANK. The offset is only sound while the file
+    # grows: IceDrive rotates or truncates logdata.txt on its own schedule, and
+    # after a truncation an offset taken before it is PAST the end of the file,
+    # so `tail -c +N` returns nothing and every readiness scan silently fails for
+    # the rest of the run - which would show up as the "alive but quiet" failure
+    # below, on a perfectly healthy client. Comparing the current size to the
+    # recorded offset catches exactly that, and reading the whole file is the
+    # right fallback: after a truncation, everything in it IS this run.
+    _icd_newlog() {
+        local sz=0
+        [ -f "$applog" ] || return 0
+        sz="$(wc -c <"$applog" 2>/dev/null || echo 0)"
+        if [ "$sz" -lt "$log_start" ]; then
+            cat "$applog" 2>/dev/null
+        else
+            tail -c "+$((log_start + 1))" "$applog" 2>/dev/null
+        fi
+    }
     [ -f "$desktop" ] || { warn "no $desktop — cannot restart the client"; return 1; }
     exec_line="$(awk -F= '$1=="Exec"{sub(/^[^=]*=/,""); print; exit}' "$desktop")"
     [ -n "$exec_line" ] || { warn "no Exec= in $desktop — cannot restart"; return 1; }
@@ -386,29 +411,52 @@ start_client() {
         return 1
     fi
 
-    # Phase 2 — it stays up AND reaches a working state. This is the C36 fix.
-    local waited=0
+    # Phase 2 — it stays up AND reaches a working state, and then KEEPS being up.
+    #
+    # READINESS DOES NOT END THE WATCH, and that is the whole correction. The
+    # first version of this fix returned 0 the moment it saw a marker — which
+    # reproduces the original defect exactly, because the observed failure logged
+    # `start watch on` at THREE seconds and died at FIVE. Seeing evidence of life
+    # and leaving immediately is the same mistake as sleeping three seconds and
+    # leaving; it just looks more thorough. A marker now starts a stabilisation
+    # countdown instead of ending the loop.
+    local waited=0 ready_at=-1
     while [ "$waited" -lt "$ready_timeout" ]; do
         if [ -z "$(app_pids)" ]; then
             warn "the client started and then EXITED after ~$((w + waited))s — it is NOT running."
             warn "  the last lines it wrote (this run only):"
-            tail -c "+$((log_start + 1))" "$applog" 2>/dev/null | tail -5 | while IFS= read -r l; do warn "    $l"; done
+            _icd_newlog | tail -5 | while IFS= read -r l; do warn "    $l"; done
             warn "  a RemoteHostClosedError here means the restart raced the old instance's teardown (C36)."
             return 1
         fi
-        if tail -c "+$((log_start + 1))" "$applog" 2>/dev/null \
+        if [ "$ready_at" -lt 0 ] && _icd_newlog \
              | grep -qE 'waiting for events|checking pending uploads|start watch on'; then
-            log "client is back and WORKING (up ${w}s, reached a working state after ${waited}s)"
+            ready_at="$waited"
+            log "client reached a working state after ${ready_at}s — watching ${STABILISE_S}s more before calling it good"
+        fi
+        if [ "$ready_at" -ge 0 ] && [ "$((waited - ready_at))" -ge "$STABILISE_S" ]; then
+            log "client is back and WORKING (up $((w + waited))s, stable ${STABILISE_S}s past readiness)"
             return 0
         fi
         sleep 2; waited=$((waited + 2))
     done
 
-    # Alive but quiet. Not a failure — see the banner — but never silent either.
-    log "client is back and has stayed up ${ready_timeout}s, but wrote no readiness"
-    log "  marker (no sync pair yet?). Treating as OK; it did NOT die, which is"
-    log "  the failure this check exists to catch."
-    return 0
+    # ── ALIVE BUT QUIET IS NOW A FAILURE, reversing this fix's first version.
+    # The reasoning then was that a hub with no sync pair would never log a
+    # marker, so refusing to capture there would break recovery for the machines
+    # that need it most. True — but it left a worse hole: an IceDrive whose
+    # carried token was REJECTED sits at a sign-in screen, alive and logging
+    # nothing, indefinitely. That is precisely the state a reflashed box lands
+    # in, the offsite copy is stopped, and returning 0 told nobody. Between
+    # "occasionally noisy on a box with no pairs" and "silent while the offsite
+    # copy is down", this file's own fail-closed rule picks the first. The
+    # message names the benign case so it is actionable either way.
+    warn "the client has stayed up ${ready_timeout}s but never reported working —"
+    warn "  no watch established, no upload check. Two things look like this: it is"
+    warn "  sitting at a SIGN-IN screen because the carried token was rejected (the"
+    warn "  offsite copy is DOWN and needs a 2FA sign-in), or this box genuinely has"
+    warn "  no sync pair yet, in which case create one and re-run. Not assuming."
+    return 1
 }
 
 # archive_lists ARCHIVE -> the tar listing on stdout, nonzero if it will not read.

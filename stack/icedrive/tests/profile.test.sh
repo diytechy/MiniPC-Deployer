@@ -361,6 +361,53 @@ pkill -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' 2>/dev/null || true
 kill "$FAKE_SESSION" 2>/dev/null || true
 if [ "$(ls "$OUT" | grep -c '^\.')" = 0 ]; then pass "I15 and no temporary file was left behind"; else fail "I15 leftovers: $(ls -A "$OUT" | tr '\n' ' ')"; fi
 echo
+
+# ── I17: readiness followed by death is STILL a failed capture (C36, round 2) ─
+# THE FIRST FIX FOR C36 WAS ITSELF WRONG, in the same shape as the bug. It
+# returned 0 the instant it saw a readiness marker - and the observed failure
+# logged `start watch on` at THREE seconds and died at FIVE, so "wait for
+# evidence of life, then leave" reproduces "sleep 3, then leave" exactly. Found
+# by an adversarial review of the fix, not by the fix failing.
+#
+# So: a marker must START a stabilisation watch, not end one. This fixture writes
+# a genuine readiness line and then exits, which passes the naive check and must
+# fail this one.
+echo "== I17: a client that looks ready and THEN dies still fails (C36 round 2) =="
+make_profile
+
+cp /bin/sleep "$TMP/xfce4-session"   # the NAME is what pgrep -x matches
+env DISPLAY=:99 "$TMP/xfce4-session" 180 &
+FAKE_SESSION2=$!
+sleep 1
+
+cat >"$TMP/ready-then-die.sh" <<'EOS'
+#!/bin/bash
+# Look healthy - exactly the line a working client writes - then die.
+mkdir -p "$HOME/.local/share/Icedrive"
+echo '[test] start watch on "/srv/library/permtest" id: 99999' >> "$HOME/.local/share/Icedrive/logdata.txt"
+exec -a "/opt/icedrive/Icedrive.AppImage" sleep 6
+EOS
+chmod +x "$TMP/ready-then-die.sh"
+printf '[Desktop Entry]\nType=Application\nExec=env HOME=%s %s\n' "$REALHOME" "$TMP/ready-then-die.sh" \
+    >"$REALHOME/.config/autostart/icedrive.desktop"
+
+setsid bash -c 'exec -a "/opt/icedrive/Icedrive.AppImage" sleep 120' &
+sleep 1
+
+rc="$(sut --capture)"
+if [ "$rc" = 1 ]; then
+    pass "I17 readiness-then-death FAILS the capture (exit 1)"
+else
+    fail "I17 exit=$rc, want 1 - a marker was treated as proof of life (C36 round 2)"
+    sed -n '1,40p' "$TMP/out.txt"
+fi
+if grep -qi 'EXITED' "$TMP/out.txt"; then
+    pass "I17 and it reports the client EXITED after looking healthy"
+else
+    fail "I17 the message does not say it exited: $(tail -3 "$TMP/out.txt")"
+fi
+pkill -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' 2>/dev/null || true
+kill "$FAKE_SESSION2" 2>/dev/null || true
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 if [ "$FAIL" -eq 0 ]; then exit 0; fi

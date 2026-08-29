@@ -1005,6 +1005,67 @@ if ! grep -q '^ok caddy' "${__restore_log:-/nonexistent}" 2>/dev/null; then
 fi
 rm -f "${__restore_log:-}" 2>/dev/null || true
 
+# ── 4-pre. FENCE THE CROSSPLAY RELAY BEFORE ANYTHING STARTS IT ──────────────
+# ORDER IS THE POINT OF THIS BLOCK. The relay is the one service on this box that
+# answers the public internet with no identity check, and `internal: true` does
+# NOT stop it reaching the HOST — Docker keeps the bridge gateway live and
+# documents the exception. Measured on the running box: the relay reached host
+# SSH, Technitium's DNS AND its admin console on 5380, and cockpit, the console
+# bypassing both of the guards on it. So the firewall rule must exist BEFORE the
+# container does, not several hundred lines later.
+#
+# READ THE PROFILE WITH env_value, NOT AS A SHELL VARIABLE. This script
+# deliberately does not source .env (see env_value's banner), so `$COMPOSE_PROFILES`
+# is UNSET here — the first version of this block tested it directly and was a
+# silent no-op: the case never matched, the unit was never installed, and a
+# reimaged box would have run the relay with the host wide open while every log
+# line said success. Found by an adversarial review, not by anything failing.
+#
+# AND IT FAILS CLOSED. If the profile is on and the fence cannot be installed,
+# this refuses to start the stack at all rather than starting an unfenced public
+# service. A missing guard on a service like this is not a degraded box, it is a
+# different box.
+__gm3_enabled=0
+case ",$(env_value COMPOSE_PROFILES)," in
+    *,gunmaster3,*) __gm3_enabled=1 ;;
+esac
+if [ "$__gm3_enabled" = 1 ]; then
+    # THE SECRET IS THE ONLY DOOR, so an absent or malformed one is fatal. An
+    # empty GAME_WS_SECRET collapses the Caddy matcher to `^/ws-$`, which makes
+    # the complete bearer credential the literal string "/ws-" — a public,
+    # guessable relay. 43 base64url characters is exactly what New-RandomToken
+    # emits; anything else means the materialiser did not fill this knob.
+    __gm3_secret="$(env_value GAME_WS_SECRET)"
+    case "$__gm3_secret" in
+        *REPLACE_WITH*|"") __gm3_bad=1 ;;
+        *) if printf '%s' "$__gm3_secret" | grep -qE '^[A-Za-z0-9_-]{43}$'; then __gm3_bad=0; else __gm3_bad=1; fi ;;
+    esac
+    if [ "$__gm3_bad" = 1 ]; then
+        log "FATAL: the 'gunmaster3' profile is enabled but GAME_WS_SECRET is missing or malformed."
+        log "  That secret is the ONLY thing between the public internet and the game relay;"
+        log "  empty, the accepted path collapses to '/ws-'. Refusing to start the stack."
+        log "  Fix: re-run Materialize-Deploy.ps1 so .env carries a 43-character token."
+        exit 1
+    fi
+    if [ ! -f "$STACK_DIR/game-isolation/game-isolation.sh" ]; then
+        log "FATAL: 'gunmaster3' is enabled but game-isolation.sh is not in the payload."
+        log "  The relay would start with this host reachable from it. Refusing."
+        exit 1
+    fi
+    install -d -m 0755 /opt/homehub/stack/game-isolation
+    install -m 0755 "$STACK_DIR/game-isolation/game-isolation.sh"         /opt/homehub/stack/game-isolation/game-isolation.sh
+    install -m 0644 "$STACK_DIR/game-isolation/homehub-game-isolation.service"         /etc/systemd/system/
+    systemctl daemon-reload
+    if systemctl enable --now homehub-game-isolation.service >/dev/null 2>&1; then
+        log "  game-isolation: the relay subnet cannot address this host"
+    else
+        log "FATAL: homehub-game-isolation.service did not start, so the public game relay"
+        log "  would be able to reach this host's own services (SSH, the DNS console)."
+        log "  Refusing to start the stack. Check: systemctl status homehub-game-isolation"
+        exit 1
+    fi
+fi
+
 log "docker compose up -d…"
 docker compose up -d
 
@@ -1399,39 +1460,6 @@ fi
 # FAIL-OPEN, like every other restore in this file. No drive, no archived set, no
 # key, a failed decrypt, a profile that is already populated: each one leaves the
 # box exactly as it would have been, and the operator signs in once by hand.
-# ── the crossplay relay's host firewall rule (profile `gunmaster3`) ──────────
-# WITHOUT THIS, A REIMAGED BOX RUNS THE RELAY WITH THE HOST WIDE OPEN TO IT.
-# The relay is the one service here that answers the public internet with no
-# identity check. It is put on an `internal: true` docker network, which removes
-# its route to the internet, the LAN and the other containers - but NOT to the
-# HOST, whose bridge address stays live (Docker documents the exception).
-# Measured on the running box before this existed: the relay reached host SSH,
-# Technitium's DNS AND its admin console on 5380, and cockpit. The console
-# bypassed both of the guards on it, because a caller that never talks to Caddy
-# is not subject to a Caddy matcher.
-#
-# GUARDED ON THE PROFILE so a box that does not run the relay does not carry a
-# firewall rule for a subnet that will never exist - and so the rule cannot
-# silently outlive the thing it fences.
-case ",${COMPOSE_PROFILES:-}," in
-    *,gunmaster3,*)
-        if [ -f "$STACK_DIR/game-isolation/game-isolation.sh" ]; then
-            install -d -m 0755 /opt/homehub/stack/game-isolation
-            install -m 0755 "$STACK_DIR/game-isolation/game-isolation.sh"                 /opt/homehub/stack/game-isolation/game-isolation.sh
-            install -m 0644 "$STACK_DIR/game-isolation/homehub-game-isolation.service"                 /etc/systemd/system/
-            systemctl daemon-reload
-            if systemctl enable --now homehub-game-isolation.service >/dev/null 2>&1; then
-                log "  game-isolation: the relay subnet cannot address this host"
-            else
-                log "  WARNING: homehub-game-isolation.service did not start - the crossplay relay"
-                log "           can reach this host's own services. Check: systemctl status homehub-game-isolation"
-            fi
-        else
-            log "  WARNING: gunmaster3 is enabled but game-isolation.sh is missing from the payload"
-        fi
-        ;;
-esac
-
 if [ "$ICEDRIVE_MODE" != "off" ] && [ -f "$STACK_DIR/icedrive/icedrive-profile.sh" ]; then
     install -d -m 0755 /var/lib/homehub
     install -m 0755 "$STACK_DIR/icedrive/icedrive-profile.sh" /usr/local/sbin/homehub-icedrive-profile

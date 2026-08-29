@@ -251,7 +251,12 @@ assert_local_image_fresh() {
     local repo; repo="$(sibling_repo_for "$ref")"
     [ -n "$repo" ] || return 0
     local dir="$REPO_ROOT/../$repo"
-    if [ ! -d "$dir/.git" ]; then
+    # ASK GIT, do not test for a .git DIRECTORY. In a linked worktree or a
+    # submodule, `.git` is a FILE pointing at the real gitdir, so the directory
+    # test called a perfectly good checkout "absent" and SKIPPED the freshness
+    # check entirely - silently allowing a stale image into the ISO, which is the
+    # exact failure this function exists to prevent (review finding 6).
+    if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         log "  (no $repo checkout beside this repo — cannot verify $ref against its source)"
         return 0
     fi
@@ -267,11 +272,20 @@ assert_local_image_fresh() {
         log "             bash scripts/ensure-local-images.sh --rebuild"
         return 0
     fi
+    # A DIRTY STAMP IS NOTED, NOT AN EXEMPTION. This used to `return 0` on
+    # `+dirty`, which meant the staleness comparison below never ran for a dirty
+    # build - so building at commit A with uncommitted changes and then moving to
+    # commit B baked an image from the WRONG REVISION with only a friendly note
+    # (review finding 5). Strip the suffix, remember it, and let the same
+    # comparison everything else gets apply.
+    local dirty=0
     case "$stamped" in
         *'+dirty')
-            log "  NOTE: $ref was built from a DIRTY $repo tree (${stamped%+dirty} + uncommitted changes)."
+            dirty=1
+            stamped="${stamped%+dirty}"
+            log "  NOTE: $ref was built from a DIRTY $repo tree (${stamped:0:12} + uncommitted changes)."
             log "        Baking it is fine for a gate run; commit before a real flash so the box is reproducible."
-            return 0 ;;
+            ;;
     esac
     if [ -n "$head" ] && [ "$stamped" != "$head" ]; then
         die "STALE local image '$ref' — built from ${stamped:0:12}, but $repo HEAD is ${head:0:12}." \
@@ -281,7 +295,11 @@ assert_local_image_fresh() {
             "Rebuild first:  bash scripts/ensure-local-images.sh --rebuild" \
             "(Deliberately shipping an older build? Export with ALLOW_STALE_LOCAL=1.)"
     fi
-    log "  source-check OK: $ref built from $repo ${stamped:0:12} (= HEAD)"
+    if [ "$dirty" = 1 ]; then
+        log "  source-check OK: $ref built from $repo ${stamped:0:12} (= HEAD) but with uncommitted changes"
+    else
+        log "  source-check OK: $ref built from $repo ${stamped:0:12} (= HEAD)"
+    fi
 }
 
 # is_local_only REF — true when REF has NO registry anywhere, so (a) it can never

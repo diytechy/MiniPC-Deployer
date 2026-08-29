@@ -547,44 +547,29 @@ dns.{$DOMAIN} {
 #     reverse_proxy host.docker.internal:8123    # trusted_proxies in its config.
 # }
 
-# ── *.{$DOMAIN} — ONE wildcard certificate for every subdomain ────────────────
-# ADDED 2026-08-29 (the Owner, after an adversarial review raised finding 6).
+# ── NO WILDCARD CERTIFICATE, AND THAT WAS MEASURED RATHER THAN ASSUMED ───────
+# A `*.{$DOMAIN}` site was added here 2026-08-29 and REVERTED the same evening.
+# The goal was worth having: with one exact certificate per site, all six private
+# hostnames are enumerable through public certificate-transparency logs, and a
+# reflash re-issues all six against Let's Encrypt's 5-duplicates-per-168h limit —
+# which this repo already flags as a real constraint on lab runs.
 #
-# TWO REASONS, and the second is the one that actually drove the decision.
+# IT DID NOT WORK, and the failure is worth recording so nobody re-attempts it
+# the same way. Caddy 2.11.4 will SERVE a wildcard for a covered subdomain — every
+# site here was measured serving `CN=*.{$DOMAIN}` — but it goes on MANAGING every
+# exact name that has its own site block. The admin API showed all seven subjects
+# under one automation policy, so a fresh box would obtain SEVEN certificates
+# rather than two: strictly worse than the six it replaced, for no benefit.
+# `prefer_wildcard` does not exist in this version — tried as a global option, a
+# `tls` subdirective and an `auto_https` argument; all three are rejected.
 #
-# 1. CERTIFICATE TRANSPARENCY. Every publicly-trusted certificate is published to
-#    public, append-only, searchable logs. With one exact certificate per site,
-#    ALL SIX private hostnames on this box — including wall. and game. — were
-#    enumerable by anyone who knew the apex, from a web search, without ever
-#    touching the box. A wildcard publishes only `*.{$DOMAIN}`.
-#
-# 2. ACME RATE LIMITS, WHICH IS WHY THIS LANDED BEFORE AN ISO REBUILD RATHER
-#    THAN "SOMETIME". Let's Encrypt allows 5 duplicate certificates per week, and
-#    this repo already treats that as a live constraint on lab runs — a reflash
-#    re-issues everything, and the box was at SIX certificates. Every rehearsal
-#    reflash therefore spent more than the weekly allowance in one run. With the
-#    wildcard it is TWO.
-#
-# THE APEX STILL NEEDS ITS OWN, and this is the classic mistake: `*.example.tld`
-# does NOT match `example.tld`. A wildcard covers exactly one label, so the bare
-# domain is not in it. That is why the apex block below still stands and why the
-# count is two rather than one.
-#
-# WHY THIS BLOCK CAN BE A BARE 404. Caddy routes most-specific-host-first, so
-# every exact site above (tracker., actual., dns., game., and the wall's
-# host:port) still wins its own traffic. What lands here is a subdomain nothing
-# defines — which previously produced a TLS handshake against a certificate that
-# did not exist. A clean 404 is a better answer, and it costs nothing.
-#
-# THE REUSE IS A CADDY BEHAVIOUR, NOT A DIRECTIVE: with a managed wildcard in the
-# config, Caddy serves it for covered subdomains instead of obtaining individual
-# certificates. There is nothing to write on each site to opt in — which also
-# means there is nothing to read on each site that shows it is happening. VERIFY
-# BY LOOKING AT WHICH CERTIFICATE IS ACTUALLY SERVED, not by reading this file.
-*.{$DOMAIN} {
-    import acme_cloudflare
-    respond "not found" 404
-}
+# THE ONLY ARRANGEMENT THAT ACTUALLY GETS TWO is one `*.{$DOMAIN}` site block
+# with `@host` matchers replacing the per-name blocks — which moves the routing
+# of every guarded site, the oauth2-proxy handoff and the host:port kiosk site in
+# a single edit to the most security-critical file on the box. Not worth doing
+# immediately before an image freeze; recorded as a candidate for when the
+# routing is being touched anyway, or for a Caddy version that prefers wildcards
+# at the management layer and not just the serving one.
 
 # ── apex — bare domain answers on-LAN too ──────────────────────────────────────
 {$DOMAIN} {

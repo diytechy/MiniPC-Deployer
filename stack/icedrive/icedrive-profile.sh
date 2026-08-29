@@ -395,6 +395,39 @@ start_client() {
     exec_line="$(awk -F= '$1=="Exec"{sub(/^[^=]*=/,""); print; exit}' "$desktop")"
     [ -n "$exec_line" ] || { warn "no Exec= in $desktop — cannot restart"; return 1; }
     session_env_load || { warn "no desktop session for $PROF_USER — cannot restart the client here"; return 1; }
+    # ── WAIT FOR PORT 14411, AND THIS IS C36'S ACTUAL ROOT CAUSE ────────────
+    # Measured 2026-08-29, by reproducing it: IceDrive binds an internal
+    # WebSocket server on 127.0.0.1:14411 for its own UI-to-engine channel. A new
+    # instance that cannot get that port logs
+    #
+    #     Failed to open WS server on port 14411
+    #     All WS ports are busy. Giving up.
+    #     failed to create wserver!
+    #
+    # and dies shortly after - which is exactly the `RemoteHostClosedError` that
+    # took the offsite copy down when this script restarted the client. The old
+    # process had been TERMed but had not yet released the socket, so the
+    # restart raced its own teardown for a port. The detection this fix added is
+    # worth keeping, but detection was never the real answer: DO NOT START THE
+    # NEW ONE UNTIL THE PORT IS ACTUALLY FREE.
+    #
+    # `pkill -f Icedrive.AppImage` does NOT find the holder, incidentally: the
+    # AppImage re-execs itself as `AppRun` out of /tmp/.mount_Icedri*, so the
+    # literal name is absent from its cmdline. CLIENT_RE already covers that,
+    # which is why stop_client works and a naive pattern does not.
+    local __p=0
+    while [ "$__p" -lt 30 ]; do
+        ss -lnt 2>/dev/null | grep -q ':14411 ' || break
+        sleep 1; __p=$((__p + 1))
+    done
+    if ss -lnt 2>/dev/null | grep -q ':14411 '; then
+        warn "port 14411 is STILL held after ${__p}s — starting now would produce"
+        warn "  'failed to create wserver' and a client that dies seconds later (C36)."
+        warn "  Not starting. The profile archive is safe; the client needs a hand."
+        return 1
+    fi
+    [ "$__p" -gt 0 ] && log "waited ${__p}s for port 14411 to be released before restarting"
+
     # Where the client's log ends BEFORE we start it. Every readiness scan below
     # reads only past this offset, so a marker left by an EARLIER run — including
     # the run we just stopped — can never be mistaken for this one starting.

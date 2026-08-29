@@ -1316,6 +1316,73 @@ if [ "$ICEDRIVE_MODE" = "appimage" ] && [ "$REMOTE_UI_ENABLED" != "true" ]; then
     ICEDRIVE_MODE=off
 fi
 
+
+# ── 6c-pre. GIVE ICEDRIVE ITS SIGN-IN BACK, BEFORE THE SESSION STARTS IT ─────
+#
+# The sync PAIRS come back from the API on their own — measured across a real
+# reboot 2026-08-29, the client asked and got them with no local state involved.
+# What does NOT come back is the ability to sign in: the token, the saved
+# credential and the web-session cookies live in the `hub` account's home
+# directory, and the account has 2FA, so a reflashed box cannot resume the
+# offsite copy until a human sits down at it.
+#
+# ORDER IS LOAD-BEARING AND THIS IS WHY IT SITS ABOVE setup-remote-ui.sh: that
+# script starts the graphical session, the session autostarts IceDrive, and
+# IceDrive begins signing in within seconds. A profile restored afterwards is a
+# profile the client has already replaced with a fresh, signed-out one.
+#
+# THE ARCHIVE IS ENCRYPTED and the two halves travel on different media: the
+# ciphertext rides the BACKUP DRIVE inside the `icedrive` backup set, and the key
+# (ICEDRIVE_PROFILE_KEY) rides the INSTALL STICK in .env. Either alone is
+# useless. That split is the change an adversarial review required before this
+# was allowed to exist at all — see the header of icedrive-profile.sh.
+#
+# FAIL-OPEN, like every other restore in this file. No drive, no archived set, no
+# key, a failed decrypt, a profile that is already populated: each one leaves the
+# box exactly as it would have been, and the operator signs in once by hand.
+if [ "$ICEDRIVE_MODE" != "off" ] && [ -f "$STACK_DIR/icedrive/icedrive-profile.sh" ]; then
+    install -d -m 0755 /var/lib/homehub
+    install -m 0755 "$STACK_DIR/icedrive/icedrive-profile.sh" /usr/local/sbin/homehub-icedrive-profile
+    if [ -f "$STACK_DIR/icedrive/homehub-icedrive-profile.service" ]; then
+        install -m 0644 "$STACK_DIR/icedrive/homehub-icedrive-profile.service" /etc/systemd/system/
+        install -m 0644 "$STACK_DIR/icedrive/homehub-icedrive-profile.timer"   /etc/systemd/system/
+        systemctl daemon-reload
+        systemctl enable --now homehub-icedrive-profile.timer >/dev/null 2>&1 || \
+            log "  WARNING: could not enable homehub-icedrive-profile.timer - the sign-in would not be captured for the NEXT reimage"
+    fi
+    _ICE_USER="$(getent passwd 1000 | cut -d: -f1)"; [ -n "$_ICE_USER" ] || _ICE_USER=hub
+    _ICE_DIR=/var/lib/homehub/icedrive
+    (
+        # Bring the encrypted archive back off the backup drive first. It is an
+        # ordinary `path:` backup set, so restore.sh is the tool - the same one
+        # the volume restores use, for the same reason: one implementation of
+        # "reconstruct this set and verify every byte".
+        if [ ! -f "$_ICE_DIR/icedrive-profile.tar.gz.gpg" ]; then
+            . /etc/homehub-backup/backup.env 2>/dev/null || exit 0
+            . "$STACK_DIR/backup/common.sh" 2>/dev/null || exit 0
+            [ -n "${BACKUP_TARGET:-}" ] || exit 0
+            mountpoint -q "$BACKUP_TARGET" || exit 0
+            _run="$(newest_run_with_set "$BACKUP_TARGET" icedrive)" || exit 0
+            [ -n "$_run" ] || exit 0
+            install -d -m 0700 "$_ICE_DIR"
+            bash "$STACK_DIR/backup/restore.sh" --run "$_run" --set icedrive --target "$_ICE_DIR" >/dev/null 2>&1 || exit 0
+        fi
+    ) || true
+    if [ -f "$_ICE_DIR/icedrive-profile.tar.gz.gpg" ]; then
+        # Exit 3 is "declined, nothing to do" (a populated profile, no archive) and
+        # is NOT a warning; exit 1 is a real failure and is.
+        bash "$STACK_DIR/icedrive/icedrive-profile.sh" --restore --user "$_ICE_USER" --env "$STACK_DIR/.env" 2>&1 | sed 's/^/  /'
+        case "${PIPESTATUS[0]}" in
+            0) log "  restored the IceDrive profile - the client should sign in without the 2FA prompt" ;;
+            3) log "  no IceDrive profile restore (the profile is already populated, or there is no archive)" ;;
+            *) log "  WARNING: the IceDrive profile restore FAILED. The client will start signed out;"
+               log "    sign in once over RDP, then: sudo homehub-icedrive-profile --capture" ;;
+        esac
+    else
+        log "  no encrypted IceDrive profile on the backup drive yet - first sign-in is by hand."
+        log "    After signing in: sudo homehub-icedrive-profile --capture"
+    fi
+fi
 if [ "$REMOTE_UI_ENABLED" = "true" ]; then
     log "provisioning the graphical session (SR-015, activated by .env)…"
     HUB_USER="$(getent passwd 1000 | cut -d: -f1)"

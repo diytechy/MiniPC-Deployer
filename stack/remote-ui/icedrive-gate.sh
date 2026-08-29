@@ -25,6 +25,13 @@
 # slow USB enclosure finishing enumeration. `nofail` in the generated fstab
 # means systemd does not wait for these disks and neither does anything else.
 #
+# SO THERE ARE TWO GATES HERE, NOT ONE, since 2026-08-29: the mount check
+# (something is mounted) and a MARKER FILE on the volume itself (and it is the
+# right something). The second closes the case the first cannot see — a blank
+# replacement disk, a re-formatted enclosure, a stand-in that has never held the
+# library — every one of which is a mounted, writable, EMPTY tree. See the
+# marker block further down for why creating it is deliberate.
+#
 # WHY A GATE AND NOT A DELAY. A timed delay is a guess about enumeration speed,
 # and open-item C27 has these enclosures dropping off the bus repeatedly — six
 # disconnects on one port inside two minutes. A drive present at T+60 s can be
@@ -44,6 +51,8 @@
 # Usage:  icedrive-gate.sh [mountpoint ...]
 #   Paths default to $ICEDRIVE_GATE_PATHS, then to /srv/library.
 #   Timeout is $ICEDRIVE_GATE_TIMEOUT seconds (default 600).
+#   Each path must also carry a MARKER file ($ICEDRIVE_GATE_MARKER, default
+#   .homehub-library). Set ICEDRIVE_GATE_REQUIRE_MARKER=false to skip that.
 #
 # NOTE ON WHICH DISK. The pairs live under /srv/library, so the LIBRARY drive is
 # what matters — not the backup drive, which IceDrive never touches. Waiting on
@@ -58,6 +67,14 @@ INTERVAL="${ICEDRIVE_GATE_INTERVAL:-5}"
 if [ "$#" -gt 0 ]; then
     PATHS=("$@")
 else
+    # `:-` AND NOT `-`, DELIBERATELY. With `:-`, an ICEDRIVE_GATE_PATHS that is
+    # set but EMPTY falls back to the default and the gate still guards. With
+    # `-` it would guard nothing, and an empty variable is exactly what a typo,
+    # an unset lookup or a truncated .env produces — so the two spellings differ
+    # by "a mistake silently disables the one check standing between a blank
+    # disk and a mirror-delete". Turning the gate OFF is therefore a positive
+    # act: give it whitespace (ICEDRIVE_GATE_PATHS=" "), which parses to zero
+    # paths and takes the start-immediately branch below.
     # shellcheck disable=SC2206
     read -r -a PATHS <<< "${ICEDRIVE_GATE_PATHS:-/srv/library}"
 fi
@@ -118,6 +135,56 @@ while :; do
 done
 
 [ "$waited" -gt 0 ] && log "all paths mounted after ${waited}s"
+
+# ── THE MARKER: mounted is not the same as "the right volume" ────────────────
+#
+# Added 2026-08-29 on the finding of an adversarial design review (gpt-5.6-sol),
+# which called the empty-mountpoint case "the most dangerous unnamed operational
+# failure" of the reflash-recovery work — and it is only half-covered by the
+# mount check above.
+#
+# What the mount check proves: SOMETHING is mounted here. What it cannot see: a
+# blank replacement disk, a re-formatted enclosure, a stand-in that has never
+# held the library. Every one of those is a mounted, writable, EMPTY tree — and
+# to a two-way sync engine, empty is indistinguishable from "every file was
+# deleted". The pairs carry absolute local paths and start scanning within
+# seconds of sign-in, so the window for noticing by hand is zero.
+#
+# The marker is a file ON THE VOLUME, which is exactly the property that makes
+# it work: it survives a reimage of the SYSTEM disk (the case this whole
+# recovery effort is about) and it is absent from any disk that has not been
+# deliberately blessed. It is a plain empty file — nothing in it is trusted, its
+# EXISTENCE is the whole signal.
+#
+# CREATING IT IS DELIBERATE, never automatic. A gate that created its own
+# marker on first sight would bless the blank disk it is supposed to refuse:
+#
+#     sudo touch /srv/library/.homehub-library
+#
+# The message below says exactly that, because the operator who hits this is
+# looking at a box whose cloud sync did not start and needs the one command.
+#
+# ICEDRIVE_GATE_REQUIRE_MARKER=false turns it off. That exists for a lab with a
+# throwaway library, and it is loud about what it is giving up.
+MARKER="${ICEDRIVE_GATE_MARKER:-.homehub-library}"
+if [ "${ICEDRIVE_GATE_REQUIRE_MARKER:-true}" = "true" ]; then
+    unmarked=()
+    for p in "${PATHS[@]}"; do
+        [ -e "$p/$MARKER" ] || unmarked+=("$p")
+    done
+    if [ "${#unmarked[@]}" -ne 0 ]; then
+        log "REFUSING TO START: mounted, but no $MARKER on: ${unmarked[*]}"
+        log "  A mount check proves something is mounted here. It cannot tell the household's"
+        log "  library from a blank replacement disk, and a two-way sync pair scanning an empty"
+        log "  tree is indistinguishable from every file having been deleted."
+        log "  If this IS the right volume, bless it once — the marker lives on the DISK, so it"
+        log "  survives a reimage and travels with the drive:"
+        for p in "${unmarked[@]}"; do log "      sudo touch $p/$MARKER"; done
+        log "  (ICEDRIVE_GATE_REQUIRE_MARKER=false disables this check and the protection with it.)"
+        exit 1
+    fi
+    log "marker present on: ${PATHS[*]} — this volume has been blessed as the library"
+fi
 
 # INFORMATIONAL ONLY, and it must never gate. The guard knows whether the disk
 # is the one storage-map names, which a mount check cannot tell; a STAND-IN is a

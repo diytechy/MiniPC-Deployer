@@ -1,0 +1,22 @@
+[Unit]
+# Capture the IceDrive client's sign-in so a reflash does not cost a 2FA prompt.
+#
+# The sync PAIRS are server-side and come back on their own. The ability to SIGN
+# IN is not: the token, the saved credential and the web-session cookies live in
+# the hub account's home directory, which a reimage wipes.
+#
+# The archive is ENCRYPTED with a key that reaches the box in .env and never
+# touches the backup drive — the ciphertext rides the drive, the key rides the
+# install stick. That split was required by an adversarial review of this
+# design; see the header of icedrive-profile.sh for the reasoning.
+Description=Capture the IceDrive profile (encrypted) for reimage recovery
+Documentation=file:/opt/homehub/stack/icedrive/icedrive-profile.sh
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/homehub-icedrive-profile --capture
+# 3 = "nothing to capture" (no profile on this box, IceDrive off). That is a
+# legitimate steady state, not a failure, and a unit stuck in `failed` for it
+# would train the reader to ignore this one.
+SuccessExitStatus=0 3

@@ -1,0 +1,20 @@
+[Unit]
+Description=Capture the IceDrive profile nightly, before the backup run
+Documentation=file:/opt/homehub/stack/icedrive/icedrive-profile.sh
+
+[Timer]
+# 02:10, and the time is chosen rather than arbitrary: homehub-backup.timer
+# fires at 03:30, so the capture is on disk and inside `/var/lib/homehub/icedrive` before
+# the run that carries it to the backup drive. Firing AFTER the backup would
+# make every archived capture exactly one day stale — recoverable, but a day of
+# sync configuration older than it needed to be, for no reason.
+OnCalendar=*-*-* 02:10:00
+# THE CAPTURE STOPS THE CLIENT for a few seconds. Persistent=true would fire a
+# missed capture the moment the box boots, which is precisely when IceDrive is
+# doing its start-up scan. Miss a night instead; the previous capture is still
+# there and a sign-in does not change daily.
+Persistent=false
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

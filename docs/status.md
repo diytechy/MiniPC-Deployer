@@ -58,8 +58,10 @@ last) — it is the record, not required reading for every pass.
 > |---|---|
 > | **C21** | `finance-auditor` restart-loops — `ACTUAL_SYNC_ID` unset, 0 budget files in Actual. One browser visit |
 > | **C22** | Three of five vhosts hold no certificate — Let's Encrypt 429. Clears itself; re-run the suite after **2026-08-29 04:12 UTC** and 11 failures become 3 |
-> | **C25** | `backup.sh --dry-run` is **not dry**: it writes a `run_<ts>/` directory to the BACKUP DRIVE, mounts CIFS and issues `hdparm -S`. Fix not applied — it is the backup service's path handling and needs a ruling |
+> | **C25** | `backup.sh --dry-run` was **not dry**: it writes a `run_<ts>/` directory to the BACKUP DRIVE, mounts CIFS and issues `hdparm -S`. **Ruled 2026-08-29: the behaviour stays, the NAME goes.** The mode is `--plan`, it names what it wrote at both ends of the run, and `--dry-run` still works. The directory is still called `run_<ts>` — renaming it is path handling, and still open |
 > | **C26** | **The household Samba accounts have never existed on any hub.** One regex in `Materialize-Deploy.ps1:890` filters on schema key NAMES, and three of the four are `@identity:` tokens that do not match. Five `Private` shares are served to nobody |
+> | **C29** | The drive-health guard could not report: `/api/feed` answered **400** because the tracker declared no item for the check ids. Not a transport fault — `docker exec tracker wget …/healthz` returned `ok`. Four item definitions added on the box; both lanes now report. The guard prints the server's own explanation instead of guessing |
+> | **C32** | The `caddy_data` ACME restore had **never fired**: `provision-mounts` writes the backup drive's fstab line seven minutes after the step that reads it. It now mounts the drive itself, READ-ONLY, from the generated fragment. Proven — 21 files, ACME keys and certs |
 > | **C27** | The **Library** stand-in dropped off the bus 5 times on port `1-8`; moving it to `1-3` gave a clean 8 MB drill run with zero disconnects. Evidence, not yet a verdict |
 > | **C28** | The share credential — now in the schema and minted; the elevated step above is what remains |
 >

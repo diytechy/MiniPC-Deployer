@@ -23,6 +23,18 @@
 #   {$WALL_HOST} {$WALL_PORT} {$PANEL_IP} {$PANEL_USER_SUB}
 
 {
+    # WHERE rate_limit SITS IN THE CHAIN, and it is the whole point of the
+    # directive. `rate_limit` is a plugin handler, so it has no place in the
+    # built-in directive order and would otherwise run AFTER basic_auth - i.e.
+    # only for callers who already authenticated, which is precisely backwards
+    # for a brute-force guard. Before, not after.
+    #
+    # IF CADDY REFUSES TO LOAD NAMING THIS LINE, the directive was renamed;
+    # `basic_auth` is the 2.7+ spelling and `basicauth` the old alias. Validate
+    # with `caddy validate` before reloading - a bad global block takes down
+    # every site at once, which is the failure this file already documents.
+    order rate_limit before basic_auth
+
     # ACME account email for public certs (Let's Encrypt / ZeroSSL).
     email {$ACME_EMAIL}
 
@@ -104,14 +116,74 @@
 # ── shared snippets: one basic_auth guard per single-user service ─────────────
 # Caddy resolves {$VAR} at config-load, so a single (protect) snippet can't carry
 # two different credential pairs; give each guarded host its own snippet.
+#
+# WHY THE PREFIX NAMES THE SITE AND NOT THE SERVER (the Owner asked, 2026-08-29:
+# "is DNS_BASICAUTH_USER used for caddy?"). Yes - BOTH pairs are Caddy's own
+# basic_auth, and neither is the credential of the thing behind it. The prefix
+# names WHICH DOOR the pair opens, because there are two independent pairs and
+# they have to stay distinguishable. Behind each one sits a SECOND, different
+# credential that Caddy knows nothing about:
+#
+#   actual.<domain>  Caddy basic_auth ->  Actual's own server password
+#                    (ACTUAL_BASICAUTH_*)  (FinanceActualPassword). Actual has no
+#                                          concept of a username, which is why the
+#                                          username field belongs to the BROWSER
+#                                          dialog and not to Actual.
+#   dns.<domain>     Caddy basic_auth ->  Technitium's admin login
+#                    (DNS_BASICAUTH_*)     (TechnitiumAdminPassword)
+#
 (protect_actual) {
     basic_auth {
         {$ACTUAL_BASICAUTH_USER} {$ACTUAL_BASICAUTH_HASH}
     }
+    import throttle
 }
 (protect_dns) {
     basic_auth {
         {$DNS_BASICAUTH_USER} {$DNS_BASICAUTH_HASH}
+    }
+    import throttle
+}
+
+# -- the throttle, and an honest account of what it does and does not buy ------
+# ADDED 2026-08-29 (the Owner). Caddy's standard build ships no rate limiter, so
+# this needs the caddy-ratelimit plugin compiled in - see stack/caddy/Dockerfile,
+# which proves the module is present at BUILD time rather than discovering it is
+# missing when Caddy refuses to load this block.
+#
+# 120 EVENTS A MINUTE IS NOT A BRUTE-FORCE LIMIT AND IS NOT PRETENDING TO BE.
+# basic_auth guards the whole site, so EVERY request carries an auth attempt: one
+# page load of Actual is dozens of them. A limit tight enough to stop guessing
+# would break the app for the person who knows the password. What this stops is
+# flooding and scraping; what stops GUESSING is fail2ban, which keys on 401s
+# specifically and bans at the firewall, and the remote_ip gate below, which takes
+# these two hosts off the internet altogether. Three layers, three jobs - and this
+# is the only one of the three that still applies to a caller already on the LAN.
+#
+# key {remote_host} is the REAL peer address, matching the remote_ip discipline
+# below. It must never become a header-derived value.
+(throttle) {
+    rate_limit {
+        zone per_ip {
+            key    {remote_host}
+            events 120
+            window 1m
+        }
+    }
+}
+
+# -- the access log fail2ban reads ---------------------------------------------
+# JSON, to a bind-mounted path the HOST can read (docker-compose.yml mounts
+# /var/log/caddy). The fail2ban filter keys on status 401 plus request.remote_ip.
+# Only the guarded sites import this: an access log of every kiosk asset would
+# bury the handful of lines that matter.
+(access_log) {
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10MiB
+            roll_keep 5
+        }
+        format json
     }
 }
 
@@ -241,19 +313,61 @@
 # ── actual.<domain> — Actual Budget (single-user; KEEP basic_auth) ─────────────
 {$ACTUAL_HOST} {
     import acme_cloudflare
-    import protect_actual
+    import access_log
     encode zstd gzip
-    reverse_proxy actual:5006
+
+    # LAN/VPN ONLY (the Owner, 2026-08-29: "ideally actual only answers from the
+    # local network or vpn"). The router forwards :80/:443 to this box, so before
+    # this block Actual answered an unlimited-guess basic_auth prompt to the whole
+    # internet - in front of budget data and, once linked, a SimpleFIN bank-sync
+    # credential.
+    #
+    # THIS DOES NOT COST A CERTIFICATE, which is what makes it safe to do:
+    # issuance is dns-01 through Cloudflare, so Let's Encrypt never needs to reach
+    # this box. The kiosk site has been LAN-only WITH a public cert since OI-12;
+    # this is the same arrangement, one host over.
+    #
+    # remote_ip, NEVER client_ip - the same rule the wall block states at length.
+    # client_ip trusts X-Forwarded-For and would hand the allow-list to anyone
+    # willing to forge a header. Caddy is the edge here; remote_ip is the truth.
+    #
+    # LAN_CIDR defaults to `private_ranges` (every RFC1918 block), which is the
+    # honest expression of "LAN or VPN, not the internet" and will cover a
+    # WireGuard subnet on the day D5 lands without another edit. Narrowing it
+    # answers a DIFFERENT question - which devices ON the LAN - and basic_auth is
+    # what answers that one.
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        import protect_actual
+        reverse_proxy actual:5006
+    }
+    # A WAN caller is refused BEFORE basic_auth, so it is never even told there is
+    # a prompt here. A second `handle` rather than a bare `respond`, so the mutual
+    # exclusion cannot depend on directive-ordering subtleties.
+    handle {
+        respond "actual: LAN only" 403
+    }
 }
 
 # ── dns.<domain> — Technitium web console (single-admin; KEEP basic_auth) ──────
 # Technitium binds :5380 on the host (host-network); proxy to the host gateway.
 dns.{$DOMAIN} {
     import acme_cloudflare
-    import protect_dns
+    import access_log
     encode zstd gzip
-    # host.docker.internal → the host where Technitium's :5380 lives.
-    reverse_proxy host.docker.internal:5380
+
+    # LAN/VPN ONLY, for the same reasons as actual.<domain> above - and arguably
+    # more so: this console can rewrite every name the household resolves.
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        import protect_dns
+        # Technitium binds :5380 on the HOST (host-network), so this crosses back
+        # out of the bridge rather than naming a compose service.
+        reverse_proxy host.docker.internal:5380
+    }
+    handle {
+        respond "dns console: LAN only" 403
+    }
 }
 
 # ── main-box services (BlueMap / Minecraft map etc.) — COMMENTED, opt-in ───────

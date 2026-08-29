@@ -92,6 +92,9 @@ services:
       ACTUAL_BASICAUTH_HASH: ${ACTUAL_BASICAUTH_HASH}
       DNS_BASICAUTH_USER: ${DNS_BASICAUTH_USER}
       DNS_BASICAUTH_HASH: ${DNS_BASICAUTH_HASH}
+      # Who may reach those two hosts AT ALL - the remote_ip matcher in front
+      # of the basic_auth. Defaults to `private_ranges` in .env.example.
+      LAN_CIDR: ${LAN_CIDR}
       ACME_EMAIL: ${ACME_EMAIL}
       # THE dns-01 CREDENTIAL. The Caddyfile's global `acme_dns cloudflare`
       # reads it; without it every issuance falls back to http-01 and needs a
@@ -106,6 +109,12 @@ services:
       # it, nothing writes it — the IMAGE populates the directory. Ships empty
       # (README only) until the OfficeWallNaglight artifact contract lands.
       - ./wall-shell:/srv/wall-shell:ro
+      # THE ACCESS LOG fail2ban READS, and it is a BIND MOUNT rather than a
+      # named volume on purpose: fail2ban runs on the HOST and has to be able to
+      # tail the file. Only the two guarded sites log here (Caddyfile's
+      # (access_log) snippet), so this stays small and the 401s are not buried
+      # under every kiosk asset request.
+      - /var/log/caddy:/var/log/caddy
       - caddy_data:/data       # certs + ACME account — persist so re-issue isn't needed on reboot
       - caddy_config:/config
     extra_hosts:

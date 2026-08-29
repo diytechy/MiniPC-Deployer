@@ -72,8 +72,30 @@ FROM caddy:${CADDY_VERSION}-builder AS builder
 # is the part that is not optional. The cost of getting it wrong is not "no
 # certificates" - it is no Caddy at all, and every web surface with it.
 ARG CLOUDFLARE_PLUGIN_VERSION=v0.2.4
+
+# THE SECOND PLUGIN, added 2026-08-29 (the Owner). basic_auth in front of
+# actual.<domain> and dns.<domain> is an ONLINE guessing target: the router
+# forwards :80/:443 (HOMELAB_TOPOLOGY.md), Caddy ships no rate limiter in the
+# standard build, and the box had no fail2ban. Unlimited attempts against a
+# browser prompt is not something bcrypt's cost factor fixes - cost 12 slows an
+# OFFLINE crack of a stolen hash, not an online one against a live prompt.
+#
+# v0.1.0 IS THE ONLY TAG THIS MODULE HAS. `go list -m --versions` returns
+# exactly one, so the pin is not a choice between releases - it is the release.
+# Said out loud because "pinned" reads like "reviewed the changelog", and here
+# there is no changelog to review. The build-time proof below is what makes it
+# safe to ship: an incompatible plugin fails the IMAGE, not a renewal at 03:00,
+# which is exactly the lesson the CLOUDFLARE_PLUGIN_VERSION comment above
+# already paid for once.
+#
+# BELT AND BRACES BY DESIGN. This throttles; the Caddyfile remote_ip gate on
+# those two hosts REMOVES them from the internet; fail2ban bans at the firewall.
+# The rate limiter is the one of the three that still helps against a caller
+# who is already inside the allow-list.
+ARG RATELIMIT_PLUGIN_VERSION=v0.1.0
 RUN xcaddy build \
-    --with github.com/caddy-dns/cloudflare@${CLOUDFLARE_PLUGIN_VERSION}
+    --with github.com/caddy-dns/cloudflare@${CLOUDFLARE_PLUGIN_VERSION} \
+    --with github.com/mholt/caddy-ratelimit@${RATELIMIT_PLUGIN_VERSION}
 
 # ── the runtime ──────────────────────────────────────────────────────────────
 # Same base the stack ran before, so nothing else about the container changes:
@@ -88,3 +110,10 @@ COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 # error in the Caddyfile.
 RUN caddy list-modules | grep -q '^dns.providers.cloudflare$' \
     || (echo "FATAL: the cloudflare DNS provider is not in this binary" >&2; exit 1)
+
+# Same proof for the rate limiter, and for the same reason: without it a stock
+# Caddy ships, the Caddyfile `rate_limit` block becomes an unknown directive,
+# and Caddy refuses to load its config at all - taking every HTTPS surface with
+# it. Fail here instead, where it costs a build.
+RUN caddy list-modules | grep -q '^http.handlers.rate_limit$' \
+    || (echo "FATAL: the rate_limit handler is not in this binary" >&2; exit 1)

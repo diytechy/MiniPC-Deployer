@@ -1,0 +1,63 @@
+# caddy-guarded.local — ban repeated refusals at the password-guarded Caddy sites.
+#
+# INSTALLED BY firstboot.sh into /etc/fail2ban/jail.d/, which substitutes
+# @LAN_IP@ from .env. This file is a TEMPLATE and carries no site addresses:
+# MiniPC-Deployer is the image repo and a real LAN address in it would be a
+# privacy finding as well as a lie on anyone else's network.
+#
+# THE ONE THING THAT MAKES THIS WORK, AND THE REASON A DEFAULT JAIL WOULD NOT:
+# chain = DOCKER-USER.
+#
+# fail2ban's stock actions insert into the INPUT chain. Traffic to a PUBLISHED
+# CONTAINER PORT never traverses INPUT: docker DNATs it in nat/PREROUTING and it
+# leaves through FORWARD. A jail on INPUT therefore bans nothing here, reports
+# healthy, and shows a growing ban count while every banned address keeps loading
+# the site. Measured on the hub before this file was written - PREROUTING carries
+# the DOCKER target, and DOCKER-USER exists with one reference - and then proven
+# after: a banned address got connection-refused on :443 while its SSH session to
+# the same box stayed up, because SSH is the INPUT path and this is not.
+#
+# DOCKER-USER is the chain docker itself guarantees is consulted FIRST inside
+# FORWARD, and that docker will not rewrite when it restarts or when a container
+# is recreated. That is why it exists, and why it is the correct hook rather than
+# a clever one.
+#
+# WHAT COUNTS AS A FAILURE is in filter.d/caddy-guarded.conf: a 401 (wrong
+# password, from inside the LAN gate) or a 403 (refused BY the LAN gate, i.e.
+# from the internet). Read that file's header before changing either.
+
+[caddy-guarded]
+enabled  = true
+backend  = auto
+logpath  = /var/log/caddy/access.log
+filter   = caddy-guarded
+port     = http,https
+protocol = tcp
+
+# THE BAN GOES IN THE FORWARD PATH, NOT INPUT. See the header.
+# allports rather than multiport: the guarded sites answer on 443, but a scanner
+# that gets banned for probing them has no business reaching any other published
+# port either, and enumerating ports here would be a second thing to keep in step
+# with docker-compose.yml.
+action = iptables-allports[name=caddy-guarded, chain=DOCKER-USER, protocol=tcp]
+
+# 15 in 10 minutes. Deliberately not tighter: basic_auth guards the whole site,
+# so a browser holding one stale saved credential can emit several 401s from a
+# single page load, and locking the Owner out of their own budget is a worse
+# outcome than a slow attacker. The RATE LIMITER (120/min per IP, in the
+# Caddyfile) is what blunts speed; this is what stops persistence.
+maxretry = 15
+findtime = 10m
+bantime  = 1h
+
+# NEVER BAN THE BOX OR ITS OWN CONTAINERS. The docker bridge subnets are where
+# every internal probe comes from - uptime-kuma, healthchecks, verify-hub - and a
+# self-ban would present as "the stack broke" with nothing pointing here.
+# 172.16.0.0/12 is docker's whole default address pool rather than the two /16s
+# in use today, so adding a compose project cannot silently make this wrong.
+#
+# THE LAN IS DELIBERATELY NOT IGNORED. Now that the remote_ip gate has taken the
+# internet out of the picture, a 401 can only come from a device already on the
+# LAN - a compromised laptop, a guest, an IoT thing. That is precisely the caller
+# this jail is left to catch, and ignoring the LAN would make it inert.
+ignoreip = 127.0.0.1/8 ::1 172.16.0.0/12 @LAN_IP@

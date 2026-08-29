@@ -82,6 +82,7 @@ apt-transport-https
 openssh-server
 cockpit               # LAN web console (terminal/logs/updates/reboot)
 unattended-upgrades   # hands-off OS security patching
+fail2ban              # bans repeated Caddy 401s at the firewall (the Owner, 2026-08-29)
 
 # ── remote reimage without media (REMOTE_MANAGEMENT.md Option E) ────────────
 # SO A REIMAGE NEVER AGAIN NEEDS SOMEONE STANDING AT THE BOX. Option E loads the

@@ -1144,6 +1144,47 @@ install -m 0755 "$STACK_DIR/tracker/tracker-defs-guard.sh" /usr/local/sbin/homeh
 install -m 0644 "$STACK_DIR/tracker/homehub-tracker-defs-health.service" /etc/systemd/system/homehub-tracker-defs-health.service
 install -m 0644 "$STACK_DIR/tracker/homehub-tracker-defs-health.timer"   /etc/systemd/system/homehub-tracker-defs-health.timer
 
+# -- fail2ban for the two password-guarded Caddy sites (the Owner, 2026-08-29) --
+#
+# actual.<domain> and dns.<domain> are the only surfaces on this box whose gate
+# is a password rather than Google sign-in, and the router forwards :80/:443 to
+# Caddy. Three layers now sit in front of them, and this is the third:
+#
+#   1. the Caddyfile remote_ip gate  - takes them off the internet entirely
+#   2. the caddy-ratelimit plugin    - 120 requests/min/IP, blunts speed
+#   3. this                          - bans persistence, at the FIREWALL
+#
+# FAIL-OPEN, like every other optional step in this file: no fail2ban binary, no
+# config directory, or a failed reload leaves the box exactly as it would have
+# been. The two layers above do not depend on it.
+#
+# THE @LAN_IP@ SUBSTITUTION is why this is not a plain `install`. The jail must
+# never ban the box itself, and MiniPC-Deployer carries no site addresses - so
+# the template ships a token and the address comes from .env at install time.
+if command -v fail2ban-server >/dev/null 2>&1 && [ -d "$STACK_DIR/caddy/fail2ban" ]; then
+    install -d -m 0755 /var/log/caddy
+    install -m 0644 "$STACK_DIR/caddy/fail2ban/caddy-guarded.filter.conf" \
+        /etc/fail2ban/filter.d/caddy-guarded.conf
+    _f2b_lan="$(sed -n 's/^LAN_IP=//p' "$STACK_DIR/.env" | tail -n1 | tr -d "\"'")"
+    if [ -n "$_f2b_lan" ]; then
+        sed "s|@LAN_IP@|$_f2b_lan|" "$STACK_DIR/caddy/fail2ban/caddy-guarded.jail.local" \
+            > /etc/fail2ban/jail.d/caddy-guarded.local
+        chmod 0644 /etc/fail2ban/jail.d/caddy-guarded.local
+        systemctl enable --now fail2ban >/dev/null 2>&1 || true
+        if systemctl reload-or-restart fail2ban >/dev/null 2>&1; then
+            log "  fail2ban: caddy-guarded jail installed (bans in DOCKER-USER, not INPUT)"
+        else
+            log "  WARNING: fail2ban would not reload - the caddy-guarded jail is NOT active"
+        fi
+    else
+        log "  WARNING: LAN_IP is empty in .env - the caddy-guarded jail was NOT installed,"
+        log "    because a jail that cannot exempt this box could ban it out of its own stack."
+    fi
+else
+    log "  fail2ban not installed - the caddy-guarded jail is skipped (the remote_ip gate"
+    log "    and the rate limiter are unaffected; both live in the Caddyfile)."
+fi
+
 # ── the A19 GATE's feed configuration, and only ever a gate's ────────────────
 # Both drive lanes take their feed settings from backup.env. A production hub
 # gets that file from the household materialiser (late-command 4b); a SIM hub

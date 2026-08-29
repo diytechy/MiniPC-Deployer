@@ -26,6 +26,16 @@ jobs:
         with:
           python-version: "3.x"
 
+      # The shell suites under stack/ are driven by tests/test_hermetic_shell_suites.py
+      # and need real POSIX tools. They SKIP when a tool is missing, so an
+      # unstated dependency here would look like a green run that tested
+      # nothing - install them explicitly rather than trusting the runner image.
+      - name: Install the tools the hermetic shell suites need
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bash tar gzip zstd rsync coreutils gnupg gawk findutils util-linux
+          for t in bash tar gzip zstd rsync sha256sum gpg awk find flock; do command -v "$t" >/dev/null || { echo "missing $t"; exit 1; }; done
+
       # Edit to your real dependencies. The reference harness uses ruff + pytest
       # (+ pytest-cov); trace.py and gen_arch_map.py are stdlib-only.
       - name: Install tooling

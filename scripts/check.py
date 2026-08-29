@@ -142,9 +142,14 @@ def steps(coverage, tier, gate, phase=None):
             "--cov-fail-under=" + str(coverage),
         ]
         pytest_needs = ("pytest", "pytest_cov")
+    # The unit-test step's own command: same interpreter and same marker as the
+    # reference pytest_cmd, without the coverage flags (see the step below).
+    unit_cmd = [sys.executable, "-m", "pytest", "-q"]
     marker = TIERS.get(tier)
     if marker:
         pytest_cmd += ["-m", marker]
+    if marker:
+        unit_cmd += ["-m", marker]
     # The traceability step only runs at G2/G3, where placeholder rows must be
     # gone, so --no-placeholders is always on here (a fresh scaffold is exempt
     # only because nothing past G1 runs against it). --html also regenerates the
@@ -172,6 +177,36 @@ def steps(coverage, tier, gate, phase=None):
             "config-validate",
             (),
             [sys.executable, str(_SCRIPTS / "validate_config.py")],
+            {"G1", "G2", "G3"},
+            "product",
+        ),
+        # THE REPO HAS HAD A tests/ DIRECTORY AND A pytest.ini ALL ALONG, AND
+        # NOTHING RAN THEM. `pytest_cmd` is assembled above and was never in this
+        # list — the kit's reference plan was replaced by `config-validate` when
+        # this became a config/infra repo, and the pytest step went with it. So
+        # `tests/test_wall_media_manifest.py` has been in the tree, green or not,
+        # unexecuted by any gate. Found 2026-08-29 while wiring the hermetic
+        # shell suites into CI.
+        #
+        # It is a PRODUCT check and runs from G1, because in this repo the tests
+        # that matter are about the deploy stack's own behaviour: the shell
+        # suites under stack/ are driven from
+        # tests/test_hermetic_shell_suites.py, and they are the only automated
+        # proof of the backup, restore, tracker-guard and IceDrive contracts that
+        # does not need a VM.
+        #
+        # requires=("pytest",) so a runner without it is SKIP(missing) and, outside
+        # --lenient, fails — rather than passing silently, which is the exact
+        # shape this step exists to end.
+        # NO COVERAGE GATE ON THIS ONE, deliberately. The `full` tier normally
+        # adds --cov against SRC and a threshold; this repo has no product
+        # Python (that is why the arch-map step was dropped), so a coverage
+        # percentage here would measure the test helpers against themselves. The
+        # repo README already warns about quoting counts that measure nothing.
+        (
+            "unit-tests",
+            ("pytest",),
+            unit_cmd,
             {"G1", "G2", "G3"},
             "product",
         ),

@@ -31,6 +31,10 @@
 #   R12 a volume that ALREADY existed and is non-empty is left alone
 #   R13 a cleanup that failed once leaves a durable note, so the next boot
 #       reports a PARTIAL volume instead of "not empty, not a fresh install"
+#   R14 technitium restores its ZONES and loses its auth.config - the archived
+#       admin password must never win over the one in .env (D4, 2026-08-29)
+#   R15 the SHIPPED DEFAULT_TABLE carries all five sets; every other case passes
+#       an explicit table, so the default is the one thing they cannot prove
 #
 # Usage: bash restore-volumes.test.sh [--keep-tmp]
 set -uo pipefail
@@ -110,6 +114,7 @@ caddy=caddy_data
 tracker=tracker_data
 actual=actual_data
 uptime-kuma=uptimekuma_data
+technitium=technitium_config
 MAP
 
 TABLE='caddy:caddy_data:caddy tracker:tracker_data:tracker actual:actual_data:actual uptimekuma:uptimekuma_data:uptime-kuma'
@@ -125,6 +130,11 @@ mkdir -p "$SRC/caddy/certificates"; printf 'cert-material\n' >"$SRC/caddy/certif
 printf -- '---\ncategory: X\nitems:\n  - id: a\n---\n' >"$SRC/tracker/defs.md"
 printf 'budget-db\n' >"$SRC/actual/budget.sqlite"
 printf 'kuma-db\n' >"$SRC/uptimekuma/kuma.db"
+# technitium: a HAND-MADE zone (the thing worth restoring) beside auth.config
+# (the thing that must not come back). R14 is the pair of those two facts.
+mkdir -p "$SRC/technitium/zones"
+printf 'hand-made.example A 10.1.2.3\n' >"$SRC/technitium/zones/diyt.win.zone"
+printf 'ARCHIVED-ADMIN-PASSWORD-HASH\n' >"$SRC/technitium/auth.config"
 cat >"$TMP/backup.env" <<ENVF
 BACKUP_TARGET=$DRIVE
 BACKUP_STAGING=$TMP/staging
@@ -137,7 +147,8 @@ INGEST_SOURCES=""
 BACKUP_SOURCES="caddy=path:$SRC/caddy
 tracker=path:$SRC/tracker
 actual=path:$SRC/actual
-uptimekuma=path:$SRC/uptimekuma"
+uptimekuma=path:$SRC/uptimekuma
+technitium=path:$SRC/technitium"
 ENVF
 bash "$BACKUP_SH" --config "$TMP/backup.env" >"$TMP/backup.out" 2>&1
 rc=$?
@@ -291,6 +302,57 @@ case "$(logline tracker)" in
     ok\ *) pass "R13 and the other sets were unaffected" ;;
     *)     fail "R13 tracker: $(logline tracker)" ;;
 esac
+echo
+echo "== R14: technitium restores its zones and LOSES auth.config =="
+# The set was deliberately absent until 2026-08-29 because a restored
+# auth.config resurrects the archived admin password and .env's is ignored -
+# measured on the box, see post_restore() in the SUT. The restore is only safe
+# because that one file is dropped, so both halves are asserted: the zone comes
+# back, and the credential does not.
+rm -rf "$VOLROOT"/stack_*
+rc="$(run_sut 'technitium:technitium_config:technitium')"
+case "$(logline technitium)" in
+    ok\ *) pass "R14 the technitium set restored" ;;
+    *)     fail "R14 technitium: $(logline technitium)"; cat "$TMP/result.log" ;;
+esac
+if [ "$(cat "$VOLROOT/stack_technitium_config/zones/diyt.win.zone" 2>/dev/null)" = 'hand-made.example A 10.1.2.3' ]; then
+    pass "R14 the hand-made zone came back byte-for-byte"
+else
+    fail "R14 zone contents: $(cat "$VOLROOT/stack_technitium_config/zones/diyt.win.zone" 2>/dev/null)"
+fi
+if [ -e "$VOLROOT/stack_technitium_config/auth.config" ]; then
+    fail "R14 auth.config SURVIVED the restore - the archived admin password would win over .env"
+else
+    pass "R14 auth.config was dropped, so Technitium re-seeds the admin from .env"
+fi
+if grep -q '^note technitium .*auth.config' "$TMP/result.log"; then
+    pass "R14 and the log says the file was dropped rather than implying a whole restore"
+else
+    fail "R14 auth.config was dropped SILENTLY"
+fi
+
+echo
+echo "== R15: the BUILT-IN table carries technitium, not just the test's =="
+# Every other case passes an explicit table, so the shipped DEFAULT_TABLE is the
+# one thing they cannot prove. This runs the SUT with no table argument at all.
+rm -rf "$VOLROOT"/stack_*
+: >"$TMP/result.log"
+rc="$(MOCK_VOLROOT="$VOLROOT" PATH="$MOCKBIN:$PATH" STACK_DIR="$STACK" HOMEHUB_RESTORE_FAILDIR="$FAILDIR" \
+      bash "$SUT" "$DRIVE" "$TMP/result.log" >"$TMP/sut.out" 2>&1; echo $?)"
+case "$(logline technitium)" in
+    ok\ *) pass "R15 the default table restored technitium with no table argument" ;;
+    *)     fail "R15 technitium: $(logline technitium)"; cat "$TMP/result.log" ;;
+esac
+for s_ in caddy tracker actual uptimekuma; do
+    case "$(logline "$s_")" in
+        ok\ *) : ;;
+        *)     fail "R15 the default table lost $s_: $(logline "$s_")" ;;
+    esac
+done
+[ "$(grep -c '^ok ' "$TMP/result.log")" = 5 ] \
+    && pass "R15 all five sets in the default table restored" \
+    || fail "R15 default table restored $(grep -c '^ok ' "$TMP/result.log") of 5"
+
 echo
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

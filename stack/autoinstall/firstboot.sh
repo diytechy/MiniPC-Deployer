@@ -866,10 +866,79 @@ rm -f "$__acme_flag" || true
             log "  $BACKUP_TARGET appeared after ${__bw}s"
         fi
     fi
+    # ── C32: MOUNT IT OURSELVES, BECAUSE ON A FRESH INSTALL NOBODY ELSE HAS ──
+    #
+    # THIS STEP COULD NEVER FIRE ON THE INSTALL IT WAS WRITTEN FOR, and that was
+    # measured on 2026-08-29 rather than reasoned about. The fstab entry for the
+    # backup drive is written by provision-mounts, which runs LATER IN THIS SAME
+    # SCRIPT:
+    #
+    #     00:03:24  /etc/homehub-samba/library-mounts.fstab installed (late-command)
+    #     00:04:52  firstboot starts
+    #     ~00:05    THIS STEP runs -> no fstab entry, so the wait above is
+    #               skipped entirely and the mountpoint check fails -> exit 0
+    #     00:12:46  [provision-mounts] fstab += /mnt/backup-drive
+    #     00:12:46  [provision-mounts] mounted /mnt/backup-drive
+    #
+    # The absence of any "waiting up to 60s" line in that boot's journal is the
+    # proof: the wait is gated on fstab naming the mountpoint, and at 00:05 it
+    # does not. So a step whose entire purpose is the FRESH install only ever
+    # worked on a box that had already been installed once, and C22 - five
+    # certificates re-issued, 122 rate-limit refusals, the apex cert landing
+    # 2h40m after boot - was never prevented, only survived.
+    #
+    # THE FIX IS SELF-CONTAINED, and deliberately not a reordering. Moving
+    # provision-mounts earlier would drag the library tree creation and the
+    # Samba provisioning with it, for one consumer. Instead: read the mount SPEC
+    # from the same generated fragment provision-mounts will use - it has been on
+    # disk since before this script started - and mount it ourselves, READ-ONLY,
+    # for the duration of the restore.
+    #
+    # READ-ONLY IS NOT DECORATION. This step only ever READS the backup drive,
+    # and it runs before anything else on the box has looked at that disk. A
+    # bug here that wrote to it would damage the one copy the restore exists to
+    # use, so the kernel is told the write cannot happen at all.
+    #
+    # Everything below stays FAIL-OPEN: any failure leaves things exactly as
+    # they were and lets caddy issue normally.
+    __src="$BACKUP_TARGET"
+    __tmpmnt=""
+    # Set BEFORE the first mount attempt so that every later `exit 0` - and
+    # there are many - unmounts. A subshell gets its own EXIT trap.
+    trap 'if [ -n "${__tmpmnt:-}" ]; then umount "$__tmpmnt" 2>/dev/null || log "  WARN: could not unmount $__tmpmnt"; rmdir "$__tmpmnt" 2>/dev/null || true; fi' EXIT
+    if ! mountpoint -q "$BACKUP_TARGET"; then
+        __frag=/etc/homehub-samba/library-mounts.fstab
+        # Field 1 is the spec (LABEL=PriBackup), field 3 the fstype. `mount`
+        # resolves LABEL=/UUID= itself, so nothing here has to know how.
+        __spec="$(awk -v t="$BACKUP_TARGET" '$0 !~ /^[[:space:]]*#/ && $2 == t { print $1; exit }' "$__frag" 2>/dev/null || true)"
+        __fstype="$(awk -v t="$BACKUP_TARGET" '$0 !~ /^[[:space:]]*#/ && $2 == t { print $3; exit }' "$__frag" 2>/dev/null || true)"
+        if [ -n "$__spec" ]; then
+            __tmpmnt="$(mktemp -d /run/homehub-acme-src.XXXXXX 2>/dev/null)" || __tmpmnt=""
+            if [ -n "$__tmpmnt" ]; then
+                # RETRY, because this is exactly where a slow USB enclosure
+                # bites: on a fresh install nothing has waited for this disk,
+                # and `nofail` means nothing ever will. Same 60s budget as the
+                # fstab path above, for the same reason.
+                __mw=0
+                until mount -t "${__fstype:-auto}" -o ro "$__spec" "$__tmpmnt" 2>/dev/null; do
+                    if [ "$__mw" -ge 60 ]; then break; fi
+                    [ "$__mw" -eq 0 ] && log "  $BACKUP_TARGET is not mounted and fstab does not list it yet (C32) - waiting up to 60s for $__spec…"
+                    sleep 2; __mw=$((__mw + 2))
+                done
+                if mountpoint -q "$__tmpmnt"; then
+                    log "  mounted $__spec READ-ONLY at $__tmpmnt for the restore${__mw:+ (after ${__mw}s)}"
+                    __src="$__tmpmnt"
+                else
+                    rmdir "$__tmpmnt" 2>/dev/null || true
+                    __tmpmnt=""
+                fi
+            fi
+        fi
+    fi
     # mountpoint, NOT -d: the directory exists whether or not the drive is on it,
     # and an unmounted empty dir would read as "no runs archived".
-    mountpoint -q "$BACKUP_TARGET" || exit 0
-    run="$(newest_run_with_set "$BACKUP_TARGET" caddy)" || exit 0
+    mountpoint -q "$__src" || exit 0
+    run="$(newest_run_with_set "$__src" caddy)" || exit 0
     [ -n "$run" ] || exit 0
     # COMPOSE creates the volume, not us: that way it gets the project-prefixed
     # name and the labels compose looks for later, instead of a hand-built name
@@ -889,6 +958,8 @@ if [ -e "$__acme_flag" ]; then
     rm -f "$__acme_flag" || true
 else
     log "no caddy_data restore (no drive, no archived 'caddy' set, or the volume is not empty)"
+    log "  since C32 this step also MOUNTS the backup drive itself when fstab does not"
+    log "  list it yet, so 'no drive' now means the disk was genuinely not there."
     log "  caddy will obtain certificates normally. Let's Encrypt allows 5 per exact"
     log "  identifier set per 168h and a reimage spends one of each, so expect the"
     log "  last hostname to take a while if this box has been reinstalled recently."

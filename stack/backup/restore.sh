@@ -64,9 +64,12 @@ bail() { local c="$1"; shift; local m; for m in "$@"; do log "ERROR: $m"; done; 
 RUN_DIR=""; SET=""; TARGET=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --run) RUN_DIR="$2"; shift 2 ;;
-        --set) SET="$2"; shift 2 ;;
-        --target) TARGET="$2"; shift 2 ;;
+        # `$# -ge 2` FIRST: an option in final position expands an unset $2 and
+        # dies on `set -u` with an unbound-variable message, instead of the
+        # documented usage exit this tool's callers switch on.
+        --run) [ $# -ge 2 ] || bail 2 "--run needs a value"; RUN_DIR="$2"; shift 2 ;;
+        --set) [ $# -ge 2 ] || bail 2 "--set needs a value"; SET="$2"; shift 2 ;;
+        --target) [ $# -ge 2 ] || bail 2 "--target needs a value"; TARGET="$2"; shift 2 ;;
         -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
         *) bail 2 "unknown arg: $1" ;;
     esac
@@ -84,6 +87,11 @@ FTAB="$RUN_DIR/$SET.files.tsv"
 #
 # Measured, not reasoned about: the hermetic suite's P9 removes the log from a
 # plan directory and asserts 3. It got 5 until this check moved up here.
+# THE DIRECTORY MUST EXIST BEFORE ITS NAME MEANS ANYTHING. Classifying on the
+# basename alone answers 3 ("holds no copy, and that is recorded") for a path
+# that is simply mistyped or gone, which is 5 ("unusable run directory").
+# (Adversarial review, 2026-08-29.)
+[ -d "$RUN_DIR" ] || bail 5 "$RUN_DIR is not a directory — check the path"
 case "$(basename "$RUN_DIR")" in
     plan_*)
         prev="$(newest_run_with_set "$(dirname "$RUN_DIR")" "$SET")"
@@ -209,6 +217,45 @@ if [ -n "${m_bytes:-}" ] && [ "$a_bytes" != "$m_bytes" ]; then
     warn "BYTE MISMATCH archive vs manifest: archive holds $a_bytes byte(s), the manifest recorded $m_bytes"
     _bad_count=1
 fi
+
+
+# M: MEMBERSHIP, NOT JUST ARITHMETIC — and this is the witness the counts cannot
+# be. Three equal numbers do not mean three equal sets. A table that lists one
+# path TWICE and omits another has the same row count, the same archive count and
+# the same manifest count as a correct one; the duplicated file is verified
+# twice, the missing one is never verified at all, and the run prints
+# RESTORE OK. (Adversarial review, 2026-08-29.)
+#
+# `tar -tv`'s name starts at field 6 and a name may contain spaces, so it is
+# rebuilt from field 6 onward rather than taken as `$6`. The leading `./` is
+# stripped because backup.sh tars with `-C "$stage" .` while the table records
+# paths relative to $stage.
+_mt="$(mktemp -d)" || bail 1 "mktemp failed"
+_list 2>/dev/null | awk '$1 ~ /^-/ {
+        name = $6; for (i = 7; i <= NF; i++) name = name " " $i
+        sub(/^\.\//, "", name); print name
+    }' | LC_ALL=C sort >"$_mt/archive" || true
+awk -F'\t' 'NR>1 && NF>=4 { print $4 }' "$FTAB" | LC_ALL=C sort >"$_mt/table" || true
+_dupes="$(LC_ALL=C uniq -d <"$_mt/table" | head -5)"
+if [ -n "$_dupes" ]; then
+    warn "DUPLICATE ROWS in $SET.files.tsv: $(printf '%s' "$_dupes" | tr '\n' ' ')"
+    warn "  A repeated path is verified twice and hides a path that is verified never — the counts still agree."
+    _bad_count=1
+fi
+_only_arch="$(LC_ALL=C comm -23 "$_mt/archive" "$_mt/table" | head -5)"
+_only_tab="$(LC_ALL=C comm -13 "$_mt/archive" "$_mt/table" | head -5)"
+if [ -n "$_only_arch" ]; then
+    warn "IN THE ARCHIVE BUT NOT IN THE TABLE: $(printf '%s' "$_only_arch" | tr '\n' ' ')"
+    warn "  These were restored and never checked against a recorded hash."
+    _bad_count=1
+fi
+if [ -n "$_only_tab" ]; then
+    warn "IN THE TABLE BUT NOT IN THE ARCHIVE: $(printf '%s' "$_only_tab" | tr '\n' ' ')"
+    warn "  The table promises files the archive does not contain."
+    _bad_count=1
+fi
+[ -n "$_only_arch$_only_tab$_dupes" ] || log "membership witness: the archive's regular files and the table's paths are the same set"
+rm -rf "$_mt"
 
 # 4. verify EVERY file in the table against its recorded hash + size.
 bad=0; checked=0

@@ -22,6 +22,9 @@
 #       twelve of those are on the household's stick and must not read as damage
 #   P11 newest_run_with_set cannot return a plan directory
 #   P12 full-run retention keeps BACKUP_KEEP good runs and prunes the rest
+#   P13 two runs cannot share one run directory (mkdir -p accepted one)
+#   P14 a note that SPELLS the status field must not promote a failed run
+#   P15 RUN.json stays valid JSON whatever the run had to say
 #
 # Usage: bash plan-and-retention.test.sh [--keep-tmp]
 #   Exit 0 = every check passed. Any failure exits 1 and names the check.
@@ -122,22 +125,31 @@ rc="$(run_backup "$TMP/backup.env")"
 if [ "$rc" != 0 ]; then fail "P5 setup: full run exit=$rc"; tail -20 "$TMP/out.txt"; fi
 for i in 1 2 3 4 5; do run_backup "$TMP/backup.env" --plan >/dev/null; sleep 1; done
 N="$(count_dirs "$T4" 'plan_*')"
-if [ "$N" -le 3 ]; then pass "P4 five plan runs left $N plan director(ies) at BACKUP_PLAN_KEEP=2 (<= keep+1)"; else fail "P4 plan litter unbounded: $N directories"; fi
+# EXACTLY the budget, not budget+1. BACKUP_PLAN_KEEP is a TOTAL: the run doing
+# the pruning is one of the survivors, so it keeps KEEP-1 of the older ones.
+# The first cut kept KEEP older PLUS itself, which meant BACKUP_PLAN_KEEP=7 left
+# eight — a budget that quietly means something other than what it says.
+if [ "$N" = 2 ]; then pass "P4 five plan runs left exactly 2 at BACKUP_PLAN_KEEP=2 — the budget is a TOTAL"; else fail "P4 left $N plan director(ies), want exactly 2"; fi
 if [ "$(count_dirs "$T4" 'run_*')" = 1 ]; then pass "P5 the real run is untouched by plan retention"; else fail "P5 plan retention removed a run_* directory"; fi
 
 echo
 echo "== P6: a green nightly also tidies plan litter =="
-T6="$TMP/t6"; write_env "$T6" 7 1
+# The plan runs are made under a LOOSE budget so there is litter left for the
+# nightly to find; the nightly then runs under a tight one. Without the two
+# budgets this asserts nothing: a plan run that has already pruned itself down
+# to the budget leaves the nightly with nothing to do, which is correct
+# behaviour and an empty test.
+T6="$TMP/t6"; write_env "$T6" 7 9
 for i in 1 2 3; do run_backup "$TMP/backup.env" --plan >/dev/null; sleep 1; done
 before="$(count_dirs "$T6" 'plan_*')"
+write_env "$T6" 7 1
 rc="$(run_backup "$TMP/backup.env")"
 after="$(count_dirs "$T6" 'plan_*')"
-if [ "$rc" = 0 ] && [ "$after" -lt "$before" ] && [ "$after" -le 1 ]; then
+if [ "$rc" = 0 ] && [ "$before" = 3 ] && [ "$after" = 1 ]; then
     pass "P6 a full run pruned plan litter $before -> $after at BACKUP_PLAN_KEEP=1"
 else
-    fail "P6 full-run plan tidy: rc=$rc before=$before after=$after"
+    fail "P6 full-run plan tidy: rc=$rc before=$before after=$after (want 3 -> 1)"
 fi
-
 echo
 echo "== P7: 0 means different things for the two budgets, deliberately =="
 T7="$TMP/t7"; write_env "$T7" 7 0
@@ -196,6 +208,77 @@ if [ "$N" = 2 ]; then pass "P12 four runs at BACKUP_KEEP=2 left exactly 2"; else
 WITH="$(find "$T12" -maxdepth 1 -type d -name 'run_*' -exec test -e '{}/RUN.json' ';' -print | wc -l | tr -d ' ')"
 if [ "$WITH" = "$N" ]; then pass "P12 every surviving run holds a RUN.json"; else fail "P12 $WITH of $N survivors hold a RUN.json"; fi
 
+
+echo
+echo "== P13: two runs cannot share one run directory =="
+# `mkdir -p` accepts an existing directory, so two runs starting inside the same
+# UTC second would share one — one manifest overwriting the other, two sets of
+# archives interleaved, and both reporting success. The nightly timer plus a
+# hand-started run is exactly how that happens.
+T13="$TMP/t13"; write_env "$T13" 7 7
+# Pre-create the directory the next run will want, to the second.
+STAMP="$(date -u +%Y%m%d_%H%M%S)"
+mkdir -p "$T13/run_$STAMP"
+rc="$(run_backup "$TMP/backup.env")"
+if [ "$rc" != 0 ] && grep -q 'already exists' "$TMP/out.txt"; then
+    pass "P13 a colliding run directory is REFUSED, naming the collision"
+elif [ "$rc" = 0 ] && [ "$(find "$T13" -maxdepth 1 -type d -name "run_$STAMP" -exec test -e '{}/RUN.json' ';' -print | wc -l)" = 0 ]; then
+    pass "P13 the run took a different second and did not touch the pre-made directory"
+else
+    fail "P13 exit=$rc — a run may have adopted a directory it did not create"
+    tail -5 "$TMP/out.txt"
+fi
+
+echo
+echo "== P14: a note that looks like a status must not promote a failed run =="
+# retention classifies on RUN.json. A substring search over the whole file lets
+# free text in `note` — which carries rsync/tar error output — spell the status
+# field, so a FAILED run takes a good-run slot and evicts a real archive.
+T14="$TMP/t14"; write_env "$T14" 1 7
+mkdir -p "$T14/run_19700101_000000"
+printf '{\n  "run": "old",\n  "status": "failed",\n  "note": "rsync said: \\"status\\": \\"ok\\" was in the output"\n}\n' \
+    >"$T14/run_19700101_000000/RUN.json"
+rc="$(run_backup "$TMP/backup.env")"
+if [ "$rc" = 0 ]; then pass "P14 the run completed"; else fail "P14 exit=$rc"; tail -5 "$TMP/out.txt"; fi
+if grep -q '1 older good run' "$TMP/out.txt"; then
+    fail "P14 a FAILED run was classified as good because its note spelled the status field"
+else
+    pass "P14 the failed run stayed in the failed bucket — the status FIELD is what is read"
+fi
+
+echo
+echo "== P15: RUN.json stays valid JSON whatever the run had to say =="
+# `note` carries set names, paths and error text. A quote or a newline in it and
+# the file stops parsing — which loses the run's durable verdict.
+T15="$TMP/t15"; SRCQ="$TMP/src \"quoted\""; mkdir -p "$SRCQ"
+printf 'x\n' >"$SRCQ/f.txt"
+mkdir -p "$T15"
+{
+    echo "BACKUP_TARGET=$T15"
+    echo "BACKUP_STAGING=$TMP/staging"
+    echo "BACKUP_KEEP=7"
+    echo "BACKUP_TARGET_REQUIRE_MOUNT=false"
+    echo 'BACKUP_DRIVE_DEVICES=""'
+    echo 'NAGLIGHT_FEED_URL=""'
+    echo 'BACKUP_WAKE_MAC=""'
+    echo 'INGEST_SOURCES=""'
+    echo "BACKUP_SOURCES=\"quoted=path:$SRCQ\""
+} >"$TMP/backup.env"
+rc="$(run_backup "$TMP/backup.env")"
+RJ="$(find "$T15" -maxdepth 2 -name RUN.json | head -1)"
+if [ -n "$RJ" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$RJ" 2>/dev/null; then
+            pass "P15 RUN.json parses as JSON with a quote-bearing path in the note"
+        else
+            fail "P15 RUN.json does not parse: $(tr -d '\n' <"$RJ" | cut -c1-160)"
+        fi
+    else
+        printf 'SKIP  P15: no python3 to parse the JSON with\n'
+    fi
+else
+    fail "P15 no RUN.json was written (run exit=$rc)"
+fi
 echo
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

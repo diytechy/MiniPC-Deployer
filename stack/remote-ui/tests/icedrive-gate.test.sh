@@ -27,6 +27,9 @@
 #       not look like the gate being broken) while an EMPTY one still guards -
 #       a typo must never be able to disable this check
 #   G8  the timeout is honoured rather than blocking forever
+#   G9  the marker must be a plain file name - a path could bless the volume
+#       from outside it, which is the one thing the marker forbids
+#   G10 nonsense timing values do not turn the gate into an infinite loop
 #
 # Usage: bash icedrive-gate.test.sh [--keep-tmp]
 set -uo pipefail
@@ -68,7 +71,7 @@ MARKDIR="$TMP/marked"; mkdir -p "$MARKDIR"
 
 gate() { # gate PATHS... -> echoes exit code; output in $TMP/out.txt
     rm -f "$TMP/started"
-    ICEDRIVE_APP="$STUB" ICEDRIVE_GATE_TIMEOUT="${GT:-2}" ICEDRIVE_GATE_INTERVAL=1 \
+    ICEDRIVE_APP="$STUB" ICEDRIVE_GATE_TIMEOUT="${GT:-2}" ICEDRIVE_GATE_INTERVAL="${ICEDRIVE_GATE_INTERVAL:-1}" \
         ICEDRIVE_GATE_REQUIRE_MARKER="${RM:-true}" ICEDRIVE_GATE_MARKER="${MK:-.homehub-library}" \
         bash "$SUT" "$@" >"$TMP/out.txt" 2>&1
     echo $?
@@ -123,6 +126,48 @@ if [ "$rc" = 0 ] && started; then pass "G7 whitespace paths -> starts immediatel
 rc="$(ICEDRIVE_GATE_PATHS="" gate)"
 if [ "$rc" = 1 ] && ! started; then pass "G7 an EMPTY value still guards the default path — a typo cannot disable the gate"; else fail "G7 an empty ICEDRIVE_GATE_PATHS disabled the gate (exit=$rc)"; fi
 
+
+echo
+echo "== G9: the marker must be a plain file name, not a path =="
+# `ICEDRIVE_GATE_MARKER=../blessed` would let a file OUTSIDE the volume bless it,
+# which is the one thing the marker exists to make impossible — surviving ON the
+# volume is the whole property. (Adversarial review, 2026-08-29.)
+: >"$TMP/outside-marker"
+MK="../$(basename "$TMP")/outside-marker"
+rc="$(gate "$MOUNTED")"
+MK=".homehub-library"
+if [ "$rc" = 1 ]; then pass "G9 a marker containing a path separator is refused (exit 1)"; else fail "G9 exit=$rc, want 1"; cat "$TMP/out.txt"; fi
+if ! started; then pass "G9 and the client was NOT started"; else fail "G9 the client ran with a marker pointing outside the volume"; fi
+if grep -q 'not a plain file name' "$TMP/out.txt"; then pass "G9 and it says why"; else fail "G9 message: $(tail -1 "$TMP/out.txt")"; fi
+
+echo
+echo "== G10: nonsense timing values do not turn the gate into an infinite loop =="
+# A non-numeric TIMEOUT breaks the `-ge` comparison so the loop never gives up; a
+# zero INTERVAL stops `waited` advancing, so it spins forever against a drive
+# that is never coming back. The whole point of this file is to reach a decision.
+#
+# THE NON-NUMERIC CASE IS CHECKED BY ITS LOG LINE, NOT BY WAITING IT OUT. The
+# correct fallback is the 600s default, and a test that sat through it would take
+# ten minutes to assert one sentence — which is how a suite stops being run.
+( GT=abc gate "$NOTMOUNTED" >/dev/null 2>&1 ) &
+GPID=$!
+sleep 3
+if grep -q 'not a whole number' "$TMP/out.txt" 2>/dev/null; then
+    pass "G10 a non-numeric timeout is rejected and replaced with the default"
+else
+    fail "G10 no fallback message: $(head -2 "$TMP/out.txt" 2>/dev/null)"
+fi
+kill "$GPID" 2>/dev/null || true
+wait "$GPID" 2>/dev/null || true
+pkill -f "$SUT" 2>/dev/null || true
+t0=$(date +%s)
+rc="$(ICEDRIVE_GATE_INTERVAL=0 GT=3 gate "$NOTMOUNTED")"
+t1=$(date +%s)
+if [ "$rc" = 1 ] && [ "$(( t1 - t0 ))" -le 20 ]; then
+    pass "G10 a zero interval is raised to 1 rather than spinning ($(( t1 - t0 ))s)"
+else
+    fail "G10 exit=$rc after $(( t1 - t0 ))s with INTERVAL=0"
+fi
 echo
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

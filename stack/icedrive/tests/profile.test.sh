@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # profile.test.sh — the IceDrive profile capture/restore, exercised.
 #
-# HERMETIC. It builds a fake profile under a temp HOME, points the script at the
-# CURRENT user (so `getent passwd` resolves and there is no IceDrive process to
-# quiesce), and never touches a real home directory. Needs bash, tar, gpg.
+# HERMETIC. It builds the fixture under a TEMP home (ICEDRIVE_PROFILE_HOME) and
+# points the script at the current user, so `getent passwd` resolves and there is
+# no IceDrive process to quiesce. It never touches a real home directory. Needs
+# bash, tar, gpg.
 #
 # WHY EVERY ONE OF THESE EXISTS. The design was reviewed adversarially before it
 # was written (gpt-5.6-sol, 2026-08-29) and came back APPROVE WITH CHANGES. Each
@@ -28,6 +29,11 @@
 #       BEFORE anything is unpacked
 #   I11 a command line that merely CONTAINS "Icedrive" is not the client - the
 #       capture must not TERM the ssh session that invoked it
+#   I12 a SYMLINK inside the archive is refused - names alone are not a check,
+#       and this extracts as root into a home directory
+#   I13 a DESTINATION root that is a symlink is refused too
+#   I14 an archive with no Icedrive.conf is refused by capture AND restore
+#   I15 the last good archive survives a capture that fails late
 #   I10 "no profile" and "no archive" exit 3, distinct from failure: a box with
 #       IceDrive off must never look like a broken recovery
 #
@@ -57,31 +63,15 @@ printf 'ICEDRIVE_PROFILE_KEY=correct-horse-battery-staple\nOTHER=x\n' >"$ENVF"
 printf 'ICEDRIVE_PROFILE_KEY=a-different-key-entirely\n' >"$TMP/env.wrong"
 printf 'OTHER=x\n' >"$TMP/env.nokey"
 
-# The script resolves HOME from getent, so the fake profile has to live under
-# the REAL home. A dedicated subdirectory keeps it out of the way, and the
-# teardown removes exactly what it made.
-REALHOME="$(getent passwd "$ME" | cut -d: -f6)"
-[ -n "$REALHOME" ] && [ -d "$REALHOME" ] || { echo "FATAL: cannot resolve a home directory for $ME"; exit 2; }
-STASH="$TMP/stash"; mkdir -p "$STASH"
-stash_real() {
-    for r in .config/Icedrive .local/share/Icedrive .config/autostart; do
-        if [ -e "$REALHOME/$r" ]; then
-            mkdir -p "$STASH/$(dirname "$r")"
-            mv "$REALHOME/$r" "$STASH/$r"
-        fi
-    done
-}
-unstash_real() {
-    for r in .config/Icedrive .local/share/Icedrive .config/autostart; do
-        rm -rf "$REALHOME/$r"
-        if [ -e "$STASH/$r" ]; then mkdir -p "$(dirname "$REALHOME/$r")"; mv "$STASH/$r" "$REALHOME/$r"; fi
-    done
-}
-# REFUSE TO RUN AS ROOT: root's home is /root and stashing anything out of it in
-# a test is not a risk worth taking for a test.
-[ "$(id -u)" != 0 ] || { echo "FATAL: run this as an ordinary user, not root"; exit 2; }
-stash_real
-trap 'unstash_real; cleanup' EXIT
+# AN ISOLATED HOME, NOT THE REAL ONE. The script resolves the profile's home from
+# `getent passwd`, so the first version of this file built its fixture in the
+# CURRENT USER'S actual home directory, stashing anything already there and
+# restoring it at exit. That works right up until the test dies at the wrong
+# moment — and it was run that way once, on the production hub, against a live
+# IceDrive profile holding the household's cloud sign-in. It survived. Once was
+# enough: the script now takes ICEDRIVE_PROFILE_HOME, and this test uses it.
+REALHOME="$TMP/home"; mkdir -p "$REALHOME"
+export ICEDRIVE_PROFILE_HOME="$REALHOME"
 
 make_profile() {
     rm -rf "$REALHOME/.config/Icedrive" "$REALHOME/.local/share/Icedrive" "$REALHOME/.config/autostart"
@@ -228,6 +218,78 @@ else
 fi
 if kill -0 "$DECOY" 2>/dev/null; then pass "I11 and the decoy was not signalled"; else fail "I11 the decoy process was killed"; fi
 kill "$DECOY" 2>/dev/null || true
+
+echo
+echo "== I12: a SYMLINK inside the archive is refused — names alone are not a check =="
+# THE FINDING THAT MATTERED MOST in the second review pass. The first version
+# validated tar member NAMES and nothing else, so a member called
+# `.config/Icedrive` that is a SYMLINK to /etc passed every name test — and this
+# extracts as root into a home directory.
+make_profile
+rc="$(sut --capture)"
+EVIL2="$TMP/evil2"; rm -rf "$EVIL2"; mkdir -p "$EVIL2/.config/Icedrive"
+printf 'ok\n' >"$EVIL2/.config/Icedrive/Icedrive.conf"
+ln -s /etc "$EVIL2/.config/Icedrive/escape"
+( cd "$EVIL2" && tar -czf "$TMP/evil2.tar.gz" .config/Icedrive )
+printf 'correct-horse-battery-staple' | gpg --batch --yes --quiet --pinentry-mode loopback \
+    --passphrase-fd 3 --symmetric --cipher-algo AES256 -o "$ARCH" "$TMP/evil2.tar.gz" 3<&0 </dev/null
+clear_profile
+rc="$(sut --restore)"
+if [ "$rc" = 1 ]; then pass "I12 an archive containing a symlink is refused (exit 1)"; else fail "I12 exit=$rc, want 1"; cat "$TMP/out.txt"; fi
+if grep -q 'links or device nodes' "$TMP/out.txt"; then pass "I12 and it names what it found"; else fail "I12 message: $(tail -1 "$TMP/out.txt")"; fi
+if [ ! -e "$REALHOME/.config/Icedrive/escape" ]; then pass "I12 and the link was not planted in the home directory"; else fail "I12 the symlink reached \$HOME"; fi
+
+echo
+echo "== I13: a DESTINATION that is a symlink is refused too =="
+# The archive can be perfect and the target still wrong: a pre-existing
+# `~/.config/Icedrive -> /etc` redirects the copy regardless.
+make_profile
+rc="$(sut --capture)"
+clear_profile
+mkdir -p "$REALHOME/.config"
+ln -s /tmp "$REALHOME/.config/Icedrive"
+rc="$(sut --restore)"
+rm -f "$REALHOME/.config/Icedrive"
+if [ "$rc" = 1 ]; then pass "I13 a symlinked destination root is refused (exit 1)"; else fail "I13 exit=$rc, want 1"; cat "$TMP/out.txt"; fi
+if grep -q 'is a SYMLINK' "$TMP/out.txt"; then pass "I13 and it names the path"; else fail "I13 message: $(tail -1 "$TMP/out.txt")"; fi
+
+echo
+echo "== I14: an archive with no Icedrive.conf is refused by capture AND by restore =="
+# An archive that unpacks cleanly and holds no credential restores a box that
+# still cannot sign in. `--verify` always said so; capture and restore did not.
+make_profile
+rm -f "$REALHOME/.config/Icedrive/Icedrive.conf"
+rc="$(sut --capture)"
+if [ "$rc" = 1 ]; then pass "I14 capture refuses when there is no Icedrive.conf to capture (exit 1)"; else fail "I14 capture exit=$rc, want 1"; cat "$TMP/out.txt"; fi
+NOCONF="$TMP/noconf"; rm -rf "$NOCONF"; mkdir -p "$NOCONF/.config/Icedrive"
+printf 'x\n' >"$NOCONF/.config/Icedrive/something-else.txt"
+( cd "$NOCONF" && tar -czf "$TMP/noconf.tar.gz" .config/Icedrive )
+printf 'correct-horse-battery-staple' | gpg --batch --yes --quiet --pinentry-mode loopback \
+    --passphrase-fd 3 --symmetric --cipher-algo AES256 -o "$ARCH" "$TMP/noconf.tar.gz" 3<&0 </dev/null
+clear_profile
+rc="$(sut --restore)"
+if [ "$rc" = 1 ]; then pass "I14 restore refuses an archive with no Icedrive.conf (exit 1)"; else fail "I14 restore exit=$rc, want 1"; cat "$TMP/out.txt"; fi
+if [ ! -e "$REALHOME/.config/Icedrive/something-else.txt" ]; then pass "I14 and nothing from it was written"; else fail "I14 it unpacked anyway"; fi
+
+echo
+echo "== I15: the last good archive survives a capture that fails =="
+# `install` straight onto the final name can truncate the previous archive and
+# then fail, leaving neither. The replacement is now: write beside, verify,
+# rename.
+make_profile
+rc="$(sut --capture)"
+GOOD_SHA="$(sha256sum "$ARCH" | cut -d' ' -f1)"
+# A capture that will fail late: remove the required member so the pre-install
+# check refuses after the archive has been built.
+rm -f "$REALHOME/.config/Icedrive/Icedrive.conf"
+rc="$(sut --capture)"
+if [ "$rc" = 1 ]; then pass "I15 the failing capture exits 1"; else fail "I15 exit=$rc"; fi
+if [ "$(sha256sum "$ARCH" | cut -d' ' -f1)" = "$GOOD_SHA" ]; then
+    pass "I15 and the previous archive is byte-identical — it was never touched"
+else
+    fail "I15 the failed capture damaged the last good archive"
+fi
+if [ "$(ls "$OUT" | grep -c '^\.')" = 0 ]; then pass "I15 and no temporary file was left behind"; else fail "I15 leftovers: $(ls -A "$OUT" | tr '\n' ' ')"; fi
 echo
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

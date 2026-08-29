@@ -261,13 +261,42 @@ if [ "$PLAN_ONLY" = 1 ]; then RUN_PREFIX=plan; else RUN_PREFIX=run; fi
 RUN_NAME="${RUN_PREFIX}_$RUN_TS"
 RUN_DIR="$BACKUP_TARGET/$RUN_NAME"
 MANIFEST="$RUN_DIR/MANIFEST.tsv"
-mkdir -p "$RUN_DIR" "$STAGING"
+mkdir -p "$STAGING"
+# `mkdir`, NOT `mkdir -p`, ON THE RUN DIRECTORY. `-p` accepts an existing one, so
+# two runs started inside the same UTC second would share it: one manifest
+# overwriting the other, two sets of archives interleaved, and both reporting
+# success. The timer plus a hand-started run is exactly how that happens.
+# (Adversarial review, 2026-08-29.)
+mkdir "$RUN_DIR" || die "$RUN_DIR already exists, or could not be created. Another run started in the same second, or the drive is read-only. Refusing rather than sharing a run directory with something else."
 LOG_FILE="$RUN_DIR/backup.log"
 
 # Run totals + the report fields, initialised BEFORE the failure machinery below
 # so the very first failure can already write a complete RUN.json.
 TOTAL_BYTES=0; TOTAL_FILES=0; SET_SUMMARY=""; SET_SUMMARY_JSON=""
 INGEST_SUMMARY="none"
+
+# json_str VALUE — the value as a JSON string literal, quotes included.
+#
+# WITHOUT THIS, RUN.json IS ONLY PROBABLY VALID. `note` carries FAIL_NOTE and
+# SET_SUMMARY, which hold set names, paths and rsync/tar error text — any of
+# which can contain a quote, a backslash or a newline. One of those and the file
+# stops parsing, which loses the run's durable verdict AND (before the anchored
+# grep in retention_prune) could make a FAILED run read as good.
+# (Adversarial review, 2026-08-29.)
+#
+# PURE PARAMETER EXPANSION, NOT A sed|awk PIPELINE. The first cut was a pipeline
+# and it silently dropped the backslash out of `\n`, turning a two-line note into
+# "twonlines" — three quoting layers (shell, sed, awk) each eating one escape.
+# Bash's own substitution has exactly one layer.
+json_str() {
+    local v="$1"
+    v="${v//\\/\\\\}"      # backslash first, or it re-escapes the ones added below
+    v="${v//\"/\\\"}"
+    v="${v//$'\t'/\\t}"
+    v="${v//$'\r'/}"
+    v="${v//$'\n'/\\n}"
+    printf '"%s"' "$v"
+}
 
 write_run_json() {
     local status="$1" note="$2"
@@ -280,7 +309,7 @@ write_run_json() {
   "sets": [$SET_SUMMARY_JSON],
   "total_files": $TOTAL_FILES,
   "total_bytes": $TOTAL_BYTES,
-  "note": "$note"
+  "note": $(json_str "$note")
 }
 JSON
 }
@@ -734,9 +763,17 @@ prune_plan_dirs() {
     done < <(find "$BACKUP_TARGET" -mindepth 1 -maxdepth 1 -type d -name 'plan_*' -printf '%f
 ' 2>/dev/null | sort)
     # Second pass with the count known: keep the newest $PLAN_KEEP, prune the rest.
-    older=$(( n - PLAN_KEEP )); i=0
+    # THE BUDGET IS A TOTAL. `n` excludes the run doing the pruning, so when a
+    # PLAN run prunes, its own directory is one of the survivors and only
+    # PLAN_KEEP-1 older ones may stay. A full run has no plan directory of its
+    # own, so it keeps PLAN_KEEP. Without this, BACKUP_PLAN_KEEP=N left N+1.
+    # (Adversarial review, 2026-08-29.)
+    local budget="$PLAN_KEEP"
+    case "$RUN_NAME" in plan_*) budget=$(( PLAN_KEEP - 1 )) ;; esac
+    if [ "$budget" -lt 0 ]; then budget=0; fi
+    older=$(( n - budget )); i=0
     if [ "$older" -lt 0 ]; then older=0; fi
-    log "plan retention: $n other plan director(ies) on $BACKUP_TARGET, keeping $PLAN_KEEP"
+    log "plan retention: $n other plan director(ies) on $BACKUP_TARGET, budget $PLAN_KEEP total (keeping $budget of them)"
     while IFS= read -r n_dir; do
         d="$BACKUP_TARGET/$n_dir"
         [ "$n_dir" = "$RUN_NAME" ] && continue
@@ -827,7 +864,12 @@ retention_prune() {
     local d good=() bad=() i
     while IFS= read -r d; do
         [ "$d" = "$RUN_NAME" ] && continue                   # never the current run
-        if grep -q '"status": "ok"' "$BACKUP_TARGET/$d/RUN.json" 2>/dev/null; then
+        # ANCHORED TO THE FIELD, not a substring of the whole file. `note` is
+        # free text written by the run itself; a note containing the characters
+        # `"status": "ok"` would promote a FAILED run into the `good` list, where
+        # it would consume a retention slot and evict a real archive.
+        # (Adversarial review, 2026-08-29.)
+        if grep -qE '^[[:space:]]*"status":[[:space:]]*"ok"[[:space:]]*,?[[:space:]]*$' "$BACKUP_TARGET/$d/RUN.json" 2>/dev/null; then
             good+=("$d")
         else
             bad+=("$d")
@@ -855,8 +897,31 @@ retention_prune() {
 }
 retention_prune
 
-write_run_json "ok" "sets: ${SET_SUMMARY:-none}"
-feed_naglight true "backup ok $RUN_TS — ${SET_SUMMARY:-no sets}"
+# THE LAST THREE STEPS ARE CHECKED, and until 2026-08-29 they were not. This
+# code runs after `trap - ERR` (deliberately — a failure here must not be
+# reported by the ERR trap's line number) and the file has no `set -e`, so a
+# write_run_json that could not write, or a feed that did not land, was ignored
+# and the run still logged "backup OK" and exited 0.
+#
+# Both matter for different reasons and neither is theoretical:
+#   RUN.json  is what retention reads to decide this run is worth keeping, and
+#             what the capacity preflight reads to size the next one. A run with
+#             no RUN.json is classified `bad` by its own next sibling.
+#   the feed  is the ONLY thing that tells anybody the backup happened. A silent
+#             failure here is the exact never-silent-green shape this service is
+#             built around.
+# (Adversarial review, 2026-08-29.)
+if ! write_run_json "ok" "sets: ${SET_SUMMARY:-none}"; then
+    report_failure "the archives are complete and verified, but RUN.json could not be written to $RUN_DIR — retention will class this run as failed and the next run cannot size itself from it"
+    exit 1
+fi
+if ! feed_naglight true "backup ok $RUN_TS — ${SET_SUMMARY:-no sets}"; then
+    log "ERROR: the backup succeeded but the report did NOT reach NagLight."
+    log "  The archives in $RUN_DIR are complete and verified; what failed is the"
+    log "  telling. Exiting non-zero so the unit shows as failed, because a backup"
+    log "  nobody is told about is the failure mode this service exists to refuse."
+    exit 1
+fi
 log "== backup OK: $TOTAL_FILES file(s), $TOTAL_BYTES byte(s) across sets =="
 log "manifest: $MANIFEST"
 exit 0

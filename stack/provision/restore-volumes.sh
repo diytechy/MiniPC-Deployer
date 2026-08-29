@@ -31,6 +31,10 @@ set -uo pipefail
 
 [ $# -ge 2 ] || { echo "usage: restore-volumes.sh SOURCE_DIR RESULT_LOG [TABLE]" >&2; exit 2; }
 SRC="$1"; LOG="$2"; TABLE="${3:-}"
+# Where a FAILED cleanup leaves its note. Outside the volume, so the service
+# never sees it, and outside /run, so it survives the reboot on which the
+# problem actually shows up.
+FAILDIR="${HOMEHUB_RESTORE_FAILDIR:-/var/lib/homehub/restore-failed}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK_DIR="${STACK_DIR:-$(cd "$HERE/.." && pwd)}"
@@ -66,6 +70,29 @@ COMMON_SH="${COMMON_SH:-$STACK_DIR/backup/common.sh}"
 DEFAULT_TABLE='caddy:caddy_data:caddy tracker:tracker_data:tracker actual:actual_data:actual uptimekuma:uptimekuma_data:uptime-kuma'
 [ -n "$TABLE" ] || TABLE="${HOMEHUB_RESTORE_VOLUMES:-$DEFAULT_TABLE}"
 
+# vol_exists VOL — does docker already know this volume, by either name? Asked
+# BEFORE `compose create`, because the answer changes what "empty" means.
+vol_exists() {
+    docker volume inspect "$1" >/dev/null 2>&1 && return 0
+    docker volume inspect "stack_$1" >/dev/null 2>&1 && return 0
+    [ -n "$(docker volume ls -q --filter "label=com.docker.compose.volume=$1" 2>/dev/null)" ]
+}
+
+# dir_has_content DIR — 0 = has something, 1 = empty, 2 = COULD NOT TELL.
+#
+# NOT `[ -n "$(ls -A "$d")" ]`, which was the first cut and fails in the
+# dangerous direction: if `ls` errors the substitution is empty, the directory
+# reads as EMPTY, and a restore lands on top of a populated volume. Three
+# outcomes, and the caller treats "could not tell" as "leave it alone".
+# (Adversarial review, 2026-08-29.)
+dir_has_content() {
+    local d="$1" out rc
+    out="$(find "$d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; rc=$?
+    [ "$rc" -eq 0 ] || return 2
+    [ -n "$out" ] && return 0
+    return 1
+}
+
 for entry in $TABLE; do
     # SHAPE FIRST, AND WITH `case`, NOT A CHAIN OF `[ ] || [ ] && [ ]`. The first
     # cut of this validation was written as one long `||` chain ending in an
@@ -87,11 +114,30 @@ for entry in $TABLE; do
         continue
     fi
 
+    # A PREVIOUS BOOT'S FAILED RESTORE LEFT A NOTE. Without this, a half-filled
+    # volume reads as "not empty (this is not a fresh install)" on every later
+    # boot — a true sentence that hides a broken volume forever.
+    if [ -e "$FAILDIR/$vol" ]; then
+        printf 'FAIL %s a previous restore failed and could not clean up; %s may hold a PARTIAL copy. Empty it by hand and delete %s, then reboot.\n' "$set_name" "$vol" "$FAILDIR/$vol" >>"$LOG"
+        continue
+    fi
+
     run="$(newest_run_with_set "$SRC" "$set_name")" || run=""
     if [ -z "$run" ]; then
         printf 'skip %s no archived set on the drive\n' "$set_name" >>"$LOG"
         continue
     fi
+
+    # DID THE VOLUME EXIST BEFORE WE ASKED COMPOSE TO MAKE IT? That is the whole
+    # definition of "fresh install" here, and asking it AFTERWARDS is wrong:
+    # docker seeds a NEWLY created named volume from whatever the image has at
+    # the mount path, so an image that ships content would make the volume
+    # non-empty the instant `compose create` runs — and the restore would decline
+    # on every fresh install, silently, forever. That is the C22 shape exactly,
+    # and it is the finding this whole file exists to not repeat.
+    # (Adversarial review, 2026-08-29.)
+    if vol_exists "$vol"; then pre_existed=1; else pre_existed=0; fi
+
     # COMPOSE creates the volume, not us: that way it gets the project-prefixed
     # name and the labels compose looks for later, instead of a hand-built name
     # this script would have to keep in step with the project directory.
@@ -105,22 +151,52 @@ for entry in $TABLE; do
         printf 'skip %s volume %s has no mountpoint\n' "$set_name" "$vol" >>"$LOG"
         continue
     fi
-    # ONLY INTO AN EMPTY VOLUME.
-    if [ -n "$(ls -A "$vmp" 2>/dev/null)" ]; then
-        printf 'skip %s volume %s is not empty (this is not a fresh install)\n' "$set_name" "$vol" >>"$LOG"
-        continue
+
+    # ONLY INTO A FRESH VOLUME.
+    if [ "$pre_existed" = 1 ]; then
+        dir_has_content "$vmp"; hc=$?
+        case "$hc" in
+            0) printf 'skip %s volume %s already existed and is not empty (this is not a fresh install)\n' "$set_name" "$vol" >>"$LOG"; continue ;;
+            2) printf 'FAIL %s could not read %s to decide whether it is empty; leaving it alone\n' "$set_name" "$vmp" >>"$LOG"; continue ;;
+        esac
+    else
+        # The volume did not exist a moment ago, so anything in it now is IMAGE
+        # SEED DATA. The archive is a full copy of a real volume of the same
+        # service, so the seed is exactly what it replaces — but say so, because
+        # deleting bytes is never something to do quietly.
+        if dir_has_content "$vmp"; then
+            printf 'note %s volume %s was created by this step and holds image seed data; clearing it before restore\n' "$set_name" "$vol" >>"$LOG"
+            if ! find "$vmp" -xdev -mindepth 1 -delete 2>/dev/null; then
+                printf 'FAIL %s could not clear the image seed data in %s; leaving it alone\n' "$set_name" "$vmp" >>"$LOG"
+                continue
+            fi
+        fi
     fi
+
     if bash "$RESTORE_SH" --run "$run" --set "$set_name" --target "$vmp" >/dev/null 2>&1; then
         printf 'ok %s from %s -> %s\n' "$set_name" "$(basename "$run")" "$vol" >>"$LOG"
     else
         # A FAILED RESTORE LEAVES A HALF-FILLED VOLUME, and that is worse than an
-        # empty one: the "only into an empty volume" guard would decline on every
+        # empty one: the "only into a fresh volume" guard would decline on every
         # later boot, so the box would carry the wreckage forever and the failure
         # would present as "already restored". restore.sh verifies every file
         # byte-for-byte, so a nonzero exit means the archive did not reconstruct.
         # Throw the partial away and let the service start clean.
-        printf 'FAIL %s restore.sh refused or failed; emptying %s again\n' "$set_name" "$vol" >>"$LOG"
-        find "$vmp" -mindepth 1 -delete 2>/dev/null || true
+        #
+        # `-xdev` IS LOAD-BEARING: GNU find crosses filesystem boundaries, so
+        # without it a mount nested under the volume would be emptied with it.
+        if find "$vmp" -xdev -mindepth 1 -delete 2>/dev/null; then
+            printf 'FAIL %s restore.sh refused or failed; %s was emptied again so the next boot retries\n' "$set_name" "$vol" >>"$LOG"
+        else
+            # THE CLEANUP ITSELF FAILED, which is the state that used to become
+            # permanent silence. Leave a note OUTSIDE the volume (so the service
+            # never sees it) and outside /run (so it survives the reboot on which
+            # the problem actually shows up), and read it at the top of the next
+            # pass. Otherwise the next boot says "not empty, so not a fresh
+            # install" — a true sentence about a broken volume.
+            mkdir -p "$FAILDIR" 2>/dev/null && : >"$FAILDIR/$vol" 2>/dev/null || true
+            printf 'FAIL %s restore.sh failed AND %s could not be emptied — it may hold a PARTIAL copy. Empty it by hand and delete %s.\n' "$set_name" "$vmp" "$FAILDIR/$vol" >>"$LOG"
+        fi
     fi
 done
 exit 0

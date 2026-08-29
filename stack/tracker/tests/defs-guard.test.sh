@@ -21,6 +21,11 @@
 #   D12 HTTP 400 naming this guard OWN check id escalates to RED - the tracker
 #       having never heard of tracker-definitions IS the deletion alarm
 #   D13 a stopped tracker does not downgrade a verdict read off the volume
+#   D14 EQUAL TOTALS ARE NOT AN EQUAL INVENTORY - a renamed id, or a file moved
+#       between users, leaves files/items/users identical
+#   D15 a corrupt baseline is yellow, never green
+#   D16 a state file that cannot be written escalates to RED - the durable
+#       verdict is the whole point, and a stale one reads as current
 #
 # Usage: bash defs-guard.test.sh [--keep-tmp]
 set -uo pipefail
@@ -248,6 +253,69 @@ TRACKER_DEFS_ROOT="$ROOT" TRACKER_DEFS_STATE_DIR="$STATE" TRACKER_DEFS_ENV_FILE=
 rc=$?
 if [ "$rc" = 0 ] && [ "$(state_of band)" = green ]; then pass "D13 green stands with the container down (exit 0)"; else fail "D13 exit=$rc band=$(state_of band)"; cat "$TMP/out.txt"; fi
 if grep -q 'read from the volume, not from the tracker' "$TMP/out.txt"; then pass "D13 and it says why the verdict is still trustworthy"; else fail "D13 no explanation for the un-sent feed"; fi
+
+echo
+echo "== D14: equal totals are not the same as an equal inventory =="
+# THE HOLE COUNTS ALONE LEAVE, found by adversarial review before it could bite:
+# rename an item, or move a file from one user to another, and files/items/users
+# are all unchanged. The guard used to say "matches the baseline exactly" — a
+# sentence about arithmetic, not about definitions.
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
+write_defs
+guard --baseline >/dev/null
+rc="$(guard --check)"
+if [ "$rc" = 0 ]; then pass "D14 setup: green against its own baseline"; else fail "D14 setup exit=$rc"; fi
+# Rename one id. Same file count, same item count, same user count.
+sed -i 's/- id: three/- id: three-renamed/' "$DEFS/beta.md"
+rc="$(guard --check)"
+if [ "$(state_of files)" = 2 ] && [ "$(state_of items)" = 3 ]; then
+    pass "D14 the totals really are unchanged (2 files / 3 items)"
+else
+    fail "D14 totals moved: files=$(state_of files) items=$(state_of items)"
+fi
+if [ "$rc" = 2 ] && [ "$(state_of band)" = yellow ]; then
+    pass "D14 yellow on an inventory change the counts cannot see (exit 2)"
+else
+    fail "D14 band=$(state_of band) exit=$rc — a renamed item passed as 'matches exactly'"
+fi
+if state_of verdict | grep -q 'INVENTORY does not'; then pass "D14 and the verdict says which kind of change it is"; else fail "D14 verdict: $(state_of verdict)"; fi
+
+echo
+echo "== D15: a corrupt baseline is yellow, never green =="
+# Without validation, a baseline whose items= is non-numeric makes the numeric
+# comparisons ERROR, and with no `set -e` the script falls through to the final
+# else — which is GREEN. A corrupt baseline is exactly when this must not say
+# everything is fine.
+write_defs
+guard --baseline >/dev/null
+sed -i 's/^items=.*/items=not-a-number/' "$STATE/tracker-defs-baseline"
+rc="$(guard --check)"
+if [ "$rc" = 2 ] && [ "$(state_of band)" = yellow ]; then
+    pass "D15 a non-numeric baseline field gives yellow, not green (exit 2)"
+else
+    fail "D15 band=$(state_of band) exit=$rc"
+fi
+if state_of verdict | grep -q 'corrupt'; then pass "D15 and it names the field"; else fail "D15 verdict: $(state_of verdict)"; fi
+
+echo
+echo "== D16: a verdict nobody can read back is not a verdict =="
+# The state file is the durable half of this design — verify-hub.sh reads it and
+# never asks the tracker. If it could not be written, the newest thing on disk is
+# a STALE answer that reads as current, and the exit code is the only signal
+# systemd then throws away.
+write_defs
+guard --baseline >/dev/null
+chmod 500 "$STATE" 2>/dev/null || true
+rc="$(guard --check)"
+chmod 700 "$STATE" 2>/dev/null || true
+if [ "$(id -u)" = 0 ]; then
+    printf 'SKIP  D16: running as root, which can write into a 0500 directory anyway\n'
+elif [ "$rc" = 1 ]; then
+    pass "D16 an unwritable state directory escalates to RED (exit 1)"
+    if grep -q 'nothing durable records it' "$TMP/out.txt"; then pass "D16 and it says why"; else fail "D16 no explanation"; fi
+else
+    fail "D16 exit=$rc with an unwritable state dir, want 1"; cat "$TMP/out.txt"
+fi
 echo
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

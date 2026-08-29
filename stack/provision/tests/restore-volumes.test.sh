@@ -25,6 +25,12 @@
 #   R8  a malformed table row is reported, never silently ignored
 #   R9  a plan_<ts> directory is never chosen as a restore source
 #   R10 the script always exits 0; the log is the verdict
+#   R11 IMAGE SEED DATA in a volume this step just created is cleared, not
+#       obeyed - docker seeds a new named volume from the image, so testing
+#       emptiness AFTER compose create would decline on every fresh install
+#   R12 a volume that ALREADY existed and is non-empty is left alone
+#   R13 a cleanup that failed once leaves a durable note, so the next boot
+#       reports a PARTIAL volume instead of "not empty, not a fresh install"
 #
 # Usage: bash restore-volumes.test.sh [--keep-tmp]
 set -uo pipefail
@@ -50,8 +56,8 @@ TMP="$(mktemp -d)"
 cleanup() { if [ "$KEEP_TMP" = 1 ]; then echo "tmp kept: $TMP"; return 0; fi; rm -rf "$TMP"; }
 trap cleanup EXIT
 
-VOLROOT="$TMP/volumes"; DRIVE="$TMP/drive"; MOCKBIN="$TMP/mockbin"
-mkdir -p "$VOLROOT" "$DRIVE" "$MOCKBIN"
+VOLROOT="$TMP/volumes"; DRIVE="$TMP/drive"; MOCKBIN="$TMP/mockbin"; FAILDIR="$TMP/faildir"
+mkdir -p "$VOLROOT" "$DRIVE" "$MOCKBIN" "$FAILDIR"
 
 # ── the mock docker ──────────────────────────────────────────────────────────
 # It has to answer THREE things, because common.sh's volume_mountpoint asks
@@ -75,7 +81,13 @@ case "$1 ${2:-}" in
     svc="${3:-}"
     [ "$svc" = "${MOCK_COMPOSE_FAIL:-}" ] && exit 1
     vol="$(grep -E "^$svc=" "$VOLROOT/.svcmap" 2>/dev/null | cut -d= -f2)"
-    [ -n "$vol" ] && mkdir -p "$VOLROOT/stack_$vol"
+    if [ -n "$vol" ] && [ ! -d "$VOLROOT/stack_$vol" ]; then
+      mkdir -p "$VOLROOT/stack_$vol"
+      # Docker seeds a NEWLY created named volume from whatever the image holds
+      # at the mount path. The flag file makes the mock do the same, so R11 can
+      # exercise the branch that clears it.
+      [ -e "$VOLROOT/.seed-on-create" ] && printf 'from the image\n' >"$VOLROOT/stack_$vol/IMAGE-SEED"
+    fi
     exit 0 ;;
   "volume inspect")
     name="${!#}"
@@ -135,7 +147,7 @@ bash "$BACKUP_SH" --config "$TMP/backup.env" --plan >/dev/null 2>&1
 
 run_sut() { # run_sut [TABLE] -> log in $TMP/result.log
     : >"$TMP/result.log"
-    MOCK_VOLROOT="$VOLROOT" PATH="$MOCKBIN:$PATH" STACK_DIR="$STACK" \
+    MOCK_VOLROOT="$VOLROOT" PATH="$MOCKBIN:$PATH" STACK_DIR="$STACK" HOMEHUB_RESTORE_FAILDIR="$FAILDIR" \
         bash "$SUT" "$DRIVE" "$TMP/result.log" "${1:-$TABLE}" >"$TMP/sut.out" 2>&1
     echo $?
 }
@@ -178,7 +190,7 @@ echo
 echo "== R6: a compose service that cannot be created is skipped, not fatal =="
 rm -rf "$VOLROOT"/stack_*
 : >"$TMP/result.log"
-rc="$(MOCK_VOLROOT="$VOLROOT" MOCK_COMPOSE_FAIL=tracker PATH="$MOCKBIN:$PATH" STACK_DIR="$STACK" \
+rc="$(MOCK_VOLROOT="$VOLROOT" MOCK_COMPOSE_FAIL=tracker PATH="$MOCKBIN:$PATH" STACK_DIR="$STACK" HOMEHUB_RESTORE_FAILDIR="$FAILDIR" \
       bash "$SUT" "$DRIVE" "$TMP/result.log" "$TABLE" >"$TMP/sut.out" 2>&1; echo $?)"
 if [ "$rc" = 0 ]; then pass "R6 exit still 0 with a service that cannot be created"; else fail "R6 exit=$rc"; fi
 case "$(logline tracker)" in skip\ *compose*) pass "R6 the tracker set was skipped, naming compose" ;; *) fail "R6 tracker: $(logline tracker)" ;; esac
@@ -217,6 +229,68 @@ while IFS= read -r l; do
 done <"$TMP/result.log"
 if [ "$BAD" = 0 ]; then pass "R9 every restore named a run_ directory, never a plan_ one"; else fail "R9 a restore was sourced from a plan directory"; cat "$TMP/result.log"; fi
 
+
+echo
+echo "== R11: image seed data in a volume this step just created is cleared, not obeyed =="
+# THE C22 SHAPE, FOUND BY REVIEW BEFORE IT COULD BITE. Docker seeds a NEWLY
+# created named volume from whatever the image has at the mount path. The first
+# cut tested "is the volume empty" AFTER `compose create`, so any image shipping
+# content there would make the restore decline on every fresh install — silently,
+# forever, exactly like the caddy restore that could never fire.
+rm -rf "$VOLROOT"/stack_*
+: >"$VOLROOT/.seed-on-create"          # tells the mock to drop a seed file
+rc="$(run_sut)"
+rm -f "$VOLROOT/.seed-on-create"
+case "$(logline caddy)" in
+    ok\ *) pass "R11 a fresh volume holding image seed data still restored" ;;
+    *)     fail "R11 caddy: $(logline caddy)"; cat "$TMP/result.log" ;;
+esac
+if grep -q '^note caddy .*image seed data' "$TMP/result.log"; then
+    pass "R11 and it said out loud that it cleared the seed"
+else
+    fail "R11 the seed was cleared silently"
+fi
+if [ -f "$VOLROOT/stack_caddy_data/acme.key" ] && [ ! -f "$VOLROOT/stack_caddy_data/IMAGE-SEED" ]; then
+    pass "R11 the archive's content is there and the seed is gone"
+else
+    fail "R11 volume contents: $(ls -A "$VOLROOT/stack_caddy_data" | tr '\n' ' ')"
+fi
+
+echo
+echo "== R12: a volume that ALREADY existed and is not empty is left alone =="
+# Same observable outcome as R11's opposite: the distinction is whether the
+# volume existed BEFORE this step created it, not whether it is empty now.
+rc="$(run_sut)"
+n_skip="$(grep -c 'already existed and is not empty' "$TMP/result.log" || true)"
+if [ "$n_skip" -ge 1 ] && [ "$(grep -c '^ok ' "$TMP/result.log")" = 0 ]; then
+    pass "R12 a pre-existing non-empty volume is skipped, and nothing was restored over it"
+else
+    fail "R12 skips=$n_skip oks=$(grep -c '^ok ' "$TMP/result.log")"; cat "$TMP/result.log"
+fi
+
+echo
+echo "== R13: a cleanup that failed once does not become permanent silence =="
+# The state this is about: restore.sh failed, the volume could not be emptied, so
+# it holds a PARTIAL copy. Without a durable note, every later boot reports
+# "not empty, so this is not a fresh install" — a true sentence about a broken
+# volume, and the service starts against it forever.
+rm -rf "$VOLROOT"/stack_*
+mkdir -p "$FAILDIR"; : >"$FAILDIR/caddy_data"
+rc="$(run_sut)"
+case "$(logline caddy)" in
+    FAIL\ *PARTIAL*) pass "R13 the note turns the next pass into a FAIL naming the partial volume" ;;
+    *)               fail "R13 caddy: $(logline caddy)" ;;
+esac
+if grep -q "$FAILDIR/caddy_data" "$TMP/result.log"; then
+    pass "R13 and it names the file to delete once the volume is cleaned by hand"
+else
+    fail "R13 the FAIL line does not say how to clear it"
+fi
+rm -f "$FAILDIR/caddy_data"
+case "$(logline tracker)" in
+    ok\ *) pass "R13 and the other sets were unaffected" ;;
+    *)     fail "R13 tracker: $(logline tracker)" ;;
+esac
 echo
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

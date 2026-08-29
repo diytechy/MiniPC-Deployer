@@ -842,6 +842,19 @@ __restore_log=/run/homehub-volume-restore.log
 # issuances, never withhold a boot" must not have a cleanup that can withhold a
 # boot. Adversarial review, 2026-08-28.
 rm -f "$__restore_log" || true
+# AND IF IT IS STILL THERE, IT IS NOT A FILE. A stale mount or a name collision
+# leaves a DIRECTORY at that path; `rm -f` cannot remove one and returns nonzero,
+# which the `|| true` above already stops from aborting the boot. What it does
+# not stop is every later read and write of $__restore_log doing something other
+# than what this step expects. Fall back to a private name rather than reason
+# about which of those are harmless. (Adversarial review, 2026-08-29.)
+if [ -e "$__restore_log" ] && [ ! -f "$__restore_log" ]; then
+    log "  WARNING: $__restore_log exists and is not a regular file - using a temporary one instead"
+    __restore_log="$(mktemp /run/homehub-volume-restore.XXXXXX 2>/dev/null)" || __restore_log=""
+fi
+if [ -z "$__restore_log" ]; then
+    log "  no writable result log - SKIPPING the volume restore entirely rather than running it blind"
+else
 (
     . /etc/homehub-backup/backup.env 2>/dev/null || exit 0
     . "$STACK_DIR/backup/common.sh"  2>/dev/null || exit 0
@@ -969,7 +982,8 @@ rm -f "$__restore_log" || true
     # accident; the parent reads the LOG, and the subshell is followed by || true.
     true
 ) || true
-if [ -s "$__restore_log" ]; then
+fi
+if [ -n "${__restore_log:-}" ] && [ -s "$__restore_log" ]; then
     while IFS= read -r __rl; do
         case "$__rl" in
             ok\ caddy*) log "restored caddy_data from the backup drive — caddy starts holding its certificates and will not call ACME" ;;
@@ -981,7 +995,7 @@ if [ -s "$__restore_log" ]; then
 else
     log "no volume restore at all (no drive, or the backup drive could not be read)"
 fi
-if ! grep -q '^ok caddy' "$__restore_log" 2>/dev/null; then
+if ! grep -q '^ok caddy' "${__restore_log:-/nonexistent}" 2>/dev/null; then
     log "  caddy_data was NOT restored, so caddy will obtain certificates normally."
     log "  since C32 this step also MOUNTS the backup drive itself when fstab does not"
     log "  list it yet, so 'no drive' now means the disk was genuinely not there."
@@ -989,7 +1003,7 @@ if ! grep -q '^ok caddy' "$__restore_log" 2>/dev/null; then
     log "  spends one of each, so expect the last hostname to take a while if this"
     log "  box has been reinstalled recently."
 fi
-rm -f "$__restore_log" || true
+rm -f "${__restore_log:-}" 2>/dev/null || true
 
 log "docker compose up -d…"
 docker compose up -d

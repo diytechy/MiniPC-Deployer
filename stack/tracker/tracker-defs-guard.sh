@@ -80,18 +80,37 @@ CHECK_ID="${TRACKER_DEFS_FEED_CHECK:-tracker-definitions}"
 
 # ── where the definitions physically are ─────────────────────────────────────
 # TRACKER_DEFS_ROOT overrides everything (the test harness uses it). Otherwise
-# resolve the docker volume the way backup.sh does — by asking docker, with the
-# compose project prefix tried second, because `volumes: tracker_data:` in
-# docker-compose.yml becomes the real volume `stack_tracker_data`.
+# resolve the docker volume the way backup.sh does — by asking docker.
+#
+# AND IT FAILS CLOSED ON AMBIGUITY (adversarial review, 2026-08-29). The first
+# cut tried `tracker_data` then `stack_tracker_data` and took the first that
+# answered. If BOTH exist — an old volume left behind by a project rename, which
+# is exactly the state a reimage or a `docker compose -p` change produces — it
+# would assess whichever came first and could report GREEN about a volume no
+# container is using, while the live one is empty. Two candidates is not a
+# tie-break, it is a question nobody has answered.
 resolve_root() {
     if [ -n "${TRACKER_DEFS_ROOT:-}" ]; then printf '%s\n' "$TRACKER_DEFS_ROOT"; return 0; fi
     command -v docker >/dev/null 2>&1 || return 1
-    local v mp
+    local v mp found="" foundname=""
     for v in "$VOLUME" "stack_$VOLUME"; do
         mp="$(docker volume inspect -f '{{.Mountpoint}}' "$v" 2>/dev/null)" || continue
-        [ -n "$mp" ] && [ -d "$mp" ] && { printf '%s\n' "$mp"; return 0; }
+        [ -n "$mp" ] && [ -d "$mp" ] || continue
+        if [ -n "$found" ]; then
+            # PRINTED, NOT ASSIGNED. This function is called in a command
+            # substitution, so it runs in a SUBSHELL and any variable it sets
+            # dies with it — the parent would have seen an empty AMBIGUOUS and
+            # taken the "cannot locate" branch instead. Same class of bug as the
+            # subshell result log in firstboot; caught here by writing the caller
+            # out longhand.
+            printf 'AMBIGUOUS:both %s and %s exist
+' "$foundname" "$v"
+            return 2
+        fi
+        found="$mp"; foundname="$v"
     done
-    return 1
+    [ -n "$found" ] || return 1
+    printf '%s\n' "$found"
 }
 
 # ── the inventory ────────────────────────────────────────────────────────────
@@ -113,11 +132,47 @@ count_items_in_file() {
     ' "$1" 2>/dev/null || echo 0
 }
 
-ROOT="$(resolve_root || true)"
-FILES=0; ITEMS=0; NEWEST=0; USERS=0; DETAIL=""
+# ids_in_file — the item IDs themselves, one per line, frontmatter only.
+# COUNTS ALONE ARE NOT AN INVENTORY (adversarial review, 2026-08-29): one user
+# losing a file while another gains one leaves every total identical, and so does
+# renaming an item. The guard would have said "matches the baseline exactly"
+# about a set that had changed underneath it. The ID list is what makes the
+# comparison mean what the message claims.
+ids_in_file() {
+    awk '
+        NR == 1 && $0 ~ /^---[[:space:]]*$/ { infm = 1; next }
+        infm && $0 ~ /^---[[:space:]]*$/    { exit }
+        infm && $0 ~ /^[[:space:]]*-[[:space:]]+id:[[:space:]]*[^[:space:]]/ {
+            sub(/^[[:space:]]*-[[:space:]]+id:[[:space:]]*/, "");
+            sub(/[[:space:]].*$/, "");
+            print
+        }
+    ' "$1" 2>/dev/null || true
+}
+
+# sanitise — strip anything that would forge a line in the key=value state file.
+# A user directory name may legally contain a newline on Linux; copied unescaped
+# into `detail=` it would let a directory called `x<LF>band=green` write its own
+# verdict. (Adversarial review, 2026-08-29.)
+sanitise() { printf '%s' "$1" | tr '\r\n' '  ' | tr -d '\000'; }
+
+ROOT=""; AMBIGUOUS=""
+# resolve_root runs in a command substitution, i.e. a SUBSHELL, so it cannot
+# hand back a variable. It returns 0 with the path, 1 for "not found", or 2 with
+# an AMBIGUOUS: line on stdout.
+_root_out="$(resolve_root)"; _rr=$?
+case "$_rr" in
+    0) ROOT="$_root_out" ;;
+    2) AMBIGUOUS="${_root_out#AMBIGUOUS:}" ;;
+    *) ROOT="" ;;
+esac
+FILES=0; ITEMS=0; NEWEST=0; USERS=0; DETAIL=""; INV=""
 band=""; verdict=""
 
-if [ -z "$ROOT" ]; then
+if [ -n "$AMBIGUOUS" ]; then
+    band=red
+    verdict="the tracker data volume is AMBIGUOUS: $AMBIGUOUS. Refusing to guess which one the container uses — assessing the wrong volume could report green about definitions nothing reads."
+elif [ -z "$ROOT" ]; then
     band=red
     verdict="cannot locate the tracker data volume ('$VOLUME' / 'stack_$VOLUME') — docker is absent or the volume does not exist. The definitions cannot be assessed at all, which is not the same as them being fine."
 elif [ ! -d "$ROOT" ]; then
@@ -131,21 +186,32 @@ else
         # LOSING one later.
         USERS=$(( USERS + 1 ))
         ddir="$udir/definitions"
+        uname_="$(sanitise "$(basename "$udir")")"
         ucount=0; uitems=0
         if [ -d "$ddir" ]; then
             for f in "$ddir"/*.md; do
                 [ -f "$f" ] || continue
                 ucount=$(( ucount + 1 ))
-                uitems=$(( uitems + $(count_items_in_file "$f") ))
+                fitems="$(count_items_in_file "$f")"
+                uitems=$(( uitems + fitems ))
+                INV="$INV$uname_/$(sanitise "$(basename "$f")"):$fitems
+$(ids_in_file "$f" | sed "s|^|$uname_/|")
+"
                 m="$(stat -c '%Y' -- "$f" 2>/dev/null || echo 0)"
                 [ "$m" -gt "$NEWEST" ] && NEWEST="$m"
             done
         fi
         FILES=$(( FILES + ucount ))
         ITEMS=$(( ITEMS + uitems ))
-        DETAIL="${DETAIL:+$DETAIL; }$(basename "$udir")=${ucount}f/${uitems}i"
+        DETAIL="${DETAIL:+$DETAIL; }${uname_}=${ucount}f/${uitems}i"
     done
 fi
+
+# The canonical inventory: every user/file with its item count, and every item
+# ID, sorted. One hash of that is what the baseline compares against, so a swap
+# that leaves the totals identical still moves it.
+INV_HASH="$(printf '%s' "$INV" | grep -v '^$' | sort | sha256sum 2>/dev/null | cut -d' ' -f1)"
+[ -n "$INV_HASH" ] || INV_HASH="unavailable"
 
 NEWEST_HUMAN="never"
 [ "$NEWEST" -gt 0 ] && NEWEST_HUMAN="$(date -u -d "@$NEWEST" +%FT%TZ 2>/dev/null || echo "$NEWEST")"
@@ -154,7 +220,11 @@ if [ "$NEWEST" -gt 0 ]; then AGE_DAYS=$(( ( $(date -u +%s) - NEWEST ) / 86400 ))
 
 # ── baseline mode ────────────────────────────────────────────────────────────
 write_baseline() {
+    local tmp
     mkdir -p "$STATE_DIR" || { warn "cannot create $STATE_DIR"; return 1; }
+    # mktemp, not a fixed .tmp name: the timer and a hand run can overlap, and
+    # two writers racing on one temporary file produce a mixed one.
+    tmp="$(mktemp "$BASELINE_FILE.XXXXXX")" || { warn "cannot create a temporary file beside $BASELINE_FILE"; return 1; }
     {
         echo "# Recorded by $TAG --baseline. The inventory a healthy tracker has."
         echo "# REFRESH THIS DELIBERATELY, never automatically: a guard that"
@@ -163,8 +233,12 @@ write_baseline() {
         echo "users=$USERS"
         echo "files=$FILES"
         echo "items=$ITEMS"
+        echo "inv_hash=$INV_HASH"
         echo "detail=$DETAIL"
-    } >"$BASELINE_FILE.tmp" && mv "$BASELINE_FILE.tmp" "$BASELINE_FILE"
+    } >"$tmp" && mv "$tmp" "$BASELINE_FILE" && return 0
+    rm -f "$tmp" 2>/dev/null
+    warn "could not write $BASELINE_FILE"
+    return 1
 }
 
 if [ "$MODE" = baseline ]; then
@@ -186,18 +260,33 @@ if [ "$MODE" = baseline ]; then
 fi
 
 # ── compare ──────────────────────────────────────────────────────────────────
-B_FILES=""; B_ITEMS=""; B_USERS=""; B_WHEN=""
+# EVERY BASELINE FIELD IS VALIDATED BEFORE IT IS COMPARED. Without this, a
+# baseline whose `items=` is missing, empty or non-numeric makes `[ "$ITEMS" -lt
+# "$B_ITEMS" ]` error out — and with no `set -e` the script simply carries on to
+# the final `else`, which is GREEN. A corrupt baseline is exactly when this thing
+# must not say everything is fine. (Adversarial review, 2026-08-29.)
+B_FILES=""; B_ITEMS=""; B_USERS=""; B_WHEN=""; B_HASH=""; B_BAD=""
 if [ -f "$BASELINE_FILE" ]; then
-    B_FILES="$(awk -F= '$1=="files"{print $2}' "$BASELINE_FILE")"
-    B_ITEMS="$(awk -F= '$1=="items"{print $2}' "$BASELINE_FILE")"
-    B_USERS="$(awk -F= '$1=="users"{print $2}' "$BASELINE_FILE")"
-    B_WHEN="$(awk -F= '$1=="baseline_utc"{print $2}' "$BASELINE_FILE")"
+    B_FILES="$(awk -F= '$1=="files"{print $2}' "$BASELINE_FILE" | head -1)"
+    B_ITEMS="$(awk -F= '$1=="items"{print $2}' "$BASELINE_FILE" | head -1)"
+    B_USERS="$(awk -F= '$1=="users"{print $2}' "$BASELINE_FILE" | head -1)"
+    B_HASH="$(awk -F= '$1=="inv_hash"{print $2}' "$BASELINE_FILE" | head -1)"
+    B_WHEN="$(awk -F= '$1=="baseline_utc"{print $2}' "$BASELINE_FILE" | head -1)"
+    for _f in B_FILES B_ITEMS B_USERS; do
+        eval "_v=\${$_f}"
+        case "${_v:-}" in
+            ''|*[!0-9]*) B_BAD="${B_BAD:+$B_BAD }$_f='${_v}'" ;;
+        esac
+    done
 fi
 
 if [ -z "$band" ]; then
     if [ "$FILES" -eq 0 ]; then
         band=red
         verdict="NO definition files at all under $ROOT ($USERS user dir(s)). A tracker with no items renders GREEN with score 0 — indistinguishable on a wall from a tracker where everything is fine."
+    elif [ -n "$B_BAD" ]; then
+        band=yellow
+        verdict="the baseline at $BASELINE_FILE is unreadable or corrupt ($B_BAD) — refusing to compare against it. Current inventory: $FILES file(s), $ITEMS item(s), $USERS user(s). Re-record it with '$TAG --baseline' once you have checked the set is right."
     elif [ -z "$B_FILES" ]; then
         band=yellow
         verdict="no baseline recorded yet — $FILES file(s), $ITEMS item(s) across $USERS user(s), newest $NEWEST_HUMAN (${AGE_DAYS}d ago). Run '$TAG --baseline' once the set is right, and this lane turns green."
@@ -210,9 +299,17 @@ if [ -z "$band" ]; then
     elif [ -n "$B_USERS" ] && [ "$USERS" -ne "$B_USERS" ]; then
         band=yellow
         verdict="the FILE and ITEM counts match the baseline but the number of user directories changed ($USERS now, $B_USERS at baseline) — someone was added or removed. [$DETAIL]"
+    elif [ -n "$B_HASH" ] && [ "$B_HASH" != "unavailable" ] && [ "$INV_HASH" != "$B_HASH" ]; then
+        # THE TOTALS AGREE AND THE SET DOES NOT. One user losing a file while
+        # another gains one, or an item renamed: every count is identical and the
+        # inventory is different. This is the branch that stops "matches the
+        # baseline exactly" from being a sentence about arithmetic rather than
+        # about definitions.
+        band=yellow
+        verdict="the counts match the baseline ($FILES file(s)/$ITEMS item(s)/$USERS user(s)) but the INVENTORY does not: a file or an item id was renamed, moved between users, or swapped. [$DETAIL]. Check the set, then re-run '$TAG --baseline'."
     else
         band=green
-        verdict="$FILES definition file(s), $ITEMS item(s), $USERS user(s) — matches the baseline recorded $B_WHEN. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago). [$DETAIL]"
+        verdict="$FILES definition file(s), $ITEMS item(s), $USERS user(s) — matches the baseline recorded $B_WHEN, by count AND by inventory. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago). [$DETAIL]"
     fi
 fi
 
@@ -220,23 +317,46 @@ fi
 # verify-hub.sh reads THIS, not /api/today, and that is deliberate. The state
 # this guard is most needed for — an empty or missing definition set — is
 # exactly the state in which the tracker's own answers stop being informative.
-if mkdir -p "$STATE_DIR" 2>/dev/null; then
+#
+# A FAILED WRITE IS A RED, NOT A WARNING. The state file IS the durable verdict;
+# if it could not be written, the last thing on disk is a stale answer and the
+# exit code would be the only signal. Systemd throws that away. So a write
+# failure escalates the band. (Adversarial review, 2026-08-29.)
+write_state() {
+    local tmp
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+    tmp="$(mktemp "$STATE_FILE.XXXXXX" 2>/dev/null)" || return 1
     {
         echo "checked_utc=$(date -u +%FT%TZ)"
         echo "band=$band"
         echo "users=$USERS"
         echo "files=$FILES"
         echo "items=$ITEMS"
+        echo "inv_hash=$INV_HASH"
         echo "newest_epoch=$NEWEST"
         echo "newest_utc=$NEWEST_HUMAN"
         echo "age_days=$AGE_DAYS"
         echo "baseline_files=${B_FILES:-none}"
         echo "baseline_items=${B_ITEMS:-none}"
-        echo "detail=$DETAIL"
-        echo "verdict=$verdict"
-    } >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
-else
-    warn "cannot write $STATE_FILE — the check ran, but nothing durable records it"
+        echo "detail=$(sanitise "$DETAIL")"
+        echo "verdict=$(sanitise "$verdict")"
+        # AN `if`, NOT `[ ] && echo`. As the LAST command of the group this is
+        # the group's exit status, so with no escalation the test returns 1, the
+        # `&& mv` never runs, and write_state reports failure on every ordinary
+        # run — which then escalates the band to red. Measured: 24 assertions
+        # failed at once and the state file was never written.
+        if [ -n "${ESCALATION:-}" ]; then echo "feed_escalation=$(sanitise "$ESCALATION")"; fi
+    } >"$tmp" && mv "$tmp" "$STATE_FILE" && return 0
+    rm -f "$tmp" 2>/dev/null
+    return 1
+}
+
+if ! write_state; then
+    warn "could not write $STATE_FILE — the check ran, but nothing durable records it."
+    warn "  Escalating to RED: a verdict nobody can read back is not a verdict, and the"
+    warn "  last thing on disk is now a STALE answer that reads as current."
+    band=red
+    verdict="could not write $STATE_FILE (was: $verdict)"
 fi
 
 case "$band" in
@@ -294,11 +414,17 @@ if [ "$MODE" = report ]; then
             case "$fbody" in
                 *"unknown feeder check id: $CHECK_ID"*)
                     band=red
-                    verdict="the tracker has NO item declaring check id '$CHECK_ID' — the definition carrying this very lane is gone. This is the deletion alarm, not a feed fault. Inventory read from the volume: $FILES file(s), $ITEMS item(s)."
+                    ESCALATION="the tracker has NO item declaring check id '$CHECK_ID' — the definition carrying this very lane is gone. This is the deletion alarm, not a feed fault. Inventory read from the volume: $FILES file(s), $ITEMS item(s)."
+                    verdict="$ESCALATION"
                     log "RED (escalated): $verdict"
-                    if mkdir -p "$STATE_DIR" 2>/dev/null; then
-                        sed -i "s/^band=.*/band=red/" "$STATE_FILE" 2>/dev/null || true
-                        printf 'feed_escalation=%s\n' "$verdict" >>"$STATE_FILE" 2>/dev/null || true
+                    # REWRITTEN WHOLE, THROUGH THE SAME CHECKED WRITER. The first
+                    # cut patched the existing file with `sed -i` and appended a
+                    # line, both `|| true` — so a failed patch left band=green on
+                    # disk while the process exited 1, and the verifier that reads
+                    # the state file (which is the durable half of this design)
+                    # would have gone on reporting healthy.
+                    if ! write_state; then
+                        warn "could not rewrite $STATE_FILE with the escalated RED verdict — the file on disk is now STALE and will read as whatever it last said"
                     fi ;;
             esac
         fi

@@ -88,6 +88,19 @@ log() {
     return 0
 }
 
+# MOVED BELOW log(), 2026-08-29. These three lines were written above it and
+# every one of them called a function that did not exist yet: bash printed
+# "log: command not found" and carried on, so a bad value was silently accepted
+# and the operator was told nothing. Found by the test written for them.
+# VALIDATED, because both bad values fail in the direction that matters. A
+# non-numeric TIMEOUT breaks the `-ge` comparison and the loop never gives up; a
+# zero or negative INTERVAL makes `waited` stop increasing, so the same loop
+# spins forever against a drive that is never coming back — and the whole point
+# of this file is to reach a DECISION. (Adversarial review, 2026-08-29.)
+case "$TIMEOUT"  in ''|*[!0-9]*) log "ICEDRIVE_GATE_TIMEOUT='$TIMEOUT' is not a whole number of seconds - using 600"; TIMEOUT=600 ;; esac
+case "$INTERVAL" in ''|*[!0-9]*) log "ICEDRIVE_GATE_INTERVAL='$INTERVAL' is not a whole number of seconds - using 5"; INTERVAL=5 ;; esac
+[ "$INTERVAL" -ge 1 ] || { log "ICEDRIVE_GATE_INTERVAL=$INTERVAL would never advance the clock - using 1"; INTERVAL=1; }
+
 # is_mounted PATH — /proc/self/mountinfo ONLY, deliberately.
 #
 # No `mountpoint`, no `findmnt`, no guard binary: this decides whether the
@@ -167,6 +180,13 @@ done
 # ICEDRIVE_GATE_REQUIRE_MARKER=false turns it off. That exists for a lab with a
 # throwaway library, and it is loud about what it is giving up.
 MARKER="${ICEDRIVE_GATE_MARKER:-.homehub-library}"
+# A BASENAME, NOT A PATH. `ICEDRIVE_GATE_MARKER=../blessed` would let a file
+# OUTSIDE the volume bless it — which is the one thing the marker exists to make
+# impossible, since surviving on the volume is the whole property.
+# (Adversarial review, 2026-08-29.)
+case "$MARKER" in
+    ''|*/*|.|..) log "REFUSING TO START: ICEDRIVE_GATE_MARKER='$MARKER' is not a plain file name. The marker must live ON the volume; a path could point anywhere."; exit 1 ;;
+esac
 if [ "${ICEDRIVE_GATE_REQUIRE_MARKER:-true}" = "true" ]; then
     unmarked=()
     for p in "${PATHS[@]}"; do

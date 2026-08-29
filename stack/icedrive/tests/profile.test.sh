@@ -289,6 +289,76 @@ if [ "$(sha256sum "$ARCH" | cut -d' ' -f1)" = "$GOOD_SHA" ]; then
 else
     fail "I15 the failed capture damaged the last good archive"
 fi
+
+# ── I16: a client that STARTS AND THEN DIES must fail the capture (C36) ──────
+# THE DEFECT THIS EXISTS TO CATCH, and it is not hypothetical: on 2026-08-29 the
+# restart brought the client up, it logged RemoteHostClosedError five seconds
+# later and exited, and the old three-second liveness check asserted "still
+# running" IN THE SAME SECOND and returned 0. The unit exited 0, the nightly
+# timer would have too, and the household's offsite copy was down until
+# verify-hub.sh noticed. A check that samples one instant cannot tell "started"
+# from "started and about to die".
+#
+# HOW THE FIXTURE FAKES A CLIENT WITHOUT ONE. Three seams, all already in the
+# script: ICEDRIVE_PROFILE_HOME for the profile, SESSION_PID to stand in for the
+# desktop session (session_env_load then reads DISPLAY out of that pid's real
+# /proc environ), and `exec -a` to give a harmless `sleep` an argv[0] matching
+# APP_RE. Nothing is installed and /opt is never touched.
+echo "== I16: a client that starts and then dies is a FAILED capture (C36) =="
+make_profile
+
+# A stand-in for the desktop session. It has to be DISCOVERABLE the way the real
+# one is - session_pid() runs `pgrep -u USER -x xfce4-session` - and exporting
+# SESSION_PID does not work, because the script initialises that variable itself
+# and clobbers anything inherited. So give the fake the right process NAME:
+# `pgrep -x` matches comm, which for a shell script would be "bash", hence a copy
+# of a real binary rather than a script. Its environ then supplies the DISPLAY
+# that session_env_load is actually looking for.
+cp /bin/sleep "$TMP/xfce4-session"
+env DISPLAY=:99 "$TMP/xfce4-session" 120 &
+FAKE_SESSION=$!
+sleep 1
+if pgrep -u "$ME" -x xfce4-session >/dev/null 2>&1; then
+    pass "I16 setup: a stand-in desktop session is discoverable with a DISPLAY"
+else
+    fail "I16 setup: no discoverable session - the capture will refuse to stop the client"
+fi
+
+cat >"$TMP/dying-client.sh" <<'EOS'
+#!/bin/bash
+exec -a "/opt/icedrive/Icedrive.AppImage" sleep 4
+EOS
+chmod +x "$TMP/dying-client.sh"
+printf '[Desktop Entry]\nType=Application\nExec=%s\n' "$TMP/dying-client.sh" \
+    >"$REALHOME/.config/autostart/icedrive.desktop"
+
+setsid bash -c 'exec -a "/opt/icedrive/Icedrive.AppImage" sleep 120' &
+sleep 1
+if pgrep -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' >/dev/null 2>&1; then
+    pass "I16 setup: a stand-in client is running and matches the app pattern"
+else
+    fail "I16 setup: no stand-in client — the restart path would not be exercised"
+fi
+
+rc="$(sut --capture)"
+if [ "$rc" = 1 ]; then
+    pass "I16 the capture FAILS when the restarted client dies (exit 1)"
+else
+    fail "I16 exit=$rc, want 1 — a dead client reported as success (this IS C36)"
+    sed -n '1,40p' "$TMP/out.txt"
+fi
+if grep -qi 'EXITED' "$TMP/out.txt"; then
+    pass "I16 and it says the client EXITED, not merely that something failed"
+else
+    fail "I16 the failure does not name what happened: $(tail -3 "$TMP/out.txt")"
+fi
+if [ -f "$OUT/icedrive-profile.tar.gz.gpg" ]; then
+    pass "I16 and the archive was still written — the copy is good, the client is not"
+else
+    fail "I16 the archive is missing; a restart failure must not discard a good capture"
+fi
+pkill -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' 2>/dev/null || true
+kill "$FAKE_SESSION" 2>/dev/null || true
 if [ "$(ls "$OUT" | grep -c '^\.')" = 0 ]; then pass "I15 and no temporary file was left behind"; else fail "I15 leftovers: $(ls -A "$OUT" | tr '\n' ' ')"; fi
 echo
 echo "──────────────────────────────────────────────────────────────"

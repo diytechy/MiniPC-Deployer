@@ -329,27 +329,85 @@ stop_client() {
     return 0
 }
 
-# start_client — 0 only if the APP is back AND still there three seconds later.
+# start_client — 0 only if the app came back AND reached a WORKING state.
+#
+# ── WHY THIS IS NOT "IS IT ALIVE AT T+3" ANY MORE (C36, 2026-08-29) ──────────
+# The previous version slept 3s and re-checked for a pid. It reported SUCCESS
+# over a client that was dying as it looked. Measured, from the unit journal and
+# the client's own log lined up to the second:
+#
+#   20:44:28    restart issued
+#   20:44:30-32 client starts, authenticates, reads storage stats, gets its pairs
+#   20:44:33.20 `WS client message: RemoteHostClosedError` — and the log ends
+#   20:44:33    this function logged "still running (after 1s)" and returned 0
+#
+# The assertion passed in the SAME SECOND the client died. The unit exited 0, the
+# nightly timer would have done the same, and the household's offsite copy was
+# down until verify-hub.sh's TC-H-S09 noticed. A liveness probe that samples one
+# instant cannot tell "started" from "started and about to die"; the fix is to
+# wait for evidence the client is DOING ITS JOB, not that it exists.
+#
+# ── THE TWO OUTCOMES ARE DELIBERATELY NOT SYMMETRIC ─────────────────────────
+# A longer window would fail a box that is simply quiet. So:
+#
+#   * THE PROCESS DIES during the window  -> HARD FAIL. This is the observed bug
+#     and the one that must never again be reported as success.
+#   * ALIVE, but no readiness marker      -> SUCCEED, LOUDLY, naming what was not
+#     observed. A hub with no sync pairs yet (any freshly reimaged one, before
+#     the Owner creates a pair) may legitimately never log one, and refusing to
+#     capture there would break the recovery story for the exact machines that
+#     need it most. Sixty seconds alive is already twenty times the old bar.
+#
+# The readiness markers are what a working client logs once its pairs are live —
+# observed on this box: `start watch on "/srv/..."`, `waiting for events`,
+# `checking pending uploads`. Matching is scoped to bytes written by THIS run
+# (see log_start), so a previous run's steady state can never satisfy it.
 start_client() {
     local desktop="$HOMEDIR/.config/autostart/icedrive.desktop" exec_line="" w=0
+    local applog="$HOMEDIR/.local/share/Icedrive/logdata.txt" log_start=0
+    local ready_timeout=60
     [ -f "$desktop" ] || { warn "no $desktop — cannot restart the client"; return 1; }
     exec_line="$(awk -F= '$1=="Exec"{sub(/^[^=]*=/,""); print; exit}' "$desktop")"
     [ -n "$exec_line" ] || { warn "no Exec= in $desktop — cannot restart"; return 1; }
     session_env_load || { warn "no desktop session for $PROF_USER — cannot restart the client here"; return 1; }
+    # Where the client's log ends BEFORE we start it. Every readiness scan below
+    # reads only past this offset, so a marker left by an EARLIER run — including
+    # the run we just stopped — can never be mistaken for this one starting.
+    [ -f "$applog" ] && log_start="$(wc -c <"$applog" 2>/dev/null || echo 0)"
+
     log "restarting the client into the live session ($(printf '%s\n' ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} | grep '^DISPLAY=' || echo 'DISPLAY=?'))"
     setsid runuser -u "$PROF_USER" -- env ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} nohup sh -c "$exec_line" >/dev/null 2>&1 &
     disown 2>/dev/null || true
+
+    # Phase 1 — a process appears at all.
     while [ "$w" -lt 25 ] && [ -z "$(app_pids)" ]; do sleep 1; w=$((w+1)); done
     if [ -z "$(app_pids)" ]; then
         warn "the client did NOT come back after ${w}s (the gate may have refused — check: journalctl -t icedrive-gate)"
         return 1
     fi
-    sleep 3
-    if [ -z "$(app_pids)" ]; then
-        warn "the client started and then exited within 3s — it is NOT running"
-        return 1
-    fi
-    log "client is back and still running (after ${w}s)"
+
+    # Phase 2 — it stays up AND reaches a working state. This is the C36 fix.
+    local waited=0
+    while [ "$waited" -lt "$ready_timeout" ]; do
+        if [ -z "$(app_pids)" ]; then
+            warn "the client started and then EXITED after ~$((w + waited))s — it is NOT running."
+            warn "  the last lines it wrote (this run only):"
+            tail -c "+$((log_start + 1))" "$applog" 2>/dev/null | tail -5 | while IFS= read -r l; do warn "    $l"; done
+            warn "  a RemoteHostClosedError here means the restart raced the old instance's teardown (C36)."
+            return 1
+        fi
+        if tail -c "+$((log_start + 1))" "$applog" 2>/dev/null \
+             | grep -qE 'waiting for events|checking pending uploads|start watch on'; then
+            log "client is back and WORKING (up ${w}s, reached a working state after ${waited}s)"
+            return 0
+        fi
+        sleep 2; waited=$((waited + 2))
+    done
+
+    # Alive but quiet. Not a failure — see the banner — but never silent either.
+    log "client is back and has stayed up ${ready_timeout}s, but wrote no readiness"
+    log "  marker (no sync pair yet?). Treating as OK; it did NOT die, which is"
+    log "  the failure this check exists to catch."
     return 0
 }
 

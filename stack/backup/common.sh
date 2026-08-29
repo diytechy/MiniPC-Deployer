@@ -615,9 +615,17 @@ mount_options_for() {
 # curl therefore cannot reach it, and the public tracker.<domain> route would
 # bounce through oauth2-proxy and overwrite X-Forwarded-User (defect found
 # 2026-07-30, Personal A9). When NAGLIGHT_FEED_CONTAINER is set the POST runs
-# INSIDE that container via docker exec + its busybox wget (present — the
-# healthcheck uses it), keeping the port closed; unset = direct curl (sim /
-# single-user setups where the URL is host-reachable).
+# INSIDE that container via docker exec + its wget (present — the healthcheck
+# uses it), keeping the port closed; unset = direct curl (sim / single-user
+# setups where the URL is host-reachable).
+#
+# IT IS NOT BUSYBOX WGET, which this comment claimed until 2026-08-29. The image
+# ships **GNU wget 1.24.5 on musl**. The distinction cost real debugging time in
+# library-guard.sh, which copies this transport: with `-q` and no `-S`, a 4xx
+# exits 8 and prints NOTHING, so a report that was being rejected with a
+# perfectly clear HTTP 400 looked like a dead network. If this function ever
+# needs the status code rather than a boolean, it needs `-S` (headers) and
+# `--content-on-error` (the body) — see library-guard.sh's feed block.
 #
 # FEED_LAST_CODE carries the outcome of the LAST post — the HTTP code, `000`
 # when nothing answered, or `skipped` when no URL is configured. Added for
@@ -641,7 +649,11 @@ feed_naglight() {
         [ -n "${NAGLIGHT_USER:-}" ]  && whdr+=(--header "X-Forwarded-User: ${NAGLIGHT_USER}")
         if docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -O /dev/null "${whdr[@]}" \
                 --post-data "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null; then
-            code=200                       # busybox wget: exit 0 == HTTP 2xx
+            code=200                       # wget: exit 0 == HTTP 2xx. NOTE: a 4xx
+                                           # lands in the else below as a bare
+                                           # 000, which cannot be told from "no
+                                           # answer". Enough for ok/fail here;
+                                           # not enough to diagnose. See above.
         else
             code=000
         fi

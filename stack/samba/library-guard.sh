@@ -301,9 +301,70 @@ if [ -n "${NAGLIGHT_FEED_URL:-}" ]; then
         hdr=(--header "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(--header "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(--header "X-Forwarded-User: ${NAGLIGHT_USER}")
-        docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -O /dev/null "${hdr[@]}" \
-            --post-data "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null \
-            && log "feed: reported $band" || log "feed: report FAILED (tracker unreachable?)"
+        # NAME WHAT ACTUALLY HAPPENED (C29). This used to be one line that threw
+        # busybox wget's stderr at /dev/null, captured no status, and printed
+        # "feed: report FAILED (tracker unreachable?)" for every possible cause.
+        # It was measured on 2026-08-29 blaming the network while the transport
+        # was fine: `docker exec tracker wget .../healthz` returned `ok`, and the
+        # real answer was HTTP 400 - the tracker has no item declaring this
+        # check id, so /api/feed rejects the post before touching any state.
+        #
+        # A report that cannot say why it failed sends the next person to the
+        # wrong subsystem, and this one sent three people to the network. Four
+        # causes, four messages, and the HTTP code carried through.
+        if ! command -v docker >/dev/null 2>&1; then
+            log "feed: NOT SENT - no docker binary on PATH, and NAGLIGHT_FEED_CONTAINER=$NAGLIGHT_FEED_CONTAINER asks for the docker exec transport"
+            log "  (the tracker is bridge-only by design, so there is no host-reachable URL to fall back to)"
+        elif ! docker inspect -f '{{.State.Running}}' "$NAGLIGHT_FEED_CONTAINER" 2>/dev/null | grep -q true; then
+            log "feed: NOT SENT - container '$NAGLIGHT_FEED_CONTAINER' is not running (state: $(docker inspect -f '{{.State.Status}}' "$NAGLIGHT_FEED_CONTAINER" 2>/dev/null || echo 'no such container'))"
+        else
+            # `-S` IS LOAD-BEARING, AND `-q` ALONE THREW THE ANSWER AWAY.
+            # The image ships GNU wget 1.24.5 on musl - NOT busybox, which
+            # the old comment here and the one in backup/common.sh both
+            # claim. With `-q` and no `-S`, a 4xx gives exit 8 and SILENCE:
+            # measured 2026-08-29 as `report FAILED (wget exit 8) - no
+            # output`, which is barely better than the message it replaced.
+            # `-q -S` stays quiet about progress and still writes the
+            # response headers to stderr, where the status line lives.
+            # `--content-on-error` IS THE POINT, and the first cut of this fix
+            # did not have it. The tracker answers 400 with a one-line
+            # explanation in the BODY, and wget throws the body away on a 4xx
+            # unless told not to. Without it this code GUESSED which 400 it
+            # was, and guessed wrong: it blamed a missing check id while the
+            # server was actually reporting that the item was not in the day's
+            # log - a different fault with a different fix. Print what the
+            # server said; never infer it from the status code alone.
+            __ferr="$(docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -S -O - --content-on-error "${hdr[@]}" \
+                        --post-data "$body" "$NAGLIGHT_FEED_URL" 2>&1)"
+            __frc=$?
+            if [ "$__frc" -eq 0 ]; then
+                log "feed: reported $band"
+            else
+                __fcode="$(printf '%s' "$__ferr" | grep -oE 'HTTP/[0-9.]+ [0-9]{3}' | grep -oE '[0-9]{3}$' | head -1)"
+                __fline="$(printf '%s' "$__ferr" | tr -s ' \n' ' ' | cut -c1-160)"
+                log "feed: report FAILED (wget exit $__frc${__fcode:+, HTTP $__fcode}) - ${__fline:-no output}"
+                # 400 has exactly one meaning here and it is not a network fault.
+                # Say so, and say where the fix is, because the check id is a
+                # WIRE CONTRACT with the tracker's item definitions and nothing
+                # else in this project asserts the two still agree.
+                # The server's own sentence, which is worth more than any
+                # mapping this script could carry. Both 400s seen on the box
+                # on 2026-08-29 are one line each, and neither is a transport
+                # fault:
+                #   unknown feeder check id: library-mounted
+                #     -> no item declares that check. A DEFINITIONS problem.
+                #   item library-drive-present not in <date> log
+                #     -> the item exists, but the day was materialized before
+                #        it did. `tracker materialize --data <dir>` fixes
+                #        today; the next rollover fixes itself.
+                __fbody="$(printf '%s' "$__ferr" | grep -vE '^[[:space:]]*(HTTP/|Content-|X-Content-|Date:|Connection:|Vary:|Transfer-)' | tr -s ' \n' ' ' | sed 's/^ *//;s/ *$//')"
+                [ -n "$__fbody" ] && log "  the tracker said: $__fbody"
+                case "${__fcode:-}" in
+                    400) log "  400 means the post was REJECTED before touching any state - nothing was recorded." ;;
+                    401|403) log "  $__fcode = the token or the forwarded identity was refused. Check NAGLIGHT_TOKEN and NAGLIGHT_USER in $ENV_FILE." ;;
+                esac
+            fi
+        fi
     else
         hdr=(-H "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(-H "Authorization: Bearer ${NAGLIGHT_TOKEN}")

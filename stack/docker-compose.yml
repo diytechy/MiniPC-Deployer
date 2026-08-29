@@ -103,6 +103,19 @@ services:
       # environment, which is worth knowing rather than discovering.
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
       MAIN_BOX_IP: ${MAIN_BOX_IP}
+      # ── Gun Master 3 relay (profile `gunmaster3`) ────────────────────────
+      # GAME_HOST is a T1 private name; GAME_WS_SECRET is the PATH COMPONENT
+      # that stands in for authentication on that host, and is the only thing
+      # between the internet and the relay. See the Caddyfile's game block.
+      GAME_HOST: ${GAME_HOST}
+      GAME_WS_SECRET: ${GAME_WS_SECRET}
+    # TWO NETWORKS, and BOTH must be named explicitly. Naming any network at all
+    # opts a service OUT of the implicit `default`, so omitting `default` here
+    # would cut Caddy off from tracker, actual and oauth2-proxy in one edit — a
+    # failure that presents as every site 502ing at once.
+    networks:
+      - default
+      - game
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       # The wall shell's static build (SR-016 / IF-005). Read-only: Caddy serves
@@ -884,6 +897,120 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - diun_data:/data
     restart: unless-stopped
+
+  # ── gunmaster3-relay — the family crossplay relay (profile `gunmaster3`) ─────
+  # WHAT IT IS: a ~300-line WebSocket relay from C:\Projects\FinnsGame\server. It
+  # forwards presence and positions between two browsers so the Owner and his son
+  # can see each other in Gun Master 3. It is not a game server: the world,
+  # physics and rendering all stay client-side. It stores nothing, writes nothing
+  # and makes no outbound calls — all three are properties of the code, and the
+  # hardening below turns them into properties of the container.
+  #
+  # ── THIS IS THE ONLY SERVICE ON THE BOX THAT FACES THE INTERNET WITH NO ──────
+  # ── IDENTITY CHECK IN FRONT OF IT, AND THAT IS A RULING, NOT AN OVERSIGHT ────
+  #
+  # The Owner, 2026-08-29: he wants to play with his son while away from home and
+  # NOT on the VPN. That rules out the remote_ip gate that took actual.<domain>
+  # and dns.<domain> off the internet the same day. The door is instead a SECRET
+  # PATH — see the Caddyfile's game block, which carries the full reasoning and
+  # the honest account of what a bearer token in a URL does and does not buy.
+  #
+  # WHY IT IS NOT basic_auth, since that is this box's convention for single-user
+  # services: the browser WebSocket constructor CANNOT SET REQUEST HEADERS, so
+  # there is nowhere to put Authorization. The only browser route is credentials
+  # embedded in the URL, which no spec requires and which would put the password
+  # in the same text box the child types into.
+  #
+  # ── ITS OWN NETWORK, AND THAT NETWORK IS `internal: true` ────────────────────
+  # The single most important line in this block. Every other container here
+  # shares the default bridge, which is where the tracker, Actual and the finance
+  # snapshots live. A public unauthenticated service does not belong on it: a
+  # code-execution bug in this process would otherwise start life next to budget
+  # data. The relay makes no outbound calls, so an internal network costs it
+  # nothing at all — it cannot reach the internet, the LAN, or its neighbours.
+  # Caddy joins both networks (see its `networks:` block) and is the only route
+  # in.
+  #
+  # BUILD: locally, like naglight:local (Q10.2 — no registry yet). From a sibling
+  # FinnsGame checkout:
+  #     docker build -t gunmaster3-relay:local ../../FinnsGame/server
+  gunmaster3-relay:
+    image: gunmaster3-relay:${GAME_RELAY_IMAGE_TAG}
+    container_name: gunmaster3-relay
+    profiles: ["gunmaster3"]
+    labels:
+      # Locally built, no registry home to watch — same reason as naglight:local.
+      - "diun.enable=false"
+    environment:
+      PORT: "8367"
+      MAX_PLAYERS: ${GAME_MAX_PLAYERS}
+      NAME: ${GAME_RELAY_NAME}
+    networks:
+      - game
+    # expose, NOT ports: nothing publishes this to the host. Caddy reaches it
+    # across the `game` network by container name and is the only thing that can.
+    expose:
+      - "8367"
+    # ── hardening: every line below is free, because the relay already does none
+    # of the things they forbid. That is the point — it makes "it stores nothing"
+    # structural instead of behavioural, so a bug cannot leave a payload behind.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Bounds the ONE real DoS vector in the relay: sockets that connect and never
+    # say hello are held for HELLO_TIMEOUT_MS (5s) and are NOT counted against
+    # MAX_PLAYERS, because capacity is checked in handleHello. A flood therefore
+    # grows file descriptors regardless of the player cap. Caddy's rate_limit
+    # (120 upgrades/min/IP) is the first line; these are the backstop.
+    pids_limit: 128
+    mem_limit: 192m
+    restart: unless-stopped
+    healthcheck:
+      # The image's own HEALTHCHECK hits /health on 127.0.0.1 — restated here so
+      # the interval matches the rest of this file. /health is deliberately NOT
+      # routed by Caddy: it answers access-control-allow-origin:* and would
+      # confirm to any scanner that a relay lives at that name. Nothing is lost —
+      # this probe runs inside the container.
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8367/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# ── networks ─────────────────────────────────────────────────────────────────
+# `default` is implicit and unchanged: every service that names no network still
+# lands on it, which is all of them but the two below.
+networks:
+  default:
+  # The relay's isolation boundary. Caddy is dual-homed and is the only path in.
+  # Do NOT add a second service here without re-reading the gunmaster3-relay
+  # banner: the value of this network is that exactly one untrusted thing sits
+  # on it.
+  #
+  # ── READ THIS BEFORE TRUSTING `internal: true` ───────────────────────────────
+  # It does LESS than its name suggests, and the first version of this file
+  # claimed more than it delivers. `internal: true` removes the default route,
+  # so there is genuinely no path to the internet, the LAN, or the other
+  # compose networks — all measured. **It does NOT stop the container reaching
+  # the HOST**, which still owns the bridge address, and Docker documents that
+  # exception. Measured 2026-08-29 from inside the relay: 172.x.0.1:22 (SSH),
+  # :53 and :5380 (Technitium — HOST-networked, so its admin console was
+  # reachable straight past Caddy's LAN gate AND its basic_auth) and :9090 all
+  # answered. Found by an adversarial review (gpt-5.6-sol), then confirmed by
+  # connecting, not by reading.
+  #
+  # THE SUBNET IS PINNED so a firewall rule can name it. A dynamically-allocated
+  # subnet moves, and a host rule naming last week's range is a rule that
+  # silently protects nothing. The host-side REJECT lives in
+  # stack/game-isolation/ and is what actually closes the hole; this pin is the
+  # half that makes it addressable.
+  game:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.90.0/24
 
 volumes:
   ddns_data:

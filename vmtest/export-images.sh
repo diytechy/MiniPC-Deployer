@@ -213,6 +213,14 @@ sibling_repo_for() {
         naglight)        echo "NagLight" ;;
         finance-auditor) echo "Finance-Auditor" ;;
         filebackup)      echo "FileBackup" ;;
+        # The relay's Dockerfile lives in a SUBDIRECTORY (FinnsGame/server), but
+        # the thing with a .git — and therefore the thing a freshness check can
+        # compare against — is the repo ROOT. Name the root here; the build side
+        # resolves the same root with `git rev-parse --show-toplevel`. Omitting
+        # this row does not fail loudly, it just silently skips the freshness
+        # comparison for the one image nobody else is watching (adversarial
+        # review finding 3, 2026-08-29).
+        gunmaster3-relay) echo "FinnsGame" ;;
         *)               echo "" ;;
     esac
 }

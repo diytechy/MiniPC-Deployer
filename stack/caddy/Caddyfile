@@ -21,6 +21,7 @@
 #   {$ACTUAL_BASICAUTH_USER} {$ACTUAL_BASICAUTH_HASH}
 #   {$DNS_BASICAUTH_USER} {$DNS_BASICAUTH_HASH}
 #   {$WALL_HOST} {$WALL_PORT} {$PANEL_IP} {$PANEL_USER_SUB}
+#   {$GAME_HOST} {$GAME_WS_SECRET}
 
 {
     # WHERE rate_limit SITS IN THE CHAIN, and it is the whole point of the
@@ -169,6 +170,25 @@
             events 120
             window 1m
         }
+        # ── IPv6: RATE-LIMIT THE /64, NOT THE ADDRESS ────────────────────────
+        # ADDED 2026-08-29 (adversarial review finding 4, gpt-5.6-sol).
+        #
+        # A per-ADDRESS bucket is close to meaningless against IPv6. The
+        # smallest block a residential or hosted client is normally handed is a
+        # /64 - eighteen quintillion addresses - and cycling source addresses
+        # inside it hands the attacker a fresh 120/min bucket every time, at no
+        # cost. The limit reads as tight and is trivially bypassed.
+        #
+        # It also cuts the other way, which is the part worth stating: Caddy
+        # allocates rate-limit STATE per distinct key, so address-cycling grows
+        # that state without bound - a memory-pressure problem for the whole
+        # proxy, not just for the site being attacked.
+        #
+        # /64 is the correct granularity: it is the standard end-site subnet, so
+        # it groups one client's addresses together without merging two
+        # different customers. IPv4 keeps its /32 default - there, one address
+        # really is one client.
+        ipv6_prefix 64
     }
 }
 
@@ -367,6 +387,111 @@ dns.{$DOMAIN} {
     }
     handle {
         respond "dns console: LAN only" 403
+    }
+}
+
+# ── {$GAME_HOST} — the Gun Master 3 crossplay relay (profile `gunmaster3`) ────
+# ADDED 2026-08-29 (the Owner). Inert until the profile is on: with the service
+# down the upstream name does not resolve and this host 502s, which is the
+# correct shape for an opt-in site.
+#
+# THIS IS THE ONE SITE ON THIS BOX THAT DELIBERATELY ANSWERS THE INTERNET WITH
+# NO IDENTITY CHECK, and the reason is the requirement itself. The Owner wants to
+# play with his son while away from home and NOT on the VPN — which is precisely
+# the case the @lan remote_ip gate on actual.<domain> and dns.<domain> exists to
+# refuse. Those two are right to be LAN-only; this one cannot be.
+#
+# ── THE DOOR IS A SECRET PATH, AND HERE IS WHAT THAT IS WORTH ────────────────
+#
+# The upgrade is accepted at /ws-{$GAME_WS_SECRET} (43 base64url chars = 32
+# random bytes, T3-Generated, minted
+# and never typed) and nowhere else. Be clear-eyed about the grade: this is a
+# BEARER TOKEN IN A URL. It identifies nobody, it is equally valid from any
+# address on earth, and anyone who ever sees it holds it until it is rotated.
+# Treat the URL as a password — if it leaks, change GAME_WS_SECRET, re-materialise
+# and re-paste it on each device; that is a complete revocation and it is cheap.
+#
+# WHY NOT basic_auth, which is this file's convention for single-user services:
+# the browser's WebSocket constructor CANNOT SET REQUEST HEADERS. There is
+# physically nowhere to put Authorization. The only browser route is
+# wss://user:pass@host/ws, which neither Chrome nor Firefox specifies and which
+# would put the password in the same box a nine-year-old types into. A convention
+# that cannot be implemented is not a convention.
+#
+# WHY NOT oauth2-proxy, which WOULD genuinely authenticate the socket (the
+# session cookie rides the same-origin upgrade): it needs a Google account for
+# the son and a new redirect URI registered in Google Cloud Console by hand. It
+# is the stronger answer and it is recorded as the follow-up, not dismissed.
+#
+# WHY THE 404 AND NOT A 403. The actual./dns. gates answer 403 because something
+# is there and the caller may not have it. Here the honest answer is that nothing
+# is at that path. It also keeps this host clear of fail2ban: that jail's filter
+# matches 401 ONLY — deliberately, because banning on a gate's 403 could have
+# locked the Owner out of the tracker from outside — and a family member
+# mistyping a 32-character path must never be able to ban the address they are
+# trying to play from.
+#
+# THE THROTTLE EARNS MORE HERE THAN ANYWHERE ELSE IN THIS FILE. On actual. every
+# page asset carries an auth attempt, so 120/min is flood control and that block
+# says so. A WebSocket is ONE request that then stays open, so here 120/min is
+# 120 CONNECTION ATTEMPTS per IP per minute — a genuinely tight limit, and the
+# thing that caps the relay's one real DoS vector: sockets that connect and never
+# send `hello` are held 5s and are NOT counted against MAX_PLAYERS.
+#
+# NO /health ROUTE, ON PURPOSE. The relay answers /health with
+# access-control-allow-origin:* — harmless counters, but it would confirm to any
+# scanner that a relay lives at this name. The container healthcheck probes it on
+# 127.0.0.1 from the inside, so publishing it buys nothing.
+#
+# COSTS NO CERTIFICATE, same as the actual. block: issuance is dns-01 through
+# Cloudflare, so Let's Encrypt never needs to reach this box.
+#
+# THE URL THE FAMILY PASTES (Multiplayer box on the game's Home screen):
+#     wss://<GAME_HOST>/ws-<GAME_WS_SECRET>
+# It needs NO game-client change — normalizeServerUrl() round-trips the path
+# verbatim, and connect() only fills in /ws when the path is empty. Verified by
+# reading FinnsGame's src/systems/{persistence,multiplayer}.ts, not assumed.
+{$GAME_HOST} {
+    import acme_cloudflare
+    import throttle
+    encode zstd gzip
+
+    # ── AN EXACT, CASE-SENSITIVE MATCH — AND THE FIRST VERSION WAS NEITHER ───
+    # CHANGED 2026-08-29 (adversarial review finding 5, gpt-5.6-sol), after this
+    # block was measured against a live box rather than read:
+    #
+    #   * `path` MATCHERS IN CADDY ARE CASE-INSENSITIVE. With the secret typed
+    #     in flipped case, the handshake still returned 101. base64url draws on
+    #     64 symbols but only 38 survive case-folding, so the door was quietly
+    #     narrower than the token looked. (Still ~226 bits, so this was never a
+    #     practical break — it was a DOCUMENTATION LIE, which is worse in a file
+    #     whose whole job is to be trusted about what it enforces.)
+    #   * THE TRAILING `*` IS A PREFIX WILDCARD, not "the rest of one segment".
+    #     `/ws-<secret>-anything` and `/ws-<secret>/deeper` both returned 101
+    #     too. The old comment claimed the relay accepts exactly one path; it
+    #     accepted an infinite family of them.
+    #
+    # `path_regexp` is Go's regexp: case-SENSITIVE, and `^…$` anchors both ends,
+    # so exactly one path matches and the comment above is now true. The secret
+    # is base64url ([A-Za-z0-9_-]) and carries no regexp metacharacter, so
+    # substituting it here is safe — do NOT relax the alphabet without revisiting
+    # that, because a `.` or `+` in the secret would widen this matcher silently.
+    #
+    # handle_path is gone with it: it strips a matched PREFIX, which only made
+    # sense while this was a prefix match. An explicit rewrite to /ws — the one
+    # path the relay accepts — replaces it, and any other path reaching the relay
+    # would be answered with its own 400 rather than half-working.
+    @ws path_regexp ^/ws-{$GAME_WS_SECRET}$
+    handle @ws {
+        rewrite * /ws
+        reverse_proxy gunmaster3-relay:8367
+    }
+
+    # Everything else, including a bare / and a wrong secret. A second `handle`
+    # rather than a bare `respond`, so the mutual exclusion cannot depend on
+    # directive-ordering subtleties — the same discipline as the wall block.
+    handle {
+        respond "not found" 404
     }
 }
 

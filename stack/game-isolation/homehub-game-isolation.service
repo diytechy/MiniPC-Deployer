@@ -1,0 +1,23 @@
+[Unit]
+# Closes the gap `internal: true` leaves open: a container on an internal docker
+# network can still address the HOST's bridge IP. See game-isolation.sh for the
+# measurements that justify this unit existing at all.
+Description=Block the Gun Master 3 relay subnet from addressing this host
+Documentation=file:///opt/homehub/stack/game-isolation/game-isolation.sh
+# AFTER docker, because the rule names a subnet whose bridge docker creates. The
+# rule itself does not depend on the bridge existing - iptables happily holds a
+# rule for a subnet with no interface - but ordering it here means the window
+# between "relay can run" and "relay is fenced" is never open.
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/homehub/stack/game-isolation/game-isolation.sh
+# The rule is NOT removed on stop. Deliberate: a stopped unit must not silently
+# re-open the host to a service that may still be running. Removing it is a
+# manual, deliberate act.
+
+[Install]
+WantedBy=multi-user.target

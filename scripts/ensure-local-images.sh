@@ -52,7 +52,15 @@ command -v docker >/dev/null 2>&1 || die "docker CLI not found (on the dev box, 
 # keys we need instead of shell-sourcing the file: .env is a compose env file,
 # not a shell script — an unquoted space in an unrelated value must not be able
 # to break this resolver (the 2026-07-10 TRACKER_GIT_NAME finding).
-ENV_FILE="$REPO_ROOT/stack/.env"
+#
+# OVERRIDABLE, and it has to be (added 2026-08-29 with the gunmaster3 profile).
+# vmtest/export-images.sh ALREADY takes `ENV_FILE=stack/.env` as a parameter and
+# derives its bake set from that file's COMPOSE_PROFILES. This resolver decides
+# which LOCAL IMAGES TO BUILD from the same knob — so if the two read different
+# files they disagree about which profiles are on, and the disagreement is
+# silent: the exporter demands an image the resolver never built. Same env file
+# in, same answer out.
+ENV_FILE="${ENV_FILE:-$REPO_ROOT/stack/.env}"
 [ -f "$ENV_FILE" ] || ENV_FILE="$REPO_ROOT/stack/.env.example"
 
 # env_get KEY : the last KEY= value in $ENV_FILE, surrounding quotes stripped.
@@ -90,10 +98,28 @@ ensure_image() {
         # Timestamps do NOT work here: a cache-identical rebuild reuses the
         # existing image record and keeps its original .Created, so an image that
         # was just rebuilt still looks stale. The commit sha is exact.
-        local rev='unknown' dirty=''
-        if [ -d "$sibling/.git" ]; then
-            rev="$(git -C "$sibling" rev-parse HEAD 2>/dev/null || echo unknown)"
-            git -C "$sibling" diff --quiet HEAD 2>/dev/null || dirty='+dirty'
+        # RESOLVE THE REPO ROOT, do not test for `$sibling/.git`. CHANGED
+        # 2026-08-29 (adversarial review finding 3): the old test only worked
+        # when the build context WAS the repo root, which held for NagLight,
+        # Finance-Auditor and FileBackup and does NOT hold for
+        # `FinnsGame/server` — the relay's Dockerfile sits in a subdirectory, so
+        # `$sibling/.git` is absent and every relay image would have stamped
+        # `unknown`. An unstamped image is precisely the vintage-blind case the
+        # stamp exists to prevent, and export-images.sh only WARNS on one, so it
+        # would have baked stale bytes quietly.
+        #
+        # `git rev-parse --show-toplevel` answers from any depth inside a
+        # checkout, so this is correct for both shapes and needs no special case.
+        local rev='unknown' dirty='' gitroot=''
+        gitroot="$(git -C "$sibling" rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -n "$gitroot" ]; then
+            rev="$(git -C "$gitroot" rev-parse HEAD 2>/dev/null || echo unknown)"
+            # --show-toplevel succeeded, so dirtiness is a real answer, not a
+            # missing-repo one. Scope it to the BUILD CONTEXT rather than the
+            # whole repo: an edit to FinnsGame's game code does not make the
+            # relay image stale, and flagging it would train people to ignore
+            # the marker.
+            git -C "$sibling" diff --quiet HEAD -- "$sibling" 2>/dev/null || dirty='+dirty'
         fi
         docker build -t "$ref" \
             --label "homehub.source.revision=${rev}${dirty}" \
@@ -142,6 +168,42 @@ ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Audi
 #     hand-tagged image carries no homehub.source.revision, and the freshness
 #     check in export-images.sh only WARNS on an unstamped image.
 ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" ""
+
+# ── gunmaster3-relay: the family crossplay relay (profile `gunmaster3`) ──────
+# GUARDED ON THE PROFILE, and that guard is the whole point of this block.
+#
+# Every ensure_image above is unconditional because every one of those services
+# is always in the stack. This one is not: `gunmaster3` ships OFF in the public
+# repo's .env.example, so building it unconditionally would make a clone WITHOUT
+# a ../FinnsGame checkout die on a service that clone does not run. The profile
+# is the honest condition — if you are not running the relay, you do not need
+# its image.
+#
+# WHY IT MATTERS THAT THIS EXISTS AT ALL, since the profile is off by default:
+# vmtest/export-images.sh derives the bake set from `docker compose config
+# --images` WITH THE ENV FILE'S PROFILES APPLIED. So the moment `gunmaster3` is
+# in COMPOSE_PROFILES (it is, in the real config.homehub.psd1), the exporter
+# expects `gunmaster3-relay:local` to exist — and firstboot's `docker compose up
+# -d` is ALL-OR-NOTHING, so an image missing from the ISO does not degrade the
+# relay, it stops the whole stack from coming up on a reflashed box. Without
+# this block the ISO builds clean and the box comes up dead.
+#
+# THE DOCKERFILE IS IN A SUBDIRECTORY of the sibling repo (FinnsGame/server),
+# unlike NagLight and FileBackup which have theirs at the repo root. ensure_image
+# takes the sibling path verbatim, so naming the subdirectory is all it needs.
+#
+# NO PUBLIC FALLBACK: nothing publishes this image anywhere, and the hub cannot
+# fetch it either — so an absent checkout must be a loud failure naming the
+# clone, exactly as it is for FileBackup.
+GAME_RELAY_IMAGE_TAG="$(env_get GAME_RELAY_IMAGE_TAG)"
+case ",$(env_get COMPOSE_PROFILES)," in
+    *,gunmaster3,*)
+        ensure_image "gunmaster3-relay:${GAME_RELAY_IMAGE_TAG:-local}" "FinnsGame/server" ""
+        ;;
+    *)
+        log "skip: gunmaster3-relay (profile 'gunmaster3' not in COMPOSE_PROFILES)"
+        ;;
+esac
 
 # ── caddy-cloudflare: a local image that is NOT an app repo ───────────────────
 # The two above resolve from SIBLING repos, because they are our applications.

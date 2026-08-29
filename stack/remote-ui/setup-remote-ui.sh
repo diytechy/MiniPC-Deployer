@@ -318,15 +318,39 @@ if [ -n "${ICEDRIVE_APPIMAGE:-}" ]; then
         install -d -o "$RDP_USER" -g "$RDP_GROUP" "$_d"
         chown "$RDP_USER:$RDP_GROUP" "$_d"
     done
+    # THE AUTOSTART ENTRY POINTS AT THE GATE, NOT AT THE APP. IceDrive's sync
+    # pairs are SERVER-SIDE: it signs in, asks the API and starts a sync thread
+    # against an absolute `path_local` without ever asking whether that disk is
+    # mounted. `/srv/library` is a directory on the eMMC that the real disk
+    # mounts over, and the fstab entries carry `nofail`, so the session can
+    # legitimately start before a slow USB enclosure has enumerated. See
+    # icedrive-gate.sh for why this is a predicate and not a delay.
+    # `$(dirname "$0")` is this file's idiom for its own directory (see the
+    # session-unit install above); there is no $HERE here, and under `set -u`
+    # referencing one would abort the whole opt-in.
+    if [ -f "$(dirname "$0")/icedrive-gate.sh" ]; then
+        install -m 0755 "$(dirname "$0")/icedrive-gate.sh" /opt/icedrive/icedrive-gate.sh
+        ICEDRIVE_EXEC=/opt/icedrive/icedrive-gate.sh
+    else
+        # A payload that predates the gate must still produce a WORKING
+        # autostart entry rather than one pointing at a file that is not
+        # there - which would leave the client silently never starting.
+        log "WARNING: icedrive-gate.sh is not beside this script - autostarting the app directly."
+        log "  The client will then start before the library disk is verified mounted."
+        ICEDRIVE_EXEC=/opt/icedrive/Icedrive.AppImage
+    fi
     cat > "$AUTOSTART_DIR/icedrive.desktop" <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=Icedrive
-Exec=/opt/icedrive/Icedrive.AppImage
+Exec=__ICEDRIVE_EXEC__
 X-GNOME-Autostart-enabled=true
 EOF
+    sed -i "s|__ICEDRIVE_EXEC__|$ICEDRIVE_EXEC|" "$AUTOSTART_DIR/icedrive.desktop"
     chown "$RDP_USER:" "$AUTOSTART_DIR/icedrive.desktop"
-    log "IceDrive installed to /opt/icedrive/ + autostart entry written"
+    log "IceDrive installed to /opt/icedrive/ + autostart entry written (via icedrive-gate.sh)"
+    log "  the gate waits for \${ICEDRIVE_GATE_PATHS:-/srv/library} to be really mounted"
+    log "  and REFUSES to start the client if it never appears - see its header"
     log "NEXT (GUI, over RDP): sign in + configure sync pairs — see README.md,"
     log "including the post-reboot one-RDP-touch limitation."
 else

@@ -32,7 +32,7 @@ different repos:
 | | **Carriage** (build time, dev PC) | **Activation** (first boot, on the box) |
 |---|---|---|
 | desktop | the 22 names in `packages.optional.list`, baked only when `BAKE_OPTIONAL=1` | `REMOTE_UI_ENABLED=true` in `.env` → firstboot step 6c runs `setup-remote-ui.sh` |
-| IceDrive | `icedrive.pin` + `export-icedrive.sh --artifact appimage` | `ICEDRIVE_MODE=appimage` → the AppImage is installed and autostarted |
+| IceDrive | `icedrive.pin` + `export-icedrive.sh --artifact appimage` | `ICEDRIVE_MODE=appimage` → the AppImage is installed and autostarted **via `icedrive-gate.sh`** (below) |
 
 Both are derived from **one declaration** in HomeHub, and
 `Materialize-Deploy.ps1` **refuses to emit an activation whose carriage is
@@ -143,3 +143,58 @@ sudo rm -rf /opt/icedrive ~hub/.config/autostart/icedrive.desktop ~hub/.xsession
 
 Then set `REMOTE_UI_ENABLED = 'false'` in HomeHub's `config.homehub.psd1` so the
 next image does not put it back.
+
+
+## `icedrive-gate.sh` — why the client is not started directly
+
+The autostart entry runs `icedrive-gate.sh`, not the AppImage. It waits for the
+disk the sync pairs point at to be **really mounted**, and refuses to start the
+client if it never appears.
+
+**Why it is needed.** IceDrive's sync pairs are *server-side* state. Measured on
+the box 2026-08-29, across a reboot:
+
+```
+the response is: {"count":1,"pairs":[{"id":63605,"path_local":"/srv/library/permtest", …}]}
+run sync threads (1); starting sync thread for syncId 63605
+start watch on "/srv/library/permtest" id: 63605
+```
+
+The client signs in, asks the API, and starts scanning an **absolute path** — it
+never asks whether that disk is mounted. `/srv/library` is an ordinary directory
+on the eMMC that the real disk mounts over, and the generated fstab carries
+`nofail`, so systemd does not wait for these disks and neither does the desktop
+session. A two-way pair scanning an unmounted mountpoint sees an empty tree, and
+*empty* and *deleted* are the same observation.
+
+**Why a predicate and not a delay.** A timed delay is a guess about enumeration
+speed, and open-item C27 has these enclosures dropping off the bus six times
+inside two minutes — a drive present at T+60 s can be gone at T+120 s. A delay
+moves the race; a check removes it.
+
+**Why not `RequiresMountsFor=` on the session unit.** That gates the whole
+graphical layer, so a missing USB disk would also cost you the remote desktop —
+the one tool you would want in order to go and look.
+
+**Behaviour**
+
+| situation | result |
+|---|---|
+| every path mounted | `exec`s the client immediately |
+| path absent | polls, then **refuses** at the timeout — logs to the journal via `logger`, exits 1 |
+| path exists but is not a mount | same refusal — this is the dangerous case a `-d` test would miss |
+| appears mid-wait | proceeds as soon as it does |
+| a STAND-IN drive | **starts** — the guard's identity verdict is logged, never enforced |
+
+Knobs: `ICEDRIVE_GATE_PATHS` (default `/srv/library`), `ICEDRIVE_GATE_TIMEOUT`
+(default 600 s), `ICEDRIVE_GATE_INTERVAL` (default 5 s), `ICEDRIVE_APP`.
+
+It reads `/proc/self/mountinfo` directly rather than calling `mountpoint`,
+`findmnt` or the guard: this decides whether the household's cloud sync starts,
+and it must not be able to answer "no" because a tool is missing. That is also a
+pure read of a virtual file, so it can never wake a spun-down disk.
+
+**Which disk.** The pairs live under `/srv/library`, so the LIBRARY drive is what
+matters — not the backup drive, which IceDrive never touches. Waiting on
+`/mnt/backup-drive` would block the cloud copy for a fault that has nothing to do
+with it. Add it to `ICEDRIVE_GATE_PATHS` only if a pair is ever pointed at it.

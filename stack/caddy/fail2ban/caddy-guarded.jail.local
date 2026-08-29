@@ -50,6 +50,30 @@ maxretry = 15
 findtime = 10m
 bantime  = 1h
 
+# THE BACKOFF IS NON-LINEAR AND PER-ADDRESS (the Owner, 2026-08-29: "I would
+# prefer a non-linear rate limit that increases the delay for each attempt, and
+# perhaps by requester").
+#
+# This is the layer that can actually deliver that, and the Caddy rate limiter is
+# not. `rate_limit` runs in the REQUEST phase - it never sees the response status,
+# so it cannot tell a failed login from a page asset, and no Caddy plugin does
+# status-aware throttling. The only thing that sees a 401 is the access log, and
+# this is what reads it.
+#
+# bantime.increment multiplies the base bantime by 2^(previous bans by this
+# address), so one address walks 1h -> 2h -> 4h -> 8h -> ... while a neighbour who
+# fat-fingered a password once still gets one hour. maxtime caps it at a week so a
+# NAT'd address behind which somebody once mistyped cannot be exiled for ever.
+# rndtime spreads the unban moment so a set of addresses banned together does not
+# come back in one synchronised wave.
+#
+# IT DEPENDS ON THE PERSISTENT DATABASE, and on fail2ban.local raising the shipped
+# dbpurgeage from 1d - without that the count resets daily and this whole block
+# quietly becomes a flat one-hour ban.
+bantime.increment = true
+bantime.maxtime   = 1w
+bantime.rndtime   = 5m
+
 # NEVER BAN THE BOX OR ITS OWN CONTAINERS. The docker bridge subnets are where
 # every internal probe comes from - uptime-kuma, healthchecks, verify-hub - and a
 # self-ban would present as "the stack broke" with nothing pointing here.

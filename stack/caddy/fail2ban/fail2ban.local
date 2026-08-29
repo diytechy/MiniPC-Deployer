@@ -1,0 +1,21 @@
+# fail2ban.local — installed by firstboot.sh alongside the caddy-guarded jail.
+#
+# ONE SETTING, AND IT EXISTS TO MAKE bantime.increment MEAN ANYTHING.
+#
+# Incremental banning works by asking the persistent database "how many times has
+# this address been banned before?" and multiplying the base bantime by 2^that.
+# The shipped `dbpurgeage = 1d` throws that history away after a day, so an
+# attacker who comes back tomorrow is a first-time offender again and the
+# escalation silently resets to one hour, for ever. The feature would look
+# enabled and do nothing - which is the exact shape of false-green this project
+# keeps finding, so it is fixed here rather than left as a footnote.
+#
+# 60 days is chosen against the behaviour being punished: someone probing a
+# household DNS console is not on a one-afternoon schedule, and a repeat visitor
+# six weeks later is the same visitor. The cost is a slightly larger sqlite file.
+[DEFAULT]
+
+# The section header matters: dbpurgeage lives under [DEFAULT] in fail2ban.conf,
+# and a .local without one makes fail2ban refuse to start with
+# "File contains no section headers" - which takes the jail with it.
+dbpurgeage = 60d

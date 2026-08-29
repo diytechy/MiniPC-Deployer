@@ -1165,6 +1165,10 @@ if command -v fail2ban-server >/dev/null 2>&1 && [ -d "$STACK_DIR/caddy/fail2ban
     install -d -m 0755 /var/log/caddy
     install -m 0644 "$STACK_DIR/caddy/fail2ban/caddy-guarded.filter.conf" \
         /etc/fail2ban/filter.d/caddy-guarded.conf
+    # Raises dbpurgeage from the shipped 1d. Without it bantime.increment resets
+    # its count every day and the escalating ban is a flat one-hour ban wearing a
+    # feature's name.
+    install -m 0644 "$STACK_DIR/caddy/fail2ban/fail2ban.local" /etc/fail2ban/fail2ban.local
     _f2b_lan="$(sed -n 's/^LAN_IP=//p' "$STACK_DIR/.env" | tail -n1 | tr -d "\"'")"
     if [ -n "$_f2b_lan" ]; then
         sed "s|@LAN_IP@|$_f2b_lan|" "$STACK_DIR/caddy/fail2ban/caddy-guarded.jail.local" \

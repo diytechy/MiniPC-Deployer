@@ -364,7 +364,7 @@ stop_client() {
 # (see log_start), so a previous run's steady state can never satisfy it.
 start_client() {
     local desktop="$HOMEDIR/.config/autostart/icedrive.desktop" exec_line="" w=0
-    local applog="$HOMEDIR/.local/share/Icedrive/logdata.txt" log_start=0
+    local applog="$HOMEDIR/.local/share/Icedrive/logdata.txt" log_start=0 log_inode=''
     local ready_timeout=60
     # How long the client must keep running AFTER it first looks healthy. The
     # observed death was at ~5s; 15 clears it with room and still keeps the
@@ -382,10 +382,20 @@ start_client() {
     # recorded offset catches exactly that, and reading the whole file is the
     # right fallback: after a truncation, everything in it IS this run.
     _icd_newlog() {
-        local sz=0
+        local sz=0 ino=''
         [ -f "$applog" ] || return 0
         sz="$(wc -c <"$applog" 2>/dev/null || echo 0)"
-        if [ "$sz" -lt "$log_start" ]; then
+        ino="$(stat -c %d:%i "$applog" 2>/dev/null || echo '')"
+        # TWO WAYS A LOG STOPS BEING THE ONE WE MEASURED, and the first version
+        # only caught one. Truncate-in-place makes it SHRINK; rotate-by-rename
+        # replaces the INODE and the new file can grow past the old offset before
+        # the next scan, at which point `tail -c +N` skips the very lines we are
+        # waiting for and a healthy restart is reported as a failure. Compare the
+        # inode as well, and start from zero whenever either says "different
+        # file".
+        if [ -n "$log_inode" ] && [ "$ino" != "$log_inode" ]; then
+            cat "$applog" 2>/dev/null
+        elif [ "$sz" -lt "$log_start" ]; then
             cat "$applog" 2>/dev/null
         else
             tail -c "+$((log_start + 1))" "$applog" 2>/dev/null
@@ -415,12 +425,22 @@ start_client() {
     # AppImage re-execs itself as `AppRun` out of /tmp/.mount_Icedri*, so the
     # literal name is absent from its cmdline. CLIENT_RE already covers that,
     # which is why stop_client works and a naive pattern does not.
+    # ONLY A BIND THAT ACTUALLY CONFLICTS COUNTS. IceDrive binds
+    # 127.0.0.1:14411, so a different service listening on the LAN address
+    # (LAN_IP:14411) does not collide with it at all - but a bare `grep :14411`
+    # sees it, waits 30s and then REFUSES TO RESTART THE CLIENT, leaving the
+    # offsite copy down over a port that was never in the way. Match only
+    # loopback, the IPv4 wildcard, and the IPv6 wildcard (which captures IPv4
+    # unless bindv6only is set).
+    __port_busy() {
+        ss -lnt 2>/dev/null | awk '{print $4}'             | grep -qE '^(127\.0\.0\.1|0\.0\.0\.0|\[::\]|\*):14411$'
+    }
     local __p=0
     while [ "$__p" -lt 30 ]; do
-        ss -lnt 2>/dev/null | grep -q ':14411 ' || break
+        __port_busy || break
         sleep 1; __p=$((__p + 1))
     done
-    if ss -lnt 2>/dev/null | grep -q ':14411 '; then
+    if __port_busy; then
         warn "port 14411 is STILL held after ${__p}s — starting now would produce"
         warn "  'failed to create wserver' and a client that dies seconds later (C36)."
         warn "  Not starting. The profile archive is safe; the client needs a hand."
@@ -431,7 +451,10 @@ start_client() {
     # Where the client's log ends BEFORE we start it. Every readiness scan below
     # reads only past this offset, so a marker left by an EARLIER run — including
     # the run we just stopped — can never be mistaken for this one starting.
-    [ -f "$applog" ] && log_start="$(wc -c <"$applog" 2>/dev/null || echo 0)"
+    if [ -f "$applog" ]; then
+        log_start="$(wc -c <"$applog" 2>/dev/null || echo 0)"
+        log_inode="$(stat -c %d:%i "$applog" 2>/dev/null || echo '')"
+    fi
 
     log "restarting the client into the live session ($(printf '%s\n' ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} | grep '^DISPLAY=' || echo 'DISPLAY=?'))"
     setsid runuser -u "$PROF_USER" -- env ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} nohup sh -c "$exec_line" >/dev/null 2>&1 &
@@ -453,8 +476,13 @@ start_client() {
     # and leaving immediately is the same mistake as sleeping three seconds and
     # leaving; it just looks more thorough. A marker now starts a stabilisation
     # countdown instead of ending the loop.
-    local waited=0 ready_at=-1
-    while [ "$waited" -lt "$ready_timeout" ]; do
+    # THE STABILISATION WINDOW IS ON TOP OF THE READINESS BUDGET, not inside it.
+    # It used to share one 60s budget, so a client that legitimately took 50s to
+    # come up was observed WORKING and then failed at 60 for "never reporting
+    # working" - a false failure that would have stopped a healthy nightly
+    # capture. The deadline now extends once readiness is seen.
+    local waited=0 ready_at=-1 deadline="$ready_timeout"
+    while [ "$waited" -lt "$deadline" ]; do
         if [ -z "$(app_pids)" ]; then
             warn "the client started and then EXITED after ~$((w + waited))s — it is NOT running."
             warn "  the last lines it wrote (this run only):"
@@ -465,6 +493,7 @@ start_client() {
         if [ "$ready_at" -lt 0 ] && _icd_newlog \
              | grep -qE 'waiting for events|checking pending uploads|start watch on'; then
             ready_at="$waited"
+            deadline=$((waited + STABILISE_S + 2))
             log "client reached a working state after ${ready_at}s — watching ${STABILISE_S}s more before calling it good"
         fi
         if [ "$ready_at" -ge 0 ] && [ "$((waited - ready_at))" -ge "$STABILISE_S" ]; then

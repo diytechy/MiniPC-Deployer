@@ -1006,63 +1006,78 @@ fi
 rm -f "${__restore_log:-}" 2>/dev/null || true
 
 # ── 4-pre. FENCE THE CROSSPLAY RELAY BEFORE ANYTHING STARTS IT ──────────────
-# ORDER IS THE POINT OF THIS BLOCK. The relay is the one service on this box that
-# answers the public internet with no identity check, and `internal: true` does
-# NOT stop it reaching the HOST — Docker keeps the bridge gateway live and
-# documents the exception. Measured on the running box: the relay reached host
-# SSH, Technitium's DNS AND its admin console on 5380, and cockpit, the console
-# bypassing both of the guards on it. So the firewall rule must exist BEFORE the
-# container does, not several hundred lines later.
+# ORDER IS THE POINT. The relay is the one service on this box that answers the
+# public internet with no identity check, and `internal: true` does NOT stop it
+# reaching the HOST - Docker keeps the bridge gateway live and documents the
+# exception. Measured: the relay reached host SSH, Technitium's DNS AND its admin
+# console on 5380, and cockpit, the console bypassing both of the guards on it.
+# So the rule must exist BEFORE the container does.
 #
-# READ THE PROFILE WITH env_value, NOT AS A SHELL VARIABLE. This script
-# deliberately does not source .env (see env_value's banner), so `$COMPOSE_PROFILES`
-# is UNSET here — the first version of this block tested it directly and was a
-# silent no-op: the case never matched, the unit was never installed, and a
-# reimaged box would have run the relay with the host wide open while every log
-# line said success. Found by an adversarial review, not by anything failing.
+# READ THE PROFILE WITH env_value, NOT AS A SHELL VARIABLE. This script does not
+# source .env, so `$COMPOSE_PROFILES` is UNSET here - the first version tested it
+# directly and was a silent no-op: the unit was never installed and a reimaged box
+# would have run the relay with the host wide open while every log line said
+# success.
 #
-# AND IT FAILS CLOSED. If the profile is on and the fence cannot be installed,
-# this refuses to start the stack at all rather than starting an unfenced public
-# service. A missing guard on a service like this is not a degraded box, it is a
-# different box.
+# ── AND IT DEGRADES, IT DOES NOT DETONATE ───────────────────────────────────
+# The version before this one called `exit 1` on any problem. That is the wrong
+# blast radius by a mile: a one-character typo in a GAME TOKEN would have taken
+# down household DNS, Caddy, Actual and the tracker on a freshly flashed box. The
+# relay is the only unsafe component, so the relay is the only thing that gets
+# switched off. On any failure this DROPS `gunmaster3` from the profile set
+# compose is about to use, lets the core stack come up, and records the problem
+# so firstboot still ends loudly and non-zero.
 __gm3_enabled=0
-case ",$(env_value COMPOSE_PROFILES)," in
+__gm3_failed=0
+__gm3_profiles="$(env_value COMPOSE_PROFILES)"
+case ",$__gm3_profiles," in
     *,gunmaster3,*) __gm3_enabled=1 ;;
 esac
 if [ "$__gm3_enabled" = 1 ]; then
-    # THE SECRET IS THE ONLY DOOR, so an absent or malformed one is fatal. An
-    # empty GAME_WS_SECRET collapses the Caddy matcher to `^/ws-$`, which makes
-    # the complete bearer credential the literal string "/ws-" — a public,
-    # guessable relay. 43 base64url characters is exactly what New-RandomToken
-    # emits; anything else means the materialiser did not fill this knob.
+    # THE SECRET IS THE ONLY DOOR. Empty, the Caddy matcher collapses to `^/ws-$`
+    # and the bearer credential becomes the literal string "/ws-". 43 base64url
+    # characters is exactly what New-RandomToken emits.
     __gm3_secret="$(env_value GAME_WS_SECRET)"
-    case "$__gm3_secret" in
-        *REPLACE_WITH*|"") __gm3_bad=1 ;;
-        *) if printf '%s' "$__gm3_secret" | grep -qE '^[A-Za-z0-9_-]{43}$'; then __gm3_bad=0; else __gm3_bad=1; fi ;;
-    esac
-    if [ "$__gm3_bad" = 1 ]; then
-        log "FATAL: the 'gunmaster3' profile is enabled but GAME_WS_SECRET is missing or malformed."
-        log "  That secret is the ONLY thing between the public internet and the game relay;"
-        log "  empty, the accepted path collapses to '/ws-'. Refusing to start the stack."
-        log "  Fix: re-run Materialize-Deploy.ps1 so .env carries a 43-character token."
-        exit 1
-    fi
-    if [ ! -f "$STACK_DIR/game-isolation/game-isolation.sh" ]; then
-        log "FATAL: 'gunmaster3' is enabled but game-isolation.sh is not in the payload."
-        log "  The relay would start with this host reachable from it. Refusing."
-        exit 1
-    fi
-    install -d -m 0755 /opt/homehub/stack/game-isolation
-    install -m 0755 "$STACK_DIR/game-isolation/game-isolation.sh"         /opt/homehub/stack/game-isolation/game-isolation.sh
-    install -m 0644 "$STACK_DIR/game-isolation/homehub-game-isolation.service"         /etc/systemd/system/
-    systemctl daemon-reload
-    if systemctl enable --now homehub-game-isolation.service >/dev/null 2>&1; then
-        log "  game-isolation: the relay subnet cannot address this host"
+    if ! printf '%s' "$__gm3_secret" | grep -qE '^[A-Za-z0-9_-]{43}$'; then
+        log "  GAME_WS_SECRET is missing or malformed - it is the ONLY thing between the"
+        log "  public internet and the game relay. Disabling the relay for this boot."
+        __gm3_failed=1
+    elif [ ! -f "$STACK_DIR/game-isolation/game-isolation.sh" ]; then
+        log "  game-isolation.sh is not in the payload - the relay would start with this"
+        log "  host reachable from it. Disabling the relay for this boot."
+        __gm3_failed=1
     else
-        log "FATAL: homehub-game-isolation.service did not start, so the public game relay"
-        log "  would be able to reach this host's own services (SSH, the DNS console)."
-        log "  Refusing to start the stack. Check: systemctl status homehub-game-isolation"
-        exit 1
+        # NO COPY HERE. The payload IS /opt/homehub/stack - the installer's
+        # late-command put it there - so `install <src> <same path>` fails with
+        # "are the same file", returns 1, and under `set -euo pipefail` killed
+        # firstboot outright BEFORE `docker compose up -d`. That shipped a box
+        # with no stack at all, and it is exactly the kind of thing that looks
+        # harmless in review. Only the mode needs converging.
+        chmod 0755 "$STACK_DIR/game-isolation/game-isolation.sh" 2>/dev/null || true
+        install -m 0644 "$STACK_DIR/game-isolation/homehub-game-isolation.service"             /etc/systemd/system/ 2>/dev/null || __gm3_failed=1
+        if [ "$__gm3_failed" = 0 ]; then
+            systemctl daemon-reload
+            systemctl enable --now homehub-game-isolation.service >/dev/null 2>&1 || __gm3_failed=1
+        fi
+        # VERIFY THE ARTIFACT, NOT THE EXIT CODE (house rule). `enable --now`
+        # returning 0 says systemd ran the unit, not that a REJECT is in INPUT.
+        if [ "$__gm3_failed" = 0 ] && ! iptables -S INPUT 2>/dev/null | grep -q 'homehub-game-isolation'; then
+            log "  the isolation unit reported success but no REJECT is in INPUT."
+            __gm3_failed=1
+        fi
+        [ "$__gm3_failed" = 0 ] && log "  game-isolation: the relay subnet cannot address this host"
+    fi
+
+    if [ "$__gm3_failed" = 1 ]; then
+        # Strip the profile from what compose will use. An exported
+        # COMPOSE_PROFILES overrides the .env value for this invocation, so the
+        # relay simply is not created - while DNS, Caddy, Actual and the tracker
+        # all come up normally.
+        COMPOSE_PROFILES="$(printf '%s' "$__gm3_profiles" | tr ',' '
+' | grep -vx 'gunmaster3' | paste -sd, -)"
+        export COMPOSE_PROFILES
+        log "  RELAY DISABLED FOR THIS BOOT. The rest of the stack starts normally."
+        log "  Fix the cause, then: systemctl start homehub-game-isolation && docker compose up -d"
     fi
 fi
 
@@ -1566,6 +1581,17 @@ date > "$MARKER"
 # shares are mounted), but `systemctl status homehub-firstboot` must be RED and
 # `systemctl is-failed` must say so. On a headless box the unit's state is the
 # only surface a defect can appear on that is not a line in a scrolling journal.
+# The relay guard reports the same way and for the same reason: the box is UP and
+# useful (DNS, Caddy, Actual and the tracker all started), but the crossplay relay
+# was deliberately left off because its fence could not be established. That must
+# not look like a clean boot - the Owner would otherwise discover it only when his
+# son says "I can't see Dad".
+if [ "${__gm3_failed:-0}" -ne 0 ]; then
+    log "FATAL: bring-up finished, but the GAME RELAY IS DISABLED - its host fence"
+    log "  could not be established (see the step 4-pre lines above). The rest of the"
+    log "  stack is running normally. Exiting non-zero so this unit reports FAILED."
+    exit 1
+fi
 if [ "$KIOSK_CONFIG_UNREADABLE" -ne 0 ]; then
     log "FATAL: bring-up finished, but the wall panel WILL run on js/config.js defaults"
     log "  (see the step 4b ERROR above). Exiting non-zero so this unit reports FAILED"

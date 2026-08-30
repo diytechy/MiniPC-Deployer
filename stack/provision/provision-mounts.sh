@@ -211,22 +211,63 @@ while IFS= read -r line || [ -n "$line" ]; do
     # MOUNT time, defaulting to root:root with a restrictive umask. Samba
     # writes as the connecting user, so without uid/gid/umask here the private
     # trees are read-only in practice no matter what the share ACLs say.
+    #
+    # ASK THE FILESYSTEM, DO NOT READ THE OPTION STRING — fixed 2026-08-30.
+    # `*uid=*` against findmnt's OPTIONS is right for the in-kernel ntfs3 driver
+    # and WRONG for ntfs-3g, which mounts as `fuseblk` and reports FUSE's own
+    # options: `rw,noatime,user_id=0,group_id=0,default_permissions,allow_other`.
+    # The uid=/gid=/umask= handed to ntfs-3g are consumed by the driver and never
+    # appear there — and `user_id=` does not contain the substring `uid=`. So on
+    # every ntfs-3g box this test failed against a perfectly-mounted drive,
+    # returned rc=1, and made firstboot exit non-zero with "at least one drive is
+    # missing, read-only, or wrongly mounted" while both drives were correct.
+    #
+    # This is the same shape as the A15 finding already fixed in verify-hub.sh:
+    # for fuseblk, branch and ask the filesystem what it SYNTHESIZED. `stat` on
+    # the mountpoint reports exactly the uid/gid/mode the driver applies, which
+    # is the thing we actually care about — Samba writes succeed or fail on the
+    # synthesized ownership, not on the spelling of the option string.
     fstype="$(findmnt -no FSTYPE --target "$mnt" 2>/dev/null || echo '')"
     case "$fstype" in
         ntfs|ntfs3|fuseblk)
             log "note: $mnt is $fstype"
-            case "$opts" in
-                *uid=*) : ;;
+            __own_ok=0
+            case "$fstype" in
+                fuseblk)
+                    # ntfs-3g: the option string cannot answer, so measure.
+                    # Non-root ownership OR any group/other permission bit means
+                    # uid=/gid=/umask= were honoured; bare root:root 0700 is the
+                    # unconfigured default this check exists to catch.
+                    # Read into named vars: `set --` would clobber the enclosing
+                    # loop's positional parameters.
+                    __u="$(stat -c '%u' "$mnt" 2>/dev/null || echo '')"
+                    __g="$(stat -c '%g' "$mnt" 2>/dev/null || echo '')"
+                    __m="$(stat -c '%a' "$mnt" 2>/dev/null || echo '')"
+                    if [ -n "$__u" ] && [ -n "$__g" ] && [ -n "$__m" ]; then
+                        if [ "$__u" != "0" ] || [ "$__g" != "0" ] \
+                           || [ "$(( 0$__m & 077 ))" -ne 0 ]; then
+                            __own_ok=1
+                        fi
+                        log "      ownership synthesized as uid=$__u gid=$__g mode=$__m"
+                    else
+                        log "      could not stat $mnt to read synthesized ownership"
+                    fi ;;
                 *)
-                    log "WARN: $mnt is NTFS but mounted without uid=/gid=. ntfs3 synthesizes"
-                    log "      ownership from the MOUNT options, so every file is root-owned and"
-                    log "      Samba writes from household accounts will FAIL regardless of the"
-                    log "      share ACLs. Expected options for the library:"
-                    log "        uid=0,gid=3000,umask=0002    (gid 3000 = the household group)"
-                    log "      Re-generate the fstab fragment (Generate-FromStorageMap.ps1) rather"
-                    log "      than hand-editing, then: mount -o remount $mnt   (open-items A15)"
-                    rc=1 ;;
-            esac ;;
+                    case "$opts" in *uid=*) __own_ok=1 ;; esac ;;
+            esac
+            if [ "$__own_ok" -ne 1 ]; then
+                log "WARN: $mnt is NTFS and its ownership is the unconfigured default."
+                log "      NTFS has no POSIX ownership: every file reports the uid/gid fixed"
+                log "      at MOUNT time. Without uid=/gid=/umask= the tree is root-owned and"
+                log "      Samba writes from household accounts will FAIL regardless of the"
+                log "      share ACLs. Expected for the library:"
+                log "        uid=0,gid=3000,umask=0002    (gid 3000 = the household group)"
+                log "      and for the backup drive:"
+                log "        uid=65532,gid=65532,umask=0027   (the filebackup principal)"
+                log "      Re-generate the fstab fragment (Generate-FromStorageMap.ps1) rather"
+                log "      than hand-editing, then: mount -o remount $mnt   (open-items A15)"
+                rc=1
+            fi ;;
     esac
 done < "$FSTAB_FRAGMENT"
 

@@ -1608,8 +1608,23 @@ if [ "$ICEDRIVE_MODE" != "off" ] && [ -f "$STACK_DIR/icedrive/icedrive-profile.s
     if [ -f "$_ICE_DIR/icedrive-profile.tar.gz.gpg" ]; then
         # Exit 3 is "declined, nothing to do" (a populated profile, no archive) and
         # is NOT a warning; exit 1 is a real failure and is.
-        bash "$STACK_DIR/icedrive/icedrive-profile.sh" --restore --user "$_ICE_USER" --env "$STACK_DIR/.env" 2>&1 | sed 's/^/  /'
-        case "${PIPESTATUS[0]}" in
+        #
+        # `|| __ice_rc=$?` IS LOad-BEARING, and its absence made the case below
+        # DEAD CODE — found 2026-08-30 on the real hub. This file runs under
+        # `set -euo pipefail`: an unguarded pipeline that exits non-zero kills the
+        # script on the spot, so exit 3 aborted firstboot before the branch that
+        # exists precisely to call exit 3 benign could run. Every boot of a hub
+        # with an already-populated IceDrive profile — i.e. every boot after the
+        # first sign-in — reported homehub-firstboot.service as FAILED, with the
+        # last log line being a decline that the code was written to tolerate.
+        #
+        # Capturing into a variable rather than appending `|| true` to the
+        # pipeline is deliberate: `|| true` is a following simple command, which
+        # resets PIPESTATUS, so the case would then read 0 for every outcome and
+        # a genuine exit 1 would report as a successful restore.
+        __ice_rc=0
+        bash "$STACK_DIR/icedrive/icedrive-profile.sh" --restore --user "$_ICE_USER" --env "$STACK_DIR/.env" 2>&1 | sed 's/^/  /' || __ice_rc=$?
+        case "$__ice_rc" in
             0) log "  restored the IceDrive profile - the client should sign in without the 2FA prompt" ;;
             3) log "  no IceDrive profile restore (the profile is already populated, or there is no archive)" ;;
             *) log "  WARNING: the IceDrive profile restore FAILED. The client will start signed out;"

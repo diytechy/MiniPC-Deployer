@@ -116,16 +116,26 @@ resolve_identity() {
     # Walk by-id symlinks and find the one pointing at this major:minor.
     # Partitions resolve to their own node, so compare against the device the
     # symlink actually names rather than assuming a whole-disk match.
-    local found="" link target dev
+    #
+    # A FILESYSTEM LIVES ON A PARTITION, SO THE MOUNTED DEVICE IS ALMOST NEVER
+    # THE WHOLE DISK. drive-identity.conf is generated from storage-map §1,
+    # which records the whole-disk by-id name ('ata-WDC_...-11BCSS0_WD-XXXX');
+    # what is actually mounted is 'ata-WDC_...-11BCSS0_WD-XXXX-part1'. Matching
+    # on equality alone therefore reported the REAL disk as a stand-in forever,
+    # and the yellow it raised was indistinguishable from a genuine substitute.
+    # '<expected>-part<N>' can only be a partition OF the expected disk — the
+    # name embeds that disk's own serial — so accepting it is exact, not loose.
+    local found="" found_exact=0 link target dev name
     for link in /dev/disk/by-id/*; do
         [ -e "$link" ] || continue
         target="$(readlink -f "$link" 2>/dev/null)" || continue
         dev="${target#/dev/}"
         [ -r "/sys/class/block/$dev/dev" ] || continue
         if [ "$(cat "/sys/class/block/$dev/dev" 2>/dev/null)" = "$majmin" ]; then
-            case "${link##*/}" in
-                "$expected") found="$expected"; break ;;
-                *) [ -n "$found" ] || found="${link##*/}" ;;
+            name="${link##*/}"
+            case "$name" in
+                "$expected"|"$expected"-part*) found="$name"; found_exact=1; break ;;
+                *) [ -n "$found" ] || found="$name" ;;
             esac
         fi
     done
@@ -134,9 +144,9 @@ resolve_identity() {
         identity_note="mounted device $majmin has no /dev/disk/by-id name to compare"
         return
     fi
-    if [ "$found" = "$expected" ]; then
+    if [ "$found_exact" = 1 ]; then
         identity_state="match"
-        identity_note="$expected"
+        identity_note="$found"
     else
         identity_state="mismatch"
         identity_note="expected '$expected' (label $want_label) but the mounted device is '$found' — a STAND-IN drive, not the real $DRIVE_LABEL disk"

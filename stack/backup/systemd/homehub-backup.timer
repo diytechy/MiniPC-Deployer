@@ -1,10 +1,21 @@
 # Nightly schedule for the AWOW bash backup (WI-10.10). Persistent so a missed
 # run (box asleep/off) fires on next boot — a backup should never silently skip.
+#
+# 03:00 BOX-LOCAL, RULED BY THE OWNER 2026-08-30 (was 03:30). Read this together
+# with firstboot's step 1c: until that date the box had no timezone at all, so
+# this line meant 03:30 UTC and fired at 22:30 for a UTC-5 household. The clock
+# time here only means what it says because 1c now sets the zone.
+#
+# PERSISTENT=TRUE HAS A SHARP EDGE WORTH KNOWING: changing the box's timezone
+# recomputes this window, and any occurrence that now sits in the past fires
+# IMMEDIATELY. Setting the zone on 2026-08-30 started both backups on the spot.
+# That is correct behaviour for "a backup should never silently skip" — just
+# expect it when you move the clock.
 [Unit]
 Description=Nightly AWOW backup timer
 
 [Timer]
-OnCalendar=*-*-* 03:30:00
+OnCalendar=*-*-* 03:00:00
 Persistent=true
 RandomizedDelaySec=600
 Unit=homehub-backup.service

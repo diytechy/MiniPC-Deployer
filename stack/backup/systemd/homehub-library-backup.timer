@@ -1,31 +1,42 @@
 # Schedule for the library backup (E2 / Phase 2).
 #
-# 21:30 IS THE Q-FB6 DEFAULT AND THE OWNER MAY MOVE IT. The constraint it is
-# chosen against is the OTHER backup: homehub-backup.timer fires at 03:30 with
-# RandomizedDelaySec=600, so it owns the drive from 03:30 to roughly 04:00 plus
-# however long the archive takes. Both services touch /mnt/backup-drive, and
-# both hold it awake with hdparm while they run — contending for one USB spindle
-# makes each slower and neither safer. 21:30 puts six clear hours in front of
-# the nightly archive on an evening the household is usually done with the
-# library for the day.
+# 03:00 BOX-LOCAL — THE OWNER MOVED THIS OFF THE Q-FB6 DEFAULT, 2026-08-30.
+# Both backups now run at 03:00. The previous value was 21:30, and the reasoning
+# it was chosen for is kept below rather than deleted, because it is still true
+# and it is what you would want to re-read if the nightly ever starts running
+# long.
 #
-# THE OFFSET IS A COURTESY, NOT A GUARANTEE, and it is worth being honest about
-# which: the FIRST real run of a ~2 TiB library takes DAYS, so it will overlap
-# 03:30 no matter which slot it starts in. What actually prevents damage is that
-# the two services write different trees, plus the wrapper's flock (which stops
-# THIS one stacking on itself). The slot is what keeps the steady-state nightly
-# runs out of each other's way once the first one is behind us.
+# WHAT THE 21:30 OFFSET WAS FOR: homehub-backup.timer owns /mnt/backup-drive
+# from its own start until its archive finishes, and both services hold the
+# drive awake with hdparm while they run. Contending for one USB spindle makes
+# each slower and neither safer. 21:30 put six clear hours in front of the
+# nightly archive.
+#
+# WHY LOSING IT IS ACCEPTABLE, AND WHERE IT IS NOT. Correctness does not rest on
+# the offset: the two services write different trees, and the wrapper's flock
+# stops this one stacking on itself. The offset only ever bought THROUGHPUT for
+# the steady state. And the honest note from the original still stands — the
+# FIRST real run of a ~2 TiB library takes DAYS, so it was always going to
+# overlap the nightly whichever slot it started in.
+#
+# SO THE COST IS SPEED, NOT SAFETY: once the first run is behind us, the nightly
+# archive and the library's incremental pass will contend for one spindle every
+# night instead of never. If the nightly starts running long, this is the first
+# thing to look at — move one of them, and this comment is the argument for
+# which way.
 [Unit]
 Description=HomeHub library backup timer (FileBackup container)
 
 [Timer]
-OnCalendar=*-*-* 21:30:00
+OnCalendar=*-*-* 03:00:00
 # A missed run (box off, or asleep) fires on the next boot. A backup should
-# never silently skip — the same reasoning as homehub-backup.timer.
+# never silently skip — the same reasoning as homehub-backup.timer, including
+# its warning that a timezone change fires any window that is now in the past.
 Persistent=true
-# Small, unlike the nightly's 600s: nothing else contends for this slot, and the
-# jitter here is only to avoid a thundering-herd start with anything else that
-# happens to like round half-hours.
+# Kept at 300s against the nightly's 600s, and now it does real work rather than
+# just avoiding round half-hours: both units share the 03:00 slot, so the two
+# jitters are the only thing that stops them starting on the same second and
+# racing each other onto one USB spindle.
 RandomizedDelaySec=300
 Unit=homehub-library-backup.service
 

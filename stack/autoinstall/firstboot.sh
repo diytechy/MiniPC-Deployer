@@ -177,6 +177,40 @@ setup_docker_lv() {
 }
 setup_docker_lv
 
+# ── 1c. THE BOX'S TIMEZONE, WHICH NOTHING USED TO SET ────────────────────────
+#
+# Found 2026-08-30 (open-items C39). The installer left the OS on UTC because
+# nothing here ever set it, and `TIMEZONE` in .env was an untouched template
+# default of `Etc/UTC`. That is not cosmetic: **systemd's OnCalendar is read in
+# the BOX's local time**, so both backup timers were firing five hours off the
+# clock times they were written to mean — the nightly's `03:30` landed at 22:30
+# for a UTC-5 household, and nobody noticed for weeks because a log line in UTC
+# looks correct to a reader who assumes UTC.
+#
+# ONE SOURCE, BOTH LAYERS. `TIMEZONE` already reaches eight containers as
+# `TZ: ${TIMEZONE}` (finance-auditor reads RUN_AT as box-local off it). This
+# step points the OS at the same value, so the timers and the containers cannot
+# disagree, and a reimage cannot silently revert to UTC.
+#
+# FAIL-OPEN and idempotent, like every other optional step in this file: no
+# .env, an unset value, or a name zoneinfo does not know leaves the box exactly
+# as it was. An unknown name is worth a loud line rather than a silent UTC.
+__tz="$(sed -n 's/^TIMEZONE=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 \
+        | tr -d "\"'" | tr -d '[:space:]')"
+if [ -n "${__tz:-}" ]; then
+    if [ "$(timedatectl show -p Timezone --value 2>/dev/null)" = "$__tz" ]; then
+        log "1c: timezone already $__tz"
+    elif [ -e "/usr/share/zoneinfo/$__tz" ]; then
+        timedatectl set-timezone "$__tz" 2>/dev/null \
+            && log "1c: timezone set to $__tz (was $(date -u +%Z); OnCalendar is read in THIS zone)" \
+            || log "WARN: 1c: timedatectl refused '$__tz' — timers stay on $(timedatectl show -p Timezone --value 2>/dev/null)"
+    else
+        log "WARN: 1c: TIMEZONE='$__tz' is not a zoneinfo name — leaving the box on $(timedatectl show -p Timezone --value 2>/dev/null); backup timers will fire in THAT zone"
+    fi
+else
+    log "1c: no TIMEZONE in .env — leaving the box on $(timedatectl show -p Timezone --value 2>/dev/null)"
+fi
+
 # ── 2. oauth2-proxy allow-list (Q10.5) ───────────────────────────────────────
 # Materialize authenticated-emails.txt (one account per line) from the
 # comma/space-separated OAUTH2_PROXY_ALLOWED_EMAILS in .env. Gitignored output.

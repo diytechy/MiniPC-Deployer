@@ -381,6 +381,26 @@ start_client() {
     # below, on a perfectly healthy client. Comparing the current size to the
     # recorded offset catches exactly that, and reading the whole file is the
     # right fallback: after a truncation, everything in it IS this run.
+    # _icd_check_rotation — latch a log replacement in the PARENT shell.
+    #
+    # THE RESET USED TO LIVE INSIDE _icd_newlog AND THEREFORE DID NOTHING: that
+    # function runs in a pipeline subshell, so any assignment vanished with it,
+    # and the next poll used the stale offset again. It was also a one-shot test:
+    # if a truncated log grew back past the old offset before the next two-second
+    # poll, `sz < log_start` read false and the marker written at byte 1 was
+    # skipped for the rest of the run — reporting a healthy client as dead.
+    # Detect the transition here, where the assignment sticks.
+    _icd_check_rotation() {
+        local sz=0 ino=''
+        [ -f "$applog" ] || return 0
+        sz="$(wc -c <"$applog" 2>/dev/null || echo 0)"
+        ino="$(stat -c %d:%i "$applog" 2>/dev/null || echo '')"
+        if { [ -n "$log_inode" ] && [ -n "$ino" ] && [ "$ino" != "$log_inode" ]; }            || [ "$sz" -lt "$log_start" ]; then
+            log_start=0
+            log_inode="$ino"
+        fi
+    }
+
     _icd_newlog() {
         local sz=0 ino=''
         [ -f "$applog" ] || return 0
@@ -490,8 +510,14 @@ start_client() {
             warn "  a RemoteHostClosedError here means the restart raced the old instance's teardown (C36)."
             return 1
         fi
+        # `grep -E ... >/dev/null`, NOT `grep -qE`. With -q, grep exits the moment
+        # it matches; the producer then takes SIGPIPE and returns 141, and under
+        # `set -o pipefail` the whole condition reads FALSE despite a match. A
+        # chatty but perfectly healthy client would be declared "never working"
+        # and fail the nightly capture. Reading to the end costs nothing here.
+        _icd_check_rotation
         if [ "$ready_at" -lt 0 ] && _icd_newlog \
-             | grep -qE 'waiting for events|checking pending uploads|start watch on'; then
+             | grep -E 'waiting for events|checking pending uploads|start watch on' >/dev/null; then
             ready_at="$waited"
             deadline=$((waited + STABILISE_S + 2))
             log "client reached a working state after ${ready_at}s — watching ${STABILISE_S}s more before calling it good"

@@ -61,19 +61,34 @@ command -v iptables >/dev/null 2>&1 || die "iptables not found"
 # Without the comment match, every boot would append another identical rule and
 # `iptables -L` would grow forever — untidy, and it makes the real state hard to
 # read at exactly the moment someone is debugging a lockout.
-if iptables -C "$CHAIN" -s "$SUBNET" -m comment --comment "$COMMENT" -j REJECT 2>/dev/null; then
-    log "already present: REJECT $SUBNET -> host ($CHAIN)"
-else
-    # -I, not -A: it must sit ABOVE any ACCEPT the distro or docker put in INPUT.
-    # Appending would place it after a permissive rule and it would never match.
-    iptables -I "$CHAIN" 1 -s "$SUBNET" -m comment --comment "$COMMENT" -j REJECT \
-        || die "could not install the REJECT rule for $SUBNET"
-    log "installed: REJECT $SUBNET -> host, at the top of $CHAIN"
-fi
+# PRESENT IS NOT THE SAME AS FIRST, and only checking presence is how a fence
+# becomes decorative. iptables evaluates INPUT in order and stops at the first
+# match, so one `-A INPUT -s <subnet> -j ACCEPT` inserted above ours - by an
+# admin, a firewall manager, or another package - makes the REJECT unreachable
+# while `iptables -C` still finds it. The old code reported "already present"
+# and returned success over exactly that.
+#
+# So delete any copy of our rule and reinsert at position 1 on EVERY run. That
+# is idempotent in the way that matters here: it converges on POSITION, not
+# merely on existence, which is also why the unit is safe to restart at any time.
+while iptables -C "$CHAIN" -s "$SUBNET" -m comment --comment "$COMMENT" -j REJECT 2>/dev/null; do
+    iptables -D "$CHAIN" -s "$SUBNET" -m comment --comment "$COMMENT" -j REJECT 2>/dev/null || break
+done
+iptables -I "$CHAIN" 1 -s "$SUBNET" -m comment --comment "$COMMENT" -j REJECT \
+    || die "could not install the REJECT rule for $SUBNET"
+log "installed: REJECT $SUBNET -> host, at position 1 of $CHAIN"
 
 # VERIFY THE ARTIFACT, NOT THE EXIT CODE (house rule). `iptables -I` returning 0
 # says the command parsed, not that the rule is where it needs to be.
 iptables -C "$CHAIN" -s "$SUBNET" -m comment --comment "$COMMENT" -j REJECT 2>/dev/null \
-    || die "the rule is NOT in $CHAIN after installing it — the relay can still reach the host"
+    || die "the rule is NOT in $CHAIN after installing it - the relay can still reach the host"
 
-log "verified: the game subnet $SUBNET cannot address this host"
+# AND IT MUST BE FIRST. `iptables -S` prints rules in evaluation order, so the
+# first `-A` line is rule 1.
+__first="$(iptables -S "$CHAIN" 2>/dev/null | grep '^-A' | head -1)"
+case "$__first" in
+    *"$COMMENT"*) : ;;
+    *) die "the REJECT is not the FIRST $CHAIN rule (first is: ${__first:-none}) - something ahead of it could match the relay's traffic first" ;;
+esac
+
+log "verified: the game subnet $SUBNET cannot address this host, and the rule is first"

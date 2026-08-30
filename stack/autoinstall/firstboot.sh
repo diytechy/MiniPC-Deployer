@@ -1029,7 +1029,14 @@ rm -f "${__restore_log:-}" 2>/dev/null || true
 # so firstboot still ends loudly and non-zero.
 __gm3_enabled=0
 __gm3_failed=0
-__gm3_profiles="$(env_value COMPOSE_PROFILES)"
+# NORMALISE ONCE, USE FOR BOTH. The detection below and the stripping further
+# down have to agree about what "gunmaster3 is enabled" means, and they did not:
+# `grep -vx gunmaster3` needs an exact whole-line match, so a value written
+# `ntfy, gunmaster3` kept the profile while the `case` also failed to see it.
+# They stayed consistent by accident rather than by construction, which is not a
+# property to rely on in the one place that decides whether a public service gets
+# a firewall. Squeeze the whitespace out first and both agree by definition.
+__gm3_profiles="$(env_value COMPOSE_PROFILES | tr -d '[:space:]')"
 case ",$__gm3_profiles," in
     *,gunmaster3,*) __gm3_enabled=1 ;;
 esac
@@ -1073,8 +1080,14 @@ if [ "$__gm3_enabled" = 1 ]; then
         # COMPOSE_PROFILES overrides the .env value for this invocation, so the
         # relay simply is not created - while DNS, Caddy, Actual and the tracker
         # all come up normally.
+        # `|| true` IS LOAD-BEARING. With COMPOSE_PROFILES=gunmaster3 (relay only)
+        # grep matches nothing, exits 1, and under `set -euo pipefail` the command
+        # substitution takes firstboot down BEFORE `docker compose up -d` - which
+        # is precisely the box-with-no-stack failure this whole block exists to
+        # avoid, reintroduced by the code avoiding it. An empty profile set is a
+        # perfectly good answer and must read as success.
         COMPOSE_PROFILES="$(printf '%s' "$__gm3_profiles" | tr ',' '
-' | grep -vx 'gunmaster3' | paste -sd, -)"
+' | { grep -vx 'gunmaster3' || true; } | paste -sd, -)"
         export COMPOSE_PROFILES
         log "  RELAY DISABLED FOR THIS BOOT. The rest of the stack starts normally."
         log "  Fix the cause, then: systemctl start homehub-game-isolation && docker compose up -d"

@@ -761,7 +761,16 @@ services:
       ND_MUSICFOLDER: /music
     volumes:
       - navidrome_data:/data
-      - ${MEDIA_ROOT}/music:/music:ro
+      # CAPITAL M, AND IT IS LOAD-BEARING — fixed 2026-08-30 (open-items C38).
+      # The library folder is `Music`. This line said `music`, which cost nothing
+      # while the stand-in drives were exFAT (case-insensitive) and broke the
+      # moment the real NTFS library went in: docker CREATES a missing bind
+      # source, so it made an empty `Media/music` beside the real `Media/Music`
+      # and navidrome indexed the empty one — 0 tracks, container healthy, no
+      # error anywhere. Two directories, two inodes, one of them a decoy.
+      # storage-map §3 row 2, BACKUP_SOURCES and the panel's sync-music all say
+      # `Music`; this was the only line that disagreed.
+      - ${MEDIA_ROOT}/Music:/music:ro
     ports:
       - "${LAN_IP}:${NAVIDROME_PORT}:4533"
     restart: unless-stopped

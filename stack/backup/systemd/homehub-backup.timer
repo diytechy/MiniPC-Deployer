@@ -17,7 +17,13 @@ Description=Nightly AWOW backup timer
 [Timer]
 OnCalendar=*-*-* 03:00:00
 Persistent=true
-RandomizedDelaySec=600
+# ZERO, ON PURPOSE (2026-08-30). This unit and homehub-library-backup.timer must
+# fire on the SAME second so both start jobs land in one systemd transaction —
+# that is where the library service's `After=homehub-backup.service` is honoured,
+# and it is what makes the two runs strictly sequential and back-to-back. With
+# jitter they land in separate transactions, `After=` becomes a no-op against a
+# unit that has already finished, and the two can overlap on one USB spindle.
+RandomizedDelaySec=0
 Unit=homehub-backup.service
 
 [Install]

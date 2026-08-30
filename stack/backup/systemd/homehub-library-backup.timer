@@ -12,18 +12,27 @@
 # each slower and neither safer. 21:30 put six clear hours in front of the
 # nightly archive.
 #
-# WHY LOSING IT IS ACCEPTABLE, AND WHERE IT IS NOT. Correctness does not rest on
-# the offset: the two services write different trees, and the wrapper's flock
-# stops this one stacking on itself. The offset only ever bought THROUGHPUT for
-# the steady state. And the honest note from the original still stands — the
-# FIRST real run of a ~2 TiB library takes DAYS, so it was always going to
-# overlap the nightly whichever slot it started in.
+# AND THE OFFSET WAS ACTIVELY WRONG FOR THIS DRIVE — the Owner, 2026-08-30.
+# The reasoning above optimises for the wrong thing. `BACKUP_DRIVE_STANDBY=241`
+# parks the 8 TB after 30 idle minutes, so six hours between the two backups
+# does not "keep them out of each other's way" — it guarantees the platter spins
+# DOWN after the nightly and has to spin back UP for the library run. That is an
+# extra stop/start cycle every night, on the one component in this system with
+# moving parts, to avoid contention that barely exists: the nightly archives ~98
+# files of container volumes and finishes in seconds.
 #
-# SO THE COST IS SPEED, NOT SAFETY: once the first run is behind us, the nightly
-# archive and the library's incremental pass will contend for one spindle every
-# night instead of never. If the nightly starts running long, this is the first
-# thing to look at — move one of them, and this comment is the argument for
-# which way.
+# So the two runs should be adjacent, not separated. Both timers now fire at
+# 03:00 and the ordering is explicit rather than hoped for — see the `After=` on
+# homehub-library-backup.service, which makes the library run wait for the
+# nightly to finish instead of racing it. Sequential, back to back, and the
+# drive never gets the 30 idle minutes it would need to park between them.
+#
+# RandomizedDelaySec IS DELIBERATELY 0 ON BOTH, and that is what makes the
+# ordering deterministic: identical OnCalendar values put both start jobs in ONE
+# systemd transaction, which is where `After=` is honoured. Re-introduce jitter
+# and the two timers land in separate transactions, `After=` becomes a no-op
+# against an already-finished unit, and the library run can start first — which
+# is the contention this arrangement exists to prevent.
 [Unit]
 Description=HomeHub library backup timer (FileBackup container)
 
@@ -33,11 +42,10 @@ OnCalendar=*-*-* 03:00:00
 # never silently skip — the same reasoning as homehub-backup.timer, including
 # its warning that a timezone change fires any window that is now in the past.
 Persistent=true
-# Kept at 300s against the nightly's 600s, and now it does real work rather than
-# just avoiding round half-hours: both units share the 03:00 slot, so the two
-# jitters are the only thing that stops them starting on the same second and
-# racing each other onto one USB spindle.
-RandomizedDelaySec=300
+# ZERO, ON PURPOSE. See the header: firing on the same second as the nightly is
+# what puts both jobs in one transaction so `After=` can order them. Jitter here
+# would break the ordering, not protect it.
+RandomizedDelaySec=0
 Unit=homehub-library-backup.service
 
 [Install]

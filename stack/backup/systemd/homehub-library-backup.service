@@ -14,7 +14,20 @@
 Description=HomeHub library backup (FileBackup container, one-shot)
 Documentation=file:///opt/homehub/stack/backup/README.md
 Wants=network-online.target
-After=network-online.target docker.service
+# homehub-backup.service IS IN THIS LIST ON PURPOSE — the Owner, 2026-08-30.
+# Both timers fire at 03:00 with no jitter, so both start jobs land in one
+# systemd transaction and this ordering is honoured: the nightly runs first, this
+# one follows the moment it finishes. Back-to-back is the POINT, not a
+# side-effect — BACKUP_DRIVE_STANDBY parks the 8 TB after 30 idle minutes, and
+# the old six-hour gap guaranteed a spin-down and a spin-up between the two runs
+# every night. Adjacent runs cost a few seconds of the nightly's ~98 files and
+# save the platter a stop/start cycle.
+#
+# ORDERING ONLY — deliberately NOT Requires= or BindsTo=. If the nightly fails
+# (an absent drive is its designed refusal), this unit must still run and still
+# report, rather than being silently cancelled with it. A skipped backup nobody
+# was told about is the failure mode this whole lane exists to prevent.
+After=network-online.target docker.service homehub-backup.service
 # NOT RequiresMountsFor= on the data drives, and that is the same deliberate
 # call homehub-backup.service makes: systemd would refuse to START the unit, so
 # NOTHING would reach NagLight — an unreported non-run, which is worse than a

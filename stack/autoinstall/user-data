@@ -59,6 +59,17 @@ autoinstall:
         match:
           name: "e*"
         dhcp4: true
+        # WAKE-ON-LAN, so the box can be brought back from an SSH poweroff
+        # without a hand on the button (added 2026-08-30 for the lab handoff:
+        # the virtual hub takes this MAC, so the real one has to be OFF for a
+        # lab run and ON again afterwards, from the dev PC, unattended).
+        # Measured on the real hub: the NIC supports it (`Supports Wake-on:
+        # pumbg`) and shipped with it disabled (`Wake-on: d`), so without this
+        # line every reflash silently turns it back off. This is the ONE place
+        # it needs to live - subiquity copies this block verbatim into
+        # /etc/cloud/cloud.cfg.d/90-installer-network.cfg, from which cloud-init
+        # renders /etc/netplan/50-cloud-init.yaml on every boot.
+        wakeonlan: true
 
   identity:
     # HOSTNAME is the ROLE, not the hardware (Owner's ruling, same reasoning as

@@ -225,9 +225,15 @@ last) — it is the record, not required reading for every pass.
       the Owner's account); redirect URI to register:
       `https://tracker.<domain>/oauth2/callback` →
       [stack/.env.example](../stack/.env.example)
-    - OI-2 — **Reimage-over-LAN ladder** is HIGH-RISK; the memo presents options
-      with checkboxes. Nothing destructive is implemented until the Owner checks one
-      → [REMOTE_MANAGEMENT.md](../REMOTE_MANAGEMENT.md)
+    - OI-2 — **Reimage-over-LAN ladder — RESOLVED 2026-08-28, ticked here
+      2026-08-30.** This entry said "nothing destructive is implemented until the
+      Owner checks one". That is no longer true: Option E (the SSH rung) is BUILT
+      AND PROVEN, `remote-reimage/` holds the initrd builder and the kexec script,
+      `kexec-tools` is baked into the image — and it has been *used*: the box
+      reimaged itself over Ethernet from an SSH command, jump 23:06:46, green
+      23:24:07, no stick written. PXE stays off the table.
+      → [REMOTE_MANAGEMENT.md](../REMOTE_MANAGEMENT.md) Option E; HomeHub
+      open-items §E6
     - OI-3 — **Push** each commit (agents lack the SSH key) →
       this repo
     - OI-5 — **Run the V3 gate** (WI-10.18): enable Hyper-V (elevated,
@@ -493,9 +499,13 @@ last) — it is the record, not required reading for every pass.
       UNENCRYPTED — physical theft/disposal exposes `.env` secrets + the
       finance volumes. Proposed: autoinstall LUKS (Subiquity supports
       `storage: layout: {name: lvm, password: …}`) + unattended unlock via
-      TPM2 enroll at first boot **if the AK41 BIOS exposes Intel PTT (Owner:
-      check BIOS)**, else dropbear-initramfs (SSH unlock over LAN — fits
-      headless). Touches the autoinstall `storage:` layout = the
+      TPM2 enroll at first boot. **THE BIOS QUESTION IS ANSWERED — 2026-07-26:
+      Intel PTT is PRESENT AND ENABLED** (vendor INTC, firmware 402.0), so
+      LUKS+TPM2 is on the table and this entry should stop asking. Still
+      unimplemented: the disk is plain LVM, no `crypt` device anywhere. Ratified
+      in principle; tracked as HomeHub open-items §E5. The fallback if PTT had
+      been absent was dropbear-initramfs (SSH unlock over LAN — fits
+      headless); it is not needed. Touches the autoinstall `storage:` layout = the
       REMOTE_MANAGEMENT **hard line**: not implemented until the Owner ratifies.
       Companion decision: LUKS on the backup drives too (finance snapshots
       land there in plaintext otherwise).

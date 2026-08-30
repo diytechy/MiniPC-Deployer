@@ -160,6 +160,113 @@ if [ "$TARGET" = "hub" ]; then
     esac
 fi
 
+# ── carriage: every payload file a late-command touches ─────────────────────
+# ADDED 2026-08-29, and the near-miss that produced it is worth stating plainly.
+# The crossplay relay's two new files were written, referenced by four new
+# unguarded late-commands, and NEVER `git add`ed. Every check on the dev PC
+# passed - the files were right there in the working tree - but
+# `copy_repo_into_payload` (vmtest/lib/common.sh) bakes `git ls-files`, DELIBERATELY,
+# so that a gitignored .env can never be flashed. An untracked file is therefore
+# present for every static check and absent from the ISO, and curtin HALTS the
+# install on a failed late-command: the flash would have produced NO BOX AT ALL.
+#
+# scripts/validate_config.py check 4c now refuses that on the dev PC. This is the
+# same invariant asked of the ARTIFACT, which is what this file is for - and it
+# catches a whole class the dev-PC check cannot see, because a file can be
+# tracked and still fail to reach the payload (a staging bug, exactly the one
+# this file was written for on 2026-08-27).
+#
+# DERIVED FROM THE PAYLOAD'S OWN user-data, not from a list kept here. A list
+# here would record what somebody remembered on the day; the ISO carries the
+# late-commands that will actually run on it.
+echo
+echo "== carriage: every payload file a late-command touches =="
+case "$TARGET" in
+    hub)  UD_ISO=/deploy-payload/stack/autoinstall/user-data;      PAY_ROOT=/opt/homehub ;;
+    wall) UD_ISO=/deploy-payload/stack/autoinstall/wall/user-data; PAY_ROOT=/opt/wall-panel ;;
+esac
+UDF="$TMP/late-user-data"
+iso_get "$UD_ISO" "$UDF"
+if [ ! -s "$UDF" ]; then
+    bad "could not extract $UD_ISO - the late-commands that will run on this ISO cannot be read, so nothing about their files can be asserted"
+else
+    # Only the UNGUARDED top-level list items: `install`, `cp`, and
+    # `curtin in-target -- chmod`. Anything inside a `bash -c '…'` carries its
+    # own `[ -f … ] ||` guard and may legitimately name a generated path
+    # (stack/.env, site/) that is not in the payload.
+    LATE_REFS="$TMP/late-refs"
+    grep -E "^[[:space:]]*- " "$UDF" \
+      | grep -v 'bash -c' \
+      | sed -E "s/^[[:space:]]*- //" \
+      | awk -v root="$PAY_ROOT" '
+          {
+            line = $0
+            if (line ~ /^(install|cp)[[:space:]]/) {
+              # THE SOURCE IS THE FIRST NON-FLAG WORD, AND A FLAG THAT TAKES A
+              # VALUE MUST TAKE ITS VALUE WITH IT. Skipping only words beginning
+              # with `-` leaves the MODE behind, so `install -m 0644 <src> <dst>`
+              # yields "0644" - which matches no payload path and is silently
+              # dropped. EVERY unit file on both images is installed exactly that
+              # way, so the first version of this loop asserted nothing about
+              # them, the relay unit included. Found by testing the parser.
+              n = split(line, w, /[[:space:]]+/)
+              skip = 0
+              for (i = 2; i <= n; i++) {
+                if (skip) { skip = 0; continue }
+                if (w[i] ~ /^-/) {
+                  if (w[i] == "-m" || w[i] == "-o" || w[i] == "-g" || w[i] == "-t" || w[i] == "-S") skip = 1
+                  continue
+                }
+                print w[i]; break
+              }
+            } else if (line ~ /^curtin[[:space:]]+in-target[[:space:]].*--[[:space:]]+chmod[[:space:]]/) {
+              n = split(line, w, /[[:space:]]+/)
+              seen = 0
+              for (i = 1; i <= n; i++) {
+                if (w[i] == "chmod") { seen = 1; i++; continue }   # skip the mode
+                if (seen && w[i] ~ /^\//) print w[i]
+              }
+            }
+          }' \
+      | sed -E "s#^/target##" \
+      | grep -E "^${PAY_ROOT}/" \
+      | sed -E "s#^${PAY_ROOT}/##" \
+      | sort -u > "$LATE_REFS"
+
+    n_ref=0; n_missing=0
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        n_ref=$((n_ref+1))
+        if ! iso_has "/deploy-payload/$rel"; then
+            bad "a late-command names /deploy-payload/$rel and the ISO DOES NOT CARRY IT - curtin halts the install on a failed list item, so this ISO flashes no box at all"
+            n_missing=$((n_missing+1))
+        fi
+    done < "$LATE_REFS"
+    if [ "$n_ref" -eq 0 ]; then
+        bad "no late-command file references were parsed out of $UD_ISO - the parser and the file have diverged, so this check asserted nothing"
+    elif [ "$n_missing" -eq 0 ]; then
+        ok "all $n_ref payload file(s) named by an unguarded late-command are on the ISO"
+    fi
+
+    # THE FOUR GAME-ISOLATION FILES, NAMED. The derived check above covers them,
+    # but only three of the four are named by a late-command that could be
+    # deleted; game-isolation.sh and gunmaster3-relay.sh are also read at RUNTIME
+    # by units whose ExecStart points into the payload, and a payload missing
+    # them fails after the install rather than during it - which is quieter and
+    # worse. Assert them by name so that stays true even if the late-commands
+    # change shape.
+    if [ "$TARGET" = "hub" ]; then
+        gm3_missing=0
+        for f in game-isolation/game-isolation.sh \
+                 game-isolation/gunmaster3-relay.sh \
+                 game-isolation/homehub-game-isolation.service \
+                 game-isolation/homehub-gunmaster3-relay.service; do
+            iso_has "/deploy-payload/stack/$f" || { bad "the crossplay relay payload is incomplete: stack/$f is not on the ISO"; gm3_missing=1; }
+        done
+        [ "$gm3_missing" -eq 0 ] && ok "all four game-isolation files (fence + relay, scripts + units) ride the ISO"
+    fi
+fi
+
 # ── carriage: the optional packages, baked but NOT install-listed ───────────
 echo
 echo "== carriage: the offline apt repo =="

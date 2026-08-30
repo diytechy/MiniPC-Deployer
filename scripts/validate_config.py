@@ -29,6 +29,7 @@ Usage: python scripts/validate_config.py [--stack stack]
 
 import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -380,6 +381,123 @@ def main():
         "systemd never sees them: " + ", ".join(orphan_units),
     )
 
+    # 4c. EVERY PAYLOAD FILE A LATE-COMMAND TOUCHES MUST EXIST **AND BE TRACKED**.
+    #
+    # ADDED 2026-08-29 after a review round found the relay's two new files
+    # UNTRACKED while every check on this dev PC passed. That combination is the
+    # dangerous one, and nothing here could see it:
+    #
+    #   * check 4 asks "does the file exist?" — it did, in the working tree;
+    #   * check 4b asks "is every shipped unit installed by something?" — it was;
+    #   * the ISO build does NOT copy the working tree. `copy_repo_into_payload`
+    #     in vmtest/lib/common.sh bakes `git ls-files` output, deliberately, so
+    #     that a gitignored .env can never be flashed into an image.
+    #
+    # So an untracked file is PRESENT for every check and ABSENT from the ISO.
+    # The new late-commands are unguarded `install`/`cp`/`chmod` list items, and
+    # curtin HALTS the install on a non-zero one — meaning the flash produces no
+    # box at all, with the only symptom being a curtin error late in the run.
+    #
+    # THIS IS DERIVED FROM user-data, NOT HAND-MAINTAINED. Check 4's list is
+    # written by hand and therefore records what somebody remembered; this reads
+    # the late-commands themselves, so a new line cannot arrive uncovered.
+    #
+    # Only the UNGUARDED top-level list items are parsed — `install`, `cp` and
+    # `curtin in-target -- chmod`. Anything inside a `bash -c '…'` or a block
+    # scalar carries its own guard (`[ -f … ] ||`) and is deliberately allowed to
+    # reference generated, gitignored paths such as stack/.env and site/.
+    payload_roots = ("/opt/homehub/", "/opt/wall-panel/")
+    tracked = set()
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO), "ls-files"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if out.returncode == 0:
+            tracked = {line.strip() for line in out.stdout.splitlines() if line.strip()}
+    except Exception:
+        tracked = set()
+
+    def payload_rel(token):
+        """/target/opt/homehub/x -> 'x'; /opt/wall-panel/x -> 'x'; else None."""
+        t = token[len("/target"):] if token.startswith("/target/") else token
+        for root in payload_roots:
+            if t.startswith(root):
+                return t[len(root):]
+        return None
+
+    refs = {}          # repo-relative path -> the user-data file that names it
+    for ud_rel in ("autoinstall/user-data", "autoinstall/wall/user-data"):
+        ud_text = load(stack / ud_rel)
+        for raw in ud_text.splitlines():
+            line = raw.strip()
+            if not line.startswith("- "):
+                continue
+            cmd = line[2:].strip()
+            if "bash -c" in cmd:
+                continue          # guarded; see the note above
+            m = re.match(r"^(install|cp)\s+(.*)$", cmd)
+            if m:
+                # The SOURCE is the first non-flag word; the destination is the
+                # last. Only the source is a payload file we must carry.
+                #
+                # A FLAG THAT TAKES A VALUE MUST TAKE ITS VALUE WITH IT. Dropping
+                # only the words starting with `-` leaves the MODE behind, so
+                # `install -m 0644 <src> <dst>` yields "0644" as the source, which
+                # maps to no payload path and is silently discarded — and EVERY
+                # unit file on both images is installed exactly that way. The
+                # first version of this check did that and therefore asserted
+                # nothing about 12 of the 30 paths, including the relay's own unit
+                # file. Found by testing the parser rather than reading it.
+                words, skip_next = [], False
+                for w in m.group(2).split():
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if w.startswith("-"):
+                        # separated forms take the next word; `-m0644` carries it
+                        if w in ("-m", "-o", "-g", "-t", "-S", "--mode", "--owner", "--group"):
+                            skip_next = True
+                        continue
+                    words.append(w)
+                if len(words) >= 2:
+                    rel = payload_rel(words[0])
+                    if rel:
+                        refs.setdefault(rel, ud_rel)
+                continue
+            m = re.match(r"^curtin\s+in-target\s+--target=\S+\s+--\s+chmod\s+\S+\s+(.*)$", cmd)
+            if m:
+                for w in m.group(1).split():
+                    rel = payload_rel(w)
+                    if rel:
+                        refs.setdefault(rel, ud_rel)
+
+    missing_file, untracked = [], []
+    for rel, ud_rel in sorted(refs.items()):
+        if not (REPO / rel).exists():
+            missing_file.append("{} (named by {})".format(rel, ud_rel))
+        elif tracked and rel not in tracked:
+            untracked.append("{} (named by {})".format(rel, ud_rel))
+    check(
+        not missing_file,
+        "every file a late-command install/cp/chmod names exists ({} paths)".format(len(refs)),
+        "late-command(s) name payload file(s) that DO NOT EXIST - curtin halts the "
+        "install on a failed list item, so this flashes no box at all: "
+        + ", ".join(missing_file),
+    )
+    if tracked:
+        check(
+            not untracked,
+            "every file a late-command names is GIT-TRACKED (the ISO bakes git ls-files, not the worktree)",
+            "late-command(s) name payload file(s) that are PRESENT HERE but UNTRACKED. "
+            "vmtest/lib/common.sh copy_repo_into_payload bakes `git ls-files`, so these "
+            "would be absent from the ISO and curtin would HALT the install: "
+            + ", ".join(untracked)
+            + "  -- fix with: git add <path>",
+        )
+    else:
+        print("SKIP git ls-files unavailable - cannot check late-command files for tracking")
+
     # 5. wall-panel knob coverage (the .env-example equivalent for image 2).
     wall_dir = stack / "autoinstall" / "wall"
     wall_env = wall_dir / "wall.env.example"
@@ -419,9 +537,18 @@ def main():
     #     This is a two-file bug: each file is correct alone and the pair is
     #     fatal, which is exactly the shape a static check catches and a reader
     #     does not. `Wants=` + `After=` gives the ordering without the coupling.
+    #     GENERALISED 2026-08-29 BEYOND THE FIRSTBOOT UNITS. The pairing is not
+    #     really "a unit and its own script": it is "a unit that Requires= X" and
+    #     "a script that stops X while that unit may be activating". The crossplay
+    #     relay unit re-created the exact bug from the other side — it is enabled
+    #     from the ISO, so on boot 1 it is activating while firstboot.sh step 1b
+    #     stops docker to carve the LV, and a `Requires=docker.service` on it put
+    #     it right back in the blast radius. Each file was correct alone. Again.
     for unit_rel, script_rel in (
         ("autoinstall/homehub-firstboot.service", "autoinstall/firstboot.sh"),
         ("autoinstall/wall/wall-firstboot.service", "autoinstall/wall/wall-firstboot.sh"),
+        ("game-isolation/homehub-gunmaster3-relay.service", "autoinstall/firstboot.sh"),
+        ("game-isolation/homehub-game-isolation.service", "autoinstall/firstboot.sh"),
     ):
         unit_text, script_text = load(stack / unit_rel), load(stack / script_rel)
         if not unit_text or not script_text:
@@ -443,11 +570,11 @@ def main():
         clash = sorted(required & stopped)
         check(
             not clash,
-            "{} stops no unit it Requires= ({} required, {} stopped)".format(
-                Path(script_rel).name, len(required), len(stopped)
+            "{} stops no unit {} Requires= ({} required, {} stopped)".format(
+                Path(script_rel).name, Path(unit_rel).name, len(required), len(stopped)
             ),
             "{} stops {} which {} declares Requires= — systemd will propagate the "
-            "stop back and SIGTERM the script mid-run. Use Wants= + After=.".format(
+            "stop back and SIGTERM whatever is activating. Use Wants= + After=.".format(
                 Path(script_rel).name, "/".join(clash), Path(unit_rel).name
             ),
         )

@@ -1,0 +1,152 @@
+[Unit]
+# SYSTEMD OWNS THIS RELAY'S LIFECYCLE, AND DOCKER DOES NOT. That sentence is the
+# entire point of this unit, and it is the design refresh of 2026-08-29
+# (CROSSPLAY_HANDOFF.md §7) rather than a new feature.
+#
+# What it replaces: ~40 lines in firstboot.sh that had to detect a profile,
+# validate the secret, install the fence unit, verify an iptables rule and
+# degrade gracefully — in shell, under `set -euo pipefail`, before the stack
+# started. Four adversarial review rounds each found a defect in the previous
+# round's fix, twice a defect that would have flashed a box with no DNS, Caddy,
+# Actual or tracker. The old ordering attempt was `Before=docker.service` on the
+# fence, which orders STARTS but cannot propagate FAILURE — and with
+# `restart: unless-stopped` on the container, Docker started the relay on every
+# boot whatever the fence had done.
+#
+# Requires= is what `Before=` never was. If homehub-game-isolation.service fails
+# — for any reason, including the rule not landing FIRST in INPUT — this unit is
+# not started at all, and the relay does not exist. That is the guarantee the
+# shell branching was trying and repeatedly failing to express.
+Description=Gun Master 3 crossplay relay (host-owned lifecycle, fenced)
+Documentation=file:///opt/homehub/stack/game-isolation/gunmaster3-relay.sh
+Documentation=file:///opt/homehub/stack/game-isolation/game-isolation.sh
+# ONE HARD REQUIREMENT, AND IT IS THE FENCE — NOT DOCKER.
+#
+#   homehub-game-isolation.service — Requires=. The host fence. `internal: true`
+#     does NOT stop a container reaching the HOST (measured: SSH, Technitium's
+#     DNS AND its admin console on 5380, cockpit), so the REJECT rule is what
+#     makes the isolation claim true. No fence, no relay. This is the one
+#     dependency whose absence must stop this unit dead.
+#
+#   docker.service — Wants= + After=, DELIBERATELY NOT Requires=, and this is
+#     the repo's most expensive lesson repeated back (validate_config.py check
+#     5b exists for it). `Requires=` PROPAGATES STOPS. firstboot.sh step 1b runs
+#     `systemctl stop docker.socket docker` to move /var/lib/docker onto its own
+#     LV, and on 2026-08-09 that stop travelled back across a Requires= and
+#     SIGTERMed homehub-firstboot.service one second in: LV created, never
+#     mounted, 0 of 15 image tars loaded, no stack, no DNS. This unit is enabled
+#     from the ISO and is therefore ACTIVATING while step 1b runs on boot 1, so
+#     a Requires= here would put it in the blast radius of that same stop.
+#     `Wants=` + `After=` gives the ordering with none of the coupling; if
+#     docker genuinely never comes up, this unit fails loudly at `compose up`,
+#     which is the better of the two silences.
+#
+#   homehub-firstboot.service — After= ONLY: no Requires=, no Wants=. Pure
+#     ordering, and it fixes a spurious failure rather than a dependency. On
+#     boot 1 dockerd is up long before the baked image tars have been loaded and
+#     long before caddy exists, so without this the unit would start, burn its
+#     120s caddy wait, and then fail `compose up` on an image that is still a
+#     tar on the disk — a `failed` unit that firstboot then fixes seconds later.
+#     NOT Requires=/Wants=, because a box whose firstboot failed for unrelated
+#     reasons should still be able to run the relay by hand.
+#
+#     NO CYCLE: the fence is Before=docker.service, firstboot is After=docker,
+#     and this is After= all three — a straight line, fence -> docker ->
+#     firstboot -> relay. But firstboot ITSELF starts this unit at its step
+#     4a-relay, and a BLOCKING `systemctl start` on a unit ordered after the
+#     caller is the 18-minute boot deadlock this project already paid for once
+#     (2026-08-27, setup-remote-ui.sh). firstboot therefore uses
+#     `systemctl start --no-block`, which enqueues the job and returns; systemd
+#     runs it the moment firstboot finishes. Do not remove either half.
+Requires=homehub-game-isolation.service
+Wants=docker.service network-online.target
+After=homehub-game-isolation.service docker.service network-online.target homehub-firstboot.service
+
+# A MISSING OR NON-EXECUTABLE SCRIPT MUST BE A FAILURE, NOT A SKIP. Without
+# this, systemd cannot run ExecCondition= and reports exit 203 (EXEC) — which
+# lands inside the 1..254 range that ExecCondition defines as "condition not
+# met", so a payload missing this script would be recorded as a CLEAN SKIP,
+# indistinguishable from GAME_RELAY_ENABLED=false. The relay would silently not
+# exist and nothing would be red anywhere. Assert= (not Condition=) is the right
+# half of that pair: a failed Assert= FAILS the unit and says so.
+AssertPathIsExecutable=/opt/homehub/stack/game-isolation/gunmaster3-relay.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/homehub/stack
+
+# ExecCondition=, NOT a branch in firstboot. Exit non-zero here means "condition
+# not met", which systemd records as a CLEAN SKIP rather than a failure — so a
+# box with GAME_RELAY_ENABLED=false has this unit enabled, inert, and green.
+#
+# WHY READING .env HERE IS NO LONGER SECURITY-CRITICAL, which is the whole
+# reason the knob moved: the old guard's .env parser disagreeing with compose's
+# meant the guard concluded "off" while compose concluded "on", and the relay
+# started UNFENCED. Now the only two outcomes of a parser disagreement are (a)
+# the relay does not start, or (b) it starts behind a fence that Requires=
+# already guaranteed. Neither is a security failure. The knob decides scope; it
+# no longer decides safety.
+ExecCondition=/opt/homehub/stack/game-isolation/gunmaster3-relay.sh condition
+
+# THE SECRET IS THE ONLY DOOR — 43 base64url characters, read from THE CADDY
+# CONTAINER'S ENVIRONMENT AND NOWHERE ELSE. The Caddyfile consumes
+# {$GAME_WS_SECRET} from there, that environment is fixed at container create
+# time, and it is therefore the value that will actually gate the public path.
+#
+# THE .env FALLBACK WAS DELETED IN ROUND 6, and it was a real hole rather than
+# belt-and-braces: it applied only when caddy was NOT RUNNING, so a stopped
+# caddy holding a stale or malformed secret while .env held a corrected one made
+# the precheck validate the file, pass, and start the relay — after which
+# starting caddy published the relay at the malformed path with every log line
+# green. Existence is now the wait condition (`.Config.Env` reads fine from a
+# stopped container) and no caddy container at all is a hard failure: caddy is
+# the only route in, so without it there is no door to validate.
+#
+# A bad or missing token fails THIS UNIT AND NOTHING ELSE; the equivalent check
+# in the old firstboot block could take household DNS down over a typo in a game
+# token.
+ExecStartPre=/opt/homehub/stack/game-isolation/gunmaster3-relay.sh precheck
+
+# `docker compose --profile gunmaster3 up -d gunmaster3-relay`, and --profile is
+# passed HERE AND NOWHERE ELSE. The service keeps `profiles: ["gunmaster3"]` in
+# docker-compose.yml precisely so firstboot's bulk `docker compose up -d` cannot
+# start it; putting `gunmaster3` into COMPOSE_PROFILES would undo that and is a
+# DEFECT, refused by verify-hub.sh (TC-H-T07), ensure-local-images.sh and
+# vmtest/export-images.sh.
+ExecStart=/opt/homehub/stack/game-isolation/gunmaster3-relay.sh start
+
+# VERIFY THE ARTIFACT, NOT THE EXIT CODE (house rule). `compose up -d` returns 0
+# once a container is STARTED, and an `active` Requires= dependency proves a
+# oneshot exited 0 once — neither is a REJECT sitting first in INPUT. If the
+# fence is not there this stops the relay again and fails the unit.
+ExecStartPost=/opt/homehub/stack/game-isolation/gunmaster3-relay.sh postcheck
+
+ExecStop=/opt/homehub/stack/game-isolation/gunmaster3-relay.sh stop
+
+# THE DEFAULT 90s WOULD KILL A HEALTHY START. ExecStartPre waits up to 120s for
+# caddy, because After=docker.service is satisfied when dockerd is up and not
+# when dockerd has finished restarting the containers it owns — so on a normal
+# reboot this unit can legitimately arrive before caddy does. 300s covers that
+# wait plus a compose up on a cold page cache.
+TimeoutStartSec=300
+
+# NO Restart=, AND THAT IS A DECISION RATHER THAN AN OMISSION.
+#
+# systemd 255 (Ubuntu 24.04) does allow Restart=on-failure on a Type=oneshot
+# unit — only `always` and `on-success` are refused for oneshot — so this was
+# available and was deliberately not taken. The dominant transient failure, a
+# relay unit arriving before caddy, is already handled by the bounded wait in
+# ExecStartPre. What is left is the non-transient case, and retrying it is
+# actively harmful: ExecStartPost fails when the FENCE is missing, and each
+# retry would start a public, unauthenticated relay, discover the host is
+# reachable from it, and stop it again — a fresh unfenced window every
+# RestartSec, forever, over a fault nobody is being told about.
+#
+# A failed relay unit is the correct end state: `systemctl is-failed
+# homehub-gunmaster3-relay` is visible, local, and harmless to the household —
+# DNS, Caddy, Actual and the tracker are untouched. Fix the cause, then
+# `systemctl start homehub-gunmaster3-relay`.
+
+[Install]
+WantedBy=multi-user.target

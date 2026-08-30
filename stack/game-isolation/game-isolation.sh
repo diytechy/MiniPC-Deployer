@@ -3,8 +3,10 @@
 #
 # WHY THIS FILE EXISTS, and it is not the reason you would guess from the name.
 #
-# The relay (docker-compose.yml, profile `gunmaster3`) is the one service on this
-# box that deliberately answers the public internet with no identity check. It is
+# The relay (docker-compose.yml, enabled by GAME_RELAY_ENABLED and started only
+# by homehub-gunmaster3-relay.service, which `Requires=` THIS unit) is the one
+# service on this box that deliberately answers the public internet with no
+# identity check. It is
 # put on a `game` network with `internal: true`, and that was documented as
 # meaning it "cannot reach the internet, the LAN, or its neighbours".
 #

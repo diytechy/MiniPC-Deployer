@@ -384,6 +384,27 @@ explicitly enabled.
 | `freshrss` / `mealie` / `homepage` | FreshRSS / Mealie / Homepage | LAN ports in `.env` | RSS · recipes · LAN dashboard |
 | `diun` | diun | logs / ntfy topic | update **notifier** for the pinned images (never auto-updates) |
 
+### The one service that is NOT in this table: the crossplay relay
+
+`gunmaster3-relay` is a compose service with `profiles: ["gunmaster3"]`, and it
+is deliberately absent from the catalog above because **its profile is not an
+enable switch.** Since 2026-08-29 (HomeHub's `CROSSPLAY_HANDOFF.md` §7):
+
+- the enable knob is **`GAME_RELAY_ENABLED=true`** in `.env`, the same
+  convention as `REMOTE_UI_ENABLED`;
+- the container carries `restart: "no"`, so **Docker never starts it**;
+- `homehub-gunmaster3-relay.service` is the only thing that ever passes
+  `--profile gunmaster3`, and it `Requires=homehub-game-isolation.service` — the
+  host firewall REJECT that makes the relay's isolation claim true. No fence, no
+  relay, enforced by systemd rather than by shell branching in firstboot;
+- the `profiles:` entry now exists solely to keep the relay **out of**
+  firstboot's bulk `docker compose up -d`.
+
+**Putting `gunmaster3` into `COMPOSE_PROFILES` is a defect**, not an alternative
+spelling: it would let that bulk `up -d` start a public, unauthenticated service
+outside the unit that fences it. `verify-hub.sh` (TC-H-T07),
+`scripts/ensure-local-images.sh` and `vmtest/export-images.sh` each refuse it.
+
 ### Where everything is configured (the pre-build chain)
 
 All configuration happens in **this directory before the USB/ISO is built**, in

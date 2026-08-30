@@ -53,20 +53,31 @@ command -v docker >/dev/null 2>&1 || die "docker CLI not found (on the dev box, 
 # not a shell script — an unquoted space in an unrelated value must not be able
 # to break this resolver (the 2026-07-10 TRACKER_GIT_NAME finding).
 #
-# OVERRIDABLE, and it has to be (added 2026-08-29 with the gunmaster3 profile).
+# OVERRIDABLE, and it has to be (added 2026-08-29 with the crossplay relay).
 # vmtest/export-images.sh ALREADY takes `ENV_FILE=stack/.env` as a parameter and
-# derives its bake set from that file's COMPOSE_PROFILES. This resolver decides
-# which LOCAL IMAGES TO BUILD from the same knob — so if the two read different
-# files they disagree about which profiles are on, and the disagreement is
-# silent: the exporter demands an image the resolver never built. Same env file
-# in, same answer out.
+# derives its bake set from that file's COMPOSE_PROFILES **and its
+# GAME_RELAY_ENABLED**. This resolver decides which LOCAL IMAGES TO BUILD from
+# the same knobs — so if the two read different files they disagree about what
+# is on, and the disagreement is silent: the exporter demands an image the
+# resolver never built. Same env file in, same answer out. When the relay's
+# enable knob moved out of COMPOSE_PROFILES (the lifecycle refresh, same day)
+# BOTH SIDES MOVED IN THE SAME COMMIT, for exactly this reason.
 ENV_FILE="${ENV_FILE:-$REPO_ROOT/stack/.env}"
 [ -f "$ENV_FILE" ] || ENV_FILE="$REPO_ROOT/stack/.env.example"
 
-# env_get KEY : the last KEY= value in $ENV_FILE, surrounding quotes stripped.
-env_get() {
-    sed -n "s/^${1}=//p" "$ENV_FILE" | tail -n1 | sed 's/^"\(.*\)"$/\1/'
-}
+# env_get KEY : the effective value of KEY in $ENV_FILE.
+#
+# ONE READER, SHARED WITH vmtest/export-images.sh (round 6, codex gpt-5.6-sol).
+# This used to be a local `sed -n "s/^KEY=//p"` that matched only a COLUMN-1
+# key, while the exporter's own reader tolerated leading whitespace — so a line
+# written `  GAME_RELAY_ENABLED=true` made the exporter bake the relay image and
+# made THIS script skip building it. Same file, two answers, and nothing says so
+# until a build fails on a missing image. The parser now lives in
+# scripts/lib/envfile.sh and both scripts call it; see that file's header for
+# the exact semantics and why they match firstboot.sh's `env_value`.
+# shellcheck source=lib/envfile.sh
+. "$SCRIPT_DIR/lib/envfile.sh"
+env_get() { env_file_value "$ENV_FILE" "$1"; }
 TRACKER_IMAGE_TAG="$(env_get TRACKER_IMAGE_TAG)"
 TRACKER_PUBLIC_IMAGE="${TRACKER_PUBLIC_IMAGE:-$(env_get TRACKER_PUBLIC_IMAGE)}"
 FINANCE_AUDITOR_IMAGE_TAG="$(env_get FINANCE_AUDITOR_IMAGE_TAG)"
@@ -176,24 +187,32 @@ ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Audi
 #     check in export-images.sh only WARNS on an unstamped image.
 ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" ""
 
-# ── gunmaster3-relay: the family crossplay relay (profile `gunmaster3`) ──────
-# GUARDED ON THE PROFILE, and that guard is the whole point of this block.
+# ── gunmaster3-relay: the family crossplay relay (GAME_RELAY_ENABLED) ────────
+# GUARDED ON THE KNOB, and that guard is the whole point of this block.
 #
 # Every ensure_image above is unconditional because every one of those services
-# is always in the stack. This one is not: `gunmaster3` ships OFF in the public
+# is always in the stack. This one is not: the relay ships OFF in the public
 # repo's .env.example, so building it unconditionally would make a clone WITHOUT
-# a ../FinnsGame checkout die on a service that clone does not run. The profile
-# is the honest condition — if you are not running the relay, you do not need
-# its image.
+# a ../FinnsGame checkout die on a service that clone does not run. The knob is
+# the honest condition — if you are not running the relay, you do not need its
+# image.
 #
-# WHY IT MATTERS THAT THIS EXISTS AT ALL, since the profile is off by default:
+# THE KNOB CHANGED 2026-08-29, from "is `gunmaster3` in COMPOSE_PROFILES" to
+# GAME_RELAY_ENABLED, and vmtest/export-images.sh moved in the same step so the
+# two still ask the same question of the same file. The relay's lifecycle now
+# belongs to homehub-gunmaster3-relay.service rather than to docker (HomeHub's
+# CROSSPLAY_HANDOFF.md §7); its compose `profiles:` entry survives only to keep
+# it out of firstboot's bulk `up -d`.
+#
+# WHY IT MATTERS THAT THIS EXISTS AT ALL, since the relay is off by default:
 # vmtest/export-images.sh derives the bake set from `docker compose config
-# --images` WITH THE ENV FILE'S PROFILES APPLIED. So the moment `gunmaster3` is
-# in COMPOSE_PROFILES (it is, in the real config.homehub.psd1), the exporter
-# expects `gunmaster3-relay:local` to exist — and firstboot's `docker compose up
-# -d` is ALL-OR-NOTHING, so an image missing from the ISO does not degrade the
-# relay, it stops the whole stack from coming up on a reflashed box. Without
-# this block the ISO builds clean and the box comes up dead.
+# --images`, and it adds `--profile gunmaster3` exactly when GAME_RELAY_ENABLED
+# is true. So the moment the knob is on (it is, in the real
+# config.homehub.psd1), the exporter expects `gunmaster3-relay:local` to exist —
+# and while the relay itself is no longer part of the all-or-nothing bulk `up`,
+# an image missing from the ISO still means the relay unit fails on a reflashed
+# box with nothing on the stick to fix it from. Without this block the ISO
+# builds clean and the relay cannot start.
 #
 # THE DOCKERFILE IS IN A SUBDIRECTORY of the sibling repo (FinnsGame/server),
 # unlike NagLight and FileBackup which have theirs at the repo root. ensure_image
@@ -202,13 +221,24 @@ ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" ""
 # NO PUBLIC FALLBACK: nothing publishes this image anywhere, and the hub cannot
 # fetch it either — so an absent checkout must be a loud failure naming the
 # clone, exactly as it is for FileBackup.
-GAME_RELAY_IMAGE_TAG="$(env_get GAME_RELAY_IMAGE_TAG)"
-case ",$(env_get COMPOSE_PROFILES)," in
+#
+# AND `gunmaster3` IN COMPOSE_PROFILES IS A REFUSED BUILD, not a warning. It
+# would put the relay into firstboot's bulk `docker compose up -d`, starting a
+# public, unauthenticated service outside the unit that fences it off the host —
+# the exact failure the lifecycle refresh exists to make unreachable. Dying here
+# costs one edit; shipping it costs an unfenced relay on a flashed box.
+case ",$(env_get COMPOSE_PROFILES | tr -d '[:space:]')," in
     *,gunmaster3,*)
+        die "COMPOSE_PROFILES in ${ENV_FILE} contains 'gunmaster3'. That is a DEFECT, not an enable switch: the relay's lifecycle belongs to homehub-gunmaster3-relay.service, and naming the profile here lets firstboot's bulk 'docker compose up -d' start a public unauthenticated service OUTSIDE the unit that fences it off this host. Remove gunmaster3 from COMPOSE_PROFILES and set GAME_RELAY_ENABLED=true instead."
+        ;;
+esac
+GAME_RELAY_IMAGE_TAG="$(env_get GAME_RELAY_IMAGE_TAG)"
+case "$(env_get GAME_RELAY_ENABLED)" in
+    true|TRUE|True|yes|1)
         ensure_image "gunmaster3-relay:${GAME_RELAY_IMAGE_TAG:-local}" "FinnsGame/server" ""
         ;;
     *)
-        log "skip: gunmaster3-relay (profile 'gunmaster3' not in COMPOSE_PROFILES)"
+        log "skip: gunmaster3-relay (GAME_RELAY_ENABLED is not true in ${ENV_FILE##*/})"
         ;;
 esac
 

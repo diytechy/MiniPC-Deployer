@@ -103,10 +103,25 @@ services:
       # environment, which is worth knowing rather than discovering.
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
       MAIN_BOX_IP: ${MAIN_BOX_IP}
-      # ── Gun Master 3 relay (profile `gunmaster3`) ────────────────────────
+      # ── Gun Master 3 relay (GAME_RELAY_ENABLED) ──────────────────────────
       # GAME_HOST is a T1 private name; GAME_WS_SECRET is the PATH COMPONENT
       # that stands in for authentication on that host, and is the only thing
       # between the internet and the relay. See the Caddyfile's game block.
+      #
+      # THIS LINE IS THE ORACLE for the relay unit's secret check, and since
+      # round 6 it is the ONLY one. homehub-gunmaster3-relay.service reads
+      # GAME_WS_SECRET back out of THIS container's environment and has no .env
+      # fallback at all, because the Caddyfile consumes {$GAME_WS_SECRET} from
+      # here — so this is the value that actually gates the public path, and
+      # validating anything else asserts what the door SHOULD be rather than
+      # what it is. Delete this line and the relay unit fails its ExecStartPre
+      # and refuses to start, which is the correct answer: with no secret in
+      # caddy's environment there is no door.
+      #
+      # AND IT IS FIXED AT CREATE TIME. Editing GAME_WS_SECRET in .env changes
+      # nothing about a running caddy; the container must be RECREATED
+      # (`docker compose up -d --force-recreate caddy`) for a new value to reach
+      # the Caddyfile. The relay unit's failure message says so.
       GAME_HOST: ${GAME_HOST}
       GAME_WS_SECRET: ${GAME_WS_SECRET}
     # TWO NETWORKS, and BOTH must be named explicitly. Naming any network at all
@@ -898,7 +913,23 @@ services:
       - diun_data:/data
     restart: unless-stopped
 
-  # ── gunmaster3-relay — the family crossplay relay (profile `gunmaster3`) ─────
+  # ── gunmaster3-relay — the family crossplay relay ────────────────────────────
+  #
+  # ── HOW IT IS TURNED ON, AND IT IS NOT `COMPOSE_PROFILES` ────────────────────
+  # CHANGED 2026-08-29 (CROSSPLAY_HANDOFF.md §7). The enable knob is
+  # **GAME_RELAY_ENABLED=true** in .env, the same convention as
+  # REMOTE_UI_ENABLED and IMMICH_ML_ENABLED. The `profiles: ["gunmaster3"]` line
+  # below STAYS, and its job is now the opposite of an enable switch: it is what
+  # keeps this service OUT of firstboot's bulk `docker compose up -d`. The only
+  # thing that ever passes `--profile gunmaster3` is
+  # homehub-gunmaster3-relay.service, which `Requires=` the host fence.
+  #
+  # PUTTING `gunmaster3` INTO COMPOSE_PROFILES IS A DEFECT, not an alternative
+  # spelling. It would let the bulk `up -d` start this container outside the
+  # unit — no fence ordering, no secret validation, no artifact check — which is
+  # precisely the failure the refresh exists to make unreachable. It is refused
+  # by verify-hub.sh (TC-H-T07), scripts/ensure-local-images.sh and
+  # vmtest/export-images.sh, each of which dies rather than warns.
   # WHAT IT IS: a ~300-line WebSocket relay from C:\Projects\FinnsGame\server. It
   # forwards presence and positions between two browsers so the Owner and his son
   # can see each other in Gun Master 3. It is not a game server: the world,
@@ -937,6 +968,9 @@ services:
   gunmaster3-relay:
     image: gunmaster3-relay:${GAME_RELAY_IMAGE_TAG}
     container_name: gunmaster3-relay
+    # NOT AN ENABLE SWITCH — see the banner above. This keeps the relay out of
+    # the bulk `docker compose up -d`; homehub-gunmaster3-relay.service is the
+    # only caller that ever passes `--profile gunmaster3`.
     profiles: ["gunmaster3"]
     labels:
       # Locally built, no registry home to watch — same reason as naglight:local.
@@ -966,7 +1000,25 @@ services:
     # (120 upgrades/min/IP) is the first line; these are the backstop.
     pids_limit: 128
     mem_limit: 192m
-    restart: unless-stopped
+    # ── `no`, AND IT MUST BE `no` RATHER THAN `on-failure` ────────────────────
+    # CHANGED 2026-08-29 from `unless-stopped` (CROSSPLAY_HANDOFF §7). SYSTEMD
+    # OWNS THIS CONTAINER'S LIFECYCLE NOW — homehub-gunmaster3-relay.service,
+    # which `Requires=` the host fence — and two owners is the same as none.
+    #
+    # `unless-stopped` was the defect: it made DOCKER start the relay on every
+    # boot, before and independently of the fence, so the fence unit failing
+    # could not stop the relay coming back. `Before=docker.service` on the fence
+    # orders the starts but cannot propagate the failure; `Requires=` on the
+    # relay unit can, and only if Docker is not also starting it behind systemd's
+    # back.
+    #
+    # AND NOT `on-failure`, which looks like the cautious choice and is not.
+    # Docker restarts on-failure containers at DAEMON START when their last exit
+    # was non-zero, and a SIGTERM'd node process exits 143 — so the ordinary
+    # `systemctl stop` of this unit would arm a resurrection at the next boot,
+    # performed by dockerd, outside the unit, with no fence check between. `no`
+    # is the whole point: nothing but the unit ever starts this container.
+    restart: "no"
     healthcheck:
       # The image's own HEALTHCHECK hits /health on 127.0.0.1 — restated here so
       # the interval matches the rest of this file. /health is deliberately NOT

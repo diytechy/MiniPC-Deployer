@@ -8,14 +8,21 @@ Documentation=file:///opt/homehub/stack/game-isolation/game-isolation.sh
 # reasoning that the rule names a subnet whose bridge docker creates. But the
 # rule does NOT need the bridge to exist - iptables holds a rule for a subnet
 # with no interface quite happily - and ordering after docker means that on every
-# reboot the relay (restart: unless-stopped) is started by docker BEFORE this
-# unit runs. That window is exactly when an already-compromised relay would
-# reach the host, and it recurs on every single boot.
+# reboot the relay (which then carried `restart: unless-stopped`) is started by
+# docker BEFORE this unit runs. That window is exactly when an already-
+# compromised relay would reach the host, and it recurred on every single boot.
 #
-# Before=docker.service closes it: the fence is up before anything can be
-# started behind it. Requires= is deliberately absent - this must run even if
-# docker is masked or broken, because a rule with no containers is harmless and
-# a container with no rule is the failure this exists to prevent.
+# THAT SECOND HALF WAS ALSO FIXED FROM THE OTHER END on 2026-08-29: the relay
+# now carries `restart: "no"` and is started only by
+# homehub-gunmaster3-relay.service, which `Requires=` this unit - so a failure
+# here does not merely lose a race, it stops the relay existing at all. Both
+# guards are kept: Before=docker.service is the ordering, Requires= on the
+# relay unit is the propagation, and neither is sufficient alone.
+#
+# Before=docker.service closes the window: the fence is up before anything can
+# be started behind it. Requires= is deliberately absent HERE - this must run
+# even if docker is masked or broken, because a rule with no containers is
+# harmless and a container with no rule is the failure this exists to prevent.
 Before=docker.service
 DefaultDependencies=no
 After=network-pre.target

@@ -58,6 +58,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
 
 REPO_ROOT="$(repo_root)"
+# THE SAME .env READER scripts/ensure-local-images.sh uses, and that is the
+# point of it being a file rather than two `sed -n`s (round 6, codex
+# gpt-5.6-sol). This script decides what to BAKE from the env file; that one
+# decides what to BUILD from the same env file. When their parsers differed, a
+# single leading space on a line made the exporter demand an image the resolver
+# never built. See scripts/lib/envfile.sh.
+# shellcheck source=../scripts/lib/envfile.sh
+. "$REPO_ROOT/scripts/lib/envfile.sh"
 ENV_FILE="${ENV_FILE:-$REPO_ROOT/stack/.env.example}"
 COMPOSE_FILE="$REPO_ROOT/stack/docker-compose.yml"
 IMAGES_OUT="${IMAGES_OUT:-$REPO_ROOT/vmtest/.out/images}"
@@ -125,8 +133,49 @@ require_free_gb "$IMAGES_OUT" 3
 # exactly the shape that ships a stick with a missing tar. Baking it costs one
 # image; leaving it out costs a wrapper run that exits on `No such image`.
 PROFILE_ARGS=(--profile ntfy --profile filebackup)
-ENV_PROFILES="$(sed -n 's/^[[:space:]]*COMPOSE_PROFILES[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" \
-                | tail -n1 | tr -d '"'\''' | tr ',' ' ')"
+ENV_PROFILES="$(env_file_value "$ENV_FILE" COMPOSE_PROFILES | tr ',' ' ')"
+
+# ── THE CROSSPLAY RELAY IS THE ONE PROFILE THAT IS NOT A PROFILE KNOB ────────
+# CHANGED 2026-08-29 with the relay lifecycle refresh (HomeHub's
+# CROSSPLAY_HANDOFF.md §7). `gunmaster3` is still a compose profile — that is
+# what keeps the relay out of firstboot's bulk `docker compose up -d` — but it
+# is no longer how the relay is ENABLED. GAME_RELAY_ENABLED is.
+#
+# So the bake set has to be derived from the knob, not from COMPOSE_PROFILES:
+# `docker compose config --images` omits a profiled service unless --profile is
+# passed, and an image omitted from the bake is an image the box cannot get.
+# Nothing publishes gunmaster3-relay:local anywhere and the hub has no network
+# route to it on first boot, so a missed bake is a relay that can never start.
+#
+# AND `gunmaster3` IN COMPOSE_PROFILES IS A REFUSED BUILD. It would let
+# firstboot's bulk `up -d` start a public, unauthenticated service OUTSIDE
+# homehub-gunmaster3-relay.service — no fence ordering, no secret validation.
+# scripts/ensure-local-images.sh refuses it in the same words, from the same
+# file, so the resolver and the exporter cannot disagree about it either.
+# $ENV_PROFILES is already SPACE-separated (the tr ',' ' ' above), so match on
+# space-delimited words. An earlier version squeezed the whitespace out and then
+# looked for `,gunmaster3,`, which silently matched nothing at all - the exact
+# class of quiet no-op this refusal exists to prevent, caught by testing the
+# refusal instead of reading it.
+case " $ENV_PROFILES " in
+    *" gunmaster3 "*)
+        die "COMPOSE_PROFILES in $ENV_FILE contains 'gunmaster3'. That is a DEFECT, not an enable switch: the relay's lifecycle belongs to homehub-gunmaster3-relay.service, and naming the profile here lets firstboot's bulk 'docker compose up -d' start a public unauthenticated service OUTSIDE the unit that fences it off the host. Remove gunmaster3 from COMPOSE_PROFILES and set GAME_RELAY_ENABLED=true instead."
+        ;;
+esac
+GAME_RELAY_ENABLED="$(env_file_value "$ENV_FILE" GAME_RELAY_ENABLED | tr -d '[:space:]')"
+# KEPT OUT OF $ENV_PROFILES ON PURPOSE: that variable is reported below as "what
+# COMPOSE_PROFILES enables", and it must stay an honest reading of that one
+# line. The relay is added to the compose invocation, not to the profile list.
+case "$GAME_RELAY_ENABLED" in
+    true|TRUE|True|yes|1)
+        PROFILE_ARGS+=(--profile gunmaster3)
+        log "GAME_RELAY_ENABLED=$GAME_RELAY_ENABLED in ${ENV_FILE##*/} — baking the crossplay relay image (--profile gunmaster3)"
+        ;;
+    *)
+        log "GAME_RELAY_ENABLED is not true in ${ENV_FILE##*/} — the crossplay relay image is NOT baked"
+        ;;
+esac
+
 for p in $ENV_PROFILES ${EXTRA_PROFILES:-}; do
     case " ${PROFILE_ARGS[*]} " in *" $p "*) continue ;; esac
     PROFILE_ARGS+=(--profile "$p")

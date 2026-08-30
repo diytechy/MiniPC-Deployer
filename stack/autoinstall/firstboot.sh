@@ -1005,92 +1005,100 @@ if ! grep -q '^ok caddy' "${__restore_log:-/nonexistent}" 2>/dev/null; then
 fi
 rm -f "${__restore_log:-}" 2>/dev/null || true
 
-# ── 4-pre. FENCE THE CROSSPLAY RELAY BEFORE ANYTHING STARTS IT ──────────────
-# ORDER IS THE POINT. The relay is the one service on this box that answers the
-# public internet with no identity check, and `internal: true` does NOT stop it
-# reaching the HOST - Docker keeps the bridge gateway live and documents the
-# exception. Measured: the relay reached host SSH, Technitium's DNS AND its admin
-# console on 5380, and cockpit, the console bypassing both of the guards on it.
-# So the rule must exist BEFORE the container does.
+# ── 4-pre. THE CROSSPLAY RELAY'S TWO UNITS, INSTALLED AND ENABLED ───────────
+# REWRITTEN 2026-08-29 (CROSSPLAY_HANDOFF.md §7). What stood here was ~40 lines
+# that detected a profile, validated a secret, installed a unit, verified an
+# iptables rule and degraded gracefully — security-critical branching in shell,
+# under `set -euo pipefail`, in the last place that runs before the household's
+# DNS, Caddy, Actual and tracker come up. Four adversarial review rounds each
+# found a defect in the previous round's fix, and TWICE that defect would have
+# flashed a box with no stack at all. The block whose entire purpose was "never
+# take the household's DNS down over a game relay" took the household's DNS down
+# over a game relay, twice, in two different ways.
 #
-# READ THE PROFILE WITH env_value, NOT AS A SHELL VARIABLE. This script does not
-# source .env, so `$COMPOSE_PROFILES` is UNSET here - the first version tested it
-# directly and was a silent no-op: the unit was never installed and a reimaged box
-# would have run the relay with the host wide open while every log line said
-# success.
+# The fix was not a fifth patch. It was moving WHO OWNS THE RELAY'S LIFECYCLE:
+#   * docker-compose.yml gives the relay `restart: "no"`, so Docker never starts
+#     it, and keeps `profiles: ["gunmaster3"]`, so the bulk `up -d` below never
+#     starts it either;
+#   * homehub-gunmaster3-relay.service is the only thing that ever passes
+#     `--profile gunmaster3`, and it `Requires=` the fence unit — so systemd,
+#     not shell branching, both orders the fence first AND propagates its
+#     failure;
+#   * the enable knob is GAME_RELAY_ENABLED in .env, read by that unit's
+#     ExecCondition, where a parse disagreement can only mean "did not start"
+#     or "started behind a guaranteed fence" — never "started unfenced".
 #
-# ── AND IT DEGRADES, IT DOES NOT DETONATE ───────────────────────────────────
-# The version before this one called `exit 1` on any problem. That is the wrong
-# blast radius by a mile: a one-character typo in a GAME TOKEN would have taken
-# down household DNS, Caddy, Actual and the tracker on a freshly flashed box. The
-# relay is the only unsafe component, so the relay is the only thing that gets
-# switched off. On any failure this DROPS `gunmaster3` from the profile set
-# compose is about to use, lets the core stack come up, and records the problem
-# so firstboot still ends loudly and non-zero.
-__gm3_enabled=0
-__gm3_failed=0
-# NORMALISE ONCE, USE FOR BOTH. The detection below and the stripping further
-# down have to agree about what "gunmaster3 is enabled" means, and they did not:
-# `grep -vx gunmaster3` needs an exact whole-line match, so a value written
-# `ntfy, gunmaster3` kept the profile while the `case` also failed to see it.
-# They stayed consistent by accident rather than by construction, which is not a
-# property to rely on in the one place that decides whether a public service gets
-# a firewall. Squeeze the whitespace out first and both agree by definition.
-__gm3_profiles="$(env_value COMPOSE_PROFILES | tr -d '[:space:]')"
-case ",$__gm3_profiles," in
-    *,gunmaster3,*) __gm3_enabled=1 ;;
-esac
-if [ "$__gm3_enabled" = 1 ]; then
-    # THE SECRET IS THE ONLY DOOR. Empty, the Caddy matcher collapses to `^/ws-$`
-    # and the bearer credential becomes the literal string "/ws-". 43 base64url
-    # characters is exactly what New-RandomToken emits.
-    __gm3_secret="$(env_value GAME_WS_SECRET)"
-    if ! printf '%s' "$__gm3_secret" | grep -qE '^[A-Za-z0-9_-]{43}$'; then
-        log "  GAME_WS_SECRET is missing or malformed - it is the ONLY thing between the"
-        log "  public internet and the game relay. Disabling the relay for this boot."
-        __gm3_failed=1
-    elif [ ! -f "$STACK_DIR/game-isolation/game-isolation.sh" ]; then
-        log "  game-isolation.sh is not in the payload - the relay would start with this"
-        log "  host reachable from it. Disabling the relay for this boot."
-        __gm3_failed=1
-    else
-        # NO COPY HERE. The payload IS /opt/homehub/stack - the installer's
-        # late-command put it there - so `install <src> <same path>` fails with
-        # "are the same file", returns 1, and under `set -euo pipefail` killed
-        # firstboot outright BEFORE `docker compose up -d`. That shipped a box
-        # with no stack at all, and it is exactly the kind of thing that looks
-        # harmless in review. Only the mode needs converging.
-        chmod 0755 "$STACK_DIR/game-isolation/game-isolation.sh" 2>/dev/null || true
-        install -m 0644 "$STACK_DIR/game-isolation/homehub-game-isolation.service"             /etc/systemd/system/ 2>/dev/null || __gm3_failed=1
-        if [ "$__gm3_failed" = 0 ]; then
-            systemctl daemon-reload
-            systemctl enable --now homehub-game-isolation.service >/dev/null 2>&1 || __gm3_failed=1
-        fi
-        # VERIFY THE ARTIFACT, NOT THE EXIT CODE (house rule). `enable --now`
-        # returning 0 says systemd ran the unit, not that a REJECT is in INPUT.
-        if [ "$__gm3_failed" = 0 ] && ! iptables -S INPUT 2>/dev/null | grep -q 'homehub-game-isolation'; then
-            log "  the isolation unit reported success but no REJECT is in INPUT."
-            __gm3_failed=1
-        fi
-        [ "$__gm3_failed" = 0 ] && log "  game-isolation: the relay subnet cannot address this host"
-    fi
+# WHAT IS LEFT HERE IS FILE COPYING, AND IT HAS NO BRANCHES. Every line ends in
+# `|| log "WARN: …"`, so NOTHING in this section can take firstboot down before
+# `docker compose up -d`. The measured fact that made all of this necessary —
+# `internal: true` does NOT stop a container reaching the HOST — lives in
+# game-isolation.sh's header, next to the port-by-port measurements.
+#
+# NOT A COPY ONTO ITSELF: the payload is $STACK_DIR/game-isolation/, the target
+# is /etc/systemd/system/. That is the round-2 bug (`install <path> <same path>`
+# exits 1, "are the same file") checked rather than assumed.
+#
+# IDEMPOTENT ON PURPOSE. autoinstall/user-data installs and enables these same
+# two units in its late-commands, so the fence exists from the very FIRST boot,
+# before dockerd has ever started — which is exactly what the fence unit's
+# `Before=docker.service` is for. THE ISO IS AUTHORITATIVE for a flashed box;
+# this section is the re-apply that covers a stack payload updated in place, a
+# box deployed by copying /opt/homehub/stack without a reflash, and any unit
+# file that changed since the ISO was built.
+chmod 0755 "$STACK_DIR/game-isolation/game-isolation.sh" 2>/dev/null || log "WARN: could not chmod game-isolation.sh"
+chmod 0755 "$STACK_DIR/game-isolation/gunmaster3-relay.sh" 2>/dev/null || log "WARN: could not chmod gunmaster3-relay.sh"
+install -m 0644 "$STACK_DIR/game-isolation/homehub-game-isolation.service"   /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-game-isolation.service"
+install -m 0644 "$STACK_DIR/game-isolation/homehub-gunmaster3-relay.service" /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-gunmaster3-relay.service"
+systemctl daemon-reload 2>/dev/null || log "WARN: systemctl daemon-reload failed"
+systemctl enable homehub-game-isolation.service   >/dev/null 2>&1 || log "WARN: could not enable homehub-game-isolation.service - the relay subnet would not be fenced off this host after a reboot"
+systemctl enable homehub-gunmaster3-relay.service >/dev/null 2>&1 || log "WARN: could not enable homehub-gunmaster3-relay.service - the relay would not come back after a reboot"
+log "game-isolation + relay units installed and enabled"
 
-    if [ "$__gm3_failed" = 1 ]; then
-        # Strip the profile from what compose will use. An exported
-        # COMPOSE_PROFILES overrides the .env value for this invocation, so the
-        # relay simply is not created - while DNS, Caddy, Actual and the tracker
-        # all come up normally.
-        # `|| true` IS LOAD-BEARING. With COMPOSE_PROFILES=gunmaster3 (relay only)
-        # grep matches nothing, exits 1, and under `set -euo pipefail` the command
-        # substitution takes firstboot down BEFORE `docker compose up -d` - which
-        # is precisely the box-with-no-stack failure this whole block exists to
-        # avoid, reintroduced by the code avoiding it. An empty profile set is a
-        # perfectly good answer and must read as success.
-        COMPOSE_PROFILES="$(printf '%s' "$__gm3_profiles" | tr ',' '
-' | { grep -vx 'gunmaster3' || true; } | paste -sd, -)"
-        export COMPOSE_PROFILES
-        log "  RELAY DISABLED FOR THIS BOOT. The rest of the stack starts normally."
-        log "  Fix the cause, then: systemctl start homehub-game-isolation && docker compose up -d"
+# ── 4-pre-b. DISARM A LEGACY RELAY CONTAINER, AND VERIFY THE DISARM ─────────
+# THE ONE THING THE LIFECYCLE REFRESH DOES NOT FIX BY ITSELF (found by codex
+# gpt-5.6-sol, round 6). A box that ran the OLD shape has a `gunmaster3-relay`
+# container created with `restart: unless-stopped`, and NOTHING below touches
+# it: the bulk `docker compose up -d` skips the relay because its profile is
+# inactive, so compose neither recreates nor removes the container it does not
+# consider part of this invocation. The container just sits there, armed.
+#
+# WHY THAT IS A SECURITY PROBLEM AND NOT UNTIDINESS. If the relay unit then
+# skips cleanly (GAME_RELAY_ENABLED=false) or fails its precheck, systemd has
+# correctly decided the relay must not run — and DOCKER restarts it anyway at
+# the next boot, because `unless-stopped` is a property of the container, not of
+# the compose file. The result is a public, unauthenticated relay started
+# outside homehub-gunmaster3-relay.service: outside the `Requires=` that
+# guarantees the fence, and outside the ExecStartPost that verifies it. Exactly
+# the state the refresh exists to make unreachable, reached from the past.
+#
+# `docker update --restart=no` rewrites the policy on the EXISTING container -
+# no recreate, no image, no compose - and is the only way to disarm one without
+# removing it. The stop is separate because `update` changes what happens at the
+# NEXT boot and nothing about now.
+#
+# VERIFY THE ARTIFACT, NOT THE EXIT CODE (house rule). Both commands can return
+# 0 against a container that is then still armed or still running, and the whole
+# point of this block is a claim about the next boot.
+#
+# STILL NON-FATAL, like everything else in this section. A failure here is loud,
+# names the exact two commands to run by hand, and does not stop the household's
+# DNS, Caddy, Actual and tracker from starting ten lines below.
+__gm3_rp="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' gunmaster3-relay 2>/dev/null || true)"
+if [ -n "$__gm3_rp" ] && [ "$__gm3_rp" != no ]; then
+    log "MIGRATION: a legacy gunmaster3-relay container is armed with restart='$__gm3_rp'"
+    log "  docker - not systemd - would start it at the next boot, outside the fence check"
+    docker update --restart=no gunmaster3-relay >/dev/null 2>&1 || log "  WARN: 'docker update --restart=no gunmaster3-relay' failed"
+    docker stop gunmaster3-relay >/dev/null 2>&1 || log "  WARN: 'docker stop gunmaster3-relay' failed"
+    __gm3_rp2="$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' gunmaster3-relay 2>/dev/null || true)"
+    __gm3_run2="$(docker inspect -f '{{.State.Running}}' gunmaster3-relay 2>/dev/null || true)"
+    if [ "$__gm3_rp2" = no ] && [ "$__gm3_run2" != true ]; then
+        log "  disarmed and stopped - the relay unit owns this container's lifecycle now"
+    else
+        log "  WARN: COULD NOT DISARM the legacy relay container (restart='${__gm3_rp2:-?}', running='${__gm3_run2:-?}')."
+        log "  Docker may start a PUBLIC, UNAUTHENTICATED relay at the next boot, outside"
+        log "  homehub-gunmaster3-relay.service and therefore outside its fence check. Run:"
+        log "    docker update --restart=no gunmaster3-relay && docker stop gunmaster3-relay"
+        log "  then confirm:  docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' gunmaster3-relay"
     fi
 fi
 
@@ -1128,6 +1136,53 @@ if [ -n "$_notrunning" ]; then
 else
     log "every compose service reached a running state"
 fi
+
+# ── 4a-relay. START THE CROSSPLAY RELAY, WHICH THE LOOP ABOVE DID NOT JUDGE ──
+# WHY THE LOOP ABOVE SAYS NOTHING ABOUT IT, stated precisely because the first
+# version of this comment got it wrong. `docker compose ps --services` DOES list
+# a profiled service once its container is running (and with `-a`, once the
+# container merely exists) — measured on Compose v5.3. What is true here is
+# narrower and is about TIMING, not profiles: at this point in firstboot nothing
+# has started the relay yet, because the only thing that ever does is its unit,
+# three lines below. So there is no container for `ps` to have found, the loop
+# correctly reported on everything that existed, and the relay needs its own
+# line. Its state is a systemd question now, not a docker one.
+#
+# --no-block IS LOAD-BEARING, AND LEAVING IT OUT DEADLOCKS THE BOOT. This script
+# runs INSIDE homehub-firstboot.service, and the unit it is starting is ordered
+# `After=homehub-firstboot.service` (so that on boot 1 the relay does not race
+# the image load and the caddy it needs). A BLOCKING `systemctl start` therefore
+# waits for a unit that cannot begin until this script's own service finishes —
+# and it never will, because it is waiting here. This project has already paid
+# for that exact deadlock once: 2026-08-27, setup-remote-ui.sh, firstboot stuck
+# `activating` for 18 MINUTES with `multi-user.target start waiting`, no session,
+# no IceDrive. Two fixes that were each correct alone wedged the whole boot.
+# --no-block ENQUEUES the job and returns; systemd runs it the moment firstboot
+# completes, so the ordering guarantee is kept and the deadlock cannot happen.
+#
+# WHICH MEANS THIS CANNOT REPORT THE RELAY'S FINAL STATE, and must not pretend
+# to: the job has not run yet. Log the fence (known now) and name the command
+# that answers the relay question afterwards.
+#
+# NON-FATAL, and this is the whole blast-radius change. The relay is the one
+# unsafe component on this box; every other thing in this file has already come
+# up by now. A relay that will not start leaves DNS, Caddy, Actual and the
+# tracker exactly as they are, says so in the journal, and waits for someone.
+# GAME_RELAY_ENABLED=false makes this a clean no-op: the unit's ExecCondition
+# reports "condition not met", which systemd records as a skip, not a failure.
+if systemctl start --no-block homehub-gunmaster3-relay.service >/dev/null 2>&1; then
+    log "crossplay relay: start QUEUED (--no-block); systemd runs it the moment firstboot finishes"
+    log "  it cannot run sooner - the unit is ordered After=homehub-firstboot.service"
+    log "  check it afterwards with: systemctl is-active homehub-gunmaster3-relay.service"
+    log "  (GAME_RELAY_ENABLED=false makes that 'inactive' with a condition-not-met skip, which is correct)"
+else
+    log "WARN: could not queue the relay unit start - systemctl status homehub-gunmaster3-relay"
+    log "  the rest of the stack is unaffected; this box simply has no crossplay relay"
+fi
+# `systemctl is-active` PRINTS ITS ANSWER AND EXITS NON-ZERO for anything but
+# active, so `|| echo unknown` appended a SECOND word on a second line to every
+# inactive answer. `|| true` keeps the printed answer and swallows the status.
+log "crossplay fence unit: $(systemctl is-active homehub-game-isolation.service 2>/dev/null || true)"
 
 # ── 4b. CAN CADDY ACTUALLY READ THE KIOSK CONFIG? (OI-20) ────────────────────
 # Installing a 0600 root-owned file into a bind mount is not the same as the
@@ -1594,17 +1649,18 @@ date > "$MARKER"
 # shares are mounted), but `systemctl status homehub-firstboot` must be RED and
 # `systemctl is-failed` must say so. On a headless box the unit's state is the
 # only surface a defect can appear on that is not a line in a scrolling journal.
-# The relay guard reports the same way and for the same reason: the box is UP and
-# useful (DNS, Caddy, Actual and the tracker all started), but the crossplay relay
-# was deliberately left off because its fence could not be established. That must
-# not look like a clean boot - the Owner would otherwise discover it only when his
-# son says "I can't see Dad".
-if [ "${__gm3_failed:-0}" -ne 0 ]; then
-    log "FATAL: bring-up finished, but the GAME RELAY IS DISABLED - its host fence"
-    log "  could not be established (see the step 4-pre lines above). The rest of the"
-    log "  stack is running normally. Exiting non-zero so this unit reports FAILED."
-    exit 1
-fi
+#
+# THE RELAY NO LONGER REPORTS HERE, and that is the design refresh rather than a
+# regression (CROSSPLAY_HANDOFF.md §7). It used to: a `__gm3_failed` flag set in
+# step 4-pre made THIS unit exit non-zero because the crossplay relay had been
+# switched off. The relay now owns its own verdict —
+# `systemctl is-failed homehub-gunmaster3-relay` — which is strictly better on
+# every axis: it is visible without reading firstboot's log, it survives every
+# subsequent boot instead of being a one-time exit code, it distinguishes "off
+# by the knob" (condition not met, a clean skip) from "tried and could not be
+# fenced" (failed), and it stops one optional service's problem from colouring
+# the whole first boot red. Step 4a-relay logs its state so the journal still
+# names it in one line.
 if [ "$KIOSK_CONFIG_UNREADABLE" -ne 0 ]; then
     log "FATAL: bring-up finished, but the wall panel WILL run on js/config.js defaults"
     log "  (see the step 4b ERROR above). Exiting non-zero so this unit reports FAILED"

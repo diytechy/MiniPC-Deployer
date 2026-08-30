@@ -772,6 +772,29 @@ autoinstall:
     - cp /target/opt/homehub/stack/autoinstall/firstboot.sh /target/usr/local/sbin/homehub-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/homehub-firstboot.sh
     - curtin in-target --target=/target -- systemctl enable homehub-firstboot.service
+    # ---- 5a. THE CROSSPLAY RELAY'S TWO UNITS, FROM THE VERY FIRST BOOT ------
+    # ADDED 2026-08-29 with the relay lifecycle refresh (HomeHub's
+    # CROSSPLAY_HANDOFF.md §7). THIS IS THE AUTHORITATIVE INSTALL; firstboot.sh
+    # step 4-pre re-applies exactly the same four lines, idempotently, to cover a
+    # stack payload updated in place on an already-flashed box.
+    #
+    # WHY IT HAS TO BE HERE AND NOT ONLY IN FIRSTBOOT: homehub-game-isolation is
+    # ordered `Before=docker.service` with `DefaultDependencies=no`, so its whole
+    # value is being up before dockerd can start anything. Enabling it from
+    # firstboot means it is enabled DURING the first boot, i.e. after docker has
+    # already started once. Enabling it here means the host REJECT for the relay
+    # subnet exists on boot 1, before any container has ever run — which is the
+    # ordering the fence unit's own banner argues for.
+    #
+    # The relay unit is safe to enable unconditionally: its ExecCondition reads
+    # GAME_RELAY_ENABLED from .env and a box with the knob off records a clean
+    # `condition not met` skip, not a failure. Nothing here starts the relay.
+    - install -m 0644 /target/opt/homehub/stack/game-isolation/homehub-game-isolation.service /target/etc/systemd/system/homehub-game-isolation.service
+    - install -m 0644 /target/opt/homehub/stack/game-isolation/homehub-gunmaster3-relay.service /target/etc/systemd/system/homehub-gunmaster3-relay.service
+    - curtin in-target --target=/target -- chmod 0755 /opt/homehub/stack/game-isolation/game-isolation.sh
+    - curtin in-target --target=/target -- chmod 0755 /opt/homehub/stack/game-isolation/gunmaster3-relay.sh
+    - curtin in-target --target=/target -- systemctl enable homehub-game-isolation.service
+    - curtin in-target --target=/target -- systemctl enable homehub-gunmaster3-relay.service
     # Low-power tune unit (per-boot powertop auto-tune + USB-storage guard).
     - install -m 0644 /target/opt/homehub/stack/autoinstall/powertune.service /target/etc/systemd/system/powertune.service
     - cp /target/opt/homehub/stack/autoinstall/powertune.sh /target/usr/local/sbin/powertune.sh

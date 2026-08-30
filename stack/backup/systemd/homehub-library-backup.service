@@ -13,20 +13,32 @@
 [Unit]
 Description=HomeHub library backup (FileBackup container, one-shot)
 Documentation=file:///opt/homehub/stack/backup/README.md
-Wants=network-online.target
-# homehub-backup.service IS IN THIS LIST ON PURPOSE — the Owner, 2026-08-30.
-# Both timers fire at 03:00 with no jitter, so both start jobs land in one
-# systemd transaction and this ordering is honoured: the nightly runs first, this
-# one follows the moment it finishes. Back-to-back is the POINT, not a
-# side-effect — BACKUP_DRIVE_STANDBY parks the 8 TB after 30 idle minutes, and
-# the old six-hour gap guaranteed a spin-down and a spin-up between the two runs
-# every night. Adjacent runs cost a few seconds of the nightly's ~98 files and
-# save the platter a stop/start cycle.
+Wants=network-online.target homehub-backup.service
+# homehub-backup.service IS PULLED IN AND ORDERED AHEAD - the Owner, 2026-08-30.
+# Back-to-back is the POINT, not a side-effect: BACKUP_DRIVE_STANDBY parks the
+# 8 TB after 30 idle minutes, so the old six-hour gap guaranteed a spin-down and
+# a spin-up between the two runs every night. Adjacent runs cost a few seconds of
+# the nightly's ~98 files and save the platter a stop/start cycle.
 #
-# ORDERING ONLY — deliberately NOT Requires= or BindsTo=. If the nightly fails
-# (an absent drive is its designed refusal), this unit must still run and still
-# report, rather than being silently cancelled with it. A skipped backup nobody
-# was told about is the failure mode this whole lane exists to prevent.
+# WANTS= IS LOAD-BEARING, AND IT WAS MISSING - added after an adversarial review
+# on 2026-08-30. `After=` alone orders nothing unless the other unit's start job
+# is ALSO in flight; it does not cause that unit to start. Measured on the box:
+# ordering DOES hold across separate transactions - start A, then start B two
+# seconds later, and B waits for A to finish - so the daily path was already
+# fine. The hole was the case where this unit's job is created while the nightly
+# has NO job at all, which `Persistent=true` on both timers makes reachable after
+# downtime: whichever catch-up is handled first wins, and if it is this one then
+# `After=` is vacuous and the two runs overlap on one USB spindle.
+#
+# `Wants=` closes that by putting the nightly into every transaction that starts
+# this unit, so `After=` always has something to order against. systemd merges
+# jobs for the same unit, so when both timers catch up together this coalesces
+# with the nightly's own job rather than queueing a second run of it.
+#
+# WANTS=, NOT Requires= OR BindsTo=, and that distinction is the design. If the
+# nightly fails - an absent drive is its designed refusal - this unit must still
+# run and still report, rather than being silently cancelled with it. A skipped
+# backup nobody was told about is the failure mode this lane exists to prevent.
 After=network-online.target docker.service homehub-backup.service
 # NOT RequiresMountsFor= on the data drives, and that is the same deliberate
 # call homehub-backup.service makes: systemd would refuse to START the unit, so

@@ -62,14 +62,22 @@ Requires=homehub-game-isolation.service
 Wants=docker.service network-online.target
 After=homehub-game-isolation.service docker.service network-online.target homehub-firstboot.service
 
-# A MISSING OR NON-EXECUTABLE SCRIPT MUST BE A FAILURE, NOT A SKIP. Without
-# this, systemd cannot run ExecCondition= and reports exit 203 (EXEC) — which
-# lands inside the 1..254 range that ExecCondition defines as "condition not
-# met", so a payload missing this script would be recorded as a CLEAN SKIP,
-# indistinguishable from GAME_RELAY_ENABLED=false. The relay would silently not
-# exist and nothing would be red anywhere. Assert= (not Condition=) is the right
-# half of that pair: a failed Assert= FAILS the unit and says so.
-AssertPathIsExecutable=/opt/homehub/stack/game-isolation/gunmaster3-relay.sh
+# A MISSING SCRIPT MUST BE A FAILURE, NOT A SKIP. Without this, systemd cannot
+# run ExecCondition= and reports exit 203 (EXEC) — which lands inside the
+# 1..254 range that ExecCondition defines as "condition not met", so a payload
+# missing this script would be recorded as a CLEAN SKIP, indistinguishable from
+# GAME_RELAY_ENABLED=false. The relay would silently not exist and nothing would
+# be red anywhere. Assert= (not Condition=) is the right half of that pair: a
+# failed Assert= FAILS the unit and says so.
+#
+# AssertPathExists, NOT AssertPathIsExecutable. The first cut used the latter
+# and the first flashed box (lab, 2026-08-30) answered `systemd-analyze verify`
+# with "Unknown key name 'AssertPathIsExecutable' in section 'Unit', ignoring"
+# — systemd 255 has no such key, so the guard was silently absent. The
+# executable bit is handled where it can be: user-data's late-commands and
+# firstboot both chmod 0755 this script, and TC-H-R07 runs systemd-analyze
+# verify on every homehub-* unit so an unknown key cannot pass again.
+AssertPathExists=/opt/homehub/stack/game-isolation/gunmaster3-relay.sh
 
 [Service]
 Type=oneshot

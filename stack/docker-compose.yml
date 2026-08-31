@@ -988,6 +988,12 @@ services:
       PORT: "8367"
       MAX_PLAYERS: ${GAME_MAX_PLAYERS}
       NAME: ${GAME_RELAY_NAME}
+      # A29 (2026-08-30): the relay's OWN door, on top of Caddy's secret path.
+      # Ships blank and blank is safe - the relay reads empty as "no key" and
+      # stays open, i.e. exactly today's behaviour. Declared here so the hub
+      # KNOWS the knob: the relay grew it upstream and nothing on this side
+      # would otherwise have noticed (open-items A28).
+      GAME_CONNECT_KEY: ${GAME_CONNECT_KEY}
     networks:
       - game
     # expose, NOT ports: nothing publishes this to the host. Caddy reaches it

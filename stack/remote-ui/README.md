@@ -144,7 +144,7 @@ GUI is the only other way to answer any of it, and that needs a desktop session.
 |---|---|
 | `icedrive_folder_pick` | the local folder of the sync pair (`/srv/library/permtest` on this box) |
 | `icedrive_sync_paused<pairId>` | `true`/`false` — the pause toggle, per pair |
-| `icedrive_isync_time-<pairId>` | epoch stamp; **only moves when a sync actually runs** |
+| `icedrive_isync_time-<pairId>` | epoch stamp. **NOT a transfer signal** — a confirmed upload left it unchanged; see below |
 | `icedrive_local_deletion_policy` | GUI "Deletion policy (Local)" |
 | `icedrive_remote_deletion_policy` | GUI "Deletion policy (Remote)" |
 | `icedrive_fuse_installed` | whether the client believes FUSE support is present |
@@ -164,10 +164,9 @@ establishes only what "Delete/Delete" looks like, not the rest of either enum.
 Both keys are **absent** until the policy is set in the GUI at least once, so
 their absence is "never configured", not "set to the default".
 
-**SYNC AND MOUNT ARE INDEPENDENT FEATURES.** Un-pausing a pair does **not**
-establish the FUSE mount: measured 2026-09-01, `sync_paused` went `true` ->
-`false` and no cloud mount appeared, with `icedrive_fuse_installed=true`
-throughout. The only IceDrive entry in `mount` at that point was
+**SYNC AND MOUNT ARE INDEPENDENT FEATURES** — see the mount section below.
+Un-pausing a pair does **not** establish the FUSE mount, and mounting does not
+advance a pair. The only IceDrive entry in `mount` before you press Mount is
 `/tmp/.mount_Icedri*`, which is the **AppImage unpacking itself** and is not a
 cloud mount. If you are checking whether the drive is mounted, exclude that path
 or you will get a false positive.
@@ -182,9 +181,101 @@ hazard `icedrive-gate.sh` covers for an unmounted disk, arriving by a different
 route — see that section below, and note the gate does **not** check that
 `folder_pick` itself still exists.
 
-**How to tell a sync actually ran**, rather than trusting the GUI: watch
-`icedrive_isync_time-<pairId>`. Pausing, resuming, and editing policy all leave
-it untouched; only a real sync moves it.
+**How to tell a sync actually ran: READ `logdata.txt`, NOT the config.**
+`~/.local/share/Icedrive/logdata.txt` names the file, the remote path, the
+upload endpoint and the server's reply:
+
+    sync: pending upload: "/2DEL_BACKUP_Repo/TestT/TestFile.txt" dest 79889533
+    got server response: {"error":false,"message":"Upload Successful","id":682902912}
+    File upload complete (sync): /srv/library/permtest/TestFile.txt
+
+**`icedrive_isync_time-<pairId>` is NOT that signal** — corrected 2026-09-01
+after an earlier draft of this section said it was. A confirmed successful
+upload left it unchanged at `1787977693`. It tracks something else (a full-scan
+stamp, most likely); do not use it as evidence of transfer.
+
+The log also shows the client ignores editor/temp droppings on its own —
+`won't upload a temporary file` / `won't delete a temporary file in cloud` for
+a `.swp` and a dotfile — so probing a sync folder with a dotfile is safe.
+
+## THE BIG ONE: there is no catch-up sync
+
+**Icedrive syncs live events only. It does not reconcile on start.** From the
+vendor's own moderator on the community forum: *"Live Sync handles everything in
+real-time, syncing changes as they happen"*, but **"if the app is closed and you
+make changes to synced folders, those updates won't sync once it's reopened."*
+Users in the same thread put it plainly: it *"misses what's happened when its
+back is turned and doesn't play catch-up like Dropbox."*
+<https://community.icedrive.net/t/how-does-sync-works/3001>
+
+**THIS IS WHY `homehub-desktop-session.service` EXISTS** (SR-015). The session
+is kept logged in so the GUI client keeps running with nobody connected — not
+as a convenience, but because **anything that happens while the client is down
+is lost to the sync forever.** A client that is merely "started again later" has
+not caught up and never will.
+
+**The operational consequence, measured 2026-09-01 (HomeHub C59/C60):** the
+desktop session was orphaned by an `xrdp-sesman` restart, so IceDrive was not
+running from 2026-08-30 to 2026-09-01. Every change to a paired path in that
+window is permanently outside the sync. **Treat any IceDrive downtime as a
+sync gap that will not close by itself.**
+
+### What this looks like when it bites
+
+A pair whose local folder was emptied or recreated while the client was down
+comes back with `"ini_done":1` (the server still considers it initialised) and
+simply **watches for new events**. It will happily upload anything you create,
+and will **never** pull the pre-existing remote content down. Observed
+2026-09-01: local scan clean, `waiting for events`, a new local file uploaded
+within 6 seconds, and five remote items still untouched hours later.
+
+### Resolution paths, in increasing cost
+
+1. **Copy it down through the MOUNT.** The mount exposes the whole account,
+   including `Encrypted/`, independently of any pair — so the content is
+   reachable immediately without touching sync state. Safest, and it does not
+   risk a delete-policy reconcile.
+2. **Delete and re-create the pair**, which forces a fresh initial sync
+   (`ini_done` resets) and populates the local side.
+3. **Use a one-way "to local" pair** if the intent is only to receive.
+
+**Do NOT expect option (2) or a resume to be non-destructive when the local
+folder is empty and the deletion policies are set to Delete** — an empty local
+side is exactly what "delete everything remotely" looks like to a two-way
+engine. Community reports of files vanishing cluster around this shape; the
+vendor default for both policies is *"Do not delete"* for that reason.
+
+## Mount: where it actually lands, and the knob that does nothing
+
+**The client mounts at `~/Icedrive` and nothing in this repo can change that.**
+Measured 2026-09-01:
+
+    mount point: /home/hub/Icedrive
+    fuse_mount done / FUSE server up and running
+    Icedrive on /home/hub/Icedrive type fuse (rw,nosuid,nodev,relatime,user_id=1000,group_id=1000)
+
+**`ICEDRIVE_MOUNTPOINT` in HomeHub's `.env` is INERT in `appimage` mode.** It
+says `/srv/icedrive`; that path has never existed on the box, and the client
+never consulted it. No configurable mount path is documented for the Linux
+AppImage — searched 2026-09-01 across the vendor help centre and community, and
+the guidance for choosing a mount location on Linux is consistently *"use rclone
+or another tool"*. Treat the knob as applying to the **CLI** (`ICEDRIVE_MODE=
+'cli'`) only, and do not write anything that depends on it while the AppImage is
+in use.
+<https://icedrive.net/help/pc> ·
+<https://community.icedrive.net/t/technical-guide-to-mounting-icedrive-as-a-virtual-drive-on-macos-and-linux/211>
+
+**⚠ `~/Icedrive` IS ON THE ROOT LV.** `/home` is not separate on this box, so
+the mount sits on the 57 GB system disk rather than a data disk. FUSE fetches on
+demand, so nothing bulk-downloads — but **anything that recursively reads that
+tree pulls content through it**: a backup, an indexer, a `du`, a file manager
+generating thumbnails. Root filling is not hypothetical here; it took the hub
+down on 2026-08-31 (HomeHub C56). Keep whole-tree readers away from `~/Icedrive`.
+
+**MOUNT AND SYNC ARE INDEPENDENT — mounting changes nothing about a pair.**
+Mounting added exactly one config key (`icedrive_first_run=false`), left
+`folder_pick`, both deletion policies and the pause flag untouched, and did not
+cause the pair's outstanding remote files to download.
 
 ## Disable / remove (on a box that had it installed)
 

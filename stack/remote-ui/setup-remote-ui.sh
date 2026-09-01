@@ -170,6 +170,35 @@ else
 fi
 systemctl is-active --quiet xrdp || die "xrdp failed to start (journalctl -u xrdp)"
 
+# ── STOP needrestart RESTARTING xrdp BEHIND OUR BACKS (2026-09-01, C59) ──────
+# The conditional restart above guards THIS script's restart. It does nothing
+# about anyone else's, and the most frequent "anyone else" is automatic:
+# needrestart, invoked by the DAILY apt-daily-upgrade.timer, restarts any
+# daemon linked against an upgraded library. On 2026-09-01 that was libbz2-1.0
+# — xrdp itself was NOT upgraded (zero xrdp entries in apt history) — and it
+# orphaned a desktop session created the night before. Every RDP connection
+# after that died in one second, blaming the window manager.
+#
+# Without this file a reimaged box is one library patch away from the same
+# wedge, with nobody having touched it. The file carries the full reasoning and
+# the stated trade-off (xrdp keeps the old library mapped until reboot;
+# acceptable because 3389 is LAN-only, SN-005).
+if [ -d /etc/needrestart ]; then
+    install -d -m0755 -o root -g root /etc/needrestart/conf.d
+    install -m0644 -o root -g root "$(dirname "$0")/90-homehub-xrdp.conf"         /etc/needrestart/conf.d/90-homehub-xrdp.conf
+    # PROVE it parses. A malformed file here is read by needrestart on every
+    # apt run, and a Perl syntax error there is someone else's confusing
+    # failure at 06:54 rather than ours now.
+    if command -v perl >/dev/null 2>&1        && ! perl -c /etc/needrestart/conf.d/90-homehub-xrdp.conf >/dev/null 2>&1; then
+        die "90-homehub-xrdp.conf failed perl -c after install"
+    fi
+    log "needrestart: xrdp/xrdp-sesman excluded from automatic restart (C59)"
+else
+    log "needrestart not installed - skipping the xrdp restart exclusion"
+    log "  (if it is installed later, re-run this script or copy"
+    log "   stack/remote-ui/90-homehub-xrdp.conf into /etc/needrestart/conf.d/)"
+fi
+
 # PROVE the group actually took, rather than trusting the restart. This is a
 # one-line check for a failure whose only other symptom is a login that refuses
 # a correct password.

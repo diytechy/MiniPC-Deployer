@@ -245,6 +245,58 @@ side is exactly what "delete everything remotely" looks like to a two-way
 engine. Community reports of files vanishing cluster around this shape; the
 vendor default for both policies is *"Do not delete"* for that reason.
 
+### ⚠ THERE IS NO CLOUD-TO-LOCAL RESTORE IN THE v3 APP
+
+**Confirmed by Icedrive staff**, and this is the single most important fact in
+this file for anyone planning a reimage. Asked directly for a cloud-to-local
+restore, staff member Chris replied:
+
+> *"With the new app our sync was built a new completely from the ground up and
+> this feature will be returning in the near future."*
+
+It existed in the **old** app. It does **not** exist in the current one, and
+users in that thread report waiting months with no date.
+<https://community.icedrive.net/t/cloud-to-local-restore/3957>
+
+**So the offsite leg cannot restore itself.** A freshly flashed box with an
+empty library cannot ask the client to pull the cloud copy back down — there is
+no such button. The only routes are:
+
+1. **MOUNT the account and copy out of `~/Icedrive` by hand.** Today this is the
+   *only* reliable cloud → local path, and it is why the mount is worth having
+   configured even when sync is the feature you actually use.
+2. Wait for the vendor to restore the feature.
+
+**This is a live constraint on reimage recovery, not a theoretical one.** Pair
+that with the no-catch-up behaviour above and the honest summary is: **IceDrive
+here is a one-way offsite copy with a manual, GUI-driven recovery.** Anything in
+this repo that treats it as a restorable backup should say so out loud — see the
+warning in [../backup/README.md](../backup/README.md) that a green backup says
+nothing about the cloud copy.
+
+### If you must re-create a pair, the community's recommended order
+
+From users who have done it on a fresh installation, and it is the cautious
+order for exactly the delete-propagation reason above:
+
+1. **Set both deletion policies to "Do not delete" FIRST** — *"ensure the syncs
+   do not delete both local and remote to avoid dataloss at first instance."*
+2. Create the pair and let it run.
+3. **Let local and remote reach agreement before touching anything.**
+4. Only then set the deletion policies back to what you actually want.
+
+<https://community.icedrive.net/t/transfer-syncs-to-new-installation/10993>
+
+Whether a fresh pair pointed at an empty local folder populates it from the
+cloud is **not answered** by any thread found — and given the staff statement
+above, do not assume it does. Verify on throwaway data before trusting it with
+anything real. The same thread leaves the **encrypted-storage** case explicitly
+unresolved, which is the case this box uses (`crypto: 1`).
+
+*(Note for future searches: the Icedrive community forum is now READ-ONLY and
+has migrated to the IcePrivacy Community platform, so these threads will not
+gain new replies.)*
+
 ## Mount: where it actually lands, and the knob that does nothing
 
 **The client mounts at `~/Icedrive` and nothing in this repo can change that.**

@@ -279,6 +279,7 @@ fi
 # the reboot that usually follows anyway.
 if [ -f "$(dirname "$0")/homehub-desktop-session.service" ]; then
     install -m0755 -o root -g root "$(dirname "$0")/homehub-desktop-session.sh"         /opt/homehub/stack/remote-ui/homehub-desktop-session.sh 2>/dev/null || true
+    install -m0755 -o root -g root "$(dirname "$0")/reap-orphan-sesman.sh" /opt/homehub/stack/remote-ui/reap-orphan-sesman.sh 2>/dev/null || true
     install -m0644 -o root -g root "$(dirname "$0")/homehub-desktop-session.service"         /etc/systemd/system/homehub-desktop-session.service
     systemctl daemon-reload
     systemctl enable homehub-desktop-session.service >/dev/null 2>&1

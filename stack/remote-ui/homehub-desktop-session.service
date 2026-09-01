@@ -36,6 +36,11 @@ Type=oneshot
 # client, and the script kills those itself. So the default KillMode is correct
 # and there is nothing here for systemd to reap that we wanted kept.
 RemainAfterExit=yes
+# Clear any orphaned xrdp-sesman FIRST (C59). A wedged RDP layer otherwise
+# stays wedged until a human finds it, and this service is the one thing that
+# runs at boot and on every deliberate restart. `-` so a failure here can never
+# be the reason the desktop does not come up.
+ExecStartPre=-/opt/homehub/stack/remote-ui/reap-orphan-sesman.sh
 ExecStart=/opt/homehub/stack/remote-ui/homehub-desktop-session.sh
 # Reads OPERATOR_PASSWORD out of the 0600 root-owned .env, and pipes it to the
 # client on stdin so it never reaches argv.

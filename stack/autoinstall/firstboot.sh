@@ -211,6 +211,61 @@ else
     log "1c: no TIMEZONE in .env — leaving the box on $(timedatectl show -p Timezone --value 2>/dev/null)"
 fi
 
+# ── 1d. WHEN UNATTENDED UPGRADES MAY RESTART THINGS (C59 / C61) ─────────────
+# Ubuntu ships apt-daily-upgrade.timer as `*-*-* 6:00` with
+# RandomizedDelaySec=60m. It runs unattended-upgrades, and `needrestart` then
+# restarts every daemon linked against an upgraded library. That is NOT
+# hypothetical here, twice over:
+#
+#   C59 (measured 2026-09-01): libbz2-1.0 was the ONLY package upgraded, xrdp
+#   was never upgraded at all, and needrestart restarted it anyway because it
+#   links against the library. That destroyed sesman's session table, orphaned
+#   a live desktop, and every RDP login afterwards died in one second blaming
+#   the window manager. Permanent until a human killed the orphan.
+#
+#   C61 (still open): dockerd is not on needrestart's exclusion list either. A
+#   restart bounces every container AND kills any `docker compose run` in
+#   flight - which is exactly how homehub-library-backup.service runs the
+#   FileBackup container. A killed container leaves a stale Temp that then
+#   refuses every LATER backup too. One unattended patch, two outages, the
+#   second one silent for days.
+#
+# THE FIX IS SCHEDULING, NOT DISABLING. Patching is worth more than the
+# restarts cost, so upgrades still happen - once a week, at a known time, in
+# the quiet half hour before the 03:00 backup rather than at a random moment
+# inside the working day. A restart that lands 30 minutes BEFORE the backup is
+# harmless; the same restart at 06:54 is what cost 2026-09-01.
+#
+# RandomizedDelaySec MUST be zeroed. The shipped 60m would smear a nominal
+# 02:30 across 02:30-03:30 - i.e. straight into the backup this window exists
+# to precede. The empty OnCalendar= clears the shipped 6:00 first; without it
+# BOTH schedules stay active and the daily one still fires.
+#
+# apt-daily.timer is deliberately untouched: it only refreshes package lists,
+# installs nothing, and therefore restarts nothing.
+#
+# Persistent=true is kept on purpose: a run missed because the box was off
+# happens at the next boot. Late patching beats skipped patching, and a
+# boot-time restart is harmless because no session or backup exists yet.
+#
+# This does NOT close C61. It narrows the window; it does not stop a restart
+# landing on a backup that is STILL RUNNING from a previous week, and it does
+# not help if apt overruns 03:00. Excluding dockerd from needrestart is the
+# belt to this braces, and is the Owner's call.
+mkdir -p /etc/systemd/system/apt-daily-upgrade.timer.d
+cat > /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf <<'EOF'
+# Installed by firstboot 1d. See HomeHub open-items.md C59 / C61.
+# Weekly, exact, 30 minutes before the 03:00 backup - NOT daily at a random time.
+[Timer]
+OnCalendar=
+OnCalendar=Sun *-*-* 02:30:00
+RandomizedDelaySec=0
+Persistent=true
+EOF
+systemctl daemon-reload
+systemctl restart apt-daily-upgrade.timer 2>/dev/null || true
+log "1d: unattended upgrades -> Sun 02:30 exactly (was daily 06:00 +/-60m); needrestart can only bounce services in that window"
+
 # ── 2. oauth2-proxy allow-list (Q10.5) ───────────────────────────────────────
 # Materialize authenticated-emails.txt (one account per line) from the
 # comma/space-separated OAUTH2_PROXY_ALLOWED_EMAILS in .env. Gitignored output.

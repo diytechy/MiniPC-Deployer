@@ -133,6 +133,59 @@ the cloud copy.** The only route that could ever close that gap is the CLI's
 FUSE mount plus `OFFSITE_PATH` — and it has its own blocker (root cannot read a
 `hub`-owned FUSE mount). See [../icedrive/README.md](../icedrive/README.md).
 
+## The client's on-disk state — `~/.config/Icedrive/Icedrive.conf`
+
+**Observed on the real hub 2026-09-01, by diffing the file across GUI actions.**
+The client has no documented config format; everything here was established by
+changing one thing in the GUI and seeing which key moved. Recorded because the
+GUI is the only other way to answer any of it, and that needs a desktop session.
+
+| key | meaning |
+|---|---|
+| `icedrive_folder_pick` | the local folder of the sync pair (`/srv/library/permtest` on this box) |
+| `icedrive_sync_paused<pairId>` | `true`/`false` — the pause toggle, per pair |
+| `icedrive_isync_time-<pairId>` | epoch stamp; **only moves when a sync actually runs** |
+| `icedrive_local_deletion_policy` | GUI "Deletion policy (Local)" |
+| `icedrive_remote_deletion_policy` | GUI "Deletion policy (Remote)" |
+| `icedrive_fuse_installed` | whether the client believes FUSE support is present |
+| `icedrive_exe_location` | path inside the AppImage's self-mount — changes every launch |
+| `icedrive_login`, `icedrive_sessId`, `icedrive_stored_cred`, `icedrivet` | account/session material. **Do not paste these anywhere**; `icedrivet` in particular is a long token that is easy to miss when redacting. |
+
+**THE DELETION-POLICY ENUM IS NOT SHARED BETWEEN THE TWO SIDES.** With **both**
+dropdowns set to **"Delete"**, the file reads:
+
+    icedrive_local_deletion_policy=2
+    icedrive_remote_deletion_policy=1
+
+Same label, different number. **Do not assume a value means the same thing on
+the other key**, and do not set these by hand from one observation — 2026-09-01
+establishes only what "Delete/Delete" looks like, not the rest of either enum.
+
+Both keys are **absent** until the policy is set in the GUI at least once, so
+their absence is "never configured", not "set to the default".
+
+**SYNC AND MOUNT ARE INDEPENDENT FEATURES.** Un-pausing a pair does **not**
+establish the FUSE mount: measured 2026-09-01, `sync_paused` went `true` ->
+`false` and no cloud mount appeared, with `icedrive_fuse_installed=true`
+throughout. The only IceDrive entry in `mount` at that point was
+`/tmp/.mount_Icedri*`, which is the **AppImage unpacking itself** and is not a
+cloud mount. If you are checking whether the drive is mounted, exclude that path
+or you will get a false positive.
+
+**A MISSING SYNC FOLDER FAILS LOUDLY, WHICH IS THE GOOD CASE.** With
+`folder_pick` pointing at a path that did not exist, resume produced a GUI
+error — *"Sync folder doesn't exist: /srv/library/permtest"* — and changed
+nothing. Worth knowing because the folder is an ordinary directory on the
+library disk: **anything that tidies up the library can delete the sync pair's
+target**, and the pair is server-side state that survives it. That is the same
+hazard `icedrive-gate.sh` covers for an unmounted disk, arriving by a different
+route — see that section below, and note the gate does **not** check that
+`folder_pick` itself still exists.
+
+**How to tell a sync actually ran**, rather than trusting the GUI: watch
+`icedrive_isync_time-<pairId>`. Pausing, resuming, and editing policy all leave
+it untouched; only a real sync moves it.
+
 ## Disable / remove (on a box that had it installed)
 
 ```sh

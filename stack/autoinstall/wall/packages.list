@@ -50,6 +50,13 @@ network-manager        # quirk 5: powersave off, and the netplan renderer
 # check reads, so naming it means a panel that did not get it REFUSES TO REBOOT
 # instead of reaching the wall and failing quietly.
 wpasupplicant          # NetworkManager's and networkd's 802.11 backend; without it there is no Wi-Fi at all
+# THE REGULATORY DATABASE, dropped by the same --no-install-recommends. Without
+# it the kernel keeps the conservative world regulatory domain, which forbids
+# 2.4 GHz channels 12-13 and most of the 5 GHz band outright. The panel would
+# then not merely connect badly to an AP on one of those channels - it would not
+# SEE it, and the symptom is "the SSID is not in range" on a radio that is
+# working perfectly. Not the current fault; named so it can never become one.
+wireless-regdb         # kernel regulatory data; without it whole channels are invisible
 # THE PANEL HAD NO RESOLVER AT ALL UNTIL 2026-08-08, and nothing said so.
 # `systemctl is-active systemd-resolved` answered `not-found`: the package was
 # never installed, so /etc/resolv.conf sat as a DANGLING symlink to
@@ -125,6 +132,16 @@ python3                # wall-media-manifest.py (JSON escaping, not bash).
                        # dependency is explicit rather than inherited by luck.
 alsa-utils             # audio sink pinning (WSN-012 lives in the app's runbook)
 pulseaudio-utils
+# ALSA'S CONFIG DATA, NAMED FOR THE SAME REASON AS THE SUPPLICANT ABOVE.
+# libasound2t64 only RECOMMENDS these two, and the repo is baked with
+# --no-install-recommends, so a panel that asks for audio would arrive with the
+# library and none of the per-card configuration it reads. Found 2026-09-03 by
+# resolving this list with and without recommends against the server squashfs's
+# own dpkg status: 88 Recommends are dropped, and these were the audio ones.
+# Cheap, and the failure they prevent (a codec that never produces sound, with
+# nothing in any log to say why) is expensive to chase on a wall-mounted box.
+alsa-ucm-conf          # per-card use-case configs; without them many codecs never route output
+alsa-topology-conf     # DSP topology data, same relationship, same reason
 va-driver-all          # VA-API decode; quirk 6 says PROVE it is engaged
 vainfo
 

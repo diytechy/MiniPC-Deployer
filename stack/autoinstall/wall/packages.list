@@ -31,6 +31,25 @@ xdg-utils
 fonts-dejavu-core
 util-linux             # rtcwake — the PRIMARY wake source (D-W4)
 network-manager        # quirk 5: powersave off, and the netplan renderer
+# AND THE SUPPLICANT, NAMED EXPLICITLY, because network-manager only RECOMMENDS
+# it and vmtest/export-apt.sh bakes the repo with --no-install-recommends. So
+# the panel installed NetworkManager with no 802.11 backend and said nothing at
+# install time; it failed 45 minutes later, on the wall, as:
+#
+#   NetworkManager[840]: <error> device (wlp1s0): Couldn't initialize supplicant
+#     interface: Failed to D-Bus activate wpa_supplicant service
+#
+# repeating every 13 seconds, taking systemd-networkd-wait-online with it, then
+# wall-firstboot (After=network-online.target), then the kiosk session — a black
+# screen whose stated cause is four services away from the missing package.
+# Measured 2026-09-03 on the real panel: /usr/sbin/wpa_supplicant absent, the
+# radio fine, ath10k bound, firmware loaded, both rfkill switches enabled.
+#
+# THE SAME SHAPE AS THE RESOLVER BELOW, and the reason both are named here
+# rather than left to Recommends: this list is what the install-completeness
+# check reads, so naming it means a panel that did not get it REFUSES TO REBOOT
+# instead of reaching the wall and failing quietly.
+wpasupplicant          # NetworkManager's and networkd's 802.11 backend; without it there is no Wi-Fi at all
 # THE PANEL HAD NO RESOLVER AT ALL UNTIL 2026-08-08, and nothing said so.
 # `systemctl is-active systemd-resolved` answered `not-found`: the package was
 # never installed, so /etc/resolv.conf sat as a DANGLING symlink to

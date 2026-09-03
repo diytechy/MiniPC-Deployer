@@ -103,14 +103,34 @@ sed -e 's/^  interactive-sections:.*/  interactive-sections: []/' "$CONFIRM_UD" 
 # not carry the Wi-Fi PSK, so of the two ISOs on the disk only the shippable
 # one holds it.
 if [ "$TARGET" = wall ]; then
+    # THE REWRITE NOW INSERTS THE match:, RATHER THAN EDITING ONE (2026-09-03).
+    # The shipped seed used to carry `match: name: "wl*"` + `set-name: wlan0`,
+    # and this awk only had to swap the glob to "e*". That stanza is GONE from
+    # the shipped seed: networkd refuses `match:` on a `wifis:` device, which
+    # cost an install, so the netdef is keyed by the real interface name and
+    # carries no match at all. See stack/autoinstall/wall/user-data.
+    #
+    # A VM's NIC is not called wlp1s0, so the gate must reintroduce a match --
+    # legal here because this block is now `ethernets:`, where networkd has
+    # always supported it. `set-name` keeps the netdef id and the kernel name
+    # agreeing, so the gate seed stays as close to the shipped one as a wire
+    # can be to a radio: same id, same address, same routes, same nameservers.
     awk '
       dropping { if ($0 ~ /^          /) next; dropping = 0 }
       /^    wifis:[[:space:]]*$/            { print "    ethernets:"; next }
+      /^      wlp1s0:[[:space:]]*$/         { print "      wlp1s0:";
+                                              print "        match:";
+                                              print "          name: \"e*\"";
+                                              print "        set-name: wlp1s0"; next }
       /^        access-points:[[:space:]]*$/ { dropping = 1; next }
       /^        macaddress:/                { print "        # (gate ISO) macaddress dropped: no virtual Wi-Fi device exists to pin."; next }
-      /^          name: "wl\*"/             { print "          name: \"e*\""; next }
                                             { print }
     ' "$GATE_UD" > "$GATE_UD.net" && mv "$GATE_UD.net" "$GATE_UD"
+
+    # The netdef id has to have survived the swap, or the block below is
+    # describing a device the rest of the seed never mentions.
+    grep -q '^      wlp1s0:' "$GATE_UD" \
+        || die "the wall gate seed lost its wlp1s0 netdef - the ethernets: block would name no device. Refusing to build."
 
     grep -q '^    ethernets:' "$GATE_UD" \
         || die "the wall gate seed still has no ethernets: block - the panel would boot with no network. Refusing to build."

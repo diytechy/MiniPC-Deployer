@@ -23,17 +23,43 @@ network:
   version: 2
   renderer: NetworkManager
   wifis:
-    wlan0:
-      match:
-        name: "wl*"
-      set-name: wlan0
-      dhcp4: true
-      dhcp4-overrides:
-        # Take DNS from the AWOW box via DHCP: the kiosk hostname resolves to the
-        # AWOW's LAN IP only through its split-horizon zone. A hard-coded public
-        # resolver here would send the panel out to the WAN address instead — and
-        # the wall port is not forwarded there, so the panel would 403 itself.
-        use-dns: true
+    # KEYED BY THE REAL INTERFACE NAME, AND IT MUST MATCH ../wall/user-data's
+    # netdef id exactly (2026-09-03). This file is 60-*, the autoinstall block
+    # lands as 50-cloud-init.yaml, and nothing disables the latter — so both
+    # describe this one radio. Netplan merges BY NETDEF ID: same id and this
+    # file cleanly overrides, which is how NetworkManager takes ownership of
+    # the interface that networkd brought up at first boot. Two different ids
+    # would be two netdefs for one device, which is the "up but unreachable"
+    # this file's own header warns about.
+    #
+    # `match: name: "wl*"` + `set-name: wlan0` lived here and was legal here —
+    # NetworkManager supports match on wifi. It was copied into the autoinstall,
+    # where the renderer is networkd, which does NOT, and that cost an install.
+    # The two files now share one shape so the idiom cannot drift again. See the
+    # long note in ../wall/user-data for the whole failure.
+    # NO dhcp4 HERE — THE ADDRESS COMES FROM ../wall/user-data (2026-09-03).
+    # This file used to carry `dhcp4: true` + `dhcp4-overrides: use-dns: true`,
+    # written before the Owner moved the panel to a static address on
+    # 2026-08-06. Both survived that change, and because this file and the
+    # autoinstall block share one netdef id, netplan MERGED them. The profile
+    # NetworkManager actually got was self-contradictory:
+    #
+    #   [ipv4]
+    #   method=auto                       <- this file's dhcp4: true
+    #   address1: <the panel's static /24>  <- the autoinstall's static block
+    #   route1:  0.0.0.0/0,<gateway>
+    #
+    # method=auto is DHCP. The panel would take a lease AND apply the static
+    # address, with use-dns pulling the router's resolver alongside the hub's —
+    # and a router-supplied resolver cannot answer the kiosk hostname, because
+    # only the hub's split-horizon zone holds it. That is the 403 blank wall
+    # the static decision existed to prevent, arriving by the back door.
+    #
+    # The autoinstall block is the single source of addresses, routes and
+    # nameservers. This file's job is the RENDERER and the credentials, so that
+    # NetworkManager owns the interface (it holds the powersave setting, quirk
+    # 5) — not to describe the address a second time.
+    wlp1s0:
       access-points:
         "@@WIFI_SSID@@":
           password: "@@WIFI_PSK@@"

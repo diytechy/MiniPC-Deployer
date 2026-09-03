@@ -75,13 +75,47 @@ autoinstall:
   # panel is useless without the hub anyway, so this adds no dependency that
   # was not already there — but it does mean a panel INSTALL needs the hub
   # serving DNS, which is why the lab installs them in that order.
+  # ── THE NETDEF IS KEYED BY THE REAL INTERFACE NAME, AND MUST BE ───────────
+  # This block used to read `wlan0:` + `match: name: "wl*"` + `set-name: wlan0`,
+  # copied from ./netplan-wifi.yaml.template where it is legal. It is not legal
+  # HERE, and it cost an install on 2026-09-03:
+  #
+  #   ERROR wlan0: networkd backend does not support wifi with match:,
+  #                only by interface name
+  #
+  # Subiquity renders netplan with NETWORKD (NetworkManager is not in the Ubuntu
+  # Server live image at all — verified against every squashfs layer: no daemon,
+  # no nmcli, no unit). networkd accepts `match:` on `ethernets:` but refuses it
+  # on `wifis:`. So `netplan apply` exits 1, the Network controller raises, and
+  # the install dies with a network_fail crash BEFORE it looks at a disk.
+  #
+  # `renderer: NetworkManager` LOOKS like the fix and is not: netplan would then
+  # emit /run/NetworkManager/system-connections/netplan-*, which sets
+  # `restart_nm` in netplan's apply.py, and the NM *start* call there is NOT
+  # guarded by nm_running() the way the stop call is. It shells out to
+  # `systemctl start NetworkManager.service` through subprocess.check_call, the
+  # unit does not exist in the live image, and apply fails again — same crash,
+  # one stage later. Keying by the real name emits no /run/NetworkManager files
+  # at all, so that path is never entered.
+  #
+  # WHY A HARDWARE-SPECIFIC NAME IS NOT A NEW CONSTRAINT: `wl*` bought
+  # portability this image never had. It is already pinned to one machine by
+  # `storage: match: serial:`, so a second value read off that same machine
+  # costs nothing. wlp1s0 is the panel's Qualcomm Atheros QCA6174 (PCI 01:00.0),
+  # read from its 2026-09-02 hardware baseline.
+  #
+  # ── AND ./netplan-wifi.yaml.template MUST USE THE SAME NETDEF ID ──────────
+  # Nothing disables cloud-init's netplan, so on the running panel BOTH this
+  # block (as 50-cloud-init.yaml) and firstboot's 60-wall-wifi.yaml describe
+  # this one radio. Netplan merges them BY NETDEF ID: same id, and the
+  # higher-numbered file cleanly overrides — which is how NetworkManager takes
+  # ownership at the second boot. Different ids would be two netdefs for one
+  # device, which is that template's own "up but unreachable". Change one of
+  # these two files and you must change the other.
   network:
     version: 2
     wifis:
-      wlan0:
-        match:
-          name: "wl*"
-        set-name: wlan0
+      wlp1s0:
         addresses: [REPLACE_WITH_PANEL_CIDR]
         routes:
           - to: default
@@ -629,6 +663,65 @@ autoinstall:
         fi
         echo "wall: install completeness check passed ($(wc -l < "$L") baked package(s) installed)."
       '
+
+    # ── ACER FIRMWARE: MAKE THE SPEC'S FALLBACK BOOT PATH SELF-SUFFICIENT ─────
+    # WHY THIS EXISTS (2026-09-03, and it cost an evening). This panel's Insyde
+    # firmware DISCARDS the NVRAM boot entry the installer creates. Observed, not
+    # inferred: `efibootmgr -c` put `ubuntu` at the head of BootOrder; one reboot
+    # later BootOrder listed only the firmware's own entries and `ubuntu` was gone.
+    #
+    # UEFI requires firmware to boot \EFI\Boot\BOOTX64.EFI with no NVRAM entry at
+    # all — it is how a USB stick boots on a machine that has never seen it.
+    # shim-signed installs itself there, so the panel HAS that path. What it lacks
+    # is the second stage: shim loads grubx64.efi FROM ITS OWN DIRECTORY, and
+    # grub-install only ever writes one into \EFI\ubuntu\. So the fallback path
+    # loaded shim and dead-ended, and the firmware said "Default Boot Device
+    # Missing or Boot Failed".
+    #
+    # AND THE DEAD END WAS NOT QUIET. shim runs \EFI\Boot\fbx64.efi when it cannot
+    # find its entry; fbx64 re-creates the entry from BOOTX64.CSV and RESETS the
+    # machine so the firmware picks it up. Against firmware that discards the entry
+    # every boot, that recovery becomes a loop — create, reset, discard, create —
+    # about ten seconds per cycle, appending one new Boot#### each time. This panel
+    # reached 131 identical entries, and a boot-variable store that full is its own
+    # class of firmware misbehaviour.
+    #
+    # So: put GRUB beside shim in the fallback directory, and disable the
+    # re-creator. The panel then boots by the one mechanism this firmware actually
+    # honours, and a dropped NVRAM entry degrades to a clean failure instead of a
+    # self-amplifying loop. Ubuntu's grubx64.efi carries /EFI/ubuntu as its
+    # compiled-in prefix, so it still finds grub.cfg and /boot from either path.
+    #
+    # WALL IMAGE ONLY, STRUCTURALLY. This file is the panel's seed; the hub builds
+    # from ../user-data and cannot be reached from here. The hub is a different
+    # machine with different firmware and has never shown this — which is why the
+    # fix lives in the seed of the box that needs it rather than in the shared
+    # builder.
+    #
+    # NON-FATAL BY DESIGN. Every failure below is reported and skipped. A panel
+    # that installed correctly must not be denied its reboot because a workaround
+    # for somebody else's firmware could not be applied.
+    - |
+      esp=/target/boot/efi
+      if [ ! -d "$esp/EFI/BOOT" ] || [ ! -f "$esp/EFI/ubuntu/grubx64.efi" ]; then
+        echo "wall: EFI boot repair SKIPPED - $esp/EFI/{BOOT,ubuntu} is not laid out as expected."
+      else
+        if cp -f "$esp/EFI/ubuntu/grubx64.efi" "$esp/EFI/BOOT/grubx64.efi"; then
+          echo "wall: EFI boot repair - grubx64.efi placed beside shim in EFI/BOOT."
+        else
+          echo "wall: EFI boot repair - could NOT copy grubx64.efi into EFI/BOOT (continuing)."
+        fi
+        if [ -f "$esp/EFI/BOOT/fbx64.efi" ]; then
+          if mv -f "$esp/EFI/BOOT/fbx64.efi" "$esp/EFI/BOOT/fbx64.efi.disabled"; then
+            echo "wall: EFI boot repair - fbx64.efi disabled (it is the reset-loop trigger)."
+          else
+            echo "wall: EFI boot repair - could NOT disable fbx64.efi (continuing)."
+          fi
+        else
+          echo "wall: EFI boot repair - no fbx64.efi present, nothing to disable."
+        fi
+        sync
+      fi
 
   # ── If the install does not run, SAY WHY, on the console (2026-08-06) ──────
   # Identical in purpose to the AWOW variant's block, and identical in text on

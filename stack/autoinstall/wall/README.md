@@ -38,6 +38,7 @@ Cockpit, and nothing that would make the panel precious.
 | `wall-sync-frame.{service,timer}` | **the frame flow's own cadence (OI-18)** — `wall-sync.sh --only frame`, every minute, per storage-map §4d. Same script, same guards; a different address, credential, shape and failure policy |
 | `wall-media-manifest.py` | the sync's post-step: emits the shell's `music/index.json` and `frame/playlist.json` into that cache (`--only <flow>` so one flow cannot rewrite the other's manifest) |
 | `netplan-wifi.yaml.template` | rendered to `/etc/netplan/60-wall-wifi.yaml` (0600) |
+| `wall-efi-fallback-sync.sh` + `wall-efi-fallback.service` | **the Insyde firmware workaround (2026-09-03)** — this panel's firmware discards the NVRAM boot entry `grub-install` creates, so it boots the spec's removable-media path, where shim has no `grubx64.efi` beside it. Installed by a **late-command**, not by firstboot, because firstboot waits on `network-online.target` and a panel that cannot boot has no network. Re-asserted from an apt hook after every upgrade and from the unit at every boot: `grub-install` restores `fbx64.efi` (the reset-loop trigger) on each grub/shim update and never maintains the fallback GRUB, so a one-shot repair would leave an unpatchable GRUB on the boot path |
 | `WALL-BURN-IN.md` | everything only the real hardware can settle — **read it before drilling** |
 
 On the panel the payload lands at `/opt/wall-panel/`, so these files live at

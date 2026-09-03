@@ -140,9 +140,9 @@ cat /sys/class/input/event*/device/name
 - [ ] Give the panel a **DHCP reservation on its hardware MAC** and confirm the
       lease is the address in `PANEL_IP`. The `/32` allow-list is keyed to it.
 - [ ] Confirm `WIFI_SSID`/`WIFI_PSK` are live from netplan and that the MAC is
-      **not** randomized (`ip link show wlan0` matches the baseline MAC).
+      **not** randomized (`ip link show wlp1s0` matches the baseline MAC).
 - [ ] Confirm Wi-Fi **powersave is off** and the panel stays SSH-able while idle
-      for an hour: `iw dev wlan0 get power_save`.
+      for an hour: `iw dev wlp1s0 get power_save`.
 - [ ] From the panel: `curl -sI https://$WALL_HOST:$WALL_PORT/api/today` → 200,
       and the shell loads. From **any other LAN device**: 403.
 - [ ] **THE OFF-LAN TEST (the one remainder the V1 sim genuinely cannot cover).**

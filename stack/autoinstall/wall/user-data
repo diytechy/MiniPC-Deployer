@@ -701,24 +701,65 @@ autoinstall:
     # NON-FATAL BY DESIGN. Every failure below is reported and skipped. A panel
     # that installed correctly must not be denied its reboot because a workaround
     # for somebody else's firmware could not be applied.
+    # AND IT IS RE-ASSERTED, NOT PERFORMED ONCE (2026-09-03, adversarial review).
+    # grub-efi-amd64-signed's postinst re-runs grub-install on EVERY upgrade, and
+    # this box has grub2/no_efi_extra_removable false, so an upgrade refreshes
+    # \EFI\BOOT\BOOTX64.EFI with a NEW shim and restores fbx64.efi — while a
+    # grubx64.efi copied here at install time is never touched again. A one-shot
+    # repair therefore leaves the panel booting an install-day GRUB that no
+    # security update reaches, and re-arms the reset loop for the day a newer
+    # shim refuses that stale GRUB. unattended-upgrades is in ./packages.list, so
+    # this is a matter of weeks, not theory.
+    #
+    # So the install-time step below only lays down the MECHANISM:
+    #   /usr/local/sbin/wall-efi-fallback-sync   the idempotent repair itself
+    #   /etc/apt/apt.conf.d/99-wall-efi-fallback fires it after any apt run, so
+    #                                            an upgrade is undone before the
+    #                                            next boot can hit it
+    #   wall-efi-fallback.service                every boot, as the backstop for
+    #                                            a hand-run grub-install or a
+    #                                            hook that did not fire
+    # then runs it once for this install. The sync copies GRUB only when the
+    # content differs, which is what keeps the fallback path CURRENT rather than
+    # frozen.
     - |
+      set -u
       esp=/target/boot/efi
+      pay=/target/opt/wall-panel/stack/autoinstall/wall
+      ok=1
+      for f in "$pay/wall-efi-fallback-sync.sh" "$pay/wall-efi-fallback.service"; do
+        [ -f "$f" ] || { echo "wall: EFI boot repair SKIPPED - $f is not on the payload."; ok=0; }
+      done
       if [ ! -d "$esp/EFI/BOOT" ] || [ ! -f "$esp/EFI/ubuntu/grubx64.efi" ]; then
         echo "wall: EFI boot repair SKIPPED - $esp/EFI/{BOOT,ubuntu} is not laid out as expected."
-      else
-        if cp -f "$esp/EFI/ubuntu/grubx64.efi" "$esp/EFI/BOOT/grubx64.efi"; then
-          echo "wall: EFI boot repair - grubx64.efi placed beside shim in EFI/BOOT."
-        else
-          echo "wall: EFI boot repair - could NOT copy grubx64.efi into EFI/BOOT (continuing)."
-        fi
-        if [ -f "$esp/EFI/BOOT/fbx64.efi" ]; then
-          if mv -f "$esp/EFI/BOOT/fbx64.efi" "$esp/EFI/BOOT/fbx64.efi.disabled"; then
-            echo "wall: EFI boot repair - fbx64.efi disabled (it is the reset-loop trigger)."
-          else
-            echo "wall: EFI boot repair - could NOT disable fbx64.efi (continuing)."
-          fi
-        else
-          echo "wall: EFI boot repair - no fbx64.efi present, nothing to disable."
+        ok=0
+      fi
+      if [ "$ok" = 1 ]; then
+        install -D -m 0755 "$pay/wall-efi-fallback-sync.sh" /target/usr/local/sbin/wall-efi-fallback-sync \
+          && echo "wall: EFI boot repair - installed /usr/local/sbin/wall-efi-fallback-sync." \
+          || { echo "wall: EFI boot repair - could NOT install the sync script (continuing)."; ok=0; }
+        install -D -m 0644 "$pay/wall-efi-fallback.service" /target/etc/systemd/system/wall-efi-fallback.service \
+          && echo "wall: EFI boot repair - installed wall-efi-fallback.service." \
+          || echo "wall: EFI boot repair - could NOT install the unit (continuing)."
+        # Enabled by the wants symlink rather than `systemctl enable`: there is no
+        # booted systemd in /target to ask, and this is exactly what enable writes.
+        mkdir -p /target/etc/systemd/system/multi-user.target.wants \
+          && ln -sf /etc/systemd/system/wall-efi-fallback.service \
+                    /target/etc/systemd/system/multi-user.target.wants/wall-efi-fallback.service \
+          && echo "wall: EFI boot repair - wall-efi-fallback.service enabled for multi-user.target." \
+          || echo "wall: EFI boot repair - could NOT enable the unit (continuing)."
+        # `|| true` inside the hook on purpose: this must never be able to fail an
+        # apt run. The unit re-tries at the next boot and the failure is logged.
+        printf '%s\n' 'DPkg::Post-Invoke { "if [ -x /usr/local/sbin/wall-efi-fallback-sync ]; then /usr/local/sbin/wall-efi-fallback-sync || true; fi"; };' \
+          > /target/etc/apt/apt.conf.d/99-wall-efi-fallback \
+          && chmod 0644 /target/etc/apt/apt.conf.d/99-wall-efi-fallback \
+          && echo "wall: EFI boot repair - apt hook installed (re-asserts after every upgrade)." \
+          || echo "wall: EFI boot repair - could NOT install the apt hook (continuing)."
+        # Run it now, against the target's ESP, so this install boots repaired.
+        if [ "$ok" = 1 ]; then
+          WALL_ESP="$esp" bash "$pay/wall-efi-fallback-sync.sh" \
+            && echo "wall: EFI boot repair - applied to this install." \
+            || echo "wall: EFI boot repair - the sync reported a problem (see above); continuing."
         fi
         sync
       fi

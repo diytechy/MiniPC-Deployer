@@ -1,0 +1,23 @@
+[Unit]
+# The BOOT-TIME backstop for the removable-media boot path. The apt hook at
+# /etc/apt/apt.conf.d/99-wall-efi-fallback catches the common case — a grub or
+# shim upgrade undoing the repair — immediately, before the next boot can hit
+# it. This catches everything else: a hand-run grub-install, an upgrade whose
+# hook did not fire, a restore from an older ESP image.
+#
+# Deliberately NOT a dependency of anything. If it fails, the panel must still
+# boot and the failure must still be visible in `systemctl status`, rather than
+# a wall-mounted machine refusing to come up over a workaround for its own
+# firmware.
+Description=Keep the UEFI removable-media boot path self-sufficient (Insyde firmware workaround)
+Documentation=file:/opt/wall-panel/stack/autoinstall/wall/wall-efi-fallback-sync.sh
+After=local-fs.target
+ConditionPathIsMountPoint=/boot/efi
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wall-efi-fallback-sync
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

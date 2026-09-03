@@ -91,9 +91,12 @@ sed -e 's/^  interactive-sections:.*/  interactive-sections: []/' "$CONFIRM_UD" 
 # Pro. So the panel's `wifis:` block, which matches wl*, matches nothing in a
 # VM and the panel comes up with no network at all.
 #
-# The gate therefore rewrites the block to `ethernets:` matching e*, keeping
-# `set-name: wlan0` so every downstream reference to the interface name still
-# resolves. THE GATE PROVES NOTHING ABOUT THE Wi-Fi PATH - not the SSID, not
+# The gate therefore rewrites the block to `ethernets:` matching e*, and gives
+# it `set-name: wlp1s0` so the netdef id and the kernel name still agree - the
+# same id the shipped seed uses, since 2026-09-03 keyed by the panel's real
+# interface rather than a renamed `wlan0`.
+#
+# THE GATE PROVES NOTHING ABOUT THE Wi-Fi PATH - not the SSID, not
 # the PSK, not roaming, not the driver. That was true of the old sim gate too;
 # it is stated here because this ISO is otherwise the production artifact and
 # the temptation to read a pass as covering everything is correspondingly

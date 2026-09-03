@@ -8,11 +8,11 @@ a question about which of the two you are looking at.
 | | `homehub-backup` (bash) | `homehub-library-backup` (container) |
 |---|---|---|
 | **What it protects** | cifs **ingest** from Mini-serv, the five `volume:` sets (Actual, Technitium, Caddy, tracker, finance), the Mini-serv `path:` set | the **nine library `path:` sets** — the ~4 TB tree that had no archive at all |
-| **How** | `tar` + `zstd` per set into a dated `run_<UTC>` folder | **FileBackup** in a container: per-file dedup, a browsable **mirror**, `Snapshot_<date>` history |
-| **Storage cost** | a **full copy per run**, `BACKUP_KEEP` of them | one mirror + deltas; growth is bounded by **change rate**, not run count |
+| **How** | `tar` + `zstd` per set into `/srv/library/Configs` — one current copy, no dated folder (`BACKUP_LAYOUT=flat`, 2026-09-01; it was a dated `run_<UTC>` on the archive drive before that) | **FileBackup** in a container: per-file dedup, a browsable **mirror**, `Snapshot_<date>` history |
+| **Storage cost** | ONE full copy, replaced each run — and then versioned by the column to the right, because the folder it lands in is part of the library | one mirror + deltas; growth is bounded by **change rate**, not run count |
 | **Runs** | `homehub-backup.timer`, 03:30 | `homehub-library-backup.timer`, 21:30 (**Q-FB6**, the Owner may move it) |
 | **Feed lane** | `backup` | `library-backup` |
-| **Retention** | `BACKUP_KEEP`, pruned after a good run | **none — nothing prunes.** See below |
+| **Retention** | **none in the flat layout** — nothing is pruned and `BACKUP_KEEP` is not read. History is the library backup's snapshots of `Configs`. (`BACKUP_LAYOUT=dated` restores the old `BACKUP_KEEP` rotation) | **none — nothing prunes.** See below |
 | **Entry point** | `backup.sh` | `library-backup.sh` (host) → one `docker compose run` |
 | **Wake-on-LAN, drive power, ingest** | yes | reuses the same `common.sh` drive-power helpers; no WoL, no ingest |
 
@@ -61,10 +61,50 @@ leg added 2026-08-09 covers what only exists across runs.
 | 1c | **source pulls** — ONE `BACKUP_SOURCES` table, three source kinds (SR-013): `path:/dir` (local rsync — including the library folders just ingested, the intended pattern), `//host/share` (cifs-mount + `rsync`, the original direct form), `volume:VOL[@CONTAINER]` (rsync from the docker volume's mountpoint, optional stop→copy→restart quiesce) | `backup.sh` + `source_kind` |
 | 2 | **archive + compress** — `tar` per set, `zstd` **where applicable** (already-compressed sets stored as plain `.tar`), minus the **excluded** patterns (`BACKUP_EXCLUDE` + per-set `name.exclude=`), which are logged, listed in `<set>.excluded.log` and recorded in the MANIFEST | `backup.sh` + `compression_decision` + `rsync_pull` |
 | 3 | **hash + verify + manifest** — per-file sha256 table + archive sha256 + integrity test; a recovery MANIFEST | `backup.sh` |
-| 4 | **external-drive target** — dated `run_<UTC>` snapshot with retention (`BACKUP_KEEP`). A `--plan` run writes `plan_<UTC>` instead, on its own `BACKUP_PLAN_KEEP` budget | `backup.sh` |
+| 4 | **target** — `BACKUP_LAYOUT=flat`: the archives land in `BACKUP_TARGET` itself, one current copy, no retention (a `--plan` run gets one `plan_latest` slot). `BACKUP_LAYOUT=dated`: a `run_<UTC>` snapshot with `BACKUP_KEEP` retention, and `plan_<UTC>` on its own `BACKUP_PLAN_KEEP` budget. See [Layout](#layout--dated-vs-flat-2026-09-01) | `backup.sh` |
 | ~~5~~ | **offsite — DELETED 2026-08-09.** The service stages nothing offsite; the IceDrive client syncs library paths directly. `OFFSITE_PATH` / `OFFSITE_UNC` / `OFFSITE_SETS` are still recognised and now **refuse the run** rather than being ignored | — |
-| 0 | **target preflight** — refuse to run unless `BACKUP_TARGET` is a real mountpoint (and not `ro`); posts `ok=false` and exits 1 if not. Zero disk I/O, so it never wakes a parked drive | `backup.sh` + `common.sh` `mount_options_for` |
+| 0 | **target preflight** — refuse to run unless a real mount *carries* `BACKUP_TARGET` (and is not `ro`); posts `ok=false` and exits 1 if not. The target may be the mountpoint itself or a folder on it, so the check walks up; landing on `/` means no data drive is there. Zero disk I/O, so it never wakes a parked drive | `backup.sh` + `common.sh` `enclosing_mountpoint` |
 | 6 | **report** — POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9) | `common.sh` `feed_naglight` |
+
+## Layout — `dated` vs `flat` (2026-09-01)
+
+`BACKUP_LAYOUT` decides what `BACKUP_TARGET` holds. It is `dated` unless set,
+and the hub sets it to `flat`.
+
+| | `dated` (original) | `flat` (the hub, since 2026-09-01) |
+|---|---|---|
+| Target | `/mnt/backup-drive` — the archive drive's root | `/srv/library/Configs` — a **folder on the library drive** |
+| Per run | one `run_<UTC>/` directory | the archives sit in the target itself |
+| Plan run | `plan_<UTC>/`, `BACKUP_PLAN_KEEP` of them | one `plan_latest/` slot, replaced |
+| Retention | `BACKUP_KEEP` good runs, pruned after a green night | **none**; `BACKUP_KEEP`/`BACKUP_PLAN_KEEP` are not read, and the run logs that it is ignoring them |
+| History | the dated siblings on the drive | the **library backup's** `Snapshot_<date>` series, which already versions `/srv/library` per file |
+
+**Why the move.** The service-state sets are small and change slowly, and the
+thing that versions `/srv/library` does it far better than a full copy per
+night: per-file dedup against a mirror, rather than seven complete copies of the
+same seven archives. Dating them under the library would have been a second and
+worse history *inside* the thing that already versions them — and worse than
+merely redundant, because each night's new directory is a whole new set of paths
+for the snapshotter to store again rather than one folder it can diff.
+
+**One copy never means no copy.** A flat run does not write over what is on the
+drive. It builds in `$BACKUP_TARGET/.incoming`, and only once the run is
+verified and `RUN.json` says `ok` does `promote_flat` move those files up —
+removing, at the same moment, any archive belonging to a set that has since left
+`BACKUP_SOURCES`, so nothing can sit there looking current. A run that **fails**
+never promotes: it is moved aside to `.last-failed` (one slot, as evidence) and
+the copy already in the folder is untouched, which `flat-layout.test.sh` F7
+asserts byte-for-byte.
+
+**Two runs at once** cannot share the folder. The dated layout's guard is the
+exclusive `mkdir` of a per-second directory name; a fixed name has no such
+guard, so a flat run takes an advisory `flock` (on `/run/homehub-backup.lock`,
+tmpfs, cleared by a reboot) and refuses to start if another run holds it.
+
+**Nothing downstream had to learn about this.** `newest_run_with_set` answers
+with the target itself when the target carries the `MANIFEST.tsv`, so
+`restore.sh`, `provision/restore-volumes.sh`, firstboot's ACME and IceDrive
+restores, and the reimage drill all resolve a flat target unchanged.
 
 ## Files
 
@@ -283,7 +323,7 @@ notoriously confusing — `1..240` = value × 5 s (so `240` = 20 min) and
 `241..251` = (value − 240) × 30 min (so `241` = 30 min) — documented in
 `common.sh` and `backup.env.example`.
 
-### The target must be a mountpoint (step 0, added 2026-08-01)
+### The target must be on a real drive (step 0, added 2026-08-01)
 
 `nofail` in the generated fstab is mandatory — a missing USB disk must not hold
 up `local-fs.target` and drop a headless box to an emergency shell. Its cost is
@@ -292,6 +332,15 @@ directory on the system disk**. Before step 0 existed, a run in that state
 created its dated folder there, copied into it, verified it (the files really
 were present), pruned old runs, and posted **`ok=true`** — a green lane writing
 the household's backups to the wrong disk until that disk filled.
+
+Since 2026-09-01 the target can also be a **folder on** a drive rather than the
+drive's mountpoint, so the check asks the more general question: *which mount
+carries this path?* (`enclosing_mountpoint`, still `/proc/self/mountinfo` only,
+still no disk I/O). For `/mnt/backup-drive` the answer is the target itself, as
+before; for `/srv/library/Configs` it is `/srv/library`. Walking up to `/` is
+what now means "no data drive is here", and it is refused exactly as an
+unmounted drive always was — which matters more in the folder case, not less,
+because a missing drive leaves a *plausible-looking* path behind either way.
 
 Step 0 refuses instead, and reports `ok=false`. Deliberately NOT done as
 `RequiresMountsFor=` on the unit: systemd would refuse to *start* the service, so
@@ -342,7 +391,8 @@ set names to `OFFSITE_SETS`.
 ## Recovery MANIFEST / state format
 
 The legacy `*FilesHashTable.csv` files (FileBackup's own hash-tracking state,
-INVENTORY.md) are the prior art. Per run, under `BACKUP_TARGET/run_<UTC>/`:
+INVENTORY.md) are the prior art. Per run — under `BACKUP_TARGET` itself in the
+flat layout, under `BACKUP_TARGET/run_<UTC>/` in the dated one:
 
 - **`MANIFEST.tsv`** — one row per set:
   `set · source · archive · algo · archive_sha256 · files · bytes · reason · excludes`
@@ -533,6 +583,21 @@ the data:
 4. **The bash service is unaffected.** Its sets, its timer, its `backup` lane and
    its retention are all independent of any of the above. What you lose is the
    library coverage, which is what there was before this shipped.
+
+### The 7-Zip level — `FILEBACKUP_7Z_LEVEL=5`, not the image's 9 (2026-09-01)
+
+FileBackup kit revision 12 (2026-09-01) made the 7-Zip effort level an
+environment knob: a single digit `0`–`9`, 7-Zip's own `-mx` range. **The image
+ships no default of its own and falls back to 9 (“Ultra”)** — the level every
+run before revision 12 used, and the one that re-packs a 4 TB library at maximum
+effort for a few percent. **The Owner ruled 5 (“Normal”).** It is set in three
+places so no layer can quietly return the library to Ultra: `stack/.env`
+(`FILEBACKUP_7Z_LEVEL=5`, pinned by HomeHub's `config.homehub.psd1`), inline in
+`docker-compose.yml` (`${FILEBACKUP_7Z_LEVEL:-5}`, for a materialised `.env` that
+predates the knob), and the wrapper logs the effective value before every run.
+The level never changes *whether* a file is compressed — that is FileBackup's
+probe — and every level's archive restores with the same kit, so changing it
+later needs no migration.
 
 ### The config file
 

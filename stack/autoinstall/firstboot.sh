@@ -962,15 +962,21 @@ else
     # character class and match nothing - skipping the wait on exactly the box
     # that needed it. A mount point is a field, so compare it as one.
     # Adversarial review, 2026-08-28.
-    if awk -v t="$BACKUP_TARGET" '$0 !~ /^[[:space:]]*#/ && $2 == t { found = 1 }
-                                  END { exit !found }' /etc/fstab 2>/dev/null; then
+    # THE TARGET IS NOT ALWAYS A MOUNTPOINT ANY MORE (2026-09-01): it moved to
+    # /srv/library/Configs, a FOLDER on the library drive. So the fstab question
+    # is asked about the deepest ancestor fstab actually names - the target
+    # itself when it is its own mountpoint, as /mnt/backup-drive was, and the
+    # drive under it otherwise. Same field-not-regex comparison as before, just
+    # applied to every ancestor (fstab_mount_for, backup/common.sh).
+    __bmp="$(fstab_mount_for "$BACKUP_TARGET" /etc/fstab)" || __bmp=""
+    if [ -n "$__bmp" ]; then
         __bw=0
-        while [ "$__bw" -lt 60 ] && ! mountpoint -q "$BACKUP_TARGET"; do
-            [ "$__bw" -eq 0 ] && log "  waiting up to 60s for $BACKUP_TARGET (fstab lists it, and nofail means nothing else waits)…"
+        while [ "$__bw" -lt 60 ] && ! mountpoint -q "$__bmp"; do
+            [ "$__bw" -eq 0 ] && log "  waiting up to 60s for $__bmp (fstab lists it, and nofail means nothing else waits)…"
             sleep 2; __bw=$((__bw + 2))
         done
-        if mountpoint -q "$BACKUP_TARGET" && [ "$__bw" -gt 0 ]; then
-            log "  $BACKUP_TARGET appeared after ${__bw}s"
+        if mountpoint -q "$__bmp" && [ "$__bw" -gt 0 ]; then
+            log "  $__bmp appeared after ${__bw}s"
         fi
     fi
     # ── C32: MOUNT IT OURSELVES, BECAUSE ON A FRESH INSTALL NOBODY ELSE HAS ──
@@ -1013,13 +1019,25 @@ else
     # Set BEFORE the first mount attempt so that every later `exit 0` - and
     # there are many - unmounts. A subshell gets its own EXIT trap.
     trap 'if [ -n "${__tmpmnt:-}" ]; then umount "$__tmpmnt" 2>/dev/null || log "  WARN: could not unmount $__tmpmnt"; rmdir "$__tmpmnt" 2>/dev/null || true; fi' EXIT
-    if ! mountpoint -q "$BACKUP_TARGET"; then
+    if ! backup_target_ready "$BACKUP_TARGET"; then
         __frag=/etc/homehub-samba/library-mounts.fstab
+        # WHICH LINE TO MOUNT is the ancestor question again: a folder target
+        # needs the DRIVE UNDER IT mounted, not a line naming the folder - there
+        # is none, and looking for one is how this step would silently become a
+        # no-op on the box it was written for. __fmp is that mountpoint and
+        # __frel the rest of the path, appended to the temporary mount below.
+        __fmp="$(fstab_mount_for "$BACKUP_TARGET" "$__frag")" || __fmp=""
+        __frel="${BACKUP_TARGET#"${__fmp:-$BACKUP_TARGET}"}"
         # Field 1 is the spec (LABEL=PriBackup), field 3 the fstype. `mount`
         # resolves LABEL=/UUID= itself, so nothing here has to know how.
-        __spec="$(awk -v t="$BACKUP_TARGET" '$0 !~ /^[[:space:]]*#/ && $2 == t { print $1; exit }' "$__frag" 2>/dev/null || true)"
-        __fstype="$(awk -v t="$BACKUP_TARGET" '$0 !~ /^[[:space:]]*#/ && $2 == t { print $3; exit }' "$__frag" 2>/dev/null || true)"
-        if [ -n "$__spec" ]; then
+        __spec="$(awk -v t="${__fmp:-}" '$0 !~ /^[[:space:]]*#/ && $2 == t { print $1; exit }' "$__frag" 2>/dev/null || true)"
+        __fstype="$(awk -v t="${__fmp:-}" '$0 !~ /^[[:space:]]*#/ && $2 == t { print $3; exit }' "$__frag" 2>/dev/null || true)"
+        # AND ONLY WHEN THE DRIVE IS NOT ALREADY MOUNTED. With a FOLDER target
+        # the "not ready" branch is also reached on a box whose drive is mounted
+        # and simply has no such folder yet - no backup has run since the
+        # reimage - and mounting an in-use NTFS volume a second time either
+        # fails or spends the whole 60s retry budget doing so, on every boot.
+        if [ -n "$__spec" ] && ! mountpoint -q "${__fmp:-/nonexistent}"; then
             __tmpmnt="$(mktemp -d /run/homehub-acme-src.XXXXXX 2>/dev/null)" || __tmpmnt=""
             if [ -n "$__tmpmnt" ]; then
                 # RETRY, because this is exactly where a slow USB enclosure
@@ -1034,7 +1052,7 @@ else
                 done
                 if mountpoint -q "$__tmpmnt"; then
                     log "  mounted $__spec READ-ONLY at $__tmpmnt for the restore${__mw:+ (after ${__mw}s)}"
-                    __src="$__tmpmnt"
+                    __src="$__tmpmnt$__frel"
                 else
                     rmdir "$__tmpmnt" 2>/dev/null || true
                     __tmpmnt=""
@@ -1042,9 +1060,12 @@ else
             fi
         fi
     fi
-    # mountpoint, NOT -d: the directory exists whether or not the drive is on it,
-    # and an unmounted empty dir would read as "no runs archived".
-    mountpoint -q "$__src" || exit 0
+    # NOT a bare `-d`: the directory exists whether or not the drive is on it, and
+    # an unmounted empty dir would read as "no runs archived". backup_target_ready
+    # asks both halves - the path exists AND a real data mount carries it rather
+    # than the root filesystem - which is the guarantee `mountpoint -q` gave while
+    # the target was itself a mountpoint.
+    backup_target_ready "$__src" || exit 0
 
     # ── GENERALISED 2026-08-29: four volumes, not one ────────────────────────
     #
@@ -1653,7 +1674,7 @@ if [ "$ICEDRIVE_MODE" != "off" ] && [ -f "$STACK_DIR/icedrive/icedrive-profile.s
             . /etc/homehub-backup/backup.env 2>/dev/null || exit 0
             . "$STACK_DIR/backup/common.sh" 2>/dev/null || exit 0
             [ -n "${BACKUP_TARGET:-}" ] || exit 0
-            mountpoint -q "$BACKUP_TARGET" || exit 0
+            backup_target_ready "$BACKUP_TARGET" || exit 0
             _run="$(newest_run_with_set "$BACKUP_TARGET" icedrive)" || exit 0
             [ -n "$_run" ] || exit 0
             install -d -m 0700 "$_ICE_DIR"

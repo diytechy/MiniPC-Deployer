@@ -96,6 +96,30 @@ load_config "$CONFIG"
 : "${BACKUP_TARGET:?BACKUP_TARGET not set}"
 : "${BACKUP_SOURCES:?BACKUP_SOURCES not set (name=//host/share lines)}"
 STAGING="${BACKUP_STAGING:-/var/tmp/homehub-backup/staging}"
+# -- BACKUP_LAYOUT - how a run is laid out under BACKUP_TARGET (2026-09-01) ---
+# dated (the original, and still the default): one `run_<UTC>` directory per run
+#        under BACKUP_TARGET, kept BACKUP_KEEP deep by the retention step below.
+# flat:  ONE copy, written straight into BACKUP_TARGET. No dated directories, no
+#        retention, no BACKUP_KEEP - because keeping history stopped being this
+#        service's job. The Owner's ruling: the service-state archives move onto
+#        the LIBRARY drive (/srv/library/Configs), and the library is already
+#        backed up per file, with Snapshot_<date> history, by the FileBackup
+#        container. A dated folder here would be a second and worse history
+#        INSIDE the thing that already versions it - and worse than merely
+#        redundant, because every night would hand the snapshotter a whole new
+#        set of paths to store again rather than one folder it can diff.
+#
+# THE COPY IS STILL NEVER OVERWRITTEN IN PLACE. A flat run builds in
+# $BACKUP_TARGET/.incoming and is promoted only once the verdict is green (see
+# promote_flat); a run that fails is set aside as .last-failed and the previous
+# good copy is left exactly where it was. "One copy" must not be allowed to mean
+# "no copy for as long as tonight's run takes", and it does not.
+LAYOUT="${BACKUP_LAYOUT:-dated}"
+case "$LAYOUT" in
+    dated|flat) ;;
+    *) die "config: BACKUP_LAYOUT='$LAYOUT' is neither 'dated' (a run_<UTC> directory per run, kept BACKUP_KEEP deep) nor 'flat' (one current copy in BACKUP_TARGET, history left to the library backup)." ;;
+esac
+
 KEEP="${BACKUP_KEEP:-7}"
 # VALIDATED IN THE FIRST SECOND, because both bad values are silent until late.
 # BACKUP_KEEP=0 is legal shell and means "keep nothing": retention deleted the
@@ -103,6 +127,14 @@ KEEP="${BACKUP_KEEP:-7}"
 # LOG_FILE lived in the directory that had just been removed (S9). A non-numeric
 # value reached the arithmetic in retention and killed the run there — after an
 # hour of archiving, with no report posted at all.
+# BOTH RETENTION KNOBS ARE DATED-LAYOUT ONLY. A flat run keeps exactly one copy
+# and prunes nothing, so neither value means anything there - and REFUSING a
+# config that still carries the shipped BACKUP_KEEP=7 would have failed every
+# box on the day the layout changed. The flat run says so in its retention step
+# instead, out loud, because a knob quietly ignored is the same family of fault
+# as a green run that wrote nothing.
+PLAN_KEEP="${BACKUP_PLAN_KEEP:-$KEEP}"
+if [ "$LAYOUT" = dated ]; then
 case "$KEEP" in
     ''|*[!0-9]*) die "config: BACKUP_KEEP='$KEEP' is not a number (it is how many dated runs to keep on the backup drive)" ;;
     0)           die "config: BACKUP_KEEP=0 means 'keep no runs at all', so this run would archive the household and then delete the archive. Set it to 1 or more." ;;
@@ -111,10 +143,10 @@ esac
 # produced on a completely different clock: BACKUP_KEEP counts nights, while plan
 # runs come from verify-hub.sh and a human hand, twelve in one day on 2026-08-28.
 # Defaults to BACKUP_KEEP so an untouched backup.env behaves sensibly.
-PLAN_KEEP="${BACKUP_PLAN_KEEP:-$KEEP}"
 case "$PLAN_KEEP" in
     ''|*[!0-9]*) die "config: BACKUP_PLAN_KEEP='$PLAN_KEEP' is not a number (it is how many plan_<ts> directories to keep on the backup drive)" ;;
 esac
+fi
 # 0 IS LEGAL HERE, unlike BACKUP_KEEP. A plan directory holds logs and nothing
 # else, so "keep none" destroys no data — it just means each plan run tidies up
 # after the ones before it. BACKUP_KEEP=0 is refused because it would delete the
@@ -150,8 +182,17 @@ STANDBY_VALUE="${BACKUP_DRIVE_STANDBY:-241}"
 #
 # Zero disk I/O (mount_options_for reads /proc/self/mountinfo), so this is safe
 # against a spun-down drive and never wakes it just to check.
+# THE TARGET IS NO LONGER ALWAYS A WHOLE DRIVE (2026-09-01). With
+# BACKUP_TARGET=/srv/library/Configs the path is a FOLDER on the library mount,
+# so "is BACKUP_TARGET itself a mountpoint" answers NO on a perfectly healthy
+# box - and this check fails the run, so it would have refused every night.
+# enclosing_mountpoint walks up to the mount that actually carries the path: the
+# same answer as before for /mnt/backup-drive, the right one for a folder.
+# Reaching `/` is what now means "no data drive carries this", which is exactly
+# the writing-to-the-system-disk case the paragraphs above are about.
+TARGET_MOUNT="$(enclosing_mountpoint "$BACKUP_TARGET")" || TARGET_MOUNT=""
 if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
-    if target_opts="$(mount_options_for "$BACKUP_TARGET")"; then
+    if [ -n "$TARGET_MOUNT" ] && [ "$TARGET_MOUNT" != "/" ] && target_opts="$(mount_options_for "$TARGET_MOUNT")"; then
         case ",$target_opts," in
             *,ro,*)
                 # ntfs3 falls back to read-only on a dirty NTFS bit (Windows Fast
@@ -159,7 +200,11 @@ if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
                 feed_naglight false "backup target $BACKUP_TARGET is mounted READ-ONLY — refusing to run (NTFS dirty bit? clear it from Windows)"
                 die "backup target $BACKUP_TARGET is mounted READ-ONLY — refusing to run. Nothing was written." ;;
         esac
-        log "target preflight: $BACKUP_TARGET is a real mountpoint (rw)"
+        if [ "$TARGET_MOUNT" = "$BACKUP_TARGET" ]; then
+            log "target preflight: $BACKUP_TARGET is a real mountpoint (rw)"
+        else
+            log "target preflight: $BACKUP_TARGET sits on $TARGET_MOUNT, a real mountpoint (rw)"
+        fi
         # A23: say so when the archive is landing on a stand-in drive. This does
         # NOT stop the run — proving the backup works on a cheap disk before
         # committing 8 TB to it is the whole point of the bring-up period — but
@@ -169,10 +214,10 @@ if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
         # this is only the line in the run log that stops "the backup is green"
         # from being read as "the backup is on the real drive".
         if [ -f /etc/homehub-samba/drive-identity.conf ]; then
-            _expect="$(awk -F'\t' -v p="$BACKUP_TARGET" '$1 == p { print $2 }' /etc/homehub-samba/drive-identity.conf)"
+            _expect="$(awk -F'\t' -v p="$TARGET_MOUNT" '$1 == p { print $2 }' /etc/homehub-samba/drive-identity.conf)"
             if [ -n "$_expect" ] && [ -e "/dev/disk/by-id/$_expect" ]; then
                 _want="$(readlink -f "/dev/disk/by-id/$_expect" 2>/dev/null)"
-                _have="$(awk -v p="$BACKUP_TARGET" '$5 == p { d = $3 } END { print d }' /proc/self/mountinfo)"
+                _have="$(awk -v p="$TARGET_MOUNT" '$5 == p { d = $3 } END { print d }' /proc/self/mountinfo)"
                 _wantmm=""
                 [ -n "$_want" ] && [ -r "/sys/class/block/${_want#/dev/}/dev" ] &&
                     _wantmm="$(cat "/sys/class/block/${_want#/dev/}/dev")"
@@ -188,12 +233,22 @@ if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
             "Refusing to run: with nofail in fstab this path is an empty directory on the SYSTEM disk," \
             "so a run would look green while writing the household's backups to the wrong drive." \
             "Check the drive is plugged in and powered, then: systemctl start homehub-backup.service" \
+            "(The target can be a FOLDER on a drive - /srv/library/Configs - in which case the mount it" \
+            "needs is the drive UNDER it, /srv/library. Nothing at or above the target is mounted.)" \
             "(Backing up to a plain directory on purpose? Set BACKUP_TARGET_REQUIRE_MOUNT=false in backup.env.)"
     fi
 else
     warn "BACKUP_TARGET_REQUIRE_MOUNT=false — not checking that $BACKUP_TARGET is a mountpoint."
     warn "  A missing drive will be backed up to the system disk and reported GREEN."
 fi
+
+# THE TARGET FOLDER MAY NOT EXIST YET. /srv/library/Configs is made by this
+# service, not by provisioning - nothing else has a reason to make it, and a
+# reimage arrives with the library drive's own tree and no such folder on it.
+# SAFE HERE AND ONLY HERE: the preflight immediately above has just proved that a
+# real data drive carries this path, so this cannot conjure a phantom directory
+# on the system disk - the entire failure that preflight exists to prevent.
+mkdir -p "$BACKUP_TARGET" || die "could not create the backup target directory $BACKUP_TARGET"
 
 # ── 0b. CAPACITY PREFLIGHT — will this run FIT, on both disks ────────────────
 # Step 0 above asks whether the target is PRESENT. It never asked whether there
@@ -222,7 +277,14 @@ free_bytes_at() { df -PB1 "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
 # empty directory) and it happens before any RUN_DIR is made, so a refusal
 # below leaves no phantom run behind.
 mkdir -p "$STAGING" 2>/dev/null || true
-_prev="$(find "$BACKUP_TARGET" -mindepth 2 -maxdepth 2 -name RUN.json 2>/dev/null | sort | tail -1)"
+# WHERE RUN.json LIVES IS A PROPERTY OF THE LAYOUT: one level down inside a
+# dated run directory, at the top in the flat one. Asking at the wrong depth
+# finds nothing, and finding nothing is not an error here - it degrades to the
+# "no previous run" warning below, so the guard would silently stop guarding.
+case "$LAYOUT" in
+    flat) _prev="$(find "$BACKUP_TARGET" -mindepth 1 -maxdepth 1 -name RUN.json 2>/dev/null | sort | tail -1)" ;;
+    *)    _prev="$(find "$BACKUP_TARGET" -mindepth 2 -maxdepth 2 -name RUN.json 2>/dev/null | sort | tail -1)" ;;
+esac
 if [ -n "$_prev" ] && [ -r "$_prev" ]; then
     _need_t="$(grep -o '"total_bytes": *[0-9]*' "$_prev" | grep -o '[0-9]*' | tail -1)"
     _need_s="$(grep -o '"bytes":[0-9]*' "$_prev" | grep -o '[0-9]*' | sort -n | tail -1)"
@@ -258,16 +320,67 @@ RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 # now cannot pick a plan directory at all), and restore.sh. Nothing else in
 # either repo matches on the prefix — swept 2026-08-29.
 if [ "$PLAN_ONLY" = 1 ]; then RUN_PREFIX=plan; else RUN_PREFIX=run; fi
-RUN_NAME="${RUN_PREFIX}_$RUN_TS"
-RUN_DIR="$BACKUP_TARGET/$RUN_NAME"
+if [ "$LAYOUT" = flat ]; then
+    # -- FLAT: the target folder IS the run, and nothing dated is created -----
+    # The work still happens in a directory of its own, so the copy already on
+    # the drive survives a run that dies half way through:
+    #   .incoming     a full run; promoted into $BACKUP_TARGET once it is green
+    #   plan_latest   a plan run; never promoted, and ONE slot rather than one
+    #                 per invocation. There is no BACKUP_PLAN_KEEP here to bound
+    #                 them, and litter on the LIBRARY drive is worse than litter
+    #                 on the archive drive: the library backup would take a
+    #                 snapshot of every plan directory, and keep all of them.
+    # `plan_latest` KEEPS THE plan_ PREFIX ON PURPOSE - restore.sh refuses a plan
+    # directory by its NAME (Q1), and that check has to keep working.
+    if [ "$PLAN_ONLY" = 1 ]; then RUN_NAME="plan_latest"; else RUN_NAME=".incoming"; fi
+    RUN_DIR="$BACKUP_TARGET/$RUN_NAME"
+    # THE CONCURRENCY GUARD BECOMES A LOCK. In the dated layout the guard is the
+    # exclusive `mkdir` of a per-second directory name (see the `else` branch);
+    # a FIXED name cannot provide one, and two runs sharing .incoming would
+    # interleave their archives and both report success - the exact failure the
+    # 2026-08-29 review found. The lock lives on /run (tmpfs, always local,
+    # cleared by a reboot) rather than on the target: a lock file on an NTFS/FUSE
+    # mount is not a thing to bet a backup on, and one left behind by a power cut
+    # would block every later run.
+    # /run FIRST because it is tmpfs - always local, always writable by the
+    # service (which runs as root), and cleared by a reboot so a lock can never
+    # outlive the machine. The fallback is for a run started by a person or a
+    # test without write access there; it sits beside the staging directory,
+    # which this run has to be able to write anyway. A leftover lock FILE locks
+    # nothing either way: flock is advisory and the kernel drops it when the
+    # process ends.
+    LOCK_FILE=/run/homehub-backup.lock
+    : >>"$LOCK_FILE" 2>/dev/null || LOCK_FILE="$(dirname "$STAGING")/backup.lock"
+    exec 9>>"$LOCK_FILE" || die "could not open a run lock at $LOCK_FILE"
+    if command -v flock >/dev/null 2>&1; then
+        flock -n 9 || die "another backup run already holds $LOCK_FILE - refusing to start a second one. The flat layout writes into ONE directory, so two runs would interleave their archives and both report success."
+    else
+        warn "flock is not installed, so two simultaneous runs cannot be refused. Install util-linux."
+    fi
+    # A LEFTOVER .incoming MEANS THE PREVIOUS RUN WAS KILLED - a run that merely
+    # FAILED sets itself aside as .last-failed (report_failure). Say so and clear
+    # it: refusing instead would leave a box whose backup never runs again until
+    # somebody logs in, which is worse than losing the debris of a killed run.
+    # The plan slot is cleared for the same reason and with less at stake.
+    if [ -d "$RUN_DIR" ]; then
+        case "$RUN_NAME" in
+            .incoming) warn "clearing a leftover .incoming under $BACKUP_TARGET - the previous run was killed before it could finish or set itself aside" ;;
+        esac
+        rm -rf -- "$RUN_DIR"
+    fi
+    mkdir "$RUN_DIR" || die "could not create $RUN_DIR - is $BACKUP_TARGET writable?"
+else
+    RUN_NAME="${RUN_PREFIX}_$RUN_TS"
+    RUN_DIR="$BACKUP_TARGET/$RUN_NAME"
+    # `mkdir`, NOT `mkdir -p`, ON THE RUN DIRECTORY. `-p` accepts an existing one, so
+    # two runs started inside the same UTC second would share it: one manifest
+    # overwriting the other, two sets of archives interleaved, and both reporting
+    # success. The timer plus a hand-started run is exactly how that happens.
+    # (Adversarial review, 2026-08-29.)
+    mkdir "$RUN_DIR" || die "$RUN_DIR already exists, or could not be created. Another run started in the same second, or the drive is read-only. Refusing rather than sharing a run directory with something else."
+fi
 MANIFEST="$RUN_DIR/MANIFEST.tsv"
 mkdir -p "$STAGING"
-# `mkdir`, NOT `mkdir -p`, ON THE RUN DIRECTORY. `-p` accepts an existing one, so
-# two runs started inside the same UTC second would share it: one manifest
-# overwriting the other, two sets of archives interleaved, and both reporting
-# success. The timer plus a hand-started run is exactly how that happens.
-# (Adversarial review, 2026-08-29.)
-mkdir "$RUN_DIR" || die "$RUN_DIR already exists, or could not be created. Another run started in the same second, or the drive is read-only. Refusing rather than sharing a run directory with something else."
 LOG_FILE="$RUN_DIR/backup.log"
 
 # Run totals + the report fields, initialised BEFORE the failure machinery below
@@ -329,6 +442,32 @@ MISSING_SETS=""
 # there first owns the verdict, so a die raised inside the trap (or vice versa)
 # cannot double-post or overwrite it. Always returns 0 — reporting must not
 # invent a second failure.
+# set_aside_flat : in the FLAT layout, move the failed run out of the way.
+#
+# Two things depend on it, and both are about the copy that is ALREADY there:
+#   * the previous good copy under $BACKUP_TARGET must survive tonight's failure
+#     untouched. It is what a restore would find, and a flat layout has no dated
+#     sibling to fall back to - so a run that failed while writing over it would
+#     leave the household with no copy at all;
+#   * the next run must not find .incoming sitting in its way. A failed run that
+#     tidied itself away completely would take its own evidence with it, so it is
+#     MOVED rather than deleted - into ONE slot, because two .last-failed
+#     directories are not twice the evidence.
+# Never raises: report_failure must always return 0, and a failure to file the
+# evidence must not become a second, louder failure than the real one.
+set_aside_flat() {
+    [ "$LAYOUT" = flat ] || return 0
+    [ "${RUN_NAME:-}" = ".incoming" ] || return 0
+    [ -d "$RUN_DIR" ] || return 0
+    rm -rf -- "$BACKUP_TARGET/.last-failed" 2>/dev/null || true
+    if mv -- "$RUN_DIR" "$BACKUP_TARGET/.last-failed" 2>/dev/null; then
+        LOG_FILE="$BACKUP_TARGET/.last-failed/backup.log"
+        log "the failed run was set aside as $BACKUP_TARGET/.last-failed - the copy already in $BACKUP_TARGET is untouched, and it is what a restore would find"
+    else
+        warn "could not set the failed run aside as .last-failed - it is still at $RUN_DIR, and the NEXT run will clear it"
+    fi
+    return 0
+}
 report_failure() {
     local note="$1"
     [ "$REPORTED_FAILURE" = 0 ] || return 0
@@ -337,6 +476,7 @@ report_failure() {
     feed_naglight false "backup FAILED: $note"
     write_run_json "failed" "$note"
     log "BACKUP FAILED: $note"
+    set_aside_flat
     return 0
 }
 on_err() {
@@ -401,7 +541,7 @@ if [ "$PLAN_ONLY" = 1 ]; then RUN_MODE=plan; else RUN_MODE=full; fi
 # tell a plan run from a real one and accepts BOTH spellings, because the run
 # directories already on the drive carry the old one. Since Q1 it does not have
 # to read a log at all in the common case - the directory NAME carries it.
-log "config=$CONFIG target=$BACKUP_TARGET keep=$KEEP mode=$RUN_MODE"
+log "config=$CONFIG target=$BACKUP_TARGET layout=$LAYOUT keep=$KEEP mode=$RUN_MODE"
 if [ "$PLAN_ONLY" = 1 ]; then
     # SAID AT THE START, not only at the end. A plan run that dies half way
     # through has still written this directory, and the operator who later finds
@@ -445,8 +585,11 @@ fi
 #
 # MIRROR SEMANTICS (`rsync -a --delete`): the library copy is made to MATCH the
 # share, so a file deleted on the share is deleted from the library on the next
-# run. History lives in the dated run snapshots under BACKUP_TARGET (BACKUP_KEEP),
-# NOT in the library. Every failure here is loud (OI-9 die reporting).
+# run. History is the LIBRARY BACKUP's Snapshot_<date> series - the FileBackup
+# container covers /srv/library whole - not this service's run directories: the
+# library trees stopped being BACKUP_SOURCES rows on 2026-08-31, and since
+# 2026-09-01 this service writes no dated directory at all. Every failure here is
+# loud (OI-9 die reporting).
 #
 # The wake pre-step above already ran, so a source box that sleeps is awake by
 # now — ingest deliberately reuses it rather than owning a second wake.
@@ -808,10 +951,17 @@ if [ "$PLAN_ONLY" = 1 ]; then
     # where, so the answer is in the run's own log rather than on the stick.
     log "plan complete: no archives written — and this run DID write $(find "$RUN_DIR" -type f 2>/dev/null | wc -l) file(s) to $RUN_DIR"
     log "  the directory stays on $BACKUP_TARGET as the plan's evidence; it holds logs only, and it"
-    log "  is named plan_ so it cannot be mistaken for an archive run (Q1). Plan directories carry"
-    log "  their own budget — BACKUP_PLAN_KEEP=$PLAN_KEEP — pruned by plan runs, not by the nightly."
-    trap - ERR
-    prune_plan_dirs
+    log "  is named plan_ so it cannot be mistaken for an archive run (Q1)."
+    if [ "$LAYOUT" = flat ]; then
+        log "  The flat layout gives it ONE slot, plan_latest, replaced by the next plan run - so there"
+        log "  is no budget to keep and nothing to prune (BACKUP_PLAN_KEEP is not read in this layout)."
+        trap - ERR
+    else
+        log "  Plan directories carry their own budget — BACKUP_PLAN_KEEP=$PLAN_KEEP — pruned by plan"
+        log "  runs, not by the nightly."
+        trap - ERR
+        prune_plan_dirs
+    fi
     exit 0
 fi
 
@@ -860,6 +1010,49 @@ fi
 # "failed" runs — mis-COUNTED, as C25 recorded, even though they were pruned
 # correctly. With the plan prefix split off, `bad` means what it says: a real
 # archive run that did not finish ok.
+# promote_flat : make this run's output THE copy under $BACKUP_TARGET.
+#
+# THE FLAT LAYOUT'S ANSWER TO RETENTION. There is nothing to rotate - one copy,
+# replaced - but "replaced" still has to be done in an order that never leaves
+# the household with less than it started with. So the run built itself in
+# .incoming, this is called only after the verdict is GREEN, and a run that
+# failed anywhere above never reaches it.
+#
+# Two halves, in this order:
+#   1. REMOVE THE STALE ARTEFACTS THIS RUN DID NOT REPRODUCE. Without it, a set
+#      renamed or dropped from BACKUP_SOURCES leaves its last archive lying here
+#      looking current, forever, and a restore would happily use it. It matches
+#      only the file shapes this service itself writes: anything else in the
+#      folder is left alone rather than tidied away by a backup script.
+#   2. MOVE this run's files up. Same filesystem, so every one is a rename.
+#
+# LOG_FILE AND MANIFEST ARE REPOINTED AT THE END, because the files they name
+# have just moved and everything after this still logs.
+promote_flat() {
+    local f base removed=0 moved=0
+    for f in "$BACKUP_TARGET"/*.tar "$BACKUP_TARGET"/*.tar.zst \
+             "$BACKUP_TARGET"/*.files.tsv "$BACKUP_TARGET"/*.excluded.log \
+             "$BACKUP_TARGET/MANIFEST.tsv" "$BACKUP_TARGET/RUN.json" \
+             "$BACKUP_TARGET/backup.log"; do
+        [ -f "$f" ] || continue
+        base="${f##*/}"
+        [ -e "$RUN_DIR/$base" ] && continue
+        rm -f -- "$f" || return 1
+        removed=$(( removed + 1 ))
+    done
+    log "promoting $RUN_NAME into $BACKUP_TARGET ($removed stale file(s) from an earlier run removed)"
+    for f in "$RUN_DIR"/*; do
+        [ -e "$f" ] || continue
+        mv -f -- "$f" "$BACKUP_TARGET/" || return 1
+        moved=$(( moved + 1 ))
+    done
+    rmdir "$RUN_DIR" 2>/dev/null || warn "$RUN_DIR is not empty after promotion - look at what is left in it"
+    LOG_FILE="$BACKUP_TARGET/backup.log"
+    MANIFEST="$BACKUP_TARGET/MANIFEST.tsv"
+    log "promoted $moved file(s); $BACKUP_TARGET now holds the current copy"
+    return 0
+}
+
 retention_prune() {
     local d good=() bad=() i
     while IFS= read -r d; do
@@ -895,7 +1088,13 @@ retention_prune() {
     # again would otherwise keep that one plan directory forever.
     prune_plan_dirs
 }
-retention_prune
+if [ "$LAYOUT" = flat ]; then
+    log "retention: none - the flat layout holds ONE current copy in $BACKUP_TARGET, which this run replaces."
+    log "  BACKUP_KEEP=$KEEP and BACKUP_PLAN_KEEP=$PLAN_KEEP are NOT read in this layout and nothing is pruned."
+    log "  The history of this folder is the library backup's Snapshot_<date> series, which versions it per file."
+else
+    retention_prune
+fi
 
 # THE LAST THREE STEPS ARE CHECKED, and until 2026-08-29 they were not. This
 # code runs after `trap - ERR` (deliberately — a failure here must not be
@@ -914,6 +1113,16 @@ retention_prune
 if ! write_run_json "ok" "sets: ${SET_SUMMARY:-none}"; then
     report_failure "the archives are complete and verified, but RUN.json could not be written to $RUN_DIR — retention will class this run as failed and the next run cannot size itself from it"
     exit 1
+fi
+
+# ONLY NOW does the flat layout touch the copy the household already had. Every
+# check above has passed and RUN.json says ok, so the previous copy has been
+# intact for the whole run and is replaced by a complete, verified one.
+if [ "$LAYOUT" = flat ]; then
+    if ! promote_flat; then
+        report_failure "the archives are complete and verified in $RUN_DIR, but they could not be moved into place in $BACKUP_TARGET - a restore would still find the PREVIOUS copy, which is intact"
+        exit 1
+    fi
 fi
 if ! feed_naglight true "backup ok $RUN_TS — ${SET_SUMMARY:-no sets}"; then
     log "ERROR: the backup succeeded but the report did NOT reach NagLight."

@@ -218,13 +218,29 @@ source_kind() {
 # LIVES HERE, NOT IN restore.sh, since 2026-08-28: firstboot's ACME restore needs
 # the identical question answered, and two copies of "which run actually has this
 # set" is exactly the kind of drift that makes one of them quietly wrong.
+#
+# IT ALSO ANSWERS FOR THE FLAT LAYOUT (BACKUP_LAYOUT=flat, 2026-09-01), and that
+# is why every reimage-restore caller kept working when the target moved. In the
+# flat layout there are no run_ directories to choose between: BASE itself IS the
+# run, holding one current copy whose history is the library backup's
+# Snapshot_<date> series. So BASE is the answer when it carries a MANIFEST.tsv
+# listing the set - checked SECOND, so a dated target (which has no manifest of
+# its own and never reaches that branch) behaves byte-identically to before.
 newest_run_with_set() {
-    local base="$1" s="$2" d
-    while IFS= read -r d; do
-        [ -f "$d/MANIFEST.tsv" ] || continue
-        awk -F'\t' -v s="$s" 'NR>1 && $1==s {found=1} END {exit !found}' "$d/MANIFEST.tsv" || continue
-        printf '%s\n' "$d"
-    done < <(find "$base" -mindepth 1 -maxdepth 1 -type d -name 'run_*' 2>/dev/null | sort) | tail -1
+    local base="$1" s="$2" d newest
+    newest="$(
+        while IFS= read -r d; do
+            [ -f "$d/MANIFEST.tsv" ] || continue
+            awk -F'\t' -v s="$s" 'NR>1 && $1==s {found=1} END {exit !found}' "$d/MANIFEST.tsv" || continue
+            printf '%s\n' "$d"
+        done < <(find "$base" -mindepth 1 -maxdepth 1 -type d -name 'run_*' 2>/dev/null | sort) | tail -1
+    )"
+    if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
+    if [ -f "$base/MANIFEST.tsv" ] &&
+       awk -F'\t' -v s="$s" 'NR>1 && $1==s {found=1} END {exit !found}' "$base/MANIFEST.tsv"; then
+        printf '%s\n' "$base"
+    fi
+    return 0
 }
 
 
@@ -608,6 +624,71 @@ mount_options_for() {
     opts="$(awk -v p="$path" '$5 == p { o = $6 } END { print o }' /proc/self/mountinfo)"
     [ -n "$opts" ] || return 1
     printf '%s' "$opts"
+}
+
+# enclosing_mountpoint PATH : echo the deepest mountpoint AT OR ABOVE PATH.
+#
+# WHY THIS EXISTS (2026-09-01): the backup target stopped being a whole drive.
+# The storage-map 4c service-state archives now land in a FOLDER on the library
+# drive (/srv/library/Configs) instead of at the root of the backup drive, so
+# `mount_options_for "$BACKUP_TARGET"` - which answers only for a path that IS
+# itself a mountpoint - began answering "not mounted" for a perfectly healthy
+# box. Walking up gives the SAME answer as before for a target that is its own
+# mountpoint (/mnt/backup-drive) and the right one for a folder on a drive.
+#
+# REACHING `/` IS THE FAILURE, and callers treat it as one: it means no data
+# drive carries the path, so the run would be writing to the SYSTEM disk - the
+# silent-green shape the target preflight has always existed to refuse.
+#
+# Zero disk I/O: mount_options_for reads /proc/self/mountinfo and nothing else,
+# so this is still safe against a spun-down drive and never wakes one.
+enclosing_mountpoint() {
+    local p="${1%/}"
+    [ -n "$p" ] || p=/
+    case "$p" in /*) ;; *) return 2 ;; esac        # a relative path has no answer
+    while :; do
+        if mount_options_for "$p" >/dev/null 2>&1; then printf '%s' "$p"; return 0; fi
+        case "$p" in /) return 1 ;; esac
+        p="${p%/*}"; [ -n "$p" ] || p=/
+    done
+}
+
+# backup_target_ready TARGET : true when TARGET exists AND sits on a real data
+# mount rather than on the root filesystem.
+#
+# The one-line form of the preflight, for the callers that only want to know
+# whether there is anything to READ - firstboot's restore steps and the reimage
+# drill. All of them used `mountpoint -q "$TARGET"`, which is exactly the test a
+# folder-on-a-drive target breaks: it would report "no backup drive" on a box
+# whose drive is mounted and full of archives, and every one of those callers
+# fails OPEN (skips the restore), so the loss would have been silent.
+backup_target_ready() {
+    local t="$1" mp
+    mp="$(enclosing_mountpoint "$t")" || return 1
+    [ "$mp" != "/" ] || return 1
+    [ -d "$t" ]
+}
+
+# fstab_mount_for PATH FSTAB : the deepest ancestor of PATH (or PATH itself)
+# that FSTAB names as a mountpoint; nothing + nonzero when none does.
+#
+# The BEFORE-IT-IS-MOUNTED counterpart of enclosing_mountpoint, for firstboot.
+# On a fresh install nothing has mounted the data drives yet (C32), so the
+# question is not "what carries this path" but "which fstab line is the one to
+# mount for it". Field 2 is compared as a FIELD and never as a regex - the
+# 2026-08-28 review's finding, which applies to every ancestor equally.
+fstab_mount_for() {
+    local p="${1%/}" f="$2"
+    [ -n "$p" ] || p=/
+    [ -f "$f" ] || return 1
+    while :; do
+        if awk -v t="$p" '$0 !~ /^[[:space:]]*#/ && $2 == t { found = 1 }
+                          END { exit !found }' "$f" 2>/dev/null; then
+            printf '%s' "$p"; return 0
+        fi
+        case "$p" in /) return 1 ;; esac
+        p="${p%/*}"; [ -n "$p" ] || p=/
+    done
 }
 
 # ── NagLight /api/feed reporting (step 6) — never-silent-green ────────────────

@@ -439,6 +439,12 @@ services:
       # visible at the seam rather than one `docker image inspect` away.
       FILEBACKUP_CONFIG_PATH: /config/FileBackup.json
       FILEBACKUP_LOG_PATH: /logs/Backup_Global.log
+      # The 7-Zip effort level (-mx 0..9) for files FileBackup compresses. The
+      # image deliberately ships NO default of its own and falls back to 9
+      # (Ultra); the Owner ruled 5 (Normal) on 2026-09-01. Defaulted inline for
+      # the same reason as the host paths below: a materialised .env written
+      # before this knob existed must not silently hand the library to -mx=9.
+      FILEBACKUP_7Z_LEVEL: ${FILEBACKUP_7Z_LEVEL:-5}
     volumes:
       # The set definition — container-internal paths only, no secret and no
       # site identity, so it is a TRACKED template (stack/backup/filebackup.json)

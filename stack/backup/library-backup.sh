@@ -491,6 +491,13 @@ count_snapshots() {
 }
 SNAPSHOT_BEFORE="$(count_snapshots)"
 
+# THE LEVEL IS SAID OUT LOUD BEFORE THE RUN, because it is the one knob whose
+# wrong value is invisible afterwards: a run at -mx=9 and a run at -mx=5 both
+# exit 0 and both make a snapshot, and only the CPU-hours differ. stack/.env is
+# what compose interpolates, so what it says is what the container gets; unset
+# means compose's inline default (5), and the container's own fallback (9) is
+# only reachable through an older docker-compose.yml.
+log "7-Zip level for compressed files: FILEBACKUP_7Z_LEVEL=${FILEBACKUP_7Z_LEVEL:-<unset: compose defaults it to 5>} (the Owner's ruling is 5 = Normal; FileBackup alone would use 9)"
 log "running: docker compose --profile filebackup run --rm -T filebackup backup"
 BACKUP_RC=0
 fb_run backup || BACKUP_RC=$?

@@ -123,9 +123,29 @@ resolve_identity() {
     # what is actually mounted is 'ata-WDC_...-11BCSS0_WD-XXXX-part1'. Matching
     # on equality alone therefore reported the REAL disk as a stand-in forever,
     # and the yellow it raised was indistinguishable from a genuine substitute.
-    # '<expected>-part<N>' can only be a partition OF the expected disk — the
-    # name embeds that disk's own serial — so accepting it is exact, not loose.
-    local found="" found_exact=0 link target dev name
+    # A '-part<N>' CANDIDATE IS ACCEPTED ON PARENTAGE, NOT ON ITS NAME.
+    # '<expected>-part*' is a lexical prefix test: it matches any by-id entry
+    # that merely BEGINS with the expected disk's name, so it is not the
+    # guarantee the previous comment here claimed. sysfs is asked instead —
+    # a partition node's parent directory IS its whole disk, so requiring that
+    # parent to be the expected disk is what makes the acceptance exact.
+    # Same fix, same reasoning, as backup.sh and library-backup.sh's
+    # identity_note(); raised by the 2026-09-06 adversarial review.
+    #
+    # ASSUMED LAYOUT (stated, not assumed silently): the mounted filesystem is
+    # the expected disk itself or a partition of it. A dm-crypt/LVM/MD layer in
+    # between resolves to a device whose sysfs parent is not the expected disk
+    # and would read as a stand-in. Every mount this guards is a plain partition
+    # by design — storage-map.md §1 — so that is a constraint, not a defect.
+    local diskmm="" _dt
+    if [ -e "/dev/disk/by-id/$expected" ]; then
+        _dt="$(readlink -f "/dev/disk/by-id/$expected" 2>/dev/null)" || _dt=""
+        if [ -n "$_dt" ] && [ -r "/sys/class/block/${_dt#/dev/}/dev" ]; then
+            diskmm="$(cat "/sys/class/block/${_dt#/dev/}/dev" 2>/dev/null)"
+        fi
+    fi
+
+    local found="" found_exact=0 link target dev name parentmm
     for link in /dev/disk/by-id/*; do
         [ -e "$link" ] || continue
         target="$(readlink -f "$link" 2>/dev/null)" || continue
@@ -134,7 +154,21 @@ resolve_identity() {
         if [ "$(cat "/sys/class/block/$dev/dev" 2>/dev/null)" = "$majmin" ]; then
             name="${link##*/}"
             case "$name" in
-                "$expected"|"$expected"-part*) found="$name"; found_exact=1; break ;;
+                "$expected")
+                    # The whole disk itself — its own name is the proof.
+                    found="$name"; found_exact=1; break ;;
+                "$expected"-part[0-9]*)
+                    parentmm=""
+                    if [ -r "/sys/class/block/$dev/../dev" ]; then
+                        parentmm="$(cat "/sys/class/block/$dev/../dev" 2>/dev/null)"
+                    fi
+                    if [ -n "$diskmm" ] && [ "$parentmm" = "$diskmm" ]; then
+                        found="$name"; found_exact=1; break
+                    fi
+                    # Spells like our partition, is not a child of our disk.
+                    # Recorded as a candidate so the message can name it, but
+                    # NOT accepted as a match.
+                    [ -n "$found" ] || found="$name" ;;
                 *) [ -n "$found" ] || found="$name" ;;
             esac
         fi

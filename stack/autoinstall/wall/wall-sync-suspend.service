@@ -1,0 +1,77 @@
+# Stop the media sync BEFORE the panel enters the sleep window (D1, 2026-09-05).
+#
+# THE FAULT THIS EXISTS FOR, measured on the real panel rather than reasoned
+# about. The nightly suspend failed for 40 s and left the panel awake:
+#
+#   PM: suspend entry (deep)
+#   Freezing user space processes failed after 20.008 seconds
+#     (1 tasks refusing to freeze): task:rsync state:D  cifs_strict_readv
+#   PM: suspend exit
+#   PM: suspend entry (s2idle)          <- systemd retries in the other mode
+#   Freezing user space processes failed after 20.001 seconds
+#
+# The rsync was NOT wedged — `rchar` was climbing at 10.6 MB/s, a healthy first
+# music mirror. The freezer simply needs every user task to reach a freeze
+# checkpoint within 20 s, and a task doing back-to-back uninterruptible CIFS
+# reads does not get there. So the panel could not sleep for a reason that looks
+# like a hang and is actually normal operation.
+#
+# AND IT IS SELF-PERPETUATING WITHOUT THIS UNIT. wall-sync-resume.service
+# restarts the mirror on every resume; a resume near a sleep boundary therefore
+# arms the exact condition that blocks the next suspend. Observed as a loop on
+# 2026-09-05: sleep -> woken early -> resume hook starts the mirror -> next
+# boundary blocked -> repeat.
+#
+# WHY STOPPING WORKS, and why the earlier `umount -f -l` theory did not: the
+# D-state is between reads, not a hang, so the task takes SIGTERM as soon as the
+# current read returns. Measured: `systemctl stop wall-sync.service` returned in
+# 1.08 s and the freeze then completed in 0.002 s. A forced lazy unmount, tried
+# first on the live panel, released nothing — the read waits on a page lock, not
+# on the mount.
+#
+# THE ORDERING IS THE WHOLE UNIT. WantedBy=sleep.target pulls it into the
+# suspend transaction and Before=sleep.target puts it ahead of the freeze —
+# the mirror image of wall-sync-resume.service, which uses After= to land on the
+# way back out. DefaultDependencies=no is required for anything that must run
+# inside a sleep transaction: the implicit ordering against shutdown.target
+# would otherwise deadlock against the transaction it is part of.
+#
+# SLEEP.TARGET, NOT SUSPEND.TARGET. sleep.target is reached for every sleep
+# operation; listing suspend.target alone would miss a `systemctl suspend` that
+# systemd resolves through the generic path, and this panel's design has exactly
+# one thing it must never do — fail to go dark because a file copy was running.
+[Unit]
+Description=Wall panel: stop the media sync before entering the sleep window
+Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
+Before=sleep.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+# The timer is stopped too, not just the running units: without that, the
+# every-minute frame cadence can start a NEW mirror in the seconds between this
+# hook finishing and the freeze starting. wall-sync-resume.service restarts it
+# on the way out.
+ExecStart=/usr/bin/systemctl stop wall-sync-frame.timer wall-sync-frame.service wall-sync.service
+# A BOUND ON THE TEARDOWN, so this hook can never become the new reason the
+# panel fails to sleep. THE FIRST VALUE HERE WAS 15 s AND IT WAS WRONG — the
+# real run on 2026-09-05 hit it: "start operation timed out. Terminating." The
+# stop of the unit itself is fast (0.75 s measured, rsync gone), but the script's
+# cleanup then unmounts two cifs shares under UMOUNT_TIMEOUT=30 s each, and a
+# share whose server is mid-transfer can use it. 45 s covers a realistic worst
+# case without being so long that a wedged teardown delays the wall going dark.
+#
+# THE FAILURE MODE IS ALREADY BENIGN, and that is measured too rather than
+# assumed: when this unit timed out on 2026-09-05 systemd killed it and
+# proceeded straight to systemd-suspend.service, which then froze user space in
+# 0.001 s and slept for the full window. A failed teardown costs a red unit in
+# the journal, not a panel that stays lit.
+TimeoutStartSec=45
+# A failed teardown must not abort the sleep transaction: going dark late beats
+# not going dark.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sleep.target

@@ -618,6 +618,21 @@ cleanup() {
     return 0
 }
 trap cleanup EXIT
+# AND ON SIGNALS, WHICH IS NOT THE SAME THING. A bash script killed by an
+# UNTRAPPED SIGTERM dies without running its EXIT trap — so `systemctl stop`
+# left the cifs mount behind, every time. Measured on the real panel 2026-09-05:
+# a clean stop returned in 0.75 s with the rsync gone and
+# `//homehub.diyt.win/Media` still mounted on /run/wall-sync/music. The next run
+# then failed with "cannot create the mountpoint" — a stopped sync silently
+# breaking the following one, on a unit whose whole contract is that a
+# left-behind mount is a failure (see release_mount).
+#
+# This matters more since the D-W4 pre-sleep teardown (wall-sync-suspend.service)
+# exists: stopping this unit is now a ROUTINE nightly event, not just something
+# an operator does by hand. `exit` from the handler is what runs the EXIT trap —
+# hence `exit N` rather than calling cleanup twice. 143/130 = 128 + the signal.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 # THE COUNT AND THE EMPTINESS TEST MUST AGREE WITH RSYNC, EXACTLY.

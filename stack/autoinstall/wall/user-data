@@ -34,6 +34,19 @@ autoinstall:
   interactive-sections: []
 
   locale: en_US.UTF-8
+
+  # TIMEZONE IS LOAD-BEARING ON THIS IMAGE, not cosmetic. The D-W4 sleep window
+  # is two wall-clock times (SLEEP_START/SLEEP_END), and BOTH consumers read the
+  # machine's LOCAL time: wall-firstboot.sh renders them into OnCalendar=, which
+  # systemd resolves locally, and wall-sleep.sh arms the RTC with
+  # `date -d "today $SLEEP_END"`. Subiquity's default is UTC, so a panel imaged
+  # without this line runs the window at whatever UTC offset the site happens to
+  # have — measured on the real panel 2026-09-05: `SLEEP_START=22:00` put it to
+  # sleep at 17:00 local and woke it at 01:30, i.e. dark through the evening it
+  # exists to be watched in, awake all night. Setting it here (rather than in
+  # firstboot) means it is right from the installer onward, including for the
+  # first night before anyone logs in.
+  timezone: REPLACE_WITH_TIMEZONE
   keyboard:
     layout: us
 
@@ -595,6 +608,15 @@ autoinstall:
     # symlink; without that the hook exists but never fires.
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-resume.service /target/etc/systemd/system/wall-sync-resume.service
     - curtin in-target --target=/target -- systemctl enable wall-sync-resume.service
+    # wall-sync-suspend — the mirror image of the resume hook (D1, 2026-09-05):
+    # WantedBy=sleep.target + Before=sleep.target, so the media sync is stopped
+    # BEFORE the freezer runs. Measured on the real panel: an active rsync on a
+    # cifs mount cannot reach a freeze checkpoint inside the kernel's 20 s
+    # window, so the nightly suspend failed twice (deep, then s2idle) and left
+    # the panel awake with the screen on. Enabling is what plants the
+    # sleep.target symlink; without it the unit exists and never fires.
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-suspend.service /target/etc/systemd/system/wall-sync-suspend.service
+    - curtin in-target --target=/target -- systemctl enable wall-sync-suspend.service
     # Seat access for the kiosk user (cage needs the DRM/input devices).
     - curtin in-target --target=/target -- usermod -aG video,input,render panel
 

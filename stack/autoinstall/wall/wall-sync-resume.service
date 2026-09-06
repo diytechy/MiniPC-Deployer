@@ -38,6 +38,15 @@ After=suspend.target
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/systemctl start --no-block wall-sync.service
+# RESTART THE FRAME CADENCE the pre-sleep hook stopped (D1, 2026-09-05).
+# wall-sync-suspend.service stops wall-sync-frame.timer so the every-minute
+# job cannot start a mirror in the gap between the teardown and the freeze.
+# A stopped timer stays stopped across the suspend, so without this line the
+# frame flow silently drops to boot-and-resume cadence after the FIRST night
+# — the exact "goes quiet and nothing is red" failure OI-18 was written
+# against. Ordered after the line above only by file order; both are
+# non-blocking and neither delays the wake.
+ExecStart=/usr/bin/systemctl start wall-sync-frame.timer
 StandardOutput=journal
 StandardError=journal
 

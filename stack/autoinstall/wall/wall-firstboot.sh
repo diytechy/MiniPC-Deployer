@@ -280,7 +280,28 @@ EOF
 render_timer wall-sleep "$SLEEP_START" "Enter the wall panel's sleep window (SLEEP_MODE=$SLEEP_MODE)"
 render_timer wall-wake  "$SLEEP_END"   "Leave the wall panel's sleep window"
 systemctl daemon-reload
-enable_unit_now "D-W4: sleep window ${SLEEP_START}-${SLEEP_END}, SLEEP_MODE=$SLEEP_MODE, RTC wake=$SLEEP_RTC_WAKE" \
+
+# SAY WHICH CLOCK THE WINDOW IS IN. Both boundaries are wall-clock times read in
+# LOCAL time - systemd resolves OnCalendar locally, and wall-sleep.sh arms the
+# RTC from `date -d "today $SLEEP_END"` - so the timezone is part of the setting,
+# not context for it. The autoinstall sets it (user-data `timezone:`), but an
+# image built before that key existed, or a hand-installed panel, lands on
+# subiquity's UTC default and the window silently slides by the UTC offset.
+# Measured on the real panel 2026-09-05: 22:00-06:30 on a UTC box meant asleep at
+# 17:00 local and awake from 01:30. Logging the zone is what makes that visible
+# in `journalctl -u wall-firstboot` instead of only on the wall in December.
+PANEL_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo unknown)"
+case "$PANEL_TZ" in
+    UTC|Etc/UTC|unknown)
+        warn "the sleep window ${SLEEP_START}-${SLEEP_END} will be read in '$PANEL_TZ'."
+        warn "These are LOCAL wall-clock times. If this site is not actually on UTC the"
+        warn "panel sleeps and wakes at the wrong hours - and nothing else reports it."
+        warn "Fix: timedatectl set-timezone <Area/City>, then re-run this script."
+        ;;
+    *)  log "D-W4: sleep window is read in $PANEL_TZ (local time)" ;;
+esac
+
+enable_unit_now "D-W4: sleep window ${SLEEP_START}-${SLEEP_END} $PANEL_TZ, SLEEP_MODE=$SLEEP_MODE, RTC wake=$SLEEP_RTC_WAKE" \
     wall-sleep.timer wall-wake.timer
 
 # The mem_sleep_default decision (user-data §6): report, never silently rewrite
@@ -498,6 +519,15 @@ if [ -f /etc/systemd/system/wall-sync-resume.service ]; then
         wall-sync-resume.service
 else
     fail_step "wall-sync-resume.service is not installed (the autoinstall late-commands place it). Without it a resume does NOT refresh the media cache — with SLEEP_MODE=suspend the panel can then run for weeks on a stale cache. Copy it from $PAYLOAD/wall-sync-resume.service and: systemctl enable wall-sync-resume.service"
+fi
+# D1 (2026-09-05): the pre-sleep teardown. Same enable-or-it-never-fires rule as
+# the resume hook above, and the same class of silent failure — except this one
+# does not show up as a stale cache, it shows up as a panel that stays lit all
+# night because the freezer could not stop an rsync in time.
+if [ -f /etc/systemd/system/wall-sync-suspend.service ]; then
+    enable_unit "D1: wall-sync-suspend.service enabled — the media sync is stopped before the freezer runs, so a mirror in flight cannot block the sleep window"         wall-sync-suspend.service
+else
+    fail_step "wall-sync-suspend.service is not installed (the autoinstall late-commands place it). Without it a media sync running at SLEEP_START blocks the freeze for 40 s (deep, then s2idle) and the panel does NOT sleep — measured on the real panel 2026-09-05. Copy it from $PAYLOAD/wall-sync-suspend.service and: systemctl enable wall-sync-suspend.service"
 fi
 # OI-18: the frame flow has its OWN cadence — every minute, per storage-map §4d
 # — so it has its own unit and timer. Enabling the TIMER is what matters; the

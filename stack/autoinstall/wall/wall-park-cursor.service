@@ -1,0 +1,50 @@
+# wall-park-cursor.service — get the arrow out of the middle of the wall.
+#
+# THE MEASUREMENT THIS EXISTS FOR (2026-09-06, with `grim -c` on the panel):
+# `cage` draws its own default cursor at the CENTRE of the output from the
+# moment the session starts, and keeps drawing it — a capture taken after 40 s
+# with nobody touching anything still had an arrow in the middle of a red wall.
+# The shell's `cursor: none` could not remove it and never could: Chromium sets
+# a cursor image only for a pointer that has ENTERED its surface, and on a
+# touch-only panel no pointer ever moves, so the CSS was correct and inert.
+#
+# One relative motion fixes both halves — it moves the pointer out of the middle
+# AND hands it to Chromium, after which the shell's cursor policy applies. Then
+# a full-screen `grim -c` shows no cursor anywhere, including right after a
+# touch. Wayland has no pointer-warp for clients, so this cannot be done from
+# inside the app; it is a seat-level action and therefore a seat-level unit.
+#
+# CONFIGURED FROM wall.env, like every other panel service:
+#   WALL_CURSOR_PARK         true|false — false and firstboot disables this unit
+#   WALL_CURSOR_PARK_CORNER  which corner to drive the pointer into
+#   WALL_CURSOR_PARK_DELAY   seconds to wait for cage to create its pointer
+# wall-firstboot.sh renders all three into /etc/wall-panel/kiosk.env.
+
+[Unit]
+Description=Wall panel: park the compositor's pointer in a corner so it is not an arrow on the wall
+Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
+# The seat must exist before there is a pointer to move. wall-kiosk.sh runs from
+# the tty1 autologin session rather than from a unit, so there is nothing to
+# order against — WALL_CURSOR_PARK_DELAY is what stands in for that ordering.
+After=multi-user.target
+# Nothing else depends on this, and it must never hold up a boot.
+DefaultDependencies=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 0644 and world-readable: every knob in it is non-secret by construction (the
+# PSK and the share credentials stay in wall.env, 0600 root:root).
+EnvironmentFile=/etc/wall-panel/kiosk.env
+# Defaults for a panel whose kiosk.env predates these knobs — an older image
+# must not fail to boot a unit it does have.
+Environment=WALL_CURSOR_PARK_DELAY=10
+Environment=WALL_CURSOR_PARK_CORNER=bottom-right
+ExecStartPre=/bin/sh -c 'sleep "${WALL_CURSOR_PARK_DELAY}"'
+ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-poke.py park
+# A panel that cannot park its cursor has a small cosmetic fault, not a reason
+# to mark the boot degraded. 69 = no /dev/uinput, 77 = not root.
+SuccessExitStatus=0 69 77
+
+[Install]
+WantedBy=multi-user.target

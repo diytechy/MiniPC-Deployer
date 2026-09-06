@@ -361,6 +361,13 @@ KIOSK_ENV=/etc/wall-panel/kiosk.env
     echo "WALL_PORT=${WALL_PORT:-8443}"
     echo "WALL_APP_CMD=${WALL_APP_CMD:-/opt/wall-panel/app/wall-shell}"
     echo "WALL_MEDIA_CACHE=${WALL_MEDIA_CACHE:-/var/cache/wall-media}"
+    # The cursor and camera knobs (2026-09-06). Non-secret by construction, and
+    # read by wall-park-cursor.service and the panel's camera diagnostics.
+    echo "WALL_CURSOR_PARK=${WALL_CURSOR_PARK:-true}"
+    echo "WALL_CURSOR_PARK_CORNER=${WALL_CURSOR_PARK_CORNER:-bottom-right}"
+    echo "WALL_CURSOR_PARK_DELAY=${WALL_CURSOR_PARK_DELAY:-10}"
+    echo "WALL_CAMERA_ENABLED=${WALL_CAMERA_ENABLED:-false}"
+    echo "WALL_CAMERA_DEVICE=${WALL_CAMERA_DEVICE:-/dev/video0}"
 } > "$KIOSK_ENV"
 chmod 0644 "$KIOSK_ENV"
 log "kiosk: $KIOSK_ENV rendered (0644) — WALL_HOST='${WALL_HOST:-}' WALL_APP_CMD='${WALL_APP_CMD:-}'"
@@ -505,6 +512,82 @@ setup_media_cache_lv
 
 install -d -m 0755 "$WALL_MEDIA_CACHE" "$WALL_MEDIA_CACHE/music" "$WALL_MEDIA_CACHE/frame"
 log "OI-15: media cache ready at $WALL_MEDIA_CACHE (music/ + frame/)"
+# ════════════════════════════════════════════════════════════════════════════
+# THE POINTER, AND THE CAMERA (2026-09-06)
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── the arrow in the middle of the wall ─────────────────────────────────────
+# `cage` parks its own default cursor at the centre of the output and never
+# moves it, and no client can: Wayland has no pointer-warp. One synthetic
+# relative motion drives it into a corner AND hands the pointer to Chromium,
+# after which the shell's own `cursor: none` finally applies. Measured with
+# `grim -c`; see wall.env.example's WALL_CURSOR_PARK block for the whole story.
+install -d -m 0755 /usr/local/lib/wall-panel
+if [ -f "$PAYLOAD/panel-poke.py" ]; then
+    install -m 0755 "$PAYLOAD/panel-poke.py" /usr/local/lib/wall-panel/panel-poke.py
+    log "cursor: /usr/local/lib/wall-panel/panel-poke.py installed"
+else
+    warn "panel-poke.py is not on the payload — the cursor cannot be parked, and"
+    warn "verify-panel.sh loses its SPLIT screenshot (it drives the same tool)."
+fi
+
+if [ -f "$PAYLOAD/wall-park-cursor.service" ]; then
+    install -m 0644 "$PAYLOAD/wall-park-cursor.service" /etc/systemd/system/wall-park-cursor.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    case "${WALL_CURSOR_PARK:-true}" in
+        true|TRUE|yes|1)
+            enable_unit "wall-park-cursor.service enabled — the pointer is driven to the ${WALL_CURSOR_PARK_CORNER:-bottom-right} corner ${WALL_CURSOR_PARK_DELAY:-10}s after boot, which is also what lets the shell hide it"                 wall-park-cursor.service ;;
+        *)
+            systemctl disable --now wall-park-cursor.service >/dev/null 2>&1 || true
+            log "cursor: WALL_CURSOR_PARK is '${WALL_CURSOR_PARK}' — unit disabled; expect cage's arrow in the CENTRE of the wall, which the shell cannot remove" ;;
+    esac
+else
+    warn "wall-park-cursor.service is not on the payload — cage's arrow stays in the middle of the wall."
+fi
+
+# ── the camera: OFF AT THE KERNEL unless the knob says otherwise ────────────
+# WALL_CAMERA_ENABLED=false does not mean "nothing opens it". It blacklists
+# uvcvideo, so /dev/video* does not exist, nothing CAN open it, and the
+# hardware activity LED cannot come on at all. A mechanism, not a policy —
+# which is the point, because the LED is wired to the sensor's power rail and
+# is the one claim about this camera that software cannot forge.
+CAM_BLACKLIST=/etc/modprobe.d/wall-camera-off.conf
+case "${WALL_CAMERA_ENABLED:-false}" in
+    true|TRUE|yes|1)
+        if [ -f "$CAM_BLACKLIST" ]; then
+            rm -f "$CAM_BLACKLIST"
+            modprobe uvcvideo >/dev/null 2>&1 || true
+            log "camera: WALL_CAMERA_ENABLED=true — uvcvideo un-blacklisted and loaded"
+        else
+            log "camera: WALL_CAMERA_ENABLED=true — uvcvideo available at ${WALL_CAMERA_DEVICE:-/dev/video0}"
+        fi
+        if [ ! -e "${WALL_CAMERA_DEVICE:-/dev/video0}" ]; then
+            warn "camera: ${WALL_CAMERA_DEVICE:-/dev/video0} does not exist even though the camera is enabled."
+            warn "  A UVC device publishes two nodes; check which is the CAPTURE node with:"
+            warn "  python3 $PAYLOAD/panel-camera.py probe --device /dev/video1"
+        fi ;;
+    *)
+        printf '# Wall panel: WALL_CAMERA_ENABLED=false in wall.env.
+# Removing this file does NOT re-enable the camera across a firstboot run;
+# set the knob instead, or the next run puts it back.
+blacklist uvcvideo
+' > "$CAM_BLACKLIST"
+        chmod 0644 "$CAM_BLACKLIST"
+        # Unload only if nothing holds it; a busy module means something is
+        # using the camera RIGHT NOW, which is worth a loud line rather than a
+        # forced removal.
+        if lsmod 2>/dev/null | grep -q '^uvcvideo'; then
+            if modprobe -r uvcvideo >/dev/null 2>&1; then
+                log "camera: WALL_CAMERA_ENABLED=false — uvcvideo blacklisted and unloaded; /dev/video* is gone and the activity LED cannot light"
+            else
+                warn "camera: uvcvideo is blacklisted for the next boot but is IN USE now and could not be unloaded."
+                warn "  Something on this panel is holding the camera open. Find it with: fuser -v /dev/video*"
+            fi
+        else
+            log "camera: WALL_CAMERA_ENABLED=false — uvcvideo blacklisted; the camera cannot be opened"
+        fi ;;
+esac
+
 if [ -f /etc/systemd/system/wall-sync.service ]; then
     enable_unit "OI-15: wall-sync.service enabled — both media flows are mirrored once after boot" \
         wall-sync.service

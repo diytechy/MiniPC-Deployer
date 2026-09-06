@@ -216,12 +216,45 @@ if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
         if [ -f /etc/homehub-samba/drive-identity.conf ]; then
             _expect="$(awk -F'\t' -v p="$TARGET_MOUNT" '$1 == p { print $2 }' /etc/homehub-samba/drive-identity.conf)"
             if [ -n "$_expect" ] && [ -e "/dev/disk/by-id/$_expect" ]; then
-                _want="$(readlink -f "/dev/disk/by-id/$_expect" 2>/dev/null)"
+                # ACCEPT A PARTITION OF THE EXPECTED DISK, not just the disk.
+                # drive-identity.conf names the whole disk, `readlink -f` gives
+                # /dev/sdX (8:0), and what is mounted is /dev/sdX1 (8:1) — never
+                # equal, so this cried STAND-IN at the real drive on every run
+                # until 2026-09-04. Loop devices mount whole-device, which is why
+                # the loopback proving run missed it. Same fix, same reasoning,
+                # as library-backup.sh identity_note() — read the long note there
+                # for the assumed layout and why parentage is checked at all.
                 _have="$(awk -v p="$TARGET_MOUNT" '$5 == p { d = $3 } END { print d }' /proc/self/mountinfo)"
-                _wantmm=""
-                [ -n "$_want" ] && [ -r "/sys/class/block/${_want#/dev/}/dev" ] &&
-                    _wantmm="$(cat "/sys/class/block/${_want#/dev/}/dev")"
-                if [ -n "$_wantmm" ] && [ "$_wantmm" != "$_have" ]; then
+                _resolved=0
+                _match=0
+                _diskmm=""
+                _target="$(readlink -f "/dev/disk/by-id/$_expect" 2>/dev/null)"
+                if [ -n "$_target" ] && [ -r "/sys/class/block/${_target#/dev/}/dev" ]; then
+                    _diskmm="$(cat "/sys/class/block/${_target#/dev/}/dev" 2>/dev/null)"
+                fi
+                if [ -n "$_have" ] && [ -n "$_diskmm" ]; then
+                    _resolved=1
+                    if [ "$_diskmm" = "$_have" ]; then _match=1; fi
+                    if [ "$_match" = 0 ]; then
+                        for _link in "/dev/disk/by-id/$_expect"-part[0-9]*; do
+                            [ -e "$_link" ] || continue
+                            _target="$(readlink -f "$_link" 2>/dev/null)" || continue
+                            [ -n "$_target" ] || continue
+                            _dev="${_target#/dev/}"
+                            [ -r "/sys/class/block/$_dev/dev" ] || continue
+                            [ -r "/sys/class/block/$_dev/../dev" ] || continue
+                            # Parentage, not name shape: this candidate's sysfs
+                            # parent must be the expected whole disk.
+                            [ "$(cat "/sys/class/block/$_dev/../dev" 2>/dev/null)" = "$_diskmm" ] || continue
+                            _mm="$(cat "/sys/class/block/$_dev/dev" 2>/dev/null)" || continue
+                            [ -n "$_mm" ] || continue
+                            if [ "$_mm" = "$_have" ]; then _match=1; break; fi
+                        done
+                    fi
+                fi
+                # Silent unless we positively resolved a candidate and none of
+                # them is what is mounted — "cannot tell" is not "wrong drive".
+                if [ "$_resolved" = 1 ] && [ "$_match" = 0 ]; then
                     log "NOTICE: this archive is landing on a STAND-IN drive, not $_expect."
                     log "  Fine during bring-up; check backup-drive-mounted is yellow, not green."
                 fi

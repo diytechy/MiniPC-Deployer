@@ -236,18 +236,74 @@ fstab_declares() {
 # backup.sh makes at its step 0; kept here rather than pushed into the guard,
 # because the guard's --report mode posts to its OWN check id and this run must
 # not write another lane's verdict.
+#
+# A FILESYSTEM LIVES ON A PARTITION, SO THE MOUNTED DEVICE IS ALMOST NEVER THE
+# WHOLE DISK — and comparing against the whole disk alone is what made this
+# report the REAL drives as stand-ins on every run up to 2026-09-04.
+# drive-identity.conf records the whole-disk by-id name
+# ('ata-WDC_...-11BCSS0_WD-XXXX'), `readlink -f` on it resolves to /dev/sdX
+# (8:0), and what is mounted is /dev/sdX1 (8:1). Those never compare equal, so
+# the yellow was permanent and indistinguishable from a genuine substitute. The
+# 2026-08-01 "proven on real loopback devices" run passed only because loop
+# devices mount WHOLE-DEVICE, which is exactly the case the bug cannot reach.
+# A candidate is accepted on PARENTAGE, not on the shape of its name: the
+# expected whole disk resolves to one major:minor, and a '-part<N>' candidate is
+# considered only when sysfs says its parent IS that disk. Matching the name
+# alone would be a lexical prefix test — '<expected>-part*' accepts any by-id
+# entry beginning with that string — so the parent check is what actually earns
+# the word "exact" here. (Raised by the 2026-09-06 adversarial review;
+# library-guard.sh's resolve_identity() still matches on name shape alone.)
+#
+# "Cannot tell" still says NOTHING: unless at least one candidate resolved to a
+# real major:minor, this stays silent rather than crying stand-in at a drive it
+# simply failed to read.
+#
+# ASSUMED LAYOUT — the mounted filesystem is the expected disk itself or a
+# partition of it. A dm-crypt/LVM/MD layer in between resolves to a 253:x or 9:x
+# device whose sysfs parent is not the expected disk, and this would call that a
+# stand-in. Both mounts it guards are plain partitions by design (storage-map.md
+# §1), so that is a stated constraint, not a live defect; supporting a stacked
+# layout means walking the sysfs 'slaves' graph and nothing here needs it yet.
 identity_note() {
-    local mp="$1" expect want have wantmm
+    local mp="$1" expect have link target dev mm diskmm resolved=0
     [ -f "$IDENTITY_FILE" ] || return 0
     expect="$(awk -F'\t' -v p="$mp" '$1 == p { print $2 }' "$IDENTITY_FILE")"
     [ -n "$expect" ] || return 0
     [ -e "/dev/disk/by-id/$expect" ] || { printf 'the disk %s names for %s is not present' "$IDENTITY_FILE" "$mp"; return 0; }
-    want="$(readlink -f "/dev/disk/by-id/$expect" 2>/dev/null)"
     have="$(awk -v p="$mp" '$5 == p { d = $3 } END { print d }' /proc/self/mountinfo)"
-    wantmm=""
-    [ -n "$want" ] && [ -r "/sys/class/block/${want#/dev/}/dev" ] &&
-        wantmm="$(cat "/sys/class/block/${want#/dev/}/dev")"
-    if [ -n "$wantmm" ] && [ -n "$have" ] && [ "$wantmm" != "$have" ]; then
+    [ -n "$have" ] || return 0
+
+    # The expected whole disk: both the first candidate, and the anchor every
+    # partition candidate below is checked against.
+    target="$(readlink -f "/dev/disk/by-id/$expect" 2>/dev/null)" || return 0
+    [ -n "$target" ] || return 0
+    [ -r "/sys/class/block/${target#/dev/}/dev" ] || return 0
+    diskmm="$(cat "/sys/class/block/${target#/dev/}/dev" 2>/dev/null)" || return 0
+    [ -n "$diskmm" ] || return 0
+    resolved=1
+    if [ "$diskmm" = "$have" ]; then
+        return 0
+    fi
+
+    for link in "/dev/disk/by-id/$expect"-part[0-9]*; do
+        [ -e "$link" ] || continue
+        target="$(readlink -f "$link" 2>/dev/null)" || continue
+        [ -n "$target" ] || continue
+        dev="${target#/dev/}"
+        [ -r "/sys/class/block/$dev/dev" ] || continue
+        [ -r "/sys/class/block/$dev/../dev" ] || continue
+        # A partition node's sysfs parent is its whole disk. Anything whose
+        # parent is not the expected disk merely spells like it, and is skipped
+        # rather than trusted.
+        [ "$(cat "/sys/class/block/$dev/../dev" 2>/dev/null)" = "$diskmm" ] || continue
+        mm="$(cat "/sys/class/block/$dev/dev" 2>/dev/null)" || continue
+        [ -n "$mm" ] || continue
+        resolved=1
+        if [ "$mm" = "$have" ]; then
+            return 0
+        fi
+    done
+    if [ "$resolved" = 1 ]; then
         printf '%s is a STAND-IN drive, not %s' "$mp" "$expect"
     fi
 }

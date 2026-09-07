@@ -1380,6 +1380,7 @@ if [ -f /etc/homehub-samba/drive-identity.conf ]; then
 else
     log "no /etc/homehub-samba/drive-identity.conf — health checks report presence only (a stand-in drive will read as healthy)"
 fi
+install -m 0755 "$STACK_DIR/samba/backup-drive-health.sh" /usr/local/sbin/homehub-backup-drive-health
 install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.service" /etc/systemd/system/homehub-backup-drive-health.service
 install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.timer"   /etc/systemd/system/homehub-backup-drive-health.timer
 

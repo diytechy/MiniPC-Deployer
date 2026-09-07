@@ -19,16 +19,34 @@ After=network-online.target docker.service
 
 [Service]
 Type=oneshot
-# BACKUP_TARGET is config, not a constant — read it from backup.env rather than
-# hardcoding a site path into a tracked unit. No backup.env (an unprovisioned or
-# sim box) = clean no-op, same posture as backup-standby.service.
-ExecStart=/bin/sh -c '\
-set -u; \
-CFG=/etc/homehub-backup/backup.env; \
-[ -f "$CFG" ] || { echo "[backup-drive-health] no $CFG — backup not provisioned, nothing to check"; exit 0; }; \
-TARGET=$(sed -n "s/^BACKUP_TARGET=//p" "$CFG" | tail -n1 | sed "s/^\\"\\(.*\\)\\"$/\\1/" | sed "s/[[:space:]]*#.*$//"); \
-[ -n "$TARGET" ] || { echo "[backup-drive-health] BACKUP_TARGET unset in $CFG — nothing to check"; exit 0; }; \
-exec /usr/local/sbin/homehub-library-guard --report --library "$TARGET" --label backup'
+# WHICH PATH THIS CHECKS, AND WHY IT IS NO LONGER BACKUP_TARGET (2026-09-07).
+# This unit used to read BACKUP_TARGET out of backup.env. That was right while
+# BACKUP_TARGET meant "the root of the backup drive" — and wrong the moment the
+# flat layout (2026-09-01) repointed it at /srv/library/Configs, a FOLDER on the
+# LIBRARY drive. The lane then failed in two ways at once:
+#   * the guard asks whether the path it is handed is ITSELF a mountpoint, and a
+#     folder is not, so it posted RED every 10 minutes on a perfectly healthy
+#     box — for six days, while every backup ran green;
+#   * and the path it was given named the LIBRARY drive, so even taken
+#     charitably this lane had stopped watching the backup drive. The 8 TB could
+#     have dropped and nothing here would have gone red.
+# The second is the one that mattered: a health lane pointed at the wrong drive
+# is worse than no lane, because it LOOKS like coverage. So the mountpoint is
+# now its own knob instead of being inferred from a path that is free to move.
+#
+# The resolution itself lives in samba/backup-drive-health.sh rather than inline
+# here, installed as /usr/local/sbin/homehub-backup-drive-health the same way
+# library-guard.sh is. Systemd un-escapes backslashes before /bin/sh ever sees
+# an ExecStart, so the old one-liner had to double every one of them inside a
+# sed, and a wrong count failed at RUNTIME rather than at install. Out there it
+# is ordinary shell, and it can be run by hand to see what it resolves.
+#
+# Still config, not a constant — BACKUP_DRIVE_MOUNT comes from backup.env. The
+# fallback is /mnt/backup-drive (what the storage map and drive-identity.conf
+# both name) and it is LOGGED when used: an unset knob must not turn the report
+# off, because a lane that silently stops reporting is the silent-green shape
+# this unit exists to prevent.
+ExecStart=/usr/local/sbin/homehub-backup-drive-health
 Environment=LIBRARY_FEED_CHECK=backup-drive-mounted
 # A failing report must not leave the unit permanently failed and mask a later
 # recovery — the REPORT is the signal, not the exit code. (Same as the library.)

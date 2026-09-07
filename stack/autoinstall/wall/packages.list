@@ -195,3 +195,9 @@ libpango-1.0-0
 libudev1
 libxcb1
 libxkbcommon0
+
+# Optional panel sensing installation. Heavy Python packages remain a separate
+# complete hash-pinned offline wheelhouse; never downloaded during first boot.
+python3-venv
+ffmpeg
+bluez

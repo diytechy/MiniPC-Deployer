@@ -1,0 +1,30 @@
+[Unit]
+Description=Panel-local presence, attention and face verifier
+After=bluetooth.service
+
+[Service]
+Type=simple
+User=wall-sensors
+Group=wall-sensors
+SupplementaryGroups=video
+EnvironmentFile=/etc/wall-panel/kiosk.env
+EnvironmentFile=/etc/wall-panel/sensors.env
+WorkingDirectory=/opt/wall-panel/app/runtime/resources/app
+ExecStart=/opt/wall-sensors/venv/bin/python -m sensors.service --state-dir /var/lib/wall-sensors --socket /run/wall-sensors/service.sock --allowed-uid ${PANEL_SENSOR_UID}
+RuntimeDirectory=wall-sensors
+RuntimeDirectoryMode=0750
+StateDirectory=wall-sensors
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+ReadWritePaths=/var/lib/wall-sensors /run/wall-sensors
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

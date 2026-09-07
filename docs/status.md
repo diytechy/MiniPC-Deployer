@@ -8,6 +8,16 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-06 panel capabilities implementation:** Owner-approved app plan has
+opt-in deploy configuration, protected Caddy routing, offline sensor installation,
+private host config and camera-off verification changes. Defaults remain disabled;
+no live deploy or ISO build occurred. Active gate stays G1. Nine targeted tests,
+config validation, Bash parsing and G1 smoke pass; hardware/Linux/Caddy runtime
+proof remains open. [Implementation and operator handoff](panel-capabilities-implementation-2026-09-06.md).
+
+The older cold-session block below is historical; HomeHub's current operating
+brief supersedes its dated live-box state.
+
 > **RESUMING FROM A COLD SESSION? THIS BLOCK IS THE WHOLE HANDOVER (2026-08-29, evening).**
 >
 > ### 0. THE ONE THING THAT NEEDS A HUMAN

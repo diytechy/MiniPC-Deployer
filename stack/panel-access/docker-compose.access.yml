@@ -1,0 +1,35 @@
+# Explicit overlay only: docker compose -f docker-compose.yml
+#   -f panel-access/docker-compose.access.yml up ...
+# No default profile or baked-image dependency can block the core stack.
+services:
+  panel-access:
+    image: ${PANEL_ACCESS_IMAGE:-node:22-bookworm-slim}
+    container_name: panel-access
+    user: "1000:1000"
+    working_dir: /app
+    command: ["node", "gateway/server.mjs"]
+    environment:
+      PANEL_ACCESS_HOST: 0.0.0.0
+      PANEL_ACCESS_PORT: "8788"
+      PANEL_ACCESS_STATE: /state/state.json.enc
+      PANEL_ACCESS_KEY: /state/state.key
+      PANEL_FEED_TOKEN_FILE: /state/feed-token
+      PANEL_TRACKER_ORIGIN: http://tracker:8787
+      PANEL_USER_SUB: ${PANEL_USER_SUB}
+      PANEL_ACCESS_MODE: ${PANEL_ACCESS_MODE:-read-protected}
+      PANEL_IDLE_MS: ${PANEL_IDLE_MS:-120000}
+      PANEL_HARD_MS: ${PANEL_HARD_MS:-900000}
+    volumes:
+      - ./panel-access/app/gateway:/app/gateway:ro
+      - /var/lib/panel-access:/state
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

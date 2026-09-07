@@ -86,6 +86,7 @@ services:
       WALL_PORT: ${WALL_PORT}
       PANEL_IP: ${PANEL_IP}
       PANEL_USER_SUB: ${PANEL_USER_SUB}
+      PANEL_ACCESS_ENABLED: ${PANEL_ACCESS_ENABLED:-false}
       # basic_auth guards the SINGLE-USER services (Actual, dns console) only.
       # The tracker host is NOT basic_auth'd — oauth2-proxy owns its auth (D2).
       ACTUAL_BASICAUTH_USER: ${ACTUAL_BASICAUTH_USER}

@@ -366,8 +366,15 @@ KIOSK_ENV=/etc/wall-panel/kiosk.env
     echo "WALL_CURSOR_PARK=${WALL_CURSOR_PARK:-true}"
     echo "WALL_CURSOR_PARK_CORNER=${WALL_CURSOR_PARK_CORNER:-bottom-right}"
     echo "WALL_CURSOR_PARK_DELAY=${WALL_CURSOR_PARK_DELAY:-10}"
-    echo "WALL_CAMERA_ENABLED=${WALL_CAMERA_ENABLED:-false}"
+    # Publish the same canonical boolean the kernel gate accepts. The sensor
+    # process reads this file once at startup, so alternate input spellings
+    # must not leave the driver and camera owner disagreeing.
+    case "${WALL_CAMERA_ENABLED:-false}" in
+        true|TRUE|yes|1) echo "WALL_CAMERA_ENABLED=true" ;;
+        *) echo "WALL_CAMERA_ENABLED=false" ;;
+    esac
     echo "WALL_CAMERA_DEVICE=${WALL_CAMERA_DEVICE:-/dev/video0}"
+    echo "WALL_HOST_CONFIG=${WALL_HOST_CONFIG:-}"
 } > "$KIOSK_ENV"
 chmod 0644 "$KIOSK_ENV"
 log "kiosk: $KIOSK_ENV rendered (0644) — WALL_HOST='${WALL_HOST:-}' WALL_APP_CMD='${WALL_APP_CMD:-}'"
@@ -552,6 +559,10 @@ fi
 # which is the point, because the LED is wired to the sensor's power rail and
 # is the one claim about this camera that software cannot forge.
 CAM_BLACKLIST=/etc/modprobe.d/wall-camera-off.conf
+sensor_was_active=0
+if systemctl is-active --quiet wall-sensors.service 2>/dev/null; then
+    sensor_was_active=1
+fi
 case "${WALL_CAMERA_ENABLED:-false}" in
     true|TRUE|yes|1)
         if [ -f "$CAM_BLACKLIST" ]; then
@@ -576,17 +587,28 @@ blacklist uvcvideo
         # Unload only if nothing holds it; a busy module means something is
         # using the camera RIGHT NOW, which is worth a loud line rather than a
         # forced removal.
+        # Release our single camera owner before unloading. It restarts with the
+        # newly rendered hardware gate false; Bluetooth can remain available.
+        if [ "$sensor_was_active" = 1 ]; then
+            systemctl stop wall-sensors.service || fail_step "camera: could not stop wall-sensors.service"
+        fi
         if lsmod 2>/dev/null | grep -q '^uvcvideo'; then
             if modprobe -r uvcvideo >/dev/null 2>&1; then
                 log "camera: WALL_CAMERA_ENABLED=false — uvcvideo blacklisted and unloaded; /dev/video* is gone and the activity LED cannot light"
             else
-                warn "camera: uvcvideo is blacklisted for the next boot but is IN USE now and could not be unloaded."
+                fail_step "camera: requested off but NOT verified off; uvcvideo remains in use. Stop the camera consumer or reboot."
                 warn "  Something on this panel is holding the camera open. Find it with: fuser -v /dev/video*"
             fi
         else
             log "camera: WALL_CAMERA_ENABLED=false — uvcvideo blacklisted; the camera cannot be opened"
-        fi ;;
+        fi
+        ;;
 esac
+# Both directions need a fresh process: its hardware gate is fixed at startup.
+# A false-to-true change must not leave a permanently disabled camera daemon.
+if [ "$sensor_was_active" = 1 ]; then
+    systemctl restart wall-sensors.service || fail_step "camera: could not restart sensors with the updated hardware gate"
+fi
 
 if [ -f /etc/systemd/system/wall-sync.service ]; then
     enable_unit "OI-15: wall-sync.service enabled — both media flows are mirrored once after boot" \

@@ -55,7 +55,7 @@ def env_keys(env_example_text):
 
 def compose_var_refs(compose_text):
     """Every ${VAR} referenced anywhere in the compose file."""
-    return set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", compose_text))
+    return set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::[-?][^}]*)?\}", compose_text))
 
 
 def caddy_var_refs(caddy_text):
@@ -64,7 +64,7 @@ def caddy_var_refs(caddy_text):
     for line in caddy_text.splitlines():
         if line.lstrip().startswith("#"):
             continue
-        refs.update(re.findall(r"\{\$([A-Za-z_][A-Za-z0-9_]*)\}", line))
+        refs.update(re.findall(r"\{\$([A-Za-z_][A-Za-z0-9_]*)(?::[^}]*)?\}", line))
     return refs
 
 
@@ -291,6 +291,11 @@ def main():
         "autoinstall/wall/wall-wake.service",
         "autoinstall/wall/wall-sleep.sh",
         "autoinstall/wall/wall-kiosk.sh",
+        "autoinstall/wall/install-wall-capabilities.sh",
+        "autoinstall/wall/wall-sensors.service",
+        "autoinstall/wall/wall-sensors-dbus.conf",
+        "panel-access/validate-panel-access.py",
+        "panel-access/docker-compose.access.yml",
         # OI-15 — the media pull. The unit + the script + the manifest generator
         # the script invokes as its post-step (a synced cache with no manifest is
         # a panel that shows no music at all, so the generator is as load-bearing

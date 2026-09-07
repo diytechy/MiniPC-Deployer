@@ -223,6 +223,49 @@
     }
 }
 
+# SR-016 opt-in private boundary. Substitution happens before import parsing;
+# an invalid selector refuses adaptation instead of falling back to legacy.
+(wall_api_false) {
+    handle /api/* {
+        reverse_proxy tracker:8787 {
+            # +---------------------------------------------------------+
+            # | DO NOT ADD `header_up -X-Forwarded-User` HERE.          |
+            # +---------------------------------------------------------+
+            # It reads like the right thing (strip, then inject) and it is
+            # how the design brief wrote it — but Caddy applies header ops
+            # in a FIXED order regardless of the order you write them:
+            # add -> set -> DELETE -> replace. A delete of the same field
+            # therefore runs AFTER the set and erases the injected identity,
+            # the tracker sees no identity at all, and every panel request
+            # 403s. Found for real in the V1 sim, 2026-07-29 (the site failed
+            # CLOSED, which is the correct direction, but it never works).
+            #
+            # The strip is not lost: `header_up <Name> <value>` is a SET, and
+            # a set REPLACES every existing value of that field — a
+            # client-supplied X-Forwarded-User (even repeated) cannot
+            # survive it. That is a behaviour a reader cannot see, so it is
+            # asserted with a forged header in validate-sim.sh check 7 rather
+            # than trusted. X-Forwarded-Email has no injected value, so it
+            # takes the plain delete.
+            header_up -X-Forwarded-Email
+            # The panel is the Owner (D-W7: full view, no per-view filter),
+            # so panel check-offs appear as him.
+            header_up X-Forwarded-User {$PANEL_USER_SUB}
+        }
+    }
+}
+
+(wall_api_true) {
+    # The gateway owns session verification and upstream identity. This must
+    # never retain the legacy identity injection or proxy arbitrary tracker APIs.
+    handle /api/* {
+        respond "wall: legacy API disabled" 403
+    }
+    handle /v1/* {
+        reverse_proxy panel-access:8788
+    }
+}
+
 # ── {$WALL_HOST}:{$WALL_PORT} — the office-wall kiosk site (SR-016, OI-12) ─────
 # RATIFIED 2026-07-29 (the Owner; the belt-and-braces "LAN port + /32" variant).
 #
@@ -271,33 +314,7 @@
         # ---- the tracker API, same-origin (OfficeWallNaglight needs doc §3.2) --
         # NagLight sends no CORS headers, so the shell's fetch("/api/today") only
         # works if the shell and the API share an origin. This site is that origin.
-        handle /api/* {
-            reverse_proxy tracker:8787 {
-                # +---------------------------------------------------------+
-                # | DO NOT ADD `header_up -X-Forwarded-User` HERE.          |
-                # +---------------------------------------------------------+
-                # It reads like the right thing (strip, then inject) and it is
-                # how the design brief wrote it — but Caddy applies header ops
-                # in a FIXED order regardless of the order you write them:
-                # add -> set -> DELETE -> replace. A delete of the same field
-                # therefore runs AFTER the set and erases the injected identity,
-                # the tracker sees no identity at all, and every panel request
-                # 403s. Found for real in the V1 sim, 2026-07-29 (the site failed
-                # CLOSED, which is the correct direction, but it never works).
-                #
-                # The strip is not lost: `header_up <Name> <value>` is a SET, and
-                # a set REPLACES every existing value of that field — a
-                # client-supplied X-Forwarded-User (even repeated) cannot
-                # survive it. That is a behaviour a reader cannot see, so it is
-                # asserted with a forged header in validate-sim.sh check 7 rather
-                # than trusted. X-Forwarded-Email has no injected value, so it
-                # takes the plain delete.
-                header_up -X-Forwarded-Email
-                # The panel is the Owner (D-W7: full view, no per-view filter),
-                # so panel check-offs appear as him.
-                header_up X-Forwarded-User {$PANEL_USER_SUB}
-            }
-        }
+        import wall_api_{$PANEL_ACCESS_ENABLED:false}
 
         # ---- the shell's static build ------------------------------------------
         # Payload dir the IMAGE populates from the OfficeWallNaglight built

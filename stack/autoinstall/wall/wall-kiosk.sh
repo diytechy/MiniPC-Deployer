@@ -137,6 +137,12 @@ journal_sink() {
 # (NagLight sends no CORS headers). The app reads this as PANEL_URL.
 export PANEL_URL="https://${WALL_HOST}:${WALL_PORT}/"
 export PANEL_KIOSK=1
+# Only the path is public. Electron reads the separate 0600 private config.
+if [ -n "${WALL_HOST_CONFIG:-}" ]; then
+    export PANEL_HOST_CONFIG="$WALL_HOST_CONFIG"
+else
+    unset PANEL_HOST_CONFIG
+fi
 log "config from: $KIOSK_ENV_SOURCE"
 log "PANEL_URL=$PANEL_URL"
 case "${WALL_HOST:-}" in

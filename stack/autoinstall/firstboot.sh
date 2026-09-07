@@ -592,6 +592,23 @@ else
     log "  hub would render nothing, so the A19 gate needs an image built WITH it."
 fi
 
+# Stage the coherent private gateway outside Caddy's public document root.
+# Installing files does not enable PANEL_ACCESS_ENABLED or its compose overlay.
+_wall_gateway=""
+shopt -s nullglob
+for cand in /opt/homehub/wall-gateway "$STACK_DIR/wall-gateway" /cdrom/deploy-payload/wall-gateway; do
+    _gateway_candidates=("$cand"/officewall-gateway-*.tar.gz)
+    if [ "${#_gateway_candidates[@]}" -gt 1 ]; then
+        log "ERROR: ambiguous private gateway payload"; exit 1
+    fi
+    if [ "${#_gateway_candidates[@]}" -eq 1 ]; then _wall_gateway="${_gateway_candidates[0]}"; break; fi
+done
+shopt -u nullglob
+if [ -n "$_wall_gateway" ]; then
+    python3 "$STACK_DIR/panel-access/install-gateway.py" "$_wall_gateway" \
+        "$STACK_DIR/wall-shell/build-info.json" "$STACK_DIR/panel-access/app" || exit 1
+fi
+
 # ── 3e. the kiosk site's RUNTIME CONFIG (config.json) — AFTER the untar ───────
 # The shell fetches `./config.json` RELATIVE TO ITS OWN ORIGIN (js/config.js
 # loadConfig), and that origin is this hub: Caddy's {$WALL_HOST}:{$WALL_PORT}

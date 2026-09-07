@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Cancel buffered gestures before suspend; restart with fresh learning afterward.
+# Implements: SR-017. Installed as a system-sleep hook by firstboot.
+set -eu
+case "${1:-}" in
+    pre) systemctl stop wall-touch-filter.service ;;
+    post) if [ -f /etc/wall-panel/touch-filter.enabled ]; then
+        systemctl start --no-block wall-touch-filter.service
+    fi ;;
+esac

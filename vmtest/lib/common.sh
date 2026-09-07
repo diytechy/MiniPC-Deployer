@@ -1906,6 +1906,8 @@ assert_wall_artifact_contract() {
     listing="$probe/tar-listing.txt"
     mkdir -p "$probe"
     tar -tzvf "$tarball" > "$listing" || die "cannot read $tarball — is it a complete gzip?"
+    python3 "$repo_root/scripts/assert_wall_capabilities.py" --shell "$tarball" || \
+        die "Wall shell is missing the required release capabilities. Rebuild all OfficeWall artifacts."
 
     grep -qE '^-rwxr-xr-x .* app/wall-shell$' "$listing" || \
         die "$(basename "$tarball") has no executable app/wall-shell." \
@@ -2100,6 +2102,7 @@ stage_wall_shell_into_payload() {
     assert_wall_artifact_contract "$repo_root" "$tarball" "$probe"
     assert_electron_runtime_deps "$repo_root" "$tarball" "$probe"
     assert_payload_stamps_agree "$dist_dir" shell "$(artifact_sha7 "$tarball")"
+    assert_coherent_wall_release "$repo_root" "$dist_dir"
 
     mkdir -p "$dest"
     # hardlink when the filesystem allows (saves ~110MB of C: — OI-6); else copy.
@@ -2163,12 +2166,30 @@ stage_wall_site_into_payload() {
             "nothing failing loudly anywhere. Rebuild it; do not repack by hand."
 
     assert_payload_stamps_agree "$dist_dir" site "$(artifact_sha7 "$tarball")"
+    assert_coherent_wall_release "$repo_root" "$dist_dir"
 
     mkdir -p "$dest"
     cp -f "$tarball" "$dest/"
     [ -f "$dist_dir/build-info.json" ] && cp -f "$dist_dir/build-info.json" "$dest/build-info.json"
     log "deploy-payload/wall-site/ = $(basename "$tarball") ($(( $(stat -c%s "$tarball") / 1024 )) KB, site/index.html present)"
     log "  -> lands at /opt/homehub/wall-site/; firstboot.sh unpacks it into stack/wall-shell/."
+    local gateway; gateway="$(find_wall_artifact "$dist_dir" 'officewall-gateway-*.tar.gz')"
+    mkdir -p "$out_dir/iso-root/deploy-payload/wall-gateway"
+    cp -f "$gateway" "$out_dir/iso-root/deploy-payload/wall-gateway/"
+    log "  matching private gateway staged; the access overlay remains opt-in."
+}
+
+# Every supplied wall release is three coherent payloads. Public builds with no
+# sibling remain supported, but a partial/stale release must never look complete.
+assert_coherent_wall_release() {
+    local repo_root="$1" dist_dir="$2" shell site gateway
+    shell="$(find_wall_artifact "$dist_dir" 'officewall-shell-*-linux-x64.tar.gz')"
+    site="$(find_wall_artifact "$dist_dir" 'officewall-site-*.tar.gz')"
+    gateway="$(find_wall_artifact "$dist_dir" 'officewall-gateway-*.tar.gz')"
+    [ -n "$shell" ] && [ -n "$site" ] && [ -n "$gateway" ] || \
+        die "Incomplete wall release: shell, site and private gateway are all required. Rebuild with npm run dist."
+    python3 "$repo_root/scripts/assert_wall_capabilities.py" --shell "$shell" --site "$site" --gateway "$gateway" || \
+        die "Wall release layout/capabilities/full source stamps do not agree."
 }
 
 # render_wall_seed_tree REPO_ROOT OUT_DIR CALLER_NAME

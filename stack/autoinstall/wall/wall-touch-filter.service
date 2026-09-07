@@ -1,0 +1,31 @@
+[Unit]
+Description=Panel touchscreen fault filter (explicit shadow/filter mode)
+After=systemd-udev-settle.service
+Before=getty@tty1.service
+ConditionPathExists=/etc/wall-panel/touch-filter.enabled
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+WorkingDirectory=/opt/wall-panel/app/runtime/resources/app
+ExecStart=/usr/bin/python3 -m touchfilter.daemon --config /etc/wall-panel/touch-filter.json
+User=root
+Group=root
+RuntimeDirectory=wall-touch-filter
+RuntimeDirectoryMode=0755
+UMask=0022
+Restart=always
+RestartSec=2
+WatchdogSec=10
+TimeoutStartSec=15
+TimeoutStopSec=3
+KillMode=control-group
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/wall-touch-filter
+
+[Install]
+WantedBy=multi-user.target

@@ -755,6 +755,11 @@ if command -v getent >/dev/null 2>&1; then
     fi
 fi
 
+# Touch fault filter is opt-in; OFF also restores the raw-input recovery path.
+if ! WALL_ENV_FILE="$ENV_FILE" bash "$PAYLOAD/configure-touch-filter.sh"; then
+    fail_step "Touch filter configuration failed; inspect wall-touch-filter.service."
+fi
+
 # ── 9. done — but only if it IS done ─────────────────────────────────────────
 # The marker means "this panel is provisioned", and units, scripts and humans all
 # read it that way. It is therefore written ONLY when every step that could fail

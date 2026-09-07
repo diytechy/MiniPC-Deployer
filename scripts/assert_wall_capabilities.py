@@ -29,6 +29,23 @@ REQUIRED = {
         "touchfilter/daemon.py",
         "touchfilter/replay.py",
     ],
+    "ambient-drill-v1": ["js/views/nag.js", "js/nag-summary.js", "css/shell.css"],
+    "virtual-input-v1": [
+        "js/pin-keypad.js",
+        "js/text-keyboard.js",
+        "electron/pandora-keyboard-bridge.cjs",
+        "electron/preload.cjs",
+    ],
+    "tracker-corrections-v2": [
+        "js/tracker.js",
+        "js/tracker-coordinator.js",
+        "js/views/nag.js",
+    ],
+    "local-visualizer-v1": [
+        "js/views/visualizer.js",
+        "js/visualizer-core.js",
+        "js/visualizer-preference.js",
+    ],
 }
 
 

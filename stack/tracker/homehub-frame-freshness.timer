@@ -1,0 +1,29 @@
+[Unit]
+Description=Check picture-frame video freshness hourly
+Documentation=file:/opt/homehub/stack/tracker/frame-freshness.sh
+
+[Timer]
+# ONE UNIT, PROBE AND ASSESSMENT TOGETHER — the Owner's ruling (plan §7.4). The
+# alternative was a prober and a feeder on separate schedules, which would have
+# re-created the ordering problem the two backup timers have to solve with a
+# shared OnCalendar and an explicit After=. One unit has no ordering problem to
+# solve.
+OnBootSec=5min
+# HOURLY, which the Owner ruled sufficient. It is far more often than the daily
+# posting obligation needs — a day would have to lose 24 consecutive runs to go
+# silent and slide toward the staleness scan — and that headroom is the point,
+# because mini-serv is asleep for most of them and each run is a chance to
+# refresh the cached probe answer while it happens to be up.
+OnUnitActiveSec=1h
+# Jitter is safe here and wanted: nothing downstream depends on this landing in
+# the same transaction as another unit (contrast the two backup timers, whose
+# RandomizedDelaySec=0 is load-bearing for their After= ordering).
+RandomizedDelaySec=5min
+# A missed run does NOT need to fire on the next boot. The answer this unit
+# produces is a 7-day-tolerance freshness comparison; catching up on a window
+# the box slept through would tell nobody anything new, and the next scheduled
+# run is at most an hour away.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

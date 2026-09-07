@@ -1,0 +1,55 @@
+[Unit]
+# "Are the picture-frame videos still current with the media that feeds them?"
+#
+# NOT "did the generator run" — there is no generator on this box to observe.
+# The lane asserts freshness of the RESULT: the newest file in mini-serv's
+# PictureFrameVideos share, against the newest media under the library's Shared
+# tree. More than 7 days apart means the source moved on and the videos did not
+# follow. Spec and rulings: HomeHub\VIDEO_FRAME_GEN_CHECK_PLAN.md.
+#
+# GREEN OR YELLOW, NEVER RED. The Owner ruled this lane may report yellow at
+# worst. That obligation is why the script MUST post on every run: an
+# `automated` item with no report for the day falls through NagLight's staleness
+# scan, which saturates at 3+ misses = red. Silence here would BE red, three
+# days later — so every failure path inside the script ends in yellow with a
+# reason instead.
+#
+# IT NEVER WAKES MINI-SERV. Reachability is a plain TCP connect with a short
+# timeout; a refused connect is a skip that leaves the last date-stamped answer
+# standing (that is what the 7-day probe tolerance is for). The backup's
+# BACKUP_WAKE_* path is deliberately NOT reused. Since the box is allowed to
+# sleep, "could not reach it" is the common case, not an exception.
+#
+# IT NEVER WAKES THE LIBRARY DRIVE EITHER. The "when did media last change" half
+# reads the manifest FileBackup already writes to the system disk each night, so
+# it is one pass over a local CSV rather than a walk of the parked 4 TB platter
+# (WI-10.10, the same contract the drive guards keep).
+Description=HomeHub picture-frame video freshness report
+Documentation=file:/opt/homehub/stack/tracker/frame-freshness.sh
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/homehub-frame-freshness --report
+# 0 green, 2 yellow — BOTH are a successful run. The report is the signal, not
+# the band, and a unit parked in `failed` over an ordinary yellow would mask the
+# next recovery. Same contract as homehub-library-health.service.
+#
+# EXIT 1 IS DIFFERENT AND IS DELIBERATELY *NOT* LISTED HERE. It means the
+# verdict was computed but could NOT be reported — tracker down, feed
+# misconfigured, HTTP 400. That is the one failure this lane cannot express in
+# its own band (it has no red), so it is expressed as a FAILED UNIT instead:
+# visible in `systemctl --failed` and in the journal. Adding 1 to this line
+# would restore exactly the hole a 2026-09-07 review found — an hourly 400
+# looking like an hourly success while NagLight's staleness fuse burns down
+# toward red.
+SuccessExitStatus=0 2
+# A CIFS operation against a box that fell asleep mid-read can hang. Bound the
+# run so systemd reclaims it, and give the script's own TERM handler a moment to
+# unmount before the kill — a leaked mount pins a machine that wants to sleep.
+# Comfortably above the script's own internal timeouts (probe 5s, mount 25s,
+# walk 60s) so the script's specific error message wins over a blunt kill.
+TimeoutStartSec=180
+TimeoutStopSec=30
+KillMode=mixed
+# The mount and umount need root; nothing else here does.

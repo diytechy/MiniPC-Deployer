@@ -1418,6 +1418,9 @@ install -d -m 0755 /var/lib/homehub
 install -m 0755 "$STACK_DIR/tracker/tracker-defs-guard.sh" /usr/local/sbin/homehub-tracker-defs-guard
 install -m 0644 "$STACK_DIR/tracker/homehub-tracker-defs-health.service" /etc/systemd/system/homehub-tracker-defs-health.service
 install -m 0644 "$STACK_DIR/tracker/homehub-tracker-defs-health.timer"   /etc/systemd/system/homehub-tracker-defs-health.timer
+install -m 0755 "$STACK_DIR/tracker/frame-freshness.sh" /usr/local/sbin/homehub-frame-freshness
+install -m 0644 "$STACK_DIR/tracker/homehub-frame-freshness.service" /etc/systemd/system/homehub-frame-freshness.service
+install -m 0644 "$STACK_DIR/tracker/homehub-frame-freshness.timer"   /etc/systemd/system/homehub-frame-freshness.timer
 
 # -- fail2ban for the two password-guarded Caddy sites (the Owner, 2026-08-29) --
 #
@@ -1527,6 +1530,14 @@ systemctl enable --now homehub-library-health.timer >/dev/null 2>&1 || \
 #     sudo homehub-tracker-defs-guard --baseline
 systemctl enable --now homehub-tracker-defs-health.timer >/dev/null 2>&1 || \
     log "WARN: could not enable homehub-tracker-defs-health.timer — a tracker whose definitions were deleted would render green with score 0 and nothing would say so"
+
+# The frame-freshness lane (VIDEO_FRAME_GEN_CHECK_PLAN.md). A failure to enable
+# is a WARN rather than fatal, but it is not harmless: the item is `automated`,
+# so a lane that stops being reported goes stale and NagLight escalates it to
+# RED after three days. The feeder exists precisely to keep that from happening
+# silently, and an un-enabled timer is the one way it can.
+systemctl enable --now homehub-frame-freshness.timer >/dev/null 2>&1 || \
+    log "WARN: could not enable homehub-frame-freshness.timer — the picture-frame videos could fall behind their source media with nothing saying so"
 
 # ── 6. make the host itself use local DNS, and give Technitium the whole port ─
 #

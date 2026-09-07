@@ -199,6 +199,9 @@ libxkbcommon0
 # Optional panel sensing installation. Heavy Python packages remain a separate
 # complete hash-pinned offline wheelhouse; never downloaded during first boot.
 python3-venv
+# python3-venv upgrades the base Python stack. Keep Vim's matching runtime in
+# the closure so apt's no-removal proof preserves vim and ubuntu-server.
+libpython3.12t64
 python3-evdev           # whole-gesture touchscreen filter; baked for offline installs
 ffmpeg
 bluez

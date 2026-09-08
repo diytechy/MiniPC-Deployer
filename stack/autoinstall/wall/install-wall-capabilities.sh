@@ -28,6 +28,7 @@ try:
     data = json.load(open(sys.argv[1]))
     url = urlsplit(data['gatewayUrl'])
     if data.get('enabled') is not True or not data.get('deviceId') or not data.get('deviceCredential'): raise ValueError()
+    if data.get('accessMode') not in {'read-protected', 'write-only'}: raise ValueError()
     if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment: raise ValueError()
     if data.get('sensorSocket') != '/run/wall-sensors/service.sock': raise ValueError()
 except (ValueError, KeyError, OSError, TypeError):

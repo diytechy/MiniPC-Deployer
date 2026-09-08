@@ -104,8 +104,12 @@ available without adding an automatic enabled service.
 
 Prepare a private 0600 host JSON using the app's broker schema, including
 `enabled:true`, the HTTPS gateway origin, its registered device ID/credential,
-and `sensorSocket:"/run/wall-sensors/service.sock"`. Transfer it through the
-private administration path, then run on the panel:
+`accessMode` set to the same `read-protected` or `write-only` value as
+`PANEL_ACCESS_MODE`, and `sensorSocket:"/run/wall-sensors/service.sock"`.
+The host-side mode is used only to keep public music visible during a cold-start
+gateway outage; tracker reads stay read-protected until the gateway confirms its
+policy. The installer rejects an absent or unknown value rather than guessing.
+Transfer it through the private administration path, then run on the panel:
 
 ```sh
 sudo bash /opt/wall-panel/stack/autoinstall/wall/install-wall-capabilities.sh \

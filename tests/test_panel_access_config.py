@@ -42,6 +42,7 @@ def test_sr017_installer_is_offline_and_separates_sensor_state_from_broker():
     installer = (root / "autoinstall/wall/install-wall-capabilities.sh").read_text()
     assert "--no-index" in installer and "--require-hashes" in installer
     assert "-o panel -g panel -m 0600" in installer
+    assert "data.get('accessMode') not in {'read-protected', 'write-only'}" in installer
     unit = (root / "autoinstall/wall/wall-sensors.service").read_text()
     assert "User=wall-sensors" in unit and "StateDirectoryMode=0700" in unit
     assert "RuntimeDirectoryMode=0750" in unit and "--allowed-uid ${PANEL_SENSOR_UID}" in unit

@@ -36,6 +36,33 @@
     # every site at once, which is the failure this file already documents.
     order rate_limit before basic_auth
 
+    # NO HTTP/3, and this is a correctness fix rather than a preference.
+    #
+    # Caddy serves h3 by default and advertises it on EVERY response:
+    #   alt-svc: h3=":443"; ma=2592000
+    # That header is a 30-day promise that this box answers QUIC on UDP 443.
+    # docker-compose publishes `443:443` — TCP ONLY — so nothing on the host has
+    # ever listened on UDP 443 and the promise was false the moment it shipped.
+    #
+    # WHAT IT LOOKS LIKE, because the symptom points nowhere near the cause. A
+    # browser believes the header, caches it, and on its NEXT visit tries QUIC
+    # first: the packets go to a port nobody holds, and the tab sits until it
+    # gives up with ERR_CONNECTION_TIMED_OUT. curl is unaffected (HTTP/1.1, no
+    # alt-svc cache), so the box tests healthy from every script while the Owner
+    # cannot open the site — measured 2026-09-08 on tracker.<domain>, where curl
+    # returned 302 from the same PC whose Edge timed out. Every host on this
+    # Caddy shares the fault, not just the tracker.
+    #
+    # WHY DISABLE RATHER THAN PUBLISH UDP 443. Publishing it fixes the LAN only.
+    # The alt-svc header goes to WAN clients too, and the router forwards no UDP
+    # — so an external browser would keep timing out for another 30 days. Making
+    # the advertisement FALSE everywhere is the fix that matches reality on both
+    # sides of the router. If h3 is wanted later it needs BOTH a `443:443/udp`
+    # publish and a router UDP forward, and then this line comes out.
+    servers {
+        protocols h1 h2
+    }
+
     # ACME account email for public certs (Let's Encrypt / ZeroSSL).
     email {$ACME_EMAIL}
 

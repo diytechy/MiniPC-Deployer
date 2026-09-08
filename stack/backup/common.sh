@@ -759,7 +759,12 @@ post_file_share_backup_state() {
         local whdr=(--header "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && whdr+=(--header "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && whdr+=(--header "X-Forwarded-User: ${NAGLIGHT_USER}")
-        if docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -O /dev/null "${whdr[@]}" \
+        # BOUNDED. Without a deadline a stalled tracker holds this call — and with
+        # it the backup lock its caller may be holding — open indefinitely, which
+        # under TimeoutStartSec=infinity means forever. This is a TRANSPORT
+        # deadline and expires no state: it never shortens a legitimately long
+        # run, it only stops one HTTP request from hanging the box.
+        if docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -O /dev/null -T 10 --tries=1 "${whdr[@]}" \
                 --post-data "$body" "$url" 2>/dev/null; then
             code=200                       # wget: exit 0 == HTTP 2xx. NOTE: a 4xx
                                            # lands in the else below as a bare
@@ -778,7 +783,7 @@ post_file_share_backup_state() {
         # the fallback APPENDED to it. The logged "HTTP 000000" then looked like
         # a transport oddity rather than "nothing answered" — a diagnostic number
         # that pointed away from the fault. Take curl's status separately.
-        if ! code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$url" 2>/dev/null)"; then
+        if ! code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 -X POST "${hdr[@]}" -d "$body" "$url" 2>/dev/null)"; then
             code=""
         fi
         [ -n "$code" ] || code=000

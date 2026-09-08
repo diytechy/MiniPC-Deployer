@@ -64,6 +64,15 @@ exit 1
 EOF
 cat >"$TMP/bin/docker" <<'EOF'
 #!/usr/bin/env bash
+# The reconciler asks the DAEMON whether a FileBackup container is still up,
+# because the flock cannot answer that: `compose run` containers are daemon-owned
+# and outlive a SIGKILLed client. MOCK_FB_RUNNING models "still up";
+# MOCK_DOCKER_PS_RC models "cannot tell".
+if [ "${1:-}" = ps ]; then
+    [ "${MOCK_DOCKER_PS_RC:-0}" = 0 ] || exit "${MOCK_DOCKER_PS_RC}"
+    [ -n "${MOCK_FB_RUNNING:-}" ] && printf '%s\n' "$MOCK_FB_RUNNING"
+    exit 0
+fi
 last=""; for arg in "$@"; do last="$arg"; done
 printf '%s\n' "docker:$last" >>"$EVENTS"
 case "$last" in
@@ -157,6 +166,7 @@ run_reconcile() {
     : >"$TMP/$name.capture"; : >"$TMP/$name.events"
     PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
         MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src" LIBRARY_BACKUP_LOCK="$lock" \
+        MOCK_FB_RUNNING="${MOCK_FB_RUNNING:-}" MOCK_DOCKER_PS_RC="${MOCK_DOCKER_PS_RC:-0}" \
         bash "$WRAPPER" --config "$TMP/good.env" --reconcile-run-state >"$TMP/$name.out" 2>&1
     RUN_RC=$?
 }
@@ -256,6 +266,76 @@ if [ "$RUN_RC" != 0 ] && [ "$(post_count "$TMP/lock-held.capture")" = 0 ]; then
     pass "SR-018 a start refused by a held lock posts nothing"
 else
     fail "SR-018 lock-held start rc=$RUN_RC posts=$(post_count "$TMP/lock-held.capture")"
+fi
+
+# ADVERSARIAL REVIEW, 2026-09-08 — one case per accepted finding.
+
+# RESTORE THE LOCK MOCK. The held-lock cases above replaced it with a permanent
+# failure, and everything below needs to actually acquire the lock; without this
+# they all fail as "another backup is already running", which looks like a
+# product defect and is purely harness state.
+cat >"$TMP/bin/flock" <<'FLOCKEOF'
+#!/usr/bin/env bash
+exit 0
+FLOCKEOF
+chmod +x "$TMP/bin/flock"
+
+# F1: the flock does NOT prove FileBackup stopped. `compose run` containers are
+# daemon-owned, so a SIGKILLed wrapper releases the lock while the container
+# keeps writing. Reconcile must fail CLOSED on both "still up" and "cannot tell".
+MOCK_FB_RUNNING=abc123 run_reconcile reconcile-container "$TMP/reconcile-container.lock"
+if [ "$RUN_RC" = 0 ] && [ "$(post_count "$TMP/reconcile-container.capture")" = 0 ]; then
+    pass "F1 reconcile leaves the phase alone while a FileBackup container is still running"
+else
+    fail "F1 reconcile withdrew a phase with a live container: posts=$(post_count "$TMP/reconcile-container.capture")"
+fi
+
+MOCK_DOCKER_PS_RC=1 run_reconcile reconcile-unknown "$TMP/reconcile-unknown.lock"
+if [ "$RUN_RC" = 0 ] && [ "$(post_count "$TMP/reconcile-unknown.capture")" = 0 ]; then
+    pass "F1 reconcile fails closed when it cannot tell whether a container is running"
+else
+    fail "F1 reconcile withdrew a phase without proof: posts=$(post_count "$TMP/reconcile-unknown.capture")"
+fi
+
+# F5: a preflight is a diagnostic, not an attempt. It must claim no phase at all,
+# or a SUCCESSFUL preflight strands `starting` on the wall with nothing to
+# withdraw it.
+: >"$TMP/preflight-only.capture"; : >"$TMP/preflight-only.events"
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/preflight-only.capture"     EVENTS="$TMP/preflight-only.events" MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/preflight-only.lock"     bash "$WRAPPER" --config "$TMP/good.env" --preflight-only >"$TMP/preflight-only.out" 2>&1
+PF_RC=$?
+if [ "$PF_RC" = 0 ] && [ "$(post_count "$TMP/preflight-only.capture")" = 0 ]; then
+    pass "F5 a successful preflight-only run claims no phase and strands nothing"
+else
+    fail "F5 preflight-only rc=$PF_RC posts=$(post_count "$TMP/preflight-only.capture") phases='$(phases "$TMP/preflight-only.capture")'"
+fi
+
+# F2: FILE_SHARE_BACKUP_STATE_LAST_CODE is ONE global, overwritten by every post.
+# The never-silent-green check must judge the lastSuccess post, not the idle that
+# follows it. Here lastSuccess fails and the later idle succeeds.
+cat >"$TMP/bin/curl" <<'CURLEOF'
+#!/usr/bin/env bash
+body=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = -d ]; then body="$2"; shift 2; continue; fi
+    shift
+done
+printf '%s
+' "$body" >>"$CAPTURE"
+printf 'state
+' >>"$EVENTS"
+case "$body" in
+    *lastSuccess*) printf '%s' "${MOCK_SUCCESS_CODE:-200}" ;;
+    *)             printf '%s' "${MOCK_HTTP_CODE:-200}" ;;
+esac
+CURLEOF
+chmod +x "$TMP/bin/curl"
+: >"$TMP/split.capture"; : >"$TMP/split.events"
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/split.capture"     EVENTS="$TMP/split.events" MOCK_BACKUP_RC=0 MOCK_VERIFY_RC=0     MOCK_HTTP_CODE=200 MOCK_SUCCESS_CODE=500 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/split.lock"     bash "$WRAPPER" --config "$TMP/good.env" --verify shallow >"$TMP/split.out" 2>&1
+SPLIT_RC=$?
+if [ "$SPLIT_RC" != 0 ] && grep -q FATAL "$TMP/split.out"; then
+    pass "F2 a failed lastSuccess still fails the unit even when the later idle post succeeds"
+else
+    fail "F2 a failed lastSuccess was masked by the following idle post (rc=$SPLIT_RC)"
 fi
 
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

@@ -181,7 +181,18 @@ for _t in flock findmnt; do
                "the wrong fault entirely.  Fix:  apt-get install util-linux"
 done
 exec 9>"$LOCK_FILE" || die "cannot open the lock file $LOCK_FILE"
-if ! flock -n 9; then
+# A BOUNDED WAIT, NOT `-n`, for a real run. The ten-minute reconciler takes this
+# same lock for the length of one HTTP post, and with `-n` a nightly backup that
+# happened to land in that window exited 1 and SKIPPED THE NIGHT — a missed
+# backup caused entirely by the staleness check meant to protect it. Waiting
+# costs at most one bounded transport deadline; a genuinely held lock (a run
+# that takes days) still refuses below, exactly as before.
+#
+# Reconcile keeps `-n`: for it a held lock is the answer, not something to wait
+# for.
+FLOCK_WAIT=(-w 30)
+[ "$RECONCILE_RUN_STATE" = 1 ] && FLOCK_WAIT=(-n)
+if ! flock "${FLOCK_WAIT[@]}" 9; then
     # A held lock is the ANSWER in reconcile mode, not a refusal: a run is in
     # progress, so its phase is current and must be left exactly as it is. Quiet
     # and zero, because this path runs on a short timer and the refusal text
@@ -200,7 +211,12 @@ if ! flock -n 9; then
     exit 1
 fi
 log "== library backup: lock acquired ($LOCK_FILE) =="
-RUN_STATE_OWNED=1
+# A --preflight-only run is a DIAGNOSTIC, not an attempt to back anything up, and
+# it exits successfully without reaching any of the phase writes below. Claiming
+# a phase for it would strand `starting` on the wall until something else
+# reconciled it. Owning no phase is also why report_failure's withdrawal is a
+# no-op on that path: there is nothing to withdraw.
+[ "$PREFLIGHT_ONLY" = 1 ] || RUN_STATE_OWNED=1
 
 # --reconcile-run-state: we just proved no run is in progress by TAKING the
 # lock, so any stored `running` phase is a leftover from a run that died without
@@ -213,8 +229,28 @@ RUN_STATE_OWNED=1
 # safe to run on a short timer.
 if [ "$RECONCILE_RUN_STATE" = 1 ]; then
     trap - ERR
+    # THE LOCK ALONE IS NOT PROOF. fb_run starts the FileBackup work through
+    # `docker compose run`, and that container is owned by the DAEMON: fd 9 is
+    # inherited by the compose client, never by the container. A wrapper killed
+    # with SIGKILL or by the OOM killer therefore releases this lock while
+    # FileBackup is still writing to /state and /backup. Withdrawing the phase
+    # on the strength of the lock would then report a live backup as finished.
+    #
+    # So ask the daemon as well, and FAIL CLOSED: if the container is up, or if
+    # we cannot tell, leave the phase exactly as it is. A phase left standing is
+    # repaired by the next cycle; one withdrawn wrongly says a running backup
+    # ended, which is the lie this whole lane exists to prevent.
+    fb_containers=""
+    if ! fb_containers="$(docker ps --filter "label=com.docker.compose.service=filebackup" --format '{{.ID}}' 2>/dev/null)"; then
+        log "run-state: cannot ask docker whether FileBackup is running — leaving the phase alone"
+        exit 0
+    fi
+    if [ -n "$fb_containers" ]; then
+        log "run-state: a FileBackup container is still running ($fb_containers) — leaving the phase alone"
+        exit 0
+    fi
     run_state idle
-    log "run-state reconciled: no backup is in progress"
+    log "run-state reconciled: no lock held and no FileBackup container running"
     exit 0
 fi
 
@@ -687,6 +723,13 @@ SUMMARY="exit=$BACKUP_RC snapshot=$SNAPSHOT_MADE drive=$FILL_PCT full; verify=$V
 [ -n "$DEGRADED" ] && SUMMARY="$SUMMARY; DEGRADED: $DEGRADED"
 SUCCESS_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 post_file_share_backup_state lastSuccess "$SUCCESS_AT"
+# CAPTURE IT NOW. FILE_SHARE_BACKUP_STATE_LAST_CODE is one global, overwritten by
+# every post, and the never-silent-green check below is about THIS post. Reading
+# the global after the idle post below inverted the contract both ways: a failed
+# lastSuccess followed by a successful idle exited 0 with the tracker never told
+# a backup happened, and a successful lastSuccess followed by a failed idle
+# reported the whole run failed after freshness was already durable.
+SUCCESS_POST_CODE="$FILE_SHARE_BACKUP_STATE_LAST_CODE"
 # Withdraw the in-progress claim only AFTER freshness is recorded. In this order
 # the lane can never show "idle at the old age" for even one poll: the success
 # lands first, so the phase clearing reveals green rather than yesterday.
@@ -695,12 +738,12 @@ run_state idle
 # the hub a configured endpoint that rejects or drops the update fails the unit:
 # otherwise the wall cannot distinguish a completed backup from one that never
 # ran, even though the archive itself remains valid.
-if [ "$FILE_SHARE_BACKUP_STATE_LAST_CODE" = "skipped" ]; then
+if [ "$SUCCESS_POST_CODE" = "skipped" ]; then
     log "NOTE: no FILE_SHARE_BACKUP_STATE_URL in $CONFIG, so this verified success advanced no panel state."
     log "  Correct for a sim box; on the hub it means the combined item cannot age correctly."
     log "  Summary that went nowhere: $SUMMARY"
-elif [ "$FILE_SHARE_BACKUP_STATE_LAST_CODE" != "200" ]; then
-    log "FATAL: the library backup itself succeeded, but its verified-success update did not land (HTTP $FILE_SHARE_BACKUP_STATE_LAST_CODE)."
+elif [ "$SUCCESS_POST_CODE" != "200" ]; then
+    log "FATAL: the library backup itself succeeded, but its verified-success update did not land (HTTP $SUCCESS_POST_CODE)."
     log "  Exiting non-zero so this unit reports FAILED. A backup nobody was told about is"
     log "  not a backup that reported — from outside this box it looks exactly like a run"
     log "  that never happened, and that is the one thing this contract forbids."

@@ -1370,27 +1370,19 @@ render_seed_tree() {
     render_sim_gate_backup_env "$payload_dir" "$sim_env" "$caller"
 }
 
-# render_sim_gate_backup_env PAYLOAD_DIR SIM_ENV CALLER — make the drive lanes REPORT.
+# render_sim_gate_backup_env PAYLOAD_DIR SIM_ENV CALLER — make the unified
+# file-share/whole-library-backup item report its independent health state.
 #
-# A19's whole assertion is that `library-mounted` and `backup-drive-mounted`
-# report RED and that the red is visible on the panel. Booting it on 2026-08-04
-# showed neither lane reporting anything at all, and both for the same reason:
-# `library-guard.sh --report` takes its feed configuration from
-# /etc/homehub-backup/backup.env, and a SIM build installs none.
+# SN-014's assertion is that a missing `/srv/library` reports a red combined
+# state. The monitor takes its endpoint configuration from backup.env, which a
+# SIM build does not otherwise receive.
 #
-#   library lane:  detects correctly, then logs
-#                  "NAGLIGHT_FEED_URL unset — journal only (red; check id would
-#                  be 'library-mounted')" and posts nothing.
-#   backup lane:   exits before it checks — "no backup.env, nothing to check".
-#
-# NEITHER IS A PRODUCT DEFECT. Both are the right behaviour for an unprovisioned
-# box, and on a real hub Personal materialises backup.env with
+# On a real hub Personal materialises backup.env with
 # NAGLIGHT_FEED_CONTAINER=tracker, which posts via `docker exec` against the
 # tracker's own loopback (the tracker is bridge-only by ratification — D2, no
 # host publish — so a host unit genuinely cannot dial it directly). What was
-# missing is a SIM equivalent, so the gate could never exercise the one path it
-# exists to assert. Measured: with this file in place, both lanes log
-# "feed: reported red" and /api/today carries reportColor=red on both items.
+# missing is a SIM equivalent, so the gate could never exercise the path it
+# exists to assert.
 #
 # LAB BUILDS ONLY. An ordinary V3 hub gate is left exactly as it was — a
 # reporting path that switches itself on would change what that gate covers
@@ -1418,26 +1410,26 @@ render_sim_gate_backup_env() {
 
     {
         sim_banner "$caller"
-        echo "# The A19 gate's feed configuration for the two DRIVE-PRESENCE lanes."
+        echo "# The SN-014 gate's configuration for the unified file-share item."
         echo "# Installed by firstboot to /etc/homehub-backup/backup.env (0600 root:root)."
         echo "# A production hub gets this file from Personal's materialiser instead;"
         echo "# this one exists so a SIM hub can report at all. See render_sim_gate_backup_env."
         echo
-        echo "# Deliberately a path nothing will ever mount, so the lane is RED for a"
-        echo "# REAL reason rather than a simulated one (A19: no data drives attached)."
-        echo "BACKUP_TARGET=/mnt/backup-drive"
-        echo "BACKUP_TARGET_REQUIRE_MOUNT=true"
+        echo "# Deliberately no data drives are attached, so /srv/library is red for a"
+        echo "# real missing-mount reason rather than a fake report."
         echo
         echo "# The tracker is bridge-only (D2), so the POST runs INSIDE the container"
         echo "# against its own loopback. Same shape as the documented production form."
-        echo "NAGLIGHT_FEED_URL=http://127.0.0.1:8787/api/feed"
+        echo "FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health"
+        echo "FILE_SHARE_BACKUP_STATE_URL=http://127.0.0.1:8787/api/backup-state"
+        echo "FILE_SHARE_SAMBA_PROBE_SHARE=Shared"
         echo "NAGLIGHT_FEED_CONTAINER=tracker"
         echo "NAGLIGHT_TOKEN=$token"
         echo "NAGLIGHT_USER=$sub"
     } > "$out"
     chmod 600 "$out"
     log "SIM gate backup.env rendered -> deploy-payload/sim-gate/backup.env (0600)"
-    log "  the two drive lanes will REPORT (as $sub), instead of logging 'journal only'"
+    log "  the unified file-share item will REPORT (as $sub), instead of logging 'journal only'"
 }
 
 # apply_sim_env_overrides FILE [OVERRIDES] [VAR_NAME] — fold KEY=VALUE pairs in.

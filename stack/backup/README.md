@@ -11,7 +11,7 @@ a question about which of the two you are looking at.
 | **How** | `tar` + `zstd` per set into `/srv/library/Configs` — one current copy, no dated folder (`BACKUP_LAYOUT=flat`, 2026-09-01; it was a dated `run_<UTC>` on the archive drive before that) | **FileBackup** in a container: per-file dedup, a browsable **mirror**, `Snapshot_<date>` history |
 | **Storage cost** | ONE full copy, replaced each run — and then versioned by the column to the right, because the folder it lands in is part of the library | one mirror + deltas; growth is bounded by **change rate**, not run count |
 | **Runs** | `homehub-backup.timer`, 03:30 | `homehub-library-backup.timer`, 21:30 (**Q-FB6**, the Owner may move it) |
-| **Feed lane** | `backup` | `library-backup` |
+| **Panel health** | no separate visible feed | sole writer of verified `lastSuccess` for `file-share-backup-health` |
 | **Retention** | **none in the flat layout** — nothing is pruned and `BACKUP_KEEP` is not read. History is the library backup's snapshots of `Configs`. (`BACKUP_LAYOUT=dated` restores the old `BACKUP_KEEP` rotation) | **none — nothing prunes.** See below |
 | **Entry point** | `backup.sh` | `library-backup.sh` (host) → one `docker compose run` |
 | **Wake-on-LAN, drive power, ingest** | yes | reuses the same `common.sh` drive-power helpers; no WoL, no ingest |
@@ -348,18 +348,11 @@ Step 0 refuses instead, and reports `ok=false`. Deliberately NOT done as
 red one. Escape hatch for a target that is legitimately a plain directory:
 `BACKUP_TARGET_REQUIRE_MOUNT=false` (the run then warns loudly every time).
 
-> **Presentation superseded 2026-09-07.** SN-014/SR-018 replace the separate
-> drive-presence and run lanes with one file-share/backup item. The services
-> below describe the current implementation and must be migrated; they are not
-> the target requirement. Physical preflight/identity safeguards remain.
-
-The presence of the drive is *also* currently watched independently of the run, by
-`homehub-backup-drive-health.timer` every 10 minutes — check id
-**`backup-drive-mounted`**, the backup-drive twin of `library-mounted`. Both use
-`samba/library-guard.sh`, whose only probe is `/proc/self/mountinfo`: the answer
-comes from the kernel's mount table and **no request ever reaches the device**,
-so a 10-minute cadence cannot fight the spin-down policy below. Before this, an
-absent backup drive was invisible until 03:30 the next morning.
+**SN-014/SR-018:** the panel has one `file-share-backup-health` item. Its monitor
+checks `/srv/library` plus a representative Samba read and sends only
+`shareHealth: red|clear`; FileBackup alone sends `lastSuccess` after artifact
+verification. The bash config backup and backup-target identity/preflight checks
+remain operational safeguards, never presentation lanes.
 
 **Power management NEVER fails a backup:** a missing `hdparm`, an absent device
 path, or an enclosure that rejects the command is logged as a WARNING and skipped.

@@ -209,10 +209,9 @@ if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
         # NOT stop the run — proving the backup works on a cheap disk before
         # committing 8 TB to it is the whole point of the bring-up period — but
         # it must not be invisible either. The composite signal is the honest
-        # one: `backup` green (the run worked) + `backup-drive-mounted` yellow
-        # (on a substitute). Identity itself is asserted by the health timer;
-        # this is only the line in the run log that stops "the backup is green"
-        # from being read as "the backup is on the real drive".
+        # identity is retained as an internal preflight/log safeguard. It is not
+        # a panel lane: the sole visible item covers file-share health and
+        # artifact-verified FileBackup age.
         if [ -f /etc/homehub-samba/drive-identity.conf ]; then
             _expect="$(awk -F'\t' -v p="$TARGET_MOUNT" '$1 == p { print $2 }' /etc/homehub-samba/drive-identity.conf)"
             if [ -n "$_expect" ] && [ -e "/dev/disk/by-id/$_expect" ]; then
@@ -256,7 +255,7 @@ if [ "${BACKUP_TARGET_REQUIRE_MOUNT:-true}" = "true" ]; then
                 # them is what is mounted — "cannot tell" is not "wrong drive".
                 if [ "$_resolved" = 1 ] && [ "$_match" = 0 ]; then
                     log "NOTICE: this archive is landing on a STAND-IN drive, not $_expect."
-                    log "  Fine during bring-up; check backup-drive-mounted is yellow, not green."
+                    log "  Fine during bring-up; this remains internal and does not alter panel health."
                 fi
             fi
         fi

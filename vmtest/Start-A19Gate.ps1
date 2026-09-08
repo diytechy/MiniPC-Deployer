@@ -26,7 +26,7 @@
     route off it.
 
     The hub is deliberately created with NO extra VHDXs: A19's assertion is that
-    `library-mounted` and `backup-drive-mounted` report RED, and they must be red
+    `file-share-backup-health` reports shareHealth=red, and it must be red
     for real rather than simulated.
 
 .PARAMETER Stage

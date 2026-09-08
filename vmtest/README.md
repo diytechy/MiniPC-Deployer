@@ -966,8 +966,8 @@ exactly like a hung VM.
   `--ignore-certificate-errors`, **this gate proves nothing about TLS trust**,
   and a production `wall.env` carrying that flag is refused by the builder.
 - **The tracker is seeded from a fixture.** `sim/tracker-seed/definitions/` is
-  the only committable thing that declares `library-mounted` and
-  `backup-drive-mounted`. Without it the gate hub reports `healthy` with an
+  the committable fixture that declares `file-share-backup-health`. Without it
+  the gate hub reports `healthy` with an
   empty `/data` (the healthcheck probes `/healthz`, which is data-free by
   design), and the panel renders a tracker with no items — where "no red drive
   check" and "the drive check is green" look identical on a wall. Seeding is

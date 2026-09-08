@@ -24,6 +24,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUITES=(
     "backup/tests/plan-and-retention.test.sh"
     "backup/tests/flat-layout.test.sh"
+    "backup/tests/library-backup-state.test.sh"
+    "samba/tests/file-share-backup-producer.test.sh"
     "tracker/tests/defs-guard.test.sh"
     "provision/tests/restore-volumes.test.sh"
     "icedrive/tests/profile.test.sh"

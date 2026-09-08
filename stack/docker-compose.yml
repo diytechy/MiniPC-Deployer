@@ -273,8 +273,8 @@ services:
       TRACKER_MULTI_USER: ${TRACKER_MULTI_USER}
       # Multi-user only: seed a brand-new user's definitions/ from this path.
       # BLANK in production (the entrypoint then passes no --seed at all) — see
-      # .env.example. Set by the A19 gate so the two drive lanes the panel is
-      # asserted on exist before the panel ever asks for them.
+      # .env.example. Set by the A19 gate so the single combined file-share /
+      # backup lane exists before the panel ever asks for it.
       TRACKER_SEED_DIR: ${TRACKER_SEED_DIR}
       # ── One-way traceability mirror (NagLight SN-024, the Owner 2026-08-09) ──
       # Commits ONE identity's data dir hourly and pushes it to a private repo,

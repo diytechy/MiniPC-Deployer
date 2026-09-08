@@ -13,9 +13,15 @@ separate visible library-drive, backup-drive and backup-run model. New
 SN-014/SR-018 and repo-local IF-006 consume NagLight IF-010: a missing library
 mount or failed representative Samba read is an immediate red override;
 otherwise one item ages from the last artifact-verified FileBackup success.
-Health recovery cannot advance that success time. These rows are Draft and the
-current services/sim still implement the superseded multi-lane behavior; no
-deployment or process gate changed.
+Health recovery cannot advance that success time. The producer, fresh
+provisioning, sim fixture, and registered TC-001 hermetic producer/full-wrapper
+tests now use the new contract; the
+legacy backup-drive unit and fixture definitions are removed. A live deployment
+also runs an idempotent stop/remove migration for an already-installed legacy
+timer, and the new guard refuses its old backup-target invocation even during a
+race. It still needs the explicit tracker-definition inventory inspection/rebaseline
+documented in `stack/tracker-seed/README.md`; no deployment or process gate
+changed.
 
 **2026-09-06 panel capabilities implementation:** Owner-approved app plan has
 opt-in deploy configuration, protected Caddy routing, offline sensor installation,
@@ -199,9 +205,11 @@ brief supersedes its dated live-box state.
 >
 > Two things were needed to get there and both are written down in
 > `BENCH_BRINGUP_HANDOFF.md`: `backup.bench.env` must be recreated after a reimage
-> (it is residue), and **`NAGLIGHT_FEED_URL` is the knob that makes it feed-less,
-> not `LIBRARY_BACKUP_FEED_CHECK`** — with the wrong one, Q-FB7 fails every single
-> cycle and the drill tells you nothing about the backup.
+> (it is residue). **Superseded 2026-09-08:** the combined-state contract no
+> longer uses `LIBRARY_BACKUP_FEED_CHECK`; `NAGLIGHT_FEED_URL` is retained only
+> for the independent tracker-definition guard, while FileBackup uses
+> `FILE_SHARE_BACKUP_STATE_URL`. A feed-less backup drill must override the new
+> state URL without disabling the definitions guard's transport.
 >
 > ### 5. OPTION E IS NOT A RESCUE PATH
 >
@@ -2688,6 +2696,11 @@ Default Switch subnet; use Windows-side `ssh`/`scp`). The `hub` account is in th
 
 ### DRIVER — G1 — Round 1 — 2026-08-01 (BACKUP DRIVE: FALSE-GREEN CLOSED — Owner question)
 
+> **Historical design, superseded 2026-09-08 by SR-018.** The separate
+> `library-mounted` and `backup-drive-mounted` panel lanes and the latter's
+> timer/service are retired. Backup-target mount/identity checks remain internal
+> preflight safeguards; one `/srv/library` + Samba monitor owns `shareHealth`.
+
 The Owner asked whether a disconnected **backup** drive produced a NagLight
 report, or whether the only check was "did the backup run". Answer: neither, and
 the gap was worse than unreported.
@@ -4313,6 +4326,10 @@ since WI-10.14.
 ---
 
 #### DEFECT: a SIM hub cannot report either drive lane, so A19's assertion was unreachable
+
+> **Historical failure record, superseded 2026-09-08.** The two lanes shown
+> below were replaced by the reserved `file-share-backup-health` state item and
+> the old backup-drive unit is actively removed during upgrade.
 
 Both lanes detected the fault perfectly and told nobody:
 

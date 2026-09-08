@@ -17,19 +17,20 @@
 #                    `root preexec` with `root preexec close = yes`, so a
 #                    client connection is REFUSED rather than served empty.
 #                    Must stay fast and quiet — it runs on every connect.
-#   --report         same check, then log loudly and POST to NagLight. Run on
-#                    a timer so a drive that vanishes at 3am is visible in the
-#                    morning rather than discovered by a missing backup.
+#   --report         checks the library mount AND a representative Samba read,
+#                    then reports only the combined file-share/backup health
+#                    override. It never reports drive identity or a backup run.
 #
 # Exit codes: 0 = library healthy; 1 = not mounted / read-only / wrong.
+# `--report` deliberately narrows that verdict: read-only and identity details
+# remain operational diagnostics, but only mount absence or a failed Samba read
+# may force the combined wall indicator red.
 set -uo pipefail
 
 LIBRARY_ROOT="${LIBRARY_ROOT:-/srv/library}"
 ENV_FILE="${ENV_FILE:-/etc/homehub-backup/backup.env}"
-# What to call this drive in messages. The guard serves TWO drives now (A21,
-# 2026-08-01): the library, and the backup target — same zero-I/O check, and
-# the wording has to name the right one or a red check sends you to the wrong
-# cupboard. Default keeps every existing message byte-identical.
+# What to call the library in internal messages. The retired backup-drive timer
+# used this script with another path; report mode now refuses that mixed wiring.
 DRIVE_LABEL="${DRIVE_LABEL:-library}"
 # A23: mountpoint<TAB>expected-by-id<TAB>label, generated from storage-map §1.
 # Absent = identity is not asserted and the old two-state behaviour stands.
@@ -38,7 +39,13 @@ MODE="--check"
 SHARE=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --check)   MODE="--check";  shift; [ $# -gt 0 ] && { SHARE="$1"; shift; } ;;
+        --check)
+            MODE="--check"; shift
+            # The optional share name is positional only. Do not swallow the
+            # next option: library-backup calls `--check --library <mount>` and
+            # the old greedy parser silently checked /srv/library instead.
+            if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then SHARE="$1"; shift; fi
+            ;;
         --report)  MODE="--report"; shift ;;
         --library) LIBRARY_ROOT="$2"; shift 2 ;;
         --label)   DRIVE_LABEL="$2";  shift 2 ;;
@@ -61,7 +68,7 @@ fail_reason=""
 #                                                  $5        $6
 # Paths with spaces appear octal-escaped (\040); none of the storage-map
 # mountpoints contain spaces, and a mismatch would fail CLOSED, which is right.
-mountinfo='/proc/self/mountinfo'
+mountinfo="${MOUNTINFO_FILE:-/proc/self/mountinfo}"
 if [ ! -r "$mountinfo" ]; then
     fail_reason="cannot read $mountinfo — unable to verify that $LIBRARY_ROOT is mounted, refusing rather than guessing"
 else
@@ -202,6 +209,17 @@ fi
 # ── --report ────────────────────────────────────────────────────────────────
 log() { echo "[library-guard] $*"; }
 
+# Defense in depth for a scripts-only upgrade where the old installed timer
+# gets one last start before retirement. BACKUP_TARGET availability must never
+# be translated into the library share-health dimension.
+REPORT_LIBRARY_ROOT="${FILE_SHARE_LIBRARY_ROOT:-/srv/library}"
+if [ "$LIBRARY_ROOT" != "$REPORT_LIBRARY_ROOT" ]; then
+    log "REFUSED legacy report path $LIBRARY_ROOT; combined share health is owned only by $REPORT_LIBRARY_ROOT"
+    logger -t homehub-library-guard -p daemon.err \
+        "refused legacy report path $LIBRARY_ROOT (expected $REPORT_LIBRARY_ROOT)" 2>/dev/null || true
+    exit 2
+fi
+
 # ── REATTACH: try to put a dropped drive back before reporting it red ────────
 # ADDED 2026-08-28, after a stand-in USB dropped off the bus SEVEN times in 46
 # minutes and every one of them left the mountpoint down until a human ran
@@ -260,31 +278,84 @@ if [ -n "$fail_reason" ] && [ "${GUARD_REATTACH:-1}" = "1" ] && ! mountpoint -q 
     fi
 fi
 
-# Three states (A23), not two:
-#   red    - not mounted, or read-only. Nothing works.
-#   yellow - mounted and writable, but the disk is NOT the one the map names.
-#            The intended state while running on stand-in flash drives during
-#            bring-up; the point is that it is VISIBLY not the finished article,
-#            so nobody later mistakes a 32 GB stick for the 8 TB archive.
-#   green  - mounted, writable, and the expected serial.
+# The Samba preexec guard above still rejects a read-only library because a
+# client allowed into a share must not discover only after connecting that
+# writes cannot work.  The wall contract is intentionally coarser: a mounted
+# share that passes a representative Samba read is available, and mount mode is
+# not a separate user-facing health dimension.  Apply that narrowing only in
+# report mode, after any reattach/reassessment has finished.
+case ",${mnt_opts:-}," in
+    *,ro,*)
+        case "$fail_reason" in
+            *"mounted READ-ONLY"*)
+                fail_reason=""
+                resolve_identity
+                ;;
+        esac
+        ;;
+esac
+
+# A successful local `ls` is a representative READ through Samba, not merely a
+# daemon-pid check.  The probe share is deliberately explicit: choosing a share
+# by title or by the first stanza would drift with the generated storage map.
+# The materialiser supplies a guest-readable share name; no password is put in
+# backup.env just to answer whether the file service is reachable.
+probe_samba() {
+    # The full literal-value loader below also loads this key for transport.
+    # It lives after the local verdict so the fast `--check` path never reads a
+    # config file.  `--report` needs the probe name before that point.
+    local share="${FILE_SHARE_SAMBA_PROBE_SHARE:-}"
+    local seconds="${FILE_SHARE_SAMBA_PROBE_TIMEOUT_SECONDS:-}"
+    if [ -f "$ENV_FILE" ]; then
+        if [ -z "$share" ]; then
+            share="$(sed -n 's/^[[:space:]]*FILE_SHARE_SAMBA_PROBE_SHARE[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" | tail -n1)"
+            share="${share%%[[:space:]]#*}"
+            share="${share#\"}"; share="${share%\"}"
+            share="${share#\'}"; share="${share%\'}"
+        fi
+        if [ -z "$seconds" ]; then
+            seconds="$(sed -n 's/^[[:space:]]*FILE_SHARE_SAMBA_PROBE_TIMEOUT_SECONDS[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" | tail -n1)"
+            seconds="${seconds%%[[:space:]]#*}"
+            seconds="${seconds#\"}"; seconds="${seconds%\"}"
+            seconds="${seconds#\'}"; seconds="${seconds%\'}"
+        fi
+    fi
+    local client="${SMBCLIENT_BIN:-smbclient}"
+    seconds="${seconds:-10}"
+    if [ -z "$share" ]; then
+        fail_reason="representative Samba probe share is not configured"
+        return
+    fi
+    if ! command -v "$client" >/dev/null 2>&1; then
+        fail_reason="smbclient is unavailable, so Samba read availability cannot be verified"
+        return
+    fi
+    case "$seconds" in ''|*[!0-9]*) seconds=10;; esac
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$client" "//127.0.0.1/$share" -N -c 'ls' >/dev/null 2>&1 || \
+            fail_reason="representative Samba read failed"
+    else
+        "$client" "//127.0.0.1/$share" -N -c 'ls' >/dev/null 2>&1 || \
+            fail_reason="representative Samba read failed"
+    fi
+}
+[ -n "$fail_reason" ] || probe_samba
+
+# Identity and mount details remain an internal safety and journal concern.
+# They intentionally never appear in the single wall item: only a broken share
+# is red, while a healthy share clears its override and leaves backup age alone.
 if [ -n "$fail_reason" ]; then
-    band="red";    verdict="$fail_reason"
-    log "UNHEALTHY: $fail_reason"
+    health="red"
+    log "UNHEALTHY file share: $fail_reason"
     logger -t homehub-library-guard -p daemon.err "$fail_reason" 2>/dev/null || true
-elif [ "$identity_state" = "mismatch" ]; then
-    band="yellow"; verdict="stand-in drive: $identity_note"
-    log "DEGRADED: $LIBRARY_ROOT mounted read-write, but $identity_note"
-    logger -t homehub-library-guard -p daemon.warning "stand-in drive at $LIBRARY_ROOT: $identity_note" 2>/dev/null || true
-elif [ "$identity_state" = "match" ]; then
-    band="green";  verdict="mounted read-write; drive identity confirmed ($identity_note)"
-    log "healthy: $LIBRARY_ROOT mounted read-write, drive identity confirmed ($identity_note)"
 else
-    # Mounted and writable, but identity could not be asserted at all (no
-    # identity file, no entry for this mountpoint, or an unresolvable device).
-    # Green on the facts that WERE checked, with the gap named in the note
-    # rather than left implied.
-    band="green";  verdict="mounted read-write; identity NOT asserted ($identity_note)"
-    log "healthy: $LIBRARY_ROOT mounted read-write (identity not asserted: $identity_note)"
+    health="clear"
+    if [ "$identity_state" = "mismatch" ]; then
+        log "NOTICE: file share healthy; internal drive identity mismatch: $identity_note"
+        logger -t homehub-library-guard -p daemon.warning "internal drive identity mismatch at $LIBRARY_ROOT: $identity_note" 2>/dev/null || true
+    else
+        log "file share healthy (mount and representative Samba read passed)"
+    fi
 fi
 
 # Report through the SAME path the backup feeder uses, so there is one way of
@@ -332,15 +403,13 @@ load_env_file() {
 }
     load_env_file "$ENV_FILE"
 fi
-if [ -n "${NAGLIGHT_FEED_URL:-}" ]; then
-    check_id="${LIBRARY_FEED_CHECK:-library-mounted}"
-    note="${verdict//\"/\'}"
-    # The severity lane (NagLight 75b3e3a): exactly one of ok|color|rgb.
-    # `color` is used rather than `ok` because a boolean cannot express
-    # "working, but on the wrong disk" — the entire state this check exists
-    # to surface. A feed that only knew true/false would have to call a
-    # stand-in drive either fine or broken, and it is neither.
-    body="$(printf '{"check":"%s","color":"%s","reason":"%s"}' "$check_id" "$band" "$note")"
+if [ -n "${FILE_SHARE_BACKUP_STATE_URL:-}" ]; then
+    item_id="${FILE_SHARE_BACKUP_FEED_ID:-file-share-backup-health}"
+    # IF-006 / IF-010: exactly one independent state dimension per request.
+    # `clear` is NOT a success report: the server preserves lastSuccess
+    # byte-for-byte, so recovery resumes the age derived from the last verified
+    # FileBackup artifact rather than starting a new clock.
+    body="$(printf '{"id":"%s","shareHealth":"%s"}' "$item_id" "$health")"
     if [ -n "${NAGLIGHT_FEED_CONTAINER:-}" ]; then
         hdr=(--header "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(--header "Authorization: Bearer ${NAGLIGHT_TOKEN}")
@@ -379,28 +448,14 @@ if [ -n "${NAGLIGHT_FEED_URL:-}" ]; then
             # log - a different fault with a different fix. Print what the
             # server said; never infer it from the status code alone.
             __ferr="$(docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -S -O - --content-on-error "${hdr[@]}" \
-                        --post-data "$body" "$NAGLIGHT_FEED_URL" 2>&1)"
+                        --post-data "$body" "$FILE_SHARE_BACKUP_STATE_URL" 2>&1)"
             __frc=$?
             if [ "$__frc" -eq 0 ]; then
-                log "feed: reported $band"
+                log "file-share/backup state: reported shareHealth=$health"
             else
                 __fcode="$(printf '%s' "$__ferr" | grep -oE 'HTTP/[0-9.]+ [0-9]{3}' | grep -oE '[0-9]{3}$' | head -1)"
                 __fline="$(printf '%s' "$__ferr" | tr -s ' \n' ' ' | cut -c1-160)"
                 log "feed: report FAILED (wget exit $__frc${__fcode:+, HTTP $__fcode}) - ${__fline:-no output}"
-                # 400 has exactly one meaning here and it is not a network fault.
-                # Say so, and say where the fix is, because the check id is a
-                # WIRE CONTRACT with the tracker's item definitions and nothing
-                # else in this project asserts the two still agree.
-                # The server's own sentence, which is worth more than any
-                # mapping this script could carry. Both 400s seen on the box
-                # on 2026-08-29 are one line each, and neither is a transport
-                # fault:
-                #   unknown feeder check id: library-mounted
-                #     -> no item declares that check. A DEFINITIONS problem.
-                #   item library-drive-present not in <date> log
-                #     -> the item exists, but the day was materialized before
-                #        it did. `tracker materialize --data <dir>` fixes
-                #        today; the next rollover fixes itself.
                 __fbody="$(printf '%s' "$__ferr" | grep -vE '^[[:space:]]*(HTTP/|Content-|X-Content-|Date:|Connection:|Vary:|Transfer-)' | tr -s ' \n' ' ' | sed 's/^ *//;s/ *$//')"
                 [ -n "$__fbody" ] && log "  the tracker said: $__fbody"
                 case "${__fcode:-}" in
@@ -413,11 +468,11 @@ if [ -n "${NAGLIGHT_FEED_URL:-}" ]; then
         hdr=(-H "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(-H "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(-H "X-Forwarded-User: ${NAGLIGHT_USER}")
-        code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null || echo 000)"
-        [ "$code" = "200" ] && log "feed: reported $band" || log "feed: report got HTTP $code"
+        code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$FILE_SHARE_BACKUP_STATE_URL" 2>/dev/null || echo 000)"
+        [ "$code" = "200" ] && log "file-share/backup state: reported shareHealth=$health" || log "file-share/backup state: report got HTTP $code"
     fi
 else
-    log "NAGLIGHT_FEED_URL unset — journal only ($band; check id would be '${LIBRARY_FEED_CHECK:-library-mounted}')"
+    log "FILE_SHARE_BACKUP_STATE_URL unset — journal only (shareHealth=$health)"
 fi
 
 [ -z "$fail_reason" ]

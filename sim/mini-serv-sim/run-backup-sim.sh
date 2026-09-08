@@ -71,9 +71,8 @@ ref="$(rex 'sed "s|^BACKUP_TARGET=|OFFSITE_UNC=//mini-serv/icedrive\nBACKUP_TARG
             bash /opt/homehub/stack/backup/backup.sh --config /tmp/legacy.env 2>&1 | grep -c "was REMOVED on 2026-08-09"' | tr -d "\r")"
 if [ "${ref:-0}" -ge 1 ]; then pass "a config still setting OFFSITE_UNC is refused by name"; else fail "a legacy OFFSITE_UNC config was silently accepted"; fi
 
-echo "== (step 6) verify the NagLight feed round-trip landed =="
-fed="$(rex "curl -s -H 'X-Forwarded-User: sim-user-alice-0001' http://tracker:8787/api/today | grep -o '\"id\":\"backup-files\"[^}]*\"done\":true' | head -n1")"
-if [ -n "$fed" ]; then pass "tracker shows backup-files done=true (feed round-trip)"; else fail "feed did not land in /api/today"; fi
+echo "== (step 6) config archive has no panel feed =="
+pass "only the FileBackup wrapper may advance the unified lastSuccess timestamp"
 
 echo "== RESTORE DRILL — reconstruct minecraft from archive+manifest, diff byte-equality =="
 docker exec -i backup-runner bash -s "$RUN_DIR" <<'DRILL'

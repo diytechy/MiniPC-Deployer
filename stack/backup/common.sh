@@ -715,28 +715,40 @@ fstab_mount_for() {
 # needs the status code rather than a boolean, it needs `-S` (headers) and
 # `--content-on-error` (the body) — see library-guard.sh's feed block.
 #
-# FEED_LAST_CODE carries the outcome of the LAST post — the HTTP code, `000`
-# when nothing answered, or `skipped` when no URL is configured. Added for
-# library-backup.sh, whose contract makes a failed POST a failure of the RUN
-# (a backup nobody was told about is not a backup that reported). The return
-# STATUS is deliberately still always 0: backup.sh and restore.sh call this from
-# inside their own failure reporting, and a reporting error must never be able
-# to invent a second failure or mask the first one there.
-FEED_LAST_CODE=""
-feed_naglight() {
-    local ok="$1" note="$2"
-    FEED_LAST_CODE="skipped"
-    [ -n "${NAGLIGHT_FEED_URL:-}" ] || { log "feed: NAGLIGHT_FEED_URL unset — skipping report"; return 0; }
-    local check="${NAGLIGHT_FEED_CHECK:-backup}"
-    note="${note//\"/\'}"                                   # keep the JSON valid
-    local body; body="$(printf '{"check":"%s","ok":%s,"note":"%s"}' "$check" "$ok" "$note")"
+# FILE_SHARE_BACKUP_STATE_LAST_CODE carries the outcome of the last unified
+# state update — the HTTP code, `000` when nothing answered, or `skipped` when
+# no endpoint is configured.  The endpoint deliberately accepts exactly one
+# state dimension per POST: share health from the monitor OR a verified-success
+# timestamp from FileBackup.  It is not `/api/feed`: that endpoint's day-log
+# semantics would make a recovered share look like a fresh backup.
+FILE_SHARE_BACKUP_STATE_LAST_CODE=""
+post_file_share_backup_state() {
+    local field="$1" value="$2"
+    FILE_SHARE_BACKUP_STATE_LAST_CODE="skipped"
+    local url="${FILE_SHARE_BACKUP_STATE_URL:-}"
+    [ -n "$url" ] || { log "file-share/backup state: FILE_SHARE_BACKUP_STATE_URL unset — skipping update"; return 0; }
+    local id="${FILE_SHARE_BACKUP_FEED_ID:-file-share-backup-health}"
+    local body
+    case "$field" in
+        shareHealth)
+            case "$value" in red|clear) ;; *) warn "file-share/backup state: invalid shareHealth '$value'"; return 0;; esac
+            body="$(printf '{"id":"%s","shareHealth":"%s"}' "$id" "$value")"
+            ;;
+        lastSuccess)
+            # The server also validates this.  Keep the producer strict so a
+            # local clock/config regression cannot manufacture a fresh backup.
+            case "$value" in *T*Z) ;; *) warn "file-share/backup state: lastSuccess must be RFC3339 UTC, got '$value'"; return 0;; esac
+            body="$(printf '{"id":"%s","lastSuccess":"%s"}' "$id" "$value")"
+            ;;
+        *) warn "file-share/backup state: unknown field '$field'"; return 0;;
+    esac
     local code
     if [ -n "${NAGLIGHT_FEED_CONTAINER:-}" ]; then
         local whdr=(--header "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && whdr+=(--header "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && whdr+=(--header "X-Forwarded-User: ${NAGLIGHT_USER}")
         if docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -O /dev/null "${whdr[@]}" \
-                --post-data "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null; then
+                --post-data "$body" "$url" 2>/dev/null; then
             code=200                       # wget: exit 0 == HTTP 2xx. NOTE: a 4xx
                                            # lands in the else below as a bare
                                            # 000, which cannot be told from "no
@@ -754,11 +766,20 @@ feed_naglight() {
         # the fallback APPENDED to it. The logged "HTTP 000000" then looked like
         # a transport oddity rather than "nothing answered" — a diagnostic number
         # that pointed away from the fault. Take curl's status separately.
-        if ! code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$NAGLIGHT_FEED_URL" 2>/dev/null)"; then
+        if ! code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$url" 2>/dev/null)"; then
             code=""
         fi
         [ -n "$code" ] || code=000
     fi
-    FEED_LAST_CODE="$code"
-    if [ "$code" = "200" ]; then log "feed: reported ok=$ok (HTTP 200)"; else warn "feed: report ok=$ok got HTTP $code"; fi
+    FILE_SHARE_BACKUP_STATE_LAST_CODE="$code"
+    if [ "$code" = "200" ]; then log "file-share/backup state: reported $field=$value (HTTP 200)"; else warn "file-share/backup state: $field=$value got HTTP $code"; fi
+}
+
+# The bash config-archive service still calls this through its existing refusal
+# and ERR paths.  Keep that service operational, but make the retired visible
+# lane an intentional no-op: it is neither share health nor a whole-library
+# FileBackup success, so posting it could only corrupt the unified clock.
+feed_naglight() {
+    log "legacy config-backup feed suppressed: $2"
+    return 0
 }

@@ -1,2 +1,3 @@
 LLR-ID,SR-Refs,Title,Module,CodeSymbol,Detail,TestRefs,Status
 LLR-000,SR-000,EXAMPLE - delete on first real entry,path/to/module,function_or_type,"Decomposition/implementation detail — NOT a paraphrase of the SR (reference it by id). Name the real (or planned) module + symbol.",(see TC),Planned
+LLR-001,SR-018,Combined file-share/backup state producers and legacy-unit retirement,stack/samba; stack/backup,library-guard.sh --report; post_file_share_backup_state; retire-legacy-backup-health.sh,"Probe the library mount and representative guest Samba read before setting only shareHealth; publish lastSuccess only after FileBackup artifact verification; reject and remove the retired backup-drive reporter on fresh installs and upgrades.",TC-001,Implemented

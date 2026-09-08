@@ -776,7 +776,7 @@ log "  bind-mount sources checked; $_created created"
 # filesystem, and a `mkdir -p` there would manufacture a plausible-looking
 # library on the system disk — masking a missing drive AND giving the backup
 # somewhere harmless-looking to write. Refusing to create is the honest answer;
-# library-mounted already reports the missing drive.
+# the unified file-share monitor already reports the missing library mount.
 if mountpoint -q /srv/library 2>/dev/null; then
     _made=0
     while read -r _p; do
@@ -1387,11 +1387,13 @@ bash "$STACK_DIR/provision/provision-actual.sh" --env "$STACK_DIR/.env"
 # stanza names it as `root preexec`, and a missing guard would make Samba
 # refuse every connection (preexec close = yes treats "cannot run" as failure).
 install -m 0755 "$STACK_DIR/samba/library-guard.sh" /usr/local/sbin/homehub-library-guard
+install -m 0755 "$STACK_DIR/samba/retire-legacy-backup-health.sh" /usr/local/sbin/homehub-retire-legacy-backup-health
+# SR-018 upgrade migration: deleting a tracked unit does not remove its already
+# installed copy. Stop and remove it before the shared guard changes meaning.
+/usr/local/sbin/homehub-retire-legacy-backup-health || \
+    log "WARN: could not fully retire the legacy backup-drive health units"
 install -m 0644 "$STACK_DIR/samba/homehub-library-health.service" /etc/systemd/system/homehub-library-health.service
 install -m 0644 "$STACK_DIR/samba/homehub-library-health.timer"   /etc/systemd/system/homehub-library-health.timer
-# Same guard, second drive (A21): the backup target had no presence check at all
-# — it was looked at once a night by the backup run, which (fstab `nofail`) could
-# not tell an absent drive from an empty directory on the system disk.
 # A23: the serials the guard asserts. Carried on the USB as site/, copied to
 # /etc/homehub-samba/ beside the fstab fragment it pairs with. Absent = the
 # guard still reports, it just cannot distinguish a stand-in from the real disk
@@ -1401,8 +1403,6 @@ if [ -f /etc/homehub-samba/drive-identity.conf ]; then
 else
     log "no /etc/homehub-samba/drive-identity.conf — health checks report presence only (a stand-in drive will read as healthy)"
 fi
-install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.service" /etc/systemd/system/homehub-backup-drive-health.service
-install -m 0644 "$STACK_DIR/samba/homehub-backup-drive-health.timer"   /etc/systemd/system/homehub-backup-drive-health.timer
 
 # ── the tracker's own definitions, watched from OUTSIDE the tracker ──────────
 # The third guard, added 2026-08-29 after /api/today was measured returning
@@ -1467,7 +1467,7 @@ fi
 # ── the A19 GATE's feed configuration, and only ever a gate's ────────────────
 # Both drive lanes take their feed settings from backup.env. A production hub
 # gets that file from the household materialiser (late-command 4b); a SIM hub
-# gets none, so on 2026-08-04's gate the library lane logged "NAGLIGHT_FEED_URL
+# gets none, so on 2026-08-04's gate the file-share monitor logged "journal only"
 # unset — journal only" and the backup lane exited before it checked. Correct
 # for an unprovisioned box, and it made A19's whole assertion unreachable.
 #
@@ -1484,7 +1484,7 @@ if [ -f "$SIM_GATE_BACKUP_ENV" ]; then
     else
         install -d -m 0755 /etc/homehub-backup
         install -m 0600 -o root -g root "$SIM_GATE_BACKUP_ENV" /etc/homehub-backup/backup.env
-        log "SIM GATE: installed a test backup.env so the two drive-presence lanes REPORT"
+        log "SIM GATE: installed a test backup.env so the unified file-share health item REPORTS"
         log "  instead of logging 'journal only'. THIS IS A GATE FIXTURE, not household config."
     fi
 fi
@@ -1514,10 +1514,11 @@ fi
 
 # Enable the health timer AFTER mounting, not before: OnBootSec=3min has long
 # elapsed by the time firstboot runs, so `enable --now` fires immediately and
-# would post a spurious library-mounted ok=false against an unmounted library.
-systemctl enable --now homehub-library-health.timer >/dev/null 2>&1 ||     log "WARN: could not enable homehub-library-health.timer — a vanished drive would go unreported"
-systemctl enable --now homehub-backup-drive-health.timer >/dev/null 2>&1 || \
-    log "WARN: could not enable homehub-backup-drive-health.timer — an absent backup drive would go unreported until the nightly run"
+# would post a spurious combined share-health red while the mount is still
+# coming up.  There is deliberately no backup-drive health timer: physical
+# backup-target checks remain internal FileBackup preflight safeguards.
+systemctl enable --now homehub-library-health.timer >/dev/null 2>&1 || \
+    log "WARN: could not enable homehub-library-health.timer — file-share failure would go unreported"
 # The definition-inventory guard (2026-08-29). Its FIRST run on a fresh box will
 # be YELLOW and should be: there is no baseline yet, and recording one
 # automatically is exactly what would make a later deletion invisible. Taking the

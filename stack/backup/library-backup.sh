@@ -78,11 +78,12 @@ fi
 load_config "$CONFIG"
 load_env_file "$STACK_DIR/.env"
 
-# The dedicated lane. NOT the `backup` check id: the bash service owns that one,
-# and one of these two going red must never be able to look like the other going
-# green. Created now, exactly when the container ships (the ratified deferral).
-NAGLIGHT_FEED_CHECK="${LIBRARY_BACKUP_FEED_CHECK:-library-backup}"
-export NAGLIGHT_FEED_CHECK
+# The reserved IF-010 item is not a generic `/api/feed` lane. This wrapper owns
+# only its lastSuccess field; the library/Samba monitor owns shareHealth. Their
+# independent writes are what let share recovery reveal an old backup age
+# instead of manufacturing a green backup.
+FILE_SHARE_BACKUP_FEED_ID="${FILE_SHARE_BACKUP_FEED_ID:-file-share-backup-health}"
+export FILE_SHARE_BACKUP_FEED_ID
 
 FB_CONFIG="${FILEBACKUP_CONFIG:-/etc/homehub-backup/filebackup.json}"
 FB_SOURCE="${FILEBACKUP_SOURCE:-/srv/library}"
@@ -109,20 +110,14 @@ SNAPSHOT_BEFORE=0; SNAPSHOT_AFTER=0
 REPORTED_FAILURE=0
 
 # report_failure NOTE — the ONE failure path. Idempotent, so whichever of the
-# ERR trap and `die` arrives first owns the verdict. Always returns 0: reporting
-# must not invent a second failure, and it must never mask the original one.
-# The failure paths all exit non-zero regardless, so a POST that does not land
-# here only needs SAYING — it cannot make the verdict any redder than it is.
+# ERR trap and `die` arrives first owns the verdict. A failed attempt does not
+# write IF-010 at all: failure must preserve the last artifact-verified success
+# timestamp. The non-zero exit plus systemd/journal remain the operational fault
+# signal.
 report_failure() {
     local note="$1"
     [ "$REPORTED_FAILURE" = 0 ] || return 0
     REPORTED_FAILURE=1
-    feed_naglight false "library-backup FAILED: $note"
-    case "$FEED_LAST_CODE" in
-        200)     ;;
-        skipped) log "  (no NAGLIGHT_FEED_URL configured, so nothing outside this box has been told — expected on a sim box, not on the hub)" ;;
-        *)       log "  AND the failure report itself did not land (HTTP $FEED_LAST_CODE) — the ERROR above is the real one, and nothing outside this box has been told about it" ;;
-    esac
     log "LIBRARY BACKUP FAILED: $note"
     return 0
 }
@@ -636,31 +631,25 @@ else
     log "verify gate: not today (mode=$VERIFY_MODE, weekday $(date +%u), verify day $VERIFY_DAY)"
 fi
 
-# ── 9. THE REPORT (E2 cross-check 2) ─────────────────────────────────────────
-# AFTER the container exits, and it can only be after: the container has
-# `network_mode: none` and no way to reach the tracker, which is the design —
-# reporting never moves inside it.
-#
-# A FAILED POST IS ITSELF A FAILURE. A backup that ran perfectly and told nobody
-# is indistinguishable, from the outside, from a backup that never ran; the whole
-# never-silent-green contract is that the outside can tell. So the exit status
-# below is non-zero when the POST did not land, and the unit shows failed.
+# ── 9. ADVANCE VERIFIED SUCCESS (SR-018 / IF-010) ────────────────────────────
+# AFTER the container and verification exit successfully, and it can only be
+# after: the container has `network_mode: none` and no way to reach the tracker.
+# A failure above deliberately leaves the previous timestamp untouched.
 trap - ERR
 SUMMARY="exit=$BACKUP_RC snapshot=$SNAPSHOT_MADE drive=$FILL_PCT full; verify=$VERIFY_NOTE"
 [ -n "$DEGRADED" ] && SUMMARY="$SUMMARY; DEGRADED: $DEGRADED"
-feed_naglight true "library backup ok — $SUMMARY"
-# An UNCONFIGURED lane is not a failed POST, and the difference matters. `skipped`
-# means backup.env carries no NAGLIGHT_FEED_URL — the documented state of a sim
-# box, and the same thing backup.sh treats as a benign skip. Failing here would
-# make every sim run red for a reason that has nothing to do with the backup.
-# It is still said out loud, every time, because on the HUB it would be a real
-# gap: a run reporting to nobody.
-if [ "$FEED_LAST_CODE" = "skipped" ]; then
-    log "NOTE: no NAGLIGHT_FEED_URL in $CONFIG, so this run reported to NOBODY."
-    log "  Correct for a sim box; on the hub it means the library-backup lane does not exist."
+SUCCESS_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+post_file_share_backup_state lastSuccess "$SUCCESS_AT"
+# An unconfigured state endpoint remains a benign, explicit sim condition. On
+# the hub a configured endpoint that rejects or drops the update fails the unit:
+# otherwise the wall cannot distinguish a completed backup from one that never
+# ran, even though the archive itself remains valid.
+if [ "$FILE_SHARE_BACKUP_STATE_LAST_CODE" = "skipped" ]; then
+    log "NOTE: no FILE_SHARE_BACKUP_STATE_URL in $CONFIG, so this verified success advanced no panel state."
+    log "  Correct for a sim box; on the hub it means the combined item cannot age correctly."
     log "  Summary that went nowhere: $SUMMARY"
-elif [ "$FEED_LAST_CODE" != "200" ]; then
-    log "FATAL: the library backup itself succeeded, but the NagLight POST did not land (HTTP $FEED_LAST_CODE)."
+elif [ "$FILE_SHARE_BACKUP_STATE_LAST_CODE" != "200" ]; then
+    log "FATAL: the library backup itself succeeded, but its verified-success update did not land (HTTP $FILE_SHARE_BACKUP_STATE_LAST_CODE)."
     log "  Exiting non-zero so this unit reports FAILED. A backup nobody was told about is"
     log "  not a backup that reported — from outside this box it looks exactly like a run"
     log "  that never happened, and that is the one thing this contract forbids."

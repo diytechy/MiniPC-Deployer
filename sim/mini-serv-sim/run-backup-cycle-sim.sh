@@ -19,8 +19,8 @@
 # DELIBERATELY HERMETIC. Sources are `path:` trees created inside the runner, not
 # Samba shares: this leg is about the pipeline's behaviour over time, and a cifs
 # dependency would make it slower and give it a second way to fail that
-# run-backup-sim.sh already covers properly. Likewise NAGLIGHT_FEED_URL is unset,
-# so the feed is a logged skip and no tracker has to exist.
+# run-backup-sim.sh already covers properly. The config-archive service has no
+# panel feed, so this cycle needs no tracker.
 #
 # The `volume:` scenarios use a MOCK `docker` on PATH — the same technique
 # run-drivepower-sim.sh uses for hdparm. A container has no docker volumes, but

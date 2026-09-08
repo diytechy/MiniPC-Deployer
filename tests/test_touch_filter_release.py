@@ -244,6 +244,8 @@ def test_firstboot_uses_nonfatal_gateway_stager_before_core_compose():
     assert gateway.index("for cand in ") < gateway.index("elif ! bash")
     assert "break" not in gateway
     assert '"${_gateway_candidates[@]}"' in gateway
+    no_payload = gateway[gateway.index('if [ "${#_gateway_candidates[@]}" -eq 0 ]'):gateway.index("elif ! bash")]
+    assert 'rm -rf "$STACK_DIR/panel-access/app"' in no_payload
     assert source.index("stage-gateway.sh") < source.index('log "docker compose up -d')
 
 

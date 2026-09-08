@@ -603,7 +603,8 @@ for cand in /opt/homehub/wall-gateway "$STACK_DIR/wall-gateway" /cdrom/deploy-pa
 done
 shopt -u nullglob
 if [ "${#_gateway_candidates[@]}" -eq 0 ]; then
-    log "NOTICE: no private gateway payload found; private access remains unavailable"
+    rm -rf "$STACK_DIR/panel-access/app"
+    log "NOTICE: no private gateway payload found; any stale private gateway was removed"
 elif ! bash "$STACK_DIR/panel-access/stage-gateway.sh" \
     "$(command -v python3)" "$STACK_DIR/panel-access/install-gateway.py" \
     "$STACK_DIR/wall-shell/build-info.json" "$STACK_DIR/panel-access/app" \

@@ -740,6 +740,18 @@ post_file_share_backup_state() {
             case "$value" in *T*Z) ;; *) warn "file-share/backup state: lastSuccess must be RFC3339 UTC, got '$value'"; return 0;; esac
             body="$(printf '{"id":"%s","lastSuccess":"%s"}' "$id" "$value")"
             ;;
+        runState)
+            # A PHASE, NOT A VERDICT.  It says where the run is, never that one
+            # succeeded: the server keeps lastSuccess untouched, so when the
+            # attempt ends the age underneath is exactly what it was.  `idle` is
+            # therefore safe on the failure path — it withdraws a claim about
+            # being in progress, and claims nothing else.
+            case "$value" in
+                starting|backing-up|verifying|idle) ;;
+                *) warn "file-share/backup state: invalid runState '$value'"; return 0;;
+            esac
+            body="$(printf '{"id":"%s","runState":"%s"}' "$id" "$value")"
+            ;;
         *) warn "file-share/backup state: unknown field '$field'"; return 0;;
     esac
     local code

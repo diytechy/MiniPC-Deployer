@@ -42,12 +42,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
 STACK_DIR="$(dirname "$HERE")"          # /opt/homehub/stack on the box
 
-CONFIG=""; PREFLIGHT_ONLY=0; VERIFY_MODE=auto
+CONFIG=""; PREFLIGHT_ONLY=0; VERIFY_MODE=auto; RECONCILE_RUN_STATE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --config)         CONFIG="$2"; shift 2 ;;
         --preflight-only) PREFLIGHT_ONLY=1; shift ;;
         --verify)         VERIFY_MODE="$2"; shift 2 ;;
+        --reconcile-run-state) RECONCILE_RUN_STATE=1; shift ;;
         -h|--help)        sed -n '2,40p' "$0"; exit 0 ;;
         *) die "unknown arg: $1 (try --help)" ;;
     esac
@@ -114,10 +115,24 @@ REPORTED_FAILURE=0
 # write IF-010 at all: failure must preserve the last artifact-verified success
 # timestamp. The non-zero exit plus systemd/journal remain the operational fault
 # signal.
+# RUN_STATE_OWNED is set only once this process holds the lock. Everything that
+# withdraws the running claim checks it, because a run we do not own is a run
+# still in progress: posting idle for it would paint a live backup as finished.
+RUN_STATE_OWNED=0
+run_state() {
+    [ "$RUN_STATE_OWNED" = 1 ] || return 0
+    post_file_share_backup_state runState "$1"
+}
+
 report_failure() {
     local note="$1"
     [ "$REPORTED_FAILURE" = 0 ] || return 0
     REPORTED_FAILURE=1
+    # Withdraw the in-progress claim. This is NOT a success report and cannot be
+    # mistaken for one: runState is an independent field, so lastSuccess keeps
+    # the last artifact-verified timestamp and the lane falls back to the age it
+    # already had (or to the share fault that caused this).
+    run_state idle
     log "LIBRARY BACKUP FAILED: $note"
     return 0
 }
@@ -167,6 +182,15 @@ for _t in flock findmnt; do
 done
 exec 9>"$LOCK_FILE" || die "cannot open the lock file $LOCK_FILE"
 if ! flock -n 9; then
+    # A held lock is the ANSWER in reconcile mode, not a refusal: a run is in
+    # progress, so its phase is current and must be left exactly as it is. Quiet
+    # and zero, because this path runs on a short timer and the refusal text
+    # below would be both wrong here and repeated every cycle.
+    if [ "$RECONCILE_RUN_STATE" = 1 ]; then
+        trap - ERR
+        log "run-state: a backup is in progress; leaving its phase alone"
+        exit 0
+    fi
     log "ANOTHER LIBRARY BACKUP IS ALREADY RUNNING (lock held: $LOCK_FILE)."
     log "  Not starting a second one: two containers sharing one /state and one"
     log "  /backup would corrupt the manifest, and the first real run of a ~2 TiB"
@@ -176,6 +200,25 @@ if ! flock -n 9; then
     exit 1
 fi
 log "== library backup: lock acquired ($LOCK_FILE) =="
+RUN_STATE_OWNED=1
+
+# --reconcile-run-state: we just proved no run is in progress by TAKING the
+# lock, so any stored `running` phase is a leftover from a run that died without
+# withdrawing it — a power cut, a SIGKILL, an OOM. Withdraw it and stop.
+#
+# This is deliberately not a timeout. Library backups are legitimately bimodal
+# (~90 min, ~5h45m on the weekly hash-recalc night), so no duration bound could
+# tell a long run from a dead one; the lock can, because the kernel drops it
+# when the holder dies. Posting idle when already idle is a no-op, so this is
+# safe to run on a short timer.
+if [ "$RECONCILE_RUN_STATE" = 1 ]; then
+    trap - ERR
+    run_state idle
+    log "run-state reconciled: no backup is in progress"
+    exit 0
+fi
+
+run_state starting
 
 # ── 2. MOUNT-IDENTITY PREFLIGHT (E2 cross-check 1 / upstream finding H) ───────
 # Refuses BEFORE anything is created, which is the whole point: with `nofail` in
@@ -542,6 +585,7 @@ count_snapshots() {
     find "$FB_CHANGES" -mindepth 1 -maxdepth 1 -type d -name 'Snapshot_*' 2>/dev/null | grep -c . || true
 }
 SNAPSHOT_BEFORE="$(count_snapshots)"
+run_state backing-up
 
 # THE LEVEL IS SAID OUT LOUD BEFORE THE RUN, because it is the one knob whose
 # wrong value is invisible afterwards: a run at -mx=9 and a run at -mx=5 both
@@ -601,6 +645,9 @@ if [ "$VERIFY_RUN" != none ]; then
     VERIFY_ARGS=(verify)
     [ "$VERIFY_RUN" = deep ] && VERIFY_ARGS+=(-Deep)
     log "verify gate: running ${VERIFY_ARGS[*]} (mode=$VERIFY_RUN, weekday $(date +%u), day $(date +%-d))"
+    # A deep verify on the monthly pass is the long half of the bimodal runtime.
+    # Naming the phase is what stops that looking like a hung backup.
+    run_state verifying
     VERIFY_RC=0
     fb_run "${VERIFY_ARGS[@]}" || VERIFY_RC=$?
     # The RESTORE-SIDE code table (SR-040), which is a different table from the
@@ -640,6 +687,10 @@ SUMMARY="exit=$BACKUP_RC snapshot=$SNAPSHOT_MADE drive=$FILL_PCT full; verify=$V
 [ -n "$DEGRADED" ] && SUMMARY="$SUMMARY; DEGRADED: $DEGRADED"
 SUCCESS_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 post_file_share_backup_state lastSuccess "$SUCCESS_AT"
+# Withdraw the in-progress claim only AFTER freshness is recorded. In this order
+# the lane can never show "idle at the old age" for even one poll: the success
+# lands first, so the phase clearing reveals green rather than yesterday.
+run_state idle
 # An unconfigured state endpoint remains a benign, explicit sim condition. On
 # the hub a configured endpoint that rejects or drops the update fails the unit:
 # otherwise the wall cannot distinguish a completed backup from one that never

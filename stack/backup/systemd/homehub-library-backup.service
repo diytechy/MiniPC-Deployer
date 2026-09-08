@@ -56,6 +56,19 @@ User=root
 # leaving a half-written manifest behind each time. Later incremental runs are
 # minutes; the first one is not, and this unit has to survive it.
 TimeoutStartSec=infinity
+# WITHDRAW THE IN-PROGRESS PHASE ON EVERY EXIT PATH, including the ones the
+# script itself can never see. ExecStart's own handlers cover success and
+# failure; they do not run on SIGKILL, an OOM kill, or `systemctl stop`, and a
+# run that dies that way would otherwise leave the wall showing "backing up"
+# forever. systemd runs ExecStopPost regardless of how ExecStart ended.
+#
+# --reconcile-run-state is lock-aware, not a timeout: it posts idle only if it
+# can TAKE the backup lock, i.e. only once no run is actually in progress. That
+# matters because this fires for a start that REFUSED because another run holds
+# the lock — without the lock check it would clear a live run's phase.
+#
+# `-` so a failure here can never change the unit's own verdict.
+ExecStopPost=-/opt/homehub/stack/backup/library-backup.sh --reconcile-run-state
 # Politeness, not throttling: the hub serves DNS, the kiosk site and the shares
 # while this runs, and a multi-day IO-heavy job must not be what makes the panel
 # stutter. `idle` yields to every other IO on the box.

@@ -142,48 +142,120 @@ run_wrapper() {
     RUN_RC=$?
 }
 post_count() { [ -s "$1" ] && wc -l <"$1" | tr -d ' ' || printf 0; }
+# The assertions below count LASTSUCCESS posts, not total posts. Run phases
+# (SR-065 as amended) share this endpoint as an independent field, so a total
+# count would now conflate "claimed a backup succeeded" with "said where the run
+# is" — which is exactly the confusion the separate field exists to prevent.
+# grep -c PRINTS 0 and EXITS 1 on no match, so a `|| printf 0` fallback appends a
+# second zero and every comparison against "0" fails. Take the output, drop the
+# status.
+success_count() { local n; n="$(grep -c '"lastSuccess"' "$1" 2>/dev/null)"; printf '%s' "${n:-0}"; }
+phases() { grep -o '"runState":"[a-z-]*"' "$1" 2>/dev/null | sed 's/.*:"//;s/"//' | tr '\n' ' '; }
+
+run_reconcile() {
+    local name="$1" lock="$2"
+    : >"$TMP/$name.capture"; : >"$TMP/$name.events"
+    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
+        MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src" LIBRARY_BACKUP_LOCK="$lock" \
+        bash "$WRAPPER" --config "$TMP/good.env" --reconcile-run-state >"$TMP/$name.out" 2>&1
+    RUN_RC=$?
+}
 
 # Green means both the backup action and the configured verify action returned
 # success.  The event log proves the one state post follows both, not merely a
 # passing shell exit or a mocked helper called in isolation.
 run_wrapper success "$TMP/good.env" shallow 0 0 200
-if [ "$RUN_RC" = 0 ] && [ "$(post_count "$TMP/success.capture")" = 1 ] \
+if [ "$RUN_RC" = 0 ] && [ "$(success_count "$TMP/success.capture")" = 1 ] \
    && grep -Eq '^\{"id":"file-share-backup-health","lastSuccess":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"\}$' "$TMP/success.capture" \
-   && [ "$(tr '\n' ' ' <"$TMP/success.events")" = 'docker:backup docker:verify state ' ]; then
+   && [ "$(tr '\n' ' ' <"$TMP/success.events")" = 'state state docker:backup state docker:verify state state ' ]; then
     pass "TC-001 SR-018 posts exactly one lastSuccess only after backup and verification"
 else
-    fail "TC-001 success boundary rc=$RUN_RC posts=$(post_count "$TMP/success.capture") events=$(tr '\n' ' ' <"$TMP/success.events")"
+    fail "TC-001 success boundary rc=$RUN_RC lastSuccess=$(success_count "$TMP/success.capture") events=$(tr '\n' ' ' <"$TMP/success.events")"
+fi
+
+# The phase order is the contract the wall reads. `verifying` must sit between
+# the two container calls, and `idle` must come AFTER lastSuccess so the lane
+# never shows "finished, at yesterday's age" for even one poll.
+if [ "$(phases "$TMP/success.capture")" = 'starting backing-up verifying idle ' ] \
+   && [ "$(grep -n '"runState":"idle"' "$TMP/success.capture" | cut -d: -f1)" -gt "$(grep -n '"lastSuccess"' "$TMP/success.capture" | cut -d: -f1)" ]; then
+    pass "SR-065 phases run starting -> backing-up -> verifying -> idle, with idle after the success"
+else
+    fail "SR-065 phase order was '$(phases "$TMP/success.capture")'"
+fi
+
+# INDEPENDENCE. No phase post may carry another field: a producer saying where a
+# run is must never be able to clear a share fault or claim freshness.
+if ! grep '"runState"' "$TMP/success.capture" | grep -q '"lastSuccess"\|"shareHealth"'; then
+    pass "SR-065 a phase post carries no other state field"
+else
+    fail "SR-065 a phase post carried a second signal: $(grep '"runState"' "$TMP/success.capture")"
 fi
 
 run_wrapper preflight "$TMP/preflight-failure.env" none 0 0 200
-if [ "$RUN_RC" != 0 ] && [ "$(post_count "$TMP/preflight.capture")" = 0 ] && [ ! -s "$TMP/preflight.events" ]; then
-    pass "TC-001 SR-018 preflight refusal posts no lastSuccess and starts no container"
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/preflight.capture")" = 0 ] \
+   && ! grep -q docker "$TMP/preflight.events" \
+   && [ "$(phases "$TMP/preflight.capture")" = 'starting idle ' ]; then
+    pass "TC-001 SR-018 preflight refusal posts no lastSuccess, starts no container, and withdraws its phase"
 else
-    fail "TC-001 preflight failure rc=$RUN_RC posts=$(post_count "$TMP/preflight.capture")"
+    fail "TC-001 preflight failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/preflight.capture") phases='$(phases "$TMP/preflight.capture")'"
 fi
 
 run_wrapper container-failure "$TMP/good.env" none 1 0 200
-if [ "$RUN_RC" != 0 ] && [ "$(post_count "$TMP/container-failure.capture")" = 0 ] \
-   && [ "$(tr '\n' ' ' <"$TMP/container-failure.events")" = 'docker:backup ' ]; then
-    pass "TC-001 SR-018 failed container posts no lastSuccess"
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/container-failure.capture")" = 0 ] \
+   && [ "$(phases "$TMP/container-failure.capture")" = 'starting backing-up idle ' ]; then
+    pass "TC-001 SR-018 failed container posts no lastSuccess and ends idle"
 else
-    fail "TC-001 container failure rc=$RUN_RC posts=$(post_count "$TMP/container-failure.capture")"
+    fail "TC-001 container failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/container-failure.capture") phases='$(phases "$TMP/container-failure.capture")'"
 fi
 
 run_wrapper verify-failure "$TMP/good.env" shallow 0 3 200
-if [ "$RUN_RC" != 0 ] && [ "$(post_count "$TMP/verify-failure.capture")" = 0 ] \
-   && [ "$(tr '\n' ' ' <"$TMP/verify-failure.events")" = 'docker:backup docker:verify ' ]; then
-    pass "TC-001 SR-018 failed verification posts no lastSuccess"
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/verify-failure.capture")" = 0 ] \
+   && [ "$(phases "$TMP/verify-failure.capture")" = 'starting backing-up verifying idle ' ]; then
+    pass "TC-001 SR-018 failed verification posts no lastSuccess and ends idle"
 else
-    fail "TC-001 verify failure rc=$RUN_RC posts=$(post_count "$TMP/verify-failure.capture")"
+    fail "TC-001 verify failure rc=$RUN_RC lastSuccess=$(success_count "$TMP/verify-failure.capture") phases='$(phases "$TMP/verify-failure.capture")'"
 fi
 
 run_wrapper rejected-state "$TMP/good.env" shallow 0 0 500
-if [ "$RUN_RC" != 0 ] && [ "$(post_count "$TMP/rejected-state.capture")" = 1 ] \
-   && [ "$(tr '\n' ' ' <"$TMP/rejected-state.events")" = 'docker:backup docker:verify state ' ]; then
-    pass "TC-001 SR-018 non-200 state update fails the wrapper without a second post"
+if [ "$RUN_RC" != 0 ] && [ "$(success_count "$TMP/rejected-state.capture")" = 1 ]; then
+    pass "TC-001 SR-018 non-200 state update fails the wrapper without a second success post"
 else
-    fail "TC-001 state rejection rc=$RUN_RC posts=$(post_count "$TMP/rejected-state.capture")"
+    fail "TC-001 state rejection rc=$RUN_RC lastSuccess=$(success_count "$TMP/rejected-state.capture")"
+fi
+
+# RECONCILE. The stale-phase recovery is lock-aware rather than time-bounded:
+# library backups are legitimately bimodal, so no duration could tell a long run
+# from a dead one, but the kernel drops the lock when a holder dies.
+run_reconcile reconcile-free "$TMP/reconcile-free.lock"
+if [ "$RUN_RC" = 0 ] && [ "$(phases "$TMP/reconcile-free.capture")" = 'idle ' ] \
+   && [ "$(success_count "$TMP/reconcile-free.capture")" = 0 ] \
+   && ! grep -q docker "$TMP/reconcile-free.events"; then
+    pass "SR-065 reconcile withdraws a stale phase, claims no success, and starts no container"
+else
+    fail "SR-065 reconcile rc=$RUN_RC phases='$(phases "$TMP/reconcile-free.capture")' events=$(tr '\n' ' ' <"$TMP/reconcile-free.events")"
+fi
+
+# A HELD LOCK IS THE ANSWER, NOT A REFUSAL: a live run owns the phase, so
+# reconcile must leave it alone and exit zero — it runs on a 10-minute timer.
+cat >"$TMP/bin/flock" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$TMP/bin/flock"
+run_reconcile reconcile-held "$TMP/reconcile-held.lock"
+if [ "$RUN_RC" = 0 ] && [ "$(post_count "$TMP/reconcile-held.capture")" = 0 ]; then
+    pass "SR-065 reconcile leaves a live run's phase alone and exits zero"
+else
+    fail "SR-065 reconcile with a held lock rc=$RUN_RC posts=$(post_count "$TMP/reconcile-held.capture")"
+fi
+
+# And a NORMAL run that cannot take the lock still posts nothing at all — the
+# running backup owns the lane, and a second start must not touch it.
+run_wrapper lock-held "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" != 0 ] && [ "$(post_count "$TMP/lock-held.capture")" = 0 ]; then
+    pass "SR-018 a start refused by a held lock posts nothing"
+else
+    fail "SR-018 lock-held start rc=$RUN_RC posts=$(post_count "$TMP/lock-held.capture")"
 fi
 
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"

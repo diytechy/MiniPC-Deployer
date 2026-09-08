@@ -12,6 +12,14 @@ After=network-online.target docker.service
 [Service]
 Type=oneshot
 ExecStartPre=/usr/local/sbin/homehub-retire-legacy-backup-health
+# POWER-LOSS RECOVERY for the backup run phase. ExecStopPost on the backup unit
+# withdraws an in-progress phase on every exit systemd can see; it cannot run
+# when the box loses power mid-run, which would leave the wall showing "backing
+# up" indefinitely. This timer already runs every 10 minutes, so it bounds that
+# staleness without a new unit and without a timeout on the run itself — the
+# call is lock-aware and leaves a genuinely live backup alone.
+# `-` so it can never fail the share-health report that is this unit's job.
+ExecStartPre=-/opt/homehub/stack/backup/library-backup.sh --reconcile-run-state
 ExecStart=/usr/local/sbin/homehub-library-guard --report --label library
 # A failing report must not put the unit in a permanent failed state that
 # masks later recoveries — the REPORT is the signal, not the exit code.

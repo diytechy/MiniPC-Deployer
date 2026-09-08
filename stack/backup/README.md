@@ -348,7 +348,12 @@ Step 0 refuses instead, and reports `ok=false`. Deliberately NOT done as
 red one. Escape hatch for a target that is legitimately a plain directory:
 `BACKUP_TARGET_REQUIRE_MOUNT=false` (the run then warns loudly every time).
 
-The presence of the drive is *also* now watched independently of the run, by
+> **Presentation superseded 2026-09-07.** SN-014/SR-018 replace the separate
+> drive-presence and run lanes with one file-share/backup item. The services
+> below describe the current implementation and must be migrated; they are not
+> the target requirement. Physical preflight/identity safeguards remain.
+
+The presence of the drive is *also* currently watched independently of the run, by
 `homehub-backup-drive-health.timer` every 10 minutes — check id
 **`backup-drive-mounted`**, the backup-drive twin of `library-mounted`. Both use
 `samba/library-guard.sh`, whose only probe is `/proc/self/mountinfo`: the answer

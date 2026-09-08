@@ -8,6 +8,15 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-07 unified file-share/backup feed requirement:** Owner retired the
+separate visible library-drive, backup-drive and backup-run model. New
+SN-014/SR-018 and repo-local IF-006 consume NagLight IF-010: a missing library
+mount or failed representative Samba read is an immediate red override;
+otherwise one item ages from the last artifact-verified FileBackup success.
+Health recovery cannot advance that success time. These rows are Draft and the
+current services/sim still implement the superseded multi-lane behavior; no
+deployment or process gate changed.
+
 **2026-09-06 panel capabilities implementation:** Owner-approved app plan has
 opt-in deploy configuration, protected Caddy routing, offline sensor installation,
 private host config and camera-off verification changes. Defaults remain disabled;
@@ -5562,3 +5571,16 @@ quietly booting the old image and reporting a pass that meant nothing.
 asserted 14/14 and **must not be flashed** — it carries the deadlocking script.
 The fix is committed and in no image. The Current State header at the top of this
 file carries the exact commands to rebuild, re-derive and re-gate.
+
+## Audit — 2026-09-07 unified file-share/backup feed requirement
+
+The Owner's new presentation ruling is recorded as SN-014/SR-018 and IF-006;
+the old IDs were not redefined. The planned producer contract keeps
+share-health override state independent from FileBackup's last verified success
+and adds the previously missing Samba availability probe. Physical mount,
+identity and backup preflight safeguards remain valid internal controls, but
+they no longer earn separate panel indicators. The current multi-lane services,
+sim fixture and shell tests are explicitly implementation work, not silently
+described as already migrated. The registry-integrity check reported SN=14,
+SR=18, LLR=0 and TC=0 with integrity=0; the 26 expected G1 decomposition
+orphans remain. G1 remains active.

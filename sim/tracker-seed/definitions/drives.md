@@ -31,7 +31,12 @@ items:
 
 # Drives (sim fixture)
 
-The two drive-presence lanes the A19 two-VM gate is built around: with no data
+> **Legacy migration fixture, not target state.** Owner ruling 2026-09-07 and
+> SN-014/SR-018 replace these two visible lanes with one combined
+> file-share/whole-library-backup item. They remain temporarily so the current
+> sim exposes the implementation work instead of pretending it is complete.
+
+The two drive-presence lanes the current A19 two-VM gate is built around: with no data
 drives attached to the hub, both must report **red**, and that red must be
 visible on the panel.
 

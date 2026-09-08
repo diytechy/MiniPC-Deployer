@@ -32,7 +32,8 @@
 #   --config         backup.env (default /etc/homehub-backup/backup.env, else
 #                    the backup.env beside this script)
 #   --preflight-only steps 1-5 and stop. Nothing is created, no container runs.
-#                    This is TC-H-M14's entry point.
+#                    This is TC-H-M21's preflight entry point; the full case
+#                    also proves the combined last_success is unchanged.
 #   --verify MODE    auto (default) | none | shallow | deep — override step 8's
 #                    calendar gate. `auto` is the weekly/monthly schedule.
 set -uo pipefail

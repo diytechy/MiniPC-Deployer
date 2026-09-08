@@ -11,41 +11,16 @@ import re
 import tarfile
 
 REQUIRED = {
-    "tracker-coordination-v1": ["js/tracker-coordinator.js", "js/tracker.js"],
-    "touch-feedback-v1": [
-        "js/touch-feedback.js",
-        "css/touch-feedback.css",
-        "vendor/waves/waves.js",
-    ],
-    "transport-state-v1": ["js/views/music.js"],
-    "private-access-v1": [
-        "js/access.js",
-        "js/views/settings.js",
-        "electron/access-broker.cjs",
-    ],
-    "sensors-v1": ["sensors/service.py", "sensors/identity.py", "sensors/face_core.py"],
-    "touch-filter-v1": [
-        "touchfilter/core.py",
-        "touchfilter/daemon.py",
-        "touchfilter/replay.py",
-    ],
-    "ambient-drill-v1": ["js/views/nag.js", "js/nag-summary.js", "css/shell.css"],
-    "virtual-input-v1": [
-        "js/pin-keypad.js",
-        "js/text-keyboard.js",
-        "electron/pandora-keyboard-bridge.cjs",
-        "electron/preload.cjs",
-    ],
-    "tracker-corrections-v2": [
-        "js/tracker.js",
-        "js/tracker-coordinator.js",
-        "js/views/nag.js",
-    ],
-    "local-visualizer-v1": [
-        "js/views/visualizer.js",
-        "js/visualizer-core.js",
-        "js/visualizer-preference.js",
-    ],
+    "tracker-coordination-v1": {"app": ["js/main.js", "js/tracker-coordinator.js", "js/tracker.js"], "site": ["js/main.js", "js/tracker-coordinator.js", "js/tracker.js"], "gateway": []},
+    "touch-feedback-v1": {"app": ["index.html", "js/main.js", "js/touch-feedback.js", "css/touch-feedback.css", "vendor/waves/waves.js"], "site": ["index.html", "js/main.js", "js/touch-feedback.js", "css/touch-feedback.css", "vendor/waves/waves.js"], "gateway": []},
+    "transport-state-v1": {"app": ["index.html", "js/main.js", "js/views/music.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/music.js", "css/shell.css"], "gateway": []},
+    "private-access-v1": {"app": ["index.html", "js/main.js", "js/access.js", "js/views/settings.js", "css/access.css", "electron/access-broker.cjs", "electron/main.cjs", "electron/preload.cjs"], "site": ["index.html", "js/main.js", "js/access.js", "js/views/settings.js", "css/access.css"], "gateway": ["gateway/server.mjs", "gateway/state.mjs"]},
+    "sensors-v1": {"app": ["index.html", "js/main.js", "js/views/settings.js", "css/access.css", "electron/main.cjs", "electron/preload.cjs", "sensors/service.py", "sensors/identity.py", "sensors/face_core.py"], "site": [], "gateway": []},
+    "touch-filter-v1": {"app": ["touchfilter/core.py", "touchfilter/daemon.py", "touchfilter/replay.py"], "site": [], "gateway": []},
+    "ambient-drill-v1": {"app": ["index.html", "js/main.js", "js/views/nag.js", "js/nag-summary.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/nag.js", "js/nag-summary.js", "css/shell.css"], "gateway": []},
+    "virtual-input-v1": {"app": ["index.html", "js/main.js", "js/pin-keypad.js", "js/text-keyboard.js", "js/views/settings.js", "js/views/pandora.js", "css/access.css", "css/shell.css", "electron/pandora-keyboard-bridge.cjs", "electron/main.cjs", "electron/preload.cjs"], "site": ["index.html", "js/main.js", "js/pin-keypad.js", "js/views/settings.js", "css/access.css"], "gateway": []},
+    "tracker-corrections-v2": {"app": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "gateway": ["gateway/server.mjs"]},
+    "local-visualizer-v1": {"app": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "gateway": []},
 }
 
 
@@ -87,24 +62,23 @@ def inspect(path, kind):
         match = re.search(r"-g([0-9a-f]{7,40})(?:-linux-x64)?\.tar\.gz$", str(path))
         if not match or not source["revision"].startswith(match[1]):
             raise ValueError("filename/source stamp mismatch")
-        if kind == "shell":
-            prefix = "app/runtime/resources/app/"
-            manifest = document(prefix + "capabilities.json")
-            if manifest.get("schemaVersion") != 1:
-                raise ValueError("unknown capability schema")
-            for capability, files in REQUIRED.items():
-                if capability not in stamp.get("capabilities", []):
-                    raise ValueError("build-info missing " + capability)
-                declared = manifest.get("capabilities", {}).get(capability, [])
-                for file in files:
-                    if file not in declared:
-                        raise ValueError("manifest missing " + file)
-                    require(prefix + file)
-        elif kind == "site":
-            require("site/index.html")
-        else:
-            for file in ("gateway/server.mjs", "gateway/state.mjs"):
-                require("access/" + file)
+        payload = {"shell": "app", "site": "site", "gateway": "gateway"}[kind]
+        prefix = {
+            "shell": "app/runtime/resources/app/",
+            "site": "site/",
+            "gateway": "access/",
+        }[kind]
+        manifest = document(prefix + "capabilities.json")
+        if manifest != {"schemaVersion": 2, "capabilities": REQUIRED}:
+            raise ValueError("capability declaration mismatch")
+        if stamp.get("capabilities") != sorted(REQUIRED):
+            raise ValueError("build-info capability list mismatch")
+        for capability, declaration in REQUIRED.items():
+            files = declaration[payload]
+            if not isinstance(files, list):
+                raise ValueError("malformed payload declaration: " + capability)
+            for file in files:
+                require(prefix + file)
         return source["revision"]
 
 

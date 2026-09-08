@@ -24,30 +24,21 @@ contract = load("scripts/assert_wall_capabilities.py", "contract")
 installer = load("stack/panel-access/install-gateway.py", "installer")
 
 
-def artifact(tmp_path, kind, revision="a" * 40, omit=None, dirty=False):
+def artifact(tmp_path, kind, revision="a" * 40, omit=None, dirty=False, manifest=None):
     root = {"shell": "app", "site": "site", "gateway": "access"}[kind]
     stamp = {
         "source": {"revision": revision, "dirty": dirty},
-        "capabilities": list(contract.REQUIRED),
+        "capabilities": sorted(contract.REQUIRED),
     }
     files = {root + "/build-info.json": json.dumps(stamp)}
-    if kind == "shell":
-        prefix = "app/runtime/resources/app/"
-        files[prefix + "capabilities.json"] = json.dumps(
-            {"schemaVersion": 1, "capabilities": contract.REQUIRED}
-        )
-        for paths in contract.REQUIRED.values():
-            for path in paths:
-                files[prefix + path] = "fixture"
-    elif kind == "site":
-        files["site/index.html"] = "fixture"
-    else:
-        files.update(
-            {
-                "access/gateway/server.mjs": "fixture",
-                "access/gateway/state.mjs": "fixture",
-            }
-        )
+    payload = {"shell": "app", "site": "site", "gateway": "gateway"}[kind]
+    prefix = {"shell": "app/runtime/resources/app/", "site": "site/", "gateway": "access/"}[kind]
+    files[prefix + "capabilities.json"] = json.dumps(
+        manifest if manifest is not None else {"schemaVersion": 2, "capabilities": contract.REQUIRED}
+    )
+    for declaration in contract.REQUIRED.values():
+        for required in declaration[payload]:
+            files[prefix + required] = "fixture"
     if omit:
         files.pop(omit)
     path = tmp_path / (
@@ -87,6 +78,40 @@ def test_dirty_or_missing_manifest_release_is_rejected(tmp_path):
             ),
             "shell",
         )
+
+
+PAYLOAD_ROOT = {"shell": "app/runtime/resources/app/", "site": "site/", "gateway": "access/"}
+PAYLOAD_NAME = {"shell": "app", "site": "site", "gateway": "gateway"}
+ALL_REQUIRED_OMISSIONS = [
+    (kind, PAYLOAD_ROOT[kind] + file)
+    for kind, payload in PAYLOAD_NAME.items()
+    for declaration in contract.REQUIRED.values()
+    for file in declaration[payload]
+]
+
+
+@pytest.mark.parametrize(("kind", "missing"), ALL_REQUIRED_OMISSIONS)
+def test_each_payload_rejects_missing_manifest_or_required_implementation(tmp_path, kind, missing):
+    with pytest.raises(ValueError, match="missing capability"):
+        contract.inspect(artifact(tmp_path, kind, omit=missing), kind)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"schemaVersion": 1, "capabilities": contract.REQUIRED},
+        {"schemaVersion": 2, "capabilities": {"local-visualizer-v1": []}},
+        {"schemaVersion": 2, "capabilities": {**contract.REQUIRED, "unexpected": {"app": [], "site": [], "gateway": []}}},
+    ],
+)
+def test_each_payload_rejects_malformed_or_mismatched_declaration(tmp_path, malformed):
+    with pytest.raises(ValueError, match="declaration mismatch"):
+        contract.inspect(artifact(tmp_path, "site", manifest=malformed), "site")
+    mismatch = {"schemaVersion": 2, "capabilities": dict(contract.REQUIRED)}
+    mismatch["capabilities"]["local-visualizer-v1"] = dict(mismatch["capabilities"]["local-visualizer-v1"])
+    mismatch["capabilities"]["local-visualizer-v1"]["site"] = ["js/views/visualizer.js"]
+    with pytest.raises(ValueError, match="declaration mismatch"):
+        contract.inspect(artifact(tmp_path, "site", manifest=mismatch), "site")
 
 
 def test_three_payload_cli_rejects_full_revision_difference_even_matching_prefix(

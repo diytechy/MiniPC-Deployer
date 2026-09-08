@@ -5601,3 +5601,89 @@ sim fixture and shell tests are explicitly implementation work, not silently
 described as already migrated. The registry-integrity check reported SN=14,
 SR=18, LLR=0 and TC=0 with integrity=0; the 26 expected G1 decomposition
 orphans remain. G1 remains active.
+
+## Audit — 2026-09-08 tracker image deployed; the backup-state producers were not
+
+The hub's `naglight:local` was rebuilt from NagLight `8814dba` and deployed,
+replacing a 2026-08-29 build. `scripts/ensure-local-images.sh` was the path used,
+with only the stale `naglight:local` tag removed first so the resolver rebuilt
+that one image and skipped the other four; the resulting image carries
+`homehub.source.revision=8814dbaadd8d…` with no `+dirty`. The offline payload
+`images/naglight_local.tar` was replaced and its `images.manifest.tsv` row
+updated to match, preserving that file's existing `repo_digest = <repo>@ + image_id`
+convention. The replaced tar was verified byte-identical to the build artifact
+after the fact; it was written with `cat new > file` rather than the `.part`-plus-
+rename this repo's own `vmtest/export-images.sh` uses, and the exporter's
+approach is the one to follow next time.
+
+**The consumer half of the run-phase work is now live and the producer half is
+not.** The tracker answers `/api/backup-state`, but `6e7e970` and `185a435` — the
+commits that emit run phases — are not on the hub: `grep -rl backup-state` over
+the deployed `stack/` and `scripts/` trees returns nothing, while this repo has
+it under `stack/backup/` and `stack/samba/`. Until those are deployed the panel
+will show no run phases, because nothing posts them. That deploy edits files
+under the deployed tree and is therefore subject to the bind-mount inode rule:
+overwrite in place, because replacing an inode leaves the container serving the
+old content while a reload silently no-ops.
+
+Two live-configuration observations, neither requiring a change here. The
+`protocols h1 h2` fix in `stack/caddy/Caddyfile` is deployed and effective — no
+`alt-svc` header is served — but browsers that cached the earlier
+`alt-svc: h3=":443"` promise keep attempting QUIC for up to 30 days, per origin,
+and present as `ERR_CONNECTION_TIMED_OUT` on one hostname while another works.
+The remedy is client-side. Separately, `*.<domain>` resolves to the WAN address
+for any client that bypasses the LAN resolver, so a device using DNS-over-HTTPS
+cannot reach any of these LAN-only hostnames; explicit A records for the LAN-only
+names would fix it zone-wide, at the cost of publishing a private address, and
+the DDNS updater manages only the apex and the wildcard so it would not fight
+them. Not acted on.
+
+The wall panel was separately updated to OfficeWallNaglight `c7c9358`; its site
+half was installed into the bind-mounted `stack/wall-shell` with the directory
+inode and the live `config.json` both verified unchanged. No ISO was built or
+flashed and nothing was pushed.
+
+## Audit — 2026-09-08 (later) the oauth2-proxy allow-list was inert; wildcard removed
+
+**`OAUTH2_PROXY_EMAIL_DOMAINS: "*"` in `stack/docker-compose.yml` defeated the
+allow-list it sat beside.** Its own trailing comment read "gate on the allow-list
+file, not the domain": the intent was right and the setting contradicted it. In
+oauth2-proxy's validator the domain check and the authenticated-emails file are
+OR'd, and a `*` domain sets `allowAll = true` and returns before the file is
+consulted. The file — one entry — was inert, and any Google account would have
+been admitted to the tracker, which in multi-user provisions a per-user data dir
+on first request. Verified against the v7.15.2 source rather than assumed; it is
+oauth2-proxy issue #73.
+
+What was actually protecting the host was not in this repo: the Google OAuth app
+sat in "Testing" publishing status, so only approved test users could complete
+consent — an accident of the Google console, and the plan of record was to publish
+the app, which would have removed it. The hub is also not WAN-reachable, so the
+exposure was LAN-scoped rather than internet-scoped.
+
+**Fixed in the source tree here AND on the deployed box.** Fixing only the running
+box would have been worse than useless: `/opt/homehub` is not the source of truth,
+so the next reimage would have silently reintroduced it. Both copies now carry a
+comment block explaining why the key must not come back, how to grant access
+(the emails file, watched at runtime, plus `OAUTH2_PROXY_ALLOWED_EMAILS` for
+reimage survival), the single-file bind-mount inode rule for editing it, and the
+fact that the allow-list is evaluated at sign-in rather than per request — so
+revoking someone needs a `OAUTH2_PROXY_COOKIE_SECRET` rotation, not just a line
+removal.
+
+Verified after restarting oauth2-proxy only: `validator.go: using authenticated
+emails file`, `watcher.go: watching … for updates`, no `EMAIL_DOMAINS` in the
+container, and a cookie-less request to `/` and `/api/today` returns 403 with the
+sign-in page. Existing sessions survived, as expected — the cookie secret was not
+rotated.
+
+**Two WAN prerequisites recorded, neither acted on.** oauth2-proxy logs
+`--reverse-proxy is enabled but no --trusted-proxy-ip CIDRs were configured`;
+that is not an auth bypass and is unreachable except through Caddy today (4180
+unpublished), but once 443 is forwarded a spoofed `X-Forwarded-For` would
+undermine the rate limit and the fail2ban 401 filter. And forwarding 443 exposes
+every site block: `actual` and `dns` fail closed on `@lan remote_ip`, `wall` is on
+8443, the apex is a static string, `game` is public by intent — leaving `tracker`
+carrying the whole load, which is why the above had to be fixed first. Adding a
+`@lan` gate to `tracker` was considered and rejected: it would mask the defect and
+would have to be removed on exposure.

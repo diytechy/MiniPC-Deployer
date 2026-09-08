@@ -218,7 +218,36 @@ services:
       OAUTH2_PROXY_COOKIE_SECURE: "true"
       # Behind Caddy's TLS termination — trust the X-Forwarded-* Caddy sets.
       OAUTH2_PROXY_REVERSE_PROXY: "true"
-      OAUTH2_PROXY_EMAIL_DOMAINS: "*"              # gate on the allow-list file, not the domain
+      # OAUTH2_PROXY_EMAIL_DOMAINS IS DELIBERATELY UNSET — do not restore it.
+      #
+      # It read `"*"` with the comment "gate on the allow-list file, not the
+      # domain". That comment stated the INTENT correctly and the setting defeated
+      # it. In oauth2-proxy's validator the two checks are OR'd, and a `*` domain
+      # sets allowAll=true and RETURNS BEFORE the authenticated-emails file is ever
+      # consulted — so the allow-list was inert and ANY Google account would have
+      # been admitted to the tracker, which in multi-user provisions a per-user data
+      # dir on first request. Verified against the v7.15.2 source 2026-09-08; it is
+      # also oauth2-proxy issue #73.
+      #
+      # WHAT WAS ACTUALLY PROTECTING THE HOST: nothing in this file. The Google
+      # OAuth app sat in "Testing" publishing status, so only developer-approved
+      # test users could complete consent. That is an accident of the Google console,
+      # not a control in this stack, and PUBLISHING THE APP REMOVES IT. The hub is
+      # also not WAN-reachable today, so the exposure was LAN-scoped — but neither
+      # of those is the gate this file claims to have.
+      #
+      # With no domains configured, allowAll stays false and
+      # OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE above becomes the SOLE gate — which is
+      # what the original comment wanted. To grant access, add the address to that
+      # file (oauth2-proxy watches it; no restart needed) AND to
+      # OAUTH2_PROXY_ALLOWED_EMAILS in .env, or a reimage silently drops them.
+      # On a running box EDIT THE FILE IN PLACE (`cat new > file`): it is a
+      # single-file bind mount, so replacing the inode leaves the container reading
+      # the old one.
+      #
+      # NOTE the allow-list is evaluated AT SIGN-IN, not per request. Removing an
+      # address does not end a session already issued (cookie expiry 168h). To revoke
+      # immediately, rotate OAUTH2_PROXY_COOKIE_SECRET — that signs EVERYONE out.
     volumes:
       # The allow-list file materialized from OAUTH2_PROXY_ALLOWED_EMAILS by the
       # first-boot flow (real accounts kept out of git; see .env.example + README).

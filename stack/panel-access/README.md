@@ -28,6 +28,17 @@ gateway application and continues to core Compose startup. This prevents stale
 private-access code from surviving a rejected release without making an optional
 accessory a boot dependency for DNS, Caddy, Actual or the tracker.
 
+The ISO payload is authoritative for `panel-access/app` on every boot. First boot
+revalidates and republishes it even when that directory already exists. Editing
+the staged application in place is unsupported because the next boot restores
+the reviewed ISO version; build and stage a new coherent release instead.
+
+The shell, site and gateway source archives do not close the gateway container's
+runtime image. `PANEL_ACCESS_IMAGE` remains a major-version example until an
+operator pins a digest, exports that exact image into the offline image payload
+and rehearses loading it. Protected access is outside offline closure until those
+steps are complete.
+
 ## Hub preparation and coordinated cutover
 
 1. Build the matching OfficeWallNaglight site, app and gateway payloads. Stage

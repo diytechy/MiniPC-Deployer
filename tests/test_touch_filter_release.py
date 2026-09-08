@@ -25,7 +25,7 @@ contract = load("scripts/assert_wall_capabilities.py", "contract")
 installer = load("stack/panel-access/install-gateway.py", "installer")
 
 
-def artifact(tmp_path, kind, revision="a" * 40, omit=None, dirty=False, manifest=None, extra=None):
+def artifact(tmp_path, kind, revision="a" * 40, omit=None, dirty=False, manifest=None, extra=None, extra_archive=None):
     root = {"shell": "app", "site": "site", "gateway": "access"}[kind]
     stamp = {
         "source": {"revision": revision, "dirty": dirty},
@@ -40,8 +40,13 @@ def artifact(tmp_path, kind, revision="a" * 40, omit=None, dirty=False, manifest
     for declaration in contract.REQUIRED.values():
         for required in declaration[payload]:
             files[prefix + required] = "fixture"
+    if kind == "site":
+        for allowed in contract.ALLOWED_SITE_FILES:
+            files.setdefault("site/" + allowed, "fixture")
     if extra:
         files[prefix + extra] = "must not be public"
+    if extra_archive:
+        files[extra_archive] = "must not escape the expected archive root"
     if omit:
         files.pop(omit)
     path = tmp_path / (
@@ -87,6 +92,24 @@ def test_dirty_or_missing_manifest_release_is_rejected(tmp_path):
 def test_public_site_rejects_privileged_trees_even_when_required_files_exist(tmp_path, forbidden):
     with pytest.raises(ValueError, match="privileged file in public site"):
         contract.inspect(artifact(tmp_path, "site", extra=forbidden), "site")
+
+
+@pytest.mark.parametrize(
+    "unexpected",
+    ["debug.txt", "js/local-debug.js", "css/private-token.txt", "assets/nested/leak"],
+)
+def test_public_site_rejects_every_arbitrary_extra_served_file(tmp_path, unexpected):
+    with pytest.raises(ValueError, match="unexpected file in public site"):
+        contract.inspect(artifact(tmp_path, "site", extra=unexpected), "site")
+
+
+@pytest.mark.parametrize("unexpected", ["leak.txt", "other/leak.txt"])
+def test_public_site_rejects_files_outside_its_archive_root(tmp_path, unexpected):
+    with pytest.raises(ValueError, match="outside public site root"):
+        contract.inspect(
+            artifact(tmp_path, "site", extra_archive=unexpected),
+            "site",
+        )
 
 
 PAYLOAD_ROOT = {"shell": "app/runtime/resources/app/", "site": "site/", "gateway": "access/"}

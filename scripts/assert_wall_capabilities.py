@@ -23,6 +23,50 @@ REQUIRED = {
     "local-visualizer-v1": {"app": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "gateway": []},
 }
 
+# Exact regular-file inventory emitted by OfficeWallNaglight's SITE_SOURCES at
+# the paired release head. The hub extracts this archive into a public document
+# root, so accepting an extra file would accept an extra HTTP response surface.
+# Keep this in lockstep with the clean three-artifact build and its source stamp.
+ALLOWED_SITE_FILES = {
+    "VERSION",
+    "build-info.json",
+    "capabilities.json",
+    "config.example.json",
+    "css/access.css",
+    "css/shell.css",
+    "css/touch-feedback.css",
+    "index.html",
+    "js/access.js",
+    "js/attention-lease.js",
+    "js/config.js",
+    "js/heartbeat.js",
+    "js/idle.js",
+    "js/main.js",
+    "js/music/local.js",
+    "js/music/md5.js",
+    "js/music/provider.js",
+    "js/music/subsonic.js",
+    "js/nag-summary.js",
+    "js/pin-keypad.js",
+    "js/state-machine.js",
+    "js/text-keyboard.js",
+    "js/touch-feedback.js",
+    "js/tracker-coordinator.js",
+    "js/tracker.js",
+    "js/views/frame.js",
+    "js/views/music.js",
+    "js/views/nag.js",
+    "js/views/pandora.js",
+    "js/views/settings.js",
+    "js/views/visualizer.js",
+    "js/visualizer-core.js",
+    "js/visualizer-preference.js",
+    "vendor/waves/LICENSE",
+    "vendor/waves/README.md",
+    "vendor/waves/waves.css",
+    "vendor/waves/waves.js",
+}
+
 
 def inspect(path, kind):
     with tarfile.open(path, "r:gz") as archive:
@@ -69,6 +113,12 @@ def inspect(path, kind):
             "gateway": "access/",
         }[kind]
         if kind == "site":
+            outside_root = sorted(
+                name for name, member in members.items()
+                if member.isfile() and not name.startswith("site/")
+            )
+            if outside_root:
+                raise ValueError("unexpected file outside public site root: " + outside_root[0])
             forbidden = ("site/electron/", "site/gateway/", "site/sensors/", "site/touchfilter/")
             leaked = sorted(
                 name for name, member in members.items()
@@ -87,6 +137,18 @@ def inspect(path, kind):
                 raise ValueError("malformed payload declaration: " + capability)
             for file in files:
                 require(prefix + file)
+        if kind == "site":
+            actual_site_files = {
+                name[len("site/"):]
+                for name, member in members.items()
+                if member.isfile() and name.startswith("site/")
+            }
+            unexpected = sorted(actual_site_files - ALLOWED_SITE_FILES)
+            missing_inventory = sorted(ALLOWED_SITE_FILES - actual_site_files)
+            if unexpected:
+                raise ValueError("unexpected file in public site: " + unexpected[0])
+            if missing_inventory:
+                raise ValueError("missing public site inventory file: " + missing_inventory[0])
         return source["revision"]
 
 

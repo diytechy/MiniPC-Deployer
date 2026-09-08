@@ -22,6 +22,12 @@ been rehearsed in the lab. Do not set the knob in a reimage payload without that
 complete installation path. The protected route refuses/502s if its gateway is
 absent; it never falls back to direct tracker access.
 
+First boot treats gateway artifact ambiguity, validation failure and publication
+failure as a loud optional-feature failure. It removes any previously staged
+gateway application and continues to core Compose startup. This prevents stale
+private-access code from surviving a rejected release without making an optional
+accessory a boot dependency for DNS, Caddy, Actual or the tracker.
+
 ## Hub preparation and coordinated cutover
 
 1. Build the matching OfficeWallNaglight site, app and gateway payloads. Stage

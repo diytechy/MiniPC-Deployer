@@ -594,19 +594,25 @@ fi
 
 # Stage the coherent private gateway outside Caddy's public document root.
 # Installing files does not enable PANEL_ACCESS_ENABLED or its compose overlay.
-_wall_gateway=""
+_wall_gateway_handled=0
 shopt -s nullglob
 for cand in /opt/homehub/wall-gateway "$STACK_DIR/wall-gateway" /cdrom/deploy-payload/wall-gateway; do
     _gateway_candidates=("$cand"/officewall-gateway-*.tar.gz)
-    if [ "${#_gateway_candidates[@]}" -gt 1 ]; then
-        log "ERROR: ambiguous private gateway payload"; exit 1
+    if [ "${#_gateway_candidates[@]}" -gt 0 ]; then
+        _wall_gateway_handled=1
+        if ! bash "$STACK_DIR/panel-access/stage-gateway.sh" \
+            "$(command -v python3)" "$STACK_DIR/panel-access/install-gateway.py" \
+            "$STACK_DIR/wall-shell/build-info.json" "$STACK_DIR/panel-access/app" \
+            "${_gateway_candidates[@]}"; then
+            rm -rf "$STACK_DIR/panel-access/app"
+            log "WARN: private gateway staging failed unexpectedly and was disabled; core startup continues"
+        fi
+        break
     fi
-    if [ "${#_gateway_candidates[@]}" -eq 1 ]; then _wall_gateway="${_gateway_candidates[0]}"; break; fi
 done
 shopt -u nullglob
-if [ -n "$_wall_gateway" ]; then
-    python3 "$STACK_DIR/panel-access/install-gateway.py" "$_wall_gateway" \
-        "$STACK_DIR/wall-shell/build-info.json" "$STACK_DIR/panel-access/app" || exit 1
+if [ "$_wall_gateway_handled" -eq 0 ]; then
+    log "NOTICE: no private gateway payload found; private access remains unavailable"
 fi
 
 # ── 3e. the kiosk site's RUNTIME CONFIG (config.json) — AFTER the untar ───────

@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -24,7 +25,7 @@ contract = load("scripts/assert_wall_capabilities.py", "contract")
 installer = load("stack/panel-access/install-gateway.py", "installer")
 
 
-def artifact(tmp_path, kind, revision="a" * 40, omit=None, dirty=False, manifest=None):
+def artifact(tmp_path, kind, revision="a" * 40, omit=None, dirty=False, manifest=None, extra=None):
     root = {"shell": "app", "site": "site", "gateway": "access"}[kind]
     stamp = {
         "source": {"revision": revision, "dirty": dirty},
@@ -39,6 +40,8 @@ def artifact(tmp_path, kind, revision="a" * 40, omit=None, dirty=False, manifest
     for declaration in contract.REQUIRED.values():
         for required in declaration[payload]:
             files[prefix + required] = "fixture"
+    if extra:
+        files[prefix + extra] = "must not be public"
     if omit:
         files.pop(omit)
     path = tmp_path / (
@@ -80,6 +83,12 @@ def test_dirty_or_missing_manifest_release_is_rejected(tmp_path):
         )
 
 
+@pytest.mark.parametrize("forbidden", ["electron/main.cjs", "gateway/server.mjs", "sensors/service.py", "touchfilter/daemon.py"])
+def test_public_site_rejects_privileged_trees_even_when_required_files_exist(tmp_path, forbidden):
+    with pytest.raises(ValueError, match="privileged file in public site"):
+        contract.inspect(artifact(tmp_path, "site", extra=forbidden), "site")
+
+
 PAYLOAD_ROOT = {"shell": "app/runtime/resources/app/", "site": "site/", "gateway": "access/"}
 PAYLOAD_NAME = {"shell": "app", "site": "site", "gateway": "gateway"}
 ALL_REQUIRED_OMISSIONS = [
@@ -88,6 +97,13 @@ ALL_REQUIRED_OMISSIONS = [
     for declaration in contract.REQUIRED.values()
     for file in declaration[payload]
 ]
+
+
+def test_tracker_correction_gateway_contract_includes_stateful_handler():
+    assert contract.REQUIRED["tracker-corrections-v2"]["gateway"] == [
+        "gateway/server.mjs",
+        "gateway/state.mjs",
+    ]
 
 
 @pytest.mark.parametrize(("kind", "missing"), ALL_REQUIRED_OMISSIONS)
@@ -151,6 +167,57 @@ def test_private_gateway_extracts_only_into_private_app_and_requires_matching_si
     with pytest.raises(ValueError, match="mismatch"):
         installer.install(gateway, site, tmp_path / "rejected")
     assert not (tmp_path / "rejected").exists()
+
+
+def test_firstboot_gateway_stager_degrades_safely_and_removes_stale_app(tmp_path):
+    bash = shutil.which("bash")
+    if not bash:
+        candidate = Path("C:/Program Files/Git/bin/bash.exe")
+        if candidate.exists():
+            bash = str(candidate)
+    if not bash:
+        pytest.skip("Bash is required for gateway staging lifecycle tests")
+
+    helper = ROOT / "stack/panel-access/stage-gateway.sh"
+    site = tmp_path / "site.json"
+    site.write_text(json.dumps({"source": {"revision": "a" * 40, "dirty": False}}))
+    good = artifact(tmp_path, "gateway")
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    duplicate = artifact(other_dir, "gateway")
+    target = tmp_path / "private-app"
+
+    def run(*archives):
+        return subprocess.run(
+            [str(bash), str(helper), sys.executable, str(ROOT / "stack/panel-access/install-gateway.py"), str(site), str(target), *map(str, archives)],
+            capture_output=True,
+            text=True,
+        )
+
+    result = run(good)
+    assert result.returncode == 0, result.stderr
+    assert (target / "gateway/server.mjs").is_file()
+
+    result = run(good, duplicate)
+    assert result.returncode == 0
+    assert "WARNING" in result.stderr and "ambiguous" in result.stderr
+    assert not target.exists()
+
+    target.mkdir()
+    (target / "stale-server.mjs").write_text("stale")
+    site.write_text(json.dumps({"source": {"revision": "b" * 40, "dirty": False}}))
+    result = run(good)
+    assert result.returncode == 0
+    assert "WARNING" in result.stderr and "disabled" in result.stderr
+    assert not target.exists()
+
+
+def test_firstboot_uses_nonfatal_gateway_stager_before_core_compose():
+    source = (ROOT / "stack/autoinstall/firstboot.sh").read_text(encoding="utf-8")
+    gateway = source[source.index("# Stage the coherent private gateway"):source.index("# ── 3e.")]
+    assert "stage-gateway.sh" in gateway
+    assert "exit 1" not in gateway
+    assert source.index("stage-gateway.sh") < source.index('log "docker compose up -d')
 
 
 def test_image_wires_filter_ordering_offline_dependency_and_suspend_recovery():

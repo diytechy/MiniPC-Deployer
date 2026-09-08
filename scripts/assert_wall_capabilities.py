@@ -19,7 +19,7 @@ REQUIRED = {
     "touch-filter-v1": {"app": ["touchfilter/core.py", "touchfilter/daemon.py", "touchfilter/replay.py"], "site": [], "gateway": []},
     "ambient-drill-v1": {"app": ["index.html", "js/main.js", "js/views/nag.js", "js/nag-summary.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/nag.js", "js/nag-summary.js", "css/shell.css"], "gateway": []},
     "virtual-input-v1": {"app": ["index.html", "js/main.js", "js/pin-keypad.js", "js/text-keyboard.js", "js/views/settings.js", "js/views/pandora.js", "css/access.css", "css/shell.css", "electron/pandora-keyboard-bridge.cjs", "electron/main.cjs", "electron/preload.cjs"], "site": ["index.html", "js/main.js", "js/pin-keypad.js", "js/views/settings.js", "css/access.css"], "gateway": []},
-    "tracker-corrections-v2": {"app": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "gateway": ["gateway/server.mjs"]},
+    "tracker-corrections-v2": {"app": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "gateway": ["gateway/server.mjs", "gateway/state.mjs"]},
     "local-visualizer-v1": {"app": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "gateway": []},
 }
 
@@ -68,6 +68,14 @@ def inspect(path, kind):
             "site": "site/",
             "gateway": "access/",
         }[kind]
+        if kind == "site":
+            forbidden = ("site/electron/", "site/gateway/", "site/sensors/", "site/touchfilter/")
+            leaked = sorted(
+                name for name, member in members.items()
+                if member.isfile() and name.startswith(forbidden)
+            )
+            if leaked:
+                raise ValueError("privileged file in public site: " + leaked[0])
         manifest = document(prefix + "capabilities.json")
         if manifest != {"schemaVersion": 2, "capabilities": REQUIRED}:
             raise ValueError("capability declaration mismatch")

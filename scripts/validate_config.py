@@ -298,6 +298,7 @@ def main():
         "autoinstall/wall/wall-touch-filter.service",
         "autoinstall/wall/wall-touch-filter-sleep",
         "panel-access/install-gateway.py",
+        "panel-access/stage-gateway.sh",
         "autoinstall/wall/wall-sensors-dbus.conf",
         "panel-access/validate-panel-access.py",
         "panel-access/docker-compose.access.yml",

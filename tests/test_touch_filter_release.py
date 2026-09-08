@@ -240,6 +240,10 @@ def test_firstboot_uses_nonfatal_gateway_stager_before_core_compose():
     gateway = source[source.index("# Stage the coherent private gateway"):source.index("# ── 3e.")]
     assert "stage-gateway.sh" in gateway
     assert "exit 1" not in gateway
+    assert "_gateway_candidates=()" in gateway
+    assert gateway.index("for cand in ") < gateway.index("elif ! bash")
+    assert "break" not in gateway
+    assert '"${_gateway_candidates[@]}"' in gateway
     assert source.index("stage-gateway.sh") < source.index('log "docker compose up -d')
 
 

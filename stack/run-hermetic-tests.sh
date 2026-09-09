@@ -30,6 +30,7 @@ SUITES=(
     "provision/tests/restore-volumes.test.sh"
     "icedrive/tests/profile.test.sh"
     "remote-ui/tests/icedrive-gate.test.sh"
+    "ai-cli/tests/ai-cli-guards.test.sh"
 )
 
 if [ "${1:-}" = "--list" ]; then

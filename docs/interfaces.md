@@ -45,6 +45,22 @@ panel; that repo owns the app):
   cache). Those four are what keeps the row out of `Implemented`; the details
   live in `stack/autoinstall/wall/README.md` "What IF-005 still owes".
 
+**This repo → on-box callers** (`Provides` — the AI CLI service):
+
+- **IF-011** — `Implemented` 2026-09-09 (SR-019; HomeHub A40). `POST /v1/ask`
+  on `{$AI_CLI_BIND}:{$AI_CLI_PORT}` — **loopback or the docker bridge only,
+  never the LAN** — takes `{route, schema, messages}` and answers by running one
+  headless CLI session on the household subscription. **Model and depth are
+  configuration, not request fields:** they come from the registry row a
+  `route` names, and a request carrying `model` or `effort` is ignored. `schema`
+  is required and becomes the CLI's `--json-schema`. **Not provided:** any path
+  that reaches this from the LAN, `--bare` (it ignores the OAuth token and needs
+  an API key), and an unconstrained answer. **Latency:** because `--bare` is
+  unusable on the subscription, full startup is paid per call — measured
+  2026-09-09 at ~1.6–2.2 s of non-model startup and ~3–4 s wall for the cheapest
+  call, on the dev PC; the hub is slower. Callers must not put this on a
+  sub-second synchronous path. Details in `stack/ai-cli/README.md`.
+
 ---
 
 ## Why a separate registry

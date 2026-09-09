@@ -1,0 +1,22 @@
+# routes-enabled — the CONSENT half of the registry (ai-template's enable-list).
+#
+# agents.registry.csv is a CATALOG. This file is the ordered list of route ids
+# a caller may actually name. An absent or empty file is "no routes", and the
+# service refuses to start rather than treating that as "everything" — an empty
+# pool is a consent decision, not a broken file.
+#
+# One id per line, `#` comments. Adding a line is the whole of turning a route
+# on; nothing else has to change.
+
+# The default, and A40's own finding is that it is the right default: song
+# grouping and categorisation are classification work, which wants an answer
+# rather than an agent, so the cheapest row leads.
+ANALYSIS-QUICK
+
+# Deeper analysis. Uncomment when a consumer needs it — the subscription is one
+# pool and this row competes with the interactive quota.
+# ANALYSIS-DEEP
+
+# The second family. Off until a consumer needs cross-family diversity; it also
+# needs the codex CLI carried and signed in on the same dedicated account.
+# ANALYSIS-CODEX

@@ -1,0 +1,99 @@
+[Unit]
+# The hub's AI CLI service (SR-019). A plain service, no container: A40
+# (2026-09-09) ruled the container out because the subscription credential has
+# to come from a home directory a human logged into interactively, so a
+# container would have to mount that home and the isolation is punctured at the
+# only point that mattered. Containment is this unit plus the guards in
+# ai_cli_service.py, and every one of them is asserted by a test.
+Description=HomeHub AI CLI service (SR-019, loopback-only, read-only tool use)
+Documentation=file:///opt/homehub/stack/ai-cli/README.md
+After=network-online.target homehub-firstboot.service
+Wants=network-online.target
+# Nothing to do on a box where the layer was never provisioned.
+ConditionPathExists=/opt/homehub/stack/.env
+
+[Service]
+Type=simple
+
+# ── ACCEPTANCE 1: a DEDICATED UNPRIVILEGED ACCOUNT, NEVER `hub` ─────────────
+# `hub` is the box's only account with a real shell AND (ALL) NOPASSWD: ALL
+# (stack/remote-ui/homehub-desktop-session.sh). A service running as `hub`,
+# driving an agent, taking requests from other containers is arbitrary code
+# execution as a passwordless-sudo user chosen by the caller. This account is
+# created by setup-ai-cli.sh with no sudo and no docker group, and it is the
+# account the CLIs are signed into over RDP — so the credential lives where the
+# service runs and nowhere else.
+#
+# The name is ALSO checked at runtime (ai_cli_service.assert_service_account),
+# because a unit file is asserted by eye and an eye is not a test: the service
+# refuses to start as `hub` or `root`, in a sudo-granting group, or named in
+# any sudoers rule.
+User=homehub-ai
+Group=homehub-ai
+NoNewPrivileges=yes
+
+# ── ACCEPTANCE 3: LOOPBACK OR THE DOCKER BRIDGE, NEVER THE LAN ──────────────
+# AI_CLI_BIND is read from the environment file below and validated by
+# resolve_bind() before the socket is created: loopback or 172.16/12 only, and
+# the wildcard is refused BY NAME, because `0.0.0.0` is exactly the edit that
+# puts the household's interactive credential on the LAN without looking like
+# a LAN address.
+#
+# THE BIND IS THE WHOLE MECHANISM, and saying so is more honest than a
+# systemd IPAddress* filter that does not do what it appears to. This service
+# must reach the vendor API over the public internet, so any IPAddressAllow
+# wide enough for that (0.0.0.0/0) also re-admits the LAN — systemd's filter
+# has no ingress/egress split to express "out to anywhere, in from loopback".
+# The refusal therefore lives in resolve_bind(), which runs before the socket
+# exists, and is asserted by test rather than read off this file.
+#
+# ExecStartPre below runs `--check`, which re-runs that validation as its own
+# process: a unit that would have bound the LAN fails BEFORE ExecStart.
+
+# ── ACCEPTANCE 4: A SCRATCH WORKING DIRECTORY PER REQUEST ───────────────────
+# StateDirectory gives the account /var/lib/homehub-ai at 0700; the service
+# makes one mkdtemp child of scratch/ per request and removes it on every exit
+# path. The unit's own working directory is that state tree and never a real
+# one, so even a bug that skipped the per-request directory could not land the
+# agent in /srv/library or /opt/homehub.
+StateDirectory=homehub-ai
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/homehub-ai
+
+# ── ACCEPTANCE 2 is in the registry and in assert_safe_template(): read-only
+# tool use, and no --dangerously-* flag anywhere. It cannot live here, so it is
+# enforced at every launch instead of being written down once.
+
+EnvironmentFile=/opt/homehub/stack/.env
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/ai-cli/ai_cli_service.py --check
+ExecStart=/usr/bin/python3 /opt/homehub/stack/ai-cli/ai_cli_service.py
+
+# Ordinary hardening. The agent reads analysis paths and writes only its own
+# scratch directory, so everything else is read-only or gone.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# A box with no AI CLI service is DEGRADED, not broken — the stack, the shares
+# and the backups are unaffected. Retry a few times, then stop rather than
+# looping forever: a REFUSED TO START is a configuration fault a human fixes,
+# and a restart loop would bury the reason in the journal.
+Restart=on-failure
+RestartSec=20
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target

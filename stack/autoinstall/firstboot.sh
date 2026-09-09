@@ -1800,6 +1800,39 @@ elif [ "$ICEDRIVE_MODE" = "off" ]; then
     log "ICEDRIVE_MODE=off - no IceDrive client of either kind on this box."
 fi
 
+# ── 6d. the AI CLI service (SR-019, A40 ratified 2026-09-09) ─────────────────
+# A plain service, no container. Gated exactly like REMOTE_UI_ENABLED, and OFF
+# by default: with the knob false the account is not created, the unit is not
+# installed, and nothing listens.
+#
+# THE SCRIPT DOES THE REFUSING, NOT THIS BLOCK. setup-ai-cli.sh refuses
+# AI_CLI_USER=hub or root, refuses an account that has since acquired sudo or
+# docker, and refuses a bind address outside loopback and the docker bridge —
+# and it re-checks all of that on EVERY boot, because an account created
+# without sudo can be given it later. A refusal is exit 2 and is reported here
+# as a WARNING with the reason, never swallowed.
+if [ "${AI_CLI_ENABLED:-false}" = "true" ]; then
+    log "provisioning the AI CLI service (activated by .env)…"
+    if [ -f "$STACK_DIR/ai-cli/setup-ai-cli.sh" ]; then
+        if bash "$STACK_DIR/ai-cli/setup-ai-cli.sh" 2>&1 | sed 's/^/  /'; then
+            log "  AI CLI service installed and enabled on ${AI_CLI_BIND:-127.0.0.1}:${AI_CLI_PORT:-8791}"
+            log "  STILL OWED BY A HUMAN: sign the CLIs in as ${AI_CLI_USER:-homehub-ai}"
+            log "    over RDP (claude setup-token). The credential does not survive a"
+            log "    reimage - the same posture as IceDrive."
+        else
+            log "  WARNING: setup-ai-cli.sh refused or failed - this box has NO AI CLI"
+            log "    service. Everything else is unaffected. The reason is in the lines"
+            log "    above; re-run by hand once fixed:"
+            log "      sudo bash $STACK_DIR/ai-cli/setup-ai-cli.sh"
+        fi
+    else
+        log "  WARNING: AI_CLI_ENABLED=true but no $STACK_DIR/ai-cli/setup-ai-cli.sh"
+        log "    on the payload - carriage missing for an activated feature."
+    fi
+else
+    log "AI_CLI_ENABLED is not true - no AI CLI service, no dedicated account."
+fi
+
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
 # A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO

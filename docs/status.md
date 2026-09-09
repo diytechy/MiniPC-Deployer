@@ -8,6 +8,22 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 the AI CLI service (B12, SR-019/LLR-002/TC-002/IF-011):** the hub
+gains a plain service — no container — that answers `POST /v1/ask` from on-box
+callers by running one headless CLI session on the household subscription:
+messages in, model and depth from a registry row rather than the request, the
+answer constrained by a supplied `--json-schema`. A40's four containments are
+implemented as **refusals in code, each asserted by a test**: a dedicated
+unprivileged account that is never `hub`, read-only tool use with no
+`--dangerously-*` flag anywhere in the tree, a bind restricted to loopback or
+the docker bridge, and a fresh 0700 working directory per request. It ships
+**OFF** (`AI_CLI_ENABLED=false`) and declares no credential — the subscription
+token is minted by `claude setup-token` in an RDP session as the service
+account and does not survive a reimage. **Measured latency floor: ~1.6–2.2 s of
+non-model startup, ~3–4 s wall for the cheapest call**, because `--bare` needs
+an API key and cannot be used on the subscription. No live hub state changed;
+no apt package added, so no apt export is owed.
+
 **2026-09-07 unified file-share/backup feed requirement:** Owner retired the
 separate visible library-drive, backup-drive and backup-run model. New
 SN-014/SR-018 and repo-local IF-006 consume NagLight IF-010: a missing library
@@ -5747,3 +5763,89 @@ pre-existing environment gap (`import pytest` fails at the interpreter) and not
 attributable to these commits. It is still an unrun step, not a passing one.
 
 Rollback point kept as the tag `pre-b15-2026-09-09` (`bf74c67`).
+
+## Audit — 2026-09-09 the AI CLI service lands, contained and off (B12)
+
+**What it is.** `stack/ai-cli/` — `ai_cli_service.py`, `agents.registry.csv`,
+`routes-enabled`, `homehub-ai-cli.service`, `setup-ai-cli.sh`, a README and a
+hermetic guards suite — plus firstboot step 6d, nine `AI_CLI_*` knobs in
+`stack/.env.example` and the matching T0 rows in HomeHub's `FieldSchema.psd1`.
+Spine: **SR-019, LLR-002, TC-002, IF-011**, under SN-016, implementing HomeHub
+`open-items.md` **A40 as ratified 2026-09-09**.
+
+**No container, and that is the ruling rather than a shortcut.** A container was
+only ever wanted for containment and delivers none here: the subscription
+credential must come from a home directory a human logged into interactively, so
+a container has to mount that home and the isolation is punctured at the only
+point that mattered.
+
+**The four acceptance properties are the block, and none of them is asserted by
+eye.** Each is a refusal in code with a test behind it:
+
+| Property | Enforced by | Asserted by |
+|---|---|---|
+| dedicated unprivileged account, never `hub` | `assert_service_account`; `setup-ai-cli.sh` refusals; `User=homehub-ai` | 8 pytest cases + guards A2/A3 |
+| read-only tool use, no `--dangerously-*` anywhere | `assert_safe_template`, run at startup **and every launch** | 9 pytest cases + guards A1/A9/A11 |
+| loopback or the docker bridge, never the LAN | `resolve_bind`, before the socket exists | 18 pytest cases + guards A4/A5/A6/A8 |
+| a scratch working directory per request | `request_scratch` + `StateDirectory` 0700 | 4 pytest cases + guards A10 |
+
+Two of those deserve naming. The account check does not stop at the name: a
+dedicated account that has **since** been put in `sudo`/`docker`/`adm`, or named
+in any sudoers rule, is refused — and `setup-ai-cli.sh` re-checks on every boot,
+because an account created without sudo can be given it later. The
+`--dangerously-*` check is by **prefix**, so a flag a future CLI version invents
+is caught before this repo is updated, and it is a **tree-wide grep**, so a
+copy-paste out of `ai-template` fails the build rather than shipping. The grep
+pattern is `--dangerously-[a-z]`, not the bare prefix, so prose that forbids the
+flag (which writes the glob) does not fail the check that enforces the ban;
+three files that must write a real flag name — the two test files and
+`stack/ai-cli/README.md` — are excluded by name, and nothing in them executes.
+
+**What was reused from `ai-template`, and what was not.** Reused: the pair-row
+registry and its loader (its IF-045 schema), the per-row cooldown, and the
+session-launch decisions (its IF-064) — prompt on stdin when the template
+carries no `{prompt}` (WI-216), codex's `--output-last-message` because it
+echoes the prompt into stdout (WI-217), a reader thread, a per-session timeout,
+stdin never left open. **Not reused: its flags.** That repo carries them because
+it *is* the consented unattended run; this service's work is chosen by a caller,
+so the consent does not transfer.
+
+**THE MEASURED LATENCY FLOOR, because it is what sizes every consumer.**
+`--bare` — the fast startup meant for scripts — ignores the OAuth token and
+requires an API key, so a service on the subscription cannot use it and pays
+full startup per call. Measured 2026-09-09, `claude 2.1.201`, trivial prompt
+(`-p … --output-format json --max-turns 1`), three runs from an empty working
+directory: wall **4125 / 2914 / 3730 ms** against the transcript's own
+`duration_ms` of **1897 / 1234 / 2087 ms** — so roughly **1.6–2.2 s of non-model
+startup, and ~3–4 s wall for the cheapest possible call**. Two caveats that make
+the real number worse, not better: this was the **dev PC, not the hub** (the
+AK41 is slower), and the directory was empty so no project `CLAUDE.md` or skills
+loaded. Consequence: nothing may put this on a sub-second synchronous path, and
+`AI_CLI_TIMEOUT_SECONDS` should be set against this figure rather than a guess.
+`--bare` is on the banned-token list for that reason as well as for safety, so
+the floor cannot be "optimised" away by quietly moving to a metered key.
+
+**Evidence.** `python scripts/check.py` — **PASS** at gate G1, all four steps:
+config-validate, unit-tests (**207 passed, 4 skipped**, of which 53 passed and 1
+skipped are the new `tests/test_ai_cli_service.py`), registry-integrity
+(SN=16 SR=19 LLR=2 TC=2, **integrity=0**), doc-navigability.
+`python scripts/trace.py --strict` — clean, orphans 26 → **25** (SR-019 has a
+TC). `python scripts/check_flows.py --no-placeholders` — **OK, 1 diagram, 2 ids,
+all known**; it was FAILING before this change for want of a "Runtime flows"
+heading, and the `/v1/ask` sequence diagram added to `docs/architecture.md`
+clears it. `bash stack/ai-cli/tests/ai-cli-guards.test.sh` — **16 PASS, 0 FAIL**
+run standalone; the whole `run-hermetic-tests.sh` runner still **refuses on this
+machine** for want of `zstd` and `rsync`, which is the pre-existing dev-PC gap,
+not a result.
+
+**Correcting the previous block's report:** `pytest` *is* available to
+`check.py` on this machine — the harness invokes `C:\Python38\python.exe -m
+pytest` and the unit-tests step ran and passed here, both before and after this
+change. B15's note that it "fails for want of `pytest`" does not reproduce.
+
+**Nothing live changed.** No account was created, no unit installed, no service
+started; deployment stays a separate Owner-run step, and the sign-in
+(`claude setup-token` over RDP as `homehub-ai`) is still owed by a human. No apt
+package name was added — the service is Python 3 stdlib only and the CLIs are
+not apt packages (SN-016) — so no apt export re-run is owed.
+

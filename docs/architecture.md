@@ -159,3 +159,57 @@ constraint was lifted 2026-07-03, WI-10.13):
 
 The honest ledger of what has and has not been exercised is
 [status.md](status.md).
+
+## Runtime flows
+
+Hand-authored sequence diagrams of the behaviour that is easiest to misread
+from registry rows (process.md §3). Each cites the ids it renders.
+
+### One `/v1/ask` request, and every refusal on the way (SR-019, LLR-002, IF-011)
+
+The four containments A40 ratified are **refusals in the request path**, not
+lines in a unit file, and this is the order they fire in. Read it for what a
+caller *cannot* make happen: it cannot reach the service from the LAN, cannot
+name a route nobody enabled, cannot choose the model or the depth, cannot get
+an unconstrained answer, and cannot make the session start anywhere real.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Owner (once, over RDP)
+    participant Sys as systemd
+    participant Svc as ai_cli_service (as homehub-ai)
+    participant Caller as an on-box caller
+    participant CLI as claude -p (child)
+
+    Note over Op,Svc: SR-019 — setup-ai-cli.sh created homehub-ai with no sudo;<br/>the Owner signed the CLI in as THAT account, so the credential<br/>lives where the service runs and nowhere else.
+    Op->>Svc: claude setup-token (~homehub-ai/.claude, 0600)
+
+    Sys->>Svc: ExecStartPre --check
+    Svc->>Svc: assert_service_account: hub/root, sudo group, sudoers rule -> REFUSE
+    Svc->>Svc: resolve_bind: not loopback and not 172.16/12 -> REFUSE (before any socket)
+    Svc->>Svc: assert_safe_template x every enabled route -> REFUSE on --dangerously-*, --bare, missing read-only token
+    Sys->>Svc: ExecStart (binds 127.0.0.1 only)
+
+    Caller->>Svc: POST /v1/ask {route, schema, messages}
+    alt route not in routes-enabled
+        Svc-->>Caller: 403 + the allowed ids
+    else no schema
+        Svc-->>Caller: 400 — an unconstrained answer is not offered
+    else route cooling down
+        Svc-->>Caller: 429
+    else accepted
+        Svc->>Svc: request_scratch -> a fresh 0700 mkdtemp dir (LLR-002)
+        Svc->>Svc: build_argv — model+effort from the ROW, never the request
+        Svc->>CLI: spawn in that dir; prompt on STDIN (never argv); --json-schema
+        Note over CLI: read-only tool use: --permission-mode plan,<br/>--disallowedTools Bash,Write,Edit
+        CLI-->>Svc: --output-format json transcript
+        Svc->>Svc: rmtree the scratch dir (every exit path, timeout included)
+        alt a typed result object
+            Svc-->>Caller: 200 {route, result, raw}
+        else exit 0 but no result object
+            Svc->>Svc: cool(route)
+            Svc-->>Caller: 502 — assert the artifact, not the exit code
+        end
+    end
+```

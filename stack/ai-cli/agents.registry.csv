@@ -1,0 +1,37 @@
+# ai-cli route registry — one row = one (model x route) PAIR.
+#
+# SCHEMA IS ai-template's (its IF-045): Id,Family,Model,Version,Tier,CmdTemplate,Env,Notes.
+# The registry loader, the enable-list composition and the per-row cooldown are
+# reused from ai-template's agent_route.py; the SESSION launch decisions
+# (prompt on stdin when the template carries no {prompt}; codex needing
+# --output-last-message because it echoes the prompt into stdout) are reused
+# from its agent_session.py. See stack/ai-cli/README.md.
+#
+# THE FLAGS ARE NOT REUSED, AND THAT IS THE POINT (A40, ratified 2026-09-09).
+# Every Claude row in ai-template/docs/agents.toml carries a
+# --dangerously-* permission-skipping flag and every codex row carries a
+# --dangerously-* sandbox-bypassing one (both named in README.md, which is the
+# one file here allowed to write them out), because THAT repo is itself the
+# consented unattended run. This service's work is chosen by a caller, so that
+# consent does not transfer. Tool use here is READ-ONLY, not absent: the model
+# may read the analysis path and reason over it, and may not write or execute.
+#   claude: --permission-mode plan + an --allowedTools read-only allow-list and
+#           an explicit --disallowedTools deny (deny wins).
+#   codex : --sandbox read-only with an approval policy that never prompts.
+# ai_cli_service.assert_safe_template REFUSES to launch a row that carries a
+# --dangerously-* flag, --bare, or that is missing its family's read-only
+# token, so this file being edited badly is a launch failure, not an exposure.
+#
+# --bare IS UNUSABLE HERE and is on the banned list for that reason as well as
+# for safety: it ignores the OAuth token and requires an API key (A40), and
+# this service leans on the subscription. Full startup is therefore paid per
+# call — see README.md "The latency floor" for the measurement.
+#
+# {model} is substituted at launch. NO {prompt}: the messages go to the child's
+# STDIN, immune to command-line caps (ai-template WI-216). --json-schema and
+# the working directory are appended per request by the service, because both
+# are per-request values and neither belongs in tracked config.
+Id,Family,Model,Version,Tier,CmdTemplate,Env,Notes
+ANALYSIS-QUICK,ANTHROPIC,claude-haiku-4-5,4.5,quick,"claude -p --model {model} --output-format json --permission-mode plan --allowedTools Read,Grep,Glob --disallowedTools Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch",CLAUDE_CODE_EFFORT_LEVEL=low,"default route for classification-shaped work (song grouping, categorisation) — A40's own finding is that these jobs want an answer, not an agent, so the cheapest row is the default"
+ANALYSIS-DEEP,ANTHROPIC,claude-opus-5,5,medium,"claude -p --model {model} --output-format json --permission-mode plan --allowedTools Read,Grep,Glob --disallowedTools Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch",CLAUDE_CODE_EFFORT_LEVEL=medium,"depth is CONFIGURATION not a request field — a caller names a route id from the enable-list and cannot dial the model or the effort itself"
+ANALYSIS-CODEX,OPENAI,gpt-5.6-codex,5.6,medium,"codex exec --sandbox read-only --ask-for-approval never -c model_reasoning_effort=medium -m {model}",,"second family for diversity; codex additionally captures --output-last-message because it echoes the whole prompt into stdout (ai-template WI-217). OFF unless named in the enable-list."

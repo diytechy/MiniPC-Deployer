@@ -5,6 +5,16 @@ needs + edge-case expectations. Engineering translations live in
 `system-requirements.csv` (referenced by `SN-Refs`); do not restate them here.
 Priority: **M**=Must · **S**=Should · **C**=Could.
 
+## Id reservations (concurrent sessions)
+
+Pulled above the marks the build plan set (`SR-018` / `IF-010`) so two sessions
+in flight cannot collide. Delete a row once the work is merged and the id is
+visible in its registry.
+
+| Ids | Taken by | When |
+|---|---|---|
+| SR-019, LLR-002, TC-002, IF-011 | B12 — the AI CLI service (SN-016, HomeHub A40) | 2026-09-09 |
+
 This repo is a **config/infra deliverable** (compose, Caddy, autoinstall,
 provisioning), scaffolded at the **minimum profile** with a **HIGH** decision
 dial (secrets-adjacent infra — ratify often). The spine is kept deliberately

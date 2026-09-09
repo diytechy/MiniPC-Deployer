@@ -1,0 +1,25 @@
+[Unit]
+Description=Run the HomeHub AI-usage feeder (SR-021)
+Documentation=file:///opt/homehub/stack/ai-usage/README.md
+
+[Timer]
+# THE CADENCE IS SET BY NAGLIGHT'S STALENESS HORIZON, NOT BY TASTE. A gauge
+# whose window kind is "weekly" goes stale 24h after `observed_at`, and the
+# codex and Claude weekly gauges are exactly that. A daily feeder would sit
+# permanently one missed run away from the whole panel reading "unavailable",
+# so the interval is a small fraction of the tightest horizon: 10 minutes is
+# 1/144th of it, which means the panel survives a long outage of any single
+# source and still tells the truth about it within the day.
+#
+# tests/test_ai_usage_feeder.py reads THIS LINE and fails if the interval is
+# ever loosened past a quarter of the weekly horizon, so the relationship is
+# enforced rather than remembered.
+OnBootSec=5min
+OnUnitActiveSec=10min
+# Do not stampede three vendor APIs from every box at the same second.
+RandomizedDelaySec=90
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

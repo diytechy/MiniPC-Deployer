@@ -8,6 +8,116 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 the AI-usage feeder (B7, SR-021/LLR-005/TC-005/IF-013):** the hub
+gains a second plain service - no container, on a 10-minute timer - that reads
+how much of each AI subscription has been consumed and posts it to NagLight as
+five gauges. It ships **OFF** (`AI_USAGE_ENABLED=false`) and declares no
+credential.
+
+**All three sources were verified with one real call BEFORE any parser existed**,
+which the build plan made a hard gate rather than a preference, because a parser
+written from documentation posts fiction and fiction looks exactly like a healthy
+subscription. None of the three was blocked:
+
+* **Codex** - `codex app-server --stdio`, JSON-RPC `initialize` then
+  `account/rateLimits/read`. Returned `rateLimits.primary.usedPercent 34`,
+  `windowDurationMins 10080` (so the codex gauge is WEEKLY), `resetsAt`
+  1789435411, plus a `rateLimitsByLimitId` map. **No credential passes through
+  the feeder for this source at all** - the child reads its own
+  `~/.codex/auth.json` and we read stdout. Only the compatible `rateLimits` view
+  is parsed: the per-limit-id buckets (`codex_bengalfox`,
+  `base_model_inference`) are vendor implementation detail and gauges keyed off
+  them would appear and vanish as a model is renamed.
+* **Claude** - `GET https://api.anthropic.com/api/oauth/usage` with
+  `anthropic-beta: oauth-2025-04-20` and a `claude-code/<version>` UA. **200**,
+  carrying `five_hour.utilization 79.0` and `seven_day.utilization 87.0` as
+  FLOAT percents, plus a `limits[]` array. That array carries the vendor's own
+  `severity` words and **the feeder discards them** - NagLight owns severity and
+  colour, and a feeder that forwarded "warning" would make the panel's authority
+  ambiguous. A test greps a built body for `severity`/`css`/`colour`.
+* **OpenCode Go** - `GET https://opencode.ai/zen/go/v1/usage` with the workspace
+  bearer key from `auth.json`. **200**, `{"usage":{"rolling":…,"weekly":
+  {"percent":58},"monthly":{"percent":89}}}`. **`rolling` is deliberately NOT
+  posted**: it names no window length and the endpoint publishes none, and since
+  `direction` is refused without a `window` the alternatives were to invent a
+  window length or to ship a gauge with the 7-day horizon that stays green for a
+  week after the feeder dies. Both are the fabricated reading the feed contract
+  was tightened to stop.
+
+**Gemini is out** - deferred as E11, and a test asserts no `parse_gemini` exists,
+because a speculative parser is exactly the failure this block was written to
+prevent.
+
+**"UNAVAILABLE, NEVER A GREEN GAUGE" IS ONE INVARIANT, NOT A SCATTER OF
+CHECKS.** `build_post` says: `observed_at == now` **if and only if** this cycle
+actually read the source. Everything else falls out of NagLight's own rule that
+`observed_at` is when the value was TRUE - a failed source reposts its last real
+reading at its **original** stamp and goes stale on its horizon, and a source
+that has never succeeded posts value 0 with **no `observed_at` at all**, which is
+stale on arrival so the panel says "unavailable" rather than showing nothing.
+Six failure classes (transport error, timeout, 401, garbage body, well-formed
+body with no usable bucket, and a bug in one of our own parsers) collapse to that
+single path, and each is asserted against NagLight's horizon table rather than
+against our intent. **The cadence follows from the horizons:** two gauges are
+`weekly`, whose horizon is 24 h, so the timer is 10 minutes and a test reads the
+shipped timer file and fails if that is ever loosened past a quarter of it.
+
+**"Never writes a vendor credential file" is an ALLOW-LIST, not a deny-list.**
+`open_for_write` is the only writing door in the module and admits exactly one
+path plus its `.tmp` sibling, because a list of known credential filenames
+cannot survive the next CLI version putting its token somewhere new. Backed by
+three independent lines: `read_secret_file` has no write mode (a test greps it),
+the unit mounts that home `ProtectHome=read-only` (not `yes` - it must still
+READ it), and a test runs a whole cycle inside a throwaway HOME holding all
+three real-shaped credential files and fails if **any byte under it changed**,
+if more than one file was written, or if the written file contains a token.
+
+**It refuses to guess, in the manner of `TRACKER_DRIVE_USER`.** `AI_USAGE_USER`
+ships blank and blank is a **refusal** - `setup-ai-usage.sh` will not install and
+`resolve_identity` will not run, both saying why. No "the only user" fallback: a
+single-user box is a two-user box after one oauth2-proxy login, and a usage gauge
+on the wrong person's board is a lie about their own subscription.
+`AI_USAGE_FEED_URL` refuses in the same spirit - loopback or an address a local
+docker bridge is **actually carrying**, never a LAN or public host and never the
+https route through oauth2-proxy, which would overwrite `X-Forwarded-User`. That
+is `resolve_bind`'s SR-019 lesson reused: `172.16.0.0/12` contains real household
+LANs, so membership of the range proves nothing.
+
+**AND THE END-TO-END SMOKE FOUND ANOTHER, WHICH IS WHY IT WAS RUN.** With all
+three parsers green against captured bodies, one cycle was run against the three
+LIVE sources with the POST recorded rather than sent (no hub state touched).
+OpenCode answered **403** where the verification call had answered 200: the
+verification sent a named `User-Agent` and the first cut of `read_opencode` sent
+none, so urllib's default `Python-urllib/3.x` went out. **The feeder behaved
+exactly as specified while broken** - two "unavailable" gauges and a named
+failure line, never a green one - which is the only reason the fault was visible
+rather than silent. Fixed, and three more mutations (M26-M28: drop the agent,
+replace the `claude-code/<version>` agent, drop the `anthropic-beta` header) all
+turn the suite red. The re-run posts **all five gauges live**: codex 34%
+(weekly), Claude session and weekly 87% (daily/weekly), OpenCode 58% weekly and
+89% monthly, each with `min:0 max:100 target:0 direction:"up"` and no colour
+field anywhere.
+
+**MUTATION-TESTED, AND IT FOUND ONE.** 25 deliberate defects were run against
+`tests/test_ai_usage_feeder.py`; 24 turned it red immediately and **M15 did
+not**. M15 made a failing source discard every reading collected so far, and the
+test passed only because it read the failing source FIRST - there was nothing
+collected yet to discard. The test now runs BOTH orders and M15 is red. That is
+the fourth block in this build to find a vacuous assertion, and the first cut of
+this one would have shipped it.
+
+**Assumption recorded for the next gate (AGENTS.md "Ask, don't assume").** The
+plan says "profile-gated". There is no compose profile to join, because this is
+not a container - so `AI_USAGE_ENABLED` **is** the gate, the same shape as
+`AI_CLI_ENABLED` and `REMOTE_UI_ENABLED`, and only a literal `true` enables it.
+
+**Not done, and named rather than buried:** `stack/run-hermetic-tests.sh`
+REFUSES on this dev PC (`missing tool(s): zstd rsync`), so the shell carriage
+(`setup-ai-usage.sh`, the firstboot hook) has been syntax-checked with `bash -n`
+and reviewed, but never executed. No live hub or panel state changed. No apt
+package added - python3 stdlib only, and python3 is already in `packages.list` -
+so no apt export is owed.
+
 **2026-09-09 occupancy power in the wall image (B9, SR-020/LLR-003/TC-003/IF-012):**
 the panel's backlight and its suspend/RTC path now come out of **one** evaluation
 of **one** knob set (`SLEEP_MODE`, `SLEEP_START`, `SLEEP_END`,

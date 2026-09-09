@@ -1,0 +1,73 @@
+[Unit]
+# The hub's AI-usage feeder (SR-021, SN-016). A plain service, no container —
+# the same reasoning A40 applied to the AI CLI service: two of the three
+# sources sit beside a credential a human minted interactively into a home
+# directory, and a container would have to mount that home.
+#
+# ONESHOT, DRIVEN BY A TIMER. There is nothing to keep alive between reads,
+# and a long-lived process holding three vendor sessions open is a bigger
+# surface than a process that exists for two seconds every ten minutes.
+Description=HomeHub AI-usage feeder (SR-021, posts usage gauges to NagLight)
+Documentation=file:///opt/homehub/stack/ai-usage/README.md
+After=network-online.target homehub-firstboot.service
+Wants=network-online.target
+ConditionPathExists=/opt/homehub/stack/.env
+
+[Service]
+Type=oneshot
+
+# THE SAME DEDICATED UNPRIVILEGED ACCOUNT AS THE AI CLI SERVICE, and never
+# `hub`. It has to be this account and not another: `codex app-server` and the
+# Claude credentials file both live in AI_USAGE_USER_ACCOUNT's home, put there
+# by the interactive sign-in, so a feeder running as anyone else would find no
+# credential and post "unavailable" forever. setup-ai-usage.sh writes
+# User=/Group= into a drop-in from AI_USAGE_USER_ACCOUNT so the account
+# certified is the account that runs — the cross-review V2 lesson, which found
+# a unit hard-coding one name while every check validated another.
+User=homehub-ai
+Group=homehub-ai
+NoNewPrivileges=yes
+
+# READ-ONLY EVERYWHERE EXCEPT ONE FILE. The acceptance criterion is that the
+# feeder never writes a vendor credential file; `open_for_write` refuses any
+# path but the state file, and this is the second, independent line: the home
+# the credentials live in is mounted read-only for this unit, so even a bug
+# past the guard cannot truncate a token. ProtectHome=read-only is deliberate
+# rather than `yes` — the feeder must still READ that home.
+ProtectHome=read-only
+StateDirectory=homehub-ai
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/homehub-ai
+
+EnvironmentFile=/opt/homehub/stack/.env
+# --check re-runs the identity and destination refusals as their own process,
+# under this unit's User=, so a box configured to guess an identity or to post
+# off-box fails BEFORE the real run.
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/ai-usage/ai_usage_feeder.py --check
+ExecStart=/usr/bin/python3 /opt/homehub/stack/ai-usage/ai_usage_feeder.py
+
+# A feeder that takes longer than this has a wedged source, and a wedged source
+# must become an "unavailable" gauge rather than a stuck unit.
+TimeoutStartSec=180
+
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# NO Restart=. A failed cycle must NOT be retried into a hot loop against three
+# vendor APIs; the timer brings the next one round soon enough, and a source
+# that failed has already posted its "unavailable" gauge.
+
+[Install]
+WantedBy=multi-user.target

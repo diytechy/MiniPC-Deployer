@@ -1833,6 +1833,38 @@ else
     log "AI_CLI_ENABLED is not true - no AI CLI service, no dedicated account."
 fi
 
+
+# ── 6e. the AI-usage feeder (SR-021, SN-016) ───────────────────────
+# A plain service on a timer, no container, OFF by default. It runs as the
+# account setup-ai-cli.sh created, because the vendor sign-ins it READS live in
+# that account's home - so this block does nothing useful on a box where the AI
+# CLI layer was never provisioned, and setup-ai-usage.sh refuses rather than
+# creating a second account nobody certified.
+#
+# THE SCRIPT DOES THE REFUSING, NOT THIS BLOCK: a blank AI_USAGE_USER is a
+# refusal and not a default, because guessing which household member's board
+# these gauges land on puts one person's usage on another person's panel.
+if [ "${AI_USAGE_ENABLED:-false}" = "true" ]; then
+    log "provisioning the AI-usage feeder (activated by .env)…"
+    if [ -f "$STACK_DIR/ai-usage/setup-ai-usage.sh" ]; then
+        if bash "$STACK_DIR/ai-usage/setup-ai-usage.sh" 2>&1 | sed 's/^/  /'; then
+            log "  AI-usage feeder installed; timer runs every 10 minutes"
+            log "  STILL OWED BY A HUMAN: the vendor sign-ins live in"
+            log "    ${AI_USAGE_USER_ACCOUNT:-homehub-ai}'s home and do not survive a"
+            log "    reimage. A source with no credential posts 'unavailable', which"
+            log "    is correct behaviour and not a fault to chase."
+        else
+            log "  WARNING: setup-ai-usage.sh refused or failed - this box posts NO"
+            log "    usage gauges. Everything else is unaffected. The reason is in the"
+            log "    lines above; re-run by hand once fixed:"
+            log "      sudo bash $STACK_DIR/ai-usage/setup-ai-usage.sh"
+        fi
+    else
+        log "  WARNING: AI_USAGE_ENABLED=true but no $STACK_DIR/ai-usage/setup-ai-usage.sh"
+        log "    on the payload - carriage missing for an activated feature."
+    fi
+fi
+
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
 # A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO

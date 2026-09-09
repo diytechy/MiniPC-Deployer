@@ -165,6 +165,43 @@ The honest ledger of what has and has not been exercised is
 Hand-authored sequence diagrams of the behaviour that is easiest to misread
 from registry rows (process.md §3). Each cites the ids it renders.
 
+### One AI-usage cycle, and how a failed source stays un-green (SR-021, LLR-005, IF-013)
+
+The behaviour worth reading as a diagram is not the happy path — it is what
+happens to the OTHER gauges when one vendor is down, and where the timestamp on
+a failed source's gauge comes from. Both are easy to misread from the registry
+rows, and both are the acceptance criteria.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as systemd timer (10 min)
+    participant F as ai_usage_feeder (SR-021)
+    participant X as codex app-server
+    participant A as api.anthropic.com
+    participant O as opencode.ai
+    participant S as state file (the ONE writable path)
+    participant N as NagLight /api/feed (IF-013)
+
+    T->>F: start (oneshot, as the dedicated account)
+    F->>F: resolve_enabled / resolve_identity / resolve_feed_url
+    Note over F: a blank identity or an off-box destination<br/>REFUSES here - it never defaults
+    F->>X: initialize + account/rateLimits/read (no credential passes through F)
+    X-->>F: usedPercent 34, windowDurationMins 10080
+    F->>A: GET /api/oauth/usage (Bearer, read-only; beta header)
+    A--xF: 401 / timeout / garbage
+    Note over F: ONE SourceFailure. The other sources keep going -<br/>a failing vendor must not blank the panel
+    F->>O: GET /zen/go/v1/usage (Bearer, read-only)
+    O-->>F: weekly 58%, monthly 89%
+    F->>S: read last-known readings
+    F->>N: codex gauge, value 34, observed_at = NOW  (live)
+    F->>N: claude gauges, last true value at its ORIGINAL stamp<br/>(or no observed_at at all, if it never succeeded)
+    Note over N: stale by NagLight's own horizon -><br/>"unavailable", never a green gauge
+    F->>N: opencode gauges, observed_at = NOW  (live)
+    F->>S: write ONLY the sources that succeeded
+    Note over S: open_for_write refuses every other path,<br/>so no vendor credential file can be written
+```
+
 ### One `/v1/ask` request, and every refusal on the way (SR-019, LLR-002, LLR-004, IF-011)
 
 The four containments A40 ratified are **refusals in the request path**, not

@@ -15,6 +15,7 @@ visible in its registry.
 |---|---|---|
 | SR-019, LLR-002, TC-002, IF-011 | B12 — the AI CLI service (SN-016, HomeHub A40) | 2026-09-09 |
 | SR-020, LLR-003, TC-003, IF-012 | B9 — occupancy power in the wall image (SN-015, WSN-018) | 2026-09-09 |
+| SR-021, LLR-005, TC-005, IF-013 | B7 — the AI-usage feeder (SN-016) | 2026-09-09 |
 
 This repo is a **config/infra deliverable** (compose, Caddy, autoinstall,
 provisioning), scaffolded at the **minimum profile** with a **HIGH** decision

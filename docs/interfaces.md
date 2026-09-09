@@ -61,6 +61,29 @@ panel; that repo owns the app):
   call, on the dev PC; the hub is slower. Callers must not put this on a
   sub-second synchronous path. Details in `stack/ai-cli/README.md`.
 
+**This repo → NagLight** (`Consumes` — the AI-usage gauges):
+
+- **IF-013** — `Implemented` 2026-09-09 (SR-021; SN-016). `POST
+  {$AI_USAGE_FEED_URL}` with `kind:"gauge"` — five ids
+  (`ai-usage-codex`, `ai-usage-claude-session`, `ai-usage-claude-weekly`,
+  `ai-usage-opencode-weekly`, `ai-usage-opencode-monthly`), each carrying
+  `unit:"%"`, `min:0`, `max:100`, `target:0`, `direction:"up"` and a `window`.
+  **Numbers only — never a severity, a `css` or a colour:** NagLight owns
+  severity and the panel renders it, and a feeder that computed a hue would make
+  that authority ambiguous. `value` and `target` are always present and `min`/
+  `max` always sent, because the 2026-09 tightening turned each omission into a
+  400 (an omitted `value` used to be stored as a fabricated 0, and `%` has no
+  agreed width to infer a range from); `direction` is emitted **if and only if**
+  `window` is. **`observed_at` is when the value was TRUE**, which is how
+  "unavailable" is said without inventing a number: a source that fails reposts
+  its last real reading at its *original* stamp and goes stale on NagLight's
+  horizon, and one that has never succeeded posts a gauge with no `observed_at`
+  at all, stale on arrival. The timer runs every 10 minutes because two of the
+  five gauges are `weekly`, whose horizon is 24 h. **Not provided:** a Gemini
+  gauge (deferred as E11) and OpenCode's `rolling` bucket, which publishes no
+  window length — a window this repo would have had to invent. Details in
+  `stack/ai-usage/README.md`.
+
 ---
 
 ## Why a separate registry

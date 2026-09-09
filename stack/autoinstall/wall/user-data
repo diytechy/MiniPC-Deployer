@@ -580,6 +580,10 @@ autoinstall:
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh /target/usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- systemctl enable wall-firstboot.service
+    # wall-door-stream — WSN-019. Installed here; firstboot creates the
+    # unprivileged account and enables/starts it only after wall.env and the
+    # packaged application broker both exist.
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-door-stream.service /target/etc/systemd/system/wall-door-stream.service
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.service /target/etc/systemd/system/wall-wakeprep.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.sh /target/usr/local/sbin/wall-wakeprep.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-wakeprep.sh

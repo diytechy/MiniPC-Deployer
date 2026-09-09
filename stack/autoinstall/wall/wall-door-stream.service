@@ -1,0 +1,48 @@
+# WSN-019 / B14: credential-isolated, explicit-start Door preview broker.
+# The camera secret stays in the existing root-only wall.env. systemd exposes a
+# read-only copy through its RAM-backed credential mount only to this service;
+# Electron and Chromium can reach only the group-owned Unix socket.
+[Unit]
+Description=Office wall panel Door stream broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wall-door-stream
+Group=wall-door-stream
+SupplementaryGroups=panel
+RuntimeDirectory=wall-door-stream
+RuntimeDirectoryMode=0750
+UMask=0007
+LoadCredential=wall.env:/etc/wall-panel/wall.env
+ExecStartPre=+/bin/chgrp panel /run/wall-door-stream
+ExecStart=/usr/bin/python3 /opt/wall-panel/app/runtime/resources/app/doorstream/service.py --config %d/wall.env --socket /run/wall-door-stream/service.sock --allowed-group panel
+Restart=on-failure
+RestartSec=3
+
+# The broker needs LAN sockets and its runtime directory, but no writable
+# filesystem, devices, home directory, elevated transition, or kernel control.
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# The service intentionally emits no camera/decoder output. Its bounded state
+# goes to the panel over the socket; FFmpeg stderr is discarded by the broker.
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target

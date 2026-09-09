@@ -8,6 +8,20 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 — B14 Door image integration is implemented, not deployed.** The
+wall image now installs a hardened `wall-door-stream.service`, creates its
+non-login service account, and starts an idle local broker only after the
+packaged application exists. systemd reads the established root-only
+`wall.env` and exposes it to that account through a RAM-backed credential
+mount; there is no second persistent password file, no credential-bearing
+process argument, and Electron can reach only `/run/wall-door-stream/service.sock`.
+The wall template declares the reserved camera address and T3 password
+placeholders plus public RTSP/geometry knobs; the SIM uses an unreachable
+`.invalid` fixture. The application capability contract now includes
+`door-stream-v1`. Next: complete the application lifecycle/synthetic stream
+proof and the independent B14 cross-review before any panel deployment. Gate
+remains G1.
+
 **2026-09-09 — two Owner rulings applied (see the audit entry at the foot of
 this file).** (1) `SLEEP_END` now has **one** default, **06:45**, on both power
 paths; the per-path default is gone and SN-015's "the disabled path is
@@ -6640,3 +6654,49 @@ started. No apt package name was added, so no apt export re-run is owed.
 **Two mutation survivors found, both test defects, both fixed.** Deleting `self._lock` from `acquire` outright left the 8-thread burst test GREEN three runs running — the check-then-claim window is a few bytecodes wide, so the interleaving simply never occurred; the test was asserting the outcome of a race that never ran. (Widening it with a `sleep` made it worse: the sleep staggered the threads and serialised them by accident.) It now holds the window open deterministically at the point between the membership check and the claim, and the lock being held is what makes that point unreachable for the other threads. Separately, moving `cool()` out of `release`'s lock was killed by nothing; that window is unreachable by construction and so untestable behaviourally, and is now asserted structurally on the parse tree of `acquire` and `release`.
 
 check.py 534 passed / 5 skipped (baseline 525/5); trace --strict-integrity 0, orphans 24; check_flows --no-placeholders OK, 4 diagrams; occupancy-power.test.sh 75 PASS / 0 FAIL standalone (baseline 73); ai-cli-guards.test.sh 21 PASS / 0 FAIL; run-hermetic-tests.sh UNRUN on this dev PC (missing zstd, rsync). 18 mutants: 16 killed on the first pass, 2 survivors (both test defects, described above), both killed after the tests were fixed. No live hub or panel state touched; no apt package added, so no apt export is owed.
+
+**2026-09-09 — B14 Door image integration (SR-017 / WSN-019).** Added the
+image-owned half of the explicit-start Door preview. `wall-door-stream.service`
+runs as a dedicated non-login account with the panel group only as a
+supplementary group; its runtime directory is group-traversable only after a
+privileged `chgrp`, and the resulting socket is the broker's sole renderer
+surface. `LoadCredential=wall.env:/etc/wall-panel/wall.env` lets PID 1 read the
+already-materialized 0600 file and provide a read-only RAM-backed copy to the
+unprivileged process. This deliberately does not create a second on-disk secret
+file and does not use `EnvironmentFile=`. Filesystem/device/kernel controls are
+removed through the unit hardening, and stdout/stderr are null: camera
+credentials and FFmpeg diagnostics cannot enter the journal from this unit.
+
+The autoinstall installs the unit but does not enable it early. Firstboot creates
+the account only after the payload and root-only config exist, verifies the
+packaged `doorstream/service.py`, enables/starts the broker, and explicitly
+restarts it on every supported firstboot rerun so an edited `wall.env` replaces
+systemd's credential snapshot. The service has no ordering dependency on
+`wall-firstboot.service`: adding that dependency would deadlock when firstboot
+starts it. Starting the broker opens no RTSP connection; the application socket
+request remains the only source-start event.
+
+The tracked wall template now carries the reserved-address and T3 password
+placeholders, fixed Remo RTSP defaults, geometry controls, and bounded stale/
+start timings. The VM renderer substitutes an unreachable `.invalid` endpoint
+and fictional password so a gate image is complete but cannot contact a real
+camera. `door-stream-v1` is mirrored into the exact private artifact contract;
+its app-only declaration prevents the Python broker and Electron bridge from
+entering the public site artifact.
+
+**Evidence:** red-first `tests/test_door_stream_service.py` failed 4/4 before
+the unit/config/wiring existed, then passed 4/4. The focused deployer set is
+**144 passed / 1 skipped**. `python scripts/validate_config.py` reports **ALL
+CONFIG CHECKS PASSED**, including YAML parse, tracked late-command inputs,
+complete wall knobs, and no orphan systemd units. Both edited shell files pass
+`bash -n`. `systemd-analyze verify` accepted the unit; it warned only about the
+Windows checkout's DrvFs executable/world-writable projection, while user-data
+installs it 0644 on the target. The first `python scripts/check.py` attempt was
+UNRUN as a product verdict: the managed sandbox denied its configured shared
+`C:\Projects\.pytest-tmp` and `docs/test/report.md` writes, producing fixture
+setup errors rather than test failures. A second normal-permission attempt then
+selected WindowsApps' broken `bash.exe` shim; with Git Bash put first explicitly,
+the complete gate passed: **547 passed / 5 skipped**, trace integrity 0 with the
+unchanged 24 legacy orphans, and doc navigation clean apart from its two known
+orphan warnings. No ISO was built, no panel state changed, and no apt package
+was added (the image already declares `python3` and `ffmpeg`).

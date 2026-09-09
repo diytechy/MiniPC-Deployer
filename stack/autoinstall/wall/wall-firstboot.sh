@@ -32,6 +32,9 @@
 #      Plus OI-16a: wall-sync-resume.service enabled, so every wake from the
 #      nightly suspend re-triggers the sync (a resume is not a boot); and
 #      wall-sync-frame.timer enabled, the frame flow's every-minute cadence.
+#  8d. WSN-019 — create and start the unprivileged Door stream broker. systemd
+#      passes the existing root-only wall.env through a RAM-backed credential
+#      mount; the password is not copied into a second persistent file.
 #   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
@@ -794,6 +797,32 @@ if command -v getent >/dev/null 2>&1; then
         warn "    ls -l /etc/resolv.conf                 (a DANGLING symlink still passes -e)"
         warn "    networkctl status                      (networkd may know the DNS already)"
     fi
+fi
+
+# ── 8d. WSN-019 — credential-isolated Door stream broker ────────────────────
+# The account owns no files and has no login. It receives the root-only wall.env
+# only through wall-door-stream.service's LoadCredential mount, then publishes a
+# 0660 socket to the panel group. Starting the unit opens NO RTSP connection;
+# only an explicit request from the unlocked Door tab starts FFmpeg.
+if ! getent group wall-door-stream >/dev/null 2>&1; then
+    groupadd --system wall-door-stream
+fi
+if ! id -u wall-door-stream >/dev/null 2>&1; then
+    useradd --system --gid wall-door-stream --home-dir /nonexistent \
+        --shell /usr/sbin/nologin wall-door-stream
+fi
+if [ -f /etc/systemd/system/wall-door-stream.service ] && \
+   [ -r /opt/wall-panel/app/runtime/resources/app/doorstream/service.py ]; then
+    enable_unit_now "WSN-019: Door broker enabled — idle until an explicit unlocked-tab start" \
+        wall-door-stream.service
+    # `enable --now` leaves an already-active process alone. A supported rerun
+    # after editing wall.env must refresh systemd's credential snapshot and the
+    # broker's in-memory configuration, so explicitly restart and judge it.
+    if ! systemctl restart wall-door-stream.service; then
+        fail_step "Door broker could not restart with the current wall.env; inspect systemctl status wall-door-stream.service"
+    fi
+else
+    fail_step "Door broker is incomplete: the unit or packaged doorstream/service.py is missing. The Door tab will remain disabled."
 fi
 
 # Touch fault filter is opt-in; OFF also restores the raw-input recovery path.

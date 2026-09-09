@@ -165,6 +165,41 @@ The honest ledger of what has and has not been exercised is
 Hand-authored sequence diagrams of the behaviour that is easiest to misread
 from registry rows (process.md §3). Each cites the ids it renders.
 
+### An explicit Door session, without giving the renderer a camera credential (SR-017)
+
+The image boundary matters more than the happy-path picture. PID 1 is the only
+component that reads the established root-only deployment file; the broker gets
+a RAM-backed credential view, while Electron gets only a local socket. Merely
+booting the panel or visiting another tab never starts FFmpeg.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as systemd (PID 1)
+    participant E as root-only wall.env
+    participant B as door broker (SR-017, unprivileged)
+    participant U as Unix socket (panel group)
+    participant R as Electron / renderer
+    participant F as FFmpeg
+    participant C as LAN camera
+
+    P->>E: LoadCredential source read
+    P->>B: read-only RAM-backed wall.env credential
+    B->>U: bind service.sock 0660
+    Note over B,C: IDLE - no RTSP connection and no decoder
+    R->>U: explicit start {mode: corrected|raw}<br/>(Door tab present and unlocked)
+    B->>F: spawn with non-secret argv; authenticated URL on stdin
+    F->>C: authenticated RTSP / H.264 video only
+    C-->>F: H.264 plus AAC
+    F->>F: map video, discard audio, correct or pad without stretch
+    F-->>B: bounded JPEG stream on stdout
+    B-->>R: generation-scoped frames and status
+    R->>U: disconnect on tab change / lock / display-off / suspend
+    B->>F: terminate, then bounded kill fallback
+    Note over R: clear the retained frame; late generations are rejected
+    Note over B,C: IDLE again - broker stays ready, source and decoder are gone
+```
+
 ### One AI-usage cycle, and how a failed source stays un-green (SR-021, LLR-005, IF-013)
 
 The behaviour worth reading as a diagram is not the happy path — it is what

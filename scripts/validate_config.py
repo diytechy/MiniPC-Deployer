@@ -285,6 +285,7 @@ def main():
         "autoinstall/wall/wall.env.example",
         "autoinstall/wall/wall-firstboot.service",
         "autoinstall/wall/wall-firstboot.sh",
+        "autoinstall/wall/wall-door-stream.service",
         "autoinstall/wall/wall-wakeprep.service",
         "autoinstall/wall/wall-wakeprep.sh",
         "autoinstall/wall/wall-sleep.service",

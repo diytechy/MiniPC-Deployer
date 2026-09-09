@@ -2521,6 +2521,13 @@ render_sim_wall_env() {
     set_env_key "$env_out" WIFI_SSID "vmtest-no-radio-in-hyperv"
     set_env_key "$env_out" WIFI_PSK "vmtest-not-a-real-psk"
 
+    # DOOR: filled but unreachable. The broker starts idle, so this never opens
+    # a connection during the gate; if a tester explicitly selects Door, the
+    # reserved .invalid name makes the synthetic limitation unmistakable and
+    # guarantees the VM cannot contact a household camera.
+    set_env_key "$env_out" DOORBELL_RTSP_HOST "vmtest-no-camera.invalid"
+    set_env_key "$env_out" DOORBELL_RTSP_PASSWORD "vmtest-not-a-real-camera-secret"
+
     # SLEEP: `backlight`, not the production `suspend`. A gate VM that suspends
     # itself at 22:00 is indistinguishable from a gate VM that died, and its
     # RTC wake is the host's clock, not the panel's firmware. backlight mode is

@@ -22,16 +22,31 @@
 # --dangerously-* flag, --bare, or that is missing its family's read-only
 # token, so this file being edited badly is a launch failure, not an exposure.
 #
+# AND, AFTER THE 2026-09-09 CROSS-REVIEW: THE WHOLE ROW IS AN ALLOW-LIST, NOT A
+# SEARCH FOR BAD STRINGS. The first version of the guard only asked whether
+# certain tokens were PRESENT, so a row reading
+#   python3 -c '<anything>' --permission-mode plan --disallowedTools Bash
+# passed every check and ran arbitrary code as the service account. Now the
+# EXECUTABLE is pinned per family (claude / codex, by bare name, resolved on
+# AI_CLI_BIN_PATH), and every token must appear in that family's declared
+# vocabulary in ai_cli_service.FAMILY_CONTRACTS with a value the service
+# constrains. A flag that is not declared there cannot be added by editing this
+# file: adding one is a reviewed edit to the service. The Env cell is an
+# allow-list too (only CLAUDE_CODE_EFFORT_LEVEL), because a row that could set
+# PATH or CODEX_HOME could move the ground the pin stands on.
+#
 # --bare IS UNUSABLE HERE and is on the banned list for that reason as well as
 # for safety: it ignores the OAuth token and requires an API key (A40), and
 # this service leans on the subscription. Full startup is therefore paid per
 # call — see README.md "The latency floor" for the measurement.
 #
 # {model} is substituted at launch. NO {prompt}: the messages go to the child's
-# STDIN, immune to command-line caps (ai-template WI-216). --json-schema and
-# the working directory are appended per request by the service, because both
-# are per-request values and neither belongs in tracked config.
+# STDIN, immune to command-line caps (ai-template WI-216). The family's schema
+# flag (claude --json-schema, codex --output-schema), codex's
+# --output-last-message and the working directory are appended per request by
+# the service, because they are per-request values and none of them belongs in
+# tracked config - writing one here is itself refused.
 Id,Family,Model,Version,Tier,CmdTemplate,Env,Notes
 ANALYSIS-QUICK,ANTHROPIC,claude-haiku-4-5,4.5,quick,"claude -p --model {model} --output-format json --permission-mode plan --allowedTools Read,Grep,Glob --disallowedTools Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch",CLAUDE_CODE_EFFORT_LEVEL=low,"default route for classification-shaped work (song grouping, categorisation) — A40's own finding is that these jobs want an answer, not an agent, so the cheapest row is the default"
 ANALYSIS-DEEP,ANTHROPIC,claude-opus-5,5,medium,"claude -p --model {model} --output-format json --permission-mode plan --allowedTools Read,Grep,Glob --disallowedTools Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch",CLAUDE_CODE_EFFORT_LEVEL=medium,"depth is CONFIGURATION not a request field — a caller names a route id from the enable-list and cannot dial the model or the effort itself"
-ANALYSIS-CODEX,OPENAI,gpt-5.6-codex,5.6,medium,"codex exec --sandbox read-only --ask-for-approval never -c model_reasoning_effort=medium -m {model}",,"second family for diversity; codex additionally captures --output-last-message because it echoes the whole prompt into stdout (ai-template WI-217). OFF unless named in the enable-list."
+ANALYSIS-CODEX,OPENAI,gpt-5.6-codex,5.6,medium,"codex exec --json --sandbox read-only --ask-for-approval never -c model_reasoning_effort=medium -m {model}",,"second family for diversity; codex additionally captures --output-last-message because it echoes the whole prompt into stdout (ai-template WI-217). --json is required so the transcript is machine-readable, and the service appends --output-schema (the caller's schema) and --output-last-message. OFF unless named in the enable-list."

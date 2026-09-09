@@ -24,20 +24,33 @@ Type=simple
 # account the CLIs are signed into over RDP — so the credential lives where the
 # service runs and nowhere else.
 #
-# The name is ALSO checked at runtime (ai_cli_service.assert_service_account),
-# because a unit file is asserted by eye and an eye is not a test: the service
-# refuses to start as `hub` or `root`, in a sudo-granting group, or named in
-# any sudoers rule.
+# THE NAME BELOW IS THE DEFAULT, AND IT IS NOT WHAT DECIDES (cross-review V2).
+# setup-ai-cli.sh writes a drop-in at
+# /etc/systemd/system/homehub-ai-cli.service.d/10-account.conf carrying
+# User=/Group= taken from AI_CLI_USER, the same knob the checks certify. The
+# reviewed version hard-coded the name here while the service validated the
+# knob, so AI_CLI_USER=alice had the checks certify `alice` while systemd still
+# started `homehub-ai` - the account asserted was not the account that ran.
+#
+# And the service now asserts its OWN EFFECTIVE IDENTITY at startup
+# (ai_cli_service.assert_effective_account), not a configured string: it
+# refuses to run if the account it is running as is not the account configured,
+# and refuses as `hub` or `root`, in a sudo-granting group, or named in any
+# sudoers rule - INCLUDING one reached through a #include, which the reviewed
+# parser treated as a comment.
 User=homehub-ai
 Group=homehub-ai
 NoNewPrivileges=yes
 
 # ── ACCEPTANCE 3: LOOPBACK OR THE DOCKER BRIDGE, NEVER THE LAN ──────────────
 # AI_CLI_BIND is read from the environment file below and validated by
-# resolve_bind() before the socket is created: loopback or 172.16/12 only, and
-# the wildcard is refused BY NAME, because `0.0.0.0` is exactly the edit that
-# puts the household's interactive credential on the LAN without looking like
-# a LAN address.
+# resolve_bind() before the socket is created: loopback, or an address a LOCAL
+# DOCKER BRIDGE INTERFACE is actually carrying. Not a range - the reviewed
+# version accepted the whole of 172.16.0.0/12, and a household LAN on
+# 172.20.0.0/16 is inside it, so "the docker bridge" admitted the LAN
+# (cross-review V3). The wildcard is refused BY NAME besides, because `0.0.0.0`
+# is exactly the edit that puts the household's interactive credential on the
+# LAN without looking like a LAN address.
 #
 # THE BIND IS THE WHOLE MECHANISM, and saying so is more honest than a
 # systemd IPAddress* filter that does not do what it appears to. This service
@@ -48,7 +61,10 @@ NoNewPrivileges=yes
 # exists, and is asserted by test rather than read off this file.
 #
 # ExecStartPre below runs `--check`, which re-runs that validation as its own
-# process: a unit that would have bound the LAN fails BEFORE ExecStart.
+# process - and, because ExecStartPre runs as this unit's User=, it re-runs the
+# effective-identity assertion under the very account that will serve. A unit
+# that would have bound the LAN, or that would have run as the wrong account,
+# fails BEFORE ExecStart.
 
 # ── ACCEPTANCE 4: A SCRATCH WORKING DIRECTORY PER REQUEST ───────────────────
 # StateDirectory gives the account /var/lib/homehub-ai at 0700; the service

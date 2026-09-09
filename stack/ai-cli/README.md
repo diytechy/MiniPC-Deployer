@@ -25,10 +25,53 @@ rather than written into a unit file and checked by eye.
 
 | # | Property | Enforced by | Asserted by |
 |---|---|---|---|
-| 1 | A **dedicated unprivileged account**, never `hub` | `assert_service_account`, `setup-ai-cli.sh` refusals, `User=homehub-ai` in the unit | `TestServiceAccount` (8 cases); guards suite A2, A3 |
-| 2 | **Read-only tool use**, no `--dangerously-*` flag anywhere | `assert_safe_template`, re-run at every launch | `TestNoDangerousFlags`, `TestReadOnlyToolUse`; guards suite A1, A9, A11 |
-| 3 | Bound to **loopback or the docker bridge**, never the LAN | `resolve_bind`, before the socket exists | `TestBindAddress` (18 cases); guards suite A4, A5, A6, A8 |
-| 4 | A **scratch working directory per request** | `request_scratch` + `StateDirectory` | `TestRequestScratch` (4 cases); guards suite A10 |
+| 1 | A **dedicated unprivileged account**, never `hub` | `assert_effective_account` (the process's *own* identity), `assert_service_account` + `collect_sudoers_lines`, the `User=` drop-in `setup-ai-cli.sh` generates from `AI_CLI_USER` | `TestServiceAccount` (17 cases); guards suite A2, A3, **A9** |
+| 2 | **Read-only tool use**, the pinned CLI and nothing else | `assert_safe_template` against `FAMILY_CONTRACTS`, `assert_safe_env`, `resolve_executable` — re-run at every launch | `TestPinnedCommand`, `TestEnvIsAnAllowList`, `TestNoDangerousFlags`, `TestReadOnlyToolUse`; guards suite A1, A11, **A12, A13** |
+| 3 | Bound to **loopback or a real docker bridge address**, never the LAN | `resolve_bind` + `docker_bridge_addresses`, before the socket exists | `TestBindAddress`, `TestTheServiceCanServeWhatItAccepts`; guards suite A4, A5, A6, A8 |
+| 4 | A **scratch working directory per request** | `request_scratch` (+ `StateDirectory` as a floor) | `TestRequestScratch` (6 cases); guards suite **A10** |
+
+### What the 2026-09-09 cross-review changed
+
+A second model family reviewed this block and **rejected it with 16 confirmed
+findings**; the coordinator verified the worst three in source. All four
+criteria are unchanged — they simply were not met. The common shape of the
+defects is worth keeping in mind before editing any guard here:
+
+> **every guard checked that a string was PRESENT where the property was about
+> IDENTITY.**
+
+* **V1 — the template guard did not pin the executable.** It asked whether
+  `--permission-mode` and `--disallowedTools` appeared, never what the command
+  *was*, so a row reading `python3 -c '…' --permission-mode plan
+  --disallowedTools Bash` passed every check and ran arbitrary code as the
+  service account. Now argv[0] is pinned per family, resolved only on
+  `AI_CLI_BIN_PATH`, and **every token must be in that executable's declared
+  vocabulary** (`FAMILY_CONTRACTS`) with a value this repo constrains. Adding a
+  flag is a reviewed edit to `ai_cli_service.py`, not a registry cell.
+* **V2 — the account asserted was not the account that ran.** The unit
+  hard-coded `User=homehub-ai` while everything else validated `AI_CLI_USER`.
+  Now `setup-ai-cli.sh` writes the unit's `User=`/`Group=` from that same knob,
+  and the service asserts its **effective identity** at startup.
+* **V3 — "the docker bridge" was the whole of `172.16.0.0/12`.** A household
+  LAN on `172.20.0.0/16` is inside it, so a LAN bind was accepted. Now a
+  non-loopback bind must be an address a local `docker0`/`br-*` interface is
+  **actually carrying**.
+
+Also fixed, each with its own test: duplicate/late flags (only the *first*
+occurrence was inspected), the never-inspected `--allowedTools` value, `Env=`
+as an unguarded `PATH`/`CODEX_HOME` injection surface, sudoers `#include` read
+as a comment, `::1` accepted then unbindable, unbounded concurrency and body
+size, the cooldown race (every thread read `available()` before any thread
+wrote), a timeout that killed only the direct child, a zero-exit non-result
+reported as success, a schema written for codex and never passed to it, and a
+scratch cleanup whose failure was swallowed.
+
+**And the test standard the review actually failed us on:** three of the shell
+checks were *vacuous* — they greped an artifact rather than observing a
+behaviour, so they would have passed with the guard deleted. Every guard here
+is now **mutation-checked**: break it, watch the test go red, restore it, watch
+it go green. If you add a guard, do that run and record it. An assertion that
+cannot fail is worse than no assertion, because it produces false evidence.
 
 Why 1 matters: `hub` is the box's only account with a real shell **and**
 `(ALL) NOPASSWD: ALL` (`stack/remote-ui/homehub-desktop-session.sh`). A service
@@ -132,7 +175,24 @@ an unconstrained answer is not offered.
 A CLI that exits 0 having emitted no result object produced **no answer**, and
 this service returns 502 for it and cools the route. Assert the artifact, not
 the exit code — a green run that yielded nothing is exactly the false evidence
-this repo has paid for before.
+this repo has paid for before. "A result" means a `type: "result"` frame that
+is not flagged `is_error` and whose `result` is not null (or, for a
+last-message family like codex, a non-empty last-message file that parses):
+the cross-review found a `{"type":"status"}` frame with exit 0 being returned
+as **200 with `"result": null`**, which is the same false evidence one level
+down.
+
+### And a bounded box
+
+This is a small always-on machine. `AI_CLI_MAX_CONCURRENT` sessions run at
+once **across all routes** (default 1) and a further request is a 503, not a
+queue; a route already in flight is a 429 taken under the same lock as the
+cooldown, so a burst cannot launch N sessions in the gap between the check and
+the claim; a body without a `Content-Length`, or above
+`AI_CLI_MAX_BODY_BYTES`, is refused **before it is read**; connections are
+capped at `AI_CLI_MAX_CONNECTIONS` and idle ones time out after
+`AI_CLI_SOCKET_TIMEOUT_SECONDS`; and a timed-out session is killed as a
+**process group**, so nothing it spawned outlives it.
 
 ## Files
 
@@ -143,9 +203,9 @@ this repo has paid for before.
 | `routes-enabled` | the consent half — which routes a caller may name |
 | `homehub-ai-cli.service` | the systemd unit (dedicated account, 0700 state tree) |
 | `setup-ai-cli.sh` | idempotent account creation + install; refuses `hub`, sudo, a LAN bind |
-| `tests/ai-cli-guards.test.sh` | the hermetic guards suite (16 checks), in `run-hermetic-tests.sh` |
+| `tests/ai-cli-guards.test.sh` | the hermetic guards suite (21 checks), in `run-hermetic-tests.sh` |
 
-Python unit tests live at `tests/test_ai_cli_service.py` (53 cases).
+Python unit tests live at `tests/test_ai_cli_service.py` (111 cases).
 
 ## Deploying
 

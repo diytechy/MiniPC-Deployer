@@ -165,13 +165,22 @@ The honest ledger of what has and has not been exercised is
 Hand-authored sequence diagrams of the behaviour that is easiest to misread
 from registry rows (process.md §3). Each cites the ids it renders.
 
-### One `/v1/ask` request, and every refusal on the way (SR-019, LLR-002, IF-011)
+### One `/v1/ask` request, and every refusal on the way (SR-019, LLR-002, LLR-004, IF-011)
 
 The four containments A40 ratified are **refusals in the request path**, not
 lines in a unit file, and this is the order they fire in. Read it for what a
 caller *cannot* make happen: it cannot reach the service from the LAN, cannot
 name a route nobody enabled, cannot choose the model or the depth, cannot get
-an unconstrained answer, and cannot make the session start anywhere real.
+an unconstrained answer, cannot make the session start anywhere real, and
+cannot make the box run more than one of them at a time.
+
+**Read the startup half with the 2026-09-09 cross-review in mind.** Each of
+those refusals used to check that a *string was present*; every one of them now
+checks an *identity*. The account is the process's own effective account, not a
+configured name; the template is validated against the pinned executable's
+declared vocabulary, not searched for bad flags; and "the docker bridge" is an
+address a bridge interface is carrying, not a /12 that also contains household
+LANs.
 
 ```mermaid
 sequenceDiagram
@@ -185,31 +194,37 @@ sequenceDiagram
     Note over Op,Svc: SR-019 — setup-ai-cli.sh created homehub-ai with no sudo;<br/>the Owner signed the CLI in as THAT account, so the credential<br/>lives where the service runs and nowhere else.
     Op->>Svc: claude setup-token (~homehub-ai/.claude, 0600)
 
-    Sys->>Svc: ExecStartPre --check
-    Svc->>Svc: assert_service_account: hub/root, sudo group, sudoers rule -> REFUSE
-    Svc->>Svc: resolve_bind: not loopback and not 172.16/12 -> REFUSE (before any socket)
-    Svc->>Svc: assert_safe_template x every enabled route -> REFUSE on --dangerously-*, --bare, missing read-only token
-    Sys->>Svc: ExecStart (binds 127.0.0.1 only)
+    Sys->>Svc: ExecStartPre --check (runs as the unit's User=)
+    Svc->>Svc: assert_effective_account: configured account != the account I AM -> REFUSE (V2)
+    Svc->>Svc: assert_service_account: hub/root, sudo group, sudoers rule -> REFUSE<br/>(#include followed; an unreadable include -> REFUSE to certify)
+    Svc->>Svc: resolve_bind: not loopback and not an address a docker bridge CARRIES -> REFUSE (V3)
+    Svc->>Svc: assert_safe_template x every enabled route: argv[0] not the pinned CLI,<br/>an undeclared or duplicated flag, a wrong-valued flag, an Env key outside<br/>the allow-list -> REFUSE (V1)
+    Sys->>Svc: ExecStart (binds 127.0.0.1 only; AF_INET6 if the address is IPv6)
 
     Caller->>Svc: POST /v1/ask {route, schema, messages}
-    alt route not in routes-enabled
+    alt no/oversized Content-Length
+        Svc-->>Caller: 411 / 413 - refused BEFORE the body is read (LLR-004)
+    else route not in routes-enabled
         Svc-->>Caller: 403 + the allowed ids
     else no schema
-        Svc-->>Caller: 400 — an unconstrained answer is not offered
-    else route cooling down
+        Svc-->>Caller: 400 - an unconstrained answer is not offered
+    else route in flight or cooling (RouteGate, one lock)
         Svc-->>Caller: 429
+    else the box is at AI_CLI_MAX_CONCURRENT
+        Svc-->>Caller: 503
     else accepted
         Svc->>Svc: request_scratch -> a fresh 0700 mkdtemp dir (LLR-002)
-        Svc->>Svc: build_argv — model+effort from the ROW, never the request
-        Svc->>CLI: spawn in that dir; prompt on STDIN (never argv); --json-schema
-        Note over CLI: read-only tool use: --permission-mode plan,<br/>--disallowedTools Bash,Write,Edit
-        CLI-->>Svc: --output-format json transcript
-        Svc->>Svc: rmtree the scratch dir (every exit path, timeout included)
-        alt a typed result object
+        Svc->>Svc: build_argv - model+effort from the ROW, never the request;<br/>argv[0] resolved on AI_CLI_BIN_PATH; the schema flag appended
+        Svc->>CLI: spawn in that dir, in its OWN process group; prompt on STDIN (never argv)
+        Note over CLI: read-only tool use: --permission-mode plan,<br/>--disallowedTools Bash,Write,Edit,...
+        CLI-->>Svc: structured transcript (or a timeout -> kill the GROUP)
+        Svc->>Svc: rmtree the scratch dir (every exit path, timeout included;<br/>a failed removal is reported, not swallowed)
+        alt a genuine result: type=result, not is_error, result not null
+            Svc->>Svc: gate.release(ok) - the row cools briefly even on success
             Svc-->>Caller: 200 {route, result, raw}
         else exit 0 but no result object
-            Svc->>Svc: cool(route)
-            Svc-->>Caller: 502 — assert the artifact, not the exit code
+            Svc->>Svc: gate.release(fail) - the row cools for the full backoff
+            Svc-->>Caller: 502 - assert the artifact, not the exit code
         end
     end
 ```

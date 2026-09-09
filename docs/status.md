@@ -39,21 +39,71 @@ containing 0, the epoch actually handed to `rtcwake` converting back to 06:45,
 a recorded `systemctl suspend`. No live panel or hub state changed; no apt
 package added, so no apt export is owed.
 
-**2026-09-09 the AI CLI service (B12, SR-019/LLR-002/TC-002/IF-011):** the hub
-gains a plain service — no container — that answers `POST /v1/ask` from on-box
-callers by running one headless CLI session on the household subscription:
-messages in, model and depth from a registry row rather than the request, the
-answer constrained by a supplied `--json-schema`. A40's four containments are
-implemented as **refusals in code, each asserted by a test**: a dedicated
-unprivileged account that is never `hub`, read-only tool use with no
-`--dangerously-*` flag anywhere in the tree, a bind restricted to loopback or
-the docker bridge, and a fresh 0700 working directory per request. It ships
-**OFF** (`AI_CLI_ENABLED=false`) and declares no credential — the subscription
-token is minted by `claude setup-token` in an RDP session as the service
-account and does not survive a reimage. **Measured latency floor: ~1.6–2.2 s of
-non-model startup, ~3–4 s wall for the cheapest call**, because `--bare` needs
-an API key and cannot be used on the subscription. No live hub state changed;
-no apt package added, so no apt export is owed.
+**2026-09-09 the AI CLI service, after a security cross-review REJECTED it
+(B12 fix round, SR-019/LLR-002/LLR-004/TC-002/TC-004/IF-011):** the hub gains a
+plain service - no container - that answers `POST /v1/ask` from on-box callers
+by running one headless CLI session on the household subscription: messages in,
+model and depth from a registry row rather than the request, the answer
+constrained by a supplied schema. It ships **OFF** (`AI_CLI_ENABLED=false`) and
+declares no credential.
+
+**The block first reported all four of A40's containments as MET. They were
+not.** A cross-review by a different model family returned 16 confirmed
+findings and the coordinator verified the worst three in source. The four
+criteria are unchanged; what changed is that each guard now checks an
+**identity** where it used to check that a **string was present**:
+
+* **A dedicated unprivileged account, never `hub`.** The unit hard-coded
+  `User=homehub-ai` while every check validated the `AI_CLI_USER` knob, so
+  `AI_CLI_USER=alice` had setup create and certify `alice` while systemd still
+  started `homehub-ai`. Now `setup-ai-cli.sh` **generates** the unit's
+  `User=`/`Group=` drop-in from that same knob, and the service asserts its own
+  **effective identity** at startup and refuses a mismatch. The sudoers search
+  also follows `#include`/`#includedir`/`@include` and refuses to certify an
+  include it could not read - the old parser treated `#include` as a comment,
+  so a NOPASSWD grant one file away was invisible.
+* **Read-only tool use, no permission-skipping flag.** The old guard never
+  pinned the executable, so a registry row of `python3 -c '...'` followed by
+  contained-looking flags passed everything and ran arbitrary code as the
+  service account. The registry is editable on the box, which is the whole
+  reason this is a runtime guard, so this was the ballgame. Now argv[0] is
+  **pinned per family**, resolved only on `AI_CLI_BIN_PATH` (and refused if the
+  binary is group/other-writable), and **every token must be in that
+  executable's declared vocabulary** with a value this repo constrains -
+  duplicates refused (the old check read only the first occurrence, and the CLI
+  takes the last), `--allowedTools` values actually inspected, and the `Env=`
+  cell an allow-list so a row cannot set `PATH`/`HOME`/`CODEX_HOME` and move
+  the ground the pin stands on.
+* **Loopback or the docker bridge, never the LAN.** "The docker bridge" was the
+  whole of `172.16.0.0/12` - which contains real household LANs, so a home on
+  `172.20.0.0/16` was accepted as a bridge. Now a non-loopback bind must be an
+  address a local `docker0`/`br-*` interface **is actually carrying**; on a box
+  with no bridge, only loopback binds. `setup-ai-cli.sh` no longer carries its
+  own copy of the rule - it calls the service's `--bind-check`.
+* **A scratch working directory per request.** Unchanged in behaviour, but a
+  failed cleanup is now reported and raised instead of swallowed by
+  `ignore_errors=True`, so "removed on every exit path" is observable.
+
+**Also bounded, because this is a small always-on box** (new LLR-004/TC-004):
+one lock now takes the availability decision, the launch claim and the cooldown
+together, so a burst cannot launch N sessions in the gap the old code left
+between `available()` and `cool()`; successful calls pace the row too (they
+never cooled at all before); at most `AI_CLI_MAX_CONCURRENT` sessions run at
+once; a body with no `Content-Length` or above `AI_CLI_MAX_BODY_BYTES` is
+refused before it is read; connections are capped and idle ones time out; a
+timed-out session is killed as a **process group** so no grandchild survives;
+`::1` is now actually servable (it was accepted and then failed to bind); codex
+is actually handed the caller's schema (the file was written and never passed);
+and a zero exit with a non-result frame is a 502, never a 200 carrying `null`.
+
+**The test standard is the other half of the fix.** Three shipped checks were
+vacuous - shell A10 greped `StateDirectory=` out of the unit and would have
+passed with `request_scratch` deleted; A9 never ran under the unit's `User=`;
+the account checks were artifact greps. They are rewritten to observe
+behaviour, and **every guard was mutation-checked**: broken deliberately,
+confirmed red, restored, confirmed green (24 of 24 bite; the evidence is in the
+audit entry below). No live hub state changed; no apt package added, so no apt
+export is owed.
 
 **2026-09-07 unified file-share/backup feed requirement:** Owner retired the
 separate visible library-drive, backup-drive and backup-run model. New
@@ -5880,3 +5930,131 @@ started; deployment stays a separate Owner-run step, and the sign-in
 package name was added — the service is Python 3 stdlib only and the CLIs are
 not apt packages (SN-016) — so no apt export re-run is owed.
 
+
+## Audit - 2026-09-09 (later) B12 fix round: the AI CLI service re-earns its four criteria
+
+**Why there was a fix round.** B12 reported all four of A40's security
+acceptance criteria as MET with evidence. A cross-review by a different model
+family returned **REJECT with 16 confirmed findings**, and the coordinator
+independently verified the three worst in source. Nothing in the review
+contradicted ratified scope - the acceptance could be met as written; it simply
+had not been. The gap between what the block claimed and what its guards
+enforced was the largest of this build, and the four criteria are the whole
+point of the block.
+
+**The shape of every finding, worth naming once:** the guards checked that a
+**string was present** where the property was about **identity**. A template
+that carried `--permission-mode plan` was treated as contained without anyone
+asking what the command was. An account name in a config file was treated as
+the account that runs. Membership of a /12 was treated as evidence of a bridge.
+
+**What was changed** (`stack/ai-cli/ai_cli_service.py`, `setup-ai-cli.sh`,
+`homehub-ai-cli.service`, `agents.registry.csv`, `stack/.env.example`, HomeHub
+`FieldSchema.psd1`):
+
+* **V1, the executable pin.** `FAMILY_CONTRACTS` declares each family's
+  executable, subcommands, whole flag vocabulary, per-flag value constraints,
+  the flags the *service* appends (refused inside a template), and how that
+  family receives the caller's schema. `assert_safe_template` walks every token
+  against it; `assert_safe_env` allow-lists `Env=`; `resolve_executable`
+  resolves the pinned name on `AI_CLI_BIN_PATH` only and refuses a
+  group/other-writable binary. Adding a flag is now a reviewed edit to the
+  service, not a registry cell nobody reads.
+* **V2, the account.** `assert_effective_account` compares the configured
+  account with this process's own effective account and refuses a mismatch or
+  an undeterminable identity; `setup-ai-cli.sh --emit-dropin` generates the
+  unit's `User=`/`Group=` from `AI_CLI_USER`, and the install path now runs
+  `--check` under `runuser -u "$AI_CLI_USER"` rather than as root.
+  `collect_sudoers_lines` follows includes; an unreadable one is kept verbatim
+  so the guard refuses to certify rather than reporting "no rule found" about a
+  file nobody opened.
+* **V3, the bridge.** `docker_bridge_addresses` reads `/sys/class/net`, keeps
+  only `docker0`/`br-*` interfaces that really are bridges, and takes the
+  addresses they carry; `resolve_bind` accepts loopback or one of those.
+* Plus, each with its own test: duplicate/late flags, `--allowedTools` values,
+  `Env=` injection, sudoers includes, `::1` bindability (`bind_family` +
+  `make_server`), concurrency/body/socket/connection bounds (`RouteGate`,
+  `make_handler`, `make_server`), the cooldown race and success pacing,
+  process-group kill, the typed-result assertion, codex's schema flag, and
+  visible scratch-cleanup failure.
+
+**Knobs added** (declared in `stack/.env.example` **and** HomeHub's
+`FieldSchema.psd1`, all `T0`): `AI_CLI_SUCCESS_COOLDOWN_SECONDS`,
+`AI_CLI_MAX_CONCURRENT`, `AI_CLI_MAX_BODY_BYTES`,
+`AI_CLI_SOCKET_TIMEOUT_SECONDS`, `AI_CLI_MAX_CONNECTIONS`, `AI_CLI_BIN_PATH`.
+
+**Spine.** SR-019 unchanged (the acceptance criteria are verbatim what they
+were). LLR-002 rewritten; **LLR-004** and **TC-004** pulled for the bounds.
+TC-002's permutations widened to the new refusals.
+
+**THE MUTATION EVIDENCE, which is the standard this round is held to.** Every
+guard was deliberately broken, its test confirmed RED, the guard restored, and
+the test confirmed GREEN. 24 of 24 bite:
+
+| Guard broken | Test | Broken | Restored |
+|---|---|---|---|
+| executable pin removed | `TestPinnedCommand` | 1 failed | 10 passed |
+| vocabulary allow-list bypassed | `...undeclared_flag...` | 1 failed | 1 passed |
+| duplicate-flag refusal disabled | `...duplicate_flag...` | 1 failed | 1 passed |
+| `--allowedTools` validator stubbed | `...allowed_tools_VALUE...` | 1 failed | 1 passed |
+| `--disallowedTools` validator stubbed | `...deny_list...` | 1 failed | 1 passed |
+| `Env=` allow-list bypassed | `TestEnvIsAnAllowList` | 1 failed | 8 passed |
+| binary mode check disabled | `...world_writable_binary...` | 1 failed | 1 passed |
+| effective-account assertion removed | `...wrong_account...` | 1 failed | 1 passed |
+| sudoers include treated as comment | `...include_is_followed...` | 1 failed | 1 passed |
+| 172.16/12 re-admitted | `...household_lan...` | 1 failed | 1 passed |
+| server forced to AF_INET | `TestTheServiceCanServeWhatItAccepts` | 1 failed | 3 passed |
+| cleanup back to `ignore_errors` | `...failed_cleanup_is_visible...` | 1 failed | 1 passed |
+| in-flight claim removed | `TestPacingIsAtomic` | 1 failed | 6 passed |
+| success no longer cools | `...successful_call_also_paces...` | 1 failed | 1 passed |
+| group kill back to `proc.kill()` | `...process_group_is_killed...` | 1 failed | 1 passed |
+| body ceiling removed | `...oversized_body...` | 1 failed | 1 passed |
+| connection ceiling removed | `...connection_ceiling...` | 1 failed | 1 passed |
+| result `type` check removed | `...non_result_object...` | 1 failed | 1 passed |
+| result-null check removed | `...null_result...` | 1 failed | 1 passed |
+| `is_error` check removed | `...is_error...` | 1 failed | 1 passed |
+| codex last-message check removed | `...last_message_family...` | 1 failed | 1 passed |
+| codex schema flag not appended | `...codex_is_actually_handed...` | 1 failed | 1 passed |
+
+and against the shell suite (baseline **21 PASS 0 FAIL**), each mutation taking
+it red on the check that is supposed to notice:
+
+| Guard broken | Shell check that went red |
+|---|---|
+| effective-account assertion removed | A9 (`--check` accepted an account nobody runs as) |
+| scratch removal disabled | A10 |
+| one shared scratch dir instead of per-request | A10 |
+| drop-in hard-coded to `homehub-ai` | A2 |
+| 172.16/12 re-admitted | A4 **and** A6 |
+| executable pin removed | A12 |
+
+The three vacuous checks the review named are gone: **A9** now runs `--check`
+twice in a process whose real identity is known and requires the two answers to
+differ for exactly one reason; **A10** drives the real request path with a fake
+CLI runner and inspects the directory the child was handed (fresh, 0700, holding
+only this request's schema, gone afterwards, different next time); **A2** runs
+the drop-in generator with an unusual account name and reads what it wrote,
+instead of greping a name out of the shipped unit.
+
+**Evidence.** `python scripts/check.py` - **PASS** at gate G1, all four steps:
+config-validate, unit-tests (**282 passed, 5 skipped**, up from 224/4 after B9;
+`tests/test_ai_cli_service.py` went from 53 cases to **111 passed, 2 skipped**
+standalone), registry-integrity (SN=16 SR=20 LLR=4 TC=4, **integrity=0**),
+doc-navigability. `python scripts/trace.py --strict-integrity` - clean.
+`python scripts/trace.py --strict` - **exit 1, pre-existing**: 24 legacy SRs
+carry no LLR/TC, unchanged by this round. `python scripts/check_flows.py
+--no-placeholders` - **OK, 2 diagrams, 6 ids, all known**.
+`bash stack/ai-cli/tests/ai-cli-guards.test.sh` - **21 PASS, 0 FAIL** run
+standalone. `stack/run-hermetic-tests.sh` was **NOT run**: it refuses on this
+dev PC for want of `zstd` and `rsync`, which is the pre-existing gap and is
+reported as UNRUN, not as passing.
+
+**Two skips, named rather than buried.** `test_the_directory_is_private_sr019`
+(POSIX mode bits) and `test_a_grandchild_does_not_survive_the_timeout_sr019`
+(real process groups) do not run on the Windows dev PC. Both properties are
+still asserted here through injected syscalls, so the DECISION is tested
+everywhere and only the syscall is skipped - but the real grandchild-kill has
+not been exercised on Linux and should be watched for on the box.
+
+**Nothing live changed.** No account was created, no unit installed, no service
+started. No apt package name was added, so no apt export re-run is owed.

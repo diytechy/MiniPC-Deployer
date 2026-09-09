@@ -236,6 +236,39 @@ newest_run_with_set() {
         done < <(find "$base" -mindepth 1 -maxdepth 1 -type d -name 'run_*' 2>/dev/null | sort) | tail -1
     )"
     if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
+    # THE FIB LAYOUT KEEPS ITS RUNS ONE LEVEL DOWN, under daily/<YYYY-MM-DD>, so
+    # neither the run_* search above nor the flat check below would find one and
+    # a restore with no --run would report "no run holds that set" on a drive
+    # that holds 7 of them. ISO dates sort lexicographically in date order, so
+    # `sort | tail -1` picks the newest for free - the same trick run_<UTC> uses.
+    #
+    # ONLY THE DAILIES, NOT THE LADDER. fib/<age>/ holds deliberately OLD samples;
+    # resolving "the newest run" to one of those would silently restore
+    # week-or-older state to somebody who asked for the current copy. Restoring
+    # from a rung is a thing you ask for by name: restore.sh --run .../fib/34.
+    # BOTH SHAPES, because this function is called with BOTH. restore.sh passes
+    # `dirname "$RUN_DIR"` when it wants a sibling run, and for a fib daily that
+    # is .../config-history/daily - so searching only "$base/daily" would look in
+    # daily/daily and silently find nothing, leaving restore's "which other night
+    # holds this set?" hint blank exactly when someone is mid-recovery.
+    # (Adversarial review, 2026-09-08.)
+    #
+    # ISO-SHAPED NAMES ONLY. Anything else under daily/ is not a run this service
+    # wrote, and `sort | tail -1` would happily hand back a stray directory whose
+    # name simply sorts late.
+    for _fibbase in "$base/daily" "$base"; do
+        [ -d "$_fibbase" ] || continue
+        newest="$(
+            while IFS= read -r d; do
+                [ -f "$d/MANIFEST.tsv" ] || continue
+                awk -F'\t' -v s="$s" 'NR>1 && $1==s {found=1} END {exit !found}' "$d/MANIFEST.tsv" || continue
+                printf '%s\n' "$d"
+            done < <(find "$_fibbase" -mindepth 1 -maxdepth 1 -type d \
+                          -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' 2>/dev/null | sort) | tail -1
+        )"
+        if [ -n "$newest" ]; then unset _fibbase; printf '%s\n' "$newest"; return 0; fi
+    done
+    unset _fibbase
     if [ -f "$base/MANIFEST.tsv" ] &&
        awk -F'\t' -v s="$s" 'NR>1 && $1==s {found=1} END {exit !found}' "$base/MANIFEST.tsv"; then
         printf '%s\n' "$base"

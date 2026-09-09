@@ -114,10 +114,60 @@ STAGING="${BACKUP_STAGING:-/var/tmp/homehub-backup/staging}"
 # promote_flat); a run that fails is set aside as .last-failed and the previous
 # good copy is left exactly where it was. "One copy" must not be allowed to mean
 # "no copy for as long as tonight's run takes", and it does not.
+# fib:   ONE dated copy per night under BACKUP_TARGET/daily/<YYYY-MM-DD>, kept
+#        BACKUP_FIB_DAILY_KEEP (7) deep, PLUS a Fibonacci ladder of older samples
+#        under BACKUP_TARGET/fib/<age>. The Owner's ruling, 2026-09-08, and it
+#        reverses the flat layout's premise rather than tweaking it.
+#
+#        WHY FLAT HAD TO GO. Flat put the archives on the LIBRARY drive and let
+#        the FileBackup snapshots be their history. Measured on the box: all 25
+#        Configs files change every night (they are fresh tar+zstd of live
+#        service state, so even identical input yields a different archive), so
+#        all 33 of their manifest rows were superseded into EVERY Snapshot_<date>
+#        - the config archives were essentially the entire per-night snapshot.
+#        The library backup was paying a full re-store of this folder nightly to
+#        version something that is 2.4 MB and versions better on its own.
+#
+#        WHY NOT `dated`. That is where these lived before flat, and it littered
+#        the archive drive's ROOT with one run_<UTC> directory per night. This
+#        layout keeps that clutter inside ONE folder, BACKUP_TARGET, with exactly
+#        two children: daily/ and fib/.
+#
+#        THE LADDER. Seven dailies give a working overlap; past that, samples are
+#        kept at Fibonacci ages 13 21 34 55 89 144 233 (F(7)..F(13)). Fibonacci's
+#        8 is skipped - it is inside the 7-day window, which is why the lowest
+#        rung draws from the dailies instead of from a rung below it.
+#
+#        IT IS A CASCADE, AND IT RUNS OLDEST FIRST. Rung F(n) is refilled from
+#        rung F(n-1) - never from the dailies, except at the bottom - every
+#        F(n-2) days:
+#
+#            233 <- 144 every 89d      55 <- 34 every 21d
+#            144 <-  89 every 55d      34 <- 21 every 13d
+#             89 <-  55 every 34d      21 <- 13 every  8d
+#                                      13 <- the oldest daily every 5d
+#
+#        THE ORDER IS THE WHOLE DESIGN, not an implementation detail. The rungs
+#        are walked from OLDEST to NEWEST, so 233 takes 144's contents before 144
+#        is itself overwritten by 89, and so on down. Walk it the other way and a
+#        single night's daily would propagate the whole length of the ladder in
+#        one pass, leaving seven rungs holding seven copies of the same day and
+#        no history at all - the exact failure the cascade exists to avoid.
+#
+#        WHY THE AGES COME OUT RIGHT. Content entering rung F(n) is at most
+#        F(n-1) days old and then sits for at most F(n-2) days before the next
+#        refill, and F(n-1) + F(n-2) = F(n) - that is the Fibonacci identity, and
+#        it is why these particular ages are the ones that work. Each rung's label
+#        is therefore its ceiling, reached just before a refill.
+#
+#        A RUNG WHOSE SOURCE IS EMPTY IS SKIPPED, and its clock is NOT advanced,
+#        so it refills the moment the rung below it first has something to give.
+#        That is how the ladder populates from the bottom up on a new box instead
+#        of standing empty for eight months, and how it recovers after a gap.
 LAYOUT="${BACKUP_LAYOUT:-dated}"
 case "$LAYOUT" in
-    dated|flat) ;;
-    *) die "config: BACKUP_LAYOUT='$LAYOUT' is neither 'dated' (a run_<UTC> directory per run, kept BACKUP_KEEP deep) nor 'flat' (one current copy in BACKUP_TARGET, history left to the library backup)." ;;
+    dated|flat|fib) ;;
+    *) die "config: BACKUP_LAYOUT='$LAYOUT' is none of 'dated' (a run_<UTC> directory per run, kept BACKUP_KEEP deep), 'flat' (one current copy in BACKUP_TARGET, history left to the library backup) or 'fib' (daily/<date> kept BACKUP_FIB_DAILY_KEEP deep plus a Fibonacci ladder under fib/)." ;;
 esac
 
 KEEP="${BACKUP_KEEP:-7}"
@@ -137,8 +187,17 @@ PLAN_KEEP="${BACKUP_PLAN_KEEP:-$KEEP}"
 if [ "$LAYOUT" = dated ]; then
 case "$KEEP" in
     ''|*[!0-9]*) die "config: BACKUP_KEEP='$KEEP' is not a number (it is how many dated runs to keep on the backup drive)" ;;
-    0)           die "config: BACKUP_KEEP=0 means 'keep no runs at all', so this run would archive the household and then delete the archive. Set it to 1 or more." ;;
 esac
+# BASE 10, THEN COMPARED AS A NUMBER. A `0)` case arm matches only the literal
+# string, so BACKUP_KEEP=00 walked straight past it and then read as zero in the
+# arithmetic below - retention would delete every previous run on a night that
+# exited green, which is precisely what that arm exists to prevent. Leading zeros
+# are octal to bash arithmetic besides, so '013' would quietly mean 11.
+# (Adversarial review of the fib layout, 2026-09-08, found the same shape in the
+# new BACKUP_FIB_DAILY_KEEP guard; this is its older sibling.)
+KEEP=$(( 10#$KEEP ))
+[ "$KEEP" -ge 1 ] ||
+    die "config: BACKUP_KEEP=0 means 'keep no runs at all', so this run would archive the household and then delete the archive. Set it to 1 or more."         "(The configured value was '${BACKUP_KEEP:-}' - '00' and other leading-zero spellings all mean zero here.)"
 # How many PLAN directories to keep. Separate from BACKUP_KEEP because they are
 # produced on a completely different clock: BACKUP_KEEP counts nights, while plan
 # runs come from verify-hub.sh and a human hand, twelve in one day on 2026-08-28.
@@ -146,11 +205,135 @@ esac
 case "$PLAN_KEEP" in
     ''|*[!0-9]*) die "config: BACKUP_PLAN_KEEP='$PLAN_KEEP' is not a number (it is how many plan_<ts> directories to keep on the backup drive)" ;;
 esac
+PLAN_KEEP=$(( 10#$PLAN_KEEP ))   # 0 IS legal here - see the note below
 fi
 # 0 IS LEGAL HERE, unlike BACKUP_KEEP. A plan directory holds logs and nothing
 # else, so "keep none" destroys no data — it just means each plan run tidies up
 # after the ones before it. BACKUP_KEEP=0 is refused because it would delete the
 # household's archive; this cannot.
+# ── the fib ladder's own knobs (BACKUP_LAYOUT=fib only) ──────────────────────
+# Validated here, in the first second, for the same reason BACKUP_KEEP is: both
+# of these are read AFTER the archives are written, so a bad value would fail the
+# run at the point where it has already done all the work and is deciding what to
+# delete. That is the worst possible moment to discover a typo.
+FIB_DAILY_KEEP="${BACKUP_FIB_DAILY_KEEP:-7}"
+FIB_SLOTS="${BACKUP_FIB_SLOTS:-13 21 34 55 89 144 233}"
+# The run's UTC date names tonight's daily. Taken once so a run crossing midnight
+# cannot write half its work under one date and half under the next.
+#
+# BACKUP_FIB_TODAY IS A TEST SEAM AND NOTHING ELSE. The ladder's whole contract is
+# about elapsed DAYS, and there is no honest way to exercise that against a clock
+# that only moves forwards at one second per second. fib-ladder.test.sh drives
+# hundreds of simulated nights through this variable in about a minute. Setting it
+# in a real backup.env would pin every run to one date, so every night would
+# overwrite the same daily and the ladder would never advance; it is deliberately
+# undocumented in backup.env.example for that reason.
+FIB_TODAY="${BACKUP_FIB_TODAY:-$(date -u +%F)}"
+FIB_SLOT_LIST=()
+FIB_CADENCE=()
+# A STRICT ISO DATE, CHECKED - and it really exists in the calendar. Everything
+# in this layout is named by or compared against a date: the daily directory, the
+# two rung markers, the cadence arithmetic. A value that is merely non-empty gets
+# as far as `date -d`, which accepts a great deal of prose ("next friday"), and a
+# value containing a slash would escape daily/ and point the same-day rm -rf at
+# something else entirely.
+fib_valid_date() {
+    case "${1:-}" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    # Round-trips only if the calendar really has that day: 2026-02-30 parses on
+    # some systems and normalises to March, which would silently rename a daily.
+    [ "$(date -u -d "$1" +%F 2>/dev/null)" = "$1" ]
+}
+if [ "$LAYOUT" = fib ]; then
+    fib_valid_date "$FIB_TODAY" ||
+        die "config: the run date '$FIB_TODAY' is not a real YYYY-MM-DD date." \
+            "It comes from BACKUP_FIB_TODAY when that is set, and from 'date -u +%F' otherwise."
+    case "$FIB_DAILY_KEEP" in
+        ''|*[!0-9]*) die "config: BACKUP_FIB_DAILY_KEEP='$FIB_DAILY_KEEP' is not a number (it is how many daily copies to keep, and the oldest of them is what the lowest ladder rung is filled from)" ;;
+    esac
+    # BASE 10, FORCED. The digit test above passes '00', which is not the literal
+    # string '0' and so slipped past a `0)` case arm - and then arithmetic read it
+    # as zero and the prune loop deleted every daily on a run that exited green.
+    # Leading zeros are also OCTAL to bash arithmetic, so an unforced '013' would
+    # quietly mean 11 and '08' would abort the run mid-arithmetic.
+    FIB_DAILY_KEEP=$(( 10#$FIB_DAILY_KEEP ))
+    [ "$FIB_DAILY_KEEP" -ge 1 ] ||
+        die "config: BACKUP_FIB_DAILY_KEEP='$BACKUP_FIB_DAILY_KEEP' is zero, so this run would archive the household and then delete the archive - and the ladder would have nothing to promote from. Set it to 1 or more."
+    # NEWLINES COLLAPSED FIRST: `read -a` consumes only the first LINE, so a
+    # multi-line BACKUP_FIB_SLOTS would silently drop every rung after the first
+    # line - a shorter ladder than the operator asked for, with no complaint.
+    read -r -a FIB_SLOT_LIST <<< "$(printf '%s' "$FIB_SLOTS" | tr '\n\t' '  ')"
+    [ "${#FIB_SLOT_LIST[@]}" -ge 2 ] ||
+        die "config: BACKUP_FIB_SLOTS needs at least two rungs - the ladder is a CASCADE, and one rung has nothing to cascade from." \
+            "The shipped ladder is '13 21 34 55 89 144 233'."
+    for _s in "${FIB_SLOT_LIST[@]}"; do
+        case "$_s" in
+            ''|*[!0-9]*) die "config: BACKUP_FIB_SLOTS contains '$_s', which is not a number. It is a space-separated list of AGES IN DAYS, ascending, e.g. '13 21 34 55 89 144 233'." ;;
+        esac
+        if [ "$_s" -le "$FIB_DAILY_KEEP" ]; then
+            die "config: BACKUP_FIB_SLOTS has a $_s-day rung, but BACKUP_FIB_DAILY_KEEP=$FIB_DAILY_KEEP already keeps every day up to $FIB_DAILY_KEEP." \
+                "A rung inside the daily window would be refilled from a daily that is already on the drive." \
+                "Drop that rung, or shorten the daily window."
+        fi
+    done
+    # -- THE CADENCES, DERIVED RATHER THAN CONFIGURED -------------------------
+    # Rung F(n) refills every F(n-2) days, and for a Fibonacci ladder that is
+    # exactly the GAP to the rung below it: F(n) - F(n-1) = F(n-2). So the whole
+    # schedule falls out of the ages themselves and there is no second list to
+    # keep in step with the first - a list that could disagree with it is a list
+    # that eventually will.
+    #
+    # THE BOTTOM RUNG has no rung below it, so the one below is derived from the
+    # one above instead: F(n-1) = F(n+1) - F(n), i.e. slots[1] - slots[0] = 21-13
+    # = 8, giving that rung a cadence of 13-8 = 5 days. 8 is exactly the Fibonacci
+    # number that falls inside the daily window, which is why this rung draws from
+    # the dailies rather than from a rung.
+    #
+    # WRITTEN THE OTHER WAY ROUND FIRST - the line below computed 5 where it
+    # needed 8 - which gave rung 13 a cadence of 8 and let its contents reach 14
+    # days, one day past its own label. Every other rung was already correct, so
+    # nothing about the cascade looked wrong; fib-ladder.test.sh caught it on the
+    # per-rung cadence table.
+    _prev=$(( 10#${FIB_SLOT_LIST[1]} - 10#${FIB_SLOT_LIST[0]} ))
+    # -- AND THEN THE CEILING IS CHECKED, RUNG BY RUNG ------------------------
+    # The derivation above is only SOUND for consecutive Fibonacci terms, and
+    # nothing stopped an operator writing a list that is merely ascending. With
+    # '20 21' the bottom cadence comes out 19, so that rung's contents reach
+    # 6+19 = 25 days against a 20-day label - the ladder would be quietly lying
+    # about the age of everything on it.
+    #
+    # Rather than demand the Fibonacci recurrence, check the PROPERTY the ladder
+    # actually promises, which is what makes any list either safe or not: content
+    # enters a rung at its predecessor's ceiling and waits one cadence, so
+    #     ceiling(i) = ceiling(i-1) + cadence(i)   must be <= label(i)
+    # with ceiling(-1) being the age of the oldest daily. For the shipped ladder
+    # that gives 11/19/32/53/87/142/231 against 13/21/34/55/89/144/233 - which is
+    # the Fibonacci identity F(n-1)+F(n-2)=F(n) showing up as headroom.
+    _ceiling=$(( FIB_DAILY_KEEP - 1 ))
+    for _i in "${!FIB_SLOT_LIST[@]}"; do
+        _this=$(( 10#${FIB_SLOT_LIST[_i]} ))
+        # NORMALISED BACK INTO THE LIST, because these strings also NAME the rung
+        # directories. Left raw, '013' would do its arithmetic as 13 while writing
+        # fib/013, so the label on the drive and the label in the schedule would
+        # disagree - and the next run with '13' would build a second, parallel rung.
+        FIB_SLOT_LIST[_i]="$_this"
+        if [ "$_i" = 0 ]; then _below="$_prev"; else _below=$(( 10#${FIB_SLOT_LIST[$(( _i - 1 ))]} )); fi
+        _cad=$(( _this - _below ))
+        [ "$_cad" -ge 1 ] ||
+            die "config: BACKUP_FIB_SLOTS must ASCEND - rung $_this is not more than $_below days above the one below it, so its refill cadence would be $_cad days." \
+                "The shipped ladder is '13 21 34 55 89 144 233'."
+        _ceiling=$(( _ceiling + _cad ))
+        [ "$_ceiling" -le "$_this" ] ||
+            die "config: BACKUP_FIB_SLOTS is not a safe ladder - the ${_this}-day rung would hold content up to $_ceiling days old, past its own label." \
+                "Content enters a rung at the age of the rung below it and then waits one cadence ($_cad days here), so each rung's label has to cover that sum." \
+                "This is why the ages are Fibonacci: F(n-1)+F(n-2)=F(n) is exactly the condition. The shipped ladder is '13 21 34 55 89 144 233'."
+        FIB_CADENCE+=("$_cad")
+    done
+    unset _ceiling _this
+    unset _s _i _prev _below _cad
+fi
 ZL="${BACKUP_ZSTD_LEVEL:-10}"
 
 # ── drive power (WI-10.10 DRIVE POWER DESIGN) ────────────────────────────────
@@ -282,6 +465,32 @@ fi
 # on the system disk - the entire failure that preflight exists to prevent.
 mkdir -p "$BACKUP_TARGET" || die "could not create the backup target directory $BACKUP_TARGET"
 
+# -- THE FIB LAYOUT IS CONFINED TO A SUBDIRECTORY, DELIBERATELY ---------------
+# This layout is the only one that MANAGES a directory tree rather than just
+# adding to it: it prunes dailies and replaces rungs. Everything it deletes is
+# built from $BACKUP_TARGET, so the blast radius is whatever that variable says -
+# and pointed at a drive ROOT it would take ownership of daily/ and fib/ at the
+# top of the whole disk, beside the household's data.
+#
+# Requiring the target to sit INSIDE a mount rather than being one gives the
+# deletions a named box to stay in, which is the thing the operator can actually
+# see and reason about. `dated` and `flat` are unaffected: neither prunes a tree
+# it did not create, and the archive drive's root is `dated`'s documented target.
+if [ "$LAYOUT" = fib ]; then
+    _fib_mnt="$(enclosing_mountpoint "$BACKUP_TARGET" 2>/dev/null || true)"
+    if [ -z "$_fib_mnt" ]; then
+        die "config: could not work out which mount carries BACKUP_TARGET=$BACKUP_TARGET, so the fib layout cannot bound what it is allowed to delete."
+    fi
+    if [ "${BACKUP_TARGET%/}" = "${_fib_mnt%/}" ]; then
+        die "config: BACKUP_TARGET=$BACKUP_TARGET IS the mountpoint $_fib_mnt, not a folder on it." \
+            "BACKUP_LAYOUT=fib prunes and replaces directories under its target, so it refuses to be pointed at a whole drive:" \
+            "it would create and then manage daily/ and fib/ at the top of that disk, beside everything else living there." \
+            "Give it a subdirectory - the shipped value is /mnt/backup-drive/config-history."
+    fi
+    log "fib: target $BACKUP_TARGET is confined inside the mount $_fib_mnt"
+    unset _fib_mnt
+fi
+
 # ── 0b. CAPACITY PREFLIGHT — will this run FIT, on both disks ────────────────
 # Step 0 above asks whether the target is PRESENT. It never asked whether there
 # is room, and that gap is bigger than it sounds because the two disks fail
@@ -315,6 +524,12 @@ mkdir -p "$STAGING" 2>/dev/null || true
 # "no previous run" warning below, so the guard would silently stop guarding.
 case "$LAYOUT" in
     flat) _prev="$(find "$BACKUP_TARGET" -mindepth 1 -maxdepth 1 -name RUN.json 2>/dev/null | sort | tail -1)" ;;
+    # fib keeps its runs one level deeper still - daily/<YYYY-MM-DD>/RUN.json -
+    # and asking at depth 2 finds NOTHING, which this block treats as "no previous
+    # run" rather than as an error. The guard would have gone on logging a warning
+    # and waving every run through, on the layout that made the target smaller.
+    # (Adversarial review, 2026-09-08.)
+    fib)  _prev="$(find "$BACKUP_TARGET/daily" -mindepth 2 -maxdepth 2 -name RUN.json 2>/dev/null | sort | tail -1)" ;;
     *)    _prev="$(find "$BACKUP_TARGET" -mindepth 2 -maxdepth 2 -name RUN.json 2>/dev/null | sort | tail -1)" ;;
 esac
 if [ -n "$_prev" ] && [ -r "$_prev" ]; then
@@ -352,8 +567,13 @@ RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
 # now cannot pick a plan directory at all), and restore.sh. Nothing else in
 # either repo matches on the prefix — swept 2026-08-29.
 if [ "$PLAN_ONLY" = 1 ]; then RUN_PREFIX=plan; else RUN_PREFIX=run; fi
-if [ "$LAYOUT" = flat ]; then
-    # -- FLAT: the target folder IS the run, and nothing dated is created -----
+if [ "$LAYOUT" = flat ] || [ "$LAYOUT" = fib ]; then
+    # -- FLAT and FIB: the run is built in a FIXED directory, not a dated one --
+    # fib is dated on the OUTSIDE (daily/<date>) but builds here first and is
+    # renamed into place by promote_fib only once the verdict is green, so it
+    # inherits this whole branch: the same .incoming staging, the same run lock,
+    # and the same leftover handling. A half-written daily must never appear
+    # under daily/ where retention and the ladder would both treat it as real.
     # The work still happens in a directory of its own, so the copy already on
     # the drive survives a run that dies half way through:
     #   .incoming     a full run; promoted into $BACKUP_TARGET once it is green
@@ -387,7 +607,17 @@ if [ "$LAYOUT" = flat ]; then
     if command -v flock >/dev/null 2>&1; then
         flock -n 9 || die "another backup run already holds $LOCK_FILE - refusing to start a second one. The flat layout writes into ONE directory, so two runs would interleave their archives and both report success."
     else
-        warn "flock is not installed, so two simultaneous runs cannot be refused. Install util-linux."
+        # FATAL, NOT A WARNING (adversarial review, 2026-09-08). In the dated
+        # layout the exclusive mkdir of run_<UTC> is itself the guard, so a
+        # missing flock costs nothing. These two layouts write into a FIXED
+        # directory and have no such guard: two runs would interleave their
+        # archives into one .incoming and both report success, and in fib they
+        # would also delete each other's staged rungs mid-cascade. Refusing to
+        # start is the only honest answer, and flock ships in util-linux on every
+        # box this service targets.
+        die "flock is not installed, so a second simultaneous run could not be refused." \
+            "BACKUP_LAYOUT=$LAYOUT writes into a FIXED directory ($RUN_NAME), so two runs would interleave their archives and both report success." \
+            "Install util-linux, or use BACKUP_LAYOUT=dated, whose per-second run directory is its own guard."
     fi
     # A LEFTOVER .incoming MEANS THE PREVIOUS RUN WAS KILLED - a run that merely
     # FAILED sets itself aside as .last-failed (report_failure). Say so and clear
@@ -1085,6 +1315,245 @@ promote_flat() {
     return 0
 }
 
+# -- fib_rm_under <victim> - delete, but only inside BACKUP_TARGET ------------
+# THE LAST LINE OF DEFENCE, and it is deliberately paranoid. Every path this
+# layout removes is composed from $BACKUP_TARGET plus a name that came off the
+# filesystem, and composed paths are exactly where an empty variable, a stray
+# symlink or a name nobody expected turns `rm -rf` into something else entirely.
+# Rather than trust each construction site, every removal is checked here against
+# the one directory this layout is allowed to touch.
+#
+# Refusing is never fatal on its own - the caller decides - but it IS reported,
+# because a retention step that quietly declined to delete anything is how a
+# drive fills up six months later.
+fib_rm_under() {
+    local victim="${1:-}" root="${BACKUP_TARGET%/}"
+    if [ -z "$root" ] || [ "$root" = "/" ]; then
+        warn "refusing to delete '$victim': BACKUP_TARGET is empty or /"
+        return 1
+    fi
+    case "$victim" in
+        */../*|*/..|../*|*..*)
+            warn "refusing to delete '$victim': the path contains '..'"; return 1 ;;
+        "$root"/?*) ;;                       # strictly BELOW the target, never the target itself
+        *)
+            warn "refusing to delete '$victim': it is not inside $root"; return 1 ;;
+    esac
+    rm -rf -- "$victim"
+}
+
+# -- fib_swap_dir <staged> <live> - install without a moment of neither --------
+# EVERY REPLACEMENT IN THIS LAYOUT GOES THROUGH HERE, because the obvious form
+#     rm -rf "$live"; mv "$staged" "$live"
+# has a window in which NEITHER exists, and a kill, an I/O error or a remount
+# read-only inside that window destroys the copy for good. On a rung that copy is
+# the only sample of its age anywhere. (Adversarial review, 2026-09-08.)
+#
+# The old directory is renamed aside first, so a failure to install the new one
+# can put it straight back. Only once the new copy is in place is the old one
+# deleted. Both moves are renames within one filesystem.
+#
+# THE `rm` RESULT IS CHECKED, which is the second half of the same finding: if a
+# partially-failed removal left the live directory in place, `mv staged live`
+# would move the staged copy INSIDE it and return success - logging a refill that
+# did not happen while the stale rung stayed live.
+fib_swap_dir() {
+    local staged="$1" live="$2" old="$2.old.$$"
+    fib_rm_under "$old" || return 1
+    if [ -e "$live" ]; then
+        mv -f -- "$live" "$old" || return 1
+    fi
+    if ! mv -f -- "$staged" "$live"; then
+        # Put the previous copy back rather than leaving nothing at all.
+        [ -e "$old" ] && mv -f -- "$old" "$live"
+        return 1
+    fi
+    fib_rm_under "$old" || warn "could not remove the superseded copy at $old - it is stale but harmless"
+    return 0
+}
+
+# -- promote_fib - .incoming becomes tonight's daily --------------------------
+# Same filesystem, so this is a rename: daily/<date> either does not exist or is
+# a complete run, never a half-populated directory that the cascade or the trim
+# could pick up mid-write.
+promote_fib() {
+    local dest="$BACKUP_TARGET/daily/$FIB_TODAY" moved
+    mkdir -p "$BACKUP_TARGET/daily" || return 1
+    # A SECOND RUN ON THE SAME DAY REPLACES THAT DAY'S COPY. The run that
+    # finishes last wins, which is the rule the flat layout applies to its single
+    # copy. It goes through fib_swap_dir so that a failure part-way leaves the
+    # EARLIER copy of today in place rather than nothing - on day one that copy
+    # can be the only completed backup on the drive.
+    [ -d "$dest" ] && log "replacing an existing daily for $FIB_TODAY - a second run today, or a re-run after a fixed fault"
+    fib_swap_dir "$RUN_DIR" "$dest" || return 1
+    moved=$(find "$dest" -maxdepth 1 -type f | wc -l)
+    # REPOINTED BECAUSE THE FILES THEY NAME HAVE JUST MOVED, and everything after
+    # this still logs. Identical reasoning to promote_flat's tail.
+    LOG_FILE="$dest/backup.log"
+    MANIFEST="$dest/MANIFEST.tsv"
+    log "promoted $RUN_NAME to daily/$FIB_TODAY ($moved file(s))"
+    return 0
+}
+
+# -- fib_retention - walk the ladder oldest-first, then trim the dailies -------
+# RUNS AFTER PROMOTION, unlike every other retention in this file, because both
+# halves operate on tonight's copy: the trim counts it toward the window, and the
+# ladder needs the daily tree complete before it can pick a source.
+#
+# TWO MARKER FILES PER RUNG, and they answer different questions:
+#   REFILLED  the date this rung was last written. The CADENCE is measured from
+#             this. It has to be stored rather than inferred, because in a
+#             cascade the contents' age no longer tells you when the rung was
+#             filled.
+#   CAPTURED  the date of the DAILY the contents ultimately came from, carried up
+#             the ladder unchanged at every hop. This is the provenance: it is
+#             what says a rung really holds 200-day-old state and not a copy of
+#             last Tuesday.
+# BOTH ARE VALIDATED ON READ. A merely-non-empty marker reaches `date -d`, which
+# accepts far more than an ISO date; a marker holding a FUTURE date makes the
+# elapsed-days arithmetic negative, and a negative interval is always less than
+# the cadence, so the rung would be "not due" forever - frozen, silently, on a
+# service whose whole point is not being silently wrong.
+#
+# RETURNS NON-ZERO IF ANY PART OF THE LADDER FAILED. The archives are already
+# written and promoted by this point, so nothing here aborts the run - but the
+# ladder IS the long-term history in this layout, and a night that could not
+# maintain it has not done what it was asked. The caller turns that into a red
+# report rather than a green one. (Adversarial review, 2026-09-08.)
+fib_retention() {
+    local dailies=() d n i slot cad slotdir srcdir srccap last since failed=0
+    # ISO-DATED DIRECTORIES ONLY, and this is a safety property rather than
+    # tidiness. Anything else under daily/ was not written by this service, so
+    # counting it would push a real backup out of the window, and PRUNING it would
+    # delete somebody else's directory because it happened to sort early. Strays
+    # are named in the log and then left completely alone.
+    while IFS= read -r d; do dailies+=("$d"); done < <(
+        find "$BACKUP_TARGET/daily" -mindepth 1 -maxdepth 1 -type d \
+             -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' -printf '%f\n' 2>/dev/null | sort)
+    n=${#dailies[@]}
+    _stray=$(find "$BACKUP_TARGET/daily" -mindepth 1 -maxdepth 1 \
+                  ! -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' -printf '%f\n' 2>/dev/null | tr '\n' ' ')
+    [ -n "$_stray" ] && warn "ladder: ignoring non-dated entries under daily/ (neither counted nor pruned): $_stray"
+    unset _stray
+    log "ladder: $n daily cop(ies) present (window $FIB_DAILY_KEEP)"
+    if [ "$n" = 0 ]; then
+        warn "ladder: no daily copies at all - nothing to cascade from"
+        return 1
+    fi
+
+    mkdir -p "$BACKUP_TARGET/fib" || { warn "ladder: could not create $BACKUP_TARGET/fib"; return 1; }
+
+    # -- OLDEST RUNG FIRST. See the design note on BACKUP_LAYOUT above: 233 must
+    # take 144's contents BEFORE 144 is overwritten by 89. Descending index is
+    # the entire mechanism by which one night's daily advances exactly one rung
+    # instead of all seven.
+    for (( i = ${#FIB_SLOT_LIST[@]} - 1; i >= 0; i-- )); do
+        slot="${FIB_SLOT_LIST[$i]}"
+        cad="${FIB_CADENCE[$i]}"
+        slotdir="$BACKUP_TARGET/fib/$slot"
+
+        last=""
+        [ -f "$slotdir/REFILLED" ] && last="$(cat "$slotdir/REFILLED" 2>/dev/null)"
+        if [ -n "$last" ] && ! fib_valid_date "$last"; then
+            warn "ladder: rung ${slot}d has an unreadable REFILLED marker ('$last') - treating it as due rather than leaving it frozen"
+            failed=1; last=""
+        fi
+        if [ -n "$last" ]; then
+            since=$(( ( $(date -u -d "$FIB_TODAY" +%s) - $(date -u -d "$last" +%s) ) / 86400 ))
+            if [ "$since" -lt 0 ]; then
+                # A FUTURE MARKER, i.e. the clock has moved backwards since it was
+                # written. Left alone this rung never comes due again.
+                warn "ladder: rung ${slot}d was refilled on $last, which is AFTER today ($FIB_TODAY) - the clock has moved backwards; treating the rung as due"
+                failed=1; since=$cad
+            elif [ "$since" -lt "$cad" ]; then
+                log "  rung ${slot}d: refilled $last (${since}d ago) - next due at ${cad}d"
+                continue
+            fi
+        else
+            since="-"
+        fi
+
+        # WHERE THIS RUNG DRAWS FROM: the rung below it, or - for the lowest -
+        # the OLDEST daily in the window, which is the closest thing to the
+        # 8-day-old sample the sequence would otherwise call for.
+        if [ "$i" = 0 ]; then
+            srcdir="$BACKUP_TARGET/daily/${dailies[0]}"
+            srccap="${dailies[0]}"
+        else
+            srcdir="$BACKUP_TARGET/fib/${FIB_SLOT_LIST[$(( i - 1 ))]}"
+            srccap=""
+            [ -f "$srcdir/CAPTURED" ] && srccap="$(cat "$srcdir/CAPTURED" 2>/dev/null)"
+        fi
+
+        # SKIPPED WITHOUT ADVANCING THE CLOCK, so this rung refills the instant
+        # the one below it first has something to give. On a new box that walks
+        # the ladder up from the bottom one rung per night; after an outage it
+        # closes the gap the same way. Not a failure: it is how the ladder fills.
+        if [ ! -d "$srcdir" ] || [ -z "$srccap" ]; then
+            log "  rung ${slot}d: due, but its source is not populated yet - skipping, clock not advanced"
+            continue
+        fi
+        # A CORRUPT PROVENANCE MARKER IS NOT COPIED UPWARDS. Carrying it would
+        # spread one bad rung's confusion over the whole ladder, one rung a cycle.
+        if ! fib_valid_date "$srccap"; then
+            warn "ladder: rung ${slot}d's source ${srcdir##*/} has an unreadable CAPTURED marker ('$srccap') - not propagating it"
+            failed=1
+            continue
+        fi
+
+        # BUILD BESIDE, THEN SWAP - see fib_swap_dir. The markers are written to
+        # the STAGED copy and CHECKED before anything live is touched: a cp that
+        # consumed the last free block leaves the marker writes failing, and
+        # installing a rung whose markers do not describe its contents is worse
+        # than not refilling it at all.
+        fib_rm_under "$slotdir.new"
+        if ! cp -a "$srcdir/." "$slotdir.new/" 2>/dev/null; then
+            warn "ladder: could not stage rung ${slot}d - leaving the existing copy in place"
+            fib_rm_under "$slotdir.new"
+            failed=1
+            continue
+        fi
+        if ! printf '%s\n' "$srccap"    > "$slotdir.new/CAPTURED" ||
+           ! printf '%s\n' "$FIB_TODAY" > "$slotdir.new/REFILLED"; then
+            warn "ladder: could not write the markers for rung ${slot}d (is the drive full?) - leaving the existing copy in place"
+            fib_rm_under "$slotdir.new"
+            failed=1
+            continue
+        fi
+        if fib_swap_dir "$slotdir.new" "$slotdir"; then
+            if [ "$since" = "-" ]; then
+                log "  rung ${slot}d: FIRST fill from ${srcdir##*/} (state of $srccap)"
+            else
+                log "  rung ${slot}d: refilled from ${srcdir##*/} (state of $srccap; ${since}d since last)"
+            fi
+        else
+            warn "ladder: could not move rung ${slot}d into place - the previous copy has been left where it was"
+            fib_rm_under "$slotdir.new"
+            failed=1
+        fi
+    done
+
+    # NOW the window is trimmed. `dailies` is the pre-trim listing, which is what
+    # the cascade above needed: the oldest daily has to still be on the drive
+    # while the lowest rung is drawing from it.
+    log "ladder: trimming the daily window to $FIB_DAILY_KEEP"
+    for (( i = 0; i < n - FIB_DAILY_KEEP; i++ )); do
+        # NEVER TONIGHT'S OWN COPY. The list is sorted by NAME, so if the clock
+        # has moved backwards - an NTP correction after a flat RTC battery, say -
+        # tonight's date sorts before the seven already on the drive and lands at
+        # the front of the prune list. The run would then delete the backup it had
+        # just taken and report ok. (Adversarial review, 2026-09-08.)
+        if [ "${dailies[$i]}" = "$FIB_TODAY" ]; then
+            warn "ladder: refusing to prune daily $FIB_TODAY - it is the copy this run just made, and it sorted oldest because the clock has moved backwards"
+            failed=1
+            continue
+        fi
+        log "  prune daily ${dailies[$i]}"
+        fib_rm_under "$BACKUP_TARGET/daily/${dailies[$i]}" || { warn "could not prune daily ${dailies[$i]}"; failed=1; }
+    done
+    return "$failed"
+}
+
 retention_prune() {
     local d good=() bad=() i
     while IFS= read -r d; do
@@ -1120,7 +1589,13 @@ retention_prune() {
     # again would otherwise keep that one plan directory forever.
     prune_plan_dirs
 }
-if [ "$LAYOUT" = flat ]; then
+if [ "$LAYOUT" = fib ]; then
+    # DEFERRED, NOT SKIPPED. The ladder and the daily prune both need this run's
+    # copy to be under daily/ first, so they run from the promotion block below
+    # rather than here. Said out loud because a retention step that logs nothing
+    # reads exactly like one that was forgotten.
+    log "retention: deferred - the fib ladder runs after promotion, once tonight's copy is under daily/$FIB_TODAY."
+elif [ "$LAYOUT" = flat ]; then
     log "retention: none - the flat layout holds ONE current copy in $BACKUP_TARGET, which this run replaces."
     log "  BACKUP_KEEP=$KEEP and BACKUP_PLAN_KEEP=$PLAN_KEEP are NOT read in this layout and nothing is pruned."
     log "  The history of this folder is the library backup's Snapshot_<date> series, which versions it per file."
@@ -1153,6 +1628,26 @@ fi
 if [ "$LAYOUT" = flat ]; then
     if ! promote_flat; then
         report_failure "the archives are complete and verified in $RUN_DIR, but they could not be moved into place in $BACKUP_TARGET - a restore would still find the PREVIOUS copy, which is intact"
+        exit 1
+    fi
+elif [ "$LAYOUT" = fib ]; then
+    if ! promote_fib; then
+        report_failure "the archives are complete and verified in $RUN_DIR, but they could not be moved into $BACKUP_TARGET/daily/$FIB_TODAY - yesterday's daily and the whole fib ladder are untouched and intact"
+        exit 1
+    fi
+    # A LADDER THAT COULD NOT BE MAINTAINED IS NOT A GREEN NIGHT. Tonight's copy
+    # is safely under daily/ and is not withdrawn - but in this layout the ladder
+    # IS the long-term history, so a run that only managed the daily has not done
+    # what it was asked, and saying otherwise is the silent-green failure this
+    # service exists to refuse. The warnings above name the specific rung.
+    # (Adversarial review, 2026-09-08.)
+    if ! fib_retention; then
+        feed_naglight false "backup $RUN_TS - tonight's copy is in daily/$FIB_TODAY, but the fib ladder could NOT be maintained; long-term history is not advancing"
+        log "ERROR: the archives are complete and promoted, but the fib ladder failed."
+        log "  daily/$FIB_TODAY is intact and restorable. What did not happen is the"
+        log "  cascade into fib/, which is the only long-term history in this layout."
+        log "  Exiting non-zero so the unit shows red rather than reporting a green"
+        log "  night on a retention policy that has stopped working."
         exit 1
     fi
 fi

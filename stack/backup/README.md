@@ -8,11 +8,11 @@ a question about which of the two you are looking at.
 | | `homehub-backup` (bash) | `homehub-library-backup` (container) |
 |---|---|---|
 | **What it protects** | cifs **ingest** from Mini-serv, the five `volume:` sets (Actual, Technitium, Caddy, tracker, finance), the Mini-serv `path:` set | the **nine library `path:` sets** — the ~4 TB tree that had no archive at all |
-| **How** | `tar` + `zstd` per set into `/srv/library/Configs` — one current copy, no dated folder (`BACKUP_LAYOUT=flat`, 2026-09-01; it was a dated `run_<UTC>` on the archive drive before that) | **FileBackup** in a container: per-file dedup, a browsable **mirror**, `Snapshot_<date>` history |
-| **Storage cost** | ONE full copy, replaced each run — and then versioned by the column to the right, because the folder it lands in is part of the library | one mirror + deltas; growth is bounded by **change rate**, not run count |
+| **How** | `tar` + `zstd` per set into `/mnt/backup-drive/config-history` — one dated copy per night plus a Fibonacci ladder of older samples (`BACKUP_LAYOUT=fib`, 2026-09-08; `flat` on the library drive before that, and a dated `run_<UTC>` on the archive drive root before that) | **FileBackup** in a container: per-file dedup, a browsable **mirror**, `Snapshot_<date>` history |
+| **Storage cost** | 7 dailies + 7 ladder rungs = **14 copies**, ~34 MB in total at the current 2.4 MB per run. Self-contained: the column to the right no longer versions it | one mirror + deltas; growth is bounded by **change rate**, not run count |
 | **Runs** | `homehub-backup.timer`, 03:30 | `homehub-library-backup.timer`, 21:30 (**Q-FB6**, the Owner may move it) |
 | **Panel health** | no separate visible feed | sole writer of verified `lastSuccess` for `file-share-backup-health` |
-| **Retention** | **none in the flat layout** — nothing is pruned and `BACKUP_KEEP` is not read. History is the library backup's snapshots of `Configs`. (`BACKUP_LAYOUT=dated` restores the old `BACKUP_KEEP` rotation) | **none — nothing prunes.** See below |
+| **Retention** | `BACKUP_FIB_DAILY_KEEP` (7) rolling dailies, plus a **cascading** Fibonacci ladder: rung F(n) is refilled from F(n-1) every F(n-2) days, up to 233. `BACKUP_KEEP` is not read. | **none — nothing prunes.** See below |
 | **Entry point** | `backup.sh` | `library-backup.sh` (host) → one `docker compose run` |
 | **Wake-on-LAN, drive power, ingest** | yes | reuses the same `common.sh` drive-power helpers; no WoL, no ingest |
 
@@ -69,15 +69,99 @@ leg added 2026-08-09 covers what only exists across runs.
 ## Layout — `dated` vs `flat` (2026-09-01)
 
 `BACKUP_LAYOUT` decides what `BACKUP_TARGET` holds. It is `dated` unless set,
-and the hub sets it to `flat`.
+and the hub sets it to `fib`.
 
-| | `dated` (original) | `flat` (the hub, since 2026-09-01) |
-|---|---|---|
-| Target | `/mnt/backup-drive` — the archive drive's root | `/srv/library/Configs` — a **folder on the library drive** |
-| Per run | one `run_<UTC>/` directory | the archives sit in the target itself |
-| Plan run | `plan_<UTC>/`, `BACKUP_PLAN_KEEP` of them | one `plan_latest/` slot, replaced |
-| Retention | `BACKUP_KEEP` good runs, pruned after a green night | **none**; `BACKUP_KEEP`/`BACKUP_PLAN_KEEP` are not read, and the run logs that it is ignoring them |
-| History | the dated siblings on the drive | the **library backup's** `Snapshot_<date>` series, which already versions `/srv/library` per file |
+| | `dated` (original) | `flat` (2026-09-01 to 09-08) | `fib` (the hub, since 2026-09-08) |
+|---|---|---|---|
+| Target | `/mnt/backup-drive` — the archive drive's root | `/srv/library/Configs` — a **folder on the library drive** | `/mnt/backup-drive/config-history` — a **folder on the archive drive** |
+| Per run | one `run_<UTC>/` directory | the archives sit in the target itself | one `daily/<YYYY-MM-DD>/` directory |
+| Plan run | `plan_<UTC>/`, `BACKUP_PLAN_KEEP` of them | one `plan_latest/` slot, replaced | one `plan_latest/` slot, replaced |
+| Retention | `BACKUP_KEEP` good runs, pruned after a green night | **none**; `BACKUP_KEEP`/`BACKUP_PLAN_KEEP` are not read, and the run logs that it is ignoring them | `BACKUP_FIB_DAILY_KEEP` dailies + one sample per rung under `fib/<age>/` |
+| History | the dated siblings on the drive | the **library backup's** `Snapshot_<date>` series, which already versions `/srv/library` per file | its own, in `fib/` — nothing else versions it |
+| Root clutter | one directory per night, forever, on the drive root | none | exactly two: `daily/` and `fib/` |
+
+### The Fibonacci ladder (`fib`, 2026-09-08)
+
+**Why `flat` was replaced.** It put the archives on the library drive so the
+FileBackup snapshots would be their history. Measured on the box on 2026-09-08:
+all 25 `Configs` files change every night — they are fresh `tar`+`zstd` of live
+service state, so identical input still yields a different archive — so **all 33
+of their rows were superseded into every `Snapshot_<date>`**. The config archives
+were essentially the entire per-night snapshot, and the library backup was paying
+a full re-store of the folder nightly to version 2.4 MB that versions better on
+its own.
+
+**The shape.** Seven dailies give a working overlap. Past that, one sample is
+kept at each Fibonacci age — 13, 21, 34, 55, 89, 144, 233 days, i.e. F(7)..F(13).
+Fibonacci's 8 is deliberately absent: it falls inside the 7-day window, which is
+why the lowest rung draws from the dailies rather than from a rung below it. A
+rung inside the window is **refused at config time**.
+
+**It is a cascade, and it runs oldest first.** Rung F(n) is refilled from rung
+F(n-1) — never from the dailies, except at the bottom — every F(n-2) days:
+
+| rung | 233 | 144 | 89 | 55 | 34 | 21 | 13 |
+|---|---|---|---|---|---|---|---|
+| filled from | 144 | 89 | 55 | 34 | 21 | 13 | oldest daily |
+| every | 89d | 55d | 34d | 21d | 13d | 8d | 5d |
+
+**The order is the whole design**, not an implementation detail. The rungs are
+walked from oldest to newest, so 233 takes 144's contents *before* 144 is itself
+overwritten by 89, and so on down. Walk it the other way and a single night's
+daily would propagate the entire length of the ladder in one pass, leaving seven
+rungs holding seven copies of the same day and no history at all — the exact
+failure the cascade exists to avoid.
+
+**Why these ages are the ones that work.** Content entering rung F(n) is at most
+F(n-1) days old, and then sits for at most F(n-2) days before the next refill.
+F(n-1) + F(n-2) = F(n) — the Fibonacci identity — so each rung's label is its
+ceiling, reached just before a refill. Measured across 300 simulated nights of
+uninterrupted running, no rung ever exceeded its label. `backup.sh` checks this
+same property against `BACKUP_FIB_SLOTS` at config time and refuses a ladder
+whose rungs could not hold their labels.
+
+**The ceiling assumes the service actually runs.** After an outage every sample
+on the drive is already older than its label, and the first run back can only
+advance each stale source one rung — the ladder re-converges over the following
+cycles rather than snapping back. The guarantee is "never older than its label
+while the nightly runs", not an unconditional one.
+
+**The cadences are derived, not configured.** For a Fibonacci ladder the gap
+between rungs *is* the previous Fibonacci number, so F(n) - F(n-1) = F(n-2) and
+the whole schedule falls out of `BACKUP_FIB_SLOTS` itself. There is no second
+list to keep in step — a list that could disagree with the first is a list that
+eventually will.
+
+**Two markers per rung.** `REFILLED` is the date the rung was last written, and
+the cadence is measured from it; in a cascade the contents' age no longer tells
+you when the rung was filled. `CAPTURED` is the date of the daily the contents
+ultimately came from, carried up the ladder unchanged at every hop — it is the
+provenance, and what says a rung really holds 200-day-old state rather than a
+copy of last Tuesday.
+
+**A rung whose source is empty is skipped and its clock is not advanced**, so it
+refills the moment the rung below it first has something to give. That is how a
+new box climbs the ladder from the bottom, one rung per night, instead of
+standing empty for eight months — and how it closes the gap after an outage.
+
+**Restoring.** `restore.sh` **requires** `--run`; it does not pick a run for you.
+Restore the current copy by naming tonight's daily, or an old sample by naming a
+rung:
+
+```
+restore.sh --run /mnt/backup-drive/config-history/daily/2026-09-08 --set caddy --target /tmp/r
+restore.sh --run /mnt/backup-drive/config-history/fib/34          --set caddy --target /tmp/r
+```
+
+What `newest_run_with_set` resolves is restore's *hint* when the run you named
+turns out not to hold the set. It searches `daily/` and never `fib/`: silently
+offering a months-old rung as "the newest run that holds it" would hand back
+stale state to somebody mid-recovery.
+
+**Tested by** `tests/fib-ladder.test.sh`, which drives 300 simulated nights
+through the `BACKUP_FIB_TODAY` seam and asserts the cascade directly: no rung
+ever older than its label, none fresher than the daily window, ages never
+decreasing going up the ladder, and every rung settling on its F(n-2) cadence.
 
 **Why the move.** The service-state sets are small and change slowly, and the
 thing that versions `/srv/library` does it far better than a full copy per

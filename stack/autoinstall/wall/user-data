@@ -556,6 +556,9 @@ autoinstall:
     # wall-sleep/-wake — the D-W4 sleep window; their .timer files are RENDERED
     #                    by firstboot from SLEEP_START/SLEEP_END (systemd cannot
     #                    interpolate an env var into OnCalendar).
+    # wall-occupancy   — EVERY MINUTE (a .timer), and ONLY when
+    #                    WALL_ABSENCE_ENABLED=true: the SN-015 presence tick.
+    #                    Enabled/disabled by wall-firstboot.sh step 6b, not here.
     # wall-sync        — ONCE AFTER BOOT, ON EVERY RESUME, and on demand over
     #                    SSH: mirror BOTH media shares into the panel's cache
     #                    (OI-15; two sources since OI-18). No timer on THIS unit,
@@ -585,6 +588,16 @@ autoinstall:
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-wake.service /target/etc/systemd/system/wall-wake.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sleep.sh /target/usr/local/sbin/wall-sleep.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sleep.sh
+    # wall-occupancy — SN-015. The every-minute presence tick and the pure
+    # decider it calls. The TIMER IS NOT ENABLED HERE: wall-firstboot.sh step 6b
+    # enables or disables it from WALL_ABSENCE_ENABLED, which is false by
+    # default, so a stock image behaves exactly as it did before SN-015.
+    # Unlike the two sleep timers this one is a fixed cadence, so it is a
+    # tracked unit file rather than one rendered from the env.
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-occupancy.service /target/etc/systemd/system/wall-occupancy.service
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-occupancy.timer /target/etc/systemd/system/wall-occupancy.timer
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-occupancy.py /target/usr/local/sbin/wall-occupancy.py
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-occupancy.py
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-kiosk.sh /target/usr/local/bin/wall-kiosk.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/bin/wall-kiosk.sh
     # wall-sync — the media pull (OI-15). Boot-once + on-demand oneshot; NO timer

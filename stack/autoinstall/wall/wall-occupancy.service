@@ -1,0 +1,24 @@
+# Evaluate the wall panel's occupancy power state once (SN-015 / SR-020).
+#
+# Driven by wall-occupancy.timer every minute. Unlike wall-sleep.timer and
+# wall-wake.timer this unit needs NO rendering: its schedule is a fixed cadence,
+# not a wall-clock boundary, so there is no env var for systemd to interpolate.
+#
+# It is a NO-OP unless WALL_ABSENCE_ENABLED=true in /etc/wall-panel/wall.env.
+# The knob is read by the script, not by the unit, so flipping it needs no
+# daemon-reload and cannot leave the unit and the config disagreeing.
+#
+# ONE script, ONE decision: `wall-sleep.sh occupancy` calls wall-occupancy.py
+# once and applies BOTH halves of what it returns (backlight AND suspend/RTC).
+# Do not add a second unit that writes the backlight — that is precisely the
+# drift SR-020 exists to prevent.
+[Unit]
+Description=Wall panel: evaluate occupancy power state
+# Do not fight a suspend/resume in progress; the next tick is a minute away.
+Conflicts=sleep.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wall-sleep.sh occupancy
+StandardOutput=journal
+StandardError=journal

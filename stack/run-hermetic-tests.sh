@@ -31,6 +31,7 @@ SUITES=(
     "icedrive/tests/profile.test.sh"
     "remote-ui/tests/icedrive-gate.test.sh"
     "ai-cli/tests/ai-cli-guards.test.sh"
+    "autoinstall/wall/tests/occupancy-power.test.sh"
 )
 
 if [ "${1:-}" = "--list" ]; then

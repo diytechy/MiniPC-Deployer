@@ -8,6 +8,37 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 occupancy power in the wall image (B9, SR-020/LLR-003/TC-003/IF-012):**
+the panel's backlight and its suspend/RTC path now come out of **one** evaluation
+of **one** knob set (`SLEEP_MODE`, `SLEEP_START`, `SLEEP_END`,
+`WALL_ABSENCE_ENABLED`, `WALL_ABSENCE_TIMEOUT_MIN`, `WALL_PRESENCE_FILE`).
+`wall-occupancy.py decide()` is a pure function returning both halves in one
+record; `wall-sleep.sh occupancy` applies that record and re-derives neither, so
+the two behaviours cannot drift into a dark screen on an awake machine or a
+suspend with somebody at the panel. **`SLEEP_END` is now 06:45** (ratified
+2026-09-08, replacing 06:30) and is one value doing three jobs: the RTC wake
+target, the morning wake timer, and the start of the on-period.
+**Off by default** — with `WALL_ABSENCE_ENABLED=false` nothing is read and
+nothing is written, and the 22:00 `SLEEP_START` schedule stands unchanged. On:
+backlight off whenever nobody is present; suspend only after an hour of absence
+**outside** the on-period, arming 06:45; **never** a suspend inside the
+on-period, so a walk-in is a backlight write and not a resume. With detection on,
+22:00 stops being a suspend and hands over to the absence timer instead of
+sleeping on somebody standing there. Presence arrives as a file (IF-012) written
+by the panel shell, not from the sensor socket — that socket checks SO_PEERCRED
+against the panel uid and refuses root by design, so the app senses and the image
+powers. **The reader fails safe in one direction only:** missing, unreadable,
+malformed, wrong-version, stale or future-stamped all read as PRESENT, so an
+image whose shell does not yet write the file is inert rather than dangerous.
+**SN-013 still holds and is asserted, not assumed:** an `rtcwake` that cannot arm
+refuses the suspend and degrades to backlight-off on *both* paths (one guard,
+`suspend_now`), and a mains blip loses the tmpfs absence clock so the panel comes
+back lit, awake and reachable and must serve a full timeout again. The tests
+assert the **artifacts** rather than a green timer — the brightness file really
+containing 0, the epoch actually handed to `rtcwake` converting back to 06:45,
+a recorded `systemctl suspend`. No live panel or hub state changed; no apt
+package added, so no apt export is owed.
+
 **2026-09-09 the AI CLI service (B12, SR-019/LLR-002/TC-002/IF-011):** the hub
 gains a plain service — no container — that answers `POST /v1/ask` from on-box
 callers by running one headless CLI session on the household subscription:

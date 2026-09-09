@@ -1,0 +1,25 @@
+# The wall panel's occupancy tick (SN-015 / SR-020).
+#
+# TRACKED, not rendered: the cadence is fixed, so unlike wall-sleep.timer /
+# wall-wake.timer there is nothing here for wall-firstboot.sh to interpolate.
+#
+# ONE MINUTE, and the resolution follows from the requirement rather than taste:
+# the absence timeout is an hour, so a minute is under 2% of it, and a walk-in
+# is handled by the SHELL's own presence write plus this tick — the panel is
+# never suspended inside the on-period, so lighting the screen is a backlight
+# write, never a resume.
+#
+# Persistent is deliberately ABSENT. A missed tick must NOT be replayed after a
+# resume or a mains-blip reboot: replaying it would evaluate an absence that
+# ended while the machine was off. The absence clock lives on tmpfs for the same
+# reason (see wall-sleep.sh) — after a blip the panel starts counting again.
+[Unit]
+Description=Wall panel: occupancy tick
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

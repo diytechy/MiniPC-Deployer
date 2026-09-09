@@ -22,6 +22,9 @@
 #   6. D-W4 — render the sleep-window timers from SLEEP_START/SLEEP_END and
 #      report what /sys/power/mem_sleep actually says (the mem_sleep_default=deep
 #      decision — see user-data §6).
+#  6b. SN-015 — enable or disable the occupancy tick (wall-occupancy.timer) from
+#      WALL_ABSENCE_ENABLED, and log which of the two power behaviours the panel
+#      actually has. Off is the default and leaves step 6 untouched.
 #   7. Autologin the kiosk user on tty1 so cage gets a real logind SEAT.
 #   8. OI-15/OI-18 — the media cache + the pull units: create the cache dir, make
 #      sure wall-sync.service is enabled, and REPORT whether BOTH shares are
@@ -139,8 +142,15 @@ fi
 
 : "${SLEEP_MODE:=suspend}"
 : "${SLEEP_START:=22:00}"
-: "${SLEEP_END:=06:30}"
+# 06:45 (SN-015, ratified 2026-09-08), replacing 06:30. ONE value: the RTC wake,
+# the wake timer, AND the start of the on-period. Keep this default identical to
+# wall-sleep.sh's — a panel whose wall.env predates the knob must get the same
+# answer from both scripts.
+: "${SLEEP_END:=06:45}"
 : "${SLEEP_RTC_WAKE:=true}"
+: "${WALL_ABSENCE_ENABLED:=false}"
+: "${WALL_ABSENCE_TIMEOUT_MIN:=60}"
+: "${WALL_PRESENCE_FILE:=/run/wall-presence/state.json}"
 : "${WALL_PORT:=8443}"
 
 # ── 2. quirk 1 — logind ignores the lid ──────────────────────────────────────
@@ -303,6 +313,34 @@ esac
 
 enable_unit_now "D-W4: sleep window ${SLEEP_START}-${SLEEP_END} $PANEL_TZ, SLEEP_MODE=$SLEEP_MODE, RTC wake=$SLEEP_RTC_WAKE" \
     wall-sleep.timer wall-wake.timer
+
+# ── 6b. SN-015 — occupancy power ─────────────────────────────────────────────
+# The timer is TRACKED rather than rendered (fixed cadence, nothing to
+# interpolate), so all that happens here is enable/disable plus saying, in
+# words, which of the two behaviours this panel actually has. The knob itself is
+# read by wall-sleep.sh at every tick, so this is about the tick existing at all.
+if [ "$WALL_ABSENCE_ENABLED" = "true" ]; then
+    if [ ! -f /etc/systemd/system/wall-occupancy.timer ]; then
+        fail_step "WALL_ABSENCE_ENABLED=true but wall-occupancy.timer is NOT installed (the autoinstall late-commands place it). Occupancy would be silently inert: the backlight would never follow presence and the absence timeout would never fire, while wall.env claims the feature is on. Copy it and wall-occupancy.service from $PAYLOAD/ and: systemctl enable --now wall-occupancy.timer"
+    else
+        # The decider is a separate file from the unit, and a missing decider is
+        # the FAIL-SAFE (wall-sleep.sh then does nothing at all) — which is
+        # exactly the silent-green shape this script exists to refuse, so it is
+        # an error here even though the panel is perfectly usable.
+        if [ ! -f /usr/local/sbin/wall-occupancy.py ]; then
+            fail_step "WALL_ABSENCE_ENABLED=true but /usr/local/sbin/wall-occupancy.py is missing. Every tick would decide NOTHING (fail-safe: never suspend, never dim), so the panel would merely look 'always on' with no error anywhere. Copy it from $PAYLOAD/wall-occupancy.py and chmod +x."
+        fi
+        enable_unit_now "SN-015: occupancy power ON - backlight follows presence; ${WALL_ABSENCE_TIMEOUT_MIN} min of absence OUTSIDE the on-period ${SLEEP_END}-${SLEEP_START} suspends with the RTC wake at ${SLEEP_END}; presence inside the on-period never suspends. Presence is read from $WALL_PRESENCE_FILE and absence is believed ONLY when positively and freshly asserted."             wall-occupancy.timer
+    fi
+else
+    # NOT an error: off is the default, and the whole point of it is that the
+    # panel then behaves exactly as it did before SN-015. Disabling rather than
+    # merely not-enabling is what makes flipping the knob back off stop the tick.
+    if [ -f /etc/systemd/system/wall-occupancy.timer ]; then
+        systemctl disable --now wall-occupancy.timer >/dev/null 2>&1 || true
+    fi
+    log "SN-015: occupancy power OFF (WALL_ABSENCE_ENABLED=false) - the ${SLEEP_START} SLEEP_START schedule stands unchanged and no presence is consulted."
+fi
 
 # The mem_sleep_default decision (user-data §6): report, never silently rewrite
 # the kernel cmdline on a keyboard-less wall-mounted machine.

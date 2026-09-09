@@ -213,3 +213,58 @@ sequenceDiagram
         end
     end
 ```
+
+### One occupancy tick, and the three states it must not collapse (SR-020, LLR-003, IF-012)
+
+This is the flow the block exists to make reviewable, because the wrong version
+of it is easy to draw and hard to spot: **two** presence tests, one next to the
+backlight and one next to the suspend. There is only one, `decide()`, and it
+returns both halves at once. Everything the tick does afterwards is applying
+that record.
+
+Read it for what CANNOT happen: the panel cannot suspend inside the on-period at
+any absence length; it cannot suspend on an absence it did not positively
+observe; and it cannot suspend without an armed RTC alarm, on either path.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Shell as panel shell (OfficeWallNaglight)
+    participant Sock as wall-sensors.sock
+    participant File as WALL_PRESENCE_FILE
+    participant Tmr as wall-occupancy.timer (1 min)
+    participant Sh as wall-sleep.sh occupancy
+    participant Dec as wall-occupancy.py decide()
+    participant HW as backlight / rtcwake / suspend
+
+    Note over Shell,Sock: IF-012 (SR-020, LLR-003) - only the PANEL uid may open the sensor socket<br/>(SO_PEERCRED), so the root power path is never a second client.
+    Shell->>Sock: status
+    Sock-->>Shell: presence + attention + bluetooth
+    Shell->>File: {schemaVersion:1, presence, observedAt, ttlMs}
+
+    Tmr->>Sh: ExecStart
+    alt WALL_ABSENCE_ENABLED=false
+        Sh-->>Tmr: exit 0 - nothing read, nothing written<br/>(the SLEEP_START=22:00 schedule stands unchanged)
+    else enabled
+        Sh->>Dec: now, minute-of-day, absent_since, the knobs
+        Dec->>File: read_presence
+        alt missing / unreadable / bad JSON / wrong version / stale / future
+            File-->>Dec: PRESENT (fail safe - absence is never inferred)
+        else fresh and positively "absent"
+            File-->>Dec: ABSENT
+        end
+        Dec-->>Sh: ONE record {backlight, power, on_period, RTC_WAKE=SLEEP_END}
+        Sh->>Sh: absence clock on /run - set when absent, cleared when present
+        Sh->>HW: backlight_set <the record's backlight>
+        alt power=suspend (absent >= timeout AND outside the on-period)
+            Sh->>HW: arm_rtc SLEEP_END (06:45)
+            alt armed
+                Sh->>HW: systemctl suspend
+            else cannot arm (SN-013)
+                Sh->>HW: backlight off only - a reachable panel beats a dark one
+            end
+        else power=stay
+            Note over Sh,HW: present, or inside the on-period. NOTHING suspended,<br/>so the next walk-in is a backlight write and not a resume.
+        end
+    end
+```

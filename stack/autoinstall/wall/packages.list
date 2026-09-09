@@ -127,7 +127,8 @@ libpam-systemd         # base-installed sibling; a silent removal cascades
 # ── the media sync (OI-15): the panel PULLS, so it needs a cifs client ───────
 cifs-utils             # mount.cifs — the read-only mount of the media share
 rsync                  # the mirror itself (`rsync -a --delete`)
-python3                # wall-media-manifest.py (JSON escaping, not bash).
+python3                # wall-media-manifest.py (JSON escaping, not bash) and
+                        # wall-occupancy.py (the SN-015 power decision).
                        # Present anyway (cloud-init needs it); listed so the
                        # dependency is explicit rather than inherited by luck.
 alsa-utils             # audio sink pinning (WSN-012 lives in the app's runbook)

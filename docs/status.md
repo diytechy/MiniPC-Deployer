@@ -15,6 +15,8 @@ packaged application exists. systemd reads the established root-only
 `wall.env` and exposes it to that account through a RAM-backed credential
 mount; there is no second persistent password file, no credential-bearing
 process argument, and Electron can reach only `/run/wall-door-stream/service.sock`.
+Every image-owned display-off and suspend path stops that broker first; display
+on readies only its idle socket, never a camera connection.
 The wall template declares the reserved camera address and T3 password
 placeholders plus public RTSP/geometry knobs; the SIM uses an unreachable
 `.invalid` fixture. The application capability contract now includes
@@ -6700,3 +6702,17 @@ the complete gate passed: **547 passed / 5 skipped**, trace integrity 0 with the
 unchanged 24 legacy orphans, and doc navigation clean apart from its two known
 orphan warnings. No ISO was built, no panel state changed, and no apt package
 was added (the image already declares `python3` and `ffmpeg`).
+
+**2026-09-09 — B14 display-power lifecycle follow-up.** `wall-sleep.sh` now
+owns the image half of Door teardown as part of the same function that owns the
+backlight: before any successful display-off it must stop
+`wall-door-stream.service`, and the scheduled suspend path repeats that
+precondition before calling `systemctl suspend`. A failed stop therefore leaves
+the panel awake and lit rather than allowing an unseen camera/decoder session.
+Turning the display on starts only the idle broker/socket; the script contains
+no FFmpeg or RTSP action, so waking cannot become an implicit camera start.
+Red-first tests failed 2/2 before the lifecycle existed and pass 6/6 after it;
+the existing occupancy power harness remains **75 PASS / 0 FAIL**. No live
+state changed and no package/image rebuild occurred. The complete gate remains
+green at **549 passed / 5 skipped**, trace integrity 0 with the unchanged 24
+legacy orphans, and clean doc navigation apart from its two known warnings.

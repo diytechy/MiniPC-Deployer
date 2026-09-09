@@ -147,6 +147,19 @@ CR="$(printf '\r')"
 DECIDER="/usr/local/sbin/wall-occupancy.py"
 [ -x "$DECIDER" ] || [ -f "$DECIDER" ] || DECIDER="$(dirname "$0")/wall-occupancy.py"
 
+# The display lifecycle is also the Door source lifecycle (WSN-019). Stopping
+# the broker destroys its active client and the FFmpeg child before the panel
+# goes dark or suspends. Starting the broker only recreates the idle Unix socket;
+# it never opens RTSP — the unlocked Door tab still requires an explicit start.
+stop_door_stream() {
+    systemctl cat wall-door-stream.service >/dev/null 2>&1 || return 0
+    systemctl stop wall-door-stream.service >/dev/null 2>&1
+}
+start_door_broker() {
+    systemctl cat wall-door-stream.service >/dev/null 2>&1 || return 0
+    systemctl start wall-door-stream.service >/dev/null 2>&1
+}
+
 # ── backlight helpers ────────────────────────────────────────────────────────
 # The interface name is hardware-specific (intel_backlight / acpi_video0 / …), so
 # it is DISCOVERED rather than assumed — the hardware baseline records which one
@@ -179,6 +192,10 @@ backlight_set() {   # backlight_set off|on
     fi
     max="$(cat "$d/max_brightness" 2>/dev/null || echo 100)"
     if [ "$1" = "off" ]; then
+        if ! stop_door_stream; then
+            log "WARNING: Door stream broker could not be stopped — refusing to turn the display off."
+            return 1
+        fi
         # Remember the level so `on` restores what the user actually had.
         cur="$(cat "$d/brightness" 2>/dev/null || echo "$max")"
         printf '%s' "$cur" > "$BACKLIGHT_PREV" 2>/dev/null || true
@@ -198,6 +215,9 @@ backlight_set() {   # backlight_set off|on
         return 1
     fi
     log "backlight $1 ($d, level $want)"
+    if [ "$1" = "on" ] && ! start_door_broker; then
+        log "WARNING: the display is on but the idle Door broker could not be readied."
+    fi
     return 0
 }
 
@@ -380,6 +400,10 @@ suspend_now() {
     else
         log "SLEEP_RTC_WAKE=false — suspending with the USB mouse as the ONLY wake."
         log "The internal touchscreen will NOT wake it from S3. This is a test mode."
+    fi
+    if ! stop_door_stream; then
+        log "WARNING: Door stream broker could not be stopped — NOT suspending while a camera source may still be active."
+        return 0
     fi
     log "suspending now"
     systemctl suspend || log "WARNING: systemctl suspend failed — the panel stays awake"

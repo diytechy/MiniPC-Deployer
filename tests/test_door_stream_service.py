@@ -59,3 +59,23 @@ def test_door_capability_matches_the_private_application_payload():
     assert __import__("scripts.assert_wall_capabilities", fromlist=["REQUIRED"]).REQUIRED[
         "door-stream-v1"
     ] == declaration
+
+
+def test_every_display_off_and_suspend_path_stops_the_door_source_first():
+    sleep = (WALL / "wall-sleep.sh").read_text(encoding="utf-8")
+    backlight = sleep[sleep.index("backlight_set()") : sleep.index("# ── which frame")]
+    off = backlight[backlight.index('if [ "$1" = "off" ]') : backlight.index("else")]
+    assert off.index("stop_door_stream") < off.index("want=0")
+    suspend = sleep[sleep.index("suspend_now()") : sleep.index("# write_absent_since")]
+    assert suspend.index("stop_door_stream") < suspend.index("systemctl suspend")
+
+
+def test_display_on_readies_the_idle_broker_without_starting_a_camera():
+    sleep = (WALL / "wall-sleep.sh").read_text(encoding="utf-8")
+    backlight = sleep[sleep.index("backlight_set()") : sleep.index("# ── which frame")]
+    on = backlight[backlight.index("else") : backlight.index("return 0")]
+    assert "start_door_broker" in on
+    executable = "\n".join(
+        line for line in sleep.splitlines() if not line.lstrip().startswith("#")
+    ).lower()
+    assert "ffmpeg" not in executable and "rtsp://" not in executable

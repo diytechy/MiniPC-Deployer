@@ -68,24 +68,180 @@ temperature and heart-rate metrics**. Consenting to it hands this box all of
 them. That is a real widening of what the household gives up for a weight bar,
 and it is the Owner's call, not this feeder's.
 
-### What is still owed, and only the Owner can clear it
+### The five steps, and where each one stands
 
 1. **Enable `health.googleapis.com`** on the Google Cloud project that owns the
    existing OAuth client — the one `oauth2-proxy` and `TRACKER_DRIVE_CLIENT_ID`
    share. (Reuse that client, do not mint a second: the tracker's Drive sync
    already learned that a second copy of the secret is a second thing to rotate.)
+   **DONE by the Owner, 2026-09-09.**
 2. **Add the scope above** to that client's consent screen, and add the Owner's
-   email to the project's **Test users** list. Projects start capped at 100 test
-   users; going beyond that needs a third-party security review, which a
-   household never will.
+   account to the project's **Test users** list. Projects start capped at 100
+   test users; going beyond that needs a third-party security review, which a
+   household never will. **DONE by the Owner, 2026-09-09.**
 3. **Consent in a browser** and mint a refresh token into `WEIGHT_TOKEN_FILE`.
+   **BUILT, never yet run against Google:** `weight_oauth.py mint`, below.
+4. **Make ONE real `dataPoints.list` call** and keep the body.
+   **BUILT, never yet run against Google:** `weight_oauth.py capture`, below.
+5. **Write `parse_weight_datapoint` against that captured body**, after pasting
+   it into `weight_feeder.py`'s module docstring the way B7 pasted its three.
+   **STILL OWED, and deliberately not started.** It is written by whoever holds
+   a real response body, never from the schema: the discovery document says
+   `weightGrams` is *grams*, and a parser that assumes kilograms posts a
+   confident, plausible, wrong body weight that nothing on the wall could
+   contradict.
 
-Then: make **one** `dataPoints.list` call by hand, paste the response body into
-`weight_feeder.py`'s module docstring the way B7 pasted its three, and only then
-write `parse_weight_datapoint` against it.
+Steps 3 and 4 are two subcommands of one Owner-run tool, `weight_oauth.py`, and
+**neither of them parses a weight** — a test asserts that of this file too, not
+only of the feeder. It is a separate file from the feeder on purpose: the
+feeder's central guarantee is that it **never writes a credential** — an
+allow-list, a systemd mount option and three tests stand behind that sentence —
+and one of these commands writes exactly the credential the feeder may not. A
+credential-writing door does not belong inside the module whose guarantee is
+that it has none.
 
 ---
 
+## Steps 3 and 4: the exact commands, and what each one prints
+
+### First, ONE line to add in the Google console
+
+Add this to the OAuth client's **Authorized redirect URIs**:
+
+```
+http://localhost:8117/
+```
+
+**ALONGSIDE the two already there** —
+`https://<TRACKER_SUBDOMAIN>.<DOMAIN>/oauth2/callback` and
+`https://<TRACKER_SUBDOMAIN>.<DOMAIN>/api/drive/callback`. Adding must not
+replace: removing the first breaks Google sign-in for the whole household, and
+removing the second breaks the tracker's Drive sync. The trailing slash is part
+of the value — Google matches a web client's redirect URI byte for byte, and a
+missing slash is the `redirect_uri_mismatch` below.
+
+Google permits `http://` **only** for `localhost`/`127.0.0.1`, which is why this
+one is not https. If the console refuses the value, try `http://127.0.0.1:8117/`
+and pass it to `mint` as `--redirect-uri`; if it refuses both, **stop and report
+it** rather than creating a Desktop-type client — that would be a second
+credential to rotate, and that is the Owner's call.
+
+### Why THIS flow, when the hub has no browser
+
+The consent screen has to open on a machine with a browser — the Owner's PC —
+while the process waiting for the code runs on the hub over SSH. Three flows
+were possible and the choice is deliberate:
+
+| flow | why not / why yes |
+|---|---|
+| `urn:ietf:wg:oauth:2.0:oob` (the old copy-the-code page) | **Not available.** Google shut it down in October 2022; new use answers `invalid_request`. |
+| a loopback **listener** on the hub | Needs `ssh -L 8117:127.0.0.1:8117` up **before** consent, because the browser resolves `localhost` on the *PC*. Forget the tunnel and the code is spent and lost. It also puts a live authorization code on a hub socket any other local account may connect to. |
+| a registered loopback redirect with **nothing listening** | **Chosen.** The browser lands on an error page, the code sits in the address bar, and it travels from the clipboard to the SSH session's stdin without touching a socket. No tunnel, no port, no race. |
+
+The one cost is that **the browser shows a failure page**, which looks like the
+flow broke. It has not: that page *is* the success case, and the step below says
+so where you will be looking. PKCE (S256) is sent as well, so a code seen in an
+address bar, a clipboard or a scrollback is useless to anyone without the
+verifier, which never leaves the minting process.
+
+### Step 3 — mint the refresh token
+
+```bash
+ssh hub
+sudo /usr/bin/python3 /opt/homehub/stack/weight/weight_oauth.py mint
+```
+
+**Why `sudo`:** `stack/.env` is mode 0600 root:root and holds
+`OAUTH2_PROXY_CLIENT_ID`/`_SECRET`. The tool reads **only those two keys** — it
+never `source`s that file — and hands the finished token to the
+`homehub-weight` account so the feeder can read it.
+
+It should print a long `https://accounts.google.com/o/oauth2/v2/auth?...` URL,
+then wait at `Paste the address-bar URL here:`.
+
+1. Open that URL in a browser **on your PC** and sign in as the household
+   account.
+2. Grant the health-metrics scope. Remember what it includes: blood glucose,
+   body fat, oxygen saturation, core body temperature and heart rate, because
+   there is no weight-only scope.
+3. The browser lands on **"This site can't be reached" /
+   `ERR_CONNECTION_REFUSED` at `localhost:8117`. THAT IS THE SUCCESS CASE.**
+4. Copy the **whole address bar** of that failed page, paste it into the SSH
+   session, and press Enter.
+
+On success it prints exactly three lines:
+
+```
+weight: refresh token written to /var/lib/homehub-weight/tokens/google-health-token.json (mode 0600, owner homehub-weight).
+weight: the token itself was not printed, and the client secret was not copied into it.
+weight: next, capture ONE response body - see stack/weight/README.md.
+```
+
+**Nothing secret is ever printed** — not the token, not the client secret, not
+the authorization code — on success, in an error, or in a traceback (there are
+no tracebacks: every failure prints one refusal line and exits 2).
+
+When it prints something else:
+
+| what it says | what it means, what to do |
+|---|---|
+| `could not read /opt/homehub/stack/.env (PermissionError)` | it was not run under `sudo`. |
+| `... already exists and --force was not given` | a token is already there. Pass `--force` only if you mean to replace a working one. |
+| `the token exchange failed: HTTP 400, redirect_uri_mismatch` | the console value and `--redirect-uri` differ — usually the trailing slash. |
+| `the token exchange failed: HTTP 400, invalid_grant` | the code expired (they last minutes) or was already used. Run `mint` again. |
+| `Google returned an error instead of a code: access_denied` | consent was declined, **or the account is not on the project's Test users list**. |
+| `the token exchange failed: HTTP 401, invalid_client` | the id/secret pair in `.env` is not the client the redirect URI is registered on. |
+| `Google's reply carried no refresh token` | Google treated this as an already-granted consent. Remove the app under `https://myaccount.google.com/permissions` and run `mint` again. |
+| `the state in that URL is not the one this run generated` | a stale browser tab from an earlier attempt. Start `mint` again. |
+| `REFUSED: ... outside the service's own state directory` | `WEIGHT_TOKEN_FILE` points somewhere that is not under `/var/lib/homehub-weight`. The guard refuses; fix the knob. |
+
+### Step 4 — capture ONE response body
+
+```bash
+sudo /usr/bin/python3 /opt/homehub/stack/weight/weight_oauth.py capture --out /home/hub/weight-datapoints.json
+```
+
+`--out` must **not already exist** — it is created `O_EXCL`, mode 0600, and
+handed back to the account that typed `sudo`. On success:
+
+```
+weight: HTTP 200 from https://health.googleapis.com/v4/users/me/dataTypes/weight/dataPoints
+weight: 1234 bytes saved to /home/hub/weight-datapoints.json (mode 0600; the body is NOT printed - it is health data).
+weight: sha256 <64 hex characters>
+weight: hand that file back. The parser is written against it, not before it.
+```
+
+**The body is never printed**, on purpose: it is a real body weight with a
+timestamp. The byte count and the sha256 are there so the file handed back can
+be shown to be the file that was captured.
+
+Exactly **one** call is made to the health API. (The token refresh that precedes
+it is a separate call to Google's *token* endpoint, not to the health API.)
+
+| what it says | what it means, what to do |
+|---|---|
+| `the list call failed: HTTP 403, PERMISSION_DENIED` | either `health.googleapis.com` is not enabled on the project that owns **this** client, or the scope is not on its consent screen. A scope added *after* consent is not in an already-minted token: fix the console, then `mint --force` again. |
+| `the list call failed: HTTP 401` | the token is not valid for this API. `mint --force`. |
+| `the list call failed: HTTP 404` | the route is wrong. It is `/v4/users/me/dataTypes/weight/dataPoints` — the prose docs' `/v4/users/me/dataPoints/weight` is the error this whole gate exists to catch. |
+| `HTTP 200` but only a handful of bytes (`{}` or an empty `dataPoint` list) | the call worked and the account simply has no weight data in Google Health. That is still a real captured body and worth keeping, but **a parser cannot be written from an empty list** — weigh in on a scale that feeds Fitbit/Pixel and capture again. |
+| `the list call was refused: refused an HTTP 302 redirect` | something answered for `health.googleapis.com` that is not Google. Do **not** retry with redirects allowed: urllib carries `Authorization` across a cross-host redirect, and that header is this whole scope. |
+| `could not read the token file ... Run mint first.` | step 3 has not been done on this box, or `WEIGHT_TOKEN_FILE` disagrees with where it was written. |
+
+### Then, and only then, step 5
+
+Hand the captured file back. The parser is written against it, in its own task,
+by whoever holds that body. Nothing in this repo may grow a
+`parse_weight_datapoint` before that — two tests fail if it does.
+
+### What has NEVER run against Google
+
+Every test of these two tools runs against a **loopback HTTP server this repo
+starts**. The consent screen, a real authorization code, a real token exchange,
+a real refresh, a real `dataPoints.list` response and the real 401/403 bodies
+are **unexercised**. What *is* exercised against real behaviour: the egress
+guards (a real 302 and a real proxy variable, on real sockets), the write guard
+(a real symlink on a real filesystem), the refusal to overwrite, and the
+no-secret-printed property (sentinel values carried through the whole flow).
 ## The goal lives in the user's definitions (SN-040), and here is exactly how
 
 `WEIGHT_DEFINITIONS_DIR` names the **directory**, never the number. In
@@ -295,10 +451,12 @@ be carriage for a container that does not exist.
 | File | What it is |
 |---|---|
 | `weight_feeder.py` | the feeder: pure core above the SHELL banner, thin I/O below |
+| `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk). No parser, and no writing door the feeder shares |
 | `homehub-weight.service` | oneshot unit, hardened, `ProtectHome=read-only` |
 | `homehub-weight.timer` | 15 min, justified against the `static` horizon |
 | `setup-weight.sh` | idempotent install; refuses rather than guessing |
 | `../../tests/test_weight_feeder.py` | TC-006 |
+| `../../tests/test_weight_oauth.py` | TC-006 - the no-leak and credential-guard properties of the two tools above |
 
 Adds **no apt package** — python3 stdlib only, and `python3` is already in
 `packages.list`. No apt export is owed.

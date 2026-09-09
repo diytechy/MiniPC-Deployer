@@ -1090,14 +1090,16 @@ def read_google_health(env):
     raise SourceFailure(
         "google-health: BLOCKED on an Owner action, so no reading was taken "
         "and no number was invented. %s "
-        "Still owed: (1) enable health.googleapis.com on the Cloud project "
-        "that owns the existing OAuth client; (2) add the scope %s to that "
-        "client's consent screen and the Owner to its Test users; (3) consent "
-        "in a browser and mint a refresh token into WEIGHT_TOKEN_FILE. Until "
-        "one real response body has been observed, this feeder posts "
-        "'unavailable' rather than a parser's guess."
+        "The Cloud project has health.googleapis.com enabled and the scope %s "
+        "on its consent screen (Owner, 2026-09-09); what remains is to run "
+        "`weight_oauth.py mint` and then `weight_oauth.py capture` on this box "
+        "and write the parser against the body that comes back - the exact "
+        "commands are in stack/weight/README.md. Until one real response body "
+        "has been observed, this feeder posts 'unavailable' rather than a "
+        "parser's guess."
         % ("A token file is present, but no parser exists yet - see the module "
-           "docstring." if have_token else "No token file is present.",
+           "docstring." if have_token else "No token file is present; run "
+           "`weight_oauth.py mint`.",
            GOOGLE_HEALTH_SCOPE))
 
 

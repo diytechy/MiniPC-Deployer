@@ -8,6 +8,28 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 — B11 steps 3 and 4 are BUILT on a SIDE BRANCH (`b11-weight-token`),
+pending merge into `IceDrive-DesktopDirection`, and neither has ever spoken to
+Google.** The Owner has cleared steps 1 and 2 (health.googleapis.com enabled on
+the project that owns the shared OAuth client; the health-metrics scope on its
+consent screen; the Owner a Test user). `stack/weight/weight_oauth.py` now
+carries the two Owner-run commands that follow: `mint` walks the Owner through
+browser consent once and writes a refresh token into `WEIGHT_TOKEN_FILE`, and
+`capture` makes exactly ONE `dataPoints.list` call and saves the raw body to a
+file. The chosen consent flow is a registered loopback redirect with **nothing
+listening** — the browser is on the PC and the process is on the hub, OOB was
+shut down by Google in 2022, and a hub-side listener would need an SSH tunnel
+raised before consent or the single-use code is lost. **The Owner must add
+`http://localhost:8117/` to the OAuth client's redirect URIs, alongside — never
+replacing — the existing `/oauth2/callback` and `/api/drive/callback`.**
+**Step 5 is deliberately NOT started:** no `parse_weight_datapoint` exists, in
+the feeder or in the new module, and two tests fail if one appears. The parser
+is written against a body a human has actually seen, because `weightGrams` is
+grams and a parser that assumes otherwise posts a confident, plausible, wrong
+body weight that nothing on the wall could contradict. Next action awaiting
+approval: the Owner runs the two commands in `stack/weight/README.md` and hands
+the captured body back. Gate remains G1.
+
 **2026-09-09 — B14 Door image integration is implemented, not deployed.** The
 wall image now installs a hardened `wall-door-stream.service`, creates its
 non-login service account, and starts an idle local broker only after the
@@ -6700,3 +6722,55 @@ the complete gate passed: **547 passed / 5 skipped**, trace integrity 0 with the
 unchanged 24 legacy orphans, and doc navigation clean apart from its two known
 orphan warnings. No ISO was built, no panel state changed, and no apt package
 was added (the image already declares `python3` and `ffmpeg`).
+
+### DRIVER — B11 steps 3-4 — 2026-09-09 (token minting + one-shot capture, side branch)
+
+**What changed.** `stack/weight/weight_oauth.py` (new) with two subcommands and
+no parser; `tests/test_weight_oauth.py` (new); `stack/weight/README.md` now
+carries the Owner's exact commands, what each prints, and a failure table for
+each; `weight_feeder.read_google_health`'s refusal message points at the new
+tool instead of restating steps the Owner has already cleared;
+`stack/.env.example` says where `WEIGHT_TOKEN_FILE` comes from.
+
+**The decisions, and why.** (1) The EXISTING OAuth client is reused — the tool
+reads only `OAUTH2_PROXY_CLIENT_ID`/`_SECRET` out of `stack/.env`, key by key,
+never `source`-ing a file that also holds the DNS admin password and the
+Cloudflare token. (2) The minted file holds **no client secret** (the feeder
+gets the pair from its unit's `EnvironmentFile=`, so the secret stays in one
+place) and **no access token** (worthless in an hour). (3) The token write goes
+through the feeder's guard with its sign reversed — one allow-listed path,
+resolved with `realpath`, contained in the service's own `StateDirectory=`,
+never the state file, and opened by the feeder's own
+unlink-then-`O_CREAT|O_EXCL|O_NOFOLLOW` door at 0600 — in a separate module,
+because a credential-writing door does not belong inside the module whose
+guarantee is that it has none. (4) Every outbound call uses
+`weight_feeder.vendor_opener()`: redirects refused, no proxy inherited, because
+urllib does not strip `Authorization` across a cross-host 302 and this token
+also grants blood glucose, body fat, oxygen saturation, core body temperature
+and heart rate. (5) Nothing secret is printed anywhere; a remote's error body is
+never echoed, only a single short `error` enum lifted through an allow-list
+pattern.
+
+**Evidence.** `python scripts/check.py` → **RESULT: PASS**, **574 passed / 6
+skipped** (this session's own baseline on this worktree was 547 / 5),
+`scripts/trace.py --strict-integrity` integrity=0 with the unchanged 24 legacy
+orphans, `check_flows.py --no-placeholders` OK (5 diagrams, 11 ids),
+`validate_config.py` ALL CONFIG CHECKS PASSED. `stack/run-hermetic-tests.sh` is
+**UNRUN** on this dev PC (it refuses without zstd/rsync) and is reported as
+unrun, not as passing. **Mutation runs: 19 deliberate defects, 19 RED, restored
+byte-identical and green** — including one first-pass SURVIVOR that was a test
+defect (the capture output's credential-name refusal was asserted only through
+`capture_output_verdict`, so deleting the call in `open_capture_output` stayed
+green; the test now opens the door itself).
+
+**What has never run against Google, stated plainly.** Every test drives a
+loopback HTTP server this repo starts. The consent screen, a real authorization
+code, a real token exchange, a real refresh, a real `dataPoints.list` response
+and the real 401/403 bodies are **unexercised**. Real behaviour IS exercised for
+the egress guards (a real 302 and real proxy variables on real sockets), the
+write guard (a real symlink on a real filesystem), the overwrite refusal, and
+the no-secret-printed property (sentinels carried through the whole flow).
+
+**Not done here.** No parser, no push, no deployment, no panel or hub state
+touched, no apt package added. This work sits on `b11-weight-token` and is owed
+a merge into `IceDrive-DesktopDirection`.

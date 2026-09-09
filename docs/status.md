@@ -5707,3 +5707,43 @@ wrong one overwrites another person's definitions. Same shape and reasoning as
 
 `docker compose --env-file .env.example config tracker` renders with Drive fully
 off (no source, no user), which is the correct default for a clone.
+
+## Audit — 2026-09-09 the `panel-capabilities-2026-09-06` branch is reconciled and gone
+
+Three commits had diverged onto that branch at `eb1b012` while this branch moved
+19 commits past it. **Two were cherry-picked; one was deliberately dropped.** The
+branch and its linked worktree are removed, so this cannot drift a third time.
+
+**Kept — `bd0977e`, the frame lane asserts freshness of the videos**, not that a
+generator ran (open item E9). Applied clean. Adds `stack/tracker/frame-freshness.sh`
+with its service and timer.
+
+**Kept — `35ac0b9`, config archives leave the library drive for a cascading
+Fibonacci ladder.** Seven rolling dailies plus rungs refilled F(n) from F(n-1)
+every F(n-2) days, out to 233. One conflict, in `stack/backup/README.md`, resolved
+by reading both sides rather than taking either: this branch's **Panel health**
+row is kept because it is the post-unification answer to "which feed", and the
+incoming **Retention** row replaces ours because ours said *"none — nothing is
+pruned"*, which the ladder makes false. The incoming **Feed lane** row (`backup` /
+`library-backup`) was dropped as the pre-unification form of the same question.
+
+**DROPPED — `973b527`, "the backup-drive health lane read `BACKUP_TARGET`, which
+the flat layout moved onto the library drive".** Recorded here so it reads as a
+decision rather than an oversight. It repairs
+`stack/samba/homehub-backup-drive-health.service`, which `31d3d72` on this branch
+**deleted** when it implemented the unified share-and-backup health producers —
+the ratified SN-014/SN-037 ruling that replaced per-drive telemetry with one
+indicator. Git surfaced it as a modify/delete conflict, but the substance is that
+the component no longer exists by decision. Applying the fix would have
+resurrected it. `stack/samba/backup-drive-health.sh` is likewise absent, verified
+after the picks.
+
+**Evidence.** `stack/backup/tests/fib-ladder.test.sh` — **41 pass, 0 fail**, run
+under WSL Ubuntu because the test needs `rsync`, which the dev PC does not have
+on PATH. `bash -n` clean on `frame-freshness.sh`, `backup.sh` and `common.sh`.
+`scripts/check.py`: config-validate, registry-integrity and doc-navigability all
+pass; **unit-tests fails for want of `pytest` on this machine**, which is a
+pre-existing environment gap (`import pytest` fails at the interpreter) and not
+attributable to these commits. It is still an unrun step, not a passing one.
+
+Rollback point kept as the tag `pre-b15-2026-09-09` (`bf74c67`).

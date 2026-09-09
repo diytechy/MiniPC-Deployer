@@ -8,6 +8,227 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 cross-review fix round on BOTH feeders (B7 SR-021 + B11 SR-022) —
+verdict REJECT, all findings applied.** A different model family reviewed the
+usage feeder and the weight feeder together; the coordinator verified the two
+worst in source and accepted the rest. These are the most serious defects this
+build has produced, because they act on the household's **real vendor
+credentials** rather than on fixtures.
+
+**V1 — the credential guard was bypassable by symlink.** `open_for_write`
+compared `os.path.abspath`, which is string arithmetic and does **not** resolve
+symlinks. Pre-creating `<state>.tmp` as a link pointing at a vendor token
+therefore passed the allow-list unchanged — the *string* matched — and
+`save_state` opened it `"w"` and truncated the token. The allow-list SHAPE was
+right; the resolution was wrong. Now:
+
+* `writable_path_verdict` resolves with `os.path.realpath`, and it is a **pure
+  decision with an injected resolver**, so the rule can be asserted on a
+  filesystem that will not grant symlinks as well as on one that will;
+* the resolved path must sit **inside the service's own `StateDirectory=`**
+  (`$STATE_DIRECTORY`, falling back to the literal `/var/lib/homehub-{ai,weight}`
+  for a hand-run). The allow-list alone is derived from a path the *config*
+  names, so it can only ever say "the feeder wrote where it was told"; this
+  bound is the one the `.env` cannot move;
+* `open_no_follow` does not trust the check that preceded it. The file is
+  unlinked first — which destroys a planted *link* and never the file it points
+  at, and clears a `.tmp` left by a killed cycle — then opened
+  `O_CREAT|O_EXCL|O_NOFOLLOW`, so a symlink planted **between** the check and
+  the open is refused by the kernel. `O_NOFOLLOW` is absent on Windows and
+  resolves to 0 there; the hub is Linux, so the deployed guard is whole and the
+  dev PC still exercises the unlink, `O_EXCL` and the resolving verdict.
+
+A refused write costs the **history**, never the gauge: the cycle has already
+posted, and the refusal is a named failure in the journal.
+
+**One redundancy was found and removed rather than reported as depth.** The
+first cut bounded both `state_path` and the path being opened. The mutation run
+killed neither — each hid the other's absence — because the allow-list pins the
+opened path to the state file or its `.tmp` anyway. It is now **one** check, on
+the path actually about to be opened, and deleting it goes red.
+
+**V2 — the feed could leave the box two ways, and did not need the URL to
+change.** All four call sites (two readers, two posters) used a bare
+`urllib.request.urlopen(Request(...))`, and urllib's **default opener** follows
+redirects *and* honours `http_proxy`/`https_proxy`. So the validated loopback
+endpoint could answer `302 Location: http://attacker.example/feed` and urllib
+would re-send the POST — feed bearer token, `X-Forwarded-User` identity, and a
+body that for the weight feeder is **the Owner's body weight** — to a host the
+*response* chose; and an exported proxy variable routed the same POST through a
+LAN proxy that saw all of it. urllib does **not** strip `Authorization` across a
+cross-host redirect, so the vendor GETs leaked in the same way.
+
+Two openers now, and the difference between them is a decision rather than an
+oversight:
+
+| | feed POST (`feed_opener`) | vendor GET (`vendor_opener`) |
+|---|---|---|
+| redirects | refused | refused |
+| proxies | `ProxyHandler({})` — none installed | none installed, **and no knob to opt back in** |
+| peer address | re-checked on the socket **before the request is written** | not checked — outbound by design |
+
+**The vendor decision, stated because it was asked for.** Those calls are
+*supposed* to leave the box, so a peer check would be nonsense. Redirects are
+still refused, because a 302 from an impersonated endpoint hands out the
+household's Claude OAuth access token, the OpenCode workspace key, or (once the
+weight half is unblocked) a Google Health token that grants blood glucose, body
+fat, oxygen saturation, core temperature and heart-rate metrics as well as
+weight — there is no weight-only scope. All three endpoints answered **200
+directly** during the 2026-09-09 verification calls, so refusing costs nothing
+that has ever been observed, and the price if a vendor starts redirecting is an
+"unavailable" gauge — the outcome this feeder exists to produce. Proxies are
+**not** made opt-in-able: a proxy knob nobody needs is a second way for a token
+to leave, and an egress proxy would be a requirement change rather than a
+setting. A vendor URL must also be `https`, because the URL is a knob and the
+headers carry a bearer token.
+
+The peer check runs inside `connect()`, after the handshake and **before**
+`http.client` writes the request line, so a connection that lands somewhere it
+should not is dropped with the token and the body unsent. That is what
+"re-validate the address actually connected to" means here; the feed host is
+already required to be an IP literal, so the URL check and the socket check
+agree by construction and the socket check is what survives a future change.
+
+**The other accepted findings, each fixed and each with a test that fails
+without it.**
+
+* **A malformed-but-200 payload became a 7-day-fresh gauge.** `window.kind`
+  *selects* NagLight's staleness horizon, so a Claude bucket with `utilization`
+  and no `resets_at`, or an OpenCode bucket missing `resetsAt`, produced a
+  windowless gauge that inherited the **static** horizon — seven days — instead
+  of the 24–48 h its real window implies. A source that died on Monday was
+  still green the following Sunday. `check_window` now refuses a window it
+  cannot determine, so that bucket becomes **unavailable**; `build_gauge`
+  refuses to construct a body that carries `observed_at` without a window at
+  all. The one legitimately windowless body is the never-measured sentinel, and
+  it is exactly the one with no stamp.
+* **A replayed or cached vendor 200 was re-stamped `now`.** The vendors do not
+  say when the value was true, but they do say when the window resets, and that
+  is the evidence there is: the window must **contain** `now`. A reset already
+  in the past means the body describes a finished window and is a replay or a
+  cache; a window that has not begun is the same evidence from the other side
+  (a clock error, or milliseconds read as seconds). `MAX_CLOCK_SKEW_SECONDS`
+  (300) is the only slack. The weight feeder already used the source's own
+  sample time rather than `now` — the fix there is `check_observed_at`, which
+  **refuses** a future stamp rather than clamping it, because clamping would
+  invent the stamp the invariant forbids.
+* **An invalid Codex window aborted the whole cycle.** `usedPercent: 34` with
+  `windowDurationMins` of `0`, `-1`, `NaN` or infinity parsed cleanly and only
+  raised later in `build_post`, **outside** the per-source catch — so the cycle
+  exited before any gauge was posted and every other source's previously fresh
+  value stayed green until it expired. Two fixes, and both were needed: the
+  window is validated **inside the reader**, and each gauge is now built and
+  posted in **its own try**, falling back to the unavailable sentinel so a
+  refusable body costs one gauge rather than the cycle.
+* **Loaded state was never validated.** Types, ranges and timestamps were all
+  trusted; `build_gauge` asked only whether the number was finite. Corrupted or
+  tampered state posted fabricated fresh readings — `-500 lb`, `100000` percent,
+  or a stamp in the **future** that made a dead source render live.
+  `validate_stored_reading` now runs **at the load and at the point of use**,
+  which are separated by the whole source read. A nonsensical stored reading is
+  not history, it is a failure, and it gets the answer a source that never
+  succeeded gets. Weight also gained a plausibility band (40–1000 lb, the same
+  numbers the goal is held to, now with one home and two names) applied to any
+  body that carries a stamp — the sentinel `0` is the only unmeasured number
+  either file may emit and it only ever appears with no stamp.
+* **Error bodies landed in the journal.** Both posters returned
+  `exc.read()[:200]` and `main` prints it to stderr, so anything a responding
+  server or an interposed proxy chose to reflect — a token echoed back in an
+  error body included — was persisted by systemd. The status code is ours to
+  read; the body is the remote's to write, and it does not get a journal. The
+  same reasoning removed the one remaining message interpolation: a
+  `SystemExit` echoing an unparseable `AI_USAGE_FEED_URL` could have printed
+  `http://user:token@host/`.
+* **B11's broad `except Exception` recorded `str(exc)`.** B7 logged only the
+  exception TYPE and that pattern is now copied. This is the branch the real
+  OAuth reader will fall into, and an exception raised inside urllib carries the
+  request object — `str(exc)` on one of those prints an `Authorization` header.
+
+**THE INVARIANT WAS NOT BROKEN, and it is asserted whole in both suites.**
+`observed_at == now` **iff** this cycle actually read the source. A failure with
+history reposts the last real value at its ORIGINAL stamp; no history posts
+value 0 with **no** `observed_at`. Every change above tightens what counts as
+"read the source" and none of them creates a new way to stamp a reading this
+cycle did not take. The wire contract is unchanged: `value`/`target` always
+present, `direction` required with a `window` and refused without, `min`/`max`
+together or both omitted (weight still omits them so NagLight infers its 50 lb
+range), numbers only and never a colour.
+
+**B11 IS STILL BLOCKED BY CONSTRUCTION.** No parser exists, `read_google_health`
+still refuses by name, and the test asserting no `parse_google_health` /
+`parse_weight_datapoint` symbol still passes — with a new test that re-asserts
+both *after* this round, because a fix round is exactly when a blocked path
+quietly acquires a way through. `vendor_opener` was written for that blocked
+half deliberately: the egress defect happened because every call site reached
+for the convenient function, and the Google Health reader is the one call site
+still unwritten.
+
+**SHARED VS MIRRORED: mirrored, deliberately, with a parity test as the price.**
+The two feeders ship as standalone scripts under separate units, separate
+unprivileged accounts and separate `StateDirectory=` roots, run as
+`/usr/bin/python3 /opt/homehub/stack/<service>/<file>.py` under
+`ProtectSystem=strict`; there is no importable module between them and adding
+one is a carriage change (a third install path, a `sys.path` two units must
+agree on, and a shared failure surface for two services required to fail
+independently). So every guard was applied twice — and the cost of that decision
+is `tests/test_feeder_egress_parity.py`, which asserts the shared properties
+against **both** modules by behaviour rather than by comparing source text (a
+text comparison passes on two identically broken copies, which is the state the
+review found). It also refuses a bare `urlopen` anywhere in either file, which
+is what will fail if the session that finally writes the Google Health reader
+reaches for the default opener. Only the genuinely divergent parts differ:
+`check_window` is B7-only (weight has no window by design) and the plausible-lb
+band is B11-only.
+
+**Evidence.** `python scripts/check.py` — **PASS** at gate G1, all four steps:
+config-validate, unit-tests **517 passed / 5 skipped** (baseline 423/5),
+registry-integrity SN=16 SR=22 LLR=6 TC=6 **integrity=0**, doc-navigability OK.
+`python scripts/trace.py --strict-integrity` — **exit 0**, orphans 24 =
+baseline. `python scripts/check_flows.py --no-placeholders` — **OK, 4 diagrams**,
+10 ids, all known (both feeder flows were updated to show the new refusals).
+`stack/run-hermetic-tests.sh` — **UNRUN**: it REFUSES on this dev PC for want of
+`zstd` and `rsync`, which is the pre-existing gap and is reported as UNRUN, not
+as passing.
+
+**Mutation: 28 deliberate defects, 28 killed** — after two passes that found
+real gaps rather than confirming the first set. The first pass had **seven**
+survivors and each one was a defect in the *tests*:
+
+| Survivor | What it exposed | Fix |
+|---|---|---|
+| state-root bound (×2) | the two containment checks were the same check twice | collapsed to one; deleting it now goes red |
+| `open_no_follow` → plain `open` | the mutant left the `unlink` in place, so it removed nothing | mutant restated to remove unlink + `O_EXCL`; weight lacked the planted-symlink test entirely |
+| missing-window branch | `window_kind_for(None)` raised a *type* error one line later — the right outcome by accident of ordering, with a journal message describing the wrong problem | the refusal message is now asserted |
+| state validation (×3) | `load_state` and `build_post` each hid the other's absence — a guard only the other guard proves is a guard nobody has tested | each layer is now asserted where it acts |
+
+The final table, every mutant taking the suite red on the check meant to notice
+and green again on restore: `realpath`→`abspath` (both feeders) · state-root
+containment dropped (both) · `open_no_follow` → plain truncating open · feed
+opener follows redirects (both) · feed opener honours `http_proxy` (both) · peer
+check removed (both) · vendor opener back to the default (both) · a stamped
+gauge may be windowless · a missing vendor window accepted · an already-passed
+reset accepted · the codex window no longer validated in the reader · per-gauge
+build/post isolation removed (both) · loaded state trusted (both) · stored
+reading trusted at the point of use · remote error body journalled (both) · the
+broad catch journals the message (weight) · a future stamp accepted · the
+plausible-weight band removed · a vendor URL may be `http`.
+
+**One test constant had to be re-derived rather than copied — the B11 lesson
+applied to B7.** `NOW` in `test_ai_usage_feeder.py` was `1789000000`, which is
+2026-09-10 00:26 UTC — an hour and a half **after** Claude's five-hour window had
+already reset. It was never an instant at which the recorded fixture body could
+have been returned, and it only stopped being harmless when the parsers began
+checking that a window contains `now`. It is now `1788944000`, an instant that
+sits inside all five observed windows, and the reason is written beside it.
+
+**Nothing live changed.** No hub or panel state was touched, no service started,
+no account created. **No knob was added or removed**, so HomeHub's
+`FieldSchema.psd1` is untouched and no apt export is owed; `.env.example` gained
+only a comment on each `*_STATE_FILE` saying the path must stay inside the
+service's `StateDirectory=`, which the shipped defaults already do.
+
+---
+
 **2026-09-09 the weight feeder (B11, SR-022/LLR-006/TC-006/IF-014) — PARTIAL,
 and the blocked half is a finding, not a gap.** The hub gains a third plain
 service — no container, on a 15-minute timer — that posts one body-weight gauge
@@ -6299,3 +6520,5 @@ not been exercised on Linux and should be watched for on the box.
 started. No apt package name was added, so no apt export re-run is owed.
 
 **2026-09-09 — B11, the weight feeder (SR-022/LLR-006/TC-006/IF-014).** PARTIAL. Google Health API v4 verified as real and reachable by real calls (discovery revision 20260907; an unauthenticated GET on the weight dataPoints route returns 401 naming google.devicesandservices.health.v4.DataPointsService.ListDataPoints). NO PARSER WRITTEN - no authenticated call is possible until the Owner enables the API, adds googlehealth.health_metrics_and_measurements.readonly (there is no weight-specific scope, and that one also grants blood glucose, body fat and heart-rate metrics) to the existing OAuth client, and mints a refresh token at a browser. Everything not depending on that shipped: the gauge plumbing, the stale-never-green invariant, the definitions-resident goal, the token directory, 10 knobs, firstboot hook 6f and a fourth runtime flow. Found a NagLight dependency: internal/defsheet drops unknown columns, so on this sheet-synced household the goal would be erased by the first sync after a sheet edit. check.py 423 passed / 5 skipped (baseline 342/5, not the 341 the plan recorded); trace.py --strict-integrity 0, orphans 24 = baseline; check_flows --no-placeholders OK, 4 diagrams; run-hermetic-tests.sh UNRUN (missing zstd, rsync). 27 mutants, 26 killed.
+
+**2026-09-09 — B7+B11 cross-review fix round (REJECT, all findings applied).** Symlink-bypassable write guard (realpath + StateDirectory bound + O_EXCL/O_NOFOLLOW), redirect/proxy egress on all four HTTP call sites (feed_opener / vendor_opener), windowless-gauge and replayed-200 freshness, per-gauge failure isolation, state validated on load and on use, no remote body or exception message in the journal. Mirrored across both feeders with tests/test_feeder_egress_parity.py as the enforcement. check.py 517 passed / 5 skipped (baseline 423/5); trace --strict-integrity 0, orphans 24; check_flows OK, 4 diagrams; run-hermetic-tests.sh UNRUN. 28 mutants, 28 killed after two passes; the first pass had 7 survivors and every one was a test defect. No knob changed, no live state touched.

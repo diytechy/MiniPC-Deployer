@@ -73,6 +73,7 @@ THE FOUR ACCEPTANCE PROPERTIES, each with the symbol that enforces it:
 Implements: SR-021, LLR-005
 """
 
+import http.client
 import json
 import math
 import os
@@ -113,6 +114,23 @@ STALE_HORIZON_SECONDS = {
     None: 7 * 24 * 3600,
 }
 
+# THE HUB AND THE VENDORS DO NOT SHARE A CLOCK, so every comparison between a
+# vendor's timestamp and ours gets this much slack and no more. It is small on
+# purpose: its job is to absorb NTP jitter, not to make an expired window look
+# current.
+MAX_CLOCK_SKEW_SECONDS = 300
+
+# No timestamp this feeder can legitimately see predates the block that wrote
+# it (2025-01-01). A stored stamp below this is corruption, not history - see
+# `validate_stored_reading`.
+EPOCH_FLOOR = 1735689600
+
+# The directory this service's own StateDirectory= gives it. The unit ships
+# `StateDirectory=homehub-ai`, so systemd exports $STATE_DIRECTORY as exactly
+# this; the literal is the fallback for a cycle run by hand, so a hand-run is
+# bound the same way rather than left unbound. See `open_for_write`.
+DEFAULT_STATE_ROOT = "/var/lib/homehub-ai"
+
 # ── Vendor credential files: read, never written ────────────────────────────
 # The acceptance criterion is "the feeder never writes a vendor credential
 # file", and it is the property that keeps the household's INTERACTIVE
@@ -138,6 +156,16 @@ class SourceFailure(Exception):
     are ONE exception on purpose: `build_post` must treat them identically, and
     a second exception type is a second chance to accidentally post a fresh
     reading for a source that failed.
+    """
+
+
+class EgressRefused(Exception):
+    """A request tried to leave this box by a route the feeder does not permit.
+
+    Raised by the redirect refusal and by the peer-address guard, and NOT a
+    subclass of SourceFailure: the two callers convert it deliberately (a
+    vendor redirect becomes an unavailable gauge; a feed redirect becomes a
+    failed post), and nothing may catch it by accident on the way out.
     """
 
 
@@ -172,6 +200,59 @@ def window_kind_for(duration_seconds):
     if duration_seconds <= 32 * 24 * 3600:
         return "monthly"
     return "static"
+
+
+def check_window(window_end, window_seconds, now, where):
+    """Validate the vendor's counting window, or raise SourceFailure.
+
+    Contract:
+      Inputs:  window_end: the epoch second the window resets at, exactly as
+                 the vendor sent it; window_seconds: its length in seconds;
+                 now: this cycle's clock (see `cycle_now`); where: str for the
+                 message.
+      Outputs: (window_end: int, window_seconds: int).
+      Raises:  SourceFailure when either end is absent or not a usable number,
+               and when the window does not CONTAIN `now`.
+
+    WHY A MISSING WINDOW IS A FAILURE RATHER THAN A GAUGE WITHOUT ONE.
+    `window.kind` is not decoration - it SELECTS NagLight's staleness horizon,
+    and a gauge with no window inherits the STATIC one, seven days. So a body
+    that answered 200 but carried no `resets_at` used to become a gauge that
+    stayed green for a week after the source died, which is the exact opposite
+    of this feeder's one promise. A window we cannot determine now makes the
+    reading unavailable instead, which is the honest answer.
+
+    WHY THE WINDOW MUST CONTAIN `now`. A reset time already in the PAST is
+    evidence that the body is a replay or a cached copy: the vendor is
+    describing a window that has finished, so its percentage is not a statement
+    about now, and stamping it `now` would be the fabrication `build_post`
+    exists to prevent. A window that has not STARTED is the same evidence from
+    the other side - a clock error, or milliseconds read as seconds, lands
+    exactly there. MAX_CLOCK_SKEW_SECONDS is the only slack allowed.
+
+    Implements: SR-021, LLR-005
+    """
+    if window_end is None or window_seconds is None:
+        raise SourceFailure(
+            "%s: the vendor named no usage window, so this reading cannot be "
+            "posted. A windowless gauge inherits the 7-day static horizon and "
+            "would stay green for a week after this source died." % where)
+    window_kind_for(window_seconds)      # refuses 0, -1, NaN, inf, True, "week"
+    if isinstance(window_end, bool) or not isinstance(window_end, (int, float)) \
+            or not math.isfinite(window_end):
+        raise SourceFailure("%s: window end is not a usable number: %r"
+                            % (where, window_end))
+    end = int(window_end)
+    length = int(window_seconds)
+    if end < now - MAX_CLOCK_SKEW_SECONDS:
+        raise SourceFailure(
+            "%s: the window reset at %d, which is already past - the body is a "
+            "replay or a cached copy, not a reading about now" % (where, end))
+    if end - length > now + MAX_CLOCK_SKEW_SECONDS:
+        raise SourceFailure(
+            "%s: the window has not begun (starts %d, now %d)"
+            % (where, end - length, now))
+    return end, length
 
 
 def check_percent(raw, where):
@@ -261,15 +342,24 @@ class GaugeSpec(object):
         self.source = source
 
 
-def parse_codex(payload):
+def parse_codex(payload, now):
     """Turn one `account/rateLimits/read` result into {gauge key: Reading}.
 
     Contract:
-      Inputs:  payload: the JSON-RPC `result` object, exactly as observed.
+      Inputs:  payload: the JSON-RPC `result` object, exactly as observed;
+               now: this cycle's clock, against which the window is checked.
       Outputs: dict of gauge key -> Reading. Empty is NOT valid; a payload with
                no usable bucket raises rather than reporting "all clear".
       Raises:  SourceFailure on a non-object, a missing or null `rateLimits`, a
-               missing `primary`, or an unusable `usedPercent`.
+               missing `primary`, an unusable `usedPercent`, or a window that
+               `check_window` refuses.
+
+    THE WINDOW IS VALIDATED HERE, INSIDE THE READER'S CATCH, AND THAT PLACEMENT
+    IS THE FIX FOR A REAL DEFECT. `usedPercent: 34` with a `windowDurationMins`
+    of 0, -1, NaN or infinity used to parse cleanly and only blow up later in
+    `build_post`, OUTSIDE the per-source try - so one vendor's malformed window
+    aborted the whole cycle before ANY gauge was posted, and every other
+    source's previously-fresh value sat green on the panel until it expired.
 
     Only the BACKWARD-COMPATIBLE single-bucket `rateLimits` view is read.
     `rateLimitsByLimitId` was observed carrying three buckets whose membership
@@ -291,13 +381,14 @@ def parse_codex(payload):
     percent = check_percent(primary.get("usedPercent"), "codex primary")
 
     minutes = primary.get("windowDurationMins")
-    resets_at = primary.get("resetsAt")
-    window_seconds = None
-    window_end = None
-    if isinstance(minutes, (int, float)) and not isinstance(minutes, bool):
-        window_seconds = int(minutes) * 60
-    if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
-        window_end = int(resets_at)
+    # Junk survives the multiply as junk (NaN*60 is NaN, True is left alone)
+    # and check_window refuses it on type or on value, so exactly one place in
+    # this file decides what a usable window is.
+    seconds = (minutes * 60
+               if isinstance(minutes, (int, float)) and not isinstance(minutes, bool)
+               else minutes)
+    window_end, window_seconds = check_window(
+        primary.get("resetsAt"), seconds, now, "codex primary")
     return {"ai-usage-codex": Reading(percent, window_end, window_seconds)}
 
 
@@ -310,18 +401,23 @@ CLAUDE_BUCKETS = (
 )
 
 
-def parse_claude(payload):
+def parse_claude(payload, now):
     """Turn one OAuth usage body into {gauge key: Reading}.
 
     Contract:
-      Inputs:  payload: the decoded JSON body, exactly as observed.
+      Inputs:  payload: the decoded JSON body, exactly as observed;
+               now: this cycle's clock, against which each window is checked.
       Outputs: dict of gauge key -> Reading, one per CLAUDE_BUCKETS entry that
                is present and usable.
       Raises:  SourceFailure on a non-object or when NO bucket is usable. A
                body whose `five_hour` is null but whose `seven_day` is fine
                yields one gauge and no exception - the two are independent
                subscriptions limits and one being absent is not a failure of
-               the other.
+               the other. A bucket whose `resets_at` is MISSING, or already in
+               the past, is skipped for the same reason a null one is: the
+               window is what selects NagLight's staleness horizon, so a
+               windowless bucket would post a gauge that stayed green for the
+               static seven days instead of the 24-48h its window implies.
 
     `severity` and `limits[].severity` are read and DISCARDED. The vendor's
     opinion of red is not NagLight's, and only one of them may own the panel's
@@ -340,9 +436,11 @@ def parse_claude(payload):
             continue
         try:
             percent = check_percent(bucket.get("utilization"), "claude " + field)
-            window_end = None
-            if bucket.get("resets_at") is not None:
-                window_end = parse_iso8601_utc(bucket["resets_at"], "claude " + field)
+            resets_at = bucket.get("resets_at")
+            window_end, window_seconds = check_window(
+                None if resets_at is None
+                else parse_iso8601_utc(resets_at, "claude " + field),
+                window_seconds, now, "claude " + field)
         except SourceFailure as exc:
             problems.append(str(exc))
             continue
@@ -364,19 +462,24 @@ OPENCODE_BUCKETS = (
 )
 
 
-def parse_opencode(payload):
+def parse_opencode(payload, now):
     """Turn one Zen usage body into {gauge key: Reading}.
 
     Contract:
       Inputs:  payload: the decoded JSON body, exactly as observed
-               ({"usage":{"weekly":{"status","percent","resetsAt"}, ...}}).
+               ({"usage":{"weekly":{"status","percent","resetsAt"}, ...}});
+               now: this cycle's clock, against which each window is checked.
       Outputs: dict of gauge key -> Reading.
       Raises:  SourceFailure on a non-object, a missing `usage`, or when no
                listed bucket is usable.
 
     A bucket whose `status` is not "ok" is skipped rather than posted: the
     vendor is telling us the number is not trustworthy, and a number we were
-    warned about is exactly the one that must not become a green gauge.
+    warned about is exactly the one that must not become a green gauge. A
+    bucket missing `resetsAt`, or carrying one that has already passed, is
+    skipped by `check_window` for the same reason `rolling` is not in the table
+    above: a gauge with no window takes the 7-day static horizon and stays
+    green long after the source has stopped answering.
 
     Implements: LLR-005
     """
@@ -398,9 +501,11 @@ def parse_opencode(payload):
             continue
         try:
             percent = check_percent(bucket.get("percent"), "opencode " + field)
-            window_end = None
-            if bucket.get("resetsAt") is not None:
-                window_end = parse_iso8601_utc(bucket["resetsAt"], "opencode " + field)
+            resets_at = bucket.get("resetsAt")
+            window_end, window_seconds = check_window(
+                None if resets_at is None
+                else parse_iso8601_utc(resets_at, "opencode " + field),
+                window_seconds, now, "opencode " + field)
         except SourceFailure as exc:
             problems.append(str(exc))
             continue
@@ -439,6 +544,12 @@ def build_gauge(spec, value, observed_at, window_end, window_seconds):
         with an agreed width, and `%` is not one of them.
       * `direction` is emitted IF AND ONLY IF `window` is - required with,
         refused without.
+      * A BODY THAT CARRIES `observed_at` MUST CARRY A WINDOW. `window.kind`
+        selects NagLight's staleness horizon, so a stamped gauge with no window
+        silently takes the STATIC one - seven days - instead of the 24-48h the
+        vendor's real window implies, and a source that died stays green for a
+        week. The one body that legitimately has no window is the
+        never-measured sentinel, and it is exactly the body with no stamp.
     NO COLOUR, NO SEVERITY, NO `css` FIELD IS EVER SET. NagLight derives them;
     a feeder that computes a hue makes the panel's authority ambiguous.
 
@@ -452,6 +563,12 @@ def build_gauge(spec, value, observed_at, window_end, window_seconds):
             raise ValueError("gauge %s: %s exceeds %d runes" % (spec.key, name, RUNE_LIMIT))
     if not math.isfinite(GAUGE_MAX - GAUGE_MIN):
         raise ValueError("gauge %s: non-finite min..max span" % spec.key)
+    if observed_at is not None and (window_end is None or window_seconds is None):
+        raise ValueError(
+            "gauge %s: a body carrying observed_at must carry the window it was "
+            "counted over - a windowless gauge inherits the 7-day static "
+            "horizon and would stay green long after this source died"
+            % spec.key)
 
     body = {
         "kind": "gauge",
@@ -476,6 +593,71 @@ def build_gauge(spec, value, observed_at, window_end, window_seconds):
     return body
 
 
+def validate_stored_reading(entry, now):
+    """Return a stored reading only if it is credible history, else None.
+
+    Contract:
+      Inputs:  entry: whatever `load_state` found under this gauge's key -
+               any JSON value at all, including None; now: this cycle's clock.
+      Outputs: a dict with exactly value/observed_at/window_end/window_seconds,
+               all numbers, or None if the entry cannot be used as history.
+      Raises:  nothing. An unusable entry is an ANSWER, not an exception - the
+               caller's job is then identical to a source that never succeeded.
+
+    THE STATE FILE IS INPUT, NOT MEMORY. It is a file on disk that a
+    half-written cycle, a disk error, or a person with an editor can change,
+    and everything downstream treats what it holds as a reading that was once
+    TRUE: it is reposted at its own stamp and the panel renders it. Nothing
+    used to check it - `build_gauge` only asked whether the value was finite -
+    so a corrupted entry could post `100000` percent, or carry a stamp in the
+    FUTURE and make a source that has been dead for days look live.
+
+    A nonsensical stored reading is not history, it is a failure, and it gets
+    the same honest answer a failed source with no history gets: value 0, no
+    stamp, "unavailable".
+
+    WHAT IS CHECKED, AND WHY EACH: the percent is re-run through the same
+    `check_percent` a vendor number faces, because state is no more trusted
+    than a vendor; the stamp must lie between EPOCH_FLOOR and now (a FUTURE
+    stamp is the one that fabricates freshness, so it is refused rather than
+    clamped); the window must be one `window_kind_for` recognises, since it is
+    what NagLight's horizon is chosen from; and the stamp must fall INSIDE the
+    window it claims, because a reading taken outside the window it names is
+    two facts that cannot both be true.
+
+    Implements: SR-021, LLR-005
+    """
+    if not isinstance(entry, dict):
+        return None
+    try:
+        value = check_percent(entry.get("value"), "stored value")
+    except SourceFailure:
+        return None
+    numbers = {}
+    for name in ("observed_at", "window_end", "window_seconds"):
+        raw = entry.get(name)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                or not math.isfinite(raw):
+            return None
+        numbers[name] = int(raw)
+    stamp = numbers["observed_at"]
+    end = numbers["window_end"]
+    length = numbers["window_seconds"]
+    if stamp < EPOCH_FLOOR or stamp > now + MAX_CLOCK_SKEW_SECONDS:
+        return None
+    if end < EPOCH_FLOOR:
+        return None
+    try:
+        window_kind_for(length)
+    except SourceFailure:
+        return None
+    if not (end - length - MAX_CLOCK_SKEW_SECONDS
+            <= stamp <= end + MAX_CLOCK_SKEW_SECONDS):
+        return None
+    return {"value": value, "observed_at": stamp,
+            "window_end": end, "window_seconds": length}
+
+
 def build_post(spec, reading, last, now):
     """Decide what to POST for one gauge this cycle - the "never green" rule.
 
@@ -485,7 +667,11 @@ def build_post(spec, reading, last, now):
                         else None (every SourceFailure class collapses to None);
                last:    the stored {"value","observed_at","window_end",
                         "window_seconds"} from a previous successful cycle, or
-                        None if this gauge has never had one;
+                        None if this gauge has never had one. It is
+                        RE-VALIDATED here even though `load_state` already
+                        validated it, because the guard has to hold at the
+                        point of use as well as at the point of load - the two
+                        are separated by every source read in the cycle;
                now:     epoch seconds.
       Outputs: (body: dict, fresh: bool). `fresh` is True only when the body
                carries THIS cycle's timestamp.
@@ -511,9 +697,10 @@ def build_post(spec, reading, last, now):
     if reading is not None:
         return build_gauge(spec, reading.percent, now,
                            reading.window_end, reading.window_seconds), True
-    if last is not None:
-        return build_gauge(spec, last["value"], last["observed_at"],
-                           last.get("window_end"), last.get("window_seconds")), False
+    checked = validate_stored_reading(last, now)
+    if checked is not None:
+        return build_gauge(spec, checked["value"], checked["observed_at"],
+                           checked["window_end"], checked["window_seconds"]), False
     return build_gauge(spec, 0.0, None, None, None), False
 
 
@@ -534,6 +721,22 @@ def is_fresh(body, now):
         return False        # a future stamp is stale by NagLight's rule.
     kind = body.get("window", {}).get("kind")
     return (now - stamp) <= STALE_HORIZON_SECONDS.get(kind, 24 * 3600)
+
+
+def cycle_now(env):
+    """The single instant this cycle reasons about, in epoch seconds.
+
+    `run_cycle` puts it in the environment alongside `_identity` and
+    `_feed_url` so that the readers - and through them the parsers - measure a
+    vendor's window against the SAME `now` the gauge will be stamped with. A
+    parser that called `time.time()` for itself could accept a window that
+    expired between the read and the post, which is precisely the "fresh stamp
+    on a stale reading" this round was sent back to fix.
+
+    Implements: LLR-005
+    """
+    raw = env.get("_now")
+    return int(raw) if raw is not None else int(time.time())
 
 
 def resolve_identity(env):
@@ -575,6 +778,31 @@ def resolve_enabled(env):
     return (env.get("AI_USAGE_ENABLED") or "false").strip() == "true"
 
 
+def resolve_state_root(env):
+    """The ONE directory under which this feeder may write, whatever the config says.
+
+    Contract:
+      Config:  STATE_DIRECTORY - exported by systemd for a unit carrying
+               `StateDirectory=`, which this one does (`StateDirectory=homehub-ai`).
+      Outputs: an absolute path; DEFAULT_STATE_ROOT when the variable is absent.
+
+    WHY THIS EXISTS SEPARATELY FROM AI_USAGE_STATE_FILE. The allow-list in
+    `open_for_write` is built from a path the CONFIG names, so on its own it
+    proves only that the feeder writes where it was told - it cannot tell a
+    state file from a vendor token if the knob names a token. Binding the write
+    to the service's OWN state directory makes the guard independent of the
+    .env: nothing outside /var/lib/homehub-ai is writable however that file is
+    edited, and the unit's StateDirectoryMode=0700 backs it from the other side.
+
+    Only one directory is ever named here (systemd would colon-separate a list,
+    and the unit declares exactly one), so the value is taken whole rather than
+    split - splitting would mangle a Windows dev path in the tests.
+
+    Implements: SR-021, LLR-005
+    """
+    return (env.get("STATE_DIRECTORY") or "").strip() or DEFAULT_STATE_ROOT
+
+
 def resolve_feed_url(env):
     """Return the /api/feed URL, refusing a destination off this box.
 
@@ -605,7 +833,11 @@ def resolve_feed_url(env):
         from urllib.parse import urlsplit
         parts = urlsplit(raw)
     except Exception as exc:                      # pragma: no cover - defensive
-        raise SystemExit("REFUSED: AI_USAGE_FEED_URL is unparseable: %s" % exc)
+        # The TYPE only, never the message: urlsplit echoes the value it was
+        # given, and a feed URL is allowed to carry userinfo, so the message
+        # could put `http://user:token@host/` into the journal.
+        raise SystemExit("REFUSED: AI_USAGE_FEED_URL is unparseable (%s)"
+                         % type(exc).__name__)
     if parts.scheme not in ("http", "https"):
         raise SystemExit("REFUSED: AI_USAGE_FEED_URL scheme %r is not http/https" % parts.scheme)
     host = parts.hostname or ""
@@ -682,16 +914,77 @@ def local_bridge_networks():
     return out
 
 
-def open_for_write(path, state_path):
+def writable_path_verdict(path, state_path, state_root, resolve=None):
+    """Decide whether `path` may be written. Returns a refusal string, or None.
+
+    Contract:
+      Inputs:  path: the file about to be opened for writing;
+               state_path: the one file this feeder owns (AI_USAGE_STATE_FILE);
+               state_root: the directory this service's StateDirectory= gave it;
+               resolve: the path resolver - `os.path.realpath` in production,
+                 injected only so a test can state what a symlink resolves to
+                 on a filesystem that will not let it create one.
+      Outputs: None if the write is allowed, else the reason it is refused.
+      Raises:  nothing. It DECIDES; `open_for_write` is what refuses.
+
+    WHY realpath AND NOT abspath - THE CROSS-REVIEW DEFECT THIS FUNCTION EXISTS
+    TO CLOSE. `os.path.abspath` is string arithmetic: it normalises `..` and
+    makes the path absolute, and it does NOT resolve symlinks. So pre-creating
+    `<state>.tmp` as a symlink pointing at a vendor token passed the old
+    allow-list unchanged - the STRING matched - and `save_state` then opened it
+    "w" and truncated the household's token. The shape of the allow-list was
+    right all along; the resolution was wrong.
+
+    THE STATE ROOT IS A SECOND, INDEPENDENT BOUND, and it is independent in the
+    way that matters: the allow-list is derived from a path the CONFIG names,
+    so it can only ever say "the feeder wrote where it was told". Requiring the
+    resolved path to sit inside the service's own StateDirectory means a .env
+    that names a token is refused too, because /home/... is not
+    /var/lib/homehub-ai whatever the knob says.
+
+    Implements: SR-021, LLR-005
+    """
+    resolve = resolve or os.path.realpath
+    # The basename is read off BOTH the name we were handed and the file it
+    # really resolves to: the first names the hazard when someone points the
+    # state knob at a token, the second when a link does the pointing.
+    for named in (path, resolve(path)):
+        if os.path.basename(named) in CREDENTIAL_BASENAMES:
+            return ("%s (which resolves to %s) is a vendor credential file. "
+                    "This feeder reads credentials and never writes one."
+                    % (path, named))
+    root = resolve(state_root)
+    inside = os.path.join(root, "")
+    real_state = resolve(state_path)
+    resolved = resolve(path)
+    # ONE containment check, on the path actually about to be OPENED. The first
+    # cut also checked `state_path` separately, which looked like defence in
+    # depth and was the same check twice: the allow-list below pins `resolved`
+    # to `real_state` or its `.tmp` sibling, so a state file outside the root
+    # can only ever reach the open as one of those two and is caught here. The
+    # mutation run proved the redundancy by deleting either copy and staying
+    # green, and a guard that only the other guard proves is a guard nobody has
+    # tested.
+    if not (resolved == root or resolved.startswith(inside)):
+        return ("%s resolves to %s, which is outside this service's own state "
+                "directory %s. A state path that leaves StateDirectory= is a "
+                "knob pointing at something that is not state."
+                % (path, resolved, root))
+    if resolved not in (real_state, real_state + ".tmp"):
+        return ("%s resolves to %s, which is outside the one path this feeder "
+                "may write (%s)." % (path, resolved, real_state))
+    return None
+
+
+def open_for_write(path, state_path, state_root):
     """The ONLY way this feeder opens a file for writing. THE credential guard.
 
     Contract:
-      Inputs:  path: the file about to be written; state_path: the one file
-               this feeder owns (AI_USAGE_STATE_FILE).
+      Inputs:  path/state_path/state_root as `writable_path_verdict` takes them.
       Outputs: an open text-mode handle.
-      Raises:  PermissionError for ANY path that is not `state_path` or its
-               `.tmp` sibling, and separately (with a louder message) for
-               anything whose basename is a known vendor credential file.
+      Raises:  PermissionError for anything the verdict refuses, and OSError
+               from the kernel if the final component is a symlink or if the
+               temp file appeared between the verdict and the open.
 
     WHY AN ALLOW-LIST AND NOT A DENY-LIST. "Never writes a vendor credential
     file" cannot be met by listing the files we know about - the next CLI
@@ -700,32 +993,77 @@ def open_for_write(path, state_path):
     basenames are a SECOND check that exists only to make the failure message
     name the real hazard when someone points the state file at a token.
 
+    THE VERDICT IS NOT TRUSTED AT THE OPEN - see `open_no_follow`. Checking a
+    path and then opening it is two operations with a gap between them, and the
+    attack this guard was rewritten for is precisely a symlink planted into
+    that gap.
+
     Implements: SR-021, LLR-005
     """
-    resolved = os.path.abspath(path)
-    allowed = {os.path.abspath(state_path), os.path.abspath(state_path) + ".tmp"}
-    if os.path.basename(resolved) in CREDENTIAL_BASENAMES:
-        raise PermissionError(
-            "REFUSED: %s is a vendor credential file. This feeder reads "
-            "credentials and never writes one." % resolved)
-    if resolved not in allowed:
-        raise PermissionError(
-            "REFUSED: %s is outside the one path this feeder may write (%s)."
-            % (resolved, state_path))
-    return open(resolved, "w", encoding="utf-8")
+    reason = writable_path_verdict(path, state_path, state_root)
+    if reason:
+        raise PermissionError("REFUSED: " + reason)
+    return open_no_follow(path)
 
 
-def load_state(state_path):
-    """Last successful reading per gauge key. A missing/corrupt file is {}."""
+def open_no_follow(path):
+    """Open `path` for writing without ever following a symlink at the last hop.
+
+    THE CHECK-THEN-OPEN RACE IS THE POINT, and it is why the verdict alone was
+    not accepted as the fix. `writable_path_verdict` resolves the path, but a
+    symlink planted between that resolution and a plain `open(path, "w")` would
+    be followed by the open. So:
+
+      * the file is unlinked first. Unlinking removes THE SYMLINK ITSELF and
+        never the file it points at, so a planted link is destroyed rather than
+        traversed - and a `.tmp` left behind by a killed cycle is cleared in
+        the same stroke, which is why O_EXCL below does not wedge the feeder;
+      * O_CREAT|O_EXCL then makes the kernel refuse if ANYTHING is at that path
+        by the time we open, symlink included - so the window between the
+        unlink and the open is closed by the kernel and not by our confidence;
+      * O_NOFOLLOW says the same thing again for the final component, on the
+        platform that has it.
+
+    O_NOFOLLOW DOES NOT EXIST ON WINDOWS and resolves to 0 there. The hub is
+    Linux, so the deployed guard is whole; on the Windows dev PC the unlink and
+    O_EXCL still stand and the verdict still resolves symlinks, which is what
+    the tests exercise.
+    """
+    try:
+        os.unlink(path)
+    except OSError:
+        pass          # absent is the normal case; a directory or a busy file
+                      # will fail loudly at the open below rather than here.
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    return os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8")
+
+
+def load_state(state_path, now):
+    """Last successful reading per gauge key, VALIDATED. Anything else is {}.
+
+    A missing or unparseable file is {} as before, and so now is any individual
+    entry `validate_stored_reading` will not vouch for. Dropping a bad entry at
+    the door rather than at the point of use means the rest of the file still
+    works: one corrupted gauge goes "unavailable" and its four neighbours keep
+    their real history.
+    """
     try:
         with open(state_path, encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for key, entry in data.items():
+        checked = validate_stored_reading(entry, now)
+        if checked is not None:
+            out[key] = checked
+    return out
 
 
-def save_state(state, state_path):
+def save_state(state, state_path, state_root):
     """Write the state file through `open_for_write`, atomically.
 
     The state holds PERCENTAGES AND TIMESTAMPS ONLY - never a token, never a
@@ -734,8 +1072,11 @@ def save_state(state, state_path):
     the credential-writing thing it promises not to be.
     """
     tmp = state_path + ".tmp"
-    with open_for_write(tmp, state_path) as handle:
+    with open_for_write(tmp, state_path, state_root) as handle:
         json.dump(state, handle, indent=1, sort_keys=True)
+    # os.replace does NOT follow a symlink at the destination - it replaces the
+    # link itself - so the rename cannot reach a token either, and the verdict
+    # has already refused a state path that resolves outside the state root.
     os.replace(tmp, state_path)
 
 
@@ -779,22 +1120,173 @@ def _opencode_key(data):
     return None
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses every 3xx instead of re-sending the request to `Location`.
+
+    HALF ONE OF THE EGRESS DEFECT. urllib's default opener FOLLOWS redirects,
+    and it copies the original request's headers onto the new request - it does
+    not strip `Authorization`. So the validated loopback feed endpoint could
+    answer `302 Location: http://attacker.example/feed` and urllib would
+    obediently re-send the POST off this box, carrying the feed bearer token,
+    the X-Forwarded-User identity and the body. On the vendor GETs the same
+    move hands out the household's Claude OAuth access token.
+
+    Refusing is safe in the failure direction: a redirect becomes an
+    "unavailable" gauge, which is the acceptance criterion rather than a
+    regression. NEITHER THE TARGET NOR THE RESPONSE IS PUT IN THE MESSAGE - a
+    hostile or confused server chooses that string, and the message ends up in
+    the journal.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise EgressRefused(
+            "refused an HTTP %s redirect: this request may not be re-sent to "
+            "a destination the response chose" % code)
+
+
+def _peer_checked_connection(base_class, allow_host):
+    """A connection class that asks the socket where it really landed.
+
+    HALF TWO OF "re-validate the address actually connected to". The check runs
+    inside `connect()`, after the TCP handshake and BEFORE http.client writes a
+    single byte of the request line, so a connection to an address that is not
+    on this box is dropped with the token and the body still unsent.
+    """
+
+    class PeerChecked(base_class):
+        def connect(self):
+            base_class.connect(self)
+            try:
+                peer = self.sock.getpeername()[0]
+            except (OSError, AttributeError, IndexError):
+                peer = None
+            if peer is None or not allow_host(peer):
+                self.close()
+                raise EgressRefused(
+                    "refused a connection that reached %r, which is neither "
+                    "loopback nor an address a local docker bridge is carrying"
+                    % (peer,))
+
+    return PeerChecked
+
+
+class _LocalOnlyHTTPHandler(urllib.request.HTTPHandler):
+    """http:// through a peer-checked connection."""
+
+    def __init__(self, allow_host):
+        urllib.request.HTTPHandler.__init__(self)
+        self._peer_checked = _peer_checked_connection(
+            http.client.HTTPConnection, allow_host)
+
+    def http_open(self, req):
+        return self.do_open(self._peer_checked, req)
+
+
+class _LocalOnlyHTTPSHandler(urllib.request.HTTPSHandler):
+    """https:// through a peer-checked connection. Present because the feed URL
+    knob accepts https, not because the bridge-only tracker is ever reached
+    that way today."""
+
+    def __init__(self, allow_host):
+        urllib.request.HTTPSHandler.__init__(self)
+        self._peer_checked = _peer_checked_connection(
+            http.client.HTTPSConnection, allow_host)
+
+    def https_open(self, req):
+        return self.do_open(self._peer_checked, req, context=self._context)
+
+
+def feed_opener(bridge_addresses=None):
+    """The opener the FEED POST uses: no proxy, no redirect, no off-box peer.
+
+    Three independent refusals, because validating the URL is not enough on its
+    own - the URL says where we MEANT to go and two mechanisms could still send
+    the request somewhere else:
+
+      * `ProxyHandler({})` installs NO proxy rather than reading the
+        environment. An `http_proxy` or `https_proxy` exported into the unit
+        would otherwise route the POST - bearer token, identity header and body
+        - through a LAN proxy that then sees all of it, defeating the whole
+        "never leaves this box" property without touching the feed URL at all.
+      * `_RefuseRedirects` refuses to be told where to go by the response.
+      * the peer check asks the socket what address it actually reached and
+        drops the connection before the request is written if that is not
+        loopback or an address a local docker bridge is really carrying.
+
+    `bridge_addresses` is injectable for the same reason it is in
+    `is_local_destination`: a test states the box's bridges rather than
+    inheriting whatever this machine happens to have.
+
+    Implements: SR-021, LLR-005
+    """
+    def allow_host(host):
+        return is_local_destination(host, bridge_addresses)
+
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _RefuseRedirects(),
+        _LocalOnlyHTTPHandler(allow_host),
+        _LocalOnlyHTTPSHandler(allow_host))
+
+
+def vendor_opener():
+    """The opener the VENDOR GETs use - and it is a DIFFERENT decision, taken
+    deliberately rather than inherited from the feed's.
+
+    These calls are OUTBOUND TO THE INTERNET BY DESIGN (api.anthropic.com,
+    opencode.ai), so the feed's peer check would be nonsense here and is
+    absent. The other two refusals still apply, and each was decided on its own
+    merits:
+
+      * REDIRECTS ARE REFUSED, because urllib carries `Authorization` across a
+        cross-host redirect. A 302 from an impersonated or compromised vendor
+        endpoint would hand the household's Claude OAuth access token, or the
+        OpenCode workspace key, to whatever host the `Location` names. Both
+        endpoints answered 200 DIRECTLY during the 2026-09-09 verification
+        calls, so refusing costs nothing that has ever been observed, and the
+        price if a vendor starts redirecting is an "unavailable" gauge - which
+        is exactly the outcome this feeder is built to produce when it cannot
+        read a source honestly.
+      * NO PROXY IS INHERITED FROM THE ENVIRONMENT. An `http_proxy` exported
+        box-wide would otherwise route a vendor bearer token through a LAN
+        proxy that terminates TLS. There is deliberately NO knob to opt back
+        in: this household's hub reaches the internet directly, and a proxy
+        knob nobody needs is a second way for a token to leave. If an egress
+        proxy is ever genuinely required it is a requirement change, not a
+        setting.
+
+    Implements: SR-021, LLR-005
+    """
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _RefuseRedirects())
+
+
 def http_json(url, headers, timeout):
     """One GET, decoded. Every failure class becomes SourceFailure.
 
     Transport error, timeout, non-200 and an undecodable body are ONE outcome
     on purpose - see SourceFailure. The response body is NOT echoed into the
     exception on an auth failure, because a 401 body can carry request context.
+
+    The URL must be https. These headers carry a vendor bearer token, and the
+    URL is a knob (AI_USAGE_CLAUDE_URL / AI_USAGE_OPENCODE_URL); an http one
+    would put the household's token on the wire in clear. The refusal is here
+    rather than at the knob because this is the one function that attaches the
+    token to a request.
     """
+    if not url.lower().startswith("https://"):
+        raise SourceFailure(
+            "%s: refused - a vendor URL carrying a bearer token must be https"
+            % url)
     request = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with vendor_opener().open(request, timeout=timeout) as response:
             if response.status != 200:
                 raise SourceFailure("%s: HTTP %s" % (url, response.status))
             raw = response.read()
     except urllib.error.HTTPError as exc:
         raise SourceFailure("%s: HTTP %s" % (url, exc.code))
-    except SourceFailure:
+    except (SourceFailure, EgressRefused):
         raise
     except Exception as exc:
         raise SourceFailure("%s: %s" % (url, type(exc).__name__))
@@ -864,7 +1356,7 @@ def read_codex(env):
         raise SourceFailure("codex: no rateLimits answer within %ss" % timeout)
     if "error" in frame:
         raise SourceFailure("codex: JSON-RPC error %s" % frame["error"].get("code"))
-    return parse_codex(frame.get("result"))
+    return parse_codex(frame.get("result"), cycle_now(env))
 
 
 def read_claude(env):
@@ -881,7 +1373,7 @@ def read_claude(env):
         "User-Agent": "claude-code/" + version,
         "Accept": "application/json",
     }, int(env.get("AI_USAGE_TIMEOUT_SECONDS") or 30))
-    return parse_claude(body)
+    return parse_claude(body, cycle_now(env))
 
 
 def read_opencode(env):
@@ -903,7 +1395,7 @@ def read_opencode(env):
         "Accept": "application/json",
         "User-Agent": env.get("AI_USAGE_AGENT") or "homehub-ai-usage/1",
     }, int(env.get("AI_USAGE_TIMEOUT_SECONDS") or 30))
-    return parse_opencode(body)
+    return parse_opencode(body, cycle_now(env))
 
 
 SOURCE_READERS = {
@@ -930,7 +1422,20 @@ def enabled_sources(env):
 
 
 def post_gauge(body, url, env, timeout):
-    """POST one gauge. Returns (ok, detail); never raises on an HTTP failure."""
+    """POST one gauge through the local-only opener. Returns (ok, detail).
+
+    Never raises: a failed post is a reported failure, not a dead cycle, so the
+    remaining gauges still go out.
+
+    THE REMOTE'S OWN WORDS ARE NEVER PUT IN `detail`. The previous version
+    returned `exc.read()[:200]`, which `main` prints to stderr and systemd
+    writes to the journal - so anything a responding server or an interposed
+    proxy chose to reflect, INCLUDING a bearer token echoed back in an error
+    body, was persisted to disk by this feeder. The status code is ours to
+    read; the body is the remote's to write, and it does not get a journal.
+
+    Implements: SR-021, LLR-005
+    """
     headers = {"Content-Type": "application/json"}
     token = env.get("AI_USAGE_FEED_TOKEN")
     if token:
@@ -939,10 +1444,12 @@ def post_gauge(body, url, env, timeout):
     data = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with feed_opener().open(request, timeout=timeout) as response:
             return response.status == 200, "HTTP %s" % response.status
+    except EgressRefused as exc:
+        return False, str(exc)           # our own words, not the remote's
     except urllib.error.HTTPError as exc:
-        return False, "HTTP %s: %s" % (exc.code, exc.read()[:200].decode("utf-8", "replace"))
+        return False, "HTTP %s (body not logged)" % exc.code
     except Exception as exc:
         return False, type(exc).__name__
 
@@ -956,20 +1463,31 @@ def run_cycle(env, now=None, readers=None, poster=None):
                class without the network.
       Outputs: (posted: list of (key, fresh, ok), failures: list of str).
 
-    A SOURCE FAILING IS NOT A CYCLE FAILING. Each source is read inside its own
-    try, and the gauges belonging to a source that raised go down the
-    unavailable path in `build_post` while the other sources still post live
-    numbers. That is the whole reason the readers return dicts keyed by gauge
-    id: one failure must not blank the panel.
+    A SOURCE FAILING IS NOT A CYCLE FAILING, AND NEITHER IS A GAUGE FAILING.
+    Each source is read inside its own try, and the gauges belonging to a
+    source that raised go down the unavailable path in `build_post` while the
+    other sources still post live numbers - that is the whole reason the
+    readers return dicts keyed by gauge id. Each gauge is then BUILT and POSTED
+    inside its own try as well, which is the second half and was missing: a
+    body this repo refuses to build (a vendor window we will not stand behind,
+    a stored entry that is not history) used to raise out of the loop and end
+    the cycle BEFORE the remaining gauges were posted, leaving their previously
+    fresh values green on the panel until they expired. A gauge that cannot be
+    built falls back to the never-measured sentinel - value 0, no stamp - so
+    the failure still shows up as "unavailable" rather than as a hole.
 
     Implements: SR-021, LLR-005
     """
     now = int(now if now is not None else time.time())
     readers = readers or SOURCE_READERS
     state_path = env.get("AI_USAGE_STATE_FILE") or "/var/lib/homehub-ai/usage-state.json"
+    state_root = resolve_state_root(env)
     feed_url = env["_feed_url"]
     timeout = int(env.get("AI_USAGE_TIMEOUT_SECONDS") or 30)
     active = enabled_sources(env)
+    # One clock for the whole cycle: the parsers check each vendor window
+    # against the same `now` the gauge will be stamped with (see `cycle_now`).
+    env["_now"] = now
 
     readings, failures = {}, []
     for name in active:
@@ -980,14 +1498,22 @@ def run_cycle(env, now=None, readers=None, poster=None):
         except Exception as exc:               # a reader bug is a source failure
             failures.append("%s: unexpected %s" % (name, type(exc).__name__))
 
-    state = load_state(state_path)
+    state = load_state(state_path, now)
     posted = []
     for spec in GAUGE_SPECS:
         if spec.source not in active:
             continue
         reading = readings.get(spec.key)
-        body, fresh = build_post(spec, reading, state.get(spec.key), now)
-        ok, detail = (poster or post_gauge)(body, feed_url, env, timeout)
+        try:
+            body, fresh = build_post(spec, reading, state.get(spec.key), now)
+        except (ValueError, SourceFailure) as exc:
+            failures.append("gauge %s: %s" % (spec.key, exc))
+            body, fresh = build_gauge(spec, 0.0, None, None, None), False
+            reading = None
+        try:
+            ok, detail = (poster or post_gauge)(body, feed_url, env, timeout)
+        except Exception as exc:               # a poster bug is a failed post
+            ok, detail = False, type(exc).__name__
         posted.append((spec.key, fresh, ok))
         if not ok:
             failures.append("post %s: %s" % (spec.key, detail))
@@ -995,7 +1521,12 @@ def run_cycle(env, now=None, readers=None, poster=None):
             state[spec.key] = {"value": reading.percent, "observed_at": now,
                                "window_end": reading.window_end,
                                "window_seconds": reading.window_seconds}
-    save_state(state, state_path)
+    try:
+        save_state(state, state_path, state_root)
+    except OSError as exc:
+        # Including PermissionError from the write guard. The gauges are
+        # already posted; losing the history is a named failure, not a crash.
+        failures.append("state %s: %s" % (state_path, type(exc).__name__))
     return posted, failures
 
 

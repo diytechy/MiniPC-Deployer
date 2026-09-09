@@ -35,6 +35,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import loopback_server, plain_200, redirect_to
+
 REPO = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO / "stack" / "weight" / "weight_feeder.py"
 
@@ -123,10 +125,35 @@ def test_a_reading_older_than_the_static_horizon_is_not_fresh_sr022():
         feeder.build_post((191.4, NOW - 3600), None, GOAL, NOW)[0], NOW) is True
 
 
-def test_a_future_stamp_is_stale_sr022():
-    """A clock-skewed or fabricated future reading is never green."""
-    body, _ = feeder.build_post((191.4, NOW + 86400), None, GOAL, NOW)
-    assert feeder.is_fresh(body, NOW) is False
+def test_a_future_stamp_is_refused_and_would_be_stale_anyway_sr022():
+    """A future stamp is now REFUSED, not merely rendered stale.
+
+    Two lines, and both are asserted because they fail differently. `is_fresh`
+    was always the reader-side rule: a stamp ahead of the clock is stale. But
+    the producer side used to build that body happily, and a future stamp is
+    the one that fabricates freshness from the other direction — it keeps a
+    dead source green until the stamp itself expires. `check_observed_at`
+    refuses it rather than clamping it to `now`, because clamping would invent
+    exactly the thing the invariant forbids: a stamp this cycle did not
+    measure.
+    """
+    with pytest.raises(feeder.SourceFailure):
+        feeder.build_post((191.4, NOW + 86400), None, GOAL, NOW)
+    assert feeder.is_fresh({"observed_at": feeder.iso8601_utc(NOW + 86400)}, NOW) is False
+
+
+def test_a_reading_this_cycle_took_must_still_be_a_plausible_weight_sr022():
+    """`gauge_body` only checked finiteness, so `-500` and `100000` were bodies.
+
+    The sentinel 0 is the ONE unmeasured number this file may emit and it is
+    only ever paired with a missing stamp; every stamped body must carry a
+    weight a person could have.
+    """
+    for absurd in (-500.0, 0.0, 100000.0, 0.001):
+        with pytest.raises((ValueError, feeder.SourceFailure)):
+            feeder.build_post((absurd, NOW), None, GOAL, NOW)
+    sentinel, fresh = feeder.build_post(None, None, GOAL, NOW)
+    assert sentinel["value"] == 0.0 and "observed_at" not in sentinel and not fresh
 
 
 def test_an_unparseable_stamp_is_stale_sr022():
@@ -567,16 +594,94 @@ def test_open_for_write_is_an_allow_list_of_one_path(tmp_path):
     """Not a deny-list of names: the next vendor tool puts its token somewhere
     new, so the feeder declares the one path it may write."""
     state = str(tmp_path / "weight-state.json")
-    with feeder.open_for_write(state, state) as handle:
+    with feeder.open_for_write(state, state, str(tmp_path)) as handle:
         handle.write("{}")
-    with feeder.open_for_write(state + ".tmp", state) as handle:
+    with feeder.open_for_write(state + ".tmp", state, str(tmp_path)) as handle:
         handle.write("{}")
     for forbidden in (str(tmp_path / "other.json"),
                       str(tmp_path / "google-health-token.json"),
                       str(tmp_path / "sub" / "weight-state.json"),
                       str(tmp_path / ".netrc")):
         with pytest.raises(PermissionError):
-            feeder.open_for_write(forbidden, state)
+            feeder.open_for_write(forbidden, state, str(tmp_path))
+
+
+def test_a_symlinked_temp_file_cannot_truncate_the_refresh_token_sr022(tmp_path):
+    """THE CROSS-REVIEW DEFECT, against the real filesystem.
+
+    `os.path.abspath` does not resolve symlinks, so a link at `<state>.tmp`
+    pointing at the Owner's Google refresh token passed the old allow-list —
+    the STRING matched — and `save_state` opened it "w" and truncated it. A
+    refresh token minted at a browser does not survive that; it costs a person
+    a trip back to a browser.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    token = tmp_path / "google-health-token.json"
+    token.write_text('{"refresh_token":"REAL-REFRESH-TOKEN"}', encoding="utf-8")
+    state = state_dir / "weight-state.json"
+    try:
+        os.symlink(str(token), str(state) + ".tmp")
+    except (OSError, NotImplementedError):      # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+
+    with pytest.raises(PermissionError):
+        feeder.save_state({"weight": {"value": 191.4, "observed_at": NOW}},
+                          str(state), str(state_dir))
+    assert token.read_text(encoding="utf-8") == '{"refresh_token":"REAL-REFRESH-TOKEN"}'
+
+
+def test_a_temp_file_planted_between_the_check_and_the_open_is_refused_sr022(tmp_path):
+    """The check-then-open race, not just the check.
+
+    `open_no_follow` unlinks first — which destroys a planted LINK and never
+    the file it points at — then creates with O_CREAT|O_EXCL, so the kernel
+    refuses anything that appeared in the gap rather than trusting a verdict
+    taken a moment earlier.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    victim = tmp_path / "refresh-token"
+    victim.write_text("KEEP-ME", encoding="utf-8")
+    tmp_file = state_dir / "weight-state.json.tmp"
+    try:
+        os.symlink(str(victim), str(tmp_file))
+    except (OSError, NotImplementedError):      # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+    with feeder.open_no_follow(str(tmp_file)) as handle:
+        handle.write("{}")
+    assert victim.read_text(encoding="utf-8") == "KEEP-ME"
+    assert not tmp_file.is_symlink()
+
+
+def test_the_state_file_must_sit_inside_the_services_own_state_directory_sr022(tmp_path):
+    """The allow-list alone only proves the feeder wrote where the .env told
+    it. A knob pointing at the token is refused because the token is not under
+    StateDirectory=, whatever the knob says."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    outside = tmp_path / "home" / ".config" / "weight-state.json"
+    outside.parent.mkdir(parents=True)
+    reason = feeder.writable_path_verdict(str(outside), str(outside), str(state_dir))
+    assert reason and "state directory" in reason
+    with pytest.raises(PermissionError):
+        feeder.open_for_write(str(outside), str(outside), str(state_dir))
+    assert not outside.exists()
+
+
+def test_the_state_root_comes_from_the_units_state_directory_sr022():
+    assert feeder.resolve_state_root({"STATE_DIRECTORY": "/var/lib/homehub-weight"}) \
+        == "/var/lib/homehub-weight"
+    assert feeder.resolve_state_root({}) == feeder.DEFAULT_STATE_ROOT
+    assert feeder.resolve_state_root({"STATE_DIRECTORY": " "}) == feeder.DEFAULT_STATE_ROOT
+    unit = (REPO / "stack" / "weight" / "homehub-weight.service").read_text(
+        encoding="utf-8")
+    # Directives matched at the START OF A LINE — the vacuous-substring shape
+    # this build has now found repeatedly is not repeated here.
+    directives = [l.strip() for l in unit.splitlines()
+                  if l and not l.startswith(("#", "[", " "))]
+    assert "StateDirectory=homehub-weight" in directives
+    assert feeder.DEFAULT_STATE_ROOT == "/var/lib/homehub-weight"
 
 
 def test_a_whole_cycle_writes_exactly_one_file_and_no_token(tmp_path):
@@ -594,6 +699,7 @@ def test_a_whole_cycle_writes_exactly_one_file_and_no_token(tmp_path):
     state_path = state_dir / "weight-state.json"
     env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
            "WEIGHT_STATE_FILE": str(state_path),
+           "STATE_DIRECTORY": str(state_dir),
            "WEIGHT_TOKEN_FILE": str(token_file)}
     feeder.run_cycle(env, now=NOW,
                      readers={"google-health": lambda e: (191.4, NOW)},
@@ -715,3 +821,281 @@ def test_no_goal_shaped_knob_is_declared_anywhere_deploy_reads_sr022():
                     "%s:%d declares a goal knob (%s). SN-040 puts the goal in "
                     "the user's definitions so it syncs with them."
                     % (path.name, number, name))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# V2 — the POST carries the Owner's body weight, so it may not leave this box
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _post_env(**extra):
+    env = {"_identity": "108000000000000000001",
+           "WEIGHT_FEED_TOKEN": "FEED-TOKEN-SECRET"}
+    env.update(extra)
+    return env
+
+
+def test_the_post_refuses_a_redirect_and_never_re_sends_the_body_sr022():
+    """urllib's default opener follows redirects and copies the request's
+    headers onto the new request, so the validated loopback endpoint could
+    answer `302 Location: <anywhere>` and urllib would re-send the POST — feed
+    token, identity header, and a body whose one number is the Owner's body
+    weight. Both halves are asserted: the post fails, and the second server
+    records that nothing ever arrived."""
+    with loopback_server(plain_200) as (elsewhere, arrived):
+        with loopback_server(redirect_to(elsewhere + "/api/feed")) as (front, front_seen):
+            ok, detail = feeder.post_gauge(
+                {"kind": "gauge", "id": "weight", "value": 191.4, "target": GOAL},
+                front + "/api/feed", _post_env(), 10)
+        assert ok is False
+        assert "redirect" in detail
+        assert arrived == [], "the body weight was re-sent to the redirect target"
+    assert front_seen and b"191.4" in front_seen[0]["body"]
+    assert "FEED-TOKEN-SECRET" not in detail
+
+
+def test_the_post_ignores_an_http_proxy_in_the_environment_sr022(monkeypatch):
+    """An `http_proxy` exported into the unit would route the POST — token,
+    identity header and body weight — through a LAN proxy that then sees all of
+    it, without the feed URL changing at all."""
+    with loopback_server(plain_200) as (proxy_url, proxy_seen):
+        with loopback_server(plain_200) as (target, target_seen):
+            for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+                monkeypatch.setenv(name, proxy_url)
+            ok, detail = feeder.post_gauge(
+                {"kind": "gauge", "id": "weight", "value": 191.4, "target": GOAL},
+                target + "/api/feed", _post_env(), 10)
+    assert ok is True, detail
+    assert proxy_seen == [], "a body weight went through the environment's proxy"
+    assert target_seen and b"191.4" in target_seen[0]["body"]
+    assert target_seen[0]["headers"]["X-Forwarded-User"] == "108000000000000000001"
+
+
+def test_the_post_re_validates_the_address_it_actually_reached_sr022():
+    """The peer check runs inside connect(), after the handshake and BEFORE a
+    byte of the request line is written — so a connection that lands somewhere
+    it should not is dropped with the token and the weight still unsent."""
+    import urllib.request as urlreq
+    with loopback_server(plain_200) as (target, seen):
+        original = feeder.is_local_destination
+        try:
+            feeder.is_local_destination = lambda host, bridges=None: False
+            request = urlreq.Request(target + "/api/feed", data=b"{}",
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+            with pytest.raises(feeder.EgressRefused):
+                feeder.feed_opener(bridge_addresses=[]).open(request, timeout=10)
+        finally:
+            feeder.is_local_destination = original
+    assert seen == [], "bytes reached a peer the guard should have refused"
+
+
+def test_the_vendor_opener_the_blocked_half_must_use_refuses_a_redirect_sr022():
+    """The door the Google Health reader will use, built before the reader.
+
+    The scope this feeder will one day hold grants blood glucose, body fat,
+    oxygen saturation, core temperature and heart-rate metrics as well as
+    weight — there is no weight-only scope — so a 302 carrying `Authorization`
+    to another host hands out all of it.
+    """
+    import urllib.request as urlreq
+    with loopback_server(plain_200) as (elsewhere, arrived):
+        with loopback_server(redirect_to(elsewhere + "/v4/users/me")) as (vendor, _):
+            request = urlreq.Request(
+                vendor + "/v4/users/me",
+                headers={"Authorization": "Bearer HEALTH-TOKEN-SECRET"})
+            with pytest.raises(feeder.EgressRefused):
+                feeder.vendor_opener().open(request, timeout=10)
+        assert arrived == [], "a health-data token followed a redirect"
+
+
+def test_the_vendor_opener_inherits_no_proxy_from_the_environment_sr022(monkeypatch):
+    """Deliberate, and different from the feed only in what it CANNOT check: a
+    Google call is outbound by design, so there is no peer check — but a
+    box-wide proxy would still terminate TLS in front of a health-data token,
+    and there is no knob to opt back in."""
+    import urllib.request as urlreq
+    with loopback_server(plain_200) as (proxy_url, proxy_seen):
+        with loopback_server(plain_200) as (vendor, vendor_seen):
+            for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+                monkeypatch.setenv(name, proxy_url)
+            request = urlreq.Request(
+                vendor + "/v4/users/me",
+                headers={"Authorization": "Bearer HEALTH-TOKEN-SECRET"})
+            feeder.vendor_opener().open(request, timeout=10).read()
+    assert proxy_seen == [], "a health-data token went through a LAN proxy"
+    assert vendor_seen and vendor_seen[0]["path"] == "/v4/users/me"
+
+
+def test_a_remote_error_body_is_never_written_to_the_journal_sr022():
+    """`exc.read()[:200]` put whatever a responding server or an interposed
+    proxy chose to reflect — a token echoed back included — into a string
+    `main` prints to stderr and systemd persists in the journal."""
+    def reflect(handler):
+        body = json.dumps({"error": "Authorization: Bearer FEED-TOKEN-SECRET"}).encode()
+        handler.send_response(500)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    with loopback_server(reflect) as (target, _):
+        ok, detail = feeder.post_gauge(
+            {"kind": "gauge", "id": "weight", "value": 191.4, "target": GOAL},
+            target + "/api/feed", _post_env(), 10)
+    assert ok is False
+    assert "500" in detail
+    assert "FEED-TOKEN-SECRET" not in detail and "Authorization" not in detail
+
+
+def test_an_unexpected_reader_exception_records_its_type_and_not_its_message(tmp_path):
+    """B7 logs only the exception TYPE, and this feeder now copies that.
+
+    The broad `except Exception` here is the branch the real OAuth reader will
+    fall into, and an exception raised inside urllib carries the request
+    object: `str(exc)` on one of those prints the Authorization header straight
+    into the journal. Asserted forward-looking, with an exception carrying a
+    header in its message the way a urllib one would.
+    """
+    def leaky(env):
+        raise RuntimeError(
+            "<urlopen error> while requesting Request(headers={'Authorization': "
+            "'Bearer HEALTH-TOKEN-SECRET'})")
+
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_STATE_FILE": str(tmp_path / "weight-state.json"),
+           "STATE_DIRECTORY": str(tmp_path)}
+    posted, failures, _ = feeder.run_cycle(
+        env, now=NOW, readers={"google-health": leaky},
+        poster=lambda *a: (True, "HTTP 200"),
+        goal_loader=lambda d: (GOAL, "health.md"))
+
+    joined = " ".join(failures)
+    assert "RuntimeError" in joined, "the failure must still be named"
+    assert "HEALTH-TOKEN-SECRET" not in joined
+    assert "Authorization" not in joined
+    assert posted[0][1] is False, "and the gauge is unavailable, never fresh"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Loaded state is input, not memory
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("entry,why", [
+    (None, "not an object at all"),
+    ("191.4", "a string"),
+    ({"value": -500.0, "observed_at": NOW - 3600}, "a negative body weight"),
+    ({"value": 100000.0, "observed_at": NOW - 3600}, "far outside any human range"),
+    ({"value": 0.0, "observed_at": NOW - 3600}, "the sentinel wearing a stamp"),
+    ({"value": float("nan"), "observed_at": NOW - 3600}, "not a number"),
+    ({"value": True, "observed_at": NOW - 3600}, "a bool, which Python calls an int"),
+    ({"value": "191.4", "observed_at": NOW - 3600}, "a numeric string"),
+    ({"value": 191.4, "observed_at": NOW + 90000}, "a stamp in the FUTURE"),
+    ({"value": 191.4, "observed_at": 1}, "a stamp before this feeder existed"),
+    ({"value": 191.4, "observed_at": "yesterday"}, "a stamp that is not a number"),
+    ({"value": 191.4}, "no stamp at all"),
+])
+def test_a_nonsensical_stored_reading_is_a_failure_not_history_sr022(entry, why):
+    """Corrupt or tampered state used to post a fabricated reading: nothing
+    checked it, so `-500 lb` went on the wall and a future stamp made a source
+    dead for a week render live. A stored reading that cannot be true is not
+    history — it gets the answer a source that never succeeded gets."""
+    assert feeder.validate_stored_reading(entry, NOW) is None, why
+
+
+def test_a_credible_stored_reading_is_still_kept_sr022():
+    kept = feeder.validate_stored_reading(
+        {"value": 191.4, "observed_at": NOW - 3 * 24 * 3600}, NOW)
+    assert kept == {"value": 191.4, "observed_at": NOW - 3 * 24 * 3600}
+
+
+def test_the_state_file_is_filtered_AT_THE_LOAD_sr022(tmp_path):
+    """One of the two layers, on its own — found by the mutation run, which
+    showed that `load_state` and `build_post` each hid the other's absence."""
+    state = tmp_path / "weight-state.json"
+    state.write_text(json.dumps({"weight": {"value": -500.0,
+                                            "observed_at": NOW - 3600}}),
+                     encoding="utf-8")
+    assert feeder.load_state(str(state), NOW) == {}
+    state.write_text(json.dumps({"weight": {"value": 191.4,
+                                            "observed_at": NOW - 3600}}),
+                     encoding="utf-8")
+    assert feeder.load_state(str(state), NOW) == {
+        "weight": {"value": 191.4, "observed_at": NOW - 3600}}
+
+
+def test_a_corrupt_stored_reading_is_refused_AT_THE_POINT_OF_USE_sr022():
+    """The other layer, handed the entry directly."""
+    body, fresh = feeder.build_post(
+        None, {"value": -500.0, "observed_at": NOW - 3600}, GOAL, NOW)
+    assert fresh is False
+    assert body["value"] == 0.0 and "observed_at" not in body
+    good, fresh = feeder.build_post(
+        None, {"value": 191.4, "observed_at": NOW - 3600}, GOAL, NOW)
+    assert fresh is False and good["value"] == 191.4
+
+
+def test_corrupt_state_posts_unavailable_and_never_a_fabricated_weight_sr022(tmp_path):
+    """End to end, through the real state file."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state = state_dir / "weight-state.json"
+    state.write_text(json.dumps({"weight": {"value": -500.0,
+                                            "observed_at": NOW + 99999}}),
+                     encoding="utf-8")
+    sent = []
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_STATE_FILE": str(state), "STATE_DIRECTORY": str(state_dir)}
+
+    def broken(e):
+        raise feeder.SourceFailure("google-health: HTTP 401")
+
+    posted, failures, _ = feeder.run_cycle(
+        env, now=NOW, readers={"google-health": broken},
+        poster=lambda body, *a: (sent.append(body), (True, "HTTP 200"))[1],
+        goal_loader=lambda d: (GOAL, "health.md"))
+
+    assert sent[0]["value"] == 0.0
+    assert "observed_at" not in sent[0]
+    assert feeder.is_fresh(sent[0], NOW) is False
+    assert posted[0][1] is False
+
+
+def test_the_invariant_holds_across_every_fix_sr022(tmp_path):
+    """the body carries a stamp from this cycle IF AND ONLY IF it read the
+    source — restated whole, because six changes in this round could each have
+    broken it from a different direction."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_STATE_FILE": str(state_dir / "weight-state.json"),
+           "STATE_DIRECTORY": str(state_dir)}
+    sent = []
+    poster = lambda body, *a: (sent.append(body), (True, "HTTP 200"))[1]
+    loader = lambda d: (GOAL, "health.md")
+
+    measured_at = NOW - 3600
+    posted, _, _ = feeder.run_cycle(
+        env, now=NOW, readers={"google-health": lambda e: (191.4, measured_at)},
+        poster=poster, goal_loader=loader)
+    assert posted[0][1] is True
+    assert sent[-1]["observed_at"] == feeder.iso8601_utc(measured_at)
+
+    def broken(e):
+        raise feeder.SourceFailure("google-health: HTTP 401")
+
+    later = NOW + 8 * 24 * 3600      # past the static 7-day horizon
+    posted, _, _ = feeder.run_cycle(env, now=later, readers={"google-health": broken},
+                                    poster=poster, goal_loader=loader)
+    assert posted[0][1] is False
+    assert sent[-1]["value"] == 191.4
+    assert sent[-1]["observed_at"] == feeder.iso8601_utc(measured_at)
+    assert feeder.is_fresh(sent[-1], later) is False
+
+
+def test_the_block_is_still_blocked_by_construction_sr022():
+    """None of this round's fixes may have opened a path to a fabricated
+    reading. `read_google_health` still refuses, and no parser has appeared."""
+    for name in ("parse_google_health", "parse_weight_datapoint",
+                 "parse_weight", "parse_datapoints"):
+        assert not hasattr(feeder, name)
+    with pytest.raises(feeder.SourceFailure):
+        feeder.read_google_health({"_now": NOW})

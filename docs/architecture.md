@@ -188,18 +188,23 @@ sequenceDiagram
     Note over F: a blank identity or an off-box destination<br/>REFUSES here - it never defaults
     F->>X: initialize + account/rateLimits/read (no credential passes through F)
     X-->>F: usedPercent 34, windowDurationMins 10080
-    F->>A: GET /api/oauth/usage (Bearer, read-only; beta header)
-    A--xF: 401 / timeout / garbage
+    Note over F: every window is checked against ONE cycle clock:<br/>a reset time already past means a replayed body,<br/>and a bucket with no window at all is UNAVAILABLE<br/>(a windowless gauge would inherit the 7-day horizon)
+    F->>A: GET /api/oauth/usage via vendor_opener (Bearer, read-only; beta header)
+    Note over F,A: NO redirect is followed and NO http_proxy is honoured:<br/>urllib carries Authorization across a cross-host 302
+    A--xF: 401 / timeout / garbage / 302
     Note over F: ONE SourceFailure. The other sources keep going -<br/>a failing vendor must not blank the panel
-    F->>O: GET /zen/go/v1/usage (Bearer, read-only)
+    F->>O: GET /zen/go/v1/usage via vendor_opener (Bearer, read-only)
     O-->>F: weekly 58%, monthly 89%
-    F->>S: read last-known readings
+    F->>S: read last-known readings, VALIDATED at the door
+    Note over S: a stored entry that cannot be true -<br/>100000%, a future stamp - is a failure, not history
     F->>N: codex gauge, value 34, observed_at = NOW  (live)
     F->>N: claude gauges, last true value at its ORIGINAL stamp<br/>(or no observed_at at all, if it never succeeded)
+    Note over F,N: the POST goes through feed_opener: no proxy, no redirect,<br/>and the socket's real peer is re-checked BEFORE the<br/>token and body are written
     Note over N: stale by NagLight's own horizon -><br/>"unavailable", never a green gauge
     F->>N: opencode gauges, observed_at = NOW  (live)
+    Note over F: each gauge is built and posted in its own try -<br/>one refusable body must not end the cycle
     F->>S: write ONLY the sources that succeeded
-    Note over S: open_for_write refuses every other path,<br/>so no vendor credential file can be written
+    Note over S: open_for_write resolves symlinks, requires the path to sit<br/>inside StateDirectory=, and opens O_EXCL|O_NOFOLLOW -<br/>so no credential file can be written or truncated
 ```
 
 ### One weight cycle: where the goal comes from, and the two different refusals (SR-022, LLR-006, IF-014)
@@ -239,14 +244,16 @@ sequenceDiagram
         Note over N: NOTHING IS POSTED. The target line IS the goal;<br/>inventing one would draw a 50 lb bar<br/>around a number nobody chose
     else goal 180 lb
         D-->>W: 180
-        W->>G: GET /v4/users/me/dataTypes/weight/dataPoints
+        W->>G: GET /v4/users/me/dataTypes/weight/dataPoints<br/>(when written, through vendor_opener: no redirect, no proxy)
         G--xW: SourceFailure - no token minted, and NO PARSER EXISTS<br/>until one real body has been observed
-        W->>S: read the last-known reading
-        alt a previous reading exists
+        Note over W: only the exception TYPE is journalled, never its message:<br/>a urllib exception carries the request and its headers
+        W->>S: read the last-known reading, VALIDATED at the door
+        alt a previous reading exists and is credible
             S-->>W: 191.4 lb, observed_at = when it was TRUE
-            W->>N: value 191.4, target 180, that ORIGINAL stamp
-        else nothing has ever been read
+            W->>N: value 191.4, target 180, that ORIGINAL stamp<br/>through feed_opener: no proxy, no redirect, peer re-checked
+        else nothing has ever been read, or what is stored cannot be true
             W->>N: value 0, target 180, NO observed_at at all
+            Note over S: -500 lb, 100000 lb or a FUTURE stamp is corruption,<br/>and corruption is not history
         end
         Note over N: stale by NagLight's own static 7-day horizon -><br/>"unavailable", never a green gauge.<br/>The 0 is unreachable as a displayed reading
         W->>S: NOT written - a failed read must not decay the stamp

@@ -215,6 +215,67 @@ the next tool putting its token somewhere new. Backed by three lines:
    refresh-token file and fails if **any byte under it changed**, if more than
    one file was written, or if the written file contains the token.
 
+**The allow-list resolves symlinks, and it is bounded twice.** `os.path.abspath`
+is string arithmetic — it does not resolve symlinks — so pre-creating
+`<state>.tmp` as a link pointing at a token passed the allow-list unchanged (the
+*string* matched) and the write truncated the token. The guard now uses
+`os.path.realpath`, **and** requires the resolved path to sit inside the
+service's own `StateDirectory=` — a bound the `.env` cannot move, because a knob
+naming a token still names something outside `/var/lib/homehub-weight`. The open
+itself does not trust the check that preceded it: the file is unlinked first
+(which destroys a planted *link*, never the file it points at), then created
+`O_CREAT|O_EXCL|O_NOFOLLOW`, so anything that appears in the gap is refused by
+the kernel rather than by our confidence.
+
+**A refused write costs the history, never the gauge.** The cycle has already
+posted by then; the refusal is a named failure in the journal.
+
+
+## The POST and the vendor GETs may not leave by a route nobody chose
+
+The feed URL is validated to loopback or an address a local docker bridge is
+really carrying (below), and for a while that was mistaken for the whole
+property. It is not, because `urllib.request.urlopen` uses urllib's **default
+opener**, which does two things nobody asked it to:
+
+* **it follows redirects**, copying the request's headers onto the new request —
+  `Authorization` included. So the validated loopback endpoint could answer
+  `302 Location: http://attacker.example/feed` and urllib would obediently
+  re-send the POST, carrying the feed bearer token, the `X-Forwarded-User`
+  identity and a body whose one number is the Owner's body weight, to a host the *response* named;
+* **it honours `http_proxy` / `https_proxy`**, so an exported proxy variable
+  routes the same POST through a LAN proxy that then sees all of it — without
+  the feed URL changing at all.
+
+Both are closed, and the two directions are decided **separately** because they
+are not the same problem:
+
+| | feed POST (`feed_opener`) | vendor GET (`vendor_opener`) |
+|---|---|---|
+| redirects | refused | refused |
+| proxies | none installed | none installed, and no knob to opt back in |
+| peer address | re-checked on the socket before the request is written | not checked — these calls go to the internet by design |
+
+The vendor half is the deliberate one. Those calls are *supposed* to leave the
+box, so a peer check would be nonsense — but urllib does not strip
+`Authorization` across a cross-host redirect, so a 302 from an impersonated
+vendor endpoint would hand out the household's Google Health token — which grants blood glucose, body fat,
+oxygen saturation, core temperature and heart-rate metrics as well as weight,
+because there is no weight-only scope. `vendor_opener` exists before the reader that will use it, because
+the egress defect happened by each call site reaching for the convenient
+function, and the Google Health reader is the one call site still unwritten.
+The price if a vendor starts redirecting is an "unavailable"
+gauge — which is the outcome this feeder exists to produce when it cannot read
+a source honestly. 
+The peer check runs inside `connect()`, after the TCP handshake and **before**
+`http.client` writes the request line, so a connection that lands somewhere it
+should not is dropped with the token and the body still unsent.
+
+**Nothing a remote sends is written to the journal.** `post_gauge` reports the
+status code and never the response body: `main` prints failures to stderr and
+systemd persists them, so an error body a responding server or an interposed
+proxy chose to reflect — a token echoed back included — used to end up on disk.
+
 ## The token's home — the `tracker_drive_tokens` shape, for a service
 
 The plan asked for "tokens in a separate volume like `tracker_drive_tokens`".

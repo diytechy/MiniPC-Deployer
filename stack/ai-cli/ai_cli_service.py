@@ -1240,16 +1240,83 @@ class request_scratch(object):
 # ---------------------------------------------------------------------------
 
 
+#: The two REASONS a row can be cooling, and they carry different advice.
+#: Pacing is the short, expected gap after a call that completed - "try again
+#: shortly". Backoff is the long gap after a call that failed - a caller told
+#: "shortly" and handed a 120 s wait learns to distrust the hint. Both are
+#: strings on the wire, so a caller branches on a constant and never on prose.
+COOLDOWN_PACING = "success-pacing"
+COOLDOWN_BACKOFF = "failure-backoff"
+
+
+def cooldown_state(cooldowns, route_id, now):
+    """The live cooldown on ``route_id``, or None when the row is free.
+
+    Contract:
+      Inputs:  cooldowns: {route_id: (until_epoch, reason)} - `RouteGate`'s
+               map; reason is COOLDOWN_PACING or COOLDOWN_BACKOFF.
+               now: epoch seconds.
+      Outputs: (until_epoch, reason) while the row is cooling, else None.
+    Pure; the racy part is `RouteGate`.
+    Implements: SR-019, LLR-004
+    """
+    entry = (cooldowns or {}).get(route_id)
+    if entry is None:
+        return None
+    until, reason = entry
+    if until <= now:
+        return None
+    return (until, reason)
+
+
 def available(cooldowns, route_id, now):
-    """True when ``route_id`` is not cooling down. ``cooldowns`` maps a route id
-    to the epoch it is available again. Pure; the racy part is `RouteGate`."""
-    until = (cooldowns or {}).get(route_id)
-    return until is None or until <= now
+    """True when ``route_id`` is not cooling down. Pure; the racy part is
+    `RouteGate`."""
+    return cooldown_state(cooldowns, route_id, now) is None
 
 
-def cool(cooldowns, route_id, now, seconds):
-    """Put ``route_id`` on cooldown until ``now + seconds``. In place."""
-    cooldowns[route_id] = now + max(0, seconds)
+def cool(cooldowns, route_id, now, seconds, reason):
+    """Put ``route_id`` on cooldown until ``now + seconds``, recording WHY.
+
+    The reason is stored with the deadline rather than beside it: a caller is
+    told which kind of wait it is, and one map cannot disagree with another
+    about the same row.
+    """
+    cooldowns[route_id] = (now + max(0, seconds), reason)
+
+
+class GateDecision(object):
+    """Why a launch was allowed or refused, and when the caller may come back.
+
+    The Owner's condition on the success cooldown (ruling 2026-09-09): a route
+    that is cooling must SAY SO, distinguishably from a route that is broken,
+    and say when it is next available. So a refusal is a record, not a bare
+    string.
+
+    Contract:
+      outcome: "ok" | "cooling" | "running" | "busy".
+      reason:  machine-readable constant - COOLDOWN_PACING / COOLDOWN_BACKOFF
+               for "cooling", "in-flight" for "running", "at-capacity" for
+               "busy", None for "ok".
+      retry_after_seconds: int >= 1, the MINIMUM wait before retrying, or None
+               when no honest bound exists (see `RouteGate.acquire`). It is a
+               floor in the `Retry-After` sense, never a promise.
+      retry_at: epoch seconds the row is next available, or None when unknown.
+    Implements: SR-019, LLR-004
+    """
+
+    __slots__ = ("outcome", "reason", "retry_after_seconds", "retry_at")
+
+    def __init__(self, outcome, reason=None, retry_after_seconds=None, retry_at=None):
+        self.outcome = outcome
+        self.reason = reason
+        self.retry_after_seconds = retry_after_seconds
+        self.retry_at = retry_at
+
+    def __repr__(self):  # test readability
+        return "GateDecision({!r}, {!r}, {!r})".format(
+            self.outcome, self.reason, self.retry_after_seconds
+        )
 
 
 class RouteGate(object):
@@ -1285,28 +1352,63 @@ class RouteGate(object):
     def acquire(self, route_id, now):
         """Claim a launch slot for ``route_id``.
 
-        Returns "ok", "cooling" (this row is backing off, or already running) or
-        "busy" (the box is at its concurrency ceiling). The caller MUST call
-        `release` for an "ok".
+        Returns a `GateDecision`. The caller MUST call `release` for an "ok".
+        The four outcomes are deliberately NOT one refusal: they need different
+        advice, and telling a caller "cooling, try again shortly" when it is
+        really in a 120 s failure backoff teaches it to ignore the hint.
+
+        Everything below happens under ONE lock, including reading the cooldown
+        deadline that goes back to the caller: the check, the claim and the
+        retry hint must describe the same instant, or a burst can slip between
+        them (that was the original race).
+        Implements: SR-019, LLR-004
         """
         with self._lock:
-            if route_id in self._in_flight or not available(
-                self.cooldowns, route_id, now
-            ):
-                return "cooling"
+            if route_id in self._in_flight:
+                # A session is running on this row. Nobody can say when it ends
+                # - up to AI_CLI_TIMEOUT_SECONDS - but the row cannot be free
+                # any SOONER than the pacing cooldown that follows it, so that
+                # is the honest floor. `Retry-After` means "wait at least this
+                # long"; a caller that comes back then gets a fresh, updated
+                # answer rather than a fabricated deadline.
+                return GateDecision(
+                    "running",
+                    "in-flight",
+                    retry_after_seconds=max(1, self.success_cooldown_seconds),
+                )
+            state = cooldown_state(self.cooldowns, route_id, now)
+            if state is not None:
+                until, reason = state
+                # Round UP: a caller that retries at the truncated second is
+                # refused again for the fraction it shaved off.
+                remaining = until - now
+                whole = int(remaining)
+                if whole < remaining:
+                    whole += 1
+                return GateDecision(
+                    "cooling",
+                    reason,
+                    retry_after_seconds=max(1, whole),
+                    retry_at=until,
+                )
             if len(self._in_flight) >= self.max_concurrent:
-                return "busy"
+                # The BOX is full, not this row. No retry hint: any of the
+                # running sessions could finish at any moment, and inventing a
+                # number here would be a guess dressed as an answer.
+                return GateDecision("busy", "at-capacity")
             self._in_flight.add(route_id)
-            return "ok"
+            return GateDecision("ok")
 
     def release(self, route_id, now, ok):
         """Give the slot back and cool the row: briefly after a success, for the
-        full backoff after a failure."""
+        full backoff after a failure - recording WHICH, so the refusal a later
+        caller sees carries the right advice."""
         seconds = self.success_cooldown_seconds if ok else self.cooldown_seconds
+        reason = COOLDOWN_PACING if ok else COOLDOWN_BACKOFF
         with self._lock:
             self._in_flight.discard(route_id)
             if seconds:
-                cool(self.cooldowns, route_id, now, seconds)
+                cool(self.cooldowns, route_id, now, seconds, reason)
 
     def in_flight(self):
         with self._lock:
@@ -1628,6 +1730,72 @@ def selectable_routes(config):
     return routes
 
 
+def refusal_response(route_id, decision, max_concurrent):
+    """Turn a non-"ok" `GateDecision` into the (status, payload) a caller reads.
+
+    THE OWNER'S CONDITION (ruling 2026-09-09) on pacing every completed call:
+    a caller must be able to tell "this route is cooling, come back at T" from
+    "this route is broken", without parsing prose. So every refusal here
+    carries a `status` and a `reason` from a fixed vocabulary, and a cooling one
+    carries the retry hint as DATA. `retry_after_seconds` is mirrored into the
+    `Retry-After` HTTP header by the handler - the header is the idiom, the
+    field is what a JSON client can actually branch on, and they come from this
+    one place so they cannot disagree.
+
+    Contract:
+      Inputs:  decision: GateDecision with outcome != "ok".
+      Outputs: (int status, dict payload). 429 for a row-level refusal
+               (cooling or already running), 503 for the box-wide ceiling.
+      Raises:  ValueError for an unknown outcome - a new outcome must decide
+               its own advice rather than falling into someone else's.
+    Implements: SR-019, LLR-004
+    """
+    payload = {
+        "route": route_id,
+        "status": decision.outcome,
+        "reason": decision.reason,
+        "retryable": True,
+    }
+    if decision.retry_after_seconds is not None:
+        payload["retry_after_seconds"] = decision.retry_after_seconds
+    if decision.retry_at is not None:
+        payload["retry_at"] = decision.retry_at
+    if decision.outcome == "cooling":
+        if decision.reason == COOLDOWN_BACKOFF:
+            payload["error"] = (
+                "route {!r} is backing off after a failed call and is not "
+                "available for another {} s. This is a BACKOFF, not the short "
+                "pacing gap - the previous session did not produce a "
+                "result.".format(route_id, decision.retry_after_seconds)
+            )
+        else:
+            payload["error"] = (
+                "route {!r} is cooling down after a completed call and is "
+                "available again in {} s. Nothing failed - this is the "
+                "expected pacing between calls.".format(
+                    route_id, decision.retry_after_seconds
+                )
+            )
+        return 429, payload
+    if decision.outcome == "running":
+        payload["error"] = (
+            "route {!r} is already running a session. Nothing failed. Retry in "
+            "no less than {} s; a session may run up to the configured "
+            "timeout, so this is a floor, not a "
+            "deadline.".format(route_id, decision.retry_after_seconds)
+        )
+        return 429, payload
+    if decision.outcome == "busy":
+        payload["error"] = (
+            "the box is already running {} session(s); this is a small "
+            "always-on machine. This route is NOT cooling - it is the "
+            "box-wide ceiling, so a different route will not help "
+            "either.".format(max_concurrent)
+        )
+        return 503, payload
+    raise ValueError("unhandled gate outcome {!r}".format(decision.outcome))
+
+
 def handle_ask(body, config, routes, gate, runner=run_session, now=None):
     """The request path: validate, claim a slot, launch one contained session.
 
@@ -1667,13 +1835,8 @@ def handle_ask(body, config, routes, gate, runner=run_session, now=None):
     # The availability check and the claim are ONE atomic step: a burst of
     # requests must not all see "available" before any of them has run.
     claim = gate.acquire(route_id, now)
-    if claim == "cooling":
-        return 429, {"error": "route {!r} is busy or cooling down".format(route_id)}
-    if claim == "busy":
-        return 503, {
-            "error": "the box is already running {} session(s); this is a small "
-            "always-on machine".format(gate.max_concurrent)
-        }
+    if claim.outcome != "ok":
+        return refusal_response(route_id, claim, gate.max_concurrent)
     ok = False
     try:
         status, payload, ok = _run_one(config, route, schema, prompt, runner)
@@ -1748,6 +1911,12 @@ def make_handler(config, routes, gate):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            # The HTTP idiom for "come back later", AS WELL AS the body field -
+            # not instead of it. Mirrored from the payload rather than computed
+            # again, so header and body can never name two different times.
+            retry_after = payload.get("retry_after_seconds")
+            if isinstance(retry_after, int) and not isinstance(retry_after, bool):
+                self.send_header("Retry-After", str(retry_after))
             self.end_headers()
             self.wfile.write(data)
 

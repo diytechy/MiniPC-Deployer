@@ -8,6 +8,18 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 — two Owner rulings applied (see the audit entry at the foot of
+this file).** (1) `SLEEP_END` now has **one** default, **06:45**, on both power
+paths; the per-path default is gone and SN-015's "the disabled path is
+completely unchanged" line is **knowingly relaxed on this one value** — the
+schedule-only morning wake moves 06:30 -> 06:45. (2) The ai-cli route cooldown
+is accepted at 5 s **on the condition that a refusal says which refusal it is**:
+a cooling route now answers 429 with `status`/`reason`
+(`success-pacing` vs `failure-backoff`), `retry_after_seconds`/`retry_at` and a
+`Retry-After` header; an in-flight row is `status:"running"`; the box-wide
+ceiling stays 503 `at-capacity`. None of B12's four security criteria moved.
+Next action awaiting approval: the gate is unchanged (G1).
+
 **2026-09-09 cross-review fix round on B9, the wall panel's occupancy power —
 verdict REJECT, 10 confirmed findings, all applied.** This is the
 highest-consequence block in the build: the panel is wall-mounted with no
@@ -31,19 +43,14 @@ wall-clock terms, which is what the requirement is written in.
 the wake time (`date -d "<today> <wake> tomorrow"`), and A18 asserts it by
 running the real script at a fixed instant on the night the clocks go back.
 
-**V3 — `SLEEP_END`'s shipped default, and the collision that turned out not to
-be one.** The acceptance promises that with absence detection disabled the
-existing schedule stands *completely* unchanged, and the morning wake is part of
-that schedule; SN-015 separately ratified 06:45 as the occupancy wake. Both now
-hold, from **one knob**: `SLEEP_END` is still the single value that is the RTC
-target, the wake timer and the on-period start, but its shipped DEFAULT is
-06:45 when `WALL_ABSENCE_ENABLED=true` and the unchanged **06:30** when it is
-false. The two paths are mutually exclusive by construction, so this is one name
-holding one value per boot rather than a second knob — and `wall.env.example`
-now ships `SLEEP_END` **commented out** so the default governs. Setting it
-explicitly pins both paths. **Flagged for the Owner** rather than silently
-picked: one line in each script collapses it back to a single 06:45 if that is
-what was meant.
+**V3 — `SLEEP_END`'s shipped default. Flagged for the Owner, and the Owner
+ruled: ONE default, 06:45.** The B9 fix round made the shipped default
+path-dependent — 06:45 with `WALL_ABSENCE_ENABLED=true`, the pre-existing 06:30
+with it false — so that SN-015's ratified 06:45 occupancy wake and its "the
+disabled path is completely unchanged" line could both hold from one knob. It
+was flagged rather than silently picked, and on **2026-09-09 the Owner ruled it
+collapsed to a single 06:45 default on both paths**: two shipped defaults for
+one knob is a rule nobody will remember in a year. See the ruling entry below.
 
 **The block's central rule was broken, and is now the decider's to enforce.**
 The absence clock was the shell's own bookkeeping ("absent, so start counting"),
@@ -574,8 +581,9 @@ of **one** knob set (`SLEEP_MODE`, `SLEEP_START`, `SLEEP_END`,
 record; `wall-sleep.sh occupancy` applies that record and re-derives neither, so
 the two behaviours cannot drift into a dark screen on an awake machine or a
 suspend with somebody at the panel. **`SLEEP_END` is now 06:45** (ratified
-2026-09-08, replacing 06:30) and is one value doing three jobs: the RTC wake
-target, the morning wake timer, and the start of the on-period.
+2026-09-08, replacing 06:30; one default on both power paths by Owner ruling
+2026-09-09) and is one value doing three jobs: the RTC wake target, the morning
+wake timer, and the start of the on-period.
 **Off by default** — with `WALL_ABSENCE_ENABLED=false` nothing is read and
 nothing is written, and the 22:00 `SLEEP_START` schedule stands unchanged. On:
 backlight off whenever nobody is present; suspend only after an hour of absence
@@ -6622,3 +6630,13 @@ started. No apt package name was added, so no apt export re-run is owed.
 **2026-09-09 — B7+B11 cross-review fix round (REJECT, all findings applied).** Symlink-bypassable write guard (realpath + StateDirectory bound + O_EXCL/O_NOFOLLOW), redirect/proxy egress on all four HTTP call sites (feed_opener / vendor_opener), windowless-gauge and replayed-200 freshness, per-gauge failure isolation, state validated on load and on use, no remote body or exception message in the journal. Mirrored across both feeders with tests/test_feeder_egress_parity.py as the enforcement. check.py 517 passed / 5 skipped (baseline 423/5); trace --strict-integrity 0, orphans 24; check_flows OK, 4 diagrams; run-hermetic-tests.sh UNRUN. 28 mutants, 28 killed after two passes; the first pass had 7 survivors and every one was a test defect. No knob changed, no live state touched.
 
 **2026-09-09 — B9 cross-review fix round (REJECT, 10 findings, all applied).** The RTC frame established from timedatectl/adjtime instead of asserting `-l` (the panel would not have woken); the alarm targeted at the next local calendar occurrence instead of now+86400 (DST); `SLEEP_END` defaulted per path so the ratified 06:45 occupancy wake and the unchanged 06:30 schedule both hold from one knob (flagged for the Owner); the absence clock moved into the decision and cleared inside the on-period, so the hour is an hour spent OUTSIDE it; the clock written atomically and range-checked; NaN/Infinity refused in the presence file; the RTC alarm read back after arming; a failed backlight-off blocking the suspend. A11/A12 rewritten to assert properties rather than spellings. check.py 525 passed / 5 skipped (baseline 517/5); trace --strict-integrity 0, orphans 24; check_flows OK, 4 diagrams; occupancy-power.test.sh 73 PASS / 0 FAIL standalone; run-hermetic-tests.sh UNRUN (missing zstd, rsync). 11 mutants, 11 killed, no first-pass survivors. No live state touched, no apt package added.
+
+**2026-09-09 — Owner rulings on two flagged items (SLEEP_END's default, and the success cooldown).** Both were flagged by their fix rounds rather than decided; both are now decided, and both are written down here rather than silently absorbed.
+
+**Ruling 1 — `SLEEP_END` collapses to ONE 06:45 default.** B9 shipped it path-dependent (06:45 with `WALL_ABSENCE_ENABLED=true`, 06:30 with it false) so that SN-015's ratified 06:45 occupancy wake and its "with detection off the existing schedule stands completely unchanged" line could both hold. The Owner ruled that two shipped defaults for one knob is a thing nobody will remember in a year: one `if` removed in `wall-sleep.sh`, one in `wall-firstboot.sh`, and A2's expectation back at 06:45. **The acceptance line is knowingly RELAXED on this one value: the schedule-only path's morning wake moves 06:30 -> 06:45 too.** That is the Owner's decision, not a defect — the SHAPE of the disabled path is still untouched (A1: an occupancy tick writes nothing; A2: `SLEEP_START` still suspends on the clock with no presence consulted), and only the minute the RTC alarm is armed for has changed. `SLEEP_END` remains ONE knob doing all three jobs (RTC target, wake timer, on-period start) and A12 still asserts behaviourally that exactly two variables in the wall tree hold a wall-clock time. `wall.env.example` now ships `SLEEP_END=06:45` **uncommented**: the only reason it was commented out was to let the path-dependent default govern, that reason is gone, and writing it out puts both bounds of the window — and so both bounds of the on-period — on the page next to `SLEEP_START`, which was already uncommented. The script defaults still cover a `wall.env` that predates the knob. A12 gained two checks closing a real gap: each script must declare exactly ONE `SLEEP_END` default (a reintroduced `if/else` lists two) and both scripts must declare the SAME one — nothing else in the suite runs `wall-firstboot.sh`, so its default was previously asserted by nothing at all.
+
+**Ruling 2 — a cooling route must tell the caller it is cooling.** The Owner accepted B12's "every completed call cools the route" (`AI_CLI_SUCCESS_COOLDOWN_SECONDS`, 5 s) on the condition that a caller can tell a cooling route from a broken one and learn when it is next available. `RouteGate.acquire` now returns a `GateDecision` instead of a bare string, and `refusal_response` turns it into a machine-readable refusal: **429 `{status:"cooling", reason:"success-pacing"|"failure-backoff", retry_after_seconds, retry_at, retryable:true}` with a `Retry-After` header mirrored from the body field** (the header as well as the field, not instead of it, and from one place so they cannot disagree); **429 `{status:"running", reason:"in-flight"}`** with `retry_after_seconds` as an honest FLOOR and deliberately no `retry_at`, because nobody can know when a running session ends; **503 `{status:"busy", reason:"at-capacity"}`** with no retry hint to invent, kept distinct because the *box* is full and a different route will not help. The cooldown reason is stored WITH the deadline (`cooldowns[id] = (until, reason)`), so a caller retrying into a 120 s failure backoff is never told "try again shortly". None of B12's four security criteria was touched — the dedicated account, the read-only tool use, the loopback/bridge-only bind and the per-request scratch dir are all unchanged, and their guards were re-mutated to confirm they still kill.
+
+**Two mutation survivors found, both test defects, both fixed.** Deleting `self._lock` from `acquire` outright left the 8-thread burst test GREEN three runs running — the check-then-claim window is a few bytecodes wide, so the interleaving simply never occurred; the test was asserting the outcome of a race that never ran. (Widening it with a `sleep` made it worse: the sleep staggered the threads and serialised them by accident.) It now holds the window open deterministically at the point between the membership check and the claim, and the lock being held is what makes that point unreachable for the other threads. Separately, moving `cool()` out of `release`'s lock was killed by nothing; that window is unreachable by construction and so untestable behaviourally, and is now asserted structurally on the parse tree of `acquire` and `release`.
+
+check.py 534 passed / 5 skipped (baseline 525/5); trace --strict-integrity 0, orphans 24; check_flows --no-placeholders OK, 4 diagrams; occupancy-power.test.sh 75 PASS / 0 FAIL standalone (baseline 73); ai-cli-guards.test.sh 21 PASS / 0 FAIL; run-hermetic-tests.sh UNRUN on this dev PC (missing zstd, rsync). 18 mutants: 16 killed on the first pass, 2 survivors (both test defects, described above), both killed after the tests were fixed. No live hub or panel state touched; no apt package added, so no apt export is owed.

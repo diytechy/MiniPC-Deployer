@@ -93,28 +93,22 @@ load_env_file "$ENV_FILE"
 # Default false: an image with no presence writer must behave exactly as it did
 # before this feature existed.
 : "${WALL_ABSENCE_ENABLED:=false}"
-# SLEEP_END — still ONE knob doing all three jobs (the RTC alarm target, the
-# morning wake timer, and the start of the on-period). What is path-dependent is
-# only its SHIPPED DEFAULT, and that is deliberate:
+# SLEEP_END — ONE knob doing all three jobs (the RTC alarm target, the morning
+# wake timer, and the start of the on-period), with ONE default, 06:45, on both
+# power paths.
 #
-#   * SN-015 ratified 06:45 (2026-09-08) as the OCCUPANCY wake, so the occupancy
-#     path derives its wake and its on-period start from 06:45;
-#   * the same acceptance promises that with absence detection DISABLED the
-#     existing schedule stands COMPLETELY unchanged, and the morning wake is
-#     part of that schedule — so the schedule-only path keeps 06:30, the value
-#     it shipped with before this feature existed.
+# History, so nobody re-derives a rule that no longer exists: this briefly
+# defaulted to 06:45 with absence detection on and 06:30 with it off, so that
+# SN-015's "the disabled path is completely unchanged" line could hold to the
+# minute. The Owner ruled on 2026-09-09 that two shipped defaults for one knob
+# is a thing nobody will remember in a year, and knowingly relaxed that
+# acceptance line on this one value: the schedule-only morning wake moves
+# 06:30 -> 06:45 too. See docs/status.md.
 #
-# The two paths are mutually exclusive (with detection on, SLEEP_START stops
-# suspending and hands over to the absence timer), so this is one name holding
-# one value per boot, NOT a second knob: whatever it resolves to still feeds the
-# alarm, the timer and the on-period from this single line. An operator who sets
-# SLEEP_END explicitly gets exactly that value on both paths.
-# Keep this block identical to wall-firstboot.sh's.
-if [ "$WALL_ABSENCE_ENABLED" = "true" ]; then
-    : "${SLEEP_END:=06:45}"
-else
-    : "${SLEEP_END:=06:30}"
-fi
+# Keep this line identical to wall-firstboot.sh's — a panel whose wall.env
+# predates the knob must get the same answer from both scripts, and A12 asserts
+# that the two agree.
+: "${SLEEP_END:=06:45}"
 : "${WALL_ABSENCE_TIMEOUT_MIN:=60}"
 : "${WALL_PRESENCE_FILE:=/run/wall-presence/state.json}"
 

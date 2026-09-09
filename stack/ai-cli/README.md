@@ -182,12 +182,48 @@ the cross-review found a `{"type":"status"}` frame with exit 0 being returned
 as **200 with `"result": null`**, which is the same false evidence one level
 down.
 
+### A refusal says which refusal it is
+
+Every **completed** call cools its route — successes included, so a hot loop
+cannot launch back-to-back sessions on the household subscription. The Owner's
+condition when ratifying that (2026-09-09) is this section: **a caller must be
+able to tell a cooling route from a broken one, and learn when it is next
+available.** So a refusal is machine-readable, never prose to be parsed:
+
+| Condition | Status | `status` | `reason` | Retry hint |
+|---|---|---|---|---|
+| paced after a **completed** call | 429 | `cooling` | `success-pacing` | `retry_after_seconds` + `retry_at`, and a `Retry-After` header |
+| backing off after a **failed** call | 429 | `cooling` | `failure-backoff` | same fields — but seconds, not "shortly" |
+| a session already running on this row | 429 | `running` | `in-flight` | `retry_after_seconds` only, as a **floor** |
+| the box is at `AI_CLI_MAX_CONCURRENT` | 503 | `busy` | `at-capacity` | none |
+
+Read `reason`, not the sentence. The two cooldowns are one code but **not one
+condition**: `success-pacing` is the short, expected gap (`AI_CLI_SUCCESS_
+COOLDOWN_SECONDS`, default 5 s) and nothing went wrong, while `failure-backoff`
+is `AI_CLI_COOLDOWN_SECONDS` (default 120 s) after a session that produced no
+result. A caller told "try again shortly" and then made to wait two minutes
+stops believing the hint, which is why they are labelled apart.
+
+`retry_after_seconds` is an integer, **rounded up**, and the `Retry-After`
+header carries the same number — mirrored from the body, so the two cannot name
+different times. It is a *minimum* wait in both places, never a promise: for an
+`in-flight` row nobody can know when the running session ends (it may run to
+`AI_CLI_TIMEOUT_SECONDS`), so the floor handed back is the pacing gap that must
+follow it, and there is deliberately **no `retry_at`**. `at-capacity` gets no
+hint at all rather than a guessed one — and it is a different code on purpose,
+because it is the *box* that is full: retrying a different route will not help,
+which is the opposite of the advice for a cooldown.
+
+A genuine failure carries none of this vocabulary: no `status: cooling`, no
+retry fields. "Cooling" and "broken" are distinguishable by a field test.
+
 ### And a bounded box
 
 This is a small always-on machine. `AI_CLI_MAX_CONCURRENT` sessions run at
 once **across all routes** (default 1) and a further request is a 503, not a
 queue; a route already in flight is a 429 taken under the same lock as the
-cooldown, so a burst cannot launch N sessions in the gap between the check and
+cooldown — the check, the claim and the retry hint describe the same instant —
+so a burst cannot launch N sessions in the gap between the check and
 the claim; a body without a `Content-Length`, or above
 `AI_CLI_MAX_BODY_BYTES`, is refused **before it is read**; connections are
 capped at `AI_CLI_MAX_CONNECTIONS` and idle ones time out after
@@ -205,7 +241,7 @@ capped at `AI_CLI_MAX_CONNECTIONS` and idle ones time out after
 | `setup-ai-cli.sh` | idempotent account creation + install; refuses `hub`, sudo, a LAN bind |
 | `tests/ai-cli-guards.test.sh` | the hermetic guards suite (21 checks), in `run-hermetic-tests.sh` |
 
-Python unit tests live at `tests/test_ai_cli_service.py` (111 cases).
+Python unit tests live at `tests/test_ai_cli_service.py` (120 cases).
 
 ## Deploying
 

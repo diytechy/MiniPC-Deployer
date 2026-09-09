@@ -27,7 +27,8 @@
 #   A1  detection OFF: an occupancy tick writes NOTHING (no dim, no suspend),
 #       however long the absence — the SLEEP_START schedule stands unchanged
 #   A2  detection OFF: the 22:00 `start` still arms the RTC and suspends, and
-#       the alarm it arms is 06:45 (the ratified SLEEP_END)
+#       the alarm it arms is 06:45 — the SINGLE SLEEP_END default that both
+#       power paths now share (Owner ruling 2026-09-09)
 #   A3  detection ON, present, inside the on-period: the backlight is ON and NO
 #       suspend was ever recorded — the walk-in needs no resume because nothing
 #       ever suspended
@@ -50,8 +51,9 @@
 #       really does invoke the decider exactly once (counted at RUNTIME)
 #   A12 ONE KNOB, asserted BEHAVIOURALLY: a single SLEEP_END line in wall.env is
 #       the value the decider gates the on-period on AND the value the alarm is
-#       armed for, in the same run; and no other variable anywhere in the wall
-#       tree carries a wall-clock time
+#       armed for, in the same run; no other variable anywhere in the wall
+#       tree carries a wall-clock time; and ONE knob means ONE default —
+#       each script declares exactly one, and both declare the same one
 #   A13 an absence that BEGAN inside the on-period does not suspend the moment
 #       the boundary passes — the hour must be an hour spent OUTSIDE it
 #   A14 a truncated absence clock ("1") is not five decades of absence
@@ -304,16 +306,18 @@ eq "100" "$(brightness)" "A1 detection off: the backlight is untouched by an occ
 eq "no" "$(suspended)" "A1 detection off: no suspend, after 10 h of absence"
 eq "NONE" "$(armed_hhmm)" "A1 detection off: no RTC alarm was armed"
 
-# ── A2: detection OFF — the schedule is unchanged, INCLUDING its morning ────
-# The cross-review's point, and it is the whole of V3: the acceptance promises
-# that with absence detection off the existing schedule stands COMPLETELY
-# unchanged, and the morning wake is part of that schedule. It shipped as 06:30.
-# 06:45 is the ratified OCCUPANCY wake (A5, A10, A20), not a change to this path.
+# ── A2: detection OFF — the schedule still suspends, and wakes at 06:45 ─────
+# The SHAPE of the disabled path is unchanged: SLEEP_START suspends on the
+# clock, with no presence consulted (A1). The morning wake is 06:45 on this path
+# too, by Owner ruling 2026-09-09 — one SLEEP_END default, not two. That ruling
+# knowingly relaxes SN-015's "the disabled path is completely unchanged" line on
+# this one value; the wake moved 06:30 -> 06:45 here. It is recorded in
+# docs/status.md, and A12 is what keeps it ONE knob rather than two.
 scenario a2
 write_env "SLEEP_MODE=suspend"
 run start
 eq "yes" "$(suspended)" "A2 detection off: SLEEP_START still suspends (schedule unchanged)"
-eq "06:30" "$(armed_hhmm)" "A2 detection off: the morning is still 06:30 — the shipped schedule"
+eq "06:45" "$(armed_hhmm)" "A2 detection off: the morning is 06:45 — the single SLEEP_END default"
 eq "yes" "$(armed_is_future)" "A2 the armed alarm is in the FUTURE, not this morning"
 
 # ── A3: ON, present, inside the on-period — the walk-in ──────────────────────
@@ -516,6 +520,22 @@ TIME_KNOBS="$(grep -hoE '^[[:space:]]*:[[:space:]]*"\$\{[A-Z_]+:=(([0-2]?[0-9]:[
     | grep -oE '\{[A-Z_]+:=' | tr -d '{:=' | sort -u | tr '\n' ' ')"
 eq "SLEEP_END SLEEP_START " "$TIME_KNOBS" \
     "A12 exactly two variables in the wall scripts hold a wall-clock time"
+# ...and ONE knob means ONE default. The Owner collapsed SLEEP_END's briefly
+# path-dependent default on 2026-09-09, so this asserts BOTH halves of that:
+# each script declares exactly one SLEEP_END default (a reintroduced if/else
+# would list two values here), and the two scripts declare the SAME one.
+# wall-firstboot.sh renders the .timer files while wall-sleep.sh arms the RTC
+# alarm, so a disagreement is a timer firing at a different minute from the
+# alarm - and nothing else in this suite runs wall-firstboot.sh at all, so
+# without this line its default is asserted by nothing.
+sleep_end_defaults() {
+    grep -oE 'SLEEP_END:=[0-9]{2}:[0-9]{2}' "$1" \
+        | grep -oE '[0-9]{2}:[0-9]{2}' | sort -u | tr '\n' ' '
+}
+eq "06:45 " "$(sleep_end_defaults "$SLEEP_SH")" \
+    "A12 wall-sleep.sh declares exactly ONE SLEEP_END default, 06:45"
+eq "$(sleep_end_defaults "$SLEEP_SH")" "$(sleep_end_defaults "$DIR/wall-firstboot.sh")" \
+    "A12 wall-firstboot.sh declares the SAME single SLEEP_END default"
 # The decider's RTC wake IS its on-period start — asserted by running it, not by
 # grepping the line that implements it.
 RTC_ECHO="$("$PY" "$DECIDER" --now-epoch 1757000000 --minute-of-day 0 \

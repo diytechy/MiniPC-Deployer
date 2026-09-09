@@ -303,10 +303,12 @@ sequenceDiagram
         Svc-->>Caller: 403 + the allowed ids
     else no schema
         Svc-->>Caller: 400 - an unconstrained answer is not offered
-    else route in flight or cooling (RouteGate, one lock)
-        Svc-->>Caller: 429
+    else route cooling (RouteGate, one lock)
+        Svc-->>Caller: 429 {status:cooling, reason:success-pacing|failure-backoff,<br/>retry_after_seconds, retry_at} + Retry-After
+    else route already in flight (same lock, same instant)
+        Svc-->>Caller: 429 {status:running, reason:in-flight,<br/>retry_after_seconds = the pacing FLOOR, no retry_at}
     else the box is at AI_CLI_MAX_CONCURRENT
-        Svc-->>Caller: 503
+        Svc-->>Caller: 503 {status:busy, reason:at-capacity} - no retry hint to invent
     else accepted
         Svc->>Svc: request_scratch -> a fresh 0700 mkdtemp dir (LLR-002)
         Svc->>Svc: build_argv - model+effort from the ROW, never the request;<br/>argv[0] resolved on AI_CLI_BIN_PATH; the schema flag appended

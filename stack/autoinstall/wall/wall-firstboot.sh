@@ -145,17 +145,13 @@ fi
 : "${SLEEP_RTC_WAKE:=true}"
 : "${WALL_ABSENCE_ENABLED:=false}"
 # SLEEP_END is ONE value doing three jobs (the RTC wake, the wake timer, and the
-# start of the on-period). Only its shipped DEFAULT depends on which power path
-# is live: 06:45 is what SN-015 ratified for OCCUPANCY, while the schedule-only
-# path keeps the 06:30 it had before this feature existed, because the same
-# acceptance promises that path is unchanged. Keep this block identical to
-# wall-sleep.sh's — a panel whose wall.env predates the knob must get the same
-# answer from both scripts, and this one renders the timers.
-if [ "$WALL_ABSENCE_ENABLED" = "true" ]; then
-    : "${SLEEP_END:=06:45}"
-else
-    : "${SLEEP_END:=06:30}"
-fi
+# start of the on-period), with ONE default, 06:45, whichever power path is
+# live. It briefly defaulted per path (06:45 on / 06:30 off); the Owner
+# collapsed that on 2026-09-09 — see wall-sleep.sh's block and docs/status.md.
+# Keep this line identical to wall-sleep.sh's — a panel whose wall.env predates
+# the knob must get the same answer from both scripts, and this one renders the
+# timers.
+: "${SLEEP_END:=06:45}"
 : "${WALL_ABSENCE_TIMEOUT_MIN:=60}"
 : "${WALL_PRESENCE_FILE:=/run/wall-presence/state.json}"
 : "${WALL_PORT:=8443}"

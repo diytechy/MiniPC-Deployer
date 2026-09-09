@@ -1108,13 +1108,19 @@ class TestPacingIsAtomic:
         gate = _gate(concurrent=4)
         first = gate.acquire("ANALYSIS-QUICK", 1000.0)
         second = gate.acquire("ANALYSIS-QUICK", 1000.0)
-        assert first == "ok"
-        assert second == "cooling", "the same row launched twice at once"
+        assert first.outcome == "ok"
+        assert second.outcome == "running", "the same row launched twice at once"
+        assert second.reason == "in-flight", (
+            "an in-flight row must not be reported as a cooldown: the advice "
+            "differs and there is no cooldown deadline to hand back"
+        )
 
     def test_the_box_wide_ceiling_holds_across_different_rows_sr019(self):
         gate = _gate(concurrent=1)
-        assert gate.acquire("ANALYSIS-QUICK", 1000.0) == "ok"
-        assert gate.acquire("ANALYSIS-DEEP", 1000.0) == "busy"
+        assert gate.acquire("ANALYSIS-QUICK", 1000.0).outcome == "ok"
+        second = gate.acquire("ANALYSIS-DEEP", 1000.0)
+        assert second.outcome == "busy"
+        assert second.reason == "at-capacity"
 
     def test_a_successful_call_also_paces_the_row_sr019(self):
         """The review: successful calls never cooled at all, so a hot loop could
@@ -1122,26 +1128,62 @@ class TestPacingIsAtomic:
         gate = _gate(success=5)
         gate.acquire("ANALYSIS-QUICK", 1000.0)
         gate.release("ANALYSIS-QUICK", 1000.0, ok=True)
-        assert gate.acquire("ANALYSIS-QUICK", 1002.0) == "cooling"
-        assert gate.acquire("ANALYSIS-QUICK", 1006.0) == "ok"
+        assert gate.acquire("ANALYSIS-QUICK", 1002.0).outcome == "cooling"
+        assert gate.acquire("ANALYSIS-QUICK", 1006.0).outcome == "ok"
 
     def test_a_failure_cools_for_longer_than_a_success_sr019(self):
         gate = _gate(cooldown=120, success=5)
         gate.acquire("R", 1000.0)
         gate.release("R", 1000.0, ok=False)
-        assert gate.acquire("R", 1010.0) == "cooling"
-        assert gate.acquire("R", 1121.0) == "ok"
+        assert gate.acquire("R", 1010.0).outcome == "cooling"
+        assert gate.acquire("R", 1121.0).outcome == "ok"
 
     def test_concurrent_threads_take_at_most_one_slot_each_sr019(self):
-        """The same property under real threads, because the lock is the fix and
-        a single-threaded test would pass without it."""
+        """The lock is the fix, so the test must FAIL when the lock is removed.
+
+        It did not. A mutation run (2026-09-09) deleted `self._lock` from
+        `acquire` outright and this test — 8 threads on a barrier, assert one
+        "ok" — still passed, three times running. The check-then-claim window is
+        a few bytecodes wide, so the interpreter simply never switched inside
+        it. The test was asserting the outcome of a race that never ran: a guard
+        nobody had tested. Widening it with a sleep made it WORSE (the sleep
+        staggered the threads and serialised them by accident).
+
+        So the window is held open deterministically, at the one place it
+        matters — between "is this row free?" and "claim it". `__len__` is
+        called by `acquire` after the membership check and before the add, and
+        this one blocks until EVERY worker has reached it.
+
+          * Lock present: the first thread reaches `__len__` still HOLDING the
+            lock, so no other thread can reach the barrier at all. It times out
+            and breaks — and that timeout IS the proof: the interleaving the
+            lock exists to prevent is unreachable. Exactly one "ok".
+          * Lock absent: all 8 arrive, the barrier trips, all 8 see an empty
+            in-flight set and all 8 claim. The mutant dies.
+        """
+
+        class _HoldsTheWindowOpen(set):
+            def __init__(self, parties, timeout):
+                set.__init__(self)
+                self.barrier = threading.Barrier(parties, timeout=timeout)
+
+            def __len__(self):
+                try:
+                    self.barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass  # the lock held: nobody else could get here.
+                return set.__len__(self)
+
         gate = _gate(concurrent=2)
+        # White-box on purpose: the requirement is about the ORDER of two
+        # operations inside one method, and that is not observable from outside.
+        gate._in_flight = _HoldsTheWindowOpen(parties=8, timeout=0.75)
         results = []
         barrier = threading.Barrier(8)
 
         def worker():
             barrier.wait()
-            results.append(gate.acquire("ANALYSIS-QUICK", 1000.0))
+            results.append(gate.acquire("ANALYSIS-QUICK", 1000.0).outcome)
 
         threads = [threading.Thread(target=worker) for _ in range(8)]
         for t in threads:
@@ -1149,6 +1191,55 @@ class TestPacingIsAtomic:
         for t in threads:
             t.join()
         assert results.count("ok") == 1, results
+
+    def test_the_claim_and_the_cooldown_are_under_the_SAME_lock_sr019(self):
+        """B12's rule, and a mutation survivor made it a test.
+
+        Moving `cool()` out of `release`'s `with self._lock:` — so the row is
+        discarded from in-flight and only cooled a moment later — leaves a
+        window in which `acquire` sees the row neither running nor cooling and
+        launches straight past the pacing. A behavioural test for that window
+        is inherently racy (the whole point of the lock is that it is
+        unreachable), and a mutation run on 2026-09-09 confirmed no behavioural
+        test in this file kills it.
+
+        So it is asserted STRUCTURALLY, on the parse tree rather than on a
+        spelling: in both `acquire` and `release`, nothing that touches the
+        in-flight set or the cooldown map may sit outside the `with self._lock`
+        block. This is a whole-region property, not a grep for a line.
+        """
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(svc.RouteGate))
+        klass = tree.body[0]
+        methods = {n.name: n for n in klass.body if isinstance(n, ast.FunctionDef)}
+        guarded_state = {"cool", "cooldown_state", "cooldowns", "_in_flight"}
+        for name in ("acquire", "release"):
+            fn = methods[name]
+            outside = []
+            for stmt in fn.body:
+                is_the_lock = (
+                    isinstance(stmt, ast.With)
+                    and any(
+                        isinstance(i.context_expr, ast.Attribute)
+                        and i.context_expr.attr == "_lock"
+                        for i in stmt.items
+                    )
+                )
+                if is_the_lock:
+                    continue
+                for node in ast.walk(stmt):
+                    if isinstance(node, ast.Name) and node.id in guarded_state:
+                        outside.append(node.id)
+                    if isinstance(node, ast.Attribute) and node.attr in guarded_state:
+                        outside.append(node.attr)
+            assert not outside, (
+                "RouteGate.{} touches {} outside `with self._lock` - the claim "
+                "and the cooldown must be one atomic decision".format(
+                    name, sorted(set(outside))
+                )
+            )
 
     def test_a_request_to_a_busy_row_is_429_not_a_second_session_sr019(
         self, tmp_path, pinned_binaries
@@ -1171,6 +1262,123 @@ class TestPacingIsAtomic:
         )
         assert status == 429
         assert launched == [], "a second session was launched for a busy row"
+
+
+# ---------------------------------------------------------------------------
+# THE OWNER'S CONDITION (ruling 2026-09-09). Pacing every completed call is
+# accepted - "on the condition that callers can tell the route is on cooldown
+# rather than broken". So the refusal itself is the requirement: it must name
+# the condition in a fixed vocabulary, say when the row is next available, and
+# never dress a 120 s failure backoff up as "try again shortly".
+#
+# Every assertion below is on a value a CALLER can branch on - the status code,
+# a constant in the body, the Retry-After header. None of them reads prose.
+# ---------------------------------------------------------------------------
+
+
+def _ask(gate, tmp_path, route="ANALYSIS-QUICK", now=1000.0, runner=None):
+    config = svc.Config(
+        env={"AI_CLI_SCRATCH_ROOT": str(tmp_path / "s")}, bridge_addresses=[]
+    )
+    return svc.handle_ask(
+        {
+            "route": route,
+            "schema": {"type": "object"},
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        config, _registry(), gate,
+        runner=runner or (lambda *a: (0, "", False)),
+        now=now,
+    )
+
+
+class TestACoolingRouteSaysSo:
+    def test_a_paced_route_is_legibly_cooling_with_a_retry_time_sr019(
+        self, tmp_path, pinned_binaries
+    ):
+        """A caller must be able to tell "cooling, come back at T" from
+        "broken" WITHOUT reading the sentence."""
+        gate = _gate(success=5)
+        gate.acquire("ANALYSIS-QUICK", 1000.0)
+        gate.release("ANALYSIS-QUICK", 1000.0, ok=True)
+        status, payload = _ask(gate, tmp_path, now=1002.0)
+        assert status == 429
+        assert payload["status"] == "cooling"
+        assert payload["reason"] == svc.COOLDOWN_PACING
+        assert payload["retryable"] is True
+        assert payload["retry_after_seconds"] == 3, payload
+        assert payload["retry_at"] == 1005.0
+        assert payload["route"] == "ANALYSIS-QUICK"
+
+    def test_a_failure_backoff_is_not_sold_as_short_pacing_sr019(
+        self, tmp_path, pinned_binaries
+    ):
+        """The one the ruling calls out: a caller retrying into a 120 s backoff
+        must not be told "try again shortly"."""
+        gate = _gate(cooldown=120, success=5)
+        gate.acquire("ANALYSIS-QUICK", 1000.0)
+        gate.release("ANALYSIS-QUICK", 1000.0, ok=False)
+        status, payload = _ask(gate, tmp_path, now=1001.0)
+        assert status == 429
+        assert payload["status"] == "cooling"
+        assert payload["reason"] == svc.COOLDOWN_BACKOFF
+        assert payload["reason"] != svc.COOLDOWN_PACING
+        assert payload["retry_after_seconds"] == 119, payload
+
+    def test_the_retry_hint_rounds_up_so_a_retry_at_it_is_not_refused_sr019(self):
+        """Truncating would send the caller back a fraction of a second early,
+        into a second refusal."""
+        gate = _gate(success=5)
+        gate.acquire("R", 1000.0)
+        gate.release("R", 1000.0, ok=True)
+        decision = gate.acquire("R", 1000.5)
+        assert decision.retry_after_seconds == 5, decision
+        assert gate.acquire("R", 1000.5 + decision.retry_after_seconds).outcome == "ok"
+
+    def test_an_in_flight_row_is_not_reported_as_a_cooldown_sr019(
+        self, tmp_path, pinned_binaries
+    ):
+        """Different condition, different advice: there is no cooldown deadline
+        for a session that is still running, so none is invented."""
+        gate = _gate(success=5)
+        gate.acquire("ANALYSIS-QUICK", 1000.0)
+        status, payload = _ask(gate, tmp_path, now=1000.0)
+        assert status == 429
+        assert payload["status"] == "running"
+        assert payload["reason"] == "in-flight"
+        assert payload["retry_after_seconds"] == 5, "the floor is the pacing gap"
+        assert "retry_at" not in payload, (
+            "nobody can know when a running session ends; a deadline here would "
+            "be a guess dressed as an answer"
+        )
+
+    def test_the_concurrency_refusal_stays_distinct_from_a_cooldown_sr019(
+        self, tmp_path, pinned_binaries
+    ):
+        """AI_CLI_MAX_CONCURRENT is the BOX being full, not this row cooling:
+        different code, different reason, and no retry hint to fabricate."""
+        gate = _gate(concurrent=1)
+        gate.acquire("ANALYSIS-DEEP", 1000.0)
+        status, payload = _ask(gate, tmp_path, now=1000.0)
+        assert status == 503
+        assert payload["status"] == "busy"
+        assert payload["reason"] == "at-capacity"
+        assert payload["status"] != "cooling"
+        assert "retry_after_seconds" not in payload
+        assert "retry_at" not in payload
+
+    def test_a_real_failure_never_claims_to_be_cooling_sr019(
+        self, tmp_path, pinned_binaries
+    ):
+        """The other half of "distinguish cooling from failed": a session that
+        actually failed must not carry the cooling vocabulary."""
+        gate = _gate()
+        status, payload = _ask(
+            gate, tmp_path, runner=lambda *a: (1, "boom", False)
+        )
+        assert status != 429
+        assert payload.get("status") != "cooling"
+        assert "retry_after_seconds" not in payload
 
 
 class TestTimeoutKillsTheWholeTree:
@@ -1222,7 +1430,7 @@ class TestTheHttpShellIsBounded:
     """Asserted against a REAL bound server, because the property is about what
     the socket accepts before any of our code decides anything."""
 
-    def _server(self, tmp_path, **env):
+    def _server(self, tmp_path, gate=None, **env):
         base = {
             "AI_CLI_BIND": "127.0.0.1",
             "AI_CLI_PORT": "0",
@@ -1231,7 +1439,7 @@ class TestTheHttpShellIsBounded:
         base.update(env)
         config = svc.Config(env=base, bridge_addresses=[])
         server = svc.make_server(
-            config, svc.make_handler(config, _registry(), _gate())
+            config, svc.make_handler(config, _registry(), gate or _gate())
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1272,6 +1480,61 @@ class TestTheHttpShellIsBounded:
             assert body["ok"] is True
             assert "ANALYSIS-QUICK" in body["routes"]
             conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def _post_ask(self, port, route="ANALYSIS-QUICK"):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        body = json.dumps(
+            {
+                "route": route,
+                "schema": {"type": "object"},
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        )
+        conn.request(
+            "POST", "/v1/ask", body,
+            {"Content-Type": "application/json", "Content-Length": str(len(body))},
+        )
+        response = conn.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        out = (response.status, response.getheader("Retry-After"), payload)
+        conn.close()
+        return out
+
+    def test_a_cooling_route_answers_with_a_retry_after_header_sr019(self, tmp_path):
+        """The ruling asks for the HTTP idiom AS WELL AS the body field. Asserted
+        over a real socket, because `Retry-After` only exists on the wire - a
+        payload-level test would pass with the header never sent."""
+        gate = _gate(success=30)
+        gate.acquire("ANALYSIS-QUICK", time.time())
+        gate.release("ANALYSIS-QUICK", time.time(), ok=True)
+        server, port = self._server(tmp_path, gate=gate)
+        try:
+            status, header, payload = self._post_ask(port)
+            assert status == 429
+            assert payload["status"] == "cooling"
+            assert header is not None, "no Retry-After on a cooling refusal"
+            assert int(header) == payload["retry_after_seconds"], (
+                "the header and the body named different times"
+            )
+            assert 1 <= int(header) <= 30
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_box_wide_refusal_sends_no_retry_after_sr019(self, tmp_path):
+        """503 at-capacity has no honest deadline, so it must not carry a
+        fabricated one - and it must not be confusable with a 429 cooldown."""
+        gate = _gate(concurrent=1)
+        gate.acquire("ANALYSIS-DEEP", time.time())
+        server, port = self._server(tmp_path, gate=gate)
+        try:
+            status, header, payload = self._post_ask(port)
+            assert status == 503
+            assert payload["reason"] == "at-capacity"
+            assert header is None, header
         finally:
             server.shutdown()
             server.server_close()

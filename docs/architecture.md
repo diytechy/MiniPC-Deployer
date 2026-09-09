@@ -334,7 +334,15 @@ that record.
 
 Read it for what CANNOT happen: the panel cannot suspend inside the on-period at
 any absence length; it cannot suspend on an absence it did not positively
-observe; and it cannot suspend without an armed RTC alarm, on either path.
+observe; it cannot suspend without an RTC alarm that has been READ BACK, on
+either path; and it cannot suspend having failed to go dark.
+
+Four of those are the cross-review's findings, and each one is a place the tick
+now refuses rather than proceeds. The absence clock is part of the record for
+the same reason both halves of the decision are: it is the one input that makes
+a suspend reachable, so a shell running it on its own rule would be a second
+decider — and the rule it got wrong is that the timeout is time spent OUTSIDE
+the on-period, which is why the clock is cleared for every minute inside it.
 
 ```mermaid
 sequenceDiagram
@@ -363,14 +371,19 @@ sequenceDiagram
         else fresh and positively "absent"
             File-->>Dec: ABSENT
         end
-        Dec-->>Sh: ONE record {backlight, power, on_period, RTC_WAKE=SLEEP_END}
-        Sh->>Sh: absence clock on /run - set when absent, cleared when present
-        Sh->>HW: backlight_set <the record's backlight>
+        Dec->>Dec: parse_absent_since - a truncated or future clock is NOT an epoch
+        Dec-->>Sh: ONE record {backlight, power, on_period, absence_clock, RTC_WAKE=SLEEP_END}
+        Sh->>Sh: absence clock on /run - start / restart / clear, as the record says<br/>(CLEARED inside the on-period, so the hour is an hour spent outside it)
+        Sh->>HW: backlight_set <the record's backlight>, and READ IT BACK
         alt power=suspend (absent >= timeout AND outside the on-period)
-            Sh->>HW: arm_rtc SLEEP_END (06:45)
-            alt armed
+            alt the backlight did not actually go off
+                Sh-->>Tmr: NO suspend - lit AND unreachable is the one outcome forbidden
+            end
+            Sh->>HW: rtcwake -m no -u|-l -t <next local occurrence of SLEEP_END><br/>(the frame from timedatectl/adjtime; the day from the calendar, not +86400)
+            Sh->>HW: read /sys/class/rtc/rtc0/wakealarm back
+            alt the alarm is really programmed
                 Sh->>HW: systemctl suspend
-            else cannot arm (SN-013)
+            else cannot arm, or exits 0 having programmed nothing (SN-013)
                 Sh->>HW: backlight off only - a reachable panel beats a dark one
             end
         else power=stay

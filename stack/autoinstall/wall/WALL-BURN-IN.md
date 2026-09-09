@@ -77,6 +77,23 @@ cat /sys/class/input/event*/device/name
       ```bash
       for i in $(seq 1 20); do sudo rtcwake -m mem -l -s 60 && sleep 30; done
       ```
+- [ ] **Confirm which frame the RTC keeps, on the real box** — this decides
+      whether the alarm is armed with `-u` or `-l`, and getting it wrong is not
+      a failure, it is a wake a whole UTC offset away (a 06:45 alarm firing at
+      00:45 or 12:45, i.e. a panel that suspended and did not come back):
+      ```bash
+      timedatectl show -p LocalRTC --value    # expect: no  (RTC in UTC)
+      cat /etc/adjtime 2>/dev/null | sed -n 3p # expect: UTC, or no file at all
+      ```
+      `wall-sleep.sh` reads exactly those two, in that order, and defaults to
+      UTC. If this panel ever reports `yes`, nothing needs editing — but say so
+      in the log, because it means the `-l` path is the one in use.
+- [ ] **Prove the armed alarm is really programmed, not merely accepted**:
+      after `sudo /usr/local/sbin/wall-sleep.sh start`, `cat
+      /sys/class/rtc/rtc0/wakealarm` and convert it back with `date -d @<value>`.
+      The script now refuses to suspend when that readback disagrees, so a panel
+      that stays awake with `the alarm did not verify` in its journal is the
+      guard working, not a bug.
 - [ ] **Prove the RTC alarm wakes it from the real path**: run
       `sudo /usr/local/sbin/wall-sleep.sh start` with `SLEEP_END` a few minutes
       out, and confirm it comes back on its own with nobody touching anything.

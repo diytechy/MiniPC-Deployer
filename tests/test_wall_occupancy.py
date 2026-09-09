@@ -114,6 +114,7 @@ def test_presence_inside_the_on_period_never_suspends_sr020():
         "backlight": "on",
         "power": "stay",
         "on_period": True,
+        "absence_clock": "clear",
         "reason": got["reason"],
     }
 
@@ -307,3 +308,136 @@ def test_cli_refuses_an_unparseable_boundary_rather_than_defaulting_sr020(tmp_pa
             "--on-start", on_start, "--on-end", on_end,
         ])
         assert rc == 2, (on_start, on_end)
+
+
+# ── the absence clock: the hour is an hour spent OUTSIDE the on-period ───────
+#
+# The cross-review's central finding. The clock used to be the shell's own
+# bookkeeping ("absent, so start counting"), which counted straight through the
+# on-period: somebody who left at midday arrived at 22:00 already carrying ten
+# hours, and the panel suspended on the very first tick outside — the hour
+# outside, which is the rule, never observed at all. The clock is now part of
+# the one decision, and these are the cases that keep it there.
+
+
+@pytest.mark.smoke
+def test_the_absence_clock_does_not_run_inside_the_on_period_sr020():
+    """Inside the on-period, absence accumulates NOTHING to carry across."""
+    inside = _decide(presence=occ.ABSENT, minute_of_day=NOON,
+                     absent_since=NOW - 10 * HOUR)
+    assert inside["on_period"] is True
+    assert inside["power"] == "stay"
+    assert inside["absence_clock"] == "clear"
+
+
+def test_a_ten_hour_absence_cannot_suspend_the_first_minute_outside_sr020():
+    """The 22:00 boundary on a midday absence: dark, awake, clock restarted.
+
+    This is the exact sequence the review named. The minute before the
+    boundary the clock is cleared (above); the minute after, there is no
+    recorded start, so the panel stays awake and the hour begins HERE.
+    """
+    outside = _decide(presence=occ.ABSENT, minute_of_day=ON_END,
+                      absent_since=None, absence_timeout_min=60)
+    assert outside["on_period"] is False
+    assert outside["power"] == "stay"
+    assert outside["backlight"] == "off"
+    assert outside["absence_clock"] == "restart"
+
+
+def test_the_clock_is_cleared_by_presence_and_untouched_when_disabled_sr020():
+    assert _decide(presence=occ.PRESENT)["absence_clock"] == "clear"
+    assert _decide(absence_enabled=False, presence=occ.ABSENT,
+                   absent_since=NOW - 10 * HOUR)["absence_clock"] == "untouched"
+
+
+def test_an_absence_clock_from_the_future_cannot_suspend_sr020():
+    """A clock stamped ahead of now is nonsense arriving at a suspend decision.
+
+    parse_absent_since already refuses it; decide() refuses it again, because
+    the input that makes a suspend reachable is the one worth guarding twice.
+    """
+    result = _decide(presence=occ.ABSENT, minute_of_day=MIDNIGHT_THIRTY,
+                     absent_since=NOW + 10 * HOUR, absence_timeout_min=60)
+    assert result["power"] == "stay"
+    assert result["absence_clock"] == "restart"
+
+
+# ── the absence clock as it is READ: a truncated write is not an epoch ───────
+
+
+@pytest.mark.smoke
+def test_a_truncated_absence_clock_is_not_five_decades_of_absence_sr020():
+    """`1` is what an interrupted write leaves behind, and it reads as 1970.
+
+    Believed, it is ~2.9 million minutes of absence and therefore an IMMEDIATE
+    suspend the first tick outside the on-period. None restarts the timer, so
+    the panel serves a full hour before it may sleep.
+    """
+    assert occ.parse_absent_since("1", NOW)[0] is None
+    assert occ.parse_absent_since("17", NOW)[0] is None
+    assert occ.parse_absent_since(str(occ.MIN_PLAUSIBLE_EPOCH - 1), NOW)[0] is None
+    assert "truncated" in occ.parse_absent_since("1", NOW)[1]
+
+
+def test_the_absence_clock_accepts_only_a_plausible_epoch_sr020():
+    assert occ.parse_absent_since(str(NOW - 3600), NOW)[0] == NOW - 3600
+    assert occ.parse_absent_since("", NOW)[0] is None
+    assert occ.parse_absent_since("   ", NOW)[0] is None
+    assert occ.parse_absent_since("not-a-number", NOW)[0] is None
+    assert occ.parse_absent_since("-1", NOW)[0] is None
+    assert occ.parse_absent_since("1757000000.5", NOW)[0] is None
+    # Beyond the tolerated skew, i.e. a clock that has not happened yet.
+    assert occ.parse_absent_since(str(NOW + 3600), NOW)[0] is None
+
+
+# ── NaN: the one value that defeats every freshness check at once ────────────
+
+
+@pytest.mark.smoke
+def test_a_non_finite_presence_reading_is_malformed_not_fresh_sr020(tmp_path):
+    """`json.loads` accepts NaN, and every comparison against NaN is FALSE.
+
+    So `age > ttl` is false, `age < -skew` is false, and a file stamped
+    `"observedAt": NaN` is treated as a fresh reading — and then believed when
+    it says "absent". That inverts this module's whole fail-safe direction, so
+    the parse itself refuses the three non-finite constants, and an in-range
+    literal that OVERFLOWS to infinity (`1e999` is legal JSON) is refused on the
+    way past as well.
+    """
+    path = tmp_path / "state.json"
+    now_ms = NOW * 1000
+    for raw in (
+        '{"schemaVersion":1,"presence":"absent","observedAt":NaN,"ttlMs":30000}',
+        '{"schemaVersion":1,"presence":"absent","observedAt":Infinity,"ttlMs":30000}',
+        '{"schemaVersion":1,"presence":"absent","observedAt":-Infinity,"ttlMs":30000}',
+        '{"schemaVersion":1,"presence":"absent","observedAt":%d,"ttlMs":NaN}' % now_ms,
+        '{"schemaVersion":1,"presence":"absent","observedAt":1,"ttlMs":1e999}',
+        '{"schemaVersion":1,"presence":"absent","observedAt":1e999,"ttlMs":30000}',
+    ):
+        path.write_text(raw, encoding="utf-8")
+        state, reason = occ.read_presence(str(path), now_ms)
+        assert state == occ.PRESENT, (raw, reason)
+
+
+def test_the_cli_reports_what_to_do_with_the_absence_clock_sr020(tmp_path, capsys):
+    """The clock travels WITH the decision, for the same reason both halves do.
+
+    A shell that ran the clock on its own rule would be a second decider, and
+    the clock is the single input that makes a suspend reachable.
+    """
+    path = tmp_path / "state.json"
+    _write(path, {"schemaVersion": 1, "presence": "absent",
+                  "observedAt": NOW * 1000, "ttlMs": 30_000, "source": "t"})
+    rc = occ.main([
+        "--now-epoch", str(NOW), "--minute-of-day", str(MIDNIGHT_THIRTY),
+        "--presence-file", str(path), "--absent-since", "1",
+        "--absence-enabled", "true", "--absence-timeout-min", "60",
+        "--on-start", "06:45", "--on-end", "22:00",
+    ])
+    assert rc == 0
+    out = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+    # The truncated clock was rejected, so this tick may NOT suspend.
+    assert out["POWER"] == "stay"
+    assert out["ABSENCE_CLOCK"] == "restart"
+    assert "truncated" in out["CLOCK_REASON"]

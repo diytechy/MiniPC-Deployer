@@ -44,10 +44,24 @@
 #       at 03:00, with an ancient absence clock sitting right there
 #   A10 detection ON: the 22:00 boundary hands over instead of suspending a
 #       panel somebody is standing at
-#   A11 ONE KNOB SET: nothing else in the wall tree writes the backlight or
-#       suspends, so the two behaviours cannot drift apart
-#   A12 SLEEP_END is the single source of the RTC wake AND the on-period start —
-#       there is no second on-period knob to disagree with it
+#   A11 ONE WRITER, asserted as a PROPERTY and not as a spelling: no file in the
+#       wall tree may change the backlight or put the machine to sleep by ANY of
+#       the mechanisms this image could use, except wall-sleep.sh — and one tick
+#       really does invoke the decider exactly once (counted at RUNTIME)
+#   A12 ONE KNOB, asserted BEHAVIOURALLY: a single SLEEP_END line in wall.env is
+#       the value the decider gates the on-period on AND the value the alarm is
+#       armed for, in the same run; and no other variable anywhere in the wall
+#       tree carries a wall-clock time
+#   A13 an absence that BEGAN inside the on-period does not suspend the moment
+#       the boundary passes — the hour must be an hour spent OUTSIDE it
+#   A14 a truncated absence clock ("1") is not five decades of absence
+#   A15 a presence file whose observedAt is NaN is malformed, not fresh
+#   A16 an rtcwake that exits 0 having programmed NOTHING is not an armed alarm
+#   A17 the RTC frame is established, not asserted: -u for a UTC RTC, -l for a
+#       LOCAL one, and the alarm verifies in both
+#   A18 the alarm is the NEXT LOCAL OCCURRENCE of the wake time, so it is still
+#       06:45 across a DST boundary and not 05:45
+#   A19 a backlight that cannot be turned off blocks the suspend
 #
 # Usage: bash occupancy-power.test.sh
 set -uo pipefail
@@ -62,6 +76,10 @@ for f in "$SLEEP_SH" "$DECIDER" "$ENV_EXAMPLE"; do
 done
 PY="$(command -v python3 || command -v python)"
 [ -n "$PY" ] || { echo "FATAL: no python3"; exit 2; }
+# Captured BEFORE $BIN goes on PATH, so the date shim below can delegate to the
+# real one without recursing into itself.
+REAL_DATE="$(command -v date)"
+[ -n "$REAL_DATE" ] || { echo "FATAL: no date"; exit 2; }
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -84,20 +102,79 @@ printf '%s\n' "\$*" >> "\$SYSTEMCTL_LOG"
 exit 0
 EOF
 
-# rtcwake honours RTCWAKE_FAIL so A7 can reproduce SN-013's "the alarm cannot
-# even be ARMED" case without needing hardware that refuses.
+# rtcwake records its argv AND — this is the part that matters after the review
+# — PROGRAMS THE FAKE RTC, exactly as the kernel would: the wakealarm node holds
+# seconds-since-epoch computed as if the RTC were UTC, so a `-l` arming lands
+# shifted by the local UTC offset. Without this the fake was indistinguishable
+# from a firmware that returns 0 and programs nothing, which is precisely the
+# failure A16 now reproduces via RTCWAKE_SILENT_NOOP.
+#   RTCWAKE_FAIL         — a non-zero exit (SN-013's "cannot even be ARMED", A7)
+#   RTCWAKE_SILENT_NOOP  — exit 0, no alarm programmed (A16)
 cat > "$BIN/rtcwake" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "\$RTCWAKE_LOG"
 [ -n "\${RTCWAKE_FAIL:-}" ] && exit 1
+if [ -z "\${RTCWAKE_SILENT_NOOP:-}" ] && [ -n "\${FAKE_RTC_DIR:-}" ]; then
+    epoch=""; frame="-u"
+    while [ \$# -gt 0 ]; do
+        case "\$1" in
+            -t) epoch="\$2"; shift ;;
+            -l) frame="-l" ;;
+            -u) frame="-u" ;;
+        esac
+        shift
+    done
+    if [ -n "\$epoch" ]; then
+        if [ "\$frame" = "-l" ]; then
+            z="\$("$REAL_DATE" -d "@\$epoch" +%z)"
+            epoch=\$(( epoch + \${z:0:1}1 * (10#\${z:1:2} * 3600 + 10#\${z:3:2} * 60) ))
+        fi
+        mkdir -p "\$FAKE_RTC_DIR/rtc0"
+        printf '%s\n' "\$epoch" > "\$FAKE_RTC_DIR/rtc0/wakealarm"
+    fi
+fi
 exit 0
 EOF
 
+# timedatectl — systemd's answer to "is the RTC in local time", which is the
+# FIRST thing wall-sleep.sh asks. FAKE_LOCAL_RTC drives it (default: no, the
+# stock Ubuntu configuration this image actually ships).
+cat > "$BIN/timedatectl" <<EOF
+#!/usr/bin/env bash
+# FAKE_NO_TIMEDATECTL makes it answer nothing, which is how the /etc/adjtime
+# fallback gets exercised on a box where timedatectl is nonetheless present.
+if [ -z "\${FAKE_NO_TIMEDATECTL:-}" ]; then
+    case "\$*" in
+        *LocalRTC*) printf '%s\n' "\${FAKE_LOCAL_RTC:-no}"; exit 0 ;;
+    esac
+fi
+exit 1
+EOF
+
+# date — a passthrough EXCEPT when FAKE_NOW is set, when the three "what time is
+# it" forms answer from that fixed epoch instead. Every conversion form is
+# delegated untouched, so the arithmetic under test is the real date(1)'s. This
+# is what makes the DST case (A18) a deterministic assertion rather than a note
+# to re-run the suite in November.
+cat > "$BIN/date" <<EOF
+#!/usr/bin/env bash
+if [ -n "\${FAKE_NOW:-}" ] && [ \$# -eq 1 ]; then
+    case "\$1" in
+        +%s) printf '%s\n' "\$FAKE_NOW"; exit 0 ;;
+        +%F|+%H|+%M|+%H:%M) exec "$REAL_DATE" -d "@\$FAKE_NOW" "\$1" ;;
+    esac
+fi
+exec "$REAL_DATE" "\$@"
+EOF
+
+# python3 records the argv it was handed as well, so "the decider was called
+# once, with THESE knobs" is a counted fact rather than a grep of the source.
 cat > "$BIN/python3" <<EOF
 #!/usr/bin/env bash
+[ -n "\${PY3_LOG:-}" ] && printf '%s\n' "\$*" >> "\$PY3_LOG"
 exec "$PY" "\$@"
 EOF
-chmod +x "$BIN/systemctl" "$BIN/rtcwake" "$BIN/python3"
+chmod +x "$BIN/systemctl" "$BIN/rtcwake" "$BIN/python3" "$BIN/timedatectl" "$BIN/date"
 export PATH="$BIN:$PATH"
 
 # ── the sandbox one scenario runs in ─────────────────────────────────────────
@@ -113,8 +190,13 @@ scenario() {
     printf '100' > "$ROOT/sys/class/backlight/intel_backlight/max_brightness"
     SYSTEMCTL_LOG="$ROOT/systemctl.log"; : > "$SYSTEMCTL_LOG"
     RTCWAKE_LOG="$ROOT/rtcwake.log";     : > "$RTCWAKE_LOG"
-    export SYSTEMCTL_LOG RTCWAKE_LOG
-    unset RTCWAKE_FAIL
+    PY3_LOG="$ROOT/python3.log";         : > "$PY3_LOG"
+    # Where the fake rtcwake programs its alarm — the same tree wall-sleep.sh
+    # reads it back from, so "armed" is one artifact written by one actor and
+    # read by another, not a shared variable.
+    FAKE_RTC_DIR="$ROOT/sys/class/rtc"
+    export SYSTEMCTL_LOG RTCWAKE_LOG PY3_LOG FAKE_RTC_DIR
+    unset RTCWAKE_FAIL RTCWAKE_SILENT_NOOP FAKE_LOCAL_RTC FAKE_NOW FAKE_NO_TIMEDATECTL
     ENV_FILE="$ROOT/etc/wall.env"
     PRESENCE_FILE="$ROOT/run/presence.json"
 }
@@ -186,6 +268,17 @@ armed_hhmm() {
     [ -n "$epoch" ] || { echo "NONE"; return; }
     date -d "@$epoch" +%H:%M
 }
+# The flag rtcwake was actually given for the RTC's frame — the finding that
+# started this round was that it was always `-l`.
+armed_frame() {
+    grep -o -- '-[lu] ' "$RTCWAKE_LOG" | tail -1 | tr -d ' \n'
+}
+decider_calls() {
+    grep -c 'wall-occupancy.py' "$PY3_LOG" 2>/dev/null || echo 0
+}
+decider_on_start() {
+    grep -o -- '--on-start [0-9:]*' "$PY3_LOG" | tail -1 | awk '{print $2}'
+}
 armed_is_future() {
     local epoch
     epoch="$(grep -o -- '-t [0-9]\+' "$RTCWAKE_LOG" | tail -1 | awk '{print $2}')"
@@ -211,12 +304,16 @@ eq "100" "$(brightness)" "A1 detection off: the backlight is untouched by an occ
 eq "no" "$(suspended)" "A1 detection off: no suspend, after 10 h of absence"
 eq "NONE" "$(armed_hhmm)" "A1 detection off: no RTC alarm was armed"
 
-# ── A2: detection OFF — the 22:00 schedule is unchanged, and wakes at 06:45 ──
+# ── A2: detection OFF — the schedule is unchanged, INCLUDING its morning ────
+# The cross-review's point, and it is the whole of V3: the acceptance promises
+# that with absence detection off the existing schedule stands COMPLETELY
+# unchanged, and the morning wake is part of that schedule. It shipped as 06:30.
+# 06:45 is the ratified OCCUPANCY wake (A5, A10, A20), not a change to this path.
 scenario a2
 write_env "SLEEP_MODE=suspend"
 run start
 eq "yes" "$(suspended)" "A2 detection off: SLEEP_START still suspends (schedule unchanged)"
-eq "06:45" "$(armed_hhmm)" "A2 the armed RTC alarm is 06:45 — the ratified SLEEP_END"
+eq "06:30" "$(armed_hhmm)" "A2 detection off: the morning is still 06:30 — the shipped schedule"
 eq "yes" "$(armed_is_future)" "A2 the armed alarm is in the FUTURE, not this morning"
 
 # ── A3: ON, present, inside the on-period — the walk-in ──────────────────────
@@ -351,31 +448,273 @@ run start
 eq "no" "$(suspended)" "A10 SLEEP_START with somebody present: handover, NOT a suspend"
 eq "NONE" "$(armed_hhmm)" "A10 SLEEP_START with somebody present: no alarm armed"
 
-# ── A11: ONE KNOB SET — there is no second writer to drift from ─────────────
-# The defect this block exists to prevent is two parallel sets of logic. The
-# check is structural because that is the only way to catch the SECOND one being
-# added later: exactly one file in the wall tree may write the backlight, and
-# exactly one may suspend.
-BL_WRITERS="$(grep -rl 'class/backlight' "$DIR" --include='*.sh' --include='*.py' \
-    | grep -v '/tests/' | sed 's|.*/||' | sort -u | tr '\n' ' ')"
-eq "wall-sleep.sh " "$BL_WRITERS" "A11 exactly ONE file in the wall tree writes the backlight"
-SUSPENDERS="$(grep -rl 'systemctl suspend' "$DIR" --include='*.sh' --include='*.py' \
-    | grep -v '/tests/' | sed 's|.*/||' | sort -u | tr '\n' ' ')"
-eq "wall-sleep.sh " "$SUSPENDERS" "A11 exactly ONE file in the wall tree suspends"
-# And within that file, both halves come from ONE decider call.
-DECIDE_CALLS="$(grep -c 'python3 "$DECIDER"' "$SLEEP_SH")"
-eq "1" "$DECIDE_CALLS" "A11 wall-sleep.sh invokes the decider exactly once"
+# ── A11: ONE WRITER — the PROPERTY, not the two spellings it used to have ───
+# The defect this block exists to prevent is two parallel sets of logic, and the
+# only way to catch the second one is to catch it being ADDED. The previous
+# version of this check grepped the literal strings `class/backlight` and
+# `systemctl suspend`, so a second writer spelled `brightnessctl`, `loginctl
+# suspend` or `echo mem > /sys/power/state` walked straight past it. So the
+# check now names the MECHANISMS — every way this image could plausibly dim a
+# screen or sleep a machine — and scans every file in the wall tree, units
+# included, not just *.sh and *.py.
+#
+# Comment lines are stripped first, because these units DISCUSS suspending at
+# length (wall-sync-suspend.service exists to explain a suspend that failed for
+# 40 s) and prose about a mechanism is not a use of it.
+BACKLIGHT_MECHANISMS='class/backlight|brightnessctl|xbacklight|ddcutil|wlr-randr|dpms|light[[:space:]]+-S|backlight_set'
+SUSPEND_MECHANISMS='systemctl[[:space:]]+(--[a-z=-]+[[:space:]]+)*suspend|loginctl[[:space:]]+(suspend|hibernate)|systemd-run[^|]*suspend|pm-suspend|/sys/power/state|rtcwake[^|]*-m[[:space:]]*(mem|disk|standby|off|freeze)|dbus-send[^|]*Suspend|busctl[^|]*Suspend|zzz'
+# power_writers REGEX — the basenames of the wall-tree files whose EXECUTABLE
+# lines match, one per line, deduplicated.
+power_writers() {
+    local re="$1" f names=""
+    while IFS= read -r f; do
+        if sed -e 's/^[[:space:]]*#.*$//' "$f" 2>/dev/null | grep -qE "$re"; then
+            names="$names$(basename "$f")\n"
+        fi
+    done <<< "$(find "$DIR" -type f ! -path '*/tests/*' ! -path '*__pycache__*' ! -name '*.md')"
+    printf '%b' "$names" | grep -v '^$' | sort -u | tr '\n' ' '
+}
+eq "wall-sleep.sh " "$(power_writers "$BACKLIGHT_MECHANISMS")" \
+    "A11 exactly ONE file in the wall tree can change the backlight, by ANY mechanism"
+eq "wall-sleep.sh " "$(power_writers "$SUSPEND_MECHANISMS")" \
+    "A11 exactly ONE file in the wall tree can suspend, by ANY mechanism"
+# And at RUNTIME, not in the source: one tick, one decision. A second call would
+# be a second decision, which is the drift this block is built to prevent.
+scenario a11
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 61
+run occupancy
+eq "1" "$(decider_calls)" "A11 one occupancy tick invokes the decider EXACTLY once (counted at runtime)"
+eq "yes" "$(suspended)" "A11 ...and that single decision is the one that suspended"
 
-# ── A12: SLEEP_END is the single source of both jobs ────────────────────────
-eq "SLEEP_END=06:45" "$(grep -E '^SLEEP_END=' "$ENV_EXAMPLE")" \
-    "A12 wall.env.example ships the ratified SLEEP_END=06:45"
-ONPERIOD_KNOBS="$(grep -cE '^#?\s*(ON_PERIOD|WALL_ON_PERIOD|SLEEP_RTC_WAKE_TIME)' "$ENV_EXAMPLE" || true)"
-eq "0" "$ONPERIOD_KNOBS" "A12 there is NO second on-period / RTC-time knob to disagree with it"
-# The decider echoes the RTC wake back from the on-period start, so the shell
-# cannot arm the alarm from a different value than the one it gated on.
-grep -q 'RTC_WAKE={}".format(args.on_start)' "$DECIDER" \
-    && pass "A12 the decider derives RTC_WAKE from the on-period start itself" \
-    || fail "A12 the decider no longer derives RTC_WAKE from the on-period start"
+# ── A12: ONE KNOB — asserted by MOVING it, not by reading the example file ──
+# The previous version grepped wall.env.example for a list of alternative knob
+# names and checked one source line of the decider. Neither would have noticed a
+# `WALL_ON_START` added inside wall-sleep.sh and defaulted from SLEEP_END: the
+# example file would not mention it, the decider would still echo its argument,
+# and the two paths would drift with a green suite. So: set ONE SLEEP_END line
+# to an unusual value and require the SAME value to appear in BOTH jobs, in the
+# same run — the on-period the decider gated on, and the epoch the alarm was
+# armed for.
+KNOB=04:07
+scenario a12
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$KNOB" "SLEEP_START=04:08" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 61
+run occupancy
+eq "$KNOB" "$(decider_on_start)" "A12 the ONE SLEEP_END line is what gated the on-period"
+eq "$KNOB" "$(armed_hhmm)" "A12 ...and the SAME value is what the RTC alarm was armed for"
+eq "$(decider_on_start)" "$(armed_hhmm)" "A12 both jobs came from one value, in one run"
+# And no OTHER variable anywhere in the wall tree carries a wall-clock time.
+# This is what a second knob would look like on the day it is introduced,
+# whatever it is called and wherever its default comes from.
+TIME_KNOBS="$(grep -hoE '^[[:space:]]*:[[:space:]]*"\$\{[A-Z_]+:=(([0-2]?[0-9]:[0-9]{2})|\$\{?SLEEP_(END|START)\}?)"?\}"?' \
+    "$SLEEP_SH" "$DIR/wall-firstboot.sh" \
+    | grep -oE '\{[A-Z_]+:=' | tr -d '{:=' | sort -u | tr '\n' ' ')"
+eq "SLEEP_END SLEEP_START " "$TIME_KNOBS" \
+    "A12 exactly two variables in the wall scripts hold a wall-clock time"
+# The decider's RTC wake IS its on-period start — asserted by running it, not by
+# grepping the line that implements it.
+RTC_ECHO="$("$PY" "$DECIDER" --now-epoch 1757000000 --minute-of-day 0 \
+    --presence-file "$TMP/nonexistent.json" --on-start 03:21 --on-end 22:00 \
+    | grep '^RTC_WAKE=' | cut -d= -f2)"
+eq "03:21" "$RTC_ECHO" "A12 the decider reports the RTC wake AS the on-period start it was given"
+
+# ── A13: the hour must be an hour spent OUTSIDE the on-period ───────────────
+# THE CENTRAL RULE, and it was broken. Somebody leaves at 12:00 and is still
+# away at 22:00. The absence clock was started inside the on-period and carried
+# straight across the boundary, so the first tick outside saw 600 minutes and
+# suspended AT ONCE — the required hour outside never observed. Tick 1 below is
+# inside the on-period with an ancient clock already sitting there; tick 2 is
+# outside it, one minute later.
+scenario a13
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=00:01" "SLEEP_START=23:59" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 600                      # absent since midday, inside the on-period
+run occupancy
+eq "no" "$(suspended)" "A13 absent 10 h INSIDE the on-period: no suspend (as A4)"
+[ -f "$ROOT/run/wall-occupancy/absent-since" ] \
+    && fail "A13 the absence clock ran INSIDE the on-period, so it can carry across" \
+    || pass "A13 the absence clock does not run inside the on-period"
+# Now the boundary passes: same absence, same panel, now outside.
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+run occupancy
+eq "no" "$(suspended)" "A13 the boundary passes on a 10 h absence: it does NOT suspend at once"
+eq "0" "$(brightness)" "A13 ...it goes dark and stays reachable"
+SINCE="$(cat "$ROOT/run/wall-occupancy/absent-since" 2>/dev/null || echo 0)"
+[ "$(( $(date +%s) - SINCE ))" -lt 120 ] \
+    && pass "A13 the hour starts AT the boundary, not at midday" \
+    || fail "A13 the absence clock carried across the boundary ($SINCE)"
+
+# ── A14: a truncated absence clock is not five decades of absence ───────────
+# A non-atomic or interrupted write leaves a prefix. "1" reads as 1970, i.e.
+# ~2.9 million minutes of absence, and the panel suspends on the next tick.
+scenario a14
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+mkdir -p "$ROOT/run/wall-occupancy"
+printf '1' > "$ROOT/run/wall-occupancy/absent-since"
+run occupancy
+eq "no" "$(suspended)" "A14 a truncated absence clock ('1') does NOT suspend the panel"
+eq "0" "$(brightness)" "A14 ...it goes dark, and the timer restarts"
+SINCE="$(cat "$ROOT/run/wall-occupancy/absent-since" 2>/dev/null || echo 0)"
+[ "$(( $(date +%s) - SINCE ))" -lt 120 ] \
+    && pass "A14 the nonsense clock was replaced with a real one" \
+    || fail "A14 the nonsense clock survived ($SINCE)"
+
+# ── A15: NaN is malformed, not fresh ───────────────────────────────────────
+# json.loads accepts NaN, and every comparison against NaN is false — so a
+# presence file with "observedAt": NaN passes the stale check, passes the skew
+# check, and is believed when it says "absent". That inverts the fail-safe.
+scenario a15
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+absent_for 61
+printf '%s' '{"schemaVersion":1,"presence":"absent","observedAt":NaN,"ttlMs":30000,"source":"t"}' \
+    > "$PRESENCE_FILE"
+run occupancy
+eq "no" "$(suspended)" "A15 a NaN observedAt is malformed: no suspend"
+eq "100" "$(brightness)" "A15 a NaN observedAt reads as PRESENT: the screen stays lit"
+scenario a15b
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+absent_for 61
+printf '%s' '{"schemaVersion":1,"presence":"absent","observedAt":1,"ttlMs":1e999,"source":"t"}' \
+    > "$PRESENCE_FILE"
+run occupancy
+eq "no" "$(suspended)" "A15 an infinite ttlMs (1e999) is malformed too: no suspend"
+
+# ── A16: a zero exit is not an armed alarm ─────────────────────────────────
+# Firmware, a wrapper or a driver that ignores the ioctl can all return success
+# having programmed nothing. The old fake could not express that — it only
+# recorded arguments — so the suite's "armed" assertion passed in exactly this
+# failure mode. Now the alarm is READ BACK, and the fake can lie.
+scenario a16
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 61
+RTCWAKE_SILENT_NOOP=1 run occupancy
+eq "no" "$(suspended)" "A16 rtcwake exits 0 but programs NOTHING -> the panel refuses to suspend"
+eq "0" "$(brightness)" "A16 ...and degrades to backlight-off, reachable over the LAN"
+[ -f "$ROOT/sys/class/rtc/rtc0/wakealarm" ] \
+    && fail "A16 the scenario did not actually reproduce an unprogrammed alarm" \
+    || pass "A16 the scenario really did leave the RTC unprogrammed"
+scenario a16b
+write_env "SLEEP_MODE=suspend"
+RTCWAKE_SILENT_NOOP=1 run start
+eq "no" "$(suspended)" "A16 the SCHEDULED path refuses an unverifiable alarm too"
+
+# ── A17: the RTC's frame is ESTABLISHED, not asserted ──────────────────────
+# THE WORST FINDING OF THE ROUND. `-l` says "this RTC keeps LOCAL time". A stock
+# Linux box keeps it in UTC, so `-l` programmed the alarm a whole UTC offset
+# away: a 06:45 alarm becomes 00:45 or 12:45 in Chicago and the panel suspends
+# and never wakes. The flag must follow what the box actually says.
+scenario a17
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 61
+FAKE_LOCAL_RTC=no run occupancy
+eq "-u" "$(armed_frame)" "A17 LocalRTC=no (this image's actual configuration) arms with -u"
+eq "yes" "$(suspended)" "A17 ...and the alarm verifies, so the suspend proceeds"
+eq "$ONP_START" "$(armed_hhmm)" "A17 ...at the local wall-clock time asked for"
+scenario a17b
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 61
+# A box whose RTC really is in local time, with a REAL offset (git-bash has no
+# tzdata, so the zone is spelled as a POSIX rule string, which glibc/msys can
+# resolve without one).
+export TZ='CST6CDT,M3.2.0/2,M11.1.0/2'
+FAKE_LOCAL_RTC=yes run occupancy
+eq "-l" "$(armed_frame)" "A17 LocalRTC=yes arms with -l"
+eq "yes" "$(suspended)" "A17 ...and the readback accounts for the offset, so it verifies"
+eq "$ONP_START" "$(armed_hhmm)" "A17 ...still at the local wall-clock time asked for"
+unset TZ
+# With no timedatectl at all, /etc/adjtime is the authority — hwclock's own
+# record, and what util-linux itself reads.
+scenario a17c
+write_env "SLEEP_MODE=suspend"
+printf '0.0 0 0.0\n0\nLOCAL\n' > "$ROOT/etc/adjtime"
+FAKE_NO_TIMEDATECTL=1 run start
+eq "-l" "$(armed_frame)" "A17 /etc/adjtime saying LOCAL is honoured (timedatectl is only asked first)"
+scenario a17d
+write_env "SLEEP_MODE=suspend"
+printf '0.0 0 0.0\n0\nUTC\n' > "$ROOT/etc/adjtime"
+FAKE_NO_TIMEDATECTL=1 run start
+eq "-u" "$(armed_frame)" "A17 /etc/adjtime saying UTC is honoured"
+
+# ── A18: the alarm is a WALL-CLOCK promise, across a DST boundary ──────────
+# `target + 86400` is only a day when the offset does not move. On the night the
+# clocks go back it lands at 05:45 instead of 06:45 — an hour early every autumn
+# and an hour late every spring, on the one wake the panel cannot miss.
+scenario a18
+write_env "SLEEP_MODE=suspend" "SLEEP_END=06:45"
+export TZ='CST6CDT,M3.2.0/2,M11.1.0/2'
+FAKE_NOW="$("$REAL_DATE" -d '2026-10-31 23:00' +%s)"
+export FAKE_NOW
+run start
+eq "06:45" "$(armed_hhmm)" "A18 the alarm across the autumn DST boundary is still 06:45 local"
+eq "2026-11-01" "$("$REAL_DATE" -d "@$(grep -o -- '-t [0-9]\+' "$RTCWAKE_LOG" | tail -1 | awk '{print $2}')" +%F)" \
+    "A18 ...on the NEXT CALENDAR DAY, not 86400 seconds later"
+unset FAKE_NOW
+unset TZ
+
+# ── A19: a backlight that cannot go off blocks the suspend ─────────────────
+# The decision being applied is "nobody is here: go dark, THEN sleep". If the
+# dark half cannot happen, suspending anyway takes the panel off the LAN having
+# satisfied neither half — lit AND unreachable. Staying awake is the direction
+# somebody can SSH into and fix.
+scenario a19
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 61
+rm -rf "$ROOT/sys/class/backlight"      # the interface renamed, or gone
+run occupancy
+eq "no" "$(suspended)" "A19 no backlight node: the panel does NOT suspend having stayed lit"
+scenario a19b
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+          "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 61
+# A brightness node that cannot be written at all — the read-only-sysfs case.
+BL_DIR="$ROOT/sys/class/backlight/intel_backlight"
+chmod a-w "$BL_DIR/brightness" 2>/dev/null || true
+if [ -w "$BL_DIR/brightness" ]; then
+    echo "  NOTE: this filesystem ignores chmod a-w, so the read-only-node case is not run here"
+else
+    run occupancy
+    eq "no" "$(suspended)" "A19 a read-only brightness node blocks the suspend too"
+    chmod u+w "$BL_DIR/brightness" 2>/dev/null || true
+fi
+
+# ── A20: the ratified 06:45 IS the occupancy wake ──────────────────────────
+# The other half of V3: 06:45 must still be what an occupancy panel wakes to,
+# with no SLEEP_END line in wall.env at all.
+scenario a20
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" "SLEEP_START=22:00" \
+          "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 61
+if [ "$(date +%H%M)" -ge 645 ] && [ "$(date +%H%M)" -lt 2200 ]; then
+    echo "  NOTE: local time is inside the 06:45-22:00 on-period, so A20 asserts the decider's knob only"
+    run occupancy
+    eq "06:45" "$(decider_on_start)" "A20 with no SLEEP_END set, occupancy uses the ratified 06:45"
+else
+    run occupancy
+    eq "06:45" "$(decider_on_start)" "A20 with no SLEEP_END set, occupancy uses the ratified 06:45"
+    eq "06:45" "$(armed_hhmm)" "A20 ...and arms the RTC for it"
+fi
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

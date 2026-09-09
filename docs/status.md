@@ -8,6 +8,104 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 cross-review fix round on B9, the wall panel's occupancy power —
+verdict REJECT, 10 confirmed findings, all applied.** This is the
+highest-consequence block in the build: the panel is wall-mounted with no
+battery and no UPS, so a wrong suspend, or a suspend with no working wake,
+costs the panel *and* LAN reach to it until somebody physically walks over and
+touches it. Every fix below therefore leans one way — **when in doubt, stay
+awake with the backlight off.**
+
+**V1 — the panel would not have woken.** `rtcwake -m no -l -t` asserted that
+the RTC keeps LOCAL time. It does not: nothing in this image runs `timedatectl
+set-local-rtc 1` and nothing writes `/etc/adjtime`, so a stock Ubuntu
+autoinstall leaves the RTC in **UTC** — and `-l` therefore programmed the alarm
+a whole UTC offset away (a 06:45 alarm firing at 00:45 or 12:45 in Chicago).
+The frame is now **established, in order of authority**: `timedatectl show -p
+LocalRTC`, then `/etc/adjtime`'s third line, then UTC as the default — and the
+alarm is armed `-u` or `-l` to match. The armed epoch is logged in local
+wall-clock terms, which is what the requirement is written in.
+
+**V2 — a fixed 86400-second day.** Across a DST boundary that lands at 05:45 or
+07:45, not 06:45. The target is now the **next local calendar occurrence** of
+the wake time (`date -d "<today> <wake> tomorrow"`), and A18 asserts it by
+running the real script at a fixed instant on the night the clocks go back.
+
+**V3 — `SLEEP_END`'s shipped default, and the collision that turned out not to
+be one.** The acceptance promises that with absence detection disabled the
+existing schedule stands *completely* unchanged, and the morning wake is part of
+that schedule; SN-015 separately ratified 06:45 as the occupancy wake. Both now
+hold, from **one knob**: `SLEEP_END` is still the single value that is the RTC
+target, the wake timer and the on-period start, but its shipped DEFAULT is
+06:45 when `WALL_ABSENCE_ENABLED=true` and the unchanged **06:30** when it is
+false. The two paths are mutually exclusive by construction, so this is one name
+holding one value per boot rather than a second knob — and `wall.env.example`
+now ships `SLEEP_END` **commented out** so the default governs. Setting it
+explicitly pins both paths. **Flagged for the Owner** rather than silently
+picked: one line in each script collapses it back to a single 06:45 if that is
+what was meant.
+
+**The block's central rule was broken, and is now the decider's to enforce.**
+The absence clock was the shell's own bookkeeping ("absent, so start counting"),
+which counted straight *through* the on-period: absent from 12:00 and still away
+at 22:00 arrived at the boundary already carrying 600 minutes and suspended on
+the very first tick outside — the required hour **outside** the on-period never
+observed at all. `decide()` now returns `absence_clock` alongside the backlight
+and the power action, and it is CLEARED for every minute that is present or
+inside the on-period.
+
+**The other accepted findings, each with a test that fails without it.**
+
+* **A truncated absence clock read as decades of absence.** A `1` left by an
+  interrupted write is 1970, i.e. an immediate suspend. It is now written
+  **atomically** (temp file + rename) and **range-checked** on read
+  (`MIN_PLAUSIBLE_EPOCH`, plus a future-stamp bound); an unusable clock restarts
+  the timer rather than being believed or left in place to be rejected forever.
+* **`json.loads` accepts `NaN`** — and every comparison against NaN is false, so
+  a presence file stamped `"observedAt": NaN` passed the staleness check, passed
+  the skew check, and was believed when it said "absent". That inverts the whole
+  fail-safe direction. The parse now refuses the three non-finite constants, and
+  an in-range literal that overflows to infinity (`1e999`) is refused as well.
+* **A zero exit from `rtcwake` was taken as proof of an alarm.** Firmware or a
+  wrapper can return success and program nothing. The alarm is now **read back**
+  from `/sys/class/rtc/rtc0/wakealarm` (with the UTC-frame shift accounted for
+  when the RTC is local) and an unverifiable alarm degrades to backlight-off on
+  BOTH paths. The suite's fake could not previously express this failure — it
+  only recorded arguments — so the old "armed" assertion passed in exactly the
+  mode it was meant to catch; the fake now programs a fake RTC, and can lie.
+* **A missing or read-only backlight did not stop the suspend.** The decision
+  being applied is "nobody is here: go dark, THEN sleep", and `backlight_set`
+  now **reads the brightness back**. If the dark half did not happen the suspend
+  is refused: lit AND unreachable is the one outcome worth avoiding above all,
+  and a lit awake panel is something somebody can SSH into. The SCHEDULED path
+  is deliberately untouched by this — it never claimed to dim anything.
+
+**Both test-quality findings rewritten to assert the property, not the
+spelling.** A11 greped the literals `class/backlight` and `systemctl suspend`;
+it now scans **every** file in the wall tree (units included, comment lines
+stripped) for **any** mechanism that could dim a screen or sleep a machine, and
+counts the decider invocations at RUNTIME. A12 greped `wall.env.example` for
+alternative knob names; it now **moves** `SLEEP_END` to an unusual value and
+requires the same value to appear in both jobs in the same run, and separately
+requires that exactly two variables in the wall scripts hold a wall-clock time.
+Both mutants the review described — `loginctl suspend` elsewhere, a
+`WALL_ON_START` defaulted from `SLEEP_END` — now go red.
+
+**Tests.** `python scripts/check.py` **525 passed / 5 skipped** (baseline
+517/5); `scripts/trace.py --strict-integrity` **0, orphans 24** (= baseline);
+`check_flows.py --no-placeholders` **OK, 4 diagrams**;
+`occupancy-power.test.sh` **73 PASS / 0 FAIL** run standalone (was 42/0).
+`stack/run-hermetic-tests.sh` was **NOT run** — it refuses on this dev PC for
+want of `zstd` and `rsync`, reported as UNRUN, never as passing.
+**11 deliberate defects, 11 killed, no first-pass survivors** — and M1 (the RTC
+frame forced back to `-l`) was killed by the readback guard as well as by its
+own case, which is the cross-check the last round's lesson asked for.
+
+**Nothing live changed.** No panel or hub state touched, no unit installed, no
+service started. No apt package name added, so no apt export is owed.
+
+---
+
 **2026-09-09 cross-review fix round on BOTH feeders (B7 SR-021 + B11 SR-022) —
 verdict REJECT, all findings applied.** A different model family reviewed the
 usage feeder and the weight feeder together; the coordinator verified the two
@@ -6522,3 +6620,5 @@ started. No apt package name was added, so no apt export re-run is owed.
 **2026-09-09 — B11, the weight feeder (SR-022/LLR-006/TC-006/IF-014).** PARTIAL. Google Health API v4 verified as real and reachable by real calls (discovery revision 20260907; an unauthenticated GET on the weight dataPoints route returns 401 naming google.devicesandservices.health.v4.DataPointsService.ListDataPoints). NO PARSER WRITTEN - no authenticated call is possible until the Owner enables the API, adds googlehealth.health_metrics_and_measurements.readonly (there is no weight-specific scope, and that one also grants blood glucose, body fat and heart-rate metrics) to the existing OAuth client, and mints a refresh token at a browser. Everything not depending on that shipped: the gauge plumbing, the stale-never-green invariant, the definitions-resident goal, the token directory, 10 knobs, firstboot hook 6f and a fourth runtime flow. Found a NagLight dependency: internal/defsheet drops unknown columns, so on this sheet-synced household the goal would be erased by the first sync after a sheet edit. check.py 423 passed / 5 skipped (baseline 342/5, not the 341 the plan recorded); trace.py --strict-integrity 0, orphans 24 = baseline; check_flows --no-placeholders OK, 4 diagrams; run-hermetic-tests.sh UNRUN (missing zstd, rsync). 27 mutants, 26 killed.
 
 **2026-09-09 — B7+B11 cross-review fix round (REJECT, all findings applied).** Symlink-bypassable write guard (realpath + StateDirectory bound + O_EXCL/O_NOFOLLOW), redirect/proxy egress on all four HTTP call sites (feed_opener / vendor_opener), windowless-gauge and replayed-200 freshness, per-gauge failure isolation, state validated on load and on use, no remote body or exception message in the journal. Mirrored across both feeders with tests/test_feeder_egress_parity.py as the enforcement. check.py 517 passed / 5 skipped (baseline 423/5); trace --strict-integrity 0, orphans 24; check_flows OK, 4 diagrams; run-hermetic-tests.sh UNRUN. 28 mutants, 28 killed after two passes; the first pass had 7 survivors and every one was a test defect. No knob changed, no live state touched.
+
+**2026-09-09 — B9 cross-review fix round (REJECT, 10 findings, all applied).** The RTC frame established from timedatectl/adjtime instead of asserting `-l` (the panel would not have woken); the alarm targeted at the next local calendar occurrence instead of now+86400 (DST); `SLEEP_END` defaulted per path so the ratified 06:45 occupancy wake and the unchanged 06:30 schedule both hold from one knob (flagged for the Owner); the absence clock moved into the decision and cleared inside the on-period, so the hour is an hour spent OUTSIDE it; the clock written atomically and range-checked; NaN/Infinity refused in the presence file; the RTC alarm read back after arming; a failed backlight-off blocking the suspend. A11/A12 rewritten to assert properties rather than spellings. check.py 525 passed / 5 skipped (baseline 517/5); trace --strict-integrity 0, orphans 24; check_flows OK, 4 diagrams; occupancy-power.test.sh 73 PASS / 0 FAIL standalone; run-hermetic-tests.sh UNRUN (missing zstd, rsync). 11 mutants, 11 killed, no first-pass survivors. No live state touched, no apt package added.

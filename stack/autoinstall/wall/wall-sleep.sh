@@ -88,15 +88,33 @@ load_env_file() {
 load_env_file "$ENV_FILE"
 : "${SLEEP_MODE:=suspend}"
 : "${SLEEP_START:=22:00}"
-# 06:45 — ratified 2026-09-08 (SN-015), replacing 06:30. This ONE value is the
-# RTC alarm target AND the start of the on-period; do not introduce a second
-# knob for either job.
-: "${SLEEP_END:=06:45}"
 : "${SLEEP_RTC_WAKE:=true}"
 # ── occupancy knobs (SN-015/SR-020) ──────────────────────────────────────────
 # Default false: an image with no presence writer must behave exactly as it did
 # before this feature existed.
 : "${WALL_ABSENCE_ENABLED:=false}"
+# SLEEP_END — still ONE knob doing all three jobs (the RTC alarm target, the
+# morning wake timer, and the start of the on-period). What is path-dependent is
+# only its SHIPPED DEFAULT, and that is deliberate:
+#
+#   * SN-015 ratified 06:45 (2026-09-08) as the OCCUPANCY wake, so the occupancy
+#     path derives its wake and its on-period start from 06:45;
+#   * the same acceptance promises that with absence detection DISABLED the
+#     existing schedule stands COMPLETELY unchanged, and the morning wake is
+#     part of that schedule — so the schedule-only path keeps 06:30, the value
+#     it shipped with before this feature existed.
+#
+# The two paths are mutually exclusive (with detection on, SLEEP_START stops
+# suspending and hands over to the absence timer), so this is one name holding
+# one value per boot, NOT a second knob: whatever it resolves to still feeds the
+# alarm, the timer and the on-period from this single line. An operator who sets
+# SLEEP_END explicitly gets exactly that value on both paths.
+# Keep this block identical to wall-firstboot.sh's.
+if [ "$WALL_ABSENCE_ENABLED" = "true" ]; then
+    : "${SLEEP_END:=06:45}"
+else
+    : "${SLEEP_END:=06:30}"
+fi
 : "${WALL_ABSENCE_TIMEOUT_MIN:=60}"
 : "${WALL_PRESENCE_FILE:=/run/wall-presence/state.json}"
 
@@ -121,6 +139,11 @@ load_env_file "$ENV_FILE"
 # scribbling a 0 into an unrelated file.
 POWER_TEST_ROOT="${PANEL_POWER_TEST_ROOT:-}"
 BACKLIGHT_ROOT="${POWER_TEST_ROOT}/sys/class/backlight"
+# Read-only, and both are how the alarm is ESTABLISHED rather than assumed: the
+# RTC's own wakealarm node (so an armed alarm is read back rather than inferred
+# from an exit code) and hwclock's record of which frame that RTC keeps.
+RTC_ROOT="${POWER_TEST_ROOT}/sys/class/rtc"
+ADJTIME_FILE="${POWER_TEST_ROOT}/etc/adjtime"
 ABSENCE_STATE_DIR="${POWER_TEST_ROOT}/run/wall-occupancy"
 BACKLIGHT_PREV="${POWER_TEST_ROOT}/run/wall-backlight.prev"
 ABSENT_SINCE_FILE="$ABSENCE_STATE_DIR/absent-since"
@@ -145,8 +168,16 @@ backlight_dir() {
     done
     return 1
 }
+# backlight_set off|on — write the level and READ IT BACK.
+#
+# The readback is the point. A missing interface, a read-only sysfs node, a
+# firmware that accepts the write and ignores it: every one of those leaves the
+# screen lit while the exit code says otherwise, and the caller that matters
+# (run_occupancy, about to suspend) would then have suspended a panel that never
+# satisfied "backlight off when nobody is present". So this returns non-zero
+# unless `brightness` actually holds the value we asked for.
 backlight_set() {   # backlight_set off|on
-    local d cur max
+    local d cur max want got
     if ! d="$(backlight_dir)"; then
         log "WARNING: no writable $BACKLIGHT_ROOT/* — cannot change the backlight."
         log "WARNING: with SLEEP_MODE=backlight the panel will stay lit all night."
@@ -157,43 +188,178 @@ backlight_set() {   # backlight_set off|on
         # Remember the level so `on` restores what the user actually had.
         cur="$(cat "$d/brightness" 2>/dev/null || echo "$max")"
         printf '%s' "$cur" > "$BACKLIGHT_PREV" 2>/dev/null || true
-        echo 0 > "$d/brightness" 2>/dev/null && log "backlight off ($d)"
+        want=0
     else
         cur="$(cat "$BACKLIGHT_PREV" 2>/dev/null || echo "$max")"
         [ -n "$cur" ] || cur="$max"
-        echo "$cur" > "$d/brightness" 2>/dev/null && log "backlight on ($d, level $cur)"
+        want="$cur"
     fi
+    if ! echo "$want" > "$d/brightness" 2>/dev/null; then
+        log "WARNING: could not write $d/brightness (read-only? gone?) — the backlight is UNCHANGED."
+        return 1
+    fi
+    got="$(cat "$d/brightness" 2>/dev/null | tr -d '[:space:]')"
+    if [ "$got" != "$want" ]; then
+        log "WARNING: $d/brightness reads '$got' after asking for '$want' — the backlight did NOT change."
+        return 1
+    fi
+    log "backlight $1 ($d, level $want)"
+    return 0
+}
+
+# ── which frame does THIS box's RTC keep time in? ────────────────────────────
+# rtcwake converts the absolute epoch it is handed into the RTC's own
+# broken-down fields, so it must be told whether that hardware clock reads UTC
+# or local wall-clock time. Get it wrong and the alarm is programmed a whole UTC
+# offset away: in America/Chicago a 06:45 alarm becomes 00:45 or 12:45, and the
+# panel suspends and does NOT wake when it should — the worst outcome this
+# script has, because there is no battery, no UPS and no LAN presence while
+# asleep. So it is ESTABLISHED, in the order of authority, never asserted:
+#
+#   1. `timedatectl show -p LocalRTC` — systemd's own answer on a systemd box,
+#      and exactly what `timedatectl set-local-rtc` would have changed;
+#   2. /etc/adjtime's third line (LOCAL|UTC) — hwclock's record, which is what
+#      systemd derives that answer from and what util-linux itself consults;
+#   3. UTC. This image never runs `timedatectl set-local-rtc 1` and ships no
+#      /etc/adjtime, so a stock Ubuntu autoinstall leaves the RTC in UTC — the
+#      standard Linux configuration, and the one this panel is actually in.
+#
+# Returns 0 for LOCAL, 1 for UTC.
+rtc_is_local() {
+    local value
+    if command -v timedatectl >/dev/null 2>&1; then
+        value="$(timedatectl show -p LocalRTC --value 2>/dev/null || true)"
+        case "$value" in
+            yes|true|1) return 0 ;;
+            no|false|0) return 1 ;;
+        esac
+    fi
+    if [ -f "$ADJTIME_FILE" ]; then
+        value="$(sed -n '3p' "$ADJTIME_FILE" 2>/dev/null | tr -d '[:space:]')"
+        [ "$value" = "LOCAL" ] && return 0
+        [ "$value" = "UTC" ] && return 1
+    fi
+    return 1
+}
+
+# utc_offset_at EPOCH — the local UTC offset, in seconds, AT that instant.
+# "At that instant" matters: the offset on the far side of a DST boundary is not
+# the offset now.
+utc_offset_at() {
+    local z sign hh mm
+    z="$(date -d "@$1" +%z 2>/dev/null || echo "")"
+    case "$z" in [+-][0-9][0-9][0-9][0-9]) ;; *) return 1 ;; esac
+    sign="${z:0:1}"; hh="${z:1:2}"; mm="${z:3:2}"
+    printf '%s' "$(( ${sign}1 * (10#$hh * 3600 + 10#$mm * 60) ))"
+}
+
+# next_wake_epoch HH:MM — the epoch of the NEXT LOCAL OCCURRENCE of that
+# wall-clock time.
+#
+# Not "now + 86400". A fixed day of seconds is only a day when the offset does
+# not move: on the night the clocks change it lands an hour early or an hour
+# late (05:45 or 07:45 for a 06:45 wake), which for a panel that must be awake
+# before the office is is a real miss. Stepping the CALENDAR DAY and re-reading
+# the wall-clock time is what makes the alarm a wall-clock promise instead of a
+# duration.
+next_wake_epoch() {
+    local wake="$1" today target now
+    now="$(date +%s)"
+    today="$(date +%F)"
+    target="$(date -d "$today $wake" +%s 2>/dev/null || echo "")"
+    [ -n "$target" ] || return 1
+    case "$target" in ''|*[!0-9]*) return 1 ;; esac
+    if [ "$target" -le "$now" ]; then
+        target="$(date -d "$today $wake tomorrow" +%s 2>/dev/null || echo "")"
+        [ -n "$target" ] || return 1
+        case "$target" in ''|*[!0-9]*) return 1 ;; esac
+    fi
+    printf '%s' "$target"
+}
+
+# rtc_alarm_ok TARGET — READ THE ALARM BACK, because a zero exit is not evidence.
+#
+# rtcwake returning 0 says a call succeeded, not that an alarm exists: firmware,
+# a wrapper, a container shim or a driver that quietly ignores the ioctl can all
+# report success and program nothing at all. The panel would then suspend with
+# no way back, which is the single failure this whole script is arranged to make
+# impossible. So the alarm is verified against the kernel's own view of it.
+#
+# The kernel exposes wakealarm as seconds-since-epoch computed AS IF the RTC
+# were UTC. When the RTC is in LOCAL time the readback is therefore shifted by
+# exactly the local UTC offset — the same shift rtcwake applied when writing it
+# — so the EXPECTATION is shifted with it rather than the check being loosened.
+rtc_alarm_ok() {
+    local target="$1" node="" candidate raw expected off drift
+    for candidate in "$RTC_ROOT/rtc0/wakealarm" "$RTC_ROOT"/rtc*/wakealarm; do
+        [ -r "$candidate" ] && { node="$candidate"; break; }
+    done
+    if [ -z "$node" ]; then
+        log "WARNING: no readable wakealarm under $RTC_ROOT — the armed alarm cannot be VERIFIED."
+        return 1
+    fi
+    raw="$(cat "$node" 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "$raw" ] || [ "$raw" = "0" ]; then
+        log "WARNING: rtcwake reported success but $node is empty — NO alarm is programmed."
+        return 1
+    fi
+    case "$raw" in *[!0-9]*) log "WARNING: $node reads '$raw', which is not an epoch"; return 1 ;; esac
+    expected="$target"
+    if rtc_is_local; then
+        off="$(utc_offset_at "$target")" || off=0
+        expected=$((target + off))
+    fi
+    drift=$((raw - expected)); [ "$drift" -lt 0 ] && drift=$(( - drift ))
+    if [ "$drift" -gt 90 ]; then
+        log "WARNING: the RTC alarm reads back as $raw, ${drift}s away from the $expected asked for."
+        return 1
+    fi
+    return 0
 }
 
 # ── arm the RTC alarm for the next occurrence of SLEEP_END ───────────────────
 # `rtcwake -m no` sets the alarm WITHOUT suspending, which is what lets us arm
-# first and suspend as a separate, verifiable step. `-l` says the RTC is in local
-# time; getting that wrong is a wake at the wrong hour, not a failure, so it is
-# worth stating explicitly rather than relying on the default.
+# first and suspend as a separate, VERIFIED step.
 # arm_rtc [HH:MM] — arm for the given wall-clock time, defaulting to SLEEP_END.
 # The occupancy path passes the RTC_WAKE the decision reported, so the alarm is
 # armed from the SAME value that defined the on-period rather than from a second
 # read of the knob.
+#
+# Returns 0 only when an alarm has been armed AND read back. Every other outcome
+# is a 1, and the caller's answer to a 1 is to stay awake.
 arm_rtc() {
-    local wake="${1:-$SLEEP_END}" target now
-    now="$(date +%s)"
-    target="$(date -d "today $wake" +%s 2>/dev/null || echo "")"
-    if [ -z "$target" ]; then
+    local wake="${1:-$SLEEP_END}" target frame flag
+    if ! target="$(next_wake_epoch "$wake")"; then
         log "WARNING: wake time '$wake' is not a time date(1) understands — NOT arming the RTC"
         return 1
     fi
-    # The wake time is normally the next morning, i.e. already past for "today".
-    [ "$target" -le "$now" ] && target=$((target + 86400))
-    if command -v rtcwake >/dev/null 2>&1; then
-        if rtcwake -m no -l -t "$target" >/dev/null 2>&1; then
-            log "RTC alarm armed for $(date -d "@$target" '+%F %T') (primary wake)"
-            return 0
-        fi
-        log "WARNING: rtcwake failed to arm the alarm"
-    else
+    if ! command -v rtcwake >/dev/null 2>&1; then
         log "WARNING: rtcwake not installed (util-linux) — cannot arm the primary wake"
+        return 1
     fi
-    return 1
+    if rtc_is_local; then frame="LOCAL"; flag="-l"; else frame="UTC"; flag="-u"; fi
+    if ! rtcwake -m no "$flag" -t "$target" >/dev/null 2>&1; then
+        log "WARNING: rtcwake failed to arm the alarm"
+        return 1
+    fi
+    if ! rtc_alarm_ok "$target"; then
+        log "WARNING: rtcwake exited 0 but no alarm could be verified — treating the"
+        log "WARNING: morning wake as UNAVAILABLE rather than assuming it exists."
+        return 1
+    fi
+    # ASSERTED in local terms, because local wall-clock is what the requirement
+    # is written in and what the Owner reads off the journal. The one case where
+    # these can honestly differ is a wake time inside the hour a spring-forward
+    # skips, which has no local instant at all — so it is said out loud rather
+    # than refused, once a year, with the alarm at the nearest real instant.
+    if [ "$(date -d "@$target" +%H:%M)" != "$wake" ]; then
+        log "WARNING: the armed alarm reads back as $(date -d "@$target" +%H:%M) local, not the"
+        log "WARNING: $wake requested — a DST-skipped hour, or a wake time date(1) read loosely."
+    fi
+    # Stated in LOCAL terms, because local wall-clock is what the requirement is
+    # written in and what the Owner reads off the journal.
+    log "RTC alarm armed for $(date -d "@$target" '+%F %H:%M %Z') — local wall-clock $(date -d "@$target" +%H:%M), requested $wake, RTC frame $frame (primary wake)"
+    return 0
 }
 
 # ── suspend, with SN-013's fail-safe in ONE place ────────────────────────────
@@ -225,14 +391,39 @@ suspend_now() {
     systemctl suspend || log "WARNING: systemctl suspend failed — the panel stays awake"
 }
 
+# write_absent_since EPOCH — record the absence start ATOMICALLY.
+#
+# A half-written clock is not a harmless glitch: a `1` left behind by a write
+# interrupted at the wrong instant reads as 1970, i.e. five decades of absence,
+# and the very next tick outside the on-period suspends the panel. So the value
+# lands in a temp file in the same directory and is renamed over the target,
+# which is atomic on the same filesystem — a reader sees either the old clock or
+# the new one, never a prefix of one. (The decider range-checks it as well; this
+# is the write half of the same guard.)
+write_absent_since() {
+    local tmp="$ABSENT_SINCE_FILE.$$"
+    if ! printf '%s\n' "$1" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null || true
+        log "WARNING: cannot write the absence clock — the absence timer will keep restarting."
+        return 1
+    fi
+    if ! mv -f "$tmp" "$ABSENT_SINCE_FILE" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null || true
+        log "WARNING: cannot replace the absence clock — the absence timer will keep restarting."
+        return 1
+    fi
+    return 0
+}
+
 # ── the occupancy evaluation (SN-015/SR-020) ─────────────────────────────────
 # ONE call to the decider, ONE record applied. Read this and note what is NOT
 # here: there is no `if present` around the backlight write and no second
 # `if absent` around the suspend. Both come out of $BACKLIGHT and $POWER, which
 # came out of the same invocation, so they cannot disagree.
 run_occupancy() {
-    local now minute out line k v
+    local now minute out line k v backlight_failed=
     local PRESENCE= BACKLIGHT= POWER= ON_PERIOD= RTC_WAKE= REASON= PRESENCE_REASON=
+    local ABSENCE_CLOCK= CLOCK_REASON=
 
     if [ ! -f "$DECIDER" ]; then
         log "WARNING: $DECIDER is missing — occupancy cannot decide anything."
@@ -260,31 +451,63 @@ run_occupancy() {
         line=${line%$CR}
         k=${line%%=*}; v=${line#*=}
         case "$k" in
-            PRESENCE|BACKLIGHT|POWER|ON_PERIOD|RTC_WAKE|REASON|PRESENCE_REASON)
+            PRESENCE|BACKLIGHT|POWER|ON_PERIOD|RTC_WAKE|REASON|PRESENCE_REASON|ABSENCE_CLOCK|CLOCK_REASON)
                 printf -v "$k" '%s' "$v" ;;
         esac
     done <<EOF
 $out
 EOF
 
-    # The absence clock is bookkeeping, not a second decision: it only records
-    # WHEN the current absence began so the next evaluation can measure it.
-    if [ "$PRESENCE" = "absent" ]; then
-        [ -f "$ABSENT_SINCE_FILE" ] || printf '%s' "$now" > "$ABSENT_SINCE_FILE" 2>/dev/null || true
-    else
-        rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
-    fi
+    # The absence clock is bookkeeping, and — like the backlight and the power
+    # action — it is bookkeeping the DECIDER dictates. What the shell must not do
+    # is run the clock on its own rule: "absent, so start counting" would keep
+    # counting straight through the on-period, and an absence that began at
+    # midday would then arrive at 22:00 already carrying ten hours and suspend on
+    # the first tick outside — the hour OUTSIDE the on-period, which is the whole
+    # rule, never observed. ABSENCE_CLOCK says start, clear, or leave it alone.
+    #
+    # An unrecognised or empty value (an older decider) is deliberately the
+    # do-nothing arm: a clock that never starts is a panel that never suspends.
+    case "$ABSENCE_CLOCK" in
+        start)   [ -f "$ABSENT_SINCE_FILE" ] || write_absent_since "$now" ;;
+        # "restart" and not "start": the file may EXIST and still be unusable —
+        # a truncated "1", a stamp from the future — and leaving it in place
+        # would mean the decider rejects it again on every tick while the panel
+        # never accumulates any absence at all. It is replaced with now.
+        restart) write_absent_since "$now" ;;
+        clear)   rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true ;;
+        *)       : ;;
+    esac
 
-    log "occupancy: presence=$PRESENCE on_period=$ON_PERIOD backlight=$BACKLIGHT power=$POWER"
+    log "occupancy: presence=$PRESENCE on_period=$ON_PERIOD backlight=$BACKLIGHT power=$POWER clock=$ABSENCE_CLOCK"
+    [ -n "$CLOCK_REASON" ] && log "occupancy: $CLOCK_REASON"
     log "occupancy: $PRESENCE_REASON"
     log "occupancy: $REASON"
 
     case "$BACKLIGHT" in
-        on)  backlight_set on ;;
-        off) backlight_set off ;;
+        on)  backlight_set on || log "WARNING: the screen could not be lit — see above." ;;
+        off) backlight_set off || backlight_failed=1 ;;
         *)   : ;;   # "unchanged" — absence detection is off; touch nothing.
     esac
     if [ "$POWER" = "suspend" ]; then
+        # THE BACKLIGHT IS A PRECONDITION OF THIS SUSPEND, not a cosmetic step
+        # beside it. The decision being applied is "nobody is here: go dark, then
+        # sleep", and SR-020 states the dark half as a requirement. If the node is
+        # missing or read-only the dark half did not happen, and suspending anyway
+        # would take the panel off the LAN having satisfied neither half — the one
+        # combination that is both wrong and unreachable. Staying awake with a lit
+        # screen is a visible nuisance somebody can SSH into and fix, so that is
+        # the direction this fails in.
+        #
+        # Note the asymmetry, and it is deliberate: the SCHEDULED path below is
+        # untouched by this: it never claimed to dim anything, and its behaviour
+        # with absence detection off must stay exactly what it was.
+        if [ -n "$backlight_failed" ]; then
+            log "WARNING: the decision was backlight-off THEN suspend, but the backlight"
+            log "WARNING: could not be turned off. NOT suspending: a panel that sleeps"
+            log "WARNING: without having gone dark is unreachable AND still lit."
+            return 0
+        fi
         if [ "$SLEEP_MODE" = "suspend" ]; then
             suspend_now "$RTC_WAKE"
         else

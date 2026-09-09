@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 # The three presence values this module understands, after normalisation.
@@ -56,6 +57,88 @@ PRESENCE_SCHEMA_VERSION = 1
 # stuck sensor that pins it ASLEEP would not be, so the skew is bounded either
 # way and an over-skewed reading is discarded (i.e. read as PRESENT).
 MAX_CLOCK_SKEW_MS = 120_000
+
+# The floor below which an "absence started at" epoch is not a timestamp at all.
+# 1_600_000_000 is 2020-09-13, years before this image existed, so no honest
+# reading can be under it. The value this exists to reject is a TRUNCATED one:
+# a `1` left behind by an interrupted or non-atomic write reads as 1970 and
+# therefore as five decades of absence, which is an IMMEDIATE suspend the first
+# time the panel steps outside the on-period. The absence clock is the only
+# input that can put the panel to sleep, so it is range-checked rather than
+# trusted to be well-formed.
+MIN_PLAUSIBLE_EPOCH = 1_600_000_000
+
+
+def _reject_non_finite(token):
+    """`json.loads`'s hook for the three constants JSON itself does not define.
+
+    Contract:
+      Inputs:  token: str — "NaN", "Infinity" or "-Infinity"
+      Outputs: never returns
+      Raises:  ValueError, always
+
+    Python's `json.loads` accepts all three by default, and a NaN is the one
+    value that defeats EVERY freshness check at once: every comparison against
+    NaN is false, so `age_ms > ttl_ms` is false, `age_ms < -skew` is false, and
+    a reading with `"observedAt": NaN` sails through as fresh. A file that then
+    says "absent" would be believed, which inverts this module's whole fail-safe
+    direction. So the parse fails and the caller reads PRESENT.
+
+    Implements: SR-020, LLR-003
+    """
+    raise ValueError("non-finite JSON constant: {}".format(token))
+
+
+def _finite_number(value):
+    """Is this a real, finite number — not a bool, not NaN, not an infinity?
+
+    Contract:
+      Inputs:  value: anything
+      Outputs: bool
+
+    `_reject_non_finite` stops the literal `NaN`/`Infinity` tokens; this stops
+    the other door into the same failure, an in-range literal that OVERFLOWS to
+    infinity on parse (`1e999` is a perfectly legal JSON number and becomes
+    `inf`). Both roads end at a comparison that cannot be false.
+
+    Implements: SR-020, LLR-003
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def parse_absent_since(text, now_epoch):
+    """Turn the absence clock's file contents into a trustworthy epoch, or None.
+
+    Contract:
+      Inputs:  text: str — the raw contents of the absence clock file
+               now_epoch: int — seconds
+      Outputs: (absent_since, reason) — absent_since is int|None, and None
+               means "no usable absence start", which restarts the timer.
+      Raises:  nothing.
+
+    None is the SAFE answer: `decide()` treats it as an absence that has not yet
+    lasted any measurable time, so the panel stays awake for a full timeout.
+    That is why every doubtful reading is turned into None rather than into a
+    best guess.
+
+    Implements: SR-020, LLR-003
+    """
+    raw = str(text).strip()
+    if not raw:
+        return None, "no absence start recorded"
+    if not raw.isdigit():
+        return None, "absence clock is not an epoch ({!r}) — restarting it".format(raw[:32])
+    value = int(raw)
+    if value < MIN_PLAUSIBLE_EPOCH:
+        return None, (
+            "absence clock reads {} — too small to be a timestamp (a truncated "
+            "write); restarting it rather than believing decades of absence".format(value)
+        )
+    if value > now_epoch + MAX_CLOCK_SKEW_MS // 1000:
+        return None, "absence clock is in the future ({}) — restarting it".format(value)
+    return value, ""
 
 
 # ── times ────────────────────────────────────────────────────────────────────
@@ -155,8 +238,10 @@ def read_presence(path, now_ms):
         return PRESENT, "presence file unreadable ({})".format(error)
 
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw, parse_constant=_reject_non_finite)
     except ValueError:
+        # Includes the NaN/Infinity rejection above: a presence file carrying a
+        # non-finite number is not a fresh reading, it is a broken one.
         return PRESENT, "presence file is not valid JSON"
     if not isinstance(payload, dict):
         return PRESENT, "presence file is not a JSON object"
@@ -164,10 +249,10 @@ def read_presence(path, now_ms):
         return PRESENT, "presence file schemaVersion is not {}".format(PRESENCE_SCHEMA_VERSION)
 
     observed_at, ttl_ms = payload.get("observedAt"), payload.get("ttlMs")
-    if not isinstance(observed_at, (int, float)) or isinstance(observed_at, bool):
-        return PRESENT, "presence file has no numeric observedAt"
-    if not isinstance(ttl_ms, (int, float)) or isinstance(ttl_ms, bool) or ttl_ms <= 0:
-        return PRESENT, "presence file has no positive ttlMs"
+    if not _finite_number(observed_at):
+        return PRESENT, "presence file has no finite numeric observedAt"
+    if not _finite_number(ttl_ms) or ttl_ms <= 0:
+        return PRESENT, "presence file has no positive finite ttlMs"
     age_ms = now_ms - observed_at
     if age_ms < -MAX_CLOCK_SKEW_MS:
         return PRESENT, "presence reading is stamped in the future (clock skew)"
@@ -211,10 +296,11 @@ def decide(
                          RTC wake time. ONE value, three jobs, by SN-015.
                on_end:   int — minutes; the on-period end == SLEEP_START
       Outputs: dict {
-                 "backlight": "on" | "off" | "unchanged",
-                 "power":     "stay" | "suspend",
-                 "on_period": bool,
-                 "reason":    str,
+                 "backlight":     "on" | "off" | "unchanged",
+                 "power":         "stay" | "suspend",
+                 "on_period":     bool,
+                 "absence_clock": "start" | "restart" | "clear" | "untouched",
+                 "reason":        str,
                }
       Raises:  nothing.
 
@@ -234,6 +320,22 @@ def decide(
          inside the on-period never suspends" a property of this function
          rather than an ordering accident in the caller.
 
+    THE HOUR IS AN HOUR SPENT OUTSIDE THE ON-PERIOD, and this record says so by
+    also naming what to do with the absence clock. The rule the block exists to
+    enforce is "absence_timeout_min of absence OUTSIDE the on-period", so an
+    absence that BEGAN inside it must not carry its elapsed time across the
+    boundary: somebody who left at 12:00 and is still away at 22:00 would
+    otherwise present the decider with 600 minutes the moment the on-period
+    closed, and the panel would suspend on the very first tick outside it, with
+    the required hour outside never observed at all. So the clock is CLEARED
+    for every minute that is present or inside the on-period, and only STARTED
+    once absence and "outside" hold together. The caller owns the file; this
+    function decides what happens to it, as it decides everything else here:
+    "clear" removes it, "start" leaves a usable clock running, and "restart"
+    replaces whatever is there with now — which is what a MISSING clock and an
+    UNUSABLE one (a truncated write, a future stamp) both need, and the reason
+    they are one word rather than two.
+
     An ABSENT with no recorded absent_since cannot have lasted an hour, so it
     stays awake — the recording is on tmpfs and a reboot therefore restarts the
     clock, which is exactly the behaviour SN-013's mains-blip case wants.
@@ -247,6 +349,7 @@ def decide(
             "backlight": "unchanged",
             "power": "stay",
             "on_period": on_period,
+            "absence_clock": "untouched",
             "reason": "absence detection disabled — the SLEEP_START schedule is unchanged",
         }
 
@@ -255,6 +358,7 @@ def decide(
             "backlight": "on",
             "power": "stay",
             "on_period": on_period,
+            "absence_clock": "clear",
             "reason": "present — the panel never suspends while somebody is here",
         }
 
@@ -263,17 +367,24 @@ def decide(
             "backlight": "off",
             "power": "stay",
             "on_period": True,
+            "absence_clock": "clear",
             "reason": "absent inside the on-period — backlight off only, so a walk-in "
-            "needs no resume",
+            "needs no resume; the absence clock does NOT run in here, so the hour a "
+            "suspend needs is an hour spent OUTSIDE the on-period",
         }
 
-    if absent_since is None:
+    if absent_since is None or absent_since > now_epoch:
+        # The second half of that test is the belt to parse_absent_since's
+        # braces: a clock stamped in the future yields a NEGATIVE age, which is
+        # not a suspend today but is nonsense arriving at a decision that can
+        # suspend, so it restarts the timer instead.
         return {
             "backlight": "off",
             "power": "stay",
             "on_period": False,
-            "reason": "absent outside the on-period, but no absence start is recorded — "
-            "the timer starts now",
+            "absence_clock": "restart",
+            "reason": "absent outside the on-period, but no usable absence start is "
+            "recorded — the timer starts now",
         }
 
     absent_minutes = (now_epoch - absent_since) / 60.0
@@ -282,6 +393,7 @@ def decide(
             "backlight": "off",
             "power": "stay",
             "on_period": False,
+            "absence_clock": "start",
             "reason": "absent {:.0f} of {} min outside the on-period".format(
                 absent_minutes, absence_timeout_min
             ),
@@ -291,6 +403,7 @@ def decide(
         "backlight": "off",
         "power": "suspend",
         "on_period": False,
+        "absence_clock": "start",
         "reason": "absent {:.0f} min (>= {}) outside the on-period — suspend, RTC wake at "
         "the on-period start".format(absent_minutes, absence_timeout_min),
     }
@@ -339,7 +452,7 @@ def main(argv=None):
         return 2
 
     presence, presence_reason = read_presence(args.presence_file, args.now_epoch * 1000)
-    absent_since = int(args.absent_since) if str(args.absent_since).strip().isdigit() else None
+    absent_since, clock_reason = parse_absent_since(args.absent_since, args.now_epoch)
 
     result = decide(
         now_epoch=args.now_epoch,
@@ -356,6 +469,11 @@ def main(argv=None):
     print("BACKLIGHT={}".format(result["backlight"]))
     print("POWER={}".format(result["power"]))
     print("ON_PERIOD={}".format("true" if result["on_period"] else "false"))
+    # What the caller must do with the absence clock. It travels WITH the
+    # decision for the same reason the backlight and the power action do: the
+    # clock is the one input that makes a suspend reachable, so a shell that
+    # managed it on its own rules would be a second decider.
+    print("ABSENCE_CLOCK={}".format(result["absence_clock"]))
     # The RTC wake time and the on-period start are THE SAME KNOB (SLEEP_END).
     # It is echoed here so the applying shell arms the alarm from the decision
     # it is applying, rather than re-reading the knob and possibly a different
@@ -363,6 +481,8 @@ def main(argv=None):
     print("RTC_WAKE={}".format(args.on_start))
     print("PRESENCE_REASON={}".format(presence_reason))
     print("REASON={}".format(result["reason"]))
+    if clock_reason:
+        print("CLOCK_REASON={}".format(clock_reason))
     return 0
 
 

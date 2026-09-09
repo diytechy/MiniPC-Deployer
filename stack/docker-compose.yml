@@ -330,8 +330,41 @@ services:
       # already does, so the file would add a mechanism without changing the
       # box's actual exposure. Revisit together with the others, not alone.
       TRACKER_MIRROR_TOKEN: ${TRACKER_MIRROR_TOKEN}
+      # ── Drive/Sheet config sync (optional; OFF unless fully configured) ──────
+      # Deployed and connected 2026-09-08. Lived only on the running box until
+      # this block landed here, which meant a reimage would have silently
+      # dropped the whole integration — /opt/homehub is not the source of truth.
+      #
+      # THE SAME GOOGLE CLIENT oauth2-proxy uses, referenced through the SAME
+      # keys rather than copied: a second copy of the secret would be a second
+      # thing to rotate and the two would drift silently. The console must list
+      # https://<TRACKER_SUBDOMAIN>.<DOMAIN>/api/drive/callback as a redirect URI
+      # ALONGSIDE the existing /oauth2/callback — adding it must not replace it,
+      # or Google sign-in breaks for everyone.
+      TRACKER_DRIVE_CLIENT_ID: ${OAUTH2_PROXY_CLIENT_ID}
+      TRACKER_DRIVE_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET}
+      TRACKER_PUBLIC_URL: https://${TRACKER_SUBDOMAIN}.${DOMAIN}
+      # MUST NOT BE INSIDE DATA_DIR, and its own volume is the enforcement: the
+      # traceability mirror above runs `git add -A` over /data and pushes hourly,
+      # so a refresh token under /data would be committed and pushed off the box.
+      # NagLight refuses such a path, symlinks included.
+      TRACKER_DRIVE_TOKEN_DIR: /drive-tokens
+      # multi-user: the ONE identity the sync runs for. WITHOUT IT the sync stays
+      # OFF and only connect/callback work — the tracker refuses to guess, because
+      # syncing the wrong person's sheet would overwrite someone else's
+      # definitions. Same shape and reasoning as TRACKER_MIRROR_USER above.
+      TRACKER_DRIVE_USER: ${TRACKER_DRIVE_USER}
+      # The sheet `tracker seed-sheet` created. Blank until seeded.
+      TRACKER_DRIVE_SHEET_ID: ${TRACKER_DRIVE_SHEET_ID}
+      # A folder source INSTEAD of a sheet. Normally blank. `root` is accepted
+      # only as a bootstrap parent and is REFUSED as a sync source by NagLight:
+      # applyFolder would promote every *.md it can see at the top of the Drive
+      # as the household's complete definition set.
+      TRACKER_DRIVE_FOLDER_ID: ${TRACKER_DRIVE_FOLDER_ID}
     volumes:
       - tracker_data:/data
+      # Drive refresh token — a SEPARATE volume so it cannot land under /data.
+      - tracker_drive_tokens:/drive-tokens
       # Read-only, and inert unless TRACKER_SEED_DIR names it. The default
       # source (./tracker-seed) ships with no definitions/ subdirectory, so
       # mounting it can seed nothing even if the env var is set by mistake.
@@ -1121,6 +1154,7 @@ volumes:
   caddy_data:
   caddy_config:
   tracker_data:
+  tracker_drive_tokens:
   actual_data:
   uptimekuma_data:
   ntfy_data:

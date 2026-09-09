@@ -5687,3 +5687,23 @@ every site block: `actual` and `dns` fail closed on `@lan remote_ip`, `wall` is 
 carrying the whole load, which is why the above had to be fixed first. Adding a
 `@lan` gate to `tracker` was considered and rejected: it would mask the defect and
 would have to be removed on exposure.
+
+## Audit — 2026-09-08 (later still) the Drive config existed only on the running box
+
+Porting the tracker's Drive block into `stack/docker-compose.yml` and
+`stack/.env.example`. It had been added directly to `/opt/homehub` when the
+integration was deployed and never landed here, so **a reimage would have
+silently dropped the whole integration** — the token-dir volume included, which
+is the part that keeps a refresh token out of the hourly GitHub mirror. Found by
+grepping this repo for a knob that was being added to the deployed stack; the
+same `/opt/homehub` drift the oauth2-proxy fix ran into earlier, in the same
+direction.
+
+Adds `TRACKER_DRIVE_USER`, the one identity the sync runs for in multi-user
+mode. Blank means the sync stays off and only connect/callback work: the tracker
+will not guess which household member's sheet to apply, because applying the
+wrong one overwrites another person's definitions. Same shape and reasoning as
+`TRACKER_MIRROR_USER`.
+
+`docker compose --env-file .env.example config tracker` renders with Drive fully
+off (no source, no user), which is the correct default for a clone.

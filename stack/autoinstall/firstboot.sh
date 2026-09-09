@@ -1865,6 +1865,44 @@ if [ "${AI_USAGE_ENABLED:-false}" = "true" ]; then
     fi
 fi
 
+
+# ── 6f. the weight feeder (SR-022, SN-040) ─────────────────
+# A plain service on a timer, no container, OFF by default. Unlike 6e it
+# CREATES its own account: the Google Health refresh token is minted for this
+# purpose, so it gets a home with nothing else in it rather than sharing the AI
+# CLIs'.
+#
+# THE SCRIPT DOES THE REFUSING, NOT THIS BLOCK: a blank WEIGHT_USER is a
+# refusal, and so is a blank WEIGHT_DEFINITIONS_DIR - the goal lives in the
+# user's own definitions (SN-040) and there is no hub knob to fall back on, so
+# a box that cannot find them has no goal and posts nothing at all.
+if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
+    log "provisioning the weight feeder (activated by .env)…"
+    if [ -f "$STACK_DIR/weight/setup-weight.sh" ]; then
+        if bash "$STACK_DIR/weight/setup-weight.sh" 2>&1 | sed 's/^/  /'; then
+            log "  weight feeder installed; timer runs every 15 minutes"
+            log "  STILL OWED BY A HUMAN - the vendor half is BLOCKED until it is"
+            log "  done, and until then the gauge correctly reads 'unavailable':"
+            log "    1. enable health.googleapis.com on the Cloud project that owns"
+            log "       the existing OAuth client;"
+            log "    2. add googlehealth.health_metrics_and_measurements.readonly to"
+            log "       that client's consent screen - NOTE that scope also grants"
+            log "       blood glucose, body fat and heart-rate metrics, there is no"
+            log "       weight-only scope - and the Owner to its Test users;"
+            log "    3. consent in a browser and mint a refresh token into"
+            log "       WEIGHT_TOKEN_FILE."
+        else
+            log "  WARNING: setup-weight.sh refused or failed - this box posts NO"
+            log "    weight gauge. Everything else is unaffected. The reason is in the"
+            log "    lines above; re-run by hand once fixed:"
+            log "      sudo bash $STACK_DIR/weight/setup-weight.sh"
+        fi
+    else
+        log "  WARNING: WEIGHT_ENABLED=true but no $STACK_DIR/weight/setup-weight.sh"
+        log "    on the payload - carriage missing for an activated feature."
+    fi
+fi
+
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
 # A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO

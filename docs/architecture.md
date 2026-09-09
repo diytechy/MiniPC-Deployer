@@ -202,6 +202,57 @@ sequenceDiagram
     Note over S: open_for_write refuses every other path,<br/>so no vendor credential file can be written
 ```
 
+### One weight cycle: where the goal comes from, and the two different refusals (SR-022, LLR-006, IF-014)
+
+The registry rows make this look like the AI-usage cycle with one source
+instead of three. It is not, and the difference is the whole block. TWO things
+can be missing here, they are not the same kind of missing, and they must not
+produce the same outcome. A missing SOURCE posts an unavailable gauge, because
+the panel has to say "we do not know what you weigh" rather than leave a hole
+where a bar belongs. A missing GOAL posts NOTHING, because the target line IS
+the goal — NagLight refuses a gauge without a target, and the only way to
+satisfy it would be to invent one and then colour a real body weight green or
+red against a number nobody chose.
+
+The second thing worth reading as a diagram is where the goal comes from: NOT
+from this box. It is read out of the user's own definitions, the same files the
+Drive sync keeps in step, which is what NagLight's weight-goal need means by "so it syncs like
+everything else".
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as systemd timer (15 min)
+    participant W as weight_feeder (SR-022)
+    participant D as the user's definitions/ (read-only bind)
+    participant G as Google Health v4 (BLOCKED - no token)
+    participant S as state file (the ONE writable path)
+    participant N as NagLight /api/feed (IF-014)
+
+    T->>W: start (oneshot, as its own dedicated account)
+    W->>W: resolve_enabled / resolve_identity / resolve_feed_url
+    Note over W: a blank identity or an off-box destination<br/>REFUSES here - it never defaults
+    W->>D: read weight_goal_lb from the frontmatter
+    alt no goal declared
+        D--xW: GoalMissing
+        W->>W: exit 2, naming the file to put it in
+        Note over N: NOTHING IS POSTED. The target line IS the goal;<br/>inventing one would draw a 50 lb bar<br/>around a number nobody chose
+    else goal 180 lb
+        D-->>W: 180
+        W->>G: GET /v4/users/me/dataTypes/weight/dataPoints
+        G--xW: SourceFailure - no token minted, and NO PARSER EXISTS<br/>until one real body has been observed
+        W->>S: read the last-known reading
+        alt a previous reading exists
+            S-->>W: 191.4 lb, observed_at = when it was TRUE
+            W->>N: value 191.4, target 180, that ORIGINAL stamp
+        else nothing has ever been read
+            W->>N: value 0, target 180, NO observed_at at all
+        end
+        Note over N: stale by NagLight's own static 7-day horizon -><br/>"unavailable", never a green gauge.<br/>The 0 is unreachable as a displayed reading
+        W->>S: NOT written - a failed read must not decay the stamp
+    end
+```
+
 ### One `/v1/ask` request, and every refusal on the way (SR-019, LLR-002, LLR-004, IF-011)
 
 The four containments A40 ratified are **refusals in the request path**, not

@@ -1,0 +1,30 @@
+[Unit]
+Description=Run the HomeHub weight feeder (SR-022)
+Documentation=file:///opt/homehub/stack/weight/README.md
+
+[Timer]
+# THE CADENCE IS SET BY NAGLIGHT'S STALENESS HORIZON, NOT BY TASTE — and here
+# the horizon is the LOOSEST one, which is why the interval matters more rather
+# than less. The weight gauge carries no window (a goal is a standing line), so
+# its kind is `static` and NagLight's horizon is SEVEN DAYS. Left to that alone,
+# a feeder that died on Monday would keep the panel showing Monday's number,
+# green, until the following Monday.
+#
+# The interval is therefore set far below it: 15 minutes is 1/672nd of the
+# horizon. That does NOT make a stale reading look fresh — `observed_at` is
+# when the person stepped on the scale, not when we asked — it means the panel
+# learns quickly that the SOURCE has gone away, and that a new weigh-in appears
+# within the quarter-hour rather than the day.
+#
+# tests/test_weight_feeder.py reads THIS LINE and fails if the interval is ever
+# loosened past a quarter of the static horizon, so the relationship is
+# enforced rather than remembered.
+OnBootSec=5min
+OnUnitActiveSec=15m
+# Do not stampede a vendor API from every box at the same second.
+RandomizedDelaySec=120
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

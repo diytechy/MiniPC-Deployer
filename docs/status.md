@@ -8,6 +8,135 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 the weight feeder (B11, SR-022/LLR-006/TC-006/IF-014) — PARTIAL,
+and the blocked half is a finding, not a gap.** The hub gains a third plain
+service — no container, on a 15-minute timer — that posts one body-weight gauge
+to NagLight under the same id B5's manual `feeders/weight-manual.ps1` uses, so
+it REPLACES that feed by upsert rather than standing a second bar beside it. It
+ships **OFF** (`WEIGHT_ENABLED=false`) and declares no credential.
+
+**THE API IS REAL, AND THE ONE REAL CALL WAS MADE BEFORE ANY PARSER — SO NO
+PARSER EXISTS YET.** The build plan named "Google Health API v4" and told this
+block to verify that before building on it. It verified:
+
+* `GET https://www.googleapis.com/discovery/v1/apis?preferred=false` → **200**,
+  531 APIs, including `health:v4` and `health:v4beta`. It is **not** Google Fit
+  (`fitness:v1`, closed to new sign-ups) and **not** Health Connect
+  (Android-device-local, no server REST path). It is the successor to the
+  **Fitbit Web API**, fed from Fitbit, Pixel Watch and partner apps.
+* `GET https://health.googleapis.com/$discovery/rest?version=v4` → **200**,
+  292 545 bytes, `revision 20260907`. The Weight type is real and exact:
+  `Weight {sampleTime: ObservationSampleTime (required), weightGrams: double
+  (required), notes: string}`, reached as the `weight` member of the `DataPoint`
+  union.
+* `GET https://health.googleapis.com/v4/users/me/dataTypes/weight/dataPoints`
+  unauthenticated → **401 UNAUTHENTICATED**, whose `ErrorInfo` names
+  `service health.googleapis.com` and
+  `method google.devicesandservices.health.v4.DataPointsService.ListDataPoints`.
+  **Routing happens before authentication**, so a 401 naming the backend RPC is
+  proof the route resolves and that auth is the only gate left.
+
+**THE PLAN'S SCOPE ASSUMPTION IS WRONG AND THAT MATTERS TO THE OWNER.** The
+plan said Weight has "its own OAuth scope". It does not — there is no
+weight-specific scope in the 21 the discovery document lists. The only scope
+that admits the Weight data type is
+`googlehealth.health_metrics_and_measurements.readonly`, which **also grants
+blood glucose, body fat, oxygen saturation, core body temperature and
+heart-rate metrics**. Consenting to a weight bar consents to all of those.
+
+**The prose docs are also wrong about the path.** `developers.google.com`
+renders the read as `/v4/users/me/dataPoints/weight`; the discovery document —
+which is what a client is routed by — says
+`v4/users/{usersId}/dataTypes/{dataTypesId}/dataPoints`. Exactly the class of
+error the verify-first gate exists to catch.
+
+**BLOCKED ON THE OWNER, AND THEREFORE NO PARSER WAS WRITTEN.** No authenticated
+call has ever been made, because that needs (1) `health.googleapis.com` enabled
+on the Cloud project that owns the existing OAuth client, (2) the scope added to
+that client's consent screen plus the Owner on its Test users list, and (3) the
+Owner at a browser minting a refresh token. B7 made "one real call before the
+parser" this build's standard, and **body weight is the worst place to break
+it**: a usage parser one field off posts a silly percentage; a weight parser
+that reads kilograms as pounds posts a confident, plausible, wrong body weight
+and nothing on the wall could tell anyone. So `read_google_health` refuses with
+a named blocker, that flows into the ordinary unavailable path, and the panel
+says "unavailable" — the truth. A test asserts no `parse_google_health` /
+`parse_weight_datapoint` symbol exists (B7's `parse_gemini` precedent), and a
+deliberate defect that stubs a plausible fake reading is killed by it.
+
+**"THE GOAL LIVES IN THE USER'S DEFINITIONS" IS BUILT, AND IT UNCOVERED A REAL
+NagLight DEPENDENCY.** B5 recorded this half as explicitly not built. It is now:
+`WEIGHT_DEFINITIONS_DIR` names the **directory**, never the number, and the goal
+is a top-level `weight_goal_lb:` in a definitions file's frontmatter.
+`internal/defs/yaml.go` ignores unknown top-level keys (`default:` branch, "//
+ignore unknown top-level keys (forward-compatible)"), so **no NagLight change is
+needed to store it there** and it rides the existing Drive sync. There is
+deliberately **no `WEIGHT_GOAL` knob**, and a test asserts the negative twice
+over: a cycle with every plausible goal-shaped knob set and an empty definitions
+tree refuses, and no goal-shaped knob may be **declared** in `.env.example` or
+`FieldSchema.psd1` at all.
+
+**THE GAP, AND IT NEEDS NagLight.** Definitions reach the hub two ways. Folder
+mode (`drive.applyFolder`) stages the `.md` bytes verbatim and the key rides
+along. **Sheet mode regenerates the `.md` from CSV through `internal/defsheet`,
+whose `columns` list is the item field set, and drops unknown columns.** This
+household runs sheet mode (`TRACKER_DRIVE_SHEET_ID` set, `FOLDER_ID` blanked
+2026-09-08), so on the deployed box the goal would be **erased by the first sync
+after someone edits the sheet**. Smallest fix: let `defsheet` carry file-level,
+non-item keys through the round trip. That is a NagLight change, a repo this
+block may not edit, so it is reported rather than worked around — writing the
+goal to a hub knob "for now" would have made the acceptance criterion false
+while looking like it passed.
+
+**TWO REFUSALS THAT MUST NOT COLLAPSE INTO ONE.** No **source** posts an
+unavailable gauge, because the panel must say "we do not know what you weigh"
+rather than leave a hole where a bar belongs. No **goal** posts **nothing**,
+because the target line *is* the goal: NagLight refuses a gauge without a
+target, and satisfying it would mean inventing one and colouring a real body
+weight against a number nobody chose.
+
+**"STALE, NEVER GREEN" IS ONE INVARIANT.** `build_post` says the body carries a
+stamp from this cycle **if and only if** this cycle read the source. A failed
+source reposts its last real reading at its **original** stamp and goes stale on
+NagLight's `static` 7-day horizon; a source that never succeeded posts value 0
+with **no `observed_at` at all**, stale on arrival, so the panel says
+"unavailable" rather than showing nothing. A failed cycle does **not** write
+state, so that stamp cannot decay into permanent freshness. And a **real but
+old** reading is still stale and must be — re-stamping it to `now` to "fix" an
+unavailable gauge is the easiest mistake here and has its own test.
+
+**THE WIRE SHAPE DIFFERS FROM IF-013 IN THREE WAYS, EACH A 400 OR A SILENT
+LIE.** No `min`/`max`: `lb` is the ONE unit NagLight infers a range for
+(`unitRangeSpan`, a 50 lb bar around the goal), so the range rule stays in the
+tracker — **decided deliberately**, and computing `goal±25` here would put a
+second range authority on the producer side. No `window` and therefore no
+`direction`, which NagLight refuses without one. And `observed_at` is an RFC3339
+**string**, not IF-013's integer — getting that wrong renders as a permanently
+stale gauge rather than failing loudly.
+
+**THE CADENCE EXPOSED A VACUOUS ASSERTION, WHICH IS THE FIFTH IN THIS BUILD AND
+THE SECOND FOUND HERE.** The usage feeder's timer test asserts the interval is
+within a quarter of the tightest horizon; copied across, that is a quarter of
+**seven days** — forty-two hours — so it passed on a three-hourly timer and was
+enforcing almost nothing. The number had to be re-derived, not the shape copied:
+the timer is 15 minutes and the test now also bounds it at one hour, because
+what matters is how long the wall can keep showing a number after the source
+went away. The second vacuous assertion was the same shape as B7's: the unit
+test read `"ProtectHome=read-only" in unit`, which passes on the **comment that
+explains the choice**, so setting the real directive to `ProtectHome=no` left the
+suite green. Both now match directives at the start of a line.
+
+**Mutation runs: 27 deliberate defects, 26 killed.** The one survivor (M25,
+removing the indent check in the goal parser) survives **by construction** —
+three redundant guards defend that property and any one alone suffices; M27
+removes all three at once and is killed, so the property is covered. Recorded
+in the code rather than left as a mystery.
+
+**UNRUN:** `stack/run-hermetic-tests.sh` still refuses on this dev PC
+(`missing tool(s): zstd rsync`), so the shell-side suites were not exercised.
+This block adds no hermetic suite and no apt package (python3 stdlib only,
+already in `packages.list`), so no apt export is owed.
+
 **2026-09-09 the AI-usage feeder (B7, SR-021/LLR-005/TC-005/IF-013):** the hub
 gains a second plain service - no container, on a 10-minute timer - that reads
 how much of each AI subscription has been consumed and posts it to NagLight as
@@ -6168,3 +6297,5 @@ not been exercised on Linux and should be watched for on the box.
 
 **Nothing live changed.** No account was created, no unit installed, no service
 started. No apt package name was added, so no apt export re-run is owed.
+
+**2026-09-09 — B11, the weight feeder (SR-022/LLR-006/TC-006/IF-014).** PARTIAL. Google Health API v4 verified as real and reachable by real calls (discovery revision 20260907; an unauthenticated GET on the weight dataPoints route returns 401 naming google.devicesandservices.health.v4.DataPointsService.ListDataPoints). NO PARSER WRITTEN - no authenticated call is possible until the Owner enables the API, adds googlehealth.health_metrics_and_measurements.readonly (there is no weight-specific scope, and that one also grants blood glucose, body fat and heart-rate metrics) to the existing OAuth client, and mints a refresh token at a browser. Everything not depending on that shipped: the gauge plumbing, the stale-never-green invariant, the definitions-resident goal, the token directory, 10 knobs, firstboot hook 6f and a fourth runtime flow. Found a NagLight dependency: internal/defsheet drops unknown columns, so on this sheet-synced household the goal would be erased by the first sync after a sheet edit. check.py 423 passed / 5 skipped (baseline 342/5, not the 341 the plan recorded); trace.py --strict-integrity 0, orphans 24 = baseline; check_flows --no-placeholders OK, 4 diagrams; run-hermetic-tests.sh UNRUN (missing zstd, rsync). 27 mutants, 26 killed.

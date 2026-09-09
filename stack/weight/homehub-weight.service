@@ -1,0 +1,78 @@
+[Unit]
+# The hub's weight feeder (SR-022, SN-040). A plain service, no container —
+# the same reasoning A40 applied to the AI CLI service and B7 applied to the
+# usage feeder: the vendor half is an OAuth refresh token a human minted
+# interactively through a browser, and a container would have to mount the
+# directory it lives in.
+#
+# ONESHOT, DRIVEN BY A TIMER. There is nothing to keep alive between reads, and
+# a long-lived process holding a health-data session open is a bigger surface
+# than a process that exists for a second every fifteen minutes.
+Description=HomeHub weight feeder (SR-022, posts the weight gauge to NagLight)
+Documentation=file:///opt/homehub/stack/weight/README.md
+After=network-online.target homehub-firstboot.service
+Wants=network-online.target
+ConditionPathExists=/opt/homehub/stack/.env
+
+[Service]
+Type=oneshot
+
+# A DEDICATED UNPRIVILEGED ACCOUNT, and never `hub` (which carries (ALL)
+# NOPASSWD: ALL) and never root. setup-weight.sh writes User=/Group= into a
+# drop-in from WEIGHT_USER_ACCOUNT so the account certified is the account that
+# runs — the cross-review V2 lesson, which found a unit hard-coding one name
+# while every check validated another.
+User=homehub-weight
+Group=homehub-weight
+NoNewPrivileges=yes
+
+# READ-ONLY EVERYWHERE EXCEPT ONE FILE. `open_for_write` refuses any path but
+# the state file; this is the second, independent line. ProtectHome=read-only
+# is deliberate rather than `yes` — the feeder must still READ the refresh
+# token, which normally lives under this account's home. A refresh token the
+# Owner minted at a browser does not survive being truncated: it costs a person
+# a trip back to a browser.
+ProtectHome=read-only
+StateDirectory=homehub-weight
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/homehub-weight
+
+# THE DEFINITIONS ARE MOUNTED READ-ONLY, AND ONLY IF THEY WERE NAMED. The goal
+# lives in the user's definitions (SN-040), which are the tracker's data — this
+# feeder READS them and must never be able to write one. setup-weight.sh writes
+# the BindReadOnlyPaths= line into the drop-in from WEIGHT_DEFINITIONS_DIR, for
+# the same reason the account is written there: a path nobody read cannot
+# diverge from a unit nobody edited.
+
+EnvironmentFile=/opt/homehub/stack/.env
+# --check re-runs the identity and destination refusals as their own process,
+# under this unit's User=, so a box configured to guess an identity or to post
+# off-box fails BEFORE the real run.
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/weight/weight_feeder.py --check
+ExecStart=/usr/bin/python3 /opt/homehub/stack/weight/weight_feeder.py
+
+# A feeder that takes longer than this has a wedged source, and a wedged source
+# must become an "unavailable" gauge rather than a stuck unit.
+TimeoutStartSec=120
+
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# NO Restart=. A failed cycle must NOT be retried into a hot loop against a
+# health API; the timer brings the next one round soon enough, and a source
+# that failed has already posted its "unavailable" gauge.
+
+[Install]
+WantedBy=multi-user.target

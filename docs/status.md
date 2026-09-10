@@ -7774,3 +7774,69 @@ mutation that did exactly that **survived** the text-only form.
 **Not done here, deliberately.** No push. No hub state touched, no deploy. No
 other service given a `TZ:` — the Owner approved the tracker, and widening it
 is a separate call. `weight_feeder.py` is untouched.
+
+## 2026-09-10 — SR-023 bounded panel-audio image slice, backend deliberately unavailable
+
+The image now carries the narrow half of the Bluetooth/audio design without
+claiming the hardware half. SN-017/SR-023/LLR-007/TC-007/IF-015 trace one
+Unix-only, newline-framed JSON protocol; pure trusted-only route restoration and
+explicit-input policy; and a stateless visualizer transform that returns only
+bounded RMS/peak/bands/activity with generation and monotonic observation time.
+The shipped backend exposes an honest `probe-required` status and refuses every
+mutation. It executes no command, calls no D-Bus API, opens no audio source and
+retains no raw samples.
+
+The unit is stopped by default through `WALL_AUDIO_ENABLED=false`, accepts only
+AF_UNIX, and is filesystem/kernel hardened. It provisionally runs as `panel`:
+the read-only probe did not find `wpctl`/`pactl`, so neither a PipeWire session
+nor a safe cross-user access mechanism has been established. No BlueZ policy,
+WirePlumber profile, or additional package was guessed. A dedicated identity is
+still the desired least-privilege shape if physical evidence proves it can reach
+the selected user-session graph narrowly. Exclusive explicit input selection
+and all-routed-non-silent visualizer eligibility are conservative assumptions,
+recorded for review rather than presented as physical proof.
+
+Evidence: `python -m pytest tests/test_panel_audio.py -q` — **8 passed**;
+`python scripts/check_flows.py --no-placeholders` — **6 flows / 13 ids, OK**.
+`python scripts/trace.py` reports the new SR-023 chain complete and the repo's
+pre-existing 24 legacy orphans unchanged in class. `validate_config.py` passes
+every functional/config/YAML check and fails only its intentional ISO guard
+because the new unit is untracked in this uncommitted handoff; it must pass once
+the coordinator stages the final patch. No ISO, VM, live-panel route, latency,
+radio, suspend/resume, or 30-minute behavior was tested. G1 does not advance.
+
+With the handoff staged temporarily so the ISO-carriage guard could inspect the
+real final file set, `python scripts/check.py` passed: **723 tests passed / 7
+skipped; RESULT PASS**. The index was then restored to an uncommitted handoff.
+
+### Adversarial broker hardening follow-up
+
+The external review rejected the first slice on nine concrete safety/evidence
+gaps. All actionable findings were accepted and implemented: slow same-UID
+clients now have read deadlines and bounded concurrent handling; response data
+uses positive method-specific schemas with MAC, BlueZ-path and encoded-audio
+rejection; mutations have an explicit authorization seam that defaults deny;
+aliases are checked against a bounded trusted/kind-correct backend inventory;
+and generation check, backend mutation and successful increment are serialized.
+The telemetry core validates generation/time types, rejects backwards monotonic
+time, applies the configured silence hold and cadence cap, and retains only
+timestamps/generation. Offline carriage now accounts for every panel-audio
+payload, and first boot fails safe on an incomplete staged unit even while the
+feature is disabled.
+
+The review's performance concern was treated as suspected rather than asserted:
+a sustained maximum-window test offers 100 windows at 10 ms intervals, proves
+the 50 ms cadence admits only 20 transforms, and places a generous bounded
+runtime ceiling around the exercised reference host. This is software evidence,
+not panel CPU, thermal or latency evidence. Socket behavior is exercised through
+real AF_UNIX connections on Linux, including a stalled partial client,
+oversized wire request, and mutation authorization. The authorization seam is
+not yet wired to a host identity mechanism; until that and the physical backend
+are reviewed, the shipped service remains default-off and mutation-denying.
+
+Post-review evidence: `python3 tests/test_panel_audio_socket.py` under Linux —
+**3 passed**; focused Windows pytest — **12 passed / 4 platform skips**; and the
+staged final image gate `python scripts/check.py` — **727 passed / 11 skipped,
+RESULT PASS** (config, registry integrity and documentation checks all passed;
+the pre-existing orphan-document warning remains). No physical proof was added,
+and G1 does not advance.

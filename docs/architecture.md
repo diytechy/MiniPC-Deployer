@@ -165,6 +165,35 @@ The honest ledger of what has and has not been exercised is
 Hand-authored sequence diagrams of the behaviour that is easiest to misread
 from registry rows (process.md §3). Each cites the ids it renders.
 
+### A bounded audio request before hardware authority exists (SR-023, LLR-007, IF-015)
+
+The unavailable result is the current production behavior, not an error hidden
+by the diagram. The physical probe has not established a PipeWire session or a
+safe BlueZ policy, so the image carries the boundary without granting authority.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as Electron main process
+    participant U as Unix socket (AF_UNIX only)
+    participant B as audio broker (SR-023)
+    participant P as pure policy (LLR-007)
+    participant H as unavailable backend
+
+    R->>U: bounded JSON {id, method, params, generation}
+    U->>B: same-UID peer; one newline-framed request
+    B->>P: validate fixed method, aliases, explicit input, generation
+    alt malformed, oversized, unknown, or stale
+        P-->>R: stable refusal; backend is not called
+    else status
+        B->>H: status
+        H-->>R: available=false, reason=probe-required
+    else mutation before physical approval
+        B->>H: already-validated fixed action
+        H-->>R: backend_unavailable; no D-Bus/subprocess/device I/O
+    end
+```
+
 ### An explicit Door session, without giving the renderer a camera credential (SR-017)
 
 The image boundary matters more than the happy-path picture. Root firstboot is

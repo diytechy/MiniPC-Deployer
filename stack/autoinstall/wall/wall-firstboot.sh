@@ -871,6 +871,49 @@ else
     fail_step "Door broker is incomplete: the unit or packaged doorstream/service.py is missing. The Door tab will remain disabled."
 fi
 
+# ── 8e. SR-023 — feasibility-gated panel-local audio broker ────────────────
+# The current backend is deliberately read-only/unavailable. It gives Electron
+# a bounded status contract while refusing every mutation until a physical
+# probe establishes the least-privilege BlueZ and PipeWire ownership boundary.
+: "${WALL_AUDIO_ENABLED:=false}"
+: "${WALL_AUDIO_SOCKET:=/run/wall-audio-router/service.sock}"
+_wall_audio_complete=1
+for _wall_audio_file in audio_router.py routing.py visualizer.py; do
+    if [ ! -r "$PAYLOAD/../../panel-audio/$_wall_audio_file" ]; then
+        fail_step "Panel audio payload is incomplete: missing $_wall_audio_file"
+        _wall_audio_complete=0
+    fi
+done
+
+if [ ! -f /etc/systemd/system/wall-audio-router.service ]; then
+    fail_step "Panel audio payload is incomplete: missing wall-audio-router.service"
+    _wall_audio_complete=0
+fi
+if [ "$WALL_AUDIO_SOCKET" != /run/wall-audio-router/service.sock ]; then
+    fail_step "WALL_AUDIO_SOCKET must remain the panel-local broker socket"
+    WALL_AUDIO_ENABLED=false
+fi
+if [ "$WALL_AUDIO_ENABLED" = true ]; then
+    if [ "$_wall_audio_complete" -ne 1 ]; then
+        fail_step "Panel audio broker files are incomplete; leaving it stopped"
+        systemctl stop wall-audio-router.service >/dev/null 2>&1 || true
+    else
+        systemctl disable wall-audio-router.service >/dev/null 2>&1 || true
+        if ! systemctl restart wall-audio-router.service; then
+            fail_step "Panel audio broker did not start; inspect its journal"
+        else
+            log "SR-023: bounded audio status broker enabled; device backend remains probe-gated"
+        fi
+    fi
+elif [ "$WALL_AUDIO_ENABLED" = false ]; then
+    systemctl disable wall-audio-router.service >/dev/null 2>&1 || true
+    systemctl stop wall-audio-router.service >/dev/null 2>&1 || true
+    log "SR-023: panel audio broker disabled (default)"
+else
+    fail_step "WALL_AUDIO_ENABLED must be exactly true or false"
+    systemctl stop wall-audio-router.service >/dev/null 2>&1 || true
+fi
+
 # Touch fault filter is opt-in; OFF also restores the raw-input recovery path.
 if ! WALL_ENV_FILE="$ENV_FILE" bash "$PAYLOAD/configure-touch-filter.sh"; then
     fail_step "Touch filter configuration failed; inspect wall-touch-filter.service."

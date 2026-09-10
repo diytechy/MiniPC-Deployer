@@ -12,6 +12,15 @@ when it misbehaves the answer is *reimage it*, not repair it
 (`REMOTE_MANAGEMENT.md`). That is why this variant installs no Docker, no
 Cockpit, and nothing that would make the panel precious.
 
+## Bluetooth/audio boundary (SR-023)
+
+The image carries a disabled-by-default Unix-socket broker and its pure routing
+and visualizer cores. This is scaffolding with an honest unavailable backend,
+not a claimed working route. See [`../../panel-audio/README.md`](../../panel-audio/README.md).
+No broad BlueZ policy or WirePlumber profile ships. The physical acceptance in
+`WALL-BURN-IN.md` must establish routing, latency, coexistence and whether the
+broker can remain a separate identity or must live in the panel user session.
+
 | | AWOW core (`../user-data`) | Wall panel (`./user-data`) |
 |---|---|---|
 | Target | headless always-on server | one fullscreen app on a wall |

@@ -1,0 +1,43 @@
+# SR-023: disabled-by-default, panel-local audio protocol. The panel identity is
+# provisional because PipeWire/WirePlumber normally live in its user session.
+# No BlueZ D-Bus policy ships until the physical feasibility probe settles that
+# boundary; the current backend reports unavailable and performs no device I/O.
+[Unit]
+Description=Office wall panel bounded audio broker
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+User=panel
+Group=panel
+EnvironmentFile=/etc/wall-panel/wall.env
+RuntimeDirectory=wall-audio-router
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/wall-panel/stack/panel-audio/audio_router.py --socket ${WALL_AUDIO_SOCKET}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# Protocol output goes only to the Unix socket. Journald receives lifecycle
+# failures but never device addresses, pairing keys, or audio samples.
+StandardOutput=journal
+StandardError=journal
+
+# No [Install]: wall-firstboot starts this only when WALL_AUDIO_ENABLED=true.

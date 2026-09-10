@@ -295,3 +295,25 @@ below has to be done twice, with the right shape each time.
       `sudo /usr/local/sbin/wall-sleep.sh start` with `SLEEP_END` a few minutes
       out (the same test as §4's RTC check) and confirm the morning-style resume
       also triggered a sync — the D-W4 window is the wake this hook exists for.
+
+## Bluetooth/audio feasibility gate (SR-023)
+
+Do not set `WALL_AUDIO_ENABLED=true` as evidence that audio works. The shipped
+backend intentionally reports `probe-required` and refuses every mutation.
+
+- [ ] Record `wpctl status`, `pactl list cards`, `aplay -l`, `arecord -l`,
+      Bluetooth adapters/controllers and codec/jack controls without printing
+      device addresses or pairing keys into committed evidence.
+- [ ] Physically prove whether the built-in jack is output or input. A playback
+      control alone is not input evidence.
+- [ ] Test desktop A2DP -> panel -> wired/USB output first; only then test the
+      two-A2DP topology, a second adapter, USB capture, or LAN fallback in the
+      approved order. Measure game latency, 30-minute dropout, reconnect,
+      reboot/resume, and BLE-presence coexistence.
+- [ ] Prove the chosen output monitor includes Library, Pandora and explicitly
+      selected desktop input. Measure animation latency and CPU/memory, and
+      verify silence and generation changes clear derived spectral state.
+- [ ] Before implementing a backend, decide with evidence whether a dedicated
+      `wall-audio-router` identity can reach the PipeWire user session through a
+      narrow mechanism. The provisional unit uses `User=panel`; do not add a
+      broad D-Bus rule merely to make a separate account convenient.

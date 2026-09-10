@@ -584,6 +584,9 @@ autoinstall:
     # unprivileged account and enables/starts it only after wall.env and the
     # packaged application broker both exist.
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-door-stream.service /target/etc/systemd/system/wall-door-stream.service
+    # wall-audio-router — SR-023. Files are carried offline; firstboot leaves the
+    # unit stopped by default and no D-Bus policy is installed before probing.
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-audio-router.service /target/etc/systemd/system/wall-audio-router.service
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.service /target/etc/systemd/system/wall-wakeprep.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-wakeprep.sh /target/usr/local/sbin/wall-wakeprep.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-wakeprep.sh

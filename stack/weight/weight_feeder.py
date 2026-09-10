@@ -295,6 +295,41 @@ TARGET_KEY = "target"
 UNIT_KEY = "unit"
 GOAL_UNIT = "lb"
 
+# ── The automated check-off: the SECOND post, on the LEGACY lane ─────────────
+# The SAME item that carries the goal also declares, in the Owner's own
+# definitions, whether a feeder ticks it at all:
+#
+#     - id: weigh-in
+#       type: automated        <- TYPE_KEY / AUTOMATED_TYPE
+#       check: weight          <- CHECK_KEY: the feeder check id NagLight
+#       recur: weekly             matches against model.Item.Check
+#       target: 170
+#       unit: lb
+#
+# THERE IS DELIBERATELY NO `WEIGHT_CHECK_ENABLED` KNOB, and the reason is the
+# one that put the goal in the definitions rather than in stack/.env (SN-040).
+# `type:` and `check:` ARE the declaration. They are the person's, they
+# round-trip through Drive sheet mode as item columns, and they are exactly
+# what NagLight itself reads to decide an item is feeder-driven. A hub knob
+# beside them would be a second place the same intent lives, and the two would
+# disagree the first time the Owner changed their mind from their phone: a knob
+# saying "yes" over an item that says `type: habit` earns a 400 every cycle,
+# and a knob saying "no" over `type: automated` leaves an item nothing can ever
+# tick and no hint why. Reverting the item to `type: habit` turns this off by
+# itself on the next sync. So nothing is added to stack/.env.example, and
+# nothing is needed in HomeHub's FieldSchema.psd1 (which is out of this block's
+# bounds anyway).
+TYPE_KEY = "type"
+CHECK_KEY = "check"
+AUTOMATED_TYPE = "automated"
+
+# Where the "which sample time have we already ticked?" marks live INSIDE the
+# one existing state file: a dict of {check id: epoch seconds} alongside the
+# gauge's own entry, written by the same `save_state` through the same
+# `open_for_write` guard. It is NOT a second state file on purpose - a second
+# file is a second path the credential allow-list would have to bless.
+CHECK_STATE_KEY = "checked"
+
 # The superseded top-level key. Kept ONLY so a file that still carries it is
 # refused with a message that says where the goal went. See above.
 LEGACY_GOAL_KEY = "weight_goal_lb"
@@ -1400,7 +1435,9 @@ def build_post(reading, last, goal_lb, now):
     Implements: SR-022, LLR-006
     """
     if reading is not None:
-        value_lb, observed_at = reading
+        # Either a WeightReading (what the vendor reader returns now, because
+        # the check-off needs its day facts) or the bare pair.
+        value_lb, observed_at = reading_pair(reading)
         # The SOURCE's own numbers are checked here as well as in the reader,
         # because this is the point at which they become a gauge: a stamp in
         # the future or a weight outside the plausible band must not be posted
@@ -1441,6 +1478,153 @@ def is_fresh(body, now):
         return False                   # a future stamp is stale by NagLight's rule
     kind = body.get("window", {}).get("kind")
     return (now - stamp) <= STALE_HORIZON_SECONDS.get(kind, 24 * 3600)
+
+
+def reading_pair(reading):
+    """(pounds, observed_at) from a WeightReading OR from a bare pair.
+
+    `read_google_health` returns the whole WeightReading now, because the
+    check-off needs the CALENDAR DAY and the vendor must be read exactly ONCE
+    per cycle - re-reading it to recover a field we already had would double
+    the calls that carry the access token. The gauge half still wants only the
+    two numbers, and a test (or a future second source) may hand back the plain
+    pair the readers used to return, so both shapes are accepted here rather
+    than at four call sites.
+
+    Implements: LLR-006
+    """
+    if isinstance(reading, WeightReading):
+        return reading.pounds, reading.observed_at
+    return reading[0], reading[1]
+
+
+def reading_day_facts(reading):
+    """(civil_date, utc_offset_seconds) from a reading, or (None, None).
+
+    A bare pair carries no day facts at all, and "we cannot say what day this
+    was" is an ANSWER here exactly as it is in `civil_date_of`: the caller's
+    job is then to NOT tick.
+
+    Implements: LLR-006
+    """
+    if isinstance(reading, WeightReading):
+        return reading.civil_date, reading.utc_offset_seconds
+    return None, None
+
+
+def local_civil_date(epoch_seconds, utc_offset_seconds):
+    """(year, month, day) at `epoch_seconds` as seen from that UTC offset.
+
+    The offset comes from the READING - Google reports the one the scale's
+    phone was standing in - so this needs no TZ database, no $TZ on the hub,
+    and no guess about where the household is. It is the same arithmetic
+    `civil_date_of` uses for its fallback, factored out so "what day was the
+    weigh-in" and "what day is it now" are computed by ONE function and cannot
+    drift apart by a rounding or a sign.
+
+    Implements: LLR-006
+    """
+    local = datetime.fromtimestamp(int(epoch_seconds) + int(utc_offset_seconds),
+                                   timezone.utc)
+    return (local.year, local.month, local.day)
+
+
+def should_check_off(reading, last_checked, now):
+    """Whether to POST the automated tick this cycle. Four gates, all required.
+
+    Contract:
+      Inputs:  reading: what THIS cycle read - a WeightReading, a bare pair, or
+               None when the source failed; last_checked: the epoch sample time
+               already ticked for this check id, or None; now: this cycle's
+               clock.
+      Outputs: bool.
+      Raises:  nothing. Every "we cannot tell" is a False.
+
+    THE GATE THAT MATTERS MOST IS THE FIRST ONE, AND IT IS THE WHOLE REASON
+    THIS IS A FUNCTION RATHER THAN AN `if` IN `run_cycle`. When the source
+    fails, `build_post` re-posts the LAST REAL VALUE AT ITS ORIGINAL STAMP so
+    the gauge stays honest and goes stale on its own. That path must NEVER
+    tick: a tick is a claim that a person stood on a scale, and a source that
+    is down is the one circumstance in which this feeder knows nothing about
+    whether they did. `reading is None` covers every SourceFailure class, the
+    unexpected-exception class, and the refused-gauge fallback, because
+    `run_cycle` clears `reading` there too.
+
+      1. A GENUINELY FRESH READ. `reading is not None` - not "the cycle
+         worked", not "the post succeeded", not `fresh` from `build_post`
+         (which is the same flag, but reading it here would make the tick
+         depend on a gauge decision that is free to change).
+      2. A SAMPLE TIME WE HAVE NOT TICKED. Strictly newer than `last_checked`.
+         The source keeps returning the same weigh-in for the whole week; the
+         feeder wakes every 15 minutes. Without this the item would be
+         re-ticked 96 times a day, each one a `SaveDay`, a panel wake and (on
+         a single-user box) a git commit, for a fact that has not changed.
+      3. A DAY WE CAN NAME. `civil_date` is not None and the reading carries a
+         `utcOffset` - without both, "did this happen today?" is unanswerable
+         and the honest answer is to stay quiet.
+      4. TODAY, IN THE READING'S OWN LOCAL FRAME. The legacy lane CANNOT
+         back-date (see `check_body`): NagLight stamps the tick on ITS today
+         and ignores `at` entirely on the `ok` path. So a three-day-old
+         weigh-in, recovered when the feeder or the network comes back, must
+         not be ticked - it would put "weighed in" on a day nobody weighed in
+         on. Missing a weigh-in is recoverable by a tap on the panel; asserting
+         one that did not happen is not.
+
+    WHAT THIS DELIBERATELY DOES NOT DO IS POST `ok: false`. There is no
+    circumstance in which this feeder knows someone did NOT weigh in, and
+    un-ticking would silently erase a tick the Owner made by hand.
+
+    Implements: SR-022, LLR-006
+    """
+    if reading is None:
+        return False
+    _pounds, observed_at = reading_pair(reading)
+    if last_checked is not None and observed_at <= last_checked:
+        return False
+    civil_date, offset = reading_day_facts(reading)
+    if civil_date is None or offset is None:
+        return False
+    return civil_date == local_civil_date(now, offset)
+
+
+def check_body(check_id):
+    """The SECOND body: the legacy-lane tick for an `type: automated` item.
+
+    Contract:
+      Inputs:  check_id: the item's `check:` value, non-blank.
+      Outputs: dict ready to json-encode.
+      Raises:  ValueError for a blank id, which NagLight answers 400
+               "missing check id".
+
+    THREE ABSENCES ARE THE CONTRACT, and each of them is a way to get this
+    wrong (all read off NagLight's `handleAPIFeed`):
+
+      * NO `kind`. `kind` is the GAUGE lane's selector; `case "":` is what
+        routes a body to the boolean/colour/rgb struct. A `kind` here would be
+        either "unknown feed kind" (400) or, worse, the gauge again.
+      * NO `color` and NO `rgb`. The handler counts signals among
+        `ok != nil`, `color != ""`, `rgb != ""` and refuses anything but
+        EXACTLY ONE. `ok` is a *bool in Go, so its PRESENCE - not its value -
+        is what selects this lane; `false` is a signal too, which is why
+        `should_check_off` returns a decision to post or not post rather than
+        a value to post.
+      * NO `note`, AND NO `at`.
+          - `note` because the gauge already carries the number and a note is
+            the obvious place a body weight would leak into the tracker's log
+            lines, which are mirrored to a private repo hourly (SN-024). It
+            would also be dead weight: the handler decodes `Note` and then
+            never reads it - grep it - so nothing would ever display it.
+          - `at` because on the `ok` path it is IGNORED. Only the colour/rgb
+            path parses it (as RFC3339, into logfile.Report); the boolean path
+            goes straight to `date := s.Now()`. Sending one would look like
+            back-dating works and quietly wouldn't. See `should_check_off`
+            gate 4 and stack/weight/README.md.
+
+    Implements: SR-022, LLR-006
+    """
+    if not isinstance(check_id, str) or not check_id.strip():
+        raise ValueError("check id is blank; NagLight answers 400 to that")
+    return {"check": check_id.strip(), "ok": True}
 
 
 def cycle_now(env):
@@ -1854,6 +2038,43 @@ CREDENTIAL_BASENAMES = frozenset({
 })
 
 
+def validate_checked_marks(entry, now):
+    """The `checked` block of the state file, VALIDATED. Anything else drops.
+
+    Contract:
+      Inputs:  entry: whatever sat under CHECK_STATE_KEY - any JSON value;
+               now: this cycle's clock.
+      Outputs: {check id: int epoch seconds}, possibly empty.
+      Raises:  nothing.
+
+    A MARK THAT DOES NOT VALIDATE IS DROPPED, AND DROPPING IT IS SAFE ONLY
+    BECAUSE `should_check_off` HAS A SECOND, INDEPENDENT GATE. Losing the mark
+    means "we have not ticked anything for this id", which on its own would
+    let an old weigh-in be ticked again on the wrong day - the exact lie this
+    block exists to avoid. Gate 4 (the weigh-in must have happened TODAY in its
+    own local frame) is what makes that harmless: a lost mark can at worst
+    re-tick a reading from today, onto today, on an item that is already done.
+    The two gates are deliberately not derived from each other.
+
+    `check_observed_at` is reused rather than re-implemented, so a mark in the
+    FUTURE - the one that would suppress every real tick until the clock caught
+    up - is refused by the same rule that refuses a future reading.
+
+    Implements: LLR-006
+    """
+    if not isinstance(entry, dict):
+        return {}
+    out = {}
+    for key, value in entry.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        try:
+            out[key] = check_observed_at(value, now, "checked mark %r" % key)
+        except SourceFailure:
+            continue
+    return out
+
+
 def load_state(state_path, now):
     """Last successful reading, VALIDATED. Anything else is {}.
 
@@ -1861,6 +2082,13 @@ def load_state(state_path, now):
     `validate_stored_reading` will not vouch for - because what this file holds
     is reposted to the wall as a body weight, and a state file is input rather
     than memory.
+
+    CHECK_STATE_KEY IS THE ONE KEY THAT IS NOT A READING, and it gets its own
+    validator rather than an exemption: without the special case the generic
+    loop below would silently DROP the tick marks on every load, the feeder
+    would believe it had never ticked, and gate 2 of `should_check_off` would
+    stop working - which is the sort of failure that shows up as 96 identical
+    ticks a day rather than as an error.
     """
     try:
         with open(state_path, encoding="utf-8") as handle:
@@ -1871,6 +2099,11 @@ def load_state(state_path, now):
         return {}
     out = {}
     for key, entry in data.items():
+        if key == CHECK_STATE_KEY:
+            marks = validate_checked_marks(entry, now)
+            if marks:
+                out[key] = marks
+            continue
         checked = validate_stored_reading(entry, now)
         if checked is not None:
             out[key] = checked
@@ -1880,10 +2113,17 @@ def load_state(state_path, now):
 def save_state(state, state_path, state_root):
     """Write the state file through `open_for_write`, atomically.
 
-    The state holds A WEIGHT AND A TIMESTAMP ONLY - never a token, never a
-    header, never a response body. That is asserted by test, because a state
-    file that quietly grew a `refresh_token` would turn this feeder into the
+    The state holds A WEIGHT, A TIMESTAMP, AND THE CHECK IDS ALREADY TICKED
+    WITH THE SAMPLE TIME EACH WAS TICKED FOR - never a token, never a header,
+    never a response body. That is asserted by test, because a state file that
+    quietly grew a `refresh_token` would turn this feeder into the
     credential-writing thing it promises not to be.
+
+    THE TICK MARKS SHARE THIS FILE RATHER THAN GETTING ONE OF THEIR OWN, and
+    that is a security decision, not tidiness: `open_for_write` allows exactly
+    one path plus its `.tmp`, realpath-resolved and contained in the
+    StateDirectory, opened O_NOFOLLOW. A second state file would mean a second
+    blessed path, and the allow-list is the guard.
     """
     tmp = state_path + ".tmp"
     with open_for_write(tmp, state_path, state_root) as handle:
@@ -1916,6 +2156,124 @@ def resolve_goal_location(env):
     category = (env.get("WEIGHT_ITEM_CATEGORY") or "").strip() or DEFAULT_GOAL_CATEGORY
     item_id = (env.get("WEIGHT_ITEM_ID") or "").strip() or DEFAULT_GOAL_ITEM_ID
     return category, item_id
+
+
+def scan_definitions(defs_dir, category, item_id):
+    """Walk the definitions ONCE and return ((item, path) | None, [legacy paths]).
+
+    Contract:
+      Inputs:  defs_dir: the user's `definitions/`; category and item_id: the
+               resolved LOCATION knobs.
+      Outputs: (found, legacy) - `found` is the matched item's field map with
+               the file it came from, or None; `legacy` lists every file still
+               carrying the superseded top-level key.
+      Raises:  GoalMissing when the directory is not there; ValueError for a
+               file that links OUT of the directory, a file that cannot be
+               read, and the item appearing in two files.
+
+    THIS IS THE WALK `load_goal_from_definitions` ALWAYS DID, lifted out
+    unchanged so the check-off can ask the SAME question of the SAME files
+    without a second copy of the containment rule. Two copies of a `realpath`
+    containment check is how one of them ends up subtly weaker.
+
+    Implements: SR-022, LLR-006
+    """
+    if not os.path.isdir(defs_dir):
+        raise GoalMissing(
+            "no definitions directory at %s. The goal is the `%s:` of the `%s` "
+            "item under category `%s` in the person's own definitions, so with "
+            "no definitions there is no goal and no honest bar to draw."
+            % (defs_dir, TARGET_KEY, item_id, category))
+    names = sorted(n for n in os.listdir(defs_dir) if n.endswith(".md"))
+    real_dir = os.path.realpath(defs_dir)
+    found, legacy = None, []
+    for name in names:
+        path = os.path.join(defs_dir, name)
+        # A DEFINITIONS FILE THAT IS A LINK OUT OF THE DIRECTORY IS REFUSED,
+        # not read. The directory is the tracker's own docker volume and so is
+        # inside the trust boundary - WEIGHT_DEFINITIONS_DIR may itself be a
+        # link, which is why the comparison is made against its RESOLVED form
+        # rather than its name - but "the goal came from a file that is not in
+        # the household's definitions at all" is a sentence this feeder should
+        # never be able to say, and one realpath is what it costs to make sure.
+        if os.path.dirname(os.path.realpath(path)) != real_dir:
+            raise ValueError(
+                "definitions file %s resolves to %s, outside the definitions "
+                "directory %s. The goal is read from the household's own "
+                "definitions, so a file that links out of them is refused "
+                "rather than read." % (path, os.path.realpath(path), real_dir))
+        try:
+            with open(path, encoding="utf-8") as handle:
+                body = handle.read()
+        except OSError as exc:
+            raise ValueError("cannot read definitions file %s: %s"
+                             % (path, type(exc).__name__))
+        if declares_legacy_goal(body, path):
+            legacy.append(path)
+        item = find_goal_item(body, path, category, item_id)
+        if item is None:
+            continue
+        if found is not None:
+            raise ValueError(
+                "item `%s` under category `%s` appears in both %s and %s; "
+                "which one carries the goal is not guessable, and picking the "
+                "first would silently follow file-name order."
+                % (item_id, category, found[1], path))
+        found = (item, path)
+    return found, legacy
+
+
+def check_id_from_definitions(defs_dir, category=None, item_id=None):
+    """The feeder check id to tick, or None when the item does not want one.
+
+    Contract:
+      Inputs:  the same directory and location knobs the goal is read from.
+      Outputs: str - the item's `check:` - when that item declares BOTH
+               `type: automated` and a non-blank `check:`; None otherwise.
+      Raises:  nothing. Every "no" - no directory, no item, no `type`, a `type`
+               that is not `automated`, no `check`, a `check` declared twice,
+               an unreadable file - is None.
+
+    IT ANSWERS None RATHER THAN RAISING BECAUSE THE TICK IS THE OPTIONAL HALF.
+    The gauge is the thing SN-040 promises: the panel must say what the person
+    weighs, or say it does not know. The tick is an extra, and an extra must
+    never be able to take the gauge down with it - so this function's failure
+    mode is silence, and `run_cycle` calls it only AFTER the gauge is posted.
+    The refusals that DO matter (no goal, no source) already have their own
+    loud paths and are unchanged.
+
+    `type: automated` IS CHECKED AS WELL AS `check:`, even though NagLight
+    checks it too. NagLight's answer to a `check:` on a `type: habit` item is
+    400 "unknown feeder check id" - correct, but it arrives once per fresh
+    reading as a journal line the Owner would have to decode. Reading the type
+    here means reverting the item to `habit` simply stops the tick, quietly,
+    which is what "the definitions are the declaration" has to mean if it means
+    anything.
+
+    Implements: SR-022, LLR-006
+    """
+    category = category or DEFAULT_GOAL_CATEGORY
+    item_id = item_id or DEFAULT_GOAL_ITEM_ID
+    try:
+        found, _legacy = scan_definitions(defs_dir, category, item_id)
+    except (GoalMissing, ValueError, OSError):
+        return None
+    if found is None:
+        return None
+    item, where = found
+    if TYPE_KEY not in item or CHECK_KEY not in item:
+        return None
+    try:
+        declared_type = clean_scalar(one_value(item[TYPE_KEY], where, TYPE_KEY))
+        declared_check = clean_scalar(one_value(item[CHECK_KEY], where, CHECK_KEY))
+    except ValueError:
+        # Declared twice: which one is authoritative is not guessable, and this
+        # half stays quiet rather than picking one. The goal loader raises on
+        # the same shape for `target`, which is the loud half.
+        return None
+    if declared_type.casefold() != AUTOMATED_TYPE:
+        return None
+    return declared_check or None
 
 
 def load_goal_from_definitions(defs_dir, category=None, item_id=None):
@@ -1964,50 +2322,10 @@ def load_goal_from_definitions(defs_dir, category=None, item_id=None):
 
     Implements: SR-022, LLR-006
     """
+    found, legacy = scan_definitions(defs_dir, category or DEFAULT_GOAL_CATEGORY,
+                                     item_id or DEFAULT_GOAL_ITEM_ID)
     category = category or DEFAULT_GOAL_CATEGORY
     item_id = item_id or DEFAULT_GOAL_ITEM_ID
-    if not os.path.isdir(defs_dir):
-        raise GoalMissing(
-            "no definitions directory at %s. The goal is the `%s:` of the `%s` "
-            "item under category `%s` in the person's own definitions, so with "
-            "no definitions there is no goal and no honest bar to draw."
-            % (defs_dir, TARGET_KEY, item_id, category))
-    names = sorted(n for n in os.listdir(defs_dir) if n.endswith(".md"))
-    real_dir = os.path.realpath(defs_dir)
-    found, legacy = None, []
-    for name in names:
-        path = os.path.join(defs_dir, name)
-        # A DEFINITIONS FILE THAT IS A LINK OUT OF THE DIRECTORY IS REFUSED,
-        # not read. The directory is the tracker's own docker volume and so is
-        # inside the trust boundary - WEIGHT_DEFINITIONS_DIR may itself be a
-        # link, which is why the comparison is made against its RESOLVED form
-        # rather than its name - but "the goal came from a file that is not in
-        # the household's definitions at all" is a sentence this feeder should
-        # never be able to say, and one realpath is what it costs to make sure.
-        if os.path.dirname(os.path.realpath(path)) != real_dir:
-            raise ValueError(
-                "definitions file %s resolves to %s, outside the definitions "
-                "directory %s. The goal is read from the household's own "
-                "definitions, so a file that links out of them is refused "
-                "rather than read." % (path, os.path.realpath(path), real_dir))
-        try:
-            with open(path, encoding="utf-8") as handle:
-                body = handle.read()
-        except OSError as exc:
-            raise ValueError("cannot read definitions file %s: %s"
-                             % (path, type(exc).__name__))
-        if declares_legacy_goal(body, path):
-            legacy.append(path)
-        item = find_goal_item(body, path, category, item_id)
-        if item is None:
-            continue
-        if found is not None:
-            raise ValueError(
-                "item `%s` under category `%s` appears in both %s and %s; "
-                "which one carries the goal is not guessable, and picking the "
-                "first would silently follow file-name order."
-                % (item_id, category, found[1], path))
-        found = (item, path)
     # WHETHER THE ITEM ACTUALLY CARRIES A TARGET, not merely whether the item
     # exists, decides which refusal the person gets. An item with no target
     # beside a lingering `weight_goal_lb` is a HALF-DONE MIGRATION, and telling
@@ -2310,19 +2628,24 @@ def read_google_health(env, list_url=None, token_endpoint=None):
                injected ONLY by tests, exactly as `weight_oauth` injects them -
                there is no knob for either, because a knob on the URL that
                carries this token is a way to send it somewhere else.
-      Outputs: (value_lb: float, observed_at: epoch seconds).
+      Outputs: the WeightReading itself.
       Raises:  SourceFailure for every failure class, NoWeightYet (a subclass)
                for an account with nothing logged. Both take the unavailable
                path in `build_post`; neither can produce a reading.
 
     IT ORCHESTRATES AND DOES NOT INTERPRET: token file, OAuth client, access
-    token, list walk, and the two numbers the gauge needs. `civil_date` and
-    `utc_offset_seconds` are computed and deliberately NOT returned here - the
-    gauge has no use for them and `observed_at` is the only stamp NagLight
-    understands. A caller that needs the CALENDAR DAY (the weigh-in check-off)
-    calls `parse_weight_datapoint` and reads them off the WeightReading; it must
-    not re-derive a day from `observed_at`, which is UTC and is a day out for
-    every evening weigh-in in this timezone. See `civil_date_of`.
+    token, list walk, one reading.
+
+    IT USED TO RETURN ONLY `(pounds, observed_at)` - the two numbers the gauge
+    needs - on the reasoning that a caller wanting the CALENDAR DAY would call
+    `parse_weight_datapoint` itself. The check-off is that caller, and it lives
+    in `run_cycle`, which reaches the vendor only through this function. Making
+    it call the parser as well would mean a SECOND list request carrying the
+    access token every 15 minutes, to recover a field this call already had. So
+    the whole reading comes back and `reading_pair` takes the two numbers off
+    it for the gauge. What has NOT changed is that a day must never be
+    re-derived from `observed_at`: that is UTC, and it is a day out for every
+    evening weigh-in in this timezone. See `civil_date_of`.
 
     Implements: SR-022, LLR-006
     """
@@ -2342,9 +2665,8 @@ def read_google_health(env, list_url=None, token_endpoint=None):
             "seconds.")
     access_token = google_access_token(client_id, client_secret, refresh_token,
                                        timeout, token_endpoint)
-    reading = list_weight_data_points(access_token, cycle_now(env), timeout,
-                                      list_url)
-    return reading.pounds, reading.observed_at
+    return list_weight_data_points(access_token, cycle_now(env), timeout,
+                                   list_url)
 
 
 SOURCE_READERS = {
@@ -2496,9 +2818,16 @@ def vendor_opener():
 
 
 def post_gauge(body, url, env, timeout):
-    """POST the gauge through the local-only opener. Returns (ok, detail).
+    """POST one body to /api/feed through the local-only opener -> (ok, detail).
 
     Never raises: a failed post is a reported failure, not a dead cycle.
+
+    IT IS BODY-AGNOSTIC, and that is what makes the two posts INDEPENDENT.
+    `run_cycle` calls it once with the gauge body and once with the check body;
+    each call has its own (ok, detail), each failure is its own line, and
+    neither can prevent or abort the other. The name is kept because it is the
+    shared name this feeder and the usage feeder are held to by the egress
+    parity test.
 
     THE REMOTE'S OWN WORDS ARE NEVER PUT IN `detail`. The previous version
     returned `exc.read()[:200]`, which `main` prints to stderr and systemd
@@ -2527,15 +2856,37 @@ def post_gauge(body, url, env, timeout):
         return False, type(exc).__name__
 
 
-def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None):
-    """One feeder cycle: load the goal, read the source, post one gauge.
+def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,
+              check_loader=None):
+    """One feeder cycle: load the goal, read the source, post the gauge, and -
+    only on a genuinely fresh weigh-in - post the automated check-off too.
 
     Contract:
       Inputs:  env: the process environment (plus `_identity` and `_feed_url`);
-               `readers`, `poster` and `goal_loader` are injectable so the
-               tests can exercise every failure class without a network or a
-               real definitions tree.
-      Outputs: (posted: list of (id, fresh, ok), failures: list of str).
+               `readers`, `poster`, `goal_loader` and `check_loader` are
+               injectable so the tests can exercise every failure class without
+               a network or a real definitions tree.
+      Outputs: (posted, failures, goal_file). `posted` is a list of
+               (id, fresh, ok): the gauge line ALWAYS first with `fresh` a
+               bool, and - only on a cycle that actually ticked - a second line
+               whose `fresh` is None, marking it as the check-off rather than a
+               gauge.
+
+    THE TWO POSTS ARE INDEPENDENT AND THE GAUGE GOES FIRST. Independent
+    because each has its own try/except and its own failure line, so a 400 on
+    the check cannot stop the wall from being told what the person weighs, and
+    a dead tracker cannot stop the tick from being ATTEMPTED. Gauge first
+    because it is the promise (SN-040: the panel must say what you weigh or say
+    it does not know) and the tick is the extra: putting the extra first would
+    put its latency and its failure modes in front of the thing that must
+    always happen. `check_id_from_definitions` is not even consulted until the
+    gauge has been posted, for the same reason - it reads the disk.
+
+    THE TICK IS RECORDED ONLY IF IT LANDED. The sample time goes into the
+    state file's `checked` block AFTER a 200, never before, so a tick that
+    failed to post is retried on the next cycle instead of being remembered as
+    done. Both the reading and the mark are written by the SAME `save_state`
+    call, through the same `open_for_write` guard, into the same one file.
 
     THE ORDER IS DELIBERATE AND IT IS THE ONE THING TO GET RIGHT HERE. The goal
     is loaded FIRST - out of the `target` of the item the location knobs name -
@@ -2598,8 +2949,42 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None):
         ok, detail = False, type(exc).__name__
     if not ok:
         failures.append("post %s: %s" % (GAUGE_ID, detail))
+    posted = [(GAUGE_ID, fresh, ok)]
+
+    # ── THE SECOND POST. Everything below here is the check-off, and NOTHING
+    # below here may change `body`, `ok` or the gauge's line above. ──────────
+    marks = dict(state.get(CHECK_STATE_KEY) or {})
+    check_id = None
     if reading is not None:
-        state[GAUGE_ID] = {"value": reading[0], "observed_at": reading[1]}
+        # Only a cycle that read the source can possibly tick, so the
+        # definitions are not re-read on the 95 cycles a week that cannot.
+        check_id = (check_loader or check_id_from_definitions)(
+            defs_dir, category, item_id)
+    if check_id is not None and should_check_off(reading, marks.get(check_id), now):
+        try:
+            tick_body = check_body(check_id)
+        except ValueError as exc:
+            tick_body = None
+            failures.append("check %s: %s" % (check_id, exc))
+        if tick_body is not None:
+            try:
+                tick_ok, tick_detail = (poster or post_gauge)(
+                    tick_body, feed_url, env, timeout)
+            except Exception as exc:       # a poster bug is a failed post
+                tick_ok, tick_detail = False, type(exc).__name__
+            if not tick_ok:
+                failures.append("post check %s: %s" % (check_id, tick_detail))
+            else:
+                # Remembered ONLY on a 200: an unremembered tick is retried,
+                # a wrongly-remembered one is lost for the week.
+                marks[check_id] = reading_pair(reading)[1]
+            posted.append((check_id, None, tick_ok))
+
+    if reading is not None:
+        value_lb, observed_at = reading_pair(reading)
+        state[GAUGE_ID] = {"value": value_lb, "observed_at": observed_at}
+        if marks:
+            state[CHECK_STATE_KEY] = marks
         try:
             save_state(state, state_path, state_root)
         except OSError as exc:
@@ -2607,7 +2992,7 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None):
             # already posted; losing the history is a named failure, not a
             # crash and never a fabricated reading.
             failures.append("state %s: %s" % (state_path, type(exc).__name__))
-    return [(GAUGE_ID, fresh, ok)], failures, goal_file
+    return posted, failures, goal_file
 
 
 def main(argv=None):
@@ -2636,7 +3021,11 @@ def main(argv=None):
         return 2
     print("weight: goal read from %s" % goal_file)
     for key, fresh, ok in posted:
-        print("weight: %-10s %-12s %s" % (key, "live" if fresh else "UNAVAILABLE",
+        # `fresh is None` marks the check-off line. It is a third state, not a
+        # falsy one: "UNAVAILABLE" is a gauge word and would be a lie about a
+        # tick that says a person stood on a scale.
+        what = "checked off" if fresh is None else ("live" if fresh else "UNAVAILABLE")
+        print("weight: %-10s %-12s %s" % (key, what,
                                           "posted" if ok else "POST FAILED"))
     for line in failures:
         print("weight: %s" % line, file=sys.stderr)

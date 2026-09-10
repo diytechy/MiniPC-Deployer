@@ -1447,16 +1447,25 @@ def test_an_empty_page_mid_walk_is_not_an_empty_history():
 def test_the_whole_vendor_read_returns_the_weight_and_the_instant(tmp_path):
     """End to end over real sockets: token refresh, list call, one reading.
 
-    The reading is returned as (pounds, observed_at) - the shape `run_cycle`
-    consumes - and `observed_at` is the sample's own instant, never `now`.
+    The WHOLE WeightReading comes back - `reading_pair` takes the gauge's two
+    numbers off it - and `observed_at` is the sample's own instant, never
+    `now`. The DAY FACTS must survive this call too: the check-off reaches the
+    vendor only through this function, and if they were dropped here it would
+    either tick on the wrong day or have to make a second, token-carrying call
+    to recover them. Exactly two requests reach the loopback, which is what
+    proves it did not.
     """
     env = google_env(tmp_path)
     with loopback_server(fake_google(CAPTURED_SHAPE)) as (base, seen):
-        value, observed_at = feeder.read_google_health(
+        reading = feeder.read_google_health(
             env, list_url=base + "/points", token_endpoint=base + "/token")
+    value, observed_at = feeder.reading_pair(reading)
     assert round(value, 1) == 176.0
     assert observed_at == CAPTURED_AT
     assert observed_at != NOW, "observed_at is when the reading was TRUE"
+    assert feeder.reading_day_facts(reading) == (FIXTURE_CIVIL_DAY, -18000), (
+        "the calendar day and its offset survive the vendor read")
+    assert len(seen) == 2, "one token refresh and one list call, and no more"
     refresh, listing = seen
     assert b"grant_type=refresh_token" in refresh["body"]
     assert b"REFRESH-TOKEN-ABC" in refresh["body"]
@@ -2903,3 +2912,593 @@ class TestTheKnobsReachTheDropIn:
         # would leave the old stub beside the new bind for a whole run.
         assert (script.index('rm -f "$WEIGHT_MOUNT_DIR"/*.md')
                 < script.index('emit_dropin "$DROPIN_DIR"'))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# C. THE AUTOMATED CHECK-OFF — the SECOND post, on the LEGACY lane.
+#
+# The tracker item became `type: automated` / `check: weight`, so a feeder can
+# tick it. Everything here exists because a tick is a CLAIM ABOUT A PERSON: it
+# says they stood on a scale. The gauge can be wrong and merely look wrong; a
+# tick that fires when the source is down tells the Owner they weighed in when
+# they did not, and nothing on the panel would ever say otherwise.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 22:24 LOCAL on the same evening as the captured weigh-in (20:24 local, which
+# is 01:24 UTC the NEXT day — the trap the capture proved). Two hours after the
+# sample and still the same CIVIL day, which is the only day this feeder is
+# ever willing to tick for.
+SAME_DAY_NOW = CAPTURED_AT + 2 * 3600
+
+# The Owner's file after the change that unblocked this block: the weigh-in
+# item is `type: automated` with `check: weight`, and the goal is still the
+# same `target`/`unit` beside it. The siblings stay, one of them carrying a
+# `target` of its own.
+AUTOMATED_MD = HEALTH_MD.replace(
+    "  - id: weigh-in\n"
+    "    title: Step on the scale\n"
+    "    type: habit\n"
+    "    recur: weekly\n",
+    "  - id: weigh-in\n"
+    "    title: Step on the scale\n"
+    "    type: automated\n"
+    "    check: weight\n"
+    "    recur: weekly\n")
+assert "type: automated" in AUTOMATED_MD, "the fixture edit must actually apply"
+
+# THE SHAPE A FIRST-PASS TEST MISSES, AND IT IS THE LIKELY ONE. Reverting the
+# item from a phone changes the TYPE column; it does not delete the CHECK
+# column, because Drive sheet mode round-trips every item column it knows. So
+# "back to a habit" on the Owner's screen arrives here as `type: habit` sitting
+# NEXT TO `check: weight` - and a reader that only looked for `check:` would go
+# on ticking an item NagLight no longer considers feeder-driven, earning a 400
+# per weigh-in. The plain `HEALTH_MD` cannot catch that: it has no `check:` at
+# all, so it is refused for the wrong reason.
+HABIT_BUT_STILL_CHECKED_MD = AUTOMATED_MD.replace("type: automated", "type: habit")
+assert "check: weight" in HABIT_BUT_STILL_CHECKED_MD
+
+
+def feed_replies(*statuses):
+    """A loopback /api/feed that answers each POST, in order, with a status.
+
+    The order IS the assertion: the gauge is post #1 and the tick is post #2,
+    so `feed_replies(200, 400)` is "the wall was told, the tick was refused".
+    The bodies come back through `loopback_server`'s `seen`.
+    """
+    calls = {"n": 0}
+
+    def respond(handler):
+        index = calls["n"]
+        calls["n"] += 1
+        status = statuses[index] if index < len(statuses) else 200
+        payload = b"{}"
+        handler.send_response(status)
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    return respond
+
+
+def captured_reader(payload=None):
+    """A source reader returning a real WeightReading parsed from a real body."""
+    body = CAPTURED_SHAPE if payload is None else payload
+    return lambda env: feeder.parse_weight_datapoint(body, feeder.cycle_now(env))
+
+
+def check_env(tmp_path, feed_url, defs=None):
+    """A run_cycle environment with a real state dir and a real definitions dir."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(exist_ok=True)
+    return dict(
+        _identity="sub-123", _feed_url=feed_url,
+        WEIGHT_STATE_FILE=str(state_dir / "weight-state.json"),
+        STATE_DIRECTORY=str(state_dir),
+        WEIGHT_DEFINITIONS_DIR=write_defs(
+            tmp_path, {"health.md": AUTOMATED_MD if defs is None else defs}))
+
+
+def bodies(seen):
+    return [json.loads(request["body"].decode()) for request in seen]
+
+
+def a_goal(*_args):
+    return (GOAL, "health.md")
+
+
+def test_a_fresh_weigh_in_posts_the_gauge_and_then_the_tick_sr022(tmp_path):
+    """THE HAPPY PATH, OVER REAL SOCKETS, END TO END.
+
+    Two POSTs arrive at one /api/feed: the gauge FIRST, then the tick. The
+    tick's body is asserted WHOLE — `{"check": ..., "ok": true}` and nothing
+    else — because every extra field is a specific failure against NagLight's
+    `handleAPIFeed`: a `kind` routes it to the gauge lane or earns "unknown
+    feed kind"; a `color` or `rgb` makes it two signals where the handler
+    demands exactly one; a `note` copies health data into the tracker's log
+    lines; an `at` is silently IGNORED on this lane and would make back-dating
+    look as though it worked.
+    """
+    with loopback_server(feed_replies(200, 200)) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW, readers={"google-health": captured_reader()},
+            goal_loader=a_goal)
+
+    assert failures == []
+    gauge, tick = bodies(seen)
+    assert gauge["kind"] == "gauge" and gauge["id"] == "weight", "the gauge is first"
+    assert tick == {"check": "weight", "ok": True}, (
+        "the tick's body is exactly the two fields the legacy lane accepts")
+    assert posted == [("weight", True, True), ("weight", None, True)]
+    # ...and the Owner's weight is nowhere in the tick, nor is their id.
+    assert "176" not in json.dumps(tick) and SENTINEL_ID not in json.dumps(tick)
+
+
+def test_a_dead_source_reposts_the_gauge_and_never_ticks_sr022(tmp_path):
+    """THE ONE THAT MATTERS MOST.
+
+    The feeder wakes every 15 minutes and, when the source fails, re-posts the
+    last real weight AT ITS ORIGINAL STAMP so the gauge stays honest and goes
+    stale by itself. That path must post ONE body and no tick: a source that is
+    down knows nothing about whether anybody stood on a scale, and a tick from
+    there is a false statement about a person that the panel would render as
+    an ordinary green check.
+    """
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        # Cycle one: a real weigh-in, so there IS history to re-post later.
+        feeder.run_cycle(env, now=SAME_DAY_NOW,
+                         readers={"google-health": captured_reader()},
+                         goal_loader=a_goal)
+        first = len(seen)
+
+        def dead(e):
+            raise feeder.SourceFailure("google-health: HTTP 401")
+
+        posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW + 900, readers={"google-health": dead},
+            goal_loader=a_goal)
+
+    resent = bodies(seen)[first:]
+    assert len(resent) == 1, "the re-post path must never tick"
+    assert resent[0]["kind"] == "gauge"
+    assert resent[0]["observed_at"] == feeder.iso8601_utc(CAPTURED_AT), (
+        "and it is still the ORIGINAL stamp, not this cycle's")
+    assert [key for key, fresh, _ok in posted if fresh is None] == []
+    assert len(failures) == 1 and "401" in failures[0]
+
+
+def test_an_unexpected_source_exception_never_ticks_either_sr022(tmp_path):
+    """The other failure branch: not a SourceFailure but anything at all.
+
+    `run_cycle` catches it, keeps `reading` None, and the tick must be gated on
+    `reading`, never on "the cycle did not raise".
+    """
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+
+        def exploding(e):
+            raise RuntimeError("boom")
+
+        _posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW, readers={"google-health": exploding},
+            goal_loader=a_goal)
+
+    assert [b for b in bodies(seen) if "check" in b] == []
+    assert failures == ["google-health: unexpected RuntimeError"]
+
+
+def test_the_same_weigh_in_is_ticked_once_however_many_cycles_run_sr022(tmp_path):
+    """96 cycles a day against one weekly weigh-in must be ONE tick.
+
+    `engine.Check` sets Done and saves the day unconditionally, so a repeated
+    `ok: true` is a repeated `SaveDay`, a repeated panel wake and (on a
+    single-user box) a repeated git commit, for a fact that has not changed.
+    The mark is keyed on the SAMPLE TIME, not on "this cycle worked".
+    """
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        for minute in (0, 15, 30, 45):
+            feeder.run_cycle(
+                env, now=SAME_DAY_NOW + minute * 60,
+                readers={"google-health": captured_reader()},
+                goal_loader=a_goal)
+
+    ticks = [body for body in bodies(seen) if "check" in body]
+    assert len(ticks) == 1, "one weigh-in, one tick, four cycles"
+    assert len(bodies(seen)) == 5, "the gauge, however, is posted every cycle"
+
+
+def test_a_second_weigh_in_the_same_day_is_ticked_again_sr022(tmp_path):
+    """The mark is "which sample time", not "have we ever ticked".
+
+    A strictly newer sample on the same civil day is a new weigh-in, and it
+    ticks. This is the other side of the test above, and it is what stops the
+    de-duplication being implemented as a latch that never reopens.
+    """
+    later_point = a_point(physical="2026-09-09T03:00:00Z", grams=FIXTURE_GRAMS + 90,
+                          point_id="P2")
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        feeder.run_cycle(env, now=SAME_DAY_NOW,
+                         readers={"google-health": captured_reader()},
+                         goal_loader=a_goal)
+        # 22:54 LOCAL, still the 8th: `now` must not cross local midnight or
+        # the day gate would - correctly - refuse the second tick too.
+        feeder.run_cycle(env, now=SAME_DAY_NOW + 30 * 60,
+                         readers={"google-health": captured_reader(a_body(later_point))},
+                         goal_loader=a_goal)
+
+    assert len([b for b in bodies(seen) if "check" in b]) == 2
+
+
+def test_a_weigh_in_from_another_day_is_never_ticked_sr022(tmp_path):
+    """THE DAY GATE, AND WHY REFUSING IS THE HONEST ANSWER.
+
+    The legacy lane cannot back-date: NagLight's `ok` path goes straight to
+    `date := s.Now()` and never looks at `at` (only the colour/rgb path parses
+    it). So a weigh-in recovered a day or two late — the feeder was down, the
+    network was out — cannot be ticked onto the day it happened. Ticking it
+    onto TODAY would write "weighed in" against a day nobody weighed in on.
+    Missing the tick is recoverable with one tap on the panel; the false one is
+    not, so this refuses.
+    """
+    yesterday = a_point(physical="2026-09-08T01:24:33Z", civil=False, point_id="P0")
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW,
+            readers={"google-health": captured_reader(a_body(yesterday))},
+            goal_loader=a_goal)
+
+    assert [b for b in bodies(seen) if "check" in b] == []
+    assert len(bodies(seen)) == 1, "the gauge is still posted - it is honest"
+    assert failures == [], "and a day we will not tick for is not a failure"
+    assert [k for k, fresh, _ in posted if fresh is None] == []
+
+
+def test_a_reading_that_cannot_name_its_day_is_never_ticked_sr022(tmp_path):
+    """No `civilTime` and no `utcOffset` is "we cannot say what day this was".
+
+    `civil_date_of` answers None there rather than raising, and None must reach
+    the tick as a refusal, not as a fall-through to `observed_at` — which is
+    UTC and is a day out for every evening weigh-in in this timezone.
+    """
+    dayless = a_point(offset=None, civil=False, point_id="P3")
+    reading = feeder.parse_weight_datapoint(a_body(dayless), SAME_DAY_NOW)
+    assert feeder.reading_day_facts(reading) == (None, None)
+    assert feeder.should_check_off(reading, None, SAME_DAY_NOW) is False
+
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        feeder.run_cycle(env, now=SAME_DAY_NOW,
+                         readers={"google-health": captured_reader(a_body(dayless))},
+                         goal_loader=a_goal)
+    assert [b for b in bodies(seen) if "check" in b] == []
+
+
+def test_a_refused_tick_leaves_the_gauge_posted_and_is_retried_sr022(tmp_path):
+    """INDEPENDENCE, FIRST DIRECTION: the tick fails, the gauge does not.
+
+    The gauge is the promise (SN-040) and the tick is the extra, so the extra
+    is posted SECOND and its 400 costs only itself. And because the mark is
+    written only after a 200, the next cycle tries again rather than recording
+    a tick that never landed.
+    """
+    with loopback_server(feed_replies(200, 400, 200, 200)) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW, readers={"google-health": captured_reader()},
+            goal_loader=a_goal)
+        assert bodies(seen)[0]["kind"] == "gauge"
+        assert posted[0] == ("weight", True, True), "the gauge landed"
+        assert posted[1] == ("weight", None, False), "the tick did not"
+        assert len(failures) == 1 and "post check weight" in failures[0]
+        assert "400" in failures[0] and "body not logged" in failures[0]
+
+        stored = json.loads((tmp_path / "state" / "weight-state.json").read_text())
+        assert feeder.CHECK_STATE_KEY not in stored, (
+            "a tick that did not land must not be remembered as done")
+
+        posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW + 900, readers={"google-health": captured_reader()},
+            goal_loader=a_goal)
+    assert failures == []
+    assert posted[1] == ("weight", None, True), "retried on the next cycle"
+    assert len([b for b in bodies(seen) if "check" in b]) == 2
+
+
+def test_a_refused_gauge_does_not_prevent_the_tick_sr022(tmp_path):
+    """INDEPENDENCE, SECOND DIRECTION, and it is the one an ordering bug hides.
+
+    A gauge that 500s must not swallow the tick: they are two facts about the
+    same weigh-in and neither is the other's precondition. Both are attempted
+    and only the failure is reported.
+    """
+    with loopback_server(feed_replies(500, 200)) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW, readers={"google-health": captured_reader()},
+            goal_loader=a_goal)
+
+    sent = bodies(seen)
+    assert len(sent) == 2 and "check" in sent[1]
+    assert posted[0] == ("weight", True, False)
+    assert posted[1] == ("weight", None, True)
+    assert len(failures) == 1 and failures[0].startswith("post weight:")
+
+
+def test_the_tick_body_carries_no_kind_no_note_no_at_and_one_signal_sr022():
+    """The wire contract of the legacy lane, asserted as four ABSENCES.
+
+    Read straight off NagLight `internal/web/handlers.go`: `case "":` selects
+    this struct, `signals != 1` is a 400, `Note` is decoded and then never read
+    by anything, and `At` is parsed only inside
+    `if body.Color != "" || body.RGB != ""`. A note would put a body weight
+    into the tracker's log lines — which the traceability mirror pushes to a
+    private repo hourly — for a field nothing displays.
+    """
+    body = feeder.check_body("weight")
+    assert set(body) == {"check", "ok"}
+    assert body["ok"] is True
+    for absent in ("kind", "note", "at", "color", "rgb", "reason",
+                   "value", "target", "observed_at"):
+        assert absent not in body
+    with pytest.raises(ValueError):
+        feeder.check_body("   ")
+    assert feeder.check_body("  weight  ")["check"] == "weight"
+
+
+def test_the_feeder_never_posts_ok_false_sr022():
+    """There is no circumstance in which this feeder knows someone did NOT
+    weigh in, and `ok: false` would call `engine.Uncheck` and silently erase a
+    tick the Owner made by hand. Asserted against the source, because the
+    absence of a branch cannot be exercised."""
+    source = (REPO / "stack" / "weight" / "weight_feeder.py").read_text(encoding="utf-8")
+    assert '"ok": False' not in source and "'ok': False" not in source
+    assert source.count('"ok": True') == 1
+
+
+def test_the_tick_mark_lives_in_the_one_existing_state_file_sr022(tmp_path):
+    """STATE, RULE 6: one file, the existing one, through the existing guard.
+
+    `open_for_write` allows exactly one path plus its `.tmp`, realpath-resolved
+    and contained in the StateDirectory, opened O_NOFOLLOW. A second state file
+    would be a second blessed path, so the mark shares this one — and the file
+    still holds nothing but weights, timestamps and a check id.
+    """
+    state_dir = tmp_path / "state"
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        feeder.run_cycle(env, now=SAME_DAY_NOW,
+                         readers={"google-health": captured_reader()},
+                         goal_loader=a_goal)
+
+    assert sorted(p.name for p in state_dir.iterdir()) == ["weight-state.json"], (
+        "no second state file, and no .tmp left behind")
+    state_file = state_dir / "weight-state.json"
+    stored = json.loads(state_file.read_text())
+    assert stored[feeder.CHECK_STATE_KEY] == {"weight": CAPTURED_AT}
+    assert sorted(stored["weight"]) == ["observed_at", "value"]
+    assert SENTINEL_ID not in json.dumps(stored)
+    assert "REFRESH-TOKEN" not in json.dumps(stored)
+    # ...and it round-trips, or gate 2 would silently stop working.
+    reloaded = feeder.load_state(str(state_file), SAME_DAY_NOW)
+    assert reloaded[feeder.CHECK_STATE_KEY] == {"weight": CAPTURED_AT}
+
+
+def test_the_tick_mark_is_written_by_the_credential_guard_sr022(tmp_path):
+    """The mark did not get its own writer. When `open_for_write` refuses, the
+    mark is lost with the reading — one guard, one file, one failure line — and
+    the gauge is still posted because it went first."""
+    state_dir = tmp_path / "state"
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+        # OUTSIDE the StateDirectory: the containment half of the guard.
+        env["WEIGHT_STATE_FILE"] = str(tmp_path / "elsewhere.json")
+        _posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW, readers={"google-health": captured_reader()},
+            goal_loader=a_goal)
+
+    assert len(bodies(seen)) == 2, "both posts still happened"
+    assert len(failures) == 1 and failures[0].startswith("state ")
+    assert "PermissionError" in failures[0]
+    assert not (tmp_path / "elsewhere.json").exists()
+    assert not (tmp_path / "elsewhere.json.tmp").exists()
+
+
+def test_a_tick_mark_that_is_not_credible_is_dropped_sr022():
+    """The state file is INPUT, not memory, and its marks get the same
+    treatment its readings get. A mark in the FUTURE is the dangerous one: it
+    would suppress every real tick until the clock caught up, so it is refused
+    by the same rule that refuses a future reading."""
+    marks = feeder.validate_checked_marks(
+        {"weight": CAPTURED_AT,
+         "future": SAME_DAY_NOW + 10 * 3600,
+         "ancient": feeder.EPOCH_FLOOR - 1,
+         "text": "yesterday",
+         "": CAPTURED_AT}, SAME_DAY_NOW)
+    assert marks == {"weight": CAPTURED_AT}
+    assert feeder.validate_checked_marks(["weight"], SAME_DAY_NOW) == {}
+    assert feeder.validate_checked_marks(None, SAME_DAY_NOW) == {}
+
+
+def test_a_lost_tick_mark_cannot_tick_the_wrong_day_sr022():
+    """The two gates are independent, and this is what that buys.
+
+    Lose the mark — a corrupted file, a person with an editor — and the day
+    gate still holds: yesterday's weigh-in is not ticked onto today just
+    because we have forgotten ticking it.
+    """
+    yesterday = a_point(physical="2026-09-08T01:24:33Z", civil=False, point_id="P0")
+    stale = feeder.parse_weight_datapoint(a_body(yesterday), SAME_DAY_NOW)
+    assert feeder.should_check_off(stale, None, SAME_DAY_NOW) is False
+    fresh = feeder.parse_weight_datapoint(CAPTURED_SHAPE, SAME_DAY_NOW)
+    assert feeder.should_check_off(fresh, None, SAME_DAY_NOW) is True
+    assert feeder.should_check_off(fresh, CAPTURED_AT, SAME_DAY_NOW) is False
+    assert feeder.should_check_off(fresh, CAPTURED_AT - 1, SAME_DAY_NOW) is True
+    assert feeder.should_check_off(None, None, SAME_DAY_NOW) is False
+
+
+def test_reverting_the_item_to_a_habit_stops_the_tick_sr022(tmp_path):
+    """RULE 7, THE KNOB QUESTION, ANSWERED BY THE DEFINITIONS INSTEAD.
+
+    `type:` and `check:` are the declaration. They belong to the person, they
+    round-trip through Drive sheet mode as item columns, and they are what
+    NagLight itself reads. So there is no `WEIGHT_CHECK_ENABLED`: putting the
+    item back to `type: habit` from a phone turns the tick off by itself on the
+    next sync, and no hub knob can contradict it in either direction.
+    """
+    for name in "abcde":
+        (tmp_path / name).mkdir()
+    automated = write_defs(tmp_path / "a", {"health.md": AUTOMATED_MD})
+    habit = write_defs(tmp_path / "b", {"health.md": HEALTH_MD})
+    empty = write_defs(tmp_path / "c", {})
+    assert feeder.check_id_from_definitions(automated) == "weight"
+    assert feeder.check_id_from_definitions(habit) is None, "type: habit does not tick"
+    # ...and the shape a revert actually produces: the check column SURVIVES
+    # the type column changing, so `type:` is what has to be read.
+    reverted = write_defs(tmp_path / "e", {"health.md": HABIT_BUT_STILL_CHECKED_MD})
+    assert feeder.check_id_from_definitions(reverted) is None, (
+        "`type: habit` beside a lingering `check:` must not tick")
+    assert feeder.check_id_from_definitions(empty) is None
+    assert feeder.check_id_from_definitions("/nonexistent/definitions") is None
+    # An `automated` item with no `check:` names no feeder, so nothing ticks it.
+    no_check = write_defs(tmp_path / "d", {
+        "health.md": AUTOMATED_MD.replace("    check: weight\n", "")})
+    assert feeder.check_id_from_definitions(no_check) is None
+    # ...and the goal still reads out of the SAME item, unchanged by all this.
+    assert feeder.load_goal_from_definitions(automated)[0] == DEFS_GOAL
+
+
+def test_a_habit_item_ticks_nothing_through_a_whole_cycle_sr022(tmp_path):
+    """The same negative, end to end: the Owner's PREVIOUS definitions file
+    posts the gauge and nothing else, with no failure line to decode."""
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed",
+                        defs=HABIT_BUT_STILL_CHECKED_MD)
+        posted, failures, _ = feeder.run_cycle(
+            env, now=SAME_DAY_NOW, readers={"google-health": captured_reader()},
+            goal_loader=a_goal)
+    assert len(bodies(seen)) == 1 and "check" not in bodies(seen)[0]
+    assert posted == [("weight", True, True)]
+    assert failures == []
+
+
+def test_a_dead_source_does_not_even_read_the_definitions_sr022(tmp_path):
+    """The tick is gated on a real read TWICE, and this is the outer gate.
+
+    `run_cycle` does not consult the definitions at all on a cycle that could
+    not read the source. `should_check_off` would refuse such a cycle anyway,
+    so without this the outer gate is untested and a mutant that removes it
+    survives - which is exactly what the first mutation round found. What it
+    buys is real: 95 cycles a week do no definitions I/O, and the gate the
+    reader sees first says plainly that a dead source cannot reach the tick.
+    """
+    asked = []
+
+    def counting_check_loader(defs_dir, *_a):
+        asked.append(defs_dir)
+        return "weight"
+
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = check_env(tmp_path, feed + "/api/feed")
+
+        def dead(e):
+            raise feeder.SourceFailure("google-health: HTTP 401")
+
+        feeder.run_cycle(env, now=SAME_DAY_NOW, readers={"google-health": dead},
+                         goal_loader=a_goal, check_loader=counting_check_loader)
+        assert asked == [], "a dead source must not even ask what to tick"
+
+        feeder.run_cycle(env, now=SAME_DAY_NOW,
+                         readers={"google-health": captured_reader()},
+                         goal_loader=a_goal, check_loader=counting_check_loader)
+    assert len(asked) == 1, "and a live one asks exactly once"
+    assert bodies(seen)[-1] == {"check": "weight", "ok": True}
+
+
+def test_the_check_id_is_whatever_the_item_declares_sr022(tmp_path):
+    """It is not hardcoded. Renaming `check:` renames what is posted, which is
+    what "the definitions are the declaration" has to mean."""
+    renamed = write_defs(tmp_path, {
+        "health.md": AUTOMATED_MD.replace("check: weight", "check: body-weight")})
+    assert feeder.check_id_from_definitions(renamed) == "body-weight"
+    with loopback_server(feed_replies()) as (feed, seen):
+        env = dict(_identity="sub-123", _feed_url=feed + "/api/feed",
+                   WEIGHT_STATE_FILE=str(tmp_path / "s.json"),
+                   STATE_DIRECTORY=str(tmp_path),
+                   WEIGHT_DEFINITIONS_DIR=renamed)
+        feeder.run_cycle(env, now=SAME_DAY_NOW,
+                         readers={"google-health": captured_reader()},
+                         goal_loader=a_goal)
+    assert bodies(seen)[1] == {"check": "body-weight", "ok": True}
+
+
+def test_no_hub_knob_can_turn_the_check_off_on_or_off_sr022():
+    """The negative, by file scan, exactly as the goal's negative is asserted.
+
+    A knob here would be a second place the same intent lives, and it would
+    disagree with the definitions the first time the Owner changed their mind
+    from their phone.
+    """
+    files = [REPO / "stack" / ".env.example"]
+    schema = REPO.parent / "HomeHub" / "scripts" / "deploy" / "FieldSchema.psd1"
+    if schema.exists():
+        files.append(schema)
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        for knob in ("WEIGHT_CHECK_ENABLED", "WEIGHT_CHECK_ID", "WEIGHT_AUTO_CHECK"):
+            assert knob not in text, "%s appears in %s" % (knob, path.name)
+
+
+def test_the_goal_and_the_check_read_the_same_files_by_the_same_rules_sr022(tmp_path):
+    """ONE walk, ONE containment rule. A definitions file that links OUT of the
+    directory is refused for the check exactly as it is for the goal — and the
+    check's refusal is SILENCE rather than an exception, because the tick may
+    never take the gauge down with it."""
+    outside = tmp_path / "outside.md"
+    outside.write_text(AUTOMATED_MD, encoding="utf-8")
+    defs_dir = write_defs(tmp_path, {"real.md": AUTOMATED_MD})
+    link = Path(defs_dir) / "linked.md"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform will not make a symlink without privilege")
+    with pytest.raises(ValueError):
+        feeder.load_goal_from_definitions(defs_dir)
+    assert feeder.check_id_from_definitions(defs_dir) is None
+
+
+def test_the_tick_is_stamped_by_naglights_clock_and_cannot_be_back_dated_sr022():
+    """WHICH DAY THE TICK LANDS ON — written down because it is NOT always the
+    day of the weigh-in, and pretending otherwise would be the lie this block
+    is about.
+
+    Established by READING NagLight's `handleAPIFeed`, not by assuming:
+
+      * the `ok` path never touches `body.At`. `At` is parsed (as RFC3339) only
+        inside `if body.Color != "" || body.RGB != ""`, into a logfile.Report.
+        The boolean path falls through to `date := s.Now()`.
+      * `s.Now()` defaults to `todayString`, which is
+        `time.Now().Format("2006-01-02")` — the TRACKER CONTAINER's local date.
+      * `stack/docker-compose.yml`'s `tracker:` service sets no `TZ:`, while
+        every other service that cares sets `TZ: ${TIMEZONE}`. So that date is
+        UTC today.
+
+    Consequence, for the captured shape: a weigh-in at 20:24 local on Monday is
+    01:24 UTC on Tuesday, so the tick lands on TUESDAY's log. This feeder
+    cannot fix that from here — the lane carries no back-dating — so it does
+    not send an `at` that would silently be dropped, and the residual
+    off-by-one is written down in stack/weight/README.md and docs/status.md for
+    the coordinator instead.
+    """
+    assert "at" not in feeder.check_body("weight")
+    compose = (REPO / "stack" / "docker-compose.yml").read_text(encoding="utf-8")
+    tracker = compose[compose.index("\n  tracker:"):compose.index("\n  actual:")]
+    assert "TZ: ${TIMEZONE}" not in tracker, (
+        "if the tracker gains a TZ the day story changes and the README must "
+        "be revisited - that is the fix, and it is the coordinator's to make")
+    # The trap itself, restated on the numbers the capture proved.
+    assert feeder.local_civil_date(CAPTURED_AT, -18000) == FIXTURE_CIVIL_DAY
+    assert time.strftime("%Y-%m-%d", time.gmtime(CAPTURED_AT)) == FIXTURE_UTC_DAY

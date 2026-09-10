@@ -57,9 +57,10 @@ evening**; in UTC it is **Tuesday**.
   it ticks off Tuesday for a Monday-evening weigh-in, every time anyone in this
   timezone stands on a scale after 7pm.
 
-No check-off is built here. `WeightReading` simply carries `civil_date` and
-`utc_offset_seconds` so the next author is handed them rather than tempted to
-re-derive a day from `observed_at`.
+The check-off **is** built now — see *[The automated check-off](#the-automated-check-off-the-second-post)*
+below — and it uses `civil_date`, never `observed_at`. What that section also
+records is the half of the day problem this repo **cannot** fix: the lane the
+tick is posted on carries no back-dating at all.
 
 ### What it does when it cannot read a weight
 
@@ -643,6 +644,127 @@ could tell.
 
 The feeder sends **numbers only** — never a colour, a band or a severity.
 NagLight owns those, and a test greps a built body for `css`/`severity`/`colour`.
+
+## The automated check-off: the second post
+
+The Owner changed the tracker item from `type: habit` to **`type: automated`**
+with **`check: weight`**, which is what makes this possible at all. Each cycle
+the feeder now posts **two** bodies to the same `/api/feed`, in this order:
+
+```
+1.  {"kind": "gauge", "id": "weight", "unit": "lb", "value": …, "target": …, "observed_at": …}
+2.  {"check": "weight", "ok": true}
+```
+
+The second is on NagLight's **legacy lane**, which is a different lane from the
+gauge — `kind` selects the gauge, and `case "":` (no `kind` at all) routes a
+body to the boolean/colour/rgb struct. The handler counts "signals" among
+`ok != nil`, `color != ""`, `rgb != ""` and refuses anything but **exactly
+one**, so `ok` travels alone. It locates the item by
+`it.Type == model.TypeAutomated && it.Check == body.Check`, first match.
+
+### When the tick is sent, and when it is deliberately not
+
+`should_check_off` has four gates, and **all four** must pass:
+
+1. **A genuinely fresh read this cycle.** Not "the cycle worked" — a source
+   that fails makes the feeder re-post the last real weight *at its original
+   stamp*, and that path must never tick. A tick is a claim that a person stood
+   on a scale, and a source that is down is precisely the circumstance in which
+   this feeder knows nothing about whether they did.
+2. **A sample time strictly newer than the one already ticked.** The scale
+   syncs one weigh-in a week; the timer fires every 15 minutes. Without this,
+   the item would be re-ticked 96 times a day.
+3. **A day we can name** — the reading carries both a `civilTime.date` (or a
+   `utcOffset` to derive one) *and* an offset. "We cannot say what day this was"
+   is an answer, and the answer is silence.
+4. **That day is today, in the reading's own local frame.** `now + utcOffset`,
+   not UTC, and not the hub's `$TZ` — the offset comes from the reading, so this
+   needs no timezone database and no guess about where the household lives.
+
+Two more things it never does: it never posts `ok: false` (nothing here can
+know somebody did *not* weigh in, and `ok: false` calls `engine.Uncheck`, which
+would silently erase a tick the Owner made by hand), and it never posts a
+`note`. The gauge already carries the number; a note would be the obvious way a
+body weight leaks into the tracker's **log lines**, which the traceability
+mirror pushes to a private repo hourly — and it would be dead weight anyway,
+because `handleAPIFeed` decodes `Note` and then never reads it.
+
+### Which day the tick lands on — and what this repo cannot fix
+
+**The legacy `ok` lane cannot back-date.** This was read off
+`internal/web/handlers.go`, not assumed:
+
+* `body.At` is parsed (`time.RFC3339`, into a `logfile.Report`) **only** inside
+  `if body.Color != "" || body.RGB != ""`. The boolean path never touches it and
+  falls through to `date := s.Now()`.
+* `s.Now()` defaults to `todayString` = `time.Now().Format("2006-01-02")` — the
+  **tracker container's local date**.
+* `stack/docker-compose.yml`'s `tracker:` service sets **no `TZ:`**, while every
+  other service that cares sets `TZ: ${TIMEZONE}`. So that date is **UTC today**.
+
+So for the shape the capture proved — a weigh-in at **20:24 local on Monday**,
+which is **01:24 UTC on Tuesday** — the tick lands on **Tuesday's** log. Gate 4
+above stops the *large* errors (a three-day-old reading recovered after an
+outage is not ticked onto today at all), but it cannot stop this ≤1-day one:
+sending an `at` would be silently dropped, which is worse than not sending it,
+because it would look as though back-dating worked.
+
+**The fix is not this feeder's to make.** Adding `TZ: ${TIMEZONE}` to the
+`tracker:` service would make `s.Now()` the household's local date and put
+evening weigh-ins on the right day — NagLight's own Dockerfile installs `tzdata`
+for exactly this ("correct local *today* for the nightly materialize"), so the
+missing `TZ:` looks like a pre-existing gap rather than a decision. But it moves
+the day boundary for **every** item in the tracker, not just this one, so it is
+a coordinator call and is written up in `docs/status.md` rather than slipped in
+here. A test asserts the `tracker:` block still has no `TZ:`, so whoever adds
+one is sent back to this section.
+
+### The two posts fail independently, and the gauge goes first
+
+Each post has its own `try`/`except` and its own failure line. A 400 on the tick
+cannot stop the wall being told what the person weighs; a 500 on the gauge
+cannot swallow the tick. **Gauge first**, because the gauge is what SN-040
+promises and the tick is the extra — putting the extra first would put its
+latency and its failure modes in front of the thing that must always happen.
+`check_id_from_definitions` is not even consulted until the gauge has been
+posted, and not at all on a cycle that could not read the source.
+
+The sample time is recorded as ticked **only after a 200**. A tick that failed
+to post is retried next cycle rather than remembered as done.
+
+### There is no `WEIGHT_CHECK_ENABLED`, on purpose
+
+`type:` and `check:` **are** the declaration. They belong to the person, they
+round-trip through Drive sheet mode as item columns, and they are what NagLight
+itself reads to decide an item is feeder-driven. A hub knob beside them would be
+a second place the same intent lives, and the two would disagree the first time
+the Owner changed their mind from a phone: a knob saying *yes* over a
+`type: habit` item earns a 400 per weigh-in, and a knob saying *no* over
+`type: automated` leaves an item nothing can ever tick and no hint why.
+
+So **nothing** is added to `stack/.env.example`, and **nothing** is owed to
+HomeHub's `FieldSchema.psd1`. Reverting the item to `type: habit` from a phone
+turns the tick off by itself on the next sync. Note that a revert changes the
+*type* column and leaves `check: weight` sitting beside it — sheet mode
+round-trips both — which is why `type:` is read as well as `check:`, and why the
+test for it uses that exact shape. (A first mutation round missed this: the
+plain `HEALTH_MD` fixture has no `check:` at all, so it was being refused for
+the wrong reason and a mutant that deleted the `type:` gate survived.)
+
+### The mark lives in the existing state file
+
+`{"checked": {"weight": <epoch sample time>}}` sits alongside the gauge's own
+entry in `weight-state.json`, written by the same `save_state` through the same
+`open_for_write` guard — one allow-listed path plus its `.tmp`, `realpath`
+-resolved, contained in the `StateDirectory`, opened `O_NOFOLLOW`. **A second
+state file would be a second blessed path**, and the allow-list is the guard.
+
+`load_state` validates the marks the way it validates readings — the state file
+is *input*, not memory. A mark in the future is dropped (it would suppress every
+real tick until the clock caught up). A dropped mark is safe only because gate 4
+is independent of it: with no mark at all, the worst that can happen is a
+re-tick of a reading from *today*, onto *today*, on an item already done.
 
 ## "Stale, never green" is one invariant, not a scatter of checks
 

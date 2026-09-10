@@ -8,6 +8,23 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 — B11's automated check-off is BUILT and LOCAL-ONLY (not pushed,
+not deployed).** The Owner changed the `weigh-in` item to `type: automated` with
+`check: weight`, and it has synced, so the feeder now posts **two** bodies per
+cycle to the same `/api/feed`: the existing `kind: gauge` body for the bar, and
+`{"check": "weight", "ok": true}` on the **legacy lane** to tick the item. The
+two posts fail independently and the **gauge goes first** — the gauge is what
+SN-040 promises, the tick is the extra. The tick fires only on a genuinely fresh
+read whose `sampleTime` is strictly newer than the one already ticked **and**
+whose civil date is today in the reading's own local frame; the source-failure
+re-post path can never tick, which is the whole point. There is **no
+`WEIGHT_CHECK_ENABLED` knob** and none is wanted: `type:`/`check:` in the
+person's own definitions are the declaration, so nothing is owed to
+`stack/.env.example` or to HomeHub's `FieldSchema.psd1`. **What the coordinator
+must decide is the DAY** — see the audit entry at the bottom of this file: the
+legacy `ok` lane cannot back-date, and the `tracker:` service carries no `TZ:`,
+so an evening weigh-in ticks the NEXT day's box. Gate remains G1.
+
 **2026-09-09 — B11 steps 3 and 4 are BUILT on a SIDE BRANCH (`b11-weight-token`),
 CROSS-REVIEW FIXES APPLIED, pending merge into `IceDrive-DesktopDirection`, and
 neither has ever spoken to Google.** A cross-review by another model family
@@ -579,6 +596,12 @@ gone, and each is asserted directly. Nothing else in this block is defended by
 more than one mechanism.
 
 ### Auto-check-off: what it would take, and why it is not built
+
+**SUPERSEDED 2026-09-09 — the check-off IS built; see the audit entry at the
+end of this file. Keep reading for the hazards it names, but note that the
+route guessed at here (`POST /api/check {id, done, expectedDate}`) is NOT the
+one used: the legacy `/api/feed` lane carries no `expectedDate` and cannot
+back-date at all.**
 
 The Owner asked whether the feeder could tick the `weigh-in` habit off when
 Google reports a new weight sample, via `POST /api/check {id, done,
@@ -7506,3 +7529,156 @@ drop-in and the override, and reloads), then `systemctl start
 homehub-weight.service` once and read the journal. The script prints which file
 it resolved; if it prints the WARNING instead, the category file has not synced
 and nothing is bound yet.
+
+---
+
+**2026-09-09 B11's automated check-off — BUILT (SR-022/LLR-006/TC-006). This
+SUPERSEDES the "Auto-check-off: what it would take, and why it is not built"
+section above.** That section named three hazards and refused to build on the
+first two; the item changing to `type: automated` / `check: weight` settled the
+route, and all three are now answered — but **not** in the shape that section
+guessed at. It assumed `POST /api/check {id, done, expectedDate}`. The actual
+route is `/api/feed`'s **legacy lane**, and it carries no `expectedDate` and no
+back-dating of any kind.
+
+**What is posted.** Two bodies per cycle to one endpoint, gauge first:
+
+```
+1.  {"kind": "gauge", "id": "weight", "unit": "lb", "value": …, "target": …, "observed_at": …}
+2.  {"check": "weight", "ok": true}
+```
+
+The second carries **no `kind`** (that selects the gauge lane; `case "":` is what
+routes to the boolean struct), **no `color`/`rgb`** (the handler counts signals
+among `ok != nil`, `color != ""`, `rgb != ""` and refuses anything but exactly
+one), **no `note`** and **no `at`**.
+
+**Hazard 1 — "fire on a new `sampleTime`, not on a successful read" — answered
+as four gates, all required.** A genuinely fresh read this cycle (not "the cycle
+worked", not the gauge's own `fresh` flag); a `sampleTime` strictly newer than
+the one already ticked; a day the reading can actually name; and that day being
+today in the reading's **own** local frame (`now + utcOffset`, so no timezone
+database and no guess about where the household lives). The source-failure
+re-post path — which reposts the last real weight at its original stamp — can
+never tick. The feeder also never posts `ok: false`: it can never know somebody
+did *not* weigh in, and `ok: false` routes to `engine.Uncheck`, which would
+silently erase a tick the Owner made by hand.
+
+**Hazard 3 — idempotency — read rather than guessed.** `engine.Check` sets
+`li.Done = true`, clears any report and calls `SaveDay` unconditionally. So a
+repeat is **not** a toggle (the retry hazard that section feared is not real),
+but it is also not free: every repeat is a `SaveDay`, a panel wake via
+`bumpRevision`, and on a single-user box a git commit. Gate 2 above is what
+keeps that to one write per weigh-in rather than 96 a day.
+
+**Hazard 2 — the DAY — is the one that is NOT fully fixed, and that is the
+finding.** The legacy `ok` path **cannot back-date**: `body.At` is parsed only
+inside `if body.Color != "" || body.RGB != ""`, and the boolean path falls
+through to `date := s.Now()`. `s.Now()` defaults to `todayString` =
+`time.Now().Format("2006-01-02")`, the **tracker container's** local date — and
+`stack/docker-compose.yml`'s `tracker:` service sets **no `TZ:`**, while every
+other service that cares sets `TZ: ${TIMEZONE}`. So the tick lands on **UTC
+today**. For the shape the capture proved — 20:24 local on Monday = 01:24 UTC on
+Tuesday — the tick lands on **Tuesday's** box. Gate 4 stops the large errors (a
+reading recovered days later after an outage is not ticked at all); it cannot
+stop this ≤1-day one. Sending an `at` was rejected as *worse* than not sending
+one: it would be silently dropped and would look as though back-dating worked.
+
+**OWED TO THE COORDINATOR — one decision.** Adding `TZ: ${TIMEZONE}` to the
+`tracker:` service in `stack/docker-compose.yml` would make `s.Now()` the
+household's local date and put evening weigh-ins on the right day. NagLight's
+own Dockerfile installs `tzdata` for exactly that reason ("correct local *today*
+for the nightly materialize"), so the missing `TZ:` reads as a pre-existing gap
+rather than a decision — **but it moves the day boundary for every item in the
+tracker, not just this one**, and other sessions are in NagLight and HomeHub.
+That is why it was not done here. A test asserts the `tracker:` block still has
+no `TZ:`, so whoever adds one is sent to `stack/weight/README.md` first.
+
+**No new knob, and that is an argued choice, not an omission.** `type:` and
+`check:` are the declaration: they belong to the person, they round-trip through
+Drive sheet mode as item columns, and they are what NagLight itself reads. A
+`WEIGHT_CHECK_ENABLED` beside them would be a second place the same intent
+lives, and the two would disagree the first time the Owner changed their mind
+from a phone. So **nothing is added to `stack/.env.example` and nothing is owed
+to HomeHub's `FieldSchema.psd1`** (which is out of this block's bounds anyway) —
+a test scans both for `WEIGHT_CHECK_*` names and fails on one.
+
+**State.** `{"checked": {"weight": <epoch sample time>}}` lives in the **existing**
+`weight-state.json`, written by the same `save_state` through the same
+`open_for_write` guard. A second state file would be a second path the
+credential allow-list has to bless, so there is not one. The mark is written
+**only after a 200**, so a tick that failed to post is retried rather than
+remembered as done. `load_state` validates the marks the way it validates
+readings — a mark in the future is dropped, because it would suppress every real
+tick until the clock caught up.
+
+**One pre-existing decision was revisited.** `read_google_health` used to return
+`(pounds, observed_at)` and deliberately drop `civil_date`/`utc_offset_seconds`,
+on the reasoning that a caller needing the calendar day would call
+`parse_weight_datapoint` itself. That caller is `run_cycle`, which reaches the
+vendor only through `read_google_health` — so honouring the old shape would have
+meant a **second** `dataPoints.list` call carrying the access token every 15
+minutes to recover a field the first call already had. It now returns the whole
+`WeightReading`, and `reading_pair` takes the gauge's two numbers off it; a test
+asserts exactly two requests reach the loopback.
+
+**Nothing was weakened.** The freshness invariant, the credential write guard,
+the no-leak property (the tick body carries no weight, no id, no token — the
+handler's `Note` field is decoded and never read by anything, so a note would
+have been a leak for no gain), `vendor_opener()`/`feed_opener()`, the OAuth
+client resolution order, the unit-before-number rule, the parser and its grams
+conversion, the depth-aware definitions reader, the scoped single-file
+definitions bind, and the two distinct refusals (no source → unavailable gauge;
+no goal → nothing posted) are all unchanged. The definitions walk was **factored
+out**, not duplicated: `scan_definitions` is the one containment rule, and both
+the goal loader and the check-id reader call it.
+
+**Mutation runs: 17 mutants, and the first pass had two survivors.**
+
+| # | mutation | test that must go red | result |
+|---|---|---|---|
+| M1 | the "strictly newer sample" gate deleted | `…same_weigh_in_is_ticked_once…` | RED |
+| M2 | the mark written whether or not the tick landed | `…refused_tick_leaves_the_gauge_posted…` | RED |
+| M3a | `run_cycle`'s outer "did we read?" gate removed | `…dead_source_does_not_even_read…` | **survived first pass**, RED after |
+| M3b | both "did we read?" gates removed | `…dead_source_reposts_the_gauge_and_never_ticks…` | RED |
+| M4 | the day gate always passes | `…another_day_is_never_ticked…` | RED |
+| M5 | "today" taken in UTC, not the reading's local frame | `…fresh_weigh_in_posts_the_gauge_and_then_the_tick…` | RED |
+| M6 | a `note` added to the tick body | `…tick_body_carries_no_kind…` | RED |
+| M6b | a `kind` added (routes to the gauge lane) | `…tick_body_carries_no_kind…` | RED |
+| M13 | an `at` added (silently dropped by the ok path) | `…cannot_be_back_dated…` | RED |
+| M7 | the tick posted BEFORE the gauge | `…fresh_weigh_in_posts_the_gauge_and_then_the_tick…` | RED |
+| M8 | a failed gauge post suppresses the tick | `…refused_gauge_does_not_prevent_the_tick…` | RED |
+| M9 | the marks get a state file of their own | `…tick_mark_lives_in_the_one_existing_state_file…` | RED |
+| M10 | `load_state` drops the marks again | `…same_weigh_in_is_ticked_once…` | RED |
+| M11 | `type:` not read, so a habit item is ticked | `…reverting_the_item_to_a_habit…` | **survived first pass**, RED after |
+| M12 | the check id hardcoded instead of read | `…check_id_is_whatever_the_item_declares…` | RED |
+| M14 | a tick mark in the FUTURE trusted | `…tick_mark_that_is_not_credible…` | RED |
+| M15 | the vendor read drops the day facts again | `…fresh_weigh_in…` / `…whole_vendor_read…` | RED |
+
+**M11 was a TEST defect, and it is the one worth reading.** The test asserted
+"`type: habit` does not tick" against the plain `HEALTH_MD` fixture — which has
+**no `check:` field at all**, so it was being refused for the wrong reason and
+the `type:` gate was never exercised. The shape a revert actually produces is
+`type: habit` sitting **next to** a lingering `check: weight`, because Drive
+sheet mode round-trips every item column it knows: changing the type column does
+not delete the check column. A `HABIT_BUT_STILL_CHECKED_MD` fixture now covers
+it, end to end as well as at the unit.
+
+**M3a was a check carried by another.** `run_cycle` gates the definitions read
+on `reading is not None` and `should_check_off` gates the tick on the same fact,
+so removing either alone changed no observable behaviour. That is deliberate
+defence in depth, but the outer gate does buy something real (95 cycles a week
+do no definitions I/O), so it is now asserted directly with an injected
+`check_loader` that counts calls, rather than left as an untested redundancy.
+
+**Evidence.** `python scripts/check.py` — **715 passed / 6 skipped**, RESULT
+PASS (baseline at `23c3f04` was 694/6, so +21 tests). `scripts/trace.py
+--strict-integrity` integrity=0. `check_flows.py --no-placeholders` and
+`check_docs.py` clean. Every cycle test in the new section runs against a **real
+loopback HTTP server**, because a stubbed `urlopen` would prove nothing about
+two posts arriving in an order. `stack/run-hermetic-tests.sh` is **UNRUN** — it
+refuses on this dev PC (missing `zstd`/`rsync`).
+
+**Not done here.** No push, no hub state touched, no deploy, no new knob, no new
+apt package, no change to `stack/.env.example`, no change to HomeHub's
+`FieldSchema.psd1`, and no change to `docker-compose.yml`.

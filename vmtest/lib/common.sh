@@ -2527,6 +2527,21 @@ render_sim_wall_env() {
     # guarantees the VM cannot contact a household camera.
     set_env_key "$env_out" DOORBELL_RTSP_HOST "vmtest-no-camera.invalid"
     set_env_key "$env_out" DOORBELL_RTSP_PASSWORD "vmtest-not-a-real-camera-secret"
+    # MOTION: explicit conservative SIM values. The all-frame trigger keeps the
+    # syntax exercisable without encoding a real property's layout; a zero-area
+    # road zone and empty masks make the fixture topology-free. The .invalid
+    # host above means these values still cannot start a real capture.
+    set_env_key "$env_out" DOORBELL_MOTION_ENABLED "false"
+    set_env_key "$env_out" DOORBELL_MOTION_CALIBRATED "false"
+    set_env_key "$env_out" DOORBELL_MOTION_SAMPLE_FPS "2"
+    set_env_key "$env_out" DOORBELL_MOTION_MIN_AREA_RATIO "0.01"
+    set_env_key "$env_out" DOORBELL_MOTION_PERSISTENCE_SECONDS "2"
+    set_env_key "$env_out" DOORBELL_MOTION_DWELL_SECONDS "3"
+    set_env_key "$env_out" DOORBELL_MOTION_STATIONARY_RATIO "0.02"
+    set_env_key "$env_out" DOORBELL_MOTION_TRIGGER_ZONE "0,0,1,1"
+    set_env_key "$env_out" DOORBELL_MOTION_ROAD_ZONE "0,0,0,0"
+    set_env_key "$env_out" DOORBELL_MOTION_MASKS ""
+    set_env_key "$env_out" DOORBELL_MOTION_DIAGNOSTICS "false"
 
     # SLEEP: `backlight`, not the production `suspend`. A gate VM that suspends
     # itself at 22:00 is indistinguishable from a gate VM that died, and its

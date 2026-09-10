@@ -29,10 +29,29 @@ LoadCredential=yaw:/run/wall-door-credentials/yaw
 LoadCredential=pitch:/run/wall-door-credentials/pitch
 LoadCredential=stale-seconds:/run/wall-door-credentials/stale-seconds
 LoadCredential=start-seconds:/run/wall-door-credentials/start-seconds
+LoadCredential=motion-enabled:/run/wall-door-credentials/motion-enabled
+LoadCredential=motion-calibrated:/run/wall-door-credentials/motion-calibrated
+LoadCredential=motion-sample-fps:/run/wall-door-credentials/motion-sample-fps
+LoadCredential=motion-min-area-ratio:/run/wall-door-credentials/motion-min-area-ratio
+LoadCredential=motion-persistence-seconds:/run/wall-door-credentials/motion-persistence-seconds
+LoadCredential=motion-dwell-seconds:/run/wall-door-credentials/motion-dwell-seconds
+LoadCredential=motion-stationary-ratio:/run/wall-door-credentials/motion-stationary-ratio
+LoadCredential=motion-trigger-zone:/run/wall-door-credentials/motion-trigger-zone
+LoadCredential=motion-road-zone:/run/wall-door-credentials/motion-road-zone
+LoadCredential=motion-masks:/run/wall-door-credentials/motion-masks
+LoadCredential=motion-diagnostics:/run/wall-door-credentials/motion-diagnostics
 ExecStartPre=+/bin/chgrp panel /run/wall-door-stream
 ExecStart=/usr/bin/python3 /opt/wall-panel/app/runtime/resources/app/doorstream/service.py --credential-directory %d --socket /run/wall-door-stream/service.sock --allowed-group panel
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=5
+KillMode=mixed
+CPUAccounting=true
+CPUQuota=80%
+MemoryAccounting=true
+MemoryMax=384M
+TasksMax=64
+OOMPolicy=stop
 
 # The broker needs LAN sockets and its runtime directory, but no writable
 # filesystem, devices, home directory, elevated transition, or kernel control.

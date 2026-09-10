@@ -17,11 +17,11 @@ REQUIRED = {
     "private-access-v1": {"app": ["index.html", "js/main.js", "js/access.js", "js/views/settings.js", "css/access.css", "electron/access-broker.cjs", "electron/main.cjs", "electron/preload.cjs"], "site": ["index.html", "js/main.js", "js/access.js", "js/views/settings.js", "css/access.css"], "gateway": ["gateway/server.mjs", "gateway/state.mjs"]},
     "sensors-v1": {"app": ["index.html", "js/main.js", "js/views/settings.js", "css/access.css", "electron/main.cjs", "electron/preload.cjs", "sensors/service.py", "sensors/identity.py", "sensors/face_core.py"], "site": [], "gateway": []},
     "touch-filter-v1": {"app": ["touchfilter/core.py", "touchfilter/daemon.py", "touchfilter/replay.py"], "site": [], "gateway": []},
-    "ambient-drill-v1": {"app": ["index.html", "js/main.js", "js/views/nag.js", "js/nag-summary.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/nag.js", "js/nag-summary.js", "css/shell.css"], "gateway": []},
+    "ambient-drill-v1": {"app": ["index.html", "js/main.js", "js/views/nag.js", "js/nag-summary.js", "js/ambient-priority.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/nag.js", "js/nag-summary.js", "js/ambient-priority.js", "css/shell.css"], "gateway": []},
     "virtual-input-v1": {"app": ["index.html", "js/main.js", "js/pin-keypad.js", "js/text-keyboard.js", "js/views/settings.js", "js/views/pandora.js", "css/access.css", "css/shell.css", "electron/pandora-keyboard-bridge.cjs", "electron/main.cjs", "electron/preload.cjs"], "site": ["index.html", "js/main.js", "js/pin-keypad.js", "js/views/settings.js", "css/access.css"], "gateway": []},
     "tracker-corrections-v2": {"app": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "gateway": ["gateway/server.mjs", "gateway/state.mjs"]},
     "local-visualizer-v1": {"app": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "gateway": []},
-    "door-stream-v1": {"app": ["index.html", "js/main.js", "js/state-machine.js", "js/views/door.js", "css/shell.css", "electron/main.cjs", "electron/preload.cjs", "electron/door-bridge.cjs", "doorstream/service.py"], "site": [], "gateway": []},
+    "door-stream-v1": {"app": ["index.html", "js/main.js", "js/state-machine.js", "js/views/door.js", "css/shell.css", "electron/main.cjs", "electron/preload.cjs", "electron/door-bridge.cjs", "doorstream/service.py", "doorstream/motion.py"], "site": [], "gateway": []},
 }
 
 # Exact regular-file inventory emitted by OfficeWallNaglight's SITE_SOURCES at
@@ -38,6 +38,7 @@ ALLOWED_SITE_FILES = {
     "css/touch-feedback.css",
     "index.html",
     "js/access.js",
+    "js/ambient-priority.js",
     "js/attention-lease.js",
     "js/config.js",
     "js/heartbeat.js",

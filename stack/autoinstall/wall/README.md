@@ -104,6 +104,42 @@ Until those land, this variant is a **complete image with a missing payload** â€
 which is the intended half-built state at this gate, and is stated as such rather
 than papered over.
 
+## Door motion image boundary (SR-024; physical calibration still open)
+
+The Door application remains a private shell artifact. This image requires that
+artifact to carry both `doorstream/service.py` and the pure
+`doorstream/motion.py` detector, and names `python3-opencv` in `packages.list`
+so MOG2/morphology/connected-components support is resolved and installed from
+the baked offline apt repository. Nothing runs pip or reaches an archive during
+first boot.
+
+Root firstboot reads `wall.env` once and writes only the exact Door allowlist to
+root-owned `/run/wall-door-credentials`; systemd copies those values into the
+unprivileged service's RAM-backed credential directory. The unit never mounts
+`wall.env`, and its stdout/stderr remain suppressed so a decoder cannot leak an
+authenticated URL. Detector configuration is public but travels through the
+same exact allowlist: effective enable/calibration gates, sample cadence, normalized minimum area, persistence,
+dwell/stationary threshold, normalized trigger/road zones and masks, plus an
+explicit diagnostics boolean. Tracked defaults contain no real-property shape
+and leave both motion gates false. Firstboot validates every value even while
+disabled; only explicit enabled+calibrated state publishes effective enable.
+Invalid configuration makes provisioning red and publishes safe disabled
+values. An incomplete payload or removed camera input stops/disables the unit
+and purges old volatile credentials and socket state.
+
+The broker is only eligible while the display is lit/present. Every backlight-
+off and suspend path completes a bounded stop before changing power state; display-on starts an
+idle broker, not FFmpeg or an RTSP session. The unit has explicit CPU, memory,
+task and stop-time ceilings. The application owns the detector and sanitized
+generation/sequence event; the renderer owns the renewable five-second preview
+lease. No normal path writes a camera frame.
+
+Before relying on motion, the Owner must calibrate the normalized zones/masks,
+component area, persistence, dwell and stationary threshold using day and night
+samples, set both motion gates true, then measure CPU/thermal load and coexistence on the real panel. The
+tracked full-frame trigger and disabled road zone are syntax-safe starting
+points, not tuned detection policy and not hardware acceptance.
+
 ## The media pull (OI-15, ruled by the Owner 2026-07-29; TWO sources since OI-18, ruled 2026-08-03)
 
 > The panel's media lives on network shares; the **panel pulls** â€” once after

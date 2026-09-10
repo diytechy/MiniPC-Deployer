@@ -64,6 +64,8 @@
 #   A18 the alarm is the NEXT LOCAL OCCURRENCE of the wake time, so it is still
 #       06:45 across a DST boundary and not 05:45
 #   A19 a backlight that cannot be turned off blocks the suspend
+#   A20 Door stop failure blocks backlight-off and suspend before either side
+#       effect, and a hung stop is cut off by the shipped teardown ceiling
 #
 # Usage: bash occupancy-power.test.sh
 set -uo pipefail
@@ -101,6 +103,12 @@ mkdir -p "$BIN"
 cat > "$BIN/systemctl" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "\$SYSTEMCTL_LOG"
+case "\$*" in
+    "stop wall-door-stream.service")
+        [ -n "\${SYSTEMCTL_STOP_SLEEP:-}" ] && sleep "\$SYSTEMCTL_STOP_SLEEP"
+        [ -n "\${SYSTEMCTL_STOP_FAIL:-}" ] && exit 1
+        ;;
+esac
 exit 0
 EOF
 
@@ -199,6 +207,7 @@ scenario() {
     FAKE_RTC_DIR="$ROOT/sys/class/rtc"
     export SYSTEMCTL_LOG RTCWAKE_LOG PY3_LOG FAKE_RTC_DIR
     unset RTCWAKE_FAIL RTCWAKE_SILENT_NOOP FAKE_LOCAL_RTC FAKE_NOW FAKE_NO_TIMEDATECTL
+    unset SYSTEMCTL_STOP_FAIL SYSTEMCTL_STOP_SLEEP
     ENV_FILE="$ROOT/etc/wall.env"
     PRESENCE_FILE="$ROOT/run/presence.json"
 }
@@ -717,6 +726,30 @@ else
     eq "no" "$(suspended)" "A19 a read-only brightness node blocks the suspend too"
     chmod u+w "$BL_DIR/brightness" 2>/dev/null || true
 fi
+
+# ── A20d: Door teardown completes before backlight-off or suspend ──────────
+scenario a20d-fail
+write_env "SLEEP_MODE=backlight"
+SYSTEMCTL_STOP_FAIL=1 run start
+eq "100" "$(brightness)" "A20d failed Door stop leaves the backlight lit"
+grep -qx 'stop wall-door-stream.service' "$SYSTEMCTL_LOG" \
+    && pass "A20d backlight-off actually attempted the Door stop" \
+    || fail "A20d backlight-off never attempted the Door stop"
+
+scenario a20d-suspend
+write_env "SLEEP_MODE=suspend"
+SYSTEMCTL_STOP_FAIL=1 run start
+eq "no" "$(suspended)" "A20d failed Door stop blocks suspend"
+
+scenario a20d-timeout
+write_env "SLEEP_MODE=backlight"
+started="$(date +%s)"
+SYSTEMCTL_STOP_SLEEP=30 run start
+elapsed=$(( $(date +%s) - started ))
+eq "100" "$(brightness)" "A20d timed-out Door stop leaves the backlight lit"
+[ "$elapsed" -le 10 ] \
+    && pass "A20d hung Door teardown is bounded (${elapsed}s)" \
+    || fail "A20d hung Door teardown exceeded its ceiling (${elapsed}s)"
 
 # ── A20: the ratified 06:45 IS the occupancy wake ──────────────────────────
 # The other half of V3: 06:45 must still be what an occupancy panel wakes to,

@@ -62,9 +62,18 @@ PKG_LIST="$REPO_ROOT/stack/autoinstall/wall/packages.list"
 [ -f "$PKG_LIST" ] || { echo "not found: $PKG_LIST" >&2; exit 1; }
 PKGS="$(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if (length($0)) print }' "$PKG_LIST" | tr '\n' ' ')"
 [ -n "$PKGS" ] || { echo "no package names could be parsed out of $PKG_LIST" >&2; exit 1; }
+grep -qx 'python3-opencv' <(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if (length($0)) print }' "$PKG_LIST") || {
+    echo "python3-opencv is absent from the offline wall package contract" >&2
+    exit 1
+}
+SHELL_ARTIFACT="$(ls "$DIST"/officewall-shell-*-linux-x64.tar.gz | head -n1)"
+python3 "$REPO_ROOT/scripts/assert_wall_capabilities.py" --shell "$SHELL_ARTIFACT" || {
+    echo "shell artifact lacks the Door motion/ambient capability payload" >&2
+    exit 1
+}
 
 echo "base image: $IMAGE"
-echo "artifact:   $(basename "$(ls "$DIST"/officewall-shell-*-linux-x64.tar.gz | head -n1)")"
+echo "artifact:   $(basename "$SHELL_ARTIFACT")"
 echo "packages:   $PKGS"
 echo
 
@@ -89,6 +98,12 @@ apt-get install -y -qq $PKGS >/dev/null 2>&1 || {
 echo "--- unpacking the way the autoinstall does: tar, as root ---"
 install -d /opt/wall-panel
 tar -xzf /art/officewall-shell-*-linux-x64.tar.gz -C /opt/wall-panel
+
+echo "--- importing OpenCV and executing the baked Door motion module ---"
+python3 -c "import cv2, runpy, sys; runpy.run_path(sys.argv[1], run_name=sys.argv[2])" \
+    /opt/wall-panel/app/runtime/resources/app/doorstream/motion.py artifact_probe \
+    && echo "ok    cv2 imports and the actual artifact motion.py executes in the package closure" \
+    || { echo "FAIL  python3-opencv or the artifact motion module is not executable in the baked closure"; exit 1; }
 
 rc=0
 [ -x /opt/wall-panel/app/wall-shell ] \

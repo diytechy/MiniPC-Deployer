@@ -220,7 +220,7 @@ sequenceDiagram
     P->>B: Door-only RAM-backed credentials
     B->>U: bind service.sock 0660
     Note over B,C: IDLE - no RTSP connection and no decoder
-    R->>U: explicit start {mode: corrected|raw}<br/>(Door tab present and unlocked)
+    R->>U: explicit visible-frame start {mode: corrected|raw}<br/>(Door is public)
     B->>F: spawn with non-secret argv; authenticated URL on stdin
     F->>C: authenticated RTSP / H.264 video only
     C-->>F: H.264 plus AAC
@@ -232,6 +232,35 @@ sequenceDiagram
     Note over R: clear the retained frame; late generations are rejected
     Note over B,C: IDLE again - broker stays ready, source and decoder are gone
 ```
+
+### Door motion eligibility and private sampling (SR-024, LLR-008, IF-016)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as occupancy/backlight decision
+    participant P as systemd
+    participant B as unprivileged Door broker (SR-024)
+    participant M as pure motion core (LLR-008)
+    participant R as Electron
+
+    O->>P: display on and presence eligible
+    Note over P: motion remains false unless enabled + calibrated + valid
+    P->>B: start idle broker with exact RAM-backed credentials
+    R->>B: FULL eligibility generation
+    B->>M: bounded samples at configured cadence
+    M-->>B: numeric zone/track decision; frame discarded
+    B-->>R: sanitized generation and sequence observation
+    Note over R: renderer owns the five-second presentation lease
+    O->>P: backlight off or suspend requested
+    P->>B: stop with bounded timeout before power transition
+    Note over B,M: no capture, detector, or retained frame while dark
+```
+
+The image supplies offline OpenCV, normalized topology-free defaults and the
+power boundary; it does not decide whether motion qualifies or renew the UI.
+The application artifact owns those pure decisions. Physical day/night tuning,
+CPU/thermal behavior and camera performance remain hardware evidence.
 
 ### One AI-usage cycle, and how a failed source stays un-green (SR-021, LLR-005, IF-013)
 

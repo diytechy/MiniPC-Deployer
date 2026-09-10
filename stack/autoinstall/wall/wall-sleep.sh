@@ -150,10 +150,13 @@ DECIDER="/usr/local/sbin/wall-occupancy.py"
 # The display lifecycle is also the Door source lifecycle (WSN-019). Stopping
 # the broker destroys its active client and the FFmpeg child before the panel
 # goes dark or suspends. Starting the broker only recreates the idle Unix socket;
-# it never opens RTSP — the unlocked Door tab still requires an explicit start.
+# it never opens RTSP — the application must separately declare present/lit
+# sampler eligibility or request public visible Door frames.
 stop_door_stream() {
     systemctl cat wall-door-stream.service >/dev/null 2>&1 || return 0
-    systemctl stop wall-door-stream.service >/dev/null 2>&1
+    # The unit owns a five-second child teardown; this outer ceiling also covers
+    # a wedged systemd transaction. Failure keeps the lit/reachable state.
+    timeout 7 systemctl stop wall-door-stream.service >/dev/null 2>&1
 }
 start_door_broker() {
     systemctl cat wall-door-stream.service >/dev/null 2>&1 || return 0

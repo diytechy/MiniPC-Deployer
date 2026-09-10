@@ -296,6 +296,27 @@ below has to be done twice, with the right shape each time.
       out (the same test as §4's RTC check) and confirm the morning-style resume
       also triggered a sync — the D-W4 window is the wake this hook exists for.
 
+## Door motion calibration and resource gate (SR-024)
+
+- [ ] Leave `DOORBELL_MOTION_ENABLED=false` and
+      `DOORBELL_MOTION_CALIBRATED=false` until every calibration check below is
+      complete. Then set both true and rerun firstboot; either true without the
+      other remains fail-closed.
+- [ ] Confirm display-off and suspend stop `wall-door-stream.service` before
+      the backlight/power transition, and that Door motion never lights a dark
+      panel. Confirm resume starts only the idle broker until the application
+      declares FULL/present eligibility.
+- [ ] With de-identified day and night samples, tune normalized trigger/road
+      zones, masks, minimum area, roughly-two-second persistence, dwell and
+      stationary thresholds. Exercise porch/driveway entry, road crossing
+      rejection, stopping/dwelling road motion, lighting shifts and noise.
+- [ ] Run a present-and-lit soak and record CPU, RSS, temperature, detector
+      cadence, reconnect/stale behavior and Pandora/audio coexistence. Confirm
+      no frame or authenticated RTSP URL appears in files, argv or logs.
+- [ ] Keep `DOORBELL_MOTION_DIAGNOSTICS=false` for normal operation. If numeric
+      diagnostics are temporarily enabled, verify their bounded output and
+      disable them after calibration. Never commit a frame or property mask.
+
 ## Bluetooth/audio feasibility gate (SR-023)
 
 Do not set `WALL_AUDIO_ENABLED=true` as evidence that audio works. The shipped

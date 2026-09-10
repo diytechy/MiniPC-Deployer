@@ -205,4 +205,5 @@ python3-venv
 libpython3.12t64
 python3-evdev           # whole-gesture touchscreen filter; baked for offline installs
 ffmpeg
+python3-opencv         # SR-024: offline MOG2/morphology/connected-components Door detector
 bluez

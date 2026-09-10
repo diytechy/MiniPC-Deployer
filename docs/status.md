@@ -7840,3 +7840,77 @@ staged final image gate `python scripts/check.py` — **727 passed / 11 skipped,
 RESULT PASS** (config, registry integrity and documentation checks all passed;
 the pre-existing orphan-document warning remains). No physical proof was added,
 and G1 does not advance.
+
+## 2026-09-10 — SR-024 Door-motion image boundary (application detector pending artifact)
+
+The image-owned Door-motion slice now traces SN-018 → SR-024 → LLR-008 →
+TC-008 and IF-016. `python3-opencv` is named in the wall package SSOT and was
+confirmed present in the existing Ubuntu apt metadata; the ordinary resolver,
+baked-list stamp, offline installer and installed-package assertion therefore
+own its carriage. Release capability validation now refuses an application
+artifact missing `doorstream/motion.py`, while the existing ambient capability
+also requires `js/ambient-priority.js` in app and site artifacts.
+
+The unprivileged Door unit receives the existing camera fields plus eleven public
+detector values through an exact systemd credential allowlist, never through
+`wall.env` or argv. Tracked/SIM zones are normalized and topology-free, the SIM
+camera host is `.invalid`, diagnostics default false, and the unit has explicit
+CPU, memory, task and stop ceilings. Existing power control was confirmed and
+made an explicit cross-lifecycle test: display-off and suspend complete a
+bounded broker stop
+before the power transition; display-on may ready only the idle broker. Motion
+still cannot wake a dark panel.
+
+Assumptions pending application/review: detector values use credential names
+`motion-enabled`, `motion-calibrated`, `motion-sample-fps`, `motion-min-area-ratio`, `motion-persistence-seconds`,
+`motion-dwell-seconds`, `motion-stationary-ratio`, `motion-trigger-zone`,
+`motion-road-zone`, `motion-masks`, and `motion-diagnostics`; zones are
+`x,y,width,height` normalized tuples and masks are a bounded application-parsed
+list of those tuples. Firstboot now validates every range before publication; the private application must emit
+only sanitized generation/sequence observations, retain no frames, and keep
+visible-frame subscription separate from sampler lifetime.
+
+Focused evidence: the red-first Door/occupancy tests failed five cases before
+the image changes, then passed **177 tests / 1 platform skip** with the broader
+release-contract fixture set. Ubuntu WSL `apt-cache show python3-opencv`
+confirmed the package name for amd64. Physical day/night tuning, camera access,
+CPU/thermal load, reconnect, latency and media coexistence remain unproven. No
+ISO, VM or live panel was changed, and G1 does not advance.
+
+Final image evidence: Ubuntu WSL `vmtest/test-wall-builder.sh` passed **121
+guards / 0 failed / 2 explicit skips**; the skips were the absent current private
+shell artifact and absent sibling Personal checkout, not silent passes. It
+exercised every new SIM knob-removal refusal and inspected rendered topology-
+free values. With the final handoff staged so offline carriage checks saw the
+real tracked set, `python scripts/check.py` passed **733 tests / 11 skipped,
+RESULT PASS**; config validation, strict registry integrity and documentation
+checks all passed (the pre-existing orphan-doc warning remains). The Docker
+artifact/runtime dependency test could not run without a new private artifact
+containing `motion.py`; its script syntax and new package/capability preflight
+are covered, and the capability unit fixture refuses the missing file.
+
+Adversarial review remediation: the earlier full-frame syntax default is no
+longer eligibility. Both tracked and SIM configuration default motion disabled
+and uncalibrated; firstboot publishes effective true only when both booleans are
+explicitly true and every numeric, zone, mask and diagnostic value is valid.
+Invalid configuration makes firstboot red and substitutes disabled safe values.
+Incomplete application/unit/camera input now stops and disables the prior unit
+and purges stale credential/socket state. The hermetic power harness injects a
+failed and a 30-second-hung Door stop: neither permits the backlight write or
+suspend, and the latter is cut off by the seven-second outer ceiling. The
+artifact test now imports `cv2` and executes the actual artifact `motion.py`
+inside its clean Ubuntu package-list closure. That Docker/artifact proof remains
+**unrun** because no current artifact containing `motion.py` is available; no
+offline runtime or physical detector claim is made from syntax/static checks.
+
+Post-review verification on 2026-09-10: with Git Bash explicitly placed on the
+Windows `PATH`, `python scripts/check.py` passed **747 tests / 11 skipped,
+RESULT PASS**, including the fake-backed stop-failure and 30-second-hang cases;
+configuration, strict trace integrity and documentation gates also passed.
+`bash -n` accepted the edited firstboot, sleep and artifact scripts. A separate
+attempt to rerun `vmtest/test-wall-builder.sh` in the Windows shell was stopped
+after it repeatedly reported the same host-bootstrap limitations (`python3`,
+`genisoimage` and `xorriso` unavailable); none of that partial run is counted as
+new builder or artifact evidence. The prior WSL builder result above predates
+this remediation, so the changed builder assertions still require a suitable
+Ubuntu/WSL runner, and the actual OpenCV artifact execution remains unproven.

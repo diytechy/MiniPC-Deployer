@@ -805,8 +805,70 @@ fi
 # exactly the Door allowlist into volatile /run files; PID 1 alone can traverse
 # their 0700 directory and copies them into the unit's credential mount. The
 # broker then publishes a 0660 socket to the panel group. Starting the unit opens
-# NO RTSP connection; only an explicit request from the unlocked Door tab starts
-# FFmpeg.
+# NO RTSP connection by itself. While the panel is present and lit, the
+# application may declare the FULL sampler eligible and may separately request
+# public visible Door frames.
+_door_cred_dir=/run/wall-door-credentials
+_door_credential_names="host password port path username width height input-fov horizontal-fov vertical-fov yaw pitch stale-seconds start-seconds motion-enabled motion-calibrated motion-sample-fps motion-min-area-ratio motion-persistence-seconds motion-dwell-seconds motion-stationary-ratio motion-trigger-zone motion-road-zone motion-masks motion-diagnostics"
+
+# Stop before removing the volatile inputs. A rerun with an incomplete payload
+# must not leave the previous process or socket alive on stale credentials.
+purge_door_runtime() {
+    systemctl disable --now wall-door-stream.service >/dev/null 2>&1 || true
+    for _door_cred_name in $_door_credential_names; do
+        rm -f -- "$_door_cred_dir/$_door_cred_name"
+    done
+    rm -f -- /run/wall-door-stream/service.sock
+}
+
+door_motion_bool_valid() {
+    [ "$1" = "true" ] || [ "$1" = "false" ]
+}
+
+door_motion_number_between() { # VALUE MIN MAX
+    awk -v value="$1" -v low="$2" -v high="$3" 'BEGIN {
+        if (value !~ /^([0-9]+([.][0-9]+)?|[.][0-9]+)$/) exit 1
+        number = value + 0
+        exit !(number >= low && number <= high)
+    }'
+}
+
+door_motion_zone_valid() { # X,Y,WIDTH,HEIGHT ALLOW_DISABLED
+    awk -v raw="$1" -v allow_disabled="$2" 'BEGIN {
+        count = split(raw, field, ",")
+        if (count != 4) exit 1
+        for (i = 1; i <= 4; i++) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", field[i])
+            if (field[i] !~ /^([0-9]+([.][0-9]+)?|[.][0-9]+)$/) exit 1
+            value[i] = field[i] + 0
+            if (value[i] < 0 || value[i] > 1) exit 1
+        }
+        if (allow_disabled && value[3] == 0 && value[4] == 0) exit 0
+        if (value[3] <= 0 || value[4] <= 0) exit 1
+        exit !((value[1] + value[3] <= 1) && (value[2] + value[4] <= 1))
+    }'
+}
+
+door_motion_masks_valid() {
+    [ -z "$1" ] && return 0
+    awk -v raw="$1" 'BEGIN {
+        zones = split(raw, zone, ";")
+        for (z = 1; z <= zones; z++) {
+            count = split(zone[z], field, ",")
+            if (count != 4) exit 1
+            for (i = 1; i <= 4; i++) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", field[i])
+                if (field[i] !~ /^([0-9]+([.][0-9]+)?|[.][0-9]+)$/) exit 1
+                value[i] = field[i] + 0
+                if (value[i] < 0 || value[i] > 1) exit 1
+            }
+            if (value[3] <= 0 || value[4] <= 0 ||
+                value[1] + value[3] > 1 || value[2] + value[4] > 1) exit 1
+        }
+        exit 0
+    }'
+}
+
 if ! getent group wall-door-stream >/dev/null 2>&1; then
     groupadd --system wall-door-stream
 fi
@@ -815,7 +877,8 @@ if ! id -u wall-door-stream >/dev/null 2>&1; then
         --shell /usr/sbin/nologin wall-door-stream
 fi
 if [ -f /etc/systemd/system/wall-door-stream.service ] && \
-   [ -r /opt/wall-panel/app/runtime/resources/app/doorstream/service.py ]; then
+   [ -r /opt/wall-panel/app/runtime/resources/app/doorstream/service.py ] && \
+   [ -r /opt/wall-panel/app/runtime/resources/app/doorstream/motion.py ]; then
     : "${DOORBELL_RTSP_PORT:=554}"
     : "${DOORBELL_RTSP_PATH:=/H.264}"
     : "${DOORBELL_RTSP_USERNAME:=admin}"
@@ -828,15 +891,61 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
     : "${DOORBELL_PITCH:=0}"
     : "${DOORBELL_STALE_SECONDS:=4}"
     : "${DOORBELL_START_SECONDS:=12}"
+    : "${DOORBELL_MOTION_ENABLED:=false}"
+    : "${DOORBELL_MOTION_CALIBRATED:=false}"
+    : "${DOORBELL_MOTION_SAMPLE_FPS:=5}"
+    : "${DOORBELL_MOTION_MIN_AREA_RATIO:=0.002}"
+    : "${DOORBELL_MOTION_PERSISTENCE_SECONDS:=2}"
+    : "${DOORBELL_MOTION_DWELL_SECONDS:=3}"
+    : "${DOORBELL_MOTION_STATIONARY_RATIO:=0.02}"
+    : "${DOORBELL_MOTION_TRIGGER_ZONE:=0,0,1,1}"
+    : "${DOORBELL_MOTION_ROAD_ZONE:=0,0,0,0}"
+    : "${DOORBELL_MOTION_MASKS:=}"
+    : "${DOORBELL_MOTION_DIAGNOSTICS:=false}"
     _door_credentials_ready=0
-    _door_cred_dir=/run/wall-door-credentials
     install -d -m 0700 -o root -g root "$_door_cred_dir"
-    # Purge the exact old allowlist before judging the new source. Otherwise a
-    # later display-on could restart the broker with credentials removed from
-    # wall.env during a supported firstboot rerun.
-    for _door_cred_name in host password port path username width height input-fov horizontal-fov vertical-fov yaw pitch stale-seconds start-seconds; do
-        rm -f -- "$_door_cred_dir/$_door_cred_name"
+    purge_door_runtime
+
+    # Validate even while disabled: a latent malformed value must not spring to
+    # life after a later one-line enable toggle. Only explicit enabled AND
+    # calibrated state may become the effective value handed to the service.
+    _door_motion_valid=1
+    for _door_bool_name in DOORBELL_MOTION_ENABLED DOORBELL_MOTION_CALIBRATED DOORBELL_MOTION_DIAGNOSTICS; do
+        if ! door_motion_bool_valid "${!_door_bool_name}"; then
+            fail_step "Door motion $_door_bool_name must be exactly true or false; motion remains disabled"
+            _door_motion_valid=0
+        fi
     done
+    door_motion_number_between "$DOORBELL_MOTION_SAMPLE_FPS" 1 10 || { fail_step "Door motion sample FPS must be between 1 and 10"; _door_motion_valid=0; }
+    door_motion_number_between "$DOORBELL_MOTION_MIN_AREA_RATIO" 0.000001 1 || { fail_step "Door motion minimum area ratio must be greater than 0 and at most 1"; _door_motion_valid=0; }
+    door_motion_number_between "$DOORBELL_MOTION_PERSISTENCE_SECONDS" 0.1 30 || { fail_step "Door motion persistence must be between 0.1 and 30 seconds"; _door_motion_valid=0; }
+    door_motion_number_between "$DOORBELL_MOTION_DWELL_SECONDS" 0.1 30 || { fail_step "Door motion dwell must be between 0.1 and 30 seconds"; _door_motion_valid=0; }
+    door_motion_number_between "$DOORBELL_MOTION_STATIONARY_RATIO" 0 1 || { fail_step "Door motion stationary ratio must be between 0 and 1"; _door_motion_valid=0; }
+    door_motion_zone_valid "$DOORBELL_MOTION_TRIGGER_ZONE" 0 || { fail_step "Door motion trigger zone must be one nonempty normalized rectangle"; _door_motion_valid=0; }
+    door_motion_zone_valid "$DOORBELL_MOTION_ROAD_ZONE" 1 || { fail_step "Door motion road zone must be disabled or one normalized rectangle"; _door_motion_valid=0; }
+    door_motion_masks_valid "$DOORBELL_MOTION_MASKS" || { fail_step "Door motion masks must be empty or normalized rectangles separated by semicolons"; _door_motion_valid=0; }
+
+    _door_motion_effective=false
+    if [ "$_door_motion_valid" -eq 1 ] && [ "$DOORBELL_MOTION_ENABLED" = "true" ]; then
+        if [ "$DOORBELL_MOTION_CALIBRATED" = "true" ]; then
+            _door_motion_effective=true
+        else
+            fail_step "Door motion was enabled without the explicit physical-calibration gate; motion remains disabled"
+        fi
+    fi
+    if [ "$_door_motion_valid" -eq 0 ]; then
+        # Do not hand malformed latent values to a future service version.
+        DOORBELL_MOTION_SAMPLE_FPS=5
+        DOORBELL_MOTION_MIN_AREA_RATIO=0.002
+        DOORBELL_MOTION_PERSISTENCE_SECONDS=2
+        DOORBELL_MOTION_DWELL_SECONDS=3
+        DOORBELL_MOTION_STATIONARY_RATIO=0.02
+        DOORBELL_MOTION_TRIGGER_ZONE=0,0,1,1
+        DOORBELL_MOTION_ROAD_ZONE=0,0,0,0
+        DOORBELL_MOTION_MASKS=
+        DOORBELL_MOTION_DIAGNOSTICS=false
+        DOORBELL_MOTION_CALIBRATED=false
+    fi
     if [ -z "${DOORBELL_RTSP_HOST:-}" ] || [ -z "${DOORBELL_RTSP_PASSWORD:-}" ]; then
         fail_step "Door broker needs DOORBELL_RTSP_HOST and DOORBELL_RTSP_PASSWORD in wall.env"
     else
@@ -854,21 +963,32 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
         printf '%s' "$DOORBELL_PITCH" > "$_door_cred_dir/pitch"
         printf '%s' "$DOORBELL_STALE_SECONDS" > "$_door_cred_dir/stale-seconds"
         printf '%s' "$DOORBELL_START_SECONDS" > "$_door_cred_dir/start-seconds"
+        printf '%s' "$_door_motion_effective" > "$_door_cred_dir/motion-enabled"
+        printf '%s' "$DOORBELL_MOTION_CALIBRATED" > "$_door_cred_dir/motion-calibrated"
+        printf '%s' "$DOORBELL_MOTION_SAMPLE_FPS" > "$_door_cred_dir/motion-sample-fps"
+        printf '%s' "$DOORBELL_MOTION_MIN_AREA_RATIO" > "$_door_cred_dir/motion-min-area-ratio"
+        printf '%s' "$DOORBELL_MOTION_PERSISTENCE_SECONDS" > "$_door_cred_dir/motion-persistence-seconds"
+        printf '%s' "$DOORBELL_MOTION_DWELL_SECONDS" > "$_door_cred_dir/motion-dwell-seconds"
+        printf '%s' "$DOORBELL_MOTION_STATIONARY_RATIO" > "$_door_cred_dir/motion-stationary-ratio"
+        printf '%s' "$DOORBELL_MOTION_TRIGGER_ZONE" > "$_door_cred_dir/motion-trigger-zone"
+        printf '%s' "$DOORBELL_MOTION_ROAD_ZONE" > "$_door_cred_dir/motion-road-zone"
+        printf '%s' "$DOORBELL_MOTION_MASKS" > "$_door_cred_dir/motion-masks"
+        printf '%s' "$DOORBELL_MOTION_DIAGNOSTICS" > "$_door_cred_dir/motion-diagnostics"
         chmod 0600 "$_door_cred_dir"/*
         _door_credentials_ready=1
     fi
     # The source is volatile, so boot ordering belongs to firstboot rather than
     # multi-user.target. Disable any old enablement before starting it here.
-    systemctl disable wall-door-stream.service >/dev/null 2>&1 || true
     if [ "$_door_credentials_ready" -eq 0 ]; then
-        systemctl stop wall-door-stream.service >/dev/null 2>&1 || true
+        purge_door_runtime
     elif ! systemctl restart wall-door-stream.service; then
         fail_step "Door broker could not restart with its Door-only credentials; inspect systemctl status wall-door-stream.service"
     else
-        log "WSN-019: Door broker ready — idle until an explicit unlocked-tab start"
+        log "SR-024: Door broker ready — idle until present/lit sampler or visible-frame eligibility"
     fi
 else
-    fail_step "Door broker is incomplete: the unit or packaged doorstream/service.py is missing. The Door tab will remain disabled."
+    purge_door_runtime
+    fail_step "Door broker is incomplete: the unit or packaged doorstream/service.py + motion.py is missing. The Door tab and motion sampler will remain disabled."
 fi
 
 # ── 8e. SR-023 — feasibility-gated panel-local audio broker ────────────────

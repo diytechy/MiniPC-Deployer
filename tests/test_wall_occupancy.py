@@ -94,6 +94,18 @@ def test_detection_disabled_leaves_both_halves_alone_sr020():
             assert got["power"] == "stay", got
 
 
+def test_door_sampler_lifetime_follows_the_backlight_and_suspend_boundary_sr024():
+    """Image integration makes dark/absent/suspended states camera-ineligible."""
+    sleep = MODULE_PATH.with_name("wall-sleep.sh").read_text(encoding="utf-8")
+    backlight = sleep[sleep.index("backlight_set()") : sleep.index("# ── which frame")]
+    off = backlight[backlight.index('if [ "$1" = "off" ]') : backlight.index("else")]
+    on = backlight[backlight.index("else") : backlight.index("return 0")]
+    suspend = sleep[sleep.index("suspend_now()") : sleep.index("# write_absent_since")]
+    assert off.index("stop_door_stream") < off.index("want=0")
+    assert suspend.index("stop_door_stream") < suspend.index("systemctl suspend")
+    assert "start_door_broker" in on
+
+
 @pytest.mark.smoke
 def test_absent_an_hour_outside_the_on_period_suspends_sr020():
     """State 1: the only combination in the whole table that suspends."""

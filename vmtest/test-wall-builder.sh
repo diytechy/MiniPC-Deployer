@@ -286,9 +286,9 @@ assert_file_matches "wall-sync.service still syncs BOTH flows (no --only)" \
 # enabled are units the panel does not have.
 UD="$WALL_DIR/user-data"
 assert_file_matches "user-data installs wall-sync-frame.service" "$UD" \
-    'cp .*wall/wall-sync-frame\.service /target/etc/systemd/system/wall-sync-frame\.service'
+    '(cp|install -m 0644) .*wall/wall-sync-frame\.service /target/etc/systemd/system/wall-sync-frame\.service'
 assert_file_matches "user-data installs wall-sync-frame.timer" "$UD" \
-    'cp .*wall/wall-sync-frame\.timer /target/etc/systemd/system/wall-sync-frame\.timer'
+    '(cp|install -m 0644) .*wall/wall-sync-frame\.timer /target/etc/systemd/system/wall-sync-frame\.timer'
 assert_file_matches "user-data enables the frame TIMER (not the service)" "$UD" \
     'systemctl enable wall-sync-frame\.timer'
 assert_file_matches "user-data does NOT enable wall-sync-frame.service itself" "$UD" \
@@ -342,6 +342,14 @@ assert_file_matches "wall.env.example no longer offers MEDIA_CIFS_EXTRA as a kno
     "$WALL_DIR/wall.env.example" '^MEDIA_CIFS_EXTRA=' --absent
 assert_file_matches "wall.env.example no longer offers the bench overrides as knobs" \
     "$WALL_DIR/wall.env.example" '^# *MEDIA_(MUSIC|FRAME)_SOURCE_OVERRIDE=' --absent
+assert_file_matches "Door motion OpenCV is named in the offline package SSOT" \
+    "$WALL_DIR/packages.list" '^python3-opencv([[:space:]]|$)'
+assert_file_matches "Door service consumes the normalized trigger-zone credential" \
+    "$WALL_DIR/wall-door-stream.service" '^LoadCredential=motion-trigger-zone:'
+assert_file_matches "Door service has a bounded memory ceiling" \
+    "$WALL_DIR/wall-door-stream.service" '^MemoryMax=384M$'
+assert_file_matches "firstboot requires the packaged pure motion core" \
+    "$FB" 'doorstream/motion\.py'
 
 echo
 echo "=== 1. the artifact gate ==="
@@ -419,6 +427,7 @@ expect_refusal "WALL_SITE_DIR with no user-data.filled is refused, not half-appl
 # instead of for the reason it names. A fixture that stops resembling what
 # Materialize-Deploy emits stops testing the guards downstream of it.
 sed -e 's/REPLACE_WITH_WIFI_SSID/TestNet/' -e 's/REPLACE_WITH_WIFI_PSK/testpsk123/' \
+    -e 's/REPLACE_WITH_TIMEZONE/Etc\/UTC/' \
     -e 's/REPLACE_WITH_PANEL_CIDR/10.0.0.50\/24/' \
     -e 's/REPLACE_WITH_LAN_GATEWAY/10.0.0.1/' \
     -e 's/REPLACE_WITH_HUB_IP/10.0.0.2/' \
@@ -518,6 +527,21 @@ if env APT_OUT="$FAKE_APT" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DI
         "$WORK/out-dir/iso-root/deploy-payload/site/wall.env" '^WALL_APP_CMD=.*--ignore-certificate-errors'
     assert_file_matches "…and still disables the GPU (a second flag must not displace the first)" \
         "$WORK/out-dir/iso-root/deploy-payload/site/wall.env" '^WALL_APP_CMD=.*--disable-gpu'
+    SIM_ENV="$WORK/out-dir/iso-root/deploy-payload/site/wall.env"
+    assert_file_matches "SIM Door camera is permanently unreachable" "$SIM_ENV" \
+        '^DOORBELL_RTSP_HOST=vmtest-no-camera\.invalid$'
+    assert_file_matches "SIM Door motion is explicitly disabled" "$SIM_ENV" \
+        '^DOORBELL_MOTION_ENABLED=false$'
+    assert_file_matches "SIM Door motion is explicitly uncalibrated" "$SIM_ENV" \
+        '^DOORBELL_MOTION_CALIBRATED=false$'
+    assert_file_matches "SIM Door motion cadence is explicitly bounded" "$SIM_ENV" \
+        '^DOORBELL_MOTION_SAMPLE_FPS=2$'
+    assert_file_matches "SIM Door trigger zone is normalized and topology-free" "$SIM_ENV" \
+        '^DOORBELL_MOTION_TRIGGER_ZONE=0,0,1,1$'
+    assert_file_matches "SIM Door road zone is disabled rather than property-shaped" "$SIM_ENV" \
+        '^DOORBELL_MOTION_ROAD_ZONE=0,0,0,0$'
+    assert_file_matches "SIM Door numeric diagnostics remain disabled" "$SIM_ENV" \
+        '^DOORBELL_MOTION_DIAGNOSTICS=false$'
 else
     fail_case "the plain sim wall build (4c baseline)" "$(tail -n 3 "$WORK/out.txt" | tr '\n' ' ' | cut -c1-200)"
 fi
@@ -640,7 +664,12 @@ echo "=== 5. cross-repo knob names: the sim renderer must fill BOTH UNCs ==="
 # call from render_sim_wall_env and the corresponding case stops refusing.
 WEX="$WALL_DIR/wall.env.example"
 cp "$WEX" "$WORK/wallenv.bak"
-for knob in MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC; do
+for knob in MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC \
+    DOORBELL_MOTION_ENABLED DOORBELL_MOTION_CALIBRATED \
+    DOORBELL_MOTION_SAMPLE_FPS DOORBELL_MOTION_MIN_AREA_RATIO \
+    DOORBELL_MOTION_PERSISTENCE_SECONDS DOORBELL_MOTION_DWELL_SECONDS \
+    DOORBELL_MOTION_STATIONARY_RATIO DOORBELL_MOTION_TRIGGER_ZONE \
+    DOORBELL_MOTION_ROAD_ZONE DOORBELL_MOTION_MASKS DOORBELL_MOTION_DIAGNOSTICS; do
     grep -v "^${knob}=" "$WORK/wallenv.bak" > "$WEX"
     expect_refusal "a sim build refuses if wall.env.example loses $knob" \
         "'$knob' is not a key" -- "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1

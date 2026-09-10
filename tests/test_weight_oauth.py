@@ -113,6 +113,32 @@ def paste_of(code, state):
     return "http://localhost:8117/?state=%s&code=%s&scope=x" % (state, code)
 
 
+def never_pasted(_text):                # pragma: no cover - the point is it is not
+    """A `prompt` for the tests whose refusal must land BEFORE the browser.
+
+    An authorization code is single-use and short-lived, so every check mint
+    can make before sending the Owner to consent IS made before it. These
+    tests assert that by making the paste itself an error.
+    """
+    raise AssertionError("mint reached the paste before it refused")
+
+
+def pasting(out, code=AUTH_CODE):
+    """A `prompt` that answers with the address bar the browser WOULD show.
+
+    THE STATE IS GENERATED INSIDE `mint`, so a test cannot know it up front -
+    it reads it back off the authorization URL mint printed, exactly as the
+    Owner reads it out of their browser. Every test that reaches the paste now
+    goes through here, because the state check is mandatory and a test that
+    hands over a bare code is a test asserting a flow the tool no longer has.
+    """
+    def prompt(_text):
+        printed = out.getvalue()
+        state = printed.split("state=")[1].split("&")[0]
+        return paste_of(code, state)
+    return prompt
+
+
 # ── A. Nothing secret is printed ────────────────────────────────────────────
 
 def test_a_whole_mint_prints_no_secret_no_code_and_no_token_sr022(tmp_path):
@@ -128,14 +154,7 @@ def test_a_whole_mint_prints_no_secret_no_code_and_no_token_sr022(tmp_path):
     state_root = str(tmp_path / "state")
     token_file = str(tmp_path / "state" / "tokens" / "google-health-token.json")
     out = io.StringIO()
-    seen_state = {}
-
-    def prompt(_text):
-        # The state is generated inside mint(); read it back off the URL it
-        # printed, exactly as the Owner reads it out of the browser.
-        printed = out.getvalue()
-        seen_state["state"] = printed.split("state=")[1].split("&")[0]
-        return paste_of(AUTH_CODE, seen_state["state"])
+    prompt = pasting(out)
 
     with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN,
                                               "access_token": ACCESS_TOKEN,
@@ -176,11 +195,11 @@ def test_a_failed_exchange_reports_the_status_and_leaks_nothing_sr022(tmp_path):
     hostile = {"error": "invalid_grant",
                "error_description": "code %s for secret %s is expired"
                                     % (AUTH_CODE, CLIENT_SECRET)}
+    out = io.StringIO()
     with loopback_server(json_responder(400, hostile)) as (token_url, _seen):
         with pytest.raises(oauth.Refused) as err:
             oauth.mint(mint_args(env_file, token_file, state_root),
-                       out=io.StringIO(),
-                       prompt=lambda _t: AUTH_CODE,
+                       out=out, prompt=pasting(out),
                        token_endpoint=token_url + "/token", now=NOW)
     message = str(err.value)
     assert "HTTP 400" in message and "invalid_grant" in message
@@ -343,7 +362,7 @@ def test_a_symlink_at_the_token_path_pointing_out_of_the_root_is_refused_sr022(t
     env_file = write_env(tmp_path)
     with pytest.raises(oauth.Refused) as err:
         oauth.mint(mint_args(env_file, str(token), str(root), extra=["--force"]),
-                   out=io.StringIO(), prompt=lambda _t: AUTH_CODE, now=NOW)
+                   out=io.StringIO(), prompt=never_pasted, now=NOW)
     assert "state directory" in str(err.value)
     assert victim.read_text(encoding="utf-8") == '{"refresh_token":"KEEP-ME"}'
 
@@ -368,14 +387,114 @@ def test_a_symlink_inside_the_root_is_destroyed_not_followed_sr022(tmp_path):
         pytest.skip("this filesystem/account cannot create symlinks")
 
     env_file = write_env(tmp_path)
+    out = io.StringIO()
     with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN}))             as (token_url, _seen):
         oauth.mint(mint_args(env_file, str(token), str(root), extra=["--force"]),
-                   out=io.StringIO(), prompt=lambda _t: AUTH_CODE,
+                   out=out, prompt=pasting(out),
                    token_endpoint=token_url + "/token", now=NOW)
 
     assert victim.read_text(encoding="utf-8") == '{"refresh_token":"KEEP-ME"}'
     assert not token.is_symlink()
     assert json.loads(token.read_text(encoding="utf-8"))["refresh_token"] == REFRESH_TOKEN
+
+
+def test_the_allow_list_is_compared_to_the_CONFIGURED_token_file_sr022(tmp_path):
+    """C2: the one-path allow-list used to compare `--token-file` TO ITSELF.
+
+    `mint` passed the effective path as both the path and the allow-list, so
+    the check was `x == x` and could not fail - vacuous exactly whenever the
+    flag was used, which is the only time it had anything to decide. The
+    allow-list is WEIGHT_TOKEN_FILE; asserted here on the verdict itself, with
+    two different paths, because that is the comparison that was wrong.
+    """
+    root = tmp_path / "state"
+    (root / "tokens").mkdir(parents=True)
+    configured = str(root / "tokens" / "google-health-token.json")
+    other = str(root / "tokens" / "somewhere-else.json")
+    assert oauth.token_write_verdict(configured, configured, "", str(root)) is None
+    reason = oauth.token_write_verdict(other, configured, "", str(root))
+    assert reason and "not the one path this tool may write" in reason
+    assert oauth.TOKEN_FILE_KEY in reason
+
+
+def test_an_overriding_token_file_says_so_out_loud_sr022(tmp_path):
+    """THE ESCAPE HATCH STAYS - ITS SILENCE DOES NOT.
+
+    `--token-file` is a documented operator flag on a tool run under sudo, and
+    the Owner's threat model does not treat their own deliberate local action
+    as an attacker, so it keeps working. What is fixed is that it used to
+    disable the allow-list WITHOUT SAYING SO. It now announces itself, names
+    the key the feeder will actually read, and says which guards still bind
+    this write - so an operator cannot end up with a token in a place the
+    service never looks and no sign that anything was overridden.
+    """
+    root = tmp_path / "state"
+    configured = str(root / "tokens" / "google-health-token.json")
+    env_file = write_env(tmp_path, WEIGHT_TOKEN_FILE=configured)
+    elsewhere = str(root / "tokens" / "a-second-copy.json")
+    out = io.StringIO()
+    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN})) \
+            as (token_url, _seen):
+        rc = oauth.mint(mint_args(env_file, elsewhere, str(root)), out=out,
+                        prompt=pasting(out), token_endpoint=token_url + "/token",
+                        now=NOW)
+    assert rc == 0
+    printed = out.getvalue()
+    assert "--token-file overrides WEIGHT_TOKEN_FILE" in printed
+    assert configured in printed
+    assert json.loads(Path(elsewhere).read_text(encoding="utf-8"))["refresh_token"] \
+        == REFRESH_TOKEN
+    for secret in SECRETS:
+        assert secret not in printed
+
+
+def test_no_notice_is_printed_when_the_flag_names_the_configured_file_sr022(tmp_path):
+    """A notice on every run is a notice nobody reads. Same path, same file,
+    no override - and `--token-file` naming exactly what the .env names is the
+    normal way this tool is invoked by hand."""
+    root = tmp_path / "state"
+    configured = str(root / "tokens" / "google-health-token.json")
+    env_file = write_env(tmp_path, WEIGHT_TOKEN_FILE=configured)
+    out = io.StringIO()
+    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN})) \
+            as (token_url, _seen):
+        oauth.mint(mint_args(env_file, configured, str(root)), out=out,
+                   prompt=pasting(out), token_endpoint=token_url + "/token",
+                   now=NOW)
+    assert "overrides" not in out.getvalue()
+    assert oauth.override_notice(configured, configured) == ()
+    assert oauth.override_notice(configured, "") == ()
+
+
+def test_the_token_write_is_contained_component_by_component_sr022(tmp_path):
+    """C1 for this tool: it reuses the feeder's open, and must pass the root.
+
+    THE FIRST VERSION OF THIS TEST SURVIVED ITS OWN MUTATION AND WAS A TEST
+    DEFECT - the fourth round running in this worktree. It planted the link on
+    a path pointing OUT of the state root, so `token_write_verdict` refused it
+    before the open was ever reached: dropping the root from the open left the
+    suite green, because the verdict was carrying the check.
+
+    The link here points to a directory INSIDE the root, which is precisely the
+    case the verdict cannot refuse - both sides resolve to the same contained
+    file, so it returns None - and the OPEN is then the only thing left. An
+    intermediate component that has become a symlink is refused at the hop.
+    """
+    root = tmp_path / "state"
+    (root / "real").mkdir(parents=True)
+    try:
+        os.symlink(str(root / "real"), str(root / "tokens"),
+                   target_is_directory=True)
+    except (OSError, NotImplementedError):      # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+    token = str(root / "tokens" / "google-health-token.json")
+
+    # The verdict passes: this is inside the root and IS the allow-listed path.
+    assert oauth.token_write_verdict(token, token, "", str(root)) is None
+    with pytest.raises((OSError, oauth.Refused)):
+        oauth.open_token_for_write(token, token, "", str(root))
+    assert not (root / "real" / "google-health-token.json").exists(), (
+        "the write walked through a swapped intermediate directory")
 
 
 def test_mint_refuses_to_overwrite_an_existing_token_without_force_sr022(tmp_path):
@@ -402,10 +521,11 @@ def test_the_minted_token_file_is_0600_sr022(tmp_path):     # pragma: no cover -
     env_file = write_env(tmp_path)
     root = tmp_path / "state"
     token = str(root / "tokens" / "google-health-token.json")
+    out = io.StringIO()
     with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN})) \
             as (token_url, _seen):
-        oauth.mint(mint_args(env_file, token, str(root)), out=io.StringIO(),
-                   prompt=lambda _t: AUTH_CODE,
+        oauth.mint(mint_args(env_file, token, str(root)), out=out,
+                   prompt=pasting(out),
                    token_endpoint=token_url + "/token", now=NOW)
     assert stat.S_IMODE(os.stat(token).st_mode) == 0o600
     assert stat.S_IMODE(os.stat(os.path.dirname(token)).st_mode) == 0o700
@@ -561,12 +681,74 @@ def test_pkce_is_s256_of_the_verifier_sr022():
         == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
 
-def test_the_paste_may_be_the_whole_url_or_the_bare_code_sr022():
+def test_the_paste_is_the_whole_url_and_a_bare_code_is_refused_sr022():
     """The Owner pastes an address bar. Telling a person to select part of a
-    string is how the wrong part gets selected."""
+    string is how the wrong part gets selected - and the part they would select
+    is the one half that carries no `state=`.
+
+    THE BARE CODE USED TO BE ACCEPTED, UNCHECKED. `code_from_paste("some-code",
+    expected_state)` returned before the parser ran, so the easiest paste in
+    the flow skipped the state check the tool documents. It is refused now, and
+    the refusal says which string to paste instead.
+    """
     assert oauth.code_from_paste(paste_of("4/0Aabc", "st8"), "st8") == "4/0Aabc"
-    assert oauth.code_from_paste("  4/0Aabc  ", "st8") == "4/0Aabc"
     assert oauth.code_from_paste("?state=st8&code=4/0Aabc", "st8") == "4/0Aabc"
+    with pytest.raises(oauth.Refused) as bare:
+        oauth.code_from_paste("some-code", "st8")
+    assert "bare code" in str(bare.value)
+    with pytest.raises(oauth.Refused):
+        oauth.code_from_paste("  4/0Aabc  ", "st8")
+
+
+def test_a_url_with_a_code_and_no_state_is_refused_sr022():
+    """The other half of the same defect: the state check used to be skipped
+    entirely when the URL simply carried no `state=`, so a redirect that lost
+    it - or never had it - was exchanged as readily as one that matched."""
+    with pytest.raises(oauth.Refused) as err:
+        oauth.code_from_paste("http://localhost:8117/?code=4/0Aabc", "st8")
+    assert "state" in str(err.value)
+
+
+@pytest.mark.parametrize("url, doubled", [
+    ("http://localhost:8117/?state=st8&code=4/0Aabc&code=4/0Aevil", "code"),
+    ("http://localhost:8117/?state=st8&state=st8&code=4/0Aabc", "state"),
+])
+def test_a_duplicated_parameter_is_refused_not_ranked_sr022(url, doubled):
+    """`?code=A&code=B` is a shape nobody can see the danger in.
+
+    `parse_qs` keeps both and first-wins is a silent ranking, so the tool could
+    exchange a code the Owner is not looking at - and with `state` doubled, a
+    matching first value would wave a second, unexamined one straight through.
+    Which one the browser really came back with is not guessable here, so the
+    paste is refused. NOTE the second case: the state DOES match on the first
+    value, so nothing but the duplicate check itself can refuse it.
+    """
+    with pytest.raises(oauth.Refused) as err:
+        oauth.code_from_paste(url, "st8")
+    assert doubled in str(err.value) and "not guessable" in str(err.value)
+
+
+def test_a_failed_state_check_never_reaches_the_token_exchange_sr022(tmp_path):
+    """ORDERING, asserted against a real (loopback) token endpoint.
+
+    A state check that runs after the exchange is not a check: the code is
+    single-use, so by the time it fails, the thing it was guarding has already
+    happened. The fake Google here records every request it receives; a stale
+    state must leave that recorder EMPTY and the token file absent.
+    """
+    env_file = write_env(tmp_path)
+    root = str(tmp_path / "state")
+    token_file = str(tmp_path / "state" / "tokens" / "google-health-token.json")
+    out = io.StringIO()
+    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN})) \
+            as (token_url, seen):
+        with pytest.raises(oauth.Refused) as err:
+            oauth.mint(mint_args(env_file, token_file, root), out=out,
+                       prompt=lambda _t: paste_of(AUTH_CODE, "a-stale-tabs-state"),
+                       token_endpoint=token_url + "/token", now=NOW)
+    assert "state" in str(err.value)
+    assert seen == [], "the exchange was attempted despite the state mismatch"
+    assert not os.path.exists(token_file)
 
 
 def test_a_state_mismatch_and_a_denial_are_both_refusals_sr022():
@@ -615,7 +797,7 @@ def test_a_missing_client_is_a_refusal_that_names_the_key_not_the_value_sr022(tm
     token = str(tmp_path / "state" / "tokens" / "google-health-token.json")
     with pytest.raises(oauth.Refused) as err:
         oauth.mint(mint_args(env_file, token, root), out=io.StringIO(),
-                   prompt=lambda _t: AUTH_CODE, now=NOW)
+                   prompt=never_pasted, now=NOW)
     assert "OAUTH2_PROXY_CLIENT_SECRET" in str(err.value)
 
 
@@ -653,9 +835,7 @@ def mint_against_a_fake_google(env_file, token_file, state_root):
     as the Owner reads it out of the browser's address bar."""
     out = io.StringIO()
 
-    def prompt(_text):
-        state = out.getvalue().split("state=")[1].split("&")[0]
-        return paste_of(AUTH_CODE, state)
+    prompt = pasting(out)
 
     with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN,
                                               "access_token": ACCESS_TOKEN,
@@ -731,7 +911,7 @@ def test_a_box_with_neither_pair_is_refused_naming_all_four_sr022(tmp_path):
     token = str(tmp_path / "state" / "tokens" / "google-health-token.json")
     with pytest.raises(oauth.Refused) as err:
         oauth.mint(mint_args(env_file, token, root), out=io.StringIO(),
-                   prompt=lambda _t: AUTH_CODE, now=NOW)
+                   prompt=never_pasted, now=NOW)
     looked_for = looked_for_clause(str(err.value))
     for name in ("OAUTH2_PROXY_CLIENT_ID", "OAUTH2_PROXY_CLIENT_SECRET",
                  "TRACKER_DRIVE_CLIENT_ID", "TRACKER_DRIVE_CLIENT_SECRET"):

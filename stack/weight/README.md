@@ -191,7 +191,9 @@ then wait at `Paste the address-bar URL here:`.
 3. The browser lands on **"This site can't be reached" /
    `ERR_CONNECTION_REFUSED` at `localhost:8117`. THAT IS THE SUCCESS CASE.**
 4. Copy the **whole address bar** of that failed page, paste it into the SSH
-   session, and press Enter.
+   session, and press Enter. **The whole URL, not just the code** — the tool
+   refuses a bare code (2026-09-09, see below), because the `state=` it must
+   check against this run is in the part you would have left behind.
 
 On success it prints exactly three lines:
 
@@ -217,7 +219,42 @@ When it prints something else:
 | `the token exchange failed: HTTP 401, invalid_client` | the id/secret pair in `.env` is not the client the redirect URI is registered on. |
 | `Google's reply carried no refresh token` | Google treated this as an already-granted consent. Remove the app under `https://myaccount.google.com/permissions` and run `mint` again. |
 | `the state in that URL is not the one this run generated` | a stale browser tab from an earlier attempt. Start `mint` again. |
+| `that paste is not a URL ... A bare code is no longer accepted` | paste the whole address bar. There is no state in a bare code, so there is nothing to check. |
+| `that URL carries no state= parameter` | not the page this run opened. Start `mint` again. |
+| `that URL carries the code parameter 2 times` | the paste carries two codes; which one Google issued is not guessable, so none is exchanged. Start `mint` again. |
+| `NOTE - --token-file overrides WEIGHT_TOKEN_FILE` | not an error: you passed `--token-file` naming something other than the configured token. It is allowed and it is printed. The feeder reads `WEIGHT_TOKEN_FILE`, so a token written elsewhere is a copy the service will not use. |
 | `REFUSED: ... outside the service's own state directory` | `WEIGHT_TOKEN_FILE` points somewhere that is not under `/var/lib/homehub-weight`. The guard refuses; fix the knob. |
+
+### What the paste is checked against (changed 2026-09-09)
+
+A cross-review found that `mint` **claimed** a PKCE + `state` check it did not
+always make: a bare pasted code was returned before the parser ran, and a URL
+carrying `code=` with no `state=` was accepted. Both are now refused.
+
+* **`state` is mandatory.** PKCE binds the code to *this process's* verifier;
+  `state` is the half that binds the *response* to the request this run made.
+  There is no weaker fallback — there is "checked" and "not checked".
+* **A bare code is refused.** It carries no `state`, and it is the paste a
+  person is most likely to produce by selecting part of a string.
+* **A duplicated `code=` or `state=` is refused, not ranked.** `?code=A&code=B`
+  is a shape nobody can see the danger in, and first-wins means the tool can
+  exchange a code the Owner is not looking at.
+* **The check is before the exchange.** A state check that runs after the
+  exchange is not a check: the code is single-use, so by the time it fails the
+  thing it guarded has happened. A test asserts the fake token endpoint records
+  *no request at all* on a state mismatch.
+
+### `--token-file` is an override, and it says so (changed 2026-09-09)
+
+The one-path allow-list is `WEIGHT_TOKEN_FILE`. `mint` used to hand the
+*effective* path to the guard as both the path and the allow-list, so passing
+`--token-file` compared it to itself and the allow-list was vacuous exactly when
+it had something to decide. The flag stays — it and `--state-root` are
+documented operator flags on a tool run under `sudo`, and a root operator can
+write anywhere regardless — but it now **prints** that it is overriding, names
+the configured path, and says which guards still bind the write: containment in
+the service's own `StateDirectory=`, the refusal to be the feeder's state file,
+and the no-symlink open below.
 
 ### Step 4 — capture ONE response body
 
@@ -299,6 +336,50 @@ both are typed by hand into a spreadsheet cell.
 
 **No NagLight change is needed.** `target` and `unit` are already item columns
 that round-trip through both sync modes today.
+
+### The frontmatter reader is depth-aware (changed 2026-09-09)
+
+A cross-review found four ways to make the reader source a **wrong goal**, all
+one defect: it ignored indentation *depth*, so anything shaped like `id:` /
+`target:` / `unit:` was read as a direct item field wherever it sat.
+
+```yaml
+items:                          items:
+  - id: weigh-in                  - id: take-vitamins
+    metadata:                       alternatives:
+      target: 170                     - id: weigh-in
+      unit: lb                          target: 170
+                                        unit: lb
+```
+
+Neither declares a 170 lb goal to any YAML parser alive — the first target
+belongs to `metadata`, the second to a nested list under a *different* item —
+and both used to yield 170 lb on the wall. So did a second `items:` block, and
+so did a tab-indented block that `yaml.v3` refuses to parse at all.
+
+The rule now is one rule, not four patches: **a field belongs to an item only at
+that item's own field column.** The sequence's indent is fixed by its first
+`- ` entry, the field column by the first field on that entry; anything deeper
+is a nested container's content and is not the item's. **Ambiguity is refused**
+— a second `items:` key, an inline `items: [...]`, or a tab in the indentation
+all raise rather than resolve, the same way two files declaring the goal already
+did.
+
+It is still a hand reader and not PyYAML, on purpose: the service is
+**stdlib-only** (a plain unit under `ProtectSystem=strict`, no venv), so a real
+parser means a new apt package name and the offline apt export re-run that goes
+with it — and a full parser is the wrong *shape* anyway, because anchors,
+aliases and merge keys let a goal arrive from a line the person cannot see
+beside the number. Where PyYAML happens to be installed, the test suite uses it
+as an **oracle** on every one of these fixtures, so "narrow" cannot quietly
+become "different".
+
+**Definitions symlinks.** The definitions directory is the tracker's own docker
+volume and is inside the trust boundary, so `WEIGHT_DEFINITIONS_DIR` may itself
+be a symlink and still be read. An individual `*.md` that resolves *outside*
+that directory is refused rather than read: "the goal came from a file that is
+not in the household's definitions" is a sentence this feeder should not be able
+to say, and one `realpath` is what it costs.
 
 ### It used to be a top-level `weight_goal_lb` key. That was changed on 2026-09-09.
 
@@ -448,6 +529,19 @@ itself does not trust the check that preceded it: the file is unlinked first
 (which destroys a planted *link*, never the file it points at), then created
 `O_CREAT|O_EXCL|O_NOFOLLOW`, so anything that appears in the gap is refused by
 the kernel rather than by our confidence.
+
+**Every component, not just the last one (changed 2026-09-09).** `O_NOFOLLOW`
+protects the *final* component only, so replacing an intermediate directory
+after the verdict resolved — swapping `.../tokens` for a link — sent the write
+outside the state directory with every guard above it already passed. The open
+now walks from the state root **one component at a time**: each intermediate
+directory is opened relative to the previous one with `O_DIRECTORY|O_NOFOLLOW`
+(`dir_fd=`, stdlib, Linux), so a component that has become a link is refused by
+the kernel *at the hop*, and the final create happens against a directory handle
+rather than a name that can be re-pointed underneath it. Windows has no `dir_fd`
+opens, so the dev PC checks each component with `lstat` instead; that fallback
+is check-then-use and does not close the race, and is not claimed to — the hub
+is Linux.
 
 **A refused write costs the history, never the gauge.** The cycle has already
 posted by then; the refusal is a named failure in the journal.

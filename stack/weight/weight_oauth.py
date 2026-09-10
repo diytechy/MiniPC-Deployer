@@ -34,10 +34,13 @@ WHAT THEY REUSE RATHER THAN REINVENT, and why each one matters:
     302 - and honours `http_proxy`. The token these calls carry grants blood
     glucose, body fat, oxygen saturation, core body temperature and heart-rate
     metrics as well as weight, because there is no weight-only scope.
-  * `weight_feeder.open_no_follow()` for the token write: unlink first (which
-    destroys a planted LINK, never the file it points at), then
-    `O_CREAT|O_EXCL|O_NOFOLLOW` at 0600, so a symlink planted between the
-    check and the open is refused by the kernel rather than by our confidence.
+  * `weight_feeder.open_no_follow()` for the token write: walk from the state
+    root ONE COMPONENT AT A TIME with `O_DIRECTORY|O_NOFOLLOW`, then unlink the
+    leaf (which destroys a planted LINK, never the file it points at) and
+    create it `O_CREAT|O_EXCL|O_NOFOLLOW` at 0600 relative to that directory
+    handle - so a link planted between the check and the open is refused by the
+    kernel rather than by our confidence, at ANY component and not merely the
+    last one.
   * `weight_feeder.CREDENTIAL_BASENAMES` for the capture output, so
     `--out ~/.netrc` is refused by name.
   * `weight_feeder.GOOGLE_HEALTH_LIST_URL` / `GOOGLE_HEALTH_SCOPE` - the route
@@ -397,28 +400,68 @@ def authorization_url(client_id, redirect_uri, state, code_challenge,
     return endpoint + "?" + urllib.parse.urlencode(fields)
 
 
+def one_parameter(fields, name):
+    """The single value of `name` in a parsed query, or None. Two is a REFUSAL.
+
+    A redirect URL is pasted out of an address bar, and `?code=A&code=B` is a
+    shape a person cannot see the danger in: `parse_qs` keeps both, and any
+    "take the first" rule means this tool can exchange a code the Owner is not
+    looking at. Which one Google issued is not guessable from here, so the
+    paste is refused rather than ranked - the same rule the feeder applies to
+    two goals in one file.
+
+    Implements: SR-022
+    """
+    values = fields.get(name) or []
+    if len(values) > 1:
+        raise Refused(
+            "that URL carries the `%s` parameter %d times. Which one the "
+            "browser really came back with is not guessable, and exchanging "
+            "one of them would be exchanging a code you are not looking at. "
+            "Start `mint` again and paste the address bar once, whole."
+            % (name, len(values)))
+    return values[0] if values else None
+
+
 def code_from_paste(raw, expected_state):
-    """The authorization code out of whatever the Owner pasted back.
+    """The authorization code out of the redirect URL the Owner pasted back.
 
     Contract:
-      Inputs:  raw - either the whole redirected URL from the address bar, or
-                     the bare `code=` value;
+      Inputs:  raw - the WHOLE redirected URL from the browser's address bar;
                expected_state - the CSRF state this process generated.
       Outputs: the authorization code.
-      Raises:  Refused - blank paste, a consent denial, a state mismatch, or a
-               paste that is not one of the two accepted shapes.
+      Raises:  Refused - blank paste, a consent denial, a missing or mismatched
+               state, a duplicated `code`/`state`/`error`, a bare code, or a
+               paste that is not a URL at all.
 
-    THE WHOLE URL IS THE EXPECTED PASTE. The browser lands on a "site can't be
-    reached" page whose address bar holds
-    `http://localhost:8117/?state=...&code=4/0A...&scope=...`, and telling a
-    person to select part of that string is how the wrong part gets selected.
-    The bare code is accepted too because somebody will paste just the code.
+    THE STATE CHECK IS MANDATORY, AND THAT IS THIS ROUND'S FIX. The first cut
+    checked the state only `if given_state is not None`, and returned a BARE
+    paste unchecked before it ever reached the parser. So the two easiest ways
+    to hand this tool a code - paste just the code, or paste a URL whose
+    `state=` was lost - were exactly the two that skipped the check the tool's
+    own documentation claims to make. A guard that any convenience path can
+    walk around is not a guard; it is a sentence in a docstring.
+
+    WHY A BARE CODE IS NOW REFUSED RATHER THAN "CHECKED WHERE POSSIBLE". PKCE
+    binds the code to THIS PROCESS'S verifier, so a stolen code is not
+    redeemable elsewhere; `state` is the half that binds the RESPONSE to the
+    request this run made, and a bare code carries no state at all. There is no
+    weaker check to fall back to - there is only "checked" and "not checked".
+    The cost of refusing is one browser trip, which the Owner is already at,
+    and the whole address-bar URL is what the printed instructions ask for
+    anyway. The cost of accepting is a code from a stale tab, or from a request
+    nobody here made, exchanged into a token file the household then trusts for
+    a year.
 
     NO REFUSAL MESSAGE HERE EVER QUOTES `raw`. It may be a live authorization
     code, and a message is a thing that gets printed.
 
     Implements: SR-022
     """
+    if not expected_state:
+        raise ValueError(
+            "code_from_paste was given no expected state. The state check is "
+            "not optional, so there is no code path that may skip it.")
     raw = (raw or "").strip()
     if not raw:
         raise Refused(
@@ -426,27 +469,35 @@ def code_from_paste(raw, expected_state):
             "browser (it starts with the redirect URI and contains `code=`).")
     looks_like_url = "://" in raw or raw.startswith("?") or raw.startswith("/?")
     if not looks_like_url:
-        if any(character.isspace() for character in raw) or "&" in raw:
-            raise Refused(
-                "that paste is neither a URL nor a bare code (it contains "
-                "whitespace or `&`). Paste the whole address-bar URL.")
-        return raw
+        raise Refused(
+            "that paste is not a URL, so it carries no `state=` and this run "
+            "cannot check that the code came back from the request it made. "
+            "A bare code is no longer accepted. Paste the WHOLE address-bar "
+            "URL of the 'site can't be reached' page - it starts with the "
+            "redirect URI - or run `mint` again if the browser has lost it.")
     parts = urllib.parse.urlsplit(raw)
-    fields = urllib.parse.parse_qs(parts.query or raw.lstrip("?"))
-    denial = printable_error_code((fields.get("error") or [None])[0])
+    fields = urllib.parse.parse_qs(parts.query or raw.lstrip("?"),
+                                   keep_blank_values=True)
+    denial = printable_error_code(one_parameter(fields, "error"))
     if fields.get("error"):
         raise Refused(
             "Google returned an error instead of a code%s. If it is "
             "`access_denied` the consent screen was declined or the account is "
             "not on the project's Test users list."
             % (": " + denial if denial else ""))
-    given_state = (fields.get("state") or [None])[0]
-    if given_state is not None and given_state != expected_state:
+    given_state = one_parameter(fields, "state")
+    if not given_state:
+        raise Refused(
+            "that URL carries no `state=` parameter, so there is nothing to "
+            "check it against the state this run generated. Every redirect "
+            "this tool sends the browser to asks for one back, so a URL "
+            "without it is not the page this run opened. Start `mint` again.")
+    if not secrets.compare_digest(given_state, expected_state):
         raise Refused(
             "the `state` in that URL is not the one this run generated. That "
             "is either a stale browser tab from an earlier attempt or a "
             "response to a request nobody here made. Start `mint` again.")
-    code = (fields.get("code") or [None])[0]
+    code = one_parameter(fields, "code")
     if not code:
         raise Refused("that URL carries no `code=` parameter.")
     return code
@@ -583,6 +634,43 @@ def token_write_verdict(path, token_path, state_path, state_root, resolve=None):
                 "must name different files."
                 % (path, resolve(state_path), TOKEN_FILE_KEY, STATE_FILE_KEY))
     return None
+
+
+def override_notice(path, configured, resolve=None):
+    """The lines `mint` must print when `--token-file` leaves the allow-list.
+
+    Contract:
+      Outputs: () when `path` IS the configured token file (or nothing is
+               configured to differ from), else the lines saying so.
+
+    THE ESCAPE HATCH STAYS; ITS SILENCE DOES NOT. `--token-file` and
+    `--state-root` are documented operator flags on a tool the Owner runs under
+    `sudo`, and a root operator can write anywhere with or without them - the
+    Owner's threat model does not treat their own deliberate local action as an
+    attacker, and a second copy of the token for a migration is a real errand.
+    What was wrong was that using the flag turned the one-path allow-list into a
+    no-op WITHOUT SAYING SO, so a guard the module documents at length silently
+    stopped deciding anything. An override that announces itself is an
+    override; one that does not is a hole.
+
+    Everything else still binds this write: containment in the service's own
+    state directory, the refusal to be the feeder's state file, and the
+    component-by-component no-symlink open.
+
+    Implements: SR-022
+    """
+    resolve = resolve or os.path.realpath
+    if not configured or resolve(path) == resolve(configured):
+        return ()
+    return (
+        "weight: NOTE - --token-file overrides %s, which is %s.\n"
+        % (TOKEN_FILE_KEY, configured),
+        "weight: the one-path allow-list does not apply to this write. The "
+        "state-directory containment, the state-file refusal and the "
+        "no-symlink open still do.\n",
+        "weight: the feeder reads %s, so a token written anywhere else is a "
+        "copy the service will not use.\n" % TOKEN_FILE_KEY,
+    )
 
 
 def capture_output_verdict(path, resolve=None):
@@ -749,7 +837,7 @@ def open_token_for_write(path, token_path, state_path, state_root):
     reason = token_write_verdict(path, token_path, state_path, state_root)
     if reason:
         raise Refused("REFUSED: " + reason)
-    return weight_feeder.open_no_follow(path)
+    return weight_feeder.open_no_follow(path, root=state_root)
 
 
 def open_capture_output(path):
@@ -814,14 +902,23 @@ def give_back_to_invoker(path):
 
 
 def resolve_paths(values, args):
-    """Settle (token_file, state_file, state_root) from the .env and the flags.
+    """Settle (token_file, configured_token_file, state_file, state_root).
 
     A flag wins over the file, which wins over the shipped default - the same
     order every other tool in this stack uses - and the state root falls back to
     the feeder's own DEFAULT_STATE_ROOT so a hand-run is bound exactly as the
     unit's StateDirectory= binds a timed run.
+
+    THE CONFIGURED PATH IS RETURNED ALONGSIDE THE EFFECTIVE ONE, and that is
+    this round's fix. `mint` used to hand the effective path to
+    `token_write_verdict` as BOTH the path and the allow-list, so the one-path
+    allow-list compared `--token-file` to itself and was vacuous exactly
+    whenever the flag was used - the only time it had anything to decide. The
+    allow-list is `WEIGHT_TOKEN_FILE`; the flag is an operator override of it,
+    which is a thing to ANNOUNCE, not a thing to silently satisfy.
     """
-    token_file = args.token_file or values.get(TOKEN_FILE_KEY) or ""
+    configured = values.get(TOKEN_FILE_KEY) or ""
+    token_file = args.token_file or configured
     if not token_file:
         raise Refused(
             "%s is not set in the .env and --token-file was not given. There "
@@ -830,7 +927,9 @@ def resolve_paths(values, args):
     state_file = values.get(STATE_FILE_KEY) or ""
     state_root = (args.state_root
                   or weight_feeder.resolve_state_root(dict(os.environ)))
-    return os.path.expanduser(token_file), os.path.expanduser(state_file), state_root
+    return (os.path.expanduser(token_file),
+            os.path.expanduser(configured) if configured else "",
+            os.path.expanduser(state_file), state_root)
 
 
 def resolve_timeout(values, args):
@@ -878,12 +977,24 @@ def mint(args, out=None, prompt=None, auth_endpoint=AUTH_ENDPOINT,
     prompt = prompt or read_pasted_code
     values = read_env_file(args.env_file)
     client_key, client_id, client_secret = resolve_client(values, args.env_file)
-    token_file, state_file, state_root = resolve_paths(values, args)
+    token_file, configured, state_file, state_root = resolve_paths(values, args)
     timeout = resolve_timeout(values, args)
     account = args.account or values.get(ACCOUNT_KEY) or "homehub-weight"
 
     ensure_directory(os.path.dirname(token_file) or ".", state_root)
-    reason = token_write_verdict(token_file, token_file, state_file, state_root)
+    # THE ALLOW-LIST IS `WEIGHT_TOKEN_FILE`, AND THE FLAG IS AN ANNOUNCED
+    # OVERRIDE OF IT - not, as it was, a silent way to compare the flag to
+    # itself. When `--token-file` names the configured file (or the .env names
+    # nothing) the allow-list decides, as it always claimed to. When it names
+    # something else, that is the documented operator hatch on a tool the Owner
+    # runs under sudo: it still works, it is PRINTED, and every other guard -
+    # the state-directory containment, the state-file refusal and the
+    # component-by-component no-symlink open - still binds the write.
+    announced = override_notice(token_file, configured)
+    for line in announced:
+        out.write(line)
+    allow_listed = token_file if announced else (configured or token_file)
+    reason = token_write_verdict(token_file, allow_listed, state_file, state_root)
     if reason:
         raise Refused("REFUSED: " + reason)
     if os.path.lexists(token_file) and not args.force:
@@ -948,7 +1059,7 @@ def capture(args, out=None, list_url=None, token_endpoint=TOKEN_ENDPOINT):
     list_url = list_url or LIST_URL
     values = read_env_file(args.env_file)
     _client_key, client_id, client_secret = resolve_client(values, args.env_file)
-    token_file, _state_file, _root = resolve_paths(values, args)
+    token_file, _configured, _state_file, _root = resolve_paths(values, args)
     timeout = resolve_timeout(values, args)
 
     try:

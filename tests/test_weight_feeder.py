@@ -26,6 +26,7 @@ Verifies: TC-006 (SR-022, LLR-006)
 """
 
 import importlib.util
+import io
 import json
 import math
 import os
@@ -646,6 +647,252 @@ def test_an_indented_legacy_key_is_an_item_field_not_a_top_level_one_sr022():
         "---\ncategory: Health\nweight_goal_lb: 999\n---\n") is True
 
 
+# ── Depth: the four ways a nested block used to speak for the item ─────────
+#
+# EVERY FIXTURE BELOW IS THE CROSS-REVIEWER'S, VERBATIM, and every one of them
+# used to yield a 170 lb goal from something that is not the Owner's declared
+# target. They are one defect - the reader ignored indentation DEPTH, so
+# anything shaped like `id:`/`target:`/`unit:` was read as a direct item field
+# wherever it sat - and they are tested one by one because a single root-cause
+# fix still has to be shown to close each door somebody actually pushed on.
+#
+# 170 IS DELIBERATELY THE SAME NUMBER THE OWNER'S REAL FILE CARRIES. A fixture
+# that used 999 would be caught by a test asserting "not 999" even if the
+# reader had merely stopped finding a goal for some unrelated reason; these
+# assert on the SHAPE of the refusal instead.
+
+NESTED_MAPPING_MD = """---
+category: Health
+items:
+  - id: weigh-in
+    metadata:
+      target: 170
+      unit: lb
+---
+"""
+
+NESTED_LIST_MD = """---
+category: Health
+items:
+  - id: take-vitamins
+    alternatives:
+      - id: weigh-in
+        target: 170
+        unit: lb
+---
+"""
+
+SECOND_ITEMS_MD = """---
+category: Health
+items:
+  - id: take-vitamins
+    title: Take the vitamins
+items:
+  - id: weigh-in
+    target: 170
+    unit: lb
+---
+"""
+
+TAB_INDENTED_MD = (
+    "---\ncategory: Health\nitems:\n\t- id: weigh-in\n"
+    "\t  target: 170\n\t  unit: lb\n---\n")
+
+
+def test_a_nested_mapping_is_not_the_items_fields_sr022(tmp_path):
+    """P1: `metadata: {target: 170, unit: lb}` is NOT a 170 lb goal.
+
+    To every YAML parser alive that target belongs to `metadata`, and the item
+    itself declares none. The old reader took both keys as the item's own and
+    posted 170 lb against the Owner's real weight. The refusal that must come
+    out is the one for an item with NO target - not a unit complaint, not a
+    band complaint - because that is what the file actually says.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": NESTED_MAPPING_MD})
+    with pytest.raises(feeder.GoalMissing) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "declares no `target:`" in str(err.value)
+
+
+def test_a_nested_list_is_not_the_configured_item_sr022(tmp_path):
+    """P2: an `alternatives:` list under take-vitamins is not the weigh-in item.
+
+    The nested entry has the right id and the right two fields, so ANY reader
+    that matches on shape rather than on depth finds it. The item the household
+    configured does not exist in this file, and the honest answer is to say so.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": NESTED_LIST_MD})
+    with pytest.raises(feeder.GoalMissing) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "weigh-in" in str(err.value)
+    # ...and the nested entry did not become an ITEM either, which is the half
+    # a "skip fields deeper than the item" patch alone would have left open.
+    _top, items = feeder.parse_definitions_file(NESTED_LIST_MD, "health.md")
+    assert len(items) == 1
+    assert feeder.clean_scalar(items[0]["id"][0]) == "take-vitamins"
+
+
+def test_a_second_items_key_is_refused_not_preferred_sr022(tmp_path):
+    """P3: two `items:` blocks is an ambiguous document, not a reset.
+
+    The old reader re-entered item mode on the second key and read the goal out
+    of it. Merging them would be no better: which sequence the household meant
+    is not guessable, and this module refuses that question everywhere else.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": SECOND_ITEMS_MD})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "not guessable" in str(err.value) and "items" in str(err.value)
+
+
+def test_a_tab_indented_item_is_refused_not_trusted_sr022(tmp_path):
+    """P4: YAML forbids tabs in indentation, so this file has no items at all.
+
+    The loader that syncs these files rejects the whole document; a reader that
+    accepted it would be the only thing in the household that believes it knows
+    what the file declares - and what it would believe is a body weight.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": TAB_INDENTED_MD})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "TAB" in str(err.value)
+
+
+@pytest.mark.parametrize("body", [NESTED_MAPPING_MD, NESTED_LIST_MD,
+                                  SECOND_ITEMS_MD, TAB_INDENTED_MD])
+def test_no_nesting_trick_can_reach_the_wall_sr022(tmp_path, body):
+    """THE PROPERTY, not the four doors: NOTHING IS POSTED for any of them.
+
+    Each fixture is run through a WHOLE CYCLE against a source that is working
+    perfectly, because the hazard is not an exception in a unit test - it is
+    170 lb arriving on the wall beside a real reading of 191. Whether the
+    refusal is GoalMissing or ValueError is the message's business; that the
+    poster is never called is the household's.
+    """
+    posted = []
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_DEFINITIONS_DIR": write_defs(tmp_path, {"health.md": body}),
+           "WEIGHT_STATE_FILE": str(tmp_path / "state.json")}
+    with pytest.raises((feeder.GoalMissing, ValueError)):
+        feeder.run_cycle(env, now=NOW,
+                         readers={"google-health": lambda _e: (191.4, NOW)},
+                         poster=lambda b, *a: (posted.append(b), (True, ""))[1])
+    assert posted == [], "a nested block put a goal on the wall"
+
+
+def test_the_readers_narrowness_agrees_with_real_yaml_sr022():
+    """The hand reader is narrow ON PURPOSE - but it must not be DIFFERENT.
+
+    PyYAML is not a dependency of this service and never will be (stdlib only,
+    no venv, and a new apt name means the offline apt export is re-run), but
+    where it happens to be installed it is a free oracle: for each fixture, what
+    the reader concluded about the weigh-in item's own `target` is checked
+    against what a real YAML parser says. That is what keeps "narrow" from
+    drifting into "wrong" without anybody noticing.
+    """
+    yaml = pytest.importorskip("yaml")
+
+    def real_target(body):
+        """The weigh-in item's OWN target, per PyYAML, or None."""
+        front = "\n".join(feeder.frontmatter_lines(body))
+        for item in (yaml.safe_load(front) or {}).get("items") or []:
+            if isinstance(item, dict) and item.get("id") == "weigh-in":
+                return item.get("target")
+        return None
+
+    assert real_target(HEALTH_MD) == 170              # the Owner's real file
+    assert real_target(NESTED_MAPPING_MD) is None     # P1: it is metadata's
+    assert real_target(NESTED_LIST_MD) is None        # P2: it is a nested list
+    with pytest.raises(yaml.YAMLError):               # P4: not YAML at all
+        yaml.safe_load("\n".join(feeder.frontmatter_lines(TAB_INDENTED_MD)))
+    # P3 is a duplicate key: PyYAML's default loader keeps the LAST one
+    # silently, which is precisely the "pick one" this reader refuses to do.
+    assert real_target(SECOND_ITEMS_MD) == 170
+    assert feeder.parse_definitions_file(HEALTH_MD, "health.md")[1][1]["target"] \
+        == ["170"]
+    for body in (NESTED_MAPPING_MD, NESTED_LIST_MD):
+        item = feeder.find_goal_item(body, "health.md", "Health", "weigh-in")
+        assert item is None or "target" not in item
+
+
+def test_a_deeper_block_cannot_reopen_the_item_after_a_nested_one_sr022():
+    """Depth is tracked, not "have we seen a nested key yet".
+
+    `notes:` opens a nested block; the item's OWN `unit:` comes back at the
+    item's column afterwards and must still be read, or the fix would be a
+    different silent wrongness - a real target refused for want of a unit.
+    """
+    body = ("---\ncategory: Health\nitems:\n  - id: weigh-in\n"
+            "    target: 170\n    notes:\n      unit: kg\n      target: 77\n"
+            "    unit: lb\n---\n")
+    item = feeder.find_goal_item(body, "health.md", "Health", "weigh-in")
+    assert item["target"] == ["170"] and item["unit"] == ["lb"]
+    assert feeder.goal_from_item(item, "health.md", "Health", "weigh-in") == 170.0
+
+
+def test_an_item_written_with_the_dash_on_its_own_line_still_reads_sr022():
+    """`-` alone, fields below it, is the other block form a person may type."""
+    body = ("---\ncategory: Health\nitems:\n  -\n    id: weigh-in\n"
+            "    target: 170\n    unit: lb\n---\n")
+    item = feeder.find_goal_item(body, "health.md", "Health", "weigh-in")
+    assert feeder.goal_from_item(item, "health.md", "Health", "weigh-in") == 170.0
+
+
+def test_a_sequence_at_column_zero_is_still_the_items_sequence_sr022():
+    """YAML lets a sequence sit at its key's own indent, and people write it.
+
+    The old reader treated every column-zero line as a top-level key, so this
+    entirely valid file silently held NO items - a blind spot that ends in "no
+    goal" for a household that declared one perfectly legibly.
+    """
+    body = ("---\ncategory: Health\nitems:\n- id: weigh-in\n  target: 170\n"
+            "  unit: lb\n---\n")
+    item = feeder.find_goal_item(body, "health.md", "Health", "weigh-in")
+    assert feeder.goal_from_item(item, "health.md", "Health", "weigh-in") == 170.0
+
+
+def test_an_inline_items_sequence_is_refused_rather_than_guessed_at_sr022():
+    """Flow style is not the shape the sheet generates, so it is not read."""
+    body = ("---\ncategory: Health\nitems: [{id: weigh-in, target: 170}]\n---\n")
+    with pytest.raises(ValueError) as err:
+        feeder.parse_definitions_file(body, "health.md")
+    assert "inline sequence" in str(err.value)
+
+
+def test_a_definitions_file_that_links_out_of_the_directory_is_refused_sr022(tmp_path):
+    """PRIORITY 4, and the cheap half of it.
+
+    The definitions directory is the tracker's own docker volume and so is
+    inside the trust boundary - WEIGHT_DEFINITIONS_DIR may legitimately BE a
+    symlink, and that stays supported. What is refused is an entry that leaves
+    it: "the goal came from a file that is not in the household's definitions"
+    is a sentence this feeder should not be able to say.
+    """
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text(HEALTH_MD.replace("target: 170", "target: 199"),
+                       encoding="utf-8")
+    defs_dir = write_defs(tmp_path, {})
+    try:
+        os.symlink(str(outside), os.path.join(defs_dir, "health.md"))
+    except (OSError, NotImplementedError):    # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "outside the definitions directory" in str(err.value)
+
+
+def test_a_symlinked_definitions_directory_is_still_read_sr022(tmp_path):
+    """The other side of the same coin: the docker volume itself may be a link,
+    and refusing that would be refusing the normal deployment."""
+    real = write_defs(tmp_path, {"health.md": HEALTH_MD})
+    link = str(tmp_path / "definitions-link")
+    try:
+        os.symlink(real, link, target_is_directory=True)
+    except (OSError, NotImplementedError):    # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+    assert feeder.load_goal_from_definitions(link)[0] == DEFS_GOAL
+
+
 def test_two_files_holding_the_item_are_refused_not_ordered_sr022(tmp_path):
     """Picking the first would silently follow file-name order.
 
@@ -956,10 +1203,97 @@ def test_a_temp_file_planted_between_the_check_and_the_open_is_refused_sr022(tmp
         os.symlink(str(victim), str(tmp_file))
     except (OSError, NotImplementedError):      # pragma: no cover - platform
         pytest.skip("this filesystem/account cannot create symlinks")
-    with feeder.open_no_follow(str(tmp_file)) as handle:
+    with feeder.open_no_follow(str(tmp_file), root=str(state_dir)) as handle:
         handle.write("{}")
     assert victim.read_text(encoding="utf-8") == "KEEP-ME"
     assert not tmp_file.is_symlink()
+
+
+def test_an_intermediate_directory_swapped_after_the_verdict_is_refused_sr022(tmp_path):
+    """THE CROSS-REVIEW DEFECT: O_NOFOLLOW protects the LAST hop only.
+
+    The window is real and the timing is not exotic: `token_write_verdict` (or
+    `writable_path_verdict`) resolves the whole path, and then the open walks
+    it again. Replace `.../tokens` with a link to somewhere else in between and
+    every guard above has already passed - the old open followed the swapped
+    directory and put the file outside the state directory the module says it
+    cannot leave.
+
+    THIS TEST PLANTS THE LINK IN THAT WINDOW BY CALLING THE OPEN DIRECTLY, on
+    the real filesystem, which is exactly the state the process would be in a
+    microsecond after the verdict. No mock: the verdict already returned, and
+    what happens next is the only thing under test.
+    """
+    root = tmp_path / "state"
+    (root / "tokens").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = root / "tokens" / "weight-state.json.tmp"
+    # ...the verdict has now resolved cleanly. The swap:
+    (root / "tokens").rmdir()
+    try:
+        os.symlink(str(outside), str(root / "tokens"), target_is_directory=True)
+    except (OSError, NotImplementedError):      # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+
+    with pytest.raises(OSError):
+        feeder.open_no_follow(str(target), root=str(root))
+    assert not (outside / "weight-state.json.tmp").exists(), (
+        "the write landed outside the state directory")
+
+
+def test_the_contained_open_still_writes_through_real_directories_sr022(tmp_path):
+    """The other half: a guard that refuses everything is not a guard.
+
+    A genuine nested directory under the root must still be walked and written,
+    or the feeder simply stops working on the hub - where the state file sits
+    one level down from StateDirectory= in exactly this shape.
+    """
+    root = tmp_path / "state"
+    (root / "tokens").mkdir(parents=True)
+    target = root / "tokens" / "weight-state.json.tmp"
+    with feeder.open_no_follow(str(target), root=str(root)) as handle:
+        handle.write("{}")
+    assert target.read_text(encoding="utf-8") == "{}"
+    assert feeder.path_components_under(str(target), str(root)) == \
+        ["tokens", "weight-state.json.tmp"]
+
+
+def test_a_path_that_is_not_under_the_root_is_never_opened_sr022(tmp_path):
+    """The walk starts AT the root, so a path it cannot reach from there is
+    refused rather than opened by its name. This is the case the containment
+    claim cannot be made for, so it is not made."""
+    root = tmp_path / "state"
+    root.mkdir()
+    stray = tmp_path / "elsewhere.json"
+    with pytest.raises(PermissionError) as err:
+        feeder.open_no_follow(str(stray), root=str(root))
+    assert "cannot be contained" in str(err.value)
+    assert not stray.exists()
+
+
+def test_open_for_write_hands_the_state_root_to_the_open_sr022(tmp_path, monkeypatch):
+    """THE WIRING, and it is named as such.
+
+    The containment above is proved against `open_no_follow` on the real
+    filesystem; what this asserts is only that the ONE caller passes its root
+    in, because a perfect guard nobody calls with a root is the same as no
+    guard. It is a weaker test than the one above and is not a substitute for
+    it - the previous three rounds each lost a first-pass mutation to a test
+    that leaned on a neighbour, so which check carries what is written down.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_path = state_dir / "weight-state.json"
+    seen = {}
+
+    def recorder(path, root=None):
+        seen["path"], seen["root"] = path, root
+        return io.StringIO()
+
+    monkeypatch.setattr(feeder, "open_no_follow", recorder)
+    feeder.open_for_write(str(state_path) + ".tmp", str(state_path), str(state_dir))
+    assert seen["root"] == str(state_dir)
 
 
 def test_the_state_file_must_sit_inside_the_services_own_state_directory_sr022(tmp_path):

@@ -449,9 +449,13 @@ def parse_goal_pounds(text, where, key):
     return value
 
 
-# One `key: value` line, at any indent. The key pattern is deliberately narrow
-# so a prose line that happens to contain a colon is not read as a field.
+# One `key: value` line, with its own indentation captured. The key pattern is
+# deliberately narrow so a prose line that happens to contain a colon is not
+# read as a field.
 FIELD_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)\s*:\s?(.*)$")
+
+# The one key whose sequence this reader follows into.
+ITEMS_KEY = "items"
 
 
 def frontmatter_lines(body):
@@ -472,19 +476,85 @@ def frontmatter_lines(body):
     return out
 
 
-def parse_definitions_file(body):
+def leading_indent(raw, where, number):
+    """The width of `raw`'s leading whitespace, refusing a TAB outright.
+
+    YAML FORBIDS TABS IN INDENTATION - not as a style rule, as a parse error:
+    `yaml.v3`, which is what NagLight's own internal/defs loads these files
+    with, rejects the document. A reader that quietly accepted a tab would be
+    reading a file the real loader cannot read, and would then be the ONLY
+    thing in the household that believes it knows what that file declares. So
+    a tab in the indentation is a refusal that names the line, not a width.
+    """
+    lead = raw[:len(raw) - len(raw.lstrip())]
+    if "\t" in lead:
+        raise ValueError(
+            "%s: line %d is indented with a TAB. YAML forbids tabs in "
+            "indentation, so the loader that syncs these files rejects the "
+            "whole document - this feeder will not be the one thing that "
+            "thinks it knows what the file says. Indent it with spaces."
+            % (where, number))
+    return len(raw) - len(raw.lstrip(" "))
+
+
+def parse_definitions_file(body, where="the definitions file"):
     """Split ONE definitions file's frontmatter into its top-level keys and its
     items, in the shape NagLight's internal/defs would see.
 
     Contract:
-      Inputs:  body: the whole .md file's text.
+      Inputs:  body: the whole .md file's text; where: its path, for messages.
       Outputs: (top: {key: [raw value, ...]}, items: [{field: [raw value, ...]}])
                or None when the text is not a definitions file.
+      Raises:  ValueError when the frontmatter cannot be read HONESTLY - a tab
+               indent, a second `items:`, or an inline `items:` sequence.
 
     Values are kept as LISTS of the raw text so a duplicate declaration is
     visible to the caller rather than silently resolved by "last one wins" -
     picking one of two contradictory goals is the defect this module refuses
     everywhere else.
+
+    INDENTATION DEPTH IS THE STRUCTURE, AND IGNORING IT WAS THE CROSS-REVIEW
+    DEFECT. The first cut read any indented `key: value` inside `items:` as a
+    field of the current item, at whatever depth it sat. Four separate findings
+    fell out of that one mistake, and every one ends with a plausible,
+    confident, WRONG number about the Owner's body on the wall:
+
+        items:                          items:
+          - id: weigh-in                  - id: take-vitamins
+            metadata:                       alternatives:
+              target: 170                     - id: weigh-in
+              unit: lb                          target: 170
+                                                unit: lb
+
+    Neither of those declares a 170 lb goal to any YAML parser alive: the first
+    is `metadata.target`, the second is a nested list belonging to a DIFFERENT
+    item. Both used to yield 170. So did a second `items:` block lower down,
+    and so did a tab-indented block that yaml.v3 refuses to parse at all.
+
+    The fix is one rule, not four patches: A FIELD BELONGS TO AN ITEM ONLY AT
+    THAT ITEM'S OWN FIELD COLUMN. The sequence's indent is fixed by its first
+    `- ` entry; the item's field column is fixed by the first field on that
+    entry; a line deeper than the field column is the content of a nested
+    container and is NOT the item's, and a `- ` deeper than the sequence indent
+    is a nested list's entry and is NOT an item.
+
+    AND AMBIGUITY IS REFUSED, NOT RESOLVED. A second `items:` key is not a
+    continuation to be merged and not a reset to be preferred; which sequence
+    the household meant is not guessable, so the document is refused. That is
+    the same rule this module already applies to two files declaring the goal,
+    two items with one id, and a target declared twice.
+
+    WHY THIS IS STILL A HAND READER AND NOT PyYAML. The service is stdlib-only
+    by design - a plain unit under ProtectSystem=strict with no venv - so a real
+    YAML parser means a new apt package name and the offline apt export re-run
+    that goes with it. It would also be the WRONG SHAPE: a full parser is
+    maximally permissive, and anchors, aliases and merge keys can make a goal
+    arrive from a line the person cannot see beside the number. What this reader
+    owes the household is the opposite - to read the narrow block subset the
+    sheet actually generates and REFUSE everything else rather than interpret
+    it. `tests/test_weight_feeder.py` checks this reading against PyYAML as an
+    oracle wherever PyYAML happens to be installed, so "narrow" cannot quietly
+    become "different".
 
     TOP-LEVEL KEYS STOP AT `items:`, exactly as internal/defs does. A key at
     column zero AFTER the item sequence is malformed YAML that the frontmatter
@@ -497,36 +567,81 @@ def parse_definitions_file(body):
     if lines is None:
         return None
     top, items = {}, []
-    in_items, after_items, current = False, False, None
-    for raw in lines:
+    in_items = after_items = False
+    seq_indent = field_indent = current = None
+    for offset, raw in enumerate(lines):
+        number = offset + 2               # +1 for the fence, +1 for 1-based
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
-        if raw[:1] not in (" ", "\t"):
-            # Column zero: a top-level key, and the end of any item.
-            in_items, current = False, None
-            match = FIELD_RE.match(raw)
+        indent = leading_indent(raw, where, number)
+        text = raw.strip()
+
+        # Have we fallen out of the item sequence?
+        if in_items and seq_indent is not None and indent < seq_indent:
+            in_items, seq_indent, field_indent, current = False, None, None, None
+        elif in_items and seq_indent is None and not text.startswith("-"):
+            # `items:` was declared and the next thing is not a sequence entry.
+            in_items = False
+
+        # Column zero, or anywhere outside the sequence.
+        if not in_items:
+            if indent:
+                continue                  # indented, but inside nothing we read
+            match = FIELD_RE.match(text)
             if match is None:
                 continue
             key = match.group(2)
-            if key == "items":
+            if key == ITEMS_KEY:
+                if after_items:
+                    raise ValueError(
+                        "%s declares `%s:` twice in one frontmatter (line %d). "
+                        "Which sequence carries the household's items is not "
+                        "guessable, and merging them would let a block nobody "
+                        "is looking at supply a number. Delete one."
+                        % (where, ITEMS_KEY, number))
+                inline = clean_scalar(match.group(3))
+                if inline not in ("", "[]"):
+                    raise ValueError(
+                        "%s writes `%s:` as an inline sequence (line %d). This "
+                        "reader follows the block form the sheet generates and "
+                        "refuses to guess at any other, because guessing wrong "
+                        "here posts a number about somebody's body."
+                        % (where, ITEMS_KEY, number))
                 in_items, after_items = True, True
+                seq_indent = field_indent = current = None
                 continue
             if after_items:
                 continue                  # see the docstring: not a declaration
             top.setdefault(key, []).append(match.group(3))
             continue
-        if not in_items:
-            continue                      # indented, but not inside `items:`
-        stripped = raw.strip()
-        if stripped.startswith("-"):
+
+        # Inside the item sequence.
+        if text.startswith("-"):
+            if seq_indent is None:
+                seq_indent = indent       # the first entry fixes the sequence
+            if indent != seq_indent:
+                continue                  # a NESTED list's entry, not an item
             current = {}
             items.append(current)
-            stripped = stripped[1:].strip()
-            if not stripped:
-                continue
+            rest = text[1:]
+            column = indent + 1 + (len(rest) - len(rest.lstrip(" ")))
+            rest = rest.strip()
+            field_indent = column if rest else None
+            if not rest:
+                continue                  # `-` alone: the fields are below it
+            match = FIELD_RE.match(rest)
+            if match is not None:
+                current.setdefault(match.group(2), []).append(match.group(3))
+            continue
         if current is None:
             continue                      # an indented line before any `- `
-        match = FIELD_RE.match(stripped)
+        if field_indent is None:
+            if indent <= seq_indent:
+                continue
+            field_indent = indent         # the first field fixes the column
+        if indent != field_indent:
+            continue                      # NOT this item's: nested, or ragged
+        match = FIELD_RE.match(text)
         if match is None:
             continue
         current.setdefault(match.group(2), []).append(match.group(3))
@@ -566,7 +681,7 @@ def find_goal_item(body, where, category, item_id):
 
     Implements: SR-022, LLR-006
     """
-    parsed = parse_definitions_file(body)
+    parsed = parse_definitions_file(body, where)
     if parsed is None:
         return None
     top, items = parsed
@@ -638,7 +753,7 @@ def goal_from_item(item, where, category, item_id):
     return parse_goal_pounds(raw_target, where_item, TARGET_KEY)
 
 
-def declares_legacy_goal(body):
+def declares_legacy_goal(body, where="the definitions file"):
     """True when this file still carries the superseded top-level goal key.
 
     Only its PRESENCE is read, never its value: the key is not the goal any
@@ -646,7 +761,7 @@ def declares_legacy_goal(body):
 
     Implements: LLR-006
     """
-    parsed = parse_definitions_file(body)
+    parsed = parse_definitions_file(body, where)
     return parsed is not None and LEGACY_GOAL_KEY in parsed[0]
 
 
@@ -1112,32 +1227,136 @@ def open_for_write(path, state_path, state_root):
     reason = writable_path_verdict(path, state_path, state_root)
     if reason:
         raise PermissionError("REFUSED: " + reason)
-    return open_no_follow(path)
+    return open_no_follow(path, root=state_root)
 
 
-def open_no_follow(path):
-    """Open `path` for writing without ever following a symlink at the last hop.
+def path_components_under(path, root):
+    """The component names leading from `root` down to `path`.
+
+    Contract:
+      Inputs:  path: the file about to be written; root: the directory the
+               write must stay inside.
+      Outputs: [name, ...] - at least one - naming each hop from `root`.
+      Raises:  ValueError when `path` is not literally under `root`, which is
+               the only case where this function cannot make the containment
+               claim and so refuses to make it.
+
+    LITERAL, NOT RESOLVED, AND ON PURPOSE. Resolution is what the verdict
+    already did; what the OPEN needs is the sequence of names it will actually
+    walk, so that each hop can be checked as it is taken. The deployed layout
+    is literal (`/var/lib/homehub-weight` from `StateDirectory=`), so a path
+    that is only under the root by way of a symlink is a shape this feeder does
+    not need and will not silently accept.
+    """
+    root_abs = os.path.abspath(root)
+    head, parts = os.path.abspath(path), []
+    while head != root_abs:
+        head, tail = os.path.split(head)
+        if not tail:
+            raise ValueError("%s is not under %s" % (path, root))
+        parts.insert(0, tail)
+    if not parts:
+        raise ValueError("%s IS %s, not a file inside it" % (path, root))
+    return parts
+
+
+# `openat`-style relative opens exist on Linux (the hub) and not on Windows
+# (the dev PC). Which one is in force decides which guard below is doing the
+# work, and the tests assert the behaviour rather than the mechanism.
+DIR_FD_OPENS = (os.open in getattr(os, "supports_dir_fd", set())
+                and hasattr(os, "O_DIRECTORY"))
+
+
+def open_no_follow(path, root=None):
+    """Open `path` for writing, following NO symlink at ANY component.
+
+    Contract:
+      Inputs:  path: the file to create; root: the directory the walk starts
+               from and may not leave - the service's own state root.
+      Outputs: an open text-mode handle, 0600.
+      Raises:  PermissionError when a component would leave `root`; OSError
+               from the kernel for a symlinked component, or for anything that
+               appeared between the verdict and the open.
 
     THE CHECK-THEN-OPEN RACE IS THE POINT. `writable_path_verdict` resolves the
-    path, but a symlink planted between that resolution and a plain
-    `open(path, "w")` would be followed by the open. So the file is unlinked
-    first - which destroys a planted LINK and never the file it points at, and
-    clears a `.tmp` left by a killed cycle - then created with O_CREAT|O_EXCL
-    so the kernel refuses anything that appeared in the gap, and O_NOFOLLOW
-    says the same again for the final component where the platform has it.
+    path, but anything planted between that resolution and the open would be
+    followed by the open. So the file is unlinked first - which destroys a
+    planted LINK and never the file it points at, and clears a `.tmp` left by a
+    killed cycle - then created with O_CREAT|O_EXCL so the kernel refuses
+    anything that appeared in the gap.
 
-    O_NOFOLLOW DOES NOT EXIST ON WINDOWS and resolves to 0 there. The hub is
-    Linux, so the deployed guard is whole; on the dev PC the unlink, O_EXCL and
-    the resolving verdict still stand, which is what the tests exercise.
+    O_NOFOLLOW ALONE WAS NOT ENOUGH, AND THAT IS THIS ROUND'S FIX. It protects
+    the FINAL component only. Replace an intermediate directory after the
+    verdict has resolved - swap `.../tokens` for a link to somebody's home
+    directory - and the old open walked through it happily: every guard above
+    it had already run, and the file landed outside the state directory the
+    module's own docstring says it cannot leave. A containment claim that holds
+    only for the last hop is not a containment claim.
+
+    So the walk is now taken ONE COMPONENT AT A TIME from `root`: each
+    intermediate directory is opened relative to the previous one with
+    O_DIRECTORY|O_NOFOLLOW, so a component that has become a link is refused by
+    the kernel AT THE HOP, and the final create happens relative to a directory
+    handle rather than to a name that can be re-pointed under it.
+
+    ON WINDOWS THERE ARE NO `dir_fd` OPENS, so the dev PC falls back to
+    checking each component with `lstat` before the open. That check is
+    check-then-use and does not close the race - it is not claimed to. The hub
+    is Linux, where the guard above is whole; the fallback exists so the same
+    tests exercise the same refusals here.
+
+    `root=None` keeps the old single-component behaviour for a caller that has
+    no root to be contained in. Nothing in this repo passes None.
     """
-    try:
-        os.unlink(path)
-    except OSError:
-        pass          # absent is the normal case; a directory or a busy file
-                      # fails loudly at the open below rather than here.
     flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
              | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
-    return os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8")
+    if root is None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8")
+
+    try:
+        parts = path_components_under(path, root)
+    except ValueError as exc:
+        raise PermissionError(
+            "REFUSED: %s cannot be opened as a path inside %s (%s), so this "
+            "write cannot be contained and is not attempted."
+            % (path, root, exc))
+
+    if not DIR_FD_OPENS:                  # pragma: no cover - Windows dev PC
+        walked = os.path.abspath(root)
+        for name in parts[:-1]:
+            walked = os.path.join(walked, name)
+            if os.path.islink(walked):
+                raise PermissionError(
+                    "REFUSED: %s is a symlink, so writing %s would land "
+                    "outside the state directory %s."
+                    % (walked, path, root))
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8")
+
+    parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in parts[:-1]:
+            hop = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=parent)
+            os.close(parent)
+            parent = hop
+        leaf = parts[-1]
+        try:
+            os.unlink(leaf, dir_fd=parent)
+        except OSError:
+            pass
+        handle = os.fdopen(os.open(leaf, flags, 0o600, dir_fd=parent), "w",
+                           encoding="utf-8")
+    finally:
+        os.close(parent)
+    return handle
 
 
 # Second-line names only;
@@ -1270,16 +1489,30 @@ def load_goal_from_definitions(defs_dir, category=None, item_id=None):
             "no definitions there is no goal and no honest bar to draw."
             % (defs_dir, TARGET_KEY, item_id, category))
     names = sorted(n for n in os.listdir(defs_dir) if n.endswith(".md"))
+    real_dir = os.path.realpath(defs_dir)
     found, legacy = None, []
     for name in names:
         path = os.path.join(defs_dir, name)
+        # A DEFINITIONS FILE THAT IS A LINK OUT OF THE DIRECTORY IS REFUSED,
+        # not read. The directory is the tracker's own docker volume and so is
+        # inside the trust boundary - WEIGHT_DEFINITIONS_DIR may itself be a
+        # link, which is why the comparison is made against its RESOLVED form
+        # rather than its name - but "the goal came from a file that is not in
+        # the household's definitions at all" is a sentence this feeder should
+        # never be able to say, and one realpath is what it costs to make sure.
+        if os.path.dirname(os.path.realpath(path)) != real_dir:
+            raise ValueError(
+                "definitions file %s resolves to %s, outside the definitions "
+                "directory %s. The goal is read from the household's own "
+                "definitions, so a file that links out of them is refused "
+                "rather than read." % (path, os.path.realpath(path), real_dir))
         try:
             with open(path, encoding="utf-8") as handle:
                 body = handle.read()
         except OSError as exc:
             raise ValueError("cannot read definitions file %s: %s"
                              % (path, type(exc).__name__))
-        if declares_legacy_goal(body):
+        if declares_legacy_goal(body, path):
             legacy.append(path)
         item = find_goal_item(body, path, category, item_id)
         if item is None:

@@ -9,8 +9,15 @@ last) — it is the record, not required reading for every pass.
 ## Current State
 
 **2026-09-09 — B11 steps 3 and 4 are BUILT on a SIDE BRANCH (`b11-weight-token`),
-pending merge into `IceDrive-DesktopDirection`, and neither has ever spoken to
-Google.** The Owner has cleared steps 1 and 2 (health.googleapis.com enabled on
+CROSS-REVIEW FIXES APPLIED, pending merge into `IceDrive-DesktopDirection`, and
+neither has ever spoken to Google.** A cross-review by another model family
+returned REJECT (10 confirmed + 1 suspected); all of it is fixed here — the
+frontmatter reader is now **depth-aware** (four ways a nested block could source
+a *wrong body weight* were one defect), the OAuth `state` check is **mandatory**
+and duplicated parameters are **refused rather than ranked**, the containment
+claim is now true at **every path component** and the token allow-list compares
+against the **configured** `WEIGHT_TOKEN_FILE` instead of against itself. Detail
+in the audit entry at the bottom of this file. The Owner has cleared steps 1 and 2 (health.googleapis.com enabled on
 the project that owns the shared OAuth client; the health-metrics scope on its
 consent screen; the Owner a Test user). `stack/weight/weight_oauth.py` now
 carries the two Owner-run commands that follow: `mint` walks the Owner through
@@ -7069,3 +7076,111 @@ and the test asserts inside that clause; the mutation is now RED.
 
 **Not done here.** No parser (step 5 is still owed a real captured body), no
 push, no hub state touched. Source and docs only, on `b11-weight-token`.
+
+## Audit — 2026-09-09 B11 cross-review fixes (`b11-weight-token`, local only)
+
+A cross-review by a different model family returned **REJECT, 10 CONFIRMED + 1
+SUSPECTED** against `8a1d2a5`. The coordinator accepted all of it. Everything
+below is source, tests and docs on the side branch; **nothing was pushed and no
+hub state was touched.**
+
+**PRIORITY 1 — the hand parser could source a WRONG GOAL. One root cause, four
+doors.** `parse_definitions_file` ignored indentation **depth**, so anything
+shaped like `id:` / `target:` / `unit:` was read as a direct item field wherever
+it sat. A nested `metadata:` mapping (P1), a nested `alternatives:` list under a
+*different* item (P2), a second `items:` block (P3) and a **tab-indented** block
+that `yaml.v3` will not parse at all (P4) each yielded a confident 170 lb goal.
+This is the plausible-but-wrong-number failure class the whole block exists to
+prevent, and it defeated the "found by **id**, not by shape" property the
+previous round tested for.
+
+The fix is **one rule, not four patches**: a field belongs to an item only at
+that item's own field column; the sequence indent is fixed by its first `- `
+entry and the field column by the first field on that entry; anything deeper is
+a nested container's content and is not the item's, and a `- ` deeper than the
+sequence indent is a nested list's entry and is not an item. **Ambiguity is
+refused rather than resolved** — a second `items:`, an inline `items: [...]`, or
+a tab in the indentation all raise, the same way two files declaring the goal
+already did. Two blind spots were closed on the way: a sequence written at
+column zero (valid YAML the old reader could not see at all) is now read, and an
+item written with `-` alone on its line is read.
+
+**Hand-parsing was KEPT, deliberately.** The service is stdlib-only by design (a
+plain unit under `ProtectSystem=strict`, no venv), so PyYAML would mean a new
+apt package name and the offline apt export re-run §5 requires — and a full
+parser is the wrong *shape* anyway: anchors, aliases and merge keys let a goal
+arrive from a line the person cannot see beside the number, and what this reader
+owes the household is to read the narrow block subset the sheet generates and
+**refuse** everything else. PyYAML is used as a **test-only oracle** where it
+happens to be installed (the precedent is `validate_config.py`, which SKIPs
+cleanly without it), so "narrow" cannot quietly become "different".
+
+**PRIORITY 2 — the OAuth flow now enforces what it claims.** `code_from_paste`
+returned a **bare code before the parser ran**, and checked `state` only when
+one happened to be present — so the two easiest pastes skipped the check the
+tool documents. `state` is now **mandatory**; a bare code is **refused** (PKCE
+binds the code to this process, but `state` is the half that binds the
+*response* to the request this run made, and a bare code carries none — there is
+no weaker fallback, only "checked" and "not checked"; the cost is one browser
+trip the Owner is already at). Duplicated `code=` / `state=` / `error=` are
+**refused, not ranked first-wins**, so the tool cannot exchange a code the Owner
+is not looking at. The ordering is asserted behaviourally: on a state mismatch
+the fake token endpoint records **no request at all**.
+
+**PRIORITY 3 — the containment claim is now true.** `O_NOFOLLOW` protects the
+**final** component only, so replacing an intermediate directory after the
+verdict resolved sent the write outside the state directory with every guard
+above already passed (C1). The open now walks from the state root **one
+component at a time** with `O_DIRECTORY|O_NOFOLLOW` and `dir_fd=` (stdlib,
+Linux), creating the leaf against a directory handle; Windows has no `dir_fd`
+opens, so the dev PC checks each component with `lstat` — that fallback is
+check-then-use, does not close the race, and is not claimed to. (C2)
+`token_write_verdict()` was handed the `--token-file` override as **both** the
+path and the allow-list, so the one-path allow-list compared it **to itself** and
+was vacuous exactly whenever the flag was used. The allow-list is now the
+**configured** `WEIGHT_TOKEN_FILE`; the flag remains an operator escape hatch —
+per the ruling, a documented flag on a tool run under `sudo` is not a
+vulnerability — but it now **announces itself**, names the configured path, and
+says which guards still bind the write. A guard that silently stops deciding was
+the defect; the hatch was not.
+
+**PRIORITY 4 — definitions symlinks.** The directory is the tracker's own docker
+volume and stays inside the trust boundary: `WEIGHT_DEFINITIONS_DIR` may itself
+be a symlink and is still read. The cheap half was taken — an individual `*.md`
+resolving **outside** that directory is refused rather than read.
+
+**Nothing was weakened.** All six vendor-absence assertions are green and no
+parser was written; the no-leak property, `vendor_opener()`, the client
+resolution order, the unit-before-number rule, the both-keys-present refusal,
+the two distinct refusals (no source → unavailable gauge; no goal → nothing
+posted) and the freshness invariant are unchanged and still asserted.
+
+**Evidence.** `python scripts/check.py` → **RESULT: PASS**, **626 passed / 6
+skipped** (baseline at `8a1d2a5`: 599 / 6 — the 27 new tests are the whole
+difference). `scripts/trace.py --strict-integrity` integrity=0 with the
+unchanged 24 legacy orphans; `check_flows.py --no-placeholders` OK, 5 diagrams;
+`validate_config.py` ALL CONFIG CHECKS PASSED. `stack/run-hermetic-tests.sh`
+**UNRUN** on this dev PC (it refuses without zstd/rsync).
+
+**Mutation runs: 17 deliberate defects (M46–M62), all RED, restored
+byte-identical and green** — including **one first-pass SURVIVOR that was, for
+the fourth round running, a TEST defect**. M62 dropped the state root from the
+token write's open and the suite stayed green: the test planted its symlink on a
+path pointing *out* of the root, so `token_write_verdict` refused it before the
+open was ever reached — the **verdict was carrying the check**. The link now
+points at a directory *inside* the root, which is precisely the case the verdict
+cannot refuse (both sides resolve to the same contained file), leaving the open
+as the only thing that can. M62 is now RED.
+
+**One check is carried by another, and it is named rather than hidden.**
+`test_open_for_write_hands_the_state_root_to_the_open_sr022` is a **wiring**
+assertion (it records what the caller passes); the containment behaviour itself
+is proved against the real filesystem by
+`test_an_intermediate_directory_swapped_after_the_verdict_is_refused_sr022`. And
+at the `mint` level the allow-list has **no observable behaviour** — it can only
+differ from the effective path when `--token-file` is used, which is the
+announced override — so C2 is carried by the verdict's own unit test plus the
+notice test, not by an end-to-end refusal.
+
+**Not done here.** No parser (step 5 is still owed a real captured body), no
+push, no hub state touched. Source, tests and docs only, on `b11-weight-token`.

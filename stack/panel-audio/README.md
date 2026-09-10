@@ -26,9 +26,26 @@ Consequently:
 
 `routing.py` and `visualizer.py` are pure/testable. The broker serializes
 generation checks and successful mutations, validates aliases against a bounded
-trusted inventory, and accepts only method-specific response schemas. Its
-socket shell has bounded concurrent clients and read deadlines. The visualizer
-consumes a bounded normalized sample window, applies a bounded silence hold and
-emission cadence, emits only derived bands/RMS/peak/activity, and retains no
-samples. The eventual capture adapter belongs behind the injected backend,
-after the probe and an adversarial authority review.
+trusted inventory, rejects common colon/hyphen/underscore/compact hardware-
+address forms, and accepts only method-specific response schemas. Backend work
+has a two-second deadline and cooperative cancellation signal; bounded daemon
+workers keep a hung mutation from holding the status/telemetry path's lock.
+
+Production uses `/var/lib/wall-audio-router/state.json`, in systemd's private
+`StateDirectory`. The broker atomically records a mutation intent before device
+I/O and records the exact result plus new JavaScript-safe generation after a
+confirmed success. A lost reply can therefore be retried with the same request
+ID and receive the saved result without a second device call. A crash, timeout
+or invalid result after intent is deliberately sticky `mutation_uncertain` on
+restart: routing changes remain refused until an operator reconciles actual
+device state and removes that journal. Status and telemetry remain readable.
+
+The socket shell has bounded concurrent clients and read deadlines. `telemetry`
+is an IF-015 read method with a positive schema: unavailable, or bounded derived
+bands/RMS/peak/activity plus generation and monotonic observation time. The
+visualizer consumes a bounded normalized sample window, applies bounded silence
+hold and emission cadence, emits no raw samples, and retains no samples. The
+shipped backend reports telemetry unavailable; the eventual capture adapter
+belongs behind the injected backend after the probe and an adversarial authority
+review. The service reads only root-owned `/etc/wall-panel/audio-router.env`,
+never the broad wall environment containing unrelated credentials.

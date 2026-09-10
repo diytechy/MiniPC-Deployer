@@ -17,7 +17,11 @@ MUTATING_METHODS = frozenset(
     {"discover", "cancel", "pair", "connect", "disconnect", "forget",
      "select_input", "select_output", "set_visualizer"}
 )
-METHODS = MUTATING_METHODS | {"status"}
+METHODS = MUTATING_METHODS | {"status", "telemetry"}
+HARDWARE_ADDRESS = re.compile(
+    r"(?i)(?<![0-9a-f])(?:(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|"
+    r"(?:[0-9a-f]{2}_){5}[0-9a-f]{2}|[0-9a-f]{12})(?![0-9a-f])"
+)
 
 
 class PolicyError(ValueError):
@@ -34,7 +38,7 @@ class Device:
     connected: bool = False
 
     def __post_init__(self):
-        if not ALIAS.fullmatch(self.alias):
+        if not ALIAS.fullmatch(self.alias) or HARDWARE_ADDRESS.search(self.alias):
             raise PolicyError("invalid device alias")
         if self.kind not in {"input", "output"}:
             raise PolicyError("invalid device kind")
@@ -50,7 +54,7 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
     if method not in METHODS:
         raise PolicyError("unknown method")
     allowed = {
-        "status": set(), "discover": {"timeoutSeconds"}, "cancel": set(),
+        "status": set(), "telemetry": set(), "discover": {"timeoutSeconds"}, "cancel": set(),
         "pair": {"alias", "confirmation"}, "connect": {"alias"},
         "disconnect": {"alias"}, "forget": {"alias"},
         "select_input": {"alias", "explicit"}, "select_output": {"alias"},
@@ -61,7 +65,8 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
     alias = params.get("alias")
     if method in {"pair", "connect", "disconnect", "forget", "select_input", "select_output"} and alias is None:
         raise PolicyError("device alias is required")
-    if alias is not None and (not isinstance(alias, str) or not ALIAS.fullmatch(alias)):
+    if alias is not None and (not isinstance(alias, str) or not ALIAS.fullmatch(alias) or
+                              HARDWARE_ADDRESS.search(alias)):
         raise PolicyError("invalid device alias")
     if method == "select_input" and params.get("explicit") is not True:
         raise PolicyError("input selection must be explicit")

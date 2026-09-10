@@ -178,6 +178,7 @@ sequenceDiagram
     participant U as Unix socket (AF_UNIX only)
     participant B as audio broker (SR-023)
     participant P as pure policy (LLR-007)
+    participant J as atomic mutation journal
     participant H as unavailable backend
 
     R->>U: bounded JSON {id, method, params, generation}
@@ -185,12 +186,18 @@ sequenceDiagram
     B->>P: validate fixed method, aliases, explicit input, generation
     alt malformed, oversized, unknown, or stale
         P-->>R: stable refusal; backend is not called
-    else status
-        B->>H: status
-        H-->>R: available=false, reason=probe-required
+    else status or telemetry
+        B->>H: bounded call outside mutation lock
+        H-->>R: status or derived telemetry unavailable
     else mutation before physical approval
-        B->>H: already-validated fixed action
+        B->>H: bounded inventory; validate alias/kind/trust
+        B->>J: fsync intent + current generation
+        B->>H: fixed action with deadline/cancellation signal
         H-->>R: backend_unavailable; no D-Bus/subprocess/device I/O
+        B->>J: clear known no-op intent
+    else future mutation outcome is uncertain
+        B->>J: pending intent survives restart
+        B-->>R: mutation_uncertain; refuse later mutations
     end
 ```
 

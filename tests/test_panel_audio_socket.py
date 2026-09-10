@@ -70,6 +70,12 @@ class PanelAudioSocketTests(unittest.TestCase):
         reply = self.exchange(wire("discover"))
         self.assertEqual("authorization_required", reply["error"]["code"])
 
+    def test_unavailable_telemetry_uses_the_bounded_if015_wire_shape(self):
+        reply = self.exchange(wire("telemetry"))
+        self.assertTrue(reply["ok"])
+        self.assertEqual({"available": False}, reply["result"])
+        self.assertNotIn("samples", json.dumps(reply))
+
 
 if __name__ == "__main__":
     unittest.main()

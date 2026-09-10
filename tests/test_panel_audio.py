@@ -19,14 +19,15 @@ WALL = ROOT / "stack/autoinstall/wall"
 sys.path.insert(0, str(AUDIO))
 from routing import Device, PolicyError, choose_restored_route, validate_action
 from visualizer import MAX_SAMPLES, VisualizerTelemetry, analyze_samples
-from audio_router import AudioBroker, BoundedUnixServer, UnavailableBackend, MAX_REQUEST_BYTES
+from audio_router import (AudioBroker, BoundedUnixServer, UnavailableBackend,
+                          JS_SAFE_INTEGER, MAX_REQUEST_BYTES)
 
 
 class FakeBackend:
     def __init__(self): self.calls = []
-    def call(self, method, params):
+    def call(self, method, params, cancel):
         self.calls.append((method, params)); return {"accepted": True}
-    def inventory(self):
+    def inventory(self, cancel):
         return [Device("speaker", "output", True), Device("desktop-in", "input", True)]
 
 
@@ -49,6 +50,8 @@ def test_input_selection_is_explicit_and_aliases_are_sanitized_sr023():
     with pytest.raises(PolicyError): validate_action("select_input", {"alias": "desktop-in"})
     validate_action("select_input", {"alias": "desktop-in", "explicit": True})
     with pytest.raises(PolicyError): validate_action("connect", {"alias": "AA:BB:CC:DD:EE:FF"})
+    for address in ("aabbccddeeff", "aa-bb-cc-dd-ee-ff", "aa_bb_cc_dd_ee_ff"):
+        with pytest.raises(PolicyError): validate_action("connect", {"alias": address})
 
 
 def test_broker_dispatches_only_exact_bounded_current_generation_requests_sr023():
@@ -64,31 +67,41 @@ def test_broker_dispatches_only_exact_bounded_current_generation_requests_sr023(
 
 def test_broker_rejects_backend_identity_and_raw_audio_fields_sr023():
     class UnsafeBackend:
-        def call(self, method, params): return {"address": "device-identity"}
+        def call(self, method, params, cancel): return {"address": "device-identity"}
+        def inventory(self, cancel): return []
     refused = response(AudioBroker(UnsafeBackend()), request())
     assert refused["error"]["code"] == "unsafe_backend_result"
     class LeakingStatus:
-        def call(self, method, params):
+        def call(self, method, params, cancel):
             return {"protocolVersion": 1, "available": True, "reason": "ready",
                     "devices": [{"alias": "speaker", "name": "AA:BB:CC:DD:EE:FF",
                                  "kind": "output", "trusted": True, "connected": True}],
                     "route": None, "visualizer": {"available": False}}
-        def inventory(self): return []
+        def inventory(self, cancel): return []
     assert response(AudioBroker(LeakingStatus()), request())["error"]["code"] == "unsafe_backend_result"
+    for address in ("aabbccddeeff", "aa-bb-cc-dd-ee-ff", "aa_bb_cc_dd_ee_ff"):
+        class VariantStatus(LeakingStatus):
+            def call(self, method, params, cancel):
+                value = super().call(method, params, cancel)
+                value["devices"][0]["name"] = address
+                return value
+        assert response(AudioBroker(VariantStatus()), request())["error"]["code"] == "unsafe_backend_result"
 
 
 def test_broker_contains_backend_failures_and_rejects_non_json_results_sr023():
     class RaisingBackend:
-        def call(self, method, params): raise RuntimeError("secret device path")
-        def inventory(self): return []
+        def call(self, method, params, cancel): raise RuntimeError("secret device path")
+        def inventory(self, cancel): return []
     class TupleBackend:
-        def call(self, method, params): return ("not", "json")
-        def inventory(self): return []
+        def call(self, method, params, cancel): return ("not", "json")
+        def inventory(self, cancel): return []
     failed = response(AudioBroker(RaisingBackend()), request())
     assert failed["error"] == {"code": "backend_failure", "message": "audio backend failed"}
     assert "secret" not in json.dumps(failed)
     assert response(AudioBroker(TupleBackend()), request())["error"]["code"] == "unsafe_backend_result"
     assert response(AudioBroker(FakeBackend()), request(generation=False))["error"]["code"] == "bad_request"
+    assert response(AudioBroker(FakeBackend()), request(generation=JS_SAFE_INTEGER + 1))["error"]["code"] == "bad_request"
+    assert response(AudioBroker(FakeBackend()), request(request_id=-1))["error"]["code"] == "bad_request"
 
 
 def test_mutations_require_authorization_and_matching_trusted_inventory_sr023():
@@ -102,13 +115,87 @@ def test_mutations_require_authorization_and_matching_trusted_inventory_sr023():
 def test_generation_serializes_concurrent_mutations_sr023():
     broker = AudioBroker(FakeBackend(), generation=7, authorize=lambda _m, _p: True)
     replies = []
-    threads = [threading.Thread(target=lambda: replies.append(response(
-        broker, request("connect", {"alias": "speaker"}, 7)))) for _ in range(2)]
+    threads = [threading.Thread(target=lambda identifier=identifier: replies.append(response(
+        broker, request("connect", {"alias": "speaker"}, 7, identifier))))
+        for identifier in ("first", "second")]
     for thread in threads: thread.start()
     for thread in threads: thread.join()
     assert sum(reply["ok"] for reply in replies) == 1
     assert {reply.get("error", {}).get("code") for reply in replies} == {None, "stale_generation"}
     assert broker.generation == 8
+
+
+def test_completed_mutation_is_deduplicated_across_restart_sr023(tmp_path):
+    state = tmp_path / "audio-state.json"
+    first_backend = FakeBackend()
+    first = AudioBroker(first_backend, generation=4, state_path=str(state),
+                        authorize=lambda _m, _p: True)
+    original = request("connect", {"alias": "speaker"}, 4, "durable-1")
+    first_reply = response(first, original)
+    assert first_reply["ok"] and first_reply["generation"] == 5
+
+    second_backend = FakeBackend()
+    restarted = AudioBroker(second_backend, state_path=str(state),
+                            authorize=lambda _m, _p: True)
+    assert response(restarted, original) == first_reply
+    assert second_backend.calls == []
+
+
+def test_uncertain_mutation_survives_restart_and_status_is_not_starved_sr023(tmp_path):
+    state = tmp_path / "audio-state.json"
+    entered = threading.Event(); cancelled = threading.Event()
+
+    class HungBackend(FakeBackend):
+        def call(self, method, params, cancel):
+            if method == "status":
+                return {"protocolVersion": 1, "available": False, "reason": "test",
+                        "devices": [], "route": None, "visualizer": {"available": False}}
+            entered.set()
+            cancel.wait(2); cancelled.set()
+            while True: time.sleep(0.1)
+
+    broker = AudioBroker(HungBackend(), state_path=str(state),
+                         authorize=lambda _m, _p: True, backend_timeout_seconds=0.1)
+    replies = []
+    mutation = threading.Thread(target=lambda: replies.append(response(
+        broker, request("connect", {"alias": "speaker"}, 0, "uncertain"))))
+    mutation.start(); assert entered.wait(1)
+    started = time.monotonic()
+    status = response(broker, request("status", {}, 0, "status-during-mutation"))
+    assert time.monotonic() - started < 0.5
+    assert status["ok"] and status["result"]["available"] is False
+    mutation.join(timeout=1)
+    assert replies[0]["error"]["code"] == "backend_timeout"
+    assert cancelled.wait(1)
+
+    restarted = AudioBroker(FakeBackend(), state_path=str(state),
+                            authorize=lambda _m, _p: True)
+    refused = response(restarted, request("connect", {"alias": "speaker"}, 0, "retry"))
+    assert refused["error"]["code"] == "mutation_uncertain"
+
+
+def test_if015_telemetry_has_only_positive_bounded_derived_schema_sr023():
+    class TelemetryBackend(FakeBackend):
+        def call(self, method, params, cancel):
+            if method == "telemetry":
+                derived = analyze_samples([0.0, 0.5, -0.5], generation=3,
+                                          observed_monotonic_ms=40)
+                return {"available": True, **derived}
+            return super().call(method, params, cancel)
+
+    telemetry = response(AudioBroker(TelemetryBackend()), request("telemetry"))["result"]
+    assert telemetry["available"] is True and telemetry["generation"] == 3
+    assert "samples" not in telemetry and len(telemetry["bands"]) <= 16
+    unavailable = response(AudioBroker(UnavailableBackend()), request("telemetry"))["result"]
+    assert unavailable == {"available": False}
+
+    class RawTelemetry(TelemetryBackend):
+        def call(self, method, params, cancel):
+            value = super().call(method, params, cancel)
+            if method == "telemetry": value["samples"] = [0.25]
+            return value
+    refused = response(AudioBroker(RawTelemetry()), request("telemetry"))
+    assert refused["error"]["code"] == "unsafe_backend_result"
 
 
 def test_shipped_backend_is_observable_but_never_mutates_sr023():
@@ -129,6 +216,12 @@ def test_visualizer_is_bounded_finite_and_emits_no_samples_sr023():
     with pytest.raises(ValueError): analyze_samples([float("nan")], generation=0)
     with pytest.raises(ValueError): analyze_samples([0.0] * (MAX_SAMPLES + 1), generation=0)
     with pytest.raises(ValueError): analyze_samples([0.0], generation=0, observed_monotonic_ms=-1)
+    for invalid in (True, JS_SAFE_INTEGER + 1):
+        with pytest.raises(ValueError): analyze_samples([0.0], generation=invalid)
+    with pytest.raises(ValueError): analyze_samples([True], generation=0)
+    with pytest.raises(ValueError): analyze_samples([0.0], generation=0, band_count=True)
+    with pytest.raises(ValueError): analyze_samples([0.0], generation=0, silence_floor=False)
+    assert analyze_samples([0.0], generation=0, silence_floor=0)["active"] is False
 
 
 def test_visualizer_silence_hold_cadence_and_generation_reset_sr023():
@@ -178,6 +271,10 @@ def test_image_contract_is_disabled_local_and_carries_no_broad_dbus_policy_sr023
     user_data = (WALL / "user-data").read_text(encoding="utf-8")
     assert "User=panel" in unit and "RestrictAddressFamilies=AF_UNIX" in unit
     assert "NoNewPrivileges=true" in unit and "ProtectSystem=strict" in unit
+    assert "EnvironmentFile=/etc/wall-panel/audio-router.env" in unit
+    assert "EnvironmentFile=/etc/wall-panel/wall.env" not in unit
+    assert "StateDirectory=wall-audio-router" in unit
+    assert "--state /var/lib/wall-audio-router/state.json" in unit
     assert "WALL_AUDIO_ENABLED=false" in env
     assert "WALL_AUDIO_SOCKET=/run/wall-audio-router/service.sock" in env
     assert "bluetoothctl" not in unit and "wpctl" not in unit and "dbus" not in unit.lower()
@@ -199,3 +296,5 @@ def test_image_contract_is_disabled_local_and_carries_no_broad_dbus_policy_sr023
     enabled_branch = firstboot.index('if [ "$WALL_AUDIO_ENABLED" = true ]')
     assert completeness < enabled_branch
     assert 'fail_step "Panel audio payload is incomplete: missing $_wall_audio_file"' in firstboot
+    assert '/etc/wall-panel/audio-router.env' in firstboot
+    assert "printf 'WALL_AUDIO_SOCKET=/run/wall-audio-router/service.sock\\n'" in firstboot

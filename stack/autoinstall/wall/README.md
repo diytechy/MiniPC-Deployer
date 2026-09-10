@@ -20,6 +20,12 @@ not a claimed working route. See [`../../panel-audio/README.md`](../../panel-aud
 No broad BlueZ policy or WirePlumber profile ships. The physical acceptance in
 `WALL-BURN-IN.md` must establish routing, latency, coexistence and whether the
 broker can remain a separate identity or must live in the panel user session.
+The unit reads a root-owned audio-only environment rather than the broad wall
+configuration, persists its generation/one-request idempotency journal in its
+private state directory, bounds backend calls, and exposes derived-only
+telemetry through IF-015. A pending journal means device outcome is uncertain;
+the broker continues status reads but refuses routing mutations until an
+operator reconciles state and removes the journal.
 
 | | AWOW core (`../user-data`) | Wall panel (`./user-data`) |
 |---|---|---|

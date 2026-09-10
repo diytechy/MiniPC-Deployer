@@ -7914,3 +7914,37 @@ after it repeatedly reported the same host-bootstrap limitations (`python3`,
 new builder or artifact evidence. The prior WSL builder result above predates
 this remediation, so the changed builder assertions still require a suitable
 Ubuntu/WSL runner, and the actual OpenCV artifact execution remains unproven.
+
+## 2026-09-10 — SR-023 second adversarial hardening
+
+The audio service no longer inherits `/etc/wall-panel/wall.env`. Firstboot now
+atomically materializes a root-owned `0600` audio-only environment containing
+only the fixed local socket, and the unit reads that file. The unit also owns a
+private state directory. Before future device I/O the broker fsyncs a mutation
+intent; after a confirmed accepted result it atomically records the exact
+response and incremented JavaScript-safe generation. An identical lost-reply
+retry is deduplicated across restart. A timeout, crash, invalid result or write
+failure after intent remains a persistent `mutation_uncertain` refusal until an
+operator reconciles device state, while status and telemetry stay available.
+
+Backend inventory and action calls now have finite deadlines, receive a
+cooperative cancellation event, and consume bounded daemon-worker slots. Only
+mutations share the serialization lock, so a stuck device action cannot starve
+status/telemetry. Alias and result validation rejects compact, colon, hyphen and
+underscore hardware-address forms plus BlueZ paths. Numeric protocol and
+telemetry counters are bounded to JavaScript-safe integers, booleans are not
+accepted as numbers, and a zero silence floor still classifies zero RMS as
+silent.
+
+IF-015 now includes a `telemetry` read with one positive derived-only schema:
+either `{available:false}` or bounded generation/time/activity/RMS/peak/bands.
+The shipped unavailable backend returns the former. No capture adapter,
+PipeWire/WirePlumber package/session, radio route, latency, coexistence or
+physical visualizer coverage is claimed.
+
+Evidence: focused Windows audio tests **15 passed / 5 platform skips** across
+the pytest and socket files (AF_UNIX socket cases require Linux); full `python
+scripts/check.py` with Git Bash on `PATH` **750 passed / 12 skipped, RESULT
+PASS**; config, strict trace integrity, flow validation, docs and edited shell
+syntax passed. Linux socket, VM actual routing and physical telemetry evidence
+remain required unrun.

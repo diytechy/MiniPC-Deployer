@@ -1013,6 +1013,20 @@ if [ "$WALL_AUDIO_SOCKET" != /run/wall-audio-router/service.sock ]; then
     fail_step "WALL_AUDIO_SOCKET must remain the panel-local broker socket"
     WALL_AUDIO_ENABLED=false
 fi
+if [ "$WALL_AUDIO_ENABLED" != true ] && [ "$WALL_AUDIO_ENABLED" != false ]; then
+    fail_step "WALL_AUDIO_ENABLED must be exactly true or false"
+    WALL_AUDIO_ENABLED=false
+fi
+# PID 1 reads this root-only, audio-only environment file before changing to
+# User=panel. Never expose the broad wall.env (which also holds unrelated
+# credentials) to the broker process.
+install -d -m 0755 -o root -g root /etc/wall-panel
+_wall_audio_env=/etc/wall-panel/audio-router.env
+_wall_audio_env_new="${_wall_audio_env}.new"
+printf 'WALL_AUDIO_SOCKET=/run/wall-audio-router/service.sock\n' > "$_wall_audio_env_new"
+chown root:root "$_wall_audio_env_new"
+chmod 0600 "$_wall_audio_env_new"
+mv -f "$_wall_audio_env_new" "$_wall_audio_env"
 if [ "$WALL_AUDIO_ENABLED" = true ]; then
     if [ "$_wall_audio_complete" -ne 1 ]; then
         fail_step "Panel audio broker files are incomplete; leaving it stopped"
@@ -1029,9 +1043,6 @@ elif [ "$WALL_AUDIO_ENABLED" = false ]; then
     systemctl disable wall-audio-router.service >/dev/null 2>&1 || true
     systemctl stop wall-audio-router.service >/dev/null 2>&1 || true
     log "SR-023: panel audio broker disabled (default)"
-else
-    fail_step "WALL_AUDIO_ENABLED must be exactly true or false"
-    systemctl stop wall-audio-router.service >/dev/null 2>&1 || true
 fi
 
 # Touch fault filter is opt-in; OFF also restores the raw-input recovery path.

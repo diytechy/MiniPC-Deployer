@@ -10,6 +10,7 @@ Implements: SR-023, LLR-007.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,28 +26,33 @@ from routing import ALIAS, Device, MUTATING_METHODS, PolicyError, validate_actio
 MAX_REQUEST_BYTES = 16_384
 MAX_RESPONSE_BYTES = 65_536
 MAX_ID_CHARS = 64
+JS_SAFE_INTEGER = 9_007_199_254_740_991
+DEFAULT_BACKEND_TIMEOUT_SECONDS = 2.0
+MAX_BACKEND_WORKERS = 4
 
 
 class Backend(Protocol):
     """The only device-I/O seam; implementations receive validated actions."""
 
-    def call(self, method: str, params: Mapping[str, object]) -> object: ...
+    def call(self, method: str, params: Mapping[str, object], cancel: threading.Event) -> object: ...
 
-    def inventory(self) -> list[Device]: ...
+    def inventory(self, cancel: threading.Event) -> list[Device]: ...
 
 
 class UnavailableBackend:
     """Safe image default until the real-panel feasibility gate is complete."""
 
-    def call(self, method: str, params: Mapping[str, object]) -> object:
+    def call(self, method: str, params: Mapping[str, object], cancel: threading.Event) -> object:
         if method == "status":
             return {
                 "protocolVersion": 1, "available": False, "reason": "probe-required",
                 "devices": [], "route": None, "visualizer": {"available": False},
             }
+        if method == "telemetry":
+            return {"available": False}
         raise BrokerError("backend_unavailable", "audio routing is not configured")
 
-    def inventory(self) -> list[Device]:
+    def inventory(self, cancel: threading.Event) -> list[Device]:
         return []
 
 
@@ -58,17 +64,95 @@ class BrokerError(Exception):
         self.code = code
 
 
+class DurableMutationState:
+    """Atomic one-record mutation journal; pending state is deliberately sticky."""
+
+    def __init__(self, path: str | None = None, generation: int = 0):
+        if not _safe_integer(generation):
+            raise ValueError("generation must be a JavaScript-safe non-negative integer")
+        self.path = Path(path) if path else None
+        self.data = {"version": 1, "generation": generation, "pending": None, "completed": None}
+        if self.path and self.path.exists():
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if (not isinstance(loaded, dict) or set(loaded) != set(self.data) or
+                    loaded.get("version") != 1 or not _safe_integer(loaded.get("generation")) or
+                    loaded.get("pending") is not None and not isinstance(loaded.get("pending"), dict) or
+                    loaded.get("completed") is not None and not isinstance(loaded.get("completed"), dict)):
+                raise ValueError("audio mutation state is invalid")
+            self.data = loaded
+
+    @property
+    def generation(self) -> int:
+        return self.data["generation"]
+
+    @property
+    def uncertain(self) -> bool:
+        return self.data["pending"] is not None
+
+    def completed(self, signature: str) -> dict | None:
+        record = self.data["completed"]
+        return record["response"] if isinstance(record, dict) and record.get("signature") == signature else None
+
+    def begin(self, signature: str) -> None:
+        changed = {**self.data, "pending": {"signature": signature}}
+        self._write(changed); self.data = changed
+
+    def finish(self, signature: str, response: dict, *, increment: bool) -> None:
+        if increment:
+            if self.generation >= JS_SAFE_INTEGER:
+                raise BrokerError("generation_exhausted", "generation limit reached")
+        changed = {**self.data, "generation": self.generation + (1 if increment else 0),
+                   "pending": None, "completed": {"signature": signature, "response": response}}
+        self._write(changed); self.data = changed
+
+    def abandon_known_noop(self) -> None:
+        changed = {**self.data, "pending": None}
+        self._write(changed); self.data = changed
+
+    def _write(self, data: dict) -> None:
+        if not self.path:
+            return
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.path.with_name(self.path.name + ".new")
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(data, stream, separators=(",", ":"), sort_keys=True, allow_nan=False)
+            stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try: os.fsync(directory)
+            finally: os.close(directory)
+
+
+def _safe_integer(value: object) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, int) and
+            0 <= value <= JS_SAFE_INTEGER)
+
+
 class AudioBroker:
     """Decode, validate and dispatch exactly one bounded IF-015 request."""
 
     def __init__(
         self, backend: Backend, generation: int = 0,
         authorize: Callable[[str, Mapping[str, object]], bool] | None = None,
+        *, state_path: str | None = None,
+        backend_timeout_seconds: float = DEFAULT_BACKEND_TIMEOUT_SECONDS,
     ):
         self.backend = backend
-        self.generation = generation
         self.authorize = authorize or (lambda _method, _params: False)
-        self._lock = threading.Lock()
+        if (isinstance(backend_timeout_seconds, bool) or
+                not isinstance(backend_timeout_seconds, (int, float)) or
+                not 0.05 <= backend_timeout_seconds <= 120):
+            raise ValueError("backend timeout outside 0.05..120 seconds")
+        self.backend_timeout_seconds = float(backend_timeout_seconds)
+        self.state = DurableMutationState(state_path, generation)
+        self._mutation_lock = threading.Lock()
+        self._backend_slots = threading.BoundedSemaphore(MAX_BACKEND_WORKERS)
+
+    @property
+    def generation(self) -> int:
+        return self.state.generation
 
     def handle(self, raw: bytes) -> bytes:
         request_id: object = None
@@ -89,30 +173,26 @@ class AudioBroker:
                 raise BrokerError("bad_request", "invalid request id")
             if len(str(request_id)) > MAX_ID_CHARS:
                 raise BrokerError("bad_request", "request id too long")
-            if (isinstance(request_generation, bool) or
-                    not isinstance(request_generation, int) or request_generation < 0):
+            if not _safe_integer(request_generation):
                 raise BrokerError("bad_request", "invalid generation")
+            if isinstance(request_id, int) and not _safe_integer(request_id):
+                raise BrokerError("bad_request", "invalid request id")
             method, params = request["method"], request["params"]
             if not isinstance(method, str) or not isinstance(params, dict):
                 raise BrokerError("bad_request", "method and params have wrong type")
             validate_action(method, params)
-            with self._lock:
+            signature = hashlib.sha256(json.dumps(
+                {"id": request_id, "method": method, "params": params, "generation": request_generation},
+                separators=(",", ":"), sort_keys=True, allow_nan=False,
+            ).encode()).hexdigest()
+            if method in MUTATING_METHODS:
+                response = self._mutation(request_id, request_generation, method, params, signature)
+            else:
                 if request_generation != self.generation:
                     raise BrokerError("stale_generation", "request generation is stale")
-                if method in MUTATING_METHODS:
-                    if not self.authorize(method, params):
-                        raise BrokerError("authorization_required", "authorization is required")
-                    inventory = self.backend.inventory()
-                    if (not isinstance(inventory, list) or len(inventory) > 64 or
-                            any(not isinstance(device, Device) for device in inventory)):
-                        raise BrokerError("unsafe_backend_result", "backend inventory is invalid")
-                    validate_inventory_action(method, params, inventory)
-                result = self.backend.call(method, params)
-                if method in MUTATING_METHODS:
-                    self.generation += 1
-                response_generation = self.generation
+                result = self._backend_call("call", method, params)
                 self._ensure_safe_result(method, result)
-            response = {"id": request_id, "generation": response_generation, "ok": True, "result": result}
+                response = {"id": request_id, "generation": self.generation, "ok": True, "result": result}
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             response = self._error(request_id, self.generation, "bad_json", "invalid JSON")
         except PolicyError as exc:
@@ -130,6 +210,74 @@ class AudioBroker:
                        "response_too_large", "backend response exceeds limit"),
                        separators=(",", ":")) + "\n").encode()
         return encoded
+
+    def _mutation(self, request_id: object, request_generation: int, method: str,
+                  params: Mapping[str, object], signature: str) -> dict:
+        if not self._mutation_lock.acquire(timeout=self.backend_timeout_seconds):
+            raise BrokerError("broker_busy", "another mutation is still running")
+        try:
+            cached = self.state.completed(signature)
+            if cached is not None:
+                if (not isinstance(cached, dict) or set(cached) != {"id", "generation", "ok", "result"} or
+                        cached.get("id") != request_id or cached.get("generation") != self.generation or
+                        cached.get("ok") is not True):
+                    raise BrokerError("unsafe_state", "persisted mutation result is invalid")
+                self._ensure_safe_result(method, cached.get("result"))
+                return cached
+            if self.state.uncertain:
+                raise BrokerError("mutation_uncertain", "previous mutation requires operator reconciliation")
+            if request_generation != self.generation:
+                raise BrokerError("stale_generation", "request generation is stale")
+            if self.generation >= JS_SAFE_INTEGER:
+                raise BrokerError("generation_exhausted", "generation limit reached")
+            if not self.authorize(method, params):
+                raise BrokerError("authorization_required", "authorization is required")
+            inventory = self._backend_call("inventory")
+            if (not isinstance(inventory, list) or len(inventory) > 64 or
+                    any(not isinstance(device, Device) for device in inventory)):
+                raise BrokerError("unsafe_backend_result", "backend inventory is invalid")
+            validate_inventory_action(method, params, inventory)
+            self.state.begin(signature)
+            try:
+                result = self._backend_call("call", method, params)
+            except BrokerError as error:
+                if error.code == "backend_unavailable":
+                    self.state.abandon_known_noop()
+                raise
+            self._ensure_safe_result(method, result)
+            accepted = result["accepted"] is True
+            response_generation = self.generation + (1 if accepted else 0)
+            response = {"id": request_id, "generation": response_generation,
+                        "ok": True, "result": result}
+            self.state.finish(signature, response, increment=accepted)
+            return response
+        finally:
+            self._mutation_lock.release()
+
+    def _backend_call(self, operation: str, method: str | None = None,
+                      params: Mapping[str, object] | None = None) -> object:
+        if not self._backend_slots.acquire(timeout=self.backend_timeout_seconds):
+            raise BrokerError("backend_busy", "audio backend capacity is exhausted")
+        cancel = threading.Event(); done = threading.Event(); outcome: dict[str, object] = {}
+
+        def invoke() -> None:
+            try:
+                outcome["result"] = (self.backend.inventory(cancel) if operation == "inventory"
+                                     else self.backend.call(str(method), params or {}, cancel))
+            except BaseException as error:  # contained and never reflected to the peer
+                outcome["error"] = error
+            finally:
+                done.set(); self._backend_slots.release()
+
+        threading.Thread(target=invoke, daemon=True, name="panel-audio-backend").start()
+        if not done.wait(self.backend_timeout_seconds):
+            cancel.set()
+            raise BrokerError("backend_timeout", "audio backend exceeded its deadline")
+        if "error" in outcome:
+            if isinstance(outcome["error"], BrokerError) and outcome["error"].code == "backend_unavailable":
+                raise BrokerError("backend_unavailable", "audio routing is not configured")
+            raise BrokerError("backend_failure", "audio backend failed")
+        return outcome.get("result")
 
     def _error(self, request_id: object, generation: object, code: str, message: str) -> dict:
         return {"id": request_id, "generation": generation, "ok": False,
@@ -158,13 +306,35 @@ class AudioBroker:
                 raise BrokerError("unsafe_backend_result", "visualizer availability is invalid")
             if "active" in visualizer and not isinstance(visualizer["active"], bool):
                 raise BrokerError("unsafe_backend_result", "visualizer activity is invalid")
+        elif method == "telemetry":
+            if value == {"available": False}:
+                return
+            expected = {"available", "generation", "observedMonotonicMs", "active", "rms", "peak", "bands"}
+            if set(value) != expected or value["available"] is not True:
+                raise BrokerError("unsafe_backend_result", "telemetry fields are not exact")
+            if not _safe_integer(value["generation"]) or not _safe_integer(value["observedMonotonicMs"]):
+                raise BrokerError("unsafe_backend_result", "telemetry counters are invalid")
+            if not isinstance(value["active"], bool):
+                raise BrokerError("unsafe_backend_result", "telemetry activity is invalid")
+            for field in ("rms", "peak"):
+                if (isinstance(value[field], bool) or not isinstance(value[field], (int, float)) or
+                        not 0 <= value[field] <= 1):
+                    raise BrokerError("unsafe_backend_result", "telemetry level is invalid")
+            bands = value["bands"]
+            if (not isinstance(bands, list) or not 1 <= len(bands) <= 16 or
+                    any(isinstance(item, bool) or not isinstance(item, (int, float)) or
+                        not 0 <= item <= 1 for item in bands)):
+                raise BrokerError("unsafe_backend_result", "telemetry bands are invalid")
         elif set(value) != {"accepted"} or not isinstance(value["accepted"], bool):
             raise BrokerError("unsafe_backend_result", "action result fields are not exact")
 
     def _safe_string(self, value: object, limit: int) -> None:
         if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):
             raise BrokerError("unsafe_backend_result", "backend string is invalid")
-        if re.search(r"(?i)(?:[0-9a-f]{2}:){5}[0-9a-f]{2}|/org/bluez/|data:audio/", value):
+        if re.search(r"(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f])|"
+                     r"(?<![0-9a-f])(?:[0-9a-f]{2}_){5}[0-9a-f]{2}(?![0-9a-f])|"
+                     r"(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])|"
+                     r"dev_[0-9a-f]{2}(?:_[0-9a-f]{2}){5}|/org/bluez(?:/|$)|data:audio/", value):
             raise BrokerError("unsafe_backend_result", "backend string exposes forbidden identity or audio")
 
     def _safe_device(self, value: object) -> None:
@@ -247,9 +417,9 @@ class BoundedUnixServer:
         except FileNotFoundError: pass
 
 
-def serve(socket_path: str, backend: Backend | None = None) -> None:
+def serve(socket_path: str, backend: Backend | None = None, *, state_path: str | None = None) -> None:
     """Serve IF-015 on one filesystem Unix socket; never binds an IP address."""
-    server = BoundedUnixServer(socket_path, AudioBroker(backend or UnavailableBackend()))
+    server = BoundedUnixServer(socket_path, AudioBroker(backend or UnavailableBackend(), state_path=state_path))
     try: server.serve_forever()
     finally: server.close()
 
@@ -257,8 +427,9 @@ def serve(socket_path: str, backend: Backend | None = None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", required=True)
+    parser.add_argument("--state", required=True)
     args = parser.parse_args()
-    serve(args.socket)
+    serve(args.socket, state_path=args.state)
 
 
 if __name__ == "__main__":

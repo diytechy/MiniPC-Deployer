@@ -14,6 +14,7 @@ from typing import Iterable
 
 MAX_SAMPLES = 2048
 MAX_BANDS = 16
+JS_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 def analyze_samples(
@@ -28,19 +29,27 @@ def analyze_samples(
     Raises: ValueError for non-finite/out-of-range or oversized input.
     Implements: SR-023, LLR-007.
     """
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+    if (isinstance(generation, bool) or not isinstance(generation, int) or
+            not 0 <= generation <= JS_SAFE_INTEGER):
         raise ValueError("generation must be a non-negative integer")
-    if not 1 <= band_count <= MAX_BANDS or not 1 <= max_samples <= MAX_SAMPLES or not 0 <= silence_floor <= 1:
+    if (isinstance(band_count, bool) or not isinstance(band_count, int) or
+            isinstance(max_samples, bool) or not isinstance(max_samples, int) or
+            isinstance(silence_floor, bool) or not isinstance(silence_floor, (int, float)) or
+            not math.isfinite(silence_floor) or not 1 <= band_count <= MAX_BANDS or
+            not 1 <= max_samples <= MAX_SAMPLES or not 0 <= silence_floor <= 1):
         raise ValueError("telemetry bounds invalid")
     if observed_monotonic_ms is not None and (
         isinstance(observed_monotonic_ms, bool) or
-        not isinstance(observed_monotonic_ms, int) or observed_monotonic_ms < 0
+        not isinstance(observed_monotonic_ms, int) or
+        not 0 <= observed_monotonic_ms <= JS_SAFE_INTEGER
     ):
         raise ValueError("observation time must be a non-negative integer")
     values: list[float] = []
     for sample in samples:
         if len(values) == max_samples:
             raise ValueError("sample window too large")
+        if isinstance(sample, bool) or not isinstance(sample, (int, float)):
+            raise ValueError("sample must be numeric and not boolean")
         value = float(sample)
         if not math.isfinite(value) or abs(value) > 1:
             raise ValueError("sample outside normalized finite range")
@@ -64,7 +73,7 @@ def analyze_samples(
             int(time.monotonic() * 1000) if observed_monotonic_ms is None
             else observed_monotonic_ms
         ),
-        "active": rms >= silence_floor,
+        "active": rms > silence_floor,
         "rms": round(min(1.0, rms), 6),
         "peak": round(min(1.0, peak), 6),
         "bands": [round(value, 6) for value in bands],
@@ -100,10 +109,12 @@ class VisualizerTelemetry:
 
     def process(self, samples: Iterable[float], *, generation: int,
                 observed_monotonic_ms: int) -> dict[str, object] | None:
-        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        if (isinstance(generation, bool) or not isinstance(generation, int) or
+                not 0 <= generation <= JS_SAFE_INTEGER):
             raise ValueError("generation must be a non-negative integer")
         if (isinstance(observed_monotonic_ms, bool) or
-                not isinstance(observed_monotonic_ms, int) or observed_monotonic_ms < 0):
+                not isinstance(observed_monotonic_ms, int) or
+                not 0 <= observed_monotonic_ms <= JS_SAFE_INTEGER):
             raise ValueError("observation time must be a non-negative integer")
         if self._last_observed_ms is not None and observed_monotonic_ms < self._last_observed_ms:
             raise ValueError("monotonic observation time moved backwards")

@@ -7982,3 +7982,13 @@ release gate. Focused evidence is **17 passed / 6 platform skips**; configuratio
 Python parsing and strict trace integrity passed; and the fresh full G1 gate is
 **758 passed / 13 skipped, RESULT PASS**. No physical routing or telemetry claim
 is added.
+
+The third Door teardown review closed two more fail-open edges. Numeric, zone
+and mask validators now consume literal stdin bytes; backslash-escaped AWK
+punctuation is rejected and the mask byte/count limits measure the value that is
+actually written. Teardown runtime-masks the unit before bounded stop/kill/reset
+handling, then requires both systemd inactivity and no dedicated-account process
+for a full settle interval; a simulated delayed `Restart=on-failure` therefore
+cannot race credential/socket unlink. The focused Door suite passes **32 tests**.
+The full G1 gate passes **762 tests / 13 skipped, RESULT PASS**. The private
+OpenCV artifact execution remains unrun pending `motion.py`.

@@ -817,19 +817,39 @@ purge_door_runtime() {
     # Never unlink a live process's credential source and call that teardown.
     # systemctl itself can wedge on a stuck child, so every control operation is
     # bounded and the dedicated account is the final process-level authority.
+    if ! timeout 5 systemctl mask --runtime wall-door-stream.service >/dev/null 2>&1; then
+        fail_step "Door broker could not be runtime-masked against restart; retaining runtime state"
+        return 1
+    fi
     if ! timeout 7 systemctl stop wall-door-stream.service >/dev/null 2>&1; then
         warn "Door broker did not stop within seven seconds; applying bounded kill fallback"
     fi
     if pgrep -u wall-door-stream >/dev/null 2>&1; then
         timeout 2 pkill -KILL -u wall-door-stream >/dev/null 2>&1 || true
     fi
+    if ! timeout 5 systemctl reset-failed wall-door-stream.service >/dev/null 2>&1; then
+        fail_step "Door broker failed-state reset could not be confirmed; retaining runtime state"
+        return 1
+    fi
     _door_wait=0
-    while pgrep -u wall-door-stream >/dev/null 2>&1 && [ "$_door_wait" -lt 10 ]; do
+    _door_stable=0
+    while [ "$_door_wait" -lt 10 ]; do
+        _door_unit_inactive=0
+        if timeout 1 systemctl is-active --quiet wall-door-stream.service >/dev/null 2>&1; then
+            _door_unit_inactive=0
+        elif [ "$?" -eq 3 ]; then
+            _door_unit_inactive=1
+        fi
+        if [ "$_door_unit_inactive" -eq 1 ] && ! pgrep -u wall-door-stream >/dev/null 2>&1; then
+            _door_stable=$((_door_stable + 1))
+        else
+            _door_stable=0
+        fi
         sleep 0.1
         _door_wait=$((_door_wait + 1))
     done
-    if pgrep -u wall-door-stream >/dev/null 2>&1; then
-        fail_step "Door broker inactivity could not be proven; retaining runtime credentials and socket"
+    if [ "$_door_stable" -ne 10 ]; then
+        fail_step "Door broker stable inactivity could not be proven; retaining runtime credentials and socket"
         return 1
     fi
     if ! timeout 5 systemctl disable wall-door-stream.service >/dev/null 2>&1; then
@@ -846,15 +866,21 @@ door_motion_bool_valid() {
 }
 
 door_motion_number_between() { # VALUE MIN MAX
-    awk -v value="$1" -v low="$2" -v high="$3" 'BEGIN {
+    case "$1" in *'
+'*) return 1 ;; esac
+    printf '%s\n' "$1" | LC_ALL=C awk -v low="$2" -v high="$3" 'NR == 1 {
+        value = $0
         if (value !~ /^([0-9]+([.][0-9]+)?|[.][0-9]+)$/) exit 1
         number = value + 0
         exit !(number >= low && number <= high)
-    }'
+    } NR != 1 { exit 1 }'
 }
 
 door_motion_zone_valid() { # X,Y,WIDTH,HEIGHT ALLOW_DISABLED
-    awk -v raw="$1" -v allow_disabled="$2" 'BEGIN {
+    case "$1" in *'
+'*) return 1 ;; esac
+    printf '%s\n' "$1" | LC_ALL=C awk -v allow_disabled="$2" 'NR == 1 {
+        raw = $0
         count = split(raw, field, ",")
         if (count != 4) exit 1
         for (i = 1; i <= 4; i++) {
@@ -866,12 +892,15 @@ door_motion_zone_valid() { # X,Y,WIDTH,HEIGHT ALLOW_DISABLED
         if (allow_disabled && value[3] == 0 && value[4] == 0) exit 0
         if (value[3] <= 0 || value[4] <= 0) exit 1
         exit !((value[1] + value[3] <= 1) && (value[2] + value[4] <= 1))
-    }'
+    } NR != 1 { exit 1 }'
 }
 
 door_motion_masks_valid() {
     [ -z "$1" ] && return 0
-    LC_ALL=C awk -v raw="$1" 'BEGIN {
+    case "$1" in *'
+'*) return 1 ;; esac
+    printf '%s\n' "$1" | LC_ALL=C awk 'NR == 1 {
+        raw = $0
         if (length(raw) > 4096) exit 1
         zones = split(raw, zone, ";")
         if (zones > 32) exit 1
@@ -888,7 +917,7 @@ door_motion_masks_valid() {
                 value[1] + value[3] > 1 || value[2] + value[4] > 1) exit 1
         }
         exit 0
-    }'
+    } NR != 1 { exit 1 }'
 }
 
 if ! getent group wall-door-stream >/dev/null 2>&1; then
@@ -1003,7 +1032,10 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
     # multi-user.target. Disable any old enablement before starting it here.
     if [ "$_door_credentials_ready" -eq 0 ]; then
         purge_door_runtime
-    elif ! systemctl restart wall-door-stream.service; then
+    elif ! timeout 5 systemctl unmask --runtime wall-door-stream.service >/dev/null 2>&1; then
+        fail_step "Door broker runtime mask could not be removed for a complete installation"
+    elif ! timeout 7 systemctl restart wall-door-stream.service; then
+        purge_door_runtime
         fail_step "Door broker could not restart with its Door-only credentials; inspect systemctl status wall-door-stream.service"
     else
         log "SR-024: Door broker ready — idle until present/lit sampler or visible-frame eligibility"

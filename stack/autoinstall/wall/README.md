@@ -131,11 +131,12 @@ explicit diagnostics boolean. Tracked defaults contain no real-property shape
 and leave both motion gates false. Firstboot validates every value even while
 disabled; only explicit enabled+calibrated state publishes effective enable.
 Invalid configuration makes provisioning red and publishes safe disabled
-values. An incomplete payload or removed camera input uses bounded stop and
-kill handling and positively verifies that the dedicated service account has no
-remaining process before disabling and purging old volatile credentials and
-socket state. If inactivity cannot be proved, provisioning is red and retains
-that runtime evidence rather than unlinking underneath a possible live process.
+values. Validators consume literal bytes through stdin so AWK cannot reinterpret
+escaped punctuation. An incomplete payload or removed camera input runtime-masks
+restart, uses bounded stop/kill/reset handling, and requires both systemd and the
+dedicated account to remain inactive throughout a settle interval before
+disabling and purging old volatile credentials/socket state. If stable inactivity
+cannot be proved, provisioning is red and retains that runtime evidence.
 
 The broker is only eligible while the display is lit/present. Every backlight-
 off and suspend path completes a bounded stop before changing power state; display-on starts an

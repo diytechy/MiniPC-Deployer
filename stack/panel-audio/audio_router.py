@@ -207,13 +207,14 @@ class AudioBroker:
                 if request_generation != self.generation:
                     raise BrokerError("stale_generation", "request generation is stale")
                 result = self._backend_call("call", method, params)
-                if method == "telemetry" and isinstance(result, dict) and result.get("available") is True:
+                if method == "telemetry":
                     if not self._mutation_lock.acquire(timeout=self.backend_timeout_seconds):
                         raise BrokerError("broker_busy", "another mutation is still running")
                     try:
                         if self.generation != request_generation:
                             raise BrokerError("stale_generation", "telemetry generation changed during capture")
-                        result = {**result, "generation": request_generation}
+                        if isinstance(result, dict) and result.get("available") is True:
+                            result = {**result, "generation": request_generation}
                         self._ensure_safe_result(method, result)
                         response = {"id": request_id, "generation": request_generation,
                                     "ok": True, "result": result}

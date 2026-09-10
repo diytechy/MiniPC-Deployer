@@ -8009,5 +8009,15 @@ credential-bearing `wall.env`; its firstboot test fixes the two-key allowlist
 and root:root 0600 materialization. The burn-in procedure records direct checks
 for that file, the panel-owned 0660 socket, peer-UID refusal, and default-denied
 mutation authorization.
-The focused audio gate passes **18 tests / 6 platform skips**; the full G1 gate
-passes **763 tests / 13 skipped, RESULT PASS**, with strict trace integrity zero.
+The focused audio gate at that review passed **18 tests / 6 platform skips**;
+the full G1 gate passed **763 tests / 13 skipped, RESULT PASS**, with strict
+trace integrity zero.
+
+A final unavailable-telemetry review closed the same epoch race for
+`{available:false}`: all telemetry now takes the mutation lock after capture,
+checks the retained request epoch, and rejects a crossed mutation. Only an
+available derived result gains an inner generation field. A coordinated fake
+proves unavailable telemetry cannot escape under the newer response epoch.
+After this correction, the focused audio gate passes **19 tests / 6 platform
+skips** and the full G1 gate passes **764 tests / 13 skipped, RESULT PASS**;
+strict trace integrity remains zero.

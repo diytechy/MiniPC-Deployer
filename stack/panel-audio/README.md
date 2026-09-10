@@ -44,8 +44,9 @@ deliberately sticky `mutation_uncertain` on
 restart: routing changes remain refused until an operator reconciles actual
 device state and removes that journal. Status and telemetry remain readable.
 
-Telemetry is stamped with the request epoch and rejected if a concurrent
-mutation advances that epoch while capture is in flight. The mode-0660 socket
+Every telemetry result is retained under its request epoch and rejected if a
+concurrent mutation advances that epoch while capture is in flight; available
+derived samples additionally carry that epoch in their result. The mode-0660 socket
 shell has bounded concurrent clients, Linux peer-UID
 enforcement and read deadlines. `telemetry`
 is an IF-015 read method with a positive schema: unavailable, or bounded derived

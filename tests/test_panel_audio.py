@@ -268,6 +268,27 @@ def test_telemetry_in_flight_across_mutation_is_rejected_not_relabelled_sr023():
     assert replies[0]["generation"] == 1
 
 
+def test_unavailable_telemetry_crossing_mutation_is_also_rejected_sr023():
+    entered = threading.Event(); release = threading.Event()
+    class RacingUnavailableBackend(FakeBackend):
+        def call(self, method, params, cancel):
+            if method == "telemetry":
+                entered.set(); release.wait(1)
+                return {"available": False}
+            return super().call(method, params, cancel)
+    broker = AudioBroker(RacingUnavailableBackend(), authorize=lambda _m, _p: True)
+    replies = []
+    sample = threading.Thread(target=lambda: replies.append(response(
+        broker, request("telemetry", generation=0, request_id="unavailable"))))
+    sample.start(); assert entered.wait(1)
+    mutation = response(broker, request("connect", {"alias": "speaker"}, 0, "route"))
+    assert mutation["ok"] and mutation["generation"] == 1
+    release.set(); sample.join(timeout=1)
+    assert not sample.is_alive()
+    assert replies[0]["error"]["code"] == "stale_generation"
+    assert replies[0]["generation"] == 1
+
+
 def test_shipped_backend_is_observable_but_never_mutates_sr023():
     broker = AudioBroker(UnavailableBackend())
     status = response(broker, request())["result"]

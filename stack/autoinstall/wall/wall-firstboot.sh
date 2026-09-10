@@ -829,11 +829,17 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
     : "${DOORBELL_STALE_SECONDS:=4}"
     : "${DOORBELL_START_SECONDS:=12}"
     _door_credentials_ready=0
+    _door_cred_dir=/run/wall-door-credentials
+    install -d -m 0700 -o root -g root "$_door_cred_dir"
+    # Purge the exact old allowlist before judging the new source. Otherwise a
+    # later display-on could restart the broker with credentials removed from
+    # wall.env during a supported firstboot rerun.
+    for _door_cred_name in host password port path username width height input-fov horizontal-fov vertical-fov yaw pitch stale-seconds start-seconds; do
+        rm -f -- "$_door_cred_dir/$_door_cred_name"
+    done
     if [ -z "${DOORBELL_RTSP_HOST:-}" ] || [ -z "${DOORBELL_RTSP_PASSWORD:-}" ]; then
         fail_step "Door broker needs DOORBELL_RTSP_HOST and DOORBELL_RTSP_PASSWORD in wall.env"
     else
-        _door_cred_dir=/run/wall-door-credentials
-        install -d -m 0700 -o root -g root "$_door_cred_dir"
         printf '%s' "$DOORBELL_RTSP_HOST" > "$_door_cred_dir/host"
         printf '%s' "$DOORBELL_RTSP_PASSWORD" > "$_door_cred_dir/password"
         printf '%s' "$DOORBELL_RTSP_PORT" > "$_door_cred_dir/port"

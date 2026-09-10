@@ -157,6 +157,10 @@ stop_door_stream() {
 }
 start_door_broker() {
     systemctl cat wall-door-stream.service >/dev/null 2>&1 || return 0
+    # Firstboot owns the volatile Door-only credential set. If current config
+    # was removed or rejected, display-on must not resurrect an older source.
+    [ -r /run/wall-door-credentials/host ] || return 0
+    [ -r /run/wall-door-credentials/password ] || return 0
     systemctl start wall-door-stream.service >/dev/null 2>&1
 }
 

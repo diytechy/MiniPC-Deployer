@@ -6738,3 +6738,15 @@ passed, and the complete G1 gate **549 passed / 5 skipped** with trace integrity
 unit; its only messages are the known DrvFS executable/world-writable projection,
 while autoinstall writes the target unit 0644. No ISO was built and no live panel
 state changed.
+
+**2026-09-09 — B14 review-2 stale-credential fix.** The second independent
+review found that a supported rerun with host/password removed stopped the unit
+but left the previous `/run` files. A later display-on could therefore start the
+broker with stale credentials. Firstboot now deletes each exact Door allowlist
+file before validating and rendering the replacement. Missing required values
+leave no reusable source and stop the unit; `wall-sleep.sh` also requires current
+host and password files before its display-on path starts the idle broker. This
+is defense in depth around the same volatile-source invariant. Review 3 remains
+required. Focused tests are **6/6**, both edited shell scripts parse cleanly, and
+the complete G1 gate remains **549 passed / 5 skipped**, trace integrity 0 with
+the unchanged 24 legacy orphans. No image or live-panel change has occurred.

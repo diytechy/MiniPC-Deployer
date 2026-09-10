@@ -34,6 +34,9 @@ def test_door_broker_is_installed_and_enabled_by_firstboot():
     assert "systemctl restart wall-door-stream.service" in firstboot
     assert "install -d -m 0700 -o root -g root \"$_door_cred_dir\"" in firstboot
     assert "printf '%s' \"$DOORBELL_RTSP_PASSWORD\" > \"$_door_cred_dir/password\"" in firstboot
+    purge = firstboot.index('rm -f -- "$_door_cred_dir/$_door_cred_name"')
+    missing = firstboot.index('if [ -z "${DOORBELL_RTSP_HOST:-}" ]')
+    assert purge < missing
     assert "After=network-online.target wall-firstboot.service" not in (
         WALL / "wall-door-stream.service"
     ).read_text(encoding="utf-8")
@@ -78,6 +81,9 @@ def test_display_on_readies_the_idle_broker_without_starting_a_camera():
     backlight = sleep[sleep.index("backlight_set()") : sleep.index("# ── which frame")]
     on = backlight[backlight.index("else") : backlight.index("return 0")]
     assert "start_door_broker" in on
+    start = sleep[sleep.index("start_door_broker()") : sleep.index("backlight_set()")]
+    assert "[ -r /run/wall-door-credentials/host ] || return 0" in start
+    assert "[ -r /run/wall-door-credentials/password ] || return 0" in start
     executable = "\n".join(
         line for line in sleep.splitlines() if not line.lstrip().startswith("#")
     ).lower()

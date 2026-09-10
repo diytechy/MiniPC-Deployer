@@ -46,7 +46,8 @@ def test_door_broker_is_installed_and_enabled_by_firstboot():
         in user_data
     )
     assert "useradd --system" in firstboot and "wall-door-stream" in firstboot
-    assert "systemctl disable --now wall-door-stream.service" in firstboot
+    assert "timeout 7 systemctl stop wall-door-stream.service" in firstboot
+    assert "timeout 2 pkill -KILL -u wall-door-stream" in firstboot
     assert "wall-door-stream.service" in firstboot
     assert "systemctl restart wall-door-stream.service" in firstboot
     assert "install -d -m 0700 -o root -g root \"$_door_cred_dir\"" in firstboot
@@ -139,6 +140,10 @@ def test_motion_is_fail_closed_and_every_public_knob_is_validated():
     ("door_motion_zone_valid", "0,0,0,0", "1", True),
     ("door_motion_masks_valid", "", "", True),
     ("door_motion_masks_valid", "0,0,0.5,1;0.5,0,0.5,1", "", True),
+    ("door_motion_masks_valid", ";".join(["0,0,0.01,0.01"] * 32), "", True),
+    ("door_motion_masks_valid", ";".join(["0,0,0.01,0.01"] * 33), "", False),
+    ("door_motion_masks_valid", "0,0,1,1" + " " * (4096 - len("0,0,1,1")), "", True),
+    ("door_motion_masks_valid", "0,0,1,1" + " " * (4097 - len("0,0,1,1")), "", False),
     ("door_motion_masks_valid", "0,0,1.1,1", "", False),
 ])
 def test_motion_config_validators_execute_boundaries(function, value, extra, accepted):
@@ -173,11 +178,63 @@ def test_motion_config_validators_execute_boundaries(function, value, extra, acc
 def test_incomplete_door_payload_stops_disables_and_purges_runtime():
     firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
     purge = firstboot[firstboot.index("purge_door_runtime()") : firstboot.index("door_motion_bool_valid()")]
-    assert "systemctl disable --now wall-door-stream.service" in purge
+    assert "timeout 7 systemctl stop wall-door-stream.service" in purge
+    assert "timeout 2 pkill -KILL -u wall-door-stream" in purge
+    assert purge.index("pgrep -u wall-door-stream") < purge.index('rm -f -- "$_door_cred_dir/$_door_cred_name"')
     assert 'rm -f -- "$_door_cred_dir/$_door_cred_name"' in purge
     assert "rm -f -- /run/wall-door-stream/service.sock" in purge
     incomplete = firstboot[firstboot.index("else\n    purge_door_runtime\n    fail_step \"Door broker is incomplete") :]
     assert incomplete.index("purge_door_runtime") < incomplete.index("fail_step")
+
+
+@pytest.mark.parametrize(("stays_active", "accepted"), [(False, True), (True, False)])
+def test_runtime_purge_kills_after_timed_out_stop_and_unlinks_only_when_inactive(
+    tmp_path, stays_active, accepted,
+):
+    bash = shutil.which("bash") or next((str(path) for path in (
+        Path("C:/Program Files/Git/bin/bash.exe"),
+        Path("C:/Program Files/Git/usr/bin/bash.exe"),
+    ) if path.is_file()), None)
+    if not bash:
+        pytest.skip("bash is required to execute the firstboot purge")
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    purge = firstboot[
+        firstboot.index("purge_door_runtime()"):
+        firstboot.index("door_motion_bool_valid()")
+    ]
+    log = (tmp_path / "calls.log").as_posix()
+    prelude = r'''
+_door_credential_names="host password"
+_door_cred_dir=/run/wall-door-credentials
+ACTIVE=1
+warn() { echo "warn:$*" >> "$LOG"; }
+fail_step() { echo "fail:$*" >> "$LOG"; }
+systemctl() { echo "systemctl:$*" >> "$LOG"; return 0; }
+timeout() {
+    echo "timeout:$*" >> "$LOG"
+    shift
+    if [ "${1:-}" = systemctl ] && [ "${2:-}" = stop ]; then return 124; fi
+    "$@"
+}
+pgrep() { [ "$ACTIVE" = 1 ]; }
+pkill() { echo "pkill:$*" >> "$LOG"; [ "$STAYS_ACTIVE" = 1 ] || ACTIVE=0; }
+sleep() { :; }
+rm() { echo "rm:$*" >> "$LOG"; }
+'''
+    result = subprocess.run(
+        [bash, "-c", prelude + "\n" + purge + "\npurge_door_runtime"],
+        env={**os.environ, "LOG": log, "STAYS_ACTIVE": "1" if stays_active else "0"},
+        capture_output=True, text=True, check=False,
+    )
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8")
+    assert (result.returncode == 0) is accepted
+    assert "timeout:7 systemctl stop wall-door-stream.service" in calls
+    assert "pkill:-KILL -u wall-door-stream" in calls
+    if accepted:
+        assert calls.index("pkill:") < calls.index("systemctl:disable") < calls.index("rm:")
+    else:
+        assert "fail:Door broker inactivity could not be proven" in calls
+        assert "rm:" not in calls
 
 
 def test_door_capability_matches_the_private_application_payload():

@@ -814,7 +814,27 @@ _door_credential_names="host password port path username width height input-fov 
 # Stop before removing the volatile inputs. A rerun with an incomplete payload
 # must not leave the previous process or socket alive on stale credentials.
 purge_door_runtime() {
-    systemctl disable --now wall-door-stream.service >/dev/null 2>&1 || true
+    # Never unlink a live process's credential source and call that teardown.
+    # systemctl itself can wedge on a stuck child, so every control operation is
+    # bounded and the dedicated account is the final process-level authority.
+    if ! timeout 7 systemctl stop wall-door-stream.service >/dev/null 2>&1; then
+        warn "Door broker did not stop within seven seconds; applying bounded kill fallback"
+    fi
+    if pgrep -u wall-door-stream >/dev/null 2>&1; then
+        timeout 2 pkill -KILL -u wall-door-stream >/dev/null 2>&1 || true
+    fi
+    _door_wait=0
+    while pgrep -u wall-door-stream >/dev/null 2>&1 && [ "$_door_wait" -lt 10 ]; do
+        sleep 0.1
+        _door_wait=$((_door_wait + 1))
+    done
+    if pgrep -u wall-door-stream >/dev/null 2>&1; then
+        fail_step "Door broker inactivity could not be proven; retaining runtime credentials and socket"
+        return 1
+    fi
+    if ! timeout 5 systemctl disable wall-door-stream.service >/dev/null 2>&1; then
+        fail_step "Door broker disable operation failed after verified process teardown"
+    fi
     for _door_cred_name in $_door_credential_names; do
         rm -f -- "$_door_cred_dir/$_door_cred_name"
     done
@@ -851,8 +871,10 @@ door_motion_zone_valid() { # X,Y,WIDTH,HEIGHT ALLOW_DISABLED
 
 door_motion_masks_valid() {
     [ -z "$1" ] && return 0
-    awk -v raw="$1" 'BEGIN {
+    LC_ALL=C awk -v raw="$1" 'BEGIN {
+        if (length(raw) > 4096) exit 1
         zones = split(raw, zone, ";")
+        if (zones > 32) exit 1
         for (z = 1; z <= zones; z++) {
             count = split(zone[z], field, ",")
             if (count != 4) exit 1

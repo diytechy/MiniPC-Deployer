@@ -7915,6 +7915,22 @@ new builder or artifact evidence. The prior WSL builder result above predates
 this remediation, so the changed builder assertions still require a suitable
 Ubuntu/WSL runner, and the actual OpenCV artifact execution remains unproven.
 
+Second Door review remediation on 2026-09-10 closes two additional static and
+fake-backed gaps. Masks are now capped at 32 normalized rectangles and 4096
+ASCII bytes, with exact-boundary and over-limit tests. Incomplete-installation
+cleanup no longer relies on an unbounded, ignored `disable --now`: it performs
+a seven-second stop, a bounded dedicated-account kill fallback, and positive
+process-inactivity verification before disabling and unlinking credentials or
+the socket. A surviving process makes firstboot red and leaves the runtime
+evidence intact. Recording-fake cases cover stop timeout with successful kill
+and persistent activity after kill. This does not change the outstanding
+release evidence: the clean offline artifact test that imports `cv2` and runs
+the actual carried `motion.py` remains **unrun** until such a private artifact
+exists, and no physical calibration/load claim is made. The focused Door suite
+passed **28 tests**; shell parsing, configuration validation and strict trace
+integrity passed; and the full G1 gate passed **756 tests / 12 skipped, RESULT
+PASS**.
+
 ## 2026-09-10 — SR-023 second adversarial hardening
 
 The audio service no longer inherits `/etc/wall-panel/wall.env`. Firstboot now

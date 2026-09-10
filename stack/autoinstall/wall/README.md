@@ -125,13 +125,17 @@ unprivileged service's RAM-backed credential directory. The unit never mounts
 `wall.env`, and its stdout/stderr remain suppressed so a decoder cannot leak an
 authenticated URL. Detector configuration is public but travels through the
 same exact allowlist: effective enable/calibration gates, sample cadence, normalized minimum area, persistence,
-dwell/stationary threshold, normalized trigger/road zones and masks, plus an
+dwell/stationary threshold, normalized trigger/road zones and masks (at most 32
+rectangles and 4096 ASCII bytes), plus an
 explicit diagnostics boolean. Tracked defaults contain no real-property shape
 and leave both motion gates false. Firstboot validates every value even while
 disabled; only explicit enabled+calibrated state publishes effective enable.
 Invalid configuration makes provisioning red and publishes safe disabled
-values. An incomplete payload or removed camera input stops/disables the unit
-and purges old volatile credentials and socket state.
+values. An incomplete payload or removed camera input uses bounded stop and
+kill handling and positively verifies that the dedicated service account has no
+remaining process before disabling and purging old volatile credentials and
+socket state. If inactivity cannot be proved, provisioning is red and retains
+that runtime evidence rather than unlinking underneath a possible live process.
 
 The broker is only eligible while the display is lit/present. Every backlight-
 off and suspend path completes a bounded stop before changing power state; display-on starts an

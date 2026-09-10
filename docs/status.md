@@ -29,13 +29,18 @@ shut down by Google in 2022, and a hub-side listener would need an SSH tunnel
 raised before consent or the single-use code is lost. **The Owner must add
 `http://localhost:8117/` to the OAuth client's redirect URIs, alongside — never
 replacing — the existing `/oauth2/callback` and `/api/drive/callback`.**
-**Step 5 is deliberately NOT started:** no `parse_weight_datapoint` exists, in
-the feeder or in the new module, and two tests fail if one appears. The parser
-is written against a body a human has actually seen, because `weightGrams` is
-grams and a parser that assumes otherwise posts a confident, plausible, wrong
-body weight that nothing on the wall could contradict. Next action awaiting
-approval: the Owner runs the two commands in `stack/weight/README.md` and hands
-the captured body back. Gate remains G1.
+**Step 5 is now DONE - see the 2026-09-09 audit entry at the bottom of this
+file.** The Owner ran `weight_oauth.py capture` against the live API and got
+HTTP 200 with one data point, so the gate B7 set - "one real call, verified,
+*before* the parser is written" - was **met, not waived**, and
+`parse_weight_datapoint` is written against that observed body. The six "no
+parser exists" absence assertions in `tests/test_weight_feeder.py` have been
+**replaced by correctness assertions**, deliberately and on the record, rather
+than quietly dropped; the equivalent assertion in `tests/test_weight_oauth.py`
+**remains**, because the capture tool still must not interpret a body. The
+captured body, the Owner's Google user id and their real weight are **not** in
+this repo: what is recorded is the body's shape, with a placeholder id and a
+made-up weight. Gate remains G1.
 
 **2026-09-09 — B14 Door image integration is implemented and independently
 reviewed, not deployed.** The
@@ -7253,3 +7258,107 @@ notice test, not by an end-to-end refusal.
 
 **Not done here.** No parser (step 5 is still owed a real captured body), no
 push, no hub state touched. Source, tests and docs only, on `b11-weight-token`.
+
+## Audit - 2026-09-09 (later) B11 step 5: the Google Health weight parser (`IceDrive-DesktopDirection`, local only)
+
+**THE GATE WAS CLEARED BY A REAL BODY, AND THAT IS THE HEADLINE.** From the
+start of B11 this repo refused to write a Google Health parser, and
+`tests/test_weight_feeder.py` asserted the refusal by name in six places
+(`parse_google_health` / `parse_weight_datapoint` / `parse_weight` /
+`parse_datapoints`, across two tests). On **2026-09-09** the Owner ran
+`weight_oauth.py capture` against the live API and got **HTTP 200, 712 bytes**,
+one data point, from
+`GET https://health.googleapis.com/v4/users/me/dataTypes/weight/dataPoints` with
+no query parameters. B7's standard was **met, not waived**. The six absence
+assertions are now **replaced by correctness assertions** - this paragraph is
+the record that they were removed deliberately and why, rather than a later
+reader finding them simply gone. The absence assertion in
+`tests/test_weight_oauth.py` **stays**: the capture tool must still not
+interpret a body, and it still fails if that file so much as mentions
+`weightGrams` or `sampleTime`.
+
+**THE CAPTURED BODY IS NOT IN THIS REPO AND NEVER WILL BE.** It carries the
+Owner's Google user id (in `name`) and their real body weight. What is recorded,
+in the module docstring and in the test fixtures, is its **shape**, with a
+placeholder id and a weight that is not the Owner's. The `name` field is not read
+by the parser at all, which is why the sentinel a test looks for cannot appear.
+
+**WHAT THE BODY SETTLED, AND WHAT IT DID NOT.**
+
+| observation | consequence |
+|---|---|
+| the top-level key is **`dataPoints`, plural** | earlier prose in this repo and in `README.md`'s troubleshooting table guessed `dataPoint`. Both corrected; the observation wins. |
+| **`weightGrams` is grams** | `grams_to_pounds` (already present, already tested) is the one conversion, reached from a vendor body only through `check_vendor_grams`. |
+| `observed_at` is `weight.sampleTime.physicalTime` | the instant the reading was TRUE, which is what NagLight's staleness rule keys off. Never `now`. |
+| `civilTime` is **2026-09-08 20:24** while `physicalTime` is **2026-09-09T01:24Z** (`utcOffset: -18000s`) | a **proven** trap. The gauge uses `physicalTime`; anything needing the reading's **calendar day** - the weigh-in auto-check-off SN-040 gestures at next - must use `civilTime`, or it ticks off Tuesday for a Monday-evening weigh-in every time. `WeightReading` carries `civil_date` and `utc_offset_seconds` so the next author is handed them. No check-off was built. |
+| the response carried **no `nextPageToken`** | so paging is an **ASSUMPTION**, marked as one in `list_weight_data_points`: a token is followed up to `MAX_LIST_PAGES` (20) and a deeper history is **refused** rather than answered from a partial walk, because "the latest reading" would then be a claim the code cannot support. Refusing costs nothing real - the failure path re-posts the last real reading at its original stamp. |
+
+**LATEST, NOT FIRST.** The captured body held exactly one point, so "the first
+element" and "the newest" were indistinguishable in the only evidence anybody
+has. The parser orders by `physicalTime` explicitly. Two points sharing the
+newest instant with **different** weights are refused rather than ranked - the
+rule this module already applies to two files declaring a goal and to a target
+declared twice.
+
+**AN EMPTY HISTORY IS NOT A BROKEN SOURCE, AND THE DISTINCTION IS A TYPE.**
+`NoWeightYet` is a **subclass** of `SourceFailure`. The subclassing is what keeps
+the outcome identical - the ordinary unavailable gauge, value 0 with **no**
+`observed_at`, never a reading of 0 - and the distinct type and sentence are what
+stop a human reading "your token expired" as "you have never weighed yourself".
+A body with **no `dataPoints` key at all** is a different thing again and is
+refused rather than read as an empty history: it is a shape nobody has seen.
+
+**NOTHING WAS WEAKENED.** The freshness invariant (`observed_at == now` **iff**
+this cycle read the source), the credential write guard, `vendor_opener()`, the
+OAuth client resolution order, the unit-before-number rule, the both-keys
+refusal, the two distinct refusals (no source -> unavailable gauge; no goal ->
+nothing posted) and the depth-aware definitions reader are all unchanged and
+still asserted. Two things were **added** to the no-leak property rather than
+subtracted from it: the parser's messages name a **field** and a **type** and
+never a **value** (a well-formed `weightGrams` *is* the Owner's body weight, and
+`run_cycle` journals a `SourceFailure`'s message), and `WeightReading.__repr__`
+prints neither the weight nor the stamp, because a repr reaches tracebacks. The
+feeder duplicates `weight_oauth`'s OAuth client resolution order and token
+endpoint - it cannot import that module, which imports *it* - and a parity test
+asserts the two copies equal, the same shape `tests/test_feeder_egress_parity.py`
+uses for the two feeders.
+
+**MUTATION: 36 mutants over three rounds, 0 survivors - after two TEST defects
+were found and fixed, the fifth round running that a first-pass survivor was a
+test problem and not a code problem.** Round 1 (26 mutants, including
+grams-as-pounds, grams-as-kilograms, an inverted conversion and a rounded 2.2046
+factor) went green immediately, which this build has learned to distrust. Round 2
+aimed ten mutants at the credential and no-leak surface and **two survived**,
+both because the FIXTURE ON THE FAILING PATH DID NOT CARRY THE SECRET: a mutant
+printing the token file's parsed contents survived against a blank `{}` file, and
+a mutant printing the token endpoint's whole payload survived against a response
+with nothing sensitive in it. Neither test could have failed. The fixtures now
+carry a sentinel on every path they drive, and both mutants are RED.
+
+**One assertion was found carried by a bystander sentence, by inspection rather
+than by mutation.** The vendor redirect test asserted `"refused" in message` -
+but if the redirect were **followed**, the second server answers `{}` and the
+parser's absent-`dataPoints` refusal *also* contains the word "refused", so the
+assertion would have passed on the exact behaviour it exists to forbid. It now
+asserts the 302 by status code and the redirect refusal's own words, which
+nothing else can produce; the "the other server received nothing at all"
+assertion was always the load-bearing one.
+
+**One check is carried by another, named rather than hidden.** In
+`test_the_vendor_read_never_writes_the_token_file`, the closing `open_for_write`
+refusal is carried by `CREDENTIAL_BASENAMES` (the fixture is named
+`google-health-token.json`) - a pre-existing guard with its own tests. The new
+assertion in that test is the file's bytes and mtime being unchanged across a
+whole successful read.
+
+**Evidence.** `python scripts/check.py` - **PASS**, 675 passed / 6 skipped
+(baseline on this branch before the change: 628 / 6). `scripts/trace.py
+--strict-integrity` - integrity 0. `check_flows.py --no-placeholders` - OK.
+`stack/run-hermetic-tests.sh` - **UNRUN**: it refuses on this dev PC (missing
+`zstd` and `rsync`).
+
+**Not done here.** No push, no hub state touched, no deploy. The weigh-in
+auto-check-off was **not** built - the parser only stops throwing away what such
+a caller would need. The `filter` query parameter (`GOOGLE_HEALTH_FILTER`) is
+still an unused constant: adding an unexercised query parameter to the single
+request shape that is KNOWN to work is the bet this gate exists to refuse.

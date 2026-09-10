@@ -1881,8 +1881,8 @@ if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
     if [ -f "$STACK_DIR/weight/setup-weight.sh" ]; then
         if bash "$STACK_DIR/weight/setup-weight.sh" 2>&1 | sed 's/^/  /'; then
             log "  weight feeder installed; timer runs every 15 minutes"
-            log "  STILL OWED BY A HUMAN - the vendor half is BLOCKED until it is"
-            log "  done, and until then the gauge correctly reads 'unavailable':"
+            log "  STILL OWED BY A HUMAN ON THIS BOX - the parser is written and"
+            log "  tested, but a hub with no refresh token reads 'unavailable':"
             log "    1. enable health.googleapis.com on the Cloud project that owns"
             log "       the existing OAuth client;"
             log "    2. add googlehealth.health_metrics_and_measurements.readonly to"
@@ -1890,7 +1890,10 @@ if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
             log "       blood glucose, body fat and heart-rate metrics, there is no"
             log "       weight-only scope - and the Owner to its Test users;"
             log "    3. consent in a browser and mint a refresh token into"
-            log "       WEIGHT_TOKEN_FILE."
+            log "       WEIGHT_TOKEN_FILE:"
+            log "         sudo python3 $STACK_DIR/weight/weight_oauth.py mint"
+            log "  A gauge that says 'unavailable' after that is a real refusal;"
+            log "  the reason is in: journalctl -u homehub-weight"
         else
             log "  WARNING: setup-weight.sh refused or failed - this box posts NO"
             log "    weight gauge. Everything else is unaffected. The reason is in the"

@@ -1021,37 +1021,689 @@ def test_a_non_finite_or_absurd_reading_never_becomes_a_body():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# The vendor path: verified, blocked, and deliberately parser-free
+# The vendor path: the gate is CLEARED, and the parser is asserted correct
+#
+# Until 2026-09-09 this section asserted that NO parser existed, because no
+# authenticated call had ever been made (B7's `parse_gemini` precedent). The
+# Owner then ran `weight_oauth.py capture` against the live API and got HTTP
+# 200 with one data point, so the absence assertions have been REPLACED - not
+# quietly dropped - by these, which assert the parser's correctness against the
+# SHAPE of that body. docs/status.md carries the record of the clearing.
+#
+# EVERY FIXTURE BELOW IS SYNTHETIC. The captured body carries the Owner's
+# Google user id and their real body weight; neither is in this repo. The ids
+# here are obvious placeholders and the weights are made up.
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_no_parser_exists_for_a_call_that_was_never_made_sr022():
-    """B7's `parse_gemini` precedent, applied to the blocked vendor half.
+# A sentinel standing where the Owner's Google user id sat. Nothing this parser
+# produces, stores or says may ever contain it - which is a property a test can
+# check by looking for this exact string.
+SENTINEL_ID = "PLACEHOLDER-USER-ID-NOT-THE-OWNERS"
 
-    A weight parser written from a schema is the worst place to break the "one
-    real call first" rule: if grams are actually kilograms the feeder does not
-    fail, it posts a confident, plausible, wrong body weight. This test is what
-    stops a later session from "finishing" the block from documentation.
+# What a hostile or confused remote puts in an error body, so "the body is not
+# logged" can be asserted as an ABSENCE rather than as a phrase in a sentence.
+ERROR_BODY_SENTINEL = "REMOTE-CHOSE-THESE-BYTES-4417"
+
+# 79 832 g is 176.0 lb to one decimal, the precision the panel shows. It is NOT
+# the captured weight.
+FIXTURE_GRAMS = 79832
+FIXTURE_POUNDS = FIXTURE_GRAMS / 453.59237
+
+# The captured body's timestamps, kept EXACTLY, because they are the proof of
+# the civilTime/physicalTime trap: 01:24 on the 9th in UTC is 20:24 on the 8th
+# locally, five hours west. The weigh-in was a Monday evening; in UTC it is
+# Tuesday.
+FIXTURE_PHYSICAL = "2026-09-09T01:24:33.390135Z"
+FIXTURE_OFFSET = "-18000s"
+FIXTURE_CIVIL_DAY = (2026, 9, 8)
+FIXTURE_UTC_DAY = "2026-09-09"
+CAPTURED_AT = 1788917073            # what FIXTURE_PHYSICAL is, in epoch seconds
+
+
+def a_point(physical=FIXTURE_PHYSICAL, grams=FIXTURE_GRAMS,
+            offset=FIXTURE_OFFSET, civil=True, point_id="P1"):
+    """One `dataPoints` element in the shape observed on 2026-09-09."""
+    sample = {"physicalTime": physical, "utcOffset": offset}
+    if civil:
+        sample["civilTime"] = {
+            "date": {"year": 2026, "month": 9, "day": 8},
+            "time": {"hours": 20, "minutes": 24, "seconds": 33,
+                     "nanos": 390135000}}
+    return {
+        "name": "users/%s/dataTypes/weight/dataPoints/%s" % (SENTINEL_ID, point_id),
+        "dataSource": {"recordingMethod": "MANUAL", "platform": "FITBIT"},
+        "weight": {"sampleTime": sample, "weightGrams": grams},
+    }
+
+
+def a_body(*points, **extra):
+    """A `ListDataPointsResponse` around those points."""
+    body = {"dataPoints": list(points)}
+    body.update(extra)
+    return body
+
+
+CAPTURED_SHAPE = a_body(a_point())
+
+
+def _json_200(handler, payload):
+    body = json.dumps(payload).encode()
+    handler.send_response(200)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def paged_google(pages):
+    """A loopback responder serving `{path: payload}` and refusing anything else."""
+    def respond(handler):
+        _json_200(handler, pages[handler.path])
+    return respond
+
+
+def fake_google(list_payload, token_payload=None, list_status=200):
+    """A loopback stand-in for Google's token endpoint AND the health API.
+
+    `/token` answers the refresh grant; anything else is the dataPoints list.
     """
-    for name in ("parse_google_health", "parse_weight_datapoint",
-                 "parse_weight", "parse_datapoints"):
-        assert not hasattr(feeder, name), (
-            "%s exists, but no authenticated Google Health call has been made. "
-            "Make one, paste the body into the module docstring, THEN write "
-            "the parser." % name)
+    payloads = {"token": token_payload or {"access_token": "ACCESS-TOKEN-XYZ"},
+                "list": list_payload}
+
+    def respond(handler):
+        if handler.path.startswith("/token"):
+            _json_200(handler, payloads["token"])
+            return
+        if list_status != 200:
+            # A REAL ERROR BODY, carrying a sentinel. Google's error bodies have
+            # been observed quoting the offending request back, and on this path
+            # that request carries the whole health-metrics scope in a header.
+            # An empty body here would let a feeder that echoes the remote's
+            # bytes pass unnoticed.
+            error = json.dumps({"error": {"message": ERROR_BODY_SENTINEL}}).encode()
+            handler.send_response(list_status)
+            handler.send_header("Content-Length", str(len(error)))
+            handler.end_headers()
+            handler.wfile.write(error)
+            return
+        _json_200(handler, payloads["list"])
+
+    return respond
 
 
-def test_the_blocked_source_refuses_by_name_rather_than_returning_zero(tmp_path):
-    """The refusal must be a SourceFailure that names the Owner action.
+def token_file(tmp_path, refresh="REFRESH-TOKEN-ABC"):
+    path = tmp_path / "google-health-token.json"
+    path.write_text(json.dumps({"refresh_token": refresh, "token_type": "Bearer"}),
+                    encoding="utf-8")
+    return path
+
+
+def google_env(tmp_path, token_path=None):
+    return {"WEIGHT_TOKEN_FILE": str(token_path or token_file(tmp_path)),
+            "OAUTH2_PROXY_CLIENT_ID": "client-id",
+            "OAUTH2_PROXY_CLIENT_SECRET": "client-secret",
+            "WEIGHT_TIMEOUT_SECONDS": "10",
+            "_now": NOW}
+
+
+def test_the_captured_shape_parses_to_the_weight_and_the_instant_sr022():
+    """The whole gate, in one assertion: the observed body yields the right
+    number of pounds at the instant the reading was true.
+
+    `weightGrams` is GRAMS. This is the fact one real call was demanded for,
+    because a parser that read it as kilograms or as pounds would not fail - it
+    would post a confident, plausible, WRONG body weight that nothing on the
+    wall could contradict.
+    """
+    reading = feeder.parse_weight_datapoint(CAPTURED_SHAPE, NOW)
+    assert reading.observed_at == CAPTURED_AT
+    assert feeder.iso8601_utc(reading.observed_at) == "2026-09-09T01:24:33Z"
+    assert round(reading.pounds, 1) == 176.0
+    assert abs(reading.pounds - FIXTURE_POUNDS) < 1e-9
+
+
+def test_grams_are_not_kilograms_and_not_pounds_sr022():
+    """The two mutants this parser exists to kill, asserted as NUMBERS.
+
+    Each wrong reading is stated as the value it WOULD produce, so a mutant
+    fails on the number rather than merely on a different exception. 79 832 read
+    as kilograms is 175 999 lb; read as pounds it is 79 832 lb; read as grams it
+    is 176.0 lb. Only one of the three is a body.
+    """
+    reading = feeder.parse_weight_datapoint(CAPTURED_SHAPE, NOW)
+    assert round(reading.pounds, 1) == 176.0
+    assert round(reading.pounds, 1) != round(FIXTURE_GRAMS * 2.20462, 1)
+    assert round(reading.pounds, 1) != float(FIXTURE_GRAMS)
+    assert round(reading.pounds, 1) != round(FIXTURE_GRAMS / 1000.0, 1)
+    # ...and the band is the SECOND line, not the first: it catches the two
+    # gross mutants, and is asserted here to be doing so rather than assumed.
+    with pytest.raises(feeder.SourceFailure):
+        feeder.check_plausible_weight_lb(FIXTURE_GRAMS * 2.20462, "kg mutant")
+    with pytest.raises(feeder.SourceFailure):
+        feeder.check_plausible_weight_lb(float(FIXTURE_GRAMS), "lb mutant")
+
+
+def test_the_latest_reading_wins_and_array_order_is_not_trusted_sr022():
+    """"The first element" is not "the newest", and the observed body could not
+    tell the difference: it held exactly one point.
+
+    The three points here are deliberately scrambled - the newest sits in the
+    MIDDLE - and each carries a distinct weight, so picking by position gives a
+    different, wrong, entirely plausible body weight.
+    """
+    body = a_body(
+        a_point("2026-09-01T12:00:00Z", 70000, point_id="old"),
+        a_point("2026-09-09T01:24:33.390135Z", FIXTURE_GRAMS, point_id="new"),
+        a_point("2026-09-05T12:00:00Z", 75000, point_id="middling"))
+    reading = feeder.parse_weight_datapoint(body, NOW)
+    assert reading.observed_at == CAPTURED_AT
+    assert round(reading.pounds, 1) == 176.0
+    assert round(reading.pounds, 1) != round(70000 / 453.59237, 1)
+    assert round(reading.pounds, 1) != round(75000 / 453.59237, 1)
+
+
+def test_the_calendar_day_is_civil_and_never_the_utc_day_sr022():
+    """THE TRAP, PROVEN BY THE CAPTURE AND ASSERTED HERE.
+
+    `physicalTime` is 01:24 on the 9th; `civilTime` is 20:24 on the 8th. A
+    future auto-check-off that asked `observed_at` what day it was would tick
+    off Tuesday for a Monday-evening weigh-in, every time. The parser must
+    expose the civil day rather than throw it away, and it must not be the UTC
+    day.
+    """
+    reading = feeder.parse_weight_datapoint(CAPTURED_SHAPE, NOW)
+    assert reading.civil_date == FIXTURE_CIVIL_DAY
+    assert feeder.iso8601_utc(reading.observed_at).startswith(FIXTURE_UTC_DAY)
+    assert reading.civil_date[2] != int(FIXTURE_UTC_DAY.split("-")[2]), (
+        "the civil day and the UTC day must differ in this fixture, or this "
+        "test is not exercising the trap at all")
+    assert reading.utc_offset_seconds == -18000
+
+
+def test_the_offset_fallback_agrees_with_the_servers_own_civil_time():
+    """`civilTime` is readOnly - the server computes it - so the arithmetic
+    fallback for a body that omits it is trustable only if the two agree on the
+    one body anybody has seen. They do."""
+    assert (feeder.parse_weight_datapoint(a_body(a_point(civil=False)),
+                                          NOW).civil_date == FIXTURE_CIVIL_DAY)
+
+
+def test_an_unusable_offset_gives_no_day_rather_than_the_wrong_day():
+    """None means "we cannot say", and it is deliberately not zero: zero is UTC,
+    a real offset, and answering it for an unreadable field would place the
+    weigh-in on the wrong calendar day with total confidence."""
+    for bad in ("18000", "-18000 s", "", None, 42, "99999999s"):
+        assert feeder.parse_google_duration_seconds(bad) is None
+    reading = feeder.parse_weight_datapoint(
+        a_body(a_point(offset="not-a-duration", civil=False)), NOW)
+    assert reading.utc_offset_seconds is None
+    assert reading.civil_date is None
+    # ...and the READING still stands. A timezone this parser cannot read is
+    # not a reason to refuse a weight that has a real instant.
+    assert round(reading.pounds, 1) == 176.0
+
+
+def test_an_empty_history_is_the_unavailable_gauge_and_not_a_broken_source():
+    """An account with no weight logged returns 200 with no points.
+
+    That is "we do not know what you weigh" - a DIFFERENT sentence from "the
+    source is broken" and the SAME outcome. So it is a distinct exception TYPE
+    that is a SourceFailure SUBCLASS: the subclassing keeps the unavailable path
+    intact, and the distinct type stops a human reading "your token expired" as
+    "you have never weighed yourself".
+    """
+    assert issubclass(feeder.NoWeightYet, feeder.SourceFailure)
+    for empty in (a_body(), {"dataPoints": None}):
+        with pytest.raises(feeder.NoWeightYet) as err:
+            feeder.parse_weight_datapoint(empty, NOW)
+        assert "no weight logged" in str(err.value)
+
+
+def test_an_absent_datapoints_key_is_refused_and_is_not_an_empty_history():
+    """`{}` and `{"dataPoints": []}` look alike and mean opposite things.
+
+    The captured body carried the key, so a body without it is a SHAPE THIS
+    PARSER DOES NOT RECOGNISE - the response changed, or something that is not
+    Google answered. Reading "no weight logged" out of that would be reading
+    meaning into a body nobody has ever seen.
+    """
+    with pytest.raises(feeder.SourceFailure) as err:
+        feeder.parse_weight_datapoint({}, NOW)
+    assert not isinstance(err.value, feeder.NoWeightYet), (
+        "an absent key must not be reported as an empty history")
+    assert "no `dataPoints` key at all" in str(err.value), (
+        "the message must name the missing key; `dataPoints` alone appears in "
+        "several other refusals and would be carried by any of them")
+    # And the SINGULAR spelling this repo's prose once guessed is not accepted.
+    with pytest.raises(feeder.SourceFailure) as err:
+        feeder.parse_weight_datapoint({"dataPoint": [a_point()]}, NOW)
+    assert not isinstance(err.value, feeder.NoWeightYet)
+
+
+@pytest.mark.parametrize("broken,why", [
+    ({"name": "x", "dataSource": {}}, "no weight member"),
+    ({"weight": {"sampleTime": {"physicalTime": FIXTURE_PHYSICAL}}}, "no weightGrams"),
+    ({"weight": {"weightGrams": FIXTURE_GRAMS}}, "no sampleTime"),
+    ({"weight": {"sampleTime": {}, "weightGrams": FIXTURE_GRAMS}}, "no physicalTime"),
+    ({"weight": {"sampleTime": {"physicalTime": "the 9th"},
+                 "weightGrams": FIXTURE_GRAMS}}, "unparseable physicalTime"),
+    ({"weight": {"sampleTime": {"physicalTime": "2026-09-09T01:24:33"},
+                 "weightGrams": FIXTURE_GRAMS}}, "zoneless physicalTime"),
+    ({"weight": "not an object"}, "weight is not an object"),
+    ("not an object", "the point is not an object"),
+])
+def test_each_malformed_point_alone_is_a_named_failure_and_never_a_reading(broken, why):
+    """Every shape the body could take that is not a usable weight, one case
+    each, and each ALONE in the body - so nothing else can be carrying the
+    refusal on its behalf."""
+    with pytest.raises(feeder.SourceFailure) as err:
+        feeder.parse_weight_datapoint(a_body(broken), NOW)
+    assert not isinstance(err.value, feeder.NoWeightYet), why
+    assert "not one usable weight" in str(err.value)
+
+
+@pytest.mark.parametrize("grams", [
+    None, "176", True, False, float("nan"), float("inf"), float("-inf"),
+    -1.0, 0, 0.0, -79832, 1e12, 0.5, [], {},
+])
+def test_a_weightgrams_that_is_not_a_body_weight_is_refused(grams):
+    """Non-numeric, non-finite, negative, zero and absurd, each alone.
+
+    `True` is in the list because `isinstance(True, int)` is True in Python and
+    a bool would otherwise sail through as 1 gram - 0.002 lb, which only the
+    band would then catch. Both guards are asserted rather than one relied on
+    to cover the other.
+    """
+    with pytest.raises(feeder.SourceFailure):
+        feeder.parse_weight_datapoint(a_body(a_point(grams=grams)), NOW)
+
+
+def test_a_future_sample_time_is_refused_because_it_would_fabricate_freshness():
+    """A stamp ahead of the clock keeps a dead source rendering green until the
+    stamp itself expires. It is refused, never clamped to `now`: clamping would
+    invent exactly the thing the freshness invariant forbids."""
+    ahead = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + 7 * 24 * 3600))
+    with pytest.raises(feeder.SourceFailure):
+        feeder.parse_weight_datapoint(a_body(a_point(physical=ahead)), NOW)
+
+
+def test_one_broken_point_costs_itself_and_not_the_whole_reading():
+    """A malformed entry in a synced history must not blank the panel."""
+    body = a_body({"weight": {"weightGrams": "not a number"}},
+                  a_point(),
+                  {"name": "users/%s/..." % SENTINEL_ID})
+    reading = feeder.parse_weight_datapoint(body, NOW)
+    assert reading.observed_at == CAPTURED_AT
+    assert round(reading.pounds, 1) == 176.0
+
+
+def test_two_newest_points_that_disagree_are_refused_rather_than_ranked():
+    """The rule this module already applies to two files declaring a goal, two
+    items with one id, and a target declared twice. Identical weights at one
+    instant are a duplicate and are accepted; different ones are a
+    contradiction, and picking one would draw a bar around a number the other
+    reading denies."""
+    contradiction = a_body(a_point(grams=FIXTURE_GRAMS, point_id="a"),
+                           a_point(grams=FIXTURE_GRAMS + 5000, point_id="b"))
+    with pytest.raises(feeder.SourceFailure) as err:
+        feeder.parse_weight_datapoint(contradiction, NOW)
+    assert "not guessable" in str(err.value)
+    duplicate = a_body(a_point(point_id="a"), a_point(point_id="b"))
+    assert round(feeder.parse_weight_datapoint(duplicate, NOW).pounds, 1) == 176.0
+
+
+def test_no_vendor_value_and_no_user_id_ever_reaches_a_message_sr022():
+    """THE NO-LEAK PROPERTY, asserted over every refusal this parser can make.
+
+    `run_cycle` prints a SourceFailure's message and systemd writes it to the
+    journal, so a message that quoted the body would persist the Owner's Google
+    user id - or their body weight - to disk. `name` is never read at all,
+    which is why the sentinel cannot appear; numbers are described by TYPE
+    rather than by value.
+    """
+    leaky = "SENTINEL-LEAK-8891"
+    bodies = [
+        a_body(a_point(grams=leaky)),
+        a_body(a_point(physical=leaky)),
+        a_body({"weight": leaky}),
+        a_body(a_point(grams=FIXTURE_GRAMS * 1000)),
+        {"dataPoints": leaky},
+        leaky,
+    ]
+    for body in bodies:
+        with pytest.raises(feeder.SourceFailure) as err:
+            feeder.parse_weight_datapoint(body, NOW)
+        message = str(err.value)
+        assert leaky not in message, message
+        assert SENTINEL_ID not in message, message
+    # A SUCCESSFUL parse keeps the user id out of everything it returns,
+    # including the repr a traceback would print - and the repr must not carry
+    # the weight or the stamp either, because those are health data too.
+    reading = feeder.parse_weight_datapoint(CAPTURED_SHAPE, NOW)
+    assert not hasattr(reading, "name")
+    for slot in feeder.WeightReading.__slots__:
+        assert SENTINEL_ID not in str(getattr(reading, slot))
+    assert SENTINEL_ID not in repr(reading)
+    assert "176" not in repr(reading) and str(CAPTURED_AT) not in repr(reading)
+
+
+def test_a_next_page_token_is_read_and_an_absent_one_is_none():
+    """The observed response had NO `nextPageToken`. What this feeder DOES with
+    one is stated in `list_weight_data_points` and marked there as an
+    assumption; this asserts only the reading of the field."""
+    assert feeder.next_page_token(a_body(a_point())) is None
+    assert feeder.next_page_token(a_body(a_point(), nextPageToken="")) is None
+    assert feeder.next_page_token(a_body(a_point(), nextPageToken=7)) is None
+    assert feeder.next_page_token(a_body(a_point(), nextPageToken="ct-2")) == "ct-2"
+
+
+def test_a_paged_history_is_walked_and_the_latest_across_pages_wins():
+    """ASSUMPTION, NOT OBSERVATION. A page token is followed, because the
+    response promises no ordering and a page left unwalked could hold a newer
+    weigh-in than any seen - so "the latest" would otherwise be a claim this
+    code cannot support. The newest point sits on the LAST page on purpose."""
+    pages = {
+        "/": a_body(a_point("2026-09-01T12:00:00Z", 70000), nextPageToken="p2"),
+        "/?pageToken=p2": a_body(a_point("2026-09-05T12:00:00Z", 75000),
+                                 nextPageToken="p3"),
+        "/?pageToken=p3": a_body(a_point()),
+    }
+    with loopback_server(paged_google(pages)) as (base, seen):
+        reading = feeder.list_weight_data_points("access-token", NOW, 10,
+                                                 base + "/")
+    assert [request["path"] for request in seen] == list(pages)
+    assert reading.observed_at == CAPTURED_AT
+    assert round(reading.pounds, 1) == 176.0
+
+
+def test_a_history_deeper_than_the_page_cap_is_refused_rather_than_guessed():
+    """A walk that never ends cannot claim to have found the latest reading, so
+    it refuses. The cost is an unavailable gauge, which re-posts the last real
+    reading at its ORIGINAL stamp - the panel degrades to the previous truth
+    rather than to a number this code cannot vouch for."""
+    def respond(handler):
+        _json_200(handler, a_body(a_point(), nextPageToken="always"))
+
+    with loopback_server(respond) as (base, seen):
+        with pytest.raises(feeder.SourceFailure) as err:
+            feeder.list_weight_data_points("access-token", NOW, 10, base + "/")
+    assert not isinstance(err.value, feeder.NoWeightYet)
+    assert "will not claim one" in str(err.value)
+    assert len(seen) == feeder.MAX_LIST_PAGES
+
+
+def test_an_empty_page_mid_walk_is_not_an_empty_history():
+    """`NoWeightYet` from one page must not end the walk - and an account whose
+    every page is empty must still be `NoWeightYet` rather than a crash."""
+    pages = {"/": a_body(nextPageToken="p2"), "/?pageToken=p2": a_body(a_point())}
+    with loopback_server(paged_google(pages)) as (base, _seen):
+        assert feeder.list_weight_data_points(
+            "access-token", NOW, 10, base + "/").observed_at == CAPTURED_AT
+
+    with loopback_server(paged_google({"/": a_body()})) as (base, _seen):
+        with pytest.raises(feeder.NoWeightYet):
+            feeder.list_weight_data_points("access-token", NOW, 10, base + "/")
+
+
+def test_the_whole_vendor_read_returns_the_weight_and_the_instant(tmp_path):
+    """End to end over real sockets: token refresh, list call, one reading.
+
+    The reading is returned as (pounds, observed_at) - the shape `run_cycle`
+    consumes - and `observed_at` is the sample's own instant, never `now`.
+    """
+    env = google_env(tmp_path)
+    with loopback_server(fake_google(CAPTURED_SHAPE)) as (base, seen):
+        value, observed_at = feeder.read_google_health(
+            env, list_url=base + "/points", token_endpoint=base + "/token")
+    assert round(value, 1) == 176.0
+    assert observed_at == CAPTURED_AT
+    assert observed_at != NOW, "observed_at is when the reading was TRUE"
+    refresh, listing = seen
+    assert b"grant_type=refresh_token" in refresh["body"]
+    assert b"REFRESH-TOKEN-ABC" in refresh["body"]
+    assert listing["headers"]["Authorization"] == "Bearer ACCESS-TOKEN-XYZ"
+    assert listing["path"] == "/points", (
+        "no query parameter is sent: the only call ever observed sent none")
+
+
+def test_the_vendor_read_never_writes_the_token_file(tmp_path):
+    """The credential write guard, from the side the parser opened.
+
+    `read_google_health` is now the one function that opens the refresh token,
+    and a read path that grew a write would be the exact thing this feeder
+    promises it cannot do. The file's bytes and its mtime are both asserted.
+    """
+    path = token_file(tmp_path)
+    before, before_mtime = path.read_bytes(), path.stat().st_mtime
+    with loopback_server(fake_google(CAPTURED_SHAPE)) as (base, _seen):
+        feeder.read_google_health(google_env(tmp_path, path),
+                                  list_url=base + "/points",
+                                  token_endpoint=base + "/token")
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime == before_mtime
+    # And the write guard still refuses that path by name, as it always did.
+    with pytest.raises(PermissionError):
+        feeder.open_for_write(str(path), str(path), str(tmp_path))
+
+
+def test_the_vendor_read_refuses_a_redirect_and_the_target_gets_nothing(tmp_path):
+    """urllib carries `Authorization` across a cross-host redirect, and this
+    token grants blood glucose, body fat, oxygen saturation, core temperature
+    and heart-rate metrics as well as weight. The second server must record no
+    request AT ALL - asserted, not assumed."""
+    with loopback_server(plain_200) as (elsewhere, arrived):
+        def respond(handler):
+            if handler.path.startswith("/token"):
+                _json_200(handler, {"access_token": "ACCESS-TOKEN-XYZ"})
+                return
+            handler.send_response(302)
+            handler.send_header("Location", elsewhere + "/points")
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+
+        with loopback_server(respond) as (base, _seen):
+            with pytest.raises(feeder.SourceFailure) as err:
+                feeder.read_google_health(google_env(tmp_path),
+                                          list_url=base + "/points",
+                                          token_endpoint=base + "/token")
+        assert arrived == []
+    # NAME THE REDIRECT, NOT THE WORD "refused". If the redirect were FOLLOWED,
+    # the second server answers `{}` and the parser's absent-`dataPoints`
+    # refusal ALSO contains the word "refused" - so a substring test for it
+    # would pass on the exact behaviour this test exists to forbid. The status
+    # code can only come from the redirect refusal.
+    message = str(err.value)
+    assert "302 redirect" in message
+    assert "may not be re-sent" in message
+
+
+def test_a_non_200_from_the_list_call_never_logs_the_remotes_body(tmp_path):
+    """A Google error body has been observed quoting the offending request back,
+    and on this path that request carries the whole health-metrics scope."""
+    with loopback_server(fake_google(CAPTURED_SHAPE, list_status=401)) as (base, _s):
+        with pytest.raises(feeder.SourceFailure) as err:
+            feeder.read_google_health(google_env(tmp_path),
+                                      list_url=base + "/points",
+                                      token_endpoint=base + "/token")
+    message = str(err.value)
+    assert "HTTP 401" in message
+    assert "mint --force" in message
+    # THE ABSENCE IS THE ASSERTION. "body is not logged" is a phrase this repo
+    # writes and would survive a feeder that appended the body after it, so the
+    # test looks for the remote's own bytes and does not find them.
+    assert ERROR_BODY_SENTINEL not in message
+    assert "body is not logged" in message
+
+
+def test_the_vendor_read_refuses_by_name_when_there_is_no_token(tmp_path):
+    """Each missing piece has a DIFFERENT errand, so each gets its own sentence.
 
     Returning a placeholder reading, or None, would post a number; raising the
     wrong exception type would crash the cycle before the unavailable gauge was
-    posted. Both are asserted against.
+    posted. Both are asserted against, as they were while this half was blocked.
     """
+    for env, expected in [({}, "WEIGHT_TOKEN_FILE is unset"),
+                          ({"WEIGHT_TOKEN_FILE": str(tmp_path / "nope.json")},
+                           "mint")]:
+        with pytest.raises(feeder.SourceFailure) as err:
+            feeder.read_google_health(dict(env, _now=NOW))
+        assert expected in str(err.value)
+    empty = tmp_path / "google-health-token.json"
+    empty.write_text("{}", encoding="utf-8")
     with pytest.raises(feeder.SourceFailure) as err:
-        feeder.read_google_health({"WEIGHT_TOKEN_FILE": str(tmp_path / "nope.json")})
+        feeder.read_google_health({"WEIGHT_TOKEN_FILE": str(empty), "_now": NOW})
+    assert "no `refresh_token`" in str(err.value)
+
+
+def test_the_refresh_token_never_reaches_a_message_on_any_failure(tmp_path):
+    """The credential this feeder reads must not be printable by any refusal.
+
+    `run_cycle` puts a SourceFailure's message in the journal, and this token
+    grants blood glucose, body fat, oxygen saturation, core temperature and
+    heart-rate metrics as well as weight. Every failure the read can reach is
+    driven here and the token is looked for in each message - an absence, not a
+    phrase.
+    """
+    secret = "REFRESH-TOKEN-SENTINEL-2291"
+    path = token_file(tmp_path, refresh=secret)
+    messages = []
+
+    # EVERY FIXTURE ON A FAILING PATH MUST ITSELF CARRY THE SECRET, or the
+    # test proves nothing about that path. The first cut of this test used a
+    # blank `{}` token file and a sentinel-free token response, and the mutation
+    # run caught it: two mutants that printed `stored` and `payload` verbatim
+    # SURVIVED, because there was nothing in either for them to print.
+    broken = tmp_path / "broken.json"
+    broken.write_text("{" + secret, encoding="utf-8")           # not JSON
+    wrong_key = tmp_path / "wrong-key.json"
+    wrong_key.write_text(json.dumps({"refreshToken": secret}), encoding="utf-8")
+    for path_under_test in (broken, wrong_key, tmp_path / "gone.json"):
+        with pytest.raises(feeder.SourceFailure) as err:
+            feeder.read_google_health({"WEIGHT_TOKEN_FILE": str(path_under_test),
+                                       "_now": NOW})
+        messages.append(str(err.value))
+
+    def no_access_token(handler):
+        # A token response with NO access_token and the secret inside it, so a
+        # refusal that echoed the payload would be visible here.
+        _json_200(handler, {"error": "invalid_grant", "echoed": secret})
+
+    with loopback_server(no_access_token) as (base, _seen):
+        with pytest.raises(feeder.SourceFailure) as err:
+            feeder.read_google_health(google_env(tmp_path, path),
+                                      list_url=base + "/points",
+                                      token_endpoint=base + "/token")
+        messages.append(str(err.value))
+
+    with loopback_server(fake_google(CAPTURED_SHAPE, list_status=403)) as (base, _s):
+        with pytest.raises(feeder.SourceFailure) as err:
+            feeder.read_google_health(google_env(tmp_path, path),
+                                      list_url=base + "/points",
+                                      token_endpoint=base + "/token")
+        messages.append(str(err.value))
+
+    assert len(messages) == 5
+    for message in messages:
+        assert secret not in message, message
+        assert "ACCESS-TOKEN" not in message, message
+        assert ERROR_BODY_SENTINEL not in message, message
+
+
+def test_a_missing_oauth_client_names_every_variable_and_no_value(tmp_path):
+    """The refusal that was hard to diagnose on the real hub was the one naming
+    only the variables that do not exist. This one names all four, says which
+    are set, and prints no value."""
+    env = {"WEIGHT_TOKEN_FILE": str(token_file(tmp_path)),
+           "OAUTH2_PROXY_CLIENT_ID": "an-id-that-must-not-be-printed",
+           "_now": NOW}
+    with pytest.raises(feeder.SourceFailure) as err:
+        feeder.read_google_health(env)
     message = str(err.value)
-    assert "BLOCKED" in message
-    assert feeder.GOOGLE_HEALTH_SCOPE in message
+    for pair in feeder.OAUTH_CLIENT_KEY_PAIRS:
+        for key in pair:
+            assert key in message
+    assert "an-id-that-must-not-be-printed" not in message
+
+
+def test_the_feeder_refreshes_with_the_same_client_the_mint_used():
+    """The feeder cannot import `weight_oauth` (which imports IT), so the
+    resolution order and the token endpoint are duplicated. Duplicated is fine;
+    DIVERGENT would be a token refreshed with a client it was not minted by,
+    which Google answers `invalid_client` and which reads like Google's fault."""
+    spec = importlib.util.spec_from_file_location(
+        "weight_oauth_parity", REPO / "stack" / "weight" / "weight_oauth.py")
+    oauth = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oauth)
+    assert feeder.OAUTH_CLIENT_KEY_PAIRS == oauth.CLIENT_KEY_PAIRS
+    assert feeder.GOOGLE_TOKEN_ENDPOINT == oauth.TOKEN_ENDPOINT
+
+
+def test_the_production_endpoints_are_https():
+    """Both carry a credential: the refresh token to the token endpoint, the
+    access token to the list. Neither is a knob - they are constants - and this
+    is what stops one quietly becoming plain http in an edit."""
+    assert feeder.GOOGLE_TOKEN_ENDPOINT.startswith("https://")
+    assert feeder.GOOGLE_HEALTH_LIST_URL.startswith("https://")
+
+
+def test_an_empty_history_posts_the_unavailable_gauge_through_a_whole_cycle(tmp_path):
+    """The end of the empty-history story, asserted where it matters.
+
+    200 with no points must reach the panel as value 0 with NO `observed_at` -
+    the one number in this file nobody measured, and the only body allowed to
+    carry it - and the failure line must say the account has logged nothing
+    rather than implying a broken source.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    env = dict(google_env(tmp_path),
+               _identity="u", _feed_url="http://127.0.0.1:1/api/feed",
+               WEIGHT_STATE_FILE=str(state_dir / "weight-state.json"),
+               STATE_DIRECTORY=str(state_dir))
+    sent = []
+    poster = lambda body, *a: (sent.append(body), (True, "HTTP 200"))[1]
+    with loopback_server(fake_google(a_body())) as (base, _seen):
+        reader = lambda e: feeder.read_google_health(
+            e, list_url=base + "/points", token_endpoint=base + "/token")
+        posted, failures, _ = feeder.run_cycle(
+            env, now=NOW, readers={"google-health": reader}, poster=poster,
+            goal_loader=lambda d, *a: (GOAL, "health.md"))
+    assert posted[0][1] is False
+    assert sent[-1]["value"] == 0.0
+    assert "observed_at" not in sent[-1]
+    assert feeder.is_fresh(sent[-1], NOW) is False
+    assert len(failures) == 1
+    assert "no weight logged" in failures[0]
+
+
+def test_a_real_reading_reaches_the_panel_at_the_instant_it_was_true(tmp_path):
+    """The other end of the same cycle: a live read posts the weight at the
+    sample's own stamp, never at `now`, and NagLight sees it as fresh."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    env = dict(google_env(tmp_path),
+               _identity="u", _feed_url="http://127.0.0.1:1/api/feed",
+               WEIGHT_STATE_FILE=str(state_dir / "weight-state.json"),
+               STATE_DIRECTORY=str(state_dir))
+    sent = []
+    poster = lambda body, *a: (sent.append(body), (True, "HTTP 200"))[1]
+    with loopback_server(fake_google(CAPTURED_SHAPE)) as (base, _seen):
+        reader = lambda e: feeder.read_google_health(
+            e, list_url=base + "/points", token_endpoint=base + "/token")
+        posted, failures, _ = feeder.run_cycle(
+            env, now=NOW, readers={"google-health": reader}, poster=poster,
+            goal_loader=lambda d, *a: (GOAL, "health.md"))
+    assert failures == []
+    assert posted[0][1] is True
+    assert round(sent[-1]["value"], 1) == 176.0
+    assert sent[-1]["observed_at"] == feeder.iso8601_utc(CAPTURED_AT)
+    assert sent[-1]["observed_at"] != feeder.iso8601_utc(NOW)
+    assert feeder.is_fresh(sent[-1], NOW) is True
+    # The state file holds a weight and a timestamp and NOTHING ELSE - no
+    # token, no header, no response body, no user id.
+    stored = json.loads((state_dir / "weight-state.json").read_text())
+    assert sorted(stored["weight"]) == ["observed_at", "value"]
+    assert SENTINEL_ID not in json.dumps(stored)
+    assert "REFRESH-TOKEN-ABC" not in json.dumps(stored)
 
 
 def test_the_verified_google_health_facts_are_the_ones_that_were_observed():
@@ -1765,11 +2417,28 @@ def test_the_invariant_holds_across_every_fix_sr022(tmp_path):
     assert feeder.is_fresh(sent[-1], later) is False
 
 
-def test_the_block_is_still_blocked_by_construction_sr022():
-    """None of this round's fixes may have opened a path to a fabricated
-    reading. `read_google_health` still refuses, and no parser has appeared."""
-    for name in ("parse_google_health", "parse_weight_datapoint",
-                 "parse_weight", "parse_datapoints"):
-        assert not hasattr(feeder, name)
-    with pytest.raises(feeder.SourceFailure):
-        feeder.read_google_health({"_now": NOW})
+def test_no_path_through_the_new_parser_can_fabricate_a_reading_sr022():
+    """WHAT THE ABSENCE ASSERTION USED TO PROTECT, NOW PROTECTED DIRECTLY.
+
+    Until 2026-09-09 this asserted that no parser existed at all, because none
+    had ever seen a real body. The parser exists now, so the property it stood
+    for is asserted where it actually lives: EVERY way the vendor half can fail
+    ends in a SourceFailure and therefore in the unavailable gauge, and NONE of
+    them returns a number. `read_google_health` returns a reading if and only if
+    a real body point carried one.
+    """
+    for env in ({"_now": NOW},                       # no token file configured
+                {"_now": NOW, "WEIGHT_TOKEN_FILE": "/nonexistent/token.json"}):
+        with pytest.raises(feeder.SourceFailure):
+            feeder.read_google_health(env)
+    for body in ({}, {"dataPoints": []}, {"dataPoints": [{}]},
+                 {"dataPoints": "weights"}, [], None,
+                 {"dataPoints": [{"weight": {"weightGrams": 0}}]}):
+        with pytest.raises(feeder.SourceFailure):
+            feeder.parse_weight_datapoint(body, NOW)
+    # ...and every one of those is caught by `run_cycle` as the unavailable
+    # gauge rather than as a crash, which is the property that matters on a
+    # wall: value 0, no stamp, "unavailable", never a plausible wrong number.
+    body, fresh = feeder.build_post(None, None, GOAL, NOW)
+    assert fresh is False and body["value"] == 0.0
+    assert "observed_at" not in body

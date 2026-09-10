@@ -13,12 +13,75 @@ browser. A container would have to mount the directory it lives in, which
 punctures the isolation at the only point that mattered.
 
 ═══════════════════════════════════════════════════════════════════════════════
-THE VENDOR SOURCE IS VERIFIED BUT NOT YET REACHABLE. READ THIS BEFORE ADDING A
-PARSER.
+THE GATE IS CLEARED. A REAL RESPONSE BODY WAS CAPTURED ON 2026-09-09, AND THE
+PARSER IN THIS FILE IS WRITTEN AGAINST IT.
 ═══════════════════════════════════════════════════════════════════════════════
 
-The build plan named "Google Health API v4". That API IS REAL, and every claim
-below was established on 2026-09-09 by CALLING Google, not by reading a blog:
+`weight_oauth.py capture` was run by the Owner against the live API on
+2026-09-09 and got HTTP 200, 712 bytes, from
+
+    GET https://health.googleapis.com/v4/users/me/dataTypes/weight/dataPoints
+
+with NO query parameters at all. THE BODY ITSELF IS NOT IN THIS REPO AND NEVER
+WILL BE - it carries the Owner's Google user id and their real body weight,
+which is health data about a specific person living in this house. What is
+recorded here is its SHAPE, with a placeholder id and a made-up weight:
+
+    {
+      "dataPoints": [
+        {
+          "name": "users/<GOOGLE-USER-ID>/dataTypes/weight/dataPoints/<POINT-ID>",
+          "dataSource": {"recordingMethod": "MANUAL", "platform": "FITBIT"},
+          "weight": {
+            "sampleTime": {
+              "physicalTime": "2026-09-09T01:24:33.390135Z",
+              "utcOffset": "-18000s",
+              "civilTime": {
+                "date": {"year": 2026, "month": 9, "day": 8},
+                "time": {"hours": 20, "minutes": 24, "seconds": 33,
+                         "nanos": 390135000}
+              }
+            },
+            "weightGrams": 79832
+          }
+        }
+      ]
+    }
+
+FOUR THINGS THE CAPTURE SETTLED, EACH OF WHICH PROSE HAD GUESSED WRONG OR NOT
+GUESSED AT ALL:
+
+  1. THE TOP-LEVEL KEY IS `dataPoints`, PLURAL. Earlier prose in this repo (and
+     the README's own troubleshooting table) said `dataPoint`. The observed
+     body says `dataPoints`, which is also what the discovery document's
+     `ListDataPointsResponse` says. The observation wins.
+  2. `weightGrams` IS GRAMS, and the observed value converts to a body weight
+     the Owner recognises. That is the one fact this whole gate existed for:
+     grams read as kilograms or as pounds does not fail, it posts a confident,
+     plausible, WRONG body weight and nothing on the wall could contradict it.
+     `grams_to_pounds` is the single conversion and `check_vendor_grams` is the
+     single place it is called from a vendor body.
+  3. `physicalTime` AND `civilTime` DISAGREE ABOUT THE DAY, AND THAT IS NOT A
+     BUG. In the captured body `physicalTime` is 2026-09-09T01:24Z while
+     `civilTime` is 2026-09-08 20:24 local, because `utcOffset` is -18000s.
+     The weigh-in happened on MONDAY EVENING; in UTC it is TUESDAY. So:
+       * the GAUGE's `observed_at` is `physicalTime` - the instant the reading
+         was true, which is what NagLight's staleness rule keys off;
+       * anything that ever needs the reading's CALENDAR DAY - a future
+         auto-check-off of the `weigh-in` habit, which is what SN-040 hints at
+         next - MUST use `civilTime` (or `physicalTime` shifted by
+         `utcOffset`), NEVER `physicalTime` alone. Using `physicalTime` would
+         tick off Tuesday for a Monday-evening weigh-in, every single time
+         anyone in this timezone stands on a scale after 7pm.
+     `WeightReading` therefore carries `civil_date` and `utc_offset_seconds`
+     alongside the pounds and the stamp. No check-off is built here; the parser
+     simply does not throw away what such a caller would need.
+  4. THE OBSERVED RESPONSE CARRIED NO `nextPageToken`. What this feeder does
+     when one IS present is stated at `list_weight_data_points`, and it is
+     marked there as an ASSUMPTION rather than an observation.
+
+Everything below this line was established on 2026-09-09 by CALLING Google,
+not by reading a blog, and remains true:
 
   * `GET https://www.googleapis.com/discovery/v1/apis?preferred=false` -> 200,
     531 APIs, of which `health:v4` (and `health:v4beta`) are listed with
@@ -76,29 +139,22 @@ below was established on 2026-09-09 by CALLING Google, not by reading a blog:
     a real widening of what the household hands this box and it is the Owner's
     call, not this feeder's.
 
-WHAT IS THEREFORE MISSING, AND ONLY THE OWNER CAN CLEAR IT:
-  1. enable `health.googleapis.com` on the Google Cloud project that owns the
-     household's one existing OAuth client - oauth2-proxy's, in
-     OAUTH2_PROXY_CLIENT_ID / OAUTH2_PROXY_CLIENT_SECRET. There is no separate
-     TRACKER_DRIVE_CLIENT_* pair: the live hub's .env was listed by key name on
-     2026-09-09 and has none, and the tracker's Drive sync reads the
-     OAUTH2_PROXY_* pair itself;
-  2. add the scope above to that client's consent screen and add the Owner to
-     the project's Test users list (projects start capped at 100 test users;
-     going past that needs a third-party security review, which the household
-     never will);
-  3. sit at a browser, consent, and mint a refresh token into
-     WEIGHT_TOKEN_FILE.
+ALL THREE OWNER STEPS ARE NOW DONE (2026-09-09): health.googleapis.com is
+enabled on the Google Cloud project that owns the household's one existing
+OAuth client - oauth2-proxy's, in OAUTH2_PROXY_CLIENT_ID /
+OAUTH2_PROXY_CLIENT_SECRET (there is no separate TRACKER_DRIVE_CLIENT_* pair on
+this hub; it is accepted as a fallback for a differently-provisioned box and
+nothing more); the scope above is on that client's consent screen and the Owner
+is a Test user; and a refresh token has been minted into WEIGHT_TOKEN_FILE.
 
-UNTIL A REAL RESPONSE BODY HAS BEEN SEEN, THIS FILE CONTAINS NO PARSER, ON
-PURPOSE. B7 made that the standard and it is not negotiable here: a parser
-written from a schema posts fiction the first time the schema is one field off,
-and fiction shaped like a body weight is indistinguishable from a healthy
-person. `read_google_health` REFUSES with a named blocker, which flows into the
-ordinary unavailable path below, so the panel says "unavailable" - the truth -
-instead of a number nobody measured. `test_weight_feeder.py` asserts that no
-`parse_google_health` / `parse_weight_datapoint` symbol exists, exactly as B7
-asserts there is no `parse_gemini`.
+WHAT REMAINS UNEXERCISED, SO THAT NOBODY READS MORE INTO THIS THAN HAPPENED.
+ONE list call has been made, and it returned ONE data point. The paging branch,
+the refresh-token grant as this FEEDER performs it (as opposed to as
+`weight_oauth.py capture` performs it), a 401 from an expired token and a
+multi-point history are all reasoned-about rather than observed, and each is
+marked as such where it lives. Every one of them fails towards the same place:
+`SourceFailure` -> the unavailable gauge -> the last real reading at its
+original stamp. Nothing on any of those paths can invent a number.
 
 ═══════════════════════════════════════════════════════════════════════════════
 
@@ -143,7 +199,9 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 # ── The wire contract (NagLight IF-012 / this repo's IF-014) ─────────────────
 # Not tunables. This is the shape POST /api/feed accepts for a weight gauge,
@@ -279,6 +337,30 @@ class SourceFailure(Exception):
     """
 
 
+class NoWeightYet(SourceFailure):
+    """The source answered, correctly, that this account has logged no weight.
+
+    A SUBCLASS OF SourceFailure ON PURPOSE, AND THE DISTINCTION IS IN THE TYPE
+    AND THE SENTENCE, NEVER IN THE OUTCOME. Being a subclass is what keeps the
+    module's central promise intact: `run_cycle` catches SourceFailure, so an
+    empty history takes the ORDINARY unavailable path - value 0 with no
+    `observed_at`, or the last real reading at its original stamp - exactly as a
+    401 or a dead network would. It is not a crash, it does not abort the cycle,
+    and it emphatically does not post 0 lb as a measurement.
+
+    Being a distinct type, with its own sentence, is what stops the two being
+    confused by a HUMAN. "Google returned 200 and you have never logged a
+    weight" and "the token expired" are the same gauge and completely different
+    errands: one is answered by standing on a scale, the other by running
+    `weight_oauth.py mint --force`. A journal line that said "google-health:
+    HTTP 200" for the first would send the Owner hunting a fault that is not
+    there, and one that said "no reading" for the second would leave a broken
+    credential looking like a lifestyle choice.
+
+    Implements: LLR-006
+    """
+
+
 class GoalMissing(Exception):
     """The user's definitions declare no goal.
 
@@ -388,7 +470,7 @@ def check_observed_at(stamp, now, where):
     return value
 
 
-def grams_to_pounds(grams):
+def grams_to_pounds(grams, where="grams"):
     """Convert the vendor's grams to the household's pounds.
 
     Google Health v4 stores body weight as `weightGrams` (a double) and NagLight
@@ -398,9 +480,411 @@ def grams_to_pounds(grams):
     a rounded 2.2046, because the panel shows one decimal and a rounded factor
     drifts visibly across the range.
 
+    THIS IS THE FUNCTION THE WHOLE "ONE REAL CALL FIRST" GATE WAS ABOUT. The
+    captured body's `weightGrams` converts, through this factor, to a number the
+    Owner recognises as their own weight; through a kilogram reading it would be
+    ~2200x too big and through a pound reading ~2.2x too small, and only the
+    second of those is caught by the plausibility band. The mutation runs for
+    this block include a mutant that returns the grams unchanged and one that
+    divides by 1000, and both must be red.
+
     Implements: LLR-006
     """
-    return check_pounds(grams, "grams") / 453.59237
+    return check_pounds(grams, where) / 453.59237
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THE GOOGLE HEALTH v4 WEIGHT PARSER, written against the body captured on
+# 2026-09-09 (its shape is in the module docstring; the body itself is not in
+# this repo and must never be).
+# ══════════════════════════════════════════════════════════════════════════════
+
+# The response's field names, as constants, because a name typed twice is a name
+# that can drift. `dataPoints` is PLURAL: earlier prose in this repo guessed
+# `dataPoint` and the observed body settled it.
+DATA_POINTS_KEY = "dataPoints"
+NEXT_PAGE_TOKEN_KEY = "nextPageToken"
+WEIGHT_MEMBER = "weight"
+WEIGHT_GRAMS_KEY = "weightGrams"
+SAMPLE_TIME_KEY = "sampleTime"
+PHYSICAL_TIME_KEY = "physicalTime"
+UTC_OFFSET_KEY = "utcOffset"
+CIVIL_TIME_KEY = "civilTime"
+CIVIL_DATE_KEY = "date"
+
+# No real UTC offset is bigger than this (the extremes in use are -12h and
+# +14h). A `utcOffset` outside it is corruption, and since the offset's only job
+# is to decide the reading's CALENDAR DAY, a corrupt one would silently move the
+# weigh-in to the wrong day - which is precisely the mistake `civil_date` exists
+# to prevent. It is answered with None ("we cannot say what day this was")
+# rather than with a wrong day.
+MAX_UTC_OFFSET_SECONDS = 18 * 3600
+
+# `google-duration` is a decimal number of seconds with a trailing `s`, e.g. the
+# observed `-18000s`. Fractional seconds are permitted by the format and are
+# dropped here: a UTC offset is a whole number of minutes, and nothing on this
+# path needs sub-second precision on a timezone.
+GOOGLE_DURATION_RE = re.compile(r"^(-?)(\d+)(?:\.(\d{1,9}))?s$")
+
+# `datetime.fromisoformat` on the Python this hub ships (3.8) accepts exactly 3
+# or 6 fractional digits, while RFC3339 permits any number and Google sends 6
+# today. The fraction is normalised to 6 rather than the parse being left to
+# depend on a vendor's formatting choice.
+FRACTIONAL_SECONDS_RE = re.compile(r"\.(\d+)")
+
+
+def parse_rfc3339_utc(text, where):
+    """Return the epoch second an RFC3339 timestamp names, or raise SourceFailure.
+
+    Contract:
+      Inputs:  text: the timestamp exactly as the vendor sent it; where: str for
+               the message.
+      Outputs: int epoch seconds.
+      Raises:  SourceFailure for a non-string, a blank, an unparseable string,
+               and - deliberately - for a stamp carrying NO ZONE at all.
+
+    A ZONELESS STAMP IS REFUSED RATHER THAN ASSUMED TO BE UTC. `physicalTime` is
+    documented and observed as UTC with a `Z`, so a stamp without one is not the
+    field this parser thinks it is reading; assuming UTC would silently shift the
+    reading by up to a day, which is how a stale weigh-in starts rendering fresh
+    (or a fresh one starts rendering as being in the future and gets refused).
+
+    THE OFFENDING TEXT IS NEVER PUT IN THE MESSAGE, only its type. Every string
+    that reaches here came off a vendor's wire, `run_cycle` prints a
+    SourceFailure's message, and systemd writes that to the journal - so the
+    rule for this whole parser is that a message may name a FIELD and a TYPE and
+    never a VALUE.
+
+    Implements: LLR-006
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise SourceFailure(
+            "%s: %s is missing or is not a string (it is a %s)"
+            % (where, PHYSICAL_TIME_KEY, type(text).__name__))
+    cleaned = text.strip()
+    if cleaned.endswith(("Z", "z")):
+        cleaned = cleaned[:-1] + "+00:00"
+    match = FRACTIONAL_SECONDS_RE.search(cleaned)
+    if match is not None:
+        digits = (match.group(1) + "000000")[:6]
+        cleaned = cleaned[:match.start(1)] + digits + cleaned[match.end(1):]
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except (ValueError, TypeError):
+        raise SourceFailure(
+            "%s: %s is not an RFC3339 timestamp (the value is not logged: it "
+            "is a vendor's bytes)" % (where, PHYSICAL_TIME_KEY))
+    if parsed.tzinfo is None:
+        raise SourceFailure(
+            "%s: %s carries no timezone. It is documented and was observed as "
+            "UTC with a `Z`; a zoneless stamp is not that field, and assuming "
+            "UTC would move the weigh-in by hours."
+            % (where, PHYSICAL_TIME_KEY))
+    return int(parsed.timestamp())
+
+
+def parse_google_duration_seconds(text):
+    """A `google-duration` (`-18000s`) as whole seconds, or None.
+
+    None means "this parser cannot say", never zero: zero is a real offset (UTC)
+    and answering it for an unreadable field would place a weigh-in on the wrong
+    calendar day with total confidence.
+
+    Implements: LLR-006
+    """
+    if not isinstance(text, str):
+        return None
+    match = GOOGLE_DURATION_RE.match(text.strip())
+    if match is None:
+        return None
+    seconds = int(match.group(2))
+    if match.group(1) == "-":
+        seconds = -seconds
+    if abs(seconds) > MAX_UTC_OFFSET_SECONDS:
+        return None
+    return seconds
+
+
+def civil_date_of(sample_time, observed_at, where):
+    """The CALENDAR DAY the weigh-in happened on, LOCALLY, or None.
+
+    Contract:
+      Inputs:  sample_time: the `sampleTime` object; observed_at: the epoch
+               second `physicalTime` named; where: str, unused in the result and
+               present so a future caller's failures can be named.
+      Outputs: (year, month, day) as ints, or None when the body carries neither
+               a usable `civilTime.date` nor a usable `utcOffset`.
+      Raises:  nothing. "We cannot say what day this was" is an ANSWER.
+
+    THIS IS THE TRAP THE CAPTURE PROVED, AND IT IS WHY THE FUNCTION EXISTS
+    BEFORE ANY CALLER DOES. The captured body's `physicalTime` is
+    2026-09-09T01:24Z and its `civilTime` is 2026-09-08 20:24, because
+    `utcOffset` is -18000s. The person stood on the scale on MONDAY EVENING; in
+    UTC it was already TUESDAY. Anything that ever asks "did they weigh in
+    today?" - the auto-check-off SN-040 gestures at - must ask THIS function and
+    never `observed_at`, or it will tick off the wrong day for every evening
+    weigh-in in this timezone, which is most of them.
+
+    `civilTime` is `readOnly` in the discovery document, i.e. the server
+    computes it, so it is preferred when present; the offset arithmetic is the
+    fallback for a body that omits it. `tests/test_weight_feeder.py` asserts the
+    two agree on the captured shape, which is what makes the fallback trustable
+    rather than merely plausible.
+
+    Implements: LLR-006
+    """
+    if isinstance(sample_time, dict):
+        civil = sample_time.get(CIVIL_TIME_KEY)
+        if isinstance(civil, dict):
+            date = civil.get(CIVIL_DATE_KEY)
+            if isinstance(date, dict):
+                parts = [date.get("year"), date.get("month"), date.get("day")]
+                if all(isinstance(part, int) and not isinstance(part, bool)
+                       for part in parts):
+                    return (parts[0], parts[1], parts[2])
+        offset = parse_google_duration_seconds(sample_time.get(UTC_OFFSET_KEY))
+        if offset is not None:
+            local = datetime.fromtimestamp(observed_at + offset, timezone.utc)
+            return (local.year, local.month, local.day)
+    return None
+
+
+class WeightReading(object):
+    """ONE weigh-in, as this feeder understands it.
+
+    `pounds` and `observed_at` are what the gauge needs. `grams`,
+    `utc_offset_seconds` and `civil_date` are carried rather than discarded
+    because the next thing anyone builds on this source is the weigh-in
+    check-off, and it needs the CALENDAR DAY, which `observed_at` cannot give it
+    (see `civil_date_of`). A parser that threw them away would look complete and
+    would quietly force the next author to re-derive them from a field they had
+    already been handed.
+    """
+
+    __slots__ = ("pounds", "observed_at", "grams", "utc_offset_seconds",
+                 "civil_date")
+
+    def __init__(self, pounds, observed_at, grams, utc_offset_seconds,
+                 civil_date):
+        self.pounds = pounds
+        self.observed_at = observed_at
+        self.grams = grams
+        self.utc_offset_seconds = utc_offset_seconds
+        self.civil_date = civil_date
+
+    def __repr__(self):
+        # NO WEIGHT AND NO STAMP IN THE REPR. A repr reaches tracebacks and
+        # logs, and this object's whole content is health data about one person.
+        return "WeightReading(<not logged: health data>)"
+
+
+def check_vendor_grams(raw, where):
+    """`weightGrams` -> plausible pounds, or SourceFailure naming no VALUE.
+
+    Contract:
+      Inputs:  raw: whatever sat under `weightGrams`; where: str for the message.
+      Outputs: float pounds inside PLAUSIBLE_LB.
+      Raises:  SourceFailure for a non-number, a bool, NaN, +/-inf, zero,
+               negative, and for anything converting outside the band.
+
+    IT WRAPS `grams_to_pounds` AND `check_plausible_weight_lb` RATHER THAN
+    CALLING THEM DIRECTLY FOR ONE REASON: THEIR MESSAGES QUOTE THE VALUE. That
+    is right for the stored-state path those two also serve, where the value is
+    ours; it is wrong here, where the value is a vendor's bytes on their way to
+    the journal, and where a well-formed value IS the Owner's body weight. So
+    the message names the field and the type, and the number stays out of the
+    log entirely.
+
+    THE BAND APPLIES TO A READING EXACTLY AS IT APPLIES TO A GOAL. 40..1000 lb
+    is not a judgement about anybody's body; it is what catches a units error
+    before it becomes a confident wrong number on a wall. Note what it CANNOT
+    catch, which is why the unit is never assumed anywhere in this file: grams
+    misread as pounds gives ~2.2x, and for a light enough person 2.2x still
+    lands inside the band.
+
+    Implements: LLR-006
+    """
+    try:
+        pounds = grams_to_pounds(raw, where)
+    except SourceFailure:
+        raise SourceFailure(
+            "%s: %s is not a usable number (it is a %s). The value is not "
+            "logged." % (where, WEIGHT_GRAMS_KEY, type(raw).__name__))
+    try:
+        return check_plausible_weight_lb(pounds, where)
+    except SourceFailure:
+        raise SourceFailure(
+            "%s: %s converts to a weight outside the plausible band %g..%g lb, "
+            "so it is a units error or corruption rather than a body weight. "
+            "The value is not logged: it is health data."
+            % (where, WEIGHT_GRAMS_KEY, PLAUSIBLE_LB[0], PLAUSIBLE_LB[1]))
+
+
+def weight_from_data_point(point, now, where):
+    """ONE element of `dataPoints` -> a WeightReading, or SourceFailure.
+
+    Contract:
+      Inputs:  point: one element, exactly as decoded; now: this cycle's clock;
+               where: "google-health dataPoints[3]" or the like.
+      Outputs: WeightReading.
+      Raises:  SourceFailure for a non-object, for a point carrying no `weight`
+               member, for a `weight` with no `weightGrams` or no `sampleTime`,
+               for an unusable number, and for a `physicalTime` that is missing,
+               unparseable, zoneless, before EPOCH_FLOOR or in the FUTURE.
+
+    A POINT WITH NO `weight` MEMBER IS NORMAL, NOT BROKEN. `DataPoint` is a
+    union of 43 members in the discovery document, and this route was asked for
+    the `weight` data type, so a point shaped otherwise is something this parser
+    does not understand rather than something that has gone wrong. It raises
+    here and `parse_weight_datapoint` SKIPS it, so one odd point among several
+    costs that point and not the reading.
+
+    `name` IS NEVER READ. It holds `users/<the Owner's Google user id>/...`, and
+    a field that is never read cannot be logged, stored, or posted by accident.
+    `dataSource` is not read either: `recordingMethod`/`platform` are the
+    vendor's provenance and nothing on the panel is entitled to them.
+
+    Implements: SR-022, LLR-006
+    """
+    if not isinstance(point, dict):
+        raise SourceFailure("%s: data point is not an object (it is a %s)"
+                            % (where, type(point).__name__))
+    if WEIGHT_MEMBER not in point:
+        raise SourceFailure(
+            "%s: data point carries no `%s` member. DataPoint is a union of 43 "
+            "members and this one is not a weight." % (where, WEIGHT_MEMBER))
+    weight = point.get(WEIGHT_MEMBER)
+    if not isinstance(weight, dict):
+        raise SourceFailure("%s: `%s` is not an object (it is a %s)"
+                            % (where, WEIGHT_MEMBER, type(weight).__name__))
+    if WEIGHT_GRAMS_KEY not in weight:
+        raise SourceFailure(
+            "%s: `%s` carries no `%s`. The discovery document marks it "
+            "required, so a weight without one is a shape this parser does not "
+            "understand." % (where, WEIGHT_MEMBER, WEIGHT_GRAMS_KEY))
+    raw_grams = weight.get(WEIGHT_GRAMS_KEY)
+    pounds = check_vendor_grams(raw_grams, where)
+    sample = weight.get(SAMPLE_TIME_KEY)
+    if not isinstance(sample, dict):
+        raise SourceFailure(
+            "%s: `%s` carries no `%s` object (it is a %s). Without it there is "
+            "no instant at which this weight was true, and `observed_at` may "
+            "not be invented from the clock."
+            % (where, WEIGHT_MEMBER, SAMPLE_TIME_KEY, type(sample).__name__))
+    # `check_observed_at` refuses a stamp before this feeder existed and a stamp
+    # in the FUTURE. Both are refused rather than clamped: a future stamp is
+    # exactly what would keep a dead source rendering green.
+    observed_at = check_observed_at(
+        parse_rfc3339_utc(sample.get(PHYSICAL_TIME_KEY), where), now, where)
+    return WeightReading(
+        pounds=pounds,
+        observed_at=observed_at,
+        grams=float(raw_grams),
+        utc_offset_seconds=parse_google_duration_seconds(
+            sample.get(UTC_OFFSET_KEY)),
+        civil_date=civil_date_of(sample, observed_at, where))
+
+
+def parse_weight_datapoint(payload, now, where="google-health"):
+    """ONE `ListDataPointsResponse` page -> the LATEST usable WeightReading.
+
+    Contract:
+      Inputs:  payload: the decoded body, exactly as observed; now: this cycle's
+               clock, so a sample time is judged against the same instant the
+               gauge is; where: str for the messages.
+      Outputs: WeightReading - the one with the greatest `physicalTime`.
+      Raises:  NoWeightYet when the account has logged nothing (an empty or null
+               `dataPoints`); SourceFailure when the body is not an object, when
+               the `dataPoints` key is ABSENT entirely, when `dataPoints` is not
+               a list, when no element is usable, and when the two newest points
+               share an instant but disagree about the weight.
+
+    THE LATEST IS CHOSEN BY `physicalTime`, NOT BY POSITION, AND THAT IS A
+    DECISION RATHER THAN A DETAIL. The captured body held exactly one point, so
+    "the first element" and "the newest" were indistinguishable in the only
+    evidence anybody has. A real history returns many, the discovery document
+    promises no ordering, and `[0]` would put an arbitrary past weigh-in on the
+    wall at its own stamp - honest about WHEN, wrong about WHAT, and completely
+    invisible.
+
+    AN EMPTY LIST IS `NoWeightYet`, AND AN ABSENT KEY IS NOT. They look alike
+    and mean opposite things. `{"dataPoints": []}` is a 200 from a working
+    source saying "this account has logged no weight" - the account is new, or
+    the scale has never synced - which is the UNAVAILABLE GAUGE case: we do not
+    know what you weigh, and 0 lb is not the answer. A body with no `dataPoints`
+    key AT ALL is a shape that is not the one that was captured: the response
+    changed, or something that is not Google answered, and reading "no weight
+    logged" out of that would be reading meaning into a body we do not
+    recognise.
+
+    A BAD POINT COSTS ITSELF, NOT THE READING. Each element is parsed
+    independently and its failure is collected; only if NOTHING survives does
+    the page fail, and then the message carries every reason. One malformed
+    entry in a synced history must not blank the panel.
+
+    TWO NEWEST POINTS AT THE SAME INSTANT WITH DIFFERENT WEIGHTS ARE REFUSED,
+    not ranked. It is the rule this module applies to two files declaring a
+    goal, two items with one id and a target declared twice, and it applies for
+    the same reason: whichever this code picked, somebody would be looking at a
+    bar drawn around a number the other reading contradicts. Identical weights
+    at one instant are a duplicate, not a contradiction, and are accepted.
+
+    Implements: SR-022, LLR-006
+    """
+    if not isinstance(payload, dict):
+        raise SourceFailure("%s: the response body is not an object (it is a %s)"
+                            % (where, type(payload).__name__))
+    if DATA_POINTS_KEY not in payload:
+        raise SourceFailure(
+            "%s: the response body carries no `%s` key at all. The body "
+            "captured on 2026-09-09 had one, so this is a shape this parser "
+            "does not recognise rather than an empty history - it is refused "
+            "instead of read as 'no weight logged'." % (where, DATA_POINTS_KEY))
+    points = payload.get(DATA_POINTS_KEY)
+    if points is None or (isinstance(points, list) and not points):
+        raise NoWeightYet(
+            "%s: HTTP 200 with no data points, so this account has no weight "
+            "logged in Google Health yet. That is not a broken source and not "
+            "a reading of 0 - it is the unavailable gauge: we do not know what "
+            "you weigh. Step on a scale that syncs to Google Health."
+            % where)
+    if not isinstance(points, list):
+        raise SourceFailure("%s: `%s` is not a list (it is a %s)"
+                            % (where, DATA_POINTS_KEY, type(points).__name__))
+    readings, problems = [], []
+    for index, point in enumerate(points):
+        try:
+            readings.append(weight_from_data_point(
+                point, now, "%s %s[%d]" % (where, DATA_POINTS_KEY, index)))
+        except SourceFailure as exc:
+            problems.append(str(exc))
+    if not readings:
+        raise SourceFailure(
+            "%s: %d data point(s) and not one usable weight among them (%s)"
+            % (where, len(points), "; ".join(problems)))
+    newest = max(reading.observed_at for reading in readings)
+    tied = [reading for reading in readings if reading.observed_at == newest]
+    if len({reading.grams for reading in tied}) > 1:
+        raise SourceFailure(
+            "%s: %d data points share the newest instant and disagree about "
+            "the weight. Which one the household weighs is not guessable, and "
+            "picking one would draw a bar around a number the other "
+            "contradicts." % (where, len(tied)))
+    return tied[0]
+
+
+def next_page_token(payload):
+    """The `nextPageToken` of a list response, or None when there is not one.
+
+    A non-string, or an empty string, is None: the field's whole meaning is "ask
+    again with this", and there is nothing to ask again with.
+
+    Implements: LLR-006
+    """
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get(NEXT_PAGE_TOKEN_KEY)
+    return token if isinstance(token, str) and token.strip() else None
 
 
 def clean_scalar(text):
@@ -1561,52 +2045,6 @@ def load_goal_from_definitions(defs_dir, category=None, item_id=None):
     return goal_from_item(found[0], found[1], category, item_id), found[1]
 
 
-def read_google_health(env):
-    """Source: Google Health API v4, Weight data type. NOT YET IMPLEMENTED.
-
-    Contract:
-      Outputs: (value_lb: float, observed_at: epoch seconds) - once the block
-               above this module's docstring has been cleared.
-      Raises:  SourceFailure, always, today.
-
-    THIS FUNCTION DELIBERATELY CONTAINS NO PARSER, AND THAT IS THE POINT. The
-    API, the data type, the route and the scope were all verified against
-    Google on 2026-09-09 (see the module docstring for the calls and the
-    responses), but no AUTHENTICATED call has ever been made, because minting
-    a token needs the Owner at a browser consenting to a scope that has to be
-    added to the OAuth client first. B7 made "one real call, verified, before
-    the parser is written" this build's standard, and a weight parser written
-    from a schema is the worst possible place to break it: if the field is one
-    name off, or grams are actually kilograms, the feeder does not fail - it
-    posts a confident, plausible, wrong body weight, and there is nothing on
-    the panel that could tell anyone.
-
-    So this refuses, by name, and the refusal flows into `build_post`'s
-    ordinary unavailable path. The panel says "unavailable", which is the
-    truth. When the Owner has minted a token, ONE list call is made by hand,
-    its body is pasted into this module's docstring the way B7 pasted its
-    three, and only then is `parse_weight_datapoint` written against it.
-
-    Implements: LLR-006
-    """
-    token_file = (env.get("WEIGHT_TOKEN_FILE") or "").strip()
-    have_token = bool(token_file) and os.path.exists(os.path.expanduser(token_file))
-    raise SourceFailure(
-        "google-health: BLOCKED on an Owner action, so no reading was taken "
-        "and no number was invented. %s "
-        "The Cloud project has health.googleapis.com enabled and the scope %s "
-        "on its consent screen (Owner, 2026-09-09); what remains is to run "
-        "`weight_oauth.py mint` and then `weight_oauth.py capture` on this box "
-        "and write the parser against the body that comes back - the exact "
-        "commands are in stack/weight/README.md. Until one real response body "
-        "has been observed, this feeder posts 'unavailable' rather than a "
-        "parser's guess."
-        % ("A token file is present, but no parser exists yet - see the module "
-           "docstring." if have_token else "No token file is present; run "
-           "`weight_oauth.py mint`.",
-           GOOGLE_HEALTH_SCOPE))
-
-
 # ── The verified Google Health v4 facts, as constants rather than prose ─────
 # Every one of these was read off the live discovery document (revision
 # 20260907) or a live 401, on 2026-09-09. They are constants so that the
@@ -1621,6 +2059,292 @@ GOOGLE_HEALTH_SCOPE = (
 GOOGLE_HEALTH_FILTER = 'weight.sample_time.physical_time >= "%s"'
 GOOGLE_HEALTH_RPC = (
     "google.devicesandservices.health.v4.DataPointsService.ListDataPoints")
+
+# Google's OAuth token endpoint. The feeder does its own refresh-token grant -
+# it cannot import `weight_oauth`, which imports THIS module - so the constant
+# lives here and `weight_oauth.TOKEN_ENDPOINT` is asserted equal to it by test,
+# the same way `tests/test_feeder_egress_parity.py` keeps the two feeders'
+# duplicated guards honest.
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+# THE OAUTH CLIENT RESOLUTION ORDER, WHICH IS `weight_oauth`'s AND MUST STAY
+# `weight_oauth`'s. `OAUTH2_PROXY_*` first because that is the household's ONE
+# Google OAuth client (the live hub's .env was listed by key name on 2026-09-09
+# and carries no TRACKER_DRIVE_CLIENT_* pair); the tracker pair second, for a
+# differently-provisioned box. FIRST COMPLETE PAIR WINS, and a pair is complete
+# only when BOTH halves are set - half a pair is a mis-provisioned box, and
+# sliding to the next one would send Google an id from one place and a secret
+# from another, which fails as `invalid_client` and looks like Google's fault.
+# A test asserts this tuple equals `weight_oauth.CLIENT_KEY_PAIRS`, so the token
+# is refreshed with the client it was minted by.
+OAUTH_CLIENT_KEY_PAIRS = (
+    ("OAUTH2_PROXY_CLIENT_ID", "OAUTH2_PROXY_CLIENT_SECRET"),
+    ("TRACKER_DRIVE_CLIENT_ID", "TRACKER_DRIVE_CLIENT_SECRET"),
+)
+
+# How many list pages this feeder will walk before it refuses. See
+# `list_weight_data_points` for the reasoning and for which half of it is an
+# assumption.
+MAX_LIST_PAGES = 20
+
+
+def resolve_oauth_client(env):
+    """The (client_id, client_secret) this refresh is made with.
+
+    Contract:
+      Config:  the pairs in OAUTH_CLIENT_KEY_PAIRS, in order, from the unit's
+               EnvironmentFile=/opt/homehub/stack/.env.
+      Raises:  SourceFailure naming EVERY variable looked for and whether each
+               is set - and NEVER a value.
+
+    IT IS A SourceFailure AND NOT A SystemExit, unlike the identity and
+    destination refusals. Those two are configuration this box cannot run
+    without at all; a missing OAuth client means one source cannot be read this
+    cycle, which is the unavailable gauge - the panel says "we do not know what
+    you weigh" and the goal, the post and the state file all still work.
+
+    Implements: SR-022, LLR-006
+    """
+    for id_key, secret_key in OAUTH_CLIENT_KEY_PAIRS:
+        client_id = (env.get(id_key) or "").strip()
+        client_secret = (env.get(secret_key) or "").strip()
+        if client_id and client_secret:
+            return client_id, client_secret
+    halves = ["%s (%s)" % (key, "set" if (env.get(key) or "").strip()
+                           else "unset or blank")
+              for pair in OAUTH_CLIENT_KEY_PAIRS for key in pair]
+    raise SourceFailure(
+        "google-health: no complete Google OAuth client pair in this unit's "
+        "environment, so the refresh token cannot be exchanged. Looked for, in "
+        "order: %s. A pair counts only when BOTH halves are set. The unit gets "
+        "these from EnvironmentFile=/opt/homehub/stack/.env; no value is "
+        "logged here." % "; ".join(halves))
+
+
+def read_refresh_token(path):
+    """The refresh token out of WEIGHT_TOKEN_FILE. READ ONLY, never written.
+
+    Every failure is a SourceFailure naming the errand, because each one has a
+    different answer and "unavailable" alone would not say which: no file means
+    `weight_oauth.py mint` has not been run on this box, and a file with no
+    `refresh_token` means the mint half-succeeded and wants `--force`.
+
+    THE TOKEN IS NEVER IN A MESSAGE - not on success, not on failure. The PATH
+    is, because a path is configuration the Owner typed and is what tells them
+    which box or which knob is wrong.
+
+    Implements: SR-022, LLR-006
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except OSError as exc:
+        raise SourceFailure(
+            "google-health: cannot read the token file %s (%s). Run "
+            "`weight_oauth.py mint` on this box - see stack/weight/README.md."
+            % (path, type(exc).__name__))
+    except ValueError:
+        raise SourceFailure(
+            "google-health: the token file %s is not JSON. Run "
+            "`weight_oauth.py mint --force`." % path)
+    token = stored.get("refresh_token") if isinstance(stored, dict) else None
+    if not isinstance(token, str) or not token:
+        raise SourceFailure(
+            "google-health: the token file %s carries no `refresh_token`. Run "
+            "`weight_oauth.py mint --force`." % path)
+    return token
+
+
+def vendor_json(request, timeout, what):
+    """Send `request` through `vendor_opener()` and decode the JSON. One door.
+
+    Contract:
+      Outputs: the decoded body.
+      Raises:  SourceFailure for EVERY failure class - transport, timeout,
+               refused redirect, non-200 and an undecodable body.
+
+    NOTHING THE REMOTE WROTE EVER REACHES THE MESSAGE. Not the body, not on a
+    401, not on a 500. `run_cycle` prints a SourceFailure's message and systemd
+    writes it to the journal, and a Google error body has been observed
+    quoting the offending request back - which on this path carries an
+    `Authorization` header that is the whole health-metrics scope. The status
+    code is ours to read; the body is the remote's to write, and it does not
+    get a journal. `EgressRefused` is converted here, deliberately and by name,
+    because its message is OURS.
+
+    Implements: SR-022, LLR-006
+    """
+    try:
+        with vendor_opener().open(request, timeout=timeout) as response:
+            if response.status != 200:
+                raise SourceFailure("google-health: %s answered HTTP %s"
+                                    % (what, response.status))
+            raw = response.read()
+    except SourceFailure:
+        raise
+    except EgressRefused as exc:
+        raise SourceFailure("google-health: %s was refused: %s" % (what, exc))
+    except urllib.error.HTTPError as exc:
+        raise SourceFailure(
+            "google-health: %s failed: HTTP %s (the body is not logged). 401 "
+            "means the refresh token is no longer valid - run `weight_oauth.py "
+            "mint --force`; 403 usually means the scope is no longer on the "
+            "consent screen." % (what, exc.code))
+    except Exception as exc:
+        raise SourceFailure("google-health: %s failed: %s"
+                            % (what, type(exc).__name__))
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        raise SourceFailure("google-health: %s returned something that is not "
+                            "JSON" % what)
+
+
+def google_access_token(client_id, client_secret, refresh_token, timeout,
+                        endpoint=None):
+    """Exchange the stored refresh token for a short-lived access token.
+
+    NOT OBSERVED FROM THIS PROCESS. `weight_oauth.py capture` performs the same
+    grant and its call is what the Owner ran; this is the same request made by
+    the feeder. If it is wrong the outcome is a named SourceFailure and an
+    unavailable gauge, never a reading.
+
+    Implements: SR-022, LLR-006
+    """
+    fields = {"client_id": client_id, "client_secret": client_secret,
+              "refresh_token": refresh_token, "grant_type": "refresh_token"}
+    request = urllib.request.Request(
+        endpoint or GOOGLE_TOKEN_ENDPOINT,
+        data=urllib.parse.urlencode(fields).encode("ascii"),
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Accept": "application/json"},
+        method="POST")
+    payload = vendor_json(request, timeout, "the token refresh")
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token:
+        raise SourceFailure(
+            "google-health: the token refresh returned no access token. If the "
+            "refresh token has been revoked, run `weight_oauth.py mint "
+            "--force`.")
+    return token
+
+
+def list_weight_data_points(access_token, now, timeout, list_url=None):
+    """Walk the `dataPoints` list and return the LATEST reading across it.
+
+    Contract:
+      Outputs: WeightReading.
+      Raises:  NoWeightYet when every page was empty; SourceFailure for a
+               transport failure, an unrecognised body, and for a history
+               deeper than MAX_LIST_PAGES pages.
+
+    NO QUERY PARAMETERS ARE SENT ON THE FIRST CALL, AND THAT IS THE OBSERVATION
+    SPEAKING. The one call anybody has ever made against this route sent none
+    and returned 200. The discovery document also offers a `filter`
+    (GOOGLE_HEALTH_FILTER, still unused below) and a `pageSize`, and either
+    would usefully bound the walk - but adding an unexercised query parameter to
+    the single request shape that is KNOWN to work is precisely the bet this
+    block's gate exists to refuse. When somebody runs the filtered call by hand
+    and sees a 200, it can be added here with the same ceremony.
+
+    WHAT HAPPENS ON A `nextPageToken` IS AN ASSUMPTION, MARKED AS ONE. The
+    captured body had none, so nothing about paging has been observed. The
+    reasoning: the acceptance criterion is the LATEST reading, the response
+    promises no ordering, and pages left unwalked could hold a newer weigh-in
+    than any seen - so a page token is FOLLOWED, up to MAX_LIST_PAGES, and a
+    history still not exhausted after that is REFUSED rather than answered from
+    the part that was seen. Refusing costs nothing the household will feel: the
+    failure path re-posts the last real reading at its ORIGINAL stamp, so the
+    panel degrades to the previous truth instead of going dark, and 20 pages of
+    weigh-ins is a depth a household does not reach. Answering from a partial
+    walk would mean claiming "latest" for a reading this code cannot know is
+    the latest, and this file does not make claims it cannot support.
+
+    AN EMPTY PAGE MID-WALK IS NOT AN EMPTY HISTORY. `NoWeightYet` from one page
+    is swallowed and the walk continues; it is only raised to the caller if
+    NOTHING was found anywhere.
+
+    Implements: SR-022, LLR-006
+    """
+    base = list_url or GOOGLE_HEALTH_LIST_URL
+    headers = {"Authorization": "Bearer " + access_token,
+               "Accept": "application/json"}
+    latest, token, pages = None, None, 0
+    while True:
+        url = base if token is None else (
+            base + ("&" if "?" in base else "?")
+            + urllib.parse.urlencode({"pageToken": token}))
+        payload = vendor_json(urllib.request.Request(url, headers=headers),
+                              timeout, "the dataPoints list call")
+        pages += 1
+        try:
+            reading = parse_weight_datapoint(payload, now)
+        except NoWeightYet:
+            reading = None
+        if reading is not None and (latest is None
+                                    or reading.observed_at > latest.observed_at):
+            latest = reading
+        token = next_page_token(payload)
+        if token is None:
+            break
+        if pages >= MAX_LIST_PAGES:
+            raise SourceFailure(
+                "google-health: the history is still not exhausted after %d "
+                "pages, so this cycle cannot know which weigh-in is the latest "
+                "and will not claim one. No reading was taken and no number "
+                "was invented." % pages)
+    if latest is None:
+        raise NoWeightYet(
+            "google-health: HTTP 200 across %d page(s) with no data points, so "
+            "this account has no weight logged in Google Health yet. That is "
+            "not a broken source and not a reading of 0 - it is the "
+            "unavailable gauge: we do not know what you weigh." % pages)
+    return latest
+
+
+def read_google_health(env, list_url=None, token_endpoint=None):
+    """Source: Google Health API v4, Weight data type. THE ONE VENDOR READ.
+
+    Contract:
+      Inputs:  env: the process environment plus `_now`; the two endpoints are
+               injected ONLY by tests, exactly as `weight_oauth` injects them -
+               there is no knob for either, because a knob on the URL that
+               carries this token is a way to send it somewhere else.
+      Outputs: (value_lb: float, observed_at: epoch seconds).
+      Raises:  SourceFailure for every failure class, NoWeightYet (a subclass)
+               for an account with nothing logged. Both take the unavailable
+               path in `build_post`; neither can produce a reading.
+
+    IT ORCHESTRATES AND DOES NOT INTERPRET: token file, OAuth client, access
+    token, list walk, and the two numbers the gauge needs. `civil_date` and
+    `utc_offset_seconds` are computed and deliberately NOT returned here - the
+    gauge has no use for them and `observed_at` is the only stamp NagLight
+    understands. A caller that needs the CALENDAR DAY (the weigh-in check-off)
+    calls `parse_weight_datapoint` and reads them off the WeightReading; it must
+    not re-derive a day from `observed_at`, which is UTC and is a day out for
+    every evening weigh-in in this timezone. See `civil_date_of`.
+
+    Implements: SR-022, LLR-006
+    """
+    token_file = (env.get("WEIGHT_TOKEN_FILE") or "").strip()
+    if not token_file:
+        raise SourceFailure(
+            "google-health: WEIGHT_TOKEN_FILE is unset, so there is no refresh "
+            "token to read and no reading was taken. Run `weight_oauth.py "
+            "mint` - see stack/weight/README.md.")
+    refresh_token = read_refresh_token(os.path.expanduser(token_file))
+    client_id, client_secret = resolve_oauth_client(env)
+    try:
+        timeout = int(env.get("WEIGHT_TIMEOUT_SECONDS") or 30)
+    except ValueError:
+        raise SourceFailure(
+            "google-health: WEIGHT_TIMEOUT_SECONDS is not a whole number of "
+            "seconds.")
+    access_token = google_access_token(client_id, client_secret, refresh_token,
+                                       timeout, token_endpoint)
+    reading = list_weight_data_points(access_token, cycle_now(env), timeout,
+                                      list_url)
+    return reading.pounds, reading.observed_at
 
 
 SOURCE_READERS = {

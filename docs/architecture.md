@@ -269,7 +269,7 @@ sequenceDiagram
     participant T as systemd timer (15 min)
     participant W as weight_feeder (SR-022)
     participant D as the user's definitions/ (read-only bind)
-    participant G as Google Health v4 (BLOCKED - no token)
+    participant G as Google Health v4 (parsed from a REAL body, 2026-09-09)
     participant S as state file (the ONE writable path)
     participant N as NagLight /api/feed (IF-014)
 
@@ -283,19 +283,26 @@ sequenceDiagram
         Note over N: NOTHING IS POSTED. The target line IS the goal;<br/>inventing one would draw a 50 lb bar<br/>around a number nobody chose
     else goal 170 lb, unit lb
         D-->>W: 170
-        W->>G: GET /v4/users/me/dataTypes/weight/dataPoints<br/>(when written, through vendor_opener: no redirect, no proxy)
-        G--xW: SourceFailure - no token minted, and NO PARSER EXISTS<br/>until one real body has been observed
-        Note over W: only the exception TYPE is journalled, never its message:<br/>a urllib exception carries the request and its headers
-        W->>S: read the last-known reading, VALIDATED at the door
-        alt a previous reading exists and is credible
-            S-->>W: 191.4 lb, observed_at = when it was TRUE
-            W->>N: value 191.4, target 170, that ORIGINAL stamp<br/>through feed_opener: no proxy, no redirect, peer re-checked
-        else nothing has ever been read, or what is stored cannot be true
-            W->>N: value 0, target 170, NO observed_at at all
-            Note over S: -500 lb, 100000 lb or a FUTURE stamp is corruption,<br/>and corruption is not history
+        W->>G: refresh the token, then GET /v4/users/me/dataTypes/weight/dataPoints<br/>through vendor_opener: no redirect, no proxy
+        alt 200 with data points
+            G-->>W: dataPoints[] -> the LATEST by physicalTime<br/>weightGrams / 453.59237 = lb; observed_at = physicalTime
+            Note over W: civilTime is a DIFFERENT DAY from physicalTime<br/>(20:24 Mon local = 01:24 Tue UTC). A future check-off<br/>must use civil_date, never observed_at
+            W->>N: value 176.0, target 170, observed_at = when it was TRUE
+            W->>S: store the weight and the stamp - nothing else
+        else 200 with NO data points (nothing logged yet), 401, or a body we do not recognise
+            G--xW: NoWeightYet / SourceFailure - never a number
+            Note over W: only the status code and our own words are journalled:<br/>never the token, never the body, never the user id
+            W->>S: read the last-known reading, VALIDATED at the door
+            alt a previous reading exists and is credible
+                S-->>W: 191.4 lb, observed_at = when it was TRUE
+                W->>N: value 191.4, target 170, that ORIGINAL stamp<br/>through feed_opener: no proxy, no redirect, peer re-checked
+            else nothing has ever been read, or what is stored cannot be true
+                W->>N: value 0, target 170, NO observed_at at all
+                Note over S: -500 lb, 100000 lb or a FUTURE stamp is corruption,<br/>and corruption is not history
+            end
+            Note over N: stale by NagLight's own static 7-day horizon -><br/>"unavailable", never a green gauge.<br/>The 0 is unreachable as a displayed reading
+            W->>S: NOT written - a failed read must not decay the stamp
         end
-        Note over N: stale by NagLight's own static 7-day horizon -><br/>"unavailable", never a green gauge.<br/>The 0 is unreachable as a displayed reading
-        W->>S: NOT written - a failed read must not decay the stamp
     end
 ```
 

@@ -11,20 +11,75 @@ The manual script remains the degraded path.
 
 ---
 
-## Status: the vendor half is BLOCKED, and this file contains no parser
+## Status: the gate is CLEARED — the parser is written against a real body
 
-**`stack/weight/weight_feeder.py` has no Google Health parser in it, on
-purpose.** B7 made "one real call, verified, *before* the parser is written" the
-standard for this build, and body weight is the worst possible place to break
-it. A usage parser that is one field off posts an obviously silly percentage. A
-weight parser that reads kilograms as pounds posts a confident, plausible,
-**wrong** body weight, and nothing on the wall could tell anyone.
+**`stack/weight/weight_feeder.py` now carries `parse_weight_datapoint`, and it
+was written against a response body a human actually saw.** On **2026-09-09**
+the Owner ran `weight_oauth.py capture` against the live API and got **HTTP 200,
+712 bytes**, with one data point. B7's standard — "one real call, verified,
+*before* the parser is written" — was met, not waived: from the block's start
+until that capture this file said *no parser exists*, and the tests asserted the
+absence by name. Those absence assertions have been **replaced by correctness
+assertions**, not quietly dropped; `docs/status.md` carries the record.
 
-So `read_google_health` raises a `SourceFailure` naming what is missing, that
-flows into the ordinary unavailable path, and the panel says **unavailable** —
-which is the truth. A test asserts that no `parse_google_health` /
-`parse_weight_datapoint` symbol exists, exactly as B7 asserts there is no
-`parse_gemini`.
+The reason the gate mattered, restated because it is the reason the parser looks
+the way it does: a usage parser that is one field off posts an obviously silly
+percentage, while **a weight parser that reads grams as kilograms posts a
+confident, plausible, wrong body weight, and nothing on the wall could tell
+anyone**.
+
+### What the captured body settled
+
+**The body itself is not in this repo and never will be** — it carries the
+Owner's Google user id and their real body weight. Its *shape* is recorded, in
+`weight_feeder.py`'s module docstring and in the test fixtures, with a
+placeholder id and a made-up weight.
+
+| what was in doubt | what the body said |
+|---|---|
+| the top-level key | **`dataPoints`, plural.** Earlier prose in this repo (and the troubleshooting table below, now corrected) guessed `dataPoint`. The observation wins. |
+| the unit of `weightGrams` | **grams.** The captured value, divided by 453.59237, is a weight the Owner recognises. |
+| which stamp is `observed_at` | `weight.sampleTime.physicalTime` — the instant the reading was *true*, which is what NagLight's staleness rule keys off. Never "now". |
+| whether `civilTime` matters | **Yes, and it is a real trap.** See below. |
+| pagination | the response carried **no `nextPageToken`**. What the feeder does with one is an *assumption*, marked as one in `list_weight_data_points`. |
+
+### The `civilTime` trap, in one line
+
+The captured `physicalTime` is `2026-09-09T01:24Z`; the captured `civilTime` is
+**2026-09-08 20:24 local** (`utcOffset: -18000s`). The weigh-in was a **Monday
+evening**; in UTC it is **Tuesday**.
+
+* The **gauge** uses `physicalTime`. That is correct: it is when the reading was
+  true, and staleness is measured in elapsed time, not in calendar days.
+* Anything that ever needs the reading's **calendar day** — the auto-check-off of
+  the `weigh-in` habit that SN-040 gestures at next — **must** use `civilTime`
+  (or `physicalTime` shifted by `utcOffset`), *never* `physicalTime`. Otherwise
+  it ticks off Tuesday for a Monday-evening weigh-in, every time anyone in this
+  timezone stands on a scale after 7pm.
+
+No check-off is built here. `WeightReading` simply carries `civil_date` and
+`utc_offset_seconds` so the next author is handed them rather than tempted to
+re-derive a day from `observed_at`.
+
+### What it does when it cannot read a weight
+
+Every failure is a `SourceFailure`, every `SourceFailure` becomes the ordinary
+**unavailable** gauge, and none of them can produce a number.
+
+| what happened | what the feeder does |
+|---|---|
+| 200, and the account has **never logged a weight** | `NoWeightYet` — a `SourceFailure` **subclass**, so the outcome is the unavailable gauge, and a distinct *type* and sentence so a human is not sent hunting a fault that is not there. **Not** a reading of 0. |
+| the body carries **no `dataPoints` key at all** | refused, and *not* read as an empty history: it is a shape nobody has seen, so it is not interpreted. |
+| a point with no `weight`, no `weightGrams`, no `sampleTime`, or a number that is not a body weight | that point is skipped; the reading comes from the others. Only if **nothing** on the page is usable does the page fail, and the message then carries every reason. |
+| `physicalTime` missing, unparseable, zoneless, before 2025, or **in the future** | refused. A future stamp is what keeps a dead source rendering green, so it is refused rather than clamped to `now`. |
+| several readings | the **latest by `physicalTime`** wins. Array order is not trusted. Two points sharing the newest instant with *different* weights are refused rather than ranked. |
+| a `nextPageToken` | followed, up to 20 pages; a history still not exhausted after that is refused, because "the latest" would be a claim the code cannot support. **Assumption, not observation.** |
+| a converted weight outside **40–1000 lb** | refused. The same band a *goal* is held to, for the same reason — a units error, not a judgement about anyone's body. |
+
+Nothing on any of those paths puts the token, the response body, the Google user
+id or the weight itself into a message: `run_cycle` prints a `SourceFailure`'s
+message and systemd writes it to the journal, so the rule is that a message names
+a **field** and a **type** and never a **value**.
 
 ### What was verified, by calling Google, on 2026-09-09
 
@@ -95,17 +150,17 @@ and it is the Owner's call, not this feeder's.
    **BUILT, never yet run against Google:** `weight_oauth.py mint`, below.
 4. **Make ONE real `dataPoints.list` call** and keep the body.
    **BUILT, never yet run against Google:** `weight_oauth.py capture`, below.
-5. **Write `parse_weight_datapoint` against that captured body**, after pasting
-   it into `weight_feeder.py`'s module docstring the way B7 pasted its three.
-   **STILL OWED, and deliberately not started.** It is written by whoever holds
-   a real response body, never from the schema: the discovery document says
-   `weightGrams` is *grams*, and a parser that assumes kilograms posts a
-   confident, plausible, wrong body weight that nothing on the wall could
-   contradict.
+5. **Write `parse_weight_datapoint` against that captured body.**
+   **DONE, 2026-09-09**, against the HTTP 200 the Owner captured — its *shape*
+   is in `weight_feeder.py`'s module docstring, with a placeholder id and a
+   made-up weight, because the real body carries the Owner's Google user id and
+   their real weight. It was written from the body and not from the schema, and
+   the schema turned out to be right about `weightGrams` being *grams* and this
+   repo's prose turned out to be wrong about the key being `dataPoint`.
 
 Steps 3 and 4 are two subcommands of one Owner-run tool, `weight_oauth.py`, and
-**neither of them parses a weight** — a test asserts that of this file too, not
-only of the feeder. It is a separate file from the feeder on purpose: the
+**neither of them parses a weight** — a test still asserts that of that file,
+because a capture tool that interpreted a body would make the capture pointless. It is a separate file from the feeder on purpose: the
 feeder's central guarantee is that it **never writes a credential** — an
 allow-list, a systemd mount option and three tests stand behind that sentence —
 and one of these commands writes exactly the credential the feeder may not. A
@@ -284,22 +339,33 @@ it is a separate call to Google's *token* endpoint, not to the health API.)
 | `the list call failed: HTTP 403, PERMISSION_DENIED` | either `health.googleapis.com` is not enabled on the project that owns **this** client, or the scope is not on its consent screen. A scope added *after* consent is not in an already-minted token: fix the console, then `mint --force` again. |
 | `the list call failed: HTTP 401` | the token is not valid for this API. `mint --force`. |
 | `the list call failed: HTTP 404` | the route is wrong. It is `/v4/users/me/dataTypes/weight/dataPoints` — the prose docs' `/v4/users/me/dataPoints/weight` is the error this whole gate exists to catch. |
-| `HTTP 200` but only a handful of bytes (`{}` or an empty `dataPoint` list) | the call worked and the account simply has no weight data in Google Health. That is still a real captured body and worth keeping, but **a parser cannot be written from an empty list** — weigh in on a scale that feeds Fitbit/Pixel and capture again. |
+| `HTTP 200` but only a handful of bytes (`{}` or an empty `dataPoints` list) | the call worked and the account simply has no weight data in Google Health. The feeder handles this as `NoWeightYet` and the panel reads "unavailable"; weigh in on a scale that feeds Fitbit/Pixel. (The key is `dataPoints`, **plural** — an earlier version of this table said `dataPoint`, and the captured body corrected it.) |
 | `the list call was refused: refused an HTTP 302 redirect` | something answered for `health.googleapis.com` that is not Google. Do **not** retry with redirects allowed: urllib carries `Authorization` across a cross-host redirect, and that header is this whole scope. |
 | `could not read the token file ... Run mint first.` | step 3 has not been done on this box, or `WEIGHT_TOKEN_FILE` disagrees with where it was written. |
 
-### Then, and only then, step 5
+### Step 5, now done
 
-Hand the captured file back. The parser is written against it, in its own task,
-by whoever holds that body. Nothing in this repo may grow a
-`parse_weight_datapoint` before that — two tests fail if it does.
+The captured file was handed back on 2026-09-09 and `parse_weight_datapoint` was
+written against it — see **Status** at the top of this file for what the body
+settled and what it left as an assumption. The captured body itself was **not**
+committed: what is in the repo is its shape, with a placeholder user id and a
+weight that is not the Owner's.
 
-### What has NEVER run against Google
+`weight_oauth.py` still may not grow a parser; a test asserts that by name, and
+also fails if that file so much as mentions `weightGrams` or `sampleTime`. It
+captures a body; it does not interpret one.
 
-Every test of these two tools runs against a **loopback HTTP server this repo
-starts**. The consent screen, a real authorization code, a real token exchange,
-a real refresh, a real `dataPoints.list` response and the real 401/403 bodies
-are **unexercised**. What *is* exercised against real behaviour: the egress
+### What has still NEVER run against Google
+
+Every test in this repo runs against a **loopback HTTP server it starts**. What
+HAS happened against Google, once, on 2026-09-09: a consent screen, an
+authorization code, a token exchange, a refresh, and **one** `dataPoints.list`
+call that returned 200 with one point. What remains **unexercised**: the real
+401/403 bodies, a multi-point history, a `nextPageToken`, and the refresh grant
+as the *feeder* performs it (as opposed to as `capture` performs it). Every one
+of those fails towards the same place — a named `SourceFailure`, the unavailable
+gauge, and the last real reading at its original stamp — so none of them can
+invent a number. What *is* exercised against real behaviour: the egress
 guards (a real 302 and a real proxy variable, on real sockets), the write guard
 (a real symlink on a real filesystem), the refusal to overwrite, and the
 no-secret-printed property (sentinel values carried through the whole flow).

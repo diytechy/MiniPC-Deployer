@@ -447,6 +447,105 @@ that directory is refused rather than read: "the goal came from a file that is
 not in the household's definitions" is a sentence this feeder should not be able
 to say, and one `realpath` is what it costs.
 
+### The service sees ONE definitions file, not the directory (changed 2026-09-09)
+
+`WEIGHT_DEFINITIONS_DIR` in `.env` names the **host** path. The service does not
+see that path at all. `setup-weight.sh` binds the **single category file the
+goal lives in**, read-only, to
+`/var/lib/homehub-weight/definitions/<that file's name>`, and points the
+service's `WEIGHT_DEFINITIONS_DIR` at that directory instead.
+
+**Scope is the reason, and it comes first.** The definitions directory is one
+household member's subtree of a volume holding **every** member's tracker data.
+A gauge about one person's body must not hand a service account read access to
+all of it, so what is exposed is the one file that carries the goal and nothing
+else. If the modes were wide open this would still be the shape.
+
+**It is also the only shape that works**, and that was measured on the hub with
+`systemd-run` as the real service account rather than reasoned about:
+
+| what was bound | result |
+|---|---|
+| the definitions directory, at the same path | **NOT-READABLE** |
+| the definitions directory, at a target the account owns | **NOT-READABLE** |
+| the one category **file** (0644), into the account's `StateDirectory` | **READABLE**, and `touch` denied |
+
+The directory is `drwx------ hub hub`, and its ancestors are root-only
+(`/var/lib/docker` is `drwx--x---`, nothing for "other"), so no mount target
+rescues a directory bind: the account cannot enter the directory, and cannot
+traverse to its own path either. An ACL is not the escape hatch — `setfacl` is
+not installed (a new apt package name, and the §5 apt export re-run with it),
+and it would be **destroyed on the next sync** regardless: NagLight's
+`internal/store/definitions.go` applies definitions by `os.MkdirTemp` +
+populate + **rename into place**, so the `definitions` inode is replaced
+wholesale.
+
+**Which file is OBSERVED, never derived from the category.** `setup-weight.sh`
+runs as root, can read the directory, and finds the `.md` whose **top-level**
+`category:` matches `WEIGHT_ITEM_CATEGORY` — trimmed and case-folded, the same
+rule `find_goal_item` applies, with the same `clean_scalar` handling of quotes
+and a trailing `# comment`. It does **not** lowercase `Health` into `health.md`:
+the filename is NagLight's slug rule, it lives in another repo, and it can
+change without telling us. The test tree is booby-trapped both ways round — the
+file carrying category `Health` is called `tracker-2b.md`, and there *is* a
+`health.md` declaring something else — so a script that guessed the name binds
+another member's tracker and reports success.
+
+Only the frontmatter counts, and only column zero: a `category:` indented under
+`items:` is a **field of an item**, and one in the prose body is a person
+thinking out loud. Both are the lines `internal/defs` draws, and both are
+asserted.
+
+**Two files declaring the category is REFUSED, not resolved.** Picking one would
+silently follow directory order, which is the same refusal the feeder already
+makes when two files hold the item. So is one file declaring `category:` twice.
+
+**A missing source must not wedge the unit**, so the bind carries systemd's `-`
+prefix:
+
+```
+BindReadOnlyPaths=-/var/lib/docker/volumes/.../definitions/tracker-2b.md:/var/lib/homehub-weight/definitions/tracker-2b.md
+```
+
+Measured on systemd 255: **without** the `-`, a source that has been renamed
+away fails the unit at `226/NAMESPACE` *before the feeder runs*, and the timer
+repeats that every fifteen minutes with nothing in the journal about why.
+**With** it, the mount is skipped, the feeder runs, and the person gets the
+feeder's own named refusal naming the item and the category. Note honestly what
+that path still is: `GoalMissing` exits **2**, so the unit is still recorded as
+failed — but it is a *diagnosed* failure from the feeder's own mouth, on its
+existing tested "no goal ⇒ nothing posted" path, not an undiagnosed namespace
+error. If no file declares the category at provisioning time, no bind line is
+written at all, `setup-weight.sh` says so loudly and exits **0**: a tracker that
+has not synced yet is a normal state at firstboot and must not stop it.
+
+**`EnvironmentFile=`, not `Environment=` — and that ordering was measured, not
+assumed.** The obvious construction does not work. On systemd 255,
+`EnvironmentFile=` assignments are applied **after every `Environment=`
+assignment, regardless of order**: an `Environment=WEIGHT_DEFINITIONS_DIR=…` in
+the drop-in *loses* to the unit's `EnvironmentFile=/opt/homehub/stack/.env`,
+even though drop-ins are parsed later, and even with both lines in one file and
+the `Environment=` second. All four orders were run. Two `EnvironmentFile=`
+lines, though, **are** applied in parse order with the last one winning, and
+drop-ins are parsed after the unit. So the override is a file —
+`homehub-weight.service.d/20-definitions.env`, holding one line — and
+`10-account.conf` points `EnvironmentFile=` at it. (systemd reads only `*.conf`
+as drop-ins, so the `.env` sitting beside it is inert.)
+
+**A stale inode is not a concern here, and the oneshot shape is why.** The
+tracker replaces the whole `definitions` directory on every sync, so a
+long-lived process would be holding a retired inode. This unit's namespace is
+torn down and rebuilt on **every timer tick**, so each run resolves the bind
+against whatever is there now.
+
+**The mount target is root-owned.** `/var/lib/homehub-weight/definitions` is
+`root:root 0755` inside the account's own `StateDirectory` — the account must
+**read** what is mounted there and must never be able to drop a file of its own
+beside it and have the feeder read that as the household's goal. systemd creates
+a missing bind destination and leaves it behind as an empty file, so
+`setup-weight.sh` sweeps stale `*.md` stubs out of that directory before it
+writes the drop-in.
+
 ### It used to be a top-level `weight_goal_lb` key. That was changed on 2026-09-09.
 
 The first version put the goal in a top-level frontmatter key and *deliberately
@@ -578,8 +677,9 @@ the next tool putting its token somewhere new. Backed by three lines:
 
 1. the allow-list itself;
 2. the unit mounts the home `ProtectHome=read-only` — deliberately not `yes`, the
-   feeder must still **read** the token — and binds the definitions directory
-   `BindReadOnlyPaths=`;
+   feeder must still **read** the token — and binds ONE definitions file
+   `BindReadOnlyPaths=` read-only, never the directory (see "The service sees
+   ONE definitions file");
 3. a test runs a whole cycle inside a throwaway HOME holding a real-shaped
    refresh-token file and fails if **any byte under it changed**, if more than
    one file was written, or if the written file contains the token.
@@ -680,7 +780,7 @@ be carriage for a container that does not exist.
 | `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk). No parser, and no writing door the feeder shares |
 | `homehub-weight.service` | oneshot unit, hardened, `ProtectHome=read-only` |
 | `homehub-weight.timer` | 15 min, justified against the `static` horizon |
-| `setup-weight.sh` | idempotent install; refuses rather than guessing |
+| `setup-weight.sh` | idempotent install; resolves the ONE category file by frontmatter and generates the drop-in; refuses rather than guessing |
 | `../../tests/test_weight_feeder.py` | TC-006 |
 | `../../tests/test_weight_oauth.py` | TC-006 - the no-leak and credential-guard properties of the two tools above |
 

@@ -621,6 +621,20 @@ which is far worse, and a `window` would drag `direction` in with it.
 
 ---
 
+**2026-09-09 (later still) B11's deployment blocker is FIXED IN SOURCE, NOT YET
+DEPLOYED.** On the hub the feeder could not read the goal: the drop-in bound the
+definitions DIRECTORY at its own path, and that directory is `drwx------ hub hub`
+under root-only ancestors. `setup-weight.sh` now resolves WHICH `.md` declares
+`WEIGHT_ITEM_CATEGORY` by reading its frontmatter (never by guessing a filename)
+and binds THAT ONE FILE read-only into the account's `StateDirectory`, with the
+service's `WEIGHT_DEFINITIONS_DIR` overridden by a generated `EnvironmentFile=` -
+`Environment=` does NOT win over the unit's `EnvironmentFile=`, measured on
+systemd 255. Scope is the reason as much as the mechanism: the volume holds every
+household member's tracker data. See the audit entry at the end of this file for
+the deploy order the coordinator owes.
+
+---
+
 **2026-09-09 the weight feeder (B11, SR-022/LLR-006/TC-006/IF-014) — PARTIAL,
 and the blocked half is a finding, not a gap.** The hub gains a third plain
 service — no container, on a 15-minute timer — that posts one body-weight gauge
@@ -7362,3 +7376,133 @@ auto-check-off was **not** built - the parser only stops throwing away what such
 a caller would need. The `filter` query parameter (`GOOGLE_HEALTH_FILTER`) is
 still an unused constant: adding an unexercised query parameter to the single
 request shape that is KNOWN to work is the bet this gate exists to refuse.
+
+## Audit - 2026-09-09 (later still) B11 - scoped definitions read access (`IceDrive-DesktopDirection`, local only)
+
+**THE FEEDER COULD NOT READ THE GOAL ON THE HUB, AND THE FIX IS A NARROWER
+MOUNT, NOT A WIDER ONE.** `setup-weight.sh` wrote
+`BindReadOnlyPaths=$WEIGHT_DEFINITIONS_DIR` - the definitions directory, mounted
+at its own path. Established empirically on the hub with `systemd-run` as the
+real service account, and not re-derived here:
+
+| what was bound | result |
+|---|---|
+| the definitions directory, at the same path | **NOT-READABLE** |
+| the definitions directory, at a target the account owns | **NOT-READABLE** |
+| the one category **file** (0644), into the account's `StateDirectory` | **READABLE**, `touch` denied |
+
+The directory is `drwx------ hub hub`, and its ancestors are root-only
+(`/var/lib/docker` is `drwx--x---`, nothing for "other"), so no mount target
+rescues a directory bind. `setfacl` is **not installed** - installing it would
+add an apt package name and owe the §5 apt-export re-run - and an ACL would be
+**destroyed on the next sync** anyway, because NagLight's
+`internal/store/definitions.go` applies definitions by `os.MkdirTemp` + populate
++ **rename into place**, replacing the `definitions` inode wholesale.
+
+**SCOPE IS THE REASON, NOT THE WORKAROUND.** The volume holds **every** household
+member's tracker data. A gauge about one person's body must not hand a service
+account read access to all of it. The drop-in now exposes exactly one file:
+
+```
+BindReadOnlyPaths=-<the category file>:/var/lib/homehub-weight/definitions/<its name>
+```
+
+**WHICH FILE IS OBSERVED, NEVER DERIVED.** `setup-weight.sh` runs as root, can
+read the directory, and finds the `.md` whose **top-level** `category:` matches
+`WEIGHT_ITEM_CATEGORY` - trimmed and case-folded, with the same `clean_scalar`
+quote/`# comment` handling `find_goal_item` uses. It does **not** lowercase
+`Health` into `health.md`: that slug rule lives in NagLight and can change
+without telling us, and this build's standing lesson is to observe rather than
+infer. The test tree is booby-trapped both ways round (the file carrying
+category `Health` is `tracker-2b.md`, and a `health.md` exists declaring
+something else), so a guessing script binds another member's tracker and reports
+success. Only the frontmatter counts, and only column zero - a `category:` under
+`items:` is an item field, one in the prose body is a person thinking out loud.
+**Two files declaring the category is REFUSED**, and so is one file declaring
+`category:` twice: the same "which one is authoritative is not guessable" the
+feeder already applies.
+
+**THE ORDERING WAS MEASURED, AND THE OBVIOUS CONSTRUCTION IS WRONG.** The task
+proposed `EnvironmentFile=` supplying the source value and a drop-in
+`Environment=` overriding it. Run on real systemd 255 (WSL Ubuntu on the dev PC;
+no hub state touched), **`EnvironmentFile=` assignments are applied AFTER every
+`Environment=` assignment regardless of order** - all four orders were run, and
+`Environment=` lost in every one, including the drop-in case and the
+same-file-Environment-second case. Two `EnvironmentFile=` lines **are** applied
+in parse order, last wins, and drop-ins parse after the unit. So the override is
+a generated file, `homehub-weight.service.d/20-definitions.env`, and
+`10-account.conf` points `EnvironmentFile=` at it. A test fails if anyone
+"simplifies" it back to `Environment=`.
+
+**A MISSING SOURCE MUST NOT WEDGE THE UNIT**, so the bind carries systemd's `-`
+prefix. Measured on 255: without it, a renamed-away source fails the unit at
+**226/NAMESPACE** before the feeder runs, repeating every fifteen minutes with
+nothing in the journal about why; with it the mount is skipped and the feeder
+reaches its own named refusal. **Recorded honestly:** that path is `GoalMissing`,
+which exits **2**, so the unit is still recorded failed - but it is a diagnosed
+failure naming the item and the category, on the existing tested "no goal ⇒
+nothing posted" path, not an undiagnosed namespace error. Changing that exit code
+would weaken one of the two distinct refusals and was not done. If **no** file
+declares the category at provisioning time, no bind line is written,
+`setup-weight.sh` warns loudly and exits **0** - an unsynced tracker is a normal
+state at firstboot and must not stop it.
+
+**STALE INODES DO NOT APPLY, AND THE ONESHOT SHAPE IS WHY.** The tracker replaces
+the whole `definitions` directory on each sync; this unit's namespace is torn
+down and rebuilt on every timer tick, so each run resolves the bind against
+whatever is there now. Recorded in the unit and in the README so the next reader
+does not re-open it.
+
+**A MEASURED SIDE EFFECT, HANDLED.** systemd creates a missing bind destination
+and **leaves it behind as an empty file on disk**. So `setup-weight.sh` sweeps
+stale `*.md` out of `/var/lib/homehub-weight/definitions` before writing the
+drop-in, and creates that directory `root:root 0755` inside the account's own
+`StateDirectory` - the account must READ what is mounted there and must never be
+able to drop a file of its own beside it and have the feeder read that as the
+household's goal.
+
+**END-TO-END ON REAL SYSTEMD, not only in unit tests.** The generated drop-in was
+dropped beside the shipped unit on WSL systemd 255, with the definitions
+directory in the hub's real shape (0700, owned by another account, under a
+0710 parent) and a second member's tracker beside the goal file. As the service
+account: `WEIGHT_DEFINITIONS_DIR=/var/lib/homehub-weight/definitions`, the host
+directory unreachable, **only** `tracker-2b.md` listed, `target: 170` readable,
+write denied (`Read-only file system`). With the source deleted, the unit's
+namespace still came up and only an empty stub was visible.
+
+**Evidence.** `python scripts/check.py` **694 passed / 6 skipped** (baseline 676/6
+at `9c017d2`), RESULT: PASS; `trace.py --strict-integrity` integrity 0, orphans
+24 = baseline; `check_flows.py --no-placeholders` OK; `stack/run-hermetic-tests.sh`
+**UNRUN** on this dev PC (missing zstd/rsync), as before. **18 mutants, 18
+killed - but only after a second round.** The first 14 all died on the first
+pass, which this build has learned to distrust, so a second set was aimed at
+what the first set could not reach and produced **four survivors, every one a
+TEST defect**: the .env-file read path (every test handed the script its knobs
+through the process environment with `WEIGHT_ENV_FILE=/nonexistent`, which is
+NOT how firstboot runs it - dropping `WEIGHT_ITEM_CATEGORY` from the keys the
+script reads out of `stack/.env` left the whole suite green while a household
+that had moved its goal would silently get `Health`), the two install-path
+hardening lines (root-owned mount target, stale-stub sweep), and the
+`--emit-dropin` argument guard. Tests added for all four; all now killed. Two
+checks are carried by a helper rather than by the test that names them:
+`_one_bind` asserts both "exactly one bind" and the `-` prefix, so several
+tests go red for M3/M4, and the install-path test is a TEXT assertion (that
+code runs only as root on the hub) - labelled as weaker in its own docstring
+rather than dressed up.
+
+**Not done here.** No push, no hub state touched, no deploy, no new apt package,
+no new knob (`WEIGHT_ITEM_CATEGORY` already shipped in `.env.example`). The
+dedicated unprivileged account, the generated account drop-in,
+`ProtectHome=read-only`, `ProtectSystem=strict`, the credential write guard, the
+no-leak property, the freshness invariant, the parser and its unit conversion,
+the depth-aware definitions reader and the two distinct refusals are all
+unchanged, and the drop-in still derives `User=`/`Group=` from the knob.
+
+**Owed to the coordinator.** `/opt/homehub` is not git and lags the repos, so the
+deploy is: copy `stack/weight/setup-weight.sh` and
+`stack/weight/homehub-weight.service` to the hub, then run
+`sudo bash /opt/homehub/stack/weight/setup-weight.sh` (it rewrites the unit, the
+drop-in and the override, and reloads), then `systemctl start
+homehub-weight.service` once and read the journal. The script prints which file
+it resolved; if it prints the WARNING instead, the category file has not synced
+and nothing is bound yet.

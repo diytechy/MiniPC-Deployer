@@ -2442,3 +2442,464 @@ def test_no_path_through_the_new_parser_can_fabricate_a_reading_sr022():
     body, fresh = feeder.build_post(None, None, GOAL, NOW)
     assert fresh is False and body["value"] == 0.0
     assert "observed_at" not in body
+
+
+# ===========================================================================
+# B11 — SCOPED DEFINITIONS READ ACCESS (the deployment blocker, 2026-09-09)
+# ===========================================================================
+# THE BLOCKER, measured on the hub with `systemd-run` as the real service
+# account, and NOT re-derived here:
+#
+#   * the definitions directory is `drwx------ hub hub`, and its ancestors are
+#     root-only (`/var/lib/docker` is `drwx--x---`, nothing for "other"), so
+#     `BindReadOnlyPaths=<dir>` at the SAME path leaves the account unable to
+#     traverse to it: NOT-READABLE;
+#   * binding that directory to a target the account owns is ALSO
+#     NOT-READABLE - the 0700 directory is the blocker, not the target;
+#   * binding the single category FILE (0644) to a target inside the account's
+#     StateDirectory is READABLE, and `touch` on it is denied.
+#
+# `setfacl` is not installed and an ACL would not survive anyway: NagLight
+# applies definitions by MkdirTemp + populate + rename-into-place, so the
+# `definitions` inode is replaced wholesale on every sync.
+#
+# SCOPE IS THE REASON, not merely the workaround. The volume holds EVERY
+# household member's tracker data; a single-user gauge must not hand this
+# service account read access to all of it. These tests assert the shape that
+# is both the safe one and the one that works.
+
+SETUP_WEIGHT = REPO / "stack" / "weight" / "setup-weight.sh"
+UNIT_PATH = REPO / "stack" / "weight" / "homehub-weight.service"
+MOUNT_DIR = "/var/lib/homehub-weight/definitions"
+
+_HAVE_BASH = bool(os.environ.get("SHELL")) or Path(
+    "C:/Program Files/Git/bin/bash.exe").exists()
+needs_bash = pytest.mark.skipif(not _HAVE_BASH, reason="needs bash")
+
+HEALTH_DEFS = (
+    "---\n"
+    "category: Health\n"
+    "color_weight: 1.5\n"
+    "items:\n"
+    "  - id: weigh-in\n"
+    "    title: Step on the scale\n"
+    "    target: 170\n"
+    "    unit: lb\n"
+    "---\n"
+    "\n"
+    "Free notes live down here.\n"
+)
+
+
+def _emit_dropin(tmp_path, files, category=None, account=None):
+    """Run the REAL setup-weight.sh drop-in generator over a definitions tree.
+
+    Returns (CompletedProcess, dropin_dir). Nothing is grepped out of the
+    script itself: what is asserted is what the script WROTE, which is the V2
+    lesson applied to the bind as well as to the account.
+    """
+    import subprocess
+
+    defs_dir = tmp_path / "definitions"
+    defs_dir.mkdir(exist_ok=True)
+    for name, body in files.items():
+        (defs_dir / name).write_text(body, encoding="utf-8")
+    out = tmp_path / "dropin"
+    env = dict(
+        os.environ,
+        WEIGHT_ENV_FILE="/nonexistent",     # never read the developer's .env
+        WEIGHT_ENABLED="true",
+        WEIGHT_USER="sub-not-a-real-google-id",
+        WEIGHT_FEED_URL="http://127.0.0.1:8099/api/v1/gauges",
+        WEIGHT_DEFINITIONS_DIR=str(defs_dir),
+        WEIGHT_USER_ACCOUNT=account or "homehub-weight",
+    )
+    if category is not None:
+        env["WEIGHT_ITEM_CATEGORY"] = category
+    proc = subprocess.run(
+        ["bash", str(SETUP_WEIGHT), "--emit-dropin", str(out)],
+        env=env, capture_output=True, text=True)
+    return proc, out
+
+
+def _bind_lines(dropin_dir):
+    conf = (dropin_dir / "10-account.conf").read_text(encoding="utf-8")
+    return [l for l in conf.splitlines() if l.startswith("BindReadOnlyPaths=")]
+
+
+def _one_bind(dropin_dir):
+    """The (source, target) of the single bind, refusing to guess if there are
+    two - a test that quietly took the first would be the same defect it is
+    here to catch."""
+    lines = _bind_lines(dropin_dir)
+    assert len(lines) == 1, "expected exactly one bind, got %r" % (lines,)
+    spec = lines[0].split("=", 1)[1]
+    assert spec.startswith("-"), (
+        "the bind must carry systemd's `-` prefix: without it a category file "
+        "that has been renamed away fails the unit at 226/NAMESPACE every "
+        "fifteen minutes. Got %r" % spec)
+    source, target = spec[1:].rsplit(":", 1)
+    return source, target
+
+
+class TestScopedDefinitionsBind:
+    """The drop-in exposes ONE definitions file, resolved by reading it."""
+
+    @needs_bash
+    def test_the_file_is_found_by_frontmatter_not_by_its_name_sr022(self, tmp_path):
+        """THE DEFECT THIS FORBIDS: deriving `health.md` from `Health`.
+
+        The filename is NagLight's slug rule, which lives in another repo and
+        can change without telling us; the `category:` in the frontmatter is
+        the thing the feeder itself matches on. So the tree here is booby
+        trapped both ways round - the file that CARRIES category `Health` is
+        called `tracker-2b.md`, and there IS a `health.md`, declaring something
+        else entirely. A script that lowercased the category would bind the
+        wrong member's tracker and say nothing about it.
+        """
+        proc, out = _emit_dropin(tmp_path, {
+            "tracker-2b.md": HEALTH_DEFS,
+            "health.md": "---\ncategory: Chores\nitems:\n  - id: bins\n---\n",
+        })
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        source, target = _one_bind(out)
+        assert Path(source).name == "tracker-2b.md", source
+        assert Path(source).name != "health.md"
+        assert target == MOUNT_DIR + "/tracker-2b.md", target
+
+    @needs_bash
+    def test_the_resolved_file_is_the_one_the_feeder_then_reads_sr022(self, tmp_path):
+        """AN ORACLE, not a restatement. The shell resolves a file; the FEEDER
+        is then pointed at a directory holding only that file and must find the
+        goal in it. If the two ever disagree about what `category:` means -
+        trimming, case, quoting, a `# comment`, depth - this fails, and no
+        amount of agreement between the shell and its own test would save it.
+        """
+        proc, out = _emit_dropin(tmp_path, {
+            "tracker-2b.md": HEALTH_DEFS,
+            "zz-other-member.md": "---\ncategory: Chores\nitems:\n  - id: bins\n---\n",
+        })
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        source, target = _one_bind(out)
+        # What the SERVICE sees: a directory holding only the bound file, under
+        # the name the bind gives it.
+        mounted = tmp_path / "mounted"
+        mounted.mkdir()
+        (mounted / Path(target).name).write_text(
+            Path(source).read_text(encoding="utf-8"), encoding="utf-8")
+        goal, where = feeder.load_goal_from_definitions(str(mounted))
+        assert goal == DEFS_GOAL
+        assert Path(where).name == Path(target).name
+
+    @needs_bash
+    def test_two_files_declaring_the_category_are_refused_sr022(self, tmp_path):
+        """REFUSED, NEVER PICKED. Two files under one category means the goal
+        could be in either, and binding one would silently follow directory
+        order - the same refusal the feeder makes when two files hold the item.
+        """
+        proc, out = _emit_dropin(tmp_path, {
+            "a-tracker.md": HEALTH_DEFS,
+            "b-tracker.md": HEALTH_DEFS,
+        })
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert "REFUSED" in proc.stdout
+        # BOTH are named: "one of your files is ambiguous" is not actionable.
+        assert "a-tracker.md" in proc.stdout and "b-tracker.md" in proc.stdout
+        # And nothing was written, so a refusal cannot leave a half-made bind.
+        assert not (out / "10-account.conf").exists()
+
+    @needs_bash
+    def test_one_file_declaring_the_category_twice_is_refused_sr022(self, tmp_path):
+        """Same rule inside one file: which category the file IS is not
+        guessable, and weight_feeder.one_value refuses it too."""
+        proc, out = _emit_dropin(tmp_path, {
+            "tracker.md": "---\ncategory: Health\ncategory: Chores\n---\n",
+        })
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert "tracker.md" in proc.stdout
+
+    @needs_bash
+    def test_no_matching_file_binds_nothing_and_is_not_a_failure_sr022(self, tmp_path):
+        """A NOT-YET-SYNCED TRACKER MUST NOT WEDGE PROVISIONING. A renamed
+        category or a tracker that has not synced yet is a normal state at
+        firstboot: the drop-in is written with NO bind, the feeder sees an
+        empty definitions directory and takes its existing "no goal, nothing
+        posted" path, and setup exits 0 so firstboot carries on.
+        """
+        proc, out = _emit_dropin(tmp_path, {
+            "zz-other-member.md": "---\ncategory: Chores\nitems:\n  - id: bins\n---\n",
+        })
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert _bind_lines(out) == []
+        assert "WARNING" in proc.stdout, (
+            "a box that binds nothing must SAY so; a silent no-op is how a "
+            "dark gauge becomes an unexplained one")
+        # The override still ships, so the service looks at the (empty) mount
+        # target rather than at a host path it cannot traverse to.
+        env = (out / "20-definitions.env").read_text(encoding="utf-8")
+        assert "WEIGHT_DEFINITIONS_DIR=%s\n" % MOUNT_DIR in env
+
+    @needs_bash
+    def test_the_missing_source_is_tolerated_by_the_dash_prefix_sr022(self, tmp_path):
+        """The `-` is asserted on the line itself, because the failure it
+        prevents is invisible until the hub: measured on systemd 255, a bind
+        with no `-` and a missing source fails the unit at 226/NAMESPACE before
+        the feeder ever runs, and the timer repeats that every fifteen minutes
+        with no diagnosis. `_one_bind` refuses a spec without it."""
+        proc, out = _emit_dropin(tmp_path, {"tracker-2b.md": HEALTH_DEFS})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert _bind_lines(out)[0].startswith("BindReadOnlyPaths=-")
+
+    @needs_bash
+    def test_only_the_one_file_is_exposed_not_the_household_sr022(self, tmp_path):
+        """SCOPE IS THE POINT. The definitions directory is one member's
+        subtree of a volume holding every member's tracker data. Exactly one
+        bind, and the DIRECTORY must appear nowhere in the drop-in - binding it
+        would hand this account read access to all of it (and would not work
+        anyway: it is 0700 under root-only ancestors).
+        """
+        defs_files = {
+            "tracker-2b.md": HEALTH_DEFS,
+            "m2-chores.md": "---\ncategory: Chores\nitems:\n  - id: bins\n---\n",
+            "m3-reading.md": "---\ncategory: Reading\nitems:\n  - id: pages\n---\n",
+        }
+        proc, out = _emit_dropin(tmp_path, defs_files)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        source, _target = _one_bind(out)
+        conf = (out / "10-account.conf").read_text(encoding="utf-8")
+        defs_dir = str(tmp_path / "definitions")
+        for line in conf.splitlines():
+            if not line.startswith("BindReadOnlyPaths="):
+                continue
+            spec = line.split("=", 1)[1].lstrip("-")
+            assert spec.rsplit(":", 1)[0] != defs_dir, (
+                "the whole definitions directory is bound: %r" % line)
+        for name in ("m2-chores.md", "m3-reading.md"):
+            assert name not in conf, (
+                "%s is another household member's tracker and must not be "
+                "reachable by this account" % name)
+        assert Path(source).name == "tracker-2b.md"
+
+    @needs_bash
+    def test_a_nested_category_does_not_choose_the_file_sr022(self, tmp_path):
+        """DEPTH IS THE STRUCTURE, in the shell reader as in the python one. A
+        `category:` indented under `items:` is a field of an ITEM; reading it
+        as the file's category is the depth-blind defect the feeder's own
+        reader was rewritten to stop making, and it would bind a file that
+        declares something else entirely."""
+        proc, out = _emit_dropin(tmp_path, {
+            "tracker.md": ("---\ncategory: Chores\nitems:\n"
+                           "  - id: q\n    category: Health\n---\n"),
+        })
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert _bind_lines(out) == []
+
+    @needs_bash
+    def test_a_prose_category_does_not_choose_the_file_sr022(self, tmp_path):
+        """Only the frontmatter counts - the lines between the first two `---`
+        fences. A `category:` in the free notes below is a person thinking out
+        loud, which is exactly the line internal/defs draws."""
+        proc, out = _emit_dropin(tmp_path, {
+            "tracker.md": "---\ncategory: Chores\n---\n\ncategory: Health\n",
+        })
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert _bind_lines(out) == []
+
+    @needs_bash
+    def test_the_category_match_is_trimmed_and_case_insensitive_sr022(self, tmp_path):
+        """Both halves are typed by a person into a spreadsheet cell, and the
+        feeder matches them trimmed and case-folded. If this script were
+        stricter it would bind nothing where the feeder would have found the
+        goal, and the panel would go dark for a difference in capitals."""
+        proc, out = _emit_dropin(
+            tmp_path, {"tracker.md": '---\ncategory:   "health"   \n---\n'},
+            category="  HEALTH ")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        source, _ = _one_bind(out)
+        assert Path(source).name == "tracker.md"
+
+
+class TestDefinitionsPathOverride:
+    """What the SERVICE sees for WEIGHT_DEFINITIONS_DIR, and how it wins."""
+
+    @needs_bash
+    def test_the_override_is_an_environment_file_not_an_environment_line_sr022(
+            self, tmp_path):
+        """MEASURED, NOT ASSUMED - and the obvious way round does not work.
+
+        On systemd 255, `EnvironmentFile=` assignments are applied AFTER every
+        `Environment=` assignment REGARDLESS OF ORDER. An
+        `Environment=WEIGHT_DEFINITIONS_DIR=...` in this drop-in LOSES to the
+        unit's `EnvironmentFile=/opt/homehub/stack/.env`, even though drop-ins
+        are parsed later, and even with both lines in one file and the
+        `Environment=` second (all four orders were run). Two
+        `EnvironmentFile=` lines ARE applied in parse order with the last one
+        winning, and drop-ins are parsed after the unit - so the override has
+        to be a FILE, and this test fails if anyone "simplifies" it back.
+        """
+        proc, out = _emit_dropin(tmp_path, {"tracker-2b.md": HEALTH_DEFS})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        conf = (out / "10-account.conf").read_text(encoding="utf-8")
+        assert "Environment=WEIGHT_DEFINITIONS_DIR" not in conf, (
+            "an Environment= line here loses to the unit's EnvironmentFile=, "
+            "measured on systemd 255 - the service would look at the host "
+            "path it cannot traverse to")
+        override = out / "20-definitions.env"
+        pointed = [l.split("=", 1)[1] for l in conf.splitlines()
+                   if l.startswith("EnvironmentFile=")]
+        assert len(pointed) == 1, conf
+        # Compared as a PATH, not as a string: bash writes back the directory
+        # it was handed, so on Windows the separators come out mixed and a
+        # string compare would pass or fail for the wrong reason.
+        assert os.path.normcase(os.path.normpath(pointed[0])) == \
+            os.path.normcase(os.path.normpath(str(override)))
+        assert override.read_text(encoding="utf-8").strip().endswith(
+            "WEIGHT_DEFINITIONS_DIR=%s" % MOUNT_DIR)
+
+    @needs_bash
+    def test_the_service_is_pointed_at_the_mount_target_not_the_host_path_sr022(
+            self, tmp_path):
+        """The host path in .env is where the file IS; the mount target is
+        where the SERVICE can reach it. Pointing the service at the host path
+        is the blocker this block exists to fix."""
+        proc, out = _emit_dropin(tmp_path, {"tracker-2b.md": HEALTH_DEFS})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        _source, target = _one_bind(out)
+        value = [l.split("=", 1)[1]
+                 for l in (out / "20-definitions.env").read_text(
+                     encoding="utf-8").splitlines()
+                 if l.startswith("WEIGHT_DEFINITIONS_DIR=")]
+        assert value == [MOUNT_DIR], value
+        assert str(tmp_path) not in value[0], (
+            "the service was pointed at the host definitions directory")
+        # The bind must land INSIDE the directory the service is told to read.
+        assert target.rsplit("/", 1)[0] == value[0]
+
+    def test_the_mount_target_is_inside_the_units_state_directory_sr022(self):
+        """A bound that the .env cannot move. The target must sit under the
+        unit's own `StateDirectory=` - the same directory the credential write
+        guard is bounded by - so "somewhere the account can reach" cannot drift
+        into "somewhere a knob chose"."""
+        unit = UNIT_PATH.read_text(encoding="utf-8")
+        state = [l.split("=", 1)[1].strip() for l in unit.splitlines()
+                 if l.startswith("StateDirectory=")]
+        assert state, "the unit declares no StateDirectory="
+        assert MOUNT_DIR.startswith("/var/lib/%s/" % state[0]), (
+            "the mount target %s is not inside StateDirectory=%s"
+            % (MOUNT_DIR, state[0]))
+        script = SETUP_WEIGHT.read_text(encoding="utf-8")
+        assert "WEIGHT_STATE_DIR=/var/lib/%s\n" % state[0] in script, (
+            "setup-weight.sh and the unit disagree about the state directory")
+
+    def test_the_setup_scripts_category_default_is_the_feeders_sr022(self):
+        """A setup script resolving a DIFFERENT category from the one the
+        feeder looks for would bind the wrong file and report success."""
+        script = SETUP_WEIGHT.read_text(encoding="utf-8")
+        assert ('WEIGHT_ITEM_CATEGORY="${WEIGHT_ITEM_CATEGORY:-%s}"'
+                % feeder.DEFAULT_GOAL_CATEGORY) in script
+
+    @needs_bash
+    def test_the_account_is_still_written_from_the_knob_sr019(self, tmp_path):
+        """Carried over, and re-asserted here because this block rewrote the
+        drop-in generator: the account certified and the account systemd runs
+        must still be one value."""
+        proc, out = _emit_dropin(tmp_path, {"tracker-2b.md": HEALTH_DEFS},
+                                 account="homehub-weight-alt")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        conf = (out / "10-account.conf").read_text(encoding="utf-8")
+        assert "User=homehub-weight-alt" in conf
+        assert "Group=homehub-weight-alt" in conf
+
+
+class TestTheKnobsReachTheDropIn:
+    """THE PATH PRODUCTION ACTUALLY USES, which the first pass of these tests
+    did not touch at all.
+
+    Written after a mutation survivor. Every test above hands the script its
+    knobs through the PROCESS environment with `WEIGHT_ENV_FILE=/nonexistent`,
+    which is convenient and is not how the hub runs it: firstboot calls
+    `setup-weight.sh` with nothing exported, and the script reads
+    `stack/.env` itself. Deleting `WEIGHT_ITEM_CATEGORY` from the list of keys
+    it reads out of that file left the whole suite green while a household that
+    had moved its goal to another category would silently get `Health` - the
+    wrong member's file bound, or none, and a dark gauge with no explanation.
+    """
+
+    @needs_bash
+    def test_the_category_and_the_path_are_read_from_the_env_file_sr022(
+            self, tmp_path):
+        import subprocess
+
+        defs_dir = tmp_path / "definitions"
+        defs_dir.mkdir()
+        (defs_dir / "tracker-2b.md").write_text(HEALTH_DEFS, encoding="utf-8")
+        (defs_dir / "wellness-notes.md").write_text(
+            "---\ncategory: Wellness\nitems:\n  - id: weigh-in\n"
+            "    target: 170\n    unit: lb\n---\n", encoding="utf-8")
+        env_file = tmp_path / "dot.env"
+        env_file.write_text(
+            "WEIGHT_ENABLED=true\n"
+            "WEIGHT_USER=sub-not-a-real-google-id\n"
+            "WEIGHT_FEED_URL=http://127.0.0.1:8099/api/v1/gauges\n"
+            "WEIGHT_DEFINITIONS_DIR=%s\n"
+            "WEIGHT_ITEM_CATEGORY=Wellness\n" % defs_dir, encoding="utf-8")
+        out = tmp_path / "dropin"
+        # NOTHING is exported: every knob has to come out of the file, which is
+        # exactly what firstboot does.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("WEIGHT_")}
+        env["WEIGHT_ENV_FILE"] = str(env_file)
+        proc = subprocess.run(
+            ["bash", str(SETUP_WEIGHT), "--emit-dropin", str(out)],
+            env=env, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        source, _target = _one_bind(out)
+        assert Path(source).name == "wellness-notes.md", (
+            "WEIGHT_ITEM_CATEGORY in the .env was ignored, so the goal's "
+            "category is whatever this script defaults to: %s" % proc.stdout)
+
+    @needs_bash
+    def test_emit_dropin_without_a_directory_refuses_sr022(self):
+        """It writes files; being handed no path must be a refusal and not a
+        pair of files somewhere nobody asked for."""
+        import subprocess
+
+        proc = subprocess.run(
+            ["bash", str(SETUP_WEIGHT), "--emit-dropin"],
+            env=dict(os.environ, WEIGHT_ENV_FILE="/nonexistent",
+                     WEIGHT_ENABLED="true", WEIGHT_USER="sub",
+                     WEIGHT_FEED_URL="http://127.0.0.1:8099/x",
+                     WEIGHT_DEFINITIONS_DIR=str(REPO)),
+            capture_output=True, text=True)
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert "REFUSED" in proc.stdout
+
+    def test_the_install_path_hardens_the_mount_target_sr022(self):
+        """READ AS A TEXT ASSERTION, AND HERE IS WHY IT IS ONE. These two lines
+        run only as root on the hub, and neither this dev PC nor the pytest
+        suite can exercise them; `--emit-dropin` deliberately stops before
+        them. So this asserts the script's text, which is weaker than running
+        it, and is written down as weaker rather than dressed up.
+
+        What it holds:
+
+        * the mount target is created **root:root 0755** inside the account's
+          own StateDirectory. Not owned by the service account: the account
+          must READ what is mounted there and must never be able to drop a file
+          of its own beside it and have the feeder read that as the
+          household's goal.
+        * stale `*.md` are swept first. systemd CREATES a missing bind
+          destination and LEAVES IT BEHIND as an empty file (measured on
+          systemd 255), so a renamed category file leaves yesterday's stub
+          sitting there for good.
+        """
+        script = SETUP_WEIGHT.read_text(encoding="utf-8")
+        assert 'install -d -m 0755 -o root -g root "$WEIGHT_MOUNT_DIR"' in script, (
+            "the mount target must be root-owned; an account-owned one lets "
+            "the feeder's own account plant a definitions file")
+        assert 'rm -f "$WEIGHT_MOUNT_DIR"/*.md' in script, (
+            "stale bind-destination stubs are never swept")
+        # ...and the sweep must come BEFORE the drop-in is written, or a rename
+        # would leave the old stub beside the new bind for a whole run.
+        assert (script.index('rm -f "$WEIGHT_MOUNT_DIR"/*.md')
+                < script.index('emit_dropin "$DROPIN_DIR"'))

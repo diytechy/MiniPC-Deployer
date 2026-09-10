@@ -37,12 +37,32 @@ StateDirectory=homehub-weight
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/homehub-weight
 
-# THE DEFINITIONS ARE MOUNTED READ-ONLY, AND ONLY IF THEY WERE NAMED. The goal
-# lives in the user's definitions (SN-040), which are the tracker's data — this
-# feeder READS them and must never be able to write one. setup-weight.sh writes
-# the BindReadOnlyPaths= line into the drop-in from WEIGHT_DEFINITIONS_DIR, for
-# the same reason the account is written there: a path nobody read cannot
-# diverge from a unit nobody edited.
+# ONE DEFINITIONS FILE IS MOUNTED READ-ONLY, NEVER THE DIRECTORY. The goal
+# lives in the user's definitions (SN-040), which are the tracker's data - this
+# feeder READS them and must never be able to write one. setup-weight.sh
+# resolves WHICH file declares WEIGHT_ITEM_CATEGORY by reading frontmatter (the
+# filename is NagLight's slug rule, not ours to guess) and writes ONE
+# `BindReadOnlyPaths=-<that file>:/var/lib/homehub-weight/definitions/<name>`
+# line into the drop-in, plus an EnvironmentFile= that points
+# WEIGHT_DEFINITIONS_DIR at the mount target.
+#
+# WHY ONE FILE AND NOT THE DIRECTORY. The directory is one household member's
+# subtree of a volume holding EVERY member's tracker data; a single-user gauge
+# must not hand this account read access to all of it. It is also the only
+# shape that WORKS: the definitions directory is 0700 hub:hub under root-only
+# ancestors, so binding it at its own path leaves this account unable to
+# traverse to it (measured on the hub, 2026-09-09).
+#
+# THE LEADING `-` IS LOAD-BEARING. Without it a source that has been renamed
+# away fails the unit at 226/NAMESPACE before the feeder runs, every fifteen
+# minutes, with no diagnosis; with it the mount is skipped and the feeder makes
+# its own named "no goal" refusal instead.
+#
+# STALE INODES ARE NOT A CONCERN, and the oneshot shape is why. NagLight
+# applies definitions by MkdirTemp + populate + rename-into-place, so the
+# `definitions` directory is REPLACED wholesale on each sync. A long-lived
+# process would be holding the retired inode; this unit's namespace is torn
+# down and rebuilt on every timer tick, so each run resolves the path afresh.
 
 EnvironmentFile=/opt/homehub/stack/.env
 # --check re-runs the identity and destination refusals as their own process,

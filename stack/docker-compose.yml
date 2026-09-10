@@ -286,6 +286,15 @@ services:
       # profile, SR-012) not to look it up; every other image is watchable.
       - "diun.enable=false"
     environment:
+      # NagLight's `time.Now()` IS the day boundary for every item in the
+      # tracker — habits, todos, rollovers, streaks, catch-ups — and for the
+      # legacy `ok` check-off lane, which cannot back-date. Without this the
+      # container ran in UTC, so the day rolled at 19:00 local. Owner-approved
+      # 2026-09-10; see stack/weight/README.md and docs/status.md. Spelled
+      # ${TIMEZONE} rather than a literal zone so it cannot drift from the
+      # other services that already share that one value. NagLight's Dockerfile
+      # installs tzdata for exactly this.
+      TZ: ${TIMEZONE}
       DATA_DIR: /data
       # If set, the entrypoint clones this remote into /data on first boot and
       # `git pull --rebase` on subsequent boots (the "clone of the data repo").

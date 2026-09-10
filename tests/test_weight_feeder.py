@@ -29,6 +29,7 @@ import importlib.util
 import io
 import json
 import math
+import re
 import os
 import sys
 import time
@@ -3482,23 +3483,72 @@ def test_the_tick_is_stamped_by_naglights_clock_and_cannot_be_back_dated_sr022()
         The boolean path falls through to `date := s.Now()`.
       * `s.Now()` defaults to `todayString`, which is
         `time.Now().Format("2006-01-02")` — the TRACKER CONTAINER's local date.
-      * `stack/docker-compose.yml`'s `tracker:` service sets no `TZ:`, while
-        every other service that cares sets `TZ: ${TIMEZONE}`. So that date is
-        UTC today.
+      * `stack/docker-compose.yml`'s `tracker:` service now sets
+        `TZ: ${TIMEZONE}` (Owner-approved 2026-09-10), the same one value the
+        other services that care already share. So that date is the
+        HOUSEHOLD's today, not UTC today.
 
-    Consequence, for the captured shape: a weigh-in at 20:24 local on Monday is
-    01:24 UTC on Tuesday, so the tick lands on TUESDAY's log. This feeder
-    cannot fix that from here — the lane carries no back-dating — so it does
-    not send an `at` that would silently be dropped, and the residual
-    off-by-one is written down in stack/weight/README.md and docs/status.md for
-    the coordinator instead.
+    THIS ASSERTION WAS INVERTED, deliberately. It used to assert the tracker
+    had NO `TZ:` — a tripwire, so that whoever added one was sent to read
+    stack/weight/README.md first. That has now happened, so the tripwire is
+    re-pointed at the thing that can still silently rot: the tracker must
+    carry a TZ, and it must be spelled `${TIMEZONE}` rather than a literal
+    zone, because a literal would drift the moment the household's one value
+    changed and would put the tracker on a different day boundary from every
+    other service.
+
+    Consequence, for the captured shape: a weigh-in at 20:24 local on
+    2026-09-08 (01:24 UTC on 2026-09-09) now ticks 2026-09-08's log, because
+    the tracker's local date and the reading's own local frame agree when the
+    household's zone is the zone the reading was taken in. (Dates, not weekday
+    names: the older prose in stack/weight/README.md says Monday/Tuesday and
+    that is wrong - 2026-09-08 is a Tuesday - but the one-day SHIFT it is
+    describing is right.) The lane still carries NO back-dating,
+    so this feeder still does not send an `at` that would be silently dropped;
+    a reading whose own offset differs from the household's can still land a
+    day out, which is what gate 4 is for.
     """
     assert "at" not in feeder.check_body("weight")
     compose = (REPO / "stack" / "docker-compose.yml").read_text(encoding="utf-8")
+    # STRUCTURE FIRST, and this half is what actually decides the question: a
+    # `TZ:` anywhere in the tracker's block is NOT the same as a TZ the process
+    # is given. Under `labels:` it reaches nothing, and a text scan cannot tell
+    # the two apart — a mutation that moved the line into `labels:` survived
+    # the text assertions below until this was added.
+    try:
+        import yaml  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - PyYAML is present in this repo
+        yaml = None
+    if yaml is not None:
+        env = yaml.safe_load(compose)["services"]["tracker"]["environment"]
+        assert env.get("TZ") == "${TIMEZONE}", (
+            "the tracker's ENVIRONMENT must carry TZ: ${TIMEZONE} - NagLight "
+            "reads it from the process environment, so a TZ anywhere else in "
+            "the service block (labels, a comment) changes nothing; found %r"
+            % (env.get("TZ"),))
     tracker = compose[compose.index("\n  tracker:"):compose.index("\n  actual:")]
-    assert "TZ: ${TIMEZONE}" not in tracker, (
-        "if the tracker gains a TZ the day story changes and the README must "
-        "be revisited - that is the fix, and it is the coordinator's to make")
-    # The trap itself, restated on the numbers the capture proved.
+    # Guard the slice itself: if the anchors ever stop naming the real service
+    # block, everything below would pass or fail for the wrong reason.
+    assert "image: naglight:" in tracker and "container_name: tracker" in tracker
+    # The text half. Be honest about what it carries: on the tracker itself
+    # these two are CARRIED by the YAML check above whenever PyYAML is
+    # installed (it is, here), and are kept as the fallback for an environment
+    # without it. The `others` scan below is the one that is NOT carried.
+    # Only real assignments, never the prose in comments.
+    assigned = re.findall(r"(?m)^\s*TZ:[ \t]*(\S+)", tracker)
+    assert assigned, (
+        "the tracker MUST set TZ: NagLight's time.Now() is the day boundary "
+        "for every item in the tracker, and with no TZ the container runs in "
+        "UTC and rolls the day at 19:00 local")
+    assert assigned == ["${TIMEZONE}"], (
+        "the tracker's TZ must be spelled ${TIMEZONE}, not a hard-coded zone, "
+        "so it cannot drift from the services that already share that value; "
+        "found %r" % (assigned,))
+    # ...and that IS the same spelling the others use, not a lookalike.
+    others = re.findall(r"(?m)^\s*TZ:[ \t]*(\S+)", compose)
+    assert set(others) == {"${TIMEZONE}"} and len(others) >= 9, (
+        "every TZ in this compose file should be the one shared value; "
+        "found %r" % (sorted(set(others)),))
+    # The numbers the capture proved — now they AGREE rather than trapping.
     assert feeder.local_civil_date(CAPTURED_AT, -18000) == FIXTURE_CIVIL_DAY
     assert time.strftime("%Y-%m-%d", time.gmtime(CAPTURED_AT)) == FIXTURE_UTC_DAY

@@ -59,8 +59,11 @@ evening**; in UTC it is **Tuesday**.
 
 The check-off **is** built now — see *[The automated check-off](#the-automated-check-off-the-second-post)*
 below — and it uses `civil_date`, never `observed_at`. What that section also
-records is the half of the day problem this repo **cannot** fix: the lane the
-tick is posted on carries no back-dating at all.
+records is the *other* half of the day problem: the lane the tick is posted on
+carries no back-dating at all, so the tick is stamped with the **tracker's**
+today. Since **2026-09-10** the tracker runs in the household's zone
+(`TZ: ${TIMEZONE}`) rather than UTC, so for a reading taken here those two now
+agree — which also moved the day boundary for every other item in the tracker.
 
 ### What it does when it cannot read a weight
 
@@ -700,25 +703,48 @@ because `handleAPIFeed` decodes `Note` and then never reads it.
   falls through to `date := s.Now()`.
 * `s.Now()` defaults to `todayString` = `time.Now().Format("2006-01-02")` — the
   **tracker container's local date**.
-* `stack/docker-compose.yml`'s `tracker:` service sets **no `TZ:`**, while every
-  other service that cares sets `TZ: ${TIMEZONE}`. So that date is **UTC today**.
+* `stack/docker-compose.yml`'s `tracker:` service **now sets `TZ: ${TIMEZONE}`**
+  — the same one value the other services that care already share, and
+  `TIMEZONE=America/Chicago` in the hub's `.env`. So that date is the
+  **household's today**.
 
-So for the shape the capture proved — a weigh-in at **20:24 local on Monday**,
-which is **01:24 UTC on Tuesday** — the tick lands on **Tuesday's** log. Gate 4
-above stops the *large* errors (a three-day-old reading recovered after an
-outage is not ticked onto today at all), but it cannot stop this ≤1-day one:
-sending an `at` would be silently dropped, which is worse than not sending it,
-because it would look as though back-dating worked.
+**This changed on 2026-09-10, and it used to say the opposite.** Until then the
+`tracker:` service set no `TZ:` at all, so `time.Now()` in the container was
+**UTC** and the tick landed on the **UTC** day. For the shape the capture
+proved — a weigh-in at **20:24 local on 2026-09-08**, which is **01:24 UTC on
+2026-09-09** — the tick used to land on **2026-09-09's** log. With the
+household's zone applied it lands on **2026-09-08's**, which is the day the
+person actually stood on the scale. (The older passages above call these Monday
+and Tuesday; 2026-09-08 is in fact a Tuesday. The day *shift* is what those
+passages are about and it is right — only the weekday names are wrong, and they
+predate this change.)
 
-**The fix is not this feeder's to make.** Adding `TZ: ${TIMEZONE}` to the
-`tracker:` service would make `s.Now()` the household's local date and put
-evening weigh-ins on the right day — NagLight's own Dockerfile installs `tzdata`
-for exactly this ("correct local *today* for the nightly materialize"), so the
-missing `TZ:` looks like a pre-existing gap rather than a decision. But it moves
-the day boundary for **every** item in the tracker, not just this one, so it is
-a coordinator call and is written up in `docs/status.md` rather than slipped in
-here. A test asserts the `tracker:` block still has no `TZ:`, so whoever adds
-one is sent back to this section.
+**What is still true:** the lane carries **no back-dating**, so this feeder
+still sends no `at` — one would be silently dropped, which is worse than not
+sending it, because it would look as though back-dating had worked. The tick is
+therefore stamped with the *tracker's* today, not the reading's day. Those two
+now agree for a reading taken in the household's own zone; a reading whose
+`utcOffset` is some other zone's can still be a day out, and **gate 4** is what
+keeps that bounded (a three-day-old reading recovered after an outage is not
+ticked onto today at all).
+
+**The consequence is much wider than weight.** `s.Now()` is the day boundary for
+**every** item in the tracker — habits, todos, rollovers, streaks, catch-ups,
+the lot. Before this change they rolled over at **midnight UTC**, which is
+**19:00 local** in `America/Chicago`; afterwards they roll at **local
+midnight**. Anything the Owner ticked between 19:00 and midnight had been
+landing on the *next* day's log; from now on it lands on the day they ticked it.
+Historical logs are **not** rewritten — the boundary moves forward only, so the
+evening of the switchover is the seam. NagLight's own Dockerfile installs
+`tzdata` for exactly this ("correct local *today* for the nightly
+materialize"), so the missing `TZ:` was a pre-existing gap rather than a
+decision. Owner-approved 2026-09-10; written up in `docs/status.md`.
+
+A test still guards this line, inverted: it now asserts the `tracker:` block
+**does** carry a `TZ` and that it is spelled `${TIMEZONE}` rather than a
+hard-coded zone, so the tracker cannot drift onto a different day boundary from
+the services that share that value. Whoever changes it is sent back to this
+section.
 
 ### The two posts fail independently, and the gauge goes first
 

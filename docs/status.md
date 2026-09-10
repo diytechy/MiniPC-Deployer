@@ -20,10 +20,27 @@ whose civil date is today in the reading's own local frame; the source-failure
 re-post path can never tick, which is the whole point. There is **no
 `WEIGHT_CHECK_ENABLED` knob** and none is wanted: `type:`/`check:` in the
 person's own definitions are the declaration, so nothing is owed to
-`stack/.env.example` or to HomeHub's `FieldSchema.psd1`. **What the coordinator
-must decide is the DAY** — see the audit entry at the bottom of this file: the
-legacy `ok` lane cannot back-date, and the `tracker:` service carries no `TZ:`,
-so an evening weigh-in ticks the NEXT day's box. Gate remains G1.
+`stack/.env.example` or to HomeHub's `FieldSchema.psd1`. **The DAY question is
+now DECIDED and applied** — see the 2026-09-10 entry below and the next
+paragraph. Gate remains G1.
+
+**2026-09-10 — THE TRACKER NOW RUNS IN THE HOUSEHOLD'S TIMEZONE
+(Owner-approved). This moves the day boundary for EVERY item in the tracker, not
+just weight.** `stack/docker-compose.yml`'s `tracker:` service gained
+`TZ: ${TIMEZONE}` (`TIMEZONE=America/Chicago` is already in the hub's `.env`).
+NagLight's `time.Now()` — which is what `s.Now()`, the nightly materialize and
+the legacy `ok` check-off lane all resolve "today" through — was running in
+**UTC**, because that one service was the only one that cares and never got a
+`TZ:` while eight others already had one. So **habits, todos, rollovers,
+streaks and catch-ups all rolled over at midnight UTC = 19:00 local**; anything
+the Owner ticked between 19:00 and midnight was landing on the **next** day's
+log. From now on they roll at **local midnight**. Nothing historical is
+rewritten — the boundary moves forward only, so the evening of the restart is
+the seam. **NOT YET DEPLOYED and it needs a container restart**: Go reads
+`TZ` once, when it builds `time.Local` at process start, so an already-running
+tracker keeps its UTC clock until it is recreated
+(`docker compose up -d tracker` on the hub, which recreates it because the
+environment changed). Local commit only, never pushed.
 
 **2026-09-09 — B11 steps 3 and 4 are BUILT on a SIDE BRANCH (`b11-weight-token`),
 CROSS-REVIEW FIXES APPLIED, pending merge into `IceDrive-DesktopDirection`, and
@@ -7584,6 +7601,10 @@ reading recovered days later after an outage is not ticked at all); it cannot
 stop this ≤1-day one. Sending an `at` was rejected as *worse* than not sending
 one: it would be silently dropped and would look as though back-dating worked.
 
+**SUPERSEDED 2026-09-10 — the decision was made and the `TZ:` was added; see
+the entry at the foot of this file.** The paragraph below is kept as the record
+of what was owed and why.
+
 **OWED TO THE COORDINATOR — one decision.** Adding `TZ: ${TIMEZONE}` to the
 `tracker:` service in `stack/docker-compose.yml` would make `s.Now()` the
 household's local date and put evening weigh-ins on the right day. NagLight's
@@ -7682,3 +7703,74 @@ refuses on this dev PC (missing `zstd`/`rsync`).
 **Not done here.** No push, no hub state touched, no deploy, no new knob, no new
 apt package, no change to `stack/.env.example`, no change to HomeHub's
 `FieldSchema.psd1`, and no change to `docker-compose.yml`.
+
+---
+
+## 2026-09-10 — the tracker gets the household's timezone (B11, Owner-approved)
+
+**One line of compose, and it moves the day boundary for every item in the
+tracker.** `stack/docker-compose.yml`'s `tracker:` service now sets
+`TZ: ${TIMEZONE}` at the top of its `environment:` block. `TIMEZONE` is already
+in the hub's `.env` (`America/Chicago`) and was already spelled that way by the
+**eight** other services in that file that care. The tracker was the only
+service that cares and had never been given one — NagLight's own Dockerfile
+installs `tzdata`, so the container was built expecting a `TZ` it was never
+handed. A pre-existing omission, not a decision.
+
+**What actually changes.** NagLight resolves "today" through Go's `time.Now()`
+— `s.Now()` = `time.Now().Format("2006-01-02")` — and that is the day boundary
+for **every** item in the tracker: habits, todos, rollovers, streaks,
+catch-ups, and the legacy `ok` check-off lane the weight feeder posts on. In
+UTC that boundary fell at **19:00 local** in `America/Chicago`. So anything the
+Owner ticked between **19:00 and midnight** had been landing on the **next**
+day's log — every evening, for every item, not only the weigh-in. After this it
+rolls at **local midnight**. Nothing historical is rewritten: the boundary moves
+forward only, and the evening of the restart is the seam.
+
+**The weight case this surfaced through.** The feeder's automated check-off
+posts `{"check": ..., "ok": true}` on the legacy lane, which **cannot**
+back-date: `body.At` is parsed only inside the `color`/`rgb` branch, and the
+boolean path falls through to `date := s.Now()`. The captured weigh-in — 20:24
+local, 01:24 UTC the next day — therefore ticked the **following** day's box.
+With the tracker on the household's zone the tick lands on the day the person
+stood on the scale. The feeder is **unchanged**: it still sends no `at` (one
+would be silently dropped), and gate 4 still bounds a reading whose own
+`utcOffset` is some other zone's.
+
+**A RESTART IS REQUIRED, and it is a RECREATE, not `docker restart`.**
+Established, not assumed, in two independent halves:
+
+1. **Docker**: a container's environment is fixed when the container is
+   created. `docker restart tracker` re-runs the same container with the same
+   environment and would add nothing.
+2. **Go**: read out of the toolchain source on this box
+   (`.../go/src/time/zoneinfo_unix.go` and `zoneinfo.go`) — `initLocal()`
+   consults `$TZ` via `syscall.Getenv` and falls back to `/etc/localtime` when
+   `TZ` is unset, and it is called through `localOnce sync.Once`. So the zone
+   is resolved **once per process**, and a long-running tracker would keep its
+   old clock even if the variable could be changed under it. (A `time.Local`
+   probe was written and run here, but the dev PC is Windows, where Go takes
+   the zone from the OS and ignores `TZ` outright — so the probe could not
+   settle the Linux question and the source was read instead. Recorded because
+   a probe that cannot decide is not evidence.)
+
+**What the coordinator runs on the hub**, from the deployed stack directory:
+`docker compose up -d tracker` — it recreates the container because the
+environment changed. Confirm with `docker exec tracker date` (it should print
+the household's local time, not UTC) and `docker inspect tracker` showing
+`TZ=America/Chicago` in `Config.Env`.
+
+**The tripwire test was inverted, not deleted.** `eebea9e` had added an
+assertion that the `tracker:` block carried **no** `TZ:`, precisely so whoever
+added one was sent to read `stack/weight/README.md` first. That has now
+happened. The assertion now requires the opposite and requires it to mean
+something: the tracker's **environment** must carry `TZ`, and it must be
+spelled `${TIMEZONE}` rather than a literal zone, so it cannot drift onto a
+different day boundary from the services that share that one value. It is
+checked structurally (PyYAML, `services.tracker.environment`) as well as by
+text, because a `TZ:` under `labels:` is not a `TZ` the process ever sees — a
+mutation that did exactly that **survived** the text-only form.
+
+**Not done here, deliberately.** No push. No hub state touched, no deploy. No
+other service given a `TZ:` — the Owner approved the tracker, and widening it
+is a separate call. `weight_feeder.py` is untouched.

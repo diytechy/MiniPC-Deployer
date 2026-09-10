@@ -6750,3 +6750,9 @@ is defense in depth around the same volatile-source invariant. Review 3 remains
 required. Focused tests are **6/6**, both edited shell scripts parse cleanly, and
 the complete G1 gate remains **549 passed / 5 skipped**, trace integrity 0 with
 the unchanged 24 legacy orphans. No image or live-panel change has occurred.
+
+**2026-09-09 — B14 independent review 4 ACCEPT.** The fourth Terra pass verified
+the stale-credential and expiry repairs plus the application broker cleanup and
+protocol fixes, then found no new in-scope concrete failure. The image work is
+review-complete and remains undeployed; only the Owner-run physical panel checks
+remain for B14.

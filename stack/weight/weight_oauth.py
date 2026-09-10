@@ -54,12 +54,27 @@ remote's to write. `tests/test_weight_oauth.py` asserts this by running the
 whole flow against a fake Google whose every field is a sentinel string and
 grepping the captured output for each one.
 
-THE ONE OAUTH CLIENT IS REUSED, NOT COPIED. The client id and secret are read
-from `stack/.env`'s `OAUTH2_PROXY_CLIENT_ID` / `OAUTH2_PROXY_CLIENT_SECRET` -
-the same pair `TRACKER_DRIVE_CLIENT_ID` references rather than duplicates,
-for the reason the tracker's Drive sync already learned: a second copy of a
-secret is a second thing to rotate, and the two drift silently. THE MINTED
-TOKEN FILE THEREFORE HOLDS NO CLIENT SECRET; the feeder gets the pair from its
+THE ONE OAUTH CLIENT IS OAUTH2-PROXY'S, AND IT IS REUSED, NOT COPIED. The
+client id and secret are read from `stack/.env`'s `OAUTH2_PROXY_CLIENT_ID` /
+`OAUTH2_PROXY_CLIENT_SECRET`. OBSERVED, NOT ASSUMED: the deployed hub's
+`/opt/homehub/stack/.env` was listed by key name on 2026-09-09 and holds
+`OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET`, `TRACKER_DRIVE_USER`,
+`TRACKER_DRIVE_SHEET_ID` and an empty `TRACKER_DRIVE_FOLDER_ID` - and NO
+`TRACKER_DRIVE_CLIENT_ID`, NO `TRACKER_DRIVE_CLIENT_SECRET` and no
+`GOOGLE_CLIENT_*` of any kind. An earlier draft of this docstring said the
+tracker's Drive sync had its own client-id variable that referenced the same
+value; it does not, and the tracker's compose reaches straight for the
+`OAUTH2_PROXY_*` pair. The household has EXACTLY ONE Google OAuth client,
+which is the good outcome: one secret to rotate, nothing to drift.
+
+`TRACKER_DRIVE_CLIENT_ID` / `TRACKER_DRIVE_CLIENT_SECRET` are still accepted as
+a FALLBACK, after the `OAUTH2_PROXY_*` pair and only if that pair is absent, so
+a differently-provisioned box that really does carry them still mints. See
+`resolve_client` for the exact order and for the refusal, which names ALL FOUR
+variables - the message that named only the two that do not exist is what made
+this hard to diagnose.
+
+THE MINTED TOKEN FILE HOLDS NO CLIENT SECRET; the feeder gets the pair from its
 `EnvironmentFile=` at run time, so the secret stays in exactly one place.
 
 Implements: SR-022, LLR-006
@@ -139,13 +154,40 @@ DEFAULT_REDIRECT_URI = "http://localhost:8117/"
 DEFAULT_ENV_FILE = "/opt/homehub/stack/.env"
 CLIENT_ID_KEY = "OAUTH2_PROXY_CLIENT_ID"
 CLIENT_SECRET_KEY = "OAUTH2_PROXY_CLIENT_SECRET"
+
+# The fallback pair, tried ONLY when the pair above is absent. It is not on the
+# hub - the live `.env` was listed by key name on 2026-09-09 and has neither of
+# these - but a differently-provisioned box may carry them, and accepting them
+# costs one tuple entry while refusing them would cost that box a mint it
+# cannot diagnose.
+FALLBACK_CLIENT_ID_KEY = "TRACKER_DRIVE_CLIENT_ID"
+FALLBACK_CLIENT_SECRET_KEY = "TRACKER_DRIVE_CLIENT_SECRET"
+
+# THE RESOLUTION ORDER, in one place, in order, so it is readable and testable.
+# First complete pair wins; a pair is complete only when BOTH halves are set.
+CLIENT_KEY_PAIRS = (
+    (CLIENT_ID_KEY, CLIENT_SECRET_KEY),
+    (FALLBACK_CLIENT_ID_KEY, FALLBACK_CLIENT_SECRET_KEY),
+)
+
+# The refusal's looked-for list is fenced by these two markers so a test can
+# cut it out and assert that every consulted variable is named INSIDE it. The
+# rest of the message may mention a variable for other reasons; only what lies
+# between these two markers is the record of what was actually searched for.
+LOOKED_FOR_PREFIX = "Looked for, in order: "
+LOOKED_FOR_SUFFIX = "."
+
 TOKEN_FILE_KEY = "WEIGHT_TOKEN_FILE"
 STATE_FILE_KEY = "WEIGHT_STATE_FILE"
 ACCOUNT_KEY = "WEIGHT_USER_ACCOUNT"
 TIMEOUT_KEY = "WEIGHT_TIMEOUT_SECONDS"
 
-ENV_KEYS = (CLIENT_ID_KEY, CLIENT_SECRET_KEY, TOKEN_FILE_KEY, STATE_FILE_KEY,
-            ACCOUNT_KEY, TIMEOUT_KEY)
+# Every key this tool reads out of `.env`, and NOTHING ELSE reaches this
+# process: the same file holds TECHNITIUM_ADMIN_PASSWORD, CLOUDFLARE_API_TOKEN
+# and the finance credentials.
+ENV_KEYS = (CLIENT_ID_KEY, CLIENT_SECRET_KEY,
+            FALLBACK_CLIENT_ID_KEY, FALLBACK_CLIENT_SECRET_KEY,
+            TOKEN_FILE_KEY, STATE_FILE_KEY, ACCOUNT_KEY, TIMEOUT_KEY)
 
 DEFAULT_TIMEOUT_SECONDS = 30
 
@@ -258,6 +300,55 @@ def env_values(text, keys=ENV_KEYS):
             value = value[1:-1]
         found[key] = value
     return found
+
+
+def resolve_client(values, path=DEFAULT_ENV_FILE, pairs=CLIENT_KEY_PAIRS):
+    """Settle WHICH pair of `.env` keys carries the Google OAuth client.
+
+    Contract:
+      Inputs:  values - what `env_values` read; path - only for the message;
+               pairs - the order, injected by tests.
+      Outputs: (id_key, client_id, client_secret) - WHICH variable the id
+               came from, then the two non-blank values. The key name is
+               returned so the minted token file can record its provenance
+               without a second search.
+      Raises:  Refused when no pair is complete - naming EVERY variable that
+               was looked for, and never a value.
+
+    THE ORDER IS `OAUTH2_PROXY_*` FIRST, `TRACKER_DRIVE_CLIENT_*` SECOND, and
+    the first COMPLETE pair wins. A pair is complete only when both halves are
+    set: half a pair is a mis-provisioned box, and silently sliding to the next
+    pair would mint with a client id from one place and a secret from another,
+    which fails at Google as `invalid_client` and looks like a Google problem.
+
+    WHY THE MESSAGE NAMES ALL FOUR. On the deployed hub this tool's first
+    version looked only for `TRACKER_DRIVE_CLIENT_ID` /
+    `TRACKER_DRIVE_CLIENT_SECRET`, which DO NOT EXIST there, and said so - so
+    the Owner went looking for a variable nobody had ever set instead of seeing
+    that the two that ARE set were the answer. A refusal that lists everything
+    it looked for turns that into one glance at the file.
+
+    Implements: SR-022, LLR-006
+    """
+    for id_key, secret_key in pairs:
+        client_id = values.get(id_key)
+        client_secret = values.get(secret_key)
+        if client_id and client_secret:
+            return id_key, client_id, client_secret
+
+    # The looked-for list is its own delimited clause, between the two markers
+    # below, so a test can assert that EVERY variable this function consulted
+    # is named IN IT - not merely somewhere in a paragraph that happens to
+    # mention two of them for other reasons.
+    halves = ["%s (%s)" % (key, "set" if values.get(key) else "unset or blank")
+              for pair in pairs for key in pair]
+    raise Refused(
+        "no complete Google OAuth client pair in %s. %s%s%s A pair counts only "
+        "when BOTH halves are set, and the pairs are tried in that order. "
+        "There is exactly one Google OAuth client in this household - "
+        "oauth2-proxy's - and it is the one to reuse; do not mint a second. "
+        "stack/.env is mode 0600 root:root, so run this with sudo."
+        % (path, LOOKED_FOR_PREFIX, "; ".join(halves), LOOKED_FOR_SUFFIX))
 
 
 def pkce_challenge(verifier):
@@ -387,7 +478,7 @@ def refresh_fields(client_id, client_secret, refresh_token):
             "refresh_token": refresh_token, "grant_type": "refresh_token"}
 
 
-def token_document(payload, minted_at, scope=SCOPE):
+def token_document(payload, minted_at, scope=SCOPE, client_key=CLIENT_ID_KEY):
     """What actually gets written to WEIGHT_TOKEN_FILE.
 
     Contract:
@@ -400,9 +491,10 @@ def token_document(payload, minted_at, scope=SCOPE):
       * THE CLIENT SECRET. The feeder receives the pair through its unit's
         `EnvironmentFile=/opt/homehub/stack/.env`, so writing it here would put
         a second copy of the household's Google client secret on disk, in a
-        second place, to be rotated separately - the exact mistake the shared
-        `TRACKER_DRIVE_CLIENT_SECRET: ${OAUTH2_PROXY_CLIENT_SECRET}` reference
-        exists to avoid.
+        second place, to be rotated separately. The household has exactly ONE
+        Google OAuth client - oauth2-proxy's - and everything that needs it
+        reaches for `OAUTH2_PROXY_CLIENT_SECRET` itself rather than keeping a
+        copy; this file is not going to be the first copy.
       * THE ACCESS TOKEN. It expires in an hour, so it is a credential with no
         durable value; `capture` refreshes for a fresh one each time.
 
@@ -428,9 +520,12 @@ def token_document(payload, minted_at, scope=SCOPE):
         "token_type": "Bearer",
         "minted_at": weight_feeder.iso8601_utc(int(minted_at)),
         "minted_by": "stack/weight/weight_oauth.py mint",
-        "client": "the shared OAUTH2_PROXY_CLIENT_ID; the client secret is "
-                  "deliberately NOT stored here - the service reads it from "
-                  "stack/.env through its unit's EnvironmentFile=",
+        # WHICH env variable the client came from, so a box that fell back
+        # to the TRACKER_DRIVE_CLIENT_* pair says so in its own token file
+        # rather than claiming a client it did not use.
+        "client": "the shared %s; the client secret is deliberately NOT stored "
+                  "here - the service reads it from stack/.env through its "
+                  "unit's EnvironmentFile=" % client_key,
     }
 
 
@@ -519,11 +614,12 @@ def capture_output_verdict(path, resolve=None):
 
 # ── SHELL: everything below touches the world ───────────────────────────────
 
-def read_env_file(path, required=()):
+def read_env_file(path):
     """Load the keys this tool owns out of a `.env` file.
 
-    Raises Refused when the file cannot be read, or when a required key is
-    absent or blank - naming the KEY and never the value.
+    Raises Refused when the file cannot be read. WHICH keys must be present is
+    not decided here: `resolve_client` owns that, because the answer is a
+    resolution ORDER across two pairs and not a flat required-list.
     """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -533,14 +629,7 @@ def read_env_file(path, required=()):
             "could not read %s (%s). stack/.env is mode 0600 root:root by "
             "design, so these tools are run with sudo; see README.md."
             % (path, type(exc).__name__))
-    values = env_values(text)
-    for key in required:
-        if not values.get(key):
-            raise Refused(
-                "%s is unset or blank in %s. It is the Google OAuth client "
-                "oauth2-proxy and the tracker's Drive sync already share; "
-                "there is no second client to mint." % (key, path))
-    return values
+    return env_values(text)
 
 
 def post_form(url, fields, timeout, what):
@@ -787,7 +876,8 @@ def mint(args, out=None, prompt=None, auth_endpoint=AUTH_ENDPOINT,
     """
     out = out or sys.stdout
     prompt = prompt or read_pasted_code
-    values = read_env_file(args.env_file, required=(CLIENT_ID_KEY, CLIENT_SECRET_KEY))
+    values = read_env_file(args.env_file)
+    client_key, client_id, client_secret = resolve_client(values, args.env_file)
     token_file, state_file, state_root = resolve_paths(values, args)
     timeout = resolve_timeout(values, args)
     account = args.account or values.get(ACCOUNT_KEY) or "homehub-weight"
@@ -805,7 +895,7 @@ def mint(args, out=None, prompt=None, auth_endpoint=AUTH_ENDPOINT,
 
     verifier = new_verifier()
     state = secrets.token_urlsafe(16)
-    url = authorization_url(values[CLIENT_ID_KEY], args.redirect_uri, state,
+    url = authorization_url(client_id, args.redirect_uri, state,
                             pkce_challenge(verifier), endpoint=auth_endpoint)
     out.write(
         "\nOpen this URL in a browser ON YOUR PC (it is one line):\n\n%s\n\n"
@@ -817,10 +907,11 @@ def mint(args, out=None, prompt=None, auth_endpoint=AUTH_ENDPOINT,
     code = code_from_paste(prompt("Paste the address-bar URL here: "), state)
     payload = post_form(
         token_endpoint,
-        authorization_code_fields(values[CLIENT_ID_KEY], values[CLIENT_SECRET_KEY],
+        authorization_code_fields(client_id, client_secret,
                                   code, verifier, args.redirect_uri),
         timeout, "the token exchange")
-    document = token_document(payload, now if now is not None else time.time())
+    document = token_document(payload, now if now is not None else time.time(),
+                              client_key=client_key)
     with open_token_for_write(token_file, token_file, state_file, state_root) as handle:
         handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
     handed = give_to_account(token_file, account)
@@ -855,7 +946,8 @@ def capture(args, out=None, list_url=None, token_endpoint=TOKEN_ENDPOINT):
     """
     out = out or sys.stdout
     list_url = list_url or LIST_URL
-    values = read_env_file(args.env_file, required=(CLIENT_ID_KEY, CLIENT_SECRET_KEY))
+    values = read_env_file(args.env_file)
+    _client_key, client_id, client_secret = resolve_client(values, args.env_file)
     token_file, _state_file, _root = resolve_paths(values, args)
     timeout = resolve_timeout(values, args)
 
@@ -874,7 +966,7 @@ def capture(args, out=None, list_url=None, token_endpoint=TOKEN_ENDPOINT):
                       "`mint --force`." % token_file)
 
     access_token = access_token_from_refresh(
-        values[CLIENT_ID_KEY], values[CLIENT_SECRET_KEY], refresh_token, timeout,
+        client_id, client_secret, refresh_token, timeout,
         endpoint=token_endpoint)
 
     url = list_url

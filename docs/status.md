@@ -6774,3 +6774,60 @@ the no-secret-printed property (sentinels carried through the whole flow).
 **Not done here.** No parser, no push, no deployment, no panel or hub state
 touched, no apt package added. This work sits on `b11-weight-token` and is owed
 a merge into `IceDrive-DesktopDirection`.
+
+### DRIVER — B11 correction — 2026-09-09 (the OAuth client variables the hub REALLY has)
+
+**Found against the live hub, not inferred.** The coordinator listed the key
+names in the deployed `/opt/homehub/stack/.env` over SSH. It holds
+`OAUTH2_PROXY_CLIENT_ID` (set), `OAUTH2_PROXY_CLIENT_SECRET` (set),
+`TRACKER_DRIVE_USER` (set), `TRACKER_DRIVE_SHEET_ID` (set) and
+`TRACKER_DRIVE_FOLDER_ID` (**empty**). It has **no `TRACKER_DRIVE_CLIENT_ID`,
+no `TRACKER_DRIVE_CLIENT_SECRET` and no `GOOGLE_CLIENT_*` of any kind.** The
+household therefore has **exactly one** Google OAuth client — oauth2-proxy's —
+which is the good outcome: one secret to rotate, nothing to drift.
+
+**What was wrong.** The prose in `stack/weight/README.md`, in
+`weight_feeder.py`'s docstring and in `weight_oauth.py`'s own docstring all
+asserted that the one client was "the one `oauth2-proxy` and
+`TRACKER_DRIVE_CLIENT_ID` share". That variable has never existed; the
+tracker's Drive sync reaches for the `OAUTH2_PROXY_*` pair directly. The
+refusal message for a missing client compounded it by naming only keys that do
+not exist on this box, which is what would have sent the Owner looking for a
+variable nobody had ever set.
+
+**What changed.** `weight_oauth.resolve_client` is now the one place the client
+is settled, and the order is explicit and injectable: `OAUTH2_PROXY_CLIENT_ID`
++ `OAUTH2_PROXY_CLIENT_SECRET` first, `TRACKER_DRIVE_CLIENT_ID` +
+`TRACKER_DRIVE_CLIENT_SECRET` second, **first complete pair wins, and a pair is
+complete only when both halves are set** — half a pair is refused rather than
+completed from the other pair, because a mismatched id/secret fails at Google
+as `invalid_client` and reads as Google's problem. The refusal names **all
+four** variables and says which are set, inside a fenced `Looked for, in
+order: … .` clause so a test can assert against the search list itself. The
+minted token file records **which** id variable was actually used, so a
+fallback box does not claim a client it did not use. The `.env` reader is
+unchanged: key by key, last wins, never `source`d, no value ever printed.
+
+**Prose corrected.** `stack/weight/README.md` step 1 now names oauth2-proxy's
+client plainly and carries a dated note saying what the live `.env` really
+holds; its step 3 states the lookup order. `weight_feeder.py`'s blocker list
+says the same. `stack/.env.example`'s Drive-sync block now says outright that
+no `TRACKER_DRIVE_CLIENT_*` variable exists anywhere.
+
+**Evidence.** `python scripts/check.py` → **RESULT: PASS**, **578 passed / 6
+skipped** (baseline at `af726b4` on this worktree: 574 / 6; the four new tests
+are the whole difference). `scripts/trace.py --strict-integrity` integrity=0
+with the unchanged 24 legacy orphans; `check_flows.py --no-placeholders` OK;
+`validate_config.py` ALL CONFIG CHECKS PASSED. `stack/run-hermetic-tests.sh`
+**UNRUN** on this dev PC (it refuses without zstd/rsync).
+
+**Mutation runs: 5 deliberate defects, 5 RED, restored byte-identical and
+green** — including **one first-pass SURVIVOR that was again a test defect**.
+Cutting the search list back to the tracker pair left the whole suite green,
+because the refusal's later sentence names the oauth2-proxy pair for an
+unrelated reason and the test searched the whole paragraph. The message now
+fences its looked-for clause between `LOOKED_FOR_PREFIX`/`LOOKED_FOR_SUFFIX`
+and the test asserts inside that clause; the mutation is now RED.
+
+**Not done here.** No parser (step 5 is still owed a real captured body), no
+push, no hub state touched. Source and docs only, on `b11-weight-token`.

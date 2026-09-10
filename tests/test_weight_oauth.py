@@ -66,10 +66,16 @@ BODY_SENTINEL = "BODY-WEIGHT-SENTINEL"
 SECRETS = (CLIENT_SECRET, AUTH_CODE, REFRESH_TOKEN, ACCESS_TOKEN)
 
 
-def write_env(tmp_path, **overrides):
-    """A `.env` in the shape stack/.env really has: our keys among others."""
-    values = {"OAUTH2_PROXY_CLIENT_ID": CLIENT_ID,
-              "OAUTH2_PROXY_CLIENT_SECRET": CLIENT_SECRET}
+def write_env(tmp_path, client=True, **overrides):
+    """A `.env` in the shape stack/.env really has: our keys among others.
+
+    `client=False` writes a file with NEITHER client pair in it, which is what
+    a box that was never provisioned for this looks like.
+    """
+    values = {}
+    if client:
+        values.update({"OAUTH2_PROXY_CLIENT_ID": CLIENT_ID,
+                       "OAUTH2_PROXY_CLIENT_SECRET": CLIENT_SECRET})
     values.update(overrides)
     lines = ["# a comment", "TECHNITIUM_ADMIN_PASSWORD=NOT-OURS-DO-NOT-READ"]
     lines += ["%s=%s" % (key, value) for key, value in values.items()]
@@ -624,6 +630,137 @@ def test_main_refuses_legibly_and_prints_no_traceback_sr022(tmp_path, capsys):
     assert rc == 2
     assert "could not read" in captured.err
     assert "Traceback" not in captured.err and "Traceback" not in captured.out
+
+
+# ── The client comes from the variables the hub REALLY has ─────────────────
+
+def looked_for_clause(message):
+    """The fenced list of variables the refusal says it SEARCHED FOR.
+
+    The rest of the paragraph names the oauth2-proxy pair for an unrelated
+    reason ("that is the one to reuse"), so searching the whole message would
+    pass on a build that had stopped looking for it.
+    """
+    assert oauth.LOOKED_FOR_PREFIX in message, message
+    tail = message.split(oauth.LOOKED_FOR_PREFIX, 1)[1]
+    assert oauth.LOOKED_FOR_SUFFIX in tail, message
+    return tail.split(oauth.LOOKED_FOR_SUFFIX, 1)[0]
+
+
+def mint_against_a_fake_google(env_file, token_file, state_root):
+    """Run a whole successful `mint` against the loopback fake. Returns the
+    stored token document. The state is read back off the printed URL exactly
+    as the Owner reads it out of the browser's address bar."""
+    out = io.StringIO()
+
+    def prompt(_text):
+        state = out.getvalue().split("state=")[1].split("&")[0]
+        return paste_of(AUTH_CODE, state)
+
+    with loopback_server(json_responder(200, {"refresh_token": REFRESH_TOKEN,
+                                              "access_token": ACCESS_TOKEN,
+                                              "scope": oauth.SCOPE,
+                                              "token_type": "Bearer"})) as (url, _seen):
+        rc = oauth.mint(mint_args(env_file, token_file, state_root), out=out,
+                        prompt=prompt, token_endpoint=url + "/token", now=NOW)
+    assert rc == 0
+    assert CLIENT_SECRET not in out.getvalue()
+    return json.loads(Path(token_file).read_text(encoding="utf-8"))
+
+
+def test_the_oauth2_proxy_pair_alone_is_enough_to_mint_sr022(tmp_path):
+    """THE DEFECT THIS TEST EXISTS FOR, observed against the deployed hub on
+    2026-09-09: `/opt/homehub/stack/.env` holds `OAUTH2_PROXY_CLIENT_ID` and
+    `OAUTH2_PROXY_CLIENT_SECRET` and has NO `TRACKER_DRIVE_CLIENT_ID` and no
+    `TRACKER_DRIVE_CLIENT_SECRET` at all. A tool that looked only for the
+    tracker names would fail at its very first step, before the Owner ever
+    reached a browser. This fixture carries ONLY the oauth2-proxy pair - the
+    real hub's shape - and mint must go all the way through.
+    """
+    env_file = write_env(tmp_path)
+    assert "TRACKER_DRIVE_CLIENT" not in Path(env_file).read_text(encoding="utf-8")
+    root = str(tmp_path / "state")
+    token = str(tmp_path / "state" / "tokens" / "google-health-token.json")
+    stored = mint_against_a_fake_google(env_file, token, root)
+    assert stored["refresh_token"] == REFRESH_TOKEN
+    assert "OAUTH2_PROXY_CLIENT_ID" in stored["client"]
+
+
+def test_the_resolution_order_is_oauth2_proxy_then_tracker_sr022():
+    """The order is a decision, so it is asserted as one rather than inferred
+    from whichever pair a fixture happens to carry."""
+    both = {"OAUTH2_PROXY_CLIENT_ID": "proxy-id",
+            "OAUTH2_PROXY_CLIENT_SECRET": "proxy-secret",
+            "TRACKER_DRIVE_CLIENT_ID": "tracker-id",
+            "TRACKER_DRIVE_CLIENT_SECRET": "tracker-secret"}
+    assert oauth.resolve_client(both) == (
+        "OAUTH2_PROXY_CLIENT_ID", "proxy-id", "proxy-secret")
+
+    tracker_only = {"TRACKER_DRIVE_CLIENT_ID": "tracker-id",
+                    "TRACKER_DRIVE_CLIENT_SECRET": "tracker-secret"}
+    assert oauth.resolve_client(tracker_only) == (
+        "TRACKER_DRIVE_CLIENT_ID", "tracker-id", "tracker-secret")
+
+    proxy_only = {"OAUTH2_PROXY_CLIENT_ID": "proxy-id",
+                  "OAUTH2_PROXY_CLIENT_SECRET": "proxy-secret"}
+    assert oauth.resolve_client(proxy_only) == (
+        "OAUTH2_PROXY_CLIENT_ID", "proxy-id", "proxy-secret")
+
+    # HALF A PAIR IS NOT A PAIR. Sliding from a set id to the other pair's
+    # secret would send Google a mismatched client and read as its problem.
+    half = {"OAUTH2_PROXY_CLIENT_ID": "proxy-id",
+            "TRACKER_DRIVE_CLIENT_SECRET": "tracker-secret"}
+    with pytest.raises(oauth.Refused):
+        oauth.resolve_client(half)
+
+
+def test_a_box_with_neither_pair_is_refused_naming_all_four_sr022(tmp_path):
+    """The message that named only the two variables that do not exist is what
+    made this hard to diagnose. It must now name every variable it looked for,
+    through the real `mint` entry point and not just the verdict function.
+
+    IT ASSERTS AGAINST THE LOOKED-FOR CLAUSE, NOT THE WHOLE PARAGRAPH. A first
+    pass of this test searched the entire message, and passed against a
+    deliberately broken build whose search list had been cut back to the
+    tracker pair - because a later sentence names the oauth2-proxy pair for a
+    different reason. Cutting the fenced clause out is what makes this test
+    the thing that catches the defect rather than a bystander.
+    """
+    env_file = write_env(tmp_path, client=False)
+    root = str(tmp_path / "state")
+    token = str(tmp_path / "state" / "tokens" / "google-health-token.json")
+    with pytest.raises(oauth.Refused) as err:
+        oauth.mint(mint_args(env_file, token, root), out=io.StringIO(),
+                   prompt=lambda _t: AUTH_CODE, now=NOW)
+    looked_for = looked_for_clause(str(err.value))
+    for name in ("OAUTH2_PROXY_CLIENT_ID", "OAUTH2_PROXY_CLIENT_SECRET",
+                 "TRACKER_DRIVE_CLIENT_ID", "TRACKER_DRIVE_CLIENT_SECRET"):
+        assert name in looked_for, (
+            "%s is consulted but is not named in the looked-for clause %r"
+            % (name, looked_for))
+    assert not os.path.exists(token)
+
+    # `capture` reads the same variables, so it refuses the same way.
+    with pytest.raises(oauth.Refused) as err2:
+        oauth.capture(capture_args(env_file, token, root, str(tmp_path / "body.json")),
+                      out=io.StringIO())
+    capture_clause = looked_for_clause(str(err2.value))
+    for name in ("OAUTH2_PROXY_CLIENT_ID", "OAUTH2_PROXY_CLIENT_SECRET",
+                 "TRACKER_DRIVE_CLIENT_ID", "TRACKER_DRIVE_CLIENT_SECRET"):
+        assert name in capture_clause
+
+
+def test_a_fallback_mint_records_the_variable_it_actually_used_sr022(tmp_path):
+    """A box that really does carry the tracker pair must not write a token
+    file claiming it used oauth2-proxy's client."""
+    env_file = write_env(tmp_path, client=False,
+                         TRACKER_DRIVE_CLIENT_ID=CLIENT_ID,
+                         TRACKER_DRIVE_CLIENT_SECRET=CLIENT_SECRET)
+    root = str(tmp_path / "state")
+    token = str(tmp_path / "state" / "tokens" / "google-health-token.json")
+    stored = mint_against_a_fake_google(env_file, token, root)
+    assert "TRACKER_DRIVE_CLIENT_ID" in stored["client"]
+    assert CLIENT_SECRET not in json.dumps(stored)
 
 
 # ── Step 5 is still forbidden, and it is forbidden HERE too ─────────────────

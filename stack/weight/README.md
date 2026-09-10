@@ -71,10 +71,22 @@ and it is the Owner's call, not this feeder's.
 ### The five steps, and where each one stands
 
 1. **Enable `health.googleapis.com`** on the Google Cloud project that owns the
-   existing OAuth client — the one `oauth2-proxy` and `TRACKER_DRIVE_CLIENT_ID`
-   share. (Reuse that client, do not mint a second: the tracker's Drive sync
-   already learned that a second copy of the secret is a second thing to rotate.)
-   **DONE by the Owner, 2026-09-09.**
+   household's one existing OAuth client — **oauth2-proxy's**, in
+   `OAUTH2_PROXY_CLIENT_ID` / `OAUTH2_PROXY_CLIENT_SECRET`. (Reuse that client,
+   do not mint a second: a second copy of the secret is a second thing to
+   rotate, and the two drift silently.) **DONE by the Owner, 2026-09-09.**
+
+   > **Corrected 2026-09-09, against the live hub.** An earlier version of this
+   > line said the client was "the one `oauth2-proxy` and `TRACKER_DRIVE_CLIENT_ID`
+   > share". **There is no `TRACKER_DRIVE_CLIENT_ID`.** The deployed
+   > `/opt/homehub/stack/.env` was listed by key name and holds
+   > `OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET`,
+   > `TRACKER_DRIVE_USER`, `TRACKER_DRIVE_SHEET_ID` and an empty
+   > `TRACKER_DRIVE_FOLDER_ID` — and no `TRACKER_DRIVE_CLIENT_*` and no
+   > `GOOGLE_CLIENT_*` of any kind. The tracker's Drive sync reaches straight
+   > for the `OAUTH2_PROXY_*` pair rather than keeping its own copy. So the
+   > household has **exactly one** Google OAuth client, which is the good
+   > outcome — one secret to rotate — and it is oauth2-proxy's.
 2. **Add the scope above** to that client's consent screen, and add the Owner's
    account to the project's **Test users** list. Projects start capped at 100
    test users; going beyond that needs a third-party security review, which a
@@ -152,9 +164,21 @@ sudo /usr/bin/python3 /opt/homehub/stack/weight/weight_oauth.py mint
 ```
 
 **Why `sudo`:** `stack/.env` is mode 0600 root:root and holds
-`OAUTH2_PROXY_CLIENT_ID`/`_SECRET`. The tool reads **only those two keys** — it
-never `source`s that file — and hands the finished token to the
-`homehub-weight` account so the feeder can read it.
+`OAUTH2_PROXY_CLIENT_ID`/`_SECRET`. The tool reads that file **key by key** —
+it never `source`s it, because the same file carries
+`TECHNITIUM_ADMIN_PASSWORD`, `CLOUDFLARE_API_TOKEN` and the finance
+credentials — and hands the finished token to the `homehub-weight` account so
+the feeder can read it.
+
+**Which variables it looks for, in order.** `OAUTH2_PROXY_CLIENT_ID` +
+`OAUTH2_PROXY_CLIENT_SECRET` first — this is the pair the hub actually has —
+then `TRACKER_DRIVE_CLIENT_ID` + `TRACKER_DRIVE_CLIENT_SECRET` as a fallback
+for a differently-provisioned box. **A pair counts only when both halves are
+set**; half a pair is refused rather than mixed with the other pair's half,
+because a mismatched id and secret fails at Google as `invalid_client` and
+reads as Google's problem. If nothing is found, the refusal **names all four
+variables and says which of them are set**, so the fix is one look at the
+file.
 
 It should print a long `https://accounts.google.com/o/oauth2/v2/auth?...` URL,
 then wait at `Paste the address-bar URL here:`.

@@ -78,7 +78,11 @@ below was established on 2026-09-09 by CALLING Google, not by reading a blog:
 
 WHAT IS THEREFORE MISSING, AND ONLY THE OWNER CAN CLEAR IT:
   1. enable `health.googleapis.com` on the Google Cloud project that owns the
-     existing OAuth client (the one oauth2-proxy and TRACKER_DRIVE_* share);
+     household's one existing OAuth client - oauth2-proxy's, in
+     OAUTH2_PROXY_CLIENT_ID / OAUTH2_PROXY_CLIENT_SECRET. There is no separate
+     TRACKER_DRIVE_CLIENT_* pair: the live hub's .env was listed by key name on
+     2026-09-09 and has none, and the tracker's Drive sync reads the
+     OAUTH2_PROXY_* pair itself;
   2. add the scope above to that client's consent screen and add the Owner to
      the project's Test users list (projects start capped at 100 test users;
      going past that needs a third-party security review, which the household

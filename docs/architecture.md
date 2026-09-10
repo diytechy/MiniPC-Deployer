@@ -272,22 +272,22 @@ sequenceDiagram
     T->>W: start (oneshot, as its own dedicated account)
     W->>W: resolve_enabled / resolve_identity / resolve_feed_url
     Note over W: a blank identity or an off-box destination<br/>REFUSES here - it never defaults
-    W->>D: read weight_goal_lb from the frontmatter
+    W->>D: read the `weigh-in` item's `target` + `unit` (WEIGHT_ITEM_*)
     alt no goal declared
         D--xW: GoalMissing
-        W->>W: exit 2, naming the file to put it in
+        W->>W: exit 2, naming the item to put the target on
         Note over N: NOTHING IS POSTED. The target line IS the goal;<br/>inventing one would draw a 50 lb bar<br/>around a number nobody chose
-    else goal 180 lb
-        D-->>W: 180
+    else goal 170 lb, unit lb
+        D-->>W: 170
         W->>G: GET /v4/users/me/dataTypes/weight/dataPoints<br/>(when written, through vendor_opener: no redirect, no proxy)
         G--xW: SourceFailure - no token minted, and NO PARSER EXISTS<br/>until one real body has been observed
         Note over W: only the exception TYPE is journalled, never its message:<br/>a urllib exception carries the request and its headers
         W->>S: read the last-known reading, VALIDATED at the door
         alt a previous reading exists and is credible
             S-->>W: 191.4 lb, observed_at = when it was TRUE
-            W->>N: value 191.4, target 180, that ORIGINAL stamp<br/>through feed_opener: no proxy, no redirect, peer re-checked
+            W->>N: value 191.4, target 170, that ORIGINAL stamp<br/>through feed_opener: no proxy, no redirect, peer re-checked
         else nothing has ever been read, or what is stored cannot be true
-            W->>N: value 0, target 180, NO observed_at at all
+            W->>N: value 0, target 170, NO observed_at at all
             Note over S: -500 lb, 100000 lb or a FUTURE stamp is corruption,<br/>and corruption is not history
         end
         Note over N: stale by NagLight's own static 7-day horizon -><br/>"unavailable", never a green gauge.<br/>The 0 is unreachable as a displayed reading

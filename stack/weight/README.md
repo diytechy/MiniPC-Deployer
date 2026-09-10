@@ -269,63 +269,105 @@ no-secret-printed property (sentinel values carried through the whole flow).
 ## The goal lives in the user's definitions (SN-040), and here is exactly how
 
 `WEIGHT_DEFINITIONS_DIR` names the **directory**, never the number. In
-multi-user mode that is `<tracker data root>/<the Google sub>/definitions` — the
+multi-user mode that is `<tracker data root>/<the Google sub>/definitions` - the
 same directory NagLight's `internal/defs.Load` reads and the Drive sync keeps in
-step. The goal is a **top-level frontmatter key**:
+step.
+
+**The goal is the `target` of ONE ITEM**, with its `unit` beside it:
 
 ```yaml
 ---
-category: health
+category: Health
 color_weight: 1.5
-weight_goal_lb: 180
 items:
   - id: weigh-in
     title: Step on the scale
     type: habit
-    recur: daily
+    recur: weekly
+    horizon: long
+    target: 170
+    unit: lb
 ---
 ```
 
-**No NagLight change is needed to store it there.** `internal/defs/yaml.go`
-parses top-level frontmatter scalars and its `default:` branch is literally
-`// ignore unknown top-level keys (forward-compatible)`. That file loads exactly
-as it did before; the tracker does not need to understand the goal, because this
-feeder is what turns it into the gauge's target line.
+**Which item is configuration, not code.** `WEIGHT_ITEM_CATEGORY` (default
+`Health`) and `WEIGHT_ITEM_ID` (default `weigh-in`) name the item's **location**.
+Neither can hold a number, so the household's intent still lives only in the
+person's own definitions; renaming or moving the item is an `.env` edit rather
+than a code change. Both halves match case-insensitively and trimmed, because
+both are typed by hand into a spreadsheet cell.
+
+**No NagLight change is needed.** `target` and `unit` are already item columns
+that round-trip through both sync modes today.
+
+### It used to be a top-level `weight_goal_lb` key. That was changed on 2026-09-09.
+
+The first version put the goal in a top-level frontmatter key and *deliberately
+refused* an item-level goal. Two facts killed that design, and they are recorded
+here so nobody restores it:
+
+* **Sheet mode erases top-level keys, and this household runs sheet mode**
+  (`TRACKER_DRIVE_SHEET_ID` set, `TRACKER_DRIVE_FOLDER_ID` deliberately blanked
+  2026-09-08). Definitions reach the hub two ways: folder mode
+  (`drive.applyFolder`) stages the `.md` bytes verbatim, but **sheet mode
+  regenerates** each `.md` from CSV through `internal/defsheet`, whose `columns`
+  list is the *item* field set - an unrecognised column is collected into
+  `unknown` and **dropped**. So `weight_goal_lb` would be deleted by the first
+  sync after anyone edited the sheet, silently, leaving the panel dark.
+* **There is no vendor fallback.** Google Health v4 has no goal or target
+  concept anywhere: `DataPoint` has 43 members and none is a goal, `Profile` and
+  `Settings` carry none, and the only two occurrences of "goal" in the 292 KB
+  discovery document (revision 20260908) are a UI settings enum.
+
+`target` and `unit` already round-trip, so the goal now lives where the sync
+will actually carry it.
+
+**A file still carrying the old key is REFUSED, not ignored** - the message
+names the key, says it is no longer read, and says where the number goes. And if
+**both** the legacy key and an item `target` are present, the feeder **refuses
+rather than ranking them**: silent precedence would leave a person looking at a
+bar drawn around one number while a different number sat in their file looking
+equally authoritative, and in sheet mode the top-level one is about to be deleted
+underneath them, so "the newest edit wins" is not even stable. It is the same
+rule this module already applies to two files declaring a goal.
 
 **There is deliberately no `WEIGHT_GOAL` knob.** A goal on the hub would need an
 SSH session and a redeploy to change, would not travel with the rest of the
-person's tracker, and would be a second home for the household's intent — which
-is how this repo's `/opt/homehub` drift started. A test asserts the negative: a
-cycle with every plausible goal knob set and an empty definitions tree refuses.
+person's tracker, and would be a second home for the household's intent - which
+is how this repo's `/opt/homehub` drift started. A test asserts the negative
+twice: a cycle with every plausible goal knob set (including the two *location*
+knobs set to `170`) and an empty definitions tree refuses, and no goal-shaped
+name may be **declared** in `.env.example` or `FieldSchema.psd1` at all.
 
-**No goal ⇒ nothing is posted at all**, and that is a *different* refusal from
+### The unit is CHECKED, never assumed
+
+If `unit` is missing, or is anything but `lb`, the feeder **refuses**. It does
+**not** convert. This is the sharpest edge in the block: `target: 77` with
+`unit: kg` is 170 lb, and **77 sits inside the 40..1000 lb sanity band**, so the
+band cannot catch it - the panel would show "77 lb" against a real 191 lb
+reading and paint it full red. A wrong unit here is the same failure class as a
+vendor parser written from a schema: confident, plausible, and wrong about
+someone's body, with nothing on the wall able to tell anyone.
+
+**A `target` that is blank, absent, non-numeric, non-finite or outside
+40..1000 lb is no goal**, and nothing is posted.
+
+**No goal => nothing is posted at all**, and that is a *different* refusal from
 "no source":
 
 | | what the panel shows | why |
 |---|---|---|
 | no **source** | an unavailable gauge | the panel must say "we do not know what you weigh" rather than leave a hole where a bar belongs |
-| no **goal** | nothing | the target line **is** the goal; NagLight refuses a gauge without a target, and the only way to satisfy it would be to invent one — drawing a 50 lb bar around a number nobody chose and colouring a real body weight green or red against it |
+| no **goal** | nothing | the target line **is** the goal; NagLight refuses a gauge without a target, and the only way to satisfy it would be to invent one - drawing a 50 lb bar around a number nobody chose and colouring a real body weight green or red against it |
 
-### KNOWN GAP — a real NagLight dependency, reported rather than worked around
+### Owed to HomeHub
 
-Definitions reach the hub two ways:
-
-* **Folder mode** (`drive.applyFolder`) stages the `.md` bytes **verbatim**. The
-  goal rides along untouched. Works today.
-* **Sheet mode** exports the sheet to CSV and **regenerates** the `.md` files
-  through `internal/defsheet`, whose `columns` list is the *item* field set.
-  An unrecognised column is collected into `unknown` and **dropped**.
-
-**This household runs sheet mode** (`TRACKER_DRIVE_SHEET_ID` set,
-`TRACKER_DRIVE_FOLDER_ID` deliberately blanked on 2026-09-08). So on the deployed
-box the goal would be erased by the first sync after someone edits the sheet.
-
-Making it survive needs a change in **NagLight**, a repo this block may not edit.
-The smallest change that would do it: let `defsheet` carry non-item, file-level
-keys through the round trip (a `settings`-shaped row, or preserving unknown
-top-level frontmatter keys per category file), so `weight_goal_lb` survives
-sheet → CSV → `.md`. Writing the goal to a hub knob "for now" was rejected: it
-would make the acceptance criterion *false* while looking like it passed.
+`WEIGHT_ITEM_CATEGORY` / `WEIGHT_ITEM_ID` are **not** yet in
+`scripts/deploy/FieldSchema.psd1`, which lives in the HomeHub repo. That is safe
+rather than broken - an undeclared knob is simply absent from the emitted `.env`,
+a blank knob takes the default, and the default is the shape the Owner's sheet
+already syncs - but until it is added, *moving* the item needs an `.env` edit on
+the hub rather than a deploy-config change.
 
 ---
 

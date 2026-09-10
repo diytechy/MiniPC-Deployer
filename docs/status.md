@@ -370,6 +370,238 @@ service's `StateDirectory=`, which the shipped defaults already do.
 
 ---
 
+**2026-09-09 the goal moved from a file-level key to the weigh-in item's
+`target` (B11 correction, SR-022/LLR-006/TC-006/IF-014). READ THIS BEFORE
+"RESTORING" `weight_goal_lb`.** The entry below describes the first version,
+which put the goal in a top-level frontmatter key `weight_goal_lb` and
+**deliberately refused an item-level goal** — mutation **M10**, "item-level
+goal", was killed by a test that enforced the refusal. The Owner has ruled that
+design out and it is now reversed. It did not survive this household's
+configuration, and neither of the two reasons is a preference:
+
+* **Drive SHEET mode erases top-level keys, and this household runs sheet mode.**
+  `TRACKER_DRIVE_FOLDER_ID` is **empty** and `TRACKER_DRIVE_SHEET_ID` is **set**
+  on the live hub. In folder mode (`drive.applyFolder`) the `.md` bytes are
+  staged verbatim and any key rides along; in sheet mode NagLight's
+  `internal/defsheet` **regenerates** each `.md` from a fixed `columns` list
+  which is the **item** field set, and a column it does not recognise is
+  collected into `unknown` and **dropped**. So `weight_goal_lb` would be deleted
+  by the first sync after anyone edited the sheet — silently, leaving the panel
+  dark with nothing saying why. The old entry called this a "known gap needing a
+  NagLight change". It was not a gap; it was the design being wrong for the
+  deployment that exists.
+* **There is no vendor fallback.** Google Health v4 has **no goal or target
+  concept at all**: `DataPoint` has 43 members and none is a goal, `Profile` and
+  `Settings` carry none, and the only two occurrences of "goal" in the 292 KB
+  discovery document (revision 20260908) are a UI settings enum. Nothing could
+  have supplied a goal if the definitions lost it.
+
+`target` and `unit` are **already** sheet columns that round-trip today, so the
+goal now lives where the sync actually carries it. The Owner has added the row
+and it has already synced to the hub:
+
+```yaml
+category: Health
+color_weight: 1.5
+  - id: weigh-in
+    title: Step on the scale
+    type: habit
+    recur: weekly
+    horizon: long
+    target: 170
+    unit: lb
+```
+
+**WHICH ITEM IS CONFIGURATION, NOT A HARDCODED STRING.** `WEIGHT_ITEM_CATEGORY`
+(default `Health`) and `WEIGHT_ITEM_ID` (default `weigh-in`) name the item's
+**location**. Both match case-insensitively and trimmed, because both are typed
+by hand into a spreadsheet cell and `Health` against `health` must not be the
+difference between a goal and a dark panel.
+
+**THE "NO GOAL KNOB ON THE HUB" PROPERTY IS INTACT AND STILL MEANS SOMETHING.**
+The two new knobs name a **place** and can never carry a number, so the
+household's intent still lives only in the person's own definitions and still
+syncs with them. They are deliberately **not** called `WEIGHT_GOAL_*`, so the
+existing file scan — no `WEIGHT_GOAL` / `WEIGHT_TARGET` / `GOAL_WEIGHT` /
+`TARGET_WEIGHT` name may be **declared** in `.env.example` or `FieldSchema.psd1`
+— is not quietly satisfied by a rename. And the runtime negative now sets the
+two location knobs to `170` as well as every goal-shaped knob, and still gets no
+goal.
+
+**THE UNIT IS CHECKED, NEVER ASSUMED, AND THAT IS THE SHARPEST EDGE IN THE
+BLOCK.** A missing `unit`, or any unit but `lb`, is a **refusal**; nothing is
+converted. `target: 77` with `unit: kg` is 170 lb, and **77 sits inside the
+40..1000 lb plausibility band**, so the band *cannot* catch it — the panel would
+show "77 lb" against a real 191 lb reading and paint it full red. The unit is
+therefore checked **before the number is even parsed**, so a kilogram target
+fails on the unit rather than misleadingly on the band. This is the same failure
+class as a vendor parser written from a schema, which this block still refuses to
+write: confident, plausible, and wrong about a person's body, with nothing on the
+wall able to tell anyone.
+
+**BOTH PRESENT IS A REFUSAL, NOT A PRECEDENCE.** If a file still carries the
+superseded `weight_goal_lb` **and** the item carries a `target`, the feeder
+refuses rather than picking one. Silent precedence is the trap: whichever way it
+fell, the person would be looking at a bar drawn around one number while a
+different number sat in their file looking equally authoritative — and in sheet
+mode the top-level one is about to be deleted underneath them, so "the newest
+edit wins" is not even stable. It is the same rule this module already applies to
+two files declaring a goal. A file carrying **only** the legacy key is also
+refused, with a message that names the key, says it is **no longer read**, and
+says where the number goes — not "no goal declared", which would leave a person
+upgrading staring at a `weight_goal_lb: 180` line while the journal said nothing
+was declared. An item that exists but carries no target *beside* a lingering
+legacy key gets the migration message rather than the both-present one, because
+that person is mid-migration and "delete one" would leave them with no goal at
+all.
+
+**A blank, absent, non-numeric, non-finite or out-of-band `target` is no goal,
+and nothing is posted.** Whether it surfaces as `GoalMissing` (nothing was
+declared) or `ValueError` (something was declared that cannot be used), the
+outcome is the same and is the one that matters — the poster is never called and
+the journal names the file. The line between the two exception types is
+deliberate: *nothing declared* is missing; *something declared we cannot use* is
+a refusal that names the file, because a typo'd `1700` for `170` must not decay
+into "no goal declared".
+
+**The two refusals that must not collapse into one are preserved.** No **source**
+still posts an unavailable gauge; no **goal** still posts **nothing**. Their
+tests are unchanged in intent and both still assert the poster was never called.
+
+**FIXTURE: THE OWNER'S REAL FILE, NOT ONE SHAPED TO SUIT THE PARSER.**
+`HEALTH_MD` in `tests/test_weight_feeder.py` mirrors what actually synced —
+`category: Health`, `color_weight: 1.5`, `horizon: long`, `recur: weekly`, and a
+sibling item on **either side** of `weigh-in`, one of which carries a `target`
+and `unit` of its own (a step count). Finding the goal by shape rather than by id
+would post a step goal as a body weight, and a test asserts it does not.
+
+**THE FieldSchema HALF IS OWED TO HomeHub.** `WEIGHT_ITEM_CATEGORY` /
+`WEIGHT_ITEM_ID` are in `stack/.env.example` with their defaults but are **not**
+in `scripts/deploy/FieldSchema.psd1`, which lives in the HomeHub repo — a repo
+this worktree may not edit. That is safe rather than broken: an undeclared knob
+is simply absent from the emitted `.env`, a blank knob takes the default, and the
+default *is* the shape the Owner's sheet already syncs. What it costs is that
+**moving** the item currently needs an `.env` edit on the hub rather than a
+deploy-config change. A test records this explicitly so it is not "fixed" by
+adding the knobs to the list that would turn the FieldSchema assertion red.
+
+**STILL NO PARSER, AND ALL SIX ABSENCE ASSERTIONS ARE STILL GREEN.** Nothing in
+this change touched the blocked vendor half: `read_google_health` still refuses
+by name, and no `parse_google_health` / `parse_weight_datapoint` / `parse_weight`
+/ `parse_datapoints` symbol exists. `grams_to_pounds` is untouched and is **not**
+reachable from the goal path — it converts a vendor **reading**, and no unit
+conversion exists anywhere on the goal path by construction.
+
+**The redundancy that carried M25 is gone, and that is recorded rather than
+silent.** The old top-level scanner had three overlapping guards against reading
+an indented line as the household's goal, so removing any one of them left the
+suite green (M25) and only removing all three was killed (M27). The frontmatter
+is now parsed once, into top-level keys and items, so the indent rule exists in
+exactly one place and is asserted directly. The "top-level keys stop at `items:`"
+rule likewise survives as one line with its own test — the test that the earlier
+mutation run had to be written to add.
+
+**THE OWNER'S OPEN QUESTION — AUTO-CHECK-OFF — IS ASSESSED, NOT BUILT.** See
+"Auto-check-off: what it would take" below.
+
+**Tests:** 599 passed, 6 skipped (baseline before this change: 578/6);
+`trace.py --strict-integrity` clean, `check_flows.py --no-placeholders` clean
+(5 diagrams). **UNRUN:** `stack/run-hermetic-tests.sh` still refuses on this dev
+PC (`missing tool(s): zstd rsync`).
+
+**Mutation run: 18 deliberate defects (M28–M45), all 18 killed — but TWO
+SURVIVED THE FIRST PASS AND BOTH WERE TEST DEFECTS.** That is the third round
+running in this worktree where the first-pass survivor was a bad assertion
+rather than a missing guard, so it is worth naming the shape: both survivors
+were tests that asserted the *outcome the person sees* ("nothing was posted",
+"it refused") when a **different guard downstream** was already producing that
+outcome, so the line under test was carrying nothing.
+
+* **M37 — the prose body read as frontmatter.** Survived. The test put a bare
+  `- id:` block after the closing fence, which the parser skips anyway because a
+  column-zero line ends the item sequence, so the fence check was never what
+  refused it. Rewritten to re-open `items:` at column zero in the prose — the
+  only shape that actually reaches the item reader — and it now dies.
+* **M45 — a blank target silently becomes `0`.** Survived. The refusal was being
+  carried by the **40..1000 lb plausibility band**, which catches the zero, so
+  "nothing was posted" stayed true and the parametrised test could not tell. A
+  new test asserts the exception TYPE through the real loader: a blank target
+  must be `GoalMissing`, not a band violation, or the journal tells the person
+  their goal is out of range when what they have done is not set one.
+
+| # | deliberate defect | killed by |
+|---|---|---|
+| M28 | unit check removed — any unit accepted | `test_a_plausible_kilogram_target_is_refused_by_the_unit_not_the_band_sr022` (+ all 7 `..._is_refused_and_never_converted_sr022` params) |
+| M29 | a missing `unit` assumed to be `lb` | `test_a_target_with_no_unit_at_all_is_refused_sr022` |
+| M30 | item found by shape (first item with a `target`) instead of by id | `test_the_siblings_targets_are_not_the_weight_goal_sr022` |
+| M31 | both keys present → the item silently wins (precedence, not refusal) | `test_both_a_legacy_key_and_an_item_target_are_refused_not_ranked_sr022` |
+| M32 | a legacy-only key silently ignored, falls through to "no goal" | `test_the_superseded_top_level_key_is_refused_not_silently_ignored_sr022` |
+| M33 | the 40..1000 lb plausibility band removed | `test_an_unusable_target_posts_nothing_at_all_sr022` (4 params) |
+| M34 | the location knobs ignored — `Health`/`weigh-in` hardcoded | `test_the_location_knobs_reach_the_loader_through_a_whole_cycle_sr022` |
+| M35 | two files holding the item → take the first | `test_two_files_holding_the_item_are_refused_not_ordered_sr022` |
+| M36 | a field declared twice → last one wins | `test_a_target_declared_twice_on_the_item_is_refused_sr022` |
+| M37 | the prose body read as frontmatter | `test_a_target_in_the_prose_body_is_not_the_goal_sr022` **(survived pass 1 — test defect, rewritten)** |
+| M38 | top-level keys do not stop at `items:` | `test_a_top_level_key_after_the_items_sequence_is_not_a_declaration_sr022` |
+| M39 | indented lines treated as top-level keys | `test_an_indented_legacy_key_is_an_item_field_not_a_top_level_one_sr022` (+29 others) |
+| M40 | `WEIGHT_GOAL_LB=180` **declared** in `.env.example` | `test_no_goal_shaped_knob_is_declared_anywhere_deploy_reads_sr022` |
+| M41 | no goal → invent 180 and post anyway | `test_a_missing_goal_posts_nothing_at_all_sr022` (+ `test_main_reports_the_refusal_and_exits_nonzero_without_posting_sr022`) |
+| M42 | category/id matched case-sensitively | `test_the_category_and_id_match_the_way_a_person_types_them_sr022` |
+| M43 | the `.env.example` default drifts from the code default | `test_the_item_location_knobs_are_declared_in_env_example_sr022` |
+| M44 | duplicate item ids in one file → take the first | `test_one_file_holding_the_item_twice_is_refused_sr022` |
+| M45 | a blank target becomes `0` rather than "no goal" | `test_a_blank_target_is_MISSING_not_a_zero_sr022` **(survived pass 1 — test defect, new test added)** |
+
+**One check IS carried by another, and it is named rather than left implicit.**
+M29 (a missing `unit` assumed to be `lb`) and M28 (the unit compared at all) are
+two lines guarding one property, and each has its own test, so neither is
+carried. But the **indent** rule (M39) and the **stop-at-`items:`** rule (M38)
+are now single lines in one shared parser rather than the three overlapping
+guards the old scanner had — the redundancy that let M25 survive last round is
+gone, and each is asserted directly. Nothing else in this block is defended by
+more than one mechanism.
+
+### Auto-check-off: what it would take, and why it is not built
+
+The Owner asked whether the feeder could tick the `weigh-in` habit off when
+Google reports a new weight sample, via `POST /api/check {id, done,
+expectedDate}`. Three hazards, and the first is the one that decides it:
+
+* **It must fire on a new `sampleTime`, not on a successful read.** The feeder
+  reads every 15 minutes and reposts the last known reading when the source
+  fails; a check-off keyed to "the cycle worked" would tick the habit off
+  hundreds of times against a weigh-in that happened days ago. The trigger is a
+  `sampleTime` strictly newer than the one in the state file — which means the
+  state file grows a second responsibility, and it is the file this block spent
+  a mutation round proving is only ever written on a successful read.
+* **`expectedDate` must be the sample's own local date, not today's.** A Sunday
+  evening weigh-in read on Monday morning would otherwise tick off Monday and
+  leave Sunday's box empty — the feeder would be recording a fact about the
+  wrong day. That needs the household's timezone applied to the sample's
+  instant, which this feeder does not currently carry.
+* **Idempotency is not established.** This repo has never exercised the
+  `{id, done, expectedDate}` shape at all: the only check-off it drives is
+  `sim/validate-sim.sh`'s `POST /api/check {"id": "..."}` with
+  `X-Forwarded-User`, which flips **today's** box and returns 200. Whether a
+  repeat POST is a no-op or a toggle is a NagLight-side fact that has not been
+  read, and a toggle would make a retry *un*-check a habit the person already
+  did. That has to be verified with one real call before anything is written —
+  the same gate that is keeping the vendor parser unwritten.
+
+**A separate interaction worth naming: `recur: weekly` against a windowless
+gauge's static 7-day staleness horizon.** The gauge sends no `window`, so
+NagLight renders it stale after **7 days** — and the item's declared cadence is
+**weekly**. Those are the same number, so a person weighing in exactly on
+schedule has **zero margin**: the gauge goes stale in the hours before each
+weigh-in, and any slip to day eight shows "unavailable" for a reading that is
+perfectly current by the household's own rule. The 15-minute timer does not help
+— it governs how fast an *absent source* becomes visible, not the horizon. This
+is not caused by the change above and is not fixed by it; the honest options are
+to accept the stale window before each weigh-in, or to raise it with NagLight as
+a horizon that should follow the item's cadence. Sending a `window` to buy a
+different horizon is **not** an option: `weekly` maps to a **24-hour** horizon,
+which is far worse, and a `window` would drag `direction` in with it.
+
+---
+
 **2026-09-09 the weight feeder (B11, SR-022/LLR-006/TC-006/IF-014) — PARTIAL,
 and the blocked half is a finding, not a gap.** The hub gains a third plain
 service — no container, on a 15-minute timer — that posts one body-weight gauge
@@ -426,6 +658,10 @@ says "unavailable" — the truth. A test asserts no `parse_google_health` /
 `parse_weight_datapoint` symbol exists (B7's `parse_gemini` precedent), and a
 deliberate defect that stubs a plausible fake reading is killed by it.
 
+**SUPERSEDED 2026-09-09 — the goal is now the weigh-in item's `target`; see
+the entry above. The paragraph below describes the design that was replaced and
+is kept so the reasoning is not lost.**
+
 **"THE GOAL LIVES IN THE USER'S DEFINITIONS" IS BUILT, AND IT UNCOVERED A REAL
 NagLight DEPENDENCY.** B5 recorded this half as explicitly not built. It is now:
 `WEIGHT_DEFINITIONS_DIR` names the **directory**, never the number, and the goal
@@ -438,7 +674,9 @@ over: a cycle with every plausible goal-shaped knob set and an empty definitions
 tree refuses, and no goal-shaped knob may be **declared** in `.env.example` or
 `FieldSchema.psd1` at all.
 
-**THE GAP, AND IT NEEDS NagLight.** Definitions reach the hub two ways. Folder
+**THE GAP, AND IT NEEDS NagLight — SUPERSEDED: it was not a gap, it was the
+design being wrong for the deployment that exists, and the goal moved onto an
+item's `target` instead. See the entry above.** Definitions reach the hub two ways. Folder
 mode (`drive.applyFolder`) stages the `.md` bytes verbatim and the key rides
 along. **Sheet mode regenerates the `.md` from CSV through `internal/defsheet`,
 whose `columns` list is the item field set, and drops unknown columns.** This

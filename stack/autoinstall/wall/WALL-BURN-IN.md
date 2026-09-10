@@ -322,6 +322,15 @@ below has to be done twice, with the right shape each time.
 Do not set `WALL_AUDIO_ENABLED=true` as evidence that audio works. The shipped
 backend intentionally reports `probe-required` and refuses every mutation.
 
+Before any hardware claim, verify the installed safety boundary. As root,
+`cat /etc/wall-panel/audio-router.env` must show exactly the nonsecret enable
+bit and fixed socket path, and `stat -c '%U:%G %a'` on that file must report
+`root:root 600`. When enabled, `stat -c '%U:%G %a'` on
+`/run/wall-audio-router/service.sock` must report `panel:panel 660`. A mutation
+sent to that socket by the panel UID must return `authorization_required`; a
+different UID must be disconnected by `SO_PEERCRED`. Do not include device
+identities in the recorded evidence.
+
 - [ ] Record `wpctl status`, `pactl list cards`, `aplay -l`, `arecord -l`,
       Bluetooth adapters/controllers and codec/jack controls without printing
       device addresses or pairing keys into committed evidence.

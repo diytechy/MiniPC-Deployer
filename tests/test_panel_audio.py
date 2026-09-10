@@ -247,6 +247,27 @@ def test_if015_telemetry_has_only_positive_bounded_derived_schema_sr023():
     assert refused["error"]["code"] == "unsafe_backend_result"
 
 
+def test_telemetry_in_flight_across_mutation_is_rejected_not_relabelled_sr023():
+    entered = threading.Event(); release = threading.Event()
+    class RacingBackend(FakeBackend):
+        def call(self, method, params, cancel):
+            if method == "telemetry":
+                entered.set(); release.wait(1)
+                return {"available": True, **analyze_samples(
+                    [0.5], generation=999, observed_monotonic_ms=40)}
+            return super().call(method, params, cancel)
+    broker = AudioBroker(RacingBackend(), authorize=lambda _m, _p: True)
+    replies = []
+    sample = threading.Thread(target=lambda: replies.append(response(
+        broker, request("telemetry", generation=0, request_id="sample"))))
+    sample.start(); assert entered.wait(1)
+    mutation = response(broker, request("connect", {"alias": "speaker"}, 0, "route"))
+    assert mutation["ok"] and mutation["generation"] == 1
+    release.set(); sample.join(timeout=1)
+    assert replies[0]["error"]["code"] == "stale_generation"
+    assert replies[0]["generation"] == 1
+
+
 def test_shipped_backend_is_observable_but_never_mutates_sr023():
     broker = AudioBroker(UnavailableBackend())
     status = response(broker, request())["result"]
@@ -346,4 +367,10 @@ def test_image_contract_is_disabled_local_and_carries_no_broad_dbus_policy_sr023
     assert completeness < enabled_branch
     assert 'fail_step "Panel audio payload is incomplete: missing $_wall_audio_file"' in firstboot
     assert '/etc/wall-panel/audio-router.env' in firstboot
-    assert "printf 'WALL_AUDIO_SOCKET=/run/wall-audio-router/service.sock\\n'" in firstboot
+    assert "printf 'WALL_AUDIO_ENABLED=%s\\nWALL_AUDIO_SOCKET=/run/wall-audio-router/service.sock\\n'" in firstboot
+    assert '"$WALL_AUDIO_ENABLED" > "$_wall_audio_env_new"' in firstboot
+    assert 'chown root:root "$_wall_audio_env_new"' in firstboot
+    assert 'chmod 0600 "$_wall_audio_env_new"' in firstboot
+    materialized = firstboot[firstboot.index("_wall_audio_env_new="):enabled_branch]
+    assert materialized.count("WALL_AUDIO_ENABLED") == 2
+    assert materialized.count("WALL_AUDIO_SOCKET") == 1

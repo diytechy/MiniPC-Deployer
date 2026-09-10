@@ -44,7 +44,9 @@ deliberately sticky `mutation_uncertain` on
 restart: routing changes remain refused until an operator reconciles actual
 device state and removes that journal. Status and telemetry remain readable.
 
-The mode-0660 socket shell has bounded concurrent clients, Linux peer-UID
+Telemetry is stamped with the request epoch and rejected if a concurrent
+mutation advances that epoch while capture is in flight. The mode-0660 socket
+shell has bounded concurrent clients, Linux peer-UID
 enforcement and read deadlines. `telemetry`
 is an IF-015 read method with a positive schema: unavailable, or bounded derived
 bands/RMS/peak/activity plus broker-owned generation and monotonic observation time. The
@@ -53,4 +55,7 @@ hold and emission cadence, emits no raw samples, and retains no samples. The
 shipped backend reports telemetry unavailable; the eventual capture adapter
 belongs behind the injected backend after the probe and an adversarial authority
 review. The service reads only root-owned `/etc/wall-panel/audio-router.env`,
-never the broad wall environment containing unrelated credentials.
+never the broad wall environment containing unrelated credentials. That file's
+exact allowlist is `WALL_AUDIO_ENABLED` and `WALL_AUDIO_SOCKET`; the enable bit
+is nonsecret installed-state evidence for the verifier without granting access
+to `wall.env`.

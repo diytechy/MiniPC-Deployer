@@ -1077,7 +1077,8 @@ fi
 install -d -m 0755 -o root -g root /etc/wall-panel
 _wall_audio_env=/etc/wall-panel/audio-router.env
 _wall_audio_env_new="${_wall_audio_env}.new"
-printf 'WALL_AUDIO_SOCKET=/run/wall-audio-router/service.sock\n' > "$_wall_audio_env_new"
+printf 'WALL_AUDIO_ENABLED=%s\nWALL_AUDIO_SOCKET=/run/wall-audio-router/service.sock\n' \
+    "$WALL_AUDIO_ENABLED" > "$_wall_audio_env_new"
 chown root:root "$_wall_audio_env_new"
 chmod 0600 "$_wall_audio_env_new"
 mv -f "$_wall_audio_env_new" "$_wall_audio_env"

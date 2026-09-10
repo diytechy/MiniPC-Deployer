@@ -7992,3 +7992,22 @@ for a full settle interval; a simulated delayed `Restart=on-failure` therefore
 cannot race credential/socket unlink. The focused Door suite passes **32 tests**.
 The full G1 gate passes **762 tests / 13 skipped, RESULT PASS**. The private
 OpenCV artifact execution remains unrun pending `motion.py`.
+
+The final audio epoch review found one cross-lane race: telemetry ran outside
+the mutation lock and could be relabelled with a newer generation. The broker
+now retains the request epoch, rejects a sample if mutation advances it while
+capture is in flight, and labels accepted telemetry only with that retained
+epoch. A coordinated fake proves generation-zero telemetry cannot escape as
+generation one after a concurrent route mutation. Future real backends must
+spawn no descendants unless isolation is extended to own and terminate their
+process group.
+
+The narrow root-owned audio environment now also materializes the validated,
+nonsecret `WALL_AUDIO_ENABLED` value alongside the fixed socket path. This lets
+installed-state verification determine intended state without reading the broad
+credential-bearing `wall.env`; its firstboot test fixes the two-key allowlist
+and root:root 0600 materialization. The burn-in procedure records direct checks
+for that file, the panel-owned 0660 socket, peer-UID refusal, and default-denied
+mutation authorization.
+The focused audio gate passes **18 tests / 6 platform skips**; the full G1 gate
+passes **763 tests / 13 skipped, RESULT PASS**, with strict trace integrity zero.

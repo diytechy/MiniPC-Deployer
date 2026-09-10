@@ -208,9 +208,21 @@ class AudioBroker:
                     raise BrokerError("stale_generation", "request generation is stale")
                 result = self._backend_call("call", method, params)
                 if method == "telemetry" and isinstance(result, dict) and result.get("available") is True:
-                    result = {**result, "generation": self.generation}
-                self._ensure_safe_result(method, result)
-                response = {"id": request_id, "generation": self.generation, "ok": True, "result": result}
+                    if not self._mutation_lock.acquire(timeout=self.backend_timeout_seconds):
+                        raise BrokerError("broker_busy", "another mutation is still running")
+                    try:
+                        if self.generation != request_generation:
+                            raise BrokerError("stale_generation", "telemetry generation changed during capture")
+                        result = {**result, "generation": request_generation}
+                        self._ensure_safe_result(method, result)
+                        response = {"id": request_id, "generation": request_generation,
+                                    "ok": True, "result": result}
+                    finally:
+                        self._mutation_lock.release()
+                else:
+                    self._ensure_safe_result(method, result)
+                    response = {"id": request_id, "generation": self.generation,
+                                "ok": True, "result": result}
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             response = self._error(request_id, self.generation, "bad_json", "invalid JSON")
         except PolicyError as exc:

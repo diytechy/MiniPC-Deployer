@@ -8,7 +8,8 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-**2026-09-09 — B14 Door image integration is implemented, not deployed.** The
+**2026-09-09 — B14 Door image integration is implemented and independently
+reviewed, not deployed.** The
 wall image now installs a hardened `wall-door-stream.service`, creates its
 non-login service account, and starts an idle local broker only after the
 packaged application exists. Root firstboot extracts only the Door allowlist
@@ -21,10 +22,12 @@ on readies only its idle socket, never a camera connection.
 The wall template declares the reserved camera address and T3 password
 placeholders plus public RTSP/geometry knobs; the SIM uses an unreachable
 `.invalid` fixture. The application capability contract now includes
-`door-stream-v1`. Application lifecycle/synthetic coverage is complete; the
-first independent review rejected three boundaries and their fixes are being
-verified before a second review. No panel deployment has occurred. Gate remains
-G1.
+`door-stream-v1`. Application lifecycle/synthetic coverage is complete. Four
+independent review rounds closed the image/application boundary findings; the
+later task-surface review also accepted the full-height Door geometry and fresh
+selection requirement after idle. No panel deployment has occurred. Owner-run
+load, latency, reconnect, filter comparison, long-run/concurrent behavior and
+Pandora-coexistence checks remain. Gate remains G1.
 
 **2026-09-09 — two Owner rulings applied (see the audit entry at the foot of
 this file).** (1) `SLEEP_END` now has **one** default, **06:45**, on both power
@@ -6756,3 +6759,13 @@ the stale-credential and expiry repairs plus the application broker cleanup and
 protocol fixes, then found no new in-scope concrete failure. The image work is
 review-complete and remains undeployed; only the Owner-run physical panel checks
 remain for B14.
+
+**2026-09-09 — B14 restart record aligned.** The Current State header no longer
+says review fixes are awaiting verification. It records the accepted image and
+application boundary, the later accepted full-height Door task surface, and the
+remaining Owner-run physical checks. No source, image or live-panel state
+changed. The full G1 gate passes with **549 passed / 5 skipped**, trace integrity
+0 with the unchanged 24 legacy orphans, and documentation navigation at 0 broken
+links with its two known orphan warnings. The first Windows run selected the
+Microsoft Store bash shim and produced seven path-conversion failures; putting
+Git Bash first on `PATH` produced the recorded green result.

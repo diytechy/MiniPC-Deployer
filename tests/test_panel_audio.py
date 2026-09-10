@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import socket
@@ -19,8 +20,15 @@ WALL = ROOT / "stack/autoinstall/wall"
 sys.path.insert(0, str(AUDIO))
 from routing import Device, PolicyError, choose_restored_route, validate_action
 from visualizer import MAX_SAMPLES, VisualizerTelemetry, analyze_samples
-from audio_router import (AudioBroker, BoundedUnixServer, UnavailableBackend,
-                          JS_SAFE_INTEGER, MAX_REQUEST_BYTES)
+from audio_router import (AudioBroker as RealAudioBroker, BoundedUnixServer,
+                          BrokerError, UnavailableBackend, JS_SAFE_INTEGER,
+                          MAX_REQUEST_BYTES)
+
+
+def AudioBroker(*args, **kwargs):
+    """White-box fakes stay in-process; production/default isolation is tested separately."""
+    kwargs.setdefault("isolate_backend", False)
+    return RealAudioBroker(*args, **kwargs)
 
 
 class FakeBackend:
@@ -29,6 +37,15 @@ class FakeBackend:
         self.calls.append((method, params)); return {"accepted": True}
     def inventory(self, cancel):
         return [Device("speaker", "output", True), Device("desktop-in", "input", True)]
+
+
+class ForeverBackend:
+    def call(self, method, params, cancel):
+        while True:
+            time.sleep(1)
+
+    def inventory(self, cancel):
+        return []
 
 
 def request(method="status", params=None, generation=0, request_id="r1"):
@@ -50,8 +67,10 @@ def test_input_selection_is_explicit_and_aliases_are_sanitized_sr023():
     with pytest.raises(PolicyError): validate_action("select_input", {"alias": "desktop-in"})
     validate_action("select_input", {"alias": "desktop-in", "explicit": True})
     with pytest.raises(PolicyError): validate_action("connect", {"alias": "AA:BB:CC:DD:EE:FF"})
-    for address in ("aabbccddeeff", "aa-bb-cc-dd-ee-ff", "aa_bb_cc_dd_ee_ff"):
+    for address in ("aabbccddeeff", "aa-bb-cc-dd-ee-ff", "aa_bb_cc_dd_ee_ff", "aabb.ccdd.eeff"):
         with pytest.raises(PolicyError): validate_action("connect", {"alias": address})
+        with pytest.raises(PolicyError):
+            validate_action("pair", {"alias": "speaker", "confirmation": address})
 
 
 def test_broker_dispatches_only_exact_bounded_current_generation_requests_sr023():
@@ -79,7 +98,7 @@ def test_broker_rejects_backend_identity_and_raw_audio_fields_sr023():
                     "route": None, "visualizer": {"available": False}}
         def inventory(self, cancel): return []
     assert response(AudioBroker(LeakingStatus()), request())["error"]["code"] == "unsafe_backend_result"
-    for address in ("aabbccddeeff", "aa-bb-cc-dd-ee-ff", "aa_bb_cc_dd_ee_ff"):
+    for address in ("aabbccddeeff", "aa-bb-cc-dd-ee-ff", "aa_bb_cc_dd_ee_ff", "aabb.ccdd.eeff"):
         class VariantStatus(LeakingStatus):
             def call(self, method, params, cancel):
                 value = super().call(method, params, cancel)
@@ -174,17 +193,47 @@ def test_uncertain_mutation_survives_restart_and_status_is_not_starved_sr023(tmp
     assert refused["error"]["code"] == "mutation_uncertain"
 
 
+def test_post_intent_backend_unavailable_remains_uncertain_across_restart_sr023(tmp_path):
+    state = tmp_path / "audio-state.json"
+
+    class MutatedThenUnavailable(FakeBackend):
+        def call(self, method, params, cancel):
+            self.calls.append((method, params))
+            raise BrokerError("backend_unavailable", "lost after possible device change")
+
+    first = AudioBroker(MutatedThenUnavailable(), state_path=str(state),
+                        authorize=lambda _m, _p: True)
+    failed = response(first, request("connect", {"alias": "speaker"}, 0, "lost"))
+    assert failed["error"]["code"] == "backend_unavailable"
+    restarted = AudioBroker(FakeBackend(), state_path=str(state),
+                            authorize=lambda _m, _p: True)
+    refused = response(restarted, request("connect", {"alias": "speaker"}, 0, "retry"))
+    assert refused["error"]["code"] == "mutation_uncertain"
+
+
+def test_killable_backend_isolation_recovers_after_more_hangs_than_worker_limit_sr023():
+    broker = RealAudioBroker(ForeverBackend(), backend_timeout_seconds=0.5)
+    for index in range(6):
+        refused = response(broker, request("status", request_id=f"hung-{index}"))
+        assert refused["error"]["code"] == "backend_timeout"
+    broker.backend = UnavailableBackend()
+    recovered = response(broker, request("status", request_id="recovered"))
+    assert recovered["ok"] and recovered["result"]["available"] is False
+    assert not any(child.name == "panel-audio-backend"
+                   for child in multiprocessing.active_children())
+
+
 def test_if015_telemetry_has_only_positive_bounded_derived_schema_sr023():
     class TelemetryBackend(FakeBackend):
         def call(self, method, params, cancel):
             if method == "telemetry":
-                derived = analyze_samples([0.0, 0.5, -0.5], generation=3,
+                derived = analyze_samples([0.0, 0.5, -0.5], generation=999,
                                           observed_monotonic_ms=40)
                 return {"available": True, **derived}
             return super().call(method, params, cancel)
 
     telemetry = response(AudioBroker(TelemetryBackend()), request("telemetry"))["result"]
-    assert telemetry["available"] is True and telemetry["generation"] == 3
+    assert telemetry["available"] is True and telemetry["generation"] == 0
     assert "samples" not in telemetry and len(telemetry["bands"]) <= 16
     unavailable = response(AudioBroker(UnavailableBackend()), request("telemetry"))["result"]
     assert unavailable == {"available": False}

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -20,7 +21,8 @@ import struct
 import threading
 from typing import Callable, Mapping, Protocol
 
-from routing import ALIAS, Device, MUTATING_METHODS, PolicyError, validate_action, validate_inventory_action
+from routing import (ALIAS, HARDWARE_ADDRESS, Device, MUTATING_METHODS,
+                     PolicyError, validate_action, validate_inventory_action)
 
 
 MAX_REQUEST_BYTES = 16_384
@@ -64,6 +66,22 @@ class BrokerError(Exception):
         self.code = code
 
 
+def _isolated_backend_entry(connection, backend: Backend, operation: str,
+                            method: str | None, params: Mapping[str, object]) -> None:
+    """Run one trusted backend operation in a process the broker can reap."""
+    cancel = threading.Event()
+    try:
+        result = (backend.inventory(cancel) if operation == "inventory"
+                  else backend.call(str(method), params, cancel))
+        connection.send(("result", result))
+    except BaseException as error:
+        code = (error.code if isinstance(error, BrokerError) and
+                error.code == "backend_unavailable" else "backend_failure")
+        connection.send(("error", code))
+    finally:
+        connection.close()
+
+
 class DurableMutationState:
     """Atomic one-record mutation journal; pending state is deliberately sticky."""
 
@@ -105,10 +123,6 @@ class DurableMutationState:
                    "pending": None, "completed": {"signature": signature, "response": response}}
         self._write(changed); self.data = changed
 
-    def abandon_known_noop(self) -> None:
-        changed = {**self.data, "pending": None}
-        self._write(changed); self.data = changed
-
     def _write(self, data: dict) -> None:
         if not self.path:
             return
@@ -138,6 +152,7 @@ class AudioBroker:
         authorize: Callable[[str, Mapping[str, object]], bool] | None = None,
         *, state_path: str | None = None,
         backend_timeout_seconds: float = DEFAULT_BACKEND_TIMEOUT_SECONDS,
+        isolate_backend: bool = True,
     ):
         self.backend = backend
         self.authorize = authorize or (lambda _method, _params: False)
@@ -146,6 +161,7 @@ class AudioBroker:
                 not 0.05 <= backend_timeout_seconds <= 120):
             raise ValueError("backend timeout outside 0.05..120 seconds")
         self.backend_timeout_seconds = float(backend_timeout_seconds)
+        self.isolate_backend = isolate_backend is True
         self.state = DurableMutationState(state_path, generation)
         self._mutation_lock = threading.Lock()
         self._backend_slots = threading.BoundedSemaphore(MAX_BACKEND_WORKERS)
@@ -191,6 +207,8 @@ class AudioBroker:
                 if request_generation != self.generation:
                     raise BrokerError("stale_generation", "request generation is stale")
                 result = self._backend_call("call", method, params)
+                if method == "telemetry" and isinstance(result, dict) and result.get("available") is True:
+                    result = {**result, "generation": self.generation}
                 self._ensure_safe_result(method, result)
                 response = {"id": request_id, "generation": self.generation, "ok": True, "result": result}
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
@@ -238,12 +256,9 @@ class AudioBroker:
                 raise BrokerError("unsafe_backend_result", "backend inventory is invalid")
             validate_inventory_action(method, params, inventory)
             self.state.begin(signature)
-            try:
-                result = self._backend_call("call", method, params)
-            except BrokerError as error:
-                if error.code == "backend_unavailable":
-                    self.state.abandon_known_noop()
-                raise
+            # Once intent is durable, no backend exception proves that the
+            # device remained unchanged. Leave pending sticky for reconciliation.
+            result = self._backend_call("call", method, params)
             self._ensure_safe_result(method, result)
             accepted = result["accepted"] is True
             response_generation = self.generation + (1 if accepted else 0)
@@ -258,6 +273,13 @@ class AudioBroker:
                       params: Mapping[str, object] | None = None) -> object:
         if not self._backend_slots.acquire(timeout=self.backend_timeout_seconds):
             raise BrokerError("backend_busy", "audio backend capacity is exhausted")
+        if self.isolate_backend:
+            try:
+                return self._isolated_backend_call(operation, method, params or {})
+            finally:
+                self._backend_slots.release()
+        # White-box tests may opt into this in-process seam to inspect their
+        # fake. Production serve() never does: Python cannot kill a stuck thread.
         cancel = threading.Event(); done = threading.Event(); outcome: dict[str, object] = {}
 
         def invoke() -> None:
@@ -278,6 +300,49 @@ class AudioBroker:
                 raise BrokerError("backend_unavailable", "audio routing is not configured")
             raise BrokerError("backend_failure", "audio backend failed")
         return outcome.get("result")
+
+    def _isolated_backend_call(self, operation: str, method: str | None,
+                               params: Mapping[str, object]) -> object:
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_isolated_backend_entry,
+            args=(child, self.backend, operation, method, params),
+            name="panel-audio-backend",
+            daemon=True,
+        )
+        try:
+            process.start(); child.close()
+            if not parent.poll(self.backend_timeout_seconds):
+                process.terminate(); process.join(0.5)
+                if process.is_alive():
+                    process.kill(); process.join(0.5)
+                if process.is_alive():
+                    raise BrokerError("backend_busy", "audio backend could not be reaped")
+                raise BrokerError("backend_timeout", "audio backend exceeded its deadline")
+            try:
+                kind, value = parent.recv()
+            except EOFError:
+                raise BrokerError("backend_failure", "audio backend failed")
+            process.join(0.5)
+            if process.is_alive():
+                process.terminate(); process.join(0.5)
+            if process.is_alive():
+                process.kill(); process.join(0.5)
+            if process.is_alive():
+                raise BrokerError("backend_busy", "audio backend could not be reaped")
+            if kind == "error":
+                if value == "backend_unavailable":
+                    raise BrokerError("backend_unavailable", "audio routing is not configured")
+                raise BrokerError("backend_failure", "audio backend failed")
+            if kind != "result":
+                raise BrokerError("backend_failure", "audio backend failed")
+            return value
+        finally:
+            parent.close()
+            child.close()
+            if process.is_alive():
+                process.kill(); process.join(0.5)
 
     def _error(self, request_id: object, generation: object, code: str, message: str) -> dict:
         return {"id": request_id, "generation": generation, "ok": False,
@@ -331,10 +396,8 @@ class AudioBroker:
     def _safe_string(self, value: object, limit: int) -> None:
         if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):
             raise BrokerError("unsafe_backend_result", "backend string is invalid")
-        if re.search(r"(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f])|"
-                     r"(?<![0-9a-f])(?:[0-9a-f]{2}_){5}[0-9a-f]{2}(?![0-9a-f])|"
-                     r"(?<![0-9a-f])[0-9a-f]{12}(?![0-9a-f])|"
-                     r"dev_[0-9a-f]{2}(?:_[0-9a-f]{2}){5}|/org/bluez(?:/|$)|data:audio/", value):
+        if (HARDWARE_ADDRESS.search(value) or
+                re.search(r"(?i)dev_[0-9a-f]{2}(?:_[0-9a-f]{2}){5}|/org/bluez(?:/|$)|data:audio/", value)):
             raise BrokerError("unsafe_backend_result", "backend string exposes forbidden identity or audio")
 
     def _safe_device(self, value: object) -> None:
@@ -368,9 +431,10 @@ class BoundedUnixServer:
     """Small bounded concurrent Unix server with per-client read deadlines."""
 
     def __init__(self, path: str, broker: AudioBroker, *, max_clients: int = 4,
-                 client_timeout_seconds: float = 2.0):
+                 client_timeout_seconds: float = 2.0, allowed_uid: int | None = None):
         self.path, self.broker = Path(path), broker
         self.client_timeout_seconds = client_timeout_seconds
+        self.allowed_uid = os.getuid() if allowed_uid is None else allowed_uid
         self._slots = threading.BoundedSemaphore(max_clients)
         self._stop = threading.Event()
         self._socket: socket.socket | None = None
@@ -398,7 +462,7 @@ class BoundedUnixServer:
             connection.settimeout(self.client_timeout_seconds)
             if hasattr(socket, "SO_PEERCRED"):
                 _pid, uid, _gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-                if uid != os.getuid(): return
+                if uid != self.allowed_uid: return
             data = bytearray()
             while not data.endswith(b"\n") and len(data) <= MAX_REQUEST_BYTES:
                 part = connection.recv(min(4096, MAX_REQUEST_BYTES + 1 - len(data)))

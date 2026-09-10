@@ -7943,11 +7943,11 @@ retry is deduplicated across restart. A timeout, crash, invalid result or write
 failure after intent remains a persistent `mutation_uncertain` refusal until an
 operator reconciles device state, while status and telemetry stay available.
 
-Backend inventory and action calls now have finite deadlines, receive a
-cooperative cancellation event, and consume bounded daemon-worker slots. Only
-mutations share the serialization lock, so a stuck device action cannot starve
-status/telemetry. Alias and result validation rejects compact, colon, hyphen and
-underscore hardware-address forms plus BlueZ paths. Numeric protocol and
+Backend inventory and action calls now have finite deadlines and run in
+killable bounded child processes. Only mutations share the serialization lock,
+so a stuck device action cannot starve status/telemetry. Alias and result
+validation rejects compact, colon, hyphen, underscore and Cisco-dotted
+hardware-address forms plus BlueZ paths. Numeric protocol and
 telemetry counters are bounded to JavaScript-safe integers, booleans are not
 accepted as numbers, and a zero silence floor still classifies zero RMS as
 silent.
@@ -7964,3 +7964,21 @@ scripts/check.py` with Git Bash on `PATH` **750 passed / 12 skipped, RESULT
 PASS**; config, strict trace integrity, flow validation, docs and edited shell
 syntax passed. Linux socket, VM actual routing and physical telemetry evidence
 remain required unrun.
+
+
+The next adversarial pass found that cooperative cancellation did not reclaim a
+slot from a backend that ignored it. Production operations now run in bounded
+spawned child processes; timeout expiry terminates and reaps the child before
+returning capacity. A regression drives six consecutive permanent hangs (past
+the former four-slot ceiling) and proves a later healthy status succeeds with
+no backend child left alive. Every exception after durable intent, including
+`backend_unavailable`, now leaves the journal sticky uncertain across restart.
+The broker overwrites backend telemetry generations with its own epoch, and
+request/result/pair-confirmation validation now also rejects Cisco-dotted
+addresses. Linux socket coverage asserts mode 0660 and uses an actual
+`SO_PEERCRED` connection against a deliberately mismatched configured UID; that
+case remains platform-skipped in the Windows run and must execute in the Linux
+release gate. Focused evidence is **17 passed / 6 platform skips**; configuration,
+Python parsing and strict trace integrity passed; and the fresh full G1 gate is
+**758 passed / 13 skipped, RESULT PASS**. No physical routing or telemetry claim
+is added.

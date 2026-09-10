@@ -20,7 +20,8 @@ MUTATING_METHODS = frozenset(
 METHODS = MUTATING_METHODS | {"status", "telemetry"}
 HARDWARE_ADDRESS = re.compile(
     r"(?i)(?<![0-9a-f])(?:(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|"
-    r"(?:[0-9a-f]{2}_){5}[0-9a-f]{2}|[0-9a-f]{12})(?![0-9a-f])"
+    r"(?:[0-9a-f]{2}_){5}[0-9a-f]{2}|(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}|"
+    r"[0-9a-f]{12})(?![0-9a-f])"
 )
 
 
@@ -78,7 +79,8 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         raise PolicyError("enabled must be boolean")
     if method == "pair" and "confirmation" in params:
         confirmation = params["confirmation"]
-        if not isinstance(confirmation, str) or not 1 <= len(confirmation) <= 16:
+        if (not isinstance(confirmation, str) or not 1 <= len(confirmation) <= 16 or
+                HARDWARE_ADDRESS.search(confirmation)):
             raise PolicyError("pairing confirmation is invalid")
 
 

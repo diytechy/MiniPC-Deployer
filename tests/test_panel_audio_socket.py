@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import stat
 import sys
 import threading
 import time
@@ -34,6 +35,16 @@ class PanelAudioSocketTests(unittest.TestCase):
         deadline = time.monotonic() + 2
         while not self.path.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(socket, "SO_PEERCRED"),
+                         "requires Linux SO_PEERCRED")
+    def test_socket_mode_and_actual_peer_uid_mismatch_are_enforced(self):
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o660)
+        self.server.allowed_uid = os.getuid() + 1
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(1); client.connect(str(self.path)); client.sendall(wire())
+        self.assertEqual(client.recv(65536), b"")
+        client.close()
 
     def tearDown(self):
         self.server.close()

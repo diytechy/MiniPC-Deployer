@@ -78,7 +78,11 @@ below was established on 2026-09-09 by CALLING Google, not by reading a blog:
 
 WHAT IS THEREFORE MISSING, AND ONLY THE OWNER CAN CLEAR IT:
   1. enable `health.googleapis.com` on the Google Cloud project that owns the
-     existing OAuth client (the one oauth2-proxy and TRACKER_DRIVE_* share);
+     household's one existing OAuth client - oauth2-proxy's, in
+     OAUTH2_PROXY_CLIENT_ID / OAUTH2_PROXY_CLIENT_SECRET. There is no separate
+     TRACKER_DRIVE_CLIENT_* pair: the live hub's .env was listed by key name on
+     2026-09-09 and has none, and the tracker's Drive sync reads the
+     OAUTH2_PROXY_* pair itself;
   2. add the scope above to that client's consent screen and add the Owner to
      the project's Test users list (projects start capped at 100 test users;
      going past that needs a third-party security review, which the household
@@ -111,7 +115,12 @@ this repo's IF-014):
     "0 lb" against a 180 lb goal is the most alarming-looking green-adjacent
     lie the panel could tell.
 
-THE GOAL LIVES IN THE USER'S DEFINITIONS - see `load_goal_from_definitions`.
+THE GOAL LIVES IN THE USER'S DEFINITIONS, AS THE `target` OF ONE ITEM - see
+the block above DEFAULT_GOAL_CATEGORY, and `load_goal_from_definitions`. It
+used to be a top-level `weight_goal_lb` key; that was changed on 2026-09-09
+because Drive SHEET mode, which this household runs, regenerates the .md
+from an item-column list and erases unknown top-level keys. Do not put it
+back.
 
 THE FOUR ACCEPTANCE PROPERTIES, each with the symbol that enforces it:
   1. a missing or stale source renders stale, never green -> `build_post`
@@ -171,8 +180,66 @@ STALE_HORIZON_SECONDS = {
     None: 7 * 24 * 3600,
 }
 
-# The one frontmatter key that carries the goal. See load_goal_from_definitions.
-GOAL_KEY = "weight_goal_lb"
+# WHERE THE GOAL LIVES: THE `target` OF ONE ITEM IN THE PERSON'S DEFINITIONS.
+#
+# THIS CHANGED ON 2026-09-09 AND THE REASON MUST NOT BE LOST (see docs/status.md,
+# "the goal moved from a file-level key to the weigh-in item's target"). The
+# first version put the goal in a TOP-LEVEL frontmatter key, `weight_goal_lb`,
+# and deliberately refused to read an item field. Two facts killed that design:
+#
+#   * THIS HOUSEHOLD RUNS SHEET MODE (TRACKER_DRIVE_SHEET_ID set,
+#     TRACKER_DRIVE_FOLDER_ID deliberately blank). In sheet mode NagLight's
+#     internal/defsheet REGENERATES each definitions .md from a fixed `columns`
+#     list, which is the ITEM field set; a column it does not recognise is
+#     collected into `unknown` and DROPPED. A top-level `weight_goal_lb` is
+#     therefore erased by the first sync after anyone edits the sheet. The old
+#     design did not merely lack a feature - it silently deleted the household's
+#     goal and left the panel dark with nothing saying why.
+#   * THERE IS NO VENDOR FALLBACK. Google Health v4 has no goal or target
+#     concept at all: `DataPoint` has 43 members and none is a goal, `Profile`
+#     and `Settings` carry none, and the only two occurrences of "goal" in the
+#     292KB discovery document (revision 20260908) are a UI settings enum.
+#
+# `target` and `unit` are ALREADY item columns that round-trip through sheet
+# mode today, so the goal now lives where the sync will actually carry it:
+#
+#     ---
+#     category: Health
+#     color_weight: 1.5
+#     items:
+#       - id: weigh-in
+#         title: Step on the scale
+#         type: habit
+#         recur: weekly
+#         horizon: long
+#         target: 170
+#         unit: lb
+#     ---
+#
+# DO NOT "RESTORE" THE TOP-LEVEL KEY. It is still recognised, but only so the
+# feeder can REFUSE and say where the goal moved to - see
+# `load_goal_from_definitions`.
+
+# WHICH item, as two LOCATION knobs rather than two hardcoded strings, so the
+# Owner can rename or move the item without a code change. They name a place,
+# never a number: there is still no goal-shaped knob anywhere deploy reads, and
+# a test asserts that negative by file scan.
+DEFAULT_GOAL_CATEGORY = "Health"
+DEFAULT_GOAL_ITEM_ID = "weigh-in"
+
+# The item fields read, and the ONE unit accepted. See `goal_from_item`: the
+# unit is CHECKED, never assumed, because 77 is a perfectly plausible kilogram
+# weight AND sits inside the pounds sanity band, so an unchecked `unit: kg`
+# posts "77 lb" - a confident, plausible, wrong number about someone's body,
+# which is the same failure class this feeder still refuses to write a vendor
+# parser for.
+TARGET_KEY = "target"
+UNIT_KEY = "unit"
+GOAL_UNIT = "lb"
+
+# The superseded top-level key. Kept ONLY so a file that still carries it is
+# refused with a message that says where the goal went. See above.
+LEGACY_GOAL_KEY = "weight_goal_lb"
 
 # A goal outside this band is a typo, not a goal. 40 lb is below any living
 # adult and 1000 lb is above the heaviest ever recorded; the point is not to
@@ -336,97 +403,366 @@ def grams_to_pounds(grams):
     return check_pounds(grams, "grams") / 453.59237
 
 
-def parse_goal_text(text, where):
-    """Parse the goal value a definitions file declared, in pounds.
+def clean_scalar(text):
+    """Strip the quoting and the trailing `# comment` a hand-edited YAML scalar
+    may carry, and return what the person meant.
+
+    Definitions frontmatter is edited by hand in a spreadsheet cell and in a
+    text editor, so `170`, `"170"`, `'170'` and `170 # summer` are all the same
+    number, and `lb`, `"lb"` and `lb  # pounds` are all the same unit.
+    """
+    cleaned = (text or "").strip()
+    if cleaned.startswith(("'", '"')) and len(cleaned) >= 2 and cleaned[-1] == cleaned[0]:
+        return cleaned[1:-1].strip()
+    return cleaned.split("#", 1)[0].strip()
+
+
+def parse_goal_pounds(text, where, key):
+    """Parse a declared goal, in pounds. The caller has ALREADY checked the unit.
 
     Contract:
-      Inputs:  text: the raw scalar exactly as written after `weight_goal_lb:`.
+      Inputs:  text: the raw scalar exactly as written after `<key>:`;
+               where: str for the message; key: the field's name, so the
+               message names the thing the person actually typed.
       Outputs: float in GOAL_MIN_LB..GOAL_MAX_LB.
       Raises:  GoalMissing for a blank; ValueError for anything unparseable or
                out of band, naming the file so the person can fix their own
                definitions.
 
-    Quotes and a trailing `# comment` are stripped, because the definitions are
-    hand-edited YAML frontmatter and both are ordinary things to write there.
-
     Implements: LLR-006
     """
-    cleaned = (text or "").strip()
-    if cleaned.startswith(("'", '"')) and len(cleaned) >= 2 and cleaned[-1] == cleaned[0]:
-        cleaned = cleaned[1:-1].strip()
-    else:
-        cleaned = cleaned.split("#", 1)[0].strip()
+    cleaned = clean_scalar(text)
     if not cleaned:
-        raise GoalMissing("%s: %s is present but blank" % (where, GOAL_KEY))
+        raise GoalMissing("%s: %s is present but blank" % (where, key))
     try:
         value = float(cleaned)
     except ValueError:
-        raise ValueError("%s: %s is not a number: %r" % (where, GOAL_KEY, text))
+        raise ValueError("%s: %s is not a number: %r" % (where, key, text))
     if not math.isfinite(value):
-        raise ValueError("%s: %s is not finite: %r" % (where, GOAL_KEY, text))
+        raise ValueError("%s: %s is not finite: %r" % (where, key, text))
     if value < GOAL_MIN_LB or value > GOAL_MAX_LB:
         raise ValueError(
             "%s: %s is %g lb, outside the sanity band %g..%g. This is a typo "
             "guard, not a judgement: a goal one digit out drags the inferred "
             "50 lb bar off the scale and paints every real reading full red."
-            % (where, GOAL_KEY, value, GOAL_MIN_LB, GOAL_MAX_LB))
+            % (where, key, value, GOAL_MIN_LB, GOAL_MAX_LB))
     return value
 
 
-# `weight_goal_lb: 180` at the TOP LEVEL of the frontmatter - column zero, so an
-# item field of the same name (which would be indented under a `- ` dash) can
-# never be mistaken for the file-level goal.
-GOAL_LINE_RE = re.compile(r"^%s\s*:\s*(.*)$" % re.escape(GOAL_KEY))
+# One `key: value` line, with its own indentation captured. The key pattern is
+# deliberately narrow so a prose line that happens to contain a colon is not
+# read as a field.
+FIELD_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)\s*:\s?(.*)$")
+
+# The one key whose sequence this reader follows into.
+ITEMS_KEY = "items"
 
 
-def find_goal_in_frontmatter(body, where):
-    """Return the goal declared in ONE definitions file, or None.
+def frontmatter_lines(body):
+    """The lines BETWEEN the first two `---` fences, or None if there are none.
 
-    Contract:
-      Inputs:  body: the whole .md file's text; where: its path, for messages.
-      Outputs: float pounds, or None when this file declares no goal.
-      Raises:  ValueError when the file declares a goal that is unusable, and
-               GoalMissing when it declares the key with nothing after it. A bad
-               declaration is NEVER treated as "no declaration": silently
-               ignoring a typo'd goal is how a person ends up staring at a bar
-               drawn around a number they thought they had changed.
-
-    Only the leading YAML frontmatter (between the first two `---` fences) is
-    read, matching internal/defs.frontmatter exactly. The prose body of a
-    definitions file is free notes and a `weight_goal_lb:` mentioned there is
-    someone writing about the goal, not declaring it.
-
-    Implements: LLR-006
+    Matches internal/defs.frontmatter: the prose body of a definitions file is
+    free notes, and a `target:` written down there is someone thinking out loud,
+    not declaring anything.
     """
     lines = body.replace("\r\n", "\n").split("\n")
     if not lines or lines[0].strip() != "---":
-        return None                     # not a definitions file at all
-    found = None
-    for index in range(1, len(lines)):
-        line = lines[index]
+        return None                       # not a definitions file at all
+    out = []
+    for line in lines[1:]:
         if line.strip() == "---":
-            break                       # end of frontmatter
-        if line.strip().startswith("items:"):
-            break                       # the item sequence; nothing top-level after
-        # DELIBERATELY REDUNDANT WITH THE `^` IN GOAL_LINE_RE AND WITH
-        # `.match`, and the mutation run of 2026-09-09 proved it: removing this
-        # check alone left the whole suite green (M25), because either of the
-        # other two still refuses an indented line. It stays because it states
-        # the intent where a reader looks for it, and because a future edit to
-        # the pattern would otherwise silently promote an item field to the
-        # household's goal. M27 removes all three at once and IS killed, so the
-        # property is covered even though this one line is not individually.
-        if line[:1] in (" ", "\t"):
-            continue                    # indented: an item field, not file-level
-        match = GOAL_LINE_RE.match(line)
+            break
+        out.append(line)
+    return out
+
+
+def leading_indent(raw, where, number):
+    """The width of `raw`'s leading whitespace, refusing a TAB outright.
+
+    YAML FORBIDS TABS IN INDENTATION - not as a style rule, as a parse error:
+    `yaml.v3`, which is what NagLight's own internal/defs loads these files
+    with, rejects the document. A reader that quietly accepted a tab would be
+    reading a file the real loader cannot read, and would then be the ONLY
+    thing in the household that believes it knows what that file declares. So
+    a tab in the indentation is a refusal that names the line, not a width.
+    """
+    lead = raw[:len(raw) - len(raw.lstrip())]
+    if "\t" in lead:
+        raise ValueError(
+            "%s: line %d is indented with a TAB. YAML forbids tabs in "
+            "indentation, so the loader that syncs these files rejects the "
+            "whole document - this feeder will not be the one thing that "
+            "thinks it knows what the file says. Indent it with spaces."
+            % (where, number))
+    return len(raw) - len(raw.lstrip(" "))
+
+
+def parse_definitions_file(body, where="the definitions file"):
+    """Split ONE definitions file's frontmatter into its top-level keys and its
+    items, in the shape NagLight's internal/defs would see.
+
+    Contract:
+      Inputs:  body: the whole .md file's text; where: its path, for messages.
+      Outputs: (top: {key: [raw value, ...]}, items: [{field: [raw value, ...]}])
+               or None when the text is not a definitions file.
+      Raises:  ValueError when the frontmatter cannot be read HONESTLY - a tab
+               indent, a second `items:`, or an inline `items:` sequence.
+
+    Values are kept as LISTS of the raw text so a duplicate declaration is
+    visible to the caller rather than silently resolved by "last one wins" -
+    picking one of two contradictory goals is the defect this module refuses
+    everywhere else.
+
+    INDENTATION DEPTH IS THE STRUCTURE, AND IGNORING IT WAS THE CROSS-REVIEW
+    DEFECT. The first cut read any indented `key: value` inside `items:` as a
+    field of the current item, at whatever depth it sat. Four separate findings
+    fell out of that one mistake, and every one ends with a plausible,
+    confident, WRONG number about the Owner's body on the wall:
+
+        items:                          items:
+          - id: weigh-in                  - id: take-vitamins
+            metadata:                       alternatives:
+              target: 170                     - id: weigh-in
+              unit: lb                          target: 170
+                                                unit: lb
+
+    Neither of those declares a 170 lb goal to any YAML parser alive: the first
+    is `metadata.target`, the second is a nested list belonging to a DIFFERENT
+    item. Both used to yield 170. So did a second `items:` block lower down,
+    and so did a tab-indented block that yaml.v3 refuses to parse at all.
+
+    The fix is one rule, not four patches: A FIELD BELONGS TO AN ITEM ONLY AT
+    THAT ITEM'S OWN FIELD COLUMN. The sequence's indent is fixed by its first
+    `- ` entry; the item's field column is fixed by the first field on that
+    entry; a line deeper than the field column is the content of a nested
+    container and is NOT the item's, and a `- ` deeper than the sequence indent
+    is a nested list's entry and is NOT an item.
+
+    AND AMBIGUITY IS REFUSED, NOT RESOLVED. A second `items:` key is not a
+    continuation to be merged and not a reset to be preferred; which sequence
+    the household meant is not guessable, so the document is refused. That is
+    the same rule this module already applies to two files declaring the goal,
+    two items with one id, and a target declared twice.
+
+    WHY THIS IS STILL A HAND READER AND NOT PyYAML. The service is stdlib-only
+    by design - a plain unit under ProtectSystem=strict with no venv - so a real
+    YAML parser means a new apt package name and the offline apt export re-run
+    that goes with it. It would also be the WRONG SHAPE: a full parser is
+    maximally permissive, and anchors, aliases and merge keys can make a goal
+    arrive from a line the person cannot see beside the number. What this reader
+    owes the household is the opposite - to read the narrow block subset the
+    sheet actually generates and REFUSE everything else rather than interpret
+    it. `tests/test_weight_feeder.py` checks this reading against PyYAML as an
+    oracle wherever PyYAML happens to be installed, so "narrow" cannot quietly
+    become "different".
+
+    TOP-LEVEL KEYS STOP AT `items:`, exactly as internal/defs does. A key at
+    column zero AFTER the item sequence is malformed YAML that the frontmatter
+    happens to contain, not a declaration, and reading it would let a stray
+    line at the bottom of a hand-edited file speak for the household.
+
+    Implements: LLR-006
+    """
+    lines = frontmatter_lines(body)
+    if lines is None:
+        return None
+    top, items = {}, []
+    in_items = after_items = False
+    seq_indent = field_indent = current = None
+    for offset, raw in enumerate(lines):
+        number = offset + 2               # +1 for the fence, +1 for 1-based
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = leading_indent(raw, where, number)
+        text = raw.strip()
+
+        # Have we fallen out of the item sequence?
+        if in_items and seq_indent is not None and indent < seq_indent:
+            in_items, seq_indent, field_indent, current = False, None, None, None
+        elif in_items and seq_indent is None and not text.startswith("-"):
+            # `items:` was declared and the next thing is not a sequence entry.
+            in_items = False
+
+        # Column zero, or anywhere outside the sequence.
+        if not in_items:
+            if indent:
+                continue                  # indented, but inside nothing we read
+            match = FIELD_RE.match(text)
+            if match is None:
+                continue
+            key = match.group(2)
+            if key == ITEMS_KEY:
+                if after_items:
+                    raise ValueError(
+                        "%s declares `%s:` twice in one frontmatter (line %d). "
+                        "Which sequence carries the household's items is not "
+                        "guessable, and merging them would let a block nobody "
+                        "is looking at supply a number. Delete one."
+                        % (where, ITEMS_KEY, number))
+                inline = clean_scalar(match.group(3))
+                if inline not in ("", "[]"):
+                    raise ValueError(
+                        "%s writes `%s:` as an inline sequence (line %d). This "
+                        "reader follows the block form the sheet generates and "
+                        "refuses to guess at any other, because guessing wrong "
+                        "here posts a number about somebody's body."
+                        % (where, ITEMS_KEY, number))
+                in_items, after_items = True, True
+                seq_indent = field_indent = current = None
+                continue
+            if after_items:
+                continue                  # see the docstring: not a declaration
+            top.setdefault(key, []).append(match.group(3))
+            continue
+
+        # Inside the item sequence.
+        if text.startswith("-"):
+            if seq_indent is None:
+                seq_indent = indent       # the first entry fixes the sequence
+            if indent != seq_indent:
+                continue                  # a NESTED list's entry, not an item
+            current = {}
+            items.append(current)
+            rest = text[1:]
+            column = indent + 1 + (len(rest) - len(rest.lstrip(" ")))
+            rest = rest.strip()
+            field_indent = column if rest else None
+            if not rest:
+                continue                  # `-` alone: the fields are below it
+            match = FIELD_RE.match(rest)
+            if match is not None:
+                current.setdefault(match.group(2), []).append(match.group(3))
+            continue
+        if current is None:
+            continue                      # an indented line before any `- `
+        if field_indent is None:
+            if indent <= seq_indent:
+                continue
+            field_indent = indent         # the first field fixes the column
+        if indent != field_indent:
+            continue                      # NOT this item's: nested, or ragged
+        match = FIELD_RE.match(text)
         if match is None:
             continue
-        if found is not None:
-            raise ValueError(
-                "%s declares %s twice; which one is authoritative is not "
-                "guessable." % (where, GOAL_KEY))
-        found = parse_goal_text(match.group(1), where)
-    return found
+        current.setdefault(match.group(2), []).append(match.group(3))
+    return top, items
+
+
+def one_value(values, where, what):
+    """The single raw value for a field, or ValueError if it was declared twice.
+
+    Two contradictory declarations of the same thing are not a tie to be broken:
+    whichever this code picked, the person would be looking at a bar drawn
+    around a number they thought they had changed.
+    """
+    if len(values) > 1:
+        raise ValueError(
+            "%s declares %s %d times; which one is authoritative is not "
+            "guessable." % (where, what, len(values)))
+    return values[0]
+
+
+def find_goal_item(body, where, category, item_id):
+    """The item this household's goal lives in, from ONE definitions file.
+
+    Contract:
+      Inputs:  body: the file's text; where: its path; category and item_id:
+               the LOCATION knobs, already resolved.
+      Outputs: {field: [raw value, ...]} for the matching item, or None when
+               this file is not that category or holds no such item.
+      Raises:  ValueError when the file declares its category twice, or holds
+               the same item id twice - defs.Load found duplicate ids on a real
+               household's files, and the loser is never used and never
+               reported.
+
+    THE MATCH IS CASE-INSENSITIVE ON BOTH HALVES. Both strings are typed by a
+    person into a spreadsheet cell, and `Health` against `health` must not be
+    the difference between a goal and a dark panel.
+
+    Implements: SR-022, LLR-006
+    """
+    parsed = parse_definitions_file(body, where)
+    if parsed is None:
+        return None
+    top, items = parsed
+    if "category" not in top:
+        return None
+    declared = clean_scalar(one_value(top["category"], where, "category"))
+    if declared.casefold() != category.strip().casefold():
+        return None
+    wanted = item_id.strip().casefold()
+    matches = [
+        item for item in items
+        if "id" in item
+        and clean_scalar(one_value(item["id"], where, "an item id")).casefold() == wanted]
+    if len(matches) > 1:
+        raise ValueError(
+            "%s holds %d items with id %r under category %r; which one carries "
+            "the goal is not guessable." % (where, len(matches), item_id, category))
+    return matches[0] if matches else None
+
+
+def goal_from_item(item, where, category, item_id):
+    """Turn the matched item's `target`/`unit` into the goal, in pounds.
+
+    Contract:
+      Outputs: float pounds.
+      Raises:  GoalMissing when there is no target, or it is blank - the
+               person has not said what they are aiming at, and there is no
+               honest bar to draw. ValueError when a target IS declared but
+               cannot be honoured: unusable as a number, or carrying no unit,
+               or carrying any unit but `lb`. The line is "nothing declared is
+               missing; something declared that we cannot use is a refusal
+               that names the file".
+
+    THE UNIT IS CHECKED BEFORE THE NUMBER IS EVEN PARSED, AND THAT ORDER IS THE
+    POINT. `target: 77` with `unit: kg` is 170 lb, and 77 sits comfortably
+    INSIDE the pounds sanity band - so the band would not catch it, and the
+    panel would show "77 lb" against a real reading of 191 and paint it full
+    red. There is deliberately NO CONVERSION: a silent kg->lb conversion is the
+    same bet as a vendor parser written from a schema, and this feeder refuses
+    that bet everywhere else. If the household ever wants kilograms, that is a
+    requirement change with its own tests, not a factor dropped in here.
+
+    Implements: SR-022, LLR-006
+    """
+    where_item = "%s (category %s, item %s)" % (where, category, item_id)
+    if TARGET_KEY not in item:
+        raise GoalMissing(
+            "%s declares no `%s:`. The goal is that item's target, so with no "
+            "target there is no goal and no honest bar to draw."
+            % (where_item, TARGET_KEY))
+    raw_target = one_value(item[TARGET_KEY], where_item, TARGET_KEY)
+    if not clean_scalar(raw_target):
+        raise GoalMissing("%s: %s is present but blank" % (where_item, TARGET_KEY))
+    if UNIT_KEY not in item:
+        raise ValueError(
+            "%s declares `%s: %s` but no `%s:`. The unit is not assumed: a "
+            "target read in the wrong unit posts a confident, plausible, wrong "
+            "number about someone's body. Add `%s: %s`."
+            % (where_item, TARGET_KEY, clean_scalar(raw_target), UNIT_KEY,
+               UNIT_KEY, GOAL_UNIT))
+    declared_unit = clean_scalar(one_value(item[UNIT_KEY], where_item, UNIT_KEY))
+    if declared_unit.casefold() != GOAL_UNIT:
+        raise ValueError(
+            "%s declares `%s: %s`, and this feeder reads %s only. It does NOT "
+            "convert: %s in another unit would be posted as %s against a %s "
+            "reading, which is a wrong number that looks entirely believable."
+            % (where_item, UNIT_KEY, declared_unit or "(blank)", GOAL_UNIT,
+               clean_scalar(raw_target), GOAL_UNIT, GOAL_UNIT))
+    return parse_goal_pounds(raw_target, where_item, TARGET_KEY)
+
+
+def declares_legacy_goal(body, where="the definitions file"):
+    """True when this file still carries the superseded top-level goal key.
+
+    Only its PRESENCE is read, never its value: the key is not the goal any
+    more, and parsing it would be the first step back towards honouring it.
+
+    Implements: LLR-006
+    """
+    parsed = parse_definitions_file(body, where)
+    return parsed is not None and LEGACY_GOAL_KEY in parsed[0]
 
 
 def gauge_body(value_lb, goal_lb, observed_at):
@@ -891,32 +1227,136 @@ def open_for_write(path, state_path, state_root):
     reason = writable_path_verdict(path, state_path, state_root)
     if reason:
         raise PermissionError("REFUSED: " + reason)
-    return open_no_follow(path)
+    return open_no_follow(path, root=state_root)
 
 
-def open_no_follow(path):
-    """Open `path` for writing without ever following a symlink at the last hop.
+def path_components_under(path, root):
+    """The component names leading from `root` down to `path`.
+
+    Contract:
+      Inputs:  path: the file about to be written; root: the directory the
+               write must stay inside.
+      Outputs: [name, ...] - at least one - naming each hop from `root`.
+      Raises:  ValueError when `path` is not literally under `root`, which is
+               the only case where this function cannot make the containment
+               claim and so refuses to make it.
+
+    LITERAL, NOT RESOLVED, AND ON PURPOSE. Resolution is what the verdict
+    already did; what the OPEN needs is the sequence of names it will actually
+    walk, so that each hop can be checked as it is taken. The deployed layout
+    is literal (`/var/lib/homehub-weight` from `StateDirectory=`), so a path
+    that is only under the root by way of a symlink is a shape this feeder does
+    not need and will not silently accept.
+    """
+    root_abs = os.path.abspath(root)
+    head, parts = os.path.abspath(path), []
+    while head != root_abs:
+        head, tail = os.path.split(head)
+        if not tail:
+            raise ValueError("%s is not under %s" % (path, root))
+        parts.insert(0, tail)
+    if not parts:
+        raise ValueError("%s IS %s, not a file inside it" % (path, root))
+    return parts
+
+
+# `openat`-style relative opens exist on Linux (the hub) and not on Windows
+# (the dev PC). Which one is in force decides which guard below is doing the
+# work, and the tests assert the behaviour rather than the mechanism.
+DIR_FD_OPENS = (os.open in getattr(os, "supports_dir_fd", set())
+                and hasattr(os, "O_DIRECTORY"))
+
+
+def open_no_follow(path, root=None):
+    """Open `path` for writing, following NO symlink at ANY component.
+
+    Contract:
+      Inputs:  path: the file to create; root: the directory the walk starts
+               from and may not leave - the service's own state root.
+      Outputs: an open text-mode handle, 0600.
+      Raises:  PermissionError when a component would leave `root`; OSError
+               from the kernel for a symlinked component, or for anything that
+               appeared between the verdict and the open.
 
     THE CHECK-THEN-OPEN RACE IS THE POINT. `writable_path_verdict` resolves the
-    path, but a symlink planted between that resolution and a plain
-    `open(path, "w")` would be followed by the open. So the file is unlinked
-    first - which destroys a planted LINK and never the file it points at, and
-    clears a `.tmp` left by a killed cycle - then created with O_CREAT|O_EXCL
-    so the kernel refuses anything that appeared in the gap, and O_NOFOLLOW
-    says the same again for the final component where the platform has it.
+    path, but anything planted between that resolution and the open would be
+    followed by the open. So the file is unlinked first - which destroys a
+    planted LINK and never the file it points at, and clears a `.tmp` left by a
+    killed cycle - then created with O_CREAT|O_EXCL so the kernel refuses
+    anything that appeared in the gap.
 
-    O_NOFOLLOW DOES NOT EXIST ON WINDOWS and resolves to 0 there. The hub is
-    Linux, so the deployed guard is whole; on the dev PC the unlink, O_EXCL and
-    the resolving verdict still stand, which is what the tests exercise.
+    O_NOFOLLOW ALONE WAS NOT ENOUGH, AND THAT IS THIS ROUND'S FIX. It protects
+    the FINAL component only. Replace an intermediate directory after the
+    verdict has resolved - swap `.../tokens` for a link to somebody's home
+    directory - and the old open walked through it happily: every guard above
+    it had already run, and the file landed outside the state directory the
+    module's own docstring says it cannot leave. A containment claim that holds
+    only for the last hop is not a containment claim.
+
+    So the walk is now taken ONE COMPONENT AT A TIME from `root`: each
+    intermediate directory is opened relative to the previous one with
+    O_DIRECTORY|O_NOFOLLOW, so a component that has become a link is refused by
+    the kernel AT THE HOP, and the final create happens relative to a directory
+    handle rather than to a name that can be re-pointed under it.
+
+    ON WINDOWS THERE ARE NO `dir_fd` OPENS, so the dev PC falls back to
+    checking each component with `lstat` before the open. That check is
+    check-then-use and does not close the race - it is not claimed to. The hub
+    is Linux, where the guard above is whole; the fallback exists so the same
+    tests exercise the same refusals here.
+
+    `root=None` keeps the old single-component behaviour for a caller that has
+    no root to be contained in. Nothing in this repo passes None.
     """
-    try:
-        os.unlink(path)
-    except OSError:
-        pass          # absent is the normal case; a directory or a busy file
-                      # fails loudly at the open below rather than here.
     flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
              | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
-    return os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8")
+    if root is None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8")
+
+    try:
+        parts = path_components_under(path, root)
+    except ValueError as exc:
+        raise PermissionError(
+            "REFUSED: %s cannot be opened as a path inside %s (%s), so this "
+            "write cannot be contained and is not attempted."
+            % (path, root, exc))
+
+    if not DIR_FD_OPENS:                  # pragma: no cover - Windows dev PC
+        walked = os.path.abspath(root)
+        for name in parts[:-1]:
+            walked = os.path.join(walked, name)
+            if os.path.islink(walked):
+                raise PermissionError(
+                    "REFUSED: %s is a symlink, so writing %s would land "
+                    "outside the state directory %s."
+                    % (walked, path, root))
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8")
+
+    parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in parts[:-1]:
+            hop = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=parent)
+            os.close(parent)
+            parent = hop
+        leaf = parts[-1]
+        try:
+            os.unlink(leaf, dir_fd=parent)
+        except OSError:
+            pass
+        handle = os.fdopen(os.open(leaf, flags, 0o600, dir_fd=parent), "w",
+                           encoding="utf-8")
+    finally:
+        os.close(parent)
+    return handle
 
 
 # Second-line names only;
@@ -970,17 +1410,44 @@ def save_state(state, state_path, state_root):
     os.replace(tmp, state_path)
 
 
-def load_goal_from_definitions(defs_dir):
+def resolve_goal_location(env):
+    """Which item carries the goal, as (category, item_id).
+
+    Contract:
+      Outputs: (str, str) - never blank; a blank or absent knob takes the
+               default, because the default IS the shape the Owner's synced
+               sheet already has.
+
+    THESE ARE LOCATION KNOBS, NOT A GOAL KNOB, AND THE DIFFERENCE IS THE WHOLE
+    ACCEPTANCE CRITERION. `WEIGHT_ITEM_CATEGORY` and `WEIGHT_ITEM_ID` name a
+    place in the person's own definitions; neither can hold a weight. So the
+    household's intent still lives in exactly one place, still syncs from the
+    person's phone, and still cannot be set on the hub - a test scans
+    `.env.example` and `FieldSchema.psd1` for any goal-shaped name and fails on
+    one. They are knobs at all so that renaming the item or moving it to
+    another category is an .env edit, not a code change.
+
+    Implements: SR-022, LLR-006
+    """
+    category = (env.get("WEIGHT_ITEM_CATEGORY") or "").strip() or DEFAULT_GOAL_CATEGORY
+    item_id = (env.get("WEIGHT_ITEM_ID") or "").strip() or DEFAULT_GOAL_ITEM_ID
+    return category, item_id
+
+
+def load_goal_from_definitions(defs_dir, category=None, item_id=None):
     """Read the goal out of the user's OWN definitions. Half the acceptance.
 
     Contract:
       Inputs:  defs_dir: the directory holding this user's definition files -
                the same `definitions/` NagLight loads with internal/defs.Load
-               and keeps in step with Drive.
+               and keeps in step with Drive; category and item_id: which item
+               carries it (see `resolve_goal_location`).
       Outputs: (goal_lb: float, source_file: str).
-      Raises:  GoalMissing when the directory is absent, holds no *.md, or no
-               file declares `weight_goal_lb`. ValueError when two files
-               declare it, or when a declaration is unusable.
+      Raises:  GoalMissing when the directory is absent, holds no *.md, holds
+               no such item, or that item declares no target. ValueError when
+               the declaration cannot be honoured - a bad target, a unit that
+               is not `lb`, two files carrying the item, or the superseded
+               top-level key still being present.
 
     WHY THE DEFINITIONS AND NOT A KNOB ON THE HUB. SN-040 says "the goal lives
     in the user's definitions so it syncs like everything else", and that is a
@@ -989,72 +1456,109 @@ def load_goal_from_definitions(defs_dir):
     itself. A goal in stack/.env would need an SSH session and a redeploy to
     change, would not travel with the rest of the person's tracker, and would
     be a second place the household's intent lives - which is how this repo's
-    own /opt/homehub drift started.
+    own /opt/homehub drift started. That has NOT changed. What changed is WHICH
+    KEY inside the definitions carries it, and why is at the top of this module.
 
-    HOW IT SURVIVES NagLight WITHOUT A NagLight CHANGE. internal/defs/yaml.go
-    parses top-level frontmatter scalars and its `default:` branch is
-    `// ignore unknown top-level keys (forward-compatible)`. So a definitions
-    file may carry
+    WHY AN ITEM'S `target` AND NOT A TOP-LEVEL KEY - THE SHORT VERSION, BECAUSE
+    A FUTURE READER WILL BE TEMPTED TO PUT IT BACK. This household runs Drive
+    SHEET mode, where internal/defsheet regenerates every .md from a fixed
+    ITEM-column list and drops what it does not recognise, so a top-level
+    `weight_goal_lb` is erased by the first sync after any sheet edit. `target`
+    and `unit` are already item columns that round-trip. And there is no vendor
+    fallback to lean on: Google Health v4 has no goal concept anywhere in its
+    discovery document.
 
-        ---
-        category: health
-        weight_goal_lb: 180
-        items:
-          - id: …
-        ---
-
-    and NagLight loads that file exactly as before. The goal is data the person
-    keeps beside the things they track; the tracker does not need to understand
-    it, because THIS feeder is what turns it into the gauge's target line.
-
-    THE ONE PLACE IT DOES NOT YET SURVIVE, AND IT IS A REAL NagLight DEPENDENCY.
-    Definitions reach the hub two ways. In FOLDER mode (drive.applyFolder) the
-    .md bytes are staged verbatim and the key rides along untouched. In SHEET
-    mode the sheet is exported to CSV and the .md files are REGENERATED from it
-    by internal/defsheet, whose `columns` list is the item field set; an unknown
-    column is collected into `unknown` and DROPPED. This household runs SHEET
-    mode (TRACKER_DRIVE_SHEET_ID set, TRACKER_DRIVE_FOLDER_ID deliberately
-    blanked on 2026-09-08), so on the deployed box the goal would be erased by
-    the first sync after someone edited the sheet. Making it survive needs a
-    change in internal/defsheet - a repo this block may not edit. Reported, not
-    worked around: writing the goal to a hub knob "for now" would quietly make
-    the acceptance criterion false while looking like it passed.
+    BOTH PRESENT IS A REFUSAL, NOT A PRECEDENCE. If a file still carries the
+    superseded `weight_goal_lb` AND the item carries a `target`, this raises
+    rather than picking one. Silent precedence is the trap: whichever way it
+    fell, the person would be looking at a bar drawn around one number while a
+    different number sat in their file looking authoritative - and in sheet
+    mode the top-level one is about to be deleted underneath them, so "the
+    newest edit wins" is not even stable. It is the same rule this module
+    already applies to two files declaring a goal, for the same reason: which
+    one is authoritative is not guessable, so it is asked rather than assumed.
 
     Implements: SR-022, LLR-006
     """
+    category = category or DEFAULT_GOAL_CATEGORY
+    item_id = item_id or DEFAULT_GOAL_ITEM_ID
     if not os.path.isdir(defs_dir):
         raise GoalMissing(
-            "no definitions directory at %s. The goal lives in the user's own "
-            "definitions (a top-level `%s:` in a definitions file's "
-            "frontmatter), so with no definitions there is no goal and no "
-            "honest bar to draw." % (defs_dir, GOAL_KEY))
+            "no definitions directory at %s. The goal is the `%s:` of the `%s` "
+            "item under category `%s` in the person's own definitions, so with "
+            "no definitions there is no goal and no honest bar to draw."
+            % (defs_dir, TARGET_KEY, item_id, category))
     names = sorted(n for n in os.listdir(defs_dir) if n.endswith(".md"))
-    found = None
+    real_dir = os.path.realpath(defs_dir)
+    found, legacy = None, []
     for name in names:
         path = os.path.join(defs_dir, name)
+        # A DEFINITIONS FILE THAT IS A LINK OUT OF THE DIRECTORY IS REFUSED,
+        # not read. The directory is the tracker's own docker volume and so is
+        # inside the trust boundary - WEIGHT_DEFINITIONS_DIR may itself be a
+        # link, which is why the comparison is made against its RESOLVED form
+        # rather than its name - but "the goal came from a file that is not in
+        # the household's definitions at all" is a sentence this feeder should
+        # never be able to say, and one realpath is what it costs to make sure.
+        if os.path.dirname(os.path.realpath(path)) != real_dir:
+            raise ValueError(
+                "definitions file %s resolves to %s, outside the definitions "
+                "directory %s. The goal is read from the household's own "
+                "definitions, so a file that links out of them is refused "
+                "rather than read." % (path, os.path.realpath(path), real_dir))
         try:
             with open(path, encoding="utf-8") as handle:
                 body = handle.read()
         except OSError as exc:
             raise ValueError("cannot read definitions file %s: %s"
                              % (path, type(exc).__name__))
-        value = find_goal_in_frontmatter(body, path)
-        if value is None:
+        if declares_legacy_goal(body, path):
+            legacy.append(path)
+        item = find_goal_item(body, path, category, item_id)
+        if item is None:
             continue
         if found is not None:
             raise ValueError(
-                "%s is declared in both %s and %s; which one is the goal is "
-                "not guessable, and picking the first would silently follow "
-                "file-name order." % (GOAL_KEY, found[1], path))
-        found = (value, path)
+                "item `%s` under category `%s` appears in both %s and %s; "
+                "which one carries the goal is not guessable, and picking the "
+                "first would silently follow file-name order."
+                % (item_id, category, found[1], path))
+        found = (item, path)
+    # WHETHER THE ITEM ACTUALLY CARRIES A TARGET, not merely whether the item
+    # exists, decides which refusal the person gets. An item with no target
+    # beside a lingering `weight_goal_lb` is a HALF-DONE MIGRATION, and telling
+    # that person "both are present, delete one" would be advice that leaves
+    # them with no goal at all.
+    has_target = (found is not None and TARGET_KEY in found[0]
+                  and bool(clean_scalar(found[0][TARGET_KEY][0])))
+    if has_target and legacy:
+        raise ValueError(
+            "%s still declares the superseded top-level `%s:` while %s carries "
+            "the goal as the `%s` item's `%s:`. This is REFUSED rather than "
+            "resolved by precedence: two numbers both look authoritative, and "
+            "in Drive sheet mode the top-level one is deleted by the next sync "
+            "anyway. Delete the `%s:` line and the goal is unambiguous."
+            % (legacy[0], LEGACY_GOAL_KEY, found[1], item_id, TARGET_KEY,
+               LEGACY_GOAL_KEY))
+    if not has_target and legacy:
+        raise ValueError(
+            "%s declares the top-level `%s:`, which is NO LONGER READ. Drive "
+            "sheet mode regenerates definitions from the item columns and "
+            "drops unknown top-level keys, so that line would be erased by the "
+            "next sync. Move the number onto the `%s` item under category `%s` "
+            "as `%s: <lb>` with `%s: %s`, and delete the `%s:` line."
+            % (legacy[0], LEGACY_GOAL_KEY, item_id, category, TARGET_KEY,
+               UNIT_KEY, GOAL_UNIT, LEGACY_GOAL_KEY))
     if found is None:
         raise GoalMissing(
-            "no definitions file under %s declares a top-level `%s:`. Add it "
-            "to the frontmatter of the health definitions file, e.g. "
-            "`%s: 180`. It is NOT a hub setting on purpose: it belongs to the "
-            "person, beside the things they track, so it syncs with them."
-            % (defs_dir, GOAL_KEY, GOAL_KEY))
-    return found
+            "no definitions file under %s holds an item with id `%s` under "
+            "category `%s`. That item's `%s:` IS the goal, so add it (with "
+            "`%s: %s`), or point WEIGHT_ITEM_CATEGORY / WEIGHT_ITEM_ID at the "
+            "item you keep it on. It is NOT a hub setting on purpose: it "
+            "belongs to the person, beside the things they track, so it syncs "
+            "with them." % (defs_dir, item_id, category, TARGET_KEY, UNIT_KEY,
+                            GOAL_UNIT))
+    return goal_from_item(found[0], found[1], category, item_id), found[1]
 
 
 def read_google_health(env):
@@ -1090,14 +1594,16 @@ def read_google_health(env):
     raise SourceFailure(
         "google-health: BLOCKED on an Owner action, so no reading was taken "
         "and no number was invented. %s "
-        "Still owed: (1) enable health.googleapis.com on the Cloud project "
-        "that owns the existing OAuth client; (2) add the scope %s to that "
-        "client's consent screen and the Owner to its Test users; (3) consent "
-        "in a browser and mint a refresh token into WEIGHT_TOKEN_FILE. Until "
-        "one real response body has been observed, this feeder posts "
-        "'unavailable' rather than a parser's guess."
+        "The Cloud project has health.googleapis.com enabled and the scope %s "
+        "on its consent screen (Owner, 2026-09-09); what remains is to run "
+        "`weight_oauth.py mint` and then `weight_oauth.py capture` on this box "
+        "and write the parser against the body that comes back - the exact "
+        "commands are in stack/weight/README.md. Until one real response body "
+        "has been observed, this feeder posts 'unavailable' rather than a "
+        "parser's guess."
         % ("A token file is present, but no parser exists yet - see the module "
-           "docstring." if have_token else "No token file is present.",
+           "docstring." if have_token else "No token file is present; run "
+           "`weight_oauth.py mint`.",
            GOOGLE_HEALTH_SCOPE))
 
 
@@ -1308,7 +1814,8 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None):
       Outputs: (posted: list of (id, fresh, ok), failures: list of str).
 
     THE ORDER IS DELIBERATE AND IT IS THE ONE THING TO GET RIGHT HERE. The goal
-    is loaded FIRST, and a missing goal aborts the cycle WITHOUT posting. That
+    is loaded FIRST - out of the `target` of the item the location knobs name -
+    and a missing goal aborts the cycle WITHOUT posting. That
     is not the same refusal as a missing source:
       * no SOURCE  -> post an unavailable gauge, because the panel must say
         "we do not know what you weigh" rather than show nothing where a bar
@@ -1335,7 +1842,9 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None):
     # the same `now` the gauge is judged by (see `cycle_now`).
     env["_now"] = now
 
-    goal_lb, goal_file = (goal_loader or load_goal_from_definitions)(defs_dir)
+    category, item_id = resolve_goal_location(env)
+    goal_lb, goal_file = (goal_loader or load_goal_from_definitions)(
+        defs_dir, category, item_id)
 
     reading, failures = None, []
     try:

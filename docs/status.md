@@ -8,6 +8,35 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-09 — B11 steps 3 and 4 are BUILT on a SIDE BRANCH (`b11-weight-token`),
+CROSS-REVIEW FIXES APPLIED, pending merge into `IceDrive-DesktopDirection`, and
+neither has ever spoken to Google.** A cross-review by another model family
+returned REJECT (10 confirmed + 1 suspected); all of it is fixed here — the
+frontmatter reader is now **depth-aware** (four ways a nested block could source
+a *wrong body weight* were one defect), the OAuth `state` check is **mandatory**
+and duplicated parameters are **refused rather than ranked**, the containment
+claim is now true at **every path component** and the token allow-list compares
+against the **configured** `WEIGHT_TOKEN_FILE` instead of against itself. Detail
+in the audit entry at the bottom of this file. The Owner has cleared steps 1 and 2 (health.googleapis.com enabled on
+the project that owns the shared OAuth client; the health-metrics scope on its
+consent screen; the Owner a Test user). `stack/weight/weight_oauth.py` now
+carries the two Owner-run commands that follow: `mint` walks the Owner through
+browser consent once and writes a refresh token into `WEIGHT_TOKEN_FILE`, and
+`capture` makes exactly ONE `dataPoints.list` call and saves the raw body to a
+file. The chosen consent flow is a registered loopback redirect with **nothing
+listening** — the browser is on the PC and the process is on the hub, OOB was
+shut down by Google in 2022, and a hub-side listener would need an SSH tunnel
+raised before consent or the single-use code is lost. **The Owner must add
+`http://localhost:8117/` to the OAuth client's redirect URIs, alongside — never
+replacing — the existing `/oauth2/callback` and `/api/drive/callback`.**
+**Step 5 is deliberately NOT started:** no `parse_weight_datapoint` exists, in
+the feeder or in the new module, and two tests fail if one appears. The parser
+is written against a body a human has actually seen, because `weightGrams` is
+grams and a parser that assumes otherwise posts a confident, plausible, wrong
+body weight that nothing on the wall could contradict. Next action awaiting
+approval: the Owner runs the two commands in `stack/weight/README.md` and hands
+the captured body back. Gate remains G1.
+
 **2026-09-09 — B14 Door image integration is implemented and independently
 reviewed, not deployed.** The
 wall image now installs a hardened `wall-door-stream.service`, creates its
@@ -355,6 +384,238 @@ service's `StateDirectory=`, which the shipped defaults already do.
 
 ---
 
+**2026-09-09 the goal moved from a file-level key to the weigh-in item's
+`target` (B11 correction, SR-022/LLR-006/TC-006/IF-014). READ THIS BEFORE
+"RESTORING" `weight_goal_lb`.** The entry below describes the first version,
+which put the goal in a top-level frontmatter key `weight_goal_lb` and
+**deliberately refused an item-level goal** — mutation **M10**, "item-level
+goal", was killed by a test that enforced the refusal. The Owner has ruled that
+design out and it is now reversed. It did not survive this household's
+configuration, and neither of the two reasons is a preference:
+
+* **Drive SHEET mode erases top-level keys, and this household runs sheet mode.**
+  `TRACKER_DRIVE_FOLDER_ID` is **empty** and `TRACKER_DRIVE_SHEET_ID` is **set**
+  on the live hub. In folder mode (`drive.applyFolder`) the `.md` bytes are
+  staged verbatim and any key rides along; in sheet mode NagLight's
+  `internal/defsheet` **regenerates** each `.md` from a fixed `columns` list
+  which is the **item** field set, and a column it does not recognise is
+  collected into `unknown` and **dropped**. So `weight_goal_lb` would be deleted
+  by the first sync after anyone edited the sheet — silently, leaving the panel
+  dark with nothing saying why. The old entry called this a "known gap needing a
+  NagLight change". It was not a gap; it was the design being wrong for the
+  deployment that exists.
+* **There is no vendor fallback.** Google Health v4 has **no goal or target
+  concept at all**: `DataPoint` has 43 members and none is a goal, `Profile` and
+  `Settings` carry none, and the only two occurrences of "goal" in the 292 KB
+  discovery document (revision 20260908) are a UI settings enum. Nothing could
+  have supplied a goal if the definitions lost it.
+
+`target` and `unit` are **already** sheet columns that round-trip today, so the
+goal now lives where the sync actually carries it. The Owner has added the row
+and it has already synced to the hub:
+
+```yaml
+category: Health
+color_weight: 1.5
+  - id: weigh-in
+    title: Step on the scale
+    type: habit
+    recur: weekly
+    horizon: long
+    target: 170
+    unit: lb
+```
+
+**WHICH ITEM IS CONFIGURATION, NOT A HARDCODED STRING.** `WEIGHT_ITEM_CATEGORY`
+(default `Health`) and `WEIGHT_ITEM_ID` (default `weigh-in`) name the item's
+**location**. Both match case-insensitively and trimmed, because both are typed
+by hand into a spreadsheet cell and `Health` against `health` must not be the
+difference between a goal and a dark panel.
+
+**THE "NO GOAL KNOB ON THE HUB" PROPERTY IS INTACT AND STILL MEANS SOMETHING.**
+The two new knobs name a **place** and can never carry a number, so the
+household's intent still lives only in the person's own definitions and still
+syncs with them. They are deliberately **not** called `WEIGHT_GOAL_*`, so the
+existing file scan — no `WEIGHT_GOAL` / `WEIGHT_TARGET` / `GOAL_WEIGHT` /
+`TARGET_WEIGHT` name may be **declared** in `.env.example` or `FieldSchema.psd1`
+— is not quietly satisfied by a rename. And the runtime negative now sets the
+two location knobs to `170` as well as every goal-shaped knob, and still gets no
+goal.
+
+**THE UNIT IS CHECKED, NEVER ASSUMED, AND THAT IS THE SHARPEST EDGE IN THE
+BLOCK.** A missing `unit`, or any unit but `lb`, is a **refusal**; nothing is
+converted. `target: 77` with `unit: kg` is 170 lb, and **77 sits inside the
+40..1000 lb plausibility band**, so the band *cannot* catch it — the panel would
+show "77 lb" against a real 191 lb reading and paint it full red. The unit is
+therefore checked **before the number is even parsed**, so a kilogram target
+fails on the unit rather than misleadingly on the band. This is the same failure
+class as a vendor parser written from a schema, which this block still refuses to
+write: confident, plausible, and wrong about a person's body, with nothing on the
+wall able to tell anyone.
+
+**BOTH PRESENT IS A REFUSAL, NOT A PRECEDENCE.** If a file still carries the
+superseded `weight_goal_lb` **and** the item carries a `target`, the feeder
+refuses rather than picking one. Silent precedence is the trap: whichever way it
+fell, the person would be looking at a bar drawn around one number while a
+different number sat in their file looking equally authoritative — and in sheet
+mode the top-level one is about to be deleted underneath them, so "the newest
+edit wins" is not even stable. It is the same rule this module already applies to
+two files declaring a goal. A file carrying **only** the legacy key is also
+refused, with a message that names the key, says it is **no longer read**, and
+says where the number goes — not "no goal declared", which would leave a person
+upgrading staring at a `weight_goal_lb: 180` line while the journal said nothing
+was declared. An item that exists but carries no target *beside* a lingering
+legacy key gets the migration message rather than the both-present one, because
+that person is mid-migration and "delete one" would leave them with no goal at
+all.
+
+**A blank, absent, non-numeric, non-finite or out-of-band `target` is no goal,
+and nothing is posted.** Whether it surfaces as `GoalMissing` (nothing was
+declared) or `ValueError` (something was declared that cannot be used), the
+outcome is the same and is the one that matters — the poster is never called and
+the journal names the file. The line between the two exception types is
+deliberate: *nothing declared* is missing; *something declared we cannot use* is
+a refusal that names the file, because a typo'd `1700` for `170` must not decay
+into "no goal declared".
+
+**The two refusals that must not collapse into one are preserved.** No **source**
+still posts an unavailable gauge; no **goal** still posts **nothing**. Their
+tests are unchanged in intent and both still assert the poster was never called.
+
+**FIXTURE: THE OWNER'S REAL FILE, NOT ONE SHAPED TO SUIT THE PARSER.**
+`HEALTH_MD` in `tests/test_weight_feeder.py` mirrors what actually synced —
+`category: Health`, `color_weight: 1.5`, `horizon: long`, `recur: weekly`, and a
+sibling item on **either side** of `weigh-in`, one of which carries a `target`
+and `unit` of its own (a step count). Finding the goal by shape rather than by id
+would post a step goal as a body weight, and a test asserts it does not.
+
+**THE FieldSchema HALF IS OWED TO HomeHub.** `WEIGHT_ITEM_CATEGORY` /
+`WEIGHT_ITEM_ID` are in `stack/.env.example` with their defaults but are **not**
+in `scripts/deploy/FieldSchema.psd1`, which lives in the HomeHub repo — a repo
+this worktree may not edit. That is safe rather than broken: an undeclared knob
+is simply absent from the emitted `.env`, a blank knob takes the default, and the
+default *is* the shape the Owner's sheet already syncs. What it costs is that
+**moving** the item currently needs an `.env` edit on the hub rather than a
+deploy-config change. A test records this explicitly so it is not "fixed" by
+adding the knobs to the list that would turn the FieldSchema assertion red.
+
+**STILL NO PARSER, AND ALL SIX ABSENCE ASSERTIONS ARE STILL GREEN.** Nothing in
+this change touched the blocked vendor half: `read_google_health` still refuses
+by name, and no `parse_google_health` / `parse_weight_datapoint` / `parse_weight`
+/ `parse_datapoints` symbol exists. `grams_to_pounds` is untouched and is **not**
+reachable from the goal path — it converts a vendor **reading**, and no unit
+conversion exists anywhere on the goal path by construction.
+
+**The redundancy that carried M25 is gone, and that is recorded rather than
+silent.** The old top-level scanner had three overlapping guards against reading
+an indented line as the household's goal, so removing any one of them left the
+suite green (M25) and only removing all three was killed (M27). The frontmatter
+is now parsed once, into top-level keys and items, so the indent rule exists in
+exactly one place and is asserted directly. The "top-level keys stop at `items:`"
+rule likewise survives as one line with its own test — the test that the earlier
+mutation run had to be written to add.
+
+**THE OWNER'S OPEN QUESTION — AUTO-CHECK-OFF — IS ASSESSED, NOT BUILT.** See
+"Auto-check-off: what it would take" below.
+
+**Tests:** 599 passed, 6 skipped (baseline before this change: 578/6);
+`trace.py --strict-integrity` clean, `check_flows.py --no-placeholders` clean
+(5 diagrams). **UNRUN:** `stack/run-hermetic-tests.sh` still refuses on this dev
+PC (`missing tool(s): zstd rsync`).
+
+**Mutation run: 18 deliberate defects (M28–M45), all 18 killed — but TWO
+SURVIVED THE FIRST PASS AND BOTH WERE TEST DEFECTS.** That is the third round
+running in this worktree where the first-pass survivor was a bad assertion
+rather than a missing guard, so it is worth naming the shape: both survivors
+were tests that asserted the *outcome the person sees* ("nothing was posted",
+"it refused") when a **different guard downstream** was already producing that
+outcome, so the line under test was carrying nothing.
+
+* **M37 — the prose body read as frontmatter.** Survived. The test put a bare
+  `- id:` block after the closing fence, which the parser skips anyway because a
+  column-zero line ends the item sequence, so the fence check was never what
+  refused it. Rewritten to re-open `items:` at column zero in the prose — the
+  only shape that actually reaches the item reader — and it now dies.
+* **M45 — a blank target silently becomes `0`.** Survived. The refusal was being
+  carried by the **40..1000 lb plausibility band**, which catches the zero, so
+  "nothing was posted" stayed true and the parametrised test could not tell. A
+  new test asserts the exception TYPE through the real loader: a blank target
+  must be `GoalMissing`, not a band violation, or the journal tells the person
+  their goal is out of range when what they have done is not set one.
+
+| # | deliberate defect | killed by |
+|---|---|---|
+| M28 | unit check removed — any unit accepted | `test_a_plausible_kilogram_target_is_refused_by_the_unit_not_the_band_sr022` (+ all 7 `..._is_refused_and_never_converted_sr022` params) |
+| M29 | a missing `unit` assumed to be `lb` | `test_a_target_with_no_unit_at_all_is_refused_sr022` |
+| M30 | item found by shape (first item with a `target`) instead of by id | `test_the_siblings_targets_are_not_the_weight_goal_sr022` |
+| M31 | both keys present → the item silently wins (precedence, not refusal) | `test_both_a_legacy_key_and_an_item_target_are_refused_not_ranked_sr022` |
+| M32 | a legacy-only key silently ignored, falls through to "no goal" | `test_the_superseded_top_level_key_is_refused_not_silently_ignored_sr022` |
+| M33 | the 40..1000 lb plausibility band removed | `test_an_unusable_target_posts_nothing_at_all_sr022` (4 params) |
+| M34 | the location knobs ignored — `Health`/`weigh-in` hardcoded | `test_the_location_knobs_reach_the_loader_through_a_whole_cycle_sr022` |
+| M35 | two files holding the item → take the first | `test_two_files_holding_the_item_are_refused_not_ordered_sr022` |
+| M36 | a field declared twice → last one wins | `test_a_target_declared_twice_on_the_item_is_refused_sr022` |
+| M37 | the prose body read as frontmatter | `test_a_target_in_the_prose_body_is_not_the_goal_sr022` **(survived pass 1 — test defect, rewritten)** |
+| M38 | top-level keys do not stop at `items:` | `test_a_top_level_key_after_the_items_sequence_is_not_a_declaration_sr022` |
+| M39 | indented lines treated as top-level keys | `test_an_indented_legacy_key_is_an_item_field_not_a_top_level_one_sr022` (+29 others) |
+| M40 | `WEIGHT_GOAL_LB=180` **declared** in `.env.example` | `test_no_goal_shaped_knob_is_declared_anywhere_deploy_reads_sr022` |
+| M41 | no goal → invent 180 and post anyway | `test_a_missing_goal_posts_nothing_at_all_sr022` (+ `test_main_reports_the_refusal_and_exits_nonzero_without_posting_sr022`) |
+| M42 | category/id matched case-sensitively | `test_the_category_and_id_match_the_way_a_person_types_them_sr022` |
+| M43 | the `.env.example` default drifts from the code default | `test_the_item_location_knobs_are_declared_in_env_example_sr022` |
+| M44 | duplicate item ids in one file → take the first | `test_one_file_holding_the_item_twice_is_refused_sr022` |
+| M45 | a blank target becomes `0` rather than "no goal" | `test_a_blank_target_is_MISSING_not_a_zero_sr022` **(survived pass 1 — test defect, new test added)** |
+
+**One check IS carried by another, and it is named rather than left implicit.**
+M29 (a missing `unit` assumed to be `lb`) and M28 (the unit compared at all) are
+two lines guarding one property, and each has its own test, so neither is
+carried. But the **indent** rule (M39) and the **stop-at-`items:`** rule (M38)
+are now single lines in one shared parser rather than the three overlapping
+guards the old scanner had — the redundancy that let M25 survive last round is
+gone, and each is asserted directly. Nothing else in this block is defended by
+more than one mechanism.
+
+### Auto-check-off: what it would take, and why it is not built
+
+The Owner asked whether the feeder could tick the `weigh-in` habit off when
+Google reports a new weight sample, via `POST /api/check {id, done,
+expectedDate}`. Three hazards, and the first is the one that decides it:
+
+* **It must fire on a new `sampleTime`, not on a successful read.** The feeder
+  reads every 15 minutes and reposts the last known reading when the source
+  fails; a check-off keyed to "the cycle worked" would tick the habit off
+  hundreds of times against a weigh-in that happened days ago. The trigger is a
+  `sampleTime` strictly newer than the one in the state file — which means the
+  state file grows a second responsibility, and it is the file this block spent
+  a mutation round proving is only ever written on a successful read.
+* **`expectedDate` must be the sample's own local date, not today's.** A Sunday
+  evening weigh-in read on Monday morning would otherwise tick off Monday and
+  leave Sunday's box empty — the feeder would be recording a fact about the
+  wrong day. That needs the household's timezone applied to the sample's
+  instant, which this feeder does not currently carry.
+* **Idempotency is not established.** This repo has never exercised the
+  `{id, done, expectedDate}` shape at all: the only check-off it drives is
+  `sim/validate-sim.sh`'s `POST /api/check {"id": "..."}` with
+  `X-Forwarded-User`, which flips **today's** box and returns 200. Whether a
+  repeat POST is a no-op or a toggle is a NagLight-side fact that has not been
+  read, and a toggle would make a retry *un*-check a habit the person already
+  did. That has to be verified with one real call before anything is written —
+  the same gate that is keeping the vendor parser unwritten.
+
+**A separate interaction worth naming: `recur: weekly` against a windowless
+gauge's static 7-day staleness horizon.** The gauge sends no `window`, so
+NagLight renders it stale after **7 days** — and the item's declared cadence is
+**weekly**. Those are the same number, so a person weighing in exactly on
+schedule has **zero margin**: the gauge goes stale in the hours before each
+weigh-in, and any slip to day eight shows "unavailable" for a reading that is
+perfectly current by the household's own rule. The 15-minute timer does not help
+— it governs how fast an *absent source* becomes visible, not the horizon. This
+is not caused by the change above and is not fixed by it; the honest options are
+to accept the stale window before each weigh-in, or to raise it with NagLight as
+a horizon that should follow the item's cadence. Sending a `window` to buy a
+different horizon is **not** an option: `weekly` maps to a **24-hour** horizon,
+which is far worse, and a `window` would drag `direction` in with it.
+
+---
+
 **2026-09-09 the weight feeder (B11, SR-022/LLR-006/TC-006/IF-014) — PARTIAL,
 and the blocked half is a finding, not a gap.** The hub gains a third plain
 service — no container, on a 15-minute timer — that posts one body-weight gauge
@@ -411,6 +672,10 @@ says "unavailable" — the truth. A test asserts no `parse_google_health` /
 `parse_weight_datapoint` symbol exists (B7's `parse_gemini` precedent), and a
 deliberate defect that stubs a plausible fake reading is killed by it.
 
+**SUPERSEDED 2026-09-09 — the goal is now the weigh-in item's `target`; see
+the entry above. The paragraph below describes the design that was replaced and
+is kept so the reasoning is not lost.**
+
 **"THE GOAL LIVES IN THE USER'S DEFINITIONS" IS BUILT, AND IT UNCOVERED A REAL
 NagLight DEPENDENCY.** B5 recorded this half as explicitly not built. It is now:
 `WEIGHT_DEFINITIONS_DIR` names the **directory**, never the number, and the goal
@@ -423,7 +688,9 @@ over: a cycle with every plausible goal-shaped knob set and an empty definitions
 tree refuses, and no goal-shaped knob may be **declared** in `.env.example` or
 `FieldSchema.psd1` at all.
 
-**THE GAP, AND IT NEEDS NagLight.** Definitions reach the hub two ways. Folder
+**THE GAP, AND IT NEEDS NagLight — SUPERSEDED: it was not a gap, it was the
+design being wrong for the deployment that exists, and the goal moved onto an
+item's `target` instead. See the entry above.** Definitions reach the hub two ways. Folder
 mode (`drive.applyFolder`) stages the `.md` bytes verbatim and the key rides
 along. **Sheet mode regenerates the `.md` from CSV through `internal/defsheet`,
 whose `columns` list is the item field set, and drops unknown columns.** This
@@ -6769,3 +7036,220 @@ changed. The full G1 gate passes with **549 passed / 5 skipped**, trace integrit
 links with its two known orphan warnings. The first Windows run selected the
 Microsoft Store bash shim and produced seven path-conversion failures; putting
 Git Bash first on `PATH` produced the recorded green result.
+
+### DRIVER — B11 steps 3-4 — 2026-09-09 (token minting + one-shot capture, side branch)
+
+**What changed.** `stack/weight/weight_oauth.py` (new) with two subcommands and
+no parser; `tests/test_weight_oauth.py` (new); `stack/weight/README.md` now
+carries the Owner's exact commands, what each prints, and a failure table for
+each; `weight_feeder.read_google_health`'s refusal message points at the new
+tool instead of restating steps the Owner has already cleared;
+`stack/.env.example` says where `WEIGHT_TOKEN_FILE` comes from.
+
+**The decisions, and why.** (1) The EXISTING OAuth client is reused — the tool
+reads only `OAUTH2_PROXY_CLIENT_ID`/`_SECRET` out of `stack/.env`, key by key,
+never `source`-ing a file that also holds the DNS admin password and the
+Cloudflare token. (2) The minted file holds **no client secret** (the feeder
+gets the pair from its unit's `EnvironmentFile=`, so the secret stays in one
+place) and **no access token** (worthless in an hour). (3) The token write goes
+through the feeder's guard with its sign reversed — one allow-listed path,
+resolved with `realpath`, contained in the service's own `StateDirectory=`,
+never the state file, and opened by the feeder's own
+unlink-then-`O_CREAT|O_EXCL|O_NOFOLLOW` door at 0600 — in a separate module,
+because a credential-writing door does not belong inside the module whose
+guarantee is that it has none. (4) Every outbound call uses
+`weight_feeder.vendor_opener()`: redirects refused, no proxy inherited, because
+urllib does not strip `Authorization` across a cross-host 302 and this token
+also grants blood glucose, body fat, oxygen saturation, core body temperature
+and heart rate. (5) Nothing secret is printed anywhere; a remote's error body is
+never echoed, only a single short `error` enum lifted through an allow-list
+pattern.
+
+**Evidence.** `python scripts/check.py` → **RESULT: PASS**, **574 passed / 6
+skipped** (this session's own baseline on this worktree was 547 / 5),
+`scripts/trace.py --strict-integrity` integrity=0 with the unchanged 24 legacy
+orphans, `check_flows.py --no-placeholders` OK (5 diagrams, 11 ids),
+`validate_config.py` ALL CONFIG CHECKS PASSED. `stack/run-hermetic-tests.sh` is
+**UNRUN** on this dev PC (it refuses without zstd/rsync) and is reported as
+unrun, not as passing. **Mutation runs: 19 deliberate defects, 19 RED, restored
+byte-identical and green** — including one first-pass SURVIVOR that was a test
+defect (the capture output's credential-name refusal was asserted only through
+`capture_output_verdict`, so deleting the call in `open_capture_output` stayed
+green; the test now opens the door itself).
+
+**What has never run against Google, stated plainly.** Every test drives a
+loopback HTTP server this repo starts. The consent screen, a real authorization
+code, a real token exchange, a real refresh, a real `dataPoints.list` response
+and the real 401/403 bodies are **unexercised**. Real behaviour IS exercised for
+the egress guards (a real 302 and real proxy variables on real sockets), the
+write guard (a real symlink on a real filesystem), the overwrite refusal, and
+the no-secret-printed property (sentinels carried through the whole flow).
+
+**Not done here.** No parser, no push, no deployment, no panel or hub state
+touched, no apt package added. This work sits on `b11-weight-token` and is owed
+a merge into `IceDrive-DesktopDirection`.
+
+### DRIVER — B11 correction — 2026-09-09 (the OAuth client variables the hub REALLY has)
+
+**Found against the live hub, not inferred.** The coordinator listed the key
+names in the deployed `/opt/homehub/stack/.env` over SSH. It holds
+`OAUTH2_PROXY_CLIENT_ID` (set), `OAUTH2_PROXY_CLIENT_SECRET` (set),
+`TRACKER_DRIVE_USER` (set), `TRACKER_DRIVE_SHEET_ID` (set) and
+`TRACKER_DRIVE_FOLDER_ID` (**empty**). It has **no `TRACKER_DRIVE_CLIENT_ID`,
+no `TRACKER_DRIVE_CLIENT_SECRET` and no `GOOGLE_CLIENT_*` of any kind.** The
+household therefore has **exactly one** Google OAuth client — oauth2-proxy's —
+which is the good outcome: one secret to rotate, nothing to drift.
+
+**What was wrong.** The prose in `stack/weight/README.md`, in
+`weight_feeder.py`'s docstring and in `weight_oauth.py`'s own docstring all
+asserted that the one client was "the one `oauth2-proxy` and
+`TRACKER_DRIVE_CLIENT_ID` share". That variable has never existed; the
+tracker's Drive sync reaches for the `OAUTH2_PROXY_*` pair directly. The
+refusal message for a missing client compounded it by naming only keys that do
+not exist on this box, which is what would have sent the Owner looking for a
+variable nobody had ever set.
+
+**What changed.** `weight_oauth.resolve_client` is now the one place the client
+is settled, and the order is explicit and injectable: `OAUTH2_PROXY_CLIENT_ID`
++ `OAUTH2_PROXY_CLIENT_SECRET` first, `TRACKER_DRIVE_CLIENT_ID` +
+`TRACKER_DRIVE_CLIENT_SECRET` second, **first complete pair wins, and a pair is
+complete only when both halves are set** — half a pair is refused rather than
+completed from the other pair, because a mismatched id/secret fails at Google
+as `invalid_client` and reads as Google's problem. The refusal names **all
+four** variables and says which are set, inside a fenced `Looked for, in
+order: … .` clause so a test can assert against the search list itself. The
+minted token file records **which** id variable was actually used, so a
+fallback box does not claim a client it did not use. The `.env` reader is
+unchanged: key by key, last wins, never `source`d, no value ever printed.
+
+**Prose corrected.** `stack/weight/README.md` step 1 now names oauth2-proxy's
+client plainly and carries a dated note saying what the live `.env` really
+holds; its step 3 states the lookup order. `weight_feeder.py`'s blocker list
+says the same. `stack/.env.example`'s Drive-sync block now says outright that
+no `TRACKER_DRIVE_CLIENT_*` variable exists anywhere.
+
+**Evidence.** `python scripts/check.py` → **RESULT: PASS**, **578 passed / 6
+skipped** (baseline at `af726b4` on this worktree: 574 / 6; the four new tests
+are the whole difference). `scripts/trace.py --strict-integrity` integrity=0
+with the unchanged 24 legacy orphans; `check_flows.py --no-placeholders` OK;
+`validate_config.py` ALL CONFIG CHECKS PASSED. `stack/run-hermetic-tests.sh`
+**UNRUN** on this dev PC (it refuses without zstd/rsync).
+
+**Mutation runs: 5 deliberate defects, 5 RED, restored byte-identical and
+green** — including **one first-pass SURVIVOR that was again a test defect**.
+Cutting the search list back to the tracker pair left the whole suite green,
+because the refusal's later sentence names the oauth2-proxy pair for an
+unrelated reason and the test searched the whole paragraph. The message now
+fences its looked-for clause between `LOOKED_FOR_PREFIX`/`LOOKED_FOR_SUFFIX`
+and the test asserts inside that clause; the mutation is now RED.
+
+**Not done here.** No parser (step 5 is still owed a real captured body), no
+push, no hub state touched. Source and docs only, on `b11-weight-token`.
+
+## Audit — 2026-09-09 B11 cross-review fixes (`b11-weight-token`, local only)
+
+A cross-review by a different model family returned **REJECT, 10 CONFIRMED + 1
+SUSPECTED** against `8a1d2a5`. The coordinator accepted all of it. Everything
+below is source, tests and docs on the side branch; **nothing was pushed and no
+hub state was touched.**
+
+**PRIORITY 1 — the hand parser could source a WRONG GOAL. One root cause, four
+doors.** `parse_definitions_file` ignored indentation **depth**, so anything
+shaped like `id:` / `target:` / `unit:` was read as a direct item field wherever
+it sat. A nested `metadata:` mapping (P1), a nested `alternatives:` list under a
+*different* item (P2), a second `items:` block (P3) and a **tab-indented** block
+that `yaml.v3` will not parse at all (P4) each yielded a confident 170 lb goal.
+This is the plausible-but-wrong-number failure class the whole block exists to
+prevent, and it defeated the "found by **id**, not by shape" property the
+previous round tested for.
+
+The fix is **one rule, not four patches**: a field belongs to an item only at
+that item's own field column; the sequence indent is fixed by its first `- `
+entry and the field column by the first field on that entry; anything deeper is
+a nested container's content and is not the item's, and a `- ` deeper than the
+sequence indent is a nested list's entry and is not an item. **Ambiguity is
+refused rather than resolved** — a second `items:`, an inline `items: [...]`, or
+a tab in the indentation all raise, the same way two files declaring the goal
+already did. Two blind spots were closed on the way: a sequence written at
+column zero (valid YAML the old reader could not see at all) is now read, and an
+item written with `-` alone on its line is read.
+
+**Hand-parsing was KEPT, deliberately.** The service is stdlib-only by design (a
+plain unit under `ProtectSystem=strict`, no venv), so PyYAML would mean a new
+apt package name and the offline apt export re-run §5 requires — and a full
+parser is the wrong *shape* anyway: anchors, aliases and merge keys let a goal
+arrive from a line the person cannot see beside the number, and what this reader
+owes the household is to read the narrow block subset the sheet generates and
+**refuse** everything else. PyYAML is used as a **test-only oracle** where it
+happens to be installed (the precedent is `validate_config.py`, which SKIPs
+cleanly without it), so "narrow" cannot quietly become "different".
+
+**PRIORITY 2 — the OAuth flow now enforces what it claims.** `code_from_paste`
+returned a **bare code before the parser ran**, and checked `state` only when
+one happened to be present — so the two easiest pastes skipped the check the
+tool documents. `state` is now **mandatory**; a bare code is **refused** (PKCE
+binds the code to this process, but `state` is the half that binds the
+*response* to the request this run made, and a bare code carries none — there is
+no weaker fallback, only "checked" and "not checked"; the cost is one browser
+trip the Owner is already at). Duplicated `code=` / `state=` / `error=` are
+**refused, not ranked first-wins**, so the tool cannot exchange a code the Owner
+is not looking at. The ordering is asserted behaviourally: on a state mismatch
+the fake token endpoint records **no request at all**.
+
+**PRIORITY 3 — the containment claim is now true.** `O_NOFOLLOW` protects the
+**final** component only, so replacing an intermediate directory after the
+verdict resolved sent the write outside the state directory with every guard
+above already passed (C1). The open now walks from the state root **one
+component at a time** with `O_DIRECTORY|O_NOFOLLOW` and `dir_fd=` (stdlib,
+Linux), creating the leaf against a directory handle; Windows has no `dir_fd`
+opens, so the dev PC checks each component with `lstat` — that fallback is
+check-then-use, does not close the race, and is not claimed to. (C2)
+`token_write_verdict()` was handed the `--token-file` override as **both** the
+path and the allow-list, so the one-path allow-list compared it **to itself** and
+was vacuous exactly whenever the flag was used. The allow-list is now the
+**configured** `WEIGHT_TOKEN_FILE`; the flag remains an operator escape hatch —
+per the ruling, a documented flag on a tool run under `sudo` is not a
+vulnerability — but it now **announces itself**, names the configured path, and
+says which guards still bind the write. A guard that silently stops deciding was
+the defect; the hatch was not.
+
+**PRIORITY 4 — definitions symlinks.** The directory is the tracker's own docker
+volume and stays inside the trust boundary: `WEIGHT_DEFINITIONS_DIR` may itself
+be a symlink and is still read. The cheap half was taken — an individual `*.md`
+resolving **outside** that directory is refused rather than read.
+
+**Nothing was weakened.** All six vendor-absence assertions are green and no
+parser was written; the no-leak property, `vendor_opener()`, the client
+resolution order, the unit-before-number rule, the both-keys-present refusal,
+the two distinct refusals (no source → unavailable gauge; no goal → nothing
+posted) and the freshness invariant are unchanged and still asserted.
+
+**Evidence.** `python scripts/check.py` → **RESULT: PASS**, **626 passed / 6
+skipped** (baseline at `8a1d2a5`: 599 / 6 — the 27 new tests are the whole
+difference). `scripts/trace.py --strict-integrity` integrity=0 with the
+unchanged 24 legacy orphans; `check_flows.py --no-placeholders` OK, 5 diagrams;
+`validate_config.py` ALL CONFIG CHECKS PASSED. `stack/run-hermetic-tests.sh`
+**UNRUN** on this dev PC (it refuses without zstd/rsync).
+
+**Mutation runs: 17 deliberate defects (M46–M62), all RED, restored
+byte-identical and green** — including **one first-pass SURVIVOR that was, for
+the fourth round running, a TEST defect**. M62 dropped the state root from the
+token write's open and the suite stayed green: the test planted its symlink on a
+path pointing *out* of the root, so `token_write_verdict` refused it before the
+open was ever reached — the **verdict was carrying the check**. The link now
+points at a directory *inside* the root, which is precisely the case the verdict
+cannot refuse (both sides resolve to the same contained file), leaving the open
+as the only thing that can. M62 is now RED.
+
+**One check is carried by another, and it is named rather than hidden.**
+`test_open_for_write_hands_the_state_root_to_the_open_sr022` is a **wiring**
+assertion (it records what the caller passes); the containment behaviour itself
+is proved against the real filesystem by
+`test_an_intermediate_directory_swapped_after_the_verdict_is_refused_sr022`. And
+at the `mint` level the allow-list has **no observable behaviour** — it can only
+differ from the effective path when `--token-file` is used, which is the
+announced override — so C2 is carried by the verdict's own unit test plus the
+notice test, not by an end-to-end refusal.
+
+**Not done here.** No parser (step 5 is still owed a real captured body), no
+push, no hub state touched. Source, tests and docs only, on `b11-weight-token`.

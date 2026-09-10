@@ -26,6 +26,7 @@ Verifies: TC-006 (SR-022, LLR-006)
 """
 
 import importlib.util
+import io
 import json
 import math
 import os
@@ -46,7 +47,8 @@ sys.modules["weight_feeder"] = feeder
 _spec.loader.exec_module(feeder)
 
 NOW = 1789000000          # a fixed "now" so nothing here depends on the clock.
-GOAL = 180.0
+GOAL = 180.0              # for the injected loaders, which do not touch disk.
+DEFS_GOAL = 170.0         # the target the Owner's real synced file carries.
 
 
 def write_defs(tmp_path, files):
@@ -58,19 +60,39 @@ def write_defs(tmp_path, files):
     return str(defs_dir)
 
 
+# THE OWNER'S ACTUAL SYNCED FILE, not a fixture shaped to suit the parser. The
+# Health category with `color_weight: 1.5`, the weigh-in item carrying
+# `target: 170` / `unit: lb` / `horizon: long` / `recur: weekly`, and a sibling
+# item either side of it - including one with a `target` of its own, because
+# finding the goal by shape rather than by id would post a step count as a body
+# weight. The prose body carries a `target:` that must NOT be read.
 HEALTH_MD = """---
-category: health
+category: Health
 color_weight: 1.5
-weight_goal_lb: 180
 items:
+  - id: take-vitamins
+    title: Take the vitamins
+    type: habit
+    recur: daily
+    horizon: short
   - id: weigh-in
     title: Step on the scale
     type: habit
+    recur: weekly
+    horizon: long
+    target: 170
+    unit: lb
+  - id: walk-steps
+    title: Walk the daily steps
+    type: metric
     recur: daily
+    horizon: short
+    target: 8000
+    unit: steps
 ---
 
-Free notes after the frontmatter. Someone might well write weight_goal_lb: 999
-down here while thinking out loud, and it must not become the goal.
+Free notes after the frontmatter. Someone might well write target: 999 down
+here while thinking out loud, and it must not become the goal.
 """
 
 
@@ -190,7 +212,7 @@ def test_every_failure_class_collapses_to_one_unavailable_post_sr022(tmp_path, b
     posted, failures, _ = feeder.run_cycle(
         env, now=NOW, readers={"google-health": reader},
         poster=lambda body, url, e, t: (posts.append(body), (True, "HTTP 200"))[1],
-        goal_loader=lambda d: (GOAL, "health.md"))
+        goal_loader=lambda d, *a: (GOAL, "health.md"))
     assert posted == [("weight", False, True)]
     assert failures and "google-health" in failures[0]
     assert len(posts) == 1
@@ -213,19 +235,44 @@ def test_a_failing_source_never_writes_state_so_history_cannot_drift(tmp_path):
                      readers={"google-health": lambda e: (_ for _ in ()).throw(
                          feeder.SourceFailure("down"))},
                      poster=lambda *a: (True, "HTTP 200"),
-                     goal_loader=lambda d: (GOAL, "health.md"))
+                     goal_loader=lambda d, *a: (GOAL, "health.md"))
     assert state_path.read_bytes() == before
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # B. "the goal lives in the user's definitions so it syncs like everything else"
+#
+# THE GOAL MOVED ON 2026-09-09, AND THIS SECTION ENFORCES THE NEW CONTRACT.
+# It used to be a top-level `weight_goal_lb:` key, and an ITEM-level goal was
+# deliberately REFUSED — a test asserted the refusal. That refusal is now
+# reversed on the Owner's ruling, because the old design does not survive this
+# household's configuration:
+#
+#   * the household runs Drive SHEET mode (TRACKER_DRIVE_SHEET_ID set,
+#     TRACKER_DRIVE_FOLDER_ID blank), where internal/defsheet regenerates each
+#     .md from a fixed ITEM-column list and drops unknown columns — so a
+#     top-level key is ERASED by the first sync after any sheet edit;
+#   * Google Health v4 carries no goal or target concept at all, so there is no
+#     vendor fallback to lean on.
+#
+# `target` and `unit` are already item columns that round-trip today. The tests
+# below therefore assert the OPPOSITE of what the old M10 test asserted, and
+# `test_the_superseded_top_level_key_is_refused_not_silently_ignored_sr022`
+# exists so nobody restores it by accident.
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_the_goal_is_read_from_the_users_definitions_sr022(tmp_path):
-    """The goal comes off disk, out of the definitions NagLight also loads."""
+def test_the_goal_is_read_from_the_owners_real_synced_file_sr022(tmp_path):
+    """The goal comes off disk, out of the definitions NagLight also loads.
+
+    HEALTH_MD is the shape the Owner's sheet ACTUALLY synced to the hub — the
+    Health category, `color_weight: 1.5`, the weigh-in item carrying
+    `target: 170` and `unit: lb`, `horizon: long`, and two sibling items either
+    side of it — so this proves the reader handles the real file and not a
+    fixture shaped to suit the parser.
+    """
     defs_dir = write_defs(tmp_path, {"health.md": HEALTH_MD})
     goal, source = feeder.load_goal_from_definitions(defs_dir)
-    assert goal == 180.0
+    assert goal == DEFS_GOAL
     assert source.endswith("health.md")
 
 
@@ -234,9 +281,139 @@ def test_the_goal_becomes_the_gauges_target_line_sr022(tmp_path):
     defs_dir = write_defs(tmp_path, {"health.md": HEALTH_MD})
     goal, _ = feeder.load_goal_from_definitions(defs_dir)
     body, _ = feeder.build_post((191.4, NOW), None, goal, NOW)
-    assert body["target"] == 180.0
+    assert body["target"] == 170.0
     assert body["value"] == 191.4
 
+
+def test_the_siblings_targets_are_not_the_weight_goal_sr022(tmp_path):
+    """The item is found by ID, not by "the first item with a target".
+
+    A definitions file is full of items and other items have targets too — the
+    step count next to the weigh-in is the obvious one. Picking by shape rather
+    than by id would post a step goal as a body weight.
+    """
+    body = HEALTH_MD.replace("  - id: weigh-in\n", "  - id: not-weigh-in\n")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(feeder.GoalMissing):
+        feeder.load_goal_from_definitions(defs_dir)
+
+
+def test_the_item_location_is_a_knob_so_the_owner_can_move_it_sr022(tmp_path):
+    """The Owner must be able to rename or move the item without a code change."""
+    body = HEALTH_MD.replace("category: Health", "category: Body")
+    body = body.replace("  - id: weigh-in\n", "  - id: scale-day\n")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(feeder.GoalMissing):
+        feeder.load_goal_from_definitions(defs_dir)
+    goal, _ = feeder.load_goal_from_definitions(defs_dir, "Body", "scale-day")
+    assert goal == DEFS_GOAL
+
+
+def test_the_knobs_default_to_the_shape_the_owner_already_synced_sr022():
+    """Defaults, and blanks that fall back to them, name the real item."""
+    assert feeder.resolve_goal_location({}) == ("Health", "weigh-in")
+    assert feeder.resolve_goal_location(
+        {"WEIGHT_ITEM_CATEGORY": "", "WEIGHT_ITEM_ID": "   "}) == ("Health", "weigh-in")
+    assert feeder.resolve_goal_location(
+        {"WEIGHT_ITEM_CATEGORY": " Body ", "WEIGHT_ITEM_ID": " scale-day "}) \
+        == ("Body", "scale-day")
+
+
+def test_the_location_knobs_reach_the_loader_through_a_whole_cycle_sr022(tmp_path):
+    """Wired end to end: a knob nobody reads is a knob that does not exist."""
+    body = HEALTH_MD.replace("category: Health", "category: Body")
+    seen = []
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_DEFINITIONS_DIR": write_defs(tmp_path, {"health.md": body}),
+           "WEIGHT_STATE_FILE": str(tmp_path / "state.json"),
+           "WEIGHT_ITEM_CATEGORY": "Body", "WEIGHT_ITEM_ID": "weigh-in"}
+    feeder.run_cycle(env, now=NOW,
+                     readers={"google-health": lambda e: (191.4, NOW)},
+                     poster=lambda body_, *a: (seen.append(body_), (True, ""))[1])
+    assert seen[-1]["target"] == DEFS_GOAL
+
+
+def test_the_category_and_id_match_the_way_a_person_types_them_sr022(tmp_path):
+    """Both halves are typed into a spreadsheet cell by a human.
+
+    `Health` against `health` must not be the difference between a goal and a
+    dark panel, so the match is case-insensitive and trimmed on both sides.
+    """
+    body = HEALTH_MD.replace("category: Health", "category: health")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    assert feeder.load_goal_from_definitions(defs_dir, "HEALTH", "Weigh-In")[0] \
+        == DEFS_GOAL
+
+
+# ── The unit is CHECKED, never assumed ─────────────────────────────────────
+# This is the sharpest edge in the block. `target: 77` with `unit: kg` is
+# 170 lb, and 77 sits INSIDE the 40..1000 lb sanity band — so the band does not
+# catch it, and the panel would show "77 lb" against a real 191 lb reading and
+# paint it full red. A wrong unit here is the same failure class as a vendor
+# parser written from a schema: confident, plausible and wrong about a person's
+# body, with nothing on the wall able to tell anyone.
+
+@pytest.mark.parametrize("unit", ["kg", "kgs", "st", "lbs", "pounds", "%", '""'])
+def test_a_unit_that_is_not_lb_is_refused_and_never_converted_sr022(tmp_path, unit):
+    body = HEALTH_MD.replace("    unit: lb\n", "    unit: %s\n" % unit)
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "unit" in str(err.value)
+
+
+def test_a_plausible_kilogram_target_is_refused_by_the_unit_not_the_band_sr022(tmp_path):
+    """The case that motivates the whole check, asserted on its own.
+
+    77 kg is a real goal a real person would type, and 77 is inside the pounds
+    band, so the sanity band CANNOT catch it. If this test ever goes green with
+    the unit check removed, the unit check is being carried by the band and the
+    band does not actually cover this.
+    """
+    body = HEALTH_MD.replace("    target: 170\n", "    target: 77\n")
+    body = body.replace("    unit: lb\n", "    unit: kg\n")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "kg" in str(err.value)
+
+
+def test_a_target_with_no_unit_at_all_is_refused_sr022(tmp_path):
+    """Absent is not "obviously pounds". Assuming is the whole defect."""
+    body = HEALTH_MD.replace("    unit: lb\n", "")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "unit" in str(err.value)
+
+
+def test_no_conversion_helper_is_reachable_from_the_goal_path_sr022(tmp_path):
+    """There is deliberately NO kg->lb conversion on the goal path.
+
+    `grams_to_pounds` exists for the vendor READING and is out of scope here;
+    what must not exist is any path by which a non-`lb` target becomes a
+    number. Asserted by proving every non-lb unit refuses (above) and that the
+    goal reader never returns for one.
+    """
+    for unit, target in (("kg", "77"), ("st", "12"), ("g", "77000")):
+        body = HEALTH_MD.replace("    target: 170\n", "    target: %s\n" % target)
+        body = body.replace("    unit: lb\n", "    unit: %s\n" % unit)
+        defs_dir = write_defs(tmp_path, {"health-%s.md" % unit: body})
+        with pytest.raises(ValueError):
+            feeder.load_goal_from_definitions(defs_dir)
+        for name in os.listdir(defs_dir):
+            os.unlink(os.path.join(defs_dir, name))
+
+
+def test_the_unit_is_read_the_way_a_person_would_write_it(tmp_path):
+    """Quotes and a trailing comment are ordinary in hand-edited frontmatter."""
+    for written in ('"lb"', "'lb'", "lb  # pounds", "LB", " lb "):
+        body = HEALTH_MD.replace("    unit: lb\n", "    unit: %s\n" % written)
+        defs_dir = write_defs(tmp_path, {"health.md": body})
+        assert feeder.load_goal_from_definitions(defs_dir)[0] == DEFS_GOAL
+
+
+# ── The target itself ───────────────────────────────────────────────────────
 
 def test_no_hub_knob_can_supply_the_goal_sr022(tmp_path):
     """The criterion is not merely "a goal exists" — it is WHERE it lives.
@@ -244,12 +421,15 @@ def test_no_hub_knob_can_supply_the_goal_sr022(tmp_path):
     A knob would be a second home for the household's intent that does not
     sync, so this asserts the negative: with a full environment set and an
     empty definitions tree, the cycle refuses. Every plausible knob name is
-    tried, so adding one later turns this red.
+    tried, so adding one later turns this red. The two knobs this block DOES
+    add name the item's LOCATION and are set here too — if either could ever
+    carry a number, this test would stop meaning anything.
     """
     defs_dir = write_defs(tmp_path, {})
     env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
            "WEIGHT_DEFINITIONS_DIR": defs_dir,
            "WEIGHT_STATE_FILE": str(tmp_path / "state.json"),
+           "WEIGHT_ITEM_CATEGORY": "170", "WEIGHT_ITEM_ID": "170",
            "WEIGHT_GOAL": "180", "WEIGHT_GOAL_LB": "180",
            "WEIGHT_TARGET": "180", "WEIGHT_TARGET_LB": "180"}
     with pytest.raises(feeder.GoalMissing):
@@ -276,108 +456,483 @@ def test_a_missing_goal_posts_nothing_at_all_sr022(tmp_path):
     assert posts == []
 
 
-def test_the_goal_survives_naglights_own_loader_sr022(tmp_path):
-    """The declaration must be legal where it lives, not merely readable by us.
+@pytest.mark.parametrize("replacement,why", [
+    ("", "absent"),
+    ("    target:\n", "blank"),
+    ("    target: '   '\n", "whitespace"),
+    ("    target: one seventy\n", "not a number"),
+    ("    target: nan\n", "not finite"),
+    ("    target: 1700\n", "out of band high"),
+    ("    target: 17\n", "out of band low"),
+    ("    target: 0\n", "zero"),
+    ("    target: -170\n", "negative"),
+])
+def test_an_unusable_target_posts_nothing_at_all_sr022(tmp_path, replacement, why):
+    """Blank, absent, non-numeric and out-of-band are ALL "no goal".
 
-    internal/defs/yaml.go ignores unknown TOP-LEVEL frontmatter keys, which is
-    the whole reason this needs no NagLight change to be stored. This asserts
-    the shape that relies on: a top-level scalar, before `items:`, in a file
-    that is otherwise an ordinary definitions file. A goal written as an ITEM
-    field (indented under a dash) would be a different thing entirely and is
-    asserted not to be picked up.
+    Whether it surfaces as GoalMissing (nothing was declared) or ValueError
+    (something was declared that cannot be used), the outcome the Owner sees is
+    the same and is the one that matters: NOTHING IS POSTED, and the journal
+    names the file. `1700` for `170` is the case that earns the band — it
+    parses, it is finite, and it would drag NagLight's inferred bar to
+    1675..1725 so every real reading paints full red forever.
     """
-    indented = HEALTH_MD.replace("weight_goal_lb: 180\n", "")
-    indented = indented.replace("    recur: daily\n",
-                                "    recur: daily\n    weight_goal_lb: 180\n")
-    defs_dir = write_defs(tmp_path, {"health.md": indented})
+    posts = []
+    body = HEALTH_MD.replace("    target: 170\n", replacement)
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_DEFINITIONS_DIR": write_defs(tmp_path, {"health.md": body}),
+           "WEIGHT_STATE_FILE": str(tmp_path / "state.json")}
+    with pytest.raises((feeder.GoalMissing, ValueError)):
+        feeder.run_cycle(env, now=NOW,
+                         readers={"google-health": lambda e: (191.4, NOW)},
+                         poster=lambda b, *a: (posts.append(b), (True, ""))[1])
+    assert posts == [], "%s target must post nothing at all" % why
+
+
+def test_a_blank_target_is_MISSING_not_a_zero_sr022(tmp_path):
+    """A blank target is "you have not said", not "you are aiming at nothing".
+
+    ASSERTED ON THE EXCEPTION TYPE, THROUGH THE REAL LOADER, BECAUSE THE LOOSE
+    VERSION SURVIVED ITS OWN MUTATION (M45) AND THAT WAS A TEST DEFECT. Turning
+    a blank into `0` still posts nothing — the 40..1000 lb band catches the zero
+    — so a test that only checks "nothing was posted" is satisfied by the BAND
+    and says nothing about this line at all. The refusal has to be the MISSING
+    one, or the journal tells the person their goal is out of range when what
+    they have actually done is not set one.
+    """
+    body = HEALTH_MD.replace("    target: 170\n", "    target: '   '\n")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
     with pytest.raises(feeder.GoalMissing):
         feeder.load_goal_from_definitions(defs_dir)
 
 
-def test_a_top_level_goal_after_the_items_sequence_is_not_the_goal_sr022(tmp_path):
-    """Nothing top-level follows `items:` in a definitions file.
+@pytest.mark.parametrize("raw,expected", [
+    ("170", 170.0), (" 170 ", 170.0), ("170.5", 170.5),
+    ('"170"', 170.0), ("'170'", 170.0), ("170 # my goal", 170.0),
+])
+def test_the_target_is_parsed_the_way_a_person_would_write_it(tmp_path, raw, expected):
+    """Frontmatter is hand-edited YAML; quotes and comments are ordinary."""
+    body = HEALTH_MD.replace("    target: 170\n", "    target: %s\n" % raw)
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    assert feeder.load_goal_from_definitions(defs_dir)[0] == expected
 
-    A key at column zero AFTER the item sequence is malformed YAML that the
-    frontmatter happens to contain, not a declaration — internal/defs stops
-    reading top-level scalars at `items:` and so must we, or a stray line at
-    the bottom of a hand-edited file silently becomes the household's goal.
+
+# ── Reversing M10, without letting anyone reverse it back ──────────────────
+
+def test_an_item_level_goal_is_now_THE_goal_which_reverses_m10_sr022(tmp_path):
+    """M10 — "an item-level goal is refused" — is DELIBERATELY REVERSED.
+
+    The old design refused this and a test enforced the refusal. It could not
+    survive: in Drive sheet mode a top-level key is erased on the next sync,
+    and Google Health v4 has no goal concept to fall back on. This test is the
+    old one turned around, and it is named so that a reader who finds the old
+    behaviour in the history knows the change was a ruling, not a regression.
+    Why it changed is recorded in docs/status.md and at the head of the feeder.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": HEALTH_MD})
+    item = feeder.find_goal_item(HEALTH_MD, "health.md", "Health", "weigh-in")
+    assert item is not None and item["target"] == ["170"]
+    assert feeder.load_goal_from_definitions(defs_dir)[0] == DEFS_GOAL
+
+
+def test_the_superseded_top_level_key_is_refused_not_silently_ignored_sr022(tmp_path):
+    """A file that still carries `weight_goal_lb` and nothing else is REFUSED.
+
+    Not "no goal declared": a person upgrading would be staring at a
+    `weight_goal_lb: 180` line while the journal said no goal was declared.
+    The refusal names the key, says it is no longer read, and says where the
+    number goes instead.
+    """
+    body = HEALTH_MD.replace("    target: 170\n", "")
+    body = body.replace("color_weight: 1.5\n", "color_weight: 1.5\nweight_goal_lb: 180\n")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    message = str(err.value)
+    assert "weight_goal_lb" in message and "NO LONGER READ" in message
+
+
+def test_both_a_legacy_key_and_an_item_target_are_refused_not_ranked_sr022(tmp_path):
+    """BOTH PRESENT IS A REFUSAL. Silent precedence is the trap.
+
+    Whichever way it fell, the person would be looking at a bar drawn around
+    one number while a different number sat in their file looking equally
+    authoritative — and in sheet mode the top-level one is about to be deleted
+    underneath them, so "the newest edit wins" is not even stable. Same rule
+    this module already applies to two files declaring a goal.
+
+    Asserted through a WHOLE CYCLE as well as at the loader, so the refusal is
+    proved to cost the post and not merely to raise somewhere.
+    """
+    body = HEALTH_MD.replace("color_weight: 1.5\n",
+                             "color_weight: 1.5\nweight_goal_lb: 180\n")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "REFUSED" in str(err.value)
+
+    posts = []
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_DEFINITIONS_DIR": defs_dir,
+           "WEIGHT_STATE_FILE": str(tmp_path / "state.json")}
+    with pytest.raises(ValueError):
+        feeder.run_cycle(env, now=NOW,
+                         readers={"google-health": lambda e: (191.4, NOW)},
+                         poster=lambda b, *a: (posts.append(b), (True, ""))[1])
+    assert posts == []
+
+
+def test_main_reports_the_refusal_and_exits_nonzero_without_posting_sr022(tmp_path, monkeypatch, capsys):
+    """The refusal must be legible in `systemctl status`, not silent."""
+    monkeypatch.setattr(feeder, "post_gauge",
+                        lambda *a: pytest.fail("nothing may be posted"))
+    monkeypatch.setattr(os, "environ", {
+        "WEIGHT_ENABLED": "true", "WEIGHT_USER": "1080",
+        "WEIGHT_FEED_URL": "http://127.0.0.1:8787/api/feed",
+        "WEIGHT_DEFINITIONS_DIR": write_defs(tmp_path, {}),
+        "WEIGHT_STATE_FILE": str(tmp_path / "state.json")})
+    assert feeder.main([]) == 2
+    err = capsys.readouterr().err
+    assert "REFUSED, nothing posted" in err
+    assert "weigh-in" in err          # it says WHICH item to put the target on
+
+
+# ── The frontmatter reader, on its own ─────────────────────────────────────
+
+def test_a_target_in_the_prose_body_is_not_the_goal_sr022(tmp_path):
+    """Only the leading frontmatter counts, matching defs.frontmatter.
+
+    THE FIRST VERSION OF THIS TEST SURVIVED ITS OWN MUTATION (M37) AND THAT WAS
+    A TEST DEFECT, NOT A CODE ONE. It put a bare `- id:` block in the prose,
+    which the parser skips anyway because a column-zero line ends the item
+    sequence — so the closing fence was never what refused it, and deleting the
+    fence check left the suite green. The prose here RE-OPENS `items:` at column
+    zero, which is the only shape that actually reaches the item reader, and it
+    declares the only weigh-in item in the file: with the fence honoured there
+    is no goal, and without it there is a 999 lb one.
+    """
+    body = ("---\ncategory: Health\nitems:\n  - id: take-vitamins\n"
+            "    title: Take the vitamins\n---\n"
+            "\nNotes. Sketching the row I mean to add to the sheet:\n\n"
+            "items:\n  - id: weigh-in\n    target: 999\n    unit: lb\n")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(feeder.GoalMissing):
+        feeder.load_goal_from_definitions(defs_dir)
+
+
+def test_a_top_level_key_after_the_items_sequence_is_not_a_declaration_sr022():
+    """internal/defs stops reading top-level scalars at `items:` and so do we.
 
     THIS TEST EXISTS BECAUSE THE MUTATION RUN FOUND THE BREAK UNTESTED: with it
     removed the whole suite stayed green, because the indent check downstream
     was catching the only case anything asserted.
     """
-    body = ("---\ncategory: health\nitems:\n  - id: x\n    title: X\n"
-            "weight_goal_lb: 999\n---\n")
-    defs_dir = write_defs(tmp_path, {"health.md": body})
-    with pytest.raises(feeder.GoalMissing):
-        feeder.load_goal_from_definitions(defs_dir)
+    body = ("---\ncategory: Health\nitems:\n  - id: weigh-in\n    target: 170\n"
+            "    unit: lb\nweight_goal_lb: 999\n---\n")
+    assert feeder.declares_legacy_goal(body) is False
+    assert feeder.goal_from_item(
+        feeder.find_goal_item(body, "f", "Health", "weigh-in"),
+        "f", "Health", "weigh-in") == 170.0
 
 
-def test_an_indented_goal_is_an_item_field_not_the_file_level_goal_sr022(tmp_path):
-    """The indent check is the other half, and it is asserted on its own.
+def test_an_indented_legacy_key_is_an_item_field_not_a_top_level_one_sr022():
+    """The indent half, asserted on its own.
 
-    Written after the mutation run: the two guards were covering for each
-    other, so breaking either left the suite green.
+    Written after the earlier mutation run, which showed the two guards were
+    covering for each other so breaking either left the suite green.
     """
-    assert feeder.find_goal_in_frontmatter(
-        "---\ncategory: health\n  weight_goal_lb: 999\n---\n", "f") is None
+    assert feeder.declares_legacy_goal(
+        "---\ncategory: Health\n  weight_goal_lb: 999\n---\n") is False
+    assert feeder.declares_legacy_goal(
+        "---\ncategory: Health\nweight_goal_lb: 999\n---\n") is True
 
 
-def test_a_goal_in_the_prose_body_is_not_the_goal_sr022(tmp_path):
-    """Only the leading frontmatter counts, matching defs.frontmatter."""
-    body = "---\ncategory: health\nitems:\n  - id: x\n---\n\nweight_goal_lb: 999\n"
-    defs_dir = write_defs(tmp_path, {"health.md": body})
-    with pytest.raises(feeder.GoalMissing):
+# ── Depth: the four ways a nested block used to speak for the item ─────────
+#
+# EVERY FIXTURE BELOW IS THE CROSS-REVIEWER'S, VERBATIM, and every one of them
+# used to yield a 170 lb goal from something that is not the Owner's declared
+# target. They are one defect - the reader ignored indentation DEPTH, so
+# anything shaped like `id:`/`target:`/`unit:` was read as a direct item field
+# wherever it sat - and they are tested one by one because a single root-cause
+# fix still has to be shown to close each door somebody actually pushed on.
+#
+# 170 IS DELIBERATELY THE SAME NUMBER THE OWNER'S REAL FILE CARRIES. A fixture
+# that used 999 would be caught by a test asserting "not 999" even if the
+# reader had merely stopped finding a goal for some unrelated reason; these
+# assert on the SHAPE of the refusal instead.
+
+NESTED_MAPPING_MD = """---
+category: Health
+items:
+  - id: weigh-in
+    metadata:
+      target: 170
+      unit: lb
+---
+"""
+
+NESTED_LIST_MD = """---
+category: Health
+items:
+  - id: take-vitamins
+    alternatives:
+      - id: weigh-in
+        target: 170
+        unit: lb
+---
+"""
+
+SECOND_ITEMS_MD = """---
+category: Health
+items:
+  - id: take-vitamins
+    title: Take the vitamins
+items:
+  - id: weigh-in
+    target: 170
+    unit: lb
+---
+"""
+
+TAB_INDENTED_MD = (
+    "---\ncategory: Health\nitems:\n\t- id: weigh-in\n"
+    "\t  target: 170\n\t  unit: lb\n---\n")
+
+
+def test_a_nested_mapping_is_not_the_items_fields_sr022(tmp_path):
+    """P1: `metadata: {target: 170, unit: lb}` is NOT a 170 lb goal.
+
+    To every YAML parser alive that target belongs to `metadata`, and the item
+    itself declares none. The old reader took both keys as the item's own and
+    posted 170 lb against the Owner's real weight. The refusal that must come
+    out is the one for an item with NO target - not a unit complaint, not a
+    band complaint - because that is what the file actually says.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": NESTED_MAPPING_MD})
+    with pytest.raises(feeder.GoalMissing) as err:
         feeder.load_goal_from_definitions(defs_dir)
+    assert "declares no `target:`" in str(err.value)
 
 
-def test_two_files_declaring_a_goal_are_refused_not_ordered_sr022(tmp_path):
+def test_a_nested_list_is_not_the_configured_item_sr022(tmp_path):
+    """P2: an `alternatives:` list under take-vitamins is not the weigh-in item.
+
+    The nested entry has the right id and the right two fields, so ANY reader
+    that matches on shape rather than on depth finds it. The item the household
+    configured does not exist in this file, and the honest answer is to say so.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": NESTED_LIST_MD})
+    with pytest.raises(feeder.GoalMissing) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "weigh-in" in str(err.value)
+    # ...and the nested entry did not become an ITEM either, which is the half
+    # a "skip fields deeper than the item" patch alone would have left open.
+    _top, items = feeder.parse_definitions_file(NESTED_LIST_MD, "health.md")
+    assert len(items) == 1
+    assert feeder.clean_scalar(items[0]["id"][0]) == "take-vitamins"
+
+
+def test_a_second_items_key_is_refused_not_preferred_sr022(tmp_path):
+    """P3: two `items:` blocks is an ambiguous document, not a reset.
+
+    The old reader re-entered item mode on the second key and read the goal out
+    of it. Merging them would be no better: which sequence the household meant
+    is not guessable, and this module refuses that question everywhere else.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": SECOND_ITEMS_MD})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "not guessable" in str(err.value) and "items" in str(err.value)
+
+
+def test_a_tab_indented_item_is_refused_not_trusted_sr022(tmp_path):
+    """P4: YAML forbids tabs in indentation, so this file has no items at all.
+
+    The loader that syncs these files rejects the whole document; a reader that
+    accepted it would be the only thing in the household that believes it knows
+    what the file declares - and what it would believe is a body weight.
+    """
+    defs_dir = write_defs(tmp_path, {"health.md": TAB_INDENTED_MD})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "TAB" in str(err.value)
+
+
+@pytest.mark.parametrize("body", [NESTED_MAPPING_MD, NESTED_LIST_MD,
+                                  SECOND_ITEMS_MD, TAB_INDENTED_MD])
+def test_no_nesting_trick_can_reach_the_wall_sr022(tmp_path, body):
+    """THE PROPERTY, not the four doors: NOTHING IS POSTED for any of them.
+
+    Each fixture is run through a WHOLE CYCLE against a source that is working
+    perfectly, because the hazard is not an exception in a unit test - it is
+    170 lb arriving on the wall beside a real reading of 191. Whether the
+    refusal is GoalMissing or ValueError is the message's business; that the
+    poster is never called is the household's.
+    """
+    posted = []
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_DEFINITIONS_DIR": write_defs(tmp_path, {"health.md": body}),
+           "WEIGHT_STATE_FILE": str(tmp_path / "state.json")}
+    with pytest.raises((feeder.GoalMissing, ValueError)):
+        feeder.run_cycle(env, now=NOW,
+                         readers={"google-health": lambda _e: (191.4, NOW)},
+                         poster=lambda b, *a: (posted.append(b), (True, ""))[1])
+    assert posted == [], "a nested block put a goal on the wall"
+
+
+def test_the_readers_narrowness_agrees_with_real_yaml_sr022():
+    """The hand reader is narrow ON PURPOSE - but it must not be DIFFERENT.
+
+    PyYAML is not a dependency of this service and never will be (stdlib only,
+    no venv, and a new apt name means the offline apt export is re-run), but
+    where it happens to be installed it is a free oracle: for each fixture, what
+    the reader concluded about the weigh-in item's own `target` is checked
+    against what a real YAML parser says. That is what keeps "narrow" from
+    drifting into "wrong" without anybody noticing.
+    """
+    yaml = pytest.importorskip("yaml")
+
+    def real_target(body):
+        """The weigh-in item's OWN target, per PyYAML, or None."""
+        front = "\n".join(feeder.frontmatter_lines(body))
+        for item in (yaml.safe_load(front) or {}).get("items") or []:
+            if isinstance(item, dict) and item.get("id") == "weigh-in":
+                return item.get("target")
+        return None
+
+    assert real_target(HEALTH_MD) == 170              # the Owner's real file
+    assert real_target(NESTED_MAPPING_MD) is None     # P1: it is metadata's
+    assert real_target(NESTED_LIST_MD) is None        # P2: it is a nested list
+    with pytest.raises(yaml.YAMLError):               # P4: not YAML at all
+        yaml.safe_load("\n".join(feeder.frontmatter_lines(TAB_INDENTED_MD)))
+    # P3 is a duplicate key: PyYAML's default loader keeps the LAST one
+    # silently, which is precisely the "pick one" this reader refuses to do.
+    assert real_target(SECOND_ITEMS_MD) == 170
+    assert feeder.parse_definitions_file(HEALTH_MD, "health.md")[1][1]["target"] \
+        == ["170"]
+    for body in (NESTED_MAPPING_MD, NESTED_LIST_MD):
+        item = feeder.find_goal_item(body, "health.md", "Health", "weigh-in")
+        assert item is None or "target" not in item
+
+
+def test_a_deeper_block_cannot_reopen_the_item_after_a_nested_one_sr022():
+    """Depth is tracked, not "have we seen a nested key yet".
+
+    `notes:` opens a nested block; the item's OWN `unit:` comes back at the
+    item's column afterwards and must still be read, or the fix would be a
+    different silent wrongness - a real target refused for want of a unit.
+    """
+    body = ("---\ncategory: Health\nitems:\n  - id: weigh-in\n"
+            "    target: 170\n    notes:\n      unit: kg\n      target: 77\n"
+            "    unit: lb\n---\n")
+    item = feeder.find_goal_item(body, "health.md", "Health", "weigh-in")
+    assert item["target"] == ["170"] and item["unit"] == ["lb"]
+    assert feeder.goal_from_item(item, "health.md", "Health", "weigh-in") == 170.0
+
+
+def test_an_item_written_with_the_dash_on_its_own_line_still_reads_sr022():
+    """`-` alone, fields below it, is the other block form a person may type."""
+    body = ("---\ncategory: Health\nitems:\n  -\n    id: weigh-in\n"
+            "    target: 170\n    unit: lb\n---\n")
+    item = feeder.find_goal_item(body, "health.md", "Health", "weigh-in")
+    assert feeder.goal_from_item(item, "health.md", "Health", "weigh-in") == 170.0
+
+
+def test_a_sequence_at_column_zero_is_still_the_items_sequence_sr022():
+    """YAML lets a sequence sit at its key's own indent, and people write it.
+
+    The old reader treated every column-zero line as a top-level key, so this
+    entirely valid file silently held NO items - a blind spot that ends in "no
+    goal" for a household that declared one perfectly legibly.
+    """
+    body = ("---\ncategory: Health\nitems:\n- id: weigh-in\n  target: 170\n"
+            "  unit: lb\n---\n")
+    item = feeder.find_goal_item(body, "health.md", "Health", "weigh-in")
+    assert feeder.goal_from_item(item, "health.md", "Health", "weigh-in") == 170.0
+
+
+def test_an_inline_items_sequence_is_refused_rather_than_guessed_at_sr022():
+    """Flow style is not the shape the sheet generates, so it is not read."""
+    body = ("---\ncategory: Health\nitems: [{id: weigh-in, target: 170}]\n---\n")
+    with pytest.raises(ValueError) as err:
+        feeder.parse_definitions_file(body, "health.md")
+    assert "inline sequence" in str(err.value)
+
+
+def test_a_definitions_file_that_links_out_of_the_directory_is_refused_sr022(tmp_path):
+    """PRIORITY 4, and the cheap half of it.
+
+    The definitions directory is the tracker's own docker volume and so is
+    inside the trust boundary - WEIGHT_DEFINITIONS_DIR may legitimately BE a
+    symlink, and that stays supported. What is refused is an entry that leaves
+    it: "the goal came from a file that is not in the household's definitions"
+    is a sentence this feeder should not be able to say.
+    """
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text(HEALTH_MD.replace("target: 170", "target: 199"),
+                       encoding="utf-8")
+    defs_dir = write_defs(tmp_path, {})
+    try:
+        os.symlink(str(outside), os.path.join(defs_dir, "health.md"))
+    except (OSError, NotImplementedError):    # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "outside the definitions directory" in str(err.value)
+
+
+def test_a_symlinked_definitions_directory_is_still_read_sr022(tmp_path):
+    """The other side of the same coin: the docker volume itself may be a link,
+    and refusing that would be refusing the normal deployment."""
+    real = write_defs(tmp_path, {"health.md": HEALTH_MD})
+    link = str(tmp_path / "definitions-link")
+    try:
+        os.symlink(real, link, target_is_directory=True)
+    except (OSError, NotImplementedError):    # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+    assert feeder.load_goal_from_definitions(link)[0] == DEFS_GOAL
+
+
+def test_two_files_holding_the_item_are_refused_not_ordered_sr022(tmp_path):
     """Picking the first would silently follow file-name order.
 
     That is the same defect class defs.Load found on a real household's files
     with duplicate `check:` ids: a loser that is never used and never reported.
     """
-    other = HEALTH_MD.replace("weight_goal_lb: 180", "weight_goal_lb: 165")
+    other = HEALTH_MD.replace("    target: 170", "    target: 165")
     defs_dir = write_defs(tmp_path, {"health.md": HEALTH_MD, "aaa.md": other})
     with pytest.raises(ValueError) as err:
         feeder.load_goal_from_definitions(defs_dir)
     assert "not guessable" in str(err.value)
 
 
-def test_one_file_declaring_the_goal_twice_is_refused_sr022(tmp_path):
-    doubled = HEALTH_MD.replace("weight_goal_lb: 180",
-                                "weight_goal_lb: 180\nweight_goal_lb: 165")
+def test_one_file_holding_the_item_twice_is_refused_sr022(tmp_path):
+    """Two items with the same id in one file: also not guessable."""
+    doubled = HEALTH_MD.replace(
+        "  - id: weigh-in\n    title: Step on the scale\n",
+        "  - id: weigh-in\n    title: Step on the scale\n"
+        "    unit: lb\n    target: 165\n  - id: weigh-in\n    title: Again\n")
     defs_dir = write_defs(tmp_path, {"health.md": doubled})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as err:
         feeder.load_goal_from_definitions(defs_dir)
+    assert "not guessable" in str(err.value)
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("180", 180.0), (" 180 ", 180.0), ("180.5", 180.5),
-    ('"180"', 180.0), ("'180'", 180.0), ("180 # my goal", 180.0),
-])
-def test_the_goal_is_parsed_the_way_a_person_would_write_it(raw, expected):
-    """Frontmatter is hand-edited YAML; quotes and comments are ordinary."""
-    assert feeder.parse_goal_text(raw, "f") == expected
+def test_a_target_declared_twice_on_the_item_is_refused_sr022(tmp_path):
+    """Last-one-wins on a body-weight goal is a number nobody chose."""
+    body = HEALTH_MD.replace("    target: 170\n", "    target: 170\n    target: 165\n")
+    defs_dir = write_defs(tmp_path, {"health.md": body})
+    with pytest.raises(ValueError) as err:
+        feeder.load_goal_from_definitions(defs_dir)
+    assert "not guessable" in str(err.value)
 
 
-@pytest.mark.parametrize("raw", ["", "   ", "#just a comment"])
-def test_a_blank_goal_declaration_is_missing_not_zero(raw):
-    with pytest.raises(feeder.GoalMissing):
-        feeder.parse_goal_text(raw, "f")
-
-
-@pytest.mark.parametrize("raw", ["one eighty", "nan", "inf", "-inf",
-                                 "1800", "18", "0", "-180"])
-def test_an_unusable_goal_is_refused_rather_than_ignored(raw):
-    """A typo'd goal must NOT degrade to "no goal declared".
-
-    `1800` for `180` is the case this guards: it parses, it is finite, and it
-    would drag NagLight's inferred bar to 1775..1825 so every real reading
-    paints full red forever, with nothing anywhere saying why.
-    """
-    with pytest.raises((ValueError, feeder.GoalMissing)):
-        feeder.parse_goal_text(raw, "f")
+def test_a_file_that_is_not_a_definitions_file_is_skipped_not_read_sr022(tmp_path):
+    """A stray .md beside the definitions must not be parsed for items."""
+    assert feeder.parse_definitions_file("just some notes\n") is None
+    defs_dir = write_defs(tmp_path, {"notes.md": "no frontmatter here\n",
+                                     "health.md": HEALTH_MD})
+    assert feeder.load_goal_from_definitions(defs_dir)[0] == DEFS_GOAL
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -648,10 +1203,97 @@ def test_a_temp_file_planted_between_the_check_and_the_open_is_refused_sr022(tmp
         os.symlink(str(victim), str(tmp_file))
     except (OSError, NotImplementedError):      # pragma: no cover - platform
         pytest.skip("this filesystem/account cannot create symlinks")
-    with feeder.open_no_follow(str(tmp_file)) as handle:
+    with feeder.open_no_follow(str(tmp_file), root=str(state_dir)) as handle:
         handle.write("{}")
     assert victim.read_text(encoding="utf-8") == "KEEP-ME"
     assert not tmp_file.is_symlink()
+
+
+def test_an_intermediate_directory_swapped_after_the_verdict_is_refused_sr022(tmp_path):
+    """THE CROSS-REVIEW DEFECT: O_NOFOLLOW protects the LAST hop only.
+
+    The window is real and the timing is not exotic: `token_write_verdict` (or
+    `writable_path_verdict`) resolves the whole path, and then the open walks
+    it again. Replace `.../tokens` with a link to somewhere else in between and
+    every guard above has already passed - the old open followed the swapped
+    directory and put the file outside the state directory the module says it
+    cannot leave.
+
+    THIS TEST PLANTS THE LINK IN THAT WINDOW BY CALLING THE OPEN DIRECTLY, on
+    the real filesystem, which is exactly the state the process would be in a
+    microsecond after the verdict. No mock: the verdict already returned, and
+    what happens next is the only thing under test.
+    """
+    root = tmp_path / "state"
+    (root / "tokens").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = root / "tokens" / "weight-state.json.tmp"
+    # ...the verdict has now resolved cleanly. The swap:
+    (root / "tokens").rmdir()
+    try:
+        os.symlink(str(outside), str(root / "tokens"), target_is_directory=True)
+    except (OSError, NotImplementedError):      # pragma: no cover - platform
+        pytest.skip("this filesystem/account cannot create symlinks")
+
+    with pytest.raises(OSError):
+        feeder.open_no_follow(str(target), root=str(root))
+    assert not (outside / "weight-state.json.tmp").exists(), (
+        "the write landed outside the state directory")
+
+
+def test_the_contained_open_still_writes_through_real_directories_sr022(tmp_path):
+    """The other half: a guard that refuses everything is not a guard.
+
+    A genuine nested directory under the root must still be walked and written,
+    or the feeder simply stops working on the hub - where the state file sits
+    one level down from StateDirectory= in exactly this shape.
+    """
+    root = tmp_path / "state"
+    (root / "tokens").mkdir(parents=True)
+    target = root / "tokens" / "weight-state.json.tmp"
+    with feeder.open_no_follow(str(target), root=str(root)) as handle:
+        handle.write("{}")
+    assert target.read_text(encoding="utf-8") == "{}"
+    assert feeder.path_components_under(str(target), str(root)) == \
+        ["tokens", "weight-state.json.tmp"]
+
+
+def test_a_path_that_is_not_under_the_root_is_never_opened_sr022(tmp_path):
+    """The walk starts AT the root, so a path it cannot reach from there is
+    refused rather than opened by its name. This is the case the containment
+    claim cannot be made for, so it is not made."""
+    root = tmp_path / "state"
+    root.mkdir()
+    stray = tmp_path / "elsewhere.json"
+    with pytest.raises(PermissionError) as err:
+        feeder.open_no_follow(str(stray), root=str(root))
+    assert "cannot be contained" in str(err.value)
+    assert not stray.exists()
+
+
+def test_open_for_write_hands_the_state_root_to_the_open_sr022(tmp_path, monkeypatch):
+    """THE WIRING, and it is named as such.
+
+    The containment above is proved against `open_no_follow` on the real
+    filesystem; what this asserts is only that the ONE caller passes its root
+    in, because a perfect guard nobody calls with a root is the same as no
+    guard. It is a weaker test than the one above and is not a substitute for
+    it - the previous three rounds each lost a first-pass mutation to a test
+    that leaned on a neighbour, so which check carries what is written down.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_path = state_dir / "weight-state.json"
+    seen = {}
+
+    def recorder(path, root=None):
+        seen["path"], seen["root"] = path, root
+        return io.StringIO()
+
+    monkeypatch.setattr(feeder, "open_no_follow", recorder)
+    feeder.open_for_write(str(state_path) + ".tmp", str(state_path), str(state_dir))
+    assert seen["root"] == str(state_dir)
 
 
 def test_the_state_file_must_sit_inside_the_services_own_state_directory_sr022(tmp_path):
@@ -704,7 +1346,7 @@ def test_a_whole_cycle_writes_exactly_one_file_and_no_token(tmp_path):
     feeder.run_cycle(env, now=NOW,
                      readers={"google-health": lambda e: (191.4, NOW)},
                      poster=lambda *a: (True, "HTTP 200"),
-                     goal_loader=lambda d: (GOAL, "health.md"))
+                     goal_loader=lambda d, *a: (GOAL, "health.md"))
 
     after = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
     assert after == before, "the feeder touched something under HOME"
@@ -795,6 +1437,30 @@ def test_the_knobs_are_declared_where_deploy_reads_them():
         assert knob in text, "%s is not declared in FieldSchema.psd1" % knob
 
 
+def test_the_item_location_knobs_are_declared_in_env_example_sr022():
+    """The two LOCATION knobs must ship, or moving the item needs a code change.
+
+    THE FieldSchema HALF IS OWED AND DELIBERATELY NOT ASSERTED HERE.
+    `FieldSchema.psd1` lives in the HomeHub repo, which this worktree may not
+    edit, so `WEIGHT_ITEM_CATEGORY` / `WEIGHT_ITEM_ID` are not in the emitter's
+    field list yet. That is SAFE rather than broken: an undeclared knob is
+    simply absent from the emitted .env, a blank/absent knob takes the default,
+    and the default IS the shape the Owner's sheet already syncs. What it costs
+    is that MOVING the item currently needs an .env edit on the hub rather than
+    a deploy-config change. Recorded in docs/status.md as owed to HomeHub; do
+    not "fix" it by adding the knobs to the list above, which would turn
+    `test_the_knobs_are_declared_where_deploy_reads_them` red for a file this
+    block cannot touch.
+    """
+    env_example = (REPO / "stack" / ".env.example").read_text(encoding="utf-8")
+    for knob in ("WEIGHT_ITEM_CATEGORY", "WEIGHT_ITEM_ID"):
+        assert "\n%s=" % knob in env_example, "%s is not in .env.example" % knob
+    # And the shipped defaults must be the ones the code falls back to, or the
+    # two would drift and nobody would notice until the item moved.
+    assert "\nWEIGHT_ITEM_CATEGORY=%s\n" % feeder.DEFAULT_GOAL_CATEGORY in env_example
+    assert "\nWEIGHT_ITEM_ID=%s\n" % feeder.DEFAULT_GOAL_ITEM_ID in env_example
+
+
 def test_no_goal_shaped_knob_is_declared_anywhere_deploy_reads_sr022():
     """The goal must not merely be unused on the hub — it must be ABSENT.
 
@@ -805,6 +1471,14 @@ def test_no_goal_shaped_knob_is_declared_anywhere_deploy_reads_sr022():
     with it — someone fills it in, nothing reads it, and the person cannot work
     out why the bar will not move. `WEIGHT_DEFINITIONS_DIR` is exempt because
     it names the directory, never the number.
+
+    STILL MEANS SOMETHING AFTER THE 2026-09-09 CHANGE, AND THAT WAS CHECKED.
+    The goal moved from a top-level frontmatter key to an item's `target`, and
+    the two knobs that move with it name the item's LOCATION - category and id.
+    They are deliberately NOT called `WEIGHT_GOAL_*`, so this scan is not
+    quietly satisfied by a rename: it still fails on any name that could carry
+    a number, and `test_no_hub_knob_can_supply_the_goal_sr022` sets the two
+    location knobs to `170` and proves that still yields no goal.
     """
     files = [REPO / "stack" / ".env.example"]
     schema = REPO.parent / "HomeHub" / "scripts" / "deploy" / "FieldSchema.psd1"
@@ -966,7 +1640,7 @@ def test_an_unexpected_reader_exception_records_its_type_and_not_its_message(tmp
     posted, failures, _ = feeder.run_cycle(
         env, now=NOW, readers={"google-health": leaky},
         poster=lambda *a: (True, "HTTP 200"),
-        goal_loader=lambda d: (GOAL, "health.md"))
+        goal_loader=lambda d, *a: (GOAL, "health.md"))
 
     joined = " ".join(failures)
     assert "RuntimeError" in joined, "the failure must still be named"
@@ -1051,7 +1725,7 @@ def test_corrupt_state_posts_unavailable_and_never_a_fabricated_weight_sr022(tmp
     posted, failures, _ = feeder.run_cycle(
         env, now=NOW, readers={"google-health": broken},
         poster=lambda body, *a: (sent.append(body), (True, "HTTP 200"))[1],
-        goal_loader=lambda d: (GOAL, "health.md"))
+        goal_loader=lambda d, *a: (GOAL, "health.md"))
 
     assert sent[0]["value"] == 0.0
     assert "observed_at" not in sent[0]
@@ -1070,7 +1744,7 @@ def test_the_invariant_holds_across_every_fix_sr022(tmp_path):
            "STATE_DIRECTORY": str(state_dir)}
     sent = []
     poster = lambda body, *a: (sent.append(body), (True, "HTTP 200"))[1]
-    loader = lambda d: (GOAL, "health.md")
+    loader = lambda d, *a: (GOAL, "health.md")
 
     measured_at = NOW - 3600
     posted, _, _ = feeder.run_cycle(

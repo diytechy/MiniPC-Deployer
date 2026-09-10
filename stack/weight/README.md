@@ -68,84 +68,387 @@ temperature and heart-rate metrics**. Consenting to it hands this box all of
 them. That is a real widening of what the household gives up for a weight bar,
 and it is the Owner's call, not this feeder's.
 
-### What is still owed, and only the Owner can clear it
+### The five steps, and where each one stands
 
 1. **Enable `health.googleapis.com`** on the Google Cloud project that owns the
-   existing OAuth client — the one `oauth2-proxy` and `TRACKER_DRIVE_CLIENT_ID`
-   share. (Reuse that client, do not mint a second: the tracker's Drive sync
-   already learned that a second copy of the secret is a second thing to rotate.)
-2. **Add the scope above** to that client's consent screen, and add the Owner's
-   email to the project's **Test users** list. Projects start capped at 100 test
-   users; going beyond that needs a third-party security review, which a
-   household never will.
-3. **Consent in a browser** and mint a refresh token into `WEIGHT_TOKEN_FILE`.
+   household's one existing OAuth client — **oauth2-proxy's**, in
+   `OAUTH2_PROXY_CLIENT_ID` / `OAUTH2_PROXY_CLIENT_SECRET`. (Reuse that client,
+   do not mint a second: a second copy of the secret is a second thing to
+   rotate, and the two drift silently.) **DONE by the Owner, 2026-09-09.**
 
-Then: make **one** `dataPoints.list` call by hand, paste the response body into
-`weight_feeder.py`'s module docstring the way B7 pasted its three, and only then
-write `parse_weight_datapoint` against it.
+   > **Corrected 2026-09-09, against the live hub.** An earlier version of this
+   > line said the client was "the one `oauth2-proxy` and `TRACKER_DRIVE_CLIENT_ID`
+   > share". **There is no `TRACKER_DRIVE_CLIENT_ID`.** The deployed
+   > `/opt/homehub/stack/.env` was listed by key name and holds
+   > `OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET`,
+   > `TRACKER_DRIVE_USER`, `TRACKER_DRIVE_SHEET_ID` and an empty
+   > `TRACKER_DRIVE_FOLDER_ID` — and no `TRACKER_DRIVE_CLIENT_*` and no
+   > `GOOGLE_CLIENT_*` of any kind. The tracker's Drive sync reaches straight
+   > for the `OAUTH2_PROXY_*` pair rather than keeping its own copy. So the
+   > household has **exactly one** Google OAuth client, which is the good
+   > outcome — one secret to rotate — and it is oauth2-proxy's.
+2. **Add the scope above** to that client's consent screen, and add the Owner's
+   account to the project's **Test users** list. Projects start capped at 100
+   test users; going beyond that needs a third-party security review, which a
+   household never will. **DONE by the Owner, 2026-09-09.**
+3. **Consent in a browser** and mint a refresh token into `WEIGHT_TOKEN_FILE`.
+   **BUILT, never yet run against Google:** `weight_oauth.py mint`, below.
+4. **Make ONE real `dataPoints.list` call** and keep the body.
+   **BUILT, never yet run against Google:** `weight_oauth.py capture`, below.
+5. **Write `parse_weight_datapoint` against that captured body**, after pasting
+   it into `weight_feeder.py`'s module docstring the way B7 pasted its three.
+   **STILL OWED, and deliberately not started.** It is written by whoever holds
+   a real response body, never from the schema: the discovery document says
+   `weightGrams` is *grams*, and a parser that assumes kilograms posts a
+   confident, plausible, wrong body weight that nothing on the wall could
+   contradict.
+
+Steps 3 and 4 are two subcommands of one Owner-run tool, `weight_oauth.py`, and
+**neither of them parses a weight** — a test asserts that of this file too, not
+only of the feeder. It is a separate file from the feeder on purpose: the
+feeder's central guarantee is that it **never writes a credential** — an
+allow-list, a systemd mount option and three tests stand behind that sentence —
+and one of these commands writes exactly the credential the feeder may not. A
+credential-writing door does not belong inside the module whose guarantee is
+that it has none.
 
 ---
 
+## Steps 3 and 4: the exact commands, and what each one prints
+
+### First, ONE line to add in the Google console
+
+Add this to the OAuth client's **Authorized redirect URIs**:
+
+```
+http://localhost:8117/
+```
+
+**ALONGSIDE the two already there** —
+`https://<TRACKER_SUBDOMAIN>.<DOMAIN>/oauth2/callback` and
+`https://<TRACKER_SUBDOMAIN>.<DOMAIN>/api/drive/callback`. Adding must not
+replace: removing the first breaks Google sign-in for the whole household, and
+removing the second breaks the tracker's Drive sync. The trailing slash is part
+of the value — Google matches a web client's redirect URI byte for byte, and a
+missing slash is the `redirect_uri_mismatch` below.
+
+Google permits `http://` **only** for `localhost`/`127.0.0.1`, which is why this
+one is not https. If the console refuses the value, try `http://127.0.0.1:8117/`
+and pass it to `mint` as `--redirect-uri`; if it refuses both, **stop and report
+it** rather than creating a Desktop-type client — that would be a second
+credential to rotate, and that is the Owner's call.
+
+### Why THIS flow, when the hub has no browser
+
+The consent screen has to open on a machine with a browser — the Owner's PC —
+while the process waiting for the code runs on the hub over SSH. Three flows
+were possible and the choice is deliberate:
+
+| flow | why not / why yes |
+|---|---|
+| `urn:ietf:wg:oauth:2.0:oob` (the old copy-the-code page) | **Not available.** Google shut it down in October 2022; new use answers `invalid_request`. |
+| a loopback **listener** on the hub | Needs `ssh -L 8117:127.0.0.1:8117` up **before** consent, because the browser resolves `localhost` on the *PC*. Forget the tunnel and the code is spent and lost. It also puts a live authorization code on a hub socket any other local account may connect to. |
+| a registered loopback redirect with **nothing listening** | **Chosen.** The browser lands on an error page, the code sits in the address bar, and it travels from the clipboard to the SSH session's stdin without touching a socket. No tunnel, no port, no race. |
+
+The one cost is that **the browser shows a failure page**, which looks like the
+flow broke. It has not: that page *is* the success case, and the step below says
+so where you will be looking. PKCE (S256) is sent as well, so a code seen in an
+address bar, a clipboard or a scrollback is useless to anyone without the
+verifier, which never leaves the minting process.
+
+### Step 3 — mint the refresh token
+
+```bash
+ssh hub
+sudo /usr/bin/python3 /opt/homehub/stack/weight/weight_oauth.py mint
+```
+
+**Why `sudo`:** `stack/.env` is mode 0600 root:root and holds
+`OAUTH2_PROXY_CLIENT_ID`/`_SECRET`. The tool reads that file **key by key** —
+it never `source`s it, because the same file carries
+`TECHNITIUM_ADMIN_PASSWORD`, `CLOUDFLARE_API_TOKEN` and the finance
+credentials — and hands the finished token to the `homehub-weight` account so
+the feeder can read it.
+
+**Which variables it looks for, in order.** `OAUTH2_PROXY_CLIENT_ID` +
+`OAUTH2_PROXY_CLIENT_SECRET` first — this is the pair the hub actually has —
+then `TRACKER_DRIVE_CLIENT_ID` + `TRACKER_DRIVE_CLIENT_SECRET` as a fallback
+for a differently-provisioned box. **A pair counts only when both halves are
+set**; half a pair is refused rather than mixed with the other pair's half,
+because a mismatched id and secret fails at Google as `invalid_client` and
+reads as Google's problem. If nothing is found, the refusal **names all four
+variables and says which of them are set**, so the fix is one look at the
+file.
+
+It should print a long `https://accounts.google.com/o/oauth2/v2/auth?...` URL,
+then wait at `Paste the address-bar URL here:`.
+
+1. Open that URL in a browser **on your PC** and sign in as the household
+   account.
+2. Grant the health-metrics scope. Remember what it includes: blood glucose,
+   body fat, oxygen saturation, core body temperature and heart rate, because
+   there is no weight-only scope.
+3. The browser lands on **"This site can't be reached" /
+   `ERR_CONNECTION_REFUSED` at `localhost:8117`. THAT IS THE SUCCESS CASE.**
+4. Copy the **whole address bar** of that failed page, paste it into the SSH
+   session, and press Enter. **The whole URL, not just the code** — the tool
+   refuses a bare code (2026-09-09, see below), because the `state=` it must
+   check against this run is in the part you would have left behind.
+
+On success it prints exactly three lines:
+
+```
+weight: refresh token written to /var/lib/homehub-weight/tokens/google-health-token.json (mode 0600, owner homehub-weight).
+weight: the token itself was not printed, and the client secret was not copied into it.
+weight: next, capture ONE response body - see stack/weight/README.md.
+```
+
+**Nothing secret is ever printed** — not the token, not the client secret, not
+the authorization code — on success, in an error, or in a traceback (there are
+no tracebacks: every failure prints one refusal line and exits 2).
+
+When it prints something else:
+
+| what it says | what it means, what to do |
+|---|---|
+| `could not read /opt/homehub/stack/.env (PermissionError)` | it was not run under `sudo`. |
+| `... already exists and --force was not given` | a token is already there. Pass `--force` only if you mean to replace a working one. |
+| `the token exchange failed: HTTP 400, redirect_uri_mismatch` | the console value and `--redirect-uri` differ — usually the trailing slash. |
+| `the token exchange failed: HTTP 400, invalid_grant` | the code expired (they last minutes) or was already used. Run `mint` again. |
+| `Google returned an error instead of a code: access_denied` | consent was declined, **or the account is not on the project's Test users list**. |
+| `the token exchange failed: HTTP 401, invalid_client` | the id/secret pair in `.env` is not the client the redirect URI is registered on. |
+| `Google's reply carried no refresh token` | Google treated this as an already-granted consent. Remove the app under `https://myaccount.google.com/permissions` and run `mint` again. |
+| `the state in that URL is not the one this run generated` | a stale browser tab from an earlier attempt. Start `mint` again. |
+| `that paste is not a URL ... A bare code is no longer accepted` | paste the whole address bar. There is no state in a bare code, so there is nothing to check. |
+| `that URL carries no state= parameter` | not the page this run opened. Start `mint` again. |
+| `that URL carries the code parameter 2 times` | the paste carries two codes; which one Google issued is not guessable, so none is exchanged. Start `mint` again. |
+| `NOTE - --token-file overrides WEIGHT_TOKEN_FILE` | not an error: you passed `--token-file` naming something other than the configured token. It is allowed and it is printed. The feeder reads `WEIGHT_TOKEN_FILE`, so a token written elsewhere is a copy the service will not use. |
+| `REFUSED: ... outside the service's own state directory` | `WEIGHT_TOKEN_FILE` points somewhere that is not under `/var/lib/homehub-weight`. The guard refuses; fix the knob. |
+
+### What the paste is checked against (changed 2026-09-09)
+
+A cross-review found that `mint` **claimed** a PKCE + `state` check it did not
+always make: a bare pasted code was returned before the parser ran, and a URL
+carrying `code=` with no `state=` was accepted. Both are now refused.
+
+* **`state` is mandatory.** PKCE binds the code to *this process's* verifier;
+  `state` is the half that binds the *response* to the request this run made.
+  There is no weaker fallback — there is "checked" and "not checked".
+* **A bare code is refused.** It carries no `state`, and it is the paste a
+  person is most likely to produce by selecting part of a string.
+* **A duplicated `code=` or `state=` is refused, not ranked.** `?code=A&code=B`
+  is a shape nobody can see the danger in, and first-wins means the tool can
+  exchange a code the Owner is not looking at.
+* **The check is before the exchange.** A state check that runs after the
+  exchange is not a check: the code is single-use, so by the time it fails the
+  thing it guarded has happened. A test asserts the fake token endpoint records
+  *no request at all* on a state mismatch.
+
+### `--token-file` is an override, and it says so (changed 2026-09-09)
+
+The one-path allow-list is `WEIGHT_TOKEN_FILE`. `mint` used to hand the
+*effective* path to the guard as both the path and the allow-list, so passing
+`--token-file` compared it to itself and the allow-list was vacuous exactly when
+it had something to decide. The flag stays — it and `--state-root` are
+documented operator flags on a tool run under `sudo`, and a root operator can
+write anywhere regardless — but it now **prints** that it is overriding, names
+the configured path, and says which guards still bind the write: containment in
+the service's own `StateDirectory=`, the refusal to be the feeder's state file,
+and the no-symlink open below.
+
+### Step 4 — capture ONE response body
+
+```bash
+sudo /usr/bin/python3 /opt/homehub/stack/weight/weight_oauth.py capture --out /home/hub/weight-datapoints.json
+```
+
+`--out` must **not already exist** — it is created `O_EXCL`, mode 0600, and
+handed back to the account that typed `sudo`. On success:
+
+```
+weight: HTTP 200 from https://health.googleapis.com/v4/users/me/dataTypes/weight/dataPoints
+weight: 1234 bytes saved to /home/hub/weight-datapoints.json (mode 0600; the body is NOT printed - it is health data).
+weight: sha256 <64 hex characters>
+weight: hand that file back. The parser is written against it, not before it.
+```
+
+**The body is never printed**, on purpose: it is a real body weight with a
+timestamp. The byte count and the sha256 are there so the file handed back can
+be shown to be the file that was captured.
+
+Exactly **one** call is made to the health API. (The token refresh that precedes
+it is a separate call to Google's *token* endpoint, not to the health API.)
+
+| what it says | what it means, what to do |
+|---|---|
+| `the list call failed: HTTP 403, PERMISSION_DENIED` | either `health.googleapis.com` is not enabled on the project that owns **this** client, or the scope is not on its consent screen. A scope added *after* consent is not in an already-minted token: fix the console, then `mint --force` again. |
+| `the list call failed: HTTP 401` | the token is not valid for this API. `mint --force`. |
+| `the list call failed: HTTP 404` | the route is wrong. It is `/v4/users/me/dataTypes/weight/dataPoints` — the prose docs' `/v4/users/me/dataPoints/weight` is the error this whole gate exists to catch. |
+| `HTTP 200` but only a handful of bytes (`{}` or an empty `dataPoint` list) | the call worked and the account simply has no weight data in Google Health. That is still a real captured body and worth keeping, but **a parser cannot be written from an empty list** — weigh in on a scale that feeds Fitbit/Pixel and capture again. |
+| `the list call was refused: refused an HTTP 302 redirect` | something answered for `health.googleapis.com` that is not Google. Do **not** retry with redirects allowed: urllib carries `Authorization` across a cross-host redirect, and that header is this whole scope. |
+| `could not read the token file ... Run mint first.` | step 3 has not been done on this box, or `WEIGHT_TOKEN_FILE` disagrees with where it was written. |
+
+### Then, and only then, step 5
+
+Hand the captured file back. The parser is written against it, in its own task,
+by whoever holds that body. Nothing in this repo may grow a
+`parse_weight_datapoint` before that — two tests fail if it does.
+
+### What has NEVER run against Google
+
+Every test of these two tools runs against a **loopback HTTP server this repo
+starts**. The consent screen, a real authorization code, a real token exchange,
+a real refresh, a real `dataPoints.list` response and the real 401/403 bodies
+are **unexercised**. What *is* exercised against real behaviour: the egress
+guards (a real 302 and a real proxy variable, on real sockets), the write guard
+(a real symlink on a real filesystem), the refusal to overwrite, and the
+no-secret-printed property (sentinel values carried through the whole flow).
 ## The goal lives in the user's definitions (SN-040), and here is exactly how
 
 `WEIGHT_DEFINITIONS_DIR` names the **directory**, never the number. In
-multi-user mode that is `<tracker data root>/<the Google sub>/definitions` — the
+multi-user mode that is `<tracker data root>/<the Google sub>/definitions` - the
 same directory NagLight's `internal/defs.Load` reads and the Drive sync keeps in
-step. The goal is a **top-level frontmatter key**:
+step.
+
+**The goal is the `target` of ONE ITEM**, with its `unit` beside it:
 
 ```yaml
 ---
-category: health
+category: Health
 color_weight: 1.5
-weight_goal_lb: 180
 items:
   - id: weigh-in
     title: Step on the scale
     type: habit
-    recur: daily
+    recur: weekly
+    horizon: long
+    target: 170
+    unit: lb
 ---
 ```
 
-**No NagLight change is needed to store it there.** `internal/defs/yaml.go`
-parses top-level frontmatter scalars and its `default:` branch is literally
-`// ignore unknown top-level keys (forward-compatible)`. That file loads exactly
-as it did before; the tracker does not need to understand the goal, because this
-feeder is what turns it into the gauge's target line.
+**Which item is configuration, not code.** `WEIGHT_ITEM_CATEGORY` (default
+`Health`) and `WEIGHT_ITEM_ID` (default `weigh-in`) name the item's **location**.
+Neither can hold a number, so the household's intent still lives only in the
+person's own definitions; renaming or moving the item is an `.env` edit rather
+than a code change. Both halves match case-insensitively and trimmed, because
+both are typed by hand into a spreadsheet cell.
+
+**No NagLight change is needed.** `target` and `unit` are already item columns
+that round-trip through both sync modes today.
+
+### The frontmatter reader is depth-aware (changed 2026-09-09)
+
+A cross-review found four ways to make the reader source a **wrong goal**, all
+one defect: it ignored indentation *depth*, so anything shaped like `id:` /
+`target:` / `unit:` was read as a direct item field wherever it sat.
+
+```yaml
+items:                          items:
+  - id: weigh-in                  - id: take-vitamins
+    metadata:                       alternatives:
+      target: 170                     - id: weigh-in
+      unit: lb                          target: 170
+                                        unit: lb
+```
+
+Neither declares a 170 lb goal to any YAML parser alive — the first target
+belongs to `metadata`, the second to a nested list under a *different* item —
+and both used to yield 170 lb on the wall. So did a second `items:` block, and
+so did a tab-indented block that `yaml.v3` refuses to parse at all.
+
+The rule now is one rule, not four patches: **a field belongs to an item only at
+that item's own field column.** The sequence's indent is fixed by its first
+`- ` entry, the field column by the first field on that entry; anything deeper
+is a nested container's content and is not the item's. **Ambiguity is refused**
+— a second `items:` key, an inline `items: [...]`, or a tab in the indentation
+all raise rather than resolve, the same way two files declaring the goal already
+did.
+
+It is still a hand reader and not PyYAML, on purpose: the service is
+**stdlib-only** (a plain unit under `ProtectSystem=strict`, no venv), so a real
+parser means a new apt package name and the offline apt export re-run that goes
+with it — and a full parser is the wrong *shape* anyway, because anchors,
+aliases and merge keys let a goal arrive from a line the person cannot see
+beside the number. Where PyYAML happens to be installed, the test suite uses it
+as an **oracle** on every one of these fixtures, so "narrow" cannot quietly
+become "different".
+
+**Definitions symlinks.** The definitions directory is the tracker's own docker
+volume and is inside the trust boundary, so `WEIGHT_DEFINITIONS_DIR` may itself
+be a symlink and still be read. An individual `*.md` that resolves *outside*
+that directory is refused rather than read: "the goal came from a file that is
+not in the household's definitions" is a sentence this feeder should not be able
+to say, and one `realpath` is what it costs.
+
+### It used to be a top-level `weight_goal_lb` key. That was changed on 2026-09-09.
+
+The first version put the goal in a top-level frontmatter key and *deliberately
+refused* an item-level goal. Two facts killed that design, and they are recorded
+here so nobody restores it:
+
+* **Sheet mode erases top-level keys, and this household runs sheet mode**
+  (`TRACKER_DRIVE_SHEET_ID` set, `TRACKER_DRIVE_FOLDER_ID` deliberately blanked
+  2026-09-08). Definitions reach the hub two ways: folder mode
+  (`drive.applyFolder`) stages the `.md` bytes verbatim, but **sheet mode
+  regenerates** each `.md` from CSV through `internal/defsheet`, whose `columns`
+  list is the *item* field set - an unrecognised column is collected into
+  `unknown` and **dropped**. So `weight_goal_lb` would be deleted by the first
+  sync after anyone edited the sheet, silently, leaving the panel dark.
+* **There is no vendor fallback.** Google Health v4 has no goal or target
+  concept anywhere: `DataPoint` has 43 members and none is a goal, `Profile` and
+  `Settings` carry none, and the only two occurrences of "goal" in the 292 KB
+  discovery document (revision 20260908) are a UI settings enum.
+
+`target` and `unit` already round-trip, so the goal now lives where the sync
+will actually carry it.
+
+**A file still carrying the old key is REFUSED, not ignored** - the message
+names the key, says it is no longer read, and says where the number goes. And if
+**both** the legacy key and an item `target` are present, the feeder **refuses
+rather than ranking them**: silent precedence would leave a person looking at a
+bar drawn around one number while a different number sat in their file looking
+equally authoritative, and in sheet mode the top-level one is about to be deleted
+underneath them, so "the newest edit wins" is not even stable. It is the same
+rule this module already applies to two files declaring a goal.
 
 **There is deliberately no `WEIGHT_GOAL` knob.** A goal on the hub would need an
 SSH session and a redeploy to change, would not travel with the rest of the
-person's tracker, and would be a second home for the household's intent — which
-is how this repo's `/opt/homehub` drift started. A test asserts the negative: a
-cycle with every plausible goal knob set and an empty definitions tree refuses.
+person's tracker, and would be a second home for the household's intent - which
+is how this repo's `/opt/homehub` drift started. A test asserts the negative
+twice: a cycle with every plausible goal knob set (including the two *location*
+knobs set to `170`) and an empty definitions tree refuses, and no goal-shaped
+name may be **declared** in `.env.example` or `FieldSchema.psd1` at all.
 
-**No goal ⇒ nothing is posted at all**, and that is a *different* refusal from
+### The unit is CHECKED, never assumed
+
+If `unit` is missing, or is anything but `lb`, the feeder **refuses**. It does
+**not** convert. This is the sharpest edge in the block: `target: 77` with
+`unit: kg` is 170 lb, and **77 sits inside the 40..1000 lb sanity band**, so the
+band cannot catch it - the panel would show "77 lb" against a real 191 lb
+reading and paint it full red. A wrong unit here is the same failure class as a
+vendor parser written from a schema: confident, plausible, and wrong about
+someone's body, with nothing on the wall able to tell anyone.
+
+**A `target` that is blank, absent, non-numeric, non-finite or outside
+40..1000 lb is no goal**, and nothing is posted.
+
+**No goal => nothing is posted at all**, and that is a *different* refusal from
 "no source":
 
 | | what the panel shows | why |
 |---|---|---|
 | no **source** | an unavailable gauge | the panel must say "we do not know what you weigh" rather than leave a hole where a bar belongs |
-| no **goal** | nothing | the target line **is** the goal; NagLight refuses a gauge without a target, and the only way to satisfy it would be to invent one — drawing a 50 lb bar around a number nobody chose and colouring a real body weight green or red against it |
+| no **goal** | nothing | the target line **is** the goal; NagLight refuses a gauge without a target, and the only way to satisfy it would be to invent one - drawing a 50 lb bar around a number nobody chose and colouring a real body weight green or red against it |
 
-### KNOWN GAP — a real NagLight dependency, reported rather than worked around
+### Owed to HomeHub
 
-Definitions reach the hub two ways:
-
-* **Folder mode** (`drive.applyFolder`) stages the `.md` bytes **verbatim**. The
-  goal rides along untouched. Works today.
-* **Sheet mode** exports the sheet to CSV and **regenerates** the `.md` files
-  through `internal/defsheet`, whose `columns` list is the *item* field set.
-  An unrecognised column is collected into `unknown` and **dropped**.
-
-**This household runs sheet mode** (`TRACKER_DRIVE_SHEET_ID` set,
-`TRACKER_DRIVE_FOLDER_ID` deliberately blanked on 2026-09-08). So on the deployed
-box the goal would be erased by the first sync after someone edits the sheet.
-
-Making it survive needs a change in **NagLight**, a repo this block may not edit.
-The smallest change that would do it: let `defsheet` carry non-item, file-level
-keys through the round trip (a `settings`-shaped row, or preserving unknown
-top-level frontmatter keys per category file), so `weight_goal_lb` survives
-sheet → CSV → `.md`. Writing the goal to a hub knob "for now" was rejected: it
-would make the acceptance criterion *false* while looking like it passed.
+`WEIGHT_ITEM_CATEGORY` / `WEIGHT_ITEM_ID` are **not** yet in
+`scripts/deploy/FieldSchema.psd1`, which lives in the HomeHub repo. That is safe
+rather than broken - an undeclared knob is simply absent from the emitted `.env`,
+a blank knob takes the default, and the default is the shape the Owner's sheet
+already syncs - but until it is added, *moving* the item needs an `.env` edit on
+the hub rather than a deploy-config change.
 
 ---
 
@@ -227,6 +530,19 @@ itself does not trust the check that preceded it: the file is unlinked first
 `O_CREAT|O_EXCL|O_NOFOLLOW`, so anything that appears in the gap is refused by
 the kernel rather than by our confidence.
 
+**Every component, not just the last one (changed 2026-09-09).** `O_NOFOLLOW`
+protects the *final* component only, so replacing an intermediate directory
+after the verdict resolved — swapping `.../tokens` for a link — sent the write
+outside the state directory with every guard above it already passed. The open
+now walks from the state root **one component at a time**: each intermediate
+directory is opened relative to the previous one with `O_DIRECTORY|O_NOFOLLOW`
+(`dir_fd=`, stdlib, Linux), so a component that has become a link is refused by
+the kernel *at the hop*, and the final create happens against a directory handle
+rather than a name that can be re-pointed underneath it. Windows has no `dir_fd`
+opens, so the dev PC checks each component with `lstat` instead; that fallback
+is check-then-use and does not close the race, and is not claimed to — the hub
+is Linux.
+
 **A refused write costs the history, never the gauge.** The cycle has already
 posted by then; the refusal is a named failure in the journal.
 
@@ -295,10 +611,12 @@ be carriage for a container that does not exist.
 | File | What it is |
 |---|---|
 | `weight_feeder.py` | the feeder: pure core above the SHELL banner, thin I/O below |
+| `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk). No parser, and no writing door the feeder shares |
 | `homehub-weight.service` | oneshot unit, hardened, `ProtectHome=read-only` |
 | `homehub-weight.timer` | 15 min, justified against the `static` horizon |
 | `setup-weight.sh` | idempotent install; refuses rather than guessing |
 | `../../tests/test_weight_feeder.py` | TC-006 |
+| `../../tests/test_weight_oauth.py` | TC-006 - the no-leak and credential-guard properties of the two tools above |
 
 Adds **no apt package** — python3 stdlib only, and `python3` is already in
 `packages.list`. No apt export is owed.

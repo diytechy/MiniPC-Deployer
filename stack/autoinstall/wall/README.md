@@ -77,7 +77,7 @@ loudly and `WALL-BURN-IN.md` carries the procedure. **Nothing here guesses.**
 | 5 | Wi-Fi power-save + MAC randomization make the panel unreachable / break its DHCP reservation | `NetworkManager/conf.d/99-wall-wifi.conf` + `macaddress: permanent` in netplan (firstboot §5) |
 | 6 | Thermals in a sealed mount; sustained video is the load case | Not config: vent clearance + a measured baseline. Burn-in §6 |
 
-## IF-005 — what landed, and the one thing still owed
+## IF-005 — implemented; physical acceptance remains
 
 The kiosk session runs **one app** — the OfficeWallNaglight shell — and consumes
 it as a **built artifact**, exactly as the tracker consumes `naglight:local`
@@ -93,12 +93,14 @@ it as a **built artifact**, exactly as the tracker consumes `naglight:local`
    therefore be served by the origin that proxies `/api/*` (the hub), while the
    Electron container is a process on the panel. One build and one stamp is what
    makes a mismatch visible with `cat` instead of invisible.
-3. **Who renders `config.json` — STILL OPEN, and it is now the only gap.** The
-   shell reads `./config.json` from its own origin for `HEARTBEAT_URL`,
-   `SUBSONIC`, `LOCAL_LIBRARY` and friends. That file is served from the hub
-   side, but several of its values are panel-side secrets. The build ships
-   `config.example.json` and deliberately refuses to pack a file named
-   `config.json` at all. Nothing renders it today; it is deploy-time work.
+3. ~~Who renders secret `config.json` values~~ — **RESOLVED 2026-09-10.** The
+   Owner ruled that HomeHub does not tunnel panel secrets. Root-only `wall.env`
+   owns the legacy feed token, Kuma push URL and optional Subsonic credentials;
+   firstboot replaces the exact `rendererConfig` allowlist in the panel-owned
+   0600 Electron host JSON. Only its path enters nonsecret `kiosk.env`, and the
+   exact trusted panel document obtains the subset through named host IPC. The
+   hub-served JSON is nonsecret and preflight rejects either access or renderer
+   credentials in it. Removing a wall.env value revokes the old value.
 4. ~~`/media/*` has no home~~ — **RESOLVED by the Owner 2026-07-29 (OI-15)**, and
    built: see "The media pull" below. `/media/*` is served **panel-locally** by
    the shell's Electron host; the kiosk site on the hub serves no `/media` route
@@ -106,9 +108,8 @@ it as a **built artifact**, exactly as the tracker consumes `naglight:local`
    Electron host mapping `/media/*` onto the cache directory — which is
    OfficeWallNaglight's half, not this repo's.
 
-Until those land, this variant is a **complete image with a missing payload** —
-which is the intended half-built state at this gate, and is stated as such rather
-than papered over.
+The source interface is implemented. Packaging, image rehearsal and physical
+panel acceptance remain separate gates; no deployment is implied here.
 
 ## Door motion image boundary (SR-024; physical calibration still open)
 

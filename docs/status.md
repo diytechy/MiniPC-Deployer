@@ -8021,3 +8021,31 @@ proves unavailable telemetry cannot escape under the newer response epoch.
 After this correction, the focused audio gate passes **19 tests / 6 platform
 skips** and the full G1 gate passes **764 tests / 13 skipped, RESULT PASS**;
 strict trace integrity remains zero.
+
+---
+
+## 2026-09-10 — IF-005 panel-local renderer secrets
+
+The remaining IF-005 configuration half is implemented. The panel's root-only
+`/etc/wall-panel/wall.env` supplies `WALL_SHELL_FEED_TOKEN`,
+`WALL_SHELL_HEARTBEAT_URL`, and the Subsonic user/password. Panel firstboot
+renders only that bounded allowlist into `/etc/wall-panel/host.json` at 0600;
+`kiosk.env` contains only the path. Empty values revoke previously rendered
+values. Capability installation preserves the local renderer block and strips
+any transferred copy, so neither HomeHub nor a gateway bundle can tunnel these
+credentials onto the panel.
+
+HomeHub's firstboot now validates the public renderer candidate immediately
+before an atomic exact-byte install. It rejects feed, heartbeat and Subsonic
+credentials recursively and leaves the prior public config intact on failure.
+Focused Windows evidence is **21 passed**; configuration validation, three
+edited shell parse checks and `git diff --check` passed. The full G1 gate with
+Git Bash on `PATH` passed **776 tests / 13 skipped, RESULT PASS** with strict
+trace integrity zero. OpenCode/Grok 4.6
+medium produced a zero-token empty session and is not review evidence.
+Independent adversarial review identified the former unvalidated production
+copy, stale documentation, and nested/case-variant secret-name bypass; all were
+corrected before final re-review.
+The final independent adversarial re-review returned **APPROVE** with no
+remaining secret-leak, trust-boundary, revocation or production-bypass defect.
+Nothing was built into an ISO, deployed, or physically accepted.

@@ -630,24 +630,10 @@ fi
 # by construction rather than by agreement, and the collision (if it ever
 # happens) is reported rather than assumed away.
 #
-# WHY LOSING IT IS SILENT, which is why this block is loud: loadConfig NEVER
-# THROWS. A 404 or a parse error yields the js/config.js DEFAULTS plus a
-# console.warn nobody on a wall can see — so the panel comes up looking like it
-# works, with no FEED_TOKEN (its feed posts are unattributed), no heartbeat, and
-# no music credentials.
-#
-# MODE: 0600 root:root — the same posture as the other site files, and it works
-# because the caddy container runs as uid 0 (measured on the pinned
-# caddy:2.11.4-alpine: no USER in the image, no 'user:' in docker-compose.yml,
-# no userns-remap), so the read-only bind mount reaches it as root. It is the
-# most restrictive mode that serves. THE MODE IS OWED A RULING (docs/status.md
-# OI-20): this file carries FEED_TOKEN, a Kuma push token and the Subsonic
-# password onto an HTTP surface — one guarded by the kiosk site's
-# `remote_ip {$PANEL_IP}/32` matcher, so it is not open to the LAN, but "a
-# secret is served over HTTP behind an IP allow-list" is a posture, not a
-# detail. If caddy ever gains a `user:` the file becomes unreadable and the
-# panel degrades to defaults SILENTLY — which is exactly the failure this
-# comment exists to make findable.
+# The Owner's 2026-09-10 ruling makes this a NONSECRET file. The real install
+# path validates the exact bytes it atomically installs and refuses access,
+# heartbeat or media credentials in either legacy or protected mode. Those
+# values originate only in the panel's root-owned wall.env/private host JSON.
 #
 # THE COLLISION IS DETECTED FROM THE ARCHIVE, NOT FROM THE DESTINATION. This
 # block used to ask `[ -f "$STACK_DIR/wall-shell/config.json" ]` AFTER the
@@ -669,14 +655,14 @@ if [ -f "$WALL_SITE_CONFIG" ]; then
         log "  materialised one. If that was a real file rather than a placeholder, the"
         log "  two are now competing: check OfficeWallNaglight's release contents."
     fi
-    install -d -m 0755 "$STACK_DIR/wall-shell"
-    install -m 0600 -o root -g root "$WALL_SITE_CONFIG" "$STACK_DIR/wall-shell/config.json"
-    log "kiosk site config installed: $STACK_DIR/wall-shell/config.json (0600 root:root,"
-    log "  served over HTTP to the panel only — carries FEED_TOKEN; mode owed a ruling)"
+    python3 "$STACK_DIR/panel-access/install-renderer-config.py" \
+        --env "$STACK_DIR/.env" --source "$WALL_SITE_CONFIG" \
+        --destination "$STACK_DIR/wall-shell/config.json"
+    log "kiosk site config installed: $STACK_DIR/wall-shell/config.json (0644, nonsecret; panel secrets stay panel-local)"
 elif [ -n "$WALL_SITE_TARBALL" ]; then
     log "NOTICE: the kiosk site is installed but there is no site/config.json in the"
     log "  payload, so the site will 404 on it and the panel runs on js/config.js"
-    log "  DEFAULTS — no FEED_TOKEN, no heartbeat, no music credentials, and nothing"
+    log "  DEFAULTS for nonsecret presentation settings. Panel secrets load locally"
     log "  on the wall saying so. Expected on a SIM build. On a PRODUCTION hub it means"
     log "  Materialize-Deploy.ps1 -Image homehub has not been re-run since config.json"
     log "  was added, or Build-VentoyStick.ps1's site\\ list does not carry it yet."
@@ -1315,25 +1301,9 @@ fi
 # inactive answer. `|| true` keeps the printed answer and swallows the status.
 log "crossplay fence unit: $(systemctl is-active homehub-game-isolation.service 2>/dev/null || true)"
 
-# ── 4b. CAN CADDY ACTUALLY READ THE KIOSK CONFIG? (OI-20) ────────────────────
-# Installing a 0600 root-owned file into a bind mount is not the same as the
-# server being able to open it, and NOTHING here checked the difference. The
-# caddy healthcheck probes the admin API on :2019, which is up whenever the
-# process is — so an unreadable config.json leaves caddy `healthy`, the site
-# answers 403/404 for /config.json, and `loadConfig` NEVER THROWS: the panel
-# paints on js/config.js DEFAULTS with no FEED_TOKEN, no heartbeat and no music
-# credentials, and nothing anywhere says so. Exactly the failure the 0600 ruling
-# (OI-20) is owed a decision about, and the one step 3e's comment predicts.
-#
-# It reads today because the pinned caddy:2.11.4-alpine declares no USER,
-# docker-compose.yml sets no `user:` for caddy, and the daemon has no
-# userns-remap — so the container is uid 0. Any ONE of those changing breaks it
-# silently. `:ro` and `read_only:` would NOT: both restrict WRITES, and this is
-# a read. So assert the read itself, and do it AS THE CONTAINER: `docker exec`
-# inherits the service's user, so this fails precisely when caddy would fail.
-#
-# Only asserted when the PRODUCTION source exists. A sim/vmtest hub legitimately
-# has no site/config.json; step 3e's NOTICE already covers that case.
+# ── 4b. CAN CADDY ACTUALLY READ THE NONSECRET KIOSK CONFIG? ──────────────────
+# The validation/install helper writes 0644, but assert the real container read:
+# a healthy Caddy admin endpoint does not prove its bind-mounted site is usable.
 KIOSK_CONFIG_UNREADABLE=0
 if [ -f "$WALL_SITE_CONFIG" ]; then
     for _i in $(seq 1 30); do
@@ -1345,13 +1315,8 @@ if [ -f "$WALL_SITE_CONFIG" ]; then
     else
         KIOSK_CONFIG_UNREADABLE=1
         log "ERROR: caddy CANNOT read /srv/wall-shell/config.json."
-        log "  The file is installed 0600 root:root and the container is running as"
-        log "  uid $(docker exec caddy id -u 2>/dev/null || echo '?') — a 'user:' in docker-compose.yml, a USER in a newer caddy"
-        log "  image, or daemon userns-remap will each do this. The kiosk site will"
-        log "  serve 403/404 for /config.json, loadConfig will NOT throw, and the panel"
-        log "  will paint on js/config.js DEFAULTS: no FEED_TOKEN (its feed posts are"
-        log "  unattributed), no heartbeat, no music credentials. Fix the ownership/mode"
-        log "  to match the uid above, or give caddy back uid 0. See OI-20."
+        log "  The nonsecret file is installed 0644 and the container runs as uid"
+        log "  $(docker exec caddy id -u 2>/dev/null || echo '?'). Inspect its bind mount and permissions."
     fi
 fi
 

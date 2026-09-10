@@ -19,7 +19,7 @@ def run_validator(tmp_path, enabled, config):
 
 
 def test_sr016_legacy_and_protected_policy_must_agree(tmp_path):
-    assert run_validator(tmp_path, "false", {"ACCESS_ENABLED": False, "FEED_TOKEN": "fixture-secret"}).returncode == 0
+    assert run_validator(tmp_path, "false", {"ACCESS_ENABLED": False}).returncode == 0
     assert run_validator(tmp_path, "true", {"ACCESS_ENABLED": True}).returncode == 0
     assert run_validator(tmp_path, "false", {"ACCESS_ENABLED": True}).returncode == 1
     assert run_validator(tmp_path, "true", {"ACCESS_ENABLED": False}).returncode == 1
@@ -30,6 +30,22 @@ def test_sr016_protected_config_never_exposes_credentials(tmp_path):
     assert result.returncode == 1
     assert "never-echo-this-secret" not in result.stdout + result.stderr
     assert run_validator(tmp_path, "true", {"ACCESS_ENABLED": True, "nested": {"deviceCredential": "hidden"}}).returncode == 1
+
+
+@pytest.mark.parametrize("enabled", ["false", "true"])
+def test_sr017_hub_renderer_never_receives_panel_local_secrets(tmp_path, enabled):
+    policy = enabled == "true"
+    for secret in [
+        {"FEED_TOKEN": "fixture"},
+        {"HEARTBEAT_URL": "https://status.invalid/push/fixture"},
+        {"nested": {"HEARTBEAT_URL": "https://status.invalid/push/fixture"}},
+        {"heartbeat_url": "https://status.invalid/push/fixture"},
+        {"SUBSONIC": {"user": "listener"}},
+        {"SUBSONIC": {"password": "fixture"}},
+        {"nested": {"subsonic": {"USER": "listener"}}},
+        {"nested": {"SUBSONIC": [{"Password": "fixture"}]}},
+    ]:
+        assert run_validator(tmp_path, enabled, {"ACCESS_ENABLED": policy, **secret}).returncode == 1
 
 
 def test_sr016_invalid_policy_fails_closed(tmp_path):

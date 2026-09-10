@@ -33,17 +33,14 @@ so ids are repo-local; each Contract cites the counterpart's id):
 **This repo ↔ OfficeWallNaglight** (`Provides` — the image side of the wall
 panel; that repo owns the app):
 
-- **IF-005** — `Partial` since 2026-07-29. **Provided now:** the panel's image
-  (the graphical autoinstall variant, SR-017) and the LAN-only kiosk site that
-  serves the shell's static build *and* proxies `/api/*` to the tracker with the
-  identity swap (SR-016) — the same-origin half of that repo's needs-doc §3.2.
-  **Still open — the artifact contract:** OfficeWallNaglight ships source, not an
-  installer, so there is no agreed build output for this repo to bake, no answer
-  to whether the static build and the Electron half are one artifact or two,
-  nothing that renders the shell's `config.json`, and no home for `/media/*`
-  (its manifest must be same-origin, but the media lives on the panel's own
-  cache). Those four are what keeps the row out of `Implemented`; the details
-  live in `stack/autoinstall/wall/README.md` "What IF-005 still owes".
+- **IF-005** — `Implemented` 2026-09-10. The image consumes one stamped
+  OfficeWallNaglight build as panel app, hub site and private gateway payloads;
+  `/media/*` remains panel-local. HomeHub serves only nonsecret renderer config.
+  The legacy feed token, Kuma push URL and optional Subsonic credentials
+  originate in root-only panel `wall.env`, are materialized into the panel-owned
+  0600 Electron host JSON, and reach only the exact trusted panel document over
+  named IPC. Hub preflight rejects those secrets in either access mode. Physical
+  image/panel acceptance remains unproven; see `stack/autoinstall/wall/README.md`.
 
 **This repo → on-box callers** (`Provides` — the AI CLI service):
 

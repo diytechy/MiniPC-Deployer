@@ -24,18 +24,22 @@ def validate(env_text, config):
         raise ValueError("ACCESS_ENABLED must be a JSON boolean")
     if config.get("ACCESS_ENABLED", False) != (enabled == "true"):
         raise ValueError("Hub and renderer access policies disagree")
-    if enabled == "true":
-        forbidden = {"feed_token", "devicecredential", "session", "wrappingkey", "pinverifier"}
-        def inspect(value):
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    if key.lower() in forbidden and child:
-                        raise ValueError("Protected renderer config contains access credentials")
-                    inspect(child)
-            elif isinstance(value, list):
-                for child in value:
-                    inspect(child)
-        inspect(config)
+    forbidden = {
+        "feed_token", "heartbeat_url", "devicecredential", "session",
+        "wrappingkey", "pinverifier",
+    }
+    def inspect(value, in_subsonic=False):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = key.lower()
+                if ((normalized in forbidden)
+                        or (in_subsonic and normalized in {"user", "password"})) and child:
+                    raise ValueError("Hub renderer config contains access credentials")
+                inspect(child, in_subsonic or normalized == "subsonic")
+        elif isinstance(value, list):
+            for child in value:
+                inspect(child, in_subsonic)
+    inspect(config)
 
 
 def main():

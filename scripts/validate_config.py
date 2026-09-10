@@ -302,6 +302,7 @@ def main():
         "panel-access/stage-gateway.sh",
         "autoinstall/wall/wall-sensors-dbus.conf",
         "panel-access/validate-panel-access.py",
+        "panel-access/install-renderer-config.py",
         "panel-access/docker-compose.access.yml",
         # OI-15 — the media pull. The unit + the script + the manifest generator
         # the script invokes as its post-step (a synced cache with no manifest is

@@ -39,9 +39,11 @@ Nothing in this repo builds, vendors, or vendors-in the shell — it is **staged
   `/api/*` works. That is expected on a checkout without the private sibling
   (this repo is public), and the build says so rather than failing.
 
-**Still owed by IF-005:** nothing renders `config.json` — the shell reads it from
-this origin and several values are secrets, so only `config.example.json` ships.
-That is deploy-time work, and it is the last open half of the interface.
+**IF-005 secret boundary, resolved 2026-09-10:** this origin may serve only
+nonsecret renderer configuration. Panel secrets originate in root-only
+`wall.env`, are materialized into the panel-owned 0600 Electron host JSON and
+reach only the exact trusted panel document through named IPC. The deployment
+preflight rejects those values here in both legacy and protected modes.
 
 ## Two things NOT served from here
 

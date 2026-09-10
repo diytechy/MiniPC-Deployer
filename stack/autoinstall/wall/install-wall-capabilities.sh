@@ -45,7 +45,31 @@ getent group wall-sensors >/dev/null || groupadd --system wall-sensors
 id wall-sensors >/dev/null 2>&1 || useradd --system --gid wall-sensors --no-create-home --shell /usr/sbin/nologin wall-sensors
 usermod -a -G wall-sensors panel
 install -d -m 0755 /etc/wall-panel
-install -o panel -g panel -m 0600 "$host_config" /etc/wall-panel/host.json
+# Preserve the rendererConfig already materialized from this panel's wall.env;
+# the transferred access registration must not replace locally-owned secrets.
+merged_config=$(mktemp /etc/wall-panel/.host.install.XXXXXX)
+cleanup_merged_config() { rm -f "$merged_config"; }
+trap cleanup_merged_config EXIT
+python3 - "$host_config" /etc/wall-panel/host.json > "$merged_config" <<'PY'
+import json, os, stat, sys
+incoming = json.load(open(sys.argv[1]))
+# The transfer supplies access registration only. Renderer secrets have one
+# source: this panel's wall.env-derived current file.
+incoming.pop('rendererConfig', None)
+try:
+    info = os.stat(sys.argv[2])
+    if info.st_mode & 0o077 or not stat.S_ISREG(info.st_mode): raise ValueError()
+    current = json.load(open(sys.argv[2]))
+    if isinstance(current.get('rendererConfig'), dict):
+        incoming['rendererConfig'] = current['rendererConfig']
+except FileNotFoundError:
+    pass
+json.dump(incoming, sys.stdout, separators=(',', ':'), sort_keys=True)
+sys.stdout.write('\n')
+PY
+install -o panel -g panel -m 0600 "$merged_config" /etc/wall-panel/host.json
+rm -f "$merged_config"
+trap - EXIT
 printf 'PANEL_SENSOR_UID=%s\n' "$(id -u panel)" > /etc/wall-panel/sensors.env
 chmod 0644 /etc/wall-panel/sensors.env
 install -m 0644 "$(dirname "$0")/wall-sensors.service" /etc/systemd/system/wall-sensors.service

@@ -383,6 +383,26 @@ ExecStart=
 ExecStart=-/sbin/agetty --noissue --autologin panel %I $TERM
 Type=idle
 EOF
+# ── the Electron host's PRIVATE renderer config ─────────────────────────────
+# Secret shell values originate on this panel, in root-only wall.env. They are
+# merged into the existing private host JSON so access registration survives a
+# rerun, then installed for the panel account at 0600. Only the path crosses
+# into kiosk.env; the values never enter the command line or hub-served files.
+WALL_HOST_CONFIG=${WALL_HOST_CONFIG:-/etc/wall-panel/host.json}
+install -d -m 0755 "$(dirname "$WALL_HOST_CONFIG")"
+HOST_CONFIG_TMP=$(mktemp "$(dirname "$WALL_HOST_CONFIG")/.host.json.XXXXXX")
+cleanup_host_config_tmp() { rm -f "$HOST_CONFIG_TMP"; }
+trap cleanup_host_config_tmp EXIT
+if python3 "$PAYLOAD/render-wall-host-config.py" "$WALL_HOST_CONFIG" > "$HOST_CONFIG_TMP"; then
+    install -o panel -g panel -m 0600 "$HOST_CONFIG_TMP" "$WALL_HOST_CONFIG"
+    rm -f "$HOST_CONFIG_TMP"
+    log "private Electron host config rendered at $WALL_HOST_CONFIG (0600; values not logged)"
+else
+    rm -f "$HOST_CONFIG_TMP"
+    fail_step "private Electron host config could not be rendered"
+fi
+trap - EXIT
+
 # ── the kiosk's OWN config file, because it cannot read wall.env ─────────────
 # THE KIOSK RUNS AS `panel`. /etc/wall-panel/wall.env is 0600 root:root — it
 # holds the Wi-Fi PSK and, optionally, music passwords — so wall-kiosk.sh's
@@ -419,7 +439,7 @@ KIOSK_ENV=/etc/wall-panel/kiosk.env
         *) echo "WALL_CAMERA_ENABLED=false" ;;
     esac
     echo "WALL_CAMERA_DEVICE=${WALL_CAMERA_DEVICE:-/dev/video0}"
-    echo "WALL_HOST_CONFIG=${WALL_HOST_CONFIG:-}"
+    echo "WALL_HOST_CONFIG=$WALL_HOST_CONFIG"
 } > "$KIOSK_ENV"
 chmod 0644 "$KIOSK_ENV"
 log "kiosk: $KIOSK_ENV rendered (0644) — WALL_HOST='${WALL_HOST:-}' WALL_APP_CMD='${WALL_APP_CMD:-}'"

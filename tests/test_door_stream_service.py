@@ -11,8 +11,9 @@ def test_door_broker_unit_is_local_unprivileged_and_credential_isolated():
     unit = (WALL / "wall-door-stream.service").read_text(encoding="utf-8")
     assert "User=wall-door-stream" in unit
     assert "SupplementaryGroups=panel" in unit
-    assert "LoadCredential=wall.env:/etc/wall-panel/wall.env" in unit
-    assert "--config %d/wall.env" in unit
+    assert "wall.env:/etc/wall-panel/wall.env" not in unit
+    assert "LoadCredential=password:/run/wall-door-credentials/password" in unit
+    assert "--credential-directory %d" in unit
     assert "--socket /run/wall-door-stream/service.sock" in unit
     assert "NoNewPrivileges=true" in unit
     assert "ProtectSystem=strict" in unit
@@ -28,9 +29,11 @@ def test_door_broker_is_installed_and_enabled_by_firstboot():
         in user_data
     )
     assert "useradd --system" in firstboot and "wall-door-stream" in firstboot
-    assert "enable_unit_now" in firstboot
+    assert "systemctl disable wall-door-stream.service" in firstboot
     assert "wall-door-stream.service" in firstboot
     assert "systemctl restart wall-door-stream.service" in firstboot
+    assert "install -d -m 0700 -o root -g root \"$_door_cred_dir\"" in firstboot
+    assert "printf '%s' \"$DOORBELL_RTSP_PASSWORD\" > \"$_door_cred_dir/password\"" in firstboot
     assert "After=network-online.target wall-firstboot.service" not in (
         WALL / "wall-door-stream.service"
     ).read_text(encoding="utf-8")

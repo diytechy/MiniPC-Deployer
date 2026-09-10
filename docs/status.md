@@ -11,18 +11,20 @@ last) — it is the record, not required reading for every pass.
 **2026-09-09 — B14 Door image integration is implemented, not deployed.** The
 wall image now installs a hardened `wall-door-stream.service`, creates its
 non-login service account, and starts an idle local broker only after the
-packaged application exists. systemd reads the established root-only
-`wall.env` and exposes it to that account through a RAM-backed credential
-mount; there is no second persistent password file, no credential-bearing
+packaged application exists. Root firstboot extracts only the Door allowlist
+from `wall.env` into root-only `/run` files; systemd exposes those to the account
+through a RAM-backed credential mount. The broker receives no unrelated panel
+secrets, there is no second persistent password file or credential-bearing
 process argument, and Electron can reach only `/run/wall-door-stream/service.sock`.
 Every image-owned display-off and suspend path stops that broker first; display
 on readies only its idle socket, never a camera connection.
 The wall template declares the reserved camera address and T3 password
 placeholders plus public RTSP/geometry knobs; the SIM uses an unreachable
 `.invalid` fixture. The application capability contract now includes
-`door-stream-v1`. Next: complete the application lifecycle/synthetic stream
-proof and the independent B14 cross-review before any panel deployment. Gate
-remains G1.
+`door-stream-v1`. Application lifecycle/synthetic coverage is complete; the
+first independent review rejected three boundaries and their fixes are being
+verified before a second review. No panel deployment has occurred. Gate remains
+G1.
 
 **2026-09-09 — two Owner rulings applied (see the audit entry at the foot of
 this file).** (1) `SLEEP_END` now has **one** default, **06:45**, on both power
@@ -6716,3 +6718,23 @@ the existing occupancy power harness remains **75 PASS / 0 FAIL**. No live
 state changed and no package/image rebuild occurred. The complete gate remains
 green at **549 passed / 5 skipped**, trace integrity 0 with the unchanged 24
 legacy orphans, and clean doc navigation apart from its two known warnings.
+
+**2026-09-09 — B14 review-1 credential-boundary fix.** The independent Terra
+review correctly rejected the first unit shape: `LoadCredential` isolated the
+broker from the renderer but handed the broker the complete `wall.env`, including
+unrelated Wi-Fi/share/music secrets. Firstboot now extracts exactly fourteen
+Door fields into a 0700 root-owned directory under `/run`, with 0600 value files;
+the unit has one `LoadCredential` per field and its Python broker reads only that
+credential directory. The directory is volatile, so the Door unit deliberately
+has no install target and firstboot disables any prior enablement before starting
+it after the sources exist on every boot. Missing required Door values stop the
+broker rather than retaining stale volatile values. There is still no second
+persistent password file and no secret in argv, logs or renderer scope.
+
+Evidence after the fix: focused image tests **6/6**, application credential and
+lifecycle tests **20/20**, `bash -n` clean, `validate_config.py` all checks
+passed, and the complete G1 gate **549 passed / 5 skipped** with trace integrity
+0 and the unchanged 24 legacy orphans. `systemd-analyze verify` accepted the
+unit; its only messages are the known DrvFS executable/world-writable projection,
+while autoinstall writes the target unit 0644. No ISO was built and no live panel
+state changed.

@@ -32,9 +32,10 @@
 #      Plus OI-16a: wall-sync-resume.service enabled, so every wake from the
 #      nightly suspend re-triggers the sync (a resume is not a boot); and
 #      wall-sync-frame.timer enabled, the frame flow's every-minute cadence.
-#  8d. WSN-019 — create and start the unprivileged Door stream broker. systemd
-#      passes the existing root-only wall.env through a RAM-backed credential
-#      mount; the password is not copied into a second persistent file.
+#  8d. WSN-019 — create and start the unprivileged Door stream broker. Extract
+#      only its allowlisted values into root-only /run files; systemd copies
+#      those into the broker's RAM-backed credential mount. No second persistent
+#      secret file exists and the broker never receives unrelated wall secrets.
 #   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
@@ -800,10 +801,12 @@ if command -v getent >/dev/null 2>&1; then
 fi
 
 # ── 8d. WSN-019 — credential-isolated Door stream broker ────────────────────
-# The account owns no files and has no login. It receives the root-only wall.env
-# only through wall-door-stream.service's LoadCredential mount, then publishes a
-# 0660 socket to the panel group. Starting the unit opens NO RTSP connection;
-# only an explicit request from the unlocked Door tab starts FFmpeg.
+# The account owns no files and has no login. The root firstboot process writes
+# exactly the Door allowlist into volatile /run files; PID 1 alone can traverse
+# their 0700 directory and copies them into the unit's credential mount. The
+# broker then publishes a 0660 socket to the panel group. Starting the unit opens
+# NO RTSP connection; only an explicit request from the unlocked Door tab starts
+# FFmpeg.
 if ! getent group wall-door-stream >/dev/null 2>&1; then
     groupadd --system wall-door-stream
 fi
@@ -813,13 +816,50 @@ if ! id -u wall-door-stream >/dev/null 2>&1; then
 fi
 if [ -f /etc/systemd/system/wall-door-stream.service ] && \
    [ -r /opt/wall-panel/app/runtime/resources/app/doorstream/service.py ]; then
-    enable_unit_now "WSN-019: Door broker enabled — idle until an explicit unlocked-tab start" \
-        wall-door-stream.service
-    # `enable --now` leaves an already-active process alone. A supported rerun
-    # after editing wall.env must refresh systemd's credential snapshot and the
-    # broker's in-memory configuration, so explicitly restart and judge it.
-    if ! systemctl restart wall-door-stream.service; then
-        fail_step "Door broker could not restart with the current wall.env; inspect systemctl status wall-door-stream.service"
+    : "${DOORBELL_RTSP_PORT:=554}"
+    : "${DOORBELL_RTSP_PATH:=/H.264}"
+    : "${DOORBELL_RTSP_USERNAME:=admin}"
+    : "${DOORBELL_OUTPUT_WIDTH:=960}"
+    : "${DOORBELL_OUTPUT_HEIGHT:=540}"
+    : "${DOORBELL_INPUT_FOV:=180}"
+    : "${DOORBELL_HORIZONTAL_FOV:=110}"
+    : "${DOORBELL_VERTICAL_FOV:=75}"
+    : "${DOORBELL_YAW:=0}"
+    : "${DOORBELL_PITCH:=0}"
+    : "${DOORBELL_STALE_SECONDS:=4}"
+    : "${DOORBELL_START_SECONDS:=12}"
+    _door_credentials_ready=0
+    if [ -z "${DOORBELL_RTSP_HOST:-}" ] || [ -z "${DOORBELL_RTSP_PASSWORD:-}" ]; then
+        fail_step "Door broker needs DOORBELL_RTSP_HOST and DOORBELL_RTSP_PASSWORD in wall.env"
+    else
+        _door_cred_dir=/run/wall-door-credentials
+        install -d -m 0700 -o root -g root "$_door_cred_dir"
+        printf '%s' "$DOORBELL_RTSP_HOST" > "$_door_cred_dir/host"
+        printf '%s' "$DOORBELL_RTSP_PASSWORD" > "$_door_cred_dir/password"
+        printf '%s' "$DOORBELL_RTSP_PORT" > "$_door_cred_dir/port"
+        printf '%s' "$DOORBELL_RTSP_PATH" > "$_door_cred_dir/path"
+        printf '%s' "$DOORBELL_RTSP_USERNAME" > "$_door_cred_dir/username"
+        printf '%s' "$DOORBELL_OUTPUT_WIDTH" > "$_door_cred_dir/width"
+        printf '%s' "$DOORBELL_OUTPUT_HEIGHT" > "$_door_cred_dir/height"
+        printf '%s' "$DOORBELL_INPUT_FOV" > "$_door_cred_dir/input-fov"
+        printf '%s' "$DOORBELL_HORIZONTAL_FOV" > "$_door_cred_dir/horizontal-fov"
+        printf '%s' "$DOORBELL_VERTICAL_FOV" > "$_door_cred_dir/vertical-fov"
+        printf '%s' "$DOORBELL_YAW" > "$_door_cred_dir/yaw"
+        printf '%s' "$DOORBELL_PITCH" > "$_door_cred_dir/pitch"
+        printf '%s' "$DOORBELL_STALE_SECONDS" > "$_door_cred_dir/stale-seconds"
+        printf '%s' "$DOORBELL_START_SECONDS" > "$_door_cred_dir/start-seconds"
+        chmod 0600 "$_door_cred_dir"/*
+        _door_credentials_ready=1
+    fi
+    # The source is volatile, so boot ordering belongs to firstboot rather than
+    # multi-user.target. Disable any old enablement before starting it here.
+    systemctl disable wall-door-stream.service >/dev/null 2>&1 || true
+    if [ "$_door_credentials_ready" -eq 0 ]; then
+        systemctl stop wall-door-stream.service >/dev/null 2>&1 || true
+    elif ! systemctl restart wall-door-stream.service; then
+        fail_step "Door broker could not restart with its Door-only credentials; inspect systemctl status wall-door-stream.service"
+    else
+        log "WSN-019: Door broker ready — idle until an explicit unlocked-tab start"
     fi
 else
     fail_step "Door broker is incomplete: the unit or packaged doorstream/service.py is missing. The Door tab will remain disabled."

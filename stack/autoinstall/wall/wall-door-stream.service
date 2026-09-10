@@ -1,7 +1,7 @@
 # WSN-019 / B14: credential-isolated, explicit-start Door preview broker.
-# The camera secret stays in the existing root-only wall.env. systemd exposes a
-# read-only copy through its RAM-backed credential mount only to this service;
-# Electron and Chromium can reach only the group-owned Unix socket.
+# Firstboot extracts only the Door allowlist into root-only files under /run.
+# systemd copies those into this service's RAM-backed credential mount; the
+# broker never receives Wi-Fi, share, music, or any other wall.env secret.
 [Unit]
 Description=Office wall panel Door stream broker
 After=network-online.target
@@ -15,9 +15,22 @@ SupplementaryGroups=panel
 RuntimeDirectory=wall-door-stream
 RuntimeDirectoryMode=0750
 UMask=0007
-LoadCredential=wall.env:/etc/wall-panel/wall.env
+LoadCredential=host:/run/wall-door-credentials/host
+LoadCredential=password:/run/wall-door-credentials/password
+LoadCredential=port:/run/wall-door-credentials/port
+LoadCredential=path:/run/wall-door-credentials/path
+LoadCredential=username:/run/wall-door-credentials/username
+LoadCredential=width:/run/wall-door-credentials/width
+LoadCredential=height:/run/wall-door-credentials/height
+LoadCredential=input-fov:/run/wall-door-credentials/input-fov
+LoadCredential=horizontal-fov:/run/wall-door-credentials/horizontal-fov
+LoadCredential=vertical-fov:/run/wall-door-credentials/vertical-fov
+LoadCredential=yaw:/run/wall-door-credentials/yaw
+LoadCredential=pitch:/run/wall-door-credentials/pitch
+LoadCredential=stale-seconds:/run/wall-door-credentials/stale-seconds
+LoadCredential=start-seconds:/run/wall-door-credentials/start-seconds
 ExecStartPre=+/bin/chgrp panel /run/wall-door-stream
-ExecStart=/usr/bin/python3 /opt/wall-panel/app/runtime/resources/app/doorstream/service.py --config %d/wall.env --socket /run/wall-door-stream/service.sock --allowed-group panel
+ExecStart=/usr/bin/python3 /opt/wall-panel/app/runtime/resources/app/doorstream/service.py --credential-directory %d --socket /run/wall-door-stream/service.sock --allowed-group panel
 Restart=on-failure
 RestartSec=3
 
@@ -44,5 +57,5 @@ LockPersonality=true
 StandardOutput=null
 StandardError=null
 
-[Install]
-WantedBy=multi-user.target
+# Deliberately no [Install] target: wall-firstboot creates the volatile
+# credential sources and starts this unit after they exist on every boot.

@@ -167,24 +167,28 @@ from registry rows (process.md §3). Each cites the ids it renders.
 
 ### An explicit Door session, without giving the renderer a camera credential (SR-017)
 
-The image boundary matters more than the happy-path picture. PID 1 is the only
-component that reads the established root-only deployment file; the broker gets
-a RAM-backed credential view, while Electron gets only a local socket. Merely
-booting the panel or visiting another tab never starts FFmpeg.
+The image boundary matters more than the happy-path picture. Root firstboot is
+the only component that reads the established deployment file. It extracts the
+Door allowlist into root-only files under `/run`; PID 1 copies those into the
+broker's RAM-backed credential view. The broker never receives unrelated Wi-Fi,
+share or music secrets, and Electron gets only a local socket. Merely booting the
+panel or visiting another tab never starts FFmpeg.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant P as systemd (PID 1)
     participant E as root-only wall.env
+    participant D as Door-only files under /run
     participant B as door broker (SR-017, unprivileged)
     participant U as Unix socket (panel group)
     participant R as Electron / renderer
     participant F as FFmpeg
     participant C as LAN camera
 
-    P->>E: LoadCredential source read
-    P->>B: read-only RAM-backed wall.env credential
+    E->>D: firstboot extracts exact Door allowlist
+    P->>D: LoadCredential sources read
+    P->>B: Door-only RAM-backed credentials
     B->>U: bind service.sock 0660
     Note over B,C: IDLE - no RTSP connection and no decoder
     R->>U: explicit start {mode: corrected|raw}<br/>(Door tab present and unlocked)

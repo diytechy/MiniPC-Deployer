@@ -8075,3 +8075,14 @@ content and is not review evidence. The first stage-only ISOs proved both build
 pipelines, but predated the tracked shared adapter and therefore are not the
 final release artifacts. No USB write, deployment, reimage, or physical-panel
 acceptance occurred.
+
+The first `All-Keep` lab attempt then exercised the adapter against the
+ordinary FileBackup checkout and found a second Windows/WSL boundary: Windows
+Git reported the CRLF-managed tree clean while WSL Git reported nearly every
+file modified, producing a false `+dirty` image stamp. The shared adapter now
+applies Windows checkout normalization (`core.autocrlf=true` and
+`core.filemode=false`) only for WSL drive mounts; native Linux worktrees retain
+their own configuration. The regression failed before the change and passed
+after it, and a direct WSL probe now reports the FileBackup tree clean at its
+exact HEAD. Full G1 after the correction: **836 passed / 13 skipped, RESULT
+PASS**, with configuration and strict trace integrity green.

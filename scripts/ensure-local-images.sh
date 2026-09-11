@@ -77,6 +77,7 @@ ENV_FILE="${ENV_FILE:-$REPO_ROOT/stack/.env}"
 # the exact semantics and why they match firstboot.sh's `env_value`.
 # shellcheck source=lib/envfile.sh
 . "$SCRIPT_DIR/lib/envfile.sh"
+. "$SCRIPT_DIR/lib/git-worktree.sh"
 env_get() { env_file_value "$ENV_FILE" "$1"; }
 TRACKER_IMAGE_TAG="$(env_get TRACKER_IMAGE_TAG)"
 TRACKER_PUBLIC_IMAGE="${TRACKER_PUBLIC_IMAGE:-$(env_get TRACKER_PUBLIC_IMAGE)}"
@@ -122,9 +123,9 @@ ensure_image() {
         # `git rev-parse --show-toplevel` answers from any depth inside a
         # checkout, so this is correct for both shapes and needs no special case.
         local rev='unknown' dirty='' gitroot=''
-        gitroot="$(git -C "$sibling" rev-parse --show-toplevel 2>/dev/null || true)"
+        gitroot="$(repo_git "$sibling" rev-parse --show-toplevel 2>/dev/null || true)"
         if [ -n "$gitroot" ]; then
-            rev="$(git -C "$gitroot" rev-parse HEAD 2>/dev/null || echo unknown)"
+            rev="$(repo_git "$sibling" rev-parse HEAD 2>/dev/null || echo unknown)"
             # --show-toplevel succeeded, so dirtiness is a real answer, not a
             # missing-repo one. Scope it to the BUILD CONTEXT rather than the
             # whole repo: an edit to FinnsGame's game code does not make the
@@ -137,7 +138,7 @@ ensure_image() {
             # relative to -C and therefore correct for both shapes, and status
             # also sees UNTRACKED files - which `diff` never does and which are
             # build inputs like any other.
-            [ -z "$(git -C "$sibling" status --porcelain --untracked-files=normal -- . 2>/dev/null)" ] || dirty='+dirty'
+            [ -z "$(repo_git "$sibling" status --porcelain --untracked-files=normal -- . 2>/dev/null)" ] || dirty='+dirty'
         fi
         docker build -t "$ref" \
             --label "homehub.source.revision=${rev}${dirty}" \

@@ -18,6 +18,9 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found. $2"
 }
 
+# shellcheck source=../../scripts/lib/git-worktree.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/lib/git-worktree.sh"
+
 # validate_autoinstall_yaml FILE — parse the rendered user-data the way
 # Subiquity will and refuse to bake a file it would reject.
 #
@@ -450,34 +453,17 @@ ensure_sim_ssh_key() {
 # The whole-worktree copy stays as a fallback for a non-git export (a source
 # tarball), and says loudly what it cannot promise.
 copy_repo_into_payload() {
-    local repo_root="$1" payload_dir="$2" git_dir_line windows_git_dir
-    local -a repo_git=(git -C "$repo_root")
+    local repo_root="$1" payload_dir="$2"
     rm -rf "$payload_dir"
     mkdir -p "$payload_dir"
 
-    # A linked worktree created by Windows Git stores an absolute Windows path
-    # in its `.git` pointer. WSL Git treats `C:/...` as relative to repo_root,
-    # declares the checkout invalid, and used to fall into the whole-tree copy
-    # below -- exactly the path that can bake ignored plaintext secrets. Resolve
-    # that pointer explicitly without rewriting the caller's worktree metadata.
-    if [ -f "$repo_root/.git" ]; then
-        IFS= read -r git_dir_line < "$repo_root/.git" || true
-        case "$git_dir_line" in
-            gitdir:\ [A-Za-z]:[\\/]*)
-                require_cmd wslpath "Windows-linked worktrees require WSL's wslpath"
-                windows_git_dir="${git_dir_line#gitdir: }"
-                repo_git=(git --git-dir="$(wslpath -u "$windows_git_dir")" --work-tree="$repo_root")
-                ;;
-        esac
-    fi
-
-    if command -v git >/dev/null 2>&1 && "${repo_git[@]}" rev-parse --git-dir >/dev/null 2>&1; then
+    if command -v git >/dev/null 2>&1 && repo_git "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
         local n
-        n=$("${repo_git[@]}" ls-files | wc -l)
+        n=$(repo_git "$repo_root" ls-files | wc -l)
         [ "$n" -gt 0 ] || die "git ls-files returned nothing in $repo_root — refusing to build an empty payload."
         log "copying $n TRACKED file(s) into deploy-payload/ (gitignored files are NOT baked)"
         # -z + --null: paths with spaces are ordinary here (docs/, stack/samba/).
-        ( cd "$repo_root" && "${repo_git[@]}" ls-files -z | tar -c --null -T - ) | ( cd "$payload_dir" && tar -x )
+        ( cd "$repo_root" && repo_git "$repo_root" ls-files -z | tar -c --null -T - ) | ( cd "$payload_dir" && tar -x )
     else
         log "WARNING: $repo_root is not a git checkout (or git is absent) — falling back to a"
         log "  WHOLE-WORKTREE copy. Anything gitignored and present will be BAKED INTO THE"

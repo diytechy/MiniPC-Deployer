@@ -8049,3 +8049,29 @@ corrected before final re-review.
 The final independent adversarial re-review returned **APPROVE** with no
 remaining secret-leak, trust-boundary, revocation or production-bypass defect.
 Nothing was built into an ISO, deployed, or physically accepted.
+
+---
+
+## 2026-09-11 — release contract and linked-worktree source safety
+
+The wall release contract now matches the reviewed OfficeWallNaglight package:
+all fifteen declared capabilities and the packaged site inventory are checked
+exactly before an artifact can enter the ISO. Door stream coverage also accepts
+the deployed query form while retaining the bounded path and parameter checks.
+
+Image resolution, source-revision freshness checks, and tracked-only payload
+copying now share one Git adapter. Under WSL it resolves the absolute Windows
+`gitdir:` pointer used by linked worktrees, including calls made from nested
+build contexts. This closes two fail-open outcomes: treating a present checkout
+as absent during image freshness verification, and falling back to a whole-tree
+copy that could include ignored local files.
+
+Evidence on the integrated source: targeted contract/worktree coverage **234
+passed / 1 platform skip**; full G1 **835 passed / 13 skipped, RESULT PASS**;
+configuration, strict trace integrity, runtime-flow, documentation, shell parse,
+and `git diff --check` gates passed. Direct WSL probes resolved the MiniPC tip
+and the linked NagLight tip exactly. OpenCode/Grok 4.6 medium produced no review
+content and is not review evidence. The first stage-only ISOs proved both build
+pipelines, but predated the tracked shared adapter and therefore are not the
+final release artifacts. No USB write, deployment, reimage, or physical-panel
+acceptance occurred.

@@ -305,14 +305,14 @@ assert_local_image_fresh() {
     # test called a perfectly good checkout "absent" and SKIPPED the freshness
     # check entirely - silently allowing a stale image into the ISO, which is the
     # exact failure this function exists to prevent (review finding 6).
-    if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! repo_git "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         log "  (no $repo checkout beside this repo — cannot verify $ref against its source)"
         return 0
     fi
 
     local stamped head
     stamped="$(docker image inspect "$ref" --format '{{index .Config.Labels "homehub.source.revision"}}' 2>/dev/null)"
-    head="$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo '')"
+    head="$(repo_git "$dir" rev-parse HEAD 2>/dev/null || echo '')"
 
     if [ -z "$stamped" ] || [ "$stamped" = "<no value>" ]; then
         log "  WARNING: $ref carries no homehub.source.revision label — cannot prove it matches $repo."
@@ -338,7 +338,7 @@ assert_local_image_fresh() {
     esac
     if [ -n "$head" ] && [ "$stamped" != "$head" ]; then
         die "STALE local image '$ref' — built from ${stamped:0:12}, but $repo HEAD is ${head:0:12}." \
-            "  HEAD: $(git -C "$dir" log -1 --format='%h %cs %s' 2>/dev/null)" \
+            "  HEAD: $(repo_git "$dir" log -1 --format='%h %cs %s' 2>/dev/null)" \
             "This image has no registry and no version in its tag, so nothing else will ever notice." \
             "Baking it means flashing a box with an app build older than its source." \
             "Rebuild first:  bash scripts/ensure-local-images.sh --rebuild" \

@@ -841,8 +841,18 @@ purge_door_runtime() {
     # request for a unit after that unit has been masked. The unit is static, so
     # there is no enablement-driven resurrection window before the mask follows.
     if ! timeout 5 systemctl reset-failed wall-door-stream.service >/dev/null 2>&1; then
-        fail_step "Door broker failed-state reset could not be confirmed; retaining runtime state"
-        return 1
+        # `reset-failed UNIT` reports "Unit ... not loaded" for a newly copied,
+        # static unit which has never run.  That is the normal first-install
+        # state: it has neither a process nor failed state to clear.  Do not
+        # confuse it with a failed reset of a live/failed broker.
+        _door_reset_state="$(timeout 5 systemctl show --property=ActiveState --property=Result --value wall-door-stream.service 2>/dev/null || true)"
+        if printf '%s\n' "$_door_reset_state" | grep -Fxq inactive && \
+           printf '%s\n' "$_door_reset_state" | grep -Fxq success; then
+            log "Door broker has no failed state to reset (first-install static unit)"
+        else
+            fail_step "Door broker failed-state reset could not be confirmed; retaining runtime state"
+            return 1
+        fi
     fi
     if ! timeout 5 systemctl mask --runtime wall-door-stream.service >/dev/null 2>&1; then
         fail_step "Door broker could not be runtime-masked against restart; retaining runtime state"

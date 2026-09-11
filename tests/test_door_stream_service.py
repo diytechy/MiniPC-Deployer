@@ -183,11 +183,13 @@ def test_incomplete_door_payload_stops_disables_and_purges_runtime():
     purge = firstboot[firstboot.index("purge_door_runtime()") : firstboot.index("door_motion_bool_valid()")]
     assert "timeout 7 systemctl stop wall-door-stream.service" in purge
     assert "timeout 5 systemctl mask --runtime wall-door-stream.service" in purge
+    assert "timeout 5 systemctl reset-failed wall-door-stream.service" in purge
     assert "timeout 2 pkill -KILL -u wall-door-stream" in purge
     assert "systemctl is-active --quiet wall-door-stream.service" in purge
     assert purge.index("pgrep -u wall-door-stream") < purge.index('rm -f -- "$_door_cred_dir/$_door_cred_name"')
     assert 'rm -f -- "$_door_cred_dir/$_door_cred_name"' in purge
     assert "rm -f -- /run/wall-door-stream/service.sock" in purge
+    assert purge.index("systemctl reset-failed wall-door-stream.service") < purge.index("systemctl mask --runtime wall-door-stream.service")
     incomplete = firstboot[firstboot.index("else\n    purge_door_runtime\n    fail_step \"Door broker is incomplete") :]
     assert incomplete.index("purge_door_runtime") < incomplete.index("fail_step")
 
@@ -248,9 +250,9 @@ rm() { echo "rm:$*" >> "$LOG"; }
     assert "timeout:5 systemctl mask --runtime wall-door-stream.service" in calls
     assert "pkill:-KILL -u wall-door-stream" in calls
     if accepted:
+        assert calls.index("systemctl:reset-failed") < calls.index("systemctl:mask")
         assert calls.index("systemctl:mask") < calls.index("pkill:")
-        assert calls.index("pkill:") < calls.index("systemctl:reset-failed")
-        assert calls.index("systemctl:reset-failed") < calls.index("systemctl:is-active")
+        assert calls.index("pkill:") < calls.index("systemctl:is-active")
         assert calls.index("systemctl:is-active") < calls.index("systemctl:disable") < calls.index("rm:")
     else:
         assert "fail:Door broker stable inactivity could not be proven" in calls

@@ -837,6 +837,13 @@ purge_door_runtime() {
     # Never unlink a live process's credential source and call that teardown.
     # systemctl itself can wedge on a stuck child, so every control operation is
     # bounded and the dedicated account is the final process-level authority.
+    # reset-failed must happen before the runtime mask: systemd rejects a reset
+    # request for a unit after that unit has been masked. The unit is static, so
+    # there is no enablement-driven resurrection window before the mask follows.
+    if ! timeout 5 systemctl reset-failed wall-door-stream.service >/dev/null 2>&1; then
+        fail_step "Door broker failed-state reset could not be confirmed; retaining runtime state"
+        return 1
+    fi
     if ! timeout 5 systemctl mask --runtime wall-door-stream.service >/dev/null 2>&1; then
         fail_step "Door broker could not be runtime-masked against restart; retaining runtime state"
         return 1
@@ -846,10 +853,6 @@ purge_door_runtime() {
     fi
     if pgrep -u wall-door-stream >/dev/null 2>&1; then
         timeout 2 pkill -KILL -u wall-door-stream >/dev/null 2>&1 || true
-    fi
-    if ! timeout 5 systemctl reset-failed wall-door-stream.service >/dev/null 2>&1; then
-        fail_step "Door broker failed-state reset could not be confirmed; retaining runtime state"
-        return 1
     fi
     _door_wait=0
     _door_stable=0

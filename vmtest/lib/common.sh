@@ -768,20 +768,25 @@ sed_delim() {
 }
 
 set_env_key() {
-    local f="$1" key="$2" val="$3" delim esc_val actual
+    local f="$1" key="$2" val="$3" delim esc_val actual rendered
     grep -qE "^${key}=" "$f" || \
         die "'$key' is not a key in $(basename "$f") — refusing to append it." \
             "A knob the consumer never reads is a silent no-op: the sim would" \
             "boot with the DEFAULT value while this build reported success." \
             "Check the spelling, or declare the knob in wall.env.example first."
-    delim="$(sed_delim "$val$key")"
+    # wall.env is consumed literally by firstboot but some helpers also source
+    # it.  Preserve ordinary values verbatim; quote whitespace/empty values so
+    # both readers see a single assignment.
+    rendered="$val"
+    case "$val" in ''|*[[:space:]]*) rendered="\"$val\"" ;; esac
+    delim="$(sed_delim "$rendered$key")"
     # In a sed REPLACEMENT, '&' means "the whole match" and '\' escapes; both
     # would silently corrupt the value.
-    esc_val="$(printf '%s' "$val" | sed -e 's/[\\&]/\\&/g')"
+    esc_val="$(printf '%s' "$rendered" | sed -e 's/[\\&]/\\&/g')"
     sed -i -e "s${delim}^${key}=.*${delim}${key}=${esc_val}${delim}" "$f"
     actual="$(sed -n "s|^${key}=||p" "$f" | tail -n1)"
-    [ "$actual" = "$val" ] || \
-        die "substitution for '$key' did not apply as written: expected '$val', file now has '$actual'"
+    [ "$actual" = "$rendered" ] || \
+        die "substitution for '$key' did not apply as written: expected '$rendered', file now has '$actual'"
 }
 
 # apply_sim_lab_netplan USER_DATA ROLE — the A19 two-VM lab's network, SIM ONLY.
@@ -1489,7 +1494,10 @@ apply_sim_env_overrides() {
         local d esc rendered
         d="$(sed_delim "$key$val")"
         if [ "$shell_quote_values" = true ]; then
-            rendered="$(printf '%q' "$val")"
+            case "$val" in
+                ''|*[[:space:]]*) rendered="\"$val\"" ;;
+                *) rendered="$val" ;;
+            esac
         else
             rendered="$(compose_escape "$val")"
         fi
@@ -2615,6 +2623,13 @@ render_sim_wall_env() {
     set_env_key "$env_out" WALL_DISABLE_INPUT ""
 
     apply_sim_env_overrides "$env_out" "${WALL_ENV_OVERRIDES:-}" WALL_ENV_OVERRIDES true
+
+    # Hyper-V exposes synthetic pointer devices, not the panel's ELAN
+    # touchscreen.  The physical filter therefore cannot reach readiness in a
+    # VM, even when the production materialiser intentionally selects `filter`.
+    # Keep the virtual gate focused on install, kiosk, and interconnect; actual
+    # touch protection remains a separate physical-panel acceptance gate.
+    set_env_key "$env_out" TOUCH_FILTER_MODE "off"
 
     # Banner LAST so it survives the substitutions above and is the first thing
     # anyone reading /etc/wall-panel/wall.env on the VM sees.

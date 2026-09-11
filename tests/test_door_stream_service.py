@@ -262,7 +262,8 @@ def test_door_capability_matches_the_private_application_payload():
         "app": [
             "index.html", "js/main.js", "js/state-machine.js", "js/views/door.js",
             "css/shell.css", "electron/main.cjs", "electron/preload.cjs",
-            "electron/door-bridge.cjs", "doorstream/service.py", "doorstream/motion.py",
+            "electron/door-bridge.cjs", "electron/display-lit.cjs",
+            "doorstream/service.py", "doorstream/motion.py",
         ],
         "site": [],
         "gateway": [],

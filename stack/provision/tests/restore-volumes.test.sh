@@ -33,8 +33,10 @@
 #       reports a PARTIAL volume instead of "not empty, not a fresh install"
 #   R14 technitium restores its ZONES and loses its auth.config - the archived
 #       admin password must never win over the one in .env (D4, 2026-08-29)
-#   R15 the SHIPPED DEFAULT_TABLE carries all five sets; every other case passes
+#   R15 the SHIPPED DEFAULT_TABLE carries all six sets; every other case passes
 #       an explicit table, so the default is the one thing they cannot prove
+#   R16 Finance-Auditor's snapshot uses its explicit profile for `create`, and
+#       never needs to start the profile-gated service to be restored
 #
 # Usage: bash restore-volumes.test.sh [--keep-tmp]
 set -uo pipefail
@@ -66,7 +68,7 @@ mkdir -p "$VOLROOT" "$DRIVE" "$MOCKBIN" "$FAILDIR"
 # ── the mock docker ──────────────────────────────────────────────────────────
 # It has to answer THREE things, because common.sh's volume_mountpoint asks
 # three (and the three are the reason it exists):
-#   compose create SVC                    -> make the volume directory
+#   compose [--profile P] create SVC      -> make the volume directory
 #   volume inspect -f {{.Mountpoint}} N   -> the path, or fail if there is none
 #   volume ls -q --filter label=com.docker.compose.volume=N
 #                                         -> the PREFIXED real name
@@ -76,13 +78,19 @@ mkdir -p "$VOLROOT" "$DRIVE" "$MOCKBIN" "$FAILDIR"
 # answered the literal inspect would make this test pass against a resolver that
 # had lost the label lookup entirely.
 # MOCK_COMPOSE_FAIL names a service whose create must fail, so R6 exercises that
-# branch rather than asserting it exists.
+# branch rather than asserting it exists. The finance service is refused unless
+# its profile is named, so the default-table check proves profile-safe creation.
 cat >"$MOCKBIN/docker" <<'MOCK'
 #!/usr/bin/env bash
 VOLROOT="${MOCK_VOLROOT:?}"
-case "$1 ${2:-}" in
-  "compose create")
-    svc="${3:-}"
+case "$1" in
+  compose)
+    shift
+    profile=""
+    if [ "${1:-}" = "--profile" ]; then profile="${2:-}"; shift 2; fi
+    [ "${1:-}" = create ] || exit 1
+    svc="${2:-}"
+    [ "$svc" = finance-auditor ] && [ "$profile" != finance-auditor ] && exit 1
     [ "$svc" = "${MOCK_COMPOSE_FAIL:-}" ] && exit 1
     vol="$(grep -E "^$svc=" "$VOLROOT/.svcmap" 2>/dev/null | cut -d= -f2)"
     if [ -n "$vol" ] && [ ! -d "$VOLROOT/stack_$vol" ]; then
@@ -92,12 +100,16 @@ case "$1 ${2:-}" in
       # exercise the branch that clears it.
       [ -e "$VOLROOT/.seed-on-create" ] && printf 'from the image\n' >"$VOLROOT/stack_$vol/IMAGE-SEED"
     fi
+    [ "$svc" = finance-auditor ] && printf '%s:%s\n' "$svc" "$profile" >>"$VOLROOT/.profile-log"
     exit 0 ;;
-  "volume inspect")
+  volume)
+    shift
+    [ "${1:-}" = inspect ] || [ "${1:-}" = ls ] || exit 1
+    if [ "$1" = inspect ]; then
     name="${!#}"
     if [ -d "$VOLROOT/$name" ]; then echo "$VOLROOT/$name"; exit 0; fi
-    echo ""; exit 1 ;;
-  "volume ls")
+    echo ""; exit 1
+    fi
     want=""
     for a in "$@"; do
       case "$a" in label=com.docker.compose.volume=*) want="${a#label=com.docker.compose.volume=}" ;; esac
@@ -115,6 +127,7 @@ tracker=tracker_data
 actual=actual_data
 uptime-kuma=uptimekuma_data
 technitium=technitium_config
+finance-auditor=finance_snapshots
 MAP
 
 TABLE='caddy:caddy_data:caddy tracker:tracker_data:tracker actual:actual_data:actual uptimekuma:uptimekuma_data:uptime-kuma'
@@ -130,6 +143,7 @@ mkdir -p "$SRC/caddy/certificates"; printf 'cert-material\n' >"$SRC/caddy/certif
 printf -- '---\ncategory: X\nitems:\n  - id: a\n---\n' >"$SRC/tracker/defs.md"
 printf 'budget-db\n' >"$SRC/actual/budget.sqlite"
 printf 'kuma-db\n' >"$SRC/uptimekuma/kuma.db"
+mkdir -p "$SRC/finance"; printf 'local-audit-snapshot\n' >"$SRC/finance/audit.json"
 # technitium: a HAND-MADE zone (the thing worth restoring) beside auth.config
 # (the thing that must not come back). R14 is the pair of those two facts.
 mkdir -p "$SRC/technitium/zones"
@@ -148,7 +162,8 @@ BACKUP_SOURCES="caddy=path:$SRC/caddy
 tracker=path:$SRC/tracker
 actual=path:$SRC/actual
 uptimekuma=path:$SRC/uptimekuma
-technitium=path:$SRC/technitium"
+technitium=path:$SRC/technitium
+finance=path:$SRC/finance"
 ENVF
 bash "$BACKUP_SH" --config "$TMP/backup.env" >"$TMP/backup.out" 2>&1
 rc=$?
@@ -332,7 +347,7 @@ else
 fi
 
 echo
-echo "== R15: the BUILT-IN table carries technitium, not just the test's =="
+echo "== R15/R16: the BUILT-IN table carries technitium + finance safely =="
 # Every other case passes an explicit table, so the shipped DEFAULT_TABLE is the
 # one thing they cannot prove. This runs the SUT with no table argument at all.
 rm -rf "$VOLROOT"/stack_*
@@ -349,9 +364,23 @@ for s_ in caddy tracker actual uptimekuma; do
         *)     fail "R15 the default table lost $s_: $(logline "$s_")" ;;
     esac
 done
-[ "$(grep -c '^ok ' "$TMP/result.log")" = 5 ] \
-    && pass "R15 all five sets in the default table restored" \
-    || fail "R15 default table restored $(grep -c '^ok ' "$TMP/result.log") of 5"
+[ "$(grep -c '^ok ' "$TMP/result.log")" = 6 ] \
+    && pass "R15 all six sets in the default table restored" \
+    || fail "R15 default table restored $(grep -c '^ok ' "$TMP/result.log") of 6"
+case "$(logline finance)" in
+    ok\ *) pass "R16 the default table restored finance_snapshots" ;;
+    *)     fail "R16 finance: $(logline finance)"; cat "$TMP/result.log" ;;
+esac
+if [ "$(cat "$VOLROOT/stack_finance_snapshots/audit.json" 2>/dev/null)" = local-audit-snapshot ]; then
+    pass "R16 the finance snapshot came back byte-for-byte"
+else
+    fail "R16 finance snapshot content wrong"
+fi
+if grep -qx 'finance-auditor:finance-auditor' "$VOLROOT/.profile-log" 2>/dev/null; then
+    pass "R16 finance used its explicit Compose profile for create"
+else
+    fail "R16 finance profile invocation missing or wrong: $(cat "$VOLROOT/.profile-log" 2>/dev/null)"
+fi
 
 echo
 echo "──────────────────────────────────────────────────────────────"

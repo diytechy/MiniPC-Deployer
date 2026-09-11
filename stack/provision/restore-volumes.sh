@@ -48,7 +48,7 @@ COMMON_SH="${COMMON_SH:-$STACK_DIR/backup/common.sh}"
 # shellcheck source=../backup/common.sh
 . "$COMMON_SH" 2>/dev/null || { printf 'skip - could not source %s\n' "$COMMON_SH" >>"$LOG"; exit 0; }
 
-# WHY THESE FOUR, and why not the fifth:
+# WHY THESE SIX, and why the Finance API cache is absent:
 #   caddy       ACME account key + certificates. The original, and the only one
 #               with a rate limit behind it (C22: 122 refusals, the apex cert
 #               2h40m late).
@@ -74,8 +74,26 @@ COMMON_SH="${COMMON_SH:-$STACK_DIR/backup/common.sh}"
 #
 #               THE HAZARD THAT KEPT IT OUT IS REAL AND IS HANDLED IN
 #               post_restore() BELOW - see there for the measurement.
-DEFAULT_TABLE='caddy:caddy_data:caddy tracker:tracker_data:tracker actual:actual_data:actual uptimekuma:uptimekuma_data:uptime-kuma technitium:technitium_config:technitium'
+#   finance     the local-only Finance-Auditor snapshot volume. The service is
+#               profile-gated, but its durable audit history is not optional
+#               once present. The separate `finance_actual_data` volume is an
+#               API cache and is deliberately re-created after a reimage.
+# `finance_snapshots` is the durable local-only audit record. Its companion
+# `finance_actual_data` is an Actual API cache and is deliberately re-created.
+# Finance-Auditor is profile-gated; compose_create_restore_target names that
+# profile for `create` only, so a reimage never starts a finance sync as a
+# side effect of restoring its data.
+DEFAULT_TABLE='caddy:caddy_data:caddy tracker:tracker_data:tracker actual:actual_data:actual uptimekuma:uptimekuma_data:uptime-kuma technitium:technitium_config:technitium finance:finance_snapshots:finance-auditor'
 [ -n "$TABLE" ] || TABLE="${HOMEHUB_RESTORE_VOLUMES:-$DEFAULT_TABLE}"
+
+# compose_create_restore_target SERVICE: create the named volume without
+# starting its service. Only Finance-Auditor needs its profile named explicitly.
+compose_create_restore_target() {
+    case "$1" in
+        finance-auditor) docker compose --profile finance-auditor create "$1" ;;
+        *)               docker compose create "$1" ;;
+    esac
+}
 
 # post_restore SET VMP - the per-set fixup a byte-for-byte restore cannot do.
 #
@@ -188,7 +206,7 @@ for entry in $TABLE; do
     # name and the labels compose looks for later, instead of a hand-built name
     # this script would have to keep in step with the project directory.
     # `create` makes the containers and their volumes without starting anything.
-    if ! docker compose create "$svc" >/dev/null 2>&1; then
+    if ! compose_create_restore_target "$svc" >/dev/null 2>&1; then
         printf 'skip %s compose could not create service %s\n' "$set_name" "$svc" >>"$LOG"
         continue
     fi

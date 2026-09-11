@@ -8,6 +8,19 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-11 — Finance-Auditor snapshot recovery is BUILT and LOCAL-ONLY (not
+pushed, deployed, or included on existing media).** A reimage now restores the
+local-only `finance_snapshots` volume through the existing byte-verifying
+`restore-volumes.sh` path. Its profile is named for `docker compose create`
+only, so restoration creates the volume without starting the profile-gated
+Finance-Auditor service or a bank-sync attempt. `finance_actual_data` remains
+excluded because it is a re-creatable Actual API cache. The hermetic
+`restore-volumes.test.sh` suite was run on the HomeHub from a temporary source
+copy: 38 PASS / 0 FAIL, including a byte-for-byte finance snapshot restore and
+the profile-only create assertion. The temporary copy was removed. This joins
+the next ISO/USB rebuild; the live hub retains its older manual-finance restore
+behavior until a full reimage or a separately approved SSH deployment.
+
 **2026-09-09 — B11's automated check-off is BUILT and LOCAL-ONLY (not pushed,
 not deployed).** The Owner changed the `weigh-in` item to `type: automated` with
 `check: weight`, and it has synced, so the feeder now posts **two** bodies per

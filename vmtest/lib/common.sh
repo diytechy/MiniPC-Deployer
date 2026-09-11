@@ -1465,6 +1465,7 @@ render_sim_gate_backup_env() {
 # hostname/storage-pin assertions elsewhere in this file exist to prevent.
 apply_sim_env_overrides() {
     local f="$1" overrides="${2-${SIM_ENV_OVERRIDES:-}}" var="${3:-SIM_ENV_OVERRIDES}"
+    local shell_quote_values="${4:-false}"
     [ -n "$overrides" ] || return 0
 
     local pair key val
@@ -1480,11 +1481,19 @@ apply_sim_env_overrides() {
             || die "$var names '$key', which is not a knob in $(basename "$f")." \
                    "Appending it would be a silent no-op — the consumer reads only knobs it asks for." \
                    "Check the spelling, or add the knob to the example file first."
-        # compose_escape + a delimiter the value cannot contain (WALL_DISABLE_INPUT
-        # is pipe-separated, so '|' is not always safe here).
-        local d esc
+        # Compose .env accepts its values verbatim, while wall.env is sourced as
+        # shell by the panel helpers.  A wall override such as
+        # TOUCH_FILTER_NAME=ELAN Touchscreen must therefore be emitted as one
+        # shell assignment, rather than turning its second word into a command.
+        # WALL_DISABLE_INPUT is pipe-separated, so '|' is not always safe here.
+        local d esc rendered
         d="$(sed_delim "$key$val")"
-        esc="$(compose_escape "$val" | sed -e 's/[\\&]/\\&/g')"
+        if [ "$shell_quote_values" = true ]; then
+            rendered="$(printf '%q' "$val")"
+        else
+            rendered="$(compose_escape "$val")"
+        fi
+        esc="$(printf '%s' "$rendered" | sed -e 's/[\\&]/\\&/g')"
         sed -i -e "s${d}^$key=.*${d}$key=$esc   # VMTEST override ($var)${d}" "$f"
         log "  sim env override: $key=$val"
     done < <(printf '%s\n' "$overrides" | tr ';' '\n')
@@ -2605,7 +2614,7 @@ render_sim_wall_env() {
     # example; asserted here so a future change to that default is caught.
     set_env_key "$env_out" WALL_DISABLE_INPUT ""
 
-    apply_sim_env_overrides "$env_out" "${WALL_ENV_OVERRIDES:-}" WALL_ENV_OVERRIDES
+    apply_sim_env_overrides "$env_out" "${WALL_ENV_OVERRIDES:-}" WALL_ENV_OVERRIDES true
 
     # Banner LAST so it survives the substitutions above and is the first thing
     # anyone reading /etc/wall-panel/wall.env on the VM sees.

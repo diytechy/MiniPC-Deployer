@@ -13,11 +13,49 @@ import sys
 from touchfilter.core import Policy
 
 
+def adaptive(env, policy):
+    """The extra config the adaptive trial needs, and nothing the others read.
+
+    Rendered rather than hand-written because a hand-written one drifted: the
+    panel carried a session_cgroup naming a Chromium scope by PID, the browser
+    respawned under a new PID, and the bridge rejected the real kiosk forever.
+    The daemon then failed open with the touchscreen ungrabbed, filtering
+    nothing while its status still said "protecting-fail-open".
+
+    So the scope is emitted as a PATTERN, with `*` standing for that PID, and
+    the slice is derived from the kiosk uid instead of being repeated as a
+    literal. Nothing here goes stale when Chromium restarts or the uid changes.
+    """
+    uid = int(env.get("TOUCH_KIOSK_UID", 1000))
+    gid = int(env.get("TOUCH_KIOSK_GID", uid))
+    if not 0 < uid < 65536 or not 0 < gid < 65536:
+        raise ValueError("invalid-kiosk-peer")
+    scope = env.get("TOUCH_KIOSK_SCOPE", "app-org.chromium.Chromium-*.scope")
+    if not re.fullmatch(r"[A-Za-z0-9@:_.*\-]{1,120}\.scope", scope) or scope.count("*") > 1:
+        raise ValueError("invalid-kiosk-scope")
+    quiet = float(env.get("TOUCH_PROTECTION_QUIET_MS", 1800000))
+    if not 60000 <= quiet <= 86400000:
+        raise ValueError("invalid-protection-quiet")
+    # protection_quiet_ms rides in `policy` but is NOT a core Policy field --
+    # daemon.load_config pops it before constructing one. Added after the
+    # Policy(**policy) validation above for exactly that reason.
+    policy["protection_quiet_ms"] = quiet
+    return {
+        "bridge": {
+            "socket": "/run/wall-touch-filter/input.sock",
+            "kiosk_uid": uid,
+            "kiosk_gid": gid,
+            "session_cgroup": f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{scope}",
+        },
+        "bench_force_protection": False,
+    }
+
+
 def render(env):
     """Return config/rules for one pinned touchscreen, never a guessed device."""
     mode = env.get("TOUCH_FILTER_MODE", "off")
     isolate = env.get("TOUCH_FILTER_ISOLATE", "false")
-    if mode not in ("off", "shadow", "filter") or isolate not in ("true", "false"):
+    if mode not in ("off", "shadow", "filter", "adaptive") or isolate not in ("true", "false"):
         raise ValueError("invalid-touch-filter-mode")
     if isolate == "true" and mode != "filter":
         raise ValueError("isolation-requires-filter")
@@ -68,6 +106,8 @@ def render(env):
         "policy": policy,
         "replay_max_ms": replay,
     }
+    if mode == "adaptive":
+        config.update(adaptive(env, policy))
     # USB identity properties and the input name may live on different sysfs
     # ancestors. ENV+ATTRS avoids invalid multiple-parent ATTRS matching.
     match = f'SUBSYSTEM=="input", KERNEL=="event*", ENV{{ID_VENDOR_ID}}=="{ids[0].lower()}", ENV{{ID_MODEL_ID}}=="{ids[1].lower()}", ATTRS{{name}}=="{name}"'

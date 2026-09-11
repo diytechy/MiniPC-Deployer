@@ -12,7 +12,7 @@ set -a
 source "$env_file"
 set +a
 mode=${TOUCH_FILTER_MODE:-off}
-case "$mode" in off|shadow|filter) ;; *) echo 'Invalid TOUCH_FILTER_MODE' >&2; exit 1;; esac
+case "$mode" in off|shadow|filter|adaptive) ;; *) echo 'Invalid TOUCH_FILTER_MODE' >&2; exit 1;; esac
 if [ "$mode" = off ]; then
     # OFF is also the SSH recovery path and works without an app/Python module.
     if [ -f /etc/systemd/system/wall-touch-filter.service ]; then
@@ -34,6 +34,9 @@ install -m 0644 "$scratch/config.json" "$config_dir/touch-filter.json"
 install -m 0644 "$payload/wall-touch-filter.service" /etc/systemd/system/wall-touch-filter.service
 install -m 0755 "$payload/wall-touch-filter-sleep" /usr/lib/systemd/system-sleep/wall-touch-filter
 touch "$config_dir/touch-filter.enabled"
+# ADAPTIVE DOES NOT TAKE uinput. Its accepted taps leave over the AF_UNIX
+# bridge to the kiosk, not through a virtual device, so loading uinput for it
+# would install a module nothing opens.
 if [ "$mode" = filter ]; then
     modprobe uinput
     printf 'uinput\n' > /etc/modules-load.d/wall-touch-filter.conf
@@ -46,11 +49,17 @@ systemctl restart wall-touch-filter.service
 python3 - "$mode" <<'PY'
 import json,time,sys
 from pathlib import Path
+# PINNED TO THE PROTOCOLS THAT EXIST, and it was pinned to 1, which stopped
+# existing. core.status has emitted 2 since the bounded-scroll candidate and
+# adaptive emits 3, so this gate could not pass for ANY mode: firstboot called
+# fail_step and no panel finished provisioning. A version set, not >=, so a
+# future bump still lands here for review rather than passing unread.
+EXPECTED={2,3}
 start=time.time()
 for _ in range(100):
     try:
         state=json.loads(Path('/run/wall-touch-filter/status.json').read_text())
-        if state.get('protocolVersion')==1 and state.get('mode')==sys.argv[1] and state.get('health')=='ready' and state.get('observedAt',0)>=start*1000:
+        if state.get('protocolVersion') in EXPECTED and state.get('mode')==sys.argv[1] and state.get('health')=='ready' and state.get('observedAt',0)>=start*1000:
             print('PASS touch filter: fresh daemon readiness verified');break
     except (OSError,ValueError):pass
     time.sleep(.1)

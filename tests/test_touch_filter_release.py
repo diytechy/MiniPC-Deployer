@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -331,3 +332,82 @@ def test_actual_hub_stager_copies_matching_private_gateway_and_refuses_partial_r
         [str(bash), "-c", script], env=env, capture_output=True, text=True
     )
     assert result.returncode != 0 and "Incomplete wall release" in result.stderr
+
+
+def test_firstboot_readiness_gate_matches_the_protocols_that_exist():
+    # It was pinned to protocolVersion 1, which stopped existing: core.status
+    # emits 2 and adaptive emits 3. The gate could not pass for ANY mode, so
+    # wall-firstboot.sh called fail_step and no panel finished provisioning.
+    helper = (ROOT / "stack/autoinstall/wall/configure-touch-filter.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "EXPECTED={2,3}" in helper
+    assert "state.get('protocolVersion') in EXPECTED" in helper
+    assert "state.get('protocolVersion')==1" not in helper
+
+
+def test_firstboot_accepts_adaptive_without_loading_uinput_for_it():
+    # Adaptive's accepted taps leave over the AF_UNIX bridge, not a virtual
+    # device, so uinput stays scoped to filter mode.
+    helper = (ROOT / "stack/autoinstall/wall/configure-touch-filter.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "off|shadow|filter|adaptive)" in helper
+    assert 'if [ "$mode" = filter ]; then\n    modprobe uinput' in helper
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TOUCH_APP_REPO"), reason="application policy comes from sibling"
+)
+def test_renderer_emits_an_adaptive_bridge_that_survives_a_kiosk_restart():
+    # The panel's hand-written config named a Chromium scope by PID. The
+    # browser respawned, peer_allowed rejected the real kiosk, and the daemon
+    # failed open with the touchscreen ungrabbed - filtering nothing while its
+    # status still read "protecting-fail-open". Rendering the scope as a
+    # pattern, and deriving the slice from the uid, is what stops that
+    # recurring on every reimage.
+    sys.path.insert(0, os.environ["TOUCH_APP_REPO"])
+    from touchfilter.bridge import session_pattern, validate_bridge_config
+
+    renderer = load("stack/autoinstall/wall/render-touch-filter.py", "renderer")
+    config, _ = renderer.render({"TOUCH_FILTER_MODE": "adaptive"})
+    validate_bridge_config(config["bridge"])
+
+    pattern = session_pattern("0::" + config["bridge"]["session_cgroup"])
+    slice_ = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+    for pid in ("26690", "1664", "7"):
+        assert pattern.fullmatch(f"{slice_}app-org.chromium.Chromium-{pid}.scope")
+    # Still exact: no sibling scope, no child cgroup, no other user's slice.
+    assert not pattern.fullmatch(f"{slice_}app-org.chromium.Chromium-1664.scope/child")
+    assert not pattern.fullmatch(f"{slice_}app-evil.Evil-1664.scope")
+    assert not pattern.fullmatch(
+        "0::/user.slice/user-1001.slice/user@1001.service/app.slice/"
+        "app-org.chromium.Chromium-1664.scope"
+    )
+
+    # protection_quiet_ms rides in policy but is not a core Policy field, so a
+    # renderer that added it before validation would raise on every adaptive
+    # render. The whole config must load the way the daemon loads it.
+    from touchfilter.daemon import load_config
+
+    for mode in ("off", "shadow", "filter", "adaptive"):
+        rendered, _ = renderer.render({"TOUCH_FILTER_MODE": mode})
+        path = Path(tempfile.mkdtemp()) / "touch-filter.json"
+        path.write_text(json.dumps(rendered), encoding="utf-8")
+        loaded = load_config(path)
+        assert ("adaptive_policy" in loaded) is (mode == "adaptive")
+        assert ("bridge" in rendered) is (mode == "adaptive")
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TOUCH_APP_REPO"), reason="application policy comes from sibling"
+)
+def test_renderer_rejects_a_scope_that_could_escape_its_own_component():
+    sys.path.insert(0, os.environ["TOUCH_APP_REPO"])
+    renderer = load("stack/autoinstall/wall/render-touch-filter.py", "renderer")
+    for scope in ("../../evil.scope", "a/b.scope", "app-*-*.scope", "notascope", ""):
+        with pytest.raises(ValueError):
+            renderer.render({"TOUCH_FILTER_MODE": "adaptive", "TOUCH_KIOSK_SCOPE": scope})
+    for uid in ("0", "-1", "99999999"):
+        with pytest.raises(ValueError):
+            renderer.render({"TOUCH_FILTER_MODE": "adaptive", "TOUCH_KIOSK_UID": uid})

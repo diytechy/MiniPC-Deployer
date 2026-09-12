@@ -80,3 +80,26 @@ never the broad wall environment containing unrelated credentials. That file's
 exact allowlist is `WALL_AUDIO_ENABLED` and `WALL_AUDIO_SOCKET`; the enable bit
 is nonsecret installed-state evidence for the verifier without granting access
 to `wall.env`.
+
+## The rest of the panel's audio lives next door
+
+This directory is the SR-023 Bluetooth/routing broker, which is still
+disabled-by-default and still reports `backend_unavailable`. The panel's working
+audio path is not here — it is a set of units and ALSA configuration under
+`../autoinstall/wall/`:
+
+| File | Does |
+|---|---|
+| `asound.conf` + `asound-{trigger,panel}-mode.conf` | the dmix/dsnoop graph and the two output modes |
+| `wall-line-in.service` | line input passthrough to the amplifier |
+| `wall-kiosk-loop.service` | routes kiosk audio through snd-aloop so it can be measured |
+| `wall-amp-trigger.service`, `panel-amp-trigger.py` | emits the amplifier's trigger tone while audio plays |
+| `wall-volume-keys.service`, `panel-volume-keys.py` | the side rocker |
+| `wall-audio-mode` | switches output modes |
+
+The measurement record behind all of it, including the trigger circuit that is
+still to be built, is `PANEL_AMP_AUTOPOWER.md` in the HomeHub repo.
+
+A mute method (`set_mute`) is planned for THIS broker and will be the first
+mutation it actually performs; the design and the open journal-class question
+are in `PANEL_MUTE_BUTTON_PLAN.md`, also in HomeHub.

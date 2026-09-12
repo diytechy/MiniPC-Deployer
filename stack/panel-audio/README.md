@@ -7,6 +7,9 @@ The real-panel read-only probe on 2026-09-10 found four ALSA playback devices,
 one ALSA capture device and a Bluetooth controller with no paired devices.
 `wpctl` and `pactl` were unavailable, so it did **not** establish a PipeWire
 session, any sink/source/monitor, an A2DP role, or acceptable latency/coexistence.
+(The A2DP SINK that landed on 2026-09-12 is bluez-alsa, not PipeWire, and is
+described in the wall README. It says nothing about this broker's backend, which
+still reports unavailable.)
 
 A codec pin dump on 2026-09-12 settled the two hardware questions that probe
 left open. The panel's codec is a Realtek **ALC255**, and **the built-in 3.5 mm
@@ -37,8 +40,14 @@ Consequently:
 - mutation requests require an injected authorization callback and default to
   deny. The image has intentionally not guessed how panel authentication maps
   onto that callback, so the shipped service cannot mutate devices;
-- no BlueZ D-Bus policy, WirePlumber profile, automatic capture selection or
-  PipeWire package/session assumption is installed;
+- no WirePlumber profile, automatic capture selection or PipeWire package/session
+  assumption is installed. **The Bluetooth FRONT DOOR is a separate thing and it
+  does ship** (SR-025, 2026-09-12): the adapter's power/discoverable/pairable
+  policy, a window-scoped pairing agent, and a bluez-alsa A2DP sink. None of
+  that is reachable from the renderer and none of it grants this broker any
+  authority -- the split is deliberate, because "the panel is a speaker a phone
+  plays through" and "the renderer may command Bluetooth" are different
+  questions with different answers. See `stack/autoinstall/wall/README.md`;
 - the unit provisionally runs as `panel`, because an eventual PipeWire graph is
   normally session-owned. A separate broker identity remains preferable for
   Bluetooth least privilege, but choosing it now could make the audio graph

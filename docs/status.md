@@ -8099,3 +8099,71 @@ their own configuration. The regression failed before the change and passed
 after it, and a direct WSL probe now reports the FileBackup tree clean at its
 exact HEAD. Full G1 after the correction: **836 passed / 13 skipped, RESULT
 PASS**, with configuration and strict trace integrity green.
+
+## 2026-09-12 — SR-025 Bluetooth front door and A2DP sink; two panel bugs fixed on hardware evidence
+
+The panel became a Bluetooth speaker. A phone or work laptop pairs inside a
+bounded window, reconnects on its own afterwards, and plays through the panel;
+in trigger mode that audio powers the amplifier. SN-019/SR-025/LLR-009/TC-009
+trace the new slice, and `bluez-alsa-utils`, `python3-dbus` and `python3-gi`
+join the wall image's offline closure.
+
+**The amplifier's detector needed no change, and that is the design.**
+`bluealsa-aplay` plays to the ALSA `default` PCM, which in trigger mode is
+`kiosk_mix` -> snd-aloop -> `kiosk_monitor` — already one of the two capture
+sources `panel-amp-trigger.py` measures. Bluetooth therefore arrives on the
+existing kiosk lane: no new source row, no second path to the relay, and nothing
+in the trigger daemon that knows Bluetooth exists. Pinning a card instead would
+have broken panel mode and decoupled the sink from `wall-audio-mode`.
+
+SR-023 was amended rather than left contradicted: its blanket "no broad BlueZ
+policy shall ship" clause became false the moment the front door shipped, so the
+adapter policy and the sink are split out into SR-025 and SR-023 now constrains
+only the renderer-facing broker, which remains off by default and unavailable.
+
+The pairing posture: not discoverable and not pairable at rest; a window that is
+opened deliberately and closes itself three ways (BlueZ's own timeouts, the
+helper's sleep, and the agent's independent timeout); a real D-Bus agent
+registered as the DEFAULT agent for that window only. The window bounds BONDING,
+not use — a bonded device reconnects and plays afterwards with the adapter
+closed, which is the feature and the residual risk at once, so `list` and
+`forget <MAC>` exist. The agent authorizes audio service UUIDs only.
+
+**Two panel defects were diagnosed against the running hardware**, both of which
+had been failing silently since they shipped:
+
+- Finger scrolling was dead. The touch filter's virtual wheel device declared
+  only wheel axes, so udev tagged it `ID_INPUT_KEY`, libinput never treated it
+  as a pointer, and every event it emitted was discarded. Probed on the panel:
+  wheel-only and wheel+xy both tag `ID_INPUT_KEY`; wheel+xy+BTN_LEFT tags
+  `ID_INPUT_MOUSE`. The scroll delta was also negated, so the direction was
+  inverted the last time any of it reached the compositor.
+- The Door tab had reported "Camera unavailable" for its entire life. Its socket
+  was correctly 0660 `wall-door-stream:panel`, inside a directory that was 0750
+  owned by a group the kiosk is not in — so `panel` got EACCES resolving the
+  path, and `existsSync()` returned a flat false. `ExecStartPre=+chgrp panel`
+  was meant to prevent this and never worked once: systemd re-applies
+  RuntimeDirectory ownership before every exec invocation. Measured, not
+  reasoned — chgrp by hand and the kiosk connects; restart and the group is
+  back. Fixed declaratively with `RuntimeDirectoryMode=0751`.
+
+Two adversarial review rounds (codex `gpt-5.6-terra`, medium) found thirteen
+real defects across this work, including two fail-opens introduced by the first
+round's own fixes — an authorization predicate that granted access on any
+malformed broker state, and a Bluetooth enable default that disagreed with its
+own documentation — and a pairing agent that would never have registered,
+because `bluetoothctl --agent` does not call RequestDefaultAgent. All fixed. One
+round-2 finding did not hold and no change was made for it: the 44.1 kHz concern
+assumed `default` was dmix, when it is a `plug` wrapping dmix in both modes; a
+test now pins that, since it is load-bearing and easy to simplify away.
+
+Evidence: MiniPC-Deployer **911 passed / 14 skipped**, `validate_config.py`
+green, `trace.py --strict-integrity` reporting SN=19 SR=25 LLR=9 TC=9 with
+integrity=0 and no new orphans. OfficeWallNaglight **323 node tests** plus 85
+touchfilter; NagLight green across every package. The three new packages resolve
+in a clean noble root with no removals.
+
+**No hardware acceptance is claimed for the Bluetooth path.** It is verified as
+far as package contents, flag names checked against bluez-alsa-utils 4.1.1 on
+the panel, and the ALSA topology read out of the tracked configuration. One real
+pairing at the panel is what would prove it.

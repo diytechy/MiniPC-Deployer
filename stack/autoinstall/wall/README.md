@@ -17,7 +17,7 @@ Cockpit, and nothing that would make the panel precious.
 The image carries a disabled-by-default Unix-socket broker and its pure routing
 and visualizer cores. This is scaffolding with an honest unavailable backend,
 not a claimed working route. See [`../../panel-audio/README.md`](../../panel-audio/README.md).
-No broad BlueZ policy or WirePlumber profile ships. The physical acceptance in
+No WirePlumber profile ships. The physical acceptance in
 `WALL-BURN-IN.md` must establish routing, latency, coexistence and whether the
 broker can remain a separate identity or must live in the panel user session.
 The unit reads a root-owned audio-only environment rather than the broad wall
@@ -25,7 +25,53 @@ configuration, persists its generation/one-request idempotency journal in its
 private state directory, bounds backend calls, and exposes derived-only
 telemetry through IF-015. A pending journal means device outcome is uncertain;
 the broker continues status reads but refuses routing mutations until an
-operator reconciles state and removes the journal.
+operator reconciles state and removes the journal -- except for `set_mute`,
+which is journaled but self-reconciling: it is idempotent and its truth can be
+read straight back off the mixer control, so a pending one is settled by
+OBSERVING the device rather than by an operator, and only when that observation
+actually returns a readable mute state.
+
+## The Bluetooth front door and the A2DP sink (SR-025)
+
+Separate from the broker above, and the distinction is the point: the broker
+governs the panel reaching OUT under the renderer's control, while this is
+whether anything out there can see the panel, attach to it, and play through it.
+The renderer is not in this path at all.
+
+**At rest the adapter is powered, not discoverable and not pairable.**
+`wall-bluetooth-pairing open` sets BlueZ's own discoverable/pairable timeouts,
+registers a real D-Bus pairing agent (`wall-bluetooth-agent`, which calls
+RegisterAgent *and* RequestDefaultAgent -- `bluetoothctl --agent` does not do the
+second, and a window opened in front of a non-default agent rejects the pairing
+it was opened for), opens both properties, sleeps the window out, stops the
+agent and re-asserts the at-rest state. The window is bounded three ways: BlueZ's
+timeouts, the helper's own sleep, and the agent's independent timeout.
+
+**The window bounds BONDING, not use.** A phone paired inside one reconnects and
+plays whenever it likes afterwards, with the adapter closed and no agent running.
+That is what makes this a speaker rather than something you re-pair every
+morning, and it is also the residual risk: a device that got through one window
+keeps its access until someone takes it away. `wall-bluetooth-pairing list` shows
+what is bonded and `forget <MAC>` revokes it. The agent's `AuthorizeService`
+accepts audio UUIDs only, so a device that paired to play music cannot later
+quietly claim HID.
+
+**The amplifier follows Bluetooth for free.** `bluealsa-aplay` plays to the ALSA
+`default` PCM, which in trigger mode is `kiosk_mix` -> snd-aloop ->
+`kiosk_monitor` -- already one of the two capture sources `panel-amp-trigger.py`
+measures. So a phone raises the level the detector watches and the relay closes,
+with no new source in the daemon and no second path to the relay. In panel mode
+`default` is the internal speaker and the amplifier is not commanded. Nothing
+pins a card, which is what keeps the sink obeying `wall-audio-mode` -- and
+`wall-audio-mode` stops the sink before its shared-memory sweep and restarts it
+after, because `bluealsa-aplay` holds a `default` handle exactly like the kiosk.
+
+Note `pcm.!default` is a `plug` wrapping the fixed-rate mixer in both modes. That
+is load-bearing: dmix has one configuration (48 kHz) and `bluealsa-aplay` passes
+the stream's own rate through, so without the plug a 44.1 kHz phone could not
+open the device at all.
+
+No physical pairing, audibility or amplifier acceptance is claimed.
 
 | | AWOW core (`../user-data`) | Wall panel (`./user-data`) |
 |---|---|---|

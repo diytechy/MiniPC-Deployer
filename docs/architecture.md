@@ -169,7 +169,10 @@ from registry rows (process.md §3). Each cites the ids it renders.
 
 The unavailable result is the current production behavior, not an error hidden
 by the diagram. The physical probe has not established a PipeWire session or a
-safe BlueZ policy, so the image carries the boundary without granting authority.
+safe BlueZ policy for the RENDERER to drive, so the image carries the boundary
+without granting authority. The adapter's own front-door policy and the A2DP
+sink are SR-025 and are unrelated to this diagram: they let a phone play through
+the panel without the renderer being in the path at all.
 
 ```mermaid
 sequenceDiagram

@@ -14,7 +14,8 @@ set -a
 source "$env_file"
 set +a
 
-enabled=${WALL_BLUETOOTH_ENABLED:-true}
+# Must match render-bluetooth.py and wall.env.example. See the note there.
+enabled=${WALL_BLUETOOTH_ENABLED:-false}
 case "$enabled" in true|false) ;; *) echo 'Invalid WALL_BLUETOOTH_ENABLED' >&2; exit 1;; esac
 
 command -v bluetoothctl >/dev/null || {
@@ -33,12 +34,17 @@ install -m 0644 "$payload/wall-bluetooth.service" /etc/systemd/system/wall-bluet
 systemctl daemon-reload
 systemctl enable wall-bluetooth.service
 
-# Assert now as well as at boot, so a re-run takes effect without a reboot. A
-# failure here is reported but does not fail firstboot: the policy is installed
-# and the boot unit will assert it again, and an adapter that is merely still in
-# BlueZ's default state is not worth abandoning a whole firstboot over.
+# Assert now as well as at boot, so a re-run takes effect without a reboot.
+#
+# THIS IS FATAL, and it did not used to be. The old reasoning was that the boot
+# unit would assert the policy again anyway -- true, but it means the window
+# between a failed install and the next reboot is spent with the adapter in
+# whatever state BlueZ left it, which on a panel that was previously
+# discoverable and pairable is precisely the state this file exists to end.
+# A security policy that could not be applied is a failed provisioning step.
 if ! systemctl restart wall-bluetooth.service; then
-    echo 'Bluetooth: at-rest policy could not be asserted now; it will be applied at boot' >&2
+    echo 'Bluetooth: at-rest adapter policy could not be asserted' >&2
+    exit 1
 fi
 /usr/local/sbin/wall-bluetooth-pairing status || true
 echo "[wall-bluetooth] Policy installed. Open a pairing window with: sudo wall-bluetooth-pairing open"

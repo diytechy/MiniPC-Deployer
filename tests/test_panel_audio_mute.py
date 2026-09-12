@@ -214,3 +214,60 @@ def test_a_malformed_mute_block_is_refused_like_any_other_backend_lie(bad):
     reply = response(AudioBroker(BadBackend(), authorize=lambda _m, _p: True),
                      request("status", {}, 0, "s"))
     assert reply["error"]["code"] == "unsafe_backend_result"
+
+
+# ── reconciliation must actually observe the control (codex review, 2026-09-12) ──
+
+def _lost_mute_journal(tmp_path, backend_factory):
+    state = tmp_path / "audio-state.json"
+    first = AudioBroker(lost_after_intent("set_mute")(), state_path=str(state),
+                        authorize=lambda _m, _p: True)
+    response(first, request("set_mute", {"muted": True}, 0, "lost"))
+    assert json.loads(state.read_text())["pending"] is not None
+    return state, AudioBroker(backend_factory(), state_path=str(state),
+                              authorize=lambda _m, _p: True)
+
+
+class _NoMuteFieldBackend(FakeBackend):
+    """Valid status, no `mute` block -- a backend predating the field."""
+
+    def call(self, method, params, cancel):
+        self.calls.append((method, params))
+        if method == "status":
+            return {"protocolVersion": 1, "available": True, "reason": "ready",
+                    "devices": [], "route": None, "visualizer": {"available": False}}
+        return {"accepted": True}
+
+
+class _UnsupportedMuteBackend(MuteAwareBackend):
+    """Valid status whose mute block says the control cannot be read."""
+
+    def call(self, method, params, cancel):
+        self.calls.append((method, params))
+        if method == "status":
+            return {"protocolVersion": 1, "available": True, "reason": "ready",
+                    "devices": [], "route": None, "visualizer": {"available": False},
+                    "mute": {"supported": False, "muted": False}}
+        return {"accepted": True}
+
+
+@pytest.mark.parametrize("backend", [_NoMuteFieldBackend, _UnsupportedMuteBackend])
+def test_a_status_that_cannot_answer_does_not_count_as_reconciliation(tmp_path, backend):
+    """A VALID STATUS IS NOT AN OBSERVATION OF THE LOST STATE.
+
+    `mute` is optional in the status schema, so a backend that predates it or a
+    panel whose output has no switch returns a perfectly valid status carrying
+    no answer. Clearing the journal on that would be the sticky-pending failure
+    dressed up as reconciliation -- the broker resuming mutations while claiming
+    to know a state it never looked at, and a retry could double-apply.
+    """
+    state, restarted = _lost_mute_journal(tmp_path, backend)
+    refused = response(restarted, request("connect", {"alias": "speaker"}, 0, "after"))
+    assert refused["error"]["code"] == "mutation_uncertain"
+    assert json.loads(state.read_text())["pending"] is not None, "the entry must survive"
+
+
+def test_a_readable_switch_is_what_actually_clears_the_journal(tmp_path):
+    state, restarted = _lost_mute_journal(tmp_path, lambda: MuteAwareBackend(muted=True))
+    assert response(restarted, request("connect", {"alias": "speaker"}, 0, "after"))["ok"]
+    assert json.loads(state.read_text())["pending"] is None

@@ -50,7 +50,12 @@ def _flag(env, key, default):
 
 def render(env):
     """Return the adapter policy for one panel, or raise ValueError."""
-    enabled = _flag(env, "WALL_BLUETOOTH_ENABLED", "true")
+    # FALSE, matching wall.env.example. This defaulted to "true" while the
+    # example claimed off, so any /etc/wall-panel/wall.env predating the knob --
+    # i.e. every panel already in the field -- rendered enabled:true and the
+    # boot unit powered the adapter on. A default that disagrees with the
+    # documented default is worse than either value on its own.
+    enabled = _flag(env, "WALL_BLUETOOTH_ENABLED", "false")
 
     alias = env.get("WALL_BLUETOOTH_ALIAS", "wall-panel")
     # The alias is broadcast to every device in range, so it is held to a plain

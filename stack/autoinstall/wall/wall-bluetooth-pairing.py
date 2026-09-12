@@ -58,14 +58,23 @@ def open_window(policy):
         sys.exit("wall-bluetooth-pairing: pairing is off by policy; nothing was opened")
 
     window = policy["pairingWindowSeconds"]
-    # Timeouts BEFORE the door opens, so the window is bounded from the instant
-    # it exists rather than a few milliseconds later.
-    ok = bluetoothctl("discoverable-timeout", str(window))
-    ok = bluetoothctl("pairable-timeout", str(window)) and ok
-    ok = bluetoothctl("pairable", "yes") and ok
-    ok = bluetoothctl("discoverable", "yes") and ok
-    if not ok:
-        close_window()
+    # BOTH TIMEOUTS MUST LAND BEFORE THE DOOR OPENS, and this is a hard gate
+    # rather than an accumulated flag. It was written as
+    # `ok = bluetoothctl("pairable", "yes") and ok`, which evaluates the call
+    # FIRST: a failed timeout write still went on to make the adapter pairable,
+    # producing exactly the unbounded, agent-less, permanently pairable panel
+    # the whole window mechanism exists to prevent.
+    if not bluetoothctl("discoverable-timeout", str(window)):
+        sys.exit("wall-bluetooth-pairing: discoverable timeout refused; nothing was opened")
+    if not bluetoothctl("pairable-timeout", str(window)):
+        sys.exit("wall-bluetooth-pairing: pairable timeout refused; nothing was opened")
+
+    if not bluetoothctl("pairable", "yes") or not bluetoothctl("discoverable", "yes"):
+        if close_window() != 0:
+            # Half-open with no way to confirm it closed. Cut the power rather
+            # than report a door state nothing has verified.
+            bluetoothctl("power", "off")
+            sys.exit("wall-bluetooth-pairing: could not open OR close the window; adapter powered off")
         sys.exit("wall-bluetooth-pairing: could not open the window; door re-closed")
 
     print(f"wall-bluetooth-pairing: open for {window}s as {policy['alias']}")
@@ -77,7 +86,13 @@ def open_window(policy):
         time.sleep(window)
     except KeyboardInterrupt:
         pass
-    return close_window()
+    # BlueZ's own timeouts have expired by now, so this is the belt to their
+    # braces -- but if it fails we cannot claim the door is shut, and an
+    # unverified open door on an agent-less adapter is the worst of the states.
+    if close_window() != 0:
+        bluetoothctl("power", "off")
+        sys.exit("wall-bluetooth-pairing: could not re-close the window; adapter powered off")
+    return 0
 
 
 def status(policy):

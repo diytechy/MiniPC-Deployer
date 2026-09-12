@@ -36,9 +36,17 @@ render = render_bluetooth.render
 
 def test_the_default_panel_is_invisible_and_unpairable_at_rest():
     """The whole posture in one assertion: an untouched wall.env yields a panel
-    that nothing in the building can see or attach to."""
+    that nothing in the building can see or attach to.
+
+    `enabled` defaults FALSE and that is checked here rather than in passing:
+    it read "true" while wall.env.example claimed off, so every panel already in
+    the field -- whose /etc/wall-panel/wall.env predates the knob entirely --
+    would have rendered enabled:true and had its adapter powered on by the boot
+    unit. A code default that disagrees with the documented one is the shape of
+    that bug, so the two are pinned together.
+    """
     policy = render({})
-    assert policy["enabled"] is True
+    assert policy["enabled"] is False
     assert policy["pairing"] == "window"
     assert policy["discoverableAtRest"] is False
     assert policy["pairableAtRest"] is False
@@ -58,7 +66,7 @@ def test_window_mode_is_never_open_at_rest():
 def test_discoverable_at_rest_is_available_without_becoming_pairable():
     """Advertising and accepting are separate decisions, and the panel can do
     the first without the second."""
-    policy = render({"WALL_BLUETOOTH_DISCOVERABLE_AT_REST": "true"})
+    policy = render({"WALL_BLUETOOTH_ENABLED": "true", "WALL_BLUETOOTH_DISCOVERABLE_AT_REST": "true"})
     assert policy["discoverableAtRest"] is True
     assert policy["pairableAtRest"] is False
 
@@ -131,7 +139,7 @@ def apply_with(policy, monkeypatch, fail=()):
 
 def test_the_timeouts_are_set_before_the_door_can_open(monkeypatch):
     """On a radio, a briefly-unbounded window is still an opportunity."""
-    policy = render({"WALL_BLUETOOTH_DISCOVERABLE_AT_REST": "true"})
+    policy = render({"WALL_BLUETOOTH_ENABLED": "true", "WALL_BLUETOOTH_DISCOVERABLE_AT_REST": "true"})
     ctl, failed = apply_with(policy, monkeypatch)
     assert failed == []
     order = [call[0] for call in ctl.calls]
@@ -140,7 +148,7 @@ def test_the_timeouts_are_set_before_the_door_can_open(monkeypatch):
 
 
 def test_a_disabled_adapter_is_powered_off_and_nothing_else_is_asserted(monkeypatch):
-    ctl, failed = apply_with(render({"WALL_BLUETOOTH_ENABLED": "false"}), monkeypatch)
+    ctl, failed = apply_with(render({}), monkeypatch)
     assert failed == []
     assert ctl.calls == [("power", "off")]
 
@@ -148,14 +156,14 @@ def test_a_disabled_adapter_is_powered_off_and_nothing_else_is_asserted(monkeypa
 def test_the_at_rest_state_is_asserted_explicitly_not_assumed(monkeypatch):
     """Both properties are written every time, including when the answer is
     "no". Assuming BlueZ powered up closed is how a panel stays open."""
-    ctl, failed = apply_with(render({}), monkeypatch)
+    ctl, failed = apply_with(render({"WALL_BLUETOOTH_ENABLED": "true"}), monkeypatch)
     assert failed == []
     assert ("pairable", "no") in ctl.calls
     assert ("discoverable", "no") in ctl.calls
 
 
 def test_a_failed_property_write_is_reported_not_swallowed(monkeypatch):
-    ctl, failed = apply_with(render({}), monkeypatch, fail=("discoverable",))
+    ctl, failed = apply_with(render({"WALL_BLUETOOTH_ENABLED": "true"}), monkeypatch, fail=("discoverable",))
     assert failed == ["discoverable"]
 
 
@@ -163,3 +171,14 @@ def test_the_rendered_policy_is_json_and_round_trips(tmp_path):
     # configure-bluetooth.sh writes exactly this and the applier reads it back.
     policy = render({})
     assert json.loads(json.dumps(policy)) == policy
+
+
+def test_the_code_default_and_the_documented_default_agree():
+    """The mismatch that shipped: render() said true, wall.env.example said
+    false, and a panel whose wall.env predates the knob got the code default."""
+    example = (ROOT / "stack/autoinstall/wall/wall.env.example").read_text(encoding="utf-8")
+    assert "WALL_BLUETOOTH_ENABLED=false" in example
+    assert render({})["enabled"] is False
+    # And the shell agrees, so the tab is hidden on the same panel the adapter
+    # is powered down on.
+    assert render({"WALL_BLUETOOTH_ENABLED": "true"})["enabled"] is True

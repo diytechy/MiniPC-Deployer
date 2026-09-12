@@ -322,6 +322,18 @@ class AudioBroker:
             raise BrokerError("mutation_uncertain", "previous mutation requires operator reconciliation")
         observed = self._backend_call("call", "status", {})
         self._ensure_safe_result("status", observed)
+        # A VALID STATUS IS NOT AN OBSERVATION OF THE THING WE LOST. `mute` is
+        # optional in the status schema, so a backend that predates it, or one
+        # whose output has no switch to read, returns a perfectly valid status
+        # carrying no answer at all -- and clearing the journal on that would be
+        # the sticky-pending failure dressed up as reconciliation: the broker
+        # would resume mutations claiming to know a state it never looked at.
+        # Self-reconciling means the control could be READ, not merely that
+        # something replied.
+        mute = observed.get("mute") if isinstance(observed, dict) else None
+        if not isinstance(mute, dict) or mute.get("supported") is not True:
+            raise BrokerError("mutation_uncertain",
+                              "mute state could not be observed; reconciliation requires an operator")
         self.state.resolve()
 
     def _backend_call(self, operation: str, method: str | None = None,

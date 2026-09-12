@@ -1295,6 +1295,14 @@ elif [ "$WALL_AUDIO_ENABLED" = false ]; then
     log "SR-023: panel audio broker disabled (default)"
 fi
 
+# The Bluetooth front door is configured independently of the broker above: the
+# broker governs the panel reaching out, this governs whether anything out there
+# can see it and ask to pair. Default is closed at rest with a self-closing
+# pairing window; see render-bluetooth.py for why.
+if ! WALL_ENV_FILE="$ENV_FILE" bash "$PAYLOAD/configure-bluetooth.sh"; then
+    fail_step "Bluetooth adapter policy failed; inspect wall-bluetooth.service."
+fi
+
 # Touch fault filter is opt-in; OFF also restores the raw-input recovery path.
 if ! WALL_ENV_FILE="$ENV_FILE" bash "$PAYLOAD/configure-touch-filter.sh"; then
     fail_step "Touch filter configuration failed; inspect wall-touch-filter.service."

@@ -298,6 +298,16 @@ def main():
         "autoinstall/wall/render-touch-filter.py",
         "autoinstall/wall/wall-touch-filter.service",
         "autoinstall/wall/wall-touch-filter-sleep",
+        # SR-023 — the Bluetooth front door. The renderer is the validator, so a
+        # missing one is not a panel that falls back to a safe default; it is a
+        # firstboot step that cannot run, leaving the adapter in whatever state
+        # BlueZ powered it up with. That is the state this whole group exists to
+        # stop being the answer.
+        "autoinstall/wall/configure-bluetooth.sh",
+        "autoinstall/wall/render-bluetooth.py",
+        "autoinstall/wall/wall-bluetooth-apply.py",
+        "autoinstall/wall/wall-bluetooth-pairing.py",
+        "autoinstall/wall/wall-bluetooth.service",
         "panel-access/install-gateway.py",
         "panel-access/stage-gateway.sh",
         "autoinstall/wall/wall-sensors-dbus.conf",

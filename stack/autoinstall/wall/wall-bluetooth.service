@@ -1,0 +1,45 @@
+# wall-bluetooth.service — assert the panel's at-rest Bluetooth state at boot.
+#
+# The state it asserts is normally CLOSED: not discoverable, not pairable, with
+# BlueZ's own timeouts pre-set so that any window opened later shuts itself.
+# See render-bluetooth.py for why that is the default and not timidity.
+#
+# Type=oneshot with RemainAfterExit: there is nothing to supervise. The adapter
+# holds the state, and re-running the same command is how a pairing window is
+# closed, so there is exactly one code path for "make the door match policy".
+
+[Unit]
+Description=Wall panel: assert the at-rest Bluetooth adapter policy
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+# bluetooth.service must be up or every property write is refused. Requires,
+# not Wants: silently leaving the adapter in whatever state it powered up with
+# is the failure this unit exists to prevent.
+After=bluetooth.service
+Requires=bluetooth.service
+ConditionPathExists=/etc/wall-panel/bluetooth.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/local/sbin/wall-bluetooth-apply
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/wall-panel
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

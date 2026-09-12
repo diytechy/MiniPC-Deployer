@@ -1176,3 +1176,35 @@ def test_epoch_from_rfc3339_fails_closed():
     for bad in (None, "", 123, "yesterday", "2026-09-12", "2026-09-12T00:00:00.123Z", []):
         assert feeder.epoch_from_rfc3339(bad) is None, bad
     assert feeder.is_fresh({"observed_at": "not-a-time", "window": {"kind": "weekly"}}, NOW) is False
+
+
+def test_a_rate_limited_bucket_is_a_reading_not_a_blank(monkeypatch):
+    """`rate-limited` at 100% is the most important thing this gauge can say.
+
+    The reader required `status == "ok"` exactly, on the reasoning that a number
+    the vendor warned us about must not become a GREEN gauge. Measured against
+    the Owner's live account on 2026-09-12, the monthly bucket was
+    {"status": "rate-limited", "percent": 100} -- the budget is spent. At 100%
+    it could never have rendered green (the gauge is full red at that end), so
+    the rule blanked the bar to "unavailable" exactly when it had something
+    worth saying, while the limit was plainly visible on the vendor's own site.
+    """
+    body = {"usage": {
+        "weekly":  {"status": "ok",           "percent": 78,  "resetsAt": "2026-09-14T00:00:00.000Z"},
+        "monthly": {"status": "rate-limited", "percent": 100, "resetsAt": "2026-09-19T00:11:19.000Z"},
+    }}
+    out = feeder.parse_opencode(body, NOW)
+    assert "ai-usage-opencode-monthly" in out, "a spent budget must still be a reading"
+    assert out["ai-usage-opencode-monthly"].percent == 100
+    assert out["ai-usage-opencode-weekly"].percent == 78
+
+
+def test_an_unknown_bucket_status_still_fails_closed():
+    """The allow-list is the point: a status nobody has seen is not a number."""
+    for status in ("degraded", "unknown", "error", None, "OK", 7, ""):
+        body = {"usage": {
+            "weekly":  {"status": "ok",   "percent": 10, "resetsAt": "2026-09-14T00:00:00.000Z"},
+            "monthly": {"status": status, "percent": 50, "resetsAt": "2026-09-19T00:11:19.000Z"},
+        }}
+        out = feeder.parse_opencode(body, NOW)
+        assert "ai-usage-opencode-monthly" not in out, status

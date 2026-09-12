@@ -457,6 +457,16 @@ def parse_claude(payload, now):
 # a fabricated reading, and `direction` is refused without a window anyway, so
 # the alternative was a gauge with a 7-day staleness horizon that stays green
 # for a week after the feeder dies. Recorded as a known gap in README.md.
+# The bucket statuses this reader knows how to believe. An ALLOW-LIST, so a
+# status nobody has seen yet still fails closed to "unavailable" rather than
+# being read as a number.
+#
+#   ok            - an ordinary reading.
+#   rate-limited  - the budget is SPENT. A definite statement, not a warning
+#                   about the number's quality, and the single most useful
+#                   thing this gauge can show.
+OPENCODE_TRUSTED_STATUSES = frozenset({"ok", "rate-limited"})
+
 OPENCODE_BUCKETS = (
     ("weekly", "ai-usage-opencode-weekly", "OpenCode weekly", 7 * 24 * 3600),
     ("monthly", "ai-usage-opencode-monthly", "OpenCode monthly", 30 * 24 * 3600),
@@ -474,9 +484,24 @@ def parse_opencode(payload, now):
       Raises:  SourceFailure on a non-object, a missing `usage`, or when no
                listed bucket is usable.
 
-    A bucket whose `status` is not "ok" is skipped rather than posted: the
-    vendor is telling us the number is not trustworthy, and a number we were
-    warned about is exactly the one that must not become a green gauge. A
+    A bucket whose status this reader does not KNOW is skipped rather than
+    posted: an unrecognised status is the vendor telling us something we cannot
+    interpret, and a number we cannot interpret must not become a gauge.
+
+    `rate-limited` IS KNOWN, AND IT IS THE MOST IMPORTANT READING THERE IS.
+    This used to require `status == "ok"` exactly, on the reasoning that "a
+    number we were warned about must not become a green gauge" -- which does not
+    survive contact with the real body. Measured 2026-09-12, the Owner's live
+    monthly bucket was:
+
+        "monthly": {"status": "rate-limited", "percent": 100, ...}
+
+    That is not an untrustworthy number. It is the vendor stating, definitely,
+    that the budget is spent -- and at 100 percent it could never have rendered
+    green in the first place, because the gauge is full red at the far end. The
+    old rule blanked the monthly bar to "unavailable" at exactly the moment it
+    had something worth saying, while the Owner could see the limit plainly on
+    the vendor's own site. A
     bucket missing `resetsAt`, or carrying one that has already passed, is
     skipped by `check_window` for the same reason `rolling` is not in the table
     above: a gauge with no window takes the 7-day static horizon and stays
@@ -497,7 +522,7 @@ def parse_opencode(payload, now):
             problems.append("%s absent" % field)
             continue
         status = bucket.get("status")
-        if status != "ok":
+        if status not in OPENCODE_TRUSTED_STATUSES:
             problems.append("%s status=%r" % (field, status))
             continue
         try:

@@ -308,6 +308,12 @@ def main():
         "autoinstall/wall/wall-bluetooth-apply.py",
         "autoinstall/wall/wall-bluetooth-pairing.py",
         "autoinstall/wall/wall-bluetooth.service",
+        # The A2DP sink overrides. Without these bluealsa runs the stock
+        # source+sink profile and bluealsa-aplay runs inside a user namespace
+        # that cannot attach the panel's dmix segments -- so pairing succeeds
+        # and nothing is ever audible, which is the worst way for this to fail.
+        "autoinstall/wall/wall-bluealsa-override.conf",
+        "autoinstall/wall/wall-bluealsa-aplay-override.conf",
         "panel-access/install-gateway.py",
         "panel-access/stage-gateway.sh",
         "autoinstall/wall/wall-sensors-dbus.conf",

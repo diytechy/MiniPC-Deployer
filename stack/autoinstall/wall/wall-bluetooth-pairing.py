@@ -43,6 +43,46 @@ def bluetoothctl(*args):
     return done.returncode == 0
 
 
+def start_agent(policy):
+    """Register a BlueZ pairing agent for the life of the window.
+
+    `bluetoothctl --agent CAP --timeout N` registers the agent, makes it the
+    default, and runs non-interactively for N seconds. The timeout is a SECOND
+    bound on top of this process's own sleep: if this script is killed without
+    running its cleanup, bluetoothctl still exits on its own and the agent goes
+    with it. Belt and braces, for the same reason the door has two timers.
+
+    Returns the process, or None if it could not be started.
+    """
+    window = policy["pairingWindowSeconds"]
+    try:
+        agent = subprocess.Popen(
+            ("bluetoothctl", "--agent", policy["agentCapability"], "--timeout", str(window)),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    # A capability BlueZ refuses makes bluetoothctl exit almost immediately, and
+    # an agent that died is indistinguishable from one that never registered --
+    # so notice it here rather than opening the door in front of nothing.
+    try:
+        agent.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        return agent
+    return None
+
+
+def stop_agent(agent):
+    """Terminate the agent. Safe to call twice, and on any exit path."""
+    if agent is None or agent.poll() is not None:
+        return
+    agent.terminate()
+    try:
+        agent.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        agent.kill()
+
+
 def close_window():
     """Re-assert the at-rest state -- the same operation the boot service runs."""
     try:
@@ -69,7 +109,16 @@ def open_window(policy):
     if not bluetoothctl("pairable-timeout", str(window)):
         sys.exit("wall-bluetooth-pairing: pairable timeout refused; nothing was opened")
 
+    # THE AGENT STARTS BEFORE THE DOOR OPENS, not after. Without a registered
+    # agent BlueZ has nobody to ask about an incoming pairing, so a phone that
+    # connected in the gap would simply fail -- and the person at the panel
+    # would be left retrying a window that looks open and is not answering.
+    agent = start_agent(policy)
+    if agent is None:
+        sys.exit("wall-bluetooth-pairing: no pairing agent; nothing was opened")
+
     if not bluetoothctl("pairable", "yes") or not bluetoothctl("discoverable", "yes"):
+        stop_agent(agent)
         if close_window() != 0:
             # Half-open with no way to confirm it closed. Cut the power rather
             # than report a door state nothing has verified.
@@ -77,18 +126,20 @@ def open_window(policy):
             sys.exit("wall-bluetooth-pairing: could not open OR close the window; adapter powered off")
         sys.exit("wall-bluetooth-pairing: could not open the window; door re-closed")
 
-    print(f"wall-bluetooth-pairing: open for {window}s as {policy['alias']}")
-    # NOTE FOR WHOEVER WIRES THE UI TO THIS: no agent is registered on this image
-    # yet, so a pairing completed inside this window is a Just Works pairing and
-    # nobody is asked to confirm anything. The window bounds WHEN that can
-    # happen, not WHETHER it is confirmed. See render-bluetooth.py.
+    print(f"wall-bluetooth-pairing: open for {window}s as {policy['alias']} "
+          f"(agent {policy['agentCapability']})")
     try:
         time.sleep(window)
     except KeyboardInterrupt:
         pass
+    finally:
+        # THE AGENT DIES WITH THE WINDOW, on every exit path including Ctrl-C.
+        # An agent outliving its window is the one leak that would turn
+        # "NoInputNoOutput is safe because it is temporary" back into a lie.
+        stop_agent(agent)
     # BlueZ's own timeouts have expired by now, so this is the belt to their
     # braces -- but if it fails we cannot claim the door is shut, and an
-    # unverified open door on an agent-less adapter is the worst of the states.
+    # unverified open door is the worst of the states to report as closed.
     if close_window() != 0:
         bluetoothctl("power", "off")
         sys.exit("wall-bluetooth-pairing: could not re-close the window; adapter powered off")

@@ -19,11 +19,12 @@ number of seconds, and closed again by BlueZ's own timeout even if nothing
 tidies up after it. `always` exists because a bench or a kiosk in a locked room
 is a real case, but it is a decision someone has to type, not one they inherit.
 
-A PAIRING WINDOW WITHOUT AN AGENT IS STILL AN OPEN DOOR. `agent_capability` is
-rendered here so the policy is complete and reviewable, but nothing in this
-image registers an agent yet; `pairing=always` without one is refused outright
-rather than quietly shipped, because that combination is the unattended-silent-
-pairing case and the only one where the window cannot limit the damage.
+THE AGENT LIVES AND DIES WITH THE WINDOW. wall-bluetooth-pairing registers a
+BlueZ agent (`bluetoothctl --agent`) for exactly the window's duration and stops
+it afterwards, so outside a window there is no agent AND the adapter is neither
+pairable nor discoverable -- two independent reasons nothing can attach. Inside
+one, a person is standing at the panel having deliberately opened it. That is
+the consent, in the absence of any pairing UI in the shell to display a passkey.
 """
 
 import json
@@ -33,11 +34,23 @@ import re
 import sys
 
 
-# BlueZ agent capabilities. DisplayYesNo is the honest one for a panel that has
-# a screen and a touch digitizer: it can show a passkey and take a confirmation.
-# NoInputNoOutput is what produces silent Just Works pairing and is deliberately
-# not offered -- a panel that can ask has no business not asking.
-AGENT_CAPABILITIES = ("DisplayYesNo", "DisplayOnly", "KeyboardDisplay")
+# BlueZ agent capabilities.
+#
+# NoInputNoOutput IS THE DEFAULT, AND THE CONSENT LIVES SOMEWHERE ELSE. An
+# earlier revision refused this capability on the grounds that it produces
+# silent Just Works pairing -- true, and it was the right call while no agent
+# existed at all, because "pairable with no agent" means the adapter accepts
+# whoever asks, indefinitely, with nothing anywhere recording that it happened.
+#
+# What makes it safe now is that the agent EXISTS ONLY INSIDE THE PAIRING
+# WINDOW. wall-bluetooth-pairing starts it, the window closes, the agent exits,
+# and outside that window the adapter is neither pairable nor discoverable. The
+# consent is a person standing at the panel opening a bounded window on purpose
+# -- the same model as the pairing button on any speaker -- rather than a
+# passkey nobody can display, because this shell has no pairing UI to display
+# one in. Adding that UI is what would make DisplayYesNo meaningful, and it is
+# kept here for exactly that.
+AGENT_CAPABILITIES = ("NoInputNoOutput", "DisplayYesNo", "DisplayOnly", "KeyboardDisplay")
 PAIRING_MODES = ("off", "window", "always")
 
 
@@ -50,12 +63,12 @@ def _flag(env, key, default):
 
 def render(env):
     """Return the adapter policy for one panel, or raise ValueError."""
-    # FALSE, matching wall.env.example. This defaulted to "true" while the
-    # example claimed off, so any /etc/wall-panel/wall.env predating the knob --
-    # i.e. every panel already in the field -- rendered enabled:true and the
-    # boot unit powered the adapter on. A default that disagrees with the
-    # documented default is worse than either value on its own.
-    enabled = _flag(env, "WALL_BLUETOOTH_ENABLED", "false")
+    # TRUE, matching wall.env.example -- and the two are pinned together by a
+    # test, because they disagreed once and a code default that contradicts the
+    # documented one is how every panel in the field ends up in a state nobody
+    # chose. Enabled means the adapter is powered and the A2DP sink runs; it
+    # does NOT mean anything can pair, which is what `pairing` below governs.
+    enabled = _flag(env, "WALL_BLUETOOTH_ENABLED", "true")
 
     alias = env.get("WALL_BLUETOOTH_ALIAS", "wall-panel")
     # The alias is broadcast to every device in range, so it is held to a plain
@@ -76,7 +89,7 @@ def render(env):
     if not 30 <= window <= 600:
         raise ValueError("invalid-bluetooth-pairing-window")
 
-    capability = env.get("WALL_BLUETOOTH_AGENT_CAPABILITY", "DisplayYesNo")
+    capability = env.get("WALL_BLUETOOTH_AGENT_CAPABILITY", "NoInputNoOutput")
     if capability not in AGENT_CAPABILITIES:
         raise ValueError("invalid-bluetooth-agent-capability")
 
@@ -87,10 +100,14 @@ def render(env):
         raise ValueError("discoverable-at-rest-requires-pairing")
 
     if pairing == "always":
-        # See the module docstring. This is the one combination whose blast
-        # radius the window cannot bound, so it is refused until an agent
-        # actually exists to demand a confirmation.
-        raise ValueError("pairing-always-requires-a-registered-agent")
+        # STILL REFUSED, and now for a sharper reason than before. The agent is
+        # window-scoped by design, so `always` would mean an adapter that is
+        # permanently pairable with an agent that is usually absent: pairing
+        # attempts fail confusingly most of the time, and whenever a window did
+        # happen to be open the door would already have been open for hours.
+        # There is no state in which `always` is the safer or the more useful
+        # setting, so it stays a refusal rather than a footgun with a comment.
+        raise ValueError("pairing-always-is-refused-the-window-is-the-consent")
 
     return {
         "enabled": enabled,

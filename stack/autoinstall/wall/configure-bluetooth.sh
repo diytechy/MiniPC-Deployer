@@ -31,8 +31,38 @@ install -m 0644 "$scratch/bluetooth.json" "$config_dir/bluetooth.json"
 install -m 0755 "$payload/wall-bluetooth-apply.py" /usr/local/sbin/wall-bluetooth-apply
 install -m 0755 "$payload/wall-bluetooth-pairing.py" /usr/local/sbin/wall-bluetooth-pairing
 install -m 0644 "$payload/wall-bluetooth.service" /etc/systemd/system/wall-bluetooth.service
+
+# ── The A2DP sink: what actually carries a phone's audio into the room ───────
+# bluez alone pairs and connects; it moves no audio. bluealsa provides the sink
+# and bluealsa-aplay writes what arrives to the ALSA `default` PCM -- which in
+# trigger mode is the loopback the amplifier's detector already listens to, so
+# the amp follows Bluetooth audio with no change to the trigger daemon.
+#
+# Both units ship with the package; we only override them. Overriding rather
+# than replacing keeps the distribution's sandboxing, which is extensive and
+# worth having, and confines our edits to the two things it cannot know about:
+# the sink-only profile and the dmix IPC the panel's audio path depends on.
+if [ "$enabled" = true ]; then
+    command -v bluealsa >/dev/null || {
+        echo 'Bluetooth: bluez-alsa-utils missing from the wall image' >&2; exit 1; }
+    for unit in bluealsa bluealsa-aplay; do
+        install -d -m 0755 "/etc/systemd/system/$unit.service.d"
+    done
+    install -m 0644 "$payload/wall-bluealsa-override.conf"         /etc/systemd/system/bluealsa.service.d/wall.conf
+    install -m 0644 "$payload/wall-bluealsa-aplay-override.conf"         /etc/systemd/system/bluealsa-aplay.service.d/wall.conf
+fi
+
 systemctl daemon-reload
 systemctl enable wall-bluetooth.service
+if [ "$enabled" = true ]; then
+    systemctl enable bluealsa.service bluealsa-aplay.service
+    # Restart rather than start: a re-run must pick up a changed override.
+    systemctl restart bluealsa.service bluealsa-aplay.service || {
+        echo 'Bluetooth: the A2DP sink did not start; pairing would succeed and play nothing' >&2
+        exit 1; }
+else
+    systemctl disable --now bluealsa.service bluealsa-aplay.service >/dev/null 2>&1 || true
+fi
 
 # Assert now as well as at boot, so a re-run takes effect without a reboot.
 #
@@ -48,3 +78,7 @@ if ! systemctl restart wall-bluetooth.service; then
 fi
 /usr/local/sbin/wall-bluetooth-pairing status || true
 echo "[wall-bluetooth] Policy installed. Open a pairing window with: sudo wall-bluetooth-pairing open"
+if [ "$enabled" = true ]; then
+    echo "[wall-bluetooth] A2DP sink active. Paired devices play to the ALSA default PCM,"
+    echo "[wall-bluetooth] which in trigger mode is what powers the amplifier."
+fi

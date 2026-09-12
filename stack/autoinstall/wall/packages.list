@@ -207,3 +207,11 @@ python3-evdev           # whole-gesture touchscreen filter; baked for offline in
 ffmpeg
 python3-opencv         # SR-024: offline MOG2/morphology/connected-components Door detector
 bluez
+# A2DP SINK. The panel is something a phone or laptop CONNECTS TO and plays
+# through; bluez alone cannot carry audio. bluez-alsa is the ALSA-native option
+# and the only one that fits this box: the whole audio path here is raw ALSA
+# (dmix/dsnoop/snd-aloop, see asound-trigger-mode.conf), and PipeWire would mean
+# replacing that working path rather than joining it. bluealsa-aplay writes to
+# the ALSA `default` PCM, which is exactly where the amplifier's detector is
+# already listening -- see wall-bluealsa-aplay-override.conf.
+bluez-alsa-utils

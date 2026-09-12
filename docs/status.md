@@ -8167,3 +8167,39 @@ in a clean noble root with no removals.
 far as package contents, flag names checked against bluez-alsa-utils 4.1.1 on
 the panel, and the ALSA topology read out of the tracked configuration. One real
 pairing at the panel is what would prove it.
+
+### Deployed the same day, and what deploying found
+
+All of the above went onto the running panel, and the shell site and rebuilt
+tracker image onto the hub. Confirmed by observation rather than assertion: the
+Door runtime directory is 0751 and the kiosk connects to the socket; the Bounded
+Scroll device is tagged `ID_INPUT_MOUSE` with a `mouse3` handler where it
+previously had neither; `bluealsa -p a2dp-sink` and `bluealsa-aplay
+--profile-a2dp --single-audio --pcm=default` run with both overrides applied and
+the adapter powered, not discoverable and not pairable with both timeouts at
+120s; the panel artifact moved f1ac1b7 -> 1a960a8; and a poked SPLIT screenshot
+shows all six tabs including BLUETOOTH.
+
+**Deploying found a defect nothing else could have.** bluez 5.72's
+`bluetoothctl` has `discoverable-timeout` and NO pairable equivalent -- the
+symmetrical verb was assumed and does not exist, failing with "Invalid command
+in menu main" so that `wall-bluetooth.service` would not start at all. Both are
+properties on org.bluez.Adapter1, so both now go through `busctl`. This is the
+argument for deploying rather than reasoning, in one line.
+
+It also found a CRLF trap that had nothing to do with Bluetooth: the Windows
+checkouts carry CRLF while the object stores are clean, so files copied straight
+from a working tree shipped a `python3` shebang. All four repos are now
+`core.autocrlf=input`; the artifact builder already refused to pack on this, and
+was right to.
+
+**A second outage surfaced and was fixed in the same pass.** The hub's
+`/api/today` was returning HTTP 500 -- one undated one-time todo failing
+validation took the entire definitions load with it, which is exactly the
+NagLight defect fixed at the top of this session and unrelated to Caddy, which
+was faithfully relaying the application's own error. Rebuilding `naglight:local`
+and recreating the tracker took the API 500 -> 200 and restored the household's
+checklist on the wall, with six definitions skipped and named.
+
+Hub SSH host key had changed, consistent with that box's 2026-09-12 reimage;
+`known_hosts` was backed up before the entry was replaced.

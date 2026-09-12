@@ -71,7 +71,19 @@ is load-bearing: dmix has one configuration (48 kHz) and `bluealsa-aplay` passes
 the stream's own rate through, so without the plug a 44.1 kHz phone could not
 open the device at all.
 
-No physical pairing, audibility or amplifier acceptance is claimed.
+**Deployment state, 2026-09-12.** This is live on the panel: the packages are
+installed, the policy is rendered, `wall-bluetooth.service` asserts the at-rest
+state at boot, and `bluealsa`/`bluealsa-aplay` run with these overrides. The
+adapter reads powered, not discoverable, not pairable, both timeouts 120s.
+
+**No physical pairing, audibility or amplifier acceptance is claimed** -- no
+device has paired to it yet, so the path from a phone to the relay is deployed
+and untested. `sudo wall-bluetooth-pairing open` is the window; `list` and
+`forget <MAC>` manage what a window let in.
+
+One thing deploying corrected that reading could not: `bluetoothctl` in bluez
+5.72 has `discoverable-timeout` and NO pairable equivalent, so both timeouts are
+set through `busctl` on org.bluez.Adapter1 instead.
 
 | | AWOW core (`../user-data`) | Wall panel (`./user-data`) |
 |---|---|---|

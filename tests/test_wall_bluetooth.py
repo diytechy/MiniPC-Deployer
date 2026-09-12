@@ -154,10 +154,20 @@ class FakeCtl:
 
 
 def apply_with(policy, monkeypatch, fail=()):
+    """Both the bluetoothctl verbs and the D-Bus timeout writes land in one
+    ordered call log, so ordering assertions still see the whole sequence."""
     ctl = FakeCtl(fail)
     monkeypatch.setattr(wall_bluetooth_apply, "bluetoothctl", ctl)
+    monkeypatch.setattr(wall_bluetooth_apply, "set_timeout",
+                        lambda prop, secs: ctl(TIMEOUT_VERB[prop], str(secs)))
     failed = wall_bluetooth_apply.apply(policy)
     return ctl, failed
+
+
+# The properties are named on D-Bus; the tests speak the old verb names because
+# that is what the ordering assertions read.
+TIMEOUT_VERB = {"DiscoverableTimeout": "discoverable-timeout",
+                "PairableTimeout": "pairable-timeout"}
 
 
 def test_the_timeouts_are_set_before_the_door_can_open(monkeypatch):
@@ -427,3 +437,22 @@ def test_a_mode_switch_takes_the_bluetooth_sink_with_it():
     bt_stop = script.index("unit stop bluealsa-aplay.service")
     assert stop_at < bt_stop < clear_at, "the sink must be stopped before the IPC sweep"
     assert "start_if_enabled bluealsa-aplay.service" in script, "and started again after"
+
+
+def test_the_pairable_timeout_is_set_over_dbus_not_via_a_verb_bluez_lacks():
+    """FOUND ON THE PANEL AT DEPLOY TIME. bluez 5.72's bluetoothctl has
+    `discoverable-timeout` and NO pairable equivalent, so the symmetrical verb
+    is a trap: it fails with "Invalid command in menu main" and the at-rest
+    assertion never completes. Both properties exist on org.bluez.Adapter1, so
+    both go through D-Bus."""
+    for src in ("wall-bluetooth-apply.py", "wall-bluetooth-pairing.py"):
+        text = (WALL / src).read_text(encoding="utf-8")
+        assert "PairableTimeout" in text and "DiscoverableTimeout" in text, src
+        assert "busctl" in text, src
+        # Code lines only: the comments explaining this deliberately NAME the
+        # verb that does not exist, which is the whole point of them.
+        code = [ln for ln in text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#") and '"""' not in ln]
+        body = chr(10).join(code)
+        assert 'bluetoothctl("pairable-timeout"' not in body, src
+        assert 'bluetoothctl("discoverable-timeout"' not in body, src

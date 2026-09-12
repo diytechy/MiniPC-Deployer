@@ -58,6 +58,22 @@ def bluetoothctl(*args):
     return done.returncode == 0
 
 
+ADAPTER = "/org/bluez/hci0"
+
+
+def set_timeout(prop, seconds):
+    """Set an Adapter1 timeout property over D-Bus. See wall-bluetooth-apply:
+    bluez 5.72's bluetoothctl has no `pairable-timeout` verb at all."""
+    try:
+        done = subprocess.run(
+            ("busctl", "set-property", "org.bluez", ADAPTER,
+             "org.bluez.Adapter1", prop, "u", str(int(seconds))),
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+    return done.returncode == 0
+
+
 def start_agent(policy):
     """Register a BlueZ pairing agent for the life of the window.
 
@@ -126,9 +142,9 @@ def open_window(policy):
     # FIRST: a failed timeout write still went on to make the adapter pairable,
     # producing exactly the unbounded, agent-less, permanently pairable panel
     # the whole window mechanism exists to prevent.
-    if not bluetoothctl("discoverable-timeout", str(window)):
+    if not set_timeout("DiscoverableTimeout", window):
         sys.exit("wall-bluetooth-pairing: discoverable timeout refused; nothing was opened")
-    if not bluetoothctl("pairable-timeout", str(window)):
+    if not set_timeout("PairableTimeout", window):
         sys.exit("wall-bluetooth-pairing: pairable timeout refused; nothing was opened")
 
     # THE AGENT STARTS BEFORE THE DOOR OPENS, not after. Without a registered

@@ -21,12 +21,35 @@ import sys
 POLICY = Path("/etc/wall-panel/bluetooth.json")
 
 
+ADAPTER = "/org/bluez/hci0"
+
+
 def bluetoothctl(*args):
     """One bluetoothctl command. Returns True on a clean exit."""
     try:
         done = subprocess.run(("bluetoothctl", *args), capture_output=True,
                               text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
+def set_timeout(prop, seconds):
+    """Set an Adapter1 timeout property over D-Bus.
+
+    NOT `bluetoothctl pairable-timeout`: BLUEZ 5.72 HAS NO SUCH COMMAND. It has
+    `discoverable-timeout` and nothing for the pairable side, so the obvious
+    symmetry is a trap -- the invented verb fails with "Invalid command in menu
+    main", which is exactly how this was found, on the panel, at deploy time.
+    Both properties exist on org.bluez.Adapter1 either way, so both go through
+    D-Bus here rather than one through each interface.
+    """
+    try:
+        done = subprocess.run(
+            ("busctl", "set-property", "org.bluez", ADAPTER,
+             "org.bluez.Adapter1", prop, "u", str(int(seconds))),
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return False
     return done.returncode == 0
 
@@ -48,10 +71,10 @@ def apply(policy):
     if not bluetoothctl("system-alias", policy["alias"]):
         failed.append("alias")
 
-    window = str(policy["pairingWindowSeconds"])
-    if not bluetoothctl("discoverable-timeout", window):
+    window = policy["pairingWindowSeconds"]
+    if not set_timeout("DiscoverableTimeout", window):
         failed.append("discoverable-timeout")
-    if not bluetoothctl("pairable-timeout", window):
+    if not set_timeout("PairableTimeout", window):
         failed.append("pairable-timeout")
 
     if not bluetoothctl("pairable", "yes" if policy["pairableAtRest"] else "no"):

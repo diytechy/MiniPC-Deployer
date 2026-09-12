@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive the ALC255 output volume from the panel's side rocker.
+"""Drive the amplifier output volume from the panel's side rocker.
 
 WHY THIS IS A DAEMON AND NOT A COMPOSITOR BINDING (2026-09-12):
 the rocker already emits standard keycodes — `Intel Virtual Buttons` declares
@@ -8,11 +8,12 @@ from a tty autologin session, not from a unit, and cage has no configurable key
 bindings. Reading evdev directly is compositor-independent and keeps working if
 the shell is restarted, which `pkill -f runtime/electron` does routinely.
 
-WHY IT CONTROLS card 0 AND NOT THE USB ADAPTER: the adapter is the *input*.
-`Master` on the ALC255 is the last stage before the headphone jack that feeds
-the amplifier, so it is the only control that is a true overall volume for the
-speakers. Turning down the adapter's capture gain instead would degrade the
-signal before the passthrough rather than after it.
+WHY IT CONTROLS THE ADAPTER AND NOT THE BUILT-IN CODEC: the amplifier is fed
+from the adapter's line output, because the ALC255 headphone jack measured
+31 dB noisier (see asound.conf). `Speaker` on the adapter is the last stage
+before that output, so it is the only control that is a true overall volume for
+the speakers. The adapter's *capture* gain must not be used for this — that
+would degrade the signal before the passthrough rather than after it.
 
 NO NEW DEPENDENCIES: the panel's installer is an offline, hash-locked
 wheelhouse, so this parses struct input_event itself rather than importing
@@ -42,11 +43,12 @@ KEY_VOLUMEUP = 115
 # Press and autorepeat both act; release does not. Holding the rocker ramps.
 ACTING_VALUES = (1, 2)
 
-# The ALC255 `Master` is a mono control with 87 steps. 3% per event is a ramp
-# that reaches either end in about a second of holding without being twitchy.
+# 3% per event is a ramp that reaches either end in about a second of holding
+# without being twitchy. The adapter's `Speaker` control spans a wide dB range
+# (20% is already -29.6 dB), so percent steps, not absolute steps, are right.
 STEP = "3%"
-CARD = "PCH"
-CONTROL = "Master"
+CARD = "ICUSBAUDIO7D"
+CONTROL = "Speaker"
 
 # Devices are matched by NAME, not by event number: `Intel Virtual Buttons` is a
 # WMI device with no stable /dev/input/by-path symlink, and its event number

@@ -14,8 +14,12 @@
 # exists. Those controls hang off node 0x19, which is declared unconnected.
 #
 # So analog input arrives on a USB audio-class adapter (C-Media CM6206,
-# 0d8c:0102, ALSA card id ICUSBAUDIO7D) and this unit passes it through to the
-# ALC255 headphone out, which is what feeds the speaker amplifier.
+# 0d8c:0102, ALSA card id ICUSBAUDIO7D) and this unit passes it through to that
+# same adapter's LINE OUTPUT, which is what feeds the speaker amplifier. The
+# built-in headphone jack was tried first and measured 31 dB noisier -- see
+# asound.conf for the loopback numbers. Using one device for both directions
+# also puts capture and playback on a single clock, so there is no drift left
+# for alsaloop to correct.
 #
 # WHY A WIRE AND NOT BLUETOOTH: the panel has no ethernet — `wlp1s0` is the only
 # interface — and its Bluetooth radio is the SAME combo part as that WiFi
@@ -53,8 +57,10 @@ ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset 'PCM Capture Source' Line
 ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 90% cap
 # -t 50000 is 50 ms of requested latency: low enough for video lip-sync, high
 # enough to survive the panel's scheduling. Raise it first if xruns appear.
-# -S 5 (auto) lets alsaloop correct the drift between the adapter's async USB
-# clock and the HDA clock; with sync off the two diverge and eventually xrun.
+# -S 5 (auto) is now nearly free: capture and playback are the same USB device
+# and share a clock, so there is no drift to correct. It is left on because it
+# costs nothing and keeps the unit correct if either end is ever moved back to
+# the built-in codec, where the two clocks really do diverge.
 # The capture side is the `linein_shared` dsnoop PCM from /etc/asound.conf, not
 # the raw hw device: alsaloop holds its capture device for as long as the
 # passthrough runs, which would lock out the amplifier-trigger level detector
@@ -65,10 +71,9 @@ ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 90% cap
 # was running.
 #
 # The PLAYBACK side is `speaker_shared` (dmix) for the same reason, and it is the
-# more urgent one: the ALC255 has exactly ONE playback substream, and the kiosk
-# plays Pandora and the local library through it. Pointing this at hw:PCH,0
-# would take that single substream and silence the kiosk for as long as the
-# passthrough ran.
+# more urgent one: the kiosk plays Pandora and the local library through the same
+# output, so pointing this at a raw hw device would take the substream and
+# silence the kiosk for as long as the passthrough ran.
 ExecStart=/usr/bin/alsaloop \
     --cdevice linein_shared \
     --pdevice speaker_shared \
@@ -96,6 +101,14 @@ LimitRTPRIO=20
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=true
+# REQUIRED BY THE CAPABILITY DROP ABOVE (measured 2026-09-12). Without
+# CAP_IPC_OWNER, root is no longer exempt from SysV IPC permission checks, and
+# the dsnoop/dmix segments carry ipc_gid=audio — so whichever client created
+# them first owns them and this one is refused:
+#     ALSA lib pcm_direct.c:2195:(_snd_pcm_direct_new) unable to create IPC shm instance
+#     capture linein_shared open error: Invalid argument
+# Joining the audio group is what the segments' group permission bits are for.
+SupplementaryGroups=audio
 
 StandardOutput=journal
 StandardError=journal

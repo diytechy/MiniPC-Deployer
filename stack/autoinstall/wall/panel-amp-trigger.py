@@ -63,6 +63,29 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
+CARDS_FILE = "/etc/wall-panel/audio-cards.env"
+
+
+def _card(key, default):
+    """Read one card id from the generated card map.
+
+    Card ids live in exactly one generated file so that swapping the USB adapter
+    is a knob rather than an edit across the ALSA configs, the mode script and
+    both daemons. The default is a fallback for a panel whose file predates it.
+    """
+    try:
+        with open(CARDS_FILE) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if value:
+                        return value
+    except OSError:
+        pass
+    return default
+
+
 def _reap(proc):
     """Terminate, then kill, then ALWAYS wait.
 
@@ -138,7 +161,7 @@ MIN_ON_SECONDS = _env("WALL_AMP_MIN_ON_SECONDS", 30.0, lo=0.0, hi=3600.0)
 MIN_OFF_SECONDS = _env("WALL_AMP_MIN_OFF_SECONDS", 10.0, lo=0.0, hi=3600.0)
 
 # The trigger output.
-TRIGGER_CARD = "PCH"
+TRIGGER_CARD = _card("WALL_AUDIO_BUILTIN_CARD", "PCH")
 TRIGGER_PCM = "trigger_out"
 # 0 Hz is all-zero samples: aplay stays alive and the relay never closes.
 TRIGGER_FREQ = _env("WALL_AMP_TONE_HZ", 1000.0, lo=50.0, hi=20000.0)

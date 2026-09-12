@@ -43,11 +43,15 @@ Wants=sound.target
 
 [Service]
 Type=simple
+# Card ids come from the generated map, with a default here so a panel whose
+# file predates it still starts. EnvironmentFile wins over Environment.
+Environment=WALL_AUDIO_ADAPTER_CARD=ICUSBAUDIO7D
+EnvironmentFile=-/etc/wall-panel/audio-cards.env
 # The adapter powers up with its capture source on `Mic` — a mono, mic-level
 # input that would clip and sum a line-level desktop feed. Selecting `Line` is
 # not optional, and it is done here rather than left to alsactl because the USB
 # card may enumerate after alsa-restore has already run.
-ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset 'PCM Capture Source' Line
+ExecStartPre=/usr/bin/amixer -c ${WALL_AUDIO_ADAPTER_CARD} sset 'PCM Capture Source' Line
 # 0% -- the BOTTOM of the range, and correct there (measured 2026-09-12 with a
 # calibrated 400 Hz staircase played from the desktop at known digital levels).
 #
@@ -74,7 +78,7 @@ ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset 'PCM Capture Source' Line
 # THE REMAINING ADJUSTMENT IS ON THE SOURCE, NOT HERE. Raising this control
 # cannot buy headroom, and lowering it is not possible. If the desktop's output
 # level changes, re-measure rather than compensating here.
-ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 0% cap
+ExecStartPre=/usr/bin/amixer -c ${WALL_AUDIO_ADAPTER_CARD} sset Line 0% cap
 # -t 50000 is 50 ms of requested latency: low enough for video lip-sync, high
 # enough to survive the panel's scheduling. Raise it first if xruns appear.
 # -S 5 (auto) is now nearly free: capture and playback are the same USB device

@@ -31,8 +31,14 @@ set -eu
 MODE_FILE=/etc/wall-panel/audio-mode
 LINK=/etc/wall-panel/audio-out.conf
 CONF_DIR=/etc/wall-panel
+# Card ids are generated into audio-cards.env by firstboot from wall.env, and
+# the defaults below are only a fallback for a panel whose file predates it.
 ADAPTER=ICUSBAUDIO7D
 BUILTIN=PCH
+# shellcheck source=/dev/null
+[ -r /etc/wall-panel/audio-cards.env ] && . /etc/wall-panel/audio-cards.env
+ADAPTER=${WALL_AUDIO_ADAPTER_CARD:-$ADAPTER}
+BUILTIN=${WALL_AUDIO_BUILTIN_CARD:-$BUILTIN}
 FAILED=0
 
 usage() { echo "usage: $0 {trigger|panel|status}" >&2; exit 2; }

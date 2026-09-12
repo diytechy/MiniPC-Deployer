@@ -63,9 +63,11 @@ STEP_FRACTION = 0.03
 # this unit.
 MODE_FILE = "/etc/wall-panel/audio-mode"
 TARGETS = {
-    "trigger": ("ICUSBAUDIO7D", "Speaker", "Speaker Playback Volume"),
-    "panel": ("PCH", "Speaker", "Speaker Playback Volume"),
+    "trigger": ("WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D"),
+    "panel": ("WALL_AUDIO_BUILTIN_CARD", "PCH"),
 }
+CONTROL = "Speaker"
+VOLUME_KCONTROL = "Speaker Playback Volume"
 # The volume control carries ONE VALUE PER CHANNEL, and `amixer sset` writes all
 # of them. That is wrong here (measured 2026-09-12): the rear pair is pinned at
 # 0 dB as the amplifier's trigger line, and a single press of the rocker dragged
@@ -82,13 +84,37 @@ def target():
             mode = fh.read().strip()
     except OSError:
         mode = "trigger"
-    return TARGETS.get(mode, TARGETS["trigger"])
+    key, fallback = TARGETS.get(mode, TARGETS["trigger"])
+    return _card(key, fallback), CONTROL, VOLUME_KCONTROL
 
 # Devices are matched by NAME, not by event number: `Intel Virtual Buttons` is a
 # WMI device with no stable /dev/input/by-path symlink, and its event number
 # moves when USB devices come and go. Any device declaring the volume keys is
 # watched, so an attached keyboard works too.
 WANTED_KEYS = {KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_MUTE}
+
+
+CARDS_FILE = "/etc/wall-panel/audio-cards.env"
+
+
+def _card(key, default):
+    """Read one card id from the generated card map.
+
+    Card ids live in exactly one generated file so that swapping the USB adapter
+    is a knob rather than an edit across the ALSA configs, the mode script and
+    both daemons. The default is a fallback for a panel whose file predates it.
+    """
+    try:
+        with open(CARDS_FILE) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(key + "="):
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if value:
+                        return value
+    except OSError:
+        pass
+    return default
 
 
 def _declares_volume_keys(sysfs_dir):

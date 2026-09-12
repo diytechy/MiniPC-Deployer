@@ -48,13 +48,17 @@ Type=simple
 # not optional, and it is done here rather than left to alsactl because the USB
 # card may enumerate after alsa-restore has already run.
 ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset 'PCM Capture Source' Line
-# 90% capture gain, measured 2026-09-12 against a full-scale tone from the
-# desktop: 85% -> -18 dBFS peak, 90% -> -15, 95% -> -10.5, 100% -> -6. 90% keeps
-# ~15 dB of headroom, which a source louder than that tone can still use.
-# The adapter's DC offset is amplified along with the signal (610 LSB at 60%,
-# 1732 at 90%), so raise this cautiously — the offset eats real headroom, and
-# the raw sample maximum, not the AC peak, is what actually clips.
-ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 90% cap
+# PROVISIONAL, AND DELIBERATELY AT THE BOTTOM OF THE RANGE (2026-09-12).
+# The source is too hot for this input: with real program material, peaks hit
+# 0 dBFS and clip at EVERY capture gain down to 20%, and even at 0% they land at
+# -0.6 dBFS with no headroom left. The gain control cannot fix a signal that is
+# already overdriving the input, so the remaining adjustment is on the source:
+# lower the PC's output, or move the cable to the rear line-out jack if it is
+# currently in a headphone output, which runs several dB hotter.
+# Re-tune this upward to put peaks near -9 dBFS once the source level is settled;
+# a mid-range setting also lands where this control has usable resolution (its
+# taper is brutal, roughly 10 dB per 5% between 55% and 65%).
+ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 0% cap
 # -t 50000 is 50 ms of requested latency: low enough for video lip-sync, high
 # enough to survive the panel's scheduling. Raise it first if xruns appear.
 # -S 5 (auto) is now nearly free: capture and playback are the same USB device

@@ -43,6 +43,14 @@ KEY_VOLUMEUP = 115
 # Press and autorepeat both act; release does not. Holding the rocker ramps.
 ACTING_VALUES = (1, 2)
 
+# THE PANEL IS MOUNTED ROTATED relative to the way the rocker was labelled, so
+# the button that sits physically uppermost on the wall is the one reporting
+# KEY_VOLUMEDOWN. Reaching up to make it quieter is wrong in the only way a
+# volume control can be wrong, so the two keycodes are swapped here. This is a
+# property of how the panel hangs, not of the hardware: if it is ever remounted
+# the right way up, set this back to False rather than rewiring anything.
+SWAP_FOR_PANEL_ORIENTATION = True
+
 # 3% per event is a ramp that reaches either end in about a second of holding
 # without being twitchy. The adapter's `Speaker` control spans a wide dB range
 # (20% is already -29.6 dB), so percent steps, not absolute steps, are right.
@@ -141,12 +149,13 @@ def main():
                 )
                 if etype != EV_KEY or value not in ACTING_VALUES:
                     continue
-                if code == KEY_VOLUMEUP:
+                if code in (KEY_VOLUMEUP, KEY_VOLUMEDOWN):
+                    louder = (code == KEY_VOLUMEUP)
+                    if SWAP_FOR_PANEL_ORIENTATION:
+                        louder = not louder
                     # `unmute` rides along so a volume press always produces
                     # sound, which is what someone reaching for the rocker means.
-                    amixer(STEP + "+", "unmute")
-                elif code == KEY_VOLUMEDOWN:
-                    amixer(STEP + "-", "unmute")
+                    amixer(STEP + ("+" if louder else "-"), "unmute")
                 elif code == KEY_MUTE:
                     amixer("toggle")
 

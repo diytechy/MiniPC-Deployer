@@ -383,6 +383,23 @@ services:
     # open). No host publish.
     expose:
       - "8787"
+    # LOOPBACK ONLY, AND THE HOST BINDING IS THE POINT. The hub-side gauge
+    # feeders (stack/ai-usage, stack/weight) are plain systemd units on the
+    # HOST, not containers, so they have to reach the tracker across the docker
+    # boundary. Without this the only address they could use is the container's
+    # own bridge IP, which compose reassigns on any recreate -- a value that
+    # cannot be written into stack/.env.example, cannot be baked into an image,
+    # and turns into permanently "unavailable" gauges the first time the stack
+    # comes up in a different order.
+    #
+    # `127.0.0.1:` is not decoration. A bare "8787:8787" publishes on every
+    # interface, which would put an identity-header-trusting API on the LAN --
+    # the tracker believes `X-Forwarded-User` because oauth2-proxy in front of
+    # it is what sets it, so anyone who could reach this port directly could
+    # name themselves anybody. Loopback keeps that trust where it was earned.
+    # Caddy is unaffected; it reaches the tracker over the bridge as before.
+    ports:
+      - "127.0.0.1:8787:8787"
     restart: unless-stopped
     healthcheck:
       # /healthz is the identity-free liveness surface in BOTH single- and

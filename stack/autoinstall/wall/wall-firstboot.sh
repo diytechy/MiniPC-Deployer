@@ -679,6 +679,40 @@ for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service 
 done
 systemctl daemon-reload >/dev/null 2>&1 || true
 
+# The trigger daemon's on/off knob is rendered into its own env file rather
+# than read from wall.env: that file is root-only and carries unrelated
+# credentials, and this service has no business seeing it.
+if [ -f /etc/wall-panel/amp-trigger.env ]; then
+    _amp_enabled=true
+    case "${WALL_AMP_TRIGGER_ENABLED:-true}" in false|FALSE|no|0) _amp_enabled=false ;; esac
+    if grep -q '^WALL_AMP_ENABLED=' /etc/wall-panel/amp-trigger.env 2>/dev/null; then
+        sed -i "s/^WALL_AMP_ENABLED=.*/WALL_AMP_ENABLED=$_amp_enabled/" /etc/wall-panel/amp-trigger.env
+    else
+        printf 'WALL_AMP_ENABLED=%s\n' "$_amp_enabled" >> /etc/wall-panel/amp-trigger.env
+    fi
+    [ "$_amp_enabled" = false ] &&
+        log "audio: WALL_AMP_TRIGGER_ENABLED is false — the tone is not emitted; the amplifier stays under whatever manual control it had"
+fi
+
+# Enablement expresses the line-in and rocker knobs, so that wall-audio-mode can
+# switch chains later without quietly turning back on something that was
+# deliberately left off.
+case "${WALL_LINE_IN_ENABLED:-true}" in
+    false|FALSE|no|0)
+        systemctl disable --now wall-line-in.service >/dev/null 2>&1 || true
+        log "audio: WALL_LINE_IN_ENABLED is false — the desktop feed is dropped; kiosk audio is unaffected" ;;
+    *)
+        enable_unit "wall-line-in.service enabled — the USB adapter's line input is passed through to the amplifier" wall-line-in.service ;;
+esac
+
+case "${WALL_VOLUME_KEYS_ENABLED:-true}" in
+    false|FALSE|no|0)
+        systemctl disable --now wall-volume-keys.service >/dev/null 2>&1 || true
+        log "audio: WALL_VOLUME_KEYS_ENABLED is false — the side rocker is inert" ;;
+    *)
+        enable_unit "wall-volume-keys.service enabled — the side rocker drives whichever output the current mode uses" wall-volume-keys.service ;;
+esac
+
 case "${WALL_AUDIO_MODE:-trigger}" in
     panel|PANEL)
         if [ -x /usr/local/sbin/wall-audio-mode ]; then
@@ -692,8 +726,6 @@ case "${WALL_AUDIO_MODE:-trigger}" in
             /usr/local/sbin/wall-audio-mode trigger >/dev/null 2>&1 ||
                 warn "audio: could not apply trigger mode"
         fi
-        enable_unit "wall-line-in.service enabled — the USB adapter's line input is passed through to the amplifier" wall-line-in.service
-        enable_unit "wall-volume-keys.service enabled — the side rocker drives the output the current mode is using" wall-volume-keys.service
         log "audio: trigger mode — the headphone jack carries the amplifier's trigger tone."
         log "audio: that jack is a CONTROL PORT, not an output; headphones there get a full-scale tone."
         ;;

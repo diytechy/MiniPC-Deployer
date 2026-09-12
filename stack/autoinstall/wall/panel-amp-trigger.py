@@ -437,6 +437,11 @@ def main():
             log("missing %s" % tool)
             return 78
 
+    if os.environ.get("WALL_AMP_ENABLED", "true").strip().lower() in ("false", "0", "no"):
+        log("WALL_AMP_ENABLED is false; idling without emitting anything")
+        while True:
+            time.sleep(3600)
+
     if current_mode() != "trigger":
         log("panel mode: the amplifier is not commanded; idling")
         # Not an error and not a restart loop -- the mode script restarts this

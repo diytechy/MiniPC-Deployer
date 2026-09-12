@@ -55,6 +55,13 @@ unit() {
     systemctl "$_action" "$@" 2>/dev/null || note_failure "systemctl $_action $*"
 }
 
+start_if_enabled() {
+    case "$(systemctl is-enabled "$1" 2>/dev/null)" in
+        disabled|masked) echo "$1 left stopped (disabled)" ;;
+        *) unit start "$1" ;;
+    esac
+}
+
 # Remove only OUR direct-plugin IPC: the segments carry ipc_gid=audio, which is
 # what distinguishes them, and shared memory is removed only when nothing is
 # attached. A blanket sweep of low-numbered keys would take unrelated services'
@@ -116,9 +123,16 @@ case "${1:-}" in
     clear_ipc
     if [ "$1" = trigger ]; then apply_trigger; else apply_panel; fi
     alsactl store 2>/dev/null || note_failure "alsactl store"
-    unit start wall-line-in.service
+    # Only start what the operator has left enabled. WALL_LINE_IN_ENABLED and
+    # WALL_VOLUME_KEYS_ENABLED are expressed as the unit's enablement, so a mode
+    # switch must not quietly re-enable something firstboot was told to leave
+    # off. The trigger daemon is different: its unit always runs and it idles on
+    # WALL_AMP_ENABLED, so that the kiosk's loopback -- which is part of the
+    # audio path in this mode, not part of the trigger -- keeps forwarding.
+    start_if_enabled wall-line-in.service
     if [ "$1" = trigger ]; then
-        unit start wall-kiosk-loop.service wall-amp-trigger.service
+        unit start wall-kiosk-loop.service
+        start_if_enabled wall-amp-trigger.service
     fi
     if [ "$FAILED" -ne 0 ]; then
         echo "mode: $1 (with $FAILED failure(s) above -- audio may be wrong)" >&2

@@ -73,6 +73,7 @@ THE FOUR ACCEPTANCE PROPERTIES, each with the symbol that enforces it:
 Implements: SR-021, LLR-005
 """
 
+import calendar
 import http.client
 import json
 import math
@@ -583,14 +584,40 @@ def build_gauge(spec, value, observed_at, window_end, window_seconds):
     }
     if window_end is not None and window_seconds is not None:
         body["window"] = {
-            "start": int(window_end) - int(window_seconds),
-            "end": int(window_end),
+            "start": rfc3339_utc(int(window_end) - int(window_seconds)),
+            "end": rfc3339_utc(int(window_end)),
             "kind": window_kind_for(window_seconds),
         }
         body["direction"] = GAUGE_DIRECTION
     if observed_at is not None:
-        body["observed_at"] = int(observed_at)
+        body["observed_at"] = rfc3339_utc(int(observed_at))
     return body
+
+
+def rfc3339_utc(epoch_seconds):
+    """Epoch seconds -> the RFC3339 UTC string the feed contract asks for.
+
+    THESE THREE FIELDS WERE EPOCH INTEGERS AND THE TRACKER REFUSED EVERY BODY.
+    IF-012 says `window{start,end}` and `observed_at` are RFC3339, and NagLight
+    declares them as Go `string`s (internal/gauge/gauge.go: "Start and End are
+    RFC3339"), so an integer is not a loose interpretation of the contract -- it
+    does not unmarshal at all. Measured on the hub 2026-09-12, posting a real
+    OpenCode reading:
+
+        HTTP 400 -> bad JSON body: json: cannot unmarshal number into Go struct
+        field Window.window.start of type string
+
+    Every gauge this feeder has ever built carried them, so the AI-usage half
+    could never have posted a single gauge -- which went unnoticed because the
+    feeder had never been run against a live tracker before today, and because
+    its own failure path turns a refused POST into exactly the "unavailable"
+    gauge a missing credential produces.
+
+    UTC with a `Z` designator, seconds precision, and no microseconds: the
+    tracker parses RFC3339 and compares against its own clock, so an offsetless
+    local string would be read as the wrong instant.
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(epoch_seconds)))
 
 
 def validate_stored_reading(entry, now):
@@ -714,13 +741,33 @@ def is_fresh(body, now):
 
     Implements: LLR-005
     """
-    stamp = body.get("observed_at")
+    # The BODY carries the wire format (RFC3339), not epoch seconds, so this
+    # reads it back rather than comparing a string to a number. It used to
+    # compare directly, which worked only because the body was wrong: the
+    # tracker declares these fields as strings and refused every integer.
+    stamp = epoch_from_rfc3339(body.get("observed_at"))
     if stamp is None:
         return False
     if stamp > now:
         return False        # a future stamp is stale by NagLight's rule.
     kind = body.get("window", {}).get("kind")
     return (now - stamp) <= STALE_HORIZON_SECONDS.get(kind, 24 * 3600)
+
+
+def epoch_from_rfc3339(text):
+    """The inverse of `rfc3339_utc`, or None for anything unparseable.
+
+    Deliberately narrow: it reads back exactly what this feeder writes. A body
+    is only ever inspected by `is_fresh`, which must fail CLOSED -- an
+    unreadable stamp is "not fresh", never "fresh", so a malformed value can
+    never make a dead source look alive.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return None
 
 
 def cycle_now(env):
@@ -1111,12 +1158,26 @@ def _claude_token(data):
     return None
 
 
+# The provider id the CLI writes, newest spelling first. `opencode-go` is what
+# the 2026-09-09 verification file carried and what this reader was built from;
+# opencode 1.18.30 writes plain `opencode`. Measured on the hub 2026-09-12: a
+# real `opencode auth login` produced {"opencode": {"type": "api", "key": ...}}
+# and this reader answered "carries no usable key" against a credential that was
+# perfectly good -- an "unavailable" gauge caused entirely by a renamed key.
+#
+# Both spellings are accepted rather than the old one replaced: a household that
+# signed in on the older CLI still has the old file and must not be broken to
+# fix the new one.
+_OPENCODE_PROVIDER_IDS = ("opencode-go", "opencode")
+
+
 def _opencode_key(data):
     if not isinstance(data, dict):
         return None
-    entry = data.get("opencode-go")
-    if isinstance(entry, dict) and isinstance(entry.get("key"), str):
-        return entry["key"]
+    for provider in _OPENCODE_PROVIDER_IDS:
+        entry = data.get(provider)
+        if isinstance(entry, dict) and isinstance(entry.get("key"), str) and entry["key"]:
+            return entry["key"]
     return None
 
 

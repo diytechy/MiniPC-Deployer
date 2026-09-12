@@ -241,7 +241,7 @@ def test_a_failed_source_reposts_the_last_true_reading_at_its_own_stamp_sr021(tm
     rec = Recorder()
     feeder.run_cycle(env, now=NOW, readers=ok_reader, poster=rec)
     assert rec.bodies[0]["value"] == 34.0
-    assert rec.bodies[0]["observed_at"] == NOW
+    assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW)
     assert feeder.is_fresh(rec.bodies[0], NOW)
 
     def broken(e):
@@ -251,7 +251,7 @@ def test_a_failed_source_reposts_the_last_true_reading_at_its_own_stamp_sr021(tm
     rec2 = Recorder()
     feeder.run_cycle(env, now=later, readers={"codex": broken}, poster=rec2)
     assert rec2.bodies[0]["value"] == 34.0, "the value must be the one that was true"
-    assert rec2.bodies[0]["observed_at"] == NOW, "stamped when it was true, not now"
+    assert rec2.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW), "stamped when it was true, not now"
     assert not feeder.is_fresh(rec2.bodies[0], later)
 
 
@@ -1090,7 +1090,7 @@ def test_corrupt_state_posts_unavailable_and_never_a_fabricated_reading_sr021(tm
     assert not feeder.is_fresh(bodies["ai-usage-codex"], NOW)
     # the untampered neighbour is still real history, reposted at its own stamp
     assert bodies["ai-usage-claude-session"]["value"] == 12.0
-    assert bodies["ai-usage-claude-session"]["observed_at"] == NOW - 7200
+    assert bodies["ai-usage-claude-session"]["observed_at"] == feeder.rfc3339_utc(NOW - 7200)
 
 
 def test_the_invariant_holds_across_every_fix_sr021(tmp_path):
@@ -1108,6 +1108,71 @@ def test_the_invariant_holds_across_every_fix_sr021(tmp_path):
     })
     fresh = {k for k, f, _ in posted if f}
     for body in rec.bodies:
-        assert (body.get("observed_at") == NOW) is (body["id"] in fresh)
+        assert (body.get("observed_at") == feeder.rfc3339_utc(NOW)) is (body["id"] in fresh)
         if body["id"] not in fresh:
             assert not feeder.is_fresh(body, NOW)
+
+
+def test_opencode_key_accepts_both_provider_spellings():
+    """The CLI renamed the provider id and it cost a real gauge.
+
+    `opencode-go` is what the 2026-09-09 verification file carried and what the
+    reader was written against; opencode 1.18.30 writes plain `opencode`.
+    Measured on the hub 2026-09-12, a genuine `opencode auth login` produced
+    {"opencode": {...}} and the feeder reported "carries no usable key" against a
+    credential that was perfectly good. Both spellings must work: a household
+    that signed in on the older CLI still has the older file.
+    """
+    assert feeder._opencode_key(
+        {"opencode-go": {"type": "api", "key": "OLD"}}) == "OLD"
+    assert feeder._opencode_key(
+        {"opencode": {"type": "api", "key": "NEW"}}) == "NEW"
+    # Newest-wins is not the point; having either is. But when both are present
+    # the documented one is preferred so behaviour is deterministic.
+    assert feeder._opencode_key(
+        {"opencode-go": {"type": "api", "key": "OLD"},
+         "opencode": {"type": "api", "key": "NEW"}}) == "OLD"
+
+
+def test_opencode_key_still_refuses_empty_and_malformed():
+    for data in ({}, {"opencode": {}}, {"opencode": {"key": ""}},
+                 {"opencode": {"key": 7}}, {"opencode": "not-a-dict"}, []):
+        assert feeder._opencode_key(data) is None, data
+
+
+def test_time_fields_are_rfc3339_strings_not_epoch_integers():
+    """The three time fields are STRINGS on the wire, and this cost every gauge.
+
+    IF-012 says `window{start,end}` and `observed_at` are RFC3339, and NagLight
+    declares them as Go strings ("Start and End are RFC3339",
+    internal/gauge/gauge.go). Sending integers is not a loose reading of the
+    contract -- it does not unmarshal. Measured against the live tracker on
+    2026-09-12 with a real OpenCode reading:
+
+        HTTP 400 -> bad JSON body: json: cannot unmarshal number into Go struct
+        field Window.window.start of type string
+
+    So the AI-usage feeder had never successfully posted a gauge. It went
+    unnoticed because it had never run against a live tracker, and because a
+    refused POST produces exactly the "unavailable" gauge a missing credential
+    does. This test is the thing that would have caught it.
+    """
+    spec = feeder.GAUGE_SPECS[0]
+    body = feeder.build_gauge(spec, 78.0, NOW, NOW + 3600, 604800)
+    for field in ("observed_at",):
+        assert isinstance(body[field], str), f"{field} must be a string"
+        assert body[field].endswith("Z"), f"{field} must be UTC with a Z designator"
+    for field in ("start", "end"):
+        value = body["window"][field]
+        assert isinstance(value, str), f"window.{field} must be a string"
+        assert value.endswith("Z"), f"window.{field} must be UTC with a Z designator"
+    # Exactly the shape NagLight parses: seconds precision, no microseconds.
+    assert body["observed_at"] == feeder.rfc3339_utc(NOW)
+    assert feeder.epoch_from_rfc3339(body["observed_at"]) == NOW
+
+
+def test_epoch_from_rfc3339_fails_closed():
+    """is_fresh must never call an unreadable stamp fresh."""
+    for bad in (None, "", 123, "yesterday", "2026-09-12", "2026-09-12T00:00:00.123Z", []):
+        assert feeder.epoch_from_rfc3339(bad) is None, bad
+    assert feeder.is_fresh({"observed_at": "not-a-time", "window": {"kind": "weekly"}}, NOW) is False

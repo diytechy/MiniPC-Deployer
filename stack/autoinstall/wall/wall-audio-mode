@@ -123,6 +123,16 @@ case "${1:-}" in
     [ "$(id -u)" -eq 0 ] || { echo "must be root" >&2; exit 1; }
     mkdir -p "$CONF_DIR"
     unit stop wall-amp-trigger.service wall-kiosk-loop.service wall-line-in.service
+    # bluealsa-aplay IS A CLIENT OF `default` LIKE THE KIOSK, and consequence 1
+    # above applies to it word for word: it resolves `default` when it opens a
+    # stream, so a connected phone would keep playing into the OLD chain after a
+    # mode switch -- into a loopback nothing forwards any more, or onto the panel
+    # speaker while still driving the amplifier's detector. Consequence 2 bites
+    # harder still: clear_ipc skips any segment with attachments, so an aplay
+    # holding the old dmix would leave a stale segment behind for the next mode
+    # to reuse, which is the failure that "looks convincingly like a signal".
+    # Stopped here and started again below, on exactly the kiosk's reasoning.
+    unit stop bluealsa-aplay.service
     restart_kiosk
     # Give the kiosk a moment to release its PCM before the segments go.
     sleep 2
@@ -136,6 +146,9 @@ case "${1:-}" in
     # WALL_AMP_ENABLED, so that the kiosk's loopback -- which is part of the
     # audio path in this mode, not part of the trigger -- keeps forwarding.
     start_if_enabled wall-line-in.service
+    # Enabled-only, like wall-line-in: a mode switch must not quietly turn
+    # Bluetooth audio back on for a panel that was configured without it.
+    start_if_enabled bluealsa-aplay.service
     if [ "$1" = trigger ]; then
         unit start wall-kiosk-loop.service
         start_if_enabled wall-amp-trigger.service
@@ -149,7 +162,7 @@ case "${1:-}" in
   status|"")
     printf 'mode:   %s\n' "$(cat "$MODE_FILE" 2>/dev/null || echo trigger)"
     printf 'chain:  %s\n' "$(readlink -f "$LINK" 2>/dev/null || echo MISSING)"
-    for u in wall-line-in wall-kiosk-loop wall-amp-trigger; do
+    for u in wall-line-in wall-kiosk-loop wall-amp-trigger bluealsa bluealsa-aplay; do
         printf '%-18s %-10s %s\n' "$u:" \
             "$(systemctl is-active "$u.service" 2>/dev/null)" \
             "$(systemctl is-enabled "$u.service" 2>/dev/null)"

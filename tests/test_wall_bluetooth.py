@@ -5,9 +5,14 @@ pairing with no user interaction whenever an adapter is pairable and an agent is
 registered. The design answer here is that BOTH of those are true only inside a
 bounded pairing window someone deliberately opened at the panel: outside one
 there is no agent and the adapter is not pairable, which are two independent
-reasons nothing can attach. So the interesting assertions below are the refusals
-and the lifecycle -- what keeps the door shut, and what guarantees the agent
-cannot outlive the window that justified it.
+reasons nothing NEW can bond. So the interesting assertions below are the
+refusals and the lifecycle -- what keeps the door shut, and what guarantees the
+agent cannot outlive the window that justified it.
+
+Said precisely, because an earlier version of this file said otherwise: the
+window bounds BONDING, not use. A device paired inside one reconnects and plays
+whenever it likes afterwards, which is what makes the panel a speaker rather
+than something you re-pair every morning, and `forget` is the only way back.
 
 The last group covers the audio path, where the whole amplifier integration
 rests on the sink playing to the ALSA `default` PCM and pinning nothing.
@@ -233,7 +238,7 @@ class FakeAgent:
         self._returncode = -9
 
 
-def test_the_agent_is_registered_with_the_configured_capability(monkeypatch):
+def test_the_agent_is_the_real_one_and_gets_the_capability_and_window(monkeypatch):
     spawned = {}
 
     def fake_popen(argv, **kwargs):
@@ -242,28 +247,46 @@ def test_the_agent_is_registered_with_the_configured_capability(monkeypatch):
 
     monkeypatch.setattr(wall_bluetooth_pairing.subprocess, "Popen", fake_popen)
     policy = render({"WALL_BLUETOOTH_PAIRING_WINDOW_SECONDS": "90"})
-    agent = wall_bluetooth_pairing.start_agent(policy)
-    assert agent is not None
-    assert spawned["argv"] == ("bluetoothctl", "--agent", "NoInputNoOutput", "--timeout", "90")
-
-
-def test_the_agents_own_timeout_matches_the_window(monkeypatch):
-    """A SECOND BOUND, deliberately. If this script is killed without running
-    its cleanup, bluetoothctl still exits on its own and the agent goes with
-    it -- the same belt-and-braces the door's two timers use."""
-    spawned = {}
-    monkeypatch.setattr(wall_bluetooth_pairing.subprocess, "Popen",
-                        lambda argv, **kw: spawned.setdefault("argv", argv) and None or FakeAgent())
-    policy = render({"WALL_BLUETOOTH_PAIRING_WINDOW_SECONDS": "300"})
-    wall_bluetooth_pairing.start_agent(policy)
+    assert wall_bluetooth_pairing.start_agent(policy) is not None
     argv = spawned["argv"]
-    assert argv[argv.index("--timeout") + 1] == str(policy["pairingWindowSeconds"])
+    # NOT bluetoothctl. `bluetoothctl --agent` registers an agent without ever
+    # calling RequestDefaultAgent, so BlueZ has one it will not route an
+    # unsolicited pairing to -- the window opens and then refuses the pairing it
+    # was opened for, with the subprocess perfectly alive throughout.
+    assert argv[0].endswith("wall-bluetooth-agent"), argv
+    assert "bluetoothctl" not in argv[0]
+    assert argv[argv.index("--capability") + 1] == "NoInputNoOutput"
+    assert argv[argv.index("--timeout") + 1] == "90"
 
 
-def test_an_agent_that_dies_at_once_is_reported_as_no_agent(monkeypatch):
-    """A capability BlueZ refuses makes bluetoothctl exit immediately, and a
-    dead agent is indistinguishable from one that never registered. Opening the
-    door in front of nothing is the failure this catches."""
+def test_the_agent_calls_request_default_agent_not_merely_register():
+    """The distinction the bluetoothctl version silently got wrong. Asserted on
+    the agent's source because the call itself needs a live BlueZ."""
+    agent_src = (WALL / "wall-bluetooth-agent.py").read_text(encoding="utf-8")
+    assert "RegisterAgent" in agent_src
+    assert "RequestDefaultAgent" in agent_src
+    # And a failure of either must abort rather than leave a half-registered
+    # agent behind a door that is about to open.
+    assert agent_src.count("sys.exit") >= 3
+    assert "UnregisterAgent" in agent_src
+
+
+def test_the_agent_refuses_non_audio_services():
+    """AuthorizeService is the one callback an ALREADY-BONDED device can reach
+    outside a window, so it is the only place the panel can still say no to a
+    device it once said yes to. Pairing to play music is not consent to become
+    a keyboard."""
+    agent_src = (WALL / "wall-bluetooth-agent.py").read_text(encoding="utf-8")
+    assert "def AuthorizeService" in agent_src
+    assert "AUDIO_UUIDS" in agent_src
+    # A2DP Sink is the one that must be allowed, or nothing plays at all.
+    assert "0000110b-0000-1000-8000-00805f9b34fb" in agent_src
+
+
+def test_an_agent_that_exits_at_once_is_reported_as_no_agent(monkeypatch):
+    """wall-bluetooth-agent exits non-zero when RegisterAgent or
+    RequestDefaultAgent is refused, so an early exit is a REAL signal here --
+    unlike the process-liveness check this replaced, which proved nothing."""
     monkeypatch.setattr(wall_bluetooth_pairing.subprocess, "Popen",
                         lambda argv, **kw: FakeAgent(dies_immediately=True))
     assert wall_bluetooth_pairing.start_agent(render({})) is None
@@ -271,7 +294,7 @@ def test_an_agent_that_dies_at_once_is_reported_as_no_agent(monkeypatch):
 
 def test_an_unstartable_agent_is_reported_rather_than_raising(monkeypatch):
     def boom(argv, **kwargs):
-        raise OSError("no bluetoothctl")
+        raise OSError("no agent installed")
 
     monkeypatch.setattr(wall_bluetooth_pairing.subprocess, "Popen", boom)
     assert wall_bluetooth_pairing.start_agent(render({})) is None
@@ -283,6 +306,40 @@ def test_stopping_the_agent_is_idempotent_and_escalates():
     assert agent.terminated
     wall_bluetooth_pairing.stop_agent(agent)  # already dead; must not raise
     wall_bluetooth_pairing.stop_agent(None)
+
+
+def test_the_agent_output_is_not_sent_to_dev_null():
+    """It logs which device paired and with what passkey, and that is the only
+    record of what a window let in. Discarding it was how the bluetoothctl
+    version also made every non-Just-Works capability unusable."""
+    src = (WALL / "wall-bluetooth-pairing.py").read_text(encoding="utf-8")
+    popen = src[src.index("agent = subprocess.Popen("):]
+    popen = popen[:popen.index("\n        )")]
+    assert "stdout=None" in popen and "stderr=None" in popen, popen
+
+
+# ── a bond outlives the window, and that has to be revocable ────────────────
+
+def test_bonded_devices_can_be_listed_and_forgotten():
+    """THE CORRECTED CLAIM. A window bounds who can BOND, not what a bonded
+    device may do afterwards -- a phone paired in a window reconnects and plays
+    whenever it likes, which is the whole point of a speaker. Earlier comments
+    here said "nothing can attach", which was simply wrong. `forget` is the only
+    way to withdraw what a window granted, so it has to exist."""
+    src = (WALL / "wall-bluetooth-pairing.py").read_text(encoding="utf-8")
+    assert "def list_bonded" in src and "def forget" in src
+    assert '"remove", mac' in src, "forget must actually remove the bond"
+    assert '"disconnect", mac' in src, "an active stream must be dropped first"
+
+
+@pytest.mark.parametrize("bad", ["", "not-a-mac", "AA:BB:CC:DD:EE", "../../etc", "AA:BB:CC:DD:EE:FF extra"])
+def test_forget_refuses_anything_that_is_not_a_mac(bad, monkeypatch):
+    calls = []
+    monkeypatch.setattr(wall_bluetooth_pairing, "bluetoothctl",
+                        lambda *a: calls.append(a) or True)
+    with pytest.raises(SystemExit):
+        wall_bluetooth_pairing.forget(bad)
+    assert calls == [], "nothing may reach bluetoothctl unvalidated"
 
 
 # ── the A2DP sink reaches the amplifier by reaching `default` ────────────────
@@ -331,3 +388,42 @@ def test_the_dmix_hostile_sandboxing_is_relaxed_with_its_reason():
     conf = _override("wall-bluealsa-aplay-override.conf")
     assert "PrivateUsers=false" in conf
     assert "RemoveIPC=false" in conf
+
+
+# ── the audio claim's two load-bearing facts ────────────────────────────────
+
+@pytest.mark.parametrize("mode_conf", ["asound-trigger-mode.conf", "asound-panel-mode.conf"])
+def test_default_is_a_plug_so_a_44_1khz_phone_can_open_it(mode_conf):
+    """WITHOUT THIS THE WHOLE FEATURE IS DEAD, and a review flagged it as
+    already dead.
+
+    dmix has ONE fixed configuration -- S16_LE/48000/2 in both mode files -- and
+    bluealsa-aplay passes the Bluetooth stream's own parameters through rather
+    than converting. A phone negotiating SBC at 44,100 Hz would therefore be
+    refused by dmix, and there would be neither audio nor a detector input.
+
+    What saves it is that `default` is not dmix: it is a `plug` WRAPPING dmix,
+    in both modes, so rate and format conversion happens before the fixed layer.
+    That is load-bearing and easy to "simplify" away, so it is pinned here.
+    """
+    conf = (WALL / mode_conf).read_text(encoding="utf-8")
+    block = conf[conf.index("pcm.!default"):]
+    block = block[:block.index("}") + 1]
+    assert "type plug" in block, block
+    # And the fixed layer really is fixed, which is why the plug is required.
+    assert "rate 48000" in conf
+
+
+def test_a_mode_switch_takes_the_bluetooth_sink_with_it():
+    """bluealsa-aplay resolves `default` when it opens a stream, exactly like
+    the kiosk, so a connected phone would keep playing into the OLD chain after
+    `wall-audio-mode panel` -- and worse, clear_ipc skips segments with
+    attachments, so an aplay holding the old dmix leaves a stale segment for the
+    next mode to reuse. That is the failure wall-audio-mode's own comments call
+    "garbage that looks convincingly like a signal"."""
+    script = (WALL / "wall-audio-mode").read_text(encoding="utf-8")
+    stop_at = script.index("unit stop wall-amp-trigger.service")
+    clear_at = script.index("clear_ipc\n", stop_at)
+    bt_stop = script.index("unit stop bluealsa-aplay.service")
+    assert stop_at < bt_stop < clear_at, "the sink must be stopped before the IPC sweep"
+    assert "start_if_enabled bluealsa-aplay.service" in script, "and started again after"

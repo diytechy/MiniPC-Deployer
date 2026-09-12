@@ -19,12 +19,20 @@ number of seconds, and closed again by BlueZ's own timeout even if nothing
 tidies up after it. `always` exists because a bench or a kiosk in a locked room
 is a real case, but it is a decision someone has to type, not one they inherit.
 
-THE AGENT LIVES AND DIES WITH THE WINDOW. wall-bluetooth-pairing registers a
-BlueZ agent (`bluetoothctl --agent`) for exactly the window's duration and stops
-it afterwards, so outside a window there is no agent AND the adapter is neither
-pairable nor discoverable -- two independent reasons nothing can attach. Inside
-one, a person is standing at the panel having deliberately opened it. That is
-the consent, in the absence of any pairing UI in the shell to display a passkey.
+THE AGENT LIVES AND DIES WITH THE WINDOW. wall-bluetooth-pairing runs
+wall-bluetooth-agent for exactly the window's duration, so outside a window
+there is no agent AND the adapter is neither pairable nor discoverable -- two
+independent reasons nothing NEW can bond. Inside one, a person is standing at
+the panel having deliberately opened it. That is the consent, in the absence of
+any pairing UI in the shell to display a passkey.
+
+SAID PRECISELY, BECAUSE AN EARLIER VERSION OF THIS COMMENT WAS WRONG: what the
+window bounds is BONDING, not use. A device that paired inside a window can
+reconnect and play afterwards at any time, with the adapter closed and no agent
+running -- which is exactly what makes the panel a speaker instead of something
+you re-pair every morning. The residual risk is that a device which got through
+one window keeps its access until someone takes it away;
+`wall-bluetooth-pairing list` and `... forget <MAC>` are the way back out.
 """
 
 import json

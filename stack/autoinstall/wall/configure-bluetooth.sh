@@ -30,6 +30,9 @@ python3 "$payload/render-bluetooth.py" "$scratch/bluetooth.json"
 install -m 0644 "$scratch/bluetooth.json" "$config_dir/bluetooth.json"
 install -m 0755 "$payload/wall-bluetooth-apply.py" /usr/local/sbin/wall-bluetooth-apply
 install -m 0755 "$payload/wall-bluetooth-pairing.py" /usr/local/sbin/wall-bluetooth-pairing
+install -m 0755 "$payload/wall-bluetooth-agent.py" /usr/local/sbin/wall-bluetooth-agent
+python3 -c 'import dbus, dbus.service, dbus.mainloop.glib; from gi.repository import GLib' || {
+    echo 'Bluetooth: python3-dbus/python3-gi missing; the pairing agent cannot run' >&2; exit 1; }
 install -m 0644 "$payload/wall-bluetooth.service" /etc/systemd/system/wall-bluetooth.service
 
 # ── The A2DP sink: what actually carries a phone's audio into the room ───────

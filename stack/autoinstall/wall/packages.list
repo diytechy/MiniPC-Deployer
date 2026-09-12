@@ -215,3 +215,12 @@ bluez
 # the ALSA `default` PCM, which is exactly where the amplifier's detector is
 # already listening -- see wall-bluealsa-aplay-override.conf.
 bluez-alsa-utils
+# The pairing agent is a real BlueZ D-Bus agent (wall-bluetooth-agent.py): it
+# must call RegisterAgent AND RequestDefaultAgent, which `bluetoothctl --agent`
+# does not do. Both of these are present on the panel today only as transitive
+# dependencies of something else, which is not a guarantee -- an offline image
+# that drops the package pulling them in would install an agent that cannot
+# import its own bindings, and the failure would be a pairing window that opens
+# and then refuses everything.
+python3-dbus
+python3-gi

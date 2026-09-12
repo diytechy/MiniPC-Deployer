@@ -307,6 +307,11 @@ def main():
         "autoinstall/wall/render-bluetooth.py",
         "autoinstall/wall/wall-bluetooth-apply.py",
         "autoinstall/wall/wall-bluetooth-pairing.py",
+        # The pairing agent proper. Shelling out to `bluetoothctl --agent` only
+        # looked like it registered one: becoming the DEFAULT agent is a
+        # separate RequestDefaultAgent call, so a window would open and then
+        # reject the pairing it was opened for.
+        "autoinstall/wall/wall-bluetooth-agent.py",
         "autoinstall/wall/wall-bluetooth.service",
         # The A2DP sink overrides. Without these bluealsa runs the stock
         # source+sink profile and bluealsa-aplay runs inside a user namespace

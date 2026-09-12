@@ -1,0 +1,99 @@
+[Unit]
+# KEEP THE CLAUDE CREDENTIAL ALIVE, and do nothing else.
+#
+# THE PROBLEM THIS EXISTS FOR. The Claude access token lives EIGHT HOURS
+# (`expiresAt` in ~/.claude/.credentials.json). Claude Code renews it out of the
+# refresh token whenever the CLI runs -- which is why an ordinary laptop signs in
+# once and works for weeks -- but the feeder never runs the CLI. It reads the
+# credential file and calls api.anthropic.com directly, and it does not so much
+# as look at `expiresAt` (grep the module: zero references). So on a hub where
+# nobody types `claude`, the token simply runs out overnight and both Claude
+# gauges go to "unavailable" with a bare 401 and no warning.
+#
+# WHY `-p "/usage"` AND NOT A PROMPT. It is a slash command handled by the CLI,
+# so it costs NOTHING: measured on the Owner's own account 2026-09-12 across
+# repeated runs, neither the request count nor the utilisation percentage moved.
+# A refresher that burned quota would corrupt the very number the gauge reports.
+#
+# It genuinely refreshes. Measured the same day against the live credential with
+# 60 seconds of life left: both tokens rotated (access and refresh) and the
+# expiry reset to a full 8.00 hours, after which the feeder read `live`.
+#
+# WHY NOT THE OBVIOUS ALTERNATIVES, each ruled out by testing rather than taste:
+#   * `claude auth status` -- does NOT refresh. It reported `loggedIn: true`
+#     against a token that was already expired, so it is not even a health check.
+#   * Teaching the FEEDER to refresh -- would make it write a vendor credential
+#     file, which is exactly what SR-021's guard structure exists to forbid, and
+#     would put that power in the component with the largest attack surface.
+#   * A hand-written OAuth refresh -- needs Claude Code's client id and token
+#     endpoint, both undocumented, and the grant appears bound to the machineID
+#     in ~/.claude.json. Reverse-engineering an auth flow into household
+#     infrastructure, for one gauge, is a bad trade.
+#
+# THE RULE THAT COST A SESSION TO LEARN, recorded so nobody repeats it: NEVER
+# run a refresh against a COPY of this credential. The refresh token is
+# single-use with rotation -- a copy that refreshes retires the live token and
+# throws the replacement away, and the Owner has to sign in again. One copy,
+# always, which is why this unit works on the real file in place.
+Description=HomeHub: keep the Claude Code credential fresh (SR-021)
+Documentation=file:///opt/homehub/stack/ai-usage/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User=/Group= arrive in a drop-in written by setup-ai-usage.sh from
+# AI_USAGE_USER_ACCOUNT, the same way the feeder's do, so the account that owns
+# the credential and the account that runs are one value.
+NoNewPrivileges=yes
+
+# THIS UNIT IS THE ONE THING ALLOWED TO WRITE THE CREDENTIAL, and that is the
+# whole reason it is a separate unit rather than a line in the feeder. The
+# feeder keeps ProtectHome=read-only and its one-path write allow-list, exactly
+# as SR-021 requires; the renewing happens here, in a process whose entire job
+# is one command, which talks to one vendor and never to the tracker.
+# `ReadWritePaths=` for the two credential paths arrives in the SAME drop-in
+# that carries User=, written by setup-ai-usage.sh from the account's real home.
+# It is not written here with `%h`, and that is not a style choice: in a SYSTEM
+# unit `%h` expands to the MANAGER's home -- /root -- not to User='s. The first
+# cut used it and systemd refused the unit outright with
+#   Failed to set up mount namespacing: /root/.claude: No such file or directory
+# (status 226/NAMESPACE), which is at least a loud failure rather than a silent
+# one. The account name already comes from one knob; so does its home.
+#
+# ProtectHome=read-only, not tmpfs: the same posture as the feeder, with exactly
+# two paths re-opened for writing. Verified as the TIGHTEST set that works --
+# `claude -p "/usage"` needs no writable ~/.cache, tested against a home that
+# offered one and a home that did not.
+ProtectHome=read-only
+
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+# The CLI and node live in /usr/local/bin; systemd's default PATH does not
+# include it. HOME is not set here -- systemd derives it from User=, which the
+# drop-in supplies, so there is still exactly one place the account is named.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# The OUTPUT IS DISCARDED ON PURPOSE. `/usage` prints the household's live
+# consumption, and this unit runs six times a day forever; persisting that to
+# the journal would write a usage history nobody asked for into the system log.
+# The gauges are where those numbers belong. Failures still surface: a non-zero
+# exit is recorded by systemd, and `systemctl status` names it.
+ExecStart=/bin/sh -c 'cd "$HOME" && exec claude -p "/usage" >/dev/null 2>&1'
+
+# A refresh that fails is not an emergency: the token is still valid until its
+# own expiry and the next run is four hours away, well inside the window. What
+# must NOT happen is a restart storm against a vendor endpoint.
+Restart=no
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

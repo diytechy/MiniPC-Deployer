@@ -1208,3 +1208,101 @@ def test_an_unknown_bucket_status_still_fails_closed():
         }}
         out = feeder.parse_opencode(body, NOW)
         assert "ai-usage-opencode-monthly" not in out, status
+
+
+# ── The Claude credential refresher (SR-021) ────────────────────────────────
+#
+# The access token lives EIGHT HOURS and the feeder never looks at `expiresAt`
+# -- it sends whatever token is in the file and lets the server decide. Claude
+# Code renews it whenever the CLI runs, which is why an ordinary laptop signs in
+# once and works for weeks; on a hub where nobody types `claude`, nothing ever
+# runs it, so the token expires overnight and both gauges 401.
+
+CLAUDE_ACCESS_TOKEN_LIFE_SECONDS = 8 * 3600   # measured twice on 2026-09-12
+
+
+def _refresh_timer():
+    return (REPO / "stack" / "ai-usage" / "homehub-claude-refresh.timer").read_text(encoding="utf-8")
+
+
+def _refresh_service():
+    return (REPO / "stack" / "ai-usage" / "homehub-claude-refresh.service").read_text(encoding="utf-8")
+
+
+def test_the_refresh_interval_must_beat_the_eight_hour_token_life():
+    """Every renewal has to land inside the token's own life or the gauges go
+    dark until a human types `claude`. Asserted, not remembered."""
+    line = [l for l in _refresh_timer().splitlines() if l.startswith("OnUnitActiveSec=")][0]
+    value = line.split("=", 1)[1].strip()
+    assert value.endswith("h"), value
+    seconds = int(value.rstrip("h")) * 3600
+    assert seconds < CLAUDE_ACCESS_TOKEN_LIFE_SECONDS, "a renewal after expiry is not a renewal"
+    # One whole missed run of margin: the hub can sleep through a cycle.
+    assert seconds * 2 <= CLAUDE_ACCESS_TOKEN_LIFE_SECONDS, "no margin for a missed run"
+
+
+def test_the_refresher_uses_the_free_slash_command_not_a_prompt():
+    """`/usage` is handled by the CLI and costs nothing -- measured across
+    repeated runs, neither the request count nor the utilisation moved. A
+    refresher that burned quota would corrupt the number the gauge reports."""
+    exec_line = [l for l in _refresh_service().splitlines() if l.startswith("ExecStart=")][0]
+    assert '"/usage"' in exec_line, exec_line
+    assert " -p " in exec_line, "must be non-interactive print mode"
+
+
+def test_the_refresher_is_persistent_but_the_feeder_is_not():
+    """A missed feeder run is one stale reading; a missed refresh is an expired
+    credential nothing on the box can recover without the Owner."""
+    assert "Persistent=true" in _refresh_timer()
+    feeder_timer = (REPO / "stack" / "ai-usage" / "homehub-ai-usage.timer").read_text(encoding="utf-8")
+    assert "Persistent=false" in feeder_timer
+
+
+def test_only_the_refresher_may_write_the_credential_not_the_feeder():
+    """The whole reason this is a separate unit. The feeder keeps
+    ProtectHome=read-only and its one-path allow-list; the renewing happens in a
+    process whose entire job is one command and which never contacts the tracker."""
+    svc = _refresh_service()
+    assert "ProtectHome=read-only" in svc, "the refresher is not a hole in the posture"
+    setup = (REPO / "stack" / "ai-usage" / "setup-ai-usage.sh").read_text(encoding="utf-8")
+    assert "ReadWritePaths=$REFRESH_HOME/.claude $REFRESH_HOME/.claude.json" in setup, (
+        "the two credential paths must be re-opened for writing, from the "
+        "account's real home")
+    feeder_unit = (REPO / "stack" / "ai-usage" / "homehub-ai-usage.service").read_text(encoding="utf-8")
+    assert "ProtectHome=read-only" in feeder_unit, "the feeder must stay read-only"
+    assert ".claude" not in feeder_unit.split("ReadWritePaths=")[-1].splitlines()[0]         if "ReadWritePaths=" in feeder_unit else True
+
+
+def test_the_refresher_never_names_the_home_with_percent_h():
+    """`%h` in a SYSTEM unit expands to the MANAGER's home -- /root -- not to
+    User='s. The first cut used it and systemd refused the unit outright:
+
+        Failed to set up mount namespacing: /root/.claude: No such file or
+        directory   (status 226/NAMESPACE)
+
+    A loud failure, but only because the path happened not to exist. The real
+    home comes from getent in setup-ai-usage.sh, from the same knob that names
+    the account."""
+    # Comments may (and do) explain the trap; DIRECTIVES may not use it.
+    directives = [l for l in _refresh_service().splitlines()
+                  if l.strip() and not l.lstrip().startswith("#")]
+    offenders = [l for l in directives if "%h" in l]
+    assert not offenders, "%%h resolves to /root in a system unit: %r" % offenders
+    setup = (REPO / "stack" / "ai-usage" / "setup-ai-usage.sh").read_text(encoding="utf-8")
+    assert 'getent passwd "$AI_USAGE_USER_ACCOUNT"' in setup
+
+
+def test_the_refresher_discards_its_output():
+    """`/usage` prints live household consumption and this runs six times a day
+    forever; the journal is not a usage history."""
+    exec_line = [l for l in _refresh_service().splitlines() if l.startswith("ExecStart=")][0]
+    assert ">/dev/null" in exec_line and "2>&1" in exec_line, exec_line
+
+
+def test_setup_installs_and_enables_the_refresher():
+    setup = (REPO / "stack" / "ai-usage" / "setup-ai-usage.sh").read_text(encoding="utf-8")
+    assert "homehub-claude-refresh.service" in setup
+    assert "homehub-claude-refresh.timer" in setup
+    assert "systemctl enable --now homehub-claude-refresh.timer" in setup
+    # It runs as the same account as the feeder, from the same single knob.
+    assert "homehub-claude-refresh.service.d" in setup

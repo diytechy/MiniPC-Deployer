@@ -1,0 +1,29 @@
+[Unit]
+Description=Refresh the Claude Code credential before it expires (SR-021)
+Documentation=file:///opt/homehub/stack/ai-usage/README.md
+
+[Timer]
+# FOUR HOURS, AGAINST AN EIGHT-HOUR TOKEN. The access token's life is 8 h
+# (`expiresAt`, measured 2026-09-12 and again after a real refresh: 8.00 h
+# exactly), so every renewal has to land inside that window or the gauges go
+# "unavailable" until a human types `claude`. Four hours is one missed run of
+# margin: the box can sleep through a cycle, or a vendor can be briefly
+# unreachable, and the token is still live when the next one fires.
+#
+# It is NOT cheaper to run this rarely. The call costs nothing -- `/usage` is a
+# slash command handled by the CLI, and neither the request count nor the
+# utilisation percentage moved across repeated runs on the Owner's own account.
+# The only cost of a shorter interval is a process start, and the only cost of
+# a longer one is the gauge going dark overnight.
+OnBootSec=3min
+OnUnitActiveSec=4h
+# Persistent, unlike the feeder's timer: a missed feeder run is one stale
+# reading, but a missed refresh is an expired credential that nothing on this
+# box can recover without the Owner. If the hub was asleep across a scheduled
+# renewal, run it on resume rather than waiting for the next slot.
+Persistent=true
+RandomizedDelaySec=300
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

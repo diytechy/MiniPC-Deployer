@@ -74,13 +74,17 @@ ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 0% cap
 # EACCES. Verified 2026-09-12 with a non-root arecord attaching while this unit
 # was running.
 #
-# The PLAYBACK side is `speaker_shared` (dmix) for the same reason, and it is the
-# more urgent one: the kiosk plays Pandora and the local library through the same
-# output, so pointing this at a raw hw device would take the substream and
-# silence the kiosk for as long as the passthrough ran.
+# The PLAYBACK side is `amp_feed` for the same reason, and it is the more urgent
+# one: the kiosk plays Pandora and the local library through the same output, so
+# pointing this at a raw hw device would take the single substream and silence
+# the kiosk for as long as the passthrough ran.
+#
+# `amp_feed` is front L/R of a 6-channel mix. The rear pair is not surround --
+# it is a control line carrying a trigger tone for the amplifier's power relay,
+# pinned at 0 dB independently of the volume rocker. See asound.conf.
 ExecStart=/usr/bin/alsaloop \
     --cdevice linein_shared \
-    --pdevice speaker_shared \
+    --pdevice amp_feed \
     --format S16_LE --rate 48000 --channels 2 \
     --tlatency 50000 --sync 5
 Restart=always

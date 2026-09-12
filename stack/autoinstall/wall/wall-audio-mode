@@ -1,0 +1,79 @@
+#!/bin/sh
+# wall-audio-mode {trigger|panel|status} — switch the panel's output chain.
+#
+# WHY THIS IS A SCRIPT AND NOT A MIXER SETTING: `pcm.!default` is static in ALSA
+# configuration, so the mode has to swap an included file. It then has to clear
+# the dmix/dsnoop IPC segments, because those keep their parameters in shared
+# memory and a segment left from the previous mode is reused rather than
+# rebuilt -- clients then read a stale layout and get garbage that looks
+# convincingly like a signal, with nothing logged anywhere.
+#
+# AUTO-MUTE STAYS DISABLED IN BOTH MODES, for opposite reasons: in trigger mode
+# so a pulled trigger cable cannot unmute the panel's own speaker into a
+# full-scale tone, and in panel mode so an inserted one cannot mute the speaker
+# that is supposed to be playing.
+set -eu
+
+MODE_FILE=/etc/wall-panel/audio-mode
+LINK=/etc/wall-panel/audio-out.conf
+CONF_DIR=/etc/wall-panel
+ADAPTER=ICUSBAUDIO7D
+BUILTIN=PCH
+
+usage() { echo "usage: $0 {trigger|panel|status}" >&2; exit 2; }
+
+clear_ipc() {
+    # Only the keys this configuration uses; other users of SysV IPC are not
+    # ours to remove.
+    for id in $(ipcs -s | awk '/0x0000/ {print $2}'); do ipcrm -s "$id" 2>/dev/null || true; done
+    for id in $(ipcs -m | awk '/0x0000/ {print $2}'); do ipcrm -m "$id" 2>/dev/null || true; done
+}
+
+apply_trigger() {
+    ln -sfn "$CONF_DIR/asound-trigger-mode.conf" "$LINK"
+    printf 'trigger\n' > "$MODE_FILE"
+    # Built-in codec: headphone jack is the control port, internal speaker silent.
+    amixer -c "$BUILTIN" -q sset 'Auto-Mute Mode' Disabled  2>/dev/null || true
+    amixer -c "$BUILTIN" -q sset Speaker mute                2>/dev/null || true
+    amixer -c "$BUILTIN" -q sset Master 100% unmute          2>/dev/null || true
+    amixer -c "$BUILTIN" -q sset Headphone 100% unmute       2>/dev/null || true
+    # Adapter carries the audio.
+    amixer -c "$ADAPTER" -q sset Speaker unmute              2>/dev/null || true
+}
+
+apply_panel() {
+    ln -sfn "$CONF_DIR/asound-panel-mode.conf" "$LINK"
+    printf 'panel\n' > "$MODE_FILE"
+    amixer -c "$BUILTIN" -q sset 'Auto-Mute Mode' Disabled   2>/dev/null || true
+    amixer -c "$BUILTIN" -q sset Master 100% unmute          2>/dev/null || true
+    amixer -c "$BUILTIN" -q sset Speaker unmute              2>/dev/null || true
+    # Muted so a trigger cable still plugged in cannot be driven, and so the
+    # amplifier is not commanded while the panel is playing its own speaker.
+    amixer -c "$BUILTIN" -q sset Headphone mute              2>/dev/null || true
+    # The adapter's line output is unpowered in this mode.
+    amixer -c "$ADAPTER" -q sset Speaker mute                2>/dev/null || true
+}
+
+case "${1:-}" in
+  trigger|panel)
+    [ "$(id -u)" -eq 0 ] || { echo "must be root" >&2; exit 1; }
+    mkdir -p "$CONF_DIR"
+    systemctl stop wall-amp-trigger.service wall-kiosk-loop.service wall-line-in.service 2>/dev/null || true
+    clear_ipc
+    [ "$1" = trigger ] && apply_trigger || apply_panel
+    alsactl store 2>/dev/null || true
+    systemctl start wall-line-in.service 2>/dev/null || true
+    if [ "$1" = trigger ]; then
+        systemctl start wall-kiosk-loop.service wall-amp-trigger.service 2>/dev/null || true
+    fi
+    echo "mode: $1"
+    ;;
+  status|"")
+    printf 'mode:   %s\n' "$(cat "$MODE_FILE" 2>/dev/null || echo trigger)"
+    printf 'chain:  %s\n' "$(readlink -f "$LINK" 2>/dev/null || echo MISSING)"
+    for u in wall-line-in wall-kiosk-loop wall-amp-trigger; do
+        printf '%-16s %s\n' "$u:" "$(systemctl is-active "$u.service" 2>/dev/null)"
+    done
+    ;;
+  *) usage ;;
+esac

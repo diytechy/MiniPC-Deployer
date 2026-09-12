@@ -55,16 +55,34 @@ SWAP_FOR_PANEL_ORIENTATION = True
 # without being twitchy. The adapter's `Speaker` control spans a wide dB range
 # (20% is already -29.6 dB), so percent steps, not absolute steps, are right.
 STEP_FRACTION = 0.03
-CARD = "ICUSBAUDIO7D"
-CONTROL = "Speaker"
+# THE ROCKER'S TARGET FOLLOWS THE OUTPUT MODE. In trigger mode the amplifier is
+# fed from the USB adapter; in panel mode the panel's own speaker is playing.
+# Adjusting the wrong card is silent -- the rocker appears dead while actually
+# moving a control nobody is listening to -- so the mode is read on every press
+# rather than captured at startup, because `wall-audio-mode` does not restart
+# this unit.
+MODE_FILE = "/etc/wall-panel/audio-mode"
+TARGETS = {
+    "trigger": ("ICUSBAUDIO7D", "Speaker", "Speaker Playback Volume"),
+    "panel": ("PCH", "Speaker", "Speaker Playback Volume"),
+}
 # The volume control carries ONE VALUE PER CHANNEL, and `amixer sset` writes all
 # of them. That is wrong here (measured 2026-09-12): the rear pair is pinned at
 # 0 dB as the amplifier's trigger line, and a single press of the rocker dragged
 # it from 197 back down to 24 with the front pair, silently disarming the
 # trigger. Only the front pair may move, so this reads the control, changes
 # indices 0 and 1, and writes every channel back.
-VOLUME_CONTROL_NAME = "Speaker Playback Volume"
 FRONT_CHANNELS = (0, 1)
+
+
+def target():
+    """(card, simple control, kcontrol name) for the output currently in use."""
+    try:
+        with open(MODE_FILE) as fh:
+            mode = fh.read().strip()
+    except OSError:
+        mode = "trigger"
+    return TARGETS.get(mode, TARGETS["trigger"])
 
 # Devices are matched by NAME, not by event number: `Intel Virtual Buttons` is a
 # WMI device with no stable /dev/input/by-path symlink, and its event number
@@ -100,20 +118,20 @@ def find_devices():
     return found
 
 
-def _run(args):
+def _run(card, args):
     """Best-effort amixer call. A failed volume nudge must never kill the daemon."""
     try:
         return subprocess.run(
-            ["/usr/bin/amixer", "-c", CARD, *args],
+            ["/usr/bin/amixer", "-c", card, *args],
             check=False, capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
         return None
 
 
-def _read_volume():
+def _read_volume(card, kcontrol):
     """Return (values, maximum) for the per-channel volume control, or None."""
-    got = _run(["cget", "name=" + VOLUME_CONTROL_NAME])
+    got = _run(card, ["cget", "name=" + kcontrol])
     if got is None or got.returncode != 0:
         return None
     values = maximum = None
@@ -135,8 +153,9 @@ def _read_volume():
 
 
 def nudge(louder):
-    """Move the front pair only, leaving the trigger channels where they are."""
-    state = _read_volume()
+    """Move the front pair only, on whichever card the current mode is using."""
+    card, control, kcontrol = target()
+    state = _read_volume(card, kcontrol)
     if state is None:
         return
     values, maximum = state
@@ -144,9 +163,9 @@ def nudge(louder):
     for i in FRONT_CHANNELS:
         if i < len(values):
             values[i] = min(maximum, max(0, values[i] + (step if louder else -step)))
-    _run(["cset", "name=" + VOLUME_CONTROL_NAME, ",".join(str(v) for v in values)])
+    _run(card, ["cset", "name=" + kcontrol, ",".join(str(v) for v in values)])
     # The mute switch is pswitch-joined, so this is one switch for every channel.
-    _run(["-q", "sset", CONTROL, "unmute"])
+    _run(card, ["-q", "sset", control, "unmute"])
 
 
 def main():
@@ -205,7 +224,8 @@ def main():
                     # silences the trigger line too and the amplifier will power
                     # down with it. That may be wanted; it is not a choice this
                     # daemon gets to make separately.
-                    _run(["-q", "sset", CONTROL, "toggle"])
+                    card, control, _ = target()
+                    _run(card, ["-q", "sset", control, "toggle"])
 
 
 if __name__ == "__main__":

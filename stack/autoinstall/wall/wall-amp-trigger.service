@@ -1,0 +1,55 @@
+# wall-amp-trigger.service — power the amplifier while audio is playing.
+#
+# Emits a tone on the ALC255 headphone jack whenever either audio source is
+# above threshold; a rectifier on the far end holds the relay closed. See
+# PANEL_AMP_AUTOPOWER.md in the HomeHub repo for the measurements, the circuit
+# and the calibration procedure.
+#
+# It needs the audio group for the dsnoop segments it reads, and it must be able
+# to drive amixer on the built-in codec -- it asserts Master and Headphone at
+# 100% on every cycle rather than inheriting them from alsactl, because a silent
+# reset would halve the trigger voltage and the amplifier would simply stop
+# switching on with nothing in any log.
+
+[Unit]
+Description=Wall panel: hold the amplifier on while audio is playing
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=sound.target wall-line-in.service
+Wants=sound.target
+
+[Service]
+Type=simple
+# Thresholds and timings live here, not in the script. Every one of them is a
+# number someone will want to change after living with it for a week. Absent
+# file or absent key falls back to the measured defaults.
+EnvironmentFile=-/etc/wall-panel/amp-trigger.env
+ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-amp-trigger.py
+Restart=always
+RestartSec=5
+# 78 = a tool it needs is missing. Restarting will not conjure one.
+SuccessExitStatus=0
+RestartPreventExitStatus=78
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# The mode file is the only thing it reads outside /usr.
+ReadOnlyPaths=/etc/wall-panel
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SupplementaryGroups=audio
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

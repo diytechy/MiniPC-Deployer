@@ -1,0 +1,46 @@
+# wall-kiosk-loop.service — forward the kiosk's audio from the loopback to the
+# real output, so the trigger detector can see it on the way past.
+#
+# WHY THE KIOSK TAKES A DETOUR AND THE PASSTHROUGH DOES NOT: the detector has to
+# know whether ANY audio is playing, and the kiosk's Pandora and local library
+# are digital -- they never reach the line input the passthrough detector
+# watches. Routing them through snd-aloop puts them somewhere readable. The
+# line-in passthrough keeps its direct path, so the extra latency lands on music
+# rather than on desktop audio where it would break lip-sync.
+#
+# Trigger mode only. `wall-audio-mode panel` stops it; there is no loopback in
+# that configuration and nothing to forward.
+
+[Unit]
+Description=Wall panel: forward kiosk audio through the detector loopback
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=sound.target
+Wants=sound.target
+ConditionPathExists=/dev/snd/pcmC2D1c
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/alsaloop \
+    --cdevice kiosk_monitor \
+    --pdevice speaker_shared \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 100000 --sync 5
+Restart=always
+RestartSec=2
+# Music, not lip-sync: a larger latency here is cheaper than an xrun.
+Nice=-5
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=15
+LimitRTPRIO=15
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+# Same reason as wall-line-in: without CAP_IPC_OWNER, root is subject to SysV
+# IPC permission checks and the dmix/dsnoop segments carry ipc_gid=audio.
+SupplementaryGroups=audio
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

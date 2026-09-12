@@ -1026,6 +1026,16 @@ def mint(args, out=None, prompt=None, auth_endpoint=AUTH_ENDPOINT,
     with open_token_for_write(token_file, token_file, state_file, state_root) as handle:
         handle.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
     handed = give_to_account(token_file, account)
+    # AND THE DIRECTORY, NOT JUST THE FILE. A 0600 token owned by the feeder is
+    # unreadable anyway if it sits inside a 0700 directory owned by root, and
+    # that is exactly what `ensure_directory` leaves behind when this tool runs
+    # under sudo -- which is how the README says to run it, because stack/.env
+    # is 0600 root:root. Measured on the hub 2026-09-12: the mint reported
+    # success, the file was correctly owned 0600, and the very next feeder run
+    # said "cannot read the token file ... (PermissionError)" because `tokens/`
+    # was drwx------ root:root. The feeder's advice on that error is "run mint",
+    # which would have rebuilt the same directory -- so the loop had no exit.
+    give_to_account(os.path.dirname(token_file) or ".", account)
     out.write("\nweight: refresh token written to %s (mode 0600%s).\n"
               % (token_file, ", owner %s" % handed if handed else ""))
     out.write("weight: the token itself was not printed, and the client secret "

@@ -3552,3 +3552,28 @@ def test_the_tick_is_stamped_by_naglights_clock_and_cannot_be_back_dated_sr022()
     # The numbers the capture proved — now they AGREE rather than trapping.
     assert feeder.local_civil_date(CAPTURED_AT, -18000) == FIXTURE_CIVIL_DAY
     assert time.strftime("%Y-%m-%d", time.gmtime(CAPTURED_AT)) == FIXTURE_UTC_DAY
+
+
+def test_mint_hands_the_token_DIRECTORY_to_the_account_too():
+    """A 0600 token the feeder owns is still unreadable inside a root 0700 dir.
+
+    `ensure_directory` creates the token directory as whoever runs the tool, and
+    the README says to run it with sudo (stack/.env is 0600 root:root). So the
+    directory came out drwx------ root:root while the file came out correctly
+    owned. Measured on the hub 2026-09-12: mint reported success and the very
+    next feeder run said "cannot read the token file ... (PermissionError)".
+    The feeder's advice for that error is "run mint", which rebuilds the same
+    directory -- a loop with no exit.
+
+    Asserted against the SOURCE, the way this suite already pins that
+    `read_secret_file` has no write mode: the hand-off is one line in a flow
+    that needs a real OAuth exchange to reach, and a mock deep enough to run it
+    would be asserting the mock.
+    """
+    source = (REPO / "stack" / "weight" / "weight_oauth.py").read_text(encoding="utf-8")
+    mint = source[source.index("handed = give_to_account(token_file"):]
+    mint = mint[:mint.index("return 0")]
+    assert "give_to_account(os.path.dirname(token_file)" in mint, (
+        "mint hands the token file to the feeder's account but not the "
+        "directory holding it; a 0700 root-owned directory makes the 0600 "
+        "token unreadable and the feeder's own remedy rebuilds it")

@@ -87,6 +87,16 @@ if [ "$MODE" = "--check-only" ]; then
     exit 0
 fi
 
+# CODEX'S WRITABLE HOME, owned by the account and holding nothing else.
+# `codex app-server` cannot run with nowhere to write -- it opens SQLite
+# databases, caches models and fetches plugins even to answer a rate-limit
+# query -- and the unit keeps ProtectHome=read-only, so $CODEX_HOME points
+# here instead. Deliberately a SIBLING of the feeder's StateDirectory, not a
+# child: the feeder's write guard bounds writes to inside StateDirectory, and
+# that bound is only meaningful while nothing in there is a credential.
+# See the note in homehub-ai-usage.service.
+install -d -m 0700 -o "$AI_USAGE_USER_ACCOUNT" -g "$AI_USAGE_USER_ACCOUNT"     /var/lib/homehub-ai-codex
+
 install -d -m 0755 "$UNIT_DIR"
 install -m 0644 "$HERE/homehub-ai-usage.service" "$UNIT_DIR/homehub-ai-usage.service"
 install -m 0644 "$HERE/homehub-ai-usage.timer"   "$UNIT_DIR/homehub-ai-usage.timer"
@@ -111,7 +121,18 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 say "AI-usage feeder installed; runs as $AI_USAGE_USER_ACCOUNT on the timer."
-say "STILL OWED BY A HUMAN: the vendor sign-ins live in that account's home"
-say "  and do not survive a reimage. A source with no credential posts"
-say "  'unavailable' - which is correct, and is not a bug to chase."
+say "STILL OWED BY A HUMAN: the vendor sign-ins do not survive a reimage, and a"
+say "  source with no credential posts 'unavailable' - correct, not a bug."
+say ""
+say "  SIGN CODEX IN WITH CODEX_HOME SET, or the unit will not find the token:"
+say "    sudo -u $AI_USAGE_USER_ACCOUNT env CODEX_HOME=/var/lib/homehub-ai-codex \\"
+say "        PATH=/usr/local/bin:/usr/bin:/bin codex login --device-auth"
+say "  The unit keeps ProtectHome=read-only, so codex writes to that directory"
+say "  and never to the account home. A sign-in done WITHOUT it lands in"
+say "  ~/.codex, which the service cannot read - the gauge then stays"
+say "  'unavailable' with the CLI insisting it is logged in."
+say ""
+say "  Claude and OpenCode are unaffected; they sign in normally:"
+say "    sudo -u $AI_USAGE_USER_ACCOUNT env HOME=~$AI_USAGE_USER_ACCOUNT \\"
+say "        PATH=/usr/local/bin:/usr/bin:/bin sh -c 'cd ~ && claude setup-token'"
 exit 0

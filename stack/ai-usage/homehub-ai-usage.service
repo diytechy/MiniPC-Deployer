@@ -39,6 +39,32 @@ StateDirectory=homehub-ai
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/homehub-ai
 
+# CODEX GETS ITS OWN WRITABLE DIRECTORY, AND IT IS NOT IN THE HOME.
+#
+# `codex app-server` is not the read-only RPC its use here suggests. Measured on
+# the hub 2026-09-12, a single rate-limit query left behind three SQLite
+# databases with live WAL files (goals/logs/memories), a 245 KB models cache, an
+# installation id, a scratch dir, and a REMOTE PLUGIN it had downloaded and
+# cached. It cannot run at all with nowhere to write: under ProtectHome=read-only
+# it died with a BrokenPipeError, which is the whole reason `ai-usage-codex` read
+# "unavailable" while `codex login status` said "Logged in using ChatGPT".
+#
+# The obvious fix -- relax ProtectHome -- is refused. That setting is the second,
+# independent line of the acceptance criterion above, and it also guards the
+# Claude and OpenCode credentials, which have nothing to do with codex. Pointing
+# $CODEX_HOME somewhere else keeps ALL of it: the home stays read-only, codex
+# still finds its own credential, and it writes only inside a directory that
+# holds nothing else. Verified under the full hardening set, including
+# ProtectHome=read-only and RestrictNamespaces, returning a real reading.
+#
+# AND IT IS OUTSIDE $STATE_DIRECTORY ON PURPOSE. The feeder's own write guard
+# bounds every write to "inside the service's own StateDirectory", which is only
+# a meaningful bound because nothing in there is a credential. Putting codex's
+# auth.json under /var/lib/homehub-ai would have quietly made the guard permit a
+# credential path. A sibling directory keeps both properties exact.
+Environment=CODEX_HOME=/var/lib/homehub-ai-codex
+ReadWritePaths=/var/lib/homehub-ai-codex
+
 EnvironmentFile=/opt/homehub/stack/.env
 # --check re-runs the identity and destination refusals as their own process,
 # under this unit's User=, so a box configured to guess an identity or to post

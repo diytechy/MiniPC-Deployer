@@ -48,16 +48,32 @@ Type=simple
 # not optional, and it is done here rather than left to alsactl because the USB
 # card may enumerate after alsa-restore has already run.
 ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset 'PCM Capture Source' Line
-# PROVISIONAL, AND DELIBERATELY AT THE BOTTOM OF THE RANGE (2026-09-12).
-# The source is too hot for this input: with real program material, peaks hit
-# 0 dBFS and clip at EVERY capture gain down to 20%, and even at 0% they land at
-# -0.6 dBFS with no headroom left. The gain control cannot fix a signal that is
-# already overdriving the input, so the remaining adjustment is on the source:
-# lower the PC's output, or move the cable to the rear line-out jack if it is
-# currently in a headphone output, which runs several dB hotter.
-# Re-tune this upward to put peaks near -9 dBFS once the source level is settled;
-# a mid-range setting also lands where this control has usable resolution (its
-# taper is brutal, roughly 10 dB per 5% between 55% and 65%).
+# 0% -- the BOTTOM of the range, and correct there (measured 2026-09-12 with a
+# calibrated 400 Hz staircase played from the desktop at known digital levels).
+#
+# This input has about +4.4 dB of gain it cannot shed, and 0% is already the
+# minimum. With the source at full output the chain measured:
+#
+#     source   panel peak   offset   step
+#       -24      -19.6       +4.4      -
+#       -18      -13.6       +4.4     6.0
+#       -12       -7.6       +4.4     6.0
+#        -6       -1.8       +4.2     5.8
+#         0       -0.3       -0.3     1.5   <-- saturating
+#
+# Linear to within 0.2 dB up to -6 dBFS, then the top step collapses: an analog
+# stage saturating, not digital clipping, so `clipped` stayed 0 and only the ear
+# noticed. Music mastered near 0 dBFS sits entirely in that region, which is
+# what made the passthrough sound distorted.
+#
+# With the desktop turned down about 13 dB the same staircase measured a
+# constant -12.9 dB offset at EVERY level including full scale, 6.0 dB steps,
+# zero clipping. Full-scale content now lands at -13 dBFS against a -83 dBFS
+# floor: about 70 dB of signal to noise, with headroom to spare.
+#
+# THE REMAINING ADJUSTMENT IS ON THE SOURCE, NOT HERE. Raising this control
+# cannot buy headroom, and lowering it is not possible. If the desktop's output
+# level changes, re-measure rather than compensating here.
 ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 0% cap
 # -t 50000 is 50 ms of requested latency: low enough for video lip-sync, high
 # enough to survive the panel's scheduling. Raise it first if xruns appear.

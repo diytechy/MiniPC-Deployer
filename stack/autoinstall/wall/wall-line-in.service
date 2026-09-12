@@ -84,7 +84,7 @@ ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 0% cap
 # pinned at 0 dB independently of the volume rocker. See asound.conf.
 ExecStart=/usr/bin/alsaloop \
     --cdevice linein_shared \
-    --pdevice amp_feed \
+    --pdevice speaker_shared \
     --format S16_LE --rate 48000 --channels 2 \
     --tlatency 50000 --sync 5
 Restart=always

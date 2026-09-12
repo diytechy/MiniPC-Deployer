@@ -54,9 +54,17 @@ SWAP_FOR_PANEL_ORIENTATION = True
 # 3% per event is a ramp that reaches either end in about a second of holding
 # without being twitchy. The adapter's `Speaker` control spans a wide dB range
 # (20% is already -29.6 dB), so percent steps, not absolute steps, are right.
-STEP = "3%"
+STEP_FRACTION = 0.03
 CARD = "ICUSBAUDIO7D"
 CONTROL = "Speaker"
+# The volume control carries ONE VALUE PER CHANNEL, and `amixer sset` writes all
+# of them. That is wrong here (measured 2026-09-12): the rear pair is pinned at
+# 0 dB as the amplifier's trigger line, and a single press of the rocker dragged
+# it from 197 back down to 24 with the front pair, silently disarming the
+# trigger. Only the front pair may move, so this reads the control, changes
+# indices 0 and 1, and writes every channel back.
+VOLUME_CONTROL_NAME = "Speaker Playback Volume"
+FRONT_CHANNELS = (0, 1)
 
 # Devices are matched by NAME, not by event number: `Intel Virtual Buttons` is a
 # WMI device with no stable /dev/input/by-path symlink, and its event number
@@ -92,18 +100,53 @@ def find_devices():
     return found
 
 
-def amixer(*args):
-    """Best-effort mixer change. A failed volume nudge must never kill the daemon."""
+def _run(args):
+    """Best-effort amixer call. A failed volume nudge must never kill the daemon."""
     try:
-        subprocess.run(
-            ["/usr/bin/amixer", "-q", "-c", CARD, "sset", CONTROL, *args],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
+        return subprocess.run(
+            ["/usr/bin/amixer", "-c", CARD, *args],
+            check=False, capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
-        pass
+        return None
+
+
+def _read_volume():
+    """Return (values, maximum) for the per-channel volume control, or None."""
+    got = _run(["cget", "name=" + VOLUME_CONTROL_NAME])
+    if got is None or got.returncode != 0:
+        return None
+    values = maximum = None
+    for line in got.stdout.splitlines():
+        line = line.strip()
+        if line.startswith(": values="):
+            try:
+                values = [int(v) for v in line[len(": values="):].split(",")]
+            except ValueError:
+                return None
+        elif "max=" in line:
+            for field in line.replace("|", ",").split(","):
+                field = field.strip()
+                if field.startswith("max=") and field[4:].isdigit():
+                    maximum = int(field[4:])
+    if not values or not maximum:
+        return None
+    return values, maximum
+
+
+def nudge(louder):
+    """Move the front pair only, leaving the trigger channels where they are."""
+    state = _read_volume()
+    if state is None:
+        return
+    values, maximum = state
+    step = max(1, int(round(maximum * STEP_FRACTION)))
+    for i in FRONT_CHANNELS:
+        if i < len(values):
+            values[i] = min(maximum, max(0, values[i] + (step if louder else -step)))
+    _run(["cset", "name=" + VOLUME_CONTROL_NAME, ",".join(str(v) for v in values)])
+    # The mute switch is pswitch-joined, so this is one switch for every channel.
+    _run(["-q", "sset", CONTROL, "unmute"])
 
 
 def main():
@@ -153,11 +196,16 @@ def main():
                     louder = (code == KEY_VOLUMEUP)
                     if SWAP_FOR_PANEL_ORIENTATION:
                         louder = not louder
-                    # `unmute` rides along so a volume press always produces
-                    # sound, which is what someone reaching for the rocker means.
-                    amixer(STEP + ("+" if louder else "-"), "unmute")
+                    # Unmuting rides along inside nudge(), so a volume press
+                    # always produces sound -- what someone reaching for the
+                    # rocker means.
+                    nudge(louder)
                 elif code == KEY_MUTE:
-                    amixer("toggle")
+                    # NOTE: the switch is joined across all channels, so this
+                    # silences the trigger line too and the amplifier will power
+                    # down with it. That may be wanted; it is not a choice this
+                    # daemon gets to make separately.
+                    _run(["-q", "sset", CONTROL, "toggle"])
 
 
 if __name__ == "__main__":

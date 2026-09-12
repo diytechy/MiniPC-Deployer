@@ -437,7 +437,7 @@ ensure_sim_ssh_key() {
 # Both images' late-commands expect the repo tree at the payload root
 # (deploy-payload/stack/...).
 #
-# TRACKED FILES ONLY, VIA `git ls-files`. This used to be `tar --exclude=.git
+# TRACKED FILES ONLY, VIA `git archive`. This used to be `tar --exclude=.git
 # --exclude=vmtest/.out .`, i.e. the whole worktree — which quietly baked every
 # GITIGNORED file into an image that is then written to a USB stick. That is not
 # theoretical: a review found `stack/provision/.token` (64 bytes, documented as
@@ -445,6 +445,41 @@ ensure_sim_ssh_key() {
 # the real stack also has a real `stack/.env` sitting right there. Both would
 # have shipped. Ignored means "not part of the deploy unit", and the payload is
 # a deploy unit.
+#
+# IT WAS `git ls-files -z | tar -c --null -T -`, AND THAT TRUSTED THE CHECKOUT.
+# `ls-files` supplies NAMES; `tar` then reads the BYTES OUT OF THE WORKTREE. So
+# the line endings in the image were whatever this box happened to have on disk,
+# and the `.gitattributes` written precisely to govern them — `* text=auto
+# eol=lf`, `*.sh text eol=lf` — had no say, because git was not the thing
+# producing the content.
+#
+# BE PRECISE ABOUT WHAT THAT DID AND DID NOT COST, because the first write-up of
+# this change overstated it. Checked 2026-09-12: every blob in this repo is LF,
+# a correct checkout therefore lands LF, and the payload this repo had already
+# built on 2026-09-06 is clean — `deploy-payload/.../wall-sync.sh` carries zero
+# CR bytes. Nothing malformed has been shown to ship through this path. What was
+# wrong was the DEPENDENCY, not an observed outcome: any checkout that does not
+# honour the attributes (`core.autocrlf=true`, an archive unpacked by a tool
+# that rewrote endings, or a worktree a script has rewritten in text mode) is
+# baked verbatim into a Linux image, and the failure that produces is a shebang
+# read as `#!/usr/bin/env python3<CR>` — exec fails with "No such file or
+# directory" naming an interpreter that is plainly installed, which is one of
+# the harder messages to trace back to a checkout. The wall panel hit exactly
+# that on wall-bluetooth-apply on 2026-09-12, through an ad-hoc file copy rather
+# than through this path.
+#
+# `git archive` removes the dependency: git IS the thing producing the content,
+# it applies .gitattributes on the way out, and the image becomes a function of
+# a revision rather than of the machine that built it.
+#
+# THE ONE BEHAVIOUR CHANGE, AND IT IS DELIBERATE: `git archive HEAD` emits
+# COMMITTED content, so an uncommitted edit to a tracked file no longer ships.
+# That is the right rule for a deploy unit — an image should be reproducible
+# from a revision — but it is a trap if it happens silently, so a dirty tree is
+# named loudly below and the build continues. It is NOT a refusal: this repo is
+# developed on Windows and checked out with CRLF, which makes `git status`
+# report tracked files as modified when nothing about them changed, so refusing
+# on dirt would block builds for the very condition being fixed here.
 #
 # Nothing the images need is untracked: the SIM `.env`, the materialised `site/`
 # files, the container image tars and the OfficeWallNaglight tarballs are all
@@ -458,12 +493,25 @@ copy_repo_into_payload() {
     mkdir -p "$payload_dir"
 
     if command -v git >/dev/null 2>&1 && repo_git "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
-        local n
+        local n dirty rev
         n=$(repo_git "$repo_root" ls-files | wc -l)
         [ "$n" -gt 0 ] || die "git ls-files returned nothing in $repo_root — refusing to build an empty payload."
-        log "copying $n TRACKED file(s) into deploy-payload/ (gitignored files are NOT baked)"
-        # -z + --null: paths with spaces are ordinary here (docs/, stack/samba/).
-        ( cd "$repo_root" && repo_git "$repo_root" ls-files -z | tar -c --null -T - ) | ( cd "$payload_dir" && tar -x )
+        rev="$(repo_git "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+        # Name what will NOT ship. See the note above for why this warns rather
+        # than refusing: a CRLF checkout reports phantom modifications.
+        dirty="$(repo_git "$repo_root" status --porcelain --untracked-files=no 2>/dev/null || true)"
+        if [ -n "$dirty" ]; then
+            log "WARNING: $repo_root has uncommitted changes to TRACKED files. The payload is"
+            log "  built from COMMITTED content ($rev), so these edits will NOT be in the image:"
+            printf '%s
+' "$dirty" | sed 's/^/    /' | while IFS= read -r line; do log "$line"; done
+            log "  (On a CRLF checkout git reports files as modified that are byte-identical in"
+            log "   the index; run 'git diff --stat' to tell a real edit from that.)"
+        fi
+        log "archiving $n TRACKED file(s) at $rev into deploy-payload/ (gitignored files are NOT baked)"
+        # `git archive`, NOT `ls-files | tar`: git applies .gitattributes here,
+        # which is the only thing that keeps eol=lf true on a Windows checkout.
+        repo_git "$repo_root" archive --format=tar HEAD | ( cd "$payload_dir" && tar -x )
     else
         log "WARNING: $repo_root is not a git checkout (or git is absent) — falling back to a"
         log "  WHOLE-WORKTREE copy. Anything gitignored and present will be BAKED INTO THE"

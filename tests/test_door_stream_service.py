@@ -313,3 +313,44 @@ def test_display_on_readies_the_idle_broker_without_starting_a_camera():
     ).lower()
     assert "ffmpeg" not in executable and "rtsp://" not in executable
     assert "systemctl start wall-door-stream.service" in start
+
+
+# ── the kiosk must be able to REACH the socket (measured 2026-09-12) ──────────
+
+def _door_unit():
+    return (WALL / "wall-door-stream.service").read_text(encoding="utf-8")
+
+
+def test_the_runtime_directory_is_traversable_by_the_kiosk():
+    """THE SOCKET WAS FINE; THE DIRECTORY AROUND IT WAS NOT.
+
+    service.sock is 0660 wall-door-stream:panel, which is the real access
+    boundary. But the directory holding it was 0750 owned by group
+    wall-door-stream, and `panel` is not in that group -- so the kiosk got
+    EACCES resolving the path and never reached the socket at all. The Door tab
+    reported "Camera unavailable" while the broker behind it ran perfectly.
+    """
+    unit = _door_unit()
+    mode = [line for line in unit.splitlines() if line.startswith("RuntimeDirectoryMode=")]
+    assert mode == ["RuntimeDirectoryMode=0751"], mode
+    # 1 in the "other" position is the whole point: search, without listing.
+    assert int(mode[0].split("=")[1], 8) & 0o001, "the kiosk cannot search the directory"
+
+
+def test_no_execstartpre_chgrp_pretends_to_grant_that_access():
+    """systemd re-applies RuntimeDirectory ownership before every exec
+    invocation in the unit, so `ExecStartPre=+/bin/chgrp panel ...` was undone
+    the instant it ran. Verified on the panel: chgrp by hand and the kiosk
+    connects; restart the service and the group is back. A line that looks like
+    it grants access and does not is worse than no line."""
+    for line in _door_unit().splitlines():
+        if line.startswith(("ExecStartPre=", "ExecStartPost=")):
+            assert "chgrp" not in line, line
+
+
+def test_the_socket_itself_still_carries_the_access_control():
+    """Loosening the directory must not have moved the boundary off the socket."""
+    unit = _door_unit()
+    assert "--allowed-group panel" in unit
+    assert "UMask=0007" in unit, "the socket must stay group-only, never world"
+    assert "Group=wall-door-stream" in unit, "the service keeps its own identity"

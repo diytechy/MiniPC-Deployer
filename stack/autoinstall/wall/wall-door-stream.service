@@ -13,7 +13,25 @@ User=wall-door-stream
 Group=wall-door-stream
 SupplementaryGroups=panel
 RuntimeDirectory=wall-door-stream
-RuntimeDirectoryMode=0750
+# 0751: TRAVERSABLE BY THE KIOSK, LISTABLE BY NOBODY.
+#
+# This was 0750 with `ExecStartPre=+/bin/chgrp panel` below it, and that chgrp
+# never survived. systemd re-applies RuntimeDirectory ownership before EVERY
+# exec invocation in the unit, so it reset the group to wall-door-stream
+# immediately after the pre-command set it to panel. Measured on the panel:
+# chgrp by hand and the kiosk connects; `systemctl restart` and the group is
+# back to wall-door-stream.
+#
+# The effect was that the socket -- correctly 0660 wall-door-stream:panel --
+# sat inside a directory the kiosk could not search, so `panel` got EACCES
+# before it ever reached the socket, and doorBridge.status()'s existsSync()
+# read plain `false`. The Door tab has reported "Camera unavailable" for its
+# whole life while the broker behind it was running perfectly.
+#
+# Directory traversal was never the security boundary here; the socket's own
+# mode is, and it is unchanged. `x` for other is the minimum that lets the
+# kiosk resolve the path, and it grants no read of the directory's contents.
+RuntimeDirectoryMode=0751
 UMask=0007
 LoadCredential=host:/run/wall-door-credentials/host
 LoadCredential=password:/run/wall-door-credentials/password
@@ -40,7 +58,9 @@ LoadCredential=motion-trigger-zone:/run/wall-door-credentials/motion-trigger-zon
 LoadCredential=motion-road-zone:/run/wall-door-credentials/motion-road-zone
 LoadCredential=motion-masks:/run/wall-door-credentials/motion-masks
 LoadCredential=motion-diagnostics:/run/wall-door-credentials/motion-diagnostics
-ExecStartPre=+/bin/chgrp panel /run/wall-door-stream
+# NO ExecStartPre chgrp here. It looked like it granted the kiosk access and it
+# did nothing at all -- see RuntimeDirectoryMode above. A privileged pre-command
+# cannot win against systemd's own directory setup, which runs after it.
 ExecStart=/usr/bin/python3 /opt/wall-panel/app/runtime/resources/app/doorstream/service.py --credential-directory %d --socket /run/wall-door-stream/service.sock --allowed-group panel
 Restart=on-failure
 RestartSec=3

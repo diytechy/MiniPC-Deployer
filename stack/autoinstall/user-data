@@ -205,6 +205,65 @@ autoinstall:
   # packages.list. A name here is in none of those.
   packages: []
 
+  # ── DIAGNOSABILITY: make a stalled install leave evidence (2026-09-11) ──────
+  # THE ETHERNET PATH IS BLIND BY CONSTRUCTION, and it cost an evening. kexec
+  # leaves no console (`nomodeset` does not save it), the installer's logs live
+  # in tmpfs and die with the power, and subiquity copies them into the target
+  # only at the END of a successful install. On 2026-09-11 a hub install stalled
+  # in curthooks for two hours: partitioned, base image extracted, then nothing
+  # - empty /boot, hostname still localhost.localdomain, no /opt/homehub. All
+  # three vantages were empty, and the SMB server logged no fault at all, so the
+  # cause could not be determined even afterwards. A failure you cannot see is a
+  # failure you get to have twice.
+  #
+  # These run in the INSTALLER environment before anything is touched, and every
+  # one of them is non-fatal by construction (`|| true`, `2>/dev/null`).
+  # INSTRUMENTATION MUST NEVER BE THE REASON AN INSTALL FAILS - a diagnostic
+  # that can break the thing it watches is worse than no diagnostic.
+  early-commands:
+    # 1. THE LIVE VANTAGE. The operator's key is already in this seed (the ssh:
+    #    section above, materialized from Personal). Reuse it for the INSTALLER's
+    #    own sshd - subiquity's `ssh:` block configures the TARGET and does
+    #    nothing for the environment the install actually runs in. With this,
+    #    a stalled install can be opened and watched:
+    #        ssh root@<box>  then  tail -f /var/log/installer/*.log
+    - |
+      {
+        seed=$(ls /autoinstall.yaml /cdrom/nocloud/user-data 2>/dev/null | head -1)
+        if [ -n "$seed" ]; then
+          mkdir -p /root/.ssh
+          grep -oE 'ssh-(ed25519|rsa) [A-Za-z0-9+/=]+' "$seed" >> /root/.ssh/authorized_keys
+          chmod 700 /root/.ssh
+          chmod 600 /root/.ssh/authorized_keys
+        fi
+        systemctl start ssh || systemctl start sshd
+      } 2>/dev/null || true
+    # 2. THE POST-MORTEM VANTAGE. Mirror the installer's own logs onto the
+    #    TARGET DISK as it goes. tmpfs dies with the power; the disk survives,
+    #    so the diagnostic shell can read what happened - which is precisely
+    #    what was missing on 2026-09-11.
+    #
+    #    HEARTBEAT IS THE POINT, not the logs. It answers the question nobody
+    #    could answer that night: is the installer ALIVE and curtin stuck, or is
+    #    the whole box dead? A timestamp that keeps advancing while curtin has
+    #    not moved separates those two, and `ps` plus the journal tail name what
+    #    it is blocked on. Writes to /target only once it exists; before that
+    #    there is nowhere durable to put anything.
+    - |
+      {
+        nohup sh -c 'while true; do
+          if [ -d /target/var/log ]; then
+            d=/target/var/log/installer-live
+            mkdir -p "$d"
+            date -u +%FT%TZ > "$d/HEARTBEAT"
+            cp -a /var/log/installer/. "$d/" 2>/dev/null
+            ps auxf > "$d/ps.txt" 2>/dev/null
+            journalctl -n 300 --no-pager > "$d/journal.txt" 2>/dev/null
+          fi
+          sleep 15
+        done' >/dev/null 2>&1 &
+      } 2>/dev/null || true
+
   # Everything site-specific happens in late-commands, which run in the installer
   # environment with the target mounted at /target. We write files INTO /target.
   #

@@ -49,14 +49,25 @@ ExecStart=/usr/local/sbin/wall-sync.sh
 # the frame flow still runs in the same pass.
 #
 # The arithmetic this number has to cover:
-#   music  mount 60 s + rsync 3000 s + unmount 30 s   = 3090 s
+#   music  mount 60 s + rsync 14400 s + unmount 30 s  = 14490 s
 #   frame  probe 4 s + mount 20 s + rsync 90 s + unmount 30 s = 144 s
-#   total worst case                                  = 3234 s
-# 3600 s leaves headroom for the manifest walks and the nm-online wait. The FIRST
-# sync copies the whole music library plus the frame set over 802.11 from a 2016
-# laptop's radio; later ones are deltas. Generous, because the failure mode of a
-# too-short timeout is a half-mirrored cache with a red unit every boot.
-TimeoutStartSec=3600
+#   total worst case                                  = 14634 s
+# 15600 s leaves headroom for the manifest walks and the nm-online wait.
+#
+# THE OLD 3600 s WAS NOT GENEROUS ENOUGH AND THE FAILURE IT PREDICTS IS THE ONE
+# THAT HAPPENED. Measured on the wall 2026-09-12: the share holds 39.8 GB in
+# 9,775 files, and a real mirror sustains 5.5 MiB/s over this link -- so a cold
+# first sync needs about 1 h 54 m and the music flow's 3000 s budget expired
+# roughly two thirds of the way through it, every run, for weeks. Because the
+# music manifest is only regenerated after a COMPLETE mirror, 26 GB sat in the
+# cache while the shell's Library stayed on whatever the last complete sync
+# described -- which was nothing. A red unit every boot, exactly as written.
+#
+# 14400 s is about 2x the measured cold-sync time, which is the headroom the
+# library needs room to grow into and a degraded link needs to survive. Later
+# runs are deltas and finish in seconds; this number only ever binds the first
+# one after a reimage or a cache wipe.
+TimeoutStartSec=15600
 # Bounded IO priority: the panel is drawing a UI and (once synced) playing music
 # while this runs, and a full first sync should not make the wall stutter.
 IOSchedulingClass=idle

@@ -46,8 +46,10 @@ ExecStart=/usr/local/sbin/wall-sync.sh --only frame
 # It matters that this is bounded at all: the frame set is a handful of rendered
 # videos, not a music library, so a run still going after two minutes is stuck,
 # not busy, and letting it stack up behind a one-minute timer is how a panel ends
-# up with fifty queued jobs. (wall-sync.service keeps its own 3600 s: the FIRST
-# music mirror really can take that long.)
+# up with fifty queued jobs. (wall-sync.service keeps its own, much larger,
+# TimeoutStartSec: the FIRST music mirror really does take hours -- measured at
+# about 1 h 54 m for 39.8 GB at 5.5 MiB/s -- and that unit carries the
+# arithmetic for it.)
 TimeoutStartSec=180
 # Same politeness as the boot sync: the panel is drawing a UI and playing music
 # while this runs, and this one runs sixty times an hour.

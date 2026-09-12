@@ -332,8 +332,19 @@ flow_spec() {
             # from a 2016 laptop's radio, so it is generous; the point of having a
             # budget at all is that a WEDGED music mount can no longer eat the
             # whole unit's TimeoutStartSec and leave the frame flow unrun.
+            #
+            # 3000 s was NOT generous enough, and a budget that a healthy first
+            # sync cannot finish inside is indistinguishable from a wedge --
+            # which is the worse failure, because the manifest is only written
+            # after a COMPLETE mirror. Measured on the wall 2026-09-12: 39.8 GB
+            # in 9,775 files, sustaining 5.5 MiB/s, so a cold mirror takes about
+            # 1 h 54 m. It expired two thirds of the way through, every run, and
+            # left 26 GB cached that the shell's Library could not see.
+            # 14400 s is roughly 2x the measured need. Keep it and
+            # wall-sync.service's TimeoutStartSec in step; that unit carries the
+            # arithmetic.
             F_MOUNT_TIMEOUT=60
-            F_RSYNC_TIMEOUT=3000
+            F_RSYNC_TIMEOUT=14400
             F_SOURCE="HOMEHUB (the AWOW) — always-on, so a refused mount is an alert"
             ;;
         frame)

@@ -6,8 +6,28 @@ not a working Bluetooth/PipeWire router yet, deliberately.
 The real-panel read-only probe on 2026-09-10 found four ALSA playback devices,
 one ALSA capture device and a Bluetooth controller with no paired devices.
 `wpctl` and `pactl` were unavailable, so it did **not** establish a PipeWire
-session, any sink/source/monitor, the built-in jack's direction, the capture
-device's physical identity, an A2DP role, or acceptable latency/coexistence.
+session, any sink/source/monitor, an A2DP role, or acceptable latency/coexistence.
+
+A codec pin dump on 2026-09-12 settled the two hardware questions that probe
+left open. The panel's codec is a Realtek **ALC255**, and **the built-in 3.5 mm
+jack is output-only** — there is no analog audio input on this box, mono or
+stereo:
+
+- the sole wired external connector is node `0x21`, `[Jack] HP Out at Ext Front`,
+  whose widget caps are `Stereo Amp-Out` with no input amp. Retasking it as a
+  line-in via `hda-verb` cannot work: the pin has no capture path in silicon;
+- every other external pin (`0x18`, `0x19`, `0x1a`, `0x1b`, `0x1e`) carries
+  pincfg `0x411111f0` — port connectivity `none`, i.e. no physical connector.
+  The pins that do have `Amp-In` are exactly the unwired ones;
+- the kernel exposes one analog jack-detect input, `HDA Intel PCH Front
+  Headphone`. The other three playback devices are HDMI/DP;
+- the single capture device is the internal digital mic, node `0x12`,
+  `[Fixed] Mic at Int` / `Conn = Digital` — not the jack.
+
+Beware one trap: `amixer` lists `Headset Mic` and `Headset Mic Boost` controls,
+so a mixer-only probe reads as though a combo jack exists. It does not — those
+controls hang off node `0x19`, which is declared unconnected. Any future
+audio-in feature therefore needs a USB sound card, not a cable.
 
 Consequently:
 

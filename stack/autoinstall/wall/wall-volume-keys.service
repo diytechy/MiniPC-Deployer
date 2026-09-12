@@ -1,0 +1,58 @@
+# wall-volume-keys.service — make the side rocker a real volume control.
+#
+# THE MEASUREMENT THIS EXISTS FOR (2026-09-12): the panel's side buttons already
+# emit standard keycodes. Parsing the KEY capability bitmaps in
+# /sys/class/input/*/device/capabilities/key found:
+#     AT Translated Set 2 keyboard    VOLUMEUP VOLUMEDOWN MUTE
+#     Intel Virtual Buttons           VOLUMEUP VOLUMEDOWN
+# so no driver work or hotkey quirk is needed — nothing was consuming them.
+#
+# It reads evdev rather than binding in the compositor because wall-kiosk.sh
+# runs Electron under cage from a tty autologin session, which offers no place
+# to put a binding and gets restarted routinely.
+#
+# It adjusts `Master` on card PCH: the last stage before the headphone jack that
+# feeds the amplifier, and therefore the only true overall speaker volume.
+
+[Unit]
+Description=Wall panel: bind the side volume rocker to the amplifier output level
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+# Reading /dev/input/event* is the whole job, so this runs as a member of the
+# input group rather than as root. DynamicUser gives it an identity that owns
+# nothing and persists nothing.
+DynamicUser=true
+SupplementaryGroups=input audio
+ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-volume-keys.py
+Restart=always
+RestartSec=3
+# 69 = no volume-key device, 77 = not permitted to read one. Both mean this
+# panel simply has no rocker to bind; that is not a degraded boot.
+SuccessExitStatus=0 69 77
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+# The mixer is reached by running amixer, and key events arrive on evdev. This
+# service never opens a socket of any kind.
+RestrictAddressFamilies=
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

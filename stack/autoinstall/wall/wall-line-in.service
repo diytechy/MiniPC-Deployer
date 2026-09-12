@@ -1,0 +1,104 @@
+# wall-line-in.service — the panel's only analog input, and why it is on USB.
+#
+# THE MEASUREMENT THIS EXISTS FOR (2026-09-12, codec pin dump on the panel):
+# the built-in 3.5 mm jack CANNOT receive audio. It is node 0x21,
+# `[Jack] HP Out at Ext Front`, whose widget caps are `Stereo Amp-Out` with no
+# input amp — so it has no capture path in silicon and `hda-verb` retasking
+# cannot invent one. Every other external pin (0x18, 0x19, 0x1a, 0x1b, 0x1e)
+# carries pincfg 0x411111f0: port connectivity `none`, no connector behind it.
+# The pins that DO have Amp-In are exactly the unwired ones. See
+# stack/panel-audio/README.md for the full dump.
+#
+# Beware the trap that makes this look unnecessary: `amixer` lists `Headset Mic`
+# and `Headset Mic Boost`, so a mixer-only probe reads as though a combo jack
+# exists. Those controls hang off node 0x19, which is declared unconnected.
+#
+# So analog input arrives on a USB audio-class adapter (C-Media CM6206,
+# 0d8c:0102, ALSA card id ICUSBAUDIO7D) and this unit passes it through to the
+# ALC255 headphone out, which is what feeds the speaker amplifier.
+#
+# WHY A WIRE AND NOT BLUETOOTH: the panel has no ethernet — `wlp1s0` is the only
+# interface — and its Bluetooth radio is the SAME combo part as that WiFi
+# (BD address C8:FF:28:15:7A:50, one digit off the WiFi MAC ...:4f). A2DP would
+# contend with the panel's only network link, and still cost ~200 ms of latency.
+# The source PC sits next to the panel, so a 3.5 mm cable costs neither.
+#
+# CARD IDS, NOT INDEXES: `hw:1` is whatever enumerated second this boot. The
+# card *ids* below are stable across reboots and re-plugs.
+
+[Unit]
+Description=Wall panel: pass the USB line-in through to the amplifier output
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=sound.target
+Wants=sound.target
+# NO ConditionPathExists HERE. It was tried and it lost a race (2026-09-12):
+# USB enumeration finished after the condition was evaluated, so a rebooted
+# panel skipped this unit with "start condition unmet" and had no passthrough
+# until someone started it by hand. 90-wall-line-in.rules device-activates it
+# instead, so the adapter's own appearance is what starts it.
+
+[Service]
+Type=simple
+# The adapter powers up with its capture source on `Mic` — a mono, mic-level
+# input that would clip and sum a line-level desktop feed. Selecting `Line` is
+# not optional, and it is done here rather than left to alsactl because the USB
+# card may enumerate after alsa-restore has already run.
+ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset 'PCM Capture Source' Line
+# 90% capture gain, measured 2026-09-12 against a full-scale tone from the
+# desktop: 85% -> -18 dBFS peak, 90% -> -15, 95% -> -10.5, 100% -> -6. 90% keeps
+# ~15 dB of headroom, which a source louder than that tone can still use.
+# The adapter's DC offset is amplified along with the signal (610 LSB at 60%,
+# 1732 at 90%), so raise this cautiously — the offset eats real headroom, and
+# the raw sample maximum, not the AC peak, is what actually clips.
+ExecStartPre=/usr/bin/amixer -c ICUSBAUDIO7D sset Line 90% cap
+# -t 50000 is 50 ms of requested latency: low enough for video lip-sync, high
+# enough to survive the panel's scheduling. Raise it first if xruns appear.
+# -S 5 (auto) lets alsaloop correct the drift between the adapter's async USB
+# clock and the HDA clock; with sync off the two diverge and eventually xrun.
+# The capture side is the `linein_shared` dsnoop PCM from /etc/asound.conf, not
+# the raw hw device: alsaloop holds its capture device for as long as the
+# passthrough runs, which would lock out the amplifier-trigger level detector
+# that must read the SAME signal to know whether audio is playing. See
+# asound.conf, and note its ipc_gid: alsaloop runs as root here, so without that
+# setting the dsnoop IPC segment is root:root and every non-root reader gets
+# EACCES. Verified 2026-09-12 with a non-root arecord attaching while this unit
+# was running.
+#
+# The PLAYBACK side is `speaker_shared` (dmix) for the same reason, and it is the
+# more urgent one: the ALC255 has exactly ONE playback substream, and the kiosk
+# plays Pandora and the local library through it. Pointing this at hw:PCH,0
+# would take that single substream and silence the kiosk for as long as the
+# passthrough ran.
+ExecStart=/usr/bin/alsaloop \
+    --cdevice linein_shared \
+    --pdevice speaker_shared \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 50000 --sync 5
+Restart=always
+RestartSec=2
+# Audio passthrough that stutters is worse than none; it is a small, steady job.
+Nice=-10
+# alsaloop asks the kernel for SCHED_RR at priority 99 and, under the default
+# service RLIMIT_RTPRIO of 0, is refused:
+#     !!!Scheduler set to Round Robin with priority 99 FAILED!
+# It then runs at normal priority and drops samples whenever something else on
+# the panel is busy. systemd places it on the realtime class instead, at a
+# priority well below the kernel's own threads — a 2-channel 48 kHz copy needs
+# almost no CPU, and giving it 99 would let a spin starve the machine. The
+# LimitRTPRIO ALONE DOES NOT HOLD IT THERE (measured 2026-09-12): the service
+# runs as root, RLIMIT_RTPRIO is not consulted for a process holding
+# CAP_SYS_NICE, and alsaloop duly reached priority 99 anyway — `chrt -p` said so.
+# Dropping the capability is what actually binds it. Root still opens /dev/snd,
+# whose nodes it owns, without CAP_DAC_OVERRIDE.
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=20
+LimitRTPRIO=20
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

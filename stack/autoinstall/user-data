@@ -263,6 +263,33 @@ autoinstall:
           sleep 15
         done' >/dev/null 2>&1 &
       } 2>/dev/null || true
+    # 3. KEEP os-prober OFF THE DATA DRIVES. This is the 2026-09-11 root cause,
+    #    caught in the act: curtin's curthooks runs `update-grub` in the target,
+    #    grub-mkconfig runs /etc/grub.d/30_os-prober, and os-prober hands every
+    #    foreign partition to `grub-mount`. On this hub that means GRUB's NTFS
+    #    driver walking a 3.6 TB Library drive -- observed at 74.6% CPU with
+    #    20m27s of CPU time accumulated, in uninterruptible sleep, with a 7.3 TB
+    #    backup drive queued behind it. It reports nothing, times out never, and
+    #    looks identical over Ethernet and USB. Two installs died here.
+    #
+    #    Detaching the disks from the INSTALLER's view is the only lever: the
+    #    scan happens inside curthooks, between curtin writing
+    #    /target/etc/default/grub and running update-grub, where there is no
+    #    hook. The kernel forgets the device; the disk is untouched and returns
+    #    on the next boot, which is why the installed system still mounts it.
+    #
+    #    THE SELECTOR IS "USB AND CARRIES NTFS", and that is deliberately exact:
+    #    the install target is NVMe (never matched), the boot medium is
+    #    iso9660/vfat (never matched), and only the data drives are NTFS. A
+    #    selector like "every USB disk" would eat the stick the installer is
+    #    running from.
+    - |
+      {
+        for disk in $(lsblk -dno NAME,TRAN | awk '$2 == "usb" { print $1 }'); do
+          lsblk -no FSTYPE "/dev/$disk" | grep -qi ntfs || continue
+          echo 1 > "/sys/block/$disk/device/delete"
+        done
+      } 2>/dev/null || true
 
   # Everything site-specific happens in late-commands, which run in the installer
   # environment with the target mounted at /target. We write files INTO /target.
@@ -277,6 +304,26 @@ autoinstall:
   # than renumbered so that 3, 3b, 4, 4b, 5 and 6 keep the identities the rest of
   # this repo refers to them by.
   late-commands:
+    # ---- 2b. Disarm os-prober ON THE INSTALLED SYSTEM -------------------------
+    # The early-command above hides the data drives from the INSTALLER. This is
+    # the other half, and without it the trap is permanent rather than
+    # install-time: `update-grub` runs on every kernel update, the drives ARE
+    # attached then, and each update would hang exactly the way the 2026-09-11
+    # installs did -- unattended, on a box nobody is watching, with no message.
+    # A hub is an appliance with no other operating system on it, so probing for
+    # one buys nothing and costs an unbounded NTFS walk.
+    #
+    # Written before anything else in late-commands: curtin has already run its
+    # own update-grub by now, so this cannot rescue the install, only every
+    # update after it. Idempotent - replaces the line if some later Ubuntu
+    # starts shipping one.
+    - |
+      {
+        f=/target/etc/default/grub
+        touch "$f"
+        sed -i '/^#*GRUB_DISABLE_OS_PROBER=/d' "$f"
+        printf 'GRUB_DISABLE_OS_PROBER=true\n' >> "$f"
+      } 2>/dev/null || true
     # ---- 3. Place the stack ---------------------------------------------------
     # The repo payload is copied by the USB-build step to /cdrom/deploy-payload
     # (a second CIDATA stick, or the remastered ISO) and picked up here into

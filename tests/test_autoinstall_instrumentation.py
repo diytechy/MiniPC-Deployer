@@ -80,3 +80,78 @@ def test_instrumentation_did_not_disturb_the_destructive_parts(autoinstall):
     assert set(autoinstall["storage"]["layout"]["match"]) <= {"serial", "path", "model", "wwn"}
     assert autoinstall["interactive-sections"] == []
     assert autoinstall["packages"] == []
+
+
+# ── os-prober: the 2026-09-11 root cause ────────────────────────────────────
+# curthooks runs `update-grub` in the target; grub-mkconfig runs
+# /etc/grub.d/30_os-prober; os-prober hands every foreign partition to
+# `grub-mount`. On the hub that is GRUB's NTFS driver walking a 3.6 TB Library
+# drive -- caught at 74.6% CPU, 20m27s of CPU time, uninterruptible sleep, with
+# a 7.3 TB backup drive queued behind it. Two installs died there, over two
+# different transports, which is why neither the share nor the network was ever
+# the variable.
+
+SELECTOR = (
+    'for disk in $(lsblk -dno NAME,TRAN | awk \'$2 == "usb" { print $1 }\'); do '
+    'lsblk -no FSTYPE "/dev/$disk" | grep -qi ntfs || continue; '
+    'echo "$disk"; done'
+)
+
+
+def _fake_lsblk(tmp_path):
+    """The hub's real layout: NTFS data drives, ISO boot stick, NVMe target."""
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / "lsblk").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-dno" ]; then\n'
+        "  printf 'sda usb\nsdb usb\nsdc usb\nnvme0n1 nvme\n'; exit 0\n"
+        "fi\n"
+        'case "$3" in\n'
+        "  /dev/sda) printf '\nntfs\n' ;;\n"
+        "  /dev/sdb) printf 'iso9660\niso9660\nvfat\next4\n' ;;\n"
+        "  /dev/sdc) printf '\nntfs\n' ;;\n"
+        "  *) printf '\n' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (d / "lsblk").chmod(0o755)
+    return d
+
+
+def test_the_detach_selector_takes_the_data_drives_and_nothing_else(tmp_path):
+    # THE SELECTOR IS THE DANGEROUS PART. "Every USB disk" would eat the stick
+    # the installer is running from; anything matching the target would eat the
+    # install. "USB and carries NTFS" is exact: NVMe is not USB, the boot medium
+    # is iso9660/vfat, and only the data drives are NTFS.
+    import os
+
+    env = dict(os.environ, PATH=f"{_fake_lsblk(tmp_path)}:{os.environ['PATH']}")
+    result = subprocess.run(
+        ["sh", "-c", SELECTOR], capture_output=True, text=True, env=env
+    )
+    picked = result.stdout.split()
+    assert picked == ["sda", "sdc"], picked
+    assert "sdb" not in picked, "would have detached the installer's own boot medium"
+    assert not any(p.startswith("nvme") for p in picked), "would have detached the target"
+
+
+def test_the_installer_detaches_ntfs_usb_disks_before_curthooks(autoinstall):
+    joined = "\n".join(autoinstall["early-commands"])
+    assert "ntfs" in joined.lower()
+    assert "/sys/block/" in joined and "device/delete" in joined
+    # Must be an EARLY command: the scan happens inside curthooks, between
+    # curtin writing /target/etc/default/grub and running update-grub, and
+    # there is no hook in between.
+    assert "device/delete" not in "\n".join(
+        c for c in autoinstall["late-commands"] if isinstance(c, str)
+    )
+
+
+def test_the_installed_system_has_os_prober_disabled_permanently(autoinstall):
+    # WITHOUT THIS THE TRAP IS PERMANENT, not install-time: update-grub runs on
+    # every kernel update, the drives ARE attached then, and each update would
+    # hang the same way -- unattended, unwatched, and silent.
+    joined = "\n".join(c for c in autoinstall["late-commands"] if isinstance(c, str))
+    assert "GRUB_DISABLE_OS_PROBER=true" in joined
+    assert "/target/etc/default/grub" in joined

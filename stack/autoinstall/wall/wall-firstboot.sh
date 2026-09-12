@@ -617,6 +617,88 @@ else
     warn "wall-park-cursor.service is not on the payload — cage's arrow stays in the middle of the wall."
 fi
 
+# ── panel audio: line input, volume rocker, amplifier trigger ───────────────
+# The built-in 3.5 mm jack CANNOT receive audio — its only wired external pin is
+# an output with no capture path in silicon — so analog input arrives on a USB
+# audio-class adapter and the built-in codec's headphone jack becomes a control
+# port carrying a trigger tone for the amplifier's relay. The full measurement
+# record is in stack/panel-audio/README.md and PANEL_AMP_AUTOPOWER.md.
+#
+# WALL_AUDIO_MODE picks the initial output chain:
+#   trigger  audio out the adapter, headphone jack drives the amplifier relay
+#   panel    everything out the panel's own speaker, amplifier not commanded
+install -d -m 0755 /etc/wall-panel
+
+for _f in asound-trigger-mode.conf asound-panel-mode.conf; do
+    if [ -f "$PAYLOAD/$_f" ]; then
+        install -m 0644 "$PAYLOAD/$_f" "/etc/wall-panel/$_f"
+    else
+        warn "audio: $_f is not on the payload — that output mode will not work."
+    fi
+done
+
+# Tunables are installed only if absent, so a re-run never discards thresholds
+# somebody arrived at by living with the thing.
+if [ -f "$PAYLOAD/amp-trigger.env" ] && [ ! -f /etc/wall-panel/amp-trigger.env ]; then
+    install -m 0644 "$PAYLOAD/amp-trigger.env" /etc/wall-panel/amp-trigger.env
+fi
+
+if [ -f "$PAYLOAD/asound.conf" ]; then
+    install -m 0644 "$PAYLOAD/asound.conf" /etc/asound.conf
+    log "audio: /etc/asound.conf installed"
+else
+    warn "audio: asound.conf is not on the payload — no dmix, so the kiosk and the"
+    warn "line-in passthrough cannot share the one playback substream this codec has."
+fi
+
+for _f in wall-audio-index.conf wall-aloop.conf; do
+    [ -f "$PAYLOAD/$_f" ] && install -m 0644 "$PAYLOAD/$_f" "/etc/modprobe.d/$_f"
+done
+# Options alone do not load a module; this is what does.
+[ -f "$PAYLOAD/wall-aloop-load.conf" ] && install -m 0644 "$PAYLOAD/wall-aloop-load.conf" /etc/modules-load.d/wall-aloop-load.conf
+
+# Device activation, because ConditionPathExists on a sound card loses the USB
+# enumeration race and a unit skipped for an unmet condition is never retried.
+if [ -f "$PAYLOAD/90-wall-line-in.rules" ]; then
+    install -m 0644 "$PAYLOAD/90-wall-line-in.rules" /etc/udev/rules.d/90-wall-line-in.rules
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+fi
+
+for _f in panel-volume-keys.py panel-amp-trigger.py; do
+    if [ -f "$PAYLOAD/$_f" ]; then
+        install -m 0755 "$PAYLOAD/$_f" "/usr/local/lib/wall-panel/$_f"
+    else
+        warn "audio: $_f is not on the payload."
+    fi
+done
+
+[ -f "$PAYLOAD/wall-audio-mode" ] && install -m 0755 "$PAYLOAD/wall-audio-mode" /usr/local/sbin/wall-audio-mode
+
+for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service; do
+    [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
+done
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+case "${WALL_AUDIO_MODE:-trigger}" in
+    panel|PANEL)
+        if [ -x /usr/local/sbin/wall-audio-mode ]; then
+            /usr/local/sbin/wall-audio-mode panel >/dev/null 2>&1 ||
+                warn "audio: could not apply panel mode"
+            log "audio: panel mode — everything out the panel's own speaker. Note this"
+            log "audio: path measured 31 dB noisier than the adapter; it is a fallback."
+        fi ;;
+    *)
+        if [ -x /usr/local/sbin/wall-audio-mode ]; then
+            /usr/local/sbin/wall-audio-mode trigger >/dev/null 2>&1 ||
+                warn "audio: could not apply trigger mode"
+        fi
+        enable_unit "wall-line-in.service enabled — the USB adapter's line input is passed through to the amplifier" wall-line-in.service
+        enable_unit "wall-volume-keys.service enabled — the side rocker drives the output the current mode is using" wall-volume-keys.service
+        log "audio: trigger mode — the headphone jack carries the amplifier's trigger tone."
+        log "audio: that jack is a CONTROL PORT, not an output; headphones there get a full-scale tone."
+        ;;
+esac
+
 # ── the camera: OFF AT THE KERNEL unless the knob says otherwise ────────────
 # WALL_CAMERA_ENABLED=false does not mean "nothing opens it". It blacklists
 # uvcvideo, so /dev/video* does not exist, nothing CAN open it, and the

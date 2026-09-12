@@ -14,9 +14,17 @@
 [Unit]
 Description=Wall panel: forward kiosk audio through the detector loopback
 Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
-After=sound.target
+After=sound.target systemd-modules-load.service
 Wants=sound.target
-ConditionPathExists=/dev/snd/pcmC2D1c
+# NO ConditionPathExists ON THE LOOPBACK NODE. The sibling line-in unit records
+# that exact pattern losing an enumeration race, and it would lose here too:
+# systemd evaluates the condition once, and a unit SKIPPED for an unmet
+# condition is not retried by Restart=. snd-aloop is loaded by
+# modules-load.d/wall-aloop-load.conf and ordered above; if it is somehow late,
+# alsaloop fails and Restart= brings it back in two seconds, which converges.
+#
+# In panel mode this unit is DISABLED by wall-audio-mode rather than relying on
+# a condition, because that mode defines no kiosk_monitor at all.
 
 [Service]
 Type=simple

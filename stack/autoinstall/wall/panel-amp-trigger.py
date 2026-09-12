@@ -63,7 +63,28 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def _env(name, default):
+def _reap(proc):
+    """Terminate, then kill, then ALWAYS wait.
+
+    A child that is killed but never waited on stays a zombie for the life of
+    this service, and this one respawns children continuously.
+    """
+    for step in (proc.terminate, proc.kill):
+        try:
+            step()
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except OSError:
+            break
+    try:
+        proc.wait(timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _env(name, default, lo=None, hi=None):
     """Tunable from /etc/wall-panel/amp-trigger.env without editing this file.
 
     Every one of these is a number someone will want to change after living with
@@ -74,32 +95,53 @@ def _env(name, default):
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         log("ignoring unparseable %s=%r" % (name, raw))
         return default
+    # Syntactic validity is not enough. nan compares false against everything,
+    # so a nan hold-off leaves the amplifier on forever and a nan attack leaves
+    # it off forever -- both silent. Infinities and negative durations do the
+    # same in other directions.
+    if not math.isfinite(value):
+        log("ignoring non-finite %s=%r" % (name, raw))
+        return default
+    if lo is not None and value < lo:
+        log("clamping %s=%r up to %g" % (name, raw, lo))
+        return lo
+    if hi is not None and value > hi:
+        log("clamping %s=%r down to %g" % (name, raw, hi))
+        return hi
+    return value
 
 
 # Thresholds on the DC-stripped RMS of the louder channel, relative to each
 # source's nominal full scale. The measured floor is -83 dBFS, so -60 sits 23 dB
 # clear of it. Hysteresis, because a single threshold chatters at the boundary.
-ON_DBFS = _env("WALL_AMP_ON_DBFS", -60.0)
-OFF_DBFS = _env("WALL_AMP_OFF_DBFS", -68.0)
+ON_DBFS = _env("WALL_AMP_ON_DBFS", -60.0, lo=-110.0, hi=0.0)
+OFF_DBFS = _env("WALL_AMP_OFF_DBFS", -68.0, lo=-110.0, hi=0.0)
+if OFF_DBFS >= ON_DBFS:
+    # Reversed or equal thresholds are not hysteresis; they are a relay that
+    # cycles while the same signal is still playing.
+    log("OFF_DBFS %.1f >= ON_DBFS %.1f; forcing 8 dB of hysteresis"
+        % (OFF_DBFS, ON_DBFS))
+    OFF_DBFS = ON_DBFS - 8.0
 
 # A click or a pop must not cycle the relay.
-ATTACK_SECONDS = _env("WALL_AMP_ATTACK_SECONDS", 0.3)
+ATTACK_SECONDS = _env("WALL_AMP_ATTACK_SECONDS", 0.3, lo=0.0, hi=60.0)
 # Gaps between tracks, dialogue pauses and quiet passages all dip below any
 # usable threshold, so the hold-off is minutes rather than seconds.
-HOLD_OFF_SECONDS = _env("WALL_AMP_HOLD_OFF_SECONDS", 240.0)
+HOLD_OFF_SECONDS = _env("WALL_AMP_HOLD_OFF_SECONDS", 240.0, lo=0.0, hi=86400.0)
 # Protect the relay contacts and the amplifier from rapid cycling whatever the
 # audio does.
-MIN_ON_SECONDS = _env("WALL_AMP_MIN_ON_SECONDS", 30.0)
-MIN_OFF_SECONDS = _env("WALL_AMP_MIN_OFF_SECONDS", 10.0)
+MIN_ON_SECONDS = _env("WALL_AMP_MIN_ON_SECONDS", 30.0, lo=0.0, hi=3600.0)
+MIN_OFF_SECONDS = _env("WALL_AMP_MIN_OFF_SECONDS", 10.0, lo=0.0, hi=3600.0)
 
 # The trigger output.
 TRIGGER_CARD = "PCH"
 TRIGGER_PCM = "trigger_out"
-TRIGGER_FREQ = _env("WALL_AMP_TONE_HZ", 1000.0)
+# 0 Hz is all-zero samples: aplay stays alive and the relay never closes.
+TRIGGER_FREQ = _env("WALL_AMP_TONE_HZ", 1000.0, lo=50.0, hi=20000.0)
 TRIGGER_AMPLITUDE = 0.99
 # 'Front Headphone Jack' -- a cable that has fallen out otherwise presents as
 # "the amplifier stopped working" with nothing anywhere to say why. The internal
@@ -107,6 +149,8 @@ TRIGGER_AMPLITUDE = 0.99
 # diagnostics rather than safety.
 JACK_CONTROL = "Front Headphone Jack"
 JACK_POLL_SECONDS = 5.0
+# Do not respawn a failing aplay on every 100 ms block.
+TONE_RETRY_SECONDS = 5.0
 
 # A source whose last block is older than this is treated as silent.
 #
@@ -125,7 +169,8 @@ def amixer(card, *args):
     try:
         return subprocess.run(["/usr/bin/amixer", "-c", card, *args],
                               check=False, capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("amixer %s %s: %s" % (card, " ".join(args), exc))
         return None
 
 
@@ -161,14 +206,30 @@ def assert_trigger_output():
 
     Not inherited from alsactl: a silent reset would halve the trigger voltage
     and the amplifier would simply stop switching on, with nothing in any log.
+
+    Failures are REPORTED, not swallowed. A muted Headphone or a renamed control
+    means this daemon can log "amplifier ON" while no trigger voltage exists at
+    all; a failure to mute Speaker can put a full-scale tone through the panel's
+    own speaker. Both are invisible unless said out loud.
     """
-    amixer(TRIGGER_CARD, "-q", "sset", "Master", "100%", "unmute")
-    amixer(TRIGGER_CARD, "-q", "sset", "Headphone", "100%", "unmute")
-    # The internal speaker stays muted and auto-mute disabled in both modes;
-    # re-asserted here so a stray mixer change cannot put a full-scale tone on
-    # the panel's own speaker.
-    amixer(TRIGGER_CARD, "-q", "sset", "Speaker", "mute")
-    amixer(TRIGGER_CARD, "-q", "sset", "Auto-Mute Mode", "Disabled")
+    ok = True
+    for args in (("sset", "Master", "100%", "unmute"),
+                 ("sset", "Headphone", "100%", "unmute"),
+                 # The internal speaker stays muted and auto-mute disabled in
+                 # both modes, re-asserted here so a stray mixer change cannot
+                 # put a full-scale tone on the panel's own speaker.
+                 ("sset", "Speaker", "mute"),
+                 ("sset", "Auto-Mute Mode", "Disabled")):
+        got = amixer(TRIGGER_CARD, "-q", *args)
+        if got is None or got.returncode != 0:
+            ok = False
+            detail = ""
+            if got is not None:
+                detail = (got.stderr or got.stdout or "").strip()
+            first = detail.splitlines()[0] if detail else "no detail"
+            log("TRIGGER PATH NOT ASSERTED: amixer %s failed: %s"
+                % (" ".join(args), first))
+    return ok
 
 
 class Level:
@@ -207,13 +268,18 @@ class Level:
                 proc = subprocess.Popen(
                     ["/usr/bin/arecord", "-D", self.pcm, "-f", "S16_LE",
                      "-r", str(RATE), "-c", str(CHANNELS), "-q", "-t", "raw"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 self.alive = True
-                backoff = 1.0
                 while not self._stop.is_set():
                     raw = proc.stdout.read(BLOCK_BYTES)
                     if not raw or len(raw) < BLOCK_BYTES:
                         break
+                    # Reset only once data has actually flowed. Resetting on a
+                    # successful Popen instead means a PCM that fails to open --
+                    # which happens inside the child, so nothing is raised here --
+                    # respawns arecord every second forever and never reaches the
+                    # backoff this loop exists to apply.
+                    backoff = 1.0
                     samples = struct.unpack("<%dh" % (len(raw) // 2), raw)
                     peak_rms = 0.0
                     for ch in range(CHANNELS):
@@ -236,10 +302,18 @@ class Level:
                 self.alive = False
                 self.dbfs = -120.0
                 if proc is not None:
+                    # ALSA reports open failures on the CHILD's stderr, so
+                    # discarding it makes a bad PCM completely silent in the
+                    # journal while the service still reports active.
                     try:
-                        proc.kill(); proc.wait(timeout=2)
-                    except (OSError, subprocess.SubprocessError):
+                        if proc.stderr is not None:
+                            err = proc.stderr.read(2048).decode("utf-8", "replace")
+                            err = err.strip()
+                            if err:
+                                log("capture %s: %s" % (self.pcm, err.splitlines()[0]))
+                    except (OSError, ValueError):
                         pass
+                    _reap(proc)
             # A source that is absent in this mode (kiosk_monitor when the
             # Loopback is not configured) must not spin.
             self._stop.wait(backoff)
@@ -277,23 +351,52 @@ class Tone:
 
     @property
     def running(self):
-        return self._proc is not None and self._proc.poll() is None
+        """Alive means aplay is up AND the feeder is still delivering.
+
+        Checking only the process leaves a hole: if the feeder thread dies
+        while aplay sits waiting on its pipe, this reads true forever and the
+        restart path never fires, so the relay opens with nothing saying why.
+        """
+        if self._proc is None or self._proc.poll() is not None:
+            return False
+        return self._thread is not None and self._thread.is_alive()
 
     def start(self):
+        """True only if the tone is actually playing.
+
+        Popen succeeding proves nothing: an ALSA open failure happens inside
+        the child, so a missing trigger_out or a busy card returned success
+        here and the caller logged 'amplifier ON' with no voltage anywhere.
+        """
         if self.running:
-            return
+            return True
         self._stop.clear()
         try:
             self._proc = subprocess.Popen(
                 ["/usr/bin/aplay", "-D", TRIGGER_PCM, "-f", "S16_LE",
                  "-r", str(RATE), "-c", str(CHANNELS), "-q", "-"],
-                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         except OSError as exc:
             log("cannot start tone: %s" % exc)
             self._proc = None
-            return
+            return False
         self._thread = threading.Thread(target=self._feed, daemon=True)
         self._thread.start()
+        # Give the child long enough to fail an ALSA open, then look.
+        try:
+            self._proc.wait(timeout=0.4)
+        except subprocess.TimeoutExpired:
+            return True
+        err = ""
+        try:
+            if self._proc.stderr is not None:
+                err = self._proc.stderr.read(2048).decode("utf-8", "replace").strip()
+        except (OSError, ValueError):
+            pass
+        log("TONE FAILED TO START on %s: %s"
+            % (TRIGGER_PCM, err.splitlines()[0] if err else "aplay exited immediately"))
+        self._proc = None
+        return False
 
     def _feed(self):
         phase = 0
@@ -325,13 +428,7 @@ class Tone:
                 proc.stdin.close()
         except OSError:
             pass
-        try:
-            proc.terminate(); proc.wait(timeout=2)
-        except (OSError, subprocess.SubprocessError):
-            try:
-                proc.kill()
-            except OSError:
-                pass
+        _reap(proc)
 
 
 def main():
@@ -362,6 +459,7 @@ def main():
     below_since = None
     changed_at = 0.0
     last_jack_poll = 0.0
+    last_tone_attempt = -1e9
     jack = True
     last_reassert = time.monotonic()
 
@@ -390,11 +488,18 @@ def main():
             if loud and jack:
                 above_since = above_since or now
                 if now - above_since >= ATTACK_SECONDS and now - changed_at >= MIN_OFF_SECONDS:
-                    on = True
-                    changed_at = now
-                    below_since = None
-                    tone.start()
-                    log("amplifier ON (%s)" % ", ".join(lv.report() for lv in levels))
+                    if now - last_tone_attempt < TONE_RETRY_SECONDS:
+                        pass
+                    elif tone.start():
+                        on = True
+                        changed_at = now
+                        below_since = None
+                        log("amplifier ON (%s)"
+                            % ", ".join(lv.report() for lv in levels))
+                    else:
+                        # Stay off and say so rather than reporting a state we
+                        # could not reach; retry on a timer, not every block.
+                        last_tone_attempt = now
             else:
                 above_since = None
         else:
@@ -413,9 +518,12 @@ def main():
                 tone.stop()
                 on = False
                 changed_at = now
-            elif on and not tone.running:
-                log("tone died; restarting")
-                tone.start()
+            elif on and not tone.running and now - last_tone_attempt >= TONE_RETRY_SECONDS:
+                last_tone_attempt = now
+                log("tone stopped unexpectedly; restarting")
+                if not tone.start():
+                    on = False
+                    changed_at = now
 
         stopping.wait(BLOCK_SECONDS)
 

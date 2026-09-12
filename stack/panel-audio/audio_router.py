@@ -22,7 +22,8 @@ import threading
 from typing import Callable, Mapping, Protocol
 
 from routing import (ALIAS, HARDWARE_ADDRESS, Device, MUTATING_METHODS,
-                     PolicyError, validate_action, validate_inventory_action)
+                     SELF_RECONCILING_METHODS, PolicyError, validate_action,
+                     validate_inventory_action)
 
 
 MAX_REQUEST_BYTES = 16_384
@@ -83,7 +84,14 @@ def _isolated_backend_entry(connection, backend: Backend, operation: str,
 
 
 class DurableMutationState:
-    """Atomic one-record mutation journal; pending state is deliberately sticky."""
+    """Atomic one-record mutation journal; pending state is deliberately sticky.
+
+    `pending` also records the METHOD that was in flight. It is not used to
+    decide whether the device changed -- nothing in the journal can know that --
+    but to decide who is entitled to answer the question. For a pairing, only an
+    operator can; for a mute, the mixer control itself can, and the broker asks
+    it. See routing.SELF_RECONCILING_METHODS and AudioRouter._reconcile.
+    """
 
     def __init__(self, path: str | None = None, generation: int = 0):
         if not _safe_integer(generation):
@@ -107,12 +115,30 @@ class DurableMutationState:
     def uncertain(self) -> bool:
         return self.data["pending"] is not None
 
+    @property
+    def pending_method(self) -> str | None:
+        """The in-flight method, or None. Absent in journals written before the
+        method was recorded, which therefore reconcile the old way: by hand."""
+        record = self.data["pending"]
+        return record.get("method") if isinstance(record, dict) else None
+
     def completed(self, signature: str) -> dict | None:
         record = self.data["completed"]
         return record["response"] if isinstance(record, dict) and record.get("signature") == signature else None
 
-    def begin(self, signature: str) -> None:
-        changed = {**self.data, "pending": {"signature": signature}}
+    def begin(self, signature: str, method: str) -> None:
+        changed = {**self.data, "pending": {"signature": signature, "method": method}}
+        self._write(changed); self.data = changed
+
+    def resolve(self) -> None:
+        """Clear a pending record that has been settled by observing the device.
+
+        Deliberately does NOT touch `generation` or `completed`. The mutation was
+        never confirmed, so it must not be reported as having landed: the client
+        keeps the generation it holds, and the truth about the device is whatever
+        the next `status` reads off it.
+        """
+        changed = {**self.data, "pending": None}
         self._write(changed); self.data = changed
 
     def finish(self, signature: str, response: dict, *, increment: bool) -> None:
@@ -256,7 +282,7 @@ class AudioBroker:
                 self._ensure_safe_result(method, cached.get("result"))
                 return cached
             if self.state.uncertain:
-                raise BrokerError("mutation_uncertain", "previous mutation requires operator reconciliation")
+                self._reconcile()
             if request_generation != self.generation:
                 raise BrokerError("stale_generation", "request generation is stale")
             if self.generation >= JS_SAFE_INTEGER:
@@ -268,7 +294,7 @@ class AudioBroker:
                     any(not isinstance(device, Device) for device in inventory)):
                 raise BrokerError("unsafe_backend_result", "backend inventory is invalid")
             validate_inventory_action(method, params, inventory)
-            self.state.begin(signature)
+            self.state.begin(signature, method)
             # Once intent is durable, no backend exception proves that the
             # device remained unchanged. Leave pending sticky for reconciliation.
             result = self._backend_call("call", method, params)
@@ -281,6 +307,22 @@ class AudioBroker:
             return response
         finally:
             self._mutation_lock.release()
+
+    def _reconcile(self) -> None:
+        """Settle a pending journal entry, or refuse until an operator does.
+
+        Called with the mutation lock held. Raises mutation_uncertain unless the
+        in-flight method was one whose true state can simply be read back, in
+        which case observing the device IS the reconciliation and the entry is
+        cleared. An observation that itself fails leaves the entry pending --
+        failing to look is not the same as having looked.
+        """
+        method = self.state.pending_method
+        if method not in SELF_RECONCILING_METHODS:
+            raise BrokerError("mutation_uncertain", "previous mutation requires operator reconciliation")
+        observed = self._backend_call("call", "status", {})
+        self._ensure_safe_result("status", observed)
+        self.state.resolve()
 
     def _backend_call(self, operation: str, method: str | None = None,
                       params: Mapping[str, object] | None = None) -> object:
@@ -366,7 +408,14 @@ class AudioBroker:
         if not isinstance(value, dict):
             raise BrokerError("unsafe_backend_result", "backend result has wrong type")
         if method == "status":
-            if set(value) != {"protocolVersion", "available", "reason", "devices", "route", "visualizer"}:
+            # `mute` is OPTIONAL where every other field is exact. A backend that
+            # predates mute, or one on a panel whose output has no switch to
+            # throw, omits it and stays valid; absent means "this panel cannot
+            # tell you", which the shell must render differently from "not
+            # muted". Making it required would have invalidated every existing
+            # backend for a field most of them cannot answer.
+            required = {"protocolVersion", "available", "reason", "devices", "route", "visualizer"}
+            if not required <= set(value) or set(value) - required - {"mute"}:
                 raise BrokerError("unsafe_backend_result", "status fields are not exact")
             if value["protocolVersion"] != 1 or not isinstance(value["available"], bool):
                 raise BrokerError("unsafe_backend_result", "status version or availability is invalid")
@@ -384,6 +433,12 @@ class AudioBroker:
                 raise BrokerError("unsafe_backend_result", "visualizer availability is invalid")
             if "active" in visualizer and not isinstance(visualizer["active"], bool):
                 raise BrokerError("unsafe_backend_result", "visualizer activity is invalid")
+            if "mute" in value:
+                mute = value["mute"]
+                if not isinstance(mute, dict) or set(mute) != {"supported", "muted"}:
+                    raise BrokerError("unsafe_backend_result", "mute status is invalid")
+                if not isinstance(mute["supported"], bool) or not isinstance(mute["muted"], bool):
+                    raise BrokerError("unsafe_backend_result", "mute state is invalid")
         elif method == "telemetry":
             if value == {"available": False}:
                 return

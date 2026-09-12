@@ -15,9 +15,22 @@ from typing import Iterable, Mapping
 ALIAS = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 MUTATING_METHODS = frozenset(
     {"discover", "cancel", "pair", "connect", "disconnect", "forget",
-     "select_input", "select_output", "set_visualizer"}
+     "select_input", "select_output", "set_visualizer", "set_mute"}
 )
 METHODS = MUTATING_METHODS | {"status", "telemetry"}
+
+# SELF-RECONCILING MUTATIONS: journaled, but never sticky.
+#
+# Every other mutation leaves the world genuinely unknown if it dies mid-flight
+# -- a half-finished pairing is why `pending` is sticky and why an operator has
+# to reconcile it by hand. Mute is not like that. It is idempotent, it is one
+# boolean, and the truthful answer can be read straight back off the mixer
+# control. A broker that refused every later routing change because one mute tap
+# timed out would be trading a real capability for no information at all.
+#
+# So a pending entry for one of these is resolved by OBSERVING the device rather
+# than by trusting the journal or an operator. See AudioRouter._reconcile.
+SELF_RECONCILING_METHODS = frozenset({"set_mute"})
 HARDWARE_ADDRESS = re.compile(
     r"(?i)(?<![0-9a-f])(?:(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|"
     r"(?:[0-9a-f]{2}_){5}[0-9a-f]{2}|(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}|"
@@ -60,6 +73,7 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         "disconnect": {"alias"}, "forget": {"alias"},
         "select_input": {"alias", "explicit"}, "select_output": {"alias"},
         "set_visualizer": {"enabled"},
+        "set_mute": {"muted"},
     }[method]
     if set(params) - allowed:
         raise PolicyError("unknown parameter")
@@ -77,6 +91,10 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
             raise PolicyError("discovery timeout outside 1..120 seconds")
     if method == "set_visualizer" and not isinstance(params.get("enabled"), bool):
         raise PolicyError("enabled must be boolean")
+    # `muted` is required, not defaulted: a mute request that forgot to say which
+    # way is a caller bug, and guessing it would silently toggle the room.
+    if method == "set_mute" and not isinstance(params.get("muted"), bool):
+        raise PolicyError("muted must be boolean")
     if method == "pair" and "confirmation" in params:
         confirmation = params["confirmation"]
         if (not isinstance(confirmation, str) or not 1 <= len(confirmation) <= 16 or

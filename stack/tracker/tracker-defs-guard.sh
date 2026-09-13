@@ -35,19 +35,34 @@
 #            first thing you want to know when a lane goes quiet.
 #
 # BANDS
-#   green   the inventory matches the baseline exactly
-#   yellow  it GREW (definitions were added — refresh the baseline), or there is
-#           no baseline yet to compare against
-#   red     it SHRANK, the definitions directory is missing/empty, or the volume
-#           cannot be found at all
+#   green   the inventory matches the baseline exactly, OR it only GREW and the
+#           baseline was refreshed automatically (see GROWTH, below)
+#   yellow  there is no baseline yet, the baseline is corrupt or carries no
+#           inventory record, or the set changed in a way that is neither pure
+#           growth nor a removal (a user directory came or went)
+#   red     anything DISAPPEARED — a file, an item id, or the whole definitions
+#           directory — or the volume cannot be found at all
+#
+# GROWTH SELF-ACCEPTS; SHRINKAGE NEVER DOES (Owner ruling, 2026-09-13, F1
+# option 1). The asymmetry was always the point: a row VANISHING is the
+# dangerous case, a row APPEARING is the benign one. Requiring a root shell on
+# another device to bless a row somebody just typed on purpose bought nothing —
+# and a lane that sits yellow for days is learned as background noise, which
+# costs the guard its ability to mean anything when a row DISAPPEARS. So an
+# inventory that ONLY grew refreshes the baseline itself and LOGS the ids it
+# accepted; anything that removed an id stays red and still needs a human.
+# ADD-AND-REMOVE IN ONE EDIT IS A REMOVAL: an item renamed, or a file moved
+# between users, stops the old id from being tracked, and that is the event this
+# guard exists for. The removal wins.
 #
 # Usage: tracker-defs-guard.sh [--check|--report|--baseline] [--quiet]
 #   --check     read-only: assess and print, write the state file, POST nothing
 #   --report    --check plus the /api/feed post (what the timer runs)
 #   --baseline  record the CURRENT inventory as the baseline and exit. This is
-#               deliberately a separate, explicit mode: a guard that refreshed
-#               its own baseline whenever it noticed a change could never report
-#               a deletion twice, and would launder the very event it exists for.
+#               how a REMOVAL is accepted, and it stays an explicit, human mode:
+#               a guard that re-baselined on every change it noticed could never
+#               report a deletion twice, and would launder the very event it
+#               exists for. Growth no longer needs it (see GROWTH, above).
 #
 # Exit: 0 = green, 1 = red, 2 = yellow, 3 = usage/internal. The unit accepts
 # 0/1/2 as success because THE REPORT is the signal, not the exit code — the
@@ -74,6 +89,13 @@ warn() { printf '%s WARN: %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 STATE_DIR="${TRACKER_DEFS_STATE_DIR:-/var/lib/homehub}"
 STATE_FILE="$STATE_DIR/tracker-defs.state"
 BASELINE_FILE="$STATE_DIR/tracker-defs-baseline"
+# THE INVENTORY ITSELF, beside the baseline. The baseline records a HASH of
+# it, which can say "something moved" and can never say WHAT — and telling an
+# addition apart from a removal is the whole of the F1 ruling. A baseline
+# written before this file existed simply has none, and the guard then falls
+# back to the pre-ruling behaviour (growth = yellow, accepted by hand) rather
+# than guessing.
+BASELINE_INV_FILE="$STATE_DIR/tracker-defs-baseline.inv"
 ENV_FILE="${TRACKER_DEFS_ENV_FILE:-/etc/homehub-backup/backup.env}"
 VOLUME="${TRACKER_DEFS_VOLUME:-tracker_data}"
 CHECK_ID="${TRACKER_DEFS_FEED_CHECK:-tracker-definitions}"
@@ -226,18 +248,41 @@ write_baseline() {
     # two writers racing on one temporary file produce a mixed one.
     tmp="$(mktemp "$BASELINE_FILE.XXXXXX")" || { warn "cannot create a temporary file beside $BASELINE_FILE"; return 1; }
     {
-        echo "# Recorded by $TAG --baseline. The inventory a healthy tracker has."
-        echo "# REFRESH THIS DELIBERATELY, never automatically: a guard that"
-        echo "# re-baselined whenever it saw a change would launder a deletion."
+        echo "# Recorded by $TAG. The inventory a healthy tracker has."
+        echo "# A REMOVAL IS ACCEPTED DELIBERATELY, never automatically: a guard"
+        echo "# that re-baselined on a deletion would launder the very event it"
+        echo "# exists for. Pure growth self-accepts (Owner ruling F1)."
+        echo "reason=${BASELINE_REASON:-human --baseline}"
         echo "baseline_utc=$(date -u +%FT%TZ)"
         echo "users=$USERS"
         echo "files=$FILES"
         echo "items=$ITEMS"
         echo "inv_hash=$INV_HASH"
         echo "detail=$DETAIL"
-    } >"$tmp" && mv "$tmp" "$BASELINE_FILE" && return 0
+    } >"$tmp" && mv "$tmp" "$BASELINE_FILE" || {
+        rm -f "$tmp" 2>/dev/null
+        warn "could not write $BASELINE_FILE"
+        return 1
+    }
+    write_baseline_inventory
+}
+
+# write_baseline_inventory records the inventory the hash above was taken of, so
+# the next run can name WHAT changed rather than only that something did.
+#
+# IT IS WRITTEN SECOND ON PURPOSE. If it fails the baseline file still exists and
+# its hash still catches a change, so the guard degrades to the pre-ruling
+# behaviour; the other order would leave an inventory describing a baseline that
+# was never recorded.
+write_baseline_inventory() {
+    local tmp
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+    tmp="$(mktemp "$BASELINE_INV_FILE.XXXXXX")" || { warn "cannot create a temporary file beside $BASELINE_INV_FILE"; return 1; }
+    if printf '%s' "$INV" | grep -v '^$' | sort >"$tmp" && mv "$tmp" "$BASELINE_INV_FILE"; then
+        return 0
+    fi
     rm -f "$tmp" 2>/dev/null
-    warn "could not write $BASELINE_FILE"
+    warn "could not write $BASELINE_INV_FILE — the next change will be reported without naming what moved"
     return 1
 }
 
@@ -280,6 +325,27 @@ if [ -f "$BASELINE_FILE" ]; then
     done
 fi
 
+# ── what moved, BY NAME ──────────────────────────────────────────────────────
+# Both lists are needed, not a count: "only grew" is the one shape allowed to
+# accept itself, and no count can tell it from an equal-sized swap. INV_DIFFABLE
+# stays 0 when the baseline predates the sidecar or it could not be read — then
+# no such claim is made at all, and the old hand-accepted path is used.
+INV_DIFFABLE=0; INV_ADDED=""; INV_REMOVED=""
+if [ -f "$BASELINE_INV_FILE" ] && [ -s "$BASELINE_INV_FILE" ] && [ -n "$INV_HASH" ] && [ "$INV_HASH" != unavailable ]; then
+    _now_inv="$(mktemp 2>/dev/null)"
+    if [ -n "$_now_inv" ]; then
+        if printf '%s' "$INV" | grep -v '^$' | sort >"$_now_inv" 2>/dev/null; then
+            INV_DIFFABLE=1
+            # comm needs both sides sorted, and both are: the baseline copy was
+            # sorted when written and this one just now, under the same collation
+            # (nothing in this script sets LC_ALL).
+            INV_ADDED="$(comm -13 "$BASELINE_INV_FILE" "$_now_inv" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
+            INV_REMOVED="$(comm -23 "$BASELINE_INV_FILE" "$_now_inv" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
+        fi
+        rm -f "$_now_inv" 2>/dev/null
+    fi
+fi
+
 if [ -z "$band" ]; then
     if [ "$FILES" -eq 0 ]; then
         band=red
@@ -292,10 +358,35 @@ if [ -z "$band" ]; then
         verdict="no baseline recorded yet — $FILES file(s), $ITEMS item(s) across $USERS user(s), newest $NEWEST_HUMAN (${AGE_DAYS}d ago). Run '$TAG --baseline' once the set is right, and this lane turns green."
     elif [ "$FILES" -lt "$B_FILES" ] || [ "$ITEMS" -lt "$B_ITEMS" ]; then
         band=red
-        verdict="definitions SHRANK: $FILES file(s)/$ITEMS item(s) now, baseline had $B_FILES/$B_ITEMS (recorded $B_WHEN). Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago). [$DETAIL]"
+        verdict="definitions SHRANK: $FILES file(s)/$ITEMS item(s) now, baseline had $B_FILES/$B_ITEMS (recorded $B_WHEN).${INV_REMOVED:+ Gone: [$INV_REMOVED].} Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago). This never self-accepts: run '$TAG --baseline' once you have confirmed the loss was intended. [$DETAIL]"
+    elif [ "$INV_DIFFABLE" = 1 ] && [ -n "$INV_REMOVED" ]; then
+        # THE REMOVAL WINS, even when something was added in the same edit. An id
+        # that stopped being tracked is the event this guard exists for, and an
+        # addition beside it is not a mitigation — a rename is exactly this
+        # shape, and the old id is gone either way.
+        band=red
+        verdict="definitions REMOVED: [$INV_REMOVED].${INV_ADDED:+ Added in the same edit: [$INV_ADDED].} Counts are $FILES file(s)/$ITEMS item(s) against a baseline of $B_FILES/$B_ITEMS, so no count could have seen this. A removal never self-accepts: run '$TAG --baseline' once you have confirmed it was intended. [$DETAIL]"
+    elif [ "$INV_DIFFABLE" = 1 ] && [ -n "$INV_ADDED" ] && [ "$USERS" -ge "${B_USERS:-$USERS}" ]; then
+        # PURE GROWTH — the one shape that accepts itself (Owner ruling F1,
+        # 2026-09-13). Nothing was removed, so nothing can be laundered by
+        # refreshing here, and the ids go to the journal and to the state file so
+        # the acceptance is still on the record even though no human typed it.
+        BASELINE_REASON="growth auto-accepted: $(sanitise "$INV_ADDED")"
+        if write_baseline; then
+            band=green
+            verdict="definitions GREW and the baseline was refreshed automatically: added [$INV_ADDED]. Now $FILES file(s)/$ITEMS item(s)/$USERS user(s); the baseline had $B_FILES/$B_ITEMS. A REMOVAL still reads RED and still needs '$TAG --baseline' from a human. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago)."
+            log "INVENTORY GREW — baseline refreshed automatically. added=[$INV_ADDED]"
+            # The state file below must report the baseline this verdict was
+            # measured against, which is now this one; leaving the old numbers
+            # would make the durable record disagree with the verdict beside it.
+            B_FILES="$FILES"; B_ITEMS="$ITEMS"; B_USERS="$USERS"; B_HASH="$INV_HASH"
+        else
+            band=yellow
+            verdict="definitions GREW (added [$INV_ADDED]) but the baseline could NOT be refreshed — $BASELINE_FILE is not writable. The addition is unaccepted and this lane stays yellow until it can be written."
+        fi
     elif [ "$FILES" -gt "$B_FILES" ] || [ "$ITEMS" -gt "$B_ITEMS" ]; then
         band=yellow
-        verdict="definitions GREW: $FILES file(s)/$ITEMS item(s) now, baseline had $B_FILES/$B_ITEMS. That is normal after adding items — re-run '$TAG --baseline' to accept it. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago)."
+        verdict="definitions GREW: $FILES file(s)/$ITEMS item(s) now, baseline had $B_FILES/$B_ITEMS — but this baseline carries no inventory record, so the guard cannot prove nothing was removed alongside and will not self-accept it. Re-run '$TAG --baseline' to accept; that also records the inventory, after which the next addition accepts itself. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago)."
     elif [ -n "$B_USERS" ] && [ "$USERS" -ne "$B_USERS" ]; then
         band=yellow
         verdict="the FILE and ITEM counts match the baseline but the number of user directories changed ($USERS now, $B_USERS at baseline) — someone was added or removed. [$DETAIL]"
@@ -309,6 +400,10 @@ if [ -z "$band" ]; then
         verdict="the counts match the baseline ($FILES file(s)/$ITEMS item(s)/$USERS user(s)) but the INVENTORY does not: a file or an item id was renamed, moved between users, or swapped. [$DETAIL]. Check the set, then re-run '$TAG --baseline'."
     else
         band=green
+        # HEAL AN OLD BASELINE while the set is known-good. Recording the
+        # inventory here is safe precisely because it matches the hash that was
+        # already accepted, and it is what lets the NEXT addition self-accept.
+        if [ ! -f "$BASELINE_INV_FILE" ]; then write_baseline_inventory || true; fi
         verdict="$FILES definition file(s), $ITEMS item(s), $USERS user(s) — matches the baseline recorded $B_WHEN, by count AND by inventory. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago). [$DETAIL]"
     fi
 fi
@@ -338,6 +433,8 @@ write_state() {
         echo "age_days=$AGE_DAYS"
         echo "baseline_files=${B_FILES:-none}"
         echo "baseline_items=${B_ITEMS:-none}"
+        echo "added=$(sanitise "$INV_ADDED")"
+        echo "removed=$(sanitise "$INV_REMOVED")"
         echo "detail=$(sanitise "$DETAIL")"
         echo "verdict=$(sanitise "$verdict")"
         # AN `if`, NOT `[ ] && echo`. As the LAST command of the group this is

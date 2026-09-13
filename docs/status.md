@@ -8,6 +8,14 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-13 — LCUS-2 amplifier actuation is BUILT and LOCAL-ONLY.** The initial
+panel actuator now defaults to the measured CH340 LCUS-2 board through a stable
+`/dev/wall-amp-relay` udev link, while `audio-jack` remains selectable. Commands,
+status readback, selected-channel ownership, latching-safe startup/shutdown and
+S3 refusal are implemented under SN-020/SR-026/LLR-010/TC-010/IF-017. Physical
+Linux enumeration, amplifier wiring and audibility remain unproven. Nothing was
+pushed, deployed or included on existing media.
+
 **2026-09-11 — Finance-Auditor snapshot recovery is BUILT and LOCAL-ONLY (not
 pushed, deployed, or included on existing media).** A reimage now restores the
 local-only `finance_snapshots` volume through the existing byte-verifying
@@ -8203,3 +8211,34 @@ checklist on the wall, with six definitions skipped and named.
 
 Hub SSH host key had changed, consistent with that box's 2026-09-12 reimage;
 `known_hosts` was backed up before the entry was replaced.
+
+---
+
+## 2026-09-13 — LCUS-2 amplifier actuator built; MSP430 route preserved
+
+The Owner selected the physically tested LCUS-2 USB dual relay for the initial
+amplifier driver. The earlier implementation remains on branch
+`msp430-amplifier-trigger` at `6aae10a`; this active branch instead implements
+SN-020/SR-026/LLR-010/TC-010 and IF-017. The shared audio detector now selects
+either `lcus-2` (default) or the retained `audio-jack` actuator. The LCUS path
+uses the four measured 9600-baud commands, parses the measured two-line status,
+owns only one configured channel, verifies every transition and heartbeat, and
+uses the measured CH340 VID/PID to create `/dev/wall-amp-relay`.
+
+The COM4 bench established both audible channel operations and, importantly,
+that an energized relay remains on across serial close/reopen. The service now
+establishes verified off even without prior local state; quiet and shutdown do
+not claim off if readback fails; S3 is refused when service teardown cannot
+verify off; and the detector is reconciled after resume. Both physical relay
+channels were left off after testing.
+
+Evidence: amplifier and Bluetooth Python suites **54 passed**, and the broader
+wall/panel Python selection **168 passed / 6 skipped**; the hermetic
+power lifecycle suite **84 PASS / 0 FAIL**; Python AST, bash syntax, configuration
+validation and flow validation pass; trace integrity is **0** with 25 pre-existing
+orphans. The full `stack/run-hermetic-tests.sh` umbrella did not start because
+this WSL installation lacks `rsync`; its directly affected occupancy/power suite
+was run independently as reported above. Not yet proven: Linux enumeration on
+the panel, actual COM/NO amplifier wiring,
+audibility, end-to-end timing, USB disconnect recovery, suspend on hardware or
+long-run behavior. Nothing was pushed, deployed or included on existing media.

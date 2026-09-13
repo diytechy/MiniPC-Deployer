@@ -102,12 +102,16 @@ audio path is not here — it is a set of units and ALSA configuration under
 | `asound.conf` + `asound-{trigger,panel}-mode.conf` | the dmix/dsnoop graph and the two output modes |
 | `wall-line-in.service` | line input passthrough to the amplifier |
 | `wall-kiosk-loop.service` | routes kiosk audio through snd-aloop so it can be measured |
-| `wall-amp-trigger.service`, `panel-amp-trigger.py` | emits the amplifier's trigger tone while audio plays |
+| `wall-amp-trigger.service`, `panel-amp-trigger.py` | detects playing audio and commands the headphone-tone or LCUS-2 actuator |
 | `wall-volume-keys.service`, `panel-volume-keys.py` | the side rocker |
 | `wall-audio-mode` | switches output modes |
 
 The measurement record behind all of it, including the trigger circuit that is
 still to be built, is `PANEL_AMP_AUTOPOWER.md` in the HomeHub repo.
+The LCUS-2 alternative changes only the final actuator. The detector still
+watches the same line-in and kiosk/Bluetooth monitor sources. Its CH340 serial
+path, selected channel and physical limitations are recorded in the application
+repo's `docs/lcus2-amplifier-trigger-plan.md`.
 
 A mute method (`set_mute`) is planned for THIS broker and will be the first
 mutation it actually performs; the design and the open journal-class question

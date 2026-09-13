@@ -66,6 +66,8 @@
 #   A19 a backlight that cannot be turned off blocks the suspend
 #   A20 Door stop failure blocks backlight-off and suspend before either side
 #       effect, and a hung stop is cut off by the shipped teardown ceiling
+#   A21 amplifier OFF failure blocks suspend; successful suspend restarts its
+#       detector after resume (the LCUS-2 relay itself latches across port close)
 #
 # Usage: bash occupancy-power.test.sh
 set -uo pipefail
@@ -107,6 +109,11 @@ case "\$*" in
     "stop wall-door-stream.service")
         [ -n "\${SYSTEMCTL_STOP_SLEEP:-}" ] && sleep "\$SYSTEMCTL_STOP_SLEEP"
         [ -n "\${SYSTEMCTL_STOP_FAIL:-}" ] && exit 1
+        ;;
+    "stop wall-amp-trigger.service")
+        [ -n "\${SYSTEMCTL_AMP_STOP_FAIL:-}" ] && exit 1
+        mkdir -p "\$(dirname "\$AMP_SAFE_STATE")"
+        printf 'OFF\n' > "\$AMP_SAFE_STATE"
         ;;
 esac
 exit 0
@@ -205,9 +212,10 @@ scenario() {
     # reads it back from, so "armed" is one artifact written by one actor and
     # read by another, not a shared variable.
     FAKE_RTC_DIR="$ROOT/sys/class/rtc"
-    export SYSTEMCTL_LOG RTCWAKE_LOG PY3_LOG FAKE_RTC_DIR
+    AMP_SAFE_STATE="$ROOT/run/wall-amp-trigger/off-verified"
+    export SYSTEMCTL_LOG RTCWAKE_LOG PY3_LOG FAKE_RTC_DIR AMP_SAFE_STATE
     unset RTCWAKE_FAIL RTCWAKE_SILENT_NOOP FAKE_LOCAL_RTC FAKE_NOW FAKE_NO_TIMEDATECTL
-    unset SYSTEMCTL_STOP_FAIL SYSTEMCTL_STOP_SLEEP
+    unset SYSTEMCTL_STOP_FAIL SYSTEMCTL_STOP_SLEEP SYSTEMCTL_AMP_STOP_FAIL
     ENV_FILE="$ROOT/etc/wall.env"
     PRESENCE_FILE="$ROOT/run/presence.json"
 }
@@ -481,7 +489,11 @@ SUSPEND_MECHANISMS='systemctl[[:space:]]+(--[a-z=-]+[[:space:]]+)*suspend|loginc
 power_writers() {
     local re="$1" f names=""
     while IFS= read -r f; do
-        if sed -e 's/^[[:space:]]*#.*$//' "$f" 2>/dev/null | grep -qE "$re"; then
+        # Do not use grep -q under pipefail here: on a large matching file grep
+        # exits before sed drains, sed receives SIGPIPE, and the true match is
+        # misreported as a failed pipeline (wall-sleep.sh crossed that size
+        # threshold when the amplifier lifecycle was added).
+        if sed -e 's/^[[:space:]]*#.*$//' "$f" 2>/dev/null | grep -E "$re" >/dev/null; then
             names="$names$(basename "$f")\n"
         fi
     done <<< "$(find "$DIR" -type f ! -path '*/tests/*' ! -path '*__pycache__*' ! -name '*.md')"
@@ -768,6 +780,23 @@ else
     eq "06:45" "$(decider_on_start)" "A20 with no SLEEP_END set, occupancy uses the ratified 06:45"
     eq "06:45" "$(armed_hhmm)" "A20 ...and arms the RTC for it"
 fi
+
+# ── A21: a latching amplifier relay is OFF before S3 and reconciled after ──
+scenario a21-fail
+write_env "SLEEP_MODE=suspend"
+SYSTEMCTL_AMP_STOP_FAIL=1 run start
+eq "no" "$(suspended)" "A21 unverified amplifier OFF blocks suspend"
+grep -qx 'stop wall-amp-trigger.service' "$SYSTEMCTL_LOG" \
+    && pass "A21 suspend attempted the amplifier's verified teardown" \
+    || fail "A21 suspend skipped amplifier teardown"
+
+scenario a21-resume
+write_env "SLEEP_MODE=suspend"
+run start
+eq "yes" "$(suspended)" "A21 verified amplifier OFF permits suspend"
+grep -qx 'start wall-amp-trigger.service' "$SYSTEMCTL_LOG" \
+    && pass "A21 amplifier detector is reconciled after resume" \
+    || fail "A21 amplifier detector was not restarted after resume"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

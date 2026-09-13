@@ -711,6 +711,11 @@ if [ -f "$PAYLOAD/90-wall-line-in.rules" ]; then
     install -m 0644 "$PAYLOAD/90-wall-line-in.rules" /etc/udev/rules.d/90-wall-line-in.rules
     udevadm control --reload-rules >/dev/null 2>&1 || true
 fi
+if [ -f "$PAYLOAD/99-wall-amp-lcus2.rules" ]; then
+    install -m 0644 "$PAYLOAD/99-wall-amp-lcus2.rules" /etc/udev/rules.d/99-wall-amp-lcus2.rules
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=tty >/dev/null 2>&1 || true
+fi
 
 for _f in panel-volume-keys.py panel-amp-trigger.py; do
     if [ -f "$PAYLOAD/$_f" ]; then
@@ -727,7 +732,7 @@ for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service 
 done
 systemctl daemon-reload >/dev/null 2>&1 || true
 
-# The trigger daemon's on/off knob is rendered into its own env file rather
+# The trigger daemon's on/off and actuator knobs are rendered into its own env file rather
 # than read from wall.env: that file is root-only and carries unrelated
 # credentials, and this service has no business seeing it.
 if [ -f /etc/wall-panel/amp-trigger.env ]; then
@@ -738,8 +743,49 @@ if [ -f /etc/wall-panel/amp-trigger.env ]; then
     else
         printf 'WALL_AMP_ENABLED=%s\n' "$_amp_enabled" >> /etc/wall-panel/amp-trigger.env
     fi
+
+    _amp_activator=${WALL_AMP_ACTIVATOR:-lcus-2}
+    case "$_amp_activator" in
+        audio-jack|lcus-2) ;;
+        *)
+            warn "audio: WALL_AMP_ACTIVATOR must be exactly audio-jack or lcus-2; the amplifier service will refuse to start"
+            _amp_activator=invalid ;;
+    esac
+    if grep -q '^WALL_AMP_ACTIVATOR=' /etc/wall-panel/amp-trigger.env 2>/dev/null; then
+        sed -i "s|^WALL_AMP_ACTIVATOR=.*|WALL_AMP_ACTIVATOR=$_amp_activator|" /etc/wall-panel/amp-trigger.env
+    else
+        printf 'WALL_AMP_ACTIVATOR=%s\n' "$_amp_activator" >> /etc/wall-panel/amp-trigger.env
+    fi
+
+    _amp_lcus2_device=${WALL_AMP_LCUS2_DEVICE:-/dev/wall-amp-relay}
+    if [ -n "$_amp_lcus2_device" ] &&
+       ! printf '%s' "$_amp_lcus2_device" | grep -Eq '^/dev/[A-Za-z0-9._/-]+$'; then
+        warn "audio: WALL_AMP_LCUS2_DEVICE must be a plain absolute /dev path; refusing the supplied value"
+        _amp_lcus2_device=
+    fi
+    if grep -q '^WALL_AMP_LCUS2_DEVICE=' /etc/wall-panel/amp-trigger.env 2>/dev/null; then
+        sed -i "s|^WALL_AMP_LCUS2_DEVICE=.*|WALL_AMP_LCUS2_DEVICE=$_amp_lcus2_device|" /etc/wall-panel/amp-trigger.env
+    else
+        printf 'WALL_AMP_LCUS2_DEVICE=%s\n' "$_amp_lcus2_device" >> /etc/wall-panel/amp-trigger.env
+    fi
+
+    _amp_lcus2_channel=${WALL_AMP_LCUS2_CHANNEL:-1}
+    case "$_amp_lcus2_channel" in
+        1|2) ;;
+        *)
+            warn "audio: WALL_AMP_LCUS2_CHANNEL must be 1 or 2; the amplifier service will refuse to start"
+            _amp_lcus2_channel=invalid ;;
+    esac
+    if grep -q '^WALL_AMP_LCUS2_CHANNEL=' /etc/wall-panel/amp-trigger.env 2>/dev/null; then
+        sed -i "s|^WALL_AMP_LCUS2_CHANNEL=.*|WALL_AMP_LCUS2_CHANNEL=$_amp_lcus2_channel|" /etc/wall-panel/amp-trigger.env
+    else
+        printf 'WALL_AMP_LCUS2_CHANNEL=%s\n' "$_amp_lcus2_channel" >> /etc/wall-panel/amp-trigger.env
+    fi
+    if [ "$_amp_activator" = lcus-2 ] && [ -z "$_amp_lcus2_device" ]; then
+        warn "audio: lcus-2 actuator selected but WALL_AMP_LCUS2_DEVICE is blank; the amplifier service will refuse to start"
+    fi
     [ "$_amp_enabled" = false ] &&
-        log "audio: WALL_AMP_TRIGGER_ENABLED is false — the tone is not emitted; the amplifier stays under whatever manual control it had"
+        log "audio: WALL_AMP_TRIGGER_ENABLED is false — no actuator is commanded; the amplifier stays under whatever manual control it had"
 fi
 
 # Enablement expresses the line-in and rocker knobs, so that wall-audio-mode can

@@ -1,7 +1,7 @@
 # wall-amp-trigger.service — power the amplifier while audio is playing.
 #
-# Emits a tone on the ALC255 headphone jack whenever either audio source is
-# above threshold; a rectifier on the far end holds the relay closed. See
+# Commands either the ALC255 tone/rectifier path or one LCUS-2 USB relay
+# channel whenever either audio source is above threshold. See
 # PANEL_AMP_AUTOPOWER.md in the HomeHub repo for the measurements, the circuit
 # and the calibration procedure.
 #
@@ -24,6 +24,8 @@ Type=simple
 # file or absent key falls back to the measured defaults.
 EnvironmentFile=-/etc/wall-panel/amp-trigger.env
 ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-amp-trigger.py
+RuntimeDirectory=wall-amp-trigger
+RuntimeDirectoryPreserve=yes
 Restart=always
 RestartSec=5
 # 78 = a tool it needs is missing. Restarting will not conjure one.
@@ -46,7 +48,7 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallArchitectures=native
-SupplementaryGroups=audio
+SupplementaryGroups=audio dialout
 
 StandardOutput=journal
 StandardError=journal

@@ -41,6 +41,11 @@ panel; that repo owns the app):
   0600 Electron host JSON, and reach only the exact trusted panel document over
   named IPC. Hub preflight rejects those secrets in either access mode. Physical
   image/panel acceptance remains unproven; see `stack/autoinstall/wall/README.md`.
+- **IF-017** — `Implemented` 2026-09-13. The app and Bluetooth sink deliver
+  audio to the existing ALSA path and know nothing about relay hardware. The
+  image-owned detector selects exactly one actuator: initially the LCUS-2 USB
+  relay, or the retained audio-jack tone alternative. An ON/OFF claim requires
+  device status readback, and shutdown/suspend own verified OFF (SR-026).
 
 **This repo → on-box callers** (`Provides` — the AI CLI service):
 

@@ -141,6 +141,7 @@ ADJTIME_FILE="${POWER_TEST_ROOT}/etc/adjtime"
 ABSENCE_STATE_DIR="${POWER_TEST_ROOT}/run/wall-occupancy"
 BACKLIGHT_PREV="${POWER_TEST_ROOT}/run/wall-backlight.prev"
 ABSENT_SINCE_FILE="$ABSENCE_STATE_DIR/absent-since"
+AMP_SAFE_STATE="${POWER_TEST_ROOT}/run/wall-amp-trigger/off-verified"
 # A bare carriage return, built rather than escaped so it survives every editor
 # and every quoting layer between here and the panel.
 CR="$(printf '\r')"
@@ -165,6 +166,20 @@ start_door_broker() {
     [ -r /run/wall-door-credentials/host ] || return 0
     [ -r /run/wall-door-credentials/password ] || return 0
     systemctl start wall-door-stream.service >/dev/null 2>&1
+}
+
+# The LCUS-2 retains an energized relay after its serial port closes. The
+# amplifier daemon therefore exits non-zero unless shutdown positively commands
+# and reads back OFF. Never enter S3 if that verified teardown fails.
+stop_amp_trigger() {
+    systemctl cat wall-amp-trigger.service >/dev/null 2>&1 || return 0
+    rm -f "$AMP_SAFE_STATE"
+    timeout 5 systemctl stop wall-amp-trigger.service >/dev/null 2>&1 || return 1
+    [ "$(cat "$AMP_SAFE_STATE" 2>/dev/null)" = "OFF" ]
+}
+start_amp_trigger() {
+    systemctl cat wall-amp-trigger.service >/dev/null 2>&1 || return 0
+    systemctl start wall-amp-trigger.service >/dev/null 2>&1
 }
 
 # ── backlight helpers ────────────────────────────────────────────────────────
@@ -412,8 +427,19 @@ suspend_now() {
         log "WARNING: Door stream broker could not be stopped — NOT suspending while a camera source may still be active."
         return 0
     fi
+    if ! stop_amp_trigger; then
+        log "WARNING: amplifier trigger OFF could not be verified — NOT suspending with a latching relay potentially energized."
+        start_door_broker || true
+        return 0
+    fi
     log "suspending now"
     systemctl suspend || log "WARNING: systemctl suspend failed — the panel stays awake"
+    # systemctl suspend returns only after resume (or immediately on failure).
+    # Reconcile the configured service in either case; it establishes verified
+    # OFF before monitoring audio again.
+    if ! start_amp_trigger; then
+        log "WARNING: amplifier trigger service did not restart after resume."
+    fi
 }
 
 # write_absent_since EPOCH — record the absence start ATOMICALLY.

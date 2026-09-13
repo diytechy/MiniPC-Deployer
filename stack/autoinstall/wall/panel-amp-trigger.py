@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Power the speaker amplifier while audio is playing.
 
-The panel emits a continuous tone on the ALC255 headphone jack whenever it sees
-audio; a rectifier on the far end turns that into a DC level that holds the
-amplifier's relay closed. Software decides, analog carries.
+The level detector is independent of the actuator. The shipped default emits a
+continuous tone on the ALC255 headphone jack for a far-end rectifier. The
+alternative commands one channel of the measured LCUS-2 USB relay through its
+CH340 serial interface. Software decides in one place; configuration chooses
+how that decision reaches the amplifier.
 
 WHY A TONE AND NOT A DETECTOR ON THE AMPLIFIER FEED (measured 2026-09-12):
 the feed is downstream of the volume control, so an analog detector's
@@ -33,6 +35,9 @@ Exit codes: 78 configuration unusable.
 import errno
 import math
 import os
+import posixpath
+import re
+import select
 import shutil
 import signal
 import struct
@@ -138,6 +143,10 @@ def _env(name, default, lo=None, hi=None):
     return value
 
 
+class ConfigurationError(ValueError):
+    """An actuator selection cannot be made safe or deterministic."""
+
+
 # Thresholds on the DC-stripped RMS of the louder channel, relative to each
 # source's nominal full scale. The measured floor is -83 dBFS, so -60 sits 23 dB
 # clear of it. Hysteresis, because a single threshold chatters at the boundary.
@@ -172,8 +181,9 @@ TRIGGER_AMPLITUDE = 0.99
 # diagnostics rather than safety.
 JACK_CONTROL = "Front Headphone Jack"
 JACK_POLL_SECONDS = 5.0
-# Do not respawn a failing aplay on every 100 ms block.
-TONE_RETRY_SECONDS = 5.0
+# Do not reopen a failing aplay or serial device on every 100 ms block.
+ACTUATOR_RETRY_SECONDS = 5.0
+SAFE_STATE_FILE = "/run/wall-amp-trigger/off-verified"
 
 # A source whose last block is older than this is treated as silent.
 #
@@ -445,49 +455,360 @@ class Tone:
         self._stop.set()
         proc, self._proc = self._proc, None
         if proc is None:
-            return
+            return True
         try:
             if proc.stdin:
                 proc.stdin.close()
         except OSError:
             pass
         _reap(proc)
+        return True
+
+    def maintain(self, _now=None):
+        """Return whether the already-started tone is still being delivered."""
+        return self.running
+
+
+def lcus2_command(channel, enabled):
+    """Return the four-byte LCUS-2 command proven on the physical board."""
+    if channel not in (1, 2) or not isinstance(enabled, bool):
+        raise ValueError("LCUS-2 channel/state is invalid")
+    operation = 1 if enabled else 0
+    return bytes((0xA0, channel, operation, (0xA0 + channel + operation) & 0xff))
+
+
+_LCUS2_STATUS = re.compile(r"^CH([12]): (ON|OFF)$")
+
+
+def parse_lcus2_status(payload):
+    """Parse the exact two-line ASCII reply observed from status command FF."""
+    try:
+        lines = [line.strip() for line in payload.decode("ascii").splitlines()
+                 if line.strip()]
+    except UnicodeDecodeError as exc:
+        raise ValueError("LCUS-2 status is not ASCII") from exc
+    if len(lines) != 2:
+        raise ValueError("LCUS-2 status must contain exactly two channels")
+    states = {}
+    for line in lines:
+        match = _LCUS2_STATUS.fullmatch(line)
+        if match is None:
+            raise ValueError("LCUS-2 status line is malformed")
+        channel = int(match.group(1))
+        if channel in states:
+            raise ValueError("LCUS-2 status repeats a channel")
+        states[channel] = match.group(2) == "ON"
+    if set(states) != {1, 2}:
+        raise ValueError("LCUS-2 status omits a channel")
+    return states
+
+
+class Lcus2SerialTransport:
+    """Acknowledged LCUS-2 control over a POSIX CH340 TTY.
+
+    The relay's state-changing command emits no acknowledgement. We therefore
+    follow it with the board's 0xff status query and accept success only when
+    the measured ASCII reply reports the requested state.
+    """
+
+    def __init__(self, device, baud=9600, timeout=0.75):
+        if baud != 9600:
+            raise ConfigurationError("LCUS-2 protocol is fixed at 9600 baud")
+        self.device = device
+        self.timeout = timeout
+        self.fd = None
+        self._termios = None
+        self._open()
+
+    def _open(self):
+        # Lazy so the detector and pure protocol tests remain importable on the
+        # Windows build host, which has no termios module.
+        import termios
+
+        self._termios = termios
+        self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        attrs = termios.tcgetattr(self.fd)
+        attrs[0] = 0
+        attrs[1] = 0
+        attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+        attrs[3] = 0
+        attrs[4] = termios.B9600
+        attrs[5] = termios.B9600
+        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        termios.tcflush(self.fd, termios.TCIOFLUSH)
+
+    def _write_all(self, payload, deadline):
+        view = memoryview(payload)
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("LCUS-2 write timed out")
+            _, writable, _ = select.select([], [self.fd], [], remaining)
+            if not writable:
+                raise TimeoutError("LCUS-2 write timed out")
+            written = os.write(self.fd, view)
+            view = view[written:]
+
+    def read_status(self, deadline):
+        self._termios.tcflush(self.fd, self._termios.TCIFLUSH)
+        self._write_all(b"\xff", deadline)
+        received = bytearray()
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([self.fd], [], [], deadline - time.monotonic())
+            if not readable:
+                break
+            chunk = os.read(self.fd, 128 - len(received))
+            if not chunk:
+                raise OSError(errno.ENODEV, "LCUS-2 serial device closed")
+            received.extend(chunk)
+            if len(received) >= 128:
+                raise OSError(errno.EPROTO, "LCUS-2 status exceeded 127 bytes")
+            try:
+                return parse_lcus2_status(bytes(received))
+            except ValueError:
+                pass
+        raise TimeoutError("LCUS-2 did not return a complete status")
+
+    def set_state(self, channel, enabled):
+        deadline = time.monotonic() + self.timeout
+        self._write_all(lcus2_command(channel, enabled), deadline)
+        # The physical COM4 bench used a 250 ms command settle before querying.
+        # Keep the same conservative interval; switching happens only at audio
+        # attack/hold boundaries, never on a latency-sensitive path.
+        time.sleep(0.25)
+        states = self.read_status(deadline)
+        if states[channel] is not enabled:
+            raise OSError(errno.EPROTO, "LCUS-2 did not apply channel %d" % channel)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+class Lcus2Relay:
+    """Own one LCUS-2 channel and verify every state written to it."""
+
+    def __init__(self, device, channel=1, timeout=0.75,
+                 heartbeat_seconds=5.0, transport_factory=None,
+                 monotonic=time.monotonic):
+        self.device = device
+        self.channel = channel
+        self.timeout = timeout
+        self.heartbeat_seconds = heartbeat_seconds
+        self.transport_factory = transport_factory or Lcus2SerialTransport
+        self.monotonic = monotonic
+        self._transport = None
+        self._running = False
+        self._checked_at = -1e9
+
+    @property
+    def running(self):
+        return self._running and self._transport is not None
+
+    def _disconnect(self):
+        transport, self._transport = self._transport, None
+        self._running = False
+        if transport is not None:
+            try:
+                transport.close()
+            except OSError:
+                pass
+
+    def start(self):
+        if self.running:
+            return True
+        try:
+            self._transport = self.transport_factory(self.device, 9600, self.timeout)
+            # A CH340 open is not proof of the relay's state. Verify OFF first,
+            # then ON, and never alter the module's other channel.
+            self._transport.set_state(self.channel, False)
+            self._transport.set_state(self.channel, True)
+            self._checked_at = self.monotonic()
+            self._running = True
+            return True
+        except (OSError, TimeoutError, ConfigurationError, ValueError) as exc:
+            log("LCUS-2 trigger failed to start: %s" % exc)
+            self._disconnect()
+            return False
+
+    def ensure_off(self):
+        """Command and verify OFF even when this process did not turn it on.
+
+        The physical LCUS-2 retains its relay state after the CH340 port is
+        closed.  Opening a fresh transport here is therefore intentional: a
+        service start or stop must establish OFF, not infer it from local
+        process state.
+        """
+        transport = None
+        try:
+            transport = self.transport_factory(self.device, 9600, self.timeout)
+            transport.set_state(self.channel, False)
+            return True
+        except (OSError, TimeoutError, ConfigurationError, ValueError) as exc:
+            log("LCUS-2 trigger OFF was not verified: %s" % exc)
+            return False
+        finally:
+            if transport is not None:
+                try:
+                    transport.close()
+                except OSError:
+                    pass
+
+    def maintain(self, now=None):
+        if not self.running:
+            return False
+        now = self.monotonic() if now is None else now
+        if now - self._checked_at < self.heartbeat_seconds:
+            return True
+        try:
+            # Re-sending ON does not cycle an already-energized relay, and the
+            # following status query proves the serial and MCU path stayed live.
+            self._transport.set_state(self.channel, True)
+            self._checked_at = now
+            return True
+        except (OSError, TimeoutError, ValueError) as exc:
+            log("LCUS-2 trigger verification failed: %s" % exc)
+            self._disconnect()
+            return False
+
+    def stop(self):
+        if self._transport is None:
+            return self.ensure_off()
+        verified = False
+        try:
+            self._transport.set_state(self.channel, False)
+            verified = True
+        except (OSError, TimeoutError, ValueError) as exc:
+            log("LCUS-2 trigger OFF was not verified: %s" % exc)
+        finally:
+            self._disconnect()
+        return verified
+
+
+def _valid_device_path(value):
+    """Accept only explicit normalized /dev paths and no control characters."""
+    if not value or any(ord(char) < 32 for char in value):
+        return False
+    normalized = posixpath.normpath(value)
+    return normalized == value and normalized.startswith("/dev/")
+
+
+def build_actuator(method, lcus2_device="", lcus2_channel="1",
+                   transport_factory=None):
+    """Build exactly one amplifier actuator from the configured method."""
+    if method == "audio-jack":
+        return Tone()
+    if method == "lcus-2":
+        if not _valid_device_path(lcus2_device):
+            raise ConfigurationError(
+                "WALL_AMP_LCUS2_DEVICE must be an explicit absolute /dev path")
+        if lcus2_channel not in ("1", "2"):
+            raise ConfigurationError("WALL_AMP_LCUS2_CHANNEL must be 1 or 2")
+        return Lcus2Relay(
+            lcus2_device,
+            channel=int(lcus2_channel),
+            heartbeat_seconds=_env("WALL_AMP_LCUS2_HEARTBEAT_SECONDS", 5.0,
+                                   lo=1.0, hi=60.0),
+            timeout=_env("WALL_AMP_LCUS2_TIMEOUT_SECONDS", 0.75,
+                         lo=0.5, hi=2.0),
+            transport_factory=transport_factory,
+        )
+    raise ConfigurationError(
+        "WALL_AMP_ACTIVATOR must be exactly audio-jack or lcus-2")
+
+
+def required_tools(method):
+    """Return only the programs used by the selected detector/actuator path."""
+    common = ("/usr/bin/arecord",)
+    if method == "audio-jack":
+        return common + ("/usr/bin/aplay", "/usr/bin/amixer")
+    if method == "lcus-2":
+        return common
+    raise ConfigurationError("unknown amplifier actuator %r" % method)
+
+
+def record_safe_state(verified):
+    """Publish or revoke the artifact consumed by the S3 power path."""
+    try:
+        if not verified:
+            try:
+                os.unlink(SAFE_STATE_FILE)
+            except FileNotFoundError:
+                pass
+            return
+        tmp = SAFE_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="ascii") as handle:
+            handle.write("OFF\n")
+        os.replace(tmp, SAFE_STATE_FILE)
+    except OSError as exc:
+        log("could not update amplifier safe-state proof: %s" % exc)
+
+
+def stop_and_record(actuator):
+    verified = actuator.stop()
+    record_safe_state(verified is not False)
+    return verified
 
 
 def main():
-    for tool in ("/usr/bin/arecord", "/usr/bin/aplay", "/usr/bin/amixer"):
+    method = os.environ.get("WALL_AMP_ACTIVATOR", "lcus-2").strip()
+    device = os.environ.get(
+        "WALL_AMP_LCUS2_DEVICE", "/dev/wall-amp-relay").strip()
+    channel = os.environ.get("WALL_AMP_LCUS2_CHANNEL", "1").strip()
+    try:
+        actuator = build_actuator(method, lcus2_device=device,
+                                  lcus2_channel=channel)
+        tools = required_tools(method)
+    except ConfigurationError as exc:
+        log("amplifier actuator configuration: %s" % exc)
+        return 78
+
+    for tool in tools:
         if not shutil.which(tool):
             log("missing %s" % tool)
             return 78
 
-    if os.environ.get("WALL_AMP_ENABLED", "true").strip().lower() in ("false", "0", "no"):
-        log("WALL_AMP_ENABLED is false; idling without emitting anything")
-        while True:
-            time.sleep(3600)
-
-    if current_mode() != "trigger":
-        log("panel mode: the amplifier is not commanded; idling")
-        # Not an error and not a restart loop -- the mode script restarts this
-        # unit when the mode changes back.
-        while True:
-            time.sleep(3600)
-
-    assert_trigger_output()
-    levels = [Level(pcm, off) for pcm, off in SOURCES]
-    for lv in levels:
-        lv.start()
-    tone = Tone()
+    # The measured LCUS-2 is a latching device: closing the serial port leaves
+    # an energized channel energized. Establish and verify the safe state on
+    # every service start, including disabled and non-trigger modes.
+    if method == "lcus-2" and not actuator.ensure_off():
+        record_safe_state(False)
+        return 1
+    record_safe_state(True)
 
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
 
+    if os.environ.get("WALL_AMP_ENABLED", "true").strip().lower() in ("false", "0", "no"):
+        log("WALL_AMP_ENABLED is false; idling without emitting anything")
+        while not stopping.wait(3600):
+            pass
+        return 0 if stop_and_record(actuator) is not False else 1
+
+    if current_mode() != "trigger":
+        log("panel mode: the amplifier is not commanded; idling")
+        # Not an error and not a restart loop -- the mode script restarts this
+        # unit when the mode changes back.
+        while not stopping.wait(3600):
+            pass
+        return 0 if stop_and_record(actuator) is not False else 1
+
+    jack_actuator = method == "audio-jack"
+    if jack_actuator:
+        assert_trigger_output()
+    else:
+        log("amplifier actuator: LCUS-2 channel %s at %s" % (channel, device))
+    levels = [Level(pcm, off) for pcm, off in SOURCES]
+    for lv in levels:
+        lv.start()
     on = False
     above_since = None
     below_since = None
     changed_at = 0.0
     last_jack_poll = 0.0
-    last_tone_attempt = -1e9
+    last_actuator_attempt = -1e9
     jack = True
     last_reassert = time.monotonic()
 
@@ -495,7 +816,7 @@ def main():
     while not stopping.is_set():
         now = time.monotonic()
 
-        if now - last_jack_poll >= JACK_POLL_SECONDS:
+        if jack_actuator and now - last_jack_poll >= JACK_POLL_SECONDS:
             last_jack_poll = now
             present = jack_present()
             if present != jack:
@@ -507,7 +828,8 @@ def main():
         # of the watchdog.
         if now - last_reassert >= 60.0:
             last_reassert = now
-            assert_trigger_output()
+            if jack_actuator:
+                assert_trigger_output()
 
         loud = any(lv.above(ON_DBFS) for lv in levels)
         quiet = all(not lv.above(OFF_DBFS) for lv in levels)
@@ -516,49 +838,55 @@ def main():
             if loud and jack:
                 above_since = above_since or now
                 if now - above_since >= ATTACK_SECONDS and now - changed_at >= MIN_OFF_SECONDS:
-                    if now - last_tone_attempt < TONE_RETRY_SECONDS:
-                        pass
-                    elif tone.start():
-                        on = True
-                        changed_at = now
-                        below_since = None
-                        log("amplifier ON (%s)"
-                            % ", ".join(lv.report() for lv in levels))
-                    else:
-                        # Stay off and say so rather than reporting a state we
-                        # could not reach; retry on a timer, not every block.
-                        last_tone_attempt = now
+                    if now - last_actuator_attempt >= ACTUATOR_RETRY_SECONDS:
+                        record_safe_state(False)
+                        if actuator.start():
+                            on = True
+                            changed_at = now
+                            below_since = None
+                            log("amplifier ON (%s)"
+                                % ", ".join(lv.report() for lv in levels))
+                        else:
+                            # Stay off and say so rather than reporting a state
+                            # we could not reach; retry on a timer, not every block.
+                            last_actuator_attempt = now
             else:
                 above_since = None
         else:
             if quiet:
                 below_since = below_since or now
                 if now - below_since >= HOLD_OFF_SECONDS and now - changed_at >= MIN_ON_SECONDS:
-                    on = False
-                    changed_at = now
-                    above_since = None
-                    tone.stop()
-                    log("amplifier OFF after %.0fs idle" % HOLD_OFF_SECONDS)
+                    if stop_and_record(actuator):
+                        on = False
+                        changed_at = now
+                        above_since = None
+                        log("amplifier OFF after %.0fs idle" % HOLD_OFF_SECONDS)
+                    else:
+                        # The relay may still be energized. Retain the logical
+                        # ON state and retry instead of publishing a false OFF.
+                        below_since = now
+                        log("amplifier OFF could not be verified; will retry")
             else:
                 below_since = None
-            if not jack and tone.running:
+            if jack_actuator and not jack and actuator.running:
                 log("trigger cable removed; stopping tone")
-                tone.stop()
+                stop_and_record(actuator)
                 on = False
                 changed_at = now
-            elif on and not tone.running and now - last_tone_attempt >= TONE_RETRY_SECONDS:
-                last_tone_attempt = now
-                log("tone stopped unexpectedly; restarting")
-                if not tone.start():
+            elif (on and not actuator.maintain(now)
+                  and now - last_actuator_attempt >= ACTUATOR_RETRY_SECONDS):
+                last_actuator_attempt = now
+                log("amplifier actuator stopped unexpectedly; restarting")
+                if not actuator.start():
                     on = False
                     changed_at = now
 
         stopping.wait(BLOCK_SECONDS)
 
-    tone.stop()
+    stopped = stop_and_record(actuator)
     for lv in levels:
         lv.stop()
-    return 0
+    return 0 if stopped is not False else 1
 
 
 if __name__ == "__main__":

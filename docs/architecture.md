@@ -165,6 +165,32 @@ The honest ledger of what has and has not been exercised is
 Hand-authored sequence diagrams of the behaviour that is easiest to misread
 from registry rows (process.md §3). Each cites the ids it renders.
 
+### Audio activity to a verified amplifier contact (SR-026, LLR-010, IF-017)
+
+The application remains hardware-blind. Every source reaches the common ALSA
+path; the image detector alone owns the configured actuator and its lifecycle.
+
+```mermaid
+flowchart LR
+    contract["SR-026 / LLR-010 / IF-017"] -. governs .-> detector
+    app[OfficeWallNaglight audio] --> alsa[ALSA default mix]
+    bt[Bluetooth A2DP sink] --> alsa
+    alsa --> detector[bounded level detector]
+    detector --> selector{WALL_AMP_ACTIVATOR}
+    selector -->|lcus-2 default| serial[CH340 /dev/wall-amp-relay]
+    serial --> relay[LCUS-2 selected dry contact]
+    selector -->|audio-jack alternative| tone[ALC255 anti-phase trigger tone]
+    relay --> amp[audio amplifier enable]
+    tone --> amp
+    power[shutdown / S3] -->|verified OFF or refuse S3| relay
+```
+
+The LCUS-2 was observed to retain ON after COM4 closed, so “the daemon exited”
+is not a safe-state assertion. Each command is followed by the board's `0xff`
+status query; service start first establishes OFF, and suspend proceeds only
+after service shutdown has verified OFF. The second relay channel is outside
+this service's ownership.
+
 ### A bounded audio request before hardware authority exists (SR-023, LLR-007, IF-015)
 
 The unavailable result is the current production behavior, not an error hidden

@@ -1,0 +1,3 @@
+# LCUS-2 dual USB relay measured 2026-09-13: CH340 VID:PID 1a86:7523.
+# Give the amplifier actuator a stable name instead of depending on ttyUSB order.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="wall-amp-relay", GROUP="dialout", MODE="0660"

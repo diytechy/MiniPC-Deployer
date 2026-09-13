@@ -340,16 +340,36 @@ This is physical work; a session can do none of it.
 **Reversible by:** `DOORBELL_MOTION_ENABLED=false` and re-running firstboot.
 The broker is restarted with a fresh credential set and builds no engine.
 
-**Gap found while writing this, not fixed here.** `electron/door-bridge.cjs`
-handles `status`, `frame` and `motion` messages and **ignores `diagnostic`
-entirely**. Nothing in the Electron host or the renderer surfaces the numbers
-step 3 and 4 depend on. Until that is closed, the diagnostic stream must be read
-directly off `/run/wall-door-stream/service.sock` as a member of the `panel`
-group (the socket is 0660 `wall-door-stream:panel` inside a 0751 directory).
-Surfacing diagnostics in the Door tab, or logging them under a
-`journalctl -t wall-door-stream` tag, is a small piece of work that belongs to
-whoever the coordinator gives the door lane to; it is out of Group C's scope
-because it touches the door view.
+**Gap found while writing this, not fixed here, and it blocks steps 3–7 as
+written.** `electron/door-bridge.cjs` handles `status`, `frame` and `motion`
+messages and **ignores `diagnostic` entirely**. Nothing in the Electron host or
+the renderer surfaces the numbers those steps depend on.
+
+Reading the socket by hand is **not** a usable substitute as things stand, and
+the first draft of this document was wrong to suggest it was. `doorstream/service.py`
+calls `server.listen(1)` and serves one client at a time in a single-threaded
+accept loop: while the kiosk's bridge owns the connection a second client just
+queues behind it and receives nothing. A hand client must also send its own
+request line first — `{"mode":"corrected","visible":false}\n` — or the broker
+sits waiting for it.
+
+So the diagnostic read is **exclusive**, and the calibration must be run one of
+two ways:
+
+* **Exclusive-diagnostic mode (available today).** Stop the kiosk
+  (`systemctl --user stop wall-kiosk` or whatever the session unit is), which
+  releases the socket, then connect as a member of the `panel` group (socket
+  0660 `wall-door-stream:panel` inside a 0751 directory), send the request line,
+  and read the `diagnostic` messages. The panel shows nothing during the run,
+  which is acceptable for calibration but means steps 4–6 need a second person
+  at the door.
+* **Bridge-forwarded diagnostics (the right fix).** Have `door-bridge.cjs`
+  accept `diagnostic` and log it under a `journalctl -t wall-door-stream` tag,
+  or surface it in the Door tab. Then the calibration is one person with the
+  panel running. It is a small change, but it touches the door view and is
+  therefore out of Group C's scope; it belongs to whichever lane the
+  coordinator gives the door to, and it should land **before** the calibration
+  is attempted.
 
 ---
 

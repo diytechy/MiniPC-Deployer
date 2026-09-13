@@ -173,18 +173,53 @@ The timers are the acceptance, because a hand-run `systemctl suspend` skips
 
 ### C. What counts as done
 
-Item 16 closes when steps 11 and 15 agree with the table above for every store
-that exists at the time, with a screenshot per check and the journal excerpts
-from 9, 10 and 14 pasted into the row. The tab gap and any store that does not
-yet exist are named explicitly in the closing note.
+Item 16 **does not close on this run.** The run establishes that every store
+which exists survives sleep and a power cycle; the Owner's item 16 also names
+the active tab, and the active tab is persisted nowhere. So the outcome of this
+procedure is one of two, and never a third:
+
+* **Persistence accepted, item 16 still open on the tab.** Steps 11 and 15
+  agree with the table for every store that exists, with a screenshot per check
+  and the journal excerpts from 9, 10 and 14. The row records "stores: pass;
+  active tab: outstanding" and names the follow-up.
+* **Failed**, if any store disagrees.
+
+Item 16 closes only after the tab is persisted and this procedure is re-run for
+steps 11 and 15. Any store that does not yet exist at the time of the run (the
+audio mode file, and the sensing store if the sensor service is still not
+installed) is named in the record, and its absence is not a pass.
 
 ---
 
 ## Item 21 — door motion takeover test plan
 
-**Blocked on** `stack/panel-access/PROVISIONING.md` §4: `motion-enabled=true` in
-`/run/wall-door-credentials/motion-enabled`, which requires
-`DOORBELL_MOTION_ENABLED=true` **and** `DOORBELL_MOTION_CALIBRATED=true`.
+**Blocked on two things, not one.** The second was missed on the first pass of
+this document and found by the adversarial review.
+
+1. `motion-enabled=true` in `/run/wall-door-credentials/motion-enabled`, which
+   requires `DOORBELL_MOTION_ENABLED=true` **and**
+   `DOORBELL_MOTION_CALIBRATED=true` (`PROVISIONING.md` §4).
+2. **A working sensor service**, i.e. `PROVISIONING.md` §3. This is not
+   optional and it is not obvious. `DoorSampling.eligible` in
+   `electron/door-bridge.cjs` is
+   `lit && (presenceRequired ? present : visible)`, and `presenceRequired` is
+   set from `!!broker.config.sensorSocket` on every poll. So:
+   * **With** a sensor service, eligibility is presence, the broker connection
+     is held open while the Door tab is hidden, and motion detection runs off
+     that same stream. This is the case the takeover was designed for.
+   * **Without** one, `visible` stands in for presence — the stream is open
+     only while the Door *tab* is open — and the module says so in as many
+     words: "a panel with no presence sensor is not running motion detection
+     either."
+
+   In FULL the Door tab is not visible, so on today's panel the broker is not
+   connected and **no amount of motion calibration can produce a takeover**.
+   Tests 21.1–21.3, 21.6 and 21.9 are not merely unverified, they are
+   unrunnable until the sensor service is installed. The alternative — making
+   the motion stream always-on for a sensorless panel — was explicitly rejected
+   once already (it held a 1536×1536 fisheye dewarp open for every lit second
+   of the day under an 80% CPU quota), so it is a design change for the Owner
+   to ask for, not a test-setup workaround.
 
 ### How the takeover actually works, so the tests match the mechanism
 
@@ -247,7 +282,14 @@ the checklist.** Concretely:
 `diagnostic` messages on the floor**. With `DOORBELL_MOTION_DIAGNOSTICS=true`
 the broker emits per-second component/track/foreground numbers that tests 21.1,
 21.7 and the whole of §4's calibration need, and nothing on the panel surfaces
-them. Until that is closed, read them directly from
-`/run/wall-door-stream/service.sock` as a member of the `panel` group. This is
-named in `PROVISIONING.md` §4 as well; it is one small change to the door
-bridge and belongs to whichever lane owns the door view.
+them.
+
+Reading the socket by hand instead is **exclusive**, not parallel:
+`doorstream/service.py` uses `listen(1)` and a single-threaded accept loop, so a
+second client queues behind the kiosk's bridge and receives nothing until the
+kiosk is stopped (and must send `{"mode":"corrected","visible":false}` as its
+first line). That makes it useless for tests 21.1–21.3, which need the panel
+running in order to observe the takeover at all. **Forwarding `diagnostic` from
+the bridge to the journal is therefore a prerequisite for item 21, not a
+convenience.** One small change to `electron/door-bridge.cjs`, owned by
+whichever lane owns the door view; also recorded in `PROVISIONING.md` §4.

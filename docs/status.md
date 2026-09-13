@@ -8,13 +8,15 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-**2026-09-13 — LCUS-2 amplifier actuation is BUILT and LOCAL-ONLY.** The initial
-panel actuator now defaults to the measured CH340 LCUS-2 board through a stable
-`/dev/wall-amp-relay` udev link, while `audio-jack` remains selectable. Commands,
-status readback, selected-channel ownership, latching-safe startup/shutdown and
-S3 refusal are implemented under SN-020/SR-026/LLR-010/TC-010/IF-017. Physical
-Linux enumeration, amplifier wiring and audibility remain unproven. Nothing was
-pushed, deployed or included on existing media.
+**2026-09-13 — LCUS-2 amplifier actuation is PROVEN ON THE PANEL, except the
+amplifier itself.** The actuator defaults to the measured CH340 LCUS-2 board
+through a stable `/dev/wall-amp-relay` udev link, `audio-jack` stays selectable,
+and SN-020/SR-026/LLR-010/TC-010/IF-017 are implemented. On the panel the board
+enumerates, the shipped transport drives it, and a full audio-to-relay cycle
+runs to the exact configured timings. **The panel now carries hand-installed
+copies of four artifacts and is AHEAD of the image** — no image has been rebuilt,
+and nothing was pushed. Still unproven: COM/NO amplifier wiring, amplifier
+audibility, S3 on hardware, USB-disconnect recovery and long-run behaviour.
 
 **2026-09-11 — Finance-Auditor snapshot recovery is BUILT and LOCAL-ONLY (not
 pushed, deployed, or included on existing media).** A reimage now restores the
@@ -8242,3 +8244,77 @@ was run independently as reported above. Not yet proven: Linux enumeration on
 the panel, actual COM/NO amplifier wiring,
 audibility, end-to-end timing, USB disconnect recovery, suspend on hardware or
 long-run behavior. Nothing was pushed, deployed or included on existing media.
+
+
+---
+
+## 2026-09-13 — LCUS-2 panel acceptance: measured, and what it cost to believe
+
+The board was plugged into the panel and the chain exercised on the real
+hardware. What the previous entry listed as unproven is now measured, with two
+exceptions that need hands and one that needs the Owner present.
+
+**Enumeration.** `1a86:7523` enumerates as `ch341-uart` on `ttyUSB0`; the
+in-tree `ch341` module is present in the offline image and its alias table
+claims the measured VID/PID directly, so no driver had to be added. The shipped
+udev rule creates `/dev/wall-amp-relay -> ttyUSB0`, `root:dialout 0660`.
+
+**Protocol, on Linux, through the shipped class.** The COM4 bench was Windows;
+`Lcus2SerialTransport` had never executed against hardware anywhere. Driven
+directly against the board it reproduced every bench observation: the `FF` query
+returns both channels, each of the four commands verifies by readback in 0.275 s,
+channel 2 was never touched, and **the relay latched across a port close and
+1 s gap** — the premise the whole safe-state design rests on, now confirmed on
+this platform rather than inherited from Windows.
+
+**End to end, at the shipped timings.** With the service in `lcus-2` mode:
+startup established verified OFF and published the proof artifact; a tone into
+`kiosk_mix` took the amplifier ON in ~1 s (attack 0.3 s); and the release came at
+**240.8 s after audio stopped, against a 240 s hold-off**. The levels confirm the
+detector's own documented numbers — `kiosk_monitor -13.5 dBFS` for a 0.30
+amplitude sine (-13.4 by calculation) and `linein_shared -83.2 dBFS`, the
+DC-stripped floor the source comment claims. Both capture sources open as root,
+so neither depends on a user ALSA config.
+
+**The heartbeat is not chatter.** `Lcus2Relay.maintain` re-sends ON every 5 s and
+the code asserted, without evidence, that this does not cycle an energized
+relay. With the relay closed and the room quiet the Owner listening at the board
+heard no repeating click. Recorded in the source as measured.
+
+**The suspend gate.** Exercising `stop_amp_trigger`'s exact mechanism — remove
+the proof, stop the unit under the 5 s ceiling, require `OFF` — the unit stopped,
+wrote `OFF`, and an independent query with the service stopped showed the relay
+open. `RuntimeDirectoryPreserve=yes` kept `/run/wall-amp-trigger` across the
+stop; the **old unit had no `RuntimeDirectory` at all**, so deploying the new
+script without the new unit would have made the proof unwritable and refused
+every suspend. A real S3 was deliberately not run remotely: suspending drops the
+panel off the LAN with no way back in before the 06:45 RTC alarm.
+
+**One false alarm, recorded because it cost time.** An initial cycle released at
+451 s rather than 240 s. That was not a defect: ad-hoc `arecord` probes joining
+and leaving the shared capture PCMs mid-cycle perturbed the daemon's own
+capture. A clean run with both captures opened once, before the stimulus, and
+held throughout gave the exact 240.8 s. The lesson is specific — **do not probe
+`linein_shared` or `kiosk_monitor` while measuring the detector's timing**; a
+single-threaded probe reading both sources also overruns and manufactures
+transients the daemon never sees.
+
+**Two code defects were fixed before any of this ran.** `termios.error` derives
+from `Exception`, not `OSError`, so it walked through every `except OSError`
+guard in `Lcus2Relay`: a device that opened but was not a TTY killed the daemon
+on a traceback instead of taking the verified-OFF path, and leaked one
+descriptor per attempt (measured 6 -> 36 over 30 attempts). It is now converted
+at the two call sites, with a regression test. `read_status` also computed its
+`select` timeout after the deadline test and could pass a negative value.
+
+**Deployment state, stated plainly.** `panel-amp-trigger.py`, the unit,
+`wall-sleep.sh` and the udev rule were hand-installed on the panel, and the
+three actuator keys rendered into `/etc/wall-panel/amp-trigger.env`. The panel
+is therefore ahead of the image and the change is not durable until firstboot
+runs from a rebuilt payload. Backups of all four originals are on the panel.
+The relay was left verified OFF and the service healthy.
+
+**Still open, and what each needs:** COM/NO continuity and the amplifier's
+trigger contract (a meter); audibility, click character, latency and false
+activations (the Owner's ears with the amplifier wired); S3 while on (the Owner
+present); USB-disconnect recovery and a long-run/reconnect test.

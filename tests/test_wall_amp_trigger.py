@@ -1,6 +1,8 @@
 """The amplifier detector can command the jack or the measured LCUS-2 relay."""
 
 import importlib.util
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -180,3 +182,47 @@ def test_image_config_selects_lcus2_through_a_stable_measured_udev_link():
     assert 'ATTRS{idVendor}=="1a86"' in rule
     assert 'ATTRS{idProduct}=="7523"' in rule
     assert 'SYMLINK+="wall-amp-relay"' in rule
+
+
+def test_a_non_serial_device_is_refused_gracefully_and_leaks_no_descriptor(monkeypatch):
+    """termios.error is built on Exception, NOT on OSError.
+
+    Unconverted it walks straight through Lcus2Relay's `except OSError` guards,
+    so a device that opens but is not a TTY killed the daemon on a traceback
+    instead of taking the designed "OFF was not verified" path -- and, because
+    the raise happened after os.open, leaked one descriptor per attempt, which
+    a heartbeat reconnect loop turns into descriptor exhaustion. The device is
+    a config value (WALL_AMP_LCUS2_DEVICE), so this is reachable in the field.
+    """
+    module = load_module()
+
+    class FakeTermiosError(Exception):
+        pass
+
+    fake_termios = types.ModuleType("termios")
+    fake_termios.error = FakeTermiosError
+    for name in ("CS8", "CREAD", "CLOCAL", "B9600", "TCSANOW",
+                 "TCIOFLUSH", "TCIFLUSH"):
+        setattr(fake_termios, name, 0)
+
+    def refuse(_fd):
+        raise FakeTermiosError(25, "Inappropriate ioctl for device")
+
+    fake_termios.tcgetattr = refuse
+
+    closed = []
+    monkeypatch.setitem(sys.modules, "termios", fake_termios)
+    # The Windows build host has neither flag; the daemon only ever runs on
+    # the panel, but this defect is worth holding from either host.
+    for flag in ("O_NOCTTY", "O_NONBLOCK"):
+        monkeypatch.setattr(module.os, flag, 0, raising=False)
+    monkeypatch.setattr(module.os, "open", lambda *_a, **_k: 4242)
+    monkeypatch.setattr(module.os, "close", closed.append)
+
+    relay = module.Lcus2Relay("/dev/wall-amp-relay")
+
+    assert relay.ensure_off() is False
+    assert relay.start() is False
+    assert relay.running is False
+    # Each refused open closed exactly the descriptor it had opened.
+    assert closed == [4242, 4242]

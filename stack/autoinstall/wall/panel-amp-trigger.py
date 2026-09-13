@@ -527,15 +527,30 @@ class Lcus2SerialTransport:
 
         self._termios = termios
         self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        attrs = termios.tcgetattr(self.fd)
-        attrs[0] = 0
-        attrs[1] = 0
-        attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
-        attrs[3] = 0
-        attrs[4] = termios.B9600
-        attrs[5] = termios.B9600
-        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
-        termios.tcflush(self.fd, termios.TCIOFLUSH)
+        # termios.error is NOT an OSError subclass (it is built with a bare
+        # Exception base), so every caller's `except OSError` would miss it and
+        # the daemon would die on a traceback instead of taking the designed
+        # "OFF was not verified" path -- and leak this fd on the way out. A
+        # device that opens but is not a TTY is a realistic misconfiguration:
+        # the symlink is a config value. Convert it and close what we opened.
+        try:
+            attrs = termios.tcgetattr(self.fd)
+            attrs[0] = 0
+            attrs[1] = 0
+            attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+            attrs[3] = 0
+            attrs[4] = termios.B9600
+            attrs[5] = termios.B9600
+            termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+        except BaseException as exc:
+            self.close()
+            if isinstance(exc, termios.error):
+                raise OSError(
+                    errno.ENOTTY,
+                    "%s is not a usable 9600-baud serial port: %s"
+                    % (self.device, exc)) from exc
+            raise
 
     def _write_all(self, payload, deadline):
         view = memoryview(payload)
@@ -550,11 +565,22 @@ class Lcus2SerialTransport:
             view = view[written:]
 
     def read_status(self, deadline):
-        self._termios.tcflush(self.fd, self._termios.TCIFLUSH)
+        # Same termios.error conversion as _open: unplugging the CH340 mid-run
+        # is exactly when this fires, and it must reach the relay's handlers.
+        try:
+            self._termios.tcflush(self.fd, self._termios.TCIFLUSH)
+        except self._termios.error as exc:
+            raise OSError(errno.ENODEV,
+                          "LCUS-2 serial device went away: %s" % exc) from exc
         self._write_all(b"\xff", deadline)
         received = bytearray()
-        while time.monotonic() < deadline:
-            readable, _, _ = select.select([self.fd], [], [], deadline - time.monotonic())
+        while True:
+            # Clamp: time passes between the deadline test and this call, and a
+            # negative select timeout raises ValueError rather than timing out.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([self.fd], [], [], remaining)
             if not readable:
                 break
             chunk = os.read(self.fd, 128 - len(received))
@@ -664,6 +690,10 @@ class Lcus2Relay:
         try:
             # Re-sending ON does not cycle an already-energized relay, and the
             # following status query proves the serial and MCU path stayed live.
+            # MEASURED on the panel 2026-09-13, not assumed: with the relay held
+            # closed and the room quiet, the Owner listening at the board heard
+            # no repeating click on the 5 s beat. Had it re-actuated, this
+            # heartbeat would chatter the contacts for as long as audio plays.
             self._transport.set_state(self.channel, True)
             self._checked_at = now
             return True

@@ -240,7 +240,9 @@ def test_a_failed_source_reposts_the_last_true_reading_at_its_own_stamp_sr021(tm
     ok_reader = {"codex": lambda e: feeder.parse_codex(CODEX_RESULT, NOW)}
     rec = Recorder()
     feeder.run_cycle(env, now=NOW, readers=ok_reader, poster=rec)
-    assert rec.bodies[0]["value"] == 34.0
+    # 34 % CONSUMED reaches the wire as 66 % REMAINING: the bar drains
+    # (GAUGE_DIRECTION, IF-012 v1.1). The state file still stores 34.
+    assert rec.bodies[0]["value"] == 66.0
     assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW)
     assert feeder.is_fresh(rec.bodies[0], NOW)
 
@@ -250,7 +252,7 @@ def test_a_failed_source_reposts_the_last_true_reading_at_its_own_stamp_sr021(tm
     later = NOW + 25 * 3600          # past the 24h weekly horizon
     rec2 = Recorder()
     feeder.run_cycle(env, now=later, readers={"codex": broken}, poster=rec2)
-    assert rec2.bodies[0]["value"] == 34.0, "the value must be the one that was true"
+    assert rec2.bodies[0]["value"] == 66.0, "the value must be the one that was true"
     assert rec2.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW), "stamped when it was true, not now"
     assert not feeder.is_fresh(rec2.bodies[0], later)
 
@@ -331,7 +333,10 @@ def test_every_posted_gauge_matches_the_tightened_wire_shape_sr021(tmp_path):
         # direction is required WITH a window and refused WITHOUT one.
         assert ("window" in body) == ("direction" in body)
         if "window" in body:
-            assert body["direction"] == "up"     # usage counts UP toward a cap
+            # The bar carries plan REMAINING and drains to 0 at the reset, so
+            # the pace line falls from a full bar rather than rising from an
+            # empty one. "up" with target 0 made pace identically zero.
+            assert body["direction"] == "down"
             assert body["window"]["start"] < body["window"]["end"]
             assert body["window"]["kind"] in ("daily", "weekly", "monthly", "static")
         for field in ("id", "label", "icon", "unit"):
@@ -368,7 +373,7 @@ def test_a_stamped_gauge_may_never_be_windowless_sr021():
     with pytest.raises(ValueError):
         feeder.build_gauge(spec, 10.0, NOW, None, 3600)
     ok = feeder.build_gauge(spec, 10.0, NOW, NOW + 600, 3600)
-    assert ok["window"]["kind"] == "daily" and ok["direction"] == "up"
+    assert ok["window"]["kind"] == "daily" and ok["direction"] == "down"
 
 
 @pytest.mark.parametrize("mangle,why", [
@@ -582,7 +587,7 @@ def test_a_planted_symlink_costs_the_history_and_never_the_token_sr021(tmp_path)
         env, now=NOW, poster=rec,
         readers={"codex": lambda e: feeder.parse_codex(CODEX_RESULT, NOW)})
 
-    assert rec.bodies and rec.bodies[0]["value"] == 34.0, "the gauge still posts"
+    assert rec.bodies and rec.bodies[0]["value"] == 66.0, "the gauge still posts"
     assert any("state" in f for f in failures), "and the refusal is reported"
     assert victim.read_text(encoding="utf-8") == "REAL-VENDOR-TOKEN"
 
@@ -1059,9 +1064,14 @@ def test_a_corrupt_stored_reading_is_refused_AT_THE_POINT_OF_USE_sr021():
     spec = feeder.GAUGE_SPECS[0]
     body, fresh = feeder.build_post(spec, None, _sane_entry(value=100000), NOW)
     assert fresh is False
+    # An unmeasured gauge posts 0 REMAINING -- an empty bar, the pessimistic
+    # end. It used to be 0 consumed, and inverting that literal would have
+    # made a never-measured source render as a full, reassuring bar.
     assert body["value"] == 0 and "observed_at" not in body
+    # The STORED value is consumed percent; the posted one is remaining, and
+    # the inversion applies to a re-posted reading exactly as to a fresh one.
     good, fresh = feeder.build_post(spec, None, _sane_entry(value=34.0), NOW)
-    assert fresh is False and good["value"] == 34.0
+    assert fresh is False and good["value"] == 66.0
 
 
 def test_corrupt_state_posts_unavailable_and_never_a_fabricated_reading_sr021(tmp_path):
@@ -1089,7 +1099,7 @@ def test_corrupt_state_posts_unavailable_and_never_a_fabricated_reading_sr021(tm
     assert "observed_at" not in bodies["ai-usage-codex"]
     assert not feeder.is_fresh(bodies["ai-usage-codex"], NOW)
     # the untampered neighbour is still real history, reposted at its own stamp
-    assert bodies["ai-usage-claude-session"]["value"] == 12.0
+    assert bodies["ai-usage-claude-session"]["value"] == 88.0  # 12 consumed
     assert bodies["ai-usage-claude-session"]["observed_at"] == feeder.rfc3339_utc(NOW - 7200)
 
 
@@ -1306,3 +1316,140 @@ def test_setup_installs_and_enables_the_refresher():
     assert "systemctl enable --now homehub-claude-refresh.timer" in setup
     # It runs as the same account as the feeder, from the same single knob.
     assert "homehub-claude-refresh.service.d" in setup
+
+
+# ── IF-012 v1.1: remaining, and the scoped per-model gauge ─────────────────
+#
+# THESE GO THROUGH run_cycle, NOT build_gauge. A NagLight field shipped dead for
+# one commit because it was added to the model and never to the wire struct, and
+# unit tests that construct the body directly cannot see that class of gap. Each
+# test below asserts on what the POSTER received.
+
+
+def _claude_with_scoped(display_name="Fable", percent=0, **over):
+    """CLAUDE_BODY plus one scoped per-model weekly limit, as observed live."""
+    body = json.loads(json.dumps(CLAUDE_BODY))
+    entry = {"kind": "weekly_scoped", "group": "weekly", "percent": percent,
+             "severity": "normal",
+             "resets_at": "2026-09-12T09:00:00.468835+00:00",
+             "scope": {"model": {"id": None, "display_name": display_name},
+                       "surface": None},
+             "is_active": False}
+    entry.update(over)
+    body["limits"].append(entry)
+    return body
+
+
+def _claude_cycle(tmp_path, body, now=NOW):
+    env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
+    rec = Recorder()
+    feeder.run_cycle(env, now=now, poster=rec,
+                     readers={"claude": lambda e: feeder.parse_claude(body, now)})
+    return {b["id"]: b for b in rec.bodies}
+
+
+def test_a_scoped_model_limit_becomes_its_own_gauge_sr075(tmp_path):
+    """Fable's weekly figure is only in limits[]; it must reach the wire."""
+    bodies = _claude_cycle(tmp_path, _claude_with_scoped(percent=12))
+    g = bodies["ai-usage-claude-weekly-fable"]
+    assert g["value"] == 88.0, "12 % consumed is 88 % remaining"
+    assert g["label"] == "Claude F5"
+    assert g["icon"] == bodies["ai-usage-claude-weekly"]["icon"], \
+        "the scoped gauge shares Claude's icon so the panel groups them"
+    assert g["direction"] == "down"
+    assert feeder.is_fresh(g, NOW)
+    # It shares the all-model weekly window, read from its own resets_at.
+    assert g["window"] == bodies["ai-usage-claude-weekly"]["window"]
+
+
+def test_the_scoped_gauge_sorts_after_the_all_model_one_sr075(tmp_path):
+    """NagLight serves gauges in id order and the panel draws the first gauge of
+    a window as the headline, so this ordering IS the sub-column contract."""
+    bodies = _claude_cycle(tmp_path, _claude_with_scoped())
+    assert sorted(bodies).index("ai-usage-claude-weekly") < \
+        sorted(bodies).index("ai-usage-claude-weekly-fable")
+
+
+def test_a_scoped_limit_is_keyed_on_display_name_not_a_codename_sr075(tmp_path):
+    """The live body carries unreleased-model placeholder keys whose names are
+    NOT contractual. Reading one would break the day it is renamed."""
+    body = json.loads(json.dumps(CLAUDE_BODY))
+    for codename in ("nimbus_quill", "cinder_cove", "copper_kite", "tangelo",
+                     "seven_day_fable"):
+        body[codename] = {"utilization": 5.0,
+                          "resets_at": "2026-09-12T09:00:00.468835+00:00"}
+    bodies = _claude_cycle(tmp_path, body)
+    assert "ai-usage-claude-weekly-fable" not in bodies, \
+        "a top-level codename must never be mistaken for a scoped model reading"
+
+    # And a scoped entry for a DIFFERENT model is not Fable either.
+    bodies = _claude_cycle(tmp_path, _claude_with_scoped(display_name="Opus"))
+    assert "ai-usage-claude-weekly-fable" not in bodies
+
+
+def test_an_absent_scoped_limit_posts_no_gauge_at_all_sr075(tmp_path):
+    """An optional gauge the vendor never mentions must not become a gauge that
+    reads 'unavailable' every cycle forever -- that teaches people to ignore the
+    word. The non-optional gauges beside it are unaffected."""
+    bodies = _claude_cycle(tmp_path, CLAUDE_BODY)
+    assert "ai-usage-claude-weekly-fable" not in bodies
+    assert {"ai-usage-claude-session", "ai-usage-claude-weekly"} <= set(bodies)
+
+
+def test_a_scoped_limit_that_disappears_still_goes_stale_in_sight_sr075(tmp_path):
+    """Once seen it keeps being posted, so a limit that VANISHES shows as
+    unavailable rather than silently leaving the wall."""
+    env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
+    seen = _claude_with_scoped(percent=40)
+    rec = Recorder()
+    feeder.run_cycle(env, now=NOW, poster=rec,
+                     readers={"claude": lambda e: feeder.parse_claude(seen, NOW)})
+    assert any(b["id"] == "ai-usage-claude-weekly-fable" for b in rec.bodies)
+
+    later = NOW + 25 * 3600          # past the weekly horizon
+    rec2 = Recorder()
+    feeder.run_cycle(env, now=later, poster=rec2,
+                     readers={"claude": lambda e: feeder.parse_claude(CLAUDE_BODY, later)})
+    g = {b["id"]: b for b in rec2.bodies}["ai-usage-claude-weekly-fable"]
+    assert g["value"] == 60.0, "the last value that WAS true, as remaining"
+    assert g["observed_at"] == feeder.rfc3339_utc(NOW), "stamped when it was true"
+    assert not feeder.is_fresh(g, later)
+
+
+def test_a_scoped_limit_with_a_bad_percent_does_not_fail_the_source_sr075(tmp_path):
+    """A malformed scoped entry is a missing reading, not a failure of the
+    top-level buckets that parsed fine beside it."""
+    for bad in (None, "40", float("nan"), -1, 101, True):
+        bodies = _claude_cycle(tmp_path, _claude_with_scoped(percent=bad))
+        assert {"ai-usage-claude-session", "ai-usage-claude-weekly"} <= set(bodies), \
+            "percent=%r took the whole source down" % (bad,)
+        assert "ai-usage-claude-weekly-fable" not in bodies
+
+
+def test_limits_that_is_not_a_list_is_survivable_sr075(tmp_path):
+    for junk in ({}, "limits", 7, None):
+        body = json.loads(json.dumps(CLAUDE_BODY))
+        body["limits"] = junk
+        bodies = _claude_cycle(tmp_path, body)
+        assert {"ai-usage-claude-session", "ai-usage-claude-weekly"} <= set(bodies)
+
+
+def test_a_never_measured_gauge_posts_an_EMPTY_bar_not_a_full_one_sr075(tmp_path):
+    """The unavailable sentinel is the pessimistic end of the bar.
+
+    Under the old count-up shape it was 0, meaning nothing consumed. Inverting
+    to remaining turned that same literal into 100 % REMAINING -- a full, green,
+    reassuring bar for a source that has never answered. It is only staleness
+    that stops it being rendered, and the number must fail safe anyway.
+    """
+    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+
+    def broken(_env):
+        raise feeder.SourceFailure("HTTP 401")
+
+    rec = Recorder()
+    feeder.run_cycle(env, now=NOW, poster=rec, readers={"codex": broken})
+    body = {b["id"]: b for b in rec.bodies}["ai-usage-codex"]
+    assert body["value"] == 0.0, "an unmeasured gauge is an EMPTY bar"
+    assert "observed_at" not in body
+    assert not feeder.is_fresh(body, NOW)

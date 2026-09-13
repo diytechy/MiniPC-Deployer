@@ -95,12 +95,46 @@ from datetime import datetime, timezone
 #     range for units with an agreed width (`lb` alone today), so a percentage
 #     feeder MUST send them;
 #   * `direction` is required whenever `window` is present and REFUSED when it
-#     is absent. Usage counts UP toward a cap, so it is always "up" here.
+#     is absent.
 GAUGE_UNIT = "%"
 GAUGE_MIN = 0.0
 GAUGE_MAX = 100.0
-GAUGE_TARGET = 0.0          # 0% consumed is the good end; we count up from it.
-GAUGE_DIRECTION = "up"
+
+# THE WIRE CARRIES PLAN REMAINING, NOT PLAN CONSUMED (Owner ruling 2026-09-12).
+#
+# This pairing is load-bearing and the previous one was silently broken. The
+# feeder used to post `target: 0` WITH `direction: "up"`, and NagLight runs an
+# "up" pace from `min` to `target` -- which is 0 to 0. The served `pace` was
+# therefore ZERO at every point of every window, for every gauge this feeder has
+# ever posted. The dashed line sat on the floor of each bar, and NagLight's
+# deviation collapsed to `value / 50`, so the bar's colour became a pure
+# function of percent consumed: full red at 50% used no matter where the window
+# was. OpenCode weekly showed red at 78% used on day six of seven -- a healthy
+# burn -- exactly as it would at 51% on day one, which is an emergency.
+#
+# Counting DOWN from a full bar fixes it without a contract change: `pace`
+# becomes `100 * (1 - elapsed)`, the plan you ought to have left right now, and
+# the bar drains as the window burns.
+GAUGE_TARGET = 0.0          # nothing left at the reset is where the pace line ends.
+GAUGE_DIRECTION = "down"    # ... and it falls to there from a full bar at the start.
+
+# THE "NEVER MEASURED ANYTHING" SENTINEL, IN CONSUMED TERMS, AND IT MUST BE THE
+# PESSIMISTIC END OF THE BAR.
+#
+# When a source fails and no previous reading exists, the feeder still posts a
+# gauge so the panel can say "unavailable" rather than silently dropping a
+# limit. That body carries NO `observed_at`, which NagLight treats as stale on
+# arrival, so the number is never rendered as a live reading -- but it is the
+# one number in this file that was not measured, and it must fail in the safe
+# direction if staleness ever stops protecting it.
+#
+# Under the old count-up shape that number was 0, meaning "nothing consumed",
+# which read as an empty bar. Inverting to remaining turned the SAME literal
+# into 100 % remaining -- a full, reassuring bar for a source that has never
+# answered. Naming it in consumed terms keeps the intent where the flip happens:
+# a fully consumed plan inverts to an empty bar, which is what an unmeasured
+# gauge should look like if it is ever seen at all.
+UNAVAILABLE_CONSUMED = GAUGE_MAX
 RUNE_LIMIT = 120            # id/label/icon/unit are capped in RUNES, not bytes.
 
 # NagLight's staleness horizons, by window kind. Kept here because the feeder's
@@ -332,15 +366,27 @@ class GaugeSpec(object):
     `key` is BOTH the NagLight upsert id and the key in this feeder's state
     file, deliberately: a repost replaces by id, and the last-known reading we
     fall back to on a failure must be the reading for that same id.
+
+    `optional` marks a gauge the vendor may legitimately never mention. The
+    five original gauges are NOT optional: each is a plan limit the household
+    knows it has, so one going missing is news and must show as "unavailable"
+    rather than vanishing. A per-model scoped limit is different -- whether it
+    appears at all depends on the plan -- and a gauge that reads "unavailable"
+    every cycle forever is worse than no gauge, because it teaches people to
+    ignore the word. So an optional spec is posted only once there is something
+    to say about it: a reading this cycle, or a stored one from a cycle that
+    had it. Once seen it keeps being posted, so a limit that DISAPPEARS still
+    goes stale in plain sight instead of silently leaving the wall.
     """
 
-    __slots__ = ("key", "label", "icon", "source")
+    __slots__ = ("key", "label", "icon", "source", "optional")
 
-    def __init__(self, key, label, icon, source):
+    def __init__(self, key, label, icon, source, optional=False):
         self.key = key
         self.label = label
         self.icon = icon
         self.source = source
+        self.optional = optional
 
 
 def parse_codex(payload, now):
@@ -401,6 +447,37 @@ CLAUDE_BUCKETS = (
     ("seven_day", "ai-usage-claude-weekly", "Claude weekly", 7 * 24 * 3600),
 )
 
+# PER-MODEL USAGE IS NOT A TOP-LEVEL KEY, AND THE ONES THAT LOOK LIKE IT ARE A
+# TRAP. Measured against the live endpoint 2026-09-12: there is no
+# `seven_day_fable`; `seven_day_opus` and `seven_day_sonnet` are both null; and
+# `seven_day_breakdown` is a split by SURFACE (Claude Code / Chats / Cowork /
+# Other) whose rows are shares of usage summing to 100, not shares of a quota.
+#
+# The body also carries `nimbus_quill`, `cinder_cove`, `copper_kite`,
+# `harbor_lantern`, `amber_ladder`, `juniper_tide`, `tangelo`,
+# `iguana_necktie`, `omelette_promotional`, `seven_day_cowork` and
+# `seven_day_omelette` -- unreleased-model placeholders, mostly null, whose
+# NAMES ARE NOT CONTRACTUAL. Keying on one would break silently the day it is
+# renamed or ships.
+#
+# The only per-model signal on the wire is `limits[]`, where a scoped limit
+# names its model in `scope.model.display_name`:
+#
+#   {"kind": "weekly_scoped", "group": "weekly", "percent": 0,
+#    "resets_at": "...", "scope": {"model": {"id": null,
+#                                            "display_name": "Fable"}}}
+#
+# `scope.model.id` is null, so the display name is the only handle there is.
+# Each entry is (display name, gauge key, label, window length in seconds).
+CLAUDE_SCOPED_MODELS = (
+    ("Fable", "ai-usage-claude-weekly-fable", "Claude F5", 7 * 24 * 3600),
+)
+
+# The kind a per-model weekly limit carries. Anything else in `limits[]` is a
+# window this feeder already reads from a top-level bucket, or one it does not
+# know; either way it is not a scoped model reading.
+CLAUDE_SCOPED_KIND = "weekly_scoped"
+
 
 def parse_claude(payload, now):
     """Turn one OAuth usage body into {gauge key: Reading}.
@@ -446,8 +523,69 @@ def parse_claude(payload, now):
             problems.append(str(exc))
             continue
         out[key] = Reading(percent, window_end, window_seconds)
+    out.update(parse_claude_scoped(payload, now, problems))
     if not out:
         raise SourceFailure("claude: no usable bucket (%s)" % "; ".join(problems))
+    return out
+
+
+def parse_claude_scoped(payload, now, problems):
+    """Per-model weekly readings out of `limits[]`, keyed on the model's name.
+
+    Contract:
+      Inputs:  payload: the decoded JSON body; now: this cycle's clock;
+               problems: the caller's list, appended to for anything skipped so
+               one failure message names every gap.
+      Outputs: dict of gauge key -> Reading, one per CLAUDE_SCOPED_MODELS entry
+               that is present AND usable. Empty is an ordinary result, not an
+               error: a household that has never touched a scoped model may
+               legitimately have no such limit, and the caller already raises
+               when NOTHING at all was usable.
+      Raises:  never. A malformed `limits[]` is a missing reading, not a failure
+               of the top-level buckets that parsed fine beside it.
+
+    `severity` IS STILL READ AND DISCARDED, here as everywhere else. The vendor
+    grades its own numbers and NagLight grades ours; only one of them may own
+    the panel's colour. This function reads `kind`, `scope.model.display_name`,
+    `percent` and `resets_at`, and nothing else.
+
+    Implements: LLR-005, SR-075 (IF-012 v1.1)
+    """
+    limits = payload.get("limits")
+    if not isinstance(limits, list):
+        return {}
+    out = {}
+    for name, key, _label, window_seconds in CLAUDE_SCOPED_MODELS:
+        entry = None
+        for candidate in limits:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("kind") != CLAUDE_SCOPED_KIND:
+                continue
+            scope = candidate.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            if isinstance(model, dict) and model.get("display_name") == name:
+                entry = candidate
+                break
+        if entry is None:
+            problems.append("no %s limit in limits[]" % name)
+            continue
+        where = "claude scoped " + name
+        try:
+            percent = check_percent(entry.get("percent"), where)
+            resets_at = entry.get("resets_at")
+            # A scoped weekly limit shares its reset with the all-model weekly
+            # bucket, so this window is the same seven days -- but it is read
+            # from the entry's OWN `resets_at` rather than copied across, so a
+            # vendor that ever decouples them cannot make this gauge lie.
+            window_end, window_length = check_window(
+                None if resets_at is None
+                else parse_iso8601_utc(resets_at, where),
+                window_seconds, now, where)
+        except SourceFailure as exc:
+            problems.append(str(exc))
+            continue
+        out[key] = Reading(percent, window_end, window_length)
     return out
 
 
@@ -545,6 +683,15 @@ GAUGE_SPECS = (
     GaugeSpec("ai-usage-codex", "Codex weekly", "🤖", "codex"),
     GaugeSpec("ai-usage-claude-session", "Claude session", "🧠", "claude"),
     GaugeSpec("ai-usage-claude-weekly", "Claude weekly", "🧠", "claude"),
+    # The scoped per-model gauge shares Claude's icon, so the panel groups it
+    # with the other two rather than inventing a fourth provider. Its id sorts
+    # immediately AFTER `ai-usage-claude-weekly`, which matters: NagLight serves
+    # gauges in id order, and the panel draws the first gauge of a window as the
+    # headline and a second one sharing that window as the narrow sub-column.
+    # Renaming this key to sort before the all-model weekly would silently swap
+    # which of the two is the headline.
+    GaugeSpec("ai-usage-claude-weekly-fable", "Claude F5", "🧠", "claude",
+              optional=True),
     GaugeSpec("ai-usage-opencode-weekly", "OpenCode weekly", "🧩", "opencode"),
     GaugeSpec("ai-usage-opencode-monthly", "OpenCode monthly", "🧩", "opencode"),
 )
@@ -602,7 +749,17 @@ def build_gauge(spec, value, observed_at, window_end, window_seconds):
         "label": spec.label,
         "icon": spec.icon,
         "unit": GAUGE_UNIT,
-        "value": float(value),
+        # CONSUMED IN, REMAINING OUT, AND THE INVERSION LIVES HERE ONLY.
+        # Every vendor states usage as percent CONSUMED, and that is what the
+        # readers parse, what `Reading.percent` holds and what the state file
+        # stores -- so the number we keep is the number the source actually
+        # said. The wire wants remaining (see GAUGE_DIRECTION), and this is the
+        # single point where the body is assembled, so it is the single point
+        # that flips. Both callers in `build_post` pass a CONSUMED percent --
+        # this cycle's reading, or a stored one being re-posted at its original
+        # timestamp -- so both get inverted identically and no stored state has
+        # to be migrated.
+        "value": float(GAUGE_MAX - value),
         "min": GAUGE_MIN,
         "max": GAUGE_MAX,
         "target": GAUGE_TARGET,
@@ -753,7 +910,7 @@ def build_post(spec, reading, last, now):
     if checked is not None:
         return build_gauge(spec, checked["value"], checked["observed_at"],
                            checked["window_end"], checked["window_seconds"]), False
-    return build_gauge(spec, 0.0, None, None, None), False
+    return build_gauge(spec, UNAVAILABLE_CONSUMED, None, None, None), False
 
 
 def is_fresh(body, now):
@@ -1590,11 +1747,17 @@ def run_cycle(env, now=None, readers=None, poster=None):
         if spec.source not in active:
             continue
         reading = readings.get(spec.key)
+        stored = state.get(spec.key)
+        # An OPTIONAL gauge the vendor has never mentioned is not posted at all
+        # -- see GaugeSpec. It becomes a real gauge the first cycle that carries
+        # it, and keeps being posted after that, stored reading and all.
+        if spec.optional and reading is None and stored is None:
+            continue
         try:
-            body, fresh = build_post(spec, reading, state.get(spec.key), now)
+            body, fresh = build_post(spec, reading, stored, now)
         except (ValueError, SourceFailure) as exc:
             failures.append("gauge %s: %s" % (spec.key, exc))
-            body, fresh = build_gauge(spec, 0.0, None, None, None), False
+            body, fresh = build_gauge(spec, UNAVAILABLE_CONSUMED, None, None, None), False
             reading = None
         try:
             ok, detail = (poster or post_gauge)(body, feed_url, env, timeout)

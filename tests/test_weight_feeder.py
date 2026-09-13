@@ -3577,3 +3577,32 @@ def test_mint_hands_the_token_DIRECTORY_to_the_account_too():
         "mint hands the token file to the feeder's account but not the "
         "directory holding it; a 0700 root-owned directory makes the 0600 "
         "token unreadable and the feeder's own remedy rebuilds it")
+
+
+def test_the_posted_body_says_lower_is_better_sr075(tmp_path):
+    """IF-012 v1.1: without `favourable` this gauge is graded symmetrically, so
+    25 lb UNDER the goal renders exactly as red as 25 lb over.
+
+    Asserted on what the POSTER received, not on gauge_body's return: a wire
+    field that is built but never sent is the failure mode this guards against.
+    """
+    posts = []
+    env = {"_identity": "u", "_feed_url": "http://127.0.0.1:8787/api/feed",
+           "WEIGHT_STATE_FILE": str(tmp_path / "state.json")}
+
+    def reader(_env):
+        raise feeder.SourceFailure("no vendor in this test")
+
+    feeder.run_cycle(
+        env, now=NOW,
+        readers={"google-health": reader},
+        poster=lambda body, url, e, t: (posts.append(body), (True, "HTTP 200"))[1],
+        goal_loader=lambda d, *a: (GOAL, "health.md"))
+
+    assert len(posts) == 1
+    assert posts[0]["favourable"] == "low"
+    assert posts[0]["target"] == float(GOAL)
+    # And it stays a STANDING target: favourable is not direction, and NagLight
+    # refuses a direction without a window.
+    assert "direction" not in posts[0]
+    assert "window" not in posts[0]

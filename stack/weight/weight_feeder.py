@@ -212,6 +212,8 @@ GAUGE_ID = "weight"          # the SAME id B5's feeders/weight-manual.ps1 posts,
 GAUGE_LABEL = "Weight"
 GAUGE_ICON = "scale"
 GAUGE_UNIT = "lb"
+# Which side of the goal is the good side (IF-012 v1.1). See gauge_body.
+GAUGE_FAVOURABLE = "low"
 RUNE_LIMIT = 120             # id/label/icon/unit are capped in RUNES, not bytes.
 
 # WHY NO min/max IS SENT, AND WHY THAT IS A DECISION RATHER THAN AN OMISSION.
@@ -1334,6 +1336,19 @@ def gauge_body(value_lb, goal_lb, observed_at):
         "unit": GAUGE_UNIT,
         "value": float(value_lb),
         "target": float(goal_lb),
+        # LOWER IS BETTER, AND NOTHING ELSE ON THE WIRE COULD SAY SO.
+        # `direction` would be the obvious place, but NagLight REFUSES it
+        # without a window (it names where a pace line starts, and a standing
+        # goal has no origin to run from), so before IF-012 v1.1 this gauge had
+        # no way to state which side of the goal was the good one. It was
+        # therefore graded symmetrically: 25 lb UNDER the goal rendered exactly
+        # as red as 25 lb over.
+        #
+        # With `favourable` the unfavourable side keeps the full ramp to red
+        # while at-or-below-goal is flat green at any distance -- deliberately
+        # flat, not merely capped, because a standing target has no deadline and
+        # nothing is lost by being on its good side (Owner ruling 2026-09-12).
+        "favourable": GAUGE_FAVOURABLE,
     }
     if observed_at is not None:
         body["observed_at"] = iso8601_utc(int(observed_at))

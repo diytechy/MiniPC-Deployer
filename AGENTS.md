@@ -1,5 +1,10 @@
 # AGENTS.md — Agent & Contributor Guide
 
+> **Current follow-up:** read [panel findings](../HomeHub/docs/PANEL_CURRENT_2026-09-13.md) first.
+> Dated build plans now redirect to historical records. All standing
+> operating rules below remain in force.
+
+
 **What this file does:** the standing brief for any agent or human working in
 this repo — *how we build here*, so quality doesn't depend on who (or which
 model) shows up. It is loaded every session: keep it short and current.

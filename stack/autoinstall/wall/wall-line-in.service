@@ -35,11 +35,28 @@ Description=Wall panel: pass the USB line-in through to the amplifier output
 Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
 After=sound.target
 Wants=sound.target
+# The guard exits within a second of a wedge, so the default 5-starts-in-10s
+# limit would land the unit in `failed` in the middle of a genuine recovery and
+# leave the panel silent until a human noticed. These are [Unit] keys, not
+# [Service] keys: systemd-analyze verify says "Unknown key name" for the
+# [Service] spelling and then IGNORES it, which reads exactly like working
+# configuration. Ten starts a minute is still bounded.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 # NO ConditionPathExists HERE. It was tried and it lost a race (2026-09-12):
 # USB enumeration finished after the condition was evaluated, so a rebooted
 # panel skipped this unit with "start condition unmet" and had no passthrough
-# until someone started it by hand. 90-wall-line-in.rules device-activates it
-# instead, so the adapter's own appearance is what starts it.
+# until someone started it by hand. 90-wall-audio-adapter.rules device-activates
+# it instead, so the adapter's own appearance is what starts it.
+#
+# AND, since 2026-09-13 (Owner item 25), the adapter's DISappearance is what
+# stops it. This unit already restarted itself when the hub moved ports -- its
+# alsaloop died rather than wedging -- but it is bound here with its two
+# siblings so all three follow one device, from one rule, with one explanation.
+# The alias is a port-independent name; the kernel's own
+# sys-devices-...-card1.device name contains the USB port that just changed.
+BindsTo=dev-wall_audio_adapter.device
+After=dev-wall_audio_adapter.device
 
 [Service]
 Type=simple
@@ -102,7 +119,9 @@ ExecStartPre=/usr/bin/amixer -c ${WALL_AUDIO_ADAPTER_CARD} sset Line 0% cap
 # `amp_feed` is front L/R of a 6-channel mix. The rear pair is not surround --
 # it is a control line carrying a trigger tone for the amplifier's power relay,
 # pinned at 0 dB independently of the volume rocker. See asound.conf.
-ExecStart=/usr/bin/alsaloop \
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
     --cdevice linein_shared \
     --pdevice speaker_shared \
     --format S16_LE --rate 48000 --channels 2 \

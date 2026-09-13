@@ -16,6 +16,25 @@ Description=Wall panel: hold the amplifier on while audio is playing
 Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
 After=sound.target wall-line-in.service
 Wants=sound.target
+# A re-enumeration can restart this unit while the relay is still being
+# re-probed, so a couple of exits in quick succession are recovery, not a
+# crash loop, and must not land it in `failed`. [Unit] keys, not [Service]:
+# the [Service] spelling is accepted-and-ignored with only a verify warning.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+# ITEM 25 (2026-09-13): when the hub moved ports this daemon lost its line-in
+# capture AND its relay handle and did not get either back until a hand-run
+# restart. Bound to the adapter's udev alias, a re-enumeration stops it -- which
+# also drives the relay to a verified OFF on the way down, the correct state
+# when there is no longer any audio hardware -- and the SYSTEMD_WANTS in
+# 90-wall-audio-adapter.rules starts it again when the adapter returns.
+#
+# The LCUS-2 relay is a SEPARATE USB device on the same hub and is deliberately
+# not a dependency: its node is a udev symlink that reappears on its own, and
+# the daemon now waits a bounded WALL_AMP_RELAY_WAIT_SECONDS for it at start
+# rather than exiting on the first ENOENT of a re-enumeration in progress.
+BindsTo=dev-wall_audio_adapter.device
+After=dev-wall_audio_adapter.device
 
 [Service]
 Type=simple

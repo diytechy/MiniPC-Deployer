@@ -743,9 +743,21 @@ done
 
 # Device activation, because ConditionPathExists on a sound card loses the USB
 # enumeration race and a unit skipped for an unmet condition is never retried.
-if [ -f "$PAYLOAD/90-wall-line-in.rules" ]; then
-    install -m 0644 "$PAYLOAD/90-wall-line-in.rules" /etc/udev/rules.d/90-wall-line-in.rules
+# Since 2026-09-13 the same rule also gives the adapter a port-independent
+# systemd alias, which is what the three audio units BindsTo= so that moving the
+# USB hub to another port stops and restarts them (Owner item 25).
+if [ -f "$PAYLOAD/90-wall-audio-adapter.rules" ]; then
+    install -m 0644 "$PAYLOAD/90-wall-audio-adapter.rules" \
+        /etc/udev/rules.d/90-wall-audio-adapter.rules
+    # The predecessor. Left in place it would keep re-adding its own add-only
+    # SYSTEMD_WANTS with no alias, which is harmless, and would keep claiming in
+    # a comment that line-in is the only unit involved, which is not.
+    rm -f /etc/udev/rules.d/90-wall-line-in.rules
     udevadm control --reload-rules >/dev/null 2>&1 || true
+    # A panel being upgraded in place has the adapter already plugged in, so no
+    # add event is coming: without this the alias would not exist until the next
+    # re-plug or reboot and every BindsTo= would refuse to start.
+    udevadm trigger --subsystem-match=sound >/dev/null 2>&1 || true
 fi
 if [ -f "$PAYLOAD/99-wall-amp-lcus2.rules" ]; then
     install -m 0644 "$PAYLOAD/99-wall-amp-lcus2.rules" /etc/udev/rules.d/99-wall-amp-lcus2.rules
@@ -753,13 +765,19 @@ if [ -f "$PAYLOAD/99-wall-amp-lcus2.rules" ]; then
     udevadm trigger --subsystem-match=tty >/dev/null 2>&1 || true
 fi
 
-for _f in panel-volume-keys.py panel-amp-trigger.py; do
+for _f in panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py; do
     if [ -f "$PAYLOAD/$_f" ]; then
         install -m 0755 "$PAYLOAD/$_f" "/usr/local/lib/wall-panel/$_f"
     else
         warn "audio: $_f is not on the payload."
     fi
 done
+
+# Not a warning: both alsaloop units name the guard as their ExecStart, so an
+# absent one is not a degraded panel, it is a panel with no audio path at all.
+if [ ! -x /usr/local/lib/wall-panel/wall-alsaloop-guard.py ]; then
+    fail_step "wall-alsaloop-guard.py is not installed. wall-line-in and wall-kiosk-loop both ExecStart it, so BOTH will fail to start and the panel will have no audio in either direction. Copy it from $PAYLOAD/ to /usr/local/lib/wall-panel/ with mode 0755."
+fi
 
 [ -f "$PAYLOAD/wall-audio-mode" ] && install -m 0755 "$PAYLOAD/wall-audio-mode" /usr/local/sbin/wall-audio-mode
 

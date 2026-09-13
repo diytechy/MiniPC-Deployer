@@ -183,6 +183,17 @@ JACK_CONTROL = "Front Headphone Jack"
 JACK_POLL_SECONDS = 5.0
 # Do not reopen a failing aplay or serial device on every 100 ms block.
 ACTUATOR_RETRY_SECONDS = 5.0
+# How long a service START waits for the relay's device node before giving up.
+#
+# ITEM 25 (2026-09-13): this service is now stopped and restarted by the USB
+# adapter's re-enumeration, and the LCUS-2 sits on the SAME hub. The restart can
+# therefore land while the CH340 is still being re-probed and /dev/wall-amp-relay
+# does not exist yet. Without this wait the start-up ensure_off() fails on the
+# first ENOENT, main() returns 1, and the amplifier stays dark for a RestartSec
+# -- with the relay possibly still latched ON from before. Bounded on purpose: a
+# relay that is genuinely absent must still fail, and be seen to fail.
+RELAY_WAIT_SECONDS = _env("WALL_AMP_RELAY_WAIT_SECONDS", 20.0, lo=0.0, hi=300.0)
+RELAY_WAIT_INTERVAL = 1.0
 SAFE_STATE_FILE = "/run/wall-amp-trigger/off-verified"
 
 # A source whose last block is older than this is treated as silent.
@@ -350,7 +361,13 @@ class Level:
             # A source that is absent in this mode (kiosk_monitor when the
             # Loopback is not configured) must not spin.
             self._stop.wait(backoff)
-            backoff = min(backoff * 2, 30.0)
+            # Capped at 8 s, not 30 (item 25, 2026-09-13). The cap is there so a
+            # source that is absent in this mode does not spin, and 8 s costs
+            # nothing for that. 30 s did cost something: after a re-enumeration
+            # this service restarts, and a capture that opens on the second or
+            # third attempt must be delivering levels inside the ten seconds the
+            # acceptance allows for the amplifier to come back on.
+            backoff = min(backoff * 2, 8.0)
 
     @property
     def stale(self):
@@ -775,6 +792,35 @@ def record_safe_state(verified):
         log("could not update amplifier safe-state proof: %s" % exc)
 
 
+def ensure_off_bounded(actuator, wait_seconds=None, monotonic=time.monotonic,
+                       sleep=time.sleep):
+    """ensure_off(), retried until it succeeds or the bounded wait expires.
+
+    The retry exists for one measured case: a USB re-enumeration restarts this
+    service while the relay's CH340 is still being probed, so the device node is
+    briefly absent. Every attempt opens a FRESH transport, which is what makes
+    this a reopen rather than a poll of a stale handle -- an ENOENT, an EIO or a
+    node that has been recreated under a new minor are all the same thing here.
+
+    Returns True on a verified OFF. It always makes at least one attempt, so a
+    zero wait keeps the old behaviour exactly.
+    """
+    wait_seconds = RELAY_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    deadline = monotonic() + wait_seconds
+    attempts = 0
+    while True:
+        attempts += 1
+        if actuator.ensure_off():
+            if attempts > 1:
+                log("relay reached a verified OFF on attempt %d" % attempts)
+            return True
+        if monotonic() >= deadline:
+            log("relay OFF still unverified after %.0fs; giving up so the "
+                "failure is visible" % wait_seconds)
+            return False
+        sleep(min(RELAY_WAIT_INTERVAL, max(0.0, deadline - monotonic())))
+
+
 def stop_and_record(actuator):
     verified = actuator.stop()
     record_safe_state(verified is not False)
@@ -802,7 +848,7 @@ def main():
     # The measured LCUS-2 is a latching device: closing the serial port leaves
     # an energized channel energized. Establish and verify the safe state on
     # every service start, including disabled and non-trigger modes.
-    if method == "lcus-2" and not actuator.ensure_off():
+    if method == "lcus-2" and not ensure_off_bounded(actuator):
         record_safe_state(False)
         return 1
     record_safe_state(True)

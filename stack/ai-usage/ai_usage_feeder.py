@@ -556,7 +556,7 @@ def parse_claude_scoped(payload, now, problems):
         return {}
     out = {}
     for name, key, _label, window_seconds in CLAUDE_SCOPED_MODELS:
-        entry = None
+        matches = []
         for candidate in limits:
             if not isinstance(candidate, dict):
                 continue
@@ -565,27 +565,33 @@ def parse_claude_scoped(payload, now, problems):
             scope = candidate.get("scope")
             model = scope.get("model") if isinstance(scope, dict) else None
             if isinstance(model, dict) and model.get("display_name") == name:
-                entry = candidate
-                break
-        if entry is None:
+                matches.append(candidate)
+        if not matches:
             problems.append("no %s limit in limits[]" % name)
             continue
+        # EVERY MATCH IS TRIED, NOT JUST THE FIRST. Nothing promises one entry
+        # per model, and "first one wins" threw away a perfectly good second
+        # reading whenever the first was malformed -- turning a recoverable
+        # payload into a missing gauge. Found by adversarial review 2026-09-12.
         where = "claude scoped " + name
-        try:
-            percent = check_percent(entry.get("percent"), where)
-            resets_at = entry.get("resets_at")
-            # A scoped weekly limit shares its reset with the all-model weekly
-            # bucket, so this window is the same seven days -- but it is read
-            # from the entry's OWN `resets_at` rather than copied across, so a
-            # vendor that ever decouples them cannot make this gauge lie.
-            window_end, window_length = check_window(
-                None if resets_at is None
-                else parse_iso8601_utc(resets_at, where),
-                window_seconds, now, where)
-        except SourceFailure as exc:
-            problems.append(str(exc))
-            continue
-        out[key] = Reading(percent, window_end, window_length)
+        for entry in matches:
+            try:
+                percent = check_percent(entry.get("percent"), where)
+                resets_at = entry.get("resets_at")
+                # A scoped weekly limit shares its reset with the all-model
+                # weekly bucket, so this window is the same seven days -- but it
+                # is read from the entry's OWN `resets_at` rather than copied
+                # across, so a vendor that ever decouples them cannot make this
+                # gauge lie.
+                window_end, window_length = check_window(
+                    None if resets_at is None
+                    else parse_iso8601_utc(resets_at, where),
+                    window_seconds, now, where)
+            except SourceFailure as exc:
+                problems.append(str(exc))
+                continue
+            out[key] = Reading(percent, window_end, window_length)
+            break
     return out
 
 
@@ -1292,6 +1298,28 @@ def load_state(state_path, now):
     return out
 
 
+def state_keys(state_path):
+    """Every gauge key the state file MENTIONS, valid or not.
+
+    `load_state` drops an entry it cannot vouch for, which is right for reading
+    a value and wrong for answering "have we ever seen this gauge". An OPTIONAL
+    spec is skipped when nothing has ever been said about it, and with only the
+    validated dict to go on a CORRUPT entry looked identical to a missing one --
+    so a Fable gauge that had been posted for weeks would silently vanish from
+    the wall the first cycle its stored reading went bad, instead of showing as
+    unavailable. Found by adversarial review 2026-09-12.
+
+    Presence, not content: a key here means "this gauge is real and we have
+    posted it", nothing more.
+    """
+    try:
+        with open(state_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return set()
+    return set(data) if isinstance(data, dict) else set()
+
+
 def save_state(state, state_path, state_root):
     """Write the state file through `open_for_write`, atomically.
 
@@ -1742,6 +1770,9 @@ def run_cycle(env, now=None, readers=None, poster=None):
             failures.append("%s: unexpected %s" % (name, type(exc).__name__))
 
     state = load_state(state_path, now)
+    # Presence, not content -- see state_keys. A corrupt stored entry must not
+    # look like a gauge we have never seen.
+    ever_seen = state_keys(state_path)
     posted = []
     for spec in GAUGE_SPECS:
         if spec.source not in active:
@@ -1751,7 +1782,7 @@ def run_cycle(env, now=None, readers=None, poster=None):
         # An OPTIONAL gauge the vendor has never mentioned is not posted at all
         # -- see GaugeSpec. It becomes a real gauge the first cycle that carries
         # it, and keeps being posted after that, stored reading and all.
-        if spec.optional and reading is None and stored is None:
+        if spec.optional and reading is None and spec.key not in ever_seen:
             continue
         try:
             body, fresh = build_post(spec, reading, stored, now)

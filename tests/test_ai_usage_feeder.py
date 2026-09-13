@@ -1418,11 +1418,20 @@ def test_a_scoped_limit_that_disappears_still_goes_stale_in_sight_sr075(tmp_path
 
 def test_a_scoped_limit_with_a_bad_percent_does_not_fail_the_source_sr075(tmp_path):
     """A malformed scoped entry is a missing reading, not a failure of the
-    top-level buckets that parsed fine beside it."""
+    top-level buckets that parsed fine beside it.
+
+    FRESHNESS is the assertion that makes this real. Checking only that the two
+    Claude ids are PRESENT would pass even if parse_claude blew up entirely,
+    because run_cycle posts an "unavailable" sentinel under those same ids -- so
+    the test would be green for exactly the failure it exists to catch. Found by
+    adversarial review 2026-09-12.
+    """
     for bad in (None, "40", float("nan"), -1, 101, True):
         bodies = _claude_cycle(tmp_path, _claude_with_scoped(percent=bad))
-        assert {"ai-usage-claude-session", "ai-usage-claude-weekly"} <= set(bodies), \
-            "percent=%r took the whole source down" % (bad,)
+        for key in ("ai-usage-claude-session", "ai-usage-claude-weekly"):
+            assert key in bodies, "percent=%r took the whole source down" % (bad,)
+            assert feeder.is_fresh(bodies[key], NOW), \
+                "percent=%r left %s as an unavailable sentinel" % (bad, key)
         assert "ai-usage-claude-weekly-fable" not in bodies
 
 
@@ -1453,3 +1462,74 @@ def test_a_never_measured_gauge_posts_an_EMPTY_bar_not_a_full_one_sr075(tmp_path
     assert body["value"] == 0.0, "an unmeasured gauge is an EMPTY bar"
     assert "observed_at" not in body
     assert not feeder.is_fresh(body, NOW)
+
+
+def test_a_scoped_reading_needs_the_weekly_scoped_kind_sr075(tmp_path):
+    """The kind is a required discriminator, not decoration.
+
+    `limits[]` also carries `session` and `weekly_all` entries, and nothing
+    stops a future one carrying a scope. A scope-matching entry of the wrong
+    kind is a DIFFERENT limit over a different period. No test pinned this, so a
+    regression that dropped the check would have passed every other scoped
+    assertion (adversarial review 2026-09-12).
+    """
+    for kind in ("session", "weekly_all", "monthly_scoped", "", None):
+        bodies = _claude_cycle(tmp_path, _claude_with_scoped(percent=30, kind=kind))
+        assert "ai-usage-claude-weekly-fable" not in bodies, \
+            "kind=%r was accepted as a scoped weekly reading" % (kind,)
+    # ...and the right kind still is.
+    bodies = _claude_cycle(tmp_path, _claude_with_scoped(percent=30))
+    assert bodies["ai-usage-claude-weekly-fable"]["value"] == 70.0
+
+
+def test_a_second_scoped_entry_is_tried_when_the_first_is_malformed_sr075(tmp_path):
+    """Nothing promises one entry per model, and first-one-wins threw away a
+    usable reading whenever a malformed duplicate preceded it (adversarial
+    review 2026-09-12)."""
+    body = _claude_with_scoped(percent=True)          # unusable: a bool
+    body["limits"].append({
+        "kind": "weekly_scoped", "group": "weekly", "percent": 40,
+        "severity": "normal", "resets_at": "2026-09-12T09:00:00.468835+00:00",
+        "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+        "is_active": False})
+    env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
+    rec = Recorder()
+    feeder.run_cycle(env, now=NOW, poster=rec,
+                     readers={"claude": lambda e: feeder.parse_claude(body, NOW)})
+    g = {b["id"]: b for b in rec.bodies}["ai-usage-claude-weekly-fable"]
+    assert g["value"] == 60.0, "the usable duplicate was never reached"
+    assert feeder.is_fresh(g, NOW)
+
+
+def test_a_seen_optional_gauge_survives_a_CORRUPT_stored_entry_sr075(tmp_path):
+    """A gauge that HAS been posted must never silently leave the wall.
+
+    `load_state` drops an entry it cannot vouch for, so a corrupt reading looked
+    exactly like a gauge that had never been seen -- and the optional skip then
+    removed it for good instead of showing it as unavailable. The skip now asks
+    the state file which keys it MENTIONS (`state_keys`), not which ones parse.
+    Found by adversarial review 2026-09-12.
+    """
+    env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
+    seen = _claude_with_scoped(percent=40)
+    feeder.run_cycle(env, now=NOW, poster=Recorder(),
+                     readers={"claude": lambda e: feeder.parse_claude(seen, NOW)})
+
+    # Corrupt ONLY the scoped gauge's stored entry; its key stays in the file.
+    path = env["AI_USAGE_STATE_FILE"]
+    with open(path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+    assert "ai-usage-claude-weekly-fable" in stored
+    stored["ai-usage-claude-weekly-fable"] = {"value": "not a number"}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stored, handle)
+
+    rec = Recorder()
+    feeder.run_cycle(env, now=NOW, poster=rec,
+                     readers={"claude": lambda e: feeder.parse_claude(CLAUDE_BODY, NOW)})
+    bodies = {b["id"]: b for b in rec.bodies}
+    assert "ai-usage-claude-weekly-fable" in bodies, \
+        "a gauge that HAS been seen vanished when its stored reading went bad"
+    g = bodies["ai-usage-claude-weekly-fable"]
+    assert not feeder.is_fresh(g, NOW), "and it must say unavailable, not a number"
+    assert "observed_at" not in g

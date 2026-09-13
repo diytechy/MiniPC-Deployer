@@ -174,6 +174,47 @@ else
 fi
 [ "$HAVE_LOGGER" -eq 1 ] || echo "[wall-kiosk] WARNING: no logger(1) — journalctl -t wall-kiosk will be EMPTY"
 
+# ── the pointer image: nothing at all ───────────────────────────────────────
+# Owner item 22 (2026-09-13): "Cursor appears whenever I touch any screen; can
+# the cursor icon be made fully transparent if it is needed?"
+#
+# It can, and it has to be done HERE rather than in the shell. Chromium sets a
+# cursor image only for a pointer that has ENTERED its surface, so the shell's
+# `cursor: none` cannot touch anything the compositor draws on its own — the
+# same measurement wall-park-cursor.service exists for. And the panel now has a
+# pointer device by design: the touch filter's scroll uinput device declares
+# REL_X + REL_Y + BTN_LEFT along with its wheel axes because libinput discards
+# the wheels of a device udev has not tagged ID_INPUT_MOUSE, so every finger
+# DRAG is pointer activity on the seat and the compositor draws a cursor for it.
+#
+# /usr/local/share/wall-cursors/default is a theme of 1x1 fully transparent
+# cursors written by panel-invisible-cursor.py. It is reached by XCURSOR_PATH
+# and NOT by XCURSOR_THEME, and that is measured, not assumed: libwlroots.so.12
+# on this panel contains XCURSOR_PATH and no XCURSOR_THEME string at all, and
+# cage 0.1.5 creates its xcursor manager with a NULL theme name, which wlroots
+# resolves to the theme literally called "default". So the only lever the
+# environment still has is where "default" is found. Same lever for the Electron
+# client, which reads the same variables.
+#
+# WALL_CURSOR_TRANSPARENT=false leaves it alone, which is how a service session
+# gets a visible arrow back without editing this file.
+WALL_CURSOR_THEME_DIR="${WALL_CURSOR_THEME_DIR:-/usr/local/share/wall-cursors}"
+case "${WALL_CURSOR_TRANSPARENT:-true}" in
+    true|TRUE|yes|1)
+        if [ -f "$WALL_CURSOR_THEME_DIR/default/cursors/default" ]; then
+            export XCURSOR_PATH="$WALL_CURSOR_THEME_DIR"
+            export XCURSOR_THEME="default"   # harmless here, correct elsewhere
+            export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+            log "cursor: transparent theme at $WALL_CURSOR_THEME_DIR (XCURSOR_PATH)"
+        else
+            log "cursor: WARNING no transparent theme at $WALL_CURSOR_THEME_DIR/default —"
+            log "cursor: expect the compositor's arrow on every touch (item 22). Re-run"
+            log "cursor: sudo /usr/local/sbin/wall-firstboot.sh, or panel-invisible-cursor.py."
+        fi ;;
+    *)
+        log "cursor: WALL_CURSOR_TRANSPARENT='${WALL_CURSOR_TRANSPARENT}' — the compositor draws its normal pointer" ;;
+esac
+
 # ── the crash-loop counter ───────────────────────────────────────────────────
 # A DEAD PANEL MUST BE A VISIBLE EVENT, and until now only half of that was
 # true. `[ -x ]` false paints the NOT INSTALLED screen below — loud. But an
@@ -201,7 +242,13 @@ while true; do
     if [ -x "${WALL_APP_CMD%% *}" ]; then
         log "starting: cage -- $WALL_APP_CMD"
         started=$(date +%s)
-        # -d: don't draw a cursor for a touch-only panel.
+        # -d IS NOT A CURSOR FLAG, whatever this comment used to say. cage's
+        # own usage string on the panel (cage 0.1.5, read 2026-09-13) is
+        # "-d  Don't draw client side decorations, when possible" — cage has no
+        # cursor option at all, and the arrow this line was credited with
+        # suppressing was never suppressed. The pointer image is handled by the
+        # transparent XCURSOR_PATH theme exported above; -d stays for what it
+        # actually does, which is still what a kiosk wants.
         # The client's own output goes to the journal live (the wrapper's
         # chmod-4755 diagnosis and Electron's "cannot open shared object file"
         # both arrive here) and its tail is kept for the screen below.

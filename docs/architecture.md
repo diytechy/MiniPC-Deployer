@@ -179,9 +179,8 @@ flowchart LR
     detector --> selector{WALL_AMP_ACTIVATOR}
     selector -->|lcus-2 default| serial[CH340 /dev/wall-amp-relay]
     serial --> relay[LCUS-2 selected dry contact]
-    selector -->|audio-jack alternative| tone[ALC255 anti-phase trigger tone]
     relay --> amp[audio amplifier enable]
-    tone --> amp
+    %% audio-jack tone actuator retired 2026-09-13; LCUS-2 is the only path
     power[shutdown / S3] -->|verified OFF or refuse S3| relay
 ```
 

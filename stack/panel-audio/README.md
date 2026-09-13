@@ -102,7 +102,7 @@ audio path is not here — it is a set of units and ALSA configuration under
 | `asound.conf` + `asound-{trigger,panel}-mode.conf` | the dmix/dsnoop graph and the two output modes |
 | `wall-line-in.service` | line input passthrough to the amplifier |
 | `wall-kiosk-loop.service` | routes kiosk audio through snd-aloop so it can be measured |
-| `wall-amp-trigger.service`, `panel-amp-trigger.py` | detects playing audio and commands the headphone-tone or LCUS-2 actuator |
+| `wall-amp-trigger.service`, `panel-amp-trigger.py` | detects playing audio and commands the LCUS-2 relay (the headphone-tone actuator is retired, 2026-09-13) |
 | `wall-volume-keys.service`, `panel-volume-keys.py` | the side rocker |
 | `wall-audio-mode` | switches output modes |
 

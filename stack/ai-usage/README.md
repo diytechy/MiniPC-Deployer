@@ -95,12 +95,64 @@ the same test.
 
 **Gemini is out** — deferred as E11.
 
-## What it posts (IF-013)
+## What it posts (IF-012, amended by v1.1 on 2026-09-12)
 
-Five gauges, upserted by id: `ai-usage-codex`, `ai-usage-claude-session`,
-`ai-usage-claude-weekly`, `ai-usage-opencode-weekly`,
-`ai-usage-opencode-monthly`. Each body is `kind:"gauge"` with `unit:"%"`,
-`min:0`, `max:100`, `target:0`, `direction:"up"` and a `window`.
+Six gauges, upserted by id: `ai-usage-codex`, `ai-usage-claude-session`,
+`ai-usage-claude-weekly`, `ai-usage-claude-weekly-fable`,
+`ai-usage-opencode-weekly`, `ai-usage-opencode-monthly`. Each body is
+`kind:"gauge"` with `unit:"%"`, `min:0`, `max:100`, `target:0`,
+`direction:"down"` and a `window`.
+
+### The wire carries REMAINING, and the pairing is load-bearing
+
+The feeder used to post `target: 0` **with** `direction: "up"`. NagLight runs an
+"up" pace from `min` to `target` — which is 0 to 0 — so the served `pace` was
+**zero at every point of every window, for every gauge this feeder ever
+posted**. The dashed line sat on the floor of each bar and the tracker's
+deviation collapsed to `value / 50`, making colour a pure function of percent
+consumed: full red at 50 % used wherever the window was. OpenCode weekly showed
+red at 78 % used on day six of seven — a healthy burn — exactly as it would at
+51 % on day one. Measured on the wire 2026-09-12.
+
+Counting **down** from a full bar fixes it with no contract change: `pace`
+becomes `100 * (1 - elapsed)`, the plan you ought to have left right now, and
+the bar drains as the window burns.
+
+Every reader still parses, and the state file still stores, the **consumed**
+percent the vendor actually stated. The inversion happens in exactly one place —
+the body assembly in `build_gauge` — so a fresh reading and a re-posted stored
+one are flipped identically and no stored state needed migrating.
+
+### Fable is a scoped limit inside `limits[]`, not a top-level key
+
+There is no `seven_day_fable`. `seven_day_opus` and `seven_day_sonnet` are
+`null`, and `seven_day_breakdown` is a split by **surface** (Claude Code /
+Chats / Cowork / Other) whose rows are shares of usage summing to 100 — not
+shares of a quota. The only per-model signal is a `limits[]` entry:
+
+    {"kind":"weekly_scoped","group":"weekly","percent":0,"resets_at":"...",
+     "scope":{"model":{"id":null,"display_name":"Fable"}}}
+
+`scope.model.id` is `null`, so the **display name is the only handle there is**.
+The body also carries `nimbus_quill`, `cinder_cove`, `copper_kite`,
+`harbor_lantern`, `amber_ladder`, `juniper_tide`, `tangelo`, `iguana_necktie`,
+`omelette_promotional`, `seven_day_cowork` and `seven_day_omelette` —
+unreleased-model placeholders, mostly null, **whose names are not contractual**.
+Keying on one would break silently the day it ships or is renamed.
+
+That gauge is **optional** (`GaugeSpec.optional`): whether a per-model limit
+exists at all depends on the plan, and a gauge reading "unavailable" every
+cycle forever is worse than no gauge, because it teaches people to ignore the
+word. It is posted once there is something to say — a reading this cycle, or a
+stored one — and keeps being posted after that, so a limit that **disappears**
+goes stale in plain sight instead of silently leaving the wall. The skip asks
+which keys the state file *mentions* (`state_keys`), not which ones parse: a
+corrupt entry must not look like a gauge that was never seen.
+
+Its id sorts immediately **after** `ai-usage-claude-weekly`, and that is
+load-bearing rather than tidy — NagLight serves gauges in id order and the panel
+draws the first gauge of a window as the headline and any later one sharing that
+window as the narrow sub-column beside it.
 
 Three rules are enforced in `build_gauge` rather than trusted, because the
 2026-09 tightening turned each of them into a 400:
@@ -123,7 +175,7 @@ rule does all the work:
 |---|---|---|
 | source read fine | the real number, stamped now | a live gauge |
 | source failed, a previous reading exists | that number, stamped **when it was true** | stale → unavailable, once the horizon passes |
-| source failed and never succeeded | value 0 with **no `observed_at` at all** | stale on arrival → unavailable |
+| source failed and never succeeded | **0 % remaining** with **no `observed_at` at all** | stale on arrival → unavailable |
 
 The invariant in `build_post` is one line: **`observed_at == now` if and only if
 this cycle actually read the source.** Every failure class — transport error,
@@ -136,8 +188,16 @@ the panel can say "unavailable" instead of showing nothing at all. It is
 unreachable as a *displayed* value by construction, because a body with no
 `observed_at` is stale the moment it arrives.
 
+**It is deliberately the pessimistic end of the bar** (`UNAVAILABLE_CONSUMED =
+GAUGE_MAX`). Under the old count-up shape the sentinel was the literal `0`,
+meaning nothing consumed. Inverting to remaining turned that same literal into
+**100 % remaining** — a full, green, reassuring bar for a source that has never
+answered, with only staleness standing between it and the wall. Naming it in
+consumed terms keeps the intent where the flip happens: an unmeasured gauge is
+an empty bar, and it fails safe if staleness ever stops protecting it.
+
 **The cadence follows from the horizons, not from taste.** A `weekly` gauge goes
-stale 24 h after `observed_at`, and two of the five are weekly. The timer runs
+stale 24 h after `observed_at`, and three of the six are weekly. The timer runs
 every 10 minutes — 1/144th of the tightest horizon — and
 `tests/test_ai_usage_feeder.py` reads the shipped timer file and fails if that
 interval is ever loosened past a quarter of it.

@@ -8,6 +8,23 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-13 — the AI-usage feeder is DEPLOYED.** The gauge-rail redesign's
+feeder half (`stack/ai-usage/ai_usage_feeder.py`, plus its README and timer)
+went to the hub during the tracker event-log cutover, in the required order:
+NagLight, then the feeder, then the panel. Deployed and repo now read the same
+sha; the feeder posted all six gauges on its first run — codex, Claude session,
+Claude weekly, **Claude weekly Fable** (the scoped sub-column), OpenCode weekly
+and monthly. `pace` is a live number on the wire (36.9 / 80.3 / 98.3) where every
+gauge used to serve 0, and the rail draws on the wall.
+
+Two things learned doing it, both worth more than the deploy. The deployed copy
+was **behind** the repo by 194 lines and a project note said the two were in
+sync — that note had by then been wrong in both directions on successive days, so
+the habit, not the note, is the answer: compare `sha256sum` on both sides before
+believing anything about what is deployed. And `/etc/systemd/system/` holds a
+**copy** of the timer unit, not a symlink to `stack/`, so updating the stack copy
+alone changes nothing that runs.
+
 **2026-09-13 — LCUS-2 amplifier actuation is PROVEN ON THE PANEL, except the
 amplifier itself.** The actuator defaults to the measured CH340 LCUS-2 board
 through a stable `/dev/wall-amp-relay` udev link, `audio-jack` stays selectable,

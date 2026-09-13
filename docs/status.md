@@ -8,6 +8,13 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-13 — MSP430 amplifier actuation is preserved on the dedicated
+`msp430-amplifier-trigger` branch, superseded for initial implementation by a
+physically tested LCUS-2 USB relay on the ordinary active branch.** This branch
+keeps the shared detector plus configurable headphone/MSP430 actuator, G2553
+P1.4 firmware, acknowledged renewable lease and complete hardware plan. It has
+not been flashed, deployed or connected to the inaccessible amplifier relay.
+
 **2026-09-11 — Finance-Auditor snapshot recovery is BUILT and LOCAL-ONLY (not
 pushed, deployed, or included on existing media).** A reimage now restores the
 local-only `finance_snapshots` volume through the existing byte-verifying
@@ -8203,3 +8210,25 @@ checklist on the wall, with six definitions skipped and named.
 
 Hub SSH host key had changed, consistent with that box's 2026-09-12 reimage;
 `known_hosts` was backed up before the entry was replaced.
+
+---
+
+## 2026-09-13 — configurable MSP430 amplifier actuator (fallback branch)
+
+SN-020 / SR-026 / LLR-010 / TC-010 / IF-017. The existing DC-stripped detector
+still watches `linein_shared` and `kiosk_monitor`; only the final actuator is
+selected. `audio-jack` remains the default. `msp430` opens an explicit stable
+`/dev` path at 9600 baud, obtains acknowledged OFF before ON, renews ON once per
+second and treats timeout/disconnect/refusal as not applied. The matching
+MSP430G2553 firmware drives P1.4 through the planned S9014 and expires the ON
+lease after approximately 3.2 seconds so a wedged Linux daemon fails off.
+
+Evidence: new focused tests **6/6 pass**; combined amplifier/Bluetooth tests
+**52/52 pass**; `validate_config.py` all pass; registry integrity is clean and
+the new trace is complete; `check_flows.py` passes all eight diagrams; Python
+syntax and WSL `bash -n` pass. The full smoke gate is not green: its unrelated
+existing AI CLI Windows/Git-Bash path test failed after **126 pass / 3 skip**.
+The MSP430 GCC toolchain is absent, so firmware compilation is explicitly
+unrun. No image, deployment, serial enumeration, transistor/relay connection
+or physical amplifier behavior is claimed. The Owner directed this work onto a
+dedicated fallback branch after a working LCUS-2 was found.

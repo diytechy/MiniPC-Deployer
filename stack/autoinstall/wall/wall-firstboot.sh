@@ -727,7 +727,7 @@ for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service 
 done
 systemctl daemon-reload >/dev/null 2>&1 || true
 
-# The trigger daemon's on/off knob is rendered into its own env file rather
+# The trigger daemon's on/off and actuator knobs are rendered into its own env file rather
 # than read from wall.env: that file is root-only and carries unrelated
 # credentials, and this service has no business seeing it.
 if [ -f /etc/wall-panel/amp-trigger.env ]; then
@@ -738,8 +738,36 @@ if [ -f /etc/wall-panel/amp-trigger.env ]; then
     else
         printf 'WALL_AMP_ENABLED=%s\n' "$_amp_enabled" >> /etc/wall-panel/amp-trigger.env
     fi
+
+    _amp_activator=${WALL_AMP_ACTIVATOR:-audio-jack}
+    case "$_amp_activator" in
+        audio-jack|msp430) ;;
+        *)
+            warn "audio: WALL_AMP_ACTIVATOR must be exactly audio-jack or msp430; the amplifier service will refuse to start"
+            _amp_activator=invalid ;;
+    esac
+    if grep -q '^WALL_AMP_ACTIVATOR=' /etc/wall-panel/amp-trigger.env 2>/dev/null; then
+        sed -i "s|^WALL_AMP_ACTIVATOR=.*|WALL_AMP_ACTIVATOR=$_amp_activator|" /etc/wall-panel/amp-trigger.env
+    else
+        printf 'WALL_AMP_ACTIVATOR=%s\n' "$_amp_activator" >> /etc/wall-panel/amp-trigger.env
+    fi
+
+    _amp_msp430_device=${WALL_AMP_MSP430_DEVICE:-}
+    if [ -n "$_amp_msp430_device" ] &&
+       ! printf '%s' "$_amp_msp430_device" | grep -Eq '^/dev/[A-Za-z0-9._/-]+$'; then
+        warn "audio: WALL_AMP_MSP430_DEVICE must be a plain absolute /dev path; refusing the supplied value"
+        _amp_msp430_device=
+    fi
+    if grep -q '^WALL_AMP_MSP430_DEVICE=' /etc/wall-panel/amp-trigger.env 2>/dev/null; then
+        sed -i "s|^WALL_AMP_MSP430_DEVICE=.*|WALL_AMP_MSP430_DEVICE=$_amp_msp430_device|" /etc/wall-panel/amp-trigger.env
+    else
+        printf 'WALL_AMP_MSP430_DEVICE=%s\n' "$_amp_msp430_device" >> /etc/wall-panel/amp-trigger.env
+    fi
+    if [ "$_amp_activator" = msp430 ] && [ -z "$_amp_msp430_device" ]; then
+        warn "audio: msp430 actuator selected but WALL_AMP_MSP430_DEVICE is blank; the amplifier service will refuse to start"
+    fi
     [ "$_amp_enabled" = false ] &&
-        log "audio: WALL_AMP_TRIGGER_ENABLED is false — the tone is not emitted; the amplifier stays under whatever manual control it had"
+        log "audio: WALL_AMP_TRIGGER_ENABLED is false — no actuator is commanded; the amplifier stays under whatever manual control it had"
 fi
 
 # Enablement expresses the line-in and rocker knobs, so that wall-audio-mode can

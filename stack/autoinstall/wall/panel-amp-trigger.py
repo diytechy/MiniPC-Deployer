@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Power the speaker amplifier while audio is playing.
 
-The panel emits a continuous tone on the ALC255 headphone jack whenever it sees
-audio; a rectifier on the far end turns that into a DC level that holds the
-amplifier's relay closed. Software decides, analog carries.
+The level detector is independent of the actuator.  The shipped default emits a
+continuous tone on the ALC255 headphone jack for a far-end rectifier.  The
+alternative sends leased ON/OFF commands over the MSP430 LaunchPad's USB serial
+backchannel; its P1.4 output drives an external S9014 pull-down on the relay's
+TRIG input.  Software decides in one place; configuration chooses how that
+decision reaches the amplifier.
 
 WHY A TONE AND NOT A DETECTOR ON THE AMPLIFIER FEED (measured 2026-09-12):
 the feed is downstream of the volume control, so an analog detector's
@@ -33,6 +36,8 @@ Exit codes: 78 configuration unusable.
 import errno
 import math
 import os
+import posixpath
+import select
 import shutil
 import signal
 import struct
@@ -138,6 +143,10 @@ def _env(name, default, lo=None, hi=None):
     return value
 
 
+class ConfigurationError(ValueError):
+    """An actuator selection cannot be made safe or deterministic."""
+
+
 # Thresholds on the DC-stripped RMS of the louder channel, relative to each
 # source's nominal full scale. The measured floor is -83 dBFS, so -60 sits 23 dB
 # clear of it. Hysteresis, because a single threshold chatters at the boundary.
@@ -172,8 +181,8 @@ TRIGGER_AMPLITUDE = 0.99
 # diagnostics rather than safety.
 JACK_CONTROL = "Front Headphone Jack"
 JACK_POLL_SECONDS = 5.0
-# Do not respawn a failing aplay on every 100 ms block.
-TONE_RETRY_SECONDS = 5.0
+# Do not reopen a failing aplay or serial device on every 100 ms block.
+ACTUATOR_RETRY_SECONDS = 5.0
 
 # A source whose last block is older than this is treated as silent.
 #
@@ -453,9 +462,207 @@ class Tone:
             pass
         _reap(proc)
 
+    def maintain(self, _now=None):
+        """Return whether the already-started tone is still being delivered."""
+        return self.running
+
+
+class Msp430SerialTransport:
+    """One acknowledged command channel over a POSIX TTY.
+
+    The implementation uses only the Python standard library so the offline
+    panel image needs no pyserial wheel.  The firmware accepts exact ``SET 0``
+    and ``SET 1`` lines and reports the state it actually applied.
+    """
+
+    def __init__(self, device, baud=9600, ack_timeout=0.5):
+        if baud != 9600:
+            raise ConfigurationError("MSP430 firmware protocol is fixed at 9600 baud")
+        self.device = device
+        self.ack_timeout = ack_timeout
+        self.fd = None
+        self._open()
+
+    def _open(self):
+        # termios is deliberately lazy: the pure detector and its tests remain
+        # importable on the Windows build host.
+        import termios
+
+        self.fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        attrs = termios.tcgetattr(self.fd)
+        attrs[0] = 0
+        attrs[1] = 0
+        attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+        attrs[3] = 0
+        attrs[4] = termios.B9600
+        attrs[5] = termios.B9600
+        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        termios.tcflush(self.fd, termios.TCIOFLUSH)
+
+    def _write_all(self, payload, deadline):
+        view = memoryview(payload)
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("MSP430 command write timed out")
+            _, writable, _ = select.select([], [self.fd], [], remaining)
+            if not writable:
+                raise TimeoutError("MSP430 command write timed out")
+            written = os.write(self.fd, view)
+            view = view[written:]
+
+    def set_state(self, enabled):
+        wanted = b"1" if enabled else b"0"
+        deadline = time.monotonic() + self.ack_timeout
+        self._write_all(b"SET " + wanted + b"\n", deadline)
+        received = bytearray()
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([self.fd], [], [], deadline - time.monotonic())
+            if not readable:
+                break
+            chunk = os.read(self.fd, 64)
+            if not chunk:
+                raise OSError(errno.ENODEV, "MSP430 serial device closed")
+            received.extend(chunk)
+            while b"\n" in received:
+                line, _, tail = received.partition(b"\n")
+                received = bytearray(tail)
+                if line.rstrip(b"\r") == b"STATE " + wanted:
+                    return
+                if line.rstrip(b"\r") == b"ERR":
+                    raise OSError(errno.EPROTO, "MSP430 refused command")
+        raise TimeoutError("MSP430 did not acknowledge state %s" % wanted.decode())
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+class Msp430Relay:
+    """Fail-off leased relay actuator using the MSP430 LaunchPad USB UART.
+
+    ``SET 1`` is renewed while audio is wanted.  Firmware expires that lease,
+    drives P1.4 low, and therefore releases the S9014 if this daemon wedges.
+    """
+
+    def __init__(self, device, baud=9600, ack_timeout=0.5,
+                 heartbeat_seconds=1.0, transport_factory=None,
+                 monotonic=time.monotonic):
+        self.device = device
+        self.baud = baud
+        self.ack_timeout = ack_timeout
+        self.heartbeat_seconds = heartbeat_seconds
+        self.transport_factory = transport_factory or Msp430SerialTransport
+        self.monotonic = monotonic
+        self._transport = None
+        self._running = False
+        self._renewed_at = -1e9
+
+    @property
+    def running(self):
+        return self._running and self._transport is not None
+
+    def _disconnect(self):
+        transport, self._transport = self._transport, None
+        self._running = False
+        if transport is not None:
+            try:
+                transport.close()
+            except OSError:
+                pass
+
+    def start(self):
+        if self.running:
+            return True
+        try:
+            self._transport = self.transport_factory(
+                self.device, self.baud, self.ack_timeout)
+            # Establish OFF after every reconnect before asking for ON.  This
+            # makes an old MCU state observable and deterministic.
+            self._transport.set_state(False)
+            self._transport.set_state(True)
+            self._renewed_at = self.monotonic()
+            self._running = True
+            return True
+        except (OSError, TimeoutError, ConfigurationError) as exc:
+            log("MSP430 trigger failed to start: %s" % exc)
+            self._disconnect()
+            return False
+
+    def maintain(self, now=None):
+        if not self.running:
+            return False
+        now = self.monotonic() if now is None else now
+        if now - self._renewed_at < self.heartbeat_seconds:
+            return True
+        try:
+            self._transport.set_state(True)
+            self._renewed_at = now
+            return True
+        except (OSError, TimeoutError) as exc:
+            log("MSP430 trigger lease renewal failed: %s" % exc)
+            self._disconnect()
+            return False
+
+    def stop(self):
+        if self._transport is not None:
+            try:
+                self._transport.set_state(False)
+            except (OSError, TimeoutError) as exc:
+                log("MSP430 trigger OFF was not acknowledged: %s" % exc)
+        self._disconnect()
+
+
+def _valid_device_path(value):
+    """Accept only explicit absolute /dev paths and no control characters."""
+    if not value or any(ord(char) < 32 for char in value):
+        return False
+    normalized = posixpath.normpath(value)
+    return normalized == value and normalized.startswith("/dev/")
+
+
+def build_actuator(method, msp430_device="", transport_factory=None):
+    """Build exactly one amplifier actuator from the configured method."""
+    if method == "audio-jack":
+        return Tone()
+    if method == "msp430":
+        if not _valid_device_path(msp430_device):
+            raise ConfigurationError(
+                "WALL_AMP_MSP430_DEVICE must be an explicit absolute /dev path")
+        return Msp430Relay(
+            msp430_device,
+            heartbeat_seconds=_env("WALL_AMP_MSP430_HEARTBEAT_SECONDS", 1.0,
+                                   lo=0.2, hi=2.0),
+            ack_timeout=_env("WALL_AMP_MSP430_ACK_TIMEOUT_SECONDS", 0.5,
+                             lo=0.1, hi=2.0),
+            transport_factory=transport_factory,
+        )
+    raise ConfigurationError(
+        "WALL_AMP_ACTIVATOR must be exactly audio-jack or msp430")
+
+
+def required_tools(method):
+    """Return only the programs used by the selected detector/actuator path."""
+    common = ("/usr/bin/arecord",)
+    if method == "audio-jack":
+        return common + ("/usr/bin/aplay", "/usr/bin/amixer")
+    if method == "msp430":
+        return common
+    raise ConfigurationError("unknown amplifier actuator %r" % method)
+
 
 def main():
-    for tool in ("/usr/bin/arecord", "/usr/bin/aplay", "/usr/bin/amixer"):
+    method = os.environ.get("WALL_AMP_ACTIVATOR", "audio-jack").strip()
+    device = os.environ.get("WALL_AMP_MSP430_DEVICE", "").strip()
+    try:
+        actuator = build_actuator(method, msp430_device=device)
+        tools = required_tools(method)
+    except ConfigurationError as exc:
+        log("amplifier actuator configuration: %s" % exc)
+        return 78
+
+    for tool in tools:
         if not shutil.which(tool):
             log("missing %s" % tool)
             return 78
@@ -472,12 +679,14 @@ def main():
         while True:
             time.sleep(3600)
 
-    assert_trigger_output()
+    jack_actuator = method == "audio-jack"
+    if jack_actuator:
+        assert_trigger_output()
+    else:
+        log("amplifier actuator: MSP430 at %s" % device)
     levels = [Level(pcm, off) for pcm, off in SOURCES]
     for lv in levels:
         lv.start()
-    tone = Tone()
-
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
@@ -487,7 +696,7 @@ def main():
     below_since = None
     changed_at = 0.0
     last_jack_poll = 0.0
-    last_tone_attempt = -1e9
+    last_actuator_attempt = -1e9
     jack = True
     last_reassert = time.monotonic()
 
@@ -495,7 +704,7 @@ def main():
     while not stopping.is_set():
         now = time.monotonic()
 
-        if now - last_jack_poll >= JACK_POLL_SECONDS:
+        if jack_actuator and now - last_jack_poll >= JACK_POLL_SECONDS:
             last_jack_poll = now
             present = jack_present()
             if present != jack:
@@ -507,7 +716,8 @@ def main():
         # of the watchdog.
         if now - last_reassert >= 60.0:
             last_reassert = now
-            assert_trigger_output()
+            if jack_actuator:
+                assert_trigger_output()
 
         loud = any(lv.above(ON_DBFS) for lv in levels)
         quiet = all(not lv.above(OFF_DBFS) for lv in levels)
@@ -516,9 +726,9 @@ def main():
             if loud and jack:
                 above_since = above_since or now
                 if now - above_since >= ATTACK_SECONDS and now - changed_at >= MIN_OFF_SECONDS:
-                    if now - last_tone_attempt < TONE_RETRY_SECONDS:
+                    if now - last_actuator_attempt < ACTUATOR_RETRY_SECONDS:
                         pass
-                    elif tone.start():
+                    elif actuator.start():
                         on = True
                         changed_at = now
                         below_since = None
@@ -527,7 +737,7 @@ def main():
                     else:
                         # Stay off and say so rather than reporting a state we
                         # could not reach; retry on a timer, not every block.
-                        last_tone_attempt = now
+                        last_actuator_attempt = now
             else:
                 above_since = None
         else:
@@ -537,25 +747,26 @@ def main():
                     on = False
                     changed_at = now
                     above_since = None
-                    tone.stop()
+                    actuator.stop()
                     log("amplifier OFF after %.0fs idle" % HOLD_OFF_SECONDS)
             else:
                 below_since = None
-            if not jack and tone.running:
+            if jack_actuator and not jack and actuator.running:
                 log("trigger cable removed; stopping tone")
-                tone.stop()
+                actuator.stop()
                 on = False
                 changed_at = now
-            elif on and not tone.running and now - last_tone_attempt >= TONE_RETRY_SECONDS:
-                last_tone_attempt = now
-                log("tone stopped unexpectedly; restarting")
-                if not tone.start():
+            elif (on and not actuator.maintain(now)
+                  and now - last_actuator_attempt >= ACTUATOR_RETRY_SECONDS):
+                last_actuator_attempt = now
+                log("amplifier actuator stopped unexpectedly; restarting")
+                if not actuator.start():
                     on = False
                     changed_at = now
 
         stopping.wait(BLOCK_SECONDS)
 
-    tone.stop()
+    actuator.stop()
     for lv in levels:
         lv.stop()
     return 0

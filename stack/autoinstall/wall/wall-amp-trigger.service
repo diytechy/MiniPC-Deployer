@@ -1,7 +1,7 @@
 # wall-amp-trigger.service — power the amplifier while audio is playing.
 #
-# Emits a tone on the ALC255 headphone jack whenever either audio source is
-# above threshold; a rectifier on the far end holds the relay closed. See
+# Commands either the ALC255 tone/rectifier path or the acknowledged MSP430
+# serial actuator whenever either audio source is above threshold. See
 # PANEL_AMP_AUTOPOWER.md in the HomeHub repo for the measurements, the circuit
 # and the calibration procedure.
 #
@@ -46,7 +46,7 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallArchitectures=native
-SupplementaryGroups=audio
+SupplementaryGroups=audio dialout
 
 StandardOutput=journal
 StandardError=journal

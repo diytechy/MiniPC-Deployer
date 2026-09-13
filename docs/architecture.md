@@ -162,6 +162,41 @@ The honest ledger of what has and has not been exercised is
 
 ## Runtime flows
 
+### One detector, two amplifier actuators (SR-026, LLR-010, IF-017)
+
+The actuator choice is downstream of the measured audio decision. It cannot
+change which source is audible enough, or give Bluetooth a special path.
+
+```mermaid
+%% Implements: SR-026, LLR-010
+sequenceDiagram
+    autonumber
+    participant A as line-in / kiosk monitor
+    participant D as common level detector
+    participant J as ALC255 jack actuator
+    participant H as MSP430 host transport
+    participant M as G2553 firmware (IF-017)
+    participant R as relay TRIG
+
+    A->>D: DC-stripped level blocks
+    D->>D: shared attack / hysteresis / hold-off
+    alt WALL_AMP_ACTIVATOR=audio-jack
+        D->>J: start or stop anti-phase tone
+        J->>R: rectified voltage (planned hardware)
+    else WALL_AMP_ACTIVATOR=msp430
+        H->>M: SET 0 after connect
+        M-->>H: STATE 0
+        D->>H: amplifier wanted
+        H->>M: SET 1, renewed each second
+        M-->>H: STATE 1 after P1.4 is high
+        M->>R: S9014 pulls active-low TRIG to U-
+        Note over M,R: no renewal for about 3.2 s -> P1.4 low
+        D->>H: amplifier no longer wanted
+        H->>M: SET 0
+        M-->>H: STATE 0
+    end
+```
+
 Hand-authored sequence diagrams of the behaviour that is easiest to misread
 from registry rows (process.md §3). Each cites the ids it renders.
 

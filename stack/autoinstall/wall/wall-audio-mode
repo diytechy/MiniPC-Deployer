@@ -68,7 +68,32 @@ unit() {
     systemctl "$_action" "$@" 2>/dev/null || note_failure "systemctl $_action $*"
 }
 
+# WHAT WAS RUNNING BEFORE THIS MODE SWITCH. Measured on the panel 2026-09-13:
+# `wall-audio-mode bus` left bluealsa-aplay stopped. The script stops it
+# unconditionally (it is a client of `default`, consequence 1 above) but only
+# started it again if it was ENABLED -- and a unit that is running while
+# statically enabled, socket-activated or simply started by hand reads as
+# "disabled", so the mode switch silently took Bluetooth audio away. A mode
+# switch may leave something off that was already off; it may not turn off
+# something that was on.
+ACTIVE_BEFORE=""
+remember_active() {
+    for _u in "$@"; do
+        systemctl is-active --quiet "$_u" 2>/dev/null &&
+            ACTIVE_BEFORE="$ACTIVE_BEFORE $_u"
+    done
+}
+
+was_active() {
+    case " $ACTIVE_BEFORE " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
 start_if_enabled() {
+    if was_active "$1"; then
+        unit start "$1"
+        return
+    fi
     case "$(systemctl is-enabled "$1" 2>/dev/null)" in
         disabled|masked) echo "$1 left stopped (disabled)" ;;
         *) unit start "$1" ;;
@@ -158,6 +183,7 @@ case "${1:-}" in
   trigger|panel|bus)
     [ "$(id -u)" -eq 0 ] || { echo "must be root" >&2; exit 1; }
     mkdir -p "$CONF_DIR"
+    remember_active wall-amp-trigger.service wall-kiosk-loop.service         wall-line-in.service bluealsa.service bluealsa-aplay.service         wall-spdif-in.service
     unit stop wall-amp-trigger.service wall-kiosk-loop.service wall-line-in.service
     # The bus-mode forwarders too: they hold dmix/dsnoop segments that the
     # sweep below would otherwise skip as still-attached, which is the
@@ -204,8 +230,31 @@ case "${1:-}" in
         # Owner left the switch on Mute.
         start_if_enabled wall-spdif-in.service
         start_if_enabled wall-amp-trigger.service
-        /usr/local/sbin/wall-audio-output apply-state ||
-            note_failure "wall-audio-output apply-state"
+        # The request watcher is part of the graph, not an optional extra: it is
+        # how the broker's request ever reaches root.
+        unit start wall-audio-apply.path
+        # THE STORED POSITION IS APPLIED THROUGH ITS UNIT, NOT BY CALLING THE
+        # SCRIPT. Measured 2026-09-13: after `wall-audio-mode bus` the state unit
+        # was left inactive, because apply_bus only ENABLED it and this line ran
+        # the command behind its back -- so `systemctl status wall-audio-state`
+        # was dead and `journalctl -u wall-audio-state` was empty, which is
+        # exactly where acceptance check 10 goes looking. `restart` rather than
+        # `start` because the unit is RemainAfterExit=yes: starting an
+        # already-active oneshot runs nothing at all.
+        #
+        # It is also what writes this boot's monotonic stamp, so a headset
+        # adapter plugged in AFTER this point is a plug event and one plugged in
+        # before it is not (Owner ruling 2026-09-13).
+        unit restart wall-audio-state.service
+        # The presence reporter is udev-driven and BindsTo the adapter alias, so
+        # it is started only if the adapter is actually there -- asking for it
+        # with nothing plugged in would be a failure, not a fix.
+        # is-active, NOT list-units: a device unit that has been unplugged can
+        # stay LOADED and inactive, and asking for a BindsTo= service with no
+        # device behind it fails the whole mode switch (review, 2026-09-13).
+        if systemctl is-active --quiet dev-wall_headset_adapter.device 2>/dev/null; then
+            start_if_enabled wall-headset-present.service
+        fi
     fi
     if [ "$FAILED" -ne 0 ]; then
         echo "mode: $1 (with $FAILED failure(s) above -- audio may be wrong)" >&2

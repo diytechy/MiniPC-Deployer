@@ -52,7 +52,10 @@ STATE_SCHEMA = {
     # The one-shot latch behind D5-as-amended. Armed while no adapter is
     # present; spent by the add event that flips speaker -> headset. Without it
     # every udev `change` on an already-plugged adapter would drag the Owner
-    # back to the headset they had deliberately switched away from.
+    # back to the headset they had deliberately switched away from. It is also
+    # SET from what coldplug sees (armed if the adapter was absent across the
+    # boot, spent if it was present), which is how a power cycle with the
+    # adapter plugged in comes back in the position the Owner left it in.
     "headset_autoswitch_armed": True,
     # The last broker request applied, for deduplication. systemd.path fires on
     # every close-write, so an unchanged request file re-read after a restart
@@ -253,12 +256,50 @@ def _headset(state, event):
     The auto-switch fires ONCE per plug. The latch is re-armed by the remove
     event, so plug / listen / unplug / plug switches twice, while a udev
     `change` storm on a stationary adapter switches nothing.
+
+    `boot` IS THE OWNER'S 2026-09-13 RULING, AND IT IS THE WHOLE REASON THIS
+    FUNCTION HAS A SECOND MODE. The position must survive a power cycle
+    "regardless of whether the adapter is plugged in over the boot; the dynamic
+    switch on plug-in is an EVENT, and over a boot we do not know when that
+    event occurred or whether it is still relevant." So a presence report that
+    comes from COLDPLUG -- udev enumerating a device that was already there
+    when the kernel started, or `apply-state` looking at what is plugged in --
+    is a FACT to be recorded and never an event to be acted on. It updates
+    `headset_present` and nothing else about the output.
+
+    It also SETS the latch rather than spending it, because coldplug is the one
+    moment the panel gets a free, trustworthy look at the world: an adapter
+    present across the boot has no pending plug event behind it (latch spent),
+    and an adapter absent across the boot means the next arrival really is a
+    fresh plug (latch armed). That is what lets acceptance check 8 still pass
+    on a panel that booted with nothing plugged in.
+
+    Measured failure this replaces (panel, 2026-09-13 23:18): a power cycle
+    with the adapter already plugged in logged "headset adapter present" then
+    "auto-switch speaker -> headset (one-shot)", and the panel came back on
+    Headset although it was left on Speaker.
     """
     present = event.get("present")
     if not isinstance(present, bool):
         raise StateError("present must be boolean")
+    boot = event.get("boot", False)
+    if not isinstance(boot, bool):
+        raise StateError("boot must be boolean")
     lines = []
-    if state["headset_present"] != present:
+    changed_presence = state["headset_present"] != present
+    if boot:
+        state["headset_present"] = present
+        # Present across the boot => no pending event; absent => the next add
+        # is a real one. Either way the OUTPUT is not touched: ruling G wins.
+        state["headset_autoswitch_armed"] = not present
+        lines.append("headset adapter %s at boot: recorded, no auto-switch "
+                     "(output stays %s)"
+                     % ("present" if present else "absent", state["output"]))
+        if changed_presence and not present and state["output"] == "headset":
+            lines.append("headset still selected: every output silent until the "
+                         "switch is moved")
+        return state, lines
+    if changed_presence:
         lines.append("headset adapter %s" % ("present" if present else "absent"))
     state["headset_present"] = present
     if not present:
@@ -267,6 +308,14 @@ def _headset(state, event):
             lines.append("headset still selected: every output silent until the "
                          "switch is moved")
         return state, lines or ["headset adapter absent (no change)"]
+    if not changed_presence:
+        # NOTHING ARRIVED. The applier already believed this adapter was there,
+        # so whatever produced this report -- a `udevadm trigger`, the presence
+        # unit being restarted, a re-assert after resume -- is not a plug, and
+        # the ruling is that only a plug may move the switch. The latch is left
+        # exactly as it was, because spending it here would eat the next real
+        # plug. (Review, 2026-09-13.)
+        return state, lines + ["headset adapter already present: no arrival to act on"]
     armed = state["headset_autoswitch_armed"]
     state["headset_autoswitch_armed"] = False
     if armed and state["output"] == "speaker":

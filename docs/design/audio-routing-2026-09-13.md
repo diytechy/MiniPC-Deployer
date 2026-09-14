@@ -120,6 +120,9 @@ with `cat`.
 }
 ```
 
+`headset_present` and `headset_autoswitch_armed` are **set from what coldplug
+sees and never acted on** — see "A plug-in is an event; a boot is not" below.
+
 Every field falls back **independently** if the file is damaged, and the
 replacement is journaled. The whole of the decision logic is
 `stack/autoinstall/wall/wall_audio_state.py` — pure, no I/O, 100 % exercised by
@@ -151,6 +154,99 @@ kernel's fact, reported by udev, and a renderer able to assert it could talk the
 panel into silence (ruling 7). `seq` is recorded in the same atomic write as the
 change it caused, because `systemd.path` fires on every close-write and a
 replayed rocker press walks the room's volume down on its own.
+
+### A plug-in is an event; a boot is not (Owner ruling, 2026-09-13)
+
+**Measured on the panel at 23:18, with bus mode installed live and acceptance
+checks 1–10 run.** After a power cycle with the USB headset adapter
+(`0d8c:0014`) already plugged in, `wall-headset-present.service` ran at boot
+alongside `wall-audio-state.service`, logged *"headset adapter present"* and then
+*"auto-switch speaker -> headset (one-shot)"* — so the panel came back on
+**Headset** although it had been left on **Speaker**.
+
+**Owner ruling:** the position must persist through a power cycle, including the
+last setting, regardless of whether the adapter is plugged in over the boot. The
+dynamic switch on plug-in is an **event**, and over a boot we do not know when
+that event occurred or whether it is still relevant.
+
+So a presence report now carries *which kind of report it is*, and only a
+**runtime add** — the adapter enumerating while the system is already up — may
+move the switch. A **coldplug** report records `headset_present`, sets the latch
+(spent if the adapter was present across the boot, armed if it was absent, so
+acceptance check 8 still passes on a panel that booted bare) and touches
+`output` never. `apply-state` itself issues one coldplug report, which is also
+what keeps `headset_present` from being a stale value carried over from the last
+boot.
+
+**How the two are told apart, and why this mechanism.** Three were available:
+
+| | Why not |
+|---|---|
+| An `/proc/uptime` threshold | A guess with a number in it, and the number is wrong on exactly the boot that is slow enough to matter: a USB bus that enumerates at t+12 s on a cold morning fires the one-shot against the ruling. |
+| An explicit `--boot` flag set by the udev rule | A udev rule cannot tell coldplug from hot-plug honestly — the synthetic-event properties differ by systemd version — and a flag baked into the rule would also be wrong for every runtime re-trigger. |
+| **Two gates over one monotonic clock — chosen** | See below. |
+
+`is_boot_presence` in `wall-audio-output` is **two gates, not one**, and the
+second review round is why:
+
+* **Gate 1 — has the boot finished at all?** While `systemctl is-system-running`
+  answers `initializing` or `starting`, a device appearing is still plausibly
+  coldplug and the Owner's stored position wins. **A slow boot stays `starting`
+  for longer all by itself**, so there is no number here to be wrong about. The
+  first draft used `Wants=systemd-udev-settle.service` for this and the review
+  was right to reject it: settle drains the queue it can *see* and promises
+  nothing about an adapter behind a slow hub that enumerates a second later —
+  which would have had `USEC_INITIALIZED` after the stamp and fired the one-shot
+  against the ruling. Settle is now **not used at all**.
+* **Gate 2 — did this device predate the stored position?** `USEC_INITIALIZED`
+  is when udev first processed *this* device; the stamp in
+  `/run/wall-panel/audio-boot-apply.json` is what `apply-state` **sampled when it
+  began** applying the stored position and **published when the apply landed**.
+  Both halves matter: publishing early would declare the boot settled while the
+  legs were still moving, and sampling late would classify a plug that arrived
+  *during* the apply — whose presence unit is sitting on the apply flock waiting
+  — as coldplug and swallow a real one. This gate is what catches the reports
+  that arrive long after boot: a `udevadm trigger`, a manual `systemctl start`,
+  the presence unit being re-run.
+
+And one gate in the **policy**, which is where it belongs: a runtime add for an
+adapter the state already believed present is **not an arrival**, moves nothing,
+and — importantly — **does not spend the latch**, because spending it there would
+eat the next real plug.
+
+Ordering: `wall-headset-present.service` is `After=wall-audio-state.service`, so
+**the stored position is applied before any presence report is acted on**.
+Ordering only, no `Wants=`: in `trigger` or `panel` mode the state unit is
+disabled and the presence reporter must still be able to record what is plugged
+in.
+
+Every doubt resolves to **coldplug**: gate 1 unanswerable (no `systemctl`), no
+`USEC_INITIALIZED`, no `udevadm`, a negative or unparseable stamp. The worst case
+is then an Owner who moves the switch by hand; the alternative failure is a panel
+that moves it for them, which is the one the ruling forbids. A `remove` is always
+a runtime event — a device that is not there cannot have been coldplugged. The one
+deliberate exception is a **booted** system with no stamp at all (`/run` cleared,
+or the state unit never ran): that reads as runtime, so a genuine plug still
+works, and the policy's own "already present" refusal is what stops it firing for
+a device that never went anywhere.
+
+**Accepted, not fixed:** moving the USB hub with the headset adapter on it
+(acceptance check 12) re-enumerates the adapter and therefore *is* a headset
+event by D5's own definition — remove re-arms, add switches. There is no signal
+that separates it from a replug, and D5 says the adapter enumerating is the
+event.
+
+**The bug the review caught before the panel did:** `headset_syspath` first
+looked the ALSA **id** up under `/sys/class/sound`. sysfs names that entry
+`cardN`; the id (`Device`, for this nameless C-Media part) has no sysfs entry at
+all, so `udevadm` would never have been asked, every plug would have read as
+coldplug, and **no runtime auto-switch would ever have fired again** — a silent,
+permanent D5 regression with green tests above it. The card *number* now comes
+from the parent directory of the same `/proc/asound/cardN/usbid` that finds the
+card, and a test asserts the difference.
+
+`wall-audio-output headset add` also takes `--boot` and `--runtime` for a caller
+that already knows. The udev path passes neither, on purpose.
 
 ### The broker's protocol surface
 
@@ -373,9 +469,55 @@ sudo wall-audio-output status   # expect output speaker, plan with both speaker 
 | 7 | `sudo wall-audio-output set speaker`, then unplug the headset adapter, then `set headset` | silence on every output; `journalctl -t wall-audio-output` says the adapter is absent; `wall-audio-output status` reports `reason: headset_absent` |
 | 8 | Plug the headset adapter back in while on Speaker | switches to Headset **once**, journaled `auto-switch speaker -> headset`; `set speaker` then replugging a `change` event does **not** switch again |
 | 9 | `sudo wall-audio-output set mute` | silence; the amplifier opens after the hold-off, not before |
-| 10 | Reboot | comes back in the position it was left in; `journalctl -u wall-audio-state` shows one apply |
+| 10 | Reboot **with the adapter unplugged** | comes back in the position it was left in; `journalctl -u wall-audio-state` shows one apply |
+| 10a | Leave the switch on **Speaker**, leave the headset adapter **plugged in**, power cycle | comes back on **Speaker**. `journalctl -t wall-audio-output` shows `headset adapter present at boot: recorded, no auto-switch (output stays speaker)` and **no** `auto-switch speaker -> headset`. This is the 23:18 regression and the Owner's ruling. |
+| 10b | Then, still up, unplug the adapter and plug it back in | switches to Headset once — the runtime event still works, and check 8 is unaffected |
 | 11 | Sleep and wake (or `systemctl suspend`) | same, via `wall-audio-resume`; audio works without a manual restart |
 | 12 | Move the USB hub to another port with music playing (item 25 regression) | within ~10 s the amplifier is on and audio is audible; the journal shows the bound units cycling once |
+
+### Three wrinkles found by the live install of 2026-09-13, and fixed
+
+1. **`wall-audio-mode bus` logged `amixer sset Bus 60%` failing.** `softvol`
+   creates its control when a **client opens** the PCM that declares it
+   (`speaker_out` / `headset_out`, never `bus`), and on the first apply after a
+   whole-graph swap there may be no client for longer than any retry window
+   worth having. Waiting harder only makes the window a bigger guess, so the
+   applier **opens the leg's own PCM itself** — `aplay -q -D speaker_out
+   /dev/null`, which opens, writes no frames and exits, so the control exists
+   afterwards and not one sample reaches the room. It is done **before the leg
+   starts**, and the remembered level is set there and then: review found that
+   creating the control *after* the forwarder is running leaves a window in which
+   a freshly created softvol sits at its default — **full scale** — with audio
+   already flowing through it. The retried set at the end of the apply stays, as
+   the belt to that brace. The pre-open is never required and carries its own
+   short (5 s) timeout, because it runs while the apply flock is held and an
+   ALSA open that wedges must not hold the switch. In Mute (and in Headset with
+   no adapter) no PCM is opened at all: the control legitimately does not exist,
+   and opening one would start audio nobody asked for.
+2. **`bluealsa-aplay` and `wall-audio-state` were left stopped afterwards.** Two
+   separate causes. `bluealsa-aplay` is stopped unconditionally — it is a client
+   of `default`, consequence 1 of the mode script — but was only started again
+   if it was *enabled*, and a unit that is merely **running** reads as
+   `disabled`; the script now remembers what was active before the sweep, and a
+   mode switch may leave something off that was already off but may not turn off
+   something that was on. `wall-audio-state.service` was only ever *enabled* by
+   `apply_bus`, while the position was applied by calling the script behind the
+   unit's back — so `systemctl status wall-audio-state` was dead and
+   `journalctl -u wall-audio-state` was empty, which is exactly where acceptance
+   check 10 goes looking. The mode switch now does `systemctl restart
+   wall-audio-state.service` (**restart**, because the unit is
+   `RemainAfterExit=yes` and starting an already-active oneshot runs nothing),
+   starts `wall-audio-apply.path`, and starts `wall-headset-present.service` when
+   the adapter's device unit is **active** — `systemctl is-active`, not
+   `list-units`, because an unplugged device unit can stay *loaded* and inactive
+   and asking for a `BindsTo=` service with no device behind it would fail the
+   whole mode switch.
+3. **Firstboot warned about "REPLACE_WITH placeholders" on a fully configured
+   panel.** A separate bug in the same install, and not an audio one: `wall.env`
+   ships its optional settings as **commented** examples that still carry
+   `REPLACE_WITH_…`, and the check was a bare `grep -q`. It now filters
+   `^[[:space:]]*#` first, so only live assignments count and the warning means
+   something again.
 
 ### If anything in 1–12 fails
 

@@ -21,6 +21,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import time
 
 import pytest
 
@@ -135,7 +136,10 @@ def test_the_adapter_appearing_flips_speaker_to_headset_once_d5_sr028(policy):
     state, _ = policy.apply_event(state, {"kind": "set_output", "output": "speaker"})
     state, lines = policy.apply_event(state, {"kind": "headset", "present": True})
     assert state["output"] == "speaker"
-    assert any("no auto-switch" in line for line in lines)
+    # The adapter never went anywhere, so this is not an arrival at all -- and
+    # the latch it does not spend is the one the NEXT real plug needs.
+    assert any("already present" in line for line in lines)
+    assert state["headset_autoswitch_armed"] is False, "already spent by the first add"
 
 
 def test_unplugging_re_arms_the_one_shot_sr028(policy):
@@ -626,3 +630,397 @@ def test_a_lost_switch_request_is_not_settled_by_the_mute_control_sr028():
     router = import_panel_audio("audio_router")
     assert router.OBSERVABLE_BLOCK["set_output"] == "switch"
     assert router.OBSERVABLE_BLOCK["set_mute"] == "mute"
+
+
+# -- the boot/power-cycle ruling (Owner, 2026-09-13) ------------------------
+#
+# Measured on the panel at 23:18 that evening: a power cycle with the USB
+# headset adapter already plugged in brought the panel back on Headset although
+# it was left on Speaker -- wall-headset-present.service ran at boot, logged
+# "headset adapter present", and fired the one-shot. The Owner's ruling: the
+# position must persist through a power cycle, including the last setting,
+# regardless of whether the adapter is plugged in over the boot; the dynamic
+# switch on plug-in is an EVENT, and over a boot we do not know when that event
+# occurred or whether it is still relevant.
+
+def test_a_coldplug_adapter_never_moves_the_switch_owner_ruling_sr028(policy):
+    """The whole ruling, in the pure core."""
+    state = policy.default_state()
+    assert state["output"] == "speaker"
+    state, lines = policy.apply_event(
+        state, {"kind": "headset", "present": True, "boot": True})
+    assert state["output"] == "speaker", "a power cycle keeps the Owner's position"
+    assert state["headset_present"] is True, "presence is still a recorded fact"
+    assert not any("auto-switch speaker -> headset" in line for line in lines)
+    assert any("no auto-switch" in line for line in lines), "and it says why"
+
+
+def test_a_coldplug_adapter_leaves_no_pending_event_behind_it_sr028(policy):
+    """Present across the boot => the latch is SPENT, so nothing fires later."""
+    state, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "headset", "present": True, "boot": True})
+    assert state["headset_autoswitch_armed"] is False
+    # A udev `change` on that same, stationary adapter must still do nothing.
+    state, lines = policy.apply_event(state, {"kind": "headset", "present": True})
+    assert state["output"] == "speaker"
+    assert any("already present" in line for line in lines), "nothing arrived"
+
+
+def test_an_adapter_absent_across_the_boot_arms_the_next_real_plug_sr028(policy):
+    """Acceptance check 8 must still pass on a panel that booted bare."""
+    state, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "headset", "present": False, "boot": True})
+    assert state["headset_autoswitch_armed"] is True
+    state, lines = policy.apply_event(state, {"kind": "headset", "present": True})
+    assert state["output"] == "headset"
+    assert any("auto-switch speaker -> headset" in line for line in lines)
+
+
+def test_a_coldplug_report_never_unmutes_or_re_selects_sr028(policy):
+    """It records, and that is all: mute and headset-selected both stand."""
+    for position in ("mute", "headset"):
+        state, _ = policy.apply_event(policy.default_state(),
+                                      {"kind": "set_output", "output": position})
+        state, _ = policy.apply_event(state,
+                                      {"kind": "headset", "present": True, "boot": True})
+        assert state["output"] == position
+
+
+def test_a_boot_flag_that_is_not_a_boolean_is_refused_sr028(policy):
+    with pytest.raises(policy.StateError):
+        policy.apply_event(policy.default_state(),
+                           {"kind": "headset", "present": True, "boot": "yes"})
+
+
+def test_coldplug_is_told_from_a_plug_by_two_monotonic_marks_sr028(applier):
+    """is_boot_presence gate 2: did this device predate the stored position?
+
+    The device's USEC_INITIALIZED is when udev first processed it; the stamp is
+    what apply-state sampled when it began applying the stored position. Earlier
+    means it was there across the boot.
+    """
+    up = dict(system_up=True)
+    assert applier.is_boot_presence(1000, stamp=5000, **up) is True
+    assert applier.is_boot_presence(5000, stamp=5000, **up) is True, "the same instant is cold"
+    assert applier.is_boot_presence(9000, stamp=5000, **up) is False, "later is a plug event"
+
+
+def test_a_boot_that_has_not_finished_can_never_auto_switch_sr028(applier):
+    """Gate 1, and the reason systemd-udev-settle was dropped.
+
+    Review was right that settle only drains the queue it can SEE: an adapter
+    behind a slow hub enumerating a second after settle returned would have had
+    USEC_INITIALIZED later than the stamp and fired the one-shot against the
+    ruling. While systemd still says `starting`, coldplug is still plausible and
+    the Owner's position wins -- and a slow boot stays `starting` for longer all
+    by itself, so there is no number here to get wrong.
+    """
+    assert applier.is_boot_presence(999_999_999, stamp=1, system_up=False) is True
+    assert applier.is_boot_presence(999_999_999, stamp=1, system_up=None) is True, \
+        "an unanswerable gate is coldplug too"
+
+
+def test_an_unknown_device_age_fails_towards_the_owners_position_sr028(applier, monkeypatch):
+    """Every doubt inside a booted system resolves to coldplug."""
+    assert applier.is_boot_presence(None, stamp=5000, system_up=True) is True
+    monkeypatch.setattr(applier, "read_boot_stamp", lambda *a, **k: None)
+    # A booted system with no stamp at all: /run cleared, or the state unit
+    # never ran. A genuine plug must still work; what stops this fallback from
+    # firing on a device that never went anywhere is the policy's own refusal to
+    # auto-switch for an adapter it already believed present.
+    assert applier.is_boot_presence(9000, stamp=None, system_up=True) is False
+
+
+def test_the_boot_stamp_is_monotonic_and_lives_in_run_sr028(applier, tmp_path):
+    stamp = tmp_path / "audio-boot-apply.json"
+    applier.write_boot_stamp(stamp)
+    value = applier.read_boot_stamp(stamp)
+    assert isinstance(value, int) and value >= 0
+    assert applier.BOOT_STAMP.name == "audio-boot-apply.json"
+    assert "run" in applier.BOOT_STAMP.parts, "it describes THIS boot and vanishes with it"
+    # A damaged or missing stamp reads as None, which is "coldplug".
+    stamp.write_text("not json", encoding="utf-8")
+    assert applier.read_boot_stamp(stamp) is None
+    assert applier.read_boot_stamp(tmp_path / "absent.json") is None
+
+
+def test_the_syspath_is_the_card_NUMBER_not_the_alsa_id_sr028(applier, tmp_path):
+    """The bug review caught, and it silently killed every runtime auto-switch.
+
+    sysfs names the class entry `cardN`; the ALSA id is what the adapter
+    enumerates under ("Device" for this nameless C-Media part) and has no sysfs
+    entry at all. Looking the id up under /sys/class/sound never resolves, so
+    udevadm is never asked, so every plug reads as coldplug, forever.
+    """
+    proc = tmp_path / "asound"
+    (proc / "card1").mkdir(parents=True)
+    (proc / "card1" / "usbid").write_text("0d8c:0014\n", encoding="utf-8")
+    (proc / "card1" / "id").write_text("Device\n", encoding="utf-8")
+    sysfs = tmp_path / "sys"
+    (sysfs / "card1").mkdir(parents=True)
+    assert applier.headset_card(proc) == "Device", "the ALSA id, for amixer and alsaloop"
+    resolved = applier.headset_syspath(proc, sysfs)
+    assert resolved is not None, "a runtime plug that cannot be dated never switches"
+    assert Path(resolved).name == "card1", "the card NUMBER is what sysfs knows"
+    # Nothing plugged in: no path, and the caller reads that as coldplug.
+    assert applier.headset_syspath(tmp_path / "empty", sysfs) is None
+
+
+def test_a_report_for_an_adapter_already_present_is_not_an_arrival_sr028(policy):
+    """A `udevadm trigger`, a restarted presence unit, a re-assert after resume.
+
+    None of them is a plug, and none may spend the latch -- spending it here
+    would eat the NEXT real plug.
+    """
+    state, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "headset", "present": False, "boot": True})
+    assert state["headset_autoswitch_armed"] is True
+    state["headset_present"] = True          # as a previous apply recorded it
+    state, lines = policy.apply_event(state, {"kind": "headset", "present": True})
+    assert state["output"] == "speaker", "nothing arrived, so nothing moves"
+    assert state["headset_autoswitch_armed"] is True, "and the latch is not eaten"
+    assert any("already present" in line for line in lines)
+
+
+def test_a_remove_is_always_a_runtime_event_sr028(applier):
+    """A device that is not there cannot have been coldplugged."""
+    assert applier.headset_event(False) == {"kind": "headset", "present": False, "boot": False}
+
+
+def test_the_state_unit_does_not_lean_on_udev_settle_sr028():
+    """Settle drains the queue it can SEE and promises nothing about later hardware.
+
+    An adapter behind a slow hub that enumerates a second after settle returned
+    would look like a runtime plug. The is-system-running gate covers that case
+    honestly; settle would only have made the hole harder to see.
+    """
+    unit = read(WALL / "wall-audio-state.service")
+    assert "Wants=systemd-udev-settle.service" not in unit
+    assert "After=systemd-udev-trigger.service" in unit
+    directives = [line for line in unit.splitlines() if not line.startswith("#")]
+    assert not any("systemd-udev-settle" in line for line in directives)
+
+
+def test_the_stored_position_is_applied_before_presence_is_acted_on_sr028():
+    presence = read(WALL / "wall-headset-present.service")
+    assert "After=wall-audio-state.service" in presence
+    # Ordering only: a panel in trigger or panel mode has the state unit
+    # disabled and the presence reporter must still record what is plugged in.
+    assert "Requires=wall-audio-state.service" not in presence
+    assert "Wants=wall-audio-state.service" not in presence
+
+
+def test_the_udev_rule_does_not_pretend_to_know_the_event_kind_sr028():
+    rules = read(WALL / "91-wall-headset-adapter.rules")
+    assert "--boot" not in rules and "--runtime" not in rules, \
+        "a flag baked into the rule would be wrong for every runtime re-trigger"
+
+
+def test_apply_state_records_presence_and_stamps_the_boot_sr028(applier, tmp_path, monkeypatch):
+    """The boot path end to end, through the real applier's own entry point."""
+    state_file = tmp_path / "audio-state.json"
+    stamp = tmp_path / "audio-boot-apply.json"
+    monkeypatch.setattr(applier, "BOOT_STAMP", stamp)
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: "Device")
+    monkeypatch.setattr(applier, "current_mode", lambda: "trigger")  # no hardware here
+    state_file.write_text(json.dumps({"version": 1, "output": "speaker",
+                                      "headset_autoswitch_armed": True}), encoding="utf-8")
+    assert applier.main(["--state", str(state_file), "apply-state"]) == 0
+    written = json.loads(state_file.read_text(encoding="utf-8"))
+    assert written["output"] == "speaker", "the power cycle kept the Owner's position"
+    assert written["headset_present"] is True
+    assert written["headset_autoswitch_armed"] is False
+    assert applier.read_boot_stamp(stamp) is not None
+
+
+def test_the_stamp_is_sampled_before_the_apply_and_published_after_it_sr028(applier, tmp_path,
+                                                                           monkeypatch):
+    """Both halves matter, and review caught both.
+
+    Publishing early would declare the boot settled while the legs were still
+    moving, so an adapter enumerating in between would read as a plug event.
+    Sampling late would classify a plug that arrived DURING the apply -- whose
+    presence unit is sitting on the flock waiting for us -- as coldplug, and
+    swallow a real one.
+    """
+    state_file = tmp_path / "audio-state.json"
+    stamp = tmp_path / "audio-boot-apply.json"
+    monkeypatch.setattr(applier, "BOOT_STAMP", stamp)
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    monkeypatch.setattr(applier, "current_mode", lambda: "bus")
+    order = []
+
+    def apply_plan(state, shell):
+        order.append("apply")
+        assert not stamp.exists(), "the stamp must not be published mid-apply"
+        return 0
+
+    monkeypatch.setattr(applier, "apply_plan", apply_plan)
+    before = int(time.monotonic() * 1_000_000)
+    assert applier.main(["--state", str(state_file), "--dry-run", "apply-state"]) == 0
+    after = int(time.monotonic() * 1_000_000)
+    assert order == ["apply"]
+    mark = applier.read_boot_stamp(stamp)
+    assert before <= mark <= after
+
+
+def test_a_negative_stamp_is_refused_sr028(applier, tmp_path):
+    """It would sit before every real initialization time and make every
+    coldplug a plug event -- the exact failure the stamp exists to prevent."""
+    stamp = tmp_path / "audio-boot-apply.json"
+    stamp.write_text(json.dumps({"monotonic_usec": -1}), encoding="utf-8")
+    assert applier.read_boot_stamp(stamp) is None
+
+
+def test_the_boot_finished_gate_reads_systemd_not_a_clock_sr028(applier):
+    def answering(text):
+        class Reply:
+            returncode, stdout, stderr = 0, text, ""
+        return lambda argv, **kwargs: Reply()
+
+    assert applier.system_is_up(run=answering("running\n")) is True
+    assert applier.system_is_up(run=answering("degraded\n")) is True
+    assert applier.system_is_up(run=answering("starting\n")) is False
+    assert applier.system_is_up(run=answering("initializing\n")) is False
+    assert applier.system_is_up(run=answering("who knows\n")) is None
+
+    def explodes(argv, **kwargs):
+        raise OSError("no systemctl here")
+
+    assert applier.system_is_up(run=explodes) is None
+
+
+# -- the level, and the control that does not exist yet ---------------------
+
+class _Reply:
+    """What subprocess.run returns to the applier."""
+
+    def __init__(self, returncode):
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = "amixer: Unable to find simple control 'Bus',0"
+
+
+def test_the_control_is_declared_and_set_before_the_leg_starts_sr028(applier, policy):
+    """Measured 2026-09-13: `wall-audio-mode bus` logged `sset Bus 60%` failing.
+
+    softvol creates its control when a CLIENT opens the PCM that declares it,
+    and on the first apply after a whole-graph swap there may be no client for
+    longer than any retry window worth having. So the applier opens the PCM
+    itself. Review then found the ordering that mattered: created AFTER the
+    forwarder is running, the control exists for a moment at the plugin default
+    -- full scale -- with audio already flowing through it. So it is declared
+    and set BEFORE the leg starts, and the retried set at the end stays as the
+    belt to that brace.
+    """
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(policy.default_state(), recorder)
+    names = [argv[0].rsplit("/", 1)[-1] for argv in recorder.commands]
+    assert "aplay" in names, "the applier declares the control itself"
+    preopen = names.index("aplay")
+    assert recorder.commands[preopen][-1] == "/dev/null", "no frames reach the room"
+    assert "speaker_out" in recorder.commands[preopen], "the PCM that DECLARES the softvol"
+    first_start = min(index for index, argv in enumerate(recorder.commands)
+                      if names[index] == "systemctl" and argv[1] == "start")
+    assert preopen < first_start, "a softvol created under a running leg starts at full scale"
+    levels = [index for index, argv in enumerate(recorder.commands)
+              if names[index] == "amixer" and "Bus" in argv]
+    assert levels[0] > preopen and levels[0] < first_start, \
+        "the remembered level is in place before a single frame is forwarded"
+    assert levels[-1] == len(recorder.commands) - 1, "and re-asserted last, retried"
+
+
+def test_the_pre_open_is_bounded_in_time_as_well_as_in_tries_sr028(applier):
+    """It runs while the apply flock is held, so an ALSA open that wedges must
+    not hold the switch for the caller's default timeout."""
+    seen = {}
+
+    def run(argv, **kwargs):
+        seen[argv[0]] = kwargs.get("timeout")
+        return _Reply(0)
+
+    shell = applier.Applier(run=run)
+    assert applier.declare_bus_control(shell, "speaker_out") is True
+    assert seen["/usr/bin/aplay"] == 5
+
+
+def test_the_pre_open_is_bounded_and_never_runs_with_no_leg_sr028(applier, policy):
+    calls = []
+
+    def always_fail(argv, **kwargs):
+        calls.append(argv)
+        return _Reply(1)
+
+    shell = applier.Applier(run=always_fail)
+    assert applier.set_bus_level(shell, "Loopback", 60, sleep=lambda _: None,
+                                 pcm="speaker_out") is False
+    assert len([a for a in calls if a[0].endswith("aplay")]) == 1
+    assert len([a for a in calls if a[0].endswith("amixer")]) == applier.BUS_CONTROL_ATTEMPTS
+
+    # Mute: no leg runs, so nothing is opened at all -- opening a PCM to create
+    # a control would start audio nobody asked for.
+    calls.clear()
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_output", "output": "mute"})
+    applier.apply_plan(muted, applier.Applier(dry_run=True))
+    shell = applier.Applier(run=always_fail)
+    # Mute, or headset with no adapter: the control legitimately does not exist
+    # and opening a PCM to create one would start audio nobody asked for.
+    assert applier.set_bus_level(shell, "Loopback", 0, expected=False,
+                                 sleep=lambda _: None, pcm="speaker_out") is True
+    assert not any(a[0].endswith("aplay") for a in calls)
+
+
+def test_each_position_pre_opens_its_own_leg_sr028(applier):
+    assert applier.BUS_CONTROL_PCM == {"speaker": "speaker_out", "headset": "headset_out"}
+    conf = read(BUS_CONF)
+    for pcm in applier.BUS_CONTROL_PCM.values():
+        assert "pcm.%s {" % pcm in conf, "the pre-open must name a PCM that exists"
+    assert "mute" not in applier.BUS_CONTROL_PCM, "there is nothing to open in Mute"
+
+
+# -- the two install wrinkles seen live on 2026-09-13 -----------------------
+
+def test_a_mode_switch_restarts_what_it_stopped_sr028():
+    """Measured: after `wall-audio-mode bus`, bluealsa-aplay was left stopped.
+
+    The script stops it unconditionally -- it is a client of `default` -- but
+    only started it again if it was ENABLED, and a unit that is merely running
+    reads as disabled. A mode switch may leave something off that was off; it
+    may not turn off something that was on.
+    """
+    mode = read(WALL / "wall-audio-mode")
+    assert "remember_active" in mode and "was_active" in mode
+    remembered = mode.split("remember_active wall-amp-trigger.service", 1)[1] \
+                     .split("unit stop", 1)[0]
+    assert "bluealsa-aplay.service" in remembered
+    starter = mode.split("start_if_enabled() {", 1)[1].split("\n}", 1)[0]
+    assert 'if was_active "$1"' in starter, "running before means running after"
+
+
+def test_bus_mode_starts_the_state_unit_rather_than_the_script_sr028():
+    """Measured: after `wall-audio-mode bus`, wall-audio-state was left inactive.
+
+    Which is where acceptance check 10 goes looking, and it was empty. `restart`
+    rather than `start`, because the unit is RemainAfterExit=yes and starting an
+    already-active oneshot runs nothing.
+    """
+    mode = read(WALL / "wall-audio-mode")
+    bus = mode.split('if [ "$1" = bus ]; then', 1)[1]
+    assert "unit restart wall-audio-state.service" in bus
+    assert "/usr/local/sbin/wall-audio-output apply-state" not in bus, \
+        "behind the unit's back is how the unit ended up dead"
+    assert "unit start wall-audio-apply.path" in bus, "the broker's only road to root"
+    assert "wall-headset-present.service" in bus
+
+
+def test_firstboot_does_not_warn_about_commented_out_placeholders():
+    """A separate firstboot bug, seen in the same install: wall.env ships its
+    optional settings as commented examples that still carry REPLACE_WITH_...,
+    so a fully configured panel warned on every run and the warning stopped
+    meaning anything.
+    """
+    firstboot = read(WALL / "wall-firstboot.sh")
+    line = [one for one in firstboot.splitlines()
+            if "REPLACE_WITH" in one and one.strip().startswith("if grep")][0]
+    assert "grep -v" in line and "#" in line

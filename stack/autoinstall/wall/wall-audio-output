@@ -19,7 +19,7 @@ Usage:
   wall-audio-output set {mute|headset|speaker}
   wall-audio-output input-mute {on|off}
   wall-audio-output volume {0..100|up|down}
-  wall-audio-output headset {add|remove}
+  wall-audio-output headset {add|remove} [--boot|--runtime]
   wall-audio-output apply-state              # re-assert the stored state (boot, resume)
   wall-audio-output apply-request [PATH]     # one broker request, deduplicated
 
@@ -61,7 +61,10 @@ CONF_DIR = Path(os.environ.get("WALL_PANEL_CONF_DIR") or "/etc/wall-panel")
 STATE_FILE = CONF_DIR / "audio-state.json"
 MODE_FILE = CONF_DIR / "audio-mode"
 CARDS_FILE = CONF_DIR / "audio-cards.env"
-RUN_DIR = Path("/run/wall-panel")
+# Overridable for the same reason CONF_DIR is: the hermetic suite drives the
+# real applier and must not read or write the panel's /run.
+LIVE_RUN_DIR = Path("/run/wall-panel")
+RUN_DIR = Path(os.environ.get("WALL_PANEL_RUN_DIR") or LIVE_RUN_DIR)
 # Resolved at apply time and read by wall-bus-headset.service through
 # EnvironmentFile=, because the headset card's id is the generic "Device" and
 # ALSA configuration cannot look a card up by USB id.
@@ -75,12 +78,21 @@ DEFAULT_REQUEST = Path("/run/wall-audio-router/request.json")
 # forwarders or by none. The lock is held across the WHOLE of load, decide,
 # save and apply, not just the write.
 LOCK_FILE = RUN_DIR / "audio-apply.lock"
+# The boot/resume stamp behind the Owner's 2026-09-13 ruling: the switch
+# position must survive a power cycle "regardless of whether the adapter is
+# plugged in over the boot". See is_boot_presence for the whole mechanism and
+# for why it is a monotonic mark rather than an uptime threshold. In /run, not
+# /etc, because it describes THIS boot and must vanish with it.
+BOOT_STAMP = RUN_DIR / "audio-boot-apply.json"
 
 # Measured 2026-09-13: the headset adapter is 0d8c:0014 ("Device"), the 5.1
 # adapter 0d8c:0102 (ICUSBAUDIO7D). The USB id is matched rather than the card
 # id because "Device" is what the kernel calls ANY nameless C-Media adapter.
 HEADSET_USB_ID = "0d8c:0014"
 PROC_ASOUND = Path("/proc/asound")
+# Where udevadm is asked about the headset card; a seam for the tests, which
+# have neither a sound card nor udev.
+SYS_CLASS_SOUND = Path("/sys/class/sound")
 # The softvol control created by asound-bus-mode.conf. It lives on the Loopback
 # card, which is always present, so the level survives a leg being stopped.
 BUS_CONTROL = "Bus"
@@ -149,6 +161,189 @@ def headset_card(proc_asound=PROC_ASOUND):
     return None
 
 
+def headset_syspath(proc_asound=PROC_ASOUND, sys_class_sound=SYS_CLASS_SOUND):
+    """The sysfs path of the headset card, for udevadm. None if it is not there.
+
+    IT IS `cardN`, NOT THE ALSA ID, AND THE DIFFERENCE IS THE WHOLE FUNCTION.
+    sysfs names the class entry by the card NUMBER (`/sys/class/sound/card1`);
+    the ALSA id `headset_card` returns is the name the adapter enumerates under
+    ("Device" for this nameless C-Media part) and has no sysfs entry of its own.
+    Looking the id up under /sys/class/sound therefore never resolves, udevadm
+    is never asked, and -- because every doubt resolves to "coldplug" -- no
+    runtime plug would EVER auto-switch again. Caught by review, 2026-09-13.
+
+    So the number is taken from the same scan that finds the card: the parent
+    directory of the matching `/proc/asound/cardN/usbid` IS `cardN`.
+    """
+    try:
+        entries = sorted(Path(proc_asound).glob("card*/usbid"))
+    except OSError:
+        return None
+    for usbid in entries:
+        try:
+            if usbid.read_text(encoding="utf-8").strip().lower() != HEADSET_USB_ID:
+                continue
+        except OSError:
+            continue
+        path = Path(sys_class_sound) / usbid.parent.name
+        return str(path) if path.exists() else None
+    return None
+
+
+def device_initialized_usec(syspath, run=subprocess.run):
+    """When udev first finished processing this device, in CLOCK_MONOTONIC usec.
+
+    `USEC_INITIALIZED` is set by udev the first time it processes a device and
+    is never rewritten by a later `change`, so it answers exactly the question
+    the ruling asks: did this adapter come into existence before or after the
+    stored position was applied? It is the same clock `time.monotonic()` reads.
+
+    None on any doubt at all -- no udevadm, no property, an unparseable value --
+    and the caller treats None as "boot", which is the safe direction: the worst
+    case is an Owner who has to move the switch by hand, never a panel that
+    moves it for them.
+    """
+    if not syspath:
+        return None
+    try:
+        done = run(["/usr/bin/udevadm", "info", "--query=property", "--path", syspath],
+                   check=False, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    for line in (done.stdout or "").splitlines():
+        key, _, value = line.partition("=")
+        if key == "USEC_INITIALIZED":
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def system_is_up(run=subprocess.run):
+    """Has systemd finished booting? None when the question cannot be answered.
+
+    `systemctl is-system-running` prints `initializing`/`starting` until
+    `startup-finished`, then `running` (or `degraded`, which is still up). This
+    is the gate that a SLOW BOOT CANNOT OUTRUN, and it is why the design does
+    not lean on systemd-udev-settle: settle only drains the queue it can see, so
+    an adapter behind a slow hub that enumerates a second after settle returned
+    would look like a runtime plug and fire the one-shot against the ruling.
+    While systemd still says `starting`, coldplug is still plausible and the
+    Owner's stored position wins. A slow boot simply stays `starting` longer --
+    there is no number here to be wrong about.
+    """
+    try:
+        done = run(["/usr/bin/systemctl", "is-system-running"],
+                   check=False, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    answer = (done.stdout or "").strip()
+    if answer in ("running", "degraded", "maintenance", "stopping"):
+        return True
+    if answer in ("initializing", "starting"):
+        return False
+    return None
+
+
+def read_boot_stamp(path=None):
+    """The monotonic microsecond at which this boot's stored position was applied.
+
+    The path defaults to BOOT_STAMP at CALL time, not at definition time, so the
+    tests can point the pair at a temp file.
+    """
+    path = BOOT_STAMP if path is None else path
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = raw.get("monotonic_usec") if isinstance(raw, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        # A negative stamp would sit before every real initialization time and
+        # turn every coldplug into a plug event -- the exact failure this file
+        # exists to prevent. Refuse it; None is read as "coldplug".
+        return None
+    return value
+
+
+def write_boot_stamp(path=None, dry_run=False, monotonic_usec=None):
+    """Mark the moment the stored position became true. Called by apply-state.
+
+    `monotonic_usec` IS SAMPLED BY THE CALLER, AT THE START OF THE APPLY, AND
+    THE FILE IS WRITTEN AT THE END. Two review findings meet here. Writing the
+    file early would classify a device that enumerated during the apply as a
+    plug event before the stored position had been applied at all; sampling the
+    clock late would classify a plug that arrived DURING the apply -- and whose
+    presence unit is sitting on the flock waiting for us -- as coldplug, and
+    swallow a real one. Sampling early and publishing late is right on both
+    counts: the mark means "the world as this apply found it".
+
+    A dry run still writes a stamp that is NOT the panel's own, on exactly
+    save_state's reasoning: the hermetic suite drives the real applier through
+    a boot and then a plug, and the difference between them is this file.
+    """
+    path = BOOT_STAMP if path is None else path
+    if dry_run and Path(path) == LIVE_RUN_DIR / "audio-boot-apply.json":
+        print("write %s (suppressed: --dry-run on the live boot stamp)" % path)
+        return
+    if monotonic_usec is None:
+        monotonic_usec = int(time.monotonic() * 1_000_000)
+    stamp = {"monotonic_usec": max(0, int(monotonic_usec))}
+    write_atomic(path, json.dumps(stamp) + "\n", mode=0o644)
+
+
+def is_boot_presence(initialized_usec, stamp=None, system_up=None):
+    """Is this presence report coldplug (a fact) or a runtime plug (an event)?
+
+    THE MECHANISM, AND WHY IT IS THIS ONE.
+
+    Three were available. An `/proc/uptime` threshold is a guess with a number
+    in it, and the number is wrong on exactly the boot that is slow enough to
+    matter -- a USB bus that enumerates at t+12 s on a cold morning would fire
+    the one-shot against the ruling. An explicit `--boot` flag set by the udev
+    rule cannot be written honestly: udev rules cannot portably tell a coldplug
+    event from a hot-plug one (`SYNTH_UUID` semantics differ by systemd
+    version), and a flag baked into the rule would also be wrong for every
+    runtime re-trigger. What is left is a comparison between marks on ONE
+    monotonic clock, and this function is TWO gates over that clock, not one:
+
+    GATE 1 -- HAS THE BOOT FINISHED AT ALL? While `systemctl is-system-running`
+    still says `starting`, a device appearing is still plausibly coldplug, and
+    the Owner's stored position wins. A slow boot stays `starting` for longer,
+    all by itself; there is no number here to be wrong about. This gate exists
+    because the first draft leaned on `systemd-udev-settle`, and review was
+    right that settle only drains the queue it can SEE: an adapter behind a slow
+    hub that enumerates one second after settle returned would have been read as
+    a plug event and fired the one-shot against the ruling.
+
+    GATE 2 -- DID THIS DEVICE PREDATE THE STORED POSITION? `USEC_INITIALIZED`
+    is when udev first processed THIS device; the stamp is what `apply-state`
+    sampled when it began applying the stored position. Earlier means it was
+    there across the boot. This is what catches the reports that arrive long
+    after the boot has finished -- a `udevadm trigger`, a manual `systemctl
+    start`, the presence unit being re-run -- none of which is a plug.
+
+    An unanswerable gate 1 (no systemctl) is BOOT. A boot that has finished with
+    no stamp at all is a RUNTIME report: `/run` has been cleared or the state
+    unit never ran, and a genuine plug must still work -- and `wall_audio_state`
+    refuses to auto-switch for an adapter it already believed present, which is
+    what stops that fallback from firing on a device that never went anywhere.
+    """
+    if system_up is None:
+        system_up = system_is_up()
+    if system_up is not True:
+        return True
+    if stamp is None:
+        stamp = read_boot_stamp()
+    if stamp is None:
+        return False
+    if initialized_usec is None:
+        return True
+    return initialized_usec <= stamp
+
+
 @contextlib.contextmanager
 def apply_lock(path=None, dry_run=False):
     """Serialize applies. Blocking, because every caller's work must still land.
@@ -184,7 +379,7 @@ class Applier:
         self._run = run
         self.commands = []
 
-    def command(self, argv, required=True, quiet=False):
+    def command(self, argv, required=True, quiet=False, timeout=15):
         """Run one command; returns 0 on success, 1 on a failure that counts.
 
         `required` False means a failure is logged rather than counted -- a card
@@ -198,7 +393,8 @@ class Applier:
             print(" ".join(argv))
             return 0
         try:
-            done = self._run(argv, check=False, capture_output=True, text=True, timeout=15)
+            done = self._run(argv, check=False, capture_output=True, text=True,
+                             timeout=timeout)
         except (OSError, subprocess.SubprocessError) as exc:
             if not quiet:
                 log("FAILED: %s: %s" % (" ".join(argv), exc))
@@ -282,17 +478,59 @@ def save_state(state, path=STATE_FILE, dry_run=False):
 # ceiling only matters on a panel that is already struggling.
 BUS_CONTROL_ATTEMPTS = 20
 BUS_CONTROL_INTERVAL_SECONDS = 0.1
+# After this many fruitless attempts (0.5 s), open the leg's PCM ourselves once
+# rather than keep waiting for someone else to. See set_bus_level.
+BUS_CONTROL_PREOPEN_AFTER = 5
+# The PCM that DECLARES the softvol for each position. Named here because the
+# pre-open must open the plugin that creates the control, not the bus: `Bus`
+# lives on speaker_out and headset_out in asound-bus-mode.conf, and opening
+# `bus` would create nothing.
+BUS_CONTROL_PCM = {"speaker": "speaker_out", "headset": "headset_out"}
 
 
-def set_bus_level(applier, card, level, expected=True, sleep=time.sleep):
+def declare_bus_control(applier, pcm):
+    """Open the leg's PCM once so softvol creates its control, before any audio.
+
+    `aplay -D speaker_out /dev/null` opens the plugin chain, writes no frames
+    and exits; the control it declares stays on the Loopback card afterwards.
+    Called BEFORE the forwarder starts, and that ordering is the point: review
+    found that creating the control after the leg was already running left a
+    window in which a freshly created softvol sat at its default -- full scale --
+    with the forwarder feeding it. Nothing is audible during the pre-open
+    itself, because there is no source and no frames.
+
+    Never required, and given a short timeout of its own: this runs while the
+    apply lock is held, so an ALSA open that wedges must not hold the switch.
+    """
+    return applier.command(["/usr/bin/aplay", "-q", "-D", pcm, "/dev/null"],
+                           required=False, quiet=True, timeout=5) == 0
+
+
+def set_bus_level(applier, card, level, expected=True, sleep=time.sleep, pcm=None):
     """Set the bus softvol, retrying until the control exists. True if it took.
 
     `expected` False means no leg is running (mute, or headset with no adapter),
     so the control legitimately does not exist and one attempt is enough.
+
+    `pcm` IS THE FIX FOR THE 2026-09-13 INSTALL FAILURE. `wall-audio-mode bus`
+    ran the first apply of the boot and logged `amixer sset Bus 60%` failing:
+    softvol creates its control when a CLIENT OPENS the PCM that declares it,
+    and on a panel that has just had its whole graph swapped there may be no
+    client for longer than the retry window. Waiting harder would only make the
+    window a bigger guess, so after BUS_CONTROL_PREOPEN_AFTER fruitless
+    attempts the applier opens the PCM itself -- `aplay -D <pcm> /dev/null`,
+    which opens, writes no frames and exits, so the control exists afterwards
+    and not one sample reaches the room. It is tried once, it is not required,
+    and the retry loop stays bounded either way.
     Implements: SR-028, LLR-014
     """
     attempts = BUS_CONTROL_ATTEMPTS if expected else 1
+    preopened = False
     for attempt in range(attempts):
+        if pcm and expected and attempt == BUS_CONTROL_PREOPEN_AFTER and not preopened:
+            preopened = True
+            applier.command(["/usr/bin/aplay", "-q", "-D", pcm, "/dev/null"],
+                            required=False, quiet=True)
         # required=True so that a missing control is REPORTED to this loop as a
         # failure; the caller decides what it means, and never counts it as a
         # failed apply -- the audio is playing either way, only the level is in
@@ -339,6 +577,18 @@ def apply_plan(state, applier):
                          "mute" if wanted["headset_muted"] else "unmute"], required=False)
         applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
                          "nocap" if wanted["input_muted"] else "cap"], required=False)
+    # THE SOFTVOL CONTROL IS DECLARED, AND SET, BEFORE THE LEG STARTS. softvol
+    # creates its control when a client opens the PCM that declares it, and a
+    # control that does not exist yet cannot be set -- which on 2026-09-13 made
+    # `wall-audio-mode bus` log `amixer sset Bus 60%` failing on the first apply
+    # of the boot. Declaring it ourselves first also closes the window review
+    # found in the first fix: a control created AFTER the forwarder is already
+    # running sits at the plugin default, which is full scale, with audio
+    # flowing through it.
+    leg_pcm = BUS_CONTROL_PCM.get(state["output"])
+    if leg_pcm and any(wanted["legs"].values()):
+        if declare_bus_control(applier, leg_pcm):
+            set_bus_level(applier, loopback, wanted["volume"], expected=False)
     for unit, should_run in wanted["legs"].items():
         if should_run:
             failures += applier.command(["/usr/bin/systemctl", "start", unit])
@@ -352,7 +602,8 @@ def apply_plan(state, applier):
     # journal line, not a failed apply: the audio is playing, only the level is
     # not what was asked for.
     if not set_bus_level(applier, loopback, wanted["volume"],
-                         expected=any(wanted["legs"].values())):
+                         expected=any(wanted["legs"].values()),
+                         pcm=leg_pcm):
         log("bus level %d%% could not be applied: the control never appeared"
             % wanted["volume"])
     if wanted["reason"]:
@@ -361,11 +612,39 @@ def apply_plan(state, applier):
     return failures
 
 
+def headset_event(present, forced_boot=False, forced_runtime=False):
+    """One `headset` event, carrying whether it is coldplug or a runtime plug.
+
+    The distinction is the Owner's 2026-09-13 ruling and it is made HERE, in the
+    shell, because it is a fact about the machine (see is_boot_presence), not a
+    policy. wall_audio_state is then told what kind of report it has, and only
+    a runtime add is allowed to move the switch.
+
+    `--boot` and `--runtime` force the answer for a caller that already knows
+    it: the udev path never passes either, because the whole point is that it
+    cannot honestly tell. A bare `wall-audio-output headset add` typed at a
+    terminal with no udev answer available resolves to BOOT -- it records the
+    adapter and leaves the switch alone -- because that is the safe direction.
+    """
+    if not present:
+        # A remove is only ever a runtime event: a device that is not there
+        # cannot be coldplugged, and the remove half of the presence unit only
+        # runs when the kernel actually took the device away.
+        return {"kind": "headset", "present": False, "boot": bool(forced_boot)}
+    if forced_runtime:
+        return {"kind": "headset", "present": True, "boot": False}
+    boot = forced_boot
+    if not boot:
+        boot = is_boot_presence(device_initialized_usec(headset_syspath()))
+    return {"kind": "headset", "present": True, "boot": bool(boot)}
+
+
 def event_from_arguments(arguments):
     """Turn the parsed command line into one wall_audio_state event, or None.
 
     None means "apply what is stored" -- boot, resume and a manual re-assert
-    all take that path, and none of them is allowed to invent a state change.
+    all take that path, and none of them is allowed to invent a state change
+    beyond recording what is plugged in (see _locked_apply).
     """
     if arguments.command == "set":
         return {"kind": "set_output", "output": arguments.value}
@@ -376,7 +655,8 @@ def event_from_arguments(arguments):
             return {"kind": "nudge_volume", "louder": arguments.value == "up"}
         return {"kind": "set_volume", "level": int(arguments.value)}
     if arguments.command == "headset":
-        return {"kind": "headset", "present": arguments.value == "add"}
+        return headset_event(arguments.value == "add", forced_boot=arguments.boot,
+                             forced_runtime=arguments.runtime)
     return None
 
 
@@ -428,10 +708,21 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true",
                         help="print the privileged commands; change nothing")
     parser.add_argument("--state", default=str(STATE_FILE))
+    parser.add_argument("--boot", action="store_true",
+                        help="force a presence report to be treated as coldplug "
+                             "(a fact to record, never an event to act on)")
+    parser.add_argument("--runtime", action="store_true",
+                        help="force a presence report to be treated as a plug "
+                             "event on an already-running system")
     parser.add_argument("command", choices=("status", "set", "input-mute", "volume",
                                             "headset", "apply-state", "apply-request"))
     parser.add_argument("value", nargs="?")
     arguments = parser.parse_args(argv)
+
+    if arguments.boot and arguments.runtime:
+        parser.error("--boot and --runtime are opposites; pass at most one")
+    if (arguments.boot or arguments.runtime) and arguments.command != "headset":
+        parser.error("--boot/--runtime only mean anything for `headset`")
 
     expects_value = {"set": policy.OUTPUTS, "input-mute": ("on", "off"),
                      "headset": ("add", "remove")}
@@ -470,6 +761,23 @@ def _locked_apply(arguments):
         log(note)
 
     seq = None
+    boot_mark = None
+    if arguments.command == "apply-state":
+        # Sampled HERE, before anything is decided or applied, and written at
+        # the very end -- see write_boot_stamp for why the two halves are apart.
+        boot_mark = int(time.monotonic() * 1_000_000)
+        # THE STORED POSITION IS APPLIED FIRST, AND WHAT IS PLUGGED IN IS ONLY
+        # RECORDED. Owner ruling 2026-09-13: over a boot we do not know when a
+        # plug event happened or whether it is still relevant, so coldplug is a
+        # fact, never an event. This refreshes `headset_present` -- which is
+        # otherwise a stale value from the last boot -- and sets the one-shot
+        # latch from what coldplug actually sees, without ever moving `output`.
+        state, lines = policy.apply_event(
+            state, headset_event(headset_card() is not None, forced_boot=True))
+        for line in lines:
+            log(line)
+        save_state(state, arguments.state, dry_run=arguments.dry_run)
+
     if arguments.command == "apply-request":
         request = read_request(arguments.value or DEFAULT_REQUEST,
                                state.get("request_seq", -1))
@@ -499,8 +807,16 @@ def _locked_apply(arguments):
         # panel is in the old trigger chain, and `wall-audio-mode bus` applies
         # it on arrival. Touching mixers or units here would fight that chain.
         log("mode is %s, not bus: state recorded, hardware untouched" % mode)
+        if boot_mark is not None:
+            write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
         return 0
     failures = apply_plan(state, Applier(dry_run=arguments.dry_run))
+    # Published only now, with the graph in the position the state asked for. A
+    # stamp written before the apply would declare the boot settled while the
+    # legs were still moving, and any adapter that enumerated in between would
+    # read as a plug event -- the very thing this is here to prevent.
+    if boot_mark is not None:
+        write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
     if failures:
         log("apply finished with %d failure(s): audio may be wrong" % failures)
         return 1

@@ -22,6 +22,16 @@ Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=sound.target
 BindsTo=dev-wall_headset_adapter.device
 After=dev-wall_headset_adapter.device
+# THE STORED POSITION IS APPLIED BEFORE ANY PRESENCE REPORT IS ACTED ON. Owner
+# ruling 2026-09-13: over a boot we do not know when a plug event happened or
+# whether it is still relevant, so the position the Owner left the panel in
+# wins, and coldplug only records what is plugged in. wall-audio-state.service
+# is the unit that applies that position and writes the monotonic stamp this
+# unit's applier compares against; running before it would make every boot look
+# like a plug event. Ordering only -- no Wants/Requires, because a panel in
+# trigger or panel mode has the state unit disabled and this one must still be
+# able to record presence.
+After=wall-audio-state.service
 
 [Service]
 Type=oneshot

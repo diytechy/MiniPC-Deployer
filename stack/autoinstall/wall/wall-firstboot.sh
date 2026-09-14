@@ -138,7 +138,11 @@ load_env_file() {
     done < "$__f"
 }
 load_env_file "$ENV_FILE"
-if grep -q "REPLACE_WITH" "$ENV_FILE"; then
+# COMMENTED-OUT LINES DO NOT COUNT. wall.env ships its optional settings as
+# commented examples that still carry REPLACE_WITH_..., so a fully configured
+# panel warned about placeholders on every firstboot and the warning stopped
+# meaning anything. Only live assignments are placeholders.
+if grep -v '^[[:space:]]*#' "$ENV_FILE" | grep -q "REPLACE_WITH"; then
     warn "$ENV_FILE still contains REPLACE_WITH placeholders."
     warn "The panel will boot, but Wi-Fi and/or the kiosk URL will be wrong until"
     warn "you edit it and re-run: sudo /usr/local/sbin/wall-firstboot.sh"

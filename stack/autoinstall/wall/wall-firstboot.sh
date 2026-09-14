@@ -1168,8 +1168,12 @@ fi
 
 if [ "${WALL_AUDIO_AEC:-0}" = "1" ]; then
     if [ -x /usr/local/sbin/wall-audio-aec ]; then
-        enable_unit wall-audio-aec.service
-        log "audio: echo canceller ENABLED (WALL_AUDIO_AEC=1); mic_selected will resolve to mic_clean in Speaker"
+        # `enable_unit SUCCESS_LINE UNIT...` — the helper SHIFTS the first
+        # argument away, so calling it with the unit name alone ran
+        # `systemctl enable` with no arguments, enabled nothing, and logged the
+        # unit name as if it had worked.
+        enable_unit "audio: echo canceller ENABLED (WALL_AUDIO_AEC=1); mic_selected will resolve to mic_clean in Speaker" \
+            wall-audio-aec.service
     else
         warn "audio: WALL_AUDIO_AEC=1 but the canceller is not installed. The mic seam is NOT moved; the raw microphone is still what the legs read."
     fi

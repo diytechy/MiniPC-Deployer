@@ -156,6 +156,10 @@ class SwitchApplierBackend:
         """
         if params["muted"] is True:
             return self._submit({"kind": "set_output", "output": "mute"})
+        # An unreadable state file answers `output` as None here, which takes
+        # this branch -- and that is the right answer rather than a lucky one:
+        # the applier's `normalize` falls back to `speaker`, so a panel whose
+        # state file cannot be parsed is not in `mute` either.
         if self._state().get("output") != "mute":
             # Accepted, and honestly seq-less: no request was minted, so there
             # is nothing for a client to correlate against.

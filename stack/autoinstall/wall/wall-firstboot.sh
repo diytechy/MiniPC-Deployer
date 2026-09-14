@@ -1537,13 +1537,14 @@ else
 fi
 
 # ── 8e. SR-023 — feasibility-gated panel-local audio broker ────────────────
-# The current backend is deliberately read-only/unavailable. It gives Electron
-# a bounded status contract while refusing every mutation until a physical
-# probe establishes the least-privilege BlueZ and PipeWire ownership boundary.
+# The shipped backend moves the panel's OWN output switch, microphone button and
+# level, through the root applier, and routes no device: BlueZ and PipeWire
+# ownership is still probe-gated, so every verb that names a device is refused
+# and authorization for them stays deny-by-default (item 23 step 5, SR-023).
 : "${WALL_AUDIO_ENABLED:=false}"
 : "${WALL_AUDIO_SOCKET:=/run/wall-audio-router/service.sock}"
 _wall_audio_complete=1
-for _wall_audio_file in audio_router.py routing.py visualizer.py; do
+for _wall_audio_file in audio_router.py routing.py visualizer.py switch_request.py switch_backend.py; do
     if [ ! -r "$PAYLOAD/../../panel-audio/$_wall_audio_file" ]; then
         fail_step "Panel audio payload is incomplete: missing $_wall_audio_file"
         _wall_audio_complete=0

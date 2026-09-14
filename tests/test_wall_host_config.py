@@ -96,7 +96,7 @@ def test_reversal_restores_gateway_mode_only_when_a_registration_is_still_there(
     bare = tmp_path / "bare.json"
     bare.write_text('{"enabled":true,"accessMode":"local"}', encoding="utf-8")
     bare.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    reverted = MODULE.render(bare, {"WALL_ACCESS_MODE": ""})
+    reverted = MODULE.render(bare, {"WALL_ACCESS_MODE": "gateway"})
     assert "accessMode" not in reverted
     assert reverted["enabled"] is False, "no registration behind it: back to the open/unprovisioned posture"
 
@@ -111,6 +111,60 @@ def test_absent_knob_leaves_todays_access_half_untouched(tmp_path):
     assert result["enabled"] is True
 
 
+def test_absent_knob_preserves_local_authority_with_dormant_gateway(tmp_path):
+    current = tmp_path / "host.json"
+    current.write_text('{"enabled":true,"accessMode":"local","gatewayUrl":"https://wall.invalid",'
+                       '"deviceId":"panel","deviceCredential":"fixture"}', encoding="utf-8")
+    current.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    result = MODULE.render(current, {})
+    assert result["accessMode"] == "local" and result["enabled"] is True
+
+
+def test_local_ssot_preserves_local_authority_during_legacy_gateway_request(tmp_path):
+    current = tmp_path / "host.json"
+    state = tmp_path / "local.json"
+    current.write_text('{"enabled":true,"accessMode":"local","gatewayUrl":"https://wall.invalid",'
+                       '"deviceId":"panel","deviceCredential":"fixture"}', encoding="utf-8")
+    current.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    state.write_text('{"schemaVersion":1,"revision":3,"localAccessEnabled":true}', encoding="utf-8")
+    result = MODULE.render(current, {"WALL_ACCESS_MODE": "gateway"}, state)
+    assert result["accessMode"] == "local" and result["localAccessEnabled"] is True
+
+
+def test_disabled_local_ssot_overrides_stale_legacy_local_request(tmp_path):
+    current = tmp_path / "host.json"
+    state = tmp_path / "local.json"
+    current.write_text('{"enabled":false}', encoding="utf-8")
+    current.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    state.write_text('{"schemaVersion":1,"revision":4,"localAccessEnabled":false}', encoding="utf-8")
+    result = MODULE.render(current, {"WALL_ACCESS_MODE": "local"}, state)
+    assert result["enabled"] is False and result["localAccessEnabled"] is False
+    assert "accessMode" not in result
+
+
+def test_committed_local_ssot_repairs_dormant_gateway_host(tmp_path):
+    current = tmp_path / "host.json"
+    state = tmp_path / "local.json"
+    current.write_text('{"enabled":false,"gatewayUrl":"https://wall.invalid",'
+                       '"deviceId":"panel","deviceCredential":"fixture"}', encoding="utf-8")
+    current.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    state.write_text('{"schemaVersion":1,"revision":1,"localAccessEnabled":true}', encoding="utf-8")
+    result = MODULE.render(current, {}, state)
+    assert result["enabled"] is True and result["accessMode"] == "local"
+    assert result["deviceCredential"] == "fixture"
+
+
+def test_local_ssot_does_not_downgrade_enabled_incomplete_gateway(tmp_path):
+    current = tmp_path / "host.json"
+    state = tmp_path / "local.json"
+    current.write_text('{"enabled":true,"accessMode":"read-protected",'
+                       '"gatewayUrl":"https://wall.invalid","deviceId":"panel"}', encoding="utf-8")
+    current.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    state.write_text('{"schemaVersion":1,"revision":1,"localAccessEnabled":true}', encoding="utf-8")
+    result = MODULE.render(current, {}, state)
+    assert result["accessMode"] == "read-protected" and result["enabled"] is True
+
+
 def test_an_unknown_access_mode_is_refused_rather_than_guessed(tmp_path):
     try:
         MODULE.render(tmp_path / "host.json", {"WALL_ACCESS_MODE": "localish"})
@@ -123,7 +177,7 @@ def test_an_unknown_access_mode_is_refused_rather_than_guessed(tmp_path):
 def test_wall_env_documents_the_knob_and_firstboot_reports_the_mode():
     env = (SCRIPT.parent / "wall.env.example").read_text(encoding="utf-8")
     assert "WALL_ACCESS_MODE=gateway" in env
-    assert "WALL_CAMERA_ENABLED=true" in env, "face on the panel still needs the hardware gate"
+    assert "WALL_CAMERA_ENABLED=false" in env, "missing legacy flag must not block sensor installation"
     firstboot = (SCRIPT.parent / "wall-firstboot.sh").read_text(encoding="utf-8")
     assert "WALL_ACCESS_MODE" in firstboot
     # The PIN is never handled by firstboot, so it can never be echoed by it.

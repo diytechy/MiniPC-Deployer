@@ -2,7 +2,6 @@
 import json
 import subprocess
 import sys
-import shutil
 from pathlib import Path
 import pytest
 
@@ -57,47 +56,18 @@ def test_sr017_installer_is_offline_and_separates_sensor_state_from_broker():
     root = SCRIPT.parents[1]
     installer = (root / "autoinstall/wall/install-wall-capabilities.sh").read_text()
     assert "--no-index" in installer and "--require-hashes" in installer
-    assert "-o panel -g panel -m 0600" in installer
+    assert 'atomic_install "$merged_config" /etc/wall-panel/host.json root panel 0640' in installer
     assert "data.get('accessMode') not in {'read-protected', 'write-only'}" in installer
     unit = (root / "autoinstall/wall/wall-sensors.service").read_text()
     assert "User=wall-sensors" in unit and "StateDirectoryMode=0700" in unit
     assert "RuntimeDirectoryMode=0750" in unit and "--allowed-uid ${PANEL_SENSOR_UID}" in unit
 
 
-@pytest.mark.parametrize("setting", ["true", "TRUE", "yes", "1", "false"])
-def test_sr017_camera_gate_refreshes_running_service_in_both_directions(setting):
-    bash = shutil.which("bash")
-    if not bash:
-        candidate = Path("C:/Program Files/Git/bin/bash.exe")
-        if candidate.exists():
-            bash = str(candidate)
-    if not bash:
-        pytest.skip("Bash is required for the isolated camera lifecycle test")
+def test_sr017_legacy_camera_flag_never_blacklists_or_unloads_hardware():
     source = (SCRIPT.parents[1] / "autoinstall/wall/wall-firstboot.sh").read_text(encoding="utf-8")
-    start = source.index("sensor_was_active=0")
-    end = source.index('\nif [ -f /etc/systemd/system/wall-sync.service', start)
-    fragment = source[start:end]
-    fixture = r'''
-set -eu
-fixture_dir=$(mktemp -d)
-trap 'rm -f "$fixture_dir/blacklist"; rmdir "$fixture_dir"' EXIT
-CAM_BLACKLIST="$fixture_dir/blacklist"
-touch "$CAM_BLACKLIST"
-PAYLOAD=/fixture
-WALL_CAMERA_DEVICE=/dev/not-a-real-camera
-systemctl() { echo "systemctl $*"; return 0; }
-lsmod() { echo 'uvcvideo fixture'; }
-modprobe() { echo "modprobe $*" >&2; return 0; }
-log() { :; }
-warn() { :; }
-fail_step() { echo "FAIL $*" >&2; exit 1; }
-'''
-    result = subprocess.run([bash, "-c", fixture + '\nWALL_CAMERA_ENABLED="' + setting + '"\n' + fragment], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-    assert "systemctl restart wall-sensors.service" in result.stdout
-    assert ("systemctl stop wall-sensors.service" in result.stdout) == (setting == "false")
-    # Execute the actual renderer-publication case too, so synonyms cannot drift.
-    normalization_start = source.index('    case "${WALL_CAMERA_ENABLED:-false}" in')
-    normalization_end = source.index("    esac", normalization_start) + len("    esac")
-    normalized = subprocess.run([bash, "-c", 'WALL_CAMERA_ENABLED="' + setting + '"\n' + source[normalization_start:normalization_end]], capture_output=True, text=True)
-    assert normalized.stdout.strip() == "WALL_CAMERA_ENABLED=" + ("false" if setting == "false" else "true")
+    camera = source[source.index("CAM_BLACKLIST="):source.index("if [ -f /etc/systemd/system/wall-sync.service")]
+    assert 'rm -f "$CAM_BLACKLIST"' in camera
+    assert "modprobe uvcvideo" in camera
+    assert "blacklist uvcvideo" not in camera
+    assert "modprobe -r uvcvideo" not in camera
+    assert "WALL_CAMERA_ENABLED" not in camera

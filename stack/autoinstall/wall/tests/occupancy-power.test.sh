@@ -76,8 +76,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIR="$(cd "$HERE/.." && pwd)"
 SLEEP_SH="$DIR/wall-sleep.sh"
 DECIDER="$DIR/wall-occupancy.py"
+SENSOR_POLICY="$DIR/wall-sensor-power-policy.py"
 ENV_EXAMPLE="$DIR/wall.env.example"
-for f in "$SLEEP_SH" "$DECIDER" "$ENV_EXAMPLE"; do
+for f in "$SLEEP_SH" "$DECIDER" "$SENSOR_POLICY" "$ENV_EXAMPLE"; do
     [ -f "$f" ] || { echo "FATAL: $f not found"; exit 2; }
 done
 PY="$(command -v python3 || command -v python)"
@@ -202,7 +203,7 @@ export PATH="$BIN:$PATH"
 scenario() {
     ROOT="$TMP/$1"
     rm -rf "$ROOT"
-    mkdir -p "$ROOT/sys/class/backlight/intel_backlight" "$ROOT/run" "$ROOT/etc"
+    mkdir -p "$ROOT/sys/class/backlight/intel_backlight" "$ROOT/run" "$ROOT/etc" "$ROOT/var/lib/wall-sensors"
     printf '100' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
     printf '100' > "$ROOT/sys/class/backlight/intel_backlight/max_brightness"
     SYSTEMCTL_LOG="$ROOT/systemctl.log"; : > "$SYSTEMCTL_LOG"
@@ -218,6 +219,8 @@ scenario() {
     unset SYSTEMCTL_STOP_FAIL SYSTEMCTL_STOP_SLEEP SYSTEMCTL_AMP_STOP_FAIL
     ENV_FILE="$ROOT/etc/wall.env"
     PRESENCE_FILE="$ROOT/run/presence.json"
+    printf '%s\n' '{"schemaVersion":2,"cameraConsentVersion":1,"cameraEnabled":false,"presenceFace":false,"presenceMotion":false,"faceLoginEnabled":false,"bluetoothEnabled":false}' \
+        > "$ROOT/var/lib/wall-sensors/config.json"
 }
 
 # write_env KEY=VALUE... — the panel's wall.env for this scenario.
@@ -269,6 +272,7 @@ prepare_script() {
     # the script says so in three lines and does nothing, which is how this very
     # omission surfaced while writing this suite.
     cp "$DECIDER" "$(dirname "$SCRIPT_UNDER_TEST")/wall-occupancy.py"
+    cp "$SENSOR_POLICY" "$(dirname "$SCRIPT_UNDER_TEST")/wall-sensor-power-policy.py"
     grep -q "^ENV_FILE=\"$ENV_FILE\"$" "$SCRIPT_UNDER_TEST"
 }
 run() {
@@ -797,6 +801,40 @@ eq "yes" "$(suspended)" "A21 verified amplifier OFF permits suspend"
 grep -qx 'start wall-amp-trigger.service' "$SYSTEMCTL_LOG" \
     && pass "A21 amplifier detector is reconciled after resume" \
     || fail "A21 amplifier detector was not restarted after resume"
+
+# ── A22: software camera/Bluetooth wake requires display-off, never S3 ──────
+scenario a22-camera
+write_env "SLEEP_MODE=suspend"
+printf '%s\n' '{"schemaVersion":2,"cameraConsentVersion":1,"cameraEnabled":true,"presenceFace":false,"presenceMotion":true,"faceLoginEnabled":false,"bluetoothEnabled":false}' \
+    > "$ROOT/var/lib/wall-sensors/config.json"
+run start
+eq "no" "$(suspended)" "A22 configured camera wake keeps the CPU awake"
+eq "0" "$(brightness)" "A22 configured camera wake uses display-off"
+
+scenario a22-bluetooth
+write_env "SLEEP_MODE=suspend"
+printf '%s\n' '{"schemaVersion":2,"cameraConsentVersion":1,"cameraEnabled":false,"presenceFace":false,"presenceMotion":false,"faceLoginEnabled":false,"bluetoothEnabled":true}' \
+    > "$ROOT/var/lib/wall-sensors/config.json"
+run start
+eq "no" "$(suspended)" "A22 configured Bluetooth wake keeps the CPU awake"
+
+scenario a22-unknown
+write_env "SLEEP_MODE=suspend"
+rm -f "$ROOT/var/lib/wall-sensors/config.json"
+run start
+eq "no" "$(suspended)" "A22 missing sensor config conservatively refuses S3"
+eq "0" "$(brightness)" "A22 missing sensor config conservatively uses display-off"
+
+scenario a22-wake
+write_env "SLEEP_MODE=backlight"
+printf '0' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+mkdir -p "$ROOT/run/wall-occupancy"
+printf '%s' "$(date +%s)" > "$ROOT/run/wall-occupancy/absent-since"
+run sensor-wake
+eq "100" "$(brightness)" "A22 validated sensor wake restores the backlight"
+[ ! -e "$ROOT/run/wall-occupancy/absent-since" ] \
+    && pass "A22 sensor wake clears the prior absence clock" \
+    || fail "A22 sensor wake left the prior absence clock"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

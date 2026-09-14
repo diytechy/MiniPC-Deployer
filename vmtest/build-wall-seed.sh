@@ -93,6 +93,7 @@ render_wall_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-wall-seed.sh"
 # is absent — an image without it boots to the NOT INSTALLED screen, which is
 # right on real hardware and useless as a gate.
 stage_wall_shell_into_payload "$OUT_DIR" "$REPO_ROOT"
+stage_wall_sensors_into_payload "$OUT_DIR"
 
 # 2026-08-06: the baked apt repo. `packages:` is empty in the shipped user-data,
 # so this is where cage, the Electron runtime libraries and openssh-server come

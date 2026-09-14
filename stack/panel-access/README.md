@@ -153,12 +153,12 @@ groups refresh. `kiosk.env` contains only the path; `wall-kiosk.sh` passes it as
 `PANEL_HOST_CONFIG`. No secret is put in the app command line or renderer JSON.
 An unreadable/invalid enabled host config fails private access closed.
 
-The kernel camera switch still belongs to `WALL_CAMERA_ENABLED`. When switched
-off, firstboot stops the sensor camera owner before unloading uvcvideo, treats a
-busy module as an explicit failure to verify off, and restarts the sensor service
-with the new hardware gate (Bluetooth may continue). A sensor config cannot
-override the hardware switch. Enabling camera features requires the configured
-model manifest and actual hardware calibration, then owner PIN-protected Settings.
+The image now makes camera hardware and the sensor service available regardless
+of gateway configuration. Firstboot removes only its own retired
+`wall-camera-off.conf`; it never opens the device. Saved schema-v2 sensor config
+and `cameraConsentVersion:1` control capture. Face also requires both private
+models to match `/opt/wall-sensors/models/manifest.json`; missing models disable
+face while motion, Bluetooth and PIN remain available.
 
 ## Evidence and remaining hardware work
 

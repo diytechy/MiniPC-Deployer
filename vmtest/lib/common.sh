@@ -2177,6 +2177,39 @@ stage_wall_shell_into_payload() {
     log "  -> lands at /opt/wall-panel/wall-app/; user-data late-command 3b untars it to /opt/wall-panel/app/."
 }
 
+# stage_wall_sensors_into_payload OUT_DIR — carry the verified local runtime on
+# every complete panel image, independently of whether a gateway is configured.
+stage_wall_sensors_into_payload() {
+    local out_dir="$1" source="${WALL_SENSOR_WHEELHOUSE:-/var/tmp/wall-sensor-wheelhouse/wheelhouse}"
+    local destination="$out_dir/iso-root/deploy-payload/sensor-wheelhouse"
+    if [ ! -d "$source" ]; then
+        if [ "${ALLOW_MISSING_SENSORS:-0}" -eq 1 ]; then
+            log "WARNING: ALLOW_MISSING_SENSORS=1 — panel image has no local sensor runtime."
+            return 0
+        fi
+        die "sensor wheelhouse missing at $source" \
+            "Build it with stack/autoinstall/wall/build-sensor-wheelhouse.sh, or set WALL_SENSOR_WHEELHOUSE." \
+            "A complete panel image always carries sensors, even with no gateway configuration."
+    fi
+    python3 "$out_dir/iso-root/deploy-payload/stack/autoinstall/wall/check-wheelhouse-lock.py" \
+        --expect "$out_dir/iso-root/deploy-payload/stack/autoinstall/wall/sensor-wheelhouse/requirements.lock" "$source" \
+        || die "sensor wheelhouse does not match the reviewed image lock"
+    rm -rf "$destination"
+    mkdir -p "$destination"
+    cp -a "$source/." "$destination/"
+    log "deploy-payload/sensor-wheelhouse = verified offline local sensor runtime"
+
+    if [ -n "${WALL_SENSOR_MODELS:-}" ]; then
+        [ -d "$WALL_SENSOR_MODELS" ] || die "WALL_SENSOR_MODELS is not a directory"
+        [ -f "$WALL_SENSOR_MODELS/manifest.json" ] || die "WALL_SENSOR_MODELS has no manifest.json"
+        mkdir -p "$out_dir/iso-root/deploy-payload/sensor-models"
+        cp -a "$WALL_SENSOR_MODELS/." "$out_dir/iso-root/deploy-payload/sensor-models/"
+        log "deploy-payload/sensor-models = private model bundle (installer verifies manifest before use)"
+    else
+        log "sensor models absent — face remains unavailable; motion/Bluetooth/PIN remain usable"
+    fi
+}
+
 # stage_wall_site_into_payload OUT_DIR REPO_ROOT — the HUB half.
 #
 # The kiosk site's document root (stack/wall-shell/, bind-mounted read-only into

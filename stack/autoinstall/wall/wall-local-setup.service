@@ -1,0 +1,24 @@
+[Unit]
+Description=Wall panel local capability setup and wake helper
+After=wall-sensors.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/wall-local-setup.py
+User=root
+Group=panel
+RuntimeDirectory=wall-local-setup
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/etc/wall-panel /run/wall-local-setup -/run/wall-occupancy -/run/wall-backlight.prev
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

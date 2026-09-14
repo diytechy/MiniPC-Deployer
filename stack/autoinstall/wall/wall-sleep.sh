@@ -147,6 +147,9 @@ AMP_SAFE_STATE="${POWER_TEST_ROOT}/run/wall-amp-trigger/off-verified"
 CR="$(printf '\r')"
 DECIDER="/usr/local/sbin/wall-occupancy.py"
 [ -x "$DECIDER" ] || [ -f "$DECIDER" ] || DECIDER="$(dirname "$0")/wall-occupancy.py"
+SENSOR_POWER_POLICY="/usr/local/sbin/wall-sensor-power-policy.py"
+[ -x "$SENSOR_POWER_POLICY" ] || [ -f "$SENSOR_POWER_POLICY" ] || SENSOR_POWER_POLICY="$(dirname "$0")/wall-sensor-power-policy.py"
+SENSOR_CONFIG="${POWER_TEST_ROOT}/var/lib/wall-sensors/config.json"
 
 # The display lifecycle is also the Door source lifecycle (WSN-019). Stopping
 # the broker destroys its active client and the FFmpeg child before the panel
@@ -408,7 +411,13 @@ arm_rtc() {
 # reachable panel beats a dark one, and an UNREACHABLE dark one is the outcome
 # this guard exists to make impossible.
 suspend_now() {
-    local wake="${1:-$SLEEP_END}"
+    local wake="${1:-$SLEEP_END}" policy
+    policy="$(python3 "$SENSOR_POWER_POLICY" "$SENSOR_CONFIG" 2>/dev/null || echo 'KEEP_AWAKE=unknown')"
+    if [ "$policy" != "KEEP_AWAKE=false" ]; then
+        backlight_set off || true
+        log "software sensor wake policy is ${policy#KEEP_AWAKE=} — display off, CPU remains awake"
+        return 0
+    fi
     if [ "$SLEEP_RTC_WAKE" = "true" ]; then
         if ! arm_rtc "$wake"; then
             # No guaranteed way back. Suspending anyway would risk a panel
@@ -609,8 +618,14 @@ case "${1:-}" in
         # mode it is a no-op unless a failed arm_rtc degraded us to L1 above.
         backlight_set on
         ;;
+    sensor-wake)
+        # The root helper independently validated a fresh positive observation.
+        # This changes display state only; it never changes lock authority.
+        rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
+        backlight_set on
+        ;;
     *)
-        echo "usage: $0 start|end|occupancy" >&2
+        echo "usage: $0 start|end|occupancy|sensor-wake" >&2
         exit 2
         ;;
 esac

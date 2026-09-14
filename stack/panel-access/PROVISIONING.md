@@ -1,5 +1,12 @@
 # Panel provisioning: protected access, camera, sensors, door motion
 
+> **2026-09-14 local-capability update:** the image now installs the sensor
+> runtime and `/run/wall-local-setup/service.sock` independently of gateway
+> registration. `WALL_CAMERA_ENABLED` is legacy migration input and does not
+> blacklist hardware. The current contract and rollback procedure are in
+> `docs/panel-local-capabilities-implementation-2026-09-14.md`; older camera and
+> manual sensor-install steps below are historical and must not guide a new image.
+
 Group C deliverable C1, 2026-09-13. This is the procedure for turning the four
 unprovisioned capabilities on, written so that a re-image reproduces it.
 

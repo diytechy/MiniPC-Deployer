@@ -580,6 +580,14 @@ autoinstall:
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh /target/usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-firstboot.sh
     - curtin in-target --target=/target -- systemctl enable wall-firstboot.service
+    # Local sensors and setup are image capabilities, not gateway add-ons.
+    # Firstboot installs the verified venv after the packaged app is present;
+    # this unit is staged now so an interrupted rerun can recover idempotently.
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sensors.service /target/etc/systemd/system/wall-sensors.service
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-local-setup.service /target/etc/systemd/system/wall-local-setup.service
+    - curtin in-target --target=/target -- install -d -m 0755 /usr/local/lib/wall-panel
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-local-setup.py /target/usr/local/lib/wall-panel/wall-local-setup.py
+    - curtin in-target --target=/target -- chmod +x /usr/local/lib/wall-panel/wall-local-setup.py
     # wall-door-stream — WSN-019. Installed here; firstboot creates the
     # unprivileged account and enables/starts it only after wall.env and the
     # packaged application broker both exist.
@@ -594,7 +602,8 @@ autoinstall:
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sleep.service /target/etc/systemd/system/wall-sleep.service
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-wake.service /target/etc/systemd/system/wall-wake.service
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sleep.sh /target/usr/local/sbin/wall-sleep.sh
-    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sleep.sh
+    - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-sensor-power-policy.py /target/usr/local/sbin/wall-sensor-power-policy.py
+    - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sleep.sh /usr/local/sbin/wall-sensor-power-policy.py
     # wall-occupancy — SN-015. The every-minute presence tick and the pure
     # decider it calls. The TIMER IS NOT ENABLED HERE: wall-firstboot.sh step 6b
     # enables or disables it from WALL_ABSENCE_ENABLED, which is false by

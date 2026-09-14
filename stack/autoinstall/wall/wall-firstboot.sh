@@ -50,6 +50,32 @@ MARKER="/opt/wall-panel/.provisioned"
 log() { echo "[wall-firstboot] $*"; }
 warn() { echo "[wall-firstboot] WARNING: $*" >&2; }
 
+# Replace a private file without ever exposing a truncated destination. The
+# temporary lives beside the target so rename is atomic; both bytes and the
+# directory entry are durable before success is reported.
+atomic_install() { # SOURCE TARGET OWNER GROUP MODE
+    local source=$1 target=$2 owner=$3 group=$4 mode=$5 temporary
+    temporary=$(mktemp "$(dirname "$target")/.$(basename "$target").XXXXXX") || return 1
+    if install -o "$owner" -g "$group" -m "$mode" "$source" "$temporary" \
+            && python3 - "$temporary" "$target" <<'PY'
+import os, sys
+temporary, target = sys.argv[1:]
+with open(temporary, 'rb') as stream:
+    os.fsync(stream.fileno())
+os.replace(temporary, target)
+directory = os.open(os.path.dirname(target), os.O_RDONLY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+    then
+        return 0
+    fi
+    rm -f "$temporary"
+    return 1
+}
+
 # ── did anything we were ASKED to do actually fail? ──────────────────────────
 # THIS SCRIPT'S SIGNATURE BUG, found twice now: a `systemctl enable` whose
 # failure was swallowed by `|| warn`, followed by an UNCONDITIONAL "…enabled" log
@@ -390,17 +416,31 @@ EOF
 # ── the Electron host's PRIVATE renderer config ─────────────────────────────
 # Secret shell values originate on this panel, in root-only wall.env. They are
 # merged into the existing private host JSON so access registration survives a
-# rerun, then installed for the panel account at 0600. Only the path crosses
+# rerun, then installed root-owned and group-readable by panel at 0640. Only the path crosses
 # into kiosk.env; the values never enter the command line or hub-served files.
 WALL_HOST_CONFIG=${WALL_HOST_CONFIG:-/etc/wall-panel/host.json}
 install -d -m 0755 "$(dirname "$WALL_HOST_CONFIG")"
+# Explicit legacy local-mode input is an opt-in migration into the root-owned
+# source of truth. Never infer it from a missing camera flag or gateway outage.
+LOCAL_CAPABILITY_STATE=/etc/wall-panel/local-capabilities.json
+if [ ! -e "$LOCAL_CAPABILITY_STATE" ]; then
+    case "${WALL_ACCESS_MODE:-gateway}" in
+        local|LOCAL)
+            LOCAL_STATE_TMP=$(mktemp /etc/wall-panel/.local-capabilities.XXXXXX)
+            printf '%s\n' '{"localAccessEnabled":true,"revision":0,"schemaVersion":1}' > "$LOCAL_STATE_TMP"
+            atomic_install "$LOCAL_STATE_TMP" "$LOCAL_CAPABILITY_STATE" root root 0600
+            rm -f "$LOCAL_STATE_TMP"
+            log "local setup: migrated explicit WALL_ACCESS_MODE=local into root-owned state" ;;
+    esac
+fi
 HOST_CONFIG_TMP=$(mktemp "$(dirname "$WALL_HOST_CONFIG")/.host.json.XXXXXX")
 cleanup_host_config_tmp() { rm -f "$HOST_CONFIG_TMP"; }
 trap cleanup_host_config_tmp EXIT
-if python3 "$PAYLOAD/render-wall-host-config.py" "$WALL_HOST_CONFIG" > "$HOST_CONFIG_TMP"; then
-    install -o panel -g panel -m 0600 "$HOST_CONFIG_TMP" "$WALL_HOST_CONFIG"
+if python3 "$PAYLOAD/render-wall-host-config.py" "$WALL_HOST_CONFIG" \
+        "$LOCAL_CAPABILITY_STATE" > "$HOST_CONFIG_TMP"; then
+    atomic_install "$HOST_CONFIG_TMP" "$WALL_HOST_CONFIG" root panel 0640
     rm -f "$HOST_CONFIG_TMP"
-    log "private Electron host config rendered at $WALL_HOST_CONFIG (0600; values not logged)"
+    log "private Electron host config rendered at $WALL_HOST_CONFIG (root:panel 0640; values not logged)"
     # ── the panel-local access state directory ─────────────────────────────
     # /var/lib is root-owned 0755, so the kiosk (which runs as `panel`) cannot
     # create this itself: without this line local mode would fail closed on
@@ -477,9 +517,8 @@ KIOSK_ENV=/etc/wall-panel/kiosk.env
     echo "WALL_CURSOR_PARK_CORNER=${WALL_CURSOR_PARK_CORNER:-bottom-right}"
     echo "WALL_CURSOR_PARK_DELAY=${WALL_CURSOR_PARK_DELAY:-10}"
     echo "WALL_CURSOR_TRANSPARENT=${WALL_CURSOR_TRANSPARENT:-true}"
-    # Publish the same canonical boolean the kernel gate accepts. The sensor
-    # process reads this file once at startup, so alternate input spellings
-    # must not leave the driver and camera owner disagreeing.
+    # Legacy migration input only. Missing/false no longer blocks hardware;
+    # the sensor's saved schema-v2 camera consent is the capture authority.
     case "${WALL_CAMERA_ENABLED:-false}" in
         true|TRUE|yes|1) echo "WALL_CAMERA_ENABLED=true" ;;
         *) echo "WALL_CAMERA_ENABLED=false" ;;
@@ -489,6 +528,31 @@ KIOSK_ENV=/etc/wall-panel/kiosk.env
 } > "$KIOSK_ENV"
 chmod 0644 "$KIOSK_ENV"
 log "kiosk: $KIOSK_ENV rendered (0644) — WALL_HOST='${WALL_HOST:-}' WALL_APP_CMD='${WALL_APP_CMD:-}'"
+
+# ── local sensors and root capability helper: image-owned, gateway-independent
+SENSOR_WHEELHOUSE=/opt/wall-panel/sensor-wheelhouse
+SENSOR_MODELS=/opt/wall-panel/sensor-models
+if [ -d "$SENSOR_WHEELHOUSE" ]; then
+    sensor_args=(--wheelhouse "$SENSOR_WHEELHOUSE")
+    if [ -d "$SENSOR_MODELS" ] && [ -f "$SENSOR_MODELS/manifest.json" ]; then
+        sensor_args+=(--models "$SENSOR_MODELS" --model-manifest "$SENSOR_MODELS/manifest.json")
+    fi
+    if "$PAYLOAD/install-wall-capabilities.sh" "${sensor_args[@]}"; then
+        log "sensors: gateway-independent runtime installed and protocol verified"
+    else
+        fail_step "sensors: offline runtime installation failed; PIN remains available but sensing is unavailable"
+    fi
+else
+    fail_step "sensors: $SENSOR_WHEELHOUSE is missing from the image payload"
+fi
+if [ -f "$PAYLOAD/wall-local-setup.py" ] && [ -f "$PAYLOAD/wall-local-setup.service" ]; then
+    install -m 0755 "$PAYLOAD/wall-local-setup.py" /usr/local/lib/wall-panel/wall-local-setup.py
+    install -m 0644 "$PAYLOAD/wall-local-setup.service" /etc/systemd/system/wall-local-setup.service
+    enable_unit_now "local setup: privileged bootstrap/adjunct and sensor wake helper ready on /run/wall-local-setup/service.sock" \
+        wall-local-setup.service
+else
+    fail_step "local setup: helper payload is incomplete"
+fi
 case "${WALL_HOST:-}" in
     ''|*REPLACE_WITH*)
         warn "WALL_HOST is unset/placeholder — PANEL_URL will not resolve and the shell"
@@ -1121,62 +1185,38 @@ case "${WALL_AUDIO_MODE:-trigger}" in
         apply_audio_mode trigger             "audio: trigger mode — audio out the USB adapter, amplifier commanded over the LCUS-2 relay."             "audio: the built-in headphone jack carries nothing; the trigger tone was retired 2026-09-13." ;;
 esac
 
-# ── the camera: OFF AT THE KERNEL unless the knob says otherwise ────────────
-# WALL_CAMERA_ENABLED=false does not mean "nothing opens it". It blacklists
-# uvcvideo, so /dev/video* does not exist, nothing CAN open it, and the
-# hardware activity LED cannot come on at all. A mechanism, not a policy —
-# which is the point, because the LED is wired to the sensor's power rail and
-# is the one claim about this camera that software cannot forge.
+# ── camera hardware availability; capture remains sensor-policy owned ───────
+# Older images created exactly this blacklist. Remove only that product-owned
+# file, never unrelated administrator policy. Loading a driver discovers the
+# device but does not open it or illuminate its capture LED.
 CAM_BLACKLIST=/etc/modprobe.d/wall-camera-off.conf
-sensor_was_active=0
-if systemctl is-active --quiet wall-sensors.service 2>/dev/null; then
-    sensor_was_active=1
+CAM_POLICY_BACKUP=/etc/wall-panel/wall-camera-off.pre-local-capabilities.conf
+CAM_POLICY_ABSENT=/etc/wall-panel/wall-camera-off.pre-local-capabilities.absent
+if [ -e "$CAM_POLICY_BACKUP" ] && [ -e "$CAM_POLICY_ABSENT" ]; then
+    fail_step "camera: prior driver-policy record is inconsistent; preserving current policy"
+elif [ ! -e "$CAM_POLICY_BACKUP" ] && [ ! -e "$CAM_POLICY_ABSENT" ]; then
+    if [ -L "$CAM_BLACKLIST" ]; then
+        fail_step "camera: legacy policy path is a symlink; refusing to read or remove it"
+    elif [ -f "$CAM_BLACKLIST" ]; then
+        install -o root -g root -m 0600 "$CAM_BLACKLIST" "$CAM_POLICY_BACKUP"
+        log "camera: privately recorded the prior product policy for exact rollback"
+    elif [ -e "$CAM_BLACKLIST" ]; then
+        fail_step "camera: legacy policy path is not a regular file; preserving it"
+    else
+        install -o root -g root -m 0600 /dev/null "$CAM_POLICY_ABSENT"
+        log "camera: privately recorded that no prior product policy existed"
+    fi
 fi
-case "${WALL_CAMERA_ENABLED:-false}" in
-    true|TRUE|yes|1)
-        if [ -f "$CAM_BLACKLIST" ]; then
-            rm -f "$CAM_BLACKLIST"
-            modprobe uvcvideo >/dev/null 2>&1 || true
-            log "camera: WALL_CAMERA_ENABLED=true — uvcvideo un-blacklisted and loaded"
-        else
-            log "camera: WALL_CAMERA_ENABLED=true — uvcvideo available at ${WALL_CAMERA_DEVICE:-/dev/video0}"
-        fi
-        if [ ! -e "${WALL_CAMERA_DEVICE:-/dev/video0}" ]; then
-            warn "camera: ${WALL_CAMERA_DEVICE:-/dev/video0} does not exist even though the camera is enabled."
-            warn "  A UVC device publishes two nodes; check which is the CAPTURE node with:"
-            warn "  python3 $PAYLOAD/panel-camera.py probe --device /dev/video1"
-        fi ;;
-    *)
-        printf '# Wall panel: WALL_CAMERA_ENABLED=false in wall.env.
-# Removing this file does NOT re-enable the camera across a firstboot run;
-# set the knob instead, or the next run puts it back.
-blacklist uvcvideo
-' > "$CAM_BLACKLIST"
-        chmod 0644 "$CAM_BLACKLIST"
-        # Unload only if nothing holds it; a busy module means something is
-        # using the camera RIGHT NOW, which is worth a loud line rather than a
-        # forced removal.
-        # Release our single camera owner before unloading. It restarts with the
-        # newly rendered hardware gate false; Bluetooth can remain available.
-        if [ "$sensor_was_active" = 1 ]; then
-            systemctl stop wall-sensors.service || fail_step "camera: could not stop wall-sensors.service"
-        fi
-        if lsmod 2>/dev/null | grep -q '^uvcvideo'; then
-            if modprobe -r uvcvideo >/dev/null 2>&1; then
-                log "camera: WALL_CAMERA_ENABLED=false — uvcvideo blacklisted and unloaded; /dev/video* is gone and the activity LED cannot light"
-            else
-                fail_step "camera: requested off but NOT verified off; uvcvideo remains in use. Stop the camera consumer or reboot."
-                warn "  Something on this panel is holding the camera open. Find it with: fuser -v /dev/video*"
-            fi
-        else
-            log "camera: WALL_CAMERA_ENABLED=false — uvcvideo blacklisted; the camera cannot be opened"
-        fi
-        ;;
-esac
-# Both directions need a fresh process: its hardware gate is fixed at startup.
-# A false-to-true change must not leave a permanently disabled camera daemon.
-if [ "$sensor_was_active" = 1 ]; then
-    systemctl restart wall-sensors.service || fail_step "camera: could not restart sensors with the updated hardware gate"
+if [ -f "$CAM_BLACKLIST" ] && [ ! -L "$CAM_BLACKLIST" ] \
+        && grep -Eq '^[[:space:]]*blacklist[[:space:]]+uvcvideo([[:space:]]|$)' "$CAM_BLACKLIST"; then
+    rm -f "$CAM_BLACKLIST"
+    log "camera: removed legacy product-owned uvcvideo blacklist"
+fi
+modprobe uvcvideo >/dev/null 2>&1 || true
+if [ -e "${WALL_CAMERA_DEVICE:-/dev/video0}" ]; then
+    log "camera: hardware available at ${WALL_CAMERA_DEVICE:-/dev/video0}; capture remains off until saved local opt-in"
+else
+    warn "camera: ${WALL_CAMERA_DEVICE:-/dev/video0} is absent; PIN, Bluetooth and non-camera functions remain available"
 fi
 
 if [ -f /etc/systemd/system/wall-sync.service ]; then

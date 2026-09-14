@@ -156,6 +156,7 @@ if [ "$TARGET" = "wall" ]; then
     render_wall_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
     # IF-005: the panel's own half of the shell build.
     stage_wall_shell_into_payload "$OUT_DIR" "$REPO_ROOT"
+    stage_wall_sensors_into_payload "$OUT_DIR"
 else
     render_seed_tree "$REPO_ROOT" "$OUT_DIR" "build-repacked-iso.sh"
     # Q10.9 B+ ALL-IMAGES: fold the docker-save tars into deploy-payload/images/.

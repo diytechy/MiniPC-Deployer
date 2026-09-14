@@ -166,7 +166,7 @@ def test_check_reports_by_message_not_by_traceback(tmp_path, capsys):
 def test_installer_validates_the_wheelhouse_before_creating_the_venv():
     text = INSTALLER.read_text(encoding="utf-8")
     check_at = text.index("check-wheelhouse-lock.py")
-    assert check_at < text.index("python3 -m venv /opt/wall-sensors/venv")
+    assert check_at < text.index('python3 -m venv "$venv_new"')
     assert check_at < text.index("--require-hashes")
     # The offline install line itself must not have loosened.
     assert "--no-index --only-binary=:all: --require-hashes" in text

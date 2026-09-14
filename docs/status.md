@@ -12,6 +12,15 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-14 — local panel capability provisioning is implemented in the
+isolated checkout, not deployed or independently reviewed.** The image now
+stages and installs the verified sensor runtime without gateway registration,
+publishes a digest-verified model manifest path, removes only its retired camera
+blacklist without opening capture, and provides an atomic root local-setup/wake
+helper. Saved camera/Bluetooth wake forces display-off instead of S3. Existing
+gateway fields and panel PIN/enrollment state are preserved. Active gate remains
+G1; next action is independent adversarial review, then coordinator integration.
+
 **2026-09-14 — panel follow-up D/F source continuation (not deployed).**
 The volume rocker uses a narrow up/down-only socket helper to reach the root
 applier under its existing DynamicUser restrictions. Successful presses carry

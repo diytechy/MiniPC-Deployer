@@ -165,6 +165,31 @@ The honest ledger of what has and has not been exercised is
 Hand-authored sequence diagrams of the behaviour that is easiest to misread
 from registry rows (process.md §3). Each cites the ids it renders.
 
+### Local setup and software wake (SR-017, SR-020)
+
+```mermaid
+sequenceDiagram
+    participant UI as panel Settings/main
+    participant H as root local-setup helper
+    participant G as configured gateway
+    participant S as sensor service
+    participant P as wall-sleep sole power writer
+    UI->>H: status (no credentials returned)
+    alt unprovisioned local bootstrap
+        UI->>H: configure(revision, local)
+    else protected gateway adjunct
+        UI->>H: configure(revision, local, session, PIN)
+        H->>G: admin/authorize using root-read registration
+        G-->>H: authorized
+    end
+    H->>H: atomic SSOT + host merge; preserve gateway/PIN state
+    S-->>UI: fresh positive camera/Bluetooth observation
+    UI->>H: wake(source, observedAt, ttlMs)
+    H->>S: independently read protocol-v2 status
+    H->>P: sensor-wake after exact fresh match
+    P->>P: backlight on; lock state unchanged
+```
+
 ### Audio activity to a verified amplifier contact (SR-026, LLR-010, IF-017)
 
 The application remains hardware-blind. Every source reaches the common ALSA

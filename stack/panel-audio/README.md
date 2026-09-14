@@ -177,7 +177,12 @@ indexes were already in use everywhere:
      needs a person;
    * every decision is journalled under `wall-usb-hub-reset@<bus id>`, including
      the ones where it decided to do nothing;
-   * `Restart=no`, and no `[Install]`: it is only ever started by the rule.
+   * `Restart=no`, and no `[Install]`: it is only ever started by the rule;
+   * it **fails closed** on both of its own dependencies. If `systemctl` cannot
+     be asked whether the adapter is active, that is not evidence the adapter
+     is absent and nothing is reset; if the `/run` record that bounds the
+     toggles cannot be written, nothing is reset either, because that file is
+     the only bound that survives the process.
 
    The 15 s wait is sized off the acceptance below — ten seconds is the whole
    budget when the hub cooperates, so intervening sooner would race a recovery

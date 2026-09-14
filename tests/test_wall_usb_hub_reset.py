@@ -14,6 +14,7 @@ included, so it must happen at most twice per hub and never on a timer.
 
 import importlib.util
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -248,7 +249,11 @@ def test_the_rule_matches_the_hub_device_and_not_its_interface():
     body = "\n".join(line for line in RULES.read_text(encoding="utf-8").splitlines()
                      if not line.lstrip().startswith("#"))
 
-    assert 'DEVTYPE=="usb_device"' in body
+    # ENV{}, not a bare key: DEVTYPE is a property, and a bare `DEVTYPE==` is a
+    # parse error that drops the entire rule -- silently, which is the worst
+    # possible failure for a recovery nobody watches.
+    assert 'ENV{DEVTYPE}=="usb_device"' in body
+    assert not re.search(r'(^|[,\s])DEVTYPE==', body)
     assert 'ATTR{idVendor}=="03eb"' in body and 'ATTR{idProduct}=="0902"' in body
     # ATTRS would walk up to the parent hubs as well.
     assert "ATTRS{idVendor}" not in body
@@ -288,3 +293,55 @@ def test_firstboot_installs_the_rule_the_unit_and_the_script():
     assert "wall-usb-hub-reset.py" in firstboot
     # An installed rule with no unit behind it is a silent no-op.
     assert "wall-usb-hub-reset@.service is not" in firstboot
+
+
+# --- terra: the two fail-open paths ---------------------------------------
+
+def test_an_unanswerable_systemctl_is_not_evidence_that_the_adapter_is_gone(tmp_path, monkeypatch):
+    """"systemctl did not answer" must never authorize a hardware reset.
+
+    Waiting the window out on unanswerable probes produces exactly the
+    "inactive for 15 s" verdict that resets the hub -- and with it the
+    amplifier's latching relay -- on no evidence at all.
+    """
+    module = load()
+    bus = Bus(tmp_path)
+
+    def broken(argv, **kwargs):
+        raise OSError("dbus is not there")
+
+    code, written = drive(module, bus, monkeypatch, broken)
+    assert code == 1          # a visible failure, not a silent no-op
+    assert written == []
+
+    # An exit code that is not one of systemctl's own answers is also no answer.
+    code, written = drive(module, bus, monkeypatch, runner(127))
+    assert code == 1
+    assert written == []
+
+
+def test_an_unanswerable_probe_is_distinguished_from_inactive():
+    module = load()
+    assert module.unit_is_active("u", run=runner(0)) is True
+    assert module.unit_is_active("u", run=runner(3)) is False
+    assert module.unit_is_active("u", run=runner(1)) is False
+    assert module.unit_is_active("u", run=runner(127)) is None
+
+
+def test_the_hub_is_not_reset_when_the_bound_cannot_be_recorded(tmp_path, monkeypatch):
+    """Fail CLOSED on the /run file.
+
+    That file is the only bound that survives process exit, and re-authorizing
+    a hub can itself produce the add events that start the next process. With
+    it unwritable, a hub that keeps coming back empty would get two fresh
+    toggles per event, forever.
+    """
+    module = load()
+    bus = Bus(tmp_path)
+    monkeypatch.setattr(module, "record_attempt",
+                        lambda *args, **kwargs: False)
+    code, written = drive(module, bus, monkeypatch, runner(*([1] * 400)))
+
+    assert code == 1
+    assert written == []
+    assert bus.authorized.strip() == "1"

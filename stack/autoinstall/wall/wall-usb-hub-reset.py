@@ -122,22 +122,45 @@ def children(bus_id, listdir=os.listdir):
 
 
 def unit_is_active(unit, run=subprocess.run):
+    """True active, False inactive, None COULD NOT TELL.
+
+    The third answer is not pedantry. "systemctl did not answer" is not
+    evidence that the adapter is absent, and treating it as such is how a hub
+    -- and with it the latching amplifier relay -- gets reset on no evidence at
+    all. Returning False here was terra's finding; the caller now refuses to
+    act on None instead.
+    """
     try:
         got = run(["/usr/bin/systemctl", "is-active", "--quiet", unit],
                   check=False, capture_output=True, timeout=5)
     except (OSError, subprocess.SubprocessError) as exc:
         log("could not ask systemd about %s: %s" % (unit, exc))
+        return None
+    if got.returncode == 0:
+        return True
+    # systemctl exits 3 for "inactive/failed", which is the answer being asked
+    # for. Anything else -- a usage error, a dead bus, a killed child -- is not
+    # an answer and must not be read as one.
+    if got.returncode in (1, 3):
         return False
-    return got.returncode == 0
+    log("systemctl is-active %s exited %d; treating that as no answer"
+        % (unit, got.returncode))
+    return None
 
 
 def wait_for_adapter(unit, wait_seconds, monotonic=time.monotonic,
                      sleep=time.sleep, run=subprocess.run):
-    """True if the adapter's device unit becomes active within the window."""
+    """True active, False inactive for the whole window, None could not tell.
+
+    A single unanswerable probe ends the wait. Waiting the window out on
+    unanswerable probes would produce exactly the "inactive for 15 s" verdict
+    that authorizes a hardware reset, on no evidence.
+    """
     deadline = monotonic() + wait_seconds
     while True:
-        if unit_is_active(unit, run=run):
-            return True
+        state = unit_is_active(unit, run=run)
+        if state is not False:
+            return state
         remaining = deadline - monotonic()
         if remaining <= 0:
             return False
@@ -167,6 +190,14 @@ def attempts_so_far(bus_id, now=None, state_dir=STATE_DIR):
 
 
 def record_attempt(bus_id, now=None, state_dir=STATE_DIR):
+    """Reserve an attempt BEFORE it is made. False means it was not reserved.
+
+    Fail CLOSED, which was terra's finding: the /run file is the only bound
+    that survives process exit, and re-authorizing a hub can itself produce the
+    add events that start the next process. If the reservation cannot be
+    written, a hub that keeps coming back empty would get two fresh toggles per
+    event forever. Not toggling at all is the safe side of that.
+    """
     now = time.time() if now is None else now
     kept = attempts_so_far(bus_id, now=now, state_dir=state_dir) + [now]
     try:
@@ -175,10 +206,13 @@ def record_attempt(bus_id, now=None, state_dir=STATE_DIR):
         with open(tmp, "w", encoding="ascii") as handle:
             handle.write("".join("%.3f\n" % stamp for stamp in kept))
         os.replace(tmp, os.path.join(state_dir, bus_id))
+        return True
     except OSError as exc:
-        # Not fatal, but say it: without the file the cooling window is gone and
-        # only the in-process counter bounds this.
-        log("could not record the attempt for %s: %s" % (bus_id, exc))
+        log("could not record the attempt for %s: %s -- NOT resetting the hub. "
+            "The only bound that survives this process lives in that file, so "
+            "without it a hub that keeps coming back empty would be reset "
+            "again on every event." % (bus_id, exc))
+        return False
 
 
 def toggle_authorized(path, sleep=time.sleep, settle=1.0):
@@ -230,12 +264,19 @@ def main(argv=None, sleep=time.sleep, monotonic=time.monotonic,
         return 0
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        if wait_for_adapter(args.unit, args.wait, monotonic=monotonic,
-                            sleep=sleep, run=run):
+        state = wait_for_adapter(args.unit, args.wait, monotonic=monotonic,
+                                 sleep=sleep, run=run)
+        if state is True:
             if attempt > 1:
                 log("%s is active after %d hub reset(s)"
                     % (args.unit, attempt - 1))
             return 0
+        if state is None:
+            log("could not establish whether %s is active. NOT resetting %s: "
+                "resetting this hub is a hardware reset of the amplifier's "
+                "latching relay and needs evidence, not a timeout."
+                % (args.unit, args.bus_id))
+            return 1
 
         kids = children(args.bus_id)
         if kids:
@@ -255,12 +296,13 @@ def main(argv=None, sleep=time.sleep, monotonic=time.monotonic,
         log("%s: hub present, no downstream ports, %s inactive for %.0f s. "
             "Toggling authorized (attempt %d of %d)."
             % (args.bus_id, args.unit, args.wait, attempt, MAX_ATTEMPTS))
-        record_attempt(args.bus_id, state_dir=state_dir)
+        if not record_attempt(args.bus_id, state_dir=state_dir):
+            return 1
         if not toggle_authorized(path, sleep=sleep):
             return 1
 
     if wait_for_adapter(args.unit, args.wait, monotonic=monotonic,
-                        sleep=sleep, run=run):
+                        sleep=sleep, run=run) is True:
         log("%s is active after %d hub reset(s)" % (args.unit, MAX_ATTEMPTS))
         return 0
     log("%s is still inactive after %d hub reset(s). Giving up so the failure "

@@ -88,14 +88,21 @@ warn() { printf '%s WARN: %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
 STATE_DIR="${TRACKER_DEFS_STATE_DIR:-/var/lib/homehub}"
 STATE_FILE="$STATE_DIR/tracker-defs.state"
-BASELINE_FILE="$STATE_DIR/tracker-defs-baseline"
+BASELINE_FILE="${TRACKER_DEFS_BASELINE_FILE:-$STATE_DIR/tracker-defs-baseline}"
 # THE INVENTORY ITSELF, beside the baseline. The baseline records a HASH of
 # it, which can say "something moved" and can never say WHAT — and telling an
 # addition apart from a removal is the whole of the F1 ruling. A baseline
 # written before this file existed simply has none, and the guard then falls
 # back to the pre-ruling behaviour (growth = yellow, accepted by hand) rather
 # than guessing.
-BASELINE_INV_FILE="$STATE_DIR/tracker-defs-baseline.inv"
+#
+# IT CARRIES THE HASH IT BELONGS TO, on its first line, and a mismatch makes it
+# non-diffable. The two files are written separately and the second write can
+# fail, so "a sidecar exists" is not "this sidecar describes this baseline" —
+# and a STALE sidecar is worse than none: growth measured against an older
+# inventory reports ids that were added long ago as new, and can miss a removal
+# that happened in between. (Adversarial review, 2026-09-13.)
+BASELINE_INV_FILE="$BASELINE_FILE.inv"
 ENV_FILE="${TRACKER_DEFS_ENV_FILE:-/etc/homehub-backup/backup.env}"
 VOLUME="${TRACKER_DEFS_VOLUME:-tracker_data}"
 CHECK_ID="${TRACKER_DEFS_FEED_CHECK:-tracker-definitions}"
@@ -276,12 +283,16 @@ write_baseline() {
 # was never recorded.
 write_baseline_inventory() {
     local tmp
-    mkdir -p "$STATE_DIR" 2>/dev/null || return 1
-    tmp="$(mktemp "$BASELINE_INV_FILE.XXXXXX")" || { warn "cannot create a temporary file beside $BASELINE_INV_FILE"; return 1; }
-    if printf '%s' "$INV" | grep -v '^$' | sort >"$tmp" && mv "$tmp" "$BASELINE_INV_FILE"; then
+    mkdir -p "$(dirname "$BASELINE_INV_FILE")" 2>/dev/null || return 1
+    tmp="$(mktemp "$BASELINE_INV_FILE.XXXXXX" 2>/dev/null)" || {
+        rm -f "$BASELINE_INV_FILE" 2>/dev/null
+        warn "cannot create a temporary file beside $BASELINE_INV_FILE — any previous inventory has been discarded rather than left to describe a baseline it does not match"
+        return 1
+    }
+    if { echo "#inv_hash=$INV_HASH"; printf '%s' "$INV" | grep -v '^$' | sort; } >"$tmp" && mv "$tmp" "$BASELINE_INV_FILE"; then
         return 0
     fi
-    rm -f "$tmp" 2>/dev/null
+    rm -f "$tmp" "$BASELINE_INV_FILE" 2>/dev/null
     warn "could not write $BASELINE_INV_FILE — the next change will be reported without naming what moved"
     return 1
 }
@@ -331,19 +342,29 @@ fi
 # stays 0 when the baseline predates the sidecar or it could not be read — then
 # no such claim is made at all, and the old hand-accepted path is used.
 INV_DIFFABLE=0; INV_ADDED=""; INV_REMOVED=""
-if [ -f "$BASELINE_INV_FILE" ] && [ -s "$BASELINE_INV_FILE" ] && [ -n "$INV_HASH" ] && [ "$INV_HASH" != unavailable ]; then
+# The sidecar must name the baseline it was taken with. A baseline refreshed
+# while the sidecar write failed leaves an older inventory on disk, and diffing
+# against THAT reports stale additions and can swallow a removal entirely.
+_inv_owner=""
+if [ -f "$BASELINE_INV_FILE" ] && [ -s "$BASELINE_INV_FILE" ]; then
+    _inv_owner="$(head -1 "$BASELINE_INV_FILE" 2>/dev/null)"
+    _inv_owner="${_inv_owner#\#inv_hash=}"
+fi
+if [ -n "$_inv_owner" ] && [ -n "${B_HASH:-}" ] && [ "$_inv_owner" = "$B_HASH" ] && [ -n "$INV_HASH" ] && [ "$INV_HASH" != unavailable ]; then
     _now_inv="$(mktemp 2>/dev/null)"
-    if [ -n "$_now_inv" ]; then
-        if printf '%s' "$INV" | grep -v '^$' | sort >"$_now_inv" 2>/dev/null; then
+    _base_inv="$(mktemp 2>/dev/null)"
+    if [ -n "$_now_inv" ] && [ -n "$_base_inv" ]; then
+        if printf '%s' "$INV" | grep -v '^$' | sort >"$_now_inv" 2>/dev/null \
+           && tail -n +2 "$BASELINE_INV_FILE" >"$_base_inv" 2>/dev/null; then
             INV_DIFFABLE=1
             # comm needs both sides sorted, and both are: the baseline copy was
             # sorted when written and this one just now, under the same collation
             # (nothing in this script sets LC_ALL).
-            INV_ADDED="$(comm -13 "$BASELINE_INV_FILE" "$_now_inv" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
-            INV_REMOVED="$(comm -23 "$BASELINE_INV_FILE" "$_now_inv" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
+            INV_ADDED="$(comm -13 "$_base_inv" "$_now_inv" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
+            INV_REMOVED="$(comm -23 "$_base_inv" "$_now_inv" 2>/dev/null | tr "\n" " " | sed "s/ *$//")"
         fi
-        rm -f "$_now_inv" 2>/dev/null
     fi
+    rm -f "$_now_inv" "$_base_inv" 2>/dev/null
 fi
 
 if [ -z "$band" ]; then
@@ -403,7 +424,7 @@ if [ -z "$band" ]; then
         # HEAL AN OLD BASELINE while the set is known-good. Recording the
         # inventory here is safe precisely because it matches the hash that was
         # already accepted, and it is what lets the NEXT addition self-accept.
-        if [ ! -f "$BASELINE_INV_FILE" ]; then write_baseline_inventory || true; fi
+        if [ "$INV_DIFFABLE" != 1 ]; then write_baseline_inventory || true; fi
         verdict="$FILES definition file(s), $ITEMS item(s), $USERS user(s) — matches the baseline recorded $B_WHEN, by count AND by inventory. Newest change $NEWEST_HUMAN (${AGE_DAYS}d ago). [$DETAIL]"
     fi
 fi

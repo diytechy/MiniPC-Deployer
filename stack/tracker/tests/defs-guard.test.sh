@@ -31,6 +31,8 @@
 #       NOT self-accept growth: the guard cannot prove nothing went with it
 #   D19 a green run HEALS such a baseline, so the next addition self-accepts
 #   D20 growth that cannot refresh the baseline stays YELLOW, never green
+#   D21 a sidecar inventory that does not belong to the baseline beside it is
+#       IGNORED - diffing against a stale one hides the removal in between
 #   D15 a corrupt baseline is yellow, never green
 #   D16 a state file that cannot be written escalates to RED - the durable
 #       verdict is the whole point, and a stale one reads as current
@@ -391,22 +393,77 @@ write_gamma
 if [ "$(id -u)" = 0 ]; then
     printf 'SKIP  D20: running as root, which can write into a 0500 directory anyway\n'
 else
-    # The STATE dir must stay writable (an unwritable one is D16's red), so only
-    # the baseline file itself is made immutable, via a read-only directory it
-    # cannot be replaced in. mktemp+mv needs write on the directory, so instead
-    # point the baseline at a path whose parent is read-only.
-    mkdir -p "$STATE/ro"
-    cp "$STATE/tracker-defs-baseline" "$STATE/ro/tracker-defs-baseline"
-    cp "$STATE/tracker-defs-baseline.inv" "$STATE/ro/tracker-defs-baseline.inv"
-    cp "$STATE/tracker-defs.state" "$STATE/ro/tracker-defs.state" 2>/dev/null || true
-    chmod 500 "$STATE/ro"
-    rc="$(TRACKER_DEFS_ROOT="$ROOT" TRACKER_DEFS_STATE_DIR="$STATE/ro" bash "$GUARD" --check >"$TMP/out.txt" 2>&1; echo $?)"
-    chmod 700 "$STATE/ro"
-    # The state file cannot be written either, so D16's escalation makes this
-    # RED rather than yellow. Either way the one forbidden answer is GREEN.
-    if [ "$rc" != 0 ]; then pass "D20 growth with an unwritable baseline is not green (exit $rc)"; else fail "D20 exit=0 — green was reported without a baseline behind it"; cat "$TMP/out.txt"; fi
-    if ! grep -q 'baseline refreshed automatically' "$TMP/out.txt"; then pass "D20 and it does not claim a refresh that did not happen"; else fail "D20 claimed an auto-refresh it could not write"; fi
+    # ONLY THE BASELINE IS MADE UNWRITABLE. Making the whole state directory
+    # read-only would break write_state too, and D16 escalates THAT to red — so
+    # the assertion would pass even if the growth branch wrongly chose green.
+    # (Adversarial review, 2026-09-13.) The baseline path is therefore moved to
+    # its own read-only directory while the state file stays where it was.
+    mkdir -p "$TMP/ro-baseline"
+    cp "$STATE/tracker-defs-baseline" "$TMP/ro-baseline/tracker-defs-baseline"
+    cp "$STATE/tracker-defs-baseline.inv" "$TMP/ro-baseline/tracker-defs-baseline.inv"
+    chmod 500 "$TMP/ro-baseline"
+    rc="$(TRACKER_DEFS_ROOT="$ROOT" TRACKER_DEFS_STATE_DIR="$STATE" \
+          TRACKER_DEFS_BASELINE_FILE="$TMP/ro-baseline/tracker-defs-baseline" \
+          bash "$GUARD" --check >"$TMP/out.txt" 2>&1; echo $?)"
+    chmod 700 "$TMP/ro-baseline"
+    if [ "$rc" = 2 ] && [ "$(state_of band)" = yellow ]; then pass "D20 growth with an unwritable baseline is YELLOW, not green (exit 2)"; else fail "D20 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+    if state_of verdict | grep -q 'could NOT be refreshed'; then pass "D20 and it says the refresh did not land"; else fail "D20 verdict: $(state_of verdict)"; fi
+    if [ "$(awk -F= '$1=="items"{print $2}' "$TMP/ro-baseline/tracker-defs-baseline")" = 3 ]; then pass "D20 the baseline really is unchanged"; else fail "D20 the baseline moved anyway"; fi
 fi
+
+echo
+echo "== D21: a sidecar that belongs to another baseline is not evidence =="
+# THE HOLE A PARTIAL REFRESH LEAVES (adversarial review, 2026-09-13). The
+# baseline and its inventory are two writes, and the second can fail. Diffing a
+# new baseline against an OLD inventory reports long-accepted ids as additions
+# — and, worse, an id removed in between never appears in the diff at all, so a
+# removal would be auto-accepted as growth. The sidecar therefore names the hash
+# it was taken with, and a mismatch means "no inventory", not "this one".
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
+write_defs
+guard --baseline >/dev/null
+# Stage exactly the aftermath of a failed sidecar write: the baseline moves on,
+# the inventory does not.
+write_gamma
+guard --check >/dev/null                      # auto-accepts {four}; both files move
+cp "$STATE/tracker-defs-baseline.inv" "$TMP/stale.inv"
+cat >"$DEFS/delta.md" <<'EOF'
+---
+category: Delta
+color_weight: 1.0
+items:
+  - id: five
+    title: Five
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Delta
+EOF
+guard --check >/dev/null                      # auto-accepts {five}
+cp "$TMP/stale.inv" "$STATE/tracker-defs-baseline.inv"   # the stale sidecar returns
+# Now remove `five` and add `six`. Against the CURRENT baseline that is a
+# removal; against the stale inventory it would look like pure growth.
+rm -f "$DEFS/delta.md"
+cat >"$DEFS/epsilon.md" <<'EOF'
+---
+category: Epsilon
+color_weight: 1.0
+items:
+  - id: six
+    title: Six
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Epsilon
+EOF
+rc="$(guard --check)"
+if [ "$rc" != 0 ]; then pass "D21 a stale sidecar did not launder the removal (exit $rc)"; else fail "D21 exit=0 — a removal was auto-accepted as growth"; cat "$TMP/out.txt"; fi
+if ! grep -q 'baseline refreshed automatically' "$TMP/out.txt"; then pass "D21 and the baseline was not refreshed"; else fail "D21 the baseline was laundered against an inventory it does not belong to"; fi
+if state_of verdict | grep -qE 'INVENTORY does not|no inventory record'; then pass "D21 it reports the mismatch as HAVING no inventory, not as one"; else fail "D21 verdict: $(state_of verdict)"; fi
 
 echo
 echo "== D15: a corrupt baseline is yellow, never green =="

@@ -15,6 +15,16 @@ done
 [ "$(id -u)" = 0 ] || fail "Run through the owner SSH administration path as root"
 [ -f "$host_config" ] && [ -d "$wheelhouse" ] || fail "Both private host config and offline wheelhouse are required"
 [ -f "$wheelhouse/requirements.lock" ] || fail "Wheelhouse needs a complete hash-pinned requirements.lock"
+# Read the lock before pip does. pip enforces the hashes but reports a missing
+# wheel or an unpinned transitive dependency as a late, opaque resolver error;
+# this refuses such a wheelhouse by name, and refuses one that would send pip to
+# an index. Built by build-sensor-wheelhouse.sh; see sensor-wheelhouse/README.md.
+# --expect anchors authenticity: the media's lock must be byte-identical to the
+# reviewed lock that shipped inside this panel image. Without it, substituted
+# media could carry its own self-consistent lock and pass every hash check.
+reviewed_lock="$(dirname "$0")/sensor-wheelhouse/requirements.lock"
+[ -f "$reviewed_lock" ] || fail "The reviewed requirements.lock is missing from the staged image payload"
+python3 "$(dirname "$0")/check-wheelhouse-lock.py" --expect "$reviewed_lock" "$wheelhouse"     || fail "Offline wheelhouse rejected; rebuild it with build-sensor-wheelhouse.sh"
 app_dir=/opt/wall-panel/app/runtime/resources/app
 [ -f "$app_dir/sensors/service.py" ] || fail "Install the matching wall app artifact first"
 command -v ffmpeg >/dev/null || fail "ffmpeg is missing from the wall image"

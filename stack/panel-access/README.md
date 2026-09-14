@@ -39,10 +39,34 @@ operator pins a digest, exports that exact image into the offline image payload
 and rehearses loading it. Protected access is outside offline closure until those
 steps are complete.
 
+## The operator install path on a running hub
+
+The two paths above are for an ISO: `install-gateway.py` is the validator and
+`stage-gateway.sh` is firstboot's wrapper around it. Neither can update the
+gateway on a hub that is already up, which is how that hub came to hold one
+unextracted tarball in `/opt/homehub/wall-gateway`, a staged application at a
+different revision than the served site, and no container at all.
+
+`gateway-release.py` is that missing path: one tarball in, a validated release
+out, the previous release kept, activation gated on the gateway's own `/health`
+and rolled back automatically when it fails. `install-gateway-state.sh` prepares
+`/var/lib/panel-access` and installs the feed token — and only the feed token.
+
+    sudo bash   panel-access/install-gateway-state.sh --feed-token-file <private path>
+    sudo python3 panel-access/gateway-release.py install --archive <tarball>
+    sudo python3 panel-access/gateway-release.py status
+
+The full procedure, including the Owner-only PIN bootstrap, device credential
+issue, rotation and uninstall, is `docs/runbooks/panel-access-gateway.md`.
+Manual unpacking into `app/gateway` is superseded by it: the release script
+keeps the retention and the markers that make a rollback possible, and a hand
+copy leaves neither.
+
 ## Hub preparation and coordinated cutover
 
 1. Build the matching OfficeWallNaglight site, app and gateway payloads. Stage
-   the gateway artifact's `gateway/` folder at `stack/panel-access/app/gateway/`.
+   the gateway artifact's `gateway/` folder at `stack/panel-access/app/gateway/`
+   **through `gateway-release.py`, not by hand.**
    The tarball root is `access/`: inspect its members/digest, then strip exactly
    that one root while unpacking into `stack/panel-access/app/` (the resulting
    entry must be `app/gateway/server.mjs`, not `app/access/gateway/server.mjs`).

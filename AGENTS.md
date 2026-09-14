@@ -1,6 +1,6 @@
 # AGENTS.md — Agent & Contributor Guide
 
-> **Current follow-up:** read [panel findings](../HomeHub/docs/PANEL_CURRENT_2026-09-13.md) first.
+> **Current follow-up:** round 2 runs from [the HomeHub handoff](../HomeHub/HANDOFF-panel-round2-coordinator-2026-09-14.md); the item ledger is [panel findings](../HomeHub/docs/PANEL_CURRENT_2026-09-13.md). Read both first.
 > Dated build plans now redirect to historical records. All standing
 > operating rules below remain in force.
 

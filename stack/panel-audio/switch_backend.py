@@ -244,6 +244,25 @@ class SwitchApplierBackend:
         still sitting there waiting to be consumed. False means the file is gone
         and the applier never saw it -- the runtime directory did not survive a
         restart -- so the acknowledgement the broker journaled is no longer true.
+
+        THE COMPARISON IS `>=`, AND THAT IS A DECISION, NOT AN OVERSIGHT (terra
+        5.1, rejected). The request file is a ONE-SLOT MAILBOX holding the
+        latest intent: a second tap overwrites an unconsumed first one, on
+        purpose, because the newest position is the one the Owner is asking for
+        and applying the older one afterwards would move the switch away from
+        it. So a sequence at or below what is sitting in the mailbox, or at or
+        below what the applier has recorded, counts as settled -- the request
+        was either applied or deliberately superseded by a newer request for the
+        same control, which is not a lost tap.
+
+        The residue, stated rather than papered over: replaying the completed
+        reply of a SUPERSEDED request reports success for an intent that was
+        overtaken. Making it exact (`== seq`) would be worse, because the redo
+        would then rewrite the older command over the newer one and move the
+        switch backwards; making `_submit` refuse while a request is unconsumed
+        would make the second tap of a quick double-tap fail. Closing it
+        properly needs a per-sequence queue in the APPLIER's protocol, which
+        this work does not own; it is recorded as the owed follow-up.
         """
         from audio_router import BrokerError
         if isinstance(seq, bool) or not isinstance(seq, int):

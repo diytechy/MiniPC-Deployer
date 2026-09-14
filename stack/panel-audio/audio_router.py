@@ -361,7 +361,11 @@ class AudioBroker:
             # request, so it is neither stale nor allowed to advance it again.
             if not replaying and request_generation != self.generation:
                 raise BrokerError("stale_generation", "request generation is stale")
-            if self.generation >= JS_SAFE_INTEGER:
+            # A REDO DOES NOT ADVANCE THE GENERATION, so the exhaustion ceiling
+            # must not refuse it (terra 5.2): a request whose own success took
+            # the counter to the limit would otherwise become undeliverable
+            # exactly when its effect had been lost.
+            if not replaying and self.generation >= JS_SAFE_INTEGER:
                 raise BrokerError("generation_exhausted", "generation limit reached")
             if not self.authorize(method, params):
                 raise BrokerError("authorization_required", "authorization is required")

@@ -1860,3 +1860,33 @@ one sends `output` and the request is refused with `switch_moved` if the switch
 has already left it. The residual race, between that read and the applier's run,
 is stated at the code rather than papered over.
 
+
+2026-09-14 (D-BACKEND, terra rounds 1-5): eight findings, seven fixed and two
+rejected with their reasons recorded at the code and in tests. Fixed: an
+unreadable state file read as an empty one, so three mutation decisions were
+taken from `{}` and a backward clock could mint below the applier's mark while
+the backend answered accepted; `switch_moved` preserved across the backend seam
+by its token alone, so a backend could answer `set_output` or `status` with a
+sentence only ever true of a guarded `set_volume`; a sparse state file reported
+as an unsupported switch rather than normalized as the applier normalizes it,
+which drew an unknown switch and refused reconciliation on a panel whose switch
+works; LLR-015 naming `AudioRouter.*` for a class called `AudioBroker`; the
+completed-mutation journal outliving the volatile request file it acknowledged,
+so a restart in the moment before the applier ran left a journal saying the
+switch had moved and told the retry it had already succeeded; and a redo being
+refused by the generation ceiling it deliberately does not advance.
+
+REJECTED, with the reasons at the code. (1) That `_state_strict` accepts a
+valid but partial object: the applier reads the same file through a field-wise
+fallback, so an absent or damaged `request_seq` is -1 on both sides, and
+validating a stricter schema here than the applier validates would refuse
+requests on a panel whose switch works. A test now asserts the two readers
+agree rather than leaving it a coincidence. (2) That a second tap overwriting an
+unconsumed first request lets the landing check settle the first one: the
+request file is a one-slot mailbox holding the latest intent, and that is the
+design. The residue is real and is stated rather than papered over: replaying
+the superseded request's completed reply reports success for an intent that was
+overtaken. Both alternatives are worse (an exact match makes the redo rewrite
+the older command over the newer one; refusing while a request is unconsumed
+fails the second tap of a double-tap). Closing it properly needs a per-sequence
+queue in the APPLIER's protocol, which this work does not own. Owed follow-up.

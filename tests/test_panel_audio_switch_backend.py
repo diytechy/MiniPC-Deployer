@@ -29,7 +29,8 @@ sys.path.insert(0, str(ROOT / "stack/autoinstall/wall"))
 import switch_request
 import switch_backend
 from switch_backend import SwitchApplierBackend
-from audio_router import AudioBroker as RealAudioBroker, BrokerError
+from audio_router import (AudioBroker as RealAudioBroker, BrokerError,
+                          JS_SAFE_INTEGER)
 from routing import PolicyError, switch_only_authorization, validate_action
 
 
@@ -692,3 +693,47 @@ def test_a_lost_mutation_reconciles_on_a_sparse_state_file_llr015(panel, tmp_pat
     }), encoding="utf-8")
     broker = AudioBroker(backend(panel), state_path=str(journal))
     assert reply(broker, wire("set_output", {"output": "mute"}))["ok"] is True
+
+
+# --- terra 5.1, rejected with its reason; terra 5.2, fixed ------------------
+
+def test_a_superseded_request_is_settled_and_the_newer_one_still_lands_sr028(panel, tmp_path):
+    """The request file is a ONE-SLOT MAILBOX holding the latest intent.
+
+    A second tap overwrites an unconsumed first one on purpose: the newest
+    position is the one being asked for, and applying the older one afterwards
+    would move the switch away from it. So an older sequence counts as settled.
+    The residue terra named is that replaying the older request's completed
+    reply reports success for an intent that was overtaken; the alternatives are
+    worse (an exact match makes the redo rewrite the older command over the
+    newer one, and refusing while a request is unconsumed fails the second tap
+    of a double-tap). Pinned here so a later change has to argue with it.
+    """
+    switch = backend(panel, clock=[100 * US, 101 * US])
+    broker = AudioBroker(switch, state_path=str(tmp_path / "journal.json"))
+    first = wire("set_output", {"output": "mute"}, request_id="a", echo_seq=True)
+    reply(broker, first)
+    second = reply(broker, wire("set_output", {"output": "headset"}, request_id="b",
+                                generation=1, echo_seq=True))
+    assert written(panel)["event"] == {"kind": "set_output", "output": "headset"}
+    assert second["result"]["seq"] == 101
+    # The older request replays as settled and does NOT overwrite the newer one.
+    assert switch._landed(100) is True
+    assert written(panel)["seq"] == 101
+
+
+def test_a_redo_is_not_refused_by_the_generation_ceiling_sr023(panel, tmp_path):
+    """terra 5.2: a redo does not advance the generation, so the ceiling that
+    guards advancing it must not refuse the redo."""
+    journal = tmp_path / "journal.json"
+    broker = AudioBroker(backend(panel, clock=[4_000 * US, 4_009 * US]),
+                         generation=JS_SAFE_INTEGER - 1, state_path=str(journal))
+    raw = wire("set_output", {"output": "headset"},
+               generation=JS_SAFE_INTEGER - 1, echo_seq=True)
+    first = reply(broker, raw)
+    assert first["ok"] is True and broker.generation == JS_SAFE_INTEGER
+    panel["request"].unlink()
+    second = reply(broker, raw)
+    assert second["ok"] is True, "the request's own success must not strand it"
+    assert written(panel)["seq"] == 4_009
+    assert second["generation"] == first["generation"] == JS_SAFE_INTEGER

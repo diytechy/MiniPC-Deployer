@@ -193,8 +193,13 @@ fi
 # on this panel contains XCURSOR_PATH and no XCURSOR_THEME string at all, and
 # cage 0.1.5 creates its xcursor manager with a NULL theme name, which wlroots
 # resolves to the theme literally called "default". So the only lever the
-# environment still has is where "default" is found. Same lever for the Electron
-# client, which reads the same variables.
+# environment still has is where "default" is found.
+#
+# THIS COVERS THE COMPOSITOR'S OWN POINTER IMAGE, NOT EVERY CURSOR. A Wayland
+# client may attach its own cursor surface with wl_pointer.set_cursor instead of
+# looking anything up in a theme, and Chromium does that once a pointer has
+# entered its surface — which is why the shell's `cursor: none` remains the
+# other half of item 22 rather than being superseded here.
 #
 # WALL_CURSOR_TRANSPARENT=false leaves it alone, which is how a service session
 # gets a visible arrow back without editing this file.

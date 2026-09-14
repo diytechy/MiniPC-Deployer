@@ -40,6 +40,19 @@ directory literally named `default`, in a directory of our own, named by
 XCURSOR_PATH. Setting XCURSOR_THEME instead would have looked right, changed
 nothing, and been very hard to disbelieve.
 
+A THEME IS NOT A UNIVERSAL CURSOR SUPPRESSOR, and the claim must stay inside
+what it can carry. It removes the image the COMPOSITOR draws from its theme --
+cage's fallback pointer, and anything wlroots paints for a seat whose client has
+said nothing. A Wayland client may instead attach its own cursor surface with
+wl_pointer.set_cursor, and that surface is the client's own bitmap, not a theme
+lookup. Chromium does exactly this once a pointer has entered its surface, which
+is why the shell's `cursor: none` (js/idle.js) is still the other half of item
+22 and is not superseded by this file. The two halves cover the two owners; the
+byte-format test below proves the FILE, not Electron's behaviour.
+
+ACCEPTANCE IS ON HARDWARE AND IS STILL OWED: `grim -c` immediately after a real
+finger drag, and again after a real mouse move across the shell.
+
 THE FORMAT, written by hand because xcursorgen is not on the image and a build
 dependency for 68 bytes is not worth it. Xcursor files are little-endian:
 

@@ -128,3 +128,16 @@ def test_wall_env_documents_the_knob_and_firstboot_reports_the_mode():
     assert "WALL_ACCESS_MODE" in firstboot
     # The PIN is never handled by firstboot, so it can never be echoed by it.
     assert "WALL_ACCESS_PIN" not in firstboot and "WALL_PANEL_PIN" not in firstboot
+
+
+def test_reversal_needs_the_whole_registration_not_two_thirds_of_it(tmp_path):
+    # Terra round 1: a gatewayUrl and a credential with no deviceId is a config
+    # the panel's readConfig REFUSES, so enabling it would produce a panel that
+    # is locked and unavailable while firstboot reports access as enabled.
+    partial = tmp_path / "partial.json"
+    partial.write_text('{"enabled":true,"accessMode":"local","gatewayUrl":"https://wall.invalid",'
+                       '"deviceCredential":"fixture"}', encoding="utf-8")
+    partial.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    result = MODULE.render(partial, {"WALL_ACCESS_MODE": "gateway"})
+    assert "accessMode" not in result
+    assert result["enabled"] is False

@@ -60,7 +60,11 @@ def render(existing_path: Path, environ: dict[str, str]) -> dict:
         # a real gateway registration; otherwise it returns to the unprovisioned
         # posture rather than to an `enabled` flag with nothing behind it.
         document.pop("accessMode", None)
-        document["enabled"] = bool(document.get("gatewayUrl")) and bool(document.get("deviceCredential"))
+        # ALL THREE registration fields, not two: access-broker readConfig
+        # refuses a config with a gatewayUrl and a credential but no deviceId,
+        # and the panel then boots into its locked-and-unavailable fallback
+        # while firstboot cheerfully reports access as enabled. Terra round 1.
+        document["enabled"] = all(bool(document.get(field)) for field in ("gatewayUrl", "deviceId", "deviceCredential"))
     document["rendererConfig"] = {
         "FEED_TOKEN": value("WALL_SHELL_FEED_TOKEN"),
         "HEARTBEAT_URL": value("WALL_SHELL_HEARTBEAT_URL"),

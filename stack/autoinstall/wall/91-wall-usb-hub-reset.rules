@@ -1,0 +1,30 @@
+# The amplifier-side USB hub, and a bounded recovery for it enumerating empty.
+#
+# ITEM 25 ADDENDUM (2026-09-13 21:52): after a hot move the Atmel 4-port hub
+# answered on the bus and none of its downstream ports did --
+# `hub 1-2:1.0: hub_ext_port_status failed (err = -71)` -- so the audio adapter
+# and the CH340 relay were both absent and item 25's BindsTo= recovery had
+# nothing to recover onto. `authorized` 0 then 1 on the hub brought both back.
+#
+# DEVTYPE=="usb_device" IS LOAD-BEARING. Without it this matches the hub's
+# INTERFACE (1-2:1.0) as well as the device (1-2), and %k would then be a name
+# with no `authorized` file -- the reset would run twice and the second one
+# would fail on a path that cannot exist. The device is also the only node whose
+# name is the bus id the reset script validates and walks children of.
+#
+# ATTR, NOT ATTRS. On the usb_device itself idVendor/idProduct are its own
+# attributes; ATTRS would also walk up to the parent hubs and could match a
+# chain that merely contains an Atmel device somewhere above it.
+#
+# NO ACTION=="add" ON THE TAG, for the reason spelled out in
+# 90-wall-audio-adapter.rules: udev re-evaluates every rule on every event and a
+# property this event did not set does not exist, so an add-only tag goes stale
+# on the next non-add event and the unit stops being tracked. The WANTS is
+# add-only on purpose though -- it is the event that starts a recovery, and
+# re-running it on every change event is exactly the loop this must not become.
+ACTION=="remove", GOTO="wall_usb_hub_end"
+SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTR{idVendor}=="03eb", ATTR{idProduct}=="0902", \
+    TAG+="systemd"
+ACTION=="add", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTR{idVendor}=="03eb", ATTR{idProduct}=="0902", \
+    ENV{SYSTEMD_WANTS}+="wall-usb-hub-reset@$kernel.service"
+LABEL="wall_usb_hub_end"

@@ -1086,11 +1086,21 @@ fi
 # A FAILURE HERE IS A WARNING, NEVER A fail_step. A panel with no canceller is
 # the panel that shipped before step 6: the microphone works, the echo is not
 # removed, and the mic seam below is not moved. That is degraded, not broken.
-if [ -d "$PAYLOAD/aec" ]; then
+# THREE SHAPES HERE ARE DICTATED BY THE PAYLOAD INVENTORY TEST
+# (tests/test_panel_audio.py), which resolves every payload reference rather
+# than pattern-matching it, and fails on one it cannot resolve:
+#   * the loop variable is `_aec`, not the `_f` used twice above. That test
+#     unions every word any loop binds to a name and crosses it with every
+#     reference using that name, so reusing `_f` would have it looking for
+#     asound-bus-mode.conf inside aec/.
+#   * the loop is ONE LINE. A backslash continuation is invisible to the
+#     resolver, which would then call the variable unresolvable.
+#   * the guard tests a FILE, not the directory: a directory is not a path
+#     `git ls-tree` lists, so it cannot be checked against the archive.
+if [ -f "$PAYLOAD/aec/Makefile" ]; then
     install -d -m 0755 /usr/local/src/wall-aec
-    for _f in wall-audio-aec.c wall_aec_policy.c wall_aec_policy.h \
-              wall_aec_profile.c wall_aec_profile.h Makefile; do
-        [ -f "$PAYLOAD/aec/$_f" ] && install -m 0644 "$PAYLOAD/aec/$_f" "/usr/local/src/wall-aec/$_f"
+    for _aec in wall-audio-aec.c wall_aec_policy.c wall_aec_policy.h wall_aec_profile.c wall_aec_profile.h Makefile; do
+        [ -f "$PAYLOAD/aec/$_aec" ] && install -m 0644 "$PAYLOAD/aec/$_aec" "/usr/local/src/wall-aec/$_aec"
     done
     if ( cd /usr/local/src/wall-aec && make >/tmp/wall-aec-build.log 2>&1 ); then
         install -m 0755 /usr/local/src/wall-aec/wall-audio-aec /usr/local/sbin/wall-audio-aec

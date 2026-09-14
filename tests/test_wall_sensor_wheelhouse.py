@@ -179,6 +179,22 @@ def test_installer_anchors_the_media_lock_to_the_lock_staged_in_the_image():
     assert 'reviewed_lock="$(dirname "$0")/sensor-wheelhouse/requirements.lock"' in text
     assert '--expect "$reviewed_lock"' in text
     assert LOCK.exists(), "the anchor the installer points at must be tracked beside it"
+    # The anchor is only worth anything if it rides to the panel. It is not named
+    # by any late-command: it arrives because late-command 3 copies the payload
+    # tree wholesale, and the installer resolves it relative to its own location.
+    user_data = (WALL / "user-data").read_text(encoding="utf-8")
+    assert 'cp -a "$d/deploy-payload/." /target/opt/wall-panel/' in user_data, (
+        "the anchor and the checker reach /opt/wall-panel only via the recursive payload copy"
+    )
+    assert LOCK.parent.name == "sensor-wheelhouse" and LOCK.parent.parent == WALL
+    assert (WALL / "check-wheelhouse-lock.py").exists()
+
+
+def test_build_refuses_a_container_that_is_not_the_panel_architecture():
+    text = BUILD.read_text(encoding="utf-8")
+    assert "--platform linux/amd64" in text, "the multi-arch base would silently build ARM wheels"
+    assert text.count("--platform linux/amd64") >= 2, "the pull and the run both need it"
+    assert '[ "$(uname -m)" = "x86_64" ]' in text
 
 
 def test_build_never_self_upgrades_pip_and_never_silently_skips_the_sensor_import():

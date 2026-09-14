@@ -40,6 +40,11 @@ if [ "${1:-}" = "--inner" ]; then
     skip_sensor_import=${2:-0}
     export DEBIAN_FRONTEND=noninteractive
     note "container: $(. /etc/os-release && echo "$PRETTY_NAME") $(uname -m)"
+    # The base image is multi-arch. On an ARM host without --platform the whole
+    # build succeeds - resolve, lock, install, import - and produces aarch64
+    # wheels with a perfectly valid lock that the x86-64 panel cannot install.
+    # The failure has to happen here, not on the panel.
+    [ "$(uname -m)" = "x86_64" ] || fail "container is $(uname -m), not x86_64; the panel is x86-64"
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends python3-venv python3-pip ca-certificates >/dev/null
     python3 --version
@@ -162,8 +167,8 @@ out_dir=$(cd "$out_dir" && pwd)
 note "mode=$mode  base=$BASE_IMAGE"
 note "output -> $out_dir  (wheels are build artefacts and are not committed)"
 
-docker pull -q "$BASE_IMAGE" >/dev/null
-mount_args=(-v "$work:/work:ro" -v "$out_dir:/out")
+docker pull -q --platform linux/amd64 "$BASE_IMAGE" >/dev/null
+mount_args=(--platform linux/amd64 -v "$work:/work:ro" -v "$out_dir:/out")
 if [ -n "$sensors_src" ]; then mount_args+=(-v "$sensors_src:/sensors-src:ro"); fi
 docker run --rm "${mount_args[@]}" -v "$here/build-sensor-wheelhouse.sh:/build.sh:ro" \
     "$BASE_IMAGE" bash /build.sh --inner "$mode" "$skip_sensor_import"

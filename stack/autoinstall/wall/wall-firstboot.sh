@@ -963,6 +963,17 @@ case "${WALL_VOLUME_KEYS_ENABLED:-true}" in
 esac
 
 case "${WALL_AUDIO_MODE:-trigger}" in
+    bus|BUS)
+        # The merged bus (D-3). Before this arm existed, `bus` fell through to
+        # the trigger arm below, so every boot re-asserted trigger over a live
+        # bus graph and half-applied it: mode file and symlink said trigger
+        # while the bus legs kept running, and both chains drove the adapter
+        # at once (measured 2026-09-14 00:06 as audible distortion).
+        if [ -x /usr/local/sbin/wall-audio-mode ]; then
+            /usr/local/sbin/wall-audio-mode bus >/dev/null 2>&1 ||
+                warn "audio: could not apply bus mode"
+            log "audio: bus mode — one merged stereo bus, the Mute/Headset/Speaker switch, amp detector on the speaker tap."
+        fi ;;
     panel|PANEL)
         if [ -x /usr/local/sbin/wall-audio-mode ]; then
             /usr/local/sbin/wall-audio-mode panel >/dev/null 2>&1 ||

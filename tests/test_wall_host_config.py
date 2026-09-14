@@ -141,3 +141,11 @@ def test_reversal_needs_the_whole_registration_not_two_thirds_of_it(tmp_path):
     result = MODULE.render(partial, {"WALL_ACCESS_MODE": "gateway"})
     assert "accessMode" not in result
     assert result["enabled"] is False
+
+
+def test_firstboot_creates_the_panel_owned_local_state_directory():
+    # /var/lib is root-owned 0755 and the kiosk runs as `panel`, so the panel
+    # cannot create this directory itself; without it local mode fails closed
+    # on every boot and the panel sits masked and unavailable.
+    firstboot = (SCRIPT.parent / "wall-firstboot.sh").read_text(encoding="utf-8")
+    assert "install -d -o panel -g panel -m 0700 /var/lib/wall-panel" in firstboot

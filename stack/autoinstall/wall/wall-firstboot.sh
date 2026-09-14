@@ -397,6 +397,14 @@ if python3 "$PAYLOAD/render-wall-host-config.py" "$WALL_HOST_CONFIG" > "$HOST_CO
     install -o panel -g panel -m 0600 "$HOST_CONFIG_TMP" "$WALL_HOST_CONFIG"
     rm -f "$HOST_CONFIG_TMP"
     log "private Electron host config rendered at $WALL_HOST_CONFIG (0600; values not logged)"
+    # ── the panel-local access state directory ─────────────────────────────
+    # /var/lib is root-owned 0755, so the kiosk (which runs as `panel`) cannot
+    # create this itself: without this line local mode would fail closed on
+    # every boot with an unwritable state path and the panel would sit masked
+    # and unavailable. Created empty; the panel writes the key and the
+    # encrypted state on first run, and the PIN is set at the wall.
+    install -d -o panel -g panel -m 0700 /var/lib/wall-panel
+
     # ── which lock is in force, stated once in the journal ─────────────────
     # Local mode is the one posture a re-image DOES reproduce: it needs no
     # per-device secret, so WALL_ACCESS_MODE=local is enough and the manual

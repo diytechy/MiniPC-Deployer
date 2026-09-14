@@ -818,9 +818,35 @@ else
     warn "line-in passthrough cannot share the one playback substream this codec has."
 fi
 
+# THE MODULE OPTIONS AND THE INITRAMFS ARE TWO COPIES, AND ONLY ONE OF THEM IS
+# READ AT BOOT. snd_usb_audio and snd_hda_intel both load from the initramfs,
+# long before this script runs, so installing a changed wall-audio-index.conf
+# into /etc/modprobe.d and stopping there changes NOTHING until something else
+# happens to rebuild the initramfs. That is not theoretical: `index=1` was
+# corrected to `index=1,3` on 2026-09-14 and the built-in codec stayed missing
+# until update-initramfs -u was run BY HAND (00:04 and 00:13 on the panel).
+#
+# Rebuilt only when a file actually changed. firstboot re-runs on every boot,
+# and update-initramfs takes tens of seconds.
+_modprobe_changed=0
 for _f in wall-audio-index.conf wall-aloop.conf; do
-    [ -f "$PAYLOAD/$_f" ] && install -m 0644 "$PAYLOAD/$_f" "/etc/modprobe.d/$_f"
+    [ -f "$PAYLOAD/$_f" ] || continue
+    if ! cmp -s "$PAYLOAD/$_f" "/etc/modprobe.d/$_f"; then
+        _modprobe_changed=1
+    fi
+    install -m 0644 "$PAYLOAD/$_f" "/etc/modprobe.d/$_f"
 done
+if [ "$_modprobe_changed" = 1 ]; then
+    if command -v update-initramfs >/dev/null 2>&1; then
+        if update-initramfs -u >/dev/null 2>&1; then
+            log "audio: module options changed — initramfs rebuilt; the new ALSA card indexes take effect on the NEXT boot."
+        else
+            fail_step "audio: /etc/modprobe.d/wall-audio-index.conf changed but update-initramfs -u FAILED. snd_usb_audio and snd_hda_intel load from the initramfs, so the OLD card indexes are what the next boot will use and the built-in codec may fail to probe at all. Run: sudo update-initramfs -u"
+        fi
+    else
+        fail_step "audio: module options changed but update-initramfs is not installed, so the initramfs still carries the OLD ALSA card indexes and the next boot will use them."
+    fi
+fi
 # Options alone do not load a module; this is what does.
 [ -f "$PAYLOAD/wall-aloop-load.conf" ] && install -m 0644 "$PAYLOAD/wall-aloop-load.conf" /etc/modules-load.d/wall-aloop-load.conf
 

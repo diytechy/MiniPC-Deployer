@@ -425,8 +425,14 @@ def test_firstboot_payload_files_are_all_tracked_and_shipped():
     import re
 
     firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    # `git ls-tree HEAD`, NOT `git ls-files`: the payload is `git archive HEAD`,
+    # so the index is the wrong tree to ask. A file that is staged but not yet
+    # committed is in `ls-files` and is NOT in the archive the panel unpacks.
+    # A new payload file therefore has to be COMMITTED before this passes,
+    # which is the deployment contract stated honestly.
     tracked = set(subprocess.run(
-        ["git", "ls-files"], cwd=ROOT, check=True, capture_output=True, text=True,
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
     ).stdout.splitlines())
 
     loops = {}
@@ -464,7 +470,8 @@ def test_firstboot_payload_files_are_all_tracked_and_shipped():
     assert not missing, (
         "wall-firstboot.sh reads these from $PAYLOAD but they are not tracked, "
         "so the image will not carry them and firstboot will skip them in "
-        "silence: %s" % missing
+        "silence (a file staged but not yet committed counts as missing -- the "
+        "payload is git archive HEAD): %s" % missing
     )
     # Spot checks that the resolution above is actually finding things, so a
     # future refactor of firstboot cannot turn this into a test of nothing:
@@ -570,3 +577,29 @@ echo "REACHED_END failed=$PROVISION_FAILED"
     assert ok.stderr.strip() == ""
     assert "LOG success line one" in ok.stdout
     assert "LOG success line two" in ok.stdout
+
+
+def test_changed_module_options_rebuild_the_initramfs():
+    """snd_usb_audio loads from the initramfs, not from /etc/modprobe.d.
+
+    `index=1` was corrected to `index=1,3` on 2026-09-14 and the built-in codec
+    stayed missing until update-initramfs -u was run BY HAND, twice. firstboot
+    installing the file and stopping there changes nothing that boot OR the
+    next one, so a re-imaged or upgraded panel would hit the same card-index
+    failure the fix was written for.
+    """
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    start = firstboot.index('for _f in wall-audio-index.conf')
+    block = firstboot[start:firstboot.index('\n# Options alone do not load', start)]
+    # Conditional on an actual change: firstboot re-runs on every boot and
+    # update-initramfs takes tens of seconds.
+    assert 'cmp -s "$PAYLOAD/$_f" "/etc/modprobe.d/$_f"' in block
+    assert "update-initramfs -u" in block
+    # And a failed or absent rebuild is a RED firstboot, not a shrug: the panel
+    # would boot with the old card indexes and nothing would say so.
+    assert block.count("fail_step") == 2, block
+    assert "|| true" not in block
+    # The knob this exists for is still the measured one.
+    index_conf = (WALL / "wall-audio-index.conf").read_text(encoding="utf-8")
+    assert "options snd_usb_audio index=1,3" in index_conf
+    assert "options snd_hda_intel index=0" in index_conf

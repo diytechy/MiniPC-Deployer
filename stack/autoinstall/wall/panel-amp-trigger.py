@@ -192,7 +192,15 @@ ACTUATOR_RETRY_SECONDS = 5.0
 # first ENOENT, main() returns 1, and the amplifier stays dark for a RestartSec
 # -- with the relay possibly still latched ON from before. Bounded on purpose: a
 # relay that is genuinely absent must still fail, and be seen to fail.
-RELAY_WAIT_SECONDS = _env("WALL_AMP_RELAY_WAIT_SECONDS", 20.0, lo=0.0, hi=300.0)
+#
+# SIX SECONDS, NOT TWENTY, and the number comes from the acceptance budget
+# rather than from a guess about USB: this wait happens BEFORE the capture
+# threads start, so every second of it is a second the detector is not
+# measuring and the amplifier is not coming back on. Ten seconds is the whole
+# budget. A relay still missing at six is picked up either by the in-loop
+# ACTUATOR_RETRY_SECONDS reopen -- which opens a fresh transport too -- or by
+# the next RestartSec, and neither of those blocks the detector.
+RELAY_WAIT_SECONDS = _env("WALL_AMP_RELAY_WAIT_SECONDS", 6.0, lo=0.0, hi=300.0)
 RELAY_WAIT_INTERVAL = 1.0
 SAFE_STATE_FILE = "/run/wall-amp-trigger/off-verified"
 

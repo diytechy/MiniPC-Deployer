@@ -8,6 +8,7 @@ alsaloop recover loop.
 """
 
 import importlib.util
+import re
 import shutil
 import subprocess
 import sys
@@ -102,6 +103,14 @@ def test_alsaloop_is_wrapped_in_the_bounded_guard(unit):
     assert "StartLimitBurst=10" in text
 
 
+def test_line_in_refuses_a_udev_start_when_it_is_disabled():
+    """Enablement is the operator's off switch, and SYSTEMD_WANTS ignores it."""
+    text = read("wall-line-in.service")
+    condition = [ln for ln in text.splitlines() if ln.startswith("ExecCondition=")]
+    assert len(condition) == 1
+    assert "multi-user.target.wants/wall-line-in.service" in condition[0]
+
+
 def test_kiosk_loop_refuses_to_run_in_panel_mode():
     """udev's SYSTEMD_WANTS ignores enablement, so the mode is checked again."""
     text = read("wall-kiosk-loop.service")
@@ -109,28 +118,43 @@ def test_kiosk_loop_refuses_to_run_in_panel_mode():
     assert "/etc/wall-panel/audio-mode" in text
 
 
+# Lines systemd-analyze emits about THIS host rather than about these files:
+# binaries and a device unit that exist only on the panel, and the executable
+# bit every file carries on a Windows mount. Anything else is a defect.
+HOST_ARTIFACTS = (
+    re.compile(r"marked (executable|world-writable)"),
+    re.compile(r"Command .*(wall-alsaloop-guard\.py|alsaloop|amixer|python3)"),
+    re.compile(r"(wall-alsaloop-guard\.py|/usr/bin/alsaloop|/usr/bin/amixer|"
+               r"/usr/bin/python3|/usr/local/lib/wall-panel)"),
+    re.compile(r"dev-wall_audio_adapter\.device"),
+    re.compile(r"Unit .*\.device .*(not found|Invalid argument)"),
+)
+
+
 @pytest.mark.skipif(shutil.which("systemd-analyze") is None,
                     reason="systemd-analyze is not available on this host")
 def test_unit_files_pass_systemd_analyze_verify(tmp_path):
     for unit in UNITS:
         shutil.copy(WALL / unit, tmp_path / unit)
+        # The repo lives on a Windows mount where every file reads as 0777;
+        # fixing the mode is better than filtering the complaint about it.
+        (tmp_path / unit).chmod(0o644)
     got = subprocess.run(
         ["systemd-analyze", "verify", *[str(tmp_path / u) for u in UNITS]],
         capture_output=True, text=True)
-    noise = ("Unknown", "not found", "Failed to prepare", "ignoring")
-    real = [ln for ln in (got.stderr + got.stdout).splitlines()
-            # A unit that names a device unit no test host has, and the guard
-            # path that exists only on the panel, are not defects here.
-            if ln.strip() and "wall_audio_adapter" not in ln
-            and "wall-alsaloop-guard" not in ln
-            and "/usr/local/lib/wall-panel" not in ln
-            and "/usr/bin/alsaloop" not in ln
-            and "/usr/bin/amixer" not in ln
-            and "/usr/lib/systemd" not in ln
-            # The worktree lives on a Windows mount in CI, where every file
-            # reads as 0777 and systemd calls that "marked executable".
-            and "marked executable" not in ln]
-    assert not [ln for ln in real if any(n in ln for n in noise)], real
+    # Allowlist, not a denylist: an unrecognised diagnostic is a defect. The
+    # [Service]-vs-[Unit] StartLimit mistake this caught reads as "Unknown key
+    # name ... ignoring", and a denylist that happened to miss that phrasing
+    # would have passed a unit whose restart bound silently did nothing.
+    unexplained = [ln.strip() for ln in (got.stderr + got.stdout).splitlines()
+                   if ln.strip()
+                   and not any(p.search(ln) for p in HOST_ARTIFACTS)]
+    assert not unexplained, unexplained
+    if not unexplained and got.returncode != 0:
+        # Exit status is still information: it must be explained by the host
+        # artifacts above and nothing else.
+        assert (got.stderr + got.stdout).strip(), (
+            "systemd-analyze failed with no diagnostic at all")
 
 
 # --- the bounded recover loop ---------------------------------------------
@@ -138,7 +162,7 @@ def test_unit_files_pass_systemd_analyze_verify(tmp_path):
 def test_error_window_trips_only_past_the_cap():
     guard = load_guard()
     clock = [0.0]
-    window = guard.ErrorWindow(max_errors=3, window=10.0,
+    window = guard.ErrorWindow(max_errors=3, window=10.0, sustain=1e9,
                                monotonic=lambda: clock[0])
     assert window.record() is False
     assert window.record() is False
@@ -147,12 +171,48 @@ def test_error_window_trips_only_past_the_cap():
 
 
 def test_errors_spread_beyond_the_window_never_trip():
+    """An isolated xrun an hour is a panel that works, not one to restart."""
     guard = load_guard()
     clock = [0.0]
-    window = guard.ErrorWindow(max_errors=3, window=10.0,
+    window = guard.ErrorWindow(max_errors=3, window=10.0, sustain=30.0,
                                monotonic=lambda: clock[0])
     for _ in range(50):
         assert window.record() is False
+        clock[0] += 11.0
+
+
+def test_a_slow_but_unbroken_error_stream_still_trips():
+    """The wedge the rate cap alone cannot see: one complaint a second, forever.
+
+    terra found this: 20-in-10s is never reached at 1 Hz, so an alsaloop broken
+    permanently would have run silent indefinitely while the unit read active --
+    the exact failure this file exists to end, in slow motion.
+    """
+    guard = load_guard()
+    clock = [0.0]
+    window = guard.ErrorWindow(max_errors=20, window=10.0, sustain=30.0,
+                               monotonic=lambda: clock[0])
+    tripped_at = None
+    for _ in range(120):
+        if window.record():
+            tripped_at = clock[0]
+            break
+        clock[0] += 1.0
+    assert tripped_at == 30.0
+    assert "unbroken" in window.reason
+
+
+def test_a_clean_gap_resets_the_sustained_streak():
+    guard = load_guard()
+    clock = [0.0]
+    window = guard.ErrorWindow(max_errors=20, window=10.0, sustain=30.0,
+                               monotonic=lambda: clock[0])
+    for _ in range(100):
+        # 25 s of complaints, then quiet for longer than the window: never a
+        # wedge, so it must never trip however long the panel runs.
+        for _ in range(25):
+            assert window.record() is False
+            clock[0] += 1.0
         clock[0] += 11.0
 
 
@@ -162,13 +222,13 @@ def test_the_measured_message_is_what_trips_it():
     assert guard.is_error_line("Poll failed: Input/output error")
     assert not guard.is_error_line("Loop started")
     lines = ["unable to prepare slave"] * 5
-    window = guard.ErrorWindow(max_errors=3, window=10.0)
+    window = guard.ErrorWindow(max_errors=3, window=10.0, sustain=1e9)
     assert guard.watch(iter(lines), window) is True
 
 
 def test_healthy_output_runs_to_the_end_without_tripping():
     guard = load_guard()
-    window = guard.ErrorWindow(max_errors=3, window=10.0)
+    window = guard.ErrorWindow(max_errors=3, window=10.0, sustain=1e9)
     assert guard.watch(iter(["Loop started", "sync 5", "done"]), window) is False
 
 

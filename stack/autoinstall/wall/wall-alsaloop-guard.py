@@ -16,9 +16,13 @@ perfectly healthy while no audio moves at all. Only a hand-run
 
 This wrapper turns that silent wedge into an exit. It runs alsaloop as a
 child, mirrors every line the child writes to the journal unchanged, and
-counts the lines that mean "the stream is broken". When more than
---max-errors of them arrive inside a --window second sliding window it kills
-the child and exits non-zero, which is what `Restart=always` is waiting for.
+counts the lines that mean "the stream is broken". It kills the child and
+exits non-zero -- which is what `Restart=always` is waiting for -- on either
+of two bounds: more than --max-errors of those lines inside a --window second
+sliding window (the flood), or errors arriving with no clean window-long gap
+for --sustain seconds (the slow wedge, which no rate cap can see, because an
+alsaloop that is broken forever but complains once a second keeps any
+sensible rate under the cap while carrying no audio at all).
 
 It is deliberately dumb: no parsing of ALSA state, no reopen logic of its
 own. The unit's Restart= is the recovery mechanism, and the device binding
@@ -31,7 +35,6 @@ error cap tripped; 2 for a usage error.
 
 import argparse
 import collections
-import os
 import re
 import signal
 import subprocess
@@ -51,37 +54,63 @@ ERROR_PATTERN = re.compile(
 
 DEFAULT_MAX_ERRORS = 20
 DEFAULT_WINDOW = 10.0
+DEFAULT_SUSTAIN = 30.0
 
 
 class ErrorWindow:
-    """A sliding window of error timestamps with a cap.
+    """A sliding window of error timestamps, with a rate cap AND a duration cap.
 
-    `record` returns True when the cap has been exceeded, i.e. when more than
-    `max_errors` error lines arrived within the last `window` seconds. The
-    window is what keeps a panel that xruns once an hour running, and the cap
-    is what stops the endless recover loop.
+    `record` returns True when either bound is exceeded:
+
+    * more than `max_errors` error lines inside the last `window` seconds --
+      the flood, which is what the measured wedge looks like; or
+    * errors arriving without a clean `window`-second gap for longer than
+      `sustain` seconds -- the SLOW wedge. A rate cap alone cannot see that
+      one: an alsaloop broken forever but printing once a second keeps the
+      window under any sensible cap and runs silent indefinitely, which is
+      precisely the active-but-no-audio state this file exists to end.
+
+    A clean gap of `window` seconds is what resets the streak, so ordinary
+    isolated xruns never accumulate towards either bound.
     """
 
     def __init__(self, max_errors=DEFAULT_MAX_ERRORS, window=DEFAULT_WINDOW,
-                 monotonic=time.monotonic):
+                 sustain=DEFAULT_SUSTAIN, monotonic=time.monotonic):
         if max_errors < 1:
             raise ValueError("max_errors must be at least 1")
         if window <= 0:
             raise ValueError("window must be positive")
+        if sustain <= 0:
+            raise ValueError("sustain must be positive")
         self.max_errors = max_errors
         self.window = window
+        self.sustain = sustain
         self.monotonic = monotonic
         self._times = collections.deque()
+        self._streak_start = None
+        self.reason = ""
 
     def __len__(self):
         return len(self._times)
 
     def record(self, now=None):
         now = self.monotonic() if now is None else now
-        self._times.append(now)
+        # Prune BEFORE appending, so an empty deque here really does mean "no
+        # error for a whole window" and the streak can be restarted.
         while self._times and now - self._times[0] > self.window:
             self._times.popleft()
-        return len(self._times) > self.max_errors
+        if not self._times:
+            self._streak_start = now
+        self._times.append(now)
+        if len(self._times) > self.max_errors:
+            self.reason = ("%d stream errors in %.0fs"
+                           % (len(self._times), self.window))
+            return True
+        if now - self._streak_start >= self.sustain:
+            self.reason = ("stream errors unbroken for %.0fs"
+                           % (now - self._streak_start))
+            return True
+        return False
 
 
 def is_error_line(line):
@@ -104,9 +133,8 @@ def watch(lines, window, echo=None):
         line = line.rstrip("\n")
         echo(line)
         if is_error_line(line) and window.record():
-            log("alsaloop reported %d stream errors in %.0fs -- the recover "
-                "loop is wedged; exiting so the unit restarts"
-                % (len(window), window.window))
+            log("alsaloop: %s -- the recover loop is wedged; exiting so the "
+                "unit restarts" % window.reason)
             return True
     return False
 
@@ -117,6 +145,8 @@ def main(argv=None):
         description="run alsaloop with a bounded recover loop")
     parser.add_argument("--max-errors", type=int, default=DEFAULT_MAX_ERRORS)
     parser.add_argument("--window", type=float, default=DEFAULT_WINDOW)
+    # The second bound: errors with no clean window-long gap for this long.
+    parser.add_argument("--sustain", type=float, default=DEFAULT_SUSTAIN)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
 
@@ -126,7 +156,7 @@ def main(argv=None):
     if not command:
         parser.error("no command given")
     try:
-        window = ErrorWindow(args.max_errors, args.window)
+        window = ErrorWindow(args.max_errors, args.window, args.sustain)
     except ValueError as exc:
         parser.error(str(exc))
 

@@ -60,6 +60,15 @@ After=dev-wall_audio_adapter.device
 
 [Service]
 Type=simple
+# WALL_LINE_IN_ENABLED IS EXPRESSED AS THIS UNIT'S ENABLEMENT -- firstboot and
+# wall-audio-mode both treat `disabled` as the operator's off switch -- but a
+# udev SYSTEMD_WANTS does not consult enablement, and since 2026-09-13 the rule
+# fires on every non-remove event rather than only on add. Without this check a
+# routine replug would start a passthrough the Owner had deliberately turned
+# off. The enablement symlink is tested directly rather than asking systemctl,
+# because a dbus round trip from inside this unit's own start job is a deadlock
+# waiting to be discovered on a bad day.
+ExecCondition=/bin/sh -c '[ -e /etc/systemd/system/multi-user.target.wants/wall-line-in.service ] || { echo "wall-line-in is disabled; not starting for a udev event" >&2; exit 1; }'
 # Card ids come from the generated map, with a default here so a panel whose
 # file predates it still starts. EnvironmentFile wins over Environment.
 Environment=WALL_AUDIO_ADAPTER_CARD=ICUSBAUDIO7D

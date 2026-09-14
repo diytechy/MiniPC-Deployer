@@ -142,8 +142,10 @@ indexes were already in use everywhere:
    node, reopening a fresh transport each attempt, because the CH340 is on the
    same hub and may still be re-probing when this service restarts. If it still
    cannot reach the relay the detector runs anyway with the safe-state proof
-   revoked — which blocks S3 exactly as before — and keeps commanding OFF on the
-   five-second actuator beat until one verifies. That path matters because the
+   revoked — which blocks S3 exactly as before — and keeps commanding OFF until
+   one verifies: once a second for the first fifteen seconds after the restart,
+   on the ordinary five-second actuator beat after that, so a relay that comes
+   back at seven seconds is commanded at seven rather than at eleven. That path matters because the
    relay can disappear BEFORE the sound card does, so the stop that `BindsTo`
    triggers may have no CH340 to command and the LCUS-2 latches physically on.
 

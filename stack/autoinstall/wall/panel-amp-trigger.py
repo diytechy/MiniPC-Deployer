@@ -183,6 +183,17 @@ JACK_CONTROL = "Front Headphone Jack"
 JACK_POLL_SECONDS = 5.0
 # Do not reopen a failing aplay or serial device on every 100 ms block.
 ACTUATOR_RETRY_SECONDS = 5.0
+# ...but five seconds is too slow for the first few, and terra found exactly why
+# (2026-09-13): after a port move this service restarts, and if the CH340 is
+# still missing when the startup wait gives up, the next attempt on a five
+# second beat lands at about eleven seconds -- outside the ten the acceptance
+# allows -- for a relay that was actually back at seven. So for a bounded spell
+# after start, retry once a second. Bounded, because a relay that is genuinely
+# absent must not be probed once a second for the life of the panel, and
+# restricted to the relay because respawning aplay that fast is a different and
+# worse thing to do.
+ACTUATOR_FAST_RETRY_SECONDS = 1.0
+ACTUATOR_FAST_RETRY_WINDOW = 15.0
 # How long a service START waits for the relay's device node before giving up.
 #
 # ITEM 25 (2026-09-13): this service is now stopped and restarted by the USB
@@ -800,6 +811,20 @@ def record_safe_state(verified):
         log("could not update amplifier safe-state proof: %s" % exc)
 
 
+def retry_beat(now, started_at, jack_actuator):
+    """How long to wait between actuator attempts, at this moment.
+
+    One second while the re-enumeration this service was restarted for could
+    still be settling, five afterwards. Pure, so the timing that the ten-second
+    acceptance depends on is testable without a relay.
+    """
+    if jack_actuator:
+        return ACTUATOR_RETRY_SECONDS
+    if now - started_at < ACTUATOR_FAST_RETRY_WINDOW:
+        return ACTUATOR_FAST_RETRY_SECONDS
+    return ACTUATOR_RETRY_SECONDS
+
+
 def ensure_off_bounded(actuator, wait_seconds=None, monotonic=time.monotonic,
                        sleep=time.sleep):
     """ensure_off(), retried until it succeeds or the bounded wait expires.
@@ -903,7 +928,8 @@ def main():
     last_actuator_attempt = -1e9
     last_off_attempt = -1e9
     jack = True
-    last_reassert = time.monotonic()
+    started_at = time.monotonic()
+    last_reassert = started_at
 
     log("watching %s" % ", ".join(pcm for pcm, _ in SOURCES))
     while not stopping.is_set():
@@ -935,7 +961,8 @@ def main():
         # is outside the ten seconds the acceptance allows. So the detector runs
         # regardless and keeps trying to reach the safe state on the actuator
         # retry beat for as long as the amplifier is supposed to be off.
-        if not on and not safe and now - last_off_attempt >= ACTUATOR_RETRY_SECONDS:
+        beat = retry_beat(now, started_at, jack_actuator)
+        if not on and not safe and now - last_off_attempt >= beat:
             last_off_attempt = now
             safe = stop_and_record(actuator) is not False
             if safe:
@@ -948,7 +975,7 @@ def main():
             if loud and jack:
                 above_since = above_since or now
                 if now - above_since >= ATTACK_SECONDS and now - changed_at >= MIN_OFF_SECONDS:
-                    if now - last_actuator_attempt >= ACTUATOR_RETRY_SECONDS:
+                    if now - last_actuator_attempt >= beat:
                         record_safe_state(False)
                         if actuator.start():
                             on = True
@@ -986,7 +1013,7 @@ def main():
                 on = False
                 changed_at = now
             elif (on and not actuator.maintain(now)
-                  and now - last_actuator_attempt >= ACTUATOR_RETRY_SECONDS):
+                  and now - last_actuator_attempt >= beat):
                 last_actuator_attempt = now
                 log("amplifier actuator stopped unexpectedly; restarting")
                 if not actuator.start():

@@ -189,3 +189,37 @@ def test_the_detector_backoff_recovers_inside_the_acceptance_window():
         total += backoff
         backoff = min(backoff * 2, 8.0)
     assert total < 10.0
+
+
+def test_the_first_attempts_after_a_restart_are_on_a_one_second_beat():
+    """terra's last open point: a relay back at 7 s must not wait until 11.
+
+    The startup wait gives up at six seconds. On the old five-second actuator
+    beat the next attempt landed at about eleven -- outside the acceptance --
+    for a relay that had been back for four seconds.
+    """
+    module = load_module()
+    started = 1000.0
+    assert module.retry_beat(started + 6.0, started, False) == 1.0
+    assert module.retry_beat(started + 7.0, started, False) == 1.0
+    # A relay absent for the whole window drops back to the slow beat rather
+    # than being probed once a second for the life of the panel.
+    assert module.retry_beat(started + 20.0, started,
+                             False) == module.ACTUATOR_RETRY_SECONDS
+    # The retired tone actuator keeps the slow beat throughout: respawning
+    # aplay once a second is a different and worse thing to do.
+    assert module.retry_beat(started + 6.0, started,
+                             True) == module.ACTUATOR_RETRY_SECONDS
+
+
+def test_the_whole_recovery_fits_the_ten_second_budget():
+    """Worst case in the acceptance: relay absent at start, back at 7 s."""
+    module = load_module()
+    gave_up_at = module.RELAY_WAIT_SECONDS
+    relay_back_at = 7.0
+    beat = module.retry_beat(gave_up_at, 0.0, False)
+    # Attempts at 6, 7, 8 ... so the first one after the node returns is 7.
+    first_after_return = gave_up_at
+    while first_after_return < relay_back_at:
+        first_after_return += beat
+    assert first_after_return + module.ATTACK_SECONDS < 10.0

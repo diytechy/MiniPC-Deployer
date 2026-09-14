@@ -642,8 +642,13 @@ def test_a_request_sequence_survives_a_broker_restart_sr028():
     request = import_panel_audio("switch_request")
     # A wall clock, so a process that restarts still produces a larger number.
     assert request.next_seq() > 0
-    assert request.next_seq(clock=lambda: 7) == 7
-    assert request.next_seq(clock=lambda: 8) > request.next_seq(clock=lambda: 7)
+    # The clock is read in nanoseconds and the sequence is MICROSECONDS: a
+    # nanosecond epoch is past JavaScript's safe-integer range, and the shell
+    # compares this number against the applier's mark with Number.isSafeInteger,
+    # so it would have silently skipped the comparison it depends on.
+    assert request.next_seq(clock=lambda: 7_000) == 7
+    assert request.next_seq(clock=lambda: 8_000) > request.next_seq(clock=lambda: 7_000)
+    assert request.next_seq() < 2 ** 53 - 1
     # And it is what the envelope accepts.
     request.envelope(request.next_seq(), {"kind": "nudge_volume", "louder": True})
 

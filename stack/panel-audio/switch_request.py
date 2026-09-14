@@ -25,6 +25,16 @@ import time
 DEFAULT_PATH = Path("/run/wall-audio-router/request.json")
 
 
+# The wall clock in MICROSECONDS. Nanoseconds were the first answer and they
+# were wrong in a way nothing on this side could see: a nanosecond epoch is
+# about 1.8e18, well past JavaScript's 2^53-1 safe integer, so the renderer --
+# which compares this number against the applier's high-water mark with
+# Number.isSafeInteger -- would have silently skipped the comparison it depends
+# on for confirming its own request. Microseconds stay safe past the year 2200
+# and are still finer than any rate a finger or a rocker can produce.
+SEQ_TICKS_PER_SECOND = 1_000_000
+
+
 def next_seq(clock=time.time_ns):
     """A sequence number that keeps increasing ACROSS A BROKER RESTART.
 
@@ -39,7 +49,12 @@ def next_seq(clock=time.time_ns):
     is bounded and loud rather than silent: the applier journals each refusal,
     and the next request after the step forward is accepted.
     """
-    return int(clock())
+    # Truncating division, so a clock that only moves forward can only produce
+    # a value that only moves forward. The caller is still responsible for
+    # keeping it above the applier's recorded mark (switch_backend._next_seq):
+    # two requests inside one microsecond, or a clock step backwards, would
+    # otherwise be discarded by the applier's deduplication in silence.
+    return int(clock()) // (1_000_000_000 // SEQ_TICKS_PER_SECOND)
 
 # The events the applier accepts from a request. `headset` is deliberately NOT
 # among them: adapter presence is the kernel's fact, reported by udev, and a

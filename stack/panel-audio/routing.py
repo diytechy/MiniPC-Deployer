@@ -16,7 +16,7 @@ ALIAS = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 MUTATING_METHODS = frozenset(
     {"discover", "cancel", "pair", "connect", "disconnect", "forget",
      "select_input", "select_output", "set_visualizer", "set_mute",
-     "set_output", "set_input_mute"}
+     "set_output", "set_input_mute", "set_volume"}
 )
 
 # THE TWO NAMES THAT LOOK ALIKE, AND ARE NOT (item 23 step 2). `select_output`
@@ -31,6 +31,14 @@ MUTATING_METHODS = frozenset(
 # stays accepted for one release so a panel running an older shell keeps its
 # mute button, and is removed with the chrome work (step 5).
 SWITCH_OUTPUTS = ("mute", "headset", "speaker")
+# The positions that carry a level. `mute` does not: there is nothing to set a
+# level on, and a remembered "mute volume" would be a second mute with no
+# control of its own (Owner ruling F, and wall_audio_state.LEVELLED_OUTPUTS).
+LEVELLED_OUTPUTS = ("headset", "speaker")
+# A PERCENTAGE, not the adapter's raw steps. The headset card has 38 of them and
+# the bus softvol 197, so a raw number would mean two different loudnesses on
+# the two outputs; the applier is the only thing that knows either scale.
+VOLUME_MIN, VOLUME_MAX = 0, 100
 METHODS = MUTATING_METHODS | {"status", "telemetry"}
 
 # SELF-RECONCILING MUTATIONS: journaled, but never sticky.
@@ -44,7 +52,8 @@ METHODS = MUTATING_METHODS | {"status", "telemetry"}
 #
 # So a pending entry for one of these is resolved by OBSERVING the device rather
 # than by trusting the journal or an operator. See AudioRouter._reconcile.
-SELF_RECONCILING_METHODS = frozenset({"set_mute", "set_output", "set_input_mute"})
+SELF_RECONCILING_METHODS = frozenset(
+    {"set_mute", "set_output", "set_input_mute", "set_volume"})
 HARDWARE_ADDRESS = re.compile(
     r"(?i)(?<![0-9a-f])(?:(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|"
     r"(?:[0-9a-f]{2}_){5}[0-9a-f]{2}|(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}|"
@@ -90,6 +99,7 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         "set_mute": {"muted"},
         "set_output": {"output"},
         "set_input_mute": {"muted"},
+        "set_volume": {"level", "output"},
     }[method]
     if set(params) - allowed:
         raise PolicyError("unknown parameter")
@@ -116,11 +126,58 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
     # shell that has already stopped the leg that was playing.
     if method == "set_output" and params.get("output") not in SWITCH_OUTPUTS:
         raise PolicyError("output must be one of %s" % ", ".join(SWITCH_OUTPUTS))
+    # A LEVEL IS A PERCENTAGE AND THE RANGE IS CLOSED HERE, not at the applier.
+    # The applier clamps, because a rocker held past the end is not an error;
+    # a broker request is different -- a client that asked for 5000 has a bug,
+    # and clamping it to 100 would hide the bug behind a room at full volume.
+    if method == "set_volume":
+        level = params.get("level")
+        if (isinstance(level, bool) or not isinstance(level, int) or
+                not VOLUME_MIN <= level <= VOLUME_MAX):
+            raise PolicyError("level must be an integer percentage in %d..%d"
+                              % (VOLUME_MIN, VOLUME_MAX))
+        # OPTIONAL, and it is a GUARD rather than a destination: the wire to the
+        # applier carries no output for a level, so naming one here means "apply
+        # this only if that is still the selected position". `mute` is refused
+        # because it has no level to set, so guarding on it could only ever
+        # refuse. Omitting it means "whatever is selected", which is what the
+        # rocker means.
+        if "output" in params and params["output"] not in LEVELLED_OUTPUTS:
+            raise PolicyError("volume output must be one of %s"
+                              % ", ".join(LEVELLED_OUTPUTS))
     if method == "pair" and "confirmation" in params:
         confirmation = params["confirmation"]
         if (not isinstance(confirmation, str) or not 1 <= len(confirmation) <= 16 or
                 HARDWARE_ADDRESS.search(confirmation)):
             raise PolicyError("pairing confirmation is invalid")
+
+
+# The verbs the panel's own switch is made of. They carry no alias, so none of
+# them can reach a Bluetooth device, and none of them is `select_output`.
+SWITCH_METHODS = frozenset({"set_output", "set_input_mute", "set_volume", "set_mute"})
+
+
+def switch_only_authorization(method: str, params: Mapping[str, object]) -> bool:
+    """Authorize the host switch and nothing else. Implements: SR-023, SR-028.
+
+    WHY THIS EXISTS AND WHY IT IS THIS NARROW. The broker's authorization
+    callback defaults to deny because the image has never decided how panel
+    authentication maps onto BLUETOOTH authority: pairing a phone, trusting it
+    and routing audio to it are decisions with a person and a policy behind
+    them, and guessing at that was the wrong risk to take (SR-023, README).
+
+    The switch is a different question with a different answer. It is the
+    physical control of the wall in front of whoever is standing at it: it names
+    no device, reaches no device, and does nothing a person at the glass could
+    not do with a knob. The socket is already peer-UID checked and 0660, so the
+    caller is the panel's own session. Denying it would mean shipping a switch
+    nobody can move, which is what the shell showed on the glass before this.
+
+    Everything else still defaults to deny, so WSN-024's routed-device backend
+    stays shut: `pair`, `connect`, `select_output` and the rest are refused here
+    before a backend can observe them at all.
+    """
+    return method in SWITCH_METHODS
 
 
 def validate_inventory_action(

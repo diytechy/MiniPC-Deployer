@@ -1830,3 +1830,63 @@ deliverable.
 and historical session logs. Operating rules, gate records, active
 requirements and runbooks were retained. See the shared current findings
 for deployment mismatch, provisioning gaps and all 17 Owner items.
+
+2026-09-14 (D-BACKEND, item 23 step 5): the broker's switch backend. The shell
+gained its upper-left microphone button and Mute/Headset/Speaker switch on the
+renderer side, but the shipped broker backend was still `UnavailableBackend`, so
+every tap on the glass was refused honestly and did nothing. `switch_backend.py`
+is now the shipped backend: it turns a validated `set_output`, `set_input_mute`,
+`set_volume` or the legacy `set_mute` into one sequenced request file that the
+root applier picks up, and it routes no device at all. `routing.validate_action`
+gained `set_volume` with a closed 0..100 percentage and an optional output guard,
+and the broker returns the sequence it minted so a client can correlate its own
+request exactly rather than by value.
+
+Four decisions worth reviewing, all recorded at the code. (1) The `seq` in the
+reply is OPT-IN, through an optional `echoSeq` request field, because the
+shipped renderer validates the action result as an exact key set and an
+unconditional extra key would have broken it in whichever order the two repos
+were deployed. (2) The minted sequence moved from nanoseconds to MICROSECONDS: a
+nanosecond epoch is past JavaScript's safe-integer range, and the renderer
+compares it against the applier's mark with `Number.isSafeInteger`, so the
+comparison it depends on would have been skipped in silence. It is also floored
+above the applier's recorded mark and any unconsumed request, so it increases
+across a restart, across two taps in one tick and across a clock stepped
+backwards. (3) Authorization ships allowing the switch verbs alone; every verb
+that names a device keeps its deny-by-default, so the routed-device backend
+stays shut. (4) A level applies to whichever output is selected when the applier
+runs, and the request wire names no output, so a caller that means a particular
+one sends `output` and the request is refused with `switch_moved` if the switch
+has already left it. The residual race, between that read and the applier's run,
+is stated at the code rather than papered over.
+
+
+2026-09-14 (D-BACKEND, terra rounds 1-5): eight findings, seven fixed and two
+rejected with their reasons recorded at the code and in tests. Fixed: an
+unreadable state file read as an empty one, so three mutation decisions were
+taken from `{}` and a backward clock could mint below the applier's mark while
+the backend answered accepted; `switch_moved` preserved across the backend seam
+by its token alone, so a backend could answer `set_output` or `status` with a
+sentence only ever true of a guarded `set_volume`; a sparse state file reported
+as an unsupported switch rather than normalized as the applier normalizes it,
+which drew an unknown switch and refused reconciliation on a panel whose switch
+works; LLR-015 naming `AudioRouter.*` for a class called `AudioBroker`; the
+completed-mutation journal outliving the volatile request file it acknowledged,
+so a restart in the moment before the applier ran left a journal saying the
+switch had moved and told the retry it had already succeeded; and a redo being
+refused by the generation ceiling it deliberately does not advance.
+
+REJECTED, with the reasons at the code. (1) That `_state_strict` accepts a
+valid but partial object: the applier reads the same file through a field-wise
+fallback, so an absent or damaged `request_seq` is -1 on both sides, and
+validating a stricter schema here than the applier validates would refuse
+requests on a panel whose switch works. A test now asserts the two readers
+agree rather than leaving it a coincidence. (2) That a second tap overwriting an
+unconsumed first request lets the landing check settle the first one: the
+request file is a one-slot mailbox holding the latest intent, and that is the
+design. The residue is real and is stated rather than papered over: replaying
+the superseded request's completed reply reports success for an intent that was
+overtaken. Both alternatives are worse (an exact match makes the redo rewrite
+the older command over the newer one; refusing while a request is unconsumed
+fails the second tap of a double-tap). Closing it properly needs a per-sequence
+queue in the APPLIER's protocol, which this work does not own. Owed follow-up.

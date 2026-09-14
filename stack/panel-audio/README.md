@@ -35,11 +35,20 @@ audio-in feature therefore needs a USB sound card, not a cable.
 Consequently:
 
 - `WALL_AUDIO_ENABLED=false` ships by default;
-- `audio_router.py` binds only a Unix socket and its shipped backend returns an
-  honest `probe-required` status while refusing mutations;
-- mutation requests require an injected authorization callback and default to
-  deny. The image has intentionally not guessed how panel authentication maps
-  onto that callback, so the shipped service cannot mutate devices;
+- `audio_router.py` binds only a Unix socket. Its shipped backend
+  (`switch_backend.py`, item 23 step 5) moves the panel's OWN Mute / Headset /
+  Speaker switch, the microphone button and the level, by writing one sequenced
+  request file that the root applier picks up through `wall-audio-apply.path`.
+  It routes no device at all: its inventory is empty, its status reports device
+  routing unavailable, and on a panel where the applier is not installed every
+  switch request is refused with `backend_unavailable`;
+- mutation requests require an injected authorization callback, and the shipped
+  one allows the SWITCH verbs only (`set_output`, `set_input_mute`,
+  `set_volume`, and the legacy `set_mute`). Those name no device and are the
+  physical control of the wall in front of whoever is standing at it. Every verb
+  that names a device still defaults to deny: the image has intentionally not
+  guessed how panel authentication maps onto BLUETOOTH authority, so the shipped
+  service cannot pair, connect, forget or route;
 - no WirePlumber profile, automatic capture selection or PipeWire package/session
   assumption is installed. **The Bluetooth FRONT DOOR is a separate thing and it
   does ship** (SR-025, 2026-09-12): the adapter's power/discoverable/pairable

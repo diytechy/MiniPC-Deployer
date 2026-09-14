@@ -1,7 +1,7 @@
 # Panel local-capability image contract
 
-Status: implemented in the isolated provisioning checkout; not deployed and not
-yet independently reviewed.
+Status: implemented and independently reviewed in the isolated provisioning
+checkout; not deployed.
 
 The wall image stages the hash-locked sensor wheelhouse and installs
 `wall-sensors.service` on first boot even when no gateway registration exists.

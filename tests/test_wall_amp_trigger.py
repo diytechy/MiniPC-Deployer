@@ -196,9 +196,15 @@ def test_no_shipped_configuration_still_names_the_tone():
     assert "WALL_AMP_ACTIVATOR=lcus-2" in amp_env
     assert "trigger_out" not in mode_script
     # firstboot accepts exactly one activator and names the retired one only to
-    # refuse it.
+    # refuse it -- and refusing it FAILS the provisioning run rather than
+    # warning past it, so a panel configured for the retired tone cannot come
+    # up wearing a green marker with an amplifier that will never switch on.
     assert "audio-jack|lcus-2)" not in firstboot
-    assert "_amp_activator=invalid" in firstboot
+    block = firstboot[firstboot.index("_amp_activator=${WALL_AMP_ACTIVATOR"):]
+    block = block[:block.index("esac")]
+    assert block.count("fail_step") == 2, block
+    assert "warn " not in block
+    assert block.count("_amp_activator=invalid") == 2
 
 
 def test_lcus2_backend_does_not_require_headphone_tools():

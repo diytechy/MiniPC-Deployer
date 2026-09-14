@@ -1,15 +1,14 @@
 # wall-amp-trigger.service — power the amplifier while audio is playing.
 #
-# Commands either the ALC255 tone/rectifier path or one LCUS-2 USB relay
-# channel whenever either audio source is above threshold. See
-# PANEL_AMP_AUTOPOWER.md in the HomeHub repo for the measurements, the circuit
-# and the calibration procedure.
+# Commands one LCUS-2 USB relay channel whenever either audio source is above
+# threshold. That relay is the ONLY actuator (ratified 2026-09-13); the ALC255
+# tone/rectifier path is retired and its code is gone. See
+# stack/panel-audio/README.md for the measurements and the calibration.
 #
-# It needs the audio group for the dsnoop segments it reads, and it must be able
-# to drive amixer on the built-in codec -- it asserts Master and Headphone at
-# 100% on every cycle rather than inheriting them from alsactl, because a silent
-# reset would halve the trigger voltage and the amplifier would simply stop
-# switching on with nothing in any log.
+# It needs the audio group for the dsnoop segments it reads. It no longer
+# touches the built-in codec's mixer at all: with no tone to keep at full scale
+# there is nothing on that card for it to assert, and the jack belongs to the
+# headset leg of the audio routing redesign (HomeHub item 23).
 
 [Unit]
 Description=Wall panel: hold the amplifier on while audio is playing

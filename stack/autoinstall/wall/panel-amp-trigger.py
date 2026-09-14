@@ -25,8 +25,8 @@ permanently. With DC stripped the floor is -83 dBFS, and that 50 dB window is
 where every threshold here lives.
 
 NO NEW DEPENDENCIES: the panel's installer is an offline, hash-locked
-wheelhouse, so capture and playback are done by driving arecord and aplay rather
-than importing a binding.
+wheelhouse, so capture is done by driving arecord rather than importing a
+binding, and the relay is driven over a plain POSIX serial file descriptor.
 
 Exit codes: 78 configuration unusable.
 """

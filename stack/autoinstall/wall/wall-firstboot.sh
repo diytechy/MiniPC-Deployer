@@ -824,10 +824,10 @@ if [ -f /etc/wall-panel/amp-trigger.env ]; then
     case "$_amp_activator" in
         lcus-2) ;;
         audio-jack)
-            warn "audio: WALL_AMP_ACTIVATOR=audio-jack was retired 2026-09-13 (the jack is now an audio output); the amplifier service will refuse to start"
+            fail_step "audio: WALL_AMP_ACTIVATOR=audio-jack was RETIRED 2026-09-13 and its code is gone. The built-in jack is an ordinary audio output now, held for the headset leg; nothing here will ever drive a tone into it again. wall-amp-trigger will exit 78 and the amplifier will never switch on. Set WALL_AMP_ACTIVATOR=lcus-2 in wall.env and re-run."
             _amp_activator=invalid ;;
         *)
-            warn "audio: WALL_AMP_ACTIVATOR must be exactly lcus-2; the amplifier service will refuse to start"
+            fail_step "audio: WALL_AMP_ACTIVATOR must be exactly lcus-2 (got '$_amp_activator'). wall-amp-trigger will exit 78 and the amplifier will never switch on. Set WALL_AMP_ACTIVATOR=lcus-2 in wall.env and re-run."
             _amp_activator=invalid ;;
     esac
     if grep -q '^WALL_AMP_ACTIVATOR=' /etc/wall-panel/amp-trigger.env 2>/dev/null; then

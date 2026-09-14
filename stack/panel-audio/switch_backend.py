@@ -58,6 +58,13 @@ DEFAULT_APPLIER_PATH = Path("/usr/local/sbin/wall-audio-output")
 # imports both and asserts they agree.
 OUTPUTS = ("mute", "headset", "speaker")
 LEVELLED_OUTPUTS = ("headset", "speaker")
+# The applier's own defaults (wall_audio_state.STATE_SCHEMA). They are here so
+# that a file this backend reads means exactly what the applier will make it
+# mean: a state with no `volume` key is a Speaker at 60%, not a Speaker at
+# silence, and reporting 0 would have drawn a switch the panel is not in.
+DEFAULT_OUTPUT = "speaker"
+DEFAULT_VOLUME = {"headset": 60, "speaker": 60}
+VOLUME_MIN, VOLUME_MAX = 0, 100
 # What an unmute from the legacy `set_mute` verb selects when the switch is
 # sitting in `mute`. Speaker rather than headset because speaker is audible
 # unconditionally: `headset` with the adapter absent silences every output
@@ -135,7 +142,7 @@ class SwitchApplierBackend:
         """
         intended = params.get("output")
         if intended is not None:
-            current = self._state_strict().get("output")
+            current = self._normalized()["output"]
             if current != intended:
                 raise _broker_error(
                     "switch_moved",
@@ -156,7 +163,7 @@ class SwitchApplierBackend:
         """
         if params["muted"] is True:
             return self._submit({"kind": "set_output", "output": "mute"})
-        if self._state_strict().get("output") != "mute":
+        if self._normalized()["output"] != "mute":
             # Accepted, and honestly seq-less: no request was minted, so there
             # is nothing for a client to correlate against.
             return {"accepted": True}
@@ -202,8 +209,7 @@ class SwitchApplierBackend:
         return max(switch_request.next_seq(self.clock), floor)
 
     def _applied_seq(self) -> int:
-        seq = self._state_strict().get("request_seq")
-        return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else -1
+        return max(self._normalized()["request_seq"], -1)
 
     def _pending_seq(self) -> int:
         """The sequence of a request the applier has not consumed yet.
@@ -278,17 +284,39 @@ class SwitchApplierBackend:
         The switch is reported in its own block, with `supported: true`, which is
         what lets the broker reconcile a lost `set_output`, `set_input_mute` or
         `set_volume` by observation rather than by an operator (LLR-015).
+
+        `supported` is FALSE only when the file cannot be READ (terra 3.1), not
+        when it is merely sparse. A readable file is normalized exactly as the
+        applier normalizes it, so a state with fields missing reports the
+        position the applier would act on -- reporting it unsupported would have
+        drawn an unknown switch and, worse, refused reconciliation on a panel
+        whose switch works and whose mutations this backend accepts.
         """
-        state = self._state()
-        output = state.get("output")
-        if output not in OUTPUTS:
-            output = "speaker"
-        input_muted = state.get("input_muted")
-        headset_present = bool(state.get("headset_present"))
-        volume = self._volume_of(state, output)
-        unavailable = output == "mute" or (output == "headset" and not headset_present)
-        reason = "headset_absent" if output == "headset" and not headset_present else None
-        readable = bool(state) and self.state_path.exists()
+        from audio_router import BrokerError
+        try:
+            state = self._normalized()
+        except BrokerError:
+            # ONLY the unreadable-file refusal is caught, and it is caught here
+            # rather than allowed out because `status` must always answer: the
+            # shell renders "unknown" and an error would leave the chrome with
+            # nothing at all to say.
+            state = None
+        if state is None:
+            return self._status_envelope({
+                "supported": False, "output": DEFAULT_OUTPUT, "inputMuted": False,
+                "available": False, "reason": "state_unreadable", "volume": 0,
+            }, muted=False, mute_supported=False)
+        output = state["output"]
+        unavailable = output == "mute" or (output == "headset" and not state["headset_present"])
+        reason = "headset_absent" if output == "headset" and not state["headset_present"] else None
+        return self._status_envelope({
+            "supported": True, "output": output, "inputMuted": state["input_muted"],
+            "available": not unavailable, "reason": reason,
+            "volume": self._volume_of(state, output),
+        }, muted=output == "mute", mute_supported=True)
+
+    @staticmethod
+    def _status_envelope(switch: dict, *, muted: bool, mute_supported: bool) -> dict:
         return {
             "protocolVersion": 1,
             "available": False,
@@ -298,27 +326,46 @@ class SwitchApplierBackend:
             "visualizer": {"available": False},
             # The legacy block, so a shell that predates the switch still reads
             # a truthful mute: `mute` IS the muted position of the switch.
-            "mute": {"supported": readable, "muted": output == "mute"},
-            "switch": {
-                "supported": readable,
-                "output": output,
-                "inputMuted": bool(input_muted),
-                "available": not unavailable,
-                "reason": reason,
-                "volume": volume,
-            },
+            "mute": {"supported": mute_supported, "muted": muted},
+            "switch": switch,
         }
+
+    def _normalized(self) -> dict:
+        """The state as the APPLIER will read it, or refuse if unreadable.
+
+        Mirrors `wall_audio_state.normalize` field by field, including its
+        defaults, because that module lives in the root applier's tree which
+        this sandbox cannot import. `test_the_backend_normalizes_like_the_applier`
+        imports both and asserts they agree on a table of damaged inputs, so the
+        two copies cannot drift in silence.
+        """
+        raw = self._state_strict()
+        state = {"output": DEFAULT_OUTPUT, "input_muted": False,
+                 "headset_present": False, "request_seq": -1,
+                 "volume": dict(DEFAULT_VOLUME)}
+        if raw.get("output") in OUTPUTS:
+            state["output"] = raw["output"]
+        for field in ("input_muted", "headset_present"):
+            if isinstance(raw.get(field), bool):
+                state[field] = raw[field]
+        seq = raw.get("request_seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
+            state["request_seq"] = seq
+        volume = raw.get("volume")
+        if isinstance(volume, dict):
+            for output in LEVELLED_OUTPUTS:
+                level = volume.get(output)
+                # bool is an int in Python and True would become 1%: refuse it.
+                if isinstance(level, int) and not isinstance(level, bool):
+                    state["volume"][output] = max(VOLUME_MIN, min(VOLUME_MAX, level))
+        return state
 
     @staticmethod
     def _volume_of(state: Mapping[str, object], output: str) -> int:
         """The remembered level of `output`; 0 in `mute`, which has no level."""
         if output not in LEVELLED_OUTPUTS:
             return 0
-        volume = state.get("volume")
-        level = volume.get(output) if isinstance(volume, dict) else None
-        if isinstance(level, bool) or not isinstance(level, int):
-            return 0
-        return max(0, min(100, level))
+        return state["volume"][output]
 
 
 def backend_from_environment():

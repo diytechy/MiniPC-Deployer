@@ -591,3 +591,49 @@ def test_the_unreadable_cases_really_are_unreadable(panel):
         with pytest.raises(BrokerError) as caught:
             backend(panel)._state_strict()
         assert caught.value.code == "backend_unavailable"
+
+
+# --- terra 3.1: a sparse state file means what the applier makes it mean -----
+
+@pytest.mark.parametrize("raw", [
+    {}, {"output": "speaker"}, {"output": "headset"}, {"output": "nonsense"},
+    {"volume": {"speaker": 5}}, {"volume": {"speaker": 500, "headset": -3}},
+    {"volume": {"speaker": True}}, {"volume": "loud"},
+    {"request_seq": -5}, {"request_seq": 12, "input_muted": "yes"},
+    {"input_muted": True, "headset_present": True},
+])
+def test_the_backend_normalizes_like_the_applier_llr013(panel, raw):
+    """The two copies of the field-wise fallback cannot drift in silence.
+
+    Reporting a sparse file as unsupported would have drawn an unknown switch on
+    a panel whose switch works, and refused reconciliation of a lost mutation
+    this same backend accepts (terra 3.1).
+    """
+    import wall_audio_state
+    panel["state"].write_text(json.dumps(raw), encoding="utf-8")
+    mine = backend(panel)._normalized()
+    theirs = wall_audio_state.normalize(raw)
+    # The applier also normalizes `version` and the auto-switch latch, which are
+    # its own business and which this backend neither reads nor reports. Every
+    # field the backend DOES carry must match.
+    assert set(mine) < set(theirs)
+    assert mine == {key: theirs[key] for key in mine}
+
+
+def test_a_sparse_state_file_reports_a_supported_switch_sr028(panel):
+    panel["state"].write_text("{}", encoding="utf-8")
+    result = reply(AudioBroker(backend(panel)), wire("status"))["result"]
+    assert result["switch"] == {"supported": True, "output": "speaker",
+                                "inputMuted": False, "available": True,
+                                "reason": None, "volume": 60}
+
+
+def test_a_lost_mutation_reconciles_on_a_sparse_state_file_llr015(panel, tmp_path):
+    panel["state"].write_text("{}", encoding="utf-8")
+    journal = tmp_path / "journal.json"
+    journal.write_text(json.dumps({
+        "version": 1, "generation": 0,
+        "pending": {"signature": "old", "method": "set_output"}, "completed": None,
+    }), encoding="utf-8")
+    broker = AudioBroker(backend(panel), state_path=str(journal))
+    assert reply(broker, wire("set_output", {"output": "mute"}))["ok"] is True

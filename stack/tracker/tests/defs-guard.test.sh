@@ -33,6 +33,8 @@
 #   D20 growth that cannot refresh the baseline stays YELLOW, never green
 #   D21 a sidecar inventory that does not belong to the baseline beside it is
 #       IGNORED - diffing against a stale one hides the removal in between
+#   D22 and it is VERIFIED, not trusted: a body that does not hash to the
+#       baseline's inv_hash is ignored however correct its own header looks
 #   D15 a corrupt baseline is yellow, never green
 #   D16 a state file that cannot be written escalates to RED - the durable
 #       verdict is the whole point, and a stale one reads as current
@@ -464,6 +466,60 @@ rc="$(guard --check)"
 if [ "$rc" != 0 ]; then pass "D21 a stale sidecar did not launder the removal (exit $rc)"; else fail "D21 exit=0 — a removal was auto-accepted as growth"; cat "$TMP/out.txt"; fi
 if ! grep -q 'baseline refreshed automatically' "$TMP/out.txt"; then pass "D21 and the baseline was not refreshed"; else fail "D21 the baseline was laundered against an inventory it does not belong to"; fi
 if state_of verdict | grep -qE 'INVENTORY does not|no inventory record'; then pass "D21 it reports the mismatch as HAVING no inventory, not as one"; else fail "D21 verdict: $(state_of verdict)"; fi
+
+echo
+echo "== D22: the sidecar is verified, not trusted =="
+# THE HEADER IS NOT THE EVIDENCE (adversarial review, second round). A sidecar
+# truncated, half-restored or hand-edited can carry the CURRENT baseline hash in
+# its header over a body that is missing an id — and that id can then be deleted
+# with the diff never seeing it, because it was never in the list being diffed.
+# So the body is re-hashed on every read.
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
+write_defs
+cat >"$DEFS/delta.md" <<'EOF'
+---
+category: Delta
+color_weight: 1.0
+items:
+  - id: five
+    title: Five
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Delta
+EOF
+guard --baseline >/dev/null
+rc="$(guard --check)"
+if [ "$rc" = 0 ]; then pass "D22 setup: green, with a sidecar this baseline really owns"; else fail "D22 setup exit=$rc"; fi
+# Forge it: drop `five` from the BODY, leave the header saying the baseline hash.
+grep -v 'user-one/five$' "$STATE/tracker-defs-baseline.inv" >"$TMP/forged.inv"
+mv "$TMP/forged.inv" "$STATE/tracker-defs-baseline.inv"
+if head -1 "$STATE/tracker-defs-baseline.inv" | grep -q "$(awk -F= '$1=="inv_hash"{print $2}' "$STATE/tracker-defs-baseline")"; then
+    pass "D22 the forged sidecar still claims the right baseline"
+else
+    fail "D22 the forgery did not keep the header, so this proves nothing"
+fi
+# Now do exactly what the forgery would hide: remove `five`, add `six`.
+rm -f "$DEFS/delta.md"
+cat >"$DEFS/epsilon.md" <<'EOF'
+---
+category: Epsilon
+color_weight: 1.0
+items:
+  - id: six
+    title: Six
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Epsilon
+EOF
+rc="$(guard --check)"
+if [ "$rc" != 0 ]; then pass "D22 a body that does not hash to the baseline is not evidence (exit $rc)"; else fail "D22 exit=0 — a removal was laundered behind a correct-looking header"; cat "$TMP/out.txt"; fi
+if ! grep -q 'baseline refreshed automatically' "$TMP/out.txt"; then pass "D22 and the baseline was not refreshed"; else fail "D22 the baseline was laundered"; fi
 
 echo
 echo "== D15: a corrupt baseline is yellow, never green =="

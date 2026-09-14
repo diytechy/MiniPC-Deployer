@@ -96,12 +96,16 @@ BASELINE_FILE="${TRACKER_DEFS_BASELINE_FILE:-$STATE_DIR/tracker-defs-baseline}"
 # back to the pre-ruling behaviour (growth = yellow, accepted by hand) rather
 # than guessing.
 #
-# IT CARRIES THE HASH IT BELONGS TO, on its first line, and a mismatch makes it
-# non-diffable. The two files are written separately and the second write can
-# fail, so "a sidecar exists" is not "this sidecar describes this baseline" —
-# and a STALE sidecar is worse than none: growth measured against an older
-# inventory reports ids that were added long ago as new, and can miss a removal
-# that happened in between. (Adversarial review, 2026-09-13.)
+# IT IS VERIFIED, NOT TRUSTED. The two files are written separately and the
+# second write can fail, so "a sidecar exists" is not "this sidecar describes
+# this baseline" — and a STALE sidecar is worse than none: growth measured
+# against an older inventory reports ids that were added long ago as new, and
+# can miss a removal that happened in between. So the body is re-hashed on every
+# read and must equal the baseline's own inv_hash. The `#inv_hash=` header it
+# carries is for the person reading the file; it is NOT what admits it, because
+# a truncated or hand-restored sidecar can carry a correct header over a body
+# that is missing an id — and that id could then be deleted without the diff
+# ever seeing it. (Adversarial review, 2026-09-13, both rounds.)
 BASELINE_INV_FILE="$BASELINE_FILE.inv"
 ENV_FILE="${TRACKER_DEFS_ENV_FILE:-/etc/homehub-backup/backup.env}"
 VOLUME="${TRACKER_DEFS_VOLUME:-tracker_data}"
@@ -346,11 +350,12 @@ INV_DIFFABLE=0; INV_ADDED=""; INV_REMOVED=""
 # while the sidecar write failed leaves an older inventory on disk, and diffing
 # against THAT reports stale additions and can swallow a removal entirely.
 _inv_owner=""
-if [ -f "$BASELINE_INV_FILE" ] && [ -s "$BASELINE_INV_FILE" ]; then
-    _inv_owner="$(head -1 "$BASELINE_INV_FILE" 2>/dev/null)"
-    _inv_owner="${_inv_owner#\#inv_hash=}"
+if [ -f "$BASELINE_INV_FILE" ] && [ -s "$BASELINE_INV_FILE" ] && [ -n "${B_HASH:-}" ]; then
+    # The BODY's hash, computed exactly as INV_HASH is, over exactly the bytes
+    # write_baseline_inventory wrote after the header.
+    _inv_owner="$(tail -n +2 "$BASELINE_INV_FILE" 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)"
 fi
-if [ -n "$_inv_owner" ] && [ -n "${B_HASH:-}" ] && [ "$_inv_owner" = "$B_HASH" ] && [ -n "$INV_HASH" ] && [ "$INV_HASH" != unavailable ]; then
+if [ -n "$_inv_owner" ] && [ "$_inv_owner" = "${B_HASH:-}" ] && [ -n "$INV_HASH" ] && [ "$INV_HASH" != unavailable ]; then
     _now_inv="$(mktemp 2>/dev/null)"
     _base_inv="$(mktemp 2>/dev/null)"
     if [ -n "$_now_inv" ] && [ -n "$_base_inv" ]; then

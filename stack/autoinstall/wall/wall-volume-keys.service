@@ -18,7 +18,8 @@
 Description=Wall panel: bind the side volume rocker to the amplifier output level
 Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
 After=sound.target
-Wants=sound.target
+Wants=sound.target wall-volume-request.socket
+After=wall-volume-request.socket
 
 [Service]
 Type=simple
@@ -44,8 +45,8 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 # The mixer is reached by running amixer, and key events arrive on evdev. This
-# service never opens a socket of any kind.
-RestrictAddressFamilies=
+# service requests only up/down through the restricted local helper.
+RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true

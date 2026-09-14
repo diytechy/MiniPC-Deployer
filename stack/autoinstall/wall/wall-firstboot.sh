@@ -934,7 +934,7 @@ fi
 
 # wall_audio_state.py is the applier's pure core and is imported from beside
 # it, so the two must land in the SAME directory or the switch cannot start.
-for _f in panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py wall-usb-hub-reset.py wall_audio_state.py wall-bt-mic.py; do
+for _f in panel-volume-request.py panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py wall-usb-hub-reset.py wall_audio_state.py wall-bt-mic.py; do
     if [ -f "$PAYLOAD/$_f" ]; then
         install -m 0755 "$PAYLOAD/$_f" "/usr/local/lib/wall-panel/$_f"
     else
@@ -983,7 +983,7 @@ if [ -x /usr/local/sbin/wall-audio-output ]; then
     fi
 fi
 
-for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service           wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service           wall-audio-apply.service wall-audio-apply.path           wall-mic-rear.service wall-bt-mic.service; do
+for _u in wall-volume-request.socket wall-volume-request@.service wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service           wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service           wall-audio-apply.service wall-audio-apply.path           wall-mic-rear.service wall-bt-mic.service; do
     [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
 done
 # The hub reset is a TEMPLATE started by udev, so it is never enabled and has no
@@ -1067,7 +1067,7 @@ esac
 
 case "${WALL_VOLUME_KEYS_ENABLED:-true}" in
     false|FALSE|no|0)
-        systemctl disable --now wall-volume-keys.service >/dev/null 2>&1 || true
+        systemctl disable --now wall-volume-keys.service wall-volume-request.socket >/dev/null 2>&1 || true
         log "audio: WALL_VOLUME_KEYS_ENABLED is false — the side rocker is inert" ;;
     *)
         enable_unit "wall-volume-keys.service enabled — the side rocker drives whichever output the current mode uses" wall-volume-keys.service ;;

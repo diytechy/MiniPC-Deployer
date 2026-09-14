@@ -605,9 +605,9 @@ def test_the_rocker_asks_the_switch_rather_than_a_card_in_bus_mode_ruling_f_sr02
     # Read rather than imported: the module asserts a Linux struct size at
     # import time, and this assertion is about what it DOES, not where it runs.
     keys = read(WALL / "panel-volume-keys.py")
-    assert "OUTPUT_SWITCH = \"/usr/local/sbin/wall-audio-output\"" in keys
+    assert 'VOLUME_SOCKET = "/run/wall-volume-request.sock"' in keys
     assert "def nudge_bus(louder):" in keys
-    assert 'if current_mode() == "bus" and nudge_bus(louder):' in keys
+    assert 'if current_mode() == "bus":\n        nudge_bus(louder)\n        return' in keys
     # The mute key is inert in bus mode until the switch has a previous-output
     # memory (step 5); a one-way mute from a key that cannot un-mute would
     # strand the panel silent for anyone not standing at it.

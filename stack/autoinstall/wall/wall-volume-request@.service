@@ -1,0 +1,18 @@
+[Unit]
+Description=Wall panel apply one bounded physical volume request
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-volume-request.py
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+RuntimeMaxSec=25
+TimeoutStopSec=2
+NoNewPrivileges=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true

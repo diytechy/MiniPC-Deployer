@@ -1,0 +1,16 @@
+# Only input-group clients can request the two physical rocker directions.
+[Unit]
+Description=Wall panel restricted volume rocker request socket
+
+[Socket]
+ListenStream=/run/wall-volume-request.sock
+SocketUser=root
+SocketGroup=input
+SocketMode=0660
+Accept=yes
+MaxConnections=4
+Backlog=8
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

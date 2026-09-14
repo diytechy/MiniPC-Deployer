@@ -392,7 +392,7 @@ class SwitchApplierBackend:
         """
         raw = self._state_strict()
         state = {"output": DEFAULT_OUTPUT, "input_muted": True,
-                 "headset_present": False, "request_seq": -1,
+                 "headset_present": False, "request_seq": -1, "volume_event_seq": 0,
                  "volume": dict(DEFAULT_VOLUME)}
         # Same rule as wall_audio_state.normalize (step 4, terra rounds 2-4):
         # the microphone is MUTED unless the document explicitly carries the
@@ -419,6 +419,11 @@ class SwitchApplierBackend:
         if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
             state["request_seq"] = seq
         elif "request_seq" in raw:
+            repaired = True
+        volume_event = raw.get("volume_event_seq", 0)
+        if isinstance(volume_event, int) and not isinstance(volume_event, bool) and 0 <= volume_event <= 9007199254740991:
+            state["volume_event_seq"] = volume_event
+        elif "volume_event_seq" in raw:
             repaired = True
         volume = raw.get("volume")
         if isinstance(volume, dict):

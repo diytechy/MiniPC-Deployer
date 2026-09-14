@@ -25,6 +25,7 @@ Exit codes: 69 no readable volume-key device, 77 not permitted to read one.
 import glob
 import os
 import select
+import socket
 import struct
 import subprocess
 import sys
@@ -189,34 +190,41 @@ def _read_volume(card, kcontrol):
     return values, maximum
 
 
-OUTPUT_SWITCH = "/usr/local/sbin/wall-audio-output"
+VOLUME_SOCKET = "/run/wall-volume-request.sock"
 
 
 def nudge_bus(louder):
-    """One rocker press in bus mode: the level of the merged bus (ruling F).
+    """Request one relative bus step through the fixed-direction root socket.
 
-    In bus mode the rocker stops being a card control. The level belongs to the
-    bus, it is remembered PER OUTPUT, and both of those facts live in the switch
-    state -- so the press is handed to the one process that owns that state
-    rather than reimplemented here against a mixer. wall-audio-output applies
-    the softvol afterwards; this daemon does not need to know it exists.
-
-    Returns True when the press was handed over, False to fall through to the
-    card-control path (a panel whose applier is not installed yet still has a
-    working rocker, which matters while the branch is half-deployed).
+    Return success only after the applier completes. A failure is journaled;
+    bus mode must never fall back to a physical mixer and disrupt its graph.
+    Implements: SR-028, LLR-014.
     """
     try:
-        subprocess.run([OUTPUT_SWITCH, "volume", "up" if louder else "down"],
-                       check=False, capture_output=True, text=True, timeout=5)
-        return True
-    except (OSError, subprocess.SubprocessError) as exc:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(24)
+            connection.connect(VOLUME_SOCKET)
+            connection.sendall(b"up\n" if louder else b"down\n")
+            connection.shutdown(socket.SHUT_WR)
+            answer = bytearray()
+            while len(answer) < 16:
+                part = connection.recv(16 - len(answer))
+                if not part:
+                    break
+                answer.extend(part)
+            if answer != b"ok\n":
+                print("bus volume apply refused or failed", file=sys.stderr, flush=True)
+                return False
+            return True
+    except OSError as exc:
         print("bus volume: %s" % exc, file=sys.stderr, flush=True)
         return False
 
 
 def nudge(louder):
     """Move the front pair only, on whichever card the current mode is using."""
-    if current_mode() == "bus" and nudge_bus(louder):
+    if current_mode() == "bus":
+        nudge_bus(louder)
         return
     card, control, kcontrol = target()
     state = _read_volume(card, kcontrol)

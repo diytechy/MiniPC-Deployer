@@ -72,6 +72,8 @@ STATE_SCHEMA = {
     # in /run because the applier must be able to answer "have I done this one"
     # before /run has been written even once.
     "request_seq": -1,
+    # Physical rocker readout event, including repeated presses at the bounds.
+    "volume_event_seq": 0,
     "version": STATE_VERSION,
 }
 
@@ -165,6 +167,11 @@ def normalize(raw):
     if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
         state["request_seq"] = seq
     elif "request_seq" in raw:
+        repaired = True
+    volume_event = raw.get("volume_event_seq", 0)
+    if isinstance(volume_event, int) and not isinstance(volume_event, bool) and 0 <= volume_event <= 9007199254740991:
+        state["volume_event_seq"] = volume_event
+    elif "volume_event_seq" in raw:
         repaired = True
     volume = raw.get("volume")
     if isinstance(volume, dict):
@@ -336,6 +343,7 @@ def _nudge_volume(state, event):
     louder = event.get("louder")
     if not isinstance(louder, bool):
         raise StateError("louder must be boolean")
+    state["volume_event_seq"] = (state["volume_event_seq"] + 1) % 9007199254740992
     step = VOLUME_STEP if louder else -VOLUME_STEP
     return _store_volume(state, clamp_volume(volume_of(state) + step))
 

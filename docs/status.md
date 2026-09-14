@@ -12,6 +12,18 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-14 — panel follow-up D/F source continuation (not deployed).**
+The volume rocker uses a narrow up/down-only socket helper to reach the root
+applier under its existing DynamicUser restrictions. Successful presses carry
+`volume_event_seq`, including at a volume limit. Firstboot carries/enables the
+helper payload. Independent terra medium review found normalization drift for
+invalid sequence values: canonical and backend normalization now both mark
+repair and force input mute. Cross-implementation regression cases cover
+negative, boolean and unsafe-integer counters. WSL targeted audio suite:
+366 passed. Active gate remains G1; no live deployment or gate advancement.
+The coordinator's final validation and hardware limitations are recorded in
+HomeHub `docs/PANEL_FOLLOWUP_2026-09-14.md`.
+
 **2026-09-13 — the AI-usage feeder is DEPLOYED.** The gauge-rail redesign's
 feeder half (`stack/ai-usage/ai_usage_feeder.py`, plus its README and timer)
 went to the hub during the tracker event-log cutover, in the required order:

@@ -657,6 +657,11 @@ def test_the_unreadable_cases_really_are_unreadable(panel):
     {"volume": {"speaker": True}}, {"volume": "loud"},
     {"request_seq": -5}, {"request_seq": 12, "input_muted": "yes"},
     {"input_muted": True, "headset_present": True},
+    # An invalid present readout sequence is a repair, so an otherwise explicit
+    # unmute must still fail safe. Keep this table shared with the applier.
+    {"input_muted": False, "volume_event_seq": -1},
+    {"input_muted": False, "volume_event_seq": True},
+    {"input_muted": False, "volume_event_seq": 9007199254740992},
 ])
 def test_the_backend_normalizes_like_the_applier_llr013(panel, raw):
     """The two copies of the field-wise fallback cannot drift in silence.

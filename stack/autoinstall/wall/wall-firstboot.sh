@@ -781,13 +781,25 @@ if [ -f "$PAYLOAD/90-wall-audio-adapter.rules" ]; then
     # re-plug or reboot and every BindsTo= would refuse to start.
     udevadm trigger --subsystem-match=sound >/dev/null 2>&1 || true
 fi
+# The hub's own recovery (item 25 addendum). Separate rule and separate unit
+# from the adapter's: this one keys on the HUB's VID:PID, fires on the hub
+# appearing rather than the adapter, and its action is a hardware reset of
+# everything downstream, so it is deliberately not folded into the rule above.
+if [ -f "$PAYLOAD/91-wall-usb-hub-reset.rules" ]; then
+    install -m 0644 "$PAYLOAD/91-wall-usb-hub-reset.rules"         /etc/udev/rules.d/91-wall-usb-hub-reset.rules
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    # No trigger here, unlike the adapter rule above. That one needed one
+    # because a BindsTo= cannot start without its alias; this one only wants to
+    # run on a FUTURE add, and triggering it now would start a reset watch
+    # against a hub that is working.
+fi
 if [ -f "$PAYLOAD/99-wall-amp-lcus2.rules" ]; then
     install -m 0644 "$PAYLOAD/99-wall-amp-lcus2.rules" /etc/udev/rules.d/99-wall-amp-lcus2.rules
     udevadm control --reload-rules >/dev/null 2>&1 || true
     udevadm trigger --subsystem-match=tty >/dev/null 2>&1 || true
 fi
 
-for _f in panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py; do
+for _f in panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py wall-usb-hub-reset.py; do
     if [ -f "$PAYLOAD/$_f" ]; then
         install -m 0755 "$PAYLOAD/$_f" "/usr/local/lib/wall-panel/$_f"
     else
@@ -803,9 +815,16 @@ fi
 
 [ -f "$PAYLOAD/wall-audio-mode" ] && install -m 0755 "$PAYLOAD/wall-audio-mode" /usr/local/sbin/wall-audio-mode
 
-for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service; do
+for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service; do
     [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
 done
+# The hub reset is a TEMPLATE started by udev, so it is never enabled and has no
+# [Install]. An installed rule with no unit behind it would be a silent no-op,
+# which is the one failure mode worth a line of its own.
+if [ -f /etc/udev/rules.d/91-wall-usb-hub-reset.rules ] &&
+   [ ! -f /etc/systemd/system/wall-usb-hub-reset@.service ]; then
+    warn "audio: 91-wall-usb-hub-reset.rules is installed but wall-usb-hub-reset@.service is not. A hub that enumerates with no ports will NOT be reset and the panel's audio will stay dead until someone toggles authorized by hand."
+fi
 systemctl daemon-reload >/dev/null 2>&1 || true
 
 # The trigger daemon's on/off and actuator knobs are rendered into its own env file rather

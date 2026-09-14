@@ -106,6 +106,7 @@ audio path is not here — it is a set of units and ALSA configuration under
 | `wall-volume-keys.service`, `panel-volume-keys.py` | the side rocker |
 | `wall-audio-mode` | switches output modes |
 | `90-wall-audio-adapter.rules` | gives the USB adapter a port-independent systemd alias and starts the three units on it |
+| `91-wall-usb-hub-reset.rules`, `wall-usb-hub-reset@.service`, `wall-usb-hub-reset.py` | bounded re-enumeration of the amplifier-side hub when it comes back with no downstream ports |
 | `wall-alsaloop-guard.py` | runs alsaloop with a bounded recover loop so a wedge becomes a restart |
 
 ### Surviving a USB re-enumeration (Owner item 25, 2026-09-13)
@@ -149,6 +150,44 @@ indexes were already in use everywhere:
    relay can disappear BEFORE the sound card does, so the stop that `BindsTo`
    triggers may have no CH340 to command and the LCUS-2 latches physically on.
 
+4. **The hub itself can be the thing that fails** (addendum, 21:52 the same
+   evening). On the Owner's second move the 4-port Atmel hub answered on the
+   bus and none of its downstream ports did —
+   `hub 1-2:1.0: hub_ext_port_status failed (err = -71)` — so the adapter and
+   the CH340 were both absent, the three units stopped exactly as designed, and
+   there was nothing for 1–3 above to recover onto. Everything in this section
+   depends on the hub cooperating, and that time it did not. A software
+   re-enumeration (`authorized` 0 then 1 on the hub) brought both back and the
+   units restarted themselves.
+
+   `91-wall-usb-hub-reset.rules` and `wall-usb-hub-reset@.service` now do that
+   automatically, and the bound matters as much as the recovery, because
+   toggling `authorized` is a hardware reset of everything below the hub —
+   including the LATCHING amplifier relay. So:
+
+   * it is a **oneshot started by a udev add event on the hub**, not a daemon
+     and not a timer, so there is no continuous authority to reset anything;
+   * it acts only when **both** conditions hold: `dev-wall_audio_adapter.device`
+     is still inactive after 15 s, *and* the hub has **no children at all**. A
+     hub with the relay attached but no adapter is a working hub and an absent
+     adapter — unplugging the adapter on purpose must not reset the relay;
+   * it toggles at most **twice per hub**, and a `/run` record caps it at twice
+     per ten minutes even if re-authorizing produces more udev events. After
+     that it logs a give-up and stops, because a hub that needs a third reset
+     needs a person;
+   * every decision is journalled under `wall-usb-hub-reset@<bus id>`, including
+     the ones where it decided to do nothing;
+   * `Restart=no`, and no `[Install]`: it is only ever started by the rule;
+   * it **fails closed** on both of its own dependencies. If `systemctl` cannot
+     be asked whether the adapter is active, that is not evidence the adapter
+     is absent and nothing is reset; if the `/run` record that bounds the
+     toggles cannot be written, nothing is reset either, because that file is
+     the only bound that survives the process.
+
+   The 15 s wait is sized off the acceptance below — ten seconds is the whole
+   budget when the hub cooperates, so intervening sooner would race a recovery
+   that was already working.
+
 A panel-mode replug does start `wall-amp-trigger`, because `SYSTEMD_WANTS`
 ignores enablement. That is the safe direction and is left alone: the daemon
 commands and verifies the relay OFF before it idles.
@@ -166,6 +205,34 @@ must show each of the three units stopping once and starting once — one cycle,
 not a restart loop — and `wall-amp-trigger` logging `amplifier ON` again. A
 `journalctl | grep 'unable to prepare slave'` that keeps growing after the move
 is the original defect, not this fix working slowly.
+
+**Acceptance for the hub reset (the addendum).** The fault is not reproducible
+on demand — it is a hub that comes back empty — so acceptance is in two parts.
+
+*Whenever it fires for real:*
+
+```sh
+journalctl -u 'wall-usb-hub-reset@*' --since -10min
+```
+
+must show exactly one `Toggling authorized (attempt 1 of 2)` line naming the bus
+id, followed by the three audio units cycling and the amplifier coming on. Two
+toggles and a give-up line is the hub failing, not this failing.
+
+*Provable at any time, without breaking anything:*
+
+```sh
+# the rule is loaded and matches the hub
+udevadm test "/sys/bus/usb/devices/$(lsusb -d 03eb:0902 >/dev/null &&     grep -l 03eb /sys/bus/usb/devices/*/idVendor | head -1 |     xargs dirname | xargs basename)" 2>&1 | grep -i systemd_wants
+# the healthy path: the adapter is present, so this exits at once, touching
+# nothing, and says so
+sudo /usr/local/lib/wall-panel/wall-usb-hub-reset.py <bus id> --wait 2
+systemctl cat 'wall-usb-hub-reset@.service' | grep -E 'Type|Restart'
+```
+
+The dry run above is safe **because** the adapter is present: the script asks
+systemd first and returns before it looks at `authorized` at all. Running it
+with the adapter genuinely absent will reset the hub, which is the point.
 
 The measurement record behind all of it, including the trigger circuit that is
 still to be built, is `PANEL_AMP_AUTOPOWER.md` in the HomeHub repo.

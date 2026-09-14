@@ -1,0 +1,39 @@
+# wall-usb-hub-reset@.service — one bounded re-enumeration of one USB hub.
+#
+# Started by 91-wall-usb-hub-reset.rules on a udev add event for the Atmel
+# 03eb:0902 hub; %i is the hub's sysfs bus id (1-2, 1-2.4, ...). See
+# wall-usb-hub-reset.py for the measured fault and why this is a oneshot rather
+# than a daemon.
+#
+# THE INSTANCE NAME IS THE POINT. One unit per hub means two hubs cannot share a
+# state file or a timeout, and systemd will not start a second copy for a bus id
+# whose first copy is still running -- which is the cheapest possible bound on
+# "never loops", ahead of the script's own counter and its /run cooling window.
+
+[Unit]
+Description=Wall panel: re-enumerate USB hub %i if it came back with no ports
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+# Ordered after the adapter's device unit so that in the ordinary case -- the
+# hub coming back WITH its children -- the thing this waits for is already on
+# its way rather than being raced.
+After=dev-wall_audio_adapter.device systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/wall-panel/wall-usb-hub-reset.py %i
+# Two waits, one toggle settle, and slack. A hung systemctl or a sysfs write
+# that blocks must not leave this running forever: the point of a oneshot here
+# is that it cannot outlive its own work.
+TimeoutStartSec=90
+# NO Restart=. A failed reset is a fact to look at, not a thing to try again on
+# a timer -- retrying is precisely how a hardware reset of the amplifier's relay
+# becomes a loop. The script's own bound is at most two toggles per hub inside a
+# ten-minute window, and this makes systemd agree with it.
+Restart=no
+# It writes one sysfs attribute and one file in /run. Nothing else.
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+RuntimeDirectory=wall-usb-hub-reset
+RuntimeDirectoryPreserve=yes

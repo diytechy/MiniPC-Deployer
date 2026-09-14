@@ -706,9 +706,11 @@ fi
 # jack is a plain, currently unused output held for the headset leg (HomeHub
 # item 23). The full measurement record is in stack/panel-audio/README.md.
 #
-# WALL_AUDIO_MODE picks the initial output chain:
+# WALL_AUDIO_MODE picks the output chain, and this script RE-ASSERTS it on
+# every boot rather than only seeding it:
 #   trigger  audio out the adapter, amplifier commanded over the LCUS-2 relay
 #   panel    everything out the panel's own speaker, amplifier not commanded
+#   bus      one merged stereo bus behind the Mute/Headset/Speaker switch
 install -d -m 0755 /etc/wall-panel
 
 # The card map: the one place ALSA card ids appear. Everything else refers to
@@ -909,7 +911,7 @@ if [ -x /usr/local/sbin/wall-audio-output ]; then
     fi
 fi
 
-for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service           wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service \n          wall-audio-apply.service wall-audio-apply.path; do
+for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service           wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service           wall-audio-apply.service wall-audio-apply.path; do
     [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
 done
 # The hub reset is a TEMPLATE started by udev, so it is never enabled and has no

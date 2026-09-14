@@ -395,3 +395,46 @@ def test_image_contract_is_disabled_local_and_carries_no_broad_dbus_policy_sr023
     materialized = firstboot[firstboot.index("_wall_audio_env_new="):enabled_branch]
     assert materialized.count("WALL_AUDIO_ENABLED") == 2
     assert materialized.count("WALL_AUDIO_SOCKET") == 1
+
+
+def test_firstboot_payload_files_are_all_tracked_and_shipped():
+    """Every file wall-firstboot.sh installs from $PAYLOAD must be in the image.
+
+    The panel's payload dir is `git archive HEAD` of this repo (vmtest/lib/
+    common.sh copy_repo_into_payload), so a file that is untracked, or renamed
+    without the firstboot reference following it, ships as an absent payload
+    entry. Both install loops guard with `[ -f ]`, so the failure is SILENT:
+    the unit or helper simply never lands. Measured 2026-09-14 on the live
+    panel, whose payload dir predates the amplifier and hub-reset work and is
+    therefore missing 91-wall-usb-hub-reset.rules, wall-usb-hub-reset@.service,
+    wall-amp-trigger.service and wall-line-in.service among others -- firstboot
+    skipped every one of them without a word.
+    """
+    import re
+
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    tracked = set(subprocess.run(
+        ["git", "ls-files", "stack/autoinstall/wall"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout.split())
+
+    refs = set()
+    for match in re.finditer(r"\$PAYLOAD/([A-Za-z0-9@._+-]+)", firstboot):
+        refs.add(match.group(1))
+    # The two bulk install loops name their files as bare words, not as
+    # $PAYLOAD/... expansions, so the regex above cannot see them.
+    for match in re.finditer(r"for _[fu] in ([^;]+); do", firstboot):
+        refs.update(match.group(1).split())
+    refs.discard("..")
+
+    missing = sorted(r for r in refs if "stack/autoinstall/wall/" + r not in tracked)
+    assert not missing, (
+        "wall-firstboot.sh installs these from $PAYLOAD but they are not tracked "
+        "under stack/autoinstall/wall/, so the image will not carry them and "
+        "firstboot will skip them in silence: %s" % missing
+    )
+    # A spot check that the regex is actually finding things, so a future
+    # refactor of firstboot cannot turn this into a test of nothing.
+    assert {"wall-alsaloop-guard.py", "wall_audio_state.py",
+            "wall-amp-trigger.service", "wall-usb-hub-reset@.service",
+            "wall-audio-apply.path"} <= refs

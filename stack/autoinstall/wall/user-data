@@ -592,6 +592,10 @@ autoinstall:
     # unprivileged account and enables/starts it only after wall.env and the
     # packaged application broker both exist.
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-door-stream.service /target/etc/systemd/system/wall-door-stream.service
+    # wall-panel-telemetry — item S. Read-only DynamicUser collector; unit is
+    # installed here, firstboot enables/starts it (WALL_TELEMETRY_ENABLED,
+    # default true).
+    - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-panel-telemetry.service /target/etc/systemd/system/wall-panel-telemetry.service
     # wall-audio-router — SR-023. Files are carried offline; firstboot leaves the
     # unit stopped by default and no D-Bus policy is installed before probing.
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-audio-router.service /target/etc/systemd/system/wall-audio-router.service

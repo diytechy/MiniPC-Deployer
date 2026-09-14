@@ -36,6 +36,8 @@
 #      only its allowlisted values into root-only /run files; systemd copies
 #      those into the broker's RAM-backed credential mount. No second persistent
 #      secret file exists and the broker never receives unrelated wall secrets.
+#  8e. Item S — enable the read-only DynamicUser thermal/CPU/presentation-mode
+#      telemetry collector (WALL_TELEMETRY_ENABLED, default true).
 #   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
@@ -1689,6 +1691,33 @@ fi
 # Touch fault filter is opt-in; OFF also restores the raw-input recovery path.
 if ! WALL_ENV_FILE="$ENV_FILE" bash "$PAYLOAD/configure-touch-filter.sh"; then
     fail_step "Touch filter configuration failed; inspect wall-touch-filter.service."
+fi
+
+# ── 8e. Item S — bounded thermal/CPU/presentation-mode telemetry collector ──
+# Read-only sensor sampling plus one small writable state dir under
+# DynamicUser; never touches input, audio or the renderer. On by default
+# (WALL_TELEMETRY_ENABLED, default true) because it is strictly read-only
+# evidence-gathering, unlike the audio broker which changes what the panel
+# does; set to false to disable entirely.
+: "${WALL_TELEMETRY_ENABLED:=true}"
+if [ "$WALL_TELEMETRY_ENABLED" != true ] && [ "$WALL_TELEMETRY_ENABLED" != false ]; then
+    fail_step "WALL_TELEMETRY_ENABLED must be exactly true or false"
+    WALL_TELEMETRY_ENABLED=false
+fi
+if [ ! -f "$PAYLOAD/panel-telemetry.py" ] || [ ! -f "$PAYLOAD/panel_telemetry_core.py" ] \
+        || [ ! -f /etc/systemd/system/wall-panel-telemetry.service ]; then
+    if [ "$WALL_TELEMETRY_ENABLED" = true ]; then
+        fail_step "Panel telemetry payload is incomplete: missing panel-telemetry.py, panel_telemetry_core.py or wall-panel-telemetry.service"
+    fi
+    WALL_TELEMETRY_ENABLED=false
+fi
+if [ "$WALL_TELEMETRY_ENABLED" = true ]; then
+    if enable_unit_now "SN-S: panel telemetry collector enabled (5s presentation poll, 5s full sample)" wall-panel-telemetry.service; then
+        :
+    fi
+else
+    systemctl disable --now wall-panel-telemetry.service >/dev/null 2>&1 || true
+    log "SN-S: panel telemetry collector disabled"
 fi
 
 # ── 9. done — but only if it IS done ─────────────────────────────────────────

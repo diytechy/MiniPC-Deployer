@@ -1,0 +1,61 @@
+# Item S: bounded thermal/CPU/presentation-mode collector. Read-only sensor
+# sampling plus a small writable state dir -- no input, audio or render
+# access, and it must never be able to affect any of those even if it goes
+# wrong.
+[Unit]
+Description=Office wall panel telemetry collector (item S)
+Documentation=file:///opt/wall-panel/docs/design/panel-telemetry-2026-09-14.md
+After=local-fs.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=wall-panel-telemetry
+StateDirectoryMode=0750
+Environment=PANEL_TELEMETRY_STATE_DIR=/var/lib/wall-panel-telemetry
+Environment=PANEL_TELEMETRY_PRESENTATION_PATH=/run/wall-panel/presentation-snapshot.json
+ExecStart=/usr/bin/python3 /opt/wall-panel/stack/autoinstall/wall/panel-telemetry.py --state-dir /var/lib/wall-panel-telemetry run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+KillMode=mixed
+CPUAccounting=true
+CPUQuota=20%
+MemoryAccounting=true
+MemoryMax=128M
+TasksMax=16
+OOMPolicy=stop
+
+# Read-only sensor access plus the one writable state dir StateDirectory=
+# already grants under /var/lib. No devices, no home, no kernel control, no
+# network at all -- this unit reads sysfs/procfs and one snapshot file, and
+# writes nothing else.
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+# ProtectProc is deliberately left at its default (visible), NOT "invisible":
+# this unit reads /proc/<pid>/comm|stat|statm for the kiosk's cage/electron
+# processes, which run as a different (non-Dynamic) user. "invisible" would
+# hide them and silently zero out the kiosk CPU/RSS fields.
+RestrictAddressFamilies=none
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# ReadOnlyPaths already covers /sys and /proc via ProtectSystem=strict's
+# defaults except for the explicit ReadWritePaths below (none needed: sensor
+# reads and StateDirectory cover everything this unit touches).
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wall-panel-telemetry
+
+[Install]
+WantedBy=multi-user.target

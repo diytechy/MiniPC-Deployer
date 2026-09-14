@@ -777,8 +777,13 @@ with nothing in the room to hear it.
 
 So the mute is now held by three things that do not depend on each other:
 
-1. **The apply stops the legs**, and a mic leg that will **not** stop now counts
-   as a failed apply and says so. (Failing to *start* one still does not: that
+1. **The apply stops the legs**, and a mic leg that will not stop is asked
+   again, **SIGKILLed**, and asked again; one that survives all of that is a
+   failed apply with a journal line saying the microphone may still be live.
+   Counting the failure and stepping over it was not enough: the state is saved
+   before the apply, the rear leg has no runtime recheck of its own, and an
+   already-open `alsaloop` goes on sending the room to the desktop. The mode
+   switch escalates the same way and **refuses to change mode** if it cannot. (Failing to *start* one still does not: that
    apply runs under a unit firstboot waits on. The asymmetry is the point.)
 2. **Both units carry `ExecCondition=wall-audio-output mic-allowed`**, which is
    re-run on every start attempt including a restart, takes no lock (so it
@@ -791,7 +796,27 @@ All three ask the **same** function, and both gates answer identically for a
 missing state file (refuse), because two gates on one privacy control that can
 disagree are worse than either answer alone.
 
-**And a damaged state file now comes back muted.** `normalize` still repairs
+**And the stored state cannot be turned into consent.** Four review rounds each
+found a different way round the previous round's rule, so the rule is now the
+simplest one that has no seam in it: **the microphone is muted unless the state
+document explicitly carries the boolean `false`.** Not "unless it says true",
+and not "unless a field needed repair" - both of those treated an ABSENT field
+as consent, and a truncated write is indistinguishable from a fresh file. `{}`,
+`{"output": "speaker"}`, `[]` and an unparseable file all come back muted. A
+document that needed any other repair comes back muted too, which catches a file
+that says `false` while being damaged elsewhere.
+
+The one exception is a state file that has **never existed**, which stays
+unmuted: there is no prior mute to lose, and a fresh image whose microphone
+needed a button press that the chrome does not have yet (step 5) would be the
+worse failure. A file that exists and cannot be READ is different in kind and is
+muted, because the applier persists what it loaded before it applies it - so the
+unmuted default was being rewritten into a valid, unmuted document that the
+units' own gate then believed.
+
+The cost of all of this is one button press after a state file is damaged.
+
+**A damaged state file comes back muted.** `normalize` still repairs
 field by field, but any document that needed a repair returns `input_muted:
 True`. Every other field's default is harmless to land on; `input_muted`'s is
 not, and the first round's argument - that the applier and the supervisor

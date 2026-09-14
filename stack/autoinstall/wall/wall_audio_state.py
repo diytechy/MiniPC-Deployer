@@ -95,13 +95,21 @@ def normalize(raw):
     whole file being discarded. The shell journals when it had to replace
     something; nothing here guesses silently.
 
-    ONE FIELD IS NOT LIKE THE OTHERS. Landing on the default for `output`, the
-    volume or the latch is harmless. Landing on the default for `input_muted` --
-    False -- means a damaged file has turned a privacy control from muted to
-    live, with nothing in the room to hear it happen. So a document that needed
-    any repair at all comes back MUTED, and a document that is not a document
-    comes back muted too. A key that is simply ABSENT is not damage: that is a
-    file written before the field existed, and it takes the schema default.
+    ONE FIELD IS NOT LIKE THE OTHERS, AND IT HAS ITS OWN RULE. Landing on the
+    default for `output`, the volume or the latch is harmless. Landing on the
+    default for `input_muted` -- False -- means a damaged or truncated file has
+    turned a privacy control from muted to live, with nothing in the room to
+    hear it happen.
+
+    So: **the microphone is muted unless this document explicitly carries the
+    boolean `false`.** An absent key is NOT treated as a fresh file taking the
+    schema default, because a truncated write is indistinguishable from one; the
+    earlier version of this rule made that mistake and review found it. A
+    document that needed any OTHER repair comes back muted too, which is what
+    catches a file that says `false` while being damaged elsewhere.
+
+    The cost is one button press after a state file is damaged. The alternative
+    is a microphone opened by a partial write.
 
     Inputs:  raw: whatever json.load returned (any type)
     Outputs: a dict satisfying STATE_SCHEMA's shape
@@ -110,7 +118,7 @@ def normalize(raw):
     state = default_state()
     if not isinstance(raw, dict):
         # Not even a document. Fall back to the whole default EXCEPT the one
-        # field whose default is not the safe answer: see `repaired` below.
+        # field whose default is not the safe answer: see the rule below.
         state["input_muted"] = True
         return state
     # WHETHER ANYTHING HAD TO BE REPLACED, AND WHY THAT DECIDES THE MICROPHONE.
@@ -131,9 +139,19 @@ def normalize(raw):
         state["output"] = raw["output"]
     elif "output" in raw:
         repaired = True
+    # THE ONE RULE, AFTER FOUR REVIEW ROUNDS FOUND FOUR WAYS ROUND THE LAST
+    # ONE: the microphone is MUTED unless this document explicitly says the
+    # boolean false. Not "unless it says true"; not "unless a field was
+    # repaired" -- both of those left holes, because a TRUNCATED write and an
+    # unreadable file are indistinguishable from a fresh one if absence is
+    # treated as consent. `{}` and `{"output": "speaker"}` are now muted.
+    #
+    # Round 3's rule (any repair mutes) is kept as well: it is what catches a
+    # document that says `false` while being damaged elsewhere.
+    state["input_muted"] = True
     if isinstance(raw.get("input_muted"), bool):
         state["input_muted"] = raw["input_muted"]
-    elif "input_muted" in raw:
+    else:
         repaired = True
     if isinstance(raw.get("headset_present"), bool):
         state["headset_present"] = raw["headset_present"]

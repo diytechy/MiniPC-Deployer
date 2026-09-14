@@ -547,6 +547,21 @@ def write_atomic(path, text, mode=0o644, dry_run=False):
     os.replace(temporary, path)
 
 
+def _muted_default():
+    """The default state, with the microphone MUTED.
+
+    What an unreadable or unparseable state file falls back to. `default_state()`
+    is Speaker and UNMUTED, which is right for a panel that has never been
+    configured and wrong for one whose state file we just failed to read: the
+    applier PERSISTS what it loaded before it applies it, so an unreadable file
+    was being rewritten as a valid, unmuted one and the units' own gate then saw
+    consent that nobody gave (terra, round 4).
+    """
+    state = policy.default_state()
+    state["input_muted"] = True
+    return state
+
+
 def load_state(path=STATE_FILE):
     """The stored state, normalized. A missing or unreadable file is the default.
 
@@ -557,9 +572,19 @@ def load_state(path=STATE_FILE):
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
+        # A panel that has never been configured. There is no prior mute to
+        # lose, so this is the ONE fallback that stays unmuted; a fresh image
+        # whose microphone needed a button press nobody has a button for yet
+        # (the chrome is step 5) would be a worse failure than the one below.
         return policy.default_state(), "no state file yet; defaults applied"
     except (OSError, ValueError) as exc:
-        return policy.default_state(), "state file unusable (%s); defaults applied" % exc
+        # A file that EXISTS and cannot be read is different in kind: it may
+        # have said `input_muted: true` a moment ago, and the applier PERSISTS
+        # what it loaded before it applies it -- so returning the unmuted
+        # default here rewrote an unreadable file into valid, unmuted consent
+        # that nobody gave, and the units' own gate then saw it (terra, round 4).
+        return _muted_default(), ("state file unusable (%s); defaults applied "
+                                  "with the MICROPHONE MUTED" % exc)
     state = policy.normalize(raw)
     # What was ACTUALLY replaced, field by field: the loaded document against
     # the normalized one. The previous spelling compared the normalized state
@@ -1185,6 +1210,38 @@ def select_mic_source(applier, source):
     return previous is not None and previous != source
 
 
+def stop_mic_leg_hard(applier, unit):
+    """Stop a mic leg, and make sure it is actually gone. True if it is.
+
+    A STOP THAT FAILED USED TO BE COUNTED AND STEPPED OVER, and for a microphone
+    that is not enough: the state is saved before the apply, `wall-mic-rear` has
+    no runtime state recheck of its own, and an already-open `alsaloop` goes on
+    sending the room to the desktop's input while the stored state says muted.
+    Nobody in the room can hear that happen. (terra, round 4; `wall-audio-mode`
+    already escalated this way and `input-mute` did not.)
+
+    So: stop, ask, SIGKILL, ask again. The ExecCondition gate stops it coming
+    back. A leg that survives all of that is a failed apply with a journal line
+    that says the microphone may still be live, which is the most honest thing
+    left to do from here.
+    """
+    applier.command(["/usr/bin/systemctl", "stop", unit], required=False)
+    if applier.command(["/usr/bin/systemctl", "is-active", "--quiet", unit],
+                       quiet=True) != 0:
+        return True
+    log("%s did not stop; killing it, because a microphone that is still open "
+        "is not something anybody in the room can hear" % unit)
+    applier.command(["/usr/bin/systemctl", "kill", "--signal=SIGKILL", unit],
+                    required=False)
+    if applier.command(["/usr/bin/systemctl", "is-active", "--quiet", unit],
+                       quiet=True) != 0:
+        return True
+    log("REFUSING TO REPORT SUCCESS: %s survived both a stop and a kill, so the "
+        "microphone may still be transmitting while the state says it is muted. "
+        "Check `systemctl status %s` and `fuser -v /dev/snd/*`." % (unit, unit))
+    return False
+
+
 def rear_mic_possible(applier, chain=None, speaker_wanted=None):
     """Whether the mic-to-rear leg may be started right now. Journals if not.
 
@@ -1376,12 +1433,12 @@ def apply_plan(state, applier):
     # broken at the glass. That asymmetry is the whole point.
     for unit, should_run in wanted["legs"].items():
         if not should_run:
-            result = applier.command(["/usr/bin/systemctl", "stop", unit])
-            failures += result
-            if result and unit in policy.MIC_LEGS:
-                log("REFUSING TO REPORT SUCCESS: %s would not stop, so the "
-                    "microphone may still be transmitting while the state says "
-                    "it is muted. Check `systemctl status %s`." % (unit, unit))
+            if unit in policy.MIC_LEGS:
+                # Stopped HARDER than the output legs, and verified: see
+                # stop_mic_leg_hard for why a counted failure is not enough.
+                failures += 0 if stop_mic_leg_hard(applier, unit) else 1
+            else:
+                failures += applier.command(["/usr/bin/systemctl", "stop", unit])
     # Mixer mutes are not required: a card that has just been unplugged has no
     # controls to set, and that is the normal headset case, not an error.
     applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",

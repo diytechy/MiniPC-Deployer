@@ -2113,10 +2113,13 @@ def test_a_repair_mutes_the_input_but_costs_nothing_else_sr029(policy):
     assert repaired["output"] == "speaker", "and the rest still falls back sanely"
     assert repaired["volume"]["speaker"] == 80, "a good field survives a bad one"
 
-    # An ABSENT key is not damage: that is a file written before the field
-    # existed, and it takes the schema default.
-    clean = policy.normalize({"output": "headset"})
-    assert clean["input_muted"] is False
+    # AN ABSENT KEY IS NOT CONSENT EITHER, and the earlier version of this test
+    # blessed the opposite (terra, round 4). A truncated write is
+    # indistinguishable from a file that never had the field, so absence is
+    # muted; only an explicit boolean `false` un-mutes.
+    partial = policy.normalize({"output": "headset"})
+    assert partial["input_muted"] is True
+    assert policy.normalize({})["input_muted"] is True
     # And a whole, valid document is untouched in both directions.
     assert policy.normalize(policy.default_state()) == policy.default_state()
 
@@ -2329,3 +2332,99 @@ def test_a_mode_switch_refuses_while_a_microphone_is_still_running_sr029():
     assert "return 1" in helper
     assert "REFUSING" in helper
     assert "stop_mic_legs_or_refuse || exit 1" in text
+
+
+# ── review round 4: the one rule, and the stop that has to bite ───────────
+
+@pytest.mark.parametrize("raw,muted", [
+    ({"output": "speaker", "input_muted": False}, False),
+    ({"output": "speaker", "input_muted": True}, True),
+    ({}, True),
+    ({"output": "speaker"}, True),
+    ({"input_muted": "false"}, True),
+    ({"input_muted": 0}, True),
+    ({"input_muted": None}, True),
+    ([], True),
+    ("nonsense", True),
+    (None, True),
+])
+def test_the_microphone_is_muted_unless_the_document_says_false_sr029(policy, raw, muted):
+    """The one rule, after four rounds found four ways round the last one.
+
+    Not "unless it says true", and not "unless a field was repaired": both of
+    those left a hole, because a TRUNCATED write and an unreadable file are
+    indistinguishable from a fresh one if absence counts as consent.
+    """
+    assert policy.normalize(raw)["input_muted"] is muted
+
+
+def test_an_unreadable_state_file_is_not_rewritten_into_consent_sr029(applier, tmp_path):
+    """The applier PERSISTS what it loaded before it applies it.
+
+    So an unreadable file returning the unmuted default was rewritten as a
+    valid, unmuted document, and the units' own ExecCondition then saw consent
+    nobody gave. A file that cannot be read comes back MUTED.
+    """
+    damaged = tmp_path / "audio-state.json"
+    damaged.write_text("{truncated", encoding="utf-8")
+    state, note = applier.load_state(damaged)
+    assert state["input_muted"] is True
+    assert "MUTED" in note
+
+    # A panel that has NEVER been configured is different in kind: there is no
+    # prior mute to lose, and a fresh image whose microphone needs a button
+    # press nobody has a button for yet would be the worse failure.
+    fresh, note = applier.load_state(tmp_path / "never-written.json")
+    assert fresh["input_muted"] is False
+    assert fresh == applier.policy.default_state()
+
+
+def test_muting_escalates_to_a_kill_rather_than_counting_and_moving_on_sr029(
+        applier, policy):
+    """A stop that failed left an already-open alsaloop transmitting.
+
+    apply_plan counted the failure and carried on; wall-mic-rear has no runtime
+    state recheck, so its open PCM went on sending the room to the desktop's
+    input while the stored state said muted. The mode switch already escalated;
+    `input-mute` did not (terra, round 4).
+    """
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    seen = []
+
+    def stubborn(argv, **kwargs):
+        seen.append(list(argv))
+        if argv[0].endswith("systemctl") and argv[1] == "stop" \
+                and len(argv) > 2 and argv[2] in policy.MIC_LEGS:
+            return _Reply(1, "", "Job failed")
+        if argv[0].endswith("systemctl") and argv[1] == "is-active" \
+                and argv[-1] in policy.MIC_LEGS:
+            return _Reply(0)          # still running
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(muted, applier.Applier(run=stubborn)) > 0
+    kills = [argv for argv in seen
+             if argv[0].endswith("systemctl") and argv[1] == "kill"
+             and argv[-1] in policy.MIC_LEGS]
+    assert kills, "a mic leg that will not stop must be KILLED, not just counted"
+
+
+def test_a_mic_leg_that_stops_normally_is_never_killed_sr029(applier, policy):
+    """Escalation only where it is needed: a clean stop stays a clean stop."""
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    seen = []
+
+    def obedient(argv, **kwargs):
+        seen.append(list(argv))
+        if argv[0].endswith("systemctl") and argv[1] == "is-active":
+            return _Reply(1)          # not running: the stop worked
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(muted, applier.Applier(run=obedient)) == 0
+    assert not [argv for argv in seen
+                if argv[0].endswith("systemctl") and argv[1] == "kill"]

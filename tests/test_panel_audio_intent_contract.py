@@ -11,8 +11,8 @@ block B18):
     owns, and OMITS it rather than guessing when the file cannot be read;
   * the `switch` status block publishes the epoch and the high-water mark, as
     nulls when unreadable and never as zeros;
-  * the mutation reply echoes the applied state the backend read when it
-    answered -- not a prediction of the outcome;
+  * the mutation reply snapshots the state as it stood BEFORE the request,
+    named for when it was taken rather than for what it predicts;
   * all three new fields ride behind the same `echoSeq` opt-in, because the
     shipped renderer validates the action result as an EXACT key set and a
     wider result reaches an un-upgraded panel as an error;
@@ -172,22 +172,25 @@ def test_a_fresh_panel_reports_the_schema_default_mark_sr028(panel):
 
 # --- the echoed applied state ------------------------------------------------
 
-def test_the_reply_echoes_the_state_the_applier_last_wrote_sr028(panel):
+def test_the_reply_snapshots_the_state_as_it_stood_BEFORE_the_request_sr028(panel):
     set_state(panel, output="headset", input_muted=True, headset_present=True)
     broker = AudioBroker(backend(panel))
     answer = reply(broker, wire("set_output", {"output": "speaker"}, echo_seq=True))
-    # The echo is what the backend HAD, not what it was asked for: `accepted`
-    # has never meant `applied`, and an echo that guessed would make that worse.
-    assert answer["result"]["effective"] == {
+    # NAMED FOR WHEN IT WAS TAKEN. Two independent reviews read the previous
+    # name (`effective`) as a claim about the outcome, and a field two readers
+    # get wrong is named wrong however carefully the contract explains it. The
+    # applier is asynchronous, so no reply can say whether this request has been
+    # applied; the STATUS verb is where the applied state lives.
+    assert answer["result"]["observedBefore"] == {
         "output": "headset", "inputMuted": True, "volume": 60,
         "requestSeq": 41, "generation": 7}
 
 
-def test_the_echo_of_a_mute_position_reports_no_level_sr028(panel):
+def test_the_snapshot_of_a_mute_position_reports_no_level_sr028(panel):
     set_state(panel, output="mute")
     broker = AudioBroker(backend(panel))
     answer = reply(broker, wire("set_output", {"output": "speaker"}, echo_seq=True))
-    assert answer["result"]["effective"]["volume"] == 0
+    assert answer["result"]["observedBefore"]["volume"] == 0
 
 
 # --- compatibility -----------------------------------------------------------
@@ -207,7 +210,7 @@ def test_a_client_that_did_not_opt_in_gets_the_historic_shape_if015(panel):
 def test_an_opted_in_client_gets_exactly_the_contract_keys_if015(panel):
     broker = AudioBroker(backend(panel))
     answer = reply(broker, wire("set_output", {"output": "headset"}, echo_seq=True))
-    assert set(answer["result"]) == {"accepted", "seq", "generation", "effective"}
+    assert set(answer["result"]) == {"accepted", "seq", "generation", "observedBefore"}
 
 
 # --- the broker's own validators --------------------------------------------
@@ -229,18 +232,18 @@ BAD_ACTIONS = [
     {"accepted": True, "seq": -1},
     {"accepted": True, "generation": -1},
     {"accepted": True, "generation": 1.5},
-    {"accepted": True, "effective": {"output": "bluetooth", "inputMuted": False,
+    {"accepted": True, "observedBefore": {"output": "bluetooth", "inputMuted": False,
                                      "volume": 60, "requestSeq": 1, "generation": 1}},
-    {"accepted": True, "effective": {"output": "speaker", "inputMuted": "yes",
+    {"accepted": True, "observedBefore": {"output": "speaker", "inputMuted": "yes",
                                      "volume": 60, "requestSeq": 1, "generation": 1}},
-    {"accepted": True, "effective": {"output": "speaker", "inputMuted": False,
+    {"accepted": True, "observedBefore": {"output": "speaker", "inputMuted": False,
                                      "volume": 101, "requestSeq": 1, "generation": 1}},
-    {"accepted": True, "effective": {"output": "speaker", "inputMuted": False,
+    {"accepted": True, "observedBefore": {"output": "speaker", "inputMuted": False,
                                      "volume": 60, "requestSeq": -2, "generation": 1}},
-    {"accepted": True, "effective": {"output": "speaker", "inputMuted": False,
+    {"accepted": True, "observedBefore": {"output": "speaker", "inputMuted": False,
                                      "volume": 60, "requestSeq": 1, "generation": -1}},
-    {"accepted": True, "effective": {"output": "speaker"}},
-    {"accepted": True, "effective": []},
+    {"accepted": True, "observedBefore": {"output": "speaker"}},
+    {"accepted": True, "observedBefore": []},
 ]
 
 

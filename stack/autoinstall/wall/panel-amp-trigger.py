@@ -264,7 +264,19 @@ BUS_TELEMETRY_INTERVAL = 0.2
 # spectrum analyser, and the alternative -- a full-rate filter bank in Python on
 # a 100 ms budget -- would put the amplifier detector's own duty at risk.
 BUS_BANDS_HZ = (60.0, 120.0, 240.0, 480.0, 960.0, 1900.0, 3400.0, 5200.0)
-BUS_DECIMATE = 4
+# DECIMATE BY TWO, NOT FOUR, AND THE DIFFERENCE IS AN HONEST TOP BAND (terra,
+# second pass). At 4x the decimated Nyquist is 6 kHz and a 4-tap boxcar keeps
+# about 57 % of a 6.8 kHz tone, which then folds down and LIGHTS the band
+# labelled 5.2 kHz -- a readout that is not imprecise but wrong about where the
+# energy is. At 2x the Nyquist is 12 kHz, the same boxcar's first null sits
+# exactly there, and nothing in the audible band folds into a displayed one at
+# all. It costs twice the Goertzel work on every other block, which is a price
+# worth paying for a number that means what its label says.
+BUS_DECIMATE = 2
+# The boxcar length, which stays at four: its first null is at RATE/4 = 12 kHz,
+# exactly the decimated Nyquist, so it is the anti-alias filter this decimation
+# needs rather than merely a smoothing of it.
+BUS_BOXCAR = 4
 # The dB window the published 0..1 band values are mapped onto. The same floor
 # the canceller's level scalar uses, and the same reasoning: linear in decibels,
 # because a band linear in AMPLITUDE sits at zero until somebody shouts.
@@ -300,11 +312,12 @@ def band_levels(samples, channels, frames):
     # decimated Nyquist, and it costs nothing because the samples are being
     # summed anyway.
     step = BUS_DECIMATE * channels
+    span = BUS_BOXCAR * channels
     mono = []
-    divisor = float(channels * BUS_DECIMATE * 32768)
-    for i in range(0, frames * channels - step, step):
+    divisor = float(channels * BUS_BOXCAR * 32768)
+    for i in range(0, frames * channels - span, step):
         total = 0.0
-        for tap in range(BUS_DECIMATE):
+        for tap in range(BUS_BOXCAR):
             base = i + tap * channels
             for ch in range(channels):
                 total += samples[base + ch]

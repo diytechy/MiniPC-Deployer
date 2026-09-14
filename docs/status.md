@@ -46,6 +46,32 @@ Four source changes, each with tests, against the coordinator plan's section A.
   `wall-amp-trigger` (already reading `speaker_tap` for the relay) and
   `wall-audio-aec`. No second capture and no routing change.
 
+**Independent review: two Terra-medium passes, thirteen real findings, all
+fixed with regression tests.** Pass one: a rolled-back state file re-opened
+every request the applier had already refused (the run marker now carries the
+sequence mark as well as the epoch); clearing /run under a running panel fenced
+nothing (a missing marker is now an epoch break for scoped requests, and the
+rocker is deliberately unaffected); the canceller never learned the input mute,
+so it claimed a live microphone through an item J coupled mute; a tap that
+failed to open at start was never retried; the divergence test used a lifetime
+mean, making detection latency a function of uptime; the AEC enable knob lived
+in two files and nothing wrote the second; bus freshness was stamped at read
+time; an absent bus was passed off as a measured quiet room; and the decimation
+had no anti-alias at all. Pass two: the epoch marker was advanced BEFORE the
+state, so a crash between them lost an accepted request permanently; a
+failed-over canceller logged "passed through" and went on cancelling; the
+reference ring desynchronised as soon as a non-unity resampler ratio was in
+force; the reply's `effective` field was renamed `observedBefore` after two
+readers took it for a claim about the outcome; the boxcar did not actually
+suppress the alias it named (decimation is now 2x, so nothing audible folds
+into a displayed band); and a mic leg could open `mic_clean` with no writer.
+
+Two claims were reviewed and REJECTED with evidence, not silently: that valid
+telemetry is refused for a missing `generation` (the router stamps it before
+validating, confirmed end to end through the real broker), and that this work
+installs the canceller on the panel (it adds the firstboot lines the plan asked
+for; nothing was installed, and the unit ships disabled).
+
 **Assumptions recorded for the next gate.** (a) Item J's latch means a person
 who was live on Speaker, taps Mute, then taps Speaker again comes back MUTED;
 that is the Owner's ruling read literally and is flagged for review. (b) The

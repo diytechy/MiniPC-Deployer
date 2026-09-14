@@ -47,11 +47,11 @@ OBSERVABLE_BLOCK = {"set_mute": "mute", "set_output": "switch",
 # all three -- the sequence identifies the request, the generation says which
 # life of the applier it belongs to, and `effective` is the applied state the
 # reply echoes (contract 2026-09-14, section 1.4).
-ACTION_RESULT_OPTIONAL = {"seq", "generation", "effective"}
-# The exact shape of `effective`. Every field is nullable, because the backend
-# reads them off a file that may be sparse, and a guessed number here would be
-# reconciled against.
-EFFECTIVE_FIELDS = {"output", "inputMuted", "volume", "requestSeq", "generation"}
+ACTION_RESULT_OPTIONAL = {"seq", "generation", "observedBefore"}
+# The exact shape of `observedBefore`. Every field is nullable, because the
+# backend reads them off a file that may be sparse, and a guessed number here
+# would be reconciled against.
+OBSERVED_BEFORE_FIELDS = {"output", "inputMuted", "volume", "requestSeq", "generation"}
 # OPT-IN, and that is the whole point. A client that does not ask gets exactly
 # the historic {"accepted": bool} -- the shipped renderer validates that result
 # as an EXACT key set and turns anything wider into an error, so echoing `seq`
@@ -683,26 +683,26 @@ class AudioBroker:
                 raise BrokerError("unsafe_backend_result", "action result sequence is invalid")
             if value.get("generation") is not None and not _safe_integer(value["generation"]):
                 raise BrokerError("unsafe_backend_result", "action result generation is invalid")
-            if value.get("effective") is not None:
-                self._safe_effective(value["effective"])
+            if value.get("observedBefore") is not None:
+                self._safe_observed_before(value["observedBefore"])
 
-    def _safe_effective(self, value: object) -> None:
-        """Validate the echoed applied state. Implements: SR-028, LLR-015."""
-        if not isinstance(value, dict) or set(value) != EFFECTIVE_FIELDS:
-            raise BrokerError("unsafe_backend_result", "effective state is not exact")
+    def _safe_observed_before(self, value: object) -> None:
+        """Validate the pre-request snapshot. Implements: SR-028, LLR-015."""
+        if not isinstance(value, dict) or set(value) != OBSERVED_BEFORE_FIELDS:
+            raise BrokerError("unsafe_backend_result", "observed state is not exact")
         if value["output"] not in SWITCH_OUTPUTS:
-            raise BrokerError("unsafe_backend_result", "effective output is invalid")
+            raise BrokerError("unsafe_backend_result", "observed output is invalid")
         if value["inputMuted"] is not None and not isinstance(value["inputMuted"], bool):
-            raise BrokerError("unsafe_backend_result", "effective input mute is invalid")
+            raise BrokerError("unsafe_backend_result", "observed input mute is invalid")
         volume = value["volume"]
         if volume is not None and (isinstance(volume, bool) or not isinstance(volume, int)
                                    or not 0 <= volume <= 100):
-            raise BrokerError("unsafe_backend_result", "effective volume is invalid")
+            raise BrokerError("unsafe_backend_result", "observed volume is invalid")
         mark = value["requestSeq"]
         if mark is not None and mark != -1 and not _safe_integer(mark):
-            raise BrokerError("unsafe_backend_result", "effective request mark is invalid")
+            raise BrokerError("unsafe_backend_result", "observed request mark is invalid")
         if value["generation"] is not None and not _safe_integer(value["generation"]):
-            raise BrokerError("unsafe_backend_result", "effective generation is invalid")
+            raise BrokerError("unsafe_backend_result", "observed generation is invalid")
 
     # Item L. Every field is checked, and the two that carry a CLAIM -- `source`
     # and `state` -- are enums rather than strings, because the whole point of

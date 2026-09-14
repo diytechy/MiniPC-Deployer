@@ -410,3 +410,34 @@ def test_telemetry_can_never_take_the_detector_down_llr015():
 
     # No exception, whatever the path does.
     module.publish_bus_telemetry(FakeLevel(), True, path="/nonexistent/dir/x.json")
+
+
+def test_an_out_of_band_tone_does_not_light_a_displayed_band_llr015():
+    """THE ALIAS THE DECIMATION MUST NOT CREATE (terra, second pass).
+
+    At 4x decimation the Nyquist is 6 kHz and a 4-tap boxcar keeps about 57 % of
+    a 6.8 kHz tone, which then folds down and LIGHTS the band labelled 5.2 kHz.
+    That is not an imprecise readout, it is one that is wrong about where the
+    energy is. At 2x the Nyquist is 12 kHz, the boxcar's first null sits exactly
+    there, and nothing audible folds into a displayed band at all.
+    """
+    import math
+    module = load_module()
+    rate, frames = module.RATE, module.BLOCK_FRAMES
+
+    def tone(hz, amplitude=0.5):
+        samples = []
+        for i in range(frames):
+            value = amplitude * math.sin(2 * math.pi * hz * i / rate)
+            pcm = max(-32768, min(32767, int(value * 32767)))
+            samples.extend([pcm, pcm])
+        return samples
+
+    reference = module.band_levels(tone(5200.0), module.CHANNELS, frames)
+    top = reference.index(max(reference))
+    for hz in (6800.0, 9000.0, 14800.0, 19000.0):
+        bands = module.band_levels(tone(hz), module.CHANNELS, frames)
+        assert all(0.0 <= b <= 1.0 for b in bands), (hz, bands)
+        assert bands[top] < reference[top] / 2.0, (
+            "a %g Hz tone lit the 5.2 kHz band at %.3f against the real tone's "
+            "%.3f" % (hz, bands[top], reference[top]))

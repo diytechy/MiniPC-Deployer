@@ -55,6 +55,9 @@
 #       per boot, the durable number survives a reboot, a request scoped to a
 #       dead epoch is refused while leaving the state byte-identical, and a
 #       delayed OLD request arriving after a newer one still cannot apply
+#   B19 step 6's seam: the canceller is selected only with BOTH the knob and a
+#       binary, and only in Speaker; plus item J's effective mute, published
+#       for the canceller BEFORE any leg moves
 #   B13 the centre/sub trim: the rendered ttable is the (L+R)/2 sum the Owner
 #       asked for, a group name moves both halves of it, a refused value moves
 #       NOTHING, and a number-moving command never starts audio
@@ -537,6 +540,66 @@ printf '{"version":1,"seq":500,"generation":'"$new_epoch"',"event":{"kind":"set_
 out="$(ep apply-request "$eprequest")"
 has "output mute -> speaker" "$out" "B18 and a request at the new epoch lands again"
 
+
+
+# ── B19 — the echo canceller's seam and item J's published mute ────────────
+# Its own temp tree in `bus` mode, because both facts here are about what the
+# applier PUBLISHES for other processes, and the publishing only happens where
+# hardware is commanded.
+AE="$TMP/aec"; mkdir -p "$AE/etc" "$AE/run"
+printf 'bus\n' > "$AE/etc/audio-mode"
+AESTATE="$AE/audio-state.json"
+ae() { WALL_PANEL_CONF_DIR="$AE/etc" WALL_PANEL_RUN_DIR="$AE/run" \
+       WALL_PANEL_AEC_BINARY="$AE/wall-audio-aec" \
+       python3 "$APPLIER" --dry-run --state "$AESTATE" "$@" 2>&1; }
+mic_source_of() { printf '%s' "$1" | grep -o 'WALL_AUDIO_MIC_SOURCE=[a-z_]*' | tail -1; }
+
+# With no canceller installed and no knob, nothing changes: the legs read the
+# raw panel microphone exactly as they did before step 6.
+out="$(ae apply-state)"
+has "microphone: mic_panel" "$out" "B19 with no canceller the panel mic is selected"
+
+# The knob alone is not enough. A published PCM name nothing feeds would leave
+# the mic legs opening a device that never produces a sample.
+printf 'WALL_AUDIO_AEC=1\n' > "$AE/etc/audio-aec.env"
+out="$(ae apply-state)"
+has "microphone: mic_panel" "$out" "B19 the knob alone does not move the seam"
+
+# Both halves, and only then.
+printf '#!/bin/sh\n' > "$AE/wall-audio-aec"; chmod +x "$AE/wall-audio-aec"
+out="$(ae apply-state)"
+has "microphone: mic_clean" "$out" "B19 knob plus binary selects the cancelled microphone"
+
+# AND ONLY IN SPEAKER. The canceller removes the ROOM's own music from the
+# microphone, and the room only has music in Speaker: in Headset the sound is in
+# somebody's ears, and in Mute nothing is playing at all.
+out="$(ae set headset)"
+hasnt "microphone: mic_clean" "$out" "B19 Headset does not go through the canceller"
+out="$(ae set speaker)"
+has "microphone: mic_clean" "$out" "B19 and Speaker does"
+
+# ITEM J's EFFECTIVE MUTE, PUBLISHED FOR THE CANCELLER. Without it the daemon's
+# status block goes on claiming a live microphone while every leg is stopped,
+# and item L's ring is drawn over a coupled mute.
+ae input-mute off >/dev/null
+out="$(ae apply-state)"
+has "WALL_AUDIO_INPUT_MUTED=0" "$(cat "$AE/run/audio-input-mute.env")" \
+    "B19 an unmuted input is published as 0"
+out="$(ae input-mute on)"
+has "WALL_AUDIO_INPUT_MUTED=1" "$(cat "$AE/run/audio-input-mute.env")" \
+    "B19 and a muted one as 1"
+# The OUTPUT mute couples it, so the published value follows the switch too.
+ae input-mute off >/dev/null
+out="$(ae set mute)"
+has "WALL_AUDIO_INPUT_MUTED=1" "$(cat "$AE/run/audio-input-mute.env")" \
+    "B19 the coupled mute is published as muted (item J)"
+# PUBLISHED BEFORE ANY LEG MOVES. Publishing after would leave a window in which
+# the wall drew a live ring over a microphone already stopped.
+mute_line="$(printf '%s\n' "$out" | grep -n 'input mute published' | head -1 | cut -d: -f1)"
+stop_line="$(printf '%s\n' "$out" | grep -n 'systemctl stop' | head -1 | cut -d: -f1)"
+{ [ -n "$mute_line" ] && [ -n "$stop_line" ] && [ "$mute_line" -lt "$stop_line" ]; } \
+    && pass "B19 and it is published before any leg moves" \
+    || fail "B19 a leg moved before the mute was published"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

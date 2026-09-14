@@ -364,11 +364,11 @@ def test_set_mute_false_when_nothing_is_muted_moves_no_switch_sr023(panel):
     broker = AudioBroker(backend(panel))
     answer = reply(broker, wire("set_mute", {"muted": False}, echo_seq=True))
     # Accepted, and honestly seq-less and epoch-less: no request was minted, so
-    # there is nothing for a client to correlate against. The EFFECTIVE state is
-    # still echoed, because the caller asked "is the output unmuted" and this is
+    # there is nothing for a client to correlate against. The state snapshot is
+    # still carried, because the caller asked "is the output unmuted" and this is
     # the evidence that it is (contract 2026-09-14, section 1.4).
     assert answer["result"] == {"accepted": True, "seq": None, "generation": None,
-                                "effective": {"output": "headset", "inputMuted": False,
+                                "observedBefore": {"output": "headset", "inputMuted": False,
                                               "volume": 60, "requestSeq": -1,
                                               "generation": 0}}
     assert not panel["request"].exists()

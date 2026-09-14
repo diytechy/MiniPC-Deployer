@@ -97,7 +97,11 @@ BOOT_STAMP = RUN_DIR / "audio-boot-apply.json"
 # guessed there. Both halves are required: a knob set on a panel with no binary
 # would publish a PCM name nothing feeds, and the mic legs would open a device
 # that never produces a sample.
-AEC_BINARY = Path("/usr/local/sbin/wall-audio-aec")
+# Overridable for the same reason CONF_DIR and RUN_DIR are: the hermetic suite
+# drives the real applier and must be able to say whether a canceller exists
+# without one being installed on the machine running the tests.
+AEC_BINARY = Path(os.environ.get("WALL_PANEL_AEC_BINARY")
+                  or "/usr/local/sbin/wall-audio-aec")
 # ONE FILE, READ BY BOTH HALVES (terra, 2026-09-14, finding 6). An earlier draft
 # had firstboot enabling the unit from `wall.env` while this applier chose
 # `mic_clean` from a file nothing wrote, so an enabled daemon could sit there
@@ -1586,9 +1590,25 @@ def apply_plan(state, applier):
     # polls it to decide whether its status block may claim a live microphone
     # level; publishing it after the legs had moved would leave a window in
     # which the wall drew a live ring over a microphone already stopped.
-    write_atomic(INPUT_MUTE_ENV,
-                 "%s=%d\n" % (INPUT_MUTE_VAR, 1 if wanted["input_muted_effective"] else 0),
-                 mode=0o644, dry_run=applier.dry_run)
+    # A dry run still writes this one, on exactly save_state's and
+    # write_epoch_marker's reasoning: the hermetic suite has to be able to
+    # read back WHAT was published, not only that something was. The LIVE
+    # path is still refused, out loud, so --dry-run never touches the
+    # panel's own /run.
+    if applier.dry_run and INPUT_MUTE_ENV == LIVE_RUN_DIR / "audio-input-mute.env":
+        print("write %s (suppressed: --dry-run on the live input-mute file)"
+              % INPUT_MUTE_ENV)
+    else:
+        write_atomic(INPUT_MUTE_ENV,
+                     "%s=%d\n" % (INPUT_MUTE_VAR,
+                                  1 if wanted["input_muted_effective"] else 0),
+                     mode=0o644)
+    # Journalled as well as written, because the ORDER is the property that
+    # matters: an operator reading the log must be able to see that the mute
+    # was published before any leg moved, not merely that it was published.
+    log("input mute published to %s: %s"
+        % (INPUT_MUTE_ENV,
+           "muted" if wanted["input_muted_effective"] else "live"))
 
     # WHICH MICROPHONE, PUBLISHED BEFORE ANYTHING OPENS ONE. The mic legs read
     # this through `@func getenv` on `mic_selected`, exactly as the headset leg
@@ -2107,21 +2127,23 @@ def _locked_apply(arguments):
             # Recorded in the SAME atomic write as the change it caused: a seq
             # that survived while its effect did not would swallow the retry.
             state["request_seq"] = seq
-            # AND IN THE RUN MARKER, which is the copy a rolled-back state file
-            # cannot take with it (terra finding 1). The two are written
-            # separately and the marker is written SECOND, so a crash between
-            # them leaves the marker BEHIND the state -- which costs nothing,
-            # because the restore only ever raises the mark.
-            #
-            # ONLY WHEN A MARKER ALREADY EXISTS. Writing one here when /run has
-            # been cleared would RE-VOUCH for an epoch this process has just
-            # said it cannot vouch for, and the next `apply-state` would then
-            # keep the dead epoch instead of opening a new one -- which is the
-            # whole fence of finding 2, undone by its own bookkeeping.
-            if epoch_vouched:
-                write_epoch_marker(state["generation"], seq,
-                                   dry_run=arguments.dry_run)
         save_state(state, arguments.state, dry_run=arguments.dry_run)
+        # THE MARKER IS ADVANCED AFTER THE STATE, AND THE ORDER IS THE WHOLE
+        # POINT (terra, second pass). The marker's mark is a RESTORE copy: on
+        # the next run the higher of the two wins. So a crash between them must
+        # leave the marker BEHIND the state, never ahead of it -- writing the
+        # marker first meant a crash before `save_state` deduplicated a request
+        # whose effect had never happened, losing it permanently and silently.
+        # An earlier comment here claimed this order while the code did the
+        # opposite; the comment was right and the code is now too.
+        #
+        # ONLY WHEN A MARKER ALREADY EXISTS. Writing one when /run has been
+        # cleared would RE-VOUCH for an epoch this process has just said it
+        # cannot vouch for, and the next `apply-state` would keep the dead epoch
+        # instead of opening a new one -- the fence of finding 2, undone by its
+        # own bookkeeping.
+        if seq is not None and epoch_vouched:
+            write_epoch_marker(state["generation"], seq, dry_run=arguments.dry_run)
 
     mode = current_mode()
     if mode != "bus":

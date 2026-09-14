@@ -348,8 +348,14 @@ static void engine_block(aec_engine *engine, const int16_t *mic, int16_t *out, b
         if (tap_present) engine->reference_starved_blocks += 1;
     }
 
+    /* `failed_over` IS CHECKED HERE, and leaving it out was a lie in the
+     * journal (terra, second pass): the daemon logged "the microphone is passed
+     * through" and then went on calling speex_echo_cancellation on the very
+     * next block. Below the profile's ERLE floor the filter is doing more harm
+     * than good -- it is subtracting an estimate it cannot make -- so it stops
+     * subtracting anything and the microphone goes through untouched. */
     bool cancelling = tap_present && engine->policy.state != AEC_STATE_DEGRADED
-        && engine->policy.adapting;
+        && !engine->policy.failed_over && engine->policy.adapting;
     if (cancelling) {
         speex_echo_cancellation(engine->echo, delayed, reference, out);
         if (engine->preprocess) speex_preprocess_run(engine->preprocess, out);
@@ -576,14 +582,31 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
 
         bool tap_present = false;
         if (tap_pcm) {
-            snd_pcm_sframes_t available = snd_pcm_avail_update(tap_pcm);
-            if (available >= AEC_FRAME_SIZE) {
+            /* DRAINED BY AVAILABILITY, NOT ONE BLOCK PER MIC BLOCK (terra,
+             * second pass). Admitting exactly 256 tap frames per mic block
+             * assumes the two cards run at exactly the same rate, which is the
+             * assumption the whole drift controller exists because they do not
+             * meet: once a non-unity ratio is in force the resampler consumes
+             * slightly more than 256 per block for a fast tap, so a ring topped
+             * up by exactly 256 starves -- and for a slow tap it fills and
+             * push_reference drops old frames, destroying the alignment. The
+             * tap is the producer; take what it has, up to what the ring can
+             * hold, and let the ring absorb the difference. */
+            for (;;) {
+                if (REF_RING_FRAMES - engine->reference_fill < AEC_FRAME_SIZE) {
+                    tap_present = true;
+                    break;   /* the ring is as full as it should get */
+                }
+                snd_pcm_sframes_t available = snd_pcm_avail_update(tap_pcm);
+                if (available < AEC_FRAME_SIZE) break;
                 snd_pcm_sframes_t read = snd_pcm_readi(tap_pcm, tap, AEC_FRAME_SIZE);
-                if (read == AEC_FRAME_SIZE) { push_reference(engine, tap, AEC_FRAME_SIZE); tap_present = true; }
-                else if (read < 0) { snd_pcm_drop(tap_pcm); snd_pcm_prepare(tap_pcm); engine->reference_fill = 0; }
-            } else if (engine->reference_fill >= AEC_FRAME_SIZE) {
-                tap_present = true;   /* still draining what the ring holds */
+                if (read == AEC_FRAME_SIZE) { push_reference(engine, tap, AEC_FRAME_SIZE); tap_present = true; continue; }
+                if (read < 0) { snd_pcm_drop(tap_pcm); snd_pcm_prepare(tap_pcm); engine->reference_fill = 0; }
+                break;
             }
+            /* Still draining what the ring holds counts as a live reference:
+             * the tap has not gone away, it is simply ahead of us. */
+            if (engine->reference_fill >= AEC_FRAME_SIZE) tap_present = true;
         }
 
         int64_t now_ms = monotonic_ms();

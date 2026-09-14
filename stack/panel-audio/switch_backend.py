@@ -195,7 +195,7 @@ class SwitchApplierBackend:
             # is still echoed, because the caller asked "is the output unmuted"
             # and this is the evidence that it is.
             return {"accepted": True, "seq": None, "generation": None,
-                    "effective": self._effective(applied)}
+                    "observedBefore": self._observed_before(applied)}
         return self._submit({"kind": "set_output", "output": UNMUTE_OUTPUT})
 
     # ---- the shell ------------------------------------------------------
@@ -245,22 +245,24 @@ class SwitchApplierBackend:
         except OSError as exc:
             raise _broker_error("backend_failure", "audio backend failed") from exc
         return {"accepted": True, "seq": seq, "generation": generation,
-                "effective": self._effective(applied)}
+                "observedBefore": self._observed_before(applied)}
 
     @classmethod
-    def _effective(cls, applied) -> dict | None:
-        """The applied state this reply echoes, or None when it was unreadable.
+    def _observed_before(cls, applied) -> dict | None:
+        """The applied state as it stood BEFORE this request, or None.
 
-        WHAT THIS IS AND IS NOT (contract 2026-09-14, section 1.4). It is the
-        state the APPLIER last wrote, read at the moment of the reply -- that
-        is, the state this request has not changed yet. It is deliberately NOT a
-        prediction of the outcome: `accepted` has never meant `applied`, and an
-        echo that guessed would make that confusion worse rather than better.
+        NAMED FOR WHEN IT WAS TAKEN, because two independent reviews read the
+        previous name -- `effective` -- as a claim about the outcome, and a
+        field two readers get wrong is named wrong however carefully the
+        contract explains it. The applier runs asynchronously behind a path
+        unit, so NO reply can say whether this request has been applied;
+        `accepted` has never meant `applied` and this field does not change
+        that. The STATUS verb is where the effective applied state lives.
 
-        What it buys the client is the thing item I needs: a renderer whose
-        request timed out can tell what the backend's high-water mark and
-        position were WITHOUT a second round trip, so it can decide between
-        "reconcile, it may have landed" and "replay".
+        What it buys the client is exactly what item I needs: a renderer whose
+        request timed out can compare a freshly read `requestSeq` against this
+        one to tell "it landed" from "it is still lost", without a second round
+        trip to establish the baseline.
         """
         if not applied:
             return None

@@ -367,6 +367,13 @@ static void test_absolute_floor(void)
     ok(saw == AEC_ACTION_FAILOVER, "and the floor still fires");
     ok(policy.failed_over, "the policy records the failover");
     ok(policy.state == AEC_STATE_BYPASSED, "and says `bypassed`, not `cancelling`");
+    /* THE SHELL READS `failed_over` TO STOP CANCELLING, and leaving that out
+     * was a lie in the journal (terra, second pass): the daemon logged "the
+     * microphone is passed through" and went on calling the canceller on the
+     * very next block. The flag is asserted here because it is the one the
+     * shell's gate reads; the gate itself is C the policy tests cannot run. */
+    ok(policy.failed_over && policy.state == AEC_STATE_BYPASSED,
+       "and both facts the shell gates on are set together");
 }
 
 /* ── the resampler handoff ───────────────────────────────────────────────── */

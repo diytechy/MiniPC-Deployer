@@ -48,6 +48,10 @@
 #   B17 the mic knobs: the rendered route's explicit zeros, a group of refusals
 #       that each move NOTHING, and a number-moving command that starts no
 #       microphone
+#   B18 the intent contract's EPOCH: apply-state opens one per boot and only
+#       per boot, the durable number survives a reboot, a request scoped to a
+#       dead epoch is refused while leaving the state byte-identical, and a
+#       delayed OLD request arriving after a newer one still cannot apply
 #   B13 the centre/sub trim: the rendered ttable is the (L+R)/2 sum the Owner
 #       asked for, a group name moves both halves of it, a refused value moves
 #       NOTHING, and a number-moving command never starts audio
@@ -348,6 +352,82 @@ out="$(mic treble=1)"
 has "refused" "$out" "B17 there is no knob this panel does not have"
 # It must never put a live microphone anywhere.
 hasnt "systemctl start" "$out" "B17 a number-moving command starts no microphone"
+
+
+# ── B18 — the epoch (intent contract 2026-09-14) ───────────────────────────
+# Its own temp tree, because it is the one block that cares about /run being
+# empty and about the state file's history. Mode is `trigger` throughout: this
+# block is about ordering, and no hardware command is wanted in it.
+EP="$TMP/epoch"; mkdir -p "$EP/etc" "$EP/run"
+printf 'trigger\n' > "$EP/etc/audio-mode"
+EPSTATE="$EP/audio-state.json"
+epoch_of() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("generation"))' "$1"; }
+ep() { WALL_PANEL_CONF_DIR="$EP/etc" WALL_PANEL_RUN_DIR="$EP/run" \
+       python3 "$APPLIER" --dry-run --state "$EPSTATE" "$@" 2>&1; }
+
+out="$(ep apply-state)"
+has "epoch 1 opened" "$out" "B18 the first apply-state opens epoch 1"
+eq "1" "$(epoch_of "$EPSTATE")" "B18 the epoch is stamped into the durable state"
+
+# A SECOND apply-state in the SAME boot must NOT advance it: a resume re-assert
+# is not a new life of the backend, and advancing here would invalidate every
+# request the renderer has in flight every time the panel wakes up.
+out="$(ep apply-state)"
+hasnt "epoch 2 opened" "$out" "B18 a resume re-assert does not open a new epoch"
+eq "1" "$(epoch_of "$EPSTATE")" "B18 and the stamp is unchanged"
+
+# A REBOOT: /run is tmpfs, so the marker goes and the durable number stays.
+rm -f "$EP/run/audio-epoch.json"
+out="$(ep apply-state)"
+has "epoch 2 opened" "$out" "B18 a boot opens the NEXT epoch, not epoch 1 again"
+eq "2" "$(epoch_of "$EPSTATE")" "B18 the epoch is monotonic across the reboot"
+
+# A request scoped to the epoch that just ended is REFUSED, and refusing it
+# leaves the state file byte-identical -- which is what "atomically" means here.
+eprequest="$EP/request.json"
+before="$(cat "$EPSTATE")"
+printf '{"version":1,"seq":50,"generation":1,"event":{"kind":"set_output","output":"mute"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "generation 1 is not the current epoch 2" "$out" "B18 a dead epoch is refused, out loud"
+eq "$before" "$(cat "$EPSTATE")" "B18 and the refusal wrote nothing at all"
+
+# The same request, re-scoped to the live epoch, lands.
+printf '{"version":1,"seq":50,"generation":2,"event":{"kind":"set_output","output":"mute"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "output speaker -> mute" "$out" "B18 the live epoch is applied"
+
+# A DELAYED OLD REQUEST ARRIVING AFTER A NEWER ONE -- the case the plan asks for
+# by name, and it is NOT the reordered-replies case the renderer tests cover.
+# Two requests are minted; the newer one reaches the applier first (the path
+# unit coalesces, or the writer raced), and the older file is then re-dropped.
+printf '{"version":1,"seq":70,"generation":2,"event":{"kind":"set_output","output":"speaker"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "output mute -> speaker" "$out" "B18 the newer request lands"
+printf '{"version":1,"seq":60,"generation":2,"event":{"kind":"set_output","output":"headset"}}\n' > "$eprequest"
+before="$(cat "$EPSTATE")"
+out="$(ep apply-request "$eprequest")"
+has "request 60 ignored: not newer than the last applied (70)" "$out" \
+    "B18 the delayed older request is refused at the APPLIER, not just in the UI"
+eq "$before" "$(cat "$EPSTATE")" "B18 and it too wrote nothing"
+
+# An UNSCOPED request is still accepted: the rocker and the root CLI have no
+# epoch of their own, and an older broker sends none.
+printf '{"version":1,"seq":80,"event":{"kind":"set_output","output":"mute"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "output speaker -> mute" "$out" "B18 an unscoped request is accepted"
+
+# A malformed epoch in an otherwise valid request is refused rather than ignored.
+printf '{"version":1,"seq":90,"generation":-1,"event":{"kind":"set_output","output":"speaker"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "generation must be a non-negative integer" "$out" "B18 a malformed epoch is refused"
+
+# A ROLLED-BACK state file: the run marker wins, because every request minted in
+# this life was stamped from it.
+python3 -c 'import json,sys; p=sys.argv[1]; s=json.load(open(p)); s["generation"]=0; json.dump(s,open(p,"w"))' "$EPSTATE"
+out="$(ep set speaker)"
+has "epoch 2 adopted from the run marker (state file said 0)" "$out" \
+    "B18 a rolled-back state file is brought back up to the live epoch"
+eq "2" "$(epoch_of "$EPSTATE")" "B18 and the durable number is repaired"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

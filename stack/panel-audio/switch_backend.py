@@ -165,10 +165,14 @@ class SwitchApplierBackend:
         """
         if params["muted"] is True:
             return self._submit({"kind": "set_output", "output": "mute"})
-        if self._normalized()["output"] != "mute":
+        applied = self._normalized()
+        if applied["output"] != "mute":
             # Accepted, and honestly seq-less: no request was minted, so there
-            # is nothing for a client to correlate against.
-            return {"accepted": True}
+            # is nothing for a client to correlate against. The effective state
+            # is still echoed, because the caller asked "is the output unmuted"
+            # and this is the evidence that it is.
+            return {"accepted": True, "seq": None, "generation": None,
+                    "effective": self._effective(applied)}
         return self._submit({"kind": "set_output", "output": UNMUTE_OUTPUT})
 
     # ---- the shell ------------------------------------------------------
@@ -196,15 +200,54 @@ class SwitchApplierBackend:
         them apart across the process boundary and across a broker restart.
         """
         seq = self._next_seq()
+        # THE EPOCH THE REQUEST IS SCOPED TO, and the state it is scoped
+        # AGAINST, both read from the one file the applier owns (contract
+        # 2026-09-14, sections 1.2 and 1.4). `_require_applier` has already
+        # proved the file is readable on every path that reaches here, so an
+        # unreadable file at this point is a race with a rewrite; the request
+        # then goes out UNSCOPED rather than carrying a guessed epoch.
+        from audio_router import BrokerError
         try:
-            switch_request.write(seq, event, path=self.request_path)
+            applied = self._normalized()
+        except BrokerError:
+            applied = None
+        generation = applied["generation"] if applied else None
+        try:
+            switch_request.write(seq, event, path=self.request_path,
+                                 generation=generation)
         except switch_request.RequestError as exc:
             # An event this module built itself was refused by the envelope:
             # a bug here, never a client's doing. Loud, and never as "accepted".
             raise _broker_error("backend_failure", "audio backend failed") from exc
         except OSError as exc:
             raise _broker_error("backend_failure", "audio backend failed") from exc
-        return {"accepted": True, "seq": seq}
+        return {"accepted": True, "seq": seq, "generation": generation,
+                "effective": self._effective(applied)}
+
+    @classmethod
+    def _effective(cls, applied) -> dict | None:
+        """The applied state this reply echoes, or None when it was unreadable.
+
+        WHAT THIS IS AND IS NOT (contract 2026-09-14, section 1.4). It is the
+        state the APPLIER last wrote, read at the moment of the reply -- that
+        is, the state this request has not changed yet. It is deliberately NOT a
+        prediction of the outcome: `accepted` has never meant `applied`, and an
+        echo that guessed would make that confusion worse rather than better.
+
+        What it buys the client is the thing item I needs: a renderer whose
+        request timed out can tell what the backend's high-water mark and
+        position were WITHOUT a second round trip, so it can decide between
+        "reconcile, it may have landed" and "replay".
+        """
+        if not applied:
+            return None
+        return {
+            "output": applied["output"],
+            "inputMuted": applied["input_muted"],
+            "volume": cls._volume_of(applied, applied["output"]),
+            "requestSeq": applied["request_seq"],
+            "generation": applied["generation"],
+        }
 
     def _next_seq(self) -> int:
         floor = max(self._applied_seq(), self._pending_seq()) + 1
@@ -356,6 +399,10 @@ class SwitchApplierBackend:
             return self._status_envelope({
                 "supported": False, "output": DEFAULT_OUTPUT, "inputMuted": False,
                 "available": False, "reason": "state_unreadable", "volume": 0,
+                # Null, not zero: an unreadable file is an epoch and a mark this
+                # broker does not know, and zero is a number a client would
+                # compare against (contract 2026-09-14, section 1.3).
+                "generation": None, "requestSeq": None,
             }, muted=False, mute_supported=False)
         output = state["output"]
         unavailable = output == "mute" or (output == "headset" and not state["headset_present"])
@@ -364,6 +411,7 @@ class SwitchApplierBackend:
             "supported": True, "output": output, "inputMuted": state["input_muted"],
             "available": not unavailable, "reason": reason,
             "volume": self._volume_of(state, output),
+            "generation": state["generation"], "requestSeq": state["request_seq"],
         }, muted=output == "mute", mute_supported=True)
 
     @staticmethod
@@ -393,7 +441,7 @@ class SwitchApplierBackend:
         raw = self._state_strict()
         state = {"output": DEFAULT_OUTPUT, "input_muted": True,
                  "headset_present": False, "request_seq": -1, "volume_event_seq": 0,
-                 "volume": dict(DEFAULT_VOLUME)}
+                 "generation": 0, "volume": dict(DEFAULT_VOLUME)}
         # Same rule as wall_audio_state.normalize (step 4, terra rounds 2-4):
         # the microphone is MUTED unless the document explicitly carries the
         # boolean false, and a document that needed ANY repair comes back
@@ -419,6 +467,14 @@ class SwitchApplierBackend:
         if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
             state["request_seq"] = seq
         elif "request_seq" in raw:
+            repaired = True
+        # The epoch (contract 2026-09-14, section 1.1). Absent is an OLDER
+        # applier's file, not damage -- the same rule wall_audio_state.normalize
+        # applies -- so it does not trip the repair-mutes-the-microphone rule.
+        generation = raw.get("generation")
+        if isinstance(generation, int) and not isinstance(generation, bool) and 0 <= generation <= 9007199254740991:
+            state["generation"] = generation
+        elif "generation" in raw:
             repaired = True
         volume_event = raw.get("volume_event_seq", 0)
         if isinstance(volume_event, int) and not isinstance(volume_event, bool) and 0 <= volume_event <= 9007199254740991:

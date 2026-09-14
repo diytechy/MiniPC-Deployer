@@ -74,6 +74,17 @@ STATE_SCHEMA = {
     "request_seq": -1,
     # Physical rocker readout event, including repeated presses at the bounds.
     "volume_event_seq": 0,
+    # THE BACKEND EPOCH (contract 2026-09-14, section 1.1). `request_seq` orders
+    # requests INSIDE one life of the applier; it cannot order across a restart,
+    # because a state file that is replaced, repaired or rolled back can move the
+    # high-water mark BACKWARDS -- and then a request the applier already refused
+    # becomes indistinguishable from a fresh one, in silence.
+    #
+    # So the applier also stamps an epoch. It lives HERE, in the durable state,
+    # so it is monotonic across reboots; it is advanced by exactly one thing,
+    # `apply-state` finding no epoch marker in /run (which is tmpfs, so: once per
+    # boot). Nothing compares a `request_seq` across a change in this number.
+    "generation": 0,
     "version": STATE_VERSION,
 }
 
@@ -167,6 +178,16 @@ def normalize(raw):
     if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
         state["request_seq"] = seq
     elif "request_seq" in raw:
+        repaired = True
+    # The epoch. A file written by an applier that predates the contract has no
+    # `generation` at all, and that is NOT a repair: it is an older-but-honest
+    # document, and treating it as damage would mute the microphone on every
+    # panel the first time the new applier reads the old file. An epoch that is
+    # PRESENT and malformed is damage like any other.
+    generation = raw.get("generation")
+    if isinstance(generation, int) and not isinstance(generation, bool) and 0 <= generation <= 9007199254740991:
+        state["generation"] = generation
+    elif "generation" in raw:
         repaired = True
     volume_event = raw.get("volume_event_seq", 0)
     if isinstance(volume_event, int) and not isinstance(volume_event, bool) and 0 <= volume_event <= 9007199254740991:

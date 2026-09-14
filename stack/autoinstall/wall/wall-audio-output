@@ -90,6 +90,14 @@ LOCK_FILE = RUN_DIR / "audio-apply.lock"
 # for why it is a monotonic mark rather than an uptime threshold. In /run, not
 # /etc, because it describes THIS boot and must vanish with it.
 BOOT_STAMP = RUN_DIR / "audio-boot-apply.json"
+# THE EPOCH MARKER (contract 2026-09-14, section 1.1). /run is tmpfs, so the
+# absence of this file at `apply-state` time is exactly "a new life of the
+# backend": a boot, or somebody clearing /run by hand. Its presence carries the
+# generation this life is running as, so a resume re-assert, a rocker press, a
+# udev event and a broker request all find the SAME number and none of them
+# advances it. The durable half lives in the state file, which is what makes the
+# epoch monotonic across reboots rather than restarting from zero each time.
+EPOCH_MARKER = RUN_DIR / "audio-epoch.json"
 
 # Measured 2026-09-13: the headset adapter is 0d8c:0014 ("Device"), the 5.1
 # adapter 0d8c:0102 (ICUSBAUDIO7D). The USB id is matched rather than the card
@@ -389,6 +397,85 @@ def write_boot_stamp(path=None, dry_run=False, monotonic_usec=None):
         monotonic_usec = int(time.monotonic() * 1_000_000)
     stamp = {"monotonic_usec": max(0, int(monotonic_usec))}
     write_atomic(path, json.dumps(stamp) + "\n", mode=0o644)
+
+
+def read_epoch_marker(path=None):
+    """The generation THIS life of the backend is running as, or None.
+
+    None means /run carries no marker: either the panel has just booted (tmpfs
+    is empty) or somebody removed it. Either way the next `apply-state` opens a
+    new epoch. Every other command treats None as "keep whatever the state file
+    says", because only `apply-state` is allowed to advance the number.
+
+    Inputs:  path: the marker file (a test seam); defaults to EPOCH_MARKER at
+             CALL time, so the hermetic suite's WALL_PANEL_RUN_DIR is honoured.
+    Outputs: int >= 0, or None
+    Implements: SR-028, LLR-014
+    """
+    path = EPOCH_MARKER if path is None else path
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = raw.get("generation") if isinstance(raw, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        # A malformed marker is worse than none: it would pin this life to a
+        # number nothing agrees on. Read it as absent and let apply-state mint a
+        # fresh epoch over it.
+        return None
+    return value
+
+
+def write_epoch_marker(generation, path=None, dry_run=False):
+    """Publish the epoch this life of the backend is running as.
+
+    A dry run still writes a marker it was GIVEN (the same rule save_state and
+    write_boot_stamp follow), because the hermetic suite drives the real applier
+    across a simulated reboot and the presence or absence of this file is the
+    whole difference between "same epoch" and "new epoch".
+    """
+    path = EPOCH_MARKER if path is None else path
+    if dry_run and Path(path) == LIVE_RUN_DIR / "audio-epoch.json":
+        print("write %s (suppressed: --dry-run on the live epoch marker)" % path)
+        return
+    write_atomic(path, json.dumps({"generation": int(generation)}) + "\n", mode=0o644)
+
+
+def open_epoch(state, dry_run=False):
+    """Decide this life's generation. Only `apply-state` may call this.
+
+    A marker in /run means this life already has an epoch and it is kept. No
+    marker means /run was cleared -- a boot -- so the epoch ADVANCES by one from
+    the durable value in the state file, which is what makes it monotonic across
+    reboots instead of restarting at zero and colliding with requests minted
+    before the power cut.
+
+    Inputs:  state: a normalized state dict (mutated in place, like the rest of
+             the apply path)
+    Outputs: (state, [journal lines])
+    Implements: SR-028, LLR-014
+    """
+    existing = read_epoch_marker()
+    if existing is not None:
+        if state["generation"] != existing:
+            # The durable file and the marker disagree: a state file was rolled
+            # back or replaced under a running panel. The MARKER wins, because
+            # every request minted in this life was stamped from it, and the
+            # state file is brought back up to it.
+            lines = ["epoch %d restored from the run marker (state file said %d)"
+                     % (existing, state["generation"])]
+            state["generation"] = existing
+            return state, lines
+        return state, []
+    generation = state["generation"] + 1
+    if generation > 9007199254740991:
+        # Unreachable in practice (one per boot), but a wrapped epoch would be a
+        # silently accepted stale request, so it is refused loudly instead.
+        raise policy.StateError("epoch exhausted")
+    state["generation"] = generation
+    write_epoch_marker(generation, dry_run=dry_run)
+    return state, ["epoch %d opened (no run marker: this is a new backend life)"
+                   % generation]
 
 
 def is_boot_presence(initialized_usec, stamp=None, system_up=None):
@@ -1633,8 +1720,8 @@ ALLOWED_REQUEST_KINDS = frozenset(
     {"set_output", "set_input_mute", "set_volume", "nudge_volume"})
 
 
-def read_request(path, last_seq=-1):
-    """One validated, deduplicated broker request, or None.
+def read_request(path, last_seq=-1, generation=None):
+    """One validated, deduplicated, epoch-scoped broker request, or None.
 
     The request file is written by a LESS privileged process, so it is treated
     as input from outside: the envelope is checked here, the contents are
@@ -1644,6 +1731,31 @@ def read_request(path, last_seq=-1):
     Deduplication is by a monotonic `seq` against the last one recorded in the
     state: systemd.path fires on close-write, and an identical re-write of an
     unchanged request must not replay a rocker press.
+
+    THE EPOCH GATE (contract 2026-09-14, section 1.2). `seq` orders requests
+    inside one life of the applier. It cannot order across a restart: a state
+    file replaced or rolled back moves `request_seq` backwards, and then a
+    request refused before the restart is indistinguishable from a fresh one. So
+    a request may also carry `generation`, and one that names an epoch this
+    applier is not in is refused outright.
+
+    `generation` is OPTIONAL, and that is not laxity. The two other writers of
+    intent -- the rocker and the root CLI -- do not go through this file at all;
+    they invoke this same binary under this same lock, so they take their
+    ordering from the same authority and have no epoch of their own to quote. A
+    request without one is accepted as unscoped, exactly as it was before this
+    change, which is also what keeps an older broker working against a newer
+    applier.
+
+    Both gates run INSIDE the caller's lock, against the state just loaded, and
+    before any policy event is applied -- so a refusal leaves the state file
+    byte-identical.
+
+    Inputs:  path: the request file
+             last_seq: the state's `request_seq` high-water mark
+             generation: the applier's current epoch, or None to skip the gate
+    Outputs: (seq, event) or None
+    Implements: SR-028, LLR-014
     """
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -1665,6 +1777,18 @@ def read_request(path, last_seq=-1):
         # only way anyone finds out why the switch stopped responding.
         log("request %d ignored: not newer than the last applied (%d)" % (seq, last_seq))
         return None
+    if "generation" in raw:
+        asked = raw.get("generation")
+        if not isinstance(asked, int) or isinstance(asked, bool) or asked < 0:
+            log("request %d refused: generation must be a non-negative integer" % seq)
+            return None
+        if generation is not None and asked != generation:
+            # Loud, because this is the only way anyone finds out that a renderer
+            # is still talking to an epoch that ended -- which is precisely the
+            # moment it must re-handshake rather than be quietly obeyed.
+            log("request %d refused: generation %d is not the current epoch %d"
+                % (seq, asked, generation))
+            return None
     event = raw.get("event")
     if not isinstance(event, dict) or event.get("kind") not in ALLOWED_REQUEST_KINDS:
         log("request refused: unknown event kind")
@@ -1794,12 +1918,34 @@ def _locked_apply(arguments):
     if note:
         log(note)
 
+    # THE MARKER WINS OVER THE FILE, FOR EVERY COMMAND BUT apply-state (which
+    # opens the epoch itself, below). Every request minted in this life of the
+    # backend was stamped from the marker, so a state file that has been rolled
+    # back or replaced underneath a running panel must be brought back up to it
+    # rather than silently refusing every request in flight.
+    if arguments.command != "apply-state":
+        marker = read_epoch_marker()
+        if marker is not None and state["generation"] != marker:
+            log("epoch %d adopted from the run marker (state file said %d)"
+                % (marker, state["generation"]))
+            state["generation"] = marker
+
     seq = None
     boot_mark = None
     if arguments.command == "apply-state":
         # Sampled HERE, before anything is decided or applied, and written at
         # the very end -- see write_boot_stamp for why the two halves are apart.
         boot_mark = int(time.monotonic() * 1_000_000)
+        # The epoch is opened BEFORE anything else this command does, so that
+        # every write below -- including the presence record -- carries the
+        # generation this life of the backend will answer requests in.
+        try:
+            state, epoch_lines = open_epoch(state, dry_run=arguments.dry_run)
+        except policy.StateError as exc:
+            log("refused: %s" % exc)
+            return 1
+        for line in epoch_lines:
+            log(line)
         # THE STORED POSITION IS APPLIED FIRST, AND WHAT IS PLUGGED IN IS ONLY
         # RECORDED. Owner ruling 2026-09-13: over a boot we do not know when a
         # plug event happened or whether it is still relevant, so coldplug is a
@@ -1814,7 +1960,8 @@ def _locked_apply(arguments):
 
     if arguments.command == "apply-request":
         request = read_request(arguments.value or DEFAULT_REQUEST,
-                               state.get("request_seq", -1))
+                               state.get("request_seq", -1),
+                               generation=state.get("generation"))
         if request is None:
             return 0
         seq, event = request

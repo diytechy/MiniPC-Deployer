@@ -135,7 +135,7 @@ class SwitchApplierBackend:
         """
         intended = params.get("output")
         if intended is not None:
-            current = self._state().get("output")
+            current = self._state_strict().get("output")
             if current != intended:
                 raise _broker_error(
                     "switch_moved",
@@ -156,11 +156,7 @@ class SwitchApplierBackend:
         """
         if params["muted"] is True:
             return self._submit({"kind": "set_output", "output": "mute"})
-        # An unreadable state file answers `output` as None here, which takes
-        # this branch -- and that is the right answer rather than a lucky one:
-        # the applier's `normalize` falls back to `speaker`, so a panel whose
-        # state file cannot be parsed is not in `mute` either.
-        if self._state().get("output") != "mute":
+        if self._state_strict().get("output") != "mute":
             # Accepted, and honestly seq-less: no request was minted, so there
             # is nothing for a client to correlate against.
             return {"accepted": True}
@@ -206,7 +202,7 @@ class SwitchApplierBackend:
         return max(switch_request.next_seq(self.clock), floor)
 
     def _applied_seq(self) -> int:
-        seq = self._state().get("request_seq")
+        seq = self._state_strict().get("request_seq")
         return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else -1
 
     def _pending_seq(self) -> int:
@@ -234,6 +230,16 @@ class SwitchApplierBackend:
         """
         if not self.applier_path.exists() or not self.state_path.exists():
             raise _broker_error("backend_unavailable", "audio routing is not configured")
+        # AND THE STATE MUST BE READABLE, not merely present (terra 1.1). Every
+        # mutation decision here is taken against that file: the sequence floor
+        # comes from its `request_seq`, the volume guard from its `output`, and
+        # the legacy unmute from whether that output is `mute`. Treating an
+        # unreadable file as an empty one would mint a sequence from the clock
+        # alone -- which a backward step can put below the applier's recorded
+        # mark, where the applier silently discards it while this backend
+        # answers "accepted" -- and would answer a legacy unmute with a cheerful
+        # no-op. A file the broker cannot read is a switch it cannot move.
+        self._state_strict()
 
     def _state(self) -> dict:
         """The applier's state file, or {} if it cannot be read.
@@ -247,6 +253,22 @@ class SwitchApplierBackend:
         except (OSError, ValueError):
             return {}
         return raw if isinstance(raw, dict) else {}
+
+    def _state_strict(self) -> dict:
+        """The applier's state, or refuse. For every path that MUTATES.
+
+        The lenient `_state` is for `status` alone, where "unknown" is a real
+        answer the shell renders. A mutation has no such answer: see
+        `_require_applier` for the two silent failures this prevents.
+        """
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise _broker_error("backend_unavailable",
+                                "audio routing is not configured") from exc
+        if not isinstance(raw, dict):
+            raise _broker_error("backend_unavailable", "audio routing is not configured")
+        return raw
 
     def _status(self) -> dict:
         """IF-015 status: no routing, plus the switch block read off the file.

@@ -435,3 +435,82 @@ def test_backend_from_environment_reads_the_installed_paths(panel, monkeypatch):
     assert built.request_path == panel["request"] and built.state_path == panel["state"]
     monkeypatch.delenv("WALL_AUDIO_REQUEST_PATH")
     assert switch_backend.backend_from_environment().request_path == switch_request.DEFAULT_PATH
+
+
+# --- terra 1.1: a state file that is present but unreadable ------------------
+
+@pytest.mark.parametrize("damage", ["not json at all", "[]", '{"output": "speaker"'])
+@pytest.mark.parametrize("method,params", [
+    ("set_output", {"output": "mute"}), ("set_input_mute", {"muted": True}),
+    ("set_volume", {"level": 30}), ("set_mute", {"muted": False}),
+    ("set_mute", {"muted": True}),
+])
+def test_a_mutation_refuses_when_the_state_cannot_be_read_sr028(panel, damage, method, params):
+    """Unreadable is not empty.
+
+    Every mutation decision is taken against this file: the sequence floor, the
+    volume guard and the legacy unmute. Reading it as `{}` would mint a sequence
+    from the clock alone -- which a backward step can put below the applier's
+    recorded mark, where the applier discards it in silence while this backend
+    answers "accepted" -- and would answer a legacy unmute with a cheerful
+    no-op.
+    """
+    panel["state"].write_text(damage, encoding="utf-8")
+    broker = AudioBroker(backend(panel))
+    answer = reply(broker, wire(method, params))
+    assert answer["ok"] is False and answer["error"]["code"] == "backend_unavailable"
+    assert not panel["request"].exists()
+
+
+def test_a_backward_clock_below_the_appliers_mark_cannot_be_written_sr028(panel):
+    """The exact silent-discard shape terra 1.1 named, end to end."""
+    panel["state"].write_text("not json at all", encoding="utf-8")
+    broker = AudioBroker(backend(panel, clock=[5 * US]))
+    assert reply(broker, wire("set_output", {"output": "mute"}))["ok"] is False
+    # ...and with the same clock and a READABLE mark, the floor still wins.
+    set_state_fresh = {"version": 1, "output": "speaker", "input_muted": False,
+                       "volume": {"headset": 60, "speaker": 72},
+                       "headset_present": False, "headset_autoswitch_armed": True,
+                       "request_seq": 900_000}
+    panel["state"].write_text(json.dumps(set_state_fresh), encoding="utf-8")
+    broker = AudioBroker(backend(panel, clock=[5 * US]))
+    answer = reply(broker, wire("set_output", {"output": "mute"}, echo_seq=True))
+    assert answer["result"]["seq"] == 900_001 == written(panel)["seq"]
+
+
+def test_status_still_answers_on_an_unreadable_state_file_sr023(panel):
+    panel["state"].write_text("not json at all", encoding="utf-8")
+    result = reply(AudioBroker(backend(panel)), wire("status"))["result"]
+    assert result["switch"]["supported"] is False and result["mute"]["supported"] is False
+
+
+# --- terra: dispatch ordering, not just the pure validator -------------------
+
+class SpyBackend:
+    """Wraps the real backend and records every call that reached it."""
+
+    def __init__(self, inner):
+        self.inner, self.calls = inner, []
+
+    def call(self, method, params, cancel):
+        self.calls.append((method, dict(params)))
+        return self.inner.call(method, params, cancel)
+
+    def inventory(self, cancel):
+        return self.inner.inventory(cancel)
+
+
+@pytest.mark.parametrize("method,params", [
+    ("set_volume", {"level": 101}), ("set_volume", {"level": -1}),
+    ("set_volume", {"level": 50, "output": "mute"}),
+    ("set_volume", {"level": 50, "alias": "speaker"}),
+    ("set_output", {"output": "louder"}), ("set_input_mute", {"muted": "on"}),
+    ("connect", {"alias": "phone"}), ("set_output", {"output": "mute", "level": 3}),
+])
+def test_a_refused_request_never_reaches_the_backend_at_all_sr023(panel, method, params):
+    """Policy and authorization are BEFORE the seam, not inside it."""
+    spy = SpyBackend(backend(panel))
+    answer = reply(AudioBroker(spy), wire(method, params))
+    assert answer["ok"] is False
+    assert spy.calls == [], "a refused request must not be observed by a backend"
+    assert not panel["request"].exists()

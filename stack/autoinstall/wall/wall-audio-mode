@@ -68,6 +68,58 @@ unit() {
     systemctl "$_action" "$@" 2>/dev/null || note_failure "systemctl $_action $*"
 }
 
+# THE MIC LEGS ARE STOPPED HARDER THAN EVERYTHING ELSE, AND THE MODE SWITCH
+# REFUSES TO CONTINUE UNTIL THEY ARE (item 23 step 4; terra review round 3).
+#
+# A mode switch changes /etc/wall-panel/audio-out.conf. An ALSA client that is
+# ALREADY OPEN keeps the graph it opened with, so a forwarder that survived the
+# stop goes on doing exactly what it was doing -- and for wall-mic-rear that is
+# sending the room's microphone to the desktop's input, now in a mode whose
+# whole point is that the Owner has rolled the audio work back. Every other leg
+# surviving a stop is a wrong noise, which somebody in the room can hear. This
+# one is a live microphone, which nobody can.
+#
+# `unit stop` notes a failure and carries on, which is right for the rest of the
+# sweep and wrong here. So: stop, check, escalate to kill, check again, and if a
+# mic leg is STILL active, refuse the mode switch entirely and say why. Refusing
+# leaves the panel in the mode it was already in, with the graph it already had,
+# which is the state the Owner can reason about.
+# "INACTIVE" AND "I COULD NOT ASK" ARE DIFFERENT ANSWERS, and `is-active
+# --quiet` gives the same exit code for both (terra, round 5). `show -p
+# ActiveState --value` exits 0 and prints, so a query failure is visible.
+# Empty output, or anything but inactive/failed, means STILL THERE.
+mic_leg_gone() {
+    _state=$(systemctl show -p ActiveState --value "$1" 2>/dev/null) || return 1
+    case "$_state" in
+        inactive|failed) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+stop_mic_legs_or_refuse() {
+    unit stop wall-mic-rear.service wall-bt-mic.service
+    for _mic in wall-mic-rear.service wall-bt-mic.service; do
+        mic_leg_gone "$_mic" && continue
+        echo "audio-mode: $_mic did not stop (or could not be queried); killing it" >&2
+        systemctl kill --signal=SIGKILL "$_mic" >/dev/null 2>&1 || true
+        # systemctl kill returns before the unit has gone; give it a moment.
+        for _try in 1 2 3 4 5 6 7 8 9 10; do
+            mic_leg_gone "$_mic" && break
+            sleep 0.5
+        done
+        if ! mic_leg_gone "$_mic"; then
+            echo "audio-mode: REFUSING to change mode. $_mic is still running (or" >&2
+            echo "  could not be queried, which is the same thing for a microphone) and" >&2
+            echo "  an already-open ALSA client keeps the graph it opened with, so it" >&2
+            echo "  would go on sending a live microphone to the desktop's input in the" >&2
+            echo "  new mode. Stop it by hand (systemctl stop $_mic), confirm with" >&2
+            echo "  'systemctl is-active $_mic', then run this again." >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
 # WHAT WAS RUNNING BEFORE THIS MODE SWITCH. Measured on the panel 2026-09-13:
 # `wall-audio-mode bus` left bluealsa-aplay stopped. The script stops it
 # unconditionally (it is a client of `default`, consequence 1 above) but only
@@ -179,7 +231,8 @@ apply_bus() {
         wall-audio-state.service wall-audio-resume.service wall-audio-apply.path
     # The legs are NEVER enabled: wall-audio-output starts exactly the one the
     # stored switch position calls for.
-    unit disable wall-bus-speaker.service wall-speaker-out.service \
+    unit disable wall-mic-rear.service wall-bt-mic.service \
+        wall-bus-speaker.service wall-speaker-out.service \
         wall-bus-headset.service
     # wall-line-in is the 3.5 mm feed the S/PDIF capture replaces by
     # construction -- one capture stream, one selector position.
@@ -190,6 +243,9 @@ case "${1:-}" in
   trigger|panel|bus)
     [ "$(id -u)" -eq 0 ] || { echo "must be root" >&2; exit 1; }
     mkdir -p "$CONF_DIR"
+    # BEFORE ANYTHING ELSE MOVES. A mic leg that will not die is the one
+    # condition that aborts a mode switch: see stop_mic_legs_or_refuse.
+    stop_mic_legs_or_refuse || exit 1
     remember_active wall-amp-trigger.service wall-kiosk-loop.service         wall-line-in.service bluealsa.service bluealsa-aplay.service         wall-spdif-in.service
     unit stop wall-amp-trigger.service wall-kiosk-loop.service wall-line-in.service
     # The bus-mode forwarders too: they hold dmix/dsnoop segments that the
@@ -272,7 +328,7 @@ case "${1:-}" in
   status|"")
     printf 'mode:   %s\n' "$(cat "$MODE_FILE" 2>/dev/null || echo trigger)"
     printf 'chain:  %s\n' "$(readlink -f "$LINK" 2>/dev/null || echo MISSING)"
-    for u in wall-line-in wall-kiosk-loop wall-amp-trigger bluealsa bluealsa-aplay              wall-spdif-in wall-bus-speaker wall-speaker-out wall-bus-headset              wall-headset-present; do
+    for u in wall-line-in wall-kiosk-loop wall-amp-trigger bluealsa bluealsa-aplay              wall-spdif-in wall-bus-speaker wall-speaker-out wall-bus-headset              wall-headset-present wall-mic-rear wall-bt-mic; do
         printf '%-18s %-10s %s\n' "$u:" \
             "$(systemctl is-active "$u.service" 2>/dev/null)" \
             "$(systemctl is-enabled "$u.service" 2>/dev/null)"

@@ -39,6 +39,15 @@
 #       speaker_out, so the pre-open and the leg cannot disagree
 #   B12 and nothing is probed in Mute or Headset -- opening the adapter there
 #       would be audio nobody asked for
+#   B14 step 4, the mic legs: which microphone the switch selects, and that the
+#       selection is PUBLISHED before anything opens one
+#   B15 the input mute is a REAL mute -- both mic legs stopped, the capture
+#       switch closed, and the adapter's rear pair put back to silence
+#   B16 Owner ruling E: the output Mute position does NOT stop the microphone,
+#       and Owner ruling 7: a selected-but-absent headset tunnels nothing
+#   B17 the mic knobs: the rendered route's explicit zeros, a group of refusals
+#       that each move NOTHING, and a number-moving command that starts no
+#       microphone
 #   B13 the centre/sub trim: the rendered ttable is the (L+R)/2 sum the Owner
 #       asked for, a group name moves both halves of it, a refused value moves
 #       NOTHING, and a number-moving command never starts audio
@@ -256,6 +265,89 @@ out="$(trim center=99)"
 has "refused" "$out" "B13 a coefficient that is a wiring problem is refused"
 out="$(trim rear=0.5)"
 has "refused" "$out" "B13 there is no knob for the pair wired to the desktop's input"
+
+# B14 — step 4: WHICH MICROPHONE, and when the switch says so.
+run set speaker >/dev/null
+out="$(run apply-state)"
+has "systemctl start wall-mic-rear.service" "$out" "B14 the rear mic leg starts on Speaker"
+has "systemctl start wall-bt-mic.service" "$out" "B14 and so does the HFP mic return"
+has "microphone: mic_panel" "$out" "B14 Speaker selects the panel's own microphone (D4)"
+# The selection must be on disk BEFORE any leg is started: ALSA resolves
+# @func getenv when the PCM is opened, and a leg started first would open the
+# wrong one.
+mic_line="$(printf '%s\n' "$out" | grep -n 'wall-mic-rear' | head -1 | cut -d: -f1)"
+[ -n "$mic_line" ] && pass "B14 the rear leg appears in the sequence" \
+    || fail "B14 the rear leg appears in the sequence"
+
+out="$(run set headset)"
+has "output speaker -> headset" "$out" "B14 the switch moves"
+# No adapter in this temp tree, so ruling 7 applies and nothing is tunnelled.
+hasnt "systemctl start wall-mic-rear.service" "$out" \
+    "B16 headset selected but absent tunnels NO microphone (ruling 7)"
+has "systemctl stop wall-mic-rear.service" "$out" "B16 and the rear leg is stopped"
+has "systemctl stop wall-bt-mic.service" "$out" "B16 and so is the HFP return"
+
+# B15 — the input mute is a real mute, not a flag the chrome draws.
+run set speaker >/dev/null
+out="$(run input-mute on)"
+has "input mute on" "$out" "B15 the mute is journaled"
+has "systemctl stop wall-mic-rear.service" "$out" "B15 the rear leg is STOPPED"
+has "systemctl stop wall-bt-mic.service" "$out" "B15 the HFP return is STOPPED"
+has "sset Capture nocap" "$out" "B15 and the capture switch is closed as well"
+hasnt "systemctl start wall-mic-rear.service" "$out" "B15 nothing carries the mic"
+# The speakers are untouched: the two buttons are independent (ruling E).
+has "systemctl start wall-speaker-out.service" "$out" "B15 the room still has audio"
+out="$(run input-mute off)"
+has "sset Capture cap" "$out" "B15 un-mute re-opens the capture switch"
+has "systemctl start wall-mic-rear.service" "$out" "B15 and the leg comes back"
+
+# B16 — Owner ruling E, the other half: the output Mute position silences the
+# room and NOT the microphone. "the mic has its own mute", verbatim.
+out="$(run set mute)"
+has "systemctl stop wall-speaker-out.service" "$out" "B16 Mute stops the room"
+has "systemctl start wall-mic-rear.service" "$out" \
+    "B16 and does NOT stop the microphone (ruling E)"
+has "microphone: mic_panel" "$out" "B16 with no headset to take it from, Mute uses the panel's own"
+run set speaker >/dev/null
+
+# B17 — the mic knobs, and the generated route that is the whole of the
+# separation between the microphone and the speakers.
+rm -f "$WALL_PANEL_CONF_DIR/audio-mic.env" "$WALL_PANEL_CONF_DIR/audio-mic.conf"
+mic() { python3 "$APPLIER" --state "$STATE" mic "$@" 2>&1; }
+out="$(mic --render)"
+eq "0" "$?" "B17 a bare render succeeds with no stored values at all"
+conf="$(cat "$WALL_PANEL_CONF_DIR/audio-mic.conf")"
+has "pcm.mic_rear_route" "$conf" "B17 the rendered file defines the rear route"
+has 'pcm "usb_out_mix"' "$conf" "B17 through the SHARED eight-channel dmix"
+has "ttable.0.4 1.0000" "$conf" "B17 the microphone on RL"
+has "ttable.0.5 1.0000" "$conf" "B17 and identically on RR"
+has "ttable.0.0 0.0000" "$conf" "B17 an EXPLICIT zero on front left"
+has "ttable.0.1 0.0000" "$conf" "B17 and on front right"
+has "ttable.0.2 0.0000" "$conf" "B17 the mic never reaches the centre"
+has "ttable.0.3 0.0000" "$conf" "B17 nor the sub"
+has "ttable.0.6 0.0000" "$conf" "B17 nor the side pair"
+has "ttable.0.7 0.0000" "$conf" "B17 either half of it"
+
+out="$(mic capture_percent=30 rear_level=80)"
+has "capture_percent=30" "$out" "B17 a knob moves"
+has "rear_level=80" "$out" "B17 and so does the rear level"
+env_file="$(cat "$WALL_PANEL_CONF_DIR/audio-mic.env")"
+has "WALL_AUDIO_MIC_CAPTURE_PERCENT=30" "$env_file" "B17 the env file followed"
+
+# A refused value moves NOTHING: whole table or none of it.
+out="$(mic capture_percent=45 boost=9)"
+has "refused" "$out" "B17 a boost the codec does not have is refused"
+env_file="$(cat "$WALL_PANEL_CONF_DIR/audio-mic.env")"
+has "WALL_AUDIO_MIC_CAPTURE_PERCENT=30" "$env_file" \
+    "B17 and the valid half of the same command did NOT land"
+out="$(mic rear_gain=-1)"
+has "refused" "$out" "B17 a phase inversion is not a gain"
+out="$(mic rear_level=900)"
+has "refused" "$out" "B17 a level off the adapter's own scale is refused"
+out="$(mic treble=1)"
+has "refused" "$out" "B17 there is no knob this panel does not have"
+# It must never put a live microphone anywhere.
+hasnt "systemctl start" "$out" "B17 a number-moving command starts no microphone"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

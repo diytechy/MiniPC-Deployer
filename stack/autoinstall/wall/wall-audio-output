@@ -141,6 +141,50 @@ TRIM_SILENT_CHANNELS = (4, 5, 6, 7)
 TRIM_MAX = 4.0
 TRIM_MAX_DB = 20.0 * math.log10(TRIM_MAX)
 
+# ── the mic legs (step 4: item 23 C, D3, D4) ──────────────────────────────
+# Same two-file shape as the trim, for the same reason: ALSA reads one, the
+# scripts read the other, neither parses the other's syntax, and the numbers
+# worth tuning at a desk move with a subcommand rather than an editor.
+MIC_ENV = CONF_DIR / "audio-mic.env"
+MIC_CONF = CONF_DIR / "audio-mic.conf"
+MIC_ENV_PREFIX = "WALL_AUDIO_MIC_"
+# THE CAPTURE GAIN DEFAULT IS A MEASUREMENT, NOT A GUESS. The panel microphone
+# was found CLIPPING at the level it had been left at (capture 62 %, +12 dB,
+# peak 32768, -15.2 dBFS RMS). Read back off the panel on 2026-09-14 after the
+# AEC measurement run had lowered it live: `Capture` 15/63 = 24 % = -6.00 dB
+# with `Internal Mic Boost` 0, and that is what is seeded here so a firstboot
+# re-run agrees with the hardware instead of shouting over it.
+#
+# REAR_LEVEL is the adapter's own per-channel value for channels 4 and 5, on its
+# 0..197 / -36.93..0 dB scale. 66 is what the Owner's bench session set the
+# FRONT pair to, i.e. a level already proven sane out of this adapter's analog
+# section; the rear pair itself sits at 0 today because the tone era put it
+# there (coordinator log, 2026-09-13 22:50) and step 4 is precisely the step
+# that gives those channels a job again. It is a bench number: turn it with
+# `wall-audio-output mic rear_level=N` while watching the desktop's input meter.
+MIC_DEFAULTS = {"capture_percent": 24, "boost": 0, "headset_capture_percent": 60,
+                "rear_level": 66, "rear_gain": 1.0}
+MIC_INT_KEYS = ("capture_percent", "boost", "headset_capture_percent", "rear_level")
+MIC_KEYS = ("capture_percent", "boost", "headset_capture_percent",
+            "rear_level", "rear_gain")
+MIC_LIMITS = {"capture_percent": (0, 100), "boost": (0, 3),
+              "headset_capture_percent": (0, 100), "rear_level": (0, 197)}
+# The two rear channels of the adapter's FIXED map FL FR FC LFE RL RR SL SR.
+MIC_REAR_CHANNELS = (4, 5)
+# Every other channel of that map, written into the generated route as an
+# EXPLICIT zero. This is now the ONLY thing keeping the microphone out of the
+# speakers: the adapter has a single mute switch for all eight channels (numid 7
+# is one boolean, measured), so it cannot be used to silence the front while the
+# rear carries the mic. See wall_audio_state.plan for the whole argument.
+MIC_SILENT_CHANNELS = (0, 1, 2, 3, 6, 7)
+MIC_GAIN_MAX = 4.0
+MIC_SOURCE_VAR = "WALL_AUDIO_MIC_SOURCE"
+MIC_SOURCE_ENV = RUN_DIR / "audio-mic-source.env"
+MIC_REAR_PCM = "mic_rear"
+MIC_REAR_UNIT = "wall-mic-rear.service"
+# numid of the adapter's eight-value `Speaker Playback Volume`.
+ADAPTER_SPEAKER_NUMID = 8
+
 # The two chains speaker_out can slave onto, named in asound-bus-mode.conf.
 # `speaker_multi` is the 8-channel route with the centre and sub; the stereo one
 # is exactly what shipped before step 3 and is the fallback.
@@ -460,6 +504,26 @@ class Applier:
             return 1 if required else 0
         return 0
 
+    def capture(self, argv, timeout=15):
+        """Run one command for its STDOUT. Returns the text, or None.
+
+        Separate from `command` because a read is not a change: it is not
+        recorded in `self.commands` as something that was done to the panel, and
+        under `dry_run` it still runs, because a dry run that cannot read the
+        hardware cannot tell the caller what it would have written. Every
+        failure -- a missing binary, a timeout, a non-zero exit -- answers None,
+        and every caller must treat None as "leave the hardware alone".
+        """
+        try:
+            done = self._run(argv, check=False, capture_output=True, text=True,
+                             timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log("could not read %s: %s" % (" ".join(argv), exc))
+            return None
+        if done.returncode != 0:
+            return None
+        return done.stdout
+
 
 def write_atomic(path, text, mode=0o644, dry_run=False):
     """Replace a file in one rename, so no reader ever sees half a state.
@@ -483,6 +547,21 @@ def write_atomic(path, text, mode=0o644, dry_run=False):
     os.replace(temporary, path)
 
 
+def _muted_default():
+    """The default state, with the microphone MUTED.
+
+    What an unreadable or unparseable state file falls back to. `default_state()`
+    is Speaker and UNMUTED, which is right for a panel that has never been
+    configured and wrong for one whose state file we just failed to read: the
+    applier PERSISTS what it loaded before it applies it, so an unreadable file
+    was being rewritten as a valid, unmuted one and the units' own gate then saw
+    consent that nobody gave (terra, round 4).
+    """
+    state = policy.default_state()
+    state["input_muted"] = True
+    return state
+
+
 def load_state(path=STATE_FILE):
     """The stored state, normalized. A missing or unreadable file is the default.
 
@@ -493,9 +572,19 @@ def load_state(path=STATE_FILE):
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except FileNotFoundError:
+        # A panel that has never been configured. There is no prior mute to
+        # lose, so this is the ONE fallback that stays unmuted; a fresh image
+        # whose microphone needed a button press nobody has a button for yet
+        # (the chrome is step 5) would be a worse failure than the one below.
         return policy.default_state(), "no state file yet; defaults applied"
     except (OSError, ValueError) as exc:
-        return policy.default_state(), "state file unusable (%s); defaults applied" % exc
+        # A file that EXISTS and cannot be read is different in kind: it may
+        # have said `input_muted: true` a moment ago, and the applier PERSISTS
+        # what it loaded before it applies it -- so returning the unmuted
+        # default here rewrote an unreadable file into valid, unmuted consent
+        # that nobody gave, and the units' own gate then saw it (terra, round 4).
+        return _muted_default(), ("state file unusable (%s); defaults applied "
+                                  "with the MICROPHONE MUTED" % exc)
     state = policy.normalize(raw)
     # What was ACTUALLY replaced, field by field: the loaded document against
     # the normalized one. The previous spelling compared the normalized state
@@ -831,6 +920,445 @@ def trim_command(arguments):
     return 0
 
 
+# -- the mic knobs, their generated route, and the hardware they touch -----
+
+def load_mic(path=None):
+    """The mic knobs, with a note for anything that had to be replaced.
+
+    Field by field, exactly as `load_trim` and `policy.normalize` do it: one bad
+    number must not throw the rest away and leave the panel with no microphone
+    policy at all.
+
+    Outputs: (dict of MIC_KEYS -> int|float, [journal lines])
+    Implements: SR-029, LLR-016
+    """
+    path = MIC_ENV if path is None else Path(path)
+    values = dict(MIC_DEFAULTS)
+    notes = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return values, []
+    except OSError as exc:
+        return values, ["mic file unusable (%s); defaults applied" % exc]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, raw = line.partition("=")
+        key = name.strip()
+        if not key.startswith(MIC_ENV_PREFIX):
+            continue
+        key = key[len(MIC_ENV_PREFIX):].lower()
+        if key not in MIC_DEFAULTS:
+            notes.append("mic %s is not a knob this panel has: ignored" % key)
+            continue
+        ok, value = parse_mic_value(key, raw.strip().strip(chr(34)).strip(chr(39)))
+        if not ok:
+            notes.append("mic %s=%r refused (%s); using %s"
+                         % (key, raw.strip(), value, MIC_DEFAULTS[key]))
+            continue
+        values[key] = value
+    return values, notes
+
+
+def parse_mic_value(key, raw):
+    """(True, value) for an acceptable knob, (False, reason) otherwise.
+
+    Refused, never clamped, for the reason the trim gives: a number this far out
+    is a typo, and a microphone level is not something to guess halfway at.
+    """
+    if key in MIC_INT_KEYS:
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return False, "not a whole number"
+        low, high = MIC_LIMITS[key]
+        if not low <= value <= high:
+            return False, "outside %d..%d" % (low, high)
+        return True, value
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return False, "not a number"
+    if value != value or value in (float("inf"), float("-inf")):
+        return False, "not a finite number"
+    if value < 0.0:
+        return False, "negative: a phase inversion is not a gain"
+    if value > MIC_GAIN_MAX:
+        return False, "above %.1f: that is a wiring problem, not a gain" % MIC_GAIN_MAX
+    return True, value
+
+
+def render_mic_conf(values):
+    """The ALSA `route` that puts the mono mic on the adapter's REAR pair.
+
+    THIS IS THE ONLY THING KEEPING THE MICROPHONE OUT OF THE SPEAKERS, and that
+    is why every channel it does not own is written out as an explicit zero
+    rather than left implicit. The adapter has ONE mute switch for all eight
+    channels (numid 7 is a single boolean, measured 2026-09-14), so hardware
+    cannot make this guarantee while the mic leg is running; `speaker_multi`'s
+    matching zeros on channels 4-7 are the other half of the same bargain,
+    keeping the room's music out of the desktop's input.
+
+    Loaded by asound-bus-mode.conf through a hook with `errors false`: a missing
+    file leaves `mic_rear_route` undefined and the rear leg simply does not run,
+    rather than taking the whole configuration -- and with it `default`, the bus
+    and both output legs -- down with it.
+    Implements: SR-029, LLR-016
+    """
+    gain = values["rear_gain"]
+    lines = [
+        "# /etc/wall-panel/audio-mic.conf - GENERATED by `wall-audio-output mic`.",
+        "# Edit with that command, not by hand: this file is rewritten whole.",
+        "# The 8-channel map is the adapter's and is fixed:",
+        "#   0 FL  1 FR  2 FC  3 LFE  4 RL  5 RR  6 SL  7 SR",
+        "# Source channel 0 is the ONLY source: mic_selected is mono.",
+        "pcm.mic_rear_route {",
+        "    type route",
+        "    slave {",
+        '        pcm "usb_out_mix"',
+        "        channels 8",
+        "    }",
+    ]
+    for channel in MIC_REAR_CHANNELS:
+        lines.append("    ttable.0.%d %.4f  # the microphone, to the desktop's input"
+                     % (channel, gain))
+    for channel in MIC_SILENT_CHANNELS:
+        lines.append("    ttable.0.%d 0.0000  # the mic must never reach this channel"
+                     % channel)
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_mic_env(values):
+    """The knobs, as the env file the next run reads back."""
+    lines = ["# GENERATED by `wall-audio-output mic`. Must agree with audio-mic.conf."]
+    for key in MIC_KEYS:
+        value = values[key]
+        lines.append("%s%s=%s" % (MIC_ENV_PREFIX, key.upper(),
+                                  value if key in MIC_INT_KEYS else "%.4f" % value))
+    return "\n".join(lines) + "\n"
+
+
+def parse_mic_assignments(assignments, values):
+    """Fold `key=value` arguments into a copy of `values`, or raise ValueError.
+
+    NOTHING IS WRITTEN UNTIL EVERY ARGUMENT HAS PARSED -- the trim command's
+    rule, and for the same reason: a bench session that typed three changes and
+    fat-fingered the fourth must not be left with the first three applied.
+    """
+    wanted = dict(values)
+    for assignment in assignments:
+        name, separator, raw = assignment.partition("=")
+        if not separator:
+            raise ValueError("%r refused: not KEY=VALUE (keys: %s)"
+                             % (assignment, ", ".join(MIC_KEYS)))
+        key = name.strip().lower()
+        if key not in MIC_DEFAULTS:
+            # "refused" in EVERY refusal message, whatever the reason. An
+            # operator scanning a bench session's output for the word should not
+            # have to know that an unknown knob is worded differently from an
+            # out-of-range one.
+            raise ValueError("%r refused: not a knob this panel has (keys: %s)"
+                             % (key, ", ".join(MIC_KEYS)))
+        ok, value = parse_mic_value(key, raw.strip())
+        if not ok:
+            raise ValueError("%s=%s refused: %s" % (key, raw.strip(), value))
+        wanted[key] = value
+    return wanted
+
+
+def parse_adapter_levels(text):
+    """The eight values of `Speaker Playback Volume` out of `amixer cget`, or None.
+
+    amixer prints them on a line of their own, `  : values=66,66,24,...`.
+    Anything that is not exactly eight integers answers None, and the caller
+    then leaves the hardware alone: a rear level is worth having, and it is not
+    worth writing a guess into a control whose other six values are the Owner's
+    bench work.
+    """
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith(":") or "values=" not in line:
+            continue
+        raw = line.split("values=", 1)[1].strip()
+        parts = raw.split(",")
+        if len(parts) != 8:
+            return None
+        try:
+            return [int(part.strip()) for part in parts]
+        except ValueError:
+            return None
+    return None
+
+
+def rear_levels(current, level):
+    """The eight values with ONLY channels 4 and 5 moved to `level`.
+
+    The other six are the Owner's bench session (66,66,24,24,*,*,24,24 measured
+    2026-09-14) and this function is the promise that they are not touched.
+    """
+    wanted = list(current)
+    for channel in MIC_REAR_CHANNELS:
+        wanted[channel] = level
+    return wanted
+
+
+def set_rear_level(applier, adapter, level):
+    """Read the adapter's eight playback values, move the rear pair, write back.
+
+    Read-modify-write rather than a blind `cset` of all eight, because six of
+    those numbers were arrived at by somebody standing at an amplifier and this
+    command has no business having an opinion about them. A read that does not
+    answer eight integers moves NOTHING and says so.
+    """
+    captured = applier.capture(["/usr/bin/amixer", "-c", adapter, "cget",
+                                "numid=%d" % ADAPTER_SPEAKER_NUMID])
+    current = parse_adapter_levels(captured)
+    if current is None:
+        log("the adapter's 8 playback levels could not be read: the mic return's "
+            "rear level is left as it is (check `amixer -c %s cget numid=%d`)"
+            % (adapter, ADAPTER_SPEAKER_NUMID))
+        return False
+    wanted = rear_levels(current, level)
+    if wanted == current:
+        return True
+    # IT REPORTED SUCCESS WHETHER OR NOT THE WRITE LANDED (terra, round 2). The
+    # direction decides, exactly as it does for the mute: failing to RAISE the
+    # rear pair is a quiet mic return, while failing to LOWER it leaves the
+    # desktop's input wired to live channels after the leg has gone -- which is
+    # the independent hardware barrier this function exists to be.
+    lowering = level < max(current[channel] for channel in MIC_REAR_CHANNELS)
+    return applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "cset",
+                            "numid=%d" % ADAPTER_SPEAKER_NUMID,
+                            ",".join(str(value) for value in wanted)],
+                           required=lowering) == 0
+
+
+def mic_command(arguments, dry_run=False):
+    """`wall-audio-output mic [--render] [KEY=VALUE ...]`. Returns an exit code.
+
+    Like `trim`, and deliberately so. It NEVER starts a leg that is stopped -- a
+    command that only moves a number must not put a live microphone anywhere --
+    and it restarts the rear leg if it is ALREADY running, because ALSA reads a
+    plugin's configuration when the PCM is opened.
+    Implements: SR-029, LLR-016
+    """
+    values, notes = load_mic()
+    for note in notes:
+        log(note)
+    assignments = [argument for argument in arguments if argument != "--render"]
+    render_only = "--render" in arguments
+    if assignments:
+        try:
+            values = parse_mic_assignments(assignments, values)
+        except ValueError as exc:
+            log("mic: %s (nothing changed)" % exc)
+            return 2
+    applier = Applier(dry_run=dry_run)
+    if assignments or render_only:
+        write_atomic(MIC_ENV, render_mic_env(values), mode=0o644, dry_run=dry_run)
+        write_atomic(MIC_CONF, render_mic_conf(values), mode=0o644, dry_run=dry_run)
+    if assignments:
+        # Only if it is ALREADY running. A missing or erroring systemctl counts
+        # as not running, for the same reason the trim command counts it that
+        # way: the safe answer to "is a microphone live" is no.
+        if applier.command(["/usr/bin/systemctl", "is-active", "--quiet",
+                            MIC_REAR_UNIT], quiet=True) == 0:
+            applier.command(["/usr/bin/systemctl", "restart", MIC_REAR_UNIT],
+                            required=False)
+        log("mic: " + ", ".join("%s=%s" % (key, values[key]) for key in MIC_KEYS))
+        return 0
+    if not render_only:
+        for key in MIC_KEYS:
+            print("%-24s %s" % (key, values[key]))
+        print("%-24s %s" % ("env", MIC_ENV))
+        print("%-24s %s" % ("alsa", MIC_CONF))
+    return 0
+
+
+def select_mic_source(applier, source):
+    """Publish which capture PCM the mic legs open. True if it CHANGED.
+
+    THE RETURN VALUE IS LOAD-BEARING. ALSA resolves `@func getenv` when the PCM
+    is OPENED, so a forwarder that is already running holds the microphone it
+    started with for as long as it lives -- and `systemctl start` on an active
+    unit does nothing at all. Moving the switch from Speaker to Headset would
+    then leave the headset's far end listening to the PANEL's microphone, which
+    is the worst kind of bug this leg can have: everything looks right, audio
+    flows, and it is the wrong room. A changed source therefore RESTARTS the
+    legs rather than starting them.
+
+    The environment half is not redundant, for exactly the reason
+    `select_speaker_chain` spells out: `@func getenv` reads the environment of
+    the process that OPENS the PCM, and this applier's own probe of `mic_rear`
+    is its own child.
+    """
+    previous = read_env(MIC_SOURCE_ENV, MIC_SOURCE_VAR, None)
+    write_atomic(MIC_SOURCE_ENV, "%s=%s\n" % (MIC_SOURCE_VAR, source),
+                 mode=0o644, dry_run=applier.dry_run)
+    os.environ[MIC_SOURCE_VAR] = source
+    # SAID OUT LOUD ON EVERY APPLY, not only when it changes. A microphone is
+    # the one thing in this graph whose state cannot be heard from the room, so
+    # "which one is open right now" has to be answerable from the journal alone
+    # -- and it is what tells a real input mute (the legs stopped, below) apart
+    # from a cosmetic one at three in the morning.
+    log("microphone: %s%s" % (source,
+                              "" if previous is None or previous == source
+                              else " (was %s: the legs are restarted)" % previous))
+    return previous is not None and previous != source
+
+
+# ActiveState values that mean the unit is genuinely gone. `deactivating` is
+# NOT one of them: it is still running. Anything else, and anything unparseable,
+# is treated as "still there" by unit_active below.
+UNIT_GONE_STATES = frozenset({"inactive", "failed"})
+
+
+def unit_active(applier, unit):
+    """True (running), False (gone) or None (could not tell). Never guesses.
+
+    `systemctl is-active --quiet` CANNOT BE USED FOR THIS, and that is the whole
+    reason this function exists (terra, round 5). It exits non-zero both for a
+    unit that is inactive and for a D-Bus error, a timeout or a missing
+    systemctl -- and `Applier.command` collapses all of those to 1. So "the
+    microphone is gone" and "I could not ask whether the microphone is gone"
+    were the same answer, which is the fail-open shape this whole control keeps
+    producing.
+
+    `systemctl show -p ActiveState --value` exits 0 and PRINTS the state, so a
+    failure to query is distinguishable from an answer. None must be treated as
+    "still running" by anything making a safety decision.
+    """
+    text = applier.capture(["/usr/bin/systemctl", "show", "-p", "ActiveState",
+                            "--value", unit])
+    if text is None:
+        return None
+    state = text.strip().splitlines()
+    state = state[0].strip() if state else ""
+    if not state:
+        return None
+    return state not in UNIT_GONE_STATES
+
+
+def stop_mic_leg_hard(applier, unit):
+    """Stop a mic leg, and make sure it is actually gone. True if it is.
+
+    A STOP THAT FAILED USED TO BE COUNTED AND STEPPED OVER, and for a microphone
+    that is not enough: the state is saved before the apply, `wall-mic-rear` has
+    no runtime state recheck of its own, and an already-open `alsaloop` goes on
+    sending the room to the desktop's input while the stored state says muted.
+    Nobody in the room can hear that happen. (terra, round 4; `wall-audio-mode`
+    already escalated this way and `input-mute` did not.)
+
+    So: stop, ask, SIGKILL, ask again. The ExecCondition gate stops it coming
+    back. A leg that survives all of that is a failed apply with a journal line
+    that says the microphone may still be live, which is the most honest thing
+    left to do from here.
+    """
+    applier.command(["/usr/bin/systemctl", "stop", unit], required=False)
+    if unit_active(applier, unit) is False:
+        return True
+    log("%s did not stop, or could not be asked; killing it, because a "
+        "microphone that is still open is not something anybody in the room "
+        "can hear" % unit)
+    applier.command(["/usr/bin/systemctl", "kill", "--signal=SIGKILL", unit],
+                    required=False)
+    still = unit_active(applier, unit)
+    if still is False:
+        return True
+    log("REFUSING TO REPORT SUCCESS: %s %s after both a stop and a kill, so the "
+        "microphone may still be transmitting while the state says it is muted. "
+        "Check `systemctl status %s` and `fuser -v /dev/snd/*`."
+        % (unit, "is still running" if still else "could not be queried", unit))
+    return False
+
+
+def rear_mic_possible(applier, chain=None, speaker_wanted=None):
+    """Whether the mic-to-rear leg may be started right now. Journals if not.
+
+    THE ONE PLACE WHERE STEP 3'S FALLBACK AND STEP 4'S LEG CANNOT BOTH EXIST.
+    The adapter has ONE playback stream. Step 4 makes the eight-channel open a
+    dmix (`usb_out_mix`) precisely so the speaker route and the mic route can
+    share it. `speaker_stereo` -- the step 3 fallback, which is deliberately
+    still a RAW open of the adapter, because the whole point of a fallback is
+    that it is the simplest thing that can possibly work -- does not go through
+    that dmix. So while the speaker leg is running on the stereo fallback, the
+    adapter is held exclusively and the rear leg cannot open it.
+
+    That is not a failure to repair here: it is the degraded chain doing exactly
+    what a degraded chain should, and the Bluetooth mic return (a different
+    device entirely) is unaffected. In Mute and in Headset the speaker leg is
+    stopped, nothing holds the adapter, and the rear leg runs normally.
+    """
+    if chain is None:
+        chain = os.environ.get(SPEAKER_CHAIN_VAR) or read_env(
+            SPEAKER_CHAIN_ENV, SPEAKER_CHAIN_VAR, SPEAKER_CHAIN_MULTI)
+    if speaker_wanted is None:
+        speaker_wanted = applier.command(
+            ["/usr/bin/systemctl", "is-active", "--quiet", SPEAKER_OUT_UNIT],
+            quiet=True) == 0
+    if speaker_wanted and chain == SPEAKER_CHAIN_STEREO:
+        log("the mic return to the desktop's input is NOT running: the speaker "
+            "leg fell back to %s, which opens the adapter directly rather than "
+            "through %s, so there is no channel left for the rear pair. Fix the "
+            "8-channel chain (see /etc/wall-panel/audio-trim.conf) and re-apply."
+            % (SPEAKER_CHAIN_STEREO, "usb_out_mix"))
+        return False
+    return True
+
+
+def mic_allowed_command(arguments):
+    """`wall-audio-output mic-allowed`: exit 0 if a mic leg may run, 1 if not.
+
+    THE UNITS' OWN GATE, AND THE ANSWER TO A RESTART BEHIND A MUTE. Both mic
+    legs are `Restart=always`, so "the applier stopped it" is not a property
+    anybody can rely on: a guard or alsaloop crash, an operator restart, a
+    `daemon-reload` workflow, or a stop that FAILED during an apply would each
+    start the leg again with the state still saying muted. Review (terra,
+    2026-09-14, rounds 1 and 2) found that path twice, once per leg.
+
+    systemd re-runs `ExecCondition=` on every start attempt INCLUDING a restart,
+    and a non-zero exit from one is a clean "not started" rather than a failure,
+    which is exactly the shape wanted here.
+
+    It takes NO LOCK, for the same reason `status` does not: this is a read, and
+    a read that blocks behind an apply would deadlock the very apply that is
+    starting the leg. Every failure answers 1 -- an unreadable state file is not
+    consent to open a microphone.
+    Implements: SR-029, LLR-016
+    """
+    # A MISSING STATE FILE IS NOT CONSENT, and that is not a hardship: the
+    # applier SAVES the state before it applies the plan, so by the time it runs
+    # `systemctl start` on either mic leg the file is there. This gate and the
+    # Bluetooth supervisor's own therefore answer identically in every case --
+    # two gates on one privacy control must not be able to disagree.
+    # IT DOES NOT USE load_state, AND THAT IS THE WHOLE POINT (terra, round 3).
+    # `load_state` exists to keep the panel working: it converts a missing,
+    # unreadable or unparseable file into `default_state()`, which is Speaker,
+    # UNMUTED. That is right for audio and exactly wrong here -- it would have
+    # started a real microphone forwarder off a corrupt file while claiming
+    # "every failure answers 1", and it would have disagreed with the Bluetooth
+    # supervisor, which parses the document itself and refuses.
+    #
+    # So this gate reads the raw JSON, and anything that is not a document it
+    # can read answers 1. `normalize` then does the rest, including its own
+    # rule that a document needing repair comes back muted.
+    try:
+        raw = json.loads(Path(arguments.state).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        log("no switch state on disk: refusing to start a microphone leg")
+        return 1
+    except (OSError, ValueError) as exc:
+        log("switch state unreadable (%s): refusing to start a microphone leg" % exc)
+        return 1
+    try:
+        return 0 if policy.mic_live(policy.normalize(raw)) else 1
+    except Exception:  # noqa: BLE001 - a policy that raises must not open a mic
+        return 1
+
+
 def probe_speaker_chain(applier):
     """Which chain speaker_out can actually slave onto. See SPEAKER_CHAIN_*.
 
@@ -906,7 +1434,17 @@ def apply_plan(state, applier):
     wanted = policy.plan(state)
     adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
     loopback = read_env(CARDS_FILE, "WALL_AUDIO_LOOPBACK_CARD", "Loopback")
+    builtin = read_env(CARDS_FILE, "WALL_AUDIO_BUILTIN_CARD", "PCH")
     headset = headset_card()
+    mic_values, mic_notes = load_mic()
+    for note in mic_notes:
+        log(note)
+    # WHICH MICROPHONE, PUBLISHED BEFORE ANYTHING OPENS ONE. The mic legs read
+    # this through `@func getenv` on `mic_selected`, exactly as the headset leg
+    # reads its card id, so it has to be written before they are started -- and
+    # before the applier's own probe of `mic_rear`, which is its own child and
+    # inherits its environment.
+    mic_source_changed = select_mic_source(applier, wanted["mic_source"])
 
     # The resolved headset card, for the headset leg's alsaloop. Written even
     # when the adapter is absent (as an empty value) so that a stale card id
@@ -914,9 +1452,26 @@ def apply_plan(state, applier):
     write_atomic(HEADSET_ENV, "WALL_AUDIO_HEADSET_CARD=%s\n" % (headset or ""),
                  mode=0o644, dry_run=applier.dry_run)
 
+    # FAILING TO START A MICROPHONE IS A DEGRADED PANEL. FAILING TO STOP ONE IS
+    # A PRIVACY FAILURE. The two directions are therefore NOT symmetric, and
+    # review (terra, 2026-09-14) was right that making them symmetric was
+    # fail-open on the one control in this design whose failure nobody can hear:
+    # a transient systemctl error would have persisted `input_muted: true`,
+    # returned success, and left the microphone transmitting.
+    #
+    # So a mic leg that will not STOP counts as a failed apply, exactly like an
+    # output leg, and says so loudly. A mic leg that will not START does not:
+    # `apply-state` runs under wall-audio-state.service, which firstboot waits
+    # on, and a non-zero return there is a red firstboot and a panel that looks
+    # broken at the glass. That asymmetry is the whole point.
     for unit, should_run in wanted["legs"].items():
         if not should_run:
-            failures += applier.command(["/usr/bin/systemctl", "stop", unit])
+            if unit in policy.MIC_LEGS:
+                # Stopped HARDER than the output legs, and verified: see
+                # stop_mic_leg_hard for why a counted failure is not enough.
+                failures += 0 if stop_mic_leg_hard(applier, unit) else 1
+            else:
+                failures += applier.command(["/usr/bin/systemctl", "stop", unit])
     # Mixer mutes are not required: a card that has just been unplugged has no
     # controls to set, and that is the normal headset case, not an error.
     applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",
@@ -924,8 +1479,58 @@ def apply_plan(state, applier):
     if headset:
         applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Speaker",
                          "mute" if wanted["headset_muted"] else "unmute"], required=False)
+        failures += applier.command(
+            ["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
+             "nocap" if wanted["input_muted"] else "cap"],
+            required=bool(wanted["input_muted"]))
         applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
-                         "nocap" if wanted["input_muted"] else "cap"], required=False)
+                         "%d%%" % mic_values["headset_capture_percent"]],
+                        required=False)
+    # THE CAPTURE SIDE. Item 23 D4 puts the PANEL's own microphone on the mic
+    # input in Speaker position, and that microphone was found CLIPPING at the
+    # level it had been left at -- peak 32768, -15.2 dBFS RMS, at capture 62 %
+    # with +12 dB of boost. The seeded knob is the level measured on the panel
+    # after the AEC run had lowered it live (24 %, -6.00 dB, boost 0), and it is
+    # re-asserted on every apply rather than trusted to alsactl, because a level
+    # that clips is not a preference somebody might have meant.
+    #
+    # `Capture Source` is NOT touched. It is an exclusive enum on this codec
+    # (`Internal Mic` | `Headset Mic`, measured 2026-09-14) and it already reads
+    # Internal Mic; the panel's own jack has no capture path at all (the
+    # 2026-09-12 pin dump), so there is nothing for the other position to mean.
+    applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Capture",
+                     "%d%%" % mic_values["capture_percent"]], required=False)
+    applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
+                     "Internal Mic Boost", "%d" % mic_values["boost"]],
+                    required=False)
+    # THE INPUT MUTE IS A REAL MUTE AND THIS IS THE HARDWARE HALF OF IT (Owner
+    # ruling E). The leg half -- stopping both forwarders, so that not one
+    # sample leaves this panel -- is in `wanted["legs"]` above and below, and it
+    # is the half that actually guarantees the property. This one is the belt:
+    # a capture switch closed on the card means an unmuted leg started by
+    # anything else still records silence.
+    # `required` follows the DIRECTION here for the same reason the legs do.
+    # Closing a capture switch that will not close is a privacy failure worth
+    # reporting; opening one that will not open is a microphone that does not
+    # work, which the leg above has already said.
+    failures += applier.command(
+        ["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Capture",
+         "nocap" if wanted["input_muted"] else "cap"],
+        required=bool(wanted["input_muted"]))
+    # THE REAR PAIR IS RAISED ONLY WHILE A MIC LEG IS MEANT TO RUN, and put back
+    # to the 0 the tone era left it at otherwise (coordinator log 2026-09-13
+    # 22:50, "adapter rear pair (RL/RR) set to 0 and stored with alsactl"). Two
+    # independent things therefore have to be wrong at once before the room's
+    # music can reach the desktop's input: the generated speaker route's
+    # explicit zeros on channels 4-7, and this level.
+    if not set_rear_level(applier, adapter,
+                          mic_values["rear_level"] if wanted["mic_live"] else 0) \
+            and not wanted["mic_live"]:
+        # Only the LOWERING direction is counted: see set_rear_level.
+        failures += 1
+        log("the adapter's rear pair could NOT be returned to silence: the "
+            "desktop's input is still wired to live channels. The generated "
+            "route's explicit zeros are the only barrier left.")
     # THE SOFTVOL CONTROL IS DECLARED, AND SET, BEFORE THE LEG STARTS. softvol
     # creates its control when a client opens the PCM that declares it, and a
     # control that does not exist yet cannot be set -- which on 2026-09-13 made
@@ -946,7 +1551,15 @@ def apply_plan(state, applier):
         if declare_bus_control(applier, leg_pcm):
             set_bus_level(applier, loopback, wanted["volume"], expected=False)
     for unit, should_run in wanted["legs"].items():
-        if should_run:
+        if not should_run:
+            continue
+        if unit in policy.MIC_LEGS:
+            if unit == MIC_REAR_UNIT and not rear_mic_possible(applier):
+                continue
+            applier.command(["/usr/bin/systemctl",
+                             "restart" if mic_source_changed else "start", unit],
+                            required=False)
+        else:
             failures += applier.command(["/usr/bin/systemctl", "start", unit])
     # THE LEVEL IS SET LAST AND IT IS RETRIED. softvol creates its control when
     # a client OPENS the PCM that declares it, and `systemctl start` on a
@@ -1071,15 +1684,15 @@ def main(argv=None):
                         help="force a presence report to be treated as a plug "
                              "event on an already-running system")
     parser.add_argument("--render", action="store_true",
-                        help="re-render the trim file from the stored values")
+                        help="re-render the generated file from the stored values")
     parser.add_argument("--trim-env", default=None,
                         help="the trim values file (a test seam)")
     parser.add_argument("--trim-conf", default=None,
                         help="the rendered ALSA trim file (a test seam)")
     parser.add_argument("command", choices=("status", "set", "input-mute", "volume",
                                             "headset", "apply-state", "apply-request",
-                                            "trim"))
-    # `trim` takes a whole table's worth of KEY=VALUE; every other command takes
+                                            "trim", "mic", "mic-allowed"))
+    # `trim` and `mic` take a whole table's worth of KEY=VALUE; every other takes
     # at most one word. Parsed as a list here and narrowed below, so that a
     # second argument to `set` is a usage error rather than a silently ignored
     # one.
@@ -1091,9 +1704,9 @@ def main(argv=None):
     arguments.trim_env = Path(arguments.trim_env or TRIM_ENV)
     arguments.trim_conf = Path(arguments.trim_conf or TRIM_CONF)
 
-    if arguments.command != "trim":
+    if arguments.command not in ("trim", "mic"):
         if arguments.render:
-            parser.error("--render only means anything for `trim`")
+            parser.error("--render only means anything for `trim` and `mic`")
         if len(arguments.value) > 1:
             parser.error("%s takes at most one argument" % arguments.command)
         arguments.value = arguments.value[0] if arguments.value else None
@@ -1102,6 +1715,17 @@ def main(argv=None):
         # Under the same lock every other writer takes: see trim_command.
         with apply_lock(dry_run=arguments.dry_run):
             return trim_command(arguments)
+
+    if arguments.command == "mic":
+        # Same lock, same reason: it rewrites a generated ALSA file and may
+        # restart a leg, so it must not interleave with an apply.
+        with apply_lock(dry_run=arguments.dry_run):
+            # dry_run was DROPPED here, so `--dry-run mic` overwrote
+            # /etc/wall-panel/audio-mic.* and could restart a live microphone
+            # (terra, round 5). A dry run must be dry in every command.
+            return mic_command(list(arguments.value)
+                               + (["--render"] if arguments.render else []),
+                               dry_run=arguments.dry_run)
 
     if arguments.boot and arguments.runtime:
         parser.error("--boot and --runtime are opposites; pass at most one")
@@ -1119,6 +1743,11 @@ def main(argv=None):
                                        and not arguments.value.isdigit()):
             parser.error("volume takes 0..100, up or down")
 
+    if arguments.command == "mic-allowed":
+        # Read-only and LOCK-FREE, like `status`: it is asked by both mic units'
+        # ExecCondition while an apply that is starting them holds the lock.
+        return mic_allowed_command(arguments)
+
     if arguments.command == "status":
         # The only read-only command, and the only one that does not take the
         # lock: a status printed during someone else's apply is a moment in
@@ -1129,6 +1758,9 @@ def main(argv=None):
         trim, trim_notes = load_trim(arguments.trim_env)
         for line in trim_notes:
             log(line)
+        mic, mic_notes = load_mic()
+        for line in mic_notes:
+            log(line)
         print(json.dumps({"mode": current_mode(), "state": state,
                           "plan": policy.plan(state),
                           # Step 3, and the two things the Owner will want at
@@ -1138,6 +1770,14 @@ def main(argv=None):
                                                     SPEAKER_CHAIN_VAR,
                                                     SPEAKER_CHAIN_MULTI),
                           "trim": {key: round(trim[key], 4) for key in TRIM_KEYS},
+                          # Step 4. `mic_source` and `mic_live` come out of the
+                          # plan, so `status` says which microphone the switch
+                          # BELIEVES is selected and whether it should be
+                          # running at all -- which is what tells a cosmetic
+                          # mute apart from a real one at the glass.
+                          "mic": {key: mic[key] for key in MIC_KEYS},
+                          "mic_source_published": read_env(MIC_SOURCE_ENV,
+                                                           MIC_SOURCE_VAR, None),
                           "headset_card": headset_card()}, indent=2, sort_keys=True))
         return 0
 

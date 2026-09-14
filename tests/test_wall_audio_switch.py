@@ -79,6 +79,26 @@ def applier(policy):
     return load(APPLIER, "wall_audio_output")
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_run_dir(applier, tmp_path, monkeypatch):
+    """Every /run path the applier publishes goes to a temp tree, in EVERY test.
+
+    Not a convenience. Tests that drive `apply_plan` for real (rather than with
+    --dry-run) write these files, and on a dev box `/run/wall-panel` resolves to
+    a real directory that SURVIVES the test run -- so the next run read back a
+    published speaker chain and a whole unrelated test started failing. It
+    happened twice while step 4 was being written, which is why the guard is
+    autouse and module-wide rather than a line in each test that remembers.
+    """
+    # BOOT_STAMP and LOCK_FILE are deliberately NOT in this list: their own
+    # tests assert their real names and paths, and both are already given temp
+    # locations by the cases that write them.
+    for name in ("SPEAKER_CHAIN_ENV", "MIC_SOURCE_ENV", "HEADSET_ENV"):
+        monkeypatch.setattr(applier, name, tmp_path / ("run-" + name.lower()))
+    for name in ("SPEAKER_CHAIN_VAR", "MIC_SOURCE_VAR"):
+        monkeypatch.delenv(getattr(applier, name), raising=False)
+
+
 # ── the pure switch policy ─────────────────────────────────────────────────
 
 def test_the_three_positions_are_the_owners_three_sr028(policy):
@@ -191,7 +211,18 @@ def test_speaker_runs_the_tap_leg_and_headset_does_not_sr028(policy):
     headset = policy.plan(state)
     assert headset["legs"]["wall-bus-headset.service"] is True
     assert not headset["legs"]["wall-bus-speaker.service"]
-    assert headset["adapter_muted"] is True
+    # STEP 4 CHANGED THIS AND THE CHANGE IS DELIBERATE. The adapter's mute is
+    # ONE boolean over all eight channels (numid 7, measured 2026-09-14), and in
+    # Headset position item 23 D3 still wants the headset's microphone on the
+    # adapter's REAR pair, which is the desktop's input. Muting the card would
+    # silence that too, and the card cannot say "front off, rear on". So it is
+    # muted only when nothing at all is meant to leave it, and the separation is
+    # the two generated route tables' explicit zeros (asserted further down).
+    assert headset["adapter_muted"] is False
+    assert headset["mic_live"] is True
+    # ... and it IS muted the moment no mic leg wants it either.
+    silent, _ = policy.apply_event(state, {"kind": "set_input_mute", "muted": True})
+    assert policy.plan(silent)["adapter_muted"] is True
 
 
 @pytest.mark.parametrize("event", [
@@ -354,7 +385,7 @@ def test_every_direct_plugin_has_a_single_card_slave_ruling_9_sr028():
         section = conf.split("pcm." + name + " {", 1)[1].split("\n}", 1)[0]
         assert section.count("pcm ") == 1, name
         assert card in section, name
-    assert blocks or True
+    assert blocks, "no direct plugin was inspected at all"
 
 
 def test_the_three_sources_land_on_one_bus_sr028():
@@ -713,7 +744,7 @@ def test_coldplug_is_told_from_a_plug_by_two_monotonic_marks_sr028(applier):
     assert applier.is_boot_presence(9000, stamp=5000, **up) is False, "later is a plug event"
 
 
-def test_a_boot_that_has_not_finished_can_never_auto_switch_sr028(applier):
+def test_a_boot_that_has_not_finished_can_never_auto_switch_sr028(applier, monkeypatch):
     """Gate 1, and the reason systemd-udev-settle was dropped.
 
     Review was right that settle only drains the queue it can SEE: an adapter
@@ -724,7 +755,15 @@ def test_a_boot_that_has_not_finished_can_never_auto_switch_sr028(applier):
     by itself, so there is no number here to get wrong.
     """
     assert applier.is_boot_presence(999_999_999, stamp=1, system_up=False) is True
-    assert applier.is_boot_presence(999_999_999, stamp=1, system_up=None) is True, \
+    # `system_up=None` is the "not supplied" sentinel, NOT "unanswerable": the
+    # function then goes and asks system_is_up() itself. Passing None here
+    # therefore asserted nothing on any machine that HAS systemd -- including
+    # the panel, which is the only machine that matters -- and passed on the dev
+    # box only because `systemctl` is missing there. Found running this suite
+    # under `wsl -d Ubuntu` for the step-4 ALSA proof, 2026-09-14. The claim is
+    # about an unanswerable gate 1, so the unanswerable thing is what is stubbed.
+    monkeypatch.setattr(applier, "system_is_up", lambda *a, **k: None)
+    assert applier.is_boot_presence(999_999_999, stamp=1) is True, \
         "an unanswerable gate is coldplug too"
 
 
@@ -903,10 +942,11 @@ def test_the_boot_finished_gate_reads_systemd_not_a_clock_sr028(applier):
 class _Reply:
     """What subprocess.run returns to the applier."""
 
-    def __init__(self, returncode):
+    def __init__(self, returncode, stdout=None, stderr=None):
         self.returncode = returncode
-        self.stdout = ""
-        self.stderr = "amixer: Unable to find simple control 'Bus',0"
+        self.stdout = "" if stdout is None else stdout
+        self.stderr = ("amixer: Unable to find simple control 'Bus',0"
+                       if stderr is None else stderr)
 
 
 def test_the_control_is_declared_and_set_before_the_leg_starts_sr028(applier, policy):
@@ -1055,10 +1095,19 @@ def test_the_speaker_leg_opens_eight_channels_d4_sr028():
     written in.
     """
     conf = read(BUS_CONF)
+    # STEP 4 MOVED THE OPEN ITSELF ONE LEVEL DOWN, into a dmix, because the
+    # adapter has ONE playback stream and the mic return needs the rear pair of
+    # it at the same time as the speaker leg has the front. speaker_hw8 is now
+    # the plug that reaches that dmix; `channels 8` -- which is the whole of how
+    # altset 1 is selected -- lives in the dmix's slave.
     hw8 = conf.split("pcm.speaker_hw8 {", 1)[1].split("\n}", 1)[0]
-    assert "channels 8" in hw8
-    assert 'pcm "card_usb"' in hw8, "the card id still comes from the generated map"
-    assert "format S16_LE" in hw8 and "rate 48000" in hw8
+    assert "usb_out_mix" in hw8
+    shared = conf.split("pcm.usb_out_mix {", 1)[1].split("\n}", 1)[0]
+    assert "type dmix" in shared
+    assert "channels 8" in shared
+    assert '"card_usb"' in shared
+    assert 'pcm "card_usb"' in shared, "the card id still comes from the generated map"
+    assert "format S16_LE" in shared and "rate 48000" in shared
 
 
 def test_the_mono_sum_reaches_both_centre_and_sub_d4_sr028(applier):
@@ -1391,12 +1440,16 @@ def test_the_generated_alsa_config_parses_sr028(tmp_path):
         pytest.skip("alsa-lib's own configuration is not present")
 
     trim = tmp_path / "audio-trim.conf"
+    mic = tmp_path / "audio-mic.conf"
     cards = tmp_path / "audio-cards.conf"
     out = tmp_path / "audio-out.conf"
     root = tmp_path / "asound.conf"
     trim.write_text(read(TRIM_EXAMPLE), encoding="utf-8")
+    mic.write_text(read(MIC_EXAMPLE), encoding="utf-8")
     cards.write_text(read(WALL / "audio-cards.conf.example"), encoding="utf-8")
-    out.write_text(read(BUS_CONF).replace("/etc/wall-panel/audio-trim.conf", str(trim)),
+    out.write_text(read(BUS_CONF)
+                   .replace("/etc/wall-panel/audio-trim.conf", str(trim))
+                   .replace("/etc/wall-panel/audio-mic.conf", str(mic)),
                    encoding="utf-8")
     root.write_text(read(WALL / "asound.conf")
                     .replace("/etc/wall-panel/audio-cards.conf", str(cards))
@@ -1411,13 +1464,1068 @@ def test_the_generated_alsa_config_parses_sr028(tmp_path):
 
     resolved = names(root)
     for name in ("bus", "bus_monitor", "speaker_tap", "speaker_out", "speaker_multi",
-                 "speaker_stereo", "speaker_hw8", "spdif_in"):
+                 "speaker_stereo", "speaker_hw8", "spdif_in",
+                 # step 4: the shared eight-channel dmix, both capture sources,
+                 # the one name the AEC step will replace, and the rear route.
+                 "usb_out_mix", "mic_panel", "mic_headset", "mic_selected",
+                 "mic_rear", "mic_rear_route"):
         assert name in resolved, "%s did not resolve: %s" % (name, sorted(resolved))
 
-    # And the containment the hook buys: without the trim file the graph is
-    # still there, only the multi chain is gone.
+    # And the containment the two hooks buy, one generated file at a time.
+    # Without the trim file the graph is still there, only the multi chain is
+    # gone -- and the MIC leg survives, because the two files are independent.
     trim.unlink()
     survived = names(root)
     assert "speaker_multi" not in survived
-    for name in ("bus", "speaker_out", "speaker_stereo"):
+    for name in ("bus", "speaker_out", "speaker_stereo", "mic_rear_route",
+                 "mic_selected"):
         assert name in survived, "a missing trim file took %s down with it" % name
+
+    # And the other way round: a missing mic file costs the rear route and
+    # NOTHING else. This is the one that matters at the glass -- a panel that
+    # went silent because a microphone's generated file was not there would be
+    # the worst possible trade.
+    trim.write_text(read(TRIM_EXAMPLE), encoding="utf-8")
+    mic.unlink()
+    survived = names(root)
+    assert "mic_rear_route" not in survived
+    for name in ("bus", "speaker_out", "speaker_multi", "mic_selected",
+                 "mic_panel", "usb_out_mix", "default"):
+        assert name in survived, "a missing mic file took %s down with it" % name
+    # `headset_out` and `mic_headset_raw` never appear in `aplay -L` at all,
+    # here or above: alsa-lib's name hints skip a definition whose card comes
+    # from `@func getenv`. That is a property of the LISTING, not of the graph --
+    # they open fine on the panel -- and it is written down so that a future
+    # reader does not add them to these lists and then "fix" the config.
+
+
+# ── step 4: the mic legs (item 23 C, D3, D4; Owner ruling E) ───────────────
+#
+# Read in this order: which microphone the switch selects, what the input mute
+# actually does, the two generated route tables that are the whole of the
+# separation between the microphone and the speakers, and the ways the leg is
+# allowed to fail.
+
+MIC_EXAMPLE = WALL / "audio-mic.conf.example"
+MIC_REAR_UNIT_FILE = WALL / "wall-mic-rear.service"
+BT_MIC_UNIT_FILE = WALL / "wall-bt-mic.service"
+BT_MIC = WALL / "wall-bt-mic.py"
+
+
+@pytest.fixture(scope="module")
+def btmic():
+    return load(BT_MIC, "wall_bt_mic")
+
+
+def test_the_mic_follows_the_output_switch_d3_d4_sr029(policy):
+    """D4 Speaker -> the panel's own mic; D3 Headset -> the adapter's.
+
+    There is no fourth button: the selection is a consequence of the output
+    position, which is what item 23 asks for and all it asks for.
+    """
+    speaker = policy.default_state()
+    assert policy.mic_source(speaker) == policy.MIC_SOURCE_PANEL
+    assert policy.plan(speaker)["mic_source"] == "mic_panel"
+
+    headset, _ = policy.apply_event(speaker, {"kind": "headset", "present": True})
+    assert headset["output"] == "headset"
+    assert policy.mic_source(headset) == policy.MIC_SOURCE_HEADSET
+    assert policy.plan(headset)["mic_source"] == "mic_headset"
+
+
+def test_output_mute_does_not_mute_the_microphone_ruling_e_sr029(policy):
+    """Owner ruling E, in as many words: "the mic has its own mute".
+
+    The Mute POSITION silences the room. It is not an input control, and a panel
+    that quietly stopped the microphone when somebody silenced the speakers
+    would be answering a question the Owner explicitly answered the other way.
+    """
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_output", "output": "mute"})
+    assert policy.audible(muted) is False, "the room is silent"
+    assert policy.mic_live(muted) is True, "the microphone is not"
+    plan = policy.plan(muted)
+    assert all(plan["legs"][unit] is False
+               for unit in policy.SPEAKER_LEGS + policy.HEADSET_LEGS)
+    assert all(plan["legs"][unit] is True for unit in policy.MIC_LEGS)
+    # And in Mute there is no headset to take the mic from, so it is the panel's.
+    assert plan["mic_source"] == "mic_panel"
+
+
+def test_the_input_mute_is_a_real_mute_not_a_ui_flag_ruling_e_sr029(policy):
+    """It STOPS both mic legs, so no sample leaves the panel at all.
+
+    This is the test that would fail if the input mute were ever reduced to
+    something the chrome draws over a running microphone. A cosmetic mute is
+    indistinguishable from a working one to whoever is on the call.
+    """
+    state, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    plan = policy.plan(state)
+    assert plan["input_muted"] is True
+    assert plan["mic_live"] is False
+    for unit in policy.MIC_LEGS:
+        assert plan["legs"][unit] is False, "%s must be STOPPED, not flagged" % unit
+    # The output is untouched: the two buttons are independent (ruling E).
+    assert plan["legs"]["wall-speaker-out.service"] is True
+
+
+def test_headset_absent_tunnels_no_microphone_ruling_7_sr029(policy):
+    """Ruling 7: "silence on every output, NO MIC TUNNELLED".
+
+    Falling back to the panel microphone here would put a live microphone in a
+    room whose owner believes the panel is switched away from it, and nobody
+    could hear that happening. It is the one failure in this design with no
+    audible symptom, which is exactly why it has a test of its own.
+    """
+    state, _ = policy.apply_event(policy.default_state(), {"kind": "headset", "present": True})
+    state, _ = policy.apply_event(state, {"kind": "headset", "present": False})
+    assert state["output"] == "headset"
+    assert policy.mic_live(state) is False
+    plan = policy.plan(state)
+    assert not any(plan["legs"].values()), "no leg at all, output or mic"
+
+
+def test_no_mic_leg_is_ever_enabled_sr029():
+    """A boot must not start a microphone the Owner did not leave running."""
+    for unit in (MIC_REAR_UNIT_FILE, BT_MIC_UNIT_FILE):
+        text = read(unit)
+        assert "[Install]" not in text, "%s must not be enableable" % unit.name
+        assert "WantedBy" not in text
+        # The mode gate every leg carries: `wall-audio-mode trigger` is the
+        # Owner's one-command rollback and must take the mic legs with it.
+        assert "audio-mode" in text and "= bus" in text
+
+
+def test_the_mic_route_writes_explicit_zeros_everywhere_else_sr029(applier):
+    """The mic on channels 4 and 5, and NOTHING anywhere else. Both halves.
+
+    This table is the whole of what keeps the microphone out of the speakers:
+    the adapter's mute is one boolean over all eight channels, so hardware
+    cannot express "front off, rear on" while the mic leg is running.
+    """
+    rendered = applier.render_mic_conf(dict(applier.MIC_DEFAULTS))
+    assert 'pcm "usb_out_mix"' in rendered, "it must share the one playback stream"
+    assert "channels 8" in rendered
+    for channel in (4, 5):
+        assert "ttable.0.%d 1.0000" % channel in rendered
+    for channel in (0, 1, 2, 3, 6, 7):
+        assert "ttable.0.%d 0.0000" % channel in rendered, (
+            "channel %d must be an EXPLICIT zero: silent on purpose and "
+            "forgotten must not look the same" % channel)
+    # The microphone reaches the two rear channels IDENTICALLY: a desktop line
+    # input is stereo and both sides must carry the same capsule.
+    assert rendered.count("ttable.0.4 1.0000") == rendered.count("ttable.0.5 1.0000")
+
+
+def test_the_two_route_tables_do_not_overlap_sr029(applier):
+    """The other direction, and the pair is the whole bargain.
+
+    The speaker route owns 0-3 and zeroes 4-7; the mic route owns 4-5 and zeroes
+    the rest. dmix sums per channel, so music cannot reach the desktop's input
+    and the microphone cannot reach the amplifier, and neither statement depends
+    on a mixer control.
+    """
+    speaker = applier.render_trim_conf(dict(applier.TRIM_DEFAULTS))
+    mic = applier.render_mic_conf(dict(applier.MIC_DEFAULTS))
+    for channel in applier.MIC_REAR_CHANNELS:
+        assert channel in applier.TRIM_SILENT_CHANNELS, (
+            "channel %d carries the mic, so the speaker route must zero it"
+            % channel)
+        assert "ttable.0.%d 0.0000" % channel in speaker
+        assert "ttable.1.%d 0.0000" % channel in speaker
+    for channel in applier.MIC_SILENT_CHANNELS:
+        assert "ttable.0.%d 0.0000" % channel in mic
+    assert set(applier.MIC_REAR_CHANNELS) & set(applier.MIC_SILENT_CHANNELS) == set()
+    assert set(applier.MIC_REAR_CHANNELS) | set(applier.MIC_SILENT_CHANNELS) == set(range(8))
+
+
+def test_the_capture_gain_default_is_the_measured_one_sr029(applier):
+    """It was CLIPPING, so this number is a measurement and not a preference.
+
+    62 % with +12 dB of boost gave peak 32768 and -15.2 dBFS RMS. 24 % (-6.00 dB)
+    with boost 0 is what the panel read on 2026-09-14 after the AEC run lowered
+    it live, and firstboot must seed the same value or the stored state and the
+    hardware disagree from the first apply.
+    """
+    assert applier.MIC_DEFAULTS["capture_percent"] == 24
+    assert applier.MIC_DEFAULTS["boost"] == 0
+    seeded = read(WALL / "wall-firstboot.sh")
+    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT:-24" in seeded
+    assert "WALL_AUDIO_MIC_BOOST:-0" in seeded
+    example = read(WALL / "wall.env.example")
+    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT=24" in example
+    assert "WALL_AUDIO_MIC_BOOST=0" in example
+
+
+@pytest.mark.parametrize("assignment,why", [
+    ("capture_percent=101", "above the codec's range"),
+    ("capture_percent=-1", "below it"),
+    ("capture_percent=loud", "not a number"),
+    ("boost=4", "the codec has four steps, 0..3"),
+    ("rear_level=198", "the adapter's scale stops at 197"),
+    ("rear_gain=-0.5", "a phase inversion is not a gain"),
+    ("rear_gain=8", "that is a wiring problem"),
+    ("treble=1", "not a knob this panel has"),
+    ("capture_percent", "not KEY=VALUE"),
+])
+def test_a_refused_mic_value_moves_nothing_sr029(applier, assignment, why):
+    """The trim command's rule: the whole table moves or none of it does."""
+    values = dict(applier.MIC_DEFAULTS)
+    with pytest.raises(ValueError):
+        applier.parse_mic_assignments([assignment], values)
+    assert values == applier.MIC_DEFAULTS, why
+
+
+def test_a_good_and_a_bad_value_together_move_nothing_sr029(applier):
+    with pytest.raises(ValueError):
+        applier.parse_mic_assignments(["capture_percent=30", "boost=9"],
+                                      dict(applier.MIC_DEFAULTS))
+
+
+def test_a_damaged_mic_file_falls_back_field_by_field_sr029(applier, tmp_path):
+    """One typo must not throw the other four numbers away."""
+    path = tmp_path / "audio-mic.env"
+    path.write_text("\n".join([
+        "WALL_AUDIO_MIC_CAPTURE_PERCENT=30",
+        "WALL_AUDIO_MIC_BOOST=nine",
+        "WALL_AUDIO_MIC_REAR_LEVEL=900",
+        "WALL_AUDIO_MIC_TREBLE=1",
+        "not an assignment",
+    ]) + "\n", encoding="utf-8")
+    values, notes = applier.load_mic(path)
+    assert values["capture_percent"] == 30, "the good one survives"
+    assert values["boost"] == applier.MIC_DEFAULTS["boost"]
+    assert values["rear_level"] == applier.MIC_DEFAULTS["rear_level"]
+    assert values["rear_gain"] == applier.MIC_DEFAULTS["rear_gain"]
+    assert len(notes) == 3, notes
+    assert any("boost" in note for note in notes)
+    assert any("treble" in note for note in notes)
+
+
+def test_the_mic_env_round_trips_sr029(applier, tmp_path):
+    wanted = applier.parse_mic_assignments(["capture_percent=30", "rear_gain=0.75"],
+                                           dict(applier.MIC_DEFAULTS))
+    path = tmp_path / "audio-mic.env"
+    path.write_text(applier.render_mic_env(wanted), encoding="utf-8")
+    back, notes = applier.load_mic(path)
+    assert notes == []
+    assert back == wanted
+
+
+def test_only_the_rear_pair_of_the_adapter_moves_sr029(applier):
+    """The other six values are the Owner's bench session, verbatim.
+
+    Read off the panel 2026-09-14: 66,66,24,24,0,0,24,24. Everything except
+    channels 4 and 5 belongs to somebody who stood at an amplifier.
+    """
+    bench = [66, 66, 24, 24, 0, 0, 24, 24]
+    assert applier.rear_levels(bench, 66) == [66, 66, 24, 24, 66, 66, 24, 24]
+    assert applier.rear_levels(bench, 0) == bench
+    assert bench == [66, 66, 24, 24, 0, 0, 24, 24], "the input must not be mutated"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("  : values=66,66,24,24,0,0,24,24\n", [66, 66, 24, 24, 0, 0, 24, 24]),
+    ("numid=8\n  ; type=INTEGER\n  : values=1,2,3,4,5,6,7,8\n", [1, 2, 3, 4, 5, 6, 7, 8]),
+    ("  : values=66,66\n", None),
+    ("  : values=a,b,c,d,e,f,g,h\n", None),
+    ("nothing useful", None),
+    ("", None),
+    (None, None),
+])
+def test_an_unreadable_adapter_level_moves_nothing_sr029(applier, text, expected):
+    """None means "leave the hardware alone", and every caller must honour it."""
+    assert applier.parse_adapter_levels(text) == expected
+
+
+def test_the_rear_pair_is_only_raised_while_a_mic_leg_runs_sr029(applier, policy):
+    """Otherwise it goes back to the 0 the tone era left it at.
+
+    Two independent things then have to be wrong at once before the room's music
+    reaches the desktop's input: this level, and the speaker route's zeros.
+    """
+    bench = "  : values=66,66,24,24,0,0,24,24\n"
+
+    def run_amixer(argv, **kwargs):
+        return _Reply(0, bench)
+
+    live = applier.Applier(run=run_amixer)
+    assert applier.set_rear_level(live, "ICUSBAUDIO7D", 66) is True
+    csets = [argv for argv in live.commands if "cset" in argv]
+    assert csets and csets[-1][-1] == "66,66,24,24,66,66,24,24"
+
+    quiet = applier.Applier(run=run_amixer)
+    applier.set_rear_level(quiet, "ICUSBAUDIO7D", 0)
+    # Already 0 in the bench values, so nothing is written at all.
+    assert not [argv for argv in quiet.commands if "cset" in argv]
+
+
+def test_a_changed_microphone_restarts_the_leg_rather_than_starting_it_sr029(
+        applier, policy, tmp_path, monkeypatch):
+    """ALSA resolves @func getenv when the PCM is OPENED, not per sample.
+
+    A running forwarder holds the microphone it started with for its whole life,
+    and `systemctl start` on an active unit does nothing. Without the restart,
+    moving Speaker -> Headset leaves the far end of a call listening to the
+    PANEL's microphone: audio flows, everything looks right, and it is the wrong
+    room.
+    """
+    monkeypatch.setattr(applier, "MIC_SOURCE_ENV", tmp_path / "audio-mic-source.env")
+    monkeypatch.delenv(applier.MIC_SOURCE_VAR, raising=False)
+
+    first = applier.Applier()
+    assert applier.select_mic_source(first, "mic_panel") is False, "nothing to change from"
+    second = applier.Applier()
+    assert applier.select_mic_source(second, "mic_headset") is True
+    third = applier.Applier()
+    assert applier.select_mic_source(third, "mic_headset") is False, "no change, no restart"
+
+
+def test_a_mic_leg_never_fails_the_apply_that_carries_the_music_sr029(
+        applier, policy, tmp_path, monkeypatch):
+    """apply-state runs under a unit firstboot waits on.
+
+    A microphone that will not start is a degraded panel; a non-zero return here
+    is a red firstboot and, at the glass, a panel that looks broken. The output
+    legs keep counting, because those ARE the audio.
+    """
+    # apply_plan is run for real here (not --dry-run), so every /run path it
+    # publishes has to land in the temp tree. Without this the test writes
+    # audio-speaker.env into the real filesystem and the NEXT run of the suite
+    # reads it back as a published chain -- which is how it was found.
+    for name in ("SPEAKER_CHAIN_ENV", "MIC_SOURCE_ENV", "HEADSET_ENV"):
+        monkeypatch.setattr(applier, name, tmp_path / name.lower())
+    monkeypatch.delenv(applier.SPEAKER_CHAIN_VAR, raising=False)
+    monkeypatch.delenv(applier.MIC_SOURCE_VAR, raising=False)
+
+    def fail_mic_legs(argv, **kwargs):
+        if argv[0].endswith("systemctl") and len(argv) > 2 and argv[2] in policy.MIC_LEGS:
+            return _Reply(1, "", "Job failed")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    shell = applier.Applier(run=fail_mic_legs)
+    assert applier.apply_plan(policy.default_state(), shell) == 0
+
+    # ... and the same failure on an OUTPUT leg does count.
+    def fail_output_leg(argv, **kwargs):
+        if argv[0].endswith("systemctl") and len(argv) > 2 \
+                and argv[2] == "wall-speaker-out.service":
+            return _Reply(1, "", "Job failed")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(policy.default_state(),
+                             applier.Applier(run=fail_output_leg)) > 0
+
+
+def test_the_stereo_fallback_and_the_rear_leg_cannot_both_run_sr029(applier):
+    """The one place step 3's fallback and step 4's leg are exclusive.
+
+    `speaker_stereo` is deliberately still a RAW open of the adapter -- the point
+    of a fallback is that it is the simplest thing that can work -- so while it
+    is running the adapter is held exclusively and the rear leg cannot open it.
+    Refused with a journal line that names the fix, rather than left to fail in
+    a restart loop.
+    """
+    shell = applier.Applier(dry_run=True)
+    assert applier.rear_mic_possible(shell, chain=applier.SPEAKER_CHAIN_STEREO,
+                                     speaker_wanted=True) is False
+    # In Mute and in Headset the speaker leg is stopped, so the adapter is free.
+    assert applier.rear_mic_possible(shell, chain=applier.SPEAKER_CHAIN_STEREO,
+                                     speaker_wanted=False) is True
+    assert applier.rear_mic_possible(shell, chain=applier.SPEAKER_CHAIN_MULTI,
+                                     speaker_wanted=True) is True
+
+
+def test_mic_selected_is_one_name_so_aec_is_one_line_sr029():
+    """The later AEC step inserts a cancelled PCM by redefining ONE name.
+
+    Nothing downstream may open `mic_panel` or `mic_headset` directly, or that
+    insertion stops being one line and becomes an edit to every leg.
+    """
+    conf = read(BUS_CONF)
+    assert "pcm.mic_selected {" in conf
+    assert "WALL_AUDIO_MIC_SOURCE" in conf
+    # The UNITS, and both of them: a `or True` here meant this could never fail
+    # and would not have caught a direct source name in either one (terra,
+    # 2026-09-14).
+    for unit in (MIC_REAR_UNIT_FILE, BT_MIC_UNIT_FILE):
+        execstart = read(unit).split("ExecStart=", 1)[1]
+        assert "mic_selected" in execstart or unit is BT_MIC_UNIT_FILE
+        assert "mic_panel" not in execstart, unit.name
+        assert "mic_headset" not in execstart, unit.name
+    # And the supervisor addresses the same one name in code.
+    assert 'MIC_PCM = "mic_selected"' in read(BT_MIC)
+    assert '"mic_panel"' not in read(BT_MIC).split("MIC_PCM")[-1]
+
+
+def test_the_mic_capture_pcms_are_dsnoop_on_one_card_each_sr029():
+    """dsnoop, so the AEC measurement loop can read the same mic as the leg."""
+    conf = read(BUS_CONF)
+    for name in ("mic_panel_raw", "mic_headset_raw"):
+        block = conf.split("pcm.%s {" % name, 1)[1].split("\n}", 1)[0]
+        assert "type dsnoop" in block
+        assert "ipc_key" in block
+    # The panel mic is mixed to mono EXPLICITLY rather than by plug's own
+    # channel conversion: this signal ends up on somebody's telephone call.
+    mono = conf.split("pcm.mic_panel {", 1)[1].split("\n}", 1)[0]
+    assert "type route" in mono
+    assert "ttable.0.0 0.5" in mono and "ttable.1.0 0.5" in mono
+
+
+def test_every_ipc_key_in_bus_mode_is_unique_sr029():
+    """A dmix and a dsnoop that collide look convincingly like a signal."""
+    conf = read(BUS_CONF)
+    keys = [int(line.split()[1]) for line in conf.splitlines()
+            if line.strip().startswith("ipc_key ")]
+    assert len(keys) == len(set(keys)), sorted(keys)
+    assert 7715 in keys and 8825 in keys and 8826 in keys
+
+
+def test_bluealsa_gains_hfp_hf_and_keeps_a2dp_sr029():
+    """The panel is the phone's HANDS-FREE unit, not its gateway."""
+    override = read(WALL / "wall-bluealsa-override.conf")
+    # The COMMAND, not the prose above it: the comment quotes the stock unit's
+    # own flags, and a test that grepped the whole file would pass on the
+    # explanation rather than on what the panel runs.
+    command = [line for line in override.splitlines()
+               if line.startswith("ExecStart=") and line.strip() != "ExecStart="]
+    assert len(command) == 1, command
+    command = command[0]
+    assert "-p hfp-hf" in command, "hfp-hf: the panel is the phone's headset"
+    assert "-p hfp-ag" not in command, "hfp-ag would make the panel the telephone"
+    assert "-p a2dp-sink" in command, "music must still work"
+    assert "-p a2dp-source" not in command, "SR-025: no pulling audio off the panel"
+
+
+@pytest.mark.parametrize("tree,expected", [
+    ("", []),
+    ("/org/bluealsa\n", []),
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/sink\n", ["AA:BB:CC:DD:EE:FF"]),
+    # a2dp endpoints are not a call and must not start a microphone
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dp/sink\n", []),
+    # the far end's voice is the OTHER direction and is not this leg
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/source\n", []),
+    ("/org/bluealsa/hci0/dev_11_22_33_44_55_66/sco/sink\n"
+     "/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/sink\n",
+     ["11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF"]),
+])
+def test_only_an_sco_sink_is_a_call_sr029(btmic, tree, expected):
+    assert btmic.parse_sco_sinks(tree) == expected
+
+
+def test_a_call_in_progress_is_never_moved_to_another_phone_sr029(btmic):
+    both = ["11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF"]
+    assert btmic.decide(both, None) == "11:22:33:44:55:66", "deterministic, not arbitrary"
+    assert btmic.decide(both, "AA:BB:CC:DD:EE:FF") == "AA:BB:CC:DD:EE:FF"
+    assert btmic.decide([], "AA:BB:CC:DD:EE:FF") is None
+
+
+def test_the_bt_mic_leg_reads_the_selected_mic_and_writes_sco_sr029(btmic):
+    argv = btmic.loop_argv("AA:BB:CC:DD:EE:FF")
+    assert "mic_selected" in argv
+    assert "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=sco" in argv
+    assert argv[0].endswith("wall-alsaloop-guard.py"), "item 25's lesson applies here too"
+    # HFP is mono at 8 or 16 kHz (review finding 4, accepted): asking for stereo
+    # would make every open a conversion nobody asked for.
+    assert argv[argv.index("--channels") + 1] == "1"
+
+
+def test_bluealsa_unreachable_means_no_call_not_an_open_microphone_sr029(btmic):
+    """The failure direction that matters is a mic that stays open."""
+    def explode(*args, **kwargs):
+        raise OSError("no busctl here")
+
+    assert btmic.read_sinks(run=explode) == []
+
+    def refuse(*args, **kwargs):
+        return _Reply(1, "", "no such service")
+
+    assert btmic.read_sinks(run=refuse) == []
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, 5.0), ("", 5.0), ("nonsense", 5.0), ("nan", 5.0),
+    ("0.1", 1.0), ("600", 60.0), ("12", 12.0),
+])
+def test_the_bt_poll_is_clamped_not_refused_sr029(btmic, raw, expected):
+    """No operator is standing in front of this daemon."""
+    assert btmic.poll_seconds(raw) == expected
+
+
+def test_the_bt_mic_leg_stops_when_bus_mode_is_rolled_back_sr029(btmic, tmp_path):
+    """`wall-audio-mode trigger` is the Owner's rollback and must roll this back too."""
+    mode = tmp_path / "audio-mode"
+    assert btmic.bus_mode_active(mode) is False, "a missing file is not bus mode"
+    mode.write_text("trigger\n", encoding="utf-8")
+    assert btmic.bus_mode_active(mode) is False
+    mode.write_text("bus\n", encoding="utf-8")
+    assert btmic.bus_mode_active(mode) is True
+
+
+def test_firstboot_seeds_the_mic_knobs_only_if_absent_sr029():
+    """The amp-trigger.env rule: a re-run must not discard a bench number."""
+    text = read(WALL / "wall-firstboot.sh")
+    assert "if [ ! -f /etc/wall-panel/audio-mic.env ]; then" in text
+    assert "wall-audio-output mic --render" in text
+    assert "wall-bt-mic.py" in text, "the supervisor must be installed"
+    for unit in ("wall-mic-rear.service", "wall-bt-mic.service"):
+        assert unit in text, "%s must be installed" % unit
+
+
+def test_the_mode_switch_takes_the_mic_legs_with_it_sr029():
+    """Item 25's lesson: a forwarder left holding a dmix leaves a stale segment."""
+    text = read(WALL / "wall-audio-mode")
+    stop = [line for line in text.splitlines() if "unit stop" in line]
+    assert any("wall-mic-rear.service" in line and "wall-bt-mic.service" in line
+               for line in stop), stop
+    assert "wall-mic-rear wall-bt-mic" in text, "and the IPC sweep must know them"
+
+
+# ── what review found, and the asymmetry it forced ────────────────────────
+# Both of these are regression tests for a FAIL-OPEN on the one control in this
+# design whose failure nobody in the room can hear (terra, 2026-09-14).
+
+def test_a_mic_leg_that_will_not_stop_fails_the_apply_sr029(applier, policy, monkeypatch):
+    """Failing to START a microphone is degradation. Failing to STOP one is not.
+
+    Before this, both directions were `required=False`: a transient systemctl
+    error would have persisted `input_muted: true`, returned success, and left
+    the microphone transmitting with the panel believing it was muted.
+    """
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+
+    def refuse_to_stop(argv, **kwargs):
+        if argv[0].endswith("systemctl") and len(argv) > 2 and argv[1] == "stop" \
+                and argv[2] in policy.MIC_LEGS:
+            return _Reply(1, "", "Job for %s failed" % argv[2])
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    shell = applier.Applier(run=refuse_to_stop)
+    assert applier.apply_plan(muted, shell) > 0, \
+        "a microphone that would not stop must NOT report success"
+
+
+def test_a_capture_switch_that_will_not_close_fails_the_apply_sr029(
+        applier, policy, monkeypatch):
+    """The hardware half of the mute fails in the same direction as the legs."""
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+
+    def refuse_nocap(argv, **kwargs):
+        if argv[0].endswith("amixer") and "nocap" in argv:
+            return _Reply(1, "", "Unable to find simple control 'Capture',0")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(muted, applier.Applier(run=refuse_nocap)) > 0
+
+    # ... and the UN-mute direction does not, because a capture switch that will
+    # not open is a microphone that does not work, which the leg already said.
+    live = policy.default_state()
+
+    def refuse_cap(argv, **kwargs):
+        if argv[0].endswith("amixer") and "cap" in argv and "nocap" not in argv:
+            return _Reply(1, "", "Unable to find simple control 'Capture',0")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(live, applier.Applier(run=refuse_cap)) == 0
+
+
+def test_the_bt_supervisor_re_checks_the_mute_every_poll_sr029(btmic, policy, tmp_path):
+    """It is Restart=always, so "it was stopped once" is not a property.
+
+    An operator restart, a daemon-reload workflow, a crash, or a stop that failed
+    during an apply would each have reopened the microphone into a live call.
+    The supervisor therefore reads the state itself rather than trusting that a
+    command reached it.
+    """
+    state = tmp_path / "audio-state.json"
+
+    def store(value):
+        state.write_text(json.dumps(value), encoding="utf-8")
+
+    store(policy.default_state())
+    assert btmic.mic_allowed(state) is True, "speaker, unmuted: a mic may run"
+
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    store(muted)
+    assert btmic.mic_allowed(state) is False, "ruling E's mute reaches the supervisor"
+
+    absent, _ = policy.apply_event(policy.default_state(),
+                                   {"kind": "headset", "present": True})
+    absent, _ = policy.apply_event(absent, {"kind": "headset", "present": False})
+    store(absent)
+    assert btmic.mic_allowed(state) is False, "ruling 7 reaches it too"
+
+
+@pytest.mark.parametrize("content", [None, "", "not json", "{oops"])
+def test_an_unparseable_state_never_opens_a_microphone_sr029(btmic, tmp_path, content):
+    """A document that cannot be READ answers False. That gate fails CLOSED.
+
+    A leg that does not run is a degraded panel; a leg that runs against a mute
+    is the failure nobody in the room can see, so an absent or unparseable state
+    file is not consent.
+    """
+    state = tmp_path / "audio-state.json"
+    if content is not None:
+        state.write_text(content, encoding="utf-8")
+    assert btmic.mic_allowed(state) is False
+
+
+@pytest.mark.parametrize("content", ["[]", '{"output": 12}', '{"input_muted": "yes"}',
+                                     '{"volume": {"speaker": "loud"}}'])
+def test_a_damaged_state_comes_back_MUTED_sr029(btmic, tmp_path, content):
+    """A damaged file must not turn a privacy control from muted to live.
+
+    This test asserted the opposite in the first round, on the argument that the
+    applier and the supervisor normalizing the same document the same way made
+    it safe. Review (terra, round 2) refused that, correctly: agreeing to open a
+    microphone nobody asked for is not safety. `normalize` now returns
+    `input_muted: True` for any document that needed repair, so BOTH halves see
+    the safe answer and they still agree.
+    """
+    state = tmp_path / "audio-state.json"
+    state.write_text(content, encoding="utf-8")
+    assert btmic.mic_allowed(state) is False
+
+
+def test_a_repair_mutes_the_input_but_costs_nothing_else_sr029(policy):
+    """Field by field is kept: a typo must not cost the panel its audio policy.
+
+    Only the microphone fails closed, because only the microphone's default is
+    the unsafe direction.
+    """
+    repaired = policy.normalize({"output": "speakers", "volume": {"speaker": 80}})
+    assert repaired["input_muted"] is True, "damage mutes the input"
+    assert repaired["output"] == "speaker", "and the rest still falls back sanely"
+    assert repaired["volume"]["speaker"] == 80, "a good field survives a bad one"
+
+    # AN ABSENT KEY IS NOT CONSENT EITHER, and the earlier version of this test
+    # blessed the opposite (terra, round 4). A truncated write is
+    # indistinguishable from a file that never had the field, so absence is
+    # muted; only an explicit boolean `false` un-mutes.
+    partial = policy.normalize({"output": "headset"})
+    assert partial["input_muted"] is True
+    assert policy.normalize({})["input_muted"] is True
+    # And a whole, valid document is untouched in both directions.
+    assert policy.normalize(policy.default_state()) == policy.default_state()
+
+
+def test_the_supervisor_and_the_applier_share_one_definition_of_mic_live_sr029(btmic):
+    """The policy is not duplicated: firstboot installs both beside each other."""
+    source = read(BT_MIC)
+    assert "policy.mic_live" in source, "the single definition, not a second copy"
+    assert "import wall_audio_state" in source
+    installed = read(WALL / "wall-firstboot.sh")
+    assert "wall_audio_state.py" in installed and "wall-bt-mic.py" in installed
+    # Both into the SAME directory, or the import above cannot resolve.
+    block = installed.split("wall_audio_state.py wall-bt-mic.py", 1)[1][:400]
+    assert "/usr/local/lib/wall-panel/" in block
+
+
+# ── review round 2: the restart paths, and telling the truth about hardware ─
+
+def test_both_mic_units_re_check_the_mute_on_every_start_sr029():
+    """Restart=always means "it was stopped once" is not a property.
+
+    A guard crash, an operator restart, a daemon-reload workflow, or a stop that
+    FAILED during an apply would each bring a mic leg back with the state still
+    saying muted. Found once per leg by review (terra, rounds 1 and 2).
+    """
+    for unit in (MIC_REAR_UNIT_FILE, BT_MIC_UNIT_FILE):
+        text = read(unit)
+        assert "Restart=always" in text, "the premise of the gate"
+        conditions = [line for line in text.splitlines()
+                      if line.startswith("ExecCondition=")]
+        assert any("mic-allowed" in line for line in conditions), \
+            "%s can be restarted behind a mute" % unit.name
+        assert any("audio-mode" in line for line in conditions), \
+            "%s must still carry the bus-mode gate" % unit.name
+
+
+def test_the_mic_allowed_gate_takes_no_lock_sr029(applier):
+    """It is asked by an ExecCondition while the apply that starts the leg holds it.
+
+    A gate that blocked on the apply lock would deadlock the very apply it is
+    gating, which is the same shape as the withdrawn firstboot ordering.
+    """
+    source = read(APPLIER)
+    dispatch = source.split('if arguments.command == "mic-allowed":', 1)[1][:600]
+    assert "apply_lock" not in dispatch
+    # and it is dispatched BEFORE the block that takes the lock
+    assert source.index('"mic-allowed"') < source.index("with apply_lock(")
+
+
+@pytest.mark.parametrize("stored,allowed", [
+    ({"output": "speaker", "input_muted": False}, 0),
+    ({"output": "speaker", "input_muted": True}, 1),
+    ({"output": "mute", "input_muted": False}, 0),
+    ({"output": "mute", "input_muted": True}, 1),
+    # ruling 7: headset selected, adapter absent -> nothing tunnelled
+    ({"output": "headset", "input_muted": False, "headset_present": False}, 1),
+    ({"output": "headset", "input_muted": False, "headset_present": True}, 0),
+])
+def test_mic_allowed_answers_the_policy_sr029(applier, tmp_path, stored, allowed):
+    state = tmp_path / "audio-state.json"
+    state.write_text(json.dumps(stored), encoding="utf-8")
+    assert applier.main(["--state", str(state), "mic-allowed"]) == allowed
+
+
+def test_a_missing_state_file_is_not_consent_sr029(applier, tmp_path):
+    """And the two gates must answer identically, or they can disagree about a mic.
+
+    Not a hardship: the applier SAVES the state before it applies the plan, so by
+    the time it runs `systemctl start` on a mic leg the file is there.
+    """
+    missing = tmp_path / "nothing.json"
+    assert applier.main(["--state", str(missing), "mic-allowed"]) == 1
+    btmic_module = load(BT_MIC, "wall_bt_mic_gate")
+    assert btmic_module.mic_allowed(missing) is False
+    source = read(APPLIER)
+    assert "save_state" in source.split("def _locked_apply", 1)[1].split("apply_plan(", 1)[0]
+
+
+def test_a_rear_level_that_would_not_lower_fails_the_apply_sr029(applier, policy):
+    """It reported success whether or not the write landed (terra, round 2).
+
+    Failing to RAISE the rear pair is a quiet mic return. Failing to LOWER it
+    leaves the desktop's input wired to live channels after the leg has gone,
+    which is the independent hardware barrier this is supposed to be.
+    """
+    raised = "  : values=66,66,24,24,66,66,24,24\n"
+
+    def refuse_cset(argv, **kwargs):
+        if argv[0].endswith("amixer") and "cset" in argv:
+            return _Reply(1, "", "Unable to find control")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, raised)
+        return _Reply(0)
+
+    # Lowering (no mic leg wanted): a refused write is reported and counted.
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    assert applier.apply_plan(muted, applier.Applier(run=refuse_cset)) > 0
+
+    # Raising: a refused write is a quiet microphone, not a failed apply.
+    lowered = "  : values=66,66,24,24,0,0,24,24\n"
+
+    def refuse_raise(argv, **kwargs):
+        if argv[0].endswith("amixer") and "cset" in argv:
+            return _Reply(1, "", "Unable to find control")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, lowered)
+        return _Reply(0)
+
+    assert applier.apply_plan(policy.default_state(),
+                             applier.Applier(run=refuse_raise)) == 0
+
+
+def test_set_rear_level_reports_what_actually_happened_sr029(applier):
+    """The unconditional `return True` is what made the above invisible."""
+    raised = "  : values=66,66,24,24,66,66,24,24\n"
+
+    def refuse(argv, **kwargs):
+        if "cset" in argv:
+            return _Reply(1, "", "nope")
+        return _Reply(0, raised)
+
+    assert applier.set_rear_level(applier.Applier(run=refuse), "ICUSBAUDIO7D", 0) is False
+
+    def accept(argv, **kwargs):
+        if "cset" in argv:
+            return _Reply(0)
+        return _Reply(0, raised)
+
+    assert applier.set_rear_level(applier.Applier(run=accept), "ICUSBAUDIO7D", 0) is True
+
+
+# ── review round 3: the gate's own fail-open, and two boundaries ───────────
+
+@pytest.mark.parametrize("content", ["", "not json", "{oops", '{"input_muted": "yes"}',
+                                     "[]", '{"output": 12}'])
+def test_the_applier_gate_refuses_a_damaged_state_too_sr029(applier, tmp_path, content):
+    """It used load_state, which exists to keep AUDIO working, not a microphone.
+
+    load_state turns an unreadable or unparseable file into `default_state()` --
+    Speaker, UNMUTED -- so the gate exited 0 and started a real forwarder off a
+    corrupt file while claiming "every failure answers 1". It also disagreed with
+    the Bluetooth supervisor, which parses the document itself (terra, round 3).
+    """
+    state = tmp_path / "audio-state.json"
+    state.write_text(content, encoding="utf-8")
+    assert applier.main(["--state", str(state), "mic-allowed"]) == 1
+
+
+def test_both_gates_answer_the_same_for_every_state_sr029(applier, tmp_path):
+    """Two gates on one privacy control must not be able to disagree."""
+    btmic_module = load(BT_MIC, "wall_bt_mic_agree")
+    state = tmp_path / "audio-state.json"
+    cases = [
+        None,                                             # missing
+        "", "not json", "{oops",                          # unparseable
+        "[]", '{"output": 12}', '{"input_muted": "yes"}',  # damaged
+        '{"volume": {"speaker": 101}}',                   # clamped
+        '{"output": "speaker", "input_muted": false}',    # clean, allowed
+        '{"output": "speaker", "input_muted": true}',     # clean, muted
+        '{"output": "headset", "input_muted": false, "headset_present": false}',
+    ]
+    for content in cases:
+        if content is None:
+            state.unlink(missing_ok=True)
+        else:
+            state.write_text(content, encoding="utf-8")
+        gate = applier.main(["--state", str(state), "mic-allowed"]) == 0
+        supervisor = btmic_module.mic_allowed(state)
+        assert gate is supervisor, "the two gates disagree about %r" % content
+
+
+@pytest.mark.parametrize("stored,expected_level,muted", [
+    (101, 100, True),
+    (-1, 0, True),
+    (100, 100, False),
+    (0, 0, False),
+    (60, 60, False),
+])
+def test_a_clamped_volume_counts_as_a_repair_sr029(policy, stored, expected_level, muted):
+    """The rule failed on its own boundary (terra, round 3).
+
+    `{"speaker": 101}` came back as 100 and stayed UNMUTED, while the applier
+    journaled the same document as repaired -- so the two halves already
+    disagreed in the log about whether anything had been replaced.
+    """
+    state = policy.normalize({"output": "speaker", "input_muted": False,
+                              "volume": {"speaker": stored, "headset": 60}})
+    assert state["volume"]["speaker"] == expected_level
+    assert state["input_muted"] is muted
+
+
+def test_a_mode_switch_refuses_while_a_microphone_is_still_running_sr029():
+    """Every other leg surviving a stop is a wrong noise. This one is a live mic.
+
+    A mode switch changes the ALSA chain, but an already-open client keeps the
+    graph it opened with -- so a surviving wall-mic-rear goes on sending the room
+    to the desktop's input in a mode whose whole point is that the audio work was
+    rolled back.
+    """
+    text = read(WALL / "wall-audio-mode")
+    assert "stop_mic_legs_or_refuse()" in text
+    # It runs BEFORE anything else in the mode switch moves.
+    body = text.split("  trigger|panel|bus)", 1)[1]
+    assert body.index("stop_mic_legs_or_refuse") < body.index("remember_active")
+    # It escalates rather than noting a failure and carrying on, and it aborts.
+    helper = text.split("stop_mic_legs_or_refuse() {", 1)[1].split("\n}", 1)[0]
+    assert "is-active" in helper
+    assert "kill" in helper
+    assert "return 1" in helper
+    assert "REFUSING" in helper
+    assert "stop_mic_legs_or_refuse || exit 1" in text
+
+
+# ── review round 4: the one rule, and the stop that has to bite ───────────
+
+@pytest.mark.parametrize("raw,muted", [
+    ({"output": "speaker", "input_muted": False}, False),
+    ({"output": "speaker", "input_muted": True}, True),
+    ({}, True),
+    ({"output": "speaker"}, True),
+    ({"input_muted": "false"}, True),
+    ({"input_muted": 0}, True),
+    ({"input_muted": None}, True),
+    ([], True),
+    ("nonsense", True),
+    (None, True),
+])
+def test_the_microphone_is_muted_unless_the_document_says_false_sr029(policy, raw, muted):
+    """The one rule, after four rounds found four ways round the last one.
+
+    Not "unless it says true", and not "unless a field was repaired": both of
+    those left a hole, because a TRUNCATED write and an unreadable file are
+    indistinguishable from a fresh one if absence counts as consent.
+    """
+    assert policy.normalize(raw)["input_muted"] is muted
+
+
+def test_an_unreadable_state_file_is_not_rewritten_into_consent_sr029(applier, tmp_path):
+    """The applier PERSISTS what it loaded before it applies it.
+
+    So an unreadable file returning the unmuted default was rewritten as a
+    valid, unmuted document, and the units' own ExecCondition then saw consent
+    nobody gave. A file that cannot be read comes back MUTED.
+    """
+    damaged = tmp_path / "audio-state.json"
+    damaged.write_text("{truncated", encoding="utf-8")
+    state, note = applier.load_state(damaged)
+    assert state["input_muted"] is True
+    assert "MUTED" in note
+
+    # A panel that has NEVER been configured is different in kind: there is no
+    # prior mute to lose, and a fresh image whose microphone needs a button
+    # press nobody has a button for yet would be the worse failure.
+    fresh, note = applier.load_state(tmp_path / "never-written.json")
+    assert fresh["input_muted"] is False
+    assert fresh == applier.policy.default_state()
+
+
+def test_muting_escalates_to_a_kill_rather_than_counting_and_moving_on_sr029(
+        applier, policy):
+    """A stop that failed left an already-open alsaloop transmitting.
+
+    apply_plan counted the failure and carried on; wall-mic-rear has no runtime
+    state recheck, so its open PCM went on sending the room to the desktop's
+    input while the stored state said muted. The mode switch already escalated;
+    `input-mute` did not (terra, round 4).
+    """
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    seen = []
+
+    def stubborn(argv, **kwargs):
+        seen.append(list(argv))
+        if argv[0].endswith("systemctl") and argv[1] == "stop" \
+                and len(argv) > 2 and argv[2] in policy.MIC_LEGS:
+            return _Reply(1, "", "Job failed")
+        if argv[0].endswith("systemctl") and argv[1] == "show" \
+                and argv[-1] in policy.MIC_LEGS:
+            return _Reply(0, "active\n")   # still running, and it SAYS so
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(muted, applier.Applier(run=stubborn)) > 0
+    kills = [argv for argv in seen
+             if argv[0].endswith("systemctl") and argv[1] == "kill"
+             and argv[-1] in policy.MIC_LEGS]
+    assert kills, "a mic leg that will not stop must be KILLED, not just counted"
+
+
+def test_a_mic_leg_that_stops_normally_is_never_killed_sr029(applier, policy):
+    """Escalation only where it is needed: a clean stop stays a clean stop."""
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    seen = []
+
+    def obedient(argv, **kwargs):
+        seen.append(list(argv))
+        if argv[0].endswith("systemctl") and argv[1] == "show":
+            return _Reply(0, "inactive\n")   # the stop worked, confirmed
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(muted, applier.Applier(run=obedient)) == 0
+    assert not [argv for argv in seen
+                if argv[0].endswith("systemctl") and argv[1] == "kill"]
+
+
+# ── review round 5: "gone" and "I could not ask" are different answers ─────
+
+@pytest.mark.parametrize("stdout,code,expected", [
+    ("inactive\n", 0, False),
+    ("failed\n", 0, False),
+    ("active\n", 0, True),
+    ("activating\n", 0, True),
+    # NOT gone: it is still shutting down, and a microphone that is still
+    # shutting down is still open.
+    ("deactivating\n", 0, True),
+    ("reloading\n", 0, True),
+    # Unobservable, all of these. None, and every caller must treat it as live.
+    ("", 0, None),
+    ("\n", 0, None),
+    (None, 1, None),
+])
+def test_unit_active_never_guesses_sr029(applier, stdout, code, expected):
+    """`systemctl is-active --quiet` could not express this and that was the bug.
+
+    It exits non-zero for an inactive unit AND for a D-Bus error, a timeout or a
+    missing systemctl, and Applier.command collapses all of them to 1 -- so "the
+    microphone is gone" and "I could not ask whether the microphone is gone"
+    were the same answer (terra, round 5).
+    """
+    def reply(argv, **kwargs):
+        return _Reply(code, stdout if stdout is not None else "")
+
+    assert applier.unit_active(applier.Applier(run=reply), "x.service") is expected
+
+
+def test_an_unqueryable_mic_leg_fails_the_apply_sr029(applier, policy):
+    """Unknown must fail the apply, not pass it."""
+    def unqueryable(argv, **kwargs):
+        if argv[0].endswith("systemctl") and argv[1] == "show":
+            return _Reply(1, "", "Failed to connect to bus")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    assert applier.apply_plan(muted, applier.Applier(run=unqueryable)) > 0
+
+
+def test_the_mode_script_also_refuses_an_unqueryable_mic_leg_sr029():
+    """The same distinction, in the shell half."""
+    text = read(WALL / "wall-audio-mode")
+    assert "mic_leg_gone()" in text
+    helper = text.split("mic_leg_gone() {", 1)[1].split("\n}", 1)[0]
+    assert "ActiveState" in helper, "is-active cannot express 'I could not ask'"
+    assert "inactive|failed) return 0" in helper
+    assert "*) return 1" in helper, "anything else, including empty, is STILL THERE"
+    # Scoped to the helper's own body: `remember_active` legitimately uses
+    # `is-active --quiet` elsewhere, where "I could not ask" is not a safety
+    # question.
+    stopper = text.split("stop_mic_legs_or_refuse() {", 1)[1].split("\n}", 1)[0]
+    decisions = [line for line in stopper.splitlines()
+                 if not line.strip().startswith(("echo", "#"))]
+    assert not any("is-active" in line for line in decisions), decisions
+
+
+def test_a_replugged_adapter_brings_the_rear_mic_leg_back_sr029():
+    """It BindsTo the adapter, so an unplug stops it. Nothing restarted it.
+
+    wall-audio-state.service is RemainAfterExit, so it does not re-assert the
+    stored position either, and one hub move -- which this appliance is known to
+    do, item 25 -- lost the mic return to the desktop permanently (terra, round
+    5). Safe to start from udev because the unit gates itself twice on every
+    start attempt.
+    """
+    rule = read(WALL / "90-wall-audio-adapter.rules")
+    assert 'SYSTEMD_WANTS}+="wall-mic-rear.service"' in rule
+    unit = read(WALL / "wall-mic-rear.service")
+    assert "BindsTo=dev-wall_audio_adapter.device" in unit
+    conditions = [line for line in unit.splitlines()
+                  if line.startswith("ExecCondition=")]
+    assert any("mic-allowed" in line for line in conditions), \
+        "starting it from udev is only safe because it gates itself"
+    # The Bluetooth leg is NOT wanted here: it has nothing to do with this
+    # adapter, and its own poll brings it back.
+    assert "wall-bt-mic.service" not in rule
+
+
+def test_a_dry_run_mic_command_writes_nothing_sr029(applier, tmp_path, monkeypatch):
+    """`--dry-run` dropped through the mic path and it overwrote /etc for real."""
+    env = tmp_path / "audio-mic.env"
+    conf = tmp_path / "audio-mic.conf"
+    monkeypatch.setattr(applier, "MIC_ENV", env)
+    monkeypatch.setattr(applier, "MIC_CONF", conf)
+    monkeypatch.setattr(applier, "LOCK_FILE", tmp_path / "lock")
+    assert applier.main(["--dry-run", "--state", str(tmp_path / "s.json"),
+                         "mic", "capture_percent=42"]) == 0
+    assert not env.exists(), "a dry run must not write the knobs"
+    assert not conf.exists(), "or the generated ALSA file"
+
+    # ... and without --dry-run it does.
+    assert applier.main(["--state", str(tmp_path / "s.json"),
+                         "mic", "capture_percent=42"]) == 0
+    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT=42" in env.read_text(encoding="utf-8")

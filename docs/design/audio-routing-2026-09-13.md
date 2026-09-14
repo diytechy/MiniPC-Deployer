@@ -1,7 +1,8 @@
 # Panel audio routing redesign — item 23, 2026-09-13
 
-**Status:** steps 1, 2 and **3** designed and implemented on branch
-`audio-routing-2026-09-13`; not deployed. Steps 4–6 are owed and listed at the
+**Status:** steps 1, 2 and 3 are on the wall (installed live 2026-09-13/14).
+Step **4**, the mic legs, is designed and implemented on branch
+`audio-routing-2026-09-13` and is NOT deployed. Steps 4–6 are owed and listed at the
 end. **Authority:** item 23 revision 2, the nine review findings, and the Owner's
 rulings on them (E, F, G and rows 1–9), all in
 [`HomeHub docs/PANEL_CURRENT_2026-09-13.md`](../../../HomeHub/docs/PANEL_CURRENT_2026-09-13.md).
@@ -636,18 +637,15 @@ cat /proc/asound/card3/stream0 | head -8     # expect Altset = 1, 8 channels
 | S3-7 | `journalctl -u wall-amp-trigger -f` while doing S3-4 | the relay closes as before: the tap is upstream of every part of step 3 |
 | S3-8 | `sudo mv /etc/wall-panel/audio-trim.conf /tmp/` then `sudo wall-audio-output set speaker` | audio still plays, **stereo front only**, and the journal says the 8-channel chain would not open and names both things to check. Put the file back and re-apply. |
 | S3-9 | Reboot, and watch the first two minutes | `journalctl -u wall-speaker-out --since -3min` shows **no underrun burst** (the 58 of 2026-09-14); the Owner hears no skipping during boot. **Firstboot must also complete normally** -- `systemctl status wall-firstboot` green, not timed out |
-| S3-9a | With the desktop playing video over S/PDIF on Speaker | ask the Owner about lip-sync: this step added about 20 ms. If it reads wrong, `--tlatency` in `wall-speaker-out.service` is the number to put back to 30000 |
+| S3-9a | (Superseded by S4-14 once step 4 is installed: the shared dmix changes this number.) With the desktop playing video over S/PDIF on Speaker | ask the Owner about lip-sync: this step added about 20 ms. If it reads wrong, `--tlatency` in `wall-speaker-out.service` is the number to put back to 30000 |
 | S3-10 | Headset position, and Mute | unchanged from steps 1–2 in every respect; `status` shows no probe and the adapter is not opened |
 
 ## What steps 4–6 still owe
 
 3. **Speaker leg, 8 channels (D4, supersedes item 17). DESIGNED AND IMPLEMENTED
    — see "Step 3" below.** Not deployed; the install and acceptance are there too.
-4. **Mic legs (C, D3, D4).** Headset mic (`Device` mono capture) or Bluetooth
-   HFP mic → the adapter's rear out and the Bluetooth mic return. Needs a
-   second capture path; the 5.1 adapter's single capture stream is spent on
-   S/PDIF. `input_muted` is already in the state and applied to the headset
-   card's `Mic` capture switch; the rest of its meaning lands here.
+4. **Mic legs (C, D3, D4). DESIGNED AND IMPLEMENTED - see "Step 4" below.**
+   Not deployed; the install and acceptance are there too.
 5. **Chrome (the triple switch + input mute) — and the broker backend that
    actually calls `switch_request`.** Today nothing does: the shipped broker is
    still `UnavailableBackend`, which refuses every mutation (SR-023, unchanged),
@@ -670,6 +668,324 @@ cat /proc/asound/card3/stream0 | head -8     # expect Altset = 1, 8 channels
   apply the same gain the leg does, or estimate it.
 * **Also owed:** the hub-that-answers-with-no-children reset from the item 25
   addendum, and the BlueALSA power-off-on-unverified-close question from D-1.
+
+## Step 4 - the mic legs (C, D3, D4, and Owner ruling E)
+
+**What the Owner asked for.** Spec C: "the selected mic feeds the rear output and
+the Bluetooth mic return". D4: in Speaker, "the panel's internal mic to the mic
+input". D3: in Headset, "that jack's mic back to the mic input". Ruling E: the
+input mute is a **separate button** from the output switch, and the output Mute
+position does not mute the microphone.
+
+### The hardware, re-measured on the panel 2026-09-14
+
+| | Measured | Consequence |
+|---|---|---|
+| Panel mic | `ALC255 Analog` capture, card `PCH`, `Capture` 15/63 = 24 % = -6.00 dB, `Internal Mic Boost` 0, `Capture Source` an **exclusive enum** reading `Internal Mic` | D4's microphone. The level had been **clipping** (62 %, +12 dB, peak 32768, -15.2 dBFS RMS) and was lowered live by the AEC run; the seeded knob is the level that is actually there |
+| Headset adapter mic | `0d8c:0014`, **mono**, `Mic` + `Auto Gain Control`, no jack detection | D3's microphone, and the reason D3 keys on the adapter and not a cable |
+| 5.1 adapter capture | ONE 2-channel stream behind a four-way selector, spent on `IEC958 In` | a wired mic can never share this adapter; that is why there are two USB parts |
+| `Speaker Playback Volume` | **eight** values, 0..197, read as `66,66,24,24,0,0,24,24` | rear (RL/RR) is at 0 from the tone era, ahead of step 3 |
+| `Speaker Playback Switch` | **ONE boolean**, `values=1` | **the whole shape of this step turns on this line** |
+| BlueALSA | `-p a2dp-sink` only; `hfp-hf` available, `bluealsa-cli` not installed | the profile has to be added, and presence read over D-Bus |
+
+### The two facts that shaped it, said plainly
+
+**1. The adapter has one playback stream and step 4 gives it a second writer.**
+Item 23 wires the adapter's **rear** pair to the desktop's input, and in Speaker
+position the microphone has to go there *while the same adapter is playing the
+room's music out of front, centre and sub*. Those are all channels of one
+eight-channel USB stream, which exactly one process may open. So `speaker_hw8`
+stops being a raw open and becomes a plug over `usb_out_mix`, a **dmix with its
+slave on exactly one card** (Owner ruling 9 is about not joining clocks across
+cards, and nothing here does). dmix sums per channel, so:
+
+```
+speaker_multi   L,R ---> FL FR FC LFE   +   explicit 0 on RL RR SL SR
+mic_rear_route  mic ---> RL RR          +   explicit 0 on FL FR FC LFE SL SR
+                             |
+                        usb_out_mix (dmix, 8 ch)  --->  the adapter
+```
+
+**2. The card's mute is one boolean over all eight channels, so it cannot be
+the separation any more.** `adapter_muted` used to be `not speaker`. In Headset
+position D3 still wants the headset's mic on the rear pair, and muting the card
+to silence the front would silence that too. The card is therefore muted only
+when **nothing at all** is meant to leave it, and the guarantee moves into the
+two generated route tables above. This is the one place step 4 **weakens a
+belt-and-braces**, it is said out loud in `wall_audio_state.plan`, and both
+tables' explicit zeros are asserted by tests and parsed by `alsa-lib` itself.
+
+Two things soften it and both are real. The rear pair's hardware level is raised
+only while a mic leg runs and is put back to 0 otherwise, so **two** independent
+things must be wrong before the room's music reaches the desktop. And the
+guarantee that always did the real work is untouched: in Mute and Headset
+nothing feeds `speaker_tap`, the detector's 240 s hold-off expires, and the
+LCUS-2 relay physically removes power from the amplifier.
+
+### The cost nobody has measured yet, said out loud
+
+**Review (terra, 2026-09-14) is right that this is the riskiest number in the
+step.** `usb_out_mix` is declared `period_size 1024 buffer_size 8192` at 48 kHz,
+which is a 170 ms ring with 21 ms periods, and the speaker leg did not have that
+ring before: it opened `card_usb` raw and `alsaloop --tlatency 50000` sized the
+buffer itself. A dmix ring is fixed and shared, so a client cannot shrink it.
+
+How much of that 170 ms becomes end-to-end delay depends on how full `alsaloop`
+keeps the ring, which is exactly the thing no test here can answer. **So the
+"80 to 100 ms" this design claimed after step 3 is no longer a number anybody
+should quote**, and S4-14 below measures it before the Owner is asked to live
+with it.
+
+The numbers were not simply reduced, and that is a decision rather than an
+oversight: the panel has a **measured** underrun problem on this leg (58
+`speaker_out` underruns in the 2026-09-14 boot minute, which is why that leg
+went from 30 ms to 50 ms) and **no** measured latency problem. Trading a known
+fault for an unknown one without a measurement is how the first one got made.
+If S4-14 says the delay is audible, the knob is `buffer_size` on `usb_out_mix`
+in `asound-bus-mode.conf`, then `--tlatency` in `wall-spdif-in.service`, in that
+order, and the underrun watch of S3-9 has to be repeated after either.
+
+### Which microphone, and what the mute does
+
+`mic_source` follows the **output** position, so there is no fourth control:
+
+| Position | Microphone | Why |
+|---|---|---|
+| Speaker | `mic_panel` (ALC255) | D4, verbatim |
+| Headset, adapter present | `mic_headset` | D3, verbatim |
+| Headset, adapter **absent** | **none, and no leg runs** | ruling 7: "no mic tunnelled". Falling back to the mic in the room would be the one failure in this design with no audible symptom |
+| Mute | `mic_panel` | **ruling E**: the output Mute silences the room, not the microphone. Mute names no output device, so there is no headset to take a mic from |
+
+**The input mute is applied by stopping both mic forwarders**, so not one sample
+leaves the panel, plus closing every capture switch that exists as the belt. It
+is deliberately not a flag the chrome draws over a running microphone: a
+cosmetic mute is indistinguishable from a working one to whoever is on the call,
+which is why there is a test named for exactly that.
+
+And because a microphone's state cannot be heard from the room, **every apply
+journals which one is open** (`microphone: mic_panel`). That line is how the
+difference is answerable at three in the morning.
+
+### Two gates on the mute, because one of them was a command
+
+The input mute is applied by stopping both mic legs. Review (terra, 2026-09-14)
+pointed out twice - once per leg - that **a stop is a command, not a property**.
+Both legs are `Restart=always`, so a guard or `alsaloop` crash, an operator
+restart, a `daemon-reload` workflow, or a stop that *failed* during an apply
+would each bring a microphone back while `audio-state.json` still said muted,
+with nothing in the room to hear it.
+
+So the mute is now held by three things that do not depend on each other:
+
+1. **The apply stops the legs**, and a mic leg that will not stop is asked
+   again, **SIGKILLed**, and asked again; one that survives all of that is a
+   failed apply with a journal line saying the microphone may still be live.
+   Counting the failure and stepping over it was not enough: the state is saved
+   before the apply, the rear leg has no runtime recheck of its own, and an
+   already-open `alsaloop` goes on sending the room to the desktop. The mode
+   switch escalates the same way and **refuses to change mode** if it cannot. (Failing to *start* one still does not: that
+   apply runs under a unit firstboot waits on. The asymmetry is the point.)
+2. **Both units carry `ExecCondition=wall-audio-output mic-allowed`**, which is
+   re-run on every start attempt including a restart, takes no lock (so it
+   cannot deadlock the apply that is starting the leg), and answers
+   `wall_audio_state.mic_live`.
+3. **`wall-bt-mic.py` re-reads the state on every poll**, because it is a
+   long-lived process and an `ExecCondition` only fires at start.
+
+All three ask the **same** function, and both gates answer identically for a
+missing state file (refuse), because two gates on one privacy control that can
+disagree are worse than either answer alone.
+
+**And the stored state cannot be turned into consent.** Four review rounds each
+found a different way round the previous round's rule, so the rule is now the
+simplest one that has no seam in it: **the microphone is muted unless the state
+document explicitly carries the boolean `false`.** Not "unless it says true",
+and not "unless a field needed repair" - both of those treated an ABSENT field
+as consent, and a truncated write is indistinguishable from a fresh file. `{}`,
+`{"output": "speaker"}`, `[]` and an unparseable file all come back muted. A
+document that needed any other repair comes back muted too, which catches a file
+that says `false` while being damaged elsewhere.
+
+The one exception is a state file that has **never existed**, which stays
+unmuted: there is no prior mute to lose, and a fresh image whose microphone
+needed a button press that the chrome does not have yet (step 5) would be the
+worse failure. A file that exists and cannot be READ is different in kind and is
+muted, because the applier persists what it loaded before it applies it - so the
+unmuted default was being rewritten into a valid, unmuted document that the
+units' own gate then believed.
+
+The cost of all of this is one button press after a state file is damaged.
+
+**A damaged state file comes back muted.** `normalize` still repairs
+field by field, but any document that needed a repair returns `input_muted:
+True`. Every other field's default is harmless to land on; `input_muted`'s is
+not, and the first round's argument - that the applier and the supervisor
+normalizing the same document the same way made it safe - was wrong, because
+agreeing to open a microphone nobody asked for is not safety.
+
+### Accepted, not fixed: the shared dmix across a suspend
+
+Review also flagged that `usb_out_mix` is a **new persistent IPC segment on the
+adapter**, and that resume runs `apply-state`, which does not clear IPC and
+whose `systemctl start` is a no-op on a leg that is already active. Only a
+*mode switch* sweeps unattached segments. So if the adapter survives S3 badly,
+a stale dmix server could in principle hold pre-suspend hardware state.
+
+**Not changed here, deliberately.** Making resume restart the legs, or sweep
+IPC, changes behaviour for the speaker chain that is **on the wall and working
+tonight**, on a risk nobody has yet observed. The existing acceptance check 11
+(sleep and wake) already exercises this path, S4-16 below extends it to the mic
+legs, and the recovery is one line that does not need this design to change:
+
+```sh
+sudo systemctl restart wall-speaker-out wall-mic-rear    # cheap; fixes a wedged client only
+sudo wall-audio-mode bus                                 # the REAL recovery: it sweeps the IPC
+```
+
+If S4-16 reproduces it, the fix belongs in `wall-audio-resume.service` as a
+restart of the legs rather than a start, and it should be made for **all** the
+legs at once rather than for the mic ones only.
+
+**And the recovery is the second line, not the first** (terra, round 3, and it
+was right to call the first one out). Restarting the clients cannot establish
+that a stale `usb_out_mix` SysV segment has been removed: only `clear_ipc` in
+`wall-audio-mode` sweeps unattached segments, and no leg restart calls it. So
+`sudo wall-audio-mode bus` is the real recovery, and it is a **whole-chain mode
+transition** with everything that implies, not a harmless one-liner. The leg
+restart is worth trying first only because it is cheaper and will fix the
+simpler failure, and S4-16 says so rather than promising it.
+
+### The AEC seam, which is the whole reason `mic_selected` exists
+
+Both legs open one name, `pcm.mic_selected`, resolved through
+`@func getenv WALL_AUDIO_MIC_SOURCE`. The later AEC step (D-3a) inserts a
+cancelled microphone by making that one name resolve somewhere else: **one line
+of configuration**, no change to a unit, a script or a leg test. Nothing
+downstream may ever open `mic_panel` or `mic_headset` directly, and a test
+asserts that neither name appears in either unit's `ExecStart`.
+
+Both capture sources are `dsnoop` rather than raw opens, for the reason
+`spdif_in` is: the AEC measurement loop must be able to read the same microphone
+the leg is forwarding, and an `alsaloop` holding the hardware locks it out.
+
+### The Bluetooth half
+
+`bluealsa` gains `-p hfp-hf`, which makes the panel the phone's **hands-free
+unit** (its headset), which is what spec A asks for. Not `hfp-ag`, which is that
+relationship inverted. Review finding 4 is accepted and unchanged: HFP and A2DP
+are the same radio link at different times, so a call is mono at 8 or 16 kHz and
+suspends the music.
+
+`wall-bt-mic.service` is a **supervisor, not a forwarder unit**, and that is
+forced: an SCO PCM exists only while a call is up and is named after the phone's
+address, so there is no device node for `BindsTo=` to bind to.
+`wall-bt-mic.py` polls BlueALSA's own D-Bus object tree for a `.../sco/sink`
+path and runs one `alsaloop` for exactly as long as one is there. Only a
+**sink** counts: `sco/source` is the far end's voice and `a2dp/sink` is music.
+Every failure to read answers "no call", because the failure direction that
+matters is a microphone that stays open.
+
+**Not done here, on purpose.** The far end's voice does not reach the bus yet.
+That direction is `bluealsa-aplay --profile-sco`, a change to a unit carrying
+the room's music today, and it is flagged rather than switched on underneath a
+working panel. A phone paired before `hfp-hf` existed must reconnect before an
+endpoint appears; the leg finding nothing meanwhile is correct and quiet.
+
+### The one place step 3's fallback and step 4's leg are exclusive
+
+`speaker_stereo` is still a **raw** open of the adapter, deliberately: the point
+of a fallback is that it is the simplest thing that can work. While the speaker
+leg is running on it, the adapter is held exclusively and the rear mic leg
+cannot open it. `rear_mic_possible` refuses the leg with a journal line naming
+the fix rather than leaving it to a restart loop. In Mute and Headset the
+speaker leg is stopped, so the rear leg runs normally, and the Bluetooth mic
+return is a different device and is unaffected either way.
+
+### Files step 4 changes or adds
+
+| File | New? | What it does |
+|---|---|---|
+| `asound-bus-mode.conf` | changed | `usb_out_mix` (the shared 8-channel dmix), `speaker_hw8` through it, `mic_panel_raw`/`mic_panel` (explicit (L+R)/2), `mic_headset_raw`/`mic_headset`, `mic_selected` (the AEC seam), `mic_rear`, and the mic file added to the one `@hooks` block |
+| `audio-mic.conf.example` | new | what the generated `pcm.mic_rear_route` looks like, and why the zeros are the point |
+| `wall-mic-rear.service` | new | `mic_selected` to the adapter's rear out, bound to the 5.1 adapter |
+| `wall-bt-mic.service`, `wall-bt-mic.py` | new | the HFP mic return and its bounded poll |
+| `wall-bluealsa-override.conf` | changed | `-p hfp-hf` alongside `-p a2dp-sink` |
+| `wall_audio_state.py` | changed | `mic_source`, `mic_live`, `MIC_LEGS`, and `adapter_muted` becoming `not (speaker or mic)` |
+| `wall-audio-output` | changed | the `mic` subcommand and its generated pair, `select_mic_source`, `set_rear_level`'s read-modify-write, `rear_mic_possible`, `Applier.capture`, mic legs excluded from the failure count |
+| `wall-audio-mode` | changed | the two mic legs join the stop list, the never-enable list and the IPC sweep |
+| `wall-firstboot.sh`, `wall.env.example` | changed | seeds `audio-mic.env` and `bt-mic.env` if absent, renders `audio-mic.conf`, installs the units and the supervisor |
+
+**Unchanged, and asserted so:** the bus, the detector's tap and its sources, the
+speaker leg's own `alsaloop` arguments, the headset output leg, the broker's
+protocol surface, and `input_muted`'s place in the state (it was already there).
+
+### Tests
+
+* `tests/test_wall_audio_switch.py` - 30 new cases, named for the rulings: the
+  selection in every position, ruling E from both sides, ruling 7 tunnelling
+  nothing, the real mute, both route tables' zeros and their disjointness, the
+  measured capture default agreeing across code, firstboot and `wall.env`, nine
+  refusals that each move nothing, field-by-field fallback, the read-modify-write
+  of the adapter's eight levels, the restart-on-change, a mic leg never failing
+  an apply while an output leg does, the stereo-fallback exclusion, the AEC seam,
+  unique IPC keys, the profile, and eight supervisor cases.
+* **`test_the_generated_alsa_config_parses_sr028` now asks `alsa-lib` about the
+  mic graph too** and about the containment in BOTH directions: deleting
+  `audio-trim.conf` costs `speaker_multi` and leaves `mic_rear_route` standing;
+  deleting `audio-mic.conf` costs `mic_rear_route` and leaves the bus, both
+  output legs and `default` standing. Run under `wsl -d Ubuntu`.
+* `stack/autoinstall/wall/tests/audio-switch.test.sh` - B14 to B17 on the real
+  applier. **103 PASS 0 FAIL.**
+
+### Install and acceptance for step 4
+
+Run with the Owner present. The rollback is still one command at every point.
+
+```sh
+# 1. Payload in place, then the audio block: it seeds audio-mic.env, renders
+#    audio-mic.conf and installs the two units and the supervisor.
+sudo /opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh
+cat /etc/wall-panel/audio-mic.conf        # expect pcm.mic_rear_route, 1.0 to ch 4 and 5
+
+# 2. The Bluetooth profile. This RESTARTS bluealsa and drops a playing phone.
+sudo systemctl daemon-reload && sudo systemctl restart bluealsa
+systemctl show -p ExecStart bluealsa | grep -o 'hfp-hf'   # expect: hfp-hf
+
+# 3. Re-apply the position, which starts the mic legs and raises the rear pair.
+sudo wall-audio-output set speaker
+sudo wall-audio-output status              # expect the mic block and mic_source_published
+amixer -c ICUSBAUDIO7D cget numid=8        # expect 66,66,24,24,66,66,24,24
+```
+
+| # | Do this | Expect |
+|---|---|---|
+| S4-1 | `journalctl -t wall-audio-output --since -2min` | `microphone: mic_panel`, and both mic legs started |
+| S4-2 | **The leak test, and it is the one that matters.** Play music on Speaker with NO one talking, and record the desktop's line input | the music is **absent** from the desktop's input. This is the speaker route's explicit zeros on channels 4 to 7 |
+| S4-3 | Talk at the panel while the music plays; record the desktop's input | the voice is there, at a usable level. If it is too hot or too quiet, `sudo wall-audio-output mic rear_level=N` while watching the meter |
+| S4-4 | Listen to the room while talking | **no voice from the speakers.** This is the mic route's explicit zeros, and it is the feedback path the design has to not have |
+| S4-5 | `sudo wall-audio-output input-mute on`, still talking | the desktop's input goes **silent**; `systemctl is-active wall-mic-rear` says `inactive`; the music keeps playing. Then `input-mute off` and it comes back |
+| S4-6 | `sudo wall-audio-output set mute` | the room is silent and the **microphone still reaches the desktop** (ruling E). `set speaker` afterwards |
+| S4-7 | Plug the headset adapter in, so the panel switches to Headset | `journalctl` shows `microphone: mic_headset (was mic_panel: the legs are restarted)`; the headset's mic reaches the desktop's input and the panel's own does not |
+| S4-8 | Unplug it while still on Headset | ruling 7: **nothing** is tunnelled; `wall-audio-output status` shows `mic_live` false and `reason: headset_absent` |
+| S4-9 | Connect the phone, place a call, answer it on the panel | `journalctl -u wall-bt-mic` shows `HFP mic return started`; the far end hears the room. Music suspends for the call and resumes after (review finding 4, accepted) |
+| S4-10 | `sudo wall-audio-output input-mute on` during that call | the far end hears **nothing**, and the journal shows the leg stopped |
+| S4-11 | **Echo, expected and not fixed here.** Ask the far end whether they hear themselves | they probably do: finding 3's open-loop echo is real and Speaker-position AEC is step D-3a. Note how bad it is; that measurement is the AEC step's input |
+| S4-12 | Reboot and watch the first two minutes | `systemctl status wall-firstboot` green, not timed out; the speaker leg starts as before; no new underrun burst; the mic legs come up with the stored position |
+| S4-13 | `sudo wall-audio-mode trigger` | **everything** stops, mic legs included, and the old chain is back. Then `sudo wall-audio-mode bus` to return |
+| S4-14 | **The latency measurement, and it gates the step.** With the desktop playing video over S/PDIF on Speaker, ask the Owner about lip-sync, before and after. Also `journalctl -u wall-speaker-out --since -10min` while music plays | the Owner hears **no new lip-sync error** and there is **no underrun burst**. The shared dmix added a 170 ms ring the raw open did not have; how much of it becomes delay is unmeasured. If it reads wrong, `buffer_size` on `usb_out_mix` is the first number to move, then `wall-spdif-in`'s `--tlatency`, and S3-9's underrun watch must be repeated after either |
+| S4-16 | **Sleep and wake, with the mic legs up.** `sudo systemctl suspend`, wake it, then play music on Speaker and talk | audio in the room, and the microphone still reaching the desktop's input, **without a manual restart**. This is the shared-dmix-across-suspend risk review flagged and nobody has yet observed; if it fails, try `sudo systemctl restart wall-speaker-out wall-mic-rear` first and `sudo wall-audio-mode bus` if that does not do it (only the mode switch sweeps the dmix's IPC segment; a leg restart cannot). Either way that is the evidence the resume unit needs changing for every leg |
+| S4-15 | **A privacy check worth doing once.** `sudo wall-audio-output input-mute on`, then `sudo systemctl restart wall-bt-mic` | the leg comes up and **refuses to open a microphone**: `journalctl -u wall-bt-mic` shows it polling and starting nothing. This is the fail-open review found, and the supervisor now re-reads the switch state on every poll rather than trusting that a stop reached it |
+
+### If anything in S4-1 to S4-13 fails
+
+The mic legs are separable from the audio the room hears, which is the point of
+their being separate units:
+
+```sh
+sudo systemctl stop wall-mic-rear wall-bt-mic      # the mic legs only; music keeps playing
+sudo wall-audio-output input-mute on               # same thing through the switch, and it persists
+sudo wall-audio-mode trigger                       # the whole-graph rollback, unchanged
+```
 
 ## Install and acceptance for steps 1–2
 

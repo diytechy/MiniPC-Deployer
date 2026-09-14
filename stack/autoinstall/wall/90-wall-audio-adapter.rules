@@ -27,6 +27,15 @@
 # NO ACTION=="add" ON THE TAG OR THE ALIAS. Measured on the panel: card1 showed
 # TAGS=:systemd:seat: but CURRENT_TAGS=:seat: -- a later non-add event had
 # reprocessed the rules without the add-only line, so the systemd tag was stale
+# THE REAR MIC LEG IS WANTED HERE TOO (item 23 step 4). It BindsTo this alias,
+# so an unplug stops it -- and on re-add nothing brought it back: the udev rule
+# named only the legacy units, and wall-audio-state.service is RemainAfterExit
+# so it does not re-assert the stored position either. The mic return to the
+# desktop was therefore lost permanently by one hub move, which is a thing this
+# appliance is already known to do (item 25). Starting it from here is safe
+# because the unit gates itself twice on every start attempt: bus mode, and
+# `wall-audio-output mic-allowed`, which refuses while the switch says muted.
+#
 # and the device unit was not tracked at all. udev re-evaluates every rule on
 # every event and a property not set by THIS event does not exist, so the tag,
 # the alias and the wants are all set on everything except remove.
@@ -35,5 +44,6 @@ SUBSYSTEM=="sound", KERNEL=="card*", ATTRS{idVendor}=="0d8c", ATTRS{idProduct}==
     TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/wall_audio_adapter", \
     ENV{SYSTEMD_WANTS}+="wall-line-in.service", \
     ENV{SYSTEMD_WANTS}+="wall-kiosk-loop.service", \
-    ENV{SYSTEMD_WANTS}+="wall-amp-trigger.service"
+    ENV{SYSTEMD_WANTS}+="wall-amp-trigger.service", \
+    ENV{SYSTEMD_WANTS}+="wall-mic-rear.service"
 LABEL="wall_audio_adapter_end"

@@ -1,0 +1,39 @@
+# The USB audio adapter's identity, as a stable systemd device unit.
+#
+# WAS 90-wall-line-in.rules. It started the line-in passthrough when the
+# adapter appeared (2026-09-12), because a plain
+# ConditionPathExists=/proc/asound/ICUSBAUDIO7D raced USB enumeration and lost:
+# after a reboot the unit was skipped with "start condition unmet" and the
+# passthrough was absent until someone started it by hand. Device activation is
+# still the fix, and it still lives here.
+#
+# WHAT 2026-09-13 ADDED (Owner item 25): the hub was moved to another port. The
+# adapter came back with the same card id, but the three long-running audio
+# consumers kept handles on the dead device instance and never noticed. The
+# units now BindsTo= the alias below, so a re-enumeration STOPS them, and the
+# SYSTEMD_WANTS on the way back in STARTS them again.
+#
+# ENV{SYSTEMD_ALIAS} IS THE WHOLE POINT AND IT IS NOT OPTIONAL. The kernel's own
+# device unit name embeds the USB path --
+# sys-devices-...-usb1-1\x2d2-1\x2d2.4-...-sound-card1.device -- and that name
+# CHANGES when the hub moves ports, which is the exact event being recovered
+# from. The alias is a port-independent name for whichever port it is on now.
+# /dev/wall_audio_adapter is a name, not a node: nothing creates that file, and
+# systemd only turns it into dev-wall_audio_adapter.device. Underscores, not
+# dashes: a dash in the path is escaped to backslash-x2d, and every unit file
+# would then have to spell the dependency that way by hand -- one lost
+# backslash and the BindsTo points at a unit that can never exist.
+#
+# NO ACTION=="add" ON THE TAG OR THE ALIAS. Measured on the panel: card1 showed
+# TAGS=:systemd:seat: but CURRENT_TAGS=:seat: -- a later non-add event had
+# reprocessed the rules without the add-only line, so the systemd tag was stale
+# and the device unit was not tracked at all. udev re-evaluates every rule on
+# every event and a property not set by THIS event does not exist, so the tag,
+# the alias and the wants are all set on everything except remove.
+ACTION=="remove", GOTO="wall_audio_adapter_end"
+SUBSYSTEM=="sound", KERNEL=="card*", ATTRS{idVendor}=="0d8c", ATTRS{idProduct}=="0102", \
+    TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/wall_audio_adapter", \
+    ENV{SYSTEMD_WANTS}+="wall-line-in.service", \
+    ENV{SYSTEMD_WANTS}+="wall-kiosk-loop.service", \
+    ENV{SYSTEMD_WANTS}+="wall-amp-trigger.service"
+LABEL="wall_audio_adapter_end"

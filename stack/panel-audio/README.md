@@ -105,6 +105,67 @@ audio path is not here — it is a set of units and ALSA configuration under
 | `wall-amp-trigger.service`, `panel-amp-trigger.py` | detects playing audio and commands the LCUS-2 relay (the headphone-tone actuator is retired, 2026-09-13) |
 | `wall-volume-keys.service`, `panel-volume-keys.py` | the side rocker |
 | `wall-audio-mode` | switches output modes |
+| `90-wall-audio-adapter.rules` | gives the USB adapter a port-independent systemd alias and starts the three units on it |
+| `wall-alsaloop-guard.py` | runs alsaloop with a bounded recover loop so a wedge becomes a restart |
+
+### Surviving a USB re-enumeration (Owner item 25, 2026-09-13)
+
+The Owner moved the USB hub that carries the adapter and the relay to another
+port. Everything below the applications recovered by itself: the kernel
+re-enumerated the ICUSBAUDIO7D with the same card id, udev recreated
+`/dev/wall-amp-relay`, and `wall-line-in` restarted because its alsaloop died.
+What did not recover was the two long-running consumers:
+
+* `wall-kiosk-loop`'s alsaloop kept its handle on the dead device instance and
+  printed `unable to prepare slave` forever. It never exits, so `Restart=always`
+  never fired and the unit read as perfectly active while no audio moved.
+* `wall-amp-trigger` lost its line-in capture and its relay handle.
+
+`systemctl restart wall-kiosk-loop wall-amp-trigger` fixed it by hand. The
+durable fix has three parts and no path edits, because card **ids** rather than
+indexes were already in use everywhere:
+
+1. `90-wall-audio-adapter.rules` tags the adapter's sound card for systemd and
+   gives it `ENV{SYSTEMD_ALIAS}="/dev/wall_audio_adapter"`. The alias is the
+   point: the kernel's own device unit name contains the USB port, which is the
+   thing that changes. On every non-remove event, so the tag cannot go stale.
+2. The three units `BindsTo=` and `After=` `dev-wall_audio_adapter.device`, so a
+   remove event stops them; the rule's `SYSTEMD_WANTS` starts them again when the
+   adapter comes back. With the adapter absent the start job fails as a
+   dependency and the unit stays inactive — no restart loop, and nothing that
+   holds up boot or the kiosk, which is a tty autologin loop rather than a unit.
+3. Both alsaloops run under `wall-alsaloop-guard.py`, which exits non-zero after
+   more than `--max-errors` stream errors inside a `--window` second window and
+   hands recovery back to `Restart=`. `panel-amp-trigger.py` additionally waits a
+   bounded `WALL_AMP_RELAY_WAIT_SECONDS` (default 6, sized from the ten-second
+   budget because this wait runs before the capture threads) for the relay's
+   node, reopening a fresh transport each attempt, because the CH340 is on the
+   same hub and may still be re-probing when this service restarts. If it still
+   cannot reach the relay the detector runs anyway with the safe-state proof
+   revoked — which blocks S3 exactly as before — and keeps commanding OFF until
+   one verifies: once a second for the first fifteen seconds after the restart,
+   on the ordinary five-second actuator beat after that, so a relay that comes
+   back at seven seconds is commanded at seven rather than at eleven. That path matters because the
+   relay can disappear BEFORE the sound card does, so the stop that `BindsTo`
+   triggers may have no CH340 to command and the LCUS-2 latches physically on.
+
+A panel-mode replug does start `wall-amp-trigger`, because `SYSTEMD_WANTS`
+ignores enablement. That is the safe direction and is left alone: the daemon
+commands and verifies the relay OFF before it idles.
+
+**Acceptance procedure.** With music playing from the kiosk and the amplifier
+on, move the USB hub to a different port on the panel. Within 10 s, with no
+manual restart: the amplifier is on and kiosk audio is audible. Then
+
+```sh
+journalctl -u wall-kiosk-loop -u wall-line-in -u wall-amp-trigger --since -2min
+systemctl status wall-kiosk-loop wall-line-in wall-amp-trigger
+```
+
+must show each of the three units stopping once and starting once — one cycle,
+not a restart loop — and `wall-amp-trigger` logging `amplifier ON` again. A
+`journalctl | grep 'unable to prepare slave'` that keeps growing after the move
+is the original defect, not this fix working slowly.
 
 The measurement record behind all of it, including the trigger circuit that is
 still to be built, is `PANEL_AMP_AUTOPOWER.md` in the HomeHub repo.

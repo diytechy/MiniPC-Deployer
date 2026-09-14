@@ -16,6 +16,35 @@ Description=Wall panel: forward kiosk audio through the detector loopback
 Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
 After=sound.target systemd-modules-load.service
 Wants=sound.target
+# The guard exits within a second of a wedge, so the default 5-starts-in-10s
+# limit would land the unit in `failed` in the middle of a genuine recovery and
+# leave the panel silent until a human noticed. These are [Unit] keys, not
+# [Service] keys: systemd-analyze verify says "Unknown key name" for the
+# [Service] spelling and then IGNORES it, which reads exactly like working
+# configuration. Ten starts a minute is still bounded.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+# THE ADAPTER'S IDENTITY, NOT ITS PORT (Owner item 25, 2026-09-13). The hub was
+# moved to another port; the adapter re-enumerated with the same card id and
+# this unit's alsaloop kept its handle on the dead device instance, printing
+# "unable to prepare slave" forever while the unit still read as active. BindsTo
+# on the udev alias makes the kernel's remove event STOP this unit, and the
+# SYSTEMD_WANTS in 90-wall-audio-adapter.rules starts it again when the device
+# comes back. The alias is used rather than the kernel's own
+# sys-devices-...-card1.device because THAT name contains the USB port, which is
+# the thing that changed.
+#
+# With the adapter absent the start job fails as "dependency" and the unit stays
+# inactive -- no restart loop, nothing held up: multi-user.target does not wait
+# on it and the kiosk itself is a tty autologin loop, not a unit. Verified on
+# systemd 255, the panel's version.
+#
+# The alias uses UNDERSCORES on purpose: systemd escapes a '-' in a device path
+# to \x2d, and a hand-written `dev-wall\x2daudio\x2dadapter.device` in three
+# unit files and a udev rule is one lost backslash away from a dependency on a
+# unit that will never exist -- which fails OPEN in the worst way, silently.
+BindsTo=dev-wall_audio_adapter.device
+After=dev-wall_audio_adapter.device
 # NO ConditionPathExists ON THE LOOPBACK NODE. The sibling line-in unit records
 # that exact pattern losing an enumeration race, and it would lose here too:
 # systemd evaluates the condition once, and a unit SKIPPED for an unmet
@@ -28,7 +57,18 @@ Wants=sound.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/alsaloop \
+# Panel mode defines no kiosk_monitor. The unit is DISABLED in that mode, but
+# the udev rule's SYSTEMD_WANTS would start it anyway on a re-plug, so the mode
+# is checked here too. An ExecCondition refusal leaves the unit inactive and
+# does NOT trigger Restart=, which is the difference from a failing ExecStart.
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = trigger ]'
+# BOUNDED RECOVER LOOP (item 25). Bare alsaloop never exits when its slave has
+# gone stale, so Restart=always never fires. The guard counts stream errors and
+# exits non-zero when they exceed the cap inside the window; see
+# wall-alsaloop-guard.py for the measured failure it was written against.
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
     --cdevice kiosk_monitor \
     --pdevice speaker_shared \
     --format S16_LE --rate 48000 --channels 2 \

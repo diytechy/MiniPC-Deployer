@@ -183,6 +183,36 @@ JACK_CONTROL = "Front Headphone Jack"
 JACK_POLL_SECONDS = 5.0
 # Do not reopen a failing aplay or serial device on every 100 ms block.
 ACTUATOR_RETRY_SECONDS = 5.0
+# ...but five seconds is too slow for the first few, and terra found exactly why
+# (2026-09-13): after a port move this service restarts, and if the CH340 is
+# still missing when the startup wait gives up, the next attempt on a five
+# second beat lands at about eleven seconds -- outside the ten the acceptance
+# allows -- for a relay that was actually back at seven. So for a bounded spell
+# after start, retry once a second. Bounded, because a relay that is genuinely
+# absent must not be probed once a second for the life of the panel, and
+# restricted to the relay because respawning aplay that fast is a different and
+# worse thing to do.
+ACTUATOR_FAST_RETRY_SECONDS = 1.0
+ACTUATOR_FAST_RETRY_WINDOW = 15.0
+# How long a service START waits for the relay's device node before giving up.
+#
+# ITEM 25 (2026-09-13): this service is now stopped and restarted by the USB
+# adapter's re-enumeration, and the LCUS-2 sits on the SAME hub. The restart can
+# therefore land while the CH340 is still being re-probed and /dev/wall-amp-relay
+# does not exist yet. Without this wait the start-up ensure_off() fails on the
+# first ENOENT, main() returns 1, and the amplifier stays dark for a RestartSec
+# -- with the relay possibly still latched ON from before. Bounded on purpose: a
+# relay that is genuinely absent must still fail, and be seen to fail.
+#
+# SIX SECONDS, NOT TWENTY, and the number comes from the acceptance budget
+# rather than from a guess about USB: this wait happens BEFORE the capture
+# threads start, so every second of it is a second the detector is not
+# measuring and the amplifier is not coming back on. Ten seconds is the whole
+# budget. A relay still missing at six is picked up either by the in-loop
+# ACTUATOR_RETRY_SECONDS reopen -- which opens a fresh transport too -- or by
+# the next RestartSec, and neither of those blocks the detector.
+RELAY_WAIT_SECONDS = _env("WALL_AMP_RELAY_WAIT_SECONDS", 6.0, lo=0.0, hi=300.0)
+RELAY_WAIT_INTERVAL = 1.0
 SAFE_STATE_FILE = "/run/wall-amp-trigger/off-verified"
 
 # A source whose last block is older than this is treated as silent.
@@ -350,7 +380,13 @@ class Level:
             # A source that is absent in this mode (kiosk_monitor when the
             # Loopback is not configured) must not spin.
             self._stop.wait(backoff)
-            backoff = min(backoff * 2, 30.0)
+            # Capped at 8 s, not 30 (item 25, 2026-09-13). The cap is there so a
+            # source that is absent in this mode does not spin, and 8 s costs
+            # nothing for that. 30 s did cost something: after a re-enumeration
+            # this service restarts, and a capture that opens on the second or
+            # third attempt must be delivering levels inside the ten seconds the
+            # acceptance allows for the amplifier to come back on.
+            backoff = min(backoff * 2, 8.0)
 
     @property
     def stale(self):
@@ -775,6 +811,49 @@ def record_safe_state(verified):
         log("could not update amplifier safe-state proof: %s" % exc)
 
 
+def retry_beat(now, started_at, jack_actuator):
+    """How long to wait between actuator attempts, at this moment.
+
+    One second while the re-enumeration this service was restarted for could
+    still be settling, five afterwards. Pure, so the timing that the ten-second
+    acceptance depends on is testable without a relay.
+    """
+    if jack_actuator:
+        return ACTUATOR_RETRY_SECONDS
+    if now - started_at < ACTUATOR_FAST_RETRY_WINDOW:
+        return ACTUATOR_FAST_RETRY_SECONDS
+    return ACTUATOR_RETRY_SECONDS
+
+
+def ensure_off_bounded(actuator, wait_seconds=None, monotonic=time.monotonic,
+                       sleep=time.sleep):
+    """ensure_off(), retried until it succeeds or the bounded wait expires.
+
+    The retry exists for one measured case: a USB re-enumeration restarts this
+    service while the relay's CH340 is still being probed, so the device node is
+    briefly absent. Every attempt opens a FRESH transport, which is what makes
+    this a reopen rather than a poll of a stale handle -- an ENOENT, an EIO or a
+    node that has been recreated under a new minor are all the same thing here.
+
+    Returns True on a verified OFF. It always makes at least one attempt, so a
+    zero wait keeps the old behaviour exactly.
+    """
+    wait_seconds = RELAY_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    deadline = monotonic() + wait_seconds
+    attempts = 0
+    while True:
+        attempts += 1
+        if actuator.ensure_off():
+            if attempts > 1:
+                log("relay reached a verified OFF on attempt %d" % attempts)
+            return True
+        if monotonic() >= deadline:
+            log("relay OFF still unverified after %.0fs; giving up so the "
+                "failure is visible" % wait_seconds)
+            return False
+        sleep(min(RELAY_WAIT_INTERVAL, max(0.0, deadline - monotonic())))
+
+
 def stop_and_record(actuator):
     verified = actuator.stop()
     record_safe_state(verified is not False)
@@ -802,14 +881,22 @@ def main():
     # The measured LCUS-2 is a latching device: closing the serial port leaves
     # an energized channel energized. Establish and verify the safe state on
     # every service start, including disabled and non-trigger modes.
-    if method == "lcus-2" and not actuator.ensure_off():
-        record_safe_state(False)
-        return 1
-    record_safe_state(True)
+    safe = True
+    if method == "lcus-2":
+        safe = ensure_off_bounded(actuator)
+    record_safe_state(safe)
 
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
+
+    # An idling service has no detector loop to reconcile the relay later, so
+    # for those two paths an unverified OFF is still a hard failure that the
+    # RestartSec is the only cure for.
+    _idle = (os.environ.get("WALL_AMP_ENABLED", "true").strip().lower()
+             in ("false", "0", "no")) or current_mode() != "trigger"
+    if _idle and not safe:
+        return 1
 
     if os.environ.get("WALL_AMP_ENABLED", "true").strip().lower() in ("false", "0", "no"):
         log("WALL_AMP_ENABLED is false; idling without emitting anything")
@@ -839,8 +926,10 @@ def main():
     changed_at = 0.0
     last_jack_poll = 0.0
     last_actuator_attempt = -1e9
+    last_off_attempt = -1e9
     jack = True
-    last_reassert = time.monotonic()
+    started_at = time.monotonic()
+    last_reassert = started_at
 
     log("watching %s" % ", ".join(pcm for pcm, _ in SOURCES))
     while not stopping.is_set():
@@ -861,6 +950,24 @@ def main():
             if jack_actuator:
                 assert_trigger_output()
 
+        # RECONCILE A RELAY WE COULD NOT REACH AT START (terra, 2026-09-13).
+        # Two things made this necessary. The relay is on the SAME USB hub as
+        # the adapter, so on a port move its node can disappear BEFORE the sound
+        # card does -- the stop that BindsTo triggers then cannot command OFF,
+        # and the LCUS-2 latches, so the amplifier can stay physically on with
+        # nothing driving it. And returning 1 here instead, as this used to,
+        # cost a whole RestartSec before the capture threads even started: a
+        # relay that came back at 7 s was not acted on until about 11 s, which
+        # is outside the ten seconds the acceptance allows. So the detector runs
+        # regardless and keeps trying to reach the safe state on the actuator
+        # retry beat for as long as the amplifier is supposed to be off.
+        beat = retry_beat(now, started_at, jack_actuator)
+        if not on and not safe and now - last_off_attempt >= beat:
+            last_off_attempt = now
+            safe = stop_and_record(actuator) is not False
+            if safe:
+                log("relay reconciled to a verified OFF")
+
         loud = any(lv.above(ON_DBFS) for lv in levels)
         quiet = all(not lv.above(OFF_DBFS) for lv in levels)
 
@@ -868,10 +975,11 @@ def main():
             if loud and jack:
                 above_since = above_since or now
                 if now - above_since >= ATTACK_SECONDS and now - changed_at >= MIN_OFF_SECONDS:
-                    if now - last_actuator_attempt >= ACTUATOR_RETRY_SECONDS:
+                    if now - last_actuator_attempt >= beat:
                         record_safe_state(False)
                         if actuator.start():
                             on = True
+                            safe = False
                             changed_at = now
                             below_since = None
                             log("amplifier ON (%s)"
@@ -888,6 +996,7 @@ def main():
                 if now - below_since >= HOLD_OFF_SECONDS and now - changed_at >= MIN_ON_SECONDS:
                     if stop_and_record(actuator):
                         on = False
+                        safe = True
                         changed_at = now
                         above_since = None
                         log("amplifier OFF after %.0fs idle" % HOLD_OFF_SECONDS)
@@ -900,15 +1009,18 @@ def main():
                 below_since = None
             if jack_actuator and not jack and actuator.running:
                 log("trigger cable removed; stopping tone")
-                stop_and_record(actuator)
+                safe = stop_and_record(actuator) is not False
                 on = False
                 changed_at = now
             elif (on and not actuator.maintain(now)
-                  and now - last_actuator_attempt >= ACTUATOR_RETRY_SECONDS):
+                  and now - last_actuator_attempt >= beat):
                 last_actuator_attempt = now
                 log("amplifier actuator stopped unexpectedly; restarting")
                 if not actuator.start():
                     on = False
+                    # The relay is in an unknown physical state: the loop above
+                    # keeps commanding OFF until one is verified.
+                    safe = False
                     changed_at = now
 
         stopping.wait(BLOCK_SECONDS)

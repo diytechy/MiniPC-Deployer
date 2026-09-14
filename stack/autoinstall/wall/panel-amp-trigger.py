@@ -32,6 +32,7 @@ Exit codes: 78 configuration unusable.
 """
 
 import errno
+import json
 import math
 import os
 import posixpath
@@ -230,6 +231,158 @@ def current_mode():
     return value if value in ("trigger", "panel", "bus") else "trigger"
 
 
+# ── bus telemetry (item L, coordinator addendum 2026-09-14) ─────────────────
+# WHY IT LIVES HERE AND NOT IN THE BROKER. Panel telemetry -- the levels the
+# shell's visualizer draws -- has been reporting `available: false` since the
+# switch backend replaced the routed one, and the reason is structural rather
+# than an oversight: the broker runs as `panel` under ProtectSystem=strict with
+# PrivateDevices=true and AF_UNIX as its only address family. It cannot open a
+# sound device at all, and giving it one would move the audio-capture privilege
+# to the process the renderer talks to, which is the one boundary SR-023 exists
+# to hold.
+#
+# THIS SERVICE ALREADY HAS THE CAPTURE. It opens `speaker_tap` -- the post-
+# switch, pre-volume tap -- every 100 ms for the amplifier detector, and has
+# done since step 3. So the telemetry is a by-product of a capture that is
+# already running: NO second capture is started, no routing changes, and when
+# the switch leaves Speaker the tap goes quiet and the telemetry says so,
+# exactly as the relay hold-off already does.
+#
+# THE SHAPE IS A FILE, for the same reason the AEC status block is: the broker
+# can read /run, and a file is the only channel that crosses this privilege
+# boundary without opening a new one.
+BUS_TELEMETRY_FILE = "/run/wall-amp-trigger/bus-telemetry.json"
+# 5 Hz. The visualizer is a wall decoration and the renderer polls at 4 Hz
+# anyway (js/main.js), so publishing faster would be work nobody reads. It is
+# also HALF the block rate, which is what keeps the band analysis below off
+# every other block and bounds its cost.
+BUS_TELEMETRY_INTERVAL = 0.2
+# Band edges in Hz, geometric from 60 Hz. EIGHT bands, and the top one stops at
+# 6 kHz because the analysis below runs on a 4x-decimated mono signal whose
+# Nyquist is 6 kHz. That is a real limitation and it is written down rather than
+# hidden: this is a loudness-per-band readout for a decoration, not a
+# spectrum analyser, and the alternative -- a full-rate filter bank in Python on
+# a 100 ms budget -- would put the amplifier detector's own duty at risk.
+BUS_BANDS_HZ = (60.0, 120.0, 240.0, 480.0, 960.0, 1900.0, 3400.0, 5200.0)
+BUS_DECIMATE = 4
+# The dB window the published 0..1 band values are mapped onto. The same floor
+# the canceller's level scalar uses, and the same reasoning: linear in decibels,
+# because a band linear in AMPLITUDE sits at zero until somebody shouts.
+BUS_FLOOR_DBFS = -60.0
+BUS_REFERENCE_DBFS = -12.0
+
+
+def band_levels(samples, channels, frames):
+    """Eight bounded band energies in [0,1] from one interleaved block.
+
+    ONE GOERTZEL PER BAND OVER A DECIMATED MONO SUM, which is the cheapest thing
+    that answers the question honestly. The cost is `bands * frames / decimate`
+    multiply-adds -- about 9,600 for a 100 ms block, against the roughly 9,600
+    the detector's own high-pass already spends -- so it roughly doubles a cost
+    that was already comfortable, and it runs on every OTHER block.
+
+    Goertzel gives the energy at ONE frequency, not in a band, so what comes out
+    is a sample of the spectrum at the band centre rather than an integral over
+    it. For a decoration that is the right trade: it tracks what a listener
+    hears move, it cannot be made expensive by a busy signal, and calling it a
+    band level rather than a band energy would be the overclaim.
+
+    Inputs:  samples: the unpacked interleaved block
+             channels/frames: its shape
+    Outputs: a list of 8 floats in [0,1]
+    Implements: SR-028, LLR-015
+    """
+    step = BUS_DECIMATE * channels
+    mono = []
+    for i in range(0, frames * channels - step, step):
+        total = 0.0
+        for ch in range(channels):
+            total += samples[i + ch]
+        mono.append(total / (channels * 32768.0))
+    count = len(mono)
+    if count < 64:
+        return [0.0] * len(BUS_BANDS_HZ)
+    rate = RATE / BUS_DECIMATE
+    out = []
+    for centre in BUS_BANDS_HZ:
+        if centre >= rate / 2.0:
+            out.append(0.0)
+            continue
+        coefficient = 2.0 * math.cos(2.0 * math.pi * centre / rate)
+        s1 = s2 = 0.0
+        for value in mono:
+            s0 = value + coefficient * s1 - s2
+            s2 = s1
+            s1 = s0
+        power = s1 * s1 + s2 * s2 - coefficient * s1 * s2
+        # Normalised by the block length so the figure does not grow with it,
+        # and expressed as an amplitude so the dB mapping below is the same one
+        # the canceller uses.
+        amplitude = math.sqrt(max(0.0, power)) * 2.0 / count
+        out.append(scalar_from_amplitude(amplitude))
+    return out
+
+
+def scalar_from_amplitude(amplitude):
+    """An amplitude in [0,1] as a bounded 0..1 scalar, linear in DECIBELS.
+
+    The same normalisation the canceller's microphone level uses and for the
+    same reason, with a reference 6 dB higher because this is a programme signal
+    on a bus rather than a voice in a room.
+    """
+    if not amplitude > 0.0:
+        return 0.0
+    dbfs = 20.0 * math.log10(amplitude)
+    span = BUS_REFERENCE_DBFS - BUS_FLOOR_DBFS
+    return max(0.0, min(1.0, (dbfs - BUS_FLOOR_DBFS) / span))
+
+
+def publish_bus_telemetry(level, active, path=BUS_TELEMETRY_FILE):
+    """Write one bounded telemetry document, atomically.
+
+    Contract:
+      Inputs:  level: the Level watching `speaker_tap`, or None when this mode
+                      has no bus tap at all
+               active: whether the amplifier is currently commanded on
+      Outputs: None; writes `path`
+      Config:  none
+      Raises:  nothing -- telemetry must never be able to stop the detector.
+    Implements: SR-028, LLR-015
+    """
+    try:
+        fresh = level is not None and level.alive and not level.stale
+        document = {
+            "schema": 1,
+            # NAMED, so the renderer can never present a level from somewhere
+            # else as the bus. `speaker_tap` is post-switch and pre-volume: it
+            # carries what the room is being sent, not what the room is set to.
+            "source": "speaker_tap",
+            "valid": bool(fresh),
+            "active": bool(active),
+            "rms": scalar_from_amplitude(
+                10.0 ** (level.dbfs / 20.0)) if fresh else 0.0,
+            "peak": level.peak if fresh else 0.0,
+            "bands": list(level.bands) if fresh else [0.0] * len(BUS_BANDS_HZ),
+            "observed_monotonic_ms": int(level.updated * 1000) if fresh else 0,
+            "reference_dbfs": BUS_REFERENCE_DBFS,
+            "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        payload = json.dumps(document, sort_keys=True) + "\n"
+        temporary = path + ".new"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        # 0644: the broker runs as `panel` and has to read it. There is nothing
+        # secret in a loudness figure, and the directory is already 0755.
+        os.chmod(path, 0o644)
+    except (OSError, ValueError) as exc:
+        # NEVER FATAL. A full /run or a missing directory must not stop the
+        # amplifier detector, whose job is the relay and not the decoration.
+        log("bus telemetry: %s" % exc)
+
+
 class Level:
     """DC-stripped block RMS for one capture source.
 
@@ -243,6 +396,12 @@ class Level:
         self.pcm = pcm
         self.offset_db = offset_db
         self.dbfs = -120.0
+        # Item L's by-products. They are published, never acted on: the
+        # detector's own decision is `dbfs` against the two thresholds and
+        # nothing here may change it.
+        self.peak = 0.0
+        self.bands = [0.0] * len(BUS_BANDS_HZ)
+        self._band_turn = False
         self.alive = False
         self.updated = 0.0
         self._hp = [0.0, 0.0]
@@ -292,6 +451,15 @@ class Level:
                         peak_rms = max(peak_rms, math.sqrt(acc / BLOCK_FRAMES))
                     self.dbfs = (20 * math.log10(peak_rms / 32768.0)
                                  if peak_rms > 0 else -120.0)
+                    # Item L. Computed from the block ALREADY in hand -- no
+                    # second capture, no routing change -- and on every OTHER
+                    # block, which is what bounds the cost against the
+                    # detector's own 100 ms budget. The peak is free; the bands
+                    # are not, so they alternate.
+                    self.peak = max(abs(v) for v in samples) / 32768.0 if samples else 0.0
+                    self._band_turn = not self._band_turn
+                    if self._band_turn:
+                        self.bands = band_levels(samples, CHANNELS, BLOCK_FRAMES)
                     self.updated = time.monotonic()
             except OSError as exc:
                 if exc.errno != errno.ENOENT:
@@ -299,6 +467,10 @@ class Level:
             finally:
                 self.alive = False
                 self.dbfs = -120.0
+                # A dead capture publishes zeros, not the last thing it saw. A
+                # frozen visualizer is indistinguishable from a quiet room.
+                self.peak = 0.0
+                self.bands = [0.0] * len(BUS_BANDS_HZ)
                 if proc is not None:
                     # ALSA reports open failures on the CHILD's stderr, so
                     # discarding it makes a bad PCM completely silent in the
@@ -760,8 +932,23 @@ def main():
     started_at = time.monotonic()
 
     log("watching %s" % ", ".join(pcm for pcm, _ in sources))
+    # The one source item L publishes, by NAME rather than by position: in
+    # `trigger` mode the sources are different and there is no bus tap at all,
+    # and publishing whichever level happened to be first would put a level from
+    # somewhere else on the wall labelled as the bus.
+    bus_level = next((lv for lv in levels if lv.pcm == "speaker_tap"), None)
+    if bus_level is None:
+        log("bus telemetry: no speaker_tap in this mode; the shell will read it "
+            "as unavailable rather than as silence")
+    last_telemetry = 0.0
     while not stopping.is_set():
         now = time.monotonic()
+
+        # Item L. Outside the decision entirely: it reads what the detector has
+        # already measured and writes a file. Nothing below may depend on it.
+        if now - last_telemetry >= BUS_TELEMETRY_INTERVAL:
+            last_telemetry = now
+            publish_bus_telemetry(bus_level, on)
 
         # RECONCILE A RELAY WE COULD NOT REACH AT START (terra, 2026-09-13).
         # Two things made this necessary. The relay is on the SAME USB hub as

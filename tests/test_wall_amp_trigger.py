@@ -276,3 +276,137 @@ def test_a_non_serial_device_is_refused_gracefully_and_leaks_no_descriptor(monke
     assert relay.running is False
     # Each refused open closed exactly the descriptor it had opened.
     assert closed == [4242, 4242]
+
+
+# --- item L: the bus telemetry the detector publishes as a by-product --------
+#
+# NO SECOND CAPTURE, and that is the whole architectural point. The detector
+# already reads `speaker_tap` every 100 ms for the relay; these levels come out
+# of the block it has already unpacked. The broker -- which cannot open a sound
+# device at all -- reads the file this writes.
+
+def test_band_levels_follow_the_tone_that_is_actually_there_llr015():
+    """A tone in one band must move that band and not its neighbours much.
+
+    Goertzel over a decimated mono sum gives the energy AT the band centre
+    rather than an integral over the band, so what is asserted is the ordering
+    and the bound -- which is what a decoration needs -- and not a filter shape
+    the implementation does not claim to have.
+    """
+    import math
+    import struct
+    module = load_module()
+    rate = module.RATE
+    frames = module.BLOCK_FRAMES
+
+    def tone(hz, amplitude=0.5):
+        samples = []
+        for i in range(frames):
+            value = amplitude * math.sin(2 * math.pi * hz * i / rate)
+            pcm = max(-32768, min(32767, int(value * 32767)))
+            samples.extend([pcm, pcm])
+        return samples
+
+    for index, centre in enumerate(module.BUS_BANDS_HZ):
+        if centre >= rate / module.BUS_DECIMATE / 2.0:
+            continue
+        bands = module.band_levels(tone(centre), module.CHANNELS, frames)
+        assert len(bands) == len(module.BUS_BANDS_HZ)
+        assert all(0.0 <= b <= 1.0 for b in bands), bands
+        assert bands[index] == max(bands), (
+            "a tone at %g Hz did not put band %d on top: %s" % (centre, index, bands))
+        assert bands[index] > 0.3, (centre, bands[index])
+
+
+def test_silence_publishes_zeros_and_never_a_floor_llr015():
+    module = load_module()
+    bands = module.band_levels([0] * (module.BLOCK_FRAMES * module.CHANNELS),
+                               module.CHANNELS, module.BLOCK_FRAMES)
+    assert bands == [0.0] * len(module.BUS_BANDS_HZ)
+    # And the scalar mapping floors rather than going negative or to -inf.
+    assert module.scalar_from_amplitude(0.0) == 0.0
+    assert module.scalar_from_amplitude(-1.0) == 0.0
+    assert module.scalar_from_amplitude(1.0) == 1.0
+
+
+def test_a_short_block_is_answered_with_zeros_rather_than_noise_llr015():
+    """A truncated read must not become a spectrum nobody can explain."""
+    module = load_module()
+    assert module.band_levels([1000] * 16, module.CHANNELS, 8) == [0.0] * len(module.BUS_BANDS_HZ)
+
+
+def test_the_published_document_is_the_contract_shape_llr015(tmp_path):
+    import json
+    module = load_module()
+
+    class FakeLevel:
+        pcm = "speaker_tap"
+        alive = True
+        stale = False
+        dbfs = -20.0
+        peak = 0.5
+        bands = [0.25] * len(module.BUS_BANDS_HZ)
+        updated = 1234.5
+
+    path = tmp_path / "bus-telemetry.json"
+    module.publish_bus_telemetry(FakeLevel(), True, path=str(path))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["schema"] == 1
+    # NAMED, so a level from somewhere else can never be presented as the bus.
+    assert document["source"] == "speaker_tap"
+    assert document["valid"] is True and document["active"] is True
+    assert 0.0 <= document["rms"] <= 1.0
+    assert document["peak"] == 0.5
+    assert document["bands"] == [0.25] * len(module.BUS_BANDS_HZ)
+    assert document["observed_monotonic_ms"] == 1234500
+
+
+def test_a_dead_or_stale_capture_publishes_silence_llr015(tmp_path):
+    """A frozen visualizer is indistinguishable from a quiet room, so it is not
+    allowed to be frozen: a capture that is not live publishes zeros and says
+    `valid: false` beside them."""
+    import json
+    module = load_module()
+
+    class DeadLevel:
+        pcm = "speaker_tap"
+        alive = False
+        stale = True
+        dbfs = -20.0
+        peak = 0.9
+        bands = [0.9] * len(module.BUS_BANDS_HZ)
+        updated = 1234.5
+
+    path = tmp_path / "bus-telemetry.json"
+    module.publish_bus_telemetry(DeadLevel(), True, path=str(path))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["valid"] is False
+    assert document["rms"] == 0.0 and document["peak"] == 0.0
+    assert document["bands"] == [0.0] * len(module.BUS_BANDS_HZ)
+
+
+def test_no_bus_tap_in_this_mode_publishes_an_invalid_document_llr015(tmp_path):
+    """`trigger` mode has no speaker_tap at all. Saying so beats saying nothing."""
+    import json
+    module = load_module()
+    path = tmp_path / "bus-telemetry.json"
+    module.publish_bus_telemetry(None, False, path=str(path))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["valid"] is False and document["bands"] == [0.0] * len(module.BUS_BANDS_HZ)
+
+
+def test_telemetry_can_never_take_the_detector_down_llr015():
+    """A full /run or a missing directory is not an amplifier fault."""
+    module = load_module()
+
+    class FakeLevel:
+        pcm = "speaker_tap"
+        alive = True
+        stale = False
+        dbfs = -20.0
+        peak = 0.5
+        bands = [0.25] * len(module.BUS_BANDS_HZ)
+        updated = 1234.5
+
+    # No exception, whatever the path does.
+    module.publish_bus_telemetry(FakeLevel(), True, path="/nonexistent/dir/x.json")

@@ -50,6 +50,29 @@ import switch_request
 # audio_router.BrokerError to speak the broker's error vocabulary.
 
 DEFAULT_STATE_PATH = Path("/etc/wall-panel/audio-state.json")
+# -- item L: the two producers this backend READS and never runs ------------
+# Neither file is opened by anything privileged here. The broker runs as
+# `panel` under ProtectSystem=strict with PrivateDevices=true and AF_UNIX as
+# its only address family: it cannot open a sound device, and giving it one
+# would move the capture privilege to the process the renderer talks to, which
+# is the boundary SR-023 exists to hold. So both producers are services that
+# ALREADY have the capture they need, and the channel between them and this
+# backend is a bounded document in /run.
+#
+#   wall-amp-trigger  already reads `speaker_tap` every 100 ms for the relay,
+#                     so the bus levels are a by-product of a capture that is
+#                     running anyway. NO second capture, no routing change.
+#   wall-audio-aec    already reads the panel microphone as its near end, so
+#                     the post-filter level is likewise a by-product.
+BUS_TELEMETRY_PATH = Path("/run/wall-amp-trigger/bus-telemetry.json")
+AEC_STATUS_PATH = Path("/run/wall-panel/aec-status.json")
+# How old a document may be and still be drawn as live. The bus publishes at
+# 5 Hz and the canceller at 0.1 Hz, so they get different windows -- one window
+# for both would either call the canceller stale constantly or let a frozen bus
+# readout sit on the wall for ten seconds.
+BUS_STALE_MS = 1500
+AEC_STALE_MS = 25000
+TELEMETRY_BANDS = 8
 DEFAULT_APPLIER_PATH = Path("/usr/local/sbin/wall-audio-output")
 # The three positions and the two that carry a level. Duplicated from
 # wall_audio_state (LLR-013) rather than imported: that module lives in the root
@@ -102,7 +125,7 @@ class SwitchApplierBackend:
         if method == "status":
             return self._status()
         if method == "telemetry":
-            return {"available": False}
+            return self._telemetry()
         if method == "request_landed":
             return {"accepted": self._landed(params["seq"])}
         handler = getattr(self, "_" + method, None)
@@ -369,6 +392,159 @@ class SwitchApplierBackend:
         if not isinstance(raw, dict):
             raise _broker_error("backend_unavailable", "audio routing is not configured")
         return raw
+
+    # ---- item L: telemetry ------------------------------------------------
+
+    def _read_document(self, path: Path, limit: int = 16384):
+        """One bounded JSON document from /run, or None. Never raises.
+
+        Telemetry is a decoration. A missing, truncated, oversized or
+        nonsensical document is "we cannot tell you", which the shell renders as
+        an absent visualizer -- never an error, and never the last thing anybody
+        saw.
+        """
+        try:
+            if path.stat().st_size > limit:
+                return None
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    @staticmethod
+    def _scalar(value):
+        """A published 0..1 float, or None. bool is an int in Python: refuse it."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        if value != value or value < 0.0 or value > 1.0:
+            return None
+        return value
+
+    def _telemetry(self) -> dict:
+        """The bus levels and the post-filter microphone scalar (item L).
+
+        WHY THIS ANSWERED `{"available": false}` UNTIL NOW, and why that was a
+        structural answer rather than a stub: this backend replaced the routed
+        one, which had a capture of its own, and the switch backend performs no
+        device I/O at all. It still performs none. What has changed is that two
+        services which already hold the captures now publish what they have
+        measured, and this reads their files.
+
+        Contract:
+          Outputs: {"available": False} when nothing usable is published, or
+                   the IF-015 telemetry result with `rms`, `peak`, `bands` and
+                   an optional `microphone` block. `generation` is stamped by
+                   the broker, not here.
+        Implements: SR-028, LLR-015
+        """
+        now_ms = int(time.monotonic() * 1000)
+        bus = self._bus_block()
+        microphone = self._microphone_block(now_ms)
+        if bus is None and microphone is None:
+            # Honest, and distinguishable from silence: the shell draws no
+            # visualizer rather than a flat one.
+            return {"available": False}
+        if bus is None:
+            # The microphone ring has telemetry and the bus does not. The bus
+            # fields must still be present and must read as SILENCE rather than
+            # as absent, because the schema is exact -- and silence is the
+            # truthful value for a bus nothing is publishing.
+            bus = {"active": False, "rms": 0.0, "peak": 0.0,
+                   "bands": [0.0] * TELEMETRY_BANDS}
+        result = {
+            "available": True,
+            "active": bus["active"],
+            "rms": bus["rms"],
+            "peak": bus["peak"],
+            "bands": bus["bands"],
+            "observedMonotonicMs": now_ms,
+        }
+        if microphone is not None:
+            result["microphone"] = microphone
+        return result
+
+    def _silent_bus(self) -> dict:
+        return {"active": False, "rms": 0.0, "peak": 0.0,
+                "bands": [0.0] * TELEMETRY_BANDS}
+
+    def _bus_block(self):
+        """`speaker_tap` levels from wall-amp-trigger, or None."""
+        raw = self._read_document(BUS_TELEMETRY_PATH)
+        if not raw or raw.get("schema") != 1 or raw.get("source") != "speaker_tap":
+            return None
+        if raw.get("valid") is not True:
+            # The producer is running and says its capture is not live -- the
+            # switch has left Speaker, or the tap has not opened. That is a
+            # SILENT bus, not an absent one, and the difference matters: the
+            # visualizer should show a quiet room, not disappear.
+            return self._silent_bus()
+        rms = self._scalar(raw.get("rms"))
+        peak = self._scalar(raw.get("peak"))
+        bands = raw.get("bands")
+        if rms is None or peak is None or not isinstance(bands, list) or len(bands) != TELEMETRY_BANDS:
+            return None
+        clean = [self._scalar(band) for band in bands]
+        if any(band is None for band in clean):
+            return None
+        observed = raw.get("observed_monotonic_ms")
+        if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+            return None
+        age = int(time.monotonic() * 1000) - observed
+        if age > BUS_STALE_MS or age < -BUS_STALE_MS:
+            # STALE IS SILENCE, NOT THE LAST FRAME. A producer that stopped
+            # would otherwise leave a still picture of a bus level on the wall
+            # for as long as nobody restarted it.
+            return self._silent_bus()
+        return {"active": raw.get("active") is True, "rms": rms, "peak": peak,
+                "bands": clean}
+
+    def _microphone_block(self, now_ms: int):
+        """The canceller's post-filter level, or None when there is no canceller.
+
+        EVERY STATE IS EXPLICIT, because the one thing this block must never do
+        is let a ring be drawn live over a microphone that is muted, stale or
+        not being cancelled at all. `source` is what stops raw capture ever
+        being presented as post-filter.
+        """
+        raw = self._read_document(AEC_STATUS_PATH)
+        if not raw or raw.get("schema") != 1:
+            return None
+        block = raw.get("microphone")
+        if not isinstance(block, dict):
+            return None
+        level = self._scalar(block.get("level"))
+        if level is None:
+            return None
+        source = block.get("source")
+        if source not in ("aec_post_filter", "raw_capture", "none"):
+            return None
+        state = block.get("state")
+        if state not in ("live", "muted", "stale", "unavailable"):
+            return None
+        observed = block.get("observed_monotonic_ms")
+        if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+            return None
+        age = now_ms - observed
+        if age < 0:
+            # The canceller restarted, so its monotonic clock and ours no longer
+            # share an origin. The age is not a number that can be defended, and
+            # a level whose age cannot be defended is stale by definition.
+            age = 0
+            state = "stale"
+        if age > AEC_STALE_MS and state == "live":
+            state = "stale"
+        reference = block.get("reference_dbfs")
+        if isinstance(reference, bool) or not isinstance(reference, (int, float)):
+            return None
+        return {
+            "level": level if state == "live" else 0.0,
+            "source": source,
+            "state": state,
+            "ageMs": age,
+            "valid": state == "live" and block.get("valid") is True,
+            "referenceDbfs": float(reference),
+        }
 
     def _status(self) -> dict:
         """IF-015 status: no routing, plus the switch block read off the file.

@@ -644,8 +644,17 @@ class AudioBroker:
             if value == {"available": False}:
                 return
             expected = {"available", "generation", "observedMonotonicMs", "active", "rms", "peak", "bands"}
-            if set(value) != expected or value["available"] is not True:
+            # `microphone` is OPTIONAL, for exactly the reason the status block's
+            # `mute` and `switch` are: a backend that predates item L, or a panel
+            # with no echo canceller installed, must stay valid. Absent means
+            # "this panel cannot tell you", which the shell must render
+            # differently from a microphone at zero.
+            if not expected <= set(value) or set(value) - expected - {"microphone"}:
                 raise BrokerError("unsafe_backend_result", "telemetry fields are not exact")
+            if value["available"] is not True:
+                raise BrokerError("unsafe_backend_result", "telemetry fields are not exact")
+            if "microphone" in value:
+                self._safe_microphone(value["microphone"])
             if not _safe_integer(value["generation"]) or not _safe_integer(value["observedMonotonicMs"]):
                 raise BrokerError("unsafe_backend_result", "telemetry counters are invalid")
             if not isinstance(value["active"], bool):
@@ -692,6 +701,41 @@ class AudioBroker:
             raise BrokerError("unsafe_backend_result", "effective request mark is invalid")
         if value["generation"] is not None and not _safe_integer(value["generation"]):
             raise BrokerError("unsafe_backend_result", "effective generation is invalid")
+
+    # Item L. Every field is checked, and the two that carry a CLAIM -- `source`
+    # and `state` -- are enums rather than strings, because the whole point of
+    # this block is that a raw or stale level can never be presented as a live
+    # post-filter one.
+    MICROPHONE_FIELDS = {"level", "source", "state", "ageMs", "valid", "referenceDbfs"}
+    MICROPHONE_SOURCES = {"aec_post_filter", "raw_capture", "none"}
+    MICROPHONE_STATES = {"live", "muted", "stale", "unavailable"}
+
+    def _safe_microphone(self, value: object) -> None:
+        """Validate the post-filter microphone block. Implements: SR-028, LLR-015."""
+        if not isinstance(value, dict) or set(value) != self.MICROPHONE_FIELDS:
+            raise BrokerError("unsafe_backend_result", "microphone telemetry is not exact")
+        level = value["level"]
+        if (isinstance(level, bool) or not isinstance(level, (int, float))
+                or not 0 <= level <= 1):
+            raise BrokerError("unsafe_backend_result", "microphone level is invalid")
+        if value["source"] not in self.MICROPHONE_SOURCES:
+            raise BrokerError("unsafe_backend_result", "microphone source is invalid")
+        if value["state"] not in self.MICROPHONE_STATES:
+            raise BrokerError("unsafe_backend_result", "microphone state is invalid")
+        if not _safe_integer(value["ageMs"]):
+            raise BrokerError("unsafe_backend_result", "microphone freshness is invalid")
+        if not isinstance(value["valid"], bool):
+            raise BrokerError("unsafe_backend_result", "microphone validity is invalid")
+        reference = value["referenceDbfs"]
+        if (isinstance(reference, bool) or not isinstance(reference, (int, float))
+                or not -120 <= reference <= 0):
+            raise BrokerError("unsafe_backend_result", "microphone reference is invalid")
+        # A BLOCK THAT CLAIMS VALIDITY MUST ALSO CLAIM A LIVE STATE. The two are
+        # separate fields so the shell can say WHY a ring is not drawn, and a
+        # backend that let them disagree would be handing the renderer a
+        # contradiction to resolve on the glass.
+        if value["valid"] and value["state"] != "live":
+            raise BrokerError("unsafe_backend_result", "microphone validity contradicts its state")
 
     def _safe_string(self, value: object, limit: int) -> None:
         if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):

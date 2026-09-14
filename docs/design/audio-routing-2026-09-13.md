@@ -222,9 +222,12 @@ as "no change", never as zero. **Not implemented in the renderer here.**
    the Owner in the room. That is the entire reason `bus` is a third mode rather
    than a rewrite of `trigger`.
 
-## One question for the Owner, and one deviation
+## One implementation deviation, and one note for the glass test
 
-**OPEN — needs a word from the Owner before the merge gate.** Ruling F says the
+**Not an open spec item.** Item 23 is settled ("Nothing open on item 23 after
+this round"); what follows is an implementation choice inside ruling F, recorded
+here so it is visible rather than buried, and worth one sentence at the glass
+test. It does not gate the merge. Ruling F says the
 level is applied to the merged bus "before it reaches any path". It is applied at
 the *end of each leg* instead: one softvol, declared once, named once, living on
 the always-present Loopback card, and only ever one leg running. The reason is
@@ -235,11 +238,12 @@ are (a) this, (b) the gain on the bus with the detector's thresholds made
 volume-aware, which puts the volume back into the actuator that finding 2 just
 took it out of, or (c) two gains, which is two things to get out of step. The
 behaviour the Owner asked for — one control, everything moves, remembered per
-output — holds in all three; only the tap's reading differs. **Recommendation:
-keep (a); the Owner is asked to confirm at the glass test.** Raised as a finding
-rather than settled quietly, per the working agreement.
-**Deviation, not open:** the rocker's `KEY_MUTE` is inert in bus mode rather than mapping to the
-  Mute position: a one-way mute from a key that cannot un-mute would strand the
+output — holds in all three; only the tap's reading differs. **Implemented: (a).** Mentioned to
+the Owner at the glass test as a courtesy, not as a question that holds the
+branch; if the Owner would rather the gain sat on the bus, (b) is a small change
+to this file plus volume-aware thresholds in the detector.
+**Deviation, not open:** the rocker's `KEY_MUTE` is inert in bus mode rather
+than mapping to the Mute position — a one-way mute from a key that cannot un-mute would strand the
   panel silent for anyone not standing at it. Step 5 gives the state a
   previous-output memory and the key a real toggle.
 
@@ -327,5 +331,60 @@ measurement worth keeping:
 
 ## Install and acceptance for steps 1–2
 
-See the coordinator hand-off in the session report; the short form is
-`wall-audio-mode bus`, with `wall-audio-mode trigger` as the rollback.
+**Run with the Owner present: this changes the live audio graph.** The rollback
+is one command at every point: `sudo wall-audio-mode trigger`.
+
+### Install
+
+```sh
+# 0. From the dev box, with the branch merged into the panel payload as usual.
+#    Nothing here is deployed by this session.
+ssh panel@<panel>
+sudo systemctl status wall-line-in wall-kiosk-loop wall-amp-trigger   # note what is running
+cat /etc/wall-panel/audio-mode                                        # expect: trigger
+
+# 1. Payload in place (whatever the release lane does today), then firstboot's
+#    audio block, which installs the new configs, units, rules and scripts and
+#    regenerates the card map with the tap subdevices.
+sudo /opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh   # or the lane's install step
+
+# 2. The loopback needs its extra substreams, and the module cannot be reloaded
+#    under a live graph. Reboot, or unload with the audio units stopped:
+sudo systemctl stop wall-line-in wall-kiosk-loop wall-amp-trigger
+sudo modprobe -r snd_aloop && sudo modprobe snd_aloop
+cat /proc/asound/Loopback/pcm0p/sub1/info >/dev/null && echo "tap substream present"
+
+# 3. Switch the chain.
+sudo wall-audio-mode bus
+wall-audio-mode status          # expect mode: bus, chain: asound-bus-mode.conf
+sudo wall-audio-output status   # expect output speaker, plan with both speaker legs true
+```
+
+### Acceptance, in order, each with its evidence
+
+| # | Do this | Expect |
+|---|---|---|
+| 1 | `aplay -L \| grep -E "^(bus\|bus_monitor\|speaker_tap\|spdif_in)$"` | all four PCMs resolve; no ALSA parse error in `dmesg`/stderr |
+| 2 | Play a test tone: `aplay -D bus /usr/share/sounds/alsa/Front_Center.wav` | heard on the amplifier; `journalctl -u wall-amp-trigger -f` shows the relay close |
+| 3 | **Three at once (step 1's acceptance):** desktop playing over S/PDIF, phone connected and playing over A2DP, kiosk playing the library | **all three audible together** on the front output, none cutting another off |
+| 4 | `amixer -c Loopback sset Bus 40%` then `80%` | the room follows; `journalctl -u wall-amp-trigger` shows the level at the tap **unchanged** (the tap is pre-volume) |
+| 5 | Rocker up/down | `journalctl -t wall-audio-output` shows `speaker volume N% -> M%`; the room follows |
+| 6 | `sudo wall-audio-output set headset` with the headset adapter plugged in | audio moves to the headset; the amplifier does **not** open immediately; `journalctl -u wall-amp-trigger` shows it opening about 4 minutes later |
+| 7 | `sudo wall-audio-output set speaker`, then unplug the headset adapter, then `set headset` | silence on every output; `journalctl -t wall-audio-output` says the adapter is absent; `wall-audio-output status` reports `reason: headset_absent` |
+| 8 | Plug the headset adapter back in while on Speaker | switches to Headset **once**, journaled `auto-switch speaker -> headset`; `set speaker` then replugging a `change` event does **not** switch again |
+| 9 | `sudo wall-audio-output set mute` | silence; the amplifier opens after the hold-off, not before |
+| 10 | Reboot | comes back in the position it was left in; `journalctl -u wall-audio-state` shows one apply |
+| 11 | Sleep and wake (or `systemctl suspend`) | same, via `wall-audio-resume`; audio works without a manual restart |
+| 12 | Move the USB hub to another port with music playing (item 25 regression) | within ~10 s the amplifier is on and audio is audible; the journal shows the bound units cycling once |
+
+### If anything in 1–12 fails
+
+```sh
+sudo wall-audio-mode trigger    # the old chain, unchanged, with the amp detector back on its old sources
+wall-audio-mode status
+```
+
+Then capture `journalctl -t wall-audio-output -u wall-spdif-in -u wall-bus-speaker
+-u wall-speaker-out -u wall-bus-headset -u wall-amp-trigger --since -20min` and
+`sudo wall-audio-output status`, which together say what the switch believed and
+what the graph did.

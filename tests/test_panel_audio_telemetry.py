@@ -283,3 +283,57 @@ def test_a_backend_that_omits_the_microphone_is_still_valid_sr028(panel):
     result = telemetry(panel)["result"]
     assert result["available"] is True
     assert "microphone" not in result
+
+
+# --- terra 2026-09-14: freshness must be the producer's, and absence must show
+
+def test_the_published_timestamp_is_the_producers_not_the_read_time_sr028(panel):
+    """Stamping `now` here made a 1.4-second-old capture look newly observed.
+
+    Both clocks are CLOCK_MONOTONIC on the same machine, so the producer's
+    instant needs no conversion -- and it is the only one that carries the
+    freshness claim this field exists for.
+    """
+    observed = int(time.monotonic() * 1000) - 800
+    write_bus(panel, observed_monotonic_ms=observed)
+    result = telemetry(panel)["result"]
+    assert result["observedMonotonicMs"] == observed
+    assert result["bus"]["ageMs"] >= 700
+    assert result["bus"]["state"] == "live" and result["bus"]["valid"] is True
+
+
+def test_an_absent_bus_is_named_unavailable_not_passed_off_as_quiet_sr028(panel):
+    """A bus nobody is publishing must not look like a measured quiet room."""
+    write_aec(panel)
+    result = telemetry(panel)["result"]
+    assert result["rms"] == 0.0
+    assert result["bus"]["state"] == "unavailable"
+    assert result["bus"]["valid"] is False
+
+
+def test_the_three_reasons_a_bus_is_silent_are_distinguishable_sr028(panel):
+    """`silent`, `stale` and `unavailable` are different facts about the panel."""
+    write_bus(panel, valid=False)
+    assert telemetry(panel)["result"]["bus"]["state"] == "silent"
+    write_bus(panel, observed_monotonic_ms=0)
+    if int(time.monotonic() * 1000) > switch_backend.BUS_STALE_MS:
+        assert telemetry(panel)["result"]["bus"]["state"] == "stale"
+    panel["bus"].unlink()
+    write_aec(panel)
+    assert telemetry(panel)["result"]["bus"]["state"] == "unavailable"
+
+
+def test_the_broker_refuses_a_bus_block_that_contradicts_itself_sr028():
+    class Lying:
+        def inventory(self, cancel):
+            return []
+
+        def call(self, method, params, cancel):
+            return {"available": True, "active": False, "rms": 0.0, "peak": 0.0,
+                    "bands": [0.0], "observedMonotonicMs": 5,
+                    "bus": {"state": "stale", "ageMs": 9000, "valid": True,
+                            "source": "speaker_tap"}}
+
+    answer = reply(AudioBroker(Lying()), wire("telemetry"))
+    assert answer["ok"] is False
+    assert answer["error"]["code"] == "unsafe_backend_result"

@@ -510,6 +510,48 @@ static void test_xrun(void)
     ok(policy.resets_this_session == 0, "but the session record is NOT erased");
 }
 
+static void test_detection_latency_is_bounded(void)
+{
+    /* THE FAILURE THIS REPLACED, AND WHY A LIFETIME MEAN WAS THE WRONG
+     * STATISTIC (terra, 2026-09-14). Comparing an average taken over every
+     * qualifying frame since the last re-arm makes the detection latency a
+     * function of the UPTIME: an hour of healthy audio dilutes a sudden
+     * complete failure so far that the mean needs a further quarter of an hour
+     * to cross the threshold, and the 60-second counters cannot bound that
+     * because they only start once it has.
+     *
+     * The estimator is now a one-pole over qualifying frames, so the same
+     * failure is detected after the same number of frames whether the panel has
+     * been up for a minute or a week. This runs the SAME failure after two very
+     * different healthy runs and requires the two latencies to be comparable.
+     */
+    aec_profile profile = fixture_profile();
+    profile.erle_floor_db = 1.0;
+    int64_t latency[2];
+    const int healthy[2] = { AEC_WARMUP_QUALIFYING_FRAMES,
+                             AEC_WARMUP_QUALIFYING_FRAMES * 30 };
+    for (int run = 0; run < 2; run++) {
+        aec_policy policy;
+        aec_policy_init(&policy, &profile, 0);
+        aec_action saw = AEC_ACTION_NONE;
+        feed_step(&policy, healthy[run], 40.0, 0, &saw, 0);
+        ok(policy.baseline_valid, "a baseline was taken");
+        int64_t frames = 0;
+        saw = AEC_ACTION_NONE;
+        while (saw == AEC_ACTION_NONE && frames < AEC_WARMUP_QUALIFYING_FRAMES * 40) {
+            feed_step(&policy, 1, 5.0, 0, &saw, 0);
+            frames += 1;
+        }
+        ok(saw == AEC_ACTION_RESET_FILTER, "the failure is detected");
+        latency[run] = frames;
+    }
+    /* Not equal -- the estimator carries a little history -- but within a small
+     * factor, which is the property a lifetime mean did not have at all. With
+     * the old statistic the second run took roughly THIRTY times longer. */
+    ok(latency[1] < latency[0] * 2,
+       "detection latency does not grow with the length of the healthy run");
+}
+
 /* ── item L and the status block ─────────────────────────────────────────── */
 
 static void test_level_and_status(void)
@@ -590,6 +632,7 @@ int main(void)
     test_drift_admission();
     test_drift_controller();
     test_xrun();
+    test_detection_latency_is_bounded();
     test_level_and_status();
     printf("\n%d PASS  %d FAIL\n", passed, failed);
     return failed ? 1 : 0;

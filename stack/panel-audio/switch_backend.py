@@ -439,36 +439,49 @@ class SwitchApplierBackend:
         Implements: SR-028, LLR-015
         """
         now_ms = int(time.monotonic() * 1000)
-        bus = self._bus_block()
+        bus = self._bus_block(now_ms)
         microphone = self._microphone_block(now_ms)
         if bus is None and microphone is None:
             # Honest, and distinguishable from silence: the shell draws no
             # visualizer rather than a flat one.
             return {"available": False}
         if bus is None:
-            # The microphone ring has telemetry and the bus does not. The bus
-            # fields must still be present and must read as SILENCE rather than
-            # as absent, because the schema is exact -- and silence is the
-            # truthful value for a bus nothing is publishing.
-            bus = {"active": False, "rms": 0.0, "peak": 0.0,
-                   "bands": [0.0] * TELEMETRY_BANDS}
+            # The microphone has telemetry and the bus has none. The bus fields
+            # must still be present because the schema is exact -- but they are
+            # marked `unavailable`, NOT passed off as a measured quiet room.
+            bus = self._silent_bus("unavailable", now_ms, 0)
         result = {
             "available": True,
             "active": bus["active"],
             "rms": bus["rms"],
             "peak": bus["peak"],
             "bands": bus["bands"],
-            "observedMonotonicMs": now_ms,
+            # THE PRODUCER'S OWN OBSERVATION INSTANT, not the moment this was
+            # read (terra, 2026-09-14). Both are CLOCK_MONOTONIC on the same
+            # machine, so it needs no conversion -- and stamping `now` here made
+            # a 1.4-second-old capture look newly observed, which is precisely
+            # the freshness claim this field exists to carry.
+            "observedMonotonicMs": bus["observed"],
+            "bus": {"state": bus["state"], "ageMs": bus["ageMs"],
+                    "valid": bus["state"] == "live", "source": "speaker_tap"},
         }
         if microphone is not None:
             result["microphone"] = microphone
         return result
 
-    def _silent_bus(self) -> dict:
-        return {"active": False, "rms": 0.0, "peak": 0.0,
-                "bands": [0.0] * TELEMETRY_BANDS}
+    def _silent_bus(self, state: str, observed: int, age_ms: int) -> dict:
+        """A bus carrying nothing, with the REASON it carries nothing.
 
-    def _bus_block(self):
+        Silence and absence are different answers and the shell renders them
+        differently, so they may not share a representation (terra, 2026-09-14):
+        a bus nobody is publishing must not be indistinguishable from a quiet
+        room. `state` is what tells them apart.
+        """
+        return {"active": False, "rms": 0.0, "peak": 0.0,
+                "bands": [0.0] * TELEMETRY_BANDS, "state": state,
+                "observed": observed, "ageMs": age_ms}
+
+    def _bus_block(self, now_ms: int):
         """`speaker_tap` levels from wall-amp-trigger, or None."""
         raw = self._read_document(BUS_TELEMETRY_PATH)
         if not raw or raw.get("schema") != 1 or raw.get("source") != "speaker_tap":
@@ -478,7 +491,7 @@ class SwitchApplierBackend:
             # switch has left Speaker, or the tap has not opened. That is a
             # SILENT bus, not an absent one, and the difference matters: the
             # visualizer should show a quiet room, not disappear.
-            return self._silent_bus()
+            return self._silent_bus("silent", now_ms, 0)
         rms = self._scalar(raw.get("rms"))
         peak = self._scalar(raw.get("peak"))
         bands = raw.get("bands")
@@ -490,14 +503,16 @@ class SwitchApplierBackend:
         observed = raw.get("observed_monotonic_ms")
         if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
             return None
-        age = int(time.monotonic() * 1000) - observed
+        age = now_ms - observed
         if age > BUS_STALE_MS or age < -BUS_STALE_MS:
             # STALE IS SILENCE, NOT THE LAST FRAME. A producer that stopped
             # would otherwise leave a still picture of a bus level on the wall
-            # for as long as nobody restarted it.
-            return self._silent_bus()
+            # for as long as nobody restarted it. The age is published beside
+            # it, so "stale" is a statement with evidence rather than a verdict.
+            return self._silent_bus("stale", now_ms, max(0, age))
         return {"active": raw.get("active") is True, "rms": rms, "peak": peak,
-                "bands": clean}
+                "bands": clean, "state": "live", "observed": observed,
+                "ageMs": max(0, age)}
 
     def _microphone_block(self, now_ms: int):
         """The canceller's post-filter level, or None when there is no canceller.

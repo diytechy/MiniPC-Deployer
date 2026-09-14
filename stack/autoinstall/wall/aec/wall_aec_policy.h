@@ -74,6 +74,11 @@
  * failover logic. Below the floor for this long and the mic legs go to
  * push-to-talk whatever the baselines say. */
 #define AEC_FLOOR_QUALIFYING_FRAMES 11250
+/* The time constant of the recent-ERLE estimator, in qualifying frames. 60 s
+ * at 5.33 ms per block, matching the warm-up grace: the thing being measured is
+ * how well the filter is doing NOW, and a faster estimator would fire on one
+ * awkward passage of music. */
+#define AEC_RECENT_TAU_FRAMES 11250.0
 
 /* Far-end activity threshold, dBFS RMS on the reference. Below this the tap is
  * silent for our purposes: no ERLE is defined, nothing adapts, and the state is
@@ -161,7 +166,11 @@ typedef struct {
     double mic_dbfs;           /* the near end, before cancellation */
     double residual_dbfs;      /* the near end after cancellation -- item L's source */
     double mic_peak_dbfs;      /* this block's peak, for the clipping warning */
-    bool input_muted;          /* the switch's effective input mute (item J) */
+    /* The switch's EFFECTIVE input mute (item J), as published by the applier.
+     * It must reach here, or the status block would go on saying the microphone
+     * is live while the applier has stopped every leg -- and item L's ring
+     * would be drawn over a coupled mute (terra, 2026-09-14). */
+    bool input_muted;
     bool tap_present;          /* false when the speaker leg is not running at all */
 } aec_block;
 
@@ -184,6 +193,17 @@ typedef struct {
     bool failed_over;
     double erle_sum_1min, erle_sum_session;
     int64_t erle_n_1min, erle_n_session;
+    /* THE STATISTIC THE HEALTH RULES ACT ON, and it is deliberately NOT the
+     * session mean (terra, 2026-09-14). A lifetime average is diluted without
+     * bound by however long the room has been fine: after an hour at 30 dB, a
+     * complete failure takes a further quarter of an hour to drag the mean
+     * below the divergence threshold, and the 60-second counters cannot bound
+     * that because they only start once it has. This is an exponential moving
+     * average over qualifying frames with a ~60 s time constant, so detection
+     * latency is a property of the filter and not of the uptime. The session
+     * mean is kept, and is used for REPORTING and for the baseline only. */
+    double erle_recent_db;
+    bool erle_recent_valid;
     int64_t window_started_ms;
     double erle_db_1min, erle_db_session;
     bool erle_1min_valid;

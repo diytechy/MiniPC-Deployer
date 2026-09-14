@@ -292,13 +292,23 @@ def band_levels(samples, channels, frames):
     Outputs: a list of 8 floats in [0,1]
     Implements: SR-028, LLR-015
     """
+    # ANTI-ALIAS BEFORE DECIMATING, WHICH PICKING EVERY FOURTH SAMPLE DOES NOT
+    # (terra, 2026-09-14). Without it a 6.8 kHz tone folds down to 5.2 kHz and
+    # lights the band labelled 5.2 kHz -- a readout that is not merely imprecise
+    # but actively wrong about where the energy is. Averaging each group of four
+    # is a 4-tap boxcar: a crude low-pass, with its first null exactly at the
+    # decimated Nyquist, and it costs nothing because the samples are being
+    # summed anyway.
     step = BUS_DECIMATE * channels
     mono = []
+    divisor = float(channels * BUS_DECIMATE * 32768)
     for i in range(0, frames * channels - step, step):
         total = 0.0
-        for ch in range(channels):
-            total += samples[i + ch]
-        mono.append(total / (channels * 32768.0))
+        for tap in range(BUS_DECIMATE):
+            base = i + tap * channels
+            for ch in range(channels):
+                total += samples[base + ch]
+        mono.append(total / divisor)
     count = len(mono)
     if count < 64:
         return [0.0] * len(BUS_BANDS_HZ)
@@ -369,10 +379,16 @@ def publish_bus_telemetry(level, active, path=BUS_TELEMETRY_FILE):
         }
         payload = json.dumps(document, sort_keys=True) + "\n"
         temporary = path + ".new"
+        # NO fsync, DELIBERATELY, and this is the one place in this tree where
+        # that is the right call (terra, 2026-09-14). /run is tmpfs and this
+        # document is disposable -- it is republished five times a second and
+        # means nothing after a reboot -- while the write happens inline in the
+        # loop that decides when the amplifier switches. Paying a durability
+        # barrier for a decoration, on the relay's own beat, trades something
+        # that matters for something that does not. The atomic rename stays:
+        # a reader must never see half a document.
         with open(temporary, "w", encoding="utf-8") as handle:
             handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
         os.replace(temporary, path)
         # 0644: the broker runs as `panel` and has to read it. There is nothing
         # secret in a loudness figure, and the directory is already 0755.

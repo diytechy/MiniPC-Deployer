@@ -80,6 +80,18 @@
 #include <speex/speex_preprocess.h>
 #include <speex/speex_resampler.h>
 
+/* THE APPLIER'S EFFECTIVE INPUT MUTE, published at every apply. It has to
+ * reach this daemon or the status block would go on saying the microphone is
+ * live while item J has stopped every leg, and item L's ring would be drawn
+ * over a coupled mute (terra, 2026-09-14). A one-line env file rather than the
+ * state JSON: it is read on a timer in an audio loop, and parsing JSON there to
+ * learn one boolean would be work paid for over and over. */
+#define DEFAULT_MUTE_FILE "/run/wall-panel/audio-input-mute.env"
+#define MUTE_POLL_MS 1000
+/* How often to try opening a tap that was not there at start. The switch can be
+ * moved to Speaker at any time, and a daemon that gave up on the first failed
+ * open would pass the microphone through for the rest of its life. */
+#define TAP_RETRY_MS 2000
 #define DEFAULT_PROFILE "/etc/wall-panel/aec-profile.json"
 #define DEFAULT_STATUS "/run/wall-panel/aec-status.json"
 #define DEFAULT_MIC "hw:PCH,0"
@@ -121,6 +133,36 @@ static void utc_now(char *out, size_t size)
     gmtime_r(&seconds, &parts);
     strftime(out, size, "%Y-%m-%dT%H:%M:%SZ", &parts);
 }
+
+/* The applier's effective input mute, or false when it has never said.
+ *
+ * FALSE ON ABSENCE IS RIGHT HERE and is not the usual cautious default: this
+ * daemon does not GATE anything on the answer -- the applier has already
+ * stopped the mic legs, so no sample leaves the panel either way -- it only
+ * decides whether the status block claims a live level. An absent file is a
+ * panel whose applier predates item J, and reporting `live` there is exactly
+ * what such a panel does.
+ *
+ * Only the live path consults it: a replay has no switch and no applier, so
+ * there is no input mute to read.
+ */
+#ifndef WALL_AEC_OFFLINE_ONLY
+static bool read_input_muted(const char *path)
+{
+    FILE *handle = fopen(path, "r");
+    if (!handle) return false;
+    char line[128];
+    bool muted = false;
+    while (fgets(line, sizeof(line), handle)) {
+        const char *at = strstr(line, "WALL_AUDIO_INPUT_MUTED=");
+        if (!at) continue;
+        muted = at[strlen("WALL_AUDIO_INPUT_MUTED=")] == '1';
+        break;
+    }
+    fclose(handle);
+    return muted;
+}
+#endif /* WALL_AEC_OFFLINE_ONLY */
 
 /* RMS and peak of one block, as amplitudes in [0,1]. The policy takes dBFS and
  * never sees a sample; this is the whole of the conversion. */
@@ -387,6 +429,9 @@ static int replay(aec_engine *engine, const char *reference_path, const char *ne
         size_t got = fread(tap, sizeof(int16_t), AEC_FRAME_SIZE, reference);
         bool tap_present = got == AEC_FRAME_SIZE;
         if (tap_present) push_reference(engine, tap, AEC_FRAME_SIZE);
+        /* A replay has no switch and no applier, so there is no input mute to
+         * read. `false` is the truthful value for a capture being re-run from
+         * a file rather than a default standing in for one. */
         engine_block(engine, mic, out, tap_present, false, now_ms);
         fwrite(out, sizeof(int16_t), AEC_FRAME_SIZE, stdout);
         /* 256 frames at 48 kHz is 16/3 ms. Accumulated from the block count so
@@ -461,7 +506,7 @@ static stream_clock read_clock(snd_pcm_t *pcm)
 }
 
 static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
-                const char *out_name)
+                const char *out_name, const char *mute_name)
 {
     snd_pcm_t *mic_pcm = open_pcm(mic_name, SND_PCM_STREAM_CAPTURE);
     if (!mic_pcm) return 1;
@@ -471,7 +516,11 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
      * Speaker, and a daemon that died with it would take the microphone with
      * it. A NULL tap is simply "no reference", which is the pass-through case. */
     snd_pcm_t *tap_pcm = open_pcm(tap_name, SND_PCM_STREAM_CAPTURE);
-    if (!tap_pcm) journal("aec: no reference at %s yet; passing the microphone through", tap_name);
+    if (!tap_pcm) journal("aec: no reference at %s yet; passing the microphone "
+                          "through and retrying every %d ms", tap_name, TAP_RETRY_MS);
+    int64_t tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
+    int64_t mute_poll_ms = 0;
+    bool input_muted = false;
 
     int16_t mic[AEC_FRAME_SIZE], tap[AEC_FRAME_SIZE], out[AEC_FRAME_SIZE];
     stream_clock tap_base = { false, 0, 0, 0, false, false };
@@ -480,6 +529,31 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
     int status = 0;
 
     while (!stopping) {
+        /* THE TAP IS RETRIED, NOT GIVEN UP ON. It is absent whenever the switch
+         * is not in Speaker, which is most of the time, so an open that failed
+         * at start says nothing about whether one will succeed later -- and
+         * without this the daemon passed the microphone through for the rest of
+         * its life after one unlucky moment. */
+        int64_t retry_now = monotonic_ms();
+        if (!tap_pcm && retry_now >= tap_retry_ms) {
+            tap_retry_ms = retry_now + TAP_RETRY_MS;
+            tap_pcm = open_pcm(tap_name, SND_PCM_STREAM_CAPTURE);
+            if (tap_pcm) {
+                journal("aec: reference at %s is available; cancelling from a "
+                        "cold filter", tap_name);
+                engine->reference_fill = 0;
+                engine_reset_filter(engine);
+                /* The alignment and the timestamp baseline are both unknown
+                 * against a stream that has only just started. */
+                aec_policy_xrun(&engine->policy, retry_now);
+                engine->policy.xruns_this_session -= 1;  /* not a fault */
+                tap_base.usable = mic_base.usable = false;
+            }
+        }
+        if (retry_now >= mute_poll_ms) {
+            mute_poll_ms = retry_now + MUTE_POLL_MS;
+            input_muted = read_input_muted(mute_name);
+        }
         snd_pcm_sframes_t got = snd_pcm_readi(mic_pcm, mic, AEC_FRAME_SIZE);
         if (got < 0) {
             /* AN XRUN ON EITHER STREAM IS A STEP CHANGE IN OFFSET, which the
@@ -513,7 +587,7 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
         }
 
         int64_t now_ms = monotonic_ms();
-        engine_block(engine, mic, out, tap_present, false, now_ms);
+        engine_block(engine, mic, out, tap_present, input_muted, now_ms);
         snd_pcm_sframes_t wrote = snd_pcm_writei(out_pcm, out, AEC_FRAME_SIZE);
         if (wrote < 0) { snd_pcm_recover(out_pcm, (int)wrote, 1); }
 
@@ -558,6 +632,7 @@ int main(int argc, char **argv)
     const char *mic_name = DEFAULT_MIC;
     const char *tap_name = DEFAULT_TAP;
     const char *out_name = DEFAULT_OUT;
+    const char *mute_name = DEFAULT_MUTE_FILE;
     const char *replay_reference = NULL;
     const char *replay_near = NULL;
 
@@ -567,12 +642,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--mic") && i + 1 < argc) mic_name = argv[++i];
         else if (!strcmp(argv[i], "--tap") && i + 1 < argc) tap_name = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_name = argv[++i];
+        else if (!strcmp(argv[i], "--mute") && i + 1 < argc) mute_name = argv[++i];
         else if (!strcmp(argv[i], "--replay") && i + 2 < argc) {
             replay_reference = argv[++i];
             replay_near = argv[++i];
         } else {
             fprintf(stderr, "usage: %s [--profile P] [--status P] [--mic PCM] [--tap PCM] "
-                            "[--out PCM] [--replay REF.raw NEAR.raw]\n", argv[0]);
+                            "[--out PCM] [--mute P] [--replay REF.raw NEAR.raw]\n", argv[0]);
             return 2;
         }
     }
@@ -603,11 +679,11 @@ int main(int argc, char **argv)
         /* The replay-only build has no live path at all. The device names were
          * still parsed above, so a command line meant for the daemon is not
          * silently accepted as something else. */
-        (void)mic_name; (void)tap_name; (void)out_name;
+        (void)mic_name; (void)tap_name; (void)out_name; (void)mute_name;
         journal("aec: built without ALSA; only --replay is available");
         result = 2;
 #else
-        result = live(&engine, mic_name, tap_name, out_name);
+        result = live(&engine, mic_name, tap_name, out_name, mute_name);
 #endif
     }
     engine_close(&engine);

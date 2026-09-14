@@ -471,6 +471,73 @@ has "epoch 2 adopted from the run marker (state file said 0)" "$out" \
     "B18 a rolled-back state file is brought back up to the live epoch"
 eq "2" "$(epoch_of "$EPSTATE")" "B18 and the durable number is repaired"
 
+# B18 (terra 2026-09-14, finding 1) -- A ROLLED-BACK STATE FILE MUST NOT
+# RE-OPEN REQUESTS THE APPLIER ALREADY REFUSED. Carrying only the generation in
+# the run marker left this hole: roll the file back to an old `request_seq`
+# while the marker still names the live epoch, and a delayed request with the
+# CURRENT generation and a sequence above the rolled-back mark was accepted.
+printf '{"version":1,"seq":300,"generation":2,"event":{"kind":"set_output","output":"headset"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "output speaker -> headset" "$out" "B18 a request at seq 300 lands"
+# Now roll the STATE back -- generation and mark together, which is what a
+# restore from a backup actually does.
+python3 -c 'import json,sys; p=sys.argv[1]; s=json.load(open(p)); s["generation"]=0; s["request_seq"]=0; json.dump(s,open(p,"w"))' "$EPSTATE"
+printf '{"version":1,"seq":200,"generation":2,"event":{"kind":"set_output","output":"mute"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "request 200 ignored: not newer than the last applied (300)" "$out" \
+    "B18 the mark is restored from the run marker, so seq 200 is still refused"
+hasnt "output headset -> mute" "$out" "B18 and the rolled-back file did not re-open it"
+eq "headset" "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["output"])' "$EPSTATE")" \
+    "B18 the position is untouched by the refusal"
+
+# B18 (terra finding 2) -- CLEARING /run UNDER A RUNNING PANEL IS AN EPOCH
+# BREAK. The process can no longer say which epoch it is in, so a request that
+# NAMES one is refused until apply-state re-establishes it. A request that names
+# none still applies: the rocker and the root CLI have no epoch to be wrong
+# about, and a volume key that stopped working because /run was cleaned would be
+# a worse failure than the one this guards.
+# Start this one from a KNOWN epoch on a levelled output: the block above
+# deliberately left the state rolled back, and a test that cannot say what the
+# epoch was before it started cannot say what changed.
+ep set speaker >/dev/null
+out="$(ep apply-state)"
+live_epoch="$(epoch_of "$EPSTATE")"
+rm -f "$EP/run/audio-epoch.json"
+printf '{"version":1,"seq":400,"generation":'"$live_epoch"',"event":{"kind":"set_output","output":"mute"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "the epoch marker is gone" "$out" "B18 a scoped request is refused while the epoch is unvouched"
+hasnt "output speaker -> mute" "$out" "B18 and it changed nothing"
+# The rocker has no epoch of its own and must keep working: a volume key that
+# stopped because /run was cleaned would be a worse failure than the one this
+# fence guards.
+before_level="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["volume"]["speaker"])' "$EPSTATE")"
+ep volume up >/dev/null
+after_level="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["volume"]["speaker"])' "$EPSTATE")"
+[ "$after_level" -gt "$before_level" ] \
+    && pass "B18 and the rocker is not stopped by a cleared /run" \
+    || fail "B18 the rocker was stopped by a cleared /run ($before_level -> $after_level)"
+printf '{"version":1,"seq":410,"event":{"kind":"set_output","output":"mute"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "output speaker -> mute" "$out" "B18 an UNSCOPED request still applies with no marker"
+# AND IT DOES NOT RE-CREATE THE MARKER. Writing one here would re-vouch for an
+# epoch this process has just said it cannot vouch for, and the next apply-state
+# would then keep the dead epoch instead of opening a new one.
+[ ! -f "$EP/run/audio-epoch.json" ] \
+    && pass "B18 and an unscoped request does not re-vouch for the dead epoch" \
+    || fail "B18 an unscoped request re-created the epoch marker"
+# The rocker and the CLI are likewise unaffected.
+# apply-state re-establishes it, and scoped requests work again at the new epoch.
+out="$(ep apply-state)"
+has "opened (no run marker" "$out" "B18 apply-state re-establishes the epoch"
+new_epoch="$(epoch_of "$EPSTATE")"
+[ "$new_epoch" -gt "$live_epoch" ] \
+    && pass "B18 and it is a NEW epoch, not the dead one" \
+    || fail "B18 the dead epoch was kept ($live_epoch -> $new_epoch)"
+printf '{"version":1,"seq":500,"generation":'"$new_epoch"',"event":{"kind":"set_output","output":"speaker"}}\n' > "$eprequest"
+out="$(ep apply-request "$eprequest")"
+has "output mute -> speaker" "$out" "B18 and a request at the new epoch lands again"
+
+
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

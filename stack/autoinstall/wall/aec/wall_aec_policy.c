@@ -94,6 +94,8 @@ void aec_policy_rearm(aec_policy *policy, int64_t now_ms)
     policy->erle_sum_session = 0.0;
     policy->erle_n_session = 0;
     policy->erle_db_session = 0.0;
+    policy->erle_recent_db = 0.0;
+    policy->erle_recent_valid = false;
     policy->adapting = true;
     policy->state = policy->profile.present ? AEC_STATE_CONVERGING : AEC_STATE_NO_PROFILE;
     (void)now_ms;
@@ -219,6 +221,15 @@ aec_decision aec_policy_block(aec_policy *policy, const aec_block *block)
     policy->erle_sum_1min += erle;  policy->erle_n_1min += 1;
     policy->erle_sum_session += erle; policy->erle_n_session += 1;
     policy->erle_db_session = policy->erle_sum_session / (double)policy->erle_n_session;
+    /* The bounded estimator the health rules actually act on. One pole over
+     * qualifying frames: its response time is fixed by AEC_RECENT_TAU_FRAMES
+     * and does not grow with how long the panel has been up. */
+    if (!policy->erle_recent_valid) {
+        policy->erle_recent_db = erle;
+        policy->erle_recent_valid = true;
+    } else {
+        policy->erle_recent_db += (erle - policy->erle_recent_db) / AEC_RECENT_TAU_FRAMES;
+    }
     policy->qualifying_frames += 1;
 
     if (policy->qualifying_frames < AEC_WARMUP_QUALIFYING_FRAMES) {
@@ -232,7 +243,11 @@ aec_decision aec_policy_block(aec_policy *policy, const aec_block *block)
          * ordinary audio. Everything below is relative to it, because the
          * retune figure came from a controlled stimulus and is not a
          * like-for-like comparison. */
-        policy->session_baseline_db = policy->erle_db_session;
+        /* The baseline is taken from the SAME statistic the tests below use.
+         * Taking it from the session mean and comparing the recent estimate
+         * against it would compare two different things, and the difference
+         * between them -- not a change in the room -- would be what fired. */
+        policy->session_baseline_db = policy->erle_recent_db;
         policy->baseline_valid = true;
         policy->below_baseline_frames = 0;
         /* DID THE LAST RESET ACTUALLY RESTORE ANYTHING? That question can only
@@ -251,7 +266,7 @@ aec_decision aec_policy_block(aec_policy *policy, const aec_block *block)
         }
     }
 
-    double current = policy->erle_db_session;
+    double current = policy->erle_recent_db;
 
     /* THE ABSOLUTE FLOOR, and the only place a profile number reaches failover.
      * Below it the canceller is not useful whatever its history, so the mic legs

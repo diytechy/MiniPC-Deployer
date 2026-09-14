@@ -649,12 +649,14 @@ class AudioBroker:
             # with no echo canceller installed, must stay valid. Absent means
             # "this panel cannot tell you", which the shell must render
             # differently from a microphone at zero.
-            if not expected <= set(value) or set(value) - expected - {"microphone"}:
+            if not expected <= set(value) or set(value) - expected - {"microphone", "bus"}:
                 raise BrokerError("unsafe_backend_result", "telemetry fields are not exact")
             if value["available"] is not True:
                 raise BrokerError("unsafe_backend_result", "telemetry fields are not exact")
             if "microphone" in value:
                 self._safe_microphone(value["microphone"])
+            if "bus" in value:
+                self._safe_bus(value["bus"])
             if not _safe_integer(value["generation"]) or not _safe_integer(value["observedMonotonicMs"]):
                 raise BrokerError("unsafe_backend_result", "telemetry counters are invalid")
             if not isinstance(value["active"], bool):
@@ -709,6 +711,25 @@ class AudioBroker:
     MICROPHONE_FIELDS = {"level", "source", "state", "ageMs", "valid", "referenceDbfs"}
     MICROPHONE_SOURCES = {"aec_post_filter", "raw_capture", "none"}
     MICROPHONE_STATES = {"live", "muted", "stale", "unavailable"}
+
+    # The bus block says WHY the levels beside it are what they are, so a bus
+    # nobody is publishing is not indistinguishable from a quiet room.
+    BUS_FIELDS = {"state", "ageMs", "valid", "source"}
+    BUS_STATES = {"live", "silent", "stale", "unavailable"}
+
+    def _safe_bus(self, value: object) -> None:
+        """Validate the bus telemetry block. Implements: SR-028, LLR-015."""
+        if not isinstance(value, dict) or set(value) != self.BUS_FIELDS:
+            raise BrokerError("unsafe_backend_result", "bus telemetry is not exact")
+        if value["state"] not in self.BUS_STATES:
+            raise BrokerError("unsafe_backend_result", "bus state is invalid")
+        if not _safe_integer(value["ageMs"]):
+            raise BrokerError("unsafe_backend_result", "bus freshness is invalid")
+        if not isinstance(value["valid"], bool):
+            raise BrokerError("unsafe_backend_result", "bus validity is invalid")
+        self._safe_string(value["source"], 32)
+        if value["valid"] != (value["state"] == "live"):
+            raise BrokerError("unsafe_backend_result", "bus validity contradicts its state")
 
     def _safe_microphone(self, value: object) -> None:
         """Validate the post-filter microphone block. Implements: SR-028, LLR-015."""

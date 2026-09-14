@@ -19,6 +19,22 @@
 #   WALL_CURSOR_PARK_CORNER  which corner to drive the pointer into
 #   WALL_CURSOR_PARK_DELAY   seconds to wait for cage to create its pointer
 # wall-firstboot.sh renders all three into /etc/wall-panel/kiosk.env.
+#
+# WHAT PARKING IS AND IS NOT, AFTER 2026-09-13 (Group B3). For a while this unit
+# was, without anybody intending it, the thing that decided WHERE FINGER SCROLLS
+# WENT. A Wayland compositor delivers a wheel event to whatever is under the
+# pointer; the touch filter turned finger drags into wheel events but moved the
+# pointer not at all; so every scroll on this panel was delivered to the corner
+# this unit had parked the pointer in — over the gauge rail, which scrolls
+# nothing. Measured on the panel against release e083f58: 278 wheel events with
+# the pointer parked changed zero pixels, and the same 278 with the pointer over
+# the station list scrolled it.
+#
+# The fix is in the filter, not here: touchfilter/daemon.py's scroll device is
+# now an absolute pointer and states the finger's position before each wheel
+# burst. So DO NOT disable or re-aim this unit to chase a scrolling fault — it
+# no longer decides that, and turning it off only puts cage's arrow back in the
+# middle of the wall. Parking is now what it says it is: a tidy start position.
 
 [Unit]
 Description=Wall panel: park the compositor's pointer in a corner so it is not an arrow on the wall

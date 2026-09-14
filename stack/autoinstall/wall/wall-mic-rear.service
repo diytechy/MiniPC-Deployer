@@ -53,6 +53,16 @@ After=dev-wall_audio_adapter.device
 [Service]
 Type=simple
 ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+# THE MUTE IS RE-CHECKED ON EVERY START ATTEMPT, RESTARTS INCLUDED. This unit
+# is Restart=always, so "the applier stopped it" is not a property anybody can
+# rely on: a guard or alsaloop crash, an operator restart, a daemon-reload
+# workflow, or a stop that FAILED during an apply would each bring it back with
+# the state still saying muted. systemd re-runs ExecCondition on every start
+# attempt and treats a non-zero exit as a clean "not started" rather than a
+# failure, which is exactly the shape wanted. It takes no lock, so it cannot
+# deadlock the apply that is starting this leg. Review (terra, 2026-09-14)
+# found this path once per mic leg.
+ExecCondition=/usr/local/sbin/wall-audio-output mic-allowed
 # Which microphone, written by wall-audio-output at every apply. `-` so a
 # hand-started leg with no applier run behind it takes the configured default
 # (the panel's own microphone), rather than refusing to start.

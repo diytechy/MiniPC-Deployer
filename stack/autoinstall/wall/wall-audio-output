@@ -1099,10 +1099,16 @@ def set_rear_level(applier, adapter, level):
     wanted = rear_levels(current, level)
     if wanted == current:
         return True
-    applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "cset",
-                     "numid=%d" % ADAPTER_SPEAKER_NUMID,
-                     ",".join(str(value) for value in wanted)], required=False)
-    return True
+    # IT REPORTED SUCCESS WHETHER OR NOT THE WRITE LANDED (terra, round 2). The
+    # direction decides, exactly as it does for the mute: failing to RAISE the
+    # rear pair is a quiet mic return, while failing to LOWER it leaves the
+    # desktop's input wired to live channels after the leg has gone -- which is
+    # the independent hardware barrier this function exists to be.
+    lowering = level < max(current[channel] for channel in MIC_REAR_CHANNELS)
+    return applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "cset",
+                            "numid=%d" % ADAPTER_SPEAKER_NUMID,
+                            ",".join(str(value) for value in wanted)],
+                           required=lowering) == 0
 
 
 def mic_command(arguments):
@@ -1211,6 +1217,43 @@ def rear_mic_possible(applier, chain=None, speaker_wanted=None):
             % (SPEAKER_CHAIN_STEREO, "usb_out_mix"))
         return False
     return True
+
+
+def mic_allowed_command(arguments):
+    """`wall-audio-output mic-allowed`: exit 0 if a mic leg may run, 1 if not.
+
+    THE UNITS' OWN GATE, AND THE ANSWER TO A RESTART BEHIND A MUTE. Both mic
+    legs are `Restart=always`, so "the applier stopped it" is not a property
+    anybody can rely on: a guard or alsaloop crash, an operator restart, a
+    `daemon-reload` workflow, or a stop that FAILED during an apply would each
+    start the leg again with the state still saying muted. Review (terra,
+    2026-09-14, rounds 1 and 2) found that path twice, once per leg.
+
+    systemd re-runs `ExecCondition=` on every start attempt INCLUDING a restart,
+    and a non-zero exit from one is a clean "not started" rather than a failure,
+    which is exactly the shape wanted here.
+
+    It takes NO LOCK, for the same reason `status` does not: this is a read, and
+    a read that blocks behind an apply would deadlock the very apply that is
+    starting the leg. Every failure answers 1 -- an unreadable state file is not
+    consent to open a microphone.
+    Implements: SR-029, LLR-016
+    """
+    # A MISSING STATE FILE IS NOT CONSENT, and that is not a hardship: the
+    # applier SAVES the state before it applies the plan, so by the time it runs
+    # `systemctl start` on either mic leg the file is there. This gate and the
+    # Bluetooth supervisor's own therefore answer identically in every case --
+    # two gates on one privacy control must not be able to disagree.
+    if not Path(arguments.state).exists():
+        log("no switch state on disk: refusing to start a microphone leg")
+        return 1
+    try:
+        state, note = load_state(arguments.state)
+    except Exception:  # noqa: BLE001 - an unreadable state must not open a mic
+        return 1
+    if note:
+        log(note)
+    return 0 if policy.mic_live(state) else 1
 
 
 def probe_speaker_chain(applier):
@@ -1377,8 +1420,14 @@ def apply_plan(state, applier):
     # independent things therefore have to be wrong at once before the room's
     # music can reach the desktop's input: the generated speaker route's
     # explicit zeros on channels 4-7, and this level.
-    set_rear_level(applier, adapter,
-                   mic_values["rear_level"] if wanted["mic_live"] else 0)
+    if not set_rear_level(applier, adapter,
+                          mic_values["rear_level"] if wanted["mic_live"] else 0) \
+            and not wanted["mic_live"]:
+        # Only the LOWERING direction is counted: see set_rear_level.
+        failures += 1
+        log("the adapter's rear pair could NOT be returned to silence: the "
+            "desktop's input is still wired to live channels. The generated "
+            "route's explicit zeros are the only barrier left.")
     # THE SOFTVOL CONTROL IS DECLARED, AND SET, BEFORE THE LEG STARTS. softvol
     # creates its control when a client opens the PCM that declares it, and a
     # control that does not exist yet cannot be set -- which on 2026-09-13 made
@@ -1539,7 +1588,7 @@ def main(argv=None):
                         help="the rendered ALSA trim file (a test seam)")
     parser.add_argument("command", choices=("status", "set", "input-mute", "volume",
                                             "headset", "apply-state", "apply-request",
-                                            "trim", "mic"))
+                                            "trim", "mic", "mic-allowed"))
     # `trim` and `mic` take a whole table's worth of KEY=VALUE; every other takes
     # at most one word. Parsed as a list here and narrowed below, so that a
     # second argument to `set` is a usage error rather than a silently ignored
@@ -1586,6 +1635,11 @@ def main(argv=None):
         if arguments.value is None or (arguments.value not in ("up", "down")
                                        and not arguments.value.isdigit()):
             parser.error("volume takes 0..100, up or down")
+
+    if arguments.command == "mic-allowed":
+        # Read-only and LOCK-FREE, like `status`: it is asked by both mic units'
+        # ExecCondition while an apply that is starting them holds the lock.
+        return mic_allowed_command(arguments)
 
     if arguments.command == "status":
         # The only read-only command, and the only one that does not take the

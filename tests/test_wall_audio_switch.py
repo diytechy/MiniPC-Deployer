@@ -2085,23 +2085,40 @@ def test_an_unparseable_state_never_opens_a_microphone_sr029(btmic, tmp_path, co
     assert btmic.mic_allowed(state) is False
 
 
-@pytest.mark.parametrize("content", ["[]", '{"output": 12}', '{"input_muted": "yes"}'])
-def test_a_damaged_but_parseable_state_follows_the_applier_sr029(btmic, tmp_path, content):
-    """And a document that parses is normalized, exactly as the applier does it.
+@pytest.mark.parametrize("content", ["[]", '{"output": 12}', '{"input_muted": "yes"}',
+                                     '{"volume": {"speaker": "loud"}}'])
+def test_a_damaged_state_comes_back_MUTED_sr029(btmic, tmp_path, content):
+    """A damaged file must not turn a privacy control from muted to live.
 
-    THE RESIDUAL IS WRITTEN DOWN RATHER THAN HIDDEN. `normalize` repairs each
-    bad field to its default, and the default is `speaker` with no input mute --
-    so a state file damaged in the `input_muted` field specifically reverts to
-    UNMUTED and a microphone may run. That is deliberate: the applier normalizes
-    the same document by the same function, so the alternative is a supervisor
-    that refuses while the applier starts the leg, which is a disagreement about
-    a microphone and is worse than either answer on its own. The Owner-visible
-    consequence is in the report; the fix, if one is ever wanted, belongs in
-    `normalize` where BOTH halves would see it, not here.
+    This test asserted the opposite in the first round, on the argument that the
+    applier and the supervisor normalizing the same document the same way made
+    it safe. Review (terra, round 2) refused that, correctly: agreeing to open a
+    microphone nobody asked for is not safety. `normalize` now returns
+    `input_muted: True` for any document that needed repair, so BOTH halves see
+    the safe answer and they still agree.
     """
     state = tmp_path / "audio-state.json"
     state.write_text(content, encoding="utf-8")
-    assert btmic.mic_allowed(state) is True
+    assert btmic.mic_allowed(state) is False
+
+
+def test_a_repair_mutes_the_input_but_costs_nothing_else_sr029(policy):
+    """Field by field is kept: a typo must not cost the panel its audio policy.
+
+    Only the microphone fails closed, because only the microphone's default is
+    the unsafe direction.
+    """
+    repaired = policy.normalize({"output": "speakers", "volume": {"speaker": 80}})
+    assert repaired["input_muted"] is True, "damage mutes the input"
+    assert repaired["output"] == "speaker", "and the rest still falls back sanely"
+    assert repaired["volume"]["speaker"] == 80, "a good field survives a bad one"
+
+    # An ABSENT key is not damage: that is a file written before the field
+    # existed, and it takes the schema default.
+    clean = policy.normalize({"output": "headset"})
+    assert clean["input_muted"] is False
+    # And a whole, valid document is untouched in both directions.
+    assert policy.normalize(policy.default_state()) == policy.default_state()
 
 
 def test_the_supervisor_and_the_applier_share_one_definition_of_mic_live_sr029(btmic):
@@ -2114,3 +2131,119 @@ def test_the_supervisor_and_the_applier_share_one_definition_of_mic_live_sr029(b
     # Both into the SAME directory, or the import above cannot resolve.
     block = installed.split("wall_audio_state.py wall-bt-mic.py", 1)[1][:400]
     assert "/usr/local/lib/wall-panel/" in block
+
+
+# ── review round 2: the restart paths, and telling the truth about hardware ─
+
+def test_both_mic_units_re_check_the_mute_on_every_start_sr029():
+    """Restart=always means "it was stopped once" is not a property.
+
+    A guard crash, an operator restart, a daemon-reload workflow, or a stop that
+    FAILED during an apply would each bring a mic leg back with the state still
+    saying muted. Found once per leg by review (terra, rounds 1 and 2).
+    """
+    for unit in (MIC_REAR_UNIT_FILE, BT_MIC_UNIT_FILE):
+        text = read(unit)
+        assert "Restart=always" in text, "the premise of the gate"
+        conditions = [line for line in text.splitlines()
+                      if line.startswith("ExecCondition=")]
+        assert any("mic-allowed" in line for line in conditions), \
+            "%s can be restarted behind a mute" % unit.name
+        assert any("audio-mode" in line for line in conditions), \
+            "%s must still carry the bus-mode gate" % unit.name
+
+
+def test_the_mic_allowed_gate_takes_no_lock_sr029(applier):
+    """It is asked by an ExecCondition while the apply that starts the leg holds it.
+
+    A gate that blocked on the apply lock would deadlock the very apply it is
+    gating, which is the same shape as the withdrawn firstboot ordering.
+    """
+    source = read(APPLIER)
+    dispatch = source.split('if arguments.command == "mic-allowed":', 1)[1][:600]
+    assert "apply_lock" not in dispatch
+    # and it is dispatched BEFORE the block that takes the lock
+    assert source.index('"mic-allowed"') < source.index("with apply_lock(")
+
+
+@pytest.mark.parametrize("stored,allowed", [
+    ({"output": "speaker", "input_muted": False}, 0),
+    ({"output": "speaker", "input_muted": True}, 1),
+    ({"output": "mute", "input_muted": False}, 0),
+    ({"output": "mute", "input_muted": True}, 1),
+    # ruling 7: headset selected, adapter absent -> nothing tunnelled
+    ({"output": "headset", "input_muted": False, "headset_present": False}, 1),
+    ({"output": "headset", "input_muted": False, "headset_present": True}, 0),
+])
+def test_mic_allowed_answers_the_policy_sr029(applier, tmp_path, stored, allowed):
+    state = tmp_path / "audio-state.json"
+    state.write_text(json.dumps(stored), encoding="utf-8")
+    assert applier.main(["--state", str(state), "mic-allowed"]) == allowed
+
+
+def test_a_missing_state_file_is_not_consent_sr029(applier, tmp_path):
+    """And the two gates must answer identically, or they can disagree about a mic.
+
+    Not a hardship: the applier SAVES the state before it applies the plan, so by
+    the time it runs `systemctl start` on a mic leg the file is there.
+    """
+    missing = tmp_path / "nothing.json"
+    assert applier.main(["--state", str(missing), "mic-allowed"]) == 1
+    btmic_module = load(BT_MIC, "wall_bt_mic_gate")
+    assert btmic_module.mic_allowed(missing) is False
+    source = read(APPLIER)
+    assert "save_state" in source.split("def _locked_apply", 1)[1].split("apply_plan(", 1)[0]
+
+
+def test_a_rear_level_that_would_not_lower_fails_the_apply_sr029(applier, policy):
+    """It reported success whether or not the write landed (terra, round 2).
+
+    Failing to RAISE the rear pair is a quiet mic return. Failing to LOWER it
+    leaves the desktop's input wired to live channels after the leg has gone,
+    which is the independent hardware barrier this is supposed to be.
+    """
+    raised = "  : values=66,66,24,24,66,66,24,24\n"
+
+    def refuse_cset(argv, **kwargs):
+        if argv[0].endswith("amixer") and "cset" in argv:
+            return _Reply(1, "", "Unable to find control")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, raised)
+        return _Reply(0)
+
+    # Lowering (no mic leg wanted): a refused write is reported and counted.
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    assert applier.apply_plan(muted, applier.Applier(run=refuse_cset)) > 0
+
+    # Raising: a refused write is a quiet microphone, not a failed apply.
+    lowered = "  : values=66,66,24,24,0,0,24,24\n"
+
+    def refuse_raise(argv, **kwargs):
+        if argv[0].endswith("amixer") and "cset" in argv:
+            return _Reply(1, "", "Unable to find control")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, lowered)
+        return _Reply(0)
+
+    assert applier.apply_plan(policy.default_state(),
+                             applier.Applier(run=refuse_raise)) == 0
+
+
+def test_set_rear_level_reports_what_actually_happened_sr029(applier):
+    """The unconditional `return True` is what made the above invisible."""
+    raised = "  : values=66,66,24,24,66,66,24,24\n"
+
+    def refuse(argv, **kwargs):
+        if "cset" in argv:
+            return _Reply(1, "", "nope")
+        return _Reply(0, raised)
+
+    assert applier.set_rear_level(applier.Applier(run=refuse), "ICUSBAUDIO7D", 0) is False
+
+    def accept(argv, **kwargs):
+        if "cset" in argv:
+            return _Reply(0)
+        return _Reply(0, raised)
+
+    assert applier.set_rear_level(applier.Applier(run=accept), "ICUSBAUDIO7D", 0) is True

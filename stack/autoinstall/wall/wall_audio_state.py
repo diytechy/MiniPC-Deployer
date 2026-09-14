@@ -95,24 +95,59 @@ def normalize(raw):
     whole file being discarded. The shell journals when it had to replace
     something; nothing here guesses silently.
 
+    ONE FIELD IS NOT LIKE THE OTHERS. Landing on the default for `output`, the
+    volume or the latch is harmless. Landing on the default for `input_muted` --
+    False -- means a damaged file has turned a privacy control from muted to
+    live, with nothing in the room to hear it happen. So a document that needed
+    any repair at all comes back MUTED, and a document that is not a document
+    comes back muted too. A key that is simply ABSENT is not damage: that is a
+    file written before the field existed, and it takes the schema default.
+
     Inputs:  raw: whatever json.load returned (any type)
     Outputs: a dict satisfying STATE_SCHEMA's shape
     Implements: SR-028, LLR-013
     """
     state = default_state()
     if not isinstance(raw, dict):
+        # Not even a document. Fall back to the whole default EXCEPT the one
+        # field whose default is not the safe answer: see `repaired` below.
+        state["input_muted"] = True
         return state
+    # WHETHER ANYTHING HAD TO BE REPLACED, AND WHY THAT DECIDES THE MICROPHONE.
+    # Every other field's default is harmless to land on: `speaker` plays music,
+    # 60% is a level, an armed latch switches once. `input_muted`'s default is
+    # False, and landing on THAT means a damaged file has turned a privacy
+    # control from muted to live -- silently, and with nothing in the room to
+    # hear. Review (terra, 2026-09-14, round 2) was right to refuse the earlier
+    # answer that the applier and the Bluetooth supervisor agreeing made it safe:
+    # agreeing to open a microphone nobody asked for is not safety.
+    #
+    # So repair is still field by field -- a typo must not cost the panel its
+    # whole audio policy -- but a document that needed ANY repair comes back
+    # with the microphone MUTED. The Owner presses one button; the alternative
+    # is a microphone opened by a truncated write.
+    repaired = False
     if raw.get("output") in OUTPUTS:
         state["output"] = raw["output"]
+    elif "output" in raw:
+        repaired = True
     if isinstance(raw.get("input_muted"), bool):
         state["input_muted"] = raw["input_muted"]
+    elif "input_muted" in raw:
+        repaired = True
     if isinstance(raw.get("headset_present"), bool):
         state["headset_present"] = raw["headset_present"]
+    elif "headset_present" in raw:
+        repaired = True
     if isinstance(raw.get("headset_autoswitch_armed"), bool):
         state["headset_autoswitch_armed"] = raw["headset_autoswitch_armed"]
+    elif "headset_autoswitch_armed" in raw:
+        repaired = True
     seq = raw.get("request_seq")
     if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
         state["request_seq"] = seq
+    elif "request_seq" in raw:
+        repaired = True
     volume = raw.get("volume")
     if isinstance(volume, dict):
         for output in LEVELLED_OUTPUTS:
@@ -120,6 +155,12 @@ def normalize(raw):
             # bool is an int in Python and True would become 1%: refuse it.
             if isinstance(level, int) and not isinstance(level, bool):
                 state["volume"][output] = clamp_volume(level)
+            elif output in volume:
+                repaired = True
+    elif "volume" in raw:
+        repaired = True
+    if repaired:
+        state["input_muted"] = True
     return state
 
 

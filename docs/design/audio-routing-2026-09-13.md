@@ -766,6 +766,60 @@ And because a microphone's state cannot be heard from the room, **every apply
 journals which one is open** (`microphone: mic_panel`). That line is how the
 difference is answerable at three in the morning.
 
+### Two gates on the mute, because one of them was a command
+
+The input mute is applied by stopping both mic legs. Review (terra, 2026-09-14)
+pointed out twice - once per leg - that **a stop is a command, not a property**.
+Both legs are `Restart=always`, so a guard or `alsaloop` crash, an operator
+restart, a `daemon-reload` workflow, or a stop that *failed* during an apply
+would each bring a microphone back while `audio-state.json` still said muted,
+with nothing in the room to hear it.
+
+So the mute is now held by three things that do not depend on each other:
+
+1. **The apply stops the legs**, and a mic leg that will **not** stop now counts
+   as a failed apply and says so. (Failing to *start* one still does not: that
+   apply runs under a unit firstboot waits on. The asymmetry is the point.)
+2. **Both units carry `ExecCondition=wall-audio-output mic-allowed`**, which is
+   re-run on every start attempt including a restart, takes no lock (so it
+   cannot deadlock the apply that is starting the leg), and answers
+   `wall_audio_state.mic_live`.
+3. **`wall-bt-mic.py` re-reads the state on every poll**, because it is a
+   long-lived process and an `ExecCondition` only fires at start.
+
+All three ask the **same** function, and both gates answer identically for a
+missing state file (refuse), because two gates on one privacy control that can
+disagree are worse than either answer alone.
+
+**And a damaged state file now comes back muted.** `normalize` still repairs
+field by field, but any document that needed a repair returns `input_muted:
+True`. Every other field's default is harmless to land on; `input_muted`'s is
+not, and the first round's argument - that the applier and the supervisor
+normalizing the same document the same way made it safe - was wrong, because
+agreeing to open a microphone nobody asked for is not safety.
+
+### Accepted, not fixed: the shared dmix across a suspend
+
+Review also flagged that `usb_out_mix` is a **new persistent IPC segment on the
+adapter**, and that resume runs `apply-state`, which does not clear IPC and
+whose `systemctl start` is a no-op on a leg that is already active. Only a
+*mode switch* sweeps unattached segments. So if the adapter survives S3 badly,
+a stale dmix server could in principle hold pre-suspend hardware state.
+
+**Not changed here, deliberately.** Making resume restart the legs, or sweep
+IPC, changes behaviour for the speaker chain that is **on the wall and working
+tonight**, on a risk nobody has yet observed. The existing acceptance check 11
+(sleep and wake) already exercises this path, S4-16 below extends it to the mic
+legs, and the recovery is one line that does not need this design to change:
+
+```sh
+sudo systemctl restart wall-speaker-out wall-mic-rear    # or: sudo wall-audio-mode bus
+```
+
+If S4-16 reproduces it, the fix belongs in `wall-audio-resume.service` as a
+restart of the legs rather than a start, and it should be made for **all** the
+legs at once rather than for the mic ones only.
+
 ### The AEC seam, which is the whole reason `mic_selected` exists
 
 Both legs open one name, `pcm.mic_selected`, resolved through
@@ -884,6 +938,7 @@ amixer -c ICUSBAUDIO7D cget numid=8        # expect 66,66,24,24,66,66,24,24
 | S4-12 | Reboot and watch the first two minutes | `systemctl status wall-firstboot` green, not timed out; the speaker leg starts as before; no new underrun burst; the mic legs come up with the stored position |
 | S4-13 | `sudo wall-audio-mode trigger` | **everything** stops, mic legs included, and the old chain is back. Then `sudo wall-audio-mode bus` to return |
 | S4-14 | **The latency measurement, and it gates the step.** With the desktop playing video over S/PDIF on Speaker, ask the Owner about lip-sync, before and after. Also `journalctl -u wall-speaker-out --since -10min` while music plays | the Owner hears **no new lip-sync error** and there is **no underrun burst**. The shared dmix added a 170 ms ring the raw open did not have; how much of it becomes delay is unmeasured. If it reads wrong, `buffer_size` on `usb_out_mix` is the first number to move, then `wall-spdif-in`'s `--tlatency`, and S3-9's underrun watch must be repeated after either |
+| S4-16 | **Sleep and wake, with the mic legs up.** `sudo systemctl suspend`, wake it, then play music on Speaker and talk | audio in the room, and the microphone still reaching the desktop's input, **without a manual restart**. This is the shared-dmix-across-suspend risk review flagged and nobody has yet observed; if it fails, `sudo systemctl restart wall-speaker-out wall-mic-rear` recovers it, and that is the evidence the resume unit needs changing for every leg |
 | S4-15 | **A privacy check worth doing once.** `sudo wall-audio-output input-mute on`, then `sudo systemctl restart wall-bt-mic` | the leg comes up and **refuses to open a microphone**: `journalctl -u wall-bt-mic` shows it polling and starting nothing. This is the fail-open review found, and the supervisor now re-reads the switch state on every poll rather than trusting that a stop reached it |
 
 ### If anything in S4-1 to S4-13 fails

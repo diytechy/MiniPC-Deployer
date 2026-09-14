@@ -677,12 +677,13 @@ fi
 # ── panel audio: line input, volume rocker, amplifier trigger ───────────────
 # The built-in 3.5 mm jack CANNOT receive audio — its only wired external pin is
 # an output with no capture path in silicon — so analog input arrives on a USB
-# audio-class adapter and the built-in codec's headphone jack becomes a control
-# port carrying a trigger tone for the amplifier's relay. The full measurement
-# record is in stack/panel-audio/README.md and PANEL_AMP_AUTOPOWER.md.
+# audio-class adapter. The jack's old role as a trigger-tone control port was
+# retired 2026-09-13: the LCUS-2 relay is the only amplifier actuator and the
+# jack is a plain, currently unused output held for the headset leg (HomeHub
+# item 23). The full measurement record is in stack/panel-audio/README.md.
 #
 # WALL_AUDIO_MODE picks the initial output chain:
-#   trigger  audio out the adapter, headphone jack drives the amplifier relay
+#   trigger  audio out the adapter, amplifier commanded over the LCUS-2 relay
 #   panel    everything out the panel's own speaker, amplifier not commanded
 install -d -m 0755 /etc/wall-panel
 
@@ -821,9 +822,12 @@ if [ -f /etc/wall-panel/amp-trigger.env ]; then
 
     _amp_activator=${WALL_AMP_ACTIVATOR:-lcus-2}
     case "$_amp_activator" in
-        audio-jack|lcus-2) ;;
+        lcus-2) ;;
+        audio-jack)
+            fail_step "audio: WALL_AMP_ACTIVATOR=audio-jack was RETIRED 2026-09-13 and its code is gone. The built-in jack is an ordinary audio output now, held for the headset leg; nothing here will ever drive a tone into it again. wall-amp-trigger will exit 78 and the amplifier will never switch on. Set WALL_AMP_ACTIVATOR=lcus-2 in wall.env and re-run."
+            _amp_activator=invalid ;;
         *)
-            warn "audio: WALL_AMP_ACTIVATOR must be exactly audio-jack or lcus-2; the amplifier service will refuse to start"
+            fail_step "audio: WALL_AMP_ACTIVATOR must be exactly lcus-2 (got '$_amp_activator'). wall-amp-trigger will exit 78 and the amplifier will never switch on. Set WALL_AMP_ACTIVATOR=lcus-2 in wall.env and re-run."
             _amp_activator=invalid ;;
     esac
     if grep -q '^WALL_AMP_ACTIVATOR=' /etc/wall-panel/amp-trigger.env 2>/dev/null; then
@@ -895,8 +899,8 @@ case "${WALL_AUDIO_MODE:-trigger}" in
             /usr/local/sbin/wall-audio-mode trigger >/dev/null 2>&1 ||
                 warn "audio: could not apply trigger mode"
         fi
-        log "audio: trigger mode — the headphone jack carries the amplifier's trigger tone."
-        log "audio: that jack is a CONTROL PORT, not an output; headphones there get a full-scale tone."
+        log "audio: trigger mode — audio out the USB adapter, amplifier commanded over the LCUS-2 relay."
+        log "audio: the built-in headphone jack carries nothing; the trigger tone was retired 2026-09-13."
         ;;
 esac
 

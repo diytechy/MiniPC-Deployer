@@ -120,14 +120,15 @@ ExecStartPre=/usr/bin/amixer -c ${WALL_AUDIO_ADAPTER_CARD} sset Line 0% cap
 # EACCES. Verified 2026-09-12 with a non-root arecord attaching while this unit
 # was running.
 #
-# The PLAYBACK side is `amp_feed` for the same reason, and it is the more urgent
-# one: the kiosk plays Pandora and the local library through the same output, so
-# pointing this at a raw hw device would take the single substream and silence
-# the kiosk for as long as the passthrough ran.
+# The PLAYBACK side is the shared `speaker_shared` dmix for the same reason, and
+# it is the more urgent one: the kiosk plays Pandora and the local library
+# through the same output, so pointing this at a raw hw device would take the
+# single substream and silence the kiosk for as long as the passthrough ran.
 #
-# `amp_feed` is front L/R of a 6-channel mix. The rear pair is not surround --
-# it is a control line carrying a trigger tone for the amplifier's power relay,
-# pinned at 0 dB independently of the volume rocker. See asound.conf.
+# THE OLD `amp_feed` SIX-CHANNEL MIX IS GONE, and so is the reason for it: its
+# rear pair was a control line carrying a trigger tone for the amplifier's power
+# relay, and that tone was retired 2026-09-13 in favour of the LCUS-2 relay.
+# This unit now feeds plain stereo. See asound.conf.
 ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
     --max-errors 20 --window 10 -- \
     /usr/bin/alsaloop \

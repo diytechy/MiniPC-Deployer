@@ -53,6 +53,11 @@ CAPABILITIES = ("NoInputNoOutput", "DisplayYesNo", "DisplayOnly", "KeyboardDispl
 AUDIO_UUIDS = {
     "0000110b-0000-1000-8000-00805f9b34fb",  # AudioSink
     "0000110a-0000-1000-8000-00805f9b34fb",  # AudioSource
+    # Advanced Audio Distribution: the profile UUID a phone presents when it
+    # opens the A2DP stream itself. Measured 2026-09-13 with a Pixel: bluez
+    # asked for 110d, the agent refused it, and the phone reported "incorrect
+    # passkey" for what was actually a service refusal after a good bond.
+    "0000110d-0000-1000-8000-00805f9b34fb",  # AdvancedAudioDistribution
     "0000110c-0000-1000-8000-00805f9b34fb",  # A/V Remote Control Target
     "0000110e-0000-1000-8000-00805f9b34fb",  # A/V Remote Control
     "0000111e-0000-1000-8000-00805f9b34fb",  # Handsfree

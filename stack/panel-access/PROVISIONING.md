@@ -169,6 +169,97 @@ Bluetooth panes open to anybody and looked identical to a provisioned one.
 
 ---
 
+## 1e. Local authentication mode — the panel locks itself **[Owner present]**
+
+*Owner ruling, 2026-09-13.* Sections 1a–1d above describe the **gateway** mode
+and remain the arrangement to use when the hub gateway is cut over. Local mode
+is the alternative the Owner chose for now: **the hub API and the hub's access
+flag stay exactly as they are today**, and the panel owns its own lock.
+
+### What it is, and what it is not
+
+* **Is:** a panel-local PIN, a panel-local session with the same idle/hard
+  bounds (120 s / 15 min), the same face unlock through the sensor service, and
+  the same masking of the three protected panes (Checklist, Settings,
+  Bluetooth). Library, Pandora and Door stay public, as in every mode.
+* **Is not:** protection of the data. In local mode the renderer reads the hub
+  API **directly**, the way an unprotected panel does today. Anyone on the LAN
+  who can reach that API is no more restricted than before. **It is a UI lock,
+  and it was accepted as one.** Say so in any summary of the panel's security.
+
+### Where each secret lives, in local mode
+
+| Secret | Lives in | Who writes it |
+|---|---|---|
+| The PIN | The panel's own encrypted access state, `/var/lib/wall-panel/access-state.json`, scrypt N=32768 r=8 p=1 — the same record the gateway writes | **The Owner**, once, at the wall, in Settings |
+| The state key | `/var/lib/wall-panel/access-state.key`, 32 random bytes, AES-256-GCM | The panel, on first run |
+| The face wrapping key | inside that state; handed to the sensor service only after a correct PIN | The panel |
+| `accessMode: "local"`, `enabled: true` | `/etc/wall-panel/host.json` | `render-wall-host-config.py` (firstboot), from `WALL_ACCESS_MODE=local` |
+
+There is **no device credential and no gateway URL**: local mode has nothing to
+register. Both files are written 0600, owned by the account the Electron host
+runs as (`panel`), inside a 0700 directory. *Deviation on purpose:* the original
+brief said root-owned. The access broker runs as `panel` and must read and write
+this state on every unlock, so root ownership would make it unreadable to the
+only process that uses it; 0600 `panel:panel` in a 0700 directory is the
+equivalent posture and matches `host.json` next to it.
+
+A state file that cannot be read, decrypted or parsed **fails closed**: the
+panel reports the unlock service as unavailable and keeps the protected panes
+masked. It never degrades to "no PIN set".
+
+### Procedure
+
+1. On the panel, as root, in `/etc/wall-panel/wall.env`:
+   `WALL_ACCESS_MODE=local` (and `WALL_ACCESS_EXPECTED=true` if you want the
+   re-image reminder; local mode satisfies it without a manual step).
+2. Re-run `wall-firstboot.sh`. It writes `accessMode: "local"` and
+   `enabled: true` into `host.json` and nothing else; no credential is written,
+   and nothing is printed that could carry a PIN. It also creates
+   `/var/lib/wall-panel` as `panel:panel` 0700 — `/var/lib` is root-owned
+   0755, so the kiosk cannot create it itself, and without it local mode fails
+   closed on every boot (masked and unavailable).
+3. Restart the kiosk (`systemctl restart wall-kiosk-loop`).
+4. **At the wall:** Settings now shows *"No panel PIN set…"* and a **Set panel
+   PIN** fieldset. Until the PIN exists the panel masks nothing — that is
+   deliberate, so the Owner is never locked out of the view that configures the
+   lock. Enter 6–12 digits twice on the keypad and tap **Set panel PIN**.
+5. The panel locks immediately. Unlock with that PIN. Nothing echoes it, no log
+   line contains it, and it is not recoverable — a forgotten PIN is repaired by
+   deleting the two files in step "Reversal" and setting a new one.
+
+### Face unlock in local mode
+
+Face is **optional** and adds two hardware prerequisites to the PIN:
+
+* `WALL_CAMERA_ENABLED=true` in `wall.env` (section 2). This gate is
+  **authoritative**: `false` blacklists `uvcvideo`, so no software setting can
+  turn the camera on, and face simply never becomes available.
+* Both ONNX model files present in the sensor service's `modelDirectory`
+  (`det_10g.onnx`, `w600k_r50.onnx`) with their **explicit SHA-256 digests in
+  the sensor `modelManifest`**. Every cold model load verifies the bytes; no
+  model is downloaded or silently accepted (`sensors/PROVENANCE.md`).
+
+With the camera gate off, or the digests absent, the PIN is the only factor —
+a supported configuration, and the one the panel ships in.
+
+### Reversal
+
+* Back to today's unprovisioned/open panel, or to gateway mode: set
+  `WALL_ACCESS_MODE=gateway` (or empty) in `wall.env` and re-run firstboot. The
+  panel returns to its gateway registration if it still holds one; if it does
+  not, `enabled` goes back to `false` and nothing is masked. A registration left
+  over from an earlier cutover is preserved and ignored while local mode is on,
+  so this is a one-knob flip in both directions.
+* To forget the PIN and the face wrapping key entirely (a forgotten PIN, or
+  handing the panel on), as root:
+  `systemctl stop wall-kiosk-loop && rm -f /var/lib/wall-panel/access-state.json /var/lib/wall-panel/access-state.key && systemctl start wall-kiosk-loop`.
+  The panel comes back unprovisioned and open, ready for a new PIN at the wall.
+  Any face enrollment is unreadable afterwards: delete it in Settings, or remove
+  the sensor gallery file, once a new PIN exists.
+
+---
+
 ## 2. The camera
 
 `WALL_CAMERA_ENABLED=false` in `wall.env` is the single source. Firstboot

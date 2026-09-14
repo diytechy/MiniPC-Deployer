@@ -34,10 +34,33 @@ pcm.card_loop_cap { type hw
     subdevice 0
 }
 
+# Bus mode's second loopback substream: the post-switch speaker tap the
+# amplifier detector reads. Device 0 is the playback side, device 1 the capture
+# side, exactly as for the bus itself; only the subdevice differs.
+pcm.card_loop_tap_play { type hw
+    card "Loopback"
+    device 0
+    subdevice 1
+}
+
+pcm.card_loop_tap_cap { type hw
+    card "Loopback"
+    device 1
+    subdevice 1
+}
+
 ctl.card_usb_ctl { type hw
     card "ICUSBAUDIO7D"
 }
 
 ctl.card_builtin_ctl { type hw
     card "PCH"
+}
+
+# The loopback's control card, which is where bus mode's softvol control lives.
+# It is deliberately not one of the two audio adapters: the Loopback is always
+# present, so the Owner's volume survives a headset being unplugged and an
+# adapter re-enumerating, and alsactl can persist it.
+ctl.card_loop_ctl { type hw
+    card "Loopback"
 }

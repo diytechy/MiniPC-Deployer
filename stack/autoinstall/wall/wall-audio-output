@@ -1,0 +1,1224 @@
+#!/usr/bin/env python3
+"""wall-audio-output — the one writer of the panel's audio switch state.
+
+THE THIN SHELL. Every decision lives in wall_audio_state (pure, unit-tested);
+this file only reads files, runs systemctl/amixer, writes the state atomically
+and journals one line per change. If you find yourself adding an `if` about
+what a mode MEANS, it belongs next door.
+
+WHY A ROOT HELPER AND NOT THE BROKER ITSELF. The audio broker
+(stack/panel-audio, SR-023) runs as `panel` under ProtectSystem=strict with
+AF_UNIX as its only address family: it can neither write /etc nor talk to
+systemd. So the broker writes a REQUEST into its own runtime directory and
+wall-audio-apply.path runs this script, as root, to answer it. The privilege
+boundary stays exactly where SR-023 put it, and the renderer still cannot name
+a unit, a card or a mixer control.
+
+Usage:
+  wall-audio-output status
+  wall-audio-output set {mute|headset|speaker}
+  wall-audio-output input-mute {on|off}
+  wall-audio-output volume {0..100|up|down}
+  wall-audio-output headset {add|remove} [--boot|--runtime]
+  wall-audio-output apply-state              # re-assert the stored state (boot, resume)
+  wall-audio-output apply-request [PATH]     # one broker request, deduplicated
+  wall-audio-output trim                     # show the centre/sub trim table
+  wall-audio-output trim KEY=VALUE ...       # move it, and re-render the ALSA file
+  wall-audio-output trim --render            # re-render from the stored values only
+
+Options: --dry-run prints each privileged command instead of running it, and
+writes no file except a state file named explicitly with --state (the hermetic
+suite drives the whole applier that way; see save_state).
+
+Config:  /etc/wall-panel/audio-state.json   the state (this script owns it)
+         /etc/wall-panel/audio-mode         trigger|panel|bus; hardware is only
+                                            touched in `bus`
+         /etc/wall-panel/audio-cards.env    generated card map
+         /etc/wall-panel/audio-trim.env     the six centre/sub trim values
+         /etc/wall-panel/audio-trim.conf    rendered from them, read by ALSA
+Exit:    0 applied (or nothing to do), 1 a refused/failed apply, 2 usage.
+Implements: SR-028, LLR-014
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import errno
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+try:
+    import fcntl
+except ImportError:  # not Linux: the tests run on the dev box, the panel does not
+    fcntl = None
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wall_audio_state as policy  # noqa: E402  (path set above; installed side by side)
+
+# The one test seam in this script: the hermetic suite points it at a temp tree
+# so that running the REAL applier cannot read or write the panel's /etc.
+CONF_DIR = Path(os.environ.get("WALL_PANEL_CONF_DIR") or "/etc/wall-panel")
+STATE_FILE = CONF_DIR / "audio-state.json"
+MODE_FILE = CONF_DIR / "audio-mode"
+CARDS_FILE = CONF_DIR / "audio-cards.env"
+# Overridable for the same reason CONF_DIR is: the hermetic suite drives the
+# real applier and must not read or write the panel's /run.
+LIVE_RUN_DIR = Path("/run/wall-panel")
+RUN_DIR = Path(os.environ.get("WALL_PANEL_RUN_DIR") or LIVE_RUN_DIR)
+# Resolved at apply time and read by wall-bus-headset.service through
+# EnvironmentFile=, because the headset card's id is the generic "Device" and
+# ALSA configuration cannot look a card up by USB id.
+HEADSET_ENV = RUN_DIR / "audio-headset.env"
+DEFAULT_REQUEST = Path("/run/wall-audio-router/request.json")
+# One apply at a time. Four independent things call this script -- a udev
+# add/remove, the rocker, the path unit answering a broker request, and the
+# boot/resume re-assert -- and without a lock two of them interleave: the
+# read-modify-write of the state loses an update, and worse, one apply can
+# start a leg while another is stopping it, leaving the room fed by two
+# forwarders or by none. The lock is held across the WHOLE of load, decide,
+# save and apply, not just the write.
+LOCK_FILE = RUN_DIR / "audio-apply.lock"
+# The boot/resume stamp behind the Owner's 2026-09-13 ruling: the switch
+# position must survive a power cycle "regardless of whether the adapter is
+# plugged in over the boot". See is_boot_presence for the whole mechanism and
+# for why it is a monotonic mark rather than an uptime threshold. In /run, not
+# /etc, because it describes THIS boot and must vanish with it.
+BOOT_STAMP = RUN_DIR / "audio-boot-apply.json"
+
+# Measured 2026-09-13: the headset adapter is 0d8c:0014 ("Device"), the 5.1
+# adapter 0d8c:0102 (ICUSBAUDIO7D). The USB id is matched rather than the card
+# id because "Device" is what the kernel calls ANY nameless C-Media adapter.
+HEADSET_USB_ID = "0d8c:0014"
+PROC_ASOUND = Path("/proc/asound")
+# Where udevadm is asked about the headset card; a seam for the tests, which
+# have neither a sound card nor udev.
+SYS_CLASS_SOUND = Path("/sys/class/sound")
+# The softvol control created by asound-bus-mode.conf. It lives on the Loopback
+# card, which is always present, so the level survives a leg being stopped.
+BUS_CONTROL = "Bus"
+
+# ── the centre/sub trim (step 3, D4, review finding 8) ─────────────────────
+# Two files, for the same reason audio-cards has two: ALSA reads one and the
+# scripts read the other, and neither has to parse the other's syntax. The env
+# file is the Owner's six numbers; the conf file is the `route` rendered from
+# them. Both live in CONF_DIR, so the hermetic suite gets its own pair.
+TRIM_ENV = CONF_DIR / "audio-trim.env"
+TRIM_CONF = CONF_DIR / "audio-trim.conf"
+TRIM_ENV_PREFIX = "WALL_AUDIO_TRIM_"
+# Front full, centre and sub each half of each input -- which is exactly the
+# (L+R)/2 mono sum the Owner asked for in D4, expressed as two coefficients
+# rather than one so that the tuning session can make the sum asymmetric if the
+# room turns out to want that.
+TRIM_DEFAULTS = {"front_l": 1.0, "front_r": 1.0,
+                 "center_l": 0.5, "center_r": 0.5,
+                 "sub_l": 0.5, "sub_r": 0.5}
+TRIM_KEYS = ("front_l", "front_r", "center_l", "center_r", "sub_l", "sub_r")
+# The convenience names a person actually types at an amplifier: `center=0.35`
+# moves both halves of the mono sum at once and keeps it a sum.
+TRIM_GROUPS = {"front": ("front_l", "front_r"),
+               "center": ("center_l", "center_r"),
+               "sub": ("sub_l", "sub_r")}
+# (source channel, destination channel) in the adapter's FIXED 8-channel map
+# FL FR FC LFE RL RR SL SR, measured on the panel. 4..7 are rendered as explicit
+# zeros and have no knob: rear is wired to the desktop's input and must never
+# carry the room's music.
+TRIM_TTABLE = {"front_l": (0, 0), "front_r": (1, 1),
+               "center_l": (0, 2), "center_r": (1, 2),
+               "sub_l": (0, 3), "sub_r": (1, 3)}
+TRIM_SILENT_CHANNELS = (4, 5, 6, 7)
+# A coefficient above 1.0 is digital gain on a signal that is already at the
+# bus's full scale, so it clips rather than getting louder. Some headroom is
+# allowed anyway -- a quiet sub on a lazy amplifier input is a real case, and
+# +12 dB is where the argument stops being about trim and starts being about
+# wiring. Refused above this rather than clamped: a number this far out is a
+# typo, and silently accepting half of it would be worse than saying no.
+TRIM_MAX = 4.0
+TRIM_MAX_DB = 20.0 * math.log10(TRIM_MAX)
+
+# The two chains speaker_out can slave onto, named in asound-bus-mode.conf.
+# `speaker_multi` is the 8-channel route with the centre and sub; the stereo one
+# is exactly what shipped before step 3 and is the fallback.
+SPEAKER_CHAIN_MULTI = "speaker_multi"
+SPEAKER_CHAIN_STEREO = "speaker_stereo"
+SPEAKER_CHAIN_VAR = "WALL_AUDIO_SPEAKER_CHAIN"
+SPEAKER_CHAIN_ENV = RUN_DIR / "audio-speaker.env"
+SPEAKER_OUT_UNIT = "wall-speaker-out.service"
+
+
+def log(message):
+    """One line to the journal. stderr, so systemd stamps the unit identity."""
+    print(message, file=sys.stderr, flush=True)
+
+
+def read_env(path, key, default):
+    """One KEY=value out of a generated env file, or the default."""
+    try:
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith(key + "="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if value:
+                    return value
+    except OSError:
+        pass
+    return default
+
+
+def current_mode():
+    """trigger | panel | bus. A missing file means trigger, as it always has."""
+    try:
+        value = MODE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "trigger"
+    return value if value in ("trigger", "panel", "bus") else "trigger"
+
+
+def headset_card(proc_asound=PROC_ASOUND):
+    """The ALSA card id of the headset adapter, or None if it is not plugged in.
+
+    Two files per card, both measured on the panel 2026-09-13:
+    `/proc/asound/cardN/usbid` carries "0d8c:0014" for exactly this device, and
+    `/proc/asound/cardN/id` carries the id ALSA knows it by. The id file is read
+    rather than the sibling `/proc/asound/<id> -> cardN` symlink: both exist, but
+    only one of them is a plain read that cannot be confused by a second card
+    whose id differs only by a suffix.
+
+    This is the only place the panel decides which card is the headset, and it is
+    recomputed on every apply -- a re-enumeration can change the index and, on a
+    panel with a second nameless adapter, even the id (Device, Device_1).
+    """
+    try:
+        entries = sorted(Path(proc_asound).glob("card*/usbid"))
+    except OSError:
+        return None
+    for usbid in entries:
+        try:
+            if usbid.read_text(encoding="utf-8").strip().lower() != HEADSET_USB_ID:
+                continue
+            card = (usbid.parent / "id").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        # An id with a space or a slash in it would be unquotable in the
+        # EnvironmentFile and unusable as an ALSA card name; refuse rather than
+        # hand alsaloop something that will fail obscurely.
+        if card and card == card.strip() and not set(card) & set(" \t\n\"'/"):
+            return card
+        log("headset adapter present but its card id %r is unusable" % card)
+        return None
+    return None
+
+
+def headset_syspath(proc_asound=PROC_ASOUND, sys_class_sound=SYS_CLASS_SOUND):
+    """The sysfs path of the headset card, for udevadm. None if it is not there.
+
+    IT IS `cardN`, NOT THE ALSA ID, AND THE DIFFERENCE IS THE WHOLE FUNCTION.
+    sysfs names the class entry by the card NUMBER (`/sys/class/sound/card1`);
+    the ALSA id `headset_card` returns is the name the adapter enumerates under
+    ("Device" for this nameless C-Media part) and has no sysfs entry of its own.
+    Looking the id up under /sys/class/sound therefore never resolves, udevadm
+    is never asked, and -- because every doubt resolves to "coldplug" -- no
+    runtime plug would EVER auto-switch again. Caught by review, 2026-09-13.
+
+    So the number is taken from the same scan that finds the card: the parent
+    directory of the matching `/proc/asound/cardN/usbid` IS `cardN`.
+    """
+    try:
+        entries = sorted(Path(proc_asound).glob("card*/usbid"))
+    except OSError:
+        return None
+    for usbid in entries:
+        try:
+            if usbid.read_text(encoding="utf-8").strip().lower() != HEADSET_USB_ID:
+                continue
+        except OSError:
+            continue
+        path = Path(sys_class_sound) / usbid.parent.name
+        return str(path) if path.exists() else None
+    return None
+
+
+def device_initialized_usec(syspath, run=subprocess.run):
+    """When udev first finished processing this device, in CLOCK_MONOTONIC usec.
+
+    `USEC_INITIALIZED` is set by udev the first time it processes a device and
+    is never rewritten by a later `change`, so it answers exactly the question
+    the ruling asks: did this adapter come into existence before or after the
+    stored position was applied? It is the same clock `time.monotonic()` reads.
+
+    None on any doubt at all -- no udevadm, no property, an unparseable value --
+    and the caller treats None as "boot", which is the safe direction: the worst
+    case is an Owner who has to move the switch by hand, never a panel that
+    moves it for them.
+    """
+    if not syspath:
+        return None
+    try:
+        done = run(["/usr/bin/udevadm", "info", "--query=property", "--path", syspath],
+                   check=False, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    for line in (done.stdout or "").splitlines():
+        key, _, value = line.partition("=")
+        if key == "USEC_INITIALIZED":
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def system_is_up(run=subprocess.run):
+    """Has systemd finished booting? None when the question cannot be answered.
+
+    `systemctl is-system-running` prints `initializing`/`starting` until
+    `startup-finished`, then `running` (or `degraded`, which is still up). This
+    is the gate that a SLOW BOOT CANNOT OUTRUN, and it is why the design does
+    not lean on systemd-udev-settle: settle only drains the queue it can see, so
+    an adapter behind a slow hub that enumerates a second after settle returned
+    would look like a runtime plug and fire the one-shot against the ruling.
+    While systemd still says `starting`, coldplug is still plausible and the
+    Owner's stored position wins. A slow boot simply stays `starting` longer --
+    there is no number here to be wrong about.
+    """
+    try:
+        done = run(["/usr/bin/systemctl", "is-system-running"],
+                   check=False, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    answer = (done.stdout or "").strip()
+    if answer in ("running", "degraded", "maintenance", "stopping"):
+        return True
+    if answer in ("initializing", "starting"):
+        return False
+    return None
+
+
+def read_boot_stamp(path=None):
+    """The monotonic microsecond at which this boot's stored position was applied.
+
+    The path defaults to BOOT_STAMP at CALL time, not at definition time, so the
+    tests can point the pair at a temp file.
+    """
+    path = BOOT_STAMP if path is None else path
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = raw.get("monotonic_usec") if isinstance(raw, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        # A negative stamp would sit before every real initialization time and
+        # turn every coldplug into a plug event -- the exact failure this file
+        # exists to prevent. Refuse it; None is read as "coldplug".
+        return None
+    return value
+
+
+def write_boot_stamp(path=None, dry_run=False, monotonic_usec=None):
+    """Mark the moment the stored position became true. Called by apply-state.
+
+    `monotonic_usec` IS SAMPLED BY THE CALLER, AT THE START OF THE APPLY, AND
+    THE FILE IS WRITTEN AT THE END. Two review findings meet here. Writing the
+    file early would classify a device that enumerated during the apply as a
+    plug event before the stored position had been applied at all; sampling the
+    clock late would classify a plug that arrived DURING the apply -- and whose
+    presence unit is sitting on the flock waiting for us -- as coldplug, and
+    swallow a real one. Sampling early and publishing late is right on both
+    counts: the mark means "the world as this apply found it".
+
+    A dry run still writes a stamp that is NOT the panel's own, on exactly
+    save_state's reasoning: the hermetic suite drives the real applier through
+    a boot and then a plug, and the difference between them is this file.
+    """
+    path = BOOT_STAMP if path is None else path
+    if dry_run and Path(path) == LIVE_RUN_DIR / "audio-boot-apply.json":
+        print("write %s (suppressed: --dry-run on the live boot stamp)" % path)
+        return
+    if monotonic_usec is None:
+        monotonic_usec = int(time.monotonic() * 1_000_000)
+    stamp = {"monotonic_usec": max(0, int(monotonic_usec))}
+    write_atomic(path, json.dumps(stamp) + "\n", mode=0o644)
+
+
+def is_boot_presence(initialized_usec, stamp=None, system_up=None):
+    """Is this presence report coldplug (a fact) or a runtime plug (an event)?
+
+    THE MECHANISM, AND WHY IT IS THIS ONE.
+
+    Three were available. An `/proc/uptime` threshold is a guess with a number
+    in it, and the number is wrong on exactly the boot that is slow enough to
+    matter -- a USB bus that enumerates at t+12 s on a cold morning would fire
+    the one-shot against the ruling. An explicit `--boot` flag set by the udev
+    rule cannot be written honestly: udev rules cannot portably tell a coldplug
+    event from a hot-plug one (`SYNTH_UUID` semantics differ by systemd
+    version), and a flag baked into the rule would also be wrong for every
+    runtime re-trigger. What is left is a comparison between marks on ONE
+    monotonic clock, and this function is TWO gates over that clock, not one:
+
+    GATE 1 -- HAS THE BOOT FINISHED AT ALL? While `systemctl is-system-running`
+    still says `starting`, a device appearing is still plausibly coldplug, and
+    the Owner's stored position wins. A slow boot stays `starting` for longer,
+    all by itself; there is no number here to be wrong about. This gate exists
+    because the first draft leaned on `systemd-udev-settle`, and review was
+    right that settle only drains the queue it can SEE: an adapter behind a slow
+    hub that enumerates one second after settle returned would have been read as
+    a plug event and fired the one-shot against the ruling.
+
+    GATE 2 -- DID THIS DEVICE PREDATE THE STORED POSITION? `USEC_INITIALIZED`
+    is when udev first processed THIS device; the stamp is what `apply-state`
+    sampled when it began applying the stored position. Earlier means it was
+    there across the boot. This is what catches the reports that arrive long
+    after the boot has finished -- a `udevadm trigger`, a manual `systemctl
+    start`, the presence unit being re-run -- none of which is a plug.
+
+    An unanswerable gate 1 (no systemctl) is BOOT. A boot that has finished with
+    no stamp at all is a RUNTIME report: `/run` has been cleared or the state
+    unit never ran, and a genuine plug must still work -- and `wall_audio_state`
+    refuses to auto-switch for an adapter it already believed present, which is
+    what stops that fallback from firing on a device that never went anywhere.
+    """
+    if system_up is None:
+        system_up = system_is_up()
+    if system_up is not True:
+        return True
+    if stamp is None:
+        stamp = read_boot_stamp()
+    if stamp is None:
+        return False
+    if initialized_usec is None:
+        return True
+    return initialized_usec <= stamp
+
+
+@contextlib.contextmanager
+def apply_lock(path=None, dry_run=False):
+    """Serialize applies. Blocking, because every caller's work must still land.
+
+    A rocker press that gave up because a udev event held the lock would be a
+    volume change the Owner made and cannot see. The critical section is a
+    handful of subprocess calls, so waiting is bounded in practice.
+    """
+    if dry_run:
+        yield
+        return
+    if fcntl is None:
+        # Only reachable off Linux, where there is no panel to serialize against.
+        # The panel itself always has fcntl, so this is never the live path; it
+        # is here so the applier can be imported and driven by the dev box tests.
+        yield
+        return
+    path = Path(path or LOCK_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(handle)
+
+
+class Applier:
+    """Runs (or, with dry_run, prints) the privileged half of one apply."""
+
+    def __init__(self, dry_run=False, run=subprocess.run):
+        self.dry_run = dry_run
+        self._run = run
+        self.commands = []
+
+    def command(self, argv, required=True, quiet=False, timeout=15):
+        """Run one command; returns 0 on success, 1 on a failure that counts.
+
+        `required` False means a failure is logged rather than counted -- a card
+        that has just been unplugged has no controls to set, which is the normal
+        headset case and not an error. `quiet` suppresses the log line for an
+        attempt that is expected to fail and will be retried, so that a normal
+        start does not put twenty identical lines in the journal.
+        """
+        self.commands.append(list(argv))
+        if self.dry_run:
+            print(" ".join(argv))
+            return 0
+        try:
+            done = self._run(argv, check=False, capture_output=True, text=True,
+                             timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            if not quiet:
+                log("FAILED: %s: %s" % (" ".join(argv), exc))
+            return 1 if required else 0
+        if done.returncode != 0:
+            detail = (done.stderr or done.stdout or "").strip().splitlines()
+            if not quiet:
+                log("%s: %s: %s" % ("FAILED" if required else "note",
+                                    " ".join(argv), detail[0] if detail else "no detail"))
+            return 1 if required else 0
+        return 0
+
+
+def write_atomic(path, text, mode=0o644, dry_run=False):
+    """Replace a file in one rename, so no reader ever sees half a state.
+
+    The state file is read by the amplifier detector and by the broker's status
+    path while it is being written; a truncate-then-write would hand them an
+    empty output field, which `normalize` would answer with `speaker` -- audio
+    in the room at a moment nobody asked for it.
+    """
+    if dry_run:
+        print("write %s" % path)
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".new")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def load_state(path=STATE_FILE):
+    """The stored state, normalized. A missing or unreadable file is the default.
+
+    Returns (state, note) where note is a journal line when the file had to be
+    replaced -- a state file that silently reverted to speaker at full level is
+    exactly the kind of change the Owner must be able to find afterwards.
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return policy.default_state(), "no state file yet; defaults applied"
+    except (OSError, ValueError) as exc:
+        return policy.default_state(), "state file unusable (%s); defaults applied" % exc
+    state = policy.normalize(raw)
+    # What was ACTUALLY replaced, field by field: the loaded document against
+    # the normalized one. The previous spelling compared the normalized state
+    # with itself, which is equal by construction, so a partial or
+    # malformed-but-parseable file was silently corrected -- exactly the
+    # "reverted to speaker at full level with nothing in the journal" case this
+    # note exists to prevent.
+    replaced = sorted(key for key, value in state.items()
+                      if not isinstance(raw, dict) or raw.get(key) != value)
+    if replaced:
+        return state, "state file repaired: %s" % ", ".join(replaced)
+    return state, None
+
+
+def save_state(state, path=STATE_FILE, dry_run=False):
+    """Persist the state. A dry run still writes a state file it was GIVEN.
+
+    --dry-run suppresses the privileged half -- systemctl, amixer, /run -- and
+    nothing else, so that a test can drive a sequence of real requests through
+    the real applier and read back what each one decided. Writing the PANEL's
+    own state file from a dry run would defeat the word, so that one alone is
+    refused, out loud.
+    """
+    if dry_run and Path(path) == STATE_FILE:
+        print("write %s (suppressed: --dry-run on the live state file)" % path)
+        return
+    write_atomic(path, json.dumps(state, indent=2, sort_keys=True) + "\n", mode=0o644)
+
+
+# How long to wait for the softvol control to appear after a leg starts, and
+# how often to look. Sized from the forwarders' own start: alsaloop opens its
+# PCMs immediately, so this is a fraction of a second in the normal case and the
+# ceiling only matters on a panel that is already struggling.
+BUS_CONTROL_ATTEMPTS = 20
+BUS_CONTROL_INTERVAL_SECONDS = 0.1
+# After this many fruitless attempts (0.5 s), open the leg's PCM ourselves once
+# rather than keep waiting for someone else to. See set_bus_level.
+BUS_CONTROL_PREOPEN_AFTER = 5
+# The PCM that DECLARES the softvol for each position. Named here because the
+# pre-open must open the plugin that creates the control, not the bus: `Bus`
+# lives on speaker_out and headset_out in asound-bus-mode.conf, and opening
+# `bus` would create nothing.
+BUS_CONTROL_PCM = {"speaker": "speaker_out", "headset": "headset_out"}
+
+
+
+def PRE_OPEN_ARGS(pcm):
+    """The pre-open: open `pcm`, write ONE frame of digital silence, exit.
+
+    It was `aplay -q -D <pcm> /dev/null`, which never opens the device at all:
+    aplay reads a WAV header first and /dev/null has none ("read_header: read
+    error", exit 1). Measured on the panel 2026-09-14 00:58 -- every probe and
+    every softvol pre-open had been failing silently, which is why the Bus
+    control "never appeared" on the first mode switch and why the 8-channel
+    speaker chain always "would not open" while `aplay -D speaker_multi` of a
+    real file played fine. Raw S16 stereo at the bus rate with `-s 1` writes a
+    single zero frame: inaudible, and the chain is genuinely opened.
+    """
+    return ["/usr/bin/aplay", "-q", "-D", pcm, "-t", "raw", "-f", "S16_LE",
+            "-r", "48000", "-c", "2", "-s", "1", "/dev/zero"]
+
+def declare_bus_control(applier, pcm):
+    """Open the leg's PCM once so softvol creates its control, before any audio.
+
+    `aplay -D speaker_out` of one raw zero frame opens the plugin chain (see PRE_OPEN_ARGS)
+    and exits; the control it declares stays on the Loopback card afterwards.
+    Called BEFORE the forwarder starts, and that ordering is the point: review
+    found that creating the control after the leg was already running left a
+    window in which a freshly created softvol sat at its default -- full scale --
+    with the forwarder feeding it. Nothing is audible during the pre-open
+    itself, because there is no source and no frames.
+
+    Never required, and given a short timeout of its own: this runs while the
+    apply lock is held, so an ALSA open that wedges must not hold the switch.
+    """
+    return applier.command(PRE_OPEN_ARGS(pcm),
+                           required=False, quiet=True, timeout=5) == 0
+
+
+def set_bus_level(applier, card, level, expected=True, sleep=time.sleep, pcm=None):
+    """Set the bus softvol, retrying until the control exists. True if it took.
+
+    `expected` False means no leg is running (mute, or headset with no adapter),
+    so the control legitimately does not exist and one attempt is enough.
+
+    `pcm` IS THE FIX FOR THE 2026-09-13 INSTALL FAILURE. `wall-audio-mode bus`
+    ran the first apply of the boot and logged `amixer sset Bus 60%` failing:
+    softvol creates its control when a CLIENT OPENS the PCM that declares it,
+    and on a panel that has just had its whole graph swapped there may be no
+    client for longer than the retry window. Waiting harder would only make the
+    window a bigger guess, so after BUS_CONTROL_PREOPEN_AFTER fruitless
+    attempts the applier opens the PCM itself -- `aplay -D <pcm>` of one raw zero frame (PRE_OPEN_ARGS),
+    which opens, writes no frames and exits, so the control exists afterwards
+    and not one sample reaches the room. It is tried once, it is not required,
+    and the retry loop stays bounded either way.
+    Implements: SR-028, LLR-014
+    """
+    attempts = BUS_CONTROL_ATTEMPTS if expected else 1
+    preopened = False
+    for attempt in range(attempts):
+        if pcm and expected and attempt == BUS_CONTROL_PREOPEN_AFTER and not preopened:
+            preopened = True
+            applier.command(PRE_OPEN_ARGS(pcm),
+                            required=False, quiet=True)
+        # required=True so that a missing control is REPORTED to this loop as a
+        # failure; the caller decides what it means, and never counts it as a
+        # failed apply -- the audio is playing either way, only the level is in
+        # question.
+        if applier.command(["/usr/bin/amixer", "-c", card, "-q", "sset",
+                            BUS_CONTROL, "%d%%" % level],
+                           quiet=attempt < attempts - 1) == 0:
+            return True
+        if attempt < attempts - 1:
+            sleep(BUS_CONTROL_INTERVAL_SECONDS)
+    return not expected
+
+
+def load_trim(path=None):
+    """The six trim coefficients, with a note for anything that had to be replaced.
+
+    Field by field, exactly as `policy.normalize` treats the state file and for
+    the same reason: a typo in one number must not throw the other five away and
+    leave the room with no centre channel.
+
+    Inputs:  path: the env file, or None for TRIM_ENV
+    Outputs: (dict of TRIM_KEYS -> float, [journal lines])
+    Implements: SR-028, LLR-014
+    """
+    path = TRIM_ENV if path is None else Path(path)
+    values = dict(TRIM_DEFAULTS)
+    notes = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return values, []
+    except OSError as exc:
+        return values, ["trim file unusable (%s); defaults applied" % exc]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, raw = line.partition("=")
+        name = name.strip()
+        if not name.startswith(TRIM_ENV_PREFIX):
+            continue
+        key = name[len(TRIM_ENV_PREFIX):].lower()
+        if key not in TRIM_DEFAULTS:
+            notes.append("trim %s is not a channel this panel has: ignored" % key)
+            continue
+        ok, value = parse_trim_value(raw.strip().strip('"').strip("'"))
+        if not ok:
+            notes.append("trim %s=%r refused (%s); using %.3f"
+                         % (key, raw.strip(), value, TRIM_DEFAULTS[key]))
+            continue
+        values[key] = value
+    return values, notes
+
+
+def parse_trim_value(raw):
+    """(True, float) for an acceptable coefficient, (False, reason) otherwise."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return False, "not a number"
+    if value != value or value in (float("inf"), float("-inf")):
+        return False, "not a finite number"
+    if value < 0.0:
+        # A negative coefficient is a phase inversion, which on a summed mono
+        # feed to a centre and a sub is a cancellation, not a trim. If anyone
+        # ever wants one it should be a deliberate new knob with its own name.
+        return False, "negative: a phase inversion is not a trim"
+    if value > TRIM_MAX:
+        return False, ("above %.1f (%+.1f dB): that is a wiring problem, not a trim"
+                       % (TRIM_MAX, TRIM_MAX_DB))
+    return True, value
+
+
+def render_trim_conf(values):
+    """The ALSA `route` for the speaker leg, as text. Pure; the caller writes it.
+
+    This is the ONLY definition of `pcm.speaker_multi`. asound-bus-mode.conf
+    loads it through a hook with `errors false`, so a missing or unreadable file
+    leaves the name undefined rather than taking the whole configuration -- and
+    with it `default`, the bus and the headset leg -- down with it. The applier's
+    probe then finds the multi chain unopenable and falls back to stereo.
+    Implements: SR-028, LLR-014
+    """
+    lines = [
+        "# /etc/wall-panel/audio-trim.conf — GENERATED by `wall-audio-output trim`.",
+        "# Edit with that command, not by hand: this file is rewritten whole.",
+        "# The 8-channel map is the adapter's and is fixed:",
+        "#   0 FL  1 FR  2 FC  3 LFE  4 RL  5 RR  6 SL  7 SR",
+        "pcm.speaker_multi {",
+        "    type route",
+        "    slave {",
+        '        pcm "speaker_hw8"',
+        "        channels 8",
+        "    }",
+    ]
+    for key in TRIM_KEYS:
+        source, destination = TRIM_TTABLE[key]
+        lines.append("    ttable.%d.%d %.4f  # %s" % (source, destination,
+                                                     values[key], key))
+    # The cross terms the six knobs do not name: front stays stereo because L
+    # does not reach FR and R does not reach FL.
+    lines.append("    ttable.1.0 0.0000  # R does not reach FL: front stays stereo")
+    lines.append("    ttable.0.1 0.0000  # L does not reach FR")
+    for channel in TRIM_SILENT_CHANNELS:
+        # Written out rather than left implicit: "silent on purpose" and
+        # "forgotten" must not look the same in a generated file. Rear carries
+        # the desktop's input, and the room's music must never reach it.
+        lines.append("    ttable.0.%d 0.0000" % channel)
+        lines.append("    ttable.1.%d 0.0000" % channel)
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_trim_env(values):
+    """The six coefficients, as the env file the next run reads back."""
+    lines = ["# GENERATED by `wall-audio-output trim`. Must agree with audio-trim.conf."]
+    for key in TRIM_KEYS:
+        lines.append("%s%s=%.4f" % (TRIM_ENV_PREFIX, key.upper(), values[key]))
+    return "\n".join(lines) + "\n"
+
+
+def parse_trim_assignments(assignments, values):
+    """Fold `key=value` arguments into a copy of `values`, or raise ValueError.
+
+    NOTHING IS WRITTEN UNTIL EVERY ARGUMENT HAS PARSED. A tuning session that
+    typed three changes and fat-fingered the fourth must not end up with the
+    first three applied and no idea which: the command either moves the whole
+    table or none of it.
+    """
+    wanted = dict(values)
+    for assignment in assignments:
+        name, separator, raw = assignment.partition("=")
+        if not separator:
+            raise ValueError("%r is not KEY=VALUE (keys: %s)"
+                             % (assignment,
+                                ", ".join(sorted(TRIM_GROUPS) + list(TRIM_KEYS))))
+        key = name.strip().lower()
+        ok, value = parse_trim_value(raw.strip())
+        if not ok:
+            raise ValueError("%s=%s refused: %s" % (key, raw.strip(), value))
+        if key in TRIM_GROUPS:
+            for member in TRIM_GROUPS[key]:
+                wanted[member] = value
+        elif key in TRIM_DEFAULTS:
+            wanted[key] = value
+        else:
+            raise ValueError("%r is not a channel this panel has (keys: %s)"
+                             % (key, ", ".join(sorted(TRIM_GROUPS) + list(TRIM_KEYS))))
+    return wanted
+
+
+def trim_command(arguments):
+    """`wall-audio-output trim [--render] [KEY=VALUE ...]`. Returns an exit code.
+
+    WHY THIS IS A SUBCOMMAND AND NOT A DOCUMENTED FILE EDIT. Owner ruling on
+    finding 8: the level tuning is a dedicated session after everything else is
+    in. That session happens standing at an amplifier, one number at a time, and
+    it must not require anybody to remember that an ALSA ttable indexes
+    destination channels in the hardware's fixed order -- nor to restart the
+    right unit afterwards for the change to be heard.
+
+    IT TAKES THE APPLY LOCK, AND THE FIRST DRAFT DID NOT. The trim is a property
+    of the ROOM rather than of the switch position, so it looked orthogonal to
+    everything `apply_lock` serializes. Review found the interleaving that makes
+    it not: this command reads "the speaker leg is running", an apply for Mute or
+    Headset then stops that leg, and the `restart` below starts it again --
+    leaving the graph in a position the Owner did not choose, with a forwarder
+    running against a stopped tap. The window is small and the fix is free, so
+    the whole of read, render and restart happens under the same lock every
+    other writer takes.
+
+    And it asks the STORED POSITION as well as systemd. `is-active` alone is a
+    fact about a moment; `output == "speaker"` is what the Owner chose. Only
+    when both agree is a restart something the Owner would recognize.
+    Implements: SR-028, LLR-014
+    """
+    values, notes = load_trim(arguments.trim_env)
+    for line in notes:
+        log(line)
+    try:
+        wanted = parse_trim_assignments(arguments.value or [], values)
+    except ValueError as exc:
+        log("refused: %s" % exc)
+        return 1
+
+    changed = [key for key in TRIM_KEYS if abs(wanted[key] - values[key]) > 1e-9]
+    if not arguments.render and not arguments.value:
+        # The bare command is a report, and it says where both files live so
+        # that the next person does not have to find them.
+        print(json.dumps({"trim": {key: round(wanted[key], 4) for key in TRIM_KEYS},
+                          "env": str(arguments.trim_env),
+                          "conf": str(arguments.trim_conf),
+                          "chain": read_env(SPEAKER_CHAIN_ENV, SPEAKER_CHAIN_VAR,
+                                            SPEAKER_CHAIN_MULTI)},
+                         indent=2, sort_keys=True))
+        return 0
+
+    write_atomic(arguments.trim_env, render_trim_env(wanted), mode=0o644,
+                 dry_run=arguments.dry_run)
+    write_atomic(arguments.trim_conf, render_trim_conf(wanted), mode=0o644,
+                 dry_run=arguments.dry_run)
+    for key in changed:
+        log("trim %s %.3f -> %.3f" % (key, values[key], wanted[key]))
+    if not changed:
+        log("trim unchanged; %s re-rendered" % arguments.trim_conf)
+
+    # ALSA reads a plugin's configuration when the PCM is OPENED, so a running
+    # leg keeps the table it started with. Restart it -- but only if it is
+    # already running, because starting it here would put audio in the room from
+    # a command that was only meant to move a number.
+    applier = Applier(dry_run=arguments.dry_run)
+    state, _ = load_state(arguments.state)
+    selected = state["output"] == "speaker" and current_mode() == "bus"
+    # `required=True` on the probe on purpose, so that a systemctl that is
+    # missing or that errors counts as NOT RUNNING and nothing is restarted.
+    # With required=False an exception would answer 0 -- "active" -- and the
+    # command would start audio on a panel that had none, which is the one thing
+    # a number-moving command must never do. `quiet` because "not active" is the
+    # normal answer here, not a fault worth a journal line.
+    running = applier.command(["/usr/bin/systemctl", "is-active", "--quiet",
+                               SPEAKER_OUT_UNIT], quiet=True) == 0
+    if running and selected:
+        if applier.command(["/usr/bin/systemctl", "restart", SPEAKER_OUT_UNIT],
+                           required=False) == 0:
+            log("speaker leg restarted: the new trim table is open")
+    else:
+        log("speaker leg is not running on Speaker: the new trim table is opened "
+            "next time the switch reaches Speaker")
+    return 0
+
+
+def probe_speaker_chain(applier):
+    """Which chain speaker_out can actually slave onto. See SPEAKER_CHAIN_*.
+
+    ONE PROBE, TWO FAILURE MODES, AND THAT IS WHY IT IS A PROBE AND NOT A CHECK.
+    The 8-channel chain is unavailable if the adapter refuses the 8-channel
+    altsetting (a different model dropped into the same role: the CM106 here has
+    one, measured, but nothing in the design requires the part) OR if
+    /etc/wall-panel/audio-trim.conf is missing or unparseable, which is where
+    `speaker_multi` is defined. Asking ALSA to open it answers both at once, and
+    answers them about the graph as it is right now rather than about a file's
+    existence.
+
+    `aplay -q -D speaker_multi` of one raw zero frame (PRE_OPEN_ARGS) opens the chain and
+    exits -- the same move `declare_bus_control` makes, for the same reason, and
+    with the same guarantee that not one sample reaches the room. Not required
+    and short-timed out: it runs under the apply lock.
+    """
+    # `required=True` so that an aplay that is missing, or that raises, is
+    # reported to this function as a FAILURE. With required=False an exception
+    # answers 0 -- "the 8-channel chain opened" -- and the leg would be pointed
+    # at a chain nobody has established exists, which is the loud way to be
+    # wrong. `quiet` because the fallback below is the journal line worth having.
+    if applier.command(PRE_OPEN_ARGS(SPEAKER_CHAIN_MULTI), quiet=True, timeout=5) == 0:
+        return SPEAKER_CHAIN_MULTI
+    log("the 8-channel speaker chain (%s) would not open: falling back to stereo "
+        "front out, with no centre and no sub. Check "
+        "/etc/wall-panel/audio-trim.conf and `cat /proc/asound/card*/stream0` "
+        "for an 8-channel altsetting." % SPEAKER_CHAIN_MULTI)
+    return SPEAKER_CHAIN_STEREO
+
+
+def select_speaker_chain(applier):
+    """Probe, publish the answer for the unit, and put it in our own environment.
+
+    THE ENVIRONMENT HALF IS NOT REDUNDANT. `@func getenv` reads the environment
+    of the process that OPENS the PCM. wall-speaker-out.service gets the answer
+    through EnvironmentFile=, but the pre-open this applier does moments later --
+    `aplay -D speaker_out`, which is what creates the softvol control -- is our
+    OWN child, so it inherits our environment and nothing else. Without this line
+    the pre-open would open the multi chain while the leg opened the stereo one,
+    and a fallback would silently create its control on the wrong graph.
+    """
+    # Do not probe against a device the leg itself is holding. While
+    # wall-speaker-out is running, the adapter is open and any probe answers
+    # "busy" -- which read as "the 8-channel chain would not open" and demoted a
+    # working multi-channel leg to stereo on the next restart. Measured on the
+    # panel 2026-09-14 01:20 (`volume 100` while playing). The published answer
+    # from the last probe with the leg stopped stands until the leg is stopped
+    # again; the probe runs only when nothing holds the adapter.
+    published = read_env(SPEAKER_CHAIN_ENV, SPEAKER_CHAIN_VAR, None)
+    leg_running = applier.command(["/usr/bin/systemctl", "is-active", "--quiet",
+                                   SPEAKER_OUT_UNIT], quiet=True) == 0
+    if leg_running and published in (SPEAKER_CHAIN_MULTI, SPEAKER_CHAIN_STEREO):
+        os.environ[SPEAKER_CHAIN_VAR] = published
+        return published
+    chain = probe_speaker_chain(applier)
+    write_atomic(SPEAKER_CHAIN_ENV, "%s=%s\n" % (SPEAKER_CHAIN_VAR, chain),
+                 mode=0o644, dry_run=applier.dry_run)
+    os.environ[SPEAKER_CHAIN_VAR] = chain
+    return chain
+
+
+def apply_plan(state, applier):
+    """Make the world match `state`. Returns the number of failures.
+
+    ORDER MATTERS AND IT IS: stop, mute, re-point, unmute, start, level.
+    Stopping first means the adapter is never fed by two legs at once; muting
+    before the legs move means the switch does not click through the
+    amplifier; the level is set LAST because the softvol control does not
+    exist until something has opened the PCM that declares it.
+    """
+    failures = 0
+    wanted = policy.plan(state)
+    adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
+    loopback = read_env(CARDS_FILE, "WALL_AUDIO_LOOPBACK_CARD", "Loopback")
+    headset = headset_card()
+
+    # The resolved headset card, for the headset leg's alsaloop. Written even
+    # when the adapter is absent (as an empty value) so that a stale card id
+    # from the last plug cannot be picked up by the next start.
+    write_atomic(HEADSET_ENV, "WALL_AUDIO_HEADSET_CARD=%s\n" % (headset or ""),
+                 mode=0o644, dry_run=applier.dry_run)
+
+    for unit, should_run in wanted["legs"].items():
+        if not should_run:
+            failures += applier.command(["/usr/bin/systemctl", "stop", unit])
+    # Mixer mutes are not required: a card that has just been unplugged has no
+    # controls to set, and that is the normal headset case, not an error.
+    applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",
+                     "mute" if wanted["adapter_muted"] else "unmute"], required=False)
+    if headset:
+        applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Speaker",
+                         "mute" if wanted["headset_muted"] else "unmute"], required=False)
+        applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
+                         "nocap" if wanted["input_muted"] else "cap"], required=False)
+    # THE SOFTVOL CONTROL IS DECLARED, AND SET, BEFORE THE LEG STARTS. softvol
+    # creates its control when a client opens the PCM that declares it, and a
+    # control that does not exist yet cannot be set -- which on 2026-09-13 made
+    # `wall-audio-mode bus` log `amixer sset Bus 60%` failing on the first apply
+    # of the boot. Declaring it ourselves first also closes the window review
+    # found in the first fix: a control created AFTER the forwarder is already
+    # running sits at the plugin default, which is full scale, with audio
+    # flowing through it.
+    leg_pcm = BUS_CONTROL_PCM.get(state["output"])
+    # WHICH SPEAKER CHAIN, DECIDED BEFORE ANYTHING OPENS speaker_out. The
+    # pre-open below and the leg itself must agree, and only this order gets
+    # that: probe, publish, then declare the control on the chain that answered.
+    # Nothing is probed when the speaker leg is not wanted -- in Mute, or in
+    # Headset, opening the adapter at all would be audio nobody asked for.
+    if state["output"] == "speaker" and any(wanted["legs"].values()):
+        select_speaker_chain(applier)
+    if leg_pcm and any(wanted["legs"].values()):
+        if declare_bus_control(applier, leg_pcm):
+            set_bus_level(applier, loopback, wanted["volume"], expected=False)
+    for unit, should_run in wanted["legs"].items():
+        if should_run:
+            failures += applier.command(["/usr/bin/systemctl", "start", unit])
+    # THE LEVEL IS SET LAST AND IT IS RETRIED. softvol creates its control when
+    # a client OPENS the PCM that declares it, and `systemctl start` on a
+    # Type=simple forwarder returns as soon as the process is forked -- not when
+    # alsaloop has opened anything. Setting the level once, immediately, would
+    # therefore leave a freshly started leg at the plugin default (full scale)
+    # rather than at the Owner's remembered level, which is the loudest possible
+    # way to get this wrong. An unanswered control after the whole window is a
+    # journal line, not a failed apply: the audio is playing, only the level is
+    # not what was asked for.
+    if not set_bus_level(applier, loopback, wanted["volume"],
+                         expected=any(wanted["legs"].values()),
+                         pcm=leg_pcm):
+        log("bus level %d%% could not be applied: the control never appeared"
+            % wanted["volume"])
+    if wanted["reason"]:
+        log("output %s is UNAVAILABLE (%s): every output silent"
+            % (state["output"], wanted["reason"]))
+    return failures
+
+
+def headset_event(present, forced_boot=False, forced_runtime=False):
+    """One `headset` event, carrying whether it is coldplug or a runtime plug.
+
+    The distinction is the Owner's 2026-09-13 ruling and it is made HERE, in the
+    shell, because it is a fact about the machine (see is_boot_presence), not a
+    policy. wall_audio_state is then told what kind of report it has, and only
+    a runtime add is allowed to move the switch.
+
+    `--boot` and `--runtime` force the answer for a caller that already knows
+    it: the udev path never passes either, because the whole point is that it
+    cannot honestly tell. A bare `wall-audio-output headset add` typed at a
+    terminal with no udev answer available resolves to BOOT -- it records the
+    adapter and leaves the switch alone -- because that is the safe direction.
+    """
+    if not present:
+        # A remove is only ever a runtime event: a device that is not there
+        # cannot be coldplugged, and the remove half of the presence unit only
+        # runs when the kernel actually took the device away.
+        return {"kind": "headset", "present": False, "boot": bool(forced_boot)}
+    if forced_runtime:
+        return {"kind": "headset", "present": True, "boot": False}
+    boot = forced_boot
+    if not boot:
+        boot = is_boot_presence(device_initialized_usec(headset_syspath()))
+    return {"kind": "headset", "present": True, "boot": bool(boot)}
+
+
+def event_from_arguments(arguments):
+    """Turn the parsed command line into one wall_audio_state event, or None.
+
+    None means "apply what is stored" -- boot, resume and a manual re-assert
+    all take that path, and none of them is allowed to invent a state change
+    beyond recording what is plugged in (see _locked_apply).
+    """
+    if arguments.command == "set":
+        return {"kind": "set_output", "output": arguments.value}
+    if arguments.command == "input-mute":
+        return {"kind": "set_input_mute", "muted": arguments.value == "on"}
+    if arguments.command == "volume":
+        if arguments.value in ("up", "down"):
+            return {"kind": "nudge_volume", "louder": arguments.value == "up"}
+        return {"kind": "set_volume", "level": int(arguments.value)}
+    if arguments.command == "headset":
+        return headset_event(arguments.value == "add", forced_boot=arguments.boot,
+                             forced_runtime=arguments.runtime)
+    return None
+
+
+ALLOWED_REQUEST_KINDS = frozenset(
+    {"set_output", "set_input_mute", "set_volume", "nudge_volume"})
+
+
+def read_request(path, last_seq=-1):
+    """One validated, deduplicated broker request, or None.
+
+    The request file is written by a LESS privileged process, so it is treated
+    as input from outside: the envelope is checked here, the contents are
+    checked by policy, and `headset` is refused outright -- adapter presence is
+    the kernel's fact to report, not the renderer's.
+
+    Deduplication is by a monotonic `seq` against the last one recorded in the
+    state: systemd.path fires on close-write, and an identical re-write of an
+    unchanged request must not replay a rocker press.
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        log("request unusable: %s" % exc)
+        return None
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        log("request refused: unknown envelope")
+        return None
+    seq = raw.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        log("request refused: seq must be a non-negative integer")
+        return None
+    if seq <= last_seq:
+        # Said out loud rather than dropped in silence: if a clock step ever
+        # puts a producer behind the recorded high-water mark, this line is the
+        # only way anyone finds out why the switch stopped responding.
+        log("request %d ignored: not newer than the last applied (%d)" % (seq, last_seq))
+        return None
+    event = raw.get("event")
+    if not isinstance(event, dict) or event.get("kind") not in ALLOWED_REQUEST_KINDS:
+        log("request refused: unknown event kind")
+        return None
+    return seq, event
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="panel audio output switch")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the privileged commands; change nothing")
+    parser.add_argument("--state", default=str(STATE_FILE))
+    parser.add_argument("--boot", action="store_true",
+                        help="force a presence report to be treated as coldplug "
+                             "(a fact to record, never an event to act on)")
+    parser.add_argument("--runtime", action="store_true",
+                        help="force a presence report to be treated as a plug "
+                             "event on an already-running system")
+    parser.add_argument("--render", action="store_true",
+                        help="re-render the trim file from the stored values")
+    parser.add_argument("--trim-env", default=None,
+                        help="the trim values file (a test seam)")
+    parser.add_argument("--trim-conf", default=None,
+                        help="the rendered ALSA trim file (a test seam)")
+    parser.add_argument("command", choices=("status", "set", "input-mute", "volume",
+                                            "headset", "apply-state", "apply-request",
+                                            "trim"))
+    # `trim` takes a whole table's worth of KEY=VALUE; every other command takes
+    # at most one word. Parsed as a list here and narrowed below, so that a
+    # second argument to `set` is a usage error rather than a silently ignored
+    # one.
+    parser.add_argument("value", nargs="*")
+    arguments = parser.parse_args(argv)
+
+    # CONF_DIR is read at import time from the environment, so these defaults
+    # follow the hermetic suite's temp tree the same way STATE_FILE does.
+    arguments.trim_env = Path(arguments.trim_env or TRIM_ENV)
+    arguments.trim_conf = Path(arguments.trim_conf or TRIM_CONF)
+
+    if arguments.command != "trim":
+        if arguments.render:
+            parser.error("--render only means anything for `trim`")
+        if len(arguments.value) > 1:
+            parser.error("%s takes at most one argument" % arguments.command)
+        arguments.value = arguments.value[0] if arguments.value else None
+
+    if arguments.command == "trim":
+        # Under the same lock every other writer takes: see trim_command.
+        with apply_lock(dry_run=arguments.dry_run):
+            return trim_command(arguments)
+
+    if arguments.boot and arguments.runtime:
+        parser.error("--boot and --runtime are opposites; pass at most one")
+    if (arguments.boot or arguments.runtime) and arguments.command != "headset":
+        parser.error("--boot/--runtime only mean anything for `headset`")
+
+    expects_value = {"set": policy.OUTPUTS, "input-mute": ("on", "off"),
+                     "headset": ("add", "remove")}
+    if arguments.command in expects_value:
+        if arguments.value not in expects_value[arguments.command]:
+            parser.error("%s takes one of %s"
+                         % (arguments.command, "|".join(expects_value[arguments.command])))
+    if arguments.command == "volume":
+        if arguments.value is None or (arguments.value not in ("up", "down")
+                                       and not arguments.value.isdigit()):
+            parser.error("volume takes 0..100, up or down")
+
+    if arguments.command == "status":
+        # The only read-only command, and the only one that does not take the
+        # lock: a status printed during someone else's apply is a moment in
+        # time, which is what it claims to be.
+        state, note = load_state(arguments.state)
+        if note:
+            log(note)
+        trim, trim_notes = load_trim(arguments.trim_env)
+        for line in trim_notes:
+            log(line)
+        print(json.dumps({"mode": current_mode(), "state": state,
+                          "plan": policy.plan(state),
+                          # Step 3, and the two things the Owner will want at
+                          # the glass test: which chain the leg actually opened,
+                          # and what the centre and sub are being fed.
+                          "speaker_chain": read_env(SPEAKER_CHAIN_ENV,
+                                                    SPEAKER_CHAIN_VAR,
+                                                    SPEAKER_CHAIN_MULTI),
+                          "trim": {key: round(trim[key], 4) for key in TRIM_KEYS},
+                          "headset_card": headset_card()}, indent=2, sort_keys=True))
+        return 0
+
+    with apply_lock(dry_run=arguments.dry_run):
+        return _locked_apply(arguments)
+
+
+def _locked_apply(arguments):
+    """One complete apply, under the lock. See apply_lock for why it is whole.
+
+    Returns the process exit code.
+    """
+    state, note = load_state(arguments.state)
+    if note:
+        log(note)
+
+    seq = None
+    boot_mark = None
+    if arguments.command == "apply-state":
+        # Sampled HERE, before anything is decided or applied, and written at
+        # the very end -- see write_boot_stamp for why the two halves are apart.
+        boot_mark = int(time.monotonic() * 1_000_000)
+        # THE STORED POSITION IS APPLIED FIRST, AND WHAT IS PLUGGED IN IS ONLY
+        # RECORDED. Owner ruling 2026-09-13: over a boot we do not know when a
+        # plug event happened or whether it is still relevant, so coldplug is a
+        # fact, never an event. This refreshes `headset_present` -- which is
+        # otherwise a stale value from the last boot -- and sets the one-shot
+        # latch from what coldplug actually sees, without ever moving `output`.
+        state, lines = policy.apply_event(
+            state, headset_event(headset_card() is not None, forced_boot=True))
+        for line in lines:
+            log(line)
+        save_state(state, arguments.state, dry_run=arguments.dry_run)
+
+    if arguments.command == "apply-request":
+        request = read_request(arguments.value or DEFAULT_REQUEST,
+                               state.get("request_seq", -1))
+        if request is None:
+            return 0
+        seq, event = request
+    else:
+        event = event_from_arguments(arguments)
+
+    if event is not None:
+        try:
+            state, lines = policy.apply_event(state, event)
+        except policy.StateError as exc:
+            log("refused: %s" % exc)
+            return 1
+        for line in lines:
+            log(line)
+        if seq is not None:
+            # Recorded in the SAME atomic write as the change it caused: a seq
+            # that survived while its effect did not would swallow the retry.
+            state["request_seq"] = seq
+        save_state(state, arguments.state, dry_run=arguments.dry_run)
+
+    mode = current_mode()
+    if mode != "bus":
+        # The state is still recorded: the Owner may set the switch while the
+        # panel is in the old trigger chain, and `wall-audio-mode bus` applies
+        # it on arrival. Touching mixers or units here would fight that chain.
+        log("mode is %s, not bus: state recorded, hardware untouched" % mode)
+        if boot_mark is not None:
+            write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
+        return 0
+    failures = apply_plan(state, Applier(dry_run=arguments.dry_run))
+    # Published only now, with the graph in the position the state asked for. A
+    # stamp written before the apply would declare the boot settled while the
+    # legs were still moving, and any adapter that enumerated in between would
+    # read as a plug event -- the very thing this is here to prevent.
+    if boot_mark is not None:
+        write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
+    if failures:
+        log("apply finished with %d failure(s): audio may be wrong" % failures)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through main()
+    try:
+        sys.exit(main())
+    except BrokenPipeError:  # pragma: no cover
+        os._exit(errno.EPIPE)

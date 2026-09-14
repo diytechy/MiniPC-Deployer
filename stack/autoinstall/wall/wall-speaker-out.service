@@ -1,0 +1,87 @@
+# wall-speaker-out.service — the switch on Speaker: tap to the amplifier.
+#
+# THE OTHER HALF OF THE SPEAKER LEG (see wall-bus-speaker.service for why there
+# are two). This one carries the volume control: its playback PCM is
+# `speaker_out`, the softvol declared in asound-bus-mode.conf whose control
+# lives on the always-present Loopback card.
+#
+# STEP 3 (D4, superseding item 17) IS DONE AND IT LIVES IN THE GRAPH, NOT HERE.
+# speaker_out now opens the adapter's 8-channel altsetting (measured: altsets of
+# 2/4/6/8 channels at 44.1 and 48 kHz, fixed map FL FR FC LFE RL RR SL SR) and a
+# `route` copies FL to ch0, FR to ch1 and (L+R)/2 to both FC and LFE, through a
+# per-channel trim table generated into /etc/wall-panel/audio-trim.conf. This
+# unit still forwards two channels: the up-mix is below the softvol, so the
+# Owner's one volume control moves front, centre and sub together.
+#
+# WHY AN EnvironmentFile FOR A CHAIN NAME. If the adapter refuses the 8-channel
+# altsetting, or the generated trim file is missing, there has to be a stereo
+# path rather than a silent panel -- and ALSA configuration has no conditionals.
+# wall-audio-output probes the multi chain once per apply and writes the name of
+# the chain that actually opened here; asound-bus-mode.conf reads it with
+# @func getenv and defaults to the 8-channel one. `-` on the path because a
+# hand-started leg with no applier run behind it must still take the default.
+#
+# NOT ENABLED: wall-audio-output owns when it runs.
+
+[Unit]
+Description=Wall panel: speaker tap to the amplifier feed (switch position Speaker)
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target
+Wants=sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+BindsTo=dev-wall_audio_adapter.device
+After=dev-wall_audio_adapter.device
+# THE BOOT MINUTE, MEASURED, AND THE FIX THAT WAS TRIED FIRST AND WITHDRAWN.
+# On the 2026-09-14 00:13 reboot the journal carried 58 speaker_out underruns
+# confined to 00:14:18-00:15:13 and ZERO afterwards -- the Owner heard them as
+# skipping during boot and nothing later. The window is exactly firstboot's
+# re-run, the kiosk session restarting and the USB tree enumerating, all
+# competing for the same CPU and the same USB host controller.
+#
+# `After=wall-firstboot.service` WAS THE OBVIOUS FIX AND IT IS A DEADLOCK.
+# Caught by review before the panel saw it. Nothing here is started by a boot
+# target: firstboot runs `wall-audio-mode bus`, which restarts
+# wall-audio-state.service, whose applier runs `systemctl start` on THIS unit
+# and waits for the job. Order that job after wall-firstboot.service and systemd
+# holds it behind firstboot's own still-running job -- while firstboot is
+# blocked waiting for the start to return. First boot would then hang to its
+# timeout and fail to provision. The ordering was incoherent as well as
+# dangerous: firstboot cannot be a unit this leg starts after when firstboot is
+# the thing that starts it.
+#
+# SO IT IS A BIGGER BUFFER AFTER ALL, AND ONLY ON THIS HALF. --tlatency 50000
+# rather than 30000: a larger ring tolerates a longer scheduling gap, which is
+# precisely what the boot minute is. The cost is about 20 ms of end-to-end
+# latency on the speaker path, taking it to roughly 80-100 ms -- still under the
+# kiosk leg's own 100 ms, and the design's stated lip-sync knob (wall-spdif-in's
+# latency) is untouched and still available. wall-bus-speaker.service keeps 30
+# ms: the measured underruns were on speaker_out, and buying tolerance twice
+# would pay for the boot minute twice.
+
+[Service]
+Type=simple
+# The chain speaker_out slaves onto, written by wall-audio-output's probe:
+# speaker_multi (8 channels, centre and sub) or speaker_stereo (the fallback).
+# `-` so a missing file is the ALSA default, not a refused start.
+EnvironmentFile=-/run/wall-panel/audio-speaker.env
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
+    --cdevice speaker_tap \
+    --pdevice speaker_out \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 50000 --sync 5
+Restart=always
+RestartSec=2
+Nice=-5
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=15
+LimitRTPRIO=15
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+SupplementaryGroups=audio
+StandardOutput=journal
+StandardError=journal

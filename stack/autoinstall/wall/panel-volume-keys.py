@@ -77,13 +77,24 @@ VOLUME_KCONTROL = "Speaker Playback Volume"
 FRONT_CHANNELS = (0, 1)
 
 
-def target():
-    """(card, simple control, kcontrol name) for the output currently in use."""
+def current_mode():
+    """trigger | panel | bus, read on every press.
+
+    Not captured at startup: `wall-audio-mode` does not restart this unit, and
+    adjusting the wrong card is silent -- the rocker appears dead while moving a
+    control nobody is listening to.
+    """
     try:
         with open(MODE_FILE) as fh:
             mode = fh.read().strip()
     except OSError:
-        mode = "trigger"
+        return "trigger"
+    return mode if mode in ("trigger", "panel", "bus") else "trigger"
+
+
+def target():
+    """(card, simple control, kcontrol name) for the output currently in use."""
+    mode = current_mode()
     key, fallback = TARGETS.get(mode, TARGETS["trigger"])
     return _card(key, fallback), CONTROL, VOLUME_KCONTROL
 
@@ -178,8 +189,35 @@ def _read_volume(card, kcontrol):
     return values, maximum
 
 
+OUTPUT_SWITCH = "/usr/local/sbin/wall-audio-output"
+
+
+def nudge_bus(louder):
+    """One rocker press in bus mode: the level of the merged bus (ruling F).
+
+    In bus mode the rocker stops being a card control. The level belongs to the
+    bus, it is remembered PER OUTPUT, and both of those facts live in the switch
+    state -- so the press is handed to the one process that owns that state
+    rather than reimplemented here against a mixer. wall-audio-output applies
+    the softvol afterwards; this daemon does not need to know it exists.
+
+    Returns True when the press was handed over, False to fall through to the
+    card-control path (a panel whose applier is not installed yet still has a
+    working rocker, which matters while the branch is half-deployed).
+    """
+    try:
+        subprocess.run([OUTPUT_SWITCH, "volume", "up" if louder else "down"],
+                       check=False, capture_output=True, text=True, timeout=5)
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("bus volume: %s" % exc, file=sys.stderr, flush=True)
+        return False
+
+
 def nudge(louder):
     """Move the front pair only, on whichever card the current mode is using."""
+    if current_mode() == "bus" and nudge_bus(louder):
+        return
     card, control, kcontrol = target()
     state = _read_volume(card, kcontrol)
     if state is None:
@@ -245,6 +283,14 @@ def main():
                     # always produces sound -- what someone reaching for the
                     # rocker means.
                     nudge(louder)
+                elif code == KEY_MUTE and current_mode() == "bus":
+                    # DELIBERATELY INERT IN BUS MODE, and said out loud. Mute is
+                    # a position of the on-glass switch now, and a one-way
+                    # `set mute` from a key that cannot un-mute would strand the
+                    # panel silent for anyone not standing at it. Step 5 gives
+                    # the state a previous-output memory and this key a toggle.
+                    print("mute key ignored in bus mode: use the on-glass switch",
+                          file=sys.stderr, flush=True)
                 elif code == KEY_MUTE:
                     # NOTE: the switch is joined across all channels, so this
                     # silences the trigger line too and the amplifier will power

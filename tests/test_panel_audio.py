@@ -5,8 +5,10 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 
@@ -395,3 +397,209 @@ def test_image_contract_is_disabled_local_and_carries_no_broad_dbus_policy_sr023
     materialized = firstboot[firstboot.index("_wall_audio_env_new="):enabled_branch]
     assert materialized.count("WALL_AUDIO_ENABLED") == 2
     assert materialized.count("WALL_AUDIO_SOCKET") == 1
+
+
+def test_firstboot_payload_files_are_all_tracked_and_shipped():
+    """Every file wall-firstboot.sh reads from $PAYLOAD must be in the image.
+
+    The panel's payload dir is `git archive HEAD` of this repo (vmtest/lib/
+    common.sh copy_repo_into_payload), so a file that is untracked, or renamed
+    without the firstboot reference following it, ships as an absent payload
+    entry. Both bulk install loops guard with `[ -f ]`, so the failure is
+    SILENT: the unit or helper simply never lands. Measured 2026-09-14 on the
+    live panel, whose payload dir predates the amplifier and hub-reset work and
+    is therefore missing 91-wall-usb-hub-reset.rules, wall-usb-hub-reset@.service,
+    wall-amp-trigger.service and wall-line-in.service among others -- firstboot
+    skipped every one of them without a word.
+
+    REFERENCES ARE RESOLVED, NOT PATTERN-MATCHED, AND EVERY LOOP COUNTS.
+    `$PAYLOAD/$_f` is worthless on its own; `$PAYLOAD/../../panel-audio/$_wall_
+    audio_file` reaches OUT of the wall directory; and `_f` is REUSED -- once
+    for the three asound-*-mode.conf files and again for the helper scripts --
+    so a dictionary keyed on the name alone silently drops whichever loop came
+    first. Both mistakes were made and caught in review. Every `for` line for a
+    name contributes its words, every path is normalised against the repo root,
+    and a shape that cannot be resolved FAILS rather than being skipped.
+    """
+    import posixpath
+    import re
+
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    # `git ls-tree HEAD`, NOT `git ls-files`: the payload is `git archive HEAD`,
+    # so the index is the wrong tree to ask. A file that is staged but not yet
+    # committed is in `ls-files` and is NOT in the archive the panel unpacks.
+    # A new payload file therefore has to be COMMITTED before this passes,
+    # which is the deployment contract stated honestly.
+    tracked = set(subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout.splitlines())
+
+    loops = {}
+    for match in re.finditer(r"for (_[A-Za-z0-9_]+) in ([^;\n]+); do", firstboot):
+        words = [w for w in match.group(2).split() if "$" not in w]
+        loops.setdefault(match.group(1), []).extend(words)
+
+    base = "stack/autoinstall/wall"
+    refs, unresolved = set(), set()
+    for match in re.finditer(r"\$PAYLOAD/([A-Za-z0-9@._+/$-]+)", firstboot):
+        raw = match.group(1)
+        variables = re.findall(r"\$(_[A-Za-z0-9_]+)", raw)
+        expansions = [raw]
+        for var in variables:
+            if not loops.get(var):
+                unresolved.add(raw)
+                expansions = []
+                break
+            expansions = [e.replace("$" + var, w) for e in expansions for w in loops[var]]
+        for expanded in expansions:
+            if "$" in expanded:
+                unresolved.add(raw)
+                continue
+            refs.add(posixpath.normpath(base + "/" + expanded))
+    # Bare `$PAYLOAD/` (the directory itself, used in message text) normalises
+    # to the directory; it is not a file reference.
+    refs.discard(base)
+
+    assert not unresolved, (
+        "this test could not resolve these $PAYLOAD references, so it was not "
+        "checking them -- teach it the new form rather than letting it pass: %s"
+        % sorted(unresolved)
+    )
+    missing = sorted(r for r in refs if r not in tracked)
+    assert not missing, (
+        "wall-firstboot.sh reads these from $PAYLOAD but they are not tracked, "
+        "so the image will not carry them and firstboot will skip them in "
+        "silence (a file staged but not yet committed counts as missing -- the "
+        "payload is git archive HEAD): %s" % missing
+    )
+    # Spot checks that the resolution above is actually finding things, so a
+    # future refactor of firstboot cannot turn this into a test of nothing:
+    # literals, a word from EACH of the two `_f` loops and from the `_u` loop,
+    # and the cross-directory form.
+    assert {
+        base + "/91-wall-usb-hub-reset.rules",
+        base + "/asound-bus-mode.conf",
+        base + "/asound-trigger-mode.conf",
+        base + "/asound-panel-mode.conf",
+        base + "/wall-alsaloop-guard.py",
+        base + "/wall_audio_state.py",
+        base + "/wall-amp-trigger.service",
+        base + "/wall-usb-hub-reset@.service",
+        base + "/wall-audio-apply.path",
+        "stack/panel-audio/audio_router.py",
+    } <= refs
+
+
+def test_firstboot_refuses_to_call_an_unapplied_audio_mode_a_success():
+    """A failed `wall-audio-mode` apply must make firstboot RED, not warn.
+
+    The bus arm logged its affirmative success line whatever the applier did,
+    and an absent applier skipped the whole arm in silence, so a half-applied
+    switch -- mode file and symlink moved, legs not moved, two chains on one
+    adapter -- could reach the wall behind a green provisioning marker. That is
+    the precise failure the bus arm exists to prevent.
+    """
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    body_start = firstboot.index("apply_audio_mode() {")
+    body = firstboot[body_start:firstboot.index("\nesac\n", body_start)]
+    assert body.count("fail_step") == 2, body
+    assert "warn " not in body
+    # Every arm goes through the helper, and no arm applies a mode any other way.
+    case_start = firstboot.index('case "${WALL_AUDIO_MODE:-trigger}" in')
+    case = firstboot[case_start:firstboot.index("\nesac\n", case_start)]
+    for mode in ("bus", "panel", "trigger"):
+        assert "apply_audio_mode " + mode in case
+    assert "/usr/local/sbin/wall-audio-mode" not in case
+    # The success lines are inside the helper's post-success loop, not printed
+    # unconditionally the way the trigger arm used to print them.
+    assert 'for line in "$@"; do log "$line"; done' in body
+    # AND THE HELPER NEVER RETURNS NONZERO. firstboot is `set -euo pipefail`
+    # and every arm calls this as a bare simple command, so a `return 1` after
+    # fail_step would kill the script on the spot instead of recording the
+    # failure and carrying on to media sync, the brokers and the red summary.
+    assert "return 1" not in body, (
+        "apply_audio_mode returns nonzero under set -e from an unguarded call "
+        "site: a failed mode apply would abort the rest of firstboot"
+    )
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_apply_audio_mode_records_failure_and_lets_firstboot_continue():
+    """Run the real helper under `set -euo pipefail` and watch what happens.
+
+    Reading the source is how the `return 1` got there in the first place. This
+    executes the function's three paths -- applier missing, applier failing,
+    applier succeeding -- from an unguarded call site in an errexit shell, and
+    asserts the script reaches its own end each time.
+    """
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    start = firstboot.index("apply_audio_mode() {")
+    helper = firstboot[start:firstboot.index("\n}\n", start) + 3]
+
+    harness = """set -euo pipefail
+PROVISION_FAILED=0
+PAYLOAD=/payload
+log()  { echo "LOG $*"; }
+warn() { echo "WARN $*"; }
+fail_step() { PROVISION_FAILED=1; echo "ERROR $*" >&2; }
+%s
+apply_audio_mode %s "success line one" "success line two"
+echo "REACHED_END failed=$PROVISION_FAILED"
+"""
+
+    def run(mode, applier_body):
+        with tempfile.TemporaryDirectory() as tmp:
+            if applier_body is not None:
+                stub = Path(tmp) / "wall-audio-mode"
+                stub.write_text("#!/bin/sh\n" + applier_body, encoding="utf-8")
+                stub.chmod(0o755)
+            # The helper hard-codes the applier's absolute path, so the stub is
+            # bound in by rewriting that one literal to a path in the cwd --
+            # which keeps the script POSIX on a Windows dev box too.
+            script = (harness % (helper, mode)).replace(
+                "/usr/local/sbin/wall-audio-mode", "./wall-audio-mode")
+            return subprocess.run(["bash", "-c", script], cwd=tmp,
+                                  capture_output=True, text=True)
+
+    missing = run("bus", None)
+    assert "REACHED_END failed=1" in missing.stdout, missing
+    assert "was NOT applied" in missing.stderr
+    assert "success line one" not in missing.stdout
+
+    failed = run("bus", "exit 3\n")
+    assert "REACHED_END failed=1" in failed.stdout, failed
+    assert "may be HALF applied" in failed.stderr
+    assert "success line one" not in failed.stdout
+
+    ok = run("bus", "exit 0\n")
+    assert "REACHED_END failed=0" in ok.stdout, ok
+    assert ok.stderr.strip() == ""
+    assert "LOG success line one" in ok.stdout
+    assert "LOG success line two" in ok.stdout
+
+
+def test_changed_module_options_rebuild_the_initramfs():
+    """snd_usb_audio loads from the initramfs, not from /etc/modprobe.d.
+
+    `index=1` was corrected to `index=1,3` on 2026-09-14 and the built-in codec
+    stayed missing until update-initramfs -u was run BY HAND, twice. firstboot
+    installing the file and stopping there changes nothing that boot OR the
+    next one, so a re-imaged or upgraded panel would hit the same card-index
+    failure the fix was written for.
+    """
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    start = firstboot.index('for _f in wall-audio-index.conf')
+    block = firstboot[start:firstboot.index('\n# Options alone do not load', start)]
+    # Conditional on an actual change: firstboot re-runs on every boot and
+    # update-initramfs takes tens of seconds.
+    assert 'cmp -s "$PAYLOAD/$_f" "/etc/modprobe.d/$_f"' in block
+    assert "update-initramfs -u" in block
+    # And a failed or absent rebuild is a RED firstboot, not a shrug: the panel
+    # would boot with the old card indexes and nothing would say so.
+    assert block.count("fail_step") == 2, block
+    assert "|| true" not in block
+    # The knob this exists for is still the measured one.
+    index_conf = (WALL / "wall-audio-index.conf").read_text(encoding="utf-8")
+    assert "options snd_usb_audio index=1,3" in index_conf
+    assert "options snd_hda_intel index=0" in index_conf

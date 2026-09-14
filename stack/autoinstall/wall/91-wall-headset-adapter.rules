@@ -1,0 +1,33 @@
+# The USB headset adapter's identity, as a stable systemd device unit.
+#
+# 0d8c:0014, a C-Media stereo-out/mono-mic adapter that enumerates as the ALSA
+# card id "Device" (measured on the panel 2026-09-13, with a 440 Hz tone heard
+# through it by the Owner). It HOT-PLUGS, and that is the whole point: its
+# arrival is the event that flips the switch from Speaker to Headset once
+# (item 23 D5, as amended by review finding 1 -- the adapter, never the cable,
+# because this device reports no jack or mic insertion at all).
+#
+# EVERY PARAGRAPH OF 90-wall-audio-adapter.rules APPLIES HERE WORD FOR WORD and
+# is not repeated: the alias is what survives a port change, the underscores
+# avoid the \x2d escaping a dash would force into the unit files, and the tag
+# must be set on every non-remove event because udev re-evaluates all rules on
+# every event and a property not set by THIS event does not exist.
+#
+# WHAT IS DIFFERENT: the alias is a DIFFERENT device, so a headset replug does
+# not touch the 5.1 adapter's three units and vice versa. Two units follow this
+# one: the presence reporter, and the headset leg of the switch.
+#
+# THIS RULE DOES NOT SAY WHETHER THE EVENT IS A PLUG OR A COLDPLUG, and it
+# deliberately does not try. Owner ruling 2026-09-13: the switch position must
+# survive a power cycle whether or not the adapter is plugged in over the boot,
+# so only an adapter that arrives while the system is already up may move the
+# switch. A udev rule cannot tell the two apart honestly -- the synthetic-event
+# properties differ by systemd version, and every runtime re-trigger would look
+# synthetic too -- so the rule reports presence and nothing else. The judgement
+# is made in wall-audio-output, by comparing this device's USEC_INITIALIZED
+# with the stamp wall-audio-state.service writes (see is_boot_presence).
+ACTION=="remove", GOTO="wall_headset_adapter_end"
+SUBSYSTEM=="sound", KERNEL=="card*", ATTRS{idVendor}=="0d8c", ATTRS{idProduct}=="0014", \
+    TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/wall_headset_adapter", \
+    ENV{SYSTEMD_WANTS}+="wall-headset-present.service"
+LABEL="wall_headset_adapter_end"

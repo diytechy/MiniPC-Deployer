@@ -15,8 +15,22 @@ from typing import Iterable, Mapping
 ALIAS = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 MUTATING_METHODS = frozenset(
     {"discover", "cancel", "pair", "connect", "disconnect", "forget",
-     "select_input", "select_output", "set_visualizer", "set_mute"}
+     "select_input", "select_output", "set_visualizer", "set_mute",
+     "set_output", "set_input_mute"}
 )
+
+# THE TWO NAMES THAT LOOK ALIKE, AND ARE NOT (item 23 step 2). `select_output`
+# routes to a trusted BLUETOOTH DEVICE by alias and predates this work.
+# `set_output` moves the panel's own Mute / Headset / Speaker switch and takes
+# no alias at all -- the renderer still cannot name a card, a unit or a mixer.
+# They were nearly merged during the redesign; keeping them apart is what stops
+# a device alias from ever reaching the host switch, and vice versa.
+#
+# `set_mute` is the generalization's predecessor: it was the OUTPUT mute, and
+# `set_output` with output="mute" is exactly that request with a wider range. It
+# stays accepted for one release so a panel running an older shell keeps its
+# mute button, and is removed with the chrome work (step 5).
+SWITCH_OUTPUTS = ("mute", "headset", "speaker")
 METHODS = MUTATING_METHODS | {"status", "telemetry"}
 
 # SELF-RECONCILING MUTATIONS: journaled, but never sticky.
@@ -30,7 +44,7 @@ METHODS = MUTATING_METHODS | {"status", "telemetry"}
 #
 # So a pending entry for one of these is resolved by OBSERVING the device rather
 # than by trusting the journal or an operator. See AudioRouter._reconcile.
-SELF_RECONCILING_METHODS = frozenset({"set_mute"})
+SELF_RECONCILING_METHODS = frozenset({"set_mute", "set_output", "set_input_mute"})
 HARDWARE_ADDRESS = re.compile(
     r"(?i)(?<![0-9a-f])(?:(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}|"
     r"(?:[0-9a-f]{2}_){5}[0-9a-f]{2}|(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}|"
@@ -74,6 +88,8 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         "select_input": {"alias", "explicit"}, "select_output": {"alias"},
         "set_visualizer": {"enabled"},
         "set_mute": {"muted"},
+        "set_output": {"output"},
+        "set_input_mute": {"muted"},
     }[method]
     if set(params) - allowed:
         raise PolicyError("unknown parameter")
@@ -93,8 +109,13 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         raise PolicyError("enabled must be boolean")
     # `muted` is required, not defaulted: a mute request that forgot to say which
     # way is a caller bug, and guessing it would silently toggle the room.
-    if method == "set_mute" and not isinstance(params.get("muted"), bool):
+    if method in ("set_mute", "set_input_mute") and not isinstance(params.get("muted"), bool):
         raise PolicyError("muted must be boolean")
+    # An enum, not a free string: the host applier turns this into units and
+    # mixer settings, so an unknown position must die here rather than at a
+    # shell that has already stopped the leg that was playing.
+    if method == "set_output" and params.get("output") not in SWITCH_OUTPUTS:
+        raise PolicyError("output must be one of %s" % ", ".join(SWITCH_OUTPUTS))
     if method == "pair" and "confirmation" in params:
         confirmation = params["confirmation"]
         if (not isinstance(confirmation, str) or not 1 <= len(confirmation) <= 16 or

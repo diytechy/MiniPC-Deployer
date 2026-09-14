@@ -32,6 +32,7 @@ SUITES=(
     "remote-ui/tests/icedrive-gate.test.sh"
     "ai-cli/tests/ai-cli-guards.test.sh"
     "autoinstall/wall/tests/occupancy-power.test.sh"
+    "autoinstall/wall/tests/audio-switch.test.sh"
 )
 
 if [ "${1:-}" = "--list" ]; then

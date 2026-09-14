@@ -1,0 +1,56 @@
+# wall-bus-headset.service — the switch on Headset: bus to the USB headset.
+#
+# ONE HOP, NO TAP. The amplifier is not involved in this position, so there is
+# nothing to detect and nothing to forward twice. The volume control is the same
+# softvol, under the same name, so the level the Owner set on the headset is
+# remembered separately and applied here (Owner ruling F; the memory itself is
+# in /etc/wall-panel/audio-state.json).
+#
+# THE CARD ID ARRIVES IN THE ENVIRONMENT. The headset adapter (0d8c:0014)
+# enumerates as the generic ALSA id "Device", which is what the kernel calls any
+# nameless C-Media adapter, so the id is resolved from /proc/asound/card*/usbid
+# by wall-audio-output on every apply and written to the file below.
+# asound-bus-mode.conf reads the same variable through @func getenv.
+#
+# BOUND TO THE HEADSET ADAPTER, NOT THE 5.1 ADAPTER. It is the only unit in the
+# graph that is: the headset hot-plugs, and its disappearance is what must stop
+# this leg. Ruling 7 then holds -- headset selected with no adapter is silence
+# on every output and a red icon, not a fallback to the speakers.
+
+[Unit]
+Description=Wall panel: merged bus to the USB headset (switch position Headset)
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target
+Wants=sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+BindsTo=dev-wall_headset_adapter.device
+After=dev-wall_headset_adapter.device
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+# Written by wall-audio-output at every apply; absent means no adapter, and the
+# unit then fails its start on the BindsTo above rather than opening "Device"
+# and hoping. The `-` prefix keeps a missing file from being a start failure of
+# its own, which would be a second, less honest way to say the same thing.
+EnvironmentFile=-/run/wall-panel/audio-headset.env
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
+    --cdevice bus_monitor \
+    --pdevice headset_out \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 30000 --sync 5
+Restart=always
+RestartSec=2
+Nice=-5
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=15
+LimitRTPRIO=15
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+SupplementaryGroups=audio
+StandardOutput=journal
+StandardError=journal

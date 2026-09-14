@@ -1,0 +1,48 @@
+# wall-audio-state.service — re-assert the stored switch position.
+#
+# Owner ruling G: the mode persists through reboot, and (item 16) through sleep.
+# The state file is the memory; this unit is the only thing that turns it back
+# into running units and mixer settings, at the two moments when nothing else
+# will: after a boot, and after a resume.
+#
+# THE RESUME HALF IS A SECOND UNIT (wall-audio-resume.service), not this one.
+# This unit is RemainAfterExit=yes, so it stays active for the life of the boot;
+# wanting it from a sleep target would "start" an already-active unit and run
+# nothing -- a silent no-op with a green status above it. See that unit for the
+# ordering that actually fires on resume.
+#
+# It never invents a state: `apply-state` applies what is stored and nothing
+# else. A panel that was left on Mute comes back on Mute, silently and
+# deliberately.
+
+[Unit]
+Description=Wall panel: apply the stored audio switch position at boot
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target systemd-modules-load.service
+Wants=sound.target
+# ORDERED AFTER COLDPLUG STARTS, BUT NOT WAITING ON IT. Owner ruling
+# 2026-09-13: the switch position must survive a power cycle "regardless of
+# whether the adapter is plugged in over the boot". The applier tells a coldplug
+# presence report from a real plug event with two gates -- has systemd finished
+# booting, and did this device predate the stamp this unit writes (see
+# is_boot_presence in wall-audio-output).
+#
+# systemd-udev-settle IS DELIBERATELY NOT USED, and an earlier draft of this
+# unit was wrong to reach for it. Settle drains the queue it can SEE; it makes
+# no promise about hardware that enumerates a second later, which is exactly the
+# adapter-behind-a-slow-hub case that would otherwise fire the one-shot against
+# the ruling. The `is-system-running` gate covers that case honestly, and a slow
+# boot simply stays `starting` for longer. Ordering after the trigger is kept
+# because it costs nothing and puts the usual case in the usual order.
+After=systemd-udev-trigger.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wall-audio-output apply-state
+SyslogIdentifier=wall-audio-output
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

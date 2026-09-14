@@ -63,6 +63,28 @@ SOURCES = (
     ("kiosk_monitor", 0.0),
 )
 
+# BUS MODE WATCHES ONE PCM, AND IT IS NOT A SOURCE (item 23, review finding 2).
+# `speaker_tap` is the second loopback substream that sits between the switch
+# and the amplifier feed, so:
+#   * in Headset or Mute the forwarders that fill it are stopped, the tap goes
+#     quiet, and the ordinary hold-off runs it down -- no immediate relay open,
+#     which is the Owner's amendment to finding 1, and no branch here at all;
+#   * a source playing into the bus while the switch is elsewhere is invisible,
+#     which is the whole complaint;
+#   * the tap is upstream of the volume control, so a quiet room does not drop
+#     the amplifier.
+# The offset is 0: everything reaching the tap is digital full scale, unlike the
+# analog line input's measured -13 dB.
+BUS_SOURCES = (
+    ("speaker_tap", 0.0),
+)
+
+
+def sources_for(mode):
+    """The capture PCMs this mode's detector reads. Implements: SR-028, LLR-014."""
+    return BUS_SOURCES if mode == "bus" else SOURCES
+
+
 def log(message):
     print(message, file=sys.stderr, flush=True)
 
@@ -191,14 +213,21 @@ STALE_SECONDS = 1.0
 MODE_FILE = "/etc/wall-panel/audio-mode"
 
 
+# The modes in which this daemon commands the amplifier at all. `panel` sends
+# everything out the panel's own speaker and never touches the relay; `trigger`
+# and `bus` both feed the amplifier, and differ only in which PCM is watched
+# (see sources_for).
+COMMANDING_MODES = ("trigger", "bus")
+
+
 def current_mode():
-    """trigger or panel. A missing file means trigger, the normal configuration."""
+    """trigger, panel or bus. A missing file means trigger, as it always has."""
     try:
         with open(MODE_FILE) as fh:
             value = fh.read().strip()
     except OSError:
         return "trigger"
-    return value if value in ("trigger", "panel") else "trigger"
+    return value if value in ("trigger", "panel", "bus") else "trigger"
 
 
 class Level:
@@ -699,7 +728,7 @@ def main():
     # for those two paths an unverified OFF is still a hard failure that the
     # RestartSec is the only cure for.
     _idle = (os.environ.get("WALL_AMP_ENABLED", "true").strip().lower()
-             in ("false", "0", "no")) or current_mode() != "trigger"
+             in ("false", "0", "no")) or current_mode() not in COMMANDING_MODES
     if _idle and not safe:
         return 1
 
@@ -709,7 +738,7 @@ def main():
             pass
         return 0 if stop_and_record(actuator) is not False else 1
 
-    if current_mode() != "trigger":
+    if current_mode() not in COMMANDING_MODES:
         log("panel mode: the amplifier is not commanded; idling")
         # Not an error and not a restart loop -- the mode script restarts this
         # unit when the mode changes back.
@@ -718,7 +747,8 @@ def main():
         return 0 if stop_and_record(actuator) is not False else 1
 
     log("amplifier actuator: LCUS-2 channel %s at %s" % (channel, device))
-    levels = [Level(pcm, off) for pcm, off in SOURCES]
+    sources = sources_for(current_mode())
+    levels = [Level(pcm, off) for pcm, off in sources]
     for lv in levels:
         lv.start()
     on = False
@@ -729,7 +759,7 @@ def main():
     last_off_attempt = -1e9
     started_at = time.monotonic()
 
-    log("watching %s" % ", ".join(pcm for pcm, _ in SOURCES))
+    log("watching %s" % ", ".join(pcm for pcm, _ in sources))
     while not stopping.is_set():
         now = time.monotonic()
 

@@ -1,0 +1,23 @@
+# wall-audio-apply.service — one broker request, applied as root.
+#
+# Started by wall-audio-apply.path. Oneshot on purpose: a request is an event,
+# not a daemon, and a failed apply must be visible as a failed unit rather than
+# as a restart loop that eventually succeeds against a state nobody asked for.
+#
+# Deduplication is by the request's `seq`, in wall-audio-output, because the
+# path unit will fire again for a rewrite of an identical request and a replayed
+# rocker press would walk the volume down the room.
+
+[Unit]
+Description=Wall panel: apply the pending audio switch request
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wall-audio-output apply-request
+# The applier's journal lines are the switch's history; give them a name an
+# operator can grep for without knowing which unit ran the script.
+SyslogIdentifier=wall-audio-output
+StandardOutput=journal
+StandardError=journal

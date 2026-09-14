@@ -1,0 +1,77 @@
+# wall-spdif-in.service — the desktop's S/PDIF feed into the merged bus.
+#
+# THE SUCCESSOR TO wall-line-in.service (item 23 step 1, review finding 6). Same
+# adapter, same alsaloop, same guard; what changes is which side of the adapter
+# it captures and where it delivers:
+#   capture  the ONE 2-channel capture stream, selector on IEC958 In rather
+#            than Line -- which retires the 3.5 mm line-in by construction,
+#            because the selector holds one source at a time (measured
+#            2026-09-13, `PCM Capture Source` = Mic | Line | IEC958 In | Mixer)
+#   playback the bus, not the adapter, so Bluetooth and the kiosk can be heard
+#            at the same time (spec B)
+#
+# wall-line-in.service is left installed and simply not started in bus mode, so
+# `wall-audio-mode trigger` is still a complete rollback.
+#
+# THE DESKTOP'S CARRIER DROPS WHEN IT SLEEPS and the capture side xruns. That is
+# the item 25 failure in a new place, and it is answered the same way: the
+# bounded guard exits, Restart= brings the forwarder back, and the whole unit is
+# bound to the adapter's device alias.
+
+[Unit]
+Description=Wall panel: desktop S/PDIF in to the merged audio bus
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=sound.target
+Wants=sound.target
+# See wall-line-in.service: these are [Unit] keys, and the [Service] spelling is
+# accepted and then ignored, which reads exactly like working configuration.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+BindsTo=dev-wall_audio_adapter.device
+After=dev-wall_audio_adapter.device
+
+[Service]
+Type=simple
+# Bus mode only. A udev SYSTEMD_WANTS does not consult the mode, and starting
+# this in trigger mode would open a capture that trigger mode's graph does not
+# define. An ExecCondition refusal leaves the unit inactive and does NOT trigger
+# Restart=, which is the difference from a failing ExecStart.
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+Environment=WALL_AUDIO_ADAPTER_CARD=ICUSBAUDIO7D
+EnvironmentFile=-/etc/wall-panel/audio-cards.env
+# The selector is asserted here, not left to alsactl, because the USB card may
+# enumerate after alsa-restore has run. It is also the ONE line that retires the
+# analog line-in: whatever is on the 3.5 mm jack stops being captured now.
+ExecStartPre=/usr/bin/amixer -c ${WALL_AUDIO_ADAPTER_CARD} sset 'PCM Capture Source' 'IEC958 In'
+# S/PDIF arrives at digital full scale with no analog stage in front of it, so
+# the +4.4 dB of unsheddable analog gain that forced the line input to 0% does
+# not apply. The capture volume is left where alsactl has it; if the desktop
+# ever sends something hotter than 0 dBFS it is the desktop that is wrong.
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
+    --cdevice spdif_in \
+    --pdevice bus \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 30000 --sync 5
+Restart=always
+RestartSec=2
+# Desktop audio is the lip-sync-sensitive leg, so it keeps the line-in unit's
+# priority and its low latency request.
+Nice=-10
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=15
+LimitRTPRIO=15
+# Dropping the capability is what actually holds alsaloop below the kernel's
+# own threads; the rlimit alone does not, for a process with CAP_SYS_NICE.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+# dmix/dsnoop segments carry ipc_gid=audio, and root is still subject to SysV
+# IPC permission checks without CAP_IPC_OWNER.
+SupplementaryGroups=audio
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

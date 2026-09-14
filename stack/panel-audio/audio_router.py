@@ -22,8 +22,8 @@ import threading
 from typing import Callable, Mapping, Protocol
 
 from routing import (ALIAS, HARDWARE_ADDRESS, Device, MUTATING_METHODS,
-                     SELF_RECONCILING_METHODS, PolicyError, validate_action,
-                     validate_inventory_action)
+                     SELF_RECONCILING_METHODS, SWITCH_OUTPUTS, PolicyError,
+                     validate_action, validate_inventory_action)
 
 
 MAX_REQUEST_BYTES = 16_384
@@ -32,6 +32,9 @@ MAX_ID_CHARS = 64
 JS_SAFE_INTEGER = 9_007_199_254_740_991
 DEFAULT_BACKEND_TIMEOUT_SECONDS = 2.0
 MAX_BACKEND_WORKERS = 4
+# The status block that settles each self-reconciling method (see _reconcile).
+OBSERVABLE_BLOCK = {"set_mute": "mute", "set_output": "switch",
+                    "set_input_mute": "switch"}
 
 
 class Backend(Protocol):
@@ -320,6 +323,12 @@ class AudioBroker:
         method = self.state.pending_method
         if method not in SELF_RECONCILING_METHODS:
             raise BrokerError("mutation_uncertain", "previous mutation requires operator reconciliation")
+        # WHICH BLOCK COUNTS AS HAVING LOOKED depends on what was in flight. A
+        # lost `set_output` is not settled by reading the mute control: the
+        # switch has three positions and the mute block cannot express two of
+        # them. Reconciling on the wrong block would be the sticky-pending
+        # failure dressed up as an observation.
+        observable = OBSERVABLE_BLOCK[method]
         observed = self._backend_call("call", "status", {})
         self._ensure_safe_result("status", observed)
         # A VALID STATUS IS NOT AN OBSERVATION OF THE THING WE LOST. `mute` is
@@ -330,10 +339,11 @@ class AudioBroker:
         # would resume mutations claiming to know a state it never looked at.
         # Self-reconciling means the control could be READ, not merely that
         # something replied.
-        mute = observed.get("mute") if isinstance(observed, dict) else None
-        if not isinstance(mute, dict) or mute.get("supported") is not True:
+        block = observed.get(observable) if isinstance(observed, dict) else None
+        if not isinstance(block, dict) or block.get("supported") is not True:
             raise BrokerError("mutation_uncertain",
-                              "mute state could not be observed; reconciliation requires an operator")
+                              "%s state could not be observed; reconciliation requires an operator"
+                              % observable)
         self.state.resolve()
 
     def _backend_call(self, operation: str, method: str | None = None,
@@ -415,6 +425,31 @@ class AudioBroker:
         return {"id": request_id, "generation": generation, "ok": False,
                 "error": {"code": code, "message": message}}
 
+    # The status block that describes the panel's own Mute/Headset/Speaker
+    # switch (item 23 step 2). Optional for exactly the reason `mute` is: a
+    # panel with no switch, or a backend that predates one, must stay valid.
+    #
+    # `available` is what the red icon renders: false with output "headset"
+    # means the adapter is absent and every output is silent (Owner ruling 7),
+    # which the shell must show differently from "playing quietly". `reason` is
+    # a short enum-ish token, never a device name or a card id.
+    SWITCH_FIELDS = {"supported", "output", "inputMuted", "available", "reason", "volume"}
+
+    def _safe_switch(self, value: object) -> None:
+        """Validate the switch status block. Implements: SR-028, LLR-015."""
+        if not isinstance(value, dict) or set(value) != self.SWITCH_FIELDS:
+            raise BrokerError("unsafe_backend_result", "switch status is not exact")
+        if value["output"] not in SWITCH_OUTPUTS:
+            raise BrokerError("unsafe_backend_result", "switch output is invalid")
+        for field in ("supported", "inputMuted", "available"):
+            if not isinstance(value[field], bool):
+                raise BrokerError("unsafe_backend_result", "switch state is invalid")
+        if value["reason"] is not None:
+            self._safe_string(value["reason"], 32)
+        volume = value["volume"]
+        if isinstance(volume, bool) or not isinstance(volume, int) or not 0 <= volume <= 100:
+            raise BrokerError("unsafe_backend_result", "switch volume is invalid")
+
     def _ensure_safe_result(self, method: str, value: object) -> None:
         """Validate a positive, method-specific response schema."""
         if not isinstance(value, dict):
@@ -427,7 +462,7 @@ class AudioBroker:
             # muted". Making it required would have invalidated every existing
             # backend for a field most of them cannot answer.
             required = {"protocolVersion", "available", "reason", "devices", "route", "visualizer"}
-            if not required <= set(value) or set(value) - required - {"mute"}:
+            if not required <= set(value) or set(value) - required - {"mute", "switch"}:
                 raise BrokerError("unsafe_backend_result", "status fields are not exact")
             if value["protocolVersion"] != 1 or not isinstance(value["available"], bool):
                 raise BrokerError("unsafe_backend_result", "status version or availability is invalid")
@@ -451,6 +486,8 @@ class AudioBroker:
                     raise BrokerError("unsafe_backend_result", "mute status is invalid")
                 if not isinstance(mute["supported"], bool) or not isinstance(mute["muted"], bool):
                     raise BrokerError("unsafe_backend_result", "mute state is invalid")
+            if "switch" in value:
+                self._safe_switch(value["switch"])
         elif method == "telemetry":
             if value == {"available": False}:
                 return

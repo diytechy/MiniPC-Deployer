@@ -1,0 +1,30 @@
+# wall-audio-apply.path — the privilege boundary between the broker and the graph.
+#
+# The audio broker (stack/panel-audio, SR-023) runs as `panel` with
+# ProtectSystem=strict and AF_UNIX as its only address family: by design it can
+# neither write /etc nor speak to systemd. The triple switch on the glass still
+# has to move real units and real mixers, so the broker writes ONE request file
+# into its own runtime directory and this path unit runs the root applier.
+#
+# Nothing in the request names a unit, a card or a mixer control -- it carries a
+# sequence number and one of four event kinds, and wall-audio-output validates
+# both before policy sees them. That keeps IF-015's promise intact: the renderer
+# still cannot name hardware.
+#
+# PathChanged, not PathModified: systemd fires the former on close-write, so one
+# complete request produces one apply rather than one per write() the broker
+# happens to make.
+
+[Unit]
+Description=Wall panel: apply one audio switch request from the broker
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+
+[Path]
+PathChanged=/run/wall-audio-router/request.json
+# The broker's RuntimeDirectory disappears when it stops; systemd re-arms the
+# watch on the parent chain when it comes back, so this unit does not have to be
+# ordered after the broker or restarted with it.
+MakeDirectory=false
+
+[Install]
+WantedBy=multi-user.target

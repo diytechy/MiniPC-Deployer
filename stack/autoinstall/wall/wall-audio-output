@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""wall-audio-output — the one writer of the panel's audio switch state.
+
+THE THIN SHELL. Every decision lives in wall_audio_state (pure, unit-tested);
+this file only reads files, runs systemctl/amixer, writes the state atomically
+and journals one line per change. If you find yourself adding an `if` about
+what a mode MEANS, it belongs next door.
+
+WHY A ROOT HELPER AND NOT THE BROKER ITSELF. The audio broker
+(stack/panel-audio, SR-023) runs as `panel` under ProtectSystem=strict with
+AF_UNIX as its only address family: it can neither write /etc nor talk to
+systemd. So the broker writes a REQUEST into its own runtime directory and
+wall-audio-apply.path runs this script, as root, to answer it. The privilege
+boundary stays exactly where SR-023 put it, and the renderer still cannot name
+a unit, a card or a mixer control.
+
+Usage:
+  wall-audio-output status
+  wall-audio-output set {mute|headset|speaker}
+  wall-audio-output input-mute {on|off}
+  wall-audio-output volume {0..100|up|down}
+  wall-audio-output headset {add|remove}
+  wall-audio-output apply-state              # re-assert the stored state (boot, resume)
+  wall-audio-output apply-request [PATH]     # one broker request, deduplicated
+
+Options: --dry-run prints each privileged command instead of running it, and
+writes no file except a state file named explicitly with --state (the hermetic
+suite drives the whole applier that way; see save_state).
+
+Config:  /etc/wall-panel/audio-state.json   the state (this script owns it)
+         /etc/wall-panel/audio-mode         trigger|panel|bus; hardware is only
+                                            touched in `bus`
+         /etc/wall-panel/audio-cards.env    generated card map
+Exit:    0 applied (or nothing to do), 1 a refused/failed apply, 2 usage.
+Implements: SR-028, LLR-014
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wall_audio_state as policy  # noqa: E402  (path set above; installed side by side)
+
+# The one test seam in this script: the hermetic suite points it at a temp tree
+# so that running the REAL applier cannot read or write the panel's /etc.
+CONF_DIR = Path(os.environ.get("WALL_PANEL_CONF_DIR") or "/etc/wall-panel")
+STATE_FILE = CONF_DIR / "audio-state.json"
+MODE_FILE = CONF_DIR / "audio-mode"
+CARDS_FILE = CONF_DIR / "audio-cards.env"
+RUN_DIR = Path("/run/wall-panel")
+# Resolved at apply time and read by wall-bus-headset.service through
+# EnvironmentFile=, because the headset card's id is the generic "Device" and
+# ALSA configuration cannot look a card up by USB id.
+HEADSET_ENV = RUN_DIR / "audio-headset.env"
+DEFAULT_REQUEST = Path("/run/wall-audio-router/request.json")
+
+# Measured 2026-09-13: the headset adapter is 0d8c:0014 ("Device"), the 5.1
+# adapter 0d8c:0102 (ICUSBAUDIO7D). The USB id is matched rather than the card
+# id because "Device" is what the kernel calls ANY nameless C-Media adapter.
+HEADSET_USB_ID = "0d8c:0014"
+PROC_ASOUND = Path("/proc/asound")
+# The softvol control created by asound-bus-mode.conf. It lives on the Loopback
+# card, which is always present, so the level survives a leg being stopped.
+BUS_CONTROL = "Bus"
+
+
+def log(message):
+    """One line to the journal. stderr, so systemd stamps the unit identity."""
+    print(message, file=sys.stderr, flush=True)
+
+
+def read_env(path, key, default):
+    """One KEY=value out of a generated env file, or the default."""
+    try:
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith(key + "="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if value:
+                    return value
+    except OSError:
+        pass
+    return default
+
+
+def current_mode():
+    """trigger | panel | bus. A missing file means trigger, as it always has."""
+    try:
+        value = MODE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "trigger"
+    return value if value in ("trigger", "panel", "bus") else "trigger"
+
+
+def headset_card(proc_asound=PROC_ASOUND):
+    """The ALSA card id of the headset adapter, or None if it is not plugged in.
+
+    /proc/asound/card*/usbid carries "0d8c:0014" for exactly this device; the
+    card id is the name of the symlink that points at that directory. This is
+    the only place the panel decides which card is the headset, and it is
+    recomputed on every apply -- a re-enumeration can change the index and, on
+    a panel with a second nameless adapter, even the id (Device, Device_1).
+    """
+    try:
+        entries = sorted(Path(proc_asound).glob("card*/usbid"))
+    except OSError:
+        return None
+    for usbid in entries:
+        try:
+            if usbid.read_text(encoding="utf-8").strip().lower() != HEADSET_USB_ID:
+                continue
+        except OSError:
+            continue
+        index = usbid.parent.name.replace("card", "")
+        for link in Path(proc_asound).iterdir():
+            # /proc/asound/<id> is a symlink to card<N>; resolve by target.
+            if link.is_symlink() and link.resolve().name == "card" + index:
+                return link.name
+        return None
+    return None
+
+
+class Applier:
+    """Runs (or, with dry_run, prints) the privileged half of one apply."""
+
+    def __init__(self, dry_run=False, run=subprocess.run):
+        self.dry_run = dry_run
+        self._run = run
+        self.commands = []
+
+    def command(self, argv, required=True):
+        """Run one command. `required` False means a failure is logged, not fatal."""
+        self.commands.append(list(argv))
+        if self.dry_run:
+            print(" ".join(argv))
+            return 0
+        try:
+            done = self._run(argv, check=False, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log("FAILED: %s: %s" % (" ".join(argv), exc))
+            return 1 if required else 0
+        if done.returncode != 0:
+            detail = (done.stderr or done.stdout or "").strip().splitlines()
+            log("%s: %s: %s" % ("FAILED" if required else "note",
+                                " ".join(argv), detail[0] if detail else "no detail"))
+            return 1 if required else 0
+        return 0
+
+
+def write_atomic(path, text, mode=0o644, dry_run=False):
+    """Replace a file in one rename, so no reader ever sees half a state.
+
+    The state file is read by the amplifier detector and by the broker's status
+    path while it is being written; a truncate-then-write would hand them an
+    empty output field, which `normalize` would answer with `speaker` -- audio
+    in the room at a moment nobody asked for it.
+    """
+    if dry_run:
+        print("write %s" % path)
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".new")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def load_state(path=STATE_FILE):
+    """The stored state, normalized. A missing or unreadable file is the default.
+
+    Returns (state, note) where note is a journal line when the file had to be
+    replaced -- a state file that silently reverted to speaker at full level is
+    exactly the kind of change the Owner must be able to find afterwards.
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return policy.default_state(), "no state file yet; defaults applied"
+    except (OSError, ValueError) as exc:
+        return policy.default_state(), "state file unusable (%s); defaults applied" % exc
+    state = policy.normalize(raw)
+    if state != policy.normalize(state):  # pragma: no cover - normalize is idempotent
+        return state, "state file normalized"
+    return state, None
+
+
+def save_state(state, path=STATE_FILE, dry_run=False):
+    """Persist the state. A dry run still writes a state file it was GIVEN.
+
+    --dry-run suppresses the privileged half -- systemctl, amixer, /run -- and
+    nothing else, so that a test can drive a sequence of real requests through
+    the real applier and read back what each one decided. Writing the PANEL's
+    own state file from a dry run would defeat the word, so that one alone is
+    refused, out loud.
+    """
+    if dry_run and Path(path) == STATE_FILE:
+        print("write %s (suppressed: --dry-run on the live state file)" % path)
+        return
+    write_atomic(path, json.dumps(state, indent=2, sort_keys=True) + "\n", mode=0o644)
+
+
+def apply_plan(state, applier):
+    """Make the world match `state`. Returns the number of failures.
+
+    ORDER MATTERS AND IT IS: stop, mute, re-point, unmute, start, level.
+    Stopping first means the adapter is never fed by two legs at once; muting
+    before the legs move means the switch does not click through the
+    amplifier; the level is set LAST because the softvol control does not
+    exist until something has opened the PCM that declares it.
+    """
+    failures = 0
+    wanted = policy.plan(state)
+    adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
+    loopback = read_env(CARDS_FILE, "WALL_AUDIO_LOOPBACK_CARD", "Loopback")
+    headset = headset_card()
+
+    # The resolved headset card, for the headset leg's alsaloop. Written even
+    # when the adapter is absent (as an empty value) so that a stale card id
+    # from the last plug cannot be picked up by the next start.
+    write_atomic(HEADSET_ENV, "WALL_AUDIO_HEADSET_CARD=%s\n" % (headset or ""),
+                 mode=0o644, dry_run=applier.dry_run)
+
+    for unit, should_run in wanted["legs"].items():
+        if not should_run:
+            failures += applier.command(["/usr/bin/systemctl", "stop", unit])
+    # Mixer mutes are not required: a card that has just been unplugged has no
+    # controls to set, and that is the normal headset case, not an error.
+    applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",
+                     "mute" if wanted["adapter_muted"] else "unmute"], required=False)
+    if headset:
+        applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Speaker",
+                         "mute" if wanted["headset_muted"] else "unmute"], required=False)
+        applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
+                         "nocap" if wanted["input_muted"] else "cap"], required=False)
+    for unit, should_run in wanted["legs"].items():
+        if should_run:
+            failures += applier.command(["/usr/bin/systemctl", "start", unit])
+    applier.command(["/usr/bin/amixer", "-c", loopback, "-q", "sset", BUS_CONTROL,
+                     "%d%%" % wanted["volume"]], required=False)
+    if wanted["reason"]:
+        log("output %s is UNAVAILABLE (%s): every output silent"
+            % (state["output"], wanted["reason"]))
+    return failures
+
+
+def event_from_arguments(arguments):
+    """Turn the parsed command line into one wall_audio_state event, or None.
+
+    None means "apply what is stored" -- boot, resume and a manual re-assert
+    all take that path, and none of them is allowed to invent a state change.
+    """
+    if arguments.command == "set":
+        return {"kind": "set_output", "output": arguments.value}
+    if arguments.command == "input-mute":
+        return {"kind": "set_input_mute", "muted": arguments.value == "on"}
+    if arguments.command == "volume":
+        if arguments.value in ("up", "down"):
+            return {"kind": "nudge_volume", "louder": arguments.value == "up"}
+        return {"kind": "set_volume", "level": int(arguments.value)}
+    if arguments.command == "headset":
+        return {"kind": "headset", "present": arguments.value == "add"}
+    return None
+
+
+ALLOWED_REQUEST_KINDS = frozenset(
+    {"set_output", "set_input_mute", "set_volume", "nudge_volume"})
+
+
+def read_request(path, last_seq=-1):
+    """One validated, deduplicated broker request, or None.
+
+    The request file is written by a LESS privileged process, so it is treated
+    as input from outside: the envelope is checked here, the contents are
+    checked by policy, and `headset` is refused outright -- adapter presence is
+    the kernel's fact to report, not the renderer's.
+
+    Deduplication is by a monotonic `seq` against the last one recorded in the
+    state: systemd.path fires on close-write, and an identical re-write of an
+    unchanged request must not replay a rocker press.
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        log("request unusable: %s" % exc)
+        return None
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        log("request refused: unknown envelope")
+        return None
+    seq = raw.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        log("request refused: seq must be a non-negative integer")
+        return None
+    if seq <= last_seq:
+        return None
+    event = raw.get("event")
+    if not isinstance(event, dict) or event.get("kind") not in ALLOWED_REQUEST_KINDS:
+        log("request refused: unknown event kind")
+        return None
+    return seq, event
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="panel audio output switch")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the privileged commands; change nothing")
+    parser.add_argument("--state", default=str(STATE_FILE))
+    parser.add_argument("command", choices=("status", "set", "input-mute", "volume",
+                                            "headset", "apply-state", "apply-request"))
+    parser.add_argument("value", nargs="?")
+    arguments = parser.parse_args(argv)
+
+    expects_value = {"set": policy.OUTPUTS, "input-mute": ("on", "off"),
+                     "headset": ("add", "remove")}
+    if arguments.command in expects_value:
+        if arguments.value not in expects_value[arguments.command]:
+            parser.error("%s takes one of %s"
+                         % (arguments.command, "|".join(expects_value[arguments.command])))
+    if arguments.command == "volume":
+        if arguments.value is None or (arguments.value not in ("up", "down")
+                                       and not arguments.value.isdigit()):
+            parser.error("volume takes 0..100, up or down")
+
+    state, note = load_state(arguments.state)
+    if note:
+        log(note)
+
+    if arguments.command == "status":
+        print(json.dumps({"mode": current_mode(), "state": state,
+                          "plan": policy.plan(state),
+                          "headset_card": headset_card()}, indent=2, sort_keys=True))
+        return 0
+
+    seq = None
+    if arguments.command == "apply-request":
+        request = read_request(arguments.value or DEFAULT_REQUEST,
+                               state.get("request_seq", -1))
+        if request is None:
+            return 0
+        seq, event = request
+    else:
+        event = event_from_arguments(arguments)
+
+    if event is not None:
+        try:
+            state, lines = policy.apply_event(state, event)
+        except policy.StateError as exc:
+            log("refused: %s" % exc)
+            return 1
+        for line in lines:
+            log(line)
+        if seq is not None:
+            # Recorded in the SAME atomic write as the change it caused: a seq
+            # that survived while its effect did not would swallow the retry.
+            state["request_seq"] = seq
+        save_state(state, arguments.state, dry_run=arguments.dry_run)
+
+    mode = current_mode()
+    if mode != "bus":
+        # The state is still recorded: the Owner may set the switch while the
+        # panel is in the old trigger chain, and `wall-audio-mode bus` applies
+        # it on arrival. Touching mixers or units here would fight that chain.
+        log("mode is %s, not bus: state recorded, hardware untouched" % mode)
+        return 0
+    failures = apply_plan(state, Applier(dry_run=arguments.dry_run))
+    if failures:
+        log("apply finished with %d failure(s): audio may be wrong" % failures)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through main()
+    try:
+        sys.exit(main())
+    except BrokenPipeError:  # pragma: no cover
+        os._exit(errno.EPIPE)

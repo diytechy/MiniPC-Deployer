@@ -734,6 +734,19 @@ pcm.card_loop_cap { type hw
     device 1
     subdevice 0
 }
+pcm.card_loop_tap_play { type hw
+    card "$_loopback"
+    device 0
+    subdevice 1
+}
+pcm.card_loop_tap_cap { type hw
+    card "$_loopback"
+    device 1
+    subdevice 1
+}
+ctl.card_loop_ctl { type hw
+    card "$_loopback"
+}
 ctl.card_usb_ctl { type hw
     card "$_adapter"
 }
@@ -755,7 +768,7 @@ if [ ! -d "/proc/asound/$_adapter" ]; then
     warn "audio: the line input and the amplifier feed will not work until it is."
 fi
 
-for _f in asound-trigger-mode.conf asound-panel-mode.conf; do
+for _f in asound-trigger-mode.conf asound-panel-mode.conf asound-bus-mode.conf; do
     if [ -f "$PAYLOAD/$_f" ]; then
         install -m 0644 "$PAYLOAD/$_f" "/etc/wall-panel/$_f"
     else
@@ -813,13 +826,24 @@ if [ -f "$PAYLOAD/91-wall-usb-hub-reset.rules" ]; then
     # run on a FUTURE add, and triggering it now would start a reset watch
     # against a hub that is working.
 fi
+# The headset adapter is a SECOND device alias (item 23 step 2): its arrival is
+# the one-shot speaker -> headset switch, and its departure is what stops the
+# headset leg. Separate from the 5.1 adapter's rule so a headset replug cannot
+# cycle the amplifier units.
+if [ -f "$PAYLOAD/91-wall-headset-adapter.rules" ]; then
+    install -m 0644 "$PAYLOAD/91-wall-headset-adapter.rules"         /etc/udev/rules.d/91-wall-headset-adapter.rules
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=sound >/dev/null 2>&1 || true
+fi
 if [ -f "$PAYLOAD/99-wall-amp-lcus2.rules" ]; then
     install -m 0644 "$PAYLOAD/99-wall-amp-lcus2.rules" /etc/udev/rules.d/99-wall-amp-lcus2.rules
     udevadm control --reload-rules >/dev/null 2>&1 || true
     udevadm trigger --subsystem-match=tty >/dev/null 2>&1 || true
 fi
 
-for _f in panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py wall-usb-hub-reset.py; do
+# wall_audio_state.py is the applier's pure core and is imported from beside
+# it, so the two must land in the SAME directory or the switch cannot start.
+for _f in panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py wall-usb-hub-reset.py wall_audio_state.py; do
     if [ -f "$PAYLOAD/$_f" ]; then
         install -m 0755 "$PAYLOAD/$_f" "/usr/local/lib/wall-panel/$_f"
     else
@@ -834,8 +858,17 @@ if [ ! -x /usr/local/lib/wall-panel/wall-alsaloop-guard.py ]; then
 fi
 
 [ -f "$PAYLOAD/wall-audio-mode" ] && install -m 0755 "$PAYLOAD/wall-audio-mode" /usr/local/sbin/wall-audio-mode
+# The switch applier. It imports wall_audio_state, which firstboot puts in
+# /usr/local/lib/wall-panel, so the script is installed with a symlink there
+# rather than copied into sbin on its own.
+if [ -f "$PAYLOAD/wall-audio-output" ]; then
+    install -m 0755 "$PAYLOAD/wall-audio-output" /usr/local/lib/wall-panel/wall-audio-output
+    ln -sfn /usr/local/lib/wall-panel/wall-audio-output /usr/local/sbin/wall-audio-output
+else
+    warn "audio: wall-audio-output is not on the payload — the Mute/Headset/Speaker switch cannot be applied."
+fi
 
-for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service; do
+for _u in wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service           wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-headset-present.service           wall-audio-state.service wall-audio-apply.service wall-audio-apply.path; do
     [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
 done
 # The hub reset is a TEMPLATE started by udev, so it is never enabled and has no

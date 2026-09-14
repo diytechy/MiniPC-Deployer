@@ -1,0 +1,48 @@
+# wall-speaker-out.service — the switch on Speaker: tap to the amplifier.
+#
+# THE OTHER HALF OF THE SPEAKER LEG (see wall-bus-speaker.service for why there
+# are two). This one carries the volume control: its playback PCM is
+# `speaker_out`, the softvol declared in asound-bus-mode.conf whose control
+# lives on the always-present Loopback card.
+#
+# STEP 3 CHANGES THIS UNIT AND NOTHING ELSE. Today speaker_out is a plug onto
+# the adapter's default 2-channel open, so front out carries stereo. The
+# center/sub work (D4, superseded item 17) opens the adapter's 8-channel mode
+# and routes (L+R)/2 to FC and LFE with a per-channel trim, inside speaker_out.
+# The measured altsets are on the panel: 2/4/6/8 channels at 44.1 and 48 kHz,
+# map FL FR FC LFE RL RR SL SR.
+#
+# NOT ENABLED: wall-audio-output owns when it runs.
+
+[Unit]
+Description=Wall panel: speaker tap to the amplifier feed (switch position Speaker)
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target
+Wants=sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+BindsTo=dev-wall_audio_adapter.device
+After=dev-wall_audio_adapter.device
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
+    --cdevice speaker_tap \
+    --pdevice speaker_out \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 30000 --sync 5
+Restart=always
+RestartSec=2
+Nice=-5
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=15
+LimitRTPRIO=15
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+SupplementaryGroups=audio
+StandardOutput=journal
+StandardError=journal

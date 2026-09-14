@@ -1,0 +1,33 @@
+# wall-headset-present.service — the headset adapter's presence, as an event.
+#
+# D5 AS AMENDED (review finding 1): the trigger is the ADAPTER enumerating, not
+# a cable. 0d8c:0014 is a USB audio-class device whose mixer carries Speaker,
+# Mic and Auto Gain Control and no jack detection at all (measured on the panel
+# 2026-09-13), so "a headset is plugged into it" is not a fact this panel can
+# observe. Its presence on the USB bus is.
+#
+# HOW THE ONE-SHOT IS BUILT: 91-wall-headset-adapter.rules gives the card a
+# port-independent alias and wants this unit; BindsTo means the kernel's remove
+# event STOPS it, and ExecStop is therefore the remove notification. The latch
+# that keeps the speaker -> headset switch to once per plug lives in
+# wall_audio_state, not here -- this unit only reports what the kernel saw.
+#
+# RemainAfterExit is what makes the stop half exist: without it the unit would
+# finish immediately and there would be nothing left for the remove event to
+# stop.
+
+[Unit]
+Description=Wall panel: report USB headset adapter presence to the audio switch
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target
+BindsTo=dev-wall_headset_adapter.device
+After=dev-wall_headset_adapter.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wall-audio-output headset add
+ExecStop=/usr/local/sbin/wall-audio-output headset remove
+SyslogIdentifier=wall-audio-output
+StandardOutput=journal
+StandardError=journal

@@ -5,8 +5,10 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 
@@ -410,12 +412,14 @@ def test_firstboot_payload_files_are_all_tracked_and_shipped():
     wall-amp-trigger.service and wall-line-in.service among others -- firstboot
     skipped every one of them without a word.
 
-    REFERENCES ARE RESOLVED, NOT PATTERN-MATCHED. `$PAYLOAD/$_f` is worthless
-    on its own, and `$PAYLOAD/../../panel-audio/$_wall_audio_file` reaches OUT
-    of the wall directory entirely; a first cut of this test captured one path
-    component, saw that one as `..` and threw it away, which quietly excused
-    the whole cross-directory class. Every loop variable is substituted from
-    its own `for` line and every path is normalised against the repo root.
+    REFERENCES ARE RESOLVED, NOT PATTERN-MATCHED, AND EVERY LOOP COUNTS.
+    `$PAYLOAD/$_f` is worthless on its own; `$PAYLOAD/../../panel-audio/$_wall_
+    audio_file` reaches OUT of the wall directory; and `_f` is REUSED -- once
+    for the three asound-*-mode.conf files and again for the helper scripts --
+    so a dictionary keyed on the name alone silently drops whichever loop came
+    first. Both mistakes were made and caught in review. Every `for` line for a
+    name contributes its words, every path is normalised against the repo root,
+    and a shape that cannot be resolved FAILS rather than being skipped.
     """
     import posixpath
     import re
@@ -427,9 +431,8 @@ def test_firstboot_payload_files_are_all_tracked_and_shipped():
 
     loops = {}
     for match in re.finditer(r"for (_[A-Za-z0-9_]+) in ([^;\n]+); do", firstboot):
-        words = [w for w in match.group(2).split() if not w.startswith("$")]
-        if words:
-            loops[match.group(1)] = words
+        words = [w for w in match.group(2).split() if "$" not in w]
+        loops.setdefault(match.group(1), []).extend(words)
 
     base = "stack/autoinstall/wall"
     refs, unresolved = set(), set()
@@ -438,7 +441,7 @@ def test_firstboot_payload_files_are_all_tracked_and_shipped():
         variables = re.findall(r"\$(_[A-Za-z0-9_]+)", raw)
         expansions = [raw]
         for var in variables:
-            if var not in loops:
+            if not loops.get(var):
                 unresolved.add(raw)
                 expansions = []
                 break
@@ -465,9 +468,13 @@ def test_firstboot_payload_files_are_all_tracked_and_shipped():
     )
     # Spot checks that the resolution above is actually finding things, so a
     # future refactor of firstboot cannot turn this into a test of nothing:
-    # literals, one word from each bulk loop, and the cross-directory form.
+    # literals, a word from EACH of the two `_f` loops and from the `_u` loop,
+    # and the cross-directory form.
     assert {
         base + "/91-wall-usb-hub-reset.rules",
+        base + "/asound-bus-mode.conf",
+        base + "/asound-trigger-mode.conf",
+        base + "/asound-panel-mode.conf",
         base + "/wall-alsaloop-guard.py",
         base + "/wall_audio_state.py",
         base + "/wall-amp-trigger.service",
@@ -500,3 +507,66 @@ def test_firstboot_refuses_to_call_an_unapplied_audio_mode_a_success():
     # The success lines are inside the helper's post-success loop, not printed
     # unconditionally the way the trigger arm used to print them.
     assert 'for line in "$@"; do log "$line"; done' in body
+    # AND THE HELPER NEVER RETURNS NONZERO. firstboot is `set -euo pipefail`
+    # and every arm calls this as a bare simple command, so a `return 1` after
+    # fail_step would kill the script on the spot instead of recording the
+    # failure and carrying on to media sync, the brokers and the red summary.
+    assert "return 1" not in body, (
+        "apply_audio_mode returns nonzero under set -e from an unguarded call "
+        "site: a failed mode apply would abort the rest of firstboot"
+    )
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_apply_audio_mode_records_failure_and_lets_firstboot_continue():
+    """Run the real helper under `set -euo pipefail` and watch what happens.
+
+    Reading the source is how the `return 1` got there in the first place. This
+    executes the function's three paths -- applier missing, applier failing,
+    applier succeeding -- from an unguarded call site in an errexit shell, and
+    asserts the script reaches its own end each time.
+    """
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    start = firstboot.index("apply_audio_mode() {")
+    helper = firstboot[start:firstboot.index("\n}\n", start) + 3]
+
+    harness = """set -euo pipefail
+PROVISION_FAILED=0
+PAYLOAD=/payload
+log()  { echo "LOG $*"; }
+warn() { echo "WARN $*"; }
+fail_step() { PROVISION_FAILED=1; echo "ERROR $*" >&2; }
+%s
+apply_audio_mode %s "success line one" "success line two"
+echo "REACHED_END failed=$PROVISION_FAILED"
+"""
+
+    def run(mode, applier_body):
+        with tempfile.TemporaryDirectory() as tmp:
+            if applier_body is not None:
+                stub = Path(tmp) / "wall-audio-mode"
+                stub.write_text("#!/bin/sh\n" + applier_body, encoding="utf-8")
+                stub.chmod(0o755)
+            # The helper hard-codes the applier's absolute path, so the stub is
+            # bound in by rewriting that one literal to a path in the cwd --
+            # which keeps the script POSIX on a Windows dev box too.
+            script = (harness % (helper, mode)).replace(
+                "/usr/local/sbin/wall-audio-mode", "./wall-audio-mode")
+            return subprocess.run(["bash", "-c", script], cwd=tmp,
+                                  capture_output=True, text=True)
+
+    missing = run("bus", None)
+    assert "REACHED_END failed=1" in missing.stdout, missing
+    assert "was NOT applied" in missing.stderr
+    assert "success line one" not in missing.stdout
+
+    failed = run("bus", "exit 3\n")
+    assert "REACHED_END failed=1" in failed.stdout, failed
+    assert "may be HALF applied" in failed.stderr
+    assert "success line one" not in failed.stdout
+
+    ok = run("bus", "exit 0\n")
+    assert "REACHED_END failed=0" in ok.stdout, ok
+    assert ok.stderr.strip() == ""
+    assert "LOG success line one" in ok.stdout
+    assert "LOG success line two" in ok.stdout

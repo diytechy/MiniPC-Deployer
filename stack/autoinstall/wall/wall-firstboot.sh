@@ -1010,7 +1010,12 @@ esac
 # That is the exact failure the bus arm was added to prevent (measured
 # 2026-09-14 00:06 as audible distortion), so it cannot be reported as success.
 # fail_step does not abort the boot: the kiosk still comes up, the unit goes
-# red, and the marker is withheld.
+# red, and the marker is withheld. THAT IS WHY THIS HELPER ALWAYS RETURNS 0.
+# The script runs under `set -euo pipefail` and every arm calls this as a bare
+# simple command, so a `return 1` here would kill firstboot on the spot --
+# skipping media sync, the door and audio brokers, Bluetooth, the touch filter
+# and the final red summary itself -- which is the opposite of recording a
+# failure and carrying on.
 #
 # An absent or non-executable applier is the same failure wearing a different
 # hat, and used to be SILENT: the arm's `if [ -x ]` simply fell through while
@@ -1019,11 +1024,11 @@ apply_audio_mode() {
     local mode="$1"; shift
     if [ ! -x /usr/local/sbin/wall-audio-mode ]; then
         fail_step "audio: /usr/local/sbin/wall-audio-mode is missing or not executable, so WALL_AUDIO_MODE=$mode was NOT applied. Whatever chain the panel came up in is what it is running, which may not be the one wall.env names. Check $PAYLOAD/wall-audio-mode reached the payload."
-        return 1
+        return 0
     fi
     if ! /usr/local/sbin/wall-audio-mode "$mode" >/dev/null 2>&1; then
         fail_step "audio: \`wall-audio-mode $mode\` FAILED. The switch may be HALF applied (mode file and symlink moved, legs not), which can leave two chains driving one adapter. Re-run by hand and read its output: sudo /usr/local/sbin/wall-audio-mode $mode"
-        return 1
+        return 0
     fi
     local line
     for line in "$@"; do log "$line"; done

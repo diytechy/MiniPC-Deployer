@@ -155,6 +155,13 @@ def normalize(raw):
             # bool is an int in Python and True would become 1%: refuse it.
             if isinstance(level, int) and not isinstance(level, bool):
                 state["volume"][output] = clamp_volume(level)
+                # A CLAMP IS A REPAIR (terra, round 3). `{"speaker": 101}` came
+                # back as 100 and stayed UNMUTED, which is the rule this
+                # function claims to follow failing on its own boundary -- and
+                # the applier journals exactly this case as "repaired", so the
+                # two halves were already disagreeing in the log.
+                if state["volume"][output] != level:
+                    repaired = True
             elif output in volume:
                 repaired = True
     elif "volume" in raw:

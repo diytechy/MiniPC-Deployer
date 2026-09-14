@@ -813,12 +813,22 @@ tonight**, on a risk nobody has yet observed. The existing acceptance check 11
 legs, and the recovery is one line that does not need this design to change:
 
 ```sh
-sudo systemctl restart wall-speaker-out wall-mic-rear    # or: sudo wall-audio-mode bus
+sudo systemctl restart wall-speaker-out wall-mic-rear    # cheap; fixes a wedged client only
+sudo wall-audio-mode bus                                 # the REAL recovery: it sweeps the IPC
 ```
 
 If S4-16 reproduces it, the fix belongs in `wall-audio-resume.service` as a
 restart of the legs rather than a start, and it should be made for **all** the
 legs at once rather than for the mic ones only.
+
+**And the recovery is the second line, not the first** (terra, round 3, and it
+was right to call the first one out). Restarting the clients cannot establish
+that a stale `usb_out_mix` SysV segment has been removed: only `clear_ipc` in
+`wall-audio-mode` sweeps unattached segments, and no leg restart calls it. So
+`sudo wall-audio-mode bus` is the real recovery, and it is a **whole-chain mode
+transition** with everything that implies, not a harmless one-liner. The leg
+restart is worth trying first only because it is cheaper and will fix the
+simpler failure, and S4-16 says so rather than promising it.
 
 ### The AEC seam, which is the whole reason `mic_selected` exists
 
@@ -938,7 +948,7 @@ amixer -c ICUSBAUDIO7D cget numid=8        # expect 66,66,24,24,66,66,24,24
 | S4-12 | Reboot and watch the first two minutes | `systemctl status wall-firstboot` green, not timed out; the speaker leg starts as before; no new underrun burst; the mic legs come up with the stored position |
 | S4-13 | `sudo wall-audio-mode trigger` | **everything** stops, mic legs included, and the old chain is back. Then `sudo wall-audio-mode bus` to return |
 | S4-14 | **The latency measurement, and it gates the step.** With the desktop playing video over S/PDIF on Speaker, ask the Owner about lip-sync, before and after. Also `journalctl -u wall-speaker-out --since -10min` while music plays | the Owner hears **no new lip-sync error** and there is **no underrun burst**. The shared dmix added a 170 ms ring the raw open did not have; how much of it becomes delay is unmeasured. If it reads wrong, `buffer_size` on `usb_out_mix` is the first number to move, then `wall-spdif-in`'s `--tlatency`, and S3-9's underrun watch must be repeated after either |
-| S4-16 | **Sleep and wake, with the mic legs up.** `sudo systemctl suspend`, wake it, then play music on Speaker and talk | audio in the room, and the microphone still reaching the desktop's input, **without a manual restart**. This is the shared-dmix-across-suspend risk review flagged and nobody has yet observed; if it fails, `sudo systemctl restart wall-speaker-out wall-mic-rear` recovers it, and that is the evidence the resume unit needs changing for every leg |
+| S4-16 | **Sleep and wake, with the mic legs up.** `sudo systemctl suspend`, wake it, then play music on Speaker and talk | audio in the room, and the microphone still reaching the desktop's input, **without a manual restart**. This is the shared-dmix-across-suspend risk review flagged and nobody has yet observed; if it fails, try `sudo systemctl restart wall-speaker-out wall-mic-rear` first and `sudo wall-audio-mode bus` if that does not do it (only the mode switch sweeps the dmix's IPC segment; a leg restart cannot). Either way that is the evidence the resume unit needs changing for every leg |
 | S4-15 | **A privacy check worth doing once.** `sudo wall-audio-output input-mute on`, then `sudo systemctl restart wall-bt-mic` | the leg comes up and **refuses to open a microphone**: `journalctl -u wall-bt-mic` shows it polling and starting nothing. This is the fail-open review found, and the supervisor now re-reads the switch state on every poll rather than trusting that a stop reached it |
 
 ### If anything in S4-1 to S4-13 fails

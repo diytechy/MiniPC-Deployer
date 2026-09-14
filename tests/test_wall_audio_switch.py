@@ -2247,3 +2247,85 @@ def test_set_rear_level_reports_what_actually_happened_sr029(applier):
         return _Reply(0, raised)
 
     assert applier.set_rear_level(applier.Applier(run=accept), "ICUSBAUDIO7D", 0) is True
+
+
+# ── review round 3: the gate's own fail-open, and two boundaries ───────────
+
+@pytest.mark.parametrize("content", ["", "not json", "{oops", '{"input_muted": "yes"}',
+                                     "[]", '{"output": 12}'])
+def test_the_applier_gate_refuses_a_damaged_state_too_sr029(applier, tmp_path, content):
+    """It used load_state, which exists to keep AUDIO working, not a microphone.
+
+    load_state turns an unreadable or unparseable file into `default_state()` --
+    Speaker, UNMUTED -- so the gate exited 0 and started a real forwarder off a
+    corrupt file while claiming "every failure answers 1". It also disagreed with
+    the Bluetooth supervisor, which parses the document itself (terra, round 3).
+    """
+    state = tmp_path / "audio-state.json"
+    state.write_text(content, encoding="utf-8")
+    assert applier.main(["--state", str(state), "mic-allowed"]) == 1
+
+
+def test_both_gates_answer_the_same_for_every_state_sr029(applier, tmp_path):
+    """Two gates on one privacy control must not be able to disagree."""
+    btmic_module = load(BT_MIC, "wall_bt_mic_agree")
+    state = tmp_path / "audio-state.json"
+    cases = [
+        None,                                             # missing
+        "", "not json", "{oops",                          # unparseable
+        "[]", '{"output": 12}', '{"input_muted": "yes"}',  # damaged
+        '{"volume": {"speaker": 101}}',                   # clamped
+        '{"output": "speaker", "input_muted": false}',    # clean, allowed
+        '{"output": "speaker", "input_muted": true}',     # clean, muted
+        '{"output": "headset", "input_muted": false, "headset_present": false}',
+    ]
+    for content in cases:
+        if content is None:
+            state.unlink(missing_ok=True)
+        else:
+            state.write_text(content, encoding="utf-8")
+        gate = applier.main(["--state", str(state), "mic-allowed"]) == 0
+        supervisor = btmic_module.mic_allowed(state)
+        assert gate is supervisor, "the two gates disagree about %r" % content
+
+
+@pytest.mark.parametrize("stored,expected_level,muted", [
+    (101, 100, True),
+    (-1, 0, True),
+    (100, 100, False),
+    (0, 0, False),
+    (60, 60, False),
+])
+def test_a_clamped_volume_counts_as_a_repair_sr029(policy, stored, expected_level, muted):
+    """The rule failed on its own boundary (terra, round 3).
+
+    `{"speaker": 101}` came back as 100 and stayed UNMUTED, while the applier
+    journaled the same document as repaired -- so the two halves already
+    disagreed in the log about whether anything had been replaced.
+    """
+    state = policy.normalize({"output": "speaker", "input_muted": False,
+                              "volume": {"speaker": stored, "headset": 60}})
+    assert state["volume"]["speaker"] == expected_level
+    assert state["input_muted"] is muted
+
+
+def test_a_mode_switch_refuses_while_a_microphone_is_still_running_sr029():
+    """Every other leg surviving a stop is a wrong noise. This one is a live mic.
+
+    A mode switch changes the ALSA chain, but an already-open client keeps the
+    graph it opened with -- so a surviving wall-mic-rear goes on sending the room
+    to the desktop's input in a mode whose whole point is that the audio work was
+    rolled back.
+    """
+    text = read(WALL / "wall-audio-mode")
+    assert "stop_mic_legs_or_refuse()" in text
+    # It runs BEFORE anything else in the mode switch moves.
+    body = text.split("  trigger|panel|bus)", 1)[1]
+    assert body.index("stop_mic_legs_or_refuse") < body.index("remember_active")
+    # It escalates rather than noting a failure and carrying on, and it aborts.
+    helper = text.split("stop_mic_legs_or_refuse() {", 1)[1].split("\n}", 1)[0]
+    assert "is-active" in helper
+    assert "kill" in helper
+    assert "return 1" in helper
+    assert "REFUSING" in helper
+    assert "stop_mic_legs_or_refuse || exit 1" in text

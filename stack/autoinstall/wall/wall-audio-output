@@ -1244,16 +1244,29 @@ def mic_allowed_command(arguments):
     # `systemctl start` on either mic leg the file is there. This gate and the
     # Bluetooth supervisor's own therefore answer identically in every case --
     # two gates on one privacy control must not be able to disagree.
-    if not Path(arguments.state).exists():
+    # IT DOES NOT USE load_state, AND THAT IS THE WHOLE POINT (terra, round 3).
+    # `load_state` exists to keep the panel working: it converts a missing,
+    # unreadable or unparseable file into `default_state()`, which is Speaker,
+    # UNMUTED. That is right for audio and exactly wrong here -- it would have
+    # started a real microphone forwarder off a corrupt file while claiming
+    # "every failure answers 1", and it would have disagreed with the Bluetooth
+    # supervisor, which parses the document itself and refuses.
+    #
+    # So this gate reads the raw JSON, and anything that is not a document it
+    # can read answers 1. `normalize` then does the rest, including its own
+    # rule that a document needing repair comes back muted.
+    try:
+        raw = json.loads(Path(arguments.state).read_text(encoding="utf-8"))
+    except FileNotFoundError:
         log("no switch state on disk: refusing to start a microphone leg")
         return 1
-    try:
-        state, note = load_state(arguments.state)
-    except Exception:  # noqa: BLE001 - an unreadable state must not open a mic
+    except (OSError, ValueError) as exc:
+        log("switch state unreadable (%s): refusing to start a microphone leg" % exc)
         return 1
-    if note:
-        log(note)
-    return 0 if policy.mic_live(state) else 1
+    try:
+        return 0 if policy.mic_live(policy.normalize(raw)) else 1
+    except Exception:  # noqa: BLE001 - a policy that raises must not open a mic
+        return 1
 
 
 def probe_speaker_chain(applier):

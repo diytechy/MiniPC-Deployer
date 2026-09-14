@@ -642,7 +642,11 @@ if [ -f "$PAYLOAD/panel-invisible-cursor.py" ]; then
                 warn "cursor: panel-invisible-cursor.py failed — the compositor's arrow will show on touch (item 22)."
             fi ;;
         *)
-            rm -rf /usr/local/share/wall-cursors
+            # ONLY the theme this script generates. /usr/local/share/wall-cursors
+            # is a search PATH, not our property: anything else dropped in it
+            # later must survive this knob being turned off.
+            rm -rf /usr/local/share/wall-cursors/default
+            rmdir /usr/local/share/wall-cursors 2>/dev/null || true
             log "cursor: WALL_CURSOR_TRANSPARENT is '${WALL_CURSOR_TRANSPARENT}' — normal pointer kept" ;;
     esac
 else

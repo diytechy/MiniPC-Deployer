@@ -310,3 +310,43 @@ def test_build_record_shape():
     assert rec["v"] == core.SCHEMA_VERSION
     assert rec["cpu_pct"] == 42.0
     assert rec["event"] is None
+
+
+# ── deployment seam (integration review, 2026-09-14) ─────────────────────────
+# Two defects the group merges left, both invisible to every other test here:
+# the collector's unit was never installed by firstboot (so the completeness
+# check always failed and, with WALL_TELEMETRY_ENABLED defaulting to true,
+# every provisioning run refused to stamp its marker), and the presentation
+# snapshot was named inside root-owned /run/wall-panel, which the unprivileged
+# renderer cannot write.
+
+_WALL = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "stack", "autoinstall", "wall",
+)
+
+
+def _read(name):
+    with open(os.path.join(_WALL, name), "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def test_firstboot_installs_the_telemetry_unit():
+    firstboot = _read("wall-firstboot.sh")
+    assert "wall-panel-telemetry.service\" /etc/systemd/system/wall-panel-telemetry.service" in firstboot, (
+        "firstboot must install wall-panel-telemetry.service; without it step 8e "
+        "fail_step's on every run and the panel is never marked provisioned"
+    )
+
+
+def test_presentation_snapshot_lives_in_a_renderer_writable_directory():
+    unit = _read("wall-panel-telemetry.service")
+    collector = _read("panel-telemetry.py")
+    firstboot = _read("wall-firstboot.sh")
+    path = "/run/wall-panel-renderer/presentation-snapshot.json"
+    assert "PANEL_TELEMETRY_PRESENTATION_PATH=" + path in unit
+    assert path in collector
+    # The directory must be created for the kiosk user, and NOT by widening
+    # /run/wall-panel, which holds the AEC input-mute file and the epoch marker.
+    assert "d /run/wall-panel-renderer 0755 panel panel" in firstboot
+    assert "/run/wall-panel/presentation-snapshot.json" not in unit + collector

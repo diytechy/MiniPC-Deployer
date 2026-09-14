@@ -18,7 +18,7 @@ StateDirectoryMode=0750
 # service (and root) can read its own telemetry.
 UMask=0077
 Environment=PANEL_TELEMETRY_STATE_DIR=/var/lib/wall-panel-telemetry
-Environment=PANEL_TELEMETRY_PRESENTATION_PATH=/run/wall-panel/presentation-snapshot.json
+Environment=PANEL_TELEMETRY_PRESENTATION_PATH=/run/wall-panel-renderer/presentation-snapshot.json
 ExecStart=/usr/bin/python3 /opt/wall-panel/stack/autoinstall/wall/panel-telemetry.py --state-dir /var/lib/wall-panel-telemetry run
 Restart=on-failure
 RestartSec=5

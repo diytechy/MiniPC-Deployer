@@ -36,7 +36,7 @@ import panel_telemetry_core as core  # noqa: E402
 
 DEFAULT_STATE_DIR = os.environ.get("PANEL_TELEMETRY_STATE_DIR", "/var/lib/wall-panel/telemetry")
 DEFAULT_PRESENTATION_PATH = os.environ.get(
-    "PANEL_TELEMETRY_PRESENTATION_PATH", "/run/wall-panel/presentation-snapshot.json"
+    "PANEL_TELEMETRY_PRESENTATION_PATH", "/run/wall-panel-renderer/presentation-snapshot.json"
 )
 INTERVAL_S = float(os.environ.get("PANEL_TELEMETRY_INTERVAL_S", "5"))
 RETENTION_DAYS = int(os.environ.get("PANEL_TELEMETRY_RETENTION_DAYS", "7"))

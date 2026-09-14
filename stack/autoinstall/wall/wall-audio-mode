@@ -78,10 +78,17 @@ unit() {
 # something that was on.
 ACTIVE_BEFORE=""
 remember_active() {
+    # An `a && b` list as the loop body returns a's status when a fails, so the
+    # function returned 3 for the first inactive unit and `set -e` killed the
+    # whole mode switch silently (measured on the panel 2026-09-14 after the
+    # boot-presence fix landed: wall-spdif-in was inactive, the script exited
+    # before touching anything, and the mode stayed trigger). Use if.
     for _u in "$@"; do
-        systemctl is-active --quiet "$_u" 2>/dev/null &&
+        if systemctl is-active --quiet "$_u" 2>/dev/null; then
             ACTIVE_BEFORE="$ACTIVE_BEFORE $_u"
+        fi
     done
+    return 0
 }
 
 was_active() {

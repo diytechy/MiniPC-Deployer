@@ -233,7 +233,7 @@ Settings view expect" is:
 > `install-wall-capabilities.sh` — the same command as step 1c above. It has
 > never been run on this panel. No code is missing.
 
-**Two artefacts do not exist in any repo and block the run:**
+**Two artefacts were build inputs outside the repo when this was written. As of 2026-09-13 evening the wheelhouse exists (`sensor-wheelhouse/requirements.lock` is committed and `build-sensor-wheelhouse.sh` reproduces it byte-identically; see `sensor-wheelhouse/README.md`) and the installer has been run on the panel. The private host config remains a per-panel secret:**
 
 1. **The offline wheelhouse.** `install-wall-capabilities.sh` requires
    `--wheelhouse DIR` containing a hash-pinned `requirements.lock`, and pip is
@@ -377,7 +377,7 @@ two ways:
 
 1. Gateway bootstrap on the hub (1a) — creates the PIN and the credential.
 2. Gateway enabled behind Caddy (1b) — validated before the panel is touched.
-3. Build the offline wheelhouse (§3) — the long pole; nothing else waits on it.
+3. Build the offline wheelhouse (§3) — done 2026-09-13, reproducible from the committed lock.
 4. `install-wall-capabilities.sh` on the panel (1c + §3) — one command does both
    the access registration and the sensor service.
 5. `WALL_ACCESS_EXPECTED=true`, camera knob if wanted (§2), firstboot, kiosk

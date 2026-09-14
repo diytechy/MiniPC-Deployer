@@ -53,3 +53,78 @@ def test_sr017_firstboot_passes_only_private_config_path_to_kiosk_env():
         assert f'echo "{key}=' not in firstboot
     installer = (SCRIPT.parent / "install-wall-capabilities.sh").read_text(encoding="utf-8")
     assert "incoming.pop('rendererConfig', None)" in installer
+
+
+# ── Group C3: local authentication mode (Owner ruling 2026-09-13) ───────────
+# The renderer half above is unchanged. What follows is the ACCESS half, which
+# this script did not own before: two fields, no credential, and a reversal.
+
+
+def test_local_mode_writes_only_access_mode_and_enabled_no_credential(tmp_path):
+    current = tmp_path / "host.json"
+    current.write_text('{"enabled":false}', encoding="utf-8")
+    current.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    result = MODULE.render(current, {"WALL_ACCESS_MODE": "local"})
+    assert result["accessMode"] == "local"
+    assert result["enabled"] is True
+    # A local panel has NO device credential and NO gateway. If either ever
+    # appears here it came from somewhere this script must not invent.
+    assert "deviceCredential" not in result
+    assert "gatewayUrl" not in result
+
+
+def test_local_mode_preserves_a_previous_registration_without_using_it(tmp_path):
+    current = tmp_path / "host.json"
+    current.write_text('{"enabled":true,"accessMode":"read-protected","gatewayUrl":"https://wall.invalid",'
+                       '"deviceId":"panel","deviceCredential":"fixture"}', encoding="utf-8")
+    current.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    result = MODULE.render(current, {"WALL_ACCESS_MODE": "local"})
+    assert result["accessMode"] == "local"
+    assert result["deviceCredential"] == "fixture", "reversal stays a one-knob edit"
+    assert result["gatewayUrl"] == "https://wall.invalid"
+
+
+def test_reversal_restores_gateway_mode_only_when_a_registration_is_still_there(tmp_path):
+    registered = tmp_path / "registered.json"
+    registered.write_text('{"enabled":true,"accessMode":"local","gatewayUrl":"https://wall.invalid",'
+                          '"deviceId":"panel","deviceCredential":"fixture"}', encoding="utf-8")
+    registered.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    back = MODULE.render(registered, {"WALL_ACCESS_MODE": "gateway"})
+    assert "accessMode" not in back
+    assert back["enabled"] is True
+
+    bare = tmp_path / "bare.json"
+    bare.write_text('{"enabled":true,"accessMode":"local"}', encoding="utf-8")
+    bare.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    reverted = MODULE.render(bare, {"WALL_ACCESS_MODE": ""})
+    assert "accessMode" not in reverted
+    assert reverted["enabled"] is False, "no registration behind it: back to the open/unprovisioned posture"
+
+
+def test_absent_knob_leaves_todays_access_half_untouched(tmp_path):
+    current = tmp_path / "host.json"
+    current.write_text('{"enabled":true,"accessMode":"read-protected","gatewayUrl":"https://wall.invalid",'
+                       '"deviceId":"panel","deviceCredential":"fixture"}', encoding="utf-8")
+    current.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    result = MODULE.render(current, {})
+    assert result["accessMode"] == "read-protected"
+    assert result["enabled"] is True
+
+
+def test_an_unknown_access_mode_is_refused_rather_than_guessed(tmp_path):
+    try:
+        MODULE.render(tmp_path / "host.json", {"WALL_ACCESS_MODE": "localish"})
+    except ValueError as error:
+        assert "WALL_ACCESS_MODE" in str(error)
+    else:
+        raise AssertionError("an unknown access mode was accepted")
+
+
+def test_wall_env_documents_the_knob_and_firstboot_reports_the_mode():
+    env = (SCRIPT.parent / "wall.env.example").read_text(encoding="utf-8")
+    assert "WALL_ACCESS_MODE=gateway" in env
+    assert "WALL_CAMERA_ENABLED=true" in env, "face on the panel still needs the hardware gate"
+    firstboot = (SCRIPT.parent / "wall-firstboot.sh").read_text(encoding="utf-8")
+    assert "WALL_ACCESS_MODE" in firstboot
+    # The PIN is never handled by firstboot, so it can never be echoed by it.
+    assert "WALL_ACCESS_PIN" not in firstboot and "WALL_PANEL_PIN" not in firstboot

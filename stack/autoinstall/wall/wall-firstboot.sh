@@ -397,6 +397,16 @@ if python3 "$PAYLOAD/render-wall-host-config.py" "$WALL_HOST_CONFIG" > "$HOST_CO
     install -o panel -g panel -m 0600 "$HOST_CONFIG_TMP" "$WALL_HOST_CONFIG"
     rm -f "$HOST_CONFIG_TMP"
     log "private Electron host config rendered at $WALL_HOST_CONFIG (0600; values not logged)"
+    # ── which lock is in force, stated once in the journal ─────────────────
+    # Local mode is the one posture a re-image DOES reproduce: it needs no
+    # per-device secret, so WALL_ACCESS_MODE=local is enough and the manual
+    # install-wall-capabilities.sh step below does not apply to it. The PIN
+    # itself is still set by hand at the wall, and is never printed here.
+    case "${WALL_ACCESS_MODE:-gateway}" in
+        local|LOCAL)
+            log "protected access: LOCAL mode (panel-local PIN; no gateway, no device credential)"
+            log "protected access: set the PIN at the wall in Settings; until then the panel masks nothing" ;;
+    esac
     # ── the re-image reminder for protected access (Group C, item 13) ───────
     # render-wall-host-config.py owns ONLY rendererConfig. The access half --
     # enabled/gatewayUrl/deviceId/deviceCredential/sensorSocket -- is a per-device
@@ -409,7 +419,9 @@ if python3 "$PAYLOAD/render-wall-host-config.py" "$WALL_HOST_CONFIG" > "$HOST_CO
     # and it is reversed by setting WALL_ACCESS_EXPECTED back to false.
     case "${WALL_ACCESS_EXPECTED:-false}" in
         true|TRUE|yes|1)
-            if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("enabled") is True else 1)' "$WALL_HOST_CONFIG" >/dev/null 2>&1; then
+            if [ "${WALL_ACCESS_MODE:-gateway}" = "local" ]; then
+                log "protected access: satisfied by WALL_ACCESS_MODE=local; no device credential is owed"
+            elif python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("enabled") is True else 1)' "$WALL_HOST_CONFIG" >/dev/null 2>&1; then
                 log "protected access: $WALL_HOST_CONFIG is enabled as expected"
             else
                 warn "protected access: WALL_ACCESS_EXPECTED=true but $WALL_HOST_CONFIG has enabled=false."

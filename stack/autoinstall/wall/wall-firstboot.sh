@@ -397,6 +397,27 @@ if python3 "$PAYLOAD/render-wall-host-config.py" "$WALL_HOST_CONFIG" > "$HOST_CO
     install -o panel -g panel -m 0600 "$HOST_CONFIG_TMP" "$WALL_HOST_CONFIG"
     rm -f "$HOST_CONFIG_TMP"
     log "private Electron host config rendered at $WALL_HOST_CONFIG (0600; values not logged)"
+    # ── the re-image reminder for protected access (Group C, item 13) ───────
+    # render-wall-host-config.py owns ONLY rendererConfig. The access half --
+    # enabled/gatewayUrl/deviceId/deviceCredential/sensorSocket -- is a per-device
+    # registration installed out of band by install-wall-capabilities.sh, and a
+    # re-image starts the file again at {"enabled": false}. Nothing used to say
+    # so, so a re-imaged panel came up with its checklist, Settings and Bluetooth
+    # panes open to anyone and looked exactly like a working one.
+    #
+    # This only ever WARNS. It cannot enable access, it writes no credential,
+    # and it is reversed by setting WALL_ACCESS_EXPECTED back to false.
+    case "${WALL_ACCESS_EXPECTED:-false}" in
+        true|TRUE|yes|1)
+            if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("enabled") is True else 1)' "$WALL_HOST_CONFIG" >/dev/null 2>&1; then
+                log "protected access: $WALL_HOST_CONFIG is enabled as expected"
+            else
+                warn "protected access: WALL_ACCESS_EXPECTED=true but $WALL_HOST_CONFIG has enabled=false."
+                warn "The panel's protected panes are OPEN. Re-run, as root:"
+                warn "  install-wall-capabilities.sh --host-config PRIVATE.json --wheelhouse OFFLINE_WHEELS"
+                warn "See stack/panel-access/PROVISIONING.md. No credential is written by firstboot."
+            fi ;;
+    esac
 else
     rm -f "$HOST_CONFIG_TMP"
     fail_step "private Electron host config could not be rendered"

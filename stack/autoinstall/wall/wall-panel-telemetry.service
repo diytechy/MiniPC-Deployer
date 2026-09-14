@@ -12,6 +12,11 @@ Type=simple
 DynamicUser=yes
 StateDirectory=wall-panel-telemetry
 StateDirectoryMode=0750
+# StateDirectoryMode bounds the DIRECTORY only; without this the manager's
+# default umask (typically 0022) would leave the JSONL files themselves
+# world-readable. 0077 with DynamicUser's own uid/gid means only this
+# service (and root) can read its own telemetry.
+UMask=0077
 Environment=PANEL_TELEMETRY_STATE_DIR=/var/lib/wall-panel-telemetry
 Environment=PANEL_TELEMETRY_PRESENTATION_PATH=/run/wall-panel/presentation-snapshot.json
 ExecStart=/usr/bin/python3 /opt/wall-panel/stack/autoinstall/wall/panel-telemetry.py --state-dir /var/lib/wall-panel-telemetry run
@@ -49,6 +54,12 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
 # ReadOnlyPaths already covers /sys and /proc via ProtectSystem=strict's
 # defaults except for the explicit ReadWritePaths below (none needed: sensor
 # reads and StateDirectory cover everything this unit touches).

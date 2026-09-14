@@ -4,7 +4,7 @@
 Thin I/O shell around panel_telemetry_core (all decisions live there). Three
 subcommands:
   run       -- foreground daemon loop (what the systemd unit execs)
-  export    -- `panel-telemetry export --since ISO8601 > file` dumps JSONL
+  export    -- `python3 panel-telemetry.py export --since ISO8601 > file` dumps JSONL
   summary   -- small human-readable digest of recent records
 
 Failure isolation: every I/O call that can fail (a missing sensor file, a
@@ -44,32 +44,95 @@ CAP_BYTES = int(os.environ.get("PANEL_TELEMETRY_CAP_BYTES", str(50 * 1024 * 1024
 KIOSK_PROCESS_NAMES = os.environ.get("PANEL_TELEMETRY_KIOSK_PROCS", "cage,electron,projectm").split(",")
 STALE_THRESHOLD_S = 15.0
 
-# Static, this-panel sensor inventory (see build/panel-telemetry-inventory-20260914
-# for how this was derived). Kept in code, not autodiscovered, because sysfs
-# device numbering is not guaranteed stable across kernels/boots and a wrong
-# guess is worse than a documented list. `canonical=True` marks the one
-# reading used for summaries; duplicates are still logged with their own
-# labels so nothing is silently discarded.
-SENSOR_INVENTORY = [
-    {"source": "hwmon:coretemp:temp1", "label": "Package id 0", "path": "/sys/class/hwmon/hwmon3/temp1_input", "canonical": True},
-    {"source": "hwmon:coretemp:temp2", "label": "Core 0", "path": "/sys/class/hwmon/hwmon3/temp2_input", "canonical": False},
-    {"source": "hwmon:coretemp:temp3", "label": "Core 1", "path": "/sys/class/hwmon/hwmon3/temp3_input", "canonical": False},
-    {"source": "thermal_zone:pch_skylake", "label": "PCH", "path": "/sys/class/thermal/thermal_zone1/temp", "canonical": False},
-    {"source": "hwmon:ath10k_hwmon:temp1", "label": "WiFi radio", "path": "/sys/class/hwmon/hwmon4/temp1_input", "canonical": False},
+# This-panel sensor inventory (see build/panel-telemetry-inventory-20260914 for
+# how it was derived): which hwmon *names* and thermal_zone *types* exist, and
+# which temp*_label a given reading has. The hwmonN/thermal_zoneN NUMBERS are
+# NOT trusted directly -- they are not guaranteed stable across a kernel
+# update or a probe-order change -- so they are re-resolved from these stable
+# names/labels at startup and once per rotation cycle (see _resolve_sensors).
+# `canonical=True` marks the one reading used for summaries; duplicates are
+# still logged with their own labels so nothing is silently discarded.
+SENSOR_TARGETS = [
+    {"hwmon_name": "coretemp", "temp_label": "Package id 0", "source": "hwmon:coretemp:package", "canonical": True},
+    {"hwmon_name": "coretemp", "temp_label": "Core 0", "source": "hwmon:coretemp:core0", "canonical": False},
+    {"hwmon_name": "coretemp", "temp_label": "Core 1", "source": "hwmon:coretemp:core1", "canonical": False},
+    {"thermal_zone_type": "pch_skylake", "source": "thermal_zone:pch_skylake", "canonical": False},
+    {"hwmon_name": "ath10k_hwmon", "temp_label": None, "source": "hwmon:ath10k_hwmon:temp1", "canonical": False},
 ]
 
-GPU_PATHS = {
-    "freq_cur_mhz": "/sys/class/drm/card1/gt_cur_freq_mhz",
-    "freq_max_mhz": "/sys/class/drm/card1/gt_max_freq_mhz",
-    "freq_act_mhz": "/sys/class/drm/card1/gt_act_freq_mhz",
-    "rc6_residency_ms": "/sys/class/drm/card1/power/rc6_residency_ms",
-}
+GPU_SYSFS_FIELDS = ("gt_cur_freq_mhz", "gt_max_freq_mhz", "gt_act_freq_mhz")
+GPU_RC6_RELATIVE = "power/rc6_residency_ms"
+GPU_CARD_GLOB = "/sys/class/drm/card[0-9]*"
 # No throttle_reason_status file exists on this panel's kernel/driver (see
 # inventory) -- marked unsupported rather than guessed.
 GPU_THROTTLE_SUPPORTED = False
 
 COOLING_GLOB = "/sys/class/thermal/cooling_device*"
 CPUFREQ_GLOB = "/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"
+HWMON_GLOB = "/sys/class/hwmon/hwmon*"
+THERMAL_ZONE_GLOB = "/sys/class/thermal/thermal_zone*"
+
+
+def _resolve_sensors(targets=SENSOR_TARGETS):
+    """Resolve each configured sensor target to a concrete sysfs path by
+    stable name/label, NOT by hwmonN/thermal_zoneN number. Call again if a
+    target goes missing (numbering can change across a kernel/module reload).
+    Returns a list of {source, label, path, canonical} with path=None when a
+    target cannot be found this call (read_sensors() then reports it as
+    unavailable, not zero)."""
+    hwmon_dirs = {}
+    for hwmon_dir in glob.glob(HWMON_GLOB):
+        name = _read_str(os.path.join(hwmon_dir, "name"))
+        if name:
+            hwmon_dirs.setdefault(name, []).append(hwmon_dir)
+    zone_dirs = {}
+    for zone_dir in glob.glob(THERMAL_ZONE_GLOB):
+        typ = _read_str(os.path.join(zone_dir, "type"))
+        if typ:
+            zone_dirs.setdefault(typ, []).append(zone_dir)
+
+    resolved = []
+    for target in targets:
+        path = None
+        label = target.get("temp_label")
+        if "hwmon_name" in target:
+            for hwmon_dir in hwmon_dirs.get(target["hwmon_name"], []):
+                if target.get("temp_label") is None:
+                    candidate = os.path.join(hwmon_dir, "temp1_input")
+                    if os.path.exists(candidate):
+                        path = candidate
+                        break
+                    continue
+                for label_file in sorted(glob.glob(os.path.join(hwmon_dir, "temp*_label"))):
+                    if _read_str(label_file) == target["temp_label"]:
+                        path = label_file[: -len("_label")] + "_input"
+                        break
+                if path:
+                    break
+        elif "thermal_zone_type" in target:
+            label = target["thermal_zone_type"]
+            for zone_dir in zone_dirs.get(target["thermal_zone_type"], []):
+                candidate = os.path.join(zone_dir, "temp")
+                if os.path.exists(candidate):
+                    path = candidate
+                    break
+        resolved.append({
+            "source": target["source"],
+            "label": label,
+            "path": path,
+            "canonical": target.get("canonical", False),
+        })
+    return resolved
+
+
+def _resolve_gpu_card():
+    """First DRM card exposing gt_cur_freq_mhz (this panel has exactly one
+    real GPU; a future multi-GPU panel would need a configured preference,
+    not this heuristic)."""
+    for card_dir in sorted(glob.glob(GPU_CARD_GLOB)):
+        if os.path.exists(os.path.join(card_dir, "gt_cur_freq_mhz")):
+            return card_dir
+    return None
 
 
 def _read_int(path):
@@ -97,17 +160,24 @@ def read_stat_line():
         return None
 
 
-def read_sensors():
+def read_sensors(resolved):
     out = []
-    for entry in SENSOR_INVENTORY:
-        raw = _read_int(entry["path"])
+    for entry in resolved:
+        raw = _read_int(entry["path"]) if entry["path"] else None
         deg_c = raw / 1000.0 if raw is not None else None
         out.append(core.build_sensor_record(entry["source"], entry["label"], deg_c, entry["canonical"]))
     return out
 
 
-def read_gpu():
-    values = {k: _read_int(p) for k, p in GPU_PATHS.items()}
+def read_gpu(card_dir):
+    values = {}
+    for field in GPU_SYSFS_FIELDS:
+        values[field] = _read_int(os.path.join(card_dir, field)) if card_dir else None
+    values["rc6_residency_ms"] = _read_int(os.path.join(card_dir, GPU_RC6_RELATIVE)) if card_dir else None
+    # "load" is deliberately absent: neither frequency nor the cumulative
+    # rc6 residency counter is a utilization percentage, and this kernel/
+    # driver exposes no busy-% file (see the inventory) -- reporting one
+    # would be a guess, not a measurement.
     values["throttle"] = "unsupported" if not GPU_THROTTLE_SUPPORTED else None
     return values
 
@@ -134,80 +204,129 @@ def read_cpufreq():
 _PID_NAME_RE = re.compile(r"^\d+$")
 
 
-def read_kiosk_processes(names):
-    """Cheap /proc scan for CPU%/RSS of configured process names. CPU% here
-    is a coarse instantaneous utime+stime/HZ-over-uptime style estimate --
-    good enough for "is the kiosk expensive right now", not a substitute for
-    /proc/stat's system-wide delta accounting."""
-    totals = {}
+def _read_proc_cpu_ticks(pid):
+    """(comm, utime+stime ticks) for one pid, or None if it could not be
+    read (process gone, permission, malformed line)."""
+    try:
+        with open("/proc/%s/stat" % pid) as fh:
+            raw = fh.read()
+        # comm can contain spaces/parens; split on the LAST ')' as /proc/pid/stat
+        # is documented to require (comm is everything between the first '('
+        # and the last ')').
+        _name_part, _, rest = raw.rpartition(")")
+        comm = raw.split("(", 1)[1].rsplit(")", 1)[0]
+        fields = rest.split()
+        utime = int(fields[11])
+        stime = int(fields[12])
+        return comm, utime + stime
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _read_rss_kb(pid):
+    try:
+        with open("/proc/%s/statm" % pid) as fh:
+            pages = int(fh.read().split()[1])
+        return pages * (os.sysconf("SC_PAGE_SIZE") // 1024)
+    except (OSError, IndexError, ValueError, AttributeError):
+        return None
+
+
+def sample_kiosk_ticks(names):
+    """One flat {pid: (comm, ticks)} snapshot. Pure sampling, no CPU% math --
+    that needs two of these plus the elapsed wall time between them, which is
+    read_kiosk_processes()'s job (mirrors the system-wide delta pattern, and
+    keeps "first sample is unknown" true for per-process CPU too)."""
+    out = {}
+    if not os.path.isdir("/proc"):
+        return out
+    for pid_name in os.listdir("/proc"):
+        if not _PID_NAME_RE.match(pid_name):
+            continue
+        comm = _read_str("/proc/%s/comm" % pid_name)
+        if not comm or comm not in names:
+            continue
+        ticks = _read_proc_cpu_ticks(pid_name)
+        if ticks is None:
+            continue
+        out[pid_name] = ticks
+
+
+    return out
+
+
+def read_kiosk_processes(names, prev_ticks, prev_wall_s, cur_wall_s):
+    """Delta-based per-process-name aggregate CPU% (like the system-wide
+    figure: ticks-busy / ticks-of-wall-time-elapsed) plus current RSS.
+    Returns (records, cur_ticks) -- caller keeps cur_ticks for the next call.
+    A process with no matching entry in prev_ticks (new PID, or first sample
+    ever) contributes RSS but no CPU -- never a fabricated 0%.
+    """
+    cur_ticks = sample_kiosk_ticks(names)
     try:
         clk_tck = os.sysconf("SC_CLK_TCK")
     except (ValueError, AttributeError):
         clk_tck = 100
-    try:
-        with open("/proc/uptime") as fh:
-            uptime_s = float(fh.read().split()[0])
-    except OSError:
-        uptime_s = None
-    for pid_name in os.listdir("/proc") if os.path.isdir("/proc") else []:
-        if not _PID_NAME_RE.match(pid_name):
-            continue
-        comm_path = "/proc/%s/comm" % pid_name
-        comm = _read_str(comm_path)
-        if not comm or comm not in names:
-            continue
-        stat_path = "/proc/%s/stat" % pid_name
-        statm_path = "/proc/%s/statm" % pid_name
-        try:
-            with open(stat_path) as fh:
-                stat_fields = fh.read().split(")", 1)[-1].split()
-            utime = int(stat_fields[11])
-            stime = int(stat_fields[12])
-            starttime = int(stat_fields[19])
-        except (OSError, IndexError, ValueError):
-            continue
-        rss_kb = None
-        try:
-            with open(statm_path) as fh:
-                pages = int(fh.read().split()[1])
-            rss_kb = pages * (os.sysconf("SC_PAGE_SIZE") // 1024)
-        except (OSError, IndexError, ValueError, AttributeError):
-            pass
-        cpu_pct = None
-        if uptime_s is not None:
-            proc_uptime_s = uptime_s - (starttime / clk_tck)
-            if proc_uptime_s > 0:
-                cpu_pct = min(100.0, ((utime + stime) / clk_tck) / proc_uptime_s * 100.0)
-        agg = totals.setdefault(comm, {"cpu_pct": 0.0, "rss_kb": 0, "count": 0})
+    elapsed_s = (cur_wall_s - prev_wall_s) if (prev_wall_s is not None and prev_ticks is not None) else None
+
+    totals = {}
+    for pid, (comm, ticks) in cur_ticks.items():
+        agg = totals.setdefault(comm, {"cpu_pct": 0.0, "cpu_known": 0, "rss_kb": 0, "count": 0})
         agg["count"] += 1
-        agg["rss_kb"] += rss_kb or 0
-        agg["cpu_pct"] += cpu_pct or 0.0
-    return [
-        {"name": name, "cpu_pct": round(v["cpu_pct"], 2), "rss_kb": v["rss_kb"], "process_count": v["count"]}
-        for name, v in sorted(totals.items())
-    ]
+        rss = _read_rss_kb(pid)
+        agg["rss_kb"] += rss or 0
+        prev = prev_ticks.get(pid) if prev_ticks else None
+        if prev is not None and elapsed_s and elapsed_s > 0:
+            _prev_comm, prev_tick_count = prev
+            tick_delta = ticks - prev_tick_count
+            if tick_delta >= 0:
+                pct = (tick_delta / clk_tck) / elapsed_s * 100.0
+                agg["cpu_pct"] += min(100.0, max(0.0, pct))
+                agg["cpu_known"] += 1
+
+    records = []
+    for name in names:
+        v = totals.get(name)
+        if v is None:
+            records.append({"name": name, "cpu_pct": None, "rss_kb": None, "process_count": 0})
+            continue
+        records.append({
+            "name": name,
+            "cpu_pct": round(v["cpu_pct"], 2) if v["cpu_known"] else None,
+            "rss_kb": v["rss_kb"],
+            "process_count": v["count"],
+        })
+    return records, cur_ticks
 
 
 def read_presentation(path, now_mono_ms):
     """Read and validate the host-written presentation snapshot. Returns a
     dict always: {"status": "ok"|"stale"|"unknown"|"invalid", "payload": ... or None}
-    Never raises."""
+    Never raises.
+
+    `payload` is populated ONLY when status is "ok". A stale, invalid or
+    missing snapshot's mode must never be retained as if it were current (S:
+    "never log stale mode as current") -- a downstream reader that only looks
+    at `presentation.payload` can never mistake an old mode for a live one;
+    the raw last-seen values are still visible in `last_seen` for debugging,
+    clearly namespaced away from the "current" field.
+    """
     try:
         with open(path, "r") as fh:
             raw = fh.read()
     except OSError:
-        return {"status": "unknown", "payload": None, "errors": ["snapshot file not present"]}
+        return {"status": "unknown", "payload": None, "last_seen": None, "errors": ["snapshot file not present"]}
     try:
         payload = json.loads(raw)
     except ValueError as exc:
-        return {"status": "invalid", "payload": None, "errors": ["json parse error: %s" % exc]}
+        return {"status": "invalid", "payload": None, "last_seen": None, "errors": ["json parse error: %s" % exc]}
     ok, errors = core.validate_presentation(payload)
     if not ok:
-        return {"status": "invalid", "payload": None, "errors": errors}
+        return {"status": "invalid", "payload": None, "last_seen": None, "errors": errors}
     record_mono = payload.get("monotonicMs")
     if core.is_stale(record_mono, now_mono_ms, STALE_THRESHOLD_S):
-        return {"status": "stale", "payload": payload, "errors": []}
-    return {"status": "ok", "payload": payload, "errors": []}
+        return {"status": "stale", "payload": None, "last_seen": payload, "errors": []}
+    return {"status": "ok", "payload": payload, "last_seen": None, "errors": []}
 
 
 def _state_path_for_day(state_dir, day_str):
@@ -219,6 +338,10 @@ def _boot_id():
 
 
 def _rotate(state_dir):
+    """Enforce retention + the 50 MiB cap. Called after EVERY append (the
+    directory holds at most a handful of files, so the stat/glob cost is
+    negligible), not just hourly -- a burst of large records must not be able
+    to sit over cap for up to an hour before anything notices."""
     now = time.time()
     files = []
     for path in glob.glob(os.path.join(state_dir, "telemetry-*.jsonl")):
@@ -236,16 +359,36 @@ def _rotate(state_dir):
             pass
 
 
+# Rate-limit disk-full/permission diagnostics: a failing write must not turn
+# into a fresh journal line every 1s tick, which is its own kind of pressure
+# on a full disk.
+_APPEND_FAILURE_LOG_EVERY = 60
+_append_failure_count = 0
+
+
 def _append_record(state_dir, record):
+    global _append_failure_count
+    # Bound a single record's own size so one oversized payload cannot blow
+    # past the cap before rotation ever runs.
+    line = json.dumps(record, sort_keys=True)
+    if len(line) > 32768:
+        line = json.dumps({"v": record.get("v"), "ts_utc": record.get("ts_utc"),
+                            "event": "record_too_large", "dropped_bytes": len(line)})
     day_str = record["ts_utc"][:10]
     path = _state_path_for_day(state_dir, day_str)
     try:
         os.makedirs(state_dir, exist_ok=True)
         with open(path, "a") as fh:
-            fh.write(json.dumps(record, sort_keys=True) + "\n")
+            fh.write(line + "\n")
+        _append_failure_count = 0
+        _rotate(state_dir)
         return True
-    except OSError:
-        # Disk full / permission loss: never raise out of the loop.
+    except OSError as exc:
+        # Disk full / permission loss: never raise out of the loop, and never
+        # spam the journal on every 1s tick while it persists.
+        _append_failure_count += 1
+        if _append_failure_count == 1 or _append_failure_count % _APPEND_FAILURE_LOG_EVERY == 0:
+            sys.stderr.write("panel-telemetry: write failed (%d consecutive): %s\n" % (_append_failure_count, exc))
         return False
 
 
@@ -270,22 +413,41 @@ def _write_mode_change_record(state_dir, boot_id, session_id, mono_s, presentati
     _append_record(state_dir, record)
 
 
+def _boottime_s():
+    """A clock that keeps advancing through suspend, unlike time.monotonic()
+    (CLOCK_MONOTONIC excludes suspended time on Linux -- see clock_gettime(2)
+    -- so it cannot see a suspend gap at all: it wakes up having "moved"
+    almost exactly as far as the CPU was actually awake). CLOCK_BOOTTIME
+    includes suspended time, so the divergence between two BOOTTIME samples IS
+    the wall-clock gap, suspend included. Falls back to time.time() (also
+    suspend-inclusive) on a platform without CLOCK_BOOTTIME (this collector
+    only ships on Linux, but the fallback keeps `--once` runnable anywhere for
+    tests)."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return time.time()
+
+
 def cmd_run(args):
     state_dir = args.state_dir
     session_id = str(uuid.uuid4())
     boot_id = _boot_id()
     prev_stat = None
-    prev_mono = None
-    last_rotate = 0.0
+    prev_boottime = None
     last_revision = None
+    sensor_targets = _resolve_sensors()
+    last_sensor_resolve = time.monotonic()
+    gpu_card = _resolve_gpu_card()
+    prev_kiosk_ticks = None
+    prev_kiosk_wall_s = None
     next_full_sample = time.monotonic()
     while True:
         tick_start = time.monotonic()
         try:
             now_mono_ms = time.monotonic() * 1000.0
             presentation = read_presentation(args.presentation_path, now_mono_ms)
-            payload = presentation.get("payload") or {}
-            revision = payload.get("revision")
+            revision = (presentation.get("payload") or {}).get("revision")
             if revision is not None and last_revision is not None and revision != last_revision:
                 _write_mode_change_record(state_dir, boot_id, session_id, tick_start, presentation, last_revision)
             if revision is not None:
@@ -296,14 +458,26 @@ def cmd_run(args):
                 cpu_pct = core.cpu_percent(prev_stat, stat) if stat is not None else None
                 prev_stat = stat if stat is not None else prev_stat
 
-                gap = core.detect_suspend_gap(prev_mono, tick_start, INTERVAL_S)
+                cur_boottime = _boottime_s()
+                gap = core.detect_suspend_gap(prev_boottime, cur_boottime, INTERVAL_S)
                 event = "suspend_gap" if gap is not None else None
 
-                sensors = read_sensors()
-                gpu = read_gpu()
+                # Re-resolve sensor/GPU paths periodically (module reload,
+                # kernel update between boots) rather than trusting numbers
+                # that were only valid at process start.
+                if tick_start - last_sensor_resolve > 3600:
+                    sensor_targets = _resolve_sensors()
+                    gpu_card = _resolve_gpu_card()
+                    last_sensor_resolve = tick_start
+
+                sensors = read_sensors(sensor_targets)
+                gpu = read_gpu(gpu_card)
                 cooling = read_cooling()
                 cpufreq = read_cpufreq()
-                kiosk = read_kiosk_processes(KIOSK_PROCESS_NAMES)
+                kiosk, prev_kiosk_ticks = read_kiosk_processes(
+                    KIOSK_PROCESS_NAMES, prev_kiosk_ticks, prev_kiosk_wall_s, tick_start,
+                )
+                prev_kiosk_wall_s = tick_start
 
                 record = core.build_record(
                     ts_utc=core.now_utc_iso(),
@@ -323,11 +497,7 @@ def cmd_run(args):
                     record["suspend_gap_s"] = gap
                 _append_record(state_dir, record)
 
-                if tick_start - last_rotate > 3600:
-                    _rotate(state_dir)
-                    last_rotate = tick_start
-
-                prev_mono = tick_start
+                prev_boottime = cur_boottime
                 next_full_sample = tick_start + INTERVAL_S
         except Exception as exc:  # noqa: BLE001 - failure isolation is the point
             sys.stderr.write("panel-telemetry: sample failed, continuing: %s\n" % exc)

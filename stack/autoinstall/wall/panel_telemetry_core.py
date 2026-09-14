@@ -38,31 +38,44 @@ def parse_stat_line(line):
     """Parse one '/proc/stat' aggregate 'cpu ...' line into a fields dict.
 
     Missing trailing fields (older kernels) are treated as 0. Raises
-    ValueError if the line does not start with 'cpu ' or has no numeric
-    fields at all.
+    ValueError if the line does not start with 'cpu ' or carries no numeric
+    fields, or a negative field (both mean this is not a real counter read
+    and must not be turned into plausible-looking telemetry).
     """
     parts = line.split()
-    if not parts or parts[0] != "cpu":
-        raise ValueError("not an aggregate 'cpu' line: %r" % (line,))
+    if len(parts) < 2 or parts[0] != "cpu":
+        raise ValueError("not an aggregate 'cpu' line with fields: %r" % (line,))
     values = [int(p) for p in parts[1:]]
+    if any(v < 0 for v in values):
+        raise ValueError("negative /proc/stat field: %r" % (line,))
     values += [0] * (len(STAT_FIELDS) - len(values))
     return dict(zip(STAT_FIELDS, values[: len(STAT_FIELDS)]))
+
+
+# Fields that sum to "total capacity" for the busy/idle split. guest and
+# guest_nice are deliberately EXCLUDED: the kernel already folds guest time
+# into user/nice (see Documentation/filesystems/proc.rst), so adding them
+# again double-counts virtualization time and understates cpu_pct.
+_TOTAL_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
 
 
 def cpu_percent(prev, cur):
     """Whole-system CPU percent (0-100) across total capacity from two
     parsed /proc/stat snapshots. Returns None when there is no valid prior
-    sample (first sample, or a detected counter reset) -- callers must treat
-    None as "unknown", never as 0.
+    sample (first sample, or a detected counter reset/anomaly) -- callers
+    must treat None as "unknown", never as 0.
     """
     if prev is None:
         return None
-    total_prev = sum(prev.values())
-    total_cur = sum(cur.values())
+    # Any individual counter going backwards (a reboot, a re-read race, or a
+    # bogus value) invalidates the whole delta even if the summed total still
+    # happens to look like it increased.
+    if any(cur[f] < prev[f] for f in _TOTAL_FIELDS):
+        return None
+    total_prev = sum(prev[f] for f in _TOTAL_FIELDS)
+    total_cur = sum(cur[f] for f in _TOTAL_FIELDS)
     total_delta = total_cur - total_prev
     if total_delta <= 0:
-        # Counter reset (reboot without a restarted collector, or a bogus
-        # reading) -- unknown, not zero.
         return None
     idle_delta = (cur["idle"] + cur["iowait"]) - (prev["idle"] + prev["iowait"])
     busy_delta = total_delta - idle_delta
@@ -102,13 +115,21 @@ def detect_suspend_gap(prev_mono_s, cur_mono_s, interval_s, factor=2.0):
 
 # ── presentation snapshot staleness & validation ─────────────────────────────
 
+def _is_finite_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
 def is_stale(record_mono_ms, now_mono_ms, threshold_s=15.0):
     """True when a presentation snapshot's monotonic timestamp is older than
-    threshold_s relative to now. A missing record (record_mono_ms is None)
-    counts as stale."""
-    if record_mono_ms is None:
+    threshold_s relative to now. A missing record, a non-finite timestamp, or
+    a timestamp that claims to be from the future (clock/process anomaly)
+    all count as stale -- never treated as fresher than they can be trusted
+    to be."""
+    if not _is_finite_number(record_mono_ms) or not _is_finite_number(now_mono_ms):
         return True
     age_s = (now_mono_ms - record_mono_ms) / 1000.0
+    if age_s < -1.0:  # small negative slack for clock-source jitter
+        return True
     return age_s > threshold_s
 
 
@@ -124,6 +145,11 @@ REQUIRED_PRESENTATION_FIELDS = {
     "monotonicMs": (int, float),
 }
 
+# The renderer must never be able to smuggle titles, URLs or other unbounded
+# text into retained telemetry through this channel -- bound every string
+# field and reject anything the schema does not name.
+_MAX_STRING_LEN = 64
+
 
 def validate_presentation(payload):
     """Validate a presentation snapshot payload. Returns (ok, errors) where
@@ -135,17 +161,43 @@ def validate_presentation(payload):
     errors = []
     if not isinstance(payload, dict):
         return False, ["payload is not an object"]
+
+    unknown = set(payload) - set(REQUIRED_PRESENTATION_FIELDS)
+    if unknown:
+        errors.append("unexpected field(s): %s" % sorted(unknown))
+
     for field, types in REQUIRED_PRESENTATION_FIELDS.items():
         if field not in payload:
             errors.append("missing field: %s" % field)
             continue
-        if not isinstance(payload[field], types):
-            errors.append("field %s has wrong type: %r" % (field, type(payload[field]).__name__))
-    if "displayMode" in payload and payload["displayMode"] not in DISPLAY_MODES:
-        errors.append("displayMode not one of %s: %r" % (DISPLAY_MODES, payload.get("displayMode")))
+        value = payload[field]
+        if isinstance(value, bool) and types in (int, (int, float)):
+            errors.append("field %s has wrong type: bool" % field)
+            continue
+        if not isinstance(value, types):
+            errors.append("field %s has wrong type: %r" % (field, type(value).__name__))
+            continue
+        if isinstance(value, str) and len(value) > _MAX_STRING_LEN:
+            errors.append("field %s exceeds %d characters" % (field, _MAX_STRING_LEN))
+    if "monotonicMs" in payload and not _is_finite_number(payload.get("monotonicMs")):
+        errors.append("monotonicMs is not a finite number")
+    if "revision" in payload and isinstance(payload.get("revision"), int) and payload["revision"] < 0:
+        errors.append("revision must not be negative")
+
+    display_mode = payload.get("displayMode")
+    if "displayMode" in payload and display_mode not in DISPLAY_MODES:
+        errors.append("displayMode not one of %s: %r" % (DISPLAY_MODES, display_mode))
     owner = payload.get("fullscreenOwner")
-    if owner is not None and owner not in FULLSCREEN_OWNERS:
+    if "fullscreenOwner" in payload and owner is not None and owner not in FULLSCREEN_OWNERS:
         errors.append("fullscreenOwner not one of %s: %r" % (FULLSCREEN_OWNERS, owner))
+
+    # Presentation-state coherence: a fullscreen owner only makes sense in
+    # FULL, and FULL always has one (something owns the whole screen).
+    if display_mode == "TABBED" and owner is not None:
+        errors.append("fullscreenOwner must be null while displayMode is TABBED, got %r" % (owner,))
+    if display_mode == "FULL" and owner is None and "fullscreenOwner" in payload and "displayMode" in payload:
+        errors.append("fullscreenOwner must not be null while displayMode is FULL")
+
     return (len(errors) == 0), errors
 
 

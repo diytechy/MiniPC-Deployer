@@ -679,8 +679,11 @@ def test_the_backend_normalizes_like_the_applier_llr013(panel, raw):
 def test_a_sparse_state_file_reports_a_supported_switch_sr028(panel):
     panel["state"].write_text("{}", encoding="utf-8")
     result = reply(AudioBroker(backend(panel)), wire("status"))["result"]
+    # A sparse file is a SUPPORTED switch (terra 3.1) but, since step 4, a
+    # microphone that reads MUTED: the applier mutes unless the document
+    # explicitly says false, and the backend agrees with it field by field.
     assert result["switch"] == {"supported": True, "output": "speaker",
-                                "inputMuted": False, "available": True,
+                                "inputMuted": True, "available": True,
                                 "reason": None, "volume": 60}
 
 

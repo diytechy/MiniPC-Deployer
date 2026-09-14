@@ -391,17 +391,35 @@ class SwitchApplierBackend:
         two copies cannot drift in silence.
         """
         raw = self._state_strict()
-        state = {"output": DEFAULT_OUTPUT, "input_muted": False,
+        state = {"output": DEFAULT_OUTPUT, "input_muted": True,
                  "headset_present": False, "request_seq": -1,
                  "volume": dict(DEFAULT_VOLUME)}
+        # Same rule as wall_audio_state.normalize (step 4, terra rounds 2-4):
+        # the microphone is MUTED unless the document explicitly carries the
+        # boolean false, and a document that needed ANY repair comes back
+        # muted too. Field-by-field repair is kept for everything else.
+        repaired = False
         if raw.get("output") in OUTPUTS:
             state["output"] = raw["output"]
-        for field in ("input_muted", "headset_present"):
-            if isinstance(raw.get(field), bool):
-                state[field] = raw[field]
+        elif "output" in raw:
+            repaired = True
+        if isinstance(raw.get("input_muted"), bool):
+            state["input_muted"] = raw["input_muted"]
+        else:
+            repaired = True
+        if isinstance(raw.get("headset_present"), bool):
+            state["headset_present"] = raw["headset_present"]
+        elif "headset_present" in raw:
+            repaired = True
+        if isinstance(raw.get("headset_autoswitch_armed"), bool):
+            pass
+        elif "headset_autoswitch_armed" in raw:
+            repaired = True
         seq = raw.get("request_seq")
         if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
             state["request_seq"] = seq
+        elif "request_seq" in raw:
+            repaired = True
         volume = raw.get("volume")
         if isinstance(volume, dict):
             for output in LEVELLED_OUTPUTS:
@@ -409,6 +427,14 @@ class SwitchApplierBackend:
                 # bool is an int in Python and True would become 1%: refuse it.
                 if isinstance(level, int) and not isinstance(level, bool):
                     state["volume"][output] = max(VOLUME_MIN, min(VOLUME_MAX, level))
+                    if state["volume"][output] != level:
+                        repaired = True
+                elif output in volume:
+                    repaired = True
+        elif "volume" in raw:
+            repaired = True
+        if repaired:
+            state["input_muted"] = True
         return state
 
     @staticmethod

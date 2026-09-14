@@ -90,6 +90,31 @@ LOCK_FILE = RUN_DIR / "audio-apply.lock"
 # for why it is a monotonic mark rather than an uptime threshold. In /run, not
 # /etc, because it describes THIS boot and must vanish with it.
 BOOT_STAMP = RUN_DIR / "audio-boot-apply.json"
+# ── the echo canceller seam (step 6) ──────────────────────────────────────
+# Whether `mic_selected` resolves to the CANCELLED microphone is a fact about
+# the machine -- is the daemon installed, and did the Owner turn it on -- so it
+# is decided here, in the shell, and handed to the pure policy rather than
+# guessed there. Both halves are required: a knob set on a panel with no binary
+# would publish a PCM name nothing feeds, and the mic legs would open a device
+# that never produces a sample.
+AEC_BINARY = Path("/usr/local/sbin/wall-audio-aec")
+AEC_ENABLE_FILE = CONF_DIR / "audio-aec.env"
+AEC_ENABLE_VAR = "WALL_AUDIO_AEC"
+
+
+def aec_available():
+    """True when the cancelled microphone may be selected. Implements: LLR-016.
+
+    DELIBERATELY NOT "is the unit running". A unit that is momentarily
+    restarting must not make the applier re-point every mic leg at the raw
+    capture and back again; the question is whether the canceller is INSTALLED
+    AND CHOSEN, and the daemon's own `Restart=always` owns the rest. If it is
+    down, `mic_clean` simply has no data and the leg's guard reports it -- which
+    is a visible, bounded failure rather than a silent flap.
+    """
+    if read_env(AEC_ENABLE_FILE, AEC_ENABLE_VAR, "0") != "1":
+        return False
+    return AEC_BINARY.exists()
 # THE EPOCH MARKER (contract 2026-09-14, section 1.1). /run is tmpfs, so the
 # absence of this file at `apply-state` time is exactly "a new life of the
 # backend": a boot, or somebody clearing /run by hand. Its presence carries the
@@ -1518,7 +1543,7 @@ def apply_plan(state, applier):
     exist until something has opened the PCM that declares it.
     """
     failures = 0
-    wanted = policy.plan(state)
+    wanted = policy.plan(state, aec_available=aec_available())
     adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
     loopback = read_env(CARDS_FILE, "WALL_AUDIO_LOOPBACK_CARD", "Loopback")
     builtin = read_env(CARDS_FILE, "WALL_AUDIO_BUILTIN_CARD", "PCH")
@@ -1913,7 +1938,7 @@ def main(argv=None):
         for line in mic_notes:
             log(line)
         print(json.dumps({"mode": current_mode(), "state": state,
-                          "plan": policy.plan(state),
+                          "plan": policy.plan(state, aec_available=aec_available()),
                           # Step 3, and the two things the Owner will want at
                           # the glass test: which chain the leg actually opened,
                           # and what the centre and sub are being fed.

@@ -814,6 +814,23 @@ pcm.card_loop_tap_cap { type hw
     device 1
     subdevice 1
 }
+# SUBDEVICE 2 IS THE ECHO CANCELLER'S (item 23 step 6, spike section 6.1).
+# Subdevices 0 and 1 are taken by the merged bus and by the amplifier
+# detector's tap; the card has 4, so 2 is free and is the one to use. The
+# canceller writes the cancelled microphone into card_loop_mic_play and
+# `mic_clean` snoops it back out -- a dsnoop for the same reason speaker_tap
+# and spdif_in are, because more than one consumer will want the microphone
+# and a raw open locks the rest out.
+pcm.card_loop_mic_play { type hw
+    card "$_loopback"
+    device 0
+    subdevice 2
+}
+pcm.card_loop_mic_cap { type hw
+    card "$_loopback"
+    device 1
+    subdevice 2
+}
 ctl.card_loop_ctl { type hw
     card "$_loopback"
 }
@@ -1057,6 +1074,59 @@ if [ -f /etc/udev/rules.d/91-wall-usb-hub-reset.rules ] &&
    [ ! -f /etc/systemd/system/wall-usb-hub-reset@.service ]; then
     warn "audio: 91-wall-usb-hub-reset.rules is installed but wall-usb-hub-reset@.service is not. A hub that enumerates with no ports will NOT be reset and the panel's audio will stay dead until someone toggles authorized by hand."
 fi
+
+# ── the echo canceller (item 23, step 6; HomeHub docs/AEC_SPIKE_2026-09-14.md)
+# BUILT HERE, FROM SOURCE, AND NOT SHIPPED AS A BINARY. The payload carries the
+# three C files and a Makefile; the image carries gcc, libasound2-dev and
+# libspeexdsp-dev (stack/autoinstall/wall/packages.list). Building on the panel
+# is what keeps the daemon matched to the libraries it links against, and this
+# script already re-runs at every boot, so a rebuild is cheap and an out-of-date
+# binary cannot survive an image update.
+#
+# A FAILURE HERE IS A WARNING, NEVER A fail_step. A panel with no canceller is
+# the panel that shipped before step 6: the microphone works, the echo is not
+# removed, and the mic seam below is not moved. That is degraded, not broken.
+if [ -d "$PAYLOAD/aec" ]; then
+    install -d -m 0755 /usr/local/src/wall-aec
+    for _f in wall-audio-aec.c wall_aec_policy.c wall_aec_policy.h \
+              wall_aec_profile.c wall_aec_profile.h Makefile; do
+        [ -f "$PAYLOAD/aec/$_f" ] && install -m 0644 "$PAYLOAD/aec/$_f" "/usr/local/src/wall-aec/$_f"
+    done
+    if ( cd /usr/local/src/wall-aec && make >/tmp/wall-aec-build.log 2>&1 ); then
+        install -m 0755 /usr/local/src/wall-aec/wall-audio-aec /usr/local/sbin/wall-audio-aec
+        log "audio: echo canceller built and installed to /usr/local/sbin/wall-audio-aec"
+    else
+        warn "audio: the echo canceller did NOT build (see /tmp/wall-aec-build.log). The microphone still works; the room's own music will not be removed from it."
+    fi
+    [ -f "$PAYLOAD/wall-audio-aec.service" ] &&
+        install -m 0644 "$PAYLOAD/wall-audio-aec.service" /etc/systemd/system/wall-audio-aec.service
+fi
+
+# THE MIC SEAM IS MOVED ONLY WHEN THE OWNER ASKS. `mic_selected` resolves
+# through WALL_AUDIO_MIC_SOURCE, which wall-audio-output publishes from the
+# switch position; with WALL_AUDIO_AEC=1 the applier publishes `mic_clean`
+# instead in Speaker, and the mic legs then read the cancelled microphone
+# without a single change to their own units.
+#
+# DEFAULT OFF, AND THE DEFAULT IS THE RULING. The canceller's acceptance needs
+# a person in the room -- the double-talk test and the real amplifier-knob move
+# -- so until that has been done the seam stays where it was and the daemon is
+# installed, buildable and startable without any consumer depending on it.
+if [ "${WALL_AUDIO_AEC:-0}" = "1" ]; then
+    if [ -x /usr/local/sbin/wall-audio-aec ]; then
+        enable_unit wall-audio-aec.service
+        log "audio: echo canceller ENABLED (WALL_AUDIO_AEC=1); mic_selected will resolve to mic_clean in Speaker"
+    else
+        warn "audio: WALL_AUDIO_AEC=1 but the canceller is not installed. The mic seam is NOT moved; the raw microphone is still what the legs read."
+    fi
+else
+    # Installed and not enabled is the intended resting state before
+    # acceptance. Said out loud so nobody reads the absence of the unit in
+    # `systemctl list-units` as a deployment that went wrong.
+    systemctl disable wall-audio-aec.service >/dev/null 2>&1 || true
+    log "audio: echo canceller installed but not enabled (WALL_AUDIO_AEC is not 1)"
+fi
+
 systemctl daemon-reload >/dev/null 2>&1 || true
 
 # The trigger daemon's on/off and actuator knobs are rendered into its own env file rather

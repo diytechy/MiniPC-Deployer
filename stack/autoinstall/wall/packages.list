@@ -224,3 +224,22 @@ bluez-alsa-utils
 # and then refuses everything.
 python3-dbus
 python3-gi
+
+# ── the echo canceller (item 23 step 6; HomeHub docs/AEC_SPIKE_2026-09-14.md) ──
+# BUILT ON THE PANEL, NOT SHIPPED AS A BINARY. wall-firstboot.sh compiles
+# stack/autoinstall/wall/aec at every boot, which is what keeps the daemon
+# matched to the libraries it links against and makes an out-of-date binary
+# impossible to leave behind. The cost is a compiler in the image; the
+# alternative is a prebuilt object whose provenance nothing on the panel can
+# check and whose ABI nothing re-verifies after an apt upgrade.
+#
+# The runtime package is libspeexdsp1, which bluez-alsa-utils already pulls in
+# transitively -- named EXPLICITLY here for the same reason python3-dbus is: a
+# transitive dependency is not a guarantee, and an offline image that dropped
+# the package pulling it in would install a daemon that cannot start.
+gcc
+libc6-dev
+make
+libspeexdsp1
+libspeexdsp-dev        # speex_echo_*, speex_preprocess_*, speex_resampler_*
+libasound2-dev         # the daemon opens both PCMs itself; see the spike, 6.1

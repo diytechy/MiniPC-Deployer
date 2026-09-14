@@ -41,7 +41,15 @@ VOLUME_STEP = 4
 # share it.
 MIC_SOURCE_PANEL = "mic_panel"      # ALC255 Analog, card PCH -- D4's "panel mic"
 MIC_SOURCE_HEADSET = "mic_headset"  # 0d8c:0014's mono mic -- D3's headset mic
-MIC_SOURCES = (MIC_SOURCE_PANEL, MIC_SOURCE_HEADSET)
+# The cancelled panel microphone (step 6). It is the SAME capsule as
+# MIC_SOURCE_PANEL with `wall-audio-aec` in front of it, so it is only
+# meaningful in the positions where the panel mic is selected -- and only worth
+# selecting in Speaker, which is the one position where the room's own music is
+# playing into it. It is chosen by the shell, not here: whether the canceller is
+# installed and enabled is a fact about the machine, and this module decides
+# policy from state alone.
+MIC_SOURCE_CLEAN = "mic_clean"
+MIC_SOURCES = (MIC_SOURCE_PANEL, MIC_SOURCE_HEADSET, MIC_SOURCE_CLEAN)
 
 STATE_VERSION = 1
 STATE_SCHEMA = {
@@ -284,7 +292,7 @@ def unavailable_reason(state):
     return None
 
 
-def mic_source(state):
+def mic_source(state, aec_available=False):
     """Which capture device the mic legs read. Follows the OUTPUT position.
 
     Item 23 D3 (Headset) routes "that jack's mic back to the mic input"; D4
@@ -306,6 +314,14 @@ def mic_source(state):
     """
     if state["output"] == "headset" and state["headset_present"]:
         return MIC_SOURCE_HEADSET
+    # THE CANCELLER IS ONLY WORTH INSERTING IN SPEAKER. It removes the ROOM's
+    # own music from the microphone, and the room only has music in Speaker --
+    # in Mute nothing is playing (and the mic is coupled off anyway, item J),
+    # and in Headset the sound is in somebody's ears, not in the air. Putting a
+    # canceller in the path there would be a filter with a silent reference,
+    # which is a slightly worse microphone for no benefit at all.
+    if aec_available and state["output"] == "speaker":
+        return MIC_SOURCE_CLEAN
     return MIC_SOURCE_PANEL
 
 
@@ -580,7 +596,7 @@ MIC_LEGS = ("wall-mic-rear.service", "wall-bt-mic.service")
 ALL_LEGS = SPEAKER_LEGS + HEADSET_LEGS + MIC_LEGS
 
 
-def plan(state):
+def plan(state, aec_available=False):
     """Translate a state into the things the shell must make true.
 
     Kept here, beside the state, so "what speaker mode means" has ONE
@@ -639,7 +655,7 @@ def plan(state):
         "input_muted": bool(state["input_muted"]),
         # Which capture PCM the mic legs open, published to them through
         # /run/wall-panel/audio-mic-source.env and read by `@func getenv`.
-        "mic_source": mic_source(state),
+        "mic_source": mic_source(state, aec_available),
         "mic_live": mic,
         # ── ITEM J, published so the UI never has to derive it ──────────────
         # What the microphone ACTUALLY is, which is the only thing the chrome

@@ -1,0 +1,7 @@
+# Build artifacts. The panel builds from source at every boot (wall-firstboot.sh)
+# and the dev box builds on demand, so a committed binary would only ever be a
+# stale one whose provenance nothing can check.
+wall-audio-aec
+wall-audio-aec-offline
+tests/aec_policy_test
+*.o

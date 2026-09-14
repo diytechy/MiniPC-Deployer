@@ -33,6 +33,10 @@ SUITES=(
     "ai-cli/tests/ai-cli-guards.test.sh"
     "autoinstall/wall/tests/occupancy-power.test.sh"
     "autoinstall/wall/tests/audio-switch.test.sh"
+    # The echo canceller. SKIPS cleanly on a box with no compiler or no
+    # libspeexdsp: that is a machine which cannot answer the question, not a
+    # broken panel.
+    "autoinstall/wall/tests/aec.test.sh"
 )
 
 if [ "${1:-}" = "--list" ]; then

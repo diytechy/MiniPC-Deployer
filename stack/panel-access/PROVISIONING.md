@@ -219,7 +219,7 @@ masked. It never degrades to "no PIN set".
    `/var/lib/wall-panel` as `panel:panel` 0700 — `/var/lib` is root-owned
    0755, so the kiosk cannot create it itself, and without it local mode fails
    closed on every boot (masked and unavailable).
-3. Restart the kiosk (`systemctl restart wall-kiosk-loop`).
+3. Restart the kiosk session (`systemctl restart getty@tty1`; `wall-kiosk-loop` is the audio loopback, not the kiosk).
 4. **At the wall:** Settings now shows *"No panel PIN set…"* and a **Set panel
    PIN** fieldset. Until the PIN exists the panel masks nothing — that is
    deliberate, so the Owner is never locked out of the view that configures the
@@ -253,7 +253,7 @@ a supported configuration, and the one the panel ships in.
   so this is a one-knob flip in both directions.
 * To forget the PIN and the face wrapping key entirely (a forgotten PIN, or
   handing the panel on), as root:
-  `systemctl stop wall-kiosk-loop && rm -f /var/lib/wall-panel/access-state.json /var/lib/wall-panel/access-state.key && systemctl start wall-kiosk-loop`.
+  `systemctl stop getty@tty1 && rm -f /var/lib/wall-panel/access-state.json /var/lib/wall-panel/access-state.key && systemctl start getty@tty1` (stop the kiosk session, not the audio loopback).
   The panel comes back unprovisioned and open, ready for a new PIN at the wall.
   Any face enrollment is unreadable afterwards: delete it in Settings, or remove
   the sensor gallery file, once a new PIN exists.

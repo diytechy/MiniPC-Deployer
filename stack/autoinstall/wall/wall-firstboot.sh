@@ -431,6 +431,7 @@ KIOSK_ENV=/etc/wall-panel/kiosk.env
     echo "WALL_CURSOR_PARK=${WALL_CURSOR_PARK:-true}"
     echo "WALL_CURSOR_PARK_CORNER=${WALL_CURSOR_PARK_CORNER:-bottom-right}"
     echo "WALL_CURSOR_PARK_DELAY=${WALL_CURSOR_PARK_DELAY:-10}"
+    echo "WALL_CURSOR_TRANSPARENT=${WALL_CURSOR_TRANSPARENT:-true}"
     # Publish the same canonical boolean the kernel gate accepts. The sensor
     # process reads this file once at startup, so alternate input spellings
     # must not leave the driver and camera owner disagreeing.
@@ -615,6 +616,41 @@ if [ -f "$PAYLOAD/wall-park-cursor.service" ]; then
     esac
 else
     warn "wall-park-cursor.service is not on the payload — cage's arrow stays in the middle of the wall."
+fi
+
+# ── the pointer image itself: fully transparent ─────────────────────────────
+# Owner item 22 (2026-09-13). Parking the pointer in a corner answered "the
+# arrow is in the MIDDLE of the wall"; it never answered "the arrow appears
+# whenever I touch the screen", and nothing in the renderer can: Chromium sets
+# a cursor image only for a pointer that has entered its surface, and the touch
+# filter's scroll device is deliberately mouse-shaped (udev tags ID_INPUT_MOUSE
+# only for REL_X + REL_Y + BTN_LEFT together, and libinput drops the wheels of
+# anything it has not tagged), so a finger drag is pointer activity on the seat
+# and the compositor draws a cursor for it.
+#
+# So the cursor IMAGE is made nothing. The theme is found by XCURSOR_PATH and
+# must be named `default`: libwlroots.so.12 on the panel carries XCURSOR_PATH
+# and no XCURSOR_THEME string, and cage 0.1.5 asks wlroots for a NULL theme,
+# which resolves to "default". wall-kiosk.sh exports the path.
+if [ -f "$PAYLOAD/panel-invisible-cursor.py" ]; then
+    install -m 0755 "$PAYLOAD/panel-invisible-cursor.py" /usr/local/lib/wall-panel/panel-invisible-cursor.py
+    case "${WALL_CURSOR_TRANSPARENT:-true}" in
+        true|TRUE|yes|1)
+            if python3 /usr/local/lib/wall-panel/panel-invisible-cursor.py                    /usr/local/share/wall-cursors/default >/dev/null 2>&1; then
+                log "cursor: transparent theme written to /usr/local/share/wall-cursors/default"
+            else
+                warn "cursor: panel-invisible-cursor.py failed — the compositor's arrow will show on touch (item 22)."
+            fi ;;
+        *)
+            # ONLY the theme this script generates. /usr/local/share/wall-cursors
+            # is a search PATH, not our property: anything else dropped in it
+            # later must survive this knob being turned off.
+            rm -rf /usr/local/share/wall-cursors/default
+            rmdir /usr/local/share/wall-cursors 2>/dev/null || true
+            log "cursor: WALL_CURSOR_TRANSPARENT is '${WALL_CURSOR_TRANSPARENT}' — normal pointer kept" ;;
+    esac
+else
+    warn "panel-invisible-cursor.py is not on the payload — the compositor's arrow shows on every touch."
 fi
 
 # ── panel audio: line input, volume rocker, amplifier trigger ───────────────

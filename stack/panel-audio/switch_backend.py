@@ -403,15 +403,29 @@ class SwitchApplierBackend:
                 # broker does not know, and zero is a number a client would
                 # compare against (contract 2026-09-14, section 1.3).
                 "generation": None, "requestSeq": None,
+                # Unreadable: the coupling cannot be evaluated and the mute
+                # certainly cannot be confirmed.
+                "inputMuteHeld": False, "inputMutedConfirmed": False,
             }, muted=False, mute_supported=False)
         output = state["output"]
         unavailable = output == "mute" or (output == "headset" and not state["headset_present"])
         reason = "headset_absent" if output == "headset" and not state["headset_present"] else None
+        # ── ITEM J, reported so the chrome never has to derive the rule ────
+        # `inputMuted` is the EFFECTIVE mute -- what the microphone actually is.
+        # `inputMuteHeld` says an independent unmute is refused right now, which
+        # is what lets the UI explain the refusal instead of just showing one.
+        # `inputMutedConfirmed` is the applier's OBSERVATION: false while a mic
+        # leg is (or may still be) transmitting, so a coupled mute is never
+        # reported as successful while the microphone is still open.
+        held = output == "mute"
+        muted_effective = state["input_muted"] or held
         return self._status_envelope({
-            "supported": True, "output": output, "inputMuted": state["input_muted"],
+            "supported": True, "output": output, "inputMuted": muted_effective,
             "available": not unavailable, "reason": reason,
             "volume": self._volume_of(state, output),
             "generation": state["generation"], "requestSeq": state["request_seq"],
+            "inputMuteHeld": held,
+            "inputMutedConfirmed": muted_effective and not state["mic_legs_running"],
         }, muted=output == "mute", mute_supported=True)
 
     @staticmethod
@@ -441,7 +455,8 @@ class SwitchApplierBackend:
         raw = self._state_strict()
         state = {"output": DEFAULT_OUTPUT, "input_muted": True,
                  "headset_present": False, "request_seq": -1, "volume_event_seq": 0,
-                 "generation": 0, "volume": dict(DEFAULT_VOLUME)}
+                 "generation": 0, "mic_legs_running": True,
+                 "volume": dict(DEFAULT_VOLUME)}
         # Same rule as wall_audio_state.normalize (step 4, terra rounds 2-4):
         # the microphone is MUTED unless the document explicitly carries the
         # boolean false, and a document that needed ANY repair comes back
@@ -471,6 +486,10 @@ class SwitchApplierBackend:
         # The epoch (contract 2026-09-14, section 1.1). Absent is an OLDER
         # applier's file, not damage -- the same rule wall_audio_state.normalize
         # applies -- so it does not trip the repair-mutes-the-microphone rule.
+        if isinstance(raw.get("mic_legs_running"), bool):
+            state["mic_legs_running"] = raw["mic_legs_running"]
+        elif "mic_legs_running" in raw:
+            repaired = True
         generation = raw.get("generation")
         if isinstance(generation, int) and not isinstance(generation, bool) and 0 <= generation <= 9007199254740991:
             state["generation"] = generation
@@ -495,6 +514,11 @@ class SwitchApplierBackend:
         elif "volume" in raw:
             repaired = True
         if repaired:
+            state["input_muted"] = True
+        # Item J, mirrored from wall_audio_state.normalize: output Mute couples
+        # the microphone, at the recovery boundary as well as at the request
+        # boundary. The paired test asserts the two copies agree.
+        if state["output"] == "mute":
             state["input_muted"] = True
         return state
 

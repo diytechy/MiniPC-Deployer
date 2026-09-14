@@ -404,7 +404,9 @@ def test_status_reports_routing_unavailable_and_the_switch_present_sr028(panel):
     assert result["switch"] == {"supported": True, "output": "headset",
                                 "inputMuted": True, "available": False,
                                 "reason": "headset_absent", "volume": 60,
-                                "generation": 0, "requestSeq": -1}
+                                "generation": 0, "requestSeq": -1,
+                                "inputMuteHeld": False,
+                                "inputMutedConfirmed": False}
 
 
 def test_status_volume_is_the_selected_outputs_memory_sr028(panel):
@@ -702,7 +704,9 @@ def test_a_sparse_state_file_reports_a_supported_switch_sr028(panel):
     assert result["switch"] == {"supported": True, "output": "speaker",
                                 "inputMuted": True, "available": True,
                                 "reason": None, "volume": 60,
-                                "generation": 0, "requestSeq": -1}
+                                "generation": 0, "requestSeq": -1,
+                                "inputMuteHeld": False,
+                                "inputMutedConfirmed": False}
 
 
 def test_a_lost_mutation_reconciles_on_a_sparse_state_file_llr015(panel, tmp_path):

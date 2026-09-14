@@ -43,8 +43,11 @@
 #       selection is PUBLISHED before anything opens one
 #   B15 the input mute is a REAL mute -- both mic legs stopped, the capture
 #       switch closed, and the adapter's rear pair put back to silence
-#   B16 Owner ruling E: the output Mute position does NOT stop the microphone,
-#       and Owner ruling 7: a selected-but-absent headset tunnels nothing
+#   B16 ITEM J (supersedes Owner ruling E): the output Mute position ALSO stops
+#       the microphone, before it stops the room; an independent unmute is
+#       refused while Mute is selected; leaving Mute retains the input mute
+#       until an explicit unmute. Plus Owner ruling 7: a selected-but-absent
+#       headset tunnels nothing
 #   B17 the mic knobs: the rendered route's explicit zeros, a group of refusals
 #       that each move NOTHING, and a number-moving command that starts no
 #       microphone
@@ -271,7 +274,13 @@ out="$(trim rear=0.5)"
 has "refused" "$out" "B13 there is no knob for the pair wired to the desktop's input"
 
 # B14 — step 4: WHICH MICROPHONE, and when the switch says so.
+# B12 left the switch in Mute, and ITEM J means that latched the input mute. The
+# explicit unmute below is not test scaffolding -- it is the Owner's own rule:
+# leaving Mute retains the microphone's muted state until somebody asks for it
+# back. Without it every assertion after this point would be about a panel whose
+# microphone is deliberately off.
 run set speaker >/dev/null
+run input-mute off >/dev/null
 out="$(run apply-state)"
 has "systemctl start wall-mic-rear.service" "$out" "B14 the rear mic leg starts on Speaker"
 has "systemctl start wall-bt-mic.service" "$out" "B14 and so does the HFP mic return"
@@ -293,6 +302,7 @@ has "systemctl stop wall-bt-mic.service" "$out" "B16 and so is the HFP return"
 
 # B15 — the input mute is a real mute, not a flag the chrome draws.
 run set speaker >/dev/null
+run input-mute off >/dev/null
 out="$(run input-mute on)"
 has "input mute on" "$out" "B15 the mute is journaled"
 has "systemctl stop wall-mic-rear.service" "$out" "B15 the rear leg is STOPPED"
@@ -305,14 +315,46 @@ out="$(run input-mute off)"
 has "sset Capture cap" "$out" "B15 un-mute re-opens the capture switch"
 has "systemctl start wall-mic-rear.service" "$out" "B15 and the leg comes back"
 
-# B16 — Owner ruling E, the other half: the output Mute position silences the
-# room and NOT the microphone. "the mic has its own mute", verbatim.
+# B16 — ITEM J, which SUPERSEDES Owner ruling E: the output Mute position now
+# silences the room AND the microphone. Ruling E's "the mic has its own mute"
+# was reversed by the Owner on 2026-09-14; the button is still separate, the
+# coupling is new. This block used to assert the opposite and is rewritten
+# rather than deleted, so the supersession is visible where it happened.
 out="$(run set mute)"
 has "systemctl stop wall-speaker-out.service" "$out" "B16 Mute stops the room"
-has "systemctl start wall-mic-rear.service" "$out" \
-    "B16 and does NOT stop the microphone (ruling E)"
-has "microphone: mic_panel" "$out" "B16 with no headset to take it from, Mute uses the panel's own"
-run set speaker >/dev/null
+has "systemctl stop wall-mic-rear.service" "$out" \
+    "B16 and ALSO stops the microphone (item J)"
+has "systemctl stop wall-bt-mic.service" "$out" "B16 including the HFP return"
+hasnt "systemctl start wall-mic-rear.service" "$out" "B16 and starts neither"
+has "sset Capture nocap" "$out" "B16 the capture switch is closed too"
+has "input mute on (coupled to the output Mute position, item J)" "$out" \
+    "B16 the coupling is journaled, not silent"
+has "microphone: mic_panel" "$out" "B16 with no headset to take it from, Mute names the panel's own"
+# THE MIC LEGS ARE STOPPED BEFORE ANY OUTPUT LEG MOVES. A coupled mute arrives
+# as ONE request; stopping the room first would leave a window in which the
+# person believes they are unheard and the microphone is still forwarding.
+mic_stop="$(printf '%s\n' "$out" | grep -n 'systemctl stop wall-mic-rear' | head -1 | cut -d: -f1)"
+out_stop="$(printf '%s\n' "$out" | grep -n 'systemctl stop wall-speaker-out' | head -1 | cut -d: -f1)"
+{ [ -n "$mic_stop" ] && [ -n "$out_stop" ] && [ "$mic_stop" -lt "$out_stop" ]; } \
+    && pass "B16 the microphone is stopped BEFORE the room" \
+    || fail "B16 the room was silenced before the microphone was"
+
+# An independent unmute is REFUSED while Mute is selected, and refusing it
+# changes nothing at all.
+before="$(cat "$STATE")"
+out="$(run input-mute off)"
+has "refused: input unmute is held" "$out" "B16 an unmute is refused while Mute is selected"
+hasnt "systemctl start wall-mic-rear.service" "$out" "B16 and starts no microphone"
+eq "$before" "$(cat "$STATE")" "B16 and the refusal wrote nothing"
+
+# Leaving Mute does NOT bring the microphone back on its own.
+out="$(run set speaker)"
+hasnt "systemctl start wall-mic-rear.service" "$out" \
+    "B16 Speaker after Mute retains the input mute (Owner, 2026-09-14)"
+has "input stays muted after leaving Mute" "$out" "B16 and says so"
+# Only an explicit unmute does.
+out="$(run input-mute off)"
+has "systemctl start wall-mic-rear.service" "$out" "B16 an explicit unmute brings it back"
 
 # B17 — the mic knobs, and the generated route that is the whole of the
 # separation between the microphone and the speakers.

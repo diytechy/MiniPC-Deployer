@@ -1551,14 +1551,29 @@ def apply_plan(state, applier):
     # `apply-state` runs under wall-audio-state.service, which firstboot waits
     # on, and a non-zero return there is a red firstboot and a panel that looks
     # broken at the glass. That asymmetry is the whole point.
+    #
+    # THE MIC LEGS ARE STOPPED FIRST, BEFORE ANY OUTPUT LEG MOVES (item J). The
+    # ordering matters because a coupled mute arrives as ONE request that
+    # changes both: `set_output mute` mutes the room and the microphone
+    # together. Stopping the output first and the microphone second would leave
+    # a window -- short, but real, and it is the window in which the room has
+    # gone quiet and the person believes they are unheard -- where the mic is
+    # still forwarding. Doing it in this order means the coupled mute takes
+    # effect NO LATER than the output change it came with.
+    mic_stopped = True
+    for unit in policy.MIC_LEGS:
+        if not wanted["legs"].get(unit, False):
+            # Stopped HARDER than the output legs, and verified: see
+            # stop_mic_leg_hard for why a counted failure is not enough.
+            if stop_mic_leg_hard(applier, unit):
+                continue
+            failures += 1
+            mic_stopped = False
     for unit, should_run in wanted["legs"].items():
+        if unit in policy.MIC_LEGS:
+            continue
         if not should_run:
-            if unit in policy.MIC_LEGS:
-                # Stopped HARDER than the output legs, and verified: see
-                # stop_mic_leg_hard for why a counted failure is not enough.
-                failures += 0 if stop_mic_leg_hard(applier, unit) else 1
-            else:
-                failures += applier.command(["/usr/bin/systemctl", "stop", unit])
+            failures += applier.command(["/usr/bin/systemctl", "stop", unit])
     # Mixer mutes are not required: a card that has just been unplugged has no
     # controls to set, and that is the normal headset case, not an error.
     applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",
@@ -1665,6 +1680,18 @@ def apply_plan(state, applier):
     if wanted["reason"]:
         log("output %s is UNAVAILABLE (%s): every output silent"
             % (state["output"], wanted["reason"]))
+    # ITEM J'S EVIDENCE, NOT ITS INTENTION. `mic_legs_running` is what the
+    # applier OBSERVED after the pass: true while any mic leg is meant to run,
+    # and -- the case that matters -- true when a leg that was meant to STOP
+    # would not, which is how the broker comes to report `inputMutedConfirmed:
+    # false` instead of a success nobody can hear is a lie.
+    if wanted["mic_live"]:
+        state["mic_legs_running"] = True
+    else:
+        state["mic_legs_running"] = not mic_stopped
+        if not mic_stopped:
+            log("REFUSING TO CONFIRM THE INPUT MUTE: a mic leg is still "
+                "transmitting. The state records it as unconfirmed.")
     return failures
 
 
@@ -1991,7 +2018,16 @@ def _locked_apply(arguments):
         if boot_mark is not None:
             write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
         return 0
+    before_observation = state.get("mic_legs_running")
     failures = apply_plan(state, Applier(dry_run=arguments.dry_run))
+    # A SECOND WRITE, AND IT IS NOT REDUNDANT. Everything else in the state is
+    # an INTENTION and is persisted before the apply, so that a crash halfway
+    # through cannot lose what the Owner asked for. `mic_legs_running` is an
+    # OBSERVATION and cannot exist until the apply has happened -- and it is the
+    # one fact that decides whether the broker may report the coupled mute as
+    # confirmed, so it must reach the file even when the apply failed.
+    if state.get("mic_legs_running") != before_observation:
+        save_state(state, arguments.state, dry_run=arguments.dry_run)
     # Published only now, with the graph in the position the state asked for. A
     # stamp written before the apply would declare the boot settled while the
     # legs were still moving, and any adapter that enumerated in between would

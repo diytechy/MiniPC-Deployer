@@ -85,6 +85,14 @@ STATE_SCHEMA = {
     # `apply-state` finding no epoch marker in /run (which is tmpfs, so: once per
     # boot). Nothing compares a `request_seq` across a change in this number.
     "generation": 0,
+    # ITEM J'S OBSERVATION. Written by the applier AFTER a pass, not before:
+    # every other field here is an intention, and this one is evidence. True
+    # means a mic leg is (or may still be) transmitting. It defaults to True
+    # because "we have never looked" must not read as "we checked and it is
+    # silent" -- the UI's `inputMutedConfirmed` is derived from it, and an
+    # unconfirmed mute shown as confirmed is the one error in this design that
+    # nobody in the room can hear.
+    "mic_legs_running": True,
     "version": STATE_VERSION,
 }
 
@@ -184,6 +192,13 @@ def normalize(raw):
     # document, and treating it as damage would mute the microphone on every
     # panel the first time the new applier reads the old file. An epoch that is
     # PRESENT and malformed is damage like any other.
+    # The observation. Absent is an older file, not damage -- but it still reads
+    # as True, because the default IS the cautious answer here and an absent
+    # observation is exactly "we have never looked".
+    if isinstance(raw.get("mic_legs_running"), bool):
+        state["mic_legs_running"] = raw["mic_legs_running"]
+    elif "mic_legs_running" in raw:
+        repaired = True
     generation = raw.get("generation")
     if isinstance(generation, int) and not isinstance(generation, bool) and 0 <= generation <= 9007199254740991:
         state["generation"] = generation
@@ -213,6 +228,15 @@ def normalize(raw):
     elif "volume" in raw:
         repaired = True
     if repaired:
+        state["input_muted"] = True
+    # ITEM J AT THE RECOVERY BOUNDARY. Every caller normalizes before it decides
+    # anything -- `apply_event` does it, the applier does it on load, the broker
+    # mirrors it -- so this one line is what makes the coupling hold for the
+    # paths that are not requests at all: boot, resume, a udev event, a rolled
+    # back state file, a document written by an applier that predates item J.
+    # Without it a panel could come up in Mute with a live microphone and no
+    # request would ever be made to notice.
+    if state["output"] == "mute":
         state["input_muted"] = True
     return state
 
@@ -268,10 +292,17 @@ def mic_source(state):
     consequence of the output switch and is not a control of its own -- there is
     no fourth button on the glass, and the Owner never asked for one.
 
-    In `mute` the panel mic is used, because Owner ruling E is explicit that the
-    output Mute position does NOT mute the microphone ("the mic has its own
-    mute"). `mute` names no output device, so there is no headset to take the
-    mic from and the built-in one is the only defensible answer.
+    In `mute` the panel mic is NAMED, and it is never opened: item J couples the
+    output Mute position to the input mute, so `mic_live` is false there and no
+    leg is started at all. The name still has to be a valid one, because it is
+    published into /run for the legs' `@func getenv` whether or not they run,
+    and `mute` names no output device to take a headset mic from.
+
+    ITEM J SUPERSEDES OWNER RULING E HERE, and the supersession is the whole
+    point of the item: ruling E said the output Mute position does NOT mute the
+    microphone ("the mic has its own mute"), and the Owner's 2026-09-14 ruling
+    replaces that. The mic button still exists and is still separate; what has
+    changed is that selecting output Mute now also mutes the input.
     """
     if state["output"] == "headset" and state["headset_present"]:
         return MIC_SOURCE_HEADSET
@@ -294,6 +325,13 @@ def mic_live(state):
       whole design that nobody could hear happening.
     """
     if state["input_muted"]:
+        return False
+    # ITEM J. Selecting output Mute mutes the microphone too. In practice this
+    # line is belt to the braces of `normalize` and `_set_output`, which both
+    # latch `input_muted` true in the mute position -- but it is the line that
+    # makes the coupling true of a state dict from ANY source, including one a
+    # future caller builds by hand, and it costs nothing.
+    if state["output"] == "mute":
         return False
     if state["output"] == "headset" and not state["headset_present"]:
         return False
@@ -330,10 +368,43 @@ def _set_output(state, event):
     if output not in OUTPUTS:
         raise StateError("output must be one of %s" % (", ".join(OUTPUTS),))
     if state["output"] == output:
+        # ALREADY THERE IS STILL A COUPLING POINT. A state that says `mute` with
+        # a stored `input_muted: false` should not exist -- `normalize` latches
+        # it -- but a deduplicated request must not be the one path that leaves
+        # it standing if it ever does.
+        if output == "mute" and not state["input_muted"]:
+            state["input_muted"] = True
+            return state, ["output already mute; input mute re-asserted (item J)"]
         return state, ["output already %s" % output]
     previous = state["output"]
     state["output"] = output
     lines = ["output %s -> %s (level %d%%)" % (previous, output, volume_of(state))]
+    # ── ITEM J: SELECTING MUTE LATCHES THE INPUT MUTE ─────────────────────────
+    # The Owner's 2026-09-14 ruling has two halves and they are only consistent
+    # if the coupling is a LATCH on the stored flag rather than a mask over it:
+    #
+    #   (a) "Selecting speaker/output Mute also mutes microphone transmission."
+    #   (b) "No inferred requirement to unmute the microphone when leaving
+    #        output Mute: default to retaining its muted state until an explicit
+    #        microphone-unmute action."
+    #
+    # A mask -- leaving `input_muted` alone and hiding it while in mute -- gives
+    # (a) and breaks (b): leaving mute would restore the unmuted flag
+    # underneath and the microphone would come back live without anyone asking
+    # for it, which is the one failure in this design nobody in the room can
+    # hear. So entering mute WRITES the flag, and leaving mute writes nothing.
+    #
+    # THE CONSEQUENCE, STATED PLAINLY BECAUSE IT IS A REAL COST: a person who
+    # was on Speaker with the microphone live, taps Mute, then taps Speaker
+    # again, comes back with the microphone MUTED and must press the mic button
+    # to get it back. That is what (b) asks for. It is an implementation
+    # interpretation recorded for Owner review, not a previously ratified rule.
+    if output == "mute" and not state["input_muted"]:
+        state["input_muted"] = True
+        lines.append("input mute on (coupled to the output Mute position, item J)")
+    elif previous == "mute" and state["input_muted"]:
+        lines.append("input stays muted after leaving Mute until an explicit "
+                     "unmute (item J)")
     if unavailable_reason(state):
         # Said out loud because the panel is about to be silent ON PURPOSE, and
         # a silent panel with no journal line looks exactly like a broken one.
@@ -347,6 +418,15 @@ def _set_input_mute(state, event):
     # request that forgot to say which way would silently toggle the mic.
     if not isinstance(muted, bool):
         raise StateError("muted must be boolean")
+    # ITEM J: AN INDEPENDENT UNMUTE IS HELD WHILE OUTPUT MUTE IS SELECTED.
+    # REFUSED, not silently dropped: the plan requires the coupling to be
+    # unbypassable, and a request that changed nothing while answering
+    # "accepted" would leave the chrome painting a live microphone over a dead
+    # one. A StateError reaches the caller as a refusal the UI can say out loud,
+    # and `input_mute_held` in the plan is what lets it say WHY.
+    if muted is False and state["output"] == "mute":
+        raise StateError("input unmute is held while the output switch is in "
+                         "mute; move the output switch first")
     if state["input_muted"] == muted:
         return state, ["input mute already %s" % ("on" if muted else "off")]
     state["input_muted"] = muted
@@ -561,5 +641,17 @@ def plan(state):
         # /run/wall-panel/audio-mic-source.env and read by `@func getenv`.
         "mic_source": mic_source(state),
         "mic_live": mic,
+        # ── ITEM J, published so the UI never has to derive it ──────────────
+        # What the microphone ACTUALLY is, which is the only thing the chrome
+        # may draw. Identical to `input_muted` today, because the coupling is a
+        # latch rather than a mask; it is published as its own name so that a
+        # consumer reads the fact rather than reconstructing the rule, and so
+        # that a future change of mechanism cannot silently change what the UI
+        # shows.
+        "input_muted_effective": bool(state["input_muted"]) or state["output"] == "mute",
+        # WHY it is muted, for the refusal the UI has to explain. True means an
+        # independent unmute is refused right now and the person must move the
+        # output switch first.
+        "input_mute_held": state["output"] == "mute",
         "reason": unavailable_reason(state),
     }

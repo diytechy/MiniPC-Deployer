@@ -570,7 +570,10 @@ class AudioBroker:
     # (2026-09-14, section 1.3) and are OPTIONAL for exactly the reason the
     # whole `switch` block is: a backend that predates them must stay valid.
     SWITCH_FIELDS = {"supported", "output", "inputMuted", "available", "reason", "volume"}
-    SWITCH_OPTIONAL_FIELDS = {"generation", "requestSeq"}
+    # `inputMuteHeld` and `inputMutedConfirmed` were added by item J and are
+    # optional on the same rule.
+    SWITCH_OPTIONAL_FIELDS = {"generation", "requestSeq",
+                              "inputMuteHeld", "inputMutedConfirmed"}
 
     def _safe_switch(self, value: object) -> None:
         """Validate the switch status block. Implements: SR-028, LLR-015."""
@@ -590,6 +593,9 @@ class AudioBroker:
         for field in ("supported", "inputMuted", "available"):
             if not isinstance(value[field], bool):
                 raise BrokerError("unsafe_backend_result", "switch state is invalid")
+        for field in ("inputMuteHeld", "inputMutedConfirmed"):
+            if field in value and not isinstance(value[field], bool):
+                raise BrokerError("unsafe_backend_result", "switch mute coupling is invalid")
         if value["reason"] is not None:
             self._safe_string(value["reason"], 32)
         volume = value["volume"]

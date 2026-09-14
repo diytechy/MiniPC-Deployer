@@ -103,6 +103,8 @@ class SwitchApplierBackend:
             return self._status()
         if method == "telemetry":
             return {"available": False}
+        if method == "request_landed":
+            return {"accepted": self._landed(params["seq"])}
         handler = getattr(self, "_" + method, None)
         if handler is None:
             # Every routing verb lands here. It is a refusal, not a crash: the
@@ -225,6 +227,36 @@ class SwitchApplierBackend:
             return -1
         seq = raw.get("seq") if isinstance(raw, dict) else None
         return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else -1
+
+    def request_landed(self, seq: int) -> bool:
+        """Declared so the broker knows this backend can answer the question.
+
+        The broker calls it through the ordinary seam as the internal method
+        `request_landed`; this attribute exists so `hasattr` can find it on a
+        backend that has a volatile effect to check. Implements: LLR-015.
+        """
+        return self._landed(seq)
+
+    def _landed(self, seq: object) -> bool:
+        """Is the request with this sequence still going to be applied?
+
+        True if the applier has already recorded it, or if the request file is
+        still sitting there waiting to be consumed. False means the file is gone
+        and the applier never saw it -- the runtime directory did not survive a
+        restart -- so the acknowledgement the broker journaled is no longer true.
+        """
+        from audio_router import BrokerError
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            return False
+        try:
+            if self._applied_seq() >= seq:
+                return True
+        except BrokerError:
+            # The state file cannot be read, so nothing here can say the request
+            # landed. Re-doing an idempotent request is the safe answer, and the
+            # re-do refuses with the same unreadable-state error.
+            return False
+        return self._pending_seq() >= seq
 
     def _require_applier(self) -> None:
         """Refuse before writing anything nobody will read.

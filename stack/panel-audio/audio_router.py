@@ -332,6 +332,7 @@ class AudioBroker:
         if not self._mutation_lock.acquire(timeout=self.backend_timeout_seconds):
             raise BrokerError("broker_busy", "another mutation is still running")
         try:
+            replaying = False
             cached = self.state.completed(signature)
             if cached is not None:
                 if (not isinstance(cached, dict) or set(cached) != {"id", "generation", "ok", "result"} or
@@ -339,10 +340,26 @@ class AudioBroker:
                         cached.get("ok") is not True):
                     raise BrokerError("unsafe_state", "persisted mutation result is invalid")
                 self._ensure_safe_result(method, cached.get("result"))
-                return cached
+                if self._effect_survived(cached.get("result")):
+                    return cached
+                # THE JOURNAL OUTLIVED THE EFFECT (terra 4.1). This broker's
+                # completed record is in StateDirectory and the request it
+                # acknowledged is one file in RuntimeDirectory, which systemd
+                # removes when the unit stops. A restart between the write and
+                # the applier consuming it leaves a journal saying the switch
+                # moved and nothing anywhere that will move it. Replaying that
+                # acknowledgement is the one case where deduplication lies, so
+                # the request is dispatched again instead -- which is safe
+                # precisely for these verbs, because every one of them is
+                # idempotent: asking for the position, the microphone state or
+                # the level that was already asked for changes nothing twice.
+                replaying = True
             if self.state.uncertain:
                 self._reconcile()
-            if request_generation != self.generation:
+            # A replay carries the generation it was first sent with, which the
+            # first completion has already advanced past. It is the SAME logical
+            # request, so it is neither stale nor allowed to advance it again.
+            if not replaying and request_generation != self.generation:
                 raise BrokerError("stale_generation", "request generation is stale")
             if self.generation >= JS_SAFE_INTEGER:
                 raise BrokerError("generation_exhausted", "generation limit reached")
@@ -359,13 +376,36 @@ class AudioBroker:
             result = self._backend_call("call", method, params)
             self._ensure_safe_result(method, result)
             accepted = result["accepted"] is True
-            response_generation = self.generation + (1 if accepted else 0)
-            response = {"id": request_id, "generation": response_generation,
+            increment = accepted and not replaying
+            response = {"id": request_id, "generation": self.generation + (1 if increment else 0),
                         "ok": True, "result": result}
-            self.state.finish(signature, response, increment=accepted)
+            self.state.finish(signature, response, increment=increment)
             return response
         finally:
             self._mutation_lock.release()
+
+    def _effect_survived(self, result: object) -> bool:
+        """Whether the effect a completed reply acknowledged is still in force.
+
+        Only a result carrying a `seq` makes a checkable claim, and only a
+        backend that offers the internal `request_landed` observation can answer
+        it; anything else is taken at its word, exactly as before. The
+        observation is dispatched through the ordinary backend seam, like
+        `_reconcile`'s `status`, so a backend that hangs answering it is still
+        bounded and killable. It is NOT an IF-015 method: `routing.METHODS` does
+        not contain it, so no client can ask for it.
+        """
+        if not isinstance(result, dict) or "seq" not in result:
+            return True
+        if not hasattr(self.backend, "request_landed"):
+            return True
+        try:
+            observed = self._backend_call("call", "request_landed", {"seq": result["seq"]})
+        except BrokerError:
+            # Failing to look is not the same as having looked, and the safe
+            # answer here is the one that re-does an idempotent request.
+            return False
+        return isinstance(observed, dict) and observed.get("accepted") is True
 
     def _reconcile(self) -> None:
         """Settle a pending journal entry, or refuse until an operator does.

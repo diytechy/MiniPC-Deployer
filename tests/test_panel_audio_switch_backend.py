@@ -277,10 +277,65 @@ def test_a_repeated_request_replays_the_same_sequence_sr023(panel, tmp_path):
                          state_path=str(tmp_path / "journal.json"))
     raw = wire("set_output", {"output": "headset"}, echo_seq=True)
     first = reply(broker, raw)
-    panel["request"].unlink()
     second = reply(broker, raw)
     assert second["result"]["seq"] == first["result"]["seq"] == 4_000
-    assert not panel["request"].exists(), "the replay writes no second request"
+    assert second["generation"] == first["generation"]
+    assert written(panel)["seq"] == 4_000, "the replay writes no second request"
+
+
+def test_a_replay_redoes_a_request_the_runtime_directory_lost_sr023(panel, tmp_path):
+    """terra 4.1: the journal outliving its effect must not be a lie.
+
+    The completed record lives in StateDirectory and the request it acknowledged
+    is one file in RuntimeDirectory, which systemd removes when the unit stops.
+    A restart between the write and the applier consuming it would otherwise
+    leave a journal saying the switch moved and nothing anywhere that will move
+    it, and the client's retry would be told it had already succeeded.
+    """
+    broker = AudioBroker(backend(panel, clock=[4_000 * US, 4_007 * US]),
+                         state_path=str(tmp_path / "journal.json"))
+    raw = wire("set_output", {"output": "headset"}, echo_seq=True)
+    first = reply(broker, raw)
+    panel["request"].unlink()          # the runtime directory did not survive
+    second = reply(broker, raw)
+    assert second["ok"] is True
+    assert written(panel)["event"] == {"kind": "set_output", "output": "headset"}
+    assert second["result"]["seq"] == written(panel)["seq"] == 4_007
+    # The SAME logical request: it is neither stale nor allowed to advance the
+    # generation a second time.
+    assert second["generation"] == first["generation"]
+
+
+def test_a_replay_is_not_redone_once_the_applier_has_recorded_it_sr028(panel, tmp_path):
+    """The request file is gone because it was CONSUMED, not lost."""
+    broker = AudioBroker(backend(panel, clock=[4_000 * US, 4_007 * US]),
+                         state_path=str(tmp_path / "journal.json"))
+    raw = wire("set_output", {"output": "headset"}, echo_seq=True)
+    first = reply(broker, raw)
+    panel["request"].unlink()
+    set_state(panel, output="headset", request_seq=4_000)
+    second = reply(broker, raw)
+    assert second["result"]["seq"] == first["result"]["seq"] == 4_000
+    assert not panel["request"].exists(), "an applied request is not re-sent"
+
+
+def test_a_replay_whose_state_cannot_be_read_refuses_rather_than_lying(panel, tmp_path):
+    broker = AudioBroker(backend(panel, clock=[4_000 * US, 4_007 * US]),
+                         state_path=str(tmp_path / "journal.json"))
+    raw = wire("set_output", {"output": "headset"}, echo_seq=True)
+    reply(broker, raw)
+    panel["request"].unlink()
+    panel["state"].write_text("not json at all", encoding="utf-8")
+    second = reply(broker, raw)
+    assert second["ok"] is False and second["error"]["code"] == "backend_unavailable"
+
+
+def test_request_landed_is_not_a_method_any_client_can_ask_for_sr023(panel):
+    """It is an internal observation, like the reconciliation status call."""
+    with pytest.raises(PolicyError):
+        validate_action("request_landed", {"seq": 1})
+    answer = reply(AudioBroker(backend(panel)), wire("request_landed", {"seq": 1}))
+    assert answer["ok"] is False and answer["error"]["code"] == "policy_refused"
 
 
 # --- the legacy verb ---------------------------------------------------------

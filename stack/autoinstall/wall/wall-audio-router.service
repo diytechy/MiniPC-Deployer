@@ -14,6 +14,15 @@ Group=panel
 EnvironmentFile=/etc/wall-panel/audio-router.env
 RuntimeDirectory=wall-audio-router
 RuntimeDirectoryMode=0700
+# The switch request the broker writes lives in this directory, and the ROOT
+# applier is what consumes it, through wall-audio-apply.path. Without this,
+# systemd removes the directory when the unit stops, so a restart in the moment
+# between the write and the applier reading it would take the request with it --
+# and the broker's own completed journal, which lives in StateDirectory, would
+# outlive the effect it acknowledged. Preserved across a restart, not across a
+# reboot: after a boot the applier re-asserts the stored state anyway, and the
+# broker re-dispatches a completed request whose effect it can no longer find.
+RuntimeDirectoryPreserve=restart
 StateDirectory=wall-audio-router
 StateDirectoryMode=0700
 UMask=0077

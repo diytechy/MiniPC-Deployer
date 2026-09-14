@@ -136,5 +136,73 @@ PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" ENV_FILE="$TMP/env" \
 [ ! -s "$CAPTURE" ] || {
     echo "FAIL: refused legacy invocation still posted combined state" >&2; exit 1; }
 
+# ── F2: A REFUSAL IS NOT SILENCE ─────────────────────────────────────────────
+# On 2026-09-13 the composite lane's row had just been added to the Sheet and
+# the tracker had not reloaded it, so every post from library-backup.sh came
+# back {"error":"invalid_id"}. The docker-exec branch reported all of them as
+# `HTTP 000` — which reads as "nothing answered" — and the night's verified
+# success was lost with no diagnosable cause in the journal. The status line and
+# the body are both available (library-guard.sh has always read them); this
+# locks them being read here too.
+mkdir -p "$TMP/dockerbin"
+cat >"$TMP/dockerbin/docker" <<'EOF'
+#!/usr/bin/env bash
+# A tracker that refuses the id, exactly as the live one did: GNU wget prints
+# the status line to stderr under -S and the body to stdout under
+# --content-on-error, then exits 8.
+case "$1" in
+  exec)
+    printf '  HTTP/1.1 400 Bad Request\n  Content-Type: application/json\n  Cache-Control: no-store\n' >&2
+    printf '{"error":"invalid_id"}\n'
+    exit 8 ;;
+esac
+exit 0
+EOF
+cat >"$TMP/dockerbin/docker-ok" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  exec) printf '  HTTP/1.1 200 OK\n' >&2; exit 0 ;;
+esac
+exit 0
+EOF
+cat >"$TMP/dockerbin/docker-dead" <<'EOF'
+#!/usr/bin/env bash
+# Nothing answered: no status line at all, which is the ONLY case that is 000.
+case "$1" in
+  exec) printf 'wget: unable to resolve host address\n' >&2; exit 4 ;;
+esac
+exit 0
+EOF
+chmod +x "$TMP/dockerbin/docker" "$TMP/dockerbin/docker-ok" "$TMP/dockerbin/docker-dead"
+
+state_post() { # state_post MOCK FIELD VALUE -> prints "<code>|<log lines>"
+    local mock="$1" field="$2" value="$3" out
+    mkdir -p "$TMP/run-$$"; cp "$TMP/dockerbin/$mock" "$TMP/run-$$/docker"; chmod +x "$TMP/run-$$/docker"
+    out="$(PATH="$TMP/run-$$:$PATH" NAGLIGHT_FEED_CONTAINER=tracker \
+        FILE_SHARE_BACKUP_STATE_URL=http://127.0.0.1:8787/api/backup-state \
+        FILE_SHARE_BACKUP_FEED_ID=file-share-backup-health \
+        bash -c '
+            log() { printf "LOG %s\n" "$*"; }; warn() { printf "WARN %s\n" "$*"; }
+            . "$1"
+            post_file_share_backup_state "$2" "$3"
+            printf "CODE %s\n" "$FILE_SHARE_BACKUP_STATE_LAST_CODE"
+        ' _ "$COMMON" "$field" "$value" 2>&1)"
+    rm -rf "$TMP/run-$$"
+    printf '%s' "$out"
+}
+
+REFUSED="$(state_post docker lastSuccess 2026-09-08T03:04:05Z)"
+printf '%s' "$REFUSED" | grep -q 'CODE 400' || {
+    echo "FAIL: a refused post must report HTTP 400, not 000 — got: $REFUSED" >&2; exit 1; }
+printf '%s' "$REFUSED" | grep -q 'invalid_id' || {
+    echo "FAIL: the tracker's own reason must reach the journal — got: $REFUSED" >&2; exit 1; }
+OK="$(state_post docker-ok runState verifying)"
+printf '%s' "$OK" | grep -q 'CODE 200' || {
+    echo "FAIL: an accepted post must still report 200 — got: $OK" >&2; exit 1; }
+DEAD="$(state_post docker-dead runState idle)"
+printf '%s' "$DEAD" | grep -q 'CODE 000' || {
+    echo "FAIL: only an unanswered request may report 000 — got: $DEAD" >&2; exit 1; }
+echo "PASS: F2 a refused state post is reported as a refusal, with the tracker's reason"
+
 echo "PASS: TC-001 SR-018 producer payload separation and upgrade retirement"
-echo "1 PASS  0 FAIL"
+echo "2 PASS  0 FAIL"

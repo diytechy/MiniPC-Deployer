@@ -6,6 +6,10 @@ build container runs, and the wiring between them and the committed lock.
 import hashlib
 import importlib.util
 import zipfile
+import os
+import re
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,6 +18,27 @@ WALL = Path(__file__).resolve().parents[1] / "stack/autoinstall/wall"
 INSTALLER = WALL / "install-wall-capabilities.sh"
 BUILD = WALL / "build-sensor-wheelhouse.sh"
 LOCK = WALL / "sensor-wheelhouse/requirements.lock"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX runtime traversal permissions")
+@pytest.mark.parametrize("variable,destination", [("venv_new", "venv"), ("models_new", "models")])
+def test_published_runtime_is_traversable_by_service_uid(tmp_path, variable, destination):
+    text = INSTALLER.read_text(encoding="utf-8")
+    unit = (WALL / "wall-sensors.service").read_text(encoding="utf-8")
+    assert "User=wall-sensors" in unit
+    assert "ExecStart=/opt/wall-sensors/venv/bin/python" in unit
+    # Execute the actual publication commands against a private mktemp-style
+    # directory; omitting chmod reproduces the live systemd 203/EXEC failure.
+    match = re.search(r'    chmod 0755 "\$' + variable + r'"\n    mv -T "\$' + variable + r'" /opt/wall-sensors/' + destination, text)
+    assert match, "runtime must become traversable before publication"
+    source = tmp_path / "private-staging"
+    source.mkdir(mode=0o700)
+    command = match.group().replace("/opt/wall-sensors/" + destination, '"$published"')
+    subprocess.run(["bash", "-eu", "-c", command], check=True,
+                   env={**os.environ, variable: str(source), "published": str(tmp_path / destination)})
+    mode = stat.S_IMODE((tmp_path / destination).stat().st_mode)
+    assert mode == 0o755
+    assert not source.exists()
 
 
 def _load(name):

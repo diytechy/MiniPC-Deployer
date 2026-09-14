@@ -105,6 +105,8 @@ else
     "$venv_new/bin/python" -c 'import numpy, PIL, cryptography, onnxruntime, dbus_next'
     rm -rf /opt/wall-sensors/venv.previous
     [ ! -e /opt/wall-sensors/venv ] || mv -T /opt/wall-sensors/venv /opt/wall-sensors/venv.previous
+    # mktemp creates 0700; the unprivileged service must traverse this tree.
+    chmod 0755 "$venv_new"
     mv -T "$venv_new" /opt/wall-sensors/venv
     venv_new=
     install -m 0644 "$wheelhouse/requirements.lock" /opt/wall-sensors/requirements.lock
@@ -145,6 +147,8 @@ PY
     chmod 0644 "$models_new"/*.onnx "$models_new/manifest.json"
     rm -rf /opt/wall-sensors/models.previous
     [ ! -e /opt/wall-sensors/models ] || mv -T /opt/wall-sensors/models /opt/wall-sensors/models.previous
+    # Model bytes are public runtime inputs, not enrollment or private keys.
+    chmod 0755 "$models_new"
     mv -T "$models_new" /opt/wall-sensors/models
     models_new=
     rm -rf /opt/wall-sensors/models.previous

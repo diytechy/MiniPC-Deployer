@@ -81,7 +81,7 @@ has "systemctl stop wall-bus-headset.service" "$out" "B1 headset leg is stopped"
 has "sset Speaker unmute" "$out" "B1 the adapter is unmuted"
 eq "2" "$(printf '%s\n' "$out" | grep -c 'sset Bus ')" \
     "B1 the level is set before the leg starts and re-asserted after it"
-has "aplay -q -D speaker_out /dev/null" "$out" \
+has "aplay -q -D speaker_out -t raw -f S16_LE -r 48000 -c 2 -s 1 /dev/zero" "$out" \
     "B1 the softvol control is declared by the applier, with no frames"
 last="$(printf '%s\n' "$out" | grep -E 'systemctl|amixer' | tail -1)"
 has "sset Bus 60%" "$last" "B1 the level is applied LAST (the softvol must exist first)"
@@ -164,7 +164,7 @@ eq "true" "$(python3 -c 'import json,sys;print(str(json.load(open(sys.argv[1]))[
 # does NOT open a PCM when the control answers straight away.
 rm -f "$STATE"
 out="$(run apply-state)"
-has "aplay -q -D speaker_out /dev/null" "$out" \
+has "aplay -q -D speaker_out -t raw -f S16_LE -r 48000 -c 2 -s 1 /dev/zero" "$out" \
     "B10 the control is declared before the leg starts"
 preopen="$(printf '%s\n' "$out" | grep -n 'aplay' | head -1 | cut -d: -f1)"
 first_start="$(printf '%s\n' "$out" | grep -n 'systemctl start' | head -1 | cut -d: -f1)"
@@ -196,7 +196,7 @@ hasnt "systemctl" "$out" "B7 no unit is touched outside bus mode"
 printf 'bus\n' > "$WALL_PANEL_CONF_DIR/audio-mode"
 rm -f "$STATE"
 out="$(run apply-state)"
-has "aplay -q -D speaker_multi /dev/null" "$out" \
+has "aplay -q -D speaker_multi -t raw -f S16_LE -r 48000 -c 2 -s 1 /dev/zero" "$out" \
     "B11 the 8-channel chain is probed, with no frames"
 probe="$(printf '%s\n' "$out" | grep -n 'D speaker_multi' | head -1 | cut -d: -f1)"
 declare_at="$(printf '%s\n' "$out" | grep -n 'D speaker_out' | head -1 | cut -d: -f1)"

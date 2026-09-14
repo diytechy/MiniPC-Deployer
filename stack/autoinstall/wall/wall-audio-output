@@ -541,10 +541,26 @@ BUS_CONTROL_PREOPEN_AFTER = 5
 BUS_CONTROL_PCM = {"speaker": "speaker_out", "headset": "headset_out"}
 
 
+
+def PRE_OPEN_ARGS(pcm):
+    """The pre-open: open `pcm`, write ONE frame of digital silence, exit.
+
+    It was `aplay -q -D <pcm> /dev/null`, which never opens the device at all:
+    aplay reads a WAV header first and /dev/null has none ("read_header: read
+    error", exit 1). Measured on the panel 2026-09-14 00:58 -- every probe and
+    every softvol pre-open had been failing silently, which is why the Bus
+    control "never appeared" on the first mode switch and why the 8-channel
+    speaker chain always "would not open" while `aplay -D speaker_multi` of a
+    real file played fine. Raw S16 stereo at the bus rate with `-s 1` writes a
+    single zero frame: inaudible, and the chain is genuinely opened.
+    """
+    return ["/usr/bin/aplay", "-q", "-D", pcm, "-t", "raw", "-f", "S16_LE",
+            "-r", "48000", "-c", "2", "-s", "1", "/dev/zero"]
+
 def declare_bus_control(applier, pcm):
     """Open the leg's PCM once so softvol creates its control, before any audio.
 
-    `aplay -D speaker_out /dev/null` opens the plugin chain, writes no frames
+    `aplay -D speaker_out` of one raw zero frame opens the plugin chain (see PRE_OPEN_ARGS)
     and exits; the control it declares stays on the Loopback card afterwards.
     Called BEFORE the forwarder starts, and that ordering is the point: review
     found that creating the control after the leg was already running left a
@@ -555,7 +571,7 @@ def declare_bus_control(applier, pcm):
     Never required, and given a short timeout of its own: this runs while the
     apply lock is held, so an ALSA open that wedges must not hold the switch.
     """
-    return applier.command(["/usr/bin/aplay", "-q", "-D", pcm, "/dev/null"],
+    return applier.command(PRE_OPEN_ARGS(pcm),
                            required=False, quiet=True, timeout=5) == 0
 
 
@@ -571,7 +587,7 @@ def set_bus_level(applier, card, level, expected=True, sleep=time.sleep, pcm=Non
     and on a panel that has just had its whole graph swapped there may be no
     client for longer than the retry window. Waiting harder would only make the
     window a bigger guess, so after BUS_CONTROL_PREOPEN_AFTER fruitless
-    attempts the applier opens the PCM itself -- `aplay -D <pcm> /dev/null`,
+    attempts the applier opens the PCM itself -- `aplay -D <pcm>` of one raw zero frame (PRE_OPEN_ARGS),
     which opens, writes no frames and exits, so the control exists afterwards
     and not one sample reaches the room. It is tried once, it is not required,
     and the retry loop stays bounded either way.
@@ -582,7 +598,7 @@ def set_bus_level(applier, card, level, expected=True, sleep=time.sleep, pcm=Non
     for attempt in range(attempts):
         if pcm and expected and attempt == BUS_CONTROL_PREOPEN_AFTER and not preopened:
             preopened = True
-            applier.command(["/usr/bin/aplay", "-q", "-D", pcm, "/dev/null"],
+            applier.command(PRE_OPEN_ARGS(pcm),
                             required=False, quiet=True)
         # required=True so that a missing control is REPORTED to this loop as a
         # failure; the caller decides what it means, and never counts it as a
@@ -827,7 +843,7 @@ def probe_speaker_chain(applier):
     answers them about the graph as it is right now rather than about a file's
     existence.
 
-    `aplay -q -D speaker_multi /dev/null` opens the chain, writes no frames and
+    `aplay -q -D speaker_multi` of one raw zero frame (PRE_OPEN_ARGS) opens the chain and
     exits -- the same move `declare_bus_control` makes, for the same reason, and
     with the same guarantee that not one sample reaches the room. Not required
     and short-timed out: it runs under the apply lock.
@@ -837,8 +853,7 @@ def probe_speaker_chain(applier):
     # answers 0 -- "the 8-channel chain opened" -- and the leg would be pointed
     # at a chain nobody has established exists, which is the loud way to be
     # wrong. `quiet` because the fallback below is the journal line worth having.
-    if applier.command(["/usr/bin/aplay", "-q", "-D", SPEAKER_CHAIN_MULTI,
-                        "/dev/null"], quiet=True, timeout=5) == 0:
+    if applier.command(PRE_OPEN_ARGS(SPEAKER_CHAIN_MULTI), quiet=True, timeout=5) == 0:
         return SPEAKER_CHAIN_MULTI
     log("the 8-channel speaker chain (%s) would not open: falling back to stereo "
         "front out, with no centre and no sub. Check "

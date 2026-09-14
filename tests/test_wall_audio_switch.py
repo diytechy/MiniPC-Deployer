@@ -930,7 +930,7 @@ def test_the_control_is_declared_and_set_before_the_leg_starts_sr028(applier, po
     # index("aplay") would now find the probe.
     preopen = min(index for index, argv in enumerate(recorder.commands)
                   if names[index] == "aplay" and "speaker_out" in argv)
-    assert recorder.commands[preopen][-1] == "/dev/null", "no frames reach the room"
+    assert recorder.commands[preopen][-1] == "/dev/zero" and recorder.commands[preopen][-3:-1] == ["-s", "1"], "one raw zero frame, nothing audible"
     assert "speaker_out" in recorder.commands[preopen], "the PCM that DECLARES the softvol"
     first_start = min(index for index, argv in enumerate(recorder.commands)
                       if names[index] == "systemctl" and argv[1] == "start")
@@ -1198,7 +1198,8 @@ def test_one_probe_answers_both_ways_the_multi_chain_can_be_missing_sr028(applie
     refusing = Refusing()
     assert applier.probe_speaker_chain(refusing) == applier.SPEAKER_CHAIN_STEREO
     assert refusing.commands == [["/usr/bin/aplay", "-q", "-D", "speaker_multi",
-                                  "/dev/null"]], "opened, no frames, nothing audible"
+                                  "-t", "raw", "-f", "S16_LE", "-r", "48000",
+                                  "-c", "2", "-s", "1", "/dev/zero"]], "opened with one raw zero frame, nothing audible"
     accepting = applier.Applier(dry_run=True)
     assert applier.probe_speaker_chain(accepting) == applier.SPEAKER_CHAIN_MULTI
 

@@ -20,10 +20,11 @@ a cache or a hardware gate.
 | Key | Setting | Owner |
 |---|---|---|
 | `officewall.media-mode` | Major-screen media: Frame media vs local audio visualizer | **This store.** `MediaPreference` in `js/visualizer-preference.js` is the only writer; the Settings radio buttons write through it. |
+| `officewall.last-tab` | The resting tab — which tab the panel opens on | **This store.** `TabPreference` in `js/tab-preference.js` is the only writer, called from `DisplayMachine.setTab` (`js/state-machine.js`); the machine reads it once in its constructor. `lastSelectedTab` in the machine is the same value in memory, seeded from this key, not a second authority. DOOR is never written (see below). |
 
-That is the **entire** renderer-persisted surface. A repo-wide grep for
-`localStorage` / `sessionStorage` / `indexedDB` across `js/` and `electron/`
-finds this one key and nothing else. Electron uses the default `userData` path
+That is the **entire** renderer-persisted surface: two keys. A repo-wide grep
+for `localStorage` / `sessionStorage` / `indexedDB` across `js/` and
+`electron/` finds these and nothing else. Electron uses the default `userData` path
 and no partition override for the shell window, so the value survives a kiosk
 restart, a suspend/resume and a reboot, and is lost only if the profile
 directory is deleted.
@@ -88,20 +89,35 @@ the mode persists through reboot, and item 16 extends that to sleep. When it
 lands it is a seventh store and this table needs a row; the acceptance below
 already has a placeholder step for it.
 
-### What is NOT stored anywhere — and item 16 asks for it
+### The active tab — the gap this document opened, now closed in code
 
-**The active tab.** `DisplayMachine` sets `this.tab = CHECKLIST` in its
-constructor and nothing persists `tab` or `lastSelectedTab`. The tab survives a
-FULL collapse (and, after the item 7 fix, is returned to correctly), but a
-kiosk restart or a power cycle always lands on Checklist.
+**Was:** `DisplayMachine` set `this.tab = CHECKLIST` in its constructor and
+nothing persisted `tab` or `lastSelectedTab`. The tab survived a FULL collapse
+(and, after the item 7 fix, was returned to correctly) and survived sleep — a
+suspend/resume does not restart the kiosk — but a kiosk restart or a power
+cycle always landed on Checklist. Item 16's "every setting and the active tab
+survive" was half unmet by construction.
 
-A suspend/resume does **not** restart the kiosk, so the tab survives sleep. A
-power cycle does not. Item 16's "every setting and the active tab survive" is
-therefore **half unmet by construction**, and closing it means persisting the
-tab — a small change, but one that touches `js/main.js` and `js/state-machine.js`,
-which Groups A and B are also editing. It is recorded here rather than done
-inside this group's diff; the coordinator should schedule it after the A→B→C
-merge.
+**Now (Group C2, branch `group-c2-tab-persistence`):** the resting tab lives in
+renderer `localStorage` under `officewall.last-tab`, store 1 above. The rules
+that make it a *setting* rather than a snapshot of the display:
+
+* **Only the tab.** FULL/SPLIT is derived from attention and idleness and is
+  recomputed from the world on every boot; nothing about it is written.
+* **Written on hand selection only.** `DisplayMachine.setTab` writes; returning
+  from FULL to the prior tab (item 7) is not a new selection and writes nothing.
+* **DOOR is never the resting tab.** It is refused by the store on write *and*
+  by the machine on read, so neither a takeover nor a hand-written value can
+  point a boot at the door camera. The previously stored tab stands instead.
+* **A tab this build does not have** (a stored `BLUETOOTH` with
+  `BLUETOOTH_ENABLED:false`), a corrupt value, or a storage layer that is
+  absent or throwing, all fall back to Checklist without an exception reaching
+  the shell. Twelve tests in `tests/tab-persistence.test.mjs` pin this.
+
+So the tab now survives a kiosk restart and a power cycle for the same reason
+the media mode does — the Chromium profile on disk — and is lost only if that
+profile directory is deleted. Steps 11 and 15 below expect **Library**, and
+item 16 can close on a re-run of them.
 
 ---
 
@@ -165,29 +181,30 @@ The timers are the acceptance, because a hand-run `systemctl suspend` skips
     * camera and door-motion state **must** survive (`wall.env` → firstboot);
     * the session **must not** survive — a reboot that left the panel unlocked
       is a defect, not a passed persistence test;
-    * the tab **will not** survive. Expected: Checklist. Record it as the known
-      gap above, do not fail the run on it, and do not close item 16 on it
-      either.
+    * the tab **must** survive: expected **Library**, from
+      `officewall.last-tab` in the Chromium profile. Checklist here is now a
+      failure, not the known gap — the gap was closed by Group C2. (Against a
+      release built before that branch merged, the old expectation stands:
+      record Checklist as the gap and do not close item 16.)
 16. `sha256sum` the deployed site payload and `VERSION` — a power cycle must not
     change what is installed.
 
 ### C. What counts as done
 
-Item 16 **does not close on this run.** The run establishes that every store
-which exists survives sleep and a power cycle; the Owner's item 16 also names
-the active tab, and the active tab is persisted nowhere. So the outcome of this
-procedure is one of two, and never a third:
+On a release that **includes** Group C2's tab persistence, item 16 closes on a
+clean run: steps 11 and 15 agree with the table for every store that exists —
+including the tab, which must read **Library** in both — with a screenshot per
+check and the journal excerpts from 9, 10 and 14. Any disagreement is a fail.
 
-* **Persistence accepted, item 16 still open on the tab.** Steps 11 and 15
-  agree with the table for every store that exists, with a screenshot per check
-  and the journal excerpts from 9, 10 and 14. The row records "stores: pass;
-  active tab: outstanding" and names the follow-up.
-* **Failed**, if any store disagrees.
+On a release built **before** that branch merged, the run still establishes
+that every store which exists survives sleep and a power cycle, but item 16
+does not close: the row records "stores: pass; active tab: outstanding", names
+the follow-up, and steps 11 and 15 are re-run once the tab persistence is
+deployed.
 
-Item 16 closes only after the tab is persisted and this procedure is re-run for
-steps 11 and 15. Any store that does not yet exist at the time of the run (the
-audio mode file, and the sensing store if the sensor service is still not
-installed) is named in the record, and its absence is not a pass.
+Either way, any store that does not yet exist at the time of the run (the audio
+mode file, and the sensing store if the sensor service is still not installed)
+is named in the record, and its absence is not a pass.
 
 ---
 

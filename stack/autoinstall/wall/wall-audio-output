@@ -1136,7 +1136,7 @@ def set_rear_level(applier, adapter, level):
                            required=lowering) == 0
 
 
-def mic_command(arguments):
+def mic_command(arguments, dry_run=False):
     """`wall-audio-output mic [--render] [KEY=VALUE ...]`. Returns an exit code.
 
     Like `trim`, and deliberately so. It NEVER starts a leg that is stopped -- a
@@ -1156,10 +1156,10 @@ def mic_command(arguments):
         except ValueError as exc:
             log("mic: %s (nothing changed)" % exc)
             return 2
-    applier = Applier()
+    applier = Applier(dry_run=dry_run)
     if assignments or render_only:
-        write_atomic(MIC_ENV, render_mic_env(values), mode=0o644)
-        write_atomic(MIC_CONF, render_mic_conf(values), mode=0o644)
+        write_atomic(MIC_ENV, render_mic_env(values), mode=0o644, dry_run=dry_run)
+        write_atomic(MIC_CONF, render_mic_conf(values), mode=0o644, dry_run=dry_run)
     if assignments:
         # Only if it is ALREADY running. A missing or erroring systemctl counts
         # as not running, for the same reason the trim command counts it that
@@ -1210,6 +1210,38 @@ def select_mic_source(applier, source):
     return previous is not None and previous != source
 
 
+# ActiveState values that mean the unit is genuinely gone. `deactivating` is
+# NOT one of them: it is still running. Anything else, and anything unparseable,
+# is treated as "still there" by unit_active below.
+UNIT_GONE_STATES = frozenset({"inactive", "failed"})
+
+
+def unit_active(applier, unit):
+    """True (running), False (gone) or None (could not tell). Never guesses.
+
+    `systemctl is-active --quiet` CANNOT BE USED FOR THIS, and that is the whole
+    reason this function exists (terra, round 5). It exits non-zero both for a
+    unit that is inactive and for a D-Bus error, a timeout or a missing
+    systemctl -- and `Applier.command` collapses all of those to 1. So "the
+    microphone is gone" and "I could not ask whether the microphone is gone"
+    were the same answer, which is the fail-open shape this whole control keeps
+    producing.
+
+    `systemctl show -p ActiveState --value` exits 0 and PRINTS the state, so a
+    failure to query is distinguishable from an answer. None must be treated as
+    "still running" by anything making a safety decision.
+    """
+    text = applier.capture(["/usr/bin/systemctl", "show", "-p", "ActiveState",
+                            "--value", unit])
+    if text is None:
+        return None
+    state = text.strip().splitlines()
+    state = state[0].strip() if state else ""
+    if not state:
+        return None
+    return state not in UNIT_GONE_STATES
+
+
 def stop_mic_leg_hard(applier, unit):
     """Stop a mic leg, and make sure it is actually gone. True if it is.
 
@@ -1226,19 +1258,20 @@ def stop_mic_leg_hard(applier, unit):
     left to do from here.
     """
     applier.command(["/usr/bin/systemctl", "stop", unit], required=False)
-    if applier.command(["/usr/bin/systemctl", "is-active", "--quiet", unit],
-                       quiet=True) != 0:
+    if unit_active(applier, unit) is False:
         return True
-    log("%s did not stop; killing it, because a microphone that is still open "
-        "is not something anybody in the room can hear" % unit)
+    log("%s did not stop, or could not be asked; killing it, because a "
+        "microphone that is still open is not something anybody in the room "
+        "can hear" % unit)
     applier.command(["/usr/bin/systemctl", "kill", "--signal=SIGKILL", unit],
                     required=False)
-    if applier.command(["/usr/bin/systemctl", "is-active", "--quiet", unit],
-                       quiet=True) != 0:
+    still = unit_active(applier, unit)
+    if still is False:
         return True
-    log("REFUSING TO REPORT SUCCESS: %s survived both a stop and a kill, so the "
+    log("REFUSING TO REPORT SUCCESS: %s %s after both a stop and a kill, so the "
         "microphone may still be transmitting while the state says it is muted. "
-        "Check `systemctl status %s` and `fuser -v /dev/snd/*`." % (unit, unit))
+        "Check `systemctl status %s` and `fuser -v /dev/snd/*`."
+        % (unit, "is still running" if still else "could not be queried", unit))
     return False
 
 
@@ -1687,8 +1720,12 @@ def main(argv=None):
         # Same lock, same reason: it rewrites a generated ALSA file and may
         # restart a leg, so it must not interleave with an apply.
         with apply_lock(dry_run=arguments.dry_run):
+            # dry_run was DROPPED here, so `--dry-run mic` overwrote
+            # /etc/wall-panel/audio-mic.* and could restart a live microphone
+            # (terra, round 5). A dry run must be dry in every command.
             return mic_command(list(arguments.value)
-                               + (["--render"] if arguments.render else []))
+                               + (["--render"] if arguments.render else []),
+                               dry_run=arguments.dry_run)
 
     if arguments.boot and arguments.runtime:
         parser.error("--boot and --runtime are opposites; pass at most one")

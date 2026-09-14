@@ -2397,9 +2397,9 @@ def test_muting_escalates_to_a_kill_rather_than_counting_and_moving_on_sr029(
         if argv[0].endswith("systemctl") and argv[1] == "stop" \
                 and len(argv) > 2 and argv[2] in policy.MIC_LEGS:
             return _Reply(1, "", "Job failed")
-        if argv[0].endswith("systemctl") and argv[1] == "is-active" \
+        if argv[0].endswith("systemctl") and argv[1] == "show" \
                 and argv[-1] in policy.MIC_LEGS:
-            return _Reply(0)          # still running
+            return _Reply(0, "active\n")   # still running, and it SAYS so
         if argv[0].endswith("amixer") and "cget" in argv:
             return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
         return _Reply(0)
@@ -2419,8 +2419,8 @@ def test_a_mic_leg_that_stops_normally_is_never_killed_sr029(applier, policy):
 
     def obedient(argv, **kwargs):
         seen.append(list(argv))
-        if argv[0].endswith("systemctl") and argv[1] == "is-active":
-            return _Reply(1)          # not running: the stop worked
+        if argv[0].endswith("systemctl") and argv[1] == "show":
+            return _Reply(0, "inactive\n")   # the stop worked, confirmed
         if argv[0].endswith("amixer") and "cget" in argv:
             return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
         return _Reply(0)
@@ -2428,3 +2428,104 @@ def test_a_mic_leg_that_stops_normally_is_never_killed_sr029(applier, policy):
     assert applier.apply_plan(muted, applier.Applier(run=obedient)) == 0
     assert not [argv for argv in seen
                 if argv[0].endswith("systemctl") and argv[1] == "kill"]
+
+
+# ── review round 5: "gone" and "I could not ask" are different answers ─────
+
+@pytest.mark.parametrize("stdout,code,expected", [
+    ("inactive\n", 0, False),
+    ("failed\n", 0, False),
+    ("active\n", 0, True),
+    ("activating\n", 0, True),
+    # NOT gone: it is still shutting down, and a microphone that is still
+    # shutting down is still open.
+    ("deactivating\n", 0, True),
+    ("reloading\n", 0, True),
+    # Unobservable, all of these. None, and every caller must treat it as live.
+    ("", 0, None),
+    ("\n", 0, None),
+    (None, 1, None),
+])
+def test_unit_active_never_guesses_sr029(applier, stdout, code, expected):
+    """`systemctl is-active --quiet` could not express this and that was the bug.
+
+    It exits non-zero for an inactive unit AND for a D-Bus error, a timeout or a
+    missing systemctl, and Applier.command collapses all of them to 1 -- so "the
+    microphone is gone" and "I could not ask whether the microphone is gone"
+    were the same answer (terra, round 5).
+    """
+    def reply(argv, **kwargs):
+        return _Reply(code, stdout if stdout is not None else "")
+
+    assert applier.unit_active(applier.Applier(run=reply), "x.service") is expected
+
+
+def test_an_unqueryable_mic_leg_fails_the_apply_sr029(applier, policy):
+    """Unknown must fail the apply, not pass it."""
+    def unqueryable(argv, **kwargs):
+        if argv[0].endswith("systemctl") and argv[1] == "show":
+            return _Reply(1, "", "Failed to connect to bus")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    assert applier.apply_plan(muted, applier.Applier(run=unqueryable)) > 0
+
+
+def test_the_mode_script_also_refuses_an_unqueryable_mic_leg_sr029():
+    """The same distinction, in the shell half."""
+    text = read(WALL / "wall-audio-mode")
+    assert "mic_leg_gone()" in text
+    helper = text.split("mic_leg_gone() {", 1)[1].split("\n}", 1)[0]
+    assert "ActiveState" in helper, "is-active cannot express 'I could not ask'"
+    assert "inactive|failed) return 0" in helper
+    assert "*) return 1" in helper, "anything else, including empty, is STILL THERE"
+    # Scoped to the helper's own body: `remember_active` legitimately uses
+    # `is-active --quiet` elsewhere, where "I could not ask" is not a safety
+    # question.
+    stopper = text.split("stop_mic_legs_or_refuse() {", 1)[1].split("\n}", 1)[0]
+    decisions = [line for line in stopper.splitlines()
+                 if not line.strip().startswith(("echo", "#"))]
+    assert not any("is-active" in line for line in decisions), decisions
+
+
+def test_a_replugged_adapter_brings_the_rear_mic_leg_back_sr029():
+    """It BindsTo the adapter, so an unplug stops it. Nothing restarted it.
+
+    wall-audio-state.service is RemainAfterExit, so it does not re-assert the
+    stored position either, and one hub move -- which this appliance is known to
+    do, item 25 -- lost the mic return to the desktop permanently (terra, round
+    5). Safe to start from udev because the unit gates itself twice on every
+    start attempt.
+    """
+    rule = read(WALL / "90-wall-audio-adapter.rules")
+    assert 'SYSTEMD_WANTS}+="wall-mic-rear.service"' in rule
+    unit = read(WALL / "wall-mic-rear.service")
+    assert "BindsTo=dev-wall_audio_adapter.device" in unit
+    conditions = [line for line in unit.splitlines()
+                  if line.startswith("ExecCondition=")]
+    assert any("mic-allowed" in line for line in conditions), \
+        "starting it from udev is only safe because it gates itself"
+    # The Bluetooth leg is NOT wanted here: it has nothing to do with this
+    # adapter, and its own poll brings it back.
+    assert "wall-bt-mic.service" not in rule
+
+
+def test_a_dry_run_mic_command_writes_nothing_sr029(applier, tmp_path, monkeypatch):
+    """`--dry-run` dropped through the mic path and it overwrote /etc for real."""
+    env = tmp_path / "audio-mic.env"
+    conf = tmp_path / "audio-mic.conf"
+    monkeypatch.setattr(applier, "MIC_ENV", env)
+    monkeypatch.setattr(applier, "MIC_CONF", conf)
+    monkeypatch.setattr(applier, "LOCK_FILE", tmp_path / "lock")
+    assert applier.main(["--dry-run", "--state", str(tmp_path / "s.json"),
+                         "mic", "capture_percent=42"]) == 0
+    assert not env.exists(), "a dry run must not write the knobs"
+    assert not conf.exists(), "or the generated ALSA file"
+
+    # ... and without --dry-run it does.
+    assert applier.main(["--state", str(tmp_path / "s.json"),
+                         "mic", "capture_percent=42"]) == 0
+    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT=42" in env.read_text(encoding="utf-8")

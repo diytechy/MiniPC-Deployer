@@ -84,19 +84,32 @@ unit() {
 # mic leg is STILL active, refuse the mode switch entirely and say why. Refusing
 # leaves the panel in the mode it was already in, with the graph it already had,
 # which is the state the Owner can reason about.
+# "INACTIVE" AND "I COULD NOT ASK" ARE DIFFERENT ANSWERS, and `is-active
+# --quiet` gives the same exit code for both (terra, round 5). `show -p
+# ActiveState --value` exits 0 and prints, so a query failure is visible.
+# Empty output, or anything but inactive/failed, means STILL THERE.
+mic_leg_gone() {
+    _state=$(systemctl show -p ActiveState --value "$1" 2>/dev/null) || return 1
+    case "$_state" in
+        inactive|failed) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 stop_mic_legs_or_refuse() {
     unit stop wall-mic-rear.service wall-bt-mic.service
     for _mic in wall-mic-rear.service wall-bt-mic.service; do
-        systemctl is-active --quiet "$_mic" 2>/dev/null || continue
-        echo "audio-mode: $_mic did not stop; killing it" >&2
+        mic_leg_gone "$_mic" && continue
+        echo "audio-mode: $_mic did not stop (or could not be queried); killing it" >&2
         systemctl kill --signal=SIGKILL "$_mic" >/dev/null 2>&1 || true
         # systemctl kill returns before the unit has gone; give it a moment.
         for _try in 1 2 3 4 5 6 7 8 9 10; do
-            systemctl is-active --quiet "$_mic" 2>/dev/null || break
+            mic_leg_gone "$_mic" && break
             sleep 0.5
         done
-        if systemctl is-active --quiet "$_mic" 2>/dev/null; then
-            echo "audio-mode: REFUSING to change mode. $_mic is still running and" >&2
+        if ! mic_leg_gone "$_mic"; then
+            echo "audio-mode: REFUSING to change mode. $_mic is still running (or" >&2
+            echo "  could not be queried, which is the same thing for a microphone) and" >&2
             echo "  an already-open ALSA client keeps the graph it opened with, so it" >&2
             echo "  would go on sending a live microphone to the desktop's input in the" >&2
             echo "  new mode. Stop it by hand (systemctl stop $_mic), confirm with" >&2

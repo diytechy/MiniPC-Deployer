@@ -21,9 +21,11 @@ import struct
 import threading
 from typing import Callable, Mapping, Protocol
 
+import switch_backend
 from routing import (ALIAS, HARDWARE_ADDRESS, Device, MUTATING_METHODS,
                      SELF_RECONCILING_METHODS, SWITCH_OUTPUTS, PolicyError,
-                     validate_action, validate_inventory_action)
+                     switch_only_authorization, validate_action,
+                     validate_inventory_action)
 
 
 MAX_REQUEST_BYTES = 16_384
@@ -34,7 +36,34 @@ DEFAULT_BACKEND_TIMEOUT_SECONDS = 2.0
 MAX_BACKEND_WORKERS = 4
 # The status block that settles each self-reconciling method (see _reconcile).
 OBSERVABLE_BLOCK = {"set_mute": "mute", "set_output": "switch",
-                    "set_input_mute": "switch"}
+                    "set_input_mute": "switch", "set_volume": "switch"}
+# The one optional field an action result may carry beyond {"accepted"}: the
+# sequence number the backend minted for this request. See _ensure_safe_result
+# and ECHO_SEQ_FIELD.
+ACTION_RESULT_OPTIONAL = {"seq"}
+# OPT-IN, and that is the whole point. A client that does not ask gets exactly
+# the historic {"accepted": bool} -- the shipped renderer validates that result
+# as an EXACT key set and turns anything wider into an error, so echoing `seq`
+# unconditionally would break every panel whose shell had not been updated
+# first, in whichever order the two repos are deployed. Asking for it is one
+# optional top-level request field, which an old broker ignores and an old
+# client never sends.
+ECHO_SEQ_FIELD = "echoSeq"
+# BACKEND ERROR CODES THAT SURVIVE THE SEAM, and their public messages.
+#
+# Everything else a backend raises becomes `backend_failure` with a fixed
+# message, because backend exception text can carry a device path or an address
+# and the broker must never reflect one. These two are different in kind: they
+# are enum-ish tokens this file defines, they name nothing about the hardware,
+# and the shell has to tell them apart to say anything useful. The message is
+# re-attached HERE rather than carried across the process boundary, which is why
+# it cannot be influenced by whatever the child actually raised.
+PRESERVED_BACKEND_CODES = {
+    "backend_unavailable": "audio routing is not configured",
+    # The selected output moved between the level being chosen and the request
+    # being written; applying it would have set the other output's level.
+    "switch_moved": "the selected output changed before the level could be applied",
+}
 
 
 class Backend(Protocol):
@@ -80,7 +109,7 @@ def _isolated_backend_entry(connection, backend: Backend, operation: str,
         connection.send(("result", result))
     except BaseException as error:
         code = (error.code if isinstance(error, BrokerError) and
-                error.code == "backend_unavailable" else "backend_failure")
+                error.code in PRESERVED_BACKEND_CODES else "backend_failure")
         connection.send(("error", code))
     finally:
         connection.close()
@@ -210,8 +239,12 @@ class AudioBroker:
             request = json.loads(raw)
             if not isinstance(request, dict):
                 raise BrokerError("bad_request", "request must be an object")
-            if set(request) != {"id", "method", "params", "generation"}:
+            if (not {"id", "method", "params", "generation"} <= set(request) or
+                    set(request) - {"id", "method", "params", "generation", ECHO_SEQ_FIELD}):
                 raise BrokerError("bad_request", "request fields are not exact")
+            echo_seq = request.get(ECHO_SEQ_FIELD, False)
+            if not isinstance(echo_seq, bool):
+                raise BrokerError("bad_request", "echoSeq must be boolean")
             request_id = request["id"]
             request_generation = request["generation"]
             if not isinstance(request_id, (str, int)) or isinstance(request_id, bool):
@@ -232,6 +265,12 @@ class AudioBroker:
             ).encode()).hexdigest()
             if method in MUTATING_METHODS:
                 response = self._mutation(request_id, request_generation, method, params, signature)
+                # Stripped AFTER the journal, never before it: the seq is
+                # persisted with the completed response, so a retry of the same
+                # request replays the same number rather than minting a second
+                # one for a change that already happened.
+                if not echo_seq:
+                    response = self._without_seq(response)
             else:
                 if request_generation != self.generation:
                     raise BrokerError("stale_generation", "request generation is stale")
@@ -373,8 +412,9 @@ class AudioBroker:
             cancel.set()
             raise BrokerError("backend_timeout", "audio backend exceeded its deadline")
         if "error" in outcome:
-            if isinstance(outcome["error"], BrokerError) and outcome["error"].code == "backend_unavailable":
-                raise BrokerError("backend_unavailable", "audio routing is not configured")
+            failure = outcome["error"]
+            if isinstance(failure, BrokerError) and failure.code in PRESERVED_BACKEND_CODES:
+                raise BrokerError(failure.code, PRESERVED_BACKEND_CODES[failure.code])
             raise BrokerError("backend_failure", "audio backend failed")
         return outcome.get("result")
 
@@ -409,8 +449,8 @@ class AudioBroker:
             if process.is_alive():
                 raise BrokerError("backend_busy", "audio backend could not be reaped")
             if kind == "error":
-                if value == "backend_unavailable":
-                    raise BrokerError("backend_unavailable", "audio routing is not configured")
+                if value in PRESERVED_BACKEND_CODES:
+                    raise BrokerError(value, PRESERVED_BACKEND_CODES[value])
                 raise BrokerError("backend_failure", "audio backend failed")
             if kind != "result":
                 raise BrokerError("backend_failure", "audio backend failed")
@@ -420,6 +460,15 @@ class AudioBroker:
             child.close()
             if process.is_alive():
                 process.kill(); process.join(0.5)
+
+    @staticmethod
+    def _without_seq(response: dict) -> dict:
+        """The historic reply shape, for a client that did not ask for `seq`."""
+        result = response.get("result")
+        if not isinstance(result, dict) or "seq" not in result:
+            return response
+        return {**response, "result": {key: value for key, value in result.items()
+                                       if key != "seq"}}
 
     def _error(self, request_id: object, generation: object, code: str, message: str) -> dict:
         return {"id": request_id, "generation": generation, "ok": False,
@@ -507,8 +556,14 @@ class AudioBroker:
                     any(isinstance(item, bool) or not isinstance(item, (int, float)) or
                         not 0 <= item <= 1 for item in bands)):
                 raise BrokerError("unsafe_backend_result", "telemetry bands are invalid")
-        elif set(value) != {"accepted"} or not isinstance(value["accepted"], bool):
+        elif ("accepted" not in value or set(value) - {"accepted"} - ACTION_RESULT_OPTIONAL or
+                not isinstance(value["accepted"], bool)):
             raise BrokerError("unsafe_backend_result", "action result fields are not exact")
+        elif "seq" in value and not _safe_integer(value["seq"]):
+            # A seq a client cannot hold exactly is worse than none: the shell
+            # compares it against the applier's mark with Number.isSafeInteger,
+            # so anything outside that range would silently never settle.
+            raise BrokerError("unsafe_backend_result", "action result sequence is invalid")
 
     def _safe_string(self, value: object, limit: int) -> None:
         if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):
@@ -599,8 +654,22 @@ class BoundedUnixServer:
 
 
 def serve(socket_path: str, backend: Backend | None = None, *, state_path: str | None = None) -> None:
-    """Serve IF-015 on one filesystem Unix socket; never binds an IP address."""
-    server = BoundedUnixServer(socket_path, AudioBroker(backend or UnavailableBackend(), state_path=state_path))
+    """Serve IF-015 on one filesystem Unix socket; never binds an IP address.
+
+    The shipped backend is the SWITCH applier backend (item 23 step 5): it moves
+    the panel's own Mute/Headset/Speaker switch, the microphone button and the
+    level, through the root applier, and routes no device at all. WSN-024's
+    routed-device backend stays unimplemented -- `inventory` is empty, so every
+    pair/connect/select verb is still refused. On a panel where the applier is
+    not installed the backend refuses with backend_unavailable, which is what
+    UnavailableBackend used to say for every method.
+    """
+    server = BoundedUnixServer(socket_path, AudioBroker(
+        backend or switch_backend.backend_from_environment(),
+        # Switch verbs only. Device routing keeps the deny-by-default it has
+        # always had; see routing.switch_only_authorization for why the two
+        # questions get different answers.
+        authorize=switch_only_authorization, state_path=state_path))
     try: server.serve_forever()
     finally: server.close()
 

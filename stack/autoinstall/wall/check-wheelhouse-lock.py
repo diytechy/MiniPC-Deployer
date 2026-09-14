@@ -8,7 +8,10 @@ transitive dependency both surface as a resolver error after pip has already
 built a temporary environment). This check reads the lock the build produced
 and refuses, with a specific message, a lock that is not fully `==`-pinned and
 sha256-hashed, that names an index or a remote URL, or whose pinned
-distributions are not all present as wheels in the wheelhouse directory.
+distributions are not all present, at the pinned version, as wheels in the
+wheelhouse directory. With `--expect PATH` it also refuses a lock that is not
+byte-identical to the reviewed lock that shipped inside the panel image, which
+is the only thing that makes substituted removable media detectable.
 
 Prints only package names and counts: a lock file carries no secrets, but the
 installer's convention is that a failing check never dumps a config value.
@@ -16,6 +19,7 @@ installer's convention is that a failing check never dumps a config value.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -82,25 +86,58 @@ def parse_lock(text: str) -> dict[str, str]:
     return pinned
 
 
-def wheel_names(wheelhouse: str) -> set[str]:
+def wheel_names(wheelhouse: str) -> set[tuple[str, str]]:
+    """{(canonical name, version)} of the wheels on the media.
+
+    Version matters: a wheelhouse holding numpy-9.9.9 for a numpy==1.26.4 pin is
+    the wrong media, and saying so here is the point of running before pip.
+    """
     found = set()
     for entry in os.listdir(wheelhouse):
         if entry.endswith(".whl"):
-            found.add(canonical(entry.split("-", 1)[0]))
+            fields = entry[: -len(".whl")].split("-")
+            if len(fields) >= 5:
+                found.add((canonical(fields[0]), fields[1]))
     return found
 
 
-def check(wheelhouse: str, required: "list[str] | tuple[str, ...]" = DEFAULT_REQUIRED) -> dict[str, str]:
+def expected_lock(lock_bytes: bytes, expected_path: str) -> None:
+    """Refuse a lock that is not the one reviewed and shipped with the image.
+
+    Hash-pinning a lock the media itself supplies proves only that the wheels
+    match that lock. The authenticity anchor is the copy of requirements.lock
+    that travelled in the panel image next to this script: swapped media has to
+    match it byte for byte.
+    """
+    with open(expected_path, "rb") as handle:
+        expected = handle.read()
+    # Byte for byte on both sides: reading either one in text mode would let a
+    # line-ending rewrite pass as identical.
+    if hashlib.sha256(lock_bytes).hexdigest() != hashlib.sha256(expected).hexdigest():
+        raise ValueError(
+            "the wheelhouse's requirements.lock is not the reviewed lock shipped with this panel image "
+            f"({os.path.basename(expected_path)}); rebuild the media from the tracked lock"
+        )
+
+
+def check(wheelhouse: str, required: "list[str] | tuple[str, ...]" = DEFAULT_REQUIRED,
+          expect: "str | None" = None) -> dict[str, str]:
     lock_path = os.path.join(wheelhouse, "requirements.lock")
-    with open(lock_path, encoding="utf-8") as handle:
-        pinned = parse_lock(handle.read())
+    with open(lock_path, "rb") as handle:
+        lock_bytes = handle.read()
+    if expect:
+        expected_lock(lock_bytes, expect)
+    pinned = parse_lock(lock_bytes.decode("utf-8"))
     missing_required = sorted(name for name in required if canonical(name) not in pinned)
     if missing_required:
         raise ValueError("lock does not pin the sensor service's own dependencies: " + ", ".join(missing_required))
     present = wheel_names(wheelhouse)
-    absent = sorted(name for name in pinned if name not in present)
+    absent = sorted(f"{name}=={version}" for name, version in pinned.items() if (name, version) not in present)
     if absent:
-        raise ValueError("wheelhouse has no wheel for: " + ", ".join(absent))
+        wrong = sorted(name for name in pinned if any(name == found for found, _ in present)
+                       and (name, pinned[name]) not in present)
+        detail = "; wrong version present for: " + ", ".join(wrong) if wrong else ""
+        raise ValueError("wheelhouse has no wheel for: " + ", ".join(absent) + detail)
     return pinned
 
 
@@ -108,9 +145,11 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wheelhouse")
     parser.add_argument("--require", action="append", default=None, help="distribution that must be pinned (repeatable)")
+    parser.add_argument("--expect", default=None,
+                        help="path of the reviewed lock the media's lock must equal byte for byte")
     args = parser.parse_args(argv)
     try:
-        pinned = check(args.wheelhouse, args.require or DEFAULT_REQUIRED)
+        pinned = check(args.wheelhouse, args.require or DEFAULT_REQUIRED, args.expect)
     except (OSError, ValueError) as error:
         print(f"[wheelhouse-lock] REFUSED: {error}", file=sys.stderr)
         return 1

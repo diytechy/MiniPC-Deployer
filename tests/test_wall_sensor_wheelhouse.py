@@ -38,11 +38,11 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def build_wheelhouse(tmp_path, names=CHECK.DEFAULT_REQUIRED):
+def build_wheelhouse(tmp_path, names=CHECK.DEFAULT_REQUIRED, salt=b""):
     wheelhouse = tmp_path / "wheelhouse"
-    wheelhouse.mkdir()
+    wheelhouse.mkdir(parents=True)
     for index, name in enumerate(names):
-        make_wheel(wheelhouse, name.replace("-", "_"), f"1.{index}.0", body=name.encode())
+        make_wheel(wheelhouse, name.replace("-", "_"), f"1.{index}.0", body=name.encode() + salt)
     WRITE.main(["write-lock.py", str(wheelhouse), str(wheelhouse / "requirements.lock")])
     return wheelhouse
 
@@ -114,6 +114,33 @@ def test_check_refuses_a_lock_whose_wheel_is_missing_from_the_directory(tmp_path
         CHECK.check(str(wheelhouse))
 
 
+def test_check_refuses_a_wheel_that_is_present_at_the_wrong_version(tmp_path):
+    wheelhouse = build_wheelhouse(tmp_path)
+    stale = next(wheelhouse.glob("cryptography-*.whl"))
+    stale.rename(stale.with_name("cryptography-99.9.9-py3-none-any.whl"))
+    with pytest.raises(ValueError, match="wrong version present for: cryptography"):
+        CHECK.check(str(wheelhouse))
+
+
+@pytest.mark.smoke
+def test_expect_refuses_media_carrying_its_own_self_consistent_lock(tmp_path):
+    """The substitution attack: a full, valid, hash-correct lock that is not ours."""
+    reviewed = build_wheelhouse(tmp_path / "reviewed")
+    substituted = build_wheelhouse(tmp_path / "substituted", salt=b"attacker rebuild")
+    # Both are internally valid; only the reviewed one is authentic.
+    assert CHECK.check(str(substituted)) and CHECK.check(str(reviewed))
+    assert CHECK.check(str(reviewed), expect=str(reviewed / "requirements.lock"))
+    with pytest.raises(ValueError, match="not the reviewed lock"):
+        CHECK.check(str(substituted), expect=str(reviewed / "requirements.lock"))
+
+
+def test_expect_accepts_a_byte_identical_copy_of_the_reviewed_lock(tmp_path):
+    wheelhouse = build_wheelhouse(tmp_path)
+    elsewhere = tmp_path / "image-copy.lock"
+    elsewhere.write_bytes((wheelhouse / "requirements.lock").read_bytes())
+    assert CHECK.check(str(wheelhouse), expect=str(elsewhere))
+
+
 def test_check_refuses_a_duplicate_pin(tmp_path):
     with pytest.raises(ValueError, match="more than once"):
         CHECK.parse_lock("numpy==1.0 --hash=sha256:%s\nnumpy==2.0 --hash=sha256:%s\n" % ("0" * 64, "1" * 64))
@@ -144,6 +171,21 @@ def test_installer_validates_the_wheelhouse_before_creating_the_venv():
     # The offline install line itself must not have loosened.
     assert "--no-index --only-binary=:all: --require-hashes" in text
     assert "--find-links \"$wheelhouse\" -r \"$wheelhouse/requirements.lock\"" in text
+
+
+@pytest.mark.smoke
+def test_installer_anchors_the_media_lock_to_the_lock_staged_in_the_image():
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert 'reviewed_lock="$(dirname "$0")/sensor-wheelhouse/requirements.lock"' in text
+    assert '--expect "$reviewed_lock"' in text
+    assert LOCK.exists(), "the anchor the installer points at must be tracked beside it"
+
+
+def test_build_never_self_upgrades_pip_and_never_silently_skips_the_sensor_import():
+    text = BUILD.read_text(encoding="utf-8")
+    assert "--upgrade pip" not in text, "an unpinned pip upgrade is an unbounded build input"
+    assert "--skip-sensor-import" in text
+    assert 'fail "no sensor source mounted' in text
 
 
 def test_committed_lock_is_valid_and_pins_the_five_sensor_requirements():

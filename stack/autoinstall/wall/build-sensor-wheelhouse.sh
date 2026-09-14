@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the offline, hash-pinned wheelhouse that install-wall-capabilities.sh
 # consumes (--wheelhouse DIR). Runs the whole resolve/download/verify cycle in a
-# Docker container whose base image matches the panel exactly: Ubuntu 24.04
-# noble, CPython 3.12, x86-64. Nothing is ever fetched on the panel.
+# Docker container on the panel's own release line and ABI: Ubuntu 24.04 noble,
+# CPython 3.12 (cp312), glibc 2.39, x86-64. Nothing is ever fetched on the panel.
 #
 #   From WSL Ubuntu (the only WSL distro here with real Docker):
 #     bash stack/autoinstall/wall/build-sensor-wheelhouse.sh
@@ -21,8 +21,12 @@ set -euo pipefail
 fail() { echo "[wheelhouse] $*" >&2; exit 1; }
 note() { echo "[wheelhouse] $*"; }
 
-# Ubuntu 24.04.3 LTS (noble), the panel's release. Pinned by digest so the
-# interpreter and glibc the wheels are selected against cannot drift.
+# Ubuntu 24.04 LTS (noble) pinned by digest. What this freezes is the rootfs the
+# wheels are SELECTED against: CPython 3.12 (so cp312 tags) and glibc 2.39 (so
+# the manylinux_2_28 floor). What it does NOT freeze is the apt archive the two
+# build packages come from or the pip inside them - so the build deliberately
+# uses the image's own pip and never upgrades it, and the wheel identity, not
+# the tool version, is what the committed hashes hold fixed.
 BASE_IMAGE=${WALL_WHEELHOUSE_IMAGE:-ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254}
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -33,16 +37,22 @@ lock_committed="$here/sensor-wheelhouse/requirements.lock"
 if [ "${1:-}" = "--inner" ]; then
     shift
     mode=$1
+    skip_sensor_import=${2:-0}
     export DEBIAN_FRONTEND=noninteractive
     note "container: $(. /etc/os-release && echo "$PRETTY_NAME") $(uname -m)"
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends python3-venv python3-pip ca-certificates >/dev/null
     python3 --version
+    # cp312 is the wheel tag the panel's 3.12.3 accepts; the patch level does not
+    # enter wheel selection, so the minor version is what has to match and is
+    # what is enforced. The full version is printed above for the build record.
     [ "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" = "3.12" ] \
         || fail "base image is not CPython 3.12; it must match the panel"
 
+    # No pip upgrade: an unpinned self-upgrade from the network would be the one
+    # unbounded input in this container. The image's pip is fixed by the digest.
     python3 -m venv /tmp/builder
-    /tmp/builder/bin/pip install --quiet --upgrade pip
+    /tmp/builder/bin/pip --version
 
     mkdir -p /out/wheelhouse
     rm -f /out/wheelhouse/*.whl /out/wheelhouse/*.tar.gz
@@ -64,8 +74,13 @@ if [ "${1:-}" = "--inner" ]; then
     cat /out/wheelhouse/requirements.lock
     note "----------------------------------------------------------------"
 
-    # The same check the installer runs on the panel.
-    python3 /work/check-wheelhouse-lock.py /out/wheelhouse
+    # The same check the installer runs on the panel, with the same authenticity
+    # anchor in reproduce mode (in refresh mode the lock is the thing being made).
+    if [ "$mode" = refresh ]; then
+        python3 /work/check-wheelhouse-lock.py /out/wheelhouse
+    else
+        python3 /work/check-wheelhouse-lock.py --expect /work/requirements.lock /out/wheelhouse
+    fi
 
     # Verify the installer's exact install line against the built wheelhouse.
     note "verifying the panel's install command in a fresh venv"
@@ -91,8 +106,10 @@ for module in ("sensors.config", "sensors.detection", "sensors.identity",
     importlib.import_module(module)
     print("[wheelhouse] import ok:", module)
 ' )
+    elif [ "$skip_sensor_import" = 1 ]; then
+        note "--skip-sensor-import: the sensors.* import check was NOT performed"
     else
-        note "no sensor source mounted; skipped the sensors.* import check"
+        fail "no sensor source mounted; pass --sensors-src DIR (OfficeWallNaglight) or --skip-sensor-import"
     fi
 
     ( cd /out && tar czf wall-sensor-wheelhouse.tar.gz wheelhouse )
@@ -103,17 +120,19 @@ fi
 
 # ---------------------------------------------------------------- outer half
 mode=reproduce
+skip_sensor_import=0
 out_dir=${WALL_WHEELHOUSE_OUT:-/var/tmp/wall-sensor-wheelhouse}
 requirements=${WALL_SENSOR_REQUIREMENTS:-}
 sensors_src=${WALL_SENSOR_SRC:-}
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --refresh) mode=refresh; shift ;;
+        --skip-sensor-import) skip_sensor_import=1; shift ;;
         --out) [ "$#" -ge 2 ] || fail "--out needs a path"; out_dir=$2; shift 2 ;;
         --requirements) [ "$#" -ge 2 ] || fail "--requirements needs a path"; requirements=$2; shift 2 ;;
         --sensors-src) [ "$#" -ge 2 ] || fail "--sensors-src needs a path"; sensors_src=$2; shift 2 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
-        *) fail "usage: $0 [--refresh] [--out DIR] [--requirements FILE] [--sensors-src DIR]" ;;
+        *) fail "usage: $0 [--refresh] [--out DIR] [--requirements FILE] [--sensors-src DIR] [--skip-sensor-import]" ;;
     esac
 done
 
@@ -147,7 +166,7 @@ docker pull -q "$BASE_IMAGE" >/dev/null
 mount_args=(-v "$work:/work:ro" -v "$out_dir:/out")
 if [ -n "$sensors_src" ]; then mount_args+=(-v "$sensors_src:/sensors-src:ro"); fi
 docker run --rm "${mount_args[@]}" -v "$here/build-sensor-wheelhouse.sh:/build.sh:ro" \
-    "$BASE_IMAGE" bash /build.sh --inner "$mode"
+    "$BASE_IMAGE" bash /build.sh --inner "$mode" "$skip_sensor_import"
 
 if [ "$mode" = refresh ]; then
     mkdir -p "$(dirname "$lock_committed")"

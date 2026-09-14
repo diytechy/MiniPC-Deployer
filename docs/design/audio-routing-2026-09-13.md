@@ -637,7 +637,7 @@ cat /proc/asound/card3/stream0 | head -8     # expect Altset = 1, 8 channels
 | S3-7 | `journalctl -u wall-amp-trigger -f` while doing S3-4 | the relay closes as before: the tap is upstream of every part of step 3 |
 | S3-8 | `sudo mv /etc/wall-panel/audio-trim.conf /tmp/` then `sudo wall-audio-output set speaker` | audio still plays, **stereo front only**, and the journal says the 8-channel chain would not open and names both things to check. Put the file back and re-apply. |
 | S3-9 | Reboot, and watch the first two minutes | `journalctl -u wall-speaker-out --since -3min` shows **no underrun burst** (the 58 of 2026-09-14); the Owner hears no skipping during boot. **Firstboot must also complete normally** -- `systemctl status wall-firstboot` green, not timed out |
-| S3-9a | With the desktop playing video over S/PDIF on Speaker | ask the Owner about lip-sync: this step added about 20 ms. If it reads wrong, `--tlatency` in `wall-speaker-out.service` is the number to put back to 30000 |
+| S3-9a | (Superseded by S4-14 once step 4 is installed: the shared dmix changes this number.) With the desktop playing video over S/PDIF on Speaker | ask the Owner about lip-sync: this step added about 20 ms. If it reads wrong, `--tlatency` in `wall-speaker-out.service` is the number to put back to 30000 |
 | S3-10 | Headset position, and Mute | unchanged from steps 1–2 in every respect; `status` shows no probe and the adapter is not opened |
 
 ## What steps 4–6 still owe
@@ -721,6 +721,29 @@ things must be wrong before the room's music reaches the desktop. And the
 guarantee that always did the real work is untouched: in Mute and Headset
 nothing feeds `speaker_tap`, the detector's 240 s hold-off expires, and the
 LCUS-2 relay physically removes power from the amplifier.
+
+### The cost nobody has measured yet, said out loud
+
+**Review (terra, 2026-09-14) is right that this is the riskiest number in the
+step.** `usb_out_mix` is declared `period_size 1024 buffer_size 8192` at 48 kHz,
+which is a 170 ms ring with 21 ms periods, and the speaker leg did not have that
+ring before: it opened `card_usb` raw and `alsaloop --tlatency 50000` sized the
+buffer itself. A dmix ring is fixed and shared, so a client cannot shrink it.
+
+How much of that 170 ms becomes end-to-end delay depends on how full `alsaloop`
+keeps the ring, which is exactly the thing no test here can answer. **So the
+"80 to 100 ms" this design claimed after step 3 is no longer a number anybody
+should quote**, and S4-14 below measures it before the Owner is asked to live
+with it.
+
+The numbers were not simply reduced, and that is a decision rather than an
+oversight: the panel has a **measured** underrun problem on this leg (58
+`speaker_out` underruns in the 2026-09-14 boot minute, which is why that leg
+went from 30 ms to 50 ms) and **no** measured latency problem. Trading a known
+fault for an unknown one without a measurement is how the first one got made.
+If S4-14 says the delay is audible, the knob is `buffer_size` on `usb_out_mix`
+in `asound-bus-mode.conf`, then `--tlatency` in `wall-spdif-in.service`, in that
+order, and the underrun watch of S3-9 has to be repeated after either.
 
 ### Which microphone, and what the mute does
 
@@ -860,6 +883,8 @@ amixer -c ICUSBAUDIO7D cget numid=8        # expect 66,66,24,24,66,66,24,24
 | S4-11 | **Echo, expected and not fixed here.** Ask the far end whether they hear themselves | they probably do: finding 3's open-loop echo is real and Speaker-position AEC is step D-3a. Note how bad it is; that measurement is the AEC step's input |
 | S4-12 | Reboot and watch the first two minutes | `systemctl status wall-firstboot` green, not timed out; the speaker leg starts as before; no new underrun burst; the mic legs come up with the stored position |
 | S4-13 | `sudo wall-audio-mode trigger` | **everything** stops, mic legs included, and the old chain is back. Then `sudo wall-audio-mode bus` to return |
+| S4-14 | **The latency measurement, and it gates the step.** With the desktop playing video over S/PDIF on Speaker, ask the Owner about lip-sync, before and after. Also `journalctl -u wall-speaker-out --since -10min` while music plays | the Owner hears **no new lip-sync error** and there is **no underrun burst**. The shared dmix added a 170 ms ring the raw open did not have; how much of it becomes delay is unmeasured. If it reads wrong, `buffer_size` on `usb_out_mix` is the first number to move, then `wall-spdif-in`'s `--tlatency`, and S3-9's underrun watch must be repeated after either |
+| S4-15 | **A privacy check worth doing once.** `sudo wall-audio-output input-mute on`, then `sudo systemctl restart wall-bt-mic` | the leg comes up and **refuses to open a microphone**: `journalctl -u wall-bt-mic` shows it polling and starting nothing. This is the fail-open review found, and the supervisor now re-reads the switch state on every poll rather than trusting that a stop reached it |
 
 ### If anything in S4-1 to S4-13 fails
 

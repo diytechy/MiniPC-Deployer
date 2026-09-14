@@ -19,6 +19,15 @@
 # ruling E's input mute is applied by STOPPING both mic legs, so that no sample
 # leaves the panel at all. A mute that only told the UI to draw a red slash
 # would be indistinguishable from a working microphone to anybody on the call.
+#
+# AND THE STOP IS NOT THE ONLY THING HOLDING THAT. This unit is Restart=always
+# and a long-lived process, so "it was stopped once" is not a property anybody
+# can rely on: an operator restart, a daemon-reload workflow, a crash, or a stop
+# that FAILED during an apply would each start it again. wall-bt-mic.py
+# therefore re-reads /etc/wall-panel/audio-state.json on every poll and refuses
+# to open a microphone unless the switch's own state still authorises one --
+# through wall_audio_state.mic_live, which is the single definition of that.
+# Review (terra, 2026-09-14) found the fail-open this closes.
 
 [Unit]
 Description=Wall panel: selected microphone to the connected phone (HFP mic return)

@@ -1306,18 +1306,26 @@ def apply_plan(state, applier):
     write_atomic(HEADSET_ENV, "WALL_AUDIO_HEADSET_CARD=%s\n" % (headset or ""),
                  mode=0o644, dry_run=applier.dry_run)
 
-    # A MIC LEG IS NEVER ALLOWED TO FAIL THE APPLY THAT CARRIES THE ROOM'S
-    # MUSIC. `apply-state` runs under wall-audio-state.service, which firstboot
-    # waits on, so a non-zero return here is a red firstboot and, at the glass,
-    # a panel that looks broken. A microphone that will not start is a
-    # microphone that is not working -- said out loud in the journal, and
-    # nothing else. The output legs keep counting, because those ARE the audio.
+    # FAILING TO START A MICROPHONE IS A DEGRADED PANEL. FAILING TO STOP ONE IS
+    # A PRIVACY FAILURE. The two directions are therefore NOT symmetric, and
+    # review (terra, 2026-09-14) was right that making them symmetric was
+    # fail-open on the one control in this design whose failure nobody can hear:
+    # a transient systemctl error would have persisted `input_muted: true`,
+    # returned success, and left the microphone transmitting.
+    #
+    # So a mic leg that will not STOP counts as a failed apply, exactly like an
+    # output leg, and says so loudly. A mic leg that will not START does not:
+    # `apply-state` runs under wall-audio-state.service, which firstboot waits
+    # on, and a non-zero return there is a red firstboot and a panel that looks
+    # broken at the glass. That asymmetry is the whole point.
     for unit, should_run in wanted["legs"].items():
         if not should_run:
-            if unit in policy.MIC_LEGS:
-                applier.command(["/usr/bin/systemctl", "stop", unit], required=False)
-            else:
-                failures += applier.command(["/usr/bin/systemctl", "stop", unit])
+            result = applier.command(["/usr/bin/systemctl", "stop", unit])
+            failures += result
+            if result and unit in policy.MIC_LEGS:
+                log("REFUSING TO REPORT SUCCESS: %s would not stop, so the "
+                    "microphone may still be transmitting while the state says "
+                    "it is muted. Check `systemctl status %s`." % (unit, unit))
     # Mixer mutes are not required: a card that has just been unplugged has no
     # controls to set, and that is the normal headset case, not an error.
     applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",
@@ -1325,8 +1333,10 @@ def apply_plan(state, applier):
     if headset:
         applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Speaker",
                          "mute" if wanted["headset_muted"] else "unmute"], required=False)
-        applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
-                         "nocap" if wanted["input_muted"] else "cap"], required=False)
+        failures += applier.command(
+            ["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
+             "nocap" if wanted["input_muted"] else "cap"],
+            required=bool(wanted["input_muted"]))
         applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
                          "%d%%" % mic_values["headset_capture_percent"]],
                         required=False)
@@ -1353,8 +1363,14 @@ def apply_plan(state, applier):
     # is the half that actually guarantees the property. This one is the belt:
     # a capture switch closed on the card means an unmuted leg started by
     # anything else still records silence.
-    applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Capture",
-                     "nocap" if wanted["input_muted"] else "cap"], required=False)
+    # `required` follows the DIRECTION here for the same reason the legs do.
+    # Closing a capture switch that will not close is a privacy failure worth
+    # reporting; opening one that will not open is a microphone that does not
+    # work, which the leg above has already said.
+    failures += applier.command(
+        ["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Capture",
+         "nocap" if wanted["input_muted"] else "cap"],
+        required=bool(wanted["input_muted"]))
     # THE REAR PAIR IS RAISED ONLY WHILE A MIC LEG IS MEANT TO RUN, and put back
     # to the 0 the tone era left it at otherwise (coordinator log 2026-09-13
     # 22:50, "adapter rear pair (RL/RR) set to 0 and stored with alsactl"). Two

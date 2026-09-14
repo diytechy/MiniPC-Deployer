@@ -36,6 +36,7 @@ Implements: SR-029, LLR-017
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -43,7 +44,15 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import wall_audio_state as policy
+except ImportError:  # pragma: no cover - firstboot installs the pair together
+    policy = None
+
 BUSCTL = "/usr/bin/busctl"
+# The switch state, read on EVERY poll. See mic_allowed.
+STATE_FILE = "/etc/wall-panel/audio-state.json"
 ALSALOOP = "/usr/bin/alsaloop"
 GUARD = "/usr/local/lib/wall-panel/wall-alsaloop-guard.py"
 # The single named alias every mic consumer opens; the AEC step replaces what it
@@ -120,6 +129,41 @@ def bus_mode_active(path=MODE_FILE):
         with open(path, encoding="utf-8") as handle:
             return handle.read().strip() == "bus"
     except OSError:
+        return False
+
+
+def mic_allowed(path=STATE_FILE):
+    """Whether the switch's own state authorises a live microphone RIGHT NOW.
+
+    THIS IS THE FIX FOR A REAL FAIL-OPEN, FOUND BY REVIEW (terra, 2026-09-14).
+    Before it, this supervisor knew only that it had been started, and it is
+    `Restart=always`. An operator restart, a `daemon-reload` workflow, a crash,
+    or a `systemctl stop` that failed during an apply would each have reopened
+    the microphone into a live call while `audio-state.json` said `input_muted`.
+    A privacy control cannot be a command somebody once sent; it has to be a
+    fact this process re-checks, which is what this does on every poll.
+
+    The policy itself is NOT duplicated here. `wall_audio_state.mic_live` is the
+    single definition of when a microphone may run -- the input mute of ruling E
+    and the "nothing tunnelled" of ruling 7 -- and firstboot installs that module
+    into this script's own directory precisely so both halves can share it.
+
+    EVERY FAILURE ANSWERS FALSE. An unreadable state file, damaged JSON, a
+    missing policy module: all of them mean "do not open a microphone". That is
+    the opposite of the direction the rest of this file fails in, and
+    deliberately: a leg that does not run is a degraded panel, while a leg that
+    runs against a mute is the failure nobody in the room can see.
+    """
+    if policy is None:
+        return False
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    try:
+        return bool(policy.mic_live(policy.normalize(raw)))
+    except Exception:  # noqa: BLE001 - a policy that raises must not open a mic
         return False
 
 
@@ -225,7 +269,7 @@ def main(argv=None):
     log("HFP mic return watching for SCO sinks every %.1f s" % interval)
     try:
         while not stopping["now"]:
-            if not bus_mode_active():
+            if not bus_mode_active() or not mic_allowed():
                 leg.stop()
             else:
                 wanted = decide(read_sinks(), leg.address)

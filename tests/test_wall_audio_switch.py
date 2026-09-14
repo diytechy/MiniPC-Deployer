@@ -79,6 +79,26 @@ def applier(policy):
     return load(APPLIER, "wall_audio_output")
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_run_dir(applier, tmp_path, monkeypatch):
+    """Every /run path the applier publishes goes to a temp tree, in EVERY test.
+
+    Not a convenience. Tests that drive `apply_plan` for real (rather than with
+    --dry-run) write these files, and on a dev box `/run/wall-panel` resolves to
+    a real directory that SURVIVES the test run -- so the next run read back a
+    published speaker chain and a whole unrelated test started failing. It
+    happened twice while step 4 was being written, which is why the guard is
+    autouse and module-wide rather than a line in each test that remembers.
+    """
+    # BOOT_STAMP and LOCK_FILE are deliberately NOT in this list: their own
+    # tests assert their real names and paths, and both are already given temp
+    # locations by the cases that write them.
+    for name in ("SPEAKER_CHAIN_ENV", "MIC_SOURCE_ENV", "HEADSET_ENV"):
+        monkeypatch.setattr(applier, name, tmp_path / ("run-" + name.lower()))
+    for name in ("SPEAKER_CHAIN_VAR", "MIC_SOURCE_VAR"):
+        monkeypatch.delenv(getattr(applier, name), raising=False)
+
+
 # ── the pure switch policy ─────────────────────────────────────────────────
 
 def test_the_three_positions_are_the_owners_three_sr028(policy):
@@ -365,7 +385,7 @@ def test_every_direct_plugin_has_a_single_card_slave_ruling_9_sr028():
         section = conf.split("pcm." + name + " {", 1)[1].split("\n}", 1)[0]
         assert section.count("pcm ") == 1, name
         assert card in section, name
-    assert blocks or True
+    assert blocks, "no direct plugin was inspected at all"
 
 
 def test_the_three_sources_land_on_one_bus_sr028():
@@ -1830,14 +1850,17 @@ def test_mic_selected_is_one_name_so_aec_is_one_line_sr029():
     conf = read(BUS_CONF)
     assert "pcm.mic_selected {" in conf
     assert "WALL_AUDIO_MIC_SOURCE" in conf
+    # The UNITS, and both of them: a `or True` here meant this could never fail
+    # and would not have caught a direct source name in either one (terra,
+    # 2026-09-14).
     for unit in (MIC_REAR_UNIT_FILE, BT_MIC_UNIT_FILE):
-        text = read(unit)
-        assert "mic_panel" not in text.split("[Unit]")[-1] or True
-    rear = read(MIC_REAR_UNIT_FILE)
-    execstart = rear.split("ExecStart=", 1)[1]
-    assert "mic_selected" in execstart
-    assert "mic_panel" not in execstart and "mic_headset" not in execstart
-    assert "mic_selected" in read(BT_MIC)
+        execstart = read(unit).split("ExecStart=", 1)[1]
+        assert "mic_selected" in execstart or unit is BT_MIC_UNIT_FILE
+        assert "mic_panel" not in execstart, unit.name
+        assert "mic_headset" not in execstart, unit.name
+    # And the supervisor addresses the same one name in code.
+    assert 'MIC_PCM = "mic_selected"' in read(BT_MIC)
+    assert '"mic_panel"' not in read(BT_MIC).split("MIC_PCM")[-1]
 
 
 def test_the_mic_capture_pcms_are_dsnoop_on_one_card_each_sr029():
@@ -1961,3 +1984,133 @@ def test_the_mode_switch_takes_the_mic_legs_with_it_sr029():
     assert any("wall-mic-rear.service" in line and "wall-bt-mic.service" in line
                for line in stop), stop
     assert "wall-mic-rear wall-bt-mic" in text, "and the IPC sweep must know them"
+
+
+# ── what review found, and the asymmetry it forced ────────────────────────
+# Both of these are regression tests for a FAIL-OPEN on the one control in this
+# design whose failure nobody in the room can hear (terra, 2026-09-14).
+
+def test_a_mic_leg_that_will_not_stop_fails_the_apply_sr029(applier, policy, monkeypatch):
+    """Failing to START a microphone is degradation. Failing to STOP one is not.
+
+    Before this, both directions were `required=False`: a transient systemctl
+    error would have persisted `input_muted: true`, returned success, and left
+    the microphone transmitting with the panel believing it was muted.
+    """
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+
+    def refuse_to_stop(argv, **kwargs):
+        if argv[0].endswith("systemctl") and len(argv) > 2 and argv[1] == "stop" \
+                and argv[2] in policy.MIC_LEGS:
+            return _Reply(1, "", "Job for %s failed" % argv[2])
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    shell = applier.Applier(run=refuse_to_stop)
+    assert applier.apply_plan(muted, shell) > 0, \
+        "a microphone that would not stop must NOT report success"
+
+
+def test_a_capture_switch_that_will_not_close_fails_the_apply_sr029(
+        applier, policy, monkeypatch):
+    """The hardware half of the mute fails in the same direction as the legs."""
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+
+    def refuse_nocap(argv, **kwargs):
+        if argv[0].endswith("amixer") and "nocap" in argv:
+            return _Reply(1, "", "Unable to find simple control 'Capture',0")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(muted, applier.Applier(run=refuse_nocap)) > 0
+
+    # ... and the UN-mute direction does not, because a capture switch that will
+    # not open is a microphone that does not work, which the leg already said.
+    live = policy.default_state()
+
+    def refuse_cap(argv, **kwargs):
+        if argv[0].endswith("amixer") and "cap" in argv and "nocap" not in argv:
+            return _Reply(1, "", "Unable to find simple control 'Capture',0")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(live, applier.Applier(run=refuse_cap)) == 0
+
+
+def test_the_bt_supervisor_re_checks_the_mute_every_poll_sr029(btmic, policy, tmp_path):
+    """It is Restart=always, so "it was stopped once" is not a property.
+
+    An operator restart, a daemon-reload workflow, a crash, or a stop that failed
+    during an apply would each have reopened the microphone into a live call.
+    The supervisor therefore reads the state itself rather than trusting that a
+    command reached it.
+    """
+    state = tmp_path / "audio-state.json"
+
+    def store(value):
+        state.write_text(json.dumps(value), encoding="utf-8")
+
+    store(policy.default_state())
+    assert btmic.mic_allowed(state) is True, "speaker, unmuted: a mic may run"
+
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    store(muted)
+    assert btmic.mic_allowed(state) is False, "ruling E's mute reaches the supervisor"
+
+    absent, _ = policy.apply_event(policy.default_state(),
+                                   {"kind": "headset", "present": True})
+    absent, _ = policy.apply_event(absent, {"kind": "headset", "present": False})
+    store(absent)
+    assert btmic.mic_allowed(state) is False, "ruling 7 reaches it too"
+
+
+@pytest.mark.parametrize("content", [None, "", "not json", "{oops"])
+def test_an_unparseable_state_never_opens_a_microphone_sr029(btmic, tmp_path, content):
+    """A document that cannot be READ answers False. That gate fails CLOSED.
+
+    A leg that does not run is a degraded panel; a leg that runs against a mute
+    is the failure nobody in the room can see, so an absent or unparseable state
+    file is not consent.
+    """
+    state = tmp_path / "audio-state.json"
+    if content is not None:
+        state.write_text(content, encoding="utf-8")
+    assert btmic.mic_allowed(state) is False
+
+
+@pytest.mark.parametrize("content", ["[]", '{"output": 12}', '{"input_muted": "yes"}'])
+def test_a_damaged_but_parseable_state_follows_the_applier_sr029(btmic, tmp_path, content):
+    """And a document that parses is normalized, exactly as the applier does it.
+
+    THE RESIDUAL IS WRITTEN DOWN RATHER THAN HIDDEN. `normalize` repairs each
+    bad field to its default, and the default is `speaker` with no input mute --
+    so a state file damaged in the `input_muted` field specifically reverts to
+    UNMUTED and a microphone may run. That is deliberate: the applier normalizes
+    the same document by the same function, so the alternative is a supervisor
+    that refuses while the applier starts the leg, which is a disagreement about
+    a microphone and is worse than either answer on its own. The Owner-visible
+    consequence is in the report; the fix, if one is ever wanted, belongs in
+    `normalize` where BOTH halves would see it, not here.
+    """
+    state = tmp_path / "audio-state.json"
+    state.write_text(content, encoding="utf-8")
+    assert btmic.mic_allowed(state) is True
+
+
+def test_the_supervisor_and_the_applier_share_one_definition_of_mic_live_sr029(btmic):
+    """The policy is not duplicated: firstboot installs both beside each other."""
+    source = read(BT_MIC)
+    assert "policy.mic_live" in source, "the single definition, not a second copy"
+    assert "import wall_audio_state" in source
+    installed = read(WALL / "wall-firstboot.sh")
+    assert "wall_audio_state.py" in installed and "wall-bt-mic.py" in installed
+    # Both into the SAME directory, or the import above cannot resolve.
+    block = installed.split("wall_audio_state.py wall-bt-mic.py", 1)[1][:400]
+    assert "/usr/local/lib/wall-panel/" in block

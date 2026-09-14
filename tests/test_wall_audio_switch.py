@@ -1269,7 +1269,10 @@ def test_the_boot_minute_fix_is_not_an_ordering_deadlock_sr028():
     """
     firstboot = read(WALL / "wall-firstboot.sh")
     mode = read(WALL / "wall-audio-mode")
-    assert "/usr/local/sbin/wall-audio-mode bus" in firstboot,         "firstboot is what applies bus mode"
+    # The literal invocation lives in firstboot's apply_audio_mode helper,
+    # which judges the result; the bus arm calls it with the mode name.
+    assert '/usr/local/sbin/wall-audio-mode "$mode"' in firstboot,         "firstboot is what applies a mode"
+    assert "apply_audio_mode bus" in firstboot,         "firstboot is what applies bus mode"
     assert "unit restart wall-audio-state.service" in mode,         "and that is what runs the applier that starts these legs"
     for name in ("wall-speaker-out.service", "wall-bus-speaker.service"):
         # Directives only: the units EXPLAIN the withdrawn ordering at length,

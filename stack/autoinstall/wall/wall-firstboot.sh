@@ -1001,6 +1001,35 @@ case "${WALL_VOLUME_KEYS_ENABLED:-true}" in
         enable_unit "wall-volume-keys.service enabled — the side rocker drives whichever output the current mode uses" wall-volume-keys.service ;;
 esac
 
+# apply_audio_mode MODE SUCCESS_LINE... — apply one output chain and JUDGE it.
+#
+# A FAILED APPLY IS A RED FIRSTBOOT, NOT A WARNING. This ran as a bare `warn`
+# until 2026-09-14 and then printed the affirmative "bus mode" line anyway, so
+# a half-applied switch -- mode file and symlink moved, legs not moved, both
+# chains on one adapter -- reached the wall behind a GREEN provisioning marker.
+# That is the exact failure the bus arm was added to prevent (measured
+# 2026-09-14 00:06 as audible distortion), so it cannot be reported as success.
+# fail_step does not abort the boot: the kiosk still comes up, the unit goes
+# red, and the marker is withheld.
+#
+# An absent or non-executable applier is the same failure wearing a different
+# hat, and used to be SILENT: the arm's `if [ -x ]` simply fell through while
+# the trigger arm logged its success line from outside the guard.
+apply_audio_mode() {
+    local mode="$1"; shift
+    if [ ! -x /usr/local/sbin/wall-audio-mode ]; then
+        fail_step "audio: /usr/local/sbin/wall-audio-mode is missing or not executable, so WALL_AUDIO_MODE=$mode was NOT applied. Whatever chain the panel came up in is what it is running, which may not be the one wall.env names. Check $PAYLOAD/wall-audio-mode reached the payload."
+        return 1
+    fi
+    if ! /usr/local/sbin/wall-audio-mode "$mode" >/dev/null 2>&1; then
+        fail_step "audio: \`wall-audio-mode $mode\` FAILED. The switch may be HALF applied (mode file and symlink moved, legs not), which can leave two chains driving one adapter. Re-run by hand and read its output: sudo /usr/local/sbin/wall-audio-mode $mode"
+        return 1
+    fi
+    local line
+    for line in "$@"; do log "$line"; done
+    return 0
+}
+
 case "${WALL_AUDIO_MODE:-trigger}" in
     bus|BUS)
         # The merged bus (D-3). Before this arm existed, `bus` fell through to
@@ -1008,26 +1037,11 @@ case "${WALL_AUDIO_MODE:-trigger}" in
         # bus graph and half-applied it: mode file and symlink said trigger
         # while the bus legs kept running, and both chains drove the adapter
         # at once (measured 2026-09-14 00:06 as audible distortion).
-        if [ -x /usr/local/sbin/wall-audio-mode ]; then
-            /usr/local/sbin/wall-audio-mode bus >/dev/null 2>&1 ||
-                warn "audio: could not apply bus mode"
-            log "audio: bus mode — one merged stereo bus, the Mute/Headset/Speaker switch, amp detector on the speaker tap."
-        fi ;;
+        apply_audio_mode bus             "audio: bus mode — one merged stereo bus, the Mute/Headset/Speaker switch, amp detector on the speaker tap." ;;
     panel|PANEL)
-        if [ -x /usr/local/sbin/wall-audio-mode ]; then
-            /usr/local/sbin/wall-audio-mode panel >/dev/null 2>&1 ||
-                warn "audio: could not apply panel mode"
-            log "audio: panel mode — everything out the panel's own speaker. Note this"
-            log "audio: path measured 31 dB noisier than the adapter; it is a fallback."
-        fi ;;
+        apply_audio_mode panel             "audio: panel mode — everything out the panel's own speaker. Note this"             "audio: path measured 31 dB noisier than the adapter; it is a fallback." ;;
     *)
-        if [ -x /usr/local/sbin/wall-audio-mode ]; then
-            /usr/local/sbin/wall-audio-mode trigger >/dev/null 2>&1 ||
-                warn "audio: could not apply trigger mode"
-        fi
-        log "audio: trigger mode — audio out the USB adapter, amplifier commanded over the LCUS-2 relay."
-        log "audio: the built-in headphone jack carries nothing; the trigger tone was retired 2026-09-13."
-        ;;
+        apply_audio_mode trigger             "audio: trigger mode — audio out the USB adapter, amplifier commanded over the LCUS-2 relay."             "audio: the built-in headphone jack carries nothing; the trigger tone was retired 2026-09-13." ;;
 esac
 
 # ── the camera: OFF AT THE KERNEL unless the knob says otherwise ────────────

@@ -398,43 +398,105 @@ def test_image_contract_is_disabled_local_and_carries_no_broad_dbus_policy_sr023
 
 
 def test_firstboot_payload_files_are_all_tracked_and_shipped():
-    """Every file wall-firstboot.sh installs from $PAYLOAD must be in the image.
+    """Every file wall-firstboot.sh reads from $PAYLOAD must be in the image.
 
     The panel's payload dir is `git archive HEAD` of this repo (vmtest/lib/
     common.sh copy_repo_into_payload), so a file that is untracked, or renamed
     without the firstboot reference following it, ships as an absent payload
-    entry. Both install loops guard with `[ -f ]`, so the failure is SILENT:
-    the unit or helper simply never lands. Measured 2026-09-14 on the live
-    panel, whose payload dir predates the amplifier and hub-reset work and is
-    therefore missing 91-wall-usb-hub-reset.rules, wall-usb-hub-reset@.service,
+    entry. Both bulk install loops guard with `[ -f ]`, so the failure is
+    SILENT: the unit or helper simply never lands. Measured 2026-09-14 on the
+    live panel, whose payload dir predates the amplifier and hub-reset work and
+    is therefore missing 91-wall-usb-hub-reset.rules, wall-usb-hub-reset@.service,
     wall-amp-trigger.service and wall-line-in.service among others -- firstboot
     skipped every one of them without a word.
+
+    REFERENCES ARE RESOLVED, NOT PATTERN-MATCHED. `$PAYLOAD/$_f` is worthless
+    on its own, and `$PAYLOAD/../../panel-audio/$_wall_audio_file` reaches OUT
+    of the wall directory entirely; a first cut of this test captured one path
+    component, saw that one as `..` and threw it away, which quietly excused
+    the whole cross-directory class. Every loop variable is substituted from
+    its own `for` line and every path is normalised against the repo root.
     """
+    import posixpath
     import re
 
     firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
     tracked = set(subprocess.run(
-        ["git", "ls-files", "stack/autoinstall/wall"],
-        cwd=ROOT, check=True, capture_output=True, text=True,
-    ).stdout.split())
+        ["git", "ls-files"], cwd=ROOT, check=True, capture_output=True, text=True,
+    ).stdout.splitlines())
 
-    refs = set()
-    for match in re.finditer(r"\$PAYLOAD/([A-Za-z0-9@._+-]+)", firstboot):
-        refs.add(match.group(1))
-    # The two bulk install loops name their files as bare words, not as
-    # $PAYLOAD/... expansions, so the regex above cannot see them.
-    for match in re.finditer(r"for _[fu] in ([^;]+); do", firstboot):
-        refs.update(match.group(1).split())
-    refs.discard("..")
+    loops = {}
+    for match in re.finditer(r"for (_[A-Za-z0-9_]+) in ([^;\n]+); do", firstboot):
+        words = [w for w in match.group(2).split() if not w.startswith("$")]
+        if words:
+            loops[match.group(1)] = words
 
-    missing = sorted(r for r in refs if "stack/autoinstall/wall/" + r not in tracked)
-    assert not missing, (
-        "wall-firstboot.sh installs these from $PAYLOAD but they are not tracked "
-        "under stack/autoinstall/wall/, so the image will not carry them and "
-        "firstboot will skip them in silence: %s" % missing
+    base = "stack/autoinstall/wall"
+    refs, unresolved = set(), set()
+    for match in re.finditer(r"\$PAYLOAD/([A-Za-z0-9@._+/$-]+)", firstboot):
+        raw = match.group(1)
+        variables = re.findall(r"\$(_[A-Za-z0-9_]+)", raw)
+        expansions = [raw]
+        for var in variables:
+            if var not in loops:
+                unresolved.add(raw)
+                expansions = []
+                break
+            expansions = [e.replace("$" + var, w) for e in expansions for w in loops[var]]
+        for expanded in expansions:
+            if "$" in expanded:
+                unresolved.add(raw)
+                continue
+            refs.add(posixpath.normpath(base + "/" + expanded))
+    # Bare `$PAYLOAD/` (the directory itself, used in message text) normalises
+    # to the directory; it is not a file reference.
+    refs.discard(base)
+
+    assert not unresolved, (
+        "this test could not resolve these $PAYLOAD references, so it was not "
+        "checking them -- teach it the new form rather than letting it pass: %s"
+        % sorted(unresolved)
     )
-    # A spot check that the regex is actually finding things, so a future
-    # refactor of firstboot cannot turn this into a test of nothing.
-    assert {"wall-alsaloop-guard.py", "wall_audio_state.py",
-            "wall-amp-trigger.service", "wall-usb-hub-reset@.service",
-            "wall-audio-apply.path"} <= refs
+    missing = sorted(r for r in refs if r not in tracked)
+    assert not missing, (
+        "wall-firstboot.sh reads these from $PAYLOAD but they are not tracked, "
+        "so the image will not carry them and firstboot will skip them in "
+        "silence: %s" % missing
+    )
+    # Spot checks that the resolution above is actually finding things, so a
+    # future refactor of firstboot cannot turn this into a test of nothing:
+    # literals, one word from each bulk loop, and the cross-directory form.
+    assert {
+        base + "/91-wall-usb-hub-reset.rules",
+        base + "/wall-alsaloop-guard.py",
+        base + "/wall_audio_state.py",
+        base + "/wall-amp-trigger.service",
+        base + "/wall-usb-hub-reset@.service",
+        base + "/wall-audio-apply.path",
+        "stack/panel-audio/audio_router.py",
+    } <= refs
+
+
+def test_firstboot_refuses_to_call_an_unapplied_audio_mode_a_success():
+    """A failed `wall-audio-mode` apply must make firstboot RED, not warn.
+
+    The bus arm logged its affirmative success line whatever the applier did,
+    and an absent applier skipped the whole arm in silence, so a half-applied
+    switch -- mode file and symlink moved, legs not moved, two chains on one
+    adapter -- could reach the wall behind a green provisioning marker. That is
+    the precise failure the bus arm exists to prevent.
+    """
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    body_start = firstboot.index("apply_audio_mode() {")
+    body = firstboot[body_start:firstboot.index("\nesac\n", body_start)]
+    assert body.count("fail_step") == 2, body
+    assert "warn " not in body
+    # Every arm goes through the helper, and no arm applies a mode any other way.
+    case_start = firstboot.index('case "${WALL_AUDIO_MODE:-trigger}" in')
+    case = firstboot[case_start:firstboot.index("\nesac\n", case_start)]
+    for mode in ("bus", "panel", "trigger"):
+        assert "apply_audio_mode " + mode in case
+    assert "/usr/local/sbin/wall-audio-mode" not in case
+    # The success lines are inside the helper's post-success loop, not printed
+    # unconditionally the way the trigger arm used to print them.
+    assert 'for line in "$@"; do log "$line"; done' in body

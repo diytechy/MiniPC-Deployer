@@ -31,7 +31,8 @@ alone changes nothing that runs.
 
 **2026-09-13 — LCUS-2 amplifier actuation is PROVEN ON THE PANEL, except the
 amplifier itself.** The actuator defaults to the measured CH340 LCUS-2 board
-through a stable `/dev/wall-amp-relay` udev link, `audio-jack` stays selectable,
+through a stable `/dev/wall-amp-relay` udev link, `audio-jack` is retired and
+refused (2026-09-13),
 and SN-020/SR-026/LLR-010/TC-010/IF-017 are implemented. On the panel the board
 enumerates, the shipped transport drives it, and a full audio-to-relay cycle
 runs to the exact configured timings. **The panel now carries hand-installed

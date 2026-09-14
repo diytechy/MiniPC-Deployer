@@ -22,10 +22,12 @@
 #    enabled wall-kiosk-loop would fail and be restarted every two seconds for
 #    as long as the panel stays in that mode.
 #
-# AUTO-MUTE STAYS DISABLED IN BOTH MODES, for opposite reasons: in trigger mode
-# so a pulled trigger cable cannot unmute the panel's own speaker into a
-# full-scale tone, and in panel mode so an inserted one cannot mute the speaker
-# that is supposed to be playing.
+# AUTO-MUTE STAYS DISABLED IN BOTH MODES, so that a cable in the built-in jack
+# cannot silently retarget the codec: in trigger mode the panel's own speaker
+# must stay muted whatever is plugged in, and in panel mode an inserted plug
+# must not mute the speaker that is supposed to be playing. Since 2026-09-13
+# that jack carries no trigger tone at all -- it is a plain audio output held
+# for the headset leg (HomeHub item 23).
 set -eu
 
 MODE_FILE=/etc/wall-panel/audio-mode
@@ -48,9 +50,9 @@ note_failure() {
     echo "FAILED: $*" >&2
 }
 
-# Mixer changes are reported, not swallowed. A Headphone left muted means the
-# trigger tone exists with no voltage behind it; a Speaker left unmuted in
-# trigger mode means a full-scale tone on the wall.
+# Mixer changes are reported, not swallowed. A Speaker left unmuted in trigger
+# mode puts the panel's own driver back into a room the amplifier is serving,
+# and a Headphone left muted silences the headset leg with nothing saying why.
 mix() {
     _card=$1; shift
     amixer -c "$_card" -q sset "$@" 2>/dev/null || note_failure "amixer -c $_card sset $*"
@@ -109,8 +111,8 @@ apply_panel() {
     mix "$BUILTIN" 'Auto-Mute Mode' Disabled
     mix "$BUILTIN" Master 100% unmute
     mix "$BUILTIN" Speaker unmute
-    # Muted so a trigger cable still plugged in cannot be driven, and so the
-    # amplifier is not commanded while the panel plays its own speaker.
+    # Muted so the panel's own speaker is the single output in this mode; the
+    # jack is an ordinary output now and would otherwise play in parallel.
     mix "$BUILTIN" Headphone mute
     mix "$ADAPTER" Speaker mute
     # Disabled, not just stopped: this mode defines no kiosk_monitor, so an

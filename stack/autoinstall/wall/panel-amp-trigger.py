@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """Power the speaker amplifier while audio is playing.
 
-The level detector is independent of the actuator. The shipped default emits a
-continuous tone on the ALC255 headphone jack for a far-end rectifier. The
-alternative commands one channel of the measured LCUS-2 USB relay through its
-CH340 serial interface. Software decides in one place; configuration chooses
-how that decision reaches the amplifier.
+The level detector is independent of the actuator. The only actuator is one
+channel of the measured LCUS-2 USB relay, commanded through its CH340 serial
+interface (ratified 2026-09-13). The retired alternative put a continuous tone
+on the ALC255 headphone jack for a far-end rectifier; that jack is now free and
+belongs to the headset leg of the item 23 audio routing redesign, so nothing
+here may open it.
 
-WHY A TONE AND NOT A DETECTOR ON THE AMPLIFIER FEED (measured 2026-09-12):
-the feed is downstream of the volume control, so an analog detector's
-sensitivity would track the rocker and quiet listening would never switch the
-amplifier on. And the ALC255, rejected for audio at 31 dB noisier than the USB
-adapter, is the right part for this: a rectifier does not care about noise and
-does care about volts, and it measured 2.6 V bridged against the adapter's 0.29.
+WHY A DETECTOR AND NOT AN ANALOG ONE ON THE AMPLIFIER FEED (measured
+2026-09-12): the feed is downstream of the volume control, so an analog
+detector's sensitivity would track the rocker and quiet listening would never
+switch the amplifier on.
 
 WHY BOTH CAPTURE SOURCES: the line input carries only the desktop. The kiosk's
 Pandora and local library play digitally and never pass through it, so a
@@ -66,29 +65,6 @@ SOURCES = (
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
-
-
-CARDS_FILE = "/etc/wall-panel/audio-cards.env"
-
-
-def _card(key, default):
-    """Read one card id from the generated card map.
-
-    Card ids live in exactly one generated file so that swapping the USB adapter
-    is a knob rather than an edit across the ALSA configs, the mode script and
-    both daemons. The default is a fallback for a panel whose file predates it.
-    """
-    try:
-        with open(CARDS_FILE) as fh:
-            for line in fh:
-                line = line.strip()
-                if line.startswith(key + "="):
-                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if value:
-                        return value
-    except OSError:
-        pass
-    return default
 
 
 def _reap(proc):
@@ -169,19 +145,7 @@ HOLD_OFF_SECONDS = _env("WALL_AMP_HOLD_OFF_SECONDS", 240.0, lo=0.0, hi=86400.0)
 MIN_ON_SECONDS = _env("WALL_AMP_MIN_ON_SECONDS", 30.0, lo=0.0, hi=3600.0)
 MIN_OFF_SECONDS = _env("WALL_AMP_MIN_OFF_SECONDS", 10.0, lo=0.0, hi=3600.0)
 
-# The trigger output.
-TRIGGER_CARD = _card("WALL_AUDIO_BUILTIN_CARD", "PCH")
-TRIGGER_PCM = "trigger_out"
-# 0 Hz is all-zero samples: aplay stays alive and the relay never closes.
-TRIGGER_FREQ = _env("WALL_AMP_TONE_HZ", 1000.0, lo=50.0, hi=20000.0)
-TRIGGER_AMPLITUDE = 0.99
-# 'Front Headphone Jack' -- a cable that has fallen out otherwise presents as
-# "the amplifier stopped working" with nothing anywhere to say why. The internal
-# speaker is muted and auto-mute disabled independently of this, so this is
-# diagnostics rather than safety.
-JACK_CONTROL = "Front Headphone Jack"
-JACK_POLL_SECONDS = 5.0
-# Do not reopen a failing aplay or serial device on every 100 ms block.
+# Do not reopen a failing serial device on every 100 ms block.
 ACTUATOR_RETRY_SECONDS = 5.0
 # ...but five seconds is too slow for the first few, and terra found exactly why
 # (2026-09-13): after a port move this service restarts, and if the CH340 is
@@ -190,8 +154,7 @@ ACTUATOR_RETRY_SECONDS = 5.0
 # allows -- for a relay that was actually back at seven. So for a bounded spell
 # after start, retry once a second. Bounded, because a relay that is genuinely
 # absent must not be probed once a second for the life of the panel, and
-# restricted to the relay because respawning aplay that fast is a different and
-# worse thing to do.
+# restricted to the relay, which is the only actuator there is.
 ACTUATOR_FAST_RETRY_SECONDS = 1.0
 ACTUATOR_FAST_RETRY_WINDOW = 15.0
 # How long a service START waits for the relay's device node before giving up.
@@ -228,15 +191,6 @@ STALE_SECONDS = 1.0
 MODE_FILE = "/etc/wall-panel/audio-mode"
 
 
-def amixer(card, *args):
-    try:
-        return subprocess.run(["/usr/bin/amixer", "-c", card, *args],
-                              check=False, capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError) as exc:
-        log("amixer %s %s: %s" % (card, " ".join(args), exc))
-        return None
-
-
 def current_mode():
     """trigger or panel. A missing file means trigger, the normal configuration."""
     try:
@@ -245,54 +199,6 @@ def current_mode():
     except OSError:
         return "trigger"
     return value if value in ("trigger", "panel") else "trigger"
-
-
-def jack_present():
-    """True if a cable is in the headphone jack, or if detection is unavailable.
-
-    Defaults to True deliberately: if the control cannot be read, refusing to
-    emit the tone would silently disable the amplifier, which is worse than
-    emitting it into a muted speaker.
-    """
-    got = amixer(TRIGGER_CARD, "cget", "name=" + JACK_CONTROL)
-    if got is None or got.returncode != 0:
-        return True
-    for line in got.stdout.splitlines():
-        line = line.strip()
-        if line.startswith(": values="):
-            return line.endswith("on")
-    return True
-
-
-def assert_trigger_output():
-    """Put the trigger path where the measured 2.6 V assumes it is.
-
-    Not inherited from alsactl: a silent reset would halve the trigger voltage
-    and the amplifier would simply stop switching on, with nothing in any log.
-
-    Failures are REPORTED, not swallowed. A muted Headphone or a renamed control
-    means this daemon can log "amplifier ON" while no trigger voltage exists at
-    all; a failure to mute Speaker can put a full-scale tone through the panel's
-    own speaker. Both are invisible unless said out loud.
-    """
-    ok = True
-    for args in (("sset", "Master", "100%", "unmute"),
-                 ("sset", "Headphone", "100%", "unmute"),
-                 # The internal speaker stays muted and auto-mute disabled in
-                 # both modes, re-asserted here so a stray mixer change cannot
-                 # put a full-scale tone on the panel's own speaker.
-                 ("sset", "Speaker", "mute"),
-                 ("sset", "Auto-Mute Mode", "Disabled")):
-        got = amixer(TRIGGER_CARD, "-q", *args)
-        if got is None or got.returncode != 0:
-            ok = False
-            detail = ""
-            if got is not None:
-                detail = (got.stderr or got.stdout or "").strip()
-            first = detail.splitlines()[0] if detail else "no detail"
-            log("TRIGGER PATH NOT ASSERTED: amixer %s failed: %s"
-                % (" ".join(args), first))
-    return ok
 
 
 class Level:
@@ -403,106 +309,6 @@ class Level:
         if self.stale:
             return "%s stalled" % self.pcm
         return "%s %.1f dBFS" % (self.pcm, self.dbfs)
-
-
-class Tone:
-    """The trigger tone, as a child aplay fed continuously.
-
-    Generated rather than looped from a file so there is no gap where a file
-    ends and restarts -- a restarting player is also what appeared to wedge the
-    shared dmix slave during bench work.
-    """
-
-    def __init__(self):
-        self._proc = None
-        self._thread = None
-        self._stop = threading.Event()
-
-    @property
-    def running(self):
-        """Alive means aplay is up AND the feeder is still delivering.
-
-        Checking only the process leaves a hole: if the feeder thread dies
-        while aplay sits waiting on its pipe, this reads true forever and the
-        restart path never fires, so the relay opens with nothing saying why.
-        """
-        if self._proc is None or self._proc.poll() is not None:
-            return False
-        return self._thread is not None and self._thread.is_alive()
-
-    def start(self):
-        """True only if the tone is actually playing.
-
-        Popen succeeding proves nothing: an ALSA open failure happens inside
-        the child, so a missing trigger_out or a busy card returned success
-        here and the caller logged 'amplifier ON' with no voltage anywhere.
-        """
-        if self.running:
-            return True
-        self._stop.clear()
-        try:
-            self._proc = subprocess.Popen(
-                ["/usr/bin/aplay", "-D", TRIGGER_PCM, "-f", "S16_LE",
-                 "-r", str(RATE), "-c", str(CHANNELS), "-q", "-"],
-                stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        except OSError as exc:
-            log("cannot start tone: %s" % exc)
-            self._proc = None
-            return False
-        self._thread = threading.Thread(target=self._feed, daemon=True)
-        self._thread.start()
-        # Give the child long enough to fail an ALSA open, then look.
-        try:
-            self._proc.wait(timeout=0.4)
-        except subprocess.TimeoutExpired:
-            return True
-        err = ""
-        try:
-            if self._proc.stderr is not None:
-                err = self._proc.stderr.read(2048).decode("utf-8", "replace").strip()
-        except (OSError, ValueError):
-            pass
-        log("TONE FAILED TO START on %s: %s"
-            % (TRIGGER_PCM, err.splitlines()[0] if err else "aplay exited immediately"))
-        self._proc = None
-        return False
-
-    def _feed(self):
-        phase = 0
-        chunk = BLOCK_FRAMES
-        while not self._stop.is_set() and self.running:
-            frames = []
-            for _ in range(chunk):
-                v = int(32767 * TRIGGER_AMPLITUDE
-                        * math.sin(2 * math.pi * TRIGGER_FREQ * phase / RATE))
-                # Anti-phase across the pair: taken across tip and ring this is
-                # double either one to ground, the +6 dB that puts the rectified
-                # level clear of the relay's threshold.
-                frames.append(v)
-                frames.append(-v)
-                phase = (phase + 1) % RATE
-            try:
-                self._proc.stdin.write(struct.pack("<%dh" % len(frames), *frames))
-                self._proc.stdin.flush()
-            except (OSError, ValueError, AttributeError):
-                return
-
-    def stop(self):
-        self._stop.set()
-        proc, self._proc = self._proc, None
-        if proc is None:
-            return True
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except OSError:
-            pass
-        _reap(proc)
-        return True
-
-    def maintain(self, _now=None):
-        """Return whether the already-started tone is still being delivered."""
-        return self.running
 
 
 def lcus2_command(channel, enabled):
@@ -762,9 +568,14 @@ def _valid_device_path(value):
 
 def build_actuator(method, lcus2_device="", lcus2_channel="1",
                    transport_factory=None):
-    """Build exactly one amplifier actuator from the configured method."""
-    if method == "audio-jack":
-        return Tone()
+    """Build the amplifier actuator from the configured method.
+
+    LCUS-2 IS THE ONLY ACTUATOR (ratified 2026-09-13). Anything else -- the
+    retired `audio-jack` tone included -- is refused loudly here rather than
+    quietly falling back, because a silent fallback to the relay on a panel
+    configured for the jack would look like it worked, and a silent fallback
+    the other way would put a full-scale tone on the jack the headset leg owns.
+    """
     if method == "lcus-2":
         if not _valid_device_path(lcus2_device):
             raise ConfigurationError(
@@ -781,16 +592,14 @@ def build_actuator(method, lcus2_device="", lcus2_channel="1",
             transport_factory=transport_factory,
         )
     raise ConfigurationError(
-        "WALL_AMP_ACTIVATOR must be exactly audio-jack or lcus-2")
+        "WALL_AMP_ACTIVATOR must be exactly lcus-2; the audio-jack tone "
+        "actuator was retired 2026-09-13 and the jack is now an audio output")
 
 
 def required_tools(method):
     """Return only the programs used by the selected detector/actuator path."""
-    common = ("/usr/bin/arecord",)
-    if method == "audio-jack":
-        return common + ("/usr/bin/aplay", "/usr/bin/amixer")
     if method == "lcus-2":
-        return common
+        return ("/usr/bin/arecord",)
     raise ConfigurationError("unknown amplifier actuator %r" % method)
 
 
@@ -811,15 +620,13 @@ def record_safe_state(verified):
         log("could not update amplifier safe-state proof: %s" % exc)
 
 
-def retry_beat(now, started_at, jack_actuator):
+def retry_beat(now, started_at):
     """How long to wait between actuator attempts, at this moment.
 
     One second while the re-enumeration this service was restarted for could
     still be settling, five afterwards. Pure, so the timing that the ten-second
     acceptance depends on is testable without a relay.
     """
-    if jack_actuator:
-        return ACTUATOR_RETRY_SECONDS
     if now - started_at < ACTUATOR_FAST_RETRY_WINDOW:
         return ACTUATOR_FAST_RETRY_SECONDS
     return ACTUATOR_RETRY_SECONDS
@@ -881,9 +688,7 @@ def main():
     # The measured LCUS-2 is a latching device: closing the serial port leaves
     # an energized channel energized. Establish and verify the safe state on
     # every service start, including disabled and non-trigger modes.
-    safe = True
-    if method == "lcus-2":
-        safe = ensure_off_bounded(actuator)
+    safe = ensure_off_bounded(actuator)
     record_safe_state(safe)
 
     stopping = threading.Event()
@@ -912,11 +717,7 @@ def main():
             pass
         return 0 if stop_and_record(actuator) is not False else 1
 
-    jack_actuator = method == "audio-jack"
-    if jack_actuator:
-        assert_trigger_output()
-    else:
-        log("amplifier actuator: LCUS-2 channel %s at %s" % (channel, device))
+    log("amplifier actuator: LCUS-2 channel %s at %s" % (channel, device))
     levels = [Level(pcm, off) for pcm, off in SOURCES]
     for lv in levels:
         lv.start()
@@ -924,31 +725,13 @@ def main():
     above_since = None
     below_since = None
     changed_at = 0.0
-    last_jack_poll = 0.0
     last_actuator_attempt = -1e9
     last_off_attempt = -1e9
-    jack = True
     started_at = time.monotonic()
-    last_reassert = started_at
 
     log("watching %s" % ", ".join(pcm for pcm, _ in SOURCES))
     while not stopping.is_set():
         now = time.monotonic()
-
-        if jack_actuator and now - last_jack_poll >= JACK_POLL_SECONDS:
-            last_jack_poll = now
-            present = jack_present()
-            if present != jack:
-                log("trigger cable %s" % ("connected" if present else "REMOVED"))
-            jack = present
-
-        # Re-assert periodically. A wedged daemon that stops doing this is also
-        # one whose tone should not be trusted to stop; this is the cheap half
-        # of the watchdog.
-        if now - last_reassert >= 60.0:
-            last_reassert = now
-            if jack_actuator:
-                assert_trigger_output()
 
         # RECONCILE A RELAY WE COULD NOT REACH AT START (terra, 2026-09-13).
         # Two things made this necessary. The relay is on the SAME USB hub as
@@ -961,7 +744,7 @@ def main():
         # is outside the ten seconds the acceptance allows. So the detector runs
         # regardless and keeps trying to reach the safe state on the actuator
         # retry beat for as long as the amplifier is supposed to be off.
-        beat = retry_beat(now, started_at, jack_actuator)
+        beat = retry_beat(now, started_at)
         if not on and not safe and now - last_off_attempt >= beat:
             last_off_attempt = now
             safe = stop_and_record(actuator) is not False
@@ -972,7 +755,7 @@ def main():
         quiet = all(not lv.above(OFF_DBFS) for lv in levels)
 
         if not on:
-            if loud and jack:
+            if loud:
                 above_since = above_since or now
                 if now - above_since >= ATTACK_SECONDS and now - changed_at >= MIN_OFF_SECONDS:
                     if now - last_actuator_attempt >= beat:
@@ -1007,13 +790,8 @@ def main():
                         log("amplifier OFF could not be verified; will retry")
             else:
                 below_since = None
-            if jack_actuator and not jack and actuator.running:
-                log("trigger cable removed; stopping tone")
-                safe = stop_and_record(actuator) is not False
-                on = False
-                changed_at = now
-            elif (on and not actuator.maintain(now)
-                  and now - last_actuator_attempt >= beat):
+            if (on and not actuator.maintain(now)
+                    and now - last_actuator_attempt >= beat):
                 last_actuator_attempt = now
                 log("amplifier actuator stopped unexpectedly; restarting")
                 if not actuator.start():

@@ -200,16 +200,12 @@ def test_the_first_attempts_after_a_restart_are_on_a_one_second_beat():
     """
     module = load_module()
     started = 1000.0
-    assert module.retry_beat(started + 6.0, started, False) == 1.0
-    assert module.retry_beat(started + 7.0, started, False) == 1.0
+    assert module.retry_beat(started + 6.0, started) == 1.0
+    assert module.retry_beat(started + 7.0, started) == 1.0
     # A relay absent for the whole window drops back to the slow beat rather
     # than being probed once a second for the life of the panel.
-    assert module.retry_beat(started + 20.0, started,
-                             False) == module.ACTUATOR_RETRY_SECONDS
-    # The retired tone actuator keeps the slow beat throughout: respawning
-    # aplay once a second is a different and worse thing to do.
-    assert module.retry_beat(started + 6.0, started,
-                             True) == module.ACTUATOR_RETRY_SECONDS
+    assert module.retry_beat(started + 20.0,
+                             started) == module.ACTUATOR_RETRY_SECONDS
 
 
 def test_the_whole_recovery_fits_the_ten_second_budget():
@@ -217,7 +213,7 @@ def test_the_whole_recovery_fits_the_ten_second_budget():
     module = load_module()
     gave_up_at = module.RELAY_WAIT_SECONDS
     relay_back_at = 7.0
-    beat = module.retry_beat(gave_up_at, 0.0, False)
+    beat = module.retry_beat(gave_up_at, 0.0)
     # Attempts at 6, 7, 8 ... so the first one after the node returns is 7.
     first_after_return = gave_up_at
     while first_after_return < relay_back_at:

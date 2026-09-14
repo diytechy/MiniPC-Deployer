@@ -138,7 +138,6 @@ def test_lcus2_failure_is_not_reported_as_on():
 def test_actuator_choice_is_exact_and_lcus2_requires_safe_configuration():
     module = load_module()
 
-    assert isinstance(module.build_actuator("audio-jack"), module.Tone)
     assert isinstance(module.build_actuator(
         "lcus-2", lcus2_device="/dev/wall-amp-relay", lcus2_channel="1"
     ), module.Lcus2Relay)
@@ -154,13 +153,58 @@ def test_actuator_choice_is_exact_and_lcus2_requires_safe_configuration():
         module.build_actuator("automatic")
 
 
+def test_the_retired_tone_actuator_is_refused_and_its_code_is_gone():
+    """Ratified 2026-09-13: LCUS-2 is the only actuator, the jack is free.
+
+    A panel still configured for the tone must FAIL, not fall back: falling
+    back to the relay would look like it worked while nobody had re-proved the
+    relay, and reviving the tone would put a full-scale signal on the jack the
+    headset leg of item 23 now owns.
+    """
+    module = load_module()
+
+    assert not hasattr(module, "Tone")
+    for gone in ("TRIGGER_PCM", "TRIGGER_FREQ", "TRIGGER_AMPLITUDE",
+                 "JACK_CONTROL", "jack_present", "assert_trigger_output"):
+        assert not hasattr(module, gone), gone
+
+    with pytest.raises(module.ConfigurationError) as refused:
+        module.build_actuator("audio-jack")
+    assert "lcus-2" in str(refused.value)
+    with pytest.raises(module.ConfigurationError):
+        module.required_tools("audio-jack")
+
+    source = (WALL / "panel-amp-trigger.py").read_text(encoding="utf-8")
+    assert "WALL_AMP_TONE_HZ" not in source
+    # Nothing in the daemon may open the built-in codec any more.
+    assert "trigger_out" not in source
+
+
+def test_no_shipped_configuration_still_names_the_tone():
+    trigger_mode = (WALL / "asound-trigger-mode.conf").read_text(encoding="utf-8")
+    amp_env = (WALL / "amp-trigger.env").read_text(encoding="utf-8")
+    env = (WALL / "wall.env.example").read_text(encoding="utf-8")
+    mode_script = (WALL / "wall-audio-mode").read_text(encoding="utf-8")
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+
+    # The PCM that carried the tone is gone from the graph, so the built-in
+    # codec has no playback path defined in trigger mode at all.
+    assert "pcm.trigger_out" not in trigger_mode
+    assert "card_builtin" not in trigger_mode
+    assert "WALL_AMP_TONE_HZ" not in amp_env
+    assert "WALL_AMP_TONE_HZ" not in env
+    assert "WALL_AMP_ACTIVATOR=lcus-2" in amp_env
+    assert "trigger_out" not in mode_script
+    # firstboot accepts exactly one activator and names the retired one only to
+    # refuse it.
+    assert "audio-jack|lcus-2)" not in firstboot
+    assert "_amp_activator=invalid" in firstboot
+
+
 def test_lcus2_backend_does_not_require_headphone_tools():
     module = load_module()
 
     assert module.required_tools("lcus-2") == ("/usr/bin/arecord",)
-    assert module.required_tools("audio-jack") == (
-        "/usr/bin/arecord", "/usr/bin/aplay", "/usr/bin/amixer",
-    )
 
 
 def test_image_config_selects_lcus2_through_a_stable_measured_udev_link():

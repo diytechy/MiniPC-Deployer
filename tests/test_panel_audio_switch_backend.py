@@ -514,3 +514,80 @@ def test_a_refused_request_never_reaches_the_backend_at_all_sr023(panel, method,
     assert answer["ok"] is False
     assert spy.calls == [], "a refused request must not be observed by a backend"
     assert not panel["request"].exists()
+
+
+# --- terra 2.2: a code is a public diagnosis, not just a token --------------
+
+class MisdiagnosingBackend:
+    """A backend that raises `switch_moved` for a method it cannot explain."""
+
+    def call(self, method, params, cancel):
+        raise BrokerError("switch_moved", "not a thing this method can mean")
+
+    def inventory(self, cancel):
+        return []
+
+
+@pytest.mark.parametrize("method,params", [
+    ("set_output", {"output": "mute"}), ("set_input_mute", {"muted": True}),
+    ("set_mute", {"muted": True}),
+])
+def test_switch_moved_cannot_explain_a_method_it_is_not_about_sr023(method, params):
+    """"The selected output changed before the level could be applied" is only
+    ever true of a guarded set_volume; an operator acts on the sentence."""
+    answer = reply(AudioBroker(MisdiagnosingBackend()), wire(method, params))
+    assert answer["error"]["code"] == "backend_failure"
+
+
+def test_switch_moved_still_explains_the_method_it_is_about_sr028():
+    answer = reply(AudioBroker(MisdiagnosingBackend()),
+                   wire("set_volume", {"level": 20, "output": "speaker"}))
+    assert answer["error"]["code"] == "switch_moved"
+
+
+def test_a_status_call_cannot_be_answered_with_switch_moved_sr023():
+    answer = reply(AudioBroker(MisdiagnosingBackend()), wire("status"))
+    assert answer["error"]["code"] == "backend_failure"
+
+
+# --- terra 2.1, rejected with its reason ------------------------------------
+
+@pytest.mark.parametrize("partial", [
+    {"output": "speaker"},                       # no request_seq at all
+    {"output": "speaker", "request_seq": "abc"},  # a request_seq of the wrong type
+    {"output": "speaker", "request_seq": True},   # bool is an int in Python
+    {"request_seq": 40, "output": "nonsense"},    # a position the applier rejects
+    {},                                           # a valid, empty object
+])
+def test_a_valid_but_partial_state_is_read_exactly_as_the_applier_reads_it_llr013(panel, partial):
+    """WHY THIS IS NOT THE HOLE IT LOOKS LIKE (terra 2.1, rejected).
+
+    `_state_strict` accepts any JSON object rather than validating the full
+    schema, and a partial one leaves `request_seq` absent so the sequence is
+    minted from the clock. That is not a bypass: the APPLIER reads the same file
+    through `wall_audio_state.normalize`, which falls back field by field on
+    purpose, so an absent or damaged `request_seq` is -1 on BOTH sides and a
+    clock-minted sequence is above it by construction. Validating a stricter
+    schema here than the applier validates would refuse switch requests on a
+    panel whose switch works perfectly.
+
+    (Terra also read the third damage string in the test above as a valid
+    partial object; it is unterminated JSON and does refuse.)
+    """
+    import wall_audio_state
+    panel["state"].write_text(json.dumps(partial), encoding="utf-8")
+    switch = backend(panel, clock=[500 * US])
+    assert switch._applied_seq() == wall_audio_state.normalize(partial)["request_seq"]
+    broker = AudioBroker(switch)
+    answer = reply(broker, wire("set_output", {"output": "mute"}, echo_seq=True))
+    assert answer["result"]["seq"] == written(panel)["seq"]
+    assert answer["result"]["seq"] > wall_audio_state.normalize(partial)["request_seq"]
+
+
+def test_the_unreadable_cases_really_are_unreadable(panel):
+    """The damage strings used above, named so nobody has to guess."""
+    for damage in ("not json at all", "[]", '{"output": "speaker"'):
+        panel["state"].write_text(damage, encoding="utf-8")
+        with pytest.raises(BrokerError) as caught:
+            backend(panel)._state_strict()
+        assert caught.value.code == "backend_unavailable"

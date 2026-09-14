@@ -64,6 +64,23 @@ PRESERVED_BACKEND_CODES = {
     # being written; applying it would have set the other output's level.
     "switch_moved": "the selected output changed before the level could be applied",
 }
+# AND WHICH METHOD EACH CODE IS ALLOWED TO EXPLAIN (terra 2.2). A code is a
+# PUBLIC DIAGNOSIS, so preserving one by its token alone lets a backend answer
+# `set_output` or `status` with "the selected output changed before the level
+# could be applied" -- a sentence that is only ever true of a guarded
+# `set_volume`. A wrong explanation is a worse failure than a generic one,
+# because an operator acts on it. None means the code may explain any method.
+PRESERVED_BACKEND_METHODS = {"switch_moved": frozenset({"set_volume"})}
+
+
+def _preserved_code(code: object, method: str | None) -> str | None:
+    """The public code this backend failure may be reported as, or None."""
+    if code not in PRESERVED_BACKEND_CODES:
+        return None
+    allowed = PRESERVED_BACKEND_METHODS.get(code)
+    if allowed is not None and method not in allowed:
+        return None
+    return str(code)
 
 
 class Backend(Protocol):
@@ -413,8 +430,10 @@ class AudioBroker:
             raise BrokerError("backend_timeout", "audio backend exceeded its deadline")
         if "error" in outcome:
             failure = outcome["error"]
-            if isinstance(failure, BrokerError) and failure.code in PRESERVED_BACKEND_CODES:
-                raise BrokerError(failure.code, PRESERVED_BACKEND_CODES[failure.code])
+            preserved = (_preserved_code(failure.code, method)
+                         if isinstance(failure, BrokerError) else None)
+            if preserved is not None:
+                raise BrokerError(preserved, PRESERVED_BACKEND_CODES[preserved])
             raise BrokerError("backend_failure", "audio backend failed")
         return outcome.get("result")
 
@@ -449,8 +468,11 @@ class AudioBroker:
             if process.is_alive():
                 raise BrokerError("backend_busy", "audio backend could not be reaped")
             if kind == "error":
-                if value in PRESERVED_BACKEND_CODES:
-                    raise BrokerError(value, PRESERVED_BACKEND_CODES[value])
+                # The child sends only a token; the PARENT decides whether that
+                # token may explain the method it dispatched.
+                preserved = _preserved_code(value, method)
+                if preserved is not None:
+                    raise BrokerError(preserved, PRESERVED_BACKEND_CODES[preserved])
                 raise BrokerError("backend_failure", "audio backend failed")
             if kind != "result":
                 raise BrokerError("backend_failure", "audio backend failed")

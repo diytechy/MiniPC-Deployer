@@ -856,14 +856,22 @@ def main():
     # The measured LCUS-2 is a latching device: closing the serial port leaves
     # an energized channel energized. Establish and verify the safe state on
     # every service start, including disabled and non-trigger modes.
-    if method == "lcus-2" and not ensure_off_bounded(actuator):
-        record_safe_state(False)
-        return 1
-    record_safe_state(True)
+    safe = True
+    if method == "lcus-2":
+        safe = ensure_off_bounded(actuator)
+    record_safe_state(safe)
 
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
+
+    # An idling service has no detector loop to reconcile the relay later, so
+    # for those two paths an unverified OFF is still a hard failure that the
+    # RestartSec is the only cure for.
+    _idle = (os.environ.get("WALL_AMP_ENABLED", "true").strip().lower()
+             in ("false", "0", "no")) or current_mode() != "trigger"
+    if _idle and not safe:
+        return 1
 
     if os.environ.get("WALL_AMP_ENABLED", "true").strip().lower() in ("false", "0", "no"):
         log("WALL_AMP_ENABLED is false; idling without emitting anything")
@@ -893,6 +901,7 @@ def main():
     changed_at = 0.0
     last_jack_poll = 0.0
     last_actuator_attempt = -1e9
+    last_off_attempt = -1e9
     jack = True
     last_reassert = time.monotonic()
 
@@ -915,6 +924,23 @@ def main():
             if jack_actuator:
                 assert_trigger_output()
 
+        # RECONCILE A RELAY WE COULD NOT REACH AT START (terra, 2026-09-13).
+        # Two things made this necessary. The relay is on the SAME USB hub as
+        # the adapter, so on a port move its node can disappear BEFORE the sound
+        # card does -- the stop that BindsTo triggers then cannot command OFF,
+        # and the LCUS-2 latches, so the amplifier can stay physically on with
+        # nothing driving it. And returning 1 here instead, as this used to,
+        # cost a whole RestartSec before the capture threads even started: a
+        # relay that came back at 7 s was not acted on until about 11 s, which
+        # is outside the ten seconds the acceptance allows. So the detector runs
+        # regardless and keeps trying to reach the safe state on the actuator
+        # retry beat for as long as the amplifier is supposed to be off.
+        if not on and not safe and now - last_off_attempt >= ACTUATOR_RETRY_SECONDS:
+            last_off_attempt = now
+            safe = stop_and_record(actuator) is not False
+            if safe:
+                log("relay reconciled to a verified OFF")
+
         loud = any(lv.above(ON_DBFS) for lv in levels)
         quiet = all(not lv.above(OFF_DBFS) for lv in levels)
 
@@ -926,6 +952,7 @@ def main():
                         record_safe_state(False)
                         if actuator.start():
                             on = True
+                            safe = False
                             changed_at = now
                             below_since = None
                             log("amplifier ON (%s)"
@@ -942,6 +969,7 @@ def main():
                 if now - below_since >= HOLD_OFF_SECONDS and now - changed_at >= MIN_ON_SECONDS:
                     if stop_and_record(actuator):
                         on = False
+                        safe = True
                         changed_at = now
                         above_since = None
                         log("amplifier OFF after %.0fs idle" % HOLD_OFF_SECONDS)
@@ -954,7 +982,7 @@ def main():
                 below_since = None
             if jack_actuator and not jack and actuator.running:
                 log("trigger cable removed; stopping tone")
-                stop_and_record(actuator)
+                safe = stop_and_record(actuator) is not False
                 on = False
                 changed_at = now
             elif (on and not actuator.maintain(now)
@@ -963,6 +991,9 @@ def main():
                 log("amplifier actuator stopped unexpectedly; restarting")
                 if not actuator.start():
                     on = False
+                    # The relay is in an unknown physical state: the loop above
+                    # keeps commanding OFF until one is verified.
+                    safe = False
                     changed_at = now
 
         stopping.wait(BLOCK_SECONDS)

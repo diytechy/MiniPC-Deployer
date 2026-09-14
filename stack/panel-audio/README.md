@@ -137,9 +137,19 @@ indexes were already in use everywhere:
 3. Both alsaloops run under `wall-alsaloop-guard.py`, which exits non-zero after
    more than `--max-errors` stream errors inside a `--window` second window and
    hands recovery back to `Restart=`. `panel-amp-trigger.py` additionally waits a
-   bounded `WALL_AMP_RELAY_WAIT_SECONDS` (default 20) for the relay's node,
-   reopening a fresh transport each attempt, because the CH340 is on the same hub
-   and may still be re-probing when this service restarts.
+   bounded `WALL_AMP_RELAY_WAIT_SECONDS` (default 6, sized from the ten-second
+   budget because this wait runs before the capture threads) for the relay's
+   node, reopening a fresh transport each attempt, because the CH340 is on the
+   same hub and may still be re-probing when this service restarts. If it still
+   cannot reach the relay the detector runs anyway with the safe-state proof
+   revoked — which blocks S3 exactly as before — and keeps commanding OFF on the
+   five-second actuator beat until one verifies. That path matters because the
+   relay can disappear BEFORE the sound card does, so the stop that `BindsTo`
+   triggers may have no CH340 to command and the LCUS-2 latches physically on.
+
+A panel-mode replug does start `wall-amp-trigger`, because `SYSTEMD_WANTS`
+ignores enablement. That is the safe direction and is left alone: the daemon
+commands and verifies the relay OFF before it idles.
 
 **Acceptance procedure.** With music playing from the kiosk and the amplifier
 on, move the USB hub to a different port on the panel. Within 10 s, with no

@@ -8,6 +8,7 @@ alsaloop recover loop.
 """
 
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -131,6 +132,20 @@ HOST_ARTIFACTS = (
 )
 
 
+def test_the_amp_unit_is_deliberately_started_even_in_panel_mode():
+    """A replug starts it whatever the mode, and that is the safe direction.
+
+    SYSTEMD_WANTS ignores enablement, so a panel-mode replug starts this unit.
+    It is left that way on purpose: the daemon's first act is to command and
+    VERIFY the relay OFF, and only then idle. Not starting it would leave a
+    latching relay in whatever state it was in. The unit therefore must NOT
+    grow the kiosk loop's mode ExecCondition.
+    """
+    text = read("wall-amp-trigger.service")
+    assert "ExecCondition=" not in text
+    assert "idl" in text.lower() or "verified OFF" in text
+
+
 @pytest.mark.skipif(shutil.which("systemd-analyze") is None,
                     reason="systemd-analyze is not available on this host")
 def test_unit_files_pass_systemd_analyze_verify(tmp_path):
@@ -150,11 +165,20 @@ def test_unit_files_pass_systemd_analyze_verify(tmp_path):
                    if ln.strip()
                    and not any(p.search(ln) for p in HOST_ARTIFACTS)]
     assert not unexplained, unexplained
-    if not unexplained and got.returncode != 0:
-        # Exit status is still information: it must be explained by the host
-        # artifacts above and nothing else.
-        assert (got.stderr + got.stdout).strip(), (
-            "systemd-analyze failed with no diagnostic at all")
+    # The exit status is evidence too, and ignoring it was terra's finding. On a
+    # host that actually has the binaries these units name there is nothing left
+    # to excuse a failure, so demand success outright; elsewhere a failure must
+    # be accounted for by a host artifact that was actually printed.
+    missing = [b for b in ("/usr/bin/alsaloop", "/usr/bin/amixer",
+                           "/usr/bin/python3",
+                           "/usr/local/lib/wall-panel/wall-alsaloop-guard.py")
+               if not os.path.exists(b)]
+    if not missing:
+        assert got.returncode == 0, (got.returncode, got.stderr + got.stdout)
+    elif got.returncode != 0:
+        assert any(b in (got.stderr + got.stdout) for b in missing), (
+            "systemd-analyze failed without naming a missing host binary: "
+            + (got.stderr + got.stdout))
 
 
 # --- the bounded recover loop ---------------------------------------------
@@ -200,6 +224,17 @@ def test_a_slow_but_unbroken_error_stream_still_trips():
         clock[0] += 1.0
     assert tripped_at == 30.0
     assert "unbroken" in window.reason
+
+
+def test_a_gap_of_exactly_the_window_is_a_clean_gap():
+    """The boundary terra asked for: `window` seconds of quiet is quiet."""
+    guard = load_guard()
+    clock = [0.0]
+    window = guard.ErrorWindow(max_errors=20, window=10.0, sustain=30.0,
+                               monotonic=lambda: clock[0])
+    for _ in range(200):
+        assert window.record() is False
+        clock[0] += 10.0
 
 
 def test_a_clean_gap_resets_the_sustained_streak():

@@ -140,11 +140,46 @@ def test_a_timeout_on_the_status_reply_is_retried_too():
     assert state["n"] == 4
 
 
-def test_the_default_wait_fits_inside_the_ten_second_acceptance():
+def test_the_default_wait_leaves_room_in_the_ten_second_acceptance():
     """It runs BEFORE the capture threads, so it spends the whole budget."""
     module = load_module()
     assert module.RELAY_WAIT_SECONDS <= 6.0
-    assert module.RELAY_WAIT_SECONDS + module.ACTUATOR_RETRY_SECONDS >= 10.0
+    # What is left for ALSA to open, a block to arrive and the attack to pass.
+    assert module.RELAY_WAIT_SECONDS + module.ATTACK_SECONDS < 10.0
+
+
+def test_an_unreachable_relay_does_not_abort_the_detector():
+    """terra: returning 1 here cost a RestartSec before capture even started.
+
+    The detector must run anyway, with the safe-state proof revoked, so the
+    relay can be reconciled on the retry beat instead of at the next restart.
+    """
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    start = source.index("def main(")
+    head = source[start:source.index("levels = [Level(", start)]
+    # The only `return 1` left before the detector starts is the idle path,
+    # which has no loop to reconcile anything later.
+    assert head.count("return 1") == 1
+    assert "_idle and not safe" in head
+    assert "not on and not safe" in source[start:]
+
+
+def test_the_reconcile_primitive_reaches_off_once_the_node_is_back():
+    """What the loop calls on the retry beat: stop() with no live transport.
+
+    This is the relay-first removal terra described -- the CH340 can vanish
+    BEFORE the sound card, so the stop that BindsTo triggers cannot command OFF
+    and the LCUS-2 latches physically ON.
+    """
+    module = load_module()
+    device = LateDevice(absent_for=2)
+    relay_ = relay(module, device)
+    assert relay_.stop() is False
+    assert relay_.stop() is False
+    assert relay_.stop() is True
+    assert device.opens == 3
+    assert device.transports[0].states == [(1, False)]
+    assert device.transports[0].closed
 
 
 def test_the_detector_backoff_recovers_inside_the_acceptance_window():

@@ -97,7 +97,9 @@ class ErrorWindow:
         now = self.monotonic() if now is None else now
         # Prune BEFORE appending, so an empty deque here really does mean "no
         # error for a whole window" and the streak can be restarted.
-        while self._times and now - self._times[0] > self.window:
+        # >= , not >: the contract says a clean gap of `window` seconds resets
+        # the streak, and an exactly-window gap is a clean gap (terra).
+        while self._times and now - self._times[0] >= self.window:
             self._times.popleft()
         if not self._times:
             self._streak_start = now

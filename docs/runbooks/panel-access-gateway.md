@@ -36,6 +36,28 @@ The install path is `stack/panel-access/gateway-release.py`. It is idempotent:
 running it twice with the same tarball stages nothing the second time and only
 reconciles the container.
 
+**What is on the hub, and why the first install is not step 1.** As inspected on
+2026-09-13 the served site was `fd64d10`, while the only gateway tarball ever
+delivered to `/opt/homehub/wall-gateway` — and the application staged by hand at
+`panel-access/app/gateway` — was `f1ac1b7`. `install` refuses that tarball, and
+is right to. The gateway you install must be the one built from the **revision
+the hub is serving**, so read that first rather than trusting this paragraph:
+
+```sh
+sudo python3 /opt/homehub/stack/panel-access/gateway-release.py status   # "site" line
+```
+
+then take `officewall-gateway-<version>-g<that short revision>.tar.gz` out of
+`OfficeWallNaglight/dist`. If it is not there, rebuild that revision: the
+builder emits app, site and gateway together, so the matching payload always
+exists for any revision the site could be at.
+
+The gateway never drags the site with it: this lane installs a gateway to match
+whatever site is already served. If the site is the thing that is behind, the
+paired lane (`HomeHub/scripts/deploy/PANEL_RELEASE.md`) owns it, and it is that
+lane's gateway pre-flight — the one that refuses to stage while the hub's
+gateway is behind — that this install path exists to satisfy.
+
 1. **Build.** OfficeWallNaglight's clean-source builder emits all three payloads
    from one commit into `dist/`. A `-dirty` suffix in the filename is a refusal,
    not a warning.
@@ -73,9 +95,16 @@ reconciles the container.
 Validate the archive (root prefix, traversal, symlinks, required members,
 oversized stamp, site agreement) → unpack to a scratch tree → compare against
 the live tree and stop if identical → publish to `panel-access/releases/<rev>/`
-→ stop and remove the container → replace `panel-access/app/gateway` → recreate
-the container → probe `/health` → **roll back automatically if it does not
-answer**. Retention is two: the active release and the previous one.
+→ stop the container and **prove it is gone** → replace `panel-access/app/gateway`
+→ recreate the container → probe `/health` **and** hash `server.mjs` as the
+container sees it → **roll back automatically if either fails**, and only then
+record the release as active. Retention is two: the active release and the
+previous one.
+
+The second half of that proof is not redundant. A detached bind mount answers
+`/health` perfectly while serving the old code from a deleted inode, and from
+the host the directory looks correct — only the container can say what it is
+actually reading.
 
 The container is recreated rather than restarted because the overlay
 bind-mounts `panel-access/app/gateway`. Replacing that directory's inode under
@@ -112,6 +141,15 @@ container that restarts forever with no useful message.
   is the safety net; the only way back is the uninstall below.
 * Output is `panel-credential.json` — `{"deviceId","credential"}`. Move it off
   the state directory once the panel has it.
+
+### Provision the panel BEFORE flipping the knob
+
+Do not enable the protected route yet. `PANEL_ACCESS_ENABLED=true` makes Caddy
+403 every `/api/*` on the wall site, and a panel that has no `deviceCredential`
+cannot use `/v1/*` instead — so flipping the knob first takes the checklist
+away from a panel that has no way back. Install the panel's private host JSON
+first (next section, `PROVISIONING.md` §1c), confirm the kiosk still works on
+the legacy route, and only then continue here.
 
 Then enable and start:
 

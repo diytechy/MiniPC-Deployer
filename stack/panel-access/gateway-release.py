@@ -166,6 +166,36 @@ def health(paths: dict, docker: str) -> bool:
     return probe.returncode == 0
 
 
+def mounted_digest(paths: dict, docker: str) -> str | None:
+    """sha256 of `server.mjs` AS THE CONTAINER SEES IT, or None.
+
+    A detached bind mount is invisible from the host: the directory on disk is
+    the new release while the container keeps reading the old inode. Only the
+    container can answer that question, so it is asked there.
+    """
+    probe = subprocess.run(
+        [docker, "exec", SERVICE, "node", "-e",
+         "var c=require('crypto'),f=require('fs');"
+         "process.stdout.write(c.createHash('sha256')"
+         ".update(f.readFileSync('/app/gateway/server.mjs')).digest('hex'))"],
+        capture_output=True, text=True)
+    if probe.returncode != 0:
+        return None
+    return probe.stdout.strip() or None
+
+
+def proven(paths: dict, docker: str) -> bool:
+    """Healthy AND serving the bytes on disk. Either one alone is not proof."""
+    if not health(paths, docker):
+        return False
+    expected = hashlib.sha256((paths["live"] / "server.mjs").read_bytes()).hexdigest()
+    if mounted_digest(paths, docker) != expected:
+        print("FAIL the running container is not reading the installed gateway"
+              " (detached bind mount)", file=sys.stderr)
+        return False
+    return True
+
+
 # ── install ──────────────────────────────────────────────────────────────────
 
 def publish(source: Path, destination: Path) -> None:
@@ -269,15 +299,19 @@ def install(paths: dict, archive: Path, docker: str, containers: bool, force: bo
             # the previous one deterministically rather than guessing.
             outcome = rollback(paths, docker, containers, automatic=True)
             return outcome
+        # THE TRANSACTION IS NOT SETTLED UNTIL IT IS PROVEN. ACTIVE is written
+        # and PENDING cleared only after the health gate passes, so a first
+        # install that comes up broken - the case with no previous release to
+        # roll back to - stays marked PENDING instead of reading as green.
+        if containers and not proven(paths, docker):
+            print("FAIL gateway did not answer /health as this release; rolling back", file=sys.stderr)
+            return rollback(paths, docker, containers, automatic=True)
         paths["active"].write_text(incoming + "\n", encoding="utf-8")
         paths["pending"].unlink(missing_ok=True)
         prune(paths, {incoming, previous or incoming})
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
-    if containers and not health(paths, docker):
-        print("FAIL gateway did not answer /health; rolling back", file=sys.stderr)
-        return rollback(paths, docker, containers, automatic=True)
     print("PASS gateway " + incoming[:7] + " installed" + ("" if containers else " (staged only; access disabled or state not bootstrapped)"))
     return 0
 
@@ -289,10 +323,18 @@ def reconcile(paths: dict, docker: str, containers: bool) -> int:
     state = container_state(paths, docker)
     if not state["present"] or state["status"] != "running":
         compose(paths, docker, "up", "-d", SERVICE)
-    if not health(paths, docker):
-        print("FAIL gateway is installed but not answering /health", file=sys.stderr)
-        return 1
-    return 0
+    if proven(paths, docker):
+        return 0
+    # An identical payload is not the same as an identical RUNNING gateway: a
+    # container whose mount was detached by an earlier hand-edit keeps serving
+    # the old inode and answers /health perfectly while doing it. Recreate it
+    # once and re-prove, rather than reporting green on a stale process.
+    print("NOTE recreating the gateway container to re-prove the installed bytes")
+    compose(paths, docker, "up", "-d", "--force-recreate", SERVICE)
+    if proven(paths, docker):
+        return 0
+    print("FAIL gateway is installed but not serving it", file=sys.stderr)
+    return 1
 
 
 def rollback(paths: dict, docker: str, containers: bool, automatic: bool = False) -> int:
@@ -301,6 +343,10 @@ def rollback(paths: dict, docker: str, containers: bool, automatic: bool = False
         print("FAIL no retained previous gateway release to roll back to", file=sys.stderr)
         return 1
     current = read_marker(paths["active"]) or read_marker(paths["pending"])
+    # A rollback mutates the same live tree an install does, so it persists the
+    # same intent first. Without this, an interruption mid-rollback leaves the
+    # markers naming a release the disk no longer holds.
+    paths["pending"].write_text(target + "\n", encoding="utf-8")
     try:
         activate(paths, paths["releases"] / target, docker, containers)
     except (Refused, OSError, subprocess.CalledProcessError) as error:
@@ -311,11 +357,13 @@ def rollback(paths: dict, docker: str, containers: bool, automatic: bool = False
         if isinstance(error, Refused):
             print("FAIL " + str(error), file=sys.stderr)
         return 1
+    settled = not containers or proven(paths, docker)
     paths["active"].write_text(target + "\n", encoding="utf-8")
-    paths["pending"].unlink(missing_ok=True)
+    if settled:
+        paths["pending"].unlink(missing_ok=True)
     if current and current != target:
         paths["previous"].write_text(current + "\n", encoding="utf-8")
-    if containers and not health(paths, docker):
+    if not settled:
         # Both release trees are still retained, and ACTIVE names what is
         # genuinely on disk. Say so plainly: a second `rollback` swaps back to
         # the release that just failed, which is a decision for a human, not a

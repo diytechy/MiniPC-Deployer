@@ -47,7 +47,20 @@ esac
 case "$STATE_DIR" in
     *..*) echo "FAIL --state-dir must not contain .." >&2; exit 1 ;;
 esac
-guard="$STATE_DIR"
+# RESOLVE SYMLINKS BEFORE JUDGING THE PATH. A lexical check answers a question
+# about the string; the token is written to whatever the kernel resolves. A
+# state dir, or any ancestor, that is a symlink into a checkout would otherwise
+# sail through a guard that looked correct.
+resolved="$STATE_DIR"
+if command -v readlink >/dev/null 2>&1; then
+    # -m: resolve as far as it exists, since the leaf is usually yet to be made.
+    resolved="$(readlink -m -- "$STATE_DIR" 2>/dev/null || printf '%s' "$STATE_DIR")"
+fi
+case "$resolved" in
+    /*) : ;;
+    *) echo "FAIL --state-dir does not resolve to an absolute path" >&2; exit 1 ;;
+esac
+guard="$resolved"
 while [ -n "$guard" ] && [ "$guard" != "/" ]; do
     if [ -e "$guard/.git" ]; then
         echo "FAIL --state-dir is inside a git checkout; a secret must not be written there" >&2
@@ -55,6 +68,10 @@ while [ -n "$guard" ] && [ "$guard" != "/" ]; do
     fi
     guard="$(dirname "$guard")"
 done
+
+# Everything below operates on the RESOLVED path, so the directory that was
+# judged is the directory that is written to.
+STATE_DIR="$resolved"
 
 [ "$(id -u)" = "0" ] || { echo "FAIL run as root" >&2; exit 1; }
 case "$OWNER_UID$OWNER_GID" in *[!0-9]*) echo "FAIL uid/gid must be numeric" >&2; exit 1 ;; esac

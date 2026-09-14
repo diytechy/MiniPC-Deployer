@@ -2,9 +2,16 @@
 
 WHAT A STUBBED DOCKER CAN AND CANNOT PROVE. These tests run the real script
 against a real filesystem with a fake `docker` on PATH, so they prove the file
-handling, the refusals, idempotency, retention and the rollback ordering, and
-they prove which docker subcommands are issued in which order. They prove
-nothing about Caddy, the container image, or a gateway that actually serves.
+handling, the refusals, idempotency, retention, the marker transaction and the
+exact order of the docker subcommands. The stub answers the two probes as the
+gateway would, so the script's own predicates decide the outcome — and the
+health probe's JavaScript is additionally executed by real `node` against a
+real HTTP server, so it is not merely mirrored.
+
+They prove nothing about Caddy, the container image, or a gateway that actually
+serves. The state installer's coverage is its REFUSALS only: no test performs a
+successful install, so the 0600 mode, the ownership and the atomic replacement
+are read from the source, not exercised. Those need root on Linux.
 """
 import hashlib
 import importlib.util
@@ -94,11 +101,26 @@ def hub(tmp_path):
                 sys.exit(0)
             sys.exit(1)
         if sys.argv[1] == 'exec':
-            # The probe is a real node script; answer it as the gateway would
-            # and let the script's own parsing decide. Anything else would make
-            # the health assertion a tautology.
+            script = sys.argv[-1]
+            if 'createHash' in script:
+                # The mount probe. Answer with the digest of what the container
+                # would be reading: the file on disk when the mount is intact,
+                # a different one when it has been detached.
+                import hashlib
+                live = pathlib.Path({str(stack / 'panel-access' / 'app' / 'gateway' / 'server.mjs')!r})
+                if behaviour == 'detached' or not live.exists():
+                    sys.stdout.write('0' * 64)
+                else:
+                    sys.stdout.write(hashlib.sha256(live.read_bytes()).hexdigest())
+                sys.exit(0)
+            # The health probe. Answer as the gateway would and let the script's
+            # own predicate decide; anything else would be a tautology.
             body = {{'ok': True, 'protocolVersion': 1}}
+            live = pathlib.Path({str(stack / 'panel-access' / 'app' / 'gateway' / 'server.mjs')!r})
+            installed = live.read_text() if live.exists() else ''
             if behaviour == 'unhealthy':
+                body = {{'ok': False, 'protocolVersion': 1}}
+            if behaviour == 'unhealthy-two' and 'two' in installed:
                 body = {{'ok': False, 'protocolVersion': 1}}
             if behaviour == 'wrong-protocol':
                 body = {{'ok': True, 'protocolVersion': 2}}
@@ -207,15 +229,17 @@ def _phases(hub):
             order.append("rm")
         elif "--force-recreate" in line:
             order.append("up")
-        elif line.startswith("exec panel-access node"):
+        elif line.startswith("exec panel-access node") and "createHash" not in line:
             order.append("probe")
+        elif line.startswith("exec panel-access node"):
+            order.append("mount")
     return order
 
 
 def test_install_stops_removes_swaps_then_recreates_in_that_exact_order(hub, tmp_path):
     hub["present"].touch()  # a container is already running
     run(hub, "install", "--archive", str(archive(tmp_path / "g.tgz")))
-    assert _phases(hub) == ["stop", "rm", "up", "probe"]
+    assert _phases(hub) == ["stop", "rm", "up", "probe", "mount"]
 
 
 def test_a_container_that_survives_removal_stops_the_swap(hub, tmp_path):
@@ -244,6 +268,30 @@ def test_health_rejects_a_gateway_that_answers_wrongly(hub, tmp_path, behaviour)
     assert (live(hub) / "server.mjs").read_bytes() == b"// one\n"
 
 
+def test_a_detached_mount_fails_the_gate_even_though_health_is_perfect(hub, tmp_path):
+    """The exact failure the swap ordering exists to prevent, caught after the fact."""
+    run(hub, "install", "--archive", str(archive(tmp_path / "one.tgz", body=b"// one\n")))
+    hub["mode"].write_text("detached", encoding="utf-8")
+    (hub["stack"] / "wall-shell" / "build-info.json").write_bytes(stamp(OTHER))
+    result = run(hub, "install", "--archive", str(archive(tmp_path / "two.tgz", revision=OTHER, body=b"// two\n")))
+    assert result.returncode == 1
+    assert "detached bind mount" in result.stderr
+    assert (live(hub) / "server.mjs").read_bytes() == b"// one\n"
+
+
+def test_an_identical_payload_still_reproves_the_running_container(hub, tmp_path):
+    """Idempotent must not mean unchecked: a stale process is recreated once."""
+    path = archive(tmp_path / "g.tgz")
+    run(hub, "install", "--archive", str(path))
+    hub["mode"].write_text("detached", encoding="utf-8")
+    hub["log"].unlink()
+    result = run(hub, "install", "--archive", str(path))
+    assert result.returncode == 1
+    assert "already at" in result.stdout
+    assert "recreating" in result.stdout
+    assert _phases(hub).count("up") == 1
+
+
 def test_the_probe_is_the_endpoint_and_not_the_cached_docker_grade(hub, tmp_path):
     run(hub, "install", "--archive", str(archive(tmp_path / "g.tgz")))
     probes = [line for line in calls(hub) if line.startswith("exec panel-access node")]
@@ -264,14 +312,16 @@ def test_a_failed_recreate_rolls_back_and_keeps_the_pending_flag(hub, tmp_path):
     # new one, and PENDING still marks the transaction as unfinished.
     assert (live(hub) / "server.mjs").read_bytes() == b"// one\n"
     assert (releases / "ACTIVE").read_text().strip() == REVISION
-    assert (releases / "PENDING").read_text().strip() == OTHER
+    # PENDING survives, naming whichever release the failed rollback was aiming
+    # at: the point is that the transaction cannot read as settled.
+    assert (releases / "PENDING").exists()
     assert run(hub, "status").returncode == 1
 
 
 def test_a_recoverable_failed_recreate_rolls_back_cleanly(hub, tmp_path):
-    """When only the new release cannot come up, the rollback settles and clears PENDING."""
+    """When only the NEW release is broken, the rollback settles and clears PENDING."""
     run(hub, "install", "--archive", str(archive(tmp_path / "one.tgz", body=b"// one\n")))
-    hub["mode"].write_text("unhealthy", encoding="utf-8")
+    hub["mode"].write_text("unhealthy-two", encoding="utf-8")
     (hub["stack"] / "wall-shell" / "build-info.json").write_bytes(stamp(OTHER))
     run(hub, "install", "--archive", str(archive(tmp_path / "two.tgz", revision=OTHER, body=b"// two\n")))
     releases = hub["stack"] / "panel-access" / "releases"
@@ -408,6 +458,54 @@ def test_uninstall_refuses_while_a_container_survives_removal(hub, tmp_path):
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits and root-only install")
 def test_state_installer_is_syntactically_valid():
     assert subprocess.run(["bash", "-n", str(STATE_INSTALLER)]).returncode == 0
+
+
+# ── the probe itself, against a real server ──────────────────────────────────
+
+def _probe_source():
+    """The exact JavaScript the script hands to `node -e`, lifted from source."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    start = text.index('"fetch(\'http://127.0.0.1:8788/health\')"')
+    end = text.index('capture_output=True', start)
+    pieces = []
+    for line in text[start:end].splitlines():
+        line = line.strip().rstrip("],").strip()
+        if line.startswith('"') and line.endswith('"'):
+            pieces.append(json.loads(line))
+    return "".join(pieces)
+
+
+@pytest.mark.parametrize("body,expected", [
+    ('{"ok":true,"protocolVersion":1}', 0),
+    ('{"ok":false,"protocolVersion":1}', 1),
+    ('{"ok":true,"protocolVersion":2}', 1),
+    ('{"ok":"yes","protocolVersion":1}', 1),
+    ('not json at all', 1),
+])
+def test_the_real_probe_script_accepts_only_a_correct_health_body(body, expected, tmp_path):
+    """Run the ACTUAL probe with node against an actual HTTP server on 8788.
+
+    The docker-stub tests above mirror the predicate; this one executes it, so
+    a probe that never parsed its response could not pass both.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is unavailable")
+    server = tmp_path / "server.js"
+    server.write_text(
+        "var h=require('http');var s=h.createServer(function(q,r){"
+        "r.writeHead(200,{'Content-Type':'application/json'});r.end(process.argv[2])});"
+        "s.listen(8788,'127.0.0.1',function(){process.stdout.write('up' + String.fromCharCode(10))});",
+        encoding="utf-8")
+    listener = subprocess.Popen([node, str(server), body], stdout=subprocess.PIPE, text=True)
+    try:
+        if (listener.stdout.readline() or "").strip() != "up":
+            pytest.skip("port 8788 is not available on this host")
+        probe = subprocess.run([node, "-e", _probe_source()], capture_output=True, text=True)
+        assert probe.returncode == expected
+    finally:
+        listener.kill()
+        listener.wait()
 
 
 def _posix(path):

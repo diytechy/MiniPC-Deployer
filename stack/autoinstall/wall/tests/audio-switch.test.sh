@@ -35,6 +35,13 @@
 #       position, and the stamp is what makes a later plug an event
 #   B10 the level's pre-open: if the softvol control never appears, the applier
 #       opens the leg's PCM itself rather than waiting longer
+#   B11 step 3: the speaker chain is probed and published BEFORE anything opens
+#       speaker_out, so the pre-open and the leg cannot disagree
+#   B12 and nothing is probed in Mute or Headset -- opening the adapter there
+#       would be audio nobody asked for
+#   B13 the centre/sub trim: the rendered ttable is the (L+R)/2 sum the Owner
+#       asked for, a group name moves both halves of it, a refused value moves
+#       NOTHING, and a number-moving command never starts audio
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -182,6 +189,73 @@ printf 'trigger\n' > "$WALL_PANEL_CONF_DIR/audio-mode"
 out="$(run set speaker)"
 has "state recorded, hardware untouched" "$out" "B7 trigger mode is left alone"
 hasnt "systemctl" "$out" "B7 no unit is touched outside bus mode"
+
+# B11 — step 3: the speaker leg probes its chain BEFORE it opens speaker_out,
+# and publishes what it found. The probe and the pre-open must agree, because
+# @func getenv reads the environment of whichever process opens the PCM.
+printf 'bus\n' > "$WALL_PANEL_CONF_DIR/audio-mode"
+rm -f "$STATE"
+out="$(run apply-state)"
+has "aplay -q -D speaker_multi /dev/null" "$out" \
+    "B11 the 8-channel chain is probed, with no frames"
+probe="$(printf '%s\n' "$out" | grep -n 'D speaker_multi' | head -1 | cut -d: -f1)"
+declare_at="$(printf '%s\n' "$out" | grep -n 'D speaker_out' | head -1 | cut -d: -f1)"
+start_at="$(printf '%s\n' "$out" | grep -n 'systemctl start wall-speaker-out' | head -1 | cut -d: -f1)"
+{ [ "$probe" -lt "$declare_at" ] && [ "$declare_at" -lt "$start_at" ]; } \
+    && pass "B11 probe, then declare the control, then start the leg" \
+    || fail "B11 the chain was chosen after something had already opened the leg"
+has "write $WALL_PANEL_RUN_DIR/audio-speaker.env" "$out" \
+    "B11 the chain is published where wall-speaker-out.service reads it"
+
+# B12 — and NOT in the positions that have no speaker leg: opening the adapter
+# in Mute or in Headset would be audio nobody asked for.
+out="$(run set mute)"
+hasnt "speaker_multi" "$out" "B12 Mute probes nothing"
+run set speaker >/dev/null
+out="$(run set headset)"
+hasnt "speaker_multi" "$out" "B12 Headset with no adapter probes nothing"
+
+# B13 — the trim table: the Owner's tuning session (finding 8) moves six
+# numbers with one command and never sees ALSA syntax.
+rm -f "$WALL_PANEL_CONF_DIR/audio-trim.env" "$WALL_PANEL_CONF_DIR/audio-trim.conf"
+trim() { python3 "$APPLIER" --state "$STATE" \
+    --trim-env "$WALL_PANEL_CONF_DIR/audio-trim.env" \
+    --trim-conf "$WALL_PANEL_CONF_DIR/audio-trim.conf" trim "$@" 2>&1; }
+out="$(trim --render)"
+eq "0" "$?" "B13 a bare render succeeds with no stored values at all"
+conf="$(cat "$WALL_PANEL_CONF_DIR/audio-trim.conf")"
+has "pcm.speaker_multi" "$conf" "B13 the rendered file defines the multi chain"
+has "ttable.0.2 0.5000" "$conf" "B13 half of L into the centre"
+has "ttable.1.2 0.5000" "$conf" "B13 half of R into the centre — (L+R)/2"
+has "ttable.0.3 0.5000" "$conf" "B13 the SAME mono sum into the sub"
+has "ttable.1.3 0.5000" "$conf" "B13 and its other half"
+has "ttable.0.0 1.0000" "$conf" "B13 front left at unity"
+has "ttable.1.0 0.0000" "$conf" "B13 front stays stereo: R does not reach FL"
+has "ttable.0.4 0.0000" "$conf" "B13 rear is an explicit zero, not an omission"
+has "ttable.1.7 0.0000" "$conf" "B13 and so is the side pair"
+
+out="$(trim center=0.35 sub=0.6)"
+has "trim center_l 0.500 -> 0.350" "$out" "B13 a group name moves both halves"
+has "trim sub_r 0.500 -> 0.600" "$out" "B13 and keeps the sub a sum"
+conf="$(cat "$WALL_PANEL_CONF_DIR/audio-trim.conf")"
+has "ttable.0.2 0.3500" "$conf" "B13 the ALSA file followed"
+has "ttable.1.3 0.6000" "$conf" "B13 for the sub too"
+has "speaker leg is not running" "$out" \
+    "B13 and a number-moving command does not start audio that was not playing"
+
+out="$(trim)"
+has '"center_l": 0.35' "$out" "B13 the bare command reports the live table"
+has '"conf":' "$out" "B13 and says where both files are"
+
+# A refused value moves NOTHING: whole table or none of it.
+out="$(trim front_l=0.9 center=-1)"
+has "refused" "$out" "B13 a phase inversion is refused"
+conf="$(cat "$WALL_PANEL_CONF_DIR/audio-trim.conf")"
+has "ttable.0.0 1.0000" "$conf" "B13 and the valid half of the same command did NOT land"
+out="$(trim center=99)"
+has "refused" "$out" "B13 a coefficient that is a wiring problem is refused"
+out="$(trim rear=0.5)"
+has "refused" "$out" "B13 there is no knob for the pair wired to the desktop's input"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

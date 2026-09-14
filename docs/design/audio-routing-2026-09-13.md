@@ -1,7 +1,7 @@
 # Panel audio routing redesign — item 23, 2026-09-13
 
-**Status:** steps 1 and 2 designed and implemented on branch
-`audio-routing-2026-09-13`; not deployed. Steps 3–6 are owed and listed at the
+**Status:** steps 1, 2 and **3** designed and implemented on branch
+`audio-routing-2026-09-13`; not deployed. Steps 4–6 are owed and listed at the
 end. **Authority:** item 23 revision 2, the nine review findings, and the Owner's
 rulings on them (E, F, G and rows 1–9), all in
 [`HomeHub docs/PANEL_CURRENT_2026-09-13.md`](../../../HomeHub/docs/PANEL_CURRENT_2026-09-13.md).
@@ -386,17 +386,248 @@ measurement worth keeping:
   the on-glass acceptance is for, and it is why the install sequence below ends
   with three sources playing at once rather than with a green test run.
 
-## What steps 3–6 still owe
+## Step 3 — the centre/sub leg (D4, review finding 8)
 
-3. **Speaker leg, 8 channels (D4, supersedes item 17).** Open altset 1 (8 ch,
-   `FL FR FC LFE RL RR SL SR`) inside `pcm.speaker_out` and add a `route`/`ttable`
-   copying (L+R)/2 to FC and LFE. **Verify which physical jack each pair drives
-   before wiring the amplifier.** Finding 8 (Owner: a dedicated tuning effort
-   after everything else) needs a trim table from day one — the hardware already
-   offers it: `Speaker Playback Volume` carries **8 independent values**, and the
-   panel is currently sitting at `30,30,24,24,197,197,24,24`, i.e. the rear pair
-   is still pinned at 0 dB from the retired trigger-tone era and must be brought
-   down before anything is plugged into it.
+**Owner D4, verbatim in effect:** in Speaker position the front output stays
+stereo and an (L+R)/2 mono signal goes to **both** the centre channel and the
+LFE channel. Front out and centre/sub out are both wired to the amplifier; the
+subwoofer is assumed to have its own low-pass, so nothing here band-limits it.
+
+### What the hardware actually offers, re-measured 2026-09-14
+
+`cat /proc/asound/card3/stream0` on the panel:
+
+| Altset | Channels | Format | Rates | Map |
+|---|---|---|---|---|
+| 1 | **8** | S16_LE | 44.1 / 48 k | `FL FR FC LFE RL RR SL SR` |
+| 2 | 2 | S16_LE | 44.1 / 48 k | `FL FR` — **what the leg opened before this step** |
+| 3 | 4 | S16_LE | 44.1 / 48 k | `FL FR FC LFE` |
+| 4 | 6 | S16_LE | 44.1 / 48 k | `FL FR FC LFE RL RR` |
+
+The map is `chmap-**fixed**` per altset (numid 1), so it is not negotiable — and
+does not need to be, because it is already the order the `ttable` is written in.
+`channels 8` on the slave is the whole of how altset 1 is selected.
+
+`Speaker Playback Volume` (numid 8) is eight independent values, 0..197,
+-36.93 dB to 0 dB, read on 2026-09-14 as **66,66,24,24,0,0,24,24** — the rear
+pair deliberately at zero, which is the state the earlier note asked for and
+already has. Those are **left alone**: see "two trims" below.
+
+### The chain
+
+```
+alsaloop (2 ch S16 48k)
+  └─ pcm.speaker_out        softvol "Bus" on the Loopback card   ← unchanged
+       └─ pcm.speaker_multi type route, the generated ttable
+            └─ pcm.speaker_hw8  type plug → card_usb, channels 8, S16_LE, 48 k
+```
+
+Three things follow from that order and each is deliberate:
+
+* **The up-mix is BELOW the volume**, so the Owner's one control moves front,
+  centre and sub together and stays one control (ruling F).
+* **The leg still forwards two channels.** `wall-speaker-out.service` is
+  unchanged in its `alsaloop` arguments; nothing upstream of `speaker_out`
+  knows there are eight channels, so the tap, the detector and the headset leg
+  are untouched.
+* **The detector's tap is unaffected, and cannot be.** It reads `speaker_tap`,
+  which is a loopback substream two hops upstream of `speaker_out`. The whole of
+  step 3 is below it.
+
+The ttable, with the day-one defaults:
+
+| | → FL (0) | → FR (1) | → FC (2) | → LFE (3) | → RL/RR/SL/SR (4–7) |
+|---|---|---|---|---|---|
+| **L (0)** | 1.0 | 0.0 | 0.5 | 0.5 | 0.0 |
+| **R (1)** | 0.0 | 1.0 | 0.5 | 0.5 | 0.0 |
+
+Channels 4–7 are rendered as **explicit zeros** rather than left out, because
+"silent on purpose" and "forgotten" must not look the same in a generated file —
+and because rear is wired to the desktop's input (item 23 revision 2), where the
+room's music must never appear.
+
+### Where the trim lives, and why it is not in this file
+
+Review finding 8 asked for a per-channel trim "from day one"; the Owner ruled
+that the tuning itself is **a dedicated effort after everything else is in**.
+That session happens standing at an amplifier, one number at a time. So the six
+coefficients are a **generated pair of files**, exactly like the card map:
+
+| File | Who writes it | Who reads it |
+|---|---|---|
+| `/etc/wall-panel/audio-trim.env` | firstboot (seed, only if absent) and `wall-audio-output trim` | `wall-audio-output` |
+| `/etc/wall-panel/audio-trim.conf` | `wall-audio-output trim` | ALSA, as the only definition of `pcm.speaker_multi` |
+
+```sh
+sudo wall-audio-output trim                       # show the table and both paths
+sudo wall-audio-output trim center=0.35 sub=0.6   # both halves of the mono sum
+sudo wall-audio-output trim front_l=0.95          # per channel, if the room is odd
+```
+
+Each of those rewrites both files and **restarts the speaker leg if it is
+running** — ALSA reads a plugin's configuration when the PCM is *opened*, so a
+running leg keeps the table it started with. It never starts a leg that was
+stopped: a command that only moves a number must not put audio in the room, and
+the "is it running" probe therefore counts a missing or erroring `systemctl` as
+**not running**. A refused value moves **nothing at all**: a session that types
+three changes and fat-fingers the fourth must not be left with the first three
+applied and no idea which. Negative is refused (a phase inversion on a summed
+mono feed is a cancellation, not a trim) and so is anything above 4.0 (+12 dB),
+which is a wiring problem.
+
+`WALL_AUDIO_TRIM_*` in `wall.env` are the values a **fresh** panel starts at.
+Firstboot writes `audio-trim.env` only if it is absent — the amp-trigger.env
+rule — so a re-run never discards numbers somebody arrived at by listening. To
+reset a panel to the seeds, delete the file and re-run firstboot.
+
+**Two trims, and which one moves.** The adapter's own eight hardware values are
+per-*channel*; the ttable is per-*channel and per-source*, so "less of the right
+channel in the sub" is expressible in one and not in the other. The tuning
+session moves the ttable; the hardware values stay where the Owner's bench work
+put them.
+
+### The fallback, and the one mechanism that makes it safe
+
+ALSA configuration has no conditionals, so "8 channels if the adapter has them"
+had to become a name the applier chooses. `speaker_out`'s slave is
+`{@func getenv vars [WALL_AUDIO_SPEAKER_CHAIN] default "speaker_multi"}` — the
+same trick the headset card already uses. On every apply that wants the speaker
+leg, `wall-audio-output` **probes** the multi chain with
+`aplay -q -D speaker_multi /dev/null` (opens, writes no frames, exits, nothing
+audible), writes the answer to `/run/wall-panel/audio-speaker.env` for
+`wall-speaker-out.service`'s `EnvironmentFile=`, **and puts it in its own
+environment** — because `@func getenv` reads the environment of whichever
+process opens the PCM, and the applier's own softvol pre-open moments later is
+its own child. Without that second half the pre-open would declare the control
+on a chain the leg was not going to use.
+
+**One probe answers both ways the multi chain can be unavailable:** an adapter
+that refuses the 8-channel altsetting (a different model dropped into the same
+role — the CM106 here has one, measured, but nothing requires the part), and a
+missing or unparseable `audio-trim.conf`. The fallback, `speaker_stereo`, is
+*exactly* what shipped before step 3, so the worst case is the panel we already
+had, with a journal line naming both things to check.
+
+That is also why the trim file is loaded with
+
+```
+@hooks [ { func load files [ { file "/etc/wall-panel/audio-trim.conf" errors false } ] } ]
+```
+
+rather than a plain `</...>` include. **`errors false` is load-bearing:** a hard
+include of an absent file aborts the *whole* configuration — the bus, the
+headset leg and `pcm.!default` with it, i.e. silence everywhere because a
+generated file went missing. With the hook, an absent file leaves only
+`speaker_multi` undefined, the probe fails, and the leg plays stereo. Both
+halves of that are asserted against real `alsa-lib` (see the tests below).
+
+### The boot-minute underruns, and the choice made about them
+
+Measured on the 2026-09-14 00:13 reboot: **58 `speaker_out` underruns confined
+to 00:14:18–00:15:13, and zero afterwards.** The Owner heard them as skipping
+during boot and nothing later. The window is exactly firstboot's re-run, the
+kiosk session restarting and the USB tree enumerating, competing for the same
+CPU and the same USB host controller.
+
+**Chosen: ordering.** Both halves of the speaker leg gain
+
+```
+After=wall-firstboot.service
+After=wall-kiosk-loop.service
+```
+
+**Ordering only — no `Wants=`/`Requires=`** — so the leg still starts on a panel
+where firstboot is masked or the kiosk loop is disabled. `After=` delays a start
+job only while the named unit's own job is queued or running, and is inert once
+they have finished, which is every start the switch makes by hand afterwards.
+USB enumeration, the third actor, was already covered by the existing
+`BindsTo=`/`After=` on the adapter's device alias.
+
+**Rejected: a larger start buffer.** Raising `alsaloop --tlatency` for this leg
+would buy the boot minute at the cost of permanently adding to the 60–80 ms the
+design already spends on two hops — paying every hour of every day to fix 55
+seconds once per boot, in the one budget (lip-sync against the desktop's S/PDIF)
+this design already calls tight. It is on **both** halves of the leg on purpose:
+ordering only the output half would let `wall-bus-speaker` fill the tap while
+its reader was still held back, trading the underruns for a backlog to drain.
+
+### Files step 3 changes or adds
+
+| File | New? | What it does |
+|---|---|---|
+| `asound-bus-mode.conf` | changed | `speaker_hw8` (8-channel open), `speaker_stereo` (the fallback), `speaker_out`'s slave chosen by `@func getenv`, the `errors false` hook that loads the trim |
+| `audio-trim.conf.example` | new | what the generated `pcm.speaker_multi` looks like, and why it is generated |
+| `wall-audio-output` | changed | `trim` subcommand, `load_trim`/`render_trim_conf`/`render_trim_env`, `probe_speaker_chain`/`select_speaker_chain`, trim and chain in `status` |
+| `wall-speaker-out.service` | changed | `EnvironmentFile=` for the chain; the boot-minute ordering |
+| `wall-bus-speaker.service` | changed | the same boot-minute ordering |
+| `wall-firstboot.sh` | changed | seeds `audio-trim.env` if absent, then renders `audio-trim.conf` |
+| `wall.env.example` | changed | the six `WALL_AUDIO_TRIM_*` seeds and what they mean |
+
+**Unchanged, and asserted so:** the headset leg, the detector's tap and its
+sources, `wall_audio_state.py` (step 3 adds no state and no policy — the trim is
+a property of the room, not of the switch), and the broker's protocol surface.
+
+### Tests
+
+* `tests/test_wall_audio_switch.py` — 18 new cases: the 8-channel open, the mono
+  sum reaching FC and LFE *identically*, front staying stereo, the explicit rear
+  zeros, the day-one defaults agreeing with `wall.env.example` and firstboot,
+  the group and per-channel trim names, five refusals that each move nothing,
+  field-by-field fallback of a damaged trim file, the env round trip, the
+  `errors false` hook, the probe answering both failure modes, the chain
+  reaching both the leg and the pre-open, probe-before-declare-before-start, no
+  probe in Mute or Headset, the ordering choice (and the absence of `Wants=`),
+  the install-only-if-absent rule, and the "never starts audio" refusal.
+* **`test_the_generated_alsa_config_parses_sr028` asks `alsa-lib` itself** —
+  `aplay -L` over the real `asound.conf` + `audio-cards.conf` + this mode file +
+  the generated trim, with the absolute include paths rewritten into a temp
+  tree. It asserts every PCM name resolves, then deletes the trim file and
+  asserts that `bus`, `speaker_out` and `speaker_stereo` **survive** while
+  `speaker_multi` is the only casualty. Skipped where alsa-lib is absent (the
+  dev box); run under `wsl -d Ubuntu`, which is where it was proven, and which
+  is the first time anything in this design has had ALSA parse it.
+* `stack/autoinstall/wall/tests/audio-switch.test.sh` — B11, B12, B13 on the
+  real applier: the probe order and its publication, nothing probed in Mute or
+  Headset, and the whole trim command including its refusals. 64 PASS 0 FAIL.
+
+### Install and acceptance for step 3
+
+Run with the Owner present, and **verify which physical jack each pair drives
+before wiring the amplifier** — the front pair and the centre/sub pair are both
+going to the amplifier, and getting them the wrong way round is a room with no
+bass and a very loud centre.
+
+```sh
+# 1. Payload in place, then the audio block, which seeds and renders the trim.
+sudo /opt/wall-panel/stack/autoinstall/wall/wall-firstboot.sh
+cat /etc/wall-panel/audio-trim.conf          # expect pcm.speaker_multi, 0.5s to FC and LFE
+
+# 2. Re-apply the position so the leg is restarted onto the new chain.
+sudo wall-audio-output set speaker
+sudo wall-audio-output status                # expect "speaker_chain": "speaker_multi"
+                                             # and the six trim values
+
+# 3. The adapter should now be in its 8-channel altsetting while audio plays.
+cat /proc/asound/card3/stream0 | head -8     # expect Altset = 1, 8 channels
+```
+
+| # | Do this | Expect |
+|---|---|---|
+| S3-1 | `wall-audio-output status` with the switch on Speaker and audio playing | `"speaker_chain": "speaker_multi"`; `/proc/asound/card*/stream0` shows the running altset at **8 channels** |
+| S3-2 | **The tone test.** Play a stereo test tone with different content in L and R (e.g. `speaker-test -D speaker_out -c 2 -t sine`), and listen at the centre/sub output with the front output disconnected | **Centre and sub carry the SAME signal**, and it is the sum of both stereo channels — a tone present only in L is audible on centre and on sub at half level, and so is one present only in R |
+| S3-3 | Same tone, listening at the **front** output | **Still stereo**: a tone only in L is silent on the right front channel |
+| S3-4 | Music through the library player, on Speaker, with the subwoofer connected | the **sub plays**, and the room is not obviously centre-heavy; note anything that wants trimming for the tuning session |
+| S3-5 | `sudo wall-audio-output trim sub=0.35`, with music still playing | the sub drops within about a second (the leg restarts); `wall-audio-output trim` shows the new value; **the front output does not change** |
+| S3-6 | The rocker, or `amixer -c Loopback sset Bus 40%` | front, centre and sub **all** follow: one control, ruling F |
+| S3-7 | `journalctl -u wall-amp-trigger -f` while doing S3-4 | the relay closes as before: the tap is upstream of every part of step 3 |
+| S3-8 | `sudo mv /etc/wall-panel/audio-trim.conf /tmp/` then `sudo wall-audio-output set speaker` | audio still plays, **stereo front only**, and the journal says the 8-channel chain would not open and names both things to check. Put the file back and re-apply. |
+| S3-9 | Reboot, and watch the first two minutes | `journalctl -u wall-speaker-out --since -3min` shows **no underrun burst**; the Owner hears no skipping during boot |
+| S3-10 | Headset position, and Mute | unchanged from steps 1–2 in every respect; `status` shows no probe and the adapter is not opened |
+
+## What steps 4–6 still owe
+
+3. **Speaker leg, 8 channels (D4, supersedes item 17). DESIGNED AND IMPLEMENTED
+   — see "Step 3" below.** Not deployed; the install and acceptance are there too.
 4. **Mic legs (C, D3, D4).** Headset mic (`Device` mono capture) or Bluetooth
    HFP mic → the adapter's rear out and the Bluetooth mic return. Needs a
    second capture path; the 5.1 adapter's single capture stream is spent on

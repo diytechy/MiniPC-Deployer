@@ -22,6 +22,9 @@ Usage:
   wall-audio-output headset {add|remove} [--boot|--runtime]
   wall-audio-output apply-state              # re-assert the stored state (boot, resume)
   wall-audio-output apply-request [PATH]     # one broker request, deduplicated
+  wall-audio-output trim                     # show the centre/sub trim table
+  wall-audio-output trim KEY=VALUE ...       # move it, and re-render the ALSA file
+  wall-audio-output trim --render            # re-render from the stored values only
 
 Options: --dry-run prints each privileged command instead of running it, and
 writes no file except a state file named explicitly with --state (the hermetic
@@ -31,6 +34,8 @@ Config:  /etc/wall-panel/audio-state.json   the state (this script owns it)
          /etc/wall-panel/audio-mode         trigger|panel|bus; hardware is only
                                             touched in `bus`
          /etc/wall-panel/audio-cards.env    generated card map
+         /etc/wall-panel/audio-trim.env     the six centre/sub trim values
+         /etc/wall-panel/audio-trim.conf    rendered from them, read by ALSA
 Exit:    0 applied (or nothing to do), 1 a refused/failed apply, 2 usage.
 Implements: SR-028, LLR-014
 """
@@ -41,6 +46,7 @@ import argparse
 import contextlib
 import errno
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -96,6 +102,53 @@ SYS_CLASS_SOUND = Path("/sys/class/sound")
 # The softvol control created by asound-bus-mode.conf. It lives on the Loopback
 # card, which is always present, so the level survives a leg being stopped.
 BUS_CONTROL = "Bus"
+
+# ── the centre/sub trim (step 3, D4, review finding 8) ─────────────────────
+# Two files, for the same reason audio-cards has two: ALSA reads one and the
+# scripts read the other, and neither has to parse the other's syntax. The env
+# file is the Owner's six numbers; the conf file is the `route` rendered from
+# them. Both live in CONF_DIR, so the hermetic suite gets its own pair.
+TRIM_ENV = CONF_DIR / "audio-trim.env"
+TRIM_CONF = CONF_DIR / "audio-trim.conf"
+TRIM_ENV_PREFIX = "WALL_AUDIO_TRIM_"
+# Front full, centre and sub each half of each input -- which is exactly the
+# (L+R)/2 mono sum the Owner asked for in D4, expressed as two coefficients
+# rather than one so that the tuning session can make the sum asymmetric if the
+# room turns out to want that.
+TRIM_DEFAULTS = {"front_l": 1.0, "front_r": 1.0,
+                 "center_l": 0.5, "center_r": 0.5,
+                 "sub_l": 0.5, "sub_r": 0.5}
+TRIM_KEYS = ("front_l", "front_r", "center_l", "center_r", "sub_l", "sub_r")
+# The convenience names a person actually types at an amplifier: `center=0.35`
+# moves both halves of the mono sum at once and keeps it a sum.
+TRIM_GROUPS = {"front": ("front_l", "front_r"),
+               "center": ("center_l", "center_r"),
+               "sub": ("sub_l", "sub_r")}
+# (source channel, destination channel) in the adapter's FIXED 8-channel map
+# FL FR FC LFE RL RR SL SR, measured on the panel. 4..7 are rendered as explicit
+# zeros and have no knob: rear is wired to the desktop's input and must never
+# carry the room's music.
+TRIM_TTABLE = {"front_l": (0, 0), "front_r": (1, 1),
+               "center_l": (0, 2), "center_r": (1, 2),
+               "sub_l": (0, 3), "sub_r": (1, 3)}
+TRIM_SILENT_CHANNELS = (4, 5, 6, 7)
+# A coefficient above 1.0 is digital gain on a signal that is already at the
+# bus's full scale, so it clips rather than getting louder. Some headroom is
+# allowed anyway -- a quiet sub on a lazy amplifier input is a real case, and
+# +12 dB is where the argument stops being about trim and starts being about
+# wiring. Refused above this rather than clamped: a number this far out is a
+# typo, and silently accepting half of it would be worse than saying no.
+TRIM_MAX = 4.0
+TRIM_MAX_DB = 20.0 * math.log10(TRIM_MAX)
+
+# The two chains speaker_out can slave onto, named in asound-bus-mode.conf.
+# `speaker_multi` is the 8-channel route with the centre and sub; the stereo one
+# is exactly what shipped before step 3 and is the fallback.
+SPEAKER_CHAIN_MULTI = "speaker_multi"
+SPEAKER_CHAIN_STEREO = "speaker_stereo"
+SPEAKER_CHAIN_VAR = "WALL_AUDIO_SPEAKER_CHAIN"
+SPEAKER_CHAIN_ENV = RUN_DIR / "audio-speaker.env"
+SPEAKER_OUT_UNIT = "wall-speaker-out.service"
 
 
 def log(message):
@@ -544,6 +597,264 @@ def set_bus_level(applier, card, level, expected=True, sleep=time.sleep, pcm=Non
     return not expected
 
 
+def load_trim(path=None):
+    """The six trim coefficients, with a note for anything that had to be replaced.
+
+    Field by field, exactly as `policy.normalize` treats the state file and for
+    the same reason: a typo in one number must not throw the other five away and
+    leave the room with no centre channel.
+
+    Inputs:  path: the env file, or None for TRIM_ENV
+    Outputs: (dict of TRIM_KEYS -> float, [journal lines])
+    Implements: SR-028, LLR-014
+    """
+    path = TRIM_ENV if path is None else Path(path)
+    values = dict(TRIM_DEFAULTS)
+    notes = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return values, []
+    except OSError as exc:
+        return values, ["trim file unusable (%s); defaults applied" % exc]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, raw = line.partition("=")
+        name = name.strip()
+        if not name.startswith(TRIM_ENV_PREFIX):
+            continue
+        key = name[len(TRIM_ENV_PREFIX):].lower()
+        if key not in TRIM_DEFAULTS:
+            notes.append("trim %s is not a channel this panel has: ignored" % key)
+            continue
+        ok, value = parse_trim_value(raw.strip().strip('"').strip("'"))
+        if not ok:
+            notes.append("trim %s=%r refused (%s); using %.3f"
+                         % (key, raw.strip(), value, TRIM_DEFAULTS[key]))
+            continue
+        values[key] = value
+    return values, notes
+
+
+def parse_trim_value(raw):
+    """(True, float) for an acceptable coefficient, (False, reason) otherwise."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return False, "not a number"
+    if value != value or value in (float("inf"), float("-inf")):
+        return False, "not a finite number"
+    if value < 0.0:
+        # A negative coefficient is a phase inversion, which on a summed mono
+        # feed to a centre and a sub is a cancellation, not a trim. If anyone
+        # ever wants one it should be a deliberate new knob with its own name.
+        return False, "negative: a phase inversion is not a trim"
+    if value > TRIM_MAX:
+        return False, ("above %.1f (%+.1f dB): that is a wiring problem, not a trim"
+                       % (TRIM_MAX, TRIM_MAX_DB))
+    return True, value
+
+
+def render_trim_conf(values):
+    """The ALSA `route` for the speaker leg, as text. Pure; the caller writes it.
+
+    This is the ONLY definition of `pcm.speaker_multi`. asound-bus-mode.conf
+    loads it through a hook with `errors false`, so a missing or unreadable file
+    leaves the name undefined rather than taking the whole configuration -- and
+    with it `default`, the bus and the headset leg -- down with it. The applier's
+    probe then finds the multi chain unopenable and falls back to stereo.
+    Implements: SR-028, LLR-014
+    """
+    lines = [
+        "# /etc/wall-panel/audio-trim.conf — GENERATED by `wall-audio-output trim`.",
+        "# Edit with that command, not by hand: this file is rewritten whole.",
+        "# The 8-channel map is the adapter's and is fixed:",
+        "#   0 FL  1 FR  2 FC  3 LFE  4 RL  5 RR  6 SL  7 SR",
+        "pcm.speaker_multi {",
+        "    type route",
+        "    slave {",
+        '        pcm "speaker_hw8"',
+        "        channels 8",
+        "    }",
+    ]
+    for key in TRIM_KEYS:
+        source, destination = TRIM_TTABLE[key]
+        lines.append("    ttable.%d.%d %.4f  # %s" % (source, destination,
+                                                     values[key], key))
+    # The cross terms the six knobs do not name: front stays stereo because L
+    # does not reach FR and R does not reach FL.
+    lines.append("    ttable.1.0 0.0000  # R does not reach FL: front stays stereo")
+    lines.append("    ttable.0.1 0.0000  # L does not reach FR")
+    for channel in TRIM_SILENT_CHANNELS:
+        # Written out rather than left implicit: "silent on purpose" and
+        # "forgotten" must not look the same in a generated file. Rear carries
+        # the desktop's input, and the room's music must never reach it.
+        lines.append("    ttable.0.%d 0.0000" % channel)
+        lines.append("    ttable.1.%d 0.0000" % channel)
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_trim_env(values):
+    """The six coefficients, as the env file the next run reads back."""
+    lines = ["# GENERATED by `wall-audio-output trim`. Must agree with audio-trim.conf."]
+    for key in TRIM_KEYS:
+        lines.append("%s%s=%.4f" % (TRIM_ENV_PREFIX, key.upper(), values[key]))
+    return "\n".join(lines) + "\n"
+
+
+def parse_trim_assignments(assignments, values):
+    """Fold `key=value` arguments into a copy of `values`, or raise ValueError.
+
+    NOTHING IS WRITTEN UNTIL EVERY ARGUMENT HAS PARSED. A tuning session that
+    typed three changes and fat-fingered the fourth must not end up with the
+    first three applied and no idea which: the command either moves the whole
+    table or none of it.
+    """
+    wanted = dict(values)
+    for assignment in assignments:
+        name, separator, raw = assignment.partition("=")
+        if not separator:
+            raise ValueError("%r is not KEY=VALUE (keys: %s)"
+                             % (assignment,
+                                ", ".join(sorted(TRIM_GROUPS) + list(TRIM_KEYS))))
+        key = name.strip().lower()
+        ok, value = parse_trim_value(raw.strip())
+        if not ok:
+            raise ValueError("%s=%s refused: %s" % (key, raw.strip(), value))
+        if key in TRIM_GROUPS:
+            for member in TRIM_GROUPS[key]:
+                wanted[member] = value
+        elif key in TRIM_DEFAULTS:
+            wanted[key] = value
+        else:
+            raise ValueError("%r is not a channel this panel has (keys: %s)"
+                             % (key, ", ".join(sorted(TRIM_GROUPS) + list(TRIM_KEYS))))
+    return wanted
+
+
+def trim_command(arguments):
+    """`wall-audio-output trim [--render] [KEY=VALUE ...]`. Returns an exit code.
+
+    WHY THIS IS A SUBCOMMAND AND NOT A DOCUMENTED FILE EDIT. Owner ruling on
+    finding 8: the level tuning is a dedicated session after everything else is
+    in. That session happens standing at an amplifier, one number at a time, and
+    it must not require anybody to remember that an ALSA ttable indexes
+    destination channels in the hardware's fixed order -- nor to restart the
+    right unit afterwards for the change to be heard.
+
+    No lock is taken and no state is read: the trim is a property of the ROOM,
+    not of the switch position, and it is orthogonal to everything apply_lock
+    serializes. The one privileged thing it does -- restarting the speaker leg
+    so the new table is opened -- is a restart of a unit whose owner is this
+    same script, and a concurrent apply will simply start it again.
+    Implements: SR-028, LLR-014
+    """
+    values, notes = load_trim(arguments.trim_env)
+    for line in notes:
+        log(line)
+    try:
+        wanted = parse_trim_assignments(arguments.value or [], values)
+    except ValueError as exc:
+        log("refused: %s" % exc)
+        return 1
+
+    changed = [key for key in TRIM_KEYS if abs(wanted[key] - values[key]) > 1e-9]
+    if not arguments.render and not arguments.value:
+        # The bare command is a report, and it says where both files live so
+        # that the next person does not have to find them.
+        print(json.dumps({"trim": {key: round(wanted[key], 4) for key in TRIM_KEYS},
+                          "env": str(arguments.trim_env),
+                          "conf": str(arguments.trim_conf),
+                          "chain": read_env(SPEAKER_CHAIN_ENV, SPEAKER_CHAIN_VAR,
+                                            SPEAKER_CHAIN_MULTI)},
+                         indent=2, sort_keys=True))
+        return 0
+
+    write_atomic(arguments.trim_env, render_trim_env(wanted), mode=0o644,
+                 dry_run=arguments.dry_run)
+    write_atomic(arguments.trim_conf, render_trim_conf(wanted), mode=0o644,
+                 dry_run=arguments.dry_run)
+    for key in changed:
+        log("trim %s %.3f -> %.3f" % (key, values[key], wanted[key]))
+    if not changed:
+        log("trim unchanged; %s re-rendered" % arguments.trim_conf)
+
+    # ALSA reads a plugin's configuration when the PCM is OPENED, so a running
+    # leg keeps the table it started with. Restart it -- but only if it is
+    # already running, because starting it here would put audio in the room from
+    # a command that was only meant to move a number.
+    applier = Applier(dry_run=arguments.dry_run)
+    # `required=True` on the probe on purpose, so that a systemctl that is
+    # missing or that errors counts as NOT RUNNING and nothing is restarted.
+    # With required=False an exception would answer 0 -- "active" -- and the
+    # command would start audio on a panel that had none, which is the one thing
+    # a number-moving command must never do. `quiet` because "not active" is the
+    # normal answer here, not a fault worth a journal line.
+    running = applier.command(["/usr/bin/systemctl", "is-active", "--quiet",
+                               SPEAKER_OUT_UNIT], quiet=True) == 0
+    if running:
+        if applier.command(["/usr/bin/systemctl", "restart", SPEAKER_OUT_UNIT],
+                           required=False) == 0:
+            log("speaker leg restarted: the new trim table is open")
+    else:
+        log("speaker leg is not running: the new trim table is opened next time "
+            "the switch reaches Speaker")
+    return 0
+
+
+def probe_speaker_chain(applier):
+    """Which chain speaker_out can actually slave onto. See SPEAKER_CHAIN_*.
+
+    ONE PROBE, TWO FAILURE MODES, AND THAT IS WHY IT IS A PROBE AND NOT A CHECK.
+    The 8-channel chain is unavailable if the adapter refuses the 8-channel
+    altsetting (a different model dropped into the same role: the CM106 here has
+    one, measured, but nothing in the design requires the part) OR if
+    /etc/wall-panel/audio-trim.conf is missing or unparseable, which is where
+    `speaker_multi` is defined. Asking ALSA to open it answers both at once, and
+    answers them about the graph as it is right now rather than about a file's
+    existence.
+
+    `aplay -q -D speaker_multi /dev/null` opens the chain, writes no frames and
+    exits -- the same move `declare_bus_control` makes, for the same reason, and
+    with the same guarantee that not one sample reaches the room. Not required
+    and short-timed out: it runs under the apply lock.
+    """
+    # `required=True` so that an aplay that is missing, or that raises, is
+    # reported to this function as a FAILURE. With required=False an exception
+    # answers 0 -- "the 8-channel chain opened" -- and the leg would be pointed
+    # at a chain nobody has established exists, which is the loud way to be
+    # wrong. `quiet` because the fallback below is the journal line worth having.
+    if applier.command(["/usr/bin/aplay", "-q", "-D", SPEAKER_CHAIN_MULTI,
+                        "/dev/null"], quiet=True, timeout=5) == 0:
+        return SPEAKER_CHAIN_MULTI
+    log("the 8-channel speaker chain (%s) would not open: falling back to stereo "
+        "front out, with no centre and no sub. Check "
+        "/etc/wall-panel/audio-trim.conf and `cat /proc/asound/card*/stream0` "
+        "for an 8-channel altsetting." % SPEAKER_CHAIN_MULTI)
+    return SPEAKER_CHAIN_STEREO
+
+
+def select_speaker_chain(applier):
+    """Probe, publish the answer for the unit, and put it in our own environment.
+
+    THE ENVIRONMENT HALF IS NOT REDUNDANT. `@func getenv` reads the environment
+    of the process that OPENS the PCM. wall-speaker-out.service gets the answer
+    through EnvironmentFile=, but the pre-open this applier does moments later --
+    `aplay -D speaker_out`, which is what creates the softvol control -- is our
+    OWN child, so it inherits our environment and nothing else. Without this line
+    the pre-open would open the multi chain while the leg opened the stereo one,
+    and a fallback would silently create its control on the wrong graph.
+    """
+    chain = probe_speaker_chain(applier)
+    write_atomic(SPEAKER_CHAIN_ENV, "%s=%s\n" % (SPEAKER_CHAIN_VAR, chain),
+                 mode=0o644, dry_run=applier.dry_run)
+    os.environ[SPEAKER_CHAIN_VAR] = chain
+    return chain
+
+
 def apply_plan(state, applier):
     """Make the world match `state`. Returns the number of failures.
 
@@ -586,6 +897,13 @@ def apply_plan(state, applier):
     # running sits at the plugin default, which is full scale, with audio
     # flowing through it.
     leg_pcm = BUS_CONTROL_PCM.get(state["output"])
+    # WHICH SPEAKER CHAIN, DECIDED BEFORE ANYTHING OPENS speaker_out. The
+    # pre-open below and the leg itself must agree, and only this order gets
+    # that: probe, publish, then declare the control on the chain that answered.
+    # Nothing is probed when the speaker leg is not wanted -- in Mute, or in
+    # Headset, opening the adapter at all would be audio nobody asked for.
+    if state["output"] == "speaker" and any(wanted["legs"].values()):
+        select_speaker_chain(applier)
     if leg_pcm and any(wanted["legs"].values()):
         if declare_bus_control(applier, leg_pcm):
             set_bus_level(applier, loopback, wanted["volume"], expected=False)
@@ -714,10 +1032,36 @@ def main(argv=None):
     parser.add_argument("--runtime", action="store_true",
                         help="force a presence report to be treated as a plug "
                              "event on an already-running system")
+    parser.add_argument("--render", action="store_true",
+                        help="re-render the trim file from the stored values")
+    parser.add_argument("--trim-env", default=None,
+                        help="the trim values file (a test seam)")
+    parser.add_argument("--trim-conf", default=None,
+                        help="the rendered ALSA trim file (a test seam)")
     parser.add_argument("command", choices=("status", "set", "input-mute", "volume",
-                                            "headset", "apply-state", "apply-request"))
-    parser.add_argument("value", nargs="?")
+                                            "headset", "apply-state", "apply-request",
+                                            "trim"))
+    # `trim` takes a whole table's worth of KEY=VALUE; every other command takes
+    # at most one word. Parsed as a list here and narrowed below, so that a
+    # second argument to `set` is a usage error rather than a silently ignored
+    # one.
+    parser.add_argument("value", nargs="*")
     arguments = parser.parse_args(argv)
+
+    # CONF_DIR is read at import time from the environment, so these defaults
+    # follow the hermetic suite's temp tree the same way STATE_FILE does.
+    arguments.trim_env = Path(arguments.trim_env or TRIM_ENV)
+    arguments.trim_conf = Path(arguments.trim_conf or TRIM_CONF)
+
+    if arguments.command != "trim":
+        if arguments.render:
+            parser.error("--render only means anything for `trim`")
+        if len(arguments.value) > 1:
+            parser.error("%s takes at most one argument" % arguments.command)
+        arguments.value = arguments.value[0] if arguments.value else None
+
+    if arguments.command == "trim":
+        return trim_command(arguments)
 
     if arguments.boot and arguments.runtime:
         parser.error("--boot and --runtime are opposites; pass at most one")
@@ -742,8 +1086,18 @@ def main(argv=None):
         state, note = load_state(arguments.state)
         if note:
             log(note)
+        trim, trim_notes = load_trim(arguments.trim_env)
+        for line in trim_notes:
+            log(line)
         print(json.dumps({"mode": current_mode(), "state": state,
                           "plan": policy.plan(state),
+                          # Step 3, and the two things the Owner will want at
+                          # the glass test: which chain the leg actually opened,
+                          # and what the centre and sub are being fed.
+                          "speaker_chain": read_env(SPEAKER_CHAIN_ENV,
+                                                    SPEAKER_CHAIN_VAR,
+                                                    SPEAKER_CHAIN_MULTI),
+                          "trim": {key: round(trim[key], 4) for key in TRIM_KEYS},
                           "headset_card": headset_card()}, indent=2, sort_keys=True))
         return 0
 

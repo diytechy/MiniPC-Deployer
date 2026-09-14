@@ -5,12 +5,21 @@
 # `speaker_out`, the softvol declared in asound-bus-mode.conf whose control
 # lives on the always-present Loopback card.
 #
-# STEP 3 CHANGES THIS UNIT AND NOTHING ELSE. Today speaker_out is a plug onto
-# the adapter's default 2-channel open, so front out carries stereo. The
-# center/sub work (D4, superseded item 17) opens the adapter's 8-channel mode
-# and routes (L+R)/2 to FC and LFE with a per-channel trim, inside speaker_out.
-# The measured altsets are on the panel: 2/4/6/8 channels at 44.1 and 48 kHz,
-# map FL FR FC LFE RL RR SL SR.
+# STEP 3 (D4, superseding item 17) IS DONE AND IT LIVES IN THE GRAPH, NOT HERE.
+# speaker_out now opens the adapter's 8-channel altsetting (measured: altsets of
+# 2/4/6/8 channels at 44.1 and 48 kHz, fixed map FL FR FC LFE RL RR SL SR) and a
+# `route` copies FL to ch0, FR to ch1 and (L+R)/2 to both FC and LFE, through a
+# per-channel trim table generated into /etc/wall-panel/audio-trim.conf. This
+# unit still forwards two channels: the up-mix is below the softvol, so the
+# Owner's one volume control moves front, centre and sub together.
+#
+# WHY AN EnvironmentFile FOR A CHAIN NAME. If the adapter refuses the 8-channel
+# altsetting, or the generated trim file is missing, there has to be a stereo
+# path rather than a silent panel -- and ALSA configuration has no conditionals.
+# wall-audio-output probes the multi chain once per apply and writes the name of
+# the chain that actually opened here; asound-bus-mode.conf reads it with
+# @func getenv and defaults to the 8-channel one. `-` on the path because a
+# hand-started leg with no applier run behind it must still take the default.
 #
 # NOT ENABLED: wall-audio-output owns when it runs.
 
@@ -23,9 +32,37 @@ StartLimitIntervalSec=60
 StartLimitBurst=10
 BindsTo=dev-wall_audio_adapter.device
 After=dev-wall_audio_adapter.device
+# THE BOOT MINUTE, MEASURED. On the 2026-09-14 00:13 reboot the journal carried
+# 58 speaker_out underruns confined to 00:14:18-00:15:13 and ZERO afterwards --
+# the Owner heard them as skipping during boot and nothing later. The window is
+# exactly firstboot's re-run, the kiosk session restarting and the USB tree
+# enumerating, all competing for the same CPU and the same USB host controller.
+#
+# ORDERING, NOT A BIGGER BUFFER, AND THAT IS A CHOICE. The alternative was to
+# raise alsaloop's --tlatency for this leg, which would buy the boot minute at
+# the cost of permanently adding to the 60-80 ms the design already spends on
+# two hops -- paying every hour of every day to fix 55 seconds once per boot,
+# in the one budget (lip-sync against the desktop's S/PDIF) the design says is
+# already tight. Ordering costs nothing after boot: `After=` only delays a start
+# job while the named unit's own job is still queued or running, and is inert
+# once those units have finished, which is every start the switch makes by hand.
+# Ordering ONLY, no Wants=/Requires=: the speaker leg must still start on a panel
+# where firstboot is masked or the kiosk loop is disabled.
+#
+# USB enumeration, the third actor, is already covered: BindsTo/After on the
+# adapter's device alias above means this leg cannot start before the adapter is
+# there at all. wall-bus-speaker.service carries the same two lines, because
+# ordering only this half would leave the tap filling ahead of its reader and
+# trade the underruns for a backlog to drain.
+After=wall-firstboot.service
+After=wall-kiosk-loop.service
 
 [Service]
 Type=simple
+# The chain speaker_out slaves onto, written by wall-audio-output's probe:
+# speaker_multi (8 channels, centre and sub) or speaker_stereo (the fallback).
+# `-` so a missing file is the ALSA default, not a refused start.
+EnvironmentFile=-/run/wall-panel/audio-speaker.env
 ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
 ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
     --max-errors 20 --window 10 -- \

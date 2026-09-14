@@ -19,7 +19,10 @@ import importlib
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import time
 
@@ -917,7 +920,11 @@ def test_the_control_is_declared_and_set_before_the_leg_starts_sr028(applier, po
     applier.apply_plan(policy.default_state(), recorder)
     names = [argv[0].rsplit("/", 1)[-1] for argv in recorder.commands]
     assert "aplay" in names, "the applier declares the control itself"
-    preopen = names.index("aplay")
+    # The aplay that DECLARES the control, not the one that probes the speaker
+    # chain: step 3 added a second no-frames open ahead of this one, and
+    # index("aplay") would now find the probe.
+    preopen = min(index for index, argv in enumerate(recorder.commands)
+                  if names[index] == "aplay" and "speaker_out" in argv)
     assert recorder.commands[preopen][-1] == "/dev/null", "no frames reach the room"
     assert "speaker_out" in recorder.commands[preopen], "the PCM that DECLARES the softvol"
     first_start = min(index for index, argv in enumerate(recorder.commands)
@@ -1024,3 +1031,317 @@ def test_firstboot_does_not_warn_about_commented_out_placeholders():
     line = [one for one in firstboot.splitlines()
             if "REPLACE_WITH" in one and one.strip().startswith("if grep")][0]
     assert "grep -v" in line and "#" in line
+
+
+# ── step 3: the centre and sub leg (D4, review finding 8) ──────────────────
+# Item 23 step 3. The speaker leg opens the adapter's 8-channel altsetting,
+# front stays stereo and an (L+R)/2 mono sum feeds BOTH the centre channel and
+# the LFE channel, through a trim table the Owner's tuning session can move
+# without touching ALSA syntax.
+
+TRIM_EXAMPLE = WALL / "audio-trim.conf.example"
+
+
+def test_the_speaker_leg_opens_eight_channels_d4_sr028():
+    """Measured on the panel: altset 1 is 8 ch S16_LE, map FL FR FC LFE RL RR SL SR.
+
+    `channels 8` on the slave is the whole of how that altsetting is selected --
+    the map is fixed by the device and is already the order the ttable is
+    written in.
+    """
+    conf = read(BUS_CONF)
+    hw8 = conf.split("pcm.speaker_hw8 {", 1)[1].split("\n}", 1)[0]
+    assert "channels 8" in hw8
+    assert 'pcm "card_usb"' in hw8, "the card id still comes from the generated map"
+    assert "format S16_LE" in hw8 and "rate 48000" in hw8
+
+
+def test_the_mono_sum_reaches_both_centre_and_sub_d4_sr028(applier):
+    """D4: the SAME (L+R)/2 signal to FC and to LFE, and front left stereo.
+
+    Asserted on the numbers the renderer produces, not on the example file, so
+    that a change to the defaults has to be made on purpose.
+    """
+    rendered = applier.render_trim_conf(applier.TRIM_DEFAULTS)
+    # 0 FL, 1 FR, 2 FC, 3 LFE -- the hardware's fixed order.
+    assert "ttable.0.2 0.5000" in rendered and "ttable.1.2 0.5000" in rendered
+    assert "ttable.0.3 0.5000" in rendered and "ttable.1.3 0.5000" in rendered
+    assert "ttable.0.0 1.0000" in rendered and "ttable.1.1 1.0000" in rendered
+    # Front stays STEREO: neither input crosses into the other front channel.
+    assert "ttable.1.0 0.0000" in rendered and "ttable.0.1 0.0000" in rendered
+    # FC and LFE are fed identically, which is what "the same mono signal on
+    # both" means and is what the Owner's tone test will show.
+    for source in (0, 1):
+        centre = rendered.split("ttable.%d.2 " % source, 1)[1].split()[0]
+        sub = rendered.split("ttable.%d.3 " % source, 1)[1].split()[0]
+        assert centre == sub
+
+
+def test_the_rear_and_side_pairs_are_explicit_zeros_sr028(applier):
+    """Rear is wired to the desktop's INPUT: the room's music must never reach it.
+
+    Written out rather than left implicit, so "silent on purpose" and
+    "forgotten" do not look the same in a generated file.
+    """
+    rendered = applier.render_trim_conf(applier.TRIM_DEFAULTS)
+    for channel in (4, 5, 6, 7):
+        assert "ttable.0.%d 0.0000" % channel in rendered
+        assert "ttable.1.%d 0.0000" % channel in rendered
+
+
+def test_the_trim_defaults_are_the_owners_day_one_table_sr028(applier):
+    """Front 1.0/1.0, centre 0.5/0.5 per input, sub 0.5/0.5 -- finding 8."""
+    assert applier.TRIM_DEFAULTS == {"front_l": 1.0, "front_r": 1.0,
+                                     "center_l": 0.5, "center_r": 0.5,
+                                     "sub_l": 0.5, "sub_r": 0.5}
+    env = read(WALL / "wall.env.example")
+    for key, value in applier.TRIM_DEFAULTS.items():
+        assert "WALL_AUDIO_TRIM_%s=%s" % (key.upper(), value) in env
+    assert "WALL_AUDIO_TRIM_FRONT_L" in read(WALL / "wall-firstboot.sh")
+
+
+def test_a_tuning_session_moves_the_table_without_alsa_syntax_finding_8_sr028(applier):
+    """`wall-audio-output trim center=0.35 sub=0.6` is the Owner ruling's mechanism.
+
+    A group name moves both halves of the mono sum at once and keeps it a sum;
+    a per-channel name is there for the room that turns out to be asymmetric.
+    """
+    values = dict(applier.TRIM_DEFAULTS)
+    moved = applier.parse_trim_assignments(["center=0.35", "sub=0.6"], values)
+    assert moved["center_l"] == moved["center_r"] == 0.35
+    assert moved["sub_l"] == moved["sub_r"] == 0.6
+    assert moved["front_l"] == 1.0, "the others are untouched"
+    assert values == applier.TRIM_DEFAULTS, "the input table is never mutated"
+    finer = applier.parse_trim_assignments(["front_l=0.95"], values)
+    assert finer["front_l"] == 0.95 and finer["front_r"] == 1.0
+
+
+@pytest.mark.parametrize("assignment", [
+    "center=-0.5",   # a phase inversion is not a trim
+    "center=99",     # above the ceiling is a wiring problem
+    "center=loud",   # not a number
+    "rear=0.5",      # there is no knob for a pair wired to the desktop's input
+    "center",        # not KEY=VALUE
+])
+def test_a_refused_trim_moves_nothing_at_all_sr028(applier, assignment):
+    """Whole table or none of it: a session that fat-fingers the fourth change
+    must not be left with the first three applied and no idea which."""
+    with pytest.raises(ValueError):
+        applier.parse_trim_assignments(["center=0.4", assignment],
+                                       dict(applier.TRIM_DEFAULTS))
+
+
+def test_the_trim_file_falls_back_field_by_field_sr028(applier, tmp_path):
+    """One bad number must not cost the other five, exactly as the state file."""
+    env = tmp_path / "audio-trim.env"
+    env.write_text("WALL_AUDIO_TRIM_CENTER_L=0.25\n"
+                   "WALL_AUDIO_TRIM_SUB_L=banana\n"
+                   "WALL_AUDIO_TRIM_REAR_L=1.0\n", encoding="utf-8")
+    values, notes = applier.load_trim(env)
+    assert values["center_l"] == 0.25, "the good one is kept"
+    assert values["sub_l"] == applier.TRIM_DEFAULTS["sub_l"], "the bad one defaults"
+    assert values["front_l"] == 1.0, "an absent one defaults"
+    assert any("sub_l" in note for note in notes), "and it is journaled, not silent"
+    assert any("rear_l" in note for note in notes)
+
+
+def test_the_trim_round_trips_through_its_own_env_file_sr028(applier, tmp_path):
+    """What `trim` writes is what the next run reads: one number, not two."""
+    env = tmp_path / "audio-trim.env"
+    wanted = applier.parse_trim_assignments(["sub=0.6", "center_r=0.4"],
+                                            dict(applier.TRIM_DEFAULTS))
+    applier.write_atomic(env, applier.render_trim_env(wanted))
+    back, notes = applier.load_trim(env)
+    assert notes == []
+    assert back == wanted
+
+
+def test_a_missing_trim_file_may_not_take_the_whole_graph_down_sr028():
+    """`errors false`, and it is load-bearing.
+
+    A plain `</...>` include of an absent file aborts the WHOLE configuration --
+    the bus, the headset leg and `default` with it, i.e. silence everywhere
+    because a generated file went missing. The hook leaves only `speaker_multi`
+    undefined, and the applier's probe then falls back to stereo.
+    """
+    conf = read(BUS_CONF)
+    assert "</etc/wall-panel/audio-trim.conf>" not in conf, "a hard include would"
+    hook = conf.split("@hooks", 1)[1].split("\n]", 1)[0]
+    assert "func load" in hook
+    assert '"/etc/wall-panel/audio-trim.conf"' in hook
+    assert "errors false" in hook
+
+
+def test_one_probe_answers_both_ways_the_multi_chain_can_be_missing_sr028(applier):
+    """An adapter that refuses 8 channels and a missing trim file are one question.
+
+    Asking ALSA to open the chain answers both, about the graph as it is now
+    rather than about a file's existence. The fallback is exactly what shipped
+    before step 3.
+    """
+
+    class Refusing:
+        dry_run = False
+
+        def __init__(self):
+            self.commands = []
+
+        def command(self, argv, required=True, quiet=False, timeout=15):
+            self.commands.append(list(argv))
+            return 1
+
+    refusing = Refusing()
+    assert applier.probe_speaker_chain(refusing) == applier.SPEAKER_CHAIN_STEREO
+    assert refusing.commands == [["/usr/bin/aplay", "-q", "-D", "speaker_multi",
+                                  "/dev/null"]], "opened, no frames, nothing audible"
+    accepting = applier.Applier(dry_run=True)
+    assert applier.probe_speaker_chain(accepting) == applier.SPEAKER_CHAIN_MULTI
+
+
+def test_the_chain_reaches_both_the_leg_and_our_own_pre_open_sr028(applier, monkeypatch,
+                                                                  tmp_path):
+    """`@func getenv` reads the environment of the process that OPENS the PCM.
+
+    The unit gets the answer through EnvironmentFile=; the applier's own
+    pre-open is its own child and gets it through the environment. Without the
+    second half the pre-open would declare the softvol on a chain the leg was
+    not going to use.
+    """
+    monkeypatch.setattr(applier, "SPEAKER_CHAIN_ENV", tmp_path / "audio-speaker.env")
+    monkeypatch.delenv(applier.SPEAKER_CHAIN_VAR, raising=False)
+
+    def refuse(argv, **kwargs):
+        raise OSError("no aplay here")
+
+    recorder = applier.Applier(dry_run=False, run=refuse)
+    chain = applier.select_speaker_chain(recorder)
+    assert chain == applier.SPEAKER_CHAIN_STEREO
+    written = (tmp_path / "audio-speaker.env").read_text(encoding="utf-8")
+    assert written.strip() == "%s=%s" % (applier.SPEAKER_CHAIN_VAR, chain)
+    assert os.environ[applier.SPEAKER_CHAIN_VAR] == chain
+    unit = read(WALL / "wall-speaker-out.service")
+    assert "EnvironmentFile=-/run/wall-panel/audio-speaker.env" in unit
+    conf = read(BUS_CONF)
+    speaker_out = conf.split("pcm.speaker_out {", 1)[1].split("\n}", 1)[0]
+    assert "@func getenv" in speaker_out
+    assert applier.SPEAKER_CHAIN_VAR in speaker_out
+    assert '"speaker_multi"' in speaker_out, "the 8-channel chain is the default"
+
+
+def test_the_chain_is_chosen_before_anything_opens_the_leg_sr028(applier, policy):
+    """Probe, publish, then declare the control -- in that order or not at all."""
+    recorder = applier.Applier(dry_run=True)
+    applier.apply_plan(policy.default_state(), recorder)
+    flat = [" ".join(one) for one in recorder.commands]
+    probe = [i for i, one in enumerate(flat) if "-D speaker_multi" in one]
+    declare = [i for i, one in enumerate(flat) if "-D speaker_out" in one]
+    start = [i for i, one in enumerate(flat) if "systemctl start wall-speaker-out" in one]
+    assert probe and declare and start
+    assert probe[0] < declare[0] < start[0]
+
+
+def test_no_chain_is_probed_when_the_speaker_leg_is_not_wanted_sr028(applier, policy):
+    """In Mute, and in Headset, opening the adapter is audio nobody asked for."""
+    for output in ("mute", "headset"):
+        state = policy.default_state()
+        state["output"] = output
+        recorder = applier.Applier(dry_run=True)
+        applier.apply_plan(state, recorder)
+        assert not [one for one in recorder.commands
+                    if "speaker_multi" in " ".join(one)], output
+
+
+def test_the_boot_minute_underruns_are_answered_by_ordering_sr028():
+    """58 underruns on 2026-09-14, 00:14:18-00:15:13, then none. Ordering, not
+    a bigger buffer: a permanent latency cost to fix a 55-second window would be
+    paid against the lip-sync budget the design already calls tight.
+
+    Ordering ONLY -- no Wants=/Requires= -- so a panel with firstboot masked or
+    the kiosk loop disabled still gets audio.
+    """
+    for name in ("wall-speaker-out.service", "wall-bus-speaker.service"):
+        unit = read(WALL / name)
+        assert "After=wall-firstboot.service" in unit, name
+        assert "After=wall-kiosk-loop.service" in unit, name
+        assert "Wants=wall-firstboot.service" not in unit, name
+        assert "Requires=wall-firstboot.service" not in unit, name
+        assert "Wants=wall-kiosk-loop.service" not in unit, name
+        # The latency budget is unchanged: the fix cost the panel nothing after
+        # the boot minute.
+        assert "--tlatency 30000" in unit, name
+
+
+def test_the_trim_is_installed_only_if_absent_so_tuning_survives_a_rerun_sr028():
+    """The Owner's tuning session is numbers arrived at by listening. A firstboot
+    re-run must not throw them away -- the same rule amp-trigger.env has."""
+    firstboot = read(WALL / "wall-firstboot.sh")
+    assert "if [ ! -f /etc/wall-panel/audio-trim.env ]; then" in firstboot
+    assert "wall-audio-output trim --render" in firstboot
+    before = firstboot.split("wall-audio-output trim --render", 1)[0]
+    assert "/usr/local/lib/wall-panel/wall-audio-output" in before, \
+        "the renderer has to be installed before firstboot calls it"
+
+
+def test_the_trim_never_starts_audio_that_was_not_running_sr028(applier):
+    """A command that only moves a number must never put audio in the room.
+
+    So the running check counts a missing or erroring systemctl as NOT running:
+    with required=False an exception would answer 0, i.e. "active", and the leg
+    would be started by a tuning command.
+    """
+
+    def refuse(argv, **kwargs):
+        raise OSError("no systemctl here")
+
+    recorder = applier.Applier(dry_run=False, run=refuse)
+    assert recorder.command(["/usr/bin/systemctl", "is-active", "--quiet",
+                             "wall-speaker-out.service"], quiet=True) == 1
+
+
+def test_the_generated_alsa_config_parses_sr028(tmp_path):
+    """The one test that asks ALSA itself, rather than reading text.
+
+    Skipped where alsa-lib is not installed (the dev box); run under
+    `wsl -d Ubuntu`, which is where it was proven. The include paths are
+    rewritten into a temp tree because the real ones are absolute and under
+    /etc -- so what is asserted is the SYNTAX and the name resolution, not the
+    panel's own file locations, which the firstboot tests cover.
+    """
+    aplay = shutil.which("aplay")
+    if not aplay:
+        pytest.skip("alsa-lib is not installed here; run under wsl -d Ubuntu")
+    alsa_conf = Path("/usr/share/alsa/alsa.conf")
+    if not alsa_conf.exists():
+        pytest.skip("alsa-lib's own configuration is not present")
+
+    trim = tmp_path / "audio-trim.conf"
+    cards = tmp_path / "audio-cards.conf"
+    out = tmp_path / "audio-out.conf"
+    root = tmp_path / "asound.conf"
+    trim.write_text(read(TRIM_EXAMPLE), encoding="utf-8")
+    cards.write_text(read(WALL / "audio-cards.conf.example"), encoding="utf-8")
+    out.write_text(read(BUS_CONF).replace("/etc/wall-panel/audio-trim.conf", str(trim)),
+                   encoding="utf-8")
+    root.write_text(read(WALL / "asound.conf")
+                    .replace("/etc/wall-panel/audio-cards.conf", str(cards))
+                    .replace("/etc/wall-panel/audio-out.conf", str(out)),
+                    encoding="utf-8")
+
+    def names(config):
+        done = subprocess.run([aplay, "-L"], capture_output=True, text=True,
+                              env={"PATH": "/usr/bin:/bin",
+                                   "ALSA_CONFIG_PATH": "%s:%s" % (alsa_conf, config)})
+        return {line for line in done.stdout.splitlines() if not line.startswith(" ")}
+
+    resolved = names(root)
+    for name in ("bus", "bus_monitor", "speaker_tap", "speaker_out", "speaker_multi",
+                 "speaker_stereo", "speaker_hw8", "spdif_in"):
+        assert name in resolved, "%s did not resolve: %s" % (name, sorted(resolved))
+
+    # And the containment the hook buys: without the trim file the graph is
+    # still there, only the multi chain is gone.
+    trim.unlink()
+    survived = names(root)
+    assert "speaker_multi" not in survived
+    for name in ("bus", "speaker_out", "speaker_stereo"):
+        assert name in survived, "a missing trim file took %s down with it" % name

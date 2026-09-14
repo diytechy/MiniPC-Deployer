@@ -32,30 +32,32 @@ StartLimitIntervalSec=60
 StartLimitBurst=10
 BindsTo=dev-wall_audio_adapter.device
 After=dev-wall_audio_adapter.device
-# THE BOOT MINUTE, MEASURED. On the 2026-09-14 00:13 reboot the journal carried
-# 58 speaker_out underruns confined to 00:14:18-00:15:13 and ZERO afterwards --
-# the Owner heard them as skipping during boot and nothing later. The window is
-# exactly firstboot's re-run, the kiosk session restarting and the USB tree
-# enumerating, all competing for the same CPU and the same USB host controller.
+# THE BOOT MINUTE, MEASURED, AND THE FIX THAT WAS TRIED FIRST AND WITHDRAWN.
+# On the 2026-09-14 00:13 reboot the journal carried 58 speaker_out underruns
+# confined to 00:14:18-00:15:13 and ZERO afterwards -- the Owner heard them as
+# skipping during boot and nothing later. The window is exactly firstboot's
+# re-run, the kiosk session restarting and the USB tree enumerating, all
+# competing for the same CPU and the same USB host controller.
 #
-# ORDERING, NOT A BIGGER BUFFER, AND THAT IS A CHOICE. The alternative was to
-# raise alsaloop's --tlatency for this leg, which would buy the boot minute at
-# the cost of permanently adding to the 60-80 ms the design already spends on
-# two hops -- paying every hour of every day to fix 55 seconds once per boot,
-# in the one budget (lip-sync against the desktop's S/PDIF) the design says is
-# already tight. Ordering costs nothing after boot: `After=` only delays a start
-# job while the named unit's own job is still queued or running, and is inert
-# once those units have finished, which is every start the switch makes by hand.
-# Ordering ONLY, no Wants=/Requires=: the speaker leg must still start on a panel
-# where firstboot is masked or the kiosk loop is disabled.
+# `After=wall-firstboot.service` WAS THE OBVIOUS FIX AND IT IS A DEADLOCK.
+# Caught by review before the panel saw it. Nothing here is started by a boot
+# target: firstboot runs `wall-audio-mode bus`, which restarts
+# wall-audio-state.service, whose applier runs `systemctl start` on THIS unit
+# and waits for the job. Order that job after wall-firstboot.service and systemd
+# holds it behind firstboot's own still-running job -- while firstboot is
+# blocked waiting for the start to return. First boot would then hang to its
+# timeout and fail to provision. The ordering was incoherent as well as
+# dangerous: firstboot cannot be a unit this leg starts after when firstboot is
+# the thing that starts it.
 #
-# USB enumeration, the third actor, is already covered: BindsTo/After on the
-# adapter's device alias above means this leg cannot start before the adapter is
-# there at all. wall-bus-speaker.service carries the same two lines, because
-# ordering only this half would leave the tap filling ahead of its reader and
-# trade the underruns for a backlog to drain.
-After=wall-firstboot.service
-After=wall-kiosk-loop.service
+# SO IT IS A BIGGER BUFFER AFTER ALL, AND ONLY ON THIS HALF. --tlatency 50000
+# rather than 30000: a larger ring tolerates a longer scheduling gap, which is
+# precisely what the boot minute is. The cost is about 20 ms of end-to-end
+# latency on the speaker path, taking it to roughly 80-100 ms -- still under the
+# kiosk leg's own 100 ms, and the design's stated lip-sync knob (wall-spdif-in's
+# latency) is untouched and still available. wall-bus-speaker.service keeps 30
+# ms: the measured underruns were on speaker_out, and buying tolerance twice
+# would pay for the boot minute twice.
 
 [Service]
 Type=simple
@@ -70,7 +72,7 @@ ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
     --cdevice speaker_tap \
     --pdevice speaker_out \
     --format S16_LE --rate 48000 --channels 2 \
-    --tlatency 30000 --sync 5
+    --tlatency 50000 --sync 5
 Restart=always
 RestartSec=2
 Nice=-5

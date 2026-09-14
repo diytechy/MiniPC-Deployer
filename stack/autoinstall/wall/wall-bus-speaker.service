@@ -28,14 +28,14 @@ StartLimitIntervalSec=60
 StartLimitBurst=10
 BindsTo=dev-wall_audio_adapter.device
 After=dev-wall_audio_adapter.device
-# The same boot-minute ordering wall-speaker-out.service carries, and for the
-# same measured window (58 underruns, 00:14:18-00:15:13, 2026-09-14). It is on
-# BOTH halves of the leg on purpose: ordering only the output half would let
-# this one fill the tap while its reader was still held back, which trades the
-# underruns for a backlog the reader then has to drain. Ordering only -- no
-# Wants= -- so a panel with firstboot masked still gets audio.
-After=wall-firstboot.service
-After=wall-kiosk-loop.service
+# NO BOOT-MINUTE ORDERING HERE, AND NONE ON THE OTHER HALF EITHER. The first
+# answer to the 2026-09-14 underruns was `After=wall-firstboot.service` on both
+# halves; review found it a first-boot DEADLOCK -- firstboot starts these units
+# synchronously, through wall-audio-mode and wall-audio-state, so ordering them
+# after firstboot parks the start job behind the job that is waiting for it. The
+# fix now lives in wall-speaker-out.service as a larger alsaloop ring, and the
+# whole argument is written out there. This half keeps its 30 ms: the measured
+# underruns were on speaker_out, not on the tap.
 
 [Service]
 Type=simple

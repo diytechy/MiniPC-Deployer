@@ -538,8 +538,13 @@ def test_one_apply_at_a_time_sr028(applier):
     assert "with apply_lock(" in source
     assert "LOCK_EX" in source
     # The lock must wrap the whole read-decide-write-apply, not just the write.
-    locked = source.split("with apply_lock(")[1]
+    # The LAST one: `trim` also takes the lock now (review, step 3), and it is
+    # written first in main(). The apply's own is the one this test is about.
+    locked = source.split("with apply_lock(")[-1]
     assert "_locked_apply(arguments)" in locked
+    # And trim's, which review added after finding that a trim could restart a
+    # leg an apply had just stopped for Mute.
+    assert "with apply_lock(" in source.split('command == "trim"', 1)[1][:200]
 
 
 def test_the_broker_reaches_root_through_one_watched_file_sr028():
@@ -1251,24 +1256,91 @@ def test_no_chain_is_probed_when_the_speaker_leg_is_not_wanted_sr028(applier, po
                     if "speaker_multi" in " ".join(one)], output
 
 
-def test_the_boot_minute_underruns_are_answered_by_ordering_sr028():
-    """58 underruns on 2026-09-14, 00:14:18-00:15:13, then none. Ordering, not
-    a bigger buffer: a permanent latency cost to fix a 55-second window would be
-    paid against the lip-sync budget the design already calls tight.
+def test_the_boot_minute_fix_is_not_an_ordering_deadlock_sr028():
+    """58 underruns on 2026-09-14, 00:14:18-00:15:13, then none.
 
-    Ordering ONLY -- no Wants=/Requires= -- so a panel with firstboot masked or
-    the kiosk loop disabled still gets audio.
+    `After=wall-firstboot.service` was the first answer and review caught it as a
+    FIRST-BOOT DEADLOCK: nothing here is started by a boot target, so firstboot
+    itself starts these units -- through wall-audio-mode and wall-audio-state --
+    and waits for the job. Ordering that job after firstboot parks it behind the
+    job that is waiting for it. The chain is asserted here so that nobody
+    re-adds the line without meeting it.
     """
+    firstboot = read(WALL / "wall-firstboot.sh")
+    mode = read(WALL / "wall-audio-mode")
+    assert "/usr/local/sbin/wall-audio-mode bus" in firstboot,         "firstboot is what applies bus mode"
+    assert "unit restart wall-audio-state.service" in mode,         "and that is what runs the applier that starts these legs"
     for name in ("wall-speaker-out.service", "wall-bus-speaker.service"):
-        unit = read(WALL / name)
-        assert "After=wall-firstboot.service" in unit, name
-        assert "After=wall-kiosk-loop.service" in unit, name
-        assert "Wants=wall-firstboot.service" not in unit, name
-        assert "Requires=wall-firstboot.service" not in unit, name
-        assert "Wants=wall-kiosk-loop.service" not in unit, name
-        # The latency budget is unchanged: the fix cost the panel nothing after
-        # the boot minute.
-        assert "--tlatency 30000" in unit, name
+        # Directives only: the units EXPLAIN the withdrawn ordering at length,
+        # and the explanation must not read as the thing it warns about.
+        directives = [one.strip() for one in read(WALL / name).splitlines()
+                      if one.strip() and not one.lstrip().startswith("#")]
+        assert "After=wall-firstboot.service" not in directives, name
+        assert "After=wall-kiosk-loop.service" not in directives, name
+
+
+def test_the_boot_minute_is_answered_by_a_bigger_ring_on_one_half_sr028():
+    """The buffer, on the half that actually underran, and only that half.
+
+    A larger ring tolerates a longer scheduling gap, which is what the boot
+    minute is. It costs about 20 ms end to end, still under the kiosk leg's own
+    100 ms; the tap keeps 30 ms because buying the tolerance twice would pay for
+    the boot minute twice.
+    """
+    assert "--tlatency 50000" in read(WALL / "wall-speaker-out.service")
+    assert "--tlatency 30000" in read(WALL / "wall-bus-speaker.service")
+    for name in ("wall-spdif-in.service", "wall-bus-headset.service"):
+        assert "--tlatency 30000" in read(WALL / name),             "%s is not on the speaker path and was not part of this" % name
+
+
+def test_the_trim_takes_the_same_lock_every_other_writer_takes_sr028():
+    """Review: trim saw the leg running, an apply for Mute stopped it, and
+    trim's restart brought it back -- the graph in a position nobody chose."""
+    source = read(APPLIER)
+    entry = source.split('if arguments.command == "trim":', 1)[1][:300]
+    assert "with apply_lock(" in entry
+    assert "return trim_command(arguments)" in entry
+
+
+def test_the_trim_restarts_nothing_the_owner_did_not_select_sr028(applier, tmp_path,
+                                                                 monkeypatch):
+    """`is-active` is a fact about a moment; the stored position is the choice.
+
+    Only when both agree is a restart something the Owner would recognize --
+    review's interleaving was trim seeing the leg active, an apply for Mute
+    stopping it, and trim starting it again.
+    """
+    (tmp_path / "audio-mode").write_text("bus" + chr(10), encoding="utf-8")
+    monkeypatch.setattr(applier, "MODE_FILE", tmp_path / "audio-mode")
+    state_file = tmp_path / "audio-state.json"
+    recorded = []
+
+    real = applier.Applier
+
+    class Recorder(real):
+        def __init__(self, dry_run=False, run=None):
+            real.__init__(self, dry_run=True)
+            recorded.append(self)
+
+    monkeypatch.setattr(applier, "Applier", Recorder)
+
+    class Arguments:
+        dry_run = True
+        render = True
+        value = []
+        trim_env = tmp_path / "audio-trim.env"
+        trim_conf = tmp_path / "audio-trim.conf"
+        state = str(state_file)
+
+    for output, expect_restart in (("speaker", True), ("headset", False),
+                                   ("mute", False)):
+        recorded[:] = []
+        state_file.write_text(json.dumps({"version": 1, "output": output}),
+                              encoding="utf-8")
+        assert applier.trim_command(Arguments()) == 0
+        issued = [" ".join(one) for one in recorded[0].commands]
+        restarted = any("systemctl restart" in one for one in issued)
+        assert restarted is expect_restart, "%s: %s" % (output, issued)
 
 
 def test_the_trim_is_installed_only_if_absent_so_tuning_survives_a_rerun_sr028():

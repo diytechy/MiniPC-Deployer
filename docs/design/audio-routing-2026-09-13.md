@@ -521,35 +521,49 @@ generated file went missing. With the hook, an absent file leaves only
 `speaker_multi` undefined, the probe fails, and the leg plays stereo. Both
 halves of that are asserted against real `alsa-lib` (see the tests below).
 
-### The boot-minute underruns, and the choice made about them
+### The boot-minute underruns: the first answer was a deadlock
 
 Measured on the 2026-09-14 00:13 reboot: **58 `speaker_out` underruns confined
-to 00:14:18–00:15:13, and zero afterwards.** The Owner heard them as skipping
+to 00:14:18-00:15:13, and zero afterwards.** The Owner heard them as skipping
 during boot and nothing later. The window is exactly firstboot's re-run, the
 kiosk session restarting and the USB tree enumerating, competing for the same
 CPU and the same USB host controller.
 
-**Chosen: ordering.** Both halves of the speaker leg gain
+**`After=wall-firstboot.service` was written first, and adversarial review
+(terra, medium) found it a first-boot deadlock before the panel did.** Nothing
+in the speaker leg is started by a boot target -- that is a deliberate property
+of steps 1-2, "no leg is ever `enable`d". The chain is:
 
 ```
-After=wall-firstboot.service
-After=wall-kiosk-loop.service
+wall-firstboot.service  (running)
+  └─ wall-audio-mode bus                       (synchronous)
+       └─ systemctl restart wall-audio-state   (synchronous, waits)
+            └─ wall-audio-output apply-state
+                 └─ systemctl start wall-speaker-out.service   ← waits for the job
 ```
 
-**Ordering only — no `Wants=`/`Requires=`** — so the leg still starts on a panel
-where firstboot is masked or the kiosk loop is disabled. `After=` delays a start
-job only while the named unit's own job is queued or running, and is inert once
-they have finished, which is every start the switch makes by hand afterwards.
-USB enumeration, the third actor, was already covered by the existing
-`BindsTo=`/`After=` on the adapter's device alias.
+Order that last job after `wall-firstboot.service` and systemd parks it behind
+firstboot's own still-running job -- while firstboot is blocked waiting for the
+start to return. First boot hangs to its timeout and fails to provision. The
+ordering was **incoherent as well as dangerous**: firstboot cannot be a unit
+this leg starts *after* when firstboot is the thing that starts it. Withdrawn,
+and a test asserts the whole call chain so that nobody re-adds the line without
+meeting it.
 
-**Rejected: a larger start buffer.** Raising `alsaloop --tlatency` for this leg
-would buy the boot minute at the cost of permanently adding to the 60–80 ms the
-design already spends on two hops — paying every hour of every day to fix 55
-seconds once per boot, in the one budget (lip-sync against the desktop's S/PDIF)
-this design already calls tight. It is on **both** halves of the leg on purpose:
-ordering only the output half would let `wall-bus-speaker` fill the tap while
-its reader was still held back, trading the underruns for a backlog to drain.
+**So it is the larger buffer after all, and on one half only.**
+`wall-speaker-out.service` goes from `--tlatency 30000` to `--tlatency 50000`;
+a larger ring tolerates a longer scheduling gap, which is precisely what the
+boot minute is. `wall-bus-speaker.service` keeps 30 ms: the measured underruns
+were on `speaker_out`, not on the tap, and buying the tolerance twice would pay
+for the boot minute twice.
+
+**The cost, said out loud.** About 20 ms of end-to-end latency on the speaker
+path, taking it from roughly 60-80 ms to 80-100 ms -- still under the kiosk
+leg's own 100 ms. The design's stated lip-sync knob (`wall-spdif-in`'s latency)
+is untouched and still available, and if the Owner hears lip-sync error at the
+glass test this number is the first one to put back. That is the trade this
+design would rather not have made; the alternative was a first boot that does
+not finish.
 
 ### Files step 3 changes or adds
 
@@ -558,8 +572,8 @@ its reader was still held back, trading the underruns for a backlog to drain.
 | `asound-bus-mode.conf` | changed | `speaker_hw8` (8-channel open), `speaker_stereo` (the fallback), `speaker_out`'s slave chosen by `@func getenv`, the `errors false` hook that loads the trim |
 | `audio-trim.conf.example` | new | what the generated `pcm.speaker_multi` looks like, and why it is generated |
 | `wall-audio-output` | changed | `trim` subcommand, `load_trim`/`render_trim_conf`/`render_trim_env`, `probe_speaker_chain`/`select_speaker_chain`, trim and chain in `status` |
-| `wall-speaker-out.service` | changed | `EnvironmentFile=` for the chain; the boot-minute ordering |
-| `wall-bus-speaker.service` | changed | the same boot-minute ordering |
+| `wall-speaker-out.service` | changed | `EnvironmentFile=` for the chain; `--tlatency` 30 ms to 50 ms for the boot minute |
+| `wall-bus-speaker.service` | changed | comment only: why the withdrawn ordering is not here either |
 | `wall-firstboot.sh` | changed | seeds `audio-trim.env` if absent, then renders `audio-trim.conf` |
 | `wall.env.example` | changed | the six `WALL_AUDIO_TRIM_*` seeds and what they mean |
 
@@ -621,7 +635,8 @@ cat /proc/asound/card3/stream0 | head -8     # expect Altset = 1, 8 channels
 | S3-6 | The rocker, or `amixer -c Loopback sset Bus 40%` | front, centre and sub **all** follow: one control, ruling F |
 | S3-7 | `journalctl -u wall-amp-trigger -f` while doing S3-4 | the relay closes as before: the tap is upstream of every part of step 3 |
 | S3-8 | `sudo mv /etc/wall-panel/audio-trim.conf /tmp/` then `sudo wall-audio-output set speaker` | audio still plays, **stereo front only**, and the journal says the 8-channel chain would not open and names both things to check. Put the file back and re-apply. |
-| S3-9 | Reboot, and watch the first two minutes | `journalctl -u wall-speaker-out --since -3min` shows **no underrun burst**; the Owner hears no skipping during boot |
+| S3-9 | Reboot, and watch the first two minutes | `journalctl -u wall-speaker-out --since -3min` shows **no underrun burst** (the 58 of 2026-09-14); the Owner hears no skipping during boot. **Firstboot must also complete normally** -- `systemctl status wall-firstboot` green, not timed out |
+| S3-9a | With the desktop playing video over S/PDIF on Speaker | ask the Owner about lip-sync: this step added about 20 ms. If it reads wrong, `--tlatency` in `wall-speaker-out.service` is the number to put back to 30000 |
 | S3-10 | Headset position, and Mute | unchanged from steps 1–2 in every respect; `status` shows no probe and the adapter is not opened |
 
 ## What steps 4–6 still owe

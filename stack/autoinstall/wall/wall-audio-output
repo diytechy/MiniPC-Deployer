@@ -745,11 +745,19 @@ def trim_command(arguments):
     destination channels in the hardware's fixed order -- nor to restart the
     right unit afterwards for the change to be heard.
 
-    No lock is taken and no state is read: the trim is a property of the ROOM,
-    not of the switch position, and it is orthogonal to everything apply_lock
-    serializes. The one privileged thing it does -- restarting the speaker leg
-    so the new table is opened -- is a restart of a unit whose owner is this
-    same script, and a concurrent apply will simply start it again.
+    IT TAKES THE APPLY LOCK, AND THE FIRST DRAFT DID NOT. The trim is a property
+    of the ROOM rather than of the switch position, so it looked orthogonal to
+    everything `apply_lock` serializes. Review found the interleaving that makes
+    it not: this command reads "the speaker leg is running", an apply for Mute or
+    Headset then stops that leg, and the `restart` below starts it again --
+    leaving the graph in a position the Owner did not choose, with a forwarder
+    running against a stopped tap. The window is small and the fix is free, so
+    the whole of read, render and restart happens under the same lock every
+    other writer takes.
+
+    And it asks the STORED POSITION as well as systemd. `is-active` alone is a
+    fact about a moment; `output == "speaker"` is what the Owner chose. Only
+    when both agree is a restart something the Owner would recognize.
     Implements: SR-028, LLR-014
     """
     values, notes = load_trim(arguments.trim_env)
@@ -787,6 +795,8 @@ def trim_command(arguments):
     # already running, because starting it here would put audio in the room from
     # a command that was only meant to move a number.
     applier = Applier(dry_run=arguments.dry_run)
+    state, _ = load_state(arguments.state)
+    selected = state["output"] == "speaker" and current_mode() == "bus"
     # `required=True` on the probe on purpose, so that a systemctl that is
     # missing or that errors counts as NOT RUNNING and nothing is restarted.
     # With required=False an exception would answer 0 -- "active" -- and the
@@ -795,13 +805,13 @@ def trim_command(arguments):
     # normal answer here, not a fault worth a journal line.
     running = applier.command(["/usr/bin/systemctl", "is-active", "--quiet",
                                SPEAKER_OUT_UNIT], quiet=True) == 0
-    if running:
+    if running and selected:
         if applier.command(["/usr/bin/systemctl", "restart", SPEAKER_OUT_UNIT],
                            required=False) == 0:
             log("speaker leg restarted: the new trim table is open")
     else:
-        log("speaker leg is not running: the new trim table is opened next time "
-            "the switch reaches Speaker")
+        log("speaker leg is not running on Speaker: the new trim table is opened "
+            "next time the switch reaches Speaker")
     return 0
 
 
@@ -1061,7 +1071,9 @@ def main(argv=None):
         arguments.value = arguments.value[0] if arguments.value else None
 
     if arguments.command == "trim":
-        return trim_command(arguments)
+        # Under the same lock every other writer takes: see trim_command.
+        with apply_lock(dry_run=arguments.dry_run):
+            return trim_command(arguments)
 
     if arguments.boot and arguments.runtime:
         parser.error("--boot and --runtime are opposites; pass at most one")

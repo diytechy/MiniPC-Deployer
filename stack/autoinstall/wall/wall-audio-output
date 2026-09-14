@@ -873,6 +873,19 @@ def select_speaker_chain(applier):
     the pre-open would open the multi chain while the leg opened the stereo one,
     and a fallback would silently create its control on the wrong graph.
     """
+    # Do not probe against a device the leg itself is holding. While
+    # wall-speaker-out is running, the adapter is open and any probe answers
+    # "busy" -- which read as "the 8-channel chain would not open" and demoted a
+    # working multi-channel leg to stereo on the next restart. Measured on the
+    # panel 2026-09-14 01:20 (`volume 100` while playing). The published answer
+    # from the last probe with the leg stopped stands until the leg is stopped
+    # again; the probe runs only when nothing holds the adapter.
+    published = read_env(SPEAKER_CHAIN_ENV, SPEAKER_CHAIN_VAR, None)
+    leg_running = applier.command(["/usr/bin/systemctl", "is-active", "--quiet",
+                                   SPEAKER_OUT_UNIT], quiet=True) == 0
+    if leg_running and published in (SPEAKER_CHAIN_MULTI, SPEAKER_CHAIN_STEREO):
+        os.environ[SPEAKER_CHAIN_VAR] = published
+        return published
     chain = probe_speaker_chain(applier)
     write_atomic(SPEAKER_CHAIN_ENV, "%s=%s\n" % (SPEAKER_CHAIN_VAR, chain),
                  mode=0o644, dry_run=applier.dry_run)

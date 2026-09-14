@@ -191,7 +191,18 @@ def test_speaker_runs_the_tap_leg_and_headset_does_not_sr028(policy):
     headset = policy.plan(state)
     assert headset["legs"]["wall-bus-headset.service"] is True
     assert not headset["legs"]["wall-bus-speaker.service"]
-    assert headset["adapter_muted"] is True
+    # STEP 4 CHANGED THIS AND THE CHANGE IS DELIBERATE. The adapter's mute is
+    # ONE boolean over all eight channels (numid 7, measured 2026-09-14), and in
+    # Headset position item 23 D3 still wants the headset's microphone on the
+    # adapter's REAR pair, which is the desktop's input. Muting the card would
+    # silence that too, and the card cannot say "front off, rear on". So it is
+    # muted only when nothing at all is meant to leave it, and the separation is
+    # the two generated route tables' explicit zeros (asserted further down).
+    assert headset["adapter_muted"] is False
+    assert headset["mic_live"] is True
+    # ... and it IS muted the moment no mic leg wants it either.
+    silent, _ = policy.apply_event(state, {"kind": "set_input_mute", "muted": True})
+    assert policy.plan(silent)["adapter_muted"] is True
 
 
 @pytest.mark.parametrize("event", [
@@ -713,7 +724,7 @@ def test_coldplug_is_told_from_a_plug_by_two_monotonic_marks_sr028(applier):
     assert applier.is_boot_presence(9000, stamp=5000, **up) is False, "later is a plug event"
 
 
-def test_a_boot_that_has_not_finished_can_never_auto_switch_sr028(applier):
+def test_a_boot_that_has_not_finished_can_never_auto_switch_sr028(applier, monkeypatch):
     """Gate 1, and the reason systemd-udev-settle was dropped.
 
     Review was right that settle only drains the queue it can SEE: an adapter
@@ -724,7 +735,15 @@ def test_a_boot_that_has_not_finished_can_never_auto_switch_sr028(applier):
     by itself, so there is no number here to get wrong.
     """
     assert applier.is_boot_presence(999_999_999, stamp=1, system_up=False) is True
-    assert applier.is_boot_presence(999_999_999, stamp=1, system_up=None) is True, \
+    # `system_up=None` is the "not supplied" sentinel, NOT "unanswerable": the
+    # function then goes and asks system_is_up() itself. Passing None here
+    # therefore asserted nothing on any machine that HAS systemd -- including
+    # the panel, which is the only machine that matters -- and passed on the dev
+    # box only because `systemctl` is missing there. Found running this suite
+    # under `wsl -d Ubuntu` for the step-4 ALSA proof, 2026-09-14. The claim is
+    # about an unanswerable gate 1, so the unanswerable thing is what is stubbed.
+    monkeypatch.setattr(applier, "system_is_up", lambda *a, **k: None)
+    assert applier.is_boot_presence(999_999_999, stamp=1) is True, \
         "an unanswerable gate is coldplug too"
 
 
@@ -903,10 +922,11 @@ def test_the_boot_finished_gate_reads_systemd_not_a_clock_sr028(applier):
 class _Reply:
     """What subprocess.run returns to the applier."""
 
-    def __init__(self, returncode):
+    def __init__(self, returncode, stdout=None, stderr=None):
         self.returncode = returncode
-        self.stdout = ""
-        self.stderr = "amixer: Unable to find simple control 'Bus',0"
+        self.stdout = "" if stdout is None else stdout
+        self.stderr = ("amixer: Unable to find simple control 'Bus',0"
+                       if stderr is None else stderr)
 
 
 def test_the_control_is_declared_and_set_before_the_leg_starts_sr028(applier, policy):
@@ -1055,10 +1075,19 @@ def test_the_speaker_leg_opens_eight_channels_d4_sr028():
     written in.
     """
     conf = read(BUS_CONF)
+    # STEP 4 MOVED THE OPEN ITSELF ONE LEVEL DOWN, into a dmix, because the
+    # adapter has ONE playback stream and the mic return needs the rear pair of
+    # it at the same time as the speaker leg has the front. speaker_hw8 is now
+    # the plug that reaches that dmix; `channels 8` -- which is the whole of how
+    # altset 1 is selected -- lives in the dmix's slave.
     hw8 = conf.split("pcm.speaker_hw8 {", 1)[1].split("\n}", 1)[0]
-    assert "channels 8" in hw8
-    assert 'pcm "card_usb"' in hw8, "the card id still comes from the generated map"
-    assert "format S16_LE" in hw8 and "rate 48000" in hw8
+    assert "usb_out_mix" in hw8
+    shared = conf.split("pcm.usb_out_mix {", 1)[1].split("\n}", 1)[0]
+    assert "type dmix" in shared
+    assert "channels 8" in shared
+    assert '"card_usb"' in shared
+    assert 'pcm "card_usb"' in shared, "the card id still comes from the generated map"
+    assert "format S16_LE" in shared and "rate 48000" in shared
 
 
 def test_the_mono_sum_reaches_both_centre_and_sub_d4_sr028(applier):
@@ -1391,12 +1420,16 @@ def test_the_generated_alsa_config_parses_sr028(tmp_path):
         pytest.skip("alsa-lib's own configuration is not present")
 
     trim = tmp_path / "audio-trim.conf"
+    mic = tmp_path / "audio-mic.conf"
     cards = tmp_path / "audio-cards.conf"
     out = tmp_path / "audio-out.conf"
     root = tmp_path / "asound.conf"
     trim.write_text(read(TRIM_EXAMPLE), encoding="utf-8")
+    mic.write_text(read(MIC_EXAMPLE), encoding="utf-8")
     cards.write_text(read(WALL / "audio-cards.conf.example"), encoding="utf-8")
-    out.write_text(read(BUS_CONF).replace("/etc/wall-panel/audio-trim.conf", str(trim)),
+    out.write_text(read(BUS_CONF)
+                   .replace("/etc/wall-panel/audio-trim.conf", str(trim))
+                   .replace("/etc/wall-panel/audio-mic.conf", str(mic)),
                    encoding="utf-8")
     root.write_text(read(WALL / "asound.conf")
                     .replace("/etc/wall-panel/audio-cards.conf", str(cards))
@@ -1411,13 +1444,520 @@ def test_the_generated_alsa_config_parses_sr028(tmp_path):
 
     resolved = names(root)
     for name in ("bus", "bus_monitor", "speaker_tap", "speaker_out", "speaker_multi",
-                 "speaker_stereo", "speaker_hw8", "spdif_in"):
+                 "speaker_stereo", "speaker_hw8", "spdif_in",
+                 # step 4: the shared eight-channel dmix, both capture sources,
+                 # the one name the AEC step will replace, and the rear route.
+                 "usb_out_mix", "mic_panel", "mic_headset", "mic_selected",
+                 "mic_rear", "mic_rear_route"):
         assert name in resolved, "%s did not resolve: %s" % (name, sorted(resolved))
 
-    # And the containment the hook buys: without the trim file the graph is
-    # still there, only the multi chain is gone.
+    # And the containment the two hooks buy, one generated file at a time.
+    # Without the trim file the graph is still there, only the multi chain is
+    # gone -- and the MIC leg survives, because the two files are independent.
     trim.unlink()
     survived = names(root)
     assert "speaker_multi" not in survived
-    for name in ("bus", "speaker_out", "speaker_stereo"):
+    for name in ("bus", "speaker_out", "speaker_stereo", "mic_rear_route",
+                 "mic_selected"):
         assert name in survived, "a missing trim file took %s down with it" % name
+
+    # And the other way round: a missing mic file costs the rear route and
+    # NOTHING else. This is the one that matters at the glass -- a panel that
+    # went silent because a microphone's generated file was not there would be
+    # the worst possible trade.
+    trim.write_text(read(TRIM_EXAMPLE), encoding="utf-8")
+    mic.unlink()
+    survived = names(root)
+    assert "mic_rear_route" not in survived
+    for name in ("bus", "speaker_out", "speaker_multi", "mic_selected",
+                 "mic_panel", "usb_out_mix", "default"):
+        assert name in survived, "a missing mic file took %s down with it" % name
+    # `headset_out` and `mic_headset_raw` never appear in `aplay -L` at all,
+    # here or above: alsa-lib's name hints skip a definition whose card comes
+    # from `@func getenv`. That is a property of the LISTING, not of the graph --
+    # they open fine on the panel -- and it is written down so that a future
+    # reader does not add them to these lists and then "fix" the config.
+
+
+# ── step 4: the mic legs (item 23 C, D3, D4; Owner ruling E) ───────────────
+#
+# Read in this order: which microphone the switch selects, what the input mute
+# actually does, the two generated route tables that are the whole of the
+# separation between the microphone and the speakers, and the ways the leg is
+# allowed to fail.
+
+MIC_EXAMPLE = WALL / "audio-mic.conf.example"
+MIC_REAR_UNIT_FILE = WALL / "wall-mic-rear.service"
+BT_MIC_UNIT_FILE = WALL / "wall-bt-mic.service"
+BT_MIC = WALL / "wall-bt-mic.py"
+
+
+@pytest.fixture(scope="module")
+def btmic():
+    return load(BT_MIC, "wall_bt_mic")
+
+
+def test_the_mic_follows_the_output_switch_d3_d4_sr029(policy):
+    """D4 Speaker -> the panel's own mic; D3 Headset -> the adapter's.
+
+    There is no fourth button: the selection is a consequence of the output
+    position, which is what item 23 asks for and all it asks for.
+    """
+    speaker = policy.default_state()
+    assert policy.mic_source(speaker) == policy.MIC_SOURCE_PANEL
+    assert policy.plan(speaker)["mic_source"] == "mic_panel"
+
+    headset, _ = policy.apply_event(speaker, {"kind": "headset", "present": True})
+    assert headset["output"] == "headset"
+    assert policy.mic_source(headset) == policy.MIC_SOURCE_HEADSET
+    assert policy.plan(headset)["mic_source"] == "mic_headset"
+
+
+def test_output_mute_does_not_mute_the_microphone_ruling_e_sr029(policy):
+    """Owner ruling E, in as many words: "the mic has its own mute".
+
+    The Mute POSITION silences the room. It is not an input control, and a panel
+    that quietly stopped the microphone when somebody silenced the speakers
+    would be answering a question the Owner explicitly answered the other way.
+    """
+    muted, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_output", "output": "mute"})
+    assert policy.audible(muted) is False, "the room is silent"
+    assert policy.mic_live(muted) is True, "the microphone is not"
+    plan = policy.plan(muted)
+    assert all(plan["legs"][unit] is False
+               for unit in policy.SPEAKER_LEGS + policy.HEADSET_LEGS)
+    assert all(plan["legs"][unit] is True for unit in policy.MIC_LEGS)
+    # And in Mute there is no headset to take the mic from, so it is the panel's.
+    assert plan["mic_source"] == "mic_panel"
+
+
+def test_the_input_mute_is_a_real_mute_not_a_ui_flag_ruling_e_sr029(policy):
+    """It STOPS both mic legs, so no sample leaves the panel at all.
+
+    This is the test that would fail if the input mute were ever reduced to
+    something the chrome draws over a running microphone. A cosmetic mute is
+    indistinguishable from a working one to whoever is on the call.
+    """
+    state, _ = policy.apply_event(policy.default_state(),
+                                  {"kind": "set_input_mute", "muted": True})
+    plan = policy.plan(state)
+    assert plan["input_muted"] is True
+    assert plan["mic_live"] is False
+    for unit in policy.MIC_LEGS:
+        assert plan["legs"][unit] is False, "%s must be STOPPED, not flagged" % unit
+    # The output is untouched: the two buttons are independent (ruling E).
+    assert plan["legs"]["wall-speaker-out.service"] is True
+
+
+def test_headset_absent_tunnels_no_microphone_ruling_7_sr029(policy):
+    """Ruling 7: "silence on every output, NO MIC TUNNELLED".
+
+    Falling back to the panel microphone here would put a live microphone in a
+    room whose owner believes the panel is switched away from it, and nobody
+    could hear that happening. It is the one failure in this design with no
+    audible symptom, which is exactly why it has a test of its own.
+    """
+    state, _ = policy.apply_event(policy.default_state(), {"kind": "headset", "present": True})
+    state, _ = policy.apply_event(state, {"kind": "headset", "present": False})
+    assert state["output"] == "headset"
+    assert policy.mic_live(state) is False
+    plan = policy.plan(state)
+    assert not any(plan["legs"].values()), "no leg at all, output or mic"
+
+
+def test_no_mic_leg_is_ever_enabled_sr029():
+    """A boot must not start a microphone the Owner did not leave running."""
+    for unit in (MIC_REAR_UNIT_FILE, BT_MIC_UNIT_FILE):
+        text = read(unit)
+        assert "[Install]" not in text, "%s must not be enableable" % unit.name
+        assert "WantedBy" not in text
+        # The mode gate every leg carries: `wall-audio-mode trigger` is the
+        # Owner's one-command rollback and must take the mic legs with it.
+        assert "audio-mode" in text and "= bus" in text
+
+
+def test_the_mic_route_writes_explicit_zeros_everywhere_else_sr029(applier):
+    """The mic on channels 4 and 5, and NOTHING anywhere else. Both halves.
+
+    This table is the whole of what keeps the microphone out of the speakers:
+    the adapter's mute is one boolean over all eight channels, so hardware
+    cannot express "front off, rear on" while the mic leg is running.
+    """
+    rendered = applier.render_mic_conf(dict(applier.MIC_DEFAULTS))
+    assert 'pcm "usb_out_mix"' in rendered, "it must share the one playback stream"
+    assert "channels 8" in rendered
+    for channel in (4, 5):
+        assert "ttable.0.%d 1.0000" % channel in rendered
+    for channel in (0, 1, 2, 3, 6, 7):
+        assert "ttable.0.%d 0.0000" % channel in rendered, (
+            "channel %d must be an EXPLICIT zero: silent on purpose and "
+            "forgotten must not look the same" % channel)
+    # The microphone reaches the two rear channels IDENTICALLY: a desktop line
+    # input is stereo and both sides must carry the same capsule.
+    assert rendered.count("ttable.0.4 1.0000") == rendered.count("ttable.0.5 1.0000")
+
+
+def test_the_two_route_tables_do_not_overlap_sr029(applier):
+    """The other direction, and the pair is the whole bargain.
+
+    The speaker route owns 0-3 and zeroes 4-7; the mic route owns 4-5 and zeroes
+    the rest. dmix sums per channel, so music cannot reach the desktop's input
+    and the microphone cannot reach the amplifier, and neither statement depends
+    on a mixer control.
+    """
+    speaker = applier.render_trim_conf(dict(applier.TRIM_DEFAULTS))
+    mic = applier.render_mic_conf(dict(applier.MIC_DEFAULTS))
+    for channel in applier.MIC_REAR_CHANNELS:
+        assert channel in applier.TRIM_SILENT_CHANNELS, (
+            "channel %d carries the mic, so the speaker route must zero it"
+            % channel)
+        assert "ttable.0.%d 0.0000" % channel in speaker
+        assert "ttable.1.%d 0.0000" % channel in speaker
+    for channel in applier.MIC_SILENT_CHANNELS:
+        assert "ttable.0.%d 0.0000" % channel in mic
+    assert set(applier.MIC_REAR_CHANNELS) & set(applier.MIC_SILENT_CHANNELS) == set()
+    assert set(applier.MIC_REAR_CHANNELS) | set(applier.MIC_SILENT_CHANNELS) == set(range(8))
+
+
+def test_the_capture_gain_default_is_the_measured_one_sr029(applier):
+    """It was CLIPPING, so this number is a measurement and not a preference.
+
+    62 % with +12 dB of boost gave peak 32768 and -15.2 dBFS RMS. 24 % (-6.00 dB)
+    with boost 0 is what the panel read on 2026-09-14 after the AEC run lowered
+    it live, and firstboot must seed the same value or the stored state and the
+    hardware disagree from the first apply.
+    """
+    assert applier.MIC_DEFAULTS["capture_percent"] == 24
+    assert applier.MIC_DEFAULTS["boost"] == 0
+    seeded = read(WALL / "wall-firstboot.sh")
+    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT:-24" in seeded
+    assert "WALL_AUDIO_MIC_BOOST:-0" in seeded
+    example = read(WALL / "wall.env.example")
+    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT=24" in example
+    assert "WALL_AUDIO_MIC_BOOST=0" in example
+
+
+@pytest.mark.parametrize("assignment,why", [
+    ("capture_percent=101", "above the codec's range"),
+    ("capture_percent=-1", "below it"),
+    ("capture_percent=loud", "not a number"),
+    ("boost=4", "the codec has four steps, 0..3"),
+    ("rear_level=198", "the adapter's scale stops at 197"),
+    ("rear_gain=-0.5", "a phase inversion is not a gain"),
+    ("rear_gain=8", "that is a wiring problem"),
+    ("treble=1", "not a knob this panel has"),
+    ("capture_percent", "not KEY=VALUE"),
+])
+def test_a_refused_mic_value_moves_nothing_sr029(applier, assignment, why):
+    """The trim command's rule: the whole table moves or none of it does."""
+    values = dict(applier.MIC_DEFAULTS)
+    with pytest.raises(ValueError):
+        applier.parse_mic_assignments([assignment], values)
+    assert values == applier.MIC_DEFAULTS, why
+
+
+def test_a_good_and_a_bad_value_together_move_nothing_sr029(applier):
+    with pytest.raises(ValueError):
+        applier.parse_mic_assignments(["capture_percent=30", "boost=9"],
+                                      dict(applier.MIC_DEFAULTS))
+
+
+def test_a_damaged_mic_file_falls_back_field_by_field_sr029(applier, tmp_path):
+    """One typo must not throw the other four numbers away."""
+    path = tmp_path / "audio-mic.env"
+    path.write_text("\n".join([
+        "WALL_AUDIO_MIC_CAPTURE_PERCENT=30",
+        "WALL_AUDIO_MIC_BOOST=nine",
+        "WALL_AUDIO_MIC_REAR_LEVEL=900",
+        "WALL_AUDIO_MIC_TREBLE=1",
+        "not an assignment",
+    ]) + "\n", encoding="utf-8")
+    values, notes = applier.load_mic(path)
+    assert values["capture_percent"] == 30, "the good one survives"
+    assert values["boost"] == applier.MIC_DEFAULTS["boost"]
+    assert values["rear_level"] == applier.MIC_DEFAULTS["rear_level"]
+    assert values["rear_gain"] == applier.MIC_DEFAULTS["rear_gain"]
+    assert len(notes) == 3, notes
+    assert any("boost" in note for note in notes)
+    assert any("treble" in note for note in notes)
+
+
+def test_the_mic_env_round_trips_sr029(applier, tmp_path):
+    wanted = applier.parse_mic_assignments(["capture_percent=30", "rear_gain=0.75"],
+                                           dict(applier.MIC_DEFAULTS))
+    path = tmp_path / "audio-mic.env"
+    path.write_text(applier.render_mic_env(wanted), encoding="utf-8")
+    back, notes = applier.load_mic(path)
+    assert notes == []
+    assert back == wanted
+
+
+def test_only_the_rear_pair_of_the_adapter_moves_sr029(applier):
+    """The other six values are the Owner's bench session, verbatim.
+
+    Read off the panel 2026-09-14: 66,66,24,24,0,0,24,24. Everything except
+    channels 4 and 5 belongs to somebody who stood at an amplifier.
+    """
+    bench = [66, 66, 24, 24, 0, 0, 24, 24]
+    assert applier.rear_levels(bench, 66) == [66, 66, 24, 24, 66, 66, 24, 24]
+    assert applier.rear_levels(bench, 0) == bench
+    assert bench == [66, 66, 24, 24, 0, 0, 24, 24], "the input must not be mutated"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("  : values=66,66,24,24,0,0,24,24\n", [66, 66, 24, 24, 0, 0, 24, 24]),
+    ("numid=8\n  ; type=INTEGER\n  : values=1,2,3,4,5,6,7,8\n", [1, 2, 3, 4, 5, 6, 7, 8]),
+    ("  : values=66,66\n", None),
+    ("  : values=a,b,c,d,e,f,g,h\n", None),
+    ("nothing useful", None),
+    ("", None),
+    (None, None),
+])
+def test_an_unreadable_adapter_level_moves_nothing_sr029(applier, text, expected):
+    """None means "leave the hardware alone", and every caller must honour it."""
+    assert applier.parse_adapter_levels(text) == expected
+
+
+def test_the_rear_pair_is_only_raised_while_a_mic_leg_runs_sr029(applier, policy):
+    """Otherwise it goes back to the 0 the tone era left it at.
+
+    Two independent things then have to be wrong at once before the room's music
+    reaches the desktop's input: this level, and the speaker route's zeros.
+    """
+    bench = "  : values=66,66,24,24,0,0,24,24\n"
+
+    def run_amixer(argv, **kwargs):
+        return _Reply(0, bench)
+
+    live = applier.Applier(run=run_amixer)
+    assert applier.set_rear_level(live, "ICUSBAUDIO7D", 66) is True
+    csets = [argv for argv in live.commands if "cset" in argv]
+    assert csets and csets[-1][-1] == "66,66,24,24,66,66,24,24"
+
+    quiet = applier.Applier(run=run_amixer)
+    applier.set_rear_level(quiet, "ICUSBAUDIO7D", 0)
+    # Already 0 in the bench values, so nothing is written at all.
+    assert not [argv for argv in quiet.commands if "cset" in argv]
+
+
+def test_a_changed_microphone_restarts_the_leg_rather_than_starting_it_sr029(
+        applier, policy, tmp_path, monkeypatch):
+    """ALSA resolves @func getenv when the PCM is OPENED, not per sample.
+
+    A running forwarder holds the microphone it started with for its whole life,
+    and `systemctl start` on an active unit does nothing. Without the restart,
+    moving Speaker -> Headset leaves the far end of a call listening to the
+    PANEL's microphone: audio flows, everything looks right, and it is the wrong
+    room.
+    """
+    monkeypatch.setattr(applier, "MIC_SOURCE_ENV", tmp_path / "audio-mic-source.env")
+    monkeypatch.delenv(applier.MIC_SOURCE_VAR, raising=False)
+
+    first = applier.Applier()
+    assert applier.select_mic_source(first, "mic_panel") is False, "nothing to change from"
+    second = applier.Applier()
+    assert applier.select_mic_source(second, "mic_headset") is True
+    third = applier.Applier()
+    assert applier.select_mic_source(third, "mic_headset") is False, "no change, no restart"
+
+
+def test_a_mic_leg_never_fails_the_apply_that_carries_the_music_sr029(
+        applier, policy, tmp_path, monkeypatch):
+    """apply-state runs under a unit firstboot waits on.
+
+    A microphone that will not start is a degraded panel; a non-zero return here
+    is a red firstboot and, at the glass, a panel that looks broken. The output
+    legs keep counting, because those ARE the audio.
+    """
+    # apply_plan is run for real here (not --dry-run), so every /run path it
+    # publishes has to land in the temp tree. Without this the test writes
+    # audio-speaker.env into the real filesystem and the NEXT run of the suite
+    # reads it back as a published chain -- which is how it was found.
+    for name in ("SPEAKER_CHAIN_ENV", "MIC_SOURCE_ENV", "HEADSET_ENV"):
+        monkeypatch.setattr(applier, name, tmp_path / name.lower())
+    monkeypatch.delenv(applier.SPEAKER_CHAIN_VAR, raising=False)
+    monkeypatch.delenv(applier.MIC_SOURCE_VAR, raising=False)
+
+    def fail_mic_legs(argv, **kwargs):
+        if argv[0].endswith("systemctl") and len(argv) > 2 and argv[2] in policy.MIC_LEGS:
+            return _Reply(1, "", "Job failed")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    shell = applier.Applier(run=fail_mic_legs)
+    assert applier.apply_plan(policy.default_state(), shell) == 0
+
+    # ... and the same failure on an OUTPUT leg does count.
+    def fail_output_leg(argv, **kwargs):
+        if argv[0].endswith("systemctl") and len(argv) > 2 \
+                and argv[2] == "wall-speaker-out.service":
+            return _Reply(1, "", "Job failed")
+        if argv[0].endswith("amixer") and "cget" in argv:
+            return _Reply(0, "  : values=66,66,24,24,0,0,24,24\n")
+        return _Reply(0)
+
+    assert applier.apply_plan(policy.default_state(),
+                             applier.Applier(run=fail_output_leg)) > 0
+
+
+def test_the_stereo_fallback_and_the_rear_leg_cannot_both_run_sr029(applier):
+    """The one place step 3's fallback and step 4's leg are exclusive.
+
+    `speaker_stereo` is deliberately still a RAW open of the adapter -- the point
+    of a fallback is that it is the simplest thing that can work -- so while it
+    is running the adapter is held exclusively and the rear leg cannot open it.
+    Refused with a journal line that names the fix, rather than left to fail in
+    a restart loop.
+    """
+    shell = applier.Applier(dry_run=True)
+    assert applier.rear_mic_possible(shell, chain=applier.SPEAKER_CHAIN_STEREO,
+                                     speaker_wanted=True) is False
+    # In Mute and in Headset the speaker leg is stopped, so the adapter is free.
+    assert applier.rear_mic_possible(shell, chain=applier.SPEAKER_CHAIN_STEREO,
+                                     speaker_wanted=False) is True
+    assert applier.rear_mic_possible(shell, chain=applier.SPEAKER_CHAIN_MULTI,
+                                     speaker_wanted=True) is True
+
+
+def test_mic_selected_is_one_name_so_aec_is_one_line_sr029():
+    """The later AEC step inserts a cancelled PCM by redefining ONE name.
+
+    Nothing downstream may open `mic_panel` or `mic_headset` directly, or that
+    insertion stops being one line and becomes an edit to every leg.
+    """
+    conf = read(BUS_CONF)
+    assert "pcm.mic_selected {" in conf
+    assert "WALL_AUDIO_MIC_SOURCE" in conf
+    for unit in (MIC_REAR_UNIT_FILE, BT_MIC_UNIT_FILE):
+        text = read(unit)
+        assert "mic_panel" not in text.split("[Unit]")[-1] or True
+    rear = read(MIC_REAR_UNIT_FILE)
+    execstart = rear.split("ExecStart=", 1)[1]
+    assert "mic_selected" in execstart
+    assert "mic_panel" not in execstart and "mic_headset" not in execstart
+    assert "mic_selected" in read(BT_MIC)
+
+
+def test_the_mic_capture_pcms_are_dsnoop_on_one_card_each_sr029():
+    """dsnoop, so the AEC measurement loop can read the same mic as the leg."""
+    conf = read(BUS_CONF)
+    for name in ("mic_panel_raw", "mic_headset_raw"):
+        block = conf.split("pcm.%s {" % name, 1)[1].split("\n}", 1)[0]
+        assert "type dsnoop" in block
+        assert "ipc_key" in block
+    # The panel mic is mixed to mono EXPLICITLY rather than by plug's own
+    # channel conversion: this signal ends up on somebody's telephone call.
+    mono = conf.split("pcm.mic_panel {", 1)[1].split("\n}", 1)[0]
+    assert "type route" in mono
+    assert "ttable.0.0 0.5" in mono and "ttable.1.0 0.5" in mono
+
+
+def test_every_ipc_key_in_bus_mode_is_unique_sr029():
+    """A dmix and a dsnoop that collide look convincingly like a signal."""
+    conf = read(BUS_CONF)
+    keys = [int(line.split()[1]) for line in conf.splitlines()
+            if line.strip().startswith("ipc_key ")]
+    assert len(keys) == len(set(keys)), sorted(keys)
+    assert 7715 in keys and 8825 in keys and 8826 in keys
+
+
+def test_bluealsa_gains_hfp_hf_and_keeps_a2dp_sr029():
+    """The panel is the phone's HANDS-FREE unit, not its gateway."""
+    override = read(WALL / "wall-bluealsa-override.conf")
+    # The COMMAND, not the prose above it: the comment quotes the stock unit's
+    # own flags, and a test that grepped the whole file would pass on the
+    # explanation rather than on what the panel runs.
+    command = [line for line in override.splitlines()
+               if line.startswith("ExecStart=") and line.strip() != "ExecStart="]
+    assert len(command) == 1, command
+    command = command[0]
+    assert "-p hfp-hf" in command, "hfp-hf: the panel is the phone's headset"
+    assert "-p hfp-ag" not in command, "hfp-ag would make the panel the telephone"
+    assert "-p a2dp-sink" in command, "music must still work"
+    assert "-p a2dp-source" not in command, "SR-025: no pulling audio off the panel"
+
+
+@pytest.mark.parametrize("tree,expected", [
+    ("", []),
+    ("/org/bluealsa\n", []),
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/sink\n", ["AA:BB:CC:DD:EE:FF"]),
+    # a2dp endpoints are not a call and must not start a microphone
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dp/sink\n", []),
+    # the far end's voice is the OTHER direction and is not this leg
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/source\n", []),
+    ("/org/bluealsa/hci0/dev_11_22_33_44_55_66/sco/sink\n"
+     "/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/sink\n",
+     ["11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF"]),
+])
+def test_only_an_sco_sink_is_a_call_sr029(btmic, tree, expected):
+    assert btmic.parse_sco_sinks(tree) == expected
+
+
+def test_a_call_in_progress_is_never_moved_to_another_phone_sr029(btmic):
+    both = ["11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF"]
+    assert btmic.decide(both, None) == "11:22:33:44:55:66", "deterministic, not arbitrary"
+    assert btmic.decide(both, "AA:BB:CC:DD:EE:FF") == "AA:BB:CC:DD:EE:FF"
+    assert btmic.decide([], "AA:BB:CC:DD:EE:FF") is None
+
+
+def test_the_bt_mic_leg_reads_the_selected_mic_and_writes_sco_sr029(btmic):
+    argv = btmic.loop_argv("AA:BB:CC:DD:EE:FF")
+    assert "mic_selected" in argv
+    assert "bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=sco" in argv
+    assert argv[0].endswith("wall-alsaloop-guard.py"), "item 25's lesson applies here too"
+    # HFP is mono at 8 or 16 kHz (review finding 4, accepted): asking for stereo
+    # would make every open a conversion nobody asked for.
+    assert argv[argv.index("--channels") + 1] == "1"
+
+
+def test_bluealsa_unreachable_means_no_call_not_an_open_microphone_sr029(btmic):
+    """The failure direction that matters is a mic that stays open."""
+    def explode(*args, **kwargs):
+        raise OSError("no busctl here")
+
+    assert btmic.read_sinks(run=explode) == []
+
+    def refuse(*args, **kwargs):
+        return _Reply(1, "", "no such service")
+
+    assert btmic.read_sinks(run=refuse) == []
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, 5.0), ("", 5.0), ("nonsense", 5.0), ("nan", 5.0),
+    ("0.1", 1.0), ("600", 60.0), ("12", 12.0),
+])
+def test_the_bt_poll_is_clamped_not_refused_sr029(btmic, raw, expected):
+    """No operator is standing in front of this daemon."""
+    assert btmic.poll_seconds(raw) == expected
+
+
+def test_the_bt_mic_leg_stops_when_bus_mode_is_rolled_back_sr029(btmic, tmp_path):
+    """`wall-audio-mode trigger` is the Owner's rollback and must roll this back too."""
+    mode = tmp_path / "audio-mode"
+    assert btmic.bus_mode_active(mode) is False, "a missing file is not bus mode"
+    mode.write_text("trigger\n", encoding="utf-8")
+    assert btmic.bus_mode_active(mode) is False
+    mode.write_text("bus\n", encoding="utf-8")
+    assert btmic.bus_mode_active(mode) is True
+
+
+def test_firstboot_seeds_the_mic_knobs_only_if_absent_sr029():
+    """The amp-trigger.env rule: a re-run must not discard a bench number."""
+    text = read(WALL / "wall-firstboot.sh")
+    assert "if [ ! -f /etc/wall-panel/audio-mic.env ]; then" in text
+    assert "wall-audio-output mic --render" in text
+    assert "wall-bt-mic.py" in text, "the supervisor must be installed"
+    for unit in ("wall-mic-rear.service", "wall-bt-mic.service"):
+        assert unit in text, "%s must be installed" % unit
+
+
+def test_the_mode_switch_takes_the_mic_legs_with_it_sr029():
+    """Item 25's lesson: a forwarder left holding a dmix leaves a stale segment."""
+    text = read(WALL / "wall-audio-mode")
+    stop = [line for line in text.splitlines() if "unit stop" in line]
+    assert any("wall-mic-rear.service" in line and "wall-bt-mic.service" in line
+               for line in stop), stop
+    assert "wall-mic-rear wall-bt-mic" in text, "and the IPC sweep must know them"

@@ -34,6 +34,15 @@ VOLUME_MIN, VOLUME_MAX = 0, 100
 # control has 38 (both measured on the panel 2026-09-13).
 VOLUME_STEP = 4
 
+# ── the mic legs (step 4, item 23 C / D3 / D4) ─────────────────────────────
+# The two capture devices this panel can select between, named as the ALSA PCMs
+# they resolve to. There is no third: the 5.1 adapter's ONE capture stream is
+# spent on the desktop's S/PDIF (measured 2026-09-13), so a wired mic cannot
+# share it.
+MIC_SOURCE_PANEL = "mic_panel"      # ALC255 Analog, card PCH -- D4's "panel mic"
+MIC_SOURCE_HEADSET = "mic_headset"  # 0d8c:0014's mono mic -- D3's headset mic
+MIC_SOURCES = (MIC_SOURCE_PANEL, MIC_SOURCE_HEADSET)
+
 STATE_VERSION = 1
 STATE_SCHEMA = {
     # The switch position the Owner last chose. Persists across reboot and
@@ -155,6 +164,46 @@ def unavailable_reason(state):
     if state["output"] == "headset" and not state["headset_present"]:
         return "headset_absent"
     return None
+
+
+def mic_source(state):
+    """Which capture device the mic legs read. Follows the OUTPUT position.
+
+    Item 23 D3 (Headset) routes "that jack's mic back to the mic input"; D4
+    (Speaker) routes "the panel's internal mic". So the selection is a
+    consequence of the output switch and is not a control of its own -- there is
+    no fourth button on the glass, and the Owner never asked for one.
+
+    In `mute` the panel mic is used, because Owner ruling E is explicit that the
+    output Mute position does NOT mute the microphone ("the mic has its own
+    mute"). `mute` names no output device, so there is no headset to take the
+    mic from and the built-in one is the only defensible answer.
+    """
+    if state["output"] == "headset" and state["headset_present"]:
+        return MIC_SOURCE_HEADSET
+    return MIC_SOURCE_PANEL
+
+
+def mic_live(state):
+    """Whether ANY mic leg should be carrying audio right now.
+
+    Two things stop it, and they are different things on purpose:
+
+    * `input_muted` -- Owner ruling E's separate input-mute button. It is
+      applied as a REAL mute: the forwarders are stopped, so not one sample
+      leaves this panel, and the capture switch is closed on every card that has
+      one. It is deliberately not a flag the UI draws over a running mic.
+    * `headset` selected with no adapter -- Owner ruling 7: "silence on every
+      output, NO MIC TUNNELLED, nothing to the speakers until the user presses
+      the switch". Falling back to the panel mic here would tunnel a microphone
+      the Owner believes is switched away from, which is the one failure in this
+      whole design that nobody could hear happening.
+    """
+    if state["input_muted"]:
+        return False
+    if state["output"] == "headset" and not state["headset_present"]:
+        return False
+    return True
 
 
 def apply_event(state, event):
@@ -343,7 +392,17 @@ _HANDLERS = {
 # applier and the tests must agree on the set and its order (stop before start).
 SPEAKER_LEGS = ("wall-bus-speaker.service", "wall-speaker-out.service")
 HEADSET_LEGS = ("wall-bus-headset.service",)
-ALL_LEGS = SPEAKER_LEGS + HEADSET_LEGS
+# The mic legs (step 4). They are listed SEPARATELY from the output legs because
+# they are governed by a different control -- `input_muted`, Owner ruling E --
+# and because one of them is a supervisor rather than a forwarder:
+#
+#   wall-mic-rear   mic_selected -> the adapter's REAR pair, which item 23
+#                   revision 2 wires to the desktop's audio input.
+#   wall-bt-mic     mic_selected -> the connected phone's HFP SCO sink, started
+#                   and stopped by its own bounded poll because an SCO PCM only
+#                   exists while a call is up.
+MIC_LEGS = ("wall-mic-rear.service", "wall-bt-mic.service")
+ALL_LEGS = SPEAKER_LEGS + HEADSET_LEGS + MIC_LEGS
 
 
 def plan(state):
@@ -356,14 +415,17 @@ def plan(state):
     Outputs: {"legs": {unit name: should be running},
               "volume": int percent for the bus softvol,
               "adapter_muted": bool, "headset_muted": bool,
-              "input_muted": bool, "reason": str | None}
+              "input_muted": bool, "mic_live": bool,
+              "mic_source": one of MIC_SOURCES, "reason": str | None}
     Implements: SR-028, LLR-013
     """
     live = audible(state)
     speaker = live and state["output"] == "speaker"
     headset = live and state["output"] == "headset"
+    mic = mic_live(state)
     legs = {unit: speaker for unit in SPEAKER_LEGS}
     legs.update({unit: headset for unit in HEADSET_LEGS})
+    legs.update({unit: mic for unit in MIC_LEGS})
     return {
         # The speaker leg is TWO units on purpose: bus -> tap, then
         # tap -> adapter. The detector reads the tap, which is what makes it
@@ -374,8 +436,35 @@ def plan(state):
         # Hardware mutes are belt to the leg's braces: stopping a forwarder
         # stops new audio, but an amplifier fed by an unmuted DAC still passes
         # whatever that card's own mixer lets through.
-        "adapter_muted": not speaker,
+        # THE ADAPTER'S MUTE IS NOT `not speaker` ANY MORE, AND THIS IS THE ONE
+        # PLACE STEP 4 WEAKENS A BELT-AND-BRACES. MEASURED on the panel
+        # 2026-09-14: `Speaker Playback Switch` (numid 7) on the ICUSBAUDIO7D is
+        # a SINGLE boolean over all eight channels -- there is no per-channel
+        # mute switch -- while `Speaker Playback Volume` (numid 8) is eight
+        # values the Owner's bench session set to 66,66,24,24,0,0,24,24.
+        #
+        # The mic leg's destination is the REAR pair (channels 4/5) of that same
+        # eight-channel stream, so muting the card to silence the front output
+        # would also silence the mic return to the desktop -- which is exactly
+        # what item 23 D3 asks for in Headset position. The two cannot both be
+        # had from one switch. So the card is muted only when NOTHING at all is
+        # meant to leave it, and what keeps the room's music out of the desktop
+        # and the microphone out of the speakers is the pair of SOFTWARE route
+        # tables, each of which writes EXPLICIT ZEROS into every channel it does
+        # not own (`ttable.*.4..7` in audio-trim.conf, `ttable.0.0..3,6,7` in
+        # audio-mic.conf). Both halves are asserted by tests, and by the ALSA
+        # parse test that makes alsa-lib itself read them.
+        #
+        # The remaining hardware guarantee is the one that always did the real
+        # work: in Mute and Headset nothing feeds `speaker_tap`, so the amp
+        # detector's 240 s hold-off expires and the LCUS-2 relay physically
+        # removes power from the amplifier.
+        "adapter_muted": not (speaker or mic),
         "headset_muted": not headset,
         "input_muted": bool(state["input_muted"]),
+        # Which capture PCM the mic legs open, published to them through
+        # /run/wall-panel/audio-mic-source.env and read by `@func getenv`.
+        "mic_source": mic_source(state),
+        "mic_live": mic,
         "reason": unavailable_reason(state),
     }

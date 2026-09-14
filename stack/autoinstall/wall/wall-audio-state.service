@@ -5,21 +5,21 @@
 # into running units and mixer settings, at the two moments when nothing else
 # will: after a boot, and after a resume.
 #
-# ONE UNIT FOR BOTH because it is the same command and the same failure mode. A
-# unit ordered After= a sleep target and wanted by it is started when that
-# target STOPS, which is the documented way to say "on resume". At boot the
-# sleep ordering is simply inert.
+# THE RESUME HALF IS A SECOND UNIT (wall-audio-resume.service), not this one.
+# This unit is RemainAfterExit=yes, so it stays active for the life of the boot;
+# wanting it from a sleep target would "start" an already-active unit and run
+# nothing -- a silent no-op with a green status above it. See that unit for the
+# ordering that actually fires on resume.
 #
 # It never invents a state: `apply-state` applies what is stored and nothing
 # else. A panel that was left on Mute comes back on Mute, silently and
 # deliberately.
 
 [Unit]
-Description=Wall panel: re-assert the stored audio switch position
+Description=Wall panel: apply the stored audio switch position at boot
 Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=sound.target systemd-modules-load.service
 Wants=sound.target
-After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 
 [Service]
 Type=oneshot
@@ -30,4 +30,4 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+WantedBy=multi-user.target

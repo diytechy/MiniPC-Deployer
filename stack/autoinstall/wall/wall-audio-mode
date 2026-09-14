@@ -144,7 +144,7 @@ apply_bus() {
     # kiosk_monitor this graph does not define.
     unit disable wall-kiosk-loop.service
     unit enable wall-spdif-in.service wall-amp-trigger.service \
-        wall-audio-state.service wall-audio-apply.path
+        wall-audio-state.service wall-audio-resume.service wall-audio-apply.path
     # The legs are NEVER enabled: wall-audio-output starts exactly the one the
     # stored switch position calls for.
     unit disable wall-bus-speaker.service wall-speaker-out.service \

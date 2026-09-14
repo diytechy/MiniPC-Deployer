@@ -252,26 +252,40 @@ def test_the_applier_runs_no_leg_when_the_headset_is_absent_sr028(applier, polic
     assert mutes and all("mute" in argv for argv in mutes)
 
 
-def test_the_headset_card_is_resolved_by_usb_id_not_by_name_sr028(applier, tmp_path):
-    """The adapter enumerates as the generic id "Device"; the USB id is the fact.
+def fake_proc_asound(root, cards):
+    """A /proc/asound as the panel really has one (read back over ssh 2026-09-13).
 
-    Built as the panel's /proc/asound looks: card directories with a usbid file,
-    and an id-named symlink pointing at each.
+    Each card is a directory with `usbid` and `id`; the id-named symlinks the
+    real procfs also carries are deliberately NOT built, because the code must
+    not depend on them.
     """
-    proc = tmp_path / "asound"
-    for index, usbid in ((1, "0d8c:0014"), (3, "0d8c:0102")):
-        card = proc / ("card%d" % index)
+    for index, usbid, card_id in cards:
+        card = root / ("card%d" % index)
         card.mkdir(parents=True)
         (card / "usbid").write_text(usbid + "\n", encoding="utf-8")
-    (proc / "Headset").symlink_to(proc / "card1", target_is_directory=True)
-    (proc / "ICUSBAUDIO7D").symlink_to(proc / "card3", target_is_directory=True)
-    assert applier.headset_card(proc) == "Headset"
+        (card / "id").write_text(card_id + "\n", encoding="utf-8")
+    return root
+
+
+def test_the_headset_card_is_resolved_by_usb_id_not_by_name_sr028(applier, tmp_path):
+    """The adapter enumerates as the generic id "Device"; the USB id is the fact."""
+    proc = fake_proc_asound(tmp_path / "asound",
+                            [(1, "0d8c:0014", "Device"), (3, "0d8c:0102", "ICUSBAUDIO7D")])
+    assert applier.headset_card(proc) == "Device"
+    # A second nameless adapter shifts the id; the USB id still finds it.
+    other = fake_proc_asound(tmp_path / "asound2",
+                             [(1, "0d8c:0099", "Device"), (2, "0d8c:0014", "Device_1")])
+    assert applier.headset_card(other) == "Device_1"
+
+
+def test_a_card_id_that_cannot_be_used_is_refused_not_passed_on_sr028(applier, tmp_path):
+    """An id with whitespace would be unquotable in the EnvironmentFile."""
+    proc = fake_proc_asound(tmp_path / "asound", [(1, "0d8c:0014", "USB Audio")])
+    assert applier.headset_card(proc) is None
 
 
 def test_no_headset_adapter_resolves_to_nothing_sr028(applier, tmp_path):
-    proc = tmp_path / "asound"
-    (proc / "card3").mkdir(parents=True)
-    (proc / "card3" / "usbid").write_text("0d8c:0102\n", encoding="utf-8")
+    proc = fake_proc_asound(tmp_path / "asound", [(3, "0d8c:0102", "ICUSBAUDIO7D")])
     assert applier.headset_card(proc) is None
 
 
@@ -435,9 +449,90 @@ def test_a_leg_is_never_enabled_sr028(unit):
 
 
 def test_the_switch_survives_reboot_and_resume_ruling_g_sr028():
-    unit = read(WALL / "wall-audio-state.service")
-    assert "apply-state" in unit
-    assert "After=suspend.target" in unit and "WantedBy=multi-user.target suspend.target" in unit
+    """Two units, because one cannot do both.
+
+    The boot unit is RemainAfterExit=yes and therefore stays active for the life
+    of the boot; wanting THAT from a sleep target would start an already-active
+    unit and run nothing -- a silent no-op with a green status above it.
+    """
+    boot = read(WALL / "wall-audio-state.service")
+    resume = read(WALL / "wall-audio-resume.service")
+    assert "apply-state" in boot and "apply-state" in resume
+    assert "RemainAfterExit=yes" in boot
+    resume_service = resume.split("[Service]")[1].split("[Install]")[0]
+    assert "RemainAfterExit" not in resume_service, "every resume must run it again"
+    assert boot.split("[Install]")[1].strip() == "WantedBy=multi-user.target"
+    install = resume.split("[Install]")[1]
+    for target in ("suspend.target", "hibernate.target", "hybrid-sleep.target",
+                   "suspend-then-hibernate.target"):
+        assert target in install and target in resume.split("[Service]")[0]
+
+
+def test_the_level_is_retried_until_the_control_exists_sr028(applier, policy):
+    """softvol creates its control on first open, and `systemctl start` does not wait.
+
+    Setting the level once, immediately, would leave a freshly started leg at the
+    plugin default -- which is full scale, the loudest possible way to be wrong.
+    """
+    class Reply:
+        """What subprocess.run returns; amixer answers this until the PCM opens."""
+
+        def __init__(self, returncode):
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = "amixer: Unable to find simple control 'Bus',0"
+
+    def amixer_that_succeeds_on(attempt_number, counter):
+        def run(argv, **kwargs):
+            counter.append(argv)
+            return Reply(0 if len(counter) >= attempt_number else 1)
+        return run
+
+    calls = []
+    shell = applier.Applier(run=amixer_that_succeeds_on(5, calls))
+    assert applier.set_bus_level(shell, "Loopback", 60, sleep=lambda _: None) is True
+    assert len(calls) == 5, "it must keep looking while a leg is starting"
+
+    calls = []
+    shell = applier.Applier(run=amixer_that_succeeds_on(999, calls))
+    assert applier.set_bus_level(shell, "Loopback", 60, sleep=lambda _: None) is False
+    assert len(calls) == applier.BUS_CONTROL_ATTEMPTS, "and give up, bounded"
+
+    # With no leg running the control legitimately does not exist: one attempt.
+    calls = []
+    shell = applier.Applier(run=amixer_that_succeeds_on(999, calls))
+    assert applier.set_bus_level(shell, "Loopback", 0, expected=False,
+                                 sleep=lambda _: None) is True
+    assert len(calls) == 1
+
+
+def test_a_repaired_state_file_says_what_it_replaced_sr028(applier, tmp_path):
+    """The check must compare the LOADED document with the normalized one.
+
+    Comparing the normalized state with itself is equal by construction, which
+    is how a partial file gets silently corrected to speaker at whatever level
+    the defaults carry -- with nothing in the journal to find afterwards.
+    """
+    state_file = tmp_path / "audio-state.json"
+    state_file.write_text(json.dumps({"output": "banana", "input_muted": "yes"}),
+                          encoding="utf-8")
+    state, note = applier.load_state(state_file)
+    assert state["output"] == "speaker"
+    assert note and "output" in note and "input_muted" in note
+    # A state the applier itself wrote is not "repaired" on the way back in.
+    applier.save_state(state, state_file)
+    assert applier.load_state(state_file)[1] is None
+
+
+def test_one_apply_at_a_time_sr028(applier):
+    """Four callers, one graph: udev, the rocker, a broker request, boot/resume."""
+    source = read(APPLIER)
+    assert "def apply_lock(" in source
+    assert "with apply_lock(" in source
+    assert "LOCK_EX" in source
+    # The lock must wrap the whole read-decide-write-apply, not just the write.
+    locked = source.split("with apply_lock(")[1]
+    assert "_locked_apply(arguments)" in locked
 
 
 def test_the_broker_reaches_root_through_one_watched_file_sr028():
@@ -491,6 +586,23 @@ def test_set_output_is_not_select_output_sr028():
     routing.validate_action("set_input_mute", {"muted": True})
     with pytest.raises(routing.PolicyError):
         routing.validate_action("set_input_mute", {"muted": "on"})
+
+
+def test_a_request_sequence_survives_a_broker_restart_sr028():
+    """A per-lifetime counter would be silently discarded after a restart.
+
+    The applier persists the high-water mark in the state file, so a producer
+    that starts again from zero would have every request below the previous
+    lifetime's last value thrown away, and the switch would simply stop
+    responding with no error anywhere.
+    """
+    request = import_panel_audio("switch_request")
+    # A wall clock, so a process that restarts still produces a larger number.
+    assert request.next_seq() > 0
+    assert request.next_seq(clock=lambda: 7) == 7
+    assert request.next_seq(clock=lambda: 8) > request.next_seq(clock=lambda: 7)
+    # And it is what the envelope accepts.
+    request.envelope(request.next_seq(), {"kind": "nudge_volume", "louder": True})
 
 
 def test_the_switch_request_carries_no_hardware_name_sr028(tmp_path):

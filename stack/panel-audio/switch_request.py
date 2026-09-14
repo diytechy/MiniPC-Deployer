@@ -20,8 +20,26 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import time
 
 DEFAULT_PATH = Path("/run/wall-audio-router/request.json")
+
+
+def next_seq(clock=time.time_ns):
+    """A sequence number that keeps increasing ACROSS A BROKER RESTART.
+
+    A counter starting from zero in each broker lifetime is wrong here and the
+    failure is silent: the applier persists the high-water mark in the state
+    file, so after a restart every request below the previous lifetime's last
+    value is discarded and the switch simply stops responding. The wall clock in
+    nanoseconds is monotonic enough for a deduplication key and needs no state
+    of its own.
+
+    The residual case -- a clock stepped backwards, by NTP or by a dead RTC --
+    is bounded and loud rather than silent: the applier journals each refusal,
+    and the next request after the step forward is accepted.
+    """
+    return int(clock())
 
 # The events the applier accepts from a request. `headset` is deliberately NOT
 # among them: adapter presence is the kernel's fact, reported by udev, and a
@@ -38,10 +56,10 @@ def envelope(seq, event):
     """Build the request envelope, or refuse it.
 
     Contract:
-      Inputs:  seq: int >= 0, strictly increasing per broker lifetime. The
-                    applier deduplicates on it, because systemd.path fires on
-                    every close-write and a replayed rocker press would walk the
-                    room's volume down on its own.
+      Inputs:  seq: int >= 0, strictly increasing ACROSS broker restarts --
+                    use next_seq(). The applier deduplicates on it, because
+                    systemd.path fires on every close-write and a replayed
+                    rocker press would walk the room's volume down on its own.
                event: {"kind": one of REQUEST_KINDS, plus that kind's key}
       Outputs: dict ready for json.dumps
       Raises:  RequestError on an unknown kind, a bad seq, or a stray key

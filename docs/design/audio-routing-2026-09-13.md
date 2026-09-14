@@ -134,6 +134,8 @@ write `/etc` nor talk to systemd, and this design does not change that.
 
 ```
 renderer ──IF-015──▶ broker (panel)  ──▶ /run/wall-audio-router/request.json
+                     (the backend that writes it is STEP 5; today the
+                      shipped backend refuses every mutation, by SR-023)
                                            │  (switch_request.py, atomic, seq'd)
                           wall-audio-apply.path (PathChanged)
                                            ▼
@@ -220,19 +222,69 @@ as "no change", never as zero. **Not implemented in the renderer here.**
    the Owner in the room. That is the entire reason `bus` is a third mode rather
    than a rewrite of `trigger`.
 
-## Deviations from the literal wording of a ruling
+## One question for the Owner, and one deviation
 
-* **Ruling F says the level is applied to the merged bus "before it reaches any
-  path".** It is applied at the *end of each leg* instead, as one softvol whose
-  control is declared once, named once, and lives on the always-present Loopback
-  card. Reason: a gain on the bus itself would sit **upstream of the detector's
-  tap**, so turning the music down would drop the amplifier out. Only one leg
-  ever runs, so there is still exactly one gain in the path and one control on
-  the glass. Intent kept, position moved 30 ms downstream.
-* **The rocker's `KEY_MUTE`** is inert in bus mode rather than mapping to the
+**OPEN — needs a word from the Owner before the merge gate.** Ruling F says the
+level is applied to the merged bus "before it reaches any path". It is applied at
+the *end of each leg* instead: one softvol, declared once, named once, living on
+the always-present Loopback card, and only ever one leg running. The reason is
+concrete — a gain on the bus itself sits **upstream of the detector's tap**, so
+turning the music down would walk the signal towards the amplifier's threshold
+and eventually switch the amplifier off underneath the listener. The alternatives
+are (a) this, (b) the gain on the bus with the detector's thresholds made
+volume-aware, which puts the volume back into the actuator that finding 2 just
+took it out of, or (c) two gains, which is two things to get out of step. The
+behaviour the Owner asked for — one control, everything moves, remembered per
+output — holds in all three; only the tap's reading differs. **Recommendation:
+keep (a); the Owner is asked to confirm at the glass test.** Raised as a finding
+rather than settled quietly, per the working agreement.
+**Deviation, not open:** the rocker's `KEY_MUTE` is inert in bus mode rather than mapping to the
   Mute position: a one-way mute from a key that cannot un-mute would strand the
   panel silent for anyone not standing at it. Step 5 gives the state a
   previous-output memory and the key a real toggle.
+
+## Things the first review caught, and where they landed
+
+The adversarial review (Codex `gpt-5.6-terra`, medium) is summarized here because
+four of its findings are now load-bearing comments in the code and one is a
+measurement worth keeping:
+
+* **The boot unit could not do the resume half.** `RemainAfterExit=yes` means it
+  stays active for the life of the boot, so wanting it from a sleep target
+  starts an already-active unit and runs *nothing* — ruling G quietly unmet with
+  a green status above it. Split into `wall-audio-state.service` (boot) and
+  `wall-audio-resume.service` (no `RemainAfterExit`, wanted by and ordered after
+  the four sleep targets).
+* **Four callers, one graph.** udev, the rocker, a broker request and the
+  boot/resume re-assert can all run the applier at once; atomic writes prevent a
+  torn file but not a lost update, and two applies can start and stop opposing
+  legs. The applier now holds an exclusive `flock` across the whole of load →
+  decide → save → apply. `status` is the one command that does not take it.
+* **The level could be set before the control existed.** `softvol` creates its
+  control when a client opens the PCM, and `systemctl start` on a `Type=simple`
+  forwarder returns at fork. Setting the level once would leave a freshly started
+  leg at the plugin default — full scale. Now retried for up to 2 s, quietly,
+  and journaled if the control never appears.
+* **A per-lifetime request counter would strand the switch.** The applier keeps
+  the high-water mark in `/etc`; a broker restarting at zero would have every
+  request silently discarded. `switch_request.next_seq()` is now a wall-clock
+  nanosecond stamp, and a refused sequence is journaled rather than dropped.
+* **The state-repair check was a tautology** (it compared a normalized state
+  with itself). It now compares the loaded document field by field and names
+  what it replaced.
+* **One finding was wrong, and the measurement is worth keeping.** The review
+  held that `/proc/asound` has no id-named symlinks. It does — read off the panel
+  tonight: `Device -> card1`, `ICUSBAUDIO7D -> card3`, `Loopback -> card2`,
+  `PCH -> card0`. The code was moved to `/proc/asound/cardN/id` anyway, which is
+  a plain read that cannot be confused by an id differing only by a suffix.
+* **Two things the review confirmed rather than faulted:** the new ipc_keys
+  (7713, 7714, 8822–8824) do not collide with trigger mode's, and the loopback
+  capture stalling when playback closes is already handled by the detector's
+  1 s staleness rule — so the OFF path still runs.
+* **Standing limitation, accepted:** the graph tests read configuration text.
+  They cannot prove ALSA parses the file or that audio is audible; that is what
+  the on-glass acceptance is for, and it is why the install sequence below ends
+  with three sources playing at once rather than with a green test run.
 
 ## What steps 3–6 still owe
 
@@ -250,7 +302,13 @@ as "no change", never as zero. **Not implemented in the renderer here.**
    second capture path; the 5.1 adapter's single capture stream is spent on
    S/PDIF. `input_muted` is already in the state and applied to the headset
    card's `Mic` capture switch; the rest of its meaning lands here.
-5. **Chrome (the triple switch + input mute).** Upper-left, above every view
+5. **Chrome (the triple switch + input mute) — and the broker backend that
+   actually calls `switch_request`.** Today nothing does: the shipped broker is
+   still `UnavailableBackend`, which refuses every mutation (SR-023, unchanged),
+   so `switch_request.py` is a *seam* with its validation and its tests, not a
+   live path. The working paths today are the `wall-audio-output` CLI, the udev
+   presence unit and the rocker. This is on the critical path for the chrome and
+   is called out so nobody reads the arrow in the diagram as already flowing. Upper-left, above every view
    including FULL and the attention takeover; per-output volume memory shown;
    red headset icon driven by `status.switch.available`. Also here: the
    `panel:audio-level` overlay (item 20), retiring `set_mute`, giving `KEY_MUTE`

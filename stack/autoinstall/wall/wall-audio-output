@@ -38,12 +38,19 @@ Implements: SR-028, LLR-014
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
+
+try:
+    import fcntl
+except ImportError:  # not Linux: the tests run on the dev box, the panel does not
+    fcntl = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wall_audio_state as policy  # noqa: E402  (path set above; installed side by side)
@@ -60,6 +67,14 @@ RUN_DIR = Path("/run/wall-panel")
 # ALSA configuration cannot look a card up by USB id.
 HEADSET_ENV = RUN_DIR / "audio-headset.env"
 DEFAULT_REQUEST = Path("/run/wall-audio-router/request.json")
+# One apply at a time. Four independent things call this script -- a udev
+# add/remove, the rocker, the path unit answering a broker request, and the
+# boot/resume re-assert -- and without a lock two of them interleave: the
+# read-modify-write of the state loses an update, and worse, one apply can
+# start a leg while another is stopping it, leaving the room fed by two
+# forwarders or by none. The lock is held across the WHOLE of load, decide,
+# save and apply, not just the write.
+LOCK_FILE = RUN_DIR / "audio-apply.lock"
 
 # Measured 2026-09-13: the headset adapter is 0d8c:0014 ("Device"), the 5.1
 # adapter 0d8c:0102 (ICUSBAUDIO7D). The USB id is matched rather than the card
@@ -102,11 +117,16 @@ def current_mode():
 def headset_card(proc_asound=PROC_ASOUND):
     """The ALSA card id of the headset adapter, or None if it is not plugged in.
 
-    /proc/asound/card*/usbid carries "0d8c:0014" for exactly this device; the
-    card id is the name of the symlink that points at that directory. This is
-    the only place the panel decides which card is the headset, and it is
-    recomputed on every apply -- a re-enumeration can change the index and, on
-    a panel with a second nameless adapter, even the id (Device, Device_1).
+    Two files per card, both measured on the panel 2026-09-13:
+    `/proc/asound/cardN/usbid` carries "0d8c:0014" for exactly this device, and
+    `/proc/asound/cardN/id` carries the id ALSA knows it by. The id file is read
+    rather than the sibling `/proc/asound/<id> -> cardN` symlink: both exist, but
+    only one of them is a plain read that cannot be confused by a second card
+    whose id differs only by a suffix.
+
+    This is the only place the panel decides which card is the headset, and it is
+    recomputed on every apply -- a re-enumeration can change the index and, on a
+    panel with a second nameless adapter, even the id (Device, Device_1).
     """
     try:
         entries = sorted(Path(proc_asound).glob("card*/usbid"))
@@ -116,15 +136,44 @@ def headset_card(proc_asound=PROC_ASOUND):
         try:
             if usbid.read_text(encoding="utf-8").strip().lower() != HEADSET_USB_ID:
                 continue
+            card = (usbid.parent / "id").read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        index = usbid.parent.name.replace("card", "")
-        for link in Path(proc_asound).iterdir():
-            # /proc/asound/<id> is a symlink to card<N>; resolve by target.
-            if link.is_symlink() and link.resolve().name == "card" + index:
-                return link.name
+        # An id with a space or a slash in it would be unquotable in the
+        # EnvironmentFile and unusable as an ALSA card name; refuse rather than
+        # hand alsaloop something that will fail obscurely.
+        if card and card == card.strip() and not set(card) & set(" \t\n\"'/"):
+            return card
+        log("headset adapter present but its card id %r is unusable" % card)
         return None
     return None
+
+
+@contextlib.contextmanager
+def apply_lock(path=None, dry_run=False):
+    """Serialize applies. Blocking, because every caller's work must still land.
+
+    A rocker press that gave up because a udev event held the lock would be a
+    volume change the Owner made and cannot see. The critical section is a
+    handful of subprocess calls, so waiting is bounded in practice.
+    """
+    if dry_run:
+        yield
+        return
+    if fcntl is None:
+        # Only reachable off Linux, where there is no panel to serialize against.
+        # The panel itself always has fcntl, so this is never the live path; it
+        # is here so the applier can be imported and driven by the dev box tests.
+        yield
+        return
+    path = Path(path or LOCK_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(handle)
 
 
 class Applier:
@@ -135,8 +184,15 @@ class Applier:
         self._run = run
         self.commands = []
 
-    def command(self, argv, required=True):
-        """Run one command. `required` False means a failure is logged, not fatal."""
+    def command(self, argv, required=True, quiet=False):
+        """Run one command; returns 0 on success, 1 on a failure that counts.
+
+        `required` False means a failure is logged rather than counted -- a card
+        that has just been unplugged has no controls to set, which is the normal
+        headset case and not an error. `quiet` suppresses the log line for an
+        attempt that is expected to fail and will be retried, so that a normal
+        start does not put twenty identical lines in the journal.
+        """
         self.commands.append(list(argv))
         if self.dry_run:
             print(" ".join(argv))
@@ -144,12 +200,14 @@ class Applier:
         try:
             done = self._run(argv, check=False, capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.SubprocessError) as exc:
-            log("FAILED: %s: %s" % (" ".join(argv), exc))
+            if not quiet:
+                log("FAILED: %s: %s" % (" ".join(argv), exc))
             return 1 if required else 0
         if done.returncode != 0:
             detail = (done.stderr or done.stdout or "").strip().splitlines()
-            log("%s: %s: %s" % ("FAILED" if required else "note",
-                                " ".join(argv), detail[0] if detail else "no detail"))
+            if not quiet:
+                log("%s: %s: %s" % ("FAILED" if required else "note",
+                                    " ".join(argv), detail[0] if detail else "no detail"))
             return 1 if required else 0
         return 0
 
@@ -190,8 +248,16 @@ def load_state(path=STATE_FILE):
     except (OSError, ValueError) as exc:
         return policy.default_state(), "state file unusable (%s); defaults applied" % exc
     state = policy.normalize(raw)
-    if state != policy.normalize(state):  # pragma: no cover - normalize is idempotent
-        return state, "state file normalized"
+    # What was ACTUALLY replaced, field by field: the loaded document against
+    # the normalized one. The previous spelling compared the normalized state
+    # with itself, which is equal by construction, so a partial or
+    # malformed-but-parseable file was silently corrected -- exactly the
+    # "reverted to speaker at full level with nothing in the journal" case this
+    # note exists to prevent.
+    replaced = sorted(key for key, value in state.items()
+                      if not isinstance(raw, dict) or raw.get(key) != value)
+    if replaced:
+        return state, "state file repaired: %s" % ", ".join(replaced)
     return state, None
 
 
@@ -208,6 +274,36 @@ def save_state(state, path=STATE_FILE, dry_run=False):
         print("write %s (suppressed: --dry-run on the live state file)" % path)
         return
     write_atomic(path, json.dumps(state, indent=2, sort_keys=True) + "\n", mode=0o644)
+
+
+# How long to wait for the softvol control to appear after a leg starts, and
+# how often to look. Sized from the forwarders' own start: alsaloop opens its
+# PCMs immediately, so this is a fraction of a second in the normal case and the
+# ceiling only matters on a panel that is already struggling.
+BUS_CONTROL_ATTEMPTS = 20
+BUS_CONTROL_INTERVAL_SECONDS = 0.1
+
+
+def set_bus_level(applier, card, level, expected=True, sleep=time.sleep):
+    """Set the bus softvol, retrying until the control exists. True if it took.
+
+    `expected` False means no leg is running (mute, or headset with no adapter),
+    so the control legitimately does not exist and one attempt is enough.
+    Implements: SR-028, LLR-014
+    """
+    attempts = BUS_CONTROL_ATTEMPTS if expected else 1
+    for attempt in range(attempts):
+        # required=True so that a missing control is REPORTED to this loop as a
+        # failure; the caller decides what it means, and never counts it as a
+        # failed apply -- the audio is playing either way, only the level is in
+        # question.
+        if applier.command(["/usr/bin/amixer", "-c", card, "-q", "sset",
+                            BUS_CONTROL, "%d%%" % level],
+                           quiet=attempt < attempts - 1) == 0:
+            return True
+        if attempt < attempts - 1:
+            sleep(BUS_CONTROL_INTERVAL_SECONDS)
+    return not expected
 
 
 def apply_plan(state, applier):
@@ -246,8 +342,19 @@ def apply_plan(state, applier):
     for unit, should_run in wanted["legs"].items():
         if should_run:
             failures += applier.command(["/usr/bin/systemctl", "start", unit])
-    applier.command(["/usr/bin/amixer", "-c", loopback, "-q", "sset", BUS_CONTROL,
-                     "%d%%" % wanted["volume"]], required=False)
+    # THE LEVEL IS SET LAST AND IT IS RETRIED. softvol creates its control when
+    # a client OPENS the PCM that declares it, and `systemctl start` on a
+    # Type=simple forwarder returns as soon as the process is forked -- not when
+    # alsaloop has opened anything. Setting the level once, immediately, would
+    # therefore leave a freshly started leg at the plugin default (full scale)
+    # rather than at the Owner's remembered level, which is the loudest possible
+    # way to get this wrong. An unanswered control after the whole window is a
+    # journal line, not a failed apply: the audio is playing, only the level is
+    # not what was asked for.
+    if not set_bus_level(applier, loopback, wanted["volume"],
+                         expected=any(wanted["legs"].values())):
+        log("bus level %d%% could not be applied: the control never appeared"
+            % wanted["volume"])
     if wanted["reason"]:
         log("output %s is UNAVAILABLE (%s): every output silent"
             % (state["output"], wanted["reason"]))
@@ -304,6 +411,10 @@ def read_request(path, last_seq=-1):
         log("request refused: seq must be a non-negative integer")
         return None
     if seq <= last_seq:
+        # Said out loud rather than dropped in silence: if a clock step ever
+        # puts a producer behind the recorded high-water mark, this line is the
+        # only way anyone finds out why the switch stopped responding.
+        log("request %d ignored: not newer than the last applied (%d)" % (seq, last_seq))
         return None
     event = raw.get("event")
     if not isinstance(event, dict) or event.get("kind") not in ALLOWED_REQUEST_KINDS:
@@ -333,15 +444,30 @@ def main(argv=None):
                                        and not arguments.value.isdigit()):
             parser.error("volume takes 0..100, up or down")
 
-    state, note = load_state(arguments.state)
-    if note:
-        log(note)
-
     if arguments.command == "status":
+        # The only read-only command, and the only one that does not take the
+        # lock: a status printed during someone else's apply is a moment in
+        # time, which is what it claims to be.
+        state, note = load_state(arguments.state)
+        if note:
+            log(note)
         print(json.dumps({"mode": current_mode(), "state": state,
                           "plan": policy.plan(state),
                           "headset_card": headset_card()}, indent=2, sort_keys=True))
         return 0
+
+    with apply_lock(dry_run=arguments.dry_run):
+        return _locked_apply(arguments)
+
+
+def _locked_apply(arguments):
+    """One complete apply, under the lock. See apply_lock for why it is whole.
+
+    Returns the process exit code.
+    """
+    state, note = load_state(arguments.state)
+    if note:
+        log(note)
 
     seq = None
     if arguments.command == "apply-request":

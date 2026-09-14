@@ -744,9 +744,17 @@ fstab_mount_for() {
 # ships **GNU wget 1.24.5 on musl**. The distinction cost real debugging time in
 # library-guard.sh, which copies this transport: with `-q` and no `-S`, a 4xx
 # exits 8 and prints NOTHING, so a report that was being rejected with a
-# perfectly clear HTTP 400 looked like a dead network. If this function ever
-# needs the status code rather than a boolean, it needs `-S` (headers) and
-# `--content-on-error` (the body) — see library-guard.sh's feed block.
+# perfectly clear HTTP 400 looked like a dead network.
+#
+# AND THEN IT COST THE SAME DEBUGGING TIME HERE, ON 2026-09-13 (F2). The lane's
+# row had just been added to the Sheet and the tracker had not reloaded it, so
+# every post from library-backup.sh came back `{"error":"invalid_id"}` — and
+# this function turned all thirteen of them into `HTTP 000`, which reads as "the
+# network is down". The verified success of that night's backup was lost with no
+# diagnosable reason anywhere in the journal, while library-guard.sh — same
+# transport, but with `-S --content-on-error` — printed the tracker's own words.
+# So this branch now reads the status line and the body too: a 4xx is a REFUSAL
+# and says so, and only a genuinely unanswered request reports 000.
 #
 # FILE_SHARE_BACKUP_STATE_LAST_CODE carries the outcome of the last unified
 # state update — the HTTP code, `000` when nothing answered, or `skipped` when
@@ -797,15 +805,25 @@ post_file_share_backup_state() {
         # under TimeoutStartSec=infinity means forever. This is a TRANSPORT
         # deadline and expires no state: it never shortens a legitimately long
         # run, it only stops one HTTP request from hanging the box.
-        if docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -O /dev/null -T 10 --tries=1 "${whdr[@]}" \
-                --post-data "$body" "$url" 2>/dev/null; then
-            code=200                       # wget: exit 0 == HTTP 2xx. NOTE: a 4xx
-                                           # lands in the else below as a bare
-                                           # 000, which cannot be told from "no
-                                           # answer". Enough for ok/fail here;
-                                           # not enough to diagnose. See above.
+        local wout wrc wbody
+        # -S puts the response headers on STDERR and --content-on-error keeps the
+        # body of a 4xx, so both are captured together. -O - because the body is
+        # now wanted; it is a one-line error object, not a payload.
+        wout="$(docker exec "$NAGLIGHT_FEED_CONTAINER" wget -q -S -O - --content-on-error -T 10 --tries=1 "${whdr[@]}" \
+                --post-data "$body" "$url" 2>&1)"
+        wrc=$?
+        if [ "$wrc" -eq 0 ]; then
+            code=200                       # wget: exit 0 == HTTP 2xx
         else
-            code=000
+            # The LAST status line, not the first: a redirect leaves two.
+            code="$(printf '%s' "$wout" | grep -oE 'HTTP/[0-9.]+ [0-9]{3}' | grep -oE '[0-9]{3}$' | tail -1)"
+            [ -n "$code" ] || code=000     # nothing answered at all
+            wbody="$(printf '%s' "$wout" | grep -vE '^[[:space:]]*(HTTP/|Content-|X-Content-|Date:|Connection:|Vary:|Transfer-|Cache-Control:)' | tr -s ' \n' ' ' | sed 's/^ *//;s/ *$//')"
+            # THE TRACKER'S OWN WORDS, verbatim. `invalid_id` means the row is
+            # not in the definitions yet (or was removed) and no retry will help;
+            # 401/403 is the token or the forwarded identity. Either way the
+            # producer cannot fix it, and the person reading the journal can.
+            [ -n "$wbody" ] && warn "file-share/backup state: the tracker said: $wbody"
         fi
     else
         local hdr=(-H "Content-Type: application/json")

@@ -12,7 +12,8 @@
 #   D4  green when the inventory matches the baseline
 #   D5  RED when a whole file is deleted
 #   D6  RED when items are deleted but the file survives (the quiet one)
-#   D7  YELLOW when the set GROWS, and green again after a deliberate re-baseline
+#   D7  GREEN when the set only GROWS — the baseline refreshes itself and the
+#       added ids are logged (Owner ruling F1, 2026-09-13, option 1)
 #   D8  RED when the definitions directory is gone entirely
 #   D9  RED when the data root cannot be resolved at all — "cannot look" is not
 #       the same as "fine", and it used to be the same status
@@ -22,7 +23,18 @@
 #       having never heard of tracker-definitions IS the deletion alarm
 #   D13 a stopped tracker does not downgrade a verdict read off the volume
 #   D14 EQUAL TOTALS ARE NOT AN EQUAL INVENTORY - a renamed id, or a file moved
-#       between users, leaves files/items/users identical
+#       between users, leaves files/items/users identical. It is a REMOVAL, and
+#       red: the old id stopped being tracked
+#   D17 add AND remove in one edit is a removal - the removal wins, and only a
+#       human --baseline clears it
+#   D18 a baseline with no recorded inventory (written before the ruling) does
+#       NOT self-accept growth: the guard cannot prove nothing went with it
+#   D19 a green run HEALS such a baseline, so the next addition self-accepts
+#   D20 growth that cannot refresh the baseline stays YELLOW, never green
+#   D21 a sidecar inventory that does not belong to the baseline beside it is
+#       IGNORED - diffing against a stale one hides the removal in between
+#   D22 and it is VERIFIED, not trusted: a body that does not hash to the
+#       baseline's inv_hash is ignored however correct its own header looks
 #   D15 a corrupt baseline is yellow, never green
 #   D16 a state file that cannot be written escalates to RED - the durable
 #       verdict is the whole point, and a stale one reads as current
@@ -153,10 +165,17 @@ if [ "$(state_of files)" = 2 ] && [ "$(state_of items)" = 2 ]; then pass "D6 the
 if [ "$rc" = 1 ] && [ "$(state_of band)" = red ]; then pass "D6 red on an item deletion with no file deletion (exit 1)"; else fail "D6 band=$(state_of band) exit=$rc"; fi
 
 echo
-echo "== D7: growth is YELLOW, and re-baselining is the deliberate way back =="
+echo "== D7: growth accepts ITSELF, and says which ids it accepted =="
+# THE OWNER'S RULING (2026-09-13, F1 option 1). Editing the Sheet is already a
+# deliberate, authenticated act; a second confirmation in a root shell on another
+# device bought nothing, and a lane that sits yellow for days is learned as
+# background noise — which costs the guard its ability to mean anything when a
+# row DISAPPEARS. So growth refreshes the baseline itself AND names what it took.
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
 write_defs
 guard --baseline >/dev/null
-cat >"$DEFS/gamma.md" <<'EOF'
+write_gamma() {
+    cat >"$DEFS/gamma.md" <<'EOF'
 ---
 category: Gamma
 color_weight: 1.0
@@ -170,12 +189,21 @@ items:
 
 # Gamma
 EOF
+}
+write_gamma
 rc="$(guard --check)"
-if [ "$rc" = 2 ] && [ "$(state_of band)" = yellow ]; then pass "D7 yellow when the set grew (exit 2)"; else fail "D7 band=$(state_of band) exit=$rc"; fi
-if state_of verdict | grep -q 'GREW'; then pass "D7 the verdict says GREW and names the re-baseline command"; else fail "D7 verdict: $(state_of verdict)"; fi
-guard --baseline >/dev/null
+if [ "$rc" = 0 ] && [ "$(state_of band)" = green ]; then pass "D7 green when the set only grew (exit 0)"; else fail "D7 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+if grep -q 'INVENTORY GREW — baseline refreshed automatically' "$TMP/out.txt"; then pass "D7 the journal records the automatic acceptance"; else fail "D7 no auto-accept line"; cat "$TMP/out.txt"; fi
+if grep -q 'user-one/four' "$TMP/out.txt"; then pass "D7 and NAMES the added id"; else fail "D7 the log does not name what it accepted: $(tail -2 "$TMP/out.txt")"; fi
+if state_of added | grep -q 'user-one/four'; then pass "D7 the state file records the added id"; else fail "D7 state added=$(state_of added)"; fi
+if [ "$(state_of baseline_items)" = "$(state_of items)" ]; then pass "D7 the state file reports the baseline it was actually measured against"; else fail "D7 baseline_items=$(state_of baseline_items) items=$(state_of items)"; fi
+# THE BASELINE REALLY MOVED, which a green band alone does not prove: a guard
+# that reported green without writing would go green again for the same reason
+# forever and never notice the NEXT change.
 rc="$(guard --check)"
-if [ "$rc" = 0 ] && [ "$(state_of band)" = green ]; then pass "D7 green again after a deliberate re-baseline"; else fail "D7 post-baseline band=$(state_of band) exit=$rc"; fi
+if [ "$rc" = 0 ] && [ "$(state_of band)" = green ] && [ -z "$(state_of added)" ]; then pass "D7 the next run is quietly green — the baseline really was refreshed"; else fail "D7 second run band=$(state_of band) added=$(state_of added)"; fi
+if [ "$(awk -F= '$1=="items"{print $2}' "$STATE/tracker-defs-baseline")" = 4 ]; then pass "D7 the baseline file carries the grown count"; else fail "D7 baseline items=$(awk -F= '$1=="items"{print $2}' "$STATE/tracker-defs-baseline")"; fi
+if grep -q 'growth auto-accepted' "$STATE/tracker-defs-baseline"; then pass "D7 and records that no human typed it"; else fail "D7 the baseline does not say how it was recorded"; fi
 
 echo
 echo "== D8/D9: absent definitions, and an unresolvable root =="
@@ -273,12 +301,225 @@ if [ "$(state_of files)" = 2 ] && [ "$(state_of items)" = 3 ]; then
 else
     fail "D14 totals moved: files=$(state_of files) items=$(state_of items)"
 fi
-if [ "$rc" = 2 ] && [ "$(state_of band)" = yellow ]; then
-    pass "D14 yellow on an inventory change the counts cannot see (exit 2)"
+# A RENAME IS A REMOVAL. `three` stopped being tracked; that an id arrived in
+# the same edit is not a mitigation, and under the F1 ruling the removal wins.
+if [ "$rc" = 1 ] && [ "$(state_of band)" = red ]; then
+    pass "D14 red on an inventory change the counts cannot see (exit 1)"
 else
     fail "D14 band=$(state_of band) exit=$rc — a renamed item passed as 'matches exactly'"
 fi
-if state_of verdict | grep -q 'INVENTORY does not'; then pass "D14 and the verdict says which kind of change it is"; else fail "D14 verdict: $(state_of verdict)"; fi
+if state_of verdict | grep -q 'REMOVED'; then pass "D14 and the verdict says which kind of change it is"; else fail "D14 verdict: $(state_of verdict)"; fi
+if state_of removed | grep -q 'user-one/three$\|user-one/three '; then pass "D14 the state file names the id that went"; else fail "D14 removed=$(state_of removed)"; fi
+if state_of added | grep -q 'user-one/three-renamed'; then pass "D14 and the id that arrived with it"; else fail "D14 added=$(state_of added)"; fi
+
+echo
+echo "== D17: add AND remove in one edit is a REMOVAL, and only a human clears it =="
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
+write_defs
+guard --baseline >/dev/null
+# beta.md (1 item) out, gamma.md (1 item) in: files, items and users all land on
+# exactly the numbers the baseline holds. Nothing but the inventory can see this.
+rm -f "$DEFS/beta.md"
+cat >"$DEFS/gamma.md" <<'EOF'
+---
+category: Gamma
+color_weight: 1.0
+items:
+  - id: four
+    title: Four
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Gamma
+EOF
+rc="$(guard --check)"
+if [ "$(state_of files)" = 2 ] && [ "$(state_of items)" = 3 ]; then pass "D17 the totals really are unchanged (2 files / 3 items)"; else fail "D17 files=$(state_of files) items=$(state_of items)"; fi
+if [ "$rc" = 1 ] && [ "$(state_of band)" = red ]; then pass "D17 the removal wins over the addition (exit 1)"; else fail "D17 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+if state_of removed | grep -q 'user-one/three'; then pass "D17 and it names the id that disappeared"; else fail "D17 removed=$(state_of removed)"; fi
+if ! grep -q 'baseline refreshed automatically' "$TMP/out.txt"; then pass "D17 the baseline was NOT laundered"; else fail "D17 the guard auto-accepted an edit that removed an id"; fi
+rc="$(guard --check)"
+if [ "$rc" = 1 ]; then pass "D17 still red on the next run — it does not tire of saying so"; else fail "D17 second run exit=$rc"; fi
+guard --baseline >/dev/null
+rc="$(guard --check)"
+if [ "$rc" = 0 ] && [ "$(state_of band)" = green ]; then pass "D17 green once a human accepted it with --baseline"; else fail "D17 post-baseline band=$(state_of band) exit=$rc"; fi
+
+echo
+echo "== D18/D19: a baseline written before the ruling has no inventory to diff =="
+# The upgrade path. Without a recorded inventory the guard cannot prove that an
+# edit ONLY added, so it must not self-accept — and it must say so rather than
+# claiming the pre-ruling wording about a re-baseline being merely 'normal'.
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
+write_defs
+guard --baseline >/dev/null
+rm -f "$STATE/tracker-defs-baseline.inv"
+write_gamma
+rc="$(guard --check)"
+if [ "$rc" = 2 ] && [ "$(state_of band)" = yellow ]; then pass "D18 growth against an inventory-less baseline is yellow, not green (exit 2)"; else fail "D18 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+if state_of verdict | grep -q 'no inventory record'; then pass "D18 and it says why it will not self-accept"; else fail "D18 verdict: $(state_of verdict)"; fi
+guard --baseline >/dev/null
+if [ -s "$STATE/tracker-defs-baseline.inv" ]; then pass "D18 --baseline records the inventory alongside"; else fail "D18 no inventory file after --baseline"; fi
+
+# D19: the same heal, without a human — a GREEN run is a known-good moment, and
+# recording the inventory there is safe because it matches the accepted hash.
+rm -f "$STATE/tracker-defs-baseline.inv"
+rc="$(guard --check)"
+if [ "$rc" = 0 ] && [ -s "$STATE/tracker-defs-baseline.inv" ]; then pass "D19 a green run heals the missing inventory record"; else fail "D19 exit=$rc inv=$( [ -f "$STATE/tracker-defs-baseline.inv" ] && echo present || echo absent)"; fi
+cat >"$DEFS/delta.md" <<'EOF'
+---
+category: Delta
+color_weight: 1.0
+items:
+  - id: five
+    title: Five
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Delta
+EOF
+rc="$(guard --check)"
+if [ "$rc" = 0 ] && [ "$(state_of band)" = green ]; then pass "D19 and the NEXT addition then self-accepts"; else fail "D19 post-heal band=$(state_of band) exit=$rc"; fi
+
+echo
+echo "== D20: growth that cannot refresh the baseline is yellow, never green =="
+# A green band means "the baseline agrees with the definitions". If the refresh
+# did not land there is no such baseline, and reporting green would be a claim
+# about a file that was never written.
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
+write_defs
+guard --baseline >/dev/null
+write_gamma
+if [ "$(id -u)" = 0 ]; then
+    printf 'SKIP  D20: running as root, which can write into a 0500 directory anyway\n'
+else
+    # ONLY THE BASELINE IS MADE UNWRITABLE. Making the whole state directory
+    # read-only would break write_state too, and D16 escalates THAT to red — so
+    # the assertion would pass even if the growth branch wrongly chose green.
+    # (Adversarial review, 2026-09-13.) The baseline path is therefore moved to
+    # its own read-only directory while the state file stays where it was.
+    mkdir -p "$TMP/ro-baseline"
+    cp "$STATE/tracker-defs-baseline" "$TMP/ro-baseline/tracker-defs-baseline"
+    cp "$STATE/tracker-defs-baseline.inv" "$TMP/ro-baseline/tracker-defs-baseline.inv"
+    chmod 500 "$TMP/ro-baseline"
+    rc="$(TRACKER_DEFS_ROOT="$ROOT" TRACKER_DEFS_STATE_DIR="$STATE" \
+          TRACKER_DEFS_BASELINE_FILE="$TMP/ro-baseline/tracker-defs-baseline" \
+          bash "$GUARD" --check >"$TMP/out.txt" 2>&1; echo $?)"
+    chmod 700 "$TMP/ro-baseline"
+    if [ "$rc" = 2 ] && [ "$(state_of band)" = yellow ]; then pass "D20 growth with an unwritable baseline is YELLOW, not green (exit 2)"; else fail "D20 band=$(state_of band) exit=$rc"; cat "$TMP/out.txt"; fi
+    if state_of verdict | grep -q 'could NOT be refreshed'; then pass "D20 and it says the refresh did not land"; else fail "D20 verdict: $(state_of verdict)"; fi
+    if [ "$(awk -F= '$1=="items"{print $2}' "$TMP/ro-baseline/tracker-defs-baseline")" = 3 ]; then pass "D20 the baseline really is unchanged"; else fail "D20 the baseline moved anyway"; fi
+fi
+
+echo
+echo "== D21: a sidecar that belongs to another baseline is not evidence =="
+# THE HOLE A PARTIAL REFRESH LEAVES (adversarial review, 2026-09-13). The
+# baseline and its inventory are two writes, and the second can fail. Diffing a
+# new baseline against an OLD inventory reports long-accepted ids as additions
+# — and, worse, an id removed in between never appears in the diff at all, so a
+# removal would be auto-accepted as growth. The sidecar therefore names the hash
+# it was taken with, and a mismatch means "no inventory", not "this one".
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
+write_defs
+guard --baseline >/dev/null
+# Stage exactly the aftermath of a failed sidecar write: the baseline moves on,
+# the inventory does not.
+write_gamma
+guard --check >/dev/null                      # auto-accepts {four}; both files move
+cp "$STATE/tracker-defs-baseline.inv" "$TMP/stale.inv"
+cat >"$DEFS/delta.md" <<'EOF'
+---
+category: Delta
+color_weight: 1.0
+items:
+  - id: five
+    title: Five
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Delta
+EOF
+guard --check >/dev/null                      # auto-accepts {five}
+cp "$TMP/stale.inv" "$STATE/tracker-defs-baseline.inv"   # the stale sidecar returns
+# Now remove `five` and add `six`. Against the CURRENT baseline that is a
+# removal; against the stale inventory it would look like pure growth.
+rm -f "$DEFS/delta.md"
+cat >"$DEFS/epsilon.md" <<'EOF'
+---
+category: Epsilon
+color_weight: 1.0
+items:
+  - id: six
+    title: Six
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Epsilon
+EOF
+rc="$(guard --check)"
+if [ "$rc" != 0 ]; then pass "D21 a stale sidecar did not launder the removal (exit $rc)"; else fail "D21 exit=0 — a removal was auto-accepted as growth"; cat "$TMP/out.txt"; fi
+if ! grep -q 'baseline refreshed automatically' "$TMP/out.txt"; then pass "D21 and the baseline was not refreshed"; else fail "D21 the baseline was laundered against an inventory it does not belong to"; fi
+if state_of verdict | grep -qE 'INVENTORY does not|no inventory record'; then pass "D21 it reports the mismatch as HAVING no inventory, not as one"; else fail "D21 verdict: $(state_of verdict)"; fi
+
+echo
+echo "== D22: the sidecar is verified, not trusted =="
+# THE HEADER IS NOT THE EVIDENCE (adversarial review, second round). A sidecar
+# truncated, half-restored or hand-edited can carry the CURRENT baseline hash in
+# its header over a body that is missing an id — and that id can then be deleted
+# with the diff never seeing it, because it was never in the list being diffed.
+# So the body is re-hashed on every read.
+rm -rf "$STATE" "$ROOT"; mkdir -p "$DEFS" "$STATE"
+write_defs
+cat >"$DEFS/delta.md" <<'EOF'
+---
+category: Delta
+color_weight: 1.0
+items:
+  - id: five
+    title: Five
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Delta
+EOF
+guard --baseline >/dev/null
+rc="$(guard --check)"
+if [ "$rc" = 0 ]; then pass "D22 setup: green, with a sidecar this baseline really owns"; else fail "D22 setup exit=$rc"; fi
+# Forge it: drop `five` from the BODY, leave the header saying the baseline hash.
+grep -v 'user-one/five$' "$STATE/tracker-defs-baseline.inv" >"$TMP/forged.inv"
+mv "$TMP/forged.inv" "$STATE/tracker-defs-baseline.inv"
+if head -1 "$STATE/tracker-defs-baseline.inv" | grep -q "$(awk -F= '$1=="inv_hash"{print $2}' "$STATE/tracker-defs-baseline")"; then
+    pass "D22 the forged sidecar still claims the right baseline"
+else
+    fail "D22 the forgery did not keep the header, so this proves nothing"
+fi
+# Now do exactly what the forgery would hide: remove `five`, add `six`.
+rm -f "$DEFS/delta.md"
+cat >"$DEFS/epsilon.md" <<'EOF'
+---
+category: Epsilon
+color_weight: 1.0
+items:
+  - id: six
+    title: Six
+    type: habit
+    recur: daily
+    horizon: daily
+---
+
+# Epsilon
+EOF
+rc="$(guard --check)"
+if [ "$rc" != 0 ]; then pass "D22 a body that does not hash to the baseline is not evidence (exit $rc)"; else fail "D22 exit=0 — a removal was laundered behind a correct-looking header"; cat "$TMP/out.txt"; fi
+if ! grep -q 'baseline refreshed automatically' "$TMP/out.txt"; then pass "D22 and the baseline was not refreshed"; else fail "D22 the baseline was laundered"; fi
 
 echo
 echo "== D15: a corrupt baseline is yellow, never green =="

@@ -1902,3 +1902,16 @@ overtaken. Both alternatives are worse (an exact match makes the redo rewrite
 the older command over the newer one; refusing while a request is unconsumed
 fails the second tap of a double-tap). Closing it properly needs a per-sequence
 queue in the APPLIER's protocol, which this work does not own. Owed follow-up.
+
+2026-09-14 panel follow-up validation: source commit c4136e6 is local; no push
+or deployment. Config validation and firstboot Bash syntax pass. Targeted audio
+tests pass (366), and the native Linux hermetic audio-switch suite reports
+103 PASS. A disposable unprivileged Linux clone ran 1,414 passing tests with
+10 skipped before the five-failure stop. Remaining failures involve the wider
+hermetic suites, reset-versus-EOF socket expectations, /run permissions/systemd
+host verification and the absent weight service account. Its doc check also
+cannot resolve HomeHub sibling links inside the disposable clone; the original
+checkout doc-navigability check passes. Registry integrity reports zero integrity
+errors and 23 existing orphans; no gate advancement is claimed. Full logs are
+in HomeHub/build/panel-followup-minipc-native-check-20260914.txt. No broad-suite
+green or hardware acceptance is claimed.

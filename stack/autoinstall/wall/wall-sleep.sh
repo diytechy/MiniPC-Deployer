@@ -210,6 +210,61 @@ start_amp_trigger() {
     systemctl start wall-amp-trigger.service >/dev/null 2>&1
 }
 
+# ── the power lock: one decision at a time (LLR-913) ─────────────────────────
+# THE RACE THIS EXISTS TO CLOSE, found in review 2026-09-15. run_occupancy is a
+# decide-THEN-act sequence: the decider says BACKLIGHT=off POWER=suspend, the
+# backlight write lands, and only then does suspend_now run. A tap arriving in
+# that window runs `touch-wake` from a DIFFERENT process, which clears the
+# absence clock and lights the screen — and the occupancy process, holding a
+# decision taken before the tap existed, then suspends a lit panel on a
+# now-stale absence clock. The person watching sees the screen come on and the
+# machine drop off the LAN.
+#
+# So the decide-and-act window and the whole touch-wake arm are serialized on
+# one lock file, and suspend_now re-checks the world under that lock right
+# before it suspends. The lock makes the interleaving impossible; the re-check
+# is defence in depth and is also the only guard left on a box with no flock.
+POWER_LOCK="${POWER_TEST_ROOT}/run/wall-power.lock"
+# Nested acquisition is a no-op, not a deadlock: run_occupancy takes the lock
+# and then calls suspend_now, which must not queue behind itself.
+POWER_LOCK_HELD=
+# Seconds to wait for the lock before declining. Generous against a decider
+# that is mid-decision (it acts in milliseconds), short enough that a wedged
+# holder does not stall a tap for ever. A knob only so the hermetic suite can
+# exercise the decline path without an eleven-second test.
+POWER_LOCK_WAIT="${POWER_LOCK_WAIT:-10}"
+power_lock_acquire() {   # power_lock_acquire LABEL — non-zero means DO NOT ACT
+    [ -n "$POWER_LOCK_HELD" ] && return 0
+    if ! command -v flock >/dev/null 2>&1; then
+        log "WARNING: flock is unavailable — $1 is running UNSERIALIZED against"
+        log "WARNING: the occupancy decider. suspend_now's re-check is the only guard."
+        return 0
+    fi
+    mkdir -p "$(dirname "$POWER_LOCK")" 2>/dev/null || true
+    # Prove the file is creatable BEFORE `exec` touches it: a failed redirection
+    # on `exec` terminates a non-interactive bash outright, which would turn an
+    # unwritable /run into a power script that silently does nothing at 22:00.
+    if ! : > "$POWER_LOCK" 2>/dev/null && [ ! -w "$POWER_LOCK" ]; then
+        log "WARNING: cannot open $POWER_LOCK — $1 is running unserialized."
+        return 0
+    fi
+    exec 9>>"$POWER_LOCK"
+    if ! flock -w "$POWER_LOCK_WAIT" 9; then
+        log "WARNING: $1 waited ${POWER_LOCK_WAIT}s for the power lock and gave up. Another power"
+        log "WARNING: decision is in flight; declining rather than acting on a stale view."
+        exec 9>&- 2>/dev/null || true
+        return 1
+    fi
+    POWER_LOCK_HELD=1
+    return 0
+}
+power_lock_release() {
+    [ -n "$POWER_LOCK_HELD" ] || return 0
+    POWER_LOCK_HELD=
+    exec 9>&- 2>/dev/null || true
+    return 0
+}
+
 # ── backlight helpers ────────────────────────────────────────────────────────
 # The interface name is hardware-specific (intel_backlight / acpi_video0 / …), so
 # it is DISCOVERED rather than assumed — the hardware baseline records which one
@@ -233,6 +288,16 @@ backlight_dir() {
 # (run_occupancy, about to suspend) would then have suspended a panel that never
 # satisfied "backlight off when nobody is present". So this returns non-zero
 # unless `brightness` actually holds the value we asked for.
+# backlight_lit — zero exit iff a backlight node exists and reads non-zero.
+# "No node" is NOT lit: A19 already refuses to suspend without a usable node,
+# and that guard stays where it is rather than being duplicated here.
+backlight_lit() {
+    local d cur
+    d="$(backlight_dir)" || return 1
+    cur="$(cat "$d/brightness" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$cur" ] && [ "$cur" != "0" ]
+}
+
 backlight_set() {   # backlight_set off|on
     local d cur max want got
     if ! d="$(backlight_dir)"; then
@@ -436,7 +501,14 @@ arm_rtc() {
 # reachable panel beats a dark one, and an UNREACHABLE dark one is the outcome
 # this guard exists to make impossible.
 suspend_now() {
-    local wake="${1:-$SLEEP_END}" policy
+    # $2, the WAKE GUARD, is what tells the two callers apart:
+    #   empty      — the SCHEDULED path. It never claimed to dim anything, so it
+    #                has nothing to re-check and its behaviour is unchanged.
+    #   "dark-only"— the occupancy path with no absence stamp to compare.
+    #   <stamp>    — the occupancy path: the absence clock as it read AFTER the
+    #                decision was applied. A touch wake deletes that file, so a
+    #                stamp that no longer matches IS the tap, observed.
+    local wake="${1:-$SLEEP_END}" guard="${2:-}" policy stamp
     policy="$(python3 "$SENSOR_POWER_POLICY" "$SENSOR_CONFIG" 2>/dev/null || echo 'KEEP_AWAKE=unknown')"
     if [ "$policy" != "KEEP_AWAKE=false" ]; then
         backlight_set off || true
@@ -456,6 +528,27 @@ suspend_now() {
     else
         log "SLEEP_RTC_WAKE=false — suspending with the USB mouse as the ONLY wake."
         log "The internal touchscreen will NOT wake it from S3. This is a test mode."
+    fi
+    # THE LAST LOOK BEFORE S3, under the power lock. Everything above — the
+    # policy read, arm_rtc — takes time, and the decision that got us here was
+    # taken before any of it. If a tap landed in the meantime the panel is lit
+    # and the absence clock has been cleared, and suspending now would take a
+    # panel somebody is standing at off the LAN.
+    if [ -n "$guard" ]; then
+        if backlight_lit; then
+            log "NOT suspending: the backlight is lit again since the decision was taken."
+            log "A touch wake landed inside the decide-and-act window; the decider owns"
+            log "the next tick and will re-decide from the current state."
+            return 0
+        fi
+        if [ "$guard" != "dark-only" ]; then
+            stamp="$(cat "$ABSENT_SINCE_FILE" 2>/dev/null || echo "")"
+            if [ "$stamp" != "$guard" ]; then
+                log "NOT suspending: the absence clock changed since the decision was taken"
+                log "(a touch or sensor wake cleared it). Re-deciding on the next tick."
+                return 0
+            fi
+        fi
     fi
     if ! stop_door_stream; then
         log "WARNING: Door stream broker could not be stopped — NOT suspending while a camera source may still be active."
@@ -505,8 +598,19 @@ write_absent_since() {
 # here: there is no `if present` around the backlight write and no second
 # `if absent` around the suspend. Both come out of $BACKLIGHT and $POWER, which
 # came out of the same invocation, so they cannot disagree.
+# run_occupancy — the decide-and-act window, held under the power lock so no
+# touch wake can land between the decision and the suspend it implies.
 run_occupancy() {
-    local now minute out line k v backlight_failed=
+    local status
+    power_lock_acquire "the occupancy decision" || return 0
+    run_occupancy_locked
+    status=$?
+    power_lock_release
+    return $status
+}
+
+run_occupancy_locked() {
+    local now minute out line k v backlight_failed= absent_stamp=
     local PRESENCE= BACKLIGHT= POWER= ON_PERIOD= RTC_WAKE= REASON= PRESENCE_REASON=
     local ABSENCE_CLOCK= CLOCK_REASON=
 
@@ -594,7 +698,12 @@ EOF
             return 0
         fi
         if [ "$SLEEP_MODE" = "suspend" ]; then
-            suspend_now "$RTC_WAKE"
+            # The absence clock AS IT READS NOW, after this decision's own
+            # bookkeeping. suspend_now compares it again at the last moment, so
+            # a wake that clears the file aborts the suspend rather than racing it.
+            absent_stamp="$(cat "$ABSENT_SINCE_FILE" 2>/dev/null || echo "")"
+            [ -n "$absent_stamp" ] || absent_stamp="dark-only"
+            suspend_now "$RTC_WAKE" "$absent_stamp"
         else
             # SLEEP_MODE=backlight is SN-013's graceful degradation for a
             # firmware whose S3 resume misbehaves. The occupancy decision is the
@@ -649,8 +758,33 @@ case "${1:-}" in
         rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
         backlight_set on
         ;;
+    touch-wake)
+        # The root-owned evdev witness in wall-local-setup.py observed one
+        # physical contact while every backlight read zero. Behaviourally this
+        # is `sensor-wake`; the separate arm exists so the journal attributes
+        # the restore to the tap rather than to an anonymous sensor claim.
+        #
+        # Clearing the absence stamp restarts the absence clock from the
+        # contact, so an absence-enabled panel cannot re-dark on the very next
+        # occupancy tick. The witness asserts no presence and writes no
+        # presence file; the decider keeps deciding. No re-sleep timer is
+        # added here or anywhere (LLR-913).
+        # Serialized against the occupancy decide-and-act window: a tap must
+        # never light a panel whose suspend is already in flight. Declining is
+        # the honest outcome — the witness journals the failure, does NOT arm
+        # its rate limit, and the next tap tries again a moment later.
+        if ! power_lock_acquire "the touch wake"; then
+            log "touch wake DECLINED: a power decision is in flight. Not lighting a"
+            log "panel that may be mid-suspend; tap again."
+            exit 75
+        fi
+        log "touch witness observed a contact on the dark panel — restoring the backlight"
+        rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
+        backlight_set on
+        power_lock_release
+        ;;
     *)
-        echo "usage: $0 start|end|occupancy|sensor-wake" >&2
+        echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake" >&2
         exit 2
         ;;
 esac

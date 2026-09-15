@@ -2064,3 +2064,43 @@ nothing to start. `test_door_broker_refusals_are_logged_not_silent_llr920` now
 asserts that seam directly. Smoke re-run: unit-tests 159 passed / 3 skipped,
 registry-integrity 24 orphans / 0 integrity errors, doc-navigability still the
 worktree-only sibling-link failure.
+2026-09-15 group W, touch wakes the dark panel (branch `w-touch-wake`, local
+commits only). LLR-910..914 and TC-910..914 landed against SR-017/SR-020, with
+the accepted design memo `HomeHub/docs/design/WAKE_TOUCH_DESIGN_2026-09-15.md`
+as its record. A root-owned evdev witness thread now runs inside
+`wall-local-setup.py`, reading the touch filter's virtual uinput node by
+identity while the daemon holds `EVIOCGRAB` and the physical node only when no
+grab exists; `validate_wake` gained a keyword-only `witness=` seam that a
+socket peer cannot reach; `wall-sleep.sh` gained a `touch-wake` arm that
+mirrors `sensor-wake` and adds no re-sleep timer. `python scripts/check.py
+--tier smoke` in the main checkout is the bar; in the worktree the
+doc-navigability step cannot resolve the `../HomeHub` sibling links and fails
+for that reason alone. Unit tests: 173 smoke passing (158 before), 34 in
+tests/test_wall_local_capabilities.py; the hermetic
+`tests/occupancy-power.test.sh` reports 98 PASS 0 FAIL under WSL Ubuntu (94
+before). Assumptions to confirm: the 2 s rate limit is sized to one deliberate
+tap and is NOT measured (LLR-911 owns the constant); the S3 hardware-wake claim
+in WALL-BURN-IN.md is still unmeasured and `wall-touch-wakeup-report.sh`
+exists to settle it in the hardware window (LLR-914). No physical acceptance,
+no deployment and no gate advancement is claimed.
+
+2026-09-15 group W, Terra review round (same branch). Six findings fixed. The
+critical one was a real race, not a style point: `run_occupancy` decides, writes
+the backlight, and only then suspends, so a tap landing in that window cleared
+the absence clock and lit the screen while the occupancy process went on to
+suspend a lit panel. The decide-and-act window and the whole `touch-wake` arm
+are now serialized on one `flock` file, a tap that cannot get the lock is
+declined with exit 75 rather than served on a stale view, and `suspend_now`
+takes a last look under the lock — a backlight lit again, or an absence clock
+that no longer matches the stamp taken after the decision, aborts the suspend.
+The scheduled 22:00 path passes no guard and is unchanged. Also: `adaptive`
+creates no uinput device (only `filter` does), so it now targets the physical
+node and reports a held grab once on a long backoff instead of retrying a
+device that is never created; the live grab is PROBED rather than inferred from
+the persisted mode, so the witness falls back to the raw node while the daemon
+is restarting and returns to the virtual node afterwards; `select_input_device`
+closes every handle on every path; the node-loss test now runs the real loop
+end to end; and the A11 one-writer admission is a Python AST audit plus a
+shell-redirection audit rather than a line regex, with planted writes proving
+it bites. Counts after the round: `check.py --tier smoke` PASS, 176 passed / 3
+skipped; `occupancy-power.test.sh` 113 PASS 0 FAIL.

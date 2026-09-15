@@ -104,6 +104,30 @@ cat /sys/class/input/event*/device/name
       S3.** That is expected — I2C-HID devices generally cannot be a system wake
       source — and it is exactly why the mouse is required rather than optional.
       Hang the mouse where a person will find it.
+- [ ] **Measure the S3 claim above instead of assuming it** (LLR-914, TC-914).
+      Run the read-only report and paste its whole output here, under the dated
+      heading in "Measured hardware-wake facts" below:
+      `sudo bash /opt/wall-panel/stack/autoinstall/wall/wall-touch-wakeup-report.sh`
+      It reads `/proc/acpi/wakeup`, the touchscreen's `power/wakeup` resolved by
+      identity, and `/sys/power/{mem_sleep,state}`. It writes nothing. If the
+      touchscreen unexpectedly reads `enabled` and proves to work, that is new
+      evidence for the coordinator and the Owner — the ruling of 2026-09-15
+      (keep suspend, lowest power) stands until they change it.
+- [ ] **Prove a tap wakes the DISPLAY-OFF, CPU-awake panel** (the two states
+      touch wake covers). With brightness confirmed zero and the machine
+      confirmed not suspended, tap once and read the brightness back. The
+      journal must show the correlated sequence in one place:
+      `journalctl -u wall-local-setup -u wall-sleep --since -2min` →
+      `touch-witness: resolved …`, `touch-witness: contact observed,
+      brightness=0, requesting touch-wake`, `touch witness observed a contact on
+      the dark panel`, then the backlight write. The FIRST tap wakes; the second
+      interacts (the compositor ignores input observed while dark, by design).
+
+### Measured hardware-wake facts
+
+Not yet measured. Record here, with the date, the report output and the
+one-line answer to "is the touchscreen a hardware wake source on this
+hardware?". Until a dated entry exists, the S3 claim above is inherited belief.
 - [ ] Confirm `wall-wakeprep` re-armed everything after a reboot:
       `journalctl -u wall-wakeprep -b` and `cat /proc/acpi/wakeup | grep XHC`.
 - [ ] Decide and configure the **Uptime-Kuma push monitor's maintenance window**

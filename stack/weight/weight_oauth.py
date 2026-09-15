@@ -116,6 +116,20 @@ TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 # from the feeder rather than restated, so the capture cannot drift from the
 # constants the feeder's tests pin.
 LIST_URL = weight_feeder.GOOGLE_HEALTH_LIST_URL
+# THE ROUTES `capture` MAY BE POINTED AT, AS AN ALLOW-LIST OF TWO RATHER THAN A
+# URL ARGUMENT. `--data-type height` exists because NI_A2's height parser was
+# written against the discovery document rather than against a body anybody has
+# seen, and this repo's standard is that a parser is settled by ONE real call.
+# It is a fixed map and not a free `--url` for the same reason the feeder has no
+# endpoint knob: the request carries an access token for the whole
+# health-metrics scope, and a knob on its destination is a way to send that
+# token somewhere else. Both values come from the feeder's own constants, so a
+# route can never drift between the tool that captures a body and the code that
+# parses it.
+LIST_URLS = {
+    "weight": weight_feeder.GOOGLE_HEALTH_LIST_URL,
+    "height": weight_feeder.GOOGLE_HEALTH_HEIGHT_LIST_URL,
+}
 SCOPE = weight_feeder.GOOGLE_HEALTH_SCOPE
 
 # THE CONSENT FLOW: a registered loopback redirect, and NO LISTENER. See the
@@ -1066,7 +1080,7 @@ def capture(args, out=None, list_url=None, token_endpoint=TOKEN_ENDPOINT):
     Implements: SR-022, LLR-006
     """
     out = out or sys.stdout
-    list_url = list_url or LIST_URL
+    list_url = list_url or LIST_URLS[getattr(args, "data_type", "weight")]
     values = read_env_file(args.env_file)
     _client_key, client_id, client_secret = resolve_client(values, args.env_file)
     token_file, _configured, _state_file, _root = resolve_paths(values, args)
@@ -1108,7 +1122,7 @@ def capture(args, out=None, list_url=None, token_endpoint=TOKEN_ENDPOINT):
             "token is not valid for this API; 403 usually means "
             "health.googleapis.com is not enabled on the project, or the scope "
             "is not on the consent screen; 404 means the route is wrong - it "
-            "is %s." % (exc.code, ", " + code if code else "", LIST_URL))
+            "is %s." % (exc.code, ", " + code if code else "", list_url))
     except Exception as exc:
         raise Refused("the list call failed: %s." % type(exc).__name__)
 
@@ -1161,6 +1175,11 @@ def build_parser():
     capturer = subcommands.add_parser(
         "capture", parents=[common],
         help="ONE dataPoints.list call, body saved verbatim")
+    capturer.add_argument(
+        "--data-type", choices=sorted(LIST_URLS), default="weight",
+        help="which Google Health data type to capture ONE body of. `height` "
+             "is for NI_A2: the height parser was written against the "
+             "discovery document, and this settles it against a real body.")
     capturer.add_argument("--out", required=True,
                           help="where to save the raw body; must not exist")
     capturer.add_argument("--page-size", type=int, default=None,

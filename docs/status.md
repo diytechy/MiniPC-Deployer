@@ -12,6 +12,31 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-14 - NI_A1 feeder rounding and the NI_A2 waist/height sister gauge
+are implemented on `ni-a2-weight-feeder`; not deployed, not merged.** The
+weight feeder now rounds the posted and stored weight to 0.1 lb (nothing ever
+removed rounding - this path never had any; the panel's half of NI_A1 is a
+separate worker's). It also posts an optional second gauge `weight-waist`
+(unit `ratio`, explicit min/max, favourable low), reading the height from the
+SAME Google Health route and scope with the data type segment swapped - no
+consent change - and the waist from NagLight's own GET /api/today over the
+already-verified local destination, so nothing new is mounted. Both halves are
+cached in the existing state file and re-posted at their original stamps.
+Ships OFF behind `WEIGHT_WAIST_ENABLED` and needs one sheet row the Owner must
+add (documented in `stack/weight/README.md`). Active gate remains G1.
+
+**Assumptions to confirm at the next gate.** (1) `heightMeters` is taken from
+the Google Health discovery document, not from a captured body - the repo's
+one-real-call gate is NOT met for height, and `weight_oauth.py capture
+--data-type height` was added so the Owner can settle it; until then any other
+field shape is refused rather than converted, and the cost is the ratio gauge
+only. (2) The plan's `target from the waist-in item's target` is implemented as
+a waist goal IN INCHES divided by the height rather than a literal 0.5 in the
+target column, because `unit: in` means inches to every other reader of that
+sheet and because NagLight marks a quantified row satisfied once progress
+reaches its target - a 0.5 there would complete the item on every entry,
+forever. The documented default when no usable target is declared is still 0.5.
+
 **2026-09-14 — local panel capability provisioning is implemented and
 independently reviewed in the isolated checkout; not deployed.** The image now
 stages and installs the verified sensor runtime without gateway registration,

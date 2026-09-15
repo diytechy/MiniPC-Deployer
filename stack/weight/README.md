@@ -920,12 +920,239 @@ is not inside anything that commits, syncs or backs up by directory sweep. No
 docker volume is declared, because nothing would mount it — declaring one would
 be carriage for a container that does not exist.
 
+## The posted weight is rounded to 0.1 lb (NI_A1)
+
+**Nothing removed rounding — this path never had any.** `git log -p` on
+`weight_feeder.py` shows no `round(` in any revision. The gauge's earlier
+integers came from B5's manual `feeders/weight-manual.ps1`, where a person typed
+them; the first automated reading landed on 2026-09-09 and `grams_to_pounds`
+divides by the exact international-pound definition, so 81 700 g posted as
+`180.11766820504496`.
+
+The panel's `formatValue` keeps one decimal for a non-integer, the string grew
+from `186 lb` to `180.1 lb`, and the fixed-width gauge cell ellipsised it into
+the **"180...."** the Owner saw (the trailing dots are the browser's U+2026).
+The panel's own truncation is fixed panel-side; this is the other half.
+
+`round_display_lb` is the one function, and **both** the wire and the state file
+go through it, so the file and every bar drawn from it agree. The **target is
+never rounded** — it is a number the person typed into their own definitions.
+Rounding happens *after* the plausibility band, so `0.04` still rounds to `0.0`
+and is still refused.
+
+---
+
+## The waist-to-height sister gauge (NI_A2)
+
+A second gauge, `weight-waist`, standing in the **same panel cell** as the
+weight bar. **Ships OFF** (`WEIGHT_WAIST_ENABLED=false`) — see below for why.
+
+```
+{"kind":"gauge","id":"weight-waist","label":"Waist/Ht","icon":"scale",
+ "unit":"ratio","value":0.5,"min":0.236,"max":0.736,"target":0.486,
+ "favourable":"low","observed_at":"2026-09-09T01:24:33Z"}
+```
+
+### Three traps, each silent if wrong
+
+| trap | what happens if you get it wrong |
+|---|---|
+| **the id must sort after `weight`** | NagLight's `Views()` orders by id and the panel draws `drawn[0]` as the headline. `waist-height` would make the *ratio* the big number and demote the body weight to the sub-column — silently, with nothing failing anywhere. `weight-waist` is that string plus a suffix, and a test pins the comparison. |
+| **`min`/`max` are REQUIRED here** | `internal/gauge.unitRangeSpan` holds exactly one entry, `lb: 50`. `ratio` is not in it, so omitting the ends is a 400 (`gauge min and max are required for unit "ratio"`) — **the exact opposite of the weight gauge's rule**, and the single easiest thing to get wrong by copying the neighbour. |
+| **the icon is the grouping key** | the panel's `groupGauges` keys standing gauges on `icon`, so `scale` is what lands this beside the weight bar rather than in a fourth cell. It is written as the weight gauge's own constant so the two cannot drift. |
+
+No `window`, therefore no `direction` (NagLight refuses a direction without a
+window). `favourable: "low"` — British spelling; there is no `favorable` alias
+and an American-spelled key is silently dropped by Go's `encoding/json`.
+
+### The height: the SAME route, the SAME scope, NO consent change
+
+`dataTypes/{dataTypesId}/dataPoints` is **one route with the data type as a path
+segment**, and there is **no height-specific OAuth scope** any more than there is
+a weight-specific one. The single scope this feeder already holds —
+
+```
+https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly
+```
+
+— is the one that admits **both** data types. So reading height asks the
+household for **nothing new**: no second consent screen, no re-mint, no
+widening. The Owner already handed this box blood glucose, body fat, oxygen
+saturation, core body temperature and heart-rate metrics when they consented for
+a weight bar, and height is inside that same grant. A test asserts the two URLs
+differ in exactly the `weight`/`height` segment and that only one scope constant
+exists, so the claim is checkable rather than remembered.
+
+**What is observed and what is assumed.** The weight body was captured live on
+2026-09-09 and the height parser inherits every *verified* part of it: the
+route, the scope, the `dataPoints` envelope, the `nextPageToken` paging and the
+`sampleTime.physicalTime` / `utcOffset` / `civilTime` shape — all properties of
+`DataPoint` rather than of the weight member. What has **not** been seen is a
+height point's own member, so **`heightMeters` is taken from the discovery
+document and is an assumption.**
+
+It is made safe by **refusing rather than guessing**: the key is required by
+exact name, so a body carrying `heightCm`, `heightMillimeters` or a bare number
+is refused, not converted. A metres reader fed centimetres posts a person 100×
+too tall; fed inches, 40× too short. Both land far outside the 24..96 in band,
+and unlike a wrong body weight — which at least lands somewhere a human
+recognises — a ratio of 0.02 is a number nobody has intuition for.
+
+**To settle the assumption with one real call**, the way the weight parser was
+settled:
+
+```bash
+sudo /opt/homehub/stack/weight/weight_oauth.py capture \
+     --data-type height --out /root/height-body.json
+```
+
+`--data-type` is a fixed allow-list of two routes, both taken from the feeder's
+own constants — not a free `--url`, because the request carries an access token
+for the whole health-metrics scope and a knob on its destination is a way to
+send that token somewhere else.
+
+### The waist: NagLight's own `/api/today`, and nothing new mounted
+
+The value the person enters is read back over the door this feeder **already
+has**. The alternatives, and why each was rejected:
+
+| source | why not |
+|---|---|
+| `events/<year>.md` | holds the real answer (`eventlog.LastFor` is the exact query), but the rows are **deltas, not absolute values**, so reading them means re-implementing NagLight's fold in another language. Worse, it needs the tracker's data volume mounted — and that volume holds **every household member's entire tracker history**. `setup-weight.sh` binds ONE category file read-only precisely so a gauge about one person's body cannot see all of it. |
+| the definitions directory | already bound, but it carries the item's **declaration**, not what anybody entered. It is where the *target* comes from and cannot answer this question. |
+| **`GET /api/today`** ✅ | the same local-only opener, the same verified destination, the same bearer token and identity header as the POST. **No mount, no file permission, no second destination**, and the number it serves is NagLight's own folded answer, so there is no second implementation to keep in step. |
+
+There is **deliberately no `WEIGHT_TODAY_URL` knob**: the URL is derived from the
+`WEIGHT_FEED_URL` that `resolve_feed_url` already refused to let off this box. A
+second URL knob would be a second destination to police, and the obvious way to
+get it wrong — the public https route — would send the tracker token out through
+oauth2-proxy with nothing refusing it.
+
+**`count` is the value, and it is there only because the item carries a
+target.** NagLight emits `count` for *quantified* items only, and quantified
+means "has a non-zero target" — so the same `target` that gives this gauge its
+goal line is what makes the measurement readable at all.
+
+**Three arrays are searched, not one.** `engine.derive` sends a quantified row
+to `items` while the occurrence's fold is short of its target and to `undoable`
+once it is met. A reader that knew only `items` would lose the measurement on
+exactly the days somebody was doing well. `catchups` is searched too.
+
+**What it costs, stated plainly:** `count` is the fold of the **current
+occurrence**, so it reads 0 at each new period until something is entered. That
+is why both halves are **cached in the state file** and re-posted at their
+**original** stamp — the gauge stands at the last real measurement and goes
+stale on NagLight's own 7-day static horizon, rather than flickering out every
+time a new week begins.
+
+### The target: one number, in the unit it is measured in
+
+The Owner declares the waist they are aiming at **in inches**, on the item, and
+the gauge's target line is that goal expressed as a ratio (`goal_in / height_in`).
+The obvious alternative — putting `0.5` straight in the target column — does not
+survive contact with either half of the system:
+
+* the item declares `unit: in`, so a `0.5` under it reads as a **half-inch
+  waist** to every other reader of that sheet, including the person who typed it;
+* NagLight treats a quantified item as **satisfied** once progress reaches its
+  target, and a waist of 33.5 against a target of 0.5 is satisfied the instant it
+  is entered, every time, forever.
+
+`unit: in` is **checked, never assumed**, and a wrong one falls back to the
+default rather than converting — `goal_from_item`'s rule: `target: 85` with
+`unit: cm` is 33.5 in, and 85 is plausible-looking enough that no band would
+catch it.
+
+**With no usable target, the documented default is `0.5`** — the conventional
+"keep your waist under half your height" threshold. That is a *default* here and
+a *refusal* for the weigh-in goal, and the difference is the point: there, the
+target line **is** the goal and inventing one would colour a real body weight
+against a number nobody chose; here the gauge is the optional extra, and refusing
+would delete a bar for somebody who had entered every measurement asked of them.
+
+### When nothing is posted at all
+
+**If either half is missing, the ratio gauge is not posted** — the rule
+`ai_usage_feeder` applies to its optional Fable gauge. A gauge standing at
+"unavailable" is a claim that a number exists and could not be read; nobody has
+promised this household a waist bar, so until they enter a waist there is no
+measurement that *failed*. Posting an unavailable one would put a permanently
+grey sister column in the weight cell of every hub that never uses the feature.
+
+Three bands guard the two numbers, and the third catches what neither of the
+others can: **each input can be plausible while the pair is nonsense.** 85 is a
+believable waist in cm and 70 a believable height in inches, and 1.21 is not a
+ratio any body has.
+
+| band | range | catches |
+|---|---|---|
+| height | 24..96 in | metres or centimetres read as inches |
+| waist | 15..80 in | `335` typed for `33.5` |
+| ratio | 0.2..1.0 | a mixed-unit pair both other bands passed |
+
+**The ratio is stamped by its OLDER half.** It was true only from the moment
+*both* measurements were; taking the newer would let a height entered today keep
+a ratio green that rests on a waist from two months ago.
+
+**Nothing in this feature can take the weight gauge down with it.** `ratio_cycle`
+runs last, after the gauge and the check-off are already on the wire, and it
+cannot raise: every failure class becomes a named journal line and the worst
+outcome is no ratio this cycle. That is the same ordering rule the check-off
+follows — the promise goes first and the extra must never be able to delay or
+lose it. It also does its **own** token refresh rather than sharing the weight
+read's: two grants a cycle is what that independence costs, and a refresh grant
+is cheap next to the list call it precedes.
+
+### The sheet row the Owner must add
+
+One row in the tracker sheet, under the `Health` category. Every column
+NagLight's `internal/defsheet` knows, in its canonical order — blank means leave
+the cell empty:
+
+| column | value | why |
+|---|---|---|
+| `category` | `Health` | the same category file the weigh-in goal lives in, so it is readable through the bind that already exists |
+| `color_weight` | *(blank)* | a category-level column, already set on the category's other rows |
+| `id` | `waist-in` | what `WEIGHT_WAIST_ITEM_ID` defaults to |
+| `title` | `Measure the waist` | free text |
+| `type` | `meta` | `hybrid` input is valid **only** on a `meta` item |
+| `recur` | `weekly` | required for every type but `project`. Weekly keeps one entry readable for the whole week; `daily` would make `count` read 0 every day until it was re-entered (the cache covers the gap either way) |
+| `horizon` | `long` | matches the weigh-in beside it |
+| `target` | `34` | **the waist you are aiming at, in inches — not the ratio.** It is also what makes the item *quantified*, which is what makes `count` appear on `/api/today` at all |
+| `unit` | `in` | checked and never converted; anything else falls back to the 0.5 default |
+| `weight` | *(blank)* | |
+| `rollover` | *(blank)* | |
+| `due` | *(blank)* | |
+| `completed_at` | *(blank)* | written back by the tracker |
+| `progress` | *(blank)* | written back by the tracker |
+| `depends_on` | *(blank)* | a `depends_on` this feeder cannot satisfy would hide the row from `/api/today` |
+| `input` | `hybrid` | free entry. The Owner's ruling (Q6). A `picker` cannot do it: 30–45 in at 0.5 in is 31 steps and the picker caps at 21 |
+| `picker_min` | *(blank)* | a hybrid item **may not** carry picker metadata — NagLight refuses the row |
+| `picker_max` | *(blank)* | |
+| `picker_step` | *(blank)* | |
+| `check` | *(blank)* | this item is entered by a person, not ticked by a feeder |
+| `pause_exempt` | *(blank)* | |
+| `delinquency_hours` | *(blank)* | |
+| `carry_over` | *(blank)* | it affects debt and catch-up offers only, never `count` |
+| `notes` | *(blank)* | |
+
+Then, on the hub, in `/opt/homehub/stack/.env`:
+
+```
+WEIGHT_WAIST_ENABLED=true
+```
+
+and restart the timer. The gauge appears on the first cycle after a waist has
+been entered.
+
+---
+
 ## Files
 
 | File | What it is |
 |---|---|
 | `weight_feeder.py` | the feeder: pure core above the SHELL banner, thin I/O below |
-| `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk). No parser, and no writing door the feeder shares |
+| `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk; `--data-type height` for NI_A2). No parser, and no writing door the feeder shares |
 | `homehub-weight.service` | oneshot unit, hardened, `ProtectHome=read-only` |
 | `homehub-weight.timer` | 15 min, justified against the `static` horizon |
 | `setup-weight.sh` | idempotent install; resolves the ONE category file by frontmatter and generates the drop-in; refuses rather than guessing |

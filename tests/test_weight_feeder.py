@@ -3606,3 +3606,733 @@ def test_the_posted_body_says_lower_is_better_sr075(tmp_path):
     # refuses a direction without a window.
     assert "direction" not in posts[0]
     assert "window" not in posts[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NI_A1 — the posted weight is rounded to the tenth the household measures in
+# ═══════════════════════════════════════════════════════════════════════════
+
+# THE NUMBER THE OWNER ACTUALLY SAW ON THE WALL, and the grams that produce it.
+# 81 700 g / 453.59237 is 180.11766820504496 exactly, which the panel rendered
+# as "180...." once its 80 px cell ellipsised the string. It is the regression
+# value: a test written with a tidy fixture would pass against code that
+# rounded nothing, because 79 832 g happens to convert to 176.00 lb.
+NI_A1_GRAMS = 81700
+NI_A1_RAW_POUNDS = NI_A1_GRAMS / 453.59237
+NI_A1_ROUNDED = 180.1
+assert repr(NI_A1_RAW_POUNDS) == "180.11766820504496", (
+    "the fixture must reproduce the live value, not merely resemble it")
+
+
+def test_the_live_value_that_broke_the_panel_posts_as_one_decimal_ni_a1():
+    """The exact number off the hub's state file, through the exact path.
+
+    NOTHING EVER REMOVED ROUNDING — this path never had any. `git log -p` on
+    weight_feeder.py shows no `round(` in any revision: the gauge's earlier
+    integers came from B5's manual PowerShell feeder, where a person typed
+    them, and the first automated reading landed on 2026-09-09 carrying the
+    full remainder of an exact-factor conversion. So this is a new rule, not a
+    restored one, which is why it is asserted on the VALUE and not on a diff.
+    """
+    body = feeder.gauge_body(NI_A1_RAW_POUNDS, GOAL, NOW)
+    assert body["value"] == NI_A1_ROUNDED
+    # And the string NagLight stores can no longer overflow a fixed-width cell.
+    assert len(str(body["value"])) <= len("180.1")
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (NI_A1_RAW_POUNDS, 180.1),
+    (176.0, 176.0),            # an exact reading is unchanged
+    (180.05, 180.1),           # the boundary rounds
+    (180.04999, 180.0),
+    (99.99, 100.0),            # the panel's 0-dp threshold, crossed by rounding
+])
+def test_the_weight_is_rounded_to_a_tenth_of_a_pound_ni_a1(raw, expected):
+    """One decimal, at the one point the body is assembled."""
+    assert feeder.round_display_lb(raw) == expected
+    assert feeder.gauge_body(raw, GOAL, NOW)["value"] == expected
+
+
+def test_the_goal_target_is_never_rounded_ni_a1():
+    """The TARGET is the person's own number and stays theirs to the digit.
+
+    Rounding the value is a statement about measurement precision. Rounding the
+    target would be editing a declaration somebody typed into their own
+    definitions, and `goal_from_item` already refuses anything it cannot honour
+    rather than adjusting it.
+    """
+    assert feeder.gauge_body(180.0, 170.25, NOW)["target"] == 170.25
+
+
+def test_rounding_cannot_rescue_an_implausible_reading_ni_a1():
+    """0.04 lb rounds to 0.0 and is STILL refused — the band comes first."""
+    with pytest.raises(ValueError):
+        feeder.gauge_body(0.04, GOAL, NOW)
+
+
+def test_the_state_file_stores_the_rounded_weight_ni_a1(tmp_path):
+    """The file and the bar agree, because both go through round_display_lb.
+
+    The stored reading's only purpose is to be re-posted at its original stamp
+    on a failed cycle, so a full-precision copy would buy nothing and would
+    make the state file disagree with every bar ever drawn from it.
+    """
+    env = check_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    point = a_point(grams=NI_A1_GRAMS)
+    feeder.run_cycle(
+        env, now=SAME_DAY_NOW,
+        readers={"google-health": captured_reader(a_body(point))},
+        poster=lambda *a: (True, "HTTP 200"), goal_loader=a_goal,
+        check_loader=lambda *a: None)
+    stored = json.loads(Path(env["WEIGHT_STATE_FILE"]).read_text())
+    assert stored["weight"]["value"] == NI_A1_ROUNDED
+    assert NI_A1_RAW_POUNDS != NI_A1_ROUNDED, "the fixture must exercise it"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NI_A2 — the height half: the SAME route, the SAME scope, no consent change
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 1.778 m is 70.0 in EXACTLY (the international inch is 0.0254 m by
+# definition), so the ratio arithmetic below has no rounding of its own to
+# argue with. It is not the Owner's height.
+FIXTURE_METRES = 1.778
+FIXTURE_HEIGHT_IN = 70.0
+
+
+def a_height_point(physical=FIXTURE_PHYSICAL, metres=FIXTURE_METRES,
+                   member="height", field="heightMeters", point_id="H1"):
+    """One height `dataPoints` element, in the envelope observed on 2026-09-09.
+
+    The ENVELOPE is verified — `dataPoints`, `sampleTime.physicalTime`,
+    `utcOffset`, `nextPageToken` are properties of `DataPoint` and were seen on
+    the weight route. The MEMBER is the assumption this fixture stands in for,
+    which is why `member` and `field` are parameters: the tests below pin what
+    happens when the body is NOT this shape.
+    """
+    return {
+        "name": "users/%s/dataTypes/height/dataPoints/%s" % (SENTINEL_ID, point_id),
+        "dataSource": {"recordingMethod": "MANUAL", "platform": "FITBIT"},
+        member: {"sampleTime": {"physicalTime": physical,
+                                "utcOffset": FIXTURE_OFFSET},
+                 field: metres},
+    }
+
+
+def test_the_height_body_parses_to_inches_and_the_instant_sr022():
+    """metres -> inches, and `physicalTime` -> the instant it was true."""
+    reading = feeder.parse_height_datapoint(a_body(a_height_point()), NOW)
+    assert reading.inches == pytest.approx(FIXTURE_HEIGHT_IN)
+    assert reading.observed_at == CAPTURED_AT
+
+
+def test_metres_are_not_centimetres_and_not_inches_sr022():
+    """The one conversion, pinned against the two ways it could be wrong.
+
+    Read as centimetres the person is 100x too short for the band; read as
+    inches they are 40x too short. BOTH are refused, which is the difference
+    from the weight path — there, a factor of 2.2 can hide inside the band.
+    """
+    assert feeder.metres_to_inches(1.0) == pytest.approx(39.37007874015748)
+    for wrong in (FIXTURE_METRES / 100.0, FIXTURE_METRES * 0.0254):
+        with pytest.raises(feeder.SourceFailure):
+            feeder.check_vendor_metres(wrong, "height")
+
+
+@pytest.mark.parametrize("field", ["heightCm", "heightMillimeters", "value"])
+def test_a_height_field_this_parser_does_not_know_is_refused_sr022(field):
+    """THE UNIT IS CHECKED, NEVER ASSUMED — and here the key name IS the unit.
+
+    `heightMeters` was taken from the discovery document, not from a captured
+    body, so this is the assumption's blast radius: any other shape is refused
+    rather than converted, the ratio gauge is simply not posted, and the weight
+    gauge is untouched.
+    """
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.parse_height_datapoint(
+            a_body(a_height_point(field=field)), NOW)
+    assert "heightMeters" in str(raised.value)
+
+
+def test_a_point_that_is_not_a_height_is_skipped_not_read_sr022():
+    """`DataPoint` is a union of 43 members; a weight point is not a height."""
+    with pytest.raises(feeder.SourceFailure):
+        feeder.parse_height_datapoint(a_body(a_point()), NOW)
+
+
+def test_the_latest_height_wins_and_array_order_is_not_trusted_sr022():
+    """Ordered by `physicalTime`, never by position — the weight rule."""
+    older = a_height_point(physical="2026-09-01T12:00:00Z", metres=1.600,
+                           point_id="H0")
+    reading = feeder.parse_height_datapoint(
+        a_body(a_height_point(), older), NOW)
+    assert reading.inches == pytest.approx(FIXTURE_HEIGHT_IN)
+
+
+def test_two_heights_at_one_instant_that_disagree_are_refused_sr022():
+    """A person's height does not change between two points sharing a stamp."""
+    with pytest.raises(feeder.SourceFailure):
+        feeder.parse_height_datapoint(
+            a_body(a_height_point(), a_height_point(metres=1.60, point_id="H2")),
+            NOW)
+
+
+def test_an_empty_height_history_is_no_ratio_and_not_a_zero_sr022():
+    """An empty list is NoWeightYet; an ABSENT key is a refusal."""
+    with pytest.raises(feeder.NoWeightYet):
+        feeder.parse_height_datapoint({"dataPoints": []}, NOW)
+    with pytest.raises(feeder.SourceFailure):
+        feeder.parse_height_datapoint({}, NOW)
+
+
+def test_no_vendor_height_ever_reaches_a_message_sr022():
+    """Not the value, not the Google user id — it is health data."""
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.parse_height_datapoint(
+            a_body(a_height_point(metres=99.0)), NOW)
+    assert "99" not in str(raised.value) and SENTINEL_ID not in str(raised.value)
+
+
+def test_the_height_route_differs_only_in_the_data_type_segment_ni_a2():
+    """ONE route, the data type as a path segment — so ONE scope.
+
+    This is the "no consent change" claim, made checkable. The two URLs must
+    share scheme, host and version and differ in exactly the `weight`/`height`
+    segment; a height URL on another host or another API version would be a
+    second grant the household never agreed to.
+    """
+    weight_url = feeder.GOOGLE_HEALTH_LIST_URL
+    height_url = feeder.GOOGLE_HEALTH_HEIGHT_LIST_URL
+    assert height_url == weight_url.replace("/dataTypes/weight/",
+                                            "/dataTypes/height/")
+    assert weight_url.count("/dataTypes/weight/") == 1
+
+
+def test_the_height_read_uses_the_one_scope_the_weight_read_holds_ni_a2():
+    """There is no height-specific scope, and no second scope constant."""
+    assert "health_metrics_and_measurements.readonly" in feeder.GOOGLE_HEALTH_SCOPE
+    scopes = [name for name in dir(feeder)
+              if "SCOPE" in name and isinstance(getattr(feeder, name), str)]
+    assert scopes == ["GOOGLE_HEALTH_SCOPE"], (
+        "a second scope constant would be a second consent screen")
+
+
+def test_the_height_reader_walks_pages_over_real_sockets_ni_a2(tmp_path):
+    """The shared page walk, exercised on the height route end to end."""
+    pages = {"/health": a_body(a_height_point(), nextPageToken="P2"),
+             "/health?pageToken=P2": a_body(
+                 a_height_point(physical="2026-09-01T12:00:00Z", metres=1.60,
+                                point_id="H0")),
+             "/token": {"access_token": "ACCESS-TOKEN-XYZ"}}
+
+    def respond(handler):
+        _json_200(handler, pages[handler.path])
+
+    with loopback_server(respond) as (base, _seen):
+        reading = feeder.read_google_health_height(
+            google_env(tmp_path), list_url=base + "/health",
+            token_endpoint=base + "/token")
+    assert reading.inches == pytest.approx(FIXTURE_HEIGHT_IN)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NI_A2 — the waist half: NagLight's own /api/today, and nothing new mounted
+# ═══════════════════════════════════════════════════════════════════════════
+
+FIXTURE_WAIST_IN = 35.0
+FIXTURE_ENTERED_AT = "2026-09-09T01:24:33+00:00"
+
+
+def a_today(count=FIXTURE_WAIST_IN, unit="in", item_id="waist-in",
+            array="items", stamp=FIXTURE_ENTERED_AT, extra=None):
+    """A GET /api/today body carrying one waist row in one of its arrays."""
+    row = {"id": item_id, "title": "Waist", "category": "Health",
+           "done": False, "auto": False, "quantified": True,
+           "input": "hybrid", "target": 34.0}
+    if count is not None:
+        row["count"] = count
+    if unit is not None:
+        row["unit"] = unit
+    if stamp is not None:
+        row["lastEventAt"] = stamp
+        row["lastEvent"] = "0" * 32
+    row.update(extra or {})
+    payload = {"date": "2026-09-09", "items": [], "undoable": [],
+               "catchups": [], "revision": 7}
+    payload[array] = [{"id": "weigh-in", "done": True}, row]
+    return payload
+
+
+def test_the_waist_is_read_from_the_today_row_with_its_unit_checked_ni_a2():
+    """`count` is the value, `unit` says what it means, `lastEventAt` when."""
+    inches, stamp = feeder.waist_from_today(a_today(), "waist-in", NOW)
+    assert inches == FIXTURE_WAIST_IN
+    assert stamp == CAPTURED_AT
+
+
+@pytest.mark.parametrize("array", ["items", "undoable", "catchups"])
+def test_the_waist_is_found_whichever_array_naglight_put_it_in_ni_a2(array):
+    """WHICH ARRAY DEPENDS ON WHETHER THE PERSON IS UNDER THEIR GOAL.
+
+    `engine.derive` sends a quantified row to `items` while the occurrence's
+    fold is short of its target and to `undoable` once it is met. A reader that
+    knew only `items` would lose the measurement on exactly the days somebody
+    was doing well, and the gauge would blink out as a reward for progress.
+    """
+    inches, _stamp = feeder.waist_from_today(a_today(array=array), "waist-in", NOW)
+    assert inches == FIXTURE_WAIST_IN
+
+
+@pytest.mark.parametrize("unit", ["cm", "in ", "IN", None, "", 7])
+def test_a_waist_in_another_unit_is_refused_not_converted_ni_a2(unit):
+    """85 with `unit: cm` is 33.5 in — plausible-looking, and wrong.
+
+    `in ` and `IN` are ACCEPTED (a person typed them); anything else, absent or
+    non-string, is refused without converting. The gauge is lost, never faked.
+    """
+    def call():
+        return feeder.waist_from_today(a_today(unit=unit), "waist-in", NOW)
+
+    if isinstance(unit, str) and unit.strip().casefold() == "in":
+        assert call()[0] == FIXTURE_WAIST_IN
+    else:
+        with pytest.raises(feeder.SourceFailure):
+            call()
+
+
+def test_no_waist_row_is_NOT_a_failure_ni_a2():
+    """Nobody has entered one: that is NoWeightYet, and no journal line."""
+    with pytest.raises(feeder.NoWeightYet):
+        feeder.waist_from_today(a_today(item_id="something-else"), "waist-in", NOW)
+    with pytest.raises(feeder.NoWeightYet):
+        feeder.waist_from_today(a_today(count=None), "waist-in", NOW)
+
+
+def test_a_body_that_is_not_the_today_shape_is_refused_ni_a2():
+    """A shape we do not recognise is refused, never read as 'nothing entered'."""
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_from_today({"hello": "world"}, "waist-in", NOW)
+
+
+def test_a_waist_with_no_stamp_is_refused_rather_than_stamped_now_ni_a2():
+    """Stamping with the clock would keep a months-old measurement fresh."""
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_from_today(a_today(stamp=None), "waist-in", NOW)
+
+
+@pytest.mark.parametrize("count", [0, 335, 3.5, -35])
+def test_an_implausible_waist_count_is_refused_ni_a2(count):
+    """`335` for `33.5` is the typo this band exists to catch."""
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_from_today(a_today(count=count), "waist-in", NOW)
+
+
+def test_the_today_url_is_derived_from_the_verified_feed_url_ni_a2():
+    """NO SECOND DESTINATION KNOB, because there is no second thing to police.
+
+    `resolve_feed_url` refuses anything but this box's loopback or a local
+    docker bridge, since the request carries the tracker token and the
+    household identity. A `WEIGHT_TODAY_URL` would be a second URL to get
+    wrong, and the obvious way to get it wrong — the public https route — would
+    send the token out through oauth2-proxy with nothing refusing it.
+    """
+    assert feeder.today_url_from_feed(
+        "http://127.0.0.1:8080/api/feed") == "http://127.0.0.1:8080/api/today"
+    assert feeder.today_url_from_feed(
+        "http://172.18.0.2:8080/api/feed/") == "http://172.18.0.2:8080/api/today"
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert 'WEIGHT_TODAY_URL"' not in source, (
+        "the destination is derived, not read from the environment")
+
+
+def test_the_waist_read_sends_the_identity_and_goes_nowhere_else_ni_a2():
+    """Over real sockets: the same local-only opener, token and identity."""
+    def respond(handler):
+        _json_200(handler, a_today())
+
+    with loopback_server(respond) as (base, seen):
+        env = {"_identity": "sub-123", "_feed_url": base + "/api/feed",
+               "WEIGHT_FEED_TOKEN": "tracker-token", "_now": NOW}
+        inches, stamp = feeder.read_waist_measurement(env, url=base + "/api/today")
+    assert (inches, stamp) == (FIXTURE_WAIST_IN, CAPTURED_AT)
+    assert seen[0]["headers"]["X-Forwarded-User"] == "sub-123"
+    assert seen[0]["headers"]["Authorization"] == "Bearer tracker-token"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NI_A2 — the ratio itself, and the exact body on the wire
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_the_ratio_is_waist_over_height_to_three_decimals_ni_a2():
+    assert feeder.waist_height_ratio(35.0, 70.0) == 0.5
+    assert feeder.waist_height_ratio(34.0, 70.0) == 0.486
+    assert feeder.waist_height_ratio(33.25, 68.5) == 0.485
+
+
+@pytest.mark.parametrize("waist, height", [
+    (85.0, 70.0),          # a waist in centimetres against a height in inches
+    (35.0, 24.5),          # a height in the band but not this person's
+])
+def test_a_mixed_unit_pair_is_refused_by_the_ratio_band_ni_a2(waist, height):
+    """EACH INPUT CAN BE PLAUSIBLE WHILE THE PAIR IS NONSENSE.
+
+    This is the band that catches what neither of the other two can: 85 is a
+    believable waist in cm and 70 a believable height in inches, and 1.21 is
+    not a ratio any body has.
+    """
+    with pytest.raises(feeder.SourceFailure):
+        feeder.waist_height_ratio(waist, height)
+
+
+def test_the_ratio_gauge_id_sorts_after_the_weight_gauge_ni_a2():
+    """THE HEADLINE TRAP, PINNED AS A COMPARISON RATHER THAN AS PROSE.
+
+    NagLight's `Views()` orders by id and the panel draws `drawn[0]` as the
+    headline. `waist-height` would make the RATIO the big number and demote the
+    body weight to the sub-column — silently, with nothing failing anywhere.
+    """
+    assert feeder.RATIO_GAUGE_ID > feeder.GAUGE_ID
+    assert sorted([feeder.RATIO_GAUGE_ID, feeder.GAUGE_ID])[0] == feeder.GAUGE_ID
+
+
+def test_the_ratio_gauge_shares_the_weight_icon_so_it_groups_ni_a2():
+    """`groupGauges` keys standing gauges on `icon`: same icon, same cell."""
+    assert feeder.RATIO_GAUGE_ICON == feeder.GAUGE_ICON == "scale"
+    assert feeder.RATIO_GAUGE_UNIT != "%", "a % unit routes into the usage row"
+
+
+def test_the_ratio_gauge_sends_min_and_max_because_ratio_has_no_span_if014():
+    """THE EXACT OPPOSITE OF THE WEIGHT GAUGE'S RULE, AND BOTH ARE RIGHT.
+
+    `unitRangeSpan` holds one entry, `lb: 50`. Omitting the ends on THIS gauge
+    is a 400 ("gauge min and max are required for unit ratio"); sending them on
+    the weight gauge would put a second range authority on the producer side.
+    Copying the neighbour breaks whichever one you copy.
+    """
+    body = feeder.ratio_gauge_body(0.5, 0.486, CAPTURED_AT)
+    assert body["min"] == 0.236 and body["max"] == 0.736
+    assert body["min"] < body["target"] < body["max"], "NagLight refuses otherwise"
+    assert "min" not in feeder.gauge_body(180.0, GOAL, NOW)
+
+
+def test_the_exact_posted_ratio_body_if014():
+    """THE WHOLE BODY, FIELD FOR FIELD. Every extra key is a 400 or a lie."""
+    assert feeder.ratio_gauge_body(0.5, 0.486, CAPTURED_AT) == {
+        "kind": "gauge",
+        "id": "weight-waist",
+        "label": "Waist/Ht",
+        "icon": "scale",
+        "unit": "ratio",
+        "value": 0.5,
+        "min": 0.236,
+        "max": 0.736,
+        "target": 0.486,
+        "favourable": "low",
+        "observed_at": "2026-09-09T01:24:33Z",
+    }
+
+
+def test_the_exact_posted_weight_body_if014():
+    """Its sister, pinned in the same way, with the NI_A1 value."""
+    assert feeder.gauge_body(NI_A1_RAW_POUNDS, 170.0, CAPTURED_AT) == {
+        "kind": "gauge",
+        "id": "weight",
+        "label": "Weight",
+        "icon": "scale",
+        "unit": "lb",
+        "value": 180.1,
+        "target": 170.0,
+        "favourable": "low",
+        "observed_at": "2026-09-09T01:24:33Z",
+    }
+
+
+def test_the_ratio_body_carries_no_window_no_direction_and_no_colour_if014():
+    body = feeder.ratio_gauge_body(0.5, 0.5, CAPTURED_AT)
+    for forbidden in ("window", "direction", "css", "severity", "color",
+                      "colour", "rgb"):
+        assert forbidden not in body
+
+
+def test_a_ratio_body_must_carry_the_instant_it_was_measured_if014():
+    """There is NO unavailable ratio gauge — see build_ratio_post."""
+    with pytest.raises(ValueError):
+        feeder.ratio_gauge_body(0.5, 0.5, None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NI_A2 — the target, the cache, and "post nothing" as the default answer
+# ═══════════════════════════════════════════════════════════════════════════
+
+WAIST_MD = HEALTH_MD.replace(
+    "  - id: walk-steps\n",
+    "  - id: waist-in\n"
+    "    title: Measure the waist\n"
+    "    type: meta\n"
+    "    input: hybrid\n"
+    "    recur: weekly\n"
+    "    target: 34\n"
+    "    unit: in\n"
+    "  - id: walk-steps\n")
+assert "id: waist-in" in WAIST_MD
+
+
+def test_the_ratio_target_is_the_waist_goal_expressed_as_a_ratio_ni_a2(tmp_path):
+    """ONE NUMBER, IN THE UNIT IT IS MEASURED IN.
+
+    The Owner declares the waist they are aiming at, in inches, because that is
+    what `unit: in` means to every other reader of that sheet — and because
+    NagLight treats a quantified row as satisfied once progress reaches its
+    target, so a `0.5` in that column would mark the item done the instant any
+    waist was entered, forever. The gauge's target line is that same goal
+    expressed in the gauge's own terms.
+    """
+    defs = write_defs(tmp_path, {"health.md": WAIST_MD})
+    target, where = feeder.waist_target_ratio_from_definitions(
+        defs, FIXTURE_HEIGHT_IN)
+    assert target == 0.486                    # 34 in / 70 in
+    assert where.endswith("health.md")
+
+
+@pytest.mark.parametrize("edit, why", [
+    ("target: 34", "no target declared at all"),
+    ("unit: in", "no unit declared, so the number means nothing"),
+])
+def test_an_undeclared_waist_target_takes_the_documented_default_ni_a2(
+        tmp_path, edit, why):
+    """A DEFAULT HERE, A REFUSAL FOR THE WEIGH-IN GOAL — and the difference is
+    the point. There, the target line IS the goal and inventing one would
+    colour a real body weight against a number nobody chose. Here the gauge is
+    the optional extra, and refusing would delete a bar for somebody who had
+    entered every measurement asked of them. 0.5 is the conventional threshold
+    and it is documented in README.md as the fallback.
+    """
+    defs = write_defs(tmp_path, {"health.md": WAIST_MD.replace(edit, "")})
+    target, where = feeder.waist_target_ratio_from_definitions(
+        defs, FIXTURE_HEIGHT_IN)
+    assert target == 0.5, why
+    assert "default" in where
+
+
+def test_a_waist_target_in_another_unit_is_never_converted_ni_a2(tmp_path):
+    """`target: 85` with `unit: cm` is 33.5 in — the goal_from_item rule."""
+    defs = write_defs(tmp_path, {"health.md": WAIST_MD.replace("unit: in",
+                                                               "unit: cm")})
+    target, _where = feeder.waist_target_ratio_from_definitions(
+        defs, FIXTURE_HEIGHT_IN)
+    assert target == feeder.DEFAULT_RATIO_TARGET
+
+
+def test_with_no_height_there_is_no_target_to_express_ni_a2(tmp_path):
+    """A ratio target is a waist goal DIVIDED BY a height; with none, default."""
+    defs = write_defs(tmp_path, {"health.md": WAIST_MD})
+    assert feeder.waist_target_ratio_from_definitions(defs, None)[0] == 0.5
+
+
+@pytest.mark.parametrize("missing", ["waist", "height", "both"])
+def test_an_absent_half_posts_no_ratio_gauge_at_all_ni_a2(missing):
+    """THE OPTIONAL-GAUGE RULE, THE ONE `ai_usage_feeder` APPLIES TO FABLE.
+
+    A gauge standing at "unavailable" is a claim that a number exists and could
+    not be read. Nobody has promised this household a waist bar, so until they
+    enter a waist there is no measurement that failed — and posting an
+    unavailable one would put a permanently grey sister column in the weight
+    cell of every hub that never uses the feature.
+    """
+    waist = {"value": FIXTURE_WAIST_IN, "observed_at": CAPTURED_AT}
+    height = {"value": FIXTURE_HEIGHT_IN, "observed_at": CAPTURED_AT}
+    if missing in ("waist", "both"):
+        waist = None
+    if missing in ("height", "both"):
+        height = None
+    assert feeder.build_ratio_post(waist, height, 0.5, NOW) is None
+
+
+def test_the_ratio_is_stamped_by_its_OLDER_half_ni_a2():
+    """The ratio was true only from the moment BOTH numbers were.
+
+    Taking the newer would let a height entered today keep a ratio green that
+    rests on a waist from two months ago; taking the older means the gauge goes
+    stale on NagLight's 7-day static horizon once the waist stops being
+    re-entered, which is exactly what should happen.
+    """
+    old, new = CAPTURED_AT - 30 * 86400, CAPTURED_AT
+    body = feeder.build_ratio_post(
+        {"value": FIXTURE_WAIST_IN, "observed_at": old},
+        {"value": FIXTURE_HEIGHT_IN, "observed_at": new}, 0.5, NOW)
+    assert body["observed_at"] == feeder.iso8601_utc(old)
+    assert not feeder.is_fresh(body, NOW), "a month-old waist is not fresh"
+
+
+def test_the_cached_inches_survive_a_load_that_refuses_pounds_ni_a2(tmp_path):
+    """A 70 in height is outside the 40..1000 lb band, so it needs its own.
+
+    Without a dedicated validator `load_state`'s generic one would DROP both
+    cached halves on every load — the ratio gauge would then never survive a
+    single failed cycle, and nothing would say why.
+    """
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "weight": {"value": 180.1, "observed_at": CAPTURED_AT},
+        "height-in": {"value": FIXTURE_HEIGHT_IN, "observed_at": CAPTURED_AT},
+        "waist-in": {"value": FIXTURE_WAIST_IN, "observed_at": CAPTURED_AT},
+        "waist-in-corrupt": {"value": "zzz"},
+    }), encoding="utf-8")
+    state = feeder.load_state(str(path), NOW)
+    assert state["height-in"]["value"] == FIXTURE_HEIGHT_IN
+    assert state["waist-in"]["value"] == FIXTURE_WAIST_IN
+    assert "waist-in-corrupt" not in state
+
+
+@pytest.mark.parametrize("entry", [
+    {"value": 3.5, "observed_at": CAPTURED_AT},        # metres read as inches
+    {"value": FIXTURE_HEIGHT_IN, "observed_at": NOW + 10 ** 6},   # future stamp
+    {"value": FIXTURE_HEIGHT_IN}, "not a dict", None,
+])
+def test_a_corrupt_cached_half_is_dropped_not_posted_ni_a2(entry):
+    """The state file is INPUT, not memory — validate_stored_reading's rule."""
+    assert feeder.validate_stored_inches(
+        entry, NOW, feeder.check_plausible_height_in, "height") is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NI_A2 — the whole cycle: three posts, and the extra never costs the promise
+# ═══════════════════════════════════════════════════════════════════════════
+
+RATIO_DEFS = WAIST_MD.replace(
+    "  - id: weigh-in\n"
+    "    title: Step on the scale\n"
+    "    type: habit\n"
+    "    recur: weekly\n",
+    "  - id: weigh-in\n"
+    "    title: Step on the scale\n"
+    "    type: automated\n"
+    "    check: weight\n"
+    "    recur: weekly\n")
+assert "type: automated" in RATIO_DEFS and "id: waist-in" in RATIO_DEFS
+
+
+def ratio_env(tmp_path, feed_url):
+    env = check_env(tmp_path, feed_url, defs=RATIO_DEFS)
+    env["WEIGHT_WAIST_ENABLED"] = "true"
+    return env
+
+
+def a_height_reader(inches=FIXTURE_HEIGHT_IN, stamp=CAPTURED_AT):
+    return lambda env: feeder.HeightReading(inches=inches, observed_at=stamp)
+
+
+def a_waist_reader(inches=FIXTURE_WAIST_IN, stamp=CAPTURED_AT):
+    return lambda env: (inches, stamp)
+
+
+def run_with_ratio(env, posts, height_reader=None, waist_reader=None,
+                   now=SAME_DAY_NOW):
+    def poster(body, url, e, t):
+        posts.append(body)
+        return True, "HTTP 200"
+
+    def ratio(env_, state, now_, poster_, feed_url, timeout, failures):
+        return feeder.ratio_cycle(
+            env_, state, now_, poster_, feed_url, timeout, failures,
+            height_readers={"google-health": height_reader or a_height_reader()},
+            waist_reader=waist_reader or a_waist_reader())
+
+    return feeder.run_cycle(
+        env, now=now, readers={"google-health": captured_reader()},
+        poster=poster, goal_loader=a_goal, check_loader=lambda *a: None,
+        ratio=ratio)
+
+
+def test_a_full_cycle_posts_the_weight_then_the_ratio_ni_a2(tmp_path):
+    """THE ORDER IS THE ASSERTION. The promise first, the extra last."""
+    posts = []
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    posted, failures, _ = run_with_ratio(env, posts)
+    assert failures == []
+    assert [body["id"] for body in posts] == ["weight", "weight-waist"]
+    assert posted == [("weight", True, True), ("weight-waist", True, True)]
+    assert posts[1]["value"] == 0.5 and posts[1]["target"] == 0.486
+
+
+def test_the_ratio_gauge_ships_off_ni_a2(tmp_path):
+    """Two extra calls a cycle, and a sheet row a person must add by hand."""
+    posts = []
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    del env["WEIGHT_WAIST_ENABLED"]
+    posted, _failures, _ = run_with_ratio(env, posts)
+    assert [body["id"] for body in posts] == ["weight"]
+    assert posted == [("weight", True, True)]
+    for value in ("True", "yes", "1", ""):
+        assert not feeder.resolve_waist_enabled({"WEIGHT_WAIST_ENABLED": value})
+    assert feeder.resolve_waist_enabled({"WEIGHT_WAIST_ENABLED": "true"})
+
+
+@pytest.mark.parametrize("why", ["source-failure", "nothing-logged", "our-bug"])
+def test_the_ratio_never_takes_the_weight_gauge_down_with_it_ni_a2(tmp_path, why):
+    """EVERY failure class in the extra leaves the promise posted, first.
+
+    `ratio_cycle` may not raise: the weight gauge and the check-off are already
+    on the wire by the time it runs, and SN-040's promise must not be behind a
+    feature that is allowed to fail.
+    """
+    errors = {"source-failure": feeder.SourceFailure("google is down"),
+              "nothing-logged": feeder.NoWeightYet("nothing logged"),
+              "our-bug": RuntimeError("a bug in our own reader")}
+
+    def boom(_env):
+        raise errors[why]
+
+    posts = []
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    posted, _failures, _ = run_with_ratio(env, posts, height_reader=boom)
+    assert posts[0]["id"] == "weight" and posts[0]["value"] == 176.0
+    assert ("weight", True, True) in posted
+    assert [body["id"] for body in posts] == ["weight"], "no ratio, no crash"
+
+
+def test_a_transient_failure_reposts_the_cached_ratio_ni_a2(tmp_path):
+    """WHY THE CACHE EXISTS: one bad fifteen minutes must not delete a gauge.
+
+    Cycle 1 reads both halves and caches them. Cycle 2's sources are both dead,
+    and the ratio still stands — at its ORIGINAL stamp, never re-stamped to
+    now, so it goes stale on NagLight's own horizon rather than lying.
+    """
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    stored = json.loads(Path(env["WEIGHT_STATE_FILE"]).read_text())
+    assert stored["height-in"]["value"] == FIXTURE_HEIGHT_IN
+    assert stored["waist-in"]["value"] == FIXTURE_WAIST_IN
+
+    def dead(_env):
+        raise feeder.SourceFailure("the source is down")
+
+    second = []
+    posted, failures, _ = run_with_ratio(
+        env, second, height_reader=dead, waist_reader=dead)
+    ratio_body = [body for body in second if body["id"] == "weight-waist"]
+    assert len(ratio_body) == 1, "the gauge survived the outage"
+    assert ratio_body[0]["observed_at"] == feeder.iso8601_utc(CAPTURED_AT)
+    assert ("weight-waist", False, True) in posted, "posted, but not fresh"
+    assert any("height" in line for line in failures), "and the failure is named"
+
+
+def test_a_cycle_that_changes_nothing_does_not_rewrite_the_state_file_ni_a2(
+        tmp_path):
+    """The unchanged rule: a failed read must not refresh history it did not
+    improve, which is what stops a stored stamp from decaying into permanent
+    freshness."""
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+    path = Path(env["WEIGHT_STATE_FILE"])
+    before = path.read_bytes()
+
+    def dead(_env):
+        raise feeder.SourceFailure("down")
+
+    feeder.run_cycle(
+        env, now=SAME_DAY_NOW + 900, readers={"google-health": dead},
+        poster=lambda *a: (True, "HTTP 200"), goal_loader=a_goal,
+        check_loader=lambda *a: None,
+        ratio=lambda e, s, n, p, f, t, fails: None)
+    assert path.read_bytes() == before

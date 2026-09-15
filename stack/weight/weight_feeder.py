@@ -227,6 +227,98 @@ RUNE_LIMIT = 120             # id/label/icon/unit are capped in RUNES, not bytes
 # table, so omitting them there is a refusal.
 GAUGE_MIN_MAX_OMITTED = True
 
+# THE POSTED WEIGHT IS ROUNDED TO 0.1 lb, AND THAT IS A DISPLAY FACT THE
+# PRODUCER OWES THE PANEL RATHER THAN A LOSS OF PRECISION.
+#
+# Nothing ever removed rounding: this path never had any. B5's manual
+# `feeders/weight-manual.ps1` posted whole numbers a person had typed, so every
+# value on this gauge was an integer until the Google Health reader landed on
+# 2026-09-09 - and `grams_to_pounds` divides by the exact international-pound
+# definition, so 81 700 g became `180.11766820504496`. The panel's `formatValue`
+# keeps one decimal for a non-integer, the string grew from `186 lb` to
+# `180.1 lb`, and the fixed-width gauge cell ellipsised it into the "180...."
+# the Owner saw (NI_A1).
+#
+# The panel's own truncation is fixed panel-side; this is the other half. The
+# scale this household weighs on reports to a tenth, the goal is declared to a
+# tenth, and fourteen decimal places of a float are not a measurement - they are
+# the conversion's remainder. They must not reach the aria label or the state
+# file either, which is why the rounding lives in `round_display_lb` and BOTH
+# the wire and the stored reading go through it.
+DISPLAY_DECIMALS_LB = 1
+
+# ── The SECOND gauge: waist-to-height ratio (NI_A2) ──────────────────────────
+# A sister bar in the weight cell, not a second cell. The panel's `groupGauges`
+# keys standing gauges on `icon`, so a gauge sharing `scale` lands in the weight
+# column automatically and needs no panel change to be GROUPED. Two traps, both
+# load-bearing:
+#
+#   * THE ID MUST SORT AFTER `weight`. NagLight's `Views()` orders by id and the
+#     panel draws `drawn[0]` as the headline, so `waist-height` would make the
+#     RATIO the headline number and demote the body weight to the sub-column,
+#     silently, with nothing failing. `weight-waist` sorts after `weight`
+#     because it is that string plus a suffix, and a test pins the comparison
+#     rather than the reasoning.
+#   * `ratio` IS NOT IN NagLight's `unitRangeSpan`. That table holds exactly one
+#     entry, `lb: 50`, so `lb` is the ONE unit whose bar the tracker will infer.
+#     Omitting min/max here is a 400 ("gauge min and max are required for unit
+#     \"ratio\""), which is the exact opposite of the weight gauge's rule and is
+#     the single easiest thing to get wrong by copying the neighbour.
+RATIO_GAUGE_ID = "weight-waist"
+RATIO_GAUGE_LABEL = "Waist/Ht"
+# THE SAME ICON IS THE GROUPING KEY. It is written as the weight gauge's
+# constant rather than as another "scale" literal so the two cannot drift apart
+# and quietly become two separate columns.
+RATIO_GAUGE_ICON = GAUGE_ICON
+RATIO_GAUGE_UNIT = "ratio"
+# Lower is better, and for the same reason as the weight gauge: a standing
+# target has no deadline, so at-or-below is flat green at any distance.
+RATIO_GAUGE_FAVOURABLE = "low"
+# The bar is target +/- this. 0.25 either side of ~0.5 spans roughly 0.25..0.75,
+# which covers the whole range a human body reaches, so a real reading is never
+# pinned to an end of the bar. It is EXPLICIT because `ratio` has no inferred
+# span; there is no household-agreed width to defer to, so unlike the weight
+# gauge there is no second authority to avoid duplicating.
+RATIO_RANGE_HALF_SPAN = 0.25
+# Three decimals. 0.001 of a ratio is about 0.07 in of waist on a 70 in frame -
+# finer than anybody measures and coarse enough that the panel never renders a
+# conversion remainder (the NI_A1 failure, one gauge over).
+DISPLAY_DECIMALS_RATIO = 3
+# The threshold the measurement is conventionally read against ("keep your waist
+# under half your height"). It is the DEFAULT ONLY - used when the Owner's item
+# declares no target at all - and it is a default rather than a refusal because,
+# unlike the weight goal, this gauge is the optional extra: refusing would mean
+# no ratio bar for someone who had entered every measurement asked of them.
+DEFAULT_RATIO_TARGET = 0.5
+# A ratio outside this is not a body. It catches the units error the two bands
+# above cannot: inches divided by inches is right, inches divided by CENTIMETRES
+# is ~0.4x, and a waist accidentally read in cm is ~2.5x. The upper end is 1.0 -
+# a waist equal to one's height - because the largest ratios ever recorded sit
+# near 0.9, so 1.0 leaves real headroom while still refusing the 1.2 that a
+# centimetre waist against an inch height produces.
+PLAUSIBLE_RATIO = (0.2, 1.0)
+
+# Where the waist measurement is declared and entered. Location knobs, never a
+# value - the same rule, and the same reason, as WEIGHT_ITEM_CATEGORY /
+# WEIGHT_ITEM_ID: the household's intent lives in the person's own definitions
+# and cannot be set on the hub.
+DEFAULT_WAIST_CATEGORY = "Health"
+DEFAULT_WAIST_ITEM_ID = "waist-in"
+# The unit the waist item must declare. CHECKED, NEVER ASSUMED, exactly as the
+# weigh-in goal's `lb` is: a waist of 85 typed with `unit: cm` is 33.5 in, and
+# 85 is a perfectly plausible-looking number that would post a ratio of 1.2 and
+# paint it full red against a goal the person is actually meeting.
+WAIST_UNIT = "in"
+# 15..80 in spans a child's waist to well past the largest adult measurement.
+PLAUSIBLE_WAIST_IN = (15.0, 80.0)
+
+# The state file's keys for the two cached halves of the ratio. They are NOT
+# weights, so `load_state`'s generic reading validator would refuse both (a
+# 70 in height is outside the 40..1000 lb band) - each gets its own validator,
+# the way CHECK_STATE_KEY does, rather than an exemption.
+HEIGHT_STATE_KEY = "height-in"
+WAIST_STATE_KEY = "waist-in"
+
 # NagLight's staleness horizons by window kind, kept here because the cadence
 # has to be chosen against them. This gauge has NO window, so it takes the
 # `static` horizon: 7 days. That is a long time for a wall panel to keep
@@ -466,6 +558,33 @@ def check_plausible_weight_lb(value, where):
             "error or corruption rather than a body weight"
             % (where, value, low, high))
     return pounds
+
+
+def round_display_lb(value):
+    """Round a weight to the precision the household actually measures in.
+
+    Contract:
+      Inputs:  value: float pounds, already checked finite by the caller.
+      Outputs: float pounds rounded to DISPLAY_DECIMALS_LB (0.1 lb).
+      Raises:  nothing - it is called only on numbers `check_pounds` vouched
+               for, and rounding cannot make a finite number infinite.
+
+    IT IS A SEPARATE FUNCTION BECAUSE IT HAS TWO CALL SITES AND MUST NOT DRIFT:
+    `gauge_body`, which decides what the wall is told, and `run_cycle`, which
+    decides what the state file remembers. A rounding applied at only one of
+    them would mean the file and the bar disagreed in the fourteenth decimal
+    place, which is exactly the sort of difference that is invisible until
+    somebody diffs two numbers that ought to be the same one.
+
+    ROUNDING IS NOT A CONVERSION AND THIS IS NOT THE UNIT GUARD. It happens
+    AFTER `check_plausible_weight_lb`, on a number that is already pounds and
+    already inside the band, so no rounding can turn an implausible reading
+    into a plausible one - 0.04 lb rounds to 0.0 and 0.0 is still refused, on
+    the other side of this call.
+
+    Implements: LLR-006
+    """
+    return round(float(value), DISPLAY_DECIMALS_LB)
 
 
 def check_observed_at(stamp, now, where):
@@ -924,6 +1043,265 @@ def next_page_token(payload):
     return token if isinstance(token, str) and token.strip() else None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# THE GOOGLE HEALTH v4 HEIGHT PARSER (NI_A2).
+#
+# WHY THE SAME ENDPOINT AND THE SAME SCOPE, AND WHY THAT IS THE WHOLE POINT.
+# `dataTypes/{dataTypesId}/dataPoints` is ONE route with the data type as a path
+# segment, and there is no height-specific OAuth scope any more than there is a
+# weight-specific one: the single scope this feeder already holds,
+# GOOGLE_HEALTH_SCOPE (`health_metrics_and_measurements.readonly`), is the one
+# that admits BOTH data types. So reading height asks the household for NOTHING
+# NEW. No second consent screen, no re-mint, no widening - the Owner already
+# handed this box body fat, blood glucose, oxygen saturation, core body
+# temperature and heart rate when they consented for a weight bar, and height is
+# inside that same grant. That is stated here, in README.md and in IF-014
+# because "no consent change" is a claim about the household's privacy and it
+# must be checkable rather than remembered.
+#
+# WHAT IS OBSERVED AND WHAT IS ASSUMED, MARKED AS SUCH. The weight body was
+# captured live on 2026-09-09 and this parser inherits every VERIFIED part of
+# it: the route, the scope, the `dataPoints` envelope, the `nextPageToken`
+# paging, and the `sampleTime.physicalTime` / `utcOffset` / `civilTime` shape,
+# which are properties of `DataPoint` rather than of the weight member. What has
+# NOT been seen is a height point's own member, so `heightMeters` is taken from
+# the discovery document and IS AN ASSUMPTION.
+#
+# THE ASSUMPTION IS MADE SAFE BY REFUSING RATHER THAN GUESSING. The key is
+# required by exact name: a body carrying `heightCm`, `heightMillimeters` or a
+# bare `height` number is REFUSED, not converted, because a metres reader fed
+# centimetres posts a person 100x too tall and a metres reader fed inches posts
+# one 40x too short - and unlike the weight gauge, whose wrongness at least
+# lands in a band a human recognises, a ratio of 0.02 or 20 is a number nobody
+# has any intuition for. A refusal costs the ratio gauge and nothing else: the
+# weight gauge is posted from a different call, and the cached height carries
+# the ratio through a transient failure. `weight_oauth.py capture --data-type
+# height` exists so the Owner can settle the assumption with one real call, and
+# when they do, this comment says what to change.
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEIGHT_MEMBER = "height"
+HEIGHT_METERS_KEY = "heightMeters"
+
+# The international inch is 0.0254 m EXACTLY, by definition, so this is not an
+# approximation and the same reasoning applies as to `grams_to_pounds`: a
+# rounded 39.37 drifts visibly once a ratio is taken to three decimals.
+METRES_PER_INCH = 0.0254
+
+# 24..96 in is 2 ft to 8 ft. As with PLAUSIBLE_LB the point is not to police
+# anybody's body: it is to catch a units error before it becomes a confident
+# wrong ratio on a wall. Note what it CANNOT catch - metres read as metres is
+# right, but centimetres read as metres is 100x and inches read as metres is
+# 40x, and BOTH land far outside this band, which is why the band is the second
+# guard and the exact key name is the first.
+PLAUSIBLE_HEIGHT_IN = (24.0, 96.0)
+
+
+def metres_to_inches(metres, where="metres"):
+    """Convert the vendor's metres to the household's inches.
+
+    Google Health v4 states body height as `heightMeters` (a double) and this
+    household measures itself in inches, so exactly one conversion exists on
+    this path and it lives here rather than inline at the call site - the same
+    rule, for the same reason, as `grams_to_pounds`.
+
+    Implements: LLR-006
+    """
+    return check_pounds(metres, where) / METRES_PER_INCH
+
+
+def check_plausible_height_in(value, where):
+    """Return `value` as a float height in inches, or raise SourceFailure.
+
+    The band is PLAUSIBLE_HEIGHT_IN and it is checked for the same reason
+    `check_plausible_weight_lb` checks its own: a finite positive number is not
+    yet a human measurement, and the ratio gauge divides by this one, so a
+    height of 0.06 (metres read as inches) would not merely be wrong, it would
+    make the ratio explode.
+
+    Implements: LLR-006
+    """
+    inches = check_pounds(value, where)
+    low, high = PLAUSIBLE_HEIGHT_IN
+    if inches < low or inches > high:
+        raise SourceFailure(
+            "%s: %r in is outside the plausible band %g..%g, so it is a units "
+            "error or corruption rather than a body height" % (where, value, low, high))
+    return inches
+
+
+def check_vendor_metres(raw, where):
+    """`heightMeters` -> plausible inches, or SourceFailure naming no VALUE.
+
+    It wraps the conversion and the band for exactly the reason
+    `check_vendor_grams` does: their messages quote the value, and a
+    well-formed value here IS the Owner's body height, which is health data
+    about a specific person. The message names the field and the type; the
+    number stays out of the journal.
+
+    Implements: LLR-006
+    """
+    try:
+        inches = metres_to_inches(raw, where)
+    except SourceFailure:
+        raise SourceFailure(
+            "%s: %s is not a usable number (it is a %s). The value is not "
+            "logged." % (where, HEIGHT_METERS_KEY, type(raw).__name__))
+    try:
+        return check_plausible_height_in(inches, where)
+    except SourceFailure:
+        raise SourceFailure(
+            "%s: %s converts to a height outside the plausible band %g..%g in, "
+            "so it is a units error or corruption rather than a body height. "
+            "The value is not logged: it is health data."
+            % (where, HEIGHT_METERS_KEY, PLAUSIBLE_HEIGHT_IN[0],
+               PLAUSIBLE_HEIGHT_IN[1]))
+
+
+class HeightReading(object):
+    """ONE height measurement: inches, and the instant it was TRUE.
+
+    It carries less than `WeightReading` on purpose. There is no check-off on
+    height and nothing downstream needs its calendar day, so `civil_date` and
+    the offset are not carried - a field nobody reads is a field that can be
+    logged by accident.
+    """
+
+    __slots__ = ("inches", "observed_at")
+
+    def __init__(self, inches, observed_at):
+        self.inches = inches
+        self.observed_at = observed_at
+
+    def __repr__(self):
+        # Same rule as WeightReading: this object's whole content is health
+        # data about one person, and a repr reaches tracebacks and journals.
+        return "HeightReading(<not logged: health data>)"
+
+
+def height_from_data_point(point, now, where):
+    """ONE element of `dataPoints` -> a HeightReading, or SourceFailure.
+
+    Contract:
+      Inputs:  point: one element, exactly as decoded; now: this cycle's clock;
+               where: "google-health(height) dataPoints[3]" or the like.
+      Outputs: HeightReading.
+      Raises:  SourceFailure for a non-object, a point with no `height` member,
+               a `height` with no `heightMeters` or no `sampleTime`, an
+               unusable number, and a `physicalTime` that is missing,
+               unparseable, zoneless, before EPOCH_FLOOR or in the FUTURE.
+
+    IT MIRRORS `weight_from_data_point` DELIBERATELY AND IS NOT FOLDED INTO IT.
+    The two differ in the member name, the field name, the conversion, the band
+    and the message wording, which is every line that matters; a shared
+    parameterised version would take five arguments to save four lines and
+    would make one data type's failure message the other's problem. What IS
+    shared is genuinely shared: `parse_rfc3339_utc`, `check_observed_at` and
+    `next_page_token` are called, not copied, because the envelope and the
+    sample-time shape are properties of `DataPoint` rather than of either
+    member, and those WERE observed on 2026-09-09.
+
+    `name` AND `dataSource` ARE NEVER READ, for the same reason as on the
+    weight path: `name` holds the Owner's Google user id.
+
+    Implements: SR-022, LLR-006
+    """
+    if not isinstance(point, dict):
+        raise SourceFailure("%s: data point is not an object (it is a %s)"
+                            % (where, type(point).__name__))
+    if HEIGHT_MEMBER not in point:
+        raise SourceFailure(
+            "%s: data point carries no `%s` member. DataPoint is a union of 43 "
+            "members and this one is not a height." % (where, HEIGHT_MEMBER))
+    height = point.get(HEIGHT_MEMBER)
+    if not isinstance(height, dict):
+        raise SourceFailure("%s: `%s` is not an object (it is a %s)"
+                            % (where, HEIGHT_MEMBER, type(height).__name__))
+    if HEIGHT_METERS_KEY not in height:
+        # THE UNIT IS CHECKED, NEVER ASSUMED, AND HERE THE KEY NAME IS THE
+        # UNIT. A body carrying `heightCm` is not a shape to convert from; it
+        # is a shape nobody has seen, and reading it as metres would post a
+        # person a hundred times too tall with nothing on the wall able to say
+        # so.
+        raise SourceFailure(
+            "%s: `%s` carries no `%s`, so this body does not state the height "
+            "in the one unit this parser reads. It is REFUSED rather than "
+            "converted from whatever else is present: the unit is never "
+            "assumed. Capture one real height body (`weight_oauth.py capture "
+            "--data-type height`) and write the parser against it."
+            % (where, HEIGHT_MEMBER, HEIGHT_METERS_KEY))
+    inches = check_vendor_metres(height.get(HEIGHT_METERS_KEY), where)
+    sample = height.get(SAMPLE_TIME_KEY)
+    if not isinstance(sample, dict):
+        raise SourceFailure(
+            "%s: `%s` carries no `%s` object (it is a %s). Without it there is "
+            "no instant at which this height was true, and `observed_at` may "
+            "not be invented from the clock."
+            % (where, HEIGHT_MEMBER, SAMPLE_TIME_KEY, type(sample).__name__))
+    observed_at = check_observed_at(
+        parse_rfc3339_utc(sample.get(PHYSICAL_TIME_KEY), where), now, where)
+    return HeightReading(inches=inches, observed_at=observed_at)
+
+
+def parse_height_datapoint(payload, now, where="google-health(height)"):
+    """ONE `ListDataPointsResponse` page -> the LATEST usable HeightReading.
+
+    Every rule is `parse_weight_datapoint`'s, applied to the other member, and
+    each is there for the reason recorded at that function: the latest is
+    chosen by `physicalTime` rather than by array position; an EMPTY list is
+    `NoWeightYet` (the source works and has nothing logged) while an ABSENT
+    `dataPoints` key is a REFUSAL (the body is not the shape that was
+    captured); one bad point costs itself and not the page.
+
+    THE TIE RULE IS THE ONE DELIBERATE DIFFERENCE, AND IT IS STILL A REFUSAL.
+    Two weigh-ins at one instant with different weights are refused because
+    either one would draw a bar the other contradicts. Two heights at one
+    instant that differ are refused for a blunter reason: an adult's height
+    does not change between two points sharing a timestamp, so the disagreement
+    is evidence the body is not what this parser thinks it is.
+
+    Implements: SR-022, LLR-006
+    """
+    if not isinstance(payload, dict):
+        raise SourceFailure("%s: the response body is not an object (it is a %s)"
+                            % (where, type(payload).__name__))
+    if DATA_POINTS_KEY not in payload:
+        raise SourceFailure(
+            "%s: the response body carries no `%s` key at all, so it is not "
+            "the envelope this route was observed to return and is refused "
+            "instead of read as 'no height logged'." % (where, DATA_POINTS_KEY))
+    points = payload.get(DATA_POINTS_KEY)
+    if points is None or (isinstance(points, list) and not points):
+        raise NoWeightYet(
+            "%s: HTTP 200 with no data points, so this account has no height "
+            "logged in Google Health yet. That is not a broken source and not "
+            "a height of 0 - the ratio gauge simply is not posted until a "
+            "height exists. Enter one in the Google Health app." % where)
+    if not isinstance(points, list):
+        raise SourceFailure("%s: `%s` is not a list (it is a %s)"
+                            % (where, DATA_POINTS_KEY, type(points).__name__))
+    readings, problems = [], []
+    for index, point in enumerate(points):
+        try:
+            readings.append(height_from_data_point(
+                point, now, "%s %s[%d]" % (where, DATA_POINTS_KEY, index)))
+        except SourceFailure as exc:
+            problems.append(str(exc))
+    if not readings:
+        raise SourceFailure(
+            "%s: %d data point(s) and not one usable height among them (%s)"
+            % (where, len(points), "; ".join(problems)))
+    newest = max(reading.observed_at for reading in readings)
+    tied = [reading for reading in readings if reading.observed_at == newest]
+    if len({reading.inches for reading in tied}) > 1:
+        raise SourceFailure(
+            "%s: %d data points share the newest instant and disagree about "
+            "the height. A person's height does not change between two points "
+            "at one instant, so this body is not what this parser thinks it "
+            "is." % (where, len(tied)))
+    return tied[0]
+
+
 def clean_scalar(text):
     """Strip the quoting and the trailing `# comment` a hand-edited YAML scalar
     may carry, and return what the person meant.
@@ -1334,7 +1712,12 @@ def gauge_body(value_lb, goal_lb, observed_at):
         "label": GAUGE_LABEL,
         "icon": GAUGE_ICON,
         "unit": GAUGE_UNIT,
-        "value": float(value_lb),
+        # ROUNDED TO 0.1 lb HERE, AT THE ONE POINT THE BODY IS ASSEMBLED.
+        # See DISPLAY_DECIMALS_LB: the conversion's remainder is not a
+        # measurement, and the panel's fixed-width cell ellipsised it into the
+        # "180...." of NI_A1. The TARGET is NOT rounded - it is a number the
+        # person typed into their own definitions and is theirs to the digit.
+        "value": round_display_lb(value_lb),
         "target": float(goal_lb),
         # LOWER IS BETTER, AND NOTHING ELSE ON THE WIRE COULD SAY SO.
         # `direction` would be the obvious place, but NagLight REFUSES it
@@ -1369,6 +1752,229 @@ def iso8601_utc(epoch_seconds):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(epoch_seconds)))
 
 
+def check_plausible_waist_in(value, where):
+    """Return `value` as a float waist in inches, or raise SourceFailure.
+
+    The band is PLAUSIBLE_WAIST_IN. It is the third of the three bands on this
+    path and it guards the ratio's NUMERATOR, which is the half a person types
+    by hand - so unlike the two vendor bands it is catching a typo (`335` for
+    `33.5`) at least as often as a units error.
+
+    Implements: LLR-006
+    """
+    inches = check_pounds(value, where)
+    low, high = PLAUSIBLE_WAIST_IN
+    if inches < low or inches > high:
+        raise SourceFailure(
+            "%s: %r in is outside the plausible band %g..%g, so it is a typo, "
+            "a units error or corruption rather than a waist measurement"
+            % (where, value, low, high))
+    return inches
+
+
+def waist_height_ratio(waist_in, height_in, where="ratio"):
+    """waist / height, both in inches, rounded to DISPLAY_DECIMALS_RATIO.
+
+    Contract:
+      Inputs:  waist_in, height_in: floats, each ALREADY through its own band.
+      Outputs: float, the dimensionless ratio, inside PLAUSIBLE_RATIO.
+      Raises:  SourceFailure when the result is outside PLAUSIBLE_RATIO.
+
+    BOTH INPUTS ARE IN INCHES AND THAT IS ENFORCED UPSTREAM, NOT HERE. The
+    height arrives from `check_vendor_metres`, which will only produce inches
+    from a field named `heightMeters`; the waist arrives from an item this
+    feeder refuses unless it declares `unit: in`. This function therefore does
+    no conversion at all - it cannot, because a dimensionless ratio gives it
+    nothing to check a conversion against - and the band below is the last
+    guard rather than the first.
+
+    THE BAND IS THE ONE CHECK THAT CATCHES A MIXED PAIR. Each input can be
+    individually plausible while the pair is nonsense: a waist read in
+    centimetres (85) against a real height (70 in) is 1.21, which no body is,
+    and neither input's own band would have blinked. Being outside it is a
+    SourceFailure rather than a clamp, because the answer to "these two numbers
+    do not describe a person" is to post no ratio, not a ratio at the edge.
+
+    Implements: LLR-006
+    """
+    ratio = round(float(waist_in) / float(height_in), DISPLAY_DECIMALS_RATIO)
+    low, high = PLAUSIBLE_RATIO
+    if not math.isfinite(ratio) or ratio < low or ratio > high:
+        raise SourceFailure(
+            "%s: a waist-to-height ratio of %r is outside %g..%g, so the two "
+            "measurements do not describe one person - most likely one of them "
+            "is in the wrong unit. No ratio is posted."
+            % (where, ratio, low, high))
+    return ratio
+
+
+# ── Reading the entered waist back out of NagLight (NI_A2) ──────────────────
+# The GET /api/today keys this parser reads, as constants because a name typed
+# twice is a name that can drift. Three arrays are searched rather than one, and
+# that is not defensiveness - it is NagLight's own model:
+# `engine.derive` sends a quantified row to `items` while the occurrence's fold
+# is short of its target and to `undoable` once it is met, so WHICH array a
+# waist entry lands in depends on whether the person is under their goal. A
+# reader that knew only `items` would lose the measurement on exactly the days
+# somebody was doing well. `catchups` is searched too, for a value entered
+# against an earlier occurrence.
+TODAY_ITEM_ARRAYS = ("items", "undoable", "catchups")
+TODAY_ID_KEY = "id"
+TODAY_COUNT_KEY = "count"
+TODAY_UNIT_KEY = "unit"
+TODAY_LAST_EVENT_AT_KEY = "lastEventAt"
+
+
+def waist_from_today(payload, item_id, now, where="naglight /api/today"):
+    """The latest entered waist, as (inches, observed_at), from /api/today.
+
+    Contract:
+      Inputs:  payload: the decoded GET /api/today body; item_id: the waist
+               item's id; now: this cycle's clock; where: str for the messages.
+      Outputs: (float inches, int epoch seconds).
+      Raises:  NoWeightYet when the response is well-formed and simply carries
+               no entered waist - nothing is broken and no ratio is posted;
+               SourceFailure when the body is not the shape this parser knows,
+               when the item declares a unit that is not `in`, or when the
+               count or the stamp cannot be used.
+
+    `count` IS THE VALUE, AND IT IS THERE ONLY BECAUSE THE ITEM CARRIES A
+    TARGET. NagLight emits `count` for QUANTIFIED items only, and quantified
+    means "has a non-zero target" - so the same `target` that gives this gauge
+    its goal line is what makes the measurement readable at all. An item with no
+    target serves no count, and this parser then correctly finds nothing.
+
+    THE UNIT IS CHECKED HERE TOO, NEVER ASSUMED. The item's declared `unit`
+    travels on the same row as its count, so the one read that hands over a
+    number also hands over what the number means - and 85 with `unit: cm` is a
+    waist that would post a ratio of 1.2 against a goal the person is meeting.
+    Refusing costs the ratio gauge only.
+
+    THE STAMP IS `lastEventAt`, WHICH IS WHEN THE PERSON ENTERED IT, and never
+    this cycle's clock. That is the same rule the weight gauge's `observed_at`
+    follows and it is what lets the ratio go stale honestly: a waist nobody has
+    re-entered for eight days takes NagLight's 7-day static horizon and renders
+    unavailable, instead of sitting green on a two-month-old measurement.
+
+    Implements: SR-022, LLR-006
+    """
+    if not isinstance(payload, dict):
+        raise SourceFailure("%s: the response body is not an object (it is a %s)"
+                            % (where, type(payload).__name__))
+    if not any(key in payload for key in TODAY_ITEM_ARRAYS):
+        raise SourceFailure(
+            "%s: the response body carries none of %s, so it is not the "
+            "/api/today shape and is refused rather than read as 'no waist "
+            "entered'." % (where, ", ".join(TODAY_ITEM_ARRAYS)))
+    row = None
+    for key in TODAY_ITEM_ARRAYS:
+        for candidate in payload.get(key) or ():
+            if isinstance(candidate, dict) \
+                    and candidate.get(TODAY_ID_KEY) == item_id:
+                row = candidate
+                break
+        if row is not None:
+            break
+    if row is None or row.get(TODAY_COUNT_KEY) is None:
+        raise NoWeightYet(
+            "%s: no `%s` row carrying a `%s`. Either the Owner has not added "
+            "the item, or it declares no `%s:` (NagLight serves a count only "
+            "for a quantified item), or nothing has been entered for the "
+            "current occurrence. Nothing is broken and no ratio is posted."
+            % (where, item_id, TODAY_COUNT_KEY, TARGET_KEY))
+    declared_unit = row.get(TODAY_UNIT_KEY)
+    if not isinstance(declared_unit, str) \
+            or declared_unit.strip().casefold() != WAIST_UNIT:
+        raise SourceFailure(
+            "%s: the `%s` item declares unit %r, and this feeder reads %s "
+            "only. It does NOT convert: a waist in another unit would post a "
+            "ratio that looks entirely believable and is wrong."
+            % (where, item_id, declared_unit, WAIST_UNIT))
+    inches = check_plausible_waist_in(row.get(TODAY_COUNT_KEY),
+                                      "%s %s count" % (where, item_id))
+    stamp = row.get(TODAY_LAST_EVENT_AT_KEY)
+    if not isinstance(stamp, str) or not stamp.strip():
+        raise SourceFailure(
+            "%s: the `%s` row carries a count but no `%s`, so there is no "
+            "instant at which the measurement was true. It is NOT stamped with "
+            "the clock: that would keep a months-old measurement permanently "
+            "fresh." % (where, item_id, TODAY_LAST_EVENT_AT_KEY))
+    return inches, check_observed_at(
+        parse_rfc3339_utc(stamp, "%s %s" % (where, TODAY_LAST_EVENT_AT_KEY)),
+        now, where)
+
+
+def ratio_gauge_body(ratio, target, observed_at):
+    """Assemble the `weight-waist` POST body in the shape /api/feed accepts.
+
+    Contract:
+      Inputs:  ratio: float, already through `waist_height_ratio`;
+               target: float, the ratio the person is aiming at;
+               observed_at: epoch seconds when the WAIST was entered - never
+               None, and never the clock.
+      Outputs: dict ready to json-encode.
+      Raises:  ValueError if this repo would emit a body the server must 400.
+
+    HOW IT DIFFERS FROM `gauge_body`, WHICH IS THE WHOLE REASON IT IS A SECOND
+    FUNCTION RATHER THAN A PARAMETER:
+
+      * `min`/`max` ARE SENT, AND THE WEIGHT GAUGE'S ARE NOT. `unitRangeSpan`
+        holds one entry, `lb: 50`. `ratio` is not in it, so omitting the ends
+        here is "gauge min and max are required for unit \"ratio\"" - a 400 -
+        while sending them on the weight gauge would put a second range
+        authority on the producer side. Copying the neighbour breaks whichever
+        one you copy.
+      * THERE IS NO UNAVAILABLE BODY. The weight gauge must exist even with
+        nothing to say, because SN-040 promises the panel says "we do not know
+        what you weigh" rather than leaving a hole. Nothing promises a ratio
+        bar, so when either half is missing NOTHING IS POSTED - the optional
+        gauge rule the usage feeder applies to Fable. That is why
+        `observed_at` is mandatory here: the only body this function ever
+        builds is one carrying a real measurement, so the sentinel 0 that
+        forced the weight gauge's stamp to be optional has no counterpart.
+
+    WHAT IS THE SAME, AND FOR THE SAME REASONS: no `window`, therefore no
+    `direction` (a goal is a standing line and NagLight refuses a direction
+    without a window); `favourable: "low"`; and NO colour, severity or `css` -
+    NagLight derives them.
+
+    Implements: SR-022, LLR-006
+    """
+    for name, number in (("value", ratio), ("target", target)):
+        if isinstance(number, bool) or not isinstance(number, (int, float)) \
+                or not math.isfinite(float(number)):
+            raise ValueError("gauge %s: %s is not a finite number: %r"
+                             % (RATIO_GAUGE_ID, name, number))
+    if observed_at is None:
+        raise ValueError(
+            "gauge %s: a ratio body must carry the instant the waist was "
+            "measured. This gauge has no unavailable form - when there is "
+            "nothing to say it is not posted at all." % RATIO_GAUGE_ID)
+    for name, text in (("id", RATIO_GAUGE_ID), ("label", RATIO_GAUGE_LABEL),
+                       ("icon", RATIO_GAUGE_ICON), ("unit", RATIO_GAUGE_UNIT)):
+        if len(text) > RUNE_LIMIT:
+            raise ValueError("gauge %s: %s exceeds %d runes"
+                             % (RATIO_GAUGE_ID, name, RUNE_LIMIT))
+    return {
+        "kind": "gauge",
+        "id": RATIO_GAUGE_ID,
+        "label": RATIO_GAUGE_LABEL,
+        "icon": RATIO_GAUGE_ICON,
+        "unit": RATIO_GAUGE_UNIT,
+        "value": float(ratio),
+        # Explicit, because `ratio` has no inferred span. NagLight also refuses
+        # a target outside min..max, which target +/- a positive half-span
+        # cannot be, so the bar is always drawable around the goal.
+        "min": round(float(target) - RATIO_RANGE_HALF_SPAN,
+                     DISPLAY_DECIMALS_RATIO),
+        "max": round(float(target) + RATIO_RANGE_HALF_SPAN,
+                     DISPLAY_DECIMALS_RATIO),
+        "target": float(target),
+        "favourable": RATIO_GAUGE_FAVOURABLE,
+        "observed_at": iso8601_utc(int(observed_at)),
+    }
+
+
 def validate_stored_reading(entry, now):
     """Return a stored reading only if it is credible history, else None.
 
@@ -1400,6 +2006,91 @@ def validate_stored_reading(entry, now):
     except SourceFailure:
         return None
     return {"value": value, "observed_at": stamp}
+
+
+def validate_stored_inches(entry, now, checker, what):
+    """Return a cached inches measurement only if it is credible, else None.
+
+    Contract:
+      Inputs:  entry: whatever `load_state` found under the key - any JSON
+               value; now: this cycle's clock; checker: the band function for
+               this measurement; what: "height"/"waist", for nothing but
+               clarity at the call site.
+      Outputs: {"value": float inches, "observed_at": int}, or None.
+      Raises:  nothing. An unusable entry is an ANSWER: the ratio simply has
+               no cached half, which is the same position as never having read
+               one.
+
+    THE CACHE IS WHAT MAKES THE RATIO SURVIVE A BAD FIFTEEN MINUTES, AND IT IS
+    WHY IT EXISTS AT ALL. A person's height does not change and their waist
+    changes slowly, but BOTH halves come from sources that can be briefly
+    unavailable - a 500 from Google, a tracker restart mid-cycle - and without a
+    cache one such cycle would delete the ratio gauge from the panel rather
+    than leave it standing at its last real value. Re-posting a cached half at
+    its ORIGINAL stamp is the same rule `build_post` applies to a weight: it is
+    not a lie, it goes stale on NagLight's static horizon, and nothing is ever
+    re-stamped to `now`.
+
+    IT IS REVALIDATED ON LOAD BECAUSE THE STATE FILE IS INPUT, NOT MEMORY -
+    `validate_stored_reading`'s reasoning, applied to the other two numbers.
+
+    Implements: LLR-006
+    """
+    if not isinstance(entry, dict):
+        return None
+    try:
+        value = checker(entry.get("value"), "stored %s" % what)
+        stamp = check_observed_at(entry.get("observed_at"), now,
+                                  "stored %s" % what)
+    except SourceFailure:
+        return None
+    return {"value": value, "observed_at": stamp}
+
+
+def build_ratio_post(waist, height, target, now):
+    """Decide whether to POST the ratio gauge this cycle, and with what.
+
+    Contract:
+      Inputs:  waist, height: each {"value", "observed_at"} - this cycle's
+               reading or the cached one, already merged by the caller - or
+               None when neither exists;
+               target: the ratio the person is aiming at;
+               now: epoch seconds.
+      Outputs: the body dict, or None meaning POST NOTHING AT ALL.
+      Raises:  ValueError for a body this repo should never build.
+               A SourceFailure from the band checks is NOT raised out: an
+               implausible pair is "no ratio", which is the same answer as a
+               missing one.
+
+    THE ABSENT HALF IS A SKIP, NOT AN UNAVAILABLE GAUGE, AND THAT IS THE ONE
+    DECISION HERE. `ai_usage_feeder` posts nothing for its optional Fable gauge
+    until the vendor has mentioned Fable once, because a gauge standing at
+    "unavailable" is a claim that a number exists and could not be read. Nobody
+    has promised this household a waist bar; until they enter a waist there is
+    no measurement that failed, so the gauge is simply not there. Posting an
+    unavailable one would put a permanently grey sister column in the weight
+    cell for every household that never uses the feature.
+
+    THE STAMP IS THE OLDER OF THE TWO HALVES, deliberately. The ratio was true
+    only from the moment BOTH of its measurements were, so the newer one cannot
+    date it; taking the newer would let a height entered today keep a ratio
+    green that rests on a waist from two months ago. Taking the older means the
+    gauge goes stale on NagLight's 7-day static horizon once the waist stops
+    being re-entered, which is exactly what should happen.
+
+    Implements: SR-022, LLR-006
+    """
+    if waist is None or height is None:
+        return None
+    try:
+        ratio = waist_height_ratio(
+            check_plausible_waist_in(waist["value"], "ratio waist"),
+            check_plausible_height_in(height["value"], "ratio height"))
+    except SourceFailure:
+        return None
+    observed_at = min(int(waist["observed_at"]), int(height["observed_at"]))
+    return ratio_gauge_body(ratio, target, check_observed_at(
+        observed_at, now, "ratio"))
 
 
 def build_post(reading, last, goal_lb, now):
@@ -1687,6 +2378,27 @@ def resolve_enabled(env):
     Implements: SR-022, LLR-006
     """
     return (env.get("WEIGHT_ENABLED") or "false").strip() == "true"
+
+
+def resolve_waist_enabled(env):
+    """True only for a literal `true`. The ratio gauge ships OFF.
+
+    Gated the same way `WEIGHT_ENABLED` is, and for two reasons beyond house
+    style:
+
+      * IT COSTS TWO EXTRA CALLS A CYCLE - a Google Health list for the height
+        and a GET /api/today for the waist, every fifteen minutes. A hub whose
+        Owner has not added the `waist-in` item would pay both forever to learn
+        nothing, and the second of them would be a request nobody asked for
+        against a tracker that has no such item.
+      * THE SHEET ITEM IS A MANUAL STEP. This gauge cannot work until a person
+        adds a row to their own tracker sheet, so "on" is a statement that the
+        step has been done. An automatic default would put a feature into a
+        permanent, silent half-failure on every other box.
+
+    Implements: SR-022, LLR-006
+    """
+    return (env.get("WEIGHT_WAIST_ENABLED") or "false").strip() == "true"
 
 
 def resolve_identity(env):
@@ -2119,6 +2831,20 @@ def load_state(state_path, now):
             if marks:
                 out[key] = marks
             continue
+        # THE TWO RATIO HALVES ARE INCHES, NOT POUNDS, and the generic
+        # validator below would silently DROP both of them - a 70 in height is
+        # outside the 40..1000 lb band. They get their own bands rather than an
+        # exemption, for the reason CHECK_STATE_KEY does: an exemption would
+        # mean the one key in this file that is never checked at all.
+        if key in (HEIGHT_STATE_KEY, WAIST_STATE_KEY):
+            cached = validate_stored_inches(
+                entry, now,
+                check_plausible_height_in if key == HEIGHT_STATE_KEY
+                else check_plausible_waist_in,
+                "height" if key == HEIGHT_STATE_KEY else "waist")
+            if cached is not None:
+                out[key] = cached
+            continue
         checked = validate_stored_reading(entry, now)
         if checked is not None:
             out[key] = checked
@@ -2170,6 +2896,40 @@ def resolve_goal_location(env):
     """
     category = (env.get("WEIGHT_ITEM_CATEGORY") or "").strip() or DEFAULT_GOAL_CATEGORY
     item_id = (env.get("WEIGHT_ITEM_ID") or "").strip() or DEFAULT_GOAL_ITEM_ID
+    return category, item_id
+
+
+def resolve_waist_location(env):
+    """Which item carries the waist measurement, as (category, item_id).
+
+    Contract:
+      Config:  WEIGHT_WAIST_CATEGORY / WEIGHT_WAIST_ITEM_ID; a blank or absent
+               knob takes (Health, waist-in).
+      Outputs: (str, str) - never blank.
+
+    LOCATION KNOBS, NEVER A VALUE - `resolve_goal_location`'s rule, and the
+    whole acceptance criterion behind it, applied to the second item. Neither
+    of these can hold a measurement or a target: they name a place in the
+    person's own definitions, so the waist number and the waist goal still live
+    beside the things they track and still sync from their phone.
+
+    THE DEFAULT CATEGORY IS THE WEIGH-IN'S, AND THAT IS LOAD-BEARING RATHER
+    THAN TIDY. `setup-weight.sh` binds exactly ONE category file into the
+    service, read-only, because the definitions directory holds every household
+    member's tracker data and a gauge about one person's body must not be handed
+    all of it. Both items living under `Health` means the waist target is
+    readable through the file that is ALREADY bound, so this feature adds no
+    mount, no second bind and no widening of what the service can see. An Owner
+    who moves `waist-in` to another category must also widen that bind, and the
+    failure if they do not is a named, quiet one: no target found, so the
+    documented default is used and the gauge still draws.
+
+    Implements: SR-022, LLR-006
+    """
+    category = (env.get("WEIGHT_WAIST_CATEGORY") or "").strip() \
+        or DEFAULT_WAIST_CATEGORY
+    item_id = (env.get("WEIGHT_WAIST_ITEM_ID") or "").strip() \
+        or DEFAULT_WAIST_ITEM_ID
     return category, item_id
 
 
@@ -2378,6 +3138,88 @@ def load_goal_from_definitions(defs_dir, category=None, item_id=None):
     return goal_from_item(found[0], found[1], category, item_id), found[1]
 
 
+def waist_target_ratio_from_definitions(defs_dir, height_in, category=None,
+                                        item_id=None):
+    """The ratio target line, out of the waist item's own `target`/`unit`.
+
+    Contract:
+      Inputs:  defs_dir: the bound definitions directory; height_in: the
+               person's height in inches, or None when it is not known;
+               category/item_id: the resolved LOCATION knobs.
+      Outputs: (target_ratio: float, source: str) - `source` is the file the
+               number came from, or a phrase naming the default.
+      Raises:  nothing. Every "no" is the documented default, because this
+               gauge is the optional extra and a refusal here would delete a
+               bar for someone who had entered every measurement asked of them.
+               That is the OPPOSITE of the weigh-in goal's rule, on purpose:
+               there, the target line IS the goal and inventing one would
+               colour a real body weight against a number nobody chose.
+
+    THE DECLARED TARGET IS A WAIST IN INCHES AND THE GAUGE'S TARGET IS A RATIO,
+    AND THIS FUNCTION IS THE ONE PLACE THAT BRIDGES THEM. It is worth saying
+    why, because the obvious reading - "put 0.5 in the target column" - does not
+    survive contact with either half of the system:
+
+      * The item declares `unit: in`, and its `target` column is the same
+        column NagLight's own sheet uses for "what am I aiming at, in this
+        item's unit". A `0.5` sitting under `unit: in` would be a half-inch
+        waist to every other reader of that sheet, including the person who
+        typed it.
+      * NagLight treats a quantified item as SATISFIED once its progress
+        reaches its target, and a waist of 33.5 against a target of 0.5 is
+        satisfied the instant it is entered - every time, forever. A target in
+        inches keeps the row behaving like the measurement it is.
+
+    So the Owner declares the waist they are aiming at, in inches, and the
+    ratio target is that goal expressed in the gauge's own terms. One number,
+    in the unit it is measured in, and no second place for the household's
+    intent to live.
+
+    `unit: in` IS CHECKED AND NEVER ASSUMED, and a wrong one falls back to the
+    default rather than converting - `goal_from_item`'s rule. A target of 85
+    with `unit: cm` is 33.5 in, and 85 is plausible-looking enough that a band
+    would not catch it; a silently converted goal is the same bet this file
+    refuses everywhere else.
+
+    Implements: SR-022, LLR-006
+    """
+    category = category or DEFAULT_WAIST_CATEGORY
+    item_id = item_id or DEFAULT_WAIST_ITEM_ID
+    fallback = (DEFAULT_RATIO_TARGET,
+                "the documented default (%g): no usable `%s:` on the `%s` item"
+                % (DEFAULT_RATIO_TARGET, TARGET_KEY, item_id))
+    if height_in is None:
+        return fallback
+    try:
+        found, _legacy = scan_definitions(defs_dir, category, item_id)
+    except (GoalMissing, ValueError, OSError):
+        return fallback
+    if found is None:
+        return fallback
+    item, where = found
+    if TARGET_KEY not in item or UNIT_KEY not in item:
+        return fallback
+    try:
+        raw_target = clean_scalar(one_value(item[TARGET_KEY], where, TARGET_KEY))
+        declared_unit = clean_scalar(one_value(item[UNIT_KEY], where, UNIT_KEY))
+    except ValueError:
+        # Declared twice: which is authoritative is not guessable, and this
+        # half stays quiet rather than picking one - `check_id_from_definitions`
+        # takes the same line for the same reason.
+        return fallback
+    if declared_unit.casefold() != WAIST_UNIT:
+        return fallback
+    try:
+        goal_in = check_plausible_waist_in(float(raw_target), "waist target")
+    except (TypeError, ValueError, SourceFailure):
+        return fallback
+    try:
+        ratio = waist_height_ratio(goal_in, height_in, "waist target")
+    except SourceFailure:
+        return fallback
+    return ratio, where
+
+
 # ── The verified Google Health v4 facts, as constants rather than prose ─────
 # Every one of these was read off the live discovery document (revision
 # 20260907) or a live 401, on 2026-09-09. They are constants so that the
@@ -2387,6 +3229,14 @@ def load_goal_from_definitions(defs_dir, category=None, item_id=None):
 GOOGLE_HEALTH_DISCOVERY = "https://health.googleapis.com/$discovery/rest?version=v4"
 GOOGLE_HEALTH_LIST_URL = (
     "https://health.googleapis.com/v4/users/me/dataTypes/weight/dataPoints")
+# THE SAME ROUTE WITH THE DATA TYPE SWAPPED, AND THE SAME SCOPE (NI_A2). The
+# verified route is `/v4/users/me/dataTypes/{dataTypesId}/dataPoints`, and
+# `weight` is a path SEGMENT in it rather than part of the route, so height is
+# reached by changing that segment and nothing else - no second scope, no second
+# consent, no second token. A test asserts these two URLs differ in exactly that
+# segment, so neither can drift onto a host or a version the other has not seen.
+GOOGLE_HEALTH_HEIGHT_LIST_URL = (
+    "https://health.googleapis.com/v4/users/me/dataTypes/height/dataPoints")
 GOOGLE_HEALTH_SCOPE = (
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly")
 GOOGLE_HEALTH_FILTER = 'weight.sample_time.physical_time >= "%s"'
@@ -2599,7 +3449,33 @@ def list_weight_data_points(access_token, now, timeout, list_url=None):
 
     Implements: SR-022, LLR-006
     """
-    base = list_url or GOOGLE_HEALTH_LIST_URL
+    return walk_data_points(access_token, now, timeout,
+                            list_url or GOOGLE_HEALTH_LIST_URL,
+                            parse_weight_datapoint, "weigh-in", "weight")
+
+
+def walk_data_points(access_token, now, timeout, base, parser, noun, what):
+    """The paging walk both data types share: LATEST reading across all pages.
+
+    Contract:
+      Inputs:  base: the dataPoints list URL for ONE data type; parser: the
+               per-page parser for that data type; noun: "weigh-in"/"height
+               measurement", for the page-limit message; what: "weight" /
+               "height", for the empty-history message.
+      Outputs: whatever `parser` returns, for the greatest `observed_at`.
+      Raises:  NoWeightYet when every page was empty; SourceFailure for a
+               transport failure, an unrecognised body, and a history deeper
+               than MAX_LIST_PAGES pages.
+
+    IT IS SHARED BECAUSE THE ENVELOPE IS SHARED AND THE MEMBERS ARE NOT. The
+    `dataPoints` / `nextPageToken` envelope, the bearer header and the page
+    limit are properties of the ROUTE, which was observed on 2026-09-09 and is
+    one route with the data type as a path segment; the member parsing is
+    per-type and stays in the two parsers. Two copies of the page-limit rule is
+    how one of them ends up walking further than the other.
+
+    Implements: SR-022, LLR-006
+    """
     headers = {"Authorization": "Bearer " + access_token,
                "Accept": "application/json"}
     latest, token, pages = None, None, 0
@@ -2611,7 +3487,7 @@ def list_weight_data_points(access_token, now, timeout, list_url=None):
                               timeout, "the dataPoints list call")
         pages += 1
         try:
-            reading = parse_weight_datapoint(payload, now)
+            reading = parser(payload, now)
         except NoWeightYet:
             reading = None
         if reading is not None and (latest is None
@@ -2623,15 +3499,16 @@ def list_weight_data_points(access_token, now, timeout, list_url=None):
         if pages >= MAX_LIST_PAGES:
             raise SourceFailure(
                 "google-health: the history is still not exhausted after %d "
-                "pages, so this cycle cannot know which weigh-in is the latest "
+                "pages, so this cycle cannot know which %s is the latest "
                 "and will not claim one. No reading was taken and no number "
-                "was invented." % pages)
+                "was invented." % (pages, noun))
     if latest is None:
         raise NoWeightYet(
             "google-health: HTTP 200 across %d page(s) with no data points, so "
-            "this account has no weight logged in Google Health yet. That is "
+            "this account has no %s logged in Google Health yet. That is "
             "not a broken source and not a reading of 0 - it is the "
-            "unavailable gauge: we do not know what you weigh." % pages)
+            "unavailable gauge: we do not know what you %s."
+            % (pages, what, "weigh" if what == "weight" else "measure"))
     return latest
 
 
@@ -2684,8 +3561,58 @@ def read_google_health(env, list_url=None, token_endpoint=None):
                                    list_url)
 
 
+def read_google_health_height(env, list_url=None, token_endpoint=None):
+    """Source: Google Health API v4, Height data type. The ratio's denominator.
+
+    Contract:
+      Inputs:  env: the process environment plus `_now`; the two endpoints are
+               injected ONLY by tests, exactly as the weight reader's are -
+               there is no knob for either, because a knob on a URL that
+               carries this token is a way to send the token somewhere else.
+      Outputs: HeightReading.
+      Raises:  SourceFailure for every failure class, NoWeightYet (a subclass)
+               for an account with no height logged. BOTH are caught by the
+               caller and cost the RATIO gauge only.
+
+    IT DOES ITS OWN TOKEN REFRESH RATHER THAN SHARING THE WEIGHT READ'S, AND
+    THAT IS BOUGHT DELIBERATELY. Threading one access token through both reads
+    would save one refresh-grant round trip every fifteen minutes and would
+    couple the promise to the extra: a token the height path mishandled, or a
+    refactor that made the weight read wait on the height read, would put the
+    "we do not know what you weigh" gauge behind a feature that is allowed to
+    fail. `run_cycle` already keeps the check-off behind the gauge for exactly
+    this reason. Two grants is what the independence costs, and a refresh grant
+    is cheap next to the list call it precedes.
+
+    Implements: SR-022, LLR-006
+    """
+    token_file = (env.get("WEIGHT_TOKEN_FILE") or "").strip()
+    if not token_file:
+        raise SourceFailure(
+            "google-health(height): WEIGHT_TOKEN_FILE is unset, so there is no "
+            "refresh token to read and no height was taken.")
+    refresh_token = read_refresh_token(os.path.expanduser(token_file))
+    client_id, client_secret = resolve_oauth_client(env)
+    try:
+        timeout = int(env.get("WEIGHT_TIMEOUT_SECONDS") or 30)
+    except ValueError:
+        raise SourceFailure(
+            "google-health(height): WEIGHT_TIMEOUT_SECONDS is not a whole "
+            "number of seconds.")
+    access_token = google_access_token(client_id, client_secret, refresh_token,
+                                       timeout, token_endpoint)
+    return walk_data_points(access_token, cycle_now(env), timeout,
+                            list_url or GOOGLE_HEALTH_HEIGHT_LIST_URL,
+                            parse_height_datapoint, "height measurement",
+                            "height")
+
+
 SOURCE_READERS = {
     "google-health": read_google_health,
+}
+
+HEIGHT_READERS = {
+    "google-health": read_google_health_height,
 }
 
 
@@ -2871,8 +3798,185 @@ def post_gauge(body, url, env, timeout):
         return False, type(exc).__name__
 
 
+def today_url_from_feed(feed_url):
+    """The /api/today URL beside the /api/feed URL this box already verified.
+
+    Contract:
+      Inputs:  feed_url: the value `resolve_feed_url` vouched for.
+      Outputs: the same origin and path with the last segment replaced by
+               `today`.
+
+    THERE IS DELIBERATELY NO `WEIGHT_TODAY_URL` KNOB. `resolve_feed_url`
+    refuses any destination that is not this box's loopback or a local docker
+    bridge, because the request carries the tracker bearer token and the
+    household identity. A second URL knob would be a second destination to
+    police, and the obvious failure - somebody setting it to the public https
+    route - would send the token out through oauth2-proxy with nothing
+    refusing it. Deriving keeps ONE verified destination.
+
+    Implements: SR-022, LLR-006
+    """
+    head, _sep, _tail = feed_url.rstrip("/").rpartition("/")
+    return (head or feed_url.rstrip("/")) + "/today"
+
+
+def read_waist_measurement(env, url=None):
+    """Source: NagLight's own GET /api/today -> (waist inches, observed_at).
+
+    Contract:
+      Inputs:  env: the process environment plus `_identity`, `_feed_url` and
+               `_now`; url: injected only by tests.
+      Outputs: (float inches, int epoch seconds).
+      Raises:  SourceFailure for every failure class, NoWeightYet (a subclass)
+               when nothing has been entered. Both cost the RATIO gauge only.
+
+    WHY /api/today AND NOT THE EVENT LOG - THE LEAST-COUPLED READ, AND THE
+    ALTERNATIVES IT WAS WEIGHED AGAINST:
+
+      * `events/<year>.md` holds the real answer: the rows are the entries, and
+        `eventlog.LastFor` is the exact query. But they are DELTAS, not
+        absolute values, so reading them means re-implementing NagLight's fold
+        - a second copy of somebody else's arithmetic, in another language,
+        drifting silently. Worse, it needs the tracker's data volume mounted
+        into this service, and that volume holds EVERY household member's
+        entire tracker history. `setup-weight.sh` binds ONE category file
+        read-only precisely so a gauge about one person's body cannot see all
+        of it; mounting `events/` to find one number would undo that decision
+        for a waist measurement.
+      * The definitions directory is already bound, but it carries the item's
+        DECLARATION, not what anybody entered. It is where the target comes
+        from and it cannot answer this question.
+      * /api/today is a door this feeder ALREADY has: the same local-only
+        opener, the same verified destination, the same bearer token and
+        identity header as the POST. It adds no mount, no file permission and
+        no second destination - and the number it serves is NagLight's own
+        folded answer, so there is no second implementation to keep in step.
+
+    WHAT IT COSTS, STATED PLAINLY: `count` is the fold of the CURRENT
+    occurrence, so it reads 0 at each new period until something is entered.
+    That is why the value is cached in the state file and re-posted at its
+    ORIGINAL stamp - the gauge stands at the last real measurement and goes
+    stale on NagLight's own horizon, rather than flickering out every time a
+    new week begins.
+
+    Implements: SR-022, LLR-006
+    """
+    _category, item_id = resolve_waist_location(env)
+    target = url or today_url_from_feed(env["_feed_url"])
+    try:
+        timeout = int(env.get("WEIGHT_TIMEOUT_SECONDS") or 30)
+    except ValueError:
+        raise SourceFailure("naglight: WEIGHT_TIMEOUT_SECONDS is not a whole "
+                            "number of seconds.")
+    headers = {"Accept": "application/json",
+               "X-Forwarded-User": env["_identity"]}
+    token = env.get("WEIGHT_FEED_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(target, headers=headers, method="GET")
+    try:
+        with feed_opener().open(request, timeout=timeout) as response:
+            if response.status != 200:
+                raise SourceFailure("naglight: /api/today answered HTTP %s"
+                                    % response.status)
+            raw = response.read()
+    except SourceFailure:
+        raise
+    except EgressRefused as exc:
+        # Our own words, not the remote's - `post_gauge`'s rule.
+        raise SourceFailure("naglight: /api/today was refused: %s" % exc)
+    except urllib.error.HTTPError as exc:
+        raise SourceFailure(
+            "naglight: /api/today failed: HTTP %s (the body is not logged)"
+            % exc.code)
+    except Exception as exc:
+        raise SourceFailure("naglight: /api/today failed: %s"
+                            % type(exc).__name__)
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        raise SourceFailure("naglight: /api/today returned something that is "
+                            "not JSON")
+    return waist_from_today(payload, item_id, cycle_now(env))
+
+
+def ratio_cycle(env, state, now, poster, feed_url, timeout, failures,
+                height_readers=None, waist_reader=None, target_loader=None):
+    """The ratio gauge's whole cycle: two reads, two caches, one post or none.
+
+    Contract:
+      Inputs:  state: the loaded state dict, MUTATED in place with any fresh
+               cached half - the caller owns the single `save_state`;
+               failures: the caller's failure list, appended to, never raised
+               through; the three loaders are injectable for the tests.
+      Outputs: (RATIO_GAUGE_ID, fresh, ok) to append to `posted`, or None
+               meaning nothing was posted at all.
+      Raises:  nothing. Every failure class becomes a line in `failures`, and
+               the worst outcome is no ratio gauge this cycle.
+
+    IT IS A SEPARATE FUNCTION SO THAT `run_cycle` STILL READS AS A LIST OF
+    STEPS, and so that this whole feature sits behind ONE call the reader can
+    see is optional. Nothing in here may raise: the weight gauge and the
+    check-off are already posted by the time it runs, for the reason the
+    check-off runs after the gauge - the promise goes first and the extra must
+    never be able to take it down.
+
+    Implements: SR-022, LLR-006
+    """
+    defs_dir = env.get("WEIGHT_DEFINITIONS_DIR") or ""
+    category, item_id = resolve_waist_location(env)
+    fresh = False
+
+    height = state.get(HEIGHT_STATE_KEY)
+    try:
+        reading = (height_readers or HEIGHT_READERS)[enabled_source(env)](env)
+        height = {"value": reading.inches, "observed_at": reading.observed_at}
+        state[HEIGHT_STATE_KEY] = height
+    except NoWeightYet:
+        # No height logged is not a failure and gets no journal line: the
+        # ratio simply is not posted until the person enters one.
+        pass
+    except SourceFailure as exc:
+        failures.append("height: %s" % exc)
+    except Exception as exc:
+        # ONLY THE TYPE, NEVER THE MESSAGE - `run_cycle`'s rule, for the same
+        # reason: an exception raised inside urllib carries the request, and
+        # str() on one of those prints the Authorization header.
+        failures.append("height: unexpected %s" % type(exc).__name__)
+
+    waist = state.get(WAIST_STATE_KEY)
+    try:
+        inches, stamp = (waist_reader or read_waist_measurement)(env)
+        waist = {"value": inches, "observed_at": stamp}
+        state[WAIST_STATE_KEY] = waist
+        fresh = True
+    except NoWeightYet:
+        pass
+    except SourceFailure as exc:
+        failures.append("waist: %s" % exc)
+    except Exception as exc:
+        failures.append("waist: unexpected %s" % type(exc).__name__)
+
+    target, _where = (target_loader or waist_target_ratio_from_definitions)(
+        defs_dir, height["value"] if height else None, category, item_id)
+    try:
+        body = build_ratio_post(waist, height, target, now)
+    except (ValueError, SourceFailure) as exc:
+        failures.append("gauge %s: %s" % (RATIO_GAUGE_ID, exc))
+        return None
+    if body is None:
+        return None
+    try:
+        ok, detail = poster(body, feed_url, env, timeout)
+    except Exception as exc:                # a poster bug is a failed post
+        ok, detail = False, type(exc).__name__
+    if not ok:
+        failures.append("post %s: %s" % (RATIO_GAUGE_ID, detail))
+    return (RATIO_GAUGE_ID, fresh, ok)
+
+
 def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,
-              check_loader=None):
+              check_loader=None, ratio=None):
     """One feeder cycle: load the goal, read the source, post the gauge, and -
     only on a genuinely fresh weigh-in - post the automated check-off too.
 
@@ -2950,6 +4054,13 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,
         failures.append("%s: unexpected %s" % (source, type(exc).__name__))
 
     state = load_state(state_path, now)
+    # A DEEP-ENOUGH COPY TO COMPARE AGAINST AT THE END. `load_state` returns
+    # fresh dicts of plain scalars, so one level of copying is all a comparison
+    # needs - and comparing is what lets the single save below be skipped on a
+    # cycle that changed nothing, which is what keeps a failed read from
+    # rewriting (and so refreshing the mtime of) history it did not improve.
+    before = {key: dict(value) if isinstance(value, dict) else value
+              for key, value in state.items()}
     try:
         body, fresh = build_post(reading, state.get(GAUGE_ID), goal_lb, now)
     except (ValueError, SourceFailure) as exc:
@@ -2997,13 +4108,37 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,
 
     if reading is not None:
         value_lb, observed_at = reading_pair(reading)
-        state[GAUGE_ID] = {"value": value_lb, "observed_at": observed_at}
+        # STORED ROUNDED, through the SAME function the wire uses. The stored
+        # reading's only purpose is to be re-posted on a failed cycle, so a
+        # full-precision copy would buy nothing and would make the state file
+        # disagree with every bar ever drawn from it (DISPLAY_DECIMALS_LB).
+        state[GAUGE_ID] = {"value": round_display_lb(value_lb),
+                           "observed_at": observed_at}
         if marks:
             state[CHECK_STATE_KEY] = marks
+
+    # ── THE THIRD POST: the waist-to-height sister gauge (NI_A2). It runs
+    # LAST, and `ratio_cycle` cannot raise, so neither the weight gauge above
+    # nor the check-off can be delayed or lost by it. It may add cached halves
+    # to `state`, which is why it runs BEFORE the one save_state below. ──────
+    if resolve_waist_enabled(env):
+        ratio_line = (ratio or ratio_cycle)(
+            env, state, now, poster or post_gauge, feed_url, timeout, failures)
+        if ratio_line is not None:
+            posted.append(ratio_line)
+
+    # ONE SAVE, AND IT IS NO LONGER GATED ON THE WEIGHT READ. It used to be:
+    # a failed weight read wrote nothing, which is what stops a stored stamp
+    # from decaying into permanent freshness. That rule is unchanged - nothing
+    # above rewrites `state[GAUGE_ID]` unless this cycle actually read a weight
+    # - but the ratio's two cached halves are written by cycles the weight read
+    # failed on, and gating the save on the weight would silently throw them
+    # away.
+    if state != before:
         try:
             save_state(state, state_path, state_root)
         except OSError as exc:
-            # Including PermissionError from the write guard. The gauge is
+            # Including PermissionError from the write guard. The gauges are
             # already posted; losing the history is a named failure, not a
             # crash and never a fabricated reading.
             failures.append("state %s: %s" % (state_path, type(exc).__name__))

@@ -350,8 +350,8 @@ def backlight_dark(root: Path = BACKLIGHT_ROOT) -> bool:
       Raises:  nothing; an unreadable device contributes no signal.
     The predicate mirrors `electron/display-lit.cjs` displayLit() for the
     backlight half: integer files, max_brightness > 0, lit iff brightness > 0.
-    The two sides are pinned by TC-911 here and TC-P-422 in the panel repo so
-    they cannot drift.
+    The two sides are pinned by test case 911 here and by the panel repo's
+    touch-wake guarantees test (case 422), so they cannot drift.
     Implements: LLR-911
     """
     signals = []

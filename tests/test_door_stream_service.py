@@ -306,8 +306,11 @@ def test_display_on_readies_the_idle_broker_without_starting_a_camera():
     on = backlight[backlight.index("else") : backlight.index("return 0")]
     assert "start_door_broker" in on
     start = sleep[sleep.index("start_door_broker()") : sleep.index("backlight_set()")]
-    assert "[ -r /run/wall-door-credentials/host ] || return 0" in start
-    assert "[ -r /run/wall-door-credentials/password ] || return 0" in start
+    # D5 (2026-09-15): the credential guard still declines to start (return 0)
+    # but is no longer silent -- it names the unreadable files in the journal.
+    guard = start[start.index("/run/wall-door-credentials/host") : start.index("systemctl start")]
+    assert "/run/wall-door-credentials/password" in guard
+    assert "log \"WARNING door broker" in guard and "return 0" in guard
     executable = "\n".join(
         line for line in sleep.splitlines() if not line.lstrip().startswith("#")
     ).lower()

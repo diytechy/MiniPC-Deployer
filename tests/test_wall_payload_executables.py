@@ -81,6 +81,36 @@ def test_every_payload_script_is_executable_in_the_index(path):
         "it (2026-09-14)." % (path, MODES[path]))
 
 
+def test_the_git_archive_the_release_ships_carries_the_executable_bit():
+    """The index is not the artefact; the tar is.
+
+    HomeHub's release lane builds the panel system payload with `git archive`
+    of this subtree and extracts it onto the panel. The index modes above are
+    the cause, but the 2026-09-14 failure happened at THIS boundary, so it is
+    checked here directly rather than inferred. git archive applies the group
+    bit itself (0664/0775, not 0644/0755), so the assertion is on the
+    executable claim, which is what firstboot needs and what the transport
+    actually preserves.
+    """
+    import io
+    import tarfile
+
+    blob = subprocess.run(["git", "-C", str(ROOT), "archive", "--format=tar",
+                           "HEAD", PAYLOAD], capture_output=True, check=True).stdout
+    modes = {}
+    with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+        for member in tar:
+            if member.isfile() and member.name.startswith(PAYLOAD + "/"):
+                modes[member.name] = member.mode
+    assert modes, "git archive produced no payload files"
+    for path in shebang_files():
+        assert modes.get(path, 0) & 0o111, (
+            "%s reaches the panel at %04o; firstboot cannot exec it"
+            % (path, modes.get(path, 0)))
+    for name in payload_scripts_executed_directly():
+        assert modes.get("%s/%s" % (PAYLOAD, name), 0) & 0o111
+
+
 def test_the_payload_tree_actually_has_scripts_to_check():
     # A rule that silently checks nothing is not a rule.
     assert len(shebang_files()) >= 30

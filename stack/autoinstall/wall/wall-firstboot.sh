@@ -563,6 +563,73 @@ log "kiosk: $KIOSK_ENV rendered (0644) — WALL_HOST='${WALL_HOST:-}' WALL_APP_C
 # ── local sensors and root capability helper: image-owned, gateway-independent
 SENSOR_WHEELHOUSE=/opt/wall-panel/sensor-wheelhouse
 SENSOR_MODELS=/opt/wall-panel/sensor-models
+# sync_sensor_models_from_payload — reconcile $SENSOR_MODELS with whatever
+# bundle THIS payload's own sensor-models subdirectory carries, every
+# firstboot run.
+#
+# Live release finding, 2026-09-15 (paired-deployment-02.json): a release
+# install rebooted into a post-install gate refusal — file-stale on
+# $SENSOR_MODELS/manifest.json, expecting the committed canonical digest and
+# finding a hand-written copy from earlier that day. Cause: the image build's
+# late-command copies the staged bundle straight to $SENSOR_MODELS (a
+# sibling of $PAYLOAD, not under it) ONCE, at install time; the release lane
+# only ever refreshes $PAYLOAD itself (/opt/wall-panel/stack/autoinstall/wall)
+# and never touches that sibling directory at all. A release's own verified
+# bundle therefore arrived inside the refreshed payload and sat there
+# unused, while $SENSOR_MODELS kept whatever the image carried (or whatever
+# a human had staged by hand) — exactly the drift this ONE reconciliation
+# step, run on every firstboot invocation regardless of how the payload's
+# copy got there, closes.
+#
+# Re-verifies the payload's own bundle against ITS OWN manifest.json before
+# installing anything: that manifest.json is the committed, reviewed one
+# (carried into $PAYLOAD by copy_repo_into_payload on an image build, or by
+# the release payload archive on a release — both are the SAME git-tracked
+# bytes, never a supplier-substituted copy), so this re-proves the .onnx
+# bytes were not corrupted or tampered with between being staged and
+# reaching this payload, the same discipline the installer's own
+# --model-manifest anchor pays again below.
+#
+# Installed ATOMICALLY (temp dir beside $SENSOR_MODELS, root:root 0644 files
+# / 0755 dir, `mv -T`, previous generation removed) — never in place, and
+# never only some of the three files. When the payload carries no complete
+# bundle at all, an existing $SENSOR_MODELS is left completely untouched:
+# absence of a NEW bundle is not licence to remove or degrade one that is
+# already installed and working.
+sync_sensor_models_from_payload() {
+    # Derived via dirname from the one literal, file-shaped payload reference
+    # below, not from a bare directory reference:
+    # test_firstboot_payload_files_are_all_tracked_and_shipped resolves every
+    # literal payload path this script mentions against the git-tracked tree
+    # and refuses one that names a directory rather than a file it can find.
+    # The manifest.json this derives from IS such a file (always committed,
+    # whether or not a bundle sits beside it).
+    local payload_bundle
+    payload_bundle="$(dirname "$PAYLOAD/sensor-models/manifest.json")"
+    [ -f "$payload_bundle/manifest.json" ] || return 0
+    [ -f "$payload_bundle/det_10g.onnx" ] || return 0
+    [ -f "$payload_bundle/w600k_r50.onnx" ] || return 0
+    if ! python3 "$PAYLOAD/check-sensor-models.py" \
+            --expect "$payload_bundle/manifest.json" "$payload_bundle" >/dev/null 2>&1; then
+        fail_step "sensors: $payload_bundle failed its own manifest check (tampered or corrupted since staging); NOT syncing it to $SENSOR_MODELS. Any existing runtime models are left untouched."
+        return 0
+    fi
+    local new_dir
+    new_dir=$(mktemp -d "$(dirname "$SENSOR_MODELS")/.$(basename "$SENSOR_MODELS").XXXXXX") || {
+        fail_step "sensors: could not create a staging directory beside $SENSOR_MODELS; $SENSOR_MODELS left untouched"
+        return 0
+    }
+    install -m 0644 -o root -g root "$payload_bundle/det_10g.onnx" "$new_dir/det_10g.onnx"
+    install -m 0644 -o root -g root "$payload_bundle/w600k_r50.onnx" "$new_dir/w600k_r50.onnx"
+    install -m 0644 -o root -g root "$payload_bundle/manifest.json" "$new_dir/manifest.json"
+    chmod 0755 "$new_dir"
+    rm -rf "$SENSOR_MODELS.previous"
+    [ ! -e "$SENSOR_MODELS" ] || mv -T "$SENSOR_MODELS" "$SENSOR_MODELS.previous"
+    mv -T "$new_dir" "$SENSOR_MODELS"
+    rm -rf "$SENSOR_MODELS.previous"
+    log "sensors: $SENSOR_MODELS synced from $payload_bundle"
+}
+sync_sensor_models_from_payload
 # The face model bundle IS "complete" only when both .onnx files are there,
 # not merely a manifest.json (2026-09-15 terra review #6: a manifest with no
 # model bytes beside it used to read as "present" and get handed to the

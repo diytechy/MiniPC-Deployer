@@ -31,6 +31,26 @@ REVIEWED_MANIFEST = WALL / "sensor-models/manifest.json"
 # --------------------------------------------------------- shared predicate
 
 
+def _run_bash_script(script: str, workdir: Path, env=None):
+    """Write `script` to a temp .sh file under `workdir` and run it as `bash
+    FILE`, never as `bash -c STRING`.
+
+    A long script with several Windows tmp paths embedded in it, passed as a
+    single argv string, hit Windows' CreateProcess/list2cmdline quoting: a
+    backslash immediately before a closing quote gets doubled, which can
+    silently corrupt an embedded quoted path and leaves bash reporting a bare
+    'unexpected end of file' -- indistinguishable from a real script bug
+    without knowing it was ever an argv-encoding problem. Writing the script
+    to a file sidesteps command-line quoting entirely.
+    """
+    script_path = workdir / "run.sh"
+    script_path.write_bytes(script.encode("utf-8"))
+    kwargs = {"capture_output": True, "text": True}
+    if env is not None:
+        kwargs["env"] = env
+    return subprocess.run(["bash", str(script_path)], **kwargs)
+
+
 def _run_common_sh_predicate(env_text: str, tmp_path: Path) -> int:
     """Source vmtest/lib/common.sh and call wall_camera_option_configured
     against a synthetic wall.env; returns the function's own exit status."""
@@ -43,7 +63,7 @@ def _run_common_sh_predicate(env_text: str, tmp_path: Path) -> int:
     # this fixture the same shape as the real file it stands in for.
     env_file.write_bytes(env_text.encode("utf-8"))
     script = f'set -euo pipefail; source "{VMTEST_LIB}"; wall_camera_option_configured "{env_file}"'
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    result = _run_bash_script(script, tmp_path)
     return result.returncode
 
 
@@ -69,7 +89,7 @@ def _run_firstboot_predicate(env_lines: list[str], tmp_path: Path) -> int:
         f'set -euo pipefail\n{load_env_file_source}\nload_env_file "{env_file}"\n'
         f'{predicate_source}\nwall_camera_option_configured'
     )
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    result = _run_bash_script(script, tmp_path)
     return result.returncode
 
 
@@ -281,7 +301,7 @@ def _run_stage(out_dir, source_wheelhouse, sensor_models_env=None):
     else:
         env.pop("WALL_SENSOR_MODELS", None)
     script = f'set -euo pipefail; source "{VMTEST_LIB}"; stage_wall_sensors_into_payload "{out_dir}"'
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    return _run_bash_script(script, out_dir.parent, env=env)
 
 
 def test_stage_wall_sensors_into_payload_fails_when_camera_configured_and_no_bundle_llr901(tmp_path):
@@ -323,12 +343,26 @@ def _firstboot_sensor_block():
     return text[start:end]
 
 
-def _run_firstboot_sensor_block(tmp_path, *, wheelhouse_present, models_present,
-                                camera_lines, installer_exit=0):
+def _run_firstboot_sensor_block(tmp_path, *, wheelhouse_present, models_present=False,
+                                camera_lines, installer_exit=0,
+                                payload_bundle_complete=False,
+                                payload_bundle_digest_mismatch=False,
+                                stale_models_content=None):
     """Run the REAL sensor block sliced out of wall-firstboot.sh, with
     fail_step/log stubbed to a readable log and a stub installer, driven by a
     synthetic wall.env through the same load_env_file + predicate this file
-    uses at runtime."""
+    uses at runtime.
+
+    payload_bundle_complete: stage a full, self-verifying bundle at
+    $PAYLOAD/sensor-models (manifest.json + both .onnx files, digests
+    matching) plus a real copy of check-sensor-models.py, the shape
+    sync_sensor_models_from_payload looks for.
+    payload_bundle_digest_mismatch: corrupt det_10g.onnx's bytes so the
+    bundle's OWN manifest check fails it.
+    stale_models_content: pre-populate $SENSOR_MODELS (the runtime path) with
+    this {name: bytes} before the block runs, simulating an existing
+    install the sync step must either replace (complete payload bundle) or
+    leave untouched (no payload bundle)."""
     payload = tmp_path / "payload"
     payload.mkdir()
     installer = payload / "install-wall-capabilities.sh"
@@ -336,13 +370,29 @@ def _run_firstboot_sensor_block(tmp_path, *, wheelhouse_present, models_present,
     installer.chmod(0o755)
     reviewed_manifest_dir = payload / "sensor-models"
     reviewed_manifest_dir.mkdir()
-    (reviewed_manifest_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    if payload_bundle_complete:
+        det_bytes, rec_bytes = b"payload-detector-bytes", b"payload-recognizer-bytes"
+        manifest = {
+            "det_10g.onnx": hashlib.sha256(det_bytes).hexdigest(),
+            "w600k_r50.onnx": hashlib.sha256(rec_bytes).hexdigest(),
+        }
+        (reviewed_manifest_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (reviewed_manifest_dir / "det_10g.onnx").write_bytes(
+            b"TAMPERED" if payload_bundle_digest_mismatch else det_bytes)
+        (reviewed_manifest_dir / "w600k_r50.onnx").write_bytes(rec_bytes)
+        shutil.copy(CHECK, payload / "check-sensor-models.py")
+    else:
+        (reviewed_manifest_dir / "manifest.json").write_text("{}", encoding="utf-8")
 
     sensor_wheelhouse = tmp_path / "sensor-wheelhouse"
     sensor_models = tmp_path / "sensor-models"
     if wheelhouse_present:
         sensor_wheelhouse.mkdir()
-    if models_present:
+    if stale_models_content is not None:
+        sensor_models.mkdir()
+        for name, data in stale_models_content.items():
+            (sensor_models / name).write_bytes(data)
+    elif models_present:
         sensor_models.mkdir()
         (sensor_models / "det_10g.onnx").write_bytes(b"x")
         (sensor_models / "w600k_r50.onnx").write_bytes(b"x")
@@ -381,7 +431,7 @@ def _run_firstboot_sensor_block(tmp_path, *, wheelhouse_present, models_present,
         ),
         'echo "PROVISION_FAILED=$PROVISION_FAILED"',
     ])
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    return _run_bash_script(script, tmp_path)
 
 
 def test_firstboot_camera_fail_step_fires_before_any_installer_work_llr901(tmp_path):
@@ -422,6 +472,84 @@ def test_firstboot_camera_not_configured_and_no_bundle_is_not_a_failure_llr901(t
         camera_lines=["WALL_ACCESS_MODE=gateway"])
     assert "PROVISION_FAILED=0" in result.stdout
     assert "wall.env enables a camera-related option" not in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="install -o root -g root needs a real root user")
+def test_firstboot_syncs_payload_bundle_into_stale_sensor_models_llr901(tmp_path):
+    """Live release finding, 2026-09-15 (paired-deployment-02.json): a
+    release install rebooted into a post-install gate refusal because
+    $SENSOR_MODELS still held a stale hand-written manifest.json while the
+    release's own verified bundle sat unused at $PAYLOAD/sensor-models.
+    sync_sensor_models_from_payload must replace the stale runtime copy with
+    exactly what the payload carries."""
+    result = _run_firstboot_sensor_block(
+        tmp_path, wheelhouse_present=True, camera_lines=["WALL_ACCESS_MODE=local"],
+        payload_bundle_complete=True,
+        stale_models_content={
+            "det_10g.onnx": b"stale-morning-copy-det",
+            "w600k_r50.onnx": b"stale-morning-copy-rec",
+            "manifest.json": b'{"stale": true}',
+        },
+    )
+    assert "PROVISION_FAILED=0" in result.stdout, result.stdout + result.stderr
+    assert "synced from" in result.stdout
+    sensor_models = tmp_path / "sensor-models"
+    assert (sensor_models / "det_10g.onnx").read_bytes() == b"payload-detector-bytes"
+    assert (sensor_models / "w600k_r50.onnx").read_bytes() == b"payload-recognizer-bytes"
+    manifest = json.loads((sensor_models / "manifest.json").read_text(encoding="utf-8"))
+    assert set(manifest) == {"det_10g.onnx", "w600k_r50.onnx"}
+    # No leftover staging/previous directory beside the runtime path.
+    assert not (tmp_path / (sensor_models.name + ".previous")).exists()
+
+
+def test_firstboot_leaves_existing_sensor_models_untouched_when_payload_has_no_bundle_llr901(tmp_path):
+    stale = {
+        "det_10g.onnx": b"stale-det",
+        "w600k_r50.onnx": b"stale-rec",
+        "manifest.json": b'{"stale": true}',
+    }
+    result = _run_firstboot_sensor_block(
+        tmp_path, wheelhouse_present=True, camera_lines=["WALL_ACCESS_MODE=gateway"],
+        payload_bundle_complete=False, stale_models_content=stale,
+    )
+    assert "PROVISION_FAILED=0" in result.stdout, result.stdout + result.stderr
+    assert "synced from" not in result.stdout
+    sensor_models = tmp_path / "sensor-models"
+    for name, data in stale.items():
+        assert (sensor_models / name).read_bytes() == data
+
+
+def test_firstboot_sync_refuses_and_leaves_existing_untouched_on_tampered_payload_bundle_llr901(tmp_path):
+    stale = {
+        "det_10g.onnx": b"stale-det",
+        "w600k_r50.onnx": b"stale-rec",
+        "manifest.json": b'{"stale": true}',
+    }
+    result = _run_firstboot_sensor_block(
+        tmp_path, wheelhouse_present=True, camera_lines=["WALL_ACCESS_MODE=local"],
+        payload_bundle_complete=True, payload_bundle_digest_mismatch=True,
+        stale_models_content=stale,
+    )
+    assert "PROVISION_FAILED=1" in result.stdout, result.stdout + result.stderr
+    assert "failed its own manifest check" in result.stdout
+    sensor_models = tmp_path / "sensor-models"
+    for name, data in stale.items():
+        assert (sensor_models / name).read_bytes() == data
+
+
+@pytest.mark.skipif(os.name == "nt", reason="install -o root -g root needs a real root user")
+def test_firstboot_sync_runs_before_the_camera_completeness_check_llr901(tmp_path):
+    """Ordering: sync happens first, so a payload that carries a complete
+    bundle satisfies the camera-configured completeness check even though
+    $SENSOR_MODELS started out completely absent -- the fail_step must NOT
+    fire in this case."""
+    result = _run_firstboot_sensor_block(
+        tmp_path, wheelhouse_present=True, camera_lines=["WALL_ACCESS_MODE=local"],
+        payload_bundle_complete=True,
+    )
+    assert "PROVISION_FAILED=0" in result.stdout, result.stdout + result.stderr
+    assert "absent or incomplete" not in result.stdout
+    assert "gateway-independent runtime installed and protocol verified" in result.stdout
 
 
 def test_firstboot_complete_bundle_is_anchored_on_the_payloads_own_manifest_llr901(tmp_path):
@@ -476,7 +604,7 @@ def test_firstboot_complete_bundle_is_anchored_on_the_payloads_own_manifest_llr9
             )
         ),
     ])
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    result = _run_bash_script(script, tmp_path)
     assert result.returncode == 0 or True, result.stdout + result.stderr  # the block itself never exits non-zero
     argv = (tmp_path / "installer-argv.txt").read_text(encoding="utf-8").splitlines()
     assert "--model-manifest" in argv

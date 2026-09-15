@@ -26,11 +26,17 @@ Ships OFF behind `WEIGHT_WAIST_ENABLED` and needs one sheet row the Owner must
 add (documented in `stack/weight/README.md`). Active gate remains G1.
 
 **Assumptions to confirm at the next gate.** (1) `heightMeters` is taken from
-the Google Health discovery document, not from a captured body - the repo's
-one-real-call gate is NOT met for height, and `weight_oauth.py capture
---data-type height` was added so the Owner can settle it; until then any other
-field shape is refused rather than converted, and the cost is the ratio gauge
-only. (2) The plan's `target from the waist-in item's target` is implemented as
+the Google Health body CAPTURED 2026-09-14 (HTTP 200, 1493 bytes, two data
+points) - the one-real-call gate is now MET for height, and the capture
+overturned the earlier discovery-document reading: the field is
+`heightMillimeters` as a decimal string, not `heightMeters` as a number.
+The captured body also confirmed the weight parser's nesting, so it needed
+no change. RESOLVED - `weight_oauth.py capture --data-type height` is the
+command that settled it. Any other field spelling, and any value that is not
+a plain decimal string, is still refused rather than converted, and the cost
+of a refusal is the ratio gauge only.
+
+(2) The plan's `target from the waist-in item's target` is implemented as
 a waist goal IN INCHES divided by the height rather than a literal 0.5 in the
 target column, because `unit: in` means inches to every other reader of that
 sheet and because NagLight marks a quantified row satisfied once progress

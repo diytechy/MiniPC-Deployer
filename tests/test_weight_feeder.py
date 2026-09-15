@@ -3693,65 +3693,128 @@ def test_the_state_file_stores_the_rounded_weight_ni_a1(tmp_path):
 # NI_A2 — the height half: the SAME route, the SAME scope, no consent change
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 1.778 m is 70.0 in EXACTLY (the international inch is 0.0254 m by
-# definition), so the ratio arithmetic below has no rounding of its own to
-# argue with. It is not the Owner's height.
-FIXTURE_METRES = 1.778
+# 1778 mm is 70.0 in EXACTLY (the international inch is 25.4 mm by definition),
+# so the ratio arithmetic below has no rounding of its own to argue with.
+#
+# IT IS A SYNTHETIC VALUE AND NOT THE OWNER'S HEIGHT. The real body captured on
+# 2026-09-14 is health data about a specific person; it was read on the hub,
+# never copied off it, and deleted afterwards. What is reproduced here is its
+# SHAPE — including the decimal STRING, which is the half a tidier fixture
+# would have quietly lost.
+FIXTURE_MILLIMETRES = "1778"
 FIXTURE_HEIGHT_IN = 70.0
 
 
-def a_height_point(physical=FIXTURE_PHYSICAL, metres=FIXTURE_METRES,
-                   member="height", field="heightMeters", point_id="H1"):
-    """One height `dataPoints` element, in the envelope observed on 2026-09-09.
+def a_height_point(physical=FIXTURE_PHYSICAL, millimetres=FIXTURE_MILLIMETRES,
+                   member="height", field="heightMillimeters", point_id="H1"):
+    """One height `dataPoints` element, in the shape observed on 2026-09-14.
 
-    The ENVELOPE is verified — `dataPoints`, `sampleTime.physicalTime`,
-    `utcOffset`, `nextPageToken` are properties of `DataPoint` and were seen on
-    the weight route. The MEMBER is the assumption this fixture stands in for,
-    which is why `member` and `field` are parameters: the tests below pin what
-    happens when the body is NOT this shape.
+    EVERY PART OF THIS IS NOW VERIFIED, INCLUDING THE MEMBER. The earlier
+    version of this fixture carried `heightMeters: 1.778`, taken from the
+    discovery document — and the real body does not have that field at all. It
+    carries `heightMillimeters` as a DECIMAL STRING. `member` and `field` stay
+    parameters so the tests below can pin what happens when a body is NOT this
+    shape, which is now a statement about the future rather than about the
+    present.
+
+    `dataSource.application.webClientId` is reproduced because the real height
+    body carries it and the weight body did not. Nothing reads it — like the
+    rest of `dataSource`, and like `name` — but a fixture that dropped it would
+    stop being the shape that was seen.
     """
     return {
         "name": "users/%s/dataTypes/height/dataPoints/%s" % (SENTINEL_ID, point_id),
-        "dataSource": {"recordingMethod": "MANUAL", "platform": "FITBIT"},
+        "dataSource": {"recordingMethod": "MANUAL",
+                       "application": {"webClientId": SENTINEL_ID},
+                       "platform": "FITBIT"},
         member: {"sampleTime": {"physicalTime": physical,
-                                "utcOffset": FIXTURE_OFFSET},
-                 field: metres},
+                                "utcOffset": FIXTURE_OFFSET,
+                                "civilTime": {
+                                    "date": {"year": 2026, "month": 9, "day": 8},
+                                    "time": {"hours": 20, "minutes": 24,
+                                             "seconds": 33, "nanos": 390135000}}},
+                 field: millimetres},
     }
 
 
-def test_the_height_body_parses_to_inches_and_the_instant_sr022():
-    """metres -> inches, and `physicalTime` -> the instant it was true."""
+def test_the_captured_height_shape_parses_to_inches_and_the_instant_sr022():
+    """THE GATE, FOR THE HEIGHT HALF: the observed body yields the right number.
+
+    `heightMillimeters` -> inches, and `sampleTime.physicalTime` -> the instant
+    it was true. The nesting is the weight body's exactly, which is what makes
+    `walk_data_points`, `parse_rfc3339_utc` and `check_observed_at` correctly
+    shared between the two data types rather than coincidentally alike.
+    """
     reading = feeder.parse_height_datapoint(a_body(a_height_point()), NOW)
     assert reading.inches == pytest.approx(FIXTURE_HEIGHT_IN)
     assert reading.observed_at == CAPTURED_AT
 
 
-def test_metres_are_not_centimetres_and_not_inches_sr022():
+def test_millimetres_are_not_metres_and_not_centimetres_sr022():
     """The one conversion, pinned against the two ways it could be wrong.
 
-    Read as centimetres the person is 100x too short for the band; read as
-    inches they are 40x too short. BOTH are refused, which is the difference
-    from the weight path — there, a factor of 2.2 can hide inside the band.
+    Read as metres the person is 1000x too short for the band; read as
+    centimetres, 10x. BOTH are refused — which is the difference from the
+    weight path, where a factor of 2.2 can hide inside the band.
     """
-    assert feeder.metres_to_inches(1.0) == pytest.approx(39.37007874015748)
-    for wrong in (FIXTURE_METRES / 100.0, FIXTURE_METRES * 0.0254):
+    assert feeder.millimetres_to_inches(25.4) == pytest.approx(1.0)
+    assert feeder.millimetres_to_inches(1778.0) == pytest.approx(70.0)
+    for wrong in ("1.778", "177.8"):
         with pytest.raises(feeder.SourceFailure):
-            feeder.check_vendor_metres(wrong, "height")
+            feeder.check_vendor_millimetres(wrong, "height")
 
 
-@pytest.mark.parametrize("field", ["heightCm", "heightMillimeters", "value"])
+def test_the_value_is_a_decimal_string_because_that_is_what_was_seen_sr022():
+    """`"1778"`, not `1778` — proto3's int64 JSON encoding.
+
+    A BARE NUMBER IS REFUSED RATHER THAN ACCEPTED, and that is this file's
+    standing rule rather than fussiness: the alternative is `float(raw)`, which
+    would also cheerfully accept `nan`, `inf`, `"  12  "` and `"1e4"`, and the
+    whole point of the gate this parser was written behind is not to take that
+    latitude with a vendor's bytes. A tenth is allowed — the field is a length,
+    not a count, and another platform may well report one.
+    """
+    assert feeder.check_vendor_millimetres("1778.0", "h") == pytest.approx(70.0)
+    for refused in (1778, 1778.0, True, None, "", " 1778", "1778 ", "+1778",
+                    "-1778", "1.778e3", "nan", "inf", "1,778"):
+        with pytest.raises(feeder.SourceFailure):
+            feeder.check_vendor_millimetres(refused, "height")
+
+
+@pytest.mark.parametrize("field", ["heightMeters", "heightCm", "value"])
 def test_a_height_field_this_parser_does_not_know_is_refused_sr022(field):
     """THE UNIT IS CHECKED, NEVER ASSUMED — and here the key name IS the unit.
 
-    `heightMeters` was taken from the discovery document, not from a captured
-    body, so this is the assumption's blast radius: any other shape is refused
-    rather than converted, the ratio gauge is simply not posted, and the weight
-    gauge is untouched.
+    `heightMeters` heads this list for a reason: it is what an earlier draft of
+    this parser read, on the discovery document's word, and the captured body
+    does not have it. Reading millimetres out of a metres field would be wrong
+    by a factor of a thousand. Any unknown shape is refused rather than
+    converted; the ratio gauge is simply not posted and the weight gauge is
+    untouched.
     """
     with pytest.raises(feeder.SourceFailure) as raised:
         feeder.parse_height_datapoint(
             a_body(a_height_point(field=field)), NOW)
-    assert "heightMeters" in str(raised.value)
+    assert "heightMillimeters" in str(raised.value)
+
+
+def test_the_weight_parser_reads_the_same_nesting_as_the_height_body_sr022():
+    """The two members sit at the SAME depth, checked rather than assumed.
+
+    The real height body settled that `height.sampleTime.physicalTime` is where
+    `weight.sampleTime.physicalTime` is, so the weight parser needed no change
+    — and it has been posting successfully since 2026-09-09. This asserts the
+    shared nesting directly, so a future body that moved it would fail here
+    rather than in one parser and not the other.
+    """
+    weight_point = a_point()
+    height_point = a_height_point()
+    assert set(weight_point["weight"]["sampleTime"]) >= {"physicalTime",
+                                                        "utcOffset", "civilTime"}
+    assert (set(height_point["height"]["sampleTime"])
+            == set(weight_point["weight"]["sampleTime"]))
+    assert feeder.parse_weight_datapoint(a_body(weight_point), NOW).observed_at \
+        == feeder.parse_height_datapoint(a_body(height_point), NOW).observed_at
 
 
 def test_a_point_that_is_not_a_height_is_skipped_not_read_sr022():
@@ -3762,8 +3825,8 @@ def test_a_point_that_is_not_a_height_is_skipped_not_read_sr022():
 
 def test_the_latest_height_wins_and_array_order_is_not_trusted_sr022():
     """Ordered by `physicalTime`, never by position — the weight rule."""
-    older = a_height_point(physical="2026-09-01T12:00:00Z", metres=1.600,
-                           point_id="H0")
+    older = a_height_point(physical="2026-09-01T12:00:00Z",
+                           millimetres="1600", point_id="H0")
     reading = feeder.parse_height_datapoint(
         a_body(a_height_point(), older), NOW)
     assert reading.inches == pytest.approx(FIXTURE_HEIGHT_IN)
@@ -3773,7 +3836,7 @@ def test_two_heights_at_one_instant_that_disagree_are_refused_sr022():
     """A person's height does not change between two points sharing a stamp."""
     with pytest.raises(feeder.SourceFailure):
         feeder.parse_height_datapoint(
-            a_body(a_height_point(), a_height_point(metres=1.60, point_id="H2")),
+            a_body(a_height_point(), a_height_point(millimetres="1600", point_id="H2")),
             NOW)
 
 
@@ -3789,8 +3852,8 @@ def test_no_vendor_height_ever_reaches_a_message_sr022():
     """Not the value, not the Google user id — it is health data."""
     with pytest.raises(feeder.SourceFailure) as raised:
         feeder.parse_height_datapoint(
-            a_body(a_height_point(metres=99.0)), NOW)
-    assert "99" not in str(raised.value) and SENTINEL_ID not in str(raised.value)
+            a_body(a_height_point(millimetres="99000")), NOW)
+    assert "99000" not in str(raised.value) and SENTINEL_ID not in str(raised.value)
 
 
 def test_the_height_route_differs_only_in_the_data_type_segment_ni_a2():
@@ -3821,8 +3884,8 @@ def test_the_height_reader_walks_pages_over_real_sockets_ni_a2(tmp_path):
     """The shared page walk, exercised on the height route end to end."""
     pages = {"/health": a_body(a_height_point(), nextPageToken="P2"),
              "/health?pageToken=P2": a_body(
-                 a_height_point(physical="2026-09-01T12:00:00Z", metres=1.60,
-                                point_id="H0")),
+                 a_height_point(physical="2026-09-01T12:00:00Z",
+                                millimetres="1600", point_id="H0")),
              "/token": {"access_token": "ACCESS-TOKEN-XYZ"}}
 
     def respond(handler):

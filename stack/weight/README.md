@@ -983,28 +983,56 @@ a weight bar, and height is inside that same grant. A test asserts the two URLs
 differ in exactly the `weight`/`height` segment and that only one scope constant
 exists, so the claim is checkable rather than remembered.
 
-**What is observed and what is assumed.** The weight body was captured live on
-2026-09-09 and the height parser inherits every *verified* part of it: the
-route, the scope, the `dataPoints` envelope, the `nextPageToken` paging and the
-`sampleTime.physicalTime` / `utcOffset` / `civilTime` shape — all properties of
-`DataPoint` rather than of the weight member. What has **not** been seen is a
-height point's own member, so **`heightMeters` is taken from the discovery
-document and is an assumption.**
+**The gate is CLEARED for height too — the parser is written against a real
+body.** On **2026-09-14** the Owner ran `weight_oauth.py capture --data-type
+height` against the live API and got **HTTP 200, 1493 bytes**, with two data
+points. The standard is B7's and it was met, not waived. The body itself is not
+in this repo and never will be; it was read on the hub, never copied off it, and
+deleted afterwards. Its *shape* is recorded in `weight_feeder.py`'s height
+banner and in the test fixtures, with a placeholder id and a made-up height.
 
-It is made safe by **refusing rather than guessing**: the key is required by
-exact name, so a body carrying `heightCm`, `heightMillimeters` or a bare number
-is refused, not converted. A metres reader fed centimetres posts a person 100×
-too tall; fed inches, 40× too short. Both land far outside the 24..96 in band,
-and unlike a wrong body weight — which at least lands somewhere a human
-recognises — a ratio of 0.02 is a number nobody has intuition for.
+### What the captured height body settled — and what it overturned
 
-**To settle the assumption with one real call**, the way the weight parser was
-settled:
+| what was in doubt | what the body said |
+|---|---|
+| the field name | **`heightMillimeters`**, not `heightMeters` |
+| its JSON type | a **decimal string** — `"1778"`, not `1778` (proto3's int64 encoding) |
+| the nesting | `height.sampleTime.physicalTime` / `utcOffset` / `civilTime` — **exactly** where `weight.sampleTime.*` sit |
+| `dataSource` | carries an extra `application.webClientId` the weight body did not. Not read, like the rest of it |
+
+**The first row is the whole reason this repo has the rule.** The previous draft
+of this parser took `heightMeters` from the *discovery document* and said so in
+its own comments. **It was wrong.** A parser that shipped on the schema's word
+would have divided a real `1778` by 0.0254 and produced a seventy-thousand-inch
+person — caught by the band at that scale, but the identical error one order of
+magnitude smaller is exactly the confident, plausible, wrong number this gate
+exists to stop. *A parser is written against a body, never against a schema.*
+
+**The third row means the weight parser needed no change** — and that was
+*checked* against the captured body rather than assumed. The two members sit at
+the same depth, which is what makes `walk_data_points`, `parse_rfc3339_utc` and
+`check_observed_at` correctly shared between the data types rather than
+coincidentally alike; a test now asserts the two `sampleTime` key sets are
+identical, so a future body that moved one would fail loudly instead of breaking
+one parser and not the other.
+
+**What is still refused rather than guessed.** The key is required by exact
+name, so a body carrying `heightMeters`, `heightCm` or a bare number is refused,
+not converted — a millimetre reader fed metres is 1000× low and fed centimetres
+10× low, and all of those land far outside the 24..96 in band. The *value* must
+be a plain decimal string matching `^\d+(\.\d+)?$`: a bare number is a shape
+nobody has seen, and `float()` alone would also accept `nan`, `inf`, `"  12  "`
+and `"1e4"`, which is precisely the latitude this file does not take with a
+vendor's bytes. A refusal costs the ratio gauge and nothing else.
+
+**To re-capture a body** (the command the 2026-09-14 capture was made with):
 
 ```bash
 sudo /opt/homehub/stack/weight/weight_oauth.py capture \
      --data-type height --out /root/height-body.json
 ```
+
+Delete it when you are done with it: it is one person's health data.
 
 `--data-type` is a fixed allow-list of two routes, both taken from the feeder's
 own constants — not a free `--url`, because the request carries an access token

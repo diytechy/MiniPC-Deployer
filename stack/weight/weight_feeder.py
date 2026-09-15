@@ -1059,55 +1059,128 @@ def next_page_token(payload):
 # because "no consent change" is a claim about the household's privacy and it
 # must be checkable rather than remembered.
 #
-# WHAT IS OBSERVED AND WHAT IS ASSUMED, MARKED AS SUCH. The weight body was
-# captured live on 2026-09-09 and this parser inherits every VERIFIED part of
-# it: the route, the scope, the `dataPoints` envelope, the `nextPageToken`
-# paging, and the `sampleTime.physicalTime` / `utcOffset` / `civilTime` shape,
-# which are properties of `DataPoint` rather than of the weight member. What has
-# NOT been seen is a height point's own member, so `heightMeters` is taken from
-# the discovery document and IS AN ASSUMPTION.
+# ══════════════════════════════════════════════════════════════════════════════
+# THE GATE IS CLEARED FOR HEIGHT TOO. A REAL HEIGHT RESPONSE BODY WAS CAPTURED
+# ON 2026-09-14, AND THE PARSER BELOW IS WRITTEN AGAINST IT.
+# ══════════════════════════════════════════════════════════════════════════════
 #
-# THE ASSUMPTION IS MADE SAFE BY REFUSING RATHER THAN GUESSING. The key is
-# required by exact name: a body carrying `heightCm`, `heightMillimeters` or a
-# bare `height` number is REFUSED, not converted, because a metres reader fed
-# centimetres posts a person 100x too tall and a metres reader fed inches posts
-# one 40x too short - and unlike the weight gauge, whose wrongness at least
-# lands in a band a human recognises, a ratio of 0.02 or 20 is a number nobody
-# has any intuition for. A refusal costs the ratio gauge and nothing else: the
-# weight gauge is posted from a different call, and the cached height carries
-# the ratio through a transient failure. `weight_oauth.py capture --data-type
-# height` exists so the Owner can settle the assumption with one real call, and
-# when they do, this comment says what to change.
+# `weight_oauth.py capture --data-type height` was run by the Owner against the
+# live API on 2026-09-14 and got HTTP 200, 1493 bytes, two data points, from
+#
+#     GET https://health.googleapis.com/v4/users/me/dataTypes/height/dataPoints
+#
+# THE BODY ITSELF IS NOT IN THIS REPO AND NEVER WILL BE - it carries the Owner's
+# Google user id and their real body height. What is recorded here is its SHAPE,
+# with a placeholder id and a made-up height:
+#
+#     {
+#       "dataPoints": [
+#         {
+#           "name": "users/<GOOGLE-USER-ID>/dataTypes/height/dataPoints/<POINT-ID>",
+#           "dataSource": {
+#             "recordingMethod": "MANUAL",
+#             "application": {"webClientId": "<CLIENT-ID>"},
+#             "platform": "FITBIT"
+#           },
+#           "height": {
+#             "sampleTime": {
+#               "physicalTime": "2026-09-14T13:02:11.482000Z",
+#               "utcOffset": "-14400s",
+#               "civilTime": {
+#                 "date": {"year": 2026, "month": 9, "day": 14},
+#                 "time": {"hours": 9, "minutes": 2, "seconds": 11,
+#                          "nanos": 482000000}
+#               }
+#             },
+#             "heightMillimeters": "1778"
+#           }
+#         }
+#       ]
+#     }
+#
+# WHAT THE CAPTURED BODY SETTLED, AND WHAT IT OVERTURNED:
+#
+#   * THE FIELD IS `heightMillimeters`, NOT `heightMeters`. The previous draft
+#     of this parser took `heightMeters` from the discovery document and said so
+#     - and it was WRONG. Had it shipped reading a number it never saw, a real
+#     1778 would have been divided by 0.0254 and posted as a 70 000-inch person;
+#     the band would have caught that one, but the same class of error at a
+#     different scale is exactly what put "a parser is written against a body,
+#     never against a schema" into this repo in the first place. The rule earned
+#     its keep here.
+#   * ITS VALUE IS A DECIMAL STRING, NOT A NUMBER. `"1778"`, not `1778`. That is
+#     proto3's int64 JSON encoding, and it is why `check_vendor_millimetres`
+#     parses a string rather than calling `check_pounds` on the raw value.
+#   * `dataSource` CARRIES AN EXTRA `application.webClientId` the weight body did
+#     not. It is not read, like the rest of `dataSource` and like `name`; it is
+#     recorded here only so a future reader knows the two bodies differ and that
+#     the difference was seen rather than missed.
+#   * THE NESTING IS THE WEIGHT BODY'S, EXACTLY. `height.sampleTime.physicalTime`
+#     / `utcOffset` / `civilTime` sit where `weight.sampleTime.*` sit, and the
+#     `dataPoints` envelope is identical - so the shared `walk_data_points`,
+#     `parse_rfc3339_utc` and `check_observed_at` were right to be shared, and
+#     THE WEIGHT PARSER NEEDS NO CHANGE. It was checked against this body, not
+#     assumed to be fine: it reads the same two levels and it has been posting
+#     successfully since 2026-09-09.
+#
+# WHAT IS STILL REFUSED RATHER THAN GUESSED. The key is required by exact name,
+# so a body carrying `heightMeters`, `heightCm` or a bare number is REFUSED, not
+# converted. A millimetre reader fed metres posts a person 39 inches per metre
+# too short and one fed centimetres is 10x out - and unlike the weight gauge,
+# whose wrongness at least lands somewhere a human recognises, a ratio of 0.02
+# or 20 is a number nobody has any intuition for. A refusal costs the ratio
+# gauge and nothing else: the weight gauge is posted from a different call, and
+# the cached height carries the ratio through a transient failure.
 # ══════════════════════════════════════════════════════════════════════════════
 
 HEIGHT_MEMBER = "height"
-HEIGHT_METERS_KEY = "heightMeters"
+HEIGHT_MILLIMETRES_KEY = "heightMillimeters"
 
-# The international inch is 0.0254 m EXACTLY, by definition, so this is not an
+# The international inch is 25.4 mm EXACTLY, by definition, so this is not an
 # approximation and the same reasoning applies as to `grams_to_pounds`: a
-# rounded 39.37 drifts visibly once a ratio is taken to three decimals.
-METRES_PER_INCH = 0.0254
+# rounded factor drifts visibly once a ratio is taken to three decimals.
+MILLIMETRES_PER_INCH = 25.4
+
+# What `heightMillimeters` is allowed to look like. Google sends proto3 int64 as
+# a DECIMAL STRING, and the captured body held `"1778"`. The pattern admits an
+# optional fractional part because the field is a length rather than a count and
+# another platform may well report tenths; it admits NO sign, NO exponent and NO
+# whitespace, because a negative height is not a measurement and `1e3` is a
+# shape nobody has seen. `float()` alone would accept `nan`, `inf`, `+1_0` and
+# leading whitespace, which is precisely the latitude this file does not take
+# with a vendor's bytes.
+HEIGHT_MILLIMETRES_RE = re.compile(r"^\d+(?:\.\d+)?$")
 
 # 24..96 in is 2 ft to 8 ft. As with PLAUSIBLE_LB the point is not to police
 # anybody's body: it is to catch a units error before it becomes a confident
-# wrong ratio on a wall. Note what it CANNOT catch - metres read as metres is
-# right, but centimetres read as metres is 100x and inches read as metres is
-# 40x, and BOTH land far outside this band, which is why the band is the second
-# guard and the exact key name is the first.
+# wrong ratio on a wall. Note what it CANNOT catch - millimetres read as
+# millimetres is right, but metres read as millimetres is 1000x low and
+# centimetres 10x low, and all of those land far outside this band, which is why
+# the band is the second guard and the exact key name is the first.
 PLAUSIBLE_HEIGHT_IN = (24.0, 96.0)
 
 
-def metres_to_inches(metres, where="metres"):
-    """Convert the vendor's metres to the household's inches.
+def millimetres_to_inches(millimetres, where="millimetres"):
+    """Convert the vendor's millimetres to the household's inches.
 
-    Google Health v4 states body height as `heightMeters` (a double) and this
-    household measures itself in inches, so exactly one conversion exists on
-    this path and it lives here rather than inline at the call site - the same
-    rule, for the same reason, as `grams_to_pounds`.
+    Contract:
+      Inputs:  millimetres: float, already parsed out of the decimal string
+               the vendor sends; where: str for the message.
+      Outputs: float inches.
+      Raises:  SourceFailure for a non-finite or non-positive value.
+
+    Google Health v4 states body height as `heightMillimeters` - OBSERVED on
+    2026-09-14, not taken from the discovery document, which is how the earlier
+    `heightMeters` reading of this field came to be wrong - and this household
+    measures itself in inches, so exactly one conversion exists on this path and
+    it lives here rather than inline at the call site. The same rule, for the
+    same reason, as `grams_to_pounds`: a factor written twice is a factor that
+    can drift, and a wrong one here is a confident, plausible, wrong number
+    about a person's body.
 
     Implements: LLR-006
     """
-    return check_pounds(metres, where) / METRES_PER_INCH
+    return check_pounds(millimetres, where) / MILLIMETRES_PER_INCH
 
 
 def check_plausible_height_in(value, where):
@@ -1115,9 +1188,9 @@ def check_plausible_height_in(value, where):
 
     The band is PLAUSIBLE_HEIGHT_IN and it is checked for the same reason
     `check_plausible_weight_lb` checks its own: a finite positive number is not
-    yet a human measurement, and the ratio gauge divides by this one, so a
-    height of 0.06 (metres read as inches) would not merely be wrong, it would
-    make the ratio explode.
+    yet a human measurement, and the ratio gauge DIVIDES BY this one, so a
+    height of 0.07 (millimetres read as inches) would not merely be wrong, it
+    would make the ratio explode.
 
     Implements: LLR-006
     """
@@ -1130,23 +1203,43 @@ def check_plausible_height_in(value, where):
     return inches
 
 
-def check_vendor_metres(raw, where):
-    """`heightMeters` -> plausible inches, or SourceFailure naming no VALUE.
+def check_vendor_millimetres(raw, where):
+    """`heightMillimeters` -> plausible inches, or SourceFailure naming no VALUE.
 
-    It wraps the conversion and the band for exactly the reason
-    `check_vendor_grams` does: their messages quote the value, and a
-    well-formed value here IS the Owner's body height, which is health data
-    about a specific person. The message names the field and the type; the
-    number stays out of the journal.
+    Contract:
+      Inputs:  raw: whatever sat under `heightMillimeters` - in the captured
+               body a DECIMAL STRING, `"1778"`; where: str for the message.
+      Outputs: float inches inside PLAUSIBLE_HEIGHT_IN.
+      Raises:  SourceFailure for anything that is not a plain decimal string,
+               and for anything converting outside the band.
 
-    Implements: LLR-006
+    IT REQUIRES A STRING, AND THAT IS THE OBSERVATION SPEAKING RATHER THAN
+    FUSSINESS. The captured body sent `"1778"`, which is proto3's int64 JSON
+    encoding, so a bare number is a shape nobody has seen on this field. This
+    file's standing rule is that an unseen shape is refused rather than read -
+    the alternative is `float(raw)`, which would also cheerfully accept `nan`,
+    `inf`, `"  12  "` and `"1e4"`, and the whole point of the gate this parser
+    was written behind is not to take that latitude with a vendor's bytes.
+
+    THE MESSAGE NAMES THE FIELD AND THE TYPE AND NEVER THE VALUE. It wraps the
+    conversion and the band for exactly the reason `check_vendor_grams` does:
+    their messages quote the value, and a well-formed value here IS the Owner's
+    body height, which is health data about a specific person, and `run_cycle`
+    journals a SourceFailure's message.
+
+    Implements: SR-022, LLR-006
     """
+    if not isinstance(raw, str) or not HEIGHT_MILLIMETRES_RE.match(raw):
+        raise SourceFailure(
+            "%s: %s is not the plain decimal string this field was observed to "
+            "carry (it is a %s). The value is not logged."
+            % (where, HEIGHT_MILLIMETRES_KEY, type(raw).__name__))
     try:
-        inches = metres_to_inches(raw, where)
+        inches = millimetres_to_inches(float(raw), where)
     except SourceFailure:
         raise SourceFailure(
             "%s: %s is not a usable number (it is a %s). The value is not "
-            "logged." % (where, HEIGHT_METERS_KEY, type(raw).__name__))
+            "logged." % (where, HEIGHT_MILLIMETRES_KEY, type(raw).__name__))
     try:
         return check_plausible_height_in(inches, where)
     except SourceFailure:
@@ -1154,7 +1247,7 @@ def check_vendor_metres(raw, where):
             "%s: %s converts to a height outside the plausible band %g..%g in, "
             "so it is a units error or corruption rather than a body height. "
             "The value is not logged: it is health data."
-            % (where, HEIGHT_METERS_KEY, PLAUSIBLE_HEIGHT_IN[0],
+            % (where, HEIGHT_MILLIMETRES_KEY, PLAUSIBLE_HEIGHT_IN[0],
                PLAUSIBLE_HEIGHT_IN[1]))
 
 
@@ -1187,7 +1280,7 @@ def height_from_data_point(point, now, where):
                where: "google-health(height) dataPoints[3]" or the like.
       Outputs: HeightReading.
       Raises:  SourceFailure for a non-object, a point with no `height` member,
-               a `height` with no `heightMeters` or no `sampleTime`, an
+               a `height` with no `heightMillimeters` or no `sampleTime`, an
                unusable number, and a `physicalTime` that is missing,
                unparseable, zoneless, before EPOCH_FLOOR or in the FUTURE.
 
@@ -1217,20 +1310,21 @@ def height_from_data_point(point, now, where):
     if not isinstance(height, dict):
         raise SourceFailure("%s: `%s` is not an object (it is a %s)"
                             % (where, HEIGHT_MEMBER, type(height).__name__))
-    if HEIGHT_METERS_KEY not in height:
+    if HEIGHT_MILLIMETRES_KEY not in height:
         # THE UNIT IS CHECKED, NEVER ASSUMED, AND HERE THE KEY NAME IS THE
-        # UNIT. A body carrying `heightCm` is not a shape to convert from; it
-        # is a shape nobody has seen, and reading it as metres would post a
-        # person a hundred times too tall with nothing on the wall able to say
-        # so.
+        # UNIT. `heightMeters` is the shape an earlier draft of this parser
+        # took from the discovery document, and the body captured on 2026-09-14
+        # does not have it; a body carrying it, or `heightCm`, is not a shape to
+        # convert from but a shape nobody has seen, and reading millimetres out
+        # of it would post a height wrong by a factor of a thousand.
         raise SourceFailure(
             "%s: `%s` carries no `%s`, so this body does not state the height "
             "in the one unit this parser reads. It is REFUSED rather than "
             "converted from whatever else is present: the unit is never "
             "assumed. Capture one real height body (`weight_oauth.py capture "
             "--data-type height`) and write the parser against it."
-            % (where, HEIGHT_MEMBER, HEIGHT_METERS_KEY))
-    inches = check_vendor_metres(height.get(HEIGHT_METERS_KEY), where)
+            % (where, HEIGHT_MEMBER, HEIGHT_MILLIMETRES_KEY))
+    inches = check_vendor_millimetres(height.get(HEIGHT_MILLIMETRES_KEY), where)
     sample = height.get(SAMPLE_TIME_KEY)
     if not isinstance(sample, dict):
         raise SourceFailure(
@@ -1760,7 +1854,7 @@ def check_plausible_waist_in(value, where):
     by hand - so unlike the two vendor bands it is catching a typo (`335` for
     `33.5`) at least as often as a units error.
 
-    THE NUMBER STAYS OUT OF THE JOURNAL, for the reason `check_vendor_metres`
+    THE NUMBER STAYS OUT OF THE JOURNAL, for the reason `check_vendor_millimetres`
     keeps the height out of it: a waist is a body measurement about a specific
     person, and `ratio_cycle` journals a SourceFailure's message. This branch
     made that rule for the vendor half and then broke it here, where the
@@ -1796,8 +1890,9 @@ def waist_height_ratio(waist_in, height_in, where="ratio"):
       Raises:  SourceFailure when the result is outside PLAUSIBLE_RATIO.
 
     BOTH INPUTS ARE IN INCHES AND THAT IS ENFORCED UPSTREAM, NOT HERE. The
-    height arrives from `check_vendor_metres`, which will only produce inches
-    from a field named `heightMeters`; the waist arrives from an item this
+    height arrives from `check_vendor_millimetres`, which will only produce
+    inches from a field named `heightMillimeters`; the waist arrives from an
+    item this
     feeder refuses unless it declares `unit: in`. This function therefore does
     no conversion at all - it cannot, because a dimensionless ratio gives it
     nothing to check a conversion against - and the band below is the last

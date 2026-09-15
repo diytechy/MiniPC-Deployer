@@ -1538,23 +1538,86 @@ def test_the_mic_follows_the_output_switch_d3_d4_sr029(policy):
     assert policy.plan(headset)["mic_source"] == "mic_headset"
 
 
-def test_output_mute_does_not_mute_the_microphone_ruling_e_sr029(policy):
-    """Owner ruling E, in as many words: "the mic has its own mute".
+def test_output_mute_also_mutes_the_microphone_item_j_sr029(policy):
+    """ITEM J, which SUPERSEDES Owner ruling E (coordinator plan, 2026-09-14).
 
-    The Mute POSITION silences the room. It is not an input control, and a panel
-    that quietly stopped the microphone when somebody silenced the speakers
-    would be answering a question the Owner explicitly answered the other way.
+    Ruling E said the Mute position silences the room and not the microphone --
+    "the mic has its own mute". The Owner reversed that on 2026-09-14: selecting
+    output Mute now also stops microphone transmission. The mic button still
+    exists and is still a separate control; what changed is the coupling.
+
+    This is the test that used to assert the opposite. It is rewritten rather
+    than deleted so the supersession is visible in one place.
+    """
+    muted, lines = policy.apply_event(policy.default_state(),
+                                      {"kind": "set_output", "output": "mute"})
+    assert policy.audible(muted) is False, "the room is silent"
+    assert policy.mic_live(muted) is False, "and so is the microphone"
+    # The coupling is a LATCH on the stored flag, not a mask over it: see
+    # _set_output for why the Owner's second half (the mute is retained after
+    # leaving the Mute position) is only consistent with a latch.
+    assert muted["input_muted"] is True
+    assert any("item J" in line for line in lines), "and it is journalled"
+    plan = policy.plan(muted)
+    assert all(plan["legs"][unit] is False for unit in policy.ALL_LEGS)
+    assert plan["input_muted_effective"] is True
+    assert plan["input_mute_held"] is True
+    # And in Mute there is no headset to take the mic from, so the name
+    # published for the legs that are NOT running is the panel's.
+    assert plan["mic_source"] == "mic_panel"
+
+
+def test_leaving_mute_retains_the_input_mute_until_an_explicit_unmute_item_j(policy):
+    """The Owner's second half, and the cost it carries.
+
+    "No inferred requirement to unmute the microphone when leaving output Mute:
+    default to retaining its muted state until an explicit microphone-unmute
+    action." So a person who was live on Speaker, taps Mute, then taps Speaker
+    again comes back MUTED and must press the mic button.
+    """
+    live = policy.default_state()
+    assert live["input_muted"] is False and policy.mic_live(live) is True
+    muted, _ = policy.apply_event(live, {"kind": "set_output", "output": "mute"})
+    back, lines = policy.apply_event(muted, {"kind": "set_output", "output": "speaker"})
+    assert back["input_muted"] is True, "not silently cleared"
+    assert policy.mic_live(back) is False
+    assert any("explicit unmute" in line for line in lines)
+    assert policy.plan(back)["input_mute_held"] is False, "but no longer HELD"
+    # The explicit unmute is what brings it back, and only that.
+    unmuted, _ = policy.apply_event(back, {"kind": "set_input_mute", "muted": False})
+    assert policy.mic_live(unmuted) is True
+
+
+def test_an_independent_unmute_is_refused_while_mute_is_selected_item_j(policy):
+    """Refused out loud, never silently dropped.
+
+    A request that changed nothing while answering "accepted" would leave the
+    chrome painting a live microphone over a dead one -- which is worse than
+    the refusal, because it is a claim.
     """
     muted, _ = policy.apply_event(policy.default_state(),
                                   {"kind": "set_output", "output": "mute"})
-    assert policy.audible(muted) is False, "the room is silent"
-    assert policy.mic_live(muted) is True, "the microphone is not"
-    plan = policy.plan(muted)
-    assert all(plan["legs"][unit] is False
-               for unit in policy.SPEAKER_LEGS + policy.HEADSET_LEGS)
-    assert all(plan["legs"][unit] is True for unit in policy.MIC_LEGS)
-    # And in Mute there is no headset to take the mic from, so it is the panel's.
-    assert plan["mic_source"] == "mic_panel"
+    with pytest.raises(policy.StateError):
+        policy.apply_event(muted, {"kind": "set_input_mute", "muted": False})
+    # Muting again is not an unmute and is not refused.
+    same, _ = policy.apply_event(muted, {"kind": "set_input_mute", "muted": True})
+    assert same["input_muted"] is True
+
+
+def test_boot_recovery_couples_the_mute_with_no_request_at_all_item_j(policy):
+    """The paths that are not requests: boot, resume, udev, a rolled-back file.
+
+    Every caller normalizes before it decides anything, so the coupling holds
+    for all of them. Without this a panel could come up in Mute with a live
+    microphone and nothing would ever ask a question that noticed.
+    """
+    recovered = policy.normalize({"output": "mute", "input_muted": False,
+                                  "volume": {"headset": 60, "speaker": 60},
+                                  "headset_present": False,
+                                  "headset_autoswitch_armed": True,
+                                  "request_seq": 5, "version": 1})
+    assert recovered["input_muted"] is True
+    assert policy.mic_live(recovered) is False
 
 
 def test_the_input_mute_is_a_real_mute_not_a_ui_flag_ruling_e_sr029(policy):
@@ -2177,7 +2240,8 @@ def test_the_mic_allowed_gate_takes_no_lock_sr029(applier):
 @pytest.mark.parametrize("stored,allowed", [
     ({"output": "speaker", "input_muted": False}, 0),
     ({"output": "speaker", "input_muted": True}, 1),
-    ({"output": "mute", "input_muted": False}, 0),
+    # Item J: output Mute couples the microphone, so the gate refuses.
+    ({"output": "mute", "input_muted": False}, 1),
     ({"output": "mute", "input_muted": True}, 1),
     # ruling 7: headset selected, adapter absent -> nothing tunnelled
     ({"output": "headset", "input_muted": False, "headset_present": False}, 1),

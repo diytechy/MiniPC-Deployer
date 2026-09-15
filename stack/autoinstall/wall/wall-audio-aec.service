@@ -1,0 +1,75 @@
+# wall-audio-aec.service - the acoustic echo canceller (item 23, step 6).
+#
+# WHAT IT IS FOR. In Speaker position the room's own music reaches the panel's
+# microphone, and everything the microphone forwards -- the desktop's input
+# through wall-mic-rear, a phone's HFP return through wall-bt-mic -- carries
+# that echo back to whoever is listening. The spike (HomeHub
+# docs/AEC_SPIKE_2026-09-14.md) measured 54.9 ms of bulk delay and 27 dB of
+# offline ERLE with a 128 ms filter and a 50 ms pre-delay; this is that design.
+#
+# IT OWNS THE RAW MICROPHONE, EXCLUSIVELY. `hw:PCH,0` is opened by this daemon
+# and by nothing else; every consumer reads `mic_clean`. That is what makes the
+# canceller impossible to bypass by accident, and it is why this unit must be
+# running before any mic leg is pointed at `mic_clean`.
+#
+# IT IS NOT ENABLED BY THE IMAGE AND MUST NOT BE, YET. The mic legs still read
+# `mic_selected`, which resolves to `mic_panel` unless WALL_AUDIO_AEC=1 in
+# wall.env. Until the Owner's acceptance -- the double-talk test and the real
+# amplifier-knob move, both of which need a person in the room -- the seam stays
+# where it was. Installing the unit and leaving the seam alone is deliberate:
+# the daemon can be started and watched without any microphone consumer
+# depending on it.
+#
+# MODELLED ON wall-speaker-out.service, which is the other realtime forwarder
+# on this panel, and for the same reasons: the scheduling class, the nice level
+# and the empty capability set are what let it keep up with a 5.33 ms block
+# without being able to do anything else.
+#
+# WHY Restart=always IS SAFE HERE. The daemon survives the tap going away on its
+# own -- that happens every time the switch leaves Speaker -- so a restart loop
+# would mean the MICROPHONE or the loopback is gone, which the burst limit
+# below turns into a stopped unit and a journal line rather than a spin.
+#
+# Documentation: HomeHub docs/AEC_SPIKE_2026-09-14.md section 6
+# Implements: SR-028, LLR-016
+
+[Unit]
+Description=Wall panel: acoustic echo canceller (speaker_tap + panel mic -> mic_clean)
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target
+Wants=sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Bus mode only. In `trigger` and `panel` there is no speaker_tap and no merged
+# bus, so there is nothing to cancel against and nothing for mic_clean to feed.
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+# The card map, for the Loopback card id the output PCM names.
+EnvironmentFile=-/etc/wall-panel/audio-cards.env
+ExecStart=/usr/local/sbin/wall-audio-aec \
+    --profile /etc/wall-panel/aec-profile.json \
+    --status /run/wall-panel/aec-status.json \
+    --mic hw:${WALL_AUDIO_BUILTIN_CARD},0 \
+    --tap speaker_tap \
+    --out card_loop_mic_play
+Restart=always
+RestartSec=2
+Nice=-5
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=15
+LimitRTPRIO=15
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/wall-panel
+SupplementaryGroups=audio
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# ProjectM preset lock — plan item Q.
+#
+# FORMAT: one preset per line, `#` comments to end of line, blank lines ignored.
+#   <sha256>  <relative path under this payload>  <upstream repo>@<commit>
+#
+# EMPTY ON PURPOSE. No preset has been selected because the upstream packs carry
+# no licence (see README.md). An empty lock is a valid lock: the installer
+# installs nothing and libprojectM renders its built-in idle output.
+#
+# Do not add a line by hand. `../build-projectm-presets.sh --refresh` writes
+# this file; a hand-written hash proves nothing about the bytes on disk.

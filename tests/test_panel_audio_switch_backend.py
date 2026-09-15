@@ -104,7 +104,11 @@ def test_set_output_writes_one_request_the_applier_accepts_sr028(panel, output):
     broker = AudioBroker(backend(panel))
     answer = reply(broker, wire("set_output", {"output": output}, echo_seq=True))
     assert answer["ok"] is True and answer["result"]["accepted"] is True
+    # `generation` joins the envelope by the intent contract (2026-09-14, 1.2):
+    # the epoch the request is scoped to, read off the state file the applier
+    # owns. The seeded state has none, so it normalizes to 0.
     assert written(panel) == {"version": 1, "seq": answer["result"]["seq"],
+                              "generation": 0,
                               "event": {"kind": "set_output", "output": output}}
 
 
@@ -359,7 +363,14 @@ def test_set_mute_false_when_nothing_is_muted_moves_no_switch_sr023(panel):
     set_state(panel, output="headset")
     broker = AudioBroker(backend(panel))
     answer = reply(broker, wire("set_mute", {"muted": False}, echo_seq=True))
-    assert answer["result"] == {"accepted": True}, "accepted, and honestly seq-less"
+    # Accepted, and honestly seq-less and epoch-less: no request was minted, so
+    # there is nothing for a client to correlate against. The state snapshot is
+    # still carried, because the caller asked "is the output unmuted" and this is
+    # the evidence that it is (contract 2026-09-14, section 1.4).
+    assert answer["result"] == {"accepted": True, "seq": None, "generation": None,
+                                "observedBefore": {"output": "headset", "inputMuted": False,
+                                              "volume": 60, "requestSeq": -1,
+                                              "generation": 0}}
     assert not panel["request"].exists()
 
 
@@ -392,7 +403,10 @@ def test_status_reports_routing_unavailable_and_the_switch_present_sr028(panel):
     assert result["available"] is False and result["devices"] == [] and result["route"] is None
     assert result["switch"] == {"supported": True, "output": "headset",
                                 "inputMuted": True, "available": False,
-                                "reason": "headset_absent", "volume": 60}
+                                "reason": "headset_absent", "volume": 60,
+                                "generation": 0, "requestSeq": -1,
+                                "inputMuteHeld": False,
+                                "inputMutedConfirmed": False}
 
 
 def test_status_volume_is_the_selected_outputs_memory_sr028(panel):
@@ -689,7 +703,10 @@ def test_a_sparse_state_file_reports_a_supported_switch_sr028(panel):
     # explicitly says false, and the backend agrees with it field by field.
     assert result["switch"] == {"supported": True, "output": "speaker",
                                 "inputMuted": True, "available": True,
-                                "reason": None, "volume": 60}
+                                "reason": None, "volume": 60,
+                                "generation": 0, "requestSeq": -1,
+                                "inputMuteHeld": False,
+                                "inputMutedConfirmed": False}
 
 
 def test_a_lost_mutation_reconciles_on_a_sparse_state_file_llr015(panel, tmp_path):

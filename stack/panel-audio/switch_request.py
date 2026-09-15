@@ -67,7 +67,7 @@ class RequestError(ValueError):
     """A request that must not be written. Never swallowed."""
 
 
-def envelope(seq, event):
+def envelope(seq, event, generation=None):
     """Build the request envelope, or refuse it.
 
     Contract:
@@ -76,8 +76,11 @@ def envelope(seq, event):
                     systemd.path fires on every close-write and a replayed
                     rocker press would walk the room's volume down on its own.
                event: {"kind": one of REQUEST_KINDS, plus that kind's key}
+               generation: int >= 0, the applier epoch this request is scoped
+                    to (read from the state file), or None to send it unscoped.
       Outputs: dict ready for json.dumps
-      Raises:  RequestError on an unknown kind, a bad seq, or a stray key
+      Raises:  RequestError on an unknown kind, a bad seq/generation, or a
+               stray key
     Implements: SR-028, LLR-015
     """
     if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
@@ -88,16 +91,29 @@ def envelope(seq, event):
                 "set_volume": {"kind", "level"}, "nudge_volume": {"kind", "louder"}}
     if set(event) != expected[event["kind"]]:
         raise RequestError("request fields are not exact")
-    return {"version": 1, "seq": seq, "event": dict(event)}
+    built = {"version": 1, "seq": seq, "event": dict(event)}
+    # THE EPOCH, AND WHY IT IS OMITTED RATHER THAN DEFAULTED WHEN UNKNOWN
+    # (contract 2026-09-14, section 1.2). `seq` orders requests inside one life
+    # of the applier and cannot order across a restart. `generation` names the
+    # life. When the broker could not read the state file it does not KNOW the
+    # epoch, and guessing zero would be a claim -- one the applier would refuse,
+    # taking the switch down on a panel whose only fault was an unreadable file.
+    # Omitting the key sends the request unscoped, which the applier accepts and
+    # journals, and which is also what an older broker does by construction.
+    if generation is not None:
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise RequestError("generation must be a non-negative integer")
+        built["generation"] = generation
+    return built
 
 
-def write(seq, event, path=DEFAULT_PATH):
+def write(seq, event, path=DEFAULT_PATH, generation=None):
     """Write one request atomically. Returns the path written.
 
     One rename, so the applier never reads half a request -- it runs the instant
     the file is closed, and a torn read would be a switch position nobody chose.
     """
-    payload = json.dumps(envelope(seq, event), sort_keys=True) + "\n"
+    payload = json.dumps(envelope(seq, event, generation), sort_keys=True) + "\n"
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".new")

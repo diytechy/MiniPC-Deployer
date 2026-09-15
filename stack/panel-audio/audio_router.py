@@ -40,7 +40,18 @@ OBSERVABLE_BLOCK = {"set_mute": "mute", "set_output": "switch",
 # The one optional field an action result may carry beyond {"accepted"}: the
 # sequence number the backend minted for this request. See _ensure_safe_result
 # and ECHO_SEQ_FIELD.
-ACTION_RESULT_OPTIONAL = {"seq"}
+# `seq`, `generation` and `effective` all ride behind the same opt-in flag, for
+# the same reason `seq` alone did: the shipped renderer validates the action
+# result as an EXACT key set, so a wider result reaches an old panel as an
+# error. They are one group because a client that wants exact correlation wants
+# all three -- the sequence identifies the request, the generation says which
+# life of the applier it belongs to, and `effective` is the applied state the
+# reply echoes (contract 2026-09-14, section 1.4).
+ACTION_RESULT_OPTIONAL = {"seq", "generation", "observedBefore"}
+# The exact shape of `observedBefore`. Every field is nullable, because the
+# backend reads them off a file that may be sparse, and a guessed number here
+# would be reconciled against.
+OBSERVED_BEFORE_FIELDS = {"output", "inputMuted", "volume", "requestSeq", "generation"}
 # OPT-IN, and that is the whole point. A client that does not ask gets exactly
 # the historic {"accepted": bool} -- the shipped renderer validates that result
 # as an EXACT key set and turns anything wider into an error, so echoing `seq`
@@ -529,12 +540,18 @@ class AudioBroker:
 
     @staticmethod
     def _without_seq(response: dict) -> dict:
-        """The historic reply shape, for a client that did not ask for `seq`."""
+        """The historic reply shape, for a client that did not ask for `seq`.
+
+        Strips the whole correlation group, not just `seq`: an old renderer
+        validates the action result as an exact key set, so leaving `generation`
+        or `effective` behind would reach it as an error (contract 2026-09-14,
+        section 1.4).
+        """
         result = response.get("result")
-        if not isinstance(result, dict) or "seq" not in result:
+        if not isinstance(result, dict) or not (set(result) & ACTION_RESULT_OPTIONAL):
             return response
         return {**response, "result": {key: value for key, value in result.items()
-                                       if key != "seq"}}
+                                       if key not in ACTION_RESULT_OPTIONAL}}
 
     def _error(self, request_id: object, generation: object, code: str, message: str) -> dict:
         return {"id": request_id, "generation": generation, "ok": False,
@@ -548,17 +565,37 @@ class AudioBroker:
     # means the adapter is absent and every output is silent (Owner ruling 7),
     # which the shell must show differently from "playing quietly". `reason` is
     # a short enum-ish token, never a device name or a card id.
+    #
+    # `generation` and `requestSeq` were added by the intent contract
+    # (2026-09-14, section 1.3) and are OPTIONAL for exactly the reason the
+    # whole `switch` block is: a backend that predates them must stay valid.
     SWITCH_FIELDS = {"supported", "output", "inputMuted", "available", "reason", "volume"}
+    # `inputMuteHeld` and `inputMutedConfirmed` were added by item J and are
+    # optional on the same rule.
+    SWITCH_OPTIONAL_FIELDS = {"generation", "requestSeq",
+                              "inputMuteHeld", "inputMutedConfirmed"}
 
     def _safe_switch(self, value: object) -> None:
         """Validate the switch status block. Implements: SR-028, LLR-015."""
-        if not isinstance(value, dict) or set(value) != self.SWITCH_FIELDS:
+        if (not isinstance(value, dict) or not self.SWITCH_FIELDS <= set(value) or
+                set(value) - self.SWITCH_FIELDS - self.SWITCH_OPTIONAL_FIELDS):
             raise BrokerError("unsafe_backend_result", "switch status is not exact")
+        # Null is legal and means "this broker could not read it"; a number must
+        # be one a JavaScript client can hold exactly, or the renderer's
+        # Number.isSafeInteger guard would skip the comparison it depends on.
+        if value.get("generation") is not None and not _safe_integer(value["generation"]):
+            raise BrokerError("unsafe_backend_result", "switch generation is invalid")
+        mark = value.get("requestSeq")
+        if mark is not None and mark != -1 and not _safe_integer(mark):
+            raise BrokerError("unsafe_backend_result", "switch request mark is invalid")
         if value["output"] not in SWITCH_OUTPUTS:
             raise BrokerError("unsafe_backend_result", "switch output is invalid")
         for field in ("supported", "inputMuted", "available"):
             if not isinstance(value[field], bool):
                 raise BrokerError("unsafe_backend_result", "switch state is invalid")
+        for field in ("inputMuteHeld", "inputMutedConfirmed"):
+            if field in value and not isinstance(value[field], bool):
+                raise BrokerError("unsafe_backend_result", "switch mute coupling is invalid")
         if value["reason"] is not None:
             self._safe_string(value["reason"], 32)
         volume = value["volume"]
@@ -607,8 +644,19 @@ class AudioBroker:
             if value == {"available": False}:
                 return
             expected = {"available", "generation", "observedMonotonicMs", "active", "rms", "peak", "bands"}
-            if set(value) != expected or value["available"] is not True:
+            # `microphone` is OPTIONAL, for exactly the reason the status block's
+            # `mute` and `switch` are: a backend that predates item L, or a panel
+            # with no echo canceller installed, must stay valid. Absent means
+            # "this panel cannot tell you", which the shell must render
+            # differently from a microphone at zero.
+            if not expected <= set(value) or set(value) - expected - {"microphone", "bus"}:
                 raise BrokerError("unsafe_backend_result", "telemetry fields are not exact")
+            if value["available"] is not True:
+                raise BrokerError("unsafe_backend_result", "telemetry fields are not exact")
+            if "microphone" in value:
+                self._safe_microphone(value["microphone"])
+            if "bus" in value:
+                self._safe_bus(value["bus"])
             if not _safe_integer(value["generation"]) or not _safe_integer(value["observedMonotonicMs"]):
                 raise BrokerError("unsafe_backend_result", "telemetry counters are invalid")
             if not isinstance(value["active"], bool):
@@ -625,11 +673,90 @@ class AudioBroker:
         elif ("accepted" not in value or set(value) - {"accepted"} - ACTION_RESULT_OPTIONAL or
                 not isinstance(value["accepted"], bool)):
             raise BrokerError("unsafe_backend_result", "action result fields are not exact")
-        elif "seq" in value and not _safe_integer(value["seq"]):
+        else:
             # A seq a client cannot hold exactly is worse than none: the shell
             # compares it against the applier's mark with Number.isSafeInteger,
-            # so anything outside that range would silently never settle.
-            raise BrokerError("unsafe_backend_result", "action result sequence is invalid")
+            # so anything outside that range would silently never settle. Null
+            # is legal -- the legacy `set_mute` no-op mints no request, so there
+            # is honestly nothing to correlate against.
+            if value.get("seq") is not None and not _safe_integer(value["seq"]):
+                raise BrokerError("unsafe_backend_result", "action result sequence is invalid")
+            if value.get("generation") is not None and not _safe_integer(value["generation"]):
+                raise BrokerError("unsafe_backend_result", "action result generation is invalid")
+            if value.get("observedBefore") is not None:
+                self._safe_observed_before(value["observedBefore"])
+
+    def _safe_observed_before(self, value: object) -> None:
+        """Validate the pre-request snapshot. Implements: SR-028, LLR-015."""
+        if not isinstance(value, dict) or set(value) != OBSERVED_BEFORE_FIELDS:
+            raise BrokerError("unsafe_backend_result", "observed state is not exact")
+        if value["output"] not in SWITCH_OUTPUTS:
+            raise BrokerError("unsafe_backend_result", "observed output is invalid")
+        if value["inputMuted"] is not None and not isinstance(value["inputMuted"], bool):
+            raise BrokerError("unsafe_backend_result", "observed input mute is invalid")
+        volume = value["volume"]
+        if volume is not None and (isinstance(volume, bool) or not isinstance(volume, int)
+                                   or not 0 <= volume <= 100):
+            raise BrokerError("unsafe_backend_result", "observed volume is invalid")
+        mark = value["requestSeq"]
+        if mark is not None and mark != -1 and not _safe_integer(mark):
+            raise BrokerError("unsafe_backend_result", "observed request mark is invalid")
+        if value["generation"] is not None and not _safe_integer(value["generation"]):
+            raise BrokerError("unsafe_backend_result", "observed generation is invalid")
+
+    # Item L. Every field is checked, and the two that carry a CLAIM -- `source`
+    # and `state` -- are enums rather than strings, because the whole point of
+    # this block is that a raw or stale level can never be presented as a live
+    # post-filter one.
+    MICROPHONE_FIELDS = {"level", "source", "state", "ageMs", "valid", "referenceDbfs"}
+    MICROPHONE_SOURCES = {"aec_post_filter", "raw_capture", "none"}
+    MICROPHONE_STATES = {"live", "muted", "stale", "unavailable"}
+
+    # The bus block says WHY the levels beside it are what they are, so a bus
+    # nobody is publishing is not indistinguishable from a quiet room.
+    BUS_FIELDS = {"state", "ageMs", "valid", "source"}
+    BUS_STATES = {"live", "silent", "stale", "unavailable"}
+
+    def _safe_bus(self, value: object) -> None:
+        """Validate the bus telemetry block. Implements: SR-028, LLR-015."""
+        if not isinstance(value, dict) or set(value) != self.BUS_FIELDS:
+            raise BrokerError("unsafe_backend_result", "bus telemetry is not exact")
+        if value["state"] not in self.BUS_STATES:
+            raise BrokerError("unsafe_backend_result", "bus state is invalid")
+        if not _safe_integer(value["ageMs"]):
+            raise BrokerError("unsafe_backend_result", "bus freshness is invalid")
+        if not isinstance(value["valid"], bool):
+            raise BrokerError("unsafe_backend_result", "bus validity is invalid")
+        self._safe_string(value["source"], 32)
+        if value["valid"] != (value["state"] == "live"):
+            raise BrokerError("unsafe_backend_result", "bus validity contradicts its state")
+
+    def _safe_microphone(self, value: object) -> None:
+        """Validate the post-filter microphone block. Implements: SR-028, LLR-015."""
+        if not isinstance(value, dict) or set(value) != self.MICROPHONE_FIELDS:
+            raise BrokerError("unsafe_backend_result", "microphone telemetry is not exact")
+        level = value["level"]
+        if (isinstance(level, bool) or not isinstance(level, (int, float))
+                or not 0 <= level <= 1):
+            raise BrokerError("unsafe_backend_result", "microphone level is invalid")
+        if value["source"] not in self.MICROPHONE_SOURCES:
+            raise BrokerError("unsafe_backend_result", "microphone source is invalid")
+        if value["state"] not in self.MICROPHONE_STATES:
+            raise BrokerError("unsafe_backend_result", "microphone state is invalid")
+        if not _safe_integer(value["ageMs"]):
+            raise BrokerError("unsafe_backend_result", "microphone freshness is invalid")
+        if not isinstance(value["valid"], bool):
+            raise BrokerError("unsafe_backend_result", "microphone validity is invalid")
+        reference = value["referenceDbfs"]
+        if (isinstance(reference, bool) or not isinstance(reference, (int, float))
+                or not -120 <= reference <= 0):
+            raise BrokerError("unsafe_backend_result", "microphone reference is invalid")
+        # A BLOCK THAT CLAIMS VALIDITY MUST ALSO CLAIM A LIVE STATE. The two are
+        # separate fields so the shell can say WHY a ring is not drawn, and a
+        # backend that let them disagree would be handing the renderer a
+        # contradiction to resolve on the glass.
+        if value["valid"] and value["state"] != "live":
+            raise BrokerError("unsafe_backend_result", "microphone validity contradicts its state")
 
     def _safe_string(self, value: object, limit: int) -> None:
         if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):

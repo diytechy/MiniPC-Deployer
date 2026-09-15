@@ -36,6 +36,8 @@
 #      only its allowlisted values into root-only /run files; systemd copies
 #      those into the broker's RAM-backed credential mount. No second persistent
 #      secret file exists and the broker never receives unrelated wall secrets.
+#  8e. Item S — enable the read-only DynamicUser thermal/CPU/presentation-mode
+#      telemetry collector (WALL_TELEMETRY_ENABLED, default true).
 #   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
@@ -814,6 +816,23 @@ pcm.card_loop_tap_cap { type hw
     device 1
     subdevice 1
 }
+# SUBDEVICE 2 IS THE ECHO CANCELLER'S (item 23 step 6, spike section 6.1).
+# Subdevices 0 and 1 are taken by the merged bus and by the amplifier
+# detector's tap; the card has 4, so 2 is free and is the one to use. The
+# canceller writes the cancelled microphone into card_loop_mic_play and
+# `mic_clean` snoops it back out -- a dsnoop for the same reason speaker_tap
+# and spdif_in are, because more than one consumer will want the microphone
+# and a raw open locks the rest out.
+pcm.card_loop_mic_play { type hw
+    card "$_loopback"
+    device 0
+    subdevice 2
+}
+pcm.card_loop_mic_cap { type hw
+    card "$_loopback"
+    device 1
+    subdevice 2
+}
 ctl.card_loop_ctl { type hw
     card "$_loopback"
 }
@@ -1057,6 +1076,115 @@ if [ -f /etc/udev/rules.d/91-wall-usb-hub-reset.rules ] &&
    [ ! -f /etc/systemd/system/wall-usb-hub-reset@.service ]; then
     warn "audio: 91-wall-usb-hub-reset.rules is installed but wall-usb-hub-reset@.service is not. A hub that enumerates with no ports will NOT be reset and the panel's audio will stay dead until someone toggles authorized by hand."
 fi
+
+# ── the echo canceller (item 23, step 6; HomeHub docs/AEC_SPIKE_2026-09-14.md)
+# BUILT HERE, FROM SOURCE, AND NOT SHIPPED AS A BINARY. The payload carries the
+# three C files and a Makefile; the image carries gcc, libasound2-dev and
+# libspeexdsp-dev (stack/autoinstall/wall/packages.list). Building on the panel
+# is what keeps the daemon matched to the libraries it links against, and this
+# script already re-runs at every boot, so a rebuild is cheap and an out-of-date
+# binary cannot survive an image update.
+#
+# A FAILURE HERE IS A WARNING, NEVER A fail_step. A panel with no canceller is
+# the panel that shipped before step 6: the microphone works, the echo is not
+# removed, and the mic seam below is not moved. That is degraded, not broken.
+# THREE SHAPES HERE ARE DICTATED BY THE PAYLOAD INVENTORY TEST
+# (tests/test_panel_audio.py), which resolves every payload reference rather
+# than pattern-matching it, and fails on one it cannot resolve:
+#   * the loop variable is `_aec`, not the `_f` used twice above. That test
+#     unions every word any loop binds to a name and crosses it with every
+#     reference using that name, so reusing `_f` would have it looking for
+#     asound-bus-mode.conf inside aec/.
+#   * the loop is ONE LINE. A backslash continuation is invisible to the
+#     resolver, which would then call the variable unresolvable.
+#   * the guard tests a FILE, not the directory: a directory is not a path
+#     `git ls-tree` lists, so it cannot be checked against the archive.
+if [ -f "$PAYLOAD/aec/Makefile" ]; then
+    install -d -m 0755 /usr/local/src/wall-aec
+    for _aec in wall-audio-aec.c wall_aec_policy.c wall_aec_policy.h wall_aec_profile.c wall_aec_profile.h Makefile; do
+        [ -f "$PAYLOAD/aec/$_aec" ] && install -m 0644 "$PAYLOAD/aec/$_aec" "/usr/local/src/wall-aec/$_aec"
+    done
+    if ( cd /usr/local/src/wall-aec && make >/tmp/wall-aec-build.log 2>&1 ); then
+        install -m 0755 /usr/local/src/wall-aec/wall-audio-aec /usr/local/sbin/wall-audio-aec
+        log "audio: echo canceller built and installed to /usr/local/sbin/wall-audio-aec"
+    else
+        warn "audio: the echo canceller did NOT build (see /tmp/wall-aec-build.log). The microphone still works; the room's own music will not be removed from it."
+    fi
+    [ -f "$PAYLOAD/wall-audio-aec.service" ] &&
+        install -m 0644 "$PAYLOAD/wall-audio-aec.service" /etc/systemd/system/wall-audio-aec.service
+fi
+
+# THE MIC SEAM IS MOVED ONLY WHEN THE OWNER ASKS. `mic_selected` resolves
+# through WALL_AUDIO_MIC_SOURCE, which wall-audio-output publishes from the
+# switch position; with WALL_AUDIO_AEC=1 the applier publishes `mic_clean`
+# instead in Speaker, and the mic legs then read the cancelled microphone
+# without a single change to their own units.
+#
+# DEFAULT OFF, AND THE DEFAULT IS THE RULING. The canceller's acceptance needs
+# a person in the room -- the double-talk test and the real amplifier-knob move
+# -- so until that has been done the seam stays where it was and the daemon is
+# installed, buildable and startable without any consumer depending on it.
+# ONE PERSISTED SOURCE FOR BOTH HALVES. The unit's enablement below and the
+# applier's choice of `mic_clean` must never be able to disagree: an enabled
+# daemon whose mic seam was never moved would sit there cancelling a microphone
+# no leg reads, and the reverse would point the legs at a PCM nothing feeds.
+# Re-asserted on every boot from wall.env, like the audio mode itself.
+cat > /etc/wall-panel/audio-aec.env <<EOF
+# GENERATED by wall-firstboot.sh. Edit wall.env and re-run, not this file.
+WALL_AUDIO_AEC=${WALL_AUDIO_AEC:-0}
+EOF
+chmod 0644 /etc/wall-panel/audio-aec.env
+
+# THE MIC LEGS MUST NOT OPEN `mic_clean` WITH NO WRITER (terra, second pass).
+# When the canceller is in the path it is the only thing feeding that PCM, so a
+# leg that starts before it -- at boot, or after the daemon fails its restart
+# burst -- opens a device that never produces a sample, and the microphone is
+# silently dead rather than visibly broken. The ordering is expressed as a
+# DROP-IN generated from the same knob, and REMOVED when the knob is off, so the
+# dependency exists exactly while the seam is moved and the units themselves
+# stay identical in both configurations.
+_aec_dropins="/etc/systemd/system/wall-mic-rear.service.d /etc/systemd/system/wall-bt-mic.service.d"
+if [ "${WALL_AUDIO_AEC:-0}" = "1" ] && [ -x /usr/local/sbin/wall-audio-aec ]; then
+    for _dir in $_aec_dropins; do
+        install -d -m 0755 "$_dir"
+        cat > "$_dir/10-aec.conf" <<EOF
+# GENERATED by wall-firstboot.sh from WALL_AUDIO_AEC. Do not edit.
+# BindsTo, not Wants: with the seam moved, a stopped canceller means this leg is
+# forwarding silence, and a leg that is visibly stopped is a better failure than
+# one that is running and carrying nothing.
+[Unit]
+After=wall-audio-aec.service
+BindsTo=wall-audio-aec.service
+EOF
+        chmod 0644 "$_dir/10-aec.conf"
+    done
+    log "audio: mic legs bound to wall-audio-aec.service (the seam is moved to mic_clean)"
+else
+    for _dir in $_aec_dropins; do
+        rm -f "$_dir/10-aec.conf"
+        rmdir "$_dir" 2>/dev/null || true
+    done
+fi
+
+if [ "${WALL_AUDIO_AEC:-0}" = "1" ]; then
+    if [ -x /usr/local/sbin/wall-audio-aec ]; then
+        # `enable_unit SUCCESS_LINE UNIT...` — the helper SHIFTS the first
+        # argument away, so calling it with the unit name alone ran
+        # `systemctl enable` with no arguments, enabled nothing, and logged the
+        # unit name as if it had worked.
+        enable_unit "audio: echo canceller ENABLED (WALL_AUDIO_AEC=1); mic_selected will resolve to mic_clean in Speaker" \
+            wall-audio-aec.service
+    else
+        warn "audio: WALL_AUDIO_AEC=1 but the canceller is not installed. The mic seam is NOT moved; the raw microphone is still what the legs read."
+    fi
+else
+    # Installed and not enabled is the intended resting state before
+    # acceptance. Said out loud so nobody reads the absence of the unit in
+    # `systemctl list-units` as a deployment that went wrong.
+    systemctl disable wall-audio-aec.service >/dev/null 2>&1 || true
+    log "audio: echo canceller installed but not enabled (WALL_AUDIO_AEC is not 1)"
+fi
+
 systemctl daemon-reload >/dev/null 2>&1 || true
 
 # The trigger daemon's on/off and actuator knobs are rendered into its own env file rather
@@ -1689,6 +1817,73 @@ fi
 # Touch fault filter is opt-in; OFF also restores the raw-input recovery path.
 if ! WALL_ENV_FILE="$ENV_FILE" bash "$PAYLOAD/configure-touch-filter.sh"; then
     fail_step "Touch filter configuration failed; inspect wall-touch-filter.service."
+fi
+
+# ── 8e. Item S — bounded thermal/CPU/presentation-mode telemetry collector ──
+# Read-only sensor sampling plus one small writable state dir under
+# DynamicUser; never touches input, audio or the renderer. On by default
+# (WALL_TELEMETRY_ENABLED, default true) because it is strictly read-only
+# evidence-gathering, unlike the audio broker which changes what the panel
+# does; set to false to disable entirely.
+: "${WALL_TELEMETRY_ENABLED:=true}"
+if [ "$WALL_TELEMETRY_ENABLED" != true ] && [ "$WALL_TELEMETRY_ENABLED" != false ]; then
+    fail_step "WALL_TELEMETRY_ENABLED must be exactly true or false"
+    WALL_TELEMETRY_ENABLED=false
+fi
+# THE UNIT IS INSTALLED HERE, and it was not installed anywhere at all before
+# this line (integration review, 2026-09-14). The audio unit loop further up
+# installs only the audio units, so /etc/systemd/system/wall-panel-telemetry.service
+# never existed, the completeness check below always failed, and -- because
+# WALL_TELEMETRY_ENABLED defaults to true -- EVERY firstboot run took the
+# fail_step branch and refused to stamp the provisioning marker. The collector
+# is item S's only producer, so this is also the whole of item S not running.
+#
+# The unit's ExecStart names the payload tree (/opt/wall-panel/stack/...), so
+# the two .py files are NOT copied anywhere: they are read from where they
+# already are. That is why only the unit is installed here.
+[ -f "$PAYLOAD/wall-panel-telemetry.service" ] &&
+    install -m 0644 "$PAYLOAD/wall-panel-telemetry.service" /etc/systemd/system/wall-panel-telemetry.service
+
+# ── the one directory the RENDERER writes and the collector reads ───────────
+# The presentation snapshot crosses from the Electron host (running as the
+# kiosk user `panel`) to the DynamicUser collector through a file. It used to
+# be named inside /run/wall-panel, which wall-audio-output creates as root:root
+# 0755 -- so the renderer could not create the file there at all, and item S
+# would have logged "unknown" for the presentation mode forever while every
+# unit looked healthy. Widening /run/wall-panel was rejected: the AEC's
+# input-mute env file and the applier's epoch marker live in it, and a renderer
+# that can write those can forge them.
+#
+# A tmpfiles rule rather than an `install -d` here, because /run is a tmpfs and
+# the kiosk session can start before this script does; tmpfiles runs in early
+# boot, so the directory is there whichever order the rest comes up in.
+cat > /etc/tmpfiles.d/wall-panel-renderer.conf <<'EOF'
+# GENERATED by wall-firstboot.sh. The kiosk renderer's own run directory: it is
+# the ONLY /run path the unprivileged renderer may write, and it holds exactly
+# one file, the item S presentation snapshot. World-readable so the telemetry
+# collector's DynamicUser can read it without being given a group.
+d /run/wall-panel-renderer 0755 panel panel -
+EOF
+chmod 0644 /etc/tmpfiles.d/wall-panel-renderer.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/wall-panel-renderer.conf >/dev/null 2>&1 ||
+    warn "SN-S: could not create /run/wall-panel-renderer now; it will exist from the next boot, and until then the presentation mode logs as unknown"
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+if [ ! -f "$PAYLOAD/panel-telemetry.py" ] || [ ! -f "$PAYLOAD/panel_telemetry_core.py" ] \
+        || [ ! -f /etc/systemd/system/wall-panel-telemetry.service ]; then
+    if [ "$WALL_TELEMETRY_ENABLED" = true ]; then
+        fail_step "Panel telemetry payload is incomplete: missing panel-telemetry.py, panel_telemetry_core.py or wall-panel-telemetry.service"
+    fi
+    WALL_TELEMETRY_ENABLED=false
+fi
+if [ "$WALL_TELEMETRY_ENABLED" = true ]; then
+    if enable_unit_now "SN-S: panel telemetry collector enabled (5s presentation poll, 5s full sample)" wall-panel-telemetry.service; then
+        :
+    fi
+else
+    systemctl disable --now wall-panel-telemetry.service >/dev/null 2>&1 || true
+    log "SN-S: panel telemetry collector disabled"
 fi
 
 # ── 9. done — but only if it IS done ─────────────────────────────────────────

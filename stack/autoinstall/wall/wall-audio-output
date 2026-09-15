@@ -90,6 +90,54 @@ LOCK_FILE = RUN_DIR / "audio-apply.lock"
 # for why it is a monotonic mark rather than an uptime threshold. In /run, not
 # /etc, because it describes THIS boot and must vanish with it.
 BOOT_STAMP = RUN_DIR / "audio-boot-apply.json"
+# ── the echo canceller seam (step 6) ──────────────────────────────────────
+# Whether `mic_selected` resolves to the CANCELLED microphone is a fact about
+# the machine -- is the daemon installed, and did the Owner turn it on -- so it
+# is decided here, in the shell, and handed to the pure policy rather than
+# guessed there. Both halves are required: a knob set on a panel with no binary
+# would publish a PCM name nothing feeds, and the mic legs would open a device
+# that never produces a sample.
+# Overridable for the same reason CONF_DIR and RUN_DIR are: the hermetic suite
+# drives the real applier and must be able to say whether a canceller exists
+# without one being installed on the machine running the tests.
+AEC_BINARY = Path(os.environ.get("WALL_PANEL_AEC_BINARY")
+                  or "/usr/local/sbin/wall-audio-aec")
+# ONE FILE, READ BY BOTH HALVES (terra, 2026-09-14, finding 6). An earlier draft
+# had firstboot enabling the unit from `wall.env` while this applier chose
+# `mic_clean` from a file nothing wrote, so an enabled daemon could sit there
+# cancelling a microphone no leg was reading. wall-firstboot.sh now RENDERS this
+# file from the wall.env knob, and it is the only thing either half consults.
+AEC_ENABLE_FILE = CONF_DIR / "audio-aec.env"
+AEC_ENABLE_VAR = "WALL_AUDIO_AEC"
+# ITEM J's EFFECTIVE MUTE, PUBLISHED FOR THE CANCELLER. The daemon needs it to
+# report `muted` rather than a live post-filter level while the legs are
+# stopped; it cannot read /etc under its own sandbox, and parsing the state JSON
+# in an audio loop to learn one boolean would be work paid over and over.
+INPUT_MUTE_ENV = RUN_DIR / "audio-input-mute.env"
+INPUT_MUTE_VAR = "WALL_AUDIO_INPUT_MUTED"
+
+
+def aec_available():
+    """True when the cancelled microphone may be selected. Implements: LLR-016.
+
+    DELIBERATELY NOT "is the unit running". A unit that is momentarily
+    restarting must not make the applier re-point every mic leg at the raw
+    capture and back again; the question is whether the canceller is INSTALLED
+    AND CHOSEN, and the daemon's own `Restart=always` owns the rest. If it is
+    down, `mic_clean` simply has no data and the leg's guard reports it -- which
+    is a visible, bounded failure rather than a silent flap.
+    """
+    if read_env(AEC_ENABLE_FILE, AEC_ENABLE_VAR, "0") != "1":
+        return False
+    return AEC_BINARY.exists()
+# THE EPOCH MARKER (contract 2026-09-14, section 1.1). /run is tmpfs, so the
+# absence of this file at `apply-state` time is exactly "a new life of the
+# backend": a boot, or somebody clearing /run by hand. Its presence carries the
+# generation this life is running as, so a resume re-assert, a rocker press, a
+# udev event and a broker request all find the SAME number and none of them
+# advances it. The durable half lives in the state file, which is what makes the
+# epoch monotonic across reboots rather than restarting from zero each time.
+EPOCH_MARKER = RUN_DIR / "audio-epoch.json"
 
 # Measured 2026-09-13: the headset adapter is 0d8c:0014 ("Device"), the 5.1
 # adapter 0d8c:0102 (ICUSBAUDIO7D). The USB id is matched rather than the card
@@ -389,6 +437,105 @@ def write_boot_stamp(path=None, dry_run=False, monotonic_usec=None):
         monotonic_usec = int(time.monotonic() * 1_000_000)
     stamp = {"monotonic_usec": max(0, int(monotonic_usec))}
     write_atomic(path, json.dumps(stamp) + "\n", mode=0o644)
+
+
+def read_epoch_marker(path=None):
+    """This life of the backend, as (generation, request high-water mark).
+
+    (None, -1) means /run carries no usable marker: either the panel has just
+    booted (tmpfs is empty) or somebody removed it. That is NOT "carry on with
+    whatever the state file says" -- see `_locked_apply`, which treats a missing
+    marker as an epoch break and refuses every request that names a generation
+    until `apply-state` re-establishes one.
+
+    THE MARK IS IN THE MARKER, NOT ONLY IN THE STATE (terra, 2026-09-14,
+    finding 1). Carrying only the generation left a hole: a state file rolled
+    back to an OLD `request_seq` while the marker still named the CURRENT epoch
+    meant a delayed request with the live generation and a sequence above the
+    rolled-back mark was accepted and applied. The high-water mark has to be
+    restored from the same authority the generation is, or the rollback quietly
+    re-opens every request the applier had already refused.
+
+    Inputs:  path: the marker file (a test seam); defaults to EPOCH_MARKER at
+             CALL time, so the hermetic suite's WALL_PANEL_RUN_DIR is honoured.
+    Outputs: (int generation or None, int mark >= -1)
+    Implements: SR-028, LLR-014
+    """
+    path = EPOCH_MARKER if path is None else path
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, -1
+    if not isinstance(raw, dict):
+        return None, -1
+    value = raw.get("generation")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        # A malformed marker is worse than none: it would pin this life to a
+        # number nothing agrees on. Read it as absent and let apply-state mint a
+        # fresh epoch over it.
+        return None, -1
+    mark = raw.get("request_seq")
+    if not isinstance(mark, int) or isinstance(mark, bool) or mark < -1:
+        mark = -1
+    return value, mark
+
+
+def write_epoch_marker(generation, request_seq=-1, path=None, dry_run=False):
+    """Publish the epoch this life of the backend is running as, and its mark.
+
+    A dry run still writes a marker it was GIVEN (the same rule save_state and
+    write_boot_stamp follow), because the hermetic suite drives the real applier
+    across a simulated reboot and the presence or absence of this file is the
+    whole difference between "same epoch" and "new epoch".
+    """
+    path = EPOCH_MARKER if path is None else path
+    if dry_run and Path(path) == LIVE_RUN_DIR / "audio-epoch.json":
+        print("write %s (suppressed: --dry-run on the live epoch marker)" % path)
+        return
+    write_atomic(path, json.dumps({"generation": int(generation),
+                                   "request_seq": int(request_seq)}) + "\n",
+                 mode=0o644)
+
+
+def open_epoch(state, dry_run=False):
+    """Decide this life's generation. Only `apply-state` may call this.
+
+    A marker in /run means this life already has an epoch and it is kept. No
+    marker means /run was cleared -- a boot -- so the epoch ADVANCES by one from
+    the durable value in the state file, which is what makes it monotonic across
+    reboots instead of restarting at zero and colliding with requests minted
+    before the power cut.
+
+    Inputs:  state: a normalized state dict (mutated in place, like the rest of
+             the apply path)
+    Outputs: (state, [journal lines])
+    Implements: SR-028, LLR-014
+    """
+    existing, mark = read_epoch_marker()
+    if existing is not None:
+        lines = []
+        if state["generation"] != existing:
+            # The durable file and the marker disagree: a state file was rolled
+            # back or replaced under a running panel. The MARKER wins, because
+            # every request minted in this life was stamped from it, and the
+            # state file is brought back up to it.
+            lines.append("epoch %d restored from the run marker (state file said %d)"
+                         % (existing, state["generation"]))
+            state["generation"] = existing
+        if mark > state["request_seq"]:
+            lines.append("request mark %d restored from the run marker "
+                         "(state file said %d)" % (mark, state["request_seq"]))
+            state["request_seq"] = mark
+        return state, lines
+    generation = state["generation"] + 1
+    if generation > 9007199254740991:
+        # Unreachable in practice (one per boot), but a wrapped epoch would be a
+        # silently accepted stale request, so it is refused loudly instead.
+        raise policy.StateError("epoch exhausted")
+    state["generation"] = generation
+    write_epoch_marker(generation, state["request_seq"], dry_run=dry_run)
+    return state, ["epoch %d opened (no run marker: this is a new backend life)"
+                   % generation]
 
 
 def is_boot_presence(initialized_usec, stamp=None, system_up=None):
@@ -1431,7 +1578,7 @@ def apply_plan(state, applier):
     exist until something has opened the PCM that declares it.
     """
     failures = 0
-    wanted = policy.plan(state)
+    wanted = policy.plan(state, aec_available=aec_available())
     adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
     loopback = read_env(CARDS_FILE, "WALL_AUDIO_LOOPBACK_CARD", "Loopback")
     builtin = read_env(CARDS_FILE, "WALL_AUDIO_BUILTIN_CARD", "PCH")
@@ -1439,6 +1586,30 @@ def apply_plan(state, applier):
     mic_values, mic_notes = load_mic()
     for note in mic_notes:
         log(note)
+    # ITEM J's EFFECTIVE MUTE, PUBLISHED BEFORE ANY LEG MOVES. The canceller
+    # polls it to decide whether its status block may claim a live microphone
+    # level; publishing it after the legs had moved would leave a window in
+    # which the wall drew a live ring over a microphone already stopped.
+    # A dry run still writes this one, on exactly save_state's and
+    # write_epoch_marker's reasoning: the hermetic suite has to be able to
+    # read back WHAT was published, not only that something was. The LIVE
+    # path is still refused, out loud, so --dry-run never touches the
+    # panel's own /run.
+    if applier.dry_run and INPUT_MUTE_ENV == LIVE_RUN_DIR / "audio-input-mute.env":
+        print("write %s (suppressed: --dry-run on the live input-mute file)"
+              % INPUT_MUTE_ENV)
+    else:
+        write_atomic(INPUT_MUTE_ENV,
+                     "%s=%d\n" % (INPUT_MUTE_VAR,
+                                  1 if wanted["input_muted_effective"] else 0),
+                     mode=0o644)
+    # Journalled as well as written, because the ORDER is the property that
+    # matters: an operator reading the log must be able to see that the mute
+    # was published before any leg moved, not merely that it was published.
+    log("input mute published to %s: %s"
+        % (INPUT_MUTE_ENV,
+           "muted" if wanted["input_muted_effective"] else "live"))
+
     # WHICH MICROPHONE, PUBLISHED BEFORE ANYTHING OPENS ONE. The mic legs read
     # this through `@func getenv` on `mic_selected`, exactly as the headset leg
     # reads its card id, so it has to be written before they are started -- and
@@ -1464,14 +1635,29 @@ def apply_plan(state, applier):
     # `apply-state` runs under wall-audio-state.service, which firstboot waits
     # on, and a non-zero return there is a red firstboot and a panel that looks
     # broken at the glass. That asymmetry is the whole point.
+    #
+    # THE MIC LEGS ARE STOPPED FIRST, BEFORE ANY OUTPUT LEG MOVES (item J). The
+    # ordering matters because a coupled mute arrives as ONE request that
+    # changes both: `set_output mute` mutes the room and the microphone
+    # together. Stopping the output first and the microphone second would leave
+    # a window -- short, but real, and it is the window in which the room has
+    # gone quiet and the person believes they are unheard -- where the mic is
+    # still forwarding. Doing it in this order means the coupled mute takes
+    # effect NO LATER than the output change it came with.
+    mic_stopped = True
+    for unit in policy.MIC_LEGS:
+        if not wanted["legs"].get(unit, False):
+            # Stopped HARDER than the output legs, and verified: see
+            # stop_mic_leg_hard for why a counted failure is not enough.
+            if stop_mic_leg_hard(applier, unit):
+                continue
+            failures += 1
+            mic_stopped = False
     for unit, should_run in wanted["legs"].items():
+        if unit in policy.MIC_LEGS:
+            continue
         if not should_run:
-            if unit in policy.MIC_LEGS:
-                # Stopped HARDER than the output legs, and verified: see
-                # stop_mic_leg_hard for why a counted failure is not enough.
-                failures += 0 if stop_mic_leg_hard(applier, unit) else 1
-            else:
-                failures += applier.command(["/usr/bin/systemctl", "stop", unit])
+            failures += applier.command(["/usr/bin/systemctl", "stop", unit])
     # Mixer mutes are not required: a card that has just been unplugged has no
     # controls to set, and that is the normal headset case, not an error.
     applier.command(["/usr/bin/amixer", "-c", adapter, "-q", "sset", "Speaker",
@@ -1578,6 +1764,18 @@ def apply_plan(state, applier):
     if wanted["reason"]:
         log("output %s is UNAVAILABLE (%s): every output silent"
             % (state["output"], wanted["reason"]))
+    # ITEM J'S EVIDENCE, NOT ITS INTENTION. `mic_legs_running` is what the
+    # applier OBSERVED after the pass: true while any mic leg is meant to run,
+    # and -- the case that matters -- true when a leg that was meant to STOP
+    # would not, which is how the broker comes to report `inputMutedConfirmed:
+    # false` instead of a success nobody can hear is a lie.
+    if wanted["mic_live"]:
+        state["mic_legs_running"] = True
+    else:
+        state["mic_legs_running"] = not mic_stopped
+        if not mic_stopped:
+            log("REFUSING TO CONFIRM THE INPUT MUTE: a mic leg is still "
+                "transmitting. The state records it as unconfirmed.")
     return failures
 
 
@@ -1633,8 +1831,8 @@ ALLOWED_REQUEST_KINDS = frozenset(
     {"set_output", "set_input_mute", "set_volume", "nudge_volume"})
 
 
-def read_request(path, last_seq=-1):
-    """One validated, deduplicated broker request, or None.
+def read_request(path, last_seq=-1, generation=None, epoch_vouched=True):
+    """One validated, deduplicated, epoch-scoped broker request, or None.
 
     The request file is written by a LESS privileged process, so it is treated
     as input from outside: the envelope is checked here, the contents are
@@ -1644,6 +1842,31 @@ def read_request(path, last_seq=-1):
     Deduplication is by a monotonic `seq` against the last one recorded in the
     state: systemd.path fires on close-write, and an identical re-write of an
     unchanged request must not replay a rocker press.
+
+    THE EPOCH GATE (contract 2026-09-14, section 1.2). `seq` orders requests
+    inside one life of the applier. It cannot order across a restart: a state
+    file replaced or rolled back moves `request_seq` backwards, and then a
+    request refused before the restart is indistinguishable from a fresh one. So
+    a request may also carry `generation`, and one that names an epoch this
+    applier is not in is refused outright.
+
+    `generation` is OPTIONAL, and that is not laxity. The two other writers of
+    intent -- the rocker and the root CLI -- do not go through this file at all;
+    they invoke this same binary under this same lock, so they take their
+    ordering from the same authority and have no epoch of their own to quote. A
+    request without one is accepted as unscoped, exactly as it was before this
+    change, which is also what keeps an older broker working against a newer
+    applier.
+
+    Both gates run INSIDE the caller's lock, against the state just loaded, and
+    before any policy event is applied -- so a refusal leaves the state file
+    byte-identical.
+
+    Inputs:  path: the request file
+             last_seq: the state's `request_seq` high-water mark
+             generation: the applier's current epoch, or None to skip the gate
+    Outputs: (seq, event) or None
+    Implements: SR-028, LLR-014
     """
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -1665,6 +1888,26 @@ def read_request(path, last_seq=-1):
         # only way anyone finds out why the switch stopped responding.
         log("request %d ignored: not newer than the last applied (%d)" % (seq, last_seq))
         return None
+    if "generation" in raw:
+        asked = raw.get("generation")
+        if not isinstance(asked, int) or isinstance(asked, bool) or asked < 0:
+            log("request %d refused: generation must be a non-negative integer" % seq)
+            return None
+        if not epoch_vouched:
+            # /run was cleared under a running panel, so this process cannot say
+            # which epoch it is in. Refusing is the only honest answer: the
+            # alternative is obeying a request whose epoch nothing can check.
+            log("request %d refused: the epoch marker is gone, so generation %d "
+                "cannot be checked; apply-state must re-establish the epoch"
+                % (seq, asked))
+            return None
+        if generation is not None and asked != generation:
+            # Loud, because this is the only way anyone finds out that a renderer
+            # is still talking to an epoch that ended -- which is precisely the
+            # moment it must re-handshake rather than be quietly obeyed.
+            log("request %d refused: generation %d is not the current epoch %d"
+                % (seq, asked, generation))
+            return None
     event = raw.get("event")
     if not isinstance(event, dict) or event.get("kind") not in ALLOWED_REQUEST_KINDS:
         log("request refused: unknown event kind")
@@ -1762,7 +2005,7 @@ def main(argv=None):
         for line in mic_notes:
             log(line)
         print(json.dumps({"mode": current_mode(), "state": state,
-                          "plan": policy.plan(state),
+                          "plan": policy.plan(state, aec_available=aec_available()),
                           # Step 3, and the two things the Owner will want at
                           # the glass test: which chain the leg actually opened,
                           # and what the centre and sub are being fed.
@@ -1794,12 +2037,61 @@ def _locked_apply(arguments):
     if note:
         log(note)
 
+    # THE MARKER IS THE AUTHORITY FOR EVERY COMMAND BUT apply-state, which opens
+    # the epoch itself below. Two things come out of it and BOTH matter (terra,
+    # 2026-09-14, findings 1 and 2):
+    #
+    #   the GENERATION, because every request minted in this life was stamped
+    #   from it, so a state file rolled back or replaced underneath a running
+    #   panel must be brought back up rather than silently refusing everything
+    #   in flight; and
+    #
+    #   the REQUEST MARK, because carrying only the generation left a hole: a
+    #   rollback to an old `request_seq` under a live epoch re-opened every
+    #   request the applier had already refused, and a delayed one would apply.
+    #
+    # A MISSING MARKER IS AN EPOCH BREAK, NOT A SHRUG. /run is tmpfs, so its
+    # absence on a running system means it was cleared under us and this process
+    # cannot vouch for the epoch at all. Requests that NAME an epoch are refused
+    # until `apply-state` re-establishes one -- which is exactly the fresh
+    # handshake the contract asks for. Requests that name none are still
+    # applied: the rocker and the root CLI have no epoch to be wrong about, and
+    # a volume key that stopped working because /run was cleaned would be a
+    # worse failure than the one this guards.
+    epoch_vouched = True
+    if arguments.command != "apply-state":
+        marker, mark = read_epoch_marker()
+        if marker is None:
+            epoch_vouched = False
+            log("no epoch marker in %s: this process cannot vouch for the "
+                "epoch, so any request that names one is refused until "
+                "apply-state re-establishes it" % EPOCH_MARKER)
+        else:
+            if state["generation"] != marker:
+                log("epoch %d adopted from the run marker (state file said %d)"
+                    % (marker, state["generation"]))
+                state["generation"] = marker
+            if mark > state.get("request_seq", -1):
+                log("request mark %d restored from the run marker (state file "
+                    "said %d)" % (mark, state.get("request_seq", -1)))
+                state["request_seq"] = mark
+
     seq = None
     boot_mark = None
     if arguments.command == "apply-state":
         # Sampled HERE, before anything is decided or applied, and written at
         # the very end -- see write_boot_stamp for why the two halves are apart.
         boot_mark = int(time.monotonic() * 1_000_000)
+        # The epoch is opened BEFORE anything else this command does, so that
+        # every write below -- including the presence record -- carries the
+        # generation this life of the backend will answer requests in.
+        try:
+            state, epoch_lines = open_epoch(state, dry_run=arguments.dry_run)
+        except policy.StateError as exc:
+            log("refused: %s" % exc)
+            return 1
+        for line in epoch_lines:
+            log(line)
         # THE STORED POSITION IS APPLIED FIRST, AND WHAT IS PLUGGED IN IS ONLY
         # RECORDED. Owner ruling 2026-09-13: over a boot we do not know when a
         # plug event happened or whether it is still relevant, so coldplug is a
@@ -1814,7 +2106,9 @@ def _locked_apply(arguments):
 
     if arguments.command == "apply-request":
         request = read_request(arguments.value or DEFAULT_REQUEST,
-                               state.get("request_seq", -1))
+                               state.get("request_seq", -1),
+                               generation=state.get("generation"),
+                               epoch_vouched=epoch_vouched)
         if request is None:
             return 0
         seq, event = request
@@ -1834,6 +2128,22 @@ def _locked_apply(arguments):
             # that survived while its effect did not would swallow the retry.
             state["request_seq"] = seq
         save_state(state, arguments.state, dry_run=arguments.dry_run)
+        # THE MARKER IS ADVANCED AFTER THE STATE, AND THE ORDER IS THE WHOLE
+        # POINT (terra, second pass). The marker's mark is a RESTORE copy: on
+        # the next run the higher of the two wins. So a crash between them must
+        # leave the marker BEHIND the state, never ahead of it -- writing the
+        # marker first meant a crash before `save_state` deduplicated a request
+        # whose effect had never happened, losing it permanently and silently.
+        # An earlier comment here claimed this order while the code did the
+        # opposite; the comment was right and the code is now too.
+        #
+        # ONLY WHEN A MARKER ALREADY EXISTS. Writing one when /run has been
+        # cleared would RE-VOUCH for an epoch this process has just said it
+        # cannot vouch for, and the next `apply-state` would keep the dead epoch
+        # instead of opening a new one -- the fence of finding 2, undone by its
+        # own bookkeeping.
+        if seq is not None and epoch_vouched:
+            write_epoch_marker(state["generation"], seq, dry_run=arguments.dry_run)
 
     mode = current_mode()
     if mode != "bus":
@@ -1844,7 +2154,16 @@ def _locked_apply(arguments):
         if boot_mark is not None:
             write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
         return 0
+    before_observation = state.get("mic_legs_running")
     failures = apply_plan(state, Applier(dry_run=arguments.dry_run))
+    # A SECOND WRITE, AND IT IS NOT REDUNDANT. Everything else in the state is
+    # an INTENTION and is persisted before the apply, so that a crash halfway
+    # through cannot lose what the Owner asked for. `mic_legs_running` is an
+    # OBSERVATION and cannot exist until the apply has happened -- and it is the
+    # one fact that decides whether the broker may report the coupled mute as
+    # confirmed, so it must reach the file even when the apply failed.
+    if state.get("mic_legs_running") != before_observation:
+        save_state(state, arguments.state, dry_run=arguments.dry_run)
     # Published only now, with the graph in the position the state asked for. A
     # stamp written before the apply would declare the boot settled while the
     # legs were still moving, and any adapter that enumerated in between would

@@ -36,6 +36,81 @@ target column, because `unit: in` means inches to every other reader of that
 sheet and because NagLight marks a quantified row satisfied once progress
 reaches its target - a 0.5 there would complete the item on every entry,
 forever. The documented default when no usable target is declared is still 0.5.
+**2026-09-14 — group A, panel audio: intent epoch, coupled mute, echo canceller
+and real telemetry (branch `p3-a`, LOCAL ONLY, nothing installed on the panel).**
+Four source changes, each with tests, against the coordinator plan's section A.
+
+* **Contract.** The root applier now stamps a backend EPOCH (`generation`) into
+  `/etc/wall-panel/audio-state.json`, advanced once per boot by `apply-state`
+  finding no marker in `/run/wall-panel/audio-epoch.json`. A broker request may
+  name the epoch it was minted against and one naming a dead epoch is refused
+  inside the apply lock, leaving the state byte-identical. The reply now echoes
+  `seq`, `generation` and the applied state (`effective`), all behind the
+  existing `echoSeq` opt-in so an un-upgraded renderer is unaffected. Field
+  names of record: OfficeWallNaglight
+  `docs/design/audio-intent-contract-2026-09-14.md`.
+* **Item J** (supersedes item-23 ruling E). Selecting output Mute now also mutes
+  the microphone, as a LATCH on the stored flag rather than a mask, because the
+  Owner's second half — the mute is retained after leaving Mute until an
+  explicit unmute — is only consistent with a latch. `normalize` applies it, so
+  it holds for boot, resume, udev, the rocker and the CLI, not only for broker
+  requests. An independent unmute while Mute is selected is refused with a
+  reason. `mic_legs_running` is the applier's OBSERVATION after its pass, and
+  the broker reports `inputMutedConfirmed: false` whenever a leg may still be
+  transmitting.
+* **Step 6.** `stack/autoinstall/wall/aec/` is a SpeexDSP echo canceller built
+  from the AEC spike's section 6: a pure-C policy core (108 assertions, no ALSA
+  and no Speex) plus an I/O shell that owns both PCMs in one process. Built on
+  the panel by firstboot, INSTALLED BUT NOT ENABLED — the mic seam moves to
+  `mic_clean` only with `WALL_AUDIO_AEC=1`, because acceptance needs a person in
+  the room.
+* **Item L.** `telemetry` no longer answers `{"available": false}`
+  unconditionally. That was structural — the broker cannot open a sound device —
+  so two services that already hold their captures publish what they measured:
+  `wall-amp-trigger` (already reading `speaker_tap` for the relay) and
+  `wall-audio-aec`. No second capture and no routing change.
+
+**Independent review: two Terra-medium passes, thirteen real findings, all
+fixed with regression tests.** Pass one: a rolled-back state file re-opened
+every request the applier had already refused (the run marker now carries the
+sequence mark as well as the epoch); clearing /run under a running panel fenced
+nothing (a missing marker is now an epoch break for scoped requests, and the
+rocker is deliberately unaffected); the canceller never learned the input mute,
+so it claimed a live microphone through an item J coupled mute; a tap that
+failed to open at start was never retried; the divergence test used a lifetime
+mean, making detection latency a function of uptime; the AEC enable knob lived
+in two files and nothing wrote the second; bus freshness was stamped at read
+time; an absent bus was passed off as a measured quiet room; and the decimation
+had no anti-alias at all. Pass two: the epoch marker was advanced BEFORE the
+state, so a crash between them lost an accepted request permanently; a
+failed-over canceller logged "passed through" and went on cancelling; the
+reference ring desynchronised as soon as a non-unity resampler ratio was in
+force; the reply's `effective` field was renamed `observedBefore` after two
+readers took it for a claim about the outcome; the boxcar did not actually
+suppress the alias it named (decimation is now 2x, so nothing audible folds
+into a displayed band); and a mic leg could open `mic_clean` with no writer.
+
+Two claims were reviewed and REJECTED with evidence, not silently: that valid
+telemetry is refused for a missing `generation` (the router stamps it before
+validating, confirmed end to end through the real broker), and that this work
+installs the canceller on the panel (it adds the firstboot lines the plan asked
+for; nothing was installed, and the unit ships disabled).
+
+**Assumptions recorded for the next gate.** (a) Item J's latch means a person
+who was live on Speaker, taps Mute, then taps Speaker again comes back MUTED;
+that is the Owner's ruling read literally and is flagged for review. (b) The
+canceller's bands and ERLE are proven only against a synthetic fixture: the
+spike's retained evidence is PNGs and JSON summaries, so no replay against real
+captures was possible. (c) Everything hardware-dependent — the rocker chain,
+coupled mic silence on both returns, AEC double talk, the amplifier-knob move —
+is explicitly unproven and listed in the group's report.
+
+**Installed baseline, read-only inspection 2026-09-14.** The panel's
+`wall_audio_state.py` and `switch_backend.py` are one commit behind `c4136e6`;
+`panel-volume-request.py` and `wall-volume-request.socket` are absent, as the
+plan already records. The state file carries neither `generation` nor
+`mic_legs_running`, which is the compatibility case this work handles.
+
 
 **2026-09-14 — local panel capability provisioning is implemented and
 independently reviewed in the isolated checkout; not deployed.** The image now

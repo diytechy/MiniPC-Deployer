@@ -50,6 +50,29 @@ import switch_request
 # audio_router.BrokerError to speak the broker's error vocabulary.
 
 DEFAULT_STATE_PATH = Path("/etc/wall-panel/audio-state.json")
+# -- item L: the two producers this backend READS and never runs ------------
+# Neither file is opened by anything privileged here. The broker runs as
+# `panel` under ProtectSystem=strict with PrivateDevices=true and AF_UNIX as
+# its only address family: it cannot open a sound device, and giving it one
+# would move the capture privilege to the process the renderer talks to, which
+# is the boundary SR-023 exists to hold. So both producers are services that
+# ALREADY have the capture they need, and the channel between them and this
+# backend is a bounded document in /run.
+#
+#   wall-amp-trigger  already reads `speaker_tap` every 100 ms for the relay,
+#                     so the bus levels are a by-product of a capture that is
+#                     running anyway. NO second capture, no routing change.
+#   wall-audio-aec    already reads the panel microphone as its near end, so
+#                     the post-filter level is likewise a by-product.
+BUS_TELEMETRY_PATH = Path("/run/wall-amp-trigger/bus-telemetry.json")
+AEC_STATUS_PATH = Path("/run/wall-panel/aec-status.json")
+# How old a document may be and still be drawn as live. The bus publishes at
+# 5 Hz and the canceller at 0.1 Hz, so they get different windows -- one window
+# for both would either call the canceller stale constantly or let a frozen bus
+# readout sit on the wall for ten seconds.
+BUS_STALE_MS = 1500
+AEC_STALE_MS = 25000
+TELEMETRY_BANDS = 8
 DEFAULT_APPLIER_PATH = Path("/usr/local/sbin/wall-audio-output")
 # The three positions and the two that carry a level. Duplicated from
 # wall_audio_state (LLR-013) rather than imported: that module lives in the root
@@ -102,7 +125,7 @@ class SwitchApplierBackend:
         if method == "status":
             return self._status()
         if method == "telemetry":
-            return {"available": False}
+            return self._telemetry()
         if method == "request_landed":
             return {"accepted": self._landed(params["seq"])}
         handler = getattr(self, "_" + method, None)
@@ -165,10 +188,14 @@ class SwitchApplierBackend:
         """
         if params["muted"] is True:
             return self._submit({"kind": "set_output", "output": "mute"})
-        if self._normalized()["output"] != "mute":
+        applied = self._normalized()
+        if applied["output"] != "mute":
             # Accepted, and honestly seq-less: no request was minted, so there
-            # is nothing for a client to correlate against.
-            return {"accepted": True}
+            # is nothing for a client to correlate against. The effective state
+            # is still echoed, because the caller asked "is the output unmuted"
+            # and this is the evidence that it is.
+            return {"accepted": True, "seq": None, "generation": None,
+                    "observedBefore": self._observed_before(applied)}
         return self._submit({"kind": "set_output", "output": UNMUTE_OUTPUT})
 
     # ---- the shell ------------------------------------------------------
@@ -196,15 +223,56 @@ class SwitchApplierBackend:
         them apart across the process boundary and across a broker restart.
         """
         seq = self._next_seq()
+        # THE EPOCH THE REQUEST IS SCOPED TO, and the state it is scoped
+        # AGAINST, both read from the one file the applier owns (contract
+        # 2026-09-14, sections 1.2 and 1.4). `_require_applier` has already
+        # proved the file is readable on every path that reaches here, so an
+        # unreadable file at this point is a race with a rewrite; the request
+        # then goes out UNSCOPED rather than carrying a guessed epoch.
+        from audio_router import BrokerError
         try:
-            switch_request.write(seq, event, path=self.request_path)
+            applied = self._normalized()
+        except BrokerError:
+            applied = None
+        generation = applied["generation"] if applied else None
+        try:
+            switch_request.write(seq, event, path=self.request_path,
+                                 generation=generation)
         except switch_request.RequestError as exc:
             # An event this module built itself was refused by the envelope:
             # a bug here, never a client's doing. Loud, and never as "accepted".
             raise _broker_error("backend_failure", "audio backend failed") from exc
         except OSError as exc:
             raise _broker_error("backend_failure", "audio backend failed") from exc
-        return {"accepted": True, "seq": seq}
+        return {"accepted": True, "seq": seq, "generation": generation,
+                "observedBefore": self._observed_before(applied)}
+
+    @classmethod
+    def _observed_before(cls, applied) -> dict | None:
+        """The applied state as it stood BEFORE this request, or None.
+
+        NAMED FOR WHEN IT WAS TAKEN, because two independent reviews read the
+        previous name -- `effective` -- as a claim about the outcome, and a
+        field two readers get wrong is named wrong however carefully the
+        contract explains it. The applier runs asynchronously behind a path
+        unit, so NO reply can say whether this request has been applied;
+        `accepted` has never meant `applied` and this field does not change
+        that. The STATUS verb is where the effective applied state lives.
+
+        What it buys the client is exactly what item I needs: a renderer whose
+        request timed out can compare a freshly read `requestSeq` against this
+        one to tell "it landed" from "it is still lost", without a second round
+        trip to establish the baseline.
+        """
+        if not applied:
+            return None
+        return {
+            "output": applied["output"],
+            "inputMuted": applied["input_muted"],
+            "volume": cls._volume_of(applied, applied["output"]),
+            "requestSeq": applied["request_seq"],
+            "generation": applied["generation"],
+        }
 
     def _next_seq(self) -> int:
         floor = max(self._applied_seq(), self._pending_seq()) + 1
@@ -327,6 +395,174 @@ class SwitchApplierBackend:
             raise _broker_error("backend_unavailable", "audio routing is not configured")
         return raw
 
+    # ---- item L: telemetry ------------------------------------------------
+
+    def _read_document(self, path: Path, limit: int = 16384):
+        """One bounded JSON document from /run, or None. Never raises.
+
+        Telemetry is a decoration. A missing, truncated, oversized or
+        nonsensical document is "we cannot tell you", which the shell renders as
+        an absent visualizer -- never an error, and never the last thing anybody
+        saw.
+        """
+        try:
+            if path.stat().st_size > limit:
+                return None
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    @staticmethod
+    def _scalar(value):
+        """A published 0..1 float, or None. bool is an int in Python: refuse it."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        if value != value or value < 0.0 or value > 1.0:
+            return None
+        return value
+
+    def _telemetry(self) -> dict:
+        """The bus levels and the post-filter microphone scalar (item L).
+
+        WHY THIS ANSWERED `{"available": false}` UNTIL NOW, and why that was a
+        structural answer rather than a stub: this backend replaced the routed
+        one, which had a capture of its own, and the switch backend performs no
+        device I/O at all. It still performs none. What has changed is that two
+        services which already hold the captures now publish what they have
+        measured, and this reads their files.
+
+        Contract:
+          Outputs: {"available": False} when nothing usable is published, or
+                   the IF-015 telemetry result with `rms`, `peak`, `bands` and
+                   an optional `microphone` block. `generation` is stamped by
+                   the broker, not here.
+        Implements: SR-028, LLR-015
+        """
+        now_ms = int(time.monotonic() * 1000)
+        bus = self._bus_block(now_ms)
+        microphone = self._microphone_block(now_ms)
+        if bus is None and microphone is None:
+            # Honest, and distinguishable from silence: the shell draws no
+            # visualizer rather than a flat one.
+            return {"available": False}
+        if bus is None:
+            # The microphone has telemetry and the bus has none. The bus fields
+            # must still be present because the schema is exact -- but they are
+            # marked `unavailable`, NOT passed off as a measured quiet room.
+            bus = self._silent_bus("unavailable", now_ms, 0)
+        result = {
+            "available": True,
+            "active": bus["active"],
+            "rms": bus["rms"],
+            "peak": bus["peak"],
+            "bands": bus["bands"],
+            # THE PRODUCER'S OWN OBSERVATION INSTANT, not the moment this was
+            # read (terra, 2026-09-14). Both are CLOCK_MONOTONIC on the same
+            # machine, so it needs no conversion -- and stamping `now` here made
+            # a 1.4-second-old capture look newly observed, which is precisely
+            # the freshness claim this field exists to carry.
+            "observedMonotonicMs": bus["observed"],
+            "bus": {"state": bus["state"], "ageMs": bus["ageMs"],
+                    "valid": bus["state"] == "live", "source": "speaker_tap"},
+        }
+        if microphone is not None:
+            result["microphone"] = microphone
+        return result
+
+    def _silent_bus(self, state: str, observed: int, age_ms: int) -> dict:
+        """A bus carrying nothing, with the REASON it carries nothing.
+
+        Silence and absence are different answers and the shell renders them
+        differently, so they may not share a representation (terra, 2026-09-14):
+        a bus nobody is publishing must not be indistinguishable from a quiet
+        room. `state` is what tells them apart.
+        """
+        return {"active": False, "rms": 0.0, "peak": 0.0,
+                "bands": [0.0] * TELEMETRY_BANDS, "state": state,
+                "observed": observed, "ageMs": age_ms}
+
+    def _bus_block(self, now_ms: int):
+        """`speaker_tap` levels from wall-amp-trigger, or None."""
+        raw = self._read_document(BUS_TELEMETRY_PATH)
+        if not raw or raw.get("schema") != 1 or raw.get("source") != "speaker_tap":
+            return None
+        if raw.get("valid") is not True:
+            # The producer is running and says its capture is not live -- the
+            # switch has left Speaker, or the tap has not opened. That is a
+            # SILENT bus, not an absent one, and the difference matters: the
+            # visualizer should show a quiet room, not disappear.
+            return self._silent_bus("silent", now_ms, 0)
+        rms = self._scalar(raw.get("rms"))
+        peak = self._scalar(raw.get("peak"))
+        bands = raw.get("bands")
+        if rms is None or peak is None or not isinstance(bands, list) or len(bands) != TELEMETRY_BANDS:
+            return None
+        clean = [self._scalar(band) for band in bands]
+        if any(band is None for band in clean):
+            return None
+        observed = raw.get("observed_monotonic_ms")
+        if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+            return None
+        age = now_ms - observed
+        if age > BUS_STALE_MS or age < -BUS_STALE_MS:
+            # STALE IS SILENCE, NOT THE LAST FRAME. A producer that stopped
+            # would otherwise leave a still picture of a bus level on the wall
+            # for as long as nobody restarted it. The age is published beside
+            # it, so "stale" is a statement with evidence rather than a verdict.
+            return self._silent_bus("stale", now_ms, max(0, age))
+        return {"active": raw.get("active") is True, "rms": rms, "peak": peak,
+                "bands": clean, "state": "live", "observed": observed,
+                "ageMs": max(0, age)}
+
+    def _microphone_block(self, now_ms: int):
+        """The canceller's post-filter level, or None when there is no canceller.
+
+        EVERY STATE IS EXPLICIT, because the one thing this block must never do
+        is let a ring be drawn live over a microphone that is muted, stale or
+        not being cancelled at all. `source` is what stops raw capture ever
+        being presented as post-filter.
+        """
+        raw = self._read_document(AEC_STATUS_PATH)
+        if not raw or raw.get("schema") != 1:
+            return None
+        block = raw.get("microphone")
+        if not isinstance(block, dict):
+            return None
+        level = self._scalar(block.get("level"))
+        if level is None:
+            return None
+        source = block.get("source")
+        if source not in ("aec_post_filter", "raw_capture", "none"):
+            return None
+        state = block.get("state")
+        if state not in ("live", "muted", "stale", "unavailable"):
+            return None
+        observed = block.get("observed_monotonic_ms")
+        if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+            return None
+        age = now_ms - observed
+        if age < 0:
+            # The canceller restarted, so its monotonic clock and ours no longer
+            # share an origin. The age is not a number that can be defended, and
+            # a level whose age cannot be defended is stale by definition.
+            age = 0
+            state = "stale"
+        if age > AEC_STALE_MS and state == "live":
+            state = "stale"
+        reference = block.get("reference_dbfs")
+        if isinstance(reference, bool) or not isinstance(reference, (int, float)):
+            return None
+        return {
+            "level": level if state == "live" else 0.0,
+            "source": source,
+            "state": state,
+            "ageMs": age,
+            "valid": state == "live" and block.get("valid") is True,
+            "referenceDbfs": float(reference),
+        }
+
     def _status(self) -> dict:
         """IF-015 status: no routing, plus the switch block read off the file.
 
@@ -356,14 +592,33 @@ class SwitchApplierBackend:
             return self._status_envelope({
                 "supported": False, "output": DEFAULT_OUTPUT, "inputMuted": False,
                 "available": False, "reason": "state_unreadable", "volume": 0,
+                # Null, not zero: an unreadable file is an epoch and a mark this
+                # broker does not know, and zero is a number a client would
+                # compare against (contract 2026-09-14, section 1.3).
+                "generation": None, "requestSeq": None,
+                # Unreadable: the coupling cannot be evaluated and the mute
+                # certainly cannot be confirmed.
+                "inputMuteHeld": False, "inputMutedConfirmed": False,
             }, muted=False, mute_supported=False)
         output = state["output"]
         unavailable = output == "mute" or (output == "headset" and not state["headset_present"])
         reason = "headset_absent" if output == "headset" and not state["headset_present"] else None
+        # ── ITEM J, reported so the chrome never has to derive the rule ────
+        # `inputMuted` is the EFFECTIVE mute -- what the microphone actually is.
+        # `inputMuteHeld` says an independent unmute is refused right now, which
+        # is what lets the UI explain the refusal instead of just showing one.
+        # `inputMutedConfirmed` is the applier's OBSERVATION: false while a mic
+        # leg is (or may still be) transmitting, so a coupled mute is never
+        # reported as successful while the microphone is still open.
+        held = output == "mute"
+        muted_effective = state["input_muted"] or held
         return self._status_envelope({
-            "supported": True, "output": output, "inputMuted": state["input_muted"],
+            "supported": True, "output": output, "inputMuted": muted_effective,
             "available": not unavailable, "reason": reason,
             "volume": self._volume_of(state, output),
+            "generation": state["generation"], "requestSeq": state["request_seq"],
+            "inputMuteHeld": held,
+            "inputMutedConfirmed": muted_effective and not state["mic_legs_running"],
         }, muted=output == "mute", mute_supported=True)
 
     @staticmethod
@@ -393,6 +648,7 @@ class SwitchApplierBackend:
         raw = self._state_strict()
         state = {"output": DEFAULT_OUTPUT, "input_muted": True,
                  "headset_present": False, "request_seq": -1, "volume_event_seq": 0,
+                 "generation": 0, "mic_legs_running": True,
                  "volume": dict(DEFAULT_VOLUME)}
         # Same rule as wall_audio_state.normalize (step 4, terra rounds 2-4):
         # the microphone is MUTED unless the document explicitly carries the
@@ -420,6 +676,18 @@ class SwitchApplierBackend:
             state["request_seq"] = seq
         elif "request_seq" in raw:
             repaired = True
+        # The epoch (contract 2026-09-14, section 1.1). Absent is an OLDER
+        # applier's file, not damage -- the same rule wall_audio_state.normalize
+        # applies -- so it does not trip the repair-mutes-the-microphone rule.
+        if isinstance(raw.get("mic_legs_running"), bool):
+            state["mic_legs_running"] = raw["mic_legs_running"]
+        elif "mic_legs_running" in raw:
+            repaired = True
+        generation = raw.get("generation")
+        if isinstance(generation, int) and not isinstance(generation, bool) and 0 <= generation <= 9007199254740991:
+            state["generation"] = generation
+        elif "generation" in raw:
+            repaired = True
         volume_event = raw.get("volume_event_seq", 0)
         if isinstance(volume_event, int) and not isinstance(volume_event, bool) and 0 <= volume_event <= 9007199254740991:
             state["volume_event_seq"] = volume_event
@@ -439,6 +707,11 @@ class SwitchApplierBackend:
         elif "volume" in raw:
             repaired = True
         if repaired:
+            state["input_muted"] = True
+        # Item J, mirrored from wall_audio_state.normalize: output Mute couples
+        # the microphone, at the recovery boundary as well as at the request
+        # boundary. The paired test asserts the two copies agree.
+        if state["output"] == "mute":
             state["input_muted"] = True
         return state
 

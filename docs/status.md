@@ -2054,3 +2054,13 @@ baseline). doc-navigability FAILS in the worktree only, because the sibling
 `../HomeHub/...` links cannot resolve from `build/wt-d`; the same check passes
 in the original checkout. Branch `d-door`, local commit only, no push, no
 deployment, active gate unchanged. Group W rebases on this file.
+
+Terra review follow-up, same day: `start_door_broker`'s failed `systemctl start`
+was returning 0 after the new warning, which would have hidden the condition
+twice over - `backlight_set` has its own caller-side warning for exactly that
+case. It returns 1 again; only the two policy guards (no unit, no readable
+credentials) still return success, because in those cases there is deliberately
+nothing to start. `test_door_broker_refusals_are_logged_not_silent_llr920` now
+asserts that seam directly. Smoke re-run: unit-tests 159 passed / 3 skipped,
+registry-integrity 24 orphans / 0 integrity errors, doc-navigability still the
+worktree-only sibling-link failure.

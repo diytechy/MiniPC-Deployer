@@ -184,9 +184,14 @@ start_door_broker() {
         log "WARNING door broker: /run/wall-door-credentials/{host,password} unreadable; not started (re-run firstboot credential provisioning)"
         return 0
     fi
+    # A FAILED START IS A FAILURE. The two guards above return 0 because they are
+    # policy — there is deliberately nothing to start — but `systemctl start`
+    # exiting non-zero means the unit was asked to run and did not, and
+    # backlight_set's caller has a warning for exactly that case. Swallowing it
+    # here would have hidden the condition twice over.
     if ! systemctl start wall-door-stream.service >/dev/null 2>&1; then
         log "WARNING door broker: systemctl start wall-door-stream.service failed"
-        return 0
+        return 1
     fi
     log "door broker: started"
 }

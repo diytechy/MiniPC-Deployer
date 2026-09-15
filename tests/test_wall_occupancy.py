@@ -129,6 +129,15 @@ def test_door_broker_refusals_are_logged_not_silent_llr920():
         assert reader not in helper, "a credential value must never reach the journal"
     stop = sleep[sleep.index("stop_door_stream()") : sleep.index("start_door_broker()")]
     assert "WARNING door broker" in stop, "a wedged stop must be readable after the fact"
+    # A FAILED START MUST STILL FAIL. Adding the warning must not have converted
+    # a non-zero `systemctl start` into a success: backlight_set has its own
+    # caller-side warning for exactly that, and swallowing the status here would
+    # have hidden the condition twice over. The two policy guards above keep
+    # returning 0 because there is deliberately nothing to start.
+    start_failure = helper[helper.index("systemctl start wall-door-stream.service >/dev/null") :]
+    failure_branch = start_failure.split("fi", 1)[0]
+    assert "return 1" in failure_branch, "a failed systemctl start must stay non-zero"
+    assert "return 0" not in failure_branch, "a failed systemctl start must not report success"
 
 
 @pytest.mark.smoke

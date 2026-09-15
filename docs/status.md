@@ -2104,3 +2104,17 @@ end to end; and the A11 one-writer admission is a Python AST audit plus a
 shell-redirection audit rather than a line regex, with planted writes proving
 it bites. Counts after the round: `check.py --tier smoke` PASS, 176 passed / 3
 skipped; `occupancy-power.test.sh` 113 PASS 0 FAIL.
+
+2026-09-15 group W, integrated-review fix (branched from the integrated head
+3ce8aaf). One MEDIUM: the `touch-wake` arm called `backlight_set on` and then
+released the lock unconditionally. This script runs `set -u` and NOT `set -e`,
+so the write's status was discarded and the arm exited 0 on a backlight that
+never came on — the witness would have read that as a completed wake, armed its
+2 s rate limit against a panel that is still dark, and the journal would have
+reported a successful touch wake. The arm now captures the status, releases the
+lock (the next tick must not queue behind a tap that achieved nothing), then
+journals what failed and exits with that status; the witness arms the rate
+limit only on exit 0, telling 75 (a power decision is in flight) from any other
+non-zero (the backlight did not come on) in the journal but treating both the
+same way. Counts: `check.py --tier smoke` PASS, 179 passed / 3 skipped;
+`occupancy-power.test.sh` 120 PASS 0 FAIL.

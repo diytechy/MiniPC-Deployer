@@ -77,6 +77,11 @@ TOUCH_WAKE_MIN_INTERVAL_S = 2.0
 # Restart=always and its uinput node is destroyed and recreated on every
 # restart and across every suspend/resume.
 TOUCH_RETRY_S = 1.0
+# EX_TEMPFAIL, the exit wall-sleep.sh uses when the touch-wake arm declines
+# because the occupancy decider holds the power lock.  Distinguished from any
+# other non-zero only in what the journal says: neither arms the rate limit,
+# because neither left a lit panel behind.
+TOUCH_WAKE_DECLINED = 75
 EV_KEY = 1
 BTN_TOUCH = 330
 
@@ -592,8 +597,21 @@ class TouchWitness:
         self.log("touch-witness: contact observed, brightness=0, requesting touch-wake")
         try:
             self.helper.wake({"source": "touch"}, witness=True)
+        except subprocess.CalledProcessError as error:
+            # THE RATE LIMIT IS ARMED BY A COMPLETED WAKE, NOT BY AN ATTEMPT.
+            # Exit 75 means the arm declined because a power decision held the
+            # lock; any other non-zero means it tried and the backlight did not
+            # come on. Both leave the panel dark, so both must leave the clock
+            # untouched -- arming it here would make the panel ignore the
+            # person's next two seconds of tapping while still dark.
+            self.log("touch-witness: touch-wake did not complete (exit %s) — %s, not arming "
+                     "the rate limit" % (error.returncode,
+                                         "a power decision is in flight"
+                                         if error.returncode == TOUCH_WAKE_DECLINED
+                                         else "the backlight did not come on"))
+            return False
         except (Refused, OSError, subprocess.SubprocessError) as error:
-            self.log("touch-witness: touch-wake failed (%s)" % error)
+            self.log("touch-witness: touch-wake failed (%s) — not arming the rate limit" % error)
             return False
         self.last_wake = now
         self.log("touch-witness: touch-wake completed")

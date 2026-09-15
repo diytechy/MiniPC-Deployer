@@ -1102,6 +1102,49 @@ grep -q 'NOT suspending: the absence clock changed' "$ROOT/out.log" \
     && pass "A24 the abort names the cleared clock" \
     || fail "A24 the abort was silent about the clock"
 
+# A24e (TC-913/LLR-913): a touch wake that did NOT light the panel must SAY so.
+# This script runs `set -u` and not `set -e`, so a discarded status is a silent
+# lie: the arm would exit 0 on a backlight that never came on, the witness would
+# read that as a completed wake and arm its 2 s rate limit against a panel that
+# is still dark, and the journal would report a successful touch wake. The three
+# statements — the exit code, the journal line and the released lock — are
+# asserted together, because a fix that only got one of them right is the same
+# defect with better manners.
+scenario a24-touch-wake-fails
+write_env "SLEEP_MODE=backlight"
+mkdir -p "$ROOT/run/wall-occupancy"
+printf '%s' "$(date +%s)" > "$ROOT/run/wall-occupancy/absent-since"
+rm -rf "$ROOT/sys/class/backlight"      # the interface renamed, or gone
+run touch-wake
+touch_status=$?
+[ "$touch_status" -ne 0 ] \
+    && pass "A24 a touch wake whose backlight write failed exits non-zero ($touch_status)" \
+    || fail "A24 a failed backlight write still exited 0 — the witness would call it a wake"
+[ "$touch_status" -ne 75 ] \
+    && pass "A24 ...and it is distinguishable from the 75 the lock decline uses" \
+    || fail "A24 a failed write is reported as a lock decline"
+grep -q 'touch wake FAILED' "$ROOT/out.log" \
+    && pass "A24 the failed touch wake names the failure in the journal" \
+    || fail "A24 the failed touch wake was silent about it"
+grep -q 'NOT recorded as a wake' "$ROOT/out.log" \
+    && pass "A24 ...and says the tap was not recorded, so the next contact retries" \
+    || fail "A24 the journal does not say the tap was not recorded"
+# The lock is RELEASED on the failing path: the next tick must not queue behind
+# a tap that achieved nothing. Proven by taking the lock afterwards with no wait.
+if command -v flock >/dev/null 2>&1; then
+    flock -n "$ROOT/run/wall-power.lock" true \
+        && pass "A24 the failed touch wake released the power lock" \
+        || fail "A24 the failed touch wake left the power lock held"
+fi
+
+# A24f: and the SUCCESSFUL arm still exits 0, so the witness may arm its clock.
+scenario a24-touch-wake-succeeds
+write_env "SLEEP_MODE=backlight"
+printf '0' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+run touch-wake
+eq "0" "$?" "A24 a touch wake that really lit the panel exits 0"
+eq "100" "$(brightness)" "A24 ...and the panel is lit"
+
 # A24d: the SCHEDULED path is untouched by all of this. It never claimed to dim
 # anything, so it has nothing to re-check and must still suspend a lit panel.
 scenario a24-scheduled

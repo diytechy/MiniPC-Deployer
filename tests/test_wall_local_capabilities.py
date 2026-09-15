@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import stat
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -627,6 +628,37 @@ def test_a_refused_wake_does_not_arm_the_rate_limit_tc911(tmp_path):
     watcher = witness(tmp_path, brightness=0, helper=helper, clock=lambda: 5.0)
     assert watcher.contact() is False
     assert watcher.last_wake is None
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("status,expected_note", [
+    (SETUP.TOUCH_WAKE_DECLINED, "a power decision is in flight"),
+    (1, "the backlight did not come on"),
+    (2, "the backlight did not come on"),
+])
+def test_only_a_completed_wake_arms_the_rate_limit_tc911(tmp_path, status, expected_note):
+    """A non-zero touch-wake leaves the panel DARK, so the clock must not start.
+
+    wall-sleep.sh runs `set -u` and not `set -e`, so a discarded backlight
+    status would have made the arm exit 0 on a panel that never lit; the arm now
+    exits with backlight_set's own status. On this side the rule is the mirror
+    image: arm only on exit 0. Arming on a failed attempt would make the panel
+    ignore the next two seconds of tapping while still dark -- exactly the
+    symptom the Owner reported in the first place.
+    """
+    said = []
+    helper = SpyHelper(error=subprocess.CalledProcessError(status, SETUP.TOUCH_POWER_COMMAND))
+    watcher = witness(tmp_path, brightness=0, helper=helper, clock=lambda: 5.0, log=said.append)
+    assert watcher.contact() is False
+    assert watcher.last_wake is None, "a failed wake armed the rate limit"
+    assert any("not arming the rate limit" in line for line in said)
+    assert any(expected_note in line for line in said)
+    assert any("exit %s" % status in line for line in said)
+    # The next contact is therefore tried immediately, not swallowed by a clock
+    # that a failure started.
+    helper.error = None
+    assert watcher.contact() is True
+    assert watcher.last_wake == 5.0
 
 
 @pytest.mark.smoke

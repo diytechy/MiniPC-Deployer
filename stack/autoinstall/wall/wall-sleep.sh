@@ -780,8 +780,25 @@ case "${1:-}" in
         fi
         log "touch witness observed a contact on the dark panel — restoring the backlight"
         rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
+        # CAPTURE the write's status. This script runs `set -u`, NOT `set -e`,
+        # so a discarded status here is a silent lie the whole way up: the arm
+        # would exit 0 on a backlight that never came on, the witness would
+        # take that as a completed wake and arm its 2 s rate limit against a
+        # panel that is still dark, and the journal would report a successful
+        # touch wake. backlight_set already READS THE LEVEL BACK, so its
+        # non-zero is the strongest evidence in this script that nothing
+        # happened — it must not be the one status that gets thrown away.
         backlight_set on
+        touch_wake_status=$?
+        # Release first, always: the next tap and the next occupancy tick both
+        # need the lock whether or not this write landed.
         power_lock_release
+        if [ "$touch_wake_status" -ne 0 ]; then
+            log "touch wake FAILED: the backlight did not come on (backlight_set exited"
+            log "$touch_wake_status; the WARNING above says which check refused)."
+            log "The tap is NOT recorded as a wake, so the witness will try again on the next contact."
+            exit "$touch_wake_status"
+        fi
         ;;
     *)
         echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake" >&2

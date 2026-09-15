@@ -820,7 +820,7 @@ pcm.card_loop_tap_cap { type hw
 # Subdevices 0 and 1 are taken by the merged bus and by the amplifier
 # detector's tap; the card has 4, so 2 is free and is the one to use. The
 # canceller writes the cancelled microphone into card_loop_mic_play and
-# `mic_clean` snoops it back out -- a dsnoop for the same reason speaker_tap
+# \`mic_clean\` snoops it back out -- a dsnoop for the same reason speaker_tap
 # and spdif_in are, because more than one consumer will want the microphone
 # and a raw open locks the rest out.
 pcm.card_loop_mic_play { type hw

@@ -2031,3 +2031,26 @@ checkout doc-navigability check passes. Registry integrity reports zero integrit
 errors and 23 existing orphans; no gate advancement is claimed. Full logs are
 in HomeHub/build/panel-followup-minipc-native-check-20260914.txt. No broad-suite
 green or hardware acceptance is claimed.
+
+
+2026-09-15 group D, Door broker lifecycle refusals (LLR-920). `wall-sleep.sh`'s
+two Door helpers no longer refuse silently. `start_door_broker` keeps every
+guard it had - an absent unit and unreadable `/run/wall-door-credentials/host`
+or `password` still start nothing, because display-on must never resurrect an
+older source - but each refusal now writes a warning naming the condition and
+the remedy, a successful start and a failed `systemctl start` are logged, and
+`stop_door_stream` logs a completed stop and warns on one that does not finish
+inside its seven-second ceiling. Credential FILE NAMES are logged; credential
+VALUES are not read anywhere in either helper. This closes the half of the
+2026-09-14 Door incident that lived in this repo: a credential purge followed
+by a wake left the broker down with nothing in the journal connecting the two,
+and the panel could observe only an absent listener. New row LLR-920 traced to
+SR-024 and TC-008; new smoke case
+`test_door_broker_refusals_are_logged_not_silent_llr920` in
+`tests/test_wall_occupancy.py`. `python scripts/check.py --tier smoke` in the
+worktree: config-validate PASS, unit-tests 159 passed / 3 skipped,
+registry-integrity 0 integrity errors and 24 orphans (unchanged from the
+baseline). doc-navigability FAILS in the worktree only, because the sibling
+`../HomeHub/...` links cannot resolve from `build/wt-d`; the same check passes
+in the original checkout. Branch `d-door`, local commit only, no push, no
+deployment, active gate unchanged. Group W rebases on this file.

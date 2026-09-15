@@ -107,6 +107,31 @@ def test_door_sampler_lifetime_follows_the_backlight_and_suspend_boundary_sr024(
 
 
 @pytest.mark.smoke
+def test_door_broker_refusals_are_logged_not_silent_llr920():
+    """LLR-920: display-on that cannot start the broker says so in the journal.
+
+    The 2026-09-14 Door incident was undiagnosable in part because this refusal
+    was a bare `return 0`: a credential purge followed by a wake left the broker
+    permanently down, the panel could see only an absent listener, and the system
+    journal held nothing at all connecting the two. The guard itself is unchanged
+    and must stay — display-on must never resurrect an older source — so what is
+    asserted here is that every exit from the helper is either a start or a
+    logged warning, and that nothing in it reads a credential VALUE.
+
+    Verifies: SR-024, LLR-920 (TC-008)
+    """
+    sleep = MODULE_PATH.with_name("wall-sleep.sh").read_text(encoding="utf-8")
+    helper = sleep[sleep.index("start_door_broker()") : sleep.index("# The LCUS-2")]
+    assert "WARNING door broker" in helper, "the unreadable-credential refusal is silent"
+    assert helper.count("log ") >= 3, "unit-absent, credentials and start failure each speak"
+    # The file names may be logged; their contents are the camera credential.
+    for reader in ("cat /run/wall-door-credentials", "$(< /run/wall-door-credentials"):
+        assert reader not in helper, "a credential value must never reach the journal"
+    stop = sleep[sleep.index("stop_door_stream()") : sleep.index("start_door_broker()")]
+    assert "WARNING door broker" in stop, "a wedged stop must be readable after the fact"
+
+
+@pytest.mark.smoke
 def test_absent_an_hour_outside_the_on_period_suspends_sr020():
     """State 1: the only combination in the whole table that suspends."""
     got = _decide(minute_of_day=MIDNIGHT_THIRTY, presence=occ.ABSENT,

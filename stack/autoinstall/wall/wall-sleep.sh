@@ -160,15 +160,35 @@ stop_door_stream() {
     systemctl cat wall-door-stream.service >/dev/null 2>&1 || return 0
     # The unit owns a five-second child teardown; this outer ceiling also covers
     # a wedged systemd transaction. Failure keeps the lit/reachable state.
-    timeout 7 systemctl stop wall-door-stream.service >/dev/null 2>&1
+    if ! timeout 7 systemctl stop wall-door-stream.service >/dev/null 2>&1; then
+        log "WARNING door broker: stop did not complete within 7s"
+        return 1
+    fi
+    log "door broker: stopped"
 }
 start_door_broker() {
-    systemctl cat wall-door-stream.service >/dev/null 2>&1 || return 0
+    if ! systemctl cat wall-door-stream.service >/dev/null 2>&1; then
+        log "door broker: unit is not installed; display-on starts nothing"
+        return 0
+    fi
     # Firstboot owns the volatile Door-only credential set. If current config
     # was removed or rejected, display-on must not resurrect an older source.
-    [ -r /run/wall-door-credentials/host ] || return 0
-    [ -r /run/wall-door-credentials/password ] || return 0
-    systemctl start wall-door-stream.service >/dev/null 2>&1
+    #
+    # D5, 2026-09-15. The refusal itself is unchanged and correct; what changed
+    # is that it used to be SILENT. A credential purge followed by a wake left
+    # the broker permanently down with nothing in the journal saying why, and
+    # the panel's Door tab could then only report an absent listener without
+    # ever being able to explain it. The file names are logged; their CONTENTS
+    # are the camera credential and are never read here.
+    if [ ! -r /run/wall-door-credentials/host ] || [ ! -r /run/wall-door-credentials/password ]; then
+        log "WARNING door broker: /run/wall-door-credentials/{host,password} unreadable; not started (re-run firstboot credential provisioning)"
+        return 0
+    fi
+    if ! systemctl start wall-door-stream.service >/dev/null 2>&1; then
+        log "WARNING door broker: systemctl start wall-door-stream.service failed"
+        return 0
+    fi
+    log "door broker: started"
 }
 
 # The LCUS-2 retains an energized relay after its serial port closes. The

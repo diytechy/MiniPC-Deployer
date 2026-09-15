@@ -18,7 +18,7 @@ Usage:
   wall-audio-output status
   wall-audio-output set {mute|headset|speaker}
   wall-audio-output input-mute {on|off}
-  wall-audio-output volume {0..100|up|down}
+  wall-audio-output volume {0..100|up|down|up:PCT|down:PCT|snap:PCT}
   wall-audio-output headset {add|remove} [--boot|--runtime]
   wall-audio-output apply-state              # re-assert the stored state (boot, resume)
   wall-audio-output apply-request [PATH]     # one broker request, deduplicated
@@ -1820,6 +1820,20 @@ def event_from_arguments(arguments):
     if arguments.command == "volume":
         if arguments.value in ("up", "down"):
             return {"kind": "nudge_volume", "louder": arguments.value == "up"}
+        # `up:PCT` / `down:PCT` -- one rocker movement of a stated size. It is
+        # spelled as a SUFFIX ON THE DIRECTION, not a second argument, so that
+        # it stays one `value` token and the privileged broker keeps passing a
+        # fixed-length argv it fully controls. See _nudge_volume for why a
+        # magnitude is needed at all.
+        if ":" in arguments.value:
+            direction, _, size = arguments.value.partition(":")
+            # `snap:PCT` -- round to the nearest multiple and settle there. The
+            # rocker sends one when the Owner lets go, so the level lands on a
+            # round number without the ramp itself being quantised.
+            if direction == "snap":
+                return {"kind": "snap_volume", "to": int(size)}
+            return {"kind": "nudge_volume", "louder": direction == "up",
+                    "step": int(size)}
         return {"kind": "set_volume", "level": int(arguments.value)}
     if arguments.command == "headset":
         return headset_event(arguments.value == "add", forced_boot=arguments.boot,
@@ -1827,8 +1841,30 @@ def event_from_arguments(arguments):
     return None
 
 
+def _volume_value_is_valid(value):
+    """True for the four accepted spellings of a volume argument.
+
+    `0..100` absolute, `up`/`down` for one default press, and `up:PCT`/
+    `down:PCT` for a movement of a stated size. PCT is validated HERE as well
+    as in the state layer: this is the boundary a human or the broker types at,
+    and argparse refusing it produces a usage message, where the state layer
+    raising StateError produces a traceback-shaped failure instead.
+    """
+    if value in ("up", "down"):
+        return True
+    if value.isdigit():
+        return 0 <= int(value) <= 100
+    direction, separator, size = value.partition(":")
+    if not separator or direction not in ("up", "down", "snap"):
+        return False
+    # isdigit() alone would accept "up:007" and unicode digits; both are fine
+    # arithmetically, but the range check is what actually matters.
+    return size.isdigit() and 1 <= int(size) <= 100
+
+
 ALLOWED_REQUEST_KINDS = frozenset(
-    {"set_output", "set_input_mute", "set_volume", "nudge_volume"})
+    {"set_output", "set_input_mute", "set_volume", "nudge_volume",
+     "snap_volume"})
 
 
 def read_request(path, last_seq=-1, generation=None, epoch_vouched=True):
@@ -1982,9 +2018,9 @@ def main(argv=None):
             parser.error("%s takes one of %s"
                          % (arguments.command, "|".join(expects_value[arguments.command])))
     if arguments.command == "volume":
-        if arguments.value is None or (arguments.value not in ("up", "down")
-                                       and not arguments.value.isdigit()):
-            parser.error("volume takes 0..100, up or down")
+        if arguments.value is None or not _volume_value_is_valid(arguments.value):
+            parser.error("volume takes 0..100, up, down, up:PCT, down:PCT "
+                         "or snap:PCT")
 
     if arguments.command == "mic-allowed":
         # Read-only and LOCK-FREE, like `status`: it is asked by both mic units'

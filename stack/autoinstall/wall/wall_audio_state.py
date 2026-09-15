@@ -33,6 +33,9 @@ VOLUME_MIN, VOLUME_MAX = 0, 100
 # 0..197 steps, so that it means the same thing on the headset card, whose own
 # control has 38 (both measured on the panel 2026-09-13).
 VOLUME_STEP = 4
+# What the level lands on when the rocker is released (Owner, 2026-09-15). The
+# ramp itself is not quantised -- only the resting place is. See _snap_volume.
+VOLUME_SNAP = 5
 
 # ── the mic legs (step 4, item 23 C / D3 / D4) ─────────────────────────────
 # The two capture devices this panel can select between, named as the ALSA PCMs
@@ -366,7 +369,12 @@ def apply_event(state, event):
                  "set_output"     {"output": one of OUTPUTS}
                  "set_input_mute" {"muted": bool}
                  "set_volume"     {"level": int}    -- absolute percent, clamped
-                 "nudge_volume"   {"louder": bool}  -- one rocker press
+                 "nudge_volume"   {"louder": bool, "step": int optional}
+                                  -- a rocker movement; "step" is its size in
+                                  percent, defaulting to VOLUME_STEP (one press)
+                 "snap_volume"    {"to": int optional} -- round the level to the
+                                  nearest multiple of "to" (default VOLUME_SNAP);
+                                  sent once when the rocker is released
                  "headset"        {"present": bool}}
     Outputs: (new_state, lines)
     Raises:  StateError if the event is unknown or malformed
@@ -460,9 +468,50 @@ def _nudge_volume(state, event):
     louder = event.get("louder")
     if not isinstance(louder, bool):
         raise StateError("louder must be boolean")
+    # OPTIONAL MAGNITUDE, defaulting to the historic single press. The rocker
+    # daemon needs this because ONE APPLY COSTS ABOUT HALF A SECOND end to end
+    # (measured 2026-09-15: 498-551 ms for a socket round trip through the
+    # Accept=yes unit). A ramp built from fixed VOLUME_STEP presses therefore
+    # cannot exceed ~8%/s no matter how fast the key repeats, and every press
+    # beyond that rate just queues -- which is exactly the bug this parameter
+    # exists to fix (the level kept falling for tens of seconds after release
+    # while the backlog drained). Sizing ONE request by the time actually held
+    # keeps the ramp on its 25%/s promise with ~2 applies a second.
+    step = event.get("step", VOLUME_STEP)
+    if isinstance(step, bool) or not isinstance(step, int):
+        raise StateError("step must be an integer percentage")
+    if not 1 <= step <= VOLUME_MAX:
+        raise StateError("step must be 1..%d" % VOLUME_MAX)
     state["volume_event_seq"] = (state["volume_event_seq"] + 1) % 9007199254740992
-    step = VOLUME_STEP if louder else -VOLUME_STEP
-    return _store_volume(state, clamp_volume(volume_of(state) + step))
+    delta = step if louder else -step
+    return _store_volume(state, clamp_volume(volume_of(state) + delta))
+
+
+def _snap_volume(state, event):
+    """Round the level to the nearest multiple of `to`, and stop there.
+
+    The rocker sent one of these when the Owner let go (Owner ruling,
+    2026-09-15: "I'd like the volume to land at / round to 5% increments after
+    a release"). It runs ONCE per gesture, at the end -- NOT on every ramp step.
+    Rounding each step instead would be both lumpy and inaccurate: steps are
+    sized by time held, about 13% at a time, and rounding each one to 5% can err
+    by 2.5% twice a second, which over a 3 s hold is a 15% drift from the rate
+    the ramp promises. Snapping only at the end keeps the ramp exact and still
+    lands on a round number.
+
+    Nearest, not "further in the direction travelled": after the first gesture
+    the level is already on the grid, so every later tap moves exactly one
+    increment and the choice stops mattering. Nearest only shows up once, when
+    coming from an off-grid level, and there it is the smaller surprise.
+    """
+    to = event.get("to", VOLUME_SNAP)
+    if isinstance(to, bool) or not isinstance(to, int):
+        raise StateError("snap increment must be an integer")
+    if not 1 <= to <= VOLUME_MAX:
+        raise StateError("snap increment must be 1..%d" % VOLUME_MAX)
+    state["volume_event_seq"] = (state["volume_event_seq"] + 1) % 9007199254740992
+    level = volume_of(state)
+    return _store_volume(state, clamp_volume(int(round(level / float(to))) * to))
 
 
 def _store_volume(state, level):
@@ -575,6 +624,7 @@ _HANDLERS = {
     "set_input_mute": _set_input_mute,
     "set_volume": _set_volume,
     "nudge_volume": _nudge_volume,
+    "snap_volume": _snap_volume,
     "headset": _headset,
 }
 

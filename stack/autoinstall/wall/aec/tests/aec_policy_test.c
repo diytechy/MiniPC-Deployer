@@ -417,6 +417,25 @@ static void test_drift_admission(void)
     aec_policy_drift(&policy, 4000, 3.0, AEC_DRIFT_LONG_WINDOW_MS, true, true,
                      AEC_DRIFT_LONG_ACCURACY_NS, true);
     ok(policy.drift_state == AEC_DRIFT_MEASURING, "but 2500 ns over 100 s does");
+
+    /* A NON-FINITE SLIP. The shell divides by driver-supplied timestamp deltas
+     * that are not guaranteed to advance, so an infinity or a NaN can reach
+     * here; carrying one into the int32_t ratio and on into
+     * speex_resampler_set_rate_frac() is undefined behaviour. Every other
+     * admission rule in this function is about a number that is merely
+     * untrustworthy -- this one is about a number that is not a number.
+     * (terra 2026-09-14, finding 2.) */
+    const double every_admission_rule_passes[] = { INFINITY, -INFINITY, NAN };
+    for (size_t i = 0; i < sizeof every_admission_rule_passes / sizeof *every_admission_rule_passes; i++) {
+        aec_policy_init(&policy, &profile, 0);
+        aec_decision decision = aec_policy_drift(&policy, 4000, every_admission_rule_passes[i],
+                                                 AEC_DRIFT_WINDOW_MS, true, true,
+                                                 AEC_DRIFT_ACCURACY_NS, true);
+        ok(policy.drift_state == AEC_DRIFT_UNMEASURABLE,
+           "a non-finite slip is unmeasurable, not a drift figure");
+        ok(decision.action == AEC_ACTION_NONE,
+           "and it never reaches the resampler");
+    }
 }
 
 static void test_drift_controller(void)

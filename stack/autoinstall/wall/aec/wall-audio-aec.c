@@ -558,7 +558,18 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
         }
         if (retry_now >= mute_poll_ms) {
             mute_poll_ms = retry_now + MUTE_POLL_MS;
+            bool was_muted = input_muted;
             input_muted = read_input_muted(mute_name);
+            /* A MUTE TRANSITION IS PUBLISHED AT ONCE, not on the ten-second
+             * status cadence (terra 2026-09-14, finding 4). The renderer's ring
+             * is already gated on the applier's switch state, so nothing draws
+             * a live ring over a muted microphone either way -- but leaving the
+             * published block saying `live` for up to ten seconds after the mic
+             * legs stopped is a level that is not true of anything, and any
+             * later consumer of that block would inherit the lie. */
+            if (input_muted != was_muted) {
+                engine->status_due_ms = 0;
+            }
         }
         snd_pcm_sframes_t got = snd_pcm_readi(mic_pcm, mic, AEC_FRAME_SIZE);
         if (got < 0) {
@@ -611,18 +622,48 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
 
         int64_t now_ms = monotonic_ms();
         engine_block(engine, mic, out, tap_present, input_muted, now_ms);
-        snd_pcm_sframes_t wrote = snd_pcm_writei(out_pcm, out, AEC_FRAME_SIZE);
-        if (wrote < 0) { snd_pcm_recover(out_pcm, (int)wrote, 1); }
+        /* A SHORT WRITE IS NOT A SUCCESS. snd_pcm_writei() may return fewer
+         * frames than it was given; dropping the tail silently punches a hole
+         * in mic_clean and moves the echo path's timing out from under the
+         * filter, with nothing recorded anywhere (terra 2026-09-14, finding 3).
+         * Push the remainder, and treat a stream that will not take it as the
+         * xrun it is so the alignment is re-derived rather than assumed. */
+        for (snd_pcm_uframes_t done = 0; done < AEC_FRAME_SIZE; ) {
+            snd_pcm_sframes_t wrote = snd_pcm_writei(out_pcm, out + done,   /* mono */
+                                                     AEC_FRAME_SIZE - done);
+            if (wrote < 0) {
+                if (snd_pcm_recover(out_pcm, (int)wrote, 1) < 0) break;
+                aec_policy_xrun(&engine->policy, now_ms);
+                tap_base.usable = mic_base.usable = false;
+                break;
+            }
+            if (wrote == 0) break;   /* nothing is moving; the next block retries */
+            done += (snd_pcm_uframes_t)wrote;
+        }
 
         if (tap_pcm && now_ms >= drift_due_ms) {
             stream_clock tap_now = read_clock(tap_pcm);
             stream_clock mic_now = read_clock(mic_pcm);
-            if (tap_base.usable && mic_base.usable) {
-                double tap_ratio = (tap_now.audio_seconds - tap_base.audio_seconds) /
-                                   (tap_now.system_seconds - tap_base.system_seconds);
-                double mic_ratio = (mic_now.audio_seconds - mic_base.audio_seconds) /
-                                   (mic_now.system_seconds - mic_base.system_seconds);
-                double slip_ppm = (tap_ratio / mic_ratio - 1.0) * 1e6;
+            /* THE DENOMINATORS ARE NOT GUARANTEED TO ADVANCE. A driver that
+             * reports the same system timestamp twice, or a clock that does not
+             * move between two reads, divides by zero here; mic_ratio can also
+             * come out at zero and divide again. The result is an infinity or a
+             * NaN that aec_policy_drift() would carry into an int32_t ratio and
+             * on into speex_resampler_set_rate_frac() (terra 2026-09-14,
+             * finding 2). Unmeasurable drift is UNMEASURABLE, not zero: the
+             * window is simply skipped and the baseline re-taken below. */
+            double tap_system = tap_now.system_seconds - tap_base.system_seconds;
+            double mic_system = mic_now.system_seconds - mic_base.system_seconds;
+            double tap_ratio = tap_system > 0.0
+                ? (tap_now.audio_seconds - tap_base.audio_seconds) / tap_system : 0.0;
+            double mic_ratio = mic_system > 0.0
+                ? (mic_now.audio_seconds - mic_base.audio_seconds) / mic_system : 0.0;
+            double slip_ppm = (tap_ratio / mic_ratio - 1.0) * 1e6;
+            bool drift_measurable = tap_base.usable && mic_base.usable
+                && tap_system > 0.0 && mic_system > 0.0
+                && isfinite(tap_ratio) && isfinite(mic_ratio) && mic_ratio > 0.0
+                && isfinite(slip_ppm);
+            if (drift_measurable) {
                 int64_t accuracy = tap_now.accuracy_ns > mic_now.accuracy_ns
                     ? tap_now.accuracy_ns : mic_now.accuracy_ns;
                 aec_decision decision = aec_policy_drift(

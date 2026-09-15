@@ -61,7 +61,18 @@ a ProjectM measurement.
 4. Every later run without `--refresh` reproduces from the lock under
    `--require-hashes` semantics: same bytes or a hard failure.
 
-Installed location on the panel: `/opt/wall-panel/projectm-presets/`, owner
-`root:root`, directories `0755`, files `0644`. The renderer reads them through
-the hub-served site like any other payload asset; nothing on the panel executes
-them.
+## The install transaction does not exist yet (SR-031, LLR-019)
+
+**Nothing installs this payload today.** Neither `wall-firstboot.sh` nor
+`user-data` stages, copies or verifies it, so the intended location below is a
+PROPOSAL, not a description of the panel. That is currently harmless because the
+lock is empty by design and the renderer is built to run presetless -- but it
+means the day the Owner rules a pack in, the payload would be reproduced into
+`.out-wall/` and go no further, silently. Building the install step is open D
+release-lane work and is recorded as SR-031 / LLR-019 / TC-016. Found by the
+integrated terra review, 2026-09-14, finding 5.
+
+Intended location on the panel, once that step exists:
+`/opt/wall-panel/projectm-presets/`, owner `root:root`, directories `0755`,
+files `0644`. The renderer would read them through the hub-served site like any
+other payload asset; nothing on the panel executes them.

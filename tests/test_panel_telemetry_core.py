@@ -350,3 +350,35 @@ def test_presentation_snapshot_lives_in_a_renderer_writable_directory():
     # /run/wall-panel, which holds the AEC input-mute file and the epoch marker.
     assert "d /run/wall-panel-renderer 0755 panel panel" in firstboot
     assert "/run/wall-panel/presentation-snapshot.json" not in unit + collector
+
+
+def test_firstboot_actually_activates_the_telemetry_unit():
+    """Installing the unit file is not the same as having the collector run.
+
+    Terra 2026-09-14 (finding 7) was right that these are source-text checks and
+    not a firstboot harness -- building one is open D-lane work. What they CAN
+    do cheaply is stop covering only the copy: the copy is what 49b0703 added,
+    but a daemon-reload that is dropped, an enable that is removed, or a
+    payload-completeness guard that is loosened would each leave a panel where
+    every file is present and nothing is sampling, which is exactly the shape of
+    the failure 49b0703 was fixing.
+    """
+    firstboot = _read("wall-firstboot.sh")
+    unit = "wall-panel-telemetry.service"
+    assert "systemctl daemon-reload" in firstboot, (
+        "a unit file written without a daemon-reload is not loaded until the next boot"
+    )
+    assert "enable_unit_now" in firstboot and unit in firstboot, (
+        "the unit must be enabled AND started, not merely installed"
+    )
+    # The guard that refuses to mark the panel provisioned on an incomplete
+    # payload. Without it the collector is quietly disabled and step 8e passes.
+    assert "Panel telemetry payload is incomplete" in firstboot
+    assert "fail_step" in firstboot
+    # And the tmpfiles rule is CREATED in this run, not only written for the
+    # next boot -- the kiosk session can already be up when firstboot runs.
+    assert "systemd-tmpfiles --create /etc/tmpfiles.d/wall-panel-renderer.conf" in firstboot
+    # /run/wall-panel must NOT be widened to solve the renderer's write: it
+    # holds the AEC input-mute file and the applier's epoch marker.
+    assert "chmod 0777 /run/wall-panel" not in firstboot
+    assert "d /run/wall-panel 0755 panel panel" not in firstboot

@@ -343,7 +343,15 @@ aec_decision aec_policy_drift(aec_policy *policy, int64_t now_ms, double slip_pp
      * accuracy field is MEANINGLESS, so it has to be checked before the number
      * it guards is used at all -- a driver that reports garbage accuracy would
      * otherwise pass a rule written to keep it out. */
-    bool admissible = valid && accuracy_reported && link_timestamps && window_ms > 0;
+    /* A NON-FINITE SLIP IS UNMEASURABLE, NOT ZERO, AND NOT A LARGE NUMBER.
+     * The shell derives slip_ppm from two divisions whose denominators are
+     * driver-supplied timestamp deltas; it guards them, but this core is the
+     * one that hands a figure to speex_resampler_set_rate_frac() through an
+     * int32_t, and casting an infinity or a NaN to int32_t is undefined. The
+     * guard therefore lives on BOTH sides of the seam (terra 2026-09-14,
+     * finding 2), so no future caller can reintroduce it from the outside. */
+    bool admissible = valid && accuracy_reported && link_timestamps && window_ms > 0
+        && isfinite(slip_ppm);
     if (admissible) {
         /* 4a nanoseconds over T milliseconds, expressed in ppm:
          *   4a[ns] / (T[ms] * 1e6 ns/ms) is a fraction; * 1e6 makes it ppm.

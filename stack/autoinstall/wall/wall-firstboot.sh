@@ -97,6 +97,26 @@ fail_step() {   # MESSAGE...
     echo "[wall-firstboot] ERROR: $*" >&2
 }
 
+# wall_camera_option_configured — true when THIS panel's wall.env enables any
+# camera-related option (Item M, 2026-09-15 Owner ruling). Mirrored BY HAND in
+# vmtest/lib/common.sh's build-time copy of this predicate — that one reads a
+# staged deploy-payload/site/wall.env before the image exists; this one reads
+# the already-sourced $ENV_FILE on the running panel. No shared shell module
+# reaches both a build-time script and a boot-time one, so keep them in sync.
+#
+# Any of the following counts:
+#   WALL_ACCESS_MODE=local        local access needs the panel's own sensing
+#   WALL_CAMERA_ENABLED=true      (TRUE/yes/1 also count, same as elsewhere)
+#   WALL_CAMERA_DEVICE=<anything> a camera node is explicitly configured
+wall_camera_option_configured() {
+    [ "${WALL_ACCESS_MODE:-gateway}" = "local" ] && return 0
+    case "${WALL_CAMERA_ENABLED:-false}" in
+        true|TRUE|yes|1) return 0 ;;
+    esac
+    grep -qE '^[[:space:]]*WALL_CAMERA_DEVICE=[^[:space:]#][^[:space:]]*' "$ENV_FILE" 2>/dev/null && return 0
+    return 1
+}
+
 # enable_unit SUCCESS_LINE UNIT... — enable units and JUDGE the result.
 # The success line is the caller's, because only the caller knows what the
 # enablement means on the wall; it is printed if and only if enable succeeded.
@@ -538,6 +558,14 @@ if [ -d "$SENSOR_WHEELHOUSE" ]; then
     sensor_args=(--wheelhouse "$SENSOR_WHEELHOUSE")
     if [ -d "$SENSOR_MODELS" ] && [ -f "$SENSOR_MODELS/manifest.json" ]; then
         sensor_args+=(--models "$SENSOR_MODELS" --model-manifest "$SENSOR_MODELS/manifest.json")
+    elif wall_camera_option_configured; then
+        # Item M, 2026-09-15 Owner ruling: the bundle is a DEPENDENCY of any
+        # camera-related option, not a separate optional package. Mirrors the
+        # SENSOR_WHEELHOUSE else-branch below: a configured-but-missing input
+        # is a fail_step, not a silent degrade, because "face reads
+        # not-ready forever" is otherwise indistinguishable from "face is
+        # still enrolling" until someone reads the sensor's own status.
+        fail_step "sensors: wall.env enables a camera-related option (WALL_ACCESS_MODE=local, WALL_CAMERA_ENABLED=true, or WALL_CAMERA_DEVICE set) but $SENSOR_MODELS is absent or incomplete (needs manifest.json + det_10g.onnx + w600k_r50.onnx). Face-shape presence and face unlock will never become ready. The image build stages this from WALL_SENSOR_MODELS (stack/autoinstall/wall/sensor-models/README.md); PIN, Bluetooth and motion presence remain available."
     fi
     if "$PAYLOAD/install-wall-capabilities.sh" "${sensor_args[@]}"; then
         log "sensors: gateway-independent runtime installed and protocol verified"

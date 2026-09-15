@@ -2177,6 +2177,25 @@ stage_wall_shell_into_payload() {
     log "  -> lands at /opt/wall-panel/wall-app/; user-data late-command 3b untars it to /opt/wall-panel/app/."
 }
 
+# wall_camera_option_configured WALL_ENV_FILE — true when the rendered
+# wall.env enables any camera-related option (Item M, 2026-09-15 Owner
+# ruling). Mirrored BY HAND in wall-firstboot.sh's own copy of this predicate
+# (its runtime is the panel's own /etc/wall-panel/wall.env, not a build-time
+# staged copy, so no shared shell module reaches both). Keep the two in sync.
+#
+# Any of the following counts:
+#   WALL_ACCESS_MODE=local        local access needs the panel's own sensing
+#   WALL_CAMERA_ENABLED=true      (TRUE/yes/1 also count, same as elsewhere)
+#   WALL_CAMERA_DEVICE=<anything> a camera node is explicitly configured
+wall_camera_option_configured() {
+    local env_file="$1"
+    [ -f "$env_file" ] || return 1
+    grep -qE '^[[:space:]]*WALL_ACCESS_MODE=[[:space:]]*local[[:space:]]*(#.*)?$' "$env_file" && return 0
+    grep -qE '^[[:space:]]*WALL_CAMERA_ENABLED=[[:space:]]*(true|TRUE|yes|1)[[:space:]]*(#.*)?$' "$env_file" && return 0
+    grep -qE '^[[:space:]]*WALL_CAMERA_DEVICE=[^[:space:]#][^[:space:]]*' "$env_file" && return 0
+    return 1
+}
+
 # stage_wall_sensors_into_payload OUT_DIR — carry the verified local runtime on
 # every complete panel image, independently of whether a gateway is configured.
 stage_wall_sensors_into_payload() {
@@ -2199,14 +2218,40 @@ stage_wall_sensors_into_payload() {
     cp -a "$source/." "$destination/"
     log "deploy-payload/sensor-wheelhouse = verified offline local sensor runtime"
 
+    # ── face model bundle (Item M, 2026-09-15 Owner ruling) ─────────────────
+    # The bundle is a DEPENDENCY of any camera-related option, not a separate
+    # optional package: an image built with a camera option on and no bundle
+    # used to boot with face features permanently unready and nothing said so
+    # until someone read the sensor's own runtime status. The predicate reads
+    # the SAME rendered wall.env the panel itself will boot from
+    # (deploy-payload/site/wall.env, staged by render_wall_seed_tree before
+    # this function runs), so the build-time decision matches what the panel
+    # will actually do at firstboot.
+    local reviewed_manifest="$out_dir/iso-root/deploy-payload/stack/autoinstall/wall/sensor-models/manifest.json"
+    local wall_env="$out_dir/iso-root/deploy-payload/site/wall.env"
+    local camera_configured=0
+    wall_camera_option_configured "$wall_env" && camera_configured=1
+
     if [ -n "${WALL_SENSOR_MODELS:-}" ]; then
         [ -d "$WALL_SENSOR_MODELS" ] || die "WALL_SENSOR_MODELS is not a directory"
-        [ -f "$WALL_SENSOR_MODELS/manifest.json" ] || die "WALL_SENSOR_MODELS has no manifest.json"
+        python3 "$out_dir/iso-root/deploy-payload/stack/autoinstall/wall/check-sensor-models.py" \
+            --expect "$reviewed_manifest" "$WALL_SENSOR_MODELS" \
+            || die "face model bundle at WALL_SENSOR_MODELS does not match the reviewed manifest" \
+                   "$reviewed_manifest (digest mismatch, missing file, or a hand-edited manifest.json)."
         mkdir -p "$out_dir/iso-root/deploy-payload/sensor-models"
         cp -a "$WALL_SENSOR_MODELS/." "$out_dir/iso-root/deploy-payload/sensor-models/"
-        log "deploy-payload/sensor-models = private model bundle (installer verifies manifest before use)"
+        log "deploy-payload/sensor-models = verified face model bundle (det_10g.onnx, w600k_r50.onnx)"
+    elif [ "$camera_configured" -eq 1 ]; then
+        die "wall.env enables a camera-related option (WALL_ACCESS_MODE=local, WALL_CAMERA_ENABLED=true," \
+            "or WALL_CAMERA_DEVICE set) but no face model bundle was supplied (WALL_SENSOR_MODELS unset)." \
+            "Face-shape presence and face unlock can never become ready without it; this build refuses" \
+            "to produce an image whose face features silently can never work." \
+            "Set WALL_SENSOR_MODELS=DIR to a reviewed local input holding det_10g.onnx, w600k_r50.onnx" \
+            "and a manifest.json byte-identical to stack/autoinstall/wall/sensor-models/manifest.json" \
+            "(see stack/autoinstall/wall/sensor-models/README.md)."
     else
-        log "sensor models absent — face remains unavailable; motion/Bluetooth/PIN remain usable"
+        log "sensor models absent — no camera-related option configured, so this is NOT an error;" \
+            "face remains unavailable; motion/Bluetooth/PIN remain usable"
     fi
 }
 

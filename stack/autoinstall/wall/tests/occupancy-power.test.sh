@@ -131,6 +131,10 @@ EOF
 cat > "$BIN/rtcwake" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "\$RTCWAKE_LOG"
+# RTCWAKE_HOOK — a script run from INSIDE suspend_now, after the decision was
+# taken and before the last look. It is how A24 puts a real touch wake into the
+# decide-and-act window at a deterministic instant instead of racing a sleep.
+[ -n "\${RTCWAKE_HOOK:-}" ] && "\$RTCWAKE_HOOK"
 [ -n "\${RTCWAKE_FAIL:-}" ] && exit 1
 if [ -z "\${RTCWAKE_SILENT_NOOP:-}" ] && [ -n "\${FAKE_RTC_DIR:-}" ]; then
     epoch=""; frame="-u"
@@ -215,7 +219,7 @@ scenario() {
     FAKE_RTC_DIR="$ROOT/sys/class/rtc"
     AMP_SAFE_STATE="$ROOT/run/wall-amp-trigger/off-verified"
     export SYSTEMCTL_LOG RTCWAKE_LOG PY3_LOG FAKE_RTC_DIR AMP_SAFE_STATE
-    unset RTCWAKE_FAIL RTCWAKE_SILENT_NOOP FAKE_LOCAL_RTC FAKE_NOW FAKE_NO_TIMEDATECTL
+    unset RTCWAKE_FAIL RTCWAKE_SILENT_NOOP FAKE_LOCAL_RTC FAKE_NOW FAKE_NO_TIMEDATECTL RTCWAKE_HOOK
     unset SYSTEMCTL_STOP_FAIL SYSTEMCTL_STOP_SLEEP SYSTEMCTL_AMP_STOP_FAIL
     ENV_FILE="$ROOT/etc/wall.env"
     PRESENCE_FILE="$ROOT/run/presence.json"
@@ -517,18 +521,152 @@ power_writers() {
 # They are admitted BY NAME and only while they stay provably read-only: the
 # second assertion below fails the moment either one grows a write to a power
 # node, so the one-writer property is tightened here, not relaxed.
-POWER_NODE_WRITES='(>>?|tee[[:space:]]+)[[:space:]]*"?[^"[:space:]|]*/sys/(class/backlight|power)|write_text\([^)]*brightness|open\([^)]*/sys/'
-readonly_power_reader() {  # FILE — echoes the basename if it WRITES a power node
-    if sed -e 's/^[[:space:]]*#.*$//' "$1" 2>/dev/null | grep -E "$POWER_NODE_WRITES" >/dev/null; then
-        basename "$1"
-    fi
+#
+# The admission is STRUCTURAL, not a line regex. A regex over source lines is
+# bypassed by any spelling it did not anticipate — `(base / "brightness")
+# .write_text("0")` walks past a pattern that expected a redirect or a literal
+# /sys path — so the Python file is parsed and its syntax tree is walked: every
+# call that can WRITE (write_text/write_bytes/write/writelines/truncate/
+# unlink/mkdir/touch/rename/replace/chmod, and open()/Path.open() in a writing
+# mode) is rejected if its own source mentions a power node OR mentions a name
+# that was assigned from one. The shell file is checked by its redirections:
+# every write target must be /dev/null.
+readonly_power_reader() {  # FILE... — prints one line per violation; silence passes
+    "$PY" - "$@" <<'PYEOF'
+import ast, re, sys
+
+KEYWORDS = ("backlight", "brightness", "/sys/power")
+WRITE_ATTRS = {"write_text", "write_bytes", "write", "writelines", "truncate",
+               "unlink", "mkdir", "touch", "rename", "replace", "chmod", "symlink_to"}
+WRITE_MODES = set("wax+")
+
+
+def mentions_power_node(text):
+    return any(word in text.lower() for word in KEYWORDS)
+
+
+def writing_mode(call):
+    """The mode string of an open()/Path.open() call, or None if it is a read."""
+    mode = ""
+    if call.args and len(call.args) > 1 and isinstance(call.args[1], ast.Constant):
+        mode = str(call.args[1].value)
+    for keyword in call.keywords:
+        if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+            mode = str(keyword.value.value)
+    return mode if set(mode) & WRITE_MODES else None
+
+
+def target_names(target):
+    """The names a single assignment target BINDS.
+
+    Deliberately NOT ast.walk: walking `self.backlight_root` also yields the
+    Name `self`, and tainting `self` makes every attribute of every object in
+    the file tainted on the next pass. The first draft of this audit did
+    exactly that and reported os.replace(temporary, path) as a backlight write.
+    """
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Attribute):
+        return [target.attr]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in target_names(element)]
+    return []
+
+
+def audit_python(path, source):
+    tree = ast.parse(source)
+    # Pass 1 — every name that was ASSIGNED from something naming a power node.
+    # This is what stops a write from hiding behind a local alias.
+    tainted = set()
+    for _ in range(3):  # a small fixed point: aliases of aliases
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = ast.get_source_segment(source, node.value) or ""
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if not (mentions_power_node(value)
+                    or any(re.search(r"\b%s\b" % re.escape(name), value) for name in tainted)):
+                continue
+            for target in targets:
+                tainted.update(name for name in target_names(target) if len(name) > 1)
+    # Parameters that DEFAULT to a power-node name carry the taint into the body.
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        positional = node.args.args[len(node.args.args) - len(node.args.defaults):]
+        pairs = list(zip(positional, node.args.defaults))
+        pairs += [(arg, default) for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults)
+                  if default is not None]
+        for arg, default in pairs:
+            segment = ast.get_source_segment(source, default) or ""
+            if mentions_power_node(segment) or segment.strip() in tainted:
+                tainted.add(arg.arg)
+    # Pass 2 — the writes themselves.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        segment = ast.get_source_segment(source, node) or ""
+        function = node.func
+        if isinstance(function, ast.Attribute) and function.attr == "open":
+            writes = writing_mode(node) is not None
+        elif isinstance(function, ast.Name) and function.id == "open":
+            writes = writing_mode(node) is not None
+        elif isinstance(function, ast.Attribute):
+            writes = function.attr in WRITE_ATTRS
+        else:
+            writes = False
+        if not writes:
+            continue
+        if (mentions_power_node(segment)
+                or any(re.search(r"\b%s\b" % re.escape(name), segment) for name in tainted)):
+            print("%s:%d writes a power node: %s"
+                  % (path, node.lineno, " ".join(segment.split())[:90]))
+
+
+def audit_shell(path, source):
+    stripped = re.sub(r"(?m)^\s*#.*$", "", source)
+    for match in re.finditer(r"(?:>>?|\btee\b|\bdd\b[^\n]*?\bof=)\s*(\"?[^\s\"|;&)]*)", stripped):
+        target = match.group(1).strip('"')
+        if target in ("/dev/null", "&1", "&2", "&-", ""):
+            continue
+        line = stripped[:match.start()].count("\n") + 1
+        print("%s:%d writes to %s; this file must only READ" % (path, line, target))
+
+
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as handle:
+        source = handle.read()
+    if path.endswith(".py"):
+        audit_python(path, source)
+    else:
+        audit_shell(path, source)
+PYEOF
 }
 eq "wall-local-setup.py wall-sleep.sh " "$(power_writers "$BACKLIGHT_MECHANISMS")" \
     "A11 only wall-sleep.sh changes the backlight; the witness only READS it"
 eq "wall-sleep.sh wall-touch-wakeup-report.sh " "$(power_writers "$SUSPEND_MECHANISMS")" \
     "A11 only wall-sleep.sh suspends; the wakeup report only READS the sleep nodes"
-eq "" "$(readonly_power_reader "$DIR/wall-local-setup.py")$(readonly_power_reader "$DIR/wall-touch-wakeup-report.sh")" \
-    "A11 neither admitted reader writes a backlight or sleep node"
+eq "" "$(readonly_power_reader "$DIR/wall-local-setup.py" "$DIR/wall-touch-wakeup-report.sh")" \
+    "A11 neither admitted reader writes a backlight or sleep node (AST + redirection audit)"
+# The audit is proven to BITE, not merely to pass: a planted write in each
+# spelling the old regex missed must be caught. A guard nobody has seen fail is
+# not a guard.
+PLANT="$TMP/plant"
+mkdir -p "$PLANT"
+cp "$DIR/wall-local-setup.py" "$PLANT/clean.py"
+{ cat "$DIR/wall-local-setup.py"; printf '\n\ndef _planted(base):\n    (base / "brightness").write_text("0")\n'; } > "$PLANT/aliased.py"
+{ cat "$DIR/wall-local-setup.py"; printf '\n\ndef _planted():\n    node = BACKLIGHT_ROOT / "x"\n    handle = node / "y"\n    handle.write_text("0")\n'; } > "$PLANT/indirect.py"
+{ cat "$DIR/wall-touch-wakeup-report.sh"; printf '\nprintf 0 > /sys/class/backlight/intel_backlight/brightness\n'; } > "$PLANT/writer.sh"
+eq "" "$(readonly_power_reader "$PLANT/clean.py")" "A11 the audit passes the real file unmodified"
+[ -n "$(readonly_power_reader "$PLANT/aliased.py")" ] \
+    && pass "A11 the audit catches a write spelled as (base / 'brightness').write_text" \
+    || fail "A11 the audit MISSED a (base / 'brightness').write_text — it is bypassable"
+[ -n "$(readonly_power_reader "$PLANT/indirect.py")" ] \
+    && pass "A11 the audit catches a write through a local alias of the backlight root" \
+    || fail "A11 the audit MISSED a write through an alias — it is bypassable"
+[ -n "$(readonly_power_reader "$PLANT/writer.sh")" ] \
+    && pass "A11 the audit catches a shell redirect into the backlight node" \
+    || fail "A11 the audit MISSED a shell redirect into the backlight node"
 # And at RUNTIME, not in the source: one tick, one decision. A second call would
 # be a second decision, which is the drift this block is built to prevent.
 scenario a11
@@ -893,6 +1031,83 @@ grep -q 'TOUCH_POWER_COMMAND = ("/usr/local/sbin/wall-sleep.sh", "touch-wake")' 
     "$DIR/wall-local-setup.py" \
     && pass "A23 the root helper's witness invokes the touch-wake arm by name" \
     || fail "A23 the root helper does not invoke touch-wake"
+
+# ── A24 (TC-913/LLR-913): a tap cannot land inside the decide-and-act window ──
+# THE DEFECT, found in review 2026-09-15. run_occupancy decides "go dark, then
+# sleep", writes brightness 0, and only THEN calls suspend_now. A tap arriving
+# in that window ran touch-wake from a different process, clearing the absence
+# clock and lighting the screen — and the occupancy process, still holding a
+# decision taken before the tap existed, suspended a LIT panel and took it off
+# the LAN in front of the person who had just touched it.
+#
+# The hook runs from inside suspend_now, so the interleaving is placed at an
+# exact instant rather than raced against a sleep.
+absence_scenario() {   # absence_scenario NAME — absent, outside the on-period, suspend due
+    scenario "$1"
+    write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" \
+              "SLEEP_END=$ONP_START" "SLEEP_START=$ONP_END" "WALL_ABSENCE_TIMEOUT_MIN=60"
+    presence absent
+    absent_for 61
+}
+
+# A24a: THE LOCK. The hook runs the REAL touch-wake arm as a second process
+# while the occupancy decision holds the lock. It must not get in.
+absence_scenario a24-lock
+cat > "$ROOT/tap.sh" <<EOF
+#!/usr/bin/env bash
+POWER_LOCK_WAIT=1 PANEL_POWER_TEST_ROOT="$ROOT" bash "$SCRIPT_UNDER_TEST" touch-wake \
+    > "$ROOT/tap.log" 2>&1
+printf '%s\n' "\$?" > "$ROOT/tap.status"
+EOF
+chmod +x "$ROOT/tap.sh"
+RTCWAKE_HOOK="$ROOT/tap.sh" run occupancy
+eq "75" "$(cat "$ROOT/tap.status" 2>/dev/null)" \
+    "A24 a tap inside the decide-and-act window is DECLINED, not silently served"
+grep -q 'touch wake DECLINED' "$ROOT/tap.log" \
+    && pass "A24 the declined tap says why, so the journal explains the dark second" \
+    || fail "A24 the declined tap journaled no reason"
+eq "0" "$(brightness)" "A24 the declined tap did NOT light a panel that was mid-suspend"
+eq "yes" "$(suspended)" "A24 the serialized decision still completed its suspend"
+[ -e "$ROOT/run/wall-occupancy/absent-since" ] \
+    && pass "A24 the declined tap did not clear the absence clock under the decider" \
+    || fail "A24 the declined tap cleared the absence clock anyway"
+
+# A24b: THE RE-CHECK, the guard that survives a box with no flock. The hook
+# lights the panel directly, exactly as a tap that got past the lock would.
+absence_scenario a24-recheck-lit
+cat > "$ROOT/tap.sh" <<EOF
+#!/usr/bin/env bash
+rm -f "$ROOT/run/wall-occupancy/absent-since"
+printf '100' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+EOF
+chmod +x "$ROOT/tap.sh"
+RTCWAKE_HOOK="$ROOT/tap.sh" run occupancy
+eq "no" "$(suspended)" "A24 a panel lit since the decision is NOT suspended"
+eq "100" "$(brightness)" "A24 ...and it is left lit and reachable, not re-darkened"
+grep -q 'NOT suspending: the backlight is lit again' "$ROOT/out.log" \
+    && pass "A24 the abort says the backlight came back, in the journal" \
+    || fail "A24 the abort was silent about the backlight"
+
+# A24c: the same guard on the absence clock alone — the wake landed and cleared
+# the clock even though the screen has not been re-read as lit yet.
+absence_scenario a24-recheck-clock
+cat > "$ROOT/tap.sh" <<EOF
+#!/usr/bin/env bash
+rm -f "$ROOT/run/wall-occupancy/absent-since"
+EOF
+chmod +x "$ROOT/tap.sh"
+RTCWAKE_HOOK="$ROOT/tap.sh" run occupancy
+eq "no" "$(suspended)" "A24 a cleared absence clock aborts the suspend it was the basis for"
+grep -q 'NOT suspending: the absence clock changed' "$ROOT/out.log" \
+    && pass "A24 the abort names the cleared clock" \
+    || fail "A24 the abort was silent about the clock"
+
+# A24d: the SCHEDULED path is untouched by all of this. It never claimed to dim
+# anything, so it has nothing to re-check and must still suspend a lit panel.
+scenario a24-scheduled
+write_env "SLEEP_MODE=suspend"
+run start
+eq "yes" "$(suspended)" "A24 the scheduled 22:00 suspend is unchanged by the wake guard"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

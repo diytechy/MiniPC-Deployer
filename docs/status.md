@@ -2051,3 +2051,24 @@ tap and is NOT measured (LLR-911 owns the constant); the S3 hardware-wake claim
 in WALL-BURN-IN.md is still unmeasured and `wall-touch-wakeup-report.sh`
 exists to settle it in the hardware window (LLR-914). No physical acceptance,
 no deployment and no gate advancement is claimed.
+
+2026-09-15 group W, Terra review round (same branch). Six findings fixed. The
+critical one was a real race, not a style point: `run_occupancy` decides, writes
+the backlight, and only then suspends, so a tap landing in that window cleared
+the absence clock and lit the screen while the occupancy process went on to
+suspend a lit panel. The decide-and-act window and the whole `touch-wake` arm
+are now serialized on one `flock` file, a tap that cannot get the lock is
+declined with exit 75 rather than served on a stale view, and `suspend_now`
+takes a last look under the lock — a backlight lit again, or an absence clock
+that no longer matches the stamp taken after the decision, aborts the suspend.
+The scheduled 22:00 path passes no guard and is unchanged. Also: `adaptive`
+creates no uinput device (only `filter` does), so it now targets the physical
+node and reports a held grab once on a long backoff instead of retrying a
+device that is never created; the live grab is PROBED rather than inferred from
+the persisted mode, so the witness falls back to the raw node while the daemon
+is restarting and returns to the virtual node afterwards; `select_input_device`
+closes every handle on every path; the node-loss test now runs the real loop
+end to end; and the A11 one-writer admission is a Python AST audit plus a
+shell-redirection audit rather than a line regex, with planted writes proving
+it bites. Counts after the round: `check.py --tier smoke` PASS, 176 passed / 3
+skipped; `occupancy-power.test.sh` 113 PASS 0 FAIL.

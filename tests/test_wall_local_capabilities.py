@@ -225,34 +225,68 @@ class FakeInfo:
 
 
 class FakeDevice:
-    """Enough evdev.InputDevice for identity selection; records its own close."""
+    """Enough evdev.InputDevice for identity selection, the grab probe and a read.
 
-    def __init__(self, path, name, vendor, product):
+    `held` models somebody else's EVIOCGRAB: grab() then raises, exactly as the
+    kernel refuses an exclusive grab that another file description holds.
+    `events` is replayed by read_loop(), which then raises `ends_with` so a node
+    that disappears mid-read is expressible.
+    """
+
+    def __init__(self, path, name, vendor, product, *, held=False, events=(),
+                 ends_with=None):
         self.path, self.name, self.info = path, name, FakeInfo(vendor, product)
         self.closed = False
+        self.held = held
+        self.events = list(events)
+        self.ends_with = ends_with
+        self.grabs = 0
+        self.ungrabs = 0
+
+    def grab(self):
+        self.grabs += 1
+        if self.held:
+            raise OSError(16, "Device or resource busy")
+
+    def ungrab(self):
+        self.ungrabs += 1
+
+    def read_loop(self):
+        for event in self.events:
+            yield event
+        raise self.ends_with if self.ends_with is not None else OSError(19, "No such device")
 
     def close(self):
         self.closed = True
 
 
 class FakeEvdev:
-    def __init__(self, devices):
+    """A device table that can also lose a node between listing and opening."""
+
+    def __init__(self, devices, vanish=()):
         self._devices = {device.path: device for device in devices}
+        self._vanish = set(vanish)
 
     def list_devices(self):
         return sorted(self._devices)
 
     def InputDevice(self, path):  # noqa: N802 - mirrors the real evdev API
+        if path in self._vanish:
+            raise OSError(19, "No such device")
         return self._devices[path]
 
+    def opened(self):
+        return list(self._devices.values())
 
-def physical_device(path="/dev/input/event5"):
-    return FakeDevice(path, TOUCH_CONFIG["name"], TOUCH_CONFIG["vendor"], TOUCH_CONFIG["product"])
+
+def physical_device(path="/dev/input/event5", **kwargs):
+    return FakeDevice(path, TOUCH_CONFIG["name"], TOUCH_CONFIG["vendor"],
+                      TOUCH_CONFIG["product"], **kwargs)
 
 
-def virtual_device(path="/dev/input/event9"):
-    return FakeDevice(path, SETUP.TOUCH_VIRTUAL_NAME,
-                      SETUP.TOUCH_VIRTUAL_VENDOR, SETUP.TOUCH_VIRTUAL_PRODUCT)
+def virtual_device(path="/dev/input/event9", **kwargs):
+    return FakeDevice(path, SETUP.TOUCH_VIRTUAL_NAME, SETUP.TOUCH_VIRTUAL_VENDOR,
+                      SETUP.TOUCH_VIRTUAL_PRODUCT, **kwargs)
 
 
 def backlight(tmp_path, brightness, maximum=100, name="intel_backlight"):
@@ -280,7 +314,7 @@ class SpyHelper:
 
 
 def witness(tmp_path, *, brightness=0, config=TOUCH_CONFIG, devices=(), clock=None,
-            helper=None):
+            helper=None, vanish=(), evdev=None, log=None, sleep=None):
     path = tmp_path / "touch-filter.json"
     if config is not None:
         path.write_text(json.dumps(config), encoding="utf-8")
@@ -289,43 +323,131 @@ def witness(tmp_path, *, brightness=0, config=TOUCH_CONFIG, devices=(), clock=No
         config_path=path,
         backlight_root=backlight(tmp_path, brightness),
         clock=clock if clock is not None else (lambda: 0.0),
-        evdev_module=FakeEvdev(list(devices)),
-        log=lambda message: None,
+        evdev_module=evdev if evdev is not None else FakeEvdev(list(devices), vanish),
+        log=log if log is not None else (lambda message: None),
+        retry_s=0,
+        blocked_retry_s=0,
+        sleep=sleep if sleep is not None else (lambda seconds: None),
     )
 
 
 @pytest.mark.smoke
 def test_witness_selects_the_virtual_node_in_filter_mode_tc910(tmp_path):
-    # The daemon holds EVIOCGRAB on the physical node in filter and adaptive
-    # mode, so a witness on that node would read nothing for ever.
-    for mode in ("filter", "adaptive"):
-        identity = SETUP.touch_identity({**TOUCH_CONFIG, "mode": mode})
-        assert identity == {"virtual": True, "name": SETUP.TOUCH_VIRTUAL_NAME,
-                            "vendor": 0, "product": 1}
+    # `filter` is the ONLY mode that creates a uinput device, and it is also
+    # the mode that grabs the raw node, so the virtual node is both the only
+    # readable source and the preferred one.
+    assert SETUP.touch_targets({**TOUCH_CONFIG, "mode": "filter"})[0] == {
+        "virtual": True, "name": SETUP.TOUCH_VIRTUAL_NAME, "vendor": 0, "product": 1}
     watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "filter"},
-                      devices=[physical_device(), virtual_device()])
+                      devices=[physical_device(held=True), virtual_device()])
     assert watcher.resolve().name == SETUP.TOUCH_VIRTUAL_NAME
+
+
+@pytest.mark.smoke
+def test_adaptive_creates_no_virtual_node_so_the_witness_targets_the_physical_one_tc910(tmp_path):
+    # configure-touch-filter.sh modprobes uinput for `filter` ALONE: adaptive's
+    # accepted taps leave over its AF_UNIX bridge, not through a device. A
+    # witness that hunted for a virtual node here would retry for ever.
+    assert SETUP.touch_targets({**TOUCH_CONFIG, "mode": "adaptive"}) == [
+        {"virtual": False, "name": TOUCH_CONFIG["name"],
+         "vendor": TOUCH_CONFIG["vendor"], "product": TOUCH_CONFIG["product"]}]
+    # With the daemon holding the raw node there is nothing to witness, and
+    # that is reported as a steady state on the long backoff, not as a fault.
+    watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "adaptive"},
+                      devices=[physical_device(held=True)])
+    with pytest.raises(SETUP.Refused, match="touch-node-grabbed"):
+        watcher.resolve()
+    slept, said = [], []
+    watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "adaptive"},
+                      devices=[physical_device(held=True)],
+                      sleep=slept.append, log=said.append)
+    watcher.blocked_retry_s = SETUP.TOUCH_BLOCKED_RETRY_S
+    watcher.run(stop=lambda: len(slept) >= 3)
+    assert slept == [SETUP.TOUCH_BLOCKED_RETRY_S] * 3
+    # Said once over three cycles, not once per retry.
+    assert sum("grabbed by the touch filter" in line for line in said) == 1
+    # Once the daemon lets go, the same physical node becomes the witness.
+    watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "adaptive"},
+                      devices=[physical_device(held=False)])
+    assert watcher.resolve().name == TOUCH_CONFIG["name"]
 
 
 @pytest.mark.smoke
 def test_witness_selects_the_physical_node_without_a_grab_tc910(tmp_path):
     for mode in ("off", "shadow"):
-        identity = SETUP.touch_identity({**TOUCH_CONFIG, "mode": mode})
-        assert identity == {"virtual": False, "name": TOUCH_CONFIG["name"],
-                            "vendor": TOUCH_CONFIG["vendor"], "product": TOUCH_CONFIG["product"]}
+        assert SETUP.touch_targets({**TOUCH_CONFIG, "mode": mode}) == [
+            {"virtual": False, "name": TOUCH_CONFIG["name"],
+             "vendor": TOUCH_CONFIG["vendor"], "product": TOUCH_CONFIG["product"]}]
     watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "shadow"},
                       devices=[physical_device(), virtual_device()])
     assert watcher.resolve().name == TOUCH_CONFIG["name"]
 
 
 @pytest.mark.smoke
+def test_the_live_grab_is_probed_not_inferred_from_the_mode_tc910(tmp_path):
+    # The persisted mode says what the daemon INTENDS. While it is down or
+    # restarting nobody holds the grab, and the raw node is then a perfectly
+    # good witness — so filter mode falls back to it and returns to the virtual
+    # node the moment the daemon is back.
+    raw = physical_device(held=False)
+    watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "filter"}, devices=[raw])
+    assert watcher.resolve().name == TOUCH_CONFIG["name"]
+    assert (raw.grabs, raw.ungrabs) == (1, 1)  # probed, and given straight back
+    # Daemon back up: the virtual node wins again and is never grab-probed,
+    # because nobody can hold a grab on it by construction.
+    virtual = virtual_device()
+    watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "filter"},
+                      devices=[physical_device(held=True), virtual])
+    assert watcher.resolve() is virtual
+    assert virtual.grabs == 0
+    # Filter mode with the raw node grabbed and no virtual node yet (the
+    # restart window in the other direction) refuses rather than reading a node
+    # that would deliver nothing.
+    watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "filter"},
+                      devices=[physical_device(held=True)])
+    with pytest.raises(SETUP.Refused, match="touch-node-grabbed"):
+        watcher.resolve()
+
+
+@pytest.mark.smoke
+def test_no_handle_is_left_open_when_a_node_vanishes_mid_enumeration_tc910(tmp_path):
+    # The filter unit is Restart=always, so a node really can disappear between
+    # list_devices() and InputDevice(). Leaking the handles opened before that
+    # point ends in EMFILE on a loop that re-resolves every second.
+    survivor = virtual_device("/dev/input/event9")
+    doomed = physical_device("/dev/input/event5")
+    evdev = FakeEvdev([doomed, survivor], vanish={"/dev/input/event9"})
+    with pytest.raises(OSError):
+        SETUP.select_input_device(evdev, SETUP.touch_targets(TOUCH_CONFIG)[0])
+    assert doomed.closed is True
+    # And on the ordinary refusals too: everything opened, nothing kept.
+    devices = [physical_device("/dev/input/event5"), physical_device("/dev/input/event6")]
+    with pytest.raises(SETUP.Refused, match="touch-node-ambiguous"):
+        SETUP.select_input_device(FakeEvdev(devices), SETUP.touch_targets(
+            {**TOUCH_CONFIG, "mode": "off"})[0])
+    assert [device.closed for device in devices] == [True, True]
+    # The one that IS returned stays open.
+    keeper = physical_device()
+    assert SETUP.select_input_device(FakeEvdev([keeper]), SETUP.touch_targets(
+        {**TOUCH_CONFIG, "mode": "off"})[0]) is keeper
+    assert keeper.closed is False
+
+
+@pytest.mark.smoke
 def test_witness_refuses_zero_or_ambiguous_matches_tc910(tmp_path):
-    watcher = witness(tmp_path, devices=[physical_device()])
+    off = {**TOUCH_CONFIG, "mode": "off"}
+    watcher = witness(tmp_path, config=off, devices=[virtual_device()])
     with pytest.raises(SETUP.Refused, match="touch-node-missing"):
         watcher.resolve()
+    watcher = witness(tmp_path, config=off, devices=[physical_device("/dev/input/event5"),
+                                                    physical_device("/dev/input/event6")])
+    with pytest.raises(SETUP.Refused, match="touch-node-ambiguous"):
+        watcher.resolve()
+    # Ambiguity on the preferred target is not silently papered over by the
+    # fallback either: filter mode with two virtual nodes refuses.
     watcher = witness(tmp_path, devices=[virtual_device("/dev/input/event9"),
                                          virtual_device("/dev/input/event10")])
-    with pytest.raises(SETUP.Refused, match="touch-node-ambiguous"):
+    with pytest.raises(SETUP.Refused):
         watcher.resolve()
 
 
@@ -341,7 +463,7 @@ def test_witness_never_opens_an_event_node_by_number_tc910(tmp_path):
     # An absent or malformed config refuses rather than guessing a device.
     for bad in (None, {}, {"mode": "off", "name": "ELAN Touchscreen", "vendor": "04f3"}):
         with pytest.raises(SETUP.Refused, match="touch-config-invalid"):
-            SETUP.touch_identity(bad)
+            SETUP.touch_targets(bad)
 
 
 @pytest.mark.smoke
@@ -449,22 +571,54 @@ def test_one_place_runs_the_power_command_tc912(monkeypatch):
 
 
 @pytest.mark.smoke
-def test_a_node_that_disappears_is_re_resolved_without_failing_the_helper_tc913(tmp_path):
-    # wall-touch-filter is Restart=always and its uinput node is destroyed and
-    # recreated with a new minor on every restart and across suspend/resume.
-    attempts = []
-    watcher = witness(tmp_path, devices=[])
+def test_a_node_that_disappears_is_re_resolved_and_reads_again_tc913(tmp_path):
+    """Resolve, wake, lose the node, re-resolve at a NEW minor, wake again.
 
-    def resolve():
-        attempts.append(len(attempts))
-        if len(attempts) < 3:
-            raise OSError("ENODEV")
-        raise SETUP.Refused("touch-node-missing")
+    wall-touch-filter is Restart=always and `wall-touch-filter-sleep pre` stops
+    it before every suspend, so the uinput node is destroyed and recreated with
+    a different minor routinely. The whole journey runs through the real
+    TouchWitness.run(), not a stubbed resolve.
+    """
+    down = SimpleNamespace(type=SETUP.EV_KEY, code=SETUP.BTN_TOUCH, value=1)
+    before = virtual_device("/dev/input/event9", events=[down])
+    after = virtual_device("/dev/input/event12", events=[down])
+    helper = SpyHelper()
+    now = [0.0]
 
-    watcher.resolve = resolve
-    watcher.retry_s = 0
-    watcher.run(stop=lambda: len(attempts) >= 3)
-    assert len(attempts) == 3
+    class Restarting:
+        """One table whose virtual node is replaced between resolutions."""
+
+        def __init__(self):
+            self.stage = 0
+            self.tables = [FakeEvdev([physical_device(held=True), before]),
+                           FakeEvdev([physical_device(held=True)]),
+                           FakeEvdev([physical_device(held=True), after])]
+
+        def table(self):
+            return self.tables[min(self.stage, len(self.tables) - 1)]
+
+        def list_devices(self):
+            return self.table().list_devices()
+
+        def InputDevice(self, path):  # noqa: N802
+            return self.table().InputDevice(path)
+
+    devices = Restarting()
+
+    def tick(_seconds):
+        # Each backoff advances the world: the node goes away, then returns.
+        devices.stage += 1
+        now[0] += 10  # well past the rate limit, so the second tap is its own
+
+    watcher = witness(tmp_path, brightness=0, helper=helper, evdev=devices,
+                      clock=lambda: now[0], sleep=tick)
+    watcher.run(stop=lambda: devices.stage >= 3)
+
+    # Two real resolutions, two real reads, two real wakes — at two different
+    # node numbers, because identity and not eventN is what found them.
+    assert before.closed is True and after.closed is True
+    assert helper.calls == [({"source": "touch"}, True), ({"source": "touch"}, True)]
+    assert devices.stage == 3
 
 
 @pytest.mark.smoke

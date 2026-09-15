@@ -1020,10 +1020,12 @@ one parser and not the other.
 name, so a body carrying `heightMeters`, `heightCm` or a bare number is refused,
 not converted — a millimetre reader fed metres is 1000× low and fed centimetres
 10× low, and all of those land far outside the 24..96 in band. The *value* must
-be a plain decimal string matching `^\d+(\.\d+)?$`: a bare number is a shape
-nobody has seen, and `float()` alone would also accept `nan`, `inf`, `"  12  "`
-and `"1e4"`, which is precisely the latitude this file does not take with a
-vendor's bytes. A refusal costs the ratio gauge and nothing else.
+be **digits and nothing else** (`^\d+$`): a bare number, a sign, an exponent or
+a fractional part are all shapes nobody has seen, and `float()` alone would also
+accept `nan`, `inf`, `"  12  "` and `"1e4"` — precisely the latitude this file
+does not take with a vendor's bytes. The first draft of this line allowed an
+optional tenth *in case* some platform reported one; that is the same bet that
+produced `heightMeters`, and adversarial review caught it. A refusal costs the ratio gauge and nothing else.
 
 **To re-capture a body** (the command the 2026-09-14 capture was made with):
 

@@ -3771,12 +3771,21 @@ def test_the_value_is_a_decimal_string_because_that_is_what_was_seen_sr022():
     standing rule rather than fussiness: the alternative is `float(raw)`, which
     would also cheerfully accept `nan`, `inf`, `"  12  "` and `"1e4"`, and the
     whole point of the gate this parser was written behind is not to take that
-    latitude with a vendor's bytes. A tenth is allowed — the field is a length,
-    not a count, and another platform may well report one.
+    latitude with a vendor's bytes.
+
+    A FRACTIONAL PART IS REFUSED TOO. An earlier version of this parser allowed
+    `"1778.5"` on the reasoning that the field is a length rather than a count
+    and some other platform might report tenths — which is the same "widen it in
+    case the vendor does something we have not observed" bet that produced the
+    `heightMeters` reading this whole commit exists to correct. If Google ever
+    does send a tenth the reading is refused, the cached height carries the
+    gauge, and the journal names the field. Found by adversarial review
+    2026-09-14.
     """
-    assert feeder.check_vendor_millimetres("1778.0", "h") == pytest.approx(70.0)
+    assert feeder.check_vendor_millimetres("1778", "h") == pytest.approx(70.0)
     for refused in (1778, 1778.0, True, None, "", " 1778", "1778 ", "+1778",
-                    "-1778", "1.778e3", "nan", "inf", "1,778"):
+                    "-1778", "1778.0", "1778.5", "1.778e3", "nan", "inf",
+                    "1,778"):
         with pytest.raises(feeder.SourceFailure):
             feeder.check_vendor_millimetres(refused, "height")
 

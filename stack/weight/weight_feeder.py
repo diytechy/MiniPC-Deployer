@@ -1141,15 +1141,27 @@ HEIGHT_MILLIMETRES_KEY = "heightMillimeters"
 # rounded factor drifts visibly once a ratio is taken to three decimals.
 MILLIMETRES_PER_INCH = 25.4
 
-# What `heightMillimeters` is allowed to look like. Google sends proto3 int64 as
-# a DECIMAL STRING, and the captured body held `"1778"`. The pattern admits an
-# optional fractional part because the field is a length rather than a count and
-# another platform may well report tenths; it admits NO sign, NO exponent and NO
-# whitespace, because a negative height is not a measurement and `1e3` is a
-# shape nobody has seen. `float()` alone would accept `nan`, `inf`, `+1_0` and
-# leading whitespace, which is precisely the latitude this file does not take
-# with a vendor's bytes.
-HEIGHT_MILLIMETRES_RE = re.compile(r"^\d+(?:\.\d+)?$")
+# What `heightMillimeters` is allowed to look like: DIGITS, and nothing else.
+# Google sends proto3 int64 as a decimal string and the captured body held
+# `"1778"`, so that is the whole of the observed shape. No sign, no exponent, no
+# whitespace, AND NO FRACTIONAL PART.
+#
+# An earlier version of this line allowed an optional `.5` on the reasoning that
+# the field is a length rather than a count and some other platform might report
+# tenths. THAT WAS THIS FILE BREAKING ITS OWN RULE three paragraphs after
+# stating it: a tenth is a shape nobody has seen, and "widen the parser in case
+# the vendor does something we have not observed" is precisely the bet that put
+# `heightMeters` in here in the first place. Found by adversarial review
+# 2026-09-14.
+#
+# Refusing costs nothing the household would feel if Google ever does send a
+# tenth: the reading is refused, the cached height carries the ratio gauge, and
+# the journal line names the field - so the fix is a one-character change made
+# against a body somebody has looked at, which is the whole point.
+#
+# `float()` alone would accept `nan`, `inf`, `+1_0` and leading whitespace,
+# which is the latitude this file does not take with a vendor's bytes.
+HEIGHT_MILLIMETRES_RE = re.compile(r"^\d+$")
 
 # 24..96 in is 2 ft to 8 ft. As with PLAUSIBLE_LB the point is not to police
 # anybody's body: it is to catch a units error before it becomes a confident

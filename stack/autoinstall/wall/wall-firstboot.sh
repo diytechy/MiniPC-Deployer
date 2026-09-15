@@ -97,6 +97,35 @@ fail_step() {   # MESSAGE...
     echo "[wall-firstboot] ERROR: $*" >&2
 }
 
+# wall_camera_option_configured — true when THIS panel's wall.env enables any
+# camera-related option (Item M, 2026-09-15 Owner ruling). Mirrored BY HAND in
+# vmtest/lib/common.sh's build-time copy of this predicate — that one reads a
+# staged deploy-payload/site/wall.env before the image exists (no shell
+# module reaches both a build-time script and a boot-time one), so it borrows
+# THIS file's own load_env_file to parse rather than re-implementing the
+# rules; keep the three conditions themselves in sync by hand.
+#
+# Reads $WALL_ACCESS_MODE/$WALL_CAMERA_ENABLED/$WALL_CAMERA_DEVICE the way
+# every other check in this script does: already exported by load_env_file
+# (called on $ENV_FILE well above this point), never re-read from the file.
+# An earlier version of this function re-parsed $ENV_FILE itself with a raw
+# grep for the WALL_CAMERA_DEVICE case (2026-09-15 terra review #4) — a second,
+# cruder parser of the same file that could disagree with load_env_file on a
+# quoted value. There is now exactly one parser.
+#
+# Any of the following counts:
+#   WALL_ACCESS_MODE=local        local access needs the panel's own sensing
+#   WALL_CAMERA_ENABLED=true      (TRUE/yes/1 also count, same as elsewhere)
+#   WALL_CAMERA_DEVICE=<anything> a camera node is explicitly configured
+wall_camera_option_configured() {
+    [ "${WALL_ACCESS_MODE:-gateway}" = "local" ] && return 0
+    case "${WALL_CAMERA_ENABLED:-false}" in
+        true|TRUE|yes|1) return 0 ;;
+    esac
+    [ -n "${WALL_CAMERA_DEVICE:-}" ] && return 0
+    return 1
+}
+
 # enable_unit SUCCESS_LINE UNIT... — enable units and JUDGE the result.
 # The success line is the caller's, because only the caller knows what the
 # enablement means on the wall; it is printed if and only if enable succeeded.
@@ -534,10 +563,40 @@ log "kiosk: $KIOSK_ENV rendered (0644) — WALL_HOST='${WALL_HOST:-}' WALL_APP_C
 # ── local sensors and root capability helper: image-owned, gateway-independent
 SENSOR_WHEELHOUSE=/opt/wall-panel/sensor-wheelhouse
 SENSOR_MODELS=/opt/wall-panel/sensor-models
+# The face model bundle IS "complete" only when both .onnx files are there,
+# not merely a manifest.json (2026-09-15 terra review #6: a manifest with no
+# model bytes beside it used to read as "present" and get handed to the
+# installer, which would then fail for a reason this step never named).
+sensor_models_complete() {
+    [ -d "$SENSOR_MODELS" ] \
+        && [ -f "$SENSOR_MODELS/det_10g.onnx" ] \
+        && [ -f "$SENSOR_MODELS/w600k_r50.onnx" ]
+}
+# Item M, 2026-09-15 Owner ruling: the bundle is a DEPENDENCY of any
+# camera-related option, not a separate optional package. Checked and
+# fail_step'd HERE, standalone and BEFORE any installer work (terra review
+# #5) — not nested inside the SENSOR_WHEELHOUSE branch below, so a
+# configured-but-missing bundle gets its own named step regardless of
+# whether the wheelhouse itself is also present, and firstboot does not
+# spend time on an installer run this panel can never finish correctly.
+if wall_camera_option_configured && ! sensor_models_complete; then
+    fail_step "sensors: wall.env enables a camera-related option (WALL_ACCESS_MODE=local, WALL_CAMERA_ENABLED=true, or WALL_CAMERA_DEVICE set) but $SENSOR_MODELS is absent or incomplete (needs det_10g.onnx AND w600k_r50.onnx). Face-shape presence and face unlock will never become ready. The image build stages this from WALL_SENSOR_MODELS (stack/autoinstall/wall/sensor-models/README.md); PIN, Bluetooth and motion presence remain available."
+fi
 if [ -d "$SENSOR_WHEELHOUSE" ]; then
     sensor_args=(--wheelhouse "$SENSOR_WHEELHOUSE")
-    if [ -d "$SENSOR_MODELS" ] && [ -f "$SENSOR_MODELS/manifest.json" ]; then
-        sensor_args+=(--models "$SENSOR_MODELS" --model-manifest "$SENSOR_MODELS/manifest.json")
+    if sensor_models_complete; then
+        # The ANCHOR is the payload's OWN reviewed, committed manifest
+        # (stack/autoinstall/wall/sensor-models/manifest.json, carried by
+        # copy_repo_into_payload on every image regardless of whether a
+        # bundle was staged), never $SENSOR_MODELS/manifest.json — that copy
+        # travelled here alongside the .onnx bytes themselves, so a supplier
+        # who substitutes both together with a self-consistent manifest of
+        # their own would sail through a check anchored on it (2026-09-15
+        # terra review #3). $PAYLOAD is this same image's git-tracked
+        # payload, so this is exactly check-wheelhouse-lock.py --expect's
+        # pattern one step up: authenticity comes from a copy the supplier
+        # of the MODELS never gets to touch.
+        sensor_args+=(--models "$SENSOR_MODELS" --model-manifest "$PAYLOAD/sensor-models/manifest.json")
     fi
     if "$PAYLOAD/install-wall-capabilities.sh" "${sensor_args[@]}"; then
         log "sensors: gateway-independent runtime installed and protocol verified"

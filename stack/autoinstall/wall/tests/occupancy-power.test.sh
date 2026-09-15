@@ -297,7 +297,12 @@ armed_frame() {
     grep -o -- '-[lu] ' "$RTCWAKE_LOG" | tail -1 | tr -d ' \n'
 }
 decider_calls() {
-    grep -c 'wall-occupancy.py' "$PY3_LOG" 2>/dev/null || echo 0
+    # `grep -c` PRINTS 0 and EXITS 1 on no match, so a bare `|| echo 0` emits
+    # two lines and every zero-count assertion compares against "0\n0". Only a
+    # case that expects zero can see it — A23 is the first one.
+    local count
+    count="$(grep -c 'wall-occupancy.py' "$PY3_LOG" 2>/dev/null)" || count=""
+    printf '%s\n' "${count:-0}"
 }
 decider_on_start() {
     grep -o -- '--on-start [0-9:]*' "$PY3_LOG" | tail -1 | awk '{print $2}'
@@ -503,10 +508,27 @@ power_writers() {
     done <<< "$(find "$DIR" -type f ! -path '*/tests/*' ! -path '*__pycache__*' ! -name '*.md')"
     printf '%b' "$names" | grep -v '^$' | sort -u | tr '\n' ' '
 }
-eq "wall-sleep.sh " "$(power_writers "$BACKLIGHT_MECHANISMS")" \
-    "A11 exactly ONE file in the wall tree can change the backlight, by ANY mechanism"
-eq "wall-sleep.sh " "$(power_writers "$SUSPEND_MECHANISMS")" \
-    "A11 exactly ONE file in the wall tree can suspend, by ANY mechanism"
+# Two files NAME a power mechanism without being a second writer of it:
+#   wall-local-setup.py READS /sys/class/backlight so its root-owned touch
+#     witness can require brightness zero before it asks wall-sleep.sh to light
+#     the panel (LLR-911), and
+#   wall-touch-wakeup-report.sh READS /sys/power/state and mem_sleep for the
+#     one-off hardware-wake measurement (LLR-914).
+# They are admitted BY NAME and only while they stay provably read-only: the
+# second assertion below fails the moment either one grows a write to a power
+# node, so the one-writer property is tightened here, not relaxed.
+POWER_NODE_WRITES='(>>?|tee[[:space:]]+)[[:space:]]*"?[^"[:space:]|]*/sys/(class/backlight|power)|write_text\([^)]*brightness|open\([^)]*/sys/'
+readonly_power_reader() {  # FILE — echoes the basename if it WRITES a power node
+    if sed -e 's/^[[:space:]]*#.*$//' "$1" 2>/dev/null | grep -E "$POWER_NODE_WRITES" >/dev/null; then
+        basename "$1"
+    fi
+}
+eq "wall-local-setup.py wall-sleep.sh " "$(power_writers "$BACKLIGHT_MECHANISMS")" \
+    "A11 only wall-sleep.sh changes the backlight; the witness only READS it"
+eq "wall-sleep.sh wall-touch-wakeup-report.sh " "$(power_writers "$SUSPEND_MECHANISMS")" \
+    "A11 only wall-sleep.sh suspends; the wakeup report only READS the sleep nodes"
+eq "" "$(readonly_power_reader "$DIR/wall-local-setup.py")$(readonly_power_reader "$DIR/wall-touch-wakeup-report.sh")" \
+    "A11 neither admitted reader writes a backlight or sleep node"
 # And at RUNTIME, not in the source: one tick, one decision. A second call would
 # be a second decision, which is the drift this block is built to prevent.
 scenario a11
@@ -835,6 +857,42 @@ eq "100" "$(brightness)" "A22 validated sensor wake restores the backlight"
 [ ! -e "$ROOT/run/wall-occupancy/absent-since" ] \
     && pass "A22 sensor wake clears the prior absence clock" \
     || fail "A22 sensor wake left the prior absence clock"
+
+# ── A23 (TC-913/LLR-913): the touch-wake arm ────────────────────────────────
+# The root-owned evdev witness observed one physical contact on dark glass. The
+# arm must do precisely what sensor-wake does — clear the absence stamp so the
+# next occupancy tick cannot immediately re-dark the panel, and put the
+# backlight on — and it must add NO timer of its own: a touch wake schedules no
+# re-sleep, the next boundary or the decider owns that.
+scenario a23-touch-wake
+write_env "SLEEP_MODE=backlight"
+printf '0' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+mkdir -p "$ROOT/run/wall-occupancy"
+printf '%s' "$(date +%s)" > "$ROOT/run/wall-occupancy/absent-since"
+run touch-wake
+eq "100" "$(brightness)" "A23 touch-wake restores the backlight"
+[ ! -e "$ROOT/run/wall-occupancy/absent-since" ] \
+    && pass "A23 touch-wake clears the absence clock, so the next tick cannot re-dark it" \
+    || fail "A23 touch-wake left the prior absence clock"
+eq "no" "$(suspended)" "A23 touch-wake never suspends or re-sleeps"
+grep -q 'touch witness observed a contact' "$ROOT/out.log" \
+    && pass "A23 touch-wake journals the tap, so witness/request/restore correlate" \
+    || fail "A23 touch-wake journaled nothing attributable to the tap"
+eq "0" "$(decider_calls)" "A23 touch-wake is display state only — it does not run the decider"
+
+# A23b: touch-wake is a declared verb, not an undocumented one.
+scenario a23-usage
+write_env "SLEEP_MODE=backlight"
+run nonsense
+grep -q 'usage: .*sensor-wake|touch-wake' "$ROOT/out.log" \
+    && pass "A23 the usage arm lists touch-wake beside sensor-wake" \
+    || fail "A23 the usage arm does not list touch-wake"
+
+# A23c: the witness the arm exists for asks for THIS verb, by this name.
+grep -q 'TOUCH_POWER_COMMAND = ("/usr/local/sbin/wall-sleep.sh", "touch-wake")' \
+    "$DIR/wall-local-setup.py" \
+    && pass "A23 the root helper's witness invokes the touch-wake arm by name" \
+    || fail "A23 the root helper does not invoke touch-wake"
 
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

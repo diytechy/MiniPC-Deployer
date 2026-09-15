@@ -206,3 +206,285 @@ def test_model_manifest_path_and_exact_names_are_one_contract():
     assert '"sensorModelManifest": "/opt/wall-sensors/models/manifest.json"' in renderer
     assert "names = {'det_10g.onnx', 'w600k_r50.onnx'}" in installer
     assert "for block in iter(lambda: model.read(1024 * 1024), b'')" in installer
+
+
+# ── TC-910..912, TC-914: the touch witness (LLR-910..912, LLR-914) ───────────
+#
+# The witness is a thread of the root helper, so everything decidable about it
+# is a pure function with an injected seam: the evdev module, the backlight
+# tree, the monotonic clock and the Helper that owns the power command. None of
+# these tests needs python-evdev, a device node or a panel.
+
+TOUCH_CONFIG = {"mode": "filter", "name": "ELAN Touchscreen", "vendor": 0x04F3,
+                "product": 0x222A, "isolate": False}
+
+
+class FakeInfo:
+    def __init__(self, vendor, product):
+        self.vendor, self.product = vendor, product
+
+
+class FakeDevice:
+    """Enough evdev.InputDevice for identity selection; records its own close."""
+
+    def __init__(self, path, name, vendor, product):
+        self.path, self.name, self.info = path, name, FakeInfo(vendor, product)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakeEvdev:
+    def __init__(self, devices):
+        self._devices = {device.path: device for device in devices}
+
+    def list_devices(self):
+        return sorted(self._devices)
+
+    def InputDevice(self, path):  # noqa: N802 - mirrors the real evdev API
+        return self._devices[path]
+
+
+def physical_device(path="/dev/input/event5"):
+    return FakeDevice(path, TOUCH_CONFIG["name"], TOUCH_CONFIG["vendor"], TOUCH_CONFIG["product"])
+
+
+def virtual_device(path="/dev/input/event9"):
+    return FakeDevice(path, SETUP.TOUCH_VIRTUAL_NAME,
+                      SETUP.TOUCH_VIRTUAL_VENDOR, SETUP.TOUCH_VIRTUAL_PRODUCT)
+
+
+def backlight(tmp_path, brightness, maximum=100, name="intel_backlight"):
+    """Build a fake /sys/class/backlight tree and return its root."""
+    root = tmp_path / "backlight"
+    device = root / name
+    device.mkdir(parents=True, exist_ok=True)
+    (device / "brightness").write_text(str(brightness), encoding="utf-8")
+    (device / "max_brightness").write_text(str(maximum), encoding="utf-8")
+    return root
+
+
+class SpyHelper:
+    """A Helper stand-in that records the wake calls the witness makes."""
+
+    def __init__(self, error=None):
+        self.calls = []
+        self.error = error
+
+    def wake(self, params, *, witness=False):
+        self.calls.append((params, witness))
+        if self.error is not None:
+            raise self.error
+        return {"woke": True}
+
+
+def witness(tmp_path, *, brightness=0, config=TOUCH_CONFIG, devices=(), clock=None,
+            helper=None):
+    path = tmp_path / "touch-filter.json"
+    if config is not None:
+        path.write_text(json.dumps(config), encoding="utf-8")
+    return SETUP.TouchWitness(
+        helper if helper is not None else SpyHelper(),
+        config_path=path,
+        backlight_root=backlight(tmp_path, brightness),
+        clock=clock if clock is not None else (lambda: 0.0),
+        evdev_module=FakeEvdev(list(devices)),
+        log=lambda message: None,
+    )
+
+
+@pytest.mark.smoke
+def test_witness_selects_the_virtual_node_in_filter_mode_tc910(tmp_path):
+    # The daemon holds EVIOCGRAB on the physical node in filter and adaptive
+    # mode, so a witness on that node would read nothing for ever.
+    for mode in ("filter", "adaptive"):
+        identity = SETUP.touch_identity({**TOUCH_CONFIG, "mode": mode})
+        assert identity == {"virtual": True, "name": SETUP.TOUCH_VIRTUAL_NAME,
+                            "vendor": 0, "product": 1}
+    watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "filter"},
+                      devices=[physical_device(), virtual_device()])
+    assert watcher.resolve().name == SETUP.TOUCH_VIRTUAL_NAME
+
+
+@pytest.mark.smoke
+def test_witness_selects_the_physical_node_without_a_grab_tc910(tmp_path):
+    for mode in ("off", "shadow"):
+        identity = SETUP.touch_identity({**TOUCH_CONFIG, "mode": mode})
+        assert identity == {"virtual": False, "name": TOUCH_CONFIG["name"],
+                            "vendor": TOUCH_CONFIG["vendor"], "product": TOUCH_CONFIG["product"]}
+    watcher = witness(tmp_path, config={**TOUCH_CONFIG, "mode": "shadow"},
+                      devices=[physical_device(), virtual_device()])
+    assert watcher.resolve().name == TOUCH_CONFIG["name"]
+
+
+@pytest.mark.smoke
+def test_witness_refuses_zero_or_ambiguous_matches_tc910(tmp_path):
+    watcher = witness(tmp_path, devices=[physical_device()])
+    with pytest.raises(SETUP.Refused, match="touch-node-missing"):
+        watcher.resolve()
+    watcher = witness(tmp_path, devices=[virtual_device("/dev/input/event9"),
+                                         virtual_device("/dev/input/event10")])
+    with pytest.raises(SETUP.Refused, match="touch-node-ambiguous"):
+        watcher.resolve()
+
+
+@pytest.mark.smoke
+def test_witness_never_opens_an_event_node_by_number_tc910(tmp_path):
+    # eventN is allocation-order dependent and changes on every daemon restart
+    # and USB re-enumeration, so no literal node path may appear in the source.
+    source = (WALL / "wall-local-setup.py").read_text(encoding="utf-8")
+    assert "/dev/input/event" not in source
+    # A node at a different number is still found, because identity selects it.
+    watcher = witness(tmp_path, devices=[virtual_device("/dev/input/event31")])
+    assert watcher.resolve().path == "/dev/input/event31"
+    # An absent or malformed config refuses rather than guessing a device.
+    for bad in (None, {}, {"mode": "off", "name": "ELAN Touchscreen", "vendor": "04f3"}):
+        with pytest.raises(SETUP.Refused, match="touch-config-invalid"):
+            SETUP.touch_identity(bad)
+
+
+@pytest.mark.smoke
+def test_brightness_zero_is_the_wake_precondition_tc911(tmp_path):
+    assert SETUP.backlight_dark(backlight(tmp_path / "dark", 0)) is True
+    assert SETUP.backlight_dark(backlight(tmp_path / "lit", 1)) is False
+    # No readable backlight is not evidence of darkness.
+    assert SETUP.backlight_dark(tmp_path / "absent") is False
+    mixed = backlight(tmp_path / "mixed", 0)
+    second = mixed / "edp_backlight"
+    second.mkdir()
+    (second / "brightness").write_text("40", encoding="utf-8")
+    (second / "max_brightness").write_text("100", encoding="utf-8")
+    assert SETUP.backlight_dark(mixed) is False
+
+
+@pytest.mark.smoke
+def test_a_lit_panel_runs_no_power_command_tc911(tmp_path):
+    helper = SpyHelper()
+    watcher = witness(tmp_path, brightness=100, helper=helper)
+    assert watcher.contact() is False
+    assert helper.calls == []
+
+
+@pytest.mark.smoke
+def test_one_contact_wakes_once_and_the_rate_limit_holds_tc911(tmp_path):
+    helper = SpyHelper()
+    now = [100.0]
+    watcher = witness(tmp_path, brightness=0, helper=helper, clock=lambda: now[0])
+    assert watcher.contact() is True
+    assert helper.calls == [({"source": "touch"}, True)]
+    now[0] += SETUP.TOUCH_WAKE_MIN_INTERVAL_S - 0.01
+    assert watcher.contact() is False
+    assert len(helper.calls) == 1
+    now[0] += 0.02
+    assert watcher.contact() is True
+    assert len(helper.calls) == 2
+    assert SETUP.TOUCH_WAKE_MIN_INTERVAL_S == 2.0
+
+
+@pytest.mark.smoke
+def test_only_a_contact_start_is_a_wake_tc911():
+    down = SimpleNamespace(type=SETUP.EV_KEY, code=SETUP.BTN_TOUCH, value=1)
+    assert SETUP.is_contact_start(down) is True
+    for other in (SimpleNamespace(type=SETUP.EV_KEY, code=SETUP.BTN_TOUCH, value=0),
+                  SimpleNamespace(type=3, code=SETUP.BTN_TOUCH, value=1),
+                  SimpleNamespace(type=SETUP.EV_KEY, code=1, value=1)):
+        assert SETUP.is_contact_start(other) is False
+
+
+@pytest.mark.smoke
+def test_a_touch_source_over_the_socket_is_refused_tc912():
+    status = {"protocolVersion": 2,
+              "config": {"schemaVersion": 2, "cameraConsentVersion": 1, "cameraEnabled": True,
+                         "presenceFace": False, "presenceMotion": True, "bluetoothEnabled": False},
+              "motion": {"state": "positive", "observedAt": 1_999_990, "ttlMs": 3000}}
+    for params in ({"source": "touch"},
+                   {"source": "touch", "observedAt": 1_999_990, "ttlMs": 3000}):
+        with pytest.raises(SETUP.Refused, match="wake-request-invalid"):
+            SETUP.validate_wake(params, status, 2_000_000)
+
+
+@pytest.mark.smoke
+def test_the_witness_seam_accepts_exactly_one_shape_tc912():
+    SETUP.validate_wake({"source": "touch"}, {}, witness=True)
+    for params in ({"source": "camera"}, {"source": "touch", "ttlMs": 1},
+                   {}, {"source": "touch", "observedAt": 1}):
+        with pytest.raises(SETUP.Refused, match="wake-request-invalid"):
+            SETUP.validate_wake(params, {}, witness=True)
+
+
+@pytest.mark.smoke
+def test_the_socket_path_never_passes_witness_true_tc912(tmp_path, monkeypatch):
+    # Structural: the seam is keyword-only and Helper.request cannot reach it.
+    source = (WALL / "wall-local-setup.py").read_text(encoding="utf-8")
+    assert "def validate_wake(params: dict, status: dict, now_ms: int | None = None, *,\n" in source
+    assert source.count("witness=True") == 3  # the seam call, Helper.wake, the witness
+    seen = {}
+    helper = SETUP.Helper()
+
+    def spy(params, status, now_ms=None, *, witness=False):
+        seen["witness"] = witness
+        raise SETUP.Refused("wake-not-observed")
+
+    monkeypatch.setattr(SETUP, "validate_wake", spy)
+    monkeypatch.setattr(SETUP, "sensor_status", lambda *args, **kwargs: {})
+    monkeypatch.setattr(SETUP.Helper, "reconcile",
+                        lambda self: (None, {"enabled": False}, {"revision": 0}))
+    with pytest.raises(SETUP.Refused):
+        helper.request({"method": "wake", "params": {"source": "touch"}})
+    assert seen == {"witness": False}
+
+
+@pytest.mark.smoke
+def test_one_place_runs_the_power_command_tc912(monkeypatch):
+    ran = []
+    monkeypatch.setattr(SETUP.subprocess, "run", lambda command, **kwargs: ran.append(command))
+    monkeypatch.setattr(SETUP, "sensor_status", lambda *args, **kwargs: {})
+    monkeypatch.setattr(SETUP, "validate_wake", lambda *args, **kwargs: None)
+    helper = SETUP.Helper()
+    assert helper.wake({"source": "touch"}, witness=True) == {"woke": True}
+    assert helper.wake({"source": "camera", "observedAt": 1, "ttlMs": 2}) == {"woke": True}
+    assert ran == [SETUP.TOUCH_POWER_COMMAND, SETUP.POWER_COMMAND]
+    assert SETUP.TOUCH_POWER_COMMAND == ("/usr/local/sbin/wall-sleep.sh", "touch-wake")
+
+
+@pytest.mark.smoke
+def test_a_node_that_disappears_is_re_resolved_without_failing_the_helper_tc913(tmp_path):
+    # wall-touch-filter is Restart=always and its uinput node is destroyed and
+    # recreated with a new minor on every restart and across suspend/resume.
+    attempts = []
+    watcher = witness(tmp_path, devices=[])
+
+    def resolve():
+        attempts.append(len(attempts))
+        if len(attempts) < 3:
+            raise OSError("ENODEV")
+        raise SETUP.Refused("touch-node-missing")
+
+    watcher.resolve = resolve
+    watcher.retry_s = 0
+    watcher.run(stop=lambda: len(attempts) >= 3)
+    assert len(attempts) == 3
+
+
+@pytest.mark.smoke
+def test_a_refused_wake_does_not_arm_the_rate_limit_tc911(tmp_path):
+    helper = SpyHelper(error=SETUP.Refused("wake-request-invalid"))
+    watcher = witness(tmp_path, brightness=0, helper=helper, clock=lambda: 5.0)
+    assert watcher.contact() is False
+    assert watcher.last_wake is None
+
+
+@pytest.mark.smoke
+def test_the_hardware_wake_measurement_is_read_only_and_recorded_tc914():
+    report = (WALL / "wall-touch-wakeup-report.sh").read_text(encoding="utf-8")
+    assert "/proc/acpi/wakeup" in report
+    assert "power/wakeup" in report
+    assert "/sys/power/mem_sleep" in report and "/sys/power/state" in report
+    # Read-only: it never writes a wakeup flag and never suspends.
+    for forbidden in ("> /sys/", ">/sys/", "rtcwake", "systemctl suspend", "echo enabled"):
+        assert forbidden not in report
+    burn_in = (WALL / "WALL-BURN-IN.md").read_text(encoding="utf-8")
+    assert "wall-touch-wakeup-report.sh" in burn_in
+    assert "### Measured hardware-wake facts" in burn_in
+

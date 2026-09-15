@@ -624,8 +624,23 @@ case "${1:-}" in
         rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
         backlight_set on
         ;;
+    touch-wake)
+        # The root-owned evdev witness in wall-local-setup.py observed one
+        # physical contact while every backlight read zero. Behaviourally this
+        # is `sensor-wake`; the separate arm exists so the journal attributes
+        # the restore to the tap rather than to an anonymous sensor claim.
+        #
+        # Clearing the absence stamp restarts the absence clock from the
+        # contact, so an absence-enabled panel cannot re-dark on the very next
+        # occupancy tick. The witness asserts no presence and writes no
+        # presence file; the decider keeps deciding. No re-sleep timer is
+        # added here or anywhere (LLR-913).
+        log "touch witness observed a contact on the dark panel — restoring the backlight"
+        rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
+        backlight_set on
+        ;;
     *)
-        echo "usage: $0 start|end|occupancy|sensor-wake" >&2
+        echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake" >&2
         exit 2
         ;;
 esac

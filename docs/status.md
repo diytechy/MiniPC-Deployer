@@ -2031,3 +2031,23 @@ checkout doc-navigability check passes. Registry integrity reports zero integrit
 errors and 23 existing orphans; no gate advancement is claimed. Full logs are
 in HomeHub/build/panel-followup-minipc-native-check-20260914.txt. No broad-suite
 green or hardware acceptance is claimed.
+
+2026-09-15 group W, touch wakes the dark panel (branch `w-touch-wake`, local
+commits only). LLR-910..914 and TC-910..914 landed against SR-017/SR-020, with
+the accepted design memo `HomeHub/docs/design/WAKE_TOUCH_DESIGN_2026-09-15.md`
+as its record. A root-owned evdev witness thread now runs inside
+`wall-local-setup.py`, reading the touch filter's virtual uinput node by
+identity while the daemon holds `EVIOCGRAB` and the physical node only when no
+grab exists; `validate_wake` gained a keyword-only `witness=` seam that a
+socket peer cannot reach; `wall-sleep.sh` gained a `touch-wake` arm that
+mirrors `sensor-wake` and adds no re-sleep timer. `python scripts/check.py
+--tier smoke` in the main checkout is the bar; in the worktree the
+doc-navigability step cannot resolve the `../HomeHub` sibling links and fails
+for that reason alone. Unit tests: 173 smoke passing (158 before), 34 in
+tests/test_wall_local_capabilities.py; the hermetic
+`tests/occupancy-power.test.sh` reports 98 PASS 0 FAIL under WSL Ubuntu (94
+before). Assumptions to confirm: the 2 s rate limit is sized to one deliberate
+tap and is NOT measured (LLR-911 owns the constant); the S3 hardware-wake claim
+in WALL-BURN-IN.md is still unmeasured and `wall-touch-wakeup-report.sh`
+exists to settle it in the hardware window (LLR-914). No physical acceptance,
+no deployment and no gate advancement is claimed.

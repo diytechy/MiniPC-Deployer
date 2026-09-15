@@ -25,6 +25,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -43,6 +44,34 @@ SETUP_SOCKET = "/run/wall-local-setup/service.sock"
 POWER_COMMAND = ("/usr/local/sbin/wall-sleep.sh", "sensor-wake")
 MAX_REQUEST = 16 * 1024
 MAX_SECRET = 4096
+
+# ── touch witness (LLR-910..913) ─────────────────────────────────────────────
+# A tap on dark glass must light the panel, and the process that asks for power
+# must never be the process that attests the evidence.  Root therefore observes
+# the contact itself, in this process, from a kernel device node: there is no
+# request, no peer and no parameter for the kiosk account to forge.
+TOUCH_POWER_COMMAND = ("/usr/local/sbin/wall-sleep.sh", "touch-wake")
+TOUCH_FILTER_CONFIG = Path("/etc/wall-panel/touch-filter.json")
+BACKLIGHT_ROOT = Path("/sys/class/backlight")
+# The uinput device wall-touch-filter creates for the filtered stream.  One
+# fact, one home: this identity is declared by touchfilter/daemon.py
+# (VIRTUAL_NAME, vendor=0, product=1) and must be kept equal to it.
+TOUCH_VIRTUAL_NAME = "OfficeWall Filtered Touchscreen"
+TOUCH_VIRTUAL_VENDOR = 0
+TOUCH_VIRTUAL_PRODUCT = 1
+# Modes in which the daemon holds EVIOCGRAB on the physical node.  The grab is
+# exclusive, so a second reader of that node receives nothing for ever; in
+# these modes the witness reads the daemon's virtual node instead.
+TOUCH_GRAB_MODES = frozenset({"filter", "adaptive"})
+# One wake per deliberate tap.  2 s is sized to a person's tap, not measured;
+# LLR-911 owns the number so a later measurement changes one constant.
+TOUCH_WAKE_MIN_INTERVAL_S = 2.0
+# Re-resolution backoff when the node disappears -- the filter unit is
+# Restart=always and its uinput node is destroyed and recreated on every
+# restart and across every suspend/resume.
+TOUCH_RETRY_S = 1.0
+EV_KEY = 1
+BTN_TOUCH = 330
 
 
 class Refused(Exception):
@@ -243,8 +272,31 @@ def sensor_status(socket_path: str = SENSOR_SOCKET) -> dict:
     return result
 
 
-def validate_wake(params: dict, status: dict, now_ms: int | None = None) -> None:
-    """Require the broker claim to match a fresh positive sensor observation."""
+def validate_wake(params: dict, status: dict, now_ms: int | None = None, *,
+                  witness: bool = False) -> None:
+    """Require the broker claim to match a fresh positive sensor observation.
+
+    Contract:
+      Inputs:  params: dict from the socket peer, or {"source": "touch"} from
+               the in-process witness; status: a sensor status result;
+               now_ms: int epoch milliseconds (test seam);
+               witness: keyword-only, True ONLY for the in-process evdev
+               witness of this same process.
+      Outputs: None on acceptance.
+      Raises:  Refused("wake-request-invalid"|"wake-not-observed"
+               |"wake-observation-stale").
+    The `witness` seam is keyword-only and is never passed by `Helper.request`,
+    the sole caller reachable from the socket, so a socket peer sending
+    `{"source": "touch", ...}` is refused by the unchanged line below.
+    Implements: LLR-912
+    """
+    if witness:
+        # The contact was observed by this process from a kernel device node.
+        # There are no peer-supplied parameters to validate, and nothing here
+        # may ever grow one.
+        if params != {"source": "touch"}:
+            raise Refused("wake-request-invalid")
+        return
     if set(params) != {"source", "observedAt", "ttlMs"} or params.get("source") not in {"camera", "bluetooth"}:
         raise Refused("wake-request-invalid")
     observed = params.get("observedAt")
@@ -273,6 +325,234 @@ def validate_wake(params: dict, status: dict, now_ms: int | None = None) -> None
                 and now - actual_at < actual_ttl and actual_at >= observed - 2):
             return
     raise Refused("wake-not-observed")
+
+
+def journal(message: str) -> None:
+    """Write one correlatable line to stderr, which systemd routes to the journal."""
+    print(message, file=sys.stderr, flush=True)
+
+
+def backlight_dark(root: Path = BACKLIGHT_ROOT) -> bool:
+    """Return whether every readable backlight reads zero brightness.
+
+    Contract:
+      Inputs:  root: directory of backlight devices (default /sys/class/backlight).
+      Outputs: True only when at least one backlight was readable and all of
+               them read brightness 0.  No readable backlight is NOT darkness:
+               with no evidence the witness declines rather than guessing.
+      Raises:  nothing; an unreadable device contributes no signal.
+    The predicate mirrors `electron/display-lit.cjs` displayLit() for the
+    backlight half: integer files, max_brightness > 0, lit iff brightness > 0.
+    The two sides are pinned by TC-911 here and TC-P-422 in the panel repo so
+    they cannot drift.
+    Implements: LLR-911
+    """
+    signals = []
+    try:
+        entries = sorted(Path(root).iterdir())
+    except OSError:
+        return False
+    for base in entries:
+        brightness, maximum = _integer_file(base / "brightness"), _integer_file(base / "max_brightness")
+        if brightness is None or maximum is None or maximum <= 0 or brightness > maximum:
+            continue
+        signals.append(brightness > 0)
+    return bool(signals) and not any(signals)
+
+
+def _integer_file(path: Path) -> int | None:
+    """Read one non-negative decimal integer, or None if it is not one."""
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def touch_identity(config: dict | None) -> dict:
+    """Return the identity of the input node the witness must open.
+
+    Contract:
+      Inputs:  config: the parsed /etc/wall-panel/touch-filter.json object, or
+               None when the file is absent.
+      Outputs: {"virtual": bool, "name": str, "vendor": int, "product": int} --
+               the daemon's virtual node while the daemon holds EVIOCGRAB on
+               the physical one, otherwise the physical node's own identity.
+      Raises:  Refused("touch-config-invalid") for a config that does not carry
+               a usable physical identity.
+    Never an `eventN` path: node numbers are allocation-order dependent and
+    change across a daemon restart or a USB re-enumeration.
+    Implements: LLR-910
+    """
+    if config is None:
+        raise Refused("touch-config-invalid")
+    if not isinstance(config, dict):
+        raise Refused("touch-config-invalid")
+    name, vendor, product = config.get("name"), config.get("vendor"), config.get("product")
+    if not isinstance(name, str) or not name or type(vendor) is not int or type(product) is not int:
+        raise Refused("touch-config-invalid")
+    if config.get("mode") in TOUCH_GRAB_MODES:
+        return {"virtual": True, "name": TOUCH_VIRTUAL_NAME,
+                "vendor": TOUCH_VIRTUAL_VENDOR, "product": TOUCH_VIRTUAL_PRODUCT}
+    return {"virtual": False, "name": name, "vendor": vendor, "product": product}
+
+
+def select_input_device(evdev, identity: dict):
+    """Return the sole input device matching `identity`; close every other handle.
+
+    Contract:
+      Inputs:  evdev: the python-evdev module (injected for test);
+               identity: as returned by touch_identity().
+      Outputs: one opened evdev.InputDevice.
+      Raises:  Refused("touch-node-missing") for zero matches and
+               Refused("touch-node-ambiguous") for more than one, exactly as
+               touchfilter's own select_device() refuses ambiguity.
+    Implements: LLR-910
+    """
+    found, others = [], []
+    for path in evdev.list_devices():
+        device = evdev.InputDevice(path)
+        if (device.name == identity["name"] and device.info.vendor == identity["vendor"]
+                and device.info.product == identity["product"]):
+            found.append(device)
+        else:
+            others.append(device)
+    for device in others + found[1:]:
+        try:
+            device.close()
+        except OSError:
+            pass
+    if not found:
+        raise Refused("touch-node-missing")
+    if len(found) > 1:
+        raise Refused("touch-node-ambiguous")
+    return found[0]
+
+
+def is_contact_start(event) -> bool:
+    """Return whether the event is the START of one physical contact.
+
+    One wake per contact, not per frame: BTN_TOUCH down is the single event
+    the daemon's virtual device emits at the head of a replayed tap.
+    Implements: LLR-911
+    """
+    return (getattr(event, "type", None) == EV_KEY and getattr(event, "code", None) == BTN_TOUCH
+            and getattr(event, "value", None) == 1)
+
+
+class TouchWitness:
+    """Observe one physical contact on the dark glass and restore the backlight.
+
+    Contract:
+      Inputs:  helper: the Helper that owns the power command;
+               config_path/backlight_root: filesystem seams;
+               clock: a CLOCK_MONOTONIC reader (the clock the filter daemon
+               pins with EVIOCSCLOCKID), evdev_module: injected for test.
+      Outputs: runs as a daemon thread for the life of the helper; never
+               returns while the service is up.
+      Config:  /etc/wall-panel/touch-filter.json (mode/name/vendor/product).
+      Raises:  nothing outward -- a missing node, a wedged daemon or a refused
+               wake is journaled and retried; the witness never fails the
+               helper (LLR-913, the resume case).
+    Implements: LLR-910, LLR-911
+    """
+
+    def __init__(self, helper, config_path=TOUCH_FILTER_CONFIG, backlight_root=BACKLIGHT_ROOT,
+                 clock=time.monotonic, evdev_module=None, log=journal,
+                 retry_s: float = TOUCH_RETRY_S):
+        self.helper = helper
+        self.config_path = Path(config_path)
+        self.backlight_root = Path(backlight_root)
+        self.clock = clock
+        self.evdev_module = evdev_module
+        self.log = log
+        self.retry_s = retry_s
+        self.last_wake = None
+
+    def _config(self) -> dict | None:
+        try:
+            value = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise Refused("touch-config-invalid") from error
+        return value
+
+    def resolve(self):
+        """Re-read the config and open the node its mode selects, by identity."""
+        identity = touch_identity(self._config())
+        device = select_input_device(self._evdev(), identity)
+        self.log("touch-witness: resolved %s node name=%r vendor=%#x product=%#x"
+                 % ("virtual" if identity["virtual"] else "physical", identity["name"],
+                    identity["vendor"], identity["product"]))
+        return device
+
+    def _evdev(self):
+        if self.evdev_module is None:
+            import evdev  # deferred: the dev host has no python-evdev and needs none
+            self.evdev_module = evdev
+        return self.evdev_module
+
+    def contact(self) -> bool:
+        """Apply the preconditions to one observed contact and wake if they hold.
+
+        Returns whether the power command ran.  Declines, with a reason on the
+        journal, when a backlight is lit (ordinary input, owned by the
+        compositor and host-attention.cjs) or when the previous wake is inside
+        the rate limit.
+        Implements: LLR-911
+        """
+        now = self.clock()
+        if not backlight_dark(self.backlight_root):
+            self.log("touch-witness: contact observed, backlight lit — declining")
+            return False
+        if self.last_wake is not None and now - self.last_wake < TOUCH_WAKE_MIN_INTERVAL_S:
+            self.log("touch-witness: contact observed, inside the %.0fs rate limit — declining"
+                     % TOUCH_WAKE_MIN_INTERVAL_S)
+            return False
+        self.log("touch-witness: contact observed, brightness=0, requesting touch-wake")
+        try:
+            self.helper.wake({"source": "touch"}, witness=True)
+        except (Refused, OSError, subprocess.SubprocessError) as error:
+            self.log("touch-witness: touch-wake failed (%s)" % error)
+            return False
+        self.last_wake = now
+        self.log("touch-witness: touch-wake completed")
+        return True
+
+    def run(self, stop=None) -> None:
+        """Block on the node for ever, re-resolving by identity when it vanishes.
+
+        `stop` is a test seam: a callable that returns True to leave the loop.
+        """
+        while stop is None or not stop():
+            device = None
+            try:
+                device = self.resolve()
+                for event in device.read_loop():
+                    if is_contact_start(event):
+                        self.contact()
+                    if stop is not None and stop():
+                        return
+            except (Refused, OSError, ValueError, ImportError) as error:
+                self.log("touch-witness: node unavailable (%s) — re-resolving" % error)
+            finally:
+                if device is not None:
+                    try:
+                        device.close()
+                    except OSError:
+                        pass
+            if stop is not None and stop():
+                return
+            time.sleep(self.retry_s)
+
+
+def start_touch_witness(helper, **kwargs) -> threading.Thread:
+    """Start the witness as a daemon thread; it must never fail the helper."""
+    witness = TouchWitness(helper, **kwargs)
+    thread = threading.Thread(target=witness.run, name="touch-witness", daemon=True)
+    thread.start()
+    return thread
 
 
 class Helper:
@@ -306,6 +586,29 @@ class Helper:
                 host = desired
         return panel, host, state
 
+    def wake(self, params: dict, *, witness: bool = False) -> dict:
+        """Validate one wake and run the single power command.
+
+        Contract:
+          Inputs:  params: the socket peer's claim, or {"source": "touch"} from
+                   the in-process witness; witness: keyword-only, True only for
+                   that witness.
+          Outputs: {"woke": True}.
+          Raises:  Refused from validate_wake; subprocess errors unchanged.
+        One place runs the power command for both paths; the arm differs so the
+        journal attributes the restore to its evidence.
+        Implements: LLR-912, LLR-913
+        """
+        if witness:
+            validate_wake(params, {}, witness=True)
+            command = TOUCH_POWER_COMMAND
+        else:
+            validate_wake(params, sensor_status())
+            command = POWER_COMMAND
+        subprocess.run(command, check=True, timeout=5, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"woke": True}
+
     def request(self, request: object) -> dict:
         if not isinstance(request, dict) or set(request) != {"method", "params"} or not isinstance(request["params"], dict):
             raise Refused("request-invalid")
@@ -316,11 +619,8 @@ class Helper:
                 raise Refused("request-invalid")
             return current_status(host, state, self.auth_paths)
         if method == "wake":
-            status = sensor_status()
-            validate_wake(params, status)
-            subprocess.run(POWER_COMMAND, check=True, timeout=5, stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return {"woke": True}
+            # Never witness=True: a socket peer is not a witness (LLR-912).
+            return self.wake(params)
         if method != "configure" or set(params) - {"expectedRevision", "accessMode", "session", "pin"}:
             raise Refused("request-invalid")
         if params.get("accessMode") != "local" or type(params.get("expectedRevision")) is not int:
@@ -381,4 +681,8 @@ def serve(helper: Helper, socket_path: str = SETUP_SOCKET) -> None:
 
 
 if __name__ == "__main__":
-    serve(Helper())
+    _helper = Helper()
+    # The witness is a thread of the existing power owner: no new privileged
+    # process, no new socket, and no new path from the kiosk account to power.
+    start_touch_witness(_helper)
+    serve(_helper)

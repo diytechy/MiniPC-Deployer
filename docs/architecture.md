@@ -190,6 +190,33 @@ sequenceDiagram
     P->>P: backlight on; lock state unchanged
 ```
 
+### A tap wakes the dark panel (SR-020, LLR-910..913)
+
+The requester is never its own witness. Root observes the contact itself, in
+the helper's own address space, from a kernel device node — so there is no
+request and no parameter for the kiosk account to forge, and Electron gains no
+touch claim. In `filter`/`adaptive` mode the touch daemon holds an exclusive
+`EVIOCGRAB` on the physical node, so the witness reads the daemon's ungrabbed
+virtual node instead; in `off`/`shadow` it reads the physical one. Either is
+resolved by identity, never by `eventN`. The first tap wakes; the second
+interacts, because the compositor ignores input observed while dark.
+
+```mermaid
+sequenceDiagram
+    %% Renders SR-020, LLR-910, LLR-911, LLR-912, LLR-913
+    participant F as finger
+    participant D as wall-touch-filter (holds EVIOCGRAB)
+    participant W as touch witness thread (in the root helper)
+    participant P as wall-sleep sole power writer
+    F->>D: physical contact
+    D->>D: classify; a fault is deliberately not a wake
+    D->>W: replayed BTN_TOUCH down on the virtual node
+    W->>W: read /sys/class/backlight; require every one zero
+    W->>W: rate limit, one wake per 2 s on CLOCK_MONOTONIC
+    W->>P: touch-wake (validate_wake witness seam, no peer params)
+    P->>P: clear the absence stamp; backlight on; no re-sleep timer
+```
+
 ### Audio activity to a verified amplifier contact (SR-026, LLR-010, IF-017)
 
 The application remains hardware-blind. Every source reaches the common ALSA

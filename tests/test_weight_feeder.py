@@ -3927,6 +3927,42 @@ def test_an_implausible_waist_count_is_refused_ni_a2(count):
         feeder.waist_from_today(a_today(count=count), "waist-in", NOW)
 
 
+@pytest.mark.parametrize("count", [335, 3.5, -35, "wide"])
+def test_no_waist_measurement_ever_reaches_a_message_sr022(count):
+    """A WAIST IS HEALTH DATA WHETHER IT WAS FETCHED OR TYPED.
+
+    This branch made that rule for the vendor height
+    (`test_no_vendor_height_ever_reaches_a_message_sr022`) and then broke it
+    for the waist, whose band message quoted the value with `%r` — and
+    `ratio_cycle` journals a SourceFailure's message. Nothing diagnostic is
+    lost: the band is still in the message, so it still says go and look at
+    the waist row. Adversarial review 2026-09-14.
+    """
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.check_plausible_waist_in(count, "waist-in")
+    message = str(raised.value)
+    assert str(count) not in message
+    assert "not logged" in message
+    # It still says WHICH of the two things was wrong — an unusable number, or
+    # a number outside the band — without ever quoting the number itself.
+    assert ("band" in message) or ("not a usable number" in message)
+
+
+def test_no_derived_ratio_ever_reaches_a_message_sr022():
+    """THE RATIO IS BOTH MEASUREMENTS IN ONE NUMBER.
+
+    A waist read in centimetres (85) against a real height (70 in) is 1.21,
+    which no body is — and that mixed-unit case, the one this band exists to
+    catch, was exactly the case that printed the pair's quotient into the
+    journal. Adversarial review 2026-09-14.
+    """
+    with pytest.raises(feeder.SourceFailure) as raised:
+        feeder.waist_height_ratio(85.0, 70.0)
+    message = str(raised.value)
+    assert "1.21" not in message and "1.214" not in message
+    assert "wrong unit" in message, "it still names the likely cause"
+
+
 def test_the_today_url_is_derived_from_the_verified_feed_url_ni_a2():
     """NO SECOND DESTINATION KNOB, because there is no second thing to police.
 
@@ -3943,6 +3979,36 @@ def test_the_today_url_is_derived_from_the_verified_feed_url_ni_a2():
     source = MODULE_PATH.read_text(encoding="utf-8")
     assert 'WEIGHT_TODAY_URL"' not in source, (
         "the destination is derived, not read from the environment")
+
+
+def test_the_today_url_is_derived_from_the_url_not_from_the_string_ni_a2():
+    """A QUERY STRING CARRIES SLASHES, AND THE LAST ONE IS NOT A PATH SEGMENT.
+
+    `resolve_feed_url` vouches for the scheme and the HOST — which is the whole
+    of its job, since the danger is the tracker token leaving this box — and
+    constrains the path, query and fragment not at all. Splitting the raw
+    STRING on its last slash therefore cut inside the query of a perfectly
+    acceptable feed URL, and the "derived" URL still pointed at /api/feed: the
+    waist read would GET the feed endpoint, find no waist in it, and the ratio
+    would go missing with nothing saying why. Adversarial review 2026-09-14.
+    """
+    derive = feeder.today_url_from_feed
+    # The query and the fragment are DROPPED rather than carried: /api/today
+    # takes neither, and anything inherited from the POST URL is noise this
+    # feeder never meant to send.
+    assert derive("http://127.0.0.1:8080/api/feed?next=/x") == \
+        "http://127.0.0.1:8080/api/today"
+    assert derive("http://127.0.0.1:8080/api/feed?a=1&b=2") == \
+        "http://127.0.0.1:8080/api/today"
+    assert derive("http://127.0.0.1:8080/api/feed#frag") == \
+        "http://127.0.0.1:8080/api/today"
+    # A non-standard mount point keeps its prefix, which is the whole reason
+    # the last segment is replaced rather than the path being hard-coded.
+    assert derive("http://naglight:8080/tracker/api/feed") == \
+        "http://naglight:8080/tracker/api/today"
+    # Userinfo and a port live in the netloc and must survive intact.
+    assert derive("https://127.0.0.1:9443/api/feed/") == \
+        "https://127.0.0.1:9443/api/today"
 
 
 def test_the_waist_read_sends_the_identity_and_goes_nowhere_else_ni_a2():
@@ -4315,6 +4381,39 @@ def test_a_transient_failure_reposts_the_cached_ratio_ni_a2(tmp_path):
     assert ratio_body[0]["observed_at"] == feeder.iso8601_utc(CAPTURED_AT)
     assert ("weight-waist", False, True) in posted, "posted, but not fresh"
     assert any("height" in line for line in failures), "and the failure is named"
+
+
+def test_one_fresh_half_does_not_make_a_fresh_ratio_ni_a2(tmp_path):
+    """TWO SOURCES DATE THIS GAUGE, SO BOTH DECIDE THE WORD.
+
+    `fresh` means here what it means in `build_post` — "the body carries a
+    stamp from THIS cycle's read" — and it is what the operator line prints as
+    `live` rather than `UNAVAILABLE`. It was set by the waist branch alone, so
+    a waist read this minute against a height cached a month ago reported
+    `live` over a body `build_ratio_post` had deliberately stamped with the
+    OLDER half: the cached repost the flag exists to distinguish, announcing
+    itself as a live reading. Adversarial review 2026-09-14.
+    """
+    def dead(_env):
+        raise feeder.SourceFailure("the source is down")
+
+    # Cycle 1 caches both halves.
+    env = ratio_env(tmp_path, "http://127.0.0.1:1/api/feed")
+    run_with_ratio(env, [])
+
+    # A live waist over a cached height is NOT a fresh ratio...
+    posts = []
+    posted, _failures, _ = run_with_ratio(env, posts, height_reader=dead)
+    assert ("weight-waist", False, True) in posted
+    assert [body for body in posts if body["id"] == "weight-waist"], "still posted"
+
+    # ...and neither is a live height over a cached waist.
+    posted, _failures, _ = run_with_ratio(env, [], waist_reader=dead)
+    assert ("weight-waist", False, True) in posted
+
+    # Both halves read in one cycle is the only fresh ratio.
+    posted, _failures, _ = run_with_ratio(env, [])
+    assert ("weight-waist", True, True) in posted
 
 
 def test_a_cycle_that_changes_nothing_does_not_rewrite_the_state_file_ni_a2(

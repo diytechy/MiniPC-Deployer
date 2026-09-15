@@ -1760,15 +1760,30 @@ def check_plausible_waist_in(value, where):
     by hand - so unlike the two vendor bands it is catching a typo (`335` for
     `33.5`) at least as often as a units error.
 
+    THE NUMBER STAYS OUT OF THE JOURNAL, for the reason `check_vendor_metres`
+    keeps the height out of it: a waist is a body measurement about a specific
+    person, and `ratio_cycle` journals a SourceFailure's message. This branch
+    made that rule for the vendor half and then broke it here, where the
+    measurement is no less personal for having been typed rather than fetched.
+    Nothing diagnostic is lost - the band is still in the message, so "go and
+    look at the waist row" is still what it says. Found by adversarial review
+    2026-09-14.
+
     Implements: LLR-006
     """
-    inches = check_pounds(value, where)
+    try:
+        inches = check_pounds(value, where)
+    except SourceFailure:
+        raise SourceFailure(
+            "%s: the waist is not a usable number (it is a %s). The value is "
+            "not logged." % (where, type(value).__name__))
     low, high = PLAUSIBLE_WAIST_IN
     if inches < low or inches > high:
         raise SourceFailure(
-            "%s: %r in is outside the plausible band %g..%g, so it is a typo, "
-            "a units error or corruption rather than a waist measurement"
-            % (where, value, low, high))
+            "%s: the waist is outside the plausible band %g..%g in, so it is a "
+            "typo, a units error or corruption rather than a waist "
+            "measurement. The value is not logged: it is health data."
+            % (where, low, high))
     return inches
 
 
@@ -1800,11 +1815,17 @@ def waist_height_ratio(waist_in, height_in, where="ratio"):
     ratio = round(float(waist_in) / float(height_in), DISPLAY_DECIMALS_RATIO)
     low, high = PLAUSIBLE_RATIO
     if not math.isfinite(ratio) or ratio < low or ratio > high:
+        # AND THE RATIO IS NOT LOGGED EITHER. It is built from two body
+        # measurements and divides one by the other, so a journal line carrying
+        # it hands out the pair in one number as surely as printing them would
+        # - and the mixed-unit case this band exists to catch is the case where
+        # it gets printed. The band says what was wrong without it.
+        # Adversarial review 2026-09-14.
         raise SourceFailure(
-            "%s: a waist-to-height ratio of %r is outside %g..%g, so the two "
+            "%s: the waist-to-height ratio is outside %g..%g, so the two "
             "measurements do not describe one person - most likely one of them "
-            "is in the wrong unit. No ratio is posted."
-            % (where, ratio, low, high))
+            "is in the wrong unit. No ratio is posted, and the value is not "
+            "logged: it is health data." % (where, low, high))
     return ratio
 
 
@@ -3804,7 +3825,7 @@ def today_url_from_feed(feed_url):
     Contract:
       Inputs:  feed_url: the value `resolve_feed_url` vouched for.
       Outputs: the same origin and path with the last segment replaced by
-               `today`.
+               `today`, carrying NO query and NO fragment.
 
     THERE IS DELIBERATELY NO `WEIGHT_TODAY_URL` KNOB. `resolve_feed_url`
     refuses any destination that is not this box's loopback or a local docker
@@ -3814,10 +3835,26 @@ def today_url_from_feed(feed_url):
     route - would send the token out through oauth2-proxy with nothing
     refusing it. Deriving keeps ONE verified destination.
 
+    IT SPLITS THE URL RATHER THAN THE STRING, and that is a fix rather than a
+    tidy-up. `resolve_feed_url` vouches for the SCHEME and the HOST - which is
+    the whole of what it is for, since the danger it exists to stop is the
+    token leaving this box - and says nothing at all about the path, the query
+    or the fragment. A perfectly acceptable `.../api/feed?x=/y` therefore had
+    its LAST SLASH inside the query string, so the last "segment" replaced was
+    part of the query and the derived URL still pointed at `/api/feed`: the
+    waist read would GET the feed endpoint and fail to find a waist in it, with
+    nothing anywhere saying why. Splitting on the URL's real grammar replaces
+    the last PATH segment, and the query and fragment are dropped rather than
+    carried, because `/api/today` takes neither and anything inherited from the
+    POST URL would be noise this feeder never meant to send.
+    Found by adversarial review 2026-09-14.
+
     Implements: SR-022, LLR-006
     """
-    head, _sep, _tail = feed_url.rstrip("/").rpartition("/")
-    return (head or feed_url.rstrip("/")) + "/today"
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(feed_url)
+    head, _sep, _tail = parts.path.rstrip("/").rpartition("/")
+    return urlunsplit((parts.scheme, parts.netloc, head + "/today", "", ""))
 
 
 def read_waist_measurement(env, url=None):
@@ -3925,12 +3962,23 @@ def ratio_cycle(env, state, now, poster, feed_url, timeout, failures,
     """
     defs_dir = env.get("WEIGHT_DEFINITIONS_DIR") or ""
     category, item_id = resolve_waist_location(env)
-    fresh = False
+    # THIS GAUGE HAS TWO SOURCES, SO IT IS FRESH ONLY WHEN THIS CYCLE READ BOTH.
+    # `fresh` means the same thing here as it does in `build_post` - "the body
+    # carries a stamp from this cycle's read", the word the operator line turns
+    # into "live" - and it was set by the WAIST branch alone. A waist read this
+    # minute against a height cached a month ago therefore printed "live" over a
+    # body `build_ratio_post` had stamped with the OLDER half, which is the
+    # cached-repost case the line exists to distinguish. Both halves date this
+    # ratio, so both halves decide the word. Found by adversarial review
+    # 2026-09-14.
+    fresh_height = False
+    fresh_waist = False
 
     height = state.get(HEIGHT_STATE_KEY)
     try:
         reading = (height_readers or HEIGHT_READERS)[enabled_source(env)](env)
         height = {"value": reading.inches, "observed_at": reading.observed_at}
+        fresh_height = True
         state[HEIGHT_STATE_KEY] = height
     except NoWeightYet:
         # No height logged is not a failure and gets no journal line: the
@@ -3949,7 +3997,7 @@ def ratio_cycle(env, state, now, poster, feed_url, timeout, failures,
         inches, stamp = (waist_reader or read_waist_measurement)(env)
         waist = {"value": inches, "observed_at": stamp}
         state[WAIST_STATE_KEY] = waist
-        fresh = True
+        fresh_waist = True
     except NoWeightYet:
         pass
     except SourceFailure as exc:
@@ -3972,7 +4020,7 @@ def ratio_cycle(env, state, now, poster, feed_url, timeout, failures,
         ok, detail = False, type(exc).__name__
     if not ok:
         failures.append("post %s: %s" % (RATIO_GAUGE_ID, detail))
-    return (RATIO_GAUGE_ID, fresh, ok)
+    return (RATIO_GAUGE_ID, fresh_height and fresh_waist, ok)
 
 
 def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,

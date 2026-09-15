@@ -2187,13 +2187,36 @@ stage_wall_shell_into_payload() {
 #   WALL_ACCESS_MODE=local        local access needs the panel's own sensing
 #   WALL_CAMERA_ENABLED=true      (TRUE/yes/1 also count, same as elsewhere)
 #   WALL_CAMERA_DEVICE=<anything> a camera node is explicitly configured
+#
+# 2026-09-15 terra review #4: an earlier version of this function re-parsed
+# the env file with three hand-written greps, independent of and slightly
+# different from wall-firstboot.sh's load_env_file (e.g. a quoted
+# WALL_CAMERA_DEVICE value, or one followed by a trailing comment, matched
+# load_env_file's export but not this function's raw regex). Two parsers of
+# the same file shape can only drift, so this now BORROWS load_env_file
+# itself out of wall-firstboot.sh — the single source both a build-time
+# script and a boot-time one now actually run — in a subshell, so nothing it
+# exports leaks into the caller.
 wall_camera_option_configured() {
     local env_file="$1"
     [ -f "$env_file" ] || return 1
-    grep -qE '^[[:space:]]*WALL_ACCESS_MODE=[[:space:]]*local[[:space:]]*(#.*)?$' "$env_file" && return 0
-    grep -qE '^[[:space:]]*WALL_CAMERA_ENABLED=[[:space:]]*(true|TRUE|yes|1)[[:space:]]*(#.*)?$' "$env_file" && return 0
-    grep -qE '^[[:space:]]*WALL_CAMERA_DEVICE=[^[:space:]#][^[:space:]]*' "$env_file" && return 0
-    return 1
+    local firstboot; firstboot="$(repo_root)/stack/autoinstall/wall/wall-firstboot.sh"
+    [ -f "$firstboot" ] || die "wall_camera_option_configured: cannot find $firstboot to borrow load_env_file from"
+    (
+        # shellcheck disable=SC1090
+        eval "$(sed -n '/^load_env_file()/,/^}/p' "$firstboot")"
+        if ! declare -F load_env_file >/dev/null; then
+            echo "[vmtest] FATAL: could not extract load_env_file() out of $firstboot — has its shape changed?" >&2
+            exit 2
+        fi
+        load_env_file "$env_file"
+        [ "${WALL_ACCESS_MODE:-gateway}" = "local" ] && exit 0
+        case "${WALL_CAMERA_ENABLED:-false}" in
+            true|TRUE|yes|1) exit 0 ;;
+        esac
+        [ -n "${WALL_CAMERA_DEVICE:-}" ] && exit 0
+        exit 1
+    )
 }
 
 # stage_wall_sensors_into_payload OUT_DIR — carry the verified local runtime on

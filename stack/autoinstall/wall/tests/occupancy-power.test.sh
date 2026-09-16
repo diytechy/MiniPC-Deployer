@@ -1152,6 +1152,22 @@ write_env "SLEEP_MODE=suspend"
 run start
 eq "yes" "$(suspended)" "A24 the scheduled 22:00 suspend is unchanged by the wake guard"
 
+# A25 (TC-917): panel-owned display-off is a third, serialized arm. It does
+# not invoke the dormant occupancy decider, does not create an absence clock or
+# suspend, and an already-dark panel remains a successful idempotent request.
+scenario a25-panel-display-off
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=false"
+run panel-display-off
+eq "0" "$?" "A25 panel display-off exits 0 after a verified dark write"
+eq "0" "$(brightness)" "A25 panel display-off writes brightness 0"
+eq "0" "$(decider_calls)" "A25 panel display-off does not consult occupancy"
+eq "no" "$(suspended)" "A25 panel display-off does not suspend"
+grep -q 'panel concluded FULLSCREEN absence' "$ROOT/out.log" \
+    && pass "A25 journal attributes darkness to the panel conclusion" \
+    || fail "A25 panel display-off lacked an attributable journal line"
+run panel-display-off
+eq "0" "$?" "A25 an already-dark panel display-off remains success"
+
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

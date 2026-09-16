@@ -32,9 +32,9 @@ VOLUME_MIN, VOLUME_MAX = 0, 100
 # One rocker press. The bus level is a PERCENTAGE rather than the adapter's raw
 # 0..197 steps, so that it means the same thing on the headset card, whose own
 # control has 38 (both measured on the panel 2026-09-13).
-VOLUME_STEP = 4
+VOLUME_STEP = 5
 # What the level lands on when the rocker is released (Owner, 2026-09-15). The
-# ramp itself is not quantised -- only the resting place is. See _snap_volume.
+# Rocker movements are grid steps; RampPlanner carries fractional time debt.
 VOLUME_SNAP = 5
 
 # ── the mic legs (step 4, item 23 C / D3 / D4) ─────────────────────────────
@@ -482,22 +482,29 @@ def _nudge_volume(state, event):
         raise StateError("step must be an integer percentage")
     if not 1 <= step <= VOLUME_MAX:
         raise StateError("step must be 1..%d" % VOLUME_MAX)
+    level = volume_of(state)
+    # WSN-062: the opening movement repairs an old off-grid value in the
+    # direction travelled. Later planner requests are whole increments, with
+    # their fractional time debt carried upstream rather than rounded away.
+    if level % VOLUME_SNAP:
+        target = ((level + VOLUME_SNAP - 1) // VOLUME_SNAP) * VOLUME_SNAP if louder \
+            else (level // VOLUME_SNAP) * VOLUME_SNAP
+    else:
+        target = level + (step if louder else -step)
     state["volume_event_seq"] = (state["volume_event_seq"] + 1) % 9007199254740992
-    delta = step if louder else -step
-    return _store_volume(state, clamp_volume(volume_of(state) + delta))
+    return _store_volume(state, clamp_volume(target))
 
 
 def _snap_volume(state, event):
-    """Round the level to the nearest multiple of `to`, and stop there.
+    """Safety-net an abnormal old level onto the grid; normal gestures need it not.
 
     The rocker sent one of these when the Owner let go (Owner ruling,
     2026-09-15: "I'd like the volume to land at / round to 5% increments after
     a release"). It runs ONCE per gesture, at the end -- NOT on every ramp step.
-    Rounding each step instead would be both lumpy and inaccurate: steps are
-    sized by time held, about 13% at a time, and rounding each one to 5% can err
-    by 2.5% twice a second, which over a 3 s hold is a 15% drift from the rate
-    the ramp promises. Snapping only at the end keeps the ramp exact and still
-    lands on a round number.
+    It was right that independently rounding 13%-ish time samples loses up to
+    2.5% twice a second. That is not this design: RampPlanner carries the
+    fractional time debt and releases only complete 5% increments, so no error
+    is discarded. A normal gesture is already on-grid and this is a no-op.
 
     Nearest, not "further in the direction travelled": after the first gesture
     the level is already on the grid, so every later tap moves exactly one
@@ -509,9 +516,11 @@ def _snap_volume(state, event):
         raise StateError("snap increment must be an integer")
     if not 1 <= to <= VOLUME_MAX:
         raise StateError("snap increment must be 1..%d" % VOLUME_MAX)
-    state["volume_event_seq"] = (state["volume_event_seq"] + 1) % 9007199254740992
     level = volume_of(state)
-    return _store_volume(state, clamp_volume(int(round(level / float(to))) * to))
+    target = clamp_volume(int(round(level / float(to))) * to)
+    if target != level:
+        state["volume_event_seq"] = (state["volume_event_seq"] + 1) % 9007199254740992
+    return _store_volume(state, target)
 
 
 def _store_volume(state, level):

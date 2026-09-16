@@ -297,11 +297,13 @@ class RampPlanner:
     """
 
     def __init__(self, tap=TAP_PERCENT, threshold=HOLD_THRESHOLD_S,
-                 rate=RAMP_PERCENT_PER_S, gap=HOLD_GAP_S):
+                 rate=RAMP_PERCENT_PER_S, gap=HOLD_GAP_S,
+                 increment=SNAP_PERCENT):
         self.tap = tap
         self.threshold = threshold
         self.rate = rate
         self.gap = gap
+        self.increment = increment
         self.louder = None      # None when no burst is in progress
         self.contact = None     # last event from the device: the finger was down
         self.ramp_from = None   # the instant un-issued ramp starts accruing
@@ -319,8 +321,29 @@ class RampPlanner:
             return 0
         self.louder = louder
         self.contact = now
+        # THE TAP IS NOT THE FIRST 5% OF THE RAMP, and an implementation that
+        # made it so was reverted on 2026-09-16. The Owner's specification has
+        # TWO separate charges -- "a press and release bumps 5%" AND "holding it
+        # past 600 ms ramps at 25% per second" -- so the ramp starts at the hold
+        # THRESHOLD, not at tap/rate. Starting it at 0.2 s instead makes a 1.0 s
+        # hold move 25% where this file's own two measured records (see settle()
+        # and _use_monotonic_timestamps) both say 15% is owed, and it speeds the
+        # rocker up under cover of a requirement about grid alignment.
         self.ramp_from = now + self.threshold
         return self.tap if louder else -self.tap
+
+    def _units_owed(self, edge):
+        """Whole settle-increments of ramp accrued up to `edge`, unpaid.
+
+        THE SINGLE ANSWER TO "IS AN INCREMENT OWED". `due` pays this many and
+        `settle` refuses to close while it is non-zero; they must never compute
+        it two ways. The epsilon absorbs the float error `ramp_from` accumulates
+        from repeated `+= step / rate` -- a debt of exactly one increment
+        otherwise evaluates to 0.9999999999999998 and truncates to nothing.
+        """
+        if self.ramp_from is None or edge < self.ramp_from:
+            return 0
+        return int((edge - self.ramp_from) * self.rate / self.increment + 1e-9)
 
     def release(self, now):
         """Take a release. Does NOT end the hold -- a repeat may follow in ~100 ms.
@@ -350,7 +373,24 @@ class RampPlanner:
         """
         if self.louder is None or now - self.contact <= self.gap:
             return False
-        if int((self.contact - self.ramp_from) * self.rate) >= 1:
+        # ONE FUNCTION ANSWERS "IS AN INCREMENT OWED", AND BOTH CALLERS USE IT.
+        # `ramp_from` is advanced by repeated `+= step / rate`, so a debt of
+        # EXACTLY one increment computes as 0.9999999999999998 and truncates to
+        # zero. Under the old per-percent test that cost nothing -- 4.999...
+        # still truncated to 4, which is >= 1 -- but compared against a whole
+        # INCREMENT the same float lands on the wrong side of the only branch
+        # that decides whether the burst stays open.
+        #
+        # Two NEARLY identical tolerances is not good enough here, and review
+        # caught the second draft doing exactly that: `>= increment - 1e-9` in
+        # this method against `int(debt / increment + 1e-9)` in `due` are not the
+        # same predicate -- for a 5% increment they disagree over a band about
+        # 4e-9 wide, and in that band `settle` cancels a burst `due` would still
+        # have paid. `due` can carry a remainder; `settle` cannot, because it
+        # cancels, so the disagreement costs a whole increment of movement the
+        # finger earned. That is the 2026-09-15 defect returning by a third
+        # route -- "a 1.0 s hold moved 10% where 15% was owed".
+        if self._units_owed(self.contact) >= 1:
             return False
         self.cancel()
         return True
@@ -372,18 +412,25 @@ class RampPlanner:
         """The ramp step owed now, as (louder, percent), or None.
 
         Accrues to `contact`, never to `now`: time after the finger lifted is
-        not owed. Returns None until a whole percent has built up, so the
-        applier is never woken for a step too small to hear.
+        not owed. Returns None until a whole grid increment has built up. The
+        fractional debt stays in `ramp_from`: quantising the ISSUED movement is
+        not independently rounding each sample, so it cannot accumulate the
+        drift that WSN-062 rejects.
         """
         if self.louder is None:
             return None
         edge = min(now, self.contact)
         if edge < self.ramp_from:
             return None
-        step = int((edge - self.ramp_from) * self.rate)
-        if step < 1:
+        # THE SAME FUNCTION settle() USES, not merely a similar expression. These
+        # two are the payer and the terminator of one debt: if they disagree
+        # about whether an increment is owed, the burst either never closes or
+        # drops movement the finger earned. Sharing `_units_owed` is what makes
+        # disagreement impossible rather than unlikely.
+        units = self._units_owed(edge)
+        if units < 1:
             return None
-        step = min(step, 100)
+        step = min(units * self.increment, 100)
         self.ramp_from += step / self.rate
         return self.louder, step
 
@@ -399,10 +446,35 @@ class RampPlanner:
         settle_at = self.contact + self.gap
         if now < self.ramp_from:
             return max(0.0, min(self.ramp_from, settle_at) - now)
-        return max(0.0, min(1.0 / self.rate, settle_at - now))
+        return max(0.0, min(self.increment / self.rate, settle_at - now))
 
 
 VOLUME_SOCKET = "/run/wall-volume-request.sock"
+GESTURE_STAMP = "/run/wall-panel/volume-gesture.json"
+
+
+def publish_gesture():
+    """Publish only the fact of a fresh physical press, before its slow apply.
+
+    This is not a control surface: root writes a fixed, mode-0644 reading and
+    the shell accepts it only while its wall-clock age is bounded.  A daemon
+    killed mid-gesture therefore leaves at most that bounded reading behind.
+    """
+    try:
+        with open(GESTURE_STAMP, "w") as stamp:
+            stamp.write('{"pressedAtMs":%d}\n' % int(time.time() * 1000))
+        os.chmod(GESTURE_STAMP, 0o644)
+    except OSError as exc:
+        print("volume gesture stamp: %s" % exc, file=sys.stderr, flush=True)
+
+
+def clear_gesture():
+    try:
+        os.unlink(GESTURE_STAMP)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print("volume gesture clear: %s" % exc, file=sys.stderr, flush=True)
 
 
 def request_bus(payload):
@@ -477,10 +549,33 @@ def nudge(louder, percent):
     if state is None:
         return
     values, maximum = state
-    step = max(1, int(round(maximum * (max(1, min(100, int(percent))) / 100.0))))
+    # THE PHYSICAL-CARD GRID IS THE MIXER'S, NOT A TRUE 5% OF FULL SCALE, and
+    # that is a knowing approximation rather than an oversight. `grain` is
+    # round(maximum * 5%) in the control's own raw units, so on a control whose
+    # maximum is not a multiple of 20 the grain multiples land NEAR 5% steps and
+    # not exactly on them -- a maximum of 38 gives grain 2, and 2/38 is 5.26%.
+    # It is kept because the mixer IS the state on this path (there is no percent
+    # anywhere to be the truth), because `snap` above has always computed the
+    # grid this way so changing only one of them would put two grids on one
+    # control, and because WSN-062's actual complaint -- a level that appears and
+    # is then taken back -- is fixed by stepping onto whatever grid is in force,
+    # whatever its spacing. Raised in review 2026-09-16 and accepted.
+    #
+    # It is also not the deployed path: the panel runs WALL_AUDIO_MODE=bus, where
+    # the applier owns a real percentage and the grid is exact. This arm covers
+    # trigger/panel mode.
+    grain = max(1, int(round(maximum * (SNAP_PERCENT / 100.0))))
+    step = max(grain, int(round(maximum * (max(1, min(100, int(percent))) / 100.0))))
     for i in FRONT_CHANNELS:
         if i < len(values):
-            values[i] = min(maximum, max(0, values[i] + (step if louder else -step)))
+            old = values[i]
+            # The first movement from an old off-grid mixer value lands ON the
+            # grid in its travelled direction; it does not overshoot then snap.
+            if old % grain:
+                values[i] = min(maximum, ((old + grain - 1) // grain) * grain) if louder \
+                    else max(0, (old // grain) * grain)
+            else:
+                values[i] = min(maximum, max(0, old + (step if louder else -step)))
     _run(card, ["cset", "name=" + kcontrol, ",".join(str(v) for v in values)])
     # The mute switch is pswitch-joined, so this is one switch for every channel.
     _run(card, ["-q", "sset", control, "unmute"])
@@ -611,6 +706,8 @@ def main():
                     if SWAP_FOR_PANEL_ORIENTATION:
                         louder = not louder
                     if value == KEY_PRESS:
+                        if not planner.held():
+                            publish_gesture()
                         tap_net += planner.press(louder, when)
                     elif value == KEY_RELEASE:
                         # NOT the end of a hold -- this rocker sends a release
@@ -642,8 +739,12 @@ def main():
         # BEFORE the apply, so a finger that came up is known to be up before
         # anything else is spent.
         if planner.settle(time.monotonic()):
-            # The gesture is over and fully paid. Land on a round number.
+            # Safety net only: WSN-062 makes normal movements grid-aligned, so
+            # this is a no-op after a normal gesture. It remains for a damaged
+            # pre-existing physical mixer value; removing it would make recovery
+            # depend on another press.
             snap(SNAP_PERCENT)
+            clear_gesture()
             continue
 
         # One apply per pass, tap first. Unmuting rides along inside nudge(), so

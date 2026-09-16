@@ -572,6 +572,40 @@ def test_one_place_runs_the_power_command_tc912(monkeypatch):
 
 
 @pytest.mark.smoke
+def test_panel_display_off_accepts_only_its_empty_conclusion_shape_tc915(monkeypatch):
+    # display-off is a renderer conclusion, not a sensor observation. In
+    # particular, accepting wake's evidence tuple here would accidentally make
+    # the image re-adjudicate the panel's 30-second state machine.
+    for params in ({},):
+        SETUP.validate_display_off(params)
+    for params in ({"source": "camera", "observedAt": 1, "ttlMs": 1},
+                   {"source": "touch"}, {"observedAt": 1}, {"reason": "absence"},
+                   {"source": "bluetooth", "ttlMs": 1}):
+        with pytest.raises(SETUP.Refused, match="display-off-request-invalid"):
+            SETUP.validate_display_off(params)
+
+    ran = []
+    monkeypatch.setattr(SETUP.subprocess, "run", lambda command, **kwargs: ran.append(command))
+    helper = SETUP.Helper()
+    assert helper.display_off({}) == {"displayOff": True}
+    assert ran == [SETUP.DISPLAY_OFF_COMMAND]
+    assert SETUP.DISPLAY_OFF_COMMAND == ("/usr/local/sbin/wall-sleep.sh", "panel-display-off")
+
+
+@pytest.mark.smoke
+def test_socket_keeps_wake_and_display_off_validation_separate_tc916(monkeypatch):
+    helper = SETUP.Helper()
+    monkeypatch.setattr(SETUP.Helper, "reconcile",
+                        lambda self: (None, {"enabled": False}, {"revision": 0}))
+    monkeypatch.setattr(SETUP.subprocess, "run", lambda *args, **kwargs: None)
+    assert helper.request({"method": "display-off", "params": {}}) == {"displayOff": True}
+    with pytest.raises(SETUP.Refused, match="display-off-request-invalid"):
+        helper.request({"method": "display-off", "params": {"source": "camera", "observedAt": 1, "ttlMs": 1}})
+    with pytest.raises(SETUP.Refused, match="wake-request-invalid"):
+        SETUP.validate_wake({}, {})
+
+
+@pytest.mark.smoke
 def test_a_node_that_disappears_is_re_resolved_and_reads_again_tc913(tmp_path):
     """Resolve, wake, lose the node, re-resolve at a NEW minor, wake again.
 
@@ -673,4 +707,3 @@ def test_the_hardware_wake_measurement_is_read_only_and_recorded_tc914():
     burn_in = (WALL / "WALL-BURN-IN.md").read_text(encoding="utf-8")
     assert "wall-touch-wakeup-report.sh" in burn_in
     assert "### Measured hardware-wake facts" in burn_in
-

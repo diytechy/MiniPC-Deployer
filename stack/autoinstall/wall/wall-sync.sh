@@ -358,11 +358,33 @@ flow_spec() {
             F_LEAF="frame"
             F_MANIFEST="playlist.json"
             F_POLICY="skip-if-unreachable"
-            # Bounded well inside wall-sync-frame.service's TimeoutStartSec: the
-            # frame set is a handful of rendered videos, so a run still going
-            # after this is stuck, not busy.
+            # THE "HANDFUL OF RENDERED VIDEOS" WAS WRONG, AND THE 90 s BUDGET
+            # BUILT ON IT MEANT THE FRAME CACHE NEVER FILLED ONCE. Measured on
+            # the panel 2026-09-16: the share is 29 files totalling 43 GB. Every
+            # run since the flow shipped was killed mid-mirror at 90 s, the
+            # manifest was never regenerated, /var/cache/wall-media/frame stayed
+            # EMPTY (4 KB), and the wall said "No frame media configured" — a
+            # failure that looked like a missing setting and was actually a
+            # budget. The every-minute timer then re-ran it forever, so the unit
+            # was permanently red and 43 GB were re-fetched and discarded each
+            # time.
+            #
+            # A FIRST MIRROR OF 43 GB OVER THIS PANEL'S RADIO IS AN HOUR, NOT A
+            # MINUTE. So the frame flow gets the music flow's budget and for the
+            # same reason: the point of a budget is that a WEDGED mount cannot
+            # eat the whole unit, not that a big transfer is forbidden. The unit's
+            # TimeoutStartSec moves with it — the two are one decision and a
+            # budget bounded "well inside" a 180 s TimeoutStartSec is the shape
+            # that produced this bug. Once the cache is full, every later run is
+            # an incremental rsync over 29 files and finishes in seconds; it is
+            # only the FIRST one that needs the room.
+            #
+            # The disk was the other half: 38 GB of music plus 43 GB of frame
+            # does not fit an 80 GB cache LV, so even a completed mirror would
+            # have filled it. `wall-cache` was extended to 131 GB from the VG's
+            # free extents on 2026-09-16 (Owner ruling, same day).
             F_MOUNT_TIMEOUT=20
-            F_RSYNC_TIMEOUT=90
+            F_RSYNC_TIMEOUT=14400
             F_SOURCE="Mini-serv — MAY BE ASLEEP, and no magic packet is ever sent for this (§4d)"
             ;;
         *)

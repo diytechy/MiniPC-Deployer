@@ -37,20 +37,31 @@ After=wall-firstboot.service
 Type=oneshot
 ExecStart=/usr/local/sbin/wall-sync.sh --only frame
 # A BACKSTOP, NOT THE PRIMARY BOUND. wall-sync.sh now carries the frame flow's
-# OWN budget and the arithmetic is: probe 4 s + mount 20 s + rsync 90 s +
-# unmount 30 s = 144 s worst case, so this is set above that. The script hitting
-# its own budget produces a NAMED failure ("rsync ... exceeded its 90s budget");
-# systemd hitting this one produces a SIGTERM and no explanation, which is why
-# the script must always get there first.
+# OWN budget and the arithmetic is: probe 4 s + mount 20 s + rsync 14400 s +
+# unmount 30 s = 14454 s worst case, so this is set above that. The script
+# hitting its own budget produces a NAMED failure ("rsync ... exceeded its
+# 14400s budget"); systemd hitting this one produces a SIGTERM and no
+# explanation, which is why the script must always get there first.
 #
-# It matters that this is bounded at all: the frame set is a handful of rendered
-# videos, not a music library, so a run still going after two minutes is stuck,
-# not busy, and letting it stack up behind a one-minute timer is how a panel ends
-# up with fifty queued jobs. (wall-sync.service keeps its own, much larger,
-# TimeoutStartSec: the FIRST music mirror really does take hours -- measured at
-# about 1 h 54 m for 39.8 GB at 5.5 MiB/s -- and that unit carries the
-# arithmetic for it.)
-TimeoutStartSec=180
+# THE OLD 180 s, AND THE 90 s RSYNC BUDGET IT WAS SIZED FOR, WERE BOTH BUILT ON
+# "the frame set is a handful of rendered videos". That was never measured and
+# it is false: on 2026-09-16 the share was 29 files totalling 43 GB. Every run
+# since the flow shipped was killed mid-mirror, the manifest was never
+# regenerated, and the wall said "No frame media configured" -- which reads as a
+# missing setting and was actually this number. So the frame flow now carries the
+# music flow's arithmetic, for the music flow's reason: the FIRST mirror really
+# does take hours -- music measured at about 1 h 54 m for 39.8 GB at 5.5 MiB/s,
+# so 43 GB is about 2 h 12 m -- and a budget exists to bound a WEDGED mount, not
+# to forbid a large transfer.
+#
+# THE ONE-MINUTE TIMER DOES NOT STACK BEHIND THIS. wall-sync-frame.timer uses
+# OnUnitInactiveSec, which measures from the moment the service goes INACTIVE, so
+# a run still going simply postpones the next trigger; there is no queue of fifty
+# jobs to grow. That was the real protection all along, not the short timeout.
+#
+# Every run AFTER the first is an incremental rsync over 29 files and finishes in
+# seconds. It is only the first that needs the room.
+TimeoutStartSec=15600
 # Same politeness as the boot sync: the panel is drawing a UI and playing music
 # while this runs, and this one runs sixty times an hour.
 IOSchedulingClass=idle

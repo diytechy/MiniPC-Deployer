@@ -152,6 +152,10 @@ def test_a_held_rocker_is_not_chopped_into_taps():
 def test_ramp_does_not_start_before_the_hold_threshold():
     plan, keys = planner()
     assert keys.HOLD_THRESHOLD_S == 0.600
+    # 0.55 s, NOT 0.45. The probe must sit between the ramp's start and the
+    # threshold, or it cannot detect a ramp that started early -- which is
+    # exactly what moving it to 0.45 concealed on 2026-09-16 while leaving this
+    # test's name claiming otherwise.
     tap, steps, _ = hold(plan, True, 0.55)
     assert tap == 5
     assert steps == []
@@ -193,8 +197,12 @@ def test_a_slow_applier_makes_steps_bigger_not_more_numerous():
     plan.release(2.000)
     first = plan.due(1.100)
     second = plan.due(1.620)
-    assert first == (True, 12)
-    assert second == (True, 13)
+    # The TOTAL is unchanged at 25; only the SPLIT moved, from 12+13 to 10+15,
+    # because WSN-062 pays in whole 5% increments and carries the remainder.
+    # That is the carry working, and it is the only thing grid stepping is
+    # allowed to change here.
+    assert first == (True, 10)
+    assert second == (True, 15)
     assert first[1] + second[1] == 25
 
 
@@ -221,7 +229,9 @@ def test_wait_blocks_when_idle_and_paces_the_ramp_when_held():
     # threshold, or the gap that would end the burst.
     assert plan.wait(0.0) == pytest.approx(min(0.600, keys.HOLD_GAP_S))
     plan.release(1.000)
-    assert plan.wait(1.000) == pytest.approx(0.04)
+    # 0.2 s, not 0.04: since WSN-062 the applier is woken once per 5% INCREMENT
+    # (5/25) rather than once per whole percent (1/25). Fewer, larger applies.
+    assert plan.wait(1.000) == pytest.approx(0.2)
 
 
 def test_step_is_clamped_into_the_protocol_range():
@@ -243,12 +253,14 @@ def test_the_arrears_survive_the_gap_that_closes_the_hold():
     plan, keys = planner()
     plan.press(True, 0.0)
     plan.release(1.0)
-    # One step paid early in the hold, leaving arrears behind.
-    assert plan.due(0.7) == (True, 2)
+    # One increment paid early in the hold, leaving arrears behind. Sampled at
+    # 0.9 rather than 0.7: under WSN-062 nothing is owed until a whole 5% has
+    # accrued, and at 0.7 only 2.5% has.
+    assert plan.due(0.9) == (True, 5)
     # The gap expires while those arrears are still unpaid: stay open.
     plan.settle(1.0 + keys.HOLD_GAP_S + 0.01)
     assert plan.held()
-    assert plan.due(1.0 + keys.HOLD_GAP_S + 0.01) == (True, 8)
+    assert plan.due(1.0 + keys.HOLD_GAP_S + 0.01) == (True, 5)
     # Paid in full (5% tap + 10% ramp for 0.4 s past the threshold), so now close.
     plan.settle(1.0 + keys.HOLD_GAP_S + 0.02)
     assert not plan.held()
@@ -411,3 +423,33 @@ def test_the_daemon_snaps_on_release_and_only_in_one_place():
     assert "SNAP_PERCENT = 5" in keys
     assert "if planner.settle(time.monotonic()):" in keys
     assert keys.count("snap(SNAP_PERCENT)") == 1
+
+
+# TC-P-490..492 / WSN-062: assert the published sequence, not merely its end.
+@pytest.mark.parametrize("louder,start", [(True, 20), (False, 100)])
+def test_tc_p_490_p491_three_second_hold_stays_on_grid_and_keeps_rate(louder, start):
+    plan, keys = planner()
+    tap, steps, _ = hold(plan, louder, 3.0)
+    levels = [start]
+    levels.append(levels[-1] + tap)
+    for direction, step in steps:
+        levels.append(levels[-1] + (step if direction else -step))
+    assert all(level % keys.SNAP_PERCENT == 0 for level in levels)
+    # 65%, not 75%: the tap and the ramp are SEPARATE charges under the Owner's
+    # rocker specification, so a 3 s hold owes 5 + (3.0 - 0.600) x 25. An earlier
+    # draft asserted 75 and the planner was bent to match it, which moved the
+    # ramp's start to 200 ms and made a 1.0 s hold move 25% against this file's
+    # own recorded 15%. Corrected on review 2026-09-16.
+    assert abs(levels[-1] - start) == pytest.approx(65, abs=keys.SNAP_PERCENT)
+
+
+@pytest.mark.parametrize("louder,expected", [(True, 65), (False, 60)])
+def test_tc_p_492_off_grid_first_movement_is_directional_and_needs_no_snap(louder, expected):
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state(); state["volume"]["speaker"] = 62
+    state, _ = policy.apply_event(state, {"kind": "nudge_volume", "louder": louder, "step": 5})
+    assert state["volume"]["speaker"] == expected
+    seq = state["volume_event_seq"]
+    state, _ = policy.apply_event(state, {"kind": "snap_volume", "to": 5})
+    assert state["volume"]["speaker"] == expected
+    assert state["volume_event_seq"] == seq

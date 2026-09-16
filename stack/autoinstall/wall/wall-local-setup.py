@@ -42,6 +42,7 @@ LOCAL_AUTH_PATHS = (
 SENSOR_SOCKET = "/run/wall-sensors/service.sock"
 SETUP_SOCKET = "/run/wall-local-setup/service.sock"
 POWER_COMMAND = ("/usr/local/sbin/wall-sleep.sh", "sensor-wake")
+DISPLAY_OFF_COMMAND = ("/usr/local/sbin/wall-sleep.sh", "panel-display-off")
 MAX_REQUEST = 16 * 1024
 MAX_SECRET = 4096
 
@@ -337,6 +338,21 @@ def validate_wake(params: dict, status: dict, now_ms: int | None = None, *,
                 and now - actual_at < actual_ttl and actual_at >= observed - 2):
             return
     raise Refused("wake-not-observed")
+
+
+def validate_display_off(params: dict) -> None:
+    """Accept only the panel's conclusion-shaped display-off request.
+
+    Unlike wake, this peer is not claiming an observation the image can
+    cross-check against sensor_status(): it is asserting the panel's own
+    conclusion that it remained FULLSCREEN with no derived presence for 30 s.
+    There is deliberately no witness path here and none may be added: a local
+    kernel witness can attest a touch, not the renderer state which produced
+    this conclusion.  The empty object is the smallest surface; journal
+    attribution comes from the distinct wall-sleep arm, not peer text.
+    """
+    if params != {}:
+        raise Refused("display-off-request-invalid")
 
 
 def journal(message: str) -> None:
@@ -718,6 +734,13 @@ class Helper:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {"woke": True}
 
+    def display_off(self, params: dict) -> dict:
+        """Execute the panel-owned display-off conclusion after shape checking."""
+        validate_display_off(params)
+        subprocess.run(DISPLAY_OFF_COMMAND, check=True, timeout=5, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"displayOff": True}
+
     def request(self, request: object) -> dict:
         if not isinstance(request, dict) or set(request) != {"method", "params"} or not isinstance(request["params"], dict):
             raise Refused("request-invalid")
@@ -730,6 +753,8 @@ class Helper:
         if method == "wake":
             # Never witness=True: a socket peer is not a witness (LLR-912).
             return self.wake(params)
+        if method == "display-off":
+            return self.display_off(params)
         if method != "configure" or set(params) - {"expectedRevision", "accessMode", "session", "pin"}:
             raise Refused("request-invalid")
         if params.get("accessMode") != "local" or type(params.get("expectedRevision")) is not int:

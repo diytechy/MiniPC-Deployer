@@ -141,6 +141,24 @@ ADJTIME_FILE="${POWER_TEST_ROOT}/etc/adjtime"
 ABSENCE_STATE_DIR="${POWER_TEST_ROOT}/run/wall-occupancy"
 BACKLIGHT_PREV="${POWER_TEST_ROOT}/run/wall-backlight.prev"
 ABSENT_SINCE_FILE="$ABSENCE_STATE_DIR/absent-since"
+# WHEN THE SCREEN WAS LAST LIT BY EVIDENCE, and the window in which a
+# display-off conclusion reached before that is treated as overtaken.
+#
+# THE RACE THIS CLOSES, found in review 2026-09-16. The panel concludes "nobody
+# for 30 s" and sends display-off. The request blocks on the power lock while a
+# `touch-wake` from a real finger runs, lights the screen and releases. The
+# queued display-off then takes the lock and blanks the panel the person is
+# standing at. SERIALIZING THE TWO IS NOT ENOUGH: the lock orders the writes but
+# does nothing about the display-off's conclusion having been overtaken by
+# evidence, and the panel's own next poll cancels only FUTURE requests, never
+# the one already in flight.
+#
+# So a wake stamps the moment, and display-off declines if that stamp is newer
+# than the window. 3 s comfortably covers a request's flight time (the socket
+# call is bounded at 5 s but the contended case is the lock, which is held for
+# one backlight write) without leaving the panel unable to blank after a wake.
+WAKE_STAMP_FILE="$ABSENCE_STATE_DIR/last-wake"
+DISPLAY_OFF_WAKE_GUARD_S=3
 AMP_SAFE_STATE="${POWER_TEST_ROOT}/run/wall-amp-trigger/off-verified"
 # A bare carriage return, built rather than escaped so it survives every editor
 # and every quoting layer between here and the panel.
@@ -296,6 +314,41 @@ backlight_lit() {
     d="$(backlight_dir)" || return 1
     cur="$(cat "$d/brightness" 2>/dev/null | tr -d '[:space:]')"
     [ -n "$cur" ] && [ "$cur" != "0" ]
+}
+
+# A MONOTONIC "now", in whole seconds. /proc/uptime and not `date +%s`, on the
+# same reasoning as the panel's other duration code: a wall clock is not a
+# duration, and an NTP correction while a wake is in flight would either disarm
+# the guard below or arm it for hours. Falls back to the wall clock only where
+# /proc does not exist, which is the dev box running the hermetic suite and
+# never the panel.
+power_now_s() {
+    if [ -r /proc/uptime ]; then
+        awk '{print int($1)}' /proc/uptime
+    else
+        date +%s
+    fi
+}
+
+# Record that the screen was lit by evidence. Called by BOTH wake arms, because
+# a display-off overtaken by a sensor wake is the same defect as one overtaken
+# by a touch; only the evidence differs.
+mark_wake() {
+    mkdir -p "$ABSENCE_STATE_DIR" 2>/dev/null || true
+    power_now_s > "$WAKE_STAMP_FILE" 2>/dev/null || true
+}
+
+# True when a wake landed inside the guard window, i.e. this display-off request
+# was decided before evidence that contradicts it.
+wake_is_recent() {
+    local stamp now
+    stamp="$(cat "$WAKE_STAMP_FILE" 2>/dev/null || echo "")"
+    case "$stamp" in ''|*[!0-9]*) return 1 ;; esac
+    now="$(power_now_s)"
+    # A stamp from the FUTURE means the box rebooted since it was written
+    # (uptime restarted), so it cannot describe a wake that is still relevant.
+    [ "$stamp" -le "$now" ] || return 1
+    [ $((now - stamp)) -lt "$DISPLAY_OFF_WAKE_GUARD_S" ]
 }
 
 backlight_set() {   # backlight_set off|on
@@ -756,6 +809,7 @@ case "${1:-}" in
         # The root helper independently validated a fresh positive observation.
         # This changes display state only; it never changes lock authority.
         rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
+        mark_wake
         backlight_set on
         ;;
     touch-wake)
@@ -780,6 +834,9 @@ case "${1:-}" in
         fi
         log "touch witness observed a contact on the dark panel — restoring the backlight"
         rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
+        # Stamped BEFORE the write, so a display-off already waiting on this lock
+        # sees the wake even if the backlight write itself is slow.
+        mark_wake
         # CAPTURE the write's status. This script runs `set -u`, NOT `set -e`,
         # so a discarded status here is a silent lie the whole way up: the arm
         # would exit 0 on a backlight that never came on, the witness would
@@ -800,8 +857,43 @@ case "${1:-}" in
             exit "$touch_wake_status"
         fi
         ;;
+    panel-display-off)
+        # WSN-057 has one display-off writer: the panel knows both FULLSCREEN
+        # and its derived 30 s absence. WALL_ABSENCE_ENABLED stays false, so
+        # run_occupancy remains available but cannot contest this write. The
+        # schedule/one-hour suspend authority deliberately remains here in the
+        # image; it is a different decision with RTC and reachability duties.
+        #
+        # Take the same lock as touch-wake. A dark request and a concurrent tap
+        # must serialize rather than interleave two read-back-backed writes.
+        if ! power_lock_acquire "the panel display-off request"; then
+            log "panel display-off DECLINED: a power decision is in flight."
+            exit 75
+        fi
+        # THE CONCLUSION IS RE-CHECKED AFTER THE LOCK, NOT ONLY BEFORE IT. The
+        # panel decided "nobody for 30 s" before this process ever started; if a
+        # wake landed while this request was queued behind the lock, that
+        # conclusion has been overtaken by evidence and must not be acted on.
+        # Declining is honest and cheap: the panel is still watching, and if the
+        # room really is empty its next poll concludes so again.
+        if wake_is_recent; then
+            log "panel display-off DECLINED: the screen was woken while this request waited."
+            power_lock_release
+            exit 75
+        fi
+        log "panel concluded FULLSCREEN absence — turning the display off"
+        # backlight_set is idempotent and verifies the level it asked for; an
+        # already-dark display is therefore success, not a failed conclusion.
+        backlight_set off
+        panel_display_off_status=$?
+        power_lock_release
+        if [ "$panel_display_off_status" -ne 0 ]; then
+            log "panel display-off FAILED: the backlight did not turn off (backlight_set exited $panel_display_off_status)."
+            exit "$panel_display_off_status"
+        fi
+        ;;
     *)
-        echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake" >&2
+        echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake|panel-display-off" >&2
         exit 2
         ;;
 esac

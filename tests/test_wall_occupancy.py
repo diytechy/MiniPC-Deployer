@@ -190,6 +190,19 @@ def test_absence_outside_the_on_period_waits_the_full_hour_sr020():
         assert got["backlight"] == "off", (minutes, got)
 
 
+def test_tc_p475_suspend_requires_both_dark_hour_and_schedule():
+    """WSN-057 characterization: the image retains this independent gate."""
+    # The schedule alone and the full hour alone each stay awake. Only their
+    # conjunction reaches suspend; panel display-off never owns this decision.
+    schedule_only = _decide(minute_of_day=MIDNIGHT_THIRTY, presence=occ.ABSENT,
+                            absent_since=NOW - 59 * 60)
+    hour_only = _decide(minute_of_day=NOON, presence=occ.ABSENT,
+                        absent_since=NOW - 2 * HOUR)
+    both = _decide(minute_of_day=MIDNIGHT_THIRTY, presence=occ.ABSENT,
+                   absent_since=NOW - HOUR)
+    assert [schedule_only["power"], hour_only["power"], both["power"]] == ["stay", "stay", "suspend"]
+
+
 def test_presence_outside_the_on_period_stays_awake_sr020():
     """23:30 with somebody there is not a suspend: the HOUR is required first.
 

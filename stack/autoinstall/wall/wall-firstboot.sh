@@ -673,6 +673,36 @@ if [ -d "$SENSOR_WHEELHOUSE" ]; then
 else
     fail_step "sensors: $SENSOR_WHEELHOUSE is missing from the image payload"
 fi
+# THE /usr/local/sbin POWER AND SYNC SCRIPTS WERE INSTALLED ONLY BY `user-data`,
+# WHICH RUNS ONCE, AT IMAGE INSTALL TIME. Nothing refreshed them afterwards: not
+# firstboot, and therefore not the release lane either, because the system
+# manifest is DERIVED from this file and a component nothing here installs is a
+# component no release can carry. Found on 2026-09-16 deploying WSN-057, when the
+# `panel-display-off` arm reached /opt/wall-panel/stack and never reached
+# /usr/local/sbin -- the socket helper called a verb the installed script did not
+# have. The deployed wall-sleep.sh was five days older than the payload beside
+# it, and wall-sync.sh had to be installed by hand earlier the same day.
+#
+# Installing them HERE puts them in the manifest and makes every boot re-assert
+# them from the payload, which is what the rest of this file already does for
+# everything it owns. `user-data` still installs them for the first boot, before
+# this script exists to run; the two agree because both read the same payload.
+# The loop header stays on ONE line ending `; do`. Both the payload-completeness
+# test and the system-manifest generator resolve a payload path containing a loop
+# variable by reading the loop that defines it, and each parses the header form
+# `for _v in WORDS; do` with the words on the same line. A line continuation
+# leaves the reference unresolvable, which those tools report rather than skip --
+# that refusal is the point of them. (Do not write an example of such a path in
+# a comment here either: the scanners read comments, and a made-up variable name
+# in prose is an unresolvable reference exactly like a real one. Learned twice.)
+for _sbin in wall-sleep.sh wall-occupancy.py wall-sensor-power-policy.py wall-sync.sh wall-media-manifest.py wall-wakeprep.sh; do
+    if [ -f "$PAYLOAD/$_sbin" ]; then
+        install -m 0755 "$PAYLOAD/$_sbin" "/usr/local/sbin/$_sbin"
+    else
+        fail_step "power/sync scripts: $_sbin is missing from the image payload"
+    fi
+done
+unset _sbin
 if [ -f "$PAYLOAD/wall-local-setup.py" ] && [ -f "$PAYLOAD/wall-local-setup.service" ]; then
     install -m 0755 "$PAYLOAD/wall-local-setup.py" /usr/local/lib/wall-panel/wall-local-setup.py
     install -m 0644 "$PAYLOAD/wall-local-setup.service" /etc/systemd/system/wall-local-setup.service

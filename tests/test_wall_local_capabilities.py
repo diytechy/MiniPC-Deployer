@@ -186,7 +186,14 @@ def test_image_contract_installs_helper_and_sensor_without_host_flag():
     assert 'WALL_ACCESS_MODE=local into root-owned state' in firstboot
     assert '[ -d "$wheelhouse" ] || fail "The offline wheelhouse is required"' in installer
     assert '[ -f "$host_config" ] && [ -d "$wheelhouse" ]' not in installer
-    assert "protocolVersion') == 2" in installer
+    # A FLOOR, and this assertion is pinned to the floor ON PURPOSE. It used to
+    # require the literal `protocolVersion') == 2`, which locked the installer to
+    # whatever version was current the day it was written: WSN-056 added one
+    # additive field, the service moved to 3, and firstboot went RED over a
+    # service that was running correctly. The property worth guarding is that
+    # the check is a comparison the protocol can GROW past, not the number.
+    assert "version >= 2" in installer
+    assert "protocolVersion') == 2" not in installer
     assert "local-capabilities-v1" in installer
     unit = (WALL / "wall-local-setup.service").read_text(encoding="utf-8")
     assert "User=root\nGroup=panel" in unit
@@ -707,3 +714,53 @@ def test_the_hardware_wake_measurement_is_read_only_and_recorded_tc914():
     burn_in = (WALL / "WALL-BURN-IN.md").read_text(encoding="utf-8")
     assert "wall-touch-wakeup-report.sh" in burn_in
     assert "### Measured hardware-wake facts" in burn_in
+
+
+def test_sensor_status_accepts_a_newer_protocol_and_still_refuses_an_older_one(monkeypatch):
+    """A sensor service that GAINS a field must not take the wake path down.
+
+    sensor_status() pinned `protocolVersion != 2` and refused anything else.
+    WSN-056 added `faceIdentity` and moved the service to 3, which would have
+    made every status read raise sensor-status-invalid -- so validate_wake could
+    cross-check no camera or bluetooth observation at all, and the panel would
+    have stopped waking from presence entirely while the sensor service sat
+    there running correctly and answering its socket.
+
+    The floor is still a floor: version 1 predates the fields read here and is
+    refused, and a non-integer version is not a version.
+
+    `SETUP.socket` is replaced rather than the stdlib module: this suite runs on
+    Windows, where `socket.AF_UNIX` does not exist and the attribute lookup
+    alone raises before any fake could be consulted.
+    """
+    class FakeSocketModule:
+        AF_UNIX, SOCK_STREAM = 1, 1
+        payload = b""
+        @classmethod
+        def socket(cls, *args, **kwargs):
+            class Connection:
+                rest = cls.payload
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def settimeout(self, _): pass
+                def connect(self, _): pass
+                def sendall(self, _): pass
+                def recv(self, _):
+                    chunk, self.rest = self.rest, b""
+                    return chunk
+            return Connection()
+
+    monkeypatch.setattr(SETUP, "socket", FakeSocketModule)
+
+    def answer(version):
+        FakeSocketModule.payload = json.dumps(
+            {"ok": True, "result": {"protocolVersion": version,
+                                    "config": {"schemaVersion": 2}}}).encode() + b"\n"
+        return SETUP.sensor_status()
+
+    assert answer(2)["protocolVersion"] == 2
+    assert answer(3)["protocolVersion"] == 3          # the version WSN-056 ships
+    assert answer(9)["protocolVersion"] == 9          # additive growth is not a refusal
+    for bad in (1, 0, -1, True, "3", None, 2.5):
+        with pytest.raises(SETUP.Refused, match="sensor-status-invalid"):
+            answer(bad)

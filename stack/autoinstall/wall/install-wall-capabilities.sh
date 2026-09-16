@@ -211,8 +211,19 @@ while time.monotonic() < deadline:
                 if not part: break
                 data.extend(part)
             result = json.loads(data)
-            if result.get('ok') is True and result.get('result', {}).get('protocolVersion') == 2:
-                print('[wall-capabilities] PASS sensor protocol 2 reachable as panel UID')
+            # A FLOOR, NOT AN EQUALITY. WSN-056 added `faceIdentity` and moved
+            # the service to protocolVersion 3; an exact `== 2` turned that
+            # additive field into a RED FIRSTBOOT -- the provisioning marker was
+            # withheld and the panel declared itself unprovisioned, over a
+            # service that was running correctly and answering on its socket.
+            # What this check is for is "the socket is reachable as the broker
+            # UID and speaks a protocol we understand", and a new field does not
+            # change that. Raise the floor deliberately if a version ever removes
+            # something; do not pin it to whatever was current the day it was
+            # written.
+            version = result.get('result', {}).get('protocolVersion')
+            if result.get('ok') is True and isinstance(version, int) and not isinstance(version, bool) and version >= 2:
+                print('[wall-capabilities] PASS sensor protocol %d reachable as panel UID' % version)
                 sys.exit(0)
     except (OSError, ValueError, TypeError):
         pass

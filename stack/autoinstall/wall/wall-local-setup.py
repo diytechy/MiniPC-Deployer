@@ -280,7 +280,21 @@ def sensor_status(socket_path: str = SENSOR_SOCKET) -> dict:
         result = response["result"] if response.get("ok") is True else None
     except (UnicodeError, ValueError, KeyError, TypeError) as error:
         raise Refused("sensor-status-invalid") from error
-    if not isinstance(result, dict) or result.get("protocolVersion") != 2:
+    # A FLOOR, NOT AN EQUALITY, and the difference is a live regression this
+    # very nearly shipped. WSN-056 added `faceIdentity` and moved the sensor
+    # service to protocolVersion 3; an exact `!= 2` then refuses every status
+    # read, which means validate_wake can no longer cross-check ANY camera or
+    # bluetooth observation and the panel stops waking from presence entirely.
+    # Nothing about this consumer's use of the status object changed -- it reads
+    # `config` and the presence readings, both unchanged -- so the check it
+    # actually wants is "at least the version whose fields I rely on".
+    #
+    # An additive field must never be able to take out the wake path. If a FUTURE
+    # version removes or repurposes something read below, add an upper bound
+    # then, deliberately, rather than leaving an equality here that fails every
+    # time the sensor service gains a field.
+    if not isinstance(result, dict) or not isinstance(result.get("protocolVersion"), int) \
+            or isinstance(result.get("protocolVersion"), bool) or result["protocolVersion"] < 2:
         raise Refused("sensor-status-invalid")
     return result
 

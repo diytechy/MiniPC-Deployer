@@ -334,6 +334,90 @@ else
     warn "whatever the installer configured; it has no ethernet to fall back on."
 fi
 
+# ── 5b. quirk 5b — the wait-online that waits for nothing ────────────────────
+# MEASURED ON THE PANEL 2026-09-16: systemd-networkd-wait-online.service is the
+# panel's ONLY failed unit, on every boot, and it has been failing since long
+# before the work that found it. It times out after two minutes —
+#   "Timeout occurred while waiting for network connectivity"
+# — on a panel that is plainly routable the whole time.
+#
+# THE CAUSE IS NOT A SECOND INTERFACE, which is the usual shape of this failure.
+# `networkctl list` on this panel shows exactly two links, `lo` and `wlp1s0`,
+# and BOTH read `unmanaged`: quirk 5 above renders the Wi-Fi netplan with
+# `renderer: NetworkManager`, so NetworkManager owns the only link that carries
+# traffic and systemd-networkd manages nothing at all. A wait-online with no
+# managed link to wait for cannot succeed — `--any` would not help, because the
+# set it waits over is empty either way. The unit is simply not the right one on
+# this machine: NetworkManager-wait-online.service is, it is enabled, and it
+# reaches network-online.target in about five seconds.
+#
+# So the cost is two minutes of every boot plus a permanently red `systemctl
+# --failed`, in exchange for nothing. Disable it — and disable it only on the
+# EVIDENCE, not on the assumption: if some future panel does have a
+# networkd-managed link, this leaves the unit exactly as it found it and says so.
+# THE PROBE MUST SUCCEED, AND EVERY LINK MUST POSITIVELY SAY `unmanaged`
+# (terra review, 2026-09-16). Two ways the first draft got this wrong, and both
+# of them disabled the wait on evidence it did not have:
+#
+#   * `networkctl list` failing — a transient D-Bus answer is enough — produced
+#     an EMPTY list, and an empty list is indistinguishable from "nothing is
+#     managed" unless the exit status is checked. `|| true` threw that away.
+#   * `pending` was treated as "not managed". It means the opposite of settled:
+#     the link's ownership is not established yet. A networkd link still in
+#     setup would have read as an absence.
+#
+# So: the probe must exit 0, and the disable path is taken only when EVERY
+# non-loopback link reads exactly `unmanaged`. Anything else — a failed probe,
+# a `pending`, a `configured` — leaves the unit alone and says so.
+NETWORKD_PROBE_OK=0
+NETWORKD_LINKS=""
+if command -v networkctl >/dev/null 2>&1; then
+    if NETWORKD_LINKS="$(networkctl list --no-legend 2>/dev/null)"; then
+        NETWORKD_PROBE_OK=1
+    fi
+else
+    NETWORKD_LINKS=""
+fi
+NETWORKD_CLAIMED="$(printf '%s\n' "$NETWORKD_LINKS" \
+    | awk 'NF && $2 != "lo" && $NF != "unmanaged" { print $2 "(" $NF ")" }')"
+if [ "$NETWORKD_PROBE_OK" != "1" ]; then
+    warn "quirk 5b: networkctl did not answer, so nothing can be said about"
+    warn "systemd-networkd-wait-online.service. Left exactly as it was."
+elif [ -n "$NETWORKD_CLAIMED" ]; then
+    log "quirk 5b: systemd-networkd still claims $(printf '%s' "$NETWORKD_CLAIMED" | tr '\n' ' ')— wait-online left enabled, it has something to wait for"
+elif ! systemctl is-enabled --quiet NetworkManager-wait-online.service 2>/dev/null; then
+    # THE REPLACEMENT HAS TO ACTUALLY BE THERE. `NetworkManager.service` being
+    # up is not the same claim: the wait unit is what is pulled into
+    # network-online.target, and disabling networkd's without NetworkManager's
+    # being enabled would leave the target reached IMMEDIATELY and always —
+    # a lie rather than a delay, for everything ordered after it, including
+    # wall-firstboot.service itself and the media sync units.
+    warn "quirk 5b: systemd-networkd manages no link, but"
+    warn "NetworkManager-wait-online.service is NOT enabled — so nothing would"
+    warn "hold network-online.target honestly. systemd-networkd-wait-online is"
+    warn "LEFT ENABLED; enable NetworkManager-wait-online first."
+elif ! systemctl is-active --quiet NetworkManager.service; then
+    # Nothing is managed by networkd AND NetworkManager is not up. Disabling the
+    # only wait-online on a machine with no other one would make
+    # network-online.target a lie rather than a delay, so refuse and say why.
+    warn "quirk 5b: systemd-networkd manages no link, but NetworkManager is NOT"
+    warn "active either — so nothing here would reach network-online.target"
+    warn "honestly. systemd-networkd-wait-online.service is LEFT ENABLED; find"
+    warn "out what is meant to own this panel's link before changing that."
+else
+    systemctl disable --now systemd-networkd-wait-online.service >/dev/null 2>&1 \
+        || warn "quirk 5b: could not disable systemd-networkd-wait-online.service"
+    # It is already `failed` from this boot; without this the red line survives
+    # the fix until the next reboot and looks like the fix did not work.
+    systemctl reset-failed systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+    if systemctl is-enabled --quiet systemd-networkd-wait-online.service 2>/dev/null; then
+        warn "quirk 5b: systemd-networkd-wait-online.service is STILL enabled after"
+        warn "disable — every boot keeps its two-minute timeout and its red line."
+    else
+        log "quirk 5b: systemd-networkd-wait-online.service disabled (networkd manages no link here; NetworkManager-wait-online.service owns network-online.target)"
+    fi
+fi
+
 # ── 6. D-W4 — the sleep window ───────────────────────────────────────────────
 # systemd cannot interpolate an env var into OnCalendar, so the two timers are
 # GENERATED here from the one schedule both sleep modes share.
@@ -740,9 +824,37 @@ systemctl daemon-reload
 # queue to drain — and this script IS a job in that queue. A blocking restart
 # would sit there until systemd's 5 s idle timeout gave up. Enqueue and return;
 # the kiosk comes up a moment later either way.
-systemctl restart --no-block getty@tty1.service >/dev/null 2>&1 \
-    || warn "could not enqueue a getty@tty1 restart — the kiosk starts on the next reboot instead"
-log "kiosk: tty1 autologin + profile hook installed, getty@tty1 restart enqueued (the session starts now, not next boot)"
+#
+# ...AND IT MUST NOT HAPPEN DURING A RELEASE. A paired release runs
+# `stop` (getty@tty1 stopped, tty1 session terminated, nothing left running out
+# of /opt/wall-panel/app) and only THEN `system-install`, which is what invokes
+# this script. The restart below then brought login -> wall-kiosk.sh -> cage ->
+# Electron straight back up, so the `activate` phase two steps later refused to
+# swap the app directory underneath a running kiosk — `RuntimeError: Kiosk still
+# running` — and rolled the whole release back. Reproduced twice on 2026-09-16;
+# it is an ORDERING fault, not a flake, and it failed EVERY no-reboot run that
+# carried a system payload. `--system-reboot` hid it because that path keeps
+# getty@tty1 masked across the reboot for a different reason.
+#
+# So the release lane sets PANEL_RELEASE_KIOSK_RESTART=0 for the duration of
+# its transaction and OWNS the kiosk lifecycle itself: its `start` phase unmasks,
+# re-enables and starts getty@tty1 after the swap, and its rollback path does the
+# same. The lane ALSO masks the unit, which is the enforcement — this variable is
+# what makes the log say the truth rather than warn about a failure that was
+# intended. It is DELIBERATELY NOT in the WALL_ namespace: wall.env knobs are
+# the operator's, declared in wall.env.example and asserted by
+# scripts/validate_config.py, and an operator who set this one would silently
+# lose the kiosk restart for ever. This is a private handshake from the release
+# lane, set for one `subprocess.run` and gone. A hand-run `sudo /usr/local/sbin/wall-firstboot.sh` sets neither and
+# is unchanged: it still restarts, which is what makes it the documented way to
+# apply a wall.env change.
+if [ "${PANEL_RELEASE_KIOSK_RESTART:-1}" = "0" ]; then
+    log "kiosk: tty1 autologin + profile hook installed; getty@tty1 restart SUPPRESSED (PANEL_RELEASE_KIOSK_RESTART=0 — a release transaction owns the kiosk lifecycle and will start it after the app swap)"
+else
+    systemctl restart --no-block getty@tty1.service >/dev/null 2>&1 \
+        || warn "could not enqueue a getty@tty1 restart — the kiosk starts on the next reboot instead"
+    log "kiosk: tty1 autologin + profile hook installed, getty@tty1 restart enqueued (the session starts now, not next boot)"
+fi
 
 # ── 8. OI-15/OI-18 — the media cache and the pull units ──────────────────────
 # The panel PULLS its media (the Owner's ruling, 2026-07-29), from TWO hosts

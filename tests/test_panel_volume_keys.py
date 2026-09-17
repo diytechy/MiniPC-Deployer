@@ -522,6 +522,23 @@ def test_a_request_that_cannot_be_read_is_still_a_failure_sr028(monkeypatch):
 
 
 def test_spent_instances_collect_themselves_sr028():
-    """Source check: a per-connection unit that lingers is how a list dies."""
+    """Source check: a per-connection unit that lingers is how a list dies.
+
+    THE SECTION IS ASSERTED, NOT JUST THE LINE. The first version of this test
+    checked only that the string was present, and it passed while the directive
+    sat in [Service] -- where systemd ignores it, logging `Unknown key name
+    'CollectMode' in section 'Service'` and collecting nothing. A test that
+    cannot tell a working directive from an ignored one is not a test of this.
+    """
     unit = (WALL / "wall-volume-request@.service").read_text()
-    assert "CollectMode=inactive-or-failed" in unit
+    sections = {}
+    current = None
+    for line in unit.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped
+            sections[current] = []
+        elif current and stripped and not stripped.startswith("#"):
+            sections[current].append(stripped)
+    assert "CollectMode=inactive-or-failed" in sections.get("[Unit]", []), \
+        "CollectMode is a [Unit] key; in [Service] systemd ignores it silently"

@@ -1,14 +1,21 @@
 [Unit]
 Description=Wall panel apply one bounded physical volume request
-
-[Service]
 # ONE INSTANCE PER CONNECTION, so without this every spent instance stays in
 # systemd's unit list until something reloads it -- and a failed one stays
 # there being red forever. `inactive-or-failed` garbage-collects both, which
 # is what keeps `systemctl --failed` a list worth reading. It does NOT hide a
 # failure: the journal keeps every line, and a fault that recurs reappears on
 # the next connection.
+#
+# IT IS A [Unit] KEY, AND THAT IS NOT A DETAIL. Put in [Service] -- where it
+# reads perfectly naturally, beside the other per-instance settings, and where
+# this file first shipped it -- systemd logs `Unknown key name 'CollectMode' in
+# section 'Service', ignoring` once per load and the unit behaves exactly as if
+# the line had never been written. Measured on the panel 2026-09-16, on the
+# first boot after it shipped there.
 CollectMode=inactive-or-failed
+
+[Service]
 ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-volume-request.py
 StandardInput=socket
 StandardOutput=journal

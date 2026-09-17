@@ -1092,3 +1092,135 @@ Then capture `journalctl -t wall-audio-output -u wall-spdif-in -u wall-bus-speak
 -u wall-speaker-out -u wall-bus-headset -u wall-amp-trigger --since -20min` and
 `sudo wall-audio-output status`, which together say what the switch believed and
 what the graph did.
+
+---
+
+## Amendment 2026-09-17 — the bus gains a second reader, and the visualizer moves onto it
+
+**Spine:** SN-041, SR-041, LLR-950..LLR-958, IF-020. **Ruling:** Owner,
+2026-09-17, in `OfficeWallNaglight/Panel_Kiosk_State.md` and section 10 of
+`panel-kiosk-state-implementation-plan-2026-09-17.md`.
+
+### What was wrong with the old source
+
+The visualizer's bands came from `wall-amp-trigger`, as a by-product of the
+capture the amplifier detector already held. That capture is `speaker_tap`, and
+the whole reason the tap exists is that the detector must see audio **after the
+switch and only on the Speaker leg** — review finding 2, still correct, still
+unchanged. Using it for visualization made the wall a function of that leg:
+
+* **Headset showed no visualizer at all.** The tap is silent whenever the switch
+  is not on Speaker, and the shell correctly rendered that as a silent bus.
+* **Nothing could be drawn that did not reach the speaker.** That is the
+  opposite of the Owner's "whatever is required so ProjectM can render audio
+  from all sound outputs that reach the speaker".
+
+### What replaced it
+
+`wall-bus-visualizer.service` opens **`bus_monitor`** — the merged, PRE-switch
+dsnoop that already carries Library, Pandora, Bluetooth and the desktop's S/PDIF
+input together — and publishes a bounded document at
+`/run/wall-bus-visualizer/bus-telemetry.json` (`schema: 2`, `source:
+"bus_monitor"`). `switch_backend.py` reads that document instead of the old one
+and refuses a version-1 `speaker_tap` document outright.
+
+**The detector is untouched.** `panel-amp-trigger.py` still opens `speaker_tap`
+and only `speaker_tap`, still takes the same relay decision, and does not read
+the new document. It keeps publishing its own `bus-telemetry.json` for its own
+purposes; nothing consumes it as the visualizer source any more. A test proves
+the isolation from the shipped text of both files, and each failure of the new
+service is injected rather than assumed.
+
+### The three consequences that are visible on the wall
+
+1. **Headset visualizes.** New behaviour, and the reason this amendment exists.
+2. **Mute yields Frame Media.** `bus_monitor` is upstream of the switch and
+   carries samples during Mute, so bus activity alone is not "playing". The
+   broker ANDs the **confirmed** output selection from
+   `/etc/wall-panel/audio-state.json` into the activity claim — and only into
+   the activity claim: the levels are still reported, because what the bus is
+   carrying is true regardless of where the switch sends it, and the `bus` block
+   still says `live`, because the capture is fine and saying otherwise would be
+   a lie about the panel's health.
+3. **The microphone left the telemetry document entirely.** It reaches neither
+   speaker nor headset, so it is not a visualization source, and the old backend
+   could substitute a microphone block for an absent bus. Removed at the
+   producer rather than filtered downstream. **Microphone capture is untouched**
+   — `wall-audio-aec` still runs and still publishes its own status file — but
+   nothing reads it over IF-015 any more, so the microphone level ring in the
+   panel's audio chrome now renders its honest "we cannot tell you" state.
+
+### Bus mode is the supported configuration, and that is a ruling
+
+`bus_monitor` is declared in `asound-bus-mode.conf` **alone**;
+`asound-panel-mode.conf`, `asound-trigger-mode.conf` and `asound.conf` do not
+have it. In any other mode the service publishes `unavailable` — which the shell
+renders differently from silence — and the visualizer falls through to Frame
+Media. No substitute capture is offered, because there is nothing correct to
+substitute.
+
+Two mechanical consequences, both settled here:
+
+* `bus_monitor` is a `dsnoop` with `ipc_perm 0660` and `ipc_gid 29`, so the new
+  service takes the `audio` group by `SupplementaryGroups=audio` — the same
+  supplementary grant `wall-bus-speaker.service` and `wall-amp-trigger.service`
+  already use, and deliberately **not** `User=panel`: the broker the renderer
+  talks to must stay unable to open a sound device (SR-023).
+* The conf comment calling `bus_monitor` **"The single reader of the bus"**
+  stopped being true the moment a second client attached, and is amended in the
+  same commit. A second reader is exactly what `dsnoop` is for, so the plugin
+  itself needed no change.
+
+### The PCM leg, and the privacy rule that replaces an absolute one
+
+The old claim — "raw samples never escape" — is retired. The durable rule is:
+
+> Raw audio is **not retained or emitted unless explicitly permitted.** ProjectM
+> has one narrow permission: bounded raw PCM may travel local, memory-only
+> process boundaries while ProjectM is the selected and **visible** fullscreen
+> owner. It is never written to disk, journaled, included in diagnostics or
+> telemetry, uploaded, or kept after ProjectM yields. This exception grants no
+> microphone capture, no recording, no diagnostics and no network transmission.
+> The ordinary visualizer stays on derived telemetry and receives no raw PCM.
+
+The mechanism is IF-020: an AF_UNIX endpoint at
+`/run/wall-bus-visualizer/pcm.sock`, mode 0660 root and the panel group,
+authorized by `SO_PEERCRED` uid against a configured allow-list **plus** that
+filesystem permission. An empty allow-list denies. Frames are a frozen 32-byte
+header plus at most one bus period of PCM16, refused at both ends when
+malformed or oversized. Backpressure is **depth one**: the older unsent block is
+dropped, never accumulated, because a queue of audio that can grow is a
+recording held in memory.
+
+**The threat model, stated by the Owner:** "This design is to make it easy to
+check stuff off NagLight but make sure my boys are not in there checking things
+off for fun." Peer credential plus filesystem permission is right-sized for
+that. It is **not** offered as a defence against a compromised host, a hostile
+local process or a compromised home network, and a review finding that assumes
+either is out of scope.
+
+### Units and configuration changed or added
+
+| File | New? | What it does |
+|---|---|---|
+| `wall-bus-visualizer.service` | new | one `bus_monitor` capture into bounded telemetry plus the optional PCM endpoint |
+| `panel-bus-visualizer.py` | new | the daemon; installed to `/usr/local/lib/wall-panel/` at 0755 |
+| `bus_source.py` | new | the pure core: window, dB curve, document, depth-one queue, peer policy |
+| `pcm_frame.py` | new | the frozen IF-020 frame codec, with a fixture shared byte-for-byte with OfficeWallNaglight |
+| `visualizer.py` | changed | optional `sample_rate` and `band_centres_hz`; the "ships no capture adapter" and "raw samples never escape" claims retired |
+| `switch_backend.py` | changed | reads the bus document, ANDs the confirmed switch, emits no microphone block |
+| `asound-bus-mode.conf` | changed | comment only: `bus_monitor` has two readers, not one |
+| `wall-firstboot.sh` | changed | installs the daemon, its three imports and the unit; enables and starts it, warning rather than failing |
+
+**Declared file modes and runtime artefacts:** daemon 0755 in
+`/usr/local/lib/wall-panel`; its three imports 0644 beside it; unit 0644 in
+`/etc/systemd/system`; `RuntimeDirectory=wall-bus-visualizer` at 0755; the
+document chmod 0644 (the broker runs as `panel` and must read it); the socket
+0660 `root:panel`. **Health probe:** `panel-bus-visualizer.py --check`, which
+verifies the tools and the configured user and reports the stored mode without
+opening a device or writing a file.
+
+**Install order (SR-041, IF-020).** The image installs **before** an app that
+can request PCM, and the endpoint's absence is a supported state: the app falls
+back to Frame Media rather than failing. So the MiniPC producer lands first, and
+an app that lands first simply shows Frame Media until the producer arrives.

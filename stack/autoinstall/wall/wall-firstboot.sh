@@ -1285,11 +1285,26 @@ fi
 
 # wall_audio_state.py is the applier's pure core and is imported from beside
 # it, so the two must land in the SAME directory or the switch cannot start.
-for _f in panel-volume-request.py panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py wall-usb-hub-reset.py wall_audio_state.py wall-bt-mic.py; do
+for _f in panel-volume-request.py panel-volume-keys.py panel-amp-trigger.py wall-alsaloop-guard.py wall-usb-hub-reset.py wall_audio_state.py wall-bt-mic.py panel-bus-visualizer.py; do
     if [ -f "$PAYLOAD/$_f" ]; then
         install -m 0755 "$PAYLOAD/$_f" "/usr/local/lib/wall-panel/$_f"
     else
         warn "audio: $_f is not on the payload."
+    fi
+done
+
+# SR-041: the merged-bus visualizer's three imports. `panel-bus-visualizer.py`
+# imports these from BESIDE itself, exactly the way the root applier imports
+# wall_audio_state, and for the same reason: the daemon lives in
+# /usr/local/lib/wall-panel and must not reach into /opt/wall-panel/stack, which
+# is a different release lane and goes stale on its own schedule. They come from
+# the panel-audio tree because that is the one home each of them has -- the
+# broker reads the same `visualizer.py` from /opt, so a fix reaches both.
+for _f in bus_source.py pcm_frame.py visualizer.py; do
+    if [ -r "$PAYLOAD/../../panel-audio/$_f" ]; then
+        install -m 0644 "$PAYLOAD/../../panel-audio/$_f" "/usr/local/lib/wall-panel/$_f"
+    else
+        warn "audio: $_f is not on the payload — the merged-bus visualizer will not start."
     fi
 done
 
@@ -1334,9 +1349,33 @@ if [ -x /usr/local/sbin/wall-audio-output ]; then
     fi
 fi
 
-for _u in wall-volume-request.socket wall-volume-request@.service wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service           wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service           wall-audio-apply.service wall-audio-apply.path           wall-mic-rear.service wall-bt-mic.service; do
+for _u in wall-volume-request.socket wall-volume-request@.service wall-line-in.service wall-volume-keys.service wall-kiosk-loop.service wall-amp-trigger.service          wall-usb-hub-reset@.service           wall-spdif-in.service wall-bus-speaker.service wall-speaker-out.service           wall-bus-headset.service wall-headset-present.service           wall-audio-state.service wall-audio-resume.service           wall-audio-apply.service wall-audio-apply.path           wall-mic-rear.service wall-bt-mic.service           wall-bus-visualizer.service; do
     [ -f "$PAYLOAD/$_u" ] && install -m 0644 "$PAYLOAD/$_u" "/etc/systemd/system/$_u"
 done
+
+# SR-041: the merged-bus visualizer. ENABLED, unlike the two switch legs, and
+# the difference is deliberate: the legs must not start audio in a position the
+# Owner did not leave the switch in, while this only READS. Its ExecCondition
+# keeps it out of the failure list in the three ALSA modes that do not declare
+# `bus_monitor`, and the daemon re-checks the mode on every block so a live
+# `wall-audio-mode` change is answered with `unavailable` rather than a stale
+# document.
+#
+# ITS FAILURE IS A DECORATION'S FAILURE. The amplifier detector, the routing and
+# the switch do not depend on it, so every branch here warns and none fails the
+# step: a panel with no visualizer is a panel that shows Frame Media.
+if [ -f /etc/systemd/system/wall-bus-visualizer.service ] &&
+   [ -x /usr/local/lib/wall-panel/panel-bus-visualizer.py ]; then
+    if ! systemctl enable wall-bus-visualizer.service >/dev/null 2>&1; then
+        warn "audio: wall-bus-visualizer could not be enabled — the visualizer will show Frame Media."
+    elif ! systemctl restart wall-bus-visualizer.service >/dev/null 2>&1; then
+        warn "audio: wall-bus-visualizer did not start — inspect its journal. Routing and the amplifier are unaffected."
+    else
+        log "SR-041: merged-bus visualizer source running; PCM endpoint idle until a local host asks"
+    fi
+else
+    warn "audio: wall-bus-visualizer is not installed — the visualizer will show Frame Media."
+fi
 # The hub reset is a TEMPLATE started by udev, so it is never enabled and has no
 # [Install]. An installed rule with no unit behind it would be a silent no-op,
 # which is the one failure mode worth a line of its own.

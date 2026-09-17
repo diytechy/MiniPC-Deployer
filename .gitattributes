@@ -25,3 +25,7 @@
 *.mca binary
 *.dat binary
 *.lock binary
+
+# The frozen IF-020 PCM frame fixture. Byte-identical in OfficeWallNaglight, so
+# a line-ending rewrite here would be a silent, cross-repository contract change.
+*.bin binary

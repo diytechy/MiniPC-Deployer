@@ -266,6 +266,30 @@ systemctl daemon-reload
 systemctl restart apt-daily-upgrade.timer 2>/dev/null || true
 log "1d: unattended upgrades -> Sun 02:30 exactly (was daily 06:00 +/-60m); needrestart can only bounce services in that window"
 
+# ── 1e. WEEKLY TRIM, WITHOUT THE WEEKLY RED LINE ─────────────────────────────
+# Stock fstrim.timer does real and useful work on the NVMe (33.6 GiB on `/` and
+# again on /var/lib/docker, measured 2026-09-16) and then fails the unit,
+# because it also asks the two USB SPINNING disks to trim and one enclosure
+# answers EREMOTEIO rather than the EOPNOTSUPP that `--quiet-unsupported`
+# suppresses. The reasoning and the device-advertises-discard rule that
+# replaces it live in the header of homehub-fstrim.sh.
+#
+# THE EMPTY `ExecStart=` IS THE WHOLE TRICK. ExecStart is list-valued, and a
+# drop-in ADDS to a list-valued directive rather than replacing it. Without the
+# reset the unit would run BOTH the stock command and ours — the red would come
+# straight back, with an override that reads as if it were correct.
+install -m 0755 "$STACK_DIR/autoinstall/homehub-fstrim.sh" /usr/local/sbin/homehub-fstrim
+mkdir -p /etc/systemd/system/fstrim.service.d
+cat > /etc/systemd/system/fstrim.service.d/override.conf <<'EOF'
+# Installed by firstboot 1e. See stack/autoinstall/homehub-fstrim.sh.
+# The empty ExecStart= is load-bearing: without it systemd runs BOTH commands.
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/homehub-fstrim
+EOF
+systemctl daemon-reload
+log "1e: fstrim -> homehub-fstrim (skips devices advertising no discard support; the SSD is still trimmed weekly)"
+
 # ── 2. oauth2-proxy allow-list (Q10.5) ───────────────────────────────────────
 # Materialize authenticated-emails.txt (one account per line) from the
 # comma/space-separated OAUTH2_PROXY_ALLOWED_EMAILS in .env. Gitignored output.

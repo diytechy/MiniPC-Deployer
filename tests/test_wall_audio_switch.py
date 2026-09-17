@@ -2600,3 +2600,36 @@ def test_a_dry_run_mic_command_writes_nothing_sr029(applier, tmp_path, monkeypat
     assert applier.main(["--state", str(tmp_path / "s.json"),
                          "mic", "capture_percent=42"]) == 0
     assert "WALL_AUDIO_MIC_CAPTURE_PERCENT=42" in env.read_text(encoding="utf-8")
+
+
+# ── the desktop leg must outlast a sleeping desktop (2026-09-16, item 5) ─────
+#
+# MEASURED 2026-09-15: wall-spdif-in ran for hours and then could not re-open
+# (`Poll FD initialization failed`). A flat 2 s retry is ten starts in twenty
+# seconds, which is the unit's own start limit, so systemd gave up and the
+# desktop's audio leg stayed dead for about a day until a reboot.
+
+def test_the_desktop_leg_backs_off_instead_of_exhausting_its_start_limit_sr028():
+    text = read(WALL / "wall-spdif-in.service")
+    assert "RestartSteps=" in text, \
+        "a flat retry against a sleeping source is what exhausted the start limit"
+    assert "RestartMaxDelaySec=" in text, "an unbounded ramp would never come back"
+    steps = int(text.split("RestartSteps=", 1)[1].split("\n", 1)[0])
+    base = int(text.split("RestartSec=", 1)[1].split("\n", 1)[0])
+    ceiling = int(text.split("RestartMaxDelaySec=", 1)[1].split("\n", 1)[0])
+    burst = int(text.split("StartLimitBurst=", 1)[1].split("\n", 1)[0])
+    window = int(text.split("StartLimitIntervalSec=", 1)[1].split("\n", 1)[0])
+    assert base < ceiling and steps > 0
+
+    # THE POINT OF THE RAMP IS THAT THE LIMIT STOPS BEING REACHABLE BY A SOURCE
+    # THAT IS MERELY ASLEEP, so assert the arithmetic rather than the constants:
+    # walk systemd's geometric schedule and count the starts inside one window.
+    delay, elapsed, starts = base, 0.0, 1
+    growth = (ceiling / base) ** (1.0 / steps)
+    while elapsed + delay <= window:
+        elapsed += delay
+        starts += 1
+        delay = min(ceiling, delay * growth)
+    assert starts < burst, (
+        f"{starts} starts fit inside the {window}s window but the limit is {burst}; "
+        "a sleeping desktop would still kill this leg")

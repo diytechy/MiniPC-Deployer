@@ -12,6 +12,22 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-16 — second spine pass corrects and extends accepted trace rows;
+active gate remains G1.** SN-022/SR-034/LLR-931 and TC-935..939 remain accepted,
+with SR-034's rendered parser literal corrected. SN-023/SR-035/LLR-932 and
+TC-940..942 now name six implemented fstrim tests, including unparseable
+capability as a logged skip and an empty mount list as success. SN-024/SR-036/
+LLR-933 and TC-943..945 remain Draft firstboot demonstrations: next panel-boot
+journal evidence is required, because no hermetic firstboot harness exists.
+SN-025/SR-037/LLR-934..935 and TC-946 define the desktop S/PDIF leg's bounded
+geometric backoff without widening the requirement to internal-source sibling
+audio legs. `python scripts/trace.py --strict` reports SN=26 SR=37 LLR=42
+TC=54, orphans=25 (the clean-tree baseline), integrity=0; its exit remains
+non-zero solely for those baseline orphans. IF-019 remains the HEVC counterpart
+obligation. Next action: obtain
+the HEVC firstboot journal on a panel boot and submit these G1 spine changes for
+human review; no gate advance is requested.
+
 **2026-09-14 - NI_A1 feeder rounding and the NI_A2 waist/height sister gauge
 are implemented on `ni-a2-weight-feeder`; not deployed, not merged.** The
 weight feeder now rounds the posted and stored weight to 0.1 lb (nothing ever

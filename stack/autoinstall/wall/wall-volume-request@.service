@@ -2,6 +2,13 @@
 Description=Wall panel apply one bounded physical volume request
 
 [Service]
+# ONE INSTANCE PER CONNECTION, so without this every spent instance stays in
+# systemd's unit list until something reloads it -- and a failed one stays
+# there being red forever. `inactive-or-failed` garbage-collects both, which
+# is what keeps `systemctl --failed` a list worth reading. It does NOT hide a
+# failure: the journal keeps every line, and a fault that recurs reappears on
+# the next connection.
+CollectMode=inactive-or-failed
 ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-volume-request.py
 StandardInput=socket
 StandardOutput=journal

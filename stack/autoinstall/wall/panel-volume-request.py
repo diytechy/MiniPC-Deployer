@@ -66,29 +66,72 @@ def apply_volume(args):
         return 1
 
 
+def read_request(connection):
+    """Read at most one EOF- or newline-delimited request from `connection`."""
+    data = bytearray()
+    # One byte past the longest legal request, so an over-long one is refused by
+    # handle_request rather than truncated into a valid prefix. Was a flat 6
+    # when b"down\n" was the longest form.
+    limit = MAX_REQUEST + 1
+    while len(data) < limit:
+        part = connection.recv(limit - len(data))
+        if not part:
+            break
+        data.extend(part)
+        if data.endswith(b"\n"):
+            break
+    return bytes(data)
+
+
 def main():
-    """Serve the single connection passed as fd 0 by systemd Accept=yes."""
+    """Serve the single connection passed as fd 0 by systemd Accept=yes.
+
+    THE EXIT CODE REPORTS THE APPLY, NOT THE DELIVERY, and that distinction is
+    what this function exists to get right. `Accept=yes` gives every connection
+    its own unit instance, so anything this process calls a failure becomes a
+    RED LINE on the panel's failed list -- and a failed list nobody can read is
+    a failed list nobody reads.
+
+    Two connections are NOT failures, and both used to be reported as one:
+
+      * A CONNECT-AND-CLOSE. `panel_system_verify.py` opens this socket during
+        every panel release to prove it accepts connections, and deliberately
+        sends NOTHING -- an `up` there would move the amplifier. That is the
+        measured cause of the two `wall-volume-request@` failures seen on every
+        boot since 2026-09-14 (the release probe runs inside firstboot's
+        window), NOT a stale rocker event, which is what the 2026-09-16 plan
+        expected to find. No request arrived, so no apply was attempted and
+        nothing went wrong.
+
+      * A CLIENT THAT STOPPED LISTENING. `panel-volume-keys.py` waits 24 s for
+        the verdict; past that it gives up and the reply lands on a closed
+        peer (EPIPE). The apply has already happened by then. Whether it
+        SUCCEEDED is the thing worth a red unit, and that is still reported --
+        an undeliverable verdict is journaled and then the apply's own result
+        decides the exit code.
+
+    A failure to READ is still a failure: a request that times out half-sent is
+    a client this applier could not serve.
+    """
     with socket.socket(fileno=0) as connection:
         connection.settimeout(2)
-        data = bytearray()
         try:
-            # One byte past the longest legal request, so an over-long one is
-            # refused by handle_request rather than truncated into a valid
-            # prefix. Was a flat 6 when b"down\n" was the longest form.
-            limit = MAX_REQUEST + 1
-            while len(data) < limit:
-                part = connection.recv(limit - len(data))
-                if not part:
-                    break
-                data.extend(part)
-                if data.endswith(b"\n"):
-                    break
-            answer = handle_request(bytes(data), apply_volume)
-            connection.sendall(answer)
-            return 0 if answer == b"ok\n" else 1
+            data = read_request(connection)
         except OSError as exc:
-            print("volume connection failed: %s" % exc, file=sys.stderr, flush=True)
+            print("volume request not received: %s" % exc, file=sys.stderr, flush=True)
             return 1
+        if not data:
+            print("volume: connection closed without a request — nothing applied",
+                  file=sys.stderr, flush=True)
+            return 0
+        answer = handle_request(data, apply_volume)
+        try:
+            connection.sendall(answer)
+        except OSError as exc:
+            print("volume verdict undeliverable (%s) — the client stopped waiting; "
+                  "the apply itself decides this unit's result" % exc,
+                  file=sys.stderr, flush=True)
+        return 0 if answer == b"ok\n" else 1
 
 
 if __name__ == "__main__":

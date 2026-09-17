@@ -1607,6 +1607,43 @@ else
     warn "Rebuild the image with the artifact staged: see vmtest/build-wall-seed.sh."
 fi
 
+# ── 8b-2. IS THE HEVC DECODE PROFILE STILL THERE TO BE USED? ─────────────────
+# THE FRAME LIBRARY IS ENTIRELY H.265 (29 files, 43 GB), and the shell plays it
+# only through this GPU's hardware decoder. The two halves of that are owned in
+# different repos on purpose: OfficeWallNaglight's `packaging/wall-shell` passes
+# the Chromium switch that ADMITS the codec, and this image provides the driver
+# that DECODES it (va-driver-all + vainfo, both in wall/packages.list).
+#
+# So this is the image's half of the contract, and it is a PROOF rather than an
+# assumption — the same rule quirk 6 already applies to VA-API in
+# WALL-BURN-IN.md §6. Skylake GT2 exposes VAProfileHEVCMain:VAEntrypointVLD
+# through Intel iHD; a distro upgrade that changed the driver, dropped the
+# firmware or renamed the profile would take the frame video away silently,
+# because the only symptom on the wall is a black rectangle where a photo
+# should be. A loud line here is cheaper than that.
+#
+# NON-FATAL. A panel with no HEVC decoder is degraded, not broken: NagLight, the
+# checklist, music, the door and every other surface are unaffected.
+if command -v vainfo >/dev/null 2>&1; then
+    VA_PROFILES="$(vainfo 2>/dev/null || true)"
+    if printf '%s' "$VA_PROFILES" | grep -q 'VAProfileHEVCMain[[:space:]]*:[[:space:]]*VAEntrypointVLD'; then
+        log "video: VAProfileHEVCMain:VAEntrypointVLD is exposed — the frame library can be decoded in hardware"
+        log "video:   driver = $(printf '%s' "$VA_PROFILES" | sed -n 's/.*Driver version: //p' | head -1)"
+    else
+        warn "video: THIS GPU NO LONGER EXPOSES VAProfileHEVCMain:VAEntrypointVLD."
+        warn "The frame videos are all H.265 and the shell admits H.265 only when a"
+        warn "hardware decoder is present, so the FRAME surface will be a black"
+        warn "rectangle while everything else on the panel keeps working."
+        warn "Check: vainfo   (expect 'Intel iHD driver'; va-driver-all provides it)"
+        warn "A driver that stopped loading usually means a renamed firmware blob or a"
+        warn "kernel/mesa upgrade, not a broken GPU."
+    fi
+else
+    warn "video: vainfo is not installed, so the HEVC decode profile was NOT verified."
+    warn "It is declared in wall/packages.list; an image missing it was built from a"
+    warn "stale package set. The frame video may or may not play — this boot cannot say."
+fi
+
 # ── 8c. CAN THIS PANEL RESOLVE A NAME AT ALL? ────────────────────────────────
 # ADDED 2026-08-08, after a panel that had installed perfectly came up unable to
 # resolve anything. `systemctl is-active systemd-resolved` said `not-found` — the

@@ -453,3 +453,75 @@ def test_tc_p_492_off_grid_first_movement_is_directional_and_needs_no_snap(loude
     state, _ = policy.apply_event(state, {"kind": "snap_volume", "to": 5})
     assert state["volume"]["speaker"] == expected
     assert state["volume_event_seq"] == seq
+
+
+# ── a client that goes away is not a failed apply (2026-09-16, item 2) ──────
+#
+# The two `wall-volume-request@` failures on every boot were MEASURED to the
+# panel release's socket-liveness probe, which connects and deliberately sends
+# nothing. The applier did the right thing behaviourally -- no volume moved --
+# and then reported a failure anyway, which is what put two red units on the
+# panel's list every boot.
+
+class HungUpSocket:
+    """A peer that is already gone: reads EOF, and refuses the reply."""
+
+    def __init__(self, request=b""):
+        self._request = request
+        self.sent = []
+
+    def settimeout(self, _seconds):
+        pass
+
+    def recv(self, _size):
+        part, self._request = self._request, b""
+        return part
+
+    def sendall(self, payload):
+        self.sent.append(payload)
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+def serve(monkeypatch, connection, apply_result=0):
+    broker = module("volume_request", "panel-volume-request.py")
+    monkeypatch.setattr(broker.socket, "socket", lambda **_kw: connection)
+    monkeypatch.setattr(broker, "apply_volume", Mock(return_value=apply_result))
+    return broker.main()
+
+
+def test_connect_and_close_is_not_a_failure_sr028(monkeypatch):
+    """The release probe's connect-only liveness check must exit 0."""
+    assert serve(monkeypatch, HungUpSocket(b"")) == 0
+
+
+def test_an_undeliverable_verdict_reports_the_apply_not_the_delivery_sr028(monkeypatch):
+    """EPIPE on the reply: the apply succeeded, so the unit must not go red."""
+    connection = HungUpSocket(b"up\n")
+    assert serve(monkeypatch, connection, apply_result=0) == 0
+    assert connection.sent == [b"ok\n"]
+
+
+def test_an_undeliverable_verdict_still_reports_a_failed_apply_sr028(monkeypatch):
+    """EPIPE does not launder a failed apply into a success."""
+    assert serve(monkeypatch, HungUpSocket(b"up\n"), apply_result=1) == 1
+
+
+def test_a_request_that_cannot_be_read_is_still_a_failure_sr028(monkeypatch):
+    """A half-sent request that times out is a client this applier failed."""
+    class Stalled(HungUpSocket):
+        def recv(self, _size):
+            raise TimeoutError("timed out")
+
+    assert serve(monkeypatch, Stalled()) == 1
+
+
+def test_spent_instances_collect_themselves_sr028():
+    """Source check: a per-connection unit that lingers is how a list dies."""
+    unit = (WALL / "wall-volume-request@.service").read_text()
+    assert "CollectMode=inactive-or-failed" in unit

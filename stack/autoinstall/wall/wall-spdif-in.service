@@ -55,7 +55,32 @@ ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
     --format S16_LE --rate 48000 --channels 2 \
     --tlatency 30000 --sync 5
 Restart=always
+# ── THE BACKOFF IS THE FIX, NOT THE OPEN ──────────────────────────────────────
+# MEASURED 2026-09-15: this leg ran healthily for hours (12m31s of CPU) and then
+# could not re-open — `Poll FD initialization failed`, alsaloop exits 1. With a
+# flat 2 s retry that is TEN STARTS IN TWENTY SECONDS, which is the start limit
+# above, so systemd stopped trying: `Start request repeated too quickly`. The
+# desktop S/PDIF leg then stayed dead for roughly a day, until a reboot, and
+# nothing would ever have brought it back on its own.
+#
+# The source of this leg is ANOTHER MACHINE. When the desktop sleeps or its
+# S/PDIF output goes idle there is no clock to open against, and that is a
+# NORMAL, TEMPORARY condition — the same judgement `wall-sync`'s frame flow
+# already makes about a sleeping Mini-serv, where an unreachable source is
+# `skip-if-unreachable` rather than a failure. A leg that cannot open because
+# its source is asleep must WAIT, not give up.
+#
+# Ramped rather than lengthened, because the two cases need different answers
+# from the same policy: a brief xrun should come back in about two seconds, and
+# an overnight sleep should be retried patiently. 2s -> ~120s over six steps
+# does both, and it also keeps the start rate under StartLimitBurst by
+# construction (t=0,2,6,14,31,66 is six starts inside the 60 s window, not ten),
+# so the limit stays armed for a genuinely hard-failing unit and stops being
+# something a sleeping desktop can trip. RestartSteps/RestartMaxDelaySec need
+# systemd 254+; this image is 255.
 RestartSec=2
+RestartSteps=6
+RestartMaxDelaySec=120
 # Desktop audio is the lip-sync-sensitive leg, so it keeps the line-in unit's
 # priority and its low latency request.
 Nice=-10

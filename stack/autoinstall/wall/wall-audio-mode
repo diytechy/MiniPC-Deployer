@@ -183,9 +183,103 @@ restart_kiosk() {
     fi
 }
 
+# Keep these two files as one small transaction from the operator's point of
+# view. The selected ALSA chain is the symlink and the mode file is the policy
+# record read by the legs; leaving either at the old value would make a later
+# adapter arrival reason from a different graph than the one the Owner chose.
+# There cannot be one filesystem-atomic write across two pathnames, so stage
+# the file first and roll the link back if publishing the file fails.
+set_mode_selection() {
+    case "$1" in
+        trigger) _target="$CONF_DIR/asound-trigger-mode.conf" ;;
+        panel)   _target="$CONF_DIR/asound-panel-mode.conf" ;;
+        bus)     _target="$CONF_DIR/asound-bus-mode.conf" ;;
+        *) return 2 ;;
+    esac
+    _selection_tmp="$MODE_FILE.tmp.$$"
+    # `a && b` as a bare statement returns a's status when a fails, and under
+    # `set -e` that kills the whole mode switch silently -- the trap documented
+    # on remember_active above. Use if, both here and in the wrapper.
+    _had_link=0
+    if _old_link=$(readlink "$LINK" 2>/dev/null); then
+        _had_link=1
+    else
+        _old_link=""
+    fi
+    # TERRA ROUND 2, major: REFUSE BEFORE MUTATING if $LINK exists but is not a
+    # symlink we can read. `ln -sfn` would replace that object, and the rollback
+    # below could only `rm` it -- destroying a file the Owner put there while
+    # reporting "nothing was changed". There is nothing to restore it from, so
+    # the only honest move is to decline before anything moves. `-e` alone is
+    # false for a dangling symlink, hence the `-L` arm.
+    if [ "$_had_link" -eq 0 ] && { [ -e "$LINK" ] || [ -L "$LINK" ]; }; then
+        echo "FATAL: $LINK exists but is not a readable symlink; refusing to" \
+             "replace it, because a rollback could not put it back." >&2
+        return 4
+    fi
+    printf '%s\n' "$1" > "$_selection_tmp" || return 1
+    if ! ln -sfn "$_target" "$LINK"; then
+        rm -f "$_selection_tmp"
+        return 1
+    fi
+    if ! mv -f "$_selection_tmp" "$MODE_FILE"; then
+        rm -f "$_selection_tmp"
+        # TERRA 2026-09-17, major: a FAILED rollback is worse than the failure
+        # it is rolling back -- the link names the new chain while the mode
+        # file still names the old one, and every later reader disagrees about
+        # which graph is selected. Say so loudly rather than returning the same
+        # code as a clean rollback. `_had_link` distinguishes "there was no
+        # link" from "readlink failed", which an empty string conflated.
+        if [ "$_had_link" -eq 1 ]; then
+            ln -sfn "$_old_link" "$LINK" || return 3
+        else
+            rm -f "$LINK" || return 3
+        fi
+        return 1
+    fi
+    return 0
+}
+
+# One place that turns a selection failure into the right refusal. Callers used
+# to ignore set_mode_selection entirely (Terra 2026-09-17, major): a failed
+# write logged "selection recorded" and exited 0, so firstboot went green with
+# no selection on disk at all.
+require_mode_selection() {
+    _sel_rc=0
+    set_mode_selection "$1" || _sel_rc=$?
+    if [ "$_sel_rc" -eq 0 ]; then
+        return 0
+    fi
+    if [ "$_sel_rc" -eq 3 ]; then
+        echo "FATAL: mode selection is INCONSISTENT -- $LINK and $MODE_FILE" \
+             "disagree and the rollback failed. Audio is not safe to use" \
+             "until one of them is corrected by hand." >&2
+    elif [ "$_sel_rc" -eq 4 ]; then
+        : # set_mode_selection has already said why, in more detail than here.
+    else
+        echo "FATAL: could not record the requested mode '$1'" \
+             "($MODE_FILE / $LINK); nothing was changed." >&2
+    fi
+    # TERRA ROUND 2, major: RETURN THE STATUS, do not flatten it to 1. The
+    # first version advertised a distinct inconsistent-state code in the
+    # requirement and then converted it here, so the distinction existed only
+    # in the log line -- unreachable to any caller, and untestable except by
+    # reading stderr. A caller that treats 3 like 1 is making a choice; a
+    # caller that CANNOT tell them apart is not.
+    return "$_sel_rc"
+}
+
+# `/proc/asound/<card-id>` is created by ALSA for the configured card id, not
+# its unstable numeric index.  An absent removable adapter is not a partial
+# switch: its BindsTo consumers have nowhere to run, and the udev re-add rule
+# will run the stored policy when it returns.  Do this BEFORE stopping clients
+# or touching mixers, but still record both halves of the requested selection.
+adapter_present() {
+    [ -d "/proc/asound/$ADAPTER" ]
+}
+
 apply_trigger() {
-    ln -sfn "$CONF_DIR/asound-trigger-mode.conf" "$LINK"
-    printf 'trigger\n' > "$MODE_FILE"
+    require_mode_selection trigger || return $?
     mix "$BUILTIN" 'Auto-Mute Mode' Disabled
     mix "$BUILTIN" Speaker mute
     mix "$BUILTIN" Master 100% unmute
@@ -195,8 +289,7 @@ apply_trigger() {
 }
 
 apply_panel() {
-    ln -sfn "$CONF_DIR/asound-panel-mode.conf" "$LINK"
-    printf 'panel\n' > "$MODE_FILE"
+    require_mode_selection panel || return $?
     mix "$BUILTIN" 'Auto-Mute Mode' Disabled
     mix "$BUILTIN" Master 100% unmute
     mix "$BUILTIN" Speaker unmute
@@ -210,8 +303,7 @@ apply_panel() {
 }
 
 apply_bus() {
-    ln -sfn "$CONF_DIR/asound-bus-mode.conf" "$LINK"
-    printf 'bus\n' > "$MODE_FILE"
+    require_mode_selection bus || return $?
     # The built-in codec is out of the audio path entirely in this mode: the
     # trigger tone is retired (DECISIONS_RATIFIED 2026-09-13) and the panel's own
     # speaker is the fallback mode's business, not this one's.
@@ -243,6 +335,16 @@ case "${1:-}" in
   trigger|panel|bus)
     [ "$(id -u)" -eq 0 ] || { echo "must be root" >&2; exit 1; }
     mkdir -p "$CONF_DIR"
+    if ! adapter_present; then
+        # The deferral is only legitimate once the selection is ACTUALLY on
+        # disk: the whole contract with the udev re-add is that it will find a
+        # recorded mode to reassert. Reporting a deferral we did not record
+        # would leave firstboot green and the next re-add reasserting the old
+        # mode (Terra 2026-09-17, major).
+        require_mode_selection "$1" || exit $?
+        echo "mode: $1 (adapter $ADAPTER absent; selection recorded and legs deferred)" >&2
+        exit 0
+    fi
     # BEFORE ANYTHING ELSE MOVES. A mic leg that will not die is the one
     # condition that aborts a mode switch: see stop_mic_legs_or_refuse.
     stop_mic_legs_or_refuse || exit 1

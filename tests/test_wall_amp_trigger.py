@@ -114,6 +114,103 @@ def test_suspend_proof_exists_only_after_verified_off(tmp_path):
     assert not marker.exists()
 
 
+def _sigterm_run(module, monkeypatch, actuator):
+    """Drive main() through one SIGTERM inside the running loop.
+
+    The actuator's `device` is what separates "the relay is unplugged" from
+    "the relay is there and refused", so each caller supplies its own.
+    """
+    handlers = {}
+
+    class Level:
+        pcm = "speaker_tap"
+
+        def __init__(self, *_args):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def above(self, _threshold):
+            return False
+
+    class StopOnTerm:
+        def __init__(self):
+            self.stopped = False
+
+        def set(self):
+            self.stopped = True
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _seconds):
+            handlers[module.signal.SIGTERM](module.signal.SIGTERM, None)
+            return True
+
+    monkeypatch.setattr(module, "build_actuator", lambda *_a, **_kw: actuator)
+    monkeypatch.setattr(module, "required_tools", lambda _method: ())
+    monkeypatch.setattr(module, "ensure_off_bounded", lambda _actuator: False)
+    monkeypatch.setattr(module, "record_safe_state", lambda _verified: None)
+    monkeypatch.setattr(module, "current_mode", lambda: "bus")
+    monkeypatch.setattr(module, "sources_for", lambda _mode: (("speaker_tap", 0.0),))
+    monkeypatch.setattr(module, "Level", Level)
+    monkeypatch.setattr(module, "publish_bus_telemetry", lambda *_a, **_kw: None)
+    monkeypatch.setattr(module.threading, "Event", StopOnTerm)
+    monkeypatch.setattr(module.signal, "signal",
+                        lambda signum, handler: handlers.setdefault(signum, handler))
+    return module.main()
+
+
+def test_a_present_relay_that_refuses_its_off_stays_fatal_on_sigterm_sr039(monkeypatch, tmp_path):
+    """TERRA 2026-09-17, major. Only ABSENCE excuses an unverified OFF.
+
+    The first version of this fix returned zero for every unverified stop, so a
+    relay that was plugged in and refused the write reported success while the
+    amplifier may still have been energized. The device node is the evidence.
+    """
+    module = load_module()
+    node = tmp_path / "wall_amp_relay"
+    node.write_bytes(b"")
+
+    class PresentButRefusing:
+        device = str(node)
+
+        def stop(self):
+            return False
+
+    assert _sigterm_run(module, monkeypatch, PresentButRefusing()) == 1
+
+
+def test_sigterm_during_relay_absence_exits_cleanly_sr039(monkeypatch):
+    """A dependency stop is clean even when the unplugged relay cannot be turned off."""
+    module = load_module()
+
+    class Absent:
+        device = "/dev/wall-amp-relay-that-is-not-plugged-in"
+
+        def stop(self):
+            return False
+
+    assert _sigterm_run(module, monkeypatch, Absent()) == 0
+
+
+def test_relay_absence_without_a_termination_request_remains_fatal_sr039(monkeypatch):
+    """Only systemd-requested shutdown is clean; an idle unsafe start still fails."""
+    module = load_module()
+
+    monkeypatch.setattr(module, "build_actuator", lambda *_a, **_kw: object())
+    monkeypatch.setattr(module, "required_tools", lambda _method: ())
+    monkeypatch.setattr(module, "ensure_off_bounded", lambda _actuator: False)
+    monkeypatch.setattr(module, "record_safe_state", lambda _verified: None)
+    monkeypatch.setattr(module, "current_mode", lambda: "panel")
+
+    assert module.main() == 1
+
+
 def test_lcus2_failure_is_not_reported_as_on():
     module = load_module()
 

@@ -2612,6 +2612,40 @@ def test_the_mode_script_also_refuses_an_unqueryable_mic_leg_sr029():
     assert not any("is-active" in line for line in decisions), decisions
 
 
+# ── removable adapter deferral must not hide a half-applied switch ──────────
+
+def test_an_absent_adapter_defers_the_mode_switch_with_consistent_selection_sr039():
+    """A firstboot run must not be red merely because the USB adapter is out."""
+    text = read(WALL / "wall-audio-mode")
+    assert "adapter_present()" in text
+    assert 'require_mode_selection "$1"' in text
+    deferred = text.split('if ! adapter_present; then', 1)[1].split('\n    fi', 1)[0]
+    # The CHECKED wrapper, not the raw one. Terra 2026-09-17 found that the
+    # deferred branch ignored the selection's status, so a failed write still
+    # logged "selection recorded" and exited zero -- firstboot green with no
+    # selection on disk for the udev re-add to reassert. The behaviour is
+    # proven in tests/test_wall_audio_mode_selection.py, which EXECUTES these
+    # functions; this line only holds the deferred branch to the checked call.
+    # `exit $?`, not `exit 1`: the helper's inconsistent-state code is distinct
+    # and must survive to the caller (Terra round 2).
+    assert 'require_mode_selection "$1" || exit $?' in deferred
+    assert "exit 0" in deferred
+    # No process may be stopped or started in this path: there is no adapter
+    # graph to reconcile, and changing legs here would manufacture a failure.
+    assert "unit " not in deferred
+    body = text.split("  trigger|panel|bus)", 1)[1]
+    assert body.index("if ! adapter_present") < body.index("stop_mic_legs_or_refuse")
+
+
+def test_a_real_mode_switch_failure_remains_fatal_after_adapter_deferral_sr039():
+    """The absent-device exception must not turn the old half-switch alarm green."""
+    text = read(WALL / "wall-audio-mode")
+    assert 'if [ "$FAILED" -ne 0 ]; then' in text
+    failure = text.split('if [ "$FAILED" -ne 0 ]; then', 1)[1].split("fi", 1)[0]
+    assert "exit 1" in failure
+    assert "audio may be wrong" in failure
+
+
 def test_a_replugged_adapter_brings_the_rear_mic_leg_back_sr029():
     """The re-add delegates this policy leg to the non-sticky reassert."""
     rule = read(WALL / "90-wall-audio-adapter.rules")

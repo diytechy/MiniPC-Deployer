@@ -897,6 +897,47 @@ def stop_and_record(actuator):
     return verified
 
 
+def relay_absent(actuator):
+    """True when the relay's device node is gone, so no OFF was ever possible.
+
+    Absence is the one condition that excuses an unverified OFF: there is no
+    contact to open, and the udev re-add will re-run this daemon against the
+    returned node.  A node that is PRESENT and still refused the write is a
+    different thing -- the amplifier may be left energized -- and must stay
+    visible.  The node is the evidence, not the failure of the write.
+    """
+    device = getattr(actuator, "device", None)
+    if not device:
+        return False
+    return not os.path.exists(device)
+
+
+def requested_shutdown(actuator):
+    """Attempt safe shutdown after SIGTERM/SIGINT without misclassifying it.
+
+    A dependency stop is systemd's intentional lifecycle action.  The relay
+    can already be unplugged when it arrives, so an unverified best-effort OFF
+    cannot turn that requested stop into a failed unit and prevent recovery on
+    the adapter's next add.  Startup failures remain non-zero in main().
+
+    TERRA 2026-09-17, major: this used to return 0 for EVERY unverified stop.
+    A present relay that refused its OFF write is not the absent-device case
+    this exists for, and reporting it green would hide an amplifier that may
+    still be energized.  Only absence is excused.
+
+    Implements: SR-039, LLR-941
+    """
+    if stop_and_record(actuator) is not False:
+        return 0
+    if relay_absent(actuator):
+        log("relay OFF could not be verified during requested shutdown; "
+            "exiting cleanly while the relay is absent")
+        return 0
+    log("relay OFF was not verified during requested shutdown and the device "
+        "node is still present; reporting the failure")
+    return 1
+
+
 def main():
     method = os.environ.get("WALL_AMP_ACTIVATOR", "lcus-2").strip()
     device = os.environ.get(
@@ -937,7 +978,7 @@ def main():
         log("WALL_AMP_ENABLED is false; idling without emitting anything")
         while not stopping.wait(3600):
             pass
-        return 0 if stop_and_record(actuator) is not False else 1
+        return requested_shutdown(actuator)
 
     if current_mode() not in COMMANDING_MODES:
         log("panel mode: the amplifier is not commanded; idling")
@@ -945,7 +986,7 @@ def main():
         # unit when the mode changes back.
         while not stopping.wait(3600):
             pass
-        return 0 if stop_and_record(actuator) is not False else 1
+        return requested_shutdown(actuator)
 
     log("amplifier actuator: LCUS-2 channel %s at %s" % (channel, device))
     sources = sources_for(current_mode())
@@ -1049,10 +1090,13 @@ def main():
 
         stopping.wait(BLOCK_SECONDS)
 
-    stopped = stop_and_record(actuator)
+    # The level threads are stopped whatever the relay did, but the relay's
+    # verdict is the unit's: discarding it here was the other half of the
+    # Terra finding above.
+    status = requested_shutdown(actuator)
     for lv in levels:
         lv.stop()
-    return 0 if stopped is not False else 1
+    return status
 
 
 if __name__ == "__main__":

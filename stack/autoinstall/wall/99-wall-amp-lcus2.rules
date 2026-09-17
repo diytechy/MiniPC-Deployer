@@ -1,3 +1,12 @@
 # LCUS-2 dual USB relay measured 2026-09-13: CH340 VID:PID 1a86:7523.
-# Give the amplifier actuator a stable name instead of depending on ttyUSB order.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="wall-amp-relay", GROUP="dialout", MODE="0660"
+# Give the amplifier actuator a stable name and a systemd device alias instead
+# of depending on ttyUSB order. Tag and alias apply on every non-remove event;
+# the WANT is add-only so a relay replug wakes an inactive trigger service but
+# ordinary change events cannot repeatedly queue it.
+ACTION=="remove", GOTO="wall_amp_lcus2_end"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    TAG+="systemd", ENV{SYSTEMD_ALIAS}="/dev/wall_amp_relay", \
+    SYMLINK+="wall-amp-relay", GROUP="dialout", MODE="0660"
+ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    ENV{SYSTEMD_WANTS}+="wall-amp-trigger.service"
+LABEL="wall_amp_lcus2_end"

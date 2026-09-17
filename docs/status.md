@@ -12,6 +12,8 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-09-16 — Draft, reviewer-ratification pending: panel USB audio/relay re-enumeration recovery (SN-026/SR-038/LLR-936..938; TC-947..950).** Adapter re-add now directly starts only legacy/always-on consumers and invokes the existing non-sticky reassert for ALL_LEGS policy; absent adapter is a logged zero-exit deferral. The CH340 now has a systemd alias and independent add activation; the actuator wants/orders after it but does not bind to it. Next action: reviewer ratification, then panel acceptance TC-950; active gate remains G1.
+
 **2026-09-16 — second spine pass corrects and extends accepted trace rows;
 active gate remains G1.** SN-022/SR-034/LLR-931 and TC-935..939 remain accepted,
 with SR-034's rendered parser literal corrected. SN-023/SR-035/LLR-932 and

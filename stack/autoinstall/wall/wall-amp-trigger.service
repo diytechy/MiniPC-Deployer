@@ -28,10 +28,13 @@ StartLimitBurst=10
 # when there is no longer any audio hardware -- and the SYSTEMD_WANTS in
 # 90-wall-audio-adapter.rules starts it again when the adapter returns.
 #
-# The LCUS-2 relay is a SEPARATE USB device on the same hub and is deliberately
-# not a dependency: its node is a udev symlink that reappears on its own, and
-# the daemon now waits a bounded WALL_AMP_RELAY_WAIT_SECONDS for it at start
-# rather than exiting on the first ENOENT of a re-enumeration in progress.
+# The LCUS-2 relay is a SEPARATE USB device. Want and order after its stable
+# alias, but do NOT BindsTo it: the relay is an actuator, not the audio path,
+# and unplugging it must not tear down the detector or room audio. The daemon's
+# bounded wait and in-loop reopen handle an absent or late node; its udev add
+# starts an inactive service after a relay-only replug.
+Wants=dev-wall_amp_relay.device
+After=dev-wall_amp_relay.device
 BindsTo=dev-wall_audio_adapter.device
 After=dev-wall_audio_adapter.device
 

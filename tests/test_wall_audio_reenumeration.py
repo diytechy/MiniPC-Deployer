@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WALL = ROOT / "stack" / "autoinstall" / "wall"
 RULES = WALL / "90-wall-audio-adapter.rules"
 GUARD = WALL / "wall-alsaloop-guard.py"
-UNITS = ("wall-line-in.service", "wall-kiosk-loop.service",
-         "wall-amp-trigger.service")
+DIRECT_UNITS = {"wall-line-in.service", "wall-kiosk-loop.service",
+                "wall-spdif-in.service", "wall-amp-trigger.service"}
 # The escaped form of the ENV{SYSTEMD_ALIAS} path, which is what systemd turns
 # it into and what every unit must name.
 DEVICE_UNIT = "dev-wall_audio_adapter.device"
@@ -60,10 +60,22 @@ def test_alias_is_port_independent_and_not_the_kernel_device_name():
 
 
 def test_every_bound_unit_is_started_again_when_the_device_returns():
+    """Derive recovery coverage so a new BindsTo= leg cannot go stale."""
     body = "\n".join(line for line in RULES.read_text(encoding="utf-8").splitlines()
                      if not line.lstrip().startswith("#"))
-    for unit in UNITS:
-        assert 'ENV{SYSTEMD_WANTS}+="%s"' % unit in body, unit
+    spec = importlib.util.spec_from_file_location("wall_audio_state",
+                                                   WALL / "wall_audio_state.py")
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    directly_started = set(re.findall(r'ENV\{SYSTEMD_WANTS\}\+="([^"]+\.service)"',
+                                      body))
+    bound = {unit.name for unit in WALL.glob("*.service")
+             if "BindsTo=%s" % DEVICE_UNIT in read(unit.name)}
+    missing = bound - directly_started - set(policy.ALL_LEGS)
+    assert not missing, "adapter-bound unit has no re-add recovery owner: %s" % \
+        ", ".join(sorted(missing))
+    assert DIRECT_UNITS <= directly_started
+    assert "wall-audio-resume.service" in directly_started
 
 
 def test_the_tag_is_not_restricted_to_add_events():
@@ -80,7 +92,8 @@ def test_the_tag_is_not_restricted_to_add_events():
 
 # --- the units -------------------------------------------------------------
 
-@pytest.mark.parametrize("unit", UNITS)
+@pytest.mark.parametrize("unit", sorted(DIRECT_UNITS | {
+    "wall-bus-speaker.service", "wall-speaker-out.service", "wall-mic-rear.service"}))
 def test_units_are_bound_to_the_adapter_and_ordered_after_it(unit):
     text = read(unit)
     assert "BindsTo=%s" % DEVICE_UNIT in text, unit
@@ -127,7 +140,7 @@ HOST_ARTIFACTS = (
     re.compile(r"Command .*(wall-alsaloop-guard\.py|alsaloop|amixer|python3)"),
     re.compile(r"(wall-alsaloop-guard\.py|/usr/bin/alsaloop|/usr/bin/amixer|"
                r"/usr/bin/python3|/usr/local/lib/wall-panel)"),
-    re.compile(r"dev-wall_audio_adapter\.device"),
+    re.compile(r"dev-wall_(audio_adapter|amp_relay)\.device"),
     re.compile(r"Unit .*\.device .*(not found|Invalid argument)"),
 )
 
@@ -146,16 +159,34 @@ def test_the_amp_unit_is_deliberately_started_even_in_panel_mode():
     assert "idl" in text.lower() or "verified OFF" in text
 
 
+def test_reassert_and_relay_aliases_recover_without_a_stale_udev_leg_list():
+    reassert = read("wall-audio-resume.service")
+    assert "apply-state" in reassert
+    assert "RemainAfterExit" not in reassert.split("[Service]", 1)[1]
+    relay_rules = read("99-wall-amp-lcus2.rules")
+    assert 'TAG+="systemd"' in relay_rules
+    assert 'ENV{SYSTEMD_ALIAS}="/dev/wall_amp_relay"' in relay_rules
+    assert 'ACTION=="add"' in relay_rules
+    assert 'ENV{SYSTEMD_WANTS}+="wall-amp-trigger.service"' in relay_rules
+    amp = read("wall-amp-trigger.service")
+    assert "Wants=dev-wall_amp_relay.device" in amp
+    assert "After=dev-wall_amp_relay.device" in amp
+    assert "BindsTo=dev-wall_amp_relay.device" not in amp
+
+
 @pytest.mark.skipif(shutil.which("systemd-analyze") is None,
                     reason="systemd-analyze is not available on this host")
 def test_unit_files_pass_systemd_analyze_verify(tmp_path):
-    for unit in UNITS:
+    verify_units = sorted(DIRECT_UNITS | {
+        "wall-bus-speaker.service", "wall-speaker-out.service", "wall-mic-rear.service",
+        "wall-audio-resume.service"})
+    for unit in verify_units:
         shutil.copy(WALL / unit, tmp_path / unit)
         # The repo lives on a Windows mount where every file reads as 0777;
         # fixing the mode is better than filtering the complaint about it.
         (tmp_path / unit).chmod(0o644)
     got = subprocess.run(
-        ["systemd-analyze", "verify", *[str(tmp_path / u) for u in UNITS]],
+        ["systemd-analyze", "verify", *[str(tmp_path / u) for u in verify_units]],
         capture_output=True, text=True)
     # Allowlist, not a denylist: an unrecognised diagnostic is a defect. The
     # [Service]-vs-[Unit] StartLimit mistake this caught reads as "Unknown key

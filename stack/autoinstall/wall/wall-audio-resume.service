@@ -1,4 +1,4 @@
-# wall-audio-resume.service — re-assert the switch position after a resume.
+# wall-audio-resume.service — re-assert the switch after resume or USB return.
 #
 # A SEPARATE UNIT FROM wall-audio-state.service, AND THAT IS THE POINT. The boot
 # unit is `RemainAfterExit=yes`, so it stays active for the life of the boot --
@@ -14,10 +14,13 @@
 #
 # Also re-asserted rather than assumed because the USB adapters may have been
 # re-enumerated across S3: the applier resolves the headset card afresh and
-# starts the leg the stored position calls for.
+# starts the leg the stored position calls for. The USB adapter's udev rule also
+# wants this unit after a re-add. That is intentionally the same operation: it
+# is non-sticky, so repeated wants are safe and policy stays in
+# wall_audio_state.py instead of being copied into a udev unit list.
 
 [Unit]
-Description=Wall panel: re-assert the stored audio switch position after resume
+Description=Wall panel: re-assert the stored audio switch after resume or USB return
 Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 After=sound.target

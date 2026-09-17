@@ -271,6 +271,27 @@ def current_mode():
     return value if value in ("trigger", "panel", "bus") else "trigger"
 
 
+def adapter_present(card, proc_asound=PROC_ASOUND):
+    """Whether the configured 5.1 adapter card is enumerated now.
+
+    The ALSA id is stable while its number and USB path are not. An absent
+    adapter is an expected slow-boot/replug state; a present adapter whose
+    mixer or legs fail remains an apply failure.
+    Implements: SR-038, LLR-936
+    """
+    try:
+        candidates = proc_asound.glob("card*/id")
+    except OSError:
+        return False
+    for identifier in candidates:
+        try:
+            if identifier.read_text(encoding="utf-8").strip() == card:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def headset_card(proc_asound=PROC_ASOUND):
     """The ALSA card id of the headset adapter, or None if it is not plugged in.
 
@@ -1568,24 +1589,14 @@ def select_speaker_chain(applier):
     return chain
 
 
-def apply_plan(state, applier):
-    """Make the world match `state`. Returns the number of failures.
+def publish_adapter_independent_state(wanted, headset, applier):
+    """Publish runtime facts that remain true while the USB adapter is absent.
 
-    ORDER MATTERS AND IT IS: stop, mute, re-point, unmute, start, level.
-    Stopping first means the adapter is never fed by two legs at once; muting
-    before the legs move means the switch does not click through the
-    amplifier; the level is set LAST because the softvol control does not
-    exist until something has opened the PCM that declares it.
+    The input-mute status is consumed by the UI and canceller, while the mic
+    source and headset-card files prevent a later leg from inheriting stale
+    runtime state.  They must be refreshed on every apply, including the
+    slow-enumeration deferral.
     """
-    failures = 0
-    wanted = policy.plan(state, aec_available=aec_available())
-    adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
-    loopback = read_env(CARDS_FILE, "WALL_AUDIO_LOOPBACK_CARD", "Loopback")
-    builtin = read_env(CARDS_FILE, "WALL_AUDIO_BUILTIN_CARD", "PCH")
-    headset = headset_card()
-    mic_values, mic_notes = load_mic()
-    for note in mic_notes:
-        log(note)
     # ITEM J's EFFECTIVE MUTE, PUBLISHED BEFORE ANY LEG MOVES. The canceller
     # polls it to decide whether its status block may claim a live microphone
     # level; publishing it after the legs had moved would leave a window in
@@ -1617,11 +1628,72 @@ def apply_plan(state, applier):
     # inherits its environment.
     mic_source_changed = select_mic_source(applier, wanted["mic_source"])
 
-    # The resolved headset card, for the headset leg's alsaloop. Written even
-    # when the adapter is absent (as an empty value) so that a stale card id
-    # from the last plug cannot be picked up by the next start.
+    # The resolved headset card is written even when the adapter is absent (as
+    # an empty value), so a later start cannot pick up a stale card id.
     write_atomic(HEADSET_ENV, "WALL_AUDIO_HEADSET_CARD=%s\n" % (headset or ""),
                  mode=0o644, dry_run=applier.dry_run)
+    return mic_source_changed
+
+
+def apply_builtin_capture_controls(wanted, mic_values, builtin, applier):
+    """Reassert the panel codec's gain and privacy switch. Returns failures.
+
+    Unlike the adapter mixer and rear pair, the built-in PCH codec remains
+    available during USB enumeration.  A failed close is counted because this
+    is the hardware half of the Owner's input-mute privacy property.
+    """
+    # THE CAPTURE SIDE. Item 23 D4 puts the PANEL's own microphone on the mic
+    # input in Speaker position, and that microphone was found CLIPPING at the
+    # level it had been left at -- peak 32768, -15.2 dBFS RMS, at capture 62 %
+    # with +12 dB of boost. The seeded knob is the level measured on the panel
+    # after the AEC run had lowered it live (24 %, -6.00 dB, boost 0), and it is
+    # re-asserted on every apply rather than trusted to alsactl, because a level
+    # that clips is not a preference somebody might have meant.
+    #
+    # `Capture Source` is NOT touched. It is an exclusive enum on this codec
+    # (`Internal Mic` | `Headset Mic`, measured 2026-09-14) and it already reads
+    # Internal Mic; the panel's own jack has no capture path at all (the
+    # 2026-09-12 pin dump), so there is nothing for the other position to mean.
+    applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Capture",
+                     "%d%%" % mic_values["capture_percent"]], required=False)
+    applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
+                     "Internal Mic Boost", "%d" % mic_values["boost"]],
+                    required=False)
+    # THE INPUT MUTE IS A REAL MUTE AND THIS IS THE HARDWARE HALF OF IT (Owner
+    # ruling E). The leg half -- stopping both forwarders, so that not one
+    # sample leaves this panel -- is in `wanted["legs"]` above and below, and it
+    # is the half that actually guarantees the property. This one is the belt:
+    # a capture switch closed on the card means an unmuted leg started by
+    # anything else still records silence.
+    # `required` follows the DIRECTION here for the same reason the legs do.
+    # Closing a capture switch that will not close is a privacy failure worth
+    # reporting; opening one that will not open is a microphone that does not
+    # work, which the leg above has already said.
+    return applier.command(
+        ["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Capture",
+         "nocap" if wanted["input_muted"] else "cap"],
+        required=bool(wanted["input_muted"]))
+
+
+def apply_plan(state, applier):
+    """Make the world match `state`. Returns the number of failures.
+
+    ORDER MATTERS AND IT IS: stop, mute, re-point, unmute, start, level.
+    Stopping first means the adapter is never fed by two legs at once; muting
+    before the legs move means the switch does not click through the
+    amplifier; the level is set LAST because the softvol control does not
+    exist until something has opened the PCM that declares it.
+    """
+    failures = 0
+    wanted = policy.plan(state, aec_available=aec_available())
+    adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
+    loopback = read_env(CARDS_FILE, "WALL_AUDIO_LOOPBACK_CARD", "Loopback")
+    builtin = read_env(CARDS_FILE, "WALL_AUDIO_BUILTIN_CARD", "PCH")
+    headset = headset_card()
+    mic_values, mic_notes = load_mic()
+    for note in mic_notes:
+        log(note)
+    mic_source_changed = publish_adapter_independent_state(wanted, headset, applier)
 
     # FAILING TO START A MICROPHONE IS A DEGRADED PANEL. FAILING TO STOP ONE IS
     # A PRIVACY FAILURE. The two directions are therefore NOT symmetric, and
@@ -1672,37 +1744,7 @@ def apply_plan(state, applier):
         applier.command(["/usr/bin/amixer", "-c", headset, "-q", "sset", "Mic",
                          "%d%%" % mic_values["headset_capture_percent"]],
                         required=False)
-    # THE CAPTURE SIDE. Item 23 D4 puts the PANEL's own microphone on the mic
-    # input in Speaker position, and that microphone was found CLIPPING at the
-    # level it had been left at -- peak 32768, -15.2 dBFS RMS, at capture 62 %
-    # with +12 dB of boost. The seeded knob is the level measured on the panel
-    # after the AEC run had lowered it live (24 %, -6.00 dB, boost 0), and it is
-    # re-asserted on every apply rather than trusted to alsactl, because a level
-    # that clips is not a preference somebody might have meant.
-    #
-    # `Capture Source` is NOT touched. It is an exclusive enum on this codec
-    # (`Internal Mic` | `Headset Mic`, measured 2026-09-14) and it already reads
-    # Internal Mic; the panel's own jack has no capture path at all (the
-    # 2026-09-12 pin dump), so there is nothing for the other position to mean.
-    applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Capture",
-                     "%d%%" % mic_values["capture_percent"]], required=False)
-    applier.command(["/usr/bin/amixer", "-c", builtin, "-q", "sset",
-                     "Internal Mic Boost", "%d" % mic_values["boost"]],
-                    required=False)
-    # THE INPUT MUTE IS A REAL MUTE AND THIS IS THE HARDWARE HALF OF IT (Owner
-    # ruling E). The leg half -- stopping both forwarders, so that not one
-    # sample leaves this panel -- is in `wanted["legs"]` above and below, and it
-    # is the half that actually guarantees the property. This one is the belt:
-    # a capture switch closed on the card means an unmuted leg started by
-    # anything else still records silence.
-    # `required` follows the DIRECTION here for the same reason the legs do.
-    # Closing a capture switch that will not close is a privacy failure worth
-    # reporting; opening one that will not open is a microphone that does not
-    # work, which the leg above has already said.
-    failures += applier.command(
-        ["/usr/bin/amixer", "-c", builtin, "-q", "sset", "Capture",
-         "nocap" if wanted["input_muted"] else "cap"],
-        required=bool(wanted["input_muted"]))
+    failures += apply_builtin_capture_controls(wanted, mic_values, builtin, applier)
     # THE REAR PAIR IS RAISED ONLY WHILE A MIC LEG IS MEANT TO RUN, and put back
     # to the 0 the tone era left it at otherwise (coordinator log 2026-09-13
     # 22:50, "adapter rear pair (RL/RR) set to 0 and stored with alsactl"). Two
@@ -2190,6 +2232,28 @@ def _locked_apply(arguments):
         if boot_mark is not None:
             write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
         return 0
+    adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
+    if not adapter_present(adapter):
+        # Slow USB enumeration is not a failed switch policy. Starting legs
+        # here only spends their 15-second waits; the adapter add rule invokes
+        # this non-sticky re-assert once the device actually exists. Do NOT
+        # generalise this to a present-but-broken adapter: apply_plan below
+        # still counts and reports those real failures.
+        wanted = policy.plan(state, aec_available=aec_available())
+        mic_values, mic_notes = load_mic()
+        for mic_note in mic_notes:
+            log(mic_note)
+        builtin = read_env(CARDS_FILE, "WALL_AUDIO_BUILTIN_CARD", "PCH")
+        deferred_applier = Applier(dry_run=arguments.dry_run)
+        publish_adapter_independent_state(wanted, headset_card(), deferred_applier)
+        failures = apply_builtin_capture_controls(
+            wanted, mic_values, builtin, deferred_applier)
+        log("audio adapter card id %r is not present: deferring apply until its "
+            "device re-add; published runtime audio state and "
+            "re-asserted built-in input controls" % adapter)
+        if boot_mark is not None:
+            write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
+        return 1 if failures else 0
     before_observation = state.get("mic_legs_running")
     failures = apply_plan(state, Applier(dry_run=arguments.dry_run))
     # A SECOND WRITE, AND IT IS NOT REDUNDANT. Everything else in the state is

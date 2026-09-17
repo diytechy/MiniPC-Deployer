@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -876,6 +877,7 @@ def test_apply_state_records_presence_and_stamps_the_boot_sr028(applier, tmp_pat
     stamp = tmp_path / "audio-boot-apply.json"
     monkeypatch.setattr(applier, "BOOT_STAMP", stamp)
     monkeypatch.setattr(applier, "headset_card", lambda *a, **k: "Device")
+    monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: True)
     monkeypatch.setattr(applier, "current_mode", lambda: "trigger")  # no hardware here
     state_file.write_text(json.dumps({"version": 1, "output": "speaker",
                                       "headset_autoswitch_armed": True}), encoding="utf-8")
@@ -901,6 +903,7 @@ def test_the_stamp_is_sampled_before_the_apply_and_published_after_it_sr028(appl
     stamp = tmp_path / "audio-boot-apply.json"
     monkeypatch.setattr(applier, "BOOT_STAMP", stamp)
     monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: True)
     monkeypatch.setattr(applier, "current_mode", lambda: "bus")
     order = []
 
@@ -916,6 +919,20 @@ def test_the_stamp_is_sampled_before_the_apply_and_published_after_it_sr028(appl
     assert order == ["apply"]
     mark = applier.read_boot_stamp(stamp)
     assert before <= mark <= after
+
+
+def test_apply_state_defers_successfully_until_the_audio_adapter_arrives_sr038(
+        applier, tmp_path, monkeypatch):
+    state_file = tmp_path / "audio-state.json"
+    stamp = tmp_path / "audio-boot-apply.json"
+    monkeypatch.setattr(applier, "BOOT_STAMP", stamp)
+    monkeypatch.setattr(applier, "headset_card", lambda *a, **k: None)
+    monkeypatch.setattr(applier, "current_mode", lambda: "bus")
+    monkeypatch.setattr(applier, "adapter_present", lambda *a, **k: False)
+    monkeypatch.setattr(applier, "apply_plan", lambda *_: pytest.fail(
+        "the absent adapter must not start or stop legs"))
+    assert applier.main(["--state", str(state_file), "apply-state"]) == 0
+    assert applier.read_boot_stamp(stamp) is not None
 
 
 def test_a_negative_stamp_is_refused_sr028(applier, tmp_path):
@@ -2269,6 +2286,39 @@ def test_a_missing_state_file_is_not_consent_sr029(applier, tmp_path):
     assert "save_state" in source.split("def _locked_apply", 1)[1].split("apply_plan(", 1)[0]
 
 
+def test_adapter_absence_still_asserts_the_builtin_input_mute_sr029(
+        applier, policy, tmp_path, monkeypatch):
+    """Slow USB enumeration must not defer the PCH privacy control with it."""
+    state = tmp_path / "audio-state.json"
+    state.write_text(json.dumps(policy.default_state()), encoding="utf-8")
+    input_mute = tmp_path / "audio-input-mute.env"
+    monkeypatch.setattr(applier, "INPUT_MUTE_ENV", input_mute)
+    monkeypatch.setattr(applier, "adapter_present", lambda _card: False)
+    monkeypatch.setattr(applier, "current_mode", lambda: "bus")
+    monkeypatch.setattr(applier, "headset_card", lambda: None)
+
+    class RecordingApplier:
+        dry_run = False
+
+        def __init__(self, **_kwargs):
+            self.commands = []
+
+        def command(self, argv, required=True, **_kwargs):
+            self.commands.append((argv, required))
+            return 0
+
+    recorder = RecordingApplier()
+    monkeypatch.setattr(applier, "Applier", lambda **_kwargs: recorder)
+    arguments = SimpleNamespace(state=state, command="input-mute", value="on",
+                                dry_run=False)
+
+    assert applier._locked_apply(arguments) == 0
+    assert input_mute.read_text(encoding="utf-8") == "WALL_AUDIO_INPUT_MUTED=1\n"
+    assert (["/usr/bin/amixer", "-c", "PCH", "-q", "sset", "Capture", "nocap"],
+            True) in recorder.commands
+    assert not any("ICUSBAUDIO7D" in command for command, _ in recorder.commands)
+
+
 def test_a_rear_level_that_would_not_lower_fails_the_apply_sr029(applier, policy):
     """It reported success whether or not the write landed (terra, round 2).
 
@@ -2563,24 +2613,20 @@ def test_the_mode_script_also_refuses_an_unqueryable_mic_leg_sr029():
 
 
 def test_a_replugged_adapter_brings_the_rear_mic_leg_back_sr029():
-    """It BindsTo the adapter, so an unplug stops it. Nothing restarted it.
-
-    wall-audio-state.service is RemainAfterExit, so it does not re-assert the
-    stored position either, and one hub move -- which this appliance is known to
-    do, item 25 -- lost the mic return to the desktop permanently (terra, round
-    5). Safe to start from udev because the unit gates itself twice on every
-    start attempt.
-    """
+    """The re-add delegates this policy leg to the non-sticky reassert."""
     rule = read(WALL / "90-wall-audio-adapter.rules")
-    assert 'SYSTEMD_WANTS}+="wall-mic-rear.service"' in rule
+    assert 'SYSTEMD_WANTS}+="wall-audio-resume.service"' in rule
+    reassert = read(WALL / "wall-audio-resume.service")
+    assert "apply-state" in reassert
+    assert "RemainAfterExit" not in reassert.split("[Service]", 1)[1]
     unit = read(WALL / "wall-mic-rear.service")
     assert "BindsTo=dev-wall_audio_adapter.device" in unit
     conditions = [line for line in unit.splitlines()
                   if line.startswith("ExecCondition=")]
     assert any("mic-allowed" in line for line in conditions), \
-        "starting it from udev is only safe because it gates itself"
-    # The Bluetooth leg is NOT wanted here: it has nothing to do with this
-    # adapter, and its own poll brings it back.
+        "the policy-owned start is only safe because it gates itself"
+    # The Bluetooth leg is not named by udev either: ALL_LEGS owns it with the
+    # rear mic, so the rule cannot go stale when policy gains another leg.
     assert "wall-bt-mic.service" not in rule
 
 

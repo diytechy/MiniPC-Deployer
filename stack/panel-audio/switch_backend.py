@@ -50,14 +50,14 @@ import switch_request
 # audio_router.BrokerError to speak the broker's error vocabulary.
 
 DEFAULT_STATE_PATH = Path("/etc/wall-panel/audio-state.json")
-# -- item L: the one producer this backend READS and never runs -------------
-# The file is not opened by anything privileged here. The broker runs as
+# -- item L: the two producers this backend READS and never runs ------------
+# Neither file is opened by anything privileged here. The broker runs as
 # `panel` under ProtectSystem=strict with PrivateDevices=true and AF_UNIX as
 # its only address family: it cannot open a sound device, and giving it one
 # would move the capture privilege to the process the renderer talks to, which
-# is the boundary SR-023 exists to hold. So the producer is a service that
-# HOLDS the capture itself, and the channel between it and this backend is a
-# bounded document in /run.
+# is the boundary SR-023 exists to hold. So both producers are services that
+# ALREADY have the capture they need, and the channel between them and this
+# backend is a bounded document in /run.
 #
 #   wall-bus-visualizer  opens `bus_monitor` -- the merged, PRE-switch bus --
 #                        and publishes bounded derived levels at 5 Hz. It is
@@ -77,18 +77,37 @@ DEFAULT_STATE_PATH = Path("/etc/wall-panel/audio-state.json")
 # unavailable. A frozen or flat visualizer during Mute is the outcome that was
 # ruled out.
 #
-# THE MICROPHONE IS GONE FROM THIS DOCUMENT (Owner ruling, 2026-09-17). It
-# reaches neither the speaker nor the headset, so it is not a visualization
-# source, and `_microphone_block` could substitute a microphone block for an
-# absent bus. That is removed HERE, at the producer of the contract, rather than
-# filtered downstream. Microphone CAPTURE is untouched: `wall-audio-aec` still
-# runs and still publishes its own status file, which this backend no longer
-# reads.
+# THE MICROPHONE STAYS, THE SUBSTITUTION GOES (Owner ruling, 2026-09-17, as
+# read back by the coordinator). The ruling is about what the VISUALIZER may
+# draw: the microphone reaches neither the speaker nor the headset, so it is not
+# a visualization source and can never stand in for the bus. It was possible to
+# read that as "the block leaves the document", and this file briefly did. That
+# is a step too far: the `microphone` block is not a visualizer feed at all --
+# it is the level indicator for the microphone button in the panel's audio
+# chrome, a different consumer with a different question, and nobody asked for
+# it to go away.
+#
+# So exactly one thing is removed, and it is the thing that was genuinely wrong:
+# `_telemetry` USED TO PUBLISH `available: true` WITH A FABRICATED SILENT BUS
+# WHEN ONLY THE MICROPHONE HAD TELEMETRY. That promoted a microphone reading
+# into the bus's place in the reply, which is precisely the confusion the ruling
+# exists to prevent. An absent bus now reports absent, whatever the microphone
+# is doing.
+#
+#   wall-bus-visualizer  opens `bus_monitor` and publishes the bus levels.
+#   wall-audio-aec       already reads the panel microphone as its near end, so
+#                        the post-filter level is a by-product of a capture that
+#                        is running anyway.
 BUS_TELEMETRY_PATH = Path("/run/wall-bus-visualizer/bus-telemetry.json")
+AEC_STATUS_PATH = Path("/run/wall-panel/aec-status.json")
 # How old a document may be and still be drawn as live. The bus publishes at
-# 5 Hz; 1500 ms is seven missed publications, which is a producer that has
-# stopped rather than one that is late.
+# 5 Hz and the canceller at 0.1 Hz, so they get different windows -- one window
+# for both would either call the canceller stale constantly or let a frozen bus
+# readout sit on the wall for ten seconds. 1500 ms is seven missed bus
+# publications, which is a producer that has stopped rather than one that is
+# late.
 BUS_STALE_MS = 1500
+AEC_STALE_MS = 25000
 TELEMETRY_BANDS = 8
 # The exact contract of the document above. `schema` 2 is not cosmetic: a
 # version-1 document is the `speaker_tap` one, which answers a different
@@ -467,19 +486,30 @@ class SwitchApplierBackend:
         happens here and `active` means what a viewer would mean by it --
         something is playing, to something audible.
 
+        THE MICROPHONE MAY NOT STAND IN FOR THE BUS, and that is the whole of
+        what the 2026-09-17 ruling changes here. This used to answer
+        `available: true` with a fabricated silent bus whenever the microphone
+        had telemetry and the bus had none -- promoting a microphone reading
+        into the bus's place in the reply. An absent bus is now absent, whatever
+        the microphone is doing. The block itself stays: it feeds the microphone
+        button's level ring in the audio chrome, which is a different consumer
+        asking a different question, and it is never a source of `bands`.
+
         Contract:
-          Outputs: {"available": False} when nothing usable is published, or
-                   the IF-015 telemetry result with `rms`, `peak`, `bands` and
-                   the `bus` block. `generation` is stamped by the broker, not
-                   here. There is no `microphone` block: the microphone is not a
-                   visualization source (Owner, 2026-09-17).
+          Outputs: {"available": False} when the BUS publishes nothing usable --
+                   regardless of the microphone -- or the IF-015 telemetry result
+                   with `rms`, `peak`, `bands`, the `bus` block and an optional
+                   `microphone` block. `generation` is stamped by the broker,
+                   not here: the producer's own capture generation lives inside
+                   its document and is never surfaced through this field.
         Implements: SR-028, SR-041, LLR-015, LLR-952
         """
         now_ms = int(time.monotonic() * 1000)
         bus = self._bus_block(now_ms)
         if bus is None:
             # Honest, and distinguishable from silence: the shell draws no
-            # visualizer rather than a flat one.
+            # visualizer rather than a flat one. NOT rescued by a microphone
+            # that happens to be publishing -- that was the substitution.
             return {"available": False}
         result = {
             "available": True,
@@ -496,6 +526,9 @@ class SwitchApplierBackend:
             "bus": {"state": bus["state"], "ageMs": bus["ageMs"],
                     "valid": bus["state"] == "live", "source": BUS_SOURCE},
         }
+        microphone = self._microphone_block(now_ms)
+        if microphone is not None:
+            result["microphone"] = microphone
         return result
 
     def _output_is_audible(self) -> bool:
@@ -583,17 +616,61 @@ class SwitchApplierBackend:
                 "bands": clean, "state": "live", "observed": observed,
                 "ageMs": max(0, age)}
 
-    # THE MICROPHONE BLOCK IS GONE, AND IT WAS DELETED RATHER THAN DISABLED.
-    # It read the canceller status file and could substitute a microphone block
-    # for an absent bus, which made the microphone a fallback visualization
-    # source on a panel where it reaches neither speaker nor headset. The Owner
-    # ruled on 2026-09-17 that it leaves this contract entirely rather than
-    # being ignored downstream, so AEC_STATUS_PATH is no longer read here at
-    # all. The canceller itself is untouched and still publishes that file for
-    # its own consumers; microphone capture is not affected by this change.
-    # Consequence, stated because it is visible: the microphone level ring in
-    # the panel's audio chrome has no producer on this contract any more, and
-    # renders its honest '''we cannot tell you''' state.
+    def _microphone_block(self, now_ms: int):
+        """The canceller's post-filter level, or None when there is no canceller.
+
+        WHOSE NUMBER THIS IS, said plainly because it was briefly deleted for
+        being the wrong one: it belongs to the microphone button's level ring in
+        the panel's audio chrome. It is NOT a visualizer feed. It never
+        contributes a band, it never sets `active`, and since 2026-09-17 it can
+        no longer stand in for an absent bus -- `_telemetry` returns
+        `available: false` when the bus publishes nothing, whatever this says.
+
+        EVERY STATE IS EXPLICIT, because the one thing this block must never do
+        is let a ring be drawn live over a microphone that is muted, stale or
+        not being cancelled at all. `source` is what stops raw capture ever
+        being presented as post-filter.
+
+        Implements: SR-028, LLR-015
+        """
+        raw = self._read_document(AEC_STATUS_PATH)
+        if not raw or raw.get("schema") != 1:
+            return None
+        block = raw.get("microphone")
+        if not isinstance(block, dict):
+            return None
+        level = self._scalar(block.get("level"))
+        if level is None:
+            return None
+        source = block.get("source")
+        if source not in ("aec_post_filter", "raw_capture", "none"):
+            return None
+        state = block.get("state")
+        if state not in ("live", "muted", "stale", "unavailable"):
+            return None
+        observed = block.get("observed_monotonic_ms")
+        if not isinstance(observed, int) or isinstance(observed, bool) or observed < 0:
+            return None
+        age = now_ms - observed
+        if age < 0:
+            # The canceller restarted, so its monotonic clock and ours no longer
+            # share an origin. The age is not a number that can be defended, and
+            # a level whose age cannot be defended is stale by definition.
+            age = 0
+            state = "stale"
+        if age > AEC_STALE_MS and state == "live":
+            state = "stale"
+        reference = block.get("reference_dbfs")
+        if isinstance(reference, bool) or not isinstance(reference, (int, float)):
+            return None
+        return {
+            "level": level if state == "live" else 0.0,
+            "source": source,
+            "state": state,
+            "ageMs": age,
+            "valid": state == "live" and block.get("valid") is True,
+            "referenceDbfs": float(reference),
+        }
 
     def _status(self) -> dict:
         """IF-015 status: no routing, plus the switch block read off the file.

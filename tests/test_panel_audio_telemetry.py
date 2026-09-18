@@ -19,11 +19,12 @@ the wall rather than a refactor:
     during Mute, so bus activity alone is not "playing"; the confirmed output
     selection is ANDed in here, and Mute reports an inactive bus WITHOUT
     pretending the capture is unavailable.
-  * THE MICROPHONE IS GONE FROM THIS DOCUMENT. It reaches neither speaker nor
-    headset, so it is not a visualization source, and the old backend could
-    substitute a microphone block for an absent bus. The substitution and the
-    block are both removed at the producer rather than filtered downstream.
-    Microphone CAPTURE is untouched; `wall-audio-aec` still runs.
+  * THE MICROPHONE MAY NOT STAND IN FOR THE BUS. The old backend answered
+    `available: true` with a fabricated silent bus whenever the microphone had
+    telemetry and the bus had none, promoting a microphone reading into the
+    bus's place. That substitution is removed. The BLOCK stays: it is the level
+    ring on the microphone button in the audio chrome, a different consumer with
+    a different question, and it is never a source of bands or of `active`.
 
 What this file still holds down, unchanged in intent:
   * no producer at all is `available: false` -- honestly absent, and
@@ -71,13 +72,15 @@ def reply(broker, raw):
 
 @pytest.fixture
 def panel(tmp_path, monkeypatch):
-    """An installed panel whose bus producer writes into tmp_path."""
+    """An installed panel whose two producers write into tmp_path."""
     applier = tmp_path / "wall-audio-output"
     applier.write_text("#!/bin/sh\n", encoding="utf-8")
     state = tmp_path / "audio-state.json"
     bus = tmp_path / "bus-telemetry.json"
+    aec = tmp_path / "aec-status.json"
     monkeypatch.setattr(switch_backend, "BUS_TELEMETRY_PATH", bus)
-    handle = {"applier": applier, "state": state, "bus": bus,
+    monkeypatch.setattr(switch_backend, "AEC_STATUS_PATH", aec)
+    handle = {"applier": applier, "state": state, "bus": bus, "aec": aec,
               "request": tmp_path / "run" / "request.json"}
     write_state(handle)
     return handle
@@ -111,6 +114,18 @@ def write_bus(panel, **fields):
     }
     document.update(fields)
     panel["bus"].write_text(json.dumps(document), encoding="utf-8")
+
+
+def write_aec(panel, **fields):
+    microphone = {
+        "level": 0.42, "source": "aec_post_filter", "state": "live",
+        "valid": True, "reference_dbfs": -18.0,
+        "observed_monotonic_ms": int(time.monotonic() * 1000),
+    }
+    microphone.update(fields.pop("microphone", {}))
+    document = {"schema": 1, "state": "cancelling", "microphone": microphone}
+    document.update(fields)
+    panel["aec"].write_text(json.dumps(document), encoding="utf-8")
 
 
 # --- nothing published -------------------------------------------------------
@@ -162,17 +177,155 @@ def test_the_bus_levels_reach_the_client_sr041(panel):
     assert result["bus"]["source"] == "bus_monitor"
 
 
-def test_the_document_never_carries_a_microphone_block_sr041(panel):
-    """Ruled 2026-09-17: the mic is not a visualization source, so it is gone.
+def test_a_microphone_can_never_stand_in_for_an_absent_bus_sr041(panel):
+    """THE SUBSTITUTION IS THE THING THAT WAS WRONG, and this is it.
 
-    Removed at the producer rather than ignored downstream, which is why this
-    asserts on the backend's own result and not on what a client chooses to
-    read.
+    The old backend answered `available: true` with a fabricated silent bus
+    whenever the microphone had telemetry and the bus had none -- promoting a
+    microphone reading into the bus's place in the reply, which is exactly the
+    confusion the 2026-09-17 ruling exists to prevent. An absent bus is absent,
+    whatever the microphone is doing.
+    """
+    write_aec(panel)                       # a canceller, and no bus at all
+    assert telemetry(panel)["result"] == {"available": False}
+    # And the same for every other reason the bus might be missing: an absent
+    # producer, a malformed document, and a panel that is not in bus mode.
+    panel["bus"].write_text("{not json", encoding="utf-8")
+    assert telemetry(panel)["result"] == {"available": False}
+    write_bus(panel, state="unavailable", valid=False, active=False)
+    assert telemetry(panel)["result"] == {"available": False}
+
+
+def test_the_microphone_block_is_still_published_for_its_own_consumer_sr041(panel):
+    """It is the level ring on the microphone button, not a visualizer feed.
+
+    The Owner's ruling is about what the VISUALIZER may draw. Reading it as
+    "the block leaves the document" would delete a working indicator nobody
+    asked to lose, so the block stays and only the substitution went.
     """
     write_bus(panel)
+    write_aec(panel)
+    microphone = telemetry(panel)["result"]["microphone"]
+    assert microphone["level"] == 0.42
+    assert microphone["source"] == "aec_post_filter"
+    assert microphone["state"] == "live"
+    assert microphone["valid"] is True
+    assert microphone["referenceDbfs"] == -18.0
+    assert microphone["ageMs"] >= 0
+
+
+def test_the_microphone_never_reaches_the_bands_or_the_activity_claim_sr041(panel):
+    """The half of the ruling that is unconditional: not a visualization source.
+
+    A loud microphone over a silent bus must draw a quiet room, not a busy one.
+    """
+    write_bus(panel, state="silent", valid=False, active=False,
+              rms=0.0, peak=0.0, bands=[0.0] * 8)
+    write_aec(panel, microphone={"level": 1.0})
     result = telemetry(panel)["result"]
+    assert result["bands"] == [0.0] * 8
+    assert result["rms"] == 0.0 and result["peak"] == 0.0
+    assert result["active"] is False
+    assert result["microphone"]["level"] == 1.0    # reported, never mixed in
+    assert result["bus"]["source"] == "bus_monitor"
+
+
+@pytest.mark.parametrize("state", ["muted", "stale", "unavailable"])
+def test_a_level_that_is_not_live_is_zeroed_and_named_sr028(panel, state):
+    """Never a frozen ring, and never one without a reason beside it."""
+    write_bus(panel)
+    write_aec(panel, microphone={"state": state, "valid": False})
+    microphone = telemetry(panel)["result"]["microphone"]
+    assert microphone["state"] == state
+    assert microphone["valid"] is False
+    assert microphone["level"] == 0.0
+
+
+def test_a_level_older_than_the_window_becomes_stale_sr028(panel):
+    """The canceller publishes at 0.1 Hz; past two and a half periods it is stale.
+
+    The two producers get DIFFERENT windows and always have: one window for both
+    would either call the canceller stale constantly or let a frozen bus readout
+    sit on the wall for ten seconds.
+    """
+    write_bus(panel)
+    write_aec(panel, microphone={"observed_monotonic_ms": 0})
+    # `time.monotonic()` on a machine that has been up for a while makes the age
+    # enormous; on one that has just booted it may not. Only assert the rule
+    # when the fixture can actually exercise it.
+    if int(time.monotonic() * 1000) > switch_backend.AEC_STALE_MS:
+        microphone = telemetry(panel)["result"]["microphone"]
+        assert microphone["state"] == "stale"
+        assert microphone["valid"] is False
+        assert microphone["level"] == 0.0
+
+
+def test_a_level_from_the_future_is_stale_rather_than_negative_sr028(panel):
+    """A restarted canceller's monotonic clock no longer shares our origin.
+
+    An age that cannot be defended is not a fresh level; it is an unknown one.
+    """
+    write_bus(panel)
+    write_aec(panel, microphone={
+        "observed_monotonic_ms": int(time.monotonic() * 1000) + 600000})
+    microphone = telemetry(panel)["result"]["microphone"]
+    assert microphone["ageMs"] == 0
+    assert microphone["state"] == "stale"
+    assert microphone["valid"] is False
+
+
+def test_a_raw_source_is_carried_but_never_relabelled_sr028(panel):
+    """`source` is the one field standing between a ring and an overclaim."""
+    write_bus(panel)
+    write_aec(panel, microphone={"source": "raw_capture"})
+    assert telemetry(panel)["result"]["microphone"]["source"] == "raw_capture"
+    for bad in ("post_filter", "", None, 1, "aec"):
+        write_aec(panel, microphone={"source": bad})
+        result = telemetry(panel)["result"]
+        assert "microphone" not in result, bad
+
+
+def test_a_malformed_microphone_block_drops_only_the_microphone_sr028(panel):
+    """The bus is a different producer and must not be taken down with it."""
+    write_bus(panel)
+    for bad in ({"level": 1.5}, {"level": "0.4"}, {"state": "busy"},
+                {"observed_monotonic_ms": -1}, {"reference_dbfs": "loud"}):
+        write_aec(panel, microphone=bad)
+        result = telemetry(panel)["result"]
+        assert result["available"] is True, bad
+        assert "microphone" not in result, bad
+        assert result["rms"] == 0.4, bad
+
+
+def test_a_backend_that_omits_the_microphone_is_still_valid_sr028(panel):
+    """Optional, for the reason the whole block is: a panel with no canceller."""
+    write_bus(panel)
+    result = telemetry(panel)["result"]
+    assert result["available"] is True
     assert "microphone" not in result
-    assert not hasattr(SwitchApplierBackend, "_microphone_block")
+
+
+def test_the_broker_refuses_a_contradictory_microphone_block_sr028():
+    """valid + a non-live state is a contradiction, and it dies at the broker.
+
+    The backend cannot produce one, but the backend is not the only thing that
+    could ever fill this seam, and the renderer must never be handed a
+    contradiction to resolve on the glass.
+    """
+    class Lying:
+        def inventory(self, cancel):
+            return []
+
+        def call(self, method, params, cancel):
+            return {"available": True, "active": True, "rms": 0.1, "peak": 0.2,
+                    "bands": [0.1], "observedMonotonicMs": 5,
+                    "microphone": {"level": 0.5, "source": "aec_post_filter",
+                                   "state": "muted", "ageMs": 10, "valid": True,
+                                   "referenceDbfs": -18.0}}
+
+    answer = reply(AudioBroker(Lying()), wire("telemetry"))
+    assert answer["ok"] is False
+    assert answer["error"]["code"] == "unsafe_backend_result"
 
 
 def test_a_producer_that_is_not_measuring_reports_SILENCE_sr041(panel):

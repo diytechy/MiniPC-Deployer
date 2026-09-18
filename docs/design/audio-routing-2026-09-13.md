@@ -1142,13 +1142,21 @@ service is injected rather than assumed.
    carrying is true regardless of where the switch sends it, and the `bus` block
    still says `live`, because the capture is fine and saying otherwise would be
    a lie about the panel's health.
-3. **The microphone left the telemetry document entirely.** It reaches neither
-   speaker nor headset, so it is not a visualization source, and the old backend
-   could substitute a microphone block for an absent bus. Removed at the
-   producer rather than filtered downstream. **Microphone capture is untouched**
-   — `wall-audio-aec` still runs and still publishes its own status file — but
-   nothing reads it over IF-015 any more, so the microphone level ring in the
-   panel's audio chrome now renders its honest "we cannot tell you" state.
+3. **The microphone can no longer stand in for the bus.** The old backend
+   answered `available: true` with a fabricated silent bus whenever the
+   microphone had telemetry and the bus had none — promoting a microphone
+   reading into the bus's place in the reply, which is exactly the confusion the
+   ruling exists to prevent. **That substitution is gone**: an absent, malformed
+   or unavailable bus reports unavailable whatever the microphone is doing.
+
+   **The `microphone` block itself stays**, and the distinction is worth being
+   exact about because this was briefly implemented the other way. The Owner's
+   ruling is about what the VISUALIZER may draw: the microphone reaches neither
+   speaker nor headset, so it is not a visualization source and never
+   contributes a band, an rms, a peak or an activity claim. But the block is not
+   a visualizer feed at all — it is the level ring on the microphone button in
+   the audio chrome, a different consumer asking a different question, and
+   deleting it would have removed a working indicator nobody asked to lose.
 
 ### Bus mode is the supported configuration, and that is a ruling
 
@@ -1208,7 +1216,7 @@ either is out of scope.
 | `bus_source.py` | new | the pure core: window, dB curve, document, depth-one queue, peer policy |
 | `pcm_frame.py` | new | the frozen IF-020 frame codec, with a fixture shared byte-for-byte with OfficeWallNaglight |
 | `visualizer.py` | changed | optional `sample_rate` and `band_centres_hz`; the "ships no capture adapter" and "raw samples never escape" claims retired |
-| `switch_backend.py` | changed | reads the bus document, ANDs the confirmed switch, emits no microphone block |
+| `switch_backend.py` | changed | reads the bus document, ANDs the confirmed switch, and refuses to let a microphone stand in for an absent bus |
 | `asound-bus-mode.conf` | changed | comment only: `bus_monitor` has two readers, not one |
 | `wall-firstboot.sh` | changed | installs the daemon, its three imports and the unit; enables and starts it, warning rather than failing |
 

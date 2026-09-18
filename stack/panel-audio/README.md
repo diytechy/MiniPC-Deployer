@@ -99,9 +99,12 @@ the merged, PRE-switch ALSA bus -- and publishes a bounded schema-2 document at
 still performs no device I/O of its own, which is the SR-023 boundary intact.
 That producer replaces the `speaker_tap`-derived document, so Headset now
 visualizes and Mute reports inactive because the broker ANDs the confirmed
-output selection into the activity claim. No microphone block is published over
-IF-015 at all: the microphone reaches neither speaker nor headset, so it is not
-a visualization source (Owner, 2026-09-17).
+output selection into the activity claim. A microphone reading can no longer
+stand in for an absent bus -- that substitution put a microphone level into the
+bus's place in the reply, and an absent bus now reports absent whatever the
+microphone is doing. The `microphone` block itself remains: it is the level ring
+on the microphone button, not a visualizer feed, and it contributes no band, no
+rms, no peak and no activity claim (Owner, 2026-09-17).
 
 **The privacy rule is no longer absolute, and saying it was would be a lie by
 omission.** Raw audio is not retained or emitted UNLESS EXPLICITLY PERMITTED.

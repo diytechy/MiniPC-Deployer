@@ -1757,7 +1757,7 @@ def test_mic_legs_gate_and_follow_aec_without_untracked_dropins_sr028():
     firstboot = read(WALL / "wall-firstboot.sh")
     assert 'rm -f "$_dir/10-aec.conf"' in firstboot
     assert 'cat > "$_dir/10-aec.conf"' not in firstboot
-    assert "wall_aec_pcm.h Makefile" in firstboot
+    assert "wall_aec_pcm.h wall_aec_status.c wall_aec_status.h Makefile" in firstboot
 
 
 def test_the_capture_gain_default_is_the_measured_one_sr029(applier):

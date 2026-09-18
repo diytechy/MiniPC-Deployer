@@ -1521,7 +1521,7 @@ fi
 #     `git ls-tree` lists, so it cannot be checked against the archive.
 if [ -f "$PAYLOAD/aec/Makefile" ]; then
     install -d -m 0755 /usr/local/src/wall-aec
-    for _aec in wall-audio-aec.c wall_aec_policy.c wall_aec_policy.h wall_aec_profile.c wall_aec_profile.h wall_aec_pcm.h Makefile; do
+    for _aec in wall-audio-aec.c wall_aec_policy.c wall_aec_policy.h wall_aec_profile.c wall_aec_profile.h wall_aec_pcm.h wall_aec_status.c wall_aec_status.h Makefile; do
         [ -f "$PAYLOAD/aec/$_aec" ] && install -m 0644 "$PAYLOAD/aec/$_aec" "/usr/local/src/wall-aec/$_aec"
     done
     if ( cd /usr/local/src/wall-aec && make >/tmp/wall-aec-build.log 2>&1 ); then

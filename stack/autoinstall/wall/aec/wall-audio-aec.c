@@ -215,7 +215,7 @@ typedef struct {
     SpeexResamplerState *resampler;
     int filter_frames;
     int predelay_frames;
-    int16_t *predelay_ring;      /* the profile's fixed pre-delay on the mic */
+    int16_t *predelay_ring;      /* the profile's fixed delay on the reference */
     int predelay_head;
     int16_t reference_ring[REF_RING_FRAMES];
     int reference_fill;
@@ -286,8 +286,11 @@ static void engine_close(aec_engine *engine)
     free(engine->predelay_ring);
 }
 
-/* Hold the microphone back by the profile's pre-delay, so the reference handed
- * to Speex is already advanced. A ring rather than a shift, because this runs
+/* Hold the REFERENCE back by the profile's pre-delay so an earlier speaker
+ * sample is paired with the microphone echo it caused. The measurement tool's
+ * "advance the reference" wording describes this relative alignment; delaying
+ * the microphone reverses it, adds needless capture latency, and asks a causal
+ * filter to model negative time. A ring rather than a shift, because this runs
  * every 5.33 ms for the life of the panel. */
 static void predelay(aec_engine *engine, const int16_t *in, int16_t *out, int count)
 {
@@ -353,9 +356,8 @@ static void push_reference(aec_engine *engine, const int16_t *frames, int count)
 static void engine_block(aec_engine *engine, const int16_t *mic, int16_t *out, bool tap_present,
                          bool input_muted, int64_t now_ms)
 {
-    int16_t delayed[AEC_FRAME_SIZE];
     int16_t reference[AEC_FRAME_SIZE];
-    predelay(engine, mic, delayed, AEC_FRAME_SIZE);
+    int16_t delayed_reference[AEC_FRAME_SIZE];
 
     int produced = tap_present ? pull_reference(engine, reference) : 0;
     if (produced < AEC_FRAME_SIZE) {
@@ -364,6 +366,7 @@ static void engine_block(aec_engine *engine, const int16_t *mic, int16_t *out, b
         memset(reference + produced, 0, (size_t)(AEC_FRAME_SIZE - produced) * sizeof(int16_t));
         if (tap_present) engine->reference_starved_blocks += 1;
     }
+    predelay(engine, reference, delayed_reference, AEC_FRAME_SIZE);
 
     /* `failed_over` IS CHECKED HERE, and leaving it out was a lie in the
      * journal (terra, second pass): the daemon logged "the microphone is passed
@@ -374,18 +377,18 @@ static void engine_block(aec_engine *engine, const int16_t *mic, int16_t *out, b
     bool cancelling = tap_present && engine->policy.state != AEC_STATE_DEGRADED
         && !engine->policy.failed_over && engine->policy.adapting;
     if (cancelling) {
-        speex_echo_cancellation(engine->echo, delayed, reference, out);
+        speex_echo_cancellation(engine->echo, mic, delayed_reference, out);
         if (engine->preprocess) speex_preprocess_run(engine->preprocess, out);
     } else {
         /* PASS THROUGH, NEVER SILENCE. The mic legs must not go quiet because
          * the canceller has an opinion; a degraded canceller is a worse
          * microphone, not an absent one. */
-        memcpy(out, delayed, AEC_FRAME_SIZE * sizeof(int16_t));
+        memcpy(out, mic, AEC_FRAME_SIZE * sizeof(int16_t));
     }
 
     double far_rms = 0.0, far_peak = 0.0, mic_rms = 0.0, mic_peak = 0.0, res_rms = 0.0, res_peak = 0.0;
-    measure(reference, AEC_FRAME_SIZE, &far_rms, &far_peak);
-    measure(delayed, AEC_FRAME_SIZE, &mic_rms, &mic_peak);
+    measure(delayed_reference, AEC_FRAME_SIZE, &far_rms, &far_peak);
+    measure(mic, AEC_FRAME_SIZE, &mic_rms, &mic_peak);
     measure(out, AEC_FRAME_SIZE, &res_rms, &res_peak);
 
     aec_block observation = {

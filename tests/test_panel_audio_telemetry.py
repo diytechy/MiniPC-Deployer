@@ -82,6 +82,16 @@ def test_aec_publication_cadence_keeps_the_button_meter_fresh_sr028():
     assert interval_ms * 10 <= switch_backend.AEC_STALE_MS
 
 
+def test_aec_predelay_holds_the_reference_not_the_microphone_sr028():
+    """Positive room delay means old speaker audio caused the mic sample now."""
+    source = (ROOT / "stack/autoinstall/wall/aec/wall-audio-aec.c").read_text(
+        encoding="utf-8")
+    assert "predelay(engine, reference, delayed_reference, AEC_FRAME_SIZE);" in source
+    assert "speex_echo_cancellation(engine->echo, mic, delayed_reference, out);" in source
+    assert "memcpy(out, mic, AEC_FRAME_SIZE * sizeof(int16_t));" in source
+    assert "predelay(engine, mic," not in source
+
+
 @pytest.fixture
 def panel(tmp_path, monkeypatch):
     """An installed panel whose two producers write into tmp_path."""

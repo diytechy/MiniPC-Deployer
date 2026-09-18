@@ -150,6 +150,26 @@ enable_unit_now() {
     return 1
 }
 
+# enable_unit_optional — same contract, but a failure WARNS instead of failing
+# the step, for a unit whose absence degrades the panel rather than breaking it.
+#
+# It exists so that "this component is optional" and "this component is declared
+# in the release manifest" can both be true. A raw `systemctl enable` said the
+# first and silently lost the second: panel_system_manifest.extract reads the
+# enable HELPERS to learn which units a release must carry, and it refuses to
+# generate a manifest it knows is short rather than emit one quietly missing a
+# unit. So an optional unit still goes through a helper; only the consequence of
+# failure differs.
+enable_unit_optional() {
+    local ok_line="$1"; shift
+    if systemctl enable --now "$@" >/dev/null 2>&1; then
+        log "$ok_line"
+        return 0
+    fi
+    warn "systemctl enable --now failed for: $*. The panel keeps working without it. Check: systemctl status $1"
+    return 1
+}
+
 # ── 1. sanity ────────────────────────────────────────────────────────────────
 if [ ! -f "$ENV_FILE" ]; then
     log "FATAL: $ENV_FILE missing (autoinstall should have seeded it from wall.env.example)"
@@ -1373,12 +1393,19 @@ done
 # step: a panel with no visualizer is a panel that shows Frame Media.
 if [ -f /etc/systemd/system/wall-bus-visualizer.service ] &&
    [ -x /usr/local/lib/wall-panel/panel-bus-visualizer.py ]; then
-    if ! systemctl enable wall-bus-visualizer.service >/dev/null 2>&1; then
-        warn "audio: wall-bus-visualizer could not be enabled — the visualizer will show Frame Media."
-    elif ! systemctl restart wall-bus-visualizer.service >/dev/null 2>&1; then
-        warn "audio: wall-bus-visualizer did not start — inspect its journal. Routing and the amplifier are unaffected."
+    # THROUGH THE HELPER, not a raw `systemctl enable`. The failure is still a
+    # warning — see the paragraph above — but the release manifest generator
+    # reads the enable helpers to learn which units a release must carry, and a
+    # raw enable would have left this unit undeclared while every test passed.
+    if enable_unit_optional "SR-041: merged-bus visualizer source running; PCM endpoint idle until a local host asks" \
+            wall-bus-visualizer.service; then
+        # Already running from a previous boot? `enable --now` leaves an active
+        # unit alone, so re-assert the new code explicitly. A restart failure is
+        # the same decoration failure as the rest of this block.
+        systemctl restart wall-bus-visualizer.service >/dev/null 2>&1 ||
+            warn "audio: wall-bus-visualizer did not restart — inspect its journal. Routing and the amplifier are unaffected."
     else
-        log "SR-041: merged-bus visualizer source running; PCM endpoint idle until a local host asks"
+        warn "audio: the visualizer will show Frame Media."
     fi
 else
     warn "audio: wall-bus-visualizer is not installed — the visualizer will show Frame Media."

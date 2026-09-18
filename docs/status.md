@@ -2169,3 +2169,64 @@ limit only on exit 0, telling 75 (a power decision is in flight) from any other
 non-zero (the backlight did not come on) in the journal but treating both the
 same way. Counts: `check.py --tier smoke` PASS, 179 passed / 3 skipped;
 `occupancy-power.test.sh` 120 PASS 0 FAIL.
+
+## 2026-09-17 evening — the broker was spending a sixth of the box starting interpreters
+
+DEPLOYED with the panel-system payload at `9c01195`.
+
+**Asked to investigate an anomaly, not a fault.** `wall-audio-router` measured
+64% of one core continuously. Nothing was failing, no test was red, and nothing
+in either repository measured it — it was visible only because the face work
+made me profile the whole unit set.
+
+`strace -c` on the live broker: **32 `execve` of
+`/usr/bin/python3 --multiprocessing-fork` in eight seconds**, with 4201 `openat`
+and 2334 `mmap` behind them, all module imports. `_backend_call` ran EVERY call
+in a freshly spawned process (added 2026-09-10, `616e005`) because a backend
+that talks to a device can hang and Python cannot kill a stuck thread. The
+renderer polls `telemetry` at 4 Hz whenever the display is lit
+(`setInterval(pollAudioTelemetry, 250)` in `js/main.js`), so the panel was
+starting a Python interpreter four times a second to read two JSON files
+out of `/run`.
+
+**The shipped backend cannot hang on hardware, and says so itself** — it runs as
+`panel` under `ProtectSystem=strict` with AF_UNIX as its only address family, so
+it can neither run `amixer` nor talk to systemd.
+
+The exemption is DECLARED BY THE BACKEND (`LOCAL_ONLY_METHODS`) and defaults to
+off, so the routed-device backend WSN-024 holds out inherits isolation by saying
+nothing. A blanket "telemetry is cheap" rule inside the broker would have gone
+silently wrong the day that backend answers `status` from BlueZ.
+`request_landed` is deliberately not declared: it reads the same file today, but
+its job is to watch a mutation settle.
+
+**Also in this deploy, the Owner's second report:** the audio-playing signal cut
+off early and sent the wall to Frame Media mid-album. The mechanism already
+existed; both numbers were wrong. `silence_floor` 0.01 -> 0.004 (about -40 to
+-48 dBFS) because the old one called ordinary quiet passages silence, and
+`silence_hold_ms` 1500 -> 5000, the Owner's figure, because even a correct floor
+is crossed between tracks. Neither alone is sufficient. `panel-bus-visualizer.py`
+passes NEITHER, so these defaults are the wall's behaviour and a test pins that.
+
+**Measured on the panel, before and after:**
+
+| | before | after |
+|---|---|---|
+| `wall-audio-router` | 64% of one core | **1%** |
+| `wall-sensors` | 153% | 57% (also the NMS fix) |
+| package temp | 78 C | **50 C** |
+| interpreter spawns | 32 / 8 s | **0 / 6 s** |
+
+**Terra found two real defects in the first draft**, both fixed and both
+mutation-checked. A slot leaked whenever `Thread.start()` raised — latent while
+only tests reached that seam, live the moment production did. And the
+declaration was membership-tested without being type-checked, so a plain string
+would have opted in by SUBSTRING, exempting "tele" and "etry" along with
+"telemetry". Its third point is accepted as a STATED COST rather than fixed: a
+declared-local call that never returns keeps its slot where a spawned process
+could be killed. That is in the function's docstring, because it is the reason
+the declaration must stay narrow.
+
+**Still owed:** whether -48 dBFS sits above this capture path's real idle noise
+floor is not answerable from the code and was not measured. If a silent room
+ever animates the visualizer, that is the number to check first.

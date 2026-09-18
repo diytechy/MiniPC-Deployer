@@ -287,11 +287,10 @@ static void engine_close(aec_engine *engine)
 }
 
 /* Hold the REFERENCE back by the profile's pre-delay so an earlier speaker
- * sample is paired with the microphone echo it caused. The measurement tool's
- * "advance the reference" wording describes this relative alignment; delaying
- * the microphone reverses it, adds needless capture latency, and asks a causal
- * filter to model negative time. A ring rather than a shift, because this runs
- * every 5.33 ms for the life of the panel. */
+ * sample is paired with the microphone echo it caused. Capture-device start
+ * skew is removed separately by aec_pcm_restart_pair(); it must not be hidden
+ * in the room geometry. A ring rather than a shift, because this runs every
+ * 5.33 ms for the life of the panel. */
 static void predelay(aec_engine *engine, const int16_t *in, int16_t *out, int count)
 {
     if (engine->predelay_frames <= 0) { memcpy(out, in, (size_t)count * sizeof(int16_t)); return; }
@@ -367,7 +366,6 @@ static void engine_block(aec_engine *engine, const int16_t *mic, int16_t *out, b
         if (tap_present) engine->reference_starved_blocks += 1;
     }
     predelay(engine, reference, delayed_reference, AEC_FRAME_SIZE);
-
     /* `failed_over` IS CHECKED HERE, and leaving it out was a lie in the
      * journal (terra, second pass): the daemon logged "the microphone is passed
      * through" and then went on calling speex_echo_cancellation on the very
@@ -577,19 +575,25 @@ static snd_pcm_t *open_reference(const char *name)
     snd_pcm_t *pcm = open_pcm(name, SND_PCM_STREAM_CAPTURE,
                               AEC_REFERENCE_CHANNELS);
     if (!pcm) return NULL;
-    /* The reference is drained with avail_update() so it never makes the
-     * blocking read that would implicitly start a prepared capture PCM.  The
-     * first live run therefore waited forever at avail=0 while music crossed
-     * the same tap. Start it explicitly, and do the same after every recovery. */
-    alsa_pcm_context context = { pcm, NULL };
-    aec_pcm_ops operations = pcm_operations(&context);
-    int error = aec_pcm_start_reference(&operations);
-    if (error < 0) {
-        journal("aec: cannot start reference %s: %s", name, snd_strerror(error));
-        snd_pcm_close(pcm);
-        return NULL;
-    }
+    /* Leave it PREPARED. The live path starts it back-to-back with the mic;
+     * starting it here was the restart-dependent alignment defect. */
     return pcm;
+}
+
+static bool restart_capture_pair(snd_pcm_t *mic, const char *mic_name,
+                                 snd_pcm_t *reference, const char *reference_name)
+{
+    alsa_pcm_context mic_context = { mic, NULL };
+    alsa_pcm_context reference_context = { reference, NULL };
+    aec_pcm_ops mic_operations = pcm_operations(&mic_context);
+    aec_pcm_ops reference_operations = pcm_operations(&reference_context);
+    int error = aec_pcm_restart_pair(&mic_operations, &reference_operations);
+    if (error < 0) {
+        journal("aec: cannot synchronise capture pair %s + %s: %s",
+                mic_name, reference_name, snd_strerror(error));
+        return false;
+    }
+    return true;
 }
 
 static bool restart_capture(snd_pcm_t *pcm, const char *name)
@@ -668,6 +672,17 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
     int64_t mute_poll_ms = 0;
     bool input_muted = false;
 
+    if (tap_pcm && !restart_capture_pair(mic_pcm, mic_name, tap_pcm, tap_name)) {
+        snd_pcm_close(tap_pcm);
+        tap_pcm = NULL;
+        tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
+        if (!restart_capture(mic_pcm, mic_name)) {
+            snd_pcm_close(out_pcm);
+            snd_pcm_close(mic_pcm);
+            return 1;
+        }
+    }
+
     int16_t mic_stereo[AEC_FRAME_SIZE * 2], tap_stereo[AEC_FRAME_SIZE * 2];
     int16_t mic[AEC_FRAME_SIZE], tap[AEC_FRAME_SIZE], out[AEC_FRAME_SIZE];
     stream_clock tap_base = { false, 0, 0, 0, false, false };
@@ -686,6 +701,15 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
             tap_retry_ms = retry_now + TAP_RETRY_MS;
             tap_pcm = open_reference(tap_name);
             if (tap_pcm) {
+                if (!restart_capture_pair(mic_pcm, mic_name, tap_pcm, tap_name)) {
+                    snd_pcm_close(tap_pcm);
+                    tap_pcm = NULL;
+                    if (!restart_capture(mic_pcm, mic_name)) {
+                        status = 1;
+                        break;
+                    }
+                    continue;
+                }
                 journal("aec: reference at %s is available; cancelling from a "
                         "cold filter", tap_name);
                 engine->reference_fill = 0;
@@ -722,16 +746,19 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
              * fire on the cold convergence this causes. */
             journal("aec: xrun on the microphone (%s); resynchronising both streams",
                     snd_strerror((int)got));
-            if (!restart_capture(mic_pcm, mic_name)) {
-                status = 1;
-                break;
-            }
             if (tap_pcm) {
-                if (!restart_capture(tap_pcm, tap_name)) {
+                if (!restart_capture_pair(mic_pcm, mic_name, tap_pcm, tap_name)) {
                     snd_pcm_close(tap_pcm);
                     tap_pcm = NULL;
                     tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
+                    if (!restart_capture(mic_pcm, mic_name)) {
+                        status = 1;
+                        break;
+                    }
                 }
+            } else if (!restart_capture(mic_pcm, mic_name)) {
+                status = 1;
+                break;
             }
             engine->reference_fill = 0;
             engine_reset_filter(engine);
@@ -747,6 +774,7 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
         }
 
         bool tap_present = false;
+        bool capture_pair_restarted = false;
         if (tap_pcm) {
             /* DRAINED BY AVAILABILITY, NOT ONE BLOCK PER MIC BLOCK (terra,
              * second pass). Admitting exactly 256 tap frames per mic block
@@ -765,12 +793,16 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
                 }
                 snd_pcm_sframes_t available = snd_pcm_avail_update(tap_pcm);
                 if (available < 0) {
-                    if (!restart_capture(tap_pcm, tap_name)) {
+                    if (!restart_capture_pair(mic_pcm, mic_name, tap_pcm, tap_name)) {
                         snd_pcm_close(tap_pcm);
                         tap_pcm = NULL;
                         tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
+                        if (!restart_capture(mic_pcm, mic_name)) {
+                            status = 1;
+                        }
                     }
                     engine->reference_fill = 0;
+                    capture_pair_restarted = status == 0;
                     break;
                 }
                 if (available < AEC_FRAME_SIZE) break;
@@ -787,18 +819,32 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
                     continue;
                 }
                 if (read < 0) {
-                    if (!restart_capture(tap_pcm, tap_name)) {
+                    if (!restart_capture_pair(mic_pcm, mic_name, tap_pcm, tap_name)) {
                         snd_pcm_close(tap_pcm);
                         tap_pcm = NULL;
                         tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
+                        if (!restart_capture(mic_pcm, mic_name)) {
+                            status = 1;
+                        }
                     }
                     engine->reference_fill = 0;
+                    capture_pair_restarted = status == 0;
                 }
                 break;
             }
             /* Still draining what the ring holds counts as a live reference:
              * the tap has not gone away, it is simply ahead of us. */
             if (engine->reference_fill >= AEC_FRAME_SIZE) tap_present = true;
+        }
+
+        if (status != 0) break;
+        if (capture_pair_restarted) {
+            /* The mic block above predates the newly aligned pair. Discard it
+             * instead of mixing two timing epochs in one filter update. */
+            engine_reset_filter(engine);
+            aec_policy_xrun(&engine->policy, monotonic_ms());
+            tap_base.usable = mic_base.usable = false;
+            continue;
         }
 
         int64_t now_ms = monotonic_ms();

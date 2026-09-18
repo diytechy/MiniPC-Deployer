@@ -47,4 +47,19 @@ static inline int aec_pcm_restart_capture(const aec_pcm_ops *ops)
     return error;
 }
 
+static inline int aec_pcm_restart_pair(const aec_pcm_ops *mic,
+                                       const aec_pcm_ops *reference)
+{
+    /* Prepare both endpoints before either one enters RUNNING. Starting the
+     * reference during open while the microphone waited for its first read
+     * created a fresh, scheduler-sized alignment error on every daemon start. */
+    (void)mic->drop(mic->context);
+    (void)reference->drop(reference->context);
+    int error = mic->prepare(mic->context);
+    if (error >= 0) error = reference->prepare(reference->context);
+    if (error >= 0) error = mic->start(mic->context);
+    if (error >= 0) error = reference->start(reference->context);
+    return error;
+}
+
 #endif

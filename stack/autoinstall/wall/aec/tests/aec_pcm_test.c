@@ -99,6 +99,30 @@ static void start_and_restart_tests(void)
     OK(aec_pcm_restart_capture(&ops) < 0, "a failed restart is returned");
     OK(strcmp(pcm.calls, "dps") == 0, "restart failure follows full sequence");
 
+    fake_pcm mic = {0}, reference = {0};
+    aec_pcm_ops mic_ops = operations(&mic);
+    aec_pcm_ops reference_ops = operations(&reference);
+    OK(aec_pcm_restart_pair(&mic_ops, &reference_ops) == 0,
+       "capture pair restart succeeds");
+    OK(strcmp(mic.calls, "dps") == 0 && strcmp(reference.calls, "dps") == 0,
+       "capture pair is prepared before its back-to-back starts");
+
+    memset(&mic, 0, sizeof(mic));
+    memset(&reference, 0, sizeof(reference));
+    reference.fail = 'p';
+    OK(aec_pcm_restart_pair(&mic_ops, &reference_ops) < 0,
+       "capture pair returns a reference prepare failure");
+    OK(strcmp(mic.calls, "dp") == 0 && strcmp(reference.calls, "dp") == 0,
+       "capture pair starts neither endpoint after a prepare failure");
+
+    memset(&mic, 0, sizeof(mic));
+    memset(&reference, 0, sizeof(reference));
+    reference.fail = 's';
+    OK(aec_pcm_restart_pair(&mic_ops, &reference_ops) < 0,
+       "capture pair returns a reference start failure");
+    OK(strcmp(mic.calls, "dps") == 0 && strcmp(reference.calls, "dps") == 0,
+       "reference start failure is visible after both prepared starts");
+
     OK(AEC_MIC_CHANNELS == 2u, "microphone uses its native stereo shape");
     OK(AEC_REFERENCE_CHANNELS == 2u, "reference uses its native stereo shape");
     OK(AEC_OUTPUT_CHANNELS == 1u, "clean loopback remains mono");

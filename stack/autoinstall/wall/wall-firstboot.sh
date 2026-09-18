@@ -734,6 +734,85 @@ sync_sensor_models_from_payload() {
     log "sensors: $SENSOR_MODELS synced from $payload_bundle"
 }
 sync_sensor_models_from_payload
+
+PROJECTM_PRESETS=/opt/wall-panel/projectm-presets
+# sync_projectm_presets_from_payload — install the Milkdrop preset pack.
+#
+# THIS IS SR-031 / LLR-019, which was open from 2026-09-14 until the Owner
+# ruled the whole cream-of-the-crop pack in on 2026-09-18. Until then
+# `projectm-presets/presets.lock` was empty by design, libprojectM rendered its
+# built-in idle output, and the absence of this arm cost nothing --
+# panel_system_manifest.py refused outright to generate a manifest for a
+# non-empty lock precisely so that the day a preset was chosen, the missing
+# installer could not be discovered on the wall.
+#
+# THE ARCHIVE IS ONE FILE AND THE LOCK IS THE PER-FILE CHECK. The release
+# stages `projectm-presets.tar` into the payload (9795 files, ~136 MB, never
+# committed -- the same treatment the ONNX bundle gets and for the same reason).
+# Its digest is declared once in the system manifest; the integrity of each
+# preset inside it comes from `projectm-presets/presets.lock`, which IS
+# committed and reviewed. So a substituted archive fails the manifest, and a
+# substituted preset inside an otherwise-correct archive fails the lock.
+#
+# ATOMIC, like the model bundle beside it: extract to a staging directory next
+# to the target, verify, then `mv -T`. A panel must never be left with half a
+# preset library, and an archive that fails verification leaves the EXISTING
+# library untouched -- a bad new pack is not a reason to lose a working one.
+sync_projectm_presets_from_payload() {
+    # DERIVED FROM THE TRACKED LOCK, not written as a literal $PAYLOAD path.
+    # test_firstboot_payload_files_are_all_tracked_and_shipped resolves every
+    # literal payload path this script mentions against the git-tracked tree and
+    # fails on one it cannot find -- and the archive is deliberately NEVER
+    # committed (136 MB of an unlicensed pack). presets.lock IS committed, so it
+    # is the one literal reference, exactly as sync_sensor_models_from_payload
+    # derives its bundle directory from the tracked manifest.json beside it.
+    local archive lock payload_presets
+    lock="$PAYLOAD/projectm-presets/presets.lock"
+    payload_presets="$(dirname "$lock")"
+    archive="$(dirname "$payload_presets")/projectm-presets.tar"
+    [ -f "$archive" ] || return 0
+    [ -f "$lock" ] || { fail_step "projectm: $archive is staged but $lock is absent; refusing to install presets nothing can verify"; return 0; }
+    local new_dir
+    new_dir=$(mktemp -d "$(dirname "$PROJECTM_PRESETS")/.$(basename "$PROJECTM_PRESETS").XXXXXX") || {
+        fail_step "projectm: could not create a staging directory beside $PROJECTM_PRESETS; it is left untouched"
+        return 0
+    }
+    if ! tar -xf "$archive" -C "$new_dir" 2>/dev/null; then
+        rm -rf "$new_dir"
+        fail_step "projectm: $archive did not extract; $PROJECTM_PRESETS left untouched"
+        return 0
+    fi
+    # Verify EVERY file against the committed lock. Parsed positionally: a
+    # sha256 is 64 characters and the path runs to end of line, because these
+    # filenames contain spaces, '#', '!' and '===' and a field split mangles
+    # them (the bug that made the lock's own reproduce path report all 9795
+    # missing).
+    local missing=0 mismatch=0 count=0 sha rel actual
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue;; esac
+        sha=${line:0:64}
+        rel=${line:66}
+        [ -n "$rel" ] || continue
+        count=$((count + 1))
+        if [ ! -f "$new_dir/$rel" ]; then missing=$((missing + 1)); continue; fi
+        actual=$(sha256sum "$new_dir/$rel" | cut -d' ' -f1)
+        [ "$actual" = "$sha" ] || mismatch=$((mismatch + 1))
+    done < "$lock"
+    if [ "$missing" -ne 0 ] || [ "$mismatch" -ne 0 ]; then
+        rm -rf "$new_dir"
+        fail_step "projectm: staged preset archive failed its own lock ($missing missing, $mismatch mismatched of $count); $PROJECTM_PRESETS left untouched"
+        return 0
+    fi
+    find "$new_dir" -type d -exec chmod 0755 {} +
+    find "$new_dir" -type f -exec chmod 0644 {} +
+    chown -R root:root "$new_dir"
+    rm -rf "$PROJECTM_PRESETS.previous"
+    [ ! -e "$PROJECTM_PRESETS" ] || mv -T "$PROJECTM_PRESETS" "$PROJECTM_PRESETS.previous"
+    mv -T "$new_dir" "$PROJECTM_PRESETS"
+    rm -rf "$PROJECTM_PRESETS.previous"
+    log "projectm: $count preset(s) installed to $PROJECTM_PRESETS, every one verified against presets.lock"
+}
+sync_projectm_presets_from_payload
 # The face model bundle IS "complete" only when both .onnx files are there,
 # not merely a manifest.json (2026-09-15 terra review #6: a manifest with no
 # model bytes beside it used to read as "present" and get handed to the

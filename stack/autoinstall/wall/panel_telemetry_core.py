@@ -145,6 +145,32 @@ REQUIRED_PRESENTATION_FIELDS = {
     "monotonicMs": (int, float),
 }
 
+# OPTIONAL, AND THAT IS WHAT MAKES THE TWO HALVES DEPLOYABLE IN EITHER ORDER
+# (Owner, 2026-09-18). The app and this image ship through different lanes, so
+# a field that is REQUIRED here would make every sample invalid until the app
+# half landed, and a field that is merely unknown would do the same in the other
+# direction -- `validate_presentation` rejects fields it does not name. Optional
+# is the only shape that survives both orders.
+#
+# `projectmPreset` is the active Milkdrop preset, or null. The Owner asked for
+# it beside the thermal and CPU numbers: "if this does become a stressor it's
+# evident in the log and can be iterated on". Display state and fullscreen state
+# were already in this record; the preset was the missing piece.
+OPTIONAL_PRESENTATION_FIELDS = {
+    "projectmPreset": (str, type(None)),
+}
+
+# These names are paths inside an upstream pack and routinely exceed the general
+# 64-character bound -- e.g. "! Transition/Fast transition to black - levels
+# effect === Goody's Lightning (ps 2-0) --- Isosceles edit.milk". Truncating to
+# 64 would merge distinct presets into indistinguishable prefixes and defeat the
+# correlation the field exists for, so this one field gets a longer bound. It is
+# still a BOUND: the renderer may not smuggle unbounded text into retained
+# telemetry through any field.
+_MAX_STRING_LEN_BY_FIELD = {
+    "projectmPreset": 200,
+}
+
 # The renderer must never be able to smuggle titles, URLs or other unbounded
 # text into retained telemetry through this channel -- bound every string
 # field and reject anything the schema does not name.
@@ -162,12 +188,18 @@ def validate_presentation(payload):
     if not isinstance(payload, dict):
         return False, ["payload is not an object"]
 
-    unknown = set(payload) - set(REQUIRED_PRESENTATION_FIELDS)
+    unknown = set(payload) - set(REQUIRED_PRESENTATION_FIELDS) - set(OPTIONAL_PRESENTATION_FIELDS)
     if unknown:
         errors.append("unexpected field(s): %s" % sorted(unknown))
 
-    for field, types in REQUIRED_PRESENTATION_FIELDS.items():
+    checked = dict(REQUIRED_PRESENTATION_FIELDS)
+    checked.update(OPTIONAL_PRESENTATION_FIELDS)
+    for field, types in checked.items():
         if field not in payload:
+            # An absent OPTIONAL field is a renderer that predates it, not a
+            # fault: the two halves ship through different lanes.
+            if field in OPTIONAL_PRESENTATION_FIELDS:
+                continue
             errors.append("missing field: %s" % field)
             continue
         value = payload[field]
@@ -177,8 +209,9 @@ def validate_presentation(payload):
         if not isinstance(value, types):
             errors.append("field %s has wrong type: %r" % (field, type(value).__name__))
             continue
-        if isinstance(value, str) and len(value) > _MAX_STRING_LEN:
-            errors.append("field %s exceeds %d characters" % (field, _MAX_STRING_LEN))
+        limit = _MAX_STRING_LEN_BY_FIELD.get(field, _MAX_STRING_LEN)
+        if isinstance(value, str) and len(value) > limit:
+            errors.append("field %s exceeds %d characters" % (field, limit))
     if "monotonicMs" in payload and not _is_finite_number(payload.get("monotonicMs")):
         errors.append("monotonicMs is not a finite number")
     if "revision" in payload and isinstance(payload.get("revision"), int) and payload["revision"] < 0:

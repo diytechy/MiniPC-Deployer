@@ -35,6 +35,13 @@
 # direct wants below are only always-on or legacy-mode consumers outside that
 # policy. Keep the rule an activation mechanism, never a second switch plan.
 #
+# `wall-bus-visualizer.service` IS named here, and it is not an exception to the
+# paragraph above: it is not a switch leg. It reads `bus_monitor` regardless of
+# where the switch is pointing, so ALL_LEGS does not and must not know about it,
+# and without a direct want a hub move would leave the wall with no visualizer
+# until the next mode switch or reboot. Its own ExecCondition still keeps it out
+# of the modes that have no such PCM (SR-041, LLR-957).
+#
 # and the device unit was not tracked at all. udev re-evaluates every rule on
 # every event and a property not set by THIS event does not exist, so the tag,
 # the alias and the wants are all set on everything except remove.
@@ -45,5 +52,6 @@ SUBSYSTEM=="sound", KERNEL=="card*", ATTRS{idVendor}=="0d8c", ATTRS{idProduct}==
     ENV{SYSTEMD_WANTS}+="wall-kiosk-loop.service", \
     ENV{SYSTEMD_WANTS}+="wall-spdif-in.service", \
     ENV{SYSTEMD_WANTS}+="wall-amp-trigger.service", \
+    ENV{SYSTEMD_WANTS}+="wall-bus-visualizer.service", \
     ENV{SYSTEMD_WANTS}+="wall-audio-resume.service"
 LABEL="wall_audio_adapter_end"

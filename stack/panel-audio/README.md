@@ -90,10 +90,32 @@ enforcement and read deadlines. `telemetry`
 is an IF-015 read method with a positive schema: unavailable, or bounded derived
 bands/RMS/peak/activity plus broker-owned generation and monotonic observation time. The
 visualizer consumes a bounded normalized sample window, applies bounded silence
-hold and emission cadence, emits no raw samples, and retains no samples. The
-shipped backend reports telemetry unavailable; the eventual capture adapter
-belongs behind the injected backend after the probe and an adversarial authority
-review. The service reads only root-owned `/etc/wall-panel/audio-router.env`,
+hold and emission cadence, and retains no samples.
+
+**The capture adapter now exists (SR-041, 2026-09-17), and it is not in this
+process.** `wall-bus-visualizer.service` holds one capture of `bus_monitor` --
+the merged, PRE-switch ALSA bus -- and publishes a bounded schema-2 document at
+`/run/wall-bus-visualizer/bus-telemetry.json`; the backend reads that file and
+still performs no device I/O of its own, which is the SR-023 boundary intact.
+That producer replaces the `speaker_tap`-derived document, so Headset now
+visualizes and Mute reports inactive because the broker ANDs the confirmed
+output selection into the activity claim. A microphone reading can no longer
+stand in for an absent bus -- that substitution put a microphone level into the
+bus's place in the reply, and an absent bus now reports absent whatever the
+microphone is doing. The `microphone` block itself remains: it is the level ring
+on the microphone button, not a visualizer feed, and it contributes no band, no
+rms, no peak and no activity claim (Owner, 2026-09-17).
+
+**The privacy rule is no longer absolute, and saying it was would be a lie by
+omission.** Raw audio is not retained or emitted UNLESS EXPLICITLY PERMITTED.
+ProjectM has one narrow permission (IF-020): bounded raw PCM may travel local,
+memory-only process boundaries while ProjectM is the selected and visible
+fullscreen owner, over an AF_UNIX endpoint authorized by peer credential and
+filesystem permission, one block deep. It is never written to disk, journaled,
+included in diagnostics or telemetry, uploaded, or kept after ProjectM yields,
+and it grants no microphone capture, recording, diagnostics or network
+transmission. Nothing in THIS directory's broker carries that permission --
+`telemetry` is derived scalars and nothing else. The service reads only root-owned `/etc/wall-panel/audio-router.env`,
 never the broad wall environment containing unrelated credentials. That file's
 exact allowlist is `WALL_AUDIO_ENABLED` and `WALL_AUDIO_SOCKET`; the enable bit
 is nonsecret installed-state evidence for the verifier without granting access

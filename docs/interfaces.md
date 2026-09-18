@@ -47,6 +47,22 @@ panel; that repo owns the app):
   audio-jack tone alternative was retired 2026-09-13 and is refused rather than
   built, so no configuration can claim the jack. An ON/OFF claim requires
   device status readback, and shutdown/suspend own verified OFF (SR-026).
+- **IF-020** — `Draft` 2026-09-17 (SR-041). The OPTIONAL panel-local ProjectM
+  PCM stream at `/run/wall-bus-visualizer/pcm.sock`. AF_UNIX only, mode 0660
+  `root:panel`, authorized by `SO_PEERCRED` uid against a configured allow-list
+  **and** that filesystem permission; an empty allow-list denies and no client
+  is started by default. Each message is one frozen 32-byte-header `WPCM`
+  version-1 frame carrying at most one 1024-frame stereo bus period, refused at
+  both ends when malformed, truncated or oversized; backpressure is depth one,
+  so an older unsent block is dropped rather than accumulated. A byte-identical
+  fixture ships in BOTH repositories (`tests/fixtures/pcm-frame-v1.bin`) and is
+  decoded by both suites, which is what stops the two implementations drifting.
+  **The endpoint's absence is a supported state**: the image installs before an
+  app that can request it, and the app falls back to Frame Media. Raw PCM is
+  local and memory-only, exists only while ProjectM is the selected and visible
+  fullscreen owner, and is never written to disk, journaled, put in diagnostics
+  or telemetry, uploaded, or kept after ProjectM yields — and the exception
+  grants no microphone capture, recording, diagnostics or network transmission.
 
 **This repo → on-box callers** (`Provides` — the AI CLI service):
 

@@ -1,0 +1,87 @@
+# wall-bus-visualizer.service — the merged bus as a visualizer source.
+#
+# WHAT IT IS. One capture of `bus_monitor`, fanned into a bounded telemetry
+# document at /run/wall-bus-visualizer/bus-telemetry.json and an optional local
+# PCM socket at /run/wall-bus-visualizer/pcm.sock. It replaces the
+# `speaker_tap`-derived document as the visualizer's source; the amplifier
+# detector keeps `speaker_tap` and is not touched by this unit at all.
+#
+# WHY IT IS A SECOND READER OF bus_monitor AND WHY THAT IS FINE. `bus_monitor`
+# is a `dsnoop` with ipc_perm 0660 and ipc_gid 29, which is exactly what dsnoop
+# is for: several readers of one capture. Until now it had one reader (whichever
+# leg the switch had started), and the comment in asound-bus-mode.conf said so.
+# It now has two, and that comment has been amended in the same commit.
+#
+# NO User=. Like wall-bus-speaker and wall-amp-trigger — the two other units
+# that touch ALSA capture on this panel — this takes the `audio` group by
+# supplementary grant rather than switching identity. Choosing an identity here
+# would be inventing a third pattern for no gain, and `panel` is deliberately
+# NOT that identity: the broker the renderer talks to must stay unable to open a
+# sound device, which is the boundary SR-023 exists to hold.
+#
+# BUS MODE ONLY. `bus_monitor` is declared in asound-bus-mode.conf and in none
+# of the other three configurations. ExecCondition keeps the unit out of the
+# journal's failure list in the modes that have no such PCM, and the daemon
+# itself re-checks on every block so a live `wall-audio-mode` change is answered
+# with `unavailable` rather than with a stale document.
+
+[Unit]
+Description=Wall panel: the merged audio bus as a bounded visualizer source
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target
+Wants=sound.target
+BindsTo=dev-wall_audio_adapter.device
+After=dev-wall_audio_adapter.device
+# A re-enumeration can restart this while ALSA is still settling, so a couple of
+# exits in quick succession are recovery, not a crash loop. [Unit] keys, not
+# [Service]: the [Service] spelling is accepted-and-ignored with only a warning.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-bus-visualizer.py
+RuntimeDirectory=wall-bus-visualizer
+RuntimeDirectoryMode=0755
+Restart=always
+RestartSec=5
+# 78 = a tool it needs is missing. Restarting will not conjure an `arecord`.
+SuccessExitStatus=0
+RestartPreventExitStatus=78
+
+# The audio group is the whole privilege: it is what ipc_gid 29 on the dsnoop
+# requires, and there is nothing else on this panel it grants that matters.
+SupplementaryGroups=audio
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# The mode file is the only thing it reads outside /usr, and it writes only its
+# own RuntimeDirectory.
+ReadOnlyPaths=/etc/wall-panel
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+# AF_UNIX ONLY. The PCM stream is local by construction, not by policy: there is
+# no address family here that could carry a sample off this machine.
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# The socket is created 0660 root:panel by the daemon itself; this keeps
+# anything it writes in its runtime directory from being world-readable by
+# default. The telemetry document is chmod 0644 explicitly, because the broker
+# runs as `panel` and must read it.
+UMask=0077
+
+# Lifecycle and counters only. A sample never reaches the journal.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

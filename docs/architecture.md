@@ -242,6 +242,59 @@ status query; service start first establishes OFF, and suspend proceeds only
 after service shutdown has verified OFF. The second relay channel is outside
 this service's ownership.
 
+### The merged bus becomes the visualizer, and ProjectM's bounded exception (SR-041, LLR-950..958, IF-020)
+
+Two things are easy to misread from the rows. First, WHERE the signal is tapped
+decides what the panel can honestly say: `bus_monitor` is upstream of the
+Mute/Headset/Speaker switch, so it carries samples the room is not hearing, and
+the activity claim is only true once the confirmed output selection is ANDed in.
+That is why Mute yields Frame Media while the bus block still reports itself
+live -- two different statements, one about the room and one about the panel's
+health. Second, the PCM leg is not a second telemetry path: it is off unless an
+authorized local host has asked, it is one block deep, and every gate that turns
+false closes it.
+
+```mermaid
+sequenceDiagram
+    participant Mix as ALSA bus_mix (Library/Pandora/Bluetooth/S-PDIF)
+    participant Mon as ALSA bus_monitor (dsnoop)
+    participant Vis as wall-bus-visualizer
+    participant Doc as /run/.../bus-telemetry.json
+    participant Brk as audio broker + switch_backend
+    participant App as Electron host
+    participant PM as ProjectM worker
+
+    Note over Mix,PM: SR-041; capture LLR-950, document LLR-951, broker LLR-952,<br/>frame LLR-953, authorization LLR-954, backpressure LLR-955,<br/>isolation LLR-956, payload LLR-957, ALSA LLR-958
+    Mix->>Mon: one merged pre-switch stereo stream
+    Vis->>Mon: arecord S16_LE/48k/2ch, one 1024-frame period
+    alt stored mode is bus and the capture is live
+        Vis->>Vis: two periods -> decimated mono window -> bounded bands
+        Vis->>Doc: atomic schema-2 document, source bus_monitor
+    else any other ALSA mode, or the capture would not open
+        Vis->>Doc: state unavailable, levels zeroed, no device opened
+    end
+    Brk->>Doc: validate schema, source, state, bounds, freshness
+    Brk->>Brk: AND activity with the CONFIRMED switch position
+    alt Speaker or Headset
+        Brk-->>App: bounded bands, active true, no microphone block
+    else Mute
+        Brk-->>App: bounded bands, active FALSE, bus still live
+    else unavailable or absent
+        Brk-->>App: available false -- fall through to Frame Media
+    end
+
+    opt every gate agrees: lit, fullscreen, ProjectM owns and is preferred, not Mute, active
+        App->>Vis: connect pcm.sock
+        Vis->>Vis: SO_PEERCRED uid + 0660 group permission
+        Vis-->>App: newest WPCM v1 frame only; older unsent block dropped
+        App->>PM: 512-sample mono float window, transferred copy
+    end
+    opt any gate turns false, or disconnect / capture failure / mode change / stop
+        Vis->>Vis: clear the one-deep buffer, then close the stream
+        App->>PM: terminate under the existing lifecycle
+    end
+```
+
 ### A bounded audio request before hardware authority exists (SR-023, LLR-007, IF-015)
 
 The unavailable result is the current production behavior, not an error hidden

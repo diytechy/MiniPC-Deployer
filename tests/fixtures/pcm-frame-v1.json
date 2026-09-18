@@ -1,0 +1,38 @@
+{
+  "channels": 2,
+  "frameBytes": 64,
+  "frameCount": 8,
+  "interleaved": [
+    -16384,
+    -15360,
+    -12288,
+    -11264,
+    -8192,
+    -7168,
+    -4096,
+    -3072,
+    0,
+    1024,
+    4096,
+    5120,
+    8192,
+    9216,
+    12288,
+    13312
+  ],
+  "monoDownmix": [
+    -15872,
+    -11776,
+    -7680,
+    -3584,
+    512,
+    4608,
+    8704,
+    12800
+  ],
+  "note": "The frozen IF-020 PCM frame. IDENTICAL BYTES ship in MiniPC-Deployer and OfficeWallNaglight so the two implementations cannot drift; each repository decodes it in its own suite.",
+  "observedMonotonicMs": 1234567,
+  "sampleRate": 48000,
+  "sequence": 4919,
+  "sha256": "cba9e47b3ba67e0e5397950df8294d84bd7558a069767de04811139c603f82fe"
+}

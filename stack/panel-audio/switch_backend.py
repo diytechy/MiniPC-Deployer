@@ -100,14 +100,13 @@ DEFAULT_STATE_PATH = Path("/etc/wall-panel/audio-state.json")
 #                        is running anyway.
 BUS_TELEMETRY_PATH = Path("/run/wall-bus-visualizer/bus-telemetry.json")
 AEC_STATUS_PATH = Path("/run/wall-panel/aec-status.json")
-# How old a document may be and still be drawn as live. The bus publishes at
-# 5 Hz and the canceller at 0.1 Hz, so they get different windows -- one window
-# for both would either call the canceller stale constantly or let a frozen bus
-# readout sit on the wall for ten seconds. 1500 ms is seven missed bus
-# publications, which is a producer that has stopped rather than one that is
-# late.
+# How old a document may be and still be drawn as live. Both producers publish
+# several times per second; 1500 ms tolerates ordinary scheduling jitter while
+# expiring a producer that has missed multiple consecutive publications.
 BUS_STALE_MS = 1500
-AEC_STALE_MS = 25000
+# wall-audio-aec publishes the button meter at 4 Hz. Six missed publications
+# are enough to stop claiming that a frozen post-filter level is live.
+AEC_STALE_MS = 1500
 TELEMETRY_BANDS = 8
 # The exact contract of the document above. `schema` 2 is not cosmetic: a
 # version-1 document is the `speaker_tap` one, which answers a different
@@ -635,14 +634,14 @@ class SwitchApplierBackend:
         """The canceller's post-filter level, or None when there is no canceller.
 
         WHOSE NUMBER THIS IS, said plainly because it was briefly deleted for
-        being the wrong one: it belongs to the microphone button's level ring in
+        being the wrong one: it belongs to the microphone button's filled disc in
         the panel's audio chrome. It is NOT a visualizer feed. It never
         contributes a band, it never sets `active`, and since 2026-09-17 it can
         no longer stand in for an absent bus -- `_telemetry` returns
         `available: false` when the bus publishes nothing, whatever this says.
 
         EVERY STATE IS EXPLICIT, because the one thing this block must never do
-        is let a ring be drawn live over a microphone that is muted, stale or
+        is let the disc be drawn live over a microphone that is muted, stale or
         not being cancelled at all. `source` is what stops raw capture ever
         being presented as post-filter.
 
@@ -683,6 +682,11 @@ class SwitchApplierBackend:
             "source": source,
             "state": state,
             "ageMs": age,
+            # Preserve the microphone producer's observation instant across
+            # the broker/IPC seam.  `ageMs` is correct when this reply is
+            # assembled; the renderer also needs the source instant to order
+            # replies and to notice a delayed answer whose age grew in flight.
+            "observedMonotonicMs": observed,
             "valid": state == "live" and block.get("valid") is True,
             "referenceDbfs": float(reference),
         }

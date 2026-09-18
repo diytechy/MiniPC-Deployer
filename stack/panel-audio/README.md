@@ -102,7 +102,7 @@ visualizes and Mute reports inactive because the broker ANDs the confirmed
 output selection into the activity claim. A microphone reading can no longer
 stand in for an absent bus -- that substitution put a microphone level into the
 bus's place in the reply, and an absent bus now reports absent whatever the
-microphone is doing. The `microphone` block itself remains: it is the level ring
+microphone is doing. The `microphone` block itself remains: it is the filled level disc
 on the microphone button, not a visualizer feed, and it contributes no band, no
 rms, no peak and no activity claim (Owner, 2026-09-17).
 

@@ -2230,3 +2230,13 @@ the declaration must stay narrow.
 **Still owed:** whether -48 dBFS sits above this capture path's real idle noise
 floor is not answerable from the code and was not measured. If a silent room
 ever animates the visualizer, that is the number to check first.
+
+## 2026-09-18 — fresh post-AEC level publication
+
+`wall-audio-aec` now publishes its microphone status at 4 Hz. Filesystem I/O
+runs on a worker fed through a non-blocking latest-value handoff, so the audio
+thread never waits behind status publication. The broker carries the source
+observation timestamp and expires six missed publications at 1.5 seconds while
+accepting the prior block shape for staggered upgrades. The AEC check target
+now tests contention, snapshot delivery, and shutdown drain; 120 policy, 25
+PCM, and 5 publisher checks pass, and both live and replay binaries compile.

@@ -1154,7 +1154,7 @@ service is injected rather than assumed.
    ruling is about what the VISUALIZER may draw: the microphone reaches neither
    speaker nor headset, so it is not a visualization source and never
    contributes a band, an rms, a peak or an activity claim. But the block is not
-   a visualizer feed at all — it is the level ring on the microphone button in
+   a visualizer feed at all — it is the filled level disc on the microphone button in
    the audio chrome, a different consumer asking a different question, and
    deleting it would have removed a working indicator nobody asked to lose.
 

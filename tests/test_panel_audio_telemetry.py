@@ -41,6 +41,7 @@ What this file still holds down, unchanged in intent:
 
 import json
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -68,6 +69,17 @@ def wire(method, params=None, generation=0, request_id="r1"):
 
 def reply(broker, raw):
     return json.loads(broker.handle(raw))
+
+
+def test_aec_publication_cadence_keeps_the_button_meter_fresh_sr028():
+    """The producer must refresh well inside the broker's honesty window."""
+    source = (ROOT / "stack/autoinstall/wall/aec/wall-audio-aec.c").read_text(
+        encoding="utf-8")
+    match = re.search(r"^#define STATUS_INTERVAL_MS (\d+)$", source, re.M)
+    assert match, "wall-audio-aec has no literal status publication cadence"
+    interval_ms = int(match.group(1))
+    assert interval_ms == 250
+    assert interval_ms * 6 == switch_backend.AEC_STALE_MS
 
 
 @pytest.fixture
@@ -197,7 +209,7 @@ def test_a_microphone_can_never_stand_in_for_an_absent_bus_sr041(panel):
 
 
 def test_the_microphone_block_is_still_published_for_its_own_consumer_sr041(panel):
-    """It is the level ring on the microphone button, not a visualizer feed.
+    """It is the filled disc on the microphone button, not a visualizer feed.
 
     The Owner's ruling is about what the VISUALIZER may draw. Reading it as
     "the block leaves the document" would delete a working indicator nobody
@@ -212,6 +224,7 @@ def test_the_microphone_block_is_still_published_for_its_own_consumer_sr041(pane
     assert microphone["valid"] is True
     assert microphone["referenceDbfs"] == -18.0
     assert microphone["ageMs"] >= 0
+    assert microphone["observedMonotonicMs"] >= 0
 
 
 def test_the_microphone_never_reaches_the_bands_or_the_activity_claim_sr041(panel):
@@ -242,11 +255,11 @@ def test_a_level_that_is_not_live_is_zeroed_and_named_sr028(panel, state):
 
 
 def test_a_level_older_than_the_window_becomes_stale_sr028(panel):
-    """The canceller publishes at 0.1 Hz; past two and a half periods it is stale.
+    """The canceller publishes at 4 Hz; six missed publications make it stale.
 
-    The two producers get DIFFERENT windows and always have: one window for both
-    would either call the canceller stale constantly or let a frozen bus readout
-    sit on the wall for ten seconds.
+    Both producers currently use the same 1.5 second honesty window because
+    both publish faster than it. Keeping separate constants preserves the
+    producer-specific contract if either cadence changes later.
     """
     write_bus(panel)
     write_aec(panel, microphone={"observed_monotonic_ms": 0})
@@ -320,7 +333,8 @@ def test_the_broker_refuses_a_contradictory_microphone_block_sr028():
             return {"available": True, "active": True, "rms": 0.1, "peak": 0.2,
                     "bands": [0.1], "observedMonotonicMs": 5,
                     "microphone": {"level": 0.5, "source": "aec_post_filter",
-                                   "state": "muted", "ageMs": 10, "valid": True,
+                                   "state": "muted", "ageMs": 10,
+                                   "observedMonotonicMs": 5, "valid": True,
                                    "referenceDbfs": -18.0}}
 
     answer = reply(AudioBroker(Lying()), wire("telemetry"))

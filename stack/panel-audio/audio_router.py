@@ -804,7 +804,9 @@ class AudioBroker:
 
     def _safe_microphone(self, value: object) -> None:
         """Validate the post-filter microphone block. Implements: SR-028, LLR-015."""
-        if not isinstance(value, dict) or set(value) != self.MICROPHONE_FIELDS:
+        if (not isinstance(value, dict) or
+                set(value) not in (self.MICROPHONE_FIELDS,
+                                   self.MICROPHONE_FIELDS | {"observedMonotonicMs"})):
             raise BrokerError("unsafe_backend_result", "microphone telemetry is not exact")
         level = value["level"]
         if (isinstance(level, bool) or not isinstance(level, (int, float))
@@ -816,6 +818,9 @@ class AudioBroker:
             raise BrokerError("unsafe_backend_result", "microphone state is invalid")
         if not _safe_integer(value["ageMs"]):
             raise BrokerError("unsafe_backend_result", "microphone freshness is invalid")
+        if ("observedMonotonicMs" in value and
+                not _safe_integer(value["observedMonotonicMs"])):
+            raise BrokerError("unsafe_backend_result", "microphone observation is invalid")
         if not isinstance(value["valid"], bool):
             raise BrokerError("unsafe_backend_result", "microphone validity is invalid")
         reference = value["referenceDbfs"]

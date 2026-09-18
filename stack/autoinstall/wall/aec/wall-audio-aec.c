@@ -62,6 +62,9 @@
 #include "wall_aec_policy.h"
 #include "wall_aec_profile.h"
 #include "wall_aec_pcm.h"
+#ifndef WALL_AEC_OFFLINE_ONLY
+#include "wall_aec_status.h"
+#endif
 
 #include <alloca.h>
 #include <errno.h>
@@ -98,7 +101,11 @@
 #define DEFAULT_MIC "hw:PCH,0"
 #define DEFAULT_TAP "speaker_tap"
 #define DEFAULT_OUT "card_loop_mic_play"
-#define STATUS_INTERVAL_MS 10000
+/* The panel polls the broker four times a second and expires a microphone
+ * observation after 1.5 seconds. Publish at the same 4 Hz cadence so a live
+ * post-AEC level remains visibly continuous instead of appearing for only the
+ * first 1.5 seconds of each old ten-second status period. `/run` is tmpfs. */
+#define STATUS_INTERVAL_MS 250
 /* At least four blocks, so a ratio change can never starve the reference ring
  * mid-block (spike 6.5, block accounting). */
 #define REF_RING_BLOCKS 8
@@ -216,6 +223,9 @@ typedef struct {
     aec_policy policy;
     char status_path[512];
     int64_t status_due_ms;
+#ifndef WALL_AEC_OFFLINE_ONLY
+    aec_status_publisher publisher;
+#endif
 } aec_engine;
 
 static void engine_reset_filter(aec_engine *engine)
@@ -259,11 +269,17 @@ static bool engine_open(aec_engine *engine, const aec_profile *profile, const ch
     if (!engine->resampler) return false;
     engine->predelay_ring = calloc((size_t)engine->predelay_frames + 1, sizeof(int16_t));
     if (!engine->predelay_ring) return false;
+#ifndef WALL_AEC_OFFLINE_ONLY
+    if (!aec_status_publisher_start(&engine->publisher, status_path, publish)) return false;
+#endif
     return true;
 }
 
 static void engine_close(aec_engine *engine)
 {
+#ifndef WALL_AEC_OFFLINE_ONLY
+    aec_status_publisher_stop(&engine->publisher);
+#endif
     if (engine->preprocess) speex_preprocess_state_destroy(engine->preprocess);
     if (engine->echo) speex_echo_state_destroy(engine->echo);
     if (engine->resampler) speex_resampler_destroy(engine->resampler);
@@ -405,7 +421,11 @@ static void engine_block(aec_engine *engine, const int16_t *mic, int16_t *out, b
     }
 
     if (now_ms >= engine->status_due_ms) {
+#ifdef WALL_AEC_OFFLINE_ONLY
         publish(&engine->policy, engine->status_path);
+#else
+        (void)aec_status_publisher_try_enqueue(&engine->publisher, &engine->policy);
+#endif
         engine->status_due_ms = now_ms + STATUS_INTERVAL_MS;
     }
 }
@@ -678,11 +698,11 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
             mute_poll_ms = retry_now + MUTE_POLL_MS;
             bool was_muted = input_muted;
             input_muted = read_input_muted(mute_name);
-            /* A MUTE TRANSITION IS PUBLISHED AT ONCE, not on the ten-second
-             * status cadence (terra 2026-09-14, finding 4). The renderer's ring
+            /* A MUTE TRANSITION IS PUBLISHED AT ONCE rather than waiting for
+             * the next 250 ms status tick. The renderer's disc
              * is already gated on the applier's switch state, so nothing draws
-             * a live ring over a muted microphone either way -- but leaving the
-             * published block saying `live` for up to ten seconds after the mic
+             * a live disc over a muted microphone either way -- but leaving the
+             * published block saying `live` after the mic
              * legs stopped is a level that is not true of anything, and any
              * later consumer of that block would inherit the lie. */
             if (input_muted != was_muted) {

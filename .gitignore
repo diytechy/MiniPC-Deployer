@@ -53,6 +53,13 @@ vmtest/.out/
 # rebuild silently delete the wall ISO, its SSH key and its SIM credentials.
 vmtest/.out-wall/
 vmtest/*.iso
+# build-projectm-presets.sh's reproduced payload: 136 MB and 9795 files of an
+# UNLICENSED upstream pack. Keeping it out of git is the whole basis on which
+# the Owner's 2026-09-18 ruling works -- installing the pack on one private
+# panel is a different act from vendoring it into a repository, and the
+# difference is exactly this line. The tracked artefacts are presets.select and
+# presets.lock, neither of which contains a preset.
+.out-wall/
 # The verified IceDrive AppImage, cached so a rebuild needs neither the vendor
 # nor the operator's Downloads folder. NEVER COMMITTED: it is ~100 MB of vendor
 # binary this project does not own, and keeping it out of git is the entire

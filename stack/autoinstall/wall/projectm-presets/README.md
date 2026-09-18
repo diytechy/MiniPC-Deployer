@@ -5,8 +5,14 @@ pattern as `../sensor-wheelhouse`: a committed `presets.lock` holds the identity
 of every file; the files themselves are build output fetched once on a
 networked machine and never fetched on the panel.
 
-It is deliberately **empty of presets today**, and the reason is a licence
-question that is the Owner's to answer, not a worker's.
+**RULED IN by the Owner, 2026-09-18.** The whole
+`projectM-visualizer/presets-cream-of-the-crop` pack is selected -- all 9795
+presets, mirroring the Owner's desktop projectMSDL setup -- and the licence
+question below is answered for the only act this repository performs: installing
+them on one private wall panel that never redistributes them. **No preset is
+committed here or in OfficeWallNaglight**, which is what keeps that act distinct
+from vendoring an unlicensed pack into a public repository. `presets.select` and
+`presets.lock` are the only committed artefacts, and neither contains a preset.
 
 ## What the runtime needs from this directory
 
@@ -35,12 +41,39 @@ That is an assumption, not a grant. Installing a few dozen of them on a private
 wall panel that never redistributes them is a different act from vendoring them
 into a public-facing repository, and the first may well be fine where the second
 is not — but which of those the Owner is willing to do is a ruling, not a
-default. Until that ruling exists:
+default.
+
+**That ruling was given on 2026-09-18: the whole pack, installed on the one
+private panel.** What it did NOT change is everything below, which is what keeps
+the private install from quietly becoming redistribution:
 
 * no preset is committed to the public OfficeWallNaglight repository;
 * no preset is committed here either, so this repository does not become the
   quiet second copy;
-* `presets.lock` is empty, and the installer therefore installs nothing.
+* `presets.select` names all 9795 by their UPSTREAM path and `presets.lock`
+  pins a sha256 for each. Together they are the curation, and they are what lets
+  any machine reproduce the payload from git -- **no deployment depends on
+  anyone's local copy** (Owner's question, 2026-09-18).
+
+## Reproducing the payload on a new machine
+
+```sh
+# From WSL Ubuntu or any Linux box. NOT Git-for-Windows: these filenames contain
+# characters Windows cannot represent and a Windows checkout silently drops ~169
+# of the 9795.
+export PRESET_REPO=https://github.com/projectM-visualizer/presets-cream-of-the-crop
+export PRESET_COMMIT=0180df21f5e0bd39b9060cc5de420ed2f1f9e509
+bash stack/autoinstall/wall/build-projectm-presets.sh --refresh   # fetches, needs network
+bash stack/autoinstall/wall/build-projectm-presets.sh                # verifies, no network
+```
+
+The second form is the one every later build runs: it checks every locked
+sha256 and fails rather than installing bytes the lock does not name.
+
+**Verified 2026-09-18:** that commit is byte-identical to the Owner's working
+copy once CRLF is normalised -- all 9795 files, same paths, same content. The
+local copy is a Windows checkout and carries CRLF; upstream is LF, and LF is
+what ships.
 
 ## What the panel does with no presets
 

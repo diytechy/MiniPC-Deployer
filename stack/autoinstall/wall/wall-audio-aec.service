@@ -37,7 +37,10 @@
 Description=Wall panel: acoustic echo canceller (speaker_tap + panel mic -> mic_clean)
 Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=sound.target
-Wants=sound.target
+# AEC restarts stop the PartOf mic legs. The coordinator re-applies the stored
+# plan only after this replacement daemon is active, preserving mute and the
+# rear-channel compatibility gate instead of starting either leg directly.
+Wants=sound.target wall-audio-aec-restore.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
 

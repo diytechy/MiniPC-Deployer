@@ -109,6 +109,10 @@
  * means "at or above a person speaking at the panel at a normal level". */
 #define AEC_LEVEL_FLOOR_DBFS -60.0
 #define AEC_LEVEL_REFERENCE_DBFS -18.0
+/* Health arithmetic must retain energy below the UI's visible floor. The room
+ * measurement put microphone noise near -67 dBFS; clamping at -60 made a
+ * quiet echo and a cancelled residual identical and falsely reported 0 ERLE. */
+#define AEC_SIGNAL_FLOOR_DBFS -96.0
 /* Bounded smoothing and update rate, so the wall cannot be made to flicker at
  * block rate by a noisy room. 50 ms samples with a 75 ms time constant keep
  * the indication legible while removing the old half-second-feeling lag. */
@@ -293,7 +297,7 @@ const char *aec_drift_state_name(aec_drift_state state);
 size_t aec_policy_status(const aec_policy *policy, const char *updated_utc,
                          char *out, size_t size);
 
-/** dBFS of an RMS amplitude in [0,1], floored at AEC_LEVEL_FLOOR_DBFS so a
+/** dBFS of an RMS amplitude in [0,1], floored at AEC_SIGNAL_FLOOR_DBFS so a
  *  digital-silence block cannot produce -inf and poison every average. */
 double aec_dbfs(double amplitude);
 

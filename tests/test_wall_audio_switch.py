@@ -1745,6 +1745,19 @@ def test_the_aec_owns_and_preserves_its_runtime_directory_sr028():
 
 def test_mic_legs_gate_and_follow_aec_without_untracked_dropins_sr028():
     """AEC ordering stays auditable while disabled raw-mic mode still starts."""
+    aec_unit = read(WALL / "wall-audio-aec.service")
+    wants = next(line for line in aec_unit.splitlines() if line.startswith("Wants="))
+    assert "wall-audio-aec-restore.service" in wants
+    assert "wall-mic-rear.service" not in wants
+    assert "wall-bt-mic.service" not in wants
+    restore = read(WALL / "wall-audio-aec-restore.service")
+    assert "After=wall-audio-aec.service" in restore
+    assert "PartOf=wall-audio-aec.service" in restore
+    assert "ExecCondition=/bin/grep -qx WALL_AUDIO_AEC=1" in restore
+    assert "ExecStart=/usr/local/sbin/wall-audio-output apply-state" in restore
+    firstboot = read(WALL / "wall-firstboot.sh")
+    assert ('install -m 0644 "$PAYLOAD/wall-audio-aec-restore.service" '
+            '/etc/systemd/system/wall-audio-aec-restore.service') in firstboot
     gate = ("ExecCondition=/bin/sh -c '! grep -qx WALL_AUDIO_AEC=1 "
             "/etc/wall-panel/audio-aec.env 2>/dev/null || systemctl is-active "
             "--quiet wall-audio-aec.service'")
@@ -1754,7 +1767,6 @@ def test_mic_legs_gate_and_follow_aec_without_untracked_dropins_sr028():
         assert "PartOf=wall-audio-aec.service" in unit
         assert gate in unit
 
-    firstboot = read(WALL / "wall-firstboot.sh")
     assert 'rm -f "$_dir/10-aec.conf"' in firstboot
     assert 'cat > "$_dir/10-aec.conf"' not in firstboot
     assert "wall_aec_pcm.h wall_aec_status.c wall_aec_status.h Makefile" in firstboot

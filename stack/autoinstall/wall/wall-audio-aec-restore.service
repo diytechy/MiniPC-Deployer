@@ -1,0 +1,18 @@
+# wall-audio-aec-restore.service -- restore the policy-owned mic legs after AEC.
+
+[Unit]
+Description=Wall panel: re-apply audio policy after AEC starts
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=wall-audio-aec.service
+PartOf=wall-audio-aec.service
+
+[Service]
+Type=oneshot
+# A manually started, disabled AEC is a probe and must not move raw-mic legs.
+ExecCondition=/bin/grep -qx WALL_AUDIO_AEC=1 /etc/wall-panel/audio-aec.env
+# The applier owns mute, source selection, rear-channel compatibility and both
+# mic legs. Re-applying the stored state preserves all four decisions.
+ExecStart=/usr/local/sbin/wall-audio-output apply-state
+SyslogIdentifier=wall-audio-output
+StandardOutput=journal
+StandardError=journal

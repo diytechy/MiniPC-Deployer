@@ -24,9 +24,9 @@ double aec_dbfs(double amplitude)
     /* FLOORED, NOT -inf. A block of digital silence is not an error -- it is
      * every block while nothing is playing -- and letting it produce -inf would
      * poison the first average it entered and never leave it. */
-    if (!(amplitude > 0.0)) return AEC_LEVEL_FLOOR_DBFS;
+    if (!(amplitude > 0.0)) return AEC_SIGNAL_FLOOR_DBFS;
     double db = 20.0 * log10(amplitude);
-    return db < AEC_LEVEL_FLOOR_DBFS ? AEC_LEVEL_FLOOR_DBFS : db;
+    return db < AEC_SIGNAL_FLOOR_DBFS ? AEC_SIGNAL_FLOOR_DBFS : db;
 }
 
 double aec_level_from_dbfs(double dbfs)
@@ -111,7 +111,7 @@ void aec_policy_init(aec_policy *policy, const aec_profile *profile, int64_t now
     policy->window_started_ms = now_ms;
     policy->last_block_ms = now_ms;
     policy->level_updated_ms = now_ms;
-    policy->mic_peak_dbfs_1min = AEC_LEVEL_FLOOR_DBFS;
+    policy->mic_peak_dbfs_1min = AEC_SIGNAL_FLOOR_DBFS;
     aec_policy_rearm(policy, now_ms);
 }
 
@@ -145,7 +145,7 @@ static void roll_window(aec_policy *policy, int64_t now_ms)
     policy->erle_n_1min = 0;
     policy->far_active_frames_1min = 0;
     policy->double_talk_frames_1min = 0;
-    policy->mic_peak_dbfs_1min = AEC_LEVEL_FLOOR_DBFS;
+    policy->mic_peak_dbfs_1min = AEC_SIGNAL_FLOOR_DBFS;
     policy->window_started_ms = now_ms;
 }
 

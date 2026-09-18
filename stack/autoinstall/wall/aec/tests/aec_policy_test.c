@@ -98,8 +98,12 @@ static void test_normalization(void)
 {
     near(aec_dbfs(1.0), 0.0, 1e-9, "full scale is 0 dBFS");
     near(aec_dbfs(0.5), -6.0206, 1e-3, "half scale is -6 dBFS");
-    ok(aec_dbfs(0.0) == AEC_LEVEL_FLOOR_DBFS, "digital silence is the floor, never -inf");
-    ok(aec_dbfs(-1.0) == AEC_LEVEL_FLOOR_DBFS, "and a nonsense amplitude cannot escape it");
+    ok(aec_dbfs(0.0) == AEC_SIGNAL_FLOOR_DBFS,
+       "digital silence is the signal floor, never -inf");
+    ok(aec_dbfs(-1.0) == AEC_SIGNAL_FLOOR_DBFS,
+       "and a nonsense amplitude cannot escape it");
+    ok(aec_dbfs(0.0005) < AEC_LEVEL_FLOOR_DBFS,
+       "health retains signal below the UI display floor");
 
     /* Item L, exactly as the telemetry contract documents it: linear in
      * DECIBELS between the floor and the reference, reaching 1.0 at the

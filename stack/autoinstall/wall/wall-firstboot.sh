@@ -1532,6 +1532,8 @@ if [ -f "$PAYLOAD/aec/Makefile" ]; then
     fi
     [ -f "$PAYLOAD/wall-audio-aec.service" ] &&
         install -m 0644 "$PAYLOAD/wall-audio-aec.service" /etc/systemd/system/wall-audio-aec.service
+    [ -f "$PAYLOAD/wall-audio-aec-restore.service" ] &&
+        install -m 0644 "$PAYLOAD/wall-audio-aec-restore.service" /etc/systemd/system/wall-audio-aec-restore.service
 fi
 
 # THE MIC SEAM IS MOVED ONLY WHEN THE OWNER ASKS. `mic_selected` resolves

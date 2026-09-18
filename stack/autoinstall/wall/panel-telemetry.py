@@ -320,6 +320,26 @@ def read_presentation(path, now_mono_ms):
         payload = json.loads(raw)
     except ValueError as exc:
         return {"status": "invalid", "payload": None, "last_seen": None, "errors": ["json parse error: %s" % exc]}
+    # THE SNAPSHOT IS A WRAPPER, AND THIS HAD NEVER UNWRAPPED IT.
+    #
+    # Found 2026-09-18 while adding `projectmPreset`: EVERY sample on the panel
+    # was recording `"status": "invalid"` with
+    #   ["unexpected field(s): ['current', 'transitions']",
+    #    "missing field: displayMode", ... ]
+    # because the renderer writes `{"current": {...}, "transitions": [...]}` --
+    # the record plus a short history -- and this handed the whole file to a
+    # validator that expects the flat record. So the display mode, the
+    # fullscreen owner and the media preference have not been in the telemetry
+    # log at all, silently, for as long as the wrapper has existed. The failure
+    # is invisible from outside precisely because `payload` is populated only on
+    # "ok": a reader sees null and cannot tell "no snapshot" from "a snapshot
+    # this collector could not read".
+    #
+    # Unwrapped here rather than in `validate_presentation`, which is right to
+    # keep describing exactly one shape -- the RECORD. The wrapper is this
+    # file's business because this file is what reads the file.
+    if isinstance(payload, dict) and isinstance(payload.get("current"), dict):
+        payload = payload["current"]
     ok, errors = core.validate_presentation(payload)
     if not ok:
         return {"status": "invalid", "payload": None, "last_seen": None, "errors": errors}

@@ -163,6 +163,21 @@ class SwitchApplierBackend:
 
     # ---- the Backend protocol -------------------------------------------
 
+    # ANSWERED FROM FILES, SO THEY NEED NO PROCESS ISOLATION (2026-09-17).
+    # This backend performs no device I/O of its own and structurally cannot --
+    # see the module docstring: it runs as `panel` under ProtectSystem=strict
+    # with AF_UNIX as its only address family, so it can neither run `amixer`
+    # nor talk to systemd. `status` reads the applier's state file and
+    # `telemetry` reads the visualizer and canceller documents out of /run.
+    # None of them can hang on hardware, and the renderer polls `telemetry` at
+    # 4 Hz whenever the display is lit: isolating it cost 64% of one core in
+    # interpreter startups alone.
+    #
+    # `request_landed` is deliberately NOT here. It also only reads the state
+    # file today, but it exists to observe a MUTATION, and a method whose job is
+    # to watch hardware settle is the wrong place to save a few milliseconds.
+    LOCAL_ONLY_METHODS = frozenset({"status", "telemetry"})
+
     def inventory(self, cancel: threading.Event) -> list:
         """No Bluetooth devices: this backend routes nothing (WSN-024)."""
         return []

@@ -102,8 +102,61 @@ class Backend(Protocol):
     def inventory(self, cancel: threading.Event) -> list[Device]: ...
 
 
+def backend_answers_locally(backend: object, method: str | None) -> bool:
+    """Whether `method` is answered with no device I/O and so needs no isolation.
+
+    THE DEFAULT IS FALSE AND THAT IS THE POINT. `_isolated_backend_call` spawns
+    a whole Python interpreter per call, because a backend that talks to a
+    device can hang and Python cannot kill a stuck thread. That is the right
+    trade for anything touching hardware. It is a poor one for an observation
+    the backend answers by reading a file: measured on the panel 2026-09-17,
+    the renderer polls `telemetry` at 4 Hz whenever the display is lit, and the
+    broker was burning 64% of one core -- about a sixth of this four-core box --
+    doing nothing but starting interpreters. 4201 `openat` and 2334 `mmap` per
+    eight seconds, all of it module imports.
+
+    The exemption is declared BY THE BACKEND, not assumed by the broker, so a
+    future routed-device backend (WSN-024) that answers `status` from BlueZ
+    inherits isolation by saying nothing. A blanket "telemetry is cheap" rule in
+    the broker would have become silently wrong the day that backend landed,
+    and nothing would have failed to say so.
+
+    THE DECLARATION IS TYPE-CHECKED, NOT JUST MEMBERSHIP-TESTED (terra,
+    2026-09-17). `method in declared` alone accepts a plain string -- and a
+    string answers membership by SUBSTRING, so `LOCAL_ONLY_METHODS = "telemetry"`
+    would quietly exempt "tele" and "etry" as well. A mapping would opt in by
+    its keys. Neither is a set of method names, and a declaration that is not one
+    is a mistake rather than permission, so it is refused. Any exception while
+    reading or testing it lands the same way: the expensive answer is the safe
+    one.
+
+    THE COST OF SAYING YES, stated so it is chosen rather than discovered. A
+    declared-local call runs on a thread this broker cannot kill. The deadline
+    still returns `backend_timeout` to the caller, but a worker that never
+    finishes keeps its slot forever, and MAX_BACKEND_WORKERS of those leave the
+    broker answering `backend_busy` for the life of the process; the spawned
+    process it replaces could always be killed and reclaimed. That is acceptable
+    ONLY for work that cannot block -- which is why the shipped backend declares
+    exactly its two regular-file reads and nothing else.
+    """
+    if method is None:
+        return False
+    try:
+        declared = getattr(backend, "LOCAL_ONLY_METHODS", None)
+        if not isinstance(declared, (set, frozenset, tuple, list)):
+            return False
+        if not all(isinstance(name, str) for name in declared):
+            return False
+        return method in declared
+    except Exception:
+        return False
+
+
 class UnavailableBackend:
     """Safe image default until the real-panel feasibility gate is complete."""
+
+    # Both answers are literals; there is nothing here that could block.
+    LOCAL_ONLY_METHODS = frozenset({"status", "telemetry"})
 
     def call(self, method: str, params: Mapping[str, object], cancel: threading.Event) -> object:
         if method == "status":
@@ -461,13 +514,20 @@ class AudioBroker:
                       params: Mapping[str, object] | None = None) -> object:
         if not self._backend_slots.acquire(timeout=self.backend_timeout_seconds):
             raise BrokerError("backend_busy", "audio backend capacity is exhausted")
-        if self.isolate_backend:
+        if self.isolate_backend and not backend_answers_locally(self.backend, method):
             try:
                 return self._isolated_backend_call(operation, method, params or {})
             finally:
                 self._backend_slots.release()
-        # White-box tests may opt into this in-process seam to inspect their
-        # fake. Production serve() never does: Python cannot kill a stuck thread.
+        # The in-process seam. White-box tests opt into it to inspect their fake,
+        # and since 2026-09-17 production reaches it for the methods a backend
+        # DECLARES it answers locally (see `backend_answers_locally`).
+        #
+        # It still enforces the deadline; what it cannot do is kill the worker
+        # when the deadline passes, because Python cannot kill a stuck thread.
+        # For a backend that reads a file that distinction is theoretical -- and
+        # for one that touches a device it is not, which is exactly why the
+        # declaration is opt-in and defaults to isolating.
         cancel = threading.Event(); done = threading.Event(); outcome: dict[str, object] = {}
 
         def invoke() -> None:
@@ -479,7 +539,18 @@ class AudioBroker:
             finally:
                 done.set(); self._backend_slots.release()
 
-        threading.Thread(target=invoke, daemon=True, name="panel-audio-backend").start()
+        # THE SLOT IS RELEASED BY THE WORKER, SO A WORKER THAT NEVER RUNS LEAKS
+        # IT (terra, 2026-09-17). `start()` can raise -- RuntimeError when the
+        # process cannot create another thread -- and the semaphore was acquired
+        # before this line. Every such failure used to cost one permanent slot,
+        # and MAX_BACKEND_WORKERS of them would leave the broker answering
+        # `backend_busy` for the life of the process. Latent while only tests
+        # reached this seam; live from the moment production did.
+        try:
+            threading.Thread(target=invoke, daemon=True, name="panel-audio-backend").start()
+        except BaseException:
+            self._backend_slots.release()
+            raise
         if not done.wait(self.backend_timeout_seconds):
             cancel.set()
             raise BrokerError("backend_timeout", "audio backend exceeded its deadline")

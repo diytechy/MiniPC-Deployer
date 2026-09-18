@@ -143,7 +143,7 @@ class VisualizerTelemetry:
     """
 
     def __init__(self, *, band_count: int = 8, max_samples: int = MAX_SAMPLES,
-                 silence_floor: float = 0.01, silence_hold_ms: int = 1500,
+                 silence_floor: float = 0.004, silence_hold_ms: int = 5000,
                  minimum_interval_ms: int = 50, sample_rate: float | None = None,
                  band_centres_hz: Iterable[float] | None = None):
         if (isinstance(silence_hold_ms, bool) or not isinstance(silence_hold_ms, int)
@@ -192,6 +192,21 @@ class VisualizerTelemetry:
             max_samples=self.max_samples, sample_rate=self.sample_rate,
             band_centres_hz=self.band_centres_hz,
         )
+        # THE HOLD IS WHAT STOPS MUSIC LOOKING LIKE SILENCE (Owner, 2026-09-17:
+        # "the audio playing signal that feeds the visualizer appears to get cut
+        # off early"). A quiet passage, a gap between tracks or a fade is not the
+        # end of playback, but each one takes rms under the floor; without a hold
+        # the wall abandons the visualizer mid-album and shows Frame Media.
+        #
+        # Both numbers moved together and neither is sufficient alone. The floor
+        # went 0.01 -> 0.004, about -40 dBFS to -48 dBFS, because the old one
+        # called ordinary quiet passages silence in the first place. The hold
+        # went 1500 ms -> 5000 ms, the Owner's figure, because even a correct
+        # floor is crossed briefly between tracks.
+        #
+        # It only ever EXTENDS activity. Nothing here can claim a bus is live
+        # that never was: `_last_signal_ms` is set only by a real reading above
+        # the floor, and `reset()` clears it on suspend, disconnect and disable.
         if telemetry["active"]:
             self._last_signal_ms = observed_monotonic_ms
         elif self._last_signal_ms is not None:

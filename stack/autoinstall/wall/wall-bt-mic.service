@@ -34,6 +34,10 @@ Description=Wall panel: selected microphone to the connected phone (HFP mic retu
 Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=sound.target bluealsa.service
 Wants=sound.target
+# Ordering does not pull AEC in when disabled. PartOf propagates an AEC
+# stop/restart to a leg that may already be reading mic_clean.
+After=wall-audio-aec.service
+PartOf=wall-audio-aec.service
 # Ordering only, no Requires: BlueALSA not running means no SCO sink, which
 # this unit already treats as "no call is up". Requiring it would make a panel
 # with Bluetooth disabled fail an apply that has nothing to do with Bluetooth.
@@ -53,6 +57,8 @@ ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || ech
 # deadlock the apply that is starting this leg. Review (terra, 2026-09-14)
 # found this path once per mic leg.
 ExecCondition=/usr/local/sbin/wall-audio-output mic-allowed
+# Refuse a silent mic_clean when the seam has moved; raw-mic mode is unaffected.
+ExecCondition=/bin/sh -c '! grep -qx WALL_AUDIO_AEC=1 /etc/wall-panel/audio-aec.env 2>/dev/null || systemctl is-active --quiet wall-audio-aec.service'
 EnvironmentFile=-/run/wall-panel/audio-mic-source.env
 EnvironmentFile=-/run/wall-panel/audio-headset.env
 EnvironmentFile=-/etc/wall-panel/bt-mic.env

@@ -22,8 +22,8 @@
 #
 # WHY THIS CANNOT REACH THE SPEAKERS. `mic_rear` is a generated `route`
 # (/etc/wall-panel/audio-mic.conf) over the SHARED eight-channel dmix
-# `usb_out_mix`. It writes the microphone to channels 4 and 5 and EXPLICIT ZEROS
-# to 0, 1, 2, 3, 6 and 7. The speaker leg's own generated route writes explicit
+# `usb_out_mix`. It writes the microphone to measured Side channels 6 and 7 and
+# EXPLICIT ZEROS to 0-5. The speaker leg's own generated route writes explicit
 # zeros to 4-7. dmix sums per channel, so the two tables are the whole of the
 # separation, in both directions, and they are the whole of it BECAUSE the
 # adapter's mute is one boolean over all eight channels (numid 7, measured
@@ -45,6 +45,10 @@ Description=Wall panel: selected microphone to the adapter's rear out (the deskt
 Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=sound.target
 Wants=sound.target
+# Ordering does not pull AEC in when the Owner has disabled it. PartOf makes a
+# later AEC stop/restart propagate to a mic leg already reading mic_clean.
+After=wall-audio-aec.service
+PartOf=wall-audio-aec.service
 StartLimitIntervalSec=60
 StartLimitBurst=10
 BindsTo=dev-wall_audio_adapter.device
@@ -63,6 +67,9 @@ ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || ech
 # deadlock the apply that is starting this leg. Review (terra, 2026-09-14)
 # found this path once per mic leg.
 ExecCondition=/usr/local/sbin/wall-audio-output mic-allowed
+# When the seam is on mic_clean, do not open it unless its only writer is live.
+# When AEC is disabled, the condition is true without starting that service.
+ExecCondition=/bin/sh -c '! grep -qx WALL_AUDIO_AEC=1 /etc/wall-panel/audio-aec.env 2>/dev/null || systemctl is-active --quiet wall-audio-aec.service'
 # Which microphone, written by wall-audio-output at every apply. `-` so a
 # hand-started leg with no applier run behind it takes the configured default
 # (the panel's own microphone), rather than refusing to start.

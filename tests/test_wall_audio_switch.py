@@ -1743,6 +1743,23 @@ def test_the_aec_owns_and_preserves_its_runtime_directory_sr028():
     assert "RuntimeDirectoryPreserve=yes" in service
 
 
+def test_mic_legs_gate_and_follow_aec_without_untracked_dropins_sr028():
+    """AEC ordering stays auditable while disabled raw-mic mode still starts."""
+    gate = ("ExecCondition=/bin/sh -c '! grep -qx WALL_AUDIO_AEC=1 "
+            "/etc/wall-panel/audio-aec.env 2>/dev/null || systemctl is-active "
+            "--quiet wall-audio-aec.service'")
+    for name in ("wall-mic-rear.service", "wall-bt-mic.service"):
+        unit = read(WALL / name)
+        assert "After=wall-audio-aec.service" in unit
+        assert "PartOf=wall-audio-aec.service" in unit
+        assert gate in unit
+
+    firstboot = read(WALL / "wall-firstboot.sh")
+    assert 'rm -f "$_dir/10-aec.conf"' in firstboot
+    assert 'cat > "$_dir/10-aec.conf"' not in firstboot
+    assert "wall_aec_pcm.h Makefile" in firstboot
+
+
 def test_the_capture_gain_default_is_the_measured_one_sr029(applier):
     """It was CLIPPING, so this number is a measurement and not a preference.
 

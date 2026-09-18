@@ -1685,7 +1685,7 @@ def test_no_mic_leg_is_ever_enabled_sr029():
 
 
 def test_the_mic_route_writes_explicit_zeros_everywhere_else_sr029(applier):
-    """The mic on channels 4 and 5, and NOTHING anywhere else. Both halves.
+    """The mic on measured return channels 6 and 7, nowhere else. Both halves.
 
     This table is the whole of what keeps the microphone out of the speakers:
     the adapter's mute is one boolean over all eight channels, so hardware
@@ -1694,21 +1694,21 @@ def test_the_mic_route_writes_explicit_zeros_everywhere_else_sr029(applier):
     rendered = applier.render_mic_conf(dict(applier.MIC_DEFAULTS))
     assert 'pcm "usb_out_mix"' in rendered, "it must share the one playback stream"
     assert "channels 8" in rendered
-    for channel in (4, 5):
+    for channel in (6, 7):
         assert "ttable.0.%d 1.0000" % channel in rendered
-    for channel in (0, 1, 2, 3, 6, 7):
+    for channel in (0, 1, 2, 3, 4, 5):
         assert "ttable.0.%d 0.0000" % channel in rendered, (
             "channel %d must be an EXPLICIT zero: silent on purpose and "
             "forgotten must not look the same" % channel)
-    # The microphone reaches the two rear channels IDENTICALLY: a desktop line
+    # The microphone reaches the two return channels IDENTICALLY: a desktop line
     # input is stereo and both sides must carry the same capsule.
-    assert rendered.count("ttable.0.4 1.0000") == rendered.count("ttable.0.5 1.0000")
+    assert rendered.count("ttable.0.6 1.0000") == rendered.count("ttable.0.7 1.0000")
 
 
 def test_the_two_route_tables_do_not_overlap_sr029(applier):
     """The other direction, and the pair is the whole bargain.
 
-    The speaker route owns 0-3 and zeroes 4-7; the mic route owns 4-5 and zeroes
+    The speaker route owns 0-3 and zeroes 4-7; the mic route owns 6-7 and zeroes
     the rest. dmix sums per channel, so music cannot reach the desktop's input
     and the microphone cannot reach the amplifier, and neither statement depends
     on a mixer control.
@@ -1725,6 +1725,22 @@ def test_the_two_route_tables_do_not_overlap_sr029(applier):
         assert "ttable.0.%d 0.0000" % channel in mic
     assert set(applier.MIC_REAR_CHANNELS) & set(applier.MIC_SILENT_CHANNELS) == set()
     assert set(applier.MIC_REAR_CHANNELS) | set(applier.MIC_SILENT_CHANNELS) == set(range(8))
+
+
+def test_the_measured_desktop_return_is_the_side_pair_sr029(applier):
+    """A tone on Rear did not move Line In; Side did, on the live wiring."""
+    assert applier.MIC_REAR_CHANNELS == (6, 7)
+
+
+def test_the_aec_owns_and_preserves_its_runtime_directory_sr028():
+    """Namespace setup used to fail before ExecCondition on every boot."""
+    unit = read(WALL / "wall-audio-aec.service")
+    service = unit.split("[Service]", 1)[1]
+    assert "RuntimeDirectory=wall-panel" in service
+    assert "RuntimeDirectoryMode=0755" in service
+    # Other audio services share /run/wall-panel. Stopping AEC must not remove
+    # their state just because this unit was the process that created it.
+    assert "RuntimeDirectoryPreserve=yes" in service
 
 
 def test_the_capture_gain_default_is_the_measured_one_sr029(applier):
@@ -1801,14 +1817,14 @@ def test_the_mic_env_round_trips_sr029(applier, tmp_path):
 
 
 def test_only_the_rear_pair_of_the_adapter_moves_sr029(applier):
-    """The other six values are the Owner's bench session, verbatim.
+    """Only the measured desktop-return pair moves.
 
     Read off the panel 2026-09-14: 66,66,24,24,0,0,24,24. Everything except
-    channels 4 and 5 belongs to somebody who stood at an amplifier.
+    channels 6 and 7 belongs to another physical jack.
     """
     bench = [66, 66, 24, 24, 0, 0, 24, 24]
-    assert applier.rear_levels(bench, 66) == [66, 66, 24, 24, 66, 66, 24, 24]
-    assert applier.rear_levels(bench, 0) == bench
+    assert applier.rear_levels(bench, 66) == [66, 66, 24, 24, 0, 0, 66, 66]
+    assert applier.rear_levels(bench, 0) == [66, 66, 24, 24, 0, 0, 0, 0]
     assert bench == [66, 66, 24, 24, 0, 0, 24, 24], "the input must not be mutated"
 
 
@@ -1840,12 +1856,12 @@ def test_the_rear_pair_is_only_raised_while_a_mic_leg_runs_sr029(applier, policy
     live = applier.Applier(run=run_amixer)
     assert applier.set_rear_level(live, "ICUSBAUDIO7D", 66) is True
     csets = [argv for argv in live.commands if "cset" in argv]
-    assert csets and csets[-1][-1] == "66,66,24,24,66,66,24,24"
+    assert csets and csets[-1][-1] == "66,66,24,24,0,0,66,66"
 
     quiet = applier.Applier(run=run_amixer)
     applier.set_rear_level(quiet, "ICUSBAUDIO7D", 0)
-    # Already 0 in the bench values, so nothing is written at all.
-    assert not [argv for argv in quiet.commands if "cset" in argv]
+    csets = [argv for argv in quiet.commands if "cset" in argv]
+    assert csets and csets[-1][-1] == "66,66,24,24,0,0,0,0"
 
 
 def test_a_changed_microphone_restarts_the_leg_rather_than_starting_it_sr029(

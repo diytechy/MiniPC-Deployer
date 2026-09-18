@@ -18,7 +18,7 @@ LDLIBS_DAEMON = -lasound -lspeexdsp -lm
 all: wall-audio-aec
 
 wall-audio-aec: wall-audio-aec.c wall_aec_policy.c wall_aec_profile.c \
-                wall_aec_policy.h wall_aec_profile.h
+                wall_aec_policy.h wall_aec_profile.h wall_aec_pcm.h
 	$(CC) $(CFLAGS) -o $@ wall-audio-aec.c wall_aec_policy.c wall_aec_profile.c $(LDLIBS_DAEMON)
 
 # The replay-only build: no ALSA, so the spike's retained captures can be run
@@ -26,16 +26,21 @@ wall-audio-aec: wall-audio-aec.c wall_aec_policy.c wall_aec_profile.c \
 # libspeexdsp, because the thing being replayed IS the canceller.
 offline: wall-audio-aec-offline
 
-wall-audio-aec-offline: wall-audio-aec.c wall_aec_policy.c wall_aec_profile.c
+wall-audio-aec-offline: wall-audio-aec.c wall_aec_policy.c wall_aec_profile.c \
+                        wall_aec_pcm.h
 	$(CC) $(CFLAGS) -DWALL_AEC_OFFLINE_ONLY -o $@ \
 	    wall-audio-aec.c wall_aec_policy.c wall_aec_profile.c -lspeexdsp -lm
 
-check: tests/aec_policy_test
+check: tests/aec_policy_test tests/aec_pcm_test
 	./tests/aec_policy_test
+	./tests/aec_pcm_test
 
 tests/aec_policy_test: tests/aec_policy_test.c wall_aec_policy.c wall_aec_profile.c \
                        wall_aec_policy.h wall_aec_profile.h
 	$(CC) $(CFLAGS) -o $@ tests/aec_policy_test.c wall_aec_policy.c wall_aec_profile.c -lm
 
+tests/aec_pcm_test: tests/aec_pcm_test.c wall_aec_pcm.h
+	$(CC) $(CFLAGS) -o $@ tests/aec_pcm_test.c
+
 clean:
-	rm -f wall-audio-aec wall-audio-aec-offline tests/aec_policy_test
+	rm -f wall-audio-aec wall-audio-aec-offline tests/aec_policy_test tests/aec_pcm_test

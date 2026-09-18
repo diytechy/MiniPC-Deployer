@@ -217,14 +217,18 @@ MIC_KEYS = ("capture_percent", "boost", "headset_capture_percent",
             "rear_level", "rear_gain")
 MIC_LIMITS = {"capture_percent": (0, 100), "boost": (0, 3),
               "headset_capture_percent": (0, 100), "rear_level": (0, 197)}
-# The two rear channels of the adapter's FIXED map FL FR FC LFE RL RR SL SR.
-MIC_REAR_CHANNELS = (4, 5)
+# The desktop Line In cable is on the adapter's Side jack.  The first physical
+# pair probe on 2026-09-18 proved channels 6/7 reach that cable; a tone on the
+# nominal Rear pair (4/5) did not move the receiving meter at all.  Keep the
+# historical REAR names in the persisted interface, but route them to the
+# measured connector rather than the intended-on-paper one.
+MIC_REAR_CHANNELS = (6, 7)
 # Every other channel of that map, written into the generated route as an
 # EXPLICIT zero. This is now the ONLY thing keeping the microphone out of the
 # speakers: the adapter has a single mute switch for all eight channels (numid 7
 # is one boolean, measured), so it cannot be used to silence the front while the
 # rear carries the mic. See wall_audio_state.plan for the whole argument.
-MIC_SILENT_CHANNELS = (0, 1, 2, 3, 6, 7)
+MIC_SILENT_CHANNELS = (0, 1, 2, 3, 4, 5)
 MIC_GAIN_MAX = 4.0
 MIC_SOURCE_VAR = "WALL_AUDIO_MIC_SOURCE"
 MIC_SOURCE_ENV = RUN_DIR / "audio-mic-source.env"

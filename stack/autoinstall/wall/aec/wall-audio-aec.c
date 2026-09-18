@@ -61,6 +61,7 @@
 
 #include "wall_aec_policy.h"
 #include "wall_aec_profile.h"
+#include "wall_aec_pcm.h"
 
 #include <alloca.h>
 #include <errno.h>
@@ -460,19 +461,128 @@ static int replay(aec_engine *engine, const char *reference_path, const char *ne
 /* ── the live path ───────────────────────────────────────────────────────── */
 
 #ifndef WALL_AEC_OFFLINE_ONLY
-static snd_pcm_t *open_pcm(const char *name, snd_pcm_stream_t direction)
+typedef struct {
+    snd_pcm_t *pcm;
+    snd_pcm_sw_params_t *sw;
+} alsa_pcm_context;
+
+static int alsa_sw_current(void *opaque)
+{
+    alsa_pcm_context *context = opaque;
+    return snd_pcm_sw_params_current(context->pcm, context->sw);
+}
+
+static int alsa_start_threshold(void *opaque, unsigned long value)
+{
+    alsa_pcm_context *context = opaque;
+    return snd_pcm_sw_params_set_start_threshold(context->pcm, context->sw,
+                                                  (snd_pcm_uframes_t)value);
+}
+
+static int alsa_avail_min(void *opaque, unsigned long value)
+{
+    alsa_pcm_context *context = opaque;
+    return snd_pcm_sw_params_set_avail_min(context->pcm, context->sw,
+                                           (snd_pcm_uframes_t)value);
+}
+
+static int alsa_sw_apply(void *opaque)
+{
+    alsa_pcm_context *context = opaque;
+    return snd_pcm_sw_params(context->pcm, context->sw);
+}
+
+static int alsa_drop(void *opaque)
+{
+    return snd_pcm_drop(((alsa_pcm_context *)opaque)->pcm);
+}
+
+static int alsa_prepare(void *opaque)
+{
+    return snd_pcm_prepare(((alsa_pcm_context *)opaque)->pcm);
+}
+
+static int alsa_start(void *opaque)
+{
+    return snd_pcm_start(((alsa_pcm_context *)opaque)->pcm);
+}
+
+static aec_pcm_ops pcm_operations(alsa_pcm_context *context)
+{
+    aec_pcm_ops operations = {
+        context, alsa_sw_current, alsa_start_threshold, alsa_avail_min,
+        alsa_sw_apply, alsa_drop, alsa_prepare, alsa_start
+    };
+    return operations;
+}
+
+static snd_pcm_t *open_pcm(const char *name, snd_pcm_stream_t direction,
+                           unsigned int channels)
 {
     snd_pcm_t *pcm = NULL;
     int error = snd_pcm_open(&pcm, name, direction, 0);
     if (error < 0) { journal("aec: cannot open %s: %s", name, snd_strerror(error)); return NULL; }
     error = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                               1, AEC_RATE_HZ, 1, 50000);
+                               channels, AEC_RATE_HZ, 1, 50000);
     if (error < 0) {
         journal("aec: cannot configure %s: %s", name, snd_strerror(error));
         snd_pcm_close(pcm);
         return NULL;
     }
+    if (direction == SND_PCM_STREAM_CAPTURE) {
+        /* snd_pcm_set_params() chose start_threshold=buffer_size on the live
+         * ALC255.  Unlike arecord's known-good start_threshold=1, that made
+         * every first snd_pcm_readi() fail with EIO.  Capture starts when data
+         * exists; playback is the direction that needs a fill threshold. */
+        snd_pcm_sw_params_t *sw = NULL;
+        snd_pcm_sw_params_alloca(&sw);
+        alsa_pcm_context context = { pcm, sw };
+        aec_pcm_ops operations = pcm_operations(&context);
+        error = aec_pcm_configure_capture(&operations, AEC_FRAME_SIZE);
+        if (error < 0) {
+            journal("aec: cannot configure capture thresholds for %s: %s",
+                    name, snd_strerror(error));
+            snd_pcm_close(pcm);
+            return NULL;
+        }
+    }
     return pcm;
+}
+
+static snd_pcm_t *open_reference(const char *name)
+{
+    snd_pcm_t *pcm = open_pcm(name, SND_PCM_STREAM_CAPTURE,
+                              AEC_REFERENCE_CHANNELS);
+    if (!pcm) return NULL;
+    /* The reference is drained with avail_update() so it never makes the
+     * blocking read that would implicitly start a prepared capture PCM.  The
+     * first live run therefore waited forever at avail=0 while music crossed
+     * the same tap. Start it explicitly, and do the same after every recovery. */
+    alsa_pcm_context context = { pcm, NULL };
+    aec_pcm_ops operations = pcm_operations(&context);
+    int error = aec_pcm_start_reference(&operations);
+    if (error < 0) {
+        journal("aec: cannot start reference %s: %s", name, snd_strerror(error));
+        snd_pcm_close(pcm);
+        return NULL;
+    }
+    return pcm;
+}
+
+static bool restart_capture(snd_pcm_t *pcm, const char *name)
+{
+    /* drop() may legitimately report that an already-faulted stream is not
+     * running. prepare() and start() are the operations that decide whether
+     * the handle is usable again, so check both of those and make failure
+     * visible rather than leaving an inert non-NULL PCM in the live loop. */
+    alsa_pcm_context context = { pcm, NULL };
+    aec_pcm_ops operations = pcm_operations(&context);
+    int error = aec_pcm_restart_capture(&operations);
+    if (error < 0) {
+        journal("aec: cannot restart capture %s: %s", name, snd_strerror(error));
+        return false;
+    }
+    return true;
 }
 
 /* Read a stream's audio and system timestamps in one pass, so the monotonic
@@ -514,20 +624,28 @@ static stream_clock read_clock(snd_pcm_t *pcm)
 static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
                 const char *out_name, const char *mute_name)
 {
-    snd_pcm_t *mic_pcm = open_pcm(mic_name, SND_PCM_STREAM_CAPTURE);
+    /* The ALC255 capture endpoint is stereo-only even though the internal mic
+     * is one acoustic source.  The first live start on 2026-09-18 proved that
+     * asking hw:PCH,0 for one channel fails with EINVAL before a frame reaches
+     * the canceller.  Own the hardware in its native two-channel shape and
+     * downmix explicitly below; the tap and clean loopback stay mono. */
+    snd_pcm_t *mic_pcm = open_pcm(mic_name, SND_PCM_STREAM_CAPTURE,
+                                  AEC_MIC_CHANNELS);
     if (!mic_pcm) return 1;
-    snd_pcm_t *out_pcm = open_pcm(out_name, SND_PCM_STREAM_PLAYBACK);
+    snd_pcm_t *out_pcm = open_pcm(out_name, SND_PCM_STREAM_PLAYBACK,
+                                  AEC_OUTPUT_CHANNELS);
     if (!out_pcm) { snd_pcm_close(mic_pcm); return 1; }
     /* The tap is opened NON-FATALLY. It disappears every time the switch leaves
      * Speaker, and a daemon that died with it would take the microphone with
      * it. A NULL tap is simply "no reference", which is the pass-through case. */
-    snd_pcm_t *tap_pcm = open_pcm(tap_name, SND_PCM_STREAM_CAPTURE);
+    snd_pcm_t *tap_pcm = open_reference(tap_name);
     if (!tap_pcm) journal("aec: no reference at %s yet; passing the microphone "
                           "through and retrying every %d ms", tap_name, TAP_RETRY_MS);
     int64_t tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
     int64_t mute_poll_ms = 0;
     bool input_muted = false;
 
+    int16_t mic_stereo[AEC_FRAME_SIZE * 2], tap_stereo[AEC_FRAME_SIZE * 2];
     int16_t mic[AEC_FRAME_SIZE], tap[AEC_FRAME_SIZE], out[AEC_FRAME_SIZE];
     stream_clock tap_base = { false, 0, 0, 0, false, false };
     stream_clock mic_base = { false, 0, 0, 0, false, false };
@@ -543,7 +661,7 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
         int64_t retry_now = monotonic_ms();
         if (!tap_pcm && retry_now >= tap_retry_ms) {
             tap_retry_ms = retry_now + TAP_RETRY_MS;
-            tap_pcm = open_pcm(tap_name, SND_PCM_STREAM_CAPTURE);
+            tap_pcm = open_reference(tap_name);
             if (tap_pcm) {
                 journal("aec: reference at %s is available; cancelling from a "
                         "cold filter", tap_name);
@@ -571,7 +689,7 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
                 engine->status_due_ms = 0;
             }
         }
-        snd_pcm_sframes_t got = snd_pcm_readi(mic_pcm, mic, AEC_FRAME_SIZE);
+        snd_pcm_sframes_t got = snd_pcm_readi(mic_pcm, mic_stereo, AEC_FRAME_SIZE);
         if (got < 0) {
             /* AN XRUN ON EITHER STREAM IS A STEP CHANGE IN OFFSET, which the
              * rate controller cannot and must not chase. Both PCMs are dropped
@@ -581,8 +699,17 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
              * fire on the cold convergence this causes. */
             journal("aec: xrun on the microphone (%s); resynchronising both streams",
                     snd_strerror((int)got));
-            snd_pcm_drop(mic_pcm); snd_pcm_prepare(mic_pcm);
-            if (tap_pcm) { snd_pcm_drop(tap_pcm); snd_pcm_prepare(tap_pcm); }
+            if (!restart_capture(mic_pcm, mic_name)) {
+                status = 1;
+                break;
+            }
+            if (tap_pcm) {
+                if (!restart_capture(tap_pcm, tap_name)) {
+                    snd_pcm_close(tap_pcm);
+                    tap_pcm = NULL;
+                    tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
+                }
+            }
             engine->reference_fill = 0;
             engine_reset_filter(engine);
             aec_policy_xrun(&engine->policy, monotonic_ms());
@@ -590,6 +717,11 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
             continue;
         }
         if (got != AEC_FRAME_SIZE) continue;
+        for (size_t frame = 0; frame < AEC_FRAME_SIZE; frame++) {
+            int32_t sum = (int32_t)mic_stereo[frame * 2] +
+                          (int32_t)mic_stereo[frame * 2 + 1];
+            mic[frame] = (int16_t)(sum / 2);
+        }
 
         bool tap_present = false;
         if (tap_pcm) {
@@ -609,10 +741,36 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
                     break;   /* the ring is as full as it should get */
                 }
                 snd_pcm_sframes_t available = snd_pcm_avail_update(tap_pcm);
+                if (available < 0) {
+                    if (!restart_capture(tap_pcm, tap_name)) {
+                        snd_pcm_close(tap_pcm);
+                        tap_pcm = NULL;
+                        tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
+                    }
+                    engine->reference_fill = 0;
+                    break;
+                }
                 if (available < AEC_FRAME_SIZE) break;
-                snd_pcm_sframes_t read = snd_pcm_readi(tap_pcm, tap, AEC_FRAME_SIZE);
-                if (read == AEC_FRAME_SIZE) { push_reference(engine, tap, AEC_FRAME_SIZE); tap_present = true; continue; }
-                if (read < 0) { snd_pcm_drop(tap_pcm); snd_pcm_prepare(tap_pcm); engine->reference_fill = 0; }
+                snd_pcm_sframes_t read = snd_pcm_readi(tap_pcm, tap_stereo,
+                                                       AEC_FRAME_SIZE);
+                if (read == AEC_FRAME_SIZE) {
+                    for (size_t frame = 0; frame < AEC_FRAME_SIZE; frame++) {
+                        int32_t sum = (int32_t)tap_stereo[frame * 2] +
+                                      (int32_t)tap_stereo[frame * 2 + 1];
+                        tap[frame] = (int16_t)(sum / 2);
+                    }
+                    push_reference(engine, tap, AEC_FRAME_SIZE);
+                    tap_present = true;
+                    continue;
+                }
+                if (read < 0) {
+                    if (!restart_capture(tap_pcm, tap_name)) {
+                        snd_pcm_close(tap_pcm);
+                        tap_pcm = NULL;
+                        tap_retry_ms = monotonic_ms() + TAP_RETRY_MS;
+                    }
+                    engine->reference_fill = 0;
+                }
                 break;
             }
             /* Still draining what the ring holds counts as a live reference:

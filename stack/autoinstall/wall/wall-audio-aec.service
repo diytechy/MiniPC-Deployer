@@ -43,6 +43,9 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+RuntimeDirectory=wall-panel
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 # Bus mode only. In `trigger` and `panel` there is no speaker_tap and no merged
 # bus, so there is nothing to cancel against and nothing for mic_clean to feed.
 ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'

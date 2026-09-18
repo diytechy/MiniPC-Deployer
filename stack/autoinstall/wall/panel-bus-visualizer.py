@@ -68,6 +68,21 @@ import pcm_frame                                                   # noqa: E402
 from visualizer import VisualizerTelemetry                         # noqa: E402
 
 MODE_FILE = "/etc/wall-panel/audio-mode"
+# The applier's own record of where the switch is. READ, never written, and read
+# for exactly one reason (terra, review round 1, finding 1, accepted in part):
+# Mute means ProjectM is not the visible fullscreen owner, so it means the PCM
+# permission does not hold. The consumer closes the socket on Mute of its own
+# accord -- the connection IS the lease -- and this is the backstop that does
+# not depend on the consumer being correct. It gates the raw stream ONLY; the
+# derived telemetry keeps reporting what the bus is carrying, because that is
+# true regardless of where the switch sends it, and the broker is what ANDs the
+# switch into the activity claim the shell gates on.
+STATE_FILE = "/etc/wall-panel/audio-state.json"
+# The two positions that send the bus somewhere audible. Duplicated from the
+# applier, like switch_backend's copy and for the same reason: that module lives
+# in a tree this sandbox does not import.
+AUDIBLE_OUTPUTS = ("headset", "speaker")
+DEFAULT_OUTPUT = "speaker"
 RUNTIME_DIR = "/run/wall-bus-visualizer"
 TELEMETRY_FILE = RUNTIME_DIR + "/bus-telemetry.json"
 SOCKET_FILE = RUNTIME_DIR + "/pcm.sock"
@@ -104,6 +119,33 @@ def current_mode(path=MODE_FILE):
             return handle.read().strip() or "trigger"
     except OSError:
         return "trigger"
+
+
+def output_is_audible(path=STATE_FILE):
+    """Whether the CONFIRMED switch position sends the bus anywhere audible.
+
+    An unreadable or absent state file answers True, and that asymmetry is
+    deliberate: this is a BACKSTOP behind the consumer's own gate, not the gate
+    itself, and a panel whose state file cannot be read is a panel where this
+    function knows nothing. Refusing PCM there would turn an unrelated file
+    problem into "ProjectM never works", which is a worse failure than the one
+    this guards. The broker's `_output_is_audible` makes the opposite choice for
+    the opposite reason: it owns the activity claim the shell gates on, and there
+    an unprovable claim must not be made.
+
+    Implements: SR-041, LLR-954.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.loads(handle.read(16384))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(raw, dict):
+        return True
+    output = raw.get("output")
+    if output not in ("mute",) + AUDIBLE_OUTPUTS:
+        output = DEFAULT_OUTPUT           # exactly the applier's own repair
+    return output in AUDIBLE_OUTPUTS
 
 
 def publish_document(document, path=TELEMETRY_FILE):
@@ -396,12 +438,40 @@ class BusCapture:
         return raw
 
     def close(self):
+        """End the capture child, bounded, and always reap it.
+
+        THE ORDER IS THE WHOLE FIX (terra, review round 1, finding 2). The first
+        version drained the child's stderr BEFORE terminating it, copying the
+        amplifier detector's pattern out of the one context where it is safe:
+        the detector only ever drains after its read loop has already broken, so
+        the child is gone and the pipe is at EOF. Here `close()` is also called
+        on service stop and on a mode change, with `arecord` running and quiet --
+        and `read(2048)` on a live, silent pipe blocks until it has 2048 bytes or
+        EOF, which is to say forever. systemd would have killed the control
+        group after its stop timeout on every single stop.
+
+        So: terminate first, which closes the pipe from the other end, THEN
+        drain what the child had already written, with the wait bounded and a
+        kill behind it. ALSA reports open failures on the child's stderr, so the
+        drain still has to happen -- discarding it would make a bad PCM
+        completely silent in the journal while the service reported itself
+        active.
+        """
         if self.process is None:
             return
         process, self.process = self.process, None
-        # ALSA reports open failures on the CHILD's stderr, so discarding it
-        # would make a bad PCM completely silent in the journal while the
-        # service still reported itself active.
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         try:
             if process.stderr is not None:
                 message = process.stderr.read(2048).decode("utf-8", "replace").strip()
@@ -414,15 +484,6 @@ class BusCapture:
                 if closer is not None:
                     closer.close()
             except OSError:
-                pass
-        try:
-            process.terminate()
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                process.kill()
-                process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
                 pass
 
 
@@ -458,10 +519,11 @@ class Service:
     """The loop that owns the capture, the document and the endpoint."""
 
     def __init__(self, *, telemetry_path=TELEMETRY_FILE, socket_path=SOCKET_FILE,
-                 mode_path=MODE_FILE, allowed_uids=(), group=None,
-                 capture=None, clock=time.monotonic):
+                 mode_path=MODE_FILE, state_path=STATE_FILE, allowed_uids=(),
+                 group=None, capture=None, clock=time.monotonic):
         self.telemetry_path = telemetry_path
         self.mode_path = mode_path
+        self.state_path = state_path
         self.clock = clock
         self.capture = capture if capture is not None else BusCapture()
         self.centres = bus_source.band_centres()
@@ -474,6 +536,9 @@ class Service:
         self.sequence = 0
         self.pending = b""
         self.published_state = None
+        # Refreshed on the publish beat; True until the first check, so a panel
+        # that has not published yet is not silently refusing PCM.
+        self.audible = True
 
     def stop(self, *_):
         self.stopping.set()
@@ -492,6 +557,16 @@ class Service:
         try:
             while not self.stopping.is_set():
                 if current_mode(self.mode_path) != "bus":
+                    # THE CAPTURE IS RELEASED BEFORE THE WAIT, NOT AFTER IT
+                    # (terra, review round 1, finding 2). `_pump` returns here
+                    # when the mode changes underneath a running capture, and
+                    # the first version then sat in this branch holding the
+                    # `bus_monitor` dsnoop reader open for as long as the panel
+                    # stayed out of bus mode -- contention beside the very legs
+                    # a mode switch is trying to rearrange. `close()` is
+                    # idempotent, so the ordinary "never started" pass through
+                    # here costs nothing.
+                    self.capture.close()
                     self._go_unavailable("this panel is not in bus mode")
                     self.stopping.wait(2.0)
                     continue
@@ -502,6 +577,7 @@ class Service:
                     continue
                 backoff = 1.0
                 self._pump()
+                self.capture.close()
                 self._go_unavailable("the capture ended")
         finally:
             self.capture.close()
@@ -528,6 +604,13 @@ class Service:
             if now - last_publish < PUBLISH_INTERVAL:
                 continue
             last_publish = now
+            # CHECKED ON THE PUBLISH BEAT, NOT PER BLOCK. Five times a second is
+            # forty times faster than anybody can move the switch, and a stat
+            # plus a small read on every one of the forty-seven blocks a second
+            # would be real cost for no extra truth.
+            self.audible = output_is_audible(self.state_path)
+            if not self.audible:
+                self.server.drop_all("the output switch is on Mute")
             self._publish_window(now)
 
     def _serve_pcm(self, block):
@@ -540,6 +623,11 @@ class Service:
         asked for.
         """
         if self.server.attached == 0:
+            return
+        if not self.audible:
+            # Belt and braces on the beat between publishes: a switch that moved
+            # to Mute has already dropped the streams above, and this keeps the
+            # blocks in between from being encoded at all.
             return
         self.sequence = (self.sequence + 1) % pcm_frame.SEQUENCE_MODULUS
         try:
@@ -588,6 +676,7 @@ class Service:
         self.telemetry.reset()
         self.server.drop_all(reason)
         self.pending = b""
+        self.audible = True
         document = bus_source.build_document(
             None, state=bus_source.STATE_UNAVAILABLE,
             generation=self.capture.generation,
@@ -607,6 +696,9 @@ def build_parser():
                         help="the local PCM endpoint")
     parser.add_argument("--mode-file", default=MODE_FILE,
                         help="the file naming the active ALSA mode")
+    parser.add_argument("--state-file", default=STATE_FILE,
+                        help="the applier's switch state, read to stop the PCM "
+                             "stream on Mute")
     parser.add_argument("--allow-user", action="append", default=[],
                         help="a user permitted to open the PCM endpoint "
                              "(repeatable; the default is `panel`)")
@@ -634,7 +726,7 @@ def main(argv=None):
         return 0
     os.makedirs(os.path.dirname(args.telemetry), exist_ok=True)
     service = Service(telemetry_path=args.telemetry, socket_path=args.socket,
-                      mode_path=args.mode_file,
+                      mode_path=args.mode_file, state_path=args.state_file,
                       allowed_uids=resolve_uids(names),
                       group=resolve_gid(args.socket_group))
     for name in (signal.SIGTERM, signal.SIGINT):

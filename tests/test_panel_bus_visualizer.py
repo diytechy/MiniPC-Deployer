@@ -452,6 +452,86 @@ def test_a_telemetry_write_failure_is_survivable_sr041(service, tmp_path):
                                    str(tmp_path / "missing" / "x.json")) is False
 
 
+def test_closing_a_live_quiet_capture_is_bounded_sr041(tmp_path):
+    """terra round 1, finding 2. A REAL child with open, silent pipes.
+
+    The first version drained the child's stderr BEFORE terminating it, which is
+    safe only in the amplifier detector's context -- there the read loop has
+    already broken, so the pipe is at EOF. Here `close()` also runs on service
+    stop and on a mode change, with the child alive and quiet, and `read(2048)`
+    on a live silent pipe blocks until it has 2048 bytes. systemd would have
+    killed the control group on every stop.
+
+    A fake capture cannot show this, which is exactly why the reviewer said the
+    existing tests would pass the defect: this one spawns a process that holds
+    both pipes open and writes nothing.
+    """
+    module = load_script("panel-bus-visualizer")
+    quiet = tmp_path / "quiet.py"
+    quiet.write_text("import sys, time\ntime.sleep(600)\n", encoding="utf-8")
+    capture = module.BusCapture(pcm="unused", arecord=sys.executable)
+    capture.process = __import__("subprocess").Popen(
+        [sys.executable, str(quiet)],
+        stdout=__import__("subprocess").PIPE, stderr=__import__("subprocess").PIPE)
+    started = __import__("time").monotonic()
+    capture.close()
+    assert __import__("time").monotonic() - started < 10
+    assert capture.process is None
+
+
+def test_a_mode_change_releases_the_capture_before_it_waits_sr041(service):
+    """terra round 1, finding 2, second half.
+
+    `_pump` returns when the mode changes underneath a running capture. The
+    first version then sat in the not-in-bus branch holding the `bus_monitor`
+    dsnoop reader open for as long as the panel stayed out of bus mode --
+    contention beside the very legs a mode switch is trying to rearrange.
+    """
+    instance = service["service"]
+    capture = service["capture"]
+    service["mode"].write_text("trigger\n", encoding="utf-8")
+    instance.stop()
+    assert instance.run() == 0
+    assert capture.closed >= 1
+
+
+def test_mute_drops_the_pcm_stream_at_the_producer_too_sr041(service, tmp_path):
+    """terra round 1, finding 1, accepted in part.
+
+    The consumer closes the socket when ProjectM yields -- the connection IS the
+    lease, and it is the only signal a producer can have, because visibility is
+    not observable from here. This is the BACKSTOP that does not depend on the
+    consumer being correct, and it is a ruling rather than an invention: Mute
+    yields Frame Media, so Mute means the PCM permission does not hold.
+
+    The DERIVED telemetry is deliberately unaffected -- what the bus is carrying
+    is true regardless of where the switch sends it.
+    """
+    module = service["module"]
+    state = tmp_path / "audio-state.json"
+    state.write_text(json.dumps({"version": 1, "output": "mute"}), encoding="utf-8")
+    assert module.output_is_audible(str(state)) is False
+    for output in ("speaker", "headset"):
+        state.write_text(json.dumps({"version": 1, "output": output}), encoding="utf-8")
+        assert module.output_is_audible(str(state)) is True, output
+    # A sparse file is repaired to Speaker exactly as the applier repairs it.
+    state.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    assert module.output_is_audible(str(state)) is True
+    # AND AN UNREADABLE ONE ANSWERS TRUE, which is the opposite of the broker's
+    # choice and is the right one here: this is a backstop, so refusing PCM
+    # because an unrelated file is damaged would turn a file problem into
+    # "ProjectM never works".
+    state.write_text("{not json", encoding="utf-8")
+    assert module.output_is_audible(str(state)) is True
+    assert module.output_is_audible(str(tmp_path / "absent.json")) is True
+
+    instance = service["service"]
+    instance.server = StubServer(attached=1)
+    instance.audible = False
+    instance._serve_pcm(block_of(bus_source.BUS_PERIOD_FRAMES))
+    assert instance.server.sent == []
+
+
 def test_the_health_probe_opens_no_device_and_writes_no_file_sr041(service, tmp_path):
     """`--check` is the probe the release manifest names.
 

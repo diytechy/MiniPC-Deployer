@@ -59,3 +59,10 @@ vmtest/*.iso
 # reason stack/remote-ui/icedrive.pin stores a hash instead of the file.
 vmtest/.cache/
 
+
+# Test scratch and agent worktrees. Untracked-but-not-ignored is how a
+# `git add -A` swept 46 pytest fixture files and four embedded git repos into a
+# source commit on 2026-09-17; ignoring them makes that impossible rather than
+# merely careless.
+.pytest-review/
+build/

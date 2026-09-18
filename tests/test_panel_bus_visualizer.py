@@ -595,6 +595,34 @@ def test_the_unit_takes_the_audio_group_by_supplementary_grant_sr041():
     assert "RestrictPRIVATE" not in unit
 
 
+def test_the_unit_is_not_torn_down_by_an_absent_adapter():
+    """Owner, 2026-09-18: an unplugged adapter must not stop the visualizer.
+
+    This daemon captures `bus_monitor`, a dsnoop on the LOOPBACK card, and never
+    opens the adapter -- verified on the panel, where its `arecord` child holds
+    /dev/snd/pcmC2D1c (card 2) and nothing on card 1. It had nevertheless
+    inherited `BindsTo=` from the units that DO hold adapter handles, so a loose
+    USB hub took the wall's visualizers down with the amplifier relay and read as
+    a regression in unrelated work.
+
+    The want STAYS: 90-wall-audio-adapter.rules must still be able to start it
+    when the adapter returns. Only the teardown goes. Asserting both halves is
+    the point -- dropping the dependency entirely would pass a naive "no BindsTo"
+    check while losing the recovery.
+    """
+    # DIRECTIVES ONLY. The unit's own comment explains at length what the
+    # `BindsTo=` was and why it went, so a whole-text search would match the
+    # explanation and fail -- the same reason the udev tests strip `#` lines.
+    unit = "\n".join(line for line in read(WALL / "wall-bus-visualizer.service").splitlines()
+                     if not line.lstrip().startswith("#"))
+    assert "BindsTo=dev-wall_audio_adapter.device" not in unit
+    assert "Wants=dev-wall_audio_adapter.device" in unit
+    assert "After=dev-wall_audio_adapter.device" in unit
+    # It must still reach multi-user.target on its own, or a boot with no
+    # adapter present would leave the wall with no visualizer at all.
+    assert "WantedBy=multi-user.target" in unit
+
+
 def test_the_unit_runs_only_in_bus_mode_sr041():
     unit = read(WALL / "wall-bus-visualizer.service")
     assert "ExecCondition=" in unit and "audio-mode" in unit and "= bus ]" in unit

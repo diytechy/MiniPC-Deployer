@@ -42,6 +42,12 @@
 # until the next mode switch or reboot. Its own ExecCondition still keeps it out
 # of the modes that have no such PCM (SR-041, LLR-957).
 #
+# SINCE 2026-09-18 THIS WANT IS THE ONLY COUPLING THAT UNIT HAS to the adapter:
+# its `BindsTo=` became a `Wants=`, because it captures `bus_monitor` on the
+# LOOPBACK card and never opens the adapter at all. So the line below still
+# recovers it after a hub move, and losing the adapter no longer STOPS it. The
+# reasoning, and the measurement behind it, is in wall-bus-visualizer.service.
+#
 # and the device unit was not tracked at all. udev re-evaluates every rule on
 # every event and a property not set by THIS event does not exist, so the tag,
 # the alias and the wants are all set on everything except remove.

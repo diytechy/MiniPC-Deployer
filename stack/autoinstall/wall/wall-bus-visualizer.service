@@ -30,7 +30,36 @@ Description=Wall panel: the merged audio bus as a bounded visualizer source
 Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=sound.target
 Wants=sound.target
-BindsTo=dev-wall_audio_adapter.device
+# NOT BindsTo, AND THE DIFFERENCE IS THE WHOLE POINT (Owner, 2026-09-18).
+#
+# This unit inherited `BindsTo=dev-wall_audio_adapter.device` from the two units
+# that genuinely hold adapter handles -- `wall-line-in` and the speaker leg --
+# where item 25's stale-handle fix requires that a re-enumeration tear them
+# down. THIS DAEMON NEVER OPENS THE ADAPTER. Measured on the panel rather than
+# assumed: its `arecord -D bus_monitor` child holds `/dev/snd/pcmC2D1c`, which is
+# card 2, the LOOPBACK card. `bus_monitor` is a dsnoop whose slave is the
+# loopback capture, exactly as asound-bus-mode.conf says when it puts the bus
+# volume control there -- "which is always present, so the control survives a leg
+# being stopped and an adapter being unplugged."
+#
+# So the binding was strictly stronger than the data path, and it cost the Owner
+# a morning: on 2026-09-18 the adapter's USB hub came loose and this unit was
+# refused with `Dependency failed`, taking the visualizers down alongside the
+# amplifier relay and reading as a software regression in the ProjectM work that
+# had landed in between. The relay really does need that hub -- it is the LCUS-2
+# on /dev/ttyUSB0 -- but the visualizer only ever needed the loopback.
+#
+# `Wants=` keeps the recovery half that DOES apply: the SYSTEMD_WANTS in
+# 90-wall-audio-adapter.rules still starts this unit when the adapter arrives,
+# and starting an already-running unit is a no-op. What is gone is the teardown.
+# Losing the adapter now leaves the bus measured and the wall drawing, with only
+# the audible leg missing -- which is the Owner's stated intent.
+#
+# NOT CHANGED, deliberately: an explicit Mute still suppresses the visualizer.
+# That AND lives in switch_backend.py `_output_is_audible()` and is a separate
+# ruling, re-confirmed on 2026-09-18. This unit's business is whether the
+# PRODUCER may run, never whether the room is hearing it.
+Wants=dev-wall_audio_adapter.device
 After=dev-wall_audio_adapter.device
 # A re-enumeration can restart this while ALSA is still settling, so a couple of
 # exits in quick succession are recovery, not a crash loop. [Unit] keys, not

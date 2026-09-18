@@ -104,8 +104,9 @@ AEC_STATUS_PATH = Path("/run/wall-panel/aec-status.json")
 # several times per second; 1500 ms tolerates ordinary scheduling jitter while
 # expiring a producer that has missed multiple consecutive publications.
 BUS_STALE_MS = 1500
-# wall-audio-aec publishes the button meter at 4 Hz. Six missed publications
-# are enough to stop claiming that a frozen post-filter level is live.
+# wall-audio-aec publishes the button meter at 10 Hz. The 1.5-second threshold
+# tolerates a short scheduler stall but still stops claiming a frozen level is
+# live after multiple consecutive missed publications.
 AEC_STALE_MS = 1500
 TELEMETRY_BANDS = 8
 # The exact contract of the document above. `schema` 2 is not cosmetic: a
@@ -169,7 +170,7 @@ class SwitchApplierBackend:
     # nor talk to systemd. `status` reads the applier's state file and
     # `telemetry` reads the visualizer and canceller documents out of /run.
     # None of them can hang on hardware, and the renderer polls `telemetry` at
-    # 4 Hz whenever the display is lit: isolating it cost 64% of one core in
+    # 10 Hz whenever the display is lit: isolating it cost 64% of one core in
     # interpreter startups alone.
     #
     # `request_landed` is deliberately NOT here. It also only reads the state

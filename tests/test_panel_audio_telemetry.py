@@ -78,8 +78,8 @@ def test_aec_publication_cadence_keeps_the_button_meter_fresh_sr028():
     match = re.search(r"^#define STATUS_INTERVAL_MS (\d+)$", source, re.M)
     assert match, "wall-audio-aec has no literal status publication cadence"
     interval_ms = int(match.group(1))
-    assert interval_ms == 250
-    assert interval_ms * 6 == switch_backend.AEC_STALE_MS
+    assert interval_ms == 100
+    assert interval_ms * 10 <= switch_backend.AEC_STALE_MS
 
 
 @pytest.fixture

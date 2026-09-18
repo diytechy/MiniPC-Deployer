@@ -101,11 +101,11 @@
 #define DEFAULT_MIC "hw:PCH,0"
 #define DEFAULT_TAP "speaker_tap"
 #define DEFAULT_OUT "card_loop_mic_play"
-/* The panel polls the broker four times a second and expires a microphone
- * observation after 1.5 seconds. Publish at the same 4 Hz cadence so a live
- * post-AEC level remains visibly continuous instead of appearing for only the
- * first 1.5 seconds of each old ten-second status period. `/run` is tmpfs. */
-#define STATUS_INTERVAL_MS 250
+/* The panel polls the broker at 10 Hz and expires a microphone observation
+ * after 1.5 seconds. Publish at the same cadence. The writer is off the audio
+ * thread and `/run` is tmpfs, so this does not trade audio scheduling for UI
+ * responsiveness. */
+#define STATUS_INTERVAL_MS 100
 /* At least four blocks, so a ratio change can never starve the reference ring
  * mid-block (spike 6.5, block accounting). */
 #define REF_RING_BLOCKS 8
@@ -699,7 +699,7 @@ static int live(aec_engine *engine, const char *mic_name, const char *tap_name,
             bool was_muted = input_muted;
             input_muted = read_input_muted(mute_name);
             /* A MUTE TRANSITION IS PUBLISHED AT ONCE rather than waiting for
-             * the next 250 ms status tick. The renderer's disc
+             * the next periodic status tick. The renderer's disc
              * is already gated on the applier's switch state, so nothing draws
              * a live disc over a muted microphone either way -- but leaving the
              * published block saying `live` after the mic

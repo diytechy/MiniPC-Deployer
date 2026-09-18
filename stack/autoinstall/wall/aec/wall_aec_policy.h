@@ -110,9 +110,10 @@
 #define AEC_LEVEL_FLOOR_DBFS -60.0
 #define AEC_LEVEL_REFERENCE_DBFS -18.0
 /* Bounded smoothing and update rate, so the wall cannot be made to flicker at
- * block rate by a noisy room. */
-#define AEC_LEVEL_TIME_CONSTANT_MS 150.0
-#define AEC_LEVEL_UPDATE_INTERVAL_MS 100
+ * block rate by a noisy room. 50 ms samples with a 75 ms time constant keep
+ * the indication legible while removing the old half-second-feeling lag. */
+#define AEC_LEVEL_TIME_CONSTANT_MS 75.0
+#define AEC_LEVEL_UPDATE_INTERVAL_MS 50
 
 /* ── types ───────────────────────────────────────────────────────────────── */
 

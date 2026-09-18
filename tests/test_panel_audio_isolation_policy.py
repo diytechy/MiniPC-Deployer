@@ -10,7 +10,7 @@ Measured on the wall panel 2026-09-17: `wall-audio-router` held 64% of one core
 `execve` of `/usr/bin/python3 --multiprocessing-fork` in eight seconds, with
 4201 `openat` and 2334 `mmap` behind them, all module imports. The cause was the
 renderer polling `telemetry` at 4 Hz whenever the display is lit
-(`setInterval(pollAudioTelemetry, 250)`), each poll starting an interpreter to
+(`setInterval(pollAudioTelemetry, 250)` at the time), each poll starting an interpreter to
 read two JSON files out of /run.
 
 The shipped backend CANNOT hang on hardware. Its own module docstring says so:

@@ -1300,11 +1300,18 @@ done
 # is a different release lane and goes stale on its own schedule. They come from
 # the panel-audio tree because that is the one home each of them has -- the
 # broker reads the same `visualizer.py` from /opt, so a fix reaches both.
-for _f in bus_source.py pcm_frame.py visualizer.py; do
-    if [ -r "$PAYLOAD/../../panel-audio/$_f" ]; then
-        install -m 0644 "$PAYLOAD/../../panel-audio/$_f" "/usr/local/lib/wall-panel/$_f"
+# A LOOP VARIABLE OF ITS OWN, and that is not cosmetic: the payload-coverage
+# test in tests/test_panel_audio.py resolves every payload-relative reference by
+# collecting the words a variable is ever assigned ANYWHERE in this file. Reusing
+# `_f` here made it cross-multiply the two lists -- so it demanded
+# `stack/panel-audio/panel-amp-trigger.py` and `stack/autoinstall/wall/pcm_frame.py`,
+# neither of which exists, and the real coverage it was written to prove was lost
+# in the noise.
+for _pa in bus_source.py pcm_frame.py visualizer.py; do
+    if [ -r "$PAYLOAD/../../panel-audio/$_pa" ]; then
+        install -m 0644 "$PAYLOAD/../../panel-audio/$_pa" "/usr/local/lib/wall-panel/$_pa"
     else
-        warn "audio: $_f is not on the payload — the merged-bus visualizer will not start."
+        warn "audio: $_pa is not on the payload — the merged-bus visualizer will not start."
     fi
 done
 

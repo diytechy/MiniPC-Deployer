@@ -11,19 +11,104 @@ import subprocess
 import sys
 
 
-# The longest accepted request is b"down:100\n" / b"snap:100\n". Read one byte
-# more than that so an over-long request is SEEN to be over-long and refused,
-# rather than being silently truncated into a valid prefix.
-MAX_REQUEST = len(b"down:100\n")
+# The longest accepted request is the guarded absolute form,
+# b"set:100:trigger:speaker:100:9007199254740991\n". Read one byte more than
+# that so an over-long request is SEEN to be over-long and refused, rather
+# than being silently truncated into a valid prefix.
+MAX_REQUEST = len(b"set:100:trigger:speaker:100:9007199254740991\n")
+# The relative forms, which are all this socket carried before the guarded
+# target. They keep their own, tighter bound: widening MAX_REQUEST for the
+# guarded form must not quietly let `down:<sixteen digits>` through the older
+# parse as well.
+MAX_RELATIVE_REQUEST = len(b"down:100\n")
+GUARDED_MODES = (b"trigger", b"panel", b"bus")
+GUARDED_OUTPUTS = (b"mute", b"headset", b"speaker")
+MAX_STATE_REVISION = 9007199254740991
+# Every reason the applier may answer a guarded target with. The reply is
+# rebuilt from this tuple rather than forwarded, so no byte of the applier's
+# stdout reaches the client unexamined either.
+REFUSAL_REASONS = (b"state-changed", b"apply-failed", b"unavailable",
+                   b"ambiguous")
+AMBIGUOUS = b"refused:ambiguous\n"
 
 
-def handle_request(data, apply):
+def _digits(field, limit):
+    """int(field) if it is plain ASCII digits within 0..limit, else None.
+
+    bytes.isdigit() is ASCII-only, unlike str.isdigit(), so a unicode digit
+    cannot get in. Leading "+"/"-" and whitespace are refused with it.
+    """
+    if not field or not field.isdigit():
+        return None
+    value = int(field)
+    return value if value <= limit else None
+
+
+def parse_guarded(data):
+    """The guarded absolute form as a rebuilt argv string, or None.
+
+    b"set:TARGET:MODE:OUTPUT:EXPECT:REVISION\n" -> "set:75:bus:speaker:70:42"
+
+    Every field is matched against a literal set or parsed as a bounded
+    integer, and the value handed to the applier is REBUILT from the parsed
+    parts. That is the same rule the relative forms have always followed, and
+    it is the whole reason this process exists: it holds the applier's
+    privileges and accepts no path, device, unit or command.
+    """
+    fields = data[:-1].split(b":")
+    if len(fields) != 6 or fields[0] != b"set":
+        return None
+    _, target, mode, output, expected, revision = fields
+    if mode not in GUARDED_MODES or output not in GUARDED_OUTPUTS:
+        return None
+    target = _digits(target, 100)
+    expected = _digits(expected, 100)
+    revision = _digits(revision, MAX_STATE_REVISION)
+    if target is None or expected is None or revision is None:
+        return None
+    return "set:%d:%s:%s:%d:%d" % (target, mode.decode("ascii"),
+                                   output.decode("ascii"), expected, revision)
+
+
+def guarded_reply(text):
+    """The applier's stdout, re-validated and rebuilt, or the ambiguous answer.
+
+    A LOST OR UNREADABLE VERDICT IS `ambiguous`, NOT A FAILURE, and the
+    difference is the point: `apply-failed` tells the actor the level did not
+    move, while `ambiguous` tells it that it does not know -- so it re-reads
+    the confirmed state instead of replaying arithmetic that may already have
+    landed. Guessing either way here is how a rocker applies one movement
+    twice.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return AMBIGUOUS
+    parts = lines[-1].encode("ascii", "replace").split(b":")
+    if len(parts) == 2 and parts[0] == b"refused" and parts[1] in REFUSAL_REASONS:
+        return b"refused:" + parts[1] + b"\n"
+    if len(parts) == 4 and parts[0] == b"ok" and parts[1] in GUARDED_OUTPUTS:
+        level = _digits(parts[2], 100)
+        revision = _digits(parts[3], MAX_STATE_REVISION)
+        if level is not None and revision is not None:
+            return b"ok:%s:%d:%d\n" % (parts[1], level, revision)
+    return AMBIGUOUS
+
+
+def handle_request(data, apply, capture=None):
     """Map exact direction bytes to a fixed applier invocation; return status.
 
     Inputs: bytes; apply(argv) returns an exit code. Unknown requests perform
     no action. Outputs: fixed ASCII success/error line. Implements: LLR-014.
 
-    Three spellings, and NOTHING ELSE reaches the applier:
+    Four spellings, and NOTHING ELSE reaches the applier:
+      b"set:T:MODE:OUT:EXPECT:REV\n"
+                                   ONE ABSOLUTE LEVEL, applied only while the
+                                   mode, output, level and state revision it
+                                   was computed on still hold. This is the
+                                   only form the rocker sends now; the three
+                                   below remain for `snap` and for a hand-run
+                                   test. Answered with `ok:OUT:LEVEL:REV` or
+                                   `refused:REASON`, never with `ok`.
       b"up\\n" / b"down\\n"          one press of the applier's default step
       b"up:PCT\\n" / b"down:PCT\\n"  one movement of PCT percent, PCT in 1..100
       b"snap:PCT\\n"                round the level to the nearest multiple of
@@ -45,6 +130,21 @@ def handle_request(data, apply):
         return b"ok\n" if apply(["volume", data[:-1].decode("ascii")]) == 0 else b"error\n"
     if not data.endswith(b"\n") or len(data) > MAX_REQUEST:
         return b"error\n"
+    # THE GUARDED FORM IS ANSWERED DIFFERENTLY, and it has to be: its whole
+    # purpose is to tell the caller what actually landed, so `ok\n` would
+    # throw away the three facts the rocker's actor rebases on. `capture` is
+    # the applier's stdout; a caller that does not supply one (every existing
+    # test of the relative forms) gets the ambiguous answer rather than a
+    # crash.
+    if data.startswith(b"set:"):
+        argument = parse_guarded(data)
+        if argument is None:
+            return b"error\n"
+        if capture is None:
+            return AMBIGUOUS
+        return guarded_reply(capture(["volume", argument]))
+    if len(data) > MAX_RELATIVE_REQUEST:
+        return b"error\n"
     direction, separator, size = data[:-1].partition(b":")
     if not separator or direction not in (b"up", b"down", b"snap"):
         return b"error\n"
@@ -56,14 +156,40 @@ def handle_request(data, apply):
     return b"ok\n" if apply(["volume", argument]) == 0 else b"error\n"
 
 
+APPLIER = "/usr/local/sbin/wall-audio-output"
+
+
 def apply_volume(args):
     """Run the fixed applier; failed applies are visible in journal and reply."""
     try:
-        return subprocess.run(["/usr/local/sbin/wall-audio-output", *args],
+        return subprocess.run([APPLIER, *args],
                               timeout=20, check=False, stdout=sys.stderr).returncode
     except (OSError, subprocess.SubprocessError) as exc:
         print("volume apply failed: %s" % exc, file=sys.stderr, flush=True)
         return 1
+
+
+def capture_volume(args):
+    """Run the fixed applier and return its stdout verdict line.
+
+    THE EXIT CODE IS DELIBERATELY NOT CONSULTED. The guarded form's whole
+    answer is the line it prints -- `refused:state-changed` is a successful
+    refusal and `ok:...` carries three facts a bare zero does not -- and
+    reading the code as well would give two sources of truth that can
+    disagree. An applier that died without printing anything prints nothing,
+    which `guarded_reply` reads as `ambiguous`: the one answer that is right
+    when we genuinely do not know.
+
+    Its stderr is left attached so the journal still gets the applier's own
+    lines; only stdout is captured.
+    """
+    try:
+        done = subprocess.run([APPLIER, *args], timeout=20, check=False,
+                              stdout=subprocess.PIPE, text=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("volume apply failed: %s" % exc, file=sys.stderr, flush=True)
+        return ""
+    return done.stdout or ""
 
 
 def read_request(connection):
@@ -124,14 +250,37 @@ def main():
             print("volume: connection closed without a request — nothing applied",
                   file=sys.stderr, flush=True)
             return 0
-        answer = handle_request(data, apply_volume)
+        answer = handle_request(data, apply_volume, capture_volume)
         try:
             connection.sendall(answer)
         except OSError as exc:
             print("volume verdict undeliverable (%s) — the client stopped waiting; "
                   "the apply itself decides this unit's result" % exc,
                   file=sys.stderr, flush=True)
-        return 0 if answer == b"ok\n" else 1
+        return 0 if _is_success(answer) else 1
+
+
+def _is_success(answer):
+    """Whether this reply should leave a green unit behind.
+
+    `Accept=yes` gives every connection its own unit instance, so whatever
+    this calls a failure becomes a RED LINE on the panel's failed list. The
+    guarded form makes that judgement finer than `== b"ok\n"`, and getting it
+    wrong in either direction is bad in a way the Owner sees:
+
+      * `ok:OUT:LEVEL:REV` is a SUCCESS. Reading the old equality literally
+        would have turned every successful rocker step into a failed unit.
+      * `refused:state-changed` and `refused:unavailable` are the PROTOCOL
+        WORKING. The Owner moved the switch mid-gesture, or the position has
+        no level; the applier declined to write a stale target, which is what
+        it is for. A red unit for that trains the list to be ignored.
+      * `refused:apply-failed` and `refused:ambiguous` are real trouble --
+        amixer or a unit did not do as it was told, or the verdict was lost --
+        and those still go red.
+    """
+    if answer == b"ok\n" or answer.startswith(b"ok:"):
+        return True
+    return answer in (b"refused:state-changed\n", b"refused:unavailable\n")
 
 
 if __name__ == "__main__":

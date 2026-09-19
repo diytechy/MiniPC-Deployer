@@ -28,6 +28,25 @@ Type=simple
 # nothing and persists nothing.
 DynamicUser=true
 SupplementaryGroups=input audio
+# THE PREVIEW DOCUMENT'S DIRECTORY, AND THE DEFECT IT REPAIRS. Measured on the
+# panel 2026-09-19: every press since WSN-063 shipped logged
+#
+#   volume gesture stamp: [Errno 13] Permission denied:
+#       '/run/wall-panel/volume-gesture.json'
+#
+# because /run/wall-panel is created by root units at 0755 and this unit is
+# DynamicUser with ProtectSystem=strict. The overlay-on-press path had
+# therefore never once run on the real panel, and the rocker responsiveness
+# plan's whole preview protocol would have inherited the same silence.
+#
+# It is deliberately NOT `RuntimeDirectory=wall-panel`: systemd chowns a
+# RuntimeDirectory to the unit's user on every start, which would hand a
+# dynamic uid the directory root writes the audio state into. This daemon gets
+# its own, at 0755 so the kiosk can read the document, and Preserve=yes so a
+# restart mid-gesture does not take the directory out from under a reader.
+RuntimeDirectory=wall-volume-gesture
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/panel-volume-keys.py
 Restart=always
 RestartSec=3

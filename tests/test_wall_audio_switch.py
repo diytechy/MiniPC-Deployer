@@ -607,10 +607,14 @@ def test_the_rocker_asks_the_switch_rather_than_a_card_in_bus_mode_ruling_f_sr02
     # import time, and this assertion is about what it DOES, not where it runs.
     keys = read(WALL / "panel-volume-keys.py")
     assert 'VOLUME_SOCKET = "/run/wall-volume-request.sock"' in keys
-    # Both carry a percent since 2026-09-15: one apply costs ~520 ms, so a ramp
-    # built from default-sized presses queues instead of keeping up.
-    assert "def nudge_bus(louder, percent):" in keys
-    assert 'if current_mode() == "bus":\n        nudge_bus(louder, percent)\n        return' in keys
+    # SINCE 2026-09-19 IT ASKS FOR AN ABSOLUTE TARGET, NOT A RELATIVE NUDGE,
+    # and the difference is the point of the guard: a relative `up:N` applies
+    # to whichever output is selected when it eventually runs, half a second
+    # later. The request now names the mode, output, level and state revision
+    # it was computed on, and the applier compare-and-sets against them.
+    assert 'payload = ("set:%d:%s:%s:%d:%d"' in keys
+    assert "def make_backend():" in keys
+    assert 'return BusBackend() if mode == "bus" else PhysicalBackend(mode)' in keys
     # The mute key is inert in bus mode until the switch has a previous-output
     # memory (step 5); a one-way mute from a key that cannot un-mute would
     # strand the panel silent for anyone not standing at it.

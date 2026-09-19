@@ -65,215 +65,217 @@ def test_rocker_keeps_dynamic_identity_and_only_unix_socket_sr028():
     assert "SocketMode=0660" in sock
 
 
-# ── the ramp: released means stopped (2026-09-15) ──────────────────────────
+# ── the pulse rule: one break pulse is 5% (2026-09-18, strategy B) ─────────
 #
-# WHAT THE HARDWARE ACTUALLY DOES, captured from the panel 2026-09-15: the
-# rocker (event5, the AT keyboard controller -- NOT Intel Virtual Buttons) sends
-# no autorepeat at all. It sends whole PRESS/RELEASE pairs 7-8 ms apart,
-# repeating every ~100 ms for as long as it is held. So a lone RELEASE proves
-# nothing, and a hold must be detected as a burst of presses.
+# WHAT THE HARDWARE ACTUALLY DOES, and the second capture is what changed the
+# design. 2026-09-15 established that the rocker (event5, the AT keyboard
+# controller -- NOT Intel Virtual Buttons) sends no autorepeat: whole
+# PRESS/RELEASE pairs 7-8 ms apart, repeating about every 100 ms while held.
+# 2026-09-18 went a layer lower, with a temporary kprobe on `serio_interrupt`
+# beneath `atkbd`, and found the same thing in the raw PS/2 stream: make E0 2E,
+# break E0 AE, next make ~106-107 ms later. It is the FIRMWARE repeating, not
+# an evdev or atkbd abstraction.
 #
-# The bug these pin: the daemon applied one volume change per press, inline,
-# while one apply costs ~520 ms. Presses arrived 5x faster than they could be
-# applied, the surplus queued, and release was not handled -- so a 3 s hold
-# drained for ~15 s and the level kept moving long after the Owner let go.
+# So there is no continuously held rocker to integrate time over -- there is a
+# train of discrete pulses, and the Owner's 2026-09-18 amendment makes each one
+# exactly 5%. The 500 ms / 25%-per-second ramp is WITHDRAWN, along with its
+# RampPlanner, its two separate charges and the quiet-gap snap that could move
+# the level with no pulse behind it.
+#
+# The bug all of this still has to keep fixed: the daemon once applied one
+# volume change per press, inline, while one apply costs ~520 ms. Presses
+# arrived 5x faster than they could be applied, the surplus queued, and a 3 s
+# hold drained for ~15 s with the level still moving long after the Owner let
+# go.
 
-REPEAT = 0.100   # the measured gap between repeats of a held rocker
-PAIR = 0.008     # the measured press -> release gap within one pair
+REPEAT = 0.106   # the 2026-09-18 measured gap between firmware pulses
+PAIR = 0.008     # the measured make -> break gap within one pulse
 
 
 def planner(**kw):
     keys = module("volume_keys", "panel-volume-keys.py")
-    return keys.RampPlanner(**kw), keys
+    return keys.PulsePlanner(**kw), keys
 
 
-def hold(plan, louder, seconds, start=0.0):
-    """Replay a real hold: pairs every ~100 ms. Returns (tap, steps, released)."""
-    tap = 0
+def hold(plan, louder, pulses, start=0.0):
+    """Replay a real hold: make/break pulses every ~106 ms.
+
+    Returns (steps, last_break) -- the signed percents the planner handed out,
+    in order, and the instant of the final break.
+    """
     steps = []
-    # Counted, not accumulated: adding 0.1 repeatedly drifts and silently drops
-    # the last pair, which makes the ramp look 3% short.
-    pairs = int(round(seconds / REPEAT)) + 1
-    for index in range(pairs):
+    last = start
+    for index in range(pulses):
         now = start + index * REPEAT
-        tap += plan.press(louder, now)
-        plan.release(now + PAIR)
-        # The daemon wakes repeatedly between device events; sample like it does.
+        plan.press(now)
+        last = now + PAIR
+        step = plan.release(louder, last)
+        if step:
+            steps.append(step)
+        # The daemon wakes repeatedly between device events; sample like it
+        # does, and assert that the gap adds nothing while it is being held.
         for tick in range(1, 5):
             edge = now + PAIR + tick * 0.02
             if edge >= start + (index + 1) * REPEAT:
                 break
-            plan.settle(edge)
-            step = plan.due(edge)
-            if step:
-                steps.append(step)
-    # One more sample after the last release. The real daemon takes it: wait()
-    # returns ~40 ms while a burst is open, so it wakes and pays out the final
-    # sliver of ramp before the gap closes the burst.
-    released = start + (pairs - 1) * REPEAT + PAIR
-    plan.settle(released)
-    step = plan.due(released)
-    if step:
-        steps.append(step)
-    return tap, steps, released
+            assert plan.settle(edge) is False
+    return steps, last
 
 
-def test_a_tap_is_one_pair_and_bumps_five_percent():
-    """8.585 PRESS / 8.592 RELEASE / then silence -- the captured tap."""
+def test_one_pulse_is_five_percent_and_the_make_earns_nothing():
+    """8.585 make / 8.592 break / then silence -- the captured tap."""
     plan, keys = planner()
-    assert keys.TAP_PERCENT == 5
-    assert plan.press(True, 8.585) == 5
-    plan.release(8.592)
-    # Still "held" during the gap: a repeat could yet arrive.
-    plan.settle(8.700)
-    assert plan.held()
-    # Once the gap passes, the hold is over and nothing more is ever owed.
-    plan.settle(8.592 + keys.HOLD_GAP_S + 0.001)
-    assert not plan.held()
-    assert plan.due(60.0) is None
-    assert plan.wait(60.0) is None
+    assert keys.PULSE_PERCENT == 5
+    # The make OPENS the gesture and charges nothing: it is not a complete
+    # contact pulse yet, and charging it would double every tap.
+    assert plan.press(8.585) is True
+    assert plan.release(True, 8.592) == 5
+    # The gap that follows declares the gesture over and adds no step.
+    assert plan.settle(8.592 + keys.HOLD_GAP_S + 0.001) is True
+    assert plan.pulses == 1
 
 
-def test_a_repeat_inside_a_hold_is_not_another_tap():
-    """The 10 Hz repeats must not each charge 5% -- that is 50%/s and a queue."""
-    plan, _ = planner()
-    assert plan.press(True, 0.0) == 5
-    assert plan.press(True, REPEAT) == 0
-    assert plan.press(True, REPEAT * 2) == 0
-
-
-def test_a_held_rocker_is_not_chopped_into_taps():
-    """The whole point of the gap: 28 pairs are ONE hold, so one 5% tap."""
-    plan, _ = planner()
-    tap, _steps, _ = hold(plan, True, 2.8)
-    assert tap == 5
-
-
-def test_ramp_does_not_start_before_the_hold_threshold():
+def test_a_hold_is_one_gesture_and_every_pulse_is_a_step():
+    """A hold is NOT chopped into taps, and it is not one tap either."""
     plan, keys = planner()
-    assert keys.HOLD_THRESHOLD_S == 0.600
-    # 0.55 s, NOT 0.45. The probe must sit between the ramp's start and the
-    # threshold, or it cannot detect a ramp that started early -- which is
-    # exactly what moving it to 0.45 concealed on 2026-09-16 while leaving this
-    # test's name claiming otherwise.
-    tap, steps, _ = hold(plan, True, 0.55)
-    assert tap == 5
-    assert steps == []
+    steps, last = hold(plan, True, 10)
+    # Ten pulses, ten steps, one gesture: the ~106 ms repeats inside the hold
+    # do not re-open it, and none of them is skipped as "just a repeat".
+    assert steps == [5] * 10
+    assert plan.held() is True
+    assert plan.settle(last + keys.HOLD_GAP_S + 0.001) is True
+    assert plan.held() is False
 
 
-def test_ramp_holds_twenty_five_percent_per_second():
-    """A 2.6 s hold owes 5% for the tap plus 25%/s for the 2 s past 600 ms."""
-    plan, keys = planner()
-    assert keys.RAMP_PERCENT_PER_S == 25.0
-    tap, steps, _ = hold(plan, True, 2.6)
-    assert tap == 5
-    assert all(louder is True for louder, _ in steps)
-    assert sum(step for _, step in steps) == pytest.approx(50, abs=1)
+def test_a_press_across_the_repeat_delay_intentionally_moves_more_than_five():
+    """No tap classifier: two pulses is 10%, and that is the specification."""
+    plan, _keys = planner()
+    steps, _last = hold(plan, True, 2)
+    assert sum(steps) == 10
 
 
-def test_release_stops_the_ramp_then_and_not_a_gap_later():
-    """The guarantee: no percent is owed for time after the finger came up.
+def test_the_quiet_gap_adds_no_step_however_long_it_is():
+    """The gap is detection latency and MUST NOT be a volume knob.
 
-    The burst is only DECLARED over HOLD_GAP_S after the last event, but the
-    ramp must not keep accruing across that gap -- it accrues to the last
-    contact, so the extra 250 ms of detection latency costs no volume.
-    """
-    plan, _ = planner()
-    tap, steps, released = hold(plan, True, 2.0)
-    spent = sum(step for _, step in steps)
-    # Let a long time pass with no further events, sampling as the daemon does.
-    for edge in (released + 0.1, released + 0.3, released + 5.0, released + 60.0):
-        plan.settle(edge)
-        assert plan.due(edge) is None
-    assert sum(step for _, step in steps) == spent
-    assert tap == 5
-
-
-def test_a_slow_applier_makes_steps_bigger_not_more_numerous():
-    """The queue is gone: elapsed time becomes ONE larger step, never a pile."""
-    plan, _ = planner()
-    plan.press(True, 0.0)
-    # The finger stays down; only the SAMPLING is slow, as a ~520 ms apply forces.
-    plan.release(2.000)
-    first = plan.due(1.100)
-    second = plan.due(1.620)
-    # The TOTAL is unchanged at 25; only the SPLIT moved, from 12+13 to 10+15,
-    # because WSN-062 pays in whole 5% increments and carries the remainder.
-    # That is the carry working, and it is the only thing grid stepping is
-    # allowed to change here.
-    assert first == (True, 10)
-    assert second == (True, 15)
-    assert first[1] + second[1] == 25
-
-
-def test_a_reversal_starts_a_fresh_hold():
-    """Pressing the other way ends the burst and re-arms the threshold."""
-    plan, _ = planner()
-    plan.press(True, 0.0)
-    plan.release(2.000)
-    assert plan.due(1.000) == (True, 10)
-    assert plan.press(False, 1.000) == -5
-    assert plan.due(1.500) is None          # inside the new 600 ms threshold
-    plan.release(2.000)
-    # Ramping the other way now. Sampled a little past the boundary rather than
-    # exactly on it: `due` truncates to whole percent and float subtraction can
-    # land a hair under. Nothing is lost -- the remainder stays in the anchor.
-    assert plan.due(1.801) == (False, 5)
-
-
-def test_wait_blocks_when_idle_and_paces_the_ramp_when_held():
-    plan, keys = planner()
-    assert plan.wait(0.0) is None           # nothing held: block, zero CPU
-    plan.press(True, 0.0)
-    # Before the ramp starts it need only wake for whichever comes first: the
-    # threshold, or the gap that would end the burst.
-    assert plan.wait(0.0) == pytest.approx(min(0.600, keys.HOLD_GAP_S))
-    plan.release(1.000)
-    # 0.2 s, not 0.04: since WSN-062 the applier is woken once per 5% INCREMENT
-    # (5/25) rather than once per whole percent (1/25). Fewer, larger applies.
-    assert plan.wait(1.000) == pytest.approx(0.2)
-
-
-def test_step_is_clamped_into_the_protocol_range():
-    """A very long hold cannot emit a step the broker would refuse."""
-    plan, _ = planner()
-    plan.press(True, 0.0)
-    plan.release(3600.0)
-    louder, step = plan.due(3600.0)
-    assert (louder, step) == (True, 100)
-
-
-def test_the_arrears_survive_the_gap_that_closes_the_hold():
-    """Ramp earned but not yet paid must not be dropped when the burst closes.
-
-    Each apply blocks ~520 ms, so when the gap expires there is normally still a
-    step outstanding. Measured on the panel before this was fixed: a 1.0 s hold
-    moved 10% where 15% was owed.
+    This is the property that let the 250 ms gap be kept without measuring a
+    tighter one: whatever it costs, it costs it in latency only.
     """
     plan, keys = planner()
-    plan.press(True, 0.0)
-    plan.release(1.0)
-    # One increment paid early in the hold, leaving arrears behind. Sampled at
-    # 0.9 rather than 0.7: under WSN-062 nothing is owed until a whole 5% has
-    # accrued, and at 0.7 only 2.5% has.
-    assert plan.due(0.9) == (True, 5)
-    # The gap expires while those arrears are still unpaid: stay open.
-    plan.settle(1.0 + keys.HOLD_GAP_S + 0.01)
-    assert plan.held()
-    assert plan.due(1.0 + keys.HOLD_GAP_S + 0.01) == (True, 5)
-    # Paid in full (5% tap + 10% ramp for 0.4 s past the threshold), so now close.
-    plan.settle(1.0 + keys.HOLD_GAP_S + 0.02)
-    assert not plan.held()
-    assert plan.due(60.0) is None
+    short, _ = hold(plan, True, 3)
+    plan.settle(3 * REPEAT + keys.HOLD_GAP_S + 0.001)
+    slow = keys.PulsePlanner(gap=2.0)
+    for index in range(3):
+        slow.press(index * REPEAT)
+        slow.release(True, index * REPEAT + PAIR)
+    slow.settle(3 * REPEAT + 2.0 + 0.001)
+    assert sum(short) == sum([5, 5, 5])
+    assert slow.pulses == 3
 
 
-def test_a_vanished_device_cancels_the_hold_outright():
-    plan, _ = planner()
-    plan.press(True, 0.0)
+def test_a_direction_reversal_stays_inside_one_gesture():
+    """One gesture, pulses in event order -- not two racing apply queues."""
+    plan, _keys = planner()
+    assert plan.press(0.0) is True
+    assert plan.release(True, 0.008) == 5
+    plan.press(REPEAT)
+    # The Owner corrected themselves inside the quiet interval. That is the
+    # SAME gesture with a pulse going the other way; a second gesture here
+    # would capture a second baseline and open a second apply queue.
+    assert plan.press(REPEAT) is False
+    assert plan.release(False, REPEAT + PAIR) == -5
+    assert plan.held() is True
+
+
+def test_a_break_with_no_gesture_open_earns_nothing():
+    """The rocker already down when the daemon starts must not be a free step."""
+    plan, _keys = planner()
+    assert plan.release(True, 1.0) == 0
+    assert plan.held() is False
+
+
+def test_a_vanished_device_cancels_the_gesture_outright():
+    plan, _keys = planner()
+    plan.press(0.0)
+    plan.release(True, 0.008)
     plan.cancel()
-    assert not plan.held()
-    assert plan.due(10.0) is None
+    assert plan.held() is False
+    # And the cancelled gesture cannot then be settled a second time, which
+    # would publish a terminal for a gesture already retired as cancelled.
+    assert plan.settle(100.0) is False
 
+
+def test_wait_blocks_when_idle_and_wakes_on_the_plan_cadence_when_held():
+    plan, keys = planner()
+    assert plan.wait(0.0) is None            # nothing held: block, zero CPU
+    plan.press(0.0)
+    plan.release(True, 0.008)
+    # 40-80 ms is what the plan asks for, and no faster: new evidence only
+    # arrives on a firmware pulse ~106 ms apart, so a tighter loop would
+    # republish the same number and nothing else.
+    assert 0.040 <= keys.LOOP_WAKE_S <= 0.080
+    assert plan.wait(0.010) == pytest.approx(keys.LOOP_WAKE_S)
+    # Close to the gap expiry it wakes exactly then rather than overshooting.
+    edge = 0.008 + keys.HOLD_GAP_S
+    assert plan.wait(edge - 0.010) == pytest.approx(0.010)
+    assert plan.wait(edge + 1.0) == 0.0
+
+
+# ── the absolute virtual target, and the boundary that proves it ───────────
+
+@pytest.mark.parametrize("start,pulses,expected", [
+    (60, [5], 65),
+    (60, [5] * 10, 100),          # clamped, and stays clamped
+    (5, [-5] * 3, 0),
+    (98, [5, -5], 95),            # the plan's boundary case, verbatim
+    (0, [-5, 5], 5),
+])
+def test_the_virtual_target_applies_pulses_in_order_with_a_clamp(start, pulses, expected):
+    """A SIGNED ACCUMULATOR IS WRONG AT A BOUNDARY, which is why this exists.
+
+    From 98, an up pulse predicts 100 and the following down must target 95.
+    Netting +5 and -5 to zero would leave 98; netting them to "no movement"
+    would leave 100. Both are levels the Owner did not ask for.
+    """
+    _plan, keys = planner()
+    target = keys.VirtualTarget(start)
+    for pulse in pulses:
+        target.step(pulse)
+    assert target.level == expected
+
+
+@pytest.mark.parametrize("louder,expected", [(True, 65), (False, 60)])
+def test_the_first_pulse_repairs_an_off_grid_level_directionally(louder, expected):
+    """WSN-062, and the reason the quiet-gap snap could be deleted.
+
+    62 with an up pulse lands on 65, not 67. The grid is reached by a pulse the
+    Owner actually sent, travelling the way they pressed -- not by a rounding
+    applied after the finger is already off.
+    """
+    _plan, keys = planner()
+    target = keys.VirtualTarget(62)
+    assert target.step(5 if louder else -5) == expected
+
+
+def test_the_rocker_path_no_longer_snaps_at_all():
+    """Source check: the withdrawn ramp, its threshold and its snap are GONE.
+
+    A quiet-gap snap moves the level with no break pulse behind it, which the
+    2026-09-18 pulse rule forbids outright -- "every percent this emits is a
+    percent the Owner pressed for". The `snap` REQUEST survives in the policy
+    and the broker for a damaged pre-existing mixer value; the rocker simply
+    never sends one.
+    """
+    keys = (WALL / "panel-volume-keys.py").read_text()
+    # The CODE is gone, not the history: the comments still explain what the
+    # ramp was and why the kprobe capture retired it, and deleting that would
+    # cost the next reader the whole reason this file looks the way it does.
+    assert "class RampPlanner" not in keys
+    assert "RAMP_PERCENT_PER_S =" not in keys
+    assert "HOLD_THRESHOLD_S =" not in keys
+    assert "SNAP_PERCENT =" not in keys
+    assert "snap(" not in keys
+    assert "def snap" not in keys
+    assert 'b"snap:' not in keys
 
 # ── the broker's magnitude form ────────────────────────────────────────────
 
@@ -347,16 +349,21 @@ def test_a_stepped_nudge_still_moves_the_readout_sequence():
         assert state["volume_event_seq"] == seq
 
 
-# ── landing on a round number (Owner, 2026-09-15) ──────────────────────────
+# ── landing on a round number ──────────────────────────────────────────────
 #
-# "I'd like the volume to land at / round to 5% increments after a release."
-# ONE snap per gesture, at the end -- the ramp itself is never quantised.
+# "I'd like the volume to land at / round to 5% increments after a release"
+# (Owner, 2026-09-15). Under the 2026-09-18 pulse rule the rocker gets this by
+# CONSTRUCTION -- every movement is a whole 5% step and the first one repairs
+# an off-grid value directionally -- so the rocker sends no snap at all. The
+# `snap` request survives in the policy and the broker for a damaged
+# pre-existing physical mixer value, and these tests still hold it to its
+# contract.
 
-def test_release_closes_the_burst_exactly_once():
-    """settle() reports the closing pass, so the level is snapped once only."""
+def test_the_gesture_closes_exactly_once():
+    """settle() reports the one closing pass, so a terminal is published once."""
     plan, keys = planner()
-    plan.press(True, 0.0)
-    plan.release(0.008)
+    plan.press(0.0)
+    plan.release(True, 0.008)
     assert plan.settle(0.1) is False                     # still inside the gap
     assert plan.settle(0.008 + keys.HOLD_GAP_S + 0.01) is True
     assert plan.settle(10.0) is False                    # and never again
@@ -417,30 +424,32 @@ def test_broker_refuses_malformed_snaps_sr028(command):
     apply.assert_not_called()
 
 
-def test_the_daemon_snaps_on_release_and_only_in_one_place():
-    """Source check: the snap is wired to the burst close, not to the ramp."""
-    keys = (WALL / "panel-volume-keys.py").read_text()
-    assert "SNAP_PERCENT = 5" in keys
-    assert "if planner.settle(time.monotonic()):" in keys
-    assert keys.count("snap(SNAP_PERCENT)") == 1
-
-
 # TC-P-490..492 / WSN-062: assert the published sequence, not merely its end.
 @pytest.mark.parametrize("louder,start", [(True, 20), (False, 100)])
-def test_tc_p_490_p491_three_second_hold_stays_on_grid_and_keeps_rate(louder, start):
+def test_tc_p_490_p491_a_three_second_hold_stays_on_grid_and_counts_its_pulses(louder, start):
+    """~28 pulses over 3 s, every level on the grid, and the count is the amount.
+
+    THE ASSERTION CHANGED WITH THE RULE, and the number it used to carry is
+    exactly why the rule changed. It used to demand 65% for a 3 s hold -- 5%
+    for the tap plus (3.0 - 0.600) x 25%/s -- a figure derived from a ramp
+    model the 2026-09-18 kprobe capture disproved. Under the pulse rule the
+    amount is not derived from a clock at all: it is 5% times however many
+    real firmware pulses arrived, which at the measured 9.3-10 Hz is about
+    140-150 percentage points over three seconds, i.e. the whole range and a
+    clamp. The pulse COUNT is authoritative, so that is what is asserted.
+    """
     plan, keys = planner()
-    tap, steps, _ = hold(plan, louder, 3.0)
+    pulses = int(round(3.0 / REPEAT))
+    steps, _last = hold(plan, louder, pulses)
+    assert len(steps) == pulses
+    assert all(abs(step) == keys.PULSE_PERCENT for step in steps)
+    target = keys.VirtualTarget(start)
     levels = [start]
-    levels.append(levels[-1] + tap)
-    for direction, step in steps:
-        levels.append(levels[-1] + (step if direction else -step))
-    assert all(level % keys.SNAP_PERCENT == 0 for level in levels)
-    # 65%, not 75%: the tap and the ramp are SEPARATE charges under the Owner's
-    # rocker specification, so a 3 s hold owes 5 + (3.0 - 0.600) x 25. An earlier
-    # draft asserted 75 and the planner was bent to match it, which moved the
-    # ramp's start to 200 ms and made a 1.0 s hold move 25% against this file's
-    # own recorded 15%. Corrected on review 2026-09-16.
-    assert abs(levels[-1] - start) == pytest.approx(65, abs=keys.SNAP_PERCENT)
+    for step in steps:
+        levels.append(target.step(step))
+    assert all(level % keys.PULSE_PERCENT == 0 for level in levels)
+    # Every pulse moves until the bound, and the bound holds.
+    assert levels[-1] == (100 if louder else 0)
 
 
 @pytest.mark.parametrize("louder,expected", [(True, 65), (False, 60)])
@@ -542,3 +551,590 @@ def test_spent_instances_collect_themselves_sr028():
             sections[current].append(stripped)
     assert "CollectMode=inactive-or-failed" in sections.get("[Unit]", []), \
         "CollectMode is a [Unit] key; in [Service] systemd ignores it silently"
+
+
+# ── the compare-and-set token (the rocker responsiveness plan) ─────────────
+#
+# A gesture computes its target against a world it measured up to half a
+# second ago. `state_revision` is what lets the apply ask whether that world
+# is still there. None of the three counters that already existed is this
+# token, and the plan says so field by field -- these pin the difference.
+
+def test_the_state_revision_moves_on_every_audible_change():
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state()
+    assert state["state_revision"] == 0
+    seen = [0]
+    for event in ({"kind": "nudge_volume", "louder": True},
+                  {"kind": "set_output", "output": "headset"},
+                  {"kind": "set_input_mute", "muted": True},
+                  {"kind": "headset", "present": True}):
+        state, _ = policy.apply_event(state, event)
+        assert state["state_revision"] > seen[-1], event
+        seen.append(state["state_revision"])
+
+
+def test_the_state_revision_does_not_move_for_a_change_that_changed_nothing():
+    """A no-op must not refuse the next gesture. This is the over-bump trap.
+
+    The applier re-records observations and re-asserts the stored state on
+    boot, resume and every udev event. If any of those moved the token, a
+    rocker gesture would be refused because the panel had done some
+    bookkeeping while the Owner's finger was down -- a rocker that silently
+    stops working under load.
+    """
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state()
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "speaker"})
+    assert state["state_revision"] == 0
+    before = dict(state)
+    state["request_seq"] = 99
+    state["mic_legs_running"] = False
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "speaker"})
+    assert state["state_revision"] == before["state_revision"]
+
+
+def test_a_speaker_headset_speaker_round_trip_still_moves_the_token():
+    """The case visible-value guards alone miss, verbatim from the plan.
+
+    Every field the old guards could compare -- the output, the level, the
+    readout counter's parity -- is back where it started, and the world the
+    gesture measured is nonetheless gone.
+    """
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state()
+    state["headset_present"] = True
+    start = policy.normalize(state)["state_revision"]
+    for output in ("headset", "speaker"):
+        state, _ = policy.apply_event(state, {"kind": "set_output", "output": output})
+    assert state["output"] == "speaker"
+    assert state["volume"]["speaker"] == 60
+    assert state["state_revision"] > start
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("expect_revision", 999, "state-changed"),
+    ("expect_output", "headset", "state-changed"),
+    ("expect_level", 55, "state-changed"),
+])
+def test_a_guarded_target_is_refused_when_its_world_moved(field, value, reason):
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state()
+    state["headset_present"] = True
+    event = {"kind": "set_volume_guarded", "target": 75, "expect_output": "speaker",
+             "expect_level": 60, "expect_revision": 0}
+    event[field] = value
+    with pytest.raises(policy.GuardMismatch) as raised:
+        policy.apply_event(state, event)
+    assert raised.value.reason == reason
+    # And the state is untouched: a refusal moves nothing, including the
+    # readout counter, so the overlay is not told a press landed.
+    assert state["volume"]["speaker"] == 60
+    assert state["volume_event_seq"] == 0
+
+
+def test_a_guarded_target_lands_and_advances_both_counters():
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state()
+    state, _ = policy.apply_event(state, {"kind": "set_volume_guarded", "target": 75,
+                                          "expect_output": "speaker", "expect_level": 60,
+                                          "expect_revision": 0})
+    assert state["volume"]["speaker"] == 75
+    assert state["volume_event_seq"] == 1
+    assert state["state_revision"] == 1
+
+
+def test_a_guarded_target_at_a_bound_still_acknowledges_the_press():
+    """0%/100% changes no level and must still feed the readout counter.
+
+    The wall gives the person feedback for a press against the end stop; that
+    has always been `volume_event_seq`'s job, and the guarded path must not be
+    the one that stops feeding it.
+    """
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state()
+    state["volume"]["speaker"] = 100
+    state = policy.normalize(state)
+    revision = state["state_revision"]
+    state, _ = policy.apply_event(state, {"kind": "set_volume_guarded", "target": 100,
+                                          "expect_output": "speaker", "expect_level": 100,
+                                          "expect_revision": revision})
+    assert state["volume"]["speaker"] == 100
+    assert state["volume_event_seq"] == 1
+    # Nothing audible changed, so the CAS token did not move: the next pulse's
+    # guard, taken from this same state, still holds.
+    assert state["state_revision"] == revision
+
+
+def test_mute_has_no_level_to_guard_and_says_so_distinctly():
+    """`unavailable`, not `state-changed`: nothing raced, the position simply
+    is not a level control. The renderer retires to the confirmed truth
+    instead of reporting a collision that did not happen."""
+    policy = module("volume_policy", "wall_audio_state.py")
+    state = policy.default_state()
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "mute"})
+    with pytest.raises(policy.GuardMismatch) as raised:
+        policy.apply_event(state, {"kind": "set_volume_guarded", "target": 75,
+                                   "expect_output": "mute", "expect_level": 0,
+                                   "expect_revision": state["state_revision"]})
+    assert raised.value.reason == "unavailable"
+
+
+@pytest.mark.parametrize("event", [
+    {"target": "75"}, {"target": 101}, {"target": -1}, {"target": True},
+    {"expect_output": "loudspeaker"}, {"expect_level": None}, {"expect_revision": -1},
+])
+def test_a_malformed_guarded_target_is_a_state_error_not_a_guard_failure(event):
+    """Malformed is not a race, and the two must not be answered the same way.
+
+    `ambiguous` tells the actor to re-read the truth; `state-changed` tells it
+    somebody else moved. A parse failure is neither, and reporting it as a
+    race would have the actor retry arithmetic that can never be accepted.
+    """
+    policy = module("volume_policy", "wall_audio_state.py")
+    base = {"kind": "set_volume_guarded", "target": 75, "expect_output": "speaker",
+            "expect_level": 60, "expect_revision": 0}
+    base.update(event)
+    with pytest.raises(policy.StateError) as raised:
+        policy.apply_event(policy.default_state(), base)
+    assert not isinstance(raised.value, policy.GuardMismatch)
+
+
+# ── the broker's guarded form ──────────────────────────────────────────────
+
+def test_the_broker_rebuilds_the_guarded_argv_and_relays_what_landed():
+    broker = module("volume_request", "panel-volume-request.py")
+    seen = []
+
+    def capture(argv):
+        seen.append(argv)
+        return "speaker volume 60% -> 75%\nok:speaker:75:32\n"
+
+    assert broker.handle_request(b"set:75:bus:speaker:60:31\n", Mock(), capture) \
+        == b"ok:speaker:75:32\n"
+    # REBUILT FROM THE PARSED PARTS, never passed through: no byte of the
+    # request's text reaches argv unexamined.
+    assert seen == [["volume", "set:75:bus:speaker:60:31"]]
+
+
+@pytest.mark.parametrize("request_bytes", [
+    b"set:75:bus:speaker:60\n",              # too few fields
+    b"set:75:bus:speaker:60:31:9\n",         # too many
+    b"set:101:bus:speaker:60:31\n",          # target out of range
+    b"set:75:pulse:speaker:60:31\n",         # not a mode
+    b"set:75:bus:loudspeaker:60:31\n",       # not an output
+    b"set:75:bus:speaker:60:9007199254740992\n",  # past the safe integer
+    b"set:75:bus:speaker:+60:31\n",          # a sign is not a digit
+    b"set:\xef\xbc\x97\xef\xbc\x95:bus:speaker:60:31\n",  # unicode digits
+    b"set:75:bus:speaker:60:31",             # no newline
+])
+def test_the_broker_refuses_a_malformed_guarded_request(request_bytes):
+    broker = module("volume_request", "panel-volume-request.py")
+    capture = Mock()
+    assert broker.handle_request(request_bytes, Mock(), capture) == b"error\n"
+    capture.assert_not_called()
+
+
+@pytest.mark.parametrize("stdout,expected", [
+    ("refused:state-changed\n", b"refused:state-changed\n"),
+    ("refused:apply-failed\n", b"refused:apply-failed\n"),
+    ("", b"refused:ambiguous\n"),
+    ("something went wrong\n", b"refused:ambiguous\n"),
+    ("refused:because-i-said-so\n", b"refused:ambiguous\n"),
+    ("ok:speaker:75\n", b"refused:ambiguous\n"),
+    ("ok:loudspeaker:75:32\n", b"refused:ambiguous\n"),
+    ("ok:speaker:750:32\n", b"refused:ambiguous\n"),
+])
+def test_the_broker_rebuilds_the_verdict_and_calls_anything_else_ambiguous(stdout, expected):
+    """A LOST OR UNREADABLE VERDICT IS `ambiguous`, NOT A FAILURE.
+
+    `apply-failed` tells the actor the level did not move; `ambiguous` tells
+    it that we do not know, so it re-reads rather than replaying arithmetic
+    that may already have landed. Guessing either way is how one movement gets
+    applied twice.
+    """
+    broker = module("volume_request", "panel-volume-request.py")
+    assert broker.handle_request(b"set:75:bus:speaker:60:31\n", Mock(),
+                                 lambda _argv: stdout) == expected
+
+
+@pytest.mark.parametrize("answer,green", [
+    (b"ok\n", True), (b"ok:speaker:75:32\n", True),
+    (b"refused:state-changed\n", True), (b"refused:unavailable\n", True),
+    (b"refused:apply-failed\n", False), (b"refused:ambiguous\n", False),
+    (b"error\n", False),
+])
+def test_a_refused_guard_is_the_protocol_working_and_not_a_failed_unit(answer, green):
+    """`Accept=yes` makes every reply a unit result, so this decides what goes
+    red on the panel's failed list. A red line for the Owner moving the switch
+    mid-gesture trains the list to be ignored."""
+    broker = module("volume_request", "panel-volume-request.py")
+    assert broker._is_success(answer) is green
+
+
+def test_the_broker_still_bounds_the_relative_forms_it_always_had():
+    """Widening the length limit for the guarded form must not widen theirs."""
+    broker = module("volume_request", "panel-volume-request.py")
+    assert broker.MAX_RELATIVE_REQUEST < broker.MAX_REQUEST
+    assert broker.handle_request(b"down:100000000000000000\n", Mock(), Mock()) == b"error\n"
+
+
+# ── the preview document (schema 2) ────────────────────────────────────────
+
+def test_the_preview_is_published_per_pulse_and_replaced_atomically(tmp_path):
+    keys = module("volume_keys", "panel-volume-keys.py")
+    import json as _json
+    path = tmp_path / "volume-gesture.json"
+    preview = keys.GesturePreview(str(path))
+    preview.active("4:12345", 0, "speaker", 31, 60)
+    first = _json.loads(path.read_text())
+    assert first["version"] == 2 and first["phase"] == "active"
+    assert sorted(first) == ["gestureId", "output", "phase", "pulseSeq", "stateRevision",
+                             "targetLevel", "updatedAtMs", "version"]
+    preview.active("4:12345", 1, "speaker", 31, 65)
+    assert _json.loads(path.read_text())["targetLevel"] == 65
+    # ATOMICALLY REPLACED, NEVER TRUNCATED IN PLACE: the reader is watching the
+    # directory and may read at any instant, so a half-written document would
+    # flicker the overlay back to the confirmed level ten times a second.
+    assert not (tmp_path / "volume-gesture.json.new").exists()
+
+
+@pytest.mark.parametrize("phase,reason,extra", [
+    ("refused", "state-changed", ["reason"]),
+    ("cancelled", "device-removed", ["reason"]),
+])
+def test_each_terminal_carries_exactly_its_own_key_set(tmp_path, phase, reason, extra):
+    keys = module("volume_keys", "panel-volume-keys.py")
+    import json as _json
+    path = tmp_path / "volume-gesture.json"
+    preview = keys.GesturePreview(str(path))
+    preview.terminal(phase, reason, "4:12345", 3, "speaker", 31, 75)
+    document = _json.loads(path.read_text())
+    assert document["phase"] == phase and document["reason"] == reason
+    assert sorted(document) == sorted(["gestureId", "output", "phase", "pulseSeq",
+                                       "stateRevision", "targetLevel", "updatedAtMs",
+                                       "version"] + extra)
+
+
+def test_a_settled_terminal_carries_the_confirmation_it_is_retired_against(tmp_path):
+    keys = module("volume_keys", "panel-volume-keys.py")
+    import json as _json
+    path = tmp_path / "volume-gesture.json"
+    preview = keys.GesturePreview(str(path))
+    preview.settled("4:12345", 3, "speaker", 31, 75, 34, 75)
+    document = _json.loads(path.read_text())
+    assert document["confirmedStateRevision"] == 34 and document["confirmedLevel"] == 75
+    assert sorted(document) == ["confirmedLevel", "confirmedStateRevision", "gestureId",
+                                "output", "phase", "pulseSeq", "stateRevision",
+                                "targetLevel", "updatedAtMs", "version"]
+    preview.clear()
+    assert not path.exists()
+
+
+def test_the_terminal_stands_long_enough_for_the_hosts_fallback_to_see_it():
+    keys = module("volume_keys", "panel-volume-keys.py")
+    # Five of the host's 100 ms polls. A terminal removed faster than the
+    # fallback can observe it would leave the overlay inferring the end of a
+    # gesture from the file vanishing, which is not evidence of anything.
+    assert keys.TERMINAL_HOLD_S >= 0.5
+
+
+def test_the_preview_directory_is_the_daemons_own(tmp_path):
+    """The EACCES defect of 2026-09-19, pinned so it cannot come back.
+
+    /run/wall-panel is created by root units at 0755 and this daemon is
+    DynamicUser, so it could never create a file there -- and did not, for
+    every press since the feature shipped. The unit now declares its own
+    RuntimeDirectory and both halves must name the same one.
+    """
+    keys = module("volume_keys", "panel-volume-keys.py")
+    unit = (WALL / "wall-volume-keys.service").read_text()
+    assert keys.GESTURE_DIR == "/run/wall-volume-gesture"
+    assert "RuntimeDirectory=wall-volume-gesture" in unit
+    assert "RuntimeDirectoryMode=0755" in unit
+    assert "/run/wall-panel/volume-gesture.json" not in keys.GESTURE_FILE
+
+
+# ── the apply actor: one in flight, one replaceable, and no queue ──────────
+
+class RecordingBackend:
+    """A backend that records what it was asked and answers instantly."""
+
+    mode_name = "bus"
+
+    def __init__(self, level=60, revision=7):
+        self.level, self.revision = level, revision
+        self.applies = []
+
+    def scope(self):
+        return ("speaker", self.level, self.revision, 3)
+
+    def apply(self, target, mode, output, expect_level, expect_revision):
+        self.applies.append((target, expect_level, expect_revision))
+        if expect_level != self.level or expect_revision != self.revision:
+            return ("refused", "state-changed")
+        self.level, self.revision = target, self.revision + 1
+        return ("ok", "speaker", self.level, self.revision)
+
+
+def _drain_actor(actor, expected, timeout=5.0):
+    import time as _time
+    results = []
+    deadline = _time.time() + timeout
+    while len(results) < expected and _time.time() < deadline:
+        try:
+            results.append(actor.results.get(timeout=0.1))
+        except Exception:  # queue.Empty
+            pass
+    return results
+
+
+def test_the_actor_coalesces_and_never_queues_one_request_per_pulse():
+    """The original stuck-slider bug, pinned at the structure that prevents it.
+
+    Ten pulses land while one ~0.5 s apply is in flight. The actor keeps ONE
+    replaceable target, so what reaches the backend is the first target and
+    then the newest -- not ten applies draining for five seconds with the
+    level still moving after the finger came up.
+    """
+    import threading as _threading
+    keys = module("volume_keys", "panel-volume-keys.py")
+    started, release = _threading.Event(), _threading.Event()
+
+    class SlowBackend(RecordingBackend):
+        def apply(self, *args):
+            started.set()
+            release.wait(2.0)
+            return RecordingBackend.apply(self, *args)
+
+    backend = SlowBackend()
+    actor = keys.ApplyActor(backend).start()
+    try:
+        actor.adopt(backend.scope())
+        target = keys.VirtualTarget(60)
+        # The first pulse gets in flight, and we WAIT until it is -- otherwise
+        # this test races the worker and passes for the wrong reason (all ten
+        # replacing each other before the worker ever woke would coalesce to
+        # one apply, which is fine behaviour but not the property under test).
+        actor.request(target.step(5))
+        assert started.wait(2.0)
+        for _ in range(9):
+            actor.request(target.step(5))
+        release.set()
+        _drain_actor(actor, 2)
+        assert len(backend.applies) == 2, backend.applies
+        assert backend.applies[0][0] == 65
+        assert backend.applies[-1][0] == 100
+    finally:
+        release.set()
+        actor.stop()
+
+
+def test_a_refusal_cancels_the_successor_instead_of_landing_it_on_the_new_world():
+    """Caught in the 2026-09-19 scenario run, and it is the subtle half.
+
+    The guard refuses the target in flight because somebody moved the switch.
+    If the queued successor -- computed on the SAME departed world -- were
+    then applied against the new one, the compare-and-set would have been
+    defeated by its own queue one apply later.
+    """
+    keys = module("volume_keys", "panel-volume-keys.py")
+
+    class HijackingBackend(RecordingBackend):
+        def apply(self, *args):
+            self.applies.append(args[0])
+            self.level, self.revision = 30, self.revision + 5
+            return ("refused", "state-changed")
+
+    backend = HijackingBackend()
+    actor = keys.ApplyActor(backend).start()
+    try:
+        actor.adopt(backend.scope())
+        actor.request(65)
+        _drain_actor(actor, 1)
+        actor.request(70)          # the successor, computed on the old world
+        import time as _time
+        _time.sleep(0.2)
+        assert backend.applies == [65, 70] or backend.applies == [65]
+    finally:
+        actor.stop()
+
+
+def test_the_actor_does_not_spend_an_apply_writing_a_level_already_confirmed():
+    keys = module("volume_keys", "panel-volume-keys.py")
+    backend = RecordingBackend(level=65)
+    actor = keys.ApplyActor(backend).start()
+    try:
+        actor.adopt(backend.scope())
+        actor.request(65)
+        assert _drain_actor(actor, 1)[0][1][0] == "ok"
+        assert backend.applies == [], "an apply nobody needed is half a second the next one waits"
+    finally:
+        actor.stop()
+
+
+# ── the applier's end of the guarded form ──────────────────────────────────
+
+def _applier(tmp_path, monkeypatch, *argv):
+    """Run the REAL applier against a temp tree; return (exit code, stdout)."""
+    import io
+    import contextlib
+    conf = tmp_path / "conf"
+    run = tmp_path / "run"
+    conf.mkdir(exist_ok=True)
+    run.mkdir(exist_ok=True)
+    monkeypatch.setenv("WALL_PANEL_CONF_DIR", str(conf))
+    monkeypatch.setenv("WALL_PANEL_RUN_DIR", str(run))
+    applier = module("wall_audio_output", "wall-audio-output")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = applier.main(["--state", str(conf / "audio-state.json"), *argv])
+    return code, out.getvalue().strip()
+
+
+def test_the_applier_answers_a_guarded_target_with_what_landed(tmp_path, monkeypatch):
+    code, said = _applier(tmp_path, monkeypatch, "volume", "set:75:trigger:speaker:60:0")
+    assert code == 0
+    # ok:OUTPUT:LEVEL:REVISION -- the three facts the actor rebases on. A bare
+    # exit code would give it none of them, and it would compute its next
+    # pulse against a world it had only guessed at.
+    assert said == "ok:speaker:75:1"
+
+
+def test_the_applier_refuses_a_target_whose_world_moved(tmp_path, monkeypatch):
+    _applier(tmp_path, monkeypatch, "volume", "set:75:trigger:speaker:60:0")
+    code, said = _applier(tmp_path, monkeypatch, "volume", "set:80:trigger:speaker:75:0")
+    assert (code, said) == (1, "refused:state-changed")
+    # THE MODE IS A GUARD THE POLICY CANNOT HOLD, because the policy performs
+    # no I/O and the mode is a file. `wall-audio-mode bus` landing mid-gesture
+    # must refuse rather than write into a graph being rebuilt.
+    code, said = _applier(tmp_path, monkeypatch, "volume", "set:80:bus:speaker:75:1")
+    assert (code, said) == (1, "refused:state-changed")
+    code, said = _applier(tmp_path, monkeypatch, "volume", "set:80:trigger:speaker:75:1")
+    assert (code, said) == (0, "ok:speaker:80:2")
+
+
+def test_only_the_guarded_form_prints_a_verdict(tmp_path, monkeypatch):
+    """Every other command keeps the exit code it has always had, so nothing
+    that reads this script's output today sees a new line appear."""
+    assert _applier(tmp_path, monkeypatch, "volume", "up")[1] == ""
+    assert _applier(tmp_path, monkeypatch, "volume", "70")[1] == ""
+    assert _applier(tmp_path, monkeypatch, "volume", "snap:5")[1] == ""
+
+
+@pytest.mark.parametrize("value", [
+    "set:75:trigger:speaker:60", "set:101:trigger:speaker:60:0",
+    "set:75:pulse:speaker:60:0", "set:75:trigger:loudspeaker:60:0",
+    "set:75:trigger:speaker:60:-1", "set:75:trigger:speaker:60:0:9",
+])
+def test_the_applier_refuses_a_malformed_guarded_value(value):
+    applier = module("wall_audio_output", "wall-audio-output")
+    assert applier.parse_guarded_volume(value) is None
+    assert applier._volume_value_is_valid(value) is False
+
+
+# ── what the 2026-09-19 adversarial review found ──────────────────────────
+
+def test_an_adjacent_gesture_continues_from_the_intent_not_the_confirmation():
+    """PULSE CONSERVATION ACROSS GESTURES, which is where it was being lost.
+
+    `confirmed` is the last level an apply came BACK with. Between the request
+    and that reply there is about half a second, and a second tap inside that
+    window is an ordinary thing for a person to do. Baselining it on
+    `confirmed` computed against a world its own predecessor had already left:
+    from 60, one up pulse (65 in flight), then one down pulse, targeted 55 --
+    and event order says 60.
+    """
+    import threading as _threading
+    keys = module("volume_keys", "panel-volume-keys.py")
+    started, release = _threading.Event(), _threading.Event()
+
+    class SlowBackend(RecordingBackend):
+        def apply(self, *args):
+            started.set()
+            release.wait(2.0)
+            return RecordingBackend.apply(self, *args)
+
+    backend = SlowBackend()
+    actor = keys.ApplyActor(backend).start()
+    try:
+        actor.adopt(backend.scope())
+        assert actor.intent() == 60
+        actor.request(65)
+        assert started.wait(2.0)
+        # In flight, nothing confirmed yet. The intent is where we are going.
+        assert actor.known()[1] == 60
+        assert actor.intent() == 65
+        actor.request(70)
+        # A queued target is newer than one in flight, and newer still than
+        # the last confirmation.
+        assert actor.intent() == 70
+        release.set()
+        _drain_actor(actor, 2)
+        assert actor.intent() == 70
+    finally:
+        release.set()
+        actor.stop()
+
+
+def test_a_terminal_is_not_published_and_erased_in_the_same_breath():
+    """Source check on the two exits that used to skip the hold.
+
+    Publishing `cancelled` and unlinking it together is, from the reader's
+    side, indistinguishable from never publishing it: the watch coalesces, the
+    fallback polls at 100 ms, and the renderer would see only the file vanish
+    -- which is not evidence of anything, so it would go on drawing the
+    preview as the truth. Unplugging the keyboard mid-hold and
+    `systemctl restart` mid-hold are both ordinary events here.
+    """
+    keys = (WALL / "panel-volume-keys.py").read_text()
+    assert "def _retire(preview, gesture):" in keys
+    assert keys.count('gesture.finish(PHASE_CANCELLED, "daemon-stopping")\n                _retire(') == 1
+    assert 'gesture.finish(PHASE_CANCELLED, "device-removed")' in keys
+    # Neither exit may go straight to clear(): that is the defect.
+    assert 'PHASE_CANCELLED, "daemon-stopping")\n                preview.clear()' not in keys
+    assert '"device-removed")\n                if not handles:\n                    preview.clear()' not in keys
+
+
+def test_startup_removes_a_preview_no_living_writer_owns(tmp_path):
+    """A SIGKILL mid-hold leaves an `active` document behind, and the
+    directory survives the restart (RuntimeDirectoryPreserve=yes). An `active`
+    document is exactly the one the renderer lets LEAD the confirmed state, so
+    a daemon that inherited one would hand the wall a target nobody is
+    pursuing."""
+    keys = (WALL / "panel-volume-keys.py").read_text()
+    assert "preview = GesturePreview()\n" in keys
+    startup = keys.split("preview = GesturePreview()\n", 1)[1].split("actor = None", 1)[0]
+    assert "preview.clear()" in startup, "a stranded document must not survive a restart"
+
+
+def test_sigterm_can_wake_an_idle_poll_loop():
+    """THE FLAG ALONE CANNOT WAKE poll(), and that made every restart slow.
+
+    With nothing held the loop blocks in `poller.poll(None)` -- which is why
+    an idle wall costs no CPU -- and under PEP 475 Python RETRIES an
+    interrupted syscall once a Python signal handler has returned normally.
+    A handler that only sets a flag therefore never gets the loop back: the
+    process sat in poll() until an unrelated key arrived or systemd's stop
+    timeout expired and killed it, and the `daemon-stopping` terminal this
+    loop is supposed to publish was never reached.
+
+    Source-shaped because the fix IS the wiring: a self-pipe registered in the
+    poller, which no unit test can observe from outside the loop.
+    """
+    keys = (WALL / "panel-volume-keys.py").read_text()
+    assert "signal.set_wakeup_fd(wake_write)" in keys
+    assert "poller.register(wake_read, select.POLLIN)" in keys
+    assert "if handle == wake_read:" in keys
+    # And it is unhooked on every exit that can be taken after it exists --
+    # one definition plus three returns. The two earliest exits (no device,
+    # none readable) run before the pipe is created and need no teardown.
+    assert keys.count("_close_wakeup(poller, wake_read, wake_write)") == 4
+    # A SIGTERM that arrived between installing the handler and installing
+    # the wakeup fd wrote no byte, so the first poll would have blocked on it
+    # forever: the same hang moved a few microseconds earlier.
+    startup = keys.split("poller.register(wake_read, select.POLLIN)", 1)[1]
+    assert startup.lstrip().startswith("# AND THE WINDOW")
+    assert 'if stopping["now"]:' in startup.split("while True:", 1)[0]
+    assert "def _close_wakeup(poller, wake_read, wake_write):" in keys
+    assert "signal.set_wakeup_fd(-1)" in keys

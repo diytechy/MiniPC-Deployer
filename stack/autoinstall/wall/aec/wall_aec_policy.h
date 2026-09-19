@@ -74,6 +74,28 @@
  * failover logic. Below the floor for this long and the mic legs go to
  * push-to-talk whatever the baselines say. */
 #define AEC_FLOOR_QUALIFYING_FRAMES 11250
+/* HOW LONG A BYPASSED CANCELLER WAITS BEFORE TRYING AGAIN, and why the retry
+ * has to exist at all.
+ *
+ * Failover is written as a health STATE with a way back: `aec_policy_block`
+ * clears `failed_over` as soon as the recent ERLE comes back above the floor.
+ * That branch could never run. Bypass is implemented by handing the microphone
+ * through untouched, so `residual == mic`, so ERLE is EXACTLY 0 dB on every
+ * qualifying frame after it -- and 0 is below every legal floor. The estimator
+ * then converges to 0 and stays there, so the recovery test can never pass and
+ * the "state" was in fact a one-way latch for the life of the daemon. Measured
+ * consequence on the panel 2026-09-18: one window below the floor at 17:10:18,
+ * with no measured profile and a guessed 40 ms pre-delay, and the cancelled
+ * microphone silently became a raw one until the unit was restarted at 17:16.
+ *
+ * So the way back is a CLOCK rather than a measurement, because a measurement
+ * of a filter that is not running is not available by construction. After this
+ * long the filter is re-initialised and given its ordinary warm-up grace; if
+ * the room really is uncancellable it fails over again a minute later, at a
+ * cost of one filter reset every ten minutes. The divergence path's
+ * give-up bound (AEC_MAX_CONSECUTIVE_RESETS) is untouched and still stops the
+ * OTHER loop. */
+#define AEC_FAILOVER_RETRY_MS 600000
 /* The time constant of the recent-ERLE estimator, in qualifying frames. 60 s
  * at 5.33 ms per block, matching the warm-up grace: the thing being measured is
  * how well the filter is doing NOW, and a faster estimator would fire on one
@@ -196,6 +218,9 @@ typedef struct {
     aec_state state;
     bool adapting;
     bool failed_over;
+    /* When the bypass began, for AEC_FAILOVER_RETRY_MS. INT64_MIN means "not
+     * bypassed"; it is set with the latch and cleared with it. */
+    int64_t failed_over_ms;
     double erle_sum_1min, erle_sum_session;
     int64_t erle_n_1min, erle_n_session;
     /* THE STATISTIC THE HEALTH RULES ACT ON, and it is deliberately NOT the

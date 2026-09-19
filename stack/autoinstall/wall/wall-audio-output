@@ -19,6 +19,12 @@ Usage:
   wall-audio-output set {mute|headset|speaker}
   wall-audio-output input-mute {on|off}
   wall-audio-output volume {0..100|up|down|up:PCT|down:PCT|snap:PCT}
+  wall-audio-output volume set:TARGET:MODE:OUTPUT:EXPECT:REVISION
+        one ABSOLUTE level, applied only while the mode, output, level and
+        state revision it was computed on all still hold. Answers on stdout
+        with `ok:OUTPUT:LEVEL:REVISION` or `refused:REASON`. The rocker's
+        apply actor uses this and nothing else; see
+        PANEL_VOLUME_ROCKER_RESPONSIVENESS_PLAN_2026-09-18.md.
   wall-audio-output headset {add|remove} [--boot|--runtime]
   wall-audio-output apply-state              # re-assert the stored state (boot, resume)
   wall-audio-output apply-request [PATH]     # one broker request, deduplicated
@@ -1871,6 +1877,12 @@ def event_from_arguments(arguments):
         # it stays one `value` token and the privileged broker keeps passing a
         # fixed-length argv it fully controls. See _nudge_volume for why a
         # magnitude is needed at all.
+        guarded = parse_guarded_volume(arguments.value)
+        if guarded is not None:
+            target, mode, output, expected, revision = guarded
+            return {"kind": "set_volume_guarded", "target": target,
+                    "expect_mode": mode, "expect_output": output,
+                    "expect_level": expected, "expect_revision": revision}
         if ":" in arguments.value:
             direction, _, size = arguments.value.partition(":")
             # `snap:PCT` -- round to the nearest multiple and settle there. The
@@ -1887,19 +1899,62 @@ def event_from_arguments(arguments):
     return None
 
 
-def _volume_value_is_valid(value):
-    """True for the four accepted spellings of a volume argument.
+# The guarded absolute form's fixed shape:
+#   set:<target>:<mode>:<output>:<expected level>:<state revision>
+# One token, like every other volume spelling, so the privileged broker keeps
+# passing a fixed-length argv it fully controls. See `_set_volume_guarded` in
+# the policy for why an absolute target needs a guard at all.
+GUARDED_VOLUME_FIELDS = 6
+GUARDED_MODES = ("trigger", "panel", "bus")
+MAX_STATE_REVISION = 9007199254740991
 
-    `0..100` absolute, `up`/`down` for one default press, and `up:PCT`/
-    `down:PCT` for a movement of a stated size. PCT is validated HERE as well
-    as in the state layer: this is the boundary a human or the broker types at,
-    and argparse refusing it produces a usage message, where the state layer
-    raising StateError produces a traceback-shaped failure instead.
+
+def parse_guarded_volume(value):
+    """(target, mode, output, expected level, revision) or None if not that form.
+
+    Returns None for "this is some other volume spelling"; raises nothing. A
+    malformed guarded form returns None too, which argparse reports as a usage
+    error -- the same answer any other unparseable value gets.
+    """
+    if not value.startswith("set:"):
+        return None
+    fields = value.split(":")
+    if len(fields) != GUARDED_VOLUME_FIELDS:
+        return None
+    _, target, mode, output, expected, revision = fields
+    if mode not in GUARDED_MODES or output not in policy.OUTPUTS:
+        return None
+    # str.isdigit() admits unicode digits, which int() then happily parses; the
+    # explicit ASCII test is what keeps a request's text from reaching argv in
+    # a spelling nobody reviewed. Leading signs and whitespace are refused with
+    # it, and every field here is a non-negative integer by construction.
+    for field in (target, expected, revision):
+        if not field or not all("0" <= character <= "9" for character in field):
+            return None
+    target, expected, revision = int(target), int(expected), int(revision)
+    if not 0 <= target <= 100 or not 0 <= expected <= 100:
+        return None
+    if revision > MAX_STATE_REVISION:
+        return None
+    return target, mode, output, expected, revision
+
+
+def _volume_value_is_valid(value):
+    """True for the five accepted spellings of a volume argument.
+
+    `0..100` absolute, `up`/`down` for one default press, `up:PCT`/`down:PCT`
+    for a movement of a stated size, `snap:PCT`, and the guarded absolute
+    `set:...` form above. PCT is validated HERE as well as in the state layer:
+    this is the boundary a human or the broker types at, and argparse refusing
+    it produces a usage message, where the state layer raising StateError
+    produces a traceback-shaped failure instead.
     """
     if value in ("up", "down"):
         return True
     if value.isdigit():
         return 0 <= int(value) <= 100
+    if value.startswith("set:"):
+        return parse_guarded_volume(value) is not None
     direction, separator, size = value.partition(":")
     if not separator or direction not in ("up", "down", "snap"):
         return False
@@ -2065,8 +2120,8 @@ def main(argv=None):
                          % (arguments.command, "|".join(expects_value[arguments.command])))
     if arguments.command == "volume":
         if arguments.value is None or not _volume_value_is_valid(arguments.value):
-            parser.error("volume takes 0..100, up, down, up:PCT, down:PCT "
-                         "or snap:PCT")
+            parser.error("volume takes 0..100, up, down, up:PCT, down:PCT, "
+                         "snap:PCT or set:TARGET:MODE:OUTPUT:EXPECT:REVISION")
 
     if arguments.command == "mic-allowed":
         # Read-only and LOCK-FREE, like `status`: it is asked by both mic units'
@@ -2108,6 +2163,45 @@ def main(argv=None):
 
     with apply_lock(dry_run=arguments.dry_run):
         return _locked_apply(arguments)
+
+
+class GuardedVerdict:
+    """The one line a guarded volume apply prints on stdout, printed once.
+
+    WHY THERE IS A REPLY AT ALL. Every other command here answers with an exit
+    code, and that is enough for them: they are fire-and-forget re-asserts. A
+    guarded target is not. The rocker's apply actor has to REBASE on what
+    actually landed -- the confirmed output, the confirmed level and the new
+    revision -- or its next pulse computes against a world it has only guessed
+    at, and a refusal it read as a success would let it keep sending targets
+    the applier will keep refusing.
+
+    The vocabulary is fixed and tiny, so the daemon parses it without a JSON
+    reader in a privileged path:
+
+        ok:<output>:<level>:<revision>
+        refused:<reason>            reason from policy.REFUSAL_REASONS
+
+    Printed exactly once, on stdout, by whichever exit is taken first. stderr
+    stays the journal, as everywhere else in this script.
+    """
+
+    def __init__(self, wanted):
+        self.wanted = wanted
+        self.spoken = False
+
+    def say(self, line):
+        if not self.wanted or self.spoken:
+            return
+        self.spoken = True
+        print(line, flush=True)
+
+    def refuse(self, reason):
+        self.say("refused:%s" % reason)
+
+    def confirm(self, state):
+        self.say("ok:%s:%d:%d" % (state["output"], policy.volume_of(state),
+                                  state["state_revision"]))
 
 
 def _locked_apply(arguments):
@@ -2197,11 +2291,36 @@ def _locked_apply(arguments):
     else:
         event = event_from_arguments(arguments)
 
+    # THE GUARDED FORM ANSWERS ON STDOUT, and only the guarded form: every
+    # other command keeps the exit code it has always had, so nothing that
+    # reads this script's output today sees a new line appear.
+    verdict = GuardedVerdict(
+        isinstance(event, dict) and event.get("kind") == "set_volume_guarded")
+
     if event is not None:
+        # THE MODE IS THE ONE GUARD THE POLICY CANNOT HOLD, because the policy
+        # performs no I/O and the mode is a file. It is checked here, under the
+        # same lock as everything else, so `wall-audio-mode bus` landing
+        # between the daemon's baseline read and this apply refuses the target
+        # rather than writing it into a graph that is being rebuilt.
+        expect_mode = event.get("expect_mode")
+        if expect_mode is not None and expect_mode != current_mode():
+            log("refused: audio mode is %s, not the %s this target was computed on"
+                % (current_mode(), expect_mode))
+            verdict.refuse(policy.REFUSE_STATE_CHANGED)
+            return 1
         try:
             state, lines = policy.apply_event(state, event)
+        except policy.GuardMismatch as exc:
+            log("refused: %s" % exc)
+            verdict.refuse(exc.reason)
+            return 1
         except policy.StateError as exc:
             log("refused: %s" % exc)
+            # A malformed guarded request is not a race and must not be
+            # reported as one: `ambiguous` is what tells the actor to re-read
+            # the confirmed state rather than to retry the same arithmetic.
+            verdict.refuse(policy.REFUSE_AMBIGUOUS)
             return 1
         for line in lines:
             log(line)
@@ -2235,6 +2354,12 @@ def _locked_apply(arguments):
         log("mode is %s, not bus: state recorded, hardware untouched" % mode)
         if boot_mark is not None:
             write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
+        # THE STATE IS THE CONFIRMED ANSWER IN THESE MODES, and saying `ok`
+        # here is not a fiction: in trigger and panel mode the rocker does not
+        # use this socket at all -- `nudge()` only brokers when the mode is
+        # bus -- so a guarded target arriving here was computed against this
+        # same mode and the state file IS what it asked to change.
+        verdict.confirm(state)
         return 0
     adapter = read_env(CARDS_FILE, "WALL_AUDIO_ADAPTER_CARD", "ICUSBAUDIO7D")
     if not adapter_present(adapter):
@@ -2257,6 +2382,11 @@ def _locked_apply(arguments):
             "re-asserted built-in input controls" % adapter)
         if boot_mark is not None:
             write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
+        # DEFERRED IS NOT APPLIED. The level was written to the state file and
+        # will be asserted when the adapter re-enumerates, but nothing audible
+        # moved, so the actor must reconcile from fresh truth rather than
+        # rebase on a target it believes landed.
+        verdict.refuse(policy.REFUSE_UNAVAILABLE)
         return 1 if failures else 0
     before_observation = state.get("mic_legs_running")
     failures = apply_plan(state, Applier(dry_run=arguments.dry_run))
@@ -2276,7 +2406,9 @@ def _locked_apply(arguments):
         write_boot_stamp(dry_run=arguments.dry_run, monotonic_usec=boot_mark)
     if failures:
         log("apply finished with %d failure(s): audio may be wrong" % failures)
+        verdict.refuse(policy.REFUSE_APPLY_FAILED)
         return 1
+    verdict.confirm(state)
     return 0
 
 

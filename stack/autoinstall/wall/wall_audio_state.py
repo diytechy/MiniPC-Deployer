@@ -85,6 +85,24 @@ STATE_SCHEMA = {
     "request_seq": -1,
     # Physical rocker readout event, including repeated presses at the bounds.
     "volume_event_seq": 0,
+    # THE COMPARE-AND-SET TOKEN for a guarded absolute volume target
+    # (PANEL_VOLUME_ROCKER_RESPONSIVENESS_PLAN_2026-09-18). None of the three
+    # counters already here is this token, and the plan says so field by field:
+    # `generation` is a backend-life epoch and does not move within a life,
+    # `request_seq` counts BROKER requests and so misses the rocker, a udev add
+    # and the root CLI, and `volume_event_seq` counts rocker readouts and so
+    # misses an output change. A rocker gesture that captured a baseline and
+    # then applied half a second later has to be able to ask "is the audible
+    # state still the one I measured" -- and speaker -> headset -> speaker is
+    # the case where every visible value agrees and the answer is still no.
+    #
+    # SO IT COVERS EXACTLY THE AUDIBLE POLICY (see _policy_fingerprint): the
+    # selected output, the input mute, the per-output level memory and the
+    # adapter's presence. Deliberately NOT request_seq, generation,
+    # volume_event_seq or mic_legs_running: those move for bookkeeping and for
+    # observations, and a gesture refused because the applier re-recorded an
+    # observation would be a rocker that silently stops working under load.
+    "state_revision": 0,
     # THE BACKEND EPOCH (contract 2026-09-14, section 1.1). `request_seq` orders
     # requests INSIDE one life of the applier; it cannot order across a restart,
     # because a state file that is replaced, repaired or rolled back can move the
@@ -110,6 +128,43 @@ STATE_SCHEMA = {
 
 class StateError(ValueError):
     """A request or a stored state that policy refuses. Never swallowed."""
+
+
+# The four refusal reasons a guarded apply may report, and the only four. The
+# preview protocol's `refused` terminal carries one of these verbatim, and the
+# renderer accepts no other spelling, so they are named once here rather than
+# written out at each boundary.
+REFUSE_STATE_CHANGED = "state-changed"
+REFUSE_APPLY_FAILED = "apply-failed"
+REFUSE_UNAVAILABLE = "unavailable"
+REFUSE_AMBIGUOUS = "ambiguous"
+REFUSAL_REASONS = (REFUSE_STATE_CHANGED, REFUSE_APPLY_FAILED,
+                   REFUSE_UNAVAILABLE, REFUSE_AMBIGUOUS)
+
+
+class GuardMismatch(StateError):
+    """A guarded target whose compare-and-set did not hold.
+
+    A StateError subclass so that every existing `except StateError` keeps
+    refusing it, and a distinct type so the one caller that must report WHICH
+    guard failed can ask instead of parsing a sentence.
+    """
+
+    def __init__(self, message, reason=REFUSE_STATE_CHANGED):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _policy_fingerprint(state):
+    """The part of the state `state_revision` is a revision OF.
+
+    Everything audible and nothing else: which output is selected, whether the
+    microphone is muted, what level each levelled output remembers, and whether
+    the headset adapter is there to be selected. See STATE_SCHEMA's note on
+    `state_revision` for why the counters are excluded.
+    """
+    return (state["output"], state["input_muted"], state["headset_present"],
+            tuple(state["volume"].get(output) for output in LEVELLED_OUTPUTS))
 
 
 def default_state():
@@ -219,6 +274,18 @@ def normalize(raw):
     if isinstance(volume_event, int) and not isinstance(volume_event, bool) and 0 <= volume_event <= 9007199254740991:
         state["volume_event_seq"] = volume_event
     elif "volume_event_seq" in raw:
+        repaired = True
+    # The CAS token. ABSENT IS NOT DAMAGE, for the same reason `generation`
+    # absent is not: a state file written by an applier that predates this
+    # field is older-but-honest, and treating it as damage would mute the
+    # microphone on every panel the first time the new applier reads it. It
+    # reads as 0, and the first accepted mutation moves it off 0 -- so a
+    # gesture whose baseline was taken against the absent field is still
+    # refused the moment anything actually changes.
+    revision = raw.get("state_revision", 0)
+    if isinstance(revision, int) and not isinstance(revision, bool) and 0 <= revision <= 9007199254740991:
+        state["state_revision"] = revision
+    elif "state_revision" in raw:
         repaired = True
     volume = raw.get("volume")
     if isinstance(volume, dict):
@@ -375,6 +442,11 @@ def apply_event(state, event):
                  "snap_volume"    {"to": int optional} -- round the level to the
                                   nearest multiple of "to" (default VOLUME_SNAP);
                                   sent once when the rocker is released
+                 "set_volume_guarded"
+                                  {"target": int, "expect_output": str,
+                                   "expect_level": int, "expect_revision": int}
+                                  -- one absolute level, applied only while the
+                                  state it was computed on still holds
                  "headset"        {"present": bool}}
     Outputs: (new_state, lines)
     Raises:  StateError if the event is unknown or malformed
@@ -384,7 +456,24 @@ def apply_event(state, event):
     handler = _HANDLERS.get(kind)
     if handler is None:
         raise StateError("unknown event kind")
-    return handler(normalize(state), event)
+    working = normalize(state)
+    # SNAPSHOT, NOT A SECOND REFERENCE. Every handler mutates the dict it is
+    # given and returns that same object, so keeping `working` around and
+    # diffing it afterwards would compare a state with itself -- which is
+    # always equal, and the revision would never move. The fingerprint is a
+    # tuple of scalars, so taking it now is the whole snapshot.
+    before = _policy_fingerprint(working)
+    result, lines = handler(working, event)
+    # THE REVISION IS BUMPED HERE AND NOWHERE ELSE, and that is what makes it
+    # impossible to forget. Every handler above is written as "change the
+    # fields"; none of them has to remember to also move a counter, and a
+    # handler added next year gets the bump for free. The diff is against the
+    # NORMALIZED input, so a repair applied on the way in counts as the change
+    # it is -- a state file that came back rolled back must not let a gesture
+    # whose baseline predates the rollback compare equal.
+    if _policy_fingerprint(result) != before:
+        result["state_revision"] = (result["state_revision"] + 1) % 9007199254740992
+    return result, lines
 
 
 def _set_output(state, event):
@@ -493,6 +582,73 @@ def _nudge_volume(state, event):
         target = level + (step if louder else -step)
     state["volume_event_seq"] = (state["volume_event_seq"] + 1) % 9007199254740992
     return _store_volume(state, clamp_volume(target))
+
+
+def _set_volume_guarded(state, event):
+    """One ABSOLUTE level, applied only if the state it was computed on still holds.
+
+    THE REASON THIS IS NOT `set_volume`. The rocker daemon computes its target
+    from a baseline it read up to half a second ago -- one privileged apply
+    costs 498-551 ms -- and in that window the Owner can have moved the switch,
+    a headset can have enumerated, and the on-glass slider can have set a level
+    of its own. An unguarded absolute write would then land the OLD gesture's
+    arithmetic on the NEW world: the plan's speaker -> headset -> speaker round
+    trip, where every visible value agrees again and the level is still wrong.
+    So the caller states the world it measured and this refuses if it moved.
+
+    THE GUARD IS THE REVISION PLUS THE VALUES, not either alone. The revision
+    catches a round trip that ends where it started; the output and level
+    catch a state file that was replaced or rolled back under a revision that
+    happens to match. Requiring both costs nothing and neither is redundant.
+
+    Inputs:  target:          0..100, the absolute level to land on
+             expect_output:   the output the caller measured
+             expect_level:    that output's level when the caller measured it
+             expect_revision: `state_revision` when the caller measured it
+    Raises:  GuardMismatch (reason `state-changed`) if any guard moved;
+             GuardMismatch (reason `unavailable`) if the measured output has
+             no level to set -- `mute`, or a headset with no adapter.
+    """
+    target = event.get("target")
+    if not isinstance(target, int) or isinstance(target, bool):
+        raise StateError("target must be an integer percentage")
+    if not VOLUME_MIN <= target <= VOLUME_MAX:
+        raise StateError("target must be %d..%d" % (VOLUME_MIN, VOLUME_MAX))
+    expect_output = event.get("expect_output")
+    if expect_output not in OUTPUTS:
+        raise StateError("expect_output must be one of %s" % (", ".join(OUTPUTS),))
+    expect_level = event.get("expect_level")
+    if not isinstance(expect_level, int) or isinstance(expect_level, bool):
+        raise StateError("expect_level must be an integer percentage")
+    expect_revision = event.get("expect_revision")
+    if not isinstance(expect_revision, int) or isinstance(expect_revision, bool) \
+            or expect_revision < 0:
+        raise StateError("expect_revision must be a non-negative integer")
+    if state["state_revision"] != expect_revision:
+        raise GuardMismatch(
+            "guard failed: state_revision is %d, not the %d this target was "
+            "computed on" % (state["state_revision"], expect_revision))
+    if state["output"] != expect_output:
+        raise GuardMismatch(
+            "guard failed: output is %s, not the %s this target was computed on"
+            % (state["output"], expect_output))
+    # `mute` HAS NO LEVEL TO GUARD OR TO SET, and that is a different answer
+    # from "the world moved": nothing changed, the position simply is not a
+    # level control. It is `unavailable` so the overlay retires to the
+    # confirmed truth instead of reporting a race that did not happen.
+    if expect_output not in LEVELLED_OUTPUTS:
+        raise GuardMismatch("output %s has no level" % expect_output,
+                            reason=REFUSE_UNAVAILABLE)
+    if volume_of(state) != clamp_volume(expect_level):
+        raise GuardMismatch(
+            "guard failed: %s is at %d%%, not the %d%% this target was computed on"
+            % (expect_output, volume_of(state), clamp_volume(expect_level)))
+    # THE READOUT COUNTER STILL MOVES AT A BOUND. A gesture pressed against
+    # 0% or 100% changes no level, and the wall must still acknowledge the
+    # press -- that is what `volume_event_seq` has always been for, and the
+    # guarded path must not be the one that stops feeding it.
+    state["volume_event_seq"] = (state["volume_event_seq"] + 1) % 9007199254740992
+    return _store_volume(state, target)
 
 
 def _snap_volume(state, event):
@@ -634,6 +790,7 @@ _HANDLERS = {
     "set_volume": _set_volume,
     "nudge_volume": _nudge_volume,
     "snap_volume": _snap_volume,
+    "set_volume_guarded": _set_volume_guarded,
     "headset": _headset,
 }
 

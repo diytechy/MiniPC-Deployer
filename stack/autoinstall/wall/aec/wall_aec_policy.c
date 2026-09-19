@@ -97,6 +97,17 @@ void aec_policy_rearm(aec_policy *policy, int64_t now_ms)
     policy->erle_recent_db = 0.0;
     policy->erle_recent_valid = false;
     policy->adapting = true;
+    /* A RE-ARM MEANS A FRESH FILTER, SO IT MUST ALSO END THE BYPASS. Leaving
+     * the latch set here made the state a lie of exactly the kind this file
+     * has already been corrected for once: `state` was written CONVERGING
+     * while `engine_block` -- which ANDs `!failed_over` into `cancelling` --
+     * went on passing the microphone straight through. The panel had 13 xruns
+     * in one session on 2026-09-18, and every one of them re-armed into that
+     * contradiction. The failover can re-assert a minute later if the room
+     * really is uncancellable; what it must not do is survive the destruction
+     * of the filter it was an opinion about. */
+    policy->failed_over = false;
+    policy->failed_over_ms = INT64_MIN;
     policy->state = policy->profile.present ? AEC_STATE_CONVERGING : AEC_STATE_NO_PROFILE;
     (void)now_ms;
 }
@@ -106,6 +117,7 @@ void aec_policy_init(aec_policy *policy, const aec_profile *profile, int64_t now
     memset(policy, 0, sizeof(*policy));
     policy->profile = *profile;
     policy->last_reset_ms = INT64_MIN;
+    policy->failed_over_ms = INT64_MIN;
     policy->drift_started_ms = INT64_MIN;
     policy->drift_state = AEC_DRIFT_MEASURING;
     policy->window_started_ms = now_ms;
@@ -268,6 +280,22 @@ aec_decision aec_policy_block(aec_policy *policy, const aec_block *block)
 
     double current = policy->erle_recent_db;
 
+    /* THE WAY OUT OF A BYPASS IS A CLOCK, NOT A MEASUREMENT, and it has to be.
+     * While bypassed the microphone is passed through untouched, so the
+     * residual IS the microphone and every qualifying frame below scores
+     * exactly 0 dB of ERLE -- which is beneath every legal floor. The
+     * recovery branch further down therefore cannot fire on its own, however
+     * good the room becomes, and without this the failover is permanent for
+     * the life of the daemon. See AEC_FAILOVER_RETRY_MS. */
+    if (policy->failed_over && policy->failed_over_ms != INT64_MIN &&
+        block->now_ms - policy->failed_over_ms >= AEC_FAILOVER_RETRY_MS) {
+        policy->resets_this_session += 1;
+        policy->last_reset_ms = block->now_ms;
+        aec_policy_rearm(policy, block->now_ms);
+        decision.action = AEC_ACTION_RESET_FILTER;
+        return decision;
+    }
+
     /* THE ABSOLUTE FLOOR, and the only place a profile number reaches failover.
      * Below it the canceller is not useful whatever its history, so the mic legs
      * hand over to push-to-talk. It is checked BEFORE the relative test because
@@ -276,13 +304,21 @@ aec_decision aec_policy_block(aec_policy *policy, const aec_block *block)
         policy->below_floor_frames += 1;
         if (policy->below_floor_frames >= AEC_FLOOR_QUALIFYING_FRAMES && !policy->failed_over) {
             policy->failed_over = true;
+            policy->failed_over_ms = block->now_ms;
             policy->state = AEC_STATE_BYPASSED;
             decision.action = AEC_ACTION_FAILOVER;
             return decision;
         }
     } else {
         policy->below_floor_frames = 0;
-        if (policy->failed_over) { policy->failed_over = false; }
+        /* Reachable only for a filter that is still RUNNING -- the bypass
+         * scores 0 dB by construction and leaves through the retry above. It
+         * is kept because a canceller that recovered on its own must not be
+         * made to wait out the retry clock. */
+        if (policy->failed_over) {
+            policy->failed_over = false;
+            policy->failed_over_ms = INT64_MIN;
+        }
     }
 
     /* DIVERGENCE, relative to what this filter itself achieved. A filter that

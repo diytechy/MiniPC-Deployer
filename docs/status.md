@@ -29,7 +29,6 @@ Evidence: `python scripts/check.py` reports **PASS** at gate G1 — 2291 passed,
 
 Next action: Owner ratification of the SR-047 spine rows, then the deploy per `stack/litellm/README.md`. Active gate remains G1. **Also awaiting the Owner: LLR-979..984 were destroyed by a `git checkout` during this session before they had ever been committed, and are rebuilt from the shipped code, its docstrings and the surviving test cases. Every one of those six Details is marked `[RECONSTRUCTED 2026-09-19 ...]`; the marker stays until the Owner has read them.**
 
-
 **2026-09-17 (later) — Draft, reviewer round complete, Owner ratification pending: the merged bus becomes the visualizer source, and one narrow raw-PCM exception (SN-041/SR-041/LLR-950..958/IF-020; TC-960..975).** Work package G of the panel kiosk state build. One new least-privileged unit, `wall-bus-visualizer.service`, opens `bus_monitor` — the merged, PRE-switch ALSA bus — and fans each captured block into a bounded schema-2 telemetry document and an OPTIONAL bounded local PCM stream for ProjectM. `switch_backend` reads that document instead of the `speaker_tap`-derived one. codex gpt-5.6-terra (medium) reviewed and returned two findings; one was accepted, one was accepted in part with the rejected half written down.
 
 * **Accepted, major: capture teardown could hang, and the capture outlived a mode change.** `close()` drained the child's stderr BEFORE terminating it — the amplifier detector's pattern, copied out of the one context where it is safe. The detector only ever drains after its read loop has broken, so the child is gone and the pipe is at EOF; here `close()` also runs on service stop and on a mode change, with `arecord` alive and quiet, and `read(2048)` on a live silent pipe blocks until it has 2048 bytes. systemd would have killed the control group on EVERY stop. Separately, when `_pump` returned on a mode change the loop sat in the not-in-bus branch holding the `bus_monitor` dsnoop reader open for as long as the panel stayed out of bus mode — contention beside the very legs a mode switch is trying to rearrange. Terminate-then-drain, and release before the wait. The reviewer was also right that the existing tests would have passed the defect: `FakeCapture` has no pipes. A real subprocess test now holds both pipes open and writes nothing.
@@ -2274,3 +2273,165 @@ code and tests remain unchanged. The Owner subsequently selected the in-hold
 audible strategy: the non-blocking guarded actor, absolute virtual target and
 causal preview reconciliation are now the asserted target. The 250 ms lifecycle
 gap remains the documented default unless the Owner objects.
+
+**2026-09-19 — the rocker plan implemented, and a preview path that had never
+run.** Strategy B of `PANEL_VOLUME_ROCKER_RESPONSIVENESS_PLAN_2026-09-18.md` is
+built. `RampPlanner` and its 500 ms / 25%-per-second model are withdrawn:
+`PulsePlanner` charges exactly one 5% step per firmware break pulse, the quiet
+gap ends the gesture and adds nothing, and `VirtualTarget` applies pulses to one
+clamped absolute level in event order (98 → up → down = 95). The quiet-gap
+`snap` is gone from the rocker — it could move the level with no pulse behind
+it. Applies moved off the input loop onto `ApplyActor`, bounded to one request
+in flight plus one replaceable target; ten pulses during one ~0.5 s apply now
+produce two applies rather than ten. `wall_audio_state.py` gained
+`state_revision`, which advances on every accepted change to output, input
+mute, a levelled output's level or adapter presence and on nothing else, and
+`set_volume_guarded` applies an absolute target as a compare-and-set against
+the mode, output, level and revision it was computed on. The applier answers
+`ok:OUTPUT:LEVEL:REVISION` or `refused:REASON` on stdout; the broker rebuilds
+both the argv and the verdict from parsed parts, and a refused guard is not a
+failed unit.
+
+**The preview file had never once been written on the real panel.** The journal
+of a unit running since 16:22 on 2026-09-18 carried
+`volume gesture stamp: [Errno 13] Permission denied:
+'/run/wall-panel/volume-gesture.json'` for every press since WSN-063 shipped:
+/run/wall-panel is created by root units at 0755 and this unit is `DynamicUser`
+under `ProtectSystem=strict`. It now has its own `RuntimeDirectory` and
+publishes the schema-2 preview to `/run/wall-volume-gesture`. Pointing
+`RuntimeDirectory=` at `wall-panel` would have been the wrong fix: systemd
+chowns it to the unit's user on every start.
+
+**Two AEC defects found while reviewing the microphone fixes.** Failover to
+passthrough was written as a health state with a recovery branch that could
+never run — the bypass copies the microphone to the output, so the residual IS
+the microphone, so ERLE is exactly 0 dB on every qualifying frame after it, and
+0 is below every legal floor. It was a one-way latch for the life of the daemon,
+and the panel had entered it at 17:10:18 on 2026-09-18 with no measured profile
+and a guessed 40 ms pre-delay. Separately, `aec_policy_rearm` left `failed_over`
+set while writing `state = CONVERGING`, so after each of the session's 13 xruns
+the published status contradicted what the shell did. Both fixed:
+`aec_policy_rearm` ends the bypass with the filter it judged, and
+`AEC_FAILOVER_RETRY_MS` gives a bypassed canceller a fresh cold start every ten
+minutes. Still outstanding and needing hardware: the panel has no
+`aec-profile.json` at all, so the corrected pre-delay direction is applied to a
+guessed 40 ms geometry.
+
+Three adversarial Terra rounds (gpt-5.6-terra, medium) found ten defects across
+the new code; all ten were fixed and pinned by tests — adjacent gestures
+baselining on a stale confirmation instead of the actor's intent, a stranded
+preview after a daemon kill, terminals published and unlinked in the same
+breath, an unbounded future-dated stamp, a transient read failure read as a
+cancellation, expiry measured from the read rather than the document stamp, and
+a SIGTERM that could not wake an idle `poll(None)`. Verified: 2087 pytest
+passed / 28 skipped, `validate_config.py` all checks passed, 129 AEC policy +
+31 PCM + 5 publisher C checks passed. Not deployed; the Owner deploys
+separately.
+
+## 2026-09-19 — WSN-024's routed-device backend, and carrying the Pandora login
+
+**Pairing, trust and discoverability now reach the glass.** `switch_backend` has
+been saying at length that it "routes nothing" and that WSN-024 keeps the
+routed-device backend disabled until the BlueZ feasibility gate settles; the
+Owner settled it by asking for the whole thing. The privilege boundary is the
+one the switch already uses — the broker runs as `panel` with AF_UNIX and
+ProtectSystem=strict and cannot drive BlueZ, so it writes one request file and
+`wall-bluetooth-device` answers it as root, beside `wall-audio-output`.
+
+`bluetooth_state` is the ONE alias rule and both sides import it, because a
+second spelling is how the renderer names a device the applier cannot find.
+Aliases are slugs of the device's own BlueZ name, ordered BY ADDRESS so the same
+two devices get the same two aliases on every poll — the renderer holds an alias
+between painting a row and the finger landing on it. **No hardware address is
+ever in the broker's process:** its document carries aliases only, the request
+carries the alias, and the applier resolves it. That is architecture rather than
+a promise somebody has to keep remembering.
+
+**The applier's presence is what ARMS the backend.** `serve()` checks for it at
+startup and keeps `switch_only_authorization` when it is absent, so a panel
+without it refuses `pair` at the gate rather than accepting it into a request
+file nothing will read — which would leave the broker's journal sticky-pending
+on a mutation that never had anywhere to go.
+
+`select_output` is a leg BESIDE the Mute/Headset/Speaker switch and deliberately
+not a fourth position of it: that enum is validated in six places and is the
+control the person at the glass is holding, and widening it would put the room's
+music inside a radio's failure modes. `bus_monitor` is a dsnoop and takes as
+many readers as ask. `select_input` is a preference handed to `wall-bt-mic`,
+which already supervises the HFP SCO leg; it can move a leg but never conjure
+one, so a working microphone stays working.
+
+**Two bugs the tests found and the code would not have.** `request_landed` was
+never routed through `call`, so the broker's capability probe succeeded and
+every DEVICE sequence was then checked against the SWITCH applier's high-water
+mark — a coin toss between replaying a `forget` and dropping a `pair`; the
+method now travels with the sequence. And `lstrip("./")` takes a SET OF
+CHARACTERS, so the Pandora archive's path guard turned `../../../etc/shadow`
+into `etc/shadow` and never saw the `..` it exists to catch.
+
+**The Pandora sign-in now survives a reimage.** Measured before built: no
+service reinstall loses it, and it survived all ~67 paired releases since the
+2026-09-11 reimage. A REIMAGE loses it, by recreating /home/panel, and nothing
+carried it forward. `wall-pandora-session save|restore|status` is that carry;
+firstboot restores a staged archive once and declines on every later boot
+because a sign-in is already there. It refuses when a keyring is installed,
+because the cookie key would then live somewhere the archive does not.
+
+**Three adversarial Terra rounds (gpt-5.6-terra, medium) found and closed
+thirteen defects.** The ones worth carrying:
+
+* **One mailbox file for non-idempotent verbs.** The switch's design was reused
+  verbatim and it is only correct for idempotent verbs: two taps before the path
+  unit fired left the first request overwritten, the applier's high-water mark
+  advanced past BOTH sequences, and `request_landed` reported the destroyed
+  request as landed. A `forget` the person asked for and was told had happened
+  did not happen. It is a spool directory now, drained in sequence order.
+* **`request_landed` was never routed through `call`.** The broker probes
+  `hasattr(backend, "request_landed")` and then asks through `call` like
+  everything else, so the method existed, the probe succeeded, and every DEVICE
+  sequence was checked against the SWITCH applier's mark.
+* **`lstrip("./")` takes a SET OF CHARACTERS**, so the Pandora archive's path
+  guard turned `../../../etc/shadow` into `etc/shadow` and never saw the `..`.
+* **BlueZ names an unresolved device after its own address**, and `name` sat in
+  the document beside the alias we were so careful about -- so an address
+  crossed the boundary, and the broker's validator then rejected the WHOLE
+  document, making one unresolved device cost every other device its row.
+* **Address-ordered aliases are stable for a FIXED set and not otherwise.** A
+  second phone also called "Pixel", with a lower address, took the bare alias
+  and pushed the first to `pixel-2` -- so a tap on a row painted a moment
+  earlier acted on the other phone. Aliases now carry forward.
+* **HFP's two UUIDs are opposite roles.** `111e` is the handsfree UNIT (a
+  headset) and `111f` is the audio GATEWAY (a phone); treating them as one made
+  every phone an output, and `select_input` refuses a non-input -- so the panel
+  could not select the phone whose microphone `wall-bt-mic` exists to carry.
+* **A bounded drain that strands work.** Whether `DirectoryNotEmpty=` fires again
+  for a directory that was already non-empty is a systemd detail a revocation
+  should not be bet on, so the observe timer drains too and ten seconds is the
+  worst case either way -- with a non-blocking lock, because the two are
+  different units and would otherwise both drain at once.
+* **A unit timeout that was right until the unit's job changed.** `observe` was
+  bounded at 25 s to sit under the broker's staleness bound; the moment it
+  gained the drain, that killed a `pair` at 25 s when a pair is deliberately
+  allowed 40, leaving BlueZ half way with the request already consumed.
+* **Every `OSError` read as lock contention**, so a `/run` that could not be
+  written looked exactly like a drain already in progress: exit 0, spool
+  untouched, unit green, forever.
+
+**One honest testing gap.** `wall-bluetooth-agent.py` imports `dbus` and `gi` at
+module scope, so its passkey publishing and its new SIGTERM handling have no
+unit test here -- the development box has neither binding. The fixes it carries
+(a FRESH document at window open rather than a merge, and a signal handler so
+the `finally` that retires it actually runs) are reasoned in the file and
+verified by reading; they are not proven by a test, and writing one that read
+the source back would prove nothing.
+
+`pytest tests/`: 2198 passed, 30 skipped, 0 failed. `scripts/check.py`:
+config-validate, registry-integrity and doc-navigability all pass.
+
+**Not deployed, and the Bluetooth half has never met a radio.** The acceptance
+plan is HomeHub
+`docs/PANEL_ACCEPTANCE_WSN024_AND_PANDORA_2026-09-19.md`; its §0 — save the
+Pandora sign-in off the panel BEFORE deploying — is not optional, because that
+sign-in is the one thing in scope that cannot be rebuilt from a repository.
+Spine: **SR-023** (amended), **SR-046**, **IF-015** (amended), LLR-979..984,
+TC-1017..1022.

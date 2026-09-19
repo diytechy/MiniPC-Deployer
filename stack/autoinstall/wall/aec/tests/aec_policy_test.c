@@ -380,6 +380,60 @@ static void test_absolute_floor(void)
        "and both facts the shell gates on are set together");
 }
 
+static void test_failover_is_not_one_way(void)
+{
+    /* THE BYPASS SCORES 0 dB BY CONSTRUCTION, so it could never measure its
+     * own way out. `engine_block` implements the bypass by copying the
+     * microphone to the output, which makes the residual identical to the
+     * microphone, which makes ERLE exactly 0 on every qualifying frame after
+     * it -- and 0 is below every legal floor. The recovery branch in
+     * `aec_policy_block` was therefore unreachable and the "state" was a
+     * one-way latch for the life of the daemon. Measured on the panel
+     * 2026-09-18: one below-floor window at 17:10:18, with no measured
+     * profile and a guessed 40 ms pre-delay, and the cancelled microphone was
+     * silently a raw one until the unit was restarted six minutes later.
+     *
+     * Two ways out are asserted here, and they are different things: the
+     * clock, and any re-arm. */
+    aec_profile profile = fixture_profile();
+    aec_policy policy;
+    aec_policy_init(&policy, &profile, 0);
+    aec_action saw = AEC_ACTION_NONE;
+    int64_t now = feed(&policy, AEC_WARMUP_QUALIFYING_FRAMES, 5.0, 0, &saw);
+    saw = AEC_ACTION_NONE;
+    now = feed(&policy, AEC_FLOOR_QUALIFYING_FRAMES, 5.0, now, &saw);
+    ok(policy.failed_over, "the canceller is bypassed");
+
+    /* The room is now perfect -- and the daemon cannot see it, because the
+     * filter it would have to measure is not running. Feeding 0 dB, which is
+     * what a bypass actually produces, must not leave it bypassed forever. */
+    saw = AEC_ACTION_NONE;
+    feed(&policy, 8, 0.0, now, &saw);
+    ok(policy.failed_over, "a bypass does not un-latch itself on one frame");
+    saw = AEC_ACTION_NONE;
+    feed(&policy, 8, 0.0, now + AEC_FAILOVER_RETRY_MS + 1, &saw);
+    ok(saw == AEC_ACTION_RESET_FILTER, "the retry clock re-initialises the filter");
+    ok(!policy.failed_over, "and ends the bypass so the shell cancels again");
+    ok(policy.state == AEC_STATE_CONVERGING,
+       "the replacement filter is converging, which is now true rather than a claim");
+
+    /* AND A RE-ARM ENDS IT TOO. An xrun destroys the filter the failover was
+     * an opinion about; leaving the latch set wrote CONVERGING into the status
+     * while the shell went on passing the microphone through. The panel logged
+     * 13 xruns in one session on 2026-09-18, and every one of them re-armed
+     * into that contradiction. */
+    aec_policy_init(&policy, &profile, 0);
+    saw = AEC_ACTION_NONE;
+    now = feed(&policy, AEC_WARMUP_QUALIFYING_FRAMES, 5.0, 0, &saw);
+    saw = AEC_ACTION_NONE;
+    now = feed(&policy, AEC_FLOOR_QUALIFYING_FRAMES, 5.0, now, &saw);
+    ok(policy.failed_over, "bypassed again");
+    aec_policy_xrun(&policy, now);
+    ok(!policy.failed_over, "an xrun re-arm ends the bypass with the filter it judged");
+    ok(policy.state == AEC_STATE_CONVERGING,
+       "and the state it publishes agrees with what the shell will do");
+}
+
 /* ── the resampler handoff ───────────────────────────────────────────────── */
 
 static void test_drift_admission(void)
@@ -659,6 +713,7 @@ int main(void)
     test_give_up_bound();
     test_reset_rate_limit();
     test_absolute_floor();
+    test_failover_is_not_one_way();
     test_drift_admission();
     test_drift_controller();
     test_xrun();

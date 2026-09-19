@@ -178,6 +178,35 @@ address is the control — but the client still requires an `Authorization`
 header. A placeholder that *looks* like a real key would be worse than none, so
 the test asserts the exact string.
 
+## Deploying this to a box that does not have it yet
+
+**The `.env` keys are a hard prerequisite, not a later step.** `.env.example`
+carries them; a box provisioned before this lane existed does not, and nothing
+merges the example into a live `/opt/homehub/stack/.env`. Read from the hub on
+2026-09-19, before any of this shipped:
+
+```
+LITELLM_CONTAINER_IP = <ABSENT>      DEVPC_HOST           = 192.168.117.243
+DEVPC_WAKE_PORT      = <ABSENT>      DEVPC_INFERENCE_PORT = 11434
+DEVPC_WAKE_URL       = <ABSENT>      LITELLM_ENABLED      = <ABSENT>
+```
+
+Only `LITELLM_CONTAINER_IP` is fatal, and it fails in the right direction:
+`llm-isolation.sh` refuses to program a partial fence and dies with *"refusing
+to fence nothing"*, so `homehub-llm-isolation.service` fails and
+`homehub-litellm.service`, which `Requires=` it, does not start. **But the
+fence unit is enabled unconditionally by firstboot whenever the payload
+directory is present** — so syncing the tree without adding that one key gives
+you a failed unit on every boot, with a `WARN` in the firstboot log and no
+lane. Add the key in the same change that delivers the tree.
+
+The other three absences are all benign and deliberate: `DEVPC_WAKE_PORT`
+defaults to 8799 in the script, and an absent `DEVPC_WAKE_URL` and
+`LITELLM_ENABLED` are exactly the shipped-off state described below.
+
+`DEVPC_HOST` and `DEVPC_INFERENCE_PORT` are already present and correct on the
+hub, and the fence uses them as they are.
+
 ## Operating notes
 
 - **Enable with `LITELLM_ENABLED=true`, never by adding `litellm` to

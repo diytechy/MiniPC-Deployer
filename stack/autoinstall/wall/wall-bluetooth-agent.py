@@ -40,6 +40,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import time
 
@@ -192,6 +193,20 @@ def _address_of(device):
     return ":".join(part.upper() for part in parts)
 
 
+def _open_window(seconds):
+    """Start a FRESH pairing document. Never merges into an old one.
+
+    `_publish` merges, which is right for adding a passkey to a window that is
+    already open and WRONG for opening one (terra, 2026-09-19, finding 6). An
+    agent that is killed rather than asked to quit does not run its `finally` --
+    which is the ORDINARY case here, because the window helper terminates it --
+    so `pairing.json` routinely survives with the last passkey and address still
+    in it. Merging a new `expiresAt` into that made a previous pairing's number
+    active again, to be compared against a different phone.
+    """
+    _write({"expiresAt": int(time.time()) + seconds})
+
+
 def _publish(update):
     """Merge one fact into the pairing document. Never raises.
 
@@ -209,8 +224,17 @@ def _publish(update):
         if not isinstance(current, dict):
             current = {}
         current.update(update)
+        _write(current)
+    except OSError as error:
+        log("could not publish the pairing state: %s" % error)
+
+
+def _write(document):
+    """Replace the pairing document atomically. Never raises."""
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
         temporary = PAIRING_PATH.with_name(PAIRING_PATH.name + ".new")
-        temporary.write_text(json.dumps(current, sort_keys=True) + LINE_END, encoding="utf-8")
+        temporary.write_text(json.dumps(document, sort_keys=True) + LINE_END, encoding="utf-8")
         os.chmod(temporary, 0o644)
         os.replace(temporary, PAIRING_PATH)
     except OSError as error:
@@ -273,8 +297,20 @@ def main(argv=None):
     # opens; most pairings never produce a number at all (a NoInputNoOutput
     # speaker has nothing to show), and a UI that only appeared for the ones
     # that did would leave the common case looking like nothing had happened.
-    _publish({"expiresAt": int(time.time()) + args.timeout})
+    #
+    # A FRESH DOCUMENT, not a merge: see _open_window.
+    _open_window(args.timeout)
     loop = GLib.MainLoop()
+    # AND `finally` IS NOT ENOUGH ON ITS OWN. The window helper stops this agent
+    # with a signal, and Python's default SIGTERM handling exits without
+    # unwinding, so the retire below would never run and the passkey would
+    # outlive its window every single time. Turning the signal into a quit makes
+    # the ordinary path the clean one.
+    for signal_number in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signal_number, lambda *_: loop.quit())
+        except (ValueError, OSError):
+            pass
     # A SECOND BOUND on top of the caller's own lifetime management: if the
     # window helper is killed without cleaning up, this still exits on its own.
     GLib.timeout_add_seconds(args.timeout, lambda: (loop.quit(), False)[1])

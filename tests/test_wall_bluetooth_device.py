@@ -81,22 +81,42 @@ def test_a_device_named_after_its_own_address_never_gets_an_address_shaped_alias
     assert not routing.HARDWARE_ADDRESS.search(alias)
 
 
-def test_aliases_are_stable_across_polls_and_never_collide():
-    """The renderer holds an alias between the paint and the finger landing.
-
-    So two devices with the same name must get the same two aliases every time,
-    in any order BlueZ lists them -- otherwise a tap lands on the other phone.
-    """
+def test_aliases_do_not_depend_on_the_order_bluez_lists_devices_in():
     devices = [("AA:BB:CC:DD:EE:01", "Pixel"), ("AA:BB:CC:DD:EE:02", "Pixel")]
     first = bluetooth_state.assign_aliases(devices)
     assert bluetooth_state.assign_aliases(list(reversed(devices))) == first
     assert len(set(first.values())) == 2
-    # The FIRST claimant keeps the bare slug, so the common case never grows a
-    # suffix and an alias never changes because an unrelated device appeared.
     assert first["AA:BB:CC:DD:EE:01"] == "pixel"
     assert first["AA:BB:CC:DD:EE:02"] == "pixel-2"
-    alone = bluetooth_state.assign_aliases([devices[0]])
-    assert alone["AA:BB:CC:DD:EE:01"] == "pixel"
+
+
+# THE DEFECT THIS PREVENTS, and it is the one address ordering could not: a
+# device that is ALREADY ON THE GLASS must not be renamed because another device
+# appeared. Ordering by address is stable for a fixed set and not otherwise -- a
+# second "Pixel" with a LOWER address took the bare alias and pushed the first to
+# `pixel-2`, so a tap on a row painted a moment earlier acted on the other phone.
+def test_a_device_already_on_the_glass_keeps_its_alias_when_another_appears():
+    alone = bluetooth_state.assign_aliases([("AA:BB:CC:DD:EE:02", "Pixel")])
+    assert alone["AA:BB:CC:DD:EE:02"] == "pixel"
+    both = bluetooth_state.assign_aliases(
+        [("AA:BB:CC:DD:EE:01", "Pixel"), ("AA:BB:CC:DD:EE:02", "Pixel")], alone)
+    assert both["AA:BB:CC:DD:EE:02"] == "pixel", "the device on the glass kept its name"
+    assert both["AA:BB:CC:DD:EE:01"] == "pixel-2"
+    # ...and it keeps it across every later poll, including one where the other
+    # device has gone away again.
+    assert bluetooth_state.assign_aliases([("AA:BB:CC:DD:EE:02", "Pixel")], both)["AA:BB:CC:DD:EE:02"] == "pixel"
+
+
+def test_a_renamed_device_gets_the_new_name_rather_than_keeping_the_old_alias():
+    before = bluetooth_state.assign_aliases([("AA:BB:CC:DD:EE:01", "Pixel")])
+    after = bluetooth_state.assign_aliases([("AA:BB:CC:DD:EE:01", "Studio Speaker")], before)
+    assert after["AA:BB:CC:DD:EE:01"] == "studio-speaker"
+
+
+def test_a_previous_map_naming_a_device_that_is_gone_does_not_reserve_its_alias():
+    stale = {"AA:BB:CC:DD:EE:09": "pixel"}
+    assigned = bluetooth_state.assign_aliases([("AA:BB:CC:DD:EE:01", "Pixel")], stale)
+    assert assigned == {"AA:BB:CC:DD:EE:01": "pixel"}
 
 
 def test_a_device_literally_named_like_a_suffix_does_not_steal_it():
@@ -115,7 +135,16 @@ def test_a_device_literally_named_like_a_suffix_does_not_steal_it():
     # the choice somebody makes about it.
     (["0000110a-0000-1000-8000-00805f9b34fb",
       "0000110b-0000-1000-8000-00805f9b34fb"], "output"),
+    # HFP's two UUIDs are OPPOSITE ROLES and were treated as one. 111e is the
+    # Handsfree UNIT -- a headset, so an output. 111f is the Audio GATEWAY -- a
+    # phone, so an input. Lumping them made every phone an output, and
+    # `select_input` refuses a device whose kind is not input, so the panel could
+    # not choose the phone whose microphone wall-bt-mic exists to carry.
     (["0000111e-0000-1000-8000-00805f9b34fb"], "output"),
+    (["0000111f-0000-1000-8000-00805f9b34fb"], "input"),
+    # A real phone: A2DP source plus the HFP gateway.
+    (["0000110a-0000-1000-8000-00805f9b34fb",
+      "0000111f-0000-1000-8000-00805f9b34fb"], "input"),
     ([], "input"),
     (None, "input"),
 ])
@@ -237,11 +266,17 @@ def backend(tmp_path):
     applier.write_text("#!/bin/sh\n", encoding="utf-8")
     switch = FakeSwitch()
     made = routed_backend.RoutedDeviceBackend(
-        switch, state_path=state, request_path=tmp_path / "request.json", applier_path=applier)
+        switch, state_path=state, request_path=tmp_path / "spool", applier_path=applier)
     made.switch_fake = switch
     made.state_file = state
-    made.request_file = tmp_path / "request.json"
+    made.spool = tmp_path / "spool"
     return made
+
+
+def spooled(backend):
+    """Every request the backend has written, oldest first."""
+    return [json.loads(path.read_text(encoding="utf-8"))
+            for path in bluetooth_request.pending(backend.spool)]
 
 
 def _cancel():
@@ -321,10 +356,23 @@ def test_a_passkey_that_is_not_digits_is_dropped_rather_than_shown(backend, pass
 def test_a_verb_becomes_a_request_file_scoped_to_the_documents_epoch(backend):
     result = backend.call("trust", {"alias": "flip", "trusted": True}, _cancel())
     assert result["accepted"] is True
-    written = json.loads(backend.request_file.read_text(encoding="utf-8"))
-    assert written["event"] == {"kind": "trust", "alias": "flip", "trusted": True}
-    assert written["generation"] == 3
-    assert written["seq"] == result["seq"]
+    written = spooled(backend)
+    assert len(written) == 1
+    assert written[0]["event"] == {"kind": "trust", "alias": "flip", "trusted": True}
+    assert written[0]["generation"] == 3
+    assert written[0]["seq"] == result["seq"]
+
+
+# THE DEFECT THIS PREVENTS. With one mailbox file the second write destroyed the
+# first, the applier advanced its high-water mark past both sequences, and
+# `request_landed` then reported the destroyed request as landed -- so a
+# revocation the person asked for and was told had happened simply did not.
+def test_two_requests_in_a_burst_both_survive_to_the_applier(backend):
+    first = backend.call("forget", {"alias": "pixel"}, _cancel())
+    second = backend.call("trust", {"alias": "flip", "trusted": True}, _cancel())
+    written = spooled(backend)
+    assert [item["seq"] for item in written] == [first["seq"], second["seq"]]
+    assert [item["event"]["kind"] for item in written] == ["forget", "trust"]
 
 
 def test_select_inputs_explicit_gate_does_not_travel(backend):
@@ -335,14 +383,13 @@ def test_select_inputs_explicit_gate_does_not_travel(backend):
     reader -- and bluetooth_request would refuse the stray key anyway.
     """
     backend.call("select_input", {"alias": "pixel", "explicit": True}, _cancel())
-    written = json.loads(backend.request_file.read_text(encoding="utf-8"))
-    assert written["event"] == {"kind": "select_input", "alias": "pixel"}
+    assert spooled(backend)[0]["event"] == {"kind": "select_input", "alias": "pixel"}
 
 
 def test_an_unreadable_document_sends_the_request_unscoped(backend):
     backend.state_file.unlink()
     backend.call("cancel", {}, _cancel())
-    assert "generation" not in json.loads(backend.request_file.read_text(encoding="utf-8"))
+    assert "generation" not in spooled(backend)[0]
 
 
 def test_two_requests_inside_one_microsecond_still_get_increasing_sequences(backend):
@@ -352,19 +399,31 @@ def test_two_requests_inside_one_microsecond_still_get_increasing_sequences(back
     assert second > first
 
 
+# THE ONE THAT ACTUALLY BITES. A broker restart resets `_last_seq` to -1; a wall
+# clock stepped backwards in between -- NTP correcting a dead RTC is how that
+# happens here -- then mints a sequence BELOW the applier's persisted mark, and
+# every request is discarded as old while `_submit` goes on returning accepted.
+def test_a_restarted_broker_with_a_backwards_clock_still_outranks_the_applier(backend):
+    # The document's mark is 100; a clock this far back mints a sequence of 1.
+    backend.clock = lambda: 1_000_000_000
+    fresh = backend.call("cancel", {}, _cancel())
+    assert fresh["seq"] > 100
+    assert spooled(backend)[0]["seq"] > 100
+
+
 def test_a_missing_applier_refuses_the_verb_rather_than_writing_a_request(backend):
     backend.applier_path.unlink()
     from audio_router import BrokerError
     with pytest.raises(BrokerError) as raised:
         backend.call("pair", {"alias": "flip"}, _cancel())
     assert raised.value.code == "backend_unavailable"
-    assert not backend.request_file.exists()
+    assert spooled(backend) == []
 
 
 def test_switch_verbs_are_delegated_untouched(backend):
     backend.call("set_output", {"output": "headset"}, _cancel())
     assert ("set_output", {"output": "headset"}) in backend.switch_fake.calls
-    assert not backend.request_file.exists()
+    assert spooled(backend) == []
 
 
 # THE BUG THIS PREVENTS: two appliers, two high-water marks, one microsecond
@@ -434,52 +493,120 @@ def applier(tmp_path, monkeypatch):
                  "MARK_PATH", "DISCOVERY_PID_PATH"):
         monkeypatch.setattr(module, name, run / (name.lower().replace("_path", "") + ".json"))
     monkeypatch.setattr(module, "adapter", lambda: ("ready", True, False, False))
-    monkeypatch.setattr(module, "inventory", lambda: [
+    module.devices = [
         {"address": "AA:BB:CC:DD:EE:01", "name": "Pixel", "paired": True, "trusted": True,
          "connected": True, "uuids": ["0000110a-0000-1000-8000-00805f9b34fb"], "battery": 80},
-    ])
+    ]
+    # KEPT BEFORE IT IS REPLACED. Most tests want the fake -- they are about the
+    # drain, not about bluetoothctl -- but the deadline tests are about the real
+    # loop, and asserting against the fake would prove nothing at all.
+    module.real_inventory = module.inventory
+    monkeypatch.setattr(module, "inventory", lambda deadline=None: list(module.devices))
     module.performed = []
     monkeypatch.setattr(module, "perform", lambda event, aliases: (
         module.performed.append(event) or True))
+    module.spool = tmp_path / "spool"
+    module.spool.mkdir()
     return module
 
 
 def test_the_published_document_carries_no_hardware_address(applier):
     rows, aliases = applier.publish()
     text = applier.STATE_PATH.read_text(encoding="utf-8")
-    assert "AA:BB:CC:DD:EE:01" not in text
-    assert "aabbccddee01" not in text.lower()
+    # `aliasesByAddress` is deliberately in this file, so the addresses ARE
+    # present -- see publish(). What must never appear is an address inside the
+    # fields the broker reads.
+    document = json.loads(text)
+    assert "AA:BB:CC:DD:EE:01" not in json.dumps(document["devices"])
+    assert "AA:BB:CC:DD:EE:01" not in json.dumps(document["route"])
+    assert "AA:BB:CC:DD:EE:01" not in json.dumps(document["pairing"])
     assert rows[0]["alias"] == "pixel" and rows[0]["kind"] == "input"
     assert aliases["AA:BB:CC:DD:EE:01"] == "pixel"
 
 
-def test_a_replayed_request_is_performed_once(applier, tmp_path):
-    request = tmp_path / "request.json"
-    bluetooth_request.write(500, {"kind": "cancel"}, request, generation=0)
-    assert applier.apply_request(request) == 0
+# BLUEZ NAMES AN UNRESOLVED DEVICE AFTER ITS OWN ADDRESS, and `name` goes into
+# the document beside the alias we were so careful about. The broker's validator
+# then rejects the WHOLE document, so one unresolved device made every other
+# device's row vanish.
+def test_a_device_named_after_its_address_publishes_no_address_and_costs_nobody_their_row(applier):
+    applier.devices = [
+        {"address": "AA:BB:CC:DD:EE:01", "name": "Pixel", "paired": True, "trusted": True,
+         "connected": True, "uuids": [], "battery": None},
+        {"address": "AA:BB:CC:DD:EE:0F", "name": "AA:BB:CC:DD:EE:0F", "paired": False,
+         "trusted": False, "connected": False, "uuids": [], "battery": None},
+    ]
+    rows, _aliases = applier.publish()
+    assert len(rows) == 2, "the unresolved device must not cost the other one its row"
+    for row in rows:
+        assert not routing.HARDWARE_ADDRESS.search(row["name"]), row
+        assert not routing.HARDWARE_ADDRESS.search(row["alias"]), row
+    # ...and the document the broker reads survives its own validator.
+    devices = routed_backend.RoutedDeviceBackend._devices(json.loads(
+        applier.STATE_PATH.read_text(encoding="utf-8"))["devices"])
+    assert devices is not None and len(devices) == 2
+
+
+# A publish that cannot finish inside its budget says "do not know" rather than
+# presenting the devices it managed to read as the whole list.
+def test_a_publish_that_runs_out_of_budget_reports_do_not_know(applier, monkeypatch):
+    monkeypatch.setattr(applier, "inventory", lambda deadline=None: None)
+    rows, _aliases = applier.publish()
+    assert rows == []
+    assert json.loads(applier.STATE_PATH.read_text(encoding="utf-8"))["reason"] == "unavailable"
+
+
+def test_a_replayed_request_is_performed_once(applier):
+    bluetooth_request.write(500, {"kind": "cancel"}, applier.spool, generation=0)
+    assert applier.apply_request(applier.spool) == 0
     assert len(applier.performed) == 1
-    # systemd.path fires again for a rewrite of an identical request.
-    assert applier.apply_request(request) == 0
-    assert len(applier.performed) == 1, "a replayed request must not act twice"
+    # The drain CONSUMES the file, so an ordinary second fire finds nothing.
+    assert applier.apply_request(applier.spool) == 0
+    assert len(applier.performed) == 1
+    # ...and a request the broker re-spools under a sequence it has already used
+    # -- the belt to the consumed file's braces -- is still refused.
+    bluetooth_request.write(500, {"kind": "cancel"}, applier.spool, generation=0)
+    assert applier.apply_request(applier.spool) == 0
+    assert len(applier.performed) == 1, "a replayed sequence must not act twice"
     # ...and a NEWER one still gets through.
-    bluetooth_request.write(501, {"kind": "cancel"}, request, generation=0)
-    assert applier.apply_request(request) == 0
+    bluetooth_request.write(501, {"kind": "cancel"}, applier.spool, generation=0)
+    assert applier.apply_request(applier.spool) == 0
     assert len(applier.performed) == 2
 
 
-def test_a_request_from_a_previous_life_of_the_applier_is_ignored(applier, tmp_path):
-    request = tmp_path / "request.json"
-    bluetooth_request.write(9, {"kind": "cancel"}, request, generation=7)
-    applier.apply_request(request)
+# THE WHOLE POINT OF THE SPOOL. Two taps before the path unit fires used to leave
+# the first request overwritten and reported as landed.
+def test_a_burst_is_drained_in_order_and_nothing_is_lost(applier):
+    for seq, kind in ((10, "cancel"), (20, "cancel"), (30, "cancel")):
+        bluetooth_request.write(seq, {"kind": kind}, applier.spool, generation=0)
+    assert applier.apply_request(applier.spool) == 0
+    assert len(applier.performed) == 3
+    assert bluetooth_request.pending(applier.spool) == []
+    _generation, mark = applier.mark()
+    assert mark == 30
+
+
+def test_a_drain_is_bounded(applier):
+    for seq in range(1, bluetooth_request.MAX_DRAIN + 5):
+        bluetooth_request.write(seq, {"kind": "cancel"}, applier.spool, generation=0)
+    applier.apply_request(applier.spool)
+    assert len(applier.performed) == bluetooth_request.MAX_DRAIN
+    # The remainder is still spooled, and the next fire takes it: a bound is not
+    # a discard.
+    assert len(bluetooth_request.pending(applier.spool)) == 4
+
+
+def test_a_request_from_a_previous_life_of_the_applier_is_ignored(applier):
+    bluetooth_request.write(9, {"kind": "cancel"}, applier.spool, generation=7)
+    applier.apply_request(applier.spool)
     assert applier.performed == [], "the applier is at epoch 0, not 7"
+    assert bluetooth_request.pending(applier.spool) == [], "and it is consumed, not left to retry"
 
 
-def test_an_unscoped_request_is_still_performed(applier, tmp_path):
+def test_an_unscoped_request_is_still_performed(applier):
     """What an older broker sends, and what a broker that could not read the
     document sends. Refusing it would take device management down over a file."""
-    request = tmp_path / "request.json"
-    bluetooth_request.write(9, {"kind": "cancel"}, request)
-    applier.apply_request(request)
+    bluetooth_request.write(9, {"kind": "cancel"}, applier.spool)
+    applier.apply_request(applier.spool)
     assert applier.performed == [{"kind": "cancel"}]
 
 
@@ -490,17 +617,21 @@ def test_an_unscoped_request_is_still_performed(applier, tmp_path):
     {"version": 1, "seq": 1},
     {"version": 1, "seq": 1, "event": "cancel"},
 ])
-def test_a_request_the_applier_cannot_read_is_ignored_and_never_fatal(applier, tmp_path, payload):
-    request = tmp_path / "request.json"
-    request.write_text(json.dumps(payload), encoding="utf-8")
-    assert applier.apply_request(request) == 0
+def test_a_request_the_applier_cannot_read_is_ignored_and_never_fatal(applier, payload):
+    (applier.spool / bluetooth_request.request_name(7)).write_text(
+        json.dumps(payload), encoding="utf-8")
+    assert applier.apply_request(applier.spool) == 0
     assert applier.performed == []
+    # CONSUMED, not left to be re-read forever: a request nothing can understand
+    # would otherwise keep the spool non-empty, and DirectoryNotEmpty would
+    # restart the applier against it on every settle.
+    assert bluetooth_request.pending(applier.spool) == []
     # It still republished, because the document going stale is what tells the
     # panel something is wrong -- and nothing is.
     assert applier.STATE_PATH.exists()
 
 
-def test_the_mark_moves_before_the_action(applier, tmp_path, monkeypatch):
+def test_the_mark_moves_before_the_action(applier, monkeypatch):
     """A process that dies mid-pairing must not have its request replayed.
 
     A half-finished bond re-attempted is the sticky case wall-bluetooth-pairing
@@ -509,8 +640,93 @@ def test_the_mark_moves_before_the_action(applier, tmp_path, monkeypatch):
     def explode(event, aliases):
         raise RuntimeError("the radio went away")
     monkeypatch.setattr(applier, "perform", explode)
-    request = tmp_path / "request.json"
-    bluetooth_request.write(42, {"kind": "pair", "alias": "pixel"}, request, generation=0)
-    assert applier.apply_request(request) == 0
+    bluetooth_request.write(42, {"kind": "pair", "alias": "pixel"}, applier.spool, generation=0)
+    assert applier.apply_request(applier.spool) == 0
     _generation, seq = applier.mark()
     assert seq == 42
+    assert bluetooth_request.pending(applier.spool) == [], "and the file is gone too"
+
+
+# ---------------------------------------------- terra round 2, the three fixes
+
+
+# R2/1. Stopping at MAX_DRAIN leaves the directory non-empty, and whether
+# DirectoryNotEmpty= fires again for a directory that was ALREADY non-empty when
+# the unit started is a systemd detail a revocation should not be bet on. The
+# observe timer drains too, so ten seconds is the worst case either way.
+def test_the_observe_verb_drains_a_spool_the_bound_left_behind(applier):
+    for seq in range(1, bluetooth_request.MAX_DRAIN + 3):
+        bluetooth_request.write(seq, {"kind": "cancel"}, applier.spool, generation=0)
+    applier.main(["observe", str(applier.spool)])
+    assert len(applier.performed) == bluetooth_request.MAX_DRAIN
+    applier.main(["observe", str(applier.spool)])
+    assert len(applier.performed) == bluetooth_request.MAX_DRAIN + 2
+    assert bluetooth_request.pending(applier.spool) == []
+
+
+def test_observe_and_apply_request_are_the_same_drain(applier):
+    bluetooth_request.write(5, {"kind": "cancel"}, applier.spool, generation=0)
+    applier.main(["observe", str(applier.spool)])
+    assert applier.performed == [{"kind": "cancel"}]
+    assert bluetooth_request.pending(applier.spool) == []
+
+
+# R2/2. Rename A while a NEW device with A's old name appears: without the
+# reservation, A's alias falls free in the same pass and B takes it, so a row
+# painted before the rename resolves to B.
+def test_an_alias_freed_by_a_rename_is_not_handed_straight_to_another_device():
+    before = bluetooth_state.assign_aliases([("AA:BB:CC:DD:EE:01", "Pixel")])
+    assert before["AA:BB:CC:DD:EE:01"] == "pixel"
+    after = bluetooth_state.assign_aliases(
+        [("AA:BB:CC:DD:EE:01", "Other"), ("AA:BB:CC:DD:EE:02", "Pixel")], before)
+    assert after["AA:BB:CC:DD:EE:01"] == "other"
+    assert after["AA:BB:CC:DD:EE:02"] != "pixel", "the renamed device's alias was reserved"
+    assert len(set(after.values())) == 2
+
+
+# ...but only while the device is still here. Reserving a departed device's
+# alias would make the map grow for the life of the boot for no benefit: nothing
+# can be painted for a device the document no longer carries.
+def test_a_departed_devices_alias_is_reusable():
+    before = {"AA:BB:CC:DD:EE:09": "pixel"}
+    after = bluetooth_state.assign_aliases([("AA:BB:CC:DD:EE:01", "Pixel")], before)
+    assert after["AA:BB:CC:DD:EE:01"] == "pixel"
+
+
+# R2/3. The budget has to cover the LISTING and the LAST PROBE, not just the gaps
+# between probes: outside it, the worst case was the control timeout plus the
+# whole budget plus one probe, past the thirty seconds the broker gives the
+# document before it stops believing it.
+def test_a_listing_that_runs_long_is_do_not_know_rather_than_an_empty_room(applier, monkeypatch):
+    monkeypatch.setattr(applier, "known_addresses", lambda deadline=None: None)
+    assert applier.real_inventory(applier.time.monotonic() + 5) is None
+
+
+def test_the_deadline_is_checked_after_the_last_probe_too(applier, monkeypatch):
+    # One device, and the probe itself consumes the whole budget. Before the
+    # post-loop check this returned a complete-looking list with that device
+    # silently missing from it.
+    monkeypatch.setattr(applier, "known_addresses", lambda deadline=None: ["AA:BB:CC:DD:EE:01"])
+    monkeypatch.setattr(applier, "device_info", lambda address: None)
+    deadline = applier.time.monotonic() - 1
+    assert applier.real_inventory(deadline) is None
+
+
+# terra round 3. Mapping every OSError to contention meant a /run that could not
+# be written looked exactly like a drain already in progress: the caller exited
+# 0, the spool was never processed, and the unit reported success forever.
+def test_a_lock_that_cannot_be_opened_fails_loudly_instead_of_looking_contended(applier, monkeypatch):
+    bluetooth_request.write(5, {"kind": "cancel"}, applier.spool, generation=0)
+    monkeypatch.setattr(applier, "drain_lock", lambda: (_ for _ in ()).throw(OSError("read-only")))
+    assert applier.apply_request(applier.spool) == 1
+    assert applier.performed == []
+    # UNTOUCHED, so the next observe tick still has the work.
+    assert len(bluetooth_request.pending(applier.spool)) == 1
+
+
+def test_a_contended_lock_leaves_the_work_to_the_holder_and_is_not_a_failure(applier, monkeypatch):
+    bluetooth_request.write(5, {"kind": "cancel"}, applier.spool, generation=0)
+    monkeypatch.setattr(applier, "drain_lock", lambda: False)
+    assert applier.apply_request(applier.spool) == 0
+    assert applier.performed == []
+    assert len(bluetooth_request.pending(applier.spool)) == 1

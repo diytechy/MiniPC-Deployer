@@ -105,7 +105,7 @@ class RoutedDeviceBackend:
                  applier_path=None, clock=time.time_ns, now=time.time):
         self.switch = switch
         self.state_path = Path(state_path or DEFAULT_STATE_PATH)
-        self.request_path = Path(request_path or bluetooth_request.DEFAULT_PATH)
+        self.request_dir = Path(request_path or bluetooth_request.DEFAULT_DIR)
         self.applier_path = Path(applier_path or DEFAULT_APPLIER_PATH)
         self.clock = clock
         self.now = now
@@ -228,9 +228,11 @@ class RoutedDeviceBackend:
         return {"kind": method, "alias": params["alias"]}
 
     def _submit(self, event: dict) -> dict:
-        seq = self._next_seq()
+        document = self._document()
+        seq = self._next_seq(document)
         try:
-            bluetooth_request.write(seq, event, self.request_path, self._generation())
+            bluetooth_request.write(seq, event, self.request_dir,
+                                    None if document is None else document["generation"])
         except bluetooth_request.RequestError as error:
             # A request this module built and this module refused is a bug in
             # `_event`, not a transient. It is still not allowed to carry its
@@ -240,19 +242,27 @@ class RoutedDeviceBackend:
             raise _broker_error("backend_failure", "could not write the device request")
         return {"accepted": True, "seq": seq}
 
-    def _next_seq(self) -> int:
-        """A sequence above every one this process has already minted.
+    def _next_seq(self, document=None) -> int:
+        """A sequence above every one this process has minted AND above the
+        applier's own high-water mark.
 
-        Two taps inside one microsecond, or a clock stepped backwards, would
-        otherwise mint a value the applier's deduplication discards in silence
-        -- and a `pair` that is silently discarded looks exactly like a pairing
-        that failed. `switch_backend._next_seq` carries the same guard for the
-        same reason.
+        THE SECOND HALF IS NOT OPTIONAL and this file shipped without it (terra,
+        2026-09-19, finding 5). Two taps inside one microsecond are the obvious
+        case and `_last_seq` covers them. The one that actually bites is a
+        BROKER RESTART: `_last_seq` starts at -1 again, and if the wall clock has
+        stepped backwards in between -- NTP correcting a dead RTC is the ordinary
+        way that happens on this box -- the next sequence lands BELOW the mark
+        the applier persisted in /run and every request is discarded as old, in
+        silence, while `_submit` goes on returning accepted. `switch_backend`
+        documents this exact guard; this one merely referred to it.
         """
+        mark = None if document is None else document["requestSeq"]
         with self._seq_lock:
             seq = bluetooth_request.next_seq(self.clock)
             if seq <= self._last_seq:
                 seq = self._last_seq + 1
+            if mark is not None and seq <= mark:
+                seq = mark + 1
             self._last_seq = seq
             return seq
 
@@ -422,18 +432,20 @@ class RoutedDeviceBackend:
             "endsInSeconds": ends,
         }
 
-    def _generation(self):
-        """The applier epoch this request is scoped to, or None.
-
-        OMITTED RATHER THAN GUESSED when the document cannot be read, which is
-        the rule `switch_request.envelope` states at length: zero is a CLAIM
-        about which life of the applier this belongs to, the applier would
-        refuse it, and device management would go dark on a panel whose only
-        fault was an unreadable file. An unscoped request is accepted and
-        journalled instead.
-        """
-        document = self._document()
-        return None if document is None else document["generation"]
+    # `_generation` was folded into `_submit`, which already has the document in
+    # hand. The rule it carried stands and is repeated there: the epoch is
+    # OMITTED rather than guessed when the document cannot be read, because zero
+    # is a CLAIM about which life of the applier a request belongs to and the
+    # applier would refuse it.
+    #
+    # THE EPOCH IS CONSTANT WITHIN A BOOT, and that is correct rather than
+    # unfinished. It exists to stop a request outliving the applier state that
+    # orders it. Both live in /run -- the broker's spool under
+    # RuntimeDirectoryPreserve=restart, the applier's mark in
+    # /run/wall-bluetooth -- so they are wiped together at a reboot and survive
+    # together across either process restarting. There is no event that
+    # invalidates one and not the other, so there is nothing for the epoch to
+    # count; the guard that does the real work is `_next_seq`'s mark comparison.
 
 
 def backend_from_environment(switch):

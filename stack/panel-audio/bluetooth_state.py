@@ -43,7 +43,16 @@ ALIAS_MAX = 48
 # "the route selector will not accept my speaker".
 AUDIO_SOURCE_UUID = "0000110a"   # the far end SOURCES audio -> panel input
 AUDIO_SINK_UUID = "0000110b"     # the far end SINKS audio   -> panel output
-HANDSFREE_UUIDS = ("0000111e", "0000111f")  # HFP: a headset, both directions
+
+# THE TWO HFP UUIDS ARE OPPOSITE ROLES AND WERE TREATED AS ONE (terra,
+# 2026-09-19, finding 4). `111e` is Handsfree -- the HF role, which is what a
+# HEADSET advertises -- and `111f` is HandsfreeAudioGateway, which is what a
+# PHONE advertises. Lumping both under "a headset, both directions" classified
+# every phone as an output, and `select_input` refuses a device whose kind is
+# not `input`, so the panel could not select the phone whose microphone
+# `wall-bt-mic` exists to carry. The primary use of the verb was unreachable.
+HANDSFREE_UNIT_UUID = "0000111e"     # the far end is a headset  -> panel output
+HANDSFREE_GATEWAY_UUID = "0000111f"  # the far end is a phone    -> panel input
 
 # What a device is when its UUIDs say nothing useful. A device BlueZ has not
 # resolved services for yet is still worth showing -- it is the one you are
@@ -98,49 +107,89 @@ def fallback_alias(index: int) -> str:
     return "device-%d" % index
 
 
-def assign_aliases(devices):
+def assign_aliases(devices, previous=None):
     """[(address, name)] -> {address: alias}, stable and collision-free.
 
-    STABLE MEANS ORDERED BY ADDRESS. The renderer holds an alias between the
-    paint and the tap, and the applier resolves it back to an address on the
-    other side of the boundary, so two devices that slug the same must get the
-    same two aliases every single time. BlueZ's own listing order is not a
-    promise, so it is not used: the addresses are sorted first and the suffix
-    falls out of that.
+    A DEVICE KEEPS THE ALIAS IT WAS LAST PUBLISHED UNDER, and that is the whole
+    of the stability guarantee. Ordering by address is not enough and shipped
+    once as if it were: it is stable for a FIXED set of devices and not
+    otherwise, so a second phone also called "Pixel", with a LOWER address,
+    took the bare `pixel` and pushed the first one to `pixel-2`. A tap on a row
+    painted a moment earlier then paired, trusted, forgot or routed the wrong
+    phone (terra, 2026-09-19, finding 3).
 
-    The suffix is `-2`, `-3`, ... on the SECOND and later claimants, so the
-    common case -- one device with a distinct name -- never grows one, and an
-    alias never changes because an unrelated device appeared.
+    `previous` is the applier's last published map. A device in it keeps its
+    alias UNLESS the alias it would derive from its CURRENT name has a different
+    base -- somebody renaming their phone should see the new name, and nothing
+    is holding a row from before the rename. Everything else is assigned as
+    before: sorted by address, bare slug to the first claimant, `-2`, `-3` after.
+
+    Still deterministic: (previous, devices) in, one map out, no clock and no
+    randomness.
     """
-    taken: dict[str, int] = {}
+    previous = {str(key).upper(): value for key, value in (previous or {}).items()}
+    ordered = sorted(devices, key=lambda item: str(item[0]).upper())
+    bases = {}
+    for index, (address, name) in enumerate(ordered, 1):
+        bases[str(address)] = slug(name) or fallback_alias(index)
+
     assigned: dict[str, str] = {}
-    for index, (address, name) in enumerate(sorted(devices, key=lambda item: str(item[0]).upper()), 1):
-        base = slug(name) or fallback_alias(index)
-        count = taken.get(base, 0) + 1
-        taken[base] = count
-        alias = base if count == 1 else "%s-%d" % (base[:ALIAS_MAX - 3], count)
-        # The suffix can still collide with a device literally named "thing-2".
-        # Bounded rather than clever: keep appending until it is free, which
-        # terminates because `taken` only grows.
-        while alias in assigned.values():
+    used: set[str] = set()
+    # Pass one: honour the previous assignment, where it still matches the name.
+    for address, base in bases.items():
+        held = previous.get(address.upper())
+        if held and held not in used and (held == base or held.startswith(base + "-")):
+            assigned[address] = held
+            used.add(held)
+    # AN ALIAS A DEVICE HELD A MOMENT AGO IS NOT HANDED STRAIGHT TO ANOTHER ONE
+    # (terra round 2, finding 2). Rename device A from "Pixel" to "Other" while a
+    # NEW device B called "Pixel" appears, and without this A's `pixel` falls
+    # free in pass two and B takes it -- so a row painted before the rename sends
+    # `pixel` and the broker resolves it to B. Reserving it costs B a suffix.
+    #
+    # ONLY FOR A DEVICE THAT IS STILL HERE. An alias belonging to a device that
+    # has GONE is not reserved: nothing can be painted for a device the document
+    # no longer carries, and reserving those would make the map grow for the life
+    # of the boot.
+    for address in bases:
+        held = previous.get(address.upper())
+        if held and address not in assigned:
+            used.add(held)
+    # Pass two: everything left, in address order, taking the first free suffix.
+    for address, base in bases.items():
+        if address in assigned:
+            continue
+        alias = base
+        count = 1
+        # Bounded rather than clever: `used` only grows, so this terminates, and
+        # it also steps over a device literally named "thing-2".
+        while alias in used:
             count += 1
-            taken[base] = count
             alias = "%s-%d" % (base[:ALIAS_MAX - 3], count)
-        assigned[str(address)] = alias
+        assigned[address] = alias
+        used.add(alias)
     return assigned
 
 
 def classify(uuids) -> str:
     """The panel-relative kind of a device, from its service UUIDs.
 
-    A device that is BOTH (a headset: it sinks the room's audio and sources a
-    microphone) is an OUTPUT, because that is the choice the Owner makes about
-    it -- "send the music there". Its microphone reaches the panel through the
-    separate mic-source selection, not through this kind.
+    ONE KIND PER DEVICE, because `kind` is IF-015's shape and is validated in
+    five places; a device that is genuinely both gets the one the Owner is more
+    likely to mean by it. A HEADSET sinks the room's audio and sources a
+    microphone, and "send the music there" is the choice somebody makes about
+    it, so a sink wins: its microphone reaches the panel through the mic-source
+    selection, which is `select_input` against a different device.
+
+    The residual, stated rather than discovered: a device advertising BOTH an
+    A2DP sink and an HFP gateway -- a car kit is the realistic one -- is an
+    output here and cannot be chosen as the mic source. Splitting `kind` into
+    two independent capabilities is the honest fix for that and is a protocol
+    change, not this one.
     """
     prefixes = {str(uuid).lower()[:8] for uuid in uuids or ()}
-    if AUDIO_SINK_UUID in prefixes or prefixes & set(HANDSFREE_UUIDS):
+    if AUDIO_SINK_UUID in prefixes or HANDSFREE_UNIT_UUID in prefixes:
         return "output"
-    if AUDIO_SOURCE_UUID in prefixes:
+    if AUDIO_SOURCE_UUID in prefixes or HANDSFREE_GATEWAY_UUID in prefixes:
         return "input"
     return DEFAULT_KIND

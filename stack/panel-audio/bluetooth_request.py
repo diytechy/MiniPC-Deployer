@@ -31,15 +31,40 @@ import os
 from pathlib import Path
 import time
 
-# IN THE BROKER'S OWN RuntimeDirectory, beside the switch request and not in a
-# directory of its own. That directory already exists, is already 0700
-# panel:panel, and already carries `RuntimeDirectoryPreserve=restart` -- which
-# the switch work needed because systemd removing the directory between the
-# write and the applier's read would take the request with it while the broker's
-# completed journal, in StateDirectory, outlived the effect it acknowledged. The
-# same hazard applies here, and inheriting the fix is better than re-deriving it
-# in a second unit stanza somebody would have to keep in step.
-DEFAULT_PATH = Path("/run/wall-audio-router/bluetooth-request.json")
+# A SPOOL DIRECTORY, NOT ONE MAILBOX FILE, and that is the difference between
+# this and the switch's request (terra, 2026-09-19, finding 1).
+#
+# The switch writes ONE file that the applier reads, and that is correct there
+# because every switch verb is idempotent: a request overwritten before it was
+# read costs at most a position somebody is about to ask for again. Device verbs
+# are not like that. Two taps in quick succession -- `forget` then `trust` --
+# both return accepted, the second atomic replace destroys the first, and the
+# applier advances its high-water mark past BOTH sequences, so `request_landed`
+# then reports the destroyed one as landed. A revocation the person asked for
+# and was told had happened simply does not happen.
+#
+# So each request is its own file, named by its sequence, and the applier DRAINS
+# the directory in sequence order. `DirectoryNotEmpty=` is the systemd spool
+# idiom and is what the path unit watches.
+#
+# STILL INSIDE THE BROKER'S OWN RuntimeDirectory. That directory is already 0700
+# panel:panel and already carries `RuntimeDirectoryPreserve=restart` -- which the
+# switch work needed because systemd removing the directory between the write
+# and the applier's read would take the request with it while the broker's
+# completed journal, in StateDirectory, outlived the effect it acknowledged.
+DEFAULT_DIR = Path("/run/wall-audio-router/bluetooth-requests")
+
+# Zero-padded so a lexical directory listing is a numeric ordering. A microsecond
+# epoch is sixteen digits today and twenty carries it past any clock this panel
+# will run under; an unpadded name would sort "9" after "10" and apply a newer
+# request before an older one.
+SEQ_DIGITS = 20
+
+# How many requests one drain will perform. A bound rather than a queue policy:
+# the broker holds a mutation lock and cannot produce these faster than a person
+# can tap, so reaching this means something is wrong, and doing unbounded work
+# inside a oneshot unit is how a wedge becomes a wedge nobody can interrupt.
+MAX_DRAIN = 64
 
 # The verbs the applier accepts. `status` and `telemetry` are absent by
 # construction: they are observations, answered from the document, and a
@@ -156,11 +181,43 @@ def _check_event(event):
         raise RequestError("pairing confirmation is invalid")
 
 
-def write(seq, event, path=DEFAULT_PATH, generation=None):
-    """Write one request atomically. Returns the path written."""
+def request_name(seq):
+    """The spool filename for one sequence."""
+    return "%0*d.json" % (SEQ_DIGITS, int(seq))
+
+
+def pending(directory=DEFAULT_DIR):
+    """Every spooled request, oldest sequence first.
+
+    Names that are not a sequence are IGNORED rather than refused: the applier
+    writes its own temporaries into this directory, and a partially written
+    `.new` must not stop the drain. It is also not the applier's business to
+    police a directory only the broker writes to.
+    """
+    try:
+        names = sorted(item.name for item in Path(directory).iterdir())
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        stem = name[:-len(".json")] if name.endswith(".json") else None
+        if stem and stem.isdigit():
+            found.append(Path(directory) / name)
+    return found
+
+
+def write(seq, event, directory=DEFAULT_DIR, generation=None):
+    """Spool one request atomically. Returns the path written.
+
+    One rename into place, so the applier -- which runs the instant the
+    directory stops being empty -- never reads half a request.
+    """
     payload = json.dumps(envelope(seq, event, generation), sort_keys=True) + "\n"
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / request_name(seq)
+    # The temporary is a sibling, so the rename is within one filesystem, and it
+    # is named so `pending` skips it: a `.json.new` has a non-numeric stem.
     temporary = path.with_name(path.name + ".new")
     with open(temporary, "w", encoding="utf-8") as handle:
         handle.write(payload)

@@ -19,9 +19,17 @@
 # the request with it while the broker's completed journal outlived the effect
 # it had acknowledged. Inheriting that is better than re-deriving it here.
 #
-# PathChanged, not PathModified: systemd fires the former on close-write, so one
-# complete request produces one apply rather than one per write() the broker
-# happens to make.
+# DirectoryNotEmpty, NOT PathChanged on one file. The broker spools each request
+# under its own sequence-named filename and the applier DRAINS the directory in
+# order, because device verbs are not idempotent: with one mailbox file, two taps
+# before this unit fired left the first request overwritten, the applier's
+# high-water mark advanced past both sequences, and `request_landed` reported the
+# destroyed request as landed. A `forget` the person asked for and was told had
+# happened simply did not happen.
+#
+# DirectoryNotEmpty is the systemd spool idiom: it activates whenever the
+# directory has anything in it, and re-activates if the drain leaves work behind,
+# so nothing is lost to a race between the write and the read.
 
 # NOT `wall-bluetooth-apply`, WHICH IS ALREADY SOMETHING ELSE. That name belongs
 # to the at-rest policy applier (`/usr/local/sbin/wall-bluetooth-apply`, run by
@@ -34,10 +42,12 @@ Description=Wall panel: apply one Bluetooth device request from the broker
 Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
 
 [Path]
-PathChanged=/run/wall-audio-router/bluetooth-request.json
+DirectoryNotEmpty=/run/wall-audio-router/bluetooth-requests
 # The broker's RuntimeDirectory disappears when it stops; systemd re-arms the
 # watch on the parent chain when it comes back, so this unit does not have to be
-# ordered after the broker or restarted with it.
+# ordered after the broker or restarted with it. The broker creates the spool
+# directory itself on its first write (bluetooth_request.write), which is why
+# this does not.
 MakeDirectory=false
 
 [Install]

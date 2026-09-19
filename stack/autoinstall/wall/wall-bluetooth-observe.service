@@ -19,7 +19,22 @@ Requires=bluetooth.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/wall-bluetooth-device publish
+ExecStart=/usr/local/sbin/wall-bluetooth-device observe
+# THE SAME BOUND AS THE APPLY UNIT, BECAUSE THIS UNIT NOW DRAINS TOO. It was 25
+# seconds, chosen to sit under the broker's thirty-second staleness bound so a
+# hung publish became a stale document rather than a unit that never returned.
+# That reasoning was correct for a unit that only published and became WRONG the
+# moment `observe` gained the drain (terra round 3): a `pair` is deliberately
+# allowed forty seconds on the radio, so a pairing picked up here was killed
+# mid-bond at twenty-five -- and the request has already been marked and consumed
+# by then, so nothing retries it and BlueZ is left half way.
+#
+# The freshness promise does not depend on this number. `publish` carries its own
+# PUBLISH_BUDGET_SECONDS and gives up into an honest "do not know" well inside
+# the staleness bound; this is only the backstop for a bluetoothctl that is
+# neither finished nor killable, and for that case a stale document is the right
+# outcome whether it arrives at twenty-five seconds or ninety.
+TimeoutStartSec=90
 SyslogIdentifier=wall-bluetooth-device
 StandardOutput=journal
 StandardError=journal

@@ -180,3 +180,28 @@ def test_status_reports_absence_as_a_nonzero_exit(tool, capsys):
     write_cookies(tool.PARTITION)
     assert tool.status() == 0
     assert "expires" in capsys.readouterr().out
+
+
+# terra, 2026-09-19, finding 8. With `--replace`, an archive holding only
+# `Local Storage` used to restore cleanly, leave this panel's EXISTING Cookies
+# in place, and then report success because `auth_cookies()` found them -- one
+# box's credentials mixed with another's player state, announced as a restored
+# session.
+def test_an_archive_carrying_no_cookies_is_refused_before_anything_is_replaced(tool, tmp_path):
+    write_cookies(tool.PARTITION)
+    (tool.PARTITION / "Local Storage").mkdir()
+    (tool.PARTITION / "Local Storage" / "mine.log").write_bytes(b"this panel")
+
+    archive = tmp_path / "storage-only.tar.gz"
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "leveldb.log").write_bytes(b"another panel")
+    with tarfile.open(archive, "w:gz") as bundle:
+        bundle.add(other, arcname="Local Storage")
+
+    with pytest.raises(SystemExit) as raised:
+        tool.restore(str(archive), True)
+    assert "carries no Cookies" in str(raised.value)
+    # Nothing was replaced: this panel's own storage is untouched.
+    assert (tool.PARTITION / "Local Storage" / "mine.log").read_bytes() == b"this panel"
+    assert set(tool.auth_cookies()) == {"at", "wrt"}

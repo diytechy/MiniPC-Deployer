@@ -290,6 +290,15 @@ def restore(archive, replace):
                 bundle.extractall(staged, members=_safe_members(bundle, str(source)))
         except tarfile.TarError as error:
             fail(f"could not read {source}: {error}")
+        # THE ARCHIVE MUST CARRY THE SIGN-IN IT CLAIMS TO BE (terra, 2026-09-19,
+        # finding 8). Without this, an archive holding only `Local Storage`
+        # restored cleanly with `--replace`, left the panel's EXISTING Cookies
+        # in place, and then reported success because `auth_cookies()` found
+        # them -- a mix of one box's credentials and another's player state,
+        # announced as a restored session.
+        if not (staged / "Cookies").is_file():
+            fail(f"{source} carries no Cookies; it is not a Pandora session and "
+                 "restoring it would mix this panel's sign-in with another's state")
         restored = []
         for name in CARRIED:
             item = staged / name

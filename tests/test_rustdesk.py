@@ -4,6 +4,7 @@ Verifies: SR-045 / LLR-971, LLR-972, LLR-973, LLR-976, LLR-977
 Cases:    TC-997 .. TC-1001, TC-1008, TC-1009, TC-1011, TC-1012
 """
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -85,11 +86,64 @@ def test_both_address_families_are_programmed_sr045():
 
 # --- TC-1008 --------------------------------------------------------------
 def test_rules_are_replayed_idempotently_by_marker_sr045():
-    live = _live(ISO.read_text(encoding="utf-8"))
-    assert "COMPUTE" not in live  # guard against a stray edit
+    """The previous version of this test asserted the literal string "-D INPUT"
+    was present, and it PASSED for weeks while the delete could not work: the
+    script stripped only "-A " from `-A INPUT -s ...`, leaving the chain at the
+    head of the spec, and then named the chain AGAIN in `-D INPUT $spec`.
+    iptables answered "Invalid rule number `INPUT'" every time and a `|| break`
+    swallowed it, so each run appended a fresh set on top of the last.
+
+    Substring presence is not behaviour. This exercises the transformation on a
+    real `iptables -S` line instead."""
+    src = ISO.read_text(encoding="utf-8")
+    live = _live(src)
     assert "purge iptables" in live and "purge ip6tables" in live
     assert "--comment $COMMENT" in live, "rules must be identified by marker"
-    assert "-D INPUT" in live, "a replay must remove its own prior rules"
+
+    # The exact shape `iptables -S INPUT` prints for one of our own rules.
+    sample = ("-A INPUT -s 192.168.117.0/24 -p tcp -m multiport "
+              "--dports 21115,21116 -m comment --comment "
+              "homehub-rustdesk-isolation -j ACCEPT")
+
+    sed_expr = re.search(r"sed '([^']+)'", live)
+    assert sed_expr, "the purge must still derive the spec with sed"
+    spec = subprocess.run(["sed", sed_expr.group(1)], input=sample,
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+    delete = re.search(r"\$bin -D (\S+)", live)
+    assert delete, "the purge must still issue a delete"
+    argv = ("iptables -D " + delete.group(1).replace("$spec", spec)).split()
+
+    # The chain must appear EXACTLY once in the resulting command line.
+    assert argv.count("INPUT") == 1, (
+        "the chain is named %d times in %r - naming it twice is the bug that "
+        "made every run accumulate rules" % (argv.count("INPUT"), " ".join(argv)))
+    assert argv[:3] == ["iptables", "-D", "INPUT"], " ".join(argv)
+    assert "--comment" in argv and "homehub-rustdesk-isolation" in argv
+
+    # And a failed delete must now be fatal, not swallowed: a stale REJECT left
+    # ahead of a freshly appended ACCEPT silently defeats the new rule.
+    assert "|| break" not in live, "a failed delete must not be swallowed"
+    assert re.search(r"if ! \$bin -D", live), "a failed delete must stop the run"
+
+
+def test_loopback_is_admitted_or_hbbs_kills_itself_sr045():
+    """hbbs runs a startup self-test against its own 0.0.0.0:21116. That
+    connection arrives over loopback, so a fence admitting only the LAN and the
+    tunnel rejects it, the test times out ("Timeout of test_hbbs") and hbbs
+    EXITS 1 - and with `restart: "no"` it stays dead while the relay beside it
+    keeps running. Found by deploying it, 2026-09-18.
+
+    The loopback ACCEPT must also be installed BEFORE the REJECT, or it is
+    unreachable."""
+    live = _live(ISO.read_text(encoding="utf-8"))
+    assert "-i lo" in live, "hbbs cannot complete its own health check without this"
+
+    accept_lo = live.index("-i lo")
+    reject = live.index("-j REJECT")
+    assert accept_lo < reject, (
+        "the loopback ACCEPT must be appended before the REJECT; INPUT is "
+        "evaluated in order and a rule after the REJECT is never reached")
 
 
 # --- TC-1001 --------------------------------------------------------------

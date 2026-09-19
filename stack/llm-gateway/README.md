@@ -82,28 +82,52 @@ them can be minted in advance by the deploy tooling:
 
 | | Where it comes from |
 |---|---|
-| `ENCRYPTION_KEY` | **is** an env var — `openssl rand -hex 32`, set **before first start** |
-| The bearer key | minted in the **dashboard**; no env var sets it |
-| The admin account | created in the **dashboard**, gated by a one-time setup code |
+| `ENCRYPTION_KEY` | **is** an env var — 64 hex chars, set **before first start** |
+| The bearer key | the app **generates** it at first start and prints it **once** |
+| The admin account | created in the **dashboard**, at `POST /api/auth/setup` |
 
-The setup code is printed in the server log while no account exists, and exists
-precisely because this install is reachable from other devices:
+Capture the bearer key from the log the first time the container runs. Nothing
+re-prints it on a later boot:
 
 ```
-docker logs llm-gateway 2>&1 | grep -i setup
+docker logs llm-gateway 2>&1 | grep -i "unified API key"
 ```
+
+### The pinned version has no setup code
+
+Upstream's current `.env.example` on `main` describes a one-time setup code,
+printed while no account exists, that a non-local device must present to claim
+the dashboard. **`v0.3.0` does not implement it.** Verified on the running
+container, not inferred: no such line appears in the log, and `/api/auth/setup`
+answers a malformed body with a validation error rather than demanding a code.
+
+So on this version **whoever reaches the dashboard first claims it**. Within
+this household's threat model that is acceptable, but it makes claiming the
+account a prompt task rather than a leisurely one. Re-check it whenever the
+image pin rotates — the gate appearing is a welcome change, not a regression.
 
 **The encryption key's ordering worry was real but does not apply here.** Earlier
 notes in this repo said to let the container run once and check whether it
 generated a key before minting one, to avoid overwriting a real key with a dead
 one. That came from upstream's *non-production* path, where an unset key is
 auto-generated into a `.encryption-key` file. The pinned image sets
-`NODE_ENV=production` in its own config, and upstream documents the key as
-**required** in production — so it must be set before the first start and the
-ordering hazard cannot arise. Checked against the image config, not assumed.
+`NODE_ENV=production`, and upstream documents the key as **required** in
+production — so it must be set before the first start and the ordering hazard
+cannot arise. Checked against the image config, and then confirmed by the
+container starting healthy with the key supplied.
 
 Keep a copy of that key **off the hub**. It lives inside the volume's backup,
 and a key whose only copy sits beside the data it decrypts is not a backup.
+
+### The name must exist on THIS resolver
+
+Caddy serving `llm.<domain>` is not enough: Technitium holds the split-horizon
+zone and has **no wildcard**, so the name needs an explicit A record or no LAN
+client can reach it. `provision-technitium.sh` now adds one, guarded on
+`LLM_GATEWAY_SUBDOMAIN`. This is the `wall.<domain>` bug of 2026-08-08 exactly —
+read the long note in that script. The Cloudflare wildcard is precisely what
+hides the failure, because it makes the name work from everywhere except the one
+network where it is used.
 
 ## Operating notes
 

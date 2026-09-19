@@ -75,13 +75,33 @@ command -v ip6tables >/dev/null 2>&1 || die "ip6tables not found - the v6 half o
 # Loop rather than delete-once: a previous run, a partial run, or an operator's
 # manual retry can leave several. Deleting until none match is what makes a
 # replay converge.
+# THIS FUNCTION DID NOT WORK UNTIL 2026-09-18, AND ITS FAILURE WAS SILENT.
+# `iptables -S INPUT` prints rules as `-A INPUT -s ... -j ACCEPT`. The old code
+# stripped only the leading `-A `, leaving `INPUT -s ... -j ACCEPT`, and then
+# passed that to `$bin -D INPUT $spec` - naming the chain TWICE. iptables
+# answered "Invalid rule number `INPUT'", the `|| break` swallowed it, and the
+# function returned 0 having removed nothing.
+#
+# So every run APPENDED a fresh set while the previous set stayed, which is the
+# exact opposite of the convergence the header promises - and the specific
+# hazard it names (a changed CIDR leaving the old, wider rule in front of the
+# new one) was live the whole time. Worse, order made it bite: the stale REJECT
+# sat AHEAD of a newly added loopback ACCEPT, so the new rule could not be
+# reached and the fix that depended on it appeared not to work.
+#
+# Strip the `-A ` and keep the chain in the spec, then let `-D` take both.
 purge() {
     local bin="$1" removed=0
     while $bin -S INPUT 2>/dev/null | grep -q -- "--comment $COMMENT"; do
         local spec
         spec="$($bin -S INPUT | grep -m1 -- "--comment $COMMENT" | sed 's/^-A //')"
         # shellcheck disable=SC2086
-        $bin -D INPUT $spec 2>/dev/null || break
+        # $spec still begins with the chain name, so this is `-D INPUT ...`.
+        # Deliberately NOT silenced: a delete that fails here used to be
+        # invisible, and an accumulating fence is worth a loud failure.
+        if ! $bin -D $spec; then
+            die "$bin: could not remove a stale rule ($spec). Refusing to append onto rules that did not clear, because a stale REJECT ahead of a new ACCEPT silently defeats it."
+        fi
         removed=$((removed + 1))
     done
     [ "$removed" -gt 0 ] && log "$bin: removed $removed stale rule(s)"
@@ -105,6 +125,28 @@ install_family() {
     for proto in tcp udp; do
         [ "$proto" = tcp ] && ports="$TCP_PORTS" || ports="$UDP_PORTS"
         [ -n "$ports" ] || continue
+
+        # LOOPBACK FIRST, AND IT IS NOT A CONVENIENCE - IT IS LOAD-BEARING.
+        # hbbs runs a SELF-TEST at startup: it connects to its own
+        # 0.0.0.0:21116 and waits for the answer. That connection arrives over
+        # loopback, so a fence that admits only the LAN and the tunnel rejects
+        # it, the test times out with "Timeout of test_hbbs", and hbbs EXITS 1.
+        # With `restart: "no"` on the container - which is itself deliberate -
+        # it then stays dead, and the symptom is a rendezvous server that
+        # listened for twenty seconds and vanished while the relay next to it
+        # kept running. The fence killed the service it exists to protect.
+        #
+        # Found by deploying it, 2026-09-18. The first read of the evidence was
+        # wrong in an instructive way: a refused connection from loopback was
+        # taken as proof the fence worked, when it was the failure itself.
+        #
+        # This ADMITS NOTHING OFF-BOX. Traffic arriving on `lo` cannot come from
+        # the LAN or the tunnel; the martian-source check drops a spoofed
+        # loopback source at the interface. So the exposure this fence controls
+        # is unchanged, and the service can complete its own health check.
+        $bin -A INPUT -i lo -p "$proto" -m multiport --dports "$ports" \
+            -m comment --comment "$COMMENT" -j ACCEPT \
+            || die "$bin: could not admit loopback for $proto/$ports (hbbs cannot self-test without it)"
 
         local cidr
         for cidr in $admitted; do

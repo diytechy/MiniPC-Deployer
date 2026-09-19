@@ -100,8 +100,15 @@ def test_env_example_declares_only_names_upstream_actually_reads_sr043():
     # And the file must say why the other two are absent, because an operator
     # who finds no bearer key here will otherwise assume the gateway has none.
     low = env.lower()
-    assert "minted in the dashboard" in low
-    assert "setup code" in low
+    assert "unified api key" in low, "say where the bearer key actually comes from"
+    assert "docker logs llm-gateway" in low, "and how to capture it before it is gone"
+
+    # The pinned version's setup-code behaviour must be stated as the PINNED
+    # version's, not as upstream's docs describe it. main documents a one-time
+    # code gating first-account creation from a non-local device; v0.3.0 does
+    # not implement it, verified on the running container. An operator told to
+    # look for a code that never prints concludes the deploy is broken.
+    assert "no setup code" in low
 
     # The real file must never be committable. stack/.env is covered by its own
     # rule; this one lives in a subdirectory and needed its own.

@@ -303,6 +303,23 @@ main() {
         echo "  note: MAIN_BOX_IP is unset — no mini-serv record. Correct only for a hub with no Mini-serv."
     fi
 
+    # THE LLM GATEWAY (SR-043), AND IT IS THE wall.<domain> BUG AGAIN. Caddy
+    # serves {$LLM_GATEWAY_HOST}, so without a record here the site exists, the
+    # container runs healthy, and no client on this LAN can reach it by name.
+    #
+    # It was nearly missed the same way, and by the same reasoning: the compose
+    # file said the wildcard DDNS record "already resolves it, so no new public
+    # name is created". That is true at Cloudflare and IRRELEVANT here. The
+    # wildcard is why the failure is invisible from anywhere NOT using this
+    # resolver — and this resolver is the only place the name is ever used. Read
+    # the WALL_HOST note above; this is the second instance of it.
+    #
+    # Guarded on the label being set, so a hub without the profile gets no
+    # record rather than one pointing at a service that is not there.
+    if [ -n "${LLM_GATEWAY_SUBDOMAIN:-}" ]; then
+        add_a "$TOKEN" "${LLM_GATEWAY_SUBDOMAIN}.${DOMAIN}" "$LAN_IP"
+    fi
+
     # Tier-2 opt-in subdomains (SR-012): bare labels from EXTRA_SUBDOMAINS in
     # .env (space/comma-separated, e.g. "vault photos music"), one A record each
     # → LAN_IP. Empty = no-op. Pairs with the commented Caddyfile sites.

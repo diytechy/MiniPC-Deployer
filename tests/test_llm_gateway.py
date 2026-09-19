@@ -78,19 +78,63 @@ def test_the_upstream_install_script_is_not_invoked_sr043():
 
 
 # --- TC-985 ---------------------------------------------------------------
-def test_bearer_key_is_declared_and_distinct_sr043():
-    """Required on every request INCLUDING from the LAN - a deliberate
-    departure, because ambient LAN trust is not enough for this one origin."""
+def test_env_example_declares_only_names_upstream_actually_reads_sr043():
+    """The previous version of this test asserted LLM_GATEWAY_API_KEY,
+    LLM_GATEWAY_ENCRYPTION_KEY and LLM_GATEWAY_ADMIN_PASSWORD were present in
+    our own example file. Upstream reads none of those names. The test read the
+    same file the names were invented in, so it could not have failed - the
+    same shape of mistake as a check that reads a Tailscale ACL nothing on the
+    box consults. It now asserts the names are ABSENT, so the invention cannot
+    come back."""
     env = ENVEX.read_text(encoding="utf-8")
-    assert "LLM_GATEWAY_API_KEY=" in env
-    assert "LLM_GATEWAY_ENCRYPTION_KEY=" in env
-    assert "LLM_GATEWAY_ADMIN_PASSWORD=" in env
-    # The three must be described as distinct, not interchangeable.
-    assert "not the same value" in env.lower() or "NOT the bearer key" in env
+
+    for invented in ("LLM_GATEWAY_API_KEY=", "LLM_GATEWAY_ENCRYPTION_KEY=",
+                     "LLM_GATEWAY_ADMIN_EMAIL=", "LLM_GATEWAY_ADMIN_PASSWORD="):
+        assert not re.search(r"^%s" % re.escape(invented), env, re.M), (
+            "%s is not a name upstream reads; setting it configures nothing "
+            "while reading as though it does" % invented)
+
+    # The one key that IS an environment variable, under upstream's own name.
+    assert re.search(r"^ENCRYPTION_KEY=", env, re.M)
+
+    # And the file must say why the other two are absent, because an operator
+    # who finds no bearer key here will otherwise assume the gateway has none.
+    low = env.lower()
+    assert "minted in the dashboard" in low
+    assert "setup code" in low
 
     # The real file must never be committable. stack/.env is covered by its own
     # rule; this one lives in a subdirectory and needed its own.
     assert "stack/llm-gateway/llm-gateway.env" in GITIGNORE.read_text(encoding="utf-8")
+
+
+def test_the_data_volume_is_mounted_where_the_image_actually_writes_sr043(compose):
+    """This said /app/data and the image declares VOLUME /app/server/data, so
+    the wrong path did not fail: docker made an ANONYMOUS volume at the real
+    path and the named one sat empty. The backup set would have captured an
+    empty volume while every provider credential lived somewhere unnamed."""
+    mounts = compose["services"]["llm-gateway"]["volumes"]
+    assert "llm_gateway_data:/app/server/data" in mounts
+    assert not any(m.endswith(":/app/data") for m in mounts)
+
+
+def test_one_proxy_hop_is_declared_so_callers_are_not_one_bucket_sr043(compose):
+    """Caddy is the only thing that can reach this container, so without
+    TRUST_PROXY every request appears to come from the bridge address and the
+    whole household shares one per-IP rate-limit bucket. `1` means one hop;
+    `true` would trust any hop."""
+    env = compose["services"]["llm-gateway"]["environment"]
+    assert str(env["TRUST_PROXY"]) == "1"
+    assert "HOST_BIND" not in env, (
+        "HOST_BIND selects a host publishing interface upstream-side; we publish "
+        "no port, so it bound nothing while reading as if it did")
+
+
+def test_no_healthcheck_override_shadows_the_images_correct_one_sr043(compose):
+    """The override here probed /health with wget: not a route this app serves,
+    not a binary in this node image. It would have reported the gateway
+    permanently unhealthy while the gateway was fine."""
+    assert "healthcheck" not in compose["services"]["llm-gateway"]
 
 
 def test_the_caddy_site_gates_by_address_and_adds_no_second_prompt_sr043():

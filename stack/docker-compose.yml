@@ -1182,11 +1182,25 @@ services:
     container_name: llm-gateway
     profiles: ["llm-gateway"]
     environment:
-      # Bind inside the container only; Caddy reaches it across the bridge.
-      # NOT 0.0.0.0-on-the-host: see the no-host-port note above.
-      HOST_BIND: 0.0.0.0
+      # NO HOST_BIND HERE, and its absence is the correction of a real mistake.
+      # HOST_BIND is not this application's listen address: upstream uses it
+      # solely to choose which host interface THEIR compose publishes the port
+      # on, and we publish no port, so setting it here bound nothing and read as
+      # if it did. The listen interface is HOST, whose default `::` is dual-stack
+      # inside the container and is what Caddy needs to reach across the bridge.
+      # Verified against the pinned image's own config, not inferred.
       PORT: 3001
       TZ: ${TIMEZONE}
+      # ONE reverse-proxy hop, and it must be declared or two things silently
+      # misbehave. Upstream defaults to NOT trusting X-Forwarded-For, which is
+      # the right default for a directly-reachable server; here Caddy is the
+      # ONLY thing that can reach this container at all — there is no host port
+      # and no second ingress — so without this every request appears to come
+      # from Caddy's bridge address. That would put every caller in the house
+      # into ONE shared 120-requests-per-minute bucket (a coding agent could
+      # then rate-limit the phone) and would log one address for all of them.
+      # `1` means exactly one hop, not `true`, which would trust any hop.
+      TRUST_PROXY: "1"
     env_file:
       # Provider keys and the at-rest encryption key. Materialised by the deploy
       # tooling, gitignored, never baked into this file (which is committed).
@@ -1195,14 +1209,25 @@ services:
       # SQLite + the AES-256-GCM-encrypted provider keys. NOT reproducible from
       # the repo, so it joins the LOCAL backup set; it holds credentials, so it
       # never joins the offsite set.
-      - llm_gateway_data:/app/data
+      #
+      # /app/server/data — NOT /app/data, which is what this line said until the
+      # path was checked against the image instead of assumed. This service has
+      # never been started, so what follows is what WOULD have happened, not a
+      # recovery that did: the image declares VOLUME /app/server/data, so the
+      # wrong path would not have failed loudly. Docker would have created an
+      # ANONYMOUS volume at the real path, put the database there, and left
+      # `llm_gateway_data` empty at a path nothing writes — and the backup set
+      # would have faithfully captured that empty volume. A mount that silently
+      # works is worse than one that fails, which is why the runbook verifies
+      # the destination after the first start rather than trusting this line.
+      - llm_gateway_data:/app/server/data
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health >/dev/null 2>&1 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+    # NO healthcheck override. The image ships a correct one — `node -e fetch`
+    # against /api/ping — and the override that used to sit here probed /health,
+    # which is not a route this application serves, using `wget`, which is not
+    # in this node image. It would have reported the gateway permanently
+    # unhealthy while the gateway was fine. Inheriting the image's probe is both
+    # correct and one fewer thing to drift from upstream.
 
 
   # ── self-hosted remote desktop: RustDesk server (SR-045, SN-045) ─────────────

@@ -75,15 +75,52 @@ Assume any search result for this project is a fork until you have checked the
 author. **The pointer of record is the project site**, which names the canonical
 repository directly. Not a search ranking.
 
+## First setup is hands-on, and that is upstream's design
+
+Three things this service needs are **not** environment variables, so none of
+them can be minted in advance by the deploy tooling:
+
+| | Where it comes from |
+|---|---|
+| `ENCRYPTION_KEY` | **is** an env var — `openssl rand -hex 32`, set **before first start** |
+| The bearer key | minted in the **dashboard**; no env var sets it |
+| The admin account | created in the **dashboard**, gated by a one-time setup code |
+
+The setup code is printed in the server log while no account exists, and exists
+precisely because this install is reachable from other devices:
+
+```
+docker logs llm-gateway 2>&1 | grep -i setup
+```
+
+**The encryption key's ordering worry was real but does not apply here.** Earlier
+notes in this repo said to let the container run once and check whether it
+generated a key before minting one, to avoid overwriting a real key with a dead
+one. That came from upstream's *non-production* path, where an unset key is
+auto-generated into a `.encryption-key` file. The pinned image sets
+`NODE_ENV=production` in its own config, and upstream documents the key as
+**required** in production — so it must be set before the first start and the
+ordering hazard cannot arise. Checked against the image config, not assumed.
+
+Keep a copy of that key **off the hub**. It lives inside the volume's backup,
+and a key whose only copy sits beside the data it decrypts is not a backup.
+
 ## Operating notes
 
 - Profile-gated and **off by default**: `COMPOSE_PROFILES=…,llm-gateway`.
-- The dashboard wants an email + password on a server install; that is the
-  gateway's own admin login and is not the bearer key.
-- Provider keys are encrypted at rest with a key generated on first setup. The
-  volume `llm_gateway_data` is therefore **not reproducible from this repo** and
-  joins the **local** backup set — never the offsite set, because it holds
-  credentials.
+- The data volume mounts at **`/app/server/data`** — the path the image declares
+  and writes. It said `/app/data` once; that did not fail, it just meant docker
+  made an anonymous volume at the real path while the named one stayed empty, so
+  the backup set would have captured nothing. Verify with
+  `docker inspect llm-gateway` after any change to it.
+- `TRUST_PROXY=1` because Caddy is the **only** thing that can reach this
+  container. Without it every caller shares one per-IP rate-limit bucket and the
+  analytics log one address for the whole household.
+- **No healthcheck override.** The image ships a correct one; ours probed a route
+  this application does not serve, with a binary this image does not carry.
+- Provider keys are encrypted at rest. The volume `llm_gateway_data` is **not
+  reproducible from this repo** and joins the **local** backup set — never the
+  offsite set, because it holds credentials.
 - Point consumers at **this gateway's URL, never a provider's**. A consumer
   found holding a provider URL is a defect in the consumer: it is what makes a
   provider swap invisible, and it is the whole reason this service exists.

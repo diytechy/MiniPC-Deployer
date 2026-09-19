@@ -330,8 +330,19 @@ def test_the_hook_is_importable_from_the_working_directory_sr044(compose):
     the process's import path. Without this the proxy starts cleanly and the
     hook never loads."""
     svc = compose["services"]["litellm"]
-    assert svc["working_dir"] == "/app/litellm"
+    assert svc["environment"]["PYTHONPATH"] == "/app/litellm"
     assert "/app/litellm/config.yaml" in svc["command"]
+
+    # AND `working_dir` MUST NOT BE OVERRIDDEN, which is the other half.
+    # This was `working_dir: /app/litellm`, and it killed the container: the
+    # image's ENTRYPOINT is the RELATIVE path `docker/prod_entrypoint.sh`,
+    # resolved against the working directory, so the override sent it looking
+    # for /app/litellm/docker/prod_entrypoint.sh. The container exited with
+    # `no such file or directory` naming a file that exists at /app/docker.
+    # Found on the first real deployment - no config-level check could see it,
+    # because the defect is the interaction between our override and the
+    # image's own metadata.
+    assert "working_dir" not in svc,         "do not override working_dir: the image's entrypoint is a RELATIVE "         "path and moving cwd makes it unresolvable"
 
 
 def test_the_image_is_the_named_upstream_pinned_by_digest_sr046(compose):

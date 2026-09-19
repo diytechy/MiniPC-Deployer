@@ -1393,6 +1393,11 @@ services:
       # container's whole reason for existing is that it is the private lane.
       LITELLM_DONT_SHOW_FEEDBACK_BOX: "true"
       LITELLM_MODE: PRODUCTION
+      # THE HOOK IS IMPORTED BY NAME, so its directory has to be on the import
+      # path. This replaces a `working_dir: /app/litellm` override that made
+      # the hook importable and broke the container - see the note where
+      # working_dir used to be, below the volumes.
+      PYTHONPATH: /app/litellm
     volumes:
       # TWO FILE MOUNTS, NOT A DIRECTORY MOUNT, and that is deliberate.
       # Replacing a bind-mounted DIRECTORY's inode detaches the mount — the
@@ -1402,10 +1407,26 @@ services:
       # container may rewrite its own routing table.
       - ./litellm/config.yaml:/app/litellm/config.yaml:ro
       - ./litellm/devpc_hold_hook.py:/app/litellm/devpc_hold_hook.py:ro
-    # So `callbacks: devpc_hold_hook.proxy_handler_instance` in config.yaml
-    # resolves. Without it the proxy starts, the hook never loads, and a cold
-    # box is discovered by a request that hangs rather than by a startup error.
-    working_dir: /app/litellm
+    # NO `working_dir` OVERRIDE, AND THAT IS LOAD-BEARING.
+    #
+    # This was `working_dir: /app/litellm`, so that
+    # `callbacks: devpc_hold_hook.proxy_handler_instance` in config.yaml would
+    # resolve - cwd is on sys.path, so moving cwd made the hook importable. It
+    # also KILLED THE CONTAINER OUTRIGHT, and only on a real box.
+    #
+    # The image's ENTRYPOINT is the RELATIVE path `docker/prod_entrypoint.sh`,
+    # resolved against the working directory. Overriding cwd sent it looking
+    # for `/app/litellm/docker/prod_entrypoint.sh`, and it died with
+    #     exec: "docker/prod_entrypoint.sh": no such file or directory
+    # naming a file that is present, executable and correct at /app/docker.
+    # No config-level check could have caught this: each half is reasonable and
+    # the defect is the INTERACTION between our override and the image's own
+    # metadata. It took starting the container to find it.
+    #
+    # PYTHONPATH (in `environment:` above) says what was actually meant - make
+    # that directory importable - without moving the process's feet. Verified
+    # inside the pinned image: cwd /app plus PYTHONPATH yields the
+    # DevPcHoldHook instance from `import devpc_hold_hook`.
     healthcheck:
       # /health/liveliness is unauthenticated and answers without touching the
       # dev PC. Probing anything that reaches the dev PC would make this

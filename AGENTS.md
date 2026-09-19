@@ -1,6 +1,11 @@
 # AGENTS.md — Agent & Contributor Guide
 
-> **Current follow-up:** round 2 runs from [the HomeHub handoff](../HomeHub/HANDOFF-panel-round2-coordinator-2026-09-14.md); the item ledger is [panel findings](../HomeHub/docs/PANEL_CURRENT_2026-09-13.md). Read both first.
+> **Current follow-up:** the panel item ledger is [panel findings](../HomeHub/docs/PANEL_CURRENT_2026-09-13.md),
+> and what is still unfinished out of the archived handoffs is [FOLLOWUPS.md](../HomeHub/FOLLOWUPS.md).
+> Read both first. The round-2 coordinator handoff this line used to point at was archived by the
+> 2026-09-18 documentation cleanup and now lives at
+> [docs/archive/2026-09-18/](../HomeHub/docs/archive/2026-09-18/HANDOFF-panel-round2-coordinator-2026-09-14.md);
+> it is history, so the live pointer is FOLLOWUPS.md rather than the archived copy.
 > Dated build plans now redirect to historical records. All standing
 > operating rules below remain in force.
 

@@ -905,23 +905,28 @@ if [ -f "$PAYLOAD/wall-pandora-session.py" ]; then
 else
     fail_step "pandora session: wall-pandora-session.py is missing from the image payload"
 fi
-PANDORA_SEED="${WALL_PANDORA_SESSION_SEED:-/opt/wall-panel/site/pandora-session.tar.gz}"
-if [ ! -f "$PANDORA_SEED" ]; then
-    log "pandora session: no staged archive at $PANDORA_SEED — the player will ask for the login once"
+# LOWER CASE, AND THAT IS NOT A STYLE CHOICE. `PANDORA_` is one of the declared
+# wall-knob namespaces (scripts/validate_config.py, WALL_KNOB_NAMESPACES), so an
+# ordinary local called PANDORA_SEED reads as an undeclared knob to the gate and
+# to the next person. The knob is WALL_PANDORA_SESSION_SEED; this is just where
+# its value is held for the next four lines.
+_pandora_seed="${WALL_PANDORA_SESSION_SEED:-/opt/wall-panel/site/pandora-session.tar.gz}"
+if [ ! -f "$_pandora_seed" ]; then
+    log "pandora session: no staged archive at $_pandora_seed — the player will ask for the login once"
 elif ! id panel >/dev/null 2>&1; then
-    warn "pandora session: no 'panel' account yet — leaving $PANDORA_SEED alone"
+    warn "pandora session: no 'panel' account yet — leaving $_pandora_seed alone"
 else
     # NOT fail_step. A sign-in the Owner can restore with one tap on the panel is
     # not worth failing an image over, and a refusal here is usually the tool
     # working: "this panel already has a sign-in" is the answer on every re-run.
-    if /usr/local/sbin/wall-pandora-session restore "$PANDORA_SEED"; then
-        log "pandora session: restored from $PANDORA_SEED"
+    if /usr/local/sbin/wall-pandora-session restore "$_pandora_seed"; then
+        log "pandora session: restored from $_pandora_seed"
     else
-        warn "pandora session: $PANDORA_SEED was not restored (see the line above);"
+        warn "pandora session: $_pandora_seed was not restored (see the line above);"
         warn "the panel still works — sign in to Pandora once on the wall."
     fi
 fi
-unset PANDORA_SEED
+unset _pandora_seed
 
 if [ -f "$PAYLOAD/wall-local-setup.py" ] && [ -f "$PAYLOAD/wall-local-setup.service" ]; then
     install -m 0755 "$PAYLOAD/wall-local-setup.py" /usr/local/lib/wall-panel/wall-local-setup.py

@@ -34,6 +34,21 @@
 # ordering alone is not enough, which is the lesson the game-isolation unit
 # records after its own first version got exactly that wrong.
 #
+# THESE RULES ARE APPENDED, AND THAT IS A JUDGEMENT WITH A CAVEAT. INPUT is
+# evaluated top to bottom, so any EARLIER rule that ACCEPTs one of these ports
+# wins before our REJECT is ever reached. Appending is correct on this box and
+# was verified rather than assumed - as of 2026-09-18 INPUT holds only Tailscale's
+# `ts-input` jump and the game fence's REJECT, neither of which accepts these
+# ports from an unadmitted source, and the chain policy is ACCEPT with no blanket
+# allow. Inserting at the head instead would put this fence AHEAD of `ts-input`,
+# whose `-i tailscale0 -j ACCEPT` is what admits the tunnel at all, so the
+# obvious "make it authoritative" change is not obviously safe.
+#
+# WHAT THIS MEANS IN PRACTICE: if anything ever adds an INPUT ACCEPT above these
+# rules, this fence stops being a fence and says nothing. Check with
+# `iptables -L INPUT -n --line-numbers` after adding any firewall-touching
+# service, and look at what sits ABOVE the rustdesk block.
+#
 # Exit 0 = both families programmed. 1 = they are not, loudly.
 set -uo pipefail
 
@@ -90,11 +105,21 @@ command -v ip6tables >/dev/null 2>&1 || die "ip6tables not found - the v6 half o
 # reached and the fix that depended on it appeared not to work.
 #
 # Strip the `-A ` and keep the chain in the spec, then let `-D` take both.
+#
+# AND IT MUST NOT PIPE INTO AN EARLY-EXITING READER. `set -o pipefail` is on at
+# the top of this script. `$bin -S INPUT | grep -q ...` lets grep exit the
+# instant it matches; iptables then writes into a closed pipe, takes SIGPIPE and
+# exits 141, and pipefail hands 141 to the `while` condition - which reads as
+# "no marked rules found", so the purge silently does nothing and the duplicates
+# come straight back. It happens to work while the rule list fits the 64 KB pipe
+# buffer, which is exactly the kind of "works on this box" that stops working on
+# a busier one. Capture the listing ONCE into a variable and search that.
 purge() {
-    local bin="$1" removed=0
-    while $bin -S INPUT 2>/dev/null | grep -q -- "--comment $COMMENT"; do
+    local bin="$1" removed=0 rules
+    rules="$($bin -S INPUT 2>/dev/null || true)"
+    while printf '%s\n' "$rules" | grep -q -- "--comment $COMMENT"; do
         local spec
-        spec="$($bin -S INPUT | grep -m1 -- "--comment $COMMENT" | sed 's/^-A //')"
+        spec="$(printf '%s\n' "$rules" | grep -m1 -- "--comment $COMMENT" | sed 's/^-A //')"
         # shellcheck disable=SC2086
         # $spec still begins with the chain name, so this is `-D INPUT ...`.
         # Deliberately NOT silenced: a delete that fails here used to be
@@ -103,6 +128,9 @@ purge() {
             die "$bin: could not remove a stale rule ($spec). Refusing to append onto rules that did not clear, because a stale REJECT ahead of a new ACCEPT silently defeats it."
         fi
         removed=$((removed + 1))
+        # Re-read after each delete: the cached listing is now one rule stale,
+        # and looping on a stale copy would try to delete the same spec forever.
+        rules="$($bin -S INPUT 2>/dev/null || true)"
     done
     [ "$removed" -gt 0 ] && log "$bin: removed $removed stale rule(s)"
     return 0

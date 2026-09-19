@@ -832,7 +832,7 @@ autoinstall:
       if [ ! -d "$S" ]; then
       if [ "$BUILD_PROFILE" = production ]; then
       echo "homehub: FATAL - this is a PRODUCTION image and the deploy payload carried no site/ directory.";
-      echo "homehub: none of .env, backup.env, cifs.creds, samba-users.creds, smb.conf.fragment or library-mounts.fstab would be installed,";
+      echo "homehub: none of .env, backup.env, llm-gateway.env, cifs.creds, samba-users.creds, smb.conf.fragment or library-mounts.fstab would be installed,";
       echo "homehub: so the box would come up on .env.example placeholders while believing it is production. Refusing to install that.";
       echo "homehub: step 3 above reports where the payload was found; site/ is staged into it by vmtest/lib/common.sh from SITE_DIR.";
       exit 1;
@@ -844,6 +844,7 @@ autoinstall:
       rc=0;
       for spec in ".env:/target/opt/homehub/stack/.env:required"
       "backup.env:/target/etc/homehub-backup/backup.env:required"
+      "llm-gateway.env:/target/opt/homehub/stack/llm-gateway/llm-gateway.env:required"
       "cifs.creds:/target/etc/homehub-backup/cifs.creds:optional"
       "samba-users.creds:/target/etc/homehub-samba/samba-users.creds:optional"
       "smb.conf.fragment:/target/etc/homehub-samba/smb.conf.fragment:required"
@@ -859,7 +860,7 @@ autoinstall:
       fi;
       continue;
       fi;
-      if install -m600 -o root -g root "$S/$f" "$d"; then
+      if install -D -m600 -o root -g root "$S/$f" "$d"; then
       chmod 600 "$S/$f" || true;
       echo "homehub: installed site/$f -> $d";
       else

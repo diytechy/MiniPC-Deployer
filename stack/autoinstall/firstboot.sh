@@ -1195,6 +1195,45 @@ systemctl enable homehub-game-isolation.service   >/dev/null 2>&1 || log "WARN: 
 systemctl enable homehub-gunmaster3-relay.service >/dev/null 2>&1 || log "WARN: could not enable homehub-gunmaster3-relay.service - the relay would not come back after a reboot"
 log "game-isolation + relay units installed and enabled"
 
+# ── 4-pre-a2. RUSTDESK: THE SAME TREATMENT, FOR THE SAME REASON (SR-045) ────
+# ADDED 2026-09-18, AFTER A REVIEW ASKED WHAT A REIMAGE WOULD CARRY. The answer
+# was nothing: the units were installed by hand on the running box and neither
+# user-data nor this script mentioned them. A reimaged hub would have come up
+# with the stack payload present, the listeners never started, and NO FENCE -
+# and it would have looked fine, because `rustdesk` is deliberately absent from
+# COMPOSE_PROFILES so the containers simply stay down rather than erroring.
+# Silent absence is the worst shape this can take.
+#
+# This is the third time in one day that work was built, tested and left out of
+# the lane (the gateway's env file and the panel audio tree being the others),
+# which is why the question "what does a reimage carry" is worth asking of every
+# new unit rather than only of the ones that look risky.
+#
+# THE EXECUTABLE BIT MATTERS HERE. The payload is staged from a Windows checkout
+# through a DrvFs mount; the fence script arrives without a reliable mode, and a
+# non-executable ExecStart fails the unit, which - because the service unit
+# Requires= it - correctly stops the listeners existing at all. Correct, but a
+# confusing way to find out.
+if [ -d "$STACK_DIR/rustdesk" ]; then
+    chmod 0755 "$STACK_DIR/rustdesk/rustdesk-isolation.sh" 2>/dev/null || log "WARN: could not chmod rustdesk-isolation.sh"
+    install -m 0644 "$STACK_DIR/rustdesk/homehub-rustdesk-isolation.service" /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-rustdesk-isolation.service"
+    install -m 0644 "$STACK_DIR/rustdesk/homehub-rustdesk.service"           /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-rustdesk.service"
+    systemctl daemon-reload 2>/dev/null || log "WARN: systemctl daemon-reload failed"
+    # ENABLE THE FENCE UNCONDITIONALLY, THE LISTENERS ONLY IF ALREADY WANTED.
+    # A fence with no listeners is harmless - it programs REJECT rules for ports
+    # nothing is bound to. Listeners with no fence are the failure this exists to
+    # prevent, so the fence is never the thing left disabled.
+    systemctl enable homehub-rustdesk-isolation.service >/dev/null 2>&1 || log "WARN: could not enable homehub-rustdesk-isolation.service - the remote-desktop ports would be unfenced after a reboot"
+    if [ "${RUSTDESK_ENABLED:-false}" = "true" ]; then
+        systemctl enable homehub-rustdesk.service >/dev/null 2>&1 || log "WARN: could not enable homehub-rustdesk.service"
+        log "rustdesk: fence + listeners enabled"
+    else
+        log "rustdesk: fence enabled, listeners left disabled (RUSTDESK_ENABLED is not true)"
+    fi
+else
+    log "rustdesk: no payload at $STACK_DIR/rustdesk - skipping (correct for a build without it)"
+fi
+
 # ── 4-pre-b. DISARM A LEGACY RELAY CONTAINER, AND VERIFY THE DISARM ─────────
 # THE ONE THING THE LIFECYCLE REFRESH DOES NOT FIX BY ITSELF (found by codex
 # gpt-5.6-sol, round 6). A box that ran the OLD shape has a `gunmaster3-relay`

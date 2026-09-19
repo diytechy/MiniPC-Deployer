@@ -144,8 +144,16 @@ def build_payload(revision: str, include_panel: bool):
                 skipped[rel] = why
                 continue
             data = tf.extractfile(m).read()
-            payload[rel] = (hashlib.sha256(data).hexdigest(), data,
-                            bool(m.mode & 0o111))
+            # A SHEBANG MEANS EXECUTABLE, WHATEVER THE INDEX SAYS. Several of
+            # these scripts are committed 100644 - `firstboot.sh`,
+            # `llm-isolation.sh`, `run-hermetic-tests.sh` - and honouring that
+            # literally STRIPPED the bit off files on the live box that had it.
+            # Nothing on the hub actually needs it (everything is run as
+            # `bash <script>`, sourced, or installed to sbin with an explicit
+            # mode), which is the only reason that was cosmetic rather than an
+            # outage. It is still not this tool's business to take a bit away.
+            executable = bool(m.mode & 0o111) or data[:2] == b"#!"
+            payload[rel] = (hashlib.sha256(data).hexdigest(), data, executable)
     if not payload:
         die("git archive %s produced no stack/ files - wrong revision?" % revision)
     return payload, skipped
@@ -330,7 +338,15 @@ D="%s"
 SUDO="${DEPLOY_SUDO-sudo -n}"
 S="$(mktemp -d /tmp/deploy-stack.XXXXXX)"
 B="$S/.rollback"
-trap 'rm -rf "$S"' EXIT
+# CLEAN UP AS ROOT, AND NEVER LET CLEANUP DECIDE THE OUTCOME.
+# `tar -x` runs under $SUDO, so the staged files are root-owned; an unprivileged
+# `rm -rf` on them fails, the trap's status becomes the script's status, and a
+# DELIVERY THAT FULLY SUCCEEDED is reported as a failure. That happened on the
+# first real run: every file landed and verified, and the tool said verified
+# False because it could not tidy /tmp. `|| true` because a leftover staging
+# directory is litter, not a failure - the verification is the authority on
+# whether the delivery worked.
+trap '$SUDO rm -rf "$S" 2>/dev/null || true' EXIT
 $SUDO mkdir -p "$B"
 $SUDO tar -x -C "$S" -f -
 
@@ -384,8 +400,12 @@ while IFS= read -r f; do
     # reload that reports success. The paths are POSITIONAL ARGUMENTS, never
     # interpolated text.
     $SUDO sh -c 'cat "$1" > "$2"' _ "$S/$f" "$D/$f" || rollback "$f"
-    if [ -x "$S/$f" ]; then $SUDO chmod 0755 "$D/$f" || rollback "$f"
-    else $SUDO chmod 0644 "$D/$f" || rollback "$f"; fi
+    # NEVER TAKE A BIT AWAY. If the staged file is executable, ensure the
+    # target is; otherwise LEAVE THE TARGET'S MODE ALONE. Setting 0644
+    # unconditionally is what stripped +x from eleven files on the first real
+    # run - a mode change nobody asked for, on a live box, as a side effect of
+    # a content sync.
+    if [ -x "$S/$f" ]; then $SUDO chmod 0755 "$D/$f" || rollback "$f"; fi
 
     printf '%%s\n' "$f" | $SUDO tee -a "$B/.done" >/dev/null
 done < "$S/.deploy-manifest"
@@ -452,9 +472,15 @@ def run_firstboot(target: str, force: bool) -> int:
 
     print("deploy-stack: re-running firstboot (idempotent, but not silent)")
     # NO PIPE. The status must survive.
+    # `bash <script>`, NOT the script directly. firstboot.sh is committed 100644
+    # and every caller inside the stack already invokes its siblings as
+    # `bash "$STACK_DIR/provision/..."`; running it directly made the first real
+    # deployment fail with `command not found` on a file that was present and
+    # correct. Going through bash is also what makes this independent of
+    # whatever mode the file happens to carry.
     r = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", target,
-         "sudo -n /opt/homehub/stack/autoinstall/firstboot.sh 2>&1"],
+         "sudo -n bash /opt/homehub/stack/autoinstall/firstboot.sh 2>&1"],
         capture_output=True, text=True)
     tail = r.stdout.splitlines()[-40:]
     print("\n".join("    " + l for l in tail))
@@ -668,14 +694,25 @@ def main() -> int:
         print("deploy-stack: %d file(s) delivered and verified by sha256 on the box."
               % len(todo))
 
-        if args.run_firstboot:
-            rc = run_firstboot(args.target, args.force_firstboot)
-            result["firstboot_rc"] = rc
-            if rc != 0:
-                result["verified"] = True   # the FILES did land; firstboot did not
-                _write_report(args.report, result)
-                die("firstboot exited %d. The files are delivered and verified, "
-                    "but units may not be installed - read the log above." % rc)
+    # FIRSTBOOT IS ASKED FOR SEPARATELY, AND IS RUN WHENEVER IT IS ASKED FOR.
+    #
+    # It used to live inside the "we wrote something" branch, so a tree that was
+    # already up to date skipped it - and that is exactly the state a retry is
+    # in. Delivering the files and installing the units are two steps; doing the
+    # first successfully, then re-running to do the second, printed "Nothing to
+    # do" and installed nothing. Found on the first real deployment.
+    #
+    # A dry run still runs nothing: --apply gates every side effect.
+    if args.run_firstboot and args.apply and result.get("verified") is not False:
+        rc = run_firstboot(args.target, args.force_firstboot)
+        result["firstboot_rc"] = rc
+        if rc != 0:
+            _write_report(args.report, result)
+            die("firstboot exited %d. The files are delivered and verified, "
+                "but units may not be installed - read the log above." % rc)
+    elif args.run_firstboot and not args.apply:
+        print("deploy-stack: --run-firstboot ignored in a dry run; it is a side "
+              "effect and needs --apply.")
 
     _write_report(args.report, result)
     return 0

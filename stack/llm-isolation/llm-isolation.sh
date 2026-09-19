@@ -126,7 +126,14 @@ die() { echo "llm-isolation: ERROR: $*" >&2; exit 1; }
 _env() {
     # \015 so a CRLF-saved .env cannot smuggle a carriage return into a value
     # that then becomes part of an iptables argument.
-    sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -1 | tr -d '\015' | tr -d '"'
+    # No `head -1`, for the reason the parser banner below gives at length: a
+    # consumer that closes the pipe early can SIGPIPE its producer, and under
+    # `set -o pipefail` that becomes the assignment's status and ends the
+    # script. .env is small enough that it would not happen today, which is
+    # exactly the kind of margin that is invisible when it stops being true.
+    # Take the FIRST match and read to the end.
+    awk -v k="$1=" 'index($0, k) == 1 && !s { print substr($0, length(k) + 1); s = 1 }' \
+        "$ENV_FILE" 2>/dev/null | tr -d '\015' | tr -d '"'
 }
 
 [ -r "$ENV_FILE" ] || die "cannot read $ENV_FILE"
@@ -164,6 +171,45 @@ if ! iptables -n -L DOCKER-USER >/dev/null 2>&1; then
     iptables -N DOCKER-USER 2>/dev/null || true
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY NO PARSER BELOW USES `exit` OR `head` — SIGPIPE, AND IT IS NOT THEORETICAL
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# `iptables -n -L INPUT --line-numbers | awk '$2=="ts-input"{print $1; exit}'`
+# reads correctly and is a latent, SILENT killer of this script.
+#
+# When awk exits at the match, it closes the pipe. If iptables has not finished
+# writing, it takes SIGPIPE and dies with 141; `set -o pipefail` adopts that as
+# the pipeline's status and `set -e` ends the script. Exit 141, no message -
+# the same signature as round 6's deploy blocker, and reached on a chain that
+# is entirely healthy.
+#
+# THE TRIGGER IS THIS BOX'S ACTUAL SHAPE. The danger is not a long chain, it is
+# a match EARLY with a large tail after it, because that is when awk exits with
+# iptables still writing. Measured on the hub 2026-09-19: `ts-input` is INPUT
+# position 1 and every other rule is below it. Reproduced here - with the match
+# first, the pipeline survives 20 trailing rules and dies with 141 at 2000,
+# which is simply where the output passes the 64 KiB pipe buffer.
+#
+# Today the hub has about twenty INPUT rules, so there is margin. The margin is
+# invisible, nobody would think to measure it before adding rules, and the
+# failure is a silent non-zero that stops the lane.
+#
+# `|| true` IS THE WRONG FIX HERE and is the reason this needs a banner rather
+# than a one-line change: elsewhere in this file `|| true` guards a `grep` that
+# legitimately matches nothing, but on these parsers it would swallow a genuine
+# failure to read the chain and let the script proceed on an empty answer.
+#
+# So every parser CONSUMES ITS WHOLE INPUT and keeps only the first match, via
+# a `!seen` flag. Slightly more awk, no early close, no signal.
+#
+# First matching rule's line number, or empty. `pat` is a literal substring,
+# matching what `grep -F` did here before.
+_first_pos() {
+    iptables -n -L "$1" --line-numbers 2>/dev/null \
+        | awk -v pat="$2" 'index($0, pat) && !s {print $1; s=1}'
+}
+
 # THE JUMP IS CHECKED UNCONDITIONALLY, NOT ONLY WHEN WE CREATE THE CHAIN.
 #
 # The first version only added `FORWARD -j DOCKER-USER` inside the branch that
@@ -180,14 +226,14 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null \
 # ACCEPT in FORWARD is a jump that is never reached for that traffic - the same
 # defect as an appended INPUT rule, one chain over.
 _fwd_jump="$(iptables -n -L FORWARD --line-numbers 2>/dev/null \
-             | awk '$2=="DOCKER-USER"{print $1; exit}')"
+             | awk '$2=="DOCKER-USER" && !s {print $1; s=1}')"
 [ -n "$_fwd_jump" ] || die "FORWARD has no DOCKER-USER jump even after adding one"
 # `|| true` for the same reason as the INPUT check further down: finding no
 # earlier ACCEPT is the GOOD case, and an unguarded pipeline makes the good
 # case fatal under `set -euo pipefail`.
 _fwd_before="$(iptables -n -L FORWARD --line-numbers 2>/dev/null \
-    | awk -v j="$_fwd_jump" '$1+0>0 && $1+0<j && ($2=="ACCEPT"||$2=="RETURN")' \
-    | head -3 || true)"
+    | awk -v j="$_fwd_jump" \
+          '$1+0>0 && $1+0<j && ($2=="ACCEPT"||$2=="RETURN") && n<3 {print; n++}')"
 if [ -n "$_fwd_before" ]; then
     die "an ACCEPT/RETURN precedes the DOCKER-USER jump in FORWARD, so this fence
 is not reached for that traffic:
@@ -229,7 +275,7 @@ _drop_guards() {
 }
 _drop_guards
 
-TS_POS="$(iptables -n -L INPUT --line-numbers 2>/dev/null | awk '$2=="ts-input"{print $1; exit}')"
+TS_POS="$(iptables -n -L INPUT --line-numbers 2>/dev/null | awk '$2=="ts-input" && !s {print $1; s=1}')"
 iptables -I DOCKER-USER 1 -s "$LITELLM_IP" -m comment --comment "$GUARD" -j REJECT --reject-with icmp-admin-prohibited
 iptables -I INPUT "$(( ${TS_POS:-0} + 1 ))" -s "$LITELLM_IP" -m comment --comment "$GUARD" -j REJECT --reject-with icmp-port-unreachable
 
@@ -291,7 +337,7 @@ done < <(iptables -n -L INPUT --line-numbers 2>/dev/null \
 # assumption every run rather than trusting this comment.
 _ipt_list() { iptables -n -L INPUT --line-numbers 2>/dev/null; }
 
-TS_POS="$(_ipt_list | awk '$2=="ts-input"{print $1; exit}')"
+TS_POS="$(_ipt_list | awk '$2=="ts-input" && !s {print $1; s=1}')"
 INS=$(( ${TS_POS:-0} + 1 ))
 
 # Inserted in REVERSE order at the same index, so the ACCEPT ends up above the
@@ -307,9 +353,9 @@ iptables -C INPUT -s "$LITELLM_IP" -d "$BRIDGE_GW" -p tcp --dport "$WAKE_PORT" -
 iptables -C INPUT -s "$LITELLM_IP" -m comment --comment "$MARKER host-deny" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || in_missing="$in_missing host-deny"
 [ -z "$in_missing" ] || die "INPUT rule(s) not present after programming:$in_missing"
 
-i_est="$(iptables -n -L INPUT --line-numbers | grep -F "$MARKER host-established" | awk '{print $1}' | head -1)"
-i_allow="$(iptables -n -L INPUT --line-numbers | grep -F "$MARKER host-allow-wake" | awk '{print $1}' | head -1)"
-i_deny="$(iptables -n -L INPUT --line-numbers | grep -F "$MARKER host-deny"        | awk '{print $1}' | head -1)"
+i_est="$(_first_pos INPUT "$MARKER host-established")"
+i_allow="$(_first_pos INPUT "$MARKER host-allow-wake")"
+i_deny="$(_first_pos INPUT "$MARKER host-deny")"
 [ "$i_est" -lt "$i_allow" ] && [ "$i_allow" -lt "$i_deny" ] \
     || die "INPUT rules are out of order (est=$i_est allow=$i_allow deny=$i_deny) - the hold hook would be unable to reach the readiness service"
 
@@ -341,8 +387,8 @@ passed vacuously. Fix the column, do not delete the check."
 # passed. The first test that actually EXECUTED the script found it on its
 # first run, which is the whole argument for driving the real thing.
 other_accept="$(_ipt_list \
-    | awk -v d="$i_deny" '$1+0>0 && $1+0<d && $2=="ACCEPT"' \
-    | grep -vF "$MARKER" | head -3 || true)"
+    | awk -v d="$i_deny" -v m="$MARKER" \
+          '$1+0>0 && $1+0<d && $2=="ACCEPT" && index($0,m)==0 && n<3 {print; n++}')"
 if [ -n "$other_accept" ]; then
     die "an ACCEPT rule precedes this fence in INPUT, so host-directed traffic from $LITELLM_IP can bypass it:
 $other_accept"
@@ -460,9 +506,9 @@ iptables -C DOCKER-USER -s "$LITELLM_IP" -m comment --comment "$MARKER deny-all"
 # `grep -vF "$GUARD"` so the reapply guard, which is still installed at this
 # point and sits below all three, does not appear in the reported positions.
 order="$(iptables -n -L DOCKER-USER --line-numbers | grep -F "$MARKER" | grep -vF "$GUARD" | awk '{print $1}' | tr '\n' ' ' || true)"
-first_est="$(iptables -n -L DOCKER-USER --line-numbers | grep -F "$MARKER allow-established" | awk '{print $1}' | head -1)"
-first_dev="$(iptables -n -L DOCKER-USER --line-numbers | grep -F "$MARKER allow-devpc"      | awk '{print $1}' | head -1)"
-first_den="$(iptables -n -L DOCKER-USER --line-numbers | grep -F "$MARKER deny-all"         | awk '{print $1}' | head -1)"
+first_est="$(_first_pos DOCKER-USER "$MARKER allow-established")"
+first_dev="$(_first_pos DOCKER-USER "$MARKER allow-devpc")"
+first_den="$(_first_pos DOCKER-USER "$MARKER deny-all")"
 [ -n "$first_est" ] && [ -n "$first_dev" ] && [ -n "$first_den" ] || die "could not read rule positions"
 [ "$first_est" -lt "$first_dev" ] || die "established rule must precede the dev-PC rule (got $order)"
 [ "$first_dev" -lt "$first_den" ] || die "dev-PC allow must precede the deny (got $order) - the lane would be dead"

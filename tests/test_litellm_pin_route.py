@@ -1138,6 +1138,9 @@ def test_the_fence_is_started_not_merely_enabled_at_firstboot_sr047():
 # no hub. The whole point is that the thing under test is the shipped file.
 # ===========================================================================
 
+import tempfile
+import pathlib
+import contextlib
 import json
 import os
 import stat
@@ -1465,7 +1468,24 @@ def test_a_failure_MID_REBUILD_leaves_the_lane_denied_not_open_sr047(tmp_path):
     picking a later one would have made this test pass without the guard.
     Removing the guard from the script turns this test red.
     """
-    envmap = _harness(tmp_path, compose_json=_V6_OFF)
+    # THE MEASURED LAYOUT OF THE REAL BOX, not a bare chain. Read from the hub
+    # on 2026-09-19: INPUT holds ts-input at 1 and the remote-desktop fence's
+    # blanket ACCEPT - which matches ANY source on those ports - just below it.
+    # A bare preseed would let this test pass with the guard inserted anywhere
+    # at all, and the property under test is that the guard OUTRANKS that
+    # ACCEPT while the rebuild is in flight.
+    envmap = _harness(tmp_path, compose_json=_V6_OFF, preseed=json.dumps({
+        "INPUT": [
+            {"target": "ts-input", "comment": "", "body": "-j ts-input"},
+            {"target": "ACCEPT", "comment": "homehub-rustdesk-isolation",
+             "body": "-p tcp -m multiport --dports 21115:21119 -j ACCEPT"},
+        ],
+        "FORWARD": [
+            {"target": "ts-forward", "comment": "", "body": "-j ts-forward"},
+            {"target": "DOCKER-USER", "comment": "", "body": "-j DOCKER-USER"},
+        ],
+        "DOCKER-USER": [],
+    }))
     envmap["IPT_FAIL"] = "deny-all"
     r = subprocess.run(
         [_BASH, "-c", 'export PATH="$STUB_BIN:$PATH"; exec bash "$1"',
@@ -1485,3 +1505,183 @@ def test_a_failure_MID_REBUILD_leaves_the_lane_denied_not_open_sr047(tmp_path):
         assert all(guard_at < i for i in allows), (
             "%s guard at %d sits below an allow, so it denies nothing that "
             "matters: %r" % (chain, guard_at, comments))
+        # Including the blanket ACCEPT that is not ours. This is the one that
+        # matters on the real box: it matches any source on the remote-desktop
+        # ports, so a guard below it would leave exactly those ports open for
+        # the whole rebuild.
+        blanket = [i for i, c in enumerate(comments) if "rustdesk" in c]
+        assert all(guard_at < i for i in blanket), (
+            "%s guard at %d sits below the remote-desktop blanket ACCEPT: %r"
+            % (chain, guard_at, comments))
+
+
+@_needs_bash
+def test_the_fence_converges_rather_than_accumulating_on_replay_sr047(tmp_path):
+    """RUN IT TWICE. This unit re-runs on every boot, and after any firewall
+    reload or compose recreate, so convergence is the normal case rather than
+    an edge one.
+
+    The reapply guard made this worth re-proving: it is a fourth marker rule
+    that is added and removed inside a single run, and an exclusion that was
+    slightly wrong would either leave one behind each time or delete a real
+    rule alongside it. Neither shows up in a single run.
+    """
+    envmap = _harness(tmp_path, compose_json=_V6_OFF, preseed=json.dumps({
+        "INPUT": [
+            {"target": "ts-input", "comment": "", "body": "-j ts-input"},
+            {"target": "ACCEPT", "comment": "homehub-rustdesk-isolation",
+             "body": "-p tcp -m multiport --dports 21115:21119 -j ACCEPT"},
+        ],
+        "FORWARD": [
+            {"target": "ts-forward", "comment": "", "body": "-j ts-forward"},
+            {"target": "DOCKER-USER", "comment": "", "body": "-j DOCKER-USER"},
+        ],
+        "DOCKER-USER": [],
+    }))
+    cmd = [_BASH, "-c", 'export PATH="$STUB_BIN:$PATH"; exec bash "$1"',
+           "_", _posix(ISO_SH)]
+
+    first = subprocess.run(cmd, env=envmap, capture_output=True, text=True)
+    assert first.returncode == 0, first.stdout + first.stderr
+    after_first = {c: _rules(tmp_path, c) for c in ("INPUT", "DOCKER-USER")}
+
+    second = subprocess.run(cmd, env=envmap, capture_output=True, text=True)
+    assert second.returncode == 0, second.stdout + second.stderr
+    after_second = {c: _rules(tmp_path, c) for c in ("INPUT", "DOCKER-USER")}
+
+    assert after_first == after_second, (
+        "a replay did not converge:\nfirst  %r\nsecond %r"
+        % (after_first, after_second))
+
+    # And exactly one of each rule, with no guard surviving either run.
+    for chain, comments in after_second.items():
+        mine = [c for c in comments if "homehub-llm-isolation" in c]
+        assert len(mine) == 3, "%s has %d marker rules, expected 3: %r" % (
+            chain, len(mine), mine)
+        assert not any("reapply-guard" in c for c in mine), mine
+
+
+@_needs_bash
+def test_a_long_chain_does_not_sigpipe_the_parsers_sr047(tmp_path):
+    """A BIG CHAIN WITH THE MATCH AT THE TOP - the shape that kills early-exit
+    parsers, and the shape this box actually has.
+
+    `awk '...{print; exit}'` closes the pipe at the match. If iptables is still
+    writing it takes SIGPIPE and dies 141, `pipefail` adopts it and `set -e`
+    ends the script: exit 141, no message, on a chain that is entirely healthy.
+    Measured on the hub, `ts-input` is INPUT position 1 and everything else is
+    below it, so the match is always early and the tail is whatever the box has
+    accumulated.
+
+    The fixtures elsewhere in this file use a handful of rules and CANNOT
+    expose this - the whole listing fits in the pipe buffer. This one pads the
+    chain past 64 KiB after the matching rule, which is where a reproduction
+    outside the harness flips from surviving to exit 141.
+    """
+    padding = [
+        {"target": "FILLER", "comment": "pad-%04d some padding text to make "
+                                        "this line wide enough to matter" % i,
+         "body": "-j FILLER"}
+        for i in range(2000)
+    ]
+    envmap = _harness(tmp_path, compose_json=_V6_OFF, preseed=json.dumps({
+        "INPUT": [{"target": "ts-input", "comment": "", "body": "-j ts-input"}] + padding,
+        "FORWARD": [{"target": "DOCKER-USER", "comment": "", "body": "-j DOCKER-USER"}] + padding,
+        "DOCKER-USER": list(padding),
+    }))
+    r = subprocess.run(
+        [_BASH, "-c", 'export PATH="$STUB_BIN:$PATH"; exec bash "$1"',
+         "_", _posix(ISO_SH)],
+        env=envmap, capture_output=True, text=True)
+
+    # 141 is the shell's SIGPIPE status. The stub is Python, which turns the
+    # same event into BrokenPipeError and exits 120, so BOTH are the defect and
+    # the `== 0` assertion below is the one that actually fires. Named here so a
+    # reader does not conclude the 141 check is dead - it is the status a real
+    # iptables would produce, and this is the one place the two differ.
+    assert r.returncode not in (141, 120), (
+        "the fence died of SIGPIPE on a healthy chain - a parser is closing "
+        "its pipe early:\n%s%s" % (r.stdout, r.stderr))
+    assert r.returncode == 0, (
+        "a long but healthy chain must still fence cleanly (exit %d):\n%s%s"
+        % (r.returncode, r.stdout, r.stderr))
+
+    # And it did the real work, not merely survived.
+    du = [c for c in _rules(tmp_path, "DOCKER-USER") if "homehub-llm-isolation" in c]
+    assert du == ["homehub-llm-isolation allow-established",
+                  "homehub-llm-isolation allow-devpc",
+                  "homehub-llm-isolation deny-all"], du
+
+
+# ── the build gate that guards the PartOf= exemption ────────────────────────
+
+
+@contextlib.contextmanager
+def _stack_copy():
+    """A whole-tree copy of `stack/`, UNDER THE REPO.
+
+    Two constraints, both learned by getting it wrong: validate_config returns
+    early when docker-compose.yml is missing, so a partial tree never reaches
+    the check under test; and it resolves paths with `relative_to(REPO)`, so a
+    tree in pytest's tmp_path raises ValueError. Either one makes the assertion
+    below pass for the wrong reason. `build/` is gitignored and the copy is
+    removed whatever happens.
+    """
+    holder = tempfile.mkdtemp(dir=str(ROOT / "build"), prefix="vc-stack-")
+    dest = pathlib.Path(holder) / "stack"
+    try:
+        # Only the files this check reads. Copying all 364 of stack/ works and
+        # costs 8.7 MB of I/O per run on a gate that already takes minutes.
+        for rel in ("docker-compose.yml",
+                    ".env.example",
+                    "caddy/Caddyfile",
+                    "autoinstall/firstboot.sh",
+                    "llm-isolation/homehub-litellm.service",
+                    "llm-isolation/homehub-llm-isolation.service"):
+            src = ROOT / "stack" / rel
+            dst = dest / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(str(src), str(dst))
+        yield dest
+    finally:
+        shutil.rmtree(holder, ignore_errors=True)
+
+
+def _validate_on(stack_dir):
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "validate_config.py"),
+         "--stack", str(stack_dir)],
+        capture_output=True, text=True, cwd=str(ROOT))
+    return r.stdout + r.stderr
+
+
+def test_the_partof_exemption_does_not_also_excuse_requires_sr047():
+    """THE EXEMPTION IS FOR ONE DIRECTIVE, NOT ONE UNIT.
+
+    `homehub-litellm.service` is allowed `PartOf=docker.service`: there is no
+    Wants=+After= form that keeps a RemainAfterExit oneshot alive across a
+    docker restart, so the usual remedy does not apply to it. The first version
+    of that exemption filtered the MERGED dependency set, so adding
+    `Requires=docker.service` to the same unit would have been waved through by
+    an exemption written for PartOf - while the comment beside it promised the
+    opposite (found in review). Requires= on docker is the 2026-08-09 bug that
+    SIGTERM'd firstboot mid-LV-move, and it must still fail the build.
+    """
+    with _stack_copy() as stack:
+        unit = stack / "llm-isolation" / "homehub-litellm.service"
+        needle = "homehub-litellm.service declares Requires="
+
+        clean = _validate_on(stack)
+        assert needle not in clean, \
+            "the shipped unit should pass the stop-propagation check:\n%s" % clean
+
+        unit.write_text(
+            unit.read_text(encoding="utf-8").replace(
+                "PartOf=docker.service",
+                "PartOf=docker.service\nRequires=docker.service"),
+            encoding="utf-8")
+
+        regressed = _validate_on(stack)
+        assert needle in regressed, (
+            "adding Requires=docker.service to the litellm unit must fail the "
+            "build; the PartOf exemption is excusing it:\n%s" % regressed)

@@ -592,7 +592,7 @@ def main():
         unit_text, script_text = load(stack / unit_rel), load(stack / script_rel)
         if not unit_text or not script_text:
             continue
-        required = set()
+        requires, part_of = set(), set()
         for line in unit_text.splitlines():
             line = line.strip()
             # PartOf= PROPAGATES STOPS TOO, and leaving it out of this parse
@@ -602,18 +602,29 @@ def main():
             # a `systemctl stop docker` reaches that unit just as surely as a
             # Requires= would. The check is about stop propagation, not about
             # one keyword.
-            if line.startswith("Requires=") or line.startswith("PartOf="):
-                for dep in line.split("=", 1)[1].split():
-                    # Compare on the bare name so `docker` and `docker.service`
-                    # are the same unit — the stop line writes it either way.
-                    required.add(dep.rsplit(".", 1)[0] if "." in dep else dep)
+            # PROVENANCE IS KEPT, not flattened into one set. The exemption
+            # below excuses exactly one unit's PartOf= on docker, and an
+            # earlier version of it filtered the merged set — so adding
+            # `Requires=docker.service` to that same unit would have been
+            # waved through by an exemption written for PartOf, while the
+            # comment promised the opposite. Found in review; the fix is to
+            # never merge the two in the first place.
+            for keyword, bucket in (("Requires=", requires), ("PartOf=", part_of)):
+                if line.startswith(keyword):
+                    for dep in line.split("=", 1)[1].split():
+                        # Compare on the bare name so `docker` and
+                        # `docker.service` are the same unit — the stop line
+                        # writes it either way.
+                        bucket.add(dep.rsplit(".", 1)[0] if "." in dep else dep)
         stopped = set()
         for m in re.finditer(r"^\s*systemctl\s+stop\s+([^\n|&;]+)", script_text, re.M):
             for unit in m.group(1).split():
                 if unit.startswith("-"):
                     continue  # a flag, not a unit
                 stopped.add(unit.rsplit(".", 1)[0] if "." in unit else unit)
-        clash = sorted(required & stopped)
+        # PartOf= propagates a stop just as surely as Requires=, so both are
+        # checked. They are reported together but exempted separately.
+        clash = sorted((requires | part_of) & stopped)
 
         # ONE MEASURED EXEMPTION, NAMED RATHER THAN SILENCED.
         #
@@ -636,11 +647,17 @@ def main():
         # a Requires= clash on the same unit still fails, and so does a PartOf
         # clash on any other.
         if Path(unit_rel).name == "homehub-litellm.service":
-            clash = [c for c in clash if c != "docker"]
+            # Only the PartOf= route is excused, and only for docker. If this
+            # unit ever also declares `Requires=docker.service`, that stays in
+            # the clash and the build fails — which is what the paragraph above
+            # promises and what the merged-set version silently did not do.
+            clash = [c for c in clash
+                     if not (c == "docker" and c in part_of and c not in requires)]
         check(
             not clash,
-            "{} stops no unit {} Requires= ({} required, {} stopped)".format(
-                Path(script_rel).name, Path(unit_rel).name, len(required), len(stopped)
+            "{} stops no unit {} Requires=/PartOf= ({} required, {} stopped)".format(
+                Path(script_rel).name, Path(unit_rel).name,
+                len(requires | part_of), len(stopped)
             ),
             "{} stops {} which {} declares Requires= — systemd will propagate the "
             "stop back and SIGTERM whatever is activating. Use Wants= + After=.".format(

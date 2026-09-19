@@ -2425,8 +2425,19 @@ the `finally` that retires it actually runs) are reasoned in the file and
 verified by reading; they are not proven by a test, and writing one that read
 the source back would prove nothing.
 
-`pytest tests/`: 2198 passed, 30 skipped, 0 failed. `scripts/check.py`:
-config-validate, registry-integrity and doc-navigability all pass.
+`pytest tests/`: 2291 passed, 30 skipped, 0 failed (re-measured 2026-09-19 after
+other sessions' work landed; it read 2198 when this entry was first written).
+`scripts/check.py`: **all four steps PASS** — config-validate, unit-tests,
+registry-integrity and doc-navigability. Two of those four were failing before
+this work: `WALL_PANDORA_SESSION_SEED` was read by firstboot and declared
+nowhere, and AGENTS.md pointed at a handoff the 2026-09-18 cleanup archived.
+
+**LLR-979..984 were destroyed and restored.** They were authored here, left
+unstaged, and taken by a concurrent session's `git checkout`; that session
+rebuilt them from the shipped code and recorded them as unrecoverable. They were
+recoverable, and `fd4dab4` restores the author's Title and Detail verbatim while
+keeping the union of both symbol lists — the reconstruction had found six real
+symbols the originals missed.
 
 **Not deployed, and the Bluetooth half has never met a radio.** The acceptance
 plan is HomeHub

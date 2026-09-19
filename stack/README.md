@@ -442,6 +442,26 @@ in `/opt/homehub/stack`, and first boot brings up core + enabled profiles.
 
 ### Enabling a service on a RUNNING box (no reflash)
 
+> **This section is for the TIER-2 CATALOG ONLY, and it reads like it is for
+> everything.** It works because a catalog service is *a compose profile plus
+> an upstream image* — nothing new has to reach the disk. The moment a service
+> ships FILES it is wrong: `stack/litellm/` carries two bind-mounted files the
+> container cannot start without, and `stack/llm-isolation/` a script and two
+> systemd units. Following the steps below for those gives you a container that
+> cannot start and a fence that was never installed, with nothing saying so.
+>
+> **To deliver a service's files to a running hub, use
+> [`scripts/deploy_stack.py`](../scripts/deploy_stack.py).** Dry run is the
+> default:
+>
+> ```
+> python scripts/deploy_stack.py --target hub@<LAN_IP>
+> python scripts/deploy_stack.py --target hub@<LAN_IP> --apply --run-firstboot
+> ```
+>
+> It also names the `.env` knobs the box is missing, which it deliberately
+> cannot write for you.
+
 ```sh
 ssh hub@<LAN_IP>
 cd /opt/homehub/stack

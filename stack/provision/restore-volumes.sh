@@ -74,6 +74,19 @@ COMMON_SH="${COMMON_SH:-$STACK_DIR/backup/common.sh}"
 #
 #               THE HAZARD THAT KEPT IT OUT IS REAL AND IS HANDLED IN
 #               post_restore() BELOW - see there for the measurement.
+#   rustdesk    ADDED 2026-09-19, and it is the one entry here whose loss is
+#               NOT recoverable by redoing some work in a browser. hbbs mints an
+#               ed25519 key pair on first start; every client that has ever been
+#               pointed at this server holds the PUBLIC half, and a server that
+#               comes back with a new pair is simply rejected by all of them.
+#               Restoring the volume is the difference between "remote access
+#               works" and "re-pair every device by hand" - at exactly the
+#               moment, post-reimage, when remote access is what you are trying
+#               to recover and the box may not be in front of you.
+#               It was in neither list until now: REIMAGE_PERSISTENCE_PLAN
+#               asserted it "IS in the local backup set", nothing checked, and
+#               it was absent from BACKUP_SOURCES and from this table both.
+#               The backup half is fixed in HomeHub's config.homehub.psd1.
 #   finance     the local-only Finance-Auditor snapshot volume. The service is
 #               profile-gated, but its durable audit history is not optional
 #               once present. The separate `finance_actual_data` volume is an
@@ -83,14 +96,22 @@ COMMON_SH="${COMMON_SH:-$STACK_DIR/backup/common.sh}"
 # Finance-Auditor is profile-gated; compose_create_restore_target names that
 # profile for `create` only, so a reimage never starts a finance sync as a
 # side effect of restoring its data.
-DEFAULT_TABLE='caddy:caddy_data:caddy tracker:tracker_data:tracker actual:actual_data:actual uptimekuma:uptimekuma_data:uptime-kuma technitium:technitium_config:technitium finance:finance_snapshots:finance-auditor'
+DEFAULT_TABLE='caddy:caddy_data:caddy tracker:tracker_data:tracker actual:actual_data:actual uptimekuma:uptimekuma_data:uptime-kuma technitium:technitium_config:technitium rustdesk:rustdesk_data:hbbs finance:finance_snapshots:finance-auditor'
 [ -n "$TABLE" ] || TABLE="${HOMEHUB_RESTORE_VOLUMES:-$DEFAULT_TABLE}"
 
 # compose_create_restore_target SERVICE: create the named volume without
-# starting its service. Only Finance-Auditor needs its profile named explicitly.
+# starting its service. Two services are profile-gated and must name their
+# profile, or `compose create` answers "no such service" and the restore skips
+# a volume it was asked to restore -- silently, because a skip is a normal
+# outcome here.
 compose_create_restore_target() {
     case "$1" in
         finance-auditor) docker compose --profile finance-auditor create "$1" ;;
+        # hbbs is the RustDesk ID/rendezvous server. `rustdesk` must NEVER be in
+        # COMPOSE_PROFILES - that is the gunmaster3 defect, and the listener unit
+        # passes --profile itself - so naming it HERE is the only way this step
+        # can see the service at all.
+        hbbs)            docker compose --profile rustdesk create "$1" ;;
         *)               docker compose create "$1" ;;
     esac
 }

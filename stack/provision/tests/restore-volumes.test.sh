@@ -91,6 +91,10 @@ case "$1" in
     [ "${1:-}" = create ] || exit 1
     svc="${2:-}"
     [ "$svc" = finance-auditor ] && [ "$profile" != finance-auditor ] && exit 1
+    # hbbs is profile-gated too, and `rustdesk` must never be in
+    # COMPOSE_PROFILES, so the caller has to name the profile explicitly or
+    # compose cannot see the service at all.
+    [ "$svc" = hbbs ] && [ "$profile" != rustdesk ] && exit 1
     [ "$svc" = "${MOCK_COMPOSE_FAIL:-}" ] && exit 1
     vol="$(grep -E "^$svc=" "$VOLROOT/.svcmap" 2>/dev/null | cut -d= -f2)"
     if [ -n "$vol" ] && [ ! -d "$VOLROOT/stack_$vol" ]; then
@@ -100,7 +104,9 @@ case "$1" in
       # exercise the branch that clears it.
       [ -e "$VOLROOT/.seed-on-create" ] && printf 'from the image\n' >"$VOLROOT/stack_$vol/IMAGE-SEED"
     fi
-    [ "$svc" = finance-auditor ] && printf '%s:%s\n' "$svc" "$profile" >>"$VOLROOT/.profile-log"
+    case "$svc" in
+      finance-auditor|hbbs) printf '%s:%s\n' "$svc" "$profile" >>"$VOLROOT/.profile-log" ;;
+    esac
     exit 0 ;;
   volume)
     shift
@@ -127,6 +133,7 @@ tracker=tracker_data
 actual=actual_data
 uptime-kuma=uptimekuma_data
 technitium=technitium_config
+hbbs=rustdesk_data
 finance-auditor=finance_snapshots
 MAP
 
@@ -137,7 +144,13 @@ TABLE='caddy:caddy_data:caddy tracker:tracker_data:tracker actual:actual_data:ac
 # a per-file hash table that restore.sh verifies byte-for-byte; a fixture that
 # only looked like one would prove nothing about the pair actually agreeing.
 SRC="$TMP/sources"
-mkdir -p "$SRC/caddy" "$SRC/tracker" "$SRC/actual" "$SRC/uptimekuma"
+mkdir -p "$SRC/caddy" "$SRC/tracker" "$SRC/actual" "$SRC/uptimekuma" "$SRC/rustdesk"
+# rustdesk: the ed25519 pair hbbs mints on first start. Every client that has
+# ever been told this server's identity holds the public half, so a server that
+# comes back with a NEW pair is rejected by all of them - which is why this set
+# is restored rather than regenerated. R17 asserts both halves come back.
+printf 'PRIVATE-KEY-MATERIAL\n' >"$SRC/rustdesk/id_ed25519"
+printf 'PUBLIC-KEY-MATERIAL\n' >"$SRC/rustdesk/id_ed25519.pub"
 printf 'acme-account-key\n' >"$SRC/caddy/acme.key"
 mkdir -p "$SRC/caddy/certificates"; printf 'cert-material\n' >"$SRC/caddy/certificates/apex.crt"
 printf -- '---\ncategory: X\nitems:\n  - id: a\n---\n' >"$SRC/tracker/defs.md"
@@ -163,6 +176,7 @@ tracker=path:$SRC/tracker
 actual=path:$SRC/actual
 uptimekuma=path:$SRC/uptimekuma
 technitium=path:$SRC/technitium
+rustdesk=path:$SRC/rustdesk
 finance=path:$SRC/finance"
 ENVF
 bash "$BACKUP_SH" --config "$TMP/backup.env" >"$TMP/backup.out" 2>&1
@@ -347,7 +361,7 @@ else
 fi
 
 echo
-echo "== R15/R16: the BUILT-IN table carries technitium + finance safely =="
+echo "== R15/R16/R17: the BUILT-IN table carries technitium, finance and rustdesk safely =="
 # Every other case passes an explicit table, so the shipped DEFAULT_TABLE is the
 # one thing they cannot prove. This runs the SUT with no table argument at all.
 rm -rf "$VOLROOT"/stack_*
@@ -358,15 +372,19 @@ case "$(logline technitium)" in
     ok\ *) pass "R15 the default table restored technitium with no table argument" ;;
     *)     fail "R15 technitium: $(logline technitium)"; cat "$TMP/result.log" ;;
 esac
-for s_ in caddy tracker actual uptimekuma; do
+for s_ in caddy tracker actual uptimekuma rustdesk; do
     case "$(logline "$s_")" in
         ok\ *) : ;;
         *)     fail "R15 the default table lost $s_: $(logline "$s_")" ;;
     esac
 done
-[ "$(grep -c '^ok ' "$TMP/result.log")" = 6 ] \
-    && pass "R15 all six sets in the default table restored" \
-    || fail "R15 default table restored $(grep -c '^ok ' "$TMP/result.log") of 6"
+# SEVEN since 2026-09-19, when rustdesk was added. The count is deliberately
+# EXACT rather than a minimum: the whole point of R15 is that the SHIPPED table
+# is what ran, so a set quietly dropped from it has to fail here rather than be
+# absorbed by a >= comparison.
+[ "$(grep -c '^ok ' "$TMP/result.log")" = 7 ] \
+    && pass "R15 all seven sets in the default table restored" \
+    || fail "R15 default table restored $(grep -c '^ok ' "$TMP/result.log") of 7"
 case "$(logline finance)" in
     ok\ *) pass "R16 the default table restored finance_snapshots" ;;
     *)     fail "R16 finance: $(logline finance)"; cat "$TMP/result.log" ;;
@@ -380,6 +398,31 @@ if grep -qx 'finance-auditor:finance-auditor' "$VOLROOT/.profile-log" 2>/dev/nul
     pass "R16 finance used its explicit Compose profile for create"
 else
     fail "R16 finance profile invocation missing or wrong: $(cat "$VOLROOT/.profile-log" 2>/dev/null)"
+fi
+
+# ── R17: the RustDesk key pair, added 2026-09-19 ─────────────────────────────
+# The only set here whose loss cannot be undone by redoing work in a browser: a
+# regenerated hbbs key pair is rejected by every client already pointed at this
+# server. Assert the CONTENT came back, not merely that a line said ok - the
+# failure this guards against is an empty volume created and reported green.
+case "$(logline rustdesk)" in
+    ok\ *) pass "R17 the default table restored rustdesk_data" ;;
+    *)     fail "R17 rustdesk: $(logline rustdesk)"; cat "$TMP/result.log" ;;
+esac
+if [ "$(cat "$VOLROOT/stack_rustdesk_data/id_ed25519" 2>/dev/null)" = PRIVATE-KEY-MATERIAL ] \
+   && [ "$(cat "$VOLROOT/stack_rustdesk_data/id_ed25519.pub" 2>/dev/null)" = PUBLIC-KEY-MATERIAL ]; then
+    pass "R17 BOTH halves of the key pair came back byte-for-byte"
+else
+    fail "R17 rustdesk key material wrong or missing"
+fi
+# The profile is the part that silently breaks: `rustdesk` must never be in
+# COMPOSE_PROFILES, so if this call stops naming it, compose answers "no such
+# service", the volume is never created, and the set skips - which is a NORMAL
+# outcome here and would therefore go unnoticed.
+if grep -qx 'hbbs:rustdesk' "$VOLROOT/.profile-log" 2>/dev/null; then
+    pass "R17 rustdesk used its explicit Compose profile for create"
+else
+    fail "R17 rustdesk profile invocation missing or wrong: $(cat "$VOLROOT/.profile-log" 2>/dev/null)"
 fi
 
 echo

@@ -39,6 +39,11 @@ class _Cfg:
     deadline_seconds = 90
     idle_sleep_seconds = 1800
     session_staleness_seconds = 120
+    # The residency probe waits out a cold model load, so its timeout is an
+    # order of magnitude above probe_timeout in production. Here it is small
+    # because every probe is stubbed.
+    ready_probe_timeout = 0.01
+    ready_ttl_seconds = 120
 
 
 class _Provider(dw.WakeProvider):
@@ -64,9 +69,24 @@ def svc(monkeypatch):
     return s
 
 
-def _probes(monkeypatch, reachable, loaded):
+def _probes(monkeypatch, reachable, loaded, resident=None):
+    """Three layers now, not two.
+
+    `loaded` is the cheap LISTING and can no longer produce `ready` on its own -
+    both Ollama and llama-server list a model that is configured and not
+    resident. `resident` is the one-token completion that actually proves it.
+    """
     monkeypatch.setattr(dw, "reachable", lambda *a, **k: reachable)
     monkeypatch.setattr(dw, "model_loaded", lambda *a, **k: loaded)
+    monkeypatch.setattr(dw, "model_resident", lambda *a, **k: resident)
+
+
+def _deep_now(svc, monkeypatch):
+    """Run the background residency probe synchronously, for determinism."""
+    monkeypatch.setattr(dw.threading, "Thread",
+                        lambda target, daemon=None: type(
+                            "T", (), {"start": lambda _self: target()})())
+    return svc.state(deep=True)
 
 
 # --- TC-988 ---------------------------------------------------------------
@@ -75,8 +95,18 @@ def test_each_state_has_its_own_determining_condition_sr044(svc, monkeypatch):
     assert svc.state()["state"] == "off"
     _probes(monkeypatch, True, False)
     assert svc.state()["state"] == "up"
-    _probes(monkeypatch, True, True)
+    # LISTED IS NOT READY. This assertion used to read `== "ready"`, and it was
+    # the defect written down as a test: a listing proves the model is
+    # CONFIGURED, and the caller still paid a full load on its first request.
+    _probes(monkeypatch, True, True, resident=None)
+    assert svc.state()["state"] == "up"
+    assert "residency not verified" in svc.state()["reason"]
+
+    # A verified completion is what promotes it, and only on a DEEP ask.
+    _probes(monkeypatch, True, True, resident=True)
+    _deep_now(svc, monkeypatch)
     assert svc.state()["state"] == "ready"
+    assert "completion verified" in svc.state()["reason"]
 
 
 # --- TC-989 ---------------------------------------------------------------
@@ -353,3 +383,104 @@ def test_the_carriage_return_guard_is_present_sr044():
     # literal CR and would have passed only by accident.
     assert block.count(r"tr -d '\015'") >= 3, (
         "every value read out of .env here needs the guard, not just the first")
+
+
+# --- TC-1045: listed is not resident ---------------------------------------
+def test_a_listed_model_is_not_ready_until_a_completion_proves_it_sr044(
+        svc, monkeypatch):
+    """THE DEFECT THIS REPLACED, STATED AS A TEST.
+
+    Both Ollama and llama-server list a model that is configured and NOT
+    resident in VRAM. `ready` on a listing meant the first request after a wake
+    still paid a full model load - `up` wearing `ready`'s name, which is the one
+    confusion this whole service exists to prevent.
+    """
+    _probes(monkeypatch, True, True, resident=None)
+    doc = svc.state(deep=False)
+    assert doc["state"] == "up", "a listing must never be enough for ready"
+    assert "residency not verified" in doc["reason"]
+
+
+# --- TC-1046: the poller must not become a keep-alive ----------------------
+def test_the_poller_never_fires_a_completion_sr044(svc, monkeypatch):
+    """A COMPLETION ON THE POLLER'S BEAT WOULD PIN THE WEIGHTS FOR EVER.
+
+    The service polls every DEVPC_WAKE_POLL_SECONDS to publish telemetry. If
+    that beat verified residency, the model could never be evicted and
+    OLLAMA_KEEP_ALIVE - whose entire job is to hand the card back when the Owner
+    wants to play a game - would be defeated by the thing watching it.
+
+    So the cheap path must fire NOTHING, and this counts.
+    """
+    calls = []
+    monkeypatch.setattr(dw, "reachable", lambda *a, **k: True)
+    monkeypatch.setattr(dw, "model_loaded", lambda *a, **k: True)
+    monkeypatch.setattr(dw, "model_resident",
+                        lambda *a, **k: calls.append(1) or True)
+
+    for _ in range(25):
+        svc.state(deep=False)
+    assert calls == [], \
+        "the poller fired %d completion(s); on a 15s beat that is a permanent " \
+        "VRAM lease" % len(calls)
+
+
+# --- TC-1047: the ask must not block on a cold load ------------------------
+def test_a_deep_ask_returns_immediately_and_verifies_behind_it_sr044(
+        svc, monkeypatch):
+    """BLOCKING /state WOULD BREAK THE CONSUMER IT EXISTS FOR.
+
+    The hold hook polls /state with a SHORT timeout while holding a request. A
+    cold load is tens of seconds, so a synchronous probe would time the hook
+    out - which it reads as `no-oracle` and REFUSES on, turning a sleeping box
+    into a hard failure. The ask returns at once; the verdict lands behind it.
+    """
+    started = []
+    monkeypatch.setattr(dw, "reachable", lambda *a, **k: True)
+    monkeypatch.setattr(dw, "model_loaded", lambda *a, **k: True)
+
+    def slow(*a, **k):
+        started.append(1)
+        raise AssertionError("must not run on the caller's thread")
+
+    monkeypatch.setattr(dw, "model_resident", slow)
+    spawned = []
+    monkeypatch.setattr(dw.threading, "Thread",
+                        lambda target, daemon=None: spawned.append(target) or
+                        type("T", (), {"start": lambda _s: None})())
+
+    doc = svc.state(deep=True)
+    assert doc["state"] == "up"
+    assert "verifying residency" in doc["reason"]
+    assert spawned, "the probe must be handed to a background thread"
+    assert started == [], "nothing may run on the caller's thread"
+
+
+# --- TC-1047: single flight ------------------------------------------------
+def test_residency_verification_is_single_flight_sr044(svc, monkeypatch):
+    """Twenty asks while one probe is in flight must not be twenty loads."""
+    monkeypatch.setattr(dw, "reachable", lambda *a, **k: True)
+    monkeypatch.setattr(dw, "model_loaded", lambda *a, **k: True)
+    monkeypatch.setattr(dw, "model_resident", lambda *a, **k: True)
+    spawned = []
+    monkeypatch.setattr(dw.threading, "Thread",
+                        lambda target, daemon=None: spawned.append(target) or
+                        type("T", (), {"start": lambda _s: None})())
+
+    for _ in range(20):
+        svc.state(deep=True)
+    assert len(spawned) == 1, "expected one in-flight probe, got %d" % len(spawned)
+
+
+# --- TC-1046: the verdict expires -----------------------------------------
+def test_a_verified_residency_expires_so_an_evicted_model_is_noticed_sr044(
+        svc, monkeypatch):
+    """The keep-alive can evict the model behind our back. A cached `ready`
+    that never expired would go on asserting a model that is gone."""
+    _probes(monkeypatch, True, True, resident=True)
+    _deep_now(svc, monkeypatch)
+    assert svc.state()["state"] == "ready"
+
+    svc._test_clock["now"] += 121        # past ready_ttl_seconds
+    assert svc.state()["state"] == "up", \
+        "a stale verification must not keep claiming ready"

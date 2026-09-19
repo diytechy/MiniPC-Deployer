@@ -13,7 +13,25 @@ truth is `up` will block on a completion and then blame the model. So the state
 is decided by TWO layers that are never collapsed into one truthiness check:
 
     reachability   ICMP or TCP to the inference port   ->  off / up
-    readiness      a model listing naming the model    ->  up  / ready
+    residency      a ONE-TOKEN COMPLETION that returns   ->  up  / ready
+
+`ready` USED TO MEAN "THE MODEL IS LISTED", AND THAT WAS THE SAME LIE THIS FILE
+EXISTS TO PREVENT, ONE LAYER DOWN. Both Ollama and llama-server list a model
+that is configured but NOT RESIDENT IN VRAM, so a caller told `ready` still
+paid a full model load on its first request - which is `up` wearing `ready`'s
+name, and is exactly the "block on a completion and then blame the model"
+failure described above. A listing proves the model is CONFIGURED. Only a
+completion proves it is LOADED.
+
+THE COMPLETION IS NEVER FIRED BY THE POLLER, and that is not an optimisation -
+it is the difference between a readiness probe and an accidental keep-alive.
+The background poller runs every DEVPC_WAKE_POLL_SECONDS; a completion on that
+beat would hold the weights in VRAM for ever and defeat OLLAMA_KEEP_ALIVE,
+whose whole job is to hand the card back when the Owner wants to play a game.
+So residency is verified only when a caller ASKS (`/state`), it runs in the
+BACKGROUND so the ask is never blocked by a cold load, it is SINGLE-FLIGHT, and
+its verdict is cached for DEVPC_READY_TTL_SECONDS. The poller reuses that cache
+and fires nothing.
 
 A reachability TIMEOUT is `off`, never `up` - a powered-off box times out, and
 calling that `up` suppresses the very wake this service exists to fire. A
@@ -148,6 +166,52 @@ def model_loaded(base_url: str, target_model: str, timeout: float = 5.0):
     return target_model in names
 
 
+def model_resident(base_url: str, target_model: str, timeout: float = 60.0):
+    """Layer two, honestly. Returns True/False, or None when it did not answer.
+
+    A ONE-TOKEN COMPLETION. It is the smallest request that cannot be satisfied
+    from a config file: the server has to have the weights in memory to emit a
+    token at all. `max_tokens: 1` keeps it cheap once the model IS resident -
+    which matters, because this runs again every time the cache expires.
+
+    THE TIMEOUT IS LONG ON PURPOSE (a minute, not the two seconds reachability
+    gets). A cold model load is tens of seconds, and the whole point is to wait
+    for it rather than declare the box unready and re-ask for ever. Nothing is
+    blocked while it waits - see the note on single-flight in WakeService.
+
+    None and False are DIFFERENT and callers must not merge them:
+      False -> the server answered and refused                  -> up
+      None  -> the completion itself failed or timed out        -> up
+    Both are `up`, because layer one already said the host answers. Neither is
+    ever `ready`, and neither is ever `off`.
+    """
+    if not target_model:
+        # No target configured: there is nothing to prove resident, and
+        # claiming `ready` would be inventing a guarantee.
+        return False
+    url = base_url.rstrip("/") + "/v1/chat/completions"
+    payload = json.dumps({
+        "model": target_model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return False
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return None
+    # A 200 with no choices is not a served completion. Ask for the thing that
+    # only a loaded model can produce rather than trusting the status line.
+    return bool(body.get("choices"))
+
+
 # ---------------------------------------------------------------------------
 # The flight: single-flight wake, one linearization point, no I/O under the lock.
 # ---------------------------------------------------------------------------
@@ -189,9 +253,14 @@ class WakeService:
         self._lock = threading.Lock()
         self._flight = None
         self._last_wake_ok = None
+        # Residency verification is CACHED, because the probe that proves it is
+        # the one thing here expensive enough to change the machine's behaviour
+        # if it ran on a timer.
+        self._resident_until = 0.0
+        self._resident_flight = False
 
     # -- state ------------------------------------------------------------
-    def state(self) -> dict:
+    def state(self, deep: bool = False) -> dict:
         """Determine the state. Precedence is FIXED and ordered (LLR-966).
 
         1. an expired wake deadline -> failed, outranking every probe, because a
@@ -226,13 +295,67 @@ class WakeService:
             return self._doc(State.WAKING if waking else State.OFF, now,
                              "wake in flight" if waking else "no probe answered")
 
-        loaded = model_loaded(self.cfg.base_url, self.cfg.target_model,
+        # A FRESH, VERIFIED RESIDENCY VERDICT OUTRANKS EVERYTHING CHEAP.
+        with self._lock:
+            fresh = self._resident_until > now
+            verifying = self._resident_flight
+
+        if fresh:
+            return self._doc(State.READY, now, "completion verified the model is resident")
+
+        # The cheap listing is kept as a PRE-FILTER, not as the answer. It is
+        # what distinguishes "this box serves a different model" - a
+        # configuration fault worth naming - from "the right model is there but
+        # cold". Firing a completion at a model the box does not have would
+        # wait out the long timeout to learn what a listing says instantly.
+        listed = model_loaded(self.cfg.base_url, self.cfg.target_model,
                               self.cfg.probe_timeout)
-        if loaded is True:
-            return self._doc(State.READY, now, "target model loaded")
-        reason = ("listing did not answer" if loaded is None
-                  else "answering, target model not loaded")
-        return self._doc(State.UP, now, reason)
+        if listed is None:
+            return self._doc(State.UP, now, "listing did not answer")
+        if listed is False:
+            return self._doc(State.UP, now, "answering, target model not listed")
+
+        if not deep:
+            # Telemetry asked. Report what is known and FIRE NOTHING: a
+            # completion on the poller's beat would pin the weights in VRAM for
+            # ever and defeat the keep-alive that hands the card back.
+            return self._doc(State.UP, now,
+                             "model listed; residency not verified (cheap probe)")
+
+        if not verifying:
+            self._begin_residency_probe()
+        return self._doc(State.UP, now,
+                         "model listed; verifying residency with a completion")
+
+    def _begin_residency_probe(self):
+        """Fire ONE background completion. Never blocks the caller.
+
+        BLOCKING /state ON THIS WOULD BREAK THE CONSUMER IT EXISTS FOR. The
+        hold hook polls /state every few seconds with a short timeout; a cold
+        load takes tens of seconds, so a synchronous probe would time the hook
+        out, which it reads as "no oracle" and REFUSES the request. The ask
+        returns immediately saying it is verifying; the next poll sees `ready`
+        once the weights are actually there. That is precisely the hold SR-044
+        describes, and it falls out of not blocking.
+        """
+        def run():
+            ok = model_resident(self.cfg.base_url, self.cfg.target_model,
+                                self.cfg.ready_probe_timeout)
+            now = self._clock()
+            with self._lock:
+                self._resident_flight = False
+                if ok is True:
+                    self._resident_until = now + self.cfg.ready_ttl_seconds
+                else:
+                    # A refusal or a timeout does NOT extend the cache, and it
+                    # does not poison it either: the next ask tries again.
+                    self._resident_until = 0.0
+
+        with self._lock:
+            if self._resident_flight:
+                return
+            self._resident_flight = True
+        threading.Thread(target=run, daemon=True).start()
 
     def _doc(self, state: State, now: float, reason: str) -> dict:
         # Every document carries the instant it was determined, so a stale

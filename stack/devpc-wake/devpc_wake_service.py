@@ -61,6 +61,16 @@ class Config:
         self.topic = env.get("DEVPC_WAKE_TOPIC", "homehub/devpc/state")
         self.poll_seconds = float(env.get("DEVPC_WAKE_POLL_SECONDS", "15"))
         self.session_url = env.get("DEVPC_SESSION_URL", "")
+        # RESIDENCY, not listing. A cold model load is tens of seconds, so this
+        # timeout is deliberately an order of magnitude above probe_timeout -
+        # the point is to WAIT for the load, not to declare the box unready and
+        # ask again for ever.
+        self.ready_probe_timeout = float(
+            env.get("DEVPC_READY_PROBE_TIMEOUT_SECONDS", "60"))
+        # How long a verified residency is trusted. Short enough that a model
+        # the keep-alive has since evicted is noticed; long enough that a burst
+        # of requests does not re-verify on every one.
+        self.ready_ttl_seconds = float(env.get("DEVPC_READY_TTL_SECONDS", "120"))
 
 
 def build_provider(cfg):
@@ -118,7 +128,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") in ("/state", ""):
-            self._json(200, self.service.state())
+            # deep=True: a caller asking means a request is imminent, so this
+            # is where verifying residency is worth its cost. The poller below
+            # passes nothing and fires no completion.
+            self._json(200, self.service.state(deep=True))
         elif self.path.rstrip("/") == "/sleep-verdict":
             # IF-026. We publish a verdict. We never actuate.
             session = self.session_reader() if self.session_reader else None
@@ -195,7 +208,11 @@ def main():
         last = None
         while True:
             try:
-                doc = svc.state()
+                # CHEAP ON PURPOSE. A completion on this beat would hold the
+                # weights in VRAM for ever and defeat the keep-alive whose job
+                # is to hand the card back. The poller reuses whatever the
+                # on-demand probe last verified.
+                doc = svc.state(deep=False)
                 # Publish on CHANGE, plus a floor, so the topic is neither
                 # chatty nor silent enough to look dead.
                 if doc["state"] != last:

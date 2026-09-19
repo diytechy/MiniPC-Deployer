@@ -2240,3 +2240,17 @@ observation timestamp and expires six missed publications at 1.5 seconds while
 accepting the prior block shape for staggered upgrades. The AEC check target
 now tests contention, snapshot delivery, and shutdown drain; 120 policy, 25
 PCM, and 5 publisher checks pass, and both live and replay binaries compile.
+**2026-09-18 — rocker pulse diagnosis only; no implementation or deployment.**
+The Owner paused the responsiveness change for planning. A fresh evdev capture
+and a temporary lower-layer `serio_interrupt` kprobe proved that a held rocker
+arrives from the i8042 controller as repeated raw `E0 2E` make / `E0 AE` break
+sequences about every 106–107 ms; evdev and `atkbd` are not synthesizing the
+pairs. The probe was removed and tracing left off. Draft behavior is now one 5%
+step per real break pulse, with display feedback per pulse. Adversarial review
+showed that audible in-hold batching is not a scalar accumulator: the blocking
+daemon needs a separate bounded actor, boundary reversals need an absolute
+virtual target, and output/generation guards need a protocol extension. The
+simple alternative is one final apply after the quiet gap. The assertion plan is
+HomeHub `docs/PANEL_VOLUME_ROCKER_RESPONSIVENESS_PLAN_2026-09-18.md`. Product
+code and tests remain unchanged; Owner selection between those strategies and
+confirmation of the 250 ms lifecycle gap is next.

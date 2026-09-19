@@ -2252,5 +2252,7 @@ daemon needs a separate bounded actor, boundary reversals need an absolute
 virtual target, and output/generation guards need a protocol extension. The
 simple alternative is one final apply after the quiet gap. The assertion plan is
 HomeHub `docs/PANEL_VOLUME_ROCKER_RESPONSIVENESS_PLAN_2026-09-18.md`. Product
-code and tests remain unchanged; Owner selection between those strategies and
-confirmation of the 250 ms lifecycle gap is next.
+code and tests remain unchanged. The Owner subsequently selected the in-hold
+audible strategy: the non-blocking guarded actor, absolute virtual target and
+causal preview reconciliation are now the asserted target. The 250 ms lifecycle
+gap remains the documented default unless the Owner objects.

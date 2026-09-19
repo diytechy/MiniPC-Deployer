@@ -1865,6 +1865,17 @@ fi
 # and it re-checks all of that on EVERY boot, because an account created
 # without sudo can be given it later. A refusal is exit 2 and is reported here
 # as a WARNING with the reason, never swallowed.
+# Same unset-variable defect as the mesh-tunnel block below carried until
+# 2026-09-18: AI_CLI_ENABLED is assigned nowhere in this script, so this read an
+# unset shell variable and was false on every run. A reimaged hub would put
+# AI_CLI_ENABLED=true in .env and then never provision the AI CLI.
+AI_CLI_ENABLED="$(_env_val AI_CLI_ENABLED | tr -d '"')"
+# Read for the LOG LINES below too: they state the bind, port and account,
+# and an unset read made them print defaults regardless of what .env said -
+# a headless box reporting a configuration it does not have.
+AI_CLI_BIND="$(_env_val AI_CLI_BIND | tr -d '"')"
+AI_CLI_PORT="$(_env_val AI_CLI_PORT | tr -d '"')"
+AI_CLI_USER="$(_env_val AI_CLI_USER | tr -d '"')"
 if [ "${AI_CLI_ENABLED:-false}" = "true" ]; then
     log "provisioning the AI CLI service (activated by .env)…"
     if [ -f "$STACK_DIR/ai-cli/setup-ai-cli.sh" ]; then
@@ -1903,6 +1914,23 @@ fi
 # ALSO OUTSIDE THE OFFLINE CLOSURE: the daemon is not in the base archive, so
 # this step needs working internet. On a box with none it fails, says so, and
 # changes nothing else.
+# READ THE KNOB FROM .env. This said "${TAILSCALE_ENABLED:-false}" until
+# 2026-09-18, and TAILSCALE_ENABLED is assigned NOWHERE in this script - it was
+# reading an unset shell variable, because firstboot deliberately does not
+# `source` .env and the unit sets no EnvironmentFile. So the branch was false on
+# every run and this entire block was dead code: a reimaged hub would write
+# TAILSCALE_ENABLED=true into .env, report nothing amiss, and come up with NO
+# MESH TUNNEL - which is the only remote access this site has, on a box behind
+# CGNAT where nothing else can reach in.
+#
+# Found by generalising a review finding against the RustDesk block above, which
+# had been written with the identical mistake. Two instances of one error is the
+# shape worth checking the rest of the file for.
+TAILSCALE_ENABLED="$(_env_val TAILSCALE_ENABLED | tr -d '"')"
+# Read for the log line below, which otherwise always printed "<unset>"
+# immediately after telling the operator a human must finish this step -
+# the least helpful moment to state a value the box did not look up.
+TAILSCALE_ADVERTISE_ROUTES="$(_env_val TAILSCALE_ADVERTISE_ROUTES | tr -d '"')"
 if [ "${TAILSCALE_ENABLED:-false}" = "true" ]; then
     log "provisioning the mesh VPN subnet router (activated by .env)…"
     if [ -f "$STACK_DIR/tailscale/setup-tailscale.sh" ]; then
@@ -1945,6 +1973,9 @@ fi
 # THE SCRIPT DOES THE REFUSING, NOT THIS BLOCK: a blank AI_USAGE_USER is a
 # refusal and not a default, because guessing which household member's board
 # these gauges land on puts one person's usage on another person's panel.
+# Same unset-variable defect as AI_CLI_ENABLED and the mesh tunnel.
+AI_USAGE_ENABLED="$(_env_val AI_USAGE_ENABLED | tr -d '"')"
+AI_USAGE_USER_ACCOUNT="$(_env_val AI_USAGE_USER_ACCOUNT | tr -d '"')"
 if [ "${AI_USAGE_ENABLED:-false}" = "true" ]; then
     log "provisioning the AI-usage feeder (activated by .env)…"
     if [ -f "$STACK_DIR/ai-usage/setup-ai-usage.sh" ]; then
@@ -1977,6 +2008,8 @@ fi
 # refusal, and so is a blank WEIGHT_DEFINITIONS_DIR - the goal lives in the
 # user's own definitions (SN-040) and there is no hub knob to fall back on, so
 # a box that cannot find them has no goal and posts nothing at all.
+# Same unset-variable defect as AI_CLI_ENABLED and the mesh tunnel above.
+WEIGHT_ENABLED="$(_env_val WEIGHT_ENABLED | tr -d '"')"
 if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
     log "provisioning the weight feeder (activated by .env)…"
     if [ -f "$STACK_DIR/weight/setup-weight.sh" ]; then

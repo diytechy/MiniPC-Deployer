@@ -1,0 +1,25 @@
+# wall-bluetooth-observe.service — republish what BlueZ currently says.
+#
+# The broker reads /run/wall-bluetooth/state.json and treats anything older than
+# thirty seconds as "do not know" (routed_backend.MAX_DOCUMENT_AGE_SECONDS),
+# which is the whole reason this exists: a document that stops being refreshed
+# must stop being believed, and the only way that rule has teeth is if something
+# refreshes it.
+#
+# THE APPLIER ALSO PUBLISHES, after every request it performs, so this timer is
+# not what makes a tap feel responsive — it is what keeps the list honest
+# between taps, when a phone connects, disconnects or walks out of the room with
+# nobody touching the panel.
+
+[Unit]
+Description=Wall panel: republish the Bluetooth device inventory
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wall-bluetooth-device publish
+SyslogIdentifier=wall-bluetooth-device
+StandardOutput=journal
+StandardError=journal

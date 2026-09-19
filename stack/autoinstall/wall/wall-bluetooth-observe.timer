@@ -1,0 +1,24 @@
+# wall-bluetooth-observe.timer — the cadence the broker's staleness rule needs.
+#
+# Ten seconds against a thirty-second staleness bound, so two consecutive misses
+# are survivable and the third is what makes the panel say it does not know.
+# A fixed cadence, so unlike the generated timers in this tree this file is
+# TRACKED rather than rendered.
+#
+# AccuracySec=1s because the default is a MINUTE: systemd coalesces timers to
+# save wakeups, and a ten-second timer with the default accuracy can fire every
+# sixty, which would put the document past the staleness bound on a panel where
+# nothing was wrong. This is the same trap the occupancy timer documents.
+
+[Unit]
+Description=Wall panel: keep the Bluetooth inventory document fresh
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=10s
+AccuracySec=1s
+Unit=wall-bluetooth-observe.service
+
+[Install]
+WantedBy=timers.target

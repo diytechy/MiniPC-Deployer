@@ -16,7 +16,21 @@ ALIAS = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 MUTATING_METHODS = frozenset(
     {"discover", "cancel", "pair", "connect", "disconnect", "forget",
      "select_input", "select_output", "set_visualizer", "set_mute",
-     "set_output", "set_input_mute", "set_volume"}
+     "set_output", "set_input_mute", "set_volume",
+     # WSN-024, added with the routed-device backend (Owner, 2026-09-19:
+     # "need bluetooth to have a method to trust a device, might need a method
+     # to ... turn on discoverability").
+     #
+     # `trust` IS A SEPARATE DECISION FROM `pair`, and it has to be, because
+     # BlueZ separates them: a bond makes a device able to connect, and
+     # `Trusted` makes the panel accept a connection the device starts on its
+     # own. A phone paired without trust works perfectly until you walk out of
+     # the room, and then never reconnects -- which reads as "Bluetooth is
+     # broken" and has no control anywhere to fix it. Pairing sets it, and this
+     # verb is how it is set or revoked afterwards.
+     #
+     # `set_discoverable` IS NOT `discover`. See bluetooth_request.REQUEST_KINDS.
+     "trust", "set_discoverable"}
 )
 
 # THE TWO NAMES THAT LOOK ALIKE, AND ARE NOT (item 23 step 2). `select_output`
@@ -61,6 +75,19 @@ HARDWARE_ADDRESS = re.compile(
 )
 
 
+# Every verb that names a device. Derived once and used by both the parameter
+# check and the inventory check, because they used to carry two hand-written
+# copies of this list and a verb added to one was silently unchecked by the
+# other.
+ALIAS_METHODS = frozenset({"pair", "trust", "connect", "disconnect", "forget",
+                           "select_input", "select_output"})
+
+# The verbs that manage DEVICES, as opposed to the panel's own switch. This is
+# the set `device_authorization` opens, and it is the whole of WSN-024's
+# surface.
+DEVICE_METHODS = ALIAS_METHODS | {"discover", "cancel", "set_discoverable"}
+
+
 class PolicyError(ValueError):
     """A request violates the fixed route/device policy."""
 
@@ -95,6 +122,8 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         "pair": {"alias", "confirmation"}, "connect": {"alias"},
         "disconnect": {"alias"}, "forget": {"alias"},
         "select_input": {"alias", "explicit"}, "select_output": {"alias"},
+        "trust": {"alias", "trusted"},
+        "set_discoverable": {"enabled"},
         "set_visualizer": {"enabled"},
         "set_mute": {"muted"},
         "set_output": {"output"},
@@ -104,7 +133,7 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
     if set(params) - allowed:
         raise PolicyError("unknown parameter")
     alias = params.get("alias")
-    if method in {"pair", "connect", "disconnect", "forget", "select_input", "select_output"} and alias is None:
+    if method in ALIAS_METHODS and alias is None:
         raise PolicyError("device alias is required")
     if alias is not None and (not isinstance(alias, str) or not ALIAS.fullmatch(alias) or
                               HARDWARE_ADDRESS.search(alias)):
@@ -115,8 +144,13 @@ def validate_action(method: str, params: Mapping[str, object]) -> None:
         timeout = params.get("timeoutSeconds", 30)
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 120:
             raise PolicyError("discovery timeout outside 1..120 seconds")
-    if method == "set_visualizer" and not isinstance(params.get("enabled"), bool):
+    if method in ("set_visualizer", "set_discoverable") and not isinstance(params.get("enabled"), bool):
         raise PolicyError("enabled must be boolean")
+    # Required rather than defaulted, for the same reason `muted` is: a trust
+    # request that forgot to say which way is a caller bug, and guessing it
+    # would silently grant or revoke a device's standing invitation.
+    if method == "trust" and not isinstance(params.get("trusted"), bool):
+        raise PolicyError("trusted must be boolean")
     # `muted` is required, not defaulted: a mute request that forgot to say which
     # way is a caller bug, and guessing it would silently toggle the room.
     if method in ("set_mute", "set_input_mute") and not isinstance(params.get("muted"), bool):
@@ -180,14 +214,46 @@ def switch_only_authorization(method: str, params: Mapping[str, object]) -> bool
     return method in SWITCH_METHODS
 
 
+# The two verbs that may name a device the panel does not trust yet. Everything
+# else needs the trust to exist first -- which is what makes `trust` the way in
+# rather than a convenience beside it.
+UNTRUSTED_METHODS = frozenset({"pair", "trust"})
+
+
+def device_authorization(method: str, params: Mapping[str, object]) -> bool:
+    """Authorize the host switch AND Bluetooth device management. WSN-024.
+
+    WHAT CHANGED, AND WHY IT IS NOT A LOOSENING OF SR-023. The docstring on
+    `switch_only_authorization` says device management stayed shut because "the
+    image has never decided how panel authentication maps onto BLUETOOTH
+    authority". That decision now exists and is made one layer up, not here:
+    `audio-ipc.cjs` admits only `set_output` and `set_input_mute` without an
+    authenticated session (PUBLIC_CONTROLS, Owner 2026-09-14, "local audio
+    switches are public, device management is not"), and every verb in
+    DEVICE_METHODS arrives having passed that check or not at all.
+
+    So this callback is not the authority; it is the broker's statement of what
+    a backend is ALLOWED to be asked. Keeping the deny-by-default for everything
+    outside these two sets is what still holds: an unknown verb, or a verb some
+    future backend invents, is refused here before any device I/O.
+
+    `switch_only_authorization` is KEPT and is still what a panel without the
+    routed-device backend installs. A panel whose applier is absent must refuse
+    at the gate rather than accept a pairing request nothing will ever answer.
+    """
+    return method in SWITCH_METHODS or method in DEVICE_METHODS
+
+
 def validate_inventory_action(
     method: str, params: Mapping[str, object], devices: Iterable[Device]
 ) -> None:
     """Refuse device actions whose alias, kind, or trust is not current.
 
-    Pair may target a discovered untrusted device. Connect/disconnect/forget
-    and route selection require a trusted device; input/output selection also
-    requires the matching kind. Implements: SR-023, LLR-007.
+    Pair and trust may target a discovered untrusted device -- `trust` above
+    all, because a device that is already trusted is the one case where that
+    verb has nothing to do. Connect/disconnect/forget and route selection
+    require a trusted device; input/output selection also requires the matching
+    kind. Implements: SR-023, LLR-007.
     """
     alias = params.get("alias")
     if alias is None:
@@ -196,7 +262,7 @@ def validate_inventory_action(
     if len(matches) != 1:
         raise PolicyError("device alias is not in the current inventory")
     device = matches[0]
-    if method != "pair" and not device.trusted:
+    if method not in UNTRUSTED_METHODS and not device.trusted:
         raise PolicyError("device is not trusted")
     expected_kind = {"select_input": "input", "select_output": "output"}.get(method)
     if expected_kind and device.kind != expected_kind:

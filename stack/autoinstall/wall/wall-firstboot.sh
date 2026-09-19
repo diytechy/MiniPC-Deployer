@@ -886,6 +886,43 @@ for _sbin in wall-sleep.sh wall-occupancy.py wall-sensor-power-policy.py wall-sy
     fi
 done
 unset _sbin
+
+# ── the Pandora sign-in, carried across a reimage ────────────────────────────
+# Owner, 2026-09-19. MEASURED BEFORE BUILT: the sign-in lives only in
+# /home/panel/.config/officewall-shell/Partitions/pandora, and nothing in this
+# lane deletes it — it survived all ~67 paired releases between the 2026-09-11
+# reimage and 2026-09-18. A RELEASE never loses it. A REIMAGE does, because it
+# recreates /home/panel, and until now nothing carried it forward.
+#
+# So this step is a RESTORE and never a save: the archive is made by hand before
+# a reimage (`sudo wall-pandora-session save ...`) and staged into the payload's
+# secret directory, which is how it survives the wipe. The tool refuses to touch
+# a panel that already has a sign-in or whose profile a live Chromium is holding,
+# so running it on every firstboot is safe and does nothing on the other 66
+# invocations.
+if [ -f "$PAYLOAD/wall-pandora-session.py" ]; then
+    install -m 0755 "$PAYLOAD/wall-pandora-session.py" /usr/local/sbin/wall-pandora-session
+else
+    fail_step "pandora session: wall-pandora-session.py is missing from the image payload"
+fi
+PANDORA_SEED="${WALL_PANDORA_SESSION_SEED:-/opt/wall-panel/site/pandora-session.tar.gz}"
+if [ ! -f "$PANDORA_SEED" ]; then
+    log "pandora session: no staged archive at $PANDORA_SEED — the player will ask for the login once"
+elif ! id panel >/dev/null 2>&1; then
+    warn "pandora session: no 'panel' account yet — leaving $PANDORA_SEED alone"
+else
+    # NOT fail_step. A sign-in the Owner can restore with one tap on the panel is
+    # not worth failing an image over, and a refusal here is usually the tool
+    # working: "this panel already has a sign-in" is the answer on every re-run.
+    if /usr/local/sbin/wall-pandora-session restore "$PANDORA_SEED"; then
+        log "pandora session: restored from $PANDORA_SEED"
+    else
+        warn "pandora session: $PANDORA_SEED was not restored (see the line above);"
+        warn "the panel still works — sign in to Pandora once on the wall."
+    fi
+fi
+unset PANDORA_SEED
+
 if [ -f "$PAYLOAD/wall-local-setup.py" ] && [ -f "$PAYLOAD/wall-local-setup.service" ]; then
     install -m 0755 "$PAYLOAD/wall-local-setup.py" /usr/local/lib/wall-panel/wall-local-setup.py
     install -m 0644 "$PAYLOAD/wall-local-setup.service" /etc/systemd/system/wall-local-setup.service

@@ -21,11 +21,12 @@ import struct
 import threading
 from typing import Callable, Mapping, Protocol
 
+import routed_backend
 import switch_backend
 from routing import (ALIAS, HARDWARE_ADDRESS, Device, MUTATING_METHODS,
                      SELF_RECONCILING_METHODS, SWITCH_OUTPUTS, PolicyError,
-                     switch_only_authorization, validate_action,
-                     validate_inventory_action)
+                     device_authorization, switch_only_authorization,
+                     validate_action, validate_inventory_action)
 
 
 MAX_REQUEST_BYTES = 16_384
@@ -404,7 +405,7 @@ class AudioBroker:
                         cached.get("ok") is not True):
                     raise BrokerError("unsafe_state", "persisted mutation result is invalid")
                 self._ensure_safe_result(method, cached.get("result"))
-                if self._effect_survived(cached.get("result")):
+                if self._effect_survived(method, cached.get("result")):
                     return cached
                 # THE JOURNAL OUTLIVED THE EFFECT (terra 4.1). This broker's
                 # completed record is in StateDirectory and the request it
@@ -452,7 +453,7 @@ class AudioBroker:
         finally:
             self._mutation_lock.release()
 
-    def _effect_survived(self, result: object) -> bool:
+    def _effect_survived(self, method: str, result: object) -> bool:
         """Whether the effect a completed reply acknowledged is still in force.
 
         Only a result carrying a `seq` makes a checkable claim, and only a
@@ -462,13 +463,22 @@ class AudioBroker:
         `_reconcile`'s `status`, so a backend that hangs answering it is still
         bounded and killable. It is NOT an IF-015 method: `routing.METHODS` does
         not contain it, so no client can ask for it.
+
+        THE METHOD TRAVELS WITH THE SEQUENCE (WSN-024). It did not have to while
+        one applier minted every seq. The routed-device backend adds a SECOND
+        applier with its own high-water mark, and both mint from the same
+        microsecond clock -- so a device seq compared against the switch's mark,
+        or the reverse, is a coin toss between "replay a `forget` that already
+        happened" and "drop a `pair` that never did". The backend needs to know
+        which of its two appliers to ask, and only the caller knows.
         """
         if not isinstance(result, dict) or "seq" not in result:
             return True
         if not hasattr(self.backend, "request_landed"):
             return True
         try:
-            observed = self._backend_call("call", "request_landed", {"seq": result["seq"]})
+            observed = self._backend_call("call", "request_landed",
+                                          {"seq": result["seq"], "method": method})
         except BrokerError:
             # Failing to look is not the same as having looked, and the safe
             # answer here is the one that re-does an idempotent request.
@@ -684,8 +694,13 @@ class AudioBroker:
             # tell you", which the shell must render differently from "not
             # muted". Making it required would have invalidated every existing
             # backend for a field most of them cannot answer.
+            # `pairing` joins `mute` and `switch` as an OPTIONAL block, and for
+            # the same reason they are optional: a backend that predates WSN-024
+            # -- which is every panel running the switch-only backend -- must
+            # stay valid. Absent means "this panel cannot tell you", which the
+            # shell renders differently from "no pairing in progress".
             required = {"protocolVersion", "available", "reason", "devices", "route", "visualizer"}
-            if not required <= set(value) or set(value) - required - {"mute", "switch"}:
+            if not required <= set(value) or set(value) - required - {"mute", "switch", "pairing"}:
                 raise BrokerError("unsafe_backend_result", "status fields are not exact")
             if value["protocolVersion"] != 1 or not isinstance(value["available"], bool):
                 raise BrokerError("unsafe_backend_result", "status version or availability is invalid")
@@ -711,6 +726,8 @@ class AudioBroker:
                     raise BrokerError("unsafe_backend_result", "mute state is invalid")
             if "switch" in value:
                 self._safe_switch(value["switch"])
+            if "pairing" in value:
+                self._safe_pairing(value["pairing"])
         elif method == "telemetry":
             if value == {"available": False}:
                 return
@@ -858,6 +875,40 @@ class AudioBroker:
         if battery is not None and (isinstance(battery, bool) or not isinstance(battery, int) or not 0 <= battery <= 100):
             raise BrokerError("unsafe_backend_result", "device battery is invalid")
 
+    def _safe_pairing(self, value: object) -> None:
+        """Validate the pairing block. WSN-024, Owner 2026-09-19.
+
+        THE PASSKEY IS A STRING OF DIGITS AND IS BOUNDED HERE. It is the one
+        field in this protocol whose whole purpose is to be READ ALOUD and
+        compared against a phone, so it crosses to the renderer verbatim -- and
+        a verbatim field is exactly the kind a backend could smuggle something
+        through. Digits only, at most sixteen of them, and nothing else: no
+        message, no device name, no address.
+
+        `device` is an ALIAS and is checked as one. Naming the device being
+        paired is the difference between "compare this number" and "compare this
+        number, to your phone" when two people are in the room.
+        """
+        fields = {"active", "discoverable", "passkey", "device", "endsInSeconds"}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise BrokerError("unsafe_backend_result", "pairing fields are not exact")
+        for flag in ("active", "discoverable"):
+            if not isinstance(value[flag], bool):
+                raise BrokerError("unsafe_backend_result", "pairing state is invalid")
+        passkey = value["passkey"]
+        if passkey is not None and (not isinstance(passkey, str) or not passkey.isdigit() or
+                                    not 1 <= len(passkey) <= 16):
+            raise BrokerError("unsafe_backend_result", "pairing passkey is invalid")
+        device = value["device"]
+        if device is not None:
+            self._safe_string(device, 48)
+            if not ALIAS.fullmatch(device):
+                raise BrokerError("unsafe_backend_result", "pairing device alias is invalid")
+        ends = value["endsInSeconds"]
+        if ends is not None and (isinstance(ends, bool) or not isinstance(ends, int)
+                                 or not 0 <= ends <= 600):
+            raise BrokerError("unsafe_backend_result", "pairing deadline is invalid")
+
     def _safe_route(self, value: object) -> None:
         if not isinstance(value, dict) or set(value) != {"input", "output"}:
             raise BrokerError("unsafe_backend_result", "route fields are invalid")
@@ -925,20 +976,37 @@ class BoundedUnixServer:
 def serve(socket_path: str, backend: Backend | None = None, *, state_path: str | None = None) -> None:
     """Serve IF-015 on one filesystem Unix socket; never binds an IP address.
 
-    The shipped backend is the SWITCH applier backend (item 23 step 5): it moves
-    the panel's own Mute/Headset/Speaker switch, the microphone button and the
-    level, through the root applier, and routes no device at all. WSN-024's
-    routed-device backend stays unimplemented -- `inventory` is empty, so every
-    pair/connect/select verb is still refused. On a panel where the applier is
-    not installed the backend refuses with backend_unavailable, which is what
-    UnavailableBackend used to say for every method.
+    TWO BACKENDS, AND WHICH ONE SHIPS IS DECIDED BY WHAT IS INSTALLED.
+
+    The floor is the SWITCH applier backend (item 23 step 5): it moves the
+    panel's own Mute/Headset/Speaker switch, the microphone button and the
+    level, through the root applier, and routes no device at all. On a panel
+    where that applier is missing it refuses with backend_unavailable.
+
+    WSN-024's routed-device backend now wraps it when -- and only when -- the
+    Bluetooth applier is installed. That condition is the whole of the safety
+    argument: a panel without `wall-bluetooth-device` keeps
+    `switch_only_authorization`, so `pair`, `connect` and `select_output` are
+    refused AT THE GATE rather than accepted into a request file nothing will
+    ever read. Accepting a pairing request no applier will answer is worse than
+    refusing it: the broker's journal would go sticky-pending on a mutation that
+    never had anywhere to go, and the next device verb would need an operator.
+
+    The check is presence, not configuration, and it is made ONCE at startup
+    rather than per request. An applier removed underneath a running broker is
+    caught by `_require_applier` on the next mutation, which is the same answer
+    one request later.
     """
+    switch = backend or switch_backend.backend_from_environment()
+    devices = routed_backend.backend_from_environment(switch)
+    routed = backend is None and devices.applier_path.exists()
     server = BoundedUnixServer(socket_path, AudioBroker(
-        backend or switch_backend.backend_from_environment(),
-        # Switch verbs only. Device routing keeps the deny-by-default it has
-        # always had; see routing.switch_only_authorization for why the two
-        # questions get different answers.
-        authorize=switch_only_authorization, state_path=state_path))
+        devices if routed else switch,
+        # Switch verbs only until the device applier is there to answer the rest;
+        # see routing.device_authorization for why this callback is a statement
+        # about what a BACKEND may be asked and not the authority itself.
+        authorize=device_authorization if routed else switch_only_authorization,
+        state_path=state_path))
     try: server.serve_forever()
     finally: server.close()
 

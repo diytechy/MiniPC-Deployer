@@ -1,0 +1,32 @@
+# wall-bluetooth-device-apply.service — one broker device request, applied as root.
+#
+# Started by wall-bluetooth-device-apply.path. Oneshot on purpose: a request is an
+# event, not a daemon, and a failed apply must be visible as a failed unit
+# rather than as a restart loop that eventually succeeds against a device
+# nobody asked to pair.
+#
+# Deduplication is by the request's `seq`, inside wall-bluetooth-device, because
+# the path unit fires again for a rewrite of an identical request — and unlike
+# the switch's verbs these are NOT all idempotent: a replayed `forget` revokes a
+# device somebody has just re-paired.
+#
+# TimeoutStartSec bounds the whole apply. A pair against a device that has gone
+# to sleep is the slow case, and the applier's own subprocess timeouts are
+# shorter than this; the unit-level bound is the backstop for a bluetoothctl
+# that is neither finished nor killable.
+
+[Unit]
+Description=Wall panel: apply the pending Bluetooth device request
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wall-bluetooth-device apply-request
+TimeoutStartSec=90
+# The applier's journal lines are the device history; give them a name an
+# operator can grep for without knowing which unit ran the script.
+SyslogIdentifier=wall-bluetooth-device
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,44 @@
+# wall-bluetooth-device-apply.path — the privilege boundary for WSN-024 device verbs.
+#
+# The audio broker (stack/panel-audio, SR-023) runs as `panel` with
+# ProtectSystem=strict and AF_UNIX as its only address family. BlueZ refuses an
+# unprivileged Pair, a write to Trusted, or StartDiscovery, so the broker writes
+# ONE request file and this path unit runs the root applier.
+#
+# A SECOND PATH UNIT, NOT A SECOND FILENAME BEHIND THE FIRST ONE. The switch's
+# applier answers a mixer write that finishes in milliseconds; a Bluetooth apply
+# can sit on a radio for the whole of a pairing timeout. Behind one unit a slow
+# pair would hold the Mute/Headset/Speaker switch, which is the control the
+# person at the glass is actually holding — and the Cancel they would reach for
+# is itself a request queued behind the pair.
+#
+# THE FILE LIVES IN THE BROKER'S OWN RuntimeDirectory, beside the switch
+# request. That directory is already 0700 panel:panel and already carries
+# RuntimeDirectoryPreserve=restart, which the switch work needed so that systemd
+# removing the directory between the write and the applier's read could not take
+# the request with it while the broker's completed journal outlived the effect
+# it had acknowledged. Inheriting that is better than re-deriving it here.
+#
+# PathChanged, not PathModified: systemd fires the former on close-write, so one
+# complete request produces one apply rather than one per write() the broker
+# happens to make.
+
+# NOT `wall-bluetooth-apply`, WHICH IS ALREADY SOMETHING ELSE. That name belongs
+# to the at-rest policy applier (`/usr/local/sbin/wall-bluetooth-apply`, run by
+# wall-bluetooth.service), which asserts discoverable/pairable at boot. Two
+# different things under one name in a directory an operator greps is how a
+# `systemctl status wall-bluetooth-apply` answers a question nobody asked.
+
+[Unit]
+Description=Wall panel: apply one Bluetooth device request from the broker
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+
+[Path]
+PathChanged=/run/wall-audio-router/bluetooth-request.json
+# The broker's RuntimeDirectory disappears when it stops; systemd re-arms the
+# watch on the parent chain when it comes back, so this unit does not have to be
+# ordered after the broker or restarted with it.
+MakeDirectory=false
+
+[Install]
+WantedBy=multi-user.target

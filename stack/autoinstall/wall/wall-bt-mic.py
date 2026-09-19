@@ -241,16 +241,51 @@ class Leg:
             log("HFP mic return stopped (%s)" % address)
 
 
-def decide(sinks, current):
+ROUTE_PATH = "/run/wall-bluetooth/route.json"
+
+
+def preferred_input(path=ROUTE_PATH):
+    """The device the Owner chose as the panel's Bluetooth mic, or None.
+
+    WSN-024 gave `select_input` to the panel, and this is where that choice
+    lands: the applier writes the route document and this supervisor reads it.
+    It is a PREFERENCE and not a command -- the leg still only runs against a
+    device that actually has an SCO sink up -- because an HFP PCM exists only
+    while a call is up, and a selection that could point the leg at a phone
+    that is not on a call would just stop the microphone working.
+
+    Missing, unreadable or malformed all mean "no preference", which is the
+    behaviour that shipped before the route document existed.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    value = stored.get("input") if isinstance(stored, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def decide(sinks, current, preferred=None):
     """Which address the leg should be on, given what exists. Pure.
 
     First by sorted order, so the answer does not change between polls for the
     same set of devices, and the CURRENT one is kept if it is still there --
     a call in progress is never moved to another phone because a second one
     happened to connect.
+
+    THE PREFERENCE OUTRANKS THE CURRENT LEG, and only that. It is an explicit
+    choice somebody made at the panel, so it must be able to MOVE a leg -- a
+    preference that could only ever apply to the next call would look like it
+    had been ignored. It cannot conjure one: a preferred device with no SCO
+    sink is not in `sinks`, and the ordinary rules then decide, which keeps a
+    working microphone working rather than silencing it in favour of a phone
+    that is not on a call.
     """
     if not sinks:
         return None
+    if preferred in sinks:
+        return preferred
     if current in sinks:
         return current
     return sinks[0]
@@ -272,7 +307,7 @@ def main(argv=None):
             if not bus_mode_active() or not mic_allowed():
                 leg.stop()
             else:
-                wanted = decide(read_sinks(), leg.address)
+                wanted = decide(read_sinks(), leg.address, preferred_input())
                 if wanted is None:
                     leg.stop()
                 elif wanted != leg.address or not leg.running():

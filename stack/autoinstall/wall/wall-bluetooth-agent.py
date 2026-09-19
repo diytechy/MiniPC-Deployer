@@ -37,7 +37,11 @@ paired to play music cannot later quietly claim, say, HID.
 """
 
 import argparse
+import json
+import os
+from pathlib import Path
 import sys
+import time
 
 import dbus
 import dbus.mainloop.glib
@@ -45,6 +49,27 @@ import dbus.service
 from gi.repository import GLib
 
 AGENT_PATH = "/org/wallpanel/bluetooth/agent"
+LINE_END = chr(10)
+
+# -- THE PAIRING IS NOW VISIBLE ON THE GLASS (Owner, 2026-09-19) -------------
+# "Need bluetooth to have a method to trust a device, might need a method to
+# either enter a PIN, set a number, or turn on discoverability."
+#
+# Everything below used to reach the JOURNAL and stop there, and the comment on
+# DisplayPasskey said so: "No pairing UI in the shell yet". There is one now, so
+# the two numbers BlueZ can produce -- the passkey to COMPARE and the PIN to
+# READ OUT -- are published where `wall-bluetooth-device publish` can put them
+# in front of the person holding the phone.
+#
+# WHAT IS PUBLISHED IS BOUNDED AND SHORT-LIVED. One address, one number, one
+# expiry; 0644 because the broker runs as `panel` and has to read it; removed
+# when the agent exits. A passkey that outlived its window would be compared
+# against the NEXT pairing, which is worse than showing nothing at all.
+RUN_DIR = Path(os.environ.get("WALL_BLUETOOTH_RUN_DIR") or "/run/wall-bluetooth")
+PAIRING_PATH = RUN_DIR / "pairing.json"
+# Written by wall-bluetooth-device before a `pair` it was asked to perform with
+# a passkey the person typed. Single-use: the applier removes it afterwards.
+PASSKEY_PATH = RUN_DIR / "passkey.json"
 CAPABILITIES = ("NoInputNoOutput", "DisplayYesNo", "DisplayOnly", "KeyboardDisplay")
 
 # A2DP Sink and Source, plus AVRCP. These are what a phone or laptop needs to
@@ -93,24 +118,52 @@ class PairingAgent(dbus.service.Object):
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
     def RequestPasskey(self, device):
-        raise Rejected("this panel cannot accept a typed passkey")
+        """A passkey the PERSON typed at the panel, or a refusal.
+
+        This used to be an unconditional refusal, and it was right to be: there
+        was no way to ask anyone. With the pairing UI there is, so
+        `wall-bluetooth-device` leaves the number the person entered where this
+        can find it before it starts the pair, and this hands it to BlueZ.
+
+        STILL A REFUSAL WHEN NOTHING WAS OFFERED. A default would be a shared
+        secret, which is exactly the objection RequestPinCode makes below, and
+        guessing zero is how a panel bonds with something nobody typed a number
+        for.
+        """
+        offered = _offered_passkey()
+        if offered is None:
+            raise Rejected("this panel has no passkey to offer for this pairing")
+        log("offering the passkey entered at the panel")
+        return dbus.UInt32(offered)
 
     @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
     def DisplayPasskey(self, device, passkey, entered):
-        # No pairing UI in the shell yet, so this reaches the journal only. It
-        # is still worth emitting: it is the one record of what was paired.
+        # SIX DIGITS WITH THE LEADING ZERO KEPT. `%06u` is not decoration here:
+        # the phone shows 012345, and an integer would offer 12345 to compare
+        # against it -- a comparison that fails for no reason at all.
         log("passkey for %s: %06u" % (device, passkey))
+        _publish({"address": _address_of(device), "passkey": "%06u" % passkey})
 
     @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
     def DisplayPinCode(self, device, pincode):
         log("pin for %s: %s" % (device, pincode))
+        _publish({"address": _address_of(device), "passkey": str(pincode)})
 
     @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
     def RequestConfirmation(self, device, passkey):
-        # The window IS the confirmation. Said plainly rather than hidden: with
-        # no UI to show the passkey on, a person cannot compare it, so this
-        # accepts and logs the value for the record.
+        # THE WINDOW IS STILL THE CONFIRMATION, and that has not changed: this
+        # accepts. What has changed is that the number is now published, so a
+        # person who wants to compare it against the phone CAN -- which is the
+        # whole of the Owner's "set a number".
+        #
+        # ACCEPTING FIRST AND SHOWING THE NUMBER IS DELIBERATE. A callback that
+        # blocked waiting for a tap would sit inside BlueZ's own pairing
+        # timeout, and a timeout that expires mid-bond leaves the device half
+        # paired -- the state wall-bluetooth-pairing's docstring calls the one
+        # that needs an operator. Comparison after the fact costs a `forget`;
+        # comparison during it costs a bond nobody can finish or undo.
         log("confirmed %s (passkey %06u)" % (device, passkey))
+        _publish({"address": _address_of(device), "passkey": "%06u" % passkey})
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
     def RequestAuthorization(self, device):
@@ -123,6 +176,67 @@ class PairingAgent(dbus.service.Object):
 
 def log(message):
     print("wall-bluetooth-agent: %s" % message, flush=True)
+
+
+def _address_of(device):
+    """The MAC inside a BlueZ object path, or "".
+
+    `/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF` -> `AA:BB:CC:DD:EE:FF`. This stays
+    on the privileged side: `wall-bluetooth-device` turns it into an alias
+    before anything the broker can read ever sees it.
+    """
+    tail = str(device).rsplit("/dev_", 1)[-1]
+    parts = tail.split("_")
+    if len(parts) != 6 or not all(len(part) == 2 for part in parts):
+        return ""
+    return ":".join(part.upper() for part in parts)
+
+
+def _publish(update):
+    """Merge one fact into the pairing document. Never raises.
+
+    A failure to publish must not take the pairing down with it. The bond is
+    what the person is standing there for; the number on the glass is how they
+    check it. Losing the number is a worse experience, losing the bond is a
+    failure, and only one of those is worth an exception.
+    """
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            current = json.loads(PAIRING_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        current.update(update)
+        temporary = PAIRING_PATH.with_name(PAIRING_PATH.name + ".new")
+        temporary.write_text(json.dumps(current, sort_keys=True) + LINE_END, encoding="utf-8")
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, PAIRING_PATH)
+    except OSError as error:
+        log("could not publish the pairing state: %s" % error)
+
+
+def _offered_passkey():
+    """The passkey the panel was given for this pairing, as an int, or None."""
+    try:
+        stored = json.loads(PASSKEY_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = stored.get("passkey") if isinstance(stored, dict) else None
+    # BlueZ passkeys are 0..999999. A wider number is not a passkey, and
+    # truncating one would offer a different number than the person typed.
+    if not isinstance(value, str) or not value.isdigit() or not 0 <= int(value) <= 999999:
+        return None
+    return int(value)
+
+
+def _retire():
+    try:
+        PAIRING_PATH.unlink()
+    except OSError:
+        pass
+
 
 
 def main(argv=None):
@@ -154,6 +268,12 @@ def main(argv=None):
         sys.exit("wall-bluetooth-agent: RequestDefaultAgent failed: %s" % exc)
 
     log("registered (%s) for %ds" % (args.capability, args.timeout))
+    # THE EXPIRY IS PUBLISHED AT THE START, not when a passkey appears. The
+    # panel draws "pairing is open, N seconds left" from the moment the window
+    # opens; most pairings never produce a number at all (a NoInputNoOutput
+    # speaker has nothing to show), and a UI that only appeared for the ones
+    # that did would leave the common case looking like nothing had happened.
+    _publish({"expiresAt": int(time.time()) + args.timeout})
     loop = GLib.MainLoop()
     # A SECOND BOUND on top of the caller's own lifetime management: if the
     # window helper is killed without cleaning up, this still exits on its own.
@@ -168,6 +288,9 @@ def main(argv=None):
             log("unregistered")
         except dbus.DBusException:
             pass
+        # The window is over, so the number is not something anybody can still
+        # compare. Removing it is what makes `active` false on the next publish.
+        _retire()
     return 0
 
 

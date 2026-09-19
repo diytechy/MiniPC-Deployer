@@ -1,0 +1,70 @@
+# wall-bus-bluetooth.service — the merged bus to a selected Bluetooth speaker.
+#
+# WSN-024's `select_output`. Started, stopped and pointed by
+# `wall-bluetooth-device`, which writes the address into the environment file
+# below and restarts this unit; there is no [Install] section, because a leg
+# with no device selected has nowhere to play.
+#
+# IT IS NOT A FOURTH POSITION OF THE SWITCH, and that is the design decision
+# this file exists to record. `SWITCH_OUTPUTS = ("mute", "headset", "speaker")`
+# is validated in six places — the renderer, the IPC sanitizer, routing policy,
+# the request envelope, the applier and the state file — and it is the control
+# the person at the glass is holding. Widening it to carry a Bluetooth device
+# would put the room's music inside a radio's failure modes: a speaker that
+# walks out of range would become a switch position that plays nothing, and the
+# Owner's ruling 7 (a selected output with no hardware is silence and a red
+# icon, never a fallback) would then apply to something that goes away on its
+# own several times a day.
+#
+# So this leg runs BESIDE whichever position the switch is in. `bus_monitor` is
+# a dsnoop and takes as many readers as ask for it, so the Headset or Speaker
+# leg is unaffected by this one starting, stopping or failing. The accepted
+# consequence, stated rather than discovered: selecting a Bluetooth output does
+# not MUTE the wired one. Turning the room off is what the switch is for.
+#
+# THE GUARD IS THE SAME ONE EVERY OTHER LEG USES. alsaloop against a BlueALSA
+# PCM fails in the same way it fails against a USB card — a burst of errors when
+# the far end goes away — and wall-alsaloop-guard.py is what stops that becoming
+# a hot restart loop.
+
+[Unit]
+Description=Wall panel: merged bus to the selected Bluetooth device
+Documentation=file:///opt/wall-panel/stack/panel-audio/README.md
+After=sound.target bluetooth.service
+Wants=sound.target
+# A radio walks away far more often than a USB adapter is unplugged, so the
+# start limit is the generous one the other hot-plugged legs use rather than
+# systemd's default five-in-ten.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Bus mode only, exactly as the wired legs are: there is no merged bus to read
+# in trigger mode, so there is nothing for this to forward.
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+# Written by wall-bluetooth-device on every `select_output`. The `-` prefix
+# keeps its absence from being a start failure of its own — the ExecCondition
+# below is the honest way to say "nothing is selected".
+EnvironmentFile=-/run/wall-panel/audio-bluetooth.env
+ExecCondition=/bin/sh -c '[ -n "$WALL_BT_OUTPUT_DEV" ]'
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
+    --cdevice bus_monitor \
+    --pdevice bluealsa:DEV=${WALL_BT_OUTPUT_DEV},PROFILE=a2dp \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 100000 --sync 5
+Restart=always
+RestartSec=2
+# NOT Nice=-5 and NOT realtime, unlike the wired legs. Those carry the room's
+# music and their deadline is the speaker's. This one feeds a radio whose own
+# buffer is measured in tens of milliseconds and whose latency is already the
+# dominant term, so giving it priority over the leg that is actually playing to
+# the room would be paying the wrong path.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+SupplementaryGroups=audio
+StandardOutput=journal
+StandardError=journal

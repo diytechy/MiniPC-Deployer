@@ -1224,11 +1224,37 @@ if [ -d "$STACK_DIR/rustdesk" ]; then
     # nothing is bound to. Listeners with no fence are the failure this exists to
     # prevent, so the fence is never the thing left disabled.
     systemctl enable homehub-rustdesk-isolation.service >/dev/null 2>&1 || log "WARN: could not enable homehub-rustdesk-isolation.service - the remote-desktop ports would be unfenced after a reboot"
-    if [ "${RUSTDESK_ENABLED:-false}" = "true" ]; then
+
+    # READ THE KNOB OUT OF .env, DO NOT EXPECT IT IN THE ENVIRONMENT. This
+    # script deliberately does not `source` .env (see the long note above at
+    # "DO NOT `source` .env"), and homehub-firstboot.service sets no
+    # EnvironmentFile, so a bare "${RUSTDESK_ENABLED:-false}" reads an UNSET
+    # SHELL VARIABLE and is false on every run - including a reimage where the
+    # emitted .env says true. That is the whole knob quietly doing nothing.
+    # Same sed idiom as _env_val below, inlined because that helper is not
+    # defined until much later in the file and a function must exist before it
+    # is called. \015 rather than \r so a CRLF-saved .env cannot smuggle a
+    # carriage return into the comparison.
+    _rustdesk_enabled="$(sed -n 's/^RUSTDESK_ENABLED=//p' "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d '\015' | tr -d '"')"
+    if [ "$_rustdesk_enabled" = "true" ]; then
         systemctl enable homehub-rustdesk.service >/dev/null 2>&1 || log "WARN: could not enable homehub-rustdesk.service"
-        log "rustdesk: fence + listeners enabled"
+        log "rustdesk: fence + listeners enabled (RUSTDESK_ENABLED=true)"
     else
-        log "rustdesk: fence enabled, listeners left disabled (RUSTDESK_ENABLED is not true)"
+        # DISABLE, DO NOT MERELY DECLINE TO ENABLE. firstboot re-runs, so a box
+        # whose knob was true and is now false would otherwise keep the listener
+        # enabled for ever - the knob would appear to turn the service off and
+        # would not. Stop it too: `disable` alone leaves a running service up
+        # until the next boot, which is exactly the window someone flipping this
+        # to false is trying to close.
+        if systemctl is-enabled homehub-rustdesk.service >/dev/null 2>&1; then
+            systemctl disable homehub-rustdesk.service >/dev/null 2>&1 || log "WARN: could not disable homehub-rustdesk.service"
+            systemctl stop    homehub-rustdesk.service >/dev/null 2>&1 || true
+            log "rustdesk: listeners DISABLED and stopped (RUSTDESK_ENABLED='$_rustdesk_enabled')"
+        else
+            log "rustdesk: fence enabled, listeners left disabled (RUSTDESK_ENABLED='$_rustdesk_enabled')"
+        fi
+        # The fence stays enabled either way, on purpose: it programs REJECT
+        # rules for ports nothing is bound to, which costs nothing.
     fi
 else
     log "rustdesk: no payload at $STACK_DIR/rustdesk - skipping (correct for a build without it)"

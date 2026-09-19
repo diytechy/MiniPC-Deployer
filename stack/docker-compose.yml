@@ -79,6 +79,10 @@ services:
       LAN_IP: ${LAN_IP}
       TRACKER_HOST: ${TRACKER_SUBDOMAIN}.${DOMAIN}
       ACTUAL_HOST: ${ACTUAL_SUBDOMAIN}.${DOMAIN}
+      # The LLM gateway site (SR-043). Joined here from a bare subdomain label,
+      # exactly as TRACKER_HOST and ACTUAL_HOST above are, so the wildcard DDNS
+      # record already resolves it and no new public name is created.
+      LLM_GATEWAY_HOST: ${LLM_GATEWAY_SUBDOMAIN}.${DOMAIN}
       # Office-wall kiosk site (SR-016). WALL_HOST is a T1 private name in the
       # real .env; PANEL_IP is the panel's DHCP-reserved address (/32 allow-list)
       # and PANEL_USER_SUB the NagLight identity this site injects.
@@ -1141,6 +1145,115 @@ services:
       retries: 3
       start_period: 10s
 
+
+  # ── centralised LLM gateway: FreeLLMAPI (SR-043, SN-043) ─────────────────────
+  #
+  # ONE endpoint every LLM consumer points at — hub services, the Owner over the
+  # tunnel, and coding agents on the dev PC — so provider keys are held once and
+  # a provider swap is invisible to every consumer.
+  #
+  # THIS IS NOT `ai-cli` AND MUST NOT BE FOLDED INTO IT (LLR-965). `ai-cli` backs
+  # onto the household SUBSCRIPTION CLIs, runs as a dedicated unprivileged
+  # account, and is bound to loopback or a docker bridge address and never the
+  # LAN — a posture that survived a cross-review which rejected the block with 16
+  # findings. This service's callers are deliberately wider. That is a departure
+  # for THIS service only; `ai-cli`'s bind is not relaxed to make room for it,
+  # and a test asserts so.
+  #
+  # NO HOST PORT, ON PURPOSE — the vaultwarden pattern above, for a different
+  # reason. This origin fronts every provider credential the household holds, so
+  # it stays on the docker bridge and is reached only through Caddy, which
+  # already terminates TLS and already carries the LAN_CIDR remote_ip gate that
+  # admits the LAN and the tunnel and 403s everything else BEFORE any handler
+  # runs. Publishing a LAN port here would create a second ingress with none of
+  # that and no way to notice.
+  #
+  # PINNED BY DIGEST, NEVER A TAG (LLR-963). A credential concentrator that
+  # auto-updates is the failure the pin exists to prevent. The digest, its
+  # version and its date live in stack/llm-gateway/gateway-image.pin; changing it
+  # is a reviewable commit.
+  #
+  # THE UPSTREAM INSTALL SCRIPT IS DELIBERATELY NOT USED. Upstream's quickstart
+  # is a piped curl-to-shell installer. It is unpinned, runs remote code at
+  # deploy time, and produces a deployment no commit describes — the opposite of
+  # every property this stack is built on. This compose file IS the install.
+  llm-gateway:
+    image: ghcr.io/tashfeenahmed/freellmapi@${LLM_GATEWAY_IMAGE_DIGEST}
+    container_name: llm-gateway
+    profiles: ["llm-gateway"]
+    environment:
+      # Bind inside the container only; Caddy reaches it across the bridge.
+      # NOT 0.0.0.0-on-the-host: see the no-host-port note above.
+      HOST_BIND: 0.0.0.0
+      PORT: 3001
+      TZ: ${TIMEZONE}
+    env_file:
+      # Provider keys and the at-rest encryption key. Materialised by the deploy
+      # tooling, gitignored, never baked into this file (which is committed).
+      - ./llm-gateway/llm-gateway.env
+    volumes:
+      # SQLite + the AES-256-GCM-encrypted provider keys. NOT reproducible from
+      # the repo, so it joins the LOCAL backup set; it holds credentials, so it
+      # never joins the offsite set.
+      - llm_gateway_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+
+  # ── self-hosted remote desktop: RustDesk server (SR-045, SN-045) ─────────────
+  #
+  # TWO PROCESSES, ONE KEY PAIR, ONE VOLUME. `hbbs` is ID/rendezvous, `hbbr` is
+  # the relay, and they MUST share a single data volume because the key pair
+  # lives in it. Two volumes silently produce two key pairs and a client that
+  # reaches the rendezvous but never the relay - which presents as an
+  # intermittent connection rather than as a misconfiguration, so it is worth
+  # more care than it looks.
+  #
+  # `restart: "no"` ON BOTH, AND IT IS LOAD-BEARING (LLR-977). The container
+  # runtime must never start these on its own - not at boot, not after a daemon
+  # restart, not after a crash - because the INPUT-chain fence that limits them
+  # to the LAN and the tunnel is installed by a systemd unit. They are started
+  # ONLY by homehub-rustdesk.service, which `Requires=` that unit, so a failure
+  # to program the fence stops the listeners existing rather than losing a race
+  # to them. This is the arrangement the crossplay relay next door already uses
+  # after its first version got exactly this wrong.
+  #
+  # HOST NETWORKING, so these are HOST sockets - which is precisely why the fence
+  # is in INPUT and NOT in DOCKER-USER. DOCKER-USER is consulted for traffic
+  # ROUTED to a published container port; a rule there would be visibly present,
+  # would read correctly to a reviewer, and would filter nothing. See
+  # stack/rustdesk/rustdesk-isolation.sh for the long version.
+  #
+  # NEVER PORT-FORWARDED AT THE ROUTER. The remote path is the mesh tunnel, which
+  # is what makes the no-forward rule affordable rather than a limitation.
+  hbbs:
+    image: rustdesk/rustdesk-server:${RUSTDESK_IMAGE_TAG}
+    container_name: hbbs
+    profiles: ["rustdesk"]
+    # `-r` names the relay this rendezvous hands clients. Without it a client
+    # that cannot connect directly is told nothing to fall back to.
+    command: hbbs -r ${RUSTDESK_RELAY_HOST}
+    network_mode: host
+    volumes:
+      - rustdesk_data:/root
+    restart: "no"
+
+  hbbr:
+    image: rustdesk/rustdesk-server:${RUSTDESK_IMAGE_TAG}
+    container_name: hbbr
+    profiles: ["rustdesk"]
+    command: hbbr
+    network_mode: host
+    volumes:
+      # THE SAME VOLUME AS hbbs. Not a copy, not a second one. See the banner.
+      - rustdesk_data:/root
+    restart: "no"
+
 # ── networks ─────────────────────────────────────────────────────────────────
 # `default` is implicit and unchanged: every service that names no network still
 # lands on it, which is all of them but the two below.
@@ -1175,6 +1288,13 @@ networks:
         - subnet: 172.28.90.0/24
 
 volumes:
+  # rustdesk (SR-045): the hbbs/hbbr KEY PAIR. Not reproducible from the repo -
+  # regenerating it invalidates every installed client - so it joins the LOCAL
+  # backup set. Never offsite.
+  rustdesk_data:
+  # llm-gateway (SR-043): SQLite + encrypted provider keys. LOCAL backup only,
+  # never offsite - it holds credentials and is not reproducible from the repo.
+  llm_gateway_data:
   ddns_data:
   technitium_config:
   caddy_data:

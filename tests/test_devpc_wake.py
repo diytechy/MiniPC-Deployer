@@ -1,0 +1,266 @@
+"""Tests for the dev-PC wake and readiness service.
+
+Verifies: SR-044 / LLR-966, LLR-967, LLR-968, LLR-969, LLR-974, LLR-978
+Cases:    TC-988, TC-989, TC-990, TC-991, TC-992, TC-994, TC-995,
+          TC-1002, TC-1003, TC-1010, TC-1013, TC-1014, TC-1016
+
+Every test here is about a distinction that a previous draft of the design got
+wrong, and each one is named after the distinction rather than the function, so
+a failure says what broke rather than where.
+"""
+import importlib.util
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+_SRC = Path(__file__).resolve().parents[1] / "stack" / "devpc-wake" / "devpc_wake.py"
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("devpc_wake", _SRC)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["devpc_wake"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+dw = _load()
+
+
+class _Cfg:
+    host = "dev-pc.invalid"
+    port = 11434
+    probe_timeout = 0.01
+    base_url = "http://dev-pc.invalid:11434"
+    target_model = "the-model"
+    deadline_seconds = 90
+    idle_sleep_seconds = 1800
+    session_staleness_seconds = 120
+
+
+class _Provider(dw.WakeProvider):
+    name = "test"
+
+    def __init__(self, fail=False):
+        self.fired = 0
+        self._fail = fail
+
+    def fire(self):
+        self.fired += 1
+        if self._fail:
+            raise OSError("actuation failed")
+
+
+@pytest.fixture
+def svc(monkeypatch):
+    clock = {"now": 1000.0}
+    provider = _Provider()
+    s = dw.WakeService(_Cfg(), provider, clock=lambda: clock["now"])
+    s._test_clock = clock
+    s._test_provider = provider
+    return s
+
+
+def _probes(monkeypatch, reachable, loaded):
+    monkeypatch.setattr(dw, "reachable", lambda *a, **k: reachable)
+    monkeypatch.setattr(dw, "model_loaded", lambda *a, **k: loaded)
+
+
+# --- TC-988 ---------------------------------------------------------------
+def test_each_state_has_its_own_determining_condition_sr044(svc, monkeypatch):
+    _probes(monkeypatch, False, None)
+    assert svc.state()["state"] == "off"
+    _probes(monkeypatch, True, False)
+    assert svc.state()["state"] == "up"
+    _probes(monkeypatch, True, True)
+    assert svc.state()["state"] == "ready"
+
+
+# --- TC-989 ---------------------------------------------------------------
+def test_the_two_probe_layers_are_not_conflated_sr044(svc, monkeypatch):
+    """A reachability timeout is off. A LISTING timeout is up. Opposite meanings."""
+    _probes(monkeypatch, False, None)
+    assert svc.state()["state"] == "off", "nothing answered: must not be up"
+
+    # Host answers; the listing itself does not. The box is demonstrably alive.
+    _probes(monkeypatch, True, None)
+    assert svc.state()["state"] == "up"
+
+    # Host answers, listing answers, model absent. Still not servable.
+    _probes(monkeypatch, True, False)
+    assert svc.state()["state"] == "up"
+
+
+# --- TC-990 ---------------------------------------------------------------
+def test_waking_expires_to_failed_at_the_deadline_sr044(svc, monkeypatch):
+    _probes(monkeypatch, False, None)
+    svc.request_wake()
+    assert svc.state()["state"] == "waking"
+
+    svc._test_clock["now"] += _Cfg.deadline_seconds - 1
+    assert svc.state()["state"] == "waking"
+
+    svc._test_clock["now"] += 2
+    assert svc.state()["state"] == "failed"
+    # And it does not linger as waking on the next read either.
+    assert svc.state()["state"] == "off"
+
+
+# --- TC-991 ---------------------------------------------------------------
+def test_the_wake_target_is_the_configured_physical_mac_sr044():
+    p = dw.MagicPacketProvider("2C-F0-5D-3F-8D-26")
+    assert p._mac == bytes.fromhex("2CF05D3F8D26")
+    # Separators must not change the target.
+    assert dw.MagicPacketProvider("2c:f0:5d:3f:8d:26")._mac == p._mac
+    for bad in ("", "not-a-mac", "2CF05D3F8D", "2CF05D3F8D2600"):
+        with pytest.raises(ValueError):
+            dw.MagicPacketProvider(bad)
+
+
+# --- TC-992 ---------------------------------------------------------------
+def test_a_second_provider_swaps_without_touching_the_state_machine_sr044(monkeypatch):
+    """The magic-packet path may never work on this NIC. Swapping must be free."""
+    calls = []
+
+    class Alt(dw.WakeProvider):
+        name = "alternate"
+
+        def fire(self):
+            calls.append(1)
+
+    clock = {"now": 500.0}
+    s = dw.WakeService(_Cfg(), Alt(), clock=lambda: clock["now"])
+    _probes(monkeypatch, False, None)
+    s.request_wake()
+    assert calls == [1]
+    assert s.state()["state"] == "waking"
+    with pytest.raises(ValueError):
+        dw.CommandProvider([])
+
+
+# --- TC-994 + TC-1003 -----------------------------------------------------
+def test_one_wake_fires_per_flight_not_per_request_sr044(svc):
+    a, b, c = svc.request_wake(), svc.request_wake(), svc.request_wake()
+    assert a is b is c
+    assert svc._test_provider.fired == 1, "a burst must not become a burst of packets"
+
+
+def test_joiners_inherit_the_deadline_and_failure_clears_the_flight_sr044(svc):
+    first = svc.request_wake()
+    svc._test_clock["now"] += 30
+    later = svc.request_wake()
+    assert later is first
+    assert later.deadline == first.deadline, "a joiner must not refresh the deadline"
+
+    failing = dw.WakeService(_Cfg(), _Provider(fail=True),
+                             clock=lambda: 1000.0)
+    flight = failing.request_wake()
+    assert flight.outcome == dw.State.FAILED
+    assert flight.done.is_set()
+    assert failing._flight is None, "a dead flight must not poison later attempts"
+    again = failing.request_wake()
+    assert again is not flight
+
+
+# --- TC-1002 --------------------------------------------------------------
+def test_state_precedence_when_layers_disagree_sr044(svc, monkeypatch):
+    """deadline > reachability > readiness, in that order."""
+    # A stale 'ready' must not mask an unreachable host.
+    _probes(monkeypatch, False, True)
+    assert svc.state()["state"] == "off"
+
+    # An expired deadline outranks a probe that would say ready.
+    svc.request_wake()
+    svc._test_clock["now"] += _Cfg.deadline_seconds + 1
+    _probes(monkeypatch, True, True)
+    assert svc.state()["state"] == "failed", "an expired wake must not be masked"
+
+
+# --- TC-1010 --------------------------------------------------------------
+def test_arrivals_interleaved_with_teardown_sr044(svc, monkeypatch):
+    """No arrival may see a removed flight beside a stale not-ready state."""
+    _probes(monkeypatch, False, None)
+    flight = svc.request_wake()
+    svc._test_clock["now"] += _Cfg.deadline_seconds + 1
+
+    seen = []
+
+    def reader():
+        seen.append(svc.state()["state"])
+
+    threads = [threading.Thread(target=reader) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+        assert not t.is_alive(), "a concurrent read deadlocked"
+
+    # Exactly one observer may resolve the expired flight to failed; the rest
+    # see the post-teardown truth. Neither is a lie, and no thread hangs.
+    assert set(seen) <= {"failed", "off"}
+    assert seen.count("failed") <= 1, "an expired flight must resolve once"
+    assert flight.done.is_set()
+
+
+# --- TC-1013 --------------------------------------------------------------
+def test_no_io_or_notification_occurs_under_the_lock_sr044(monkeypatch):
+    """Firing under the lock would deadlock a continuation that re-enters."""
+    clock = {"now": 10.0}
+    holder = {}
+
+    class Reentrant(dw.WakeProvider):
+        name = "reentrant"
+
+        def fire(self):
+            # A continuation that reads state. If this ran under the lock, the
+            # acquire below would never return.
+            holder["locked_during_fire"] = svc_ref[0]._lock.locked()
+
+    svc_ref = [None]
+    svc_ref[0] = dw.WakeService(_Cfg(), Reentrant(), clock=lambda: clock["now"])
+    _probes(monkeypatch, False, None)
+    svc_ref[0].request_wake()
+    assert holder["locked_during_fire"] is False, "wake I/O ran while holding the lock"
+
+
+# --- TC-995 + TC-1014 + TC-1016 -------------------------------------------
+def test_the_idle_timer_is_inhibited_while_a_session_is_attached_sr044(svc):
+    fresh = svc._test_clock["now"]
+    # IDLE MUST GENUINELY HAVE ELAPSED, or every assertion below passes for the
+    # wrong reason - the idle gate short-circuits before the session is read,
+    # and a broken session check would still look green.
+    long_ago = fresh - _Cfg.idle_sleep_seconds - 1
+    attached = {"attached": True, "observed_at": fresh}
+    detached = {"attached": False, "observed_at": fresh}
+    assert svc.sleep_verdict(long_ago, attached)["permit"] is False
+    assert svc.sleep_verdict(long_ago, detached)["permit"] is True
+    # Idle not elapsed beats everything else, including a clean detached reading.
+    assert svc.sleep_verdict(fresh, detached)["permit"] is False
+
+
+@pytest.mark.parametrize("session, why", [
+    (None, "absent"),
+    ({"attached": False, "observed_at": 0.0}, "stale"),
+    ({"observed_at": 1000.0}, "malformed - no attached key"),
+    ({"attached": "false", "observed_at": 1000.0}, "malformed - string not bool"),
+    ({"attached": True, "observed_at": 1000.0}, "genuinely attached"),
+])
+def test_an_unavailable_session_signal_is_treated_as_attached_sr044(svc, session, why):
+    """Fail closed to ATTACHED. A false detached suspends a machine in use."""
+    long_ago = svc._test_clock["now"] - _Cfg.idle_sleep_seconds - 1
+    # Idle is deliberately elapsed so the SESSION reading is what decides. With
+    # a recent request the idle gate answers first and this would prove nothing.
+    assert svc.sleep_verdict(long_ago, session)["permit"] is False, why
+
+
+def test_the_hub_publishes_a_verdict_and_never_actuates_sr044(svc):
+    """IF-026: the hub decides; the dev PC polls and sleeps itself."""
+    long_ago = svc._test_clock["now"] - _Cfg.idle_sleep_seconds - 1
+    verdict = svc.sleep_verdict(long_ago, {"attached": False, "observed_at": svc._test_clock["now"]})
+    assert verdict["permit"] is True, "the permitting path must be exercised, not just the deny path"
+    assert set(verdict) == {"permit", "reason", "observed_at"}
+    assert not hasattr(svc, "sleep_now"), "the hub must expose no sleep actuation"
+    assert not hasattr(svc, "suspend"), "the hub must expose no sleep actuation"

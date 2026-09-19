@@ -1822,6 +1822,53 @@ else
     log "AI_CLI_ENABLED is not true - no AI CLI service, no dedicated account."
 fi
 
+# ── mesh VPN subnet router (SR-042, SN-042) ──────────────────────────────────
+#
+# THIS CANNOT COMPLETE UNATTENDED AND THAT IS THE DESIGN, NOT A DEFECT. The
+# script converges everything it can - repository, package, forwarding sysctls,
+# route advertisement - and then prints an authorisation URL and STOPS. It
+# accepts no auth key and has no flag that would take one, because a long-lived
+# key that enrols nodes admits a device to a tunnel reaching the whole LAN, and
+# it is the one credential here whose leak needs no other access to exploit.
+#
+# SO A FIRST BOOT LEAVES THIS HALF-DONE ON PURPOSE. That is a deliberate
+# exception to SN-001's zero-click bar, of the same shape SN-016 already carries
+# for the AI CLI sign-in, and it is reported loudly rather than hidden.
+#
+# ALSO OUTSIDE THE OFFLINE CLOSURE: the daemon is not in the base archive, so
+# this step needs working internet. On a box with none it fails, says so, and
+# changes nothing else.
+if [ "${TAILSCALE_ENABLED:-false}" = "true" ]; then
+    log "provisioning the mesh VPN subnet router (activated by .env)…"
+    if [ -f "$STACK_DIR/tailscale/setup-tailscale.sh" ]; then
+        if bash "$STACK_DIR/tailscale/setup-tailscale.sh" 2>&1 | sed 's/^/  /'; then
+            log "  mesh daemon converged; route advertised PENDING APPROVAL:"
+            log "    ${TAILSCALE_ADVERTISE_ROUTES:-<unset>}"
+            log "  STILL OWED BY A HUMAN, and none of it can be done from this box:"
+            log "    1. authorise this node from the URL printed above"
+            log "    2. approve the subnet route in the admin console"
+            log "    3. apply the tracked ACL (stack/tailscale/tailnet-acl.hujson)"
+            log "       BEFORE a second device joins - the default policy lets every"
+            log "       node reach every node, and this node advertises the whole LAN"
+            log "    4. enable tailnet lock"
+            log "  NONE OF THIS SURVIVES A REIMAGE - re-install and re-authorise."
+        else
+            log "  WARNING: setup-tailscale.sh refused or failed - this box has NO"
+            log "    remote access path. Everything else is unaffected. The reason is"
+            log "    in the lines above; re-run by hand once fixed:"
+            log "      sudo bash $STACK_DIR/tailscale/setup-tailscale.sh"
+        fi
+    else
+        log "  WARNING: TAILSCALE_ENABLED=true but no $STACK_DIR/tailscale/setup-tailscale.sh"
+        log "    on the payload - carriage missing for an activated feature."
+    fi
+else
+    log "TAILSCALE_ENABLED is not true - no mesh VPN, no subnet route."
+    log "  NOTE: this site is behind carrier-grade NAT (measured 2026-09-18), so the"
+    log "  router's WireGuard server is configured and structurally unreachable."
+    log "  With this knob off there is NO remote access path into this LAN."
+fi
+
 
 # ── 6e. the AI-usage feeder (SR-021, SN-016) ───────────────────────
 # A plain service on a timer, no container, OFF by default. It runs as the

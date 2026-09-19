@@ -1,0 +1,35 @@
+[Unit]
+# Measured readiness for the dev PC, and the wake that gets it there (SR-044).
+Description=Dev-PC wake and readiness state
+Documentation=file:///opt/homehub/stack/devpc-wake/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/homehub/stack/.env
+ExecStart=/usr/bin/python3 /opt/homehub/stack/devpc-wake/devpc_wake_service.py
+Restart=on-failure
+RestartSec=10s
+
+# Unprivileged. A magic packet needs a broadcast UDP socket, which any user may
+# open - it needs NO raw socket and NO capability, so this service has neither.
+# If a future actuation provider seems to want CAP_NET_RAW, that is a signal the
+# provider is wrong rather than that this line should change.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

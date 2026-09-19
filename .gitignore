@@ -30,6 +30,11 @@ docs/test/stub-report.md
 # *.example templates are tracked.
 stack/.env
 stack/provision/.token
+# The LLM gateway env: every provider credential the household holds PLUS the
+# key that decrypts them at rest. The densest secret file in this stack, and it
+# sits in a subdirectory rather than under the stack/.env rule above - only the
+# .example is tracked (SR-043, SN-007).
+stack/llm-gateway/llm-gateway.env
 stack/.provisioned
 # oauth2-proxy allow-list holds real Google accounts — only the .example tracked.
 stack/oauth2-proxy/authenticated-emails.txt

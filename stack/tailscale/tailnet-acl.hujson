@@ -1,0 +1,57 @@
+// tailnet-acl.hujson — A REFERENCE TO PASTE INTO THE ADMIN CONSOLE.
+//
+// NOTHING READS THIS FILE. Tailscale's policy lives server-side in the
+// coordination service; the daemon fetches it from there and never looks at
+// local disk. This file is not deployed to the hub, is not consumed by
+// tailscaled, and is not uploaded by anything. It is a document.
+//
+// An earlier version of this file WAS deployed to the hub, and the setup
+// script "verified" it by reading it. That check was backwards and has been
+// removed: it confirmed that a file written here said what was written here,
+// which is true regardless of what policy is actually in force. Real
+// verification would need a tailnet API key, and that key can rewrite who
+// reaches the whole LAN — not worth carrying to catch the Owner's own console
+// edits (standing threat model, ruled 2026-08-09).
+//
+// THE EARLIER VERSION WAS ALSO BROKEN, IN TWO WAYS WORTH RECORDING:
+//   1. It put `autogroup:admin` inside a `groups` entry. Group members must be
+//      full email addresses; an autogroup cannot be one. That is a hard syntax
+//      error and the console rejects it.
+//   2. Every rule targeted `tag:homehub:*`, but the hub authenticated AS A USER
+//      and carries no tag. With deny-by-omission, that policy accepts nothing —
+//      applying it would have cut off tunnel access to the hub entirely.
+// Validate anything here in the console's preview before saving it.
+//
+// DO YOU NEED A POLICY AT ALL? On a single-user tailnet the default is "every
+// member reaches everything", and every member is the Owner's own device — so
+// the default means your laptop reaches your hub. That is fine. This becomes
+// worth applying when a second person, a shared node or a tagged service
+// appears, which is the point at which "every node" stops meaning "my nodes".
+{
+  "acls": [
+    // The Owner's own devices reach each other.
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["autogroup:self:*"],
+    },
+
+    // The LAN reached THROUGH the hub's subnet route. A subnet route is not
+    // self-authorising: traffic to a LAN host is evaluated by this policy
+    // first, so removing this rule removes LAN access even while the route
+    // stays advertised and approved in the console.
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["192.168.117.0/24:*"],
+    },
+  ],
+
+  // Deny by omission: anything not accepted above is refused. There is no
+  // trailing allow-all and one should not be added "temporarily".
+
+  // No Tailscale SSH. The hub already has key-only SSH under its own
+  // requirement, and a second authentication path to the same box is a second
+  // thing to get wrong and a second thing to revoke.
+  "ssh": [],
+}

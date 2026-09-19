@@ -1,0 +1,32 @@
+# gateway-image.pin — the deployed gateway image, by digest.
+#
+# Implements: SR-043, LLR-963
+#
+# A DIGEST, NOT A TAG. This service holds every provider credential the
+# household has; an image that can change underneath it without a commit is the
+# failure this file exists to prevent. docker-compose.yml references
+# ${LLM_GATEWAY_IMAGE_DIGEST}, which is materialised from the value below.
+#
+# TAGS MOVE AND THESE TWO PROVE IT. At the time of pinning, `latest` resolved to
+# a DIFFERENT digest than `v0.3.0` — `latest` follows `main`, not the newest
+# release. Anyone who "pinned latest" would be tracking the development branch of
+# a credential concentrator. Both values are recorded so the next reader can see
+# that for themselves rather than take it on trust.
+#
+# TO ROTATE: pick the new release tag, resolve its digest against
+# ghcr.io/tashfeenahmed/freellmapi, update DIGEST and VERSION and DATE together,
+# and commit all three in one change. Do not update the digest alone; a digest
+# with a stale version line is worse than no record, because it reads as verified.
+#
+# WHAT THIS IS NOT. Upstream ships a piped curl-to-shell installer. It is not
+# used here and must not be: it is unpinned, it runs remote code at deploy time,
+# and it yields a deployment no commit describes. This repo's compose is the
+# install.
+
+IMAGE=ghcr.io/tashfeenahmed/freellmapi
+VERSION=v0.3.0
+DIGEST=sha256:04ce170ae9b6f209c6f66ccd1ff8dbd28b95dbd3fea202f4039e527ca26870fe
+PINNED=2026-09-18
+
+# Recorded for contrast only — NOT deployed. See the note above.
+OBSERVED_LATEST_DIGEST=sha256:7e54541a352b3d5eef53cd6a85789362eef7f1fe3dabe9adbeee3cdb82d3b4eb

@@ -1,0 +1,35 @@
+[Unit]
+# Restrict the host-networked remote-desktop listeners to the LAN and the mesh
+# tunnel, in both address families. See rustdesk-isolation.sh for why this is
+# INPUT and not DOCKER-USER, and why the IPv6 half is not optional.
+Description=Fence the RustDesk relay/rendezvous ports to the LAN and tunnel
+Documentation=file:///opt/homehub/stack/rustdesk/rustdesk-isolation.sh
+
+# BEFORE docker, for the reason the game-isolation unit records after getting it
+# wrong once: ordering After=docker means that on every reboot docker starts the
+# containers before this unit runs, and that window - on every single boot - is
+# exactly when the listeners are up with no fence. A rule for a port nothing is
+# listening on is harmless; a listener with no rule is the failure this exists
+# to prevent.
+Before=docker.service
+DefaultDependencies=no
+After=network-pre.target
+Wants=network-pre.target
+
+# Deliberately NO Requires=docker.service: this must run even if docker is
+# masked or broken. The propagation runs the other way - the service unit that
+# starts the containers Requires= THIS unit, so a failure here does not merely
+# lose a race, it stops the listeners existing at all. Ordering and propagation
+# are both kept because neither is sufficient alone.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/homehub/stack/rustdesk/rustdesk-isolation.sh
+
+# The rules are NOT removed on stop. Deliberate, and the same choice made next
+# door: a stopped fence must never silently re-open the host to listeners that
+# may still be running. Removing them is a manual, deliberate act.
+
+[Install]
+WantedBy=multi-user.target

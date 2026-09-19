@@ -22,6 +22,7 @@
 #   {$DNS_BASICAUTH_USER} {$DNS_BASICAUTH_HASH}
 #   {$WALL_HOST} {$WALL_PORT} {$PANEL_IP} {$PANEL_USER_SUB}
 #   {$GAME_HOST} {$GAME_WS_SECRET}
+#   {$LLM_GATEWAY_HOST}
 
 {
     # WHERE rate_limit SITS IN THE CHAIN, and it is the whole point of the
@@ -410,6 +411,49 @@
     # exclusion cannot depend on directive-ordering subtleties.
     handle {
         respond "actual: LAN only" 403
+    }
+}
+
+# ── llm.<domain> — the centralised LLM gateway (SR-043, SN-043) ───────────────
+# Enabled only when COMPOSE_PROFILES carries `llm-gateway`; with the profile off
+# this site answers 502 because nothing is behind it, which is the intended and
+# visible result of a disabled profile rather than a misconfiguration.
+{$LLM_GATEWAY_HOST} {
+    import acme_cloudflare
+    import access_log
+    encode zstd gzip
+
+    # LAN/TUNNEL ONLY, and this host has a stronger claim to the gate than
+    # actual.<domain> next door: behind it sits an origin that fronts EVERY
+    # provider credential the household holds, in one process, by design.
+    #
+    # remote_ip, NEVER client_ip - the same rule the other gated blocks state.
+    # client_ip trusts X-Forwarded-For and would hand the allow-list to anyone
+    # willing to forge a header. Caddy is the edge; remote_ip is the truth.
+    #
+    # LAN_CIDR now names the LAN *and the mesh tunnel's range*, so a client on
+    # cellular is admitted by the SAME rule that admits a laptop in the house and
+    # no second mechanism exists to drift from it. It must continue to EXCLUDE
+    # the docker bridge range: LAN_CIDR was once `private_ranges`, which includes
+    # the bridge space, and that put the one deliberately public workload inside
+    # a LAN-only gate.
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        # NO basic_auth HERE, and its absence is deliberate rather than an
+        # omission. This gateway carries its OWN bearer key on every request,
+        # including from the LAN (LLR-964), so the credential check belongs to
+        # the application and adding a second prompt in front of it would break
+        # every programmatic consumer - coding agents and the phone alike - for
+        # no gain. Ambient LAN trust is NOT what protects this host; the bearer
+        # key is, and it is required even from inside the house.
+        reverse_proxy llm-gateway:3001
+    }
+    # A WAN caller is refused BEFORE reaching the application, so it is never
+    # told what is here and never gets to present a key. A second `handle`
+    # rather than a bare `respond`, so the mutual exclusion cannot depend on
+    # directive-ordering subtleties.
+    handle {
+        respond "llm gateway: LAN or tunnel only" 403
     }
 }
 

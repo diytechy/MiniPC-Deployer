@@ -1,0 +1,35 @@
+[Unit]
+# The ONLY thing that starts the remote-desktop listeners (SR-045, LLR-977).
+#
+# Both containers carry `restart: "no"` in the compose file, so the container
+# runtime never starts them on its own - not at boot, not after a daemon
+# restart, not after a crash. This unit is their owner.
+Description=RustDesk rendezvous + relay (LAN and tunnel only)
+Documentation=file:///opt/homehub/stack/rustdesk/README.md
+
+# REQUIRES THE FENCE, NOT MERELY AFTER IT. `After=` alone would order the start
+# and still start the listeners when the fence had FAILED. `Requires=` makes the
+# failure propagate: no fence, no listeners. The crossplay relay next door
+# learned this the hard way - its first version relied on ordering alone and
+# re-opened the window on every boot.
+Requires=homehub-rustdesk-isolation.service
+After=homehub-rustdesk-isolation.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/homehub/stack
+
+# `up` with no `-d` would block this oneshot forever; `--no-build` because the
+# image is pinned and this unit must never become a build step on a live box.
+ExecStart=/usr/bin/docker compose --profile rustdesk up -d --no-build hbbs hbbr
+ExecStop=/usr/bin/docker compose --profile rustdesk stop hbbs hbbr
+
+# Deliberately NOT ExecStopPost-removing the fence: a stopped service must never
+# take the INPUT rules with it. If these containers are ever started by some
+# other means, they must find the fence already up.
+
+[Install]
+WantedBy=multi-user.target

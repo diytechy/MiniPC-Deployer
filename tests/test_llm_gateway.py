@@ -180,12 +180,20 @@ def test_the_two_lanes_share_no_credential_account_or_volume_sr043(compose):
 
 # --- TC-993 ---------------------------------------------------------------
 @pytest.mark.skip(reason=(
-    "NOT YET IMPLEMENTED, and deliberately not faked. SR-044 requires a request "
-    "for a local model on a cold box to be HELD and to fall back rather than "
-    "error. The gateway is a third-party binary and cannot host that logic, so "
-    "the hold belongs in a small OpenAI-compatible shim in front of the dev PC "
-    "which the gateway's custom endpoint points at. That shim is the one "
-    "outstanding piece of SR-044 and is tracked as such rather than skipped "
-    "quietly."))
+    "STILL PENDING, and for a narrower reason than before. The shim now EXISTS "
+    "- stack/litellm/ is it, and its hold logic, refusal contract and egress "
+    "fence are covered by tests/test_litellm_pin_route.py. What remains "
+    "unverified is the END-TO-END behaviour this test is named for: that the "
+    "gateway's custom endpoint really points at the shim, that the shim's 503 "
+    "reaches the gateway intact, and that the gateway then substitutes a cloud "
+    "tier. None of that is assertable from this repo - the gateway stores "
+    "backend definitions in its own DATABASE, not in any file here, and no "
+    "provider credential exists yet to fall back to. "
+    "A first version of this test was un-skipped and asserted that some files "
+    "exist and that the README contains a sentence. It was green and it tested "
+    "nothing it was named for; an adversarial review caught it. Re-skipped "
+    "rather than left as a passing test that implies coverage it does not have."))
 def test_a_cold_box_request_is_held_and_falls_back_rather_than_erroring_sr044():
-    raise AssertionError("pending the holding shim")
+    raise AssertionError(
+        "pending the deployed gateway backend configuration and at least one "
+        "provider credential")

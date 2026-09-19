@@ -1260,6 +1260,150 @@ else
     log "rustdesk: no payload at $STACK_DIR/rustdesk - skipping (correct for a build without it)"
 fi
 
+# ── devpc-wake: install the unit always, ENABLE it only on the knob (SR-044) ──
+#
+# A SYSTEMD UNIT, NOT A COMPOSE SERVICE. It sends a magic packet, which needs a
+# broadcast UDP socket on the host; a bridged container cannot usefully do that.
+# There is no `devpc-wake` compose profile and naming one does nothing.
+#
+# INSTALL ALWAYS, ENABLE CONDITIONALLY, and the split is the point. Until now
+# NOTHING installed this unit at all, so the service could not be started even
+# to test it - the code was deployed to /opt/homehub/stack/devpc-wake and was
+# unreachable from systemd. Installing it unconditionally means the physical
+# wake test (S3 and S5, Owner at the keyboard) is one `systemctl start` away,
+# while DEVPC_WAKE_ENABLED still governs whether it comes back after a reboot.
+#
+# WHY IT IS STILL false BY DEFAULT. The magic-packet path through the dev PC's
+# Hyper-V external vSwitch is UNVERIFIED and may never work - the driver reports
+# every wake filter armed either way, so the arming evidence is not evidence. A
+# wake provider that cannot wake makes every cold request wait out the hold cap
+# before failing, which is worse than not holding at all.
+if [ -d "$STACK_DIR/devpc-wake" ]; then
+    install -m 0644 "$STACK_DIR/devpc-wake/homehub-devpc-wake.service" /etc/systemd/system/ 2>/dev/null \
+        || log "WARN: could not install homehub-devpc-wake.service"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # \015 rather than \r so a CRLF-saved .env cannot smuggle a carriage return
+    # into the comparison - the same guard the rustdesk knob above needed.
+    _devpc_wake_enabled="$(sed -n 's/^DEVPC_WAKE_ENABLED=//p' "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d '\015' | tr -d '"')"
+    if [ "$_devpc_wake_enabled" = "true" ]; then
+        # REFUSE TO ENABLE A SERVICE THAT CANNOT WAKE ANYTHING. devpc_wake_service.py
+        # already exits with that message, but a unit that enables and then
+        # crash-loops on RestartSec is a worse way to learn it than a log line
+        # here: the journal fills, uptime-kuma goes red, and the cause is three
+        # levels down. Checked here so the knob reports its own precondition.
+        _devpc_mac="$(sed -n 's/^DEVPC_WAKE_MAC=//p' "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d '\015' | tr -d '"')"
+        _devpc_cmd="$(sed -n 's/^DEVPC_WAKE_COMMAND=//p' "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d '\015' | tr -d '"')"
+        if [ -z "$_devpc_mac" ] && [ -z "$_devpc_cmd" ]; then
+            # DISABLE AND STOP, not merely decline to enable. This branch used
+            # to only log (found by review): a box previously configured with a
+            # MAC, enabled and running, that then had the MAC cleared, would
+            # keep the OLD unit enabled and running against the OLD
+            # configuration - the knob would appear to have taken effect and
+            # would not. Route it through the same path as the false case.
+            if systemctl is-enabled homehub-devpc-wake.service >/dev/null 2>&1; then
+                systemctl disable homehub-devpc-wake.service >/dev/null 2>&1 || log "WARN: could not disable homehub-devpc-wake.service"
+                systemctl stop    homehub-devpc-wake.service >/dev/null 2>&1 || true
+                log "devpc-wake: DEVPC_WAKE_ENABLED=true but no actuator configured - previously-enabled unit DISABLED and stopped"
+            else
+                log "devpc-wake: DEVPC_WAKE_ENABLED=true but neither DEVPC_WAKE_MAC nor DEVPC_WAKE_COMMAND is set - unit INSTALLED but left disabled"
+            fi
+        else
+            systemctl enable --now homehub-devpc-wake.service >/dev/null 2>&1 \
+                || log "WARN: could not enable homehub-devpc-wake.service"
+            log "devpc-wake: enabled (DEVPC_WAKE_ENABLED=true)"
+        fi
+    else
+        # DISABLE, DO NOT MERELY DECLINE TO ENABLE - firstboot re-runs, and a box
+        # whose knob was true and is now false would otherwise keep the service
+        # enabled for ever. Same reasoning as the rustdesk listener above.
+        if systemctl is-enabled homehub-devpc-wake.service >/dev/null 2>&1; then
+            systemctl disable homehub-devpc-wake.service >/dev/null 2>&1 || log "WARN: could not disable homehub-devpc-wake.service"
+            systemctl stop    homehub-devpc-wake.service >/dev/null 2>&1 || true
+            log "devpc-wake: DISABLED and stopped (DEVPC_WAKE_ENABLED='$_devpc_wake_enabled')"
+        else
+            log "devpc-wake: unit INSTALLED, left disabled (DEVPC_WAKE_ENABLED='$_devpc_wake_enabled') - start it by hand for the S3/S5 wake test"
+        fi
+    fi
+else
+    log "devpc-wake: no payload at $STACK_DIR/devpc-wake - skipping (correct for a build without it)"
+fi
+
+# ── litellm: the fence is enabled ALWAYS, the lane only on the knob (SR-047) ──
+#
+# THE FENCE AND THE LANE ARE ENABLED DIFFERENTLY, AND THE ASYMMETRY IS THE
+# POINT - the same shape the rustdesk pair uses. A fence with no container is
+# harmless: it programs REJECT rules for a source address nothing is using. A
+# container with no fence is a proxy with 32 provider pass-through routes and
+# unrestricted outbound networking, which is the exact state an adversarial
+# review found and this whole arrangement exists to prevent.
+#
+# So homehub-llm-isolation.service is enabled unconditionally, and
+# homehub-litellm.service - which Requires= it - is enabled only when the lane
+# is wanted. There is deliberately no `litellm` entry in COMPOSE_PROFILES: the
+# bulk `docker compose up -d` below would otherwise start the container before
+# this fence had ever run.
+if [ -d "$STACK_DIR/llm-isolation" ]; then
+    chmod 0755 "$STACK_DIR/llm-isolation/llm-isolation.sh" 2>/dev/null || log "WARN: could not chmod llm-isolation.sh"
+    install -m 0644 "$STACK_DIR/llm-isolation/homehub-llm-isolation.service" /etc/systemd/system/ 2>/dev/null \
+        || log "WARN: could not install homehub-llm-isolation.service"
+    install -m 0644 "$STACK_DIR/llm-isolation/homehub-litellm.service" /etc/systemd/system/ 2>/dev/null \
+        || log "WARN: could not install homehub-litellm.service"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # `--now`, NOT BARE `enable`. `enable` only arranges for the next boot, and
+    # firstboot's bulk `docker compose up -d` happens LATER IN THIS SAME BOOT.
+    # A fence that is merely enabled has not programmed a single rule yet, so
+    # anything that started the lane before the next reboot would start it
+    # unfenced. Raised in review alongside the contradictory COMPOSE_PROFILES
+    # instruction, which was the path that would have done exactly that.
+    systemctl enable --now homehub-llm-isolation.service >/dev/null 2>&1 \
+        || log "WARN: could not enable+start homehub-llm-isolation.service - the private LLM lane would be unfenced"
+
+    _litellm_enabled="$(sed -n 's/^LITELLM_ENABLED=//p' "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d '\015' | tr -d '"')"
+    if [ "$_litellm_enabled" = "true" ]; then
+        # STARTED IN THIS BOOT, NOT MERELY ENABLED - which it was not, and a
+        # review round caught it. `enable` alone arms the unit for the NEXT
+        # boot and starts nothing in this one - and nothing else in this
+        # boot will start the lane either, because the `litellm` profile is
+        # deliberately absent from COMPOSE_PROFILES so the bulk
+        # `docker compose up -d` cannot reach it, and firstboot does not
+        # reboot. So a freshly provisioned box with LITELLM_ENABLED=true sat
+        # with no lane at all while this line logged that it was enabled.
+        # Starting it here is safe in the strong sense: the unit Requires= the
+        # fence, so if the fence is not up the lane does not start.
+        #
+        # `--no-block`, NOT `enable --now`, and that is this file's own rule
+        # rather than a preference - see the crossplay relay's banner near the
+        # end. A BLOCKING `systemctl start` from inside homehub-firstboot.service
+        # is the 18-minute boot deadlock this project paid for on 2026-08-27.
+        # This unit is not currently ordered `After=homehub-firstboot.service`,
+        # so a blocking start would happen to work today - which is exactly the
+        # kind of "correct alone" that wedged the boot last time, because adding
+        # that ordering later is a one-line change nobody would connect to this.
+        # `--no-block` enqueues the job and is safe under either ordering.
+        systemctl enable homehub-litellm.service >/dev/null 2>&1 \
+            || log "WARN: could not enable homehub-litellm.service"
+        if systemctl start --no-block homehub-litellm.service >/dev/null 2>&1; then
+            log "litellm: fence up, private lane start QUEUED (--no-block, LITELLM_ENABLED=true)"
+            log "  check it afterwards with: systemctl is-active homehub-litellm.service"
+        else
+            log "WARN: could not queue homehub-litellm.service - the lane will come up on the next boot"
+        fi
+    else
+        # DISABLE, DO NOT MERELY DECLINE TO ENABLE - firstboot re-runs.
+        if systemctl is-enabled homehub-litellm.service >/dev/null 2>&1; then
+            systemctl disable homehub-litellm.service >/dev/null 2>&1 || log "WARN: could not disable homehub-litellm.service"
+            systemctl stop    homehub-litellm.service >/dev/null 2>&1 || true
+            log "litellm: private lane DISABLED and stopped (LITELLM_ENABLED='$_litellm_enabled')"
+        else
+            log "litellm: fence enabled, private lane left disabled (LITELLM_ENABLED='$_litellm_enabled')"
+        fi
+    fi
+else
+    log "litellm: no payload at $STACK_DIR/llm-isolation - skipping (correct for a build without it)"
+fi
+
 # ── 4-pre-b. DISARM A LEGACY RELAY CONTAINER, AND VERIFY THE DISARM ─────────
 # THE ONE THING THE LIFECYCLE REFRESH DOES NOT FIX BY ITSELF (found by codex
 # gpt-5.6-sol, round 6). A box that ran the OLD shape has a `gunmaster3-relay`

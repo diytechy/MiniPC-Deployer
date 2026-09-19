@@ -264,3 +264,92 @@ def test_the_hub_publishes_a_verdict_and_never_actuates_sr044(svc):
     assert set(verdict) == {"permit", "reason", "observed_at"}
     assert not hasattr(svc, "sleep_now"), "the hub must expose no sleep actuation"
     assert not hasattr(svc, "suspend"), "the hub must expose no sleep actuation"
+
+
+# --- TC-1028 ---------------------------------------------------------------
+# The unit-installation half of SR-044, which had no test because nothing
+# installed the unit. Until 2026-09-19 firstboot.sh never mentioned
+# devpc-wake at all: the code was deployed to /opt/homehub/stack/devpc-wake
+# and was unreachable from systemd, so the S3/S5 physical test could not be
+# run without hand-writing a unit file on the box.
+_FIRSTBOOT = Path(__file__).resolve().parents[1] / "stack" / "autoinstall" / "firstboot.sh"
+
+
+def _devpc_block():
+    """The devpc-wake stanza ONLY.
+
+    Bounded by its own closing `fi` rather than by a character count. A
+    fixed-size window overran into the next section of firstboot.sh and made
+    these tests read text they do not own - which would have let a neighbouring
+    edit turn one of them green or red for no reason.
+    """
+    text = _FIRSTBOOT.read_text(encoding="utf-8")
+    assert "devpc-wake" in text, (
+        "firstboot.sh must handle the devpc-wake unit; a payload nothing "
+        "installs is a service that cannot even be tested by hand")
+    start = text.index("# ── devpc-wake:")
+    end = text.index('log "devpc-wake: no payload at', start)
+    return text[start:end]
+
+
+def _devpc_live():
+    """The same stanza with comment lines removed.
+
+    Ordering assertions MUST run against this and not the raw block. The first
+    draft of the install-order test compared positions in the commented text
+    and failed, because the banner above the code says "enables it only on
+    DEVPC_WAKE_ENABLED=true" hundreds of characters before the install line.
+    It was asserting against prose describing the behaviour instead of against
+    the behaviour - the same shape of mistake as a test that reads back the
+    file its value was invented in.
+    """
+    return "\n".join(l for l in _devpc_block().splitlines()
+                     if not l.lstrip().startswith("#"))
+
+
+def test_the_wake_unit_is_installed_unconditionally_sr044():
+    """INSTALL ALWAYS, ENABLE CONDITIONALLY. The install must not be gated on
+    the knob: the whole point is that the Owner can run the physical wake test
+    with one `systemctl start` while the service still stays disabled across
+    reboots until the packet is proven to work."""
+    block = _devpc_live()
+    install_at = block.index("install -m 0644")
+    knob_at = block.index("DEVPC_WAKE_ENABLED")
+    assert install_at < knob_at, (
+        "the unit must be installed BEFORE the knob is consulted, so a box "
+        "with the knob false still has a unit that can be started by hand")
+    assert "homehub-devpc-wake.service" in block
+    assert "systemctl daemon-reload" in block, (
+        "a freshly installed unit systemd has not re-read cannot be started")
+
+
+def test_the_knob_disables_rather_than_merely_declining_to_enable_sr044():
+    """firstboot re-runs. A box whose knob was true and is now false would
+    otherwise keep the service enabled for ever - the knob would appear to
+    turn it off and would not. Same defect the rustdesk listener block fixed."""
+    block = _devpc_block()
+    assert "systemctl disable homehub-devpc-wake.service" in block
+    assert "systemctl stop    homehub-devpc-wake.service" in block, (
+        "disable alone leaves a running service up until the next boot, which "
+        "is exactly the window somebody flipping this to false is closing")
+
+
+def test_enabling_is_refused_when_nothing_can_actuate_a_wake_sr044():
+    """devpc_wake_service.py already exits when neither knob is set, but a
+    unit that enables and then crash-loops on RestartSec is a worse way to
+    learn it: the journal fills and uptime-kuma goes red three levels from the
+    cause."""
+    block = _devpc_block()
+    assert "DEVPC_WAKE_MAC" in block and "DEVPC_WAKE_COMMAND" in block
+    assert "INSTALLED but left disabled" in block
+
+
+def test_the_carriage_return_guard_is_present_sr044():
+    """A CRLF-saved .env must not smuggle a carriage return into the string
+    comparison - the same guard the rustdesk knob needed."""
+    block = _devpc_block()
+    # A RAW string. Without the r-prefix Python reads \015 as an octal escape
+    # for a carriage return, so the assertion searched the shell script for a
+    # literal CR and would have passed only by accident.
+    assert block.count(r"tr -d '\015'") >= 3, (
+        "every value read out of .env here needs the guard, not just the first")

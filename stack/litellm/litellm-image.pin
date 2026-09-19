@@ -1,0 +1,48 @@
+# litellm-image.pin — the deployed routing proxy image, by digest.
+#
+# Implements: SR-047, LLR-990
+#
+# A DIGEST, NOT A TAG. The same rule as gateway-image.pin next door, for a
+# different reason. This container holds no provider credential — that is the
+# whole design — so the risk here is not credential exposure. It is that this
+# process is the thing enforcing "finance cannot reach a cloud provider", and a
+# process that can change underneath that guarantee without a commit is not
+# enforcing anything.
+#
+# TAGS MOVE, AND THE INTERESTING PART IS THAT TODAY THEY DO NOT. At the moment
+# of pinning, `v1.101.0`, `main-stable` and `latest` ALL resolved to the SAME
+# digest, recorded below. That is the opposite of what the LLM gateway's pin
+# found (where `latest` tracked `main` and differed from the newest release),
+# and it is worth writing down precisely because it is the trap: someone who
+# "pinned latest" here would be correct today and silently wrong after the next
+# push, with nothing in the repo recording the moment it changed.
+#
+# TO ROTATE: pick the new release tag, resolve its digest against
+# ghcr.io/berriai/litellm, update DIGEST and VERSION and PINNED together, and
+# commit all three in one change. A digest with a stale version line reads as
+# verified and is not.
+#
+#     docker buildx imagetools inspect ghcr.io/berriai/litellm:<tag>
+#
+# WHICH IMAGE. `ghcr.io/berriai/litellm` — the plain image, NOT
+# `litellm-database`. The database variant exists for deployments that need
+# virtual keys and spend tracking; this one deliberately has neither, runs
+# config-only with `store_model_in_db: false`, and therefore needs no Postgres,
+# no volume and no entry in any backup set. Choosing the database image would
+# quietly reintroduce all three.
+#
+# ON ROTATION, RE-CHECK ONE BEHAVIOUR: that fallbacks are still OPT-IN. The
+# entire fail-closed property rests on an absent key meaning "nothing falls
+# anywhere". If a future release ever ships a default fallback, this pin is the
+# thing that gives you a controlled moment to find out.
+
+IMAGE=ghcr.io/berriai/litellm
+VERSION=v1.101.0
+DIGEST=sha256:d295634e09c648dcdb72c4cc2dd226f5fb87823a73e88cbbed6f205e4deb044b
+PINNED=2026-09-19
+
+# Recorded for contrast only — NOT a second thing to deploy. Both resolved to
+# the identical digest above on 2026-09-19; if a future reader finds them
+# differing, that is the tag moving, not an error in this file.
+OBSERVED_MAIN_STABLE_DIGEST=sha256:d295634e09c648dcdb72c4cc2dd226f5fb87823a73e88cbbed6f205e4deb044b
+OBSERVED_LATEST_DIGEST=sha256:d295634e09c648dcdb72c4cc2dd226f5fb87823a73e88cbbed6f205e4deb044b

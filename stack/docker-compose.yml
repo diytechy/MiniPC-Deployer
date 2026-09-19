@@ -1221,6 +1221,21 @@ services:
       # works is worse than one that fails, which is why the runbook verifies
       # the destination after the first start rather than trusting this line.
       - llm_gateway_data:/app/server/data
+    networks:
+      # `default` MUST be listed explicitly. Naming any network on a service
+      # that previously had none REPLACES the implicit default membership, and
+      # dropping it here would cut this container off from Caddy — the only
+      # thing that can reach it — so the gateway would go dark while looking
+      # like a routing change to an unrelated service.
+      - default
+      # Joined so the gateway's CUSTOM ENDPOINT can reach the private lane by
+      # name (http://litellm:4000/v1) instead of pointing at the dev PC
+      # directly, which would bypass both the hold and the fence. Membership
+      # here does NOT put this container behind the egress fence: that rule
+      # matches the litellm container's pinned address alone, and this one
+      # keeps its own unrestricted egress, which is correct — reaching twelve
+      # cloud providers is its job.
+      - llmprivate
     restart: unless-stopped
     # NO healthcheck override. The image ships a correct one — `node -e fetch`
     # against /api/ping — and the override that used to sit here probed /health,
@@ -1228,6 +1243,179 @@ services:
     # in this node image. It would have reported the gateway permanently
     # unhealthy while the gateway was fine. Inheriting the image's probe is both
     # correct and one fewer thing to drift from upstream.
+
+
+  # ── litellm — the PINNED route to the dev PC, and nothing else (SR-047) ──────
+  #
+  # ONE DEPLOYMENT, NO CLOUD CREDENTIAL, NO SECOND WAY OUT. This container
+  # exists so that "a request sent here cannot reach a cloud provider" is a
+  # property of the topology and not a policy anyone has to enforce. It is the
+  # lane the finance audit will use, and it is the lane that holds a request
+  # while the dev PC wakes (SR-044's shim, as stack/litellm/devpc_hold_hook.py).
+  #
+  # WHY NOT JUST RESTRICT A KEY ON llm-gateway. Because that would make the
+  # guarantee a check running inside a process that still holds twelve
+  # platforms' credentials, and llm-gateway cannot express it anyway: its
+  # fallback chain is GLOBAL (its router selects `FROM fallback_config WHERE
+  # enabled = 1` with no caller column), so "finance may not fall back" and
+  # "agents may" are not both sayable there. Read from the running container
+  # 2026-09-19, not inferred.
+  #
+  # HOW THE TWO LANES COMPOSE, because it looks like duplication and is not:
+  #
+  #     finance ──────────────────► litellm ──► dev PC     (no fallbacks)
+  #     agents / phone ──► llm-gateway ─┤
+  #                             └───────► 12 free cloud tiers
+  #
+  # llm-gateway's CUSTOM ENDPOINT points at this container rather than at the
+  # dev PC directly, so this is the SOLE path to the dev PC and the hold logic
+  # is written once. When the box is cold: litellm refuses (correct for
+  # finance), llm-gateway sees that refusal as retryable and walks to a cloud
+  # tier (correct for agents). Each component makes the decision that is its
+  # job, and finance never traverses the one that substitutes.
+  #
+  # THAT HANDOFF IS A STRING MATCH AND IT IS FRAGILE. llm-gateway decides
+  # retryability by substring-matching the error text. devpc_hold_hook.py's
+  # expiry message therefore contains "503" and "unavailable" deliberately, and
+  # TC-1025 asserts it against the gateway's vendored matcher list. Changing
+  # that message breaks the agents lane silently.
+  #
+  # NO HOST PORT AND NO CADDY SITE — a stronger posture than llm-gateway's, not
+  # a weaker one. llm-gateway needs an ingress because a human uses its
+  # dashboard. This has no dashboard worth reaching, no admin UI in use, and no
+  # human operand: its whole configuration is stack/litellm/config.yaml in git.
+  # Its only ingress is the compose bridge. Do not add a site "for debugging".
+  #
+  # NO VOLUME, AND THAT IS THE POINT OF store_model_in_db: false. With the DB
+  # off, upstream documents the config file as fully authoritative, so nothing
+  # can add a deployment at runtime that git would not record. It also means
+  # this container is fully reproducible from this repo and joins NO backup set
+  # — unlike llm_gateway_data, which holds credentials and cannot be.
+  #
+  # ── THE CONFIG FILE IS NOT THE BOUNDARY. THE FIREWALL IS. ───────────────────
+  #
+  # An earlier version of this banner claimed the one-deployment `model_list`
+  # made cloud egress impossible. THAT WAS FALSE, and an adversarial review
+  # (codex gpt-5.6-terra, 2026-09-19) caught it. Measured against the pinned
+  # digest: the proxy registers THIRTY-TWO provider pass-through routes —
+  # /vertex_ai/{endpoint}, /gemini/, /anthropic/, /bedrock/, /cohere/,
+  # /mistral/, /openai/, /azure/, /vllm/ … — entirely independently of
+  # `model_list`, and the vertex handler FORWARDS CALLER-SUPPLIED credentials
+  # when the proxy holds none ("default_vertex_config not set, forwarding
+  # caller-provided headers", its own log line). A test request with an
+  # `x-goog-api-key` header opened a connection to
+  # aiplatform.l.rep.googleapis.com:443. `model_list` constrained none of it.
+  #
+  # "Holds no credential" is therefore NOT a boundary, because the credential
+  # can arrive in the request. The boundary is below the application:
+  #
+  #   1. a dedicated network with a PINNED subnet and a STATIC address, so a
+  #      firewall rule can name exactly this container and nothing else;
+  #   2. stack/llm-isolation/ programs DOCKER-USER to allow this address to
+  #      reach the dev PC's inference port and REJECT everything else;
+  #   3. `restart: "no"` plus homehub-litellm.service, so the runtime never
+  #      starts this container outside that fence.
+  #
+  # `allowed_routes` in config.yaml removes the pass-through routes as defence
+  # in depth. It is IN-PROCESS POLICY and is explicitly not the guarantee — if
+  # it were, we would be back to trusting the thing being constrained.
+  litellm:
+    image: ghcr.io/berriai/litellm@${LITELLM_IMAGE_DIGEST}
+    container_name: litellm
+    # NEVER add `litellm` to COMPOSE_PROFILES. firstboot runs a bulk
+    # `docker compose up -d`, and a profiled-in service would start OUTSIDE the
+    # fence on every boot. homehub-litellm.service passes `--profile litellm`
+    # itself, which is what makes naming it here unnecessary and unsafe.
+    profiles: ["litellm"]
+    command: ["--config", "/app/litellm/config.yaml", "--port", "4000"]
+    networks:
+      llmprivate:
+        # PINNED, so llm-isolation.sh can write `-s <this address>` rather than
+        # a subnet match that would silently cover any future neighbour.
+        ipv4_address: ${LITELLM_CONTAINER_IP}
+    # NO `extra_hosts`, AND ITS ABSENCE IS THE SECOND CORRECTION TO THIS LINE.
+    #
+    # First this service told operators to use `host.docker.internal`, which
+    # Docker Desktop provides and Docker Engine on Ubuntu does NOT — so the
+    # readiness probe failed name resolution and the hold silently never woke
+    # anything. The fix was `extra_hosts: host.docker.internal:host-gateway`.
+    #
+    # THAT FIX WAS ALSO WRONG, and a third review round caught it.
+    # `host-gateway` resolves to the DEFAULT bridge's gateway — `docker0`,
+    # measured as 172.17.0.1 on this hub — NOT to this network's .1. The
+    # readiness probe would have gone to 172.17.0.1:8799 while the INPUT fence
+    # permits only 172.28.91.1:8799, so it would have been rejected by our own
+    # fence and reported as "no oracle". A mapping-only test cannot see that
+    # mismatch, because both halves are individually correct.
+    #
+    # So DEVPC_WAKE_URL names the pinned bridge gateway literally. That address
+    # is the .1 of the subnet pinned below, is what llm-isolation.sh derives
+    # for its allow rule, and TC-1034 asserts all three agree.
+    #
+    # `restart: "no"` IS LOAD-BEARING, exactly as it is on the rustdesk pair.
+    # The fence is installed by a systemd unit this container is started by; a
+    # restart policy would let the runtime bring it up at boot, after a daemon
+    # restart or after a crash, with the fence not yet programmed.
+    restart: "no"
+    environment:
+      TZ: ${TIMEZONE}
+      # Where config.yaml's `model:` comes from. THE `openai/` PREFIX IS
+      # APPLIED HERE, not in the YAML: LiteLLM substitutes os.environ/ only for
+      # a value that BEGINS with it, so `openai/os.environ/X` would be passed
+      # through as a literal model name. Composing it here keeps ONE source of
+      # truth for the model id — the same DEVPC_TARGET_MODEL that devpc-wake
+      # looks for in the dev PC's /v1/models listing to decide `ready`.
+      DEVPC_LITELLM_MODEL: "openai/${DEVPC_TARGET_MODEL}"
+      DEVPC_TARGET_MODEL: ${DEVPC_TARGET_MODEL}
+      # The only destination this proxy has. Points at the dev PC's
+      # OpenAI-compatible inference server, which MUST be running as a Windows
+      # service — after a cold wake there is no user session for it to live in.
+      DEVPC_OPENAI_BASE_URL: http://${DEVPC_HOST}:${DEVPC_INFERENCE_PORT}/v1
+      # The readiness oracle the hold hook asks. EMPTY DISABLES THE HOLD, which
+      # is the correct setting while the wake path is unverified: requests then
+      # fail fast against a cold box instead of waiting out the full cap. The
+      # hook says so once at startup rather than leaving it to be discovered.
+      DEVPC_WAKE_URL: ${DEVPC_WAKE_URL:-}
+      DEVPC_HOLD_CAP_SECONDS: ${DEVPC_HOLD_CAP_SECONDS:-120}
+      # THESE TWO WERE DECLARED IN .env.example, READ BY HoldPolicy, AND NEVER
+      # PASSED IN. The container silently used the Python defaults (3 and 5),
+      # so turning either knob in stack/.env changed nothing on the box while
+      # reading as though it did - the same shape as the HOST_BIND line the
+      # gateway's banner above records. Found by review, not by anything
+      # failing.
+      DEVPC_HOLD_POLL_SECONDS: ${DEVPC_HOLD_POLL_SECONDS:-3}
+      DEVPC_HOLD_PROBE_TIMEOUT_SECONDS: ${DEVPC_HOLD_PROBE_TIMEOUT_SECONDS:-5}
+      # Our own bearer key, NOT a provider credential. Its job is that a request
+      # misdirected between the two lanes 401s instead of quietly succeeding
+      # against the wrong one.
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      # Upstream phones home with anonymous usage unless told not to. This
+      # container's whole reason for existing is that it is the private lane.
+      LITELLM_DONT_SHOW_FEEDBACK_BOX: "true"
+      LITELLM_MODE: PRODUCTION
+    volumes:
+      # TWO FILE MOUNTS, NOT A DIRECTORY MOUNT, and that is deliberate.
+      # Replacing a bind-mounted DIRECTORY's inode detaches the mount — the
+      # container keeps serving the old contents while the deploy reports
+      # success. Two explicit files make the update surface obvious and match
+      # the Caddyfile pattern above. Both are read-only: nothing in this
+      # container may rewrite its own routing table.
+      - ./litellm/config.yaml:/app/litellm/config.yaml:ro
+      - ./litellm/devpc_hold_hook.py:/app/litellm/devpc_hold_hook.py:ro
+    # So `callbacks: devpc_hold_hook.proxy_handler_instance` in config.yaml
+    # resolves. Without it the proxy starts, the hook never loads, and a cold
+    # box is discovered by a request that hangs rather than by a startup error.
+    working_dir: /app/litellm
+    healthcheck:
+      # /health/liveliness is unauthenticated and answers without touching the
+      # dev PC. Probing anything that reaches the dev PC would make this
+      # container unhealthy every night the box is asleep, which is the normal
+      # case — the same mistake devpc-wake's /health deliberately avoids.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness',timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
 
   # ── self-hosted remote desktop: RustDesk server (SR-045, SN-045) ─────────────
@@ -1311,6 +1499,29 @@ networks:
     ipam:
       config:
         - subnet: 172.28.90.0/24
+
+  # The private LLM lane's own network (SR-047).
+  #
+  # NOT `internal: true`, AND THAT IS THE POINT. This container legitimately
+  # needs to reach the dev PC, which is on the LAN — `internal` would remove
+  # the default route and kill the one destination the lane exists for. The
+  # restriction is therefore selective, not total, and selective restriction
+  # cannot be expressed by a docker network flag at all. It lives in
+  # stack/llm-isolation/, which programs DOCKER-USER.
+  #
+  # THE SUBNET IS PINNED so that a firewall rule can name an address inside it.
+  # A dynamically-allocated subnet moves, and a rule naming last week's range
+  # is a rule that silently protects nothing — the same reasoning the `game`
+  # network's pin carries, reached independently for a different chain.
+  #
+  # Callers reach this lane by joining this network: llm-gateway does so to
+  # serve its custom endpoint, and the future finance consumer will. They are
+  # unaffected by the fence, which matches on the litellm container's address
+  # alone and not on the subnet.
+  llmprivate:
+    ipam:
+      config:
+        - subnet: 172.28.91.0/24
 
 volumes:
   # rustdesk (SR-045): the hbbs/hbbr KEY PAIR. Not reproducible from the repo -

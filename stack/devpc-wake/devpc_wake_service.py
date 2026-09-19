@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -142,6 +143,32 @@ class Handler(BaseHTTPRequestHandler):
         print("devpc-wake: " + (fmt % args), flush=True)
 
 
+def read_session(url, timeout):
+    """IF-025. Fetch the dev PC's session-attachment reading, or None.
+
+    NONE IS NOT 'DETACHED'. Every failure path here - no URL configured, the
+    host unreachable, a non-200, a body that is not JSON - returns None, and
+    sleep_verdict() treats None as ATTACHED and refuses to permit sleep. That
+    asymmetry is the requirement (LLR-978): a false `attached` costs idle watts
+    until the next poll, while a false `detached` suspends a machine somebody
+    is using and loses their work.
+
+    So this function is deliberately incapable of producing a permissive
+    answer by accident. The only way to reach `attached: false` is for a fresh,
+    well-formed body to say so explicitly.
+    """
+    if not url:
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            doc = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def main():
     cfg = Config()
     if not cfg.host:
@@ -151,6 +178,18 @@ def main():
 
     Handler.service = svc
     Handler.publisher = pub
+    # WITHOUT THIS LINE the reader stayed None forever and every sleep verdict
+    # was "session signal unavailable - treated as attached". That fails closed,
+    # so nothing broke and nothing complained - the dev PC simply never slept,
+    # and the reason was invisible because the fail-closed message is also what
+    # a genuinely-unreachable agent produces. cfg.session_url was being read
+    # from the environment and then discarded.
+    Handler.session_reader = lambda: read_session(cfg.session_url, cfg.probe_timeout)
+    if not cfg.session_url:
+        print("devpc-wake: DEVPC_SESSION_URL is empty - sleep will NEVER be "
+              "permitted (fail-closed to attached). This is correct until the "
+              "service-mode session agent exists; it is logged so that 'the box "
+              "never sleeps' is explained rather than investigated.", flush=True)
 
     def poller():
         last = None

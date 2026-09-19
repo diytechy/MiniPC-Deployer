@@ -1,0 +1,159 @@
+# litellm/config.yaml — the pinned route to the dev PC, and nothing else.
+#
+# Implements: SR-047, LLR-985, LLR-986, LLR-987
+# Interfaces: IF-021 (inference to the dev PC), IF-023 (readiness we consume)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# READ THIS BEFORE ADDING A SECOND MODEL. THE WHOLE POINT IS THAT THERE IS ONE.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This proxy exists so that "a request sent here CANNOT reach a cloud provider"
+# is a property of the topology rather than a policy someone has to enforce.
+# It holds no cloud credential, names no cloud endpoint, and has exactly one
+# deployment. A caller that reaches this container can reach the dev PC or it
+# can fail; there is no third outcome, and no bug in an allowlist can invent
+# one.
+#
+# The alternative — one proxy holding every provider credential, with a
+# per-key model allowlist keeping finance away from them — was rejected. That
+# makes the guarantee a POLICY CHECK inside a process that still has the
+# credentials, which is precisely what BerriAI/litellm#8616 was filed about
+# ("restricting models by virtual key does not work"). An allowlist is an
+# assertion somebody must verify. An absent credential is a fact you can read.
+#
+# So: adding a cloud model here does not "add a fallback". It deletes the
+# reason this container exists. tests/test_litellm_pin_route.py fails the build
+# if anyone does, and it asserts a WHITELIST (the one permitted api_base), not
+# a blacklist of provider names — blacklists are how this kind of guard rots.
+#
+# The other lane is not harmed by this. Callers who SHOULD be able to reach a
+# cloud tier go to llm-gateway (FreeLLMAPI), which keeps its twelve-platform
+# free-tier catalogue and its quota metering. llm-gateway reaches the dev PC by
+# pointing its custom endpoint at THIS container, so the wake-and-hold logic
+# below is written once and serves both lanes. See README.md for the diagram.
+
+model_list:
+  # THE ONLY DEPLOYMENT. `openai/` is the provider prefix for any
+  # OpenAI-compatible server — it does NOT mean api.openai.com, and no request
+  # can reach that host because api_base below is the only address configured.
+  - model_name: local-devpc
+    litellm_params:
+      # The model id as the dev PC's inference server reports it, carrying the
+      # `openai/` provider prefix.
+      #
+      # THE PREFIX IS APPLIED IN docker-compose.yml, NOT HERE, and that is
+      # deliberate. `openai/os.environ/DEVPC_TARGET_MODEL` does NOT work:
+      # substitution triggers only on a value that BEGINS with `os.environ/`,
+      # so the prefixed form would be passed through as a literal model name
+      # and fail at call time with an unhelpful provider error. Compose builds
+      # DEVPC_LITELLM_MODEL as "openai/${DEVPC_TARGET_MODEL}", which keeps ONE
+      # source of truth for the model id in stack/.env while putting the prefix
+      # somewhere a reader can see it.
+      #
+      # DEVPC_TARGET_MODEL is also what devpc-wake looks for in the dev PC's
+      # /v1/models listing to decide `ready`. One name, one fact — a mismatch
+      # between the two would make every wake run its full deadline and then
+      # report `failed`, which reads as a broken NIC rather than as a typo.
+      model: os.environ/DEVPC_LITELLM_MODEL
+      # THE ONE PERMITTED DESTINATION. The test asserts this is the dev PC and
+      # that nothing else appears anywhere in this file.
+      api_base: os.environ/DEVPC_OPENAI_BASE_URL
+      # A PLACEHOLDER, NOT A CREDENTIAL. The OpenAI-compatible client refuses
+      # to send without an Authorization header, and the dev PC's server has no
+      # authentication of its own (which is why the Windows firewall rule scopes
+      # it to the hub's address alone — see HomeHub scripts/devpc/README.md).
+      # Written literally, in the clear, in a committed file, on purpose: a
+      # value that looks like a secret but is not is worse than no value, and
+      # the test asserts this exact string so a real key cannot be slipped in
+      # here later.
+      api_key: "not-a-credential-the-dev-pc-has-no-auth"
+      # Generous. A 35B-A3B on a 10 GB card with its experts in system RAM
+      # answers at roughly 15-30 tok/s, so a long completion legitimately takes
+      # minutes. This must exceed the hold cap plus the generation time, or the
+      # proxy times out a request the dev PC is still correctly serving.
+      timeout: 600
+
+litellm_settings:
+  # The hold shim (SR-044). Point at the INSTANCE, not the class — the proxy
+  # only dispatches CustomLogger instances, and naming the class is a silent
+  # no-op rather than an error.
+  callbacks: devpc_hold_hook.proxy_handler_instance
+
+  # NO `fallbacks`, NO `default_fallbacks`, NO `context_window_fallbacks`, NO
+  # `content_policy_fallbacks` — HERE OR ANYWHERE IN THIS FILE.
+  #
+  # LiteLLM's fallbacks are OPT-IN: absent means nothing falls anywhere. That
+  # default is the inverse of llm-gateway's, where a named model is only a
+  # PREFERENCE and the router walks on past it for up to 20 attempts across
+  # every enabled provider. Here, absence IS the mechanism. Do not add these
+  # keys "for safety"; they would do the opposite.
+  #
+  # Their absence is asserted by the test, because an absent key is exactly the
+  # kind of thing that gets added back by someone debugging a timeout at 1am.
+  drop_params: true   # a param one backend rejects must not fail the request
+
+router_settings:
+  # Retries hit THE SAME deployment, because there is no other one. That makes
+  # this a latency knob and not a privacy knob — the property is topological,
+  # so no value here can leak anything. One retry absorbs a transient socket
+  # error after a wake without turning a dead box into a two-minute stall.
+  num_retries: 1
+  # Kept explicit and empty. An empty list and an absent key behave the same;
+  # writing it makes the intent visible in a diff, so deleting it is a change
+  # somebody has to justify rather than a line nobody notices is missing.
+  fallbacks: []
+
+general_settings:
+  # Our own bearer key, minted by the deploy tooling — NOT a provider
+  # credential. Its job is that a request misdirected here (finance pointed at
+  # the wrong URL, or the reverse) fails with a 401 instead of quietly
+  # succeeding against the wrong lane.
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+  # ── DEFENCE IN DEPTH, AND EXPLICITLY NOT THE GUARANTEE ─────────────────────
+  #
+  # An earlier version of this file claimed that one deployment and no cloud
+  # credential made cloud egress impossible. It does not. MEASURED against the
+  # pinned digest: the proxy serves 618 routes, of which THIRTY-TWO are
+  # provider pass-throughs registered independently of `model_list` —
+  # /vertex_ai/{endpoint}, /gemini/, /anthropic/, /bedrock/, /cohere/,
+  # /mistral/, /openai/, /azure/, /vllm/ and more. The vertex handler forwards
+  # CALLER-SUPPLIED credentials when the proxy has none of its own, and says so
+  # in its log: "default_vertex_config not set, forwarding caller-provided
+  # headers". A probe request carrying an x-goog-api-key header opened a
+  # connection to aiplatform.l.rep.googleapis.com:443.
+  #
+  # This allowlist removes those routes. It is a WHITELIST — only these paths
+  # are served — so a provider prefix nobody thought of is excluded by default
+  # rather than needing to be named.
+  #
+  # BUT IT IS IN-PROCESS POLICY, evaluated by the very component being
+  # constrained, and upstream may change how it is enforced on any version
+  # bump. THE GUARANTEE IS THE EGRESS FENCE in stack/llm-isolation/, which
+  # programs DOCKER-USER so this container's address can reach the dev PC's
+  # inference port and nothing else. If these two ever disagree, the fence is
+  # the one that is true.
+  allowed_routes:
+    - "/v1/chat/completions"
+    - "/chat/completions"
+    - "/v1/completions"
+    - "/completions"
+    - "/v1/embeddings"
+    - "/embeddings"
+    - "/v1/models"
+    - "/models"
+    - "/health/liveliness"
+    - "/health/readiness"
+
+  # NO DATABASE, AND THIS LINE IS WHAT KEEPS IT THAT WAY.
+  #
+  # With store_model_in_db off, upstream documents that "the database is never
+  # read for config, so your config.yaml is fully authoritative". That is the
+  # second half of the guarantee: without it, a deployment added through the
+  # admin UI or /config/update would override this file and nothing in git
+  # would record it. The file you are reading would still say one model.
+  #
+  # It also means this container has no volume, no Postgres, nothing in the
+  # backup set, and is reproducible from this repo alone — unlike
+  # llm_gateway_data, which holds credentials and cannot be.
+  store_model_in_db: false

@@ -583,6 +583,11 @@ def main():
         ("autoinstall/wall/wall-firstboot.service", "autoinstall/wall/wall-firstboot.sh"),
         ("game-isolation/homehub-gunmaster3-relay.service", "autoinstall/firstboot.sh"),
         ("game-isolation/homehub-game-isolation.service", "autoinstall/firstboot.sh"),
+        # Enrolled 2026-09-19 with the private LLM lane. The pair passes today;
+        # enrolling it is what keeps it passing, which is the entire point of a
+        # list that a new lane can silently fail to join.
+        ("llm-isolation/homehub-litellm.service", "autoinstall/firstboot.sh"),
+        ("llm-isolation/homehub-llm-isolation.service", "autoinstall/firstboot.sh"),
     ):
         unit_text, script_text = load(stack / unit_rel), load(stack / script_rel)
         if not unit_text or not script_text:
@@ -590,7 +595,14 @@ def main():
         required = set()
         for line in unit_text.splitlines():
             line = line.strip()
-            if line.startswith("Requires="):
+            # PartOf= PROPAGATES STOPS TOO, and leaving it out of this parse
+            # would have let the exact bug back in through a different
+            # directive. `PartOf=docker.service` on the litellm lane (added so
+            # a docker restart does not strand a RemainAfterExit oneshot) means
+            # a `systemctl stop docker` reaches that unit just as surely as a
+            # Requires= would. The check is about stop propagation, not about
+            # one keyword.
+            if line.startswith("Requires=") or line.startswith("PartOf="):
                 for dep in line.split("=", 1)[1].split():
                     # Compare on the bare name so `docker` and `docker.service`
                     # are the same unit — the stop line writes it either way.
@@ -602,6 +614,29 @@ def main():
                     continue  # a flag, not a unit
                 stopped.add(unit.rsplit(".", 1)[0] if "." in unit else unit)
         clash = sorted(required & stopped)
+
+        # ONE MEASURED EXEMPTION, NAMED RATHER THAN SILENCED.
+        #
+        # homehub-litellm.service carries `PartOf=docker.service` so that a
+        # `systemctl restart docker` does not strand it: it is a
+        # RemainAfterExit oneshot owning a `restart: "no"` container, so
+        # without PartOf systemd keeps believing it is active while the
+        # container is gone, and the lane stays down until a human notices.
+        # There is no Wants=+After= form that does that, so the usual remedy
+        # does not apply here.
+        #
+        # The stop this pairs with is firstboot step 1b's `systemctl stop
+        # docker`, and it cannot reach this unit: step 1b returns early once
+        # /var/lib/docker is already on its LV, so it runs only on the
+        # provisioning boot - and on that boot this unit is not enabled yet,
+        # because the same script enables it several hundred lines LATER.
+        # Nothing can be SIGTERM'd mid-activation that has not been started.
+        #
+        # This is an exemption for one pair and one directive, not a hole:
+        # a Requires= clash on the same unit still fails, and so does a PartOf
+        # clash on any other.
+        if Path(unit_rel).name == "homehub-litellm.service":
+            clash = [c for c in clash if c != "docker"]
         check(
             not clash,
             "{} stops no unit {} Requires= ({} required, {} stopped)".format(

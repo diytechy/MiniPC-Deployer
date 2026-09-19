@@ -1,0 +1,66 @@
+[Unit]
+# The ONLY thing that starts the private LLM lane (SR-047, LLR-991).
+#
+# The container carries `restart: "no"` in the compose file, so the container
+# runtime never starts it on its own - not at boot, not after a daemon restart,
+# not after a crash. This unit is its owner, and the `litellm` compose profile
+# is deliberately absent from COMPOSE_PROFILES so that firstboot's bulk
+# `docker compose up -d` cannot start it outside the fence. That is exactly the
+# gunmaster3 defect, which this stack has now hit twice.
+Description=Private LLM lane (egress-fenced to the dev PC only)
+Documentation=file:///opt/homehub/stack/litellm/README.md
+
+# REQUIRES THE FENCE, NOT MERELY AFTER IT. `After=` alone would order the start
+# and still start the proxy when the fence had FAILED - and a proxy with no
+# fence is a container with 32 provider pass-through routes and unrestricted
+# outbound networking, which is precisely the state the review found.
+Requires=homehub-llm-isolation.service
+After=homehub-llm-isolation.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+# PartOf=docker.service, BECAUSE WITHOUT IT A DOCKER RESTART KILLS THIS LANE
+# FOR GOOD. Found in review, and it is invisible from either file alone:
+# `Type=oneshot` + `RemainAfterExit=yes` means systemd considers this unit
+# ACTIVE for ever once `up -d` has returned, while the container carries
+# `restart: "no"` precisely so nothing but this unit may start it. So
+# `systemctl restart docker` stops the container, systemd still believes the
+# unit is active, ExecStart is never re-run, and the lane is down until a human
+# notices. `PartOf=` is the one directive that propagates a stop/restart from
+# docker to us; combined with the `After=docker.service` above, the restart
+# lands after the daemon is back.
+#
+# NOT on homehub-llm-isolation.service, which the same review asked for and
+# which would be wrong: that unit is `DefaultDependencies=no` and
+# `Before=docker.service` on purpose, so making it PartOf the thing it is
+# ordered before invites a restart-ordering conflict. It also buys nothing.
+# Docker does not touch DOCKER-USER - that chain exists for exactly this
+# purpose and the daemon only ensures the jump to it is present - and it never
+# touches INPUT, where the other half of the fence lives. The rules survive a
+# daemon restart; the container does not. Only the container needs this.
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/homehub/stack
+
+# `up` with no `-d` would block this oneshot for ever; `--no-build` because the
+# image is pinned by digest and this unit must never become a build step on a
+# live box.
+ExecStart=/usr/bin/docker compose --profile litellm up -d --no-build litellm
+
+# THE `-` PREFIX IS NOT COSMETIC, and it is the other half of PartOf=. The
+# stop that PartOf propagates arrives while dockerd is going down, so
+# `docker compose stop` talks to a socket that is closing and exits non-zero.
+# Without the `-`, that failure marks the unit failed, and a failed unit is not
+# restarted when docker comes back - which would reintroduce the exact defect
+# PartOf= was added to fix, by a different route. A container we cannot reach
+# because its daemon is stopping is already stopped.
+ExecStop=-/usr/bin/docker compose --profile litellm stop litellm
+
+# Deliberately NOT removing the fence on stop: if this container is ever started
+# by some other means, it must find the fence already up.
+
+[Install]
+WantedBy=multi-user.target

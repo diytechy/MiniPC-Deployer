@@ -1,0 +1,37 @@
+[Unit]
+# Restrict the private LLM lane's EGRESS to the dev PC alone (SR-047, LLR-991).
+#
+# See llm-isolation.sh for why this is DOCKER-USER and not INPUT - the opposite
+# choice to the two fences next door, because this one restricts where a
+# container may SEND, which is forwarded traffic, rather than what may reach the
+# host's own bridge address, which is not.
+Description=Fence the private LLM lane's egress to the dev PC only
+Documentation=file:///opt/homehub/stack/llm-isolation/llm-isolation.sh
+
+# BEFORE docker, for the reason both sibling units record after one of them got
+# it wrong: ordering After=docker means that on every reboot docker starts the
+# container before this unit runs, and that window - on every single boot - is
+# exactly when the proxy is up with unrestricted egress and 32 provider
+# pass-through routes registered. A rule for a container that is not running is
+# harmless; a running container with no rule is the failure this prevents.
+Before=docker.service
+DefaultDependencies=no
+After=network-pre.target
+Wants=network-pre.target
+
+# Deliberately NO Requires=docker.service: this must run even if docker is
+# masked or broken. The propagation runs the other way - homehub-litellm.service
+# Requires= THIS unit, so a failure here does not merely lose a race, it stops
+# the container existing at all.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/homehub/stack/llm-isolation/llm-isolation.sh
+
+# The rules are NOT removed on stop, the same choice both siblings made: a
+# stopped fence must never silently re-open egress for a container that may
+# still be running. Removing them is a manual, deliberate act.
+
+[Install]
+WantedBy=multi-user.target

@@ -105,11 +105,48 @@ session, so you sitting at the physical keyboard would have read as detached.
 watches this service, and a sleeping dev PC is the normal case. Conflating them
 would make the monitor red every night and train you to ignore it.
 
-## Known gap
+## Known gap — CLOSED
 
 SR-044 requires a request for a local model on a cold box to be **held** and to
 fall back rather than error. The gateway is a third-party binary and cannot host
-that logic, so the hold belongs in a small OpenAI-compatible shim in front of
-the dev PC, which the gateway's custom endpoint points at instead of pointing at
-the dev PC directly. **That shim is not built yet** and its test is skipped with
-that reason rather than passing quietly.
+that logic, so the hold belongs in a shim in front of the dev PC.
+
+**That shim is built**: `stack/litellm/devpc_hold_hook.py`, a LiteLLM
+`CustomLogger` whose `decide_hold()` is a pure function over this service's
+`/state`. Read its header before changing any error string — the gateway
+classifies retryability by **substring-matching the message**, so `"503"` and
+`"unavailable"` are load-bearing and `TC-1025` asserts them.
+
+## Known defects
+
+**`/sleep-verdict` throws on every call.** In `devpc_wake_service.py`:
+
+```python
+Handler.session_reader = lambda: read_session(cfg.session_url, cfg.probe_timeout)
+```
+
+That assigns a plain function as a **class attribute**, so `self.session_reader()`
+binds it as a method and passes `self` — giving
+`TypeError: <lambda>() takes 0 positional arguments but 1 was given`. It needs
+`staticmethod(...)`. Confirmed live on the hub 2026-09-19.
+
+It is not currently breaking anything: nothing polls that endpoint yet, and with
+`DEVPC_SESSION_URL` empty the verdict fail-closes to "attached" regardless. It
+**is** a prerequisite for the dev-PC sleep agent, so it is Phase 0.1 of the
+lifecycle plan (in the `HomeHub` repo,
+`docs/DEVPC_INFERENCE_STATE_AND_LIFECYCLE_PLAN_2026-09-19.md`).
+
+## Deployment status, 2026-09-19
+
+Enabled and running on the hub: `DEVPC_WAKE_ENABLED=true`,
+`homehub-devpc-wake.service` enabled and active, serving on `:8799`. `/health`
+answers, `POST /wake` fires the magic packet, and the state machine settles
+`waking → failed → off` when nothing answers.
+
+Both the knob and `systemctl enable` were required — `firstboot.sh` **disables**
+the unit whenever the knob is not `true`, so a hand-start alone would not have
+survived a reboot.
+
+**The physical S3/S5 wake is still unproven**, and §"The wake path is unverified"
+above still governs. `DEVPC_WAKE_URL` is deliberately still empty, so the hold
+hook does not yet consult this service.

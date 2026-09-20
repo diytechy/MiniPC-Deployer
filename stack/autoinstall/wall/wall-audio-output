@@ -1653,12 +1653,27 @@ def apply_builtin_capture_controls(wanted, mic_values, builtin, applier):
     is the hardware half of the Owner's input-mute privacy property.
     """
     # THE CAPTURE SIDE. Item 23 D4 puts the PANEL's own microphone on the mic
-    # input in Speaker position, and that microphone was found CLIPPING at the
-    # level it had been left at -- peak 32768, -15.2 dBFS RMS, at capture 62 %
-    # with +12 dB of boost. The seeded knob is the level measured on the panel
-    # after the AEC run had lowered it live (24 %, -6.00 dB, boost 0), and it is
-    # re-asserted on every apply rather than trusted to alsactl, because a level
-    # that clips is not a preference somebody might have meant.
+    # input in Speaker position, and the seeded knob is the level measured on
+    # the panel: 62 %, +12.00 dB, boost 0. It is re-asserted on every apply
+    # rather than trusted to alsactl, because this number is a measurement and
+    # not a preference somebody might have meant.
+    #
+    # IT WAS 24 % UNTIL 2026-09-19, ON A CLIPPING REPORT THAT COULD NOT BE
+    # REPRODUCED. 24 % reads -87.4 dBFS and again -79.9 dBFS (peak 41 of 32768)
+    # at mic_clean -- the converter's own noise, not a quiet room -- so every
+    # microphone consumer was faithfully carrying silence and three rounds of
+    # return-path testing read ABSENT in a way indistinguishable from a severed
+    # cable. The old note read '62 %, +12 dB boost', but +12 dB is not a value
+    # Internal Mic Boost can take (0, +10, +20, +30), so the capture level's own
+    # dB figure had been counted twice and its 32768 peak was taken somewhere
+    # ahead of the AEC that now owns this path. See wall.env.example.
+    #
+    # THIS IS ALSO WHY MOVING THE KNOB IS NOT ENOUGH ON A LIVE PANEL. `mic`
+    # rewrites audio-mic.env and the generated route; the hardware level is
+    # asserted HERE, on an apply. firstboot seeds audio-mic.env only when it is
+    # absent -- deliberately, so a level somebody arrived at by living with the
+    # panel is not discarded by a re-run -- so a shipped default change reaches
+    # an installed panel through `mic` plus `apply-state`, not through a deploy.
     #
     # `Capture Source` is NOT touched. It is an exclusive enum on this codec
     # (`Internal Mic` | `Headset Mic`, measured 2026-09-14) and it already reads

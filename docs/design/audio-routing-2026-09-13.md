@@ -870,26 +870,52 @@ the leg is forwarding, and an `alsaloop` holding the hardware locks it out.
 
 ### The Bluetooth half
 
-`bluealsa` gains `-p hfp-hf`, which makes the panel the phone's **hands-free
-unit** (its headset), which is what spec A asks for. Not `hfp-ag`, which is that
-relationship inverted. Review finding 4 is accepted and unchanged: HFP and A2DP
-are the same radio link at different times, so a call is mono at 8 or 16 kHz and
-suspends the music.
+> **AMENDED 2026-09-20. This section described step 4, when the panel could only
+> BE a headset. It now has all four profiles and can also HAVE one.** What
+> follows is the current shape; the standing document is HomeHub
+> `docs/FOLLOWUP_BLUETOOTH_ACCEPTANCE_2026-09-19d.md`.
 
-`wall-bt-mic.service` is a **supervisor, not a forwarder unit**, and that is
-forced: an SCO PCM exists only while a call is up and is named after the phone's
-address, so there is no device node for `BindsTo=` to bind to.
-`wall-bt-mic.py` polls BlueALSA's own D-Bus object tree for a `.../sco/sink`
-path and runs one `alsaloop` for exactly as long as one is there. Only a
-**sink** counts: `sco/source` is the far end's voice and `a2dp/sink` is music.
-Every failure to read answers "no call", because the failure direction that
-matters is a microphone that stays open.
+`bluealsa` runs `-p a2dp-sink -p a2dp-source -p hfp-hf -p hfp-ag`. The first
+pair is the panel as the thing you play INTO: `a2dp-sink` is music from a phone
+or a laptop, and `hfp-hf` makes the panel the gateway's **hands-free unit** (its
+headset), which is what spec A asks for. The second pair is the mirror image,
+added 2026-09-19 on the Owner's ruling: they let the panel play out to, and take
+a microphone from, a Bluetooth headset that IT connected to.
 
-**Not done here, on purpose.** The far end's voice does not reach the bus yet.
-That direction is `bluealsa-aplay --profile-sco`, a change to a unit carrying
-the room's music today, and it is flagged rather than switched on underneath a
-working panel. A phone paired before `hfp-hf` existed must reconnect before an
-endpoint appears; the leg finding nothing meanwhile is correct and quiet.
+**One adapter holds both roles and that is not a compromise.** Bluetooth
+negotiates per peer, so a laptop takes the panel's HF/sink side while a headset
+takes its AG/source side. Two simultaneous eSCO links were measured on this
+dongle on 2026-09-19, which is what makes a bridge possible at all.
+
+Review finding 4 is accepted and unchanged: HFP and A2DP are the same radio link
+at different times, so a call is mono at 8 or 16 kHz and suspends the music. That
+now cuts both ways — while the panel bridges a call to a headset, that headset
+hears the whole merged bus at narrowband, and its own A2DP leg is stopped for the
+duration.
+
+`wall-bt-call.service` (was `wall-bt-mic.service`) is a **supervisor, not a
+forwarder unit**, and that is forced: an SCO PCM exists only while a call is up
+and is named after the peer's address, so there is no device node for `BindsTo=`
+to bind to. It polls BlueALSA's own D-Bus object tree and runs up to four
+`alsaloop` children:
+
+1. the gateway's far end onto the merged `bus` (behind `WALL_BT_SCO_PLAYBACK`);
+2. `mic_selected` to the gateway;
+3. `bus_monitor` to the headset's AG-role SCO sink;
+4. the headset's microphone into `btmic_in`, which `mic_bt` snoops back out.
+
+Legs 1 and 2 are a **call**; all four are a **bridge**. Every failure to read
+answers "no call", because the failure direction that matters is a microphone
+that stays open, and the mute is re-checked on every tick for BOTH microphone
+directions rather than once per start.
+
+**Two things this section used to say, and why they changed.** The object path
+was `.../sco/sink`: BlueALSA v4 names that middle segment after the PROFILE, so
+it is `hfphf/sink` for the HF role and `hfpag/sink` for the AG one, and matching
+the old spelling meant the leg never started at all. And "the far end's voice
+does not reach the bus yet" — it does now, and the knob is on. A device paired
+before a profile existed keeps its old picture of the panel and must be
+re-paired before that profile's endpoint appears.
 
 ### The one place step 3's fallback and step 4's leg are exclusive
 
@@ -908,8 +934,8 @@ return is a different device and is unaffected either way.
 | `asound-bus-mode.conf` | changed | `usb_out_mix` (the shared 8-channel dmix), `speaker_hw8` through it, `mic_panel_raw`/`mic_panel` (explicit (L+R)/2), `mic_headset_raw`/`mic_headset`, `mic_selected` (the AEC seam), `mic_rear`, and the mic file added to the one `@hooks` block |
 | `audio-mic.conf.example` | new | what the generated `pcm.mic_rear_route` looks like, and why the zeros are the point |
 | `wall-mic-rear.service` | new | `mic_selected` to the adapter's rear out, bound to the 5.1 adapter |
-| `wall-bt-mic.service`, `wall-bt-mic.py` | new | the HFP mic return and its bounded poll |
-| `wall-bluealsa-override.conf` | changed | `-p hfp-hf` alongside `-p a2dp-sink` |
+| `wall-bt-mic.service`, `wall-bt-mic.py` | new | the HFP mic return and its bounded poll. **Renamed `wall-bt-call.*` 2026-09-19** when it grew the far-end direction, and again extended to four legs by the bridge |
+| `wall-bluealsa-override.conf` | changed | `-p hfp-hf` alongside `-p a2dp-sink`. **All four profiles since 2026-09-19**; that file's own rationale is the current argument |
 | `wall_audio_state.py` | changed | `mic_source`, `mic_live`, `MIC_LEGS`, and `adapter_muted` becoming `not (speaker or mic)` |
 | `wall-audio-output` | changed | the `mic` subcommand and its generated pair, `select_mic_source`, `set_rear_level`'s read-modify-write, `rear_mic_possible`, `Applier.capture`, mic legs excluded from the failure count |
 | `wall-audio-mode` | changed | the two mic legs join the stop list, the never-enable list and the IPC sweep |

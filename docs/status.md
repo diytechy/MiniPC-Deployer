@@ -2439,10 +2439,70 @@ recoverable, and `fd4dab4` restores the author's Title and Detail verbatim while
 keeping the union of both symbol lists — the reconstruction had found six real
 symbols the originals missed.
 
-**Not deployed, and the Bluetooth half has never met a radio.** The acceptance
-plan is HomeHub
-`docs/PANEL_ACCEPTANCE_WSN024_AND_PANDORA_2026-09-19.md`; its §0 — save the
+**Not deployed, and the Bluetooth half has never met a radio** *(when written;
+it deployed the next afternoon and the dual role followed on 2026-09-20 -- see
+the entry below).* The acceptance plan was HomeHub
+`docs/PANEL_ACCEPTANCE_WSN024_AND_PANDORA_2026-09-19.md`, now archived to
+`docs/archive/2026-09-20/`; its §0 — save the
 Pandora sign-in off the panel BEFORE deploying — is not optional, because that
 sign-in is the one thing in scope that cannot be rebuilt from a repository.
 Spine: **SR-023** (amended), **SR-046**, **IF-015** (amended), LLR-979..984,
 TC-1017..1022.
+
+---
+
+2026-09-20 (B3–B7, the dual Bluetooth mode, deployed): the Headset switch
+position became one that RESOLVES — a connected Bluetooth headset first, the USB
+adapter second, silence and the red icon when neither — per the Owner's ruling
+Q5 quoted verbatim in the spine. `wall_audio_state.headset_via` is the single
+spelling of that priority, and the output leg, the microphone source, the
+hardware mutes and the published state all read it; two spellings would put the
+room's music in one headset and somebody's voice in the other. Both of the
+position's legs are named in every plan, the loser explicitly false, because the
+applier stops what the plan says is false and an omitted leg keeps running.
+
+The Bluetooth leg is a unit of its own rather than the WSN-024 route leg the plan
+proposed: sharing it would give one unit two owners and one environment file two
+writers. It plays through a new `bt_headset_out` softvol carrying the same "Bus
+Playback Volume" control, so the rocker still works in that position.
+
+`mic_bt` is a third microphone source and is a LOOPBACK, not a BlueALSA PCM: an
+SCO capture cannot be wrapped in `plug` (`Poll FD initialization failed`,
+measured) and exists only while the link is up, named after the headset's
+address, so nothing downstream could open it by name.
+
+`wall-bt-call` grew from two legs to four and from one state to three — idle,
+call, bridge. A2DP and SCO are exclusive on one peer, so the bridge takes the
+headset's A2DP leg down behind a marker file the unit tests; a marker and not a
+match against the published JSON, because neither systemd's parser nor sh's can
+be trusted to keep a quoted fragment intact and a condition that silently matched
+nothing would start that leg under a live SCO link.
+
+**Four defects worth recording.** Two adversarial Terra rounds found that the
+bridge opened the headset's microphone before consulting the mute; that the
+supervisor restarted the A2DP leg whenever a call ended, and "the call ended"
+says nothing about where the switch is; and that a call which merely CONTINUED
+aged out of the broker's staleness window with every leg still running. The
+panel's own paired list found the fourth: the office desktop advertises
+`Handsfree`, so "connected + trusted + advertises `hf`" would have made it the
+panel's own Bluetooth headset the moment it was trusted, routing the room's music
+into the PC under the desk. A UUID says what a device CAN do; the class of device
+says what it IS, and the rule now requires the Audio/Video major class.
+
+**And one component was retired the day it was built.** The "silence pump" fed
+`mic_bt` zeros on the belief that a loopback capture with no writer blocks.
+Measured three ways on the panel and it does not — snd-aloop's capture side
+free-runs silent. A component whose stated reason is false is worse than no
+component; a test now pins its absence and names what to measure before bringing
+it back.
+
+`pytest tests/`: **2411 passed, 30 skipped**. `trace.py` integrity 0, orphans
+unchanged at 25. Spine: **SR-025**, **SR-028**, **SR-029** amended and **SR-048**
+new; **LLR-013**, **LLR-014**, **LLR-017** amended and **LLR-020**, **LLR-021**
+new; **IF-015** amended; **TC-013**, **TC-014** extended.
+
+**Deployed** 2026-09-20 as `f9bbabc` with OfficeWallNaglight `adb4d34`, paired,
+`installed-verified-awaiting-visual-acceptance`, 95 files / 42 units / 66
+packages. Largely UNTESTED against real hardware — everything needing a Bluetooth
+headset in the room waits on HomeHub open-items **C75**. Standing document:
+HomeHub `docs/FOLLOWUP_BLUETOOTH_ACCEPTANCE_2026-09-19d.md`.

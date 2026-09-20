@@ -2828,3 +2828,112 @@ def test_the_desktop_leg_backs_off_instead_of_exhausting_its_start_limit_sr028()
     assert starts < burst, (
         f"{starts} starts fit inside the {window}s window but the limit is {burst}; "
         "a sleeping desktop would still kill this leg")
+
+
+# ---------------------------------------------------------------------------
+# A published object is not a call (2026-09-19)
+# ---------------------------------------------------------------------------
+#
+# This leg's SECOND defect, uncovered the moment the first was fixed. BlueALSA
+# v3 published an SCO PCM only while a call was running, so the object WAS the
+# answer and this file was built on that. v4 publishes the objects for every
+# supported profile the moment the device connects.
+#
+# Measured on the panel, with the dev PC as gateway: merely connected gives an
+# ACL and no eSCO, `Running false`, and a forwarder started against it dies in
+# seconds with `overrun for capture mic_selected` / `Poll FD initialization
+# failed` -- so the supervisor restarts it, forever, while `TX sco` stays 0.
+# With the gateway holding its hands-free microphone open, `Running` reads true
+# and the SAME argv carries audio: `TX sco` 0 -> 4999.
+
+
+def _tree_with(*paths):
+    return "\n".join(paths) + "\n"
+
+
+_CONNECTED = "/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink"
+_OTHER = "/org/bluealsa/hci0/dev_11_22_33_44_55_66/hfphf/sink"
+
+
+def _bus(tree, running):
+    """A fake busctl: the tree, then one Running answer per object path."""
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if "tree" in argv:
+            return _Reply(0, tree, "")
+        path = argv[argv.index("org.bluealsa") + 1]
+        return _Reply(0, "b true\n" if running.get(path) else "b false\n", "")
+
+    run.calls = calls
+    return run
+
+
+def test_a_connected_device_that_is_not_on_a_call_starts_no_leg_sr029(btmic):
+    """The exact shipped state that flapped: object present, transport not."""
+    run = _bus(_tree_with(_CONNECTED), {_CONNECTED: False})
+    assert btmic.read_sinks(run=run) == []
+
+
+def test_an_acquired_transport_is_a_call_sr029(btmic):
+    run = _bus(_tree_with(_CONNECTED), {_CONNECTED: True})
+    assert btmic.read_sinks(run=run) == ["AA:BB:CC:DD:EE:FF"]
+
+
+def test_only_the_device_actually_on_a_call_is_offered_sr029(btmic):
+    """Two connected gateways, one on a call. Picking the other one would
+    point the microphone at a device that cannot carry it."""
+    run = _bus(_tree_with(_OTHER, _CONNECTED), {_CONNECTED: True, _OTHER: False})
+    assert btmic.read_sinks(run=run) == ["AA:BB:CC:DD:EE:FF"]
+
+
+def test_an_unreadable_running_property_is_no_call_sr029(btmic):
+    """Same direction as everything else here: the failure that matters is a
+    microphone that stays open, not one that does not."""
+    def explode(argv, **kwargs):
+        if "tree" in argv:
+            return _Reply(0, _tree_with(_CONNECTED), "")
+        raise OSError("dbus is unhappy")
+
+    assert btmic.read_sinks(run=explode) == []
+
+    def refuse(argv, **kwargs):
+        if "tree" in argv:
+            return _Reply(0, _tree_with(_CONNECTED), "")
+        return _Reply(1, "", "no such object")
+
+    assert btmic.read_sinks(run=refuse) == []
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("b true\n", True), ("b true", True),
+    ("b false\n", False), ("", False), (None, False),
+    # Nothing clever: a property that did not answer exactly is not a call.
+    ("true", False), ("b TRUE", False), ("b true extra", False),
+])
+def test_the_running_property_is_read_strictly_sr029(btmic, text, expected):
+    assert btmic.parse_running(text) is expected
+
+
+def test_the_property_is_asked_of_the_pcm_interface_sr029(btmic):
+    """Pinned because a wrong interface name answers an error, which this file
+    turns into 'no call' -- a silent permanent regression to the bug above."""
+    run = _bus(_tree_with(_CONNECTED), {_CONNECTED: True})
+    btmic.read_sinks(run=run)
+    query = [argv for argv in run.calls if "get-property" in argv][0]
+    assert query[:3] == [btmic.BUSCTL, "--system", "get-property"]
+    assert "org.bluealsa" in query and _CONNECTED in query
+    assert "org.bluealsa.PCM1" in query and "Running" in query
+
+
+def test_the_shipped_rate_is_left_alone_sr029(btmic):
+    """THE RATE WAS NEVER THE FAULT and this pins it so nobody 'fixes' it.
+
+    The link negotiates CVSD at 8 kHz while the leg asks for 16 kHz, which
+    looks exactly like the cause and is not: with the transport acquired,
+    16000 and 8000 carried 3995 and 4000 bytes in twelve seconds. ALSA
+    converts. The fault was starting the leg with no transport at all.
+    """
+    argv = btmic.loop_argv("AA:BB:CC:DD:EE:FF")
+    assert argv[argv.index("--rate") + 1] == "16000"

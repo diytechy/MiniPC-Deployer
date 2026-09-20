@@ -4,11 +4,19 @@
 WHY THIS IS A SUPERVISOR AND NOT AN alsaloop UNIT LIKE EVERY OTHER LEG. The
 other legs address a PCM that exists whenever its card is plugged in, so
 `BindsTo=` a udev device alias is enough to start and stop them. An HFP SCO PCM
-is not like that: it exists only while a CALL is up, it is named after the
+is not like that: it comes and goes with the CALL, it is named after the
 phone's Bluetooth address, and BlueZ has no device node for it. There is nothing
-for systemd to bind to. So this process watches BlueALSA's own D-Bus object tree
-and runs exactly one alsaloop for exactly as long as there is a sink to run it
-into.
+for systemd to bind to. So this process watches BlueALSA's own D-Bus objects and
+runs exactly one alsaloop for exactly as long as a call is up.
+
+AND "A CALL IS UP" IS A PROPERTY, NOT THE PRESENCE OF AN OBJECT. That is the
+one thing this file got wrong for the whole of its first life. BlueALSA v3
+published an SCO PCM only while a call was running, so the object WAS the
+answer; v4 publishes the objects for every supported profile the moment the
+device connects, and `org.bluealsa.PCM1.Running` is what now separates
+'connected' from 'on a call'. Starting a forwarder against an unacquired
+transport does not fail cleanly -- it overruns the capture, dies, and gets
+restarted forever. See `sink_is_running`.
 
 WHAT THE PANEL IS IN THIS LINK. `hfp-hf` -- the panel is the phone's Hands-Free
 unit, i.e. the headset. Item 23 A: "Bluetooth connects as headset mic input and
@@ -103,6 +111,19 @@ def log(message):
     """One line to the journal. stderr, so systemd stamps the unit identity."""
     sys.stderr.write("%s\n" % message)
     sys.stderr.flush()
+
+
+def sco_object_paths(text):
+    """Every HF-role SCO playback OBJECT in a `busctl tree` dump, path and all.
+
+    Paths rather than addresses, because the caller has to ask each one a
+    second question -- see `read_sinks`. Sorted for the same reason
+    `parse_sco_sinks` sorts: the choice below must not change between polls.
+    """
+    found = {}
+    for match in SCO_SINK.finditer(text or ""):
+        found[match.group(0)] = match.group("dev").replace("_", ":").upper()
+    return sorted(found.items())
 
 
 def parse_sco_sinks(text):
@@ -203,13 +224,66 @@ def loop_argv(address):
             "--tlatency", "50000", "--sync", "5"]
 
 
+def parse_running(text):
+    """`busctl get-property ... Running` as a bool. Anything else is False.
+
+    The property is a plain variant, so the answer is the literal line `b true`
+    or `b false`. Unparseable is False for the reason everything in this file
+    fails toward False: the failure that matters is a microphone that stays
+    open.
+    """
+    return (text or "").strip() == "b true"
+
+
+def sink_is_running(path, run=subprocess.run):
+    """Whether this SCO PCM has its transport ACQUIRED -- i.e. a call is up.
+
+    THE OBJECT EXISTING IS NOT A CALL, AND ASSUMING IT WAS IS WHY THIS LEG
+    FLAPPED (measured 2026-09-19). Under BlueALSA v3 an SCO PCM appeared only
+    for the duration of a call, which is what this file's docstring still says
+    and what `read_sinks` was built on. Under v4 -- v4.1.1 is what the panel
+    runs -- the PCM objects for every supported profile are published as soon
+    as the device CONNECTS, and `Running` is what separates the two.
+    
+    Measured, with the panel as the hands-free unit and the dev PC as gateway:
+    merely connected gives `hcitool con` with an ACL and no eSCO, `Running
+    false`, and an alsaloop started against it dies in seconds with `overrun
+    for capture mic_selected` then `Poll FD initialization failed` -- so the
+    supervisor restarted it, forever, while `TX sco` stayed 0. With the gateway
+    holding its hands-free microphone open there is an eSCO link, `Running`
+    reads true, and the SAME alsaloop argv carries audio: `TX sco` 0 -> 4999 in
+    fifteen seconds, the first microphone bytes this panel has ever sent.
+    
+    THE RATE WAS NEVER THE FAULT, which is worth writing down because it looks
+    like it should have been. The link negotiates CVSD at 8 kHz and the leg
+    asks for 16 kHz; with SCO up, 16000 and 8000 carry identically (3995 and
+    4000 bytes in twelve seconds). ALSA converts. Do not "fix" the rate.
+    """
+    try:
+        done = run([BUSCTL, "--system", "get-property", "org.bluealsa", path,
+                    "org.bluealsa.PCM1", "Running"],
+                   check=False, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("bluealsa PCM %s unreadable (%s): treated as no call" % (path, exc))
+        return False
+    if done.returncode != 0:
+        return False
+    return parse_running(done.stdout)
+
+
 def read_sinks(run=subprocess.run):
-    """Ask BlueALSA what SCO sinks exist. [] on any failure, never an exception.
+    """Every address whose SCO sink is RUNNING. [] on any failure, never raises.
 
     A BlueALSA that is not running, a busctl that is missing, a D-Bus that is
     slow: all of them mean "no call is up", which is the safe answer, because
     the failure direction that matters is a microphone that stays open, not one
     that does not.
+
+    TWO QUESTIONS, NOT ONE, and the second is the one that was missing. The
+    tree says which SCO sinks EXIST; `sink_is_running` says which of them have
+    a transport. See `sink_is_running` for what it cost to leave that out. One
+    extra busctl call per candidate, and there is normally either no candidate
+    or one.
     """
     try:
         done = run([BUSCTL, "--system", "tree", "org.bluealsa"],
@@ -219,7 +293,8 @@ def read_sinks(run=subprocess.run):
         return []
     if done.returncode != 0:
         return []
-    return parse_sco_sinks(done.stdout)
+    return sorted({address for path, address in sco_object_paths(done.stdout)
+                   if sink_is_running(path, run=run)})
 
 
 class Leg:
@@ -276,9 +351,9 @@ def preferred_input(path=ROUTE_PATH):
     WSN-024 gave `select_input` to the panel, and this is where that choice
     lands: the applier writes the route document and this supervisor reads it.
     It is a PREFERENCE and not a command -- the leg still only runs against a
-    device that actually has an SCO sink up -- because an HFP PCM exists only
-    while a call is up, and a selection that could point the leg at a phone
-    that is not on a call would just stop the microphone working.
+    device whose SCO transport is actually ACQUIRED (`sink_is_running`) --
+    because a selection that could point the leg at a phone that is not on a
+    call would just stop the microphone working.
 
     Missing, unreadable or malformed all mean "no preference", which is the
     behaviour that shipped before the route document existed.

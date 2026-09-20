@@ -433,6 +433,9 @@ def publish():
             # field beside the alias we were so careful about.
             "name": safe_name(info["name"], alias),
             "kind": bluetooth_state.classify(info["uuids"]),
+            # B2: the facts, beside the headline. See bluetooth_state for why
+            # both exist rather than one replacing the other.
+            "capabilities": bluetooth_state.capabilities(info["uuids"]),
             "trusted": bool(info["trusted"]),
             "connected": bool(info["connected"]),
         }

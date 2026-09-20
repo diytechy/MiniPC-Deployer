@@ -88,6 +88,31 @@ ALIAS_METHODS = frozenset({"pair", "trust", "connect", "disconnect", "forget",
 DEVICE_METHODS = ALIAS_METHODS | {"discover", "cancel", "set_discoverable"}
 
 
+# B2. The capability vocabulary, duplicated from bluetooth_state deliberately:
+# this module is the POLICY and must not import the observer's module to know
+# what a legal value is -- the applier does not import this one either, for the
+# same reason the alias length lives in both. The paired test asserts they
+# agree, which is the cheap half of the trade.
+CAPABILITIES = ("sink", "source", "hf", "ag")
+# WHICH CAPABILITY EACH ROUTE NEEDS, and this is the whole of B2's widening.
+#
+# `select_output` wants somewhere to PLAY, so the device must be able to
+# receive: a sink. `select_input` wants somewhere to LISTEN to, so the device
+# must be able to send -- and there are three ways to be able to send. A phone
+# playing music is a `source`; a phone on a call is an `ag` and its far end is
+# what arrives; a HEADSET is an `hf` and its microphone is what arrives.
+#
+# THE THIRD ONE IS THE POINT. A headset advertises sink and hf, so it is
+# headlined `output` and, before this, `select_input` refused it because its
+# kind was not `input`. That made "use my Bluetooth headset's microphone"
+# unexpressible, which is the residual `classify` used to document and B2
+# exists to close.
+ROUTE_CAPABILITIES = {
+    "select_output": ("sink",),
+    "select_input": ("source", "ag", "hf"),
+}
+
+
 class PolicyError(ValueError):
     """A request violates the fixed route/device policy."""
 
@@ -100,12 +125,22 @@ class Device:
     kind: str
     trusted: bool = False
     connected: bool = False
+    # B2. WHAT THE DEVICE CAN DO, as opposed to which column its card is in.
+    # A TUPLE because this dataclass is frozen and hashed elsewhere; a list
+    # field would make Device unhashable and the failure would surface
+    # somewhere unrelated. Defaults to empty so every existing construction --
+    # including the tests that build a Device by hand -- keeps working and
+    # simply has no capability to offer.
+    capabilities: tuple = ()
 
     def __post_init__(self):
         if not ALIAS.fullmatch(self.alias) or HARDWARE_ADDRESS.search(self.alias):
             raise PolicyError("invalid device alias")
         if self.kind not in {"input", "output"}:
             raise PolicyError("invalid device kind")
+        if not isinstance(self.capabilities, tuple) or \
+                not all(capability in CAPABILITIES for capability in self.capabilities):
+            raise PolicyError("invalid device capabilities")
 
 
 def validate_action(method: str, params: Mapping[str, object]) -> None:
@@ -264,9 +299,29 @@ def validate_inventory_action(
     device = matches[0]
     if method not in UNTRUSTED_METHODS and not device.trusted:
         raise PolicyError("device is not trusted")
-    expected_kind = {"select_input": "input", "select_output": "output"}.get(method)
-    if expected_kind and device.kind != expected_kind:
-        raise PolicyError("device kind does not match route")
+    # B2: the ROUTE GATE READS CAPABILITIES, not the headline kind.
+    #
+    # It used to compare `device.kind` against a fixed expectation, which is
+    # why a headset -- headlined `output` because it is mostly a thing you
+    # play to -- could never be selected as the microphone source. The check
+    # is not loosened by this: a device still has to be able to do the thing
+    # being asked of it, and now that is asked of the facts rather than of a
+    # summary that had to pick one.
+    #
+    # A DEVICE THAT DECLARES NOTHING IS STILL REFUSED. An empty capability set
+    # satisfies no route, which is the honest answer for a device advertising
+    # no audio UUID, and is the same answer the old check gave by a different
+    # argument. The fallback to `kind` below is for a document written by an
+    # applier that predates B2, where absent is "not stated" and not "none".
+    needed = ROUTE_CAPABILITIES.get(method)
+    if needed:
+        if device.capabilities:
+            if not any(capability in device.capabilities for capability in needed):
+                raise PolicyError("device cannot carry that route")
+        else:
+            expected_kind = {"select_input": "input", "select_output": "output"}[method]
+            if device.kind != expected_kind:
+                raise PolicyError("device kind does not match route")
 
 
 def choose_restored_route(

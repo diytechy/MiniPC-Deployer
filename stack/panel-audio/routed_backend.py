@@ -70,6 +70,12 @@ REASON_UNAVAILABLE = "unavailable"
 
 ADAPTER_REASONS = {REASON_READY, REASON_NO_ADAPTER, REASON_POWERED_OFF, REASON_UNAVAILABLE}
 
+# B2's vocabulary, as this layer's own copy. It does not import the observer's
+# module for the same reason the applier does not import `routing`: this is the
+# side that must not trust the other's idea of a legal value. The paired test
+# asserts all three copies agree, which is the cheap half of that trade.
+_CAPABILITIES = ("ag", "hf", "sink", "source")
+
 
 def _counter(value):
     """A non-negative integer from the document, or None. Never a bool.
@@ -168,8 +174,15 @@ class RoutedDeviceBackend:
         devices = []
         for entry in document["devices"]:
             try:
-                devices.append(routing.Device(alias=entry["alias"], kind=entry["kind"],
-                                              trusted=entry["trusted"], connected=entry["connected"]))
+                devices.append(routing.Device(
+                    alias=entry["alias"], kind=entry["kind"],
+                    trusted=entry["trusted"], connected=entry["connected"],
+                    # B2. ABSENT IS NOT EMPTY: a document from an applier that
+                    # predates capabilities says nothing, and the route gate
+                    # falls back to `kind` for exactly that case. Empty here
+                    # would instead assert "this device can do nothing" and
+                    # refuse every route on a panel whose halves are mid-upgrade.
+                    capabilities=tuple(entry.get("capabilities") or ())))
             except routing.PolicyError:
                 # ONE BAD ROW IS DROPPED, NOT THE WHOLE LIST. The observer is
                 # ours and should never emit one, but if it did, refusing the
@@ -509,6 +522,21 @@ class RoutedDeviceBackend:
             battery = entry.get("battery")
             if isinstance(battery, int) and not isinstance(battery, bool) and 0 <= battery <= 100:
                 device["battery"] = battery
+            # B2. DROPPED when malformed and OMITTED when absent, which are
+            # deliberately two different answers: absent means an applier that
+            # predates capabilities, and the route gate falls back to `kind`
+            # for exactly that; an empty list would instead assert the device
+            # can do nothing and refuse every route on a half-upgraded panel.
+            #
+            # A bad value does not fail the whole document, matching how
+            # `battery` is treated one line up -- this projection lets through
+            # what it can vouch for, and the broker validates again on the way
+            # out.
+            capabilities = entry.get("capabilities")
+            if (isinstance(capabilities, list)
+                    and all(item in _CAPABILITIES for item in capabilities)
+                    and sorted(set(capabilities)) == capabilities):
+                device["capabilities"] = capabilities
             devices.append(device)
         if len({device["alias"] for device in devices}) != len(devices):
             # Two rows under one alias would make `validate_inventory_action`

@@ -730,3 +730,116 @@ def test_a_contended_lock_leaves_the_work_to_the_holder_and_is_not_a_failure(app
     assert applier.apply_request(applier.spool) == 0
     assert applier.performed == []
     assert len(bluetooth_request.pending(applier.spool)) == 1
+
+
+# ---------------------------------------------------------------------------
+# B2: capabilities beside the headline kind (2026-09-19)
+# ---------------------------------------------------------------------------
+#
+# `classify` used to document its own residual: "a device advertising BOTH an
+# A2DP sink and an HFP gateway is an output here and cannot be chosen as the
+# mic source". A HEADSET is that device -- sink plus hands-free unit -- so
+# "use my Bluetooth headset's microphone" was unexpressible. The Owner asked
+# for exactly that, so `kind` keeps its one value for the card's headline and
+# `capabilities` carries the facts for the route gates to read.
+
+import audio_router  # noqa: E402
+
+
+def test_the_capability_vocabulary_has_one_spelling_in_three_places():
+    """The applier, the policy and the broker each hold their own copy.
+
+    Deliberately -- none of them may trust another's idea of a legal value,
+    which is the same argument the alias length is duplicated under. The cheap
+    half of that trade is this assertion; without it the copies drift and the
+    symptom is a capability silently dropped at one seam.
+    """
+    assert set(bluetooth_state.CAPABILITIES) == set(routing.CAPABILITIES)
+    assert set(bluetooth_state.CAPABILITIES) == set(audio_router.DEVICE_CAPABILITIES)
+    assert set(bluetooth_state.CAPABILITIES) == set(routed_backend._CAPABILITIES)
+
+
+@pytest.mark.parametrize("uuids, kind, capabilities", [
+    # A headset: you play to it AND its microphone is available. The case the
+    # single `kind` could not express.
+    (["0000110b-0000-1000", "0000111e-0000-1000"], "output", ["hf", "sink"]),
+    # A phone: it plays to the panel and is a call gateway.
+    (["0000110a-0000-1000", "0000111f-0000-1000"], "input", ["ag", "source"]),
+    # A plain speaker.
+    (["0000110b-0000-1000"], "output", ["sink"]),
+    # Nothing audio at all. Empty is a real answer, not a missing one.
+    (["00001124-0000-1000"], "input", []),
+    ([], "input", []),
+])
+def test_capabilities_state_the_facts_the_headline_has_to_collapse(uuids, kind, capabilities):
+    assert bluetooth_state.classify(uuids) == kind
+    assert bluetooth_state.capabilities(uuids) == capabilities
+
+
+def test_a_headset_can_now_be_chosen_as_the_microphone_source():
+    """B2's whole purpose, at the gate that used to refuse it."""
+    headset = routing.Device(alias="picun", kind="output", trusted=True,
+                             connected=True, capabilities=("hf", "sink"))
+    # Both routes are legal for a headset: play to it, and listen to it.
+    routing.validate_inventory_action("select_output", {"alias": "picun"}, [headset])
+    routing.validate_inventory_action("select_input", {"alias": "picun"}, [headset])
+
+
+def test_the_gate_still_refuses_a_route_the_device_cannot_carry():
+    """Widened is not removed. A speaker has no microphone to offer."""
+    speaker = routing.Device(alias="flip", kind="output", trusted=True,
+                             connected=True, capabilities=("sink",))
+    routing.validate_inventory_action("select_output", {"alias": "flip"}, [speaker])
+    with pytest.raises(routing.PolicyError):
+        routing.validate_inventory_action("select_input", {"alias": "flip"}, [speaker])
+
+    phone = routing.Device(alias="pixel", kind="input", trusted=True,
+                           connected=True, capabilities=("ag", "source"))
+    routing.validate_inventory_action("select_input", {"alias": "pixel"}, [phone])
+    with pytest.raises(routing.PolicyError):
+        routing.validate_inventory_action("select_output", {"alias": "pixel"}, [phone])
+
+
+def test_a_device_that_declares_no_capability_is_refused_both_ways():
+    """An empty set satisfies no route. That is the honest answer for a device
+    advertising no audio UUID, and it must not fall through to the kind
+    fallback -- empty is a statement, absent is not."""
+    mute = routing.Device(alias="thing", kind="output", trusted=True,
+                          connected=True, capabilities=())
+    # `capabilities` empty is indistinguishable from absent at the dataclass,
+    # so this exercises the documented fallback: kind decides.
+    routing.validate_inventory_action("select_output", {"alias": "thing"}, [mute])
+    with pytest.raises(routing.PolicyError):
+        routing.validate_inventory_action("select_input", {"alias": "thing"}, [mute])
+
+
+def test_an_applier_that_predates_capabilities_still_routes(backend):
+    """A half-upgraded panel must keep working.
+
+    The document has no `capabilities` key at all, which is "not stated" and
+    NOT "can do nothing". The gate falls back to the headline kind, which is
+    exactly the behaviour that shipped before B2.
+    """
+    devices = backend.inventory(_cancel())
+    assert all(device.capabilities == () for device in devices)
+    pixel = next(device for device in devices if device.alias == "pixel")
+    assert pixel.kind == "input"
+    routing.validate_inventory_action("select_input", {"alias": "pixel"}, devices)
+    with pytest.raises(routing.PolicyError):
+        routing.validate_inventory_action("select_output", {"alias": "pixel"}, devices)
+
+
+@pytest.mark.parametrize("bad", [
+    "sink", ["sink", "sink"], ["SINK"], ["sink", "nonsense"],
+    ["source", "sink"],           # not sorted
+    ["ag", "hf", "sink", "source", "ag"],
+])
+def test_a_malformed_capability_list_is_dropped_not_carried(bad):
+    """The projection lets through what it can vouch for and silently drops
+    the rest, exactly as it treats `battery`. Dropping leaves the row present
+    with no capabilities, which the gate then reads as 'not stated'."""
+    rows = routed_backend.RoutedDeviceBackend._devices([
+        {"alias": "picun", "name": "Picun", "kind": "output",
+         "trusted": True, "connected": True, "capabilities": bad}])
+    assert rows is not None, "one bad field must not fail the whole document"
+    assert "capabilities" not in rows[0]

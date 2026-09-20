@@ -171,6 +171,47 @@ def assign_aliases(devices, previous=None):
     return assigned
 
 
+# WHAT A DEVICE CAN DO, AS FOUR INDEPENDENT FACTS (B2, 2026-09-19).
+#
+# `kind` answers "which column does this card go in", which is a presentation
+# question and has to have one answer. These answer "may the panel ask this
+# device for X", which is a policy question and genuinely has more than one
+# answer for the same device -- a headset both sinks the room's audio and
+# sources a microphone, and collapsing that into one word is what stopped a
+# headset ever being the mic source.
+#
+# They are named for what the FAR END is, exactly as the UUID constants above
+# are, because the alternative -- naming them for the panel's side -- inverts
+# every time somebody reads it quickly.
+CAPABILITY_SINK = "sink"      # the far end can RECEIVE audio: a speaker, a headset
+CAPABILITY_SOURCE = "source"  # the far end can SEND audio: a phone playing music
+CAPABILITY_HF = "hf"          # the far end is a hands-free UNIT: a headset
+CAPABILITY_AG = "ag"          # the far end is a hands-free GATEWAY: a phone, a laptop
+CAPABILITIES = (CAPABILITY_SINK, CAPABILITY_SOURCE, CAPABILITY_HF, CAPABILITY_AG)
+
+
+def capabilities(uuids) -> list:
+    """Every capability the device advertises, sorted. Never raises.
+
+    SORTED because this reaches a document the renderer compares, and an
+    arbitrary order would make an unchanged device look changed on every
+    republish. Empty is a legitimate answer -- a device advertising no audio
+    UUID at all can be neither a source nor a sink -- and the route gates
+    refuse it on those grounds rather than on a guess.
+    """
+    prefixes = {str(uuid).lower()[:8] for uuid in uuids or ()}
+    found = []
+    if AUDIO_SINK_UUID in prefixes:
+        found.append(CAPABILITY_SINK)
+    if AUDIO_SOURCE_UUID in prefixes:
+        found.append(CAPABILITY_SOURCE)
+    if HANDSFREE_UNIT_UUID in prefixes:
+        found.append(CAPABILITY_HF)
+    if HANDSFREE_GATEWAY_UUID in prefixes:
+        found.append(CAPABILITY_AG)
+    return sorted(found)
+
+
 def classify(uuids) -> str:
     """The panel-relative kind of a device, from its service UUIDs.
 
@@ -181,11 +222,14 @@ def classify(uuids) -> str:
     it, so a sink wins: its microphone reaches the panel through the mic-source
     selection, which is `select_input` against a different device.
 
-    The residual, stated rather than discovered: a device advertising BOTH an
-    A2DP sink and an HFP gateway -- a car kit is the realistic one -- is an
-    output here and cannot be chosen as the mic source. Splitting `kind` into
-    two independent capabilities is the honest fix for that and is a protocol
-    change, not this one.
+    THAT RESIDUAL IS CLOSED NOW, and this function is no longer the whole
+    answer. `kind` remains exactly what it was -- the card's headline, one
+    value, chosen by the precedence below -- but `capabilities` beside it
+    carries the facts without collapsing them, and the route gates read that.
+    A headset is still headlined `output` and can now also be chosen as the
+    microphone source, which is what B2 was for. Do not widen the precedence
+    here to compensate: two places deciding the same thing differently is the
+    defect this pair exists to avoid.
     """
     prefixes = {str(uuid).lower()[:8] for uuid in uuids or ()}
     if AUDIO_SINK_UUID in prefixes or HANDSFREE_UNIT_UUID in prefixes:

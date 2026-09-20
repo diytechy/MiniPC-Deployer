@@ -153,6 +153,12 @@ def backend_answers_locally(backend: object, method: str | None) -> bool:
         return False
 
 
+# B2's vocabulary at the broker seam. Held here as well as in routing and in
+# bluetooth_state because this is the layer that decides what may reach the
+# RENDERER, and it does not get to trust the backend's own idea of the list.
+DEVICE_CAPABILITIES = ("ag", "hf", "sink", "source")
+
+
 class UnavailableBackend:
     """Safe image default until the real-panel feasibility gate is complete."""
 
@@ -859,7 +865,7 @@ class AudioBroker:
             raise BrokerError("unsafe_backend_result", "backend string exposes forbidden identity or audio")
 
     def _safe_device(self, value: object) -> None:
-        if not isinstance(value, dict) or set(value) - {"alias", "name", "kind", "trusted", "connected", "battery"}:
+        if not isinstance(value, dict) or set(value) - {"alias", "name", "kind", "trusted", "connected", "battery", "capabilities"}:
             raise BrokerError("unsafe_backend_result", "device fields are invalid")
         required = {"alias", "name", "kind", "trusted", "connected"}
         if not required <= set(value):
@@ -874,6 +880,19 @@ class AudioBroker:
         battery = value.get("battery")
         if battery is not None and (isinstance(battery, bool) or not isinstance(battery, int) or not 0 <= battery <= 100):
             raise BrokerError("unsafe_backend_result", "device battery is invalid")
+        # B2. OPTIONAL, because a backend that predates it says nothing and
+        # must keep working; but if it is there it is held to the vocabulary,
+        # unique, and sorted. Sorted is not fussiness: the renderer diffs this
+        # document, and an arbitrary order would make an unchanged device look
+        # changed on every republish.
+        capabilities = value.get("capabilities")
+        if capabilities is not None:
+            if not isinstance(capabilities, list) or len(capabilities) > 4:
+                raise BrokerError("unsafe_backend_result", "device capabilities are invalid")
+            if any(item not in DEVICE_CAPABILITIES for item in capabilities):
+                raise BrokerError("unsafe_backend_result", "device capabilities are invalid")
+            if sorted(set(capabilities)) != capabilities:
+                raise BrokerError("unsafe_backend_result", "device capabilities are invalid")
 
     def _safe_pairing(self, value: object) -> None:
         """Validate the pairing block. WSN-024, Owner 2026-09-19.

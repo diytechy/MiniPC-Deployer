@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""The Bluetooth half of item 23 spec C: the selected mic back to the phone.
+"""Every leg of a call the panel is carrying, and the state of that call.
+
+IT STARTED AS ONE DIRECTION and this docstring has been rewritten twice
+because of it. It began as the selected microphone back to a phone (item 23
+spec C); A3 added the far end onto the merged bus; B7 added the two legs that
+carry the whole thing out to a Bluetooth headset the panel is itself the
+gateway for. Four forwarders and three states now, which is why the file is
+named for the CALL rather than for the microphone.
 
 WHY THIS IS A SUPERVISOR AND NOT AN alsaloop UNIT LIKE EVERY OTHER LEG. The
 other legs address a PCM that exists whenever its card is plugged in, so
@@ -23,11 +30,25 @@ unit, i.e. the headset. Item 23 A: "Bluetooth connects as headset mic input and
 as speaker output". The panel's microphone is therefore what the far end of the
 call hears, and `bluealsa:DEV=<addr>,PROFILE=sco` PLAYBACK is where it goes.
 
-WHAT THIS DELIBERATELY DOES NOT DO. It does not carry the far end's voice back
-to the bus. That direction is `bluealsa-aplay --profile-sco` and it is a change
-to a unit that is carrying the room's music today, so it is a separate,
-flagged knob (WALL_BT_SCO_PLAYBACK in wall.env) and not something this step
-turns on underneath a working panel.
+AND `hfp-ag` TOWARD A HEADSET IT RESOLVED (B7). The same adapter holds both
+roles, because Bluetooth negotiates per peer: the laptop connects to the
+panel's hands-free unit and the headset connects to the panel's gateway. That
+is what makes a BRIDGE possible -- the panel on a call AND the Headset switch
+position resolving to a Bluetooth headset -- and it is the only arrangement in
+which this panel's own mute and echo canceller sit inside somebody's call.
+Two simultaneous eSCO links were measured on this adapter 2026-09-19.
+
+WHAT IT CARRIES, AND WHERE EACH LEG GOES:
+
+  1. the gateway's far end        -> `bus`      (behind WALL_BT_SCO_PLAYBACK)
+  2. `mic_selected`               -> the gateway
+  3. `bus_monitor`                -> the headset's gateway-role SCO sink
+  4. the headset's own microphone -> `btmic_in`, which `mic_bt` snoops
+
+Legs 1 and 2 are a CALL; all four are a BRIDGE. The far end lands on the bus
+rather than on an output so that it follows the Mute/Headset/Speaker switch
+like every other bus source -- which is also why the bridge depends on that
+knob: with it off, leg 3 would carry a bus with no far end on it.
 
 ACCEPTED, AND ITEM 23 REVIEW FINDING 4 SAYS SO: while a call is up the link is
 HFP, which is mono at 8 or 16 kHz, and A2DP is suspended. "Bluetooth speaker"
@@ -35,11 +56,14 @@ and "Bluetooth mic" are the same radio link at different times, not both at
 once. The Owner accepted that on 2026-09-13.
 
 Contract:
-  Inputs:  the BlueALSA D-Bus object tree (read with busctl), WALL_BT_MIC_*
-  Outputs: at most one alsaloop child at a time
-  Config:  WALL_BT_MIC_POLL_SECONDS, WALL_AUDIO_MIC_SOURCE (through ALSA)
-  Raises:  nothing; every failure is a journal line and another poll
-Implements: SR-029, LLR-017
+  Inputs:  the BlueALSA D-Bus object tree (read with busctl); the switch state;
+           the applier's published headset resolution and microphone selection
+  Outputs: up to four alsaloop children; /run/wall-panel/call-state.json (0644,
+           aliases only) and the bridge marker beside it
+  Config:  WALL_BT_MIC_POLL_SECONDS, WALL_BT_SCO_PLAYBACK
+  Raises:  nothing; every failure is a journal line, an answer of `idle`, and
+           another poll
+Implements: SR-029, SR-048, LLR-017, LLR-021
 """
 
 from __future__ import annotations

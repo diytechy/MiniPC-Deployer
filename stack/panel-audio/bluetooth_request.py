@@ -206,22 +206,75 @@ def pending(directory=DEFAULT_DIR):
     return found
 
 
-def write(seq, event, directory=DEFAULT_DIR, generation=None):
+class SequenceTaken(RequestError):
+    """`exclusive` was asked for and that sequence is already spooled.
+
+    Its own type because it is the one failure here a CALLER can fix, by
+    minting another sequence and trying again. Every other RequestError means
+    the request was malformed and retrying it would produce the same thing.
+    """
+
+
+def write(seq, event, directory=DEFAULT_DIR, generation=None, exclusive=False):
     """Spool one request atomically. Returns the path written.
 
     One rename into place, so the applier -- which runs the instant the
     directory stops being empty -- never reads half a request.
+
+    `exclusive` REFUSES TO CLOBBER AN EXISTING REQUEST (terra, 2026-09-19,
+    round 2). Two requests must never share a filename, and the filename is
+    the sequence. `os.replace` cannot say no, so two writers that arrive at
+    the same sequence silently keep ONE request while both callers are told
+    `accepted` -- a tap that did nothing, which is the whole family of defect
+    this file was audited for. It is opt-in rather than the default because
+    the applier's own tests deliberately rewrite a sequence to prove a replay
+    is refused DOWNSTREAM, and that is a different question from this one.
+
+    HOW TWO WRITERS ARRIVE AT ONE SEQUENCE, given the clock is microseconds.
+    Every mutation runs in its own spawned child, so `RoutedDeviceBackend`'s
+    in-process guard cannot see across them, and the remaining floors are
+    read-then-write rather than a reservation. Two children that both clamp up
+    to the same floor -- which is what happens when the clock has stepped
+    backwards below the applier's mark -- compute the same sequence. Narrow,
+    and cheaper to make impossible than to reason about again later.
+
+    The temporary carries the PID as well, or the two writers would collide on
+    that instead and one would fsync a file the other had already linked away.
+    `pending` still skips it: the stem is not all digits.
     """
     payload = json.dumps(envelope(seq, event, generation), sort_keys=True) + "\n"
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / request_name(seq)
-    # The temporary is a sibling, so the rename is within one filesystem, and it
-    # is named so `pending` skips it: a `.json.new` has a non-numeric stem.
-    temporary = path.with_name(path.name + ".new")
-    with open(temporary, "w", encoding="utf-8") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    # The temporary is a sibling, so the link/rename is within one filesystem.
+    temporary = path.with_name("%s.%d.new" % (path.name, os.getpid()))
+    # THE CLEANUP COVERS THE WRITE, NOT ONLY THE LINK (terra, 2026-09-19,
+    # round 3). A full disk, a revoked mount or an fsync error leaves a
+    # partial temporary behind, and while `pending` skips it -- the stem is
+    # not all digits -- the applier's spool is not a scratch space and this
+    # would leak one file per failure, in a tmpfs, on a panel nobody logs in
+    # to. The caller still gets its `backend_failure`; this is only about what
+    # is left on disk when it does.
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if exclusive:
+            # `os.link` is atomic AND refuses an existing target, which
+            # `os.replace` is not and does not. Both halves are needed: the
+            # applier may read this directory at any moment.
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                raise SequenceTaken("sequence %d is already spooled" % seq)
+        else:
+            os.replace(temporary, path)
+    finally:
+        # The link leaves the temporary behind; the replace consumed it. Either
+        # way nothing that is not a request may stay in the applier's spool.
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
     return path

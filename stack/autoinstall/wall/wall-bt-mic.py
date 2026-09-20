@@ -60,11 +60,37 @@ GUARD = "/usr/local/lib/wall-panel/wall-alsaloop-guard.py"
 MIC_PCM = "mic_selected"
 MODE_FILE = "/etc/wall-panel/audio-mode"
 
-# /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/sink -- the object path BlueALSA
-# publishes for the playback half of an HFP link. `source` is the other half
-# (the far end's voice) and is deliberately not used here.
+# /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink -- the object path
+# BlueALSA publishes for the playback half of an HFP link the panel is the
+# HANDS-FREE unit of. `source` is the other half (the far end's voice) and is
+# deliberately not used here; that direction is A3's.
+#
+# THE PROFILE SEGMENT IS `hfphf`, NOT `sco`, AND THIS SHIPPED MATCHING `sco`
+# (measured 2026-09-19). BlueALSA v3 named the middle segment after the
+# TRANSPORT; v4 -- v4.1.1 is what the panel runs -- names it after the PROFILE,
+# so a real tree reads:
+#
+#   /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsnk/source
+#   /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink
+#   /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/source
+#
+# The old pattern matched none of it, so the supervisor never started a loop --
+# and "no SCO sink" is its deliberate quiet answer, so it never said so either.
+# `hciconfig` is the proof it had been silent all along: RX sco 239690, TX sco
+# 0. The panel had received call audio and never sent one byte of microphone.
+# The test could not catch it because the fixture was an INVENTED `sco/sink`
+# string rather than a captured tree; the fixture is now a real one.
+#
+# `sco` is still accepted so a v3 BlueALSA is not broken by the fix. `hfpag` is
+# NOT: on an AG link the sink is what the panel plays TO a headset, and sending
+# the panel's microphone there would be a different leg pointed the wrong way.
+# Goal 2 adds it deliberately or not at all.
+#
+# The PCM NAME is unaffected and was verified on the panel rather than assumed:
+# `bluealsa:DEV=<addr>,PROFILE=sco` still resolves, and the plugin logs that it
+# opened `.../hfphf/sink`. v4 accepts only `a2dp` and `sco` there.
 SCO_SINK = re.compile(
-    r"/org/bluealsa/(?P<hci>hci\d+)/dev_(?P<dev>[0-9A-Fa-f_]{17})/sco/sink\b")
+    r"/org/bluealsa/(?P<hci>hci\d+)/dev_(?P<dev>[0-9A-Fa-f_]{17})/(?:sco|hfphf)/sink\b")
 
 DEFAULT_POLL_SECONDS = 5.0
 # A poll that is cheap enough to be frequent and slow enough not to matter: the

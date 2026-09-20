@@ -112,6 +112,44 @@ class RoutedDeviceBackend:
         self._seq_lock = threading.Lock()
         self._last_seq = -1
 
+    # ---- surviving `spawn` ------------------------------------------------
+
+    # THIS BACKEND IS PICKLED ON EVERY MUTATION, AND SHIPPED UNABLE TO BE
+    # (2026-09-19). `AudioBroker._mutation` calls `inventory()` first, that call
+    # is isolated, the isolation context is `spawn`, and `spawn` hands the child
+    # its work by pickling it -- backend object included. `_seq_lock` is a
+    # `threading.Lock`, a `_thread.lock` cannot be pickled, so `process.start()`
+    # raised a plain `TypeError` that `handle()`'s `except Exception` turned
+    # into `backend_failure`. EVERY mutation the broker accepts died there:
+    # Bluetooth's `discover`, `pair`, `trust`, `forget`, `set_discoverable` --
+    # and, because this backend WRAPS the switch one, the panel's own
+    # Mute/Headset/Speaker switch and its volume too. `status` and `telemetry`
+    # are in LOCAL_ONLY_METHODS and never pickle anything, so the pane went on
+    # rendering correct live state while every button on it was dead. That is
+    # indistinguishable from a panel whose touch has stopped, and it was first
+    # reported as exactly that.
+    #
+    # The lock is dropped and re-created rather than made lazy because a lazy
+    # lock is a second way to get this wrong: a `None` that must be checked at
+    # every use, in a method whose whole job is to be atomic.
+    #
+    # WHAT THE CHILD MUST NOT BE GIVEN IS A CLAIM, and `_last_seq` is one. See
+    # `_next_seq` for why it is deliberately NOT carried across.
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        del state["_seq_lock"]
+        # Not carried: a child sees one call and then exits, so the value it
+        # would inherit can only go stale, and a stale high-water mark read as
+        # authoritative is worse than no mark at all. `_next_seq` reads the
+        # spool instead, which is the same fact and is shared.
+        state["_last_seq"] = -1
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._seq_lock = threading.Lock()
+
     # ---- the Backend protocol -------------------------------------------
 
     def inventory(self, cancel: threading.Event) -> list:
@@ -227,20 +265,45 @@ class RoutedDeviceBackend:
         # request if it was absent -- so it stops here rather than travelling.
         return {"kind": method, "alias": params["alias"]}
 
+    # How many sequences to walk past before giving up. The collision it exists
+    # for needs two children to clamp to the same floor in the same instant, so
+    # one retry would almost always do; the bound is here because a LOOP in the
+    # verb path must terminate on its own rather than on the argument that it
+    # cannot happen twice. Small enough that a spool somebody has filled with
+    # junk named like requests refuses quickly instead of spinning.
+    MAX_SEQ_ATTEMPTS = 8
+
     def _submit(self, event: dict) -> dict:
         document = self._document()
-        seq = self._next_seq(document)
-        try:
-            bluetooth_request.write(seq, event, self.request_dir,
-                                    None if document is None else document["generation"])
-        except bluetooth_request.RequestError as error:
-            # A request this module built and this module refused is a bug in
-            # `_event`, not a transient. It is still not allowed to carry its
-            # message out: `backend_failure`'s text is fixed at the seam.
-            raise _broker_error("backend_failure", str(error))
-        except OSError:
-            raise _broker_error("backend_failure", "could not write the device request")
-        return {"accepted": True, "seq": seq}
+        generation = None if document is None else document["generation"]
+        # THE FLOOR IS READ-THEN-WRITE, SO THE WRITE IS WHAT RESERVES (terra,
+        # 2026-09-19, round 2). Every mutation is a separate spawned child, so
+        # nothing in this process can hold a sequence between choosing it and
+        # writing it, and two children that clamp to the same floor would
+        # otherwise have one request silently overwrite the other while both
+        # callers were told `accepted`. `exclusive=True` makes the filesystem
+        # the arbiter -- the loser is told so and takes the next sequence.
+        for _ in range(self.MAX_SEQ_ATTEMPTS):
+            seq = self._next_seq(document)
+            try:
+                bluetooth_request.write(seq, event, self.request_dir, generation,
+                                        exclusive=True)
+            except bluetooth_request.SequenceTaken:
+                # `_next_seq` re-reads the spool, so the sequence just lost is
+                # now a floor and the next attempt cannot choose it again.
+                continue
+            except bluetooth_request.RequestError as error:
+                # A request this module built and this module refused is a bug
+                # in `_event`, not a transient. It is still not allowed to
+                # carry its message out: `backend_failure`'s text is fixed at
+                # the seam.
+                raise _broker_error("backend_failure", str(error))
+            except OSError:
+                raise _broker_error("backend_failure", "could not write the device request")
+            return {"accepted": True, "seq": seq}
+        # REFUSED, NOT ACCEPTED-AND-DROPPED. The one answer this whole path
+        # exists to avoid is telling the person a tap landed when it did not.
+        raise _broker_error("backend_failure", "could not reserve a request sequence")
 
     def _next_seq(self, document=None) -> int:
         """A sequence above every one this process has minted AND above the
@@ -255,16 +318,86 @@ class RoutedDeviceBackend:
         the applier persisted in /run and every request is discarded as old, in
         silence, while `_submit` goes on returning accepted. `switch_backend`
         documents this exact guard; this one merely referred to it.
+
+        AND `_last_seq` ALONE STOPPED BEING THE FIRST HALF THE DAY MUTATIONS
+        WERE ISOLATED. Every mutation runs in a spawned child holding a COPY of
+        this object (see `__getstate__`), so the parent's counter never advances
+        and two children cannot see each other's. The in-process counter is kept
+        because the in-process seam is real -- white-box tests use it, and a
+        backend that declared a mutation local would use it too -- but the
+        cross-process fact has to come from somewhere both children can read.
+        That is the SPOOL: a request file is named after its sequence, so
+        reusing a sequence whose file is still there does not race, it silently
+        OVERWRITES a request the applier has not drained yet. Reading the
+        directory costs one `iterdir` on a path this method is about to write
+        to anyway.
+
+        AND THE SPOOL ALONE HAS A HOLE, WHICH THE DOCUMENT DOES NOT COVER
+        (terra, 2026-09-19). `wall-bluetooth-device` calls `remember(seq)` and
+        unlinks the spool file BEFORE performing the action -- deliberately, so
+        a crash mid-pairing cannot replay it -- and only republishes the
+        document when the action finishes. A `pair` takes up to forty seconds.
+        For that whole window the spool is empty and `document["requestSeq"]`
+        still names the request before it, so neither of the two floors above
+        knows about the sequence the applier has already committed to. A clock
+        that steps backwards in that window -- NTP correcting a dead RTC, which
+        is the ordinary way it happens on this box -- mints a sequence at or
+        below it, `_submit` answers `accepted`, and the applier discards the
+        request in silence.
+        `mark.json` is that committed value, written before the action and
+        world-readable, so reading it closes the window rather than narrowing
+        it.
         """
         mark = None if document is None else document["requestSeq"]
+        floors = [mark, self._highest_spooled(), self._applier_mark()]
         with self._seq_lock:
             seq = bluetooth_request.next_seq(self.clock)
             if seq <= self._last_seq:
                 seq = self._last_seq + 1
-            if mark is not None and seq <= mark:
-                seq = mark + 1
+            for floor in floors:
+                if floor is not None and seq <= floor:
+                    seq = floor + 1
             self._last_seq = seq
             return seq
+
+    def _applier_mark(self):
+        """The sequence the applier has already committed to, or None.
+
+        Read from the applier's own `mark.json` rather than from the document,
+        because the document lags it by the length of the action. Derived from
+        `state_path` rather than configured separately: the two files are
+        written by the same process into the same runtime directory, and a
+        second knob would be a second thing to point at the wrong tree in a
+        test that then proves nothing.
+
+        NEVER RAISES and never guesses. A file that is missing (nothing has
+        been applied since boot), unreadable, torn, or carrying a value that is
+        not a plain non-negative integer answers None -- this is a floor to be
+        raised past, and an invented one is a claim. `bool` is excluded for the
+        reason `_counter` gives: `isinstance(True, int)` is True, and a mark of
+        `true` would become the floor 1 and hold nothing back.
+        """
+        try:
+            with open(self.state_path.parent / "mark.json", "r", encoding="utf-8") as handle:
+                value = json.load(handle).get("requestSeq")
+        except (OSError, ValueError, AttributeError):
+            return None
+        return _counter(value)
+
+    def _highest_spooled(self):
+        """The largest sequence still waiting in the spool, or None.
+
+        NEVER RAISES, and an unreadable spool answers None rather than zero:
+        this is a floor to be raised past, and inventing one from a directory
+        that could not be read would be a claim. `bluetooth_request.pending`
+        already ignores anything whose stem is not digits, so the int() is safe
+        on every name it returns.
+        """
+        try:
+            names = [int(path.stem) for path in bluetooth_request.pending(self.request_dir)]
+        except (OSError, ValueError):
+            return None
+        return max(names) if names else None
 
     def _require_applier(self) -> None:
         if not self.applier_path.exists():

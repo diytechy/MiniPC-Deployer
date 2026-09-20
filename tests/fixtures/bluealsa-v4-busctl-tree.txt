@@ -1,0 +1,36 @@
+CAPTURED, NOT WRITTEN. `busctl tree org.bluealsa` on the office wall panel,
+2026-09-19, BlueALSA v4.1.1 started as `bluealsa -S -p a2dp-sink -p hfp-hf`,
+with the dev PC connected as a gateway.
+
+This file exists because the test that was supposed to pin the object path fed
+the parser an INVENTED `sco/sink` string -- the same spelling the parser was
+written against -- so it agreed with itself and could not fail. v4 names the
+middle segment after the PROFILE (`hfphf`, `a2dpsnk`), not the transport, and
+the shipped regex matched nothing on a real panel for as long as it shipped.
+
+The address below is the dev PC's and is replaced with a documentation value;
+the SHAPE is what is under test and the shape is verbatim.
+
+└─ /org
+  ├─ /org/bluealsa
+  │ └─ /org/bluealsa/hci0
+  │   └─ /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF
+  │     ├─ /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsnk
+  │     │ └─ /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsnk/source
+  │     ├─ /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf
+  │     │ ├─ /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink
+  │     │ └─ /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/source
+  │     └─ /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/rfcomm
+  └─ /org/bluez
+    ├─ /org/bluez/HFP
+    │ └─ /org/bluez/HFP/HandsFree
+    └─ /org/bluez/hci0
+      ├─ /org/bluez/hci0/A2DP
+      │ └─ /org/bluez/hci0/A2DP/SBC
+      │   └─ /org/bluez/hci0/A2DP/SBC/sink
+      │     ├─ /org/bluez/hci0/A2DP/SBC/sink/1
+      │     ├─ /org/bluez/hci0/A2DP/SBC/sink/2
+      │     ├─ /org/bluez/hci0/A2DP/SBC/sink/3
+      │     └─ /org/bluez/hci0/A2DP/SBC/sink/4
+      └─ /org/bluez/hci0/battery
+        └─ /org/bluez/hci0/battery/dev_AA_BB_CC_DD_EE_FF

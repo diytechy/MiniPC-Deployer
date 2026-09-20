@@ -63,7 +63,7 @@ def test_the_default_panel_is_invisible_and_unpairable_at_rest():
     assert policy["discoverableAtRest"] is False
     assert policy["pairableAtRest"] is False
     assert policy["pairingWindowSeconds"] == 120
-    assert policy["agentCapability"] == "NoInputNoOutput"
+    assert policy["agentCapability"] == "DisplayYesNo"
     assert policy["alias"] == "wall-panel"
 
 
@@ -104,17 +104,41 @@ def test_advertising_a_panel_that_refuses_every_pairing_is_refused():
                 "WALL_BLUETOOTH_DISCOVERABLE_AT_REST": "true"})
 
 
-def test_the_agent_capability_defaults_to_the_window_scoped_one():
-    """NoInputNoOutput is the default and IS accepted, which reverses an earlier
-    refusal. It produces silent Just Works pairing, and that is safe here only
-    because the agent exists solely while a window is open -- outside one there
-    is no agent AND the adapter is not pairable. The consent is a person opening
-    the window, since the shell has no pairing UI to show a passkey in.
-    DisplayYesNo stays selectable for when it does."""
-    assert render({})["agentCapability"] == "NoInputNoOutput"
-    assert render({"WALL_BLUETOOTH_AGENT_CAPABILITY": "DisplayYesNo"})["agentCapability"] == "DisplayYesNo"
+def test_the_agent_capability_defaults_to_the_authenticated_one():
+    """DisplayYesNo since 2026-09-19, and the reversal has a measurement behind it.
+
+    The default was NoInputNoOutput, on the argument that the pairing WINDOW is
+    the consent -- the agent exists only while one is open, outside it the
+    adapter is neither pairable nor discoverable. That still holds and the
+    window has not changed. What it could not give is authentication of the
+    PEER: NoInputNoOutput is Just Works, and the bond measured from the dev PC
+    came back `ConfirmOnly` with `protection: None`. The comment that shipped
+    it named its own exit condition -- a pairing UI to display a number in --
+    and WSN-024 built one. Owner ruling 2026-09-19.
+
+    NoInputNoOutput stays SELECTABLE. A panel with no glass, or a device that
+    cannot do numeric comparison, still needs it, and refusing it outright is
+    the mistake an even earlier revision made and reversed.
+    """
+    assert render({})["agentCapability"] == "DisplayYesNo"
+    assert render({"WALL_BLUETOOTH_AGENT_CAPABILITY": "NoInputNoOutput"})["agentCapability"] == "NoInputNoOutput"
     with pytest.raises(ValueError):
         render({"WALL_BLUETOOTH_AGENT_CAPABILITY": "Whatever"})
+
+
+def test_the_shipped_wall_env_and_the_code_default_agree_on_the_capability():
+    """Two files, one fact -- and they disagreed for the whole of WSN-024.
+
+    `wall.env.example` shipped NoInputNoOutput while the pane it was paired
+    with had been built to display a passkey, so the panel paired by Just
+    Works and nothing failed to say so. The renderer's default only ever
+    applies to a wall.env that omits the key, which makes a drift between the
+    two invisible on every panel that has one -- which is every panel.
+    """
+    example = (WALL / "wall.env.example").read_text(encoding="utf-8")
+    shipped = "WALL_BLUETOOTH_AGENT_CAPABILITY=%s" % render({})["agentCapability"]
+    assert any(line.strip() == shipped for line in example.splitlines()), (
+        "wall.env.example ships a capability the renderer would not default to")
 
 
 @pytest.mark.parametrize("window", ["29", "601", "0", "-120", "abc", ""])
@@ -265,7 +289,7 @@ def test_the_agent_is_the_real_one_and_gets_the_capability_and_window(monkeypatc
     # was opened for, with the subprocess perfectly alive throughout.
     assert argv[0].endswith("wall-bluetooth-agent"), argv
     assert "bluetoothctl" not in argv[0]
-    assert argv[argv.index("--capability") + 1] == "NoInputNoOutput"
+    assert argv[argv.index("--capability") + 1] == "DisplayYesNo"
     assert argv[argv.index("--timeout") + 1] == "90"
 
 

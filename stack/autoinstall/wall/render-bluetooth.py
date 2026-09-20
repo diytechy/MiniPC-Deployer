@@ -44,20 +44,39 @@ import sys
 
 # BlueZ agent capabilities.
 #
-# NoInputNoOutput IS THE DEFAULT, AND THE CONSENT LIVES SOMEWHERE ELSE. An
-# earlier revision refused this capability on the grounds that it produces
-# silent Just Works pairing -- true, and it was the right call while no agent
-# existed at all, because "pairable with no agent" means the adapter accepts
-# whoever asks, indefinitely, with nothing anywhere recording that it happened.
+# DisplayYesNo IS THE DEFAULT SINCE 2026-09-19, AND THE CONSENT IS NOW IN TWO
+# PLACES. It used to be NoInputNoOutput, on the argument that the consent lived
+# entirely in the pairing WINDOW: the agent exists only while the window is
+# open, outside it the adapter is neither pairable nor discoverable, and so a
+# person standing at the panel opening a bounded window on purpose was the
+# whole ceremony -- the same model as the pairing button on any speaker. That
+# argument was sound and it is still half the answer; the window has not
+# changed.
 #
-# What makes it safe now is that the agent EXISTS ONLY INSIDE THE PAIRING
-# WINDOW. wall-bluetooth-pairing starts it, the window closes, the agent exits,
-# and outside that window the adapter is neither pairable nor discoverable. The
-# consent is a person standing at the panel opening a bounded window on purpose
-# -- the same model as the pairing button on any speaker -- rather than a
-# passkey nobody can display, because this shell has no pairing UI to display
-# one in. Adding that UI is what would make DisplayYesNo meaningful, and it is
-# kept here for exactly that.
+# What it could not give was AUTHENTICATION of the peer. NoInputNoOutput means
+# Just Works: measured from the dev PC on 2026-09-19 the bond came back
+# `ConfirmOnly` with `protection: None`, so anything inside the window that
+# answered first was trusted, with no way for a person to tell which device
+# they had actually bonded to. The comment this replaces named its own exit
+# condition -- "Adding that UI is what would make DisplayYesNo meaningful" --
+# and WSN-024 added it. Owner ruling 2026-09-19: "we must show a pairing UI for
+# a device to become trusted."
+#
+# Both ends claiming display and yes/no selects Numeric Comparison instead of
+# Just Works, and the six digits reach the glass through
+# wall-bluetooth-agent's RequestConfirmation. BE PRECISE ABOUT WHAT THAT IS
+# WORTH: the agent ACCEPTS before anyone compares -- see its own comment for
+# why a blocking callback inside BlueZ's pairing timeout leaves half-paired
+# devices -- so this is not MITM protection, because nothing is asked and
+# nothing can refuse. It is a visible number to be checked and REJECTED after
+# the fact, which is what the Owner asked for and is strictly more than the
+# silent bond it replaces. Making the tap load-bearing is separate follow-up
+# work with its own risk.
+#
+# THE DEFAULT HERE MATTERS ONLY FOR A wall.env THAT OMITS THE KEY, which today
+# means one carried over from before this change. It is set to the same value
+# wall.env.example ships so the two cannot disagree, and the safer of the two
+# is the one an old file inherits.
 AGENT_CAPABILITIES = ("NoInputNoOutput", "DisplayYesNo", "DisplayOnly", "KeyboardDisplay")
 PAIRING_MODES = ("off", "window", "always")
 
@@ -97,7 +116,7 @@ def render(env):
     if not 30 <= window <= 600:
         raise ValueError("invalid-bluetooth-pairing-window")
 
-    capability = env.get("WALL_BLUETOOTH_AGENT_CAPABILITY", "NoInputNoOutput")
+    capability = env.get("WALL_BLUETOOTH_AGENT_CAPABILITY", "DisplayYesNo")
     if capability not in AGENT_CAPABILITIES:
         raise ValueError("invalid-bluetooth-agent-capability")
 

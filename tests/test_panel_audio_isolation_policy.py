@@ -289,3 +289,325 @@ def test_a_worker_that_cannot_start_does_not_leak_its_slot(tmp_path, monkeypatch
     monkeypatch.undo()
     assert broker._backend_call("call", "telemetry", {}) == {"available": False}, (
         "the broker still had capacity after repeated thread-start failures")
+
+
+# ---------------------------------------------------------------------------
+# The backend has to SURVIVE the isolation, not just deserve it (2026-09-19)
+# ---------------------------------------------------------------------------
+#
+# Everything above this line asks WHICH calls are isolated. Nothing asked
+# whether the isolated call works, and the answer on the shipped panel was no.
+#
+# `spawn` hands the child its work by PICKLING it, backend object included.
+# WSN-024's `RoutedDeviceBackend` holds a `threading.Lock`; a `_thread.lock`
+# cannot be pickled; `process.start()` raised a bare `TypeError` that
+# `handle()`'s `except Exception` turned into `backend_failure` with nothing in
+# the journal. Every mutation the broker accepts died there -- the Bluetooth
+# verbs AND, because the routed backend wraps the switch one, the panel's own
+# Mute/Headset/Speaker switch. The pane kept rendering correct live state,
+# because `status` and `telemetry` are LOCAL_ONLY and pickle nothing, so the
+# wall looked like a panel whose touch had died and was first reported as that.
+#
+# WHY THE SUITE WAS GREEN THROUGH ALL OF IT. Every other test of this seam uses
+# the in-process path -- white-box tests opt into it deliberately -- so nothing
+# in this repository had ever pickled a real backend. A test asserting that
+# `inventory()` returns two devices passed that day and would have passed every
+# day. The test therefore has to BE the spawn.
+
+import json  # noqa: E402
+import multiprocessing  # noqa: E402
+
+import bluetooth_request  # noqa: E402
+import routed_backend  # noqa: E402
+from routing import device_authorization  # noqa: E402
+
+
+def _shipped_document(now):
+    """The observer document, in the shape `_document` requires."""
+    return {
+        "version": 1, "publishedAt": now, "reason": "ready", "adapter": True,
+        "powered": True, "discoverable": False, "pairable": False,
+        "devices": [{"alias": "pixel", "name": "Pixel", "kind": "input",
+                     "trusted": True, "connected": True, "battery": None}],
+        "route": {"input": "pixel", "output": None},
+        "pairing": {"active": False, "discoverable": False, "passkey": None,
+                    "device": None, "endsInSeconds": None},
+        "generation": 3, "requestSeq": 100,
+    }
+
+
+def _shipped_backend(tmp_path):
+    """The object `serve()` builds, assembled the way `serve()` assembles it.
+
+    Built through both `backend_from_environment` functions rather than by
+    calling the constructors, because the defect was in what the SHIPPED
+    composition holds -- a hand-built backend is free to omit the field that
+    breaks.
+    """
+    import os
+    state = tmp_path / "bluetooth-state.json"
+    state.write_text(json.dumps(_shipped_document(time.time())), encoding="utf-8")
+    applier = tmp_path / "wall-bluetooth-device"
+    applier.write_text("#!/bin/sh\n", encoding="utf-8")
+    os.environ["WALL_AUDIO_REQUEST_PATH"] = str(tmp_path / "request.json")
+    os.environ["WALL_AUDIO_STATE_PATH"] = str(tmp_path / "audio-state.json")
+    os.environ["WALL_AUDIO_APPLIER_PATH"] = str(applier)
+    os.environ["WALL_BLUETOOTH_STATE_PATH"] = str(state)
+    os.environ["WALL_BLUETOOTH_REQUEST_PATH"] = str(tmp_path / "spool")
+    os.environ["WALL_BLUETOOTH_APPLIER_PATH"] = str(applier)
+    try:
+        import switch_backend as _switch
+        return routed_backend.backend_from_environment(_switch.backend_from_environment())
+    finally:
+        for name in ("WALL_AUDIO_REQUEST_PATH", "WALL_AUDIO_STATE_PATH",
+                     "WALL_AUDIO_APPLIER_PATH", "WALL_BLUETOOTH_STATE_PATH",
+                     "WALL_BLUETOOTH_REQUEST_PATH", "WALL_BLUETOOTH_APPLIER_PATH"):
+            os.environ.pop(name, None)
+
+
+import time  # noqa: E402
+
+
+def test_the_shipped_backend_survives_the_spawn_boundary(tmp_path):
+    """The exact transport `_isolated_backend_call` uses, on the real object.
+
+    `multiprocessing.get_context("spawn")` rather than `pickle.dumps`: the
+    context is what the broker uses, it may reduce differently, and a pickle
+    assertion would pass on an object the child could not rebuild.
+    """
+    backend = _shipped_backend(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(target=_echo_aliases, args=(child, backend), daemon=True)
+    # A TypeError HERE, out of start(), is the shipped defect -- the child never
+    # ran, so no assertion about its answer could have caught it.
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(30), "the spawned child never answered"
+        assert parent.recv() == ["pixel"], "the child rebuilt a backend that cannot see the document"
+    finally:
+        parent.close()
+        process.join(10)
+
+
+def _echo_aliases(pipe, backend):
+    """Runs in the spawned child: prove the rebuilt object is usable, not just built.
+
+    `inventory` is the call in the traceback -- `AudioBroker._mutation` makes it
+    before EVERY mutation -- so it is the one that has to come back.
+    """
+    try:
+        pipe.send(sorted(device.alias for device in backend.inventory(threading.Event())))
+    finally:
+        pipe.close()
+
+
+def test_a_mutation_reaches_the_spool_through_the_isolated_path(tmp_path):
+    """End to end, isolation ON: the verb the wall could not perform.
+
+    This is the assertion that fails on the shipped tree. `isolate_backend` is
+    left at its default so the broker chooses the spawn itself.
+    """
+    backend = _shipped_backend(tmp_path)
+    broker = _CountingBroker(backend, authorize=device_authorization,
+                             isolate_backend=True,
+                             state_path=str(tmp_path / "broker-state.json"))
+    result = broker._backend_call("call", "set_discoverable", {"enabled": True})
+    assert broker.spawns == ["set_discoverable"], "the mutation must have been isolated"
+    assert result["accepted"] is True
+    spooled = bluetooth_request.pending(tmp_path / "spool")
+    assert len(spooled) == 1, "the request never reached the applier's spool"
+    assert json.loads(spooled[0].read_text(encoding="utf-8"))["event"]["kind"] == "set_discoverable"
+
+
+def test_a_child_cannot_reuse_a_sequence_still_in_the_spool(tmp_path):
+    """The guard `spawn` deleted, restored from the one place both children see.
+
+    `_last_seq` lives in the child's COPY and dies with it, so two mutations in
+    the same microsecond would mint the same sequence -- and a request file is
+    NAMED after its sequence, so the second would overwrite a request the
+    applier had not drained. The spool itself is the shared high-water mark.
+    """
+    backend = _shipped_backend(tmp_path)
+    spool = tmp_path / "spool"
+    # A request already waiting, at a sequence far above the clock's. Written
+    # as a file rather than through `write`, because what `_highest_spooled`
+    # reads is the NAME -- the applier has not drained it, and that is all
+    # the next sequence has to clear.
+    spool.mkdir(parents=True, exist_ok=True)
+    (spool / bluetooth_request.request_name(10 ** 17)).write_text("{}\n", encoding="utf-8")
+    fresh = routed_backend.RoutedDeviceBackend.__new__(routed_backend.RoutedDeviceBackend)
+    fresh.__setstate__(backend.__getstate__())
+    assert fresh._last_seq == -1, "a child must not inherit a high-water mark it cannot refresh"
+    assert fresh._next_seq(None) > 10 ** 17, "a fresh child reused a spooled sequence"
+
+
+def test_a_child_clears_the_mark_the_applier_has_already_committed_to(tmp_path):
+    """The window the spool does not cover (terra, 2026-09-19).
+
+    `wall-bluetooth-device` writes `mark.json` and unlinks the spool file
+    BEFORE it performs the action, and republishes the document only when the
+    action finishes -- up to forty seconds later for a `pair`. In between, the
+    spool is empty and the document still names the PREVIOUS request, so a
+    clock that steps backwards mints a sequence the applier will silently
+    discard while the broker answers `accepted`.
+
+    Both other floors are deliberately left saying "nothing here", which is
+    exactly the state that window produces.
+    """
+    backend = _shipped_backend(tmp_path)
+    assert not list(bluetooth_request.pending(tmp_path / "spool")), "the spool must be empty"
+    (tmp_path / "mark.json").write_text(
+        json.dumps({"generation": 3, "requestSeq": 10 ** 17}), encoding="utf-8")
+    assert backend._next_seq(None) > 10 ** 17, (
+        "a sequence at or below the applier's committed mark is discarded in silence")
+
+
+@pytest.mark.parametrize("damage", ["", "not json", '{"requestSeq": true}',
+                                    '{"requestSeq": -1}', '{"requestSeq": "8"}', '{}', '[]'])
+def test_an_unreadable_mark_is_no_floor_rather_than_a_guessed_one(tmp_path, damage):
+    """A floor is raised past; inventing one from a file that did not parse
+    would hold back a request that was perfectly fine. Every shape answers
+    None and lets the clock decide, and none of them raises."""
+    backend = _shipped_backend(tmp_path)
+    (tmp_path / "mark.json").write_text(damage, encoding="utf-8")
+    assert backend._applier_mark() is None
+    assert backend._next_seq(None) > 0
+
+
+def test_a_sequence_taken_behind_the_backs_floors_is_refused_not_clobbered(tmp_path):
+    """The reservation, which is a different guarantee from the floor.
+
+    The floors are READ-THEN-WRITE. In a sequential test they look sufficient
+    -- `_next_seq` re-reads the spool and steps past what is there -- which is
+    exactly why a sequential test proves nothing here. Every mutation is its
+    own spawned child, so two of them can both read the floors BEFORE either
+    writes, and then both compute the same sequence. `os.replace` cannot
+    refuse, so one request silently replaced the other while both callers were
+    told `accepted`: a tap that did nothing.
+
+    Forced by taking the sequence after `_next_seq` has chosen it and before
+    `_submit` writes it, which is precisely the interleaving a second child
+    produces.
+    """
+    backend = _shipped_backend(tmp_path)
+    spool = tmp_path / "spool"
+    chosen = backend._next_seq(None)
+
+    original = routed_backend.RoutedDeviceBackend._next_seq
+    calls = []
+
+    def racing(self, document=None):
+        seq = original(self, document)
+        if not calls:
+            calls.append(seq)
+            # The other child wins the sequence in the gap.
+            spool.mkdir(parents=True, exist_ok=True)
+            (spool / bluetooth_request.request_name(seq)).write_text(
+                json.dumps({"seq": seq, "event": {"kind": "discover"}}), encoding="utf-8")
+        return seq
+
+    routed_backend.RoutedDeviceBackend._next_seq = racing
+    try:
+        result = backend._submit({"kind": "cancel"})
+    finally:
+        routed_backend.RoutedDeviceBackend._next_seq = original
+
+    assert result["seq"] != calls[0], "the loser must take a different sequence"
+    spooled = bluetooth_request.pending(spool)
+    assert len(spooled) == 2, "the other child's request was overwritten"
+    kinds = sorted(json.loads(path.read_text(encoding="utf-8"))["event"]["kind"]
+                   for path in spooled)
+    assert kinds == ["cancel", "discover"], kinds
+    # The acknowledged sequence must be the one on disk, or the renderer
+    # correlates its reply to a request that is not there.
+    assert (spool / bluetooth_request.request_name(result["seq"])).exists()
+    assert chosen > 0
+
+
+def test_the_exclusive_write_refuses_an_existing_sequence(tmp_path):
+    """The primitive the reservation rests on, held on its own.
+
+    `os.replace` overwrites and cannot be asked not to; `os.link` refuses. If
+    this ever silently becomes a replace again, every test above it still
+    passes, because they exercise the loop that this makes possible.
+    """
+    spool = tmp_path / "spool"
+    bluetooth_request.write(41, {"kind": "discover", "timeoutSeconds": 30}, spool, exclusive=True)
+    with pytest.raises(bluetooth_request.SequenceTaken):
+        bluetooth_request.write(41, {"kind": "cancel"}, spool, exclusive=True)
+    kept = json.loads((spool / bluetooth_request.request_name(41)).read_text(encoding="utf-8"))
+    assert kept["event"]["kind"] == "discover", "the refused write still overwrote"
+    # Without the flag the historic behaviour is untouched: the applier's own
+    # tests deliberately rewrite a sequence to prove a REPLAY is refused
+    # downstream, which is a different question from this one.
+    bluetooth_request.write(41, {"kind": "cancel"}, spool)
+    replaced = json.loads((spool / bluetooth_request.request_name(41)).read_text(encoding="utf-8"))
+    assert replaced["event"]["kind"] == "cancel"
+
+
+def test_no_temporary_is_left_in_the_appliers_spool(tmp_path):
+    """The exclusive path LINKS rather than renames, so the temporary is not
+    consumed and has to be removed deliberately. `pending` would skip it, but
+    the applier's directory is not a scratch space and this leaks one file per
+    tap."""
+    spool = tmp_path / "spool"
+    for seq in (7, 8, 9):
+        bluetooth_request.write(seq, {"kind": "cancel"}, spool, exclusive=True)
+    names = sorted(path.name for path in spool.iterdir())
+    assert all(name.endswith(".json") and name[:-5].isdigit() for name in names), names
+
+
+def test_a_sequence_that_can_never_be_reserved_refuses_rather_than_lying(monkeypatch, tmp_path):
+    """The bound on the retry loop, and the direction it fails in.
+
+    In ordinary use the loop cannot exhaust: `_next_seq` clears the HIGHEST
+    spooled sequence, so a lost race hands the next attempt a free one. The
+    bound is there because a loop in the verb path has to terminate on its own
+    rather than on the argument that it cannot spin -- so the test forces the
+    only state that spins, a writer that always says the sequence is taken.
+
+    Being told `accepted` for a request that was never written is the one
+    answer this path must never give, so exhaustion is a refusal.
+    """
+    backend = _shipped_backend(tmp_path)
+    attempts = []
+
+    def always_taken(seq, event, directory=None, generation=None, exclusive=False):
+        attempts.append(seq)
+        raise bluetooth_request.SequenceTaken("taken")
+
+    monkeypatch.setattr(bluetooth_request, "write", always_taken)
+    import audio_router
+    with pytest.raises(audio_router.BrokerError) as caught:
+        backend._submit({"kind": "cancel"})
+    assert caught.value.code == "backend_failure"
+    assert len(attempts) == routed_backend.RoutedDeviceBackend.MAX_SEQ_ATTEMPTS, (
+        "the loop must be bounded by MAX_SEQ_ATTEMPTS and nothing else")
+    assert not bluetooth_request.pending(tmp_path / "spool"), "a refusal must spool nothing"
+
+
+def test_a_failed_write_leaves_nothing_behind_in_the_spool(tmp_path, monkeypatch):
+    """terra, round 3. The cleanup has to cover the WRITE, not only the link.
+
+    A full tmpfs or an fsync error used to leave a partial `.new` behind --
+    one per failure, on a panel nobody logs in to, in a filesystem that is
+    RAM. `pending` skips a non-numeric stem, so nothing would ever have said
+    so.
+
+    Failed at `fsync` rather than at `open`: that is the realistic error (the
+    write lands in the page cache and the flush is what discovers the full
+    disk), and it unwinds through the `with`, so the handle is closed before
+    the cleanup runs. An injection that leaves the handle open would be
+    testing the platform's unlink semantics instead.
+    """
+    spool = tmp_path / "spool"
+
+    def full_disk(fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(bluetooth_request.os, "fsync", full_disk)
+    with pytest.raises(OSError):
+        bluetooth_request.write(3, {"kind": "cancel"}, spool, exclusive=True)
+    assert list(spool.iterdir()) == [], "a partial temporary was left in the applier's spool"

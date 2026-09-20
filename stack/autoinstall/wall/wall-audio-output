@@ -216,7 +216,7 @@ MIC_ENV_PREFIX = "WALL_AUDIO_MIC_"
 # there (coordinator log, 2026-09-13 22:50) and step 4 is precisely the step
 # that gives those channels a job again. It is a bench number: turn it with
 # `wall-audio-output mic rear_level=N` while watching the desktop's input meter.
-MIC_DEFAULTS = {"capture_percent": 24, "boost": 0, "headset_capture_percent": 60,
+MIC_DEFAULTS = {"capture_percent": 62, "boost": 0, "headset_capture_percent": 60,
                 "rear_level": 66, "rear_gain": 1.0}
 MIC_INT_KEYS = ("capture_percent", "boost", "headset_capture_percent", "rear_level")
 MIC_KEYS = ("capture_percent", "boost", "headset_capture_percent",

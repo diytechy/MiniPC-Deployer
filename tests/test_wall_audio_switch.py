@@ -1777,21 +1777,57 @@ def test_mic_legs_gate_and_follow_aec_without_untracked_dropins_sr028():
 
 
 def test_the_capture_gain_default_is_the_measured_one_sr029(applier):
-    """It was CLIPPING, so this number is a measurement and not a preference.
+    """This number is a measurement, and the measurement CHANGED (2026-09-19).
 
-    62 % with +12 dB of boost gave peak 32768 and -15.2 dBFS RMS. 24 % (-6.00 dB)
-    with boost 0 is what the panel read on 2026-09-14 after the AEC run lowered
-    it live, and firstboot must seed the same value or the stored state and the
-    hardware disagree from the first apply.
+    It was 24 %, from a 2026-09-14 note reporting the microphone clipping at
+    62 %. On the panel, from `mic_clean`, 24 % reads -87.4 dBFS (rms 1.4 LSB)
+    and again -79.9 dBFS (peak 41 of 32768) -- the ADC's own noise, not a quiet
+    room. 62 % reads -36.3 dBFS with the Owner talking and -48.9 dBFS ambient,
+    with 15 dB of peak headroom left. The clipping could not be reproduced; see
+    wall.env.example for why the old note's "+12 dB boost" was the capture
+    level's own dB double-counted.
+
+    WHAT THIS PROTECTED, AND WHY IT IS NOT A STYLE RULE. The three places have
+    to agree or the stored state and the hardware disagree from the first
+    apply -- and that is exactly the state the panel was found in, with
+    `wall.env` saying 62 and the GENERATED `audio-mic.env` saying 24. The
+    generated file is what is live, so the panel had been carrying silence to
+    every microphone consumer while its configuration said otherwise.
     """
-    assert applier.MIC_DEFAULTS["capture_percent"] == 24
+    assert applier.MIC_DEFAULTS["capture_percent"] == 62
     assert applier.MIC_DEFAULTS["boost"] == 0
     seeded = read(WALL / "wall-firstboot.sh")
-    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT:-24" in seeded
+    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT:-62" in seeded
     assert "WALL_AUDIO_MIC_BOOST:-0" in seeded
     example = read(WALL / "wall.env.example")
-    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT=24" in example
+    assert "WALL_AUDIO_MIC_CAPTURE_PERCENT=62" in example
     assert "WALL_AUDIO_MIC_BOOST=0" in example
+
+
+def test_the_seeded_mic_gain_is_the_one_the_applier_would_choose_sr029(applier):
+    """firstboot's fallbacks and MIC_DEFAULTS are one fact in two files.
+
+    The previous test pins each to a literal, which catches them drifting to
+    DIFFERENT literals only because a human kept both lines in view. This
+    derives one from the other, so the next person who changes the default in
+    one place is told about the other rather than trusted to remember it.
+
+    The seam is real: `audio-mic.env` is generated once, by whichever of the
+    two runs first, and never reconciled afterwards -- deliberately, so a level
+    somebody arrived at by living with the panel is not discarded by a re-run.
+    The cost of that decision is that a disagreement here becomes permanent on
+    the wall the moment it ships.
+    """
+    seeded = read(WALL / "wall-firstboot.sh")
+    example = read(WALL / "wall.env.example")
+    for key, value in (("CAPTURE_PERCENT", applier.MIC_DEFAULTS["capture_percent"]),
+                       ("BOOST", applier.MIC_DEFAULTS["boost"]),
+                       ("HEADSET_CAPTURE_PERCENT", applier.MIC_DEFAULTS["headset_capture_percent"]),
+                       ("REAR_LEVEL", applier.MIC_DEFAULTS["rear_level"])):
+        assert "WALL_AUDIO_MIC_%s:-%d}" % (key, value) in seeded, (
+            "firstboot seeds a different %s than the applier would default to" % key)
+        assert "WALL_AUDIO_MIC_%s=%d\n" % (key, value) in example, (
+            "wall.env.example documents a different %s than the applier defaults to" % key)
 
 
 @pytest.mark.parametrize("assignment,why", [
@@ -2041,17 +2077,47 @@ def test_bluealsa_gains_hfp_hf_and_keeps_a2dp_sr029():
 @pytest.mark.parametrize("tree,expected", [
     ("", []),
     ("/org/bluealsa\n", []),
+    # v4 -- what the panel runs. The profile names the segment.
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink\n", ["AA:BB:CC:DD:EE:FF"]),
+    # v3, still accepted so the fix does not break an older BlueALSA
     ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/sink\n", ["AA:BB:CC:DD:EE:FF"]),
-    # a2dp endpoints are not a call and must not start a microphone
+    # a2dp endpoints are not a call and must not start a microphone -- in both
+    # spellings, because v4 writes `a2dpsnk` where v3 wrote `a2dp`
     ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dp/sink\n", []),
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsnk/sink\n", []),
     # the far end's voice is the OTHER direction and is not this leg
     ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/source\n", []),
-    ("/org/bluealsa/hci0/dev_11_22_33_44_55_66/sco/sink\n"
-     "/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/sco/sink\n",
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/source\n", []),
+    # AG is the panel playing OUT to a headset. Its sink is not a microphone
+    # destination, and matching it would point this leg backwards. Goal 2 adds
+    # that direction deliberately or not at all.
+    ("/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfpag/sink\n", []),
+    ("/org/bluealsa/hci0/dev_11_22_33_44_55_66/hfphf/sink\n"
+     "/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink\n",
      ["11:22:33:44:55:66", "AA:BB:CC:DD:EE:FF"]),
 ])
 def test_only_an_sco_sink_is_a_call_sr029(btmic, tree, expected):
     assert btmic.parse_sco_sinks(tree) == expected
+
+
+def test_the_parser_is_held_against_a_captured_tree_not_an_invented_one_sr029(btmic):
+    """The fixture is `busctl tree org.bluealsa` off the panel, verbatim.
+
+    THIS IS THE TEST THAT WAS MISSING, and its absence is why the leg could
+    ship dead. The parametrised cases above are hand-written strings, and a
+    hand-written string agrees with whatever the parser happens to expect --
+    the previous version of this file fed it `sco/sink`, which is precisely
+    the spelling the regex was written against and precisely the spelling no
+    panel has ever published. `hciconfig` on the wall read `TX sco: 0`.
+
+    Only the ADDRESS in the fixture is substituted (LLR-979). The path shape,
+    the indentation and the box-drawing characters are as captured, so a
+    future BlueALSA that renames a segment again fails here first.
+    """
+    tree = (Path(__file__).resolve().parent / "fixtures"
+            / "bluealsa-v4-busctl-tree.txt").read_text(encoding="utf-8")
+    assert btmic.parse_sco_sinks(tree) == ["AA:BB:CC:DD:EE:FF"], (
+        "the real v4 object path must be recognised as a call")
 
 
 def test_a_call_in_progress_is_never_moved_to_another_phone_sr029(btmic):

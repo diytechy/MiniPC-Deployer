@@ -2058,8 +2058,21 @@ def test_every_ipc_key_in_bus_mode_is_unique_sr029():
     assert 7715 in keys and 8825 in keys and 8826 in keys
 
 
-def test_bluealsa_gains_hfp_hf_and_keeps_a2dp_sr029():
-    """The panel is the phone's HANDS-FREE unit, not its gateway."""
+def test_bluealsa_carries_both_roles_sr029():
+    """The panel is the gateway's hands-free unit AND a headset's gateway.
+
+    THIS TEST USED TO REFUSE THE SECOND HALF, and it was right to while the
+    panel only ever played audio IN. The Owner ruled on 2026-09-19 that the
+    panel must also connect out to a Bluetooth headset, which is the
+    source/gateway role; B1 enables it. The four are pinned positively rather
+    than the refusal simply deleted, because the two original profiles are
+    what the wall runs on today and nothing else would be left asserting them.
+
+    Bluetooth negotiates per peer, so holding all four is not a contradiction:
+    a laptop takes the panel's HF/sink side and a headset takes its AG/source
+    side. Measured on the panel with all four enabled -- bluealsa started
+    clean and the dev PC still negotiated `hfphf`.
+    """
     override = read(WALL / "wall-bluealsa-override.conf")
     # The COMMAND, not the prose above it: the comment quotes the stock unit's
     # own flags, and a test that grepped the whole file would pass on the
@@ -2068,10 +2081,10 @@ def test_bluealsa_gains_hfp_hf_and_keeps_a2dp_sr029():
                if line.startswith("ExecStart=") and line.strip() != "ExecStart="]
     assert len(command) == 1, command
     command = command[0]
-    assert "-p hfp-hf" in command, "hfp-hf: the panel is the phone's headset"
-    assert "-p hfp-ag" not in command, "hfp-ag would make the panel the telephone"
-    assert "-p a2dp-sink" in command, "music must still work"
-    assert "-p a2dp-source" not in command, "SR-025: no pulling audio off the panel"
+    assert "-p hfp-hf" in command, "hfp-hf: the panel is the gateway's headset"
+    assert "-p a2dp-sink" in command, "music into the panel must still work"
+    assert "-p hfp-ag" in command, "hfp-ag: the panel is its own headset's gateway"
+    assert "-p a2dp-source" in command, "a2dp-source: the panel plays out to a headset"
 
 
 @pytest.mark.parametrize("tree,expected", [

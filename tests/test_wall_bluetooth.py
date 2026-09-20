@@ -403,14 +403,47 @@ def test_the_sink_plays_to_default_and_never_pins_a_card():
         assert not [d for d in directives if pinned in d], pinned
 
 
-def test_the_sink_does_not_also_offer_to_take_audio_off_the_panel():
-    """The stock unit runs a2dp-source as well. The panel is the thing you play
-    INTO; a source profile would let a phone pull audio off it."""
+def test_the_panel_offers_both_roles_and_says_which_is_which():
+    """It used to refuse a source profile outright, and that was right then.
+
+    The old assertion was "the panel is the thing you play INTO; a source
+    profile would let a phone pull audio off it". The Owner ruled on
+    2026-09-19 that the panel must also be able to connect to a Bluetooth
+    headset of its own, which is that role exactly -- so the refusal is
+    replaced by a POSITIVE pin on all four profiles rather than removed.
+    Removing it would leave nothing saying the sink and hands-free roles are
+    still there, and those are the ones the wall has today.
+
+    The residual the source role brings is real and is recorded in SR-025 and
+    in the override's own comment: a profile list cannot confine the source to
+    a device the panel SELECTED, only to one that is bonded. That narrowing is
+    policy for the applier.
+    """
     conf = _override("wall-bluealsa-override.conf")
-    assert "-p a2dp-sink" in conf
     directives = [line for line in conf.splitlines()
                   if line.strip() and not line.lstrip().startswith("#") and "=" in line]
-    assert not [d for d in directives if "a2dp-source" in d]
+    exec_start = [d for d in directives if d.startswith("ExecStart=") and d.strip() != "ExecStart="]
+    assert len(exec_start) == 1, exec_start
+    command = exec_start[0]
+    for profile in ("a2dp-sink", "hfp-hf", "a2dp-source", "hfp-ag"):
+        assert "-p %s" % profile in command, profile
+    # The two the panel has always had must not be lost while adding the two
+    # new ones -- that swap would read as "still four profiles" and would take
+    # music and the headset role off the wall.
+    assert command.index("a2dp-sink") > 0 and command.index("hfp-hf") > 0
+
+
+def test_the_source_role_is_documented_as_bonded_only_not_selected_only():
+    """The honest limit, pinned so it is not quietly upgraded in the telling.
+
+    SR-025's amendment says the panel is a source 'only toward a device the
+    panel itself selected'. The profile list cannot deliver that -- any BONDED
+    device may ask and bluealsa will offer -- so the file that enables it has
+    to say so, or the next reader will believe the stronger claim.
+    """
+    conf = _override("wall-bluealsa-override.conf")
+    assert "RESIDUAL" in conf.upper(), "the override must state what it does not confine"
+    assert "bonded" in conf.lower()
 
 
 def test_the_dmix_hostile_sandboxing_is_relaxed_with_its_reason():

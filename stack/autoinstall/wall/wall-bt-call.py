@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import re
 import signal
 import subprocess
@@ -66,7 +67,17 @@ GUARD = "/usr/local/lib/wall-panel/wall-alsaloop-guard.py"
 # The single named alias every mic consumer opens; the AEC step replaces what it
 # resolves to and nothing here changes. See asound-bus-mode.conf.
 MIC_PCM = "mic_selected"
+# WHERE THE FAR END LANDS. The merged bus, so a call is a bus source like any
+# other and follows the switch. See voice_argv.
+BUS_PCM = "bus"
 MODE_FILE = "/etc/wall-panel/audio-mode"
+# A3's knob. The far-end leg stays OFF unless this is set, because it puts a
+# new writer on the bus that carries the room's music and the Owner asked for
+# that to be a decision rather than a side effect of a deploy.
+SCO_PLAYBACK_VAR = "WALL_BT_SCO_PLAYBACK"
+# Aliases only ever leave this process; the address is what it works in.
+BLUETOOTH_STATE = "/run/wall-bluetooth/state.json"
+CALL_STATE = "/run/wall-panel/call-state.json"
 
 # /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink -- the object path
 # BlueALSA publishes for the playback half of an HFP link the panel is the
@@ -214,13 +225,46 @@ def mic_allowed(path=STATE_FILE):
         return False
 
 
-def loop_argv(address):
-    """The alsaloop command line, under the same guard every other leg uses."""
+def loop_argv(address, rate=None):
+    """The microphone leg: the selected mic to the gateway. `rate` is ignored.
+
+    THE RATE IS A CONSTANT HERE ON PURPOSE, and it is the one thing in this
+    file that looks like a bug and is not. The link is usually CVSD at 8 kHz
+    while this asks for 16 kHz; measured on the panel with the transport
+    acquired, 16000 and 8000 carried 3995 and 4000 bytes in twelve seconds.
+    The playback side is a RAW BlueALSA PCM and its plugin converts. The
+    parameter exists only so both legs share one call shape.
+    """
     return [GUARD, "--max-errors", "20", "--window", "10", "--",
             ALSALOOP,
             "--cdevice", MIC_PCM,
             "--pdevice", pcm_name(address),
             "--format", "S16_LE", "--rate", "16000", "--channels", "1",
+            "--tlatency", "50000", "--sync", "5"]
+
+
+def voice_argv(address, rate):
+    """The far-end leg: the gateway's voice onto the merged bus. A3.
+
+    WHY THE RATE IS NOT A CONSTANT HERE, when it is for the microphone. This
+    leg's CAPTURE device is the raw BlueALSA PCM, and a capture device must be
+    opened at its own rate: wrapping it in `plug` -- which works on the
+    playback side -- fails with `Poll FD initialization failed`, because plug
+    does not give alsaloop the poll descriptors it needs from a capture. So
+    the negotiated rate is read from the PCM (`pcm_sampling`) and passed. Mono
+    for the same reason; `bus` accepts the conversion, the SCO PCM does not.
+
+    IT LANDS ON `bus`, NOT ON AN OUTPUT. That is the whole point: the far end
+    becomes another bus source, so it follows the Mute/Headset/Speaker switch
+    like the library, Pandora and the dev PC, the visualizer sees it, and in
+    the Speaker position the echo canceller removes it from the microphone
+    before it goes back up the link. Owner ruling 2026-09-19, §17 Q2.
+    """
+    return [GUARD, "--max-errors", "20", "--window", "10", "--",
+            ALSALOOP,
+            "--cdevice", pcm_name(address),
+            "--pdevice", BUS_PCM,
+            "--format", "S16_LE", "--rate", str(int(rate)), "--channels", "1",
             "--tlatency", "50000", "--sync", "5"]
 
 
@@ -271,6 +315,45 @@ def sink_is_running(path, run=subprocess.run):
     return parse_running(done.stdout)
 
 
+def parse_sampling(text):
+    """`busctl get-property ... Sampling` as an int, or None.
+
+    The property is a `u`, so the answer is the literal line `u 8000`. None for
+    anything else, and the caller then leaves the leg alone rather than opening
+    a PCM at a rate nobody confirmed.
+    """
+    parts = (text or "").split()
+    if len(parts) != 2 or parts[0] != "u" or not parts[1].isdigit():
+        return None
+    value = int(parts[1])
+    # CVSD is 8000 and mSBC is 16000; nothing else is an HFP rate, and a number
+    # outside that set means this property is not what it is assumed to be.
+    return value if value in (8000, 16000) else None
+
+
+def pcm_sampling(path, run=subprocess.run):
+    """The rate the SCO transport actually negotiated, or None.
+
+    THE FAR-END LEG CANNOT GUESS THIS, and unlike the microphone leg it cannot
+    be given a constant either. Measured on the panel: the CAPTURE side of an
+    alsaloop must be the RAW BlueALSA PCM at its own rate. Wrapping it in
+    `plug` -- which works perfectly on the playback side -- fails with `Poll FD
+    initialization failed`, because the plug plugin does not expose the poll
+    descriptors alsaloop needs from a capture device. So the rate has to be
+    right, and CVSD (8000) and mSBC (16000) are chosen per call.
+    """
+    try:
+        done = run([BUSCTL, "--system", "get-property", "org.bluealsa", path,
+                    "org.bluealsa.PCM1", "Sampling"],
+                   check=False, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("bluealsa PCM %s rate unreadable (%s)" % (path, exc))
+        return None
+    if done.returncode != 0:
+        return None
+    return parse_sampling(done.stdout)
+
+
 def read_sinks(run=subprocess.run):
     """Every address whose SCO sink is RUNNING. [] on any failure, never raises.
 
@@ -293,31 +376,81 @@ def read_sinks(run=subprocess.run):
         return []
     if done.returncode != 0:
         return []
-    return sorted({address for path, address in sco_object_paths(done.stdout)
-                   if sink_is_running(path, run=run)})
+    return sorted(read_calls(run=run))
+
+
+def read_calls(run=subprocess.run):
+    """{address: negotiated rate} for every gateway actually on a call.
+
+    The rate is carried alongside because the far-end leg needs it and asking
+    for it here costs nothing: the object has already been found and already
+    answered one property.
+
+    A PCM that is running but will not say its rate is DROPPED rather than
+    guessed. Losing the microphone for a poll is recoverable; opening a PCM at
+    a rate nobody confirmed is how the leg flapped in the first place.
+    """
+    try:
+        done = run([BUSCTL, "--system", "tree", "org.bluealsa"],
+                   check=False, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("bluealsa object tree unreadable (%s): no HFP mic return this poll" % exc)
+        return {}
+    if done.returncode != 0:
+        return {}
+    calls = {}
+    for path, address in sco_object_paths(done.stdout):
+        if not sink_is_running(path, run=run):
+            continue
+        rate = pcm_sampling(path, run=run)
+        if rate is not None:
+            calls[address] = rate
+    return calls
 
 
 class Leg:
-    """At most one alsaloop child, started and stopped by address."""
+    """At most one alsaloop child, started and stopped by address.
 
-    def __init__(self, popen=subprocess.Popen):
+    TWO INSTANCES NOW, NOT ONE, and they are deliberately independent. The
+    microphone leg carries the panel to the gateway; the voice leg carries the
+    gateway's far end to the merged bus. They start and stop on DIFFERENT
+    conditions -- muting the microphone must not silence the person you are
+    listening to, which is what a muted headset does -- so a single leg with
+    two directions would have had to re-derive that distinction internally.
+
+    `name` is only for the journal, and it is worth the field: two legs
+    logging "started" with no way to tell which is the failure mode this file
+    already had once, in a different costume.
+    """
+
+    def __init__(self, name, argv, popen=subprocess.Popen):
         self._popen = popen
+        self._argv = argv
+        self.name = name
         self.address = None
         self.child = None
 
     def running(self):
         return self.child is not None and self.child.poll() is None
 
-    def start(self, address):
+    def start(self, address, rate=None):
         self.stop()
         try:
-            self.child = self._popen(loop_argv(address))
+            self.child = self._popen(self._argv(address, rate))
         except OSError as exc:
-            log("could not start the HFP mic return to %s: %s" % (address, exc))
+            log("could not start the %s leg to %s: %s" % (self.name, address, exc))
             self.child = None
             return False
         self.address = address
-        log("HFP mic return started: %s -> %s" % (MIC_PCM, pcm_name(address)))
+        log("%s leg started (%s)" % (self.name, pcm_name(address)))
+        return True
+
+    def ensure(self, address, rate=None):
+        """Start if it is not already on this address and alive. Idempotent,
+        because the poll loop calls it every interval and a restart drops
+        audio for as long as ALSA takes to reopen."""
+        if address != self.address or not self.running():
+            return self.start(address, rate)
         return True
 
     def stop(self):
@@ -335,11 +468,11 @@ class Leg:
                     self.child.kill()
                     self.child.wait(timeout=5)
         except (OSError, subprocess.SubprocessError) as exc:
-            log("HFP mic return would not stop cleanly (%s)" % exc)
+            log("%s leg would not stop cleanly (%s)" % (self.name, exc))
         self.child = None
         self.address = None
         if address:
-            log("HFP mic return stopped (%s)" % address)
+            log("%s leg stopped (%s)" % (self.name, address))
 
 
 ROUTE_PATH = "/run/wall-bluetooth/route.json"
@@ -392,35 +525,159 @@ def decide(sinks, current, preferred=None):
     return sinks[0]
 
 
+def sco_playback_enabled(env=None):
+    """Whether A3's far-end leg is switched on. Default OFF.
+
+    A new writer on the bus that carries the room's music is a decision, not
+    something a deploy should turn on underneath a working panel. Same
+    reasoning the knob shipped with; what changed is that there is now a leg
+    behind it.
+    """
+    value = (os.environ if env is None else env).get(SCO_PLAYBACK_VAR, "")
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def alias_of(address, path=BLUETOOTH_STATE):
+    """The observer's alias for an address, or None. NEVER the address.
+
+    LLR-979: no hardware address reaches a published document. This process
+    works in addresses because BlueALSA's PCM names are addresses; everything
+    it PUBLISHES is an alias, and an alias it cannot find is `null` rather
+    than a fallback that leaks the thing the rule exists to keep out.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    table = stored.get("aliasesByAddress") if isinstance(stored, dict) else None
+    if not isinstance(table, dict):
+        return None
+    value = table.get(address)
+    return value if isinstance(value, str) and value else None
+
+
+def _same_fact(left, right):
+    """Two call documents describing the same situation. `revision` excluded,
+    because it is the counter and would make every document differ from the
+    one before it."""
+    keys = set(left) | set(right)
+    return all(left.get(key) == right.get(key) for key in keys if key != "revision")
+
+
+def call_document(state, gateway_alias, since, mic, revision):
+    """The published fact, as §20a defines it. Pure, so the shape is testable."""
+    return {"state": state, "gateway": gateway_alias, "headset": None,
+            "since": since, "mic": mic, "revision": revision}
+
+
+def publish_call_state(document, path=CALL_STATE):
+    """Write /run/wall-panel/call-state.json atomically, 0644.
+
+    EVERY FAILURE IS SILENT AND THE CALL STILL WORKS. This file is an
+    observation for the glass; a panel that cannot write it is a panel with a
+    missing status line, and taking the audio down to report that would be the
+    diagnostic failing the thing it reports on.
+    """
+    try:
+        target = pathlib.Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".new")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(document, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, target)
+    except OSError as exc:
+        log("could not publish the call state (%s)" % exc)
+
+
 def main(argv=None):
     interval = poll_seconds()
-    leg = Leg()
+    mic_leg = Leg("HFP mic return", loop_argv)
+    voice_leg = Leg("HFP far-end", voice_argv)
     stopping = {"now": False}
+    published = {"document": None, "since": None, "revision": 0}
 
     def handle(signum, frame):  # noqa: ARG001 - the signal API's shape
         stopping["now"] = True
 
+    def announce(state, address, mic):
+        """Publish only when something CHANGED, so the revision counts events
+        rather than polls and the journal does not fill with sameness."""
+        since = published["since"]
+        if state == "idle":
+            since = None
+        elif since is None:
+            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        document = call_document(state, alias_of(address) if address else None,
+                                 since, mic, published["revision"])
+        # The revision counts EVENTS, not polls, so a call that stays up does
+        # not churn a file the broker re-reads on a 30 s staleness rule.
+        if published["document"] is not None and _same_fact(document, published["document"]):
+            return
+        published["revision"] += 1
+        document["revision"] = published["revision"]
+        published["since"] = since
+        published["document"] = document
+        publish_call_state(document)
+
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGINT, handle)
-    log("HFP mic return watching for SCO sinks every %.1f s" % interval)
+    log("HFP call supervisor watching for calls every %.1f s" % interval)
     try:
         while not stopping["now"]:
-            if not bus_mode_active() or not mic_allowed():
-                leg.stop()
+            if not bus_mode_active():
+                mic_leg.stop(); voice_leg.stop(); announce("idle", None, None)
             else:
-                wanted = decide(read_sinks(), leg.address, preferred_input())
+                calls = read_calls()
+                wanted = decide(sorted(calls), mic_leg.address or voice_leg.address,
+                                preferred_input())
                 if wanted is None:
-                    leg.stop()
-                elif wanted != leg.address or not leg.running():
-                    leg.start(wanted)
+                    mic_leg.stop(); voice_leg.stop(); announce("idle", None, None)
+                else:
+                    # THE FAR END FIRST, AND INDEPENDENTLY OF THE MUTE. Muting
+                    # the panel stops what it SENDS; it does not stop the other
+                    # person being heard, which is what a muted headset does
+                    # (WSN-027, §20a).
+                    if sco_playback_enabled():
+                        voice_leg.ensure(wanted, calls[wanted])
+                    else:
+                        voice_leg.stop()
+                    if mic_allowed():
+                        mic_leg.ensure(wanted)
+                    else:
+                        mic_leg.stop()
+                    announce("call", wanted,
+                             MIC_PCM if mic_leg.running() else None)
             # Sleep in short slices so SIGTERM is answered promptly rather than
             # after a whole poll interval: systemd's stop timeout is not long.
+            #
+            # AND SO THE MUTE IS. The microphone used to be stopped by the
+            # APPLIER stopping this whole unit, which was immediate; now that
+            # the unit also carries the far end it must survive a mute, so the
+            # mute is enforced in here instead (see CALL_LEGS in
+            # wall_audio_state). Re-checked on every tick rather than once per
+            # poll, because "no sample leaves the panel" (WSN-027, Owner
+            # ruling E) is not a promise that can be kept up to five seconds
+            # late. Discovery stays on the slow interval -- that is the part
+            # that costs a busctl call; this is one small read of a file the
+            # applier has already written.
             waited = 0.0
             while waited < interval and not stopping["now"]:
                 time.sleep(0.25)
                 waited += 0.25
+                if mic_leg.running() and not mic_allowed():
+                    mic_leg.stop()
+                    announce("call", voice_leg.address, None)
     finally:
-        leg.stop()
+        mic_leg.stop()
+        voice_leg.stop()
+        # The last word is always "no call". A stale `call` left in /run would
+        # have the chrome showing a handset for a process that is gone.
+        publish_call_state(call_document("idle", None, None, None,
+                                         published["revision"] + 1))
     return 0
 
 

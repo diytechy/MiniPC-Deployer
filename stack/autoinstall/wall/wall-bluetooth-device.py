@@ -649,7 +649,7 @@ def apply_route(side, address):
         that enum is validated in six places and is the control the person at
         the glass is holding, and widening it to carry a Bluetooth device would
         put the room's music inside a radio's failure modes.
-      * INPUT is a PREFERENCE handed to `wall-bt-mic`, which already supervises
+      * INPUT is a PREFERENCE handed to `wall-bt-call`, which already supervises
         the HFP SCO leg and already has to choose when two phones are connected.
         It is not a unit this script starts: an SCO PCM exists only while a call
         is up, which is why that supervisor exists at all.
@@ -658,7 +658,7 @@ def apply_route(side, address):
     the Owner's choice stands -- and the next connection retries it.
     """
     if side == "input":
-        # `wall-bt-mic` re-reads the route document on its own poll; there is
+        # `wall-bt-call` re-reads the route document on its own poll; there is
         # nothing to restart and nothing that could fail here.
         log("input preference recorded")
         return True

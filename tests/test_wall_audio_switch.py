@@ -1536,8 +1536,8 @@ def test_the_generated_alsa_config_parses_sr028(tmp_path):
 
 MIC_EXAMPLE = WALL / "audio-mic.conf.example"
 MIC_REAR_UNIT_FILE = WALL / "wall-mic-rear.service"
-BT_MIC_UNIT_FILE = WALL / "wall-bt-mic.service"
-BT_MIC = WALL / "wall-bt-mic.py"
+BT_MIC_UNIT_FILE = WALL / "wall-bt-call.service"
+BT_MIC = WALL / "wall-bt-call.py"
 
 
 @pytest.fixture(scope="module")
@@ -1753,7 +1753,7 @@ def test_mic_legs_gate_and_follow_aec_without_untracked_dropins_sr028():
     wants = next(line for line in aec_unit.splitlines() if line.startswith("Wants="))
     assert "wall-audio-aec-restore.service" in wants
     assert "wall-mic-rear.service" not in wants
-    assert "wall-bt-mic.service" not in wants
+    assert "wall-bt-call.service" not in wants
     restore = read(WALL / "wall-audio-aec-restore.service")
     assert "After=wall-audio-aec.service" in restore
     assert "PartOf=wall-audio-aec.service" in restore
@@ -1765,7 +1765,7 @@ def test_mic_legs_gate_and_follow_aec_without_untracked_dropins_sr028():
     gate = ("ExecCondition=/bin/sh -c '! grep -qx WALL_AUDIO_AEC=1 "
             "/etc/wall-panel/audio-aec.env 2>/dev/null || systemctl is-active "
             "--quiet wall-audio-aec.service'")
-    for name in ("wall-mic-rear.service", "wall-bt-mic.service"):
+    for name in ("wall-mic-rear.service", "wall-bt-call.service"):
         unit = read(WALL / name)
         assert "After=wall-audio-aec.service" in unit
         assert "PartOf=wall-audio-aec.service" in unit
@@ -2174,8 +2174,8 @@ def test_firstboot_seeds_the_mic_knobs_only_if_absent_sr029():
     text = read(WALL / "wall-firstboot.sh")
     assert "if [ ! -f /etc/wall-panel/audio-mic.env ]; then" in text
     assert "wall-audio-output mic --render" in text
-    assert "wall-bt-mic.py" in text, "the supervisor must be installed"
-    for unit in ("wall-mic-rear.service", "wall-bt-mic.service"):
+    assert "wall-bt-call.py" in text, "the supervisor must be installed"
+    for unit in ("wall-mic-rear.service", "wall-bt-call.service"):
         assert unit in text, "%s must be installed" % unit
 
 
@@ -2183,9 +2183,9 @@ def test_the_mode_switch_takes_the_mic_legs_with_it_sr029():
     """Item 25's lesson: a forwarder left holding a dmix leaves a stale segment."""
     text = read(WALL / "wall-audio-mode")
     stop = [line for line in text.splitlines() if "unit stop" in line]
-    assert any("wall-mic-rear.service" in line and "wall-bt-mic.service" in line
+    assert any("wall-mic-rear.service" in line and "wall-bt-call.service" in line
                for line in stop), stop
-    assert "wall-mic-rear wall-bt-mic" in text, "and the IPC sweep must know them"
+    assert "wall-mic-rear wall-bt-call" in text, "and the IPC sweep must know them"
 
 
 # ── what review found, and the asymmetry it forced ────────────────────────
@@ -2332,9 +2332,9 @@ def test_the_supervisor_and_the_applier_share_one_definition_of_mic_live_sr029(b
     assert "policy.mic_live" in source, "the single definition, not a second copy"
     assert "import wall_audio_state" in source
     installed = read(WALL / "wall-firstboot.sh")
-    assert "wall_audio_state.py" in installed and "wall-bt-mic.py" in installed
+    assert "wall_audio_state.py" in installed and "wall-bt-call.py" in installed
     # Both into the SAME directory, or the import above cannot resolve.
-    block = installed.split("wall_audio_state.py wall-bt-mic.py", 1)[1][:400]
+    block = installed.split("wall_audio_state.py wall-bt-call.py", 1)[1][:400]
     assert "/usr/local/lib/wall-panel/" in block
 
 
@@ -2352,10 +2352,45 @@ def test_both_mic_units_re_check_the_mute_on_every_start_sr029():
         assert "Restart=always" in text, "the premise of the gate"
         conditions = [line for line in text.splitlines()
                       if line.startswith("ExecCondition=")]
-        assert any("mic-allowed" in line for line in conditions), \
-            "%s can be restarted behind a mute" % unit.name
         assert any("audio-mode" in line for line in conditions), \
             "%s must still carry the bus-mode gate" % unit.name
+
+    # THE REAR LEG KEEPS THE UNIT GATE. It is a microphone and nothing else,
+    # so refusing to start is the whole of what it needs to do when muted.
+    assert any("mic-allowed" in line for line in read(MIC_REAR_UNIT_FILE).splitlines()
+               if line.startswith("ExecCondition=")), \
+        "wall-mic-rear can be restarted behind a mute"
+
+
+def test_the_call_supervisor_enforces_the_mute_in_process_not_at_the_unit_sr029(btmic):
+    """The same guarantee, moved, because the unit grew a second direction.
+
+    wall-bt-call carries the far END as well as the microphone now, and
+    muting your microphone must not silence the person you are listening to
+    (WSN-027 read with the call plan). A unit-level `mic-allowed` gate stops
+    both legs together, so it was removed -- and removing a guarantee without
+    replacing it is how this file's defects have always started.
+
+    The replacement is stricter, not weaker: the unit gate is evaluated once
+    per START, so an operator restart races it, while this is re-read on
+    every 0.25 s tick and cannot be outrun. It is also faster than the
+    APPLIER stopping the unit, which is what used to enforce it.
+    """
+    unit = read(BT_MIC_UNIT_FILE)
+    conditions = [line for line in unit.splitlines() if line.startswith("ExecCondition=")]
+    assert not any("mic-allowed" in line for line in conditions), \
+        "a unit-level mute gate would take the far-end leg down with the microphone"
+
+    source = read(WALL / "wall-bt-call.py")
+    # The slow poll must not own the mute: the tick loop has to re-check it.
+    # Bounded at `finally:` -- the teardown below it stops both legs, which is
+    # correct there and would make this assertion pass for the wrong reason.
+    tick = source.split("while waited < interval", 1)[1].split("finally:", 1)[0]
+    assert "mic_allowed()" in tick, \
+        "the mute is only re-checked once per poll; that can be five seconds late"
+    assert "mic_leg.stop()" in tick, "the tick must stop the MICROPHONE leg"
+    assert "voice_leg.stop()" not in tick, \
+        "the tick stops the far-end leg too, which is the thing this must not do"
 
 
 def test_the_mic_allowed_gate_takes_no_lock_sr029(applier):
@@ -2776,7 +2811,7 @@ def test_a_replugged_adapter_brings_the_rear_mic_leg_back_sr029():
         "the policy-owned start is only safe because it gates itself"
     # The Bluetooth leg is not named by udev either: ALL_LEGS owns it with the
     # rear mic, so the rule cannot go stale when policy gains another leg.
-    assert "wall-bt-mic.service" not in rule
+    assert "wall-bt-call.service" not in rule
 
 
 def test_a_dry_run_mic_command_writes_nothing_sr029(applier, tmp_path, monkeypatch):
@@ -2855,8 +2890,13 @@ _CONNECTED = "/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink"
 _OTHER = "/org/bluealsa/hci0/dev_11_22_33_44_55_66/hfphf/sink"
 
 
-def _bus(tree, running):
-    """A fake busctl: the tree, then one Running answer per object path."""
+def _bus(tree, running, sampling=None):
+    """A fake busctl: the tree, then the properties read off each object path.
+
+    `sampling` defaults to 8000 -- CVSD, which is what the panel's own link
+    negotiates. A path mapped to None answers an unparseable rate, which is
+    how "running, but will not say its rate" is exercised.
+    """
     calls = []
 
     def run(argv, **kwargs):
@@ -2864,7 +2904,12 @@ def _bus(tree, running):
         if "tree" in argv:
             return _Reply(0, tree, "")
         path = argv[argv.index("org.bluealsa") + 1]
-        return _Reply(0, "b true\n" if running.get(path) else "b false\n", "")
+        if argv[-1] == "Running":
+            return _Reply(0, "b true\n" if running.get(path) else "b false\n", "")
+        if argv[-1] == "Sampling":
+            rate = (sampling or {}).get(path, 8000)
+            return _Reply(0, ("u %d\n" % rate) if rate else "\n", "")
+        raise AssertionError("unexpected property %s" % argv[-1])
 
     run.calls = calls
     return run

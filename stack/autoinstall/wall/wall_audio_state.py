@@ -805,11 +805,23 @@ HEADSET_LEGS = ("wall-bus-headset.service",)
 #
 #   wall-mic-rear   mic_selected -> the adapter's REAR pair, which item 23
 #                   revision 2 wires to the desktop's audio input.
-#   wall-bt-mic     mic_selected -> the connected phone's HFP SCO sink, started
-#                   and stopped by its own bounded poll because an SCO PCM only
-#                   exists while a call is up.
-MIC_LEGS = ("wall-mic-rear.service", "wall-bt-mic.service")
-ALL_LEGS = SPEAKER_LEGS + HEADSET_LEGS + MIC_LEGS
+MIC_LEGS = ("wall-mic-rear.service",)
+# THE CALL SUPERVISOR IS NOT A MIC LEG, and it stopped being one when it grew
+# the far-end direction (A3, 2026-09-19). It was in MIC_LEGS, which keys on
+# `mic_live`, so muting the microphone stopped the whole unit -- and the unit
+# now also carries the OTHER person's voice onto the bus. Muting your
+# microphone must not silence the person you are listening to; that is what a
+# muted headset does, and it is WSN-027 read with §20a of the call plan.
+#
+# So it keys on `audible` instead: output Mute (or Headset with no adapter)
+# means the panel is silent and there is nothing for either direction to do,
+# while Speaker and Headset keep the supervisor up. The INPUT mute is then
+# enforced inside the process, which re-reads the switch state on every tick
+# and stops the microphone leg alone. That is the tighter guarantee of the
+# two -- a unit stop can be outrun by an operator restart, and a per-tick
+# check cannot -- and it is what `wall-bt-call.service` argues at length.
+CALL_LEGS = ("wall-bt-call.service",)
+ALL_LEGS = SPEAKER_LEGS + HEADSET_LEGS + MIC_LEGS + CALL_LEGS
 
 
 def plan(state, aec_available=False):
@@ -833,6 +845,9 @@ def plan(state, aec_available=False):
     legs = {unit: speaker for unit in SPEAKER_LEGS}
     legs.update({unit: headset for unit in HEADSET_LEGS})
     legs.update({unit: mic for unit in MIC_LEGS})
+    # Not `mic`: see CALL_LEGS. The supervisor owns the microphone half of its
+    # own behaviour, and stopping it for a mute would take the far end with it.
+    legs.update({unit: live for unit in CALL_LEGS})
     return {
         # The speaker leg is TWO units on purpose: bus -> tap, then
         # tap -> adapter. The detector reads the tap, which is what makes it

@@ -97,8 +97,8 @@ mic_leg_gone() {
 }
 
 stop_mic_legs_or_refuse() {
-    unit stop wall-mic-rear.service wall-bt-mic.service
-    for _mic in wall-mic-rear.service wall-bt-mic.service; do
+    unit stop wall-mic-rear.service wall-bt-call.service
+    for _mic in wall-mic-rear.service wall-bt-call.service; do
         mic_leg_gone "$_mic" && continue
         echo "audio-mode: $_mic did not stop (or could not be queried); killing it" >&2
         systemctl kill --signal=SIGKILL "$_mic" >/dev/null 2>&1 || true
@@ -323,7 +323,7 @@ apply_bus() {
         wall-audio-state.service wall-audio-resume.service wall-audio-apply.path
     # The legs are NEVER enabled: wall-audio-output starts exactly the one the
     # stored switch position calls for.
-    unit disable wall-mic-rear.service wall-bt-mic.service \
+    unit disable wall-mic-rear.service wall-bt-call.service \
         wall-bus-speaker.service wall-speaker-out.service \
         wall-bus-headset.service
     # wall-line-in is the 3.5 mm feed the S/PDIF capture replaces by
@@ -430,7 +430,7 @@ case "${1:-}" in
   status|"")
     printf 'mode:   %s\n' "$(cat "$MODE_FILE" 2>/dev/null || echo trigger)"
     printf 'chain:  %s\n' "$(readlink -f "$LINK" 2>/dev/null || echo MISSING)"
-    for u in wall-line-in wall-kiosk-loop wall-amp-trigger bluealsa bluealsa-aplay              wall-spdif-in wall-bus-speaker wall-speaker-out wall-bus-headset              wall-headset-present wall-mic-rear wall-bt-mic; do
+    for u in wall-line-in wall-kiosk-loop wall-amp-trigger bluealsa bluealsa-aplay              wall-spdif-in wall-bus-speaker wall-speaker-out wall-bus-headset              wall-headset-present wall-mic-rear wall-bt-call; do
         printf '%-18s %-10s %s\n' "$u:" \
             "$(systemctl is-active "$u.service" 2>/dev/null)" \
             "$(systemctl is-enabled "$u.service" 2>/dev/null)"

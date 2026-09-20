@@ -2,7 +2,7 @@
 #
 # WHAT IT IS FOR. In Speaker position the room's own music reaches the panel's
 # microphone, and everything the microphone forwards -- the desktop's input
-# through wall-mic-rear, a phone's HFP return through wall-bt-mic -- carries
+# through wall-mic-rear, a phone's HFP return through wall-bt-call -- carries
 # that echo back to whoever is listening. The spike (HomeHub
 # docs/AEC_SPIKE_2026-09-14.md) measured 54.9 ms of bulk delay and 27 dB of
 # offline ERLE with a 128 ms filter and a 50 ms pre-delay; this is that design.

@@ -50,7 +50,7 @@ AUDIO_SINK_UUID = "0000110b"     # the far end SINKS audio   -> panel output
 # PHONE advertises. Lumping both under "a headset, both directions" classified
 # every phone as an output, and `select_input` refuses a device whose kind is
 # not `input`, so the panel could not select the phone whose microphone
-# `wall-bt-mic` exists to carry. The primary use of the verb was unreachable.
+# `wall-bt-call` exists to carry. The primary use of the verb was unreachable.
 HANDSFREE_UNIT_UUID = "0000111e"     # the far end is a headset  -> panel output
 HANDSFREE_GATEWAY_UUID = "0000111f"  # the far end is a phone    -> panel input
 

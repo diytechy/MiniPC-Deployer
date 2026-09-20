@@ -286,7 +286,7 @@ run set speaker >/dev/null
 run input-mute off >/dev/null
 out="$(run apply-state)"
 has "systemctl start wall-mic-rear.service" "$out" "B14 the rear mic leg starts on Speaker"
-has "systemctl start wall-bt-mic.service" "$out" "B14 and so does the HFP mic return"
+has "systemctl start wall-bt-call.service" "$out" "B14 and so does the HFP mic return"
 has "microphone: mic_panel" "$out" "B14 Speaker selects the panel's own microphone (D4)"
 # The selection must be on disk BEFORE any leg is started: ALSA resolves
 # @func getenv when the PCM is opened, and a leg started first would open the
@@ -301,7 +301,7 @@ has "output speaker -> headset" "$out" "B14 the switch moves"
 hasnt "systemctl start wall-mic-rear.service" "$out" \
     "B16 headset selected but absent tunnels NO microphone (ruling 7)"
 has "systemctl stop wall-mic-rear.service" "$out" "B16 and the rear leg is stopped"
-has "systemctl stop wall-bt-mic.service" "$out" "B16 and so is the HFP return"
+has "systemctl stop wall-bt-call.service" "$out" "B16 and so is the HFP return"
 
 # B15 — the input mute is a real mute, not a flag the chrome draws.
 run set speaker >/dev/null
@@ -309,7 +309,7 @@ run input-mute off >/dev/null
 out="$(run input-mute on)"
 has "input mute on" "$out" "B15 the mute is journaled"
 has "systemctl stop wall-mic-rear.service" "$out" "B15 the rear leg is STOPPED"
-has "systemctl stop wall-bt-mic.service" "$out" "B15 the HFP return is STOPPED"
+has "systemctl stop wall-bt-call.service" "$out" "B15 the HFP return is STOPPED"
 has "sset Capture nocap" "$out" "B15 and the capture switch is closed as well"
 hasnt "systemctl start wall-mic-rear.service" "$out" "B15 nothing carries the mic"
 # The speakers are untouched: the two buttons are independent (ruling E).
@@ -327,7 +327,7 @@ out="$(run set mute)"
 has "systemctl stop wall-speaker-out.service" "$out" "B16 Mute stops the room"
 has "systemctl stop wall-mic-rear.service" "$out" \
     "B16 and ALSO stops the microphone (item J)"
-has "systemctl stop wall-bt-mic.service" "$out" "B16 including the HFP return"
+has "systemctl stop wall-bt-call.service" "$out" "B16 including the HFP return"
 hasnt "systemctl start wall-mic-rear.service" "$out" "B16 and starts neither"
 has "sset Capture nocap" "$out" "B16 the capture switch is closed too"
 has "input mute on (coupled to the output Mute position, item J)" "$out" \

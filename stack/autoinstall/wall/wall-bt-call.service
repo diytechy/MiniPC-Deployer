@@ -1,4 +1,11 @@
-# wall-bt-mic.service - the selected microphone back to the connected phone.
+# wall-bt-call.service - both directions of a call the panel is the headset for.
+#
+# WAS wall-bt-mic.service, which carried the microphone only. It now supervises
+# TWO legs: the selected microphone to the gateway, and (A3, behind
+# WALL_BT_SCO_PLAYBACK) the gateway's far end onto the merged bus. One process
+# rather than two units because an SCO PCM exists only for the duration of a
+# call and is named after the peer, so neither leg can be a `BindsTo=` unit,
+# and two supervisors polling the same D-Bus tree would race each other.
 #
 # THE SECOND HALF OF ITEM 23 SPEC C: "the selected mic feeds the rear output and
 # the Bluetooth mic return". wall-mic-rear.service is the rear-output half.
@@ -15,10 +22,21 @@
 # SCO sink and this unit simply polls and finds nothing, which is a correct and
 # quiet way to be inactive -- it is not an error and must not be logged as one.
 #
-# NOT ENABLED, and stopped by `input_muted` exactly as the rear leg is: Owner
-# ruling E's input mute is applied by STOPPING both mic legs, so that no sample
-# leaves the panel at all. A mute that only told the UI to draw a red slash
-# would be indistinguishable from a working microphone to anybody on the call.
+# NOT ENABLED, and the MICROPHONE LEG is stopped by `input_muted` exactly as the
+# rear leg is: Owner ruling E's input mute is applied by STOPPING both mic legs,
+# so that no sample leaves the panel at all. A mute that only told the UI to
+# draw a red slash would be indistinguishable from a working microphone to
+# anybody on the call.
+#
+# WHICH IS WHY `mic-allowed` IS NO LONGER AN ExecCondition ON THIS UNIT. It
+# used to be, correctly, while the unit was the microphone and nothing else.
+# Now the unit also carries the FAR END, and muting the panel must not silence
+# the person you are listening to -- that is what a muted headset does
+# (WSN-027, and §20a of the 2026-09-19 plan). A unit-level gate would stop
+# both legs together. The check has moved to the per-poll one the process
+# already made through `wall_audio_state.mic_live`, which is the same
+# authority re-read on every poll rather than once per start, and is strictly
+# the tighter of the two: an operator restart cannot outrun it.
 #
 # AND THE STOP IS NOT THE ONLY THING HOLDING THAT. This unit is Restart=always
 # and a long-lived process, so "it was stopped once" is not a property anybody
@@ -27,10 +45,11 @@
 # therefore re-reads /etc/wall-panel/audio-state.json on every poll and refuses
 # to open a microphone unless the switch's own state still authorises one --
 # through wall_audio_state.mic_live, which is the single definition of that.
-# Review (terra, 2026-09-14) found the fail-open this closes.
+# Review (terra, 2026-09-14) found the fail-open this closes. That per-poll
+# check is now the ONLY mute gate, by the argument above.
 
 [Unit]
-Description=Wall panel: selected microphone to the connected phone (HFP mic return)
+Description=Wall panel: both directions of a call the panel is the headset for
 Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
 After=sound.target bluealsa.service
 Wants=sound.target
@@ -47,22 +66,19 @@ StartLimitBurst=10
 [Service]
 Type=simple
 ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
-# THE MUTE IS RE-CHECKED ON EVERY START ATTEMPT, RESTARTS INCLUDED. This unit
-# is Restart=always, so "the applier stopped it" is not a property anybody can
-# rely on: a guard or alsaloop crash, an operator restart, a daemon-reload
-# workflow, or a stop that FAILED during an apply would each bring it back with
-# the state still saying muted. systemd re-runs ExecCondition on every start
-# attempt and treats a non-zero exit as a clean "not started" rather than a
-# failure, which is exactly the shape wanted. It takes no lock, so it cannot
-# deadlock the apply that is starting this leg. Review (terra, 2026-09-14)
-# found this path once per mic leg.
-ExecCondition=/usr/local/sbin/wall-audio-output mic-allowed
 # Refuse a silent mic_clean when the seam has moved; raw-mic mode is unaffected.
+# STILL A UNIT GATE, unlike the mute: a dead echo canceller means the
+# microphone leg would send raw echo to the far end, and there is no useful
+# far-end-only mode to keep running in when the panel's own capture chain is
+# broken. Failing closed here is the same answer it always was.
 ExecCondition=/bin/sh -c '! grep -qx WALL_AUDIO_AEC=1 /etc/wall-panel/audio-aec.env 2>/dev/null || systemctl is-active --quiet wall-audio-aec.service'
 EnvironmentFile=-/run/wall-panel/audio-mic-source.env
 EnvironmentFile=-/run/wall-panel/audio-headset.env
 EnvironmentFile=-/etc/wall-panel/bt-mic.env
-ExecStart=/usr/local/lib/wall-panel/wall-bt-mic.py
+# A3's knob. Absent or 0 leaves the far-end leg off and this unit behaves
+# exactly as wall-bt-mic.service did.
+EnvironmentFile=-/etc/wall-panel/bt-call.env
+ExecStart=/usr/local/lib/wall-panel/wall-bt-call.py
 Restart=always
 RestartSec=5
 Nice=-5
@@ -70,5 +86,6 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=true
 SupplementaryGroups=audio
+ExecStopPost=-/bin/rm -f /run/wall-panel/call-state.json
 StandardOutput=journal
 StandardError=journal

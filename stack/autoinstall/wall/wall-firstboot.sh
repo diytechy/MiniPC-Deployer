@@ -1242,6 +1242,27 @@ pcm.card_loop_mic_cap { type hw
     device 1
     subdevice 2
 }
+# SUBDEVICE 3 IS THE BLUETOOTH HEADSET'S MICROPHONE (B3, 2026-09-19), and it is
+# the last free one: wall-aloop.conf asks for 4 substreams and 0, 1 and 2 are
+# the merged bus, the amplifier detector's tap and the canceller.
+#
+# WHY A LOOPBACK AND NOT THE BlueALSA PCM DIRECTLY. An SCO capture PCM cannot be
+# wrapped in \`plug\` -- measured on the panel 2026-09-19, \`Poll FD
+# initialization failed\`, because plug does not hand alsaloop the poll
+# descriptors a capture needs -- and it exists only while the AG link is up and
+# is named after the headset's address. Neither \`mic_selected\` nor any leg can
+# open a name like that. \`wall-bt-call\` therefore owns the radio end and writes
+# here, and everything downstream keeps opening one fixed name.
+pcm.card_loop_btmic_play { type hw
+    card "$_loopback"
+    device 0
+    subdevice 3
+}
+pcm.card_loop_btmic_cap { type hw
+    card "$_loopback"
+    device 1
+    subdevice 3
+}
 ctl.card_loop_ctl { type hw
     card "$_loopback"
 }

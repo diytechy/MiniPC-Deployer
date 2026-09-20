@@ -49,6 +49,35 @@ pcm.card_loop_tap_cap { type hw
     subdevice 1
 }
 
+# The echo canceller's substream: it writes the cancelled microphone here and
+# `mic_clean` snoops it back out.
+pcm.card_loop_mic_play { type hw
+    card "Loopback"
+    device 0
+    subdevice 2
+}
+
+pcm.card_loop_mic_cap { type hw
+    card "Loopback"
+    device 1
+    subdevice 2
+}
+
+# The Bluetooth headset's microphone (B3). `wall-bt-call` writes here while it
+# is bridging a call, and silence the rest of the time so that nothing
+# downstream stalls on a loopback with no writer; `mic_bt` snoops it back out.
+pcm.card_loop_btmic_play { type hw
+    card "Loopback"
+    device 0
+    subdevice 3
+}
+
+pcm.card_loop_btmic_cap { type hw
+    card "Loopback"
+    device 1
+    subdevice 3
+}
+
 ctl.card_usb_ctl { type hw
     card "ICUSBAUDIO7D"
 }

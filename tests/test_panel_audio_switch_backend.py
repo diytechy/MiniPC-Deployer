@@ -406,7 +406,12 @@ def test_status_reports_routing_unavailable_and_the_switch_present_sr028(panel):
                                 "reason": "headset_absent", "volume": 60,
                                 "generation": 0, "requestSeq": -1,
                                 "inputMuteHeld": False,
-                                "inputMutedConfirmed": False}
+                                "inputMutedConfirmed": False,
+                                # B4: Headset with NEITHER headset. The token is
+                                # unchanged and `headsetVia` is the null that
+                                # says why -- the position resolves to nothing.
+                                "headsetVia": None,
+                                "btHeadsetPresent": False}
 
 
 def test_status_volume_is_the_selected_outputs_memory_sr028(panel):
@@ -706,7 +711,13 @@ def test_a_sparse_state_file_reports_a_supported_switch_sr028(panel):
                                 "reason": None, "volume": 60,
                                 "generation": 0, "requestSeq": -1,
                                 "inputMuteHeld": False,
-                                "inputMutedConfirmed": False}
+                                "inputMutedConfirmed": False,
+                                # B4: absent keys in a sparse file are NOT a
+                                # repair, so the microphone's mute above comes
+                                # from the rule it always came from and not
+                                # from the two fields this release added.
+                                "headsetVia": None,
+                                "btHeadsetPresent": False}
 
 
 def test_a_lost_mutation_reconciles_on_a_sparse_state_file_llr015(panel, tmp_path):

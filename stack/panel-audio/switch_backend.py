@@ -728,10 +728,27 @@ class SwitchApplierBackend:
                 # Unreadable: the coupling cannot be evaluated and the mute
                 # certainly cannot be confirmed.
                 "inputMuteHeld": False, "inputMutedConfirmed": False,
+                # THE SHAPE IS THE SAME IN BOTH ARMS. A renderer that has to
+                # ask whether a key exists before reading it will one day be
+                # written by somebody who forgets, and "unknown" is a value
+                # this block can carry: null means the same thing here as it
+                # does in Speaker.
+                "headsetVia": None, "btHeadsetPresent": False,
             }, muted=False, mute_supported=False)
         output = state["output"]
-        unavailable = output == "mute" or (output == "headset" and not state["headset_present"])
-        reason = "headset_absent" if output == "headset" and not state["headset_present"] else None
+        # ── B4: Headset RESOLVES, so "is it available" is a priority ────────
+        # Bluetooth wins whenever it is connected, then the USB adapter, then
+        # nothing -- the Owner's ruling Q5, 2026-09-19. The same three answers
+        # `wall_audio_state.headset_via` gives, mirrored here for the same
+        # reason the whole of `_normalized` is: this sandbox cannot import the
+        # applier's tree, and a test asserts the two agree.
+        #
+        # THE REASON TOKEN DOES NOT CHANGE. `headset_absent` now means "neither
+        # headset resolves", and the chrome's red icon needs no second word.
+        via = ("bluetooth" if state["bt_headset_present"]
+               else "usb" if state["headset_present"] else None)
+        unavailable = output == "mute" or (output == "headset" and via is None)
+        reason = "headset_absent" if output == "headset" and via is None else None
         # ── ITEM J, reported so the chrome never has to derive the rule ────
         # `inputMuted` is the EFFECTIVE mute -- what the microphone actually is.
         # `inputMuteHeld` says an independent unmute is refused right now, which
@@ -748,6 +765,14 @@ class SwitchApplierBackend:
             "generation": state["generation"], "requestSeq": state["request_seq"],
             "inputMuteHeld": held,
             "inputMutedConfirmed": muted_effective and not state["mic_legs_running"],
+            # WHICH HEADSET "Headset" MEANS, so the chrome can put a Bluetooth
+            # mark on the segment and the person knows before a call starts.
+            # Null in any position but Headset: it is the resolution OF a
+            # position, not a standing fact about the hardware.
+            "headsetVia": via if output == "headset" else None,
+            # The same question without the switch, which is what explains the
+            # red icon ("neither") and what a future pane would offer.
+            "btHeadsetPresent": state["bt_headset_present"],
         }, muted=output == "mute", mute_supported=True)
 
     @staticmethod
@@ -776,7 +801,8 @@ class SwitchApplierBackend:
         """
         raw = self._state_strict()
         state = {"output": DEFAULT_OUTPUT, "input_muted": True,
-                 "headset_present": False, "request_seq": -1, "volume_event_seq": 0,
+                 "headset_present": False, "bt_headset_present": False,
+                 "request_seq": -1, "volume_event_seq": 0,
                  "generation": 0, "mic_legs_running": True,
                  "volume": dict(DEFAULT_VOLUME)}
         # Same rule as wall_audio_state.normalize (step 4, terra rounds 2-4):
@@ -799,6 +825,19 @@ class SwitchApplierBackend:
         if isinstance(raw.get("headset_autoswitch_armed"), bool):
             pass
         elif "headset_autoswitch_armed" in raw:
+            repaired = True
+        # B4: the second presence. An ABSENT key is not a repair -- a state
+        # file written before B4 has neither -- for exactly the reason
+        # `wall_audio_state.normalize` gives: a panel whose first status after
+        # the upgrade declared the file damaged would report a muted microphone
+        # nobody muted. A key that is present and the wrong type still is.
+        if isinstance(raw.get("bt_headset_present"), bool):
+            state["bt_headset_present"] = raw["bt_headset_present"]
+        elif "bt_headset_present" in raw:
+            repaired = True
+        if isinstance(raw.get("bt_headset_autoswitch_armed"), bool):
+            pass
+        elif "bt_headset_autoswitch_armed" in raw:
             repaired = True
         seq = raw.get("request_seq")
         if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:

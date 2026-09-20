@@ -86,6 +86,6 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=true
 SupplementaryGroups=audio
-ExecStopPost=-/bin/rm -f /run/wall-panel/call-state.json
+ExecStopPost=-/bin/rm -f /run/wall-panel/call-state.json /run/wall-panel/call-bridge
 StandardOutput=journal
 StandardError=journal

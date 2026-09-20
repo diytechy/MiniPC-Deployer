@@ -1,0 +1,95 @@
+# wall-bus-bt-headset.service — the switch on Headset, resolved to Bluetooth.
+#
+# B4, Owner ruling 2026-09-19 Q5: "Bluetooth is automatic and has priority over
+# USB, even if USB is plugged back in. When the bluetooth headset is not
+# connected, always attempt to resolve to USB. The headset icon would be red if
+# both the USB and bluetooth are not connected."
+#
+# So this is the Headset position's OTHER leg. `wall_audio_state.headset_via`
+# decides which of the two runs, the applier starts exactly one, and the glass
+# is unchanged — the switch still has three positions and a Bluetooth headset
+# is a RESOLUTION of Headset, never a fourth pill (WSN-024's closing line).
+#
+# WHY THIS IS NOT wall-bus-bluetooth.service, WHICH PLAYS THE SAME AUDIO TO THE
+# SAME KIND OF DEVICE. That unit is WSN-024's `select_output`: a route the Owner
+# picked in the Bluetooth pane, owned and restarted by `wall-bluetooth-device`,
+# running BESIDE whatever the switch is doing. This one is owned by the audio
+# applier and follows the switch. Sharing one unit would give it two owners and
+# one environment file two writers, and every out-of-sync defect in this panel's
+# access chain so far has been an overloaded name rather than a race. The cost
+# is stated rather than discovered: an explicitly routed Bluetooth speaker and a
+# Bluetooth headset that Headset resolved to will both play, which is exactly
+# what WSN-024 already says a route leg does.
+#
+# THE DESTINATION IS `bt_headset_out`, NOT `bluealsa:` DIRECTLY, and that is
+# not cosmetic: `bt_headset_out` carries the "Bus Playback Volume" softvol, so
+# the rocker works in this position. A leg that addressed the radio directly
+# would leave the Owner's remembered Headset level with nothing to act on.
+#
+# A2DP, NOT SCO. The headset hears the merged bus in stereo at 48 kHz for as
+# long as nothing needs its microphone. `wall-bt-call` takes the link to SCO
+# while it bridges a call — the two profiles are exclusive on one peer — and
+# stops this leg for the duration; see §20b leg 3 of the call plan.
+
+[Unit]
+Description=Wall panel: merged bus to the Bluetooth headset (switch position Headset)
+Documentation=file:///opt/wall-panel/docs/design/audio-routing-2026-09-13.md
+After=sound.target bluetooth.service
+Wants=sound.target
+# A radio walks away far more often than a USB adapter is unplugged, so the
+# generous start limit rather than systemd's default five-in-ten.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = bus ]'
+# Written by wall-audio-output on every apply, beside the USB card id, from the
+# address the Bluetooth observer resolved. The `-` prefix keeps its absence from
+# being a start failure of its own; the ExecCondition below is the honest way to
+# say "no Bluetooth headset is connected".
+EnvironmentFile=-/run/wall-panel/audio-headset.env
+ExecCondition=/bin/sh -c '[ -n "$WALL_AUDIO_HEADSET_BT_DEV" ]'
+# AND THE SWITCH HAS TO BE POINTING HERE (terra, 2026-09-19, finding 2). An
+# address alone is not the condition: the applier publishes one for as long as
+# a Bluetooth headset is CONNECTED, whatever position the switch is in, so a
+# unit gated on the address alone would play the room's music into the headset
+# from Speaker or Mute. It happened by the bridge's own hand -- the supervisor
+# `systemctl start`s this unit when a call ends, and "the call ended" says
+# nothing about where the switch is. `WALL_AUDIO_HEADSET_VIA` is the applier's
+# published RESOLUTION and is `bluetooth` only in the Headset position.
+ExecCondition=/bin/sh -c '[ "$WALL_AUDIO_HEADSET_VIA" = bluetooth ]'
+# AND NOT WHILE A CALL IS BRIDGED TO THIS HEADSET. A2DP and SCO are exclusive
+# on one peer, so `wall-bt-call` takes this leg down for the duration of a
+# bridge and puts it back afterwards (§20b leg 3). This condition is what stops
+# an apply arriving mid-call -- the Owner pressing Mute, a volume request, a
+# headset plug -- from starting it again underneath a live SCO link. The
+# supervisor publishes `bridge` BEFORE it stops this unit, so the ordering
+# holds.
+#
+# A MARKER FILE AND NOT A GREP OF call-state.json. The state document is JSON
+# and a unit file cannot quote a JSON fragment through systemd's parser and
+# sh's without one of them eating a quote -- and a condition that silently
+# matched nothing would start this leg under a live SCO link with no sign in
+# the journal. `wall-bt-call` touches and removes the marker in the same two
+# places it publishes the state.
+ExecCondition=/bin/sh -c '! test -e /run/wall-panel/call-bridge'
+ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
+    --max-errors 20 --window 10 -- \
+    /usr/bin/alsaloop \
+    --cdevice bus_monitor \
+    --pdevice bt_headset_out \
+    --format S16_LE --rate 48000 --channels 2 \
+    --tlatency 100000 --sync 5
+Restart=always
+RestartSec=2
+# NOT Nice=-5 and NOT realtime, unlike the wired headset leg, and for the same
+# reason wall-bus-bluetooth.service is not: this feeds a radio whose own buffer
+# already dominates the latency, so giving it priority over the leg playing to
+# the room would be paying the wrong path.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+SupplementaryGroups=audio
+StandardOutput=journal
+StandardError=journal

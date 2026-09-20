@@ -52,6 +52,14 @@ import routing
 
 DEFAULT_STATE_PATH = Path("/run/wall-bluetooth/state.json")
 DEFAULT_APPLIER_PATH = Path("/usr/local/sbin/wall-bluetooth-device")
+# B7 §20d: the call the panel is carrying, published by `wall-bt-call`.
+#
+# READ HERE AND NOT COMMANDED. A call is a fact the panel OBSERVES -- the
+# gateway placed it and the gateway hangs it up -- so it rides on `status` and
+# there is no verb. It carries aliases only; the supervisor resolves the
+# address through the same observer document this backend reads (LLR-979).
+DEFAULT_CALL_PATH = Path("/run/wall-panel/call-state.json")
+CALL_STATES = ("idle", "call", "bridge")
 
 # How old the observer's document may be before its contents stop being facts.
 # The observer republishes on a timer and after every apply; a document older
@@ -108,9 +116,11 @@ class RoutedDeviceBackend:
     LOCAL_ONLY_METHODS = frozenset({"status", "telemetry"})
 
     def __init__(self, switch, *, state_path=None, request_path=None,
-                 applier_path=None, clock=time.time_ns, now=time.time):
+                 applier_path=None, call_path=None,
+                 clock=time.time_ns, now=time.time):
         self.switch = switch
         self.state_path = Path(state_path or DEFAULT_STATE_PATH)
+        self.call_path = Path(call_path or DEFAULT_CALL_PATH)
         self.request_dir = Path(request_path or bluetooth_request.DEFAULT_DIR)
         self.applier_path = Path(applier_path or DEFAULT_APPLIER_PATH)
         self.clock = clock
@@ -440,6 +450,10 @@ class RoutedDeviceBackend:
         if not isinstance(base, dict):
             raise _broker_error("backend_failure", "audio backend failed")
         merged = dict(base)
+        # B7 §20d. Added BEFORE the document guard below, because whether the
+        # panel is on a call is independent of whether the device inventory is
+        # fresh; see `_call`.
+        merged["call"] = self._call()
         document = self._document()
         if document is None:
             merged.update({"available": False, "reason": REASON_UNAVAILABLE,
@@ -457,6 +471,64 @@ class RoutedDeviceBackend:
         # and its own way of going stale; here it expires with the document.
         merged["pairing"] = document["pairing"]
         return merged
+
+    # THE CALL BLOCK IS ADDED OUTSIDE THE DOCUMENT GUARD ABOVE, deliberately.
+    # A Bluetooth adapter that is off, or an observer that has stopped
+    # publishing, says nothing at all about whether the panel is on a call --
+    # the supervisor has its own file and its own liveness. Folding the two
+    # together would blank the handset on the glass because a device list went
+    # stale, which is the diagnostic failing the thing it reports on.
+
+    def _call(self):
+        """The `call` block for status: always a dict, never raises.
+
+        IDLE IS THE ANSWER TO EVERY FAILURE -- a missing file, damaged JSON, a
+        state nobody recognises, a document older than the staleness bound.
+        Same direction as `mic_allowed` in the supervisor and for the same
+        reason: a bridge that does not form is a missing status line, while a
+        handset drawn for a call that ended is the panel lying about a
+        microphone.
+
+        THE SAME STALENESS RULE AS THE DEVICE DOCUMENT, and it needs one for a
+        sharper reason than the inventory does: the supervisor writes this file
+        only when something CHANGES, so a long call is a document that stops
+        being touched. That is why it carries `since` and why freshness is
+        measured against the file's mtime rather than a field -- the fact has
+        not changed, but the process asserting it must still be alive. The
+        supervisor's poll is five seconds by default and the unit is
+        Restart=always, so `MAX_DOCUMENT_AGE_SECONDS` is many polls of slack.
+        """
+        idle = {"state": "idle", "gateway": None, "headset": None,
+                "since": None}
+        try:
+            raw = json.loads(self.call_path.read_text(encoding="utf-8"))
+            age = self.now() - self.call_path.stat().st_mtime
+        except (OSError, ValueError):
+            return idle
+        if age > MAX_DOCUMENT_AGE_SECONDS or age < -1:
+            return idle
+        if not isinstance(raw, dict) or raw.get("state") not in CALL_STATES:
+            return idle
+        if raw["state"] == "idle":
+            return idle
+        return {
+            "state": raw["state"],
+            # ALIASES ARE VALIDATED HERE TOO. This document is written by a
+            # root process on the other side of IF-015, and `routing.ALIAS`
+            # refusing anything address-shaped is the guarantee, not the
+            # writer's good intentions. An unusable alias becomes null rather
+            # than failing the block: the person still needs to see that a
+            # call is up.
+            "gateway": self._alias_or_none(raw.get("gateway")),
+            "headset": self._alias_or_none(raw.get("headset")),
+            "since": raw.get("since") if isinstance(raw.get("since"), str) else None,
+        }
+
+    @staticmethod
+    def _alias_or_none(value):
+        if isinstance(value, str) and routing.ALIAS.fullmatch(value):
+            return value
+        return None
 
     def _document(self):
         """The observer document, normalized, or None if it cannot be trusted.
@@ -622,4 +694,5 @@ def backend_from_environment(switch):
         state_path=os.environ.get("WALL_BLUETOOTH_STATE_PATH") or None,
         request_path=os.environ.get("WALL_BLUETOOTH_REQUEST_PATH") or None,
         applier_path=os.environ.get("WALL_BLUETOOTH_APPLIER_PATH") or None,
+        call_path=os.environ.get("WALL_PANEL_CALL_STATE_PATH") or None,
     )

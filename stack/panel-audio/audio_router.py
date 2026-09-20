@@ -659,8 +659,19 @@ class AudioBroker:
     SWITCH_FIELDS = {"supported", "output", "inputMuted", "available", "reason", "volume"}
     # `inputMuteHeld` and `inputMutedConfirmed` were added by item J and are
     # optional on the same rule.
+    # `headsetVia` and `btHeadsetPresent` were added by B4 and are optional on
+    # the same rule again: a panel whose applier predates the Bluetooth
+    # resolution omits them, and absent means "this panel cannot tell you"
+    # rather than "no Bluetooth headset". The chrome renders the two
+    # differently -- a missing key draws the Headset segment exactly as it drew
+    # it yesterday, which is the right answer on a panel that has not upgraded.
     SWITCH_OPTIONAL_FIELDS = {"generation", "requestSeq",
-                              "inputMuteHeld", "inputMutedConfirmed"}
+                              "inputMuteHeld", "inputMutedConfirmed",
+                              "headsetVia", "btHeadsetPresent"}
+    # What `headsetVia` may say. Null is legal and means "the switch is not on
+    # Headset", which is not the same as "Headset resolves to nothing" -- that
+    # is `available: false` with `reason: headset_absent`.
+    HEADSET_VIA_VALUES = (None, "usb", "bluetooth")
 
     def _safe_switch(self, value: object) -> None:
         """Validate the switch status block. Implements: SR-028, LLR-015."""
@@ -683,11 +694,47 @@ class AudioBroker:
         for field in ("inputMuteHeld", "inputMutedConfirmed"):
             if field in value and not isinstance(value[field], bool):
                 raise BrokerError("unsafe_backend_result", "switch mute coupling is invalid")
+        if ("headsetVia" in value
+                and value["headsetVia"] not in self.HEADSET_VIA_VALUES):
+            raise BrokerError("unsafe_backend_result", "headset resolution is invalid")
+        if "btHeadsetPresent" in value and not isinstance(value["btHeadsetPresent"], bool):
+            raise BrokerError("unsafe_backend_result", "headset resolution is invalid")
         if value["reason"] is not None:
             self._safe_string(value["reason"], 32)
         volume = value["volume"]
         if isinstance(volume, bool) or not isinstance(volume, int) or not 0 <= volume <= 100:
             raise BrokerError("unsafe_backend_result", "switch volume is invalid")
+
+    # The call block (B7 §20d). Exact, like every other block: the renderer
+    # validates a fixed key set, so a field added without a version is an error
+    # at the far end rather than a feature.
+    CALL_FIELDS = {"state", "gateway", "headset", "since"}
+    CALL_STATES = ("idle", "call", "bridge")
+    # An ISO-8601 instant is 20 characters; the bound is here for the same
+    # reason every other string bound in this file is, not because anything is
+    # expected to be longer.
+    CALL_SINCE_MAX = 32
+
+    def _safe_call(self, value: object) -> None:
+        """Validate the call status block. Implements: SR-029, LLR-017 (B7).
+
+        AN ALIAS IS CHECKED AGAINST `routing.ALIAS` HERE AS WELL as in the
+        backend, and the duplication is the point: this is the boundary, and a
+        hardware address reaching the renderer is the one failure LLR-979
+        exists to make impossible. The backend is a writer like any other.
+        """
+        if (not isinstance(value, dict) or set(value) != self.CALL_FIELDS):
+            raise BrokerError("unsafe_backend_result", "call status is not exact")
+        if value["state"] not in self.CALL_STATES:
+            raise BrokerError("unsafe_backend_result", "call state is invalid")
+        for field in ("gateway", "headset"):
+            alias = value[field]
+            if alias is None:
+                continue
+            if not isinstance(alias, str) or not ALIAS.fullmatch(alias):
+                raise BrokerError("unsafe_backend_result", "call alias is invalid")
+        if value["since"] is not None:
+            self._safe_string(value["since"], self.CALL_SINCE_MAX)
 
     def _ensure_safe_result(self, method: str, value: object) -> None:
         """Validate a positive, method-specific response schema."""
@@ -705,9 +752,14 @@ class AudioBroker:
             # -- which is every panel running the switch-only backend -- must
             # stay valid. Absent means "this panel cannot tell you", which the
             # shell renders differently from "no pairing in progress".
+            # `call` joins them (B7 §20d) and is optional on the same rule:
+            # a panel with no call supervisor omits it, and absent means "this
+            # panel cannot tell you" rather than "no call".
             required = {"protocolVersion", "available", "reason", "devices", "route", "visualizer"}
-            if not required <= set(value) or set(value) - required - {"mute", "switch", "pairing"}:
+            if not required <= set(value) or set(value) - required - {"mute", "switch", "pairing", "call"}:
                 raise BrokerError("unsafe_backend_result", "status fields are not exact")
+            if "call" in value:
+                self._safe_call(value["call"])
             if value["protocolVersion"] != 1 or not isinstance(value["available"], bool):
                 raise BrokerError("unsafe_backend_result", "status version or availability is invalid")
             self._safe_string(value["reason"], 64)

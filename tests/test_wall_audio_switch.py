@@ -438,9 +438,18 @@ def test_the_speaker_leg_carries_the_volume_and_the_tap_does_not_sr028():
 
 
 def test_both_legs_share_one_control_on_an_always_present_card_ruling_f_sr028():
+    """THREE legs now, still one control. B4 gave the Headset position a second
+    destination -- a Bluetooth headset -- and the Owner's remembered level has
+    to act on it too, or the rocker does nothing in the one position where the
+    output is on somebody's head. Every leg that plays the bus declares the SAME
+    control on the SAME always-present card."""
     conf = read(BUS_CONF)
-    assert conf.count('name "Bus Playback Volume"') == 2
-    assert conf.count('card "Loopback"') == 2, "not on an adapter that can be unplugged"
+    assert conf.count('name "Bus Playback Volume"') == 3
+    assert conf.count('card "Loopback"') == 3, "not on an adapter that can be unplugged"
+    for chain in ("speaker_out", "headset_out", "bt_headset_out"):
+        block = conf.split("pcm.%s {" % chain, 1)[1].split("\npcm.", 1)[0]
+        assert "type softvol" in block, chain
+        assert 'name "Bus Playback Volume"' in block, chain
 
 
 def test_the_headset_card_reaches_alsa_through_the_environment_sr028():
@@ -843,7 +852,8 @@ def test_a_report_for_an_adapter_already_present_is_not_an_arrival_sr028(policy)
 
 def test_a_remove_is_always_a_runtime_event_sr028(applier):
     """A device that is not there cannot have been coldplugged."""
-    assert applier.headset_event(False) == {"kind": "headset", "present": False, "boot": False}
+    assert applier.headset_event(False) == {"kind": "headset", "present": False,
+                                           "boot": False, "via": "usb"}
 
 
 def test_the_state_unit_does_not_lean_on_udev_settle_sr028():
@@ -2995,3 +3005,423 @@ def test_the_shipped_rate_is_left_alone_sr029(btmic):
     """
     argv = btmic.loop_argv("AA:BB:CC:DD:EE:FF")
     assert argv[argv.index("--rate") + 1] == "16000"
+
+
+# ── B3 / B4 / B5: the Headset position resolves ──────────────────────────────
+# Owner ruling 2026-09-19 Q5, verbatim: "Bluetooth is automatic and has
+# priority over USB, even if USB is plugged back in. When the bluetooth headset
+# is not connected, always attempt to resolve to USB. The headset icon would be
+# red if both the USB and bluetooth are not connected."
+
+
+def _headset_state(policy, output="headset", usb=False, bluetooth=False):
+    state = policy.default_state()
+    state["output"] = output
+    state["input_muted"] = False
+    state["headset_present"] = usb
+    state["bt_headset_present"] = bluetooth
+    return state
+
+
+def test_bluetooth_outranks_usb_even_when_both_are_there_b4_sr028(policy):
+    """The Owner's priority, and the clause that surprises people: BOTH."""
+    assert policy.headset_via(_headset_state(policy, usb=True, bluetooth=True)) == "bluetooth"
+    assert policy.headset_via(_headset_state(policy, usb=True)) == "usb"
+    assert policy.headset_via(_headset_state(policy, bluetooth=True)) == "bluetooth"
+    assert policy.headset_via(_headset_state(policy)) is None
+
+
+def test_headset_with_neither_is_the_red_icon_and_no_mic_b4_sr028(policy):
+    """Ruling 7 as amended: silence on every output, and NOTHING tunnelled.
+
+    The reason token is deliberately the one that already shipped, so the
+    chrome's red icon needs no second word for a second kind of absence.
+    """
+    state = _headset_state(policy)
+    assert policy.audible(state) is False
+    assert policy.unavailable_reason(state) == "headset_absent"
+    assert policy.mic_live(state) is False
+
+
+def test_exactly_one_headset_leg_runs_and_the_other_is_named_false_b4(policy):
+    """BOTH legs appear in every plan. Naming only the winner would leave the
+    loser's last value in place -- the applier stops what the plan says is
+    False -- so moving USB -> Bluetooth would play the room into two headsets.
+    """
+    bluetooth = policy.plan(_headset_state(policy, usb=True, bluetooth=True))["legs"]
+    assert bluetooth["wall-bus-bt-headset.service"] is True
+    assert bluetooth["wall-bus-headset.service"] is False
+    usb = policy.plan(_headset_state(policy, usb=True))["legs"]
+    assert usb["wall-bus-headset.service"] is True
+    assert usb["wall-bus-bt-headset.service"] is False
+    neither = policy.plan(_headset_state(policy))["legs"]
+    assert neither["wall-bus-headset.service"] is False
+    assert neither["wall-bus-bt-headset.service"] is False
+
+
+def test_the_usb_card_is_muted_while_headset_resolves_to_bluetooth_b4(policy):
+    """A card left unmuted with no leg feeding it passes whatever alsactl last
+    restored into a headset hanging on the desk."""
+    assert policy.plan(_headset_state(policy, usb=True))["headset_muted"] is False
+    assert policy.plan(
+        _headset_state(policy, usb=True, bluetooth=True))["headset_muted"] is True
+
+
+def test_the_microphone_follows_the_same_resolution_as_the_output_b3(policy):
+    """One resolution for both directions. Two would put the room's music in
+    one headset and somebody's voice in the other."""
+    assert policy.mic_source(_headset_state(policy, usb=True)) == "mic_headset"
+    assert policy.mic_source(
+        _headset_state(policy, usb=True, bluetooth=True)) == "mic_bt"
+    assert policy.mic_source(_headset_state(policy, bluetooth=True)) == "mic_bt"
+    assert "mic_bt" in policy.MIC_SOURCES
+
+
+def test_the_resolution_is_published_only_in_the_headset_position_b4(policy):
+    """`headset_via` in the plan is the resolution OF a position, not a
+    standing fact about the hardware -- otherwise the chrome would put a
+    Bluetooth mark on a Headset segment nobody is pointing at."""
+    speaker = policy.plan(_headset_state(policy, output="speaker", bluetooth=True))
+    assert speaker["headset_via"] is None
+    assert speaker["bt_headset_present"] is True
+    headset = policy.plan(_headset_state(policy, bluetooth=True))
+    assert headset["headset_via"] == "bluetooth"
+
+
+def test_the_two_presences_have_two_latches_b5_sr028(policy):
+    """A Bluetooth headset connecting must flip Speaker -> Headset even if a
+    USB plug already spent its own latch this boot. One shared latch would
+    make the second arrival of the day silent."""
+    state = policy.default_state()
+    state["input_muted"] = False
+    state, _ = policy.apply_event(state, {"kind": "headset", "present": True,
+                                          "boot": False, "via": "usb"})
+    assert state["output"] == "headset"
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "speaker"})
+    state, _ = policy.apply_event(state, {"kind": "headset", "present": True,
+                                          "boot": False, "via": "bluetooth"})
+    assert state["output"] == "headset", "the Bluetooth latch was still armed"
+
+
+def test_a_republished_bluetooth_presence_is_not_an_arrival_b5(policy):
+    """WHAT MAKES A TEN-SECOND OBSERVER SAFE. It reports presence, not arrival
+    -- it cannot tell them apart -- so every report after the first lands on
+    the already-present branch and moves nothing."""
+    state = policy.default_state()
+    state["input_muted"] = False
+    connect = {"kind": "headset", "present": True, "boot": False, "via": "bluetooth"}
+    state, _ = policy.apply_event(state, connect)
+    assert state["output"] == "headset"
+    state, _ = policy.apply_event(state, {"kind": "set_output", "output": "speaker"})
+    state, lines = policy.apply_event(state, connect)
+    assert state["output"] == "speaker"
+    assert any("already present" in line for line in lines)
+
+
+def test_a_bluetooth_headset_at_boot_records_and_does_not_move_the_switch_b5(policy):
+    """Ruling G: the position the Owner left the panel in wins over a presence
+    nobody can date."""
+    state = policy.default_state()
+    state["input_muted"] = False
+    state, lines = policy.apply_event(state, {"kind": "headset", "present": True,
+                                              "boot": True, "via": "bluetooth"})
+    assert state["output"] == "speaker"
+    assert state["bt_headset_present"] is True
+    assert state["bt_headset_autoswitch_armed"] is False
+    assert any("bluetooth headset present at boot" in line for line in lines)
+
+
+def test_losing_bluetooth_falls_back_to_usb_and_says_so_b5(policy):
+    """Owner ruling Q5's second clause. The journal line matters: before B4 a
+    headset going away in the Headset position always meant silence, and a log
+    that still said so would send the next person hunting a fault."""
+    state = _headset_state(policy, usb=True, bluetooth=True)
+    state, lines = policy.apply_event(state, {"kind": "headset", "present": False,
+                                              "boot": False, "via": "bluetooth"})
+    assert policy.headset_via(state) == "usb"
+    assert policy.audible(state) is True
+    assert any("resolved to usb" in line for line in lines)
+    state, lines = policy.apply_event(state, {"kind": "headset", "present": False,
+                                              "boot": False, "via": "usb"})
+    assert policy.headset_via(state) is None
+    assert any("every output silent" in line for line in lines)
+
+
+def test_a_usb_plug_while_bluetooth_is_connected_changes_nothing_audible_b5(policy):
+    """Owner ruling Q5: Bluetooth keeps priority "even if USB is plugged back
+    in". The plug is still recorded and may still flip Speaker -> Headset --
+    "either USB or Bluetooth connecting would flip to headset mode" -- but
+    what Headset RESOLVES to does not move."""
+    state = _headset_state(policy, bluetooth=True)
+    before = policy.plan(state)
+    state, _ = policy.apply_event(state, {"kind": "headset", "present": True,
+                                          "boot": False, "via": "usb"})
+    after = policy.plan(state)
+    assert state["headset_present"] is True
+    assert after["legs"] == before["legs"]
+    assert after["mic_source"] == before["mic_source"] == "mic_bt"
+
+
+def test_an_unknown_via_is_refused_rather_than_guessed_b5(policy):
+    with pytest.raises(policy.StateError):
+        policy.apply_event(policy.default_state(),
+                           {"kind": "headset", "present": True, "via": "wifi"})
+
+
+def test_via_defaults_to_usb_so_every_existing_caller_still_means_the_adapter(policy):
+    """The udev unit, the coldplug report and a bare CLI `headset add` all
+    predate B5 and all mean the cable. A default that retargeted them at the
+    radio would be the worst kind of upgrade."""
+    state = policy.default_state()
+    state, _ = policy.apply_event(state, {"kind": "headset", "present": True,
+                                          "boot": True})
+    assert state["headset_present"] is True
+    assert state["bt_headset_present"] is False
+
+
+def test_a_state_file_written_before_b4_is_not_damaged_by_the_new_fields(policy):
+    """An ABSENT key is not a repair. If it were, the first apply after the
+    upgrade would come back with the microphone muted for no reason anybody
+    could see -- the repair-mutes rule firing on an upgrade."""
+    state = policy.normalize({"output": "speaker", "input_muted": False,
+                              "headset_present": True,
+                              "headset_autoswitch_armed": False})
+    assert state["input_muted"] is False, "an upgrade must not mute the mic"
+    assert state["bt_headset_present"] is False
+    # A key that is PRESENT and the wrong type still is a repair.
+    damaged = policy.normalize({"output": "speaker", "input_muted": False,
+                                "bt_headset_present": "yes"})
+    assert damaged["input_muted"] is True
+
+
+def test_the_bluetooth_presence_is_in_the_revision_fingerprint_b4(policy):
+    """A rocker gesture that captured a baseline over USB and applied after a
+    Bluetooth headset connected is aimed at a different card at a different
+    level, and every other visible value agrees."""
+    usb = _headset_state(policy, usb=True)
+    both = _headset_state(policy, usb=True, bluetooth=True)
+    assert policy._policy_fingerprint(usb) != policy._policy_fingerprint(both)
+
+
+def test_the_bt_headset_leg_carries_the_shared_softvol_and_its_conditions_b4():
+    unit = read(WALL / "wall-bus-bt-headset.service")
+    assert "--pdevice bt_headset_out" in unit, "the rocker must reach this leg"
+    assert "WALL_AUDIO_HEADSET_BT_DEV" in unit
+    # The bridge takes A2DP down; this is what stops an apply mid-call putting
+    # it back under a live SCO link.
+    assert "/run/wall-panel/call-bridge" in unit
+    assert "EnvironmentFile=-/run/wall-panel/audio-headset.env" in unit
+
+
+def test_mic_bt_is_a_loopback_and_never_a_bluealsa_capture_b3():
+    """An SCO capture PCM cannot be wrapped in `plug` (`Poll FD initialization
+    failed`, measured 2026-09-19) and is named after the headset's address, so
+    nothing downstream could open it by name. The supervisor owns the radio end
+    and everything else opens one fixed name."""
+    conf = read(BUS_CONF)
+    block = conf.split("pcm.mic_bt_raw {", 1)[1].split("\npcm.", 1)[0]
+    assert "card_loop_btmic_cap" in block and "bluealsa" not in block
+    writer = conf.split("pcm.btmic_in {", 1)[1].split("\npcm.", 1)[0]
+    assert "card_loop_btmic_play" in writer
+
+
+def test_the_bt_mic_loopback_has_a_substream_to_live_on_b3():
+    """Subdevices 0, 1 and 2 are the merged bus, the amplifier tap and the
+    canceller. The modprobe line has to actually offer a fourth."""
+    options = read(WALL / "wall-aloop.conf")
+    assert "pcm_substreams=4" in options
+    cards = read(WALL / "audio-cards.conf.example")
+    assert "subdevice 3" in cards and "card_loop_btmic_play" in cards
+    firstboot = read(WALL / "wall-firstboot.sh")
+    assert "card_loop_btmic_play" in firstboot and "card_loop_btmic_cap" in firstboot
+
+
+# ── B7: the bridge ───────────────────────────────────────────────────────────
+
+_AG = "/org/bluealsa/hci0/dev_99_88_77_66_55_44/hfpag/sink"
+
+
+def test_the_ag_objects_are_matched_and_the_hf_ones_are_not_b7(btmic):
+    """Two roles, two regexes. A caller that mixed them would bridge a call
+    into the gateway it came from."""
+    tree = _tree_with(_CONNECTED, _AG)
+    assert btmic.ag_object_paths(tree) == [(_AG, "99:88:77:66:55:44")]
+    assert btmic.parse_sco_sinks(tree) == ["AA:BB:CC:DD:EE:FF"]
+
+
+def test_the_ag_link_rate_does_not_wait_for_running_b7(btmic):
+    """On the AG side the panel is the gateway: the link comes up because this
+    process opens the PCM, so waiting for Running would be waiting for
+    something only this process can cause."""
+    run = _bus(_tree_with(_AG), {_AG: False}, sampling={_AG: 16000})
+    assert btmic.ag_link_rate("99:88:77:66:55:44", run=run) == 16000
+    assert btmic.ag_link_rate("AA:BB:CC:DD:EE:FF", run=run) is None
+
+
+def test_the_headset_resolution_is_read_and_never_re_derived_b7(btmic, tmp_path):
+    env = tmp_path / "audio-headset.env"
+    env.write_text("WALL_AUDIO_HEADSET_BT_DEV=99:88:77:66:55:44\n"
+                   "WALL_AUDIO_HEADSET_VIA=bluetooth\n", encoding="utf-8")
+    assert btmic.headset_resolution(env) == ("bluetooth", "99:88:77:66:55:44")
+    env.write_text("WALL_AUDIO_HEADSET_VIA=usb\n", encoding="utf-8")
+    assert btmic.headset_resolution(env) == ("usb", None)
+    # Resolved to Bluetooth with no address is a contradiction the applier
+    # cannot write; treat it as nothing rather than guess.
+    env.write_text("WALL_AUDIO_HEADSET_VIA=bluetooth\n", encoding="utf-8")
+    assert btmic.headset_resolution(env) == (None, None)
+    assert btmic.headset_resolution(tmp_path / "gone.env") == (None, None)
+
+
+def test_the_bridge_legs_point_the_right_way_b7(btmic):
+    """Leg 3 carries the BUS to the headset; leg 4 carries the headset's
+    microphone into the loopback. Swapped, the Owner would hear themselves."""
+    out = btmic.headset_voice_argv("99:88:77:66:55:44")
+    assert out[out.index("--cdevice") + 1] == "bus_monitor"
+    assert out[out.index("--pdevice") + 1] == "bluealsa:DEV=99:88:77:66:55:44,PROFILE=sco"
+    back = btmic.headset_mic_argv("99:88:77:66:55:44", 16000)
+    assert back[back.index("--cdevice") + 1] == "bluealsa:DEV=99:88:77:66:55:44,PROFILE=sco"
+    assert back[back.index("--pdevice") + 1] == "btmic_in"
+    # The capture side is opened at the NEGOTIATED rate: `plug` over a capture
+    # fails, so nothing can convert for it.
+    assert back[back.index("--rate") + 1] == "16000"
+
+
+def test_the_silence_pump_writes_into_the_same_loopback_b3(btmic):
+    """A loopback capture with no writer BLOCKS rather than returning silence,
+    and an alsaloop sitting on it is an xrun storm the guard gives up on."""
+    argv = btmic.silence_argv()
+    assert "btmic_in" in argv[-1] and "/dev/zero" in argv[-1]
+
+
+def test_the_call_document_names_the_headset_only_while_bridging_b7(btmic):
+    bridged = btmic.call_document("bridge", "desktop-office", None, "mic_bt", 3,
+                                  headset_alias="picun")
+    assert bridged["headset"] == "picun" and bridged["state"] == "bridge"
+    plain = btmic.call_document("call", "desktop-office", None, "mic_selected", 3,
+                                headset_alias="picun")
+    assert plain["headset"] is None, "a headset with no bridge is not in the call"
+
+
+def test_the_mic_source_reaches_the_child_and_a_change_restarts_it_b3(btmic):
+    """ALSA resolves `@func getenv` in the process that OPENS the PCM. The
+    applier restarts the MIC legs on a source change and only `start`s this
+    unit, so a supervisor that trusted its start-time environment would leave
+    the gateway listening to yesterday's microphone."""
+    started = []
+
+    class _Child:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(argv, env=None):
+        started.append((argv, (env or {}).get("WALL_AUDIO_MIC_SOURCE")))
+        return _Child()
+
+    leg = btmic.Leg("mic", btmic.loop_argv, popen=popen)
+    leg.ensure("AA:BB:CC:DD:EE:FF", mic_source="mic_headset")
+    leg.ensure("AA:BB:CC:DD:EE:FF", mic_source="mic_headset")
+    assert len(started) == 1, "an unchanged source must not restart the leg"
+    leg.ensure("AA:BB:CC:DD:EE:FF", mic_source="mic_bt")
+    assert len(started) == 2 and started[-1][1] == "mic_bt"
+
+
+# ── what the first review round found, pinned ────────────────────────────────
+
+
+def test_the_bridge_headset_mic_obeys_the_mute_terra_1(btmic, tmp_path, monkeypatch):
+    """FINDING 1. The bridge opens a SECOND microphone -- the headset's SCO
+    capture, into `btmic_in` -- and it shipped for a moment outside the mute
+    gate, on the reasoning that the gateway-bound leg is what SENDS. A
+    microphone this panel has opened against a mute is the failure nobody in
+    the room can see whatever happens to the samples, and `wall-mic-rear`
+    reads the same loopback.
+
+    Asserted against the SOURCE rather than by driving `main`, which is an
+    unbounded poll loop: the property is that no `headset_mic_leg.ensure` is
+    reachable without `mic_allowed()` having answered true first.
+    """
+    source = read(BT_MIC)
+    bridge = source.split("# ── BRIDGE", 1)[1].split("# ── ORDINARY CALL", 1)[0]
+    gate = bridge.index("if mic_allowed():")
+    assert bridge.index("headset_mic_leg.ensure(") > gate, \
+        "the headset microphone is opened before the mute is consulted"
+    # And the per-tick check, which is the tighter of the two gates: an
+    # operator restart cannot outrun it.
+    tick = source.split("while waited < interval", 1)[1]
+    assert "headset_mic_leg.stop()" in tick
+    assert "headset_mic_leg.running()" in tick
+
+
+def test_the_bluetooth_leg_is_gated_on_the_resolution_not_the_address_terra_2():
+    """FINDING 2. An address is published for as long as a headset is
+    CONNECTED, whatever position the switch is in -- so a unit gated on the
+    address alone plays the room into the headset from Speaker. The bridge
+    did it by its own hand: it `systemctl start`s this unit when a call ends,
+    and "the call ended" says nothing about where the switch is."""
+    unit = read(WALL / "wall-bus-bt-headset.service")
+    assert '[ "$WALL_AUDIO_HEADSET_VIA" = bluetooth ]' in unit
+
+
+def test_the_resolution_is_only_bluetooth_in_the_headset_position(policy):
+    """The other half of finding 2: the value the unit gates on must actually
+    be null anywhere but Headset, or the condition above proves nothing."""
+    for output in ("speaker", "mute"):
+        plan = policy.plan(_headset_state(policy, output=output, bluetooth=True))
+        assert plan["headset_via"] is None, output
+
+
+def test_a_call_that_merely_continues_stays_fresh_terra_3(btmic):
+    """FINDING 3. The supervisor publishes only on a CHANGE and the broker
+    rejects the document once its mtime passes the staleness bound -- so a
+    call doing what calls mostly do, continuing, read as `idle` inside half a
+    minute with both legs still running. The heartbeat is a timestamp and not
+    a rewrite, so the revision still counts events and the broker's readers
+    see no churn."""
+    source = read(BT_MIC)
+    assert "def touch_call_state(" in source
+    unchanged = source.split("if published[\"document\"] is not None and _same_fact", 1)[1]
+    assert "touch_call_state()" in unchanged.split("return", 1)[0]
+    assert 'if state != "idle"' in unchanged.split("return", 1)[0]
+
+
+def test_the_broker_ages_the_call_document_off_its_mtime(tmp_path):
+    """The other side of finding 3's contract: the broker measures the FILE,
+    not a field, so the heartbeat above is what keeps a long call visible."""
+    routed = import_panel_audio("routed_backend")
+    call = tmp_path / "call-state.json"
+    call.write_text(json.dumps({"state": "call", "gateway": "desktop-office",
+                                "headset": None, "since": "2026-09-19T20:30:07Z"}),
+                    encoding="utf-8")
+    fresh = routed.RoutedDeviceBackend(None, call_path=call, now=lambda: call.stat().st_mtime)
+    assert fresh._call()["state"] == "call"
+    stale = routed.RoutedDeviceBackend(
+        None, call_path=call,
+        now=lambda: call.stat().st_mtime + routed.MAX_DOCUMENT_AGE_SECONDS + 1)
+    assert stale._call()["state"] == "idle"
+
+
+def test_the_broker_refuses_an_address_shaped_alias_in_the_call_block(tmp_path):
+    """LLR-979 at the boundary. The supervisor is a root process on the other
+    side of IF-015; its good intentions are not the guarantee."""
+    routed = import_panel_audio("routed_backend")
+    call = tmp_path / "call-state.json"
+    call.write_text(json.dumps({"state": "bridge", "gateway": "AA:BB:CC:DD:EE:FF",
+                                "headset": "picun", "since": None}), encoding="utf-8")
+    backend = routed.RoutedDeviceBackend(None, call_path=call,
+                                         now=lambda: call.stat().st_mtime)
+    block = backend._call()
+    assert block["gateway"] is None, "an address must not reach the glass"
+    assert block["headset"] == "picun" and block["state"] == "bridge"
+
+
+def test_a_missing_call_document_is_idle_and_never_an_error(tmp_path):
+    routed = import_panel_audio("routed_backend")
+    backend = routed.RoutedDeviceBackend(None, call_path=tmp_path / "nothing.json")
+    assert backend._call() == {"state": "idle", "gateway": None,
+                               "headset": None, "since": None}

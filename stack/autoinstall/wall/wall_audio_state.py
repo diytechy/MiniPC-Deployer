@@ -52,7 +52,30 @@ MIC_SOURCE_HEADSET = "mic_headset"  # 0d8c:0014's mono mic -- D3's headset mic
 # installed and enabled is a fact about the machine, and this module decides
 # policy from state alone.
 MIC_SOURCE_CLEAN = "mic_clean"
-MIC_SOURCES = (MIC_SOURCE_PANEL, MIC_SOURCE_HEADSET, MIC_SOURCE_CLEAN)
+# THE BLUETOOTH HEADSET'S MICROPHONE (B3, 2026-09-19). It is NOT a BlueALSA PCM
+# opened here: an SCO capture PCM cannot be wrapped in `plug` (measured
+# 2026-09-19: `Poll FD initialization failed`) and it exists only while the AG
+# link is up, so nothing downstream could open it by name and survive. It is a
+# LOOPBACK, written by `wall-bt-call`, in exactly the shape `mic_clean` already
+# has -- which is what lets the mic legs keep opening one name and nothing
+# else in the graph learn what a radio is.
+MIC_SOURCE_BT = "mic_bt"
+MIC_SOURCES = (MIC_SOURCE_PANEL, MIC_SOURCE_HEADSET, MIC_SOURCE_CLEAN,
+               MIC_SOURCE_BT)
+
+# ── which thing the Headset position resolves to (B4, Owner ruling Q5) ──────
+# "Bluetooth is automatic and has priority over USB, even if USB is plugged
+# back in. When the bluetooth headset is not connected, always attempt to
+# resolve to USB. The headset icon would be red if both the USB and bluetooth
+# are not connected."  (Owner, 2026-09-19.)
+#
+# So Headset is no longer a synonym for "the USB adapter". It is a POSITION
+# that resolves, and these are the three answers. The switch still has three
+# positions and the glass is unchanged -- WSN-024's closing line holds, because
+# a Bluetooth headset is a resolution of Headset and never a fourth pill.
+HEADSET_VIA_BLUETOOTH = "bluetooth"
+HEADSET_VIA_USB = "usb"
+HEADSET_VIA_NONE = None
 
 STATE_VERSION = 1
 STATE_SCHEMA = {
@@ -77,6 +100,23 @@ STATE_SCHEMA = {
     # boot, spent if it was present), which is how a power cycle with the
     # adapter plugged in comes back in the position the Owner left it in.
     "headset_autoswitch_armed": True,
+    # ── the Bluetooth headset, as a SECOND presence (B4/B5) ─────────────────
+    # Whether a trusted Bluetooth device that can be a headset -- it advertises
+    # the hands-free UNIT role, `bluetooth_state.CAPABILITY_HF` -- is connected
+    # right now. It is a separate field from `headset_present` and not a widened
+    # one, because the two are independently true: the Owner's ruling is a
+    # PRIORITY between them, and a priority needs both terms.
+    #
+    # `wall-bluetooth-device observe` is what reports it, on the same ten-second
+    # cadence it already keeps the inventory fresh on, through the same
+    # `wall-audio-output headset` verb the USB adapter's udev unit uses.
+    "bt_headset_present": False,
+    # The one-shot latch for the Bluetooth side, with the same life as the USB
+    # one and kept SEPARATE for the same reason the presences are: a headset
+    # connecting must be able to flip Speaker -> Headset once even if a USB plug
+    # already spent its own latch this boot, and vice versa. Sharing one latch
+    # would make the second arrival of the day silent.
+    "bt_headset_autoswitch_armed": True,
     # The last broker request applied, for deduplication. systemd.path fires on
     # every close-write, so an unchanged request file re-read after a restart
     # would otherwise replay a rocker press. It lives in the state rather than
@@ -163,7 +203,14 @@ def _policy_fingerprint(state):
     the headset adapter is there to be selected. See STATE_SCHEMA's note on
     `state_revision` for why the counters are excluded.
     """
+    # THE BLUETOOTH PRESENCE IS IN HERE FOR THE SAME REASON THE USB ONE IS.
+    # A rocker gesture that captured a baseline in Headset-over-USB and applied
+    # after a Bluetooth headset connected is aimed at a different card with a
+    # different level; every other visible value agrees and the answer is still
+    # no. Leaving it out would be the speaker -> headset -> speaker hole again,
+    # in the one costume B4 adds.
     return (state["output"], state["input_muted"], state["headset_present"],
+            state["bt_headset_present"],
             tuple(state["volume"].get(output) for output in LEVELLED_OUTPUTS))
 
 
@@ -247,6 +294,22 @@ def normalize(raw):
     if isinstance(raw.get("headset_autoswitch_armed"), bool):
         state["headset_autoswitch_armed"] = raw["headset_autoswitch_armed"]
     elif "headset_autoswitch_armed" in raw:
+        repaired = True
+    # THE BLUETOOTH PRESENCE DEFAULTS TO FALSE AND AN ABSENT KEY IS NOT A
+    # REPAIR. A state file written before B4 has neither key, and a panel whose
+    # first apply after the upgrade declared its state damaged would come back
+    # with the microphone muted for no reason anybody could see. Absent means
+    # "this file predates the field", which is a true and harmless answer: the
+    # observer republishes the real presence within ten seconds, and False in
+    # the meantime resolves Headset to USB, which is what the panel did
+    # yesterday. A key that is PRESENT and the wrong type is still a repair.
+    if isinstance(raw.get("bt_headset_present"), bool):
+        state["bt_headset_present"] = raw["bt_headset_present"]
+    elif "bt_headset_present" in raw:
+        repaired = True
+    if isinstance(raw.get("bt_headset_autoswitch_armed"), bool):
+        state["bt_headset_autoswitch_armed"] = raw["bt_headset_autoswitch_armed"]
+    elif "bt_headset_autoswitch_armed" in raw:
         repaired = True
     seq = raw.get("request_seq")
     if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
@@ -340,24 +403,62 @@ def volume_of(state, output=None):
     return clamp_volume(state["volume"].get(output, STATE_SCHEMA["volume"][output]))
 
 
+def headset_via(state):
+    """What the Headset position resolves to RIGHT NOW: bluetooth, usb or None.
+
+    THE OWNER'S RULING IS A PRIORITY AND THIS IS THE WHOLE OF IT (Q5,
+    2026-09-19): "Bluetooth is automatic and has priority over USB, even if USB
+    is plugged back in. When the bluetooth headset is not connected, always
+    attempt to resolve to USB. The headset icon would be red if both the USB
+    and bluetooth are not connected."
+
+    So Bluetooth wins whenever it is there -- unconditionally, with no latch and
+    no memory of which arrived first. That is deliberately simpler than the USB
+    auto-switch, which needs a latch because it MOVES the switch; this only
+    decides what the switch already points at, and a rule with a memory in it
+    would make "which headset am I on" unanswerable from the panel's face.
+
+    None is the red-icon case, and it is the only one: Headset with neither.
+
+    ONE FUNCTION, called by `audible`, `mic_source`, `plan` and the shell. The
+    priority must not be spelled twice -- an applier that resolved output one
+    way and the microphone another would put the room's music in one headset
+    and somebody's voice in the other, which is the precise failure `mic_source`
+    already documents for the USB case.
+    """
+    if state["bt_headset_present"]:
+        return HEADSET_VIA_BLUETOOTH
+    if state["headset_present"]:
+        return HEADSET_VIA_USB
+    return HEADSET_VIA_NONE
+
+
 def audible(state):
     """Whether ANY output should be carrying audio right now.
 
-    False in `mute`, and false for `headset` while the adapter is absent --
-    Owner ruling 7: silence on every output, nothing tunnelled, nothing to the
+    False in `mute`, and false for `headset` while the position resolves to
+    NEITHER a Bluetooth headset nor the USB adapter -- Owner ruling 7 as
+    amended by Q5: silence on every output, nothing tunnelled, nothing to the
     speakers, until the user presses the switch. The red icon is the UI's
     rendering of exactly this being false while the output is `headset`.
     """
     if state["output"] == "mute":
         return False
     if state["output"] == "headset":
-        return bool(state["headset_present"])
+        return headset_via(state) is not None
     return True
 
 
 def unavailable_reason(state):
-    """Why the selected output is silent, for the UI's red icon, or None."""
-    if state["output"] == "headset" and not state["headset_present"]:
+    """Why the selected output is silent, for the UI's red icon, or None.
+
+    THE TOKEN IS UNCHANGED ON PURPOSE. `headset_absent` is what the chrome,
+    the broker and three test files already read, and its MEANING widens from
+    "the USB adapter is not plugged in" to "neither headset resolves" without
+    any of them having to learn a second word. The Owner's ruling asks for one
+    red icon, not two.
+    """
+    if state["output"] == "headset" and headset_via(state) is None:
         return "headset_absent"
     return None
 
@@ -382,7 +483,26 @@ def mic_source(state, aec_available=False):
     replaces that. The mic button still exists and is still separate; what has
     changed is that selecting output Mute now also mutes the input.
     """
-    if state["output"] == "headset" and state["headset_present"]:
+    # THE HEADSET POSITION TAKES THE MICROPHONE OF WHICHEVER HEADSET IT
+    # RESOLVED TO (B3/B4). It has to be the same resolution `plan` sends the
+    # OUTPUT to, or the far end of whatever is listening hears a different
+    # room from the one the music is in.
+    #
+    # `mic_bt` IS SILENT UNLESS A BRIDGE IS UP, AND THAT IS NOT A DEFECT. A
+    # Bluetooth headset cannot carry A2DP and SCO at once -- the profile, not
+    # this panel -- so taking its microphone would drop the room's music to
+    # 8 kHz mono for as long as the mic was open. `wall-bt-call` therefore
+    # raises the AG link only while it is bridging a gateway's call, and feeds
+    # `mic_bt` silence the rest of the time so that nothing downstream stalls
+    # on a loopback with no writer. What reaches the desktop's line input in
+    # the Headset-over-Bluetooth position is therefore silence unless a call
+    # is up; naming `mic_panel` there instead would tunnel a microphone the
+    # Owner believes is switched away from, which is the one failure in this
+    # design nobody could hear happening (ruling 7).
+    via = headset_via(state)
+    if state["output"] == "headset" and via == HEADSET_VIA_BLUETOOTH:
+        return MIC_SOURCE_BT
+    if state["output"] == "headset" and via == HEADSET_VIA_USB:
         return MIC_SOURCE_HEADSET
     # THE CANCELLER IS ONLY WORTH INSERTING IN SPEAKER. It removes the ROOM's
     # own music from the microphone, and the room only has music in Speaker --
@@ -419,7 +539,7 @@ def mic_live(state):
     # future caller builds by hand, and it costs nothing.
     if state["output"] == "mute":
         return False
-    if state["output"] == "headset" and not state["headset_present"]:
+    if state["output"] == "headset" and headset_via(state) is None:
         return False
     return True
 
@@ -739,49 +859,85 @@ def _headset(state, event):
     boot = event.get("boot", False)
     if not isinstance(boot, bool):
         raise StateError("boot must be boolean")
+    # WHICH HEADSET THIS REPORT IS ABOUT (B5). Absent means `usb`, because every
+    # caller that predates B5 -- the udev presence unit, `apply-state`'s
+    # coldplug report, a bare CLI `headset add` -- is talking about the USB
+    # adapter, and a default that silently retargeted them at the radio would
+    # be the worst kind of upgrade.
+    via = event.get("via", HEADSET_VIA_USB)
+    if via not in (HEADSET_VIA_USB, HEADSET_VIA_BLUETOOTH):
+        raise StateError("via must be usb or bluetooth")
+    bluetooth = via == HEADSET_VIA_BLUETOOTH
+    presence_key = "bt_headset_present" if bluetooth else "headset_present"
+    latch_key = ("bt_headset_autoswitch_armed" if bluetooth
+                 else "headset_autoswitch_armed")
+    # THE NOUN, so a journal a week later says which radio or cable moved. The
+    # two reports are otherwise indistinguishable in the log, and they now have
+    # genuinely different consequences.
+    noun = "bluetooth headset" if bluetooth else "headset adapter"
     lines = []
-    changed_presence = state["headset_present"] != present
+    changed_presence = state[presence_key] != present
     if boot:
-        state["headset_present"] = present
+        state[presence_key] = present
         # Present across the boot => no pending event; absent => the next add
         # is a real one. Either way the OUTPUT is not touched: ruling G wins.
-        state["headset_autoswitch_armed"] = not present
-        lines.append("headset adapter %s at boot: recorded, no auto-switch "
+        state[latch_key] = not present
+        lines.append("%s %s at boot: recorded, no auto-switch "
                      "(output stays %s)"
-                     % ("present" if present else "absent", state["output"]))
+                     % (noun, "present" if present else "absent", state["output"]))
         if changed_presence and not present and state["output"] == "headset":
-            lines.append("headset still selected: every output silent until the "
-                         "switch is moved")
+            lines.append(_headset_left_selected(state))
         return state, lines
     if changed_presence:
-        lines.append("headset adapter %s" % ("present" if present else "absent"))
-    state["headset_present"] = present
+        lines.append("%s %s" % (noun, "present" if present else "absent"))
+    state[presence_key] = present
     if not present:
-        state["headset_autoswitch_armed"] = True
+        state[latch_key] = True
         if state["output"] == "headset":
-            lines.append("headset still selected: every output silent until the "
-                         "switch is moved")
-        return state, lines or ["headset adapter absent (no change)"]
+            lines.append(_headset_left_selected(state))
+        return state, lines or ["%s absent (no change)" % noun]
     if not changed_presence:
         # NOTHING ARRIVED. The applier already believed this adapter was there,
         # so whatever produced this report -- a `udevadm trigger`, the presence
-        # unit being restarted, a re-assert after resume -- is not a plug, and
-        # the ruling is that only a plug may move the switch. The latch is left
-        # exactly as it was, because spending it here would eat the next real
-        # plug. (Review, 2026-09-13.)
-        return state, lines + ["headset adapter already present: no arrival to act on"]
-    armed = state["headset_autoswitch_armed"]
-    state["headset_autoswitch_armed"] = False
+        # unit being restarted, a re-assert after resume, the Bluetooth
+        # observer's ten-second republish -- is not a plug, and the ruling is
+        # that only a plug may move the switch. The latch is left exactly as it
+        # was, because spending it here would eat the next real plug.
+        # (Review, 2026-09-13.)
+        #
+        # THIS LINE IS WHAT MAKES THE BLUETOOTH OBSERVER SAFE TO RUN EVERY TEN
+        # SECONDS. It reports presence, not arrival -- it has no way to tell
+        # them apart -- so all but the first report of a connected headset lands
+        # here and does nothing at all.
+        return state, lines + ["%s already present: no arrival to act on" % noun]
+    armed = state[latch_key]
+    state[latch_key] = False
     if armed and state["output"] == "speaker":
         state["output"] = "headset"
-        lines.append("auto-switch speaker -> headset (one-shot, level %d%%)"
-                     % volume_of(state))
+        lines.append("auto-switch speaker -> headset (one-shot, %s, level %d%%)"
+                     % (via, volume_of(state)))
     else:
         # Spent latch, or the Owner is in mute/headset already: say why nothing
         # moved, so an Owner who expected a switch can see the reason.
         lines.append("no auto-switch (output %s, latch %s)"
                      % (state["output"], "armed" if armed else "spent"))
     return state, lines
+
+
+def _headset_left_selected(state):
+    """The line for a presence report that left Headset pointing at something.
+
+    ONE OF TWO SENTENCES, AND THEY ARE DIFFERENT FACTS (B4). Before the
+    Bluetooth resolution existed, a headset going away while Headset was
+    selected always meant silence; now it usually means the OTHER headset
+    takes over, and a journal that still said "every output silent" would send
+    the next person looking for a fault that is not there.
+    """
+    via = headset_via(state)
+    if via is None:
+        return ("headset still selected: every output silent until the "
+                "switch is moved")
+    return "headset still selected: resolved to %s" % via
 
 
 _HANDLERS = {
@@ -798,7 +954,23 @@ _HANDLERS = {
 # The forwarder units the switch owns. Named once, here, because the plan, the
 # applier and the tests must agree on the set and its order (stop before start).
 SPEAKER_LEGS = ("wall-bus-speaker.service", "wall-speaker-out.service")
-HEADSET_LEGS = ("wall-bus-headset.service",)
+# THE HEADSET POSITION IS TWO LEGS AND AT MOST ONE OF THEM RUNS (B4). Which one
+# is `headset_via`'s answer; the name `HEADSET_LEGS` is kept for the set of
+# units the position owns, because the applier, the tests and `ALL_LEGS` all
+# need "everything Headset may start" as one tuple.
+HEADSET_USB_LEGS = ("wall-bus-headset.service",)
+# A UNIT OF ITS OWN, NOT `wall-bus-bluetooth.service`, AND THE PLAN SAID
+# OTHERWISE. §13 B4 proposed reusing the WSN-024 route leg, and that would give
+# two owners to one unit and one environment file: `wall-bluetooth-device`
+# restarts it on every `select_output`, and the applier would start and stop it
+# on every switch move. Every out-of-sync defect in this panel's access chain so
+# far has been an overloaded name rather than a race, so the two facts get two
+# units. The cost is stated rather than discovered: selecting a Bluetooth
+# SPEAKER as an explicit route while Headset resolves to a Bluetooth HEADSET
+# runs both legs, which is exactly what WSN-024 already says a route leg does
+# ("it runs BESIDE whichever position the switch is in").
+HEADSET_BT_LEGS = ("wall-bus-bt-headset.service",)
+HEADSET_LEGS = HEADSET_USB_LEGS + HEADSET_BT_LEGS
 # The mic legs (step 4). They are listed SEPARATELY from the output legs because
 # they are governed by a different control -- `input_muted`, Owner ruling E --
 # and because one of them is a supervisor rather than a forwarder:
@@ -841,9 +1013,17 @@ def plan(state, aec_available=False):
     live = audible(state)
     speaker = live and state["output"] == "speaker"
     headset = live and state["output"] == "headset"
+    via = headset_via(state)
     mic = mic_live(state)
     legs = {unit: speaker for unit in SPEAKER_LEGS}
-    legs.update({unit: headset for unit in HEADSET_LEGS})
+    # EXACTLY ONE OF THE TWO, AND BOTH ARE NAMED EVERY TIME. Writing only the
+    # winner would leave the loser's previous value in place -- the applier
+    # stops what the plan says is False -- so a move from USB to Bluetooth would
+    # leave the USB leg running and the room's music in two headsets.
+    legs.update({unit: headset and via == HEADSET_VIA_USB
+                 for unit in HEADSET_USB_LEGS})
+    legs.update({unit: headset and via == HEADSET_VIA_BLUETOOTH
+                 for unit in HEADSET_BT_LEGS})
     legs.update({unit: mic for unit in MIC_LEGS})
     # Not `mic`: see CALL_LEGS. The supervisor owns the microphone half of its
     # own behaviour, and stopping it for a mute would take the far end with it.
@@ -882,12 +1062,28 @@ def plan(state, aec_available=False):
         # detector's 240 s hold-off expires and the LCUS-2 relay physically
         # removes power from the amplifier.
         "adapter_muted": not (speaker or mic),
-        "headset_muted": not headset,
+        # THE USB CARD'S OWN MUTE, AND IT FOLLOWS THE RESOLUTION AND NOT THE
+        # POSITION (B4). Headset resolving to Bluetooth leaves the USB adapter
+        # plugged in with no leg feeding it, so it is muted exactly as it is in
+        # Speaker -- otherwise a card left unmuted would pass whatever alsactl
+        # last restored into a headset hanging on the desk.
+        "headset_muted": not (headset and via == HEADSET_VIA_USB),
         "input_muted": bool(state["input_muted"]),
         # Which capture PCM the mic legs open, published to them through
         # /run/wall-panel/audio-mic-source.env and read by `@func getenv`.
         "mic_source": mic_source(state, aec_available),
         "mic_live": mic,
+        # WHAT HEADSET MEANS RIGHT NOW (B4), published so that nothing else has
+        # to re-derive the priority: the applier writes it into
+        # /run/wall-panel/audio-headset.env for the legs and for `wall-bt-call`,
+        # and the broker carries it to the chrome so the Headset segment can
+        # wear a Bluetooth mark. None in any position but Headset -- it is the
+        # resolution OF a position, not a standing fact about the hardware.
+        "headset_via": via if state["output"] == "headset" else None,
+        # The same question asked without the switch: is a Bluetooth headset
+        # there at all. The chrome needs this to explain the red icon, and
+        # `wall-bt-call` needs it to know whether a bridge is even possible.
+        "bt_headset_present": bool(state["bt_headset_present"]),
         # ── ITEM J, published so the UI never has to derive it ──────────────
         # What the microphone ACTUALLY is, which is the only thing the chrome
         # may draw. Identical to `input_muted` today, because the coupling is a

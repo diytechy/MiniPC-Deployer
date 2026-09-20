@@ -91,6 +91,18 @@ LOCK_PATH = STATE_DIR / "drain.lock"
 DISCOVERY_PID_PATH = STATE_DIR / "discovery.pid"
 
 DEFAULT_REQUEST_DIR = Path("/run/wall-audio-router/bluetooth-requests")
+# WHERE THE AUDIO SWITCH LEARNS THAT A BLUETOOTH HEADSET IS THERE (B5). This
+# process is the only thing on the panel that may ask BlueZ a question, so it
+# is the only thing that can answer "is a headset connected"; `wall-audio-output`
+# reads this document and is the only writer of the environment file the legs
+# read. One fact, one writer, one direction.
+BT_HEADSET_PATH = STATE_DIR / "headset.json"
+AUDIO_TOOL = os.environ.get("WALL_AUDIO_TOOL") or "/usr/local/sbin/wall-audio-output"
+# The apply the report triggers takes the applier's lock and moves real legs.
+# Bounded so a wedged apply cannot hold the observe timer past its own budget;
+# the presence is already recorded in the document above by then, so the next
+# tick's apply-state picks it up regardless.
+AUDIO_TOOL_TIMEOUT_SECONDS = 30
 PAIRING_TOOL = os.environ.get("WALL_BLUETOOTH_PAIRING_TOOL") or "/usr/local/sbin/wall-bluetooth-pairing"
 
 # Long enough for a real bond over a radio, short enough that the oneshot unit
@@ -410,6 +422,14 @@ def publish():
     deadline = time.monotonic() + PUBLISH_BUDGET_SECONDS
     reason, _powered, _discoverable, _pairable = adapter()
     devices = inventory(deadline) if reason == "ready" else []
+    # WHETHER THIS PUBLISH KNOWS ANYTHING (B5). An empty list means two
+    # different things here -- "nothing is connected" and "the adapter would
+    # not answer" -- and the broker already has a sentence for the difference
+    # ("do not know"). The HEADSET report does not: a busy adapter reported as
+    # a disconnection would take the room's audio away from a headset that is
+    # still on somebody's head, and put it back ten seconds later. So the
+    # report is only sent from a publish that actually looked.
+    known = reason == "ready" and devices is not None
     if devices is None:
         # The budget ran out. "Do not know" is the honest answer and is the same
         # one the broker derives from a stale document, so the panel already has
@@ -460,7 +480,114 @@ def publish():
         # `panel` account already runs the kiosk.
         "aliasesByAddress": aliases,
     })
+    if known:
+        report_bt_headset(devices, aliases)
     return rows, aliases
+
+
+# ------------------------------------------------------ the headset presence
+
+
+def choose_bt_headset(devices, held=None):
+    """Which connected device is THE Bluetooth headset, as (address, …) or None.
+
+    Pure, so the rule is testable without a radio.
+
+    THREE CONDITIONS, AND EACH ONE IS THERE FOR A DIFFERENT FAILURE:
+
+      * CONNECTED, because a paired headset in a drawer must not resolve the
+        Headset position to itself and make the panel silent. This is the whole
+        difference between B4 and a red icon nobody can explain.
+      * TRUSTED, because the Headset position is a control the Owner uses daily
+        and `select_output`'s gate already works this way. A device that merely
+        connected -- which on a discoverable adapter is a thing anybody in
+        radio range can arrange -- must not be able to take the room's audio.
+        This is the SR-025 amendment read literally: a source only toward a
+        device the panel itself selected.
+      * THE HANDS-FREE UNIT ROLE (`hf`), because that is what distinguishes a
+        headset from a Bluetooth SPEAKER. A speaker is an A2DP sink and has no
+        microphone; resolving Headset to one would put the room's audio in the
+        speaker and leave the mic nowhere, which is not what "Headset" means on
+        this glass. A speaker is what `select_output` is for.
+
+    TIES ARE BROKEN TOWARD THE ONE ALREADY HELD, then by address. The first
+    clause is what stops two connected headsets making the panel alternate
+    between them on a ten-second timer; the second is what makes the answer the
+    same on every poll and every boot, exactly as `assign_aliases` is.
+    """
+    if bluetooth_state is None:
+        return None
+    candidates = []
+    for info in devices or ():
+        if not info.get("connected") or not info.get("trusted"):
+            continue
+        if bluetooth_state.CAPABILITY_HF not in bluetooth_state.capabilities(
+                info.get("uuids")):
+            continue
+        candidates.append(info)
+    if not candidates:
+        return None
+    held = str(held or "").upper()
+    for info in candidates:
+        if str(info["address"]).upper() == held:
+            return info
+    return sorted(candidates, key=lambda info: str(info["address"]).upper())[0]
+
+
+def report_bt_headset(devices, aliases):
+    """Record the connected Bluetooth headset and tell the audio switch.
+
+    THE REPORT IS ONLY SENT WHEN SOMETHING CHANGED, and that is not an
+    optimisation. `wall-audio-output headset` takes the applier's lock and runs
+    a whole apply; doing that every ten seconds forever would put a lock
+    acquisition and a dozen `amixer` calls between the Owner's finger and every
+    rocker press, for a fact that had not moved. The policy would no-op anyway
+    -- `wall_audio_state` refuses to act on a presence it already believed --
+    so what is saved is only work, but it is work on the path that has to feel
+    instant.
+
+    AN ADDRESS CHANGE WITH NO PRESENCE CHANGE STILL REPORTS. Swapping one
+    connected headset for another leaves `bt_headset_present` true throughout,
+    so the policy has nothing to do -- but the environment file the legs read
+    carries the OLD address, and the room's music would keep playing to a
+    headset that has gone. The apply is what rewrites it.
+
+    EVERY FAILURE IS LOGGED AND SWALLOWED. This runs inside `publish`, which is
+    what keeps the broker's document fresh; a headset report that could take
+    the inventory down with it would be the diagnostic failing the thing it
+    reports on.
+    """
+    try:
+        held = (read_document(BT_HEADSET_PATH, {}) or {})
+    except Exception:  # noqa: BLE001 - a damaged document is "none held"
+        held = {}
+    previous = str(held.get("address") or "").upper()
+    previous = previous if ADDRESS.fullmatch(previous) else ""
+    chosen = choose_bt_headset(devices, previous)
+    address = str(chosen["address"]).upper() if chosen else ""
+    if address and not ADDRESS.fullmatch(address):
+        log("a connected headset's address is unusable; ignoring it")
+        address = ""
+    if address == previous:
+        return
+    alias = aliases.get(address) if address else None
+    if address:
+        write_document(BT_HEADSET_PATH, {"address": address, "alias": alias})
+    else:
+        try:
+            BT_HEADSET_PATH.unlink()
+        except OSError:
+            pass
+    # The DOCUMENT IS WRITTEN BEFORE THE REPORT and that order is load-bearing:
+    # the apply the report triggers reads this file, so a report that overtook
+    # its own evidence would publish the previous address.
+    action = "add" if address else "remove"
+    log("bluetooth headset %s (%s)" % (action, alias or "no alias"))
+    argv = [AUDIO_TOOL, "headset", action, "--via", "bluetooth"]
+    done = _run(argv, AUDIO_TOOL_TIMEOUT_SECONDS)
+    if done is None or done.returncode != 0:
+        log("the audio switch would not take the headset %s; the next "
+            "apply-state will pick it up" % action)
 
 
 def resolve(alias, aliases):

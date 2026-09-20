@@ -25,7 +25,7 @@ Usage:
         with `ok:OUTPUT:LEVEL:REVISION` or `refused:REASON`. The rocker's
         apply actor uses this and nothing else; see
         PANEL_VOLUME_ROCKER_RESPONSIVENESS_PLAN_2026-09-18.md.
-  wall-audio-output headset {add|remove} [--boot|--runtime]
+  wall-audio-output headset {add|remove} [--boot|--runtime] [--via usb|bluetooth]
   wall-audio-output apply-state              # re-assert the stored state (boot, resume)
   wall-audio-output apply-request [PATH]     # one broker request, deduplicated
   wall-audio-output trim                     # show the centre/sub trim table
@@ -55,6 +55,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -81,6 +82,18 @@ RUN_DIR = Path(os.environ.get("WALL_PANEL_RUN_DIR") or LIVE_RUN_DIR)
 # EnvironmentFile=, because the headset card's id is the generic "Device" and
 # ALSA configuration cannot look a card up by USB id.
 HEADSET_ENV = RUN_DIR / "audio-headset.env"
+# WHERE THE BLUETOOTH HEADSET'S ADDRESS COMES FROM (B4/B5). `wall-bluetooth-device
+# observe` resolves it -- it is the only thing on the panel that talks to BlueZ --
+# and writes this document; the applier READS it and is the only writer of
+# HEADSET_ENV. Two writers on one environment file is the overloaded-name defect
+# this panel has paid for more than once, so the two sides get two files and one
+# direction.
+#
+# It is under /run/wall-bluetooth, beside the inventory the same process
+# publishes, and it carries an ADDRESS because that is what BlueALSA's PCM names
+# are made of. It never crosses IF-015: the broker reads the inventory document,
+# which carries aliases only (LLR-979).
+BT_HEADSET_DOC = Path("/run/wall-bluetooth/headset.json")
 DEFAULT_REQUEST = Path("/run/wall-audio-router/request.json")
 # One apply at a time. Four independent things call this script -- a udev
 # add/remove, the rocker, the path unit answering a broker request, and the
@@ -335,6 +348,40 @@ def headset_card(proc_asound=PROC_ASOUND):
         log("headset adapter present but its card id %r is unusable" % card)
         return None
     return None
+
+
+# The same shape `wall-bluetooth-device` validates on its own side. Repeated
+# rather than imported because this script does not import the broker's tree and
+# must not start: an address is the one value that reaches a BlueALSA PCM name,
+# and a malformed one there is a leg that fails in a way nobody can read.
+BT_ADDRESS = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
+
+
+def bt_headset(path=None):
+    """(address, alias) of the connected Bluetooth headset, or (None, None).
+
+    THE OBSERVER DECIDES, NOT THIS SCRIPT. Which connected device counts as a
+    headset -- trusted, and advertising the hands-free UNIT role -- is a BlueZ
+    question, and `wall-bluetooth-device` is the only thing here that may ask
+    one. This reads the answer.
+
+    EVERY FAILURE IS "NO BLUETOOTH HEADSET", which resolves Headset to the USB
+    adapter or to the red icon. That is the same direction the rest of the
+    switch fails in: a leg that does not run is a degraded panel, and falling
+    back to the wired headset is what the Owner's ruling asks for anyway.
+    """
+    try:
+        with open(path or BT_HEADSET_DOC, encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(stored, dict):
+        return None, None
+    address = str(stored.get("address") or "").upper()
+    if not BT_ADDRESS.fullmatch(address):
+        return None, None
+    alias = stored.get("alias")
+    return address, alias if isinstance(alias, str) and alias else None
 
 
 def headset_syspath(proc_asound=PROC_ASOUND, sys_class_sound=SYS_CLASS_SOUND):
@@ -803,9 +850,23 @@ BUS_CONTROL_INTERVAL_SECONDS = 0.1
 BUS_CONTROL_PREOPEN_AFTER = 5
 # The PCM that DECLARES the softvol for each position. Named here because the
 # pre-open must open the plugin that creates the control, not the bus: `Bus`
-# lives on speaker_out and headset_out in asound-bus-mode.conf, and opening
-# `bus` would create nothing.
+# lives on speaker_out, headset_out and bt_headset_out in asound-bus-mode.conf,
+# and opening `bus` would create nothing.
+#
+# HEADSET HAS TWO, BECAUSE IT RESOLVES (B4). The pre-open has to open the
+# plugin the LEG will open, or the control is declared on the wrong chain and
+# the level lands nowhere; `bus_control_pcm` below picks, from the one
+# resolution in the policy.
 BUS_CONTROL_PCM = {"speaker": "speaker_out", "headset": "headset_out"}
+BUS_CONTROL_PCM_BT_HEADSET = "bt_headset_out"
+
+
+def bus_control_pcm(state):
+    """Which plugin declares the softvol for the position `state` selects."""
+    if (state["output"] == "headset"
+            and policy.headset_via(state) == policy.HEADSET_VIA_BLUETOOTH):
+        return BUS_CONTROL_PCM_BT_HEADSET
+    return BUS_CONTROL_PCM.get(state["output"])
 
 
 
@@ -1640,8 +1701,27 @@ def publish_adapter_independent_state(wanted, headset, applier):
 
     # The resolved headset card is written even when the adapter is absent (as
     # an empty value), so a later start cannot pick up a stale card id.
-    write_atomic(HEADSET_ENV, "WALL_AUDIO_HEADSET_CARD=%s\n" % (headset or ""),
+    #
+    # FOUR VALUES NOW, ONE FILE, ONE WRITER (B4). The Bluetooth leg needs the
+    # headset's address, `wall-bt-call` needs to know whether Headset resolved
+    # to a radio at all, and the broker carries the same answer to the chrome's
+    # Bluetooth mark. All of them are derived HERE, from the one `headset_via`
+    # in the policy, so nothing downstream re-implements the Owner's priority.
+    # Empty values rather than absent keys, for the same reason the card id is
+    # written empty: an EnvironmentFile that stops mentioning a variable leaves
+    # the last one in a running unit's environment.
+    bt_address, bt_alias = bt_headset()
+    write_atomic(HEADSET_ENV,
+                 "WALL_AUDIO_HEADSET_BT_ALIAS=%s\n"
+                 "WALL_AUDIO_HEADSET_BT_DEV=%s\n"
+                 "WALL_AUDIO_HEADSET_CARD=%s\n"
+                 "WALL_AUDIO_HEADSET_VIA=%s\n"
+                 % (bt_alias or "", bt_address or "", headset or "",
+                    wanted.get("headset_via") or "none"),
                  mode=0o644, dry_run=applier.dry_run)
+    log("headset resolves to %s (usb card %s, bluetooth %s)"
+        % (wanted.get("headset_via") or "nothing", headset or "absent",
+           "connected" if bt_address else "absent"))
     return mic_source_changed
 
 
@@ -1792,7 +1872,7 @@ def apply_plan(state, applier):
     # found in the first fix: a control created AFTER the forwarder is already
     # running sits at the plugin default, which is full scale, with audio
     # flowing through it.
-    leg_pcm = BUS_CONTROL_PCM.get(state["output"])
+    leg_pcm = bus_control_pcm(state)
     # WHICH SPEAKER CHAIN, DECIDED BEFORE ANYTHING OPENS speaker_out. The
     # pre-open below and the leg itself must agree, and only this order gets
     # that: probe, publish, then declare the control on the chain that answered.
@@ -1846,7 +1926,8 @@ def apply_plan(state, applier):
     return failures
 
 
-def headset_event(present, forced_boot=False, forced_runtime=False):
+def headset_event(present, forced_boot=False, forced_runtime=False,
+                  via=policy.HEADSET_VIA_USB):
     """One `headset` event, carrying whether it is coldplug or a runtime plug.
 
     The distinction is the Owner's 2026-09-13 ruling and it is made HERE, in the
@@ -1864,13 +1945,30 @@ def headset_event(present, forced_boot=False, forced_runtime=False):
         # A remove is only ever a runtime event: a device that is not there
         # cannot be coldplugged, and the remove half of the presence unit only
         # runs when the kernel actually took the device away.
-        return {"kind": "headset", "present": False, "boot": bool(forced_boot)}
+        return {"kind": "headset", "present": False, "boot": bool(forced_boot),
+                "via": via}
     if forced_runtime:
-        return {"kind": "headset", "present": True, "boot": False}
+        return {"kind": "headset", "present": True, "boot": False, "via": via}
     boot = forced_boot
-    if not boot:
+    if not boot and via == policy.HEADSET_VIA_BLUETOOTH:
+        # GATE 1 ONLY, FOR THE RADIO. `is_boot_presence` compares a udev
+        # USEC_INITIALIZED against the boot stamp, and a Bluetooth device has
+        # neither: BlueZ is not udev, and nothing stamps the moment a link came
+        # up. What survives is the first of its two gates -- has the boot
+        # finished at all -- which is the one with no number in it and the one
+        # a slow boot cannot outrun.
+        #
+        # The second gate is not lost so much as relocated. `wall_audio_state`
+        # refuses to auto-switch for a presence it already believed, so the
+        # observer's ten-second republish of a headset that has been connected
+        # all along cannot move the switch however this resolves. What gate 1
+        # buys is the FIRST report after a boot: a headset already connected
+        # when the panel came up is recorded and does not drag the Owner off
+        # the position they left the panel in (ruling G).
+        boot = system_is_up() is not True
+    elif not boot:
         boot = is_boot_presence(device_initialized_usec(headset_syspath()))
-    return {"kind": "headset", "present": True, "boot": bool(boot)}
+    return {"kind": "headset", "present": True, "boot": bool(boot), "via": via}
 
 
 def event_from_arguments(arguments):
@@ -1910,7 +2008,8 @@ def event_from_arguments(arguments):
         return {"kind": "set_volume", "level": int(arguments.value)}
     if arguments.command == "headset":
         return headset_event(arguments.value == "add", forced_boot=arguments.boot,
-                             forced_runtime=arguments.runtime)
+                             forced_runtime=arguments.runtime,
+                             via=arguments.via)
     return None
 
 
@@ -2078,6 +2177,11 @@ def main(argv=None):
     parser.add_argument("--runtime", action="store_true",
                         help="force a presence report to be treated as a plug "
                              "event on an already-running system")
+    parser.add_argument("--via", choices=(policy.HEADSET_VIA_USB,
+                                          policy.HEADSET_VIA_BLUETOOTH),
+                        default=policy.HEADSET_VIA_USB,
+                        help="which headset a presence report is about "
+                             "(default: the USB adapter)")
     parser.add_argument("--render", action="store_true",
                         help="re-render the generated file from the stored values")
     parser.add_argument("--trim-env", default=None,
@@ -2126,6 +2230,8 @@ def main(argv=None):
         parser.error("--boot and --runtime are opposites; pass at most one")
     if (arguments.boot or arguments.runtime) and arguments.command != "headset":
         parser.error("--boot/--runtime only mean anything for `headset`")
+    if arguments.via != policy.HEADSET_VIA_USB and arguments.command != "headset":
+        parser.error("--via only means anything for `headset`")
 
     expects_value = {"set": policy.OUTPUTS, "input-mute": ("on", "off"),
                      "headset": ("add", "remove")}
@@ -2173,7 +2279,16 @@ def main(argv=None):
                           "mic": {key: mic[key] for key in MIC_KEYS},
                           "mic_source_published": read_env(MIC_SOURCE_ENV,
                                                            MIC_SOURCE_VAR, None),
-                          "headset_card": headset_card()}, indent=2, sort_keys=True))
+                          "headset_card": headset_card(),
+                          # THE RESOLUTION, NOT THE TWO PRESENCES (B4). What
+                          # somebody reading `status` at three in the morning
+                          # needs is which headset "Headset" currently means;
+                          # both presences are already in the state block above.
+                          # The alias and never the address: this output is
+                          # pasted into tickets.
+                          "headset_via": policy.headset_via(state),
+                          "bt_headset": bt_headset()[1]},
+                         indent=2, sort_keys=True))
         return 0
 
     with apply_lock(dry_run=arguments.dry_run):
@@ -2291,6 +2406,19 @@ def _locked_apply(arguments):
         # latch from what coldplug actually sees, without ever moving `output`.
         state, lines = policy.apply_event(
             state, headset_event(headset_card() is not None, forced_boot=True))
+        for line in lines:
+            log(line)
+        # AND THE SAME FOR THE RADIO (B5). `bt_headset_present` is just as
+        # stale across a boot as the USB one, and for a worse reason: the
+        # observer republishes every ten seconds, so a state file that came
+        # back saying a headset was connected would resolve Headset to a
+        # Bluetooth device that is not there for as long as it takes the timer
+        # to fire -- silence, in the position the Owner left the panel in.
+        # Coldplug is a fact here too: it records and never moves `output`.
+        bt_address, _bt_alias = bt_headset()
+        state, lines = policy.apply_event(
+            state, headset_event(bt_address is not None, forced_boot=True,
+                                 via=policy.HEADSET_VIA_BLUETOOTH))
         for line in lines:
             log(line)
         save_state(state, arguments.state, dry_run=arguments.dry_run)

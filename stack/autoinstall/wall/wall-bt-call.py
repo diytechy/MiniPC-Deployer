@@ -79,6 +79,44 @@ SCO_PLAYBACK_VAR = "WALL_BT_SCO_PLAYBACK"
 BLUETOOTH_STATE = "/run/wall-bluetooth/state.json"
 CALL_STATE = "/run/wall-panel/call-state.json"
 
+# ── B7, the bridge ──────────────────────────────────────────────────────────
+# WHAT THE HEADSET POSITION RESOLVED TO, RE-READ ON EVERY POLL. The unit also
+# takes this file as an EnvironmentFile, and that is NOT the same thing: an
+# EnvironmentFile is read once, when the unit starts, and the resolution moves
+# whenever a headset connects or walks away. A supervisor that trusted its own
+# start-time environment would bridge a call to a headset that left the room
+# twenty minutes ago.
+HEADSET_ENV = "/run/wall-panel/audio-headset.env"
+# THE SAME FILE, FOR THE SAME REASON, FOR THE MICROPHONE. `mic_selected`
+# resolves through `@func getenv` in the process that OPENS it -- which is this
+# supervisor's alsaloop child, inheriting this process's environment. The
+# applier restarts the MIC legs when the source changes and only `start`s this
+# unit, so a source change while the supervisor is alive would otherwise leave
+# the gateway listening to whichever microphone was selected when the unit
+# started. Read per poll, passed to the child, and a change restarts the leg.
+MIC_SOURCE_ENV = "/run/wall-panel/audio-mic-source.env"
+MIC_SOURCE_VAR = "WALL_AUDIO_MIC_SOURCE"
+# Where the bridge puts the headset's microphone: the writing side of the
+# loopback `mic_bt` snoops. See asound-bus-mode.conf.
+BT_MIC_IN_PCM = "btmic_in"
+# The A2DP leg the applier runs to the same headset. A2DP and SCO are exclusive
+# on one peer, so the bridge must take it down for the duration; the unit's own
+# ExecCondition refuses to start while this process says `bridge`, which is what
+# keeps an apply during a call from fighting this one.
+BT_HEADSET_UNIT = "wall-bus-bt-headset.service"
+SYSTEMCTL = "/usr/bin/systemctl"
+# The same fact as `call-state.json`'s `bridge`, in the one shape a unit file
+# can test without quoting a JSON fragment through systemd's parser AND sh's.
+# Written before the A2DP leg is stopped and removed after it is started, so
+# the unit's ExecCondition is never the last to know.
+BRIDGE_MARKER = "/run/wall-panel/call-bridge"
+# The silence pump. A loopback capture with NO writer does not return silence:
+# it blocks, and the mic leg reading `mic_bt` becomes an xrun storm the guard
+# eventually gives up on. So something always writes while Headset resolves to
+# Bluetooth, and what changes is whether it is the headset's microphone or
+# zeros. `aplay` is already on the panel and reading /dev/zero costs nothing.
+APLAY = "/usr/bin/aplay"
+
 # /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink -- the object path
 # BlueALSA publishes for the playback half of an HFP link the panel is the
 # HANDS-FREE unit of. `source` is the other half (the far end's voice) and is
@@ -110,6 +148,21 @@ CALL_STATE = "/run/wall-panel/call-state.json"
 # opened `.../hfphf/sink`. v4 accepts only `a2dp` and `sco` there.
 SCO_SINK = re.compile(
     r"/org/bluealsa/(?P<hci>hci\d+)/dev_(?P<dev>[0-9A-Fa-f_]{17})/(?:sco|hfphf)/sink\b")
+
+# THE OTHER ROLE'S OBJECTS (B7). `hfpag` is the panel as hands-free GATEWAY --
+# what it is toward a headset it selected -- and it is the exact mirror of the
+# pair above: `sink` is what the panel PLAYS to the headset, `source` is the
+# headset's microphone coming back. The comment above says `hfpag` is "NOT"
+# accepted, and that remains true of SCO_SINK: sending the panel's microphone
+# to a headset would be a leg pointed the wrong way. These are the legs Goal 2
+# adds deliberately, which is what that sentence was holding the door open for.
+#
+# Only the SINK path is matched and the source is derived from it, because the
+# two are published together for one device and one regex is one thing to keep
+# right. BlueALSA has no v3 spelling to be compatible with here: the AG role
+# was never enabled on this panel before B1.
+AG_SINK = re.compile(
+    r"/org/bluealsa/(?P<hci>hci\d+)/dev_(?P<dev>[0-9A-Fa-f_]{17})/hfpag/sink\b")
 
 DEFAULT_POLL_SECONDS = 5.0
 # A poll that is cheap enough to be frequent and slow enough not to matter: the
@@ -152,9 +205,80 @@ def parse_sco_sinks(text):
     return sorted(found)
 
 
+def ag_object_paths(text):
+    """Every AG-role SCO playback OBJECT in a `busctl tree` dump, path and all.
+
+    The mirror of `sco_object_paths`, and separate from it rather than a
+    parameter, because the two answer different questions and a caller that
+    mixed them up would bridge a call into the gateway it came from.
+    """
+    found = {}
+    for match in AG_SINK.finditer(text or ""):
+        found[match.group(0)] = match.group("dev").replace("_", ":").upper()
+    return sorted(found.items())
+
+
 def pcm_name(address):
     """The BlueALSA PCM for one device's SCO playback."""
     return "bluealsa:DEV=%s,PROFILE=sco" % address
+
+
+def read_env_file(path, key):
+    """One value out of a systemd EnvironmentFile, or None. Never raises.
+
+    A deliberately small parser: these files are written by `write_atomic` in
+    `wall-audio-output`, one `KEY=value` per line and nothing else -- no
+    quoting, no continuations, no comments. Anything more would be a second,
+    less honest copy of systemd's parser.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                name, sep, value = line.partition("=")
+                if sep and name.strip() == key:
+                    value = value.strip()
+                    return value or None
+    except OSError:
+        return None
+    return None
+
+
+def headset_resolution(path=HEADSET_ENV):
+    """(via, address) for what the Headset position resolves to right now.
+
+    `via` is `bluetooth`, `usb` or None, exactly as `wall_audio_state.headset_via`
+    answered it on the applier's last pass; the address is only ever present
+    with `bluetooth`.
+
+    THE POLICY IS NOT RE-DERIVED HERE and must not be. The Owner's priority
+    (Bluetooth over USB, always) has one spelling, in `wall_audio_state`, and
+    this process reads the answer the applier published rather than asking BlueZ
+    the same question a second way. Two spellings of that rule is how the room's
+    music ends up in one headset and somebody's voice in another.
+
+    Missing or unreadable answers None, which is "no bridge is possible" -- the
+    same direction everything else in this file fails in.
+    """
+    via = read_env_file(path, "WALL_AUDIO_HEADSET_VIA")
+    if via not in ("bluetooth", "usb"):
+        return None, None
+    if via != "bluetooth":
+        return via, None
+    address = read_env_file(path, "WALL_AUDIO_HEADSET_BT_DEV")
+    if not address:
+        # Resolved to Bluetooth with no address is a contradiction the applier
+        # cannot write -- `headset_via` answers bluetooth only from a presence
+        # that came with one -- so treat it as nothing rather than guessing.
+        return None, None
+    return via, address.upper()
+
+
+def mic_source_name(path=MIC_SOURCE_ENV):
+    """Which capture PCM `mic_selected` should resolve to, or None.
+
+    Read per poll and handed to the child's environment; see MIC_SOURCE_ENV.
+    """
+    return read_env_file(path, MIC_SOURCE_VAR)
 
 
 def poll_seconds(raw=None):
@@ -266,6 +390,72 @@ def voice_argv(address, rate):
             "--pdevice", BUS_PCM,
             "--format", "S16_LE", "--rate", str(int(rate)), "--channels", "1",
             "--tlatency", "50000", "--sync", "5"]
+
+
+def headset_voice_argv(address, rate=None):
+    """Bridge leg 3: the merged bus to the Bluetooth headset's SCO sink.
+
+    THIS REPLACES THE HEADSET'S A2DP LEG FOR THE DURATION, and it is not a
+    choice: A2DP and SCO are exclusive on one peer, so while the panel holds
+    the AG link the headset hears the whole bus at 8 or 16 kHz mono. Library
+    music in the background of a call is CVSD-quality; that is the profile,
+    not a defect, and it is why the bridge exists only while a call is up.
+
+    `rate` is accepted and IGNORED, exactly as it is on the microphone leg
+    toward a gateway, and for the same measured reason: the playback side is a
+    raw BlueALSA PCM whose plugin converts, so a fixed 16000 carries against an
+    8 kHz CVSD link. The parameter is there so every leg shares one call shape.
+    """
+    return [GUARD, "--max-errors", "20", "--window", "10", "--",
+            ALSALOOP,
+            "--cdevice", "bus_monitor",
+            "--pdevice", pcm_name(address),
+            "--format", "S16_LE", "--rate", "16000", "--channels", "1",
+            "--tlatency", "50000", "--sync", "5"]
+
+
+def headset_mic_argv(address, rate):
+    """Bridge leg 4: the Bluetooth headset's microphone into `mic_bt`.
+
+    The rate is READ AND PASSED for the reason `voice_argv` documents: this
+    leg's capture device is a raw BlueALSA PCM, and `plug` over a capture fails
+    with `Poll FD initialization failed`. The destination is the loopback
+    writing side, which IS wrapped in `plug`, so the conversion happens where
+    it is allowed to.
+
+    Nothing downstream learns that a radio is involved: the mic legs open
+    `mic_selected`, which the applier has already resolved to `mic_bt`.
+    """
+    return [GUARD, "--max-errors", "20", "--window", "10", "--",
+            ALSALOOP,
+            "--cdevice", pcm_name(address),
+            "--pdevice", BT_MIC_IN_PCM,
+            "--format", "S16_LE", "--rate", str(int(rate)), "--channels", "1",
+            "--tlatency", "50000", "--sync", "5"]
+
+
+def silence_argv(address=None, rate=None):
+    """The silence pump: zeros into `mic_bt` while no bridge is up.
+
+    WHY THIS EXISTS AT ALL. `mic_bt` is a loopback, and a loopback capture with
+    no writer BLOCKS rather than returning silence -- the reader gets no poll
+    events at all, and an alsaloop sitting on it becomes an xrun storm the
+    guard gives up on after twenty. The Headset-over-Bluetooth position names
+    `mic_bt` as the microphone whether or not a call is bridged (naming the
+    panel's own microphone there would tunnel a capsule the Owner believes is
+    switched away from -- ruling 7), so something has to be writing.
+
+    What the desktop's line input therefore hears in that position, with no
+    call up, is silence. That is the honest answer: taking the headset's
+    microphone outside a call would drop the room's music to 8 kHz mono for as
+    long as it was open, because A2DP and SCO are exclusive on one peer.
+
+    The signature takes and ignores the leg arguments so that `Leg` can drive
+    it exactly like the other four.
+    """
+    return ["/bin/sh", "-c",
+            "exec %s -q -D %s -f S16_LE -r 48000 -c 1 -t raw /dev/zero"
+            % (APLAY, BT_MIC_IN_PCM)]
 
 
 def parse_running(text):
@@ -408,6 +598,36 @@ def read_calls(run=subprocess.run):
     return calls
 
 
+def ag_link_rate(address, run=subprocess.run):
+    """The negotiated rate of the AG SCO link to `address`, or None (B7).
+
+    `Running` IS NOT ASKED HERE, and that is the difference from `read_calls`.
+    On the HF side the panel is waiting for a gateway to raise SCO, so Running
+    is the only honest answer to "is there a call". On the AG side the panel is
+    the gateway: the link comes up because THIS process opens the PCM, so
+    waiting for it to be running first would be waiting for something only this
+    process can cause. What is asked instead is that the object exists -- the
+    headset is connected and offers the profile -- and at what rate it would
+    open.
+
+    None means "do not bridge to this headset", which leaves the ordinary
+    call state and the far end on the room's speakers. Same direction as
+    everything else here.
+    """
+    try:
+        done = run([BUSCTL, "--system", "tree", "org.bluealsa"],
+                   check=False, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("bluealsa object tree unreadable (%s): no bridge this poll" % exc)
+        return None
+    if done.returncode != 0:
+        return None
+    for path, found in ag_object_paths(done.stdout):
+        if found == str(address).upper():
+            return pcm_sampling(path, run=run)
+    return None
+
+
 class Leg:
     """At most one alsaloop child, started and stopped by address.
 
@@ -429,28 +649,42 @@ class Leg:
         self.name = name
         self.address = None
         self.child = None
+        # WHAT `mic_selected` RESOLVED TO WHEN THIS CHILD WAS SPAWNED. ALSA
+        # reads `@func getenv` in the process that OPENS the PCM, so a child
+        # holds whatever it inherited for as long as it lives; `ensure` treats
+        # a change here exactly as it treats a change of address, because both
+        # mean this leg is carrying the wrong audio.
+        self.mic_source = None
 
     def running(self):
         return self.child is not None and self.child.poll() is None
 
-    def start(self, address, rate=None):
+    def start(self, address, rate=None, mic_source=None):
         self.stop()
+        environment = None
+        if mic_source:
+            environment = dict(os.environ)
+            environment[MIC_SOURCE_VAR] = mic_source
         try:
-            self.child = self._popen(self._argv(address, rate))
+            self.child = self._popen(self._argv(address, rate), env=environment)
         except OSError as exc:
             log("could not start the %s leg to %s: %s" % (self.name, address, exc))
             self.child = None
             return False
         self.address = address
-        log("%s leg started (%s)" % (self.name, pcm_name(address)))
+        self.mic_source = mic_source
+        log("%s leg started (%s%s)"
+            % (self.name, pcm_name(address) if address else "no device",
+               "" if not mic_source else ", mic %s" % mic_source))
         return True
 
-    def ensure(self, address, rate=None):
+    def ensure(self, address, rate=None, mic_source=None):
         """Start if it is not already on this address and alive. Idempotent,
         because the poll loop calls it every interval and a restart drops
         audio for as long as ALSA takes to reopen."""
-        if address != self.address or not self.running():
-            return self.start(address, rate)
+        if (address != self.address or self.mic_source != mic_source
+                or not self.running()):
+            return self.start(address, rate, mic_source)
         return True
 
     def stop(self):
@@ -565,10 +799,80 @@ def _same_fact(left, right):
     return all(left.get(key) == right.get(key) for key in keys if key != "revision")
 
 
-def call_document(state, gateway_alias, since, mic, revision):
-    """The published fact, as §20a defines it. Pure, so the shape is testable."""
-    return {"state": state, "gateway": gateway_alias, "headset": None,
+def call_document(state, gateway_alias, since, mic, revision,
+                  headset_alias=None):
+    """The published fact, as §20a defines it. Pure, so the shape is testable.
+
+    `headset` is the alias of the Bluetooth headset a `bridge` is carrying the
+    call to, and None in every other state. An alias, never an address
+    (LLR-979).
+    """
+    return {"state": state, "gateway": gateway_alias,
+            "headset": headset_alias if state == "bridge" else None,
             "since": since, "mic": mic, "revision": revision}
+
+
+def set_bridge_marker(present, path=BRIDGE_MARKER):
+    """Create or remove the marker `wall-bus-bt-headset.service` tests.
+
+    Every failure is a journal line and nothing else: a marker that cannot be
+    written means the A2DP leg may be restarted under the bridge, which is an
+    audible glitch, and taking the call down to avoid it would be worse.
+    """
+    try:
+        target = pathlib.Path(path)
+        if present:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
+            os.chmod(target, 0o644)
+        else:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+    except OSError as exc:
+        log("could not %s the bridge marker (%s)"
+            % ("write" if present else "remove", exc))
+
+
+def _systemctl(action, unit, run=subprocess.run):
+    """Best-effort `systemctl <action> <unit>`. Never raises, always logs.
+
+    WHY THIS PROCESS TOUCHES A UNIT AT ALL. A2DP and SCO are exclusive on one
+    peer, so the bridge has to take the headset's A2DP leg down for the
+    duration and put it back afterwards, and this is the only thing that knows
+    when a bridge begins and ends. The applier cannot: "bridging" is a runtime
+    fact about a radio, not a state anybody stored.
+
+    It is not a fight with the applier, because `wall-bus-bt-headset.service`
+    carries an ExecCondition that refuses to start while this process says
+    `bridge`. An apply during a call therefore no-ops on that unit instead of
+    restarting it under a live SCO link.
+    """
+    try:
+        done = run([SYSTEMCTL, action, unit], check=False,
+                   capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("could not %s %s (%s)" % (action, unit, exc))
+        return False
+    if done.returncode != 0:
+        log("%s %s returned %d" % (action, unit, done.returncode))
+        return False
+    return True
+
+
+def touch_call_state(path=CALL_STATE):
+    """Mark the call document fresh without rewriting it.
+
+    The broker measures this file's age to decide whether to believe it, and
+    the supervisor writes it only on a CHANGE -- so the heartbeat is a
+    timestamp and not a rewrite. Every failure is silent, for the same reason
+    `publish_call_state`'s is: a status line is not worth a call.
+    """
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
 
 
 def publish_call_state(document, path=CALL_STATE):
@@ -597,13 +901,39 @@ def main(argv=None):
     interval = poll_seconds()
     mic_leg = Leg("HFP mic return", loop_argv)
     voice_leg = Leg("HFP far-end", voice_argv)
+    # ── the bridge's own three children (B7) ───────────────────────────────
+    # Leg 3 and leg 4 of §20b, plus the silence pump that keeps `mic_bt` from
+    # blocking its readers when leg 4 is not running. All three address the
+    # HEADSET; the two above address the GATEWAY.
+    headset_voice_leg = Leg("bridge to headset", headset_voice_argv)
+    headset_mic_leg = Leg("bridge headset mic", headset_mic_argv)
+    silence_leg = Leg("mic_bt silence", silence_argv)
     stopping = {"now": False}
     published = {"document": None, "since": None, "revision": 0}
+    # Whether THIS process has taken the headset's A2DP leg down. Held rather
+    # than re-derived, so the unit is stopped and started exactly once per
+    # bridge instead of on every poll.
+    bridging = {"now": False}
 
     def handle(signum, frame):  # noqa: ARG001 - the signal API's shape
         stopping["now"] = True
 
-    def announce(state, address, mic):
+    def stop_bridge_legs():
+        """End the bridge and give the headset its A2DP leg back."""
+        headset_voice_leg.stop()
+        headset_mic_leg.stop()
+        if bridging["now"]:
+            bridging["now"] = False
+            # The unit's ExecCondition reads `call-state.json`, so the state
+            # has to have stopped saying `bridge` before this start is tried.
+            publish_call_state(call_document(
+                "call", published["document"].get("gateway")
+                if published["document"] else None,
+                published["since"], None, published["revision"]))
+            set_bridge_marker(False)
+            _systemctl("start", BT_HEADSET_UNIT)
+
+    def announce(state, address, mic, headset_alias=None):
         """Publish only when something CHANGED, so the revision counts events
         rather than polls and the journal does not fill with sameness."""
         since = published["since"]
@@ -612,10 +942,20 @@ def main(argv=None):
         elif since is None:
             since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         document = call_document(state, alias_of(address) if address else None,
-                                 since, mic, published["revision"])
+                                 since, mic, published["revision"],
+                                 headset_alias=headset_alias)
         # The revision counts EVENTS, not polls, so a call that stays up does
         # not churn a file the broker re-reads on a 30 s staleness rule.
         if published["document"] is not None and _same_fact(document, published["document"]):
+            # THE FACT HAS NOT CHANGED AND THE FILE STILL HAS TO BE FRESH
+            # (terra, 2026-09-19, finding 3). The broker rejects this document
+            # once its mtime is older than its staleness bound, so a call that
+            # simply CONTINUES -- which is what a call mostly does -- would be
+            # reported as idle within half a minute while both legs were still
+            # running. The revision still counts EVENTS, so the broker's
+            # readers see no churn; only the timestamp moves.
+            if state != "idle":
+                touch_call_state()
             return
         published["revision"] += 1
         document["revision"] = published["revision"]
@@ -628,15 +968,88 @@ def main(argv=None):
     log("HFP call supervisor watching for calls every %.1f s" % interval)
     try:
         while not stopping["now"]:
+            # WHAT HEADSET MEANS RIGHT NOW, READ BEFORE ANYTHING ELSE. Both the
+            # silence pump and the bridge turn on it, and it moves whenever a
+            # headset connects or walks away.
+            via, headset_address = headset_resolution()
+            source = mic_source_name()
             if not bus_mode_active():
-                mic_leg.stop(); voice_leg.stop(); announce("idle", None, None)
+                mic_leg.stop(); voice_leg.stop()
+                stop_bridge_legs(); silence_leg.stop()
+                announce("idle", None, None)
             else:
+                # THE PUMP RUNS WHENEVER `mic_bt` IS THE NAMED MICROPHONE AND
+                # THE BRIDGE IS NOT FEEDING IT. It is started before any
+                # decision about calls, because the thing it prevents -- a
+                # reader blocked on a loopback with no writer -- is a failure
+                # of the panel's ORDINARY Headset position and has nothing to
+                # do with Bluetooth calls.
                 calls = read_calls()
                 wanted = decide(sorted(calls), mic_leg.address or voice_leg.address,
                                 preferred_input())
+                # A bridge needs a call, a Bluetooth headset behind the Headset
+                # position, and an AG SCO object for it. Anything missing and
+                # this is an ordinary call: the far end goes to the bus and out
+                # of whatever the switch points at.
+                bridge_rate = None
+                if wanted is not None and via == "bluetooth" and headset_address:
+                    bridge_rate = ag_link_rate(headset_address)
                 if wanted is None:
-                    mic_leg.stop(); voice_leg.stop(); announce("idle", None, None)
+                    mic_leg.stop(); voice_leg.stop(); stop_bridge_legs()
+                    if via == "bluetooth":
+                        silence_leg.ensure(None)
+                    else:
+                        silence_leg.stop()
+                    announce("idle", None, None)
+                elif bridge_rate is not None:
+                    # ── BRIDGE ──────────────────────────────────────────────
+                    # The A2DP leg goes first and the state file says `bridge`
+                    # before it does, so the unit's own ExecCondition holds it
+                    # down against an apply that arrives mid-call.
+                    if not bridging["now"]:
+                        bridging["now"] = True
+                        announce("bridge", wanted, None,
+                                 headset_alias=alias_of(headset_address))
+                        set_bridge_marker(True)
+                        _systemctl("stop", BT_HEADSET_UNIT)
+                    # THE HEADSET'S MICROPHONE OBEYS THE MUTE TOO (terra,
+                    # 2026-09-19, finding 1). It shipped outside the gate for
+                    # a moment on the reasoning that leg 2 is what SENDS -- but
+                    # a microphone this panel has opened against a mute is the
+                    # failure nobody in the room can see, whatever happens to
+                    # the samples afterwards, and `wall-mic-rear` reads the
+                    # same loopback. Muted, the pump takes the loopback back so
+                    # nothing downstream stalls on a writer that left.
+                    if mic_allowed():
+                        silence_leg.stop()
+                        headset_mic_leg.ensure(headset_address, bridge_rate)
+                    else:
+                        headset_mic_leg.stop()
+                        silence_leg.ensure(None)
+                    # The far end reaches the headset through the BUS, exactly
+                    # as it reaches the room's speakers: `voice_leg` puts it on
+                    # the bus and leg 3 carries the bus to the headset. So this
+                    # one is still behind WALL_BT_SCO_PLAYBACK -- without it the
+                    # bus has no far end on it and leg 3 would carry silence.
+                    if sco_playback_enabled():
+                        voice_leg.ensure(wanted, calls[wanted])
+                        headset_voice_leg.ensure(headset_address)
+                    else:
+                        voice_leg.stop(); headset_voice_leg.stop()
+                    if mic_allowed():
+                        mic_leg.ensure(wanted, mic_source=source)
+                    else:
+                        mic_leg.stop()
+                    announce("bridge", wanted,
+                             (source or MIC_PCM) if mic_leg.running() else None,
+                             headset_alias=alias_of(headset_address))
                 else:
+                    # ── ORDINARY CALL ───────────────────────────────────────
+                    stop_bridge_legs()
+                    if via == "bluetooth":
+                        silence_leg.ensure(None)
+                    else:
+                        silence_leg.stop()
                     # THE FAR END FIRST, AND INDEPENDENTLY OF THE MUTE. Muting
                     # the panel stops what it SENDS; it does not stop the other
                     # person being heard, which is what a muted headset does
@@ -646,11 +1059,11 @@ def main(argv=None):
                     else:
                         voice_leg.stop()
                     if mic_allowed():
-                        mic_leg.ensure(wanted)
+                        mic_leg.ensure(wanted, mic_source=source)
                     else:
                         mic_leg.stop()
                     announce("call", wanted,
-                             MIC_PCM if mic_leg.running() else None)
+                             (source or MIC_PCM) if mic_leg.running() else None)
             # Sleep in short slices so SIGTERM is answered promptly rather than
             # after a whole poll interval: systemd's stop timeout is not long.
             #
@@ -677,16 +1090,42 @@ def main(argv=None):
             while waited < interval and not stopping["now"]:
                 time.sleep(0.25)
                 waited += 0.25
-                if mic_leg.running() and not mic_allowed():
+                if (mic_leg.running() or headset_mic_leg.running()) and not mic_allowed():
                     mic_leg.stop()
-                    announce("call", voice_leg.address, None)
+                    # BOTH microphones, on the same tick. The bridge opens the
+                    # headset's capture as well as the gateway-bound leg, and a
+                    # mute that stopped one of them would be the cosmetic kind.
+                    # The pump is NOT started from here: this loop exists to
+                    # answer SIGTERM promptly and must not grow a leg start
+                    # (see the paragraph above). The next poll starts it, which
+                    # is the same asymmetry the microphone already has --
+                    # stopping fast and resuming slowly is the right way round.
+                    headset_mic_leg.stop()
+                    # THE STATE SURVIVES THE MUTE. A muted headset is still on
+                    # a call and still bridging; what stops is the microphone,
+                    # and that is what the `mic: null` says.
+                    announce("bridge" if bridging["now"] else "call",
+                             voice_leg.address or mic_leg.address, None,
+                             headset_alias=alias_of(headset_mic_leg.address)
+                             if bridging["now"] else None)
     finally:
         mic_leg.stop()
         voice_leg.stop()
+        # THE HEADSET'S A2DP LEG IS PUT BACK BEFORE THIS PROCESS GOES. Leaving
+        # it stopped would leave a Bluetooth headset silent in the Headset
+        # position after a `systemctl restart` of this unit, with nothing in
+        # the journal to connect the two.
+        headset_voice_leg.stop()
+        headset_mic_leg.stop()
+        silence_leg.stop()
         # The last word is always "no call". A stale `call` left in /run would
         # have the chrome showing a handset for a process that is gone.
         publish_call_state(call_document("idle", None, None, None,
                                          published["revision"] + 1))
+        set_bridge_marker(False)
+        if bridging["now"]:
+            bridging["now"] = False
+            _systemctl("start", BT_HEADSET_UNIT)
     return 0
 
 

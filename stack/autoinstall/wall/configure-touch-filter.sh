@@ -55,12 +55,38 @@ from pathlib import Path
 # fail_step and no panel finished provisioning. A version set, not >=, so a
 # future bump still lands here for review rather than passing unread.
 EXPECTED={2,3}
+# WHICH HEALTHS MEAN "THE DAEMON IS UP AND THE TOUCHSCREEN IS NOT SWALLOWED",
+# per mode -- and 'ready' alone was wrong for adaptive (measured 2026-09-19).
+#
+# THE FAILURE IT CAUSED. The Owner moved the panel to adaptive on 2026-09-19.
+# The next deploy's firstboot failed here, the whole paired release rolled
+# back, and the log line named the touch filter -- nothing to do with what was
+# being deployed. It is not a flake: adaptive reaches 'ready' only once
+# `AdaptiveGuard` clears `recovery`, which happens only when it takes the grab,
+# which requires `bridge.ready`, which requires the KIOSK to be connected. The
+# release lane stops the kiosk before running firstboot. So the gate was
+# waiting for a state the sequence it runs in makes unreachable, and every
+# adaptive deploy would have failed here forever.
+#
+# 'protecting-fail-open' is adaptive's correct resting answer with no bridge:
+# it has NOT grabbed the device, so touches reach the compositor natively. That
+# is the safe direction and it is what a panel in adaptive mode looks like at
+# every boot before the kiosk comes up.
+#
+# 'protecting-unavailable' is deliberately NOT accepted, for the same reason:
+# it means grabbed WHILE the output path is unavailable, which is the one state
+# where the daemon is eating touches. So is anything else -- 'stopped', 'off',
+# 'device-unavailable' -- by being absent from the set rather than by being
+# listed, so a new health lands here for review instead of passing unread.
+HEALTHY={'shadow':{'ready'},'filter':{'ready'},
+         'adaptive':{'ready','protecting-fail-open'}}[sys.argv[1]]
 start=time.time()
 for _ in range(100):
     try:
         state=json.loads(Path('/run/wall-touch-filter/status.json').read_text())
-        if state.get('protocolVersion') in EXPECTED and state.get('mode')==sys.argv[1] and state.get('health')=='ready' and state.get('observedAt',0)>=start*1000:
-            print('PASS touch filter: fresh daemon readiness verified');break
+        if state.get('protocolVersion') in EXPECTED and state.get('mode')==sys.argv[1] and state.get('health') in HEALTHY and state.get('observedAt',0)>=start*1000:
+            print('PASS touch filter: fresh daemon readiness verified (%s, health=%s)'
+                  % (sys.argv[1],state.get('health')));break
     except (OSError,ValueError):pass
     time.sleep(.1)
 else:raise SystemExit('Touch filter did not produce fresh readiness; udev isolation not changed')

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -411,3 +412,115 @@ def test_renderer_rejects_a_scope_that_could_escape_its_own_component():
     for uid in ("0", "-1", "99999999"):
         with pytest.raises(ValueError):
             renderer.render({"TOUCH_FILTER_MODE": "adaptive", "TOUCH_KIOSK_UID": uid})
+
+
+# ---------------------------------------------------------------------------
+# The readiness gate's HEALTH set, executed rather than grepped (2026-09-19)
+# ---------------------------------------------------------------------------
+
+
+def _run_readiness_gate(mode, status, tmp_path):
+    """Execute the gate's real embedded Python against one status document.
+
+    THE DECISION LOGIC IS THE THING UNDER TEST, so it is executed rather than
+    asserted as source text the way the two tests above do. Only two literals
+    are substituted -- the status path, which is hardcoded to /run, and the
+    retry count, because a failing gate otherwise sleeps for ten seconds. The
+    protocol set, the mode comparison, the HEALTH set and the freshness rule
+    are the shipped ones.
+
+    Returns the gate's stdout on success; raises SystemExit's message on
+    refusal, which is what firstboot turns into a fail_step.
+    """
+    import re as _re
+    helper = (ROOT / "stack/autoinstall/wall/configure-touch-filter.sh").read_text(encoding="utf-8")
+    body = helper.split('python3 - "$mode" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+    document = tmp_path / "status.json"
+    document.write_text(json.dumps(status), encoding="utf-8")
+    before = body
+    body = body.replace("'/run/wall-touch-filter/status.json'", repr(str(document)))
+    body = body.replace("range(100)", "range(2)")
+    assert body != before and "range(2)" in body, "the substitution did not take"
+    assert "/run/wall-touch-filter" not in body, "the gate would read the real panel path"
+    import contextlib
+    out = io.StringIO()
+    # The body does `import sys` itself, so the mode has to arrive the way the
+    # shell delivers it -- as argv -- rather than through the exec namespace.
+    argv = sys.argv
+    sys.argv = [str(ROOT / "configure-touch-filter.sh"), mode]
+    try:
+        with contextlib.redirect_stdout(out):
+            exec(compile(body, "readiness-gate", "exec"), {})
+    finally:
+        sys.argv = argv
+    return out.getvalue()
+
+
+def _fresh(**fields):
+    base = {"protocolVersion": 3, "mode": "adaptive", "health": "ready",
+            "observedAt": (time.time() + 5) * 1000}
+    base.update(fields)
+    return base
+
+
+def test_adaptive_passes_the_gate_while_the_kiosk_bridge_is_down():
+    """The defect that rolled back a whole paired release (2026-09-19).
+
+    The Owner moved the panel to adaptive; the next deploy's firstboot failed
+    on this gate and the release rolled back, with a log line naming the touch
+    filter and nothing to do with what was being deployed.
+
+    It is not a flake. Adaptive reaches 'ready' only once AdaptiveGuard clears
+    `recovery`, which happens only when it takes the grab, which requires
+    `bridge.ready` -- the KIOSK. The release lane stops the kiosk before
+    running firstboot, so the gate was waiting for a state the sequence it
+    runs in makes unreachable. Every adaptive deploy would have failed here.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        assert "PASS" in _run_readiness_gate(
+            "adaptive", _fresh(health="protecting-fail-open"), tmp)
+
+
+def test_the_gate_still_refuses_a_daemon_that_is_swallowing_touches():
+    """'protecting-fail-open' is accepted because it means NOT grabbed, so
+    touches reach the compositor natively. 'protecting-unavailable' is the
+    opposite -- grabbed while the output path is unavailable -- and is the one
+    state where the daemon eats every touch. Widening the set must not have
+    widened it to that."""
+    import tempfile
+    for health in ("protecting-unavailable", "stopped", "off", "device-unavailable"):
+        with tempfile.TemporaryDirectory() as directory:
+            with pytest.raises(SystemExit):
+                _run_readiness_gate("adaptive", _fresh(health=health), Path(directory))
+
+
+def test_shadow_and_filter_are_not_widened_by_the_adaptive_fix():
+    """Only adaptive has a bridge it must wait for. For the other two a daemon
+    that has not reached 'ready' is still a daemon that has not started."""
+    import tempfile
+    for mode in ("shadow", "filter"):
+        with tempfile.TemporaryDirectory() as directory:
+            assert "PASS" in _run_readiness_gate(
+                mode, _fresh(mode=mode, health="ready"), Path(directory))
+        with tempfile.TemporaryDirectory() as directory:
+            with pytest.raises(SystemExit):
+                _run_readiness_gate(
+                    mode, _fresh(mode=mode, health="protecting-fail-open"), Path(directory))
+
+
+def test_the_gate_still_requires_a_fresh_document_and_the_right_mode():
+    """The two assertions that were always doing the real work. A status left
+    by the PREVIOUS daemon would otherwise pass the restart it is meant to
+    prove, and a document for another mode is a config that did not take."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        with pytest.raises(SystemExit):
+            _run_readiness_gate("adaptive", _fresh(observedAt=0), Path(directory))
+    with tempfile.TemporaryDirectory() as directory:
+        with pytest.raises(SystemExit):
+            _run_readiness_gate("adaptive", _fresh(mode="shadow"), Path(directory))
+    with tempfile.TemporaryDirectory() as directory:
+        with pytest.raises(SystemExit):
+            _run_readiness_gate("adaptive", _fresh(protocolVersion=1), Path(directory))

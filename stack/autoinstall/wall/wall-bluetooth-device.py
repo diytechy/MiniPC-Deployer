@@ -238,6 +238,35 @@ def safe_name(name, alias):
     return text[:96]
 
 
+# Bits 8..12 of the Class of Device are the MAJOR DEVICE CLASS, and 0x04 is
+# Audio/Video -- the class every headset, speaker and headphone reports.
+# Measured on the panel 2026-09-19: the Owner's phone reads 0x005a420c (major
+# 0x02, Phone) and the office desktop reads 0x002e4104 (major 0x01, Computer);
+# BlueZ renders the same two as `Icon: phone` and `Icon: computer`.
+MAJOR_CLASS_SHIFT = 8
+MAJOR_CLASS_MASK = 0x1F
+MAJOR_CLASS_AUDIO_VIDEO = 0x04
+
+
+def major_device_class(raw):
+    """The major device class out of a `bluetoothctl info` Class line, or None.
+
+    None whenever it cannot be read, and the caller treats that as "not a
+    headset" -- which resolves the Headset position to the USB adapter, i.e.
+    to exactly what this panel did before any of this existed.
+    """
+    text = (raw or "").strip().split()
+    if not text:
+        return None
+    try:
+        value = int(text[0], 16 if text[0].lower().startswith("0x") else 10)
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    return (value >> MAJOR_CLASS_SHIFT) & MAJOR_CLASS_MASK
+
+
 def device_info(address):
     """The facts about one device, or None when BlueZ will not say."""
     ok, text = bluetoothctl("info", address, timeout=INFO_TIMEOUT_SECONDS)
@@ -258,6 +287,12 @@ def device_info(address):
         "paired": fields.get("Paired") == "yes",
         "trusted": fields.get("Trusted") == "yes",
         "connected": fields.get("Connected") == "yes",
+        # THE CLASS OF DEVICE, FOR ONE QUESTION ONLY: is this thing actually a
+        # headset. See `major_device_class` and `choose_bt_headset`. It is not
+        # published to the broker and must not be -- it is a fixed field of a
+        # device the panel can already name, which is exactly the kind of
+        # stable hardware identifier IF-015 keeps out.
+        "major_class": major_device_class(fields.get("Class")),
         "uuids": uuids,
         "battery": battery,
     }
@@ -509,6 +544,16 @@ def choose_bt_headset(devices, held=None):
         microphone; resolving Headset to one would put the room's audio in the
         speaker and leave the mic nowhere, which is not what "Headset" means on
         this glass. A speaker is what `select_output` is for.
+      * AND THE AUDIO/VIDEO MAJOR CLASS, because the role on its own is NOT
+        enough and the panel's own paired list proves it (measured 2026-09-19).
+        The office desktop advertises `Handsfree` -- Windows offers both HFP
+        roles -- so with the role alone it would have been picked as the
+        panel's Bluetooth headset the moment it was trusted, and the room's
+        music would have been routed into the PC under the Owner's desk. A
+        UUID says what a device CAN do; the class of device says what it IS,
+        and only the second one answers "is this a thing somebody wears".
+        Unreadable is not a headset, which resolves Headset to the USB adapter
+        -- what this panel did before any of this existed.
 
     TIES ARE BROKEN TOWARD THE ONE ALREADY HELD, then by address. The first
     clause is what stops two connected headsets making the panel alternate
@@ -523,6 +568,8 @@ def choose_bt_headset(devices, held=None):
             continue
         if bluetooth_state.CAPABILITY_HF not in bluetooth_state.capabilities(
                 info.get("uuids")):
+            continue
+        if info.get("major_class") != MAJOR_CLASS_AUDIO_VIDEO:
             continue
         candidates.append(info)
     if not candidates:

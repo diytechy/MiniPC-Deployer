@@ -843,3 +843,98 @@ def test_a_malformed_capability_list_is_dropped_not_carried(bad):
          "trusted": True, "connected": True, "capabilities": bad}])
     assert rows is not None, "one bad field must not fail the whole document"
     assert "capabilities" not in rows[0]
+
+
+
+# ── what the panel's own paired list found, pinned (B5, 2026-09-19) ─────────
+# MEASURED ON THE REAL PANEL, and it is the reason the eligibility rule has a
+# second half. The office desktop advertises `Handsfree` -- Windows offers both
+# HFP roles -- so the hands-free UNIT role on its own would have picked the PC
+# under the Owner's desk as the panel's Bluetooth headset the moment it was
+# trusted, and the room's music would have gone there. A UUID says what a
+# device CAN do; the class of device says what it IS.
+#
+# The two class values below are the real ones read off the panel.
+_PHONE_CLASS = "0x005a420c"      # major 0x02, Phone      -- the Owner's Pixel
+_COMPUTER_CLASS = "0x002e4104"   # major 0x01, Computer   -- the office desktop
+_HEADSET_CLASS = "0x240404"      # major 0x04, Audio/Video
+
+_AUDIO_SOURCE = "0000110a-0000-1000-8000-00805f9b34fb"
+_AUDIO_SINK = "0000110b-0000-1000-8000-00805f9b34fb"
+_HF_UNIT = "0000111e-0000-1000-8000-00805f9b34fb"
+_HF_GATEWAY = "0000111f-0000-1000-8000-00805f9b34fb"
+
+
+def _seen(module, address, klass, uuids, connected=True, trusted=True):
+    return {"address": address, "connected": connected, "trusted": trusted,
+            "major_class": module.major_device_class(klass), "uuids": uuids}
+
+
+def test_the_major_device_class_is_read_off_the_real_values(applier):
+    assert applier.major_device_class(_PHONE_CLASS) == 2
+    assert applier.major_device_class(_COMPUTER_CLASS) == 1
+    assert applier.major_device_class(_HEADSET_CLASS) == 4
+    assert applier.major_device_class("5915148") == 2, "a decimal Class still reads"
+    # Unreadable is not a headset, which resolves Headset to the USB adapter --
+    # what this panel did before any of this existed.
+    for bad in ("", "   ", "nonsense", None, "-1"):
+        assert applier.major_device_class(bad) is None, repr(bad)
+
+
+def test_a_dual_role_computer_is_not_the_panels_headset(applier):
+    """THE DEFECT THIS RULE EXISTS FOR, found by looking at the real panel.
+
+    The office desktop is connected, trusted, and advertises the hands-free
+    unit role. With the role alone it was eligible, so the Headset position
+    would have resolved to it and the room's music would have played into the
+    PC under the desk.
+    """
+    desktop = _seen(applier, "5C:F3:70:64:50:40", _COMPUTER_CLASS,
+                    [_AUDIO_SOURCE, _AUDIO_SINK, _HF_UNIT, _HF_GATEWAY])
+    phone = _seen(applier, "30:E0:44:4F:25:4C", _PHONE_CLASS,
+                  [_AUDIO_SOURCE, _HF_GATEWAY])
+    assert applier.choose_bt_headset([desktop, phone]) is None
+    headset = _seen(applier, "AA:11:22:33:44:55", _HEADSET_CLASS,
+                    [_AUDIO_SINK, _HF_UNIT])
+    chosen = applier.choose_bt_headset([desktop, phone, headset])
+    assert chosen["address"] == "AA:11:22:33:44:55"
+
+
+def test_the_other_three_eligibility_conditions_still_bite(applier):
+    base = _seen(applier, "AA:11:22:33:44:55", _HEADSET_CLASS,
+                 [_AUDIO_SINK, _HF_UNIT])
+    assert applier.choose_bt_headset([base])["address"] == base["address"]
+    # In a drawer: paired but not connected. Resolving Headset to it would make
+    # the panel silent with a red icon nobody could explain.
+    assert applier.choose_bt_headset([{**base, "connected": False}]) is None
+    # Merely connected, on a discoverable adapter, is anything in radio range.
+    assert applier.choose_bt_headset([{**base, "trusted": False}]) is None
+    # A Bluetooth SPEAKER: an audio-class sink with no microphone. It belongs
+    # to the output route selector, not to the Headset position.
+    assert applier.choose_bt_headset([{**base, "uuids": [_AUDIO_SINK]}]) is None
+
+
+def test_the_choice_does_not_wander_between_polls(applier):
+    """Ties break toward the one already held, then by address -- otherwise two
+    connected headsets would make the panel alternate on a ten-second timer."""
+    first = _seen(applier, "AA:11:22:33:44:55", _HEADSET_CLASS,
+                  [_AUDIO_SINK, _HF_UNIT])
+    second = _seen(applier, "BB:11:22:33:44:55", _HEADSET_CLASS,
+                   [_AUDIO_SINK, _HF_UNIT])
+    assert applier.choose_bt_headset([second, first])["address"] == first["address"]
+    assert applier.choose_bt_headset(
+        [first, second], held="BB:11:22:33:44:55")["address"] == second["address"]
+    # A held device that has gone does not stop the rule answering.
+    assert applier.choose_bt_headset(
+        [first], held="CC:11:22:33:44:55")["address"] == first["address"]
+
+
+def test_the_class_is_never_published_to_the_broker(applier):
+    """It is a fixed field of a device the panel can already name, which is the
+    kind of stable hardware identifier IF-015 keeps out. It is read for one
+    question and stays on this side of the boundary."""
+    source = APPLIER.read_text(encoding="utf-8")
+    published = source.split("write_document(STATE_PATH, {", 1)[1].split("})", 1)[0]
+    assert "major_class" not in published
+    row = source.split('rows.append(row)', 1)[0].rsplit('row = {', 1)[1]
+    assert "major_class" not in row

@@ -110,12 +110,23 @@ SYSTEMCTL = "/usr/bin/systemctl"
 # Written before the A2DP leg is stopped and removed after it is started, so
 # the unit's ExecCondition is never the last to know.
 BRIDGE_MARKER = "/run/wall-panel/call-bridge"
-# The silence pump. A loopback capture with NO writer does not return silence:
-# it blocks, and the mic leg reading `mic_bt` becomes an xrun storm the guard
-# eventually gives up on. So something always writes while Headset resolves to
-# Bluetooth, and what changes is whether it is the headset's microphone or
-# zeros. `aplay` is already on the panel and reading /dev/zero costs nothing.
-APLAY = "/usr/bin/aplay"
+# THERE IS NO SILENCE PUMP, AND THERE WAS ONE FOR AN AFTERNOON. It existed on
+# the belief that a loopback capture with no writer BLOCKS rather than
+# returning silence, which would have made the mic leg reading `mic_bt` an
+# xrun storm whenever the Headset position resolved to Bluetooth outside a
+# call. MEASURED ON THE PANEL 2026-09-19 and it is not true here: with nothing
+# writing, `mic_bt` delivered ten seconds of exact zeros, an `alsaloop` in the
+# real leg's shape ran twelve seconds with no error of any kind, and a reader
+# held across a writer ARRIVING and then LEAVING -- which is a call starting
+# and ending -- survived both transitions with an empty log. snd-aloop's
+# capture side free-runs on its own timer.
+#
+# So the pump is gone, along with the coordination it needed: it and the
+# bridge's leg 4 would have been two writers on one loopback substream, and
+# the supervisor had to stop one before starting the other. What it was there
+# to guarantee is simply true without it. Do not re-add it without repeating
+# those three measurements, because a component whose stated reason is false
+# is worse than no component.
 
 # /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/hfphf/sink -- the object path
 # BlueALSA publishes for the playback half of an HFP link the panel is the
@@ -432,30 +443,6 @@ def headset_mic_argv(address, rate):
             "--pdevice", BT_MIC_IN_PCM,
             "--format", "S16_LE", "--rate", str(int(rate)), "--channels", "1",
             "--tlatency", "50000", "--sync", "5"]
-
-
-def silence_argv(address=None, rate=None):
-    """The silence pump: zeros into `mic_bt` while no bridge is up.
-
-    WHY THIS EXISTS AT ALL. `mic_bt` is a loopback, and a loopback capture with
-    no writer BLOCKS rather than returning silence -- the reader gets no poll
-    events at all, and an alsaloop sitting on it becomes an xrun storm the
-    guard gives up on after twenty. The Headset-over-Bluetooth position names
-    `mic_bt` as the microphone whether or not a call is bridged (naming the
-    panel's own microphone there would tunnel a capsule the Owner believes is
-    switched away from -- ruling 7), so something has to be writing.
-
-    What the desktop's line input therefore hears in that position, with no
-    call up, is silence. That is the honest answer: taking the headset's
-    microphone outside a call would drop the room's music to 8 kHz mono for as
-    long as it was open, because A2DP and SCO are exclusive on one peer.
-
-    The signature takes and ignores the leg arguments so that `Leg` can drive
-    it exactly like the other four.
-    """
-    return ["/bin/sh", "-c",
-            "exec %s -q -D %s -f S16_LE -r 48000 -c 1 -t raw /dev/zero"
-            % (APLAY, BT_MIC_IN_PCM)]
 
 
 def parse_running(text):
@@ -907,7 +894,6 @@ def main(argv=None):
     # HEADSET; the two above address the GATEWAY.
     headset_voice_leg = Leg("bridge to headset", headset_voice_argv)
     headset_mic_leg = Leg("bridge headset mic", headset_mic_argv)
-    silence_leg = Leg("mic_bt silence", silence_argv)
     stopping = {"now": False}
     published = {"document": None, "since": None, "revision": 0}
     # Whether THIS process has taken the headset's A2DP leg down. Held rather
@@ -975,15 +961,9 @@ def main(argv=None):
             source = mic_source_name()
             if not bus_mode_active():
                 mic_leg.stop(); voice_leg.stop()
-                stop_bridge_legs(); silence_leg.stop()
+                stop_bridge_legs()
                 announce("idle", None, None)
             else:
-                # THE PUMP RUNS WHENEVER `mic_bt` IS THE NAMED MICROPHONE AND
-                # THE BRIDGE IS NOT FEEDING IT. It is started before any
-                # decision about calls, because the thing it prevents -- a
-                # reader blocked on a loopback with no writer -- is a failure
-                # of the panel's ORDINARY Headset position and has nothing to
-                # do with Bluetooth calls.
                 calls = read_calls()
                 wanted = decide(sorted(calls), mic_leg.address or voice_leg.address,
                                 preferred_input())
@@ -996,10 +976,6 @@ def main(argv=None):
                     bridge_rate = ag_link_rate(headset_address)
                 if wanted is None:
                     mic_leg.stop(); voice_leg.stop(); stop_bridge_legs()
-                    if via == "bluetooth":
-                        silence_leg.ensure(None)
-                    else:
-                        silence_leg.stop()
                     announce("idle", None, None)
                 elif bridge_rate is not None:
                     # ── BRIDGE ──────────────────────────────────────────────
@@ -1021,11 +997,9 @@ def main(argv=None):
                     # same loopback. Muted, the pump takes the loopback back so
                     # nothing downstream stalls on a writer that left.
                     if mic_allowed():
-                        silence_leg.stop()
                         headset_mic_leg.ensure(headset_address, bridge_rate)
                     else:
                         headset_mic_leg.stop()
-                        silence_leg.ensure(None)
                     # The far end reaches the headset through the BUS, exactly
                     # as it reaches the room's speakers: `voice_leg` puts it on
                     # the bus and leg 3 carries the bus to the headset. So this
@@ -1046,10 +1020,6 @@ def main(argv=None):
                 else:
                     # ── ORDINARY CALL ───────────────────────────────────────
                     stop_bridge_legs()
-                    if via == "bluetooth":
-                        silence_leg.ensure(None)
-                    else:
-                        silence_leg.stop()
                     # THE FAR END FIRST, AND INDEPENDENTLY OF THE MUTE. Muting
                     # the panel stops what it SENDS; it does not stop the other
                     # person being heard, which is what a muted headset does
@@ -1117,7 +1087,6 @@ def main(argv=None):
         # the journal to connect the two.
         headset_voice_leg.stop()
         headset_mic_leg.stop()
-        silence_leg.stop()
         # The last word is always "no call". A stale `call` left in /run would
         # have the chrome showing a handset for a process that is gone.
         publish_call_state(call_document("idle", None, None, None,

@@ -3286,11 +3286,23 @@ def test_the_bridge_legs_point_the_right_way_b7(btmic):
     assert back[back.index("--rate") + 1] == "16000"
 
 
-def test_the_silence_pump_writes_into_the_same_loopback_b3(btmic):
-    """A loopback capture with no writer BLOCKS rather than returning silence,
-    and an alsaloop sitting on it is an xrun storm the guard gives up on."""
-    argv = btmic.silence_argv()
-    assert "btmic_in" in argv[-1] and "/dev/zero" in argv[-1]
+def test_there_is_no_silence_pump_and_the_reason_is_recorded_b3(btmic):
+    """IT EXISTED FOR AN AFTERNOON, on the belief that a loopback capture with
+    no writer blocks rather than returning silence. Measured on the panel
+    2026-09-19 and it does not: ten seconds of `mic_bt` with nothing writing
+    delivered exact zeros, an alsaloop in the real leg's shape ran twelve
+    seconds with no error, and a reader held across a writer arriving and then
+    leaving -- a call starting and ending -- survived both transitions.
+
+    This test exists so the component cannot come back without the comment
+    that says what to measure first. A component whose stated reason is false
+    is worse than no component, and this one also needed the supervisor to
+    sequence two writers onto one loopback substream.
+    """
+    assert not hasattr(btmic, "silence_argv")
+    source = read(BT_MIC)
+    assert "THERE IS NO SILENCE PUMP" in source
+    assert "free-runs on its own timer" in source
 
 
 def test_the_call_document_names_the_headset_only_while_bridging_b7(btmic):

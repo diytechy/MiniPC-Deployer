@@ -64,8 +64,8 @@ pcm.card_loop_mic_cap { type hw
 }
 
 # The Bluetooth headset's microphone (B3). `wall-bt-call` writes here while it
-# is bridging a call, and silence the rest of the time so that nothing
-# downstream stalls on a loopback with no writer; `mic_bt` snoops it back out.
+# is bridging a call; with nothing writing the capture side free-runs silent,
+# which was measured rather than assumed. `mic_bt` snoops it back out.
 pcm.card_loop_btmic_play { type hw
     card "Loopback"
     device 0

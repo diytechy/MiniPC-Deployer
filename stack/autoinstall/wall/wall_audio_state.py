@@ -492,13 +492,14 @@ def mic_source(state, aec_available=False):
     # Bluetooth headset cannot carry A2DP and SCO at once -- the profile, not
     # this panel -- so taking its microphone would drop the room's music to
     # 8 kHz mono for as long as the mic was open. `wall-bt-call` therefore
-    # raises the AG link only while it is bridging a gateway's call, and feeds
-    # `mic_bt` silence the rest of the time so that nothing downstream stalls
-    # on a loopback with no writer. What reaches the desktop's line input in
-    # the Headset-over-Bluetooth position is therefore silence unless a call
-    # is up; naming `mic_panel` there instead would tunnel a microphone the
-    # Owner believes is switched away from, which is the one failure in this
-    # design nobody could hear happening (ruling 7).
+    # raises the AG link only while it is bridging a gateway's call, and the
+    # loopback behind `mic_bt` free-runs silent the rest of the time (measured
+    # 2026-09-19; see that file for the three measurements that retired the
+    # "silence pump" this design carried for an afternoon). What reaches the
+    # desktop's line input in the Headset-over-Bluetooth position is therefore
+    # silence unless a call is up; naming `mic_panel` there instead would
+    # tunnel a microphone the Owner believes is switched away from, which is
+    # the one failure in this design nobody could hear happening (ruling 7).
     via = headset_via(state)
     if state["output"] == "headset" and via == HEADSET_VIA_BLUETOOTH:
         return MIC_SOURCE_BT

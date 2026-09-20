@@ -664,6 +664,15 @@ def main(argv=None):
             # late. Discovery stays on the slow interval -- that is the part
             # that costs a busctl call; this is one small read of a file the
             # applier has already written.
+            #
+            # THE ASYMMETRY IS DELIBERATE AND WAS MEASURED: muting stops the
+            # leg within a tick, un-muting brings it back on the next POLL, so
+            # up to the interval later. Stopping fast and resuming slowly is
+            # the right way round for a microphone -- the failure that matters
+            # is one that stays open -- and resuming is not a promise anyone
+            # made. Do not "fix" this by starting the leg from the tick: that
+            # would put a leg start inside the loop that exists to answer
+            # SIGTERM promptly.
             waited = 0.0
             while waited < interval and not stopping["now"]:
                 time.sleep(0.25)

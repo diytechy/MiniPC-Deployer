@@ -354,10 +354,12 @@ Both scripts:
   (Q10.9 B+ — hardlinked when the filesystem allows, to save C: space per OI-6),
   with a **SIM `.env`**
   materialized from `stack/.env.example` — fictional domain, fictional Google
-  OAuth client, a real-shaped (but throwaway) oauth2-proxy cookie secret, a
-  random Technitium admin password, and real Caddy bcrypt basic_auth hashes
-  (generated via `docker run --rm caddy:2-alpine caddy hash-password`, if
-  Docker is available in WSL — it is, per WI-10.13).
+  OAuth client, real-shaped (but throwaway) cookie secrets for oauth2-proxy
+  and the admin portal's `admin-auth`, a random Technitium admin password, and
+  a real bcrypt for the admin sign-in (generated via `docker run --rm
+  caddy:2-alpine caddy hash-password`, if Docker is available in WSL — it is,
+  per WI-10.13). The sign-in's SIM plaintext is kept in `secrets/creds.env` as
+  `SIM_ADMIN_AUTH_PASSWORD`, so a gate can sign in to `*.admin.<domain>`.
 - Are **idempotent**: re-running reuses the existing SSH key + SIM secrets
   (pass `CLEAN=1` in the environment, or `--clean`, to force fresh ones).
 - **Never** touch a real secret. Real materialization for the physical AWOW

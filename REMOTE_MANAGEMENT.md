@@ -54,15 +54,63 @@ Provisioned by `stack/autoinstall/user-data`:
     account has a locked password, which is exactly the no-way-in state that
     cost a GRUB rescue on 2026-08-06.
 - **Cockpit web console** (host package, not a container — the plan's preferred
-  form) on `https://<LAN_IP>:9090`: terminal, logs, service control, updates,
-  reboot, metrics. **LAN-only** — it is *not* proxied through Caddy to the
-  internet, and the router must not forward :9090.
+  form): terminal, logs, service control, updates, reboot, metrics. **Loopback
+  only since 2026-09-25 (D-A3)** — a `cockpit.socket` drop-in
+  (`stack/cockpit/listen.conf`) binds it to `127.0.0.1:9090`, because a
+  sudo-capable shell in a browser used to answer on every interface, the tailnet
+  included. Reach it over SSH:
+  `ssh -L 9090:127.0.0.1:9090 hub@homehub`, then `https://localhost:9090`.
+  It is *not* proxied through Caddy, and the router must not forward :9090.
 - **unattended-upgrades** — hands-off OS **security** patching so the box stays
   current without a visit. (Kernel/livepatch and reboot-on-kernel-update are a
   separate opt-in; unattended-upgrades handles security packages by default.)
-- **Dozzle** (WI-10.11) on `http://<LAN_IP>:8081` — live container logs in a
-  browser, no SSH needed. **Uptime-Kuma** on `http://<LAN_IP>:3001` watches the
-  services and can alert.
+- **The admin portal — one front door for the browser tools** (ADMIN_PORTAL_PLAN,
+  2026-09-25). Sign in once at `https://admin.<domain>` and every
+  `*.admin.<domain>` site opens without another prompt:
+
+  | Site | Tool |
+  |---|---|
+  | `admin.<domain>` | Homepage — the landing page, a status dot per tool |
+  | `kuma.admin.<domain>` | Uptime-Kuma — up-checks and alerts (its own login too) |
+  | `logs.admin.<domain>` | Dozzle — live container logs, no SSH needed |
+  | `dns.admin.<domain>` | Technitium's console (its own login too) |
+  | `actual.admin.<domain>` | Actual Budget (its own password too) |
+
+  The login is `admin-auth`, a second oauth2-proxy in password mode (the
+  credential is `ADMIN_AUTH_USER`/`ADMIN_AUTH_HASH` in `.env`; the password is
+  the one that used to open `actual.<domain>`). Its cookie is scoped to
+  `.admin.<domain>`, so the tracker never sees it. Every admin site answers the
+  LAN and the tunnel only and gives anything else 403. The tools themselves
+  publish on the hub's **loopback only** — the old `http://<LAN_IP>:3001` and
+  `:8081` ports are closed — and Technitium's `:5380` is fenced to loopback and
+  Caddy (`stack/dns-console/`). The old names `actual.<domain>` and
+  `dns.<domain>` redirect for one release.
+- **When Caddy is the thing that is broken: the SSH fallback.** Every tool above
+  stays reachable over a tunnel, because each publishes on the hub's loopback:
+
+  | Service | Command | Then open |
+  |---|---|---|
+  | Dozzle | `ssh -L 8081:127.0.0.1:8081 hub@homehub` | `http://localhost:8081` |
+  | Uptime-Kuma | `ssh -L 3001:127.0.0.1:3001 hub@homehub` | `http://localhost:3001` |
+  | Technitium | `ssh -L 5380:127.0.0.1:5380 hub@homehub` | `http://localhost:5380` |
+  | Homepage | `ssh -L 3002:127.0.0.1:3002 hub@homehub` | `http://localhost:3002` |
+  | Actual | `ssh -L 5006:127.0.0.1:5006 hub@homehub` | `http://localhost:5006` |
+  | Cockpit | `ssh -L 9090:127.0.0.1:9090 hub@homehub` | `https://localhost:9090` |
+
+  Several `-L` flags can share one `ssh` session. The ports follow
+  `DOZZLE_PORT`, `UPTIMEKUMA_PORT`, `HOMEPAGE_PORT` and `ACTUAL_PORT` in `.env`.
+- **Optional exit node (Tailscale), off by default.** `TAILSCALE_ADVERTISE_EXIT_NODE=true`
+  makes `stack/tailscale/setup-tailscale.sh` offer the hub as an exit node with
+  `tailscale set --advertise-exit-node` — never `up`, which needs the whole
+  configuration restated and puts the LAN route at risk if one flag is left out —
+  and fails if `tailscale debug prefs` no longer shows the LAN route afterwards.
+  Advertising routes nothing: the Owner approves **Use as exit node** for `homehub`
+  in the admin console, then each device chooses it (tray → Exit node → homehub;
+  off with *None* or `tailscale set --exit-node=`). **Switch off clients first**,
+  then set the knob to false and re-run the script; assume a device still pointing
+  at a vanished exit node has no internet. Before/after evidence: HomeHub
+  `scripts/verify/exit-node-check.sh snapshot | diff <name> | verify`.
+  Plan: HomeHub `docs/EXIT_NODE_PLAN_2026-09-22.md`.
 
 ### The remote workflow (from the Owner's workstation, over the LAN)
 
@@ -92,9 +140,9 @@ docker compose up -d                # enable: pulls the image, starts it
 docker compose up -d --remove-orphans   # disable: removes de-profiled containers
 ```
 
-For anything a browser can do instead of a shell: **Cockpit** (system) and
-**Dozzle** (logs) cover "navigate, read logs, accept updates, reboot" without a
-terminal.
+For anything a browser can do instead of a shell: the **admin portal**
+(Dozzle for logs, Kuma for health) and **Cockpit** over its tunnel (system)
+cover "navigate, read logs, accept updates, reboot" without a terminal.
 
 ### State & credentials — what survives an update vs a reimage
 
@@ -105,7 +153,7 @@ disposable code; everything stateful sits in exactly two places on the host:
 | Where | What lives there | container update (`compose pull` + `up -d`, or a pin bump) | reimage (USB re-flash) |
 |---|---|---|---|
 | **Named Docker volumes** | Actual's server password + **SimpleFIN bank-sync credential** + budget files (`actual_data`) · Technitium zones/settings (`technitium_config`) · Caddy certs + ACME account (`caddy_data`) · tracker user data (`tracker_data`) · Vaultwarden vault + other tier-2 state | **survives** — pull/up recreates containers *around* unchanged volumes | **wiped** — restore from the volume backups (the `volume:` lines in `backup.env`, SR-013 + `restore.sh`), or re-do the small set of one-time in-app auths |
-| **Host config files** | `/opt/homehub/stack/.env` (OAuth client secret, Cloudflare token, Technitium admin password, basic_auth hashes) · `oauth2-proxy/authenticated-emails.txt` · `provision/.token` · `/etc/homehub-backup/{backup.env,cifs.creds}` | survives | `.env` + the allow-list are **re-seeded from the USB payload** (carry your filled `.env` on the stick); `provision/.token` re-mints itself idempotently; `/etc/homehub-backup/*` must be restored by hand |
+| **Host config files** | `/opt/homehub/stack/.env` (OAuth client secret, Cloudflare token, Technitium admin password, the admin sign-in hash and cookie secret) · `oauth2-proxy/authenticated-emails.txt` · `admin-auth/htpasswd` (re-written from `.env` by firstboot) · `provision/.token` · `/etc/homehub-backup/{backup.env,cifs.creds}` | survives | `.env` + the allow-list are **re-seeded from the USB payload** (carry your filled `.env` on the stick); `provision/.token` re-mints itself idempotently; `/etc/homehub-backup/*` must be restored by hand |
 
 Consequences worth internalizing:
 
@@ -167,11 +215,14 @@ libraries were in no image at all, so "RDP in and sign in to IceDrive" was an
 instruction nobody could follow. See
 [stack/remote-ui/README.md](stack/remote-ui/README.md).
 
-**LAN-only like Cockpit** — never proxied through Caddy, never port-forwarded.
+**LAN-only** — never proxied through Caddy, never port-forwarded. (Cockpit is
+stricter still since D-A3: loopback only, over `ssh -L`.)
 
-> **WireGuard is the later remote-access answer** (D5): once set up, the same LAN
-> workflow works from anywhere. Until then this is LAN / VPN-to-LAN only — do not
-> expose SSH, Cockpit, or the aux UIs to the public internet.
+> **Remote access is the mesh tunnel**, not a router forward: the Tailscale
+> subnet router (SR-042, `stack/tailscale/`) puts the same LAN workflow — SSH,
+> the tunnels above, the admin portal — within reach from anywhere. The admin
+> sites' `@lan` gate admits the tunnel's range as well as the LAN. Do not expose
+> SSH, Cockpit, or the management UIs to the public internet.
 
 ### The wall panel is REIMAGE-NOT-REPAIR (SN-013/SR-017, 2026-07-29)
 

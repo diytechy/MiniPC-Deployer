@@ -1,0 +1,30 @@
+---
+# The admin tools (ADMIN_PORTAL_PLAN §4.2, §4.4).
+#
+# THE LINK AND THE PROBE ARE DIFFERENT ADDRESSES, ON PURPOSE. `href` is what the
+# browser opens: the Caddy site under *.admin.<domain>, behind the admin login.
+# `siteMonitor` is what Homepage's own server fetches for the status dot, from
+# inside the `admin` docker network by container name. So a dot needs no Kuma
+# monitor to exist, and it tells you whether the TOOL is up independently of
+# Caddy, DNS or a certificate — which is the question you have when a link fails.
+#
+# Technitium is host-networked, so it has no container name to probe. Its dot
+# asks the admin bridge's gateway (172.28.92.1 — the host itself), which is a
+# source the DNS-console fence admits (the whole admin subnet may reach 5380).
+- Admin:
+    - Uptime Kuma:
+        href: https://kuma.admin.{{HOMEPAGE_VAR_DOMAIN}}/
+        description: Up-checks and alerts (its own login as well)
+        siteMonitor: http://uptime-kuma:3001
+    - Dozzle:
+        href: https://logs.admin.{{HOMEPAGE_VAR_DOMAIN}}/
+        description: Live container logs
+        siteMonitor: http://dozzle:8080
+    - Technitium:
+        href: https://dns.admin.{{HOMEPAGE_VAR_DOMAIN}}/
+        description: DNS console (its own login as well)
+        siteMonitor: http://172.28.92.1:5380
+    - Actual:
+        href: https://actual.admin.{{HOMEPAGE_VAR_DOMAIN}}/
+        description: Budget (its own password as well)
+        siteMonitor: http://actual:5006

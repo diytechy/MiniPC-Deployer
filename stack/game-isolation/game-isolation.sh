@@ -22,7 +22,7 @@
 #
 # The 5380 line is the serious one. That console can rewrite every name the
 # household resolves, and reaching it this way goes straight past BOTH of the
-# guards put on it: Caddy's LAN-only remote_ip gate and Caddy's basic_auth. The
+# guards put on it: Caddy's LAN-only remote_ip gate and the admin sign-in. The
 # gate is a Caddy site matcher; a caller that never talks to Caddy is not
 # subject to it. Technitium binds :5380 on ALL interfaces because it is
 # host-networked, and the bridge is one of them.

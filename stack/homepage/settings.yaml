@@ -1,0 +1,20 @@
+---
+# Homepage — the admin portal's landing page, served at admin.<domain> behind
+# the admin login (ADMIN_PORTAL_PLAN §4.4). docker-compose.yml mounts THIS
+# DIRECTORY read-only at /app/config, so the config is the repo's and survives a
+# reimage; before 2026-09-25 it lived only in the `homepage_config` volume.
+#
+# EVERY FILE IN THIS DIRECTORY IS LOAD-BEARING, even the empty-looking ones.
+# At start Homepage copies a skeleton file into /app/config for any it finds
+# missing; on a read-only mount that copy fails with EROFS and the page answers
+# 500 (measured against the pinned v0.10.9). The eight files here are exactly
+# the image's /app/src/skeleton set.
+#
+# Hostnames are written as {{HOMEPAGE_VAR_DOMAIN}}, which compose sets from
+# DOMAIN, so no site name is committed here.
+
+title: HomeHub admin
+
+# No version badge: it is the one thing on this page that would make the
+# server fetch GitHub's release list, and an admin page has no need to.
+hideVersion: true

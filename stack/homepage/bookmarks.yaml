@@ -1,0 +1,21 @@
+---
+# The household sites, for convenience. These are OUTSIDE the admin namespace
+# and never see the admin cookie: each keeps its own login (ADMIN_PORTAL_PLAN
+# §5). A link here whose compose profile is off answers 502, not an error in
+# this file.
+- Household:
+    - Tracker:
+        - abbr: TR
+          href: https://tracker.{{HOMEPAGE_VAR_DOMAIN}}/
+    - Photos:
+        - abbr: PH
+          href: https://photos.{{HOMEPAGE_VAR_DOMAIN}}/
+    - Jellyfin:
+        - abbr: JF
+          href: https://jellyfin.{{HOMEPAGE_VAR_DOMAIN}}/
+    - Music:
+        - abbr: MU
+          href: https://music.{{HOMEPAGE_VAR_DOMAIN}}/
+    - ntfy:
+        - abbr: NT
+          href: https://ntfy.{{HOMEPAGE_VAR_DOMAIN}}/

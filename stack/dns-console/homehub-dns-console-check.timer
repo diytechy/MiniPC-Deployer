@@ -1,0 +1,13 @@
+[Unit]
+# The backstop for every path that moves Tailscale's jump without restarting
+# tailscaled, and for a hook run that gave up waiting. Worst case the console
+# is reachable from the tailnet (behind Technitium's own login) for one period.
+Description=Re-check the DNS-console fence every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

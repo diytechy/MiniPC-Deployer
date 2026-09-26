@@ -5,7 +5,7 @@
 # PC (FinanceActualPassword, GeneratedPassword kind) and this script sets it on
 # the un-bootstrapped server at first boot — instead of a human inventing it in
 # Actual's UI and re-typing it into the store. Finance-Auditor then finds
-# ACTUAL_PASSWORD already correct, and browser logins to actual.<domain> read
+# ACTUAL_PASSWORD already correct, and browser logins to actual.admin.<domain> read
 # it back with Show-DeploySecret.ps1.
 #
 # Mechanism: actual-server accepts one unauthenticated

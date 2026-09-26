@@ -37,6 +37,15 @@ SUITES=(
     # libspeexdsp: that is a machine which cannot answer the question, not a
     # broken panel.
     "autoinstall/wall/tests/aec.test.sh"
+    # The DNS-console fence (tcp/5380): against fake iptables/ip6tables/curl,
+    # then - where unprivileged user namespaces are allowed - against real
+    # iptables in a throwaway netns, including the real llm-isolation.sh read
+    # back over it. The netns half SKIPS where the kernel forbids it. A minute
+    # or two; the waits it exercises are real seconds.
+    "dns-console/tests/fence.test.sh"
+    # firstboot step 2b: the admin sign-in file, including the `$$` that
+    # Materialize writes and the containers never see.
+    "autoinstall/tests/admin-htpasswd.test.sh"
 )
 
 if [ "${1:-}" = "--list" ]; then

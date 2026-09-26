@@ -1,0 +1,34 @@
+[Unit]
+# Fence Technitium's admin console (tcp/5380) to loopback and the pinned admin
+# network, above Tailscale's ts-input jump, in both families. See
+# dns-console-fence.sh for why above ts-input and what tailscaled does to it.
+Description=Fence the DNS admin console (tcp/5380) to loopback and the admin network
+Documentation=file:///opt/homehub/stack/dns-console/dns-console-fence.sh
+
+# BEFORE docker, like the three sibling fences, and DefaultDependencies=no so it
+# can be. Technitium is a container, so the console never answers unfenced at
+# boot.
+Before=docker.service
+DefaultDependencies=no
+After=network-pre.target
+Wants=network-pre.target
+# Ordering only (no Wants): both siblings insert at the head of INPUT and then
+# read the chain back to prove their own position. Running after them means this
+# unit can never insert between another fence's insert and its read-back.
+After=homehub-game-isolation.service homehub-llm-isolation.service
+
+# NOTHING Requires= this unit, and nothing may - decision D-A5. Technitium is the
+# household resolver; a firewall hiccup must not become no DNS for the house.
+# A failure here is detected and alerted instead (the check timer).
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/homehub/stack/dns-console/dns-console-fence.sh install
+TimeoutStartSec=120
+
+# The rules are NOT removed on stop, the same choice as the sibling fences.
+# Rollback is `dns-console-fence.sh remove`, a deliberate act.
+
+[Install]
+WantedBy=multi-user.target

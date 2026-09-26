@@ -1,0 +1,15 @@
+[Unit]
+# Driven by homehub-dns-console-check.timer. Verifies the tcp/5380 fence is
+# present, in order and above ts-input in both families; on drift re-asserts it
+# and alerts through ntfy; on a failure to re-assert alerts and FAILS, so
+# `systemctl --failed` shows it too. This is the only thing that sees the jump
+# move without a tailscaled restart (`tailscale down`/`up`, a re-login, a
+# control-pushed firewall change) - see dns-console-fence.sh.
+Description=Check the DNS-console fence is above ts-input; re-assert and alert on drift
+Documentation=file:///opt/homehub/stack/dns-console/dns-console-fence.sh
+After=homehub-dns-console.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/homehub/stack/dns-console/dns-console-fence.sh check
+TimeoutStartSec=120

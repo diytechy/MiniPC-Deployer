@@ -45,6 +45,21 @@
       "src":    ["autogroup:member"],
       "dst":    ["192.168.117.0/24:*"],
     },
+
+    // Using an exit node - the hub, once the Owner has approved "Use as exit
+    // node" for it. Being allowed to reach the node is not enough; Tailscale's
+    // exit-node docs say to add "a grant or ACL whose dst is autogroup:internet"
+    // (tailscale.com/docs/features/exit-nodes/how-to/setup). An `acls` dst
+    // needs a port, hence `:*`. The same rule as a grant, from Tailscale's grant
+    // examples, is {"src": ["autogroup:member"], "dst": ["autogroup:internet"],
+    // "ip": ["*"]}. autogroup:internet is PUBLIC addresses only - it excludes
+    // 10/8, 172.16/12, 192.168/16 and 100.64/10 - so it opens no path to the
+    // LAN or the docker bridges; the rule above is still what admits the LAN.
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["autogroup:internet:*"],
+    },
   ],
 
   // Deny by omission: anything not accepted above is refused. There is no

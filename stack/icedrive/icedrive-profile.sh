@@ -706,7 +706,25 @@ restore)
     # right ones once `..`, absolute paths and link chains are in play.
     links="$(find "$stage" \( -type l -o -type p -o -type s -o -type b -o -type c \) -printf '%P (%y)\n' 2>/dev/null | head -5)"
     [ -z "$links" ] || die "the archive contains links or device nodes, which an IceDrive profile does not: $(printf '%s' "$links" | tr '\n' '; '). Refusing; nothing was written to $HOMEDIR."
-    cp -a "$stage/." "$HOMEDIR/" || die "copying the staged profile into $HOMEDIR failed — it may be partial; delete $HOMEDIR/.config/Icedrive and $HOMEDIR/.local/share/Icedrive before retrying"
+    # PATH BY PATH, NEVER `cp -a "$stage/." "$HOMEDIR/"`. That form copies the
+    # STAGE DIRECTORY'S OWN owner and mode onto $HOMEDIR — root:root 0755, since
+    # this runs as root — and a new `.local` parent came across root-owned too.
+    # On the real hub (2026-09-16) the user could no longer write to their own
+    # home, so xauth could not lock ~/.Xauthority and every RDP session died
+    # before Xorg started: a black screen, two weeks later, nowhere near here.
+    # Missing parents are created as the user; existing ones are not touched.
+    for r in "${REL_PATHS[@]}"; do
+        [ -e "$stage/$r" ] || continue
+        parent="$(dirname "$r")"; walk="$HOMEDIR"
+        IFS=/ read -ra parts <<<"$parent"
+        for part in "${parts[@]}"; do
+            walk="$walk/$part"
+            [ -d "$walk" ] && continue
+            mkdir "$walk" && chown "$PROF_USER:$PROF_USER" "$walk" || \
+                die "could not create $walk as $PROF_USER — nothing further was written"
+        done
+        cp -a "$stage/$r" "$HOMEDIR/$parent/" || die "copying $r into $HOMEDIR failed — it may be partial; delete $HOMEDIR/.config/Icedrive and $HOMEDIR/.local/share/Icedrive before retrying"
+    done
     # OWNERSHIP AND MODE, AND THESE ARE FATAL. Unpacked as root, a profile the
     # client cannot read is a restore that did not happen — and it would present
     # as "the sign-in did not survive", which sends the reader somewhere else.

@@ -36,6 +36,19 @@
 # top-level sesman would look like an orphan — but that is also what a deliberate
 # `systemctl stop` looks like. No MainPID to compare against means no reaping.
 #
+# THE SECOND SHAPE: A HEADLESS SESSION (2026-10-01). A per-session sesman whose
+# X server has died, but which is NOT an orphan — still a child of the live
+# sesman, so the test above passes it, and still in the live table, so every
+# connection RECONNECTS to it. The operator gets a black screen; the log says
+# `reconnected session ... display :10` and `scp_process_msg failed`. Measured
+# on the real hub: Xorg for :10 ended 2026-09-19, the sesman and its chansrv
+# lived on, and 8,660 restarts of the session service all reattached to nothing.
+#   * xrdp-sesman, AND PPID == MainPID (a per-session child), AND
+#   * no Xorg / Xvnc anywhere among its descendants, AND
+#   * older than HEADLESS_GRACE_S, so a session still bringing its X server up
+#     (the X server is a forked sesman until it execs) is never mistaken for one.
+# Killing it ends the table entry, so the next connect mints a fresh session.
+#
 # Exits 0 ALWAYS. It is a best-effort cleanup in front of the session service;
 # a failure here must never be the reason the desktop does not come up.
 set -uo pipefail
@@ -85,4 +98,27 @@ if [ "$found" -eq 0 ]; then
 else
     log "reaped $found orphaned sesman process(es); RDP will mint a clean session on the next connect"
 fi
+
+HEADLESS_GRACE_S="${HEADLESS_GRACE_S:-120}"
+headless=0
+for p in $(pgrep -P "$main" -x xrdp-sesman 2>/dev/null || true); do
+    has_x=0
+    for d in $(descendants "$p"); do
+        case "$(ps -o comm= -p "$d" 2>/dev/null)" in Xorg|Xvnc) has_x=1; break ;; esac
+    done
+    [ "$has_x" = 0 ] || continue
+    age="$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')"
+    if [ -z "$age" ] || [ "$age" -lt "$HEADLESS_GRACE_S" ]; then continue; fi
+
+    headless=$((headless + 1))
+    log "HEADLESS session sesman $p (child of MainPID $main, ${age}s old, no X server) — every connect would reattach to a black screen; reaping"
+    tree="$(descendants "$p" | tr '\n' ' ')$p"
+    log "  tree: $tree"
+    # shellcheck disable=SC2086
+    kill -TERM $tree 2>/dev/null || true
+    sleep 3
+    # shellcheck disable=SC2086
+    kill -KILL $tree 2>/dev/null || true
+done
+[ "$headless" -eq 0 ] || log "reaped $headless headless session(s); RDP will mint a clean session on the next connect"
 exit 0

@@ -153,8 +153,15 @@ DB_BEFORE="$(sha256sum "$REALHOME/.local/share/Icedrive/tempdata.db" | cut -d' '
 rc="$(sut --restore)"
 if [ "$rc" = 3 ]; then pass "I6 restore DECLINES a non-empty profile (exit 3)"; else fail "I6 exit=$rc over a populated profile, want 3"; cat "$TMP/out.txt"; fi
 clear_profile
+rm -rf "$REALHOME/.local"   # so restore has to create a parent, the way a reimage does
+chmod 0750 "$REALHOME"
 rc="$(sut --restore)"
 if [ "$rc" = 0 ]; then pass "I5 restore onto a clean profile exits 0"; else fail "I5 restore exit=$rc"; cat "$TMP/out.txt"; fi
+# The home directory's own mode must survive. `cp -a "$stage/." "$HOME/"` stamped
+# the stage dir's root:root 0755 onto the real hub's home and broke every RDP login.
+HM="$(stat -c '%a' "$REALHOME")"
+if [ "$HM" = 750 ]; then pass "I5 restore leaves the home directory's own mode alone"; else fail "I5 home dir mode became $HM, want 750 — restore copied the stage dir's attributes onto it"; fi
+chmod 0755 "$REALHOME"
 CONF_AFTER="$(sha256sum "$REALHOME/.config/Icedrive/Icedrive.conf" 2>/dev/null | cut -d' ' -f1)"
 DB_AFTER="$(sha256sum "$REALHOME/.local/share/Icedrive/tempdata.db" 2>/dev/null | cut -d' ' -f1)"
 if [ "$CONF_BEFORE" = "$CONF_AFTER" ] && [ "$DB_BEFORE" = "$DB_AFTER" ]; then

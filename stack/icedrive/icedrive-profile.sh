@@ -712,7 +712,19 @@ restore)
     # On the real hub (2026-09-16) the user could no longer write to their own
     # home, so xauth could not lock ~/.Xauthority and every RDP session died
     # before Xorg started: a black screen, two weeks later, nowhere near here.
-    # Missing parents are created as the user; existing ones are not touched.
+    # Missing parents are created as the user; existing ones are not touched —
+    # EXCEPT the exact damage the old form left: a home or profile parent owned
+    # by root. Leaving that in place would report a successful restore on a box
+    # whose RDP still cannot start, so it is handed back to the user.
+    if [ "$(id -u)" = 0 ]; then
+        for d in "$HOMEDIR" "$HOMEDIR/.config" "$HOMEDIR/.config/autostart" "$HOMEDIR/.local" "$HOMEDIR/.local/share"; do
+            [ -d "$d" ] && [ ! -L "$d" ] || continue
+            if [ "$(stat -c %u "$d")" = 0 ]; then
+                chown "$PROF_USER:$PROF_USER" "$d" || die "$d is owned by root and could not be handed back to $PROF_USER"
+                warn "$d was owned by root (an earlier restore did that) — returned to $PROF_USER"
+            fi
+        done
+    fi
     for r in "${REL_PATHS[@]}"; do
         [ -e "$stage/$r" ] || continue
         parent="$(dirname "$r")"; walk="$HOMEDIR"

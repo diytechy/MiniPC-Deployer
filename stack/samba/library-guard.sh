@@ -290,8 +290,19 @@ if { [ "$mount_state" = "absent" ] || [ "$mount_state" = "stale" ]; } && [ "${GU
             # mount alone fails on the still-occupied fuseblk mount. Lazy
             # unmount disconnects the dead mount before fstab can attach the
             # returned drive; never attempt mount if that detach fails.
-            log "REATTACH: stale $LIBRARY_ROOT; trying 'umount -l $LIBRARY_ROOT'"
-            if ! umount -l "$LIBRARY_ROOT" >/dev/null 2>&1; then
+            # RE-CHECK IMMEDIATELY BEFORE ACTING. umount -l works by mountpoint,
+            # so if the drive came back and something remounted it since the
+            # check above, this would detach the HEALTHY new mount. Act only if
+            # the same dead device is still the one mounted here.
+            stale_majmin="$mounted_majmin"
+            check_mount
+            if [ "$mount_state" != "stale" ] || [ "$mounted_majmin" != "$stale_majmin" ]; then
+                reattach_ready=0
+                log "REATTACH: $LIBRARY_ROOT changed since the check (now '$mount_state', device ${mounted_majmin:-none}) — not detaching; next run reassesses"
+            else
+                log "REATTACH: stale $LIBRARY_ROOT; trying 'umount -l $LIBRARY_ROOT'"
+            fi
+            if [ "$reattach_ready" = 1 ] && ! umount -l "$LIBRARY_ROOT" >/dev/null 2>&1; then
                 reattach_ready=0
                 log "REATTACH: FAILED - could not detach stale mount at $LIBRARY_ROOT"
             fi

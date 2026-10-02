@@ -9,6 +9,10 @@ COMMON="$ROOT/stack/backup/common.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
+# The mountinfo fixture's device must also exist in the sysfs fixture. A
+# present mountinfo line alone is no longer proof that the USB disk survived.
+export SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block"
+mkdir -p "$SYS_DEV_BLOCK_DIR/0:31"
 
 cat >"$TMP/mountinfo" <<'EOF'
 24 22 0:31 / /srv/library rw,relatime - tmpfs tmpfs rw

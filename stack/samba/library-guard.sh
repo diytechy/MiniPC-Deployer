@@ -21,10 +21,10 @@
 #                    then reports only the combined file-share/backup health
 #                    override. It never reports drive identity or a backup run.
 #
-# Exit codes: 0 = library healthy; 1 = not mounted / read-only / wrong.
+# Exit codes: 0 = library healthy; 1 = not mounted / stale / read-only / wrong.
 # `--report` deliberately narrows that verdict: read-only and identity details
-# remain operational diagnostics, but only mount absence or a failed Samba read
-# may force the combined wall indicator red.
+# remain operational diagnostics, but mount absence, a vanished mounted device,
+# or a failed Samba read may force the combined wall indicator red.
 set -uo pipefail
 
 LIBRARY_ROOT="${LIBRARY_ROOT:-/srv/library}"
@@ -69,14 +69,37 @@ fail_reason=""
 # Paths with spaces appear octal-escaped (\040); none of the storage-map
 # mountpoints contain spaces, and a mismatch would fail CLOSED, which is right.
 mountinfo="${MOUNTINFO_FILE:-/proc/self/mountinfo}"
-if [ ! -r "$mountinfo" ]; then
-    fail_reason="cannot read $mountinfo — unable to verify that $LIBRARY_ROOT is mounted, refusing rather than guessing"
-else
-    # Last match wins: a path can be mounted over more than once.
-    mnt_opts="$(awk -v p="$LIBRARY_ROOT" '$5 == p { o = $6 } END { print o }' "$mountinfo")"
-    if [ -z "$mnt_opts" ]; then
+# A mountinfo line survived the 2026-09-30 USB disconnect while its fuseblk
+# device did not. Test the kernel's device node too; -e is a sysfs metadata
+# lookup, not a filesystem read or an instruction to spin up the drive.
+# The override mirrors MOUNTINFO_FILE so tests can model a dead device safely.
+sys_dev_block="${SYS_DEV_BLOCK_DIR:-/sys/dev/block}"
+mount_state="unknown"
+check_mount() {
+    local mounted_fields
+    mnt_opts=""; mounted_majmin=""; fail_reason=""
+    if [ ! -r "$mountinfo" ]; then
+        fail_reason="cannot read $mountinfo — unable to verify that $LIBRARY_ROOT is mounted, refusing rather than guessing"
+        mount_state="unknown"
+        return
+    fi
+    # Last match wins: a path can be mounted over more than once. One awk keeps
+    # the options and the device number from the same mountinfo entry.
+    mounted_fields="$(awk -v p="$LIBRARY_ROOT" '$5 == p { d = $3; o = $6 } END { if (o != "") print d, o }' "$mountinfo")"
+    if [ -z "$mounted_fields" ]; then
+        mount_state="absent"
         fail_reason="$LIBRARY_ROOT is NOT MOUNTED — the $DRIVE_LABEL drive is absent or failed to mount"
     else
+        mounted_majmin="${mounted_fields%% *}"
+        mnt_opts="${mounted_fields#* }"
+        if [ ! -e "$sys_dev_block/$mounted_majmin" ]; then
+            # This is stronger than an unnamed by-id device: the kernel has no
+            # device at all. Samba must refuse even when identity is optional.
+            mount_state="stale"
+            fail_reason="$LIBRARY_ROOT has a STALE mount — mounted device $mounted_majmin no longer exists"
+            return
+        fi
+        mount_state="healthy"
         case ",$mnt_opts," in
             *,ro,*)
                 # ntfs3 falls back to read-only when the NTFS dirty bit is set
@@ -86,7 +109,8 @@ else
                 ;;
         esac
     fi
-fi
+}
+check_mount
 
 # ── identity: is the mounted device the drive the storage-map names? (A23) ────
 # fstab mounts by LABEL so a stand-in flash drive can substitute during
@@ -115,9 +139,9 @@ resolve_identity() {
     done < "$IDENTITY_FILE"
     [ -n "$expected" ] || { identity_note="no entry for $LIBRARY_ROOT in $IDENTITY_FILE"; return; }
 
-    # major:minor of whatever is mounted there (mountinfo field 3).
-    local majmin
-    majmin="$(awk -v p="$LIBRARY_ROOT" '$5 == p { d = $3 } END { print d }' /proc/self/mountinfo)"
+    # Reuse the number checked above. Reading the real mountinfo here used to
+    # disagree with MOUNTINFO_FILE fixtures and could name another mount.
+    local majmin="$mounted_majmin"
     [ -n "$majmin" ] || { identity_note="could not read the mounted device number"; return; }
 
     # Walk by-id symlinks and find the one pointing at this major:minor.
@@ -244,35 +268,47 @@ fi
 #
 # AND IT CAN BE INHIBITED, because a timer that fights an operator is worse than
 # one that does nothing: `touch /run/homehub-no-remount` while you fsck or swap a
-# drive, and this stands down and says so.
-if [ -n "$fail_reason" ] && [ "${GUARD_REATTACH:-1}" = "1" ] && ! mountpoint -q "$LIBRARY_ROOT" 2>/dev/null; then
-    if [ -e /run/homehub-no-remount ]; then
+# drive, and this stands down before either unmount or mount. The override lets
+# the tests exercise this without writing to /run.
+no_remount_file="${NO_REMOUNT_FILE:-/run/homehub-no-remount}"
+fstab_file="${FSTAB_FILE:-/etc/fstab}"
+# A failed Samba probe alone must NEVER authorize umount -l: Samba could be
+# broken while the disk is healthy. Only a present mount whose kernel device
+# vanished is stale, and only that state may be detached from live clients.
+# The device check above now runs before this remedy, unlike the old Samba
+# probe that could detect the outage only after the remedy had been skipped.
+if { [ "$mount_state" = "absent" ] || [ "$mount_state" = "stale" ]; } && [ "${GUARD_REATTACH:-1}" = "1" ]; then
+    if [ -e "$no_remount_file" ]; then
         log "NOT reattaching $LIBRARY_ROOT: /run/homehub-no-remount exists (deliberate maintenance)"
-    elif ! findmnt -sn --target "$LIBRARY_ROOT" >/dev/null 2>&1 \
-         && ! awk -v m="$LIBRARY_ROOT" '$1 !~ /^#/ && $2 == m {found=1} END{exit !found}' /etc/fstab 2>/dev/null; then
+    elif ! awk -v m="$LIBRARY_ROOT" '$1 !~ /^#/ && $2 == m {found=1} END{exit !found}' "$fstab_file" 2>/dev/null; then
+        # findmnt reports an occupied stale mount, not whether fstab permits
+        # reattachment. Verify fstab itself before changing the mountpoint.
         log "NOT reattaching $LIBRARY_ROOT: no fstab entry declares it, and this never guesses a device"
     else
-        log "REATTACH: $LIBRARY_ROOT is not mounted; trying 'mount $LIBRARY_ROOT' (fstab entry only)"
-        if mount "$LIBRARY_ROOT" >/dev/null 2>&1 && mountpoint -q "$LIBRARY_ROOT" 2>/dev/null; then
+        reattach_ready=1
+        if [ "$mount_state" = "stale" ]; then
+            # mount alone fails on the still-occupied fuseblk mount. Lazy
+            # unmount disconnects the dead mount before fstab can attach the
+            # returned drive; never attempt mount if that detach fails.
+            log "REATTACH: stale $LIBRARY_ROOT; trying 'umount -l $LIBRARY_ROOT'"
+            if ! umount -l "$LIBRARY_ROOT" >/dev/null 2>&1; then
+                reattach_ready=0
+                log "REATTACH: FAILED - could not detach stale mount at $LIBRARY_ROOT"
+            fi
+        fi
+        if [ "$reattach_ready" = 1 ] && mount "$LIBRARY_ROOT" >/dev/null 2>&1 && mountpoint -q "$LIBRARY_ROOT" 2>/dev/null; then
             log "REATTACH: SUCCEEDED - $LIBRARY_ROOT is mounted again ($(findmnt -no SOURCE,FSTYPE "$LIBRARY_ROOT" 2>/dev/null))"
             logger -t homehub-library-guard -p daemon.warning \
                 "reattached $LIBRARY_ROOT after it dropped - the drive returned and nothing else would have remounted it" 2>/dev/null || true
             # RE-ASSESS AGAINST THE NEW REALITY. Reporting the verdict computed
             # while the drive was down would say "NOT MOUNTED" about a drive this
             # function just mounted — the report has to describe the box as it is
-            # when the report is written. Same two questions as the inline block
-            # above (mounted? writable?), then identity.
-            fail_reason=""; identity_state=""; identity_note=""
-            mnt_opts="$(awk -v p="$LIBRARY_ROOT" '$5 == p { o = $6 } END { print o }' "$mountinfo")"
-            if [ -z "$mnt_opts" ]; then
-                fail_reason="$LIBRARY_ROOT is NOT MOUNTED — the $DRIVE_LABEL drive is absent or failed to mount"
-            else
-                case ",$mnt_opts," in
-                    *,ro,*) fail_reason="$LIBRARY_ROOT is mounted READ-ONLY — writes will fail (NTFS dirty bit? clear it from Windows)" ;;
-                esac
-            fi
+            # when the report is written. Recheck mount presence, device
+            # existence, and write mode against the post-reattach mountinfo.
+            identity_state="unknown"; identity_note=""
+            check_mount
             [ -n "$fail_reason" ] || resolve_identity
-        else
+        elif [ "$reattach_ready" = 1 ]; then
             log "REATTACH: FAILED - 'mount $LIBRARY_ROOT' did not take; the drive is absent, or the filesystem refused"
         fi
     fi

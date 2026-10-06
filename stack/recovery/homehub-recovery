@@ -3,9 +3,10 @@
 
   status                 mode, health, brake, the last boots, quarantined services
   disarm                 the ONLY way to stop the supervisor with the hardware
-                         watchdog closed (§3.6): writes a one-use authorisation
-                         naming this boot and the running invocation, then stops
-                         the unit. A reboot never writes it, so a reboot never disarms.
+                         watchdog closed (§3.6): a one-use authorisation naming
+                         this boot and the running invocation, a SIGUSR1, and a
+                         stop ONLY after the supervisor acknowledged and sysfs
+                         reads the device inactive. A reboot never disarms.
   reset-brake            forget the counted boots so far (the brake also clears
                          by itself after 24 h with no counted boot)
   release SERVICE        undo a quarantine: restore the restart policy and start it
@@ -47,7 +48,8 @@ def cmd_status(paths: rc.Paths, _args) -> int:
     status = rc.read_json(paths.status_json)
     boot = rc.read_json(paths.boot_json)
     code, active, _ = _run(["systemctl", "is-active", UNIT], 10)
-    print("supervisor unit: {}".format(active or "unknown"))
+    print("supervisor unit: {}   reset device {}: {}".format(
+        active or "unknown", _device(paths), device_state(paths, _device(paths))))
     if status:
         print("mode: {mode}   health: {health}   armed: {armed}   petting: {petting}".format(**status))
         for reason in status.get("reasons") or []:
@@ -86,24 +88,138 @@ def _read(path: str) -> str:
         return ""
 
 
+def _device(paths: rc.Paths) -> str:
+    """The reset device the supervisor was configured with (recovery.env)."""
+    return rc.read_env_file(paths.conf_file).get("HUB_WD_DEVICE") or "/dev/watchdog0"
+
+
+def device_state(paths: rc.Paths, device: str) -> str:
+    """'active', 'inactive', 'absent' or 'unknown', from sysfs."""
+    sysdir = os.path.join(paths.watchdog_class_dir, os.path.basename(device))
+    if not os.path.isdir(sysdir):
+        return "absent"
+    try:
+        with open(os.path.join(sysdir, "state"), encoding="ascii") as handle:
+            state = handle.read().strip()
+    except OSError:
+        return "unknown"
+    return state if state in ("active", "inactive") else "unknown"
+
+
+def _nowayout(paths: rc.Paths, device: str) -> str:
+    try:
+        with open(os.path.join(paths.watchdog_class_dir, os.path.basename(device), "nowayout"),
+                  encoding="ascii") as handle:
+            return handle.read().strip()
+    except OSError:
+        return "?"
+
+
+def _open_device(path: str) -> int:
+    """Seam for tests: open the watchdog for writing (this pings a running one)."""
+    return os.open(path, os.O_WRONLY)
+
+
+def _orphan_disarm(paths: rc.Paths, device: str) -> int:
+    """A device is running and NO supervisor owns it: magic-close it ourselves.
+
+    This is the case a failed or killed supervisor leaves behind: an active
+    timer that nothing pets, which resets the box. With nowayout=0 the kernel
+    stops it when a holder writes 'V' and closes. Guarded: only when the unit
+    is not active (an owner would make the open fail EBUSY anyway), only with
+    nowayout 0, and verified afterwards.
+    """
+    print("WARNING: {} is ACTIVE and no supervisor is running - nothing is petting it and the board"
+          " will reset.".format(device), file=sys.stderr)
+    if _nowayout(paths, device) != "0":
+        print("REFUSED: nowayout is set (or unreadable) on {}; it cannot be stopped from userspace."
+              " Expect a reset.".format(device), file=sys.stderr)
+        return 1
+    dev_path = os.path.join(paths.root, device.lstrip("/"))
+    try:
+        fd = _open_device(dev_path)
+        try:
+            os.write(fd, b"V")
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        print("FAILED to open and magic-close {}: {}".format(device, exc), file=sys.stderr)
+        return 1
+    state = device_state(paths, device)
+    if state not in ("inactive", "absent"):
+        print("FAILED: {} still reads {} after the magic close.".format(device, state), file=sys.stderr)
+        return 1
+    print("disarmed an orphaned {}: verified {}.".format(device, state))
+    return 0
+
+
+def _wait_for_ack(paths: rc.Paths, boot_id: str, invocation: str) -> dict:
+    deadline = time.monotonic() + float(os.environ.get("RECOVERY_ACK_WAIT", "15"))
+    while time.monotonic() < deadline:
+        ack = rc.read_json(paths.disarm_ack_file)
+        if ack and ack.get("boot_id") == boot_id and ack.get("invocation_id") == invocation:
+            return ack
+        time.sleep(0.2)
+    return {}
+
+
 def cmd_disarm(paths: rc.Paths, _args) -> int:
+    """Stop the supervisor with the watchdog VERIFIABLY stopped, or not at all (review C2).
+
+    1. Write a one-use authorisation naming this boot and the running invocation.
+    2. Ask with SIGUSR1; the supervisor disables the card, magic-closes, and
+       acknowledges ok only once sysfs reads inactive.
+    3. Read the acknowledgement AND sysfs ourselves; only then stop the unit,
+       and read sysfs once more after the stop.
+    Any step that does not prove the device stopped exits non-zero WITHOUT
+    stopping the unit, so a failed disarm leaves a running, petting supervisor
+    rather than an orphaned timer. A device that is active with no supervisor
+    running is disarmed directly (see _orphan_disarm).
+    Implements: SR-051, LLR-1002, LLR-1010
+    """
+    device = _device(paths)
     code, active, _ = _run(["systemctl", "is-active", UNIT], 10)
     if active != "active":
-        print("{} is not running ({}); nothing to disarm.".format(UNIT, active or "unknown"))
-        return 0
+        state = device_state(paths, device)
+        if state in ("inactive", "absent"):
+            print("{} is not running ({}) and {} is {}; nothing is armed.".format(
+                UNIT, active or "unknown", device, state))
+            return 0
+        return _orphan_disarm(paths, device)
     code, invocation, err = _run(["systemctl", "show", "-p", "InvocationID", "--value", UNIT], 10)
     if code != 0 or not invocation:
         print("REFUSED: cannot read the supervisor's InvocationID ({}); not stopping it, because "
-              "a stop without the authorisation would leave the device running".format(err), file=sys.stderr)
+              "a stop without a verified disarm would leave the device running".format(err), file=sys.stderr)
         return 1
+    boot_id = rc.read_boot_id(paths)
     os.makedirs(paths.run_dir, exist_ok=True)
-    rc.atomic_write(paths.disarm_file, "{} {}\n".format(rc.read_boot_id(paths), invocation).encode("ascii"),
+    try:
+        os.unlink(paths.disarm_ack_file)
+    except OSError:
+        pass
+    rc.atomic_write(paths.disarm_file, "{} {}\n".format(boot_id, invocation).encode("ascii"),
                     mode=0o600, durable=False)
+    code, _, err = _run(["systemctl", "kill", "-s", "SIGUSR1", "--kill-whom=main", UNIT], 10)
+    if code != 0:
+        print("FAILED: could not signal the supervisor ({}); it is still running and armed.".format(err),
+              file=sys.stderr)
+        return 1
+    ack = _wait_for_ack(paths, boot_id, invocation)
+    state = device_state(paths, device)
+    if not ack.get("ok") or state not in ("inactive", "absent"):
+        print("FAILED: the watchdog was NOT verified stopped (acknowledgement: {}; {} reads {}). The "
+              "supervisor is still running and petting it; nothing was stopped.".format(
+                  ack.get("detail", "none received"), device, state), file=sys.stderr)
+        return 1
     code, _, err = _run(["systemctl", "stop", UNIT], 120)
     if code != 0:
         print("systemctl stop failed: {}".format(err), file=sys.stderr)
         return 1
-    print("disarmed: the supervisor stopped and magic-closed the watchdog (journal: homehub-recoveryd).")
+    state = device_state(paths, device)
+    if state not in ("inactive", "absent"):
+        print("FAILED: {} reads {} after the stop.".format(device, state), file=sys.stderr)
+        return 1
+    print("disarmed: the watchdog is verified {} and the supervisor is stopped.".format(state))
     print("It starts again at the next boot unless HUB_WATCHDOG_ENABLED is false.")
     return 0
 

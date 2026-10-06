@@ -107,21 +107,56 @@ def _fake_run(monkeypatch, answers):
     return calls
 
 
-def test_disarm_writes_this_boot_and_invocation_then_stops_tc1063(tmp_path, monkeypatch):
+def _supervisor_answering(monkeypatch, tree, ack_ok=True, stops=True, ack=True):
+    """Model the running supervisor's side of the disarm protocol.
+
+    On `systemctl kill -s SIGUSR1` it reads the authorisation, and - like the
+    real one - stops the device (sysfs inactive) only when `stops`, then writes
+    the acknowledgement it would write (`ack_ok`), unless `ack` is False (it
+    never answers)."""
+    state = tree.watchdog(state="active")
+    monkeypatch.setenv("RECOVERY_ACK_WAIT", "0.5")
+    calls = []
+
+    def run(argv, timeout=60):
+        calls.append(argv)
+        if argv[:2] == ["systemctl", "is-active"]:
+            return 0, "active", ""
+        if argv[:2] == ["systemctl", "show"]:
+            return 0, "f" * 32, ""
+        if argv[:3] == ["systemctl", "kill", "-s"]:
+            boot, invocation = open(tree.paths.disarm_file).read().split()
+            if stops:
+                tree.write(state, "inactive\n")
+            if ack:
+                tree.write(tree.paths.disarm_ack_file, json.dumps(
+                    {"boot_id": boot, "invocation_id": invocation, "ok": ack_ok, "detail": "x"}))
+            return 0, "", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_run", run)
+    return calls, state
+
+
+STOP = ["systemctl", "stop", "homehub-recoveryd.service"]
+SIGUSR1 = ["systemctl", "kill", "-s", "SIGUSR1", "--kill-whom=main", "homehub-recoveryd.service"]
+
+
+def test_disarm_signals_waits_for_a_verified_ack_then_stops_tc1063(tmp_path, monkeypatch):
     tree = Tree(tmp_path)
-    calls = _fake_run(monkeypatch, [(["systemctl", "is-active"], (0, "active", "")),
-                                    (["systemctl", "show"], (0, "f" * 32, ""))])
-    written = {}
-    real = rc.atomic_write
-
-    def capture(path, data, **kw):
-        written[path] = data
-        real(path, data, **kw)
-
-    monkeypatch.setattr(rc, "atomic_write", capture)
+    calls, state = _supervisor_answering(monkeypatch, tree)
     assert cli.main(["--root", str(tmp_path), "disarm"]) == 0
-    assert written[tree.paths.disarm_file].decode().split() == [BOOT_ID, "f" * 32]
-    assert calls[-1] == ["systemctl", "stop", "homehub-recoveryd.service"]
+    assert calls.index(SIGUSR1) < calls.index(STOP)
+    assert open(state).read().strip() == "inactive"
+
+
+@pytest.mark.parametrize("ack_ok,stops,ack", [(False, False, True), (True, False, True), (True, True, False)])
+def test_disarm_that_is_not_verified_never_stops_the_supervisor_tc1080(tmp_path, monkeypatch, ack_ok, stops, ack):
+    """Review C2: a nack, an ack contradicted by sysfs, or no ack at all."""
+    tree = Tree(tmp_path)
+    calls, _ = _supervisor_answering(monkeypatch, tree, ack_ok=ack_ok, stops=stops, ack=ack)
+    assert cli.main(["--root", str(tmp_path), "disarm"]) == 1
+    assert SIGUSR1 in calls and STOP not in calls, "a supervisor was stopped with its device unverified"
 
 
 def test_disarm_refuses_to_stop_without_an_invocation_id_tc1063(tmp_path, monkeypatch):
@@ -129,7 +164,42 @@ def test_disarm_refuses_to_stop_without_an_invocation_id_tc1063(tmp_path, monkey
     calls = _fake_run(monkeypatch, [(["systemctl", "is-active"], (0, "active", "")),
                                     (["systemctl", "show"], (1, "", "boom"))])
     assert cli.main(["--root", str(tmp_path), "disarm"]) == 1
-    assert ["systemctl", "stop", "homehub-recoveryd.service"] not in calls
+    assert STOP not in calls and SIGUSR1 not in calls
+
+
+def test_disarm_with_nothing_running_and_nothing_armed_does_nothing_tc1080(tmp_path, monkeypatch):
+    Tree(tmp_path)
+    calls = _fake_run(monkeypatch, [(["systemctl", "is-active"], (3, "failed", ""))])
+    opened = []
+    monkeypatch.setattr(cli, "_open_device", lambda p: opened.append(p))
+    assert cli.main(["--root", str(tmp_path), "disarm"]) == 0
+    assert calls == [["systemctl", "is-active", "homehub-recoveryd.service"]] and not opened
+
+
+@pytest.mark.parametrize("stops,nowayout,expected", [(True, "0", 0), (False, "0", 1), (True, "1", 1)])
+def test_an_active_device_with_no_supervisor_is_disarmed_and_verified_tc1080(
+        tmp_path, monkeypatch, stops, nowayout, expected):
+    """Review C2: a failed or killed supervisor left the timer running."""
+    tree = Tree(tmp_path)
+    state = tree.watchdog(state="active")
+    tree.write(os.path.join(os.path.dirname(state), "nowayout"), nowayout + "\n")
+    _fake_run(monkeypatch, [(["systemctl", "is-active"], (3, "failed", ""))])
+    sink = tmp_path / "devnode"
+    opened = []
+
+    def fake_open(path):
+        opened.append(path)
+        fd = os.open(str(sink), os.O_WRONLY | os.O_CREAT)
+        if stops:
+            tree.write(state, "inactive\n")  # the kernel stops it on 'V' + close
+        return fd
+
+    monkeypatch.setattr(cli, "_open_device", fake_open)
+    assert cli.main(["--root", str(tmp_path), "disarm"]) == expected
+    if nowayout == "1":
+        assert not opened, "tried to open a nowayout device"
+    else:
+        assert opened and sink.read_bytes() == b"V"
 
 
 def test_release_restores_the_policy_starts_it_and_tells_the_supervisor_tc1063(tmp_path, monkeypatch):

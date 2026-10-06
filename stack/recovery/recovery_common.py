@@ -20,9 +20,11 @@ Implements: SR-049, SR-050, SR-051, LLR-994, LLR-995, LLR-1001
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -364,6 +366,9 @@ def _fsync_dir(directory: str) -> None:
         os.close(fd)
 
 
+_TMP_COUNTER = itertools.count()
+
+
 def atomic_write(path: str, data: bytes, mode: int = 0o644, durable: bool = True) -> None:
     """Replace `path` with `data` so a reader sees the old or the new file, never half.
 
@@ -375,8 +380,11 @@ def atomic_write(path: str, data: bytes, mode: int = 0o644, durable: bool = True
     Implements: SR-049, LLR-995
     """
     directory = os.path.dirname(path) or "."
-    tmp = "{}.tmp.{}".format(path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    # UNIQUE AND EXCLUSIVE (review C6): pid + thread + a process-wide counter,
+    # opened O_EXCL. The supervisor has two telemetry threads; with a pid-only
+    # name they truncated and renamed each other's temp file.
+    tmp = "{}.tmp.{}.{}.{}".format(path, os.getpid(), threading.get_ident(), next(_TMP_COUNTER))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         try:
             view = memoryview(data)

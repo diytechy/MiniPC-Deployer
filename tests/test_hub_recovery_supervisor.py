@@ -653,3 +653,78 @@ def test_a_kill_of_the_backup_names_the_backup_in_its_event_tc1055(tmp_path):
     assert _pressure_until_kill(sup, clock, tree)
     kill = actions_of(drain_telemetry(sup), "kill")[0]
     assert kill["details"]["interrupts_backup"] is True
+
+
+# ── review C6: quarantine persistence under two telemetry threads ───────────
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX rename-over semantics; Windows refuses a "
+                    "concurrent replace of one target. Runs on Linux (WSL / CI), as on the hub.")
+def test_overlapping_atomic_writes_never_collide_tc1076(tmp_path):
+    target = str(tmp_path / "quarantine.json")
+    errors = []
+
+    def writer(tag):
+        for i in range(150):
+            try:
+                rc.atomic_write(target, json.dumps({"tag": tag, "i": i}).encode(), durable=False)
+            except Exception as exc:  # noqa: BLE001 - any collision is the failure
+                errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(t,)) for t in ("a", "b", "c")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors[:3]
+    assert json.load(open(target))["i"] == 149
+    assert os.listdir(str(tmp_path)) == ["quarantine.json"], "a temp file was left behind"
+
+
+def test_a_delayed_older_quarantine_snapshot_never_overwrites_a_newer_one_tc1076(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    tree.boot_json()
+    sup = make_supervisor(tree)
+    sup.setup()
+    sup.quarantined = {"immich-ml": {"container": cid(1)}}
+    sup._persist_quarantine()
+    older = sup.workers.telemetry.pop()
+    sup.quarantined = {}
+    sup._persist_quarantine()
+    newer = sup.workers.telemetry.pop()
+    sup._execute_telemetry(newer)
+    sup._execute_telemetry(older)  # the stalled one finally lands
+    on_disk = json.load(open(tree.paths.quarantine_file))
+    assert on_disk["quarantined"] == {} and on_disk["seq"] == newer["seq"]
+
+    # And writers are serialised: while one is stuck inside its write, a second
+    # does not write at the same time.
+    gate, entered = threading.Event(), threading.Event()
+    real = rc.atomic_write
+    calls = []
+
+    def slow(path, data, **kw):
+        calls.append(json.loads(data)["seq"])
+        if len(calls) == 1:
+            entered.set()
+            gate.wait(10)
+        real(path, data, **kw)
+
+    monkeypatch.setattr(rc, "atomic_write", slow)
+    sup.quarantined = {"a": {}}
+    sup._persist_quarantine()
+    first = sup.workers.telemetry.pop()
+    sup.quarantined = {"a": {}, "b": {}}
+    sup._persist_quarantine()
+    second = sup.workers.telemetry.pop()
+    t1 = threading.Thread(target=sup._execute_telemetry, args=(first,))
+    t1.start()
+    assert entered.wait(5)
+    t2 = threading.Thread(target=sup._execute_telemetry, args=(second,))
+    t2.start()
+    t2.join(0.5)
+    assert t2.is_alive() and calls == [first["seq"]], "two quarantine writers ran at once"
+    gate.set()
+    t1.join(5)
+    t2.join(5)
+    assert sorted(json.load(open(tree.paths.quarantine_file))["quarantined"]) == ["a", "b"]

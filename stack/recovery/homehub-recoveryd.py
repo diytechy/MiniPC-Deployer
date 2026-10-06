@@ -487,6 +487,9 @@ class Supervisor:
         self.pets = 0
         self.inventory: Dict[str, rc.ContainerInfo] = {}
         self.quarantined: Dict[str, dict] = {}
+        self.quarantine_seq = 0
+        self._quarantine_written_seq = 0
+        self._quarantine_lock = threading.Lock()
         self.kill_history: List[Tuple[float, str]] = []
         self.pending_confirm: Dict[str, dict] = {}
         self.pending_reconcile: Dict[str, dict] = {}
@@ -679,7 +682,7 @@ class Supervisor:
             self.event("quarantined", kmsg=True, cgroup_kill=written, **details)
             self._enqueue("quarantine", key, {"key": key, "container": victim.container_id,
                                               "restart": info.restart})
-            self.workers.emit({"type": "quarantine-file", "quarantined": dict(self.quarantined)})
+            self._persist_quarantine()
             self.sm.note_no_kill(now)
         else:
             self.kill_history.append((now, key))
@@ -763,7 +766,7 @@ class Supervisor:
             self.quarantined.pop(name, None)
             self.kill_history = [(t, k) for t, k in self.kill_history if k != name]
             self.event("released", service=name)
-        self.workers.emit({"type": "quarantine-file", "quarantined": dict(self.quarantined)})
+        self._persist_quarantine()
 
     # ── L2: sshd ────────────────────────────────────────────────────────────
     def _ssh_check(self, now: float) -> None:
@@ -874,9 +877,7 @@ class Supervisor:
             self.inventory = rc.read_inventory(self.paths.docker_containers_dir)
             return
         if kind == "quarantine-file":
-            os.makedirs(self.paths.state_dir, exist_ok=True)
-            rc.atomic_write(self.paths.quarantine_file,
-                            json.dumps({"quarantined": item["quarantined"]}, sort_keys=True).encode())
+            self._write_quarantine_snapshot(item)
             return
         line = {k: v for k, v in item.items() if k not in ("type", "samples", "evidence")}
         self.journal(json.dumps(line, sort_keys=True, default=str))
@@ -886,6 +887,30 @@ class Supervisor:
             os.makedirs(self.paths.events_dir, exist_ok=True)
             rc.atomic_write(os.path.join(self.paths.events_dir, name),
                             json.dumps(item, sort_keys=True, default=str).encode())
+
+    def _persist_quarantine(self) -> None:
+        """Main thread: queue a NUMBERED snapshot of the quarantine set."""
+        self.quarantine_seq += 1
+        self.workers.emit({"type": "quarantine-file", "seq": self.quarantine_seq,
+                           "quarantined": dict(self.quarantined)})
+
+    def _write_quarantine_snapshot(self, item: dict) -> None:
+        """Telemetry thread: one writer at a time, and the newest snapshot wins.
+
+        Review C6: two telemetry threads could each hold a quarantine snapshot;
+        an older one stalled in fsync could land AFTER a newer one and put a
+        released (or a newly quarantined) service back the way it was. The lock
+        serialises writers - only telemetry threads take it, never the main
+        thread - and a snapshot older than the last one written is dropped.
+        """
+        with self._quarantine_lock:
+            if item["seq"] <= self._quarantine_written_seq:
+                return
+            os.makedirs(self.paths.state_dir, exist_ok=True)
+            rc.atomic_write(self.paths.quarantine_file,
+                            json.dumps({"quarantined": item["quarantined"], "seq": item["seq"]},
+                                       sort_keys=True).encode())
+            self._quarantine_written_seq = item["seq"]
 
     @staticmethod
     def _stdout_journal(line: str) -> None:

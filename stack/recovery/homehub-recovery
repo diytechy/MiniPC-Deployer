@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""homehub-recovery — the Owner's handle on the hub recovery capability.
+
+  status                 mode, health, brake, the last boots, quarantined services
+  disarm                 the ONLY way to stop the supervisor with the hardware
+                         watchdog closed (§3.6): writes a one-use authorisation
+                         naming this boot and the running invocation, then stops
+                         the unit. A reboot never writes it, so a reboot never disarms.
+  reset-brake            forget the counted boots so far (the brake also clears
+                         by itself after 24 h with no counted boot)
+  release SERVICE        undo a quarantine: restore the restart policy and start it
+  events [-n N]          the newest evidence records
+  check-config FILE      validate a .env-style file; print the normalised knobs
+                         (setup-recovery.sh's refusal path; exit 2 on a bad knob)
+
+Installed as /usr/local/sbin/homehub-recovery, a SYMLINK into the stack tree:
+it imports recovery_common from beside its real path, and a copy would break
+that import (the panel volume-applier lesson).
+
+Implements: SR-050, SR-051, LLR-1002, LLR-1006
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import recovery_common as rc  # noqa: E402
+
+UNIT = "homehub-recoveryd.service"
+
+
+def _run(argv, timeout=60):
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return done.returncode, (done.stdout or "").strip(), (done.stderr or "").strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, "", str(exc)
+
+
+def cmd_status(paths: rc.Paths, _args) -> int:
+    status = rc.read_json(paths.status_json)
+    boot = rc.read_json(paths.boot_json)
+    code, active, _ = _run(["systemctl", "is-active", UNIT], 10)
+    print("supervisor unit: {}".format(active or "unknown"))
+    if status:
+        print("mode: {mode}   health: {health}   armed: {armed}   petting: {petting}".format(**status))
+        for reason in status.get("reasons") or []:
+            print("  report-only because: {}".format(reason))
+        print("memory state: {}   episode age: {}   kill budget left: {}".format(
+            status.get("state"), status.get("episode_age"), status.get("kill_budget_left")))
+        if status.get("quarantined"):
+            print("QUARANTINED (stopped until released): {}".format(", ".join(status["quarantined"])))
+            print("  release with: homehub-recovery release <service>")
+        age = time.time() - float(status.get("utc") or 0)
+        if age > 30:
+            print("WARNING: status.json is {:.0f} s old - the supervisor is not ticking".format(age))
+    else:
+        print("no status: the supervisor is not running (HUB_WATCHDOG_ENABLED off, or stopped)")
+    if boot:
+        print("this boot: previous boot was {class}; brake: {brake_detail}; braked: {braked}; "
+              "kernel.panic={kernel_panic}; committed: {committed}".format(
+                  **{k: boot.get(k) for k in ("class", "brake_detail", "braked", "kernel_panic",
+                                              "committed")}))
+        print("D10: unexplained boots {} counted (bootstatus proven: {})".format(
+            "ARE" if boot.get("counting_unexplained") else "are NOT", boot.get("bootstatus_proven")))
+    entries = rc.parse_boots_log(_read(paths.boots_log))
+    if entries:
+        print("last boots:")
+        for entry in entries[-5:]:
+            print("  {}  {:<12} {}".format(entry.get("utc", "?"), entry.get("class", entry.get("event")),
+                                          entry.get("reason", "")))
+    return 0
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def cmd_disarm(paths: rc.Paths, _args) -> int:
+    code, active, _ = _run(["systemctl", "is-active", UNIT], 10)
+    if active != "active":
+        print("{} is not running ({}); nothing to disarm.".format(UNIT, active or "unknown"))
+        return 0
+    code, invocation, err = _run(["systemctl", "show", "-p", "InvocationID", "--value", UNIT], 10)
+    if code != 0 or not invocation:
+        print("REFUSED: cannot read the supervisor's InvocationID ({}); not stopping it, because "
+              "a stop without the authorisation would leave the device running".format(err), file=sys.stderr)
+        return 1
+    os.makedirs(paths.run_dir, exist_ok=True)
+    rc.atomic_write(paths.disarm_file, "{} {}\n".format(rc.read_boot_id(paths), invocation).encode("ascii"),
+                    mode=0o600, durable=False)
+    code, _, err = _run(["systemctl", "stop", UNIT], 120)
+    if code != 0:
+        print("systemctl stop failed: {}".format(err), file=sys.stderr)
+        return 1
+    print("disarmed: the supervisor stopped and magic-closed the watchdog (journal: homehub-recoveryd).")
+    print("It starts again at the next boot unless HUB_WATCHDOG_ENABLED is false.")
+    return 0
+
+
+def cmd_reset_brake(paths: rc.Paths, _args) -> int:
+    now = time.time()
+    rc.append_boots_log(paths.boots_log, {"t": now, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                                      time.gmtime(now)),
+                                          "event": "brake-reset"})
+    # Re-run the (idempotent) classifier so boot.json and kernel.panic reflect
+    # the reset now, then restart the supervisor so it re-reads boot.json.
+    _run(["systemctl", "restart", "homehub-recovery-boot.service"], 60)
+    _run(["systemctl", "try-restart", UNIT], 60)
+    print("brake reset: counted boots before now no longer count.")
+    return 0
+
+
+def cmd_release(paths: rc.Paths, args) -> int:
+    data = rc.read_json(paths.quarantine_file) or {}
+    quarantined = data.get("quarantined") or {}
+    record = quarantined.get(args.service)
+    if record is None:
+        print("{} is not quarantined (known: {})".format(args.service, ", ".join(sorted(quarantined)) or "none"))
+        return 1
+    container = record.get("container", "")
+    restart = record.get("restart") or "unless-stopped"
+    if restart == "no":
+        restart = "unless-stopped"
+    code1, _, err1 = _run(["docker", "update", "--restart={}".format(restart), container], 60)
+    code2, _, err2 = _run(["docker", "start", container], 120)
+    if code1 != 0 or code2 != 0:
+        print("release incomplete: update rc={} ({}) start rc={} ({})".format(code1, err1, code2, err2),
+              file=sys.stderr)
+        print("If the container was removed, recreate it: cd /opt/homehub/stack && docker compose up -d "
+              + args.service, file=sys.stderr)
+        return 1
+    quarantined.pop(args.service, None)
+    rc.atomic_write(paths.quarantine_file, json.dumps({"quarantined": quarantined}, sort_keys=True).encode())
+    os.makedirs(paths.run_dir, exist_ok=True)
+    with open(paths.released_file, "a", encoding="utf-8") as handle:
+        handle.write(args.service + "\n")
+    print("released {}: restart policy {} restored and the container started.".format(args.service, restart))
+    return 0
+
+
+def cmd_events(paths: rc.Paths, args) -> int:
+    try:
+        names = sorted(n for n in os.listdir(paths.events_dir) if n.endswith(".json"))
+    except OSError:
+        names = []
+    if not names:
+        print("no recovery events recorded")
+        return 0
+    for name in names[-args.n:]:
+        event = rc.read_json(os.path.join(paths.events_dir, name)) or {}
+        details = event.get("details") or {}
+        summary = " ".join("{}={}".format(k, v) for k, v in sorted(details.items())
+                           if v not in (None, "", [], {}))
+        print("{}  {:<22} {}".format(name[:-5], event.get("action", "?"), summary[:160]))
+    return 0
+
+
+def cmd_check_config(_paths: rc.Paths, args) -> int:
+    try:
+        cfg = rc.parse_config(rc.read_env_file(args.file))
+    except rc.ConfigError as exc:
+        print("REFUSED: {}".format(exc), file=sys.stderr)
+        return 2
+    sys.stdout.write(rc.render_config(cfg))
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="homehub-recovery", description="hub recovery capability")
+    parser.add_argument("--root", default="/", help=argparse.SUPPRESS)  # tests only
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status")
+    sub.add_parser("disarm")
+    sub.add_parser("reset-brake")
+    release = sub.add_parser("release")
+    release.add_argument("service")
+    events = sub.add_parser("events")
+    events.add_argument("-n", type=int, default=20)
+    check = sub.add_parser("check-config")
+    check.add_argument("file")
+    args = parser.parse_args(argv)
+    handlers = {"status": cmd_status, "disarm": cmd_disarm, "reset-brake": cmd_reset_brake,
+                "release": cmd_release, "events": cmd_events, "check-config": cmd_check_config}
+    return handlers[args.command](rc.Paths(args.root), args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

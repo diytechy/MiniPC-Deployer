@@ -1,0 +1,38 @@
+# homehub-recovery-stamp - C5's clean-shutdown stamp. ALWAYS ON (record-only).
+# It does nothing at start; its ExecStop writes the stamp atomically (temp file,
+# fsync, rename, fsync of the directory) carrying this boot's id, UTC and the
+# supervisor's /run intent if there is one. A boot with no stamp behind it was
+# not a clean shutdown.
+#
+# WHEN IT STOPS IS THE WHOLE DESIGN: after Docker, before filesystems go away.
+# systemd stops units in the REVERSE of their start order, so:
+#   Before=docker.service  -> this starts before Docker and therefore STOPS
+#                             AFTER it. (The design text says After=docker,
+#                             which would stop it BEFORE Docker - the opposite
+#                             of the "stops after Docker" it states as the goal;
+#                             a Docker stop that hung would then be hidden behind
+#                             an already-written stamp. Recorded as a deviation.)
+#   After=local-fs.target  -> it stops before local filesystems are unmounted.
+#   RequiresMountsFor=     -> and before the mounts holding its files.
+# DefaultDependencies=no so it is not ordered after basic.target and therefore
+# not stopped early with everything else; Conflicts=/Before=shutdown.target make
+# it part of the shutdown transaction explicitly.
+[Unit]
+Description=HomeHub recovery: write the clean-shutdown stamp late in shutdown
+Documentation=file:///opt/homehub/stack/recovery/README.md
+DefaultDependencies=no
+After=local-fs.target
+Before=docker.service shutdown.target umount.target
+Conflicts=shutdown.target
+RequiresMountsFor=/var/lib /opt/homehub
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/bin/python3 /opt/homehub/stack/recovery/homehub-recovery-boot.py stamp
+SyslogIdentifier=homehub-recovery-stamp
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

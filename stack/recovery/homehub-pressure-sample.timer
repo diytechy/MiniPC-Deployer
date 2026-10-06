@@ -1,0 +1,12 @@
+# Every 30 s, from a minute after boot. AccuracySec=1s because the default
+# (1 min) would quietly coalesce a 30 s cadence into a 60 s one.
+[Unit]
+Description=HomeHub pressure sample every 30 s (C1)
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

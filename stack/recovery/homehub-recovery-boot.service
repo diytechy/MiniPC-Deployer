@@ -1,0 +1,23 @@
+# homehub-recovery-boot - C5 boot accounting. ALWAYS ON (record-only).
+# Classifies the previous boot (clean / recovery / watchdog / panic /
+# unexplained), commits it to /var/lib/homehub-recovery/boots.log atomically,
+# computes the loop brake and sets kernel.panic for this boot. Leaves
+# /run/homehub-recovery/boot.json for the supervisor. See stack/recovery/README.md.
+[Unit]
+Description=HomeHub recovery: classify the previous boot, apply the brake, set kernel.panic
+Documentation=file:///opt/homehub/stack/recovery/README.md
+# pstore: systemd-pstore MOVES records out of /sys/fs/pstore at boot, so read
+# after it. modules-load: the watchdog driver must be loaded for its bootstatus.
+After=local-fs.target systemd-pstore.service systemd-modules-load.service
+Before=homehub-recoveryd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/homehub-recovery/recovery.env
+ExecStart=/usr/bin/python3 /opt/homehub/stack/recovery/homehub-recovery-boot.py classify
+SyslogIdentifier=homehub-recovery-boot
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

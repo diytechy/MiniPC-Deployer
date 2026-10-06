@@ -1,0 +1,57 @@
+# homehub-recoveryd - the hub recovery supervisor (C2). OPT-IN: enabled only by
+# setup-recovery.sh when HUB_WATCHDOG_ENABLED=true. See stack/recovery/README.md.
+#
+# THERE IS NO ExecStop= AND THERE MUST NEVER BE ONE (design §3.6, review R2-1).
+# ExecStop runs on EVERY stop, including the one a reboot performs, so anything
+# placed there cannot tell an Owner's "stop it" from a recovery reboot. Disarm
+# is `homehub-recovery disarm`, which writes a one-use authorisation naming this
+# boot and this invocation before it stops the unit. A plain stop (every reboot,
+# `systemctl restart`) hands the hardware timer to the shutdown with a 300 s
+# timeout and no magic close.
+[Unit]
+Description=HomeHub recovery supervisor (memory-stall kill, sshd, graceful reboot, hardware watchdog)
+Documentation=file:///opt/homehub/stack/recovery/README.md
+# The boot classifier must have decided this boot's brake and written
+# /run/homehub-recovery/boot.json first. Wants=, not Requires=: if the classifier
+# FAILED, this still starts and reads that failure as report-only, which is the
+# point - an unwritable disk must not silently turn the supervisor off.
+Wants=homehub-recovery-boot.service
+After=homehub-recovery-boot.service docker.service
+# After=docker.service also orders the STOP: this unit stops BEFORE Docker, so
+# the 300 s hand-off timeout covers Docker's container shutdown too (§3.4).
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/homehub-recovery/recovery.env
+ExecStart=/usr/bin/python3 /opt/homehub/stack/recovery/homehub-recoveryd.py
+SyslogIdentifier=homehub-recoveryd
+# NO automatic restart, deliberately. A crashed supervisor that systemd brought
+# back would re-arm and pet the device, so a crash loop would never reach L4
+# and never be counted. Dying stops the petting; the board resets within
+# HUB_WD_HW_TIMEOUT and the boot is counted toward the brake. Bounded, recorded.
+Restart=no
+# Only the main process gets SIGTERM; a child command (docker, systemctl) still
+# running is SIGKILLed after the main process exits.
+KillMode=mixed
+TimeoutStopSec=30
+
+# -- execution envelope (§3.0) ------------------------------------------------
+# Never chosen by the kernel OOM killer or by earlyoom.
+OOMScoreAdjust=-1000
+# The LOWEST realtime priority: enough to be scheduled while the box thrashes,
+# not enough to starve anything else realtime. Workers drop themselves to
+# SCHED_OTHER; spawned commands start at normal priority via ResetOnFork.
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=1
+CPUSchedulingResetOnFork=yes
+# A runaway realtime loop gets SIGXCPU at 2 s of unbroken RT CPU, SIGKILL at 4 s.
+# Dying stops the petting -> L4 -> counted. The main loop blocks every 5 s.
+LimitRTTIME=2s:4s
+# mlockall(MCL_CURRENT|MCL_FUTURE) needs a lock limit; FINITE on purpose, with
+# MemoryMax, so a leak in the supervisor cannot itself starve the host.
+LimitMEMLOCK=128M
+MemoryMax=128M
+MemoryMin=64M
+
+[Install]
+WantedBy=multi-user.target

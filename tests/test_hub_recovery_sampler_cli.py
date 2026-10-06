@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from recovery_harness import BOOT_ID, GiB, Tree, cid, load_script, rc
+from recovery_harness import GiB, Tree, cid, load_script, rc
 
 sampler = load_script("homehub_pressure_sample", "homehub-pressure-sample.py")
 cli = load_script("homehub_recovery_cli", "homehub-recovery")

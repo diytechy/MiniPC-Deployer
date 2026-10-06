@@ -12,6 +12,15 @@
 # hung-task settings, the backup slice) is installed by firstboot itself and is
 # untouched here: it is record-only and the knob does not govern it.
 #
+# EVERY REPLACEMENT OF A RUNNING SUPERVISOR GOES THROUGH THE VERIFIED DISARM
+# (review C1/C2): off, full -> contain, a different reset device, any changed
+# knob. Setup decides everything first, then - only if something changes -
+# runs `homehub-recovery disarm`, which stops the unit only after the device is
+# proven inactive, and only THEN writes files and starts the new supervisor. A
+# disarm that cannot be proven exits 1 with nothing changed. An unchanged
+# re-run (every ordinary boot) leaves the running supervisor alone. The
+# non-magic hand-off is reserved for real shutdowns.
+#
 # WHAT "ON" INSTALLS (HUB_WATCHDOG_ENABLED=true):
 #   /etc/homehub-recovery/recovery.env    the validated knobs, for every unit
 #   /etc/default/earlyoom                 C3, from earlyoom.default.tmpl
@@ -30,11 +39,12 @@
 # reported by firstboot as a WARNING with the reason - and nothing is changed.
 #
 # Test seams: RECOVERY_ENV_FILE, RECOVERY_ROOT (prefix for /etc, /sys, /proc),
-# RECOVERY_DEVICE_WAIT (seconds to wait for /dev/watchdog0 after modprobe).
+# RECOVERY_DEVICE_WAIT (seconds to wait for /dev/watchdog0 after modprobe),
+# RECOVERY_ACK_WAIT (seconds the CLI waits for the supervisor's disarm ack).
 #
 # Usage: setup-recovery.sh
 # Exit 0 = converged (on or off). 1 = failed. 2 = refused (bad knob).
-# Implements: SR-050, SR-051, LLR-1006
+# Implements: SR-050, SR-051, LLR-1006, LLR-1010
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,29 +104,69 @@ SHUTDOWN_SECONDS="$(knob HUB_WD_SHUTDOWN_SECONDS)"
 MEM_PCT="$(knob HUB_OOM_MEM_PCT)"
 SWAP_PCT="$(knob HUB_OOM_SWAP_PCT)"
 
-# write_if_changed PATH CONTENT -> 0 if the file changed, 1 if it already held it
-write_if_changed() {
-    local path="$1" content="$2"
-    if [ -f "$path" ] && [ "$(cat "$path")" = "$content" ]; then
-        return 1
+supervisor_active() { systemctl is-active --quiet homehub-recoveryd.service 2>/dev/null; }
+
+# ── THE ONLY WAY SETUP STOPS OR REPLACES A SUPERVISOR (review C1, C2) ────────
+# `homehub-recovery disarm` stops the device, has the supervisor acknowledge
+# it, reads sysfs itself, and only then stops the unit; with nothing running and
+# nothing armed it is a no-op, and a device left active by a dead supervisor is
+# disarmed directly. A plain `systemctl restart` here would hand the running
+# timer to a "shutdown" that never comes - full -> contain, reset device ->
+# none, or a report-only replacement would each leave a ~300 s countdown on a
+# healthy box. If the disarm cannot be PROVEN, setup exits 1 having changed
+# NOTHING: no unit disabled, no file removed, the old supervisor still petting.
+disarm_first() {
+    if ! "$PY" "$CLI" --root "${ROOT:-/}" disarm; then
+        say "FAILED: the reset device could not be verified disarmed. NOTHING was changed:"
+        say "  the supervisor (if any) is still running and petting it. Investigate with"
+        say "  'sudo homehub-recovery status', then re-run this script."
+        exit 1
     fi
-    mkdir -p "$(dirname "$path")"
-    printf '%s\n' "$content" >"$path.tmp"
-    mv -f "$path.tmp" "$path"
+}
+
+# differs PATH WANT -> 0 if PATH does not already hold WANT ("" = must be absent)
+differs() {
+    if [ -z "$2" ]; then [ -e "$1" ]; return; fi
+    [ ! -f "$1" ] || [ "$(cat "$1")" != "$2" ]
+}
+
+# put PATH WANT -> write it, or remove it when WANT is ""; 0 if anything changed
+put() {
+    differs "$1" "$2" || return 1
+    if [ -z "$2" ]; then rm -f "$1"; else
+        mkdir -p "$(dirname "$1")"
+        printf '%s\n' "$2" >"$1.tmp"
+        mv -f "$1.tmp" "$1"
+    fi
     return 0
 }
 
-# remove_if_present PATH -> 0 if something was removed
-remove_if_present() {
-    if [ -e "$1" ]; then rm -f "$1"; return 0; fi
-    return 1
+conf_text() {
+    printf '%s\n%s\n%s\n%s' "$normalised" \
+        "# The reset device the supervisor opens; empty = no hardware reset (contain tier," \
+        "# or no device on this box)." "HUB_WD_DEVICE=$1"
 }
 
-install_conf() {
-    write_if_changed "$CONF_FILE" "${normalised}
-# The reset device the supervisor opens; empty = no hardware reset (contain tier,
-# or no device on this box).
-HUB_WD_DEVICE=$1" || true
+# ── tailscaled: protect the RUNNING process, not only its next start (C7) ────
+# systemd applies OOMScoreAdjust when it spawns a service; a drop-in plus a
+# daemon-reload leaves the tailscaled that is already running at its old score.
+# So the live process is set and READ BACK before earlyoom is allowed to run.
+# Returns 1 only when a running tailscaled could not be protected.
+protect_running_tailscaled() {
+    local pid file
+    pid="$(systemctl show -p MainPID --value tailscaled.service 2>/dev/null || true)"
+    case "$pid" in
+        ''|0|*[!0-9]*)
+            say "  tailscaled is not running; its drop-in protects it from its next start"
+            return 0 ;;
+    esac
+    file="$ROOT/proc/$pid/oom_score_adj"
+    if { printf '%s\n' -1000 >"$file"; } 2>/dev/null && [ "$(cat "$file" 2>/dev/null)" = "-1000" ]; then
+        say "  tailscaled (pid $pid) oom_score_adj -1000, verified"
+        return 0
+    fi
+    say "  WARNING: could not set the running tailscaled (pid $pid) to oom_score_adj -1000"
+    return 1
 }
 
 unit_exists() { systemctl cat "$1" >/dev/null 2>&1; }
@@ -124,6 +174,8 @@ unit_exists() { systemctl cat "$1" >/dev/null 2>&1; }
 # ── the reset device (C7): wdat_wdt -> iTCO_wdt -> softdog -> none ───────────
 # Echoes the module that produced /dev/watchdog0, or "none". Persisted in
 # modules-load.d so the classifier can read bootstatus early on later boots.
+# Loading a module opens nothing, so this is safe while a supervisor holds the
+# device; it runs before anything is decided.
 choose_reset_device() {
     local wanted="$1" candidates m i
     case "$wanted" in
@@ -156,80 +208,94 @@ choose_reset_device() {
 
 converge_off() {
     say "HUB_WATCHDOG_ENABLED is not true - converging the recovery supervisor OFF."
-    if systemctl is-active --quiet homehub-recoveryd.service 2>/dev/null; then
-        # DISARM FIRST, AND REFUSE TO STOP WITHOUT IT. A plain stop hands the
-        # running timer to the shutdown hand-off, and with no shutdown coming
-        # the board would reset 300 s later.
-        if ! "$PY" "$CLI" --root "${ROOT:-/}" disarm; then
-            say "FAILED: could not disarm homehub-recoveryd; leaving it running rather than"
-            say "  stopping it armed. Investigate, then: sudo homehub-recovery disarm"
-            exit 1
-        fi
-    fi
+    disarm_first
     systemctl disable homehub-recoveryd.service >/dev/null 2>&1 || true
     local reexec=0
-    remove_if_present "$SYSTEM_DROPIN" && reexec=1
-    remove_if_present "$TAILSCALED_DROPIN" || true
-    remove_if_present "$MODULES_FILE" || true
+    put "$SYSTEM_DROPIN" "" && reexec=1
+    put "$TAILSCALED_DROPIN" "" || true
+    put "$MODULES_FILE" "" || true
     if unit_exists earlyoom.service; then
         systemctl disable --now earlyoom.service >/dev/null 2>&1 || true
     fi
-    install_conf ""
+    put "$CONF_FILE" "$(conf_text "")" || true
     sysctl -q -w kernel.panic=0 >/dev/null 2>&1 || say "WARN: could not set kernel.panic=0"
     systemctl daemon-reload
     if [ "$reexec" = 1 ]; then
         systemctl daemon-reexec
     fi
-    say "recovery supervisor OFF: disarmed, disabled, drop-ins removed, kernel.panic=0."
+    say "recovery supervisor OFF: disarmed (verified), disabled, drop-ins removed, kernel.panic=0."
     say "  Still on (record-only): hub-pressure samples and boot accounting."
 }
 
 converge_on() {
     say "HUB_WATCHDOG_ENABLED=true - converging the recovery supervisor ON (tiers: $TIERS)."
-    local device="" module="none" reexec=0 content
-    content="$(sed -e "s/@MEM_PCT@/$MEM_PCT/" -e "s/@SWAP_PCT@/$SWAP_PCT/" "$HERE/earlyoom.default.tmpl")"
-    write_if_changed "$EARLYOOM_DEFAULT" "$content" || true
-    write_if_changed "$TAILSCALED_DROPIN" "$(cat "$HERE/dropins/tailscaled-oom.conf")" || true
+    local device="" module="none" reexec=0 system_dropin="" modules="" changed=0
+    local earlyoom_text tailscaled_text conf
 
+    # 1. DECIDE everything first; nothing on disk changes yet.
     if [ "$TIERS" = full ]; then
         module="$(choose_reset_device "$RESET_DEVICE")"
         if [ "$module" != none ]; then
             device=/dev/watchdog0
-            write_if_changed "$MODULES_FILE" "$module" || true
-            content="$(sed -e "s|@SHUTDOWN_SECONDS@|$SHUTDOWN_SECONDS|" -e "s|@DEVICE@|$device|" \
+            modules="$module"
+            system_dropin="$(sed -e "s|@SHUTDOWN_SECONDS@|$SHUTDOWN_SECONDS|" -e "s|@DEVICE@|$device|" \
                 "$HERE/dropins/system-reboot-watchdog.conf.tmpl")"
-            write_if_changed "$SYSTEM_DROPIN" "$content" && reexec=1
             say "  reset device: $module ($device); reset-on-expiry is UNPROVEN until the P4 test"
         else
             say "  WARNING: no reset device - graceful reboots (L3) only, no hardware reset (L4)"
-            remove_if_present "$SYSTEM_DROPIN" && reexec=1
-            remove_if_present "$MODULES_FILE" || true
         fi
     else
         say "  tiers=contain: kills, sshd restarts and quarantine only; no reboot, no device"
-        remove_if_present "$SYSTEM_DROPIN" && reexec=1
-        remove_if_present "$MODULES_FILE" || true
     fi
-    install_conf "$device"
+    earlyoom_text="$(sed -e "s/@MEM_PCT@/$MEM_PCT/" -e "s/@SWAP_PCT@/$SWAP_PCT/" "$HERE/earlyoom.default.tmpl")"
+    tailscaled_text="$(cat "$HERE/dropins/tailscaled-oom.conf")"
+    conf="$(conf_text "$device")"
+    local pair var
+    for pair in "$CONF_FILE|conf" "$SYSTEM_DROPIN|system_dropin" "$MODULES_FILE|modules" \
+                "$EARLYOOM_DEFAULT|earlyoom_text" "$TAILSCALED_DROPIN|tailscaled_text"; do
+        var="${pair##*|}"
+        if differs "${pair%%|*}" "${!var}"; then changed=1; fi
+    done
 
+    # 2. Nothing to change and the supervisor is running: leave it running.
+    #    Re-running setup on every boot must not disarm and restart it each time.
+    if [ "$changed" = 0 ] && supervisor_active; then
+        protect_running_tailscaled || true
+        say "recovery supervisor already converged and running; nothing restarted."
+        return 0
+    fi
+
+    # 3. Anything else replaces the supervisor, so disarm it - verified - FIRST.
+    disarm_first
+
+    put "$CONF_FILE" "$conf" || true
+    put "$EARLYOOM_DEFAULT" "$earlyoom_text" || true
+    put "$TAILSCALED_DROPIN" "$tailscaled_text" || true
+    put "$MODULES_FILE" "$modules" || true
+    put "$SYSTEM_DROPIN" "$system_dropin" && reexec=1
     systemctl daemon-reload
     if [ "$reexec" = 1 ]; then
         # RebootWatchdogSec is read by PID 1 at start; a reload does not apply it.
         systemctl daemon-reexec
     fi
     if unit_exists earlyoom.service; then
-        systemctl enable earlyoom.service >/dev/null 2>&1 || true
-        systemctl restart earlyoom.service || say "WARN: earlyoom did not restart"
+        if protect_running_tailscaled; then
+            systemctl enable earlyoom.service >/dev/null 2>&1 || true
+            systemctl restart earlyoom.service || say "WARN: earlyoom did not restart"
+        else
+            say "  earlyoom NOT started: it could pick the remote-access tunnel. Fix the above and re-run."
+        fi
     else
+        protect_running_tailscaled || true
         say "  WARNING: earlyoom is not installed - no fast-spike backstop (C3)."
         say "    It is in packages.list; this image was baked before it was added."
     fi
     systemctl enable homehub-recoveryd.service >/dev/null
     # Recompute this boot's brake and kernel.panic under the new knobs (the
-    # classifier is idempotent within a boot), then (re)start the supervisor.
-    # A restart is a plain stop + start: it hands off and re-arms (L-12).
+    # classifier is idempotent within a boot), then START the supervisor: the
+    # old one, if any, was stopped by the verified disarm above.
     systemctl restart homehub-recovery-boot.service || say "WARN: boot accounting did not re-run"
-    systemctl restart homehub-recoveryd.service
+    systemctl start homehub-recoveryd.service
     say "recovery supervisor ON. Check: homehub-recovery status"
 }
 

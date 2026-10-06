@@ -229,11 +229,23 @@ def cmd_reset_brake(paths: rc.Paths, _args) -> int:
     rc.append_boots_log(paths.boots_log, {"t": now, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                                       time.gmtime(now)),
                                           "event": "brake-reset"})
-    # Re-run the (idempotent) classifier so boot.json and kernel.panic reflect
-    # the reset now, then restart the supervisor so it re-reads boot.json.
-    _run(["systemctl", "restart", "homehub-recovery-boot.service"], 60)
-    _run(["systemctl", "try-restart", UNIT], 60)
     print("brake reset: counted boots before now no longer count.")
+    # Re-run the (idempotent) classifier so boot.json and kernel.panic reflect
+    # the reset now. The supervisor is replaced through the VERIFIED disarm,
+    # never a bare restart (review C1): a restart hands the timer off, and a
+    # replacement that did not arm would leave it counting down.
+    _run(["systemctl", "restart", "homehub-recovery-boot.service"], 60)
+    code, active, _ = _run(["systemctl", "is-active", UNIT], 10)
+    if active != "active":
+        return 0
+    if cmd_disarm(paths, None) != 0:
+        print("The running supervisor could not be disarmed, so it was left running; it will "
+              "notice the reset by itself within 10 minutes.", file=sys.stderr)
+        return 1
+    code, _, err = _run(["systemctl", "start", UNIT], 60)
+    if code != 0:
+        print("could not start the supervisor again: {}".format(err), file=sys.stderr)
+        return 1
     return 0
 
 

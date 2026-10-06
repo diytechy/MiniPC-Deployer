@@ -223,3 +223,19 @@ def test_reset_brake_records_a_reset_the_brake_honours_tc1063(tmp_path, monkeypa
     entries = rc.parse_boots_log(open(tree.paths.boots_log).read())
     assert entries[-1]["event"] == "brake-reset"
     assert not rc.brake_state(entries, entries[-1]["t"] + 1, 3, False).braked
+
+
+@pytest.mark.parametrize("stops", [True, False])
+def test_reset_brake_replaces_a_running_supervisor_only_through_the_disarm_tc1083(tmp_path, monkeypatch, stops):
+    """Review C1: a bare restart would hand off a timer the replacement may not take."""
+    tree = Tree(tmp_path)
+    calls, state = _supervisor_answering(monkeypatch, tree, ack_ok=stops, stops=stops)
+    rc_ = cli.main(["--root", str(tmp_path), "reset-brake"])
+    assert not [c for c in calls if c[:2] in (["systemctl", "try-restart"], ["systemctl", "restart"])
+                and c[-1] == "homehub-recoveryd.service"]
+    if stops:
+        assert rc_ == 0 and calls.index(SIGUSR1) < calls.index(STOP) < calls.index(
+            ["systemctl", "start", "homehub-recoveryd.service"])
+    else:
+        assert rc_ == 1 and STOP not in calls
+    assert rc.read_boots_log_strict(tree.paths.boots_log)[-1]["event"] == "brake-reset"

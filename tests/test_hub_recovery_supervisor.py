@@ -888,3 +888,45 @@ def test_a_delayed_older_quarantine_snapshot_never_overwrites_a_newer_one_tc1076
     t1.join(5)
     t2.join(5)
     assert sorted(json.load(open(tree.paths.quarantine_file))["quarantined"]) == ["a", "b"]
+
+
+# ── review C1, supervisor side: a non-arming replacement takes over the orphan ─
+
+
+@pytest.mark.parametrize("why", ["contain", "braked", "report-only"])
+def test_a_replacement_that_will_not_arm_stops_its_predecessors_timer_tc1083(tmp_path, why):
+    """`systemctl restart` handed the timer off at 300 s; nobody would pet it."""
+    tree = Tree(tmp_path)
+    tree.watchdog(state="active")
+    cfg = config(HUB_WD_TIERS="contain") if why == "contain" else config()
+    if why == "braked":
+        tree.boot_json(braked=True)
+    elif why == "contain":
+        tree.boot_json()
+    sup = make_supervisor(tree, cfg=cfg)
+    sup.setup()
+    assert sup.mode == why
+    assert FakeDevice.instances and ("magic_close",) in FakeDevice.instances[0].calls
+    assert FakeDevice.state() == "inactive" and sup.device is None
+
+
+def test_an_orphan_that_will_not_stop_is_held_and_petted_tc1083(tmp_path):
+    tree, clock = Tree(tmp_path), FakeClock()
+    tree.watchdog(state="active")
+    sup = make_supervisor(tree, clock=clock)
+    FakeDevice.fail_disarm = True
+    sup.setup()  # no boot.json: report-only
+    assert sup.mode == "report-only" and sup.device is not None and sup.petting and sup.arm_error
+    pets = sup.device.pets
+    tick_for(sup, clock, tree, 20, 0)
+    assert sup.device.pets >= pets + 4
+
+
+def test_full_tier_with_no_reset_device_still_reboots_tc1083(tmp_path):
+    tree, clock = Tree(tmp_path), FakeClock()
+    tree.boot_json()
+    sup = make_supervisor(tree, clock=clock, device_path="")
+    sup.setup()
+    assert sup.mode == "full" and not FakeDevice.instances
+    sup._reboot(clock.mono, "test")
+    assert len(sup.workers.actions["reboot"]) == 1

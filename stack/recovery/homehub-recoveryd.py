@@ -558,11 +558,15 @@ class Supervisor:
             self.mode = "full"
         else:
             self.mode = "contain"
-        if self.mode == "full":
+        if self.mode == "full" and self.device_path:
             outcome, detail = self._arm()
             if outcome == "refused":
                 self.reasons.append(detail)
                 self.mode = "report-only"
+        else:
+            # full with no reset device configured is "graceful reboots only";
+            # every other mode must not leave a predecessor's timer running.
+            self._disarm_orphan_at_start()
         self.next_brake_check = self.clock.monotonic() + BRAKE_CHECK_SECONDS
         self.event("start", mode=self.mode, reasons=list(self.reasons), braked=self.braked,
                    device=self.device_path if self.device else None, kmsg=True)
@@ -688,6 +692,37 @@ class Supervisor:
                             "the board will reset".format(exc))
         return False
 
+    def _disarm_orphan_at_start(self) -> None:
+        """This instance will NOT arm, but a previous one may have handed off.
+
+        `systemctl restart` (or any start after a plain stop) runs the old
+        instance's SIGTERM hand-off: the timer keeps running at 300 s for the
+        replacement to take over. A replacement that comes up contain, braked
+        or report-only never opens the device, so that countdown would reset a
+        healthy box (review C1). Take it over and stop it, verified; if it will
+        not stop, hold it and keep petting, red.
+        Implements: SR-051, LLR-1010
+        """
+        if self.device_state() != "active":
+            return
+        configured = self.device_path
+        self.device_path = configured or "/dev/watchdog0"
+        try:
+            self.device = self.device_opener(self.device_path)
+        except Exception as exc:  # noqa: BLE001
+            self.device = None
+            self.arm_error = "a running watchdog left by a previous instance could not be opened: {!r}".format(exc)
+            self.kmsg.write(self.arm_error + "; the board will reset")
+            self.device_path = configured
+            return
+        if self._release_device_verified():
+            self.event("orphan-disarmed", kmsg=True, mode=self.mode)
+            self.device_path = configured
+        else:
+            self.arm_error = ("a running watchdog left by a previous instance could not be disarmed; "
+                              "holding and petting it")
+            self.event("orphan-retained", kmsg=True, detail=self.arm_error)
+
     def _write_kernel_panic(self, value: int) -> None:
         try:
             with open(self.paths.kernel_panic_file, "w", encoding="ascii") as handle:
@@ -715,10 +750,11 @@ class Supervisor:
                        device_released=released)
         elif not braked and self.mode == "braked":
             if self.cfg.full:
-                outcome, detail = self._arm()
-                if outcome == "refused":
-                    self.event("brake-cleared-not-armed", kmsg=True, detail=detail)
-                    return
+                if self.device_path:  # no device configured: graceful reboots only
+                    outcome, detail = self._arm()
+                    if outcome == "refused":
+                        self.event("brake-cleared-not-armed", kmsg=True, detail=detail)
+                        return
                 self.mode = "full"
                 self._write_kernel_panic(rc.kernel_panic_value(self.cfg, True, False))
             else:

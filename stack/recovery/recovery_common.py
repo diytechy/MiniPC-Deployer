@@ -97,6 +97,10 @@ class Paths:
         return os.path.join(self.run_dir, "disarm")
 
     @property
+    def disarm_ack_file(self) -> str:
+        return os.path.join(self.run_dir, "disarm-ack")
+
+    @property
     def released_file(self) -> str:
         return os.path.join(self.run_dir, "released")
 

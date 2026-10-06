@@ -73,26 +73,59 @@ class FakeClock:
 
 
 class FakeDevice:
-    """Records what the supervisor asked of /dev/watchdog0."""
+    """Records what the supervisor asked of /dev/watchdog0 and drives a fake
+    sysfs `state` the way the kernel would: open starts the timer, a disable
+    or a magic close stops it, a plain close leaves it running.
+
+    Class-level switches inject failures: fail_open, fail_set_timeout (after a
+    successful open, the review-C3 case) and fail_disarm (neither disable nor
+    magic close stops the timer, the review-C2 case)."""
 
     instances: list = []
+    state_file = None
+    fail_open = False
+    fail_set_timeout = False
+    fail_disarm = False
 
     def __init__(self, path: str) -> None:
+        if FakeDevice.fail_open:
+            raise OSError(16, "Device or resource busy")
         self.path = path
         self.calls: list = []
         self.pets = 0
         FakeDevice.instances.append(self)
+        self._state("active")
+
+    @classmethod
+    def _state(cls, value: str) -> None:
+        if cls.state_file:
+            with open(cls.state_file, "w", encoding="ascii", newline="\n") as handle:
+                handle.write(value + "\n")
+
+    @classmethod
+    def state(cls) -> str:
+        with open(cls.state_file, encoding="ascii") as handle:
+            return handle.read().strip()
 
     def set_timeout(self, seconds: int) -> int:
         self.calls.append(("set_timeout", seconds))
+        if FakeDevice.fail_set_timeout:
+            raise OSError(22, "Invalid argument")
         return seconds
 
     def keepalive(self) -> None:
         self.pets += 1
         self.calls.append(("keepalive",))
 
+    def disable_card(self) -> None:
+        self.calls.append(("disable_card",))
+        if not FakeDevice.fail_disarm:
+            self._state("inactive")
+
     def magic_close(self) -> None:
         self.calls.append(("magic_close",))
+        if not FakeDevice.fail_disarm:
+            self._state("inactive")
 
     def close(self) -> None:
         self.calls.append(("close",))
@@ -121,6 +154,10 @@ class Tree:
             BOOT_ID[:8], BOOT_ID[8:12], BOOT_ID[12:16], BOOT_ID[16:20], BOOT_ID[20:]))
         self.write(self.paths.kernel_panic_file, "0\n")
         self.psi(0.0)
+        # A watchdog the kernel knows about, stopped, with WDAT-like limits:
+        # min 1 s, max_timeout 0 (the core pets a short hardware heartbeat
+        # itself, so no upper bound).
+        self.watchdog(min_timeout=1, max_timeout=0)
         self.write(os.path.join(self.paths.proc_dir, "meminfo"),
                    "MemTotal: 8000000 kB\nMemAvailable: 4000000 kB\nSwapTotal: 4000000 kB\n"
                    "SwapFree: 3000000 kB\n")
@@ -151,6 +188,15 @@ class Tree:
                 {"RestartPolicy": {"Name": restart}, "AutoRemove": False}))
         return scope
 
+    def watchdog(self, min_timeout: int = 1, max_timeout: int = 0, state: str = "inactive") -> str:
+        d = os.path.join(self.paths.watchdog_class_dir, "watchdog0")
+        os.makedirs(d, exist_ok=True)
+        self.write(os.path.join(d, "min_timeout"), "{}\n".format(min_timeout))
+        self.write(os.path.join(d, "max_timeout"), "{}\n".format(max_timeout))
+        self.write(os.path.join(d, "state"), state + "\n")
+        self.write(os.path.join(d, "nowayout"), "0\n")
+        return os.path.join(d, "state")
+
     def empty(self, scope: str) -> None:
         self.write(os.path.join(scope, "cgroup.events"), "populated 0\nfrozen 0\n")
 
@@ -170,6 +216,8 @@ def make_supervisor(tree: Tree, cfg=None, clock=None, runner=None, sshd_probe=No
                     start_threads=False, lock_memory=None, sched_other=None, journal=None,
                     device_opener=None, device_path="/dev/watchdog0"):
     FakeDevice.instances = []
+    FakeDevice.state_file = os.path.join(tree.paths.watchdog_class_dir, "watchdog0", "state")
+    FakeDevice.fail_open = FakeDevice.fail_set_timeout = FakeDevice.fail_disarm = False
     exits = []
     sup = recoveryd.Supervisor(
         cfg or config(), tree.paths, BOOT_ID, INVOCATION, clock=clock or FakeClock(),

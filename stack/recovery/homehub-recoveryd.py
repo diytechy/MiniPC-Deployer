@@ -79,6 +79,13 @@ QUARANTINE_AFTER_KILLS = 2
 SSH_PROBE_SECONDS = 60
 ESCALATION_SECONDS = 120     # §3.3: no SIGTERM this long after a reboot request
 INVENTORY_SECONDS = 30
+# The running supervisor re-reads the boot accounting this often, so a brake
+# that expires (24 h with no counted boot) is noticed without a restart, and a
+# log that becomes unreadable brakes it (review C9).
+BRAKE_CHECK_SECONDS = 600
+# `homehub-recovery disarm` asks for a disarm with this signal; SIGTERM never
+# disarms. getattr: the module also imports on the Windows dev box.
+SIG_DISARM = getattr(signal, "SIGUSR1", 10)
 RING_SIZE = 48               # 4 minutes of samples held for evidence
 TELEMETRY_QUEUE = 256
 WORKER_STACK = 256 * 1024
@@ -249,8 +256,10 @@ class WatchdogDevice:
     Implements: SR-051, LLR-1002
     """
 
+    WDIOC_SETOPTIONS = 0x80045704
     WDIOC_KEEPALIVE = 0x80045705
     WDIOC_SETTIMEOUT = 0xC0045706
+    WDIOS_DISABLECARD = 0x0001
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -269,9 +278,15 @@ class WatchdogDevice:
     def keepalive(self) -> None:
         self._ioctl(self.WDIOC_KEEPALIVE, 0)
 
+    def disable_card(self) -> None:
+        """WDIOS_DISABLECARD: stop the timer while the descriptor is still held."""
+        self._ioctl(self.WDIOC_SETOPTIONS, self.WDIOS_DISABLECARD)
+
     def magic_close(self) -> None:
-        os.write(self.fd, b"V")
-        self.close()
+        try:
+            os.write(self.fd, b"V")
+        finally:
+            self.close()
 
     def close(self) -> None:
         if self.fd is not None:
@@ -484,6 +499,11 @@ class Supervisor:
         self.device = None
         self.petting = False
         self.dying = False
+        # Set when arming failed after the device was opened AND it could not
+        # be verified stopped: the supervisor keeps petting rather than abandon
+        # a running timer (review C3), and says so in a red status.
+        self.arm_error: Optional[str] = None
+        self.next_brake_check = 0.0
         self.pets = 0
         self.inventory: Dict[str, rc.ContainerInfo] = {}
         self.quarantined: Dict[str, dict] = {}
@@ -538,16 +558,12 @@ class Supervisor:
             self.mode = "full"
         else:
             self.mode = "contain"
-        if self.mode == "full" and self.device_path:
-            try:
-                self.device = self.device_opener(self.device_path)
-                self.device.set_timeout(self.cfg.hw_timeout)
-                self.device.keepalive()
-                self.petting = True
-            except Exception as exc:  # noqa: BLE001
-                self.device = None
-                self.reasons.append("could not arm {}: {!r}".format(self.device_path, exc))
+        if self.mode == "full":
+            outcome, detail = self._arm()
+            if outcome == "refused":
+                self.reasons.append(detail)
                 self.mode = "report-only"
+        self.next_brake_check = self.clock.monotonic() + BRAKE_CHECK_SECONDS
         self.event("start", mode=self.mode, reasons=list(self.reasons), braked=self.braked,
                    device=self.device_path if self.device else None, kmsg=True)
         self._write_status(self.clock.monotonic())
@@ -563,11 +579,185 @@ class Supervisor:
     def acts(self) -> bool:
         return self.mode in ("full", "contain", "braked")
 
+    # ── the reset device: arm, verified release (review C2, C3) ────────────
+    @property
+    def device_name(self) -> str:
+        return os.path.basename(self.device_path or "watchdog0")
+
+    def _sysfs(self, leaf: str) -> Optional[str]:
+        try:
+            with open(os.path.join(self.paths.watchdog_class_dir, self.device_name, leaf),
+                      encoding="ascii") as handle:
+                return handle.read().strip()
+        except OSError:
+            return None
+
+    def device_state(self) -> str:
+        """'active', 'inactive', 'absent' (no such watchdog) or 'unknown'.
+
+        sysfs, so the main thread may read it (kernfs never waits on a disk).
+        Anything but inactive/absent counts as RUNNING wherever a decision
+        rests on it."""
+        if not os.path.isdir(os.path.join(self.paths.watchdog_class_dir, self.device_name)):
+            return "absent"
+        state = self._sysfs("state")
+        return state if state in ("active", "inactive") else "unknown"
+
+    def _timeout_error(self) -> Optional[str]:
+        """Both timeouts must lie inside the DEVICE's range, read before opening.
+
+        Opening a watchdog STARTS it; a timeout the firmware rejects found out
+        after that is a running timer nobody can set (review C3). max_timeout 0
+        means the core has no upper bound (it pets a short hardware heartbeat
+        itself); an unreadable range refuses to arm."""
+        lo_raw, hi_raw = self._sysfs("min_timeout"), self._sysfs("max_timeout")
+        if lo_raw is None or hi_raw is None or not lo_raw.isdigit() or not hi_raw.isdigit():
+            return "cannot read {}'s min_timeout/max_timeout; not arming".format(self.device_name)
+        lo, hi = int(lo_raw), int(hi_raw)
+        for knob, value in (("HUB_WD_HW_TIMEOUT", self.cfg.hw_timeout),
+                            ("HUB_WD_SHUTDOWN_SECONDS", self.cfg.shutdown_seconds)):
+            if value < lo or (hi > 0 and value > hi):
+                return "{}={} is outside {}'s range {}..{}; not arming".format(
+                    knob, value, self.device_name, lo, hi if hi else "unbounded")
+        return None
+
+    def _arm(self) -> Tuple[str, str]:
+        """Open and set the device. Returns (outcome, detail):
+
+          armed     open, timeout set, petted
+          refused   nothing is running: validation failed, the open failed, or
+                    a later step failed and the device was VERIFIED stopped
+          retained  a later step failed and the device could NOT be verified
+                    stopped, so it is held and petted (at whatever timeout it
+                    has) rather than abandoned - the box must not reset because
+                    arming went wrong
+        Implements: SR-051, LLR-1002, LLR-1010
+        """
+        if not self.device_path:
+            return "refused", "no reset device configured"
+        error = self._timeout_error()
+        if error:
+            return "refused", error
+        try:
+            self.device = self.device_opener(self.device_path)
+        except Exception as exc:  # noqa: BLE001
+            self.device = None
+            return "refused", "could not open {}: {!r}".format(self.device_path, exc)
+        try:
+            self.device.set_timeout(self.cfg.hw_timeout)
+            self.device.keepalive()
+            self.petting = True
+            self.arm_error = None
+            return "armed", "armed {} at {} s".format(self.device_path, self.cfg.hw_timeout)
+        except Exception as exc:  # noqa: BLE001
+            detail = "arming {} failed after open: {!r}".format(self.device_path, exc)
+        if self._release_device_verified():
+            return "refused", detail + "; the device was disarmed and verified inactive"
+        self.arm_error = detail + "; the device could NOT be disarmed, so it is held and petted"
+        self.event("arm-failed-device-retained", kmsg=True, detail=self.arm_error)
+        return "retained", self.arm_error
+
+    def _release_device_verified(self) -> bool:
+        """Stop the device and PROVE it stopped; otherwise keep owning it.
+
+        disable_card first (the descriptor is still held, so a failure costs
+        nothing), then the magic close, then sysfs must read inactive. If it
+        does not, the device is reopened and petted: an active timer with no
+        owner resets the box, which is the one outcome a disarm must never
+        cause. Returns True only on verified inactive (or absent).
+        Implements: SR-051, LLR-1002, LLR-1010
+        """
+        if self.device is not None:
+            try:
+                self.device.disable_card()
+            except Exception:  # noqa: BLE001 - optional; the magic close is the main path
+                pass
+            try:
+                self.device.magic_close()
+            except Exception as exc:  # noqa: BLE001
+                self.kmsg.write("magic close failed: {!r}".format(exc))
+        self.device, self.petting = None, False
+        if self.device_state() in ("inactive", "absent"):
+            return True
+        try:
+            self.device = self.device_opener(self.device_path)
+            self.petting = True
+            self.device.keepalive()
+        except Exception as exc:  # noqa: BLE001
+            self.kmsg.write("device still ACTIVE after disarm and could not be reopened ({!r}); "
+                            "the board will reset".format(exc))
+        return False
+
+    def _write_kernel_panic(self, value: int) -> None:
+        try:
+            with open(self.paths.kernel_panic_file, "w", encoding="ascii") as handle:
+                handle.write("{}\n".format(value))
+        except OSError as exc:
+            self.event("kernel-panic-write-failed", value=value, error=str(exc))
+
+    def _apply_brake(self, result: dict) -> None:
+        """Main thread: act on a periodic brake re-evaluation (review C9).
+
+        Fail closed: an unreadable log arrives as braked. Engaging releases the
+        device verifiably (a device that will not stop is kept and petted, and
+        the mode still stops rebooting). Clearing re-arms only through _arm(),
+        with its range validation; a refusal leaves it braked.
+        Implements: SR-051, LLR-1011
+        """
+        braked = bool(result.get("braked"))
+        if self.mode not in ("full", "braked", "contain"):
+            return
+        if braked and self.mode != "braked":
+            released = self.device is None or self._release_device_verified()
+            self.mode, self.braked = "braked", True
+            self._write_kernel_panic(0)
+            self.event("brake-engaged", kmsg=True, detail=result.get("detail"),
+                       device_released=released)
+        elif not braked and self.mode == "braked":
+            if self.cfg.full:
+                outcome, detail = self._arm()
+                if outcome == "refused":
+                    self.event("brake-cleared-not-armed", kmsg=True, detail=detail)
+                    return
+                self.mode = "full"
+                self._write_kernel_panic(rc.kernel_panic_value(self.cfg, True, False))
+            else:
+                self.mode = "contain"
+            self.braked = False
+            self.event("brake-cleared", kmsg=True, mode=self.mode, detail=result.get("detail"))
+        else:
+            return
+        self._update_boot_record()
+
+    def _update_boot_record(self) -> None:
+        boot = rc.read_json(self.paths.boot_json)  # tmpfs
+        if boot is None:
+            return
+        boot["braked"] = self.braked
+        boot["kernel_panic"] = rc.kernel_panic_value(self.cfg, True, self.braked) if self.mode != "report-only" else 0
+        try:
+            rc.atomic_write(self.paths.boot_json, json.dumps(boot, sort_keys=True).encode(), durable=False)
+        except OSError:
+            pass
+
+    def _brake_check(self) -> None:
+        """Telemetry thread: read the accounting (disk) and post the verdict."""
+        try:
+            state = rc.evaluate_brake(self.paths, self.cfg, self.clock.utc())
+            result = {"kind": "brake", "braked": state.braked, "ok": True, "detail": state.detail}
+        except rc.AccountingError as exc:
+            result = {"kind": "brake", "braked": True, "ok": False,
+                      "detail": "accounting unreadable, so braked: {}".format(exc)}
+        self.workers.results.append(result)
+
     # ── the loop ────────────────────────────────────────────────────────────
     def run(self, wait: Callable[[float], Optional[int]]) -> None:
         """Tick every SAMPLE_SECONDS until SIGTERM. `wait` returns a signal or None."""
         while True:
             sig = wait(SAMPLE_SECONDS)
+            if sig == SIG_DISARM:
+                self.on_disarm_request()
+                continue
             if sig is not None:
                 self.on_sigterm()
                 return
@@ -604,6 +794,10 @@ class Supervisor:
         if now >= self.next_inventory:
             self.next_inventory = now + INVENTORY_SECONDS
             self.workers.emit({"type": "inventory"})
+        if now >= self.next_brake_check:
+            self.next_brake_check = now + BRAKE_CHECK_SECONDS
+            if self.mode in ("full", "braked", "contain"):
+                self.workers.emit({"type": "brake-check"})
         self._write_status(now)
         self._pet()
 
@@ -747,6 +941,9 @@ class Supervisor:
             except IndexError:
                 return
             kind, key = result.get("kind"), result.get("key")
+            if kind == "brake":
+                self._apply_brake(result)
+                continue
             if kind != "reboot":  # a reboot is never re-queued, whatever happened
                 self.inflight.discard((kind, key))
             if kind == "reconcile" and result.get("ok"):
@@ -818,7 +1015,7 @@ class Supervisor:
                        note="no SIGTERM {} s after the reboot request; petting stopped, L4 resets "
                             "within {} s".format(ESCALATION_SECONDS, self.cfg.hw_timeout))
 
-    # ── SIGTERM and disarm (§3.4, §3.6) ─────────────────────────────────────
+    # ── disarm (SIGUSR1) and SIGTERM (§3.4, §3.6; review C2) ───────────────
     def consume_disarm(self) -> bool:
         """True only if /run names THIS boot and THIS invocation. Always deleted."""
         try:
@@ -832,24 +1029,58 @@ class Supervisor:
             pass
         return len(text) >= 2 and text[0] == self.boot_id and text[1] == self.invocation_id
 
+    def on_disarm_request(self) -> None:
+        """SIGUSR1 from `homehub-recovery disarm`: disarm, VERIFY, acknowledge.
+
+        The device is stopped while this process keeps running, and the
+        acknowledgement says ok only when sysfs reads inactive (or there is no
+        device). The CLI stops the unit only after reading ok=true - so a stop
+        can never be the thing that leaves a timer running, and a disarm that
+        failed leaves the supervisor running and petting (review C2).
+        Implements: SR-051, LLR-1002, LLR-1010
+        """
+        if not self.consume_disarm():
+            self._write_ack(False, self.device_state(), "no authorisation naming this boot and invocation")
+            self.event("disarm-refused", kmsg=True)
+            return
+        ok = self._release_device_verified() if self.device is not None else \
+            self.device_state() in ("inactive", "absent")
+        state = self.device_state()
+        if ok:
+            self.mode = "disarmed"
+            self.reasons.append("disarmed by the operator")
+        self._write_ack(ok, state, "verified" if ok else "device still {}; kept armed".format(state))
+        self.event("disarmed" if ok else "disarm-failed", kmsg=True, device_state=state)
+        self._write_status(self.clock.monotonic())
+
+    def _write_ack(self, ok: bool, state: str, detail: str) -> None:
+        ack = {"boot_id": self.boot_id, "invocation_id": self.invocation_id, "ok": ok,
+               "device_state": state, "detail": detail, "utc": self.clock.utc()}
+        try:
+            os.makedirs(self.paths.run_dir, exist_ok=True)
+            rc.atomic_write(self.paths.disarm_ack_file, json.dumps(ack).encode(), durable=False)
+        except OSError as exc:
+            self.kmsg.write("could not write the disarm acknowledgement: {!r}".format(exc))
+
     def on_sigterm(self) -> None:
-        authorised = self.consume_disarm()
+        """Every stop that is not preceded by a verified disarm: the HAND-OFF.
+
+        Raise the timeout to the shutdown bound, pet once, close WITHOUT the
+        magic character. A reboot, `systemctl restart`, and a stop issued by
+        anything but the disarm protocol all land here; none of them disarms.
+        """
         if self.device is not None:
             try:
-                if authorised:
-                    self.device.magic_close()
-                    self.event("disarmed", kmsg=True)
-                else:
-                    self.device.set_timeout(self.cfg.shutdown_seconds)
-                    self.device.keepalive()
-                    self.device.close()
-                    self.event("handed-off", kmsg=True, timeout=self.cfg.shutdown_seconds,
-                               note="device left running for the shutdown; no magic close")
+                self.device.set_timeout(self.cfg.shutdown_seconds)
+                self.device.keepalive()
+                self.device.close()
+                self.event("handed-off", kmsg=True, timeout=self.cfg.shutdown_seconds,
+                           note="device left running for the shutdown; no magic close")
             except Exception as exc:  # noqa: BLE001 - the exit must happen regardless
                 self.kmsg.write("SIGTERM device step failed: {!r}".format(exc))
             self.device = None
         else:
-            self.event("stop", authorised=authorised)
+            self.event("stop", mode=self.mode)
         deadline = time.monotonic() + 1.0
         while self.workers.telemetry and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -878,6 +1109,9 @@ class Supervisor:
             return
         if kind == "quarantine-file":
             self._write_quarantine_snapshot(item)
+            return
+        if kind == "brake-check":
+            self._brake_check()
             return
         line = {k: v for k, v in item.items() if k not in ("type", "samples", "evidence")}
         self.journal(json.dumps(line, sort_keys=True, default=str))
@@ -918,11 +1152,13 @@ class Supervisor:
         sys.stdout.flush()
 
     def _write_status(self, now: float) -> None:
-        red = self.mode == "report-only" or bool(self.quarantined) or self.dying
+        red = (self.mode in ("report-only", "disarmed") or bool(self.quarantined) or self.dying
+               or bool(self.arm_error))
         status = {
             "boot_id": self.boot_id, "invocation_id": self.invocation_id,
             "mode": self.mode, "reasons": self.reasons, "health": "red" if red else "green",
             "braked": self.braked, "armed": self.device is not None, "petting": self.petting,
+            "arm_error": self.arm_error,
             "state": self.sm.state, "episode_age": None if self.sm.t0 is None else round(now - self.sm.t0),
             "kill_budget_left": self.sm.budget_left(now), "quarantined": sorted(self.quarantined),
             "reboot_requested": self.reboot_requested_at is not None,
@@ -986,7 +1222,8 @@ def main() -> int:
     paths = rc.Paths("/")
     # Block the stop signals BEFORE any thread exists so every worker inherits
     # the mask and SIGTERM can only be collected by the main loop's sigtimedwait.
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+    signals = {signal.SIGTERM, signal.SIGINT, SIG_DISARM}
+    signal.pthread_sigmask(signal.SIG_BLOCK, signals)
     try:
         cfg = rc.load_config(paths, os.environ)
         config_error = None
@@ -1000,7 +1237,7 @@ def main() -> int:
     supervisor.setup()
 
     def wait(timeout: float) -> Optional[int]:
-        info = signal.sigtimedwait({signal.SIGTERM, signal.SIGINT}, timeout)
+        info = signal.sigtimedwait(signals, timeout)
         return None if info is None else info.si_signo
 
     supervisor.run(wait)

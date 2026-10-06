@@ -491,12 +491,46 @@ def test_sigterm_without_authorisation_hands_off_with_300s_and_no_magic_close_tc
     assert sup.exits == [0]
 
 
-def test_sigterm_with_this_boot_and_invocation_magic_closes_tc1052(tmp_path):
+def test_sigterm_never_disarms_even_with_a_valid_authorisation_present_tc1052(tmp_path):
+    """A reboot is SIGTERM; only the SIGUSR1 disarm request may stop the device."""
     tree, sup, dev = _armed(tmp_path)
     tree.write(tree.paths.disarm_file, "{} {}\n".format(BOOT_ID, INVOCATION))
-    sup.on_sigterm()
-    assert ("magic_close",) in dev.calls and ("set_timeout", 300) not in dev.calls
+    sup.run(_signals(15))  # SIGTERM through the real loop
+    assert ("magic_close",) not in dev.calls and ("set_timeout", 300) in dev.calls
+    assert FakeDevice.state() == "active", "a SIGTERM stopped the timer"
+
+
+def _ack(tree):
+    return json.load(open(tree.paths.disarm_ack_file))
+
+
+def test_a_disarm_request_stops_the_device_verifies_it_and_acknowledges_tc1077(tmp_path):
+    tree, sup, dev = _armed(tmp_path)
+    assert FakeDevice.state() == "active"
+    tree.write(tree.paths.disarm_file, "{} {}\n".format(BOOT_ID, INVOCATION))
+    sup.run(_signals(recoveryd.SIG_DISARM, None, 15))
+    assert ("disable_card",) in dev.calls and ("magic_close",) in dev.calls
+    assert FakeDevice.state() == "inactive"
+    ack = _ack(tree)
+    assert ack["ok"] is True and ack["boot_id"] == BOOT_ID and ack["invocation_id"] == INVOCATION
+    assert ack["device_state"] == "inactive"
+    assert sup.mode == "disarmed" and sup.device is None
     assert not os.path.exists(tree.paths.disarm_file), "the authorisation was not consumed"
+    # The stop that follows is an ordinary SIGTERM with nothing left to hand off.
+    assert ("set_timeout", 300) not in dev.calls and sup.exits == [0]
+
+
+def test_a_disarm_that_does_not_stop_the_device_keeps_it_armed_and_says_so_tc1077(tmp_path):
+    tree, sup, dev = _armed(tmp_path)
+    FakeDevice.fail_disarm = True
+    tree.write(tree.paths.disarm_file, "{} {}\n".format(BOOT_ID, INVOCATION))
+    sup.on_disarm_request()
+    ack = _ack(tree)
+    assert ack["ok"] is False and ack["device_state"] == "active"
+    assert sup.device is not None and sup.petting, "an active timer was abandoned"
+    assert sup.mode == "full"
+    reopened = FakeDevice.instances[-1]
+    assert reopened is not dev and reopened.pets >= 1
 
 
 @pytest.mark.parametrize("content", ["{} {}".format(BOOT_ID, "2" * 32), "{} {}".format("c" * 32, INVOCATION),
@@ -504,9 +538,135 @@ def test_sigterm_with_this_boot_and_invocation_magic_closes_tc1052(tmp_path):
 def test_a_stale_authorisation_is_ignored_and_consumed_tc1052(tmp_path, content):
     tree, sup, dev = _armed(tmp_path)
     tree.write(tree.paths.disarm_file, content)
-    sup.on_sigterm()
-    assert ("magic_close",) not in dev.calls and ("set_timeout", 300) in dev.calls
+    sup.on_disarm_request()
+    assert ("magic_close",) not in dev.calls and FakeDevice.state() == "active"
+    assert _ack(tree)["ok"] is False and sup.mode == "full"
     assert not os.path.exists(tree.paths.disarm_file)
+
+
+def _signals(*sequence):
+    """A fake sigtimedwait: returns each item once, then SIGTERM."""
+    items = list(sequence)
+
+    def wait(timeout):
+        return items.pop(0) if items else 15
+
+    return wait
+
+
+# ── review C3: the device's real range, and failure after open ──────────────
+
+
+@pytest.mark.parametrize("limits,knobs,fragment", [
+    ((1, 30), {}, "HUB_WD_HW_TIMEOUT=60 is outside"),
+    ((1, 120), {}, "HUB_WD_SHUTDOWN_SECONDS=300 is outside"),
+    ((90, 0), {}, "HUB_WD_HW_TIMEOUT=60 is outside"),
+])
+def test_timeouts_outside_the_devices_range_never_open_it_tc1078(tmp_path, limits, knobs, fragment):
+    tree = Tree(tmp_path)
+    tree.boot_json()
+    tree.watchdog(min_timeout=limits[0], max_timeout=limits[1])
+    sup = make_supervisor(tree, cfg=config(**knobs))
+    sup.setup()
+    assert not FakeDevice.instances, "the device was opened (and so started) before validation"
+    assert sup.mode == "report-only" and any(fragment in r for r in sup.reasons)
+
+
+def test_an_unreadable_device_range_refuses_to_arm_tc1078(tmp_path):
+    tree = Tree(tmp_path)
+    tree.boot_json()
+    os.unlink(os.path.join(tree.paths.watchdog_class_dir, "watchdog0", "max_timeout"))
+    sup = make_supervisor(tree)
+    sup.setup()
+    assert not FakeDevice.instances and sup.mode == "report-only"
+
+
+def test_a_failure_after_open_disarms_verifies_and_only_then_reports_only_tc1078(tmp_path):
+    tree = Tree(tmp_path)
+    tree.boot_json()
+    sup = make_supervisor(tree)
+    FakeDevice.fail_set_timeout = True
+    sup.setup()
+    dev = FakeDevice.instances[0]
+    assert ("magic_close",) in dev.calls and FakeDevice.state() == "inactive"
+    assert sup.mode == "report-only" and sup.device is None
+    assert any("verified inactive" in r for r in sup.reasons)
+
+
+def test_a_failure_after_open_that_cannot_disarm_keeps_petting_tc1078(tmp_path):
+    tree, clock = Tree(tmp_path), FakeClock()
+    tree.boot_json()
+    sup = make_supervisor(tree, clock=clock)
+    FakeDevice.fail_set_timeout = True
+    FakeDevice.fail_disarm = True
+    sup.setup()
+    assert FakeDevice.state() == "active"
+    assert sup.device is not None and sup.petting and sup.arm_error
+    pets = sup.device.pets
+    tick_for(sup, clock, tree, 30, 0)
+    assert sup.device.pets >= pets + 6, "an active device was abandoned"
+    status = json.load(open(tree.paths.status_json))
+    assert status["health"] == "red" and status["arm_error"]
+    assert any(line.startswith("arm-failed-device-retained") for line in sup.kmsg.lines)
+
+
+# ── review C9: the running supervisor follows the brake ─────────────────────
+
+
+def _log_entries(tree, entries):
+    tree.write(tree.paths.boots_log, "\n".join(json.dumps(e) for e in entries) + "\n")
+
+
+def _run_brake_check(sup, clock, tree):
+    clock.advance(recoveryd.BRAKE_CHECK_SECONDS)
+    sup.safe_tick()          # schedules the check
+    drain_telemetry(sup)     # a telemetry thread reads the log
+    clock.advance(5)
+    sup.safe_tick()          # the main thread applies the verdict
+
+
+def test_a_brake_that_expires_while_running_re_arms_through_validation_tc1079(tmp_path):
+    tree, clock = Tree(tmp_path), FakeClock()
+    tree.boot_json(braked=True)
+    day = 24 * 3600
+    _log_entries(tree, [{"t": clock.wall - day - 3 * 60 * 60 + i * 60, "class": "recovery"} for i in range(3)])
+    sup = make_supervisor(tree, clock=clock)
+    sup.setup()
+    assert sup.mode == "braked" and not FakeDevice.instances
+    _run_brake_check(sup, clock, tree)
+    assert sup.mode == "full" and FakeDevice.instances and FakeDevice.state() == "active"
+    assert open(tree.paths.kernel_panic_file).read().strip() == "10"
+    assert json.load(open(tree.paths.boot_json))["braked"] is False
+
+
+def test_an_expired_brake_does_not_arm_a_device_outside_its_range_tc1079(tmp_path):
+    tree, clock = Tree(tmp_path), FakeClock()
+    tree.boot_json(braked=True)
+    tree.watchdog(min_timeout=1, max_timeout=30)
+    sup = make_supervisor(tree, clock=clock)
+    sup.setup()
+    _run_brake_check(sup, clock, tree)
+    assert sup.mode == "braked" and not FakeDevice.instances
+    assert open(tree.paths.kernel_panic_file).read().strip() == "0"
+
+
+@pytest.mark.parametrize("damage", ["counted", "unreadable"])
+def test_a_brake_that_engages_while_running_releases_the_device_tc1079(tmp_path, damage):
+    tree, clock = Tree(tmp_path), FakeClock()
+    tree.boot_json()
+    tree.write(tree.paths.kernel_panic_file, "10\n")
+    sup = make_supervisor(tree, clock=clock)
+    sup.setup()
+    assert sup.mode == "full" and FakeDevice.state() == "active"
+    if damage == "counted":
+        _log_entries(tree, [{"t": clock.wall - 600 + i, "class": "watchdog"} for i in range(3)])
+    else:
+        os.makedirs(tree.paths.boots_log)  # unreadable: fail closed means braked
+    _run_brake_check(sup, clock, tree)
+    assert sup.mode == "braked" and sup.device is None and FakeDevice.state() == "inactive"
+    assert open(tree.paths.kernel_panic_file).read().strip() == "0"
+    sup._reboot(clock.mono, "test")
+    assert not sup.workers.actions["reboot"]
 
 
 def test_the_unit_has_no_execstop_and_the_envelope_settings_tc1052():

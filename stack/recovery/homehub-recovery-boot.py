@@ -182,7 +182,16 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
 
     stamp = rc.read_json(paths.stamp_file)
     already = last_boot == boot_id
-    entries = rc.parse_boots_log(_read_text(paths.boots_log))
+    # FAIL CLOSED (review C4): an existing log that cannot be read or parsed is
+    # NOT an empty history. Nothing is committed, the brake is taken as ON,
+    # kernel.panic stays 0 and the supervisor runs report-only - on a same-boot
+    # re-run exactly as on the first run.
+    try:
+        entries = rc.read_boots_log_strict(paths.boots_log)
+        log_ok = True
+    except rc.AccountingError as exc:
+        entries, log_ok = [], False
+        committed, error = False, "boot accounting unreadable: {}".format(exc)
     proven = os.path.exists(paths.bootstatus_proven_file)
 
     if already:
@@ -204,6 +213,10 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
         record.update({"class": cls, "reason": reason, "previous_boot_id": previous,
                        "bootstatus": bootstatus})
         try:
+            if not committed:
+                # A read already failed: committing on top of a history we could
+                # not read would rewrite it from a partial view.
+                raise OSError(error)
             os.makedirs(paths.state_dir, exist_ok=True)
             os.makedirs(paths.events_dir, exist_ok=True)
             if proven and not os.path.exists(paths.bootstatus_proven_file):
@@ -222,9 +235,13 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
             rc.atomic_write(paths.last_boot_file, (boot_id + "\n").encode("ascii"))
             rc.atomic_delete(paths.stamp_file)
         except OSError as exc:
-            committed, error = False, "accounting could not be committed: {}".format(exc)
+            if committed:
+                committed, error = False, "accounting could not be committed: {}".format(exc)
 
     brake = rc.brake_state(entries, now, cfg.max_recovery_boots, proven)
+    if not log_ok:
+        brake = rc.BrakeState(braked=True, counted_recent=-1, last_counted_utc=None,
+                              detail="UNKNOWN - the accounting could not be read, so braked")
     panic = rc.kernel_panic_value(cfg, committed, brake.braked)
     panic_set = write_kernel_panic(paths, panic)
     record.update({
@@ -243,14 +260,6 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
     # tmpfs: no fsync, and it must be written even when the disk refused.
     rc.atomic_write(paths.boot_json, json.dumps(record, sort_keys=True).encode("utf-8"), durable=False)
     return record, committed
-
-
-def _read_text(path: str) -> str:
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return handle.read()
-    except OSError:
-        return ""
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

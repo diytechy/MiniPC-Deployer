@@ -277,3 +277,44 @@ def test_the_stamp_unit_stops_after_docker_and_before_unmount_tc1060():
     assert lines["Conflicts"] == "shutdown.target" and lines["DefaultDependencies"] == "no"
     assert "local-fs.target" in lines["After"]
     assert lines["ExecStop"].endswith("homehub-recovery-boot.py stamp")
+
+
+# ── review C4: unreadable accounting fails closed ───────────────────────────
+
+
+@pytest.mark.parametrize("damage", ["eio", "corrupt-line", "not-a-record"])
+@pytest.mark.parametrize("rerun", [False, True])
+def test_unreadable_accounting_fails_closed_even_on_a_same_boot_rerun_tc1075(tmp_path, damage, rerun):
+    """A braked boot whose log then becomes unreadable must not release the brake."""
+    tree = _tree(tmp_path)
+    _history(tree, ["recovery", "watchdog"])
+    _stamp(tree, intent={"reason": "stall"})
+    first, committed = _classify(tree, cfg=config())
+    assert committed and first["braked"]
+    if not rerun:
+        # damage before the FIRST classification of a boot instead
+        tree.write(tree.paths.last_boot_file, PREV + "\n")
+    if damage == "eio":
+        os.unlink(tree.paths.boots_log)
+        os.makedirs(tree.paths.boots_log)  # open() raises: the portable stand-in for EIO
+    elif damage == "corrupt-line":
+        with open(tree.paths.boots_log, "a", encoding="utf-8") as handle:
+            handle.write('{"t": 1, "class": "recov\n')
+    else:
+        with open(tree.paths.boots_log, "a", encoding="utf-8") as handle:
+            handle.write('["not", "a", "record"]\n')
+    record, committed = _classify(tree, cfg=config(), now=NOW + 60)
+    assert not committed and "unreadable" in record["error"]
+    assert record["braked"] and record["kernel_panic"] == 0
+    assert open(tree.paths.kernel_panic_file).read().strip() == "0"
+    assert json.load(open(tree.paths.boot_json))["committed"] is False
+    sup = make_supervisor(tree)
+    sup.setup()
+    assert sup.mode == "report-only" and not FakeDevice.instances
+
+
+def test_an_absent_log_is_a_first_install_not_an_error_tc1075(tmp_path):
+    tree = _tree(tmp_path)
+    assert not os.path.exists(tree.paths.boots_log)
+    record, committed = _classify(tree)
+    assert committed and record["error"] == ""

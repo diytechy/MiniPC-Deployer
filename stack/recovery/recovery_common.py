@@ -537,8 +537,61 @@ def brake_state(
     return BrakeState(braked=braked, counted_recent=recent, last_counted_utc=last, detail=detail)
 
 
+class AccountingError(Exception):
+    """boots.log exists but cannot be read or validated. Decisions fail CLOSED."""
+
+
+def read_boots_log_strict(path: str) -> List[dict]:
+    """Every boots.log entry, or AccountingError - never a silently shorter history.
+
+    Contract:
+      Outputs: [] ONLY when the file does not exist (the capability's first
+               install). Any other OSError (EIO, EACCES...), a line that is not
+               JSON, or a line that is not an object with a numeric "t" raises.
+    WHY STRICT (review C4): the lenient reader turned an unreadable log into an
+    EMPTY history, and an empty history is "not braked" - so a disk error
+    released the brake and let the supervisor arm and reboot. Whatever decides
+    the brake reads through here and treats AccountingError as braked and
+    uncommitted.
+    Implements: SR-051, LLR-997, LLR-1009
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        raise AccountingError("cannot read {}: {}".format(path, exc))
+    out = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            raise AccountingError("{} line {} is not JSON".format(path, number))
+        if not isinstance(value, dict) or not isinstance(value.get("t"), (int, float)):
+            raise AccountingError("{} line {} is not a boot record".format(path, number))
+        out.append(value)
+    return out
+
+
+def evaluate_brake(paths: "Paths", cfg: "Config", now_utc: float) -> "BrakeState":
+    """The brake as the durable accounting says it is NOW. Raises AccountingError.
+
+    One home for "read the log and decide", used by the boot classifier and by
+    the running supervisor's periodic re-evaluation (review C9).
+    Implements: SR-051, LLR-997, LLR-1009
+    """
+    entries = read_boots_log_strict(paths.boots_log)
+    proven = os.path.exists(paths.bootstatus_proven_file)
+    return brake_state(entries, now_utc, cfg.max_recovery_boots, proven)
+
+
 def parse_boots_log(text: str) -> List[dict]:
-    """boots.log is JSON lines; a corrupt line is skipped, never fatal."""
+    """boots.log for DISPLAY only (the CLI's status): a corrupt line is skipped.
+
+    Never use this for a decision; read_boots_log_strict is the fail-closed one."""
     out = []
     for line in text.splitlines():
         line = line.strip()

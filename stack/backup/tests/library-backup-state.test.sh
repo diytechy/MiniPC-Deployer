@@ -344,5 +344,55 @@ else
     fail "F2 a failed lastSuccess was masked by the following idle post (rc=$SPLIT_RC)"
 fi
 
+# ── hub recovery C4: the backup slice's exact peak (SR-049) ──────────────────
+# Logged after the backup AND after the verify, from the slice that outlives
+# each --rm container. A diagnostic: an unreadable slice never fails the run.
+mkdir -p "$TMP/slice"
+printf '3221225472\n' >"$TMP/slice/memory.peak"
+FILEBACKUP_SLICE_CGROUP="$TMP/slice" run_wrapper peak "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" = 0 ] \
+   && grep -qF 'filebackup slice memory.peak: 3221225472 bytes (3072 MiB) after backup (exit 0)' "$TMP/peak.out" \
+   && grep -qF 'memory.peak: 3221225472 bytes (3072 MiB) after shallow verify (exit 0)' "$TMP/peak.out"; then
+    pass "TC-1064 the slice's memory.peak is logged after the backup and after the verify"
+else
+    fail "TC-1064 slice peak not logged (rc=$RUN_RC): $(grep 'memory.peak' "$TMP/peak.out" | tr '\n' '|')"
+fi
+FILEBACKUP_SLICE_CGROUP="$TMP/no-such-slice" run_wrapper nopeak "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && grep -qF 'filebackup slice memory.peak: unavailable' "$TMP/nopeak.out"; then
+    pass "TC-1064 an unreadable slice is reported and does not fail the run"
+else
+    fail "TC-1064 an unreadable slice changed the run (rc=$RUN_RC)"
+fi
+
+# ── hub recovery §8: staging left by an interrupted run refuses, NAMED ────────
+# Temp predates two recovery events; the one that names the backup is chosen
+# over the later one that does not, and an event older than Temp is ignored by
+# its MTIME even though its name sorts last.
+mkdir -p "$TMP/changes/Temp" "$TMP/events"
+printf 'staged\n' >"$TMP/changes/Temp/only-copy"
+touch -d '2026-10-01 00:00:00' "$TMP/changes/Temp"
+printf '{"action": "kill", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261005T010203Z-bbbbbbbb-kill.json"
+printf '{"action": "restart-ssh", "details": {}}\n' >"$TMP/events/20261005T020000Z-bbbbbbbb-restart-ssh.json"
+printf '{"action": "reboot", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
+touch -d '2026-09-01 00:00:00' "$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
+RECOVERY_EVENTS_DIR="$TMP/events" run_wrapper staging "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" != 0 ] \
+   && grep -qF 'LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event 20261005T010203Z-bbbbbbbb-kill)' "$TMP/staging.out" \
+   && ! grep -q '^docker:' "$TMP/staging.events" \
+   && [ "$(success_count "$TMP/staging.capture")" = 0 ] \
+   && [ "$(cat "$TMP/changes/Temp/only-copy")" = staged ]; then
+    pass "TC-1065 staging left by an interrupted run refuses with the recovery event that named the backup, and Temp is untouched"
+else
+    fail "TC-1065 staging refusal rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/staging.events"): $(grep 'REFUSED' "$TMP/staging.out" | head -2 | tr '\n' '|')"
+fi
+RECOVERY_EVENTS_DIR="$TMP/no-events" run_wrapper staging2 "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" != 0 ] \
+   && grep -qF 'LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event none recorded)' "$TMP/staging2.out"; then
+    pass "TC-1065 with no recovery event recorded the refusal says so rather than inventing one"
+else
+    fail "TC-1065 no-event refusal rc=$RUN_RC: $(grep 'REFUSED' "$TMP/staging2.out" | head -1)"
+fi
+rm -rf "$TMP/changes/Temp"
+
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

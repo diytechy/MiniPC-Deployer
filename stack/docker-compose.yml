@@ -647,6 +647,22 @@ services:
     image: filebackup:${FILEBACKUP_IMAGE_TAG}
     profiles: ["filebackup"]
     user: "65532:65532"
+    # ITS OWN CGROUP, SO ITS PEAK IS MEASURED EXACTLY (hub recovery C4, SR-049).
+    # Under Docker's systemd driver every `compose run --rm` container of this
+    # service lands in homehub.slice/homehub-filebackup.slice, a static slice
+    # unit firstboot enables. The slice outlives each throwaway container, so
+    # library-backup.sh reads its memory.peak after the run - the peak since
+    # boot across runs, an UPPER bound for any one run. The recovery supervisor
+    # scans this slice as well as system.slice, so the move does not take the
+    # backup out of its victim set.
+    cgroup_parent: homehub-filebackup.slice
+    # A memory ceiling, OFF by default (0 = no limit, the behaviour before this
+    # knob existed). memswap_limit is set EQUAL on purpose: a limit that let the
+    # container spill the rest into swap would turn an OOM kill of this one
+    # container into the whole-box thrash the limit exists to prevent. Sized
+    # from the slice's measured peak (P2), never guessed.
+    mem_limit: ${FILEBACKUP_MEM_LIMIT:-0}
+    memswap_limit: ${FILEBACKUP_MEM_LIMIT:-0}
     read_only: true
     network_mode: none
     cap_drop:

@@ -571,6 +571,49 @@ probe_write "$FB_CHANGES"
 probe_write "$FB_STATE"
 probe_write "$FB_LOGS"
 
+# ── 5b. STAGING LEFT BY AN INTERRUPTED RUN (hub recovery §8, D8) ─────────────
+# FileBackup stages a set in <change root>/Temp and removes it as the run ends.
+# A run killed from outside - the recovery supervisor's early kill, a graceful
+# recovery reboot, a power cut - leaves Temp behind, and FileBackup itself then
+# refuses every later run until a person recovers it (its README, "A run
+# refuses because `Temp` exists"). Temp may hold the only copy of superseded
+# data, so NOTHING here touches it.
+#
+# What this adds is the SIGNAL, said here where it is cheap and named: which
+# recovery event interrupted the run, so the Owner is not left reconstructing it
+# from a container log. Until FileBackup can recover killed staging by itself
+# (D8, which gates the reboot tier), this line is the honest alert; the NagLight
+# lane cannot show it yet (design §8, P5). WHEN FileBackup GAINS SELF-RECOVERY
+# THIS REFUSAL MUST GO, or it would block the very recovery it waits for.
+#
+# The event is the newest recovery evidence file written after Temp was, and one
+# that names the backup (`"interrupts_backup": true`) is preferred over one that
+# merely happened since. No event at all says so rather than inventing one.
+RECOVERY_EVENTS_DIR="${RECOVERY_EVENTS_DIR:-/var/lib/homehub-recovery/events}"
+staging_recovery_event() {
+    local temp="$1" named="" any="" f
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        any="$f"
+        if grep -q '"interrupts_backup": true' "$f" 2>/dev/null; then named="$f"; fi
+    done < <(find "$RECOVERY_EVENTS_DIR" -maxdepth 1 -name '*.json' -newer "$temp" 2>/dev/null | sort || true)
+    f="${named:-$any}"
+    if [ -n "$f" ]; then
+        f="$(basename "$f")"
+        printf '%s' "${f%.json}"
+    else
+        printf 'none recorded'
+    fi
+}
+if [ -d "$FB_CHANGES/Temp" ]; then
+    _interrupted_by="$(staging_recovery_event "$FB_CHANGES/Temp")"
+    log "LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event $_interrupted_by)"
+    refuse "FileBackup's staging folder $FB_CHANGES/Temp is still present from an interrupted run." \
+           "FileBackup would refuse this run itself; it may hold the only copy of superseded data, so it is" \
+           "left exactly as it is. Recover it by hand per FileBackup's README, \"A run refuses because \`Temp\` exists\"," \
+           "then start the backup again. Recovery evidence: homehub-recovery events"
+fi
+
 if [ "$PREFLIGHT_ONLY" = 1 ]; then
     log "--preflight-only: every check passed and NOTHING was started."
     log "  degraded notes: ${DEGRADED:-none}"
@@ -620,6 +663,28 @@ fb_run() {
 count_snapshots() {
     find "$FB_CHANGES" -mindepth 1 -maxdepth 1 -type d -name 'Snapshot_*' 2>/dev/null | grep -c . || true
 }
+
+# log_slice_peak WHEN — the backup's exact memory peak (hub recovery C4).
+# The filebackup service runs under homehub-filebackup.slice (compose
+# cgroup_parent), and the SLICE's cgroup outlives each `--rm` container, so its
+# memory.peak is still readable after the run. It is the peak since boot ACROSS
+# runs: an upper bound for this one, never a lower one - which is the direction
+# a memory limit must be sized from. A diagnostic, so it can never fail the run.
+FILEBACKUP_SLICE_CGROUP="${FILEBACKUP_SLICE_CGROUP:-}"
+log_slice_peak() {
+    local cg="$FILEBACKUP_SLICE_CGROUP" peak=""
+    if [ -z "$cg" ]; then
+        cg="$(systemctl show -p ControlGroup --value homehub-filebackup.slice 2>/dev/null || true)"
+        [ -z "$cg" ] || cg="/sys/fs/cgroup$cg"
+    fi
+    [ -z "$cg" ] || peak="$(cat "$cg/memory.peak" 2>/dev/null || true)"
+    case "$peak" in
+        ''|*[!0-9]*)
+            log "filebackup slice memory.peak: unavailable ($1; ${cg:-homehub-filebackup.slice is not active}) - firstboot step 6g installs the slice" ;;
+        *)
+            log "filebackup slice memory.peak: $peak bytes ($(( peak / 1048576 )) MiB) $1 - the peak since boot across runs, an upper bound for this one" ;;
+    esac
+}
 SNAPSHOT_BEFORE="$(count_snapshots)"
 run_state backing-up
 
@@ -633,6 +698,7 @@ log "7-Zip level for compressed files: FILEBACKUP_7Z_LEVEL=${FILEBACKUP_7Z_LEVEL
 log "running: docker compose --profile filebackup run --rm -T filebackup backup"
 BACKUP_RC=0
 fb_run backup || BACKUP_RC=$?
+log_slice_peak "after backup (exit $BACKUP_RC)"
 SNAPSHOT_AFTER="$(count_snapshots)"
 SNAPSHOT_MADE=no
 [ "${SNAPSHOT_AFTER:-0}" -gt "${SNAPSHOT_BEFORE:-0}" ] && SNAPSHOT_MADE=yes
@@ -686,6 +752,7 @@ if [ "$VERIFY_RUN" != none ]; then
     run_state verifying
     VERIFY_RC=0
     fb_run "${VERIFY_ARGS[@]}" || VERIFY_RC=$?
+    log_slice_peak "after $VERIFY_RUN verify (exit $VERIFY_RC)"
     # The RESTORE-SIDE code table (SR-040), which is a different table from the
     # backup one above and is shared with reconstruct.sh:
     #   0 complete · 1 incomplete/content · 2 usage or precondition ·

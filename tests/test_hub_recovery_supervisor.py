@@ -219,6 +219,34 @@ def test_an_unidentified_container_is_skipped_not_guessed_tc1049(tmp_path):
     assert any("unidentified" in s for s in choice.skipped)
 
 
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "unreadable", "no-name", "no-hostconfig"])
+def test_a_protected_container_with_damaged_metadata_is_never_chosen_tc1074(tmp_path, damage):
+    """Review C5: caddy's metadata DIRECTORY exists but its identity cannot be read."""
+    tree = Tree(tmp_path)
+    tree.container(1, "caddy", 6 * GiB)
+    tree.container(2, "jellyfin", 1 * GiB)
+    meta = os.path.join(tree.paths.docker_containers_dir, cid(1))
+    config_file = os.path.join(meta, "config.v2.json")
+    if damage == "missing":
+        os.unlink(config_file)
+    elif damage == "corrupt":
+        tree.write(config_file, '{"Name": "/caddy", "Config": ')
+    elif damage == "unreadable":
+        # A directory where the file should be: open() raises an OSError, the
+        # portable stand-in for EIO.
+        os.unlink(config_file)
+        os.makedirs(config_file)
+    elif damage == "no-name":
+        tree.write(config_file, json.dumps({"Name": "", "Config": {"Labels": {}}}))
+    else:
+        os.unlink(os.path.join(meta, "hostconfig.json"))
+    inventory = rc.read_inventory(tree.paths.docker_containers_dir)
+    assert cid(1) not in inventory, "a blank or partial identity was invented"
+    choice = rc.choose_victim(rc.scan_container_scopes(tree.paths.cgroup_root), inventory, ("caddy",))
+    assert choice.victim.container_id == cid(2)
+    assert any("unidentified" in s for s in choice.skipped)
+
+
 def test_the_backup_slice_is_still_in_the_victim_set_tc1049(tmp_path):
     """C4 moves filebackup under homehub.slice; it must not leave L1's reach."""
     tree = Tree(tmp_path)

@@ -690,12 +690,25 @@ def read_inventory(containers_dir: str) -> Dict[str, ContainerInfo]:
     for cid in ids:
         if not re.fullmatch(r"[0-9a-f]{64}", cid):
             continue
-        cfg = read_json(os.path.join(containers_dir, cid, "config.v2.json")) or {}
-        host = read_json(os.path.join(containers_dir, cid, "hostconfig.json")) or {}
-        labels = (cfg.get("Config") or {}).get("Labels") or {}
+        # NO VALID METADATA, NO ENTRY (review C5). A missing, corrupt or
+        # unreadable config.v2.json used to become a ContainerInfo with an
+        # EMPTY name, which no protect entry can match - so a protected
+        # container whose metadata read failed became a candidate victim.
+        # Omitted here, the chooser treats it as unidentified and skips it.
+        cfg = read_json(os.path.join(containers_dir, cid, "config.v2.json"))
+        host = read_json(os.path.join(containers_dir, cid, "hostconfig.json"))
+        if cfg is None or host is None:
+            continue
+        name = cfg.get("Name")
+        config_block = cfg.get("Config")
+        if not isinstance(name, str) or not name.strip("/") or not isinstance(config_block, dict):
+            continue
+        labels = config_block.get("Labels") or {}
+        if not isinstance(labels, dict):
+            continue
         policy = (host.get("RestartPolicy") or {}).get("Name") or "no"
         out[cid] = ContainerInfo(
-            name=str(cfg.get("Name") or "").lstrip("/"),
+            name=name.lstrip("/"),
             service=str(labels.get("com.docker.compose.service") or ""),
             restart=str(policy),
             auto_remove=bool(host.get("AutoRemove")),

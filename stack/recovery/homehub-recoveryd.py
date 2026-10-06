@@ -136,7 +136,8 @@ class MemoryStateMachine:
 
     def observe(self, now: float, psi: Optional[float]) -> List[str]:
         out: List[str] = []
-        if self._last is not None and now - self._last > GAP_SECONDS:
+        gap = self._last is not None and now - self._last > GAP_SECONDS
+        if gap:
             out.append("gap")
         self._last = now
         measured = psi is not None
@@ -149,6 +150,12 @@ class MemoryStateMachine:
                 self._clear_since, self._clear_count = None, 0
                 out.append("episode-open")
             return out
+        # "60 s of CONSECUTIVE MEASURED calm" (§3.1): an unreadable sample or a
+        # scheduling gap is not calm, so it breaks the streak. Counting the
+        # unmeasured interval would let 10 s of calm plus 50 s of nothing close
+        # an episode and throw away its reboot clock (review C8).
+        if gap or not measured:
+            self._clear_since, self._clear_count = None, 0
         if measured:
             self.samples.append((now, pressured))
             if pressured:

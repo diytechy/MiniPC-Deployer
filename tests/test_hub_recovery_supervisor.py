@@ -125,6 +125,29 @@ def test_sixty_seconds_of_measured_calm_clears_tc1048():
     assert "clear" in out and sm.state == recoveryd.NORMAL and sm.t0 is None
 
 
+def test_unmeasured_time_and_gaps_break_the_calm_streak_tc1073():
+    """Review C8: 15 s of calm, then 50 s unmeasured, then calm, is NOT 60 s of calm."""
+    sm = machine()
+    sm.observe(0, 90)
+    t, out = feed(sm, 0, 15, 5)
+    t, out = feed(sm, t, 50, None)
+    assert "clear" not in out, "unreadable PSI was counted as calm"
+    t, out = feed(sm, t, 60, 5)  # calm at 70..125: 55 s since the streak restarted
+    assert "clear" not in out, "the streak did not restart after the unmeasured stretch"
+    t, out = feed(sm, t, 5, 5)
+    assert "clear" in out
+    # A scheduling gap breaks it the same way.
+    sm2 = machine()
+    sm2.observe(0, 90)
+    t, _ = feed(sm2, 0, 15, 5)
+    out = sm2.observe(t + 50, 5)
+    assert out == ["gap"], "a gap was counted as calm"
+    t, out = feed(sm2, t + 50, 55, 5)
+    assert "clear" not in out
+    _, out = feed(sm2, t, 5, 5)
+    assert "clear" in out
+
+
 def test_a_wall_clock_jump_changes_nothing_tc1048(tmp_path):
     """NTP stepping the wall clock by an hour mid-episode must not kill."""
     tree, clock = Tree(tmp_path), FakeClock()

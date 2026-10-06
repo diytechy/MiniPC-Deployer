@@ -17,7 +17,11 @@
 #                                 gains network aliases so the client resolves
 #                                 the vhost names to Caddy
 #   ddns        real Cloudflare -> DISABLED (profile sim-disabled): zero calls
-#   aux (kuma/dozzle) LAN_IP binds -> DISABLED (out of V1 gate scope)
+#   aux (kuma/dozzle) -> DISABLED (out of V1 gate scope)
+#   admin-auth  htpasswd materialised by firstboot -> the committed fixture
+#                 sim/admin-auth/htpasswd.sim (simadmin / simpass); image pinned
+#                 by SIM_ADMIN_AUTH_IMAGE_TAG, because the sim's oauth2-proxy
+#                 pin (v7.6.0) predates --trusted-proxy-ip and refuses to start
 #   + dex        NEW sim-only mock OIDC provider (2 static users)
 #   + simclient  NEW sim-only probe box (dig/curl/jq) the gate execs into
 
@@ -60,6 +64,21 @@ services:
     volumes: !override
       - ../sim/oauth2-proxy/authenticated-emails.sim.txt:/etc/oauth2-proxy/authenticated-emails.txt:ro
 
+  # ── admin-auth: the admin portal's one login, with a committed fixture ───────
+  # Every flag is the REAL service's (base file). Two deltas only:
+  #   - the credential: on the box firstboot writes admin-auth/htpasswd from
+  #     .env; the sim mounts a fictional bcrypt of "simpass" for `simadmin`
+  #     (the same fixture hash the old basic_auth sites used);
+  #   - the image tag: the base file reuses OAUTH2_PROXY_IMAGE_TAG, which the sim
+  #     still pins at v7.6.0 for the Dex login path, and v7.6.0 rejects
+  #     --trusted-proxy-ip ("unknown flag", measured). admin-auth therefore runs
+  #     the production pin, SIM_ADMIN_AUTH_IMAGE_TAG.
+  admin-auth:
+    image: quay.io/oauth2-proxy/oauth2-proxy:${SIM_ADMIN_AUTH_IMAGE_TAG}
+    volumes: !override
+      - ../sim/admin-auth/htpasswd.sim:/etc/admin-auth/htpasswd:ro
+      - ./admin-auth/templates:/etc/admin-auth/templates:ro
+
   # ── Caddy: internal CA + vhost aliases so the client resolves them to Caddy ──
   caddy:
     # The real stack publishes the wall kiosk port bound to LAN_IP; that address
@@ -82,6 +101,10 @@ services:
           - ${ACTUAL_SUBDOMAIN}.${DOMAIN}
           - dns.${DOMAIN}
           - ${DOMAIN}
+          # the admin portal (Caddyfile.sim): sign-in host + two gated sites
+          - admin.${DOMAIN}
+          - actual.admin.${DOMAIN}
+          - dns.admin.${DOMAIN}
       # Second leg on the fixed-subnet network, so the gate can dial Caddy from a
       # KNOWN source address (see the simlan network comment at the bottom).
       simlan:

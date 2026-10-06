@@ -1,0 +1,9 @@
+---
+# Read from inside the container: CPU and memory are the host's; `disk: /` is
+# the filesystem holding docker's data, since that is where this container's
+# root lives. No search widget (the skeleton's) — nothing on this page should
+# send what is typed into it to a third party.
+- resources:
+    cpu: true
+    memory: true
+    disk: /

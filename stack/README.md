@@ -10,19 +10,27 @@ Services (all health-checked, all `restart: unless-stopped`):
 - **Technitium DNS** — split-horizon LAN DNS + recursion + ad-blocklists; its
   HTTP API is the health/config surface.
 - **Caddy** — reverse proxy + automatic TLS (valid on the LAN via split-horizon).
-  `basic_auth` guards the single-user services (Actual, the DNS console) only.
+  Every management UI sits under `*.admin.<domain>` behind **one admin login**
+  (`admin-auth`, below); every site but the tracker and the game relay is
+  LAN + tunnel only (`@lan` gate, 403 default). See §8.
+- **admin-auth** — the admin portal's login: a second oauth2-proxy in password
+  mode, in front of Homepage, Uptime-Kuma, Dozzle, the Technitium console and
+  Actual. Its cookie is scoped to `.admin.<domain>`, so the tracker never sees it.
 - **oauth2-proxy** — Google sign-in in front of the tracker subdomain (D1/D2);
   forwards verified identity headers to the tracker container.
 - **tracker** — the **NagLight** web container (`naglight:local`), multi-user via
   trusted headers (D3).
-- **Actual Budget** — finances on its own subdomain, behind `basic_auth`.
+- **Actual Budget** — finances, at `actual.admin.<domain>` behind the admin
+  login (and its own server password).
 - **ddns** — Cloudflare dynamic-DNS updater (qmcgaw/ddns-updater): keeps the
   apex + wildcard A records pointed at the home IP, checked every
   `DDNS_PERIOD` (default 5m). Replaces the legacy DDNS-Cloudflare-PowerShell
   scripts on Mini-serv (WI-9 Q4). Needs a NEW scoped Cloudflare token — the
   old share token is rotation-flagged (see `.env.example`).
-- **Uptime-Kuma · Dozzle · (ntfy)** — auxiliary LAN-only observability
-  (WI-10.11); see §8.
+- **Uptime-Kuma · Dozzle · Homepage** — the admin portal's tools,
+  loopback-published and reached through Caddy (WI-10.11, ADMIN_PORTAL_PLAN);
+  see §8. **(ntfy)** — optional self-hosted push, a household app at
+  `ntfy.<domain>`.
 - **Finance-Auditor** — the daily finance audit pipeline (SR-014/IF-004):
   triggers Actual's bank sync, runs the audit rules, posts a de-identified
   status to the tracker. **Profile-gated** (`finance-auditor` in
@@ -50,9 +58,16 @@ placeholders only — no secrets. Copy `.env.example` → `.env` and fill it in;
 stack/
   docker-compose.yml          the services, health-checked, restart:unless-stopped
   .env.example                every knob (domains, LAN IP, tokens, data-repo remote, image tags)
-  caddy/Caddyfile             reverse proxy; oauth2-proxy for tracker, basic_auth for actual/dns
+  caddy/Caddyfile             reverse proxy; oauth2-proxy for tracker, the admin login for *.admin.<domain>
+  caddy/fail2ban/             the jail that bans repeated wrong admin passwords (DOCKER-USER)
   oauth2-proxy/
     authenticated-emails.txt.example   allow-list template (real file gitignored)
+  admin-auth/
+    templates/sign_in.html    the admin sign-in page (password form, no dead provider button)
+    htpasswd.example          credential template; the real htpasswd is written by firstboot, gitignored
+  homepage/                   the admin landing page's config, mounted read-only (every file required)
+  dns-console/                the tcp/5380 fence that keeps Technitium's console to loopback + Caddy
+  cockpit/                    cockpit.socket drop-in: Cockpit on 127.0.0.1 only
   mosquitto/
     mosquitto.conf              MQTT broker config (tier-2 homeassistant/mosquitto profiles, §9)
   tracker/
@@ -153,7 +168,8 @@ Fill in at minimum:
 | `DOMAIN` | your public apex (e.g. `example.tld`) |
 | `LAN_IP` | the hub's LAN IP — **give it a DHCP reservation** at this address |
 | `ACME_EMAIL` | email for Let's Encrypt |
-| `ACTUAL_BASICAUTH_HASH` / `DNS_BASICAUTH_HASH` | `docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpass'` |
+| `ADMIN_AUTH_USER` / `ADMIN_AUTH_HASH` | the admin sign-in; the hash is `docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpass'` (double every `$` in `.env`) |
+| `ADMIN_AUTH_COOKIE_SECRET` | `openssl rand -base64 32 \| tr -- '+/' '-_'` — a different value from the tracker's |
 | `TECHNITIUM_ADMIN_PASSWORD` | strong password (set on Technitium's first start) |
 | `OAUTH2_PROXY_CLIENT_ID` / `_SECRET` | from your Google OAuth client (**Owner manual step**, below) |
 | `OAUTH2_PROXY_COOKIE_SECRET` | `openssl rand -base64 32 \| tr -- '+/' '-_'` |
@@ -198,7 +214,8 @@ the OAuth client (needs the Owner's Google account — an agent cannot):
 
 Actual **owns the SimpleFIN relationship** (Finance-Auditor, when it lands,
 only *triggers* Actual's sync — it never talks to banks). After first
-bring-up: open `https://actual.<domain>`, set Actual's server password, then
+bring-up: open `https://actual.admin.<domain>`, sign in to the admin portal,
+set Actual's server password, then
 link SimpleFIN under its bank-sync settings. The credential is stored
 **server-side in the `actual_data` volume** — never in `.env`, never in git.
 It survives every container update and comes back from the SR-013 volume
@@ -285,7 +302,8 @@ bash provision/healthcheck.sh --env .env
 
 ```sh
 dig @<HOMEHUB_LAN_IP> tracker.<domain> +short          # expect the hub's LAN IP
-curl -s "http://<HOMEHUB_LAN_IP>:5380/api/dashboard/stats/get?token=<TOKEN>" | head
+# Technitium's API is fenced to loopback + Caddy (stack/dns-console/), so ask it ON the box:
+ssh hub@<HOMEHUB_LAN_IP> 'curl -s "http://127.0.0.1:5380/api/dashboard/stats/get?token=<TOKEN>" | head'
 bash provision/healthcheck.sh --env .env            # all-in-one from the box
 ```
 
@@ -334,32 +352,77 @@ a day or two, then pick the secondary DNS. Track:
 
 ---
 
-## 8. Auxiliary observability (LAN-only, WI-10.11)
+## 8. The admin portal — management UIs behind one login (WI-10.11, ADMIN_PORTAL_PLAN)
 
-Three optional management UIs, each **published bound to `LAN_IP` only** — they
-are reachable from the LAN but are **not** proxied through Caddy and **not**
-forwarded by the router. Do not add public Caddy sites for them.
+**The rule (P1, 2026-09-25):** a browser-only management UI publishes on
+`127.0.0.1` only and is reached through a Caddy site under `*.admin.<domain>`,
+behind **one** admin login. Every admin site is `@lan`-gated with a 403 default
+(P2) — that gate, not the router, keeps them off the internet. It replaced the
+old rule ("bind `LAN_IP`, do not add Caddy sites"), whose raw LAN ports were the
+weaker door: Dozzle's had no login at all.
 
-| Service | Default URL | Purpose |
+| Site | What | Its own login behind the admin one? |
 |---|---|---|
-| Uptime-Kuma | `http://<LAN_IP>:3001` | generic up-checks (can POST to NagLight `/api/feed`) |
-| Dozzle | `http://<LAN_IP>:8081` | live container log viewer (docker socket, read-only) |
-| ntfy | `http://<LAN_IP>:8090` | **optional** self-hosted push — opt-in |
+| `https://admin.<domain>` | the sign-in page, then **Homepage** (profile `homepage`) with a status dot per tool | no — the admin login is its only credential |
+| `https://kuma.admin.<domain>` | Uptime-Kuma | yes (D-A2) |
+| `https://logs.admin.<domain>` | Dozzle — live container logs | **no** — the admin login is its only credential |
+| `https://dns.admin.<domain>` | Technitium's console | yes |
+| `https://actual.admin.<domain>` | Actual Budget | yes (its server password) |
 
-ntfy is behind a compose **profile**, so it starts only when asked:
+- **One sign-in covers all five.** The cookie (`__Secure-homehub_admin`, 168h)
+  is scoped to `.admin.<domain>`, so the tracker and the game relay never
+  receive it. A wrong password is a 401 in Caddy's access log, which the
+  `caddy-guarded` fail2ban jail bans on.
+- **The old names** `actual.<domain>` and `dns.<domain>` redirect to the new
+  ones for one release, then go. A browser that cached a basic_auth credential
+  for the old name keeps replaying it; close those tabs.
+- **Kuma's push path** (`GET /api/push/<token>`) is the one route in the admin
+  zone that needs no sign-in: the wall panel's heartbeat cannot sign in. Make
+  the push token 32 characters when you create the monitor, and build Kuma's
+  monitors against **container names**, not the LAN IP.
+- **Every name needs its label in `EXTRA_SUBDOMAINS`** (`admin kuma.admin
+  logs.admin dns.admin actual.admin`), or split-horizon has no record for it.
 
-```sh
-docker compose --profile ntfy up -d
-```
+### When Caddy is the thing that is broken: the SSH fallback
 
-All ports are configurable in `.env` (`UPTIMEKUMA_PORT`, `DOZZLE_PORT`,
-`NTFY_PORT`); each has a healthcheck that has been **run against its pinned
-image** (2026-08-01). Do not "simplify" the Uptime-Kuma or Dozzle probes back
-into a `wget`/`CMD-SHELL` one-liner: kuma ships no `wget` and Dozzle is
-distroless (no shell at all), which is exactly why both sat permanently red
-until 2026-08-01. Each now runs the probe binary its own image provides — see
-`docs/status.md`, entry "2026-08-01". The WI-10.14 lesson generalises: check
-what a probe tool actually exists in the image before writing a healthcheck.
+Each tool is published on the hub's loopback, so an SSH tunnel reaches it with
+Caddy down. From the laptop (see REMOTE_MANAGEMENT.md for the key):
+
+| Service | Command | Then open |
+|---|---|---|
+| Dozzle | `ssh -L 8081:127.0.0.1:8081 hub@homehub` | `http://localhost:8081` |
+| Uptime-Kuma | `ssh -L 3001:127.0.0.1:3001 hub@homehub` | `http://localhost:3001` |
+| Technitium | `ssh -L 5380:127.0.0.1:5380 hub@homehub` | `http://localhost:5380` |
+| Homepage | `ssh -L 3002:127.0.0.1:3002 hub@homehub` | `http://localhost:3002` |
+| Actual | `ssh -L 5006:127.0.0.1:5006 hub@homehub` | `http://localhost:5006` |
+| Cockpit | `ssh -L 9090:127.0.0.1:9090 hub@homehub` | `https://localhost:9090` |
+
+Ports follow `DOZZLE_PORT`, `UPTIMEKUMA_PORT`, `HOMEPAGE_PORT` and `ACTUAL_PORT`
+in `.env`. Technitium's console answers on every interface (it is
+host-networked), so `stack/dns-console/` fences tcp/5380 to loopback and the
+pinned `admin` network — one REJECT per address family, above Tailscale's
+`ts-input` jump, re-asserted after every tailscaled start and every ~2 min, with
+an ntfy alert on drift. A failed fence does **not** stop Technitium (D-A5): it
+is the household resolver.
+
+### Healthchecks
+
+Each tool's healthcheck has been **run against its pinned image** (2026-08-01).
+Do not "simplify" the Uptime-Kuma or Dozzle probes back into a
+`wget`/`CMD-SHELL` one-liner: kuma ships no `wget` and Dozzle is distroless (no
+shell at all), which is exactly why both sat permanently red until 2026-08-01.
+Each now runs the probe binary its own image provides — see `docs/status.md`,
+entry "2026-08-01". The WI-10.14 lesson generalises: check what a probe tool
+actually exists in the image before writing a healthcheck. `admin-auth` has no
+container healthcheck for the same reason as `oauth2-proxy` (distroless); if it
+is down, every gated site answers 502 — it fails closed.
+
+### ntfy and the household apps
+
+ntfy is optional and profile-gated (`ntfy` in `COMPOSE_PROFILES`). It is a
+household app, not an admin tool: like Immich, Jellyfin and Navidrome it gets a
+site **outside** the admin namespace with **no admin login** — their phone and
+TV apps cannot do a web sign-in (§9, Phase B).
 
 ---
 
@@ -372,16 +435,18 @@ explicitly enabled.
 
 | Profile | Service | Access (default) | Purpose |
 |---|---|---|---|
-| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `http://<LAN_IP>:2283` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125, or cap it with `IMMICH_ML_MEM_LIMIT` |
+| `immich` (+`immich-ml`) | Immich (+DB+Redis) | `https://photos.<domain>`; `http://<LAN_IP>:2283` until `IMMICH_BIND_IP=127.0.0.1` | photo backup, Google-Photos-style; ML is a separate heavy profile — leave off on the J4125, or cap it with `IMMICH_ML_MEM_LIMIT` |
 | `photoprism` | PhotoPrism (+MariaDB) | `http://<LAN_IP>:2342` | photo library indexed in place (run at most ONE photo stack) |
-| `jellyfin` | Jellyfin | `http://<LAN_IP>:8096` | movies/TV; library path via `JELLYFIN_LIBRARY_DIR`; QSV `/dev/dri` wired up by firstboot when an iGPU is present |
-| `navidrome` | Navidrome | `http://<LAN_IP>:4533` | music, Subsonic API |
+| `jellyfin` | Jellyfin | `https://jellyfin.<domain>`; `http://<LAN_IP>:8096` until `JELLYFIN_BIND_IP=127.0.0.1` | movies/TV; library path via `JELLYFIN_LIBRARY_DIR`; QSV `/dev/dri` wired up by firstboot when an iGPU is present |
+| `navidrome` | Navidrome | `https://music.<domain>`; `http://<LAN_IP>:4533` until `NAVIDROME_BIND_IP=127.0.0.1` | music, Subsonic API |
+| `ntfy` | ntfy | `https://ntfy.<domain>`; `http://<LAN_IP>:8090` until `NTFY_BIND_IP=127.0.0.1` | self-hosted push; also where host-side alerts go (`HOMEHUB_ALERT_TOPIC`) |
 | `audiobookshelf` | Audiobookshelf | `http://<LAN_IP>:13378` | podcasts + audiobooks |
 | `vaultwarden` | Vaultwarden | **Caddy site only** (HTTPS required) | Bitwarden-compatible passwords |
 | `homeassistant` | Home Assistant | `http://<LAN_IP>:8123` (host net) | home automation (container flavor — no add-on store) |
 | `mosquitto` | Mosquitto | `<LAN_IP>:1883` | MQTT bus for HA; config in `mosquitto/mosquitto.conf` |
 | `syncthing` | Syncthing | `http://<LAN_IP>:8384` | p2p file sync — feeds `MEDIA_ROOT` from phones/PCs |
-| `freshrss` / `mealie` / `homepage` | FreshRSS / Mealie / Homepage | LAN ports in `.env` | RSS · recipes · LAN dashboard |
+| `freshrss` / `mealie` | FreshRSS / Mealie | LAN ports in `.env` | RSS · recipes |
+| `homepage` | Homepage | `https://admin.<domain>` (§8) | the admin portal's landing page |
 | `diun` | diun | logs / ntfy topic | update **notifier** for the pinned images (never auto-updates) |
 
 ### The one service that is NOT in this table: the crossplay relay
@@ -414,9 +479,12 @@ four places — then the build scripts carry it onto the box:
    pins, `MEDIA_ROOT`, and the enable switch **`COMPOSE_PROFILES`**. Compose
    reads `COMPOSE_PROFILES` from `.env`, so firstboot's plain
    `docker compose up -d` brings enabled profiles up at first boot.
-2. **`stack/caddy/Caddyfile`** — uncomment a tier-2 site block to publish that
-   service (each carries its own login; no basic_auth on them).
-3. **`stack/.env` → `EXTRA_SUBDOMAINS`** — one label per uncommented site;
+2. **`stack/caddy/Caddyfile`** — add a site for that service in the gated
+   shape of the household-app sites (`photos.`, `jellyfin.`, `music.`,
+   `ntfy.`: `acme_cloudflare`, `@lan`, 403 default). Do not uncomment a stub
+   as it stands — the stubs predate the `@lan` gate. Each app carries its own
+   login; never put one behind the admin login, which its clients cannot do.
+3. **`stack/.env` → `EXTRA_SUBDOMAINS`** — one label per site;
    provisioning adds the split-horizon A records.
 4. **`vmtest/export-images.sh`** — bakes core+ntfy **plus every profile
    `COMPOSE_PROFILES` names in the `.env` being bundled**. Nothing extra is

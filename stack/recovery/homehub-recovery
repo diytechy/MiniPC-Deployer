@@ -17,7 +17,7 @@ Installed as /usr/local/sbin/homehub-recovery, a SYMLINK into the stack tree:
 it imports recovery_common from beside its real path, and a copy would break
 that import (the panel volume-applier lesson).
 
-Implements: SR-050, SR-051, LLR-1002, LLR-1006
+Implements: SR-050, SR-051, LLR-998, LLR-1001, LLR-1002
 """
 
 from __future__ import annotations

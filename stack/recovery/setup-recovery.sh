@@ -34,6 +34,7 @@
 #
 # Usage: setup-recovery.sh
 # Exit 0 = converged (on or off). 1 = failed. 2 = refused (bad knob).
+# Implements: SR-050, SR-051, LLR-1006
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

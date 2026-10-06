@@ -313,6 +313,24 @@ docker-compose-plugin
 systemd-sysv
 libpam-systemd
 
+# ── the hub recovery capability's fast-spike backstop (C3, SR-050) ──────────
+# earlyoom 1.7 (noble/universe; depends only on libc6, lsb-base and
+# sysvinit-utils, all already in the base). It is INSTALLED on every hub but
+# CONFIGURED AND ENABLED ONLY when HUB_WATCHDOG_ENABLED=true:
+# stack/recovery/setup-recovery.sh writes /etc/default/earlyoom from the
+# HUB_OOM_* knobs and enables it, and on every other boot it DISABLES it, so
+# the feature ships off.
+#
+# THE ONE WINDOW, said rather than hidden: the package's postinst enables its
+# unit, so the FIRST boot of a fresh image runs earlyoom with Debian's defaults
+# for the minutes until firstboot step 6g converges it off. That is a
+# conservative killer (it only acts below 10 % available memory AND 10 % free
+# swap), and it is preferable to the alternative of a package that is missing
+# on the day the knob is turned on - which is what keeping it in
+# packages.optional.list (baked only when HomeHub asks) would mean.
+# A re-export of the baked apt repo is owed with this line (see the header).
+earlyoom
+
 
 # ── NOTHING FOR THE DESKTOP OR ICEDRIVE LIVES HERE ──────────────────────────
 # RULED BY THE OWNER 2026-08-27: this repo ships them OFF. "Deployer I'm okay

@@ -31,6 +31,8 @@ SUITES=(
     "icedrive/tests/profile.test.sh"
     "remote-ui/tests/icedrive-gate.test.sh"
     "ai-cli/tests/ai-cli-guards.test.sh"
+    # The hub recovery converger: disarm-before-disable, drop-ins, device choice.
+    "recovery/tests/setup-recovery.test.sh"
     "autoinstall/wall/tests/occupancy-power.test.sh"
     "autoinstall/wall/tests/audio-switch.test.sh"
     # The echo canceller. SKIPS cleanly on a box with no compiler or no

@@ -463,10 +463,17 @@ def main():
     # today; an entry here is a claim someone has to defend.
     unit_exemptions = set()
     orphan_units = []
-    for unit_dir in (stack / "backup" / "systemd", stack / "samba", stack / "autoinstall"):
+    # stack/recovery joined 2026-10-05 (hub recovery, SR-049..SR-051): six
+    # units installed by firstboot step 6g, one of them only ENABLED by the
+    # knob - the install line is unconditional, so the check holds. `*.slice`
+    # joined with it: homehub-filebackup.slice is a unit like any other, and a
+    # slice nothing installs would leave the backup's peak unmeasured silently.
+    for unit_dir in (stack / "backup" / "systemd", stack / "samba", stack / "autoinstall",
+                     stack / "recovery"):
         if not unit_dir.is_dir():
             continue
-        for unit in sorted(unit_dir.glob("*.service")) + sorted(unit_dir.glob("*.timer")):
+        for unit in (sorted(unit_dir.glob("*.service")) + sorted(unit_dir.glob("*.timer"))
+                     + sorted(unit_dir.glob("*.slice"))):
             if unit.name in unit_exemptions:
                 continue
             if unit.name not in unit_installers:
@@ -612,6 +619,30 @@ def main():
         check(True, "admin portal: caddy's static address, admin-auth's "
               "--trusted-proxy-ip and ADMIN_NET_GATEWAY agree with the pinned "
               "`admin` network", "")
+
+    # 4e. EVERY HOST KNOB A SCRIPT READS IS DECLARED IN .env.example.
+    #
+    # Check 1 covers compose's ${VAR}s, but the host features firstboot and the
+    # stack/*/setup-*.sh scripts switch on are read straight from .env with the
+    # `_env_val NAME` helper, and nothing compared those names to the template.
+    # A knob read and never declared is one no operator can discover, and the
+    # unset-variable defects of 2026-09-18 (TAILSCALE_ENABLED, AI_CLI_ENABLED)
+    # were exactly host knobs. Matched on `_env_val NAME` call sites, so the
+    # helper's own definition (`_env_val() {`) is not a read.
+    host_knob_files = [stack / "autoinstall" / "firstboot.sh"] + sorted(stack.glob("*/setup-*.sh"))
+    host_knobs = {}
+    for path in host_knob_files:
+        for name in re.findall(r"\b_env_val[ \t]+([A-Z][A-Z0-9_]*)\b", load(path)):
+            host_knobs.setdefault(name, path.relative_to(stack).as_posix())
+    undeclared_host = sorted(n for n in host_knobs if n not in keys)
+    check(
+        not undeclared_host,
+        "every host knob read with _env_val is declared in .env.example ({} knobs in {} files)".format(
+            len(host_knobs), len(host_knob_files)
+        ),
+        "host knobs read but NOT declared in .env.example: "
+        + ", ".join("{} ({})".format(n, host_knobs[n]) for n in undeclared_host),
+    )
 
     # 5. wall-panel knob coverage (the .env-example equivalent for image 2).
     wall_dir = stack / "autoinstall" / "wall"

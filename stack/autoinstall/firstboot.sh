@@ -2312,6 +2312,99 @@ if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
     fi
 fi
 
+
+# ── 6g. hub recovery: the always-on record, and the opt-in supervisor ───────
+# (SR-049..SR-051; HomeHub HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md)
+#
+# TWO HALVES, AND ONLY ONE OF THEM IS A KNOB.
+#
+# ALWAYS ON, record-only, whatever HUB_WATCHDOG_ENABLED says (Owner D1): the
+# 30 s `hub-pressure` sample (C1); boot accounting - the late-shutdown stamp
+# and the boot classifier that counts every reboot (C5); a pinned persistent
+# journal and kernel.hung_task_warnings=-1 (C6); and the library backup's own
+# slice, so its memory peak is measured exactly (C4). None of these acts on
+# anything. They exist because the 2026-10-04 wedge left no pressure record, no
+# count of how it ended, and a journal nobody had pinned.
+#
+# OPT-IN: the supervisor that kills, restarts sshd, reboots and drives the
+# hardware watchdog. setup-recovery.sh converges it ON or OFF and is called
+# EITHER WAY, because off is also a state: a knob turned to false must DISARM
+# the timer before anything stops the unit, or the box resets 300 s later.
+# The script does the refusing (a bad knob is exit 2, nothing changed) and
+# reports it here as a WARNING with the reason, never swallowed.
+#
+# Every unit is (re)installed from the payload on every boot, like the other
+# host units this file carries, so a deploy that changed one takes effect.
+if [ -d "$STACK_DIR/recovery" ]; then
+    _rec="$STACK_DIR/recovery"
+    # ISO9660 drops executable bits; the CLI is run by name through its symlink.
+    chmod 0755 "$_rec/homehub-recovery" "$_rec/setup-recovery.sh" 2>/dev/null || true
+    install -m 0644 "$_rec/homehub-pressure-sample.service" /etc/systemd/system/homehub-pressure-sample.service \
+        || log "WARN: could not install homehub-pressure-sample.service"
+    install -m 0644 "$_rec/homehub-pressure-sample.timer"   /etc/systemd/system/homehub-pressure-sample.timer \
+        || log "WARN: could not install homehub-pressure-sample.timer"
+    install -m 0644 "$_rec/homehub-recovery-boot.service"   /etc/systemd/system/homehub-recovery-boot.service \
+        || log "WARN: could not install homehub-recovery-boot.service"
+    install -m 0644 "$_rec/homehub-recovery-stamp.service"  /etc/systemd/system/homehub-recovery-stamp.service \
+        || log "WARN: could not install homehub-recovery-stamp.service"
+    # The supervisor's unit FILE always lands; whether it is ENABLED is the knob's.
+    install -m 0644 "$_rec/homehub-recoveryd.service"       /etc/systemd/system/homehub-recoveryd.service \
+        || log "WARN: could not install homehub-recoveryd.service"
+    install -m 0644 "$STACK_DIR/backup/systemd/homehub-filebackup.slice" /etc/systemd/system/homehub-filebackup.slice \
+        || log "WARN: could not install homehub-filebackup.slice"
+    ln -sfn "$_rec/homehub-recovery" /usr/local/sbin/homehub-recovery \
+        || log "WARN: could not link /usr/local/sbin/homehub-recovery"
+
+    # C6, always on. The journald drop-in only RESTARTS journald when it changed,
+    # so an ordinary boot does not bounce the logger.
+    mkdir -p /etc/systemd/journald.conf.d
+    if ! cmp -s "$_rec/dropins/journald-60-homehub-recovery.conf" /etc/systemd/journald.conf.d/60-homehub-recovery.conf; then
+        install -m 0644 "$_rec/dropins/journald-60-homehub-recovery.conf" /etc/systemd/journald.conf.d/60-homehub-recovery.conf \
+            && { systemctl restart systemd-journald || log "WARN: journald did not restart; the cap applies from next boot"; } \
+            || log "WARN: could not install the journald drop-in"
+    fi
+    install -m 0644 "$_rec/dropins/sysctl-60-homehub-recovery.conf" /etc/sysctl.d/60-homehub-recovery.conf \
+        && { sysctl -q -p /etc/sysctl.d/60-homehub-recovery.conf || log "WARN: hung_task_warnings not applied until next boot"; } \
+        || log "WARN: could not install the hung-task sysctl"
+
+    systemctl daemon-reload || log "WARN: systemctl daemon-reload failed"
+    # The slice must be ACTIVE for its cgroup (and so its memory.peak) to
+    # outlive each --rm backup container.
+    systemctl enable --now homehub-filebackup.slice >/dev/null 2>&1 \
+        || log "WARN: homehub-filebackup.slice not enabled - the backup peak will not be measured"
+    # The stamp unit's ExecStop is the whole point; it only runs if the unit is
+    # active, so start it now on the boot that installs it.
+    systemctl enable --now homehub-recovery-stamp.service >/dev/null 2>&1 \
+        || log "WARN: homehub-recovery-stamp.service not active - this boot's shutdown will read as unexplained"
+    # Classify now on the boot that installs it (idempotent within a boot); it
+    # runs early on its own from the next boot.
+    systemctl enable homehub-recovery-boot.service >/dev/null 2>&1 \
+        || log "WARN: homehub-recovery-boot.service not enabled - reboots will not be counted"
+    systemctl start homehub-recovery-boot.service \
+        || log "WARN: boot accounting did not commit this boot - see journalctl -t homehub-recovery-boot"
+    systemctl enable --now homehub-pressure-sample.timer >/dev/null 2>&1 \
+        || log "WARN: homehub-pressure-sample.timer not enabled - no hub-pressure record"
+    log "hub recovery record (always on): hub-pressure every 30 s, boot accounting, persistent journal"
+
+    HUB_WATCHDOG_ENABLED="$(_env_val HUB_WATCHDOG_ENABLED | tr -d '"')"
+    HUB_WD_TIERS="$(_env_val HUB_WD_TIERS | tr -d '"')"
+    if [ "${HUB_WATCHDOG_ENABLED:-false}" = "true" ]; then
+        log "provisioning the hub recovery supervisor (activated by .env, tiers: ${HUB_WD_TIERS:-contain})…"
+    else
+        log "HUB_WATCHDOG_ENABLED is not true - converging the recovery supervisor OFF."
+    fi
+    if bash "$_rec/setup-recovery.sh" 2>&1 | sed 's/^/  /'; then
+        log "  hub recovery converged. Check: sudo homehub-recovery status"
+    else
+        log "  WARNING: setup-recovery.sh refused or failed - the recovery supervisor is in"
+        log "    whatever state it was in before this boot. Everything else is unaffected."
+        log "    The reason is in the lines above; re-run by hand once fixed:"
+        log "      sudo bash $_rec/setup-recovery.sh"
+    fi
+else
+    log "WARN: no $STACK_DIR/recovery on the payload - no pressure record, no boot accounting."
+fi
+
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"
 # A defect found in step 4b is reported HERE, at the end, and as a NON-ZERO

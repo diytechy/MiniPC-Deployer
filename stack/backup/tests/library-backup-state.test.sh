@@ -102,6 +102,12 @@ cat >"$TMP/mountinfo" <<EOF
 24 22 0:31 / $TMP/src rw,relatime - tmpfs tmpfs rw
 25 22 0:32 / $TMP/backup rw,relatime - tmpfs tmpfs rw
 EOF
+# The guard also asks the kernel whether each mounted device still EXISTS
+# (e32a1b4: a vanished device is a stale mount). 0:31 and 0:32 are fictional, so
+# model them as present; without this every run refused as "stale" and the
+# suite asserted nothing past the preflight.
+mkdir -p "$TMP/sys-dev-block"
+: >"$TMP/sys-dev-block/0:31"; : >"$TMP/sys-dev-block/0:32"
 
 write_config() {
     local target="$1"
@@ -143,7 +149,7 @@ EOF
 run_wrapper() {
     local name="$1" config="$2" verify="$3" backup_rc="$4" verify_rc="$5" http_code="$6"
     : >"$TMP/$name.capture"; : >"$TMP/$name.events"
-    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
+    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
         MOCK_BACKUP_RC="$backup_rc" MOCK_VERIFY_RC="$verify_rc" MOCK_HTTP_CODE="$http_code" \
         LIBRARY_ROOT="$TMP/src" \
         LIBRARY_BACKUP_LOCK="$TMP/$name.lock" \
@@ -164,7 +170,7 @@ phases() { grep -o '"runState":"[a-z-]*"' "$1" 2>/dev/null | sed 's/.*:"//;s/"//
 run_reconcile() {
     local name="$1" lock="$2"
     : >"$TMP/$name.capture"; : >"$TMP/$name.events"
-    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
+    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
         MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src" LIBRARY_BACKUP_LOCK="$lock" \
         MOCK_FB_RUNNING="${MOCK_FB_RUNNING:-}" MOCK_DOCKER_PS_RC="${MOCK_DOCKER_PS_RC:-0}" \
         bash "$WRAPPER" --config "$TMP/good.env" --reconcile-run-state >"$TMP/$name.out" 2>&1
@@ -301,7 +307,7 @@ fi
 # or a SUCCESSFUL preflight strands `starting` on the wall with nothing to
 # withdraw it.
 : >"$TMP/preflight-only.capture"; : >"$TMP/preflight-only.events"
-PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/preflight-only.capture"     EVENTS="$TMP/preflight-only.events" MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/preflight-only.lock"     bash "$WRAPPER" --config "$TMP/good.env" --preflight-only >"$TMP/preflight-only.out" 2>&1
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/preflight-only.capture"     EVENTS="$TMP/preflight-only.events" MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/preflight-only.lock"     bash "$WRAPPER" --config "$TMP/good.env" --preflight-only >"$TMP/preflight-only.out" 2>&1
 PF_RC=$?
 if [ "$PF_RC" = 0 ] && [ "$(post_count "$TMP/preflight-only.capture")" = 0 ]; then
     pass "F5 a successful preflight-only run claims no phase and strands nothing"
@@ -330,7 +336,7 @@ esac
 CURLEOF
 chmod +x "$TMP/bin/curl"
 : >"$TMP/split.capture"; : >"$TMP/split.events"
-PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/split.capture"     EVENTS="$TMP/split.events" MOCK_BACKUP_RC=0 MOCK_VERIFY_RC=0     MOCK_HTTP_CODE=200 MOCK_SUCCESS_CODE=500 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/split.lock"     bash "$WRAPPER" --config "$TMP/good.env" --verify shallow >"$TMP/split.out" 2>&1
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/split.capture"     EVENTS="$TMP/split.events" MOCK_BACKUP_RC=0 MOCK_VERIFY_RC=0     MOCK_HTTP_CODE=200 MOCK_SUCCESS_CODE=500 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/split.lock"     bash "$WRAPPER" --config "$TMP/good.env" --verify shallow >"$TMP/split.out" 2>&1
 SPLIT_RC=$?
 if [ "$SPLIT_RC" != 0 ] && grep -q FATAL "$TMP/split.out"; then
     pass "F2 a failed lastSuccess still fails the unit even when the later idle post succeeds"

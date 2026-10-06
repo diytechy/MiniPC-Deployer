@@ -60,6 +60,11 @@ on every boot, which converges the opt-in half **on or off** from `.env`.
   timer to the shutdown with 300 s and **no** magic close, and systemd's own
   `RebootWatchdogSec=300s` covers the late phase. Worst case from the start of
   an episode to a reset is about 22 minutes; that is a bound, not a prediction.
+  Both timeouts are checked against the device's own `min_timeout`/`max_timeout`
+  **before** it is opened (opening starts it). If arming fails after the open,
+  the device is disarmed and verified stopped before the supervisor falls back
+  to report-only; if it will not stop, it is held and petted and the status is
+  red, because an abandoned timer resets the box.
 - **L5 — panic.** `kernel.panic=10`, unless braked.
 
 Every action leaves a `/dev/kmsg` line (written by the main thread, so it
@@ -81,6 +86,9 @@ held in memory.
   `would-have-killed=<name> (protected)` instead, and every `hub-pressure`
   sample logs them in full, so a pass does not become a blind spot. They keep
   their own memory caps.
+  A container whose Docker metadata cannot be read (missing, corrupt,
+  unreadable) has no identity and is never chosen, because it might be one of
+  them.
 - **It never waits for a backup** (D8). A recovery in the middle of the
   library backup interrupts it; see "The backup" below.
 - **It does not restart anything but sshd**, and it does not touch the panel.
@@ -93,18 +101,36 @@ held in memory.
 sudo homehub-recovery disarm
 ```
 
-writes a one-use authorisation naming **this boot** and **this invocation** of
-the supervisor, then stops it; the supervisor magic-closes the watchdog only
-when it finds that authorisation. **A plain `systemctl stop` or a reboot is not
-a disarm**: the unit has no `ExecStop`, so a stop hands the running timer to the
-shutdown, and with no shutdown coming the board resets 300 s later. A
-`systemctl restart` is fine — the new instance re-arms.
+1. writes a one-use authorisation naming **this boot** and **this invocation**;
+2. asks the supervisor to disarm (SIGUSR1). It disables the card, magic-closes,
+   and acknowledges **ok** only when `/sys/class/watchdog/watchdog0/state`
+   reads `inactive`;
+3. reads that state itself, and **only then** stops the unit, and reads it
+   once more.
+
+Anything short of proof exits non-zero with the supervisor **still running and
+petting** — a failed disarm never leaves an orphaned timer. If the supervisor
+is already dead but its device is still active, `disarm` says so loudly and
+stops the device itself (open, `V`, close, verified; refused if `nowayout` is set).
+
+**A plain `systemctl stop` or a reboot is not a disarm**: the unit has no
+`ExecStop`, and SIGTERM always hands the running timer to the shutdown with
+300 s. A `systemctl restart` is fine in the `full` tier — the new instance
+re-arms — and a replacement that comes up NOT arming (contain, braked,
+report-only) finds its predecessor's timer still active and stops it,
+verified, rather than leave it counting down.
+
+**Setup never restarts a running supervisor.** When a re-run changes anything
+(knob off, `full` → `contain`, a different reset device), it runs the verified
+disarm **before** touching a file and starts the replacement afterwards; if the
+disarm cannot be proven it exits 1 with nothing changed. An unchanged re-run —
+every ordinary boot — leaves the running supervisor alone. `reset-brake`
+replaces it the same way.
 
 To turn the capability off for good: `HUB_WATCHDOG_ENABLED=false` in `.env`,
 then `sudo bash /opt/homehub/stack/recovery/setup-recovery.sh` (firstboot does
-it every boot). That disarms first, refuses to stop a supervisor it could not
-disarm, then disables the unit, removes every drop-in and sets
-`kernel.panic=0`. The always-on record keeps running.
+it every boot): verified disarm, then the unit disabled, every drop-in removed
+and `kernel.panic=0`. The always-on record keeps running.
 
 ## The brake
 
@@ -117,11 +143,16 @@ Three counted boots inside 24 h engage the brake:
 - it **still** kills, restarts sshd and quarantines, none of which can loop the box.
 
 It clears after **24 h with no counted boot** (not when the oldest ages out),
-or at once with `sudo homehub-recovery reset-brake`.
+or at once with `sudo homehub-recovery reset-brake`. The running supervisor
+re-reads the accounting **every 10 minutes**, so a brake that expires is
+noticed without a restart (re-arming only through the range check), and one
+that engages releases the device and sets `kernel.panic=0` at once.
 
-If the boot accounting cannot be **committed** (a full or read-only disk), the
-supervisor runs **report-only** — every decision recorded as `would-have`,
-nothing acted on — because an unwritable disk must not be a way round the brake.
+If the boot accounting cannot be **committed** (a full or read-only disk) **or
+read** (an I/O error, a corrupt line in `boots.log`), the boot is treated as
+braked and the supervisor runs **report-only** — every decision recorded as
+`would-have`, nothing acted on — because a disk fault must not be a way round
+the brake. Only an absent `boots.log` (the first install) is an empty history.
 
 ## D10 — is a power cut counted?
 
@@ -147,7 +178,7 @@ The P4 expiry test is what answers this: after the test reset, run
 | From | Who | How |
 |---|---|---|
 | the supervisor's kill (L1) | `caddy`, `technitium` | `HUB_WD_PROTECT` |
-| earlyoom and the kernel OOM killer | `tailscaled`, `homehub-recoveryd` | `OOMScoreAdjust=-1000` |
+| earlyoom and the kernel OOM killer | `tailscaled`, `homehub-recoveryd` | `OOMScoreAdjust=-1000` — and for a tailscaled already running when the capability is enabled, its live `oom_score_adj` is set and read back before earlyoom may start (earlyoom stays off if that fails) |
 | the same | `sshd`'s listener | OpenSSH sets its own listener to −1000 and puts each session back to the value it inherited (measured on the hub 2026-10-05). **No drop-in is added for `ssh.service`**: a −1000 unit setting would be inherited by every session, making anything run over SSH unkillable. |
 
 ## The backup
@@ -187,7 +218,7 @@ The NagLight backup lane cannot show this yet (P5).
 |---|---|
 | `homehub-recovery status` | mode, health, brake, last boots, quarantined services, the D10 line |
 | `homehub-recovery events [-n N]` | the newest evidence records |
-| `homehub-recovery disarm` | stop it with the watchdog closed |
+| `homehub-recovery disarm` | stop it with the watchdog verified closed |
 | `homehub-recovery reset-brake` | forget the counted boots so far |
 | `homehub-recovery release <service>` | undo a quarantine |
 | `journalctl -t hub-pressure -o cat` | the pressure record |

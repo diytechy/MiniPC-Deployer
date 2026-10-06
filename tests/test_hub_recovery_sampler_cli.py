@@ -4,7 +4,7 @@ The sampler runs against a fake procfs/cgroupfs/Docker tree; the CLI's
 systemctl and docker calls are substituted at its single `_run` seam so a
 test can see exactly what disarm and release ask the system to do.
 
-Implements: TC-1061..TC-1063 (see docs/test/test-cases.csv)
+Implements: TC-1061..TC-1063, TC-1080, TC-1083 (see docs/test/test-cases.csv)
 """
 
 from __future__ import annotations

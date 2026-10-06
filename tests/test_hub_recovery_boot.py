@@ -5,7 +5,7 @@ last-boot, pstore records, the watchdog's bootstatus, kernel.panic and
 /run/homehub-recovery/boot.json are all real files. Only the boot id and the
 clock are chosen by the test.
 
-Implements: TC-1056..TC-1060 (see docs/test/test-cases.csv)
+Implements: TC-1056..TC-1060, TC-1075 (see docs/test/test-cases.csv)
 """
 
 from __future__ import annotations

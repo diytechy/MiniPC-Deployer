@@ -9,7 +9,7 @@ than what it says.
 Grouped as §9 groups them: state machine, victims, kill, threads, shutdown and
 disarm, envelope, evidence. Boot accounting is tests/test_hub_recovery_boot.py.
 
-Implements: TC-1048..TC-1055 (see docs/test/test-cases.csv)
+Implements: TC-1048..TC-1055, TC-1073..TC-1079, TC-1083 (see docs/test/test-cases.csv)
 """
 
 from __future__ import annotations

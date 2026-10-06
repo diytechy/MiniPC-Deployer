@@ -17,6 +17,7 @@ visible in its registry.
 | SR-020, LLR-003, TC-003, IF-012 | B9 — occupancy power in the wall image (SN-015, WSN-018) | 2026-09-09 |
 | SR-021, LLR-005, TC-005, IF-013 | B7 — the AI-usage feeder (SN-016) | 2026-09-09 |
 | SR-022, LLR-006, TC-006, IF-014 | B11 — the weight feeder (SN-016; NagLight's weight-goal need) | 2026-09-09 |
+| SN-046, SR-049..SR-051, LLR-994.., TC-1048.. | the hub hang watchdog / recovery capability (HomeHub `HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md` §12) | 2026-10-05 |
 
 This repo is a **config/infra deliverable** (compose, Caddy, autoinstall,
 provisioning), scaffolded at the **minimum profile** with a **HIGH** decision

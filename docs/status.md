@@ -12,61 +12,76 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-**Review round 1 in progress:** right-base merge `91cd3a2` retains admin portal
-and Tailscale exit-node changes. Optional Postgres missing/stopped now skips
-loudly without aborting other sets or retention; running-dump/daemon failures
-remain fatal. Mock boundary: 10 passed; mock full backup pipeline: 8 PASS 0 FAIL.
-History is not frozen during optional skips; README records retention limits.
-HomeHub review fix `48f6e66`: before/after 188 discovered, 178 passed, 9 failed,
-1 skipped; same expected failures. Final stack/docs checks still pending.
+**2026-10-09 — Sure phase-1 review round 1; active gate G1 unchanged.**
+Right-base merge `91cd3a2` retains the admin portal and Tailscale exit-node
+changes. Review fixes add loud optional-container skips, explicit version pins,
+consistent default hostnames/Caddy logging, and corrected cross-repo and recovery
+contracts. [Sure enablement and source evidence](../stack/sure/README.md) is the
+review artifact. No gate advanced; nothing deployed or pushed. Next: Claude
+re-review, then Owner activation and restore/key-escrow acceptance; FA image dependency blocks rollout.
 
-**2026-10-09 — Sure phase-1 preparation authored; active gate G1 unchanged.**
-Four dormant services, immutable registry pins, LAN own-login proxy/DNS,
-Actual-default bridge knobs, T3 handoff, reporting controls and scheduled logical
-backup are built. [Sure source audit and enablement](../stack/sure/README.md)
-records the contracts and limits. Hats: System/Software/Test Engineer.
-Spine: SR-060..066, LLR-1040..1046, TC-1100..1114, IF-030..034 (Draft).
-Next: Claude code review; Owner activation and restore acceptance remain pending.
-No gate advanced, deployment or push performed.
+**Merge-order blocker:** these FA Compose env mappings must not reach the hub
+until FA's empty-as-absent fix for TRACKER_FEED_USER, SURE_API_KEY, SURE_URL and
+DATA_SOURCE is in the FA image the hub builds. Current FA rejects the blank
+feed user even on Actual. Static wiring/default checks do not prove runtime
+compatibility. No Finance-Auditor file was edited.
 
-Real checks: validate_config.py ALL CONFIG CHECKS PASSED; full pytest **2424
-passed, 30 skipped in 217.86s** (baseline 2411/30); Sure checks 13 passed; new
-mock-Docker Fibonacci backup shell suite **6 PASS 0 FAIL**; check.py --tier smoke
-**RESULT: PASS**, 214 passed / 4 skipped / 2236 deselected. Every touched shell
-file passed bash -n; seven touched shell/Python files verified LF. Trace: 25
-pre-existing orphans, 0 integrity findings, no new orphan. Docs: 0 broken links.
-Standalone flow check still rejects the pre-existing first flow (now diagram2).
-The generic code-map generator scans no src here and has no module-map markers;
-no generated block was hand-edited.
+Review commits: MiniPC merge `91cd3a2`, optional backup skip `faa6f34`, final
+wiring/pins/contracts `9dad6e8`;
+HomeHub `48f6e66` corrects minting/restore dependencies and case-sensitive profile
+handling. The working-copy ending fix produced no content change: requested
+HomeHub files match committed LF/BOM conventions. ExpectedOptionalAbsent keeps
+the generated keys listed because Prep has not run since schema addition;
+reasons now explicitly require removal once Prep has minted them. Optional does
+not suppress that unattended minting. No Prep/mint/export was performed here.
 
-HomeHub commits `91db01e`, `041ba2f`: Pester before **183 discovered / 171
-passed / 11 failed / 1 skipped** (110.07s), after **188 / 176 / 11 / 1**
-(118.67s), same failures. The brief's baseline was wrong by two existing
-failures (admin template mismatch and stale homepage rollback exception).
-Analyzer unchanged: 1 warning + 2 informational; PowerShell parsing and privacy
-gates passed. Other concurrent HomeHub changes and its scratchpad were preserved.
+Final checks: config validation ALL CONFIG CHECKS PASSED; full Python3.12 pytest
+2487 passed / 30 skipped / 8 warnings in210.05s; smoke RESULT: PASS, 229 passed /
+4 skipped / 2284 deselected in7.94s. Targeted Sure pytest 16 passed; mock-Docker
+full backup pipeline 8 PASS 0 FAIL. HomeHub before:
+188 discovered / 178 passed / 9 failed / 1 skipped in107.59s; after identical
+counts in108.44s; final committed-stack after-check again 178/9/1 in108.3s.
+The earlier two extra failures were caused by the old local
+MiniPC base, not by a wrong brief: corrected by this merge. Same nine known
+failures (AdminAuthCookieSecret; LitellmMasterKey; two LabRunner; five switch
+matrix). ScriptAnalyzer unchanged 1 warning + 2 informational; edited PowerShell
+parses and privacy gates pass. All three touched shells pass bash -n; edited
+shell/Python files are LF. Trace:25 pre-existing orphans / integrity0; docs:
+0 broken links with6 existing orphan-doc warnings. Python3.12 emits8 existing
+Pandora tar extraction deprecation warnings; no test failures.
 
-Additional WSL hermetic-runner attempts were NOT green: first attempt had an
-invalid temporary HOME and reported 519 PASS / 61 FAIL across13 suites; corrected
-temporary HOME attempt still had failures in unchanged library/IceDrive/AI/wall
-suites and hit its 240s bound before a final aggregate. Their causes were not
-investigated. These are not passing evidence; Windows pytest skips the POSIX
-aggregate. The new Sure suite was separately executed successfully with mocks.
+Owner acceptance items (one decision each; source paths are at pinned Sure):
 
-Judgments: upstream actually names Redis latest; retain that tag immutably
-(config version8.10.2). GitHub has no env off switch; loopback hostname override
-blocks the release-note API, unmeasured at runtime. The brief's explicit minimum
-backup-contract authorization was used for the HomeHub postgres/profile helper
-and affected storage docs, correcting the stale library Configs destination to
-backup-drive/config-history. Profile activation must regenerate/incorporate the
-active backup source fragment; it cannot alter installed backup.env by itself.
-Attachments are copied live, without a transaction-aligned snapshot guarantee.
+- Accept `api.github.com` loopback: only the What's new/release-highlight UI loses fetching; no env off switch (pages_controller.rb:90; release_highlights_controller.rb:7; provider/github.rb:18,27,66).
+- Bootstrap first household account then enable invite-only, leaving default-family ID blank to require codes; open is the env default and saved settings win (app/models/setting.rb:201-207,226-236; app/controllers/concerns/invitable.rb:9-17).
+- NEVER ROTATE SECRET_KEY_BASE; preserve exact key through canonical DPAPI store, protected install .env/ISO and existing encrypted-vault export before ledger use; encrypted-column restores require it (config/initializers/active_record_encryption.rb:23-36; HomeHub SECRET_HANDOFF.md).
+- Accept live attachment copies without alignment to the SQL dump; no quiesce is configured (stack/docker-compose.yml sure_storage; existing backup volume source; HomeHub storage-map.md).
 
-**NOT proven:** nothing ran on a hub/panel; no contact, deploy, image pull, real
-Postgres dump, database restore, bank sync, login/invite/API/read-scope test,
-image probe execution, Caddy adaptation/TLS test or telemetry capture. Full
-HomeHub generator/materialisation was not run. No deployment secret was read,
-minted, printed or written. Finance-Auditor remained read-only.
+Judgments/limits: current household Caddy sites are live from day one; no
+profile-to-site gate exists. Sure's site requests a real certificate while its
+profile is off and returns LAN 502; WAN remains 403. Optional missing/stopped
+Postgres skips are explicitly nonfatal, unlike required path/volume missing
+sources: other backups and retention finish. No fresh ledger is claimed. This
+also means history is not frozen; same-day daily replacement/ordinary retention
+can remove prior ledger archives. Preserve a verified archive/key before long
+term disablement. Running dump or Docker query failures remain fatal.
+
+Spine stays Draft: SR-060..066, LLR-1040..1046, TC-1100..1117, IF-030..034;
+review adds TC-1115..1117 for missing/stopped/query-failure boundaries. CSV
+prose corrected line by line; TC-1114 placed in order and edited rows re-read.
+Original full WSL hermetic attempts were NOT green (unrelated unchanged suites; corrected attempt hit240s). That
+aggregate was not proven; the Sure mock pipeline ran independently in Ubuntu.
+Python3.8 cannot run imported upstream Tailscale tests using Path.write_text's
+newline parameter. Python3.12 with existing Python3.8 site-packages runs those
+checks (20 passed / 1 skipped); no dependency install or source workaround.
+
+**NOT proven:** hub/panel startup, any actual image executable/probe, TLS/Caddy
+adaptation, own login/invites, bank sync, FA blank handling/API/read scope,
+runtime telemetry absence, real pg_dump or restore, SQL/attachment consistency,
+key escrow/export, or full HomeHub materialisation. Nothing deployed, pulled,
+run in Docker, contacted on a box, pushed, or secret-minted/printed. Classic
+Docker image-store save/load of tag@digest drops RepoDigests; if sure is baked,
+payload loading and digest-reference resolution still require Owner acceptance.
 
 **2026-09-19 — Draft, nine review rounds complete, Owner ratification pending: two LLM lanes, one of which cannot reach a cloud provider (SN-043/SN-044/SR-047 and SR-044's last piece; LLR-985..991; TC-1023..1041).** One OpenAI-compatible proxy with exactly one deployment, no cloud credential and no database, plus a hold hook that waits while the dev PC wakes. Nine rounds with codex gpt-5.6-terra (medium) produced 31 findings; 30 were accepted and one was rejected with the rejection confirmed in a later round.
 

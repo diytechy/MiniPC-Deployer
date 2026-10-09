@@ -254,6 +254,94 @@ def plan(payload: dict, current: dict):
     return missing, stale, same
 
 
+# THE TWO BOOT COPIES, as (payload path, path on the box).
+#
+# THIS LANE NEVER WRITES THESE. firstboot.sh installs both itself (its step 1a),
+# and the lane has no write path to /usr/local/sbin. The report below only says
+# whether they are current. See docs/design/firstboot-boot-copy-refresh-2026-10-09.md.
+BOOT_COPIES = (
+    ("autoinstall/firstboot.sh", "/usr/local/sbin/homehub-firstboot.sh"),
+    ("autoinstall/powertune.sh", "/usr/local/sbin/powertune.sh"),
+)
+BOOT_COPY_MODE = "755"
+
+# One line per boot copy, POSIX sh, run in ONE ssh. Output per path is either
+# `<path>\t<sha256>\t<sha256 of CR-stripped bytes>\t<mode>` or `<path>\tMISSING`.
+# The CR-stripped hash is `sed 's/\r$//'`, the same CRLF->LF rule the Python side
+# applies to the payload, so the two can be compared directly.
+_BOOT_COPY_LINE = (
+    'if [ -f "{d}" ]; then '
+    'printf "{d}\\t%s\\t%s\\t%s\\n" '
+    '"$(sudo -n sha256sum "{d}" | cut -d" " -f1)" '
+    '"$(sudo -n sed \'s/\\r$//\' "{d}" | sha256sum | cut -d" " -f1)" '
+    '"$(sudo -n stat -c %a "{d}")"; '
+    'else printf "{d}\\tMISSING\\n"; fi'
+)
+
+
+def boot_copy_state(expected_sha: str, expected_lf_sha: str,
+                    actual_sha, actual_lf_sha) -> str:
+    """Classify one boot copy from its exact hash and its CR-stripped hash.
+
+    EXACT EQUALITY IS THE ONLY WAY TO BE CURRENT. A CRLF boot copy is genuinely
+    broken - the kernel looks for an interpreter whose name ends in a carriage
+    return - so `stale-line-endings` is a LABEL for the operator, never a pass.
+    """
+    if actual_sha is None:
+        return "missing"
+    if actual_sha == expected_sha:
+        return "current"
+    if actual_lf_sha == expected_lf_sha:
+        return "stale-line-endings"
+    return "stale"
+
+
+def boot_copy_report(target: str, payload: dict):
+    """Read-only: state of each boot copy on the box, or None if the box could not say.
+
+    A diagnostic must not be able to fail the run it reports on, so an ssh or
+    parse failure is returned as None for the caller to warn about, never die().
+    """
+    script = "\n".join(_BOOT_COPY_LINE.format(d=dest) for _rel, dest in BOOT_COPIES)
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", target, script],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    seen = {}
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if parts and parts[0]:
+            seen[parts[0]] = parts[1:]
+    records = []
+    for rel, dest in BOOT_COPIES:
+        got = seen.get(dest)
+        if got is None:
+            return None
+        expected_sha = payload[rel][0]
+        expected_lf = hashlib.sha256(payload[rel][1].replace(b"\r\n", b"\n")).hexdigest()
+        if got == ["MISSING"]:
+            actual_sha = actual_lf = mode = None
+        elif len(got) == 3 and got[0] and got[1]:
+            actual_sha, actual_lf, mode = got[0], got[1], got[2]
+        else:
+            return None
+        state = boot_copy_state(expected_sha, expected_lf, actual_sha, actual_lf)
+        records.append({"path": dest, "expected_sha256": expected_sha,
+                        "actual_sha256": actual_sha, "mode": mode, "state": state})
+    return records
+
+
+def boot_copies_due(result: dict) -> bool:
+    """Report the boot copies unless the delivery is KNOWN to have failed.
+
+    `verified` is None when there was nothing to deliver, which is exactly the
+    incident state (the tree is current, the boot copy is not). `is True` here
+    would skip the report precisely when it is needed, so the gate is `is not
+    False`, as at the `--run-firstboot` gate in main().
+    """
+    return result.get("verified") is not False
+
+
 def safe_paths(todo: list) -> None:
     """Refuse a payload whose paths the remote shell cannot carry safely.
 
@@ -693,6 +781,27 @@ def main() -> int:
                 "updated. Re-run; this tool is idempotent." % len(bad))
         print("deploy-stack: %d file(s) delivered and verified by sha256 on the box."
               % len(todo))
+
+    # BOOT COPIES: VERIFY-ONLY. Read-only, runs even when there was nothing to
+    # deliver (the incident state), and in a dry run. Staleness does not fail the
+    # run: firstboot is the writer, and --run-firstboot below converges them.
+    if boot_copies_due(result):
+        recs = boot_copy_report(args.target, payload)
+        if recs is None:
+            print("deploy-stack: WARNING could not read the boot copies on %s; "
+                  "not reported (informational, does not fail the run)." % args.target)
+            result["boot_copies_error"] = "unreadable over ssh"
+        else:
+            result["boot_copies"] = recs
+            for rec in recs:
+                if rec["state"] == "current":
+                    note = ""
+                    if rec["mode"] != BOOT_COPY_MODE:
+                        note = " (mode %s, expected %s)" % (rec["mode"], BOOT_COPY_MODE)
+                    print("  boot copy current        : %s%s" % (rec["path"], note))
+                else:
+                    print("deploy-stack: boot copy %s: %s - a --run-firstboot will "
+                          "refresh it" % (rec["state"], rec["path"]))
 
     # FIRSTBOOT IS ASKED FOR SEPARATELY, AND IS RUN WHENEVER IT IS ASKED FOR.
     #

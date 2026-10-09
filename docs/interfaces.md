@@ -113,9 +113,8 @@ post to `/api/feed` from this box or the stack; each row cites its code):
 
 - **IF-035** — `Implemented`. The frame-freshness lane,
   `stack/tracker/frame-freshness.sh`: colour `green` or `yellow` only, posted by
-  `docker exec` of the tracker container; `--check` posts nothing, and in
-  `--report` mode exit 0/2 (green/yellow) applies only when the report
-  succeeded — a failed report exits 1 so the unit shows it.
+  `docker exec` of the tracker container; `--check` posts nothing; exit is 0/2 (green/yellow) by band in both
+  modes, and 1 only when `--report` fails to deliver, so the unit shows it.
 - **IF-036** — `Implemented`. The tracker-definitions guard,
   `stack/tracker/tracker-defs-guard.sh`: colour `green`, `yellow` or `red`; a
   failed post changes the exit status only through the unknown-check escalation.

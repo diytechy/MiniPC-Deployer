@@ -1,5 +1,8 @@
 # AWOW AK41 always-on core — deploy stack
 
+Sure's dormant household-finance profile and source audit are documented in
+[sure/README.md](sure/README.md). Actual stays running until a later cutover.
+
 Zero-manual-config, always-on box image for the **AWOW AK41** (Celeron J4125,
 8 GB, x86). Flash a USB → boot the hub → the whole stack comes up on its own.
 Migrated from `life-tracker/deploy/` (WI-10.1); NagLight is now the source of the

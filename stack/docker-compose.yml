@@ -24,6 +24,33 @@
 # invoked by the first-boot systemd unit AFTER `docker compose up -d` — not here,
 # because it talks to Technitium's HTTP API once the container is healthy.
 
+# Sure release e336a285: one Rails environment for web and Sidekiq.
+# Implements: SR-060, SR-062, SR-064, LLR-1040, LLR-1042, LLR-1044.
+x-sure-environment: &sure-environment
+  SELF_HOSTED: "true"
+  SECRET_KEY_BASE: ${SURE_SECRET_KEY_BASE:-}
+  POSTGRES_USER: sure
+  POSTGRES_PASSWORD: ${SURE_DB_PASSWORD:-}
+  POSTGRES_DB: sure_production
+  DB_HOST: sure-postgres
+  DB_PORT: "5432"
+  REDIS_URL: redis://sure-redis:6379/1
+  APP_DOMAIN: ${SURE_SUBDOMAIN}.${DOMAIN}
+  RAILS_FORCE_SSL: "true"
+  RAILS_ASSUME_SSL: "true"
+  # Empty explicit values also override any inherited image defaults.
+  POSTHOG_FEEDBACK_ENABLED: "false"
+  POSTHOG_KEY: ""
+  SENTRY_DSN: ""
+  LANGFUSE_PUBLIC_KEY: ""
+  LANGFUSE_SECRET_KEY: ""
+  LOGTAIL_API_KEY: ""
+  LOGTAIL_INGESTING_HOST: ""
+  SKYLIGHT_AUTHENTICATION: ""
+  # AI stays off: no OPENAI_* keys. Before enabling, route OPENAI_URI_BASE
+  # to the litellm finance lane, NEVER llm-gateway (FA DEC-21 / restructure
+  # sections 3 and 6.2). Keep AI rule actions disabled until that lane answers.
+
 services:
   technitium:
     image: technitium/dns-server:${TECHNITIUM_IMAGE_TAG}
@@ -79,6 +106,7 @@ services:
       LAN_IP: ${LAN_IP}
       TRACKER_HOST: ${TRACKER_SUBDOMAIN}.${DOMAIN}
       ACTUAL_HOST: ${ACTUAL_SUBDOMAIN}.${DOMAIN}
+      SURE_HOST: ${SURE_SUBDOMAIN}.${DOMAIN}
       # The LLM gateway site (SR-043). Joined here from a bare subdomain label,
       # exactly as TRACKER_HOST and ACTUAL_HOST above are, so the wildcard DDNS
       # record already resolves it and no new public name is created.
@@ -464,12 +492,19 @@ services:
       ACTUAL_URL: http://actual:5006
       ACTUAL_SYNC_ID: ${FINANCE_ACTUAL_SYNC_ID}
       ACTUAL_PASSWORD: ${FINANCE_ACTUAL_PASSWORD}
-      # Tracker feed (FA IF-001) — bridge-internal, bearer-token'd. NOTE: in
-      # multi-user tracker mode (D3) direct /api/* posts also need an
-      # X-Forwarded-User header, which FA's feed client does not send yet —
-      # fine single-user; recorded as an FA gap for multi-user boxes.
+      # Preparation only: keep Actual until the later Owner cutover.
+      DATA_SOURCE: ${FINANCE_DATA_SOURCE:-actual}
+      SURE_URL: ${FINANCE_SURE_URL:-http://sure-web:3000}
+      SURE_API_KEY: ${FINANCE_SURE_API_KEY:-}
+      # Header work is dispatched in Finance-Auditor docs/status.md,
+      # "Dispatched from HomeHub" / "Hub side, when this lands"; not merged yet.
+      # The non-secret Google sub is separate from the shared feed token.
+      TRACKER_FEED_USER: ${FINANCE_TRACKER_FEED_USER:-}
       TRACKER_FEED_URL: http://tracker:8787/api/feed
       TRACKER_FEED_TOKEN: ${FINANCE_TRACKER_FEED_TOKEN}
+    networks:
+      - default
+      - sure
     volumes:
       - finance_snapshots:/snapshots          # LAN-only audit artifacts (FA SR-005/006)
       - finance_actual_data:/data/actual      # @actual-app/api cache — persist across restarts
@@ -478,6 +513,98 @@ services:
         condition: service_healthy
       tracker:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Sure household ledger: opt-in preparation beside unchanged Actual.
+  # Implements: SR-060, SR-061, SR-062, LLR-1040..LLR-1042.
+  # All raw ledger/storage/dumps are NEVER-OFFSITE, like finance_snapshots.
+  sure-web:
+    image: ghcr.io/we-promise/sure:${SURE_IMAGE_TAG}
+    container_name: sure-web
+    profiles: ["sure"]
+    environment: *sure-environment
+    # The release-notes provider has no env off switch at this release.
+    # Fail its API connection locally; legitimate bank/price hosts stay usable.
+    extra_hosts: ["api.github.com:127.0.0.1"]
+    volumes:
+      - sure_storage:/rails/storage
+    networks: [default, sure]
+    depends_on:
+      sure-postgres:
+        condition: service_healthy
+      sure-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/up"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    labels: ["diun.enable=true"]
+    restart: unless-stopped
+
+  sure-worker:
+    image: ghcr.io/we-promise/sure:${SURE_IMAGE_TAG}
+    container_name: sure-worker
+    profiles: ["sure"]
+    command: bundle exec sidekiq
+    environment: *sure-environment
+    extra_hosts: ["api.github.com:127.0.0.1"]
+    volumes:
+      - sure_storage:/rails/storage
+    networks: [default, sure]
+    depends_on:
+      sure-postgres:
+        condition: service_healthy
+      sure-redis:
+        condition: service_healthy
+    # Ruby and sidekiq/api ship in Sure; match THIS worker's live heartbeat,
+    # so Redis answering or a different worker cannot make this one healthy.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bundle exec ruby -rsidekiq/api -rsocket -e
+          'exit(Sidekiq::ProcessSet.new.any? { |p| p["hostname"] == Socket.gethostname && Time.now.to_f - p["beat"].to_f < 120 } ? 0 : 1)'
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s
+    labels: ["diun.enable=true"]
+    restart: unless-stopped
+
+  sure-postgres:
+    image: postgres:${SURE_POSTGRES_IMAGE_TAG}
+    container_name: sure-postgres
+    profiles: ["sure"]
+    environment:
+      POSTGRES_USER: sure
+      POSTGRES_PASSWORD: ${SURE_DB_PASSWORD:-}
+      POSTGRES_DB: sure_production
+    volumes:
+      - sure_postgres_data:/var/lib/postgresql/data
+    networks: [sure]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    labels: ["diun.enable=true"]
+    restart: unless-stopped
+
+  sure-redis:
+    image: redis:${SURE_REDIS_IMAGE_TAG}
+    container_name: sure-redis
+    profiles: ["sure"]
+    volumes:
+      - sure_redis_data:/data
+    networks: [sure]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    labels: ["diun.enable=true"]
     restart: unless-stopped
 
   # ── filebackup — the LIBRARY backup, as a ONE-SHOT container (E2 / P1.1) ─────
@@ -1492,6 +1619,10 @@ services:
 # `default` is implicit and unchanged: every service that names no network still
 # lands on it, which is all of them but the two below.
 networks:
+  # The ledger database/cache have no external route. Rails keeps default
+  # egress for legitimate bank/price providers; FA uses only internal HTTP.
+  sure:
+    internal: true
   default:
   # The relay's isolation boundary. Caddy is dual-homed and is the only path in.
   # Do NOT add a second service here without re-reading the gunmaster3-relay
@@ -1545,6 +1676,10 @@ networks:
         - subnet: 172.28.91.0/24
 
 volumes:
+  # Sure ledger and attachments: private, LAN backup drive only.
+  sure_storage:
+  sure_postgres_data:
+  sure_redis_data:
   # rustdesk (SR-045): the hbbs/hbbr KEY PAIR. Not reproducible from the repo -
   # regenerating it invalidates every installed client - so it joins the LOCAL
   # backup set. Never offsite.

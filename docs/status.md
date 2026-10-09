@@ -21,10 +21,16 @@ Built the logical-dump collector using the existing backup common library:
 custom pg_dump, signature and pg_restore TOC checks, restrictive file mode,
 atomic promotion, and no execution during a plan run. Six mock-Docker boundary
 tests passed (failure, empty, invalid, TOC failure, success, plan); this does not
-prove a database restore. Stack/access/bridge drafting is in progress.
+prove a database restore. Authored four profile-gated services with named volumes
+and shipped-tool health probes, internal FA access with Actual defaults retained,
+LAN-only Caddy own-login site, DNS knob, immutable registry pins, reporting
+controls and AI-off comments. GitHub has no env off switch; loopback host override
+blocks its release-note API path. Eleven Sure static/mock tests passed;
+validate_config.py reports ALL CONFIG CHECKS PASSED.
 
-Findings awaiting Owner response: upstream Redis example is `latest`, not a
-numeric version; storage-map.md still describes library Configs while backup.sh
+Findings: upstream Redis example is `latest`, not a numeric version; preserve
+that tag with its verified immutable digest (config version 8.10.2).
+Storage-map.md still describes library Configs while backup.sh
 and backup.env.example use backup-drive/config-history with Fibonacci history.
 Permission requested for the minimum HomeHub generator contract correction.
 HomeHub measured baseline is 183 discovered / 171 passed / 11 failed / 1 skipped,

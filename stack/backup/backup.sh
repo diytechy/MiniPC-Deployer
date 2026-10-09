@@ -994,8 +994,20 @@ for line in "${SOURCE_LINES[@]}"; do
             # Implements: SR-065, LLR-1045.
             chmod 0700 "$stage"
             log "[$name] logical Postgres dump from ${src#postgres:} (LAN-only)"
-            postgres_dump "${src#postgres:}" "$stage/ledger.dump" \
-                || { FAIL_NOTE="logical Postgres dump failed for $name"; false; }
+            dump_rc=0
+            postgres_dump "${src#postgres:}" "$stage/ledger.dump" || dump_rc=$?
+            case "$dump_rc" in
+                0) ;;
+                2)
+                    # This source is optional when its Compose profile is off.
+                    # Unlike required path/volume sources, do not mark the night
+                    # red: other sets and their normal retention must finish.
+                    warn "[$name] SOURCE MISSING, SET SKIPPED: Postgres container ${src#postgres:} absent or stopped; NO fresh ledger backup"
+                    rm -rf "$stage"
+                    continue
+                    ;;
+                *) FAIL_NOTE="logical Postgres dump failed for $name"; false ;;
+            esac
             ;;
         cifs)
             mp="$(mktemp -d)"

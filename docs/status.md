@@ -12,6 +12,14 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**Review round 1 in progress:** right-base merge `91cd3a2` retains admin portal
+and Tailscale exit-node changes. Optional Postgres missing/stopped now skips
+loudly without aborting other sets or retention; running-dump/daemon failures
+remain fatal. Mock boundary: 10 passed; mock full backup pipeline: 8 PASS 0 FAIL.
+History is not frozen during optional skips; README records retention limits.
+HomeHub review fix `48f6e66`: before/after 188 discovered, 178 passed, 9 failed,
+1 skipped; same expected failures. Final stack/docs checks still pending.
+
 **2026-10-09 — Sure phase-1 preparation authored; active gate G1 unchanged.**
 Four dormant services, immutable registry pins, LAN own-login proxy/DNS,
 Actual-default bridge knobs, T3 handoff, reporting controls and scheduled logical

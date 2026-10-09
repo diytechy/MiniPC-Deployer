@@ -208,8 +208,8 @@ source_kind() {
 
 # postgres_dump CONTAINER DESTINATION : collect one logical ledger dump.
 # Contract: Inputs: named running Postgres container and destination file path.
-# Outputs: atomically replaced custom-format dump; 0 on success, 1 on failure.
-# Config: PLAN_ONLY=1 suppresses exec and writes. Container POSTGRES_USER and
+# Outputs: atomically replaced dump; 0 success, 2 absent/stopped, 1 failure.
+# Config: PLAN_ONLY=1 suppresses all Docker queries and writes. POSTGRES_USER and
 # POSTGRES_DB select the database; local socket auth uses no password in argv.
 # Errors: failed/empty/invalid dump or unreadable table of contents leaves the
 # destination untouched. pg_restore --list checks structure, NOT restorability.
@@ -219,6 +219,15 @@ postgres_dump() {
     # Container names are identifiers, not Docker options or source paths.
     [[ "$container" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || return 1
     [ "${PLAN_ONLY:-0}" != 1 ] || return 0
+    # A successful list distinguishes an optional absent container from a broken
+    # daemon/CLI. The exact name filter must not match similarly named services.
+    local state
+    state="$(docker container ls --all --filter "name=^/${container}$" --format '{{.State}}')" || return 1
+    case "$state" in
+        running) ;;
+        ''|created|exited|paused|restarting|removing|dead) return 2 ;;
+        *) return 1 ;;
+    esac
     # The caller supplies a private staging directory; restrictive mode keeps
     # raw finance data away from other local users even while the dump is made.
     (

@@ -224,13 +224,19 @@ sequenceDiagram
         Web-->>Owner: Sure household session
     end
     Note over FA,Web: DATA_SOURCE remains actual; future read-only Sure URL internal
-    Backup->>DB: pg_dump custom format through container exec
-    DB-->>Backup: Logical dump stream
-    alt failed, empty or invalid dump / TOC
+    Backup->>DB: Query exact container name and state
+    alt missing or stopped optional container
+        Backup-->>Backup: Loud SOURCE MISSING, SET SKIPPED; no fresh ledger
+        Backup->>Drive: Continue other sets and ordinary retention (history not frozen)
+    else running container
+        Backup->>DB: pg_dump custom format through container exec
+        DB-->>Backup: Logical dump stream
+    alt Docker query failure, failed, empty or invalid dump / TOC
         Backup-->>Backup: Fail run; no rotation of previous good copy
     else validated structure
         Backup->>Drive: Existing archive + checksums + manifest
         Backup->>Drive: Existing daily/Fibonacci retention
+    end
     end
     Note over Backup,Drive: NEVER-OFFSITE; structural checks are not a restore
 ```

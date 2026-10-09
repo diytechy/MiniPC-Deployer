@@ -11,12 +11,21 @@ done
 TEMP_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEMP_ROOT"' EXIT
 mkdir -p "$TEMP_ROOT/bin" "$TEMP_ROOT/drive"
+mkdir -p "$TEMP_ROOT/fixture"
+printf 'other-set-fixture' >"$TEMP_ROOT/fixture/other.txt"
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); printf 'PASS %s\n' "$*"; }
 fail() { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$*"; }
 cat >"$TEMP_ROOT/bin/docker" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$DOCKER_CALL_LOG"
+if [ "$1" = container ] && [ "$2" = ls ]; then
+    case "$DUMP_MODE" in
+        missing) exit 0 ;;
+        stopped) printf 'exited'; exit 0 ;;
+        *) printf 'running'; exit 0 ;;
+    esac
+fi
 [ "$1" = exec ] || exit 9
 if [ "$2" = -i ]; then
     [ "$3" = sure-postgres ] && [ "$4" = pg_restore ] || exit 9
@@ -40,7 +49,8 @@ BACKUP_DRIVE_DEVICES=""
 NAGLIGHT_FEED_URL=""
 BACKUP_WAKE_MAC=""
 INGEST_SOURCES=""
-BACKUP_SOURCES="sure-ledger=postgres:sure-postgres"
+BACKUP_SOURCES="sure-ledger=postgres:sure-postgres
+other=path:$TEMP_ROOT/fixture"
 ENV
 if bash "$BACKUP" --config "$TEMP_ROOT/backup.env" >"$TEMP_ROOT/good.log" 2>&1; then
     pass 'logical dump joins normal archive pipeline'
@@ -78,5 +88,16 @@ if bash "$BACKUP" --config "$TEMP_ROOT/backup.env" --plan >"$TEMP_ROOT/plan.log"
 else
     fail 'plan never invokes Docker'; cat "$TEMP_ROOT/plan.log"
 fi
+for mode in missing stopped; do
+    export DUMP_MODE="$mode"
+    if bash "$BACKUP" --config "$TEMP_ROOT/backup.env" >"$TEMP_ROOT/$mode.log" 2>&1 \
+        && grep -q 'SOURCE MISSING, SET SKIPPED' "$TEMP_ROOT/$mode.log" \
+        && grep -q 'promoted .*daily/' "$TEMP_ROOT/$mode.log" \
+        && find "$TEMP_ROOT/drive" -name 'other.tar*' | grep -q .; then
+        pass "$mode container skips loudly while other set and retention finish"
+    else
+        fail "$mode soft skip pipeline"; cat "$TEMP_ROOT/$mode.log"
+    fi
+done
 printf '%s PASS %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

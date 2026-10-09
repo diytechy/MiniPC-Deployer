@@ -75,6 +75,13 @@ hand-carried backup configuration; its existing `-Verify` comparison must agree.
 Profile selection alone does not update an already installed backup.env.
 The existing drive/mount preflight and run lock still apply. A failed dump
 fails the run before rotation; the previous good archive remains.
+If the configured Postgres container is missing or stopped, the optional set
+instead logs `SOURCE MISSING, SET SKIPPED` and **NO fresh ledger backup**. Other
+sets and ordinary retention finish. A Docker query failure remains fatal.
+This deliberately differs from required path/volume missing-source verdicts.
+It does not freeze ledger history: normal retention, including replacement of
+the same day's daily, can remove an older ledger archive. Preserve a verified
+ledger archive and its encryption key before disabling Sure long term.
 
 The SSOT target is `/mnt/backup-drive/config-history`, on the LAN backup drive,
 with `daily/` and `fib/` history. This corrects the older storage-map description

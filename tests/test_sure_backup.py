@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 pytestmark = [pytest.mark.full, pytest.mark.smoke]
 
 
-@pytest.mark.parametrize("mode", ["good", "failed", "empty", "invalid", "toc-failed", "plan", "bad-name"])
+@pytest.mark.parametrize("mode", ["good", "failed", "empty", "invalid", "toc-failed", "plan", "bad-name", "missing", "stopped", "daemon-failed"])
 def test_logical_dump_boundary_sr065(tmp_path, mode):
     """A failed or empty dump cannot replace the last good file; plan never execs."""
     bash = shutil.which("bash")
@@ -28,6 +28,15 @@ def test_logical_dump_boundary_sr065(tmp_path, mode):
 set -euo pipefail
 . "$COMMON"
 docker() {
+    if [ "$1" = container ] && [ "$2" = ls ]; then
+        case "$MODE" in
+            missing) return 0 ;;
+            stopped) printf 'exited'; return 0 ;;
+            daemon-failed) return 1 ;;
+            plan) echo 'plan queried Docker' >&2; return 9 ;;
+            *) printf 'running'; return 0 ;;
+        esac
+    fi
     if [ "$1" = exec ]; then
         if [ "${2:-}" = -i ] && [ "${4:-}" = pg_restore ]; then
             cat >/dev/null
@@ -58,6 +67,9 @@ postgres_dump "$container" "$DESTINATION"
         assert actual == b"PGDMPsynthetic-fixture"
     elif mode == "plan":
         assert result.returncode == 0, result.stderr
+        assert actual == b"last-good"
+    elif mode in ("missing", "stopped"):
+        assert result.returncode == 2, result.stderr
         assert actual == b"last-good"
     else:
         assert result.returncode == 1, result.stderr

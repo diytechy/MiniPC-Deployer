@@ -317,6 +317,12 @@ def boot_copy_report(target: str, payload: dict):
         got = seen.get(dest)
         if got is None:
             return None
+        if rel not in payload:
+            # A revision that predates this source has nothing to compare
+            # against; say so rather than raise after a good delivery.
+            records.append({"path": dest, "expected_sha256": None,
+                            "actual_sha256": None, "mode": None, "state": "no-source"})
+            continue
         expected_sha = payload[rel][0]
         expected_lf = hashlib.sha256(payload[rel][1].replace(b"\r\n", b"\n")).hexdigest()
         if got == ["MISSING"]:
@@ -799,6 +805,9 @@ def main() -> int:
                     if rec["mode"] != BOOT_COPY_MODE:
                         note = " (mode %s, expected %s)" % (rec["mode"], BOOT_COPY_MODE)
                     print("  boot copy current        : %s%s" % (rec["path"], note))
+                elif rec["state"] == "no-source":
+                    print("  boot copy not compared   : %s (not in this revision's payload)"
+                          % rec["path"])
                 else:
                     print("deploy-stack: boot copy %s: %s - a --run-firstboot will "
                           "refresh it" % (rec["state"], rec["path"]))

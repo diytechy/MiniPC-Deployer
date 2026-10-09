@@ -442,3 +442,16 @@ def test_boot_copy_report_never_dies_when_the_box_cannot_be_read(monkeypatch):
     monkeypatch.setattr(ds.subprocess, "run", lambda argv, **kw:
                         subprocess.CompletedProcess(argv, 255, "", "denied"))
     assert ds.boot_copy_report("hub@example", payload) is None
+
+
+def test_boot_copy_report_survives_a_payload_without_the_source(monkeypatch):
+    """A revision that predates powertune.sh reports no-source, it does not raise."""
+    fb = b"#!/usr/bin/env bash\necho firstboot\n"
+    payload = {"autoinstall/firstboot.sh": (_sha(fb), fb, True)}
+    lines = ["/usr/local/sbin/homehub-firstboot.sh\t%s\t%s\t755" % (_sha(fb), _sha(fb)),
+             "/usr/local/sbin/powertune.sh\tMISSING"]
+    monkeypatch.setattr(ds.subprocess, "run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 0, "\n".join(lines) + "\n", ""))
+    by = {r["path"]: r for r in ds.boot_copy_report("hub@example", payload)}
+    assert by["/usr/local/sbin/homehub-firstboot.sh"]["state"] == "current"
+    assert by["/usr/local/sbin/powertune.sh"]["state"] == "no-source"

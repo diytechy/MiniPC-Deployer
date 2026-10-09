@@ -534,3 +534,56 @@ def test_sleep_verdict_http_uses_the_production_session_binding_sr044(
             server.shutdown()
             thread.join(timeout=5)
             assert not thread.is_alive(), "HTTP server failed to stop"
+
+
+# --- SR-044: main() wires the session reader; the helper test cannot see it -
+def test_main_wires_the_session_reader_into_the_handler_sr044(monkeypatch):
+    """The HTTP tests above call bind_session_reader themselves, so deleting
+    the call from main() leaves them green. Run main() with its collaborators
+    stubbed and check that the reader it leaves on Handler is the production
+    probe, bound to the configured URL and timeout."""
+    monkeypatch.setenv("DEVPC_HOST", "dev-pc.invalid")
+    monkeypatch.setenv("DEVPC_SESSION_URL", "http://session.invalid/session")
+    monkeypatch.setenv("DEVPC_PROBE_TIMEOUT_SECONDS", "0.25")
+    calls = []
+
+    def read_session(url, timeout):
+        calls.append((url, timeout))
+        return {"attached": False, "observed_at": 1000.0}
+
+    class _Stub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def publish(self, doc):
+            pass
+
+        def serve_forever(self):
+            # main() must return here, so the test never blocks on a socket.
+            return None
+
+    class _Threading:
+        @staticmethod
+        def Thread(*args, **kwargs):
+            return type("_NoThread", (), {"start": lambda self: None})()
+
+    # Register restoration before main() mutates the class.
+    monkeypatch.setattr(dws.Handler, "session_reader", None)
+    monkeypatch.setattr(dws.Handler, "service", None)
+    monkeypatch.setattr(dws.Handler, "publisher", None)
+    monkeypatch.setattr(dws, "read_session", read_session)
+    monkeypatch.setattr(dws, "build_provider", lambda cfg: object())
+    monkeypatch.setattr(dws, "WakeService", _Stub)
+    monkeypatch.setattr(dws, "Publisher", _Stub)
+    monkeypatch.setattr(dws, "threading", _Threading)
+    monkeypatch.setattr(dws, "ThreadingHTTPServer", _Stub)
+
+    dws.main()
+
+    reader = dws.Handler.__dict__["session_reader"]
+    assert isinstance(reader, staticmethod), "reader must be static to bind"
+    # Called through an instance, as GET /sleep-verdict does, it must take no
+    # self argument and must reach the probe with the configured values.
+    assert object.__new__(dws.Handler).session_reader() == {
+        "attached": False, "observed_at": 1000.0}
+    assert calls == [("http://session.invalid/session", 0.25)]

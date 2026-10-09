@@ -204,6 +204,37 @@ source_kind() {
     esac
 }
 
+# postgres_dump CONTAINER DESTINATION : collect one logical ledger dump.
+# Contract: Inputs: named running Postgres container and destination file path.
+# Outputs: atomically replaced custom-format dump; 0 on success, 1 on failure.
+# Config: PLAN_ONLY=1 suppresses exec and writes. Container POSTGRES_USER and
+# POSTGRES_DB select the database; local socket auth uses no password in argv.
+# Errors: failed/empty/invalid dump or unreadable table of contents leaves the
+# destination untouched. pg_restore --list checks structure, NOT restorability.
+# Implements: SR-065, LLR-1045.
+postgres_dump() {
+    local container="$1" destination="$2" partial="$2.partial"
+    [ "${PLAN_ONLY:-0}" != 1 ] || return 0
+    # The caller supplies a private staging directory; restrictive mode keeps
+    # raw finance data away from other local users even while the dump is made.
+    (
+        umask 077
+        if ! docker exec "$container" sh -c \
+            'exec pg_dump --format=custom --no-password --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' >"$partial"; then
+            rm -f -- "$partial"
+            return 1
+        fi
+        # Validate both signature and pg_restore's TOC parsing before promotion.
+        # A successful CLI exit with no output is not a successful backup.
+        if [ ! -s "$partial" ] || [ "$(head -c 5 "$partial")" != PGDMP ] \
+            || ! docker exec -i "$container" pg_restore --list <"$partial" >/dev/null; then
+            rm -f -- "$partial"
+            return 1
+        fi
+        mv -f -- "$partial" "$destination"
+    )
+}
+
 # newest_run_with_set BASE SET : the newest sibling run directory whose MANIFEST
 # actually lists SET, or nothing. Run names are run_%Y%m%d_%H%M%S so a plain
 # sort is chronological (the same assumption retention makes). Read-only.

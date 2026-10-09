@@ -12,6 +12,32 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-09 — Sure phase-1 preparation in progress, active gate G1 unchanged.**
+Owner brief authorizes local implementation on `sure-stack`; Claude review and
+all runtime acceptance remain pending. No gate advanced. Hats: System/Software
+Engineer and Test Engineer. Read-only Sure source is release e336a285.
+
+Built the logical-dump collector using the existing backup common library:
+custom pg_dump, signature and pg_restore TOC checks, restrictive file mode,
+atomic promotion, and no execution during a plan run. Six mock-Docker boundary
+tests passed (failure, empty, invalid, TOC failure, success, plan); this does not
+prove a database restore. Stack/access/bridge drafting is in progress.
+
+Findings awaiting Owner response: upstream Redis example is `latest`, not a
+numeric version; storage-map.md still describes library Configs while backup.sh
+and backup.env.example use backup-drive/config-history with Fibonacci history.
+Permission requested for the minimum HomeHub generator contract correction.
+HomeHub measured baseline is 183 discovered / 171 passed / 11 failed / 1 skipped,
+not the brief's 173 passed / 9 failed. Deployer baseline: 2411 passed, 30 skipped
+in 221.57s; validate_config.py: ALL CONFIG CHECKS PASSED.
+
+**NOT proven:** nothing ran on a box; no hub/panel contact, deployment, image
+pull, bank sync, Sure login/API request, telemetry capture, backup restore or
+real Postgres dump. No secret was read, minted, printed or written.
+
+Next: resolve the two findings, finish the scheduled backup and HomeHub contract,
+record reserved spine rows, run checks and leave local commits for review.
+
 **2026-09-19 — Draft, nine review rounds complete, Owner ratification pending: two LLM lanes, one of which cannot reach a cloud provider (SN-043/SN-044/SR-047 and SR-044's last piece; LLR-985..991; TC-1023..1041).** One OpenAI-compatible proxy with exactly one deployment, no cloud credential and no database, plus a hold hook that waits while the dev PC wakes. Nine rounds with codex gpt-5.6-terra (medium) produced 31 findings; 30 were accepted and one was rejected with the rejection confirmed in a later round.
 
 * **The property this lane exists for was CLAIMED AND WAS FALSE, and that is the finding the whole design turns on.** The first version argued the container could not reach a cloud provider because it holds no cloud credential and names no cloud endpoint. Measured against the pinned digest rather than inferred: the proxy serves 618 routes of which 32 are provider pass-throughs registered independently of `model_list`, and the Vertex handler FORWARDS CALLER-SUPPLIED CREDENTIALS when the proxy has none of its own — its own log line says so. A probe carrying an `x-goog-api-key` made the container open a connection to `aiplatform.l.rep.googleapis.com:443`. **The credential can arrive in the request**, so its absence from the config was never a boundary. The boundary is now `stack/llm-isolation/`, below the application, and `allowed_routes` is documented as defence-in-depth rather than the control.

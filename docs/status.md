@@ -12,6 +12,41 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-09 - `/sleep-verdict` binding fixed in source (SR-044 / LLR-978).**
+On `fix-sleep-verdict-binding`, cut from `IceDrive-DesktopDirection` as requested;
+`sure-stack` is unchanged. `main()` now calls `bind_session_reader(cfg)`, which
+wraps the configured zero-argument session probe in `staticmethod`. The prior
+explanatory comment is retained with an added descriptor-binding explanation.
+Real Handler loopback GET tests cover a fresh detached reading (200 JSON permit)
+and None (200 JSON deny, fail-closed to attached), using the production helper.
+
+Evidence (actual output):
+
+```text
+python -m pytest -q tests/test_devpc_wake.py
+28 passed in 1.09s
+python scripts/validate_config.py
+ALL CONFIG CHECKS PASSED
+mutation: restore the plain lambda assignment, run the two HTTP cases
+2 failed, 26 deselected in 1.21s
+MUTATION CHECK PASS: both HTTP cases reject the original binding TypeError
+python scripts/check.py
+2413 passed, 30 skipped in 218.48s (0:03:38)
+Traceability: SN=33 SR=47 LLR=94 TC=148 orphans=25 integrity=0
+check_docs: OK - 20 doc(s), 66 intra-repo link(s), 0 broken (6 orphan warning(s)).
+RESULT: PASS
+```
+
+The fixed source was restored after mutation. Both changed Python files are LF;
+`git diff --check` passed. README Known defects now records the source fix dated
+2026-10-09. HomeHub is unchanged: FOLLOWUPS A6's Phase 0 TypeError item should
+be marked source-fixed / live verification pending, and A2's earlier wiring
+note should acknowledge the binding correction. No Owner policy decision was
+made. No push or deployment. Active gate remains G1; no gate advanced.
+Next action awaiting Owner authorization: deploy this source fix and verify the
+live endpoint. NOT PROVEN: live hub response, real session-agent integration,
+and physical dev-PC sleep/wake behavior.
+
 **2026-09-19 — Draft, nine review rounds complete, Owner ratification pending: two LLM lanes, one of which cannot reach a cloud provider (SN-043/SN-044/SR-047 and SR-044's last piece; LLR-985..991; TC-1023..1041).** One OpenAI-compatible proxy with exactly one deployment, no cloud credential and no database, plus a hold hook that waits while the dev PC wakes. Nine rounds with codex gpt-5.6-terra (medium) produced 31 findings; 30 were accepted and one was rejected with the rejection confirmed in a later round.
 
 * **The property this lane exists for was CLAIMED AND WAS FALSE, and that is the finding the whole design turns on.** The first version argued the container could not reach a cloud provider because it holds no cloud credential and names no cloud endpoint. Measured against the pinned digest rather than inferred: the proxy serves 618 routes of which 32 are provider pass-throughs registered independently of `model_list`, and the Vertex handler FORWARDS CALLER-SUPPLIED CREDENTIALS when the proxy has none of its own — its own log line says so. A probe carrying an `x-goog-api-key` made the container open a connection to `aiplatform.l.rep.googleapis.com:443`. **The credential can arrive in the request**, so its absence from the config was never a boundary. The boundary is now `stack/llm-isolation/`, below the application, and `allowed_routes` is documented as defence-in-depth rather than the control.

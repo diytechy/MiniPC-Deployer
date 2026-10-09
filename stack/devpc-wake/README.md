@@ -119,22 +119,25 @@ classifies retryability by **substring-matching the message**, so `"503"` and
 
 ## Known defects
 
-**`/sleep-verdict` throws on every call.** In `devpc_wake_service.py`:
+**Fixed in source 2026-10-09: `/sleep-verdict` lambda binding.** The plain
+function assigned to `Handler.session_reader` was bound as a method when
+`self.session_reader()` called it, passing an unwanted `self` and raising
+`TypeError`. Confirmed live on the hub 2026-09-19.
 
-```python
-Handler.session_reader = lambda: read_session(cfg.session_url, cfg.probe_timeout)
-```
+`bind_session_reader(cfg)`, called by `main()`, now wraps the probe in
+`staticmethod(...)`. Real Handler HTTP regression tests use that same helper
+and assert 200 JSON verdicts for a fresh detached body (permit) and an
+unavailable reading (deny, treated as attached). Removing `staticmethod`
+makes both tests fail with the original TypeError.
 
-That assigns a plain function as a **class attribute**, so `self.session_reader()`
-binds it as a method and passes `self` — giving
-`TypeError: <lambda>() takes 0 positional arguments but 1 was given`. It needs
-`staticmethod(...)`. Confirmed live on the hub 2026-09-19.
+This source fix has not been deployed or verified on the hub. It addresses
+Phase 0.1 of the lifecycle plan in `HomeHub`,
+`docs/DEVPC_INFERENCE_STATE_AND_LIFECYCLE_PLAN_2026-09-19.md`.
 
-It is not currently breaking anything: nothing polls that endpoint yet, and with
-`DEVPC_SESSION_URL` empty the verdict fail-closes to "attached" regardless. It
-**is** a prerequisite for the dev-PC sleep agent, so it is Phase 0.1 of the
-lifecycle plan (in the `HomeHub` repo,
-`docs/DEVPC_INFERENCE_STATE_AND_LIFECYCLE_PLAN_2026-09-19.md`).
+**Cross-repo follow-up (HomeHub unchanged):** `FOLLOWUPS.md` A6 still lists
+this TypeError as Phase 0 work; update it to distinguish fixed source from
+pending deployment/live verification. A2's 2026-09-19 session-reader wiring
+note should also mention this subsequent binding correction.
 
 ## Deployment status, 2026-09-19
 

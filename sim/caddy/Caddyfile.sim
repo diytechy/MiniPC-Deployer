@@ -1,28 +1,49 @@
 # Caddyfile.sim — SIM variant of stack/caddy/Caddyfile (WI-10.14).
 #
-# Structurally IDENTICAL to the real Caddyfile (same vhosts, same auth model:
-# tracker -> oauth2-proxy with NO basic_auth; actual + dns -> basic_auth). Only
-# the two things the sim genuinely cannot reproduce differ, and each is a
-# documented REAL↔SIM delta:
+# Structurally the real Caddyfile's auth model: tracker -> oauth2-proxy; the
+# admin portal (*.admin.<domain>) -> ONE admin login via admin-auth, the same
+# (protect_admin) snippet, sign-in route and HSTS as the real file; the old
+# actual./dns. names -> redirects into the admin namespace. Only what the sim
+# genuinely cannot reproduce differs, and each is a documented REAL↔SIM delta:
 #
 #   1. TLS: `local_certs` (Caddy's internal CA) instead of public ACME — a local
 #      box cannot ACME a real public domain. vhost/auth structure is unchanged.
-#   2. dns vhost proxies to `technitium:5380` (a bridge service name here) rather
-#      than `host.docker.internal:5380` — in the sim Technitium is a bridge
+#   2. dns.admin proxies to `technitium:5380` (a bridge service name here) rather
+#      than the admin bridge gateway — in the sim Technitium is a bridge
 #      container, not host-networked.
-#   3. basic_auth credentials are inlined (fictional bcrypt of "simpass") instead
-#      of `{$VAR}` env indirection, so the sim needs no bcrypt-through-env-file
-#      escaping. The credential is a throwaway sim fixture.
+#   3. The admin login's credential is a committed fixture (a fictional bcrypt of
+#      "simpass" for `simadmin`, sim/admin-auth/htpasswd.sim) — see the overlay.
 #   4. the wall kiosk site is NOT host-published (the real stack binds it to
 #      LAN_IP, which is fictional here and unbindable on the WSL host). The gate's
 #      probes reach it over the compose network instead — see the site's banner.
+#   5. NO @lan remote_ip gates and NO throttle. The sim has never carried the
+#      LAN gates (LAN_CIDR is not a sim knob; every probe comes from the compose
+#      bridge), and the throttle needs the rate_limit ordering this file does
+#      not declare. Both are proven by HomeHub's admin-portal harness instead.
+#      Only admin., actual.admin. and dns.admin. are reproduced: Kuma and Dozzle
+#      are disabled in the sim, and Homepage's profile is off (admin. therefore
+#      answers 502 after sign-in, as the real one does with the profile off).
 
 {
     # Internal CA — self-signed roots minted locally; no ACME, no public domain.
     local_certs
 }
 
-# ── tracker.<domain> — NagLight via oauth2-proxy (NO basic_auth) — IDENTICAL ──
+# ── the admin gate — IDENTICAL to the real Caddyfile's snippet ────────────────
+(protect_admin) {
+    forward_auth admin-auth:4180 {
+        uri /oauth2/auth
+        @unauth status 401
+        handle_response @unauth {
+            redir * https://{$ADMIN_HOST}/oauth2/sign_in?rd=https://{hostport}{%uri}
+        }
+    }
+}
+(hsts) {
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}
+
+# ── tracker.<domain> — NagLight via oauth2-proxy (no admin login) — IDENTICAL ─
 {$TRACKER_HOST} {
     encode zstd gzip
     reverse_proxy oauth2-proxy:4180 {
@@ -72,24 +93,46 @@
     }
 }
 
-# ── actual.<domain> — Actual Budget (KEEP basic_auth) — IDENTICAL structure ───
-{$ACTUAL_HOST} {
-    basic_auth {
-        simadmin $2a$14$Y4yRZbFveiGyoGAGNRPhruhFz7N1uIQBs6UI14hYblEEDLol92hj.
+# ── admin.<domain> — the sign-in host (Homepage behind it; profile off here) ─
+admin.{$DOMAIN} {
+    import hsts
+    handle /oauth2/* {
+        @plainrd expression `{http.request.uri.query.rd}.startsWith("http:")`
+        respond @plainrd "sign-in: https only" 400
+        reverse_proxy admin-auth:4180 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+        }
     }
-    encode zstd gzip
+    handle {
+        import protect_admin
+        reverse_proxy homepage:3000
+    }
+}
+
+# ── actual.admin.<domain> — Actual behind the admin login — IDENTICAL shape ───
+actual.admin.{$DOMAIN} {
+    import hsts
+    import protect_admin
     reverse_proxy actual:5006
 }
 
-# ── dns.<domain> — Technitium console (KEEP basic_auth) ───────────────────────
+# ── dns.admin.<domain> — Technitium console behind the admin login ───────────
 # DELTA: sim Technitium is a bridge container -> proxy to `technitium:5380`
-# (real Caddyfile uses host.docker.internal:5380 for the host-net container).
-dns.{$DOMAIN} {
-    basic_auth {
-        simadmin $2a$14$Y4yRZbFveiGyoGAGNRPhruhFz7N1uIQBs6UI14hYblEEDLol92hj.
-    }
-    encode zstd gzip
+# (the real Caddyfile uses {$ADMIN_NET_GATEWAY}:5380 for the host-net container).
+dns.admin.{$DOMAIN} {
+    import hsts
+    import protect_admin
     reverse_proxy technitium:5380
+}
+
+# ── the old names — one-release redirects into the admin namespace ────────────
+{$ACTUAL_HOST} {
+    redir https://actual.admin.{$DOMAIN}{uri}
+}
+dns.{$DOMAIN} {
+    redir https://dns.admin.{$DOMAIN}{uri}
 }
 
 # ── apex — bare domain answers on-LAN too — IDENTICAL ─────────────────────────

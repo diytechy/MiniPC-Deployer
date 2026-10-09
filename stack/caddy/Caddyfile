@@ -5,31 +5,47 @@
 # the hostname never changes, the public cert Caddy obtains via ACME validates on
 # the LAN too — no cert warnings, no internal hostname.
 #
-# AUTH MODEL (WI-10.2, decisions D1/D2):
-#   - tracker.<domain>  -> oauth2-proxy (Google sign-in). NO basic_auth on this
-#     host; oauth2-proxy is the gate and forwards verified identity headers
-#     (X-Forwarded-Email / X-Forwarded-User) to the tracker container.
-#   - actual.<domain>, dns.<domain>, map.<domain> -> KEEP basic_auth (the Owner's
-#     single-user services; oauth2-proxy is only for the multi-user tracker).
+# AUTH MODEL (WI-10.2 D1/D2; the admin portal, ADMIN_PORTAL_PLAN P1-P4, 2026-09-25):
+#   - tracker.<domain>  -> oauth2-proxy (Google sign-in). oauth2-proxy is the
+#     gate and forwards verified identity headers (X-Forwarded-Email /
+#     X-Forwarded-User) to the tracker container. Unchanged.
+#   - *.admin.<domain>  -> ONE admin login (the `admin-auth` container, a second
+#     oauth2-proxy in password mode) in front of Homepage (admin.), Kuma,
+#     Dozzle, Technitium and Actual. It replaced per-site basic_auth, because a
+#     browser scopes basic_auth to one origin: five sites meant five prompts. A
+#     cookie can span them, and it is scoped to .admin.<domain> so the tracker
+#     and the public game relay never receive it. For Kuma, Technitium and
+#     Actual it is defence in depth in front of their own logins; for Dozzle
+#     and Homepage it is the ONLY credential (P4).
+#   - photos. jellyfin. music. ntfy. -> NO admin login. Their phone and TV apps
+#     cannot complete a web sign-in, so each app's own login is the gate.
+#   - EVERY site above except the tracker is `@lan remote_ip {$LAN_CIDR}` with a
+#     403 default (P2). That gate — not the router — keeps them off the
+#     internet, which is why none of this depends on the router forward.
 #
-#   - {$WALL_HOST}:{$WALL_PORT} -> the office-wall kiosk site (SR-016). A THIRD
-#     auth model: no interactive login at all, identity injected by source IP.
-#     Read the block's own banner before touching it — it is security-critical.
+#   - {$WALL_HOST}:{$WALL_PORT} -> the office-wall kiosk site (SR-016). No
+#     interactive login at all, identity injected by source IP. Read the block's
+#     own banner before touching it — it is security-critical.
+#   - {$GAME_HOST} -> the crossplay relay, public BY RULING, behind a secret
+#     path. {$LLM_GATEWAY_HOST} -> @lan plus the gateway's own bearer key.
 #
 # Env vars (set in docker-compose.yml from .env):
 #   {$DOMAIN} {$LAN_IP} {$TRACKER_HOST} {$ACTUAL_HOST} {$ACME_EMAIL} {$MAIN_BOX_IP}
-#   {$ACTUAL_BASICAUTH_USER} {$ACTUAL_BASICAUTH_HASH}
-#   {$DNS_BASICAUTH_USER} {$DNS_BASICAUTH_HASH}
-#   {$WALL_HOST} {$WALL_PORT} {$PANEL_IP} {$PANEL_USER_SUB}
+#   {$LAN_CIDR} {$CLOUDFLARE_API_TOKEN} {$ADMIN_HOST} {$ADMIN_NET_GATEWAY}
+#   {$WALL_HOST} {$WALL_PORT} {$PANEL_IP} {$PANEL_USER_SUB} {$PANEL_ACCESS_ENABLED}
 #   {$GAME_HOST} {$GAME_WS_SECRET}
 #   {$LLM_GATEWAY_HOST}
 
 {
     # WHERE rate_limit SITS IN THE CHAIN, and it is the whole point of the
     # directive. `rate_limit` is a plugin handler, so it has no place in the
-    # built-in directive order and would otherwise run AFTER basic_auth - i.e.
-    # only for callers who already authenticated, which is precisely backwards
-    # for a brute-force guard. Before, not after.
+    # built-in directive order and would otherwise run AFTER the auth
+    # directives - i.e. only for callers who already authenticated, which is
+    # precisely backwards for a brute-force guard. Before, not after.
+    #
+    # No site uses basic_auth any more (the admin portal replaced it), but it is
+    # still a built-in directive and still the anchor: everything that matters
+    # here — forward_auth, respond, reverse_proxy — comes after it.
     #
     # IF CADDY REFUSES TO LOAD NAMING THIS LINE, the directive was renamed;
     # `basic_auth` is the 2.7+ spelling and `basicauth` the old alias. Validate
@@ -142,36 +158,50 @@
     }
 }
 
-# ── shared snippets: one basic_auth guard per single-user service ─────────────
-# Caddy resolves {$VAR} at config-load, so a single (protect) snippet can't carry
-# two different credential pairs; give each guarded host its own snippet.
+# ── the admin gate: one login for every *.admin.<domain> site ─────────────────
+# ADDED 2026-09-25 (ADMIN_PORTAL_PLAN §4.1), replacing the two per-site
+# basic_auth snippets. Proven by HomeHub's scripts/verify/admin-portal-harness/
+# (47 checks against the hub's real Kuma, Dozzle and Technitium), and this is
+# that harness's snippet with only the upstream changed to the container name.
 #
-# WHY THE PREFIX NAMES THE SITE AND NOT THE SERVER (the Owner asked, 2026-08-29:
-# "is DNS_BASICAUTH_USER used for caddy?"). Yes - BOTH pairs are Caddy's own
-# basic_auth, and neither is the credential of the thing behind it. The prefix
-# names WHICH DOOR the pair opens, because there are two independent pairs and
-# they have to stay distinguishable. Behind each one sits a SECOND, different
-# credential that Caddy knows nothing about:
+# Caddy asks admin-auth `/oauth2/auth` about every request (forward_auth). A 2xx
+# lets the request through to the site's handler; a 401 — not signed in —
+# becomes a redirect to the sign-in page carrying the original URL.
 #
-#   actual.<domain>  Caddy basic_auth ->  Actual's own server password
-#                    (ACTUAL_BASICAUTH_*)  (FinanceActualPassword). Actual has no
-#                                          concept of a username, which is why the
-#                                          username field belongs to the BROWSER
-#                                          dialog and not to Actual.
-#   dns.<domain>     Caddy basic_auth ->  Technitium's admin login
-#                    (DNS_BASICAUTH_*)     (TechnitiumAdminPassword)
-#
-(protect_actual) {
-    basic_auth {
-        {$ACTUAL_BASICAUTH_USER} {$ACTUAL_BASICAUTH_HASH}
+#   * `{%uri}`, NEVER `{uri}`. The escaped form keeps the original query's `&`
+#     and `=` from being read as parameters of the sign-in URL (harness U3: a
+#     real sign-in lands back on /dash?a=1&b=2 intact).
+#   * ONLY 401 becomes a redirect. Anything else from /oauth2/auth — a 403, or
+#     502 when admin-auth is down — goes back to the caller as it is, so an
+#     outage fails CLOSED instead of looping (harness T10: 502).
+#   * NO identity headers are copied upstream. None of these tools reads one,
+#     which keeps the header-ordering trap described at (wall_api_false) out of
+#     play. If Dozzle's forward-proxy auth mode is ever adopted, it applies in
+#     full.
+#   * The upstream DOES receive the admin cookie (Caddy cannot remove one cookie
+#     and keep the rest). That is why every app behind this gate is counted as
+#     inside the admin trust zone (P4).
+(protect_admin) {
+    forward_auth admin-auth:4180 {
+        uri /oauth2/auth
+        @unauth status 401
+        handle_response @unauth {
+            redir * https://{$ADMIN_HOST}/oauth2/sign_in?rd=https://{hostport}{%uri}
+        }
     }
-    import throttle
 }
-(protect_dns) {
-    basic_auth {
-        {$DNS_BASICAUTH_USER} {$DNS_BASICAUTH_HASH}
-    }
-    import throttle
+
+# HSTS on every *.admin.<domain> site, and NEVER on the bare domain.
+#
+# It is the real defence against the one downgrade the sign-in route cannot
+# see: oauth2-proxy honours an `rd=http://…` target when it arrives in the
+# sign-in form's POST body (harness: asserted as a known gap). After one HTTPS
+# visit a browser never makes the plain-HTTP hop again. includeSubDomains is
+# correct only because every name under admin. is HTTPS-only by design. On the
+# bare domain it would commit every present and future name under it to HTTPS
+# for a year, and not every device that might one day get a name speaks it.
+(hsts) {
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 }
 
 # -- the throttle, and an honest account of what it does and does not buy ------
@@ -181,13 +211,12 @@
 # missing when Caddy refuses to load this block.
 #
 # 120 EVENTS A MINUTE IS NOT A BRUTE-FORCE LIMIT AND IS NOT PRETENDING TO BE.
-# basic_auth guards the whole site, so EVERY request carries an auth attempt: one
-# page load of Actual is dozens of them. A limit tight enough to stop guessing
-# would break the app for the person who knows the password. What this stops is
-# flooding and scraping; what stops GUESSING is fail2ban, which keys on 401s
-# specifically and bans at the firewall, and the remote_ip gate below, which takes
-# these two hosts off the internet altogether. Three layers, three jobs - and this
-# is the only one of the three that still applies to a caller already on the LAN.
+# Imported on admin.<domain>'s /oauth2/* (the sign-in route) and on the game
+# relay. What it stops is flooding and scraping; what stops GUESSING is
+# fail2ban, which keys on 401s specifically — a wrong admin password is one —
+# and bans at the firewall, and the @lan gate, which takes the admin sites off
+# the internet altogether. Three layers, three jobs - and this is the only one
+# of the three that still applies to a caller already on the LAN.
 #
 # key {remote_host} is the REAL peer address, matching the remote_ip discipline
 # below. It must never become a header-derived value.
@@ -223,8 +252,11 @@
 # -- the access log fail2ban reads ---------------------------------------------
 # JSON, to a bind-mounted path the HOST can read (docker-compose.yml mounts
 # /var/log/caddy). The fail2ban filter keys on status 401 plus request.remote_ip.
-# Only the guarded sites import this: an access log of every kiosk asset would
-# bury the handful of lines that matter.
+# Only admin.<domain> (where a wrong admin password is a 401) and the LLM
+# gateway import this: an access log of every kiosk asset would bury the
+# handful of lines that matter. The other admin sites deliberately do NOT: they
+# turn "not signed in" into a 302 before logging, so they have no 401s to give,
+# and kuma.admin's push route carries its token in the path.
 (access_log) {
     log {
         output file /var/log/caddy/access.log {
@@ -375,42 +407,201 @@
     }
 }
 
-# ── actual.<domain> — Actual Budget (single-user; KEEP basic_auth) ─────────────
-{$ACTUAL_HOST} {
-    import acme_cloudflare
-    import access_log
-    encode zstd gzip
+# ══ THE ADMIN PORTAL — *.admin.<domain> (ADMIN_PORTAL_PLAN §4, P1-P4) ════════
+# Five sites, one login. Each is wrapped the same way, and every part of the
+# wrapping is load-bearing:
+#
+#   import acme_cloudflare   without it a new name falls back to http-01, which
+#                            cannot succeed here (the snippet's banner says why).
+#                            Two-label names under admin. issue by dns-01 like
+#                            any other — measured on the hub, precondition 3.
+#   @lan remote_ip {$LAN_CIDR} / 403 default
+#                            the gate that keeps these off the internet (P2). A
+#                            WAN caller is refused before any login exists for
+#                            it to attack. remote_ip, NEVER client_ip — the rule
+#                            the wall block states at length: client_ip trusts
+#                            X-Forwarded-For and would hand the allow-list to
+#                            anyone willing to forge a header. The names DO
+#                            resolve publicly (the DDNS wildcard answers any
+#                            label), so this gate is the protection, not DNS.
+#   import hsts              see the snippet.
+#   import protect_admin     the one login, on everything except the sign-in
+#                            route itself and Kuma's push path.
+#
+# NO `encode` on these, as the harness ran them: Dozzle's log stream is
+# server-sent events and gains nothing from compression but buffering.
+#
+# THE BLOCKS BELOW ARE THE HARNESS'S, VERBATIM, apart from these production
+# substitutions: `import acme_cloudflare` for `tls internal`; container names
+# for LAN addresses; the real Homepage and Actual for the `respond` stand-ins;
+# Kuma's push route matching GET alone (the harness allowed GET and POST to
+# assert that Kuma itself refuses POST). Change them only with the harness.
 
-    # LAN/VPN ONLY (the Owner, 2026-08-29: "ideally actual only answers from the
-    # local network or vpn"). The router forwards :80/:443 to this box, so before
-    # this block Actual answered an unlimited-guess basic_auth prompt to the whole
-    # internet - in front of budget data and, once linked, a SimpleFIN bank-sync
-    # credential.
-    #
-    # THIS DOES NOT COST A CERTIFICATE, which is what makes it safe to do:
-    # issuance is dns-01 through Cloudflare, so Let's Encrypt never needs to reach
-    # this box. The kiosk site has been LAN-only WITH a public cert since OI-12;
-    # this is the same arrangement, one host over.
-    #
-    # remote_ip, NEVER client_ip - the same rule the wall block states at length.
-    # client_ip trusts X-Forwarded-For and would hand the allow-list to anyone
-    # willing to forge a header. Caddy is the edge here; remote_ip is the truth.
-    #
-    # LAN_CIDR defaults to `private_ranges` (every RFC1918 block), which is the
-    # honest expression of "LAN or VPN, not the internet" and will cover a
-    # WireGuard subnet on the day D5 lands without another edit. Narrowing it
-    # answers a DIFFERENT question - which devices ON the LAN - and basic_auth is
-    # what answers that one.
+# ── admin.<domain> — the sign-in host, and Homepage behind it ───────────────
+admin.{$DOMAIN} {
+    import acme_cloudflare
+    # THE ONLY ADMIN SITE THAT LOGS, because it is the only one that can emit a
+    # 401: a wrong password here is one (harness T3), and the unchanged
+    # caddy-guarded fail2ban filter matches it (harness: against a real line).
+    import access_log
+    import hsts
     @lan remote_ip {$LAN_CIDR}
     handle @lan {
-        import protect_actual
+        # The sign-in, callback and sign-out routes. NOT behind protect_admin —
+        # this IS the gate.
+        handle /oauth2/* {
+            # Flood control, as everywhere in this file; guessing is fail2ban's.
+            import throttle
+            # Refuse a sign-in link whose `rd` would send the browser back over
+            # plain HTTP. It only sees the QUERY STRING: the form posts `rd` in
+            # the body, where Caddy cannot look, so HSTS (above) is what closes
+            # that case. This stops a crafted link, which is the easy one.
+            @plainrd expression `{http.request.uri.query.rd}.startsWith("http:")`
+            respond @plainrd "sign-in: https only" 400
+            reverse_proxy admin-auth:4180 {
+                # admin-auth builds its redirects from these, and trusts them
+                # ONLY from this Caddy's pinned address (--trusted-proxy-ip).
+                header_up X-Real-IP {remote_host}
+                header_up X-Forwarded-Proto {scheme}
+                header_up X-Forwarded-Host {host}
+            }
+        }
+        handle {
+            import protect_admin
+            # Homepage (profile `homepage`). With the profile off, a signed-in
+            # visitor gets 502 here — the visible shape of a disabled profile.
+            reverse_proxy homepage:3000
+        }
+    }
+    handle {
+        respond "admin: LAN only" 403
+    }
+}
+
+# ── kuma.admin.<domain> — Uptime-Kuma (its own login too, D-A2) ─────────────
+kuma.admin.{$DOMAIN} {
+    import acme_cloudflare
+    import hsts
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        # THE ONE UNGATED PATH IN THE ADMIN ZONE: the wall panel's heartbeat.
+        # The panel cannot sign in, and without this the panel-down alert — which
+        # the repo calls required — would fire permanently.
+        #
+        # GET ONLY, settled from both ends: the panel sends GET (OfficeWallNaglight
+        # js/heartbeat.js, `?status=up&msg=OK`), and Kuma 1.23 itself refuses POST
+        # on this path (harness). Nothing else needs to reach it.
+        #
+        # THE EXACT MATCH IS LOAD-BEARING. One path segment of token characters
+        # and nothing deeper: with the prefix `^/api/push/` the harness got 200
+        # from Kuma's web app for /api/push/a/b with no login — the SPA answers
+        # any path. path_regexp is anchored at both ends and case-sensitive.
+        #
+        # What the token is worth: Kuma generates 10 characters (~59 bits) and it
+        # rides in the URL path. It can only mark a monitor up. Replace it with a
+        # 32-character one when the monitor is made (plan §4.2). The route stays
+        # inside @lan, and this site has no access log, so the token is not
+        # written anywhere by Caddy.
+        @push {
+            method GET
+            path_regexp ^/api/push/[A-Za-z0-9_-]+$
+        }
+        handle @push {
+            reverse_proxy uptime-kuma:3001
+        }
+        handle {
+            import protect_admin
+            # Kuma's UI is socket.io; the websocket upgrade passes the gate with
+            # the cookie (harness: 101) and is refused without it (302).
+            reverse_proxy uptime-kuma:3001
+        }
+    }
+    handle {
+        respond "kuma: LAN only" 403
+    }
+}
+
+# ── logs.admin.<domain> — Dozzle (NO login of its own: this gate is it, P4) ─
+logs.admin.{$DOMAIN} {
+    import acme_cloudflare
+    import hsts
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        import protect_admin
+        reverse_proxy dozzle:8080
+    }
+    handle {
+        respond "logs: LAN only" 403
+    }
+}
+
+# ── dns.admin.<domain> — Technitium's console (its own login too) ───────────
+# Technitium is host-networked, so its console is a HOST port. It is reached
+# through the `admin` bridge's gateway ({$ADMIN_NET_GATEWAY}, the host's own
+# address on that bridge), NOT host.docker.internal: that is docker0, reached
+# via Caddy's default route, so the source the host saw would be whichever
+# network owned that route. Through the admin gateway the source is always
+# Caddy's pinned 172.28.92.2 — inside the one subnet the host's DNS-console
+# fence (stack/dns-console/) lets through to tcp/5380.
+dns.admin.{$DOMAIN} {
+    import acme_cloudflare
+    import hsts
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        import protect_admin
+        reverse_proxy {$ADMIN_NET_GATEWAY}:5380
+    }
+    handle {
+        respond "dns console: LAN only" 403
+    }
+}
+
+# ── actual.admin.<domain> — Actual Budget (its own password too) ────────────
+actual.admin.{$DOMAIN} {
+    import acme_cloudflare
+    import hsts
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        import protect_admin
         reverse_proxy actual:5006
     }
-    # A WAN caller is refused BEFORE basic_auth, so it is never even told there is
-    # a prompt here. A second `handle` rather than a bare `respond`, so the mutual
-    # exclusion cannot depend on directive-ordering subtleties.
     handle {
         respond "actual: LAN only" 403
+    }
+}
+
+# ── the OLD names, for ONE release: redirects into the admin namespace ──────
+# actual.<domain> ({$ACTUAL_HOST}) and dns.<domain> used to be the sites
+# themselves, each behind its own basic_auth. They moved under admin. because
+# outside it they would never receive the admin cookie and would have needed a
+# prompt of their own — the thing the portal exists to remove.
+#
+# Kept for one release so bookmarks land, then removed with their
+# EXTRA_SUBDOMAINS entries. Still @lan-gated: a redirect is not worth answering
+# the internet with. `{uri}` (path + query, unescaped) is correct HERE, unlike
+# protect_admin's `{%uri}`: the target is a whole URL, not a parameter.
+#
+# THE SWITCH-DAY TRAP: a browser that cached a basic_auth credential for the old
+# name keeps replaying it, and Actual reports that as "server offline" (the
+# 2026-08-29 lesson). Close the old tabs.
+{$ACTUAL_HOST} {
+    import acme_cloudflare
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        redir https://actual.admin.{$DOMAIN}{uri}
+    }
+    handle {
+        respond "actual: LAN only" 403
+    }
+}
+dns.{$DOMAIN} {
+    import acme_cloudflare
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        redir https://dns.admin.{$DOMAIN}{uri}
+    }
+    handle {
+        respond "dns console: LAN only" 403
     }
 }
 
@@ -423,9 +614,9 @@
     import access_log
     encode zstd gzip
 
-    # LAN/TUNNEL ONLY, and this host has a stronger claim to the gate than
-    # actual.<domain> next door: behind it sits an origin that fronts EVERY
-    # provider credential the household holds, in one process, by design.
+    # LAN/TUNNEL ONLY, and this host has as strong a claim to the gate as any
+    # admin site above: behind it sits an origin that fronts EVERY provider
+    # credential the household holds, in one process, by design.
     #
     # remote_ip, NEVER client_ip - the same rule the other gated blocks state.
     # client_ip trusts X-Forwarded-For and would hand the allow-list to anyone
@@ -457,27 +648,6 @@
     }
 }
 
-# ── dns.<domain> — Technitium web console (single-admin; KEEP basic_auth) ──────
-# Technitium binds :5380 on the host (host-network); proxy to the host gateway.
-dns.{$DOMAIN} {
-    import acme_cloudflare
-    import access_log
-    encode zstd gzip
-
-    # LAN/VPN ONLY, for the same reasons as actual.<domain> above - and arguably
-    # more so: this console can rewrite every name the household resolves.
-    @lan remote_ip {$LAN_CIDR}
-    handle @lan {
-        import protect_dns
-        # Technitium binds :5380 on the HOST (host-network), so this crosses back
-        # out of the bridge rather than naming a compose service.
-        reverse_proxy host.docker.internal:5380
-    }
-    handle {
-        respond "dns console: LAN only" 403
-    }
-}
-
 # ── {$GAME_HOST} — the Gun Master 3 crossplay relay (profile `gunmaster3`) ────
 # ADDED 2026-08-29 (the Owner). Inert until the profile is on: with the service
 # down the upstream name does not resolve and this host 502s, which is the
@@ -486,8 +656,8 @@ dns.{$DOMAIN} {
 # THIS IS THE ONE SITE ON THIS BOX THAT DELIBERATELY ANSWERS THE INTERNET WITH
 # NO IDENTITY CHECK, and the reason is the requirement itself. The Owner wants to
 # play with his son while away from home and NOT on the VPN — which is precisely
-# the case the @lan remote_ip gate on actual.<domain> and dns.<domain> exists to
-# refuse. Those two are right to be LAN-only; this one cannot be.
+# the case the @lan remote_ip gate on the admin sites exists to refuse. Those
+# are right to be LAN-only; this one cannot be.
 #
 # ── THE DOOR IS A SECRET PATH, AND HERE IS WHAT THAT IS WORTH ────────────────
 #
@@ -499,7 +669,9 @@ dns.{$DOMAIN} {
 # Treat the URL as a password — if it leaks, change GAME_WS_SECRET, re-materialise
 # and re-paste it on each device; that is a complete revocation and it is cheap.
 #
-# WHY NOT basic_auth, which is this file's convention for single-user services:
+# WHY NOT basic_auth, which was this file's convention for single-user services
+# when the relay landed (the admin login has since replaced it; the same reason
+# rules that out too — it is a cookie on a browser page, not a game client):
 # the browser's WebSocket constructor CANNOT SET REQUEST HEADERS. There is
 # physically nowhere to put Authorization. The only browser route is
 # wss://user:pass@host/ws, which neither Chrome nor Firefox specifies and which
@@ -511,7 +683,7 @@ dns.{$DOMAIN} {
 # the son and a new redirect URI registered in Google Cloud Console by hand. It
 # is the stronger answer and it is recorded as the follow-up, not dismissed.
 #
-# WHY THE 404 AND NOT A 403. The actual./dns. gates answer 403 because something
+# WHY THE 404 AND NOT A 403. The @lan gates answer 403 because something
 # is there and the caller may not have it. Here the honest answer is that nothing
 # is at that path. It also keeps this host clear of fail2ban: that jail's filter
 # matches 401 ONLY — deliberately, because banning on a gate's 403 could have
@@ -519,9 +691,9 @@ dns.{$DOMAIN} {
 # mistyping a 32-character path must never be able to ban the address they are
 # trying to play from.
 #
-# THE THROTTLE EARNS MORE HERE THAN ANYWHERE ELSE IN THIS FILE. On actual. every
-# page asset carries an auth attempt, so 120/min is flood control and that block
-# says so. A WebSocket is ONE request that then stays open, so here 120/min is
+# THE THROTTLE EARNS MORE HERE THAN ANYWHERE ELSE IN THIS FILE. On the admin
+# sign-in route 120/min is flood control and the snippet says so. A WebSocket is
+# ONE request that then stays open, so here 120/min is
 # 120 CONNECTION ATTEMPTS per IP per minute — a genuinely tight limit, and the
 # thing that caps the relay's one real DoS vector: sockets that connect and never
 # send `hello` are held 5s and are NOT counted against MAX_PLAYERS.
@@ -531,7 +703,7 @@ dns.{$DOMAIN} {
 # scanner that a relay lives at this name. The container healthcheck probes it on
 # 127.0.0.1 from the inside, so publishing it buys nothing.
 #
-# COSTS NO CERTIFICATE, same as the actual. block: issuance is dns-01 through
+# COSTS NO CERTIFICATE, same as the admin sites: issuance is dns-01 through
 # Cloudflare, so Let's Encrypt never needs to reach this box.
 #
 # THE URL THE FAMILY PASTES (Multiplayer box on the game's Home screen):
@@ -587,44 +759,122 @@ dns.{$DOMAIN} {
 # A flaky MAIN box may host the heavy services. Uncomment + set MAIN_BOX_IP in
 # .env to have Caddy on THIS box reverse-proxy across the LAN to them. The
 # provisioning script already creates a `map.<domain>` split-horizon record when
-# MAIN_BOX_IP is set, so this just wires the proxy. KEEP basic_auth on these.
+# MAIN_BOX_IP is set, so this just wires the proxy.
+#
+# ITS OLD GUARD IS GONE: this stub used `import protect_dns`, a basic_auth
+# snippet the admin portal removed. It is rewritten below in the gated shape of
+# the household-app sites (LAN + tunnel, no login). For a login as well, move it
+# under the admin namespace as map.admin.{$DOMAIN} with `import protect_admin`
+# (the admin cookie never reaches a name outside .admin.<domain>) and add that
+# label to EXTRA_SUBDOMAINS.
 #
 # map.{$DOMAIN} {
-#     import protect_dns
+#     import acme_cloudflare
 #     encode zstd gzip
-#     reverse_proxy {$MAIN_BOX_IP}:8100   # BlueMap default web port
+#     @lan remote_ip {$LAN_CIDR}
+#     handle @lan {
+#         reverse_proxy {$MAIN_BOX_IP}:8100   # BlueMap default web port
+#     }
+#     handle {
+#         respond "map: LAN only" 403
+#     }
 # }
 
-# ── tier-2 opt-in public sites (SR-012) — COMMENTED, uncomment per service ─────
+# ══ HOUSEHOLD APPS WITH THEIR OWN CLIENTS (ADMIN_PORTAL_PLAN §5, Phase B) ═════
+# Immich, Jellyfin, Navidrome and ntfy. Their phone and TV apps talk to the
+# app's API directly and cannot complete a web sign-in, so these sites are
+# OUTSIDE the admin namespace and carry NO admin login: each app's own login is
+# the gate. They never receive the admin cookie.
+#
+# The same wrapping as the admin sites otherwise — acme_cloudflare, the @lan
+# gate, a 403 default — written fresh rather than uncommented from the old
+# stubs, which had neither the gate nor acme_cloudflare and would have exposed
+# the app to the internet while 443 is forwarded (review finding 6).
+#
+# EACH SITE IS LIVE FROM DAY ONE, alongside the app's LAN port. The switch is
+# per app and in this order: re-point that app's clients at its name here,
+# verify, then set its *_BIND_IP knob to 127.0.0.1 so the LAN port closes. One
+# app at a time. A site whose profile is off answers 502.
+#
+# Split-horizon only helps a client that asks Technitium: a TV that hard-codes a
+# public resolver gets the public answer and the 403. Such a device is a reason
+# to keep that one app's LAN port (plan §5).
+
+# ── photos.<domain> — Immich (mobile auto-backup points here) ───────────────
+photos.{$DOMAIN} {
+    import acme_cloudflare
+    encode zstd gzip
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        reverse_proxy immich-server:2283
+    }
+    handle {
+        respond "photos: LAN only" 403
+    }
+}
+
+# ── jellyfin.<domain> — Jellyfin (set its published URL to this name) ───────
+jellyfin.{$DOMAIN} {
+    import acme_cloudflare
+    encode zstd gzip
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        reverse_proxy jellyfin:8096
+    }
+    handle {
+        respond "jellyfin: LAN only" 403
+    }
+}
+
+# ── music.<domain> — Navidrome (Subsonic clients point here) ────────────────
+music.{$DOMAIN} {
+    import acme_cloudflare
+    encode zstd gzip
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        reverse_proxy navidrome:4533
+    }
+    handle {
+        respond "music: LAN only" 403
+    }
+}
+
+# ── ntfy.<domain> — ntfy (NTFY_BASE_URL points here; NTFY_BEHIND_PROXY=true) ─
+# NO `encode`, unlike its neighbours: subscribers hold a long-lived HTTP stream
+# (JSON/SSE lines) open, and compression buffers what must arrive at once.
+ntfy.{$DOMAIN} {
+    import acme_cloudflare
+    @lan remote_ip {$LAN_CIDR}
+    handle @lan {
+        reverse_proxy ntfy:80
+    }
+    handle {
+        respond "ntfy: LAN only" 403
+    }
+}
+
+# ── tier-2 opt-in sites (SR-012) — COMMENTED, the OLDER PUBLIC SHAPE ───────────
 # Publishing a tier-2 service is a deliberate THREE-step opt-in:
 #   1. enable its compose profile (COMPOSE_PROFILES in .env),
-#   2. uncomment its block here,
+#   2. add its site here,
 #   3. add its label to EXTRA_SUBDOMAINS in .env (split-horizon record).
-# Every service below carries its OWN login — do NOT wrap them in basic_auth;
-# their mobile/desktop clients authenticate against the app's API directly and
-# a second auth layer breaks them. Most are also LAN-reachable on their LAN_IP
-# port bind (exception: Vaultwarden, which is HTTPS-only by design — this site
-# IS its ingress).
+# THESE STUBS PREDATE THE @lan GATES and have neither the gate nor
+# acme_cloudflare: uncommented as they stand, a site would answer the internet
+# while 443 is forwarded, and would try an http-01 challenge that cannot
+# succeed. Write it in the shape of the household-app sites above instead.
+# Every service below carries its OWN login — do NOT put it behind the admin
+# login; its mobile/desktop clients authenticate against the app's API directly
+# and a second auth layer breaks them. Most are also LAN-reachable on their
+# LAN_IP port bind (exception: Vaultwarden, which is HTTPS-only by design — its
+# site IS its ingress).
 #
 # vault.{$DOMAIN} {          # Vaultwarden — the Bitwarden clients point here
 #     encode zstd gzip
 #     reverse_proxy vaultwarden:80
 # }
-# photos.{$DOMAIN} {         # Immich — the mobile app needs this for away-from-home auto-backup
-#     encode zstd gzip
-#     reverse_proxy immich-server:2283
-# }
 # prism.{$DOMAIN} {          # PhotoPrism
 #     encode zstd gzip
 #     reverse_proxy photoprism:2342
-# }
-# jellyfin.{$DOMAIN} {       # Jellyfin
-#     encode zstd gzip
-#     reverse_proxy jellyfin:8096
-# }
-# music.{$DOMAIN} {          # Navidrome — Subsonic clients point here
-#     encode zstd gzip
-#     reverse_proxy navidrome:4533
 # }
 # audio.{$DOMAIN} {          # Audiobookshelf — its apps point here
 #     encode zstd gzip

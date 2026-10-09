@@ -1,10 +1,12 @@
 # AWOW AK41 always-on core — the whole stack (host layout).
 #
-# Four services, all health-checked, all restart:unless-stopped so a reboot or a
-# single crash self-heals with zero manual clicks (the WI-4.7 goal):
+# The core services, all restart:unless-stopped so a reboot or a single crash
+# self-heals with zero manual clicks (the WI-4.7 goal):
 #   technitium  — split-horizon LAN DNS + recursion + blocklists + HTTP API
-#   caddy       — reverse proxy + basic_auth + automatic TLS (valid on LAN via
-#                 split-horizon)
+#   caddy       — reverse proxy + automatic TLS (valid on LAN via split-horizon)
+#   oauth2-proxy — Google sign-in for the tracker (D1/D2)
+#   admin-auth  — the ONE admin login in front of every *.admin.<domain> site
+#                 (ADMIN_PORTAL_PLAN, P1-P4; replaced per-site basic_auth)
 #   tracker     — the NagLight web container (image naglight:local, WI-10.1/10.4)
 #   actual      — Actual Budget (finances)
 #   ddns        — Cloudflare dynamic-DNS updater (apex + wildcard A records
@@ -18,7 +20,12 @@
 #     :5380 for its HTTP API/console. Host network because a DNS server must see
 #     real client IPs for per-client rules and must own :53.
 #   - Caddy publishes :80/:443 to the host for the reverse proxy + ACME.
-#   - tracker and actual stay on the internal bridge; only Caddy reaches them.
+#   - tracker stays on the internal bridge; only Caddy reaches it.
+#   - Management UIs (Kuma, Dozzle, Homepage, Actual) publish on 127.0.0.1
+#     ONLY and are reached through Caddy's *.admin.<domain> sites; the loopback
+#     publish exists so each stays usable over `ssh -L` when Caddy is the thing
+#     that is broken (plan §4.6). The pinned `admin` network (bottom of file)
+#     is what lets admin-auth trust Caddy's address and nobody else's.
 #
 # Provisioning (Technitium zero-touch) is done by provision/provision-technitium.sh,
 # invoked by the first-boot systemd unit AFTER `docker compose up -d` — not here,
@@ -91,14 +98,21 @@ services:
       PANEL_IP: ${PANEL_IP}
       PANEL_USER_SUB: ${PANEL_USER_SUB}
       PANEL_ACCESS_ENABLED: ${PANEL_ACCESS_ENABLED:-false}
-      # basic_auth guards the SINGLE-USER services (Actual, dns console) only.
-      # The tracker host is NOT basic_auth'd — oauth2-proxy owns its auth (D2).
-      ACTUAL_BASICAUTH_USER: ${ACTUAL_BASICAUTH_USER}
-      ACTUAL_BASICAUTH_HASH: ${ACTUAL_BASICAUTH_HASH}
-      DNS_BASICAUTH_USER: ${DNS_BASICAUTH_USER}
-      DNS_BASICAUTH_HASH: ${DNS_BASICAUTH_HASH}
-      # Who may reach those two hosts AT ALL - the remote_ip matcher in front
-      # of the basic_auth. Defaults to `private_ranges` in .env.example.
+      # ── the admin portal (ADMIN_PORTAL_PLAN §4) ─────────────────────────────
+      # The sign-in host every gated admin site redirects to. Not a knob: the
+      # cookie domain (.admin.${DOMAIN}, in admin-auth below) is derived the
+      # same way, and the two must never disagree.
+      ADMIN_HOST: admin.${DOMAIN}
+      # Where dns.admin.<domain> reaches Technitium's console: the `admin`
+      # bridge's gateway, which the HOST owns. NOT host.docker.internal: that
+      # is docker0's address, reached via Caddy's default route, so the source
+      # the host sees would be whichever network happens to own that route. Via
+      # this gateway the source is always Caddy's pinned 172.28.92.2, which is
+      # the address the DNS-console fence admits. Literal, like the network.
+      ADMIN_NET_GATEWAY: 172.28.92.1
+      # Who may reach the gated sites AT ALL — the remote_ip matcher every admin
+      # and household-app site puts in front of everything else (P2). It is
+      # this, not the router, that keeps them off the internet.
       LAN_CIDR: ${LAN_CIDR}
       ACME_EMAIL: ${ACME_EMAIL}
       # THE dns-01 CREDENTIAL. The Caddyfile's global `acme_dns cloudflare`
@@ -129,13 +143,20 @@ services:
       # the Caddyfile. The relay unit's failure message says so.
       GAME_HOST: ${GAME_HOST}
       GAME_WS_SECRET: ${GAME_WS_SECRET}
-    # TWO NETWORKS, and BOTH must be named explicitly. Naming any network at all
-    # opts a service OUT of the implicit `default`, so omitting `default` here
-    # would cut Caddy off from tracker, actual and oauth2-proxy in one edit — a
-    # failure that presents as every site 502ing at once.
+    # THREE NETWORKS, and ALL must be named explicitly. Naming any network at
+    # all opts a service OUT of the implicit `default`, so omitting `default`
+    # here would cut Caddy off from tracker, actual and oauth2-proxy in one edit
+    # — a failure that presents as every site 502ing at once.
     networks:
-      - default
-      - game
+      default:
+      game:
+      admin:
+        # STATIC, and outside the network's ip_range so nothing dynamic can
+        # take it first. admin-auth's --trusted-proxy-ip names this exact
+        # address (only Caddy may assert X-Forwarded-*), and it is the source
+        # the DNS-console fence sees for dns.admin.<domain>.
+        # tests/test_admin_portal.py asserts the pieces agree.
+        ipv4_address: 172.28.92.2
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       # The wall shell's static build (SR-016 / IF-005). Read-only: Caddy serves
@@ -144,18 +165,18 @@ services:
       - ./wall-shell:/srv/wall-shell:ro
       # THE ACCESS LOG fail2ban READS, and it is a BIND MOUNT rather than a
       # named volume on purpose: fail2ban runs on the HOST and has to be able to
-      # tail the file. Only the two guarded sites log here (Caddyfile's
-      # (access_log) snippet), so this stays small and the 401s are not buried
-      # under every kiosk asset request.
+      # tail the file. Only the admin sign-in host and the LLM gateway log here
+      # (Caddyfile's (access_log) snippet), so this stays small and the 401s are
+      # not buried under every kiosk asset request.
       - /var/log/caddy:/var/log/caddy
       - caddy_data:/data       # certs + ACME account — persist so re-issue isn't needed on reboot
       - caddy_config:/config
     extra_hosts:
       # host.docker.internal is a Docker DESKTOP name — plain docker-ce (what the
       # AWOW runs) does not provide it unless mapped to the host gateway here.
-      # Without this the dns.<domain> site (reverse_proxy host.docker.internal:5380)
-      # 502s on the real box. The homehub-sim could not catch it: Caddyfile.sim
-      # deliberately proxies the bridge container name instead (review 2026-07-10).
+      # NO LIVE SITE USES IT ANY MORE: dns.<domain> used to proxy through it, and
+      # dns.admin.<domain> deliberately does not (see ADMIN_NET_GATEWAY above for
+      # why). Kept for the commented home.* stub in the Caddyfile.
       - "host.docker.internal:host-gateway"
     depends_on:
       oauth2-proxy:
@@ -163,6 +184,10 @@ services:
         # no container healthcheck (see its block). It waits for the tracker to be
         # healthy before starting, so start-order is still correct; Caddy tolerates
         # a brief 502 if it races ahead.
+        condition: service_started
+      admin-auth:
+        # Same reasoning: distroless, no healthcheck. If it is down, every gated
+        # admin site answers 502 — it fails closed, never open (harness T10).
         condition: service_started
     restart: unless-stopped
     healthcheck:
@@ -269,6 +294,94 @@ services:
     # rather than via a container healthcheck. Caddy therefore waits only for this
     # service to START (below), and oauth2-proxy itself waits for the tracker to
     # be healthy before it starts, so ordering is still correct.
+
+  # ── admin-auth — ONE login for every *.admin.<domain> site (ADMIN_PORTAL_PLAN) ─
+  # The same pinned image as oauth2-proxy above, run as a second instance in
+  # password mode and in auth-only mode: Caddy asks it `/oauth2/auth` for each
+  # request to a gated admin site (forward_auth) and it proxies nothing itself.
+  #
+  # WHY A SECOND INSTANCE AND NOT THE ONE ABOVE: that one is the tracker's
+  # identity source (D3), and in multi-user mode the tracker provisions a data
+  # directory for any identity it is handed. A password login there would put a
+  # second kind of identity inside the tracker's trust boundary.
+  #
+  # WHY A COOKIE AT ALL: basic_auth is scoped per origin by the browser, so five
+  # sites meant five prompts. The cookie is scoped to .admin.<domain> and NOT the
+  # bare domain, so the tracker and the public game relay never receive it and
+  # cannot replay it (harness T6). What it is worth: for Kuma, Technitium and
+  # Actual it is defence in depth in front of their own logins; for Dozzle and
+  # Homepage it is the ONLY credential (P4).
+  #
+  # EVERY SETTING IS A FLAG, NOT AN OAUTH2_PROXY_* VARIABLE, and that is the
+  # point. oauth2-proxy silently ignores an environment variable it does not
+  # know, so a misspelt --trusted-proxy-ip would quietly restore "trust
+  # X-Forwarded-* from anyone"; a misspelt FLAG refuses to start. The one
+  # exception is the cookie secret, which stays out of argv (and the
+  # container's process list) — and a wrong name for THAT one fails loudly too,
+  # because oauth2-proxy will not start without a secret.
+  #
+  # The flags are exactly the set scripts/verify/admin-portal-harness/run.sh
+  # (HomeHub) proved against real Kuma, Dozzle and Technitium, with production
+  # values. Do not "tidy" any of them without re-reading why each is there:
+  #   --provider=oidc … --oidc-jwks-url   v7.15.2 refuses to start without a
+  #       provider, even for htpasswd-only use. A dummy OIDC provider that can
+  #       never be reached satisfies it.
+  #   --custom-templates-dir   the stock page shows "Sign in with OpenID Connect",
+  #       which leads to that dead provider. The template drops the button.
+  #       --skip-provider-button is NOT the fix: it skips straight to the dead
+  #       provider and the password form is never shown.
+  #   --trusted-proxy-ip   without it oauth2-proxy trusts X-Forwarded-* from
+  #       every address. It names Caddy's pinned address on the `admin` network.
+  #   --email-domain is DELIBERATELY UNSET: `*` would make any allow-list inert
+  #       (oauth2-proxy issue #73, the same trap recorded on the block above).
+  #   --upstream=static://202   auth-only: a signed-in request that somehow
+  #       reached this service directly gets an empty 202, never a backend.
+  admin-auth:
+    image: quay.io/oauth2-proxy/oauth2-proxy:${OAUTH2_PROXY_IMAGE_TAG}
+    container_name: admin-auth
+    command:
+      - --provider=oidc
+      - --client-id=unused
+      - --client-secret=unused
+      - --skip-oidc-discovery
+      - --oidc-issuer-url=https://unused.invalid
+      - --login-url=https://unused.invalid/a
+      - --redeem-url=https://unused.invalid/t
+      - --oidc-jwks-url=https://unused.invalid/k
+      - --htpasswd-file=/etc/admin-auth/htpasswd
+      - --display-htpasswd-form=true
+      - --custom-templates-dir=/etc/admin-auth/templates
+      - --cookie-name=__Secure-homehub_admin
+      - --cookie-secure=true
+      - --cookie-domain=.admin.${DOMAIN}
+      - --whitelist-domain=.admin.${DOMAIN}
+      - --reverse-proxy=true
+      - --trusted-proxy-ip=172.28.92.2/32
+      - --upstream=static://202
+      - --http-address=0.0.0.0:4180
+    environment:
+      # 32 random bytes, base64url (HomeHub store AdminAuthCookieSecret). Rotating
+      # it signs every admin session out at once — the revocation lever, as it is
+      # for the tracker's. Session length is oauth2-proxy's default, 168h (D-A4).
+      OAUTH2_PROXY_COOKIE_SECRET: ${ADMIN_AUTH_COOKIE_SECRET}
+    volumes:
+      # user:bcrypt, materialised by firstboot.sh from ADMIN_AUTH_USER and
+      # ADMIN_AUTH_HASH (gitignored; see admin-auth/htpasswd.example). A
+      # SINGLE-FILE bind mount, so on a running box EDIT IT IN PLACE — the same
+      # inode rule as authenticated-emails.txt above.
+      - ./admin-auth/htpasswd:/etc/admin-auth/htpasswd:ro
+      # The tracked sign-in template (no provider button).
+      - ./admin-auth/templates:/etc/admin-auth/templates:ro
+    # The admin network ONLY. Caddy is the one thing that talks to it, and it
+    # has no business on the bridge the tracker and the finance data share.
+    networks:
+      - admin
+    expose:
+      - "4180"
+    restart: unless-stopped
+    # NO container healthcheck, for the same reason as oauth2-proxy above: the
+    # image is distroless. Caddy waits only for it to START. If it is down, the
+    # gated sites answer 502 (fail closed) and admin.<domain>/oauth2/* does too.
 
   tracker:
     # NagLight is the canonical build now (its repo owns the Dockerfile, WI-10.4).
@@ -422,11 +535,24 @@ services:
     image: actualbudget/actual-server:${ACTUAL_IMAGE_TAG}
     container_name: actual
     environment:
+      # The port INSIDE the container. Not the .env knob of the same name, which
+      # is the loopback HOST port below.
       ACTUAL_PORT: "5006"
     volumes:
       - actual_data:/data
     expose:
       - "5006"
+    # LOOPBACK ONLY, and it exists for one reason: the SSH fallback (plan §4.6).
+    # Actual had no host port at all, so with Caddy broken there was no way to
+    # reach it; `ssh -L 5006:127.0.0.1:5006 hub@homehub` now works. It is not a
+    # LAN door — 127.0.0.1 is not reachable from any other machine.
+    ports:
+      - "127.0.0.1:${ACTUAL_PORT}:5006"
+    # `default` stays: finance-auditor reaches http://actual:5006 over it (FA
+    # IF-002). `admin` is how Caddy's actual.admin.<domain> site gets here.
+    networks:
+      - default
+      - admin
     restart: unless-stopped
     healthcheck:
       # The actual-server image ships bash but NO wget/curl (verified in the
@@ -460,7 +586,7 @@ services:
       TZ: ${TIMEZONE}                  # RUN_AT is read as BOX-LOCAL time (FA SR-001)
       RUN_AT: ${FINANCE_RUN_AT}
       # Actual over the compose-internal bridge ONLY (FA IF-002/SR-003) — never
-      # the public actual.<domain> route.
+      # the actual.admin.<domain> route, which sits behind a browser login.
       ACTUAL_URL: http://actual:5006
       ACTUAL_SYNC_ID: ${FINANCE_ACTUAL_SYNC_ID}
       ACTUAL_PASSWORD: ${FINANCE_ACTUAL_PASSWORD}
@@ -608,19 +734,41 @@ services:
       - ddns_data:/updater/data
     restart: unless-stopped
 
-  # ── Auxiliary LAN-only observability (WI-10.11) ───────────────────────────────
-  # These management UIs are published bound to the box's LAN_IP only (not to
-  # 0.0.0.0), so they are reachable on the LAN but NOT proxied to the public
-  # internet and NOT forwarded by the router. Do NOT add Caddy sites for them.
+  # ── Management UIs: the admin portal (WI-10.11; ADMIN_PORTAL_PLAN P1-P4) ─────
+  # THE RULE (P1, 2026-09-25): a browser-only management UI publishes on
+  # 127.0.0.1 ONLY and is reached through a Caddy site under *.admin.<domain>,
+  # behind the one admin login (admin-auth). Every such site keeps the
+  # `@lan remote_ip {$LAN_CIDR}` gate with a 403 default (P2) — that gate, not
+  # the router, is what keeps them off the internet.
+  #
+  # IT REPLACES "bind LAN_IP, do NOT add Caddy sites for them", which predated
+  # the @lan gates. That rule's goal — keep these off the internet — is now met
+  # THROUGH Caddy, and the raw LAN ports it left were the weaker door: each was a
+  # separate surface a port scan finds, and Dozzle's had no login at all, so it
+  # served every container's logs to anything on the LAN.
+  #
+  # THE LOOPBACK PUBLISH IS NOT DECORATION (P3): it is the way in when Caddy is
+  # the thing that is broken — `ssh -L <port>:127.0.0.1:<port> hub@homehub`.
+  # 127.0.0.1 is unreachable from any other machine, so it adds no LAN door.
 
   # Uptime-Kuma — generic up-checks (can also POST to NagLight /api/feed).
+  # Reached at kuma.admin.<domain>. Keeps its OWN login behind the admin one
+  # (D-A2). Its push endpoint (GET /api/push/<token>) is the one path the
+  # Caddyfile exempts from the admin login, because the wall panel's heartbeat
+  # cannot sign in.
   uptime-kuma:
     image: louislam/uptime-kuma:${UPTIMEKUMA_IMAGE_TAG}
     container_name: uptime-kuma
     volumes:
       - uptimekuma_data:/app/data
     ports:
-      - "${LAN_IP}:${UPTIMEKUMA_PORT}:3001"   # LAN-only: bound to the box's LAN IP
+      - "127.0.0.1:${UPTIMEKUMA_PORT}:3001"   # loopback only — see the banner above
+    # `default` so its monitors can reach the stack by container name (build
+    # them that way, not against the LAN IP — plan §4.7); `admin` so Caddy and
+    # Homepage reach it.
+    networks:
+      - default
+      - admin
     restart: unless-stopped
     healthcheck:
       # The uptime-kuma image ships NO wget (it has curl + bash; verified against
@@ -638,6 +786,8 @@ services:
       start_period: 30s
 
   # Dozzle — live container log viewer (reads the docker socket read-only).
+  # Reached at logs.admin.<domain>. It has NO login of its own, so the admin
+  # login is its only credential (P4).
   dozzle:
     image: amir20/dozzle:${DOZZLE_IMAGE_TAG}
     container_name: dozzle
@@ -646,7 +796,11 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
-      - "${LAN_IP}:${DOZZLE_PORT}:8080"       # LAN-only: bound to the box's LAN IP
+      - "127.0.0.1:${DOZZLE_PORT}:8080"       # loopback only — see the banner above
+    # The admin network ONLY: it needs the socket, not the network, and nothing
+    # on the default bridge has reason to reach a log viewer.
+    networks:
+      - admin
     restart: unless-stopped
     healthcheck:
       # The dozzle image is DISTROLESS — no /bin/sh, no wget (verified against the
@@ -664,22 +818,75 @@ services:
       retries: 5
       start_period: 10s
 
-  # ntfy — OPTIONAL self-hosted push notifications (currently external). Opt-in:
-  # starts only with `docker compose --profile ntfy up -d`. LAN-only like the rest.
+  # Homepage — the admin portal's landing page, at admin.<domain> behind the
+  # admin login. It has no login of its own: the admin login is its only
+  # credential (P4). Still profile-gated (`homepage` in COMPOSE_PROFILES); with
+  # the profile off, admin.<domain> signs you in and then answers 502.
+  homepage:
+    image: ghcr.io/gethomepage/homepage:${HOMEPAGE_IMAGE_TAG}
+    container_name: homepage
+    profiles: ["homepage"]
+    environment:
+      # The Host names Homepage will answer: the Caddy site, and the two a
+      # browser sends through `ssh -L ${HOMEPAGE_PORT}:127.0.0.1:${HOMEPAGE_PORT}`.
+      # MEASURED 2026-09-25: the pinned v0.10.9 has NO host check at all — this
+      # variable is inert at that tag, and pages and /api/* answer any Host.
+      # Later Homepage releases refuse a Host that is not listed here, so the
+      # value is set now, so that a pin bump cannot lock out the portal and the
+      # tunnel. The gate in front of Homepage is Caddy's, not this.
+      HOMEPAGE_ALLOWED_HOSTS: admin.${DOMAIN},localhost:${HOMEPAGE_PORT},127.0.0.1:${HOMEPAGE_PORT}
+      # Hostnames in the config are written {{HOMEPAGE_VAR_DOMAIN}}, so the
+      # tracked YAML names no site.
+      HOMEPAGE_VAR_DOMAIN: ${DOMAIN}
+      # The config mount is read-only, and Homepage otherwise writes its log
+      # under /app/config/logs.
+      LOG_TARGETS: stdout
+    volumes:
+      # THE CONFIG IS THE REPO'S NOW (stack/homepage/), read-only, so a reimage
+      # restores it. It used to live only in the `homepage_config` volume, which
+      # stays declared at the bottom — unused — until the repo copy is verified
+      # on the hub (rollback). Every file in that directory is required: Homepage
+      # copies a skeleton file in at start for any that is missing, and on a
+      # read-only mount that copy fails and the page answers 500 (measured).
+      # No docker.sock, on purpose: socket access would put the host behind a
+      # page whose only credential is the admin login.
+      - ./homepage:/app/config:ro
+    ports:
+      - "127.0.0.1:${HOMEPAGE_PORT}:3000"     # loopback only — see the banner above
+    # The admin network ONLY. Its status dots (siteMonitor) probe Kuma, Dozzle
+    # and Actual by container name there, and Technitium via the admin gateway.
+    networks:
+      - admin
+    restart: unless-stopped
+
+  # ntfy — OPTIONAL self-hosted push notifications. Opt-in: starts only with the
+  # `ntfy` profile. A household app, NOT an admin tool: it gets ntfy.<domain>
+  # outside the admin namespace with no admin login (its phone app cannot do a
+  # web sign-in) — ADMIN_PORTAL_PLAN §5.
   ntfy:
     image: binwiederhier/ntfy:${NTFY_IMAGE_TAG}
     container_name: ntfy
     profiles: ["ntfy"]
     command: serve
     environment:
-      NTFY_BASE_URL: http://${LAN_IP}:${NTFY_PORT}
+      # The public face is the Caddy site now. Links ntfy generates (the web
+      # app, attachments) point there; subscriptions made against the old LAN
+      # URL must be re-created on the day the LAN port closes (Phase B).
+      NTFY_BASE_URL: https://ntfy.${DOMAIN}
       NTFY_LISTEN_HTTP: ":80"
-      NTFY_BEHIND_PROXY: "false"
+      # Behind Caddy: without this every client looks like Caddy's address and
+      # the whole house shares one rate-limit bucket.
+      NTFY_BEHIND_PROXY: "true"
     volumes:
       - ntfy_data:/var/lib/ntfy
       - ntfy_cache:/var/cache/ntfy
     ports:
-      - "${LAN_IP}:${NTFY_PORT}:80"           # LAN-only: bound to the box's LAN IP
+      # PHASE B BIND: empty NTFY_BIND_IP = LAN_IP, today's LAN port. The Owner
+      # sets it to 127.0.0.1 once every subscriber is re-pointed at
+      # https://ntfy.<domain> (plan §5, "one app at a time"). The host-side
+      # alert helpers post to ${NTFY_BIND_IP:-LAN_IP}:${NTFY_PORT}, so they
+      # follow the flip without an edit.
+      - "${NTFY_BIND_IP:-${LAN_IP}}:${NTFY_PORT}:80"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/v1/health || exit 1"]
@@ -695,9 +902,17 @@ services:
   # its profile is enabled (COMPOSE_PROFILES in .env, or `--profile NAME up -d`).
   #
   # Ground rules for this tier:
-  #   - LAN-only UIs bind ${LAN_IP} (the WI-10.11 pattern); public exposure is a
-  #     deliberate second step: uncomment the matching Caddyfile site AND add the
-  #     label to EXTRA_SUBDOMAINS in .env (split-horizon record).
+  #   - UIs bind ${LAN_IP}; a Caddy site is a deliberate second step AND a label
+  #     in EXTRA_SUBDOMAINS (split-horizon record). Write the site in the gated
+  #     shape of the Caddyfile's photos./jellyfin./music. sites (@lan, 403
+  #     default), NOT by uncommenting a stub: the stubs are the older public
+  #     shape. A management UI goes under *.admin.<domain> instead (P1, above).
+  #   - IMMICH / JELLYFIN / NAVIDROME carry a *_BIND_IP knob (ADMIN_PORTAL_PLAN
+  #     §5, Phase B). Empty = LAN_IP, today's LAN port. Once that app's clients
+  #     are re-pointed at its Caddy site, set the knob to 127.0.0.1 — one app at
+  #     a time. The port line nests the default (the knob, else LAN_IP), so a
+  #     materialised .env that predates the knob keeps today's bind rather than
+  #     breaking.
   #   - Image pins are best-effort as of 2026-07 authoring and are NOT part of
   #     the sim-validated set — VERIFY the tag at enable time; the diun profile
   #     watches them afterwards.
@@ -740,7 +955,9 @@ services:
     volumes:
       - ${MEDIA_ROOT}/immich:/data
     ports:
-      - "${LAN_IP}:${IMMICH_PORT}:2283"   # LAN UI/API; public = Caddyfile photos.* site
+      # LAN UI/API until IMMICH_BIND_IP=127.0.0.1 (Phase B); then photos.<domain>
+      # only — re-point the mobile app's server URL (auto-backup) first.
+      - "${IMMICH_BIND_IP:-${LAN_IP}}:${IMMICH_PORT}:2283"
     depends_on:
       - immich-redis
       - immich-db
@@ -848,7 +1065,9 @@ services:
     # (Hyper-V VMs). Compose auto-loads that file, so nothing else changes.
     # Prefer direct-play regardless; this is no 4K transcoding box.
     ports:
-      - "${LAN_IP}:${JELLYFIN_PORT}:8096"
+      # LAN until JELLYFIN_BIND_IP=127.0.0.1 (Phase B); then jellyfin.<domain>
+      # only — set its published URL and re-point the TV/phone apps first.
+      - "${JELLYFIN_BIND_IP:-${LAN_IP}}:${JELLYFIN_PORT}:8096"
     restart: unless-stopped
 
   # ── music: Navidrome (Subsonic API — pick any client app) ────────────────────
@@ -871,7 +1090,9 @@ services:
       # `Music`; this was the only line that disagreed.
       - ${MEDIA_ROOT}/Music:/music:ro
     ports:
-      - "${LAN_IP}:${NAVIDROME_PORT}:4533"
+      # LAN until NAVIDROME_BIND_IP=127.0.0.1 (Phase B); then music.<domain>
+      # only — re-point the Subsonic clients first.
+      - "${NAVIDROME_BIND_IP:-${LAN_IP}}:${NAVIDROME_PORT}:4533"
     restart: unless-stopped
 
   # ── podcasts + audiobooks: Audiobookshelf (subscribe/auto-download/track) ─────
@@ -956,7 +1177,9 @@ services:
       - "${LAN_IP}:21027:21027/udp"                # local discovery
     restart: unless-stopped
 
-  # ── quality-of-life: RSS, recipes, LAN dashboard ─────────────────────────────
+  # ── quality-of-life: RSS, recipes ────────────────────────────────────────────
+  # (Homepage, the old LAN dashboard, is now the admin portal's landing page —
+  # see the management-UI section above.)
   freshrss:
     image: freshrss/freshrss:${FRESHRSS_IMAGE_TAG}
     container_name: freshrss
@@ -982,21 +1205,6 @@ services:
       - mealie_data:/app/data
     ports:
       - "${LAN_IP}:${MEALIE_PORT}:9000"
-    restart: unless-stopped
-
-  homepage:
-    image: ghcr.io/gethomepage/homepage:${HOMEPAGE_IMAGE_TAG}
-    container_name: homepage
-    profiles: ["homepage"]
-    environment:
-      # Required since v0.9.2 — requests with any other Host are rejected.
-      HOMEPAGE_ALLOWED_HOSTS: ${LAN_IP}:${HOMEPAGE_PORT}
-    volumes:
-      # Config lives in the volume (YAML, edited in place); no docker.sock on
-      # purpose — the discovery widgets aren't worth socket access here.
-      - homepage_config:/app/config
-    ports:
-      - "${LAN_IP}:${HOMEPAGE_PORT}:3000"
     restart: unless-stopped
 
   # ── ops: diun — pinned-image update NOTIFIER (closes the stale-pin gap) ───────
@@ -1054,8 +1262,8 @@ services:
   # PATH — see the Caddyfile's game block, which carries the full reasoning and
   # the honest account of what a bearer token in a URL does and does not buy.
   #
-  # WHY IT IS NOT basic_auth, since that is this box's convention for single-user
-  # services: the browser WebSocket constructor CANNOT SET REQUEST HEADERS, so
+  # WHY IT IS NOT basic_auth, which was this box's convention for single-user
+  # services when the relay landed: the browser WebSocket constructor CANNOT SET REQUEST HEADERS, so
   # there is nowhere to put Authorization. The only browser route is credentials
   # embedded in the URL, which no spec requires and which would put the password
   # in the same text box the child types into.
@@ -1490,7 +1698,8 @@ services:
 
 # ── networks ─────────────────────────────────────────────────────────────────
 # `default` is implicit and unchanged: every service that names no network still
-# lands on it, which is all of them but the two below.
+# lands on it. A service that names ANY network must list `default` too if it
+# needs it — naming one replaces the implicit membership.
 networks:
   default:
   # The relay's isolation boundary. Caddy is dual-homed and is the only path in.
@@ -1544,6 +1753,33 @@ networks:
       config:
         - subnet: 172.28.91.0/24
 
+  # The admin portal's network (ADMIN_PORTAL_PLAN §4.4). Members: caddy (at a
+  # STATIC address), admin-auth and dozzle and homepage (this network only),
+  # uptime-kuma and actual (this and `default`).
+  #
+  # PINNED, and for the same reason as the two above: something outside Docker
+  # has to name an address on it. admin-auth's --trusted-proxy-ip names Caddy's
+  # 172.28.92.2, and the host's DNS-console fence admits this subnet to tcp/5380.
+  # `default` has no ipam block, so its subnet is whatever Docker picks and may
+  # differ after a reimage — a trusted-proxy value written against it would one
+  # day trust the wrong thing.
+  #
+  # ip_range KEEPS DYNAMIC ALLOCATION IN THE UPPER HALF, so the static .2 below
+  # it can never be handed to a container that happened to start first.
+  #
+  # The gateway (.1) is the HOST's address on this bridge, which is how Caddy
+  # reaches the host-networked Technitium console (ADMIN_NET_GATEWAY).
+  #
+  # NOT `internal: true`, and not an isolation boundary like `game`: everything
+  # on it is already inside the admin trust zone (P4). What guards these UIs is
+  # Caddy's @lan gate plus the admin login, and the loopback-only publishes.
+  admin:
+    ipam:
+      config:
+        - subnet: 172.28.92.0/24
+          gateway: 172.28.92.1
+          ip_range: 172.28.92.128/25
+
 volumes:
   # rustdesk (SR-045): the hbbs/hbbr KEY PAIR. Not reproducible from the repo -
   # regenerating it invalidates every installed client - so it joins the LOCAL
@@ -1582,5 +1818,8 @@ volumes:
   syncthing_data:
   freshrss_data:
   mealie_data:
+  # UNUSED since 2026-09-25 — Homepage reads ./homepage from the repo. Kept
+  # declared, and so not pruned, until that copy is verified on the hub: it is
+  # the rollback (ADMIN_PORTAL_PLAN §8).
   homepage_config:
   diun_data:

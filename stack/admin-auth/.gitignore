@@ -1,0 +1,5 @@
+# The materialised admin credential (user:bcrypt) — written on the box by
+# firstboot.sh from ADMIN_AUTH_USER + ADMIN_AUTH_HASH in .env. Only the
+# .example is tracked; the ISO bakes `git archive HEAD`, so an ignored file can
+# never ride into an image either.
+/htpasswd

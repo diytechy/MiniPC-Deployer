@@ -9,7 +9,9 @@
 #   1  every service healthcheck green (functional probe for the distroless ones)
 #   2  split-horizon: dig via Technitium returns the sim LAN answers
 #   3  curl through Caddy (internal CA) reaches tracker + actual with the right
-#      auth behavior (tracker -> oauth2-proxy 302; actual -> 401 w/o basic_auth)
+#      auth behavior (tracker -> oauth2-proxy 302; actual.admin -> the admin
+#      sign-in without a cookie, a wrong password 401, then 200 signed in; the
+#      old actual. name redirects into the admin namespace)
 #   4  oauth2-proxy: unauthenticated -> 302 to Dex, then a FULL headless login
 #      (curl cookie-jar dance) lands on the authenticated tracker
 #   5  multi-user isolation over HTTP: X-Forwarded-User A vs B see only their own
@@ -102,11 +104,41 @@ if [ "$tcode" = "302" ] && printf '%s' "$tloc" | grep -q 'dex'; then
 else
     fail "tracker -> code=$tcode loc=$tloc (want 302 -> dex)"
 fi
-# actual: basic_auth. No creds -> 401; correct creds -> 200 (proves proxy reach).
-acode_noauth="$(sc "${CURLK[@]}" -o /dev/null -w '%{http_code}' "https://$ACT/" 2>/dev/null)"
-[ "$acode_noauth" = "401" ] && pass "actual without basic_auth -> 401" || fail "actual no-auth -> $acode_noauth (want 401)"
-acode_auth="$(sc "${CURLK[@]}" -u simadmin:simpass -o /dev/null -w '%{http_code}' "https://$ACT/" 2>/dev/null)"
-[ "$acode_auth" = "200" ] && pass "actual with basic_auth -> 200 (reaches upstream)" || fail "actual with auth -> $acode_auth (want 200)"
+# The admin portal (Caddyfile.sim): Actual lives at actual.admin.<domain>
+# behind the ONE admin login (admin-auth); the old actual.<domain> redirects.
+ADM="admin.${DOMAIN}"; AACT="actual.admin.${DOMAIN}"
+aold="$(sc "${CURLK[@]}" -o /dev/null -w '%{http_code} %{redirect_url}' "https://$ACT/x?a=1" 2>/dev/null)"
+if [ "$aold" = "302 https://$AACT/x?a=1" ]; then
+    pass "old actual. name -> 302 into the admin namespace (path+query kept)"
+else
+    fail "old actual. name -> '$aold' (want 302 https://$AACT/x?a=1)"
+fi
+# No cookie -> 302 to the sign-in host with the original URL ESCAPED in rd.
+anc="$(sc "${CURLK[@]}" -o /dev/null -w '%{http_code} %{redirect_url}' "https://$AACT/x?a=1&b=2" 2>/dev/null)"
+if [ "$anc" = "302 https://$ADM/oauth2/sign_in?rd=https://$AACT%2Fx%3Fa%3D1%26b%3D2" ]; then
+    pass "actual.admin without a cookie -> 302 to the admin sign-in (escaped rd)"
+else
+    fail "actual.admin no-cookie -> '$anc'"
+fi
+# The sign-in page is the custom template: password form, no dead provider button.
+spage="$(sc "${CURLK[@]}" "https://$ADM/oauth2/sign_in" 2>/dev/null)"
+if printf '%s' "$spage" | grep -q 'type="password"' && ! printf '%s' "$spage" | grep -q 'Sign in with'; then
+    pass "admin sign-in page: password form, no provider button (custom template)"
+else
+    fail "admin sign-in page is not the custom template"
+fi
+awrong="$(sc "${CURLK[@]}" -o /dev/null -w '%{http_code}' -d 'username=simadmin&password=nope&rd=/' "https://$ADM/oauth2/sign_in" 2>/dev/null)"
+[ "$awrong" = "401" ] && pass "admin sign-in, wrong password -> 401 (what fail2ban keys on)" || fail "admin wrong password -> $awrong (want 401)"
+sc rm -f /tmp/adm.jar >/dev/null 2>&1
+aok="$(sc "${CURLK[@]}" -c /tmp/adm.jar -o /dev/null -w '%{http_code} %{redirect_url}' \
+        -d 'username=simadmin&password=simpass' --data-urlencode "rd=https://$AACT/" "https://$ADM/oauth2/sign_in" 2>/dev/null)"
+[ "$aok" = "302 https://$AACT/" ] && pass "admin sign-in, right password -> 302 back to actual.admin" || fail "admin sign-in -> '$aok'"
+ascope="$(scsh "awk '/homehub_admin/{sub(/#HttpOnly_/,\"\",\$1); print \$1, \$4}' /tmp/adm.jar")"
+[ "$ascope" = ".admin.$DOMAIN TRUE" ] && pass "admin cookie scoped to .admin.$DOMAIN, Secure" || fail "admin cookie scope/secure -> '$ascope'"
+acode_auth="$(sc "${CURLK[@]}" -b /tmp/adm.jar -o /dev/null -w '%{http_code}' "https://$AACT/" 2>/dev/null)"
+[ "$acode_auth" = "200" ] && pass "actual.admin signed in -> 200 (reaches upstream)" || fail "actual.admin signed in -> $acode_auth (want 200)"
+atrk="$(sc "${CURLK[@]}" -b /tmp/adm.jar -o /dev/null -w '%{http_code} %{redirect_url}' "https://$TRK/" 2>/dev/null)"
+case "$atrk" in 302\ *dex*) pass "tracker ignores the admin cookie (still -> Dex)" ;; *) fail "tracker with the admin cookie -> '$atrk'" ;; esac
 
 # ── Check 4 — full unauthenticated -> Dex login -> trusted-headers ────────────
 echo "-- (4) oauth2-proxy + Dex full login --"

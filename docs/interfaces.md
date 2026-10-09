@@ -102,8 +102,8 @@ panel; that repo owns the app):
   "unavailable" is said without inventing a number: a source that fails reposts
   its last real reading at its *original* stamp and goes stale on NagLight's
   horizon, and one that has never succeeded posts a gauge with no `observed_at`
-  at all, stale on arrival. The timer runs every 10 minutes because two of the
-  five gauges are `weekly`, whose horizon is 24 h. **Not provided:** a Gemini
+  at all, stale on arrival. The timer runs every 10 minutes because four of the
+  six gauges are `weekly`, whose horizon is 24 h. **Not provided:** a Gemini
   gauge (deferred as E11) and OpenCode's `rolling` bucket, which publishes no
   window length — a window this repo would have had to invent. Details in
   `stack/ai-usage/README.md`.
@@ -113,14 +113,17 @@ post to `/api/feed` from this box or the stack; each row cites its code):
 
 - **IF-035** — `Implemented`. The frame-freshness lane,
   `stack/tracker/frame-freshness.sh`: colour `green` or `yellow` only, posted by
-  `docker exec` of the tracker container; a failed report exits 1 so the unit
-  shows it.
+  `docker exec` of the tracker container; `--check` posts nothing, and in
+  `--report` mode exit 0/2 (green/yellow) applies only when the report
+  succeeded — a failed report exits 1 so the unit shows it.
 - **IF-036** — `Implemented`. The tracker-definitions guard,
   `stack/tracker/tracker-defs-guard.sh`: colour `green`, `yellow` or `red`; a
   failed post changes the exit status only through the unknown-check escalation.
 - **IF-037** — `Draft`. The Finance-Auditor colour lane, posted by the
   `finance-auditor` service that `stack/docker-compose.yml` runs; the wire contract
-  is Finance-Auditor's IF-001. Failure is logged and not turned into a nonzero exit.
+  is Finance-Auditor's IF-001. `reason` is 1-80 characters and `color` is from
+  Finance-Auditor's colour order; the same URL and headers also carry its separate
+  gauge POST. Failure is logged and not turned into a nonzero exit.
 
 ---
 

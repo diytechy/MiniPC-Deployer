@@ -11,7 +11,37 @@ joins both, retains `DATA_SOURCE=actual` and has no Sure startup dependency.
 The future read-only API URL is `http://sure-web:3000`.
 `FINANCE_TRACKER_FEED_USER` is a separate non-secret Google sub. The header fix
 is dispatched in Finance-Auditor `docs/status.md`, "Dispatched from HomeHub";
-it is not merged by this preparation. Actual remains unchanged.
+it is not merged by this preparation. The Actual service is preserved; new FA
+env wiring has the merge-order dependency below.
+
+**Merge-order dependency:** this Compose wiring must not reach the hub until
+Finance-Auditor's empty-as-absent fix is included in the FA image the hub builds.
+Compose exports blank optional `TRACKER_FEED_USER` and `SURE_API_KEY`; FA's
+current bridge rejects the former even on the Actual path. Its fix must cover
+`TRACKER_FEED_USER`, `SURE_API_KEY`, `SURE_URL` and `DATA_SOURCE`. Static tests
+prove mappings and defaults only, not that the current FA accepts them.
+
+## What changes with the profile off
+
+Sure containers stay off. The Caddy site and Technitium DNS provisioning remain
+active, following the repo's current household-site convention (Caddyfile's
+"EACH SITE IS LIVE FROM DAY ONE"). There is no automatic profile-to-site gate;
+older commented tier-2 stubs are explicitly an obsolete public shape.
+`SURE_HOST` and `APP_DOMAIN` default to `sure.<domain>` when the subdomain knob is
+absent. Caddy will request its real certificate even while Sure is off, answer
+LAN requests with 502, and deny other sources with 403. Enabling the profile
+does not decide outside-LAN access.
+
+**Owner enablement item:** Sure defaults to open LAN registration. The default
+is env-settable (`ONBOARDING_STATE` in `app/models/setting.rb:201-207`), but an
+existing saved setting takes precedence (`:226-236`). We leave it unset for
+first-account bootstrap. Create the first household account, then set hosting
+onboarding to **invite-only before allowing other LAN clients to register**.
+Leave the invite-only default-family ID blank so invite codes are required;
+an existing family invitation token is also accepted. Evidence:
+`app/controllers/concerns/invitable.rb:9-17`,
+`app/controllers/registrations_controller.rb:61-94,123-127`.
+The LAN gate does not itself restrict household account creation.
 
 ## Registry evidence and payload
 
@@ -23,13 +53,13 @@ No image layers were fetched. Sure's amd64 config OCI revision matches source
 | Tag | Index SHA-256 | Linux amd64 manifest SHA-256 |
 |---|---|---|
 | `ghcr.io/we-promise/sure:0.7.5-hotfix.2` | `aa46be2d8e3f8b2182261dc05933a64b4a12543dd5f44ad12f08868caac1f997` | `cd6706f544cd5f9b299a586d719776cf2595b483ea1f1a396137da0d23eafb20` |
-| `postgres:16` | `ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d` | `75adc2a65806c96bc0e59030230bfe3f1c1b0d6d8f8181a8913e2b8b53bdc166` |
-| `redis:latest` | `2c2dff791878316e3b083188be0d578423b24813cdda5de0e80ea4f7b3e6bfd6` | `6e9101032a2126aeeb4b1e862ac77d2fcf26b831ae37e5ff2e69169f82ddd411` |
+| `postgres:16.15` | `ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d` | `75adc2a65806c96bc0e59030230bfe3f1c1b0d6d8f8181a8913e2b8b53bdc166` |
+| `redis:8.10.2` | `2c2dff791878316e3b083188be0d578423b24813cdda5de0e80ea4f7b3e6bfd6` | `6e9101032a2126aeeb4b1e862ac77d2fcf26b831ae37e5ff2e69169f82ddd411` |
 
-Upstream's example specifies Redis `latest`; config metadata identifies it as
-`8.10.2`. The immutable digest preserves the upstream tag selection; no numeric
-Redis version was named by upstream. Postgres metadata identifies
-`16.15-1.pgdg13+2`. The exporter derives its list from Compose and selected
+Upstream's example specifies Redis `latest` and Postgres `16`. Registry config
+metadata identifies `8.10.2` and `16.15-1.pgdg13+2`. Independently queried explicit
+tags `8.10.2` and `16.15` resolve to the same index digests above; these explicit
+tags follow this repo's plain-version convention. The exporter derives its list from Compose and selected
 profiles, including `EXTRA_PROFILES`; a future bake must select `sure` even if
 runtime activation follows later. No duplicate image list is needed. Diun
 watches Docker containers by default; all four explicitly opt in. These public
@@ -98,11 +128,26 @@ database, recover attachments, and reconcile accounts before any cutover. This
 work neither runs recovery nor automatically replaces a database on reimage.
 TOC parsing and tar/hash checks do not establish restorability.
 
+**Restore dependency — NEVER ROTATE `SECRET_KEY_BASE`.** Self-hosted Sure derives
+Active Record encryption keys from it
+(`config/initializers/active_record_encryption.rb:23-36`). A ledger dump cannot
+recover encrypted SimpleFIN access URLs/provider keys without the exact original
+key; rotating it makes those columns unreadable. Preserve `SureSecretKeyBase`
+in the operator's canonical user/machine-scoped DPAPI `~\DeployProps.xml` and
+protected materialised install `.env`/ISO. Before ledger use, preserve it through
+HomeHub's existing encrypted-vault export and retain the recovery factors
+(`HomeHub/SECRET_HANDOFF.md`, T3 vault amendment). A pre-mint export lacks it.
+Recover the original key with the dump; never mint a replacement for recovery.
+This work has not created or verified that escrow artifact.
+
 HomeHub T3 optional store keys `SureSecretKeyBase`, `SureDbPassword` and
 `FinanceSureApiKey` map to `SURE_SECRET_KEY_BASE`, `SURE_DB_PASSWORD` and
 `FINANCE_SURE_API_KEY`. Optional during preparation avoids demanding new
-secrets for unrelated Actual materialisation. Supply both Sure startup secrets
-before selecting `sure`; create the bridge key with read scope in Sure before
+secrets for unrelated Actual materialisation. Optional does **not** prevent
+minting: `PrepDeploySecrets.ps1 -NonInteractive` generates absent
+`SureSecretKeyBase` (`GeneratedHex`) and `SureDbPassword` (`Generated`) even when
+Sure is off (Generated/GeneratedHex branches, lines405-417). Run normal secret
+preparation/materialisation before selecting `sure`; create the bridge key with read scope in Sure before
 the later source cutover. No values were minted here.
 
 SimpleFIN setup token is entered in Sure UI, not env: `app/views/simplefin_items/new.html.erb:16`,
@@ -118,3 +163,7 @@ HTTP API/health traffic remains internal with `RAILS_ASSUME_SSL=true`.
 **NOT proven:** startup, image executables, TLS/network/login/invites, provider
 sync, bridge key scope/API access, runtime telemetry absence, pg_dump execution
 or restore. No deployment, image pull, SSH, lab run, box contact or push.
+Offline bake/save/load was not tested: under Docker's classic image store,
+`docker save/load` of a `tag@digest` reference drops RepoDigests. If `sure` is
+baked, Owner must verify that digest-based references resolve after loading the
+payload; this authoring work does not prove that path.

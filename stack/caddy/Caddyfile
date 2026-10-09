@@ -407,10 +407,14 @@
     }
 }
 
-# Sure uses its own household logins, scoped to LAN (FA DEC-21).
+# ── sure.<domain> — household finance, own logins, LAN only (FA DEC-21) ──
+# Site stays live with profile off: ACME certificate request and LAN 502.
+# See sure/README.md before activation.
 # Implements: SR-062, LLR-1042. Keep global options before all site blocks.
 {$SURE_HOST} {
     import acme_cloudflare
+    import access_log
+    encode zstd gzip
     @sure_lan remote_ip {$LAN_CIDR}
     handle @sure_lan {
         reverse_proxy sure-web:3000

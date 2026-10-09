@@ -228,10 +228,12 @@ sequenceDiagram
     alt missing or stopped optional container
         Backup-->>Backup: Loud SOURCE MISSING, SET SKIPPED; no fresh ledger
         Backup->>Drive: Continue other sets and ordinary retention (history not frozen)
+    else Docker query failure
+        Backup-->>Backup: Fail run; no rotation of previous good copy
     else running container
         Backup->>DB: pg_dump custom format through container exec
         DB-->>Backup: Logical dump stream
-    alt Docker query failure, failed, empty or invalid dump / TOC
+    alt failed, empty or invalid dump / TOC
         Backup-->>Backup: Fail run; no rotation of previous good copy
     else validated structure
         Backup->>Drive: Existing archive + checksums + manifest

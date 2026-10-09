@@ -1,6 +1,6 @@
 """Drive the logical-dump shell boundary with a fake Docker CLI.
 
-Verifies SR-065, LLR-1045; TC-1105..TC-1110. No daemon, image or ledger.
+Verifies SR-065, LLR-1045; TC-1105..TC-1110, TC-1114..TC-1117. No daemon, image or ledger.
 """
 import os
 from pathlib import Path

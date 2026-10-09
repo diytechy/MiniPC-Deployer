@@ -221,8 +221,8 @@ postgres_dump() {
     [ "${PLAN_ONLY:-0}" != 1 ] || return 0
     # A successful list distinguishes an optional absent container from a broken
     # daemon/CLI. The exact name filter must not match similarly named services.
-    local state
-    state="$(docker container ls --all --filter "name=^/${container}$" --format '{{.State}}')" || return 1
+    local state name_filter="${container//./[.]}"
+    state="$(docker container ls --all --filter "name=^/${name_filter}$" --format '{{.State}}')" || return 1
     case "$state" in
         running) ;;
         ''|created|exited|paused|restarting|removing|dead) return 2 ;;

@@ -45,7 +45,8 @@ def test_sure_registry_pins_sr061():
     for key in ("SURE_IMAGE_TAG", "SURE_POSTGRES_IMAGE_TAG", "SURE_REDIS_IMAGE_TAG"):
         assert re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", knobs[key])
     assert knobs["SURE_IMAGE_TAG"] == "0.7.5-hotfix.2@sha256:aa46be2d8e3f8b2182261dc05933a64b4a12543dd5f44ad12f08868caac1f997"
-    assert knobs["SURE_POSTGRES_IMAGE_TAG"].startswith("16@")
+    assert knobs["SURE_POSTGRES_IMAGE_TAG"].startswith("16.15@")
+    assert knobs["SURE_REDIS_IMAGE_TAG"].startswith("8.10.2@")
     services = stack()["services"]
     assert services["sure-web"]["image"] == services["sure-worker"]["image"] == "ghcr.io/we-promise/sure:${SURE_IMAGE_TAG}"
     assert services["sure-postgres"]["image"] == "postgres:${SURE_POSTGRES_IMAGE_TAG}"
@@ -65,15 +66,19 @@ def test_sure_own_login_lan_tls_sr062():
     assert "remote_ip {$LAN_CIDR}" in site
     assert 'respond "Forbidden" 403' in site
     assert "reverse_proxy sure-web:3000" in site
+    assert "import access_log" in site and "encode zstd gzip" in site
     assert "oauth2-proxy" not in site and "X-Forwarded-User" not in site and "basic_auth" not in site
-    assert stack()["services"]["caddy"]["environment"]["SURE_HOST"] == "${SURE_SUBDOMAIN}.${DOMAIN}"
+    assert stack()["services"]["caddy"]["environment"]["SURE_HOST"] == "${SURE_SUBDOMAIN:-sure}.${DOMAIN}"
     for name in ("sure-web", "sure-worker"):
         settings = stack()["services"][name]["environment"]
-        assert settings["APP_DOMAIN"] == "${SURE_SUBDOMAIN}.${DOMAIN}"
+        assert settings["APP_DOMAIN"] == "${SURE_SUBDOMAIN:-sure}.${DOMAIN}"
         assert settings["RAILS_FORCE_SSL"] == settings["RAILS_ASSUME_SSL"] == "true"
 
 
 def test_finance_defaults_and_separate_user_sr063():
+    """Prove wiring only; blanks require FA's empty-as-absent fix in its image."""
+    # Compose exports blank optional values. Their runtime acceptance is an FA
+    # merge-order dependency, not a claim this static contract can establish.
     service = stack()["services"]["finance-auditor"]
     settings = service["environment"]
     assert settings["DATA_SOURCE"] == "${FINANCE_DATA_SOURCE:-actual}"

@@ -42,7 +42,7 @@ x-sure-environment: &sure-environment
   DB_HOST: sure-postgres
   DB_PORT: "5432"
   REDIS_URL: redis://sure-redis:6379/1
-  APP_DOMAIN: ${SURE_SUBDOMAIN}.${DOMAIN}
+  APP_DOMAIN: ${SURE_SUBDOMAIN:-sure}.${DOMAIN}
   RAILS_FORCE_SSL: "true"
   RAILS_ASSUME_SSL: "true"
   # Empty explicit values also override any inherited image defaults.
@@ -113,7 +113,7 @@ services:
       LAN_IP: ${LAN_IP}
       TRACKER_HOST: ${TRACKER_SUBDOMAIN}.${DOMAIN}
       ACTUAL_HOST: ${ACTUAL_SUBDOMAIN}.${DOMAIN}
-      SURE_HOST: ${SURE_SUBDOMAIN}.${DOMAIN}
+      SURE_HOST: ${SURE_SUBDOMAIN:-sure}.${DOMAIN}
       # The LLM gateway site (SR-043). Joined here from a bare subdomain label,
       # exactly as TRACKER_HOST and ACTUAL_HOST above are, so the wildcard DDNS
       # record already resolves it and no new public name is created.

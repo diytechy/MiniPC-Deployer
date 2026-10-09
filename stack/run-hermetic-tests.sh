@@ -22,6 +22,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SUITES=(
+    "backup/tests/postgres-source.test.sh"
     "backup/tests/plan-and-retention.test.sh"
     "backup/tests/flat-layout.test.sh"
     "backup/tests/library-backup-state.test.sh"

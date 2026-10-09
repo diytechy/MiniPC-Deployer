@@ -188,20 +188,67 @@ compression_decision() {
 #   //host/share            cifs pull over the LAN (the original form)
 #   volume:VOL              docker named volume on THIS box, copied live
 #   volume:VOL@CONTAINER    stop CONTAINER first, copy, restart right after
+#   postgres:CONTAINER      logical dump with image-shipped pg_dump/pg_restore
 #   path:/abs/dir           a local directory on this box
 # Lines starting with # are skipped by backup.sh, so the table can carry
 # commented-out entries. One table drives one execution sequence — every set,
 # whatever its source kind, flows through the same archive/hash/manifest/
-# retention/offsite/report pipeline.
+# retention/report pipeline (offsite staging is removed).
 
-# source_kind SPEC : echoes cifs|volume|path|bad. Pure — no I/O, unit-greppable.
+# source_kind SPEC : echoes cifs|volume|postgres|path|bad. Pure — no I/O.
 source_kind() {
     case "$1" in
         //*)      echo cifs ;;
         volume:*) echo volume ;;
+        postgres:*) echo postgres ;;
         path:/*)  echo path ;;
         *)        echo bad ;;
     esac
+}
+
+# postgres_dump CONTAINER DESTINATION : collect one logical ledger dump.
+# Contract: Inputs: named running Postgres container and destination file path.
+# Outputs: atomically replaced dump; 0 success, 2 absent/stopped, 1 failure.
+# Config: PLAN_ONLY=1 suppresses all Docker queries and writes. POSTGRES_USER and
+# POSTGRES_DB select the database; local socket auth uses no password in argv.
+# Errors: failed/empty/invalid dump or unreadable table of contents leaves the
+# destination untouched. pg_restore --list checks structure, NOT restorability.
+# Implements: SR-065, LLR-1045.
+postgres_dump() {
+    local container="$1" destination="$2" partial="$2.partial"
+    # Container names are identifiers, not Docker options or source paths.
+    [[ "$container" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || return 1
+    [ "${PLAN_ONLY:-0}" != 1 ] || return 0
+    # A successful list distinguishes an optional absent container from a broken
+    # daemon/CLI. The exact name filter must not match similarly named services.
+    local state name_filter="${container//./[.]}"
+    state="$(docker container ls --all --filter "name=^/${name_filter}$" --format '{{.State}}')" || return 1
+    case "$state" in
+        running) ;;
+        ''|created|exited|paused|restarting|removing|dead) return 2 ;;
+        *) return 1 ;;
+    esac
+    # The caller supplies a private staging directory; restrictive mode keeps
+    # raw finance data away from other local users even while the dump is made.
+    (
+        umask 077
+        if ! docker exec "$container" sh -c \
+            'exec pg_dump --format=custom --no-password --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' >"$partial"; then
+            rm -f -- "$partial"
+            return 1
+        fi
+        # Validate both signature and pg_restore's TOC parsing before promotion.
+        # A successful CLI exit with no output is not a successful backup.
+        if [ ! -s "$partial" ] || [ "$(head -c 5 "$partial")" != PGDMP ] \
+            || ! docker exec -i "$container" pg_restore --list <"$partial" >/dev/null; then
+            rm -f -- "$partial"
+            return 1
+        fi
+        if ! mv -f -- "$partial" "$destination"; then
+            rm -f -- "$partial"
+            return 1
+        fi
+    )
 }
 
 # newest_run_with_set BASE SET : the newest sibling run directory whose MANIFEST

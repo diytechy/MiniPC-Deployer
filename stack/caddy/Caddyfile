@@ -407,6 +407,23 @@
     }
 }
 
+# ── sure.<domain> — household finance, own logins, LAN only (FA DEC-21) ──
+# Site stays live with profile off: ACME certificate request and LAN 502.
+# See sure/README.md before activation.
+# Implements: SR-062, LLR-1042. Keep global options before all site blocks.
+{$SURE_HOST} {
+    import acme_cloudflare
+    import access_log
+    encode zstd gzip
+    @sure_lan remote_ip {$LAN_CIDR}
+    handle @sure_lan {
+        reverse_proxy sure-web:3000
+    }
+    handle {
+        respond "Forbidden" 403
+    }
+}
+
 # ══ THE ADMIN PORTAL — *.admin.<domain> (ADMIN_PORTAL_PLAN §4, P1-P4) ════════
 # Five sites, one login. Each is wrapped the same way, and every part of the
 # wrapping is load-bearing:

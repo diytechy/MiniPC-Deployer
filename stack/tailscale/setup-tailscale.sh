@@ -33,6 +33,18 @@
 # admits a device to a tunnel that reaches the entire LAN. TC-977 asserts that
 # no such flag or field exists anywhere in the repo, the payload or the store.
 #
+# THE EXIT NODE IS A KNOB, OFF BY DEFAULT: TAILSCALE_ADVERTISE_EXIT_NODE=true|false
+# (HomeHub docs/EXIT_NODE_PLAN_2026-09-22.md). True makes this node OFFER itself
+# as an exit node, and that alone routes nothing: the Owner must approve "Use as
+# exit node" for it in the admin console, and after that each device opts in for
+# itself (Exit node -> homehub, or None). It is converged with `tailscale set`,
+# never `tailscale up`: `set` changes only the preferences it names, while `up`
+# expects the whole configuration, so an `up` that left out the route flag would
+# put the LAN route - which remote access depends on - at risk. The result is
+# read back from `tailscale debug prefs`, and a run that finds the LAN route gone
+# FAILS. Setting it back to false is the hub half of a switch-off: move every
+# device to None FIRST, or one still pointing here loses its internet.
+#
 # Usage: setup-tailscale.sh [--check-only]
 # Exit 0 = converged, or disabled, or waiting for the Owner to authorise.
 #        1 = failed.
@@ -48,11 +60,13 @@ MODE="${1:-}"
 TAILSCALE_ENABLED="${TAILSCALE_ENABLED:-false}"
 TAILSCALE_ADVERTISE_ROUTES="${TAILSCALE_ADVERTISE_ROUTES:-}"
 TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-homehub}"
+TAILSCALE_ADVERTISE_EXIT_NODE="${TAILSCALE_ADVERTISE_EXIT_NODE:-false}"
 
 if [ -f "$ENV_FILE" ]; then
     # Read only the keys we own, and never `source` a file that may hold
     # secrets into this shell's environment wholesale.
-    for key in TAILSCALE_ENABLED TAILSCALE_ADVERTISE_ROUTES TAILSCALE_HOSTNAME; do
+    for key in TAILSCALE_ENABLED TAILSCALE_ADVERTISE_ROUTES TAILSCALE_HOSTNAME \
+               TAILSCALE_ADVERTISE_EXIT_NODE; do
         value="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
         [ -n "$value" ] && printf -v "$key" '%s' "$value"
     done
@@ -61,6 +75,43 @@ fi
 log() { printf '%s\n' "$*"; }
 fail() { log "ERROR: $*"; exit 1; }
 refuse() { log "REFUSED: $*"; exit 2; }
+
+# THE ROUTES AS THE DAEMON HOLDS THEM, read from `tailscale debug prefs` (JSON),
+# never from the human `status` table. An exit node has no field of its own: it
+# IS 0.0.0.0/0 and ::/0 together in AdvertiseRoutes (Prefs.AdvertisesExitNode ->
+# tsaddr.ContainsExitRoutes, ipn/prefs.go). Parsed as JSON and compared as
+# networks, because a substring test over this output is not a state test.
+# Sets PREFS_MISSING (configured LAN routes that are absent), PREFS_EXIT
+# (on|off|partial), PREFS_CORPDNS and PREFS_ROUTES; returns 1 if unreadable.
+PREFS_PY='
+import ipaddress, json, sys
+try:
+    prefs = json.load(sys.stdin)
+    held = [ipaddress.ip_network(r, strict=False) for r in (prefs.get("AdvertiseRoutes") or [])]
+    want = [r.strip() for r in sys.argv[1].split(",") if r.strip()]
+    missing = [r for r in want if ipaddress.ip_network(r, strict=False) not in held]
+except Exception:
+    print("unreadable")
+    raise SystemExit(0)
+v4 = ipaddress.ip_network("0.0.0.0/0") in held
+v6 = ipaddress.ip_network("::/0") in held
+print("missing=" + ",".join(missing))
+print("exit=" + ("on" if v4 and v6 else "partial" if v4 or v6 else "off"))
+print("corpdns=" + ("true" if prefs.get("CorpDNS") else "false"))
+print("routes=" + ",".join(str(n) for n in held))
+'
+read_prefs() {
+    local json facts
+    command -v python3 >/dev/null 2>&1 || { log "python3 is needed to read the prefs JSON"; return 1; }
+    json="$(tailscale debug prefs 2>/dev/null)" || return 1
+    facts="$(printf '%s' "$json" | python3 -c "$PREFS_PY" "$TAILSCALE_ADVERTISE_ROUTES")" || return 1
+    case "$facts" in unreadable*|'') return 1 ;; esac
+    PREFS_MISSING="$(printf '%s\n' "$facts" | sed -n 's/^missing=//p')"
+    PREFS_EXIT="$(printf '%s\n' "$facts" | sed -n 's/^exit=//p')"
+    PREFS_CORPDNS="$(printf '%s\n' "$facts" | sed -n 's/^corpdns=//p')"
+    PREFS_ROUTES="$(printf '%s\n' "$facts" | sed -n 's/^routes=//p')"
+    return 0
+}
 
 if [ "$TAILSCALE_ENABLED" != "true" ]; then
     log "TAILSCALE_ENABLED is not true - no mesh VPN, no subnet route, nothing installed."
@@ -103,6 +154,15 @@ case "$TAILSCALE_ADVERTISE_ROUTES" in
             Advertise the LAN only; the tunnel routes its own space itself."
         fi
         ;;
+esac
+
+# Exactly true or false. Anything else is refused rather than read as one or
+# the other: guessing "false" would silently withdraw an exit node devices may
+# be using, and guessing "true" would offer one nobody chose.
+case "$TAILSCALE_ADVERTISE_EXIT_NODE" in
+    true|false) ;;
+    *) refuse "TAILSCALE_ADVERTISE_EXIT_NODE is '$TAILSCALE_ADVERTISE_EXIT_NODE'. It
+    must be exactly true or false." ;;
 esac
 
 if [ "$MODE" = "--check-only" ]; then
@@ -158,6 +218,32 @@ if [ "$MODE" = "--check-only" ]; then
                 # which way is how the previous bug happened.
                 log "check: tailnet lock state UNDETERMINED - output not recognised:"
                 printf '%s\n' "$lock_state" | sed 's/^/          /'
+            fi
+
+            # READ-ONLY: the routes and the exit node as the daemon holds
+            # them. Advertised is all this box can see; approval is in the
+            # admin console and is reported as pending, never as active.
+            if read_prefs; then
+                if [ -n "$PREFS_MISSING" ]; then
+                    log "check: LAN route MISSING from AdvertiseRoutes: $PREFS_MISSING (held: ${PREFS_ROUTES:-none})"
+                    rc=1
+                else
+                    log "check: LAN route advertised ($TAILSCALE_ADVERTISE_ROUTES); approval is console-side"
+                fi
+                case "$PREFS_EXIT:$TAILSCALE_ADVERTISE_EXIT_NODE" in
+                    on:true)   log "check: exit node ADVERTISED, as configured; usable only once 'Use as exit node' is approved in the admin console" ;;
+                    off:false) log "check: exit node not advertised, as configured" ;;
+                    on:false)  log "check: DRIFT - exit node advertised, but TAILSCALE_ADVERTISE_EXIT_NODE=false"; rc=1 ;;
+                    off:true)  log "check: DRIFT - exit node NOT advertised, but TAILSCALE_ADVERTISE_EXIT_NODE=true"; rc=1 ;;
+                    *)         log "check: exit routes PARTIAL - only one of 0.0.0.0/0 and ::/0 is advertised"; rc=1 ;;
+                esac
+                if [ "$PREFS_CORPDNS" != "false" ]; then
+                    log "check: accept-dns is ON (CorpDNS true) - Technitium must stay this box's resolver"
+                    rc=1
+                fi
+            else
+                log "check: could not read 'tailscale debug prefs' as JSON"
+                rc=1
             fi
         else
             log "check: daemon installed, NOT authorised (run without --check-only)"
@@ -232,9 +318,9 @@ systemctl enable --now tailscaled >/dev/null 2>&1 || fail "could not enable tail
 #
 #   --advertise-routes   the LAN, so hosts that will never run a client are
 #                        reachable through this one.
-#   --advertise-exit-node is NOT passed. Household internet traffic must never
-#                        transit the hub; an exit node is a different product
-#                        decision with a different privacy shape.
+#   --advertise-exit-node only as TAILSCALE_ADVERTISE_EXIT_NODE says (default
+#                        false; see the header). An authorised node is
+#                        converged by step 3a with `set`, never with `up`.
 #   --accept-dns=false   Technitium is this LAN's resolver. Accepting the
 #                        tunnel's DNS would displace the split-horizon records
 #                        that make every service name resolve to a LAN address.
@@ -257,12 +343,50 @@ else
     log " No auth key is used, accepted or stored (LLR-959)."
     log "================================================================"
     log ""
+    # The ONE `up`, reached only when the node is not running (never enrolled,
+    # expired, or `tailscale down`). It names the exit-node knob because `up`
+    # on a node that was enrolled before refuses to run while a non-default
+    # preference goes unmentioned ("requires mentioning all non-default
+    # flags"); without it, re-enrolling a node that offers an exit node fails.
     tailscale up \
         --advertise-routes="$TAILSCALE_ADVERTISE_ROUTES" \
+        --advertise-exit-node="$TAILSCALE_ADVERTISE_EXIT_NODE" \
         --accept-dns=false \
         --hostname="$TAILSCALE_HOSTNAME" \
         || fail "tailscale up failed"
 fi
+
+# ---------------------------------------------------------------------------
+# 3a. The exit node: `set`, naming that one preference and nothing else.
+# ---------------------------------------------------------------------------
+# With --advertise-exit-node alone, `set` recomputes AdvertiseRoutes from the
+# CURRENT list: it adds or removes 0.0.0.0/0 and ::/0 and keeps every other
+# prefix, and returns the list untouched when the state already matches
+# (calcAdvertiseRoutesForSet, cmd/tailscale/cli/set.go). It is called for false
+# as well as true, because false has to converge too - "no call when false"
+# would leave an earlier true in place for ever.
+log "Exit node: converging to TAILSCALE_ADVERTISE_EXIT_NODE=$TAILSCALE_ADVERTISE_EXIT_NODE"
+tailscale set --advertise-exit-node="$TAILSCALE_ADVERTISE_EXIT_NODE" \
+    || fail "tailscale set could not change the exit-node preference to $TAILSCALE_ADVERTISE_EXIT_NODE"
+
+# ---------------------------------------------------------------------------
+# 3b. Read the result back. Verify the artifact, not the exit code.
+# ---------------------------------------------------------------------------
+read_prefs || fail "could not read 'tailscale debug prefs' as JSON, so the routes
+    this node advertises are UNVERIFIED. Check by hand: sudo tailscale debug prefs"
+if [ -n "$PREFS_MISSING" ]; then
+    fail "THE LAN ROUTE IS GONE from AdvertiseRoutes (missing: $PREFS_MISSING;
+    held: ${PREFS_ROUTES:-none}). Every host behind this box is reached through
+    it. Restore it - this keeps the exit-node setting as it is:
+        sudo tailscale set --advertise-routes=$TAILSCALE_ADVERTISE_ROUTES"
+fi
+case "$PREFS_EXIT:$TAILSCALE_ADVERTISE_EXIT_NODE" in
+    on:true|off:false) ;;
+    *) fail "exit routes are '$PREFS_EXIT' after converging to
+    TAILSCALE_ADVERTISE_EXIT_NODE=$TAILSCALE_ADVERTISE_EXIT_NODE (held: ${PREFS_ROUTES:-none})" ;;
+esac
+[ "$PREFS_CORPDNS" = "false" ] \
+    || fail "CorpDNS is true after --accept-dns=false - Technitium must stay this box's resolver"
 
 # ---------------------------------------------------------------------------
 # 4. Report honestly.
@@ -291,6 +415,13 @@ log "in the REPO at stack/tailscale/tailnet-acl.hujson; it is deliberately not"
 log "deployed here, because nothing on this box reads it - the policy in force"
 log "lives server-side and tailscaled never looks at local disk for it."
 log ""
-log "Not done and deliberately so: this node is NOT an exit node, and it does"
-log "NOT accept the tunnel's DNS (Technitium stays this LAN's resolver)."
+if [ "$TAILSCALE_ADVERTISE_EXIT_NODE" = "true" ]; then
+    log "Exit node ADVERTISED and PENDING APPROVAL. Nothing routes through this box"
+    log "until the Owner approves 'Use as exit node' for it in the admin console,"
+    log "and then only for a device that selects it (Exit node -> homehub; off = None)."
+else
+    log "Not an exit node (TAILSCALE_ADVERTISE_EXIT_NODE=false)."
+fi
+log "Deliberately not done: this node does NOT accept the tunnel's DNS"
+log "(Technitium stays this LAN's resolver)."
 exit 0

@@ -344,6 +344,67 @@ elif [ ! -f "$EMAILS_FILE" ]; then
     : > "$EMAILS_FILE"   # empty file so the bind-mount is a file, not a dir
 fi
 
+# ── 2b. admin sign-in file (ADMIN_PORTAL_PLAN_2026-09-22 §3) ─────────────────
+# admin-auth (a second oauth2-proxy) reads `user:bcrypt` from a single-file bind
+# mount of $STACK_DIR/admin-auth/htpasswd. Materialised from ADMIN_AUTH_USER +
+# ADMIN_AUTH_HASH exactly as the allow-list above is, with three differences:
+#
+#   * WRITTEN IN PLACE, AND ONLY WHEN IT CHANGED. `>` truncates the existing
+#     inode, which a single-file bind mount keeps seeing; `install`/`mv` would
+#     swap the inode and the running container would keep the old file for
+#     ever. Unchanged content is not rewritten, so oauth2-proxy's file watcher
+#     is not poked on every boot.
+#   * 0640 root:65532, NOT the allow-list's 0644. This holds a password hash
+#     (T3), and the image runs as uid 65532 whose primary group is 65532
+#     (`nonroot` in the image's /etc/passwd; checked on the pinned v7.15.2).
+#     Group-read is all it needs; no host account has that gid.
+#   * NEVER LOGGED. Not the hash, not its length.
+#
+# THE HASH ARRIVES WITH EVERY `$` DOUBLED. Materialize-Deploy escapes `$` as
+# `$$` in the compose .env (measured on the hub: `$$2b$$12$$…`), and compose
+# un-doubles it for containers - but this file is not read by compose. Written
+# raw, every sign-in would 401 exactly like a wrong password. env_value collapses
+# `$$` to `$` and leaves a hand-written single-`$` hash as it is; the result
+# must then look like bcrypt or nothing is written.
+#
+# firstboot runs on every boot (see the header), so this converges each time.
+# A placeholder or empty hash leaves the file as it is (or creates it empty, so
+# docker binds a file and not a directory) and warns. admin-auth REFUSES TO
+# START on an empty file ("doesn't contain a single valid user entry", measured
+# on v7.15.2), so the gated sites answer 502 - closed, and loudly, which is the
+# safe way to be unconfigured.
+ADMIN_AUTH_UID_GID=65532
+HTPASSWD_FILE="$STACK_DIR/admin-auth/htpasswd"
+mkdir -p "$STACK_DIR/admin-auth"
+if [ -d "$HTPASSWD_FILE" ]; then
+    # docker creates a missing bind source as a DIRECTORY. An empty one is that
+    # artefact and is safe to replace; anything else is left for a human.
+    rmdir "$HTPASSWD_FILE" 2>/dev/null \
+        && log "2b: removed an empty directory docker had created at admin-auth/htpasswd" \
+        || log "WARNING: 2b: admin-auth/htpasswd is a non-empty DIRECTORY - not touching it; admin sign-in will not work"
+fi
+if [ ! -d "$HTPASSWD_FILE" ]; then
+    __admin_user="$(env_value ADMIN_AUTH_USER)"
+    __admin_hash="$(env_value ADMIN_AUTH_HASH)"
+    if [ -z "$__admin_hash" ] || [ "${__admin_hash#*REPLACE_WITH}" != "$__admin_hash" ]; then
+        log "WARNING: 2b: ADMIN_AUTH_HASH is empty or a placeholder - admin sign-in file left unchanged; nobody can sign in to *.admin until it is set"
+    elif ! [[ "$__admin_user" =~ ^[A-Za-z0-9._@-]{1,64}$ ]]; then
+        log "WARNING: 2b: ADMIN_AUTH_USER is empty or has characters an htpasswd line cannot carry - admin sign-in file left unchanged"
+    elif ! [[ "$__admin_hash" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]]; then
+        log "WARNING: 2b: ADMIN_AUTH_HASH is not a bcrypt hash (\$2a\$/\$2b\$/\$2y\$) - admin sign-in file left unchanged"
+    elif [ "$(cat "$HTPASSWD_FILE" 2>/dev/null)" = "$__admin_user:$__admin_hash" ]; then
+        log "2b: admin sign-in file unchanged (user '$__admin_user')"
+    else
+        printf '%s:%s\n' "$__admin_user" "$__admin_hash" > "$HTPASSWD_FILE" \
+            && log "2b: admin sign-in file written in place (user '$__admin_user')" \
+            || log "WARNING: 2b: could not write admin-auth/htpasswd"
+    fi
+    unset __admin_user __admin_hash
+    [ -e "$HTPASSWD_FILE" ] || : > "$HTPASSWD_FILE"
+    chown "root:$ADMIN_AUTH_UID_GID" "$HTPASSWD_FILE" 2>/dev/null || log "WARN: 2b: could not chgrp admin-auth/htpasswd to $ADMIN_AUTH_UID_GID"
+    chmod 0640 "$HTPASSWD_FILE" 2>/dev/null || log "WARN: 2b: could not chmod admin-auth/htpasswd"
+fi
+
 # ── 3. load the baked image payload (Q10.9 B+ ALL-IMAGES) ─────────────────────
 # A freshly-imaged AWOW carries every stack image as a docker-save tar in the
 # deploy payload (built by vmtest/export-images.sh, versions pinned to the
@@ -1260,6 +1321,68 @@ else
     log "rustdesk: no payload at $STACK_DIR/rustdesk - skipping (correct for a build without it)"
 fi
 
+# ── 4-pre-a3. DNS CONSOLE FENCE (ADMIN_PORTAL_PLAN_2026-09-22 §4.5, D-A5) ──
+# Technitium's console (tcp/5380) fenced to loopback and the pinned admin
+# network, ABOVE Tailscale's ts-input jump - see dns-console-fence.sh for why
+# above, and for the tailscaled source that moves the jump on every start.
+# Four units: the boot fence (Before=docker), a hook that re-asserts after every
+# tailscaled start, and a 2-minute check timer that re-asserts and alerts.
+#
+# SAME SHAPE AS THE RUSTDESK BLOCK: file copying, every line WARNs rather than
+# dies, and none of it can stop the stack below from coming up. That matters
+# twice here: D-A5 says a fence failure must never cost the household its
+# resolver, so this block must not be able to stop `docker compose up` either.
+#
+# RESTART, NOT START, OF THE BOOT UNIT. firstboot re-runs on every boot and after
+# a payload update in place; `start` on an active RemainAfterExit unit is a
+# no-op, so a changed script or subnet would wait for a reboot. The fence
+# converges idempotently, so restarting it is cheap. The hook unit is only
+# enabled: it runs when tailscaled next starts.
+if [ -d "$STACK_DIR/dns-console" ]; then
+    chmod 0755 "$STACK_DIR/dns-console/dns-console-fence.sh" 2>/dev/null || log "WARN: could not chmod dns-console-fence.sh"
+    for __u in homehub-dns-console.service homehub-dns-console-tailscaled.service \
+               homehub-dns-console-check.service homehub-dns-console-check.timer; do
+        install -m 0644 "$STACK_DIR/dns-console/$__u" /etc/systemd/system/ 2>/dev/null || log "WARN: could not install $__u"
+    done
+    systemctl daemon-reload 2>/dev/null || log "WARN: systemctl daemon-reload failed"
+    systemctl enable homehub-dns-console.service homehub-dns-console-tailscaled.service \
+                     homehub-dns-console-check.timer >/dev/null 2>&1 \
+        || log "WARN: could not enable the dns-console units - tcp/5380 would be unfenced after a reboot"
+    systemctl restart homehub-dns-console.service >/dev/null 2>&1 \
+        || log "WARN: the DNS-console fence did not assert (journalctl -u homehub-dns-console). Technitium keeps running (D-A5); the check timer retries and alerts"
+    systemctl start homehub-dns-console-check.timer >/dev/null 2>&1 || log "WARN: could not start homehub-dns-console-check.timer"
+    log "dns-console: fence $(systemctl is-active homehub-dns-console.service 2>/dev/null || true), check timer $(systemctl is-active homehub-dns-console-check.timer 2>/dev/null || true)"
+else
+    log "dns-console: no payload at $STACK_DIR/dns-console - skipping (correct for a build without it)"
+fi
+
+# ── 4-pre-a4. COCKPIT ON LOOPBACK ONLY (ADMIN_PORTAL_PLAN_2026-09-22 D-A3) ──
+# A drop-in resets cockpit.socket's ListenStream to 127.0.0.1:9090; reached over
+# `ssh -L 9090:127.0.0.1:9090`. stack/cockpit/listen.conf says why the reset line
+# is load-bearing and why there is no [::1] listener.
+#
+# ASKED OF THE INPUT: the drop-in is (re)installed and the socket restarted only
+# when the installed copy differs from the payload's, so a routine re-run does
+# not bounce a Cockpit session someone has open. Skipped when cockpit is not
+# installed (a box built without it, or the lab).
+if [ ! -f "$STACK_DIR/cockpit/listen.conf" ]; then
+    log "cockpit: no payload at $STACK_DIR/cockpit - skipping the loopback drop-in"
+elif systemctl cat cockpit.socket >/dev/null 2>&1; then
+    if ! cmp -s "$STACK_DIR/cockpit/listen.conf" /etc/systemd/system/cockpit.socket.d/listen.conf; then
+        if mkdir -p /etc/systemd/system/cockpit.socket.d \
+           && install -m 0644 "$STACK_DIR/cockpit/listen.conf" /etc/systemd/system/cockpit.socket.d/listen.conf; then
+            systemctl daemon-reload 2>/dev/null || log "WARN: systemctl daemon-reload failed"
+            systemctl restart cockpit.socket 2>/dev/null || log "WARN: cockpit.socket did not restart - check 'systemctl status cockpit.socket'"
+            log "cockpit: loopback-only drop-in installed and socket restarted"
+        else
+            log "WARN: could not install the cockpit.socket drop-in - Cockpit still answers on every interface"
+        fi
+    fi
+    log "cockpit: listening on $(ss -Htln 'sport = :9090' 2>/dev/null | awk '{printf "%s ", $4}' || true)"
+else
+    log "cockpit: cockpit.socket not present - skipping the loopback drop-in"
+fi
+
 # ── devpc-wake: install the unit always, ENABLE it only on the knob (SR-044) ──
 #
 # A SYSTEMD UNIT, NOT A COMPOSE SERVICE. It sends a magic packet, which needs a
@@ -1620,13 +1743,14 @@ install -m 0755 "$STACK_DIR/tracker/frame-freshness.sh" /usr/local/sbin/homehub-
 install -m 0644 "$STACK_DIR/tracker/homehub-frame-freshness.service" /etc/systemd/system/homehub-frame-freshness.service
 install -m 0644 "$STACK_DIR/tracker/homehub-frame-freshness.timer"   /etc/systemd/system/homehub-frame-freshness.timer
 
-# -- fail2ban for the two password-guarded Caddy sites (the Owner, 2026-08-29) --
+# -- fail2ban for the password-guarded Caddy sites (the Owner, 2026-08-29) ------
 #
-# actual.<domain> and dns.<domain> are the only surfaces on this box whose gate
-# is a password rather than Google sign-in, and the router forwards :80/:443 to
-# Caddy. Three layers now sit in front of them, and this is the third:
+# Since the admin portal (2026-09-25) the password-guarded surface is the admin
+# sign-in at admin.<domain> - one login for every *.admin.<domain> site - and a
+# wrong password there is the 401 this jail bans on. Three layers sit in front
+# of it, and this is the third:
 #
-#   1. the Caddyfile remote_ip gate  - takes them off the internet entirely
+#   1. the Caddyfile remote_ip gate  - takes it off the internet entirely
 #   2. the caddy-ratelimit plugin    - 120 requests/min/IP, blunts speed
 #   3. this                          - bans persistence, at the FIREWALL
 #
@@ -2088,6 +2212,10 @@ if [ "${TAILSCALE_ENABLED:-false}" = "true" ]; then
             log "       BEFORE a second device joins - the default policy lets every"
             log "       node reach every node, and this node advertises the whole LAN"
             log "    4. enable tailnet lock"
+            if [ "$(_env_val TAILSCALE_ADVERTISE_EXIT_NODE | tr -d '"')" = "true" ]; then
+                log "    5. approve Use as exit node for homehub in the Tailscale console (a reimaged"
+                log "       hub enrols as a new node, so the approval does not survive a reimage)"
+            fi
             log "  NONE OF THIS SURVIVES A REIMAGE - re-install and re-authorise."
         else
             log "  WARNING: setup-tailscale.sh refused or failed - this box has NO"

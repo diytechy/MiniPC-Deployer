@@ -43,8 +43,13 @@ docker compose -p homehub-sim \
    OIDC discovery).
 2. **split-horizon DNS** — `dig @technitium` returns the sim LAN IP for the
    tracker/actual/apex names.
-3. **Caddy + auth** — through Caddy's **internal CA**: tracker → 302 to Dex (no
-   basic_auth); actual → 401 without basic_auth, 200 with it.
+3. **Caddy + auth** — through Caddy's **internal CA**: tracker → 302 to Dex.
+   The admin portal: the old `actual.` name → 302 into `actual.admin.`;
+   `actual.admin.` without a cookie → 302 to the admin sign-in with the original
+   URL escaped in `rd`; the sign-in page is the custom template (password form,
+   no provider button); a wrong password → 401; the right one → 302 and a cookie
+   scoped to `.admin.<domain>`, `Secure`; then `actual.admin.` → 200; the
+   tracker ignores the admin cookie.
 4. **oauth2-proxy + Dex** — unauthenticated → 302 to Dex, then a **full headless
    login** (curl cookie-jar dance) lands on the authenticated tracker page.
 5. **multi-user isolation** — `X-Forwarded-User` A vs B (direct to `tracker:8787`,
@@ -80,9 +85,11 @@ vantage — that stays a hardware/V3 remainder.
 | DNS | Technitium host-net :53 | bridge + alt host API port; `dig @technitium` from the client | systemd-resolved owns loopback :53 on WSL; can't share host :53 |
 | OIDC | `provider=google` | `provider=oidc`, issuer = Dex (`sim/dex/`) | no Google client needed to exercise the whole login path |
 | TLS | public ACME | Caddy `local_certs` internal CA (`sim/caddy/Caddyfile.sim`) | a local box can't ACME a real public domain |
-| basic_auth | `{$VAR}` from `.env` | inlined fictional bcrypt in Caddyfile.sim | avoids `$`-in-env-file escaping; the credential is a sim fixture |
+| admin login credential | `admin-auth/htpasswd`, written by firstboot from `ADMIN_AUTH_USER`/`_HASH` | committed fixture `sim/admin-auth/htpasswd.sim` (`simadmin` / `simpass`) | no firstboot in the sim; the credential is a sim fixture |
+| admin-auth image | `OAUTH2_PROXY_IMAGE_TAG` (v7.15.2) | `SIM_ADMIN_AUTH_IMAGE_TAG` (v7.15.2) | the sim still pins the tracker's oauth2-proxy at v7.6.0, which rejects `--trusted-proxy-ip` |
+| admin sites | five, each `@lan`-gated, throttled sign-in | `admin.`, `actual.admin.`, `dns.admin.`; no `@lan` gate, no throttle | the sim has never carried the LAN gates; both are proven by HomeHub's admin-portal harness |
 | ddns | Cloudflare updater | disabled (`profile: sim-disabled`) | zero real Cloudflare calls |
-| aux (Kuma/Dozzle) | LAN_IP-bound | disabled | they bind a fictional LAN_IP; out of the V1 gate scope |
+| aux (Kuma/Dozzle) | loopback-bound, reached via `kuma.admin.` / `logs.admin.` | disabled | out of the V1 gate scope |
 | tracker data perms | (needs NagLight Dockerfile chown — see status.md) | `init-perms` one-shot chowns the volume to uid 1000 | surfaced a real NagLight bug; the sim reproduces the fixed end-state |
 | wall kiosk port | published bound to `LAN_IP` (the router never forwards it) | not host-published at all; probes reach it over the compose network | `LAN_IP` is fictional here and unbindable on the WSL host |
 | wall panel identity | a LAN host with a DHCP reservation on its hardware MAC | a container with a static lease on the sim-only `simlan` | both are "one known address" — the property the `/32` needs |

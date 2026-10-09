@@ -1051,7 +1051,10 @@ apply_sim_caddy_local_certs() {
     # site body is a Caddy parse error, and the container would restart-loop.
     local lc_line first_site
     lc_line="$(grep -nE '^[[:space:]]*local_certs[[:space:]]*$' "$cf" | cut -d: -f1)"
-    first_site="$(grep -nE '^\(protect_actual\)' "$cf" | cut -d: -f1)"
+    # The first snippet after the global block. (protect_actual) was the anchor
+    # until the admin portal removed it (2026-09-25); acme_cloudflare is defined
+    # first and every site imports it, so it is the steadier choice anyway.
+    first_site="$(grep -nE '^\(acme_cloudflare\)' "$cf" | cut -d: -f1)"
     [ -n "$first_site" ] && [ "$lc_line" -lt "$first_site" ] || \
         die "local_certs landed at line $lc_line, outside the Caddyfile's global block. Caddy would refuse the config."
     log "SIM TLS: stack/caddy/Caddyfile -> local_certs (internal CA; the tracked file keeps public ACME)"
@@ -1121,17 +1124,25 @@ render_seed_tree() {
     local creds_file="$out_dir/secrets/creds.env"
     CREDS_FILE="$creds_file"   # exported for the caller
     local sim_password sim_password_hash cookie_secret technitium_pw
+    local admin_cookie_secret admin_password
     if [ ! -f "$creds_file" ]; then
         sim_password="vmtest-$(openssl rand -hex 6)"
         sim_password_hash="$(openssl passwd -6 "$sim_password")"
         cookie_secret="$(openssl rand -base64 32 | tr -- '+/' '-_')"
         technitium_pw="$(openssl rand -base64 18)"
+        admin_cookie_secret="$(openssl rand -base64 32 | tr -- '+/' '-_')"
+        admin_password="sim-admin-$(openssl rand -hex 6)"
         {
             sim_banner "$caller"
             echo "SIM_CONSOLE_PASSWORD=$sim_password"
             echo "SIM_CONSOLE_PASSWORD_HASH=$sim_password_hash"
             echo "TECHNITIUM_ADMIN_PASSWORD=$technitium_pw"
             echo "OAUTH2_PROXY_COOKIE_SECRET=$cookie_secret"
+            # The admin portal's sign-in (admin-auth). The PLAINTEXT is kept
+            # here, unlike the old per-site basic_auth passwords, which were
+            # thrown away: a gate that tests the portal has to be able to sign in.
+            echo "ADMIN_AUTH_COOKIE_SECRET=$admin_cookie_secret"
+            echo "SIM_ADMIN_AUTH_PASSWORD=$admin_password"
         } > "$creds_file"
         chmod 600 "$creds_file"
     else
@@ -1143,6 +1154,20 @@ render_seed_tree() {
         sim_password_hash="$(grep '^SIM_CONSOLE_PASSWORD_HASH=' "$creds_file" | cut -d= -f2-)"
         technitium_pw="$(grep '^TECHNITIUM_ADMIN_PASSWORD=' "$creds_file" | cut -d= -f2-)"
         cookie_secret="$(grep '^OAUTH2_PROXY_COOKIE_SECRET=' "$creds_file" | cut -d= -f2-)"
+        admin_cookie_secret="$(grep '^ADMIN_AUTH_COOKIE_SECRET=' "$creds_file" | cut -d= -f2-)"
+        admin_password="$(grep '^SIM_ADMIN_AUTH_PASSWORD=' "$creds_file" | cut -d= -f2-)"
+        # A creds.env written before the admin portal has neither: mint them
+        # once and APPEND, so the rest of the file (and any ISO built from it)
+        # keeps its secrets.
+        if [ -z "$admin_cookie_secret" ] || [ -z "$admin_password" ]; then
+            admin_cookie_secret="$(openssl rand -base64 32 | tr -- '+/' '-_')"
+            admin_password="sim-admin-$(openssl rand -hex 6)"
+            {
+                echo "ADMIN_AUTH_COOKIE_SECRET=$admin_cookie_secret"
+                echo "SIM_ADMIN_AUTH_PASSWORD=$admin_password"
+            } >> "$creds_file"
+            log "added the admin-portal SIM secrets to $creds_file"
+        fi
     fi
 
     # ── render user-data: SSH placeholder + password + hostname ──────────────
@@ -1383,15 +1408,16 @@ render_seed_tree() {
     fi
 
     local sim_env="$payload_dir/stack/.env"
-    local basicauth_hash_actual="REPLACE_WITH_caddy_hash-password_OUTPUT"
-    local basicauth_hash_dns="REPLACE_WITH_caddy_hash-password_OUTPUT"
+    # The admin portal's credential (admin-auth). ONE bcrypt, where there used
+    # to be two basic_auth hashes; firstboot writes it into admin-auth/htpasswd.
+    local admin_auth_hash="REPLACE_WITH_caddy_hash-password_OUTPUT"
     if command -v docker >/dev/null 2>&1; then
-        log "generating real Caddy bcrypt basic_auth hashes via docker (SIM passwords, not secrets)"
-        basicauth_hash_actual="$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "sim-actual-$(openssl rand -hex 4)" 2>/dev/null || echo "$basicauth_hash_actual")"
-        basicauth_hash_dns="$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "sim-dns-$(openssl rand -hex 4)" 2>/dev/null || echo "$basicauth_hash_dns")"
+        log "generating a real bcrypt for the admin sign-in via docker (SIM password, kept in $creds_file)"
+        admin_auth_hash="$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$admin_password" 2>/dev/null | tr -d '\r' || true)"
+        [ -n "$admin_auth_hash" ] || admin_auth_hash="REPLACE_WITH_caddy_hash-password_OUTPUT"
     else
-        log "WARNING: docker not found in WSL - basic_auth hashes left as REPLACE_WITH placeholders." \
-            "Caddy will still start, but basic_auth logins won't work until you run:" \
+        log "WARNING: docker not found in WSL - ADMIN_AUTH_HASH left as a REPLACE_WITH placeholder." \
+            "admin-auth still starts, but no admin sign-in will succeed until you run:" \
             "docker run --rm caddy:2-alpine caddy hash-password --plaintext 'yourpass'"
     fi
 
@@ -1408,8 +1434,8 @@ render_seed_tree() {
         -e "s|^MAIN_BOX_IP=.*|MAIN_BOX_IP=|" \
         -e "s|^DNS_HOSTNAME=.*|DNS_HOSTNAME=dns.vmtest.sim.invalid|" \
         -e "s|^ACME_EMAIL=.*|ACME_EMAIL=vmtest@example.invalid   # no real ACME in a VM, see vmtest/README.md|" \
-        -e "s|^ACTUAL_BASICAUTH_HASH=.*|ACTUAL_BASICAUTH_HASH=$(compose_escape "$basicauth_hash_actual")|" \
-        -e "s|^DNS_BASICAUTH_HASH=.*|DNS_BASICAUTH_HASH=$(compose_escape "$basicauth_hash_dns")|" \
+        -e "s|^ADMIN_AUTH_HASH=.*|ADMIN_AUTH_HASH=$(compose_escape "$admin_auth_hash")|" \
+        -e "s|^ADMIN_AUTH_COOKIE_SECRET=.*|ADMIN_AUTH_COOKIE_SECRET=$admin_cookie_secret|" \
         -e "s|^OAUTH2_PROXY_CLIENT_ID=.*|OAUTH2_PROXY_CLIENT_ID=sim-client-id.apps.googleusercontent.com|" \
         -e "s|^OAUTH2_PROXY_CLIENT_SECRET=.*|OAUTH2_PROXY_CLIENT_SECRET=sim-client-secret-not-real|" \
         -e "s|^OAUTH2_PROXY_COOKIE_SECRET=.*|OAUTH2_PROXY_COOKIE_SECRET=$cookie_secret|" \

@@ -14,6 +14,10 @@ Checks (each prints PASS/FAIL; nonzero exit if any FAIL):
      (an .example stand-in counts, since the real file is gitignored/seeded).
   4. Files referenced by autoinstall late-commands under the stack exist — for
      BOTH image targets (the AWOW core and the wall panel variant).
+  4d. The admin portal's pinned addresses agree: caddy's static IP on the
+     `admin` network is inside its subnet and outside its ip_range, admin-auth's
+     --trusted-proxy-ip is exactly that IP, and ADMIN_NET_GATEWAY is the
+     network's gateway.
   5. Every knob the wall panel's scripts read has a key in wall.env.example.
      The wall variant is configured by a shell-sourced env file rather than by
      compose, so check 1 cannot see it: without this, adding a `$WALL_FOO` read
@@ -181,6 +185,65 @@ def image_packages(packages_list_text):
         if name:
             names.add(name)
     return names
+
+
+def _service_block(compose_text, name):
+    """The text of one top-level service, `  name:` to the next `  other:`."""
+    m = re.search(r"^  " + re.escape(name) + r":\s*$(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|^\S)",
+                  compose_text, re.M | re.S)
+    return m.group(1) if m else ""
+
+
+def admin_network_problems(compose_text):
+    """Every way the admin portal's pinned addresses disagree (empty = fine).
+
+    Regex over the text, like the rest of this file (stdlib only). It reads:
+    the `admin` network's subnet/gateway/ip_range, caddy's ipv4_address on it,
+    admin-auth's --trusted-proxy-ip, and caddy's ADMIN_NET_GATEWAY."""
+    import ipaddress
+
+    problems = []
+    net = re.search(
+        r"^  admin:\s*\n    ipam:\s*\n      config:\s*\n"
+        r"        - subnet: *(\S+)\s*\n          gateway: *(\S+)\s*\n"
+        r"          ip_range: *(\S+)", compose_text, re.M)
+    if not net:
+        return ["no `admin` network with a pinned subnet, gateway and ip_range"]
+    try:
+        subnet = ipaddress.ip_network(net.group(1))
+        gateway = ipaddress.ip_address(net.group(2))
+        ip_range = ipaddress.ip_network(net.group(3))
+    except ValueError as e:
+        return ["the `admin` network's ipam does not parse: %s" % e]
+
+    caddy = _service_block(compose_text, "caddy")
+    m = re.search(r"^      admin:\s*\n        (?:#[^\n]*\n\s*)*ipv4_address: *(\S+)",
+                  caddy, re.M)
+    if not m:
+        return ["caddy has no static ipv4_address on the `admin` network"]
+    caddy_ip = ipaddress.ip_address(m.group(1))
+
+    if caddy_ip not in subnet:
+        problems.append("caddy's %s is outside the admin subnet %s" % (caddy_ip, subnet))
+    if caddy_ip in ip_range:
+        problems.append("caddy's %s is inside ip_range %s, so a container that starts "
+                        "first can take it" % (caddy_ip, ip_range))
+    if caddy_ip == gateway:
+        problems.append("caddy's address is the bridge gateway %s" % gateway)
+    if not ip_range.subnet_of(subnet):
+        problems.append("ip_range %s is not inside the subnet %s" % (ip_range, subnet))
+
+    auth = _service_block(compose_text, "admin-auth")
+    tp = re.findall(r"--trusted-proxy-ip=(\S+)", auth)
+    if tp != ["%s/32" % caddy_ip]:
+        problems.append("admin-auth --trusted-proxy-ip is %s, not exactly caddy's %s/32"
+                        % (tp or "absent", caddy_ip))
+
+    gw = re.search(r"^      ADMIN_NET_GATEWAY: *(\S+)", caddy, re.M)
+    if not gw or gw.group(1) != str(gateway):
+        problems.append("caddy's ADMIN_NET_GATEWAY is %s, not the admin bridge gateway %s"
+                        % (gw.group(1) if gw else "absent", gateway))
+    return problems
 
 
 def bind_mount_paths(compose_text, stack):
@@ -532,6 +595,24 @@ def main():
     else:
         print("SKIP git ls-files unavailable - cannot check late-command files for tracking")
 
+    # 4d. THE ADMIN PORTAL'S PINNED ADDRESSES AGREE (ADMIN_PORTAL_PLAN §4.4).
+    #
+    #     Three things outside Docker's control name addresses on the `admin`
+    #     network, each in a different place: Caddy's static ipv4_address,
+    #     admin-auth's --trusted-proxy-ip (the ONE peer allowed to assert
+    #     X-Forwarded-*), and ADMIN_NET_GATEWAY (where Caddy reaches the
+    #     host-networked Technitium console). Each is correct alone and the set
+    #     is only correct together: a trusted-proxy value that drifts from
+    #     Caddy's address leaves admin-auth trusting a stranger, and a static
+    #     address inside ip_range can be handed to whatever starts first.
+    admin_problems = admin_network_problems(compose)
+    for msg in admin_problems:
+        check(False, "", "admin portal: " + msg)
+    if not admin_problems:
+        check(True, "admin portal: caddy's static address, admin-auth's "
+              "--trusted-proxy-ip and ADMIN_NET_GATEWAY agree with the pinned "
+              "`admin` network", "")
+
     # 5. wall-panel knob coverage (the .env-example equivalent for image 2).
     wall_dir = stack / "autoinstall" / "wall"
     wall_env = wall_dir / "wall.env.example"
@@ -588,6 +669,11 @@ def main():
         # list that a new lane can silently fail to join.
         ("llm-isolation/homehub-litellm.service", "autoinstall/firstboot.sh"),
         ("llm-isolation/homehub-llm-isolation.service", "autoinstall/firstboot.sh"),
+        # Enrolled 2026-09-25 with the admin portal's DNS-console fence. The
+        # tailscaled hook carries PartOf=tailscaled.service; firstboot never
+        # stops tailscaled, so the pair passes - enrolling it keeps it that way.
+        ("dns-console/homehub-dns-console.service", "autoinstall/firstboot.sh"),
+        ("dns-console/homehub-dns-console-tailscaled.service", "autoinstall/firstboot.sh"),
     ):
         unit_text, script_text = load(stack / unit_rel), load(stack / script_rel)
         if not unit_text or not script_text:

@@ -1,4 +1,5 @@
-# caddy-guarded.local — ban repeated refusals at the password-guarded Caddy sites.
+# caddy-guarded.local — ban repeated wrong passwords at the guarded Caddy sites
+# (since 2026-09-25: the admin portal's sign-in host, admin.<domain>).
 #
 # INSTALLED BY firstboot.sh into /etc/fail2ban/jail.d/, which substitutes
 # @LAN_IP@ from .env. This file is a TEMPLATE and carries no site addresses:
@@ -22,9 +23,12 @@
 # is recreated. That is why it exists, and why it is the correct hook rather than
 # a clever one.
 #
-# WHAT COUNTS AS A FAILURE is in filter.d/caddy-guarded.conf: a 401 (wrong
-# password, from inside the LAN gate) or a 403 (refused BY the LAN gate, i.e.
-# from the internet). Read that file's header before changing either.
+# WHAT COUNTS AS A FAILURE is in filter.d/caddy-guarded.conf: a 401 ONLY — a
+# wrong admin password at admin.<domain>'s sign-in form (from inside the LAN
+# gate), or any 401 from the LLM gateway, the other site that writes the log.
+# NOT a 403: that is the gate refusing a non-LAN caller, and banning it risks
+# locking the Owner out of the tracker from outside. Read that file's header
+# before changing either.
 
 [caddy-guarded]
 enabled  = true
@@ -41,10 +45,12 @@ protocol = tcp
 # with docker-compose.yml.
 action = iptables-allports[name=caddy-guarded, chain=DOCKER-USER, protocol=tcp]
 
-# 15 in 10 minutes. Deliberately not tighter: basic_auth guards the whole site,
-# so a browser holding one stale saved credential can emit several 401s from a
-# single page load, and locking the Owner out of their own budget is a worse
-# outcome than a slow attacker. The RATE LIMITER (120/min per IP, in the
+# 15 in 10 minutes. Set when basic_auth guarded whole sites and one stale saved
+# credential could emit several 401s from a single page load. Since the admin
+# portal (2026-09-25) a 401 is one submitted sign-in form, so 15 is now a
+# generous margin for fat fingers; it was left as it is rather than tightened.
+# Locking the Owner out of their own tools is a worse outcome than a slow
+# attacker. The RATE LIMITER (120/min per IP on the sign-in route, in the
 # Caddyfile) is what blunts speed; this is what stops persistence.
 maxretry = 15
 findtime = 10m

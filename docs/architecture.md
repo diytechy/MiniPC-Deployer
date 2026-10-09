@@ -37,8 +37,9 @@ graph LR
     oauth --> tracker["tracker<br/>(NagLight naglight:local)"]
     panel["wall panel<br/>(2nd image · cage kiosk)"] -->|"LAN only :WALL_PORT"| caddy
     caddy -->|"wall host: /32 + identity injected<br/>(NO oauth2-proxy)"| tracker
-    caddy -->|basic_auth| actual["Actual Budget"]
-    caddy -->|basic_auth| tech
+    caddy -->|"*.admin sites: forward_auth"| aauth["admin-auth<br/>one admin login"]
+    caddy -->|"actual.admin (signed in)"| actual["Actual Budget"]
+    caddy -->|"dns.admin via the admin bridge gateway"| tech
     ddns["ddns<br/>(Cloudflare A records)"] -.->|follows home IP| net
     backup["bash backup service<br/>(systemd timer)"] -.->|"wake (WoL) then cifs INGEST + volume: sources"| net
     backup -.->|"mirror network shares into"| lib[("library tree<br/>(on-box)")]
@@ -46,22 +47,49 @@ graph LR
     ice -.->|syncs| cloud([IceDrive cloud])
     fa["finance-auditor<br/>(profile until FA G-Final)"] -.->|triggers bank sync| actual
     fa -.->|de-identified status| tracker
-    subgraph observability [LAN-only]
+    subgraph observability ["admin portal (127.0.0.1 publishes)"]
       kuma["Uptime-Kuma"]
       dozzle["Dozzle"]
-      ntfy["ntfy (optional)"]
+      homepage["Homepage"]
     end
+    caddy -->|"kuma.admin, logs.admin, admin. (signed in)"| observability
+    caddy -->|"ntfy. (@lan, own login)"| ntfy["ntfy (optional)"]
     subgraph tier2 ["tier-2 opt-in (SR-012 — compose profiles, OFF by default)"]
-      t2["Immich / PhotoPrism · Jellyfin · Navidrome · Audiobookshelf ·<br/>Vaultwarden · Home Assistant + Mosquitto · Syncthing ·<br/>FreshRSS · Mealie · Homepage · diun"]
+      t2["Immich / PhotoPrism · Jellyfin · Navidrome · Audiobookshelf ·<br/>Vaultwarden · Home Assistant + Mosquitto · Syncthing ·<br/>FreshRSS · Mealie · diun"]
     end
 ```
 
 - **Ingress:** the router forwards :80/:443 to Caddy, which terminates TLS
   (public cert, valid on-LAN via split-horizon) and routes per host.
 - **Auth split (D1/D2):** the tracker host goes through **oauth2-proxy** (Google
-  sign-in, allow-list) with **no** basic_auth; Actual and the DNS console keep
-  **basic_auth**. The tracker container is bridge-only (`expose`, never
-  host-published) so its only ingress is a Caddy site (SR-004).
+  sign-in, allow-list). The tracker container is bridge-only (`expose`, plus a
+  loopback publish for the host feeders) so its only network ingress is a Caddy
+  site (SR-004).
+- **The admin portal (ADMIN_PORTAL_PLAN, P1–P4, 2026-09-25):** every
+  browser-only management UI — Homepage (`admin.`), Uptime-Kuma, Dozzle, the
+  Technitium console and Actual — is published on `127.0.0.1` only and reached
+  through a Caddy site under `*.admin.<domain>` behind **one admin login**:
+  `admin-auth`, a second oauth2-proxy in password mode, asked by Caddy's
+  `forward_auth` on every request. It replaced per-site basic_auth, because a
+  browser scopes basic_auth to one origin. The cookie is scoped to
+  `.admin.<domain>`, so the tracker and the public game relay never receive it.
+  For Kuma, Technitium and Actual it is defence in depth in front of their own
+  logins; for Dozzle and Homepage it is the only credential (P4). admin-auth
+  trusts `X-Forwarded-*` only from Caddy's static address on a pinned `admin`
+  network (172.28.92.0/24, Caddy .2), which is also how Caddy reaches the
+  host-networked Technitium console (via that bridge's gateway) — and what the
+  `homehub-dns-console` fence lets through to tcp/5380. The loopback publishes
+  are the `ssh -L` fallback when Caddy is the broken piece (stack/README §8).
+- **The `@lan` gate is the internet boundary (P2):** every admin site, the
+  household-app sites and the LLM gateway answer only `LAN_CIDR` (LAN + tunnel)
+  and give everyone else 403 before any login — so none of it depends on the
+  router forward. The tracker and the game relay are the two sites that answer
+  the internet.
+- **Household apps with their own clients (Phase B):** Immich, Jellyfin,
+  Navidrome and ntfy get `photos.`, `jellyfin.`, `music.` and `ntfy.` sites
+  outside the admin namespace, with **no** admin login (their apps cannot do a
+  web sign-in). Each keeps its LAN port until its `*_BIND_IP` knob is set to
+  `127.0.0.1`, one app at a time, after its clients are re-pointed.
 - **A THIRD auth model — the wall kiosk site (SR-016, ratified 2026-07-29):** a
   keyboard-less panel cannot complete an OAuth consent, so
   `{$WALL_HOST}:{$WALL_PORT}` **bypasses oauth2-proxy** and injects the panel's
@@ -85,8 +113,8 @@ graph LR
 - **DDNS (WI-9 Q4):** the `ddns` container keeps the apex + wildcard Cloudflare
   A records pointed at the home IP, so the whole external path survives an IP
   change.
-- **Observability (WI-10.11):** Uptime-Kuma, Dozzle, and optional ntfy run
-  LAN-only.
+- **Observability (WI-10.11):** Uptime-Kuma and Dozzle, behind the admin
+  portal (above); optional ntfy as a household app.
 - **Backup (WI-10.10/SR-013):** the bash backup service (systemd timer, not a
   container) **wakes, ingests, then archives** — a source box that is allowed to
   sleep gets a Wake-on-LAN packet and must answer tcp/445 before the run touches
@@ -114,7 +142,8 @@ graph LR
   install itself. `EXTRA_PROFILES` still adds profiles the `.env` does not
   enable.
 - **Remote management (WI-10.12):** SSH (key-only), **passwordless `sudo`**,
-  Cockpit, and unattended-upgrades are provisioned by the autoinstall. The sudo
+  Cockpit (on `127.0.0.1:9090` only since D-A3, reached over `ssh -L`), and
+  unattended-upgrades are provisioned by the autoinstall. The sudo
   drop-in is the third leg of the key-only design, not a separate concession —
   a locked password makes `sudo` unsatisfiable, so without it the box is
   read-only over SSH. `REMOTE_MANAGEMENT.md` is the ops + reimage-ladder memo

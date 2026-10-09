@@ -1,0 +1,34 @@
+[Unit]
+# Put the DNS-console fence back above ts-input after tailscaled starts. Every
+# tailscaled start deletes its jump and re-inserts it at INPUT position 1, above
+# this fence (dns-console-fence.sh header, with source links), so this runs on
+# EVERY start: boot, `systemctl restart`, the auto-updater's restart, and
+# systemd's own restart after a crash.
+#
+# WHY THIS SET OF DEPENDENCIES, checked against systemd v255 (Ubuntu 24.04):
+#   WantedBy=tailscaled.service  a start OR RESTART job for tailscaled pulls in
+#       a start job for every Wants= unit - src/core/transaction.c:1031,
+#       `if (IN_SET(type, JOB_START, JOB_RESTART))` -> UNIT_ATOM_PULL_IN_START_IGNORED.
+#       An automatic restart after a crash is a JOB_START on tailscaled
+#       (src/core/service.c:2521), so it pulls this in too.
+#   RemainAfterExit=no           so the unit is inactive between runs and a
+#       start job actually runs it; an active oneshot would treat it as a no-op.
+#   PartOf=tailscaled.service    "When systemd stops or restarts the units
+#       listed here, the action is propagated to this unit" (systemd.unit(5)).
+#       It matters when tailscaled restarts WHILE this is still waiting: the
+#       wait is restarted rather than finishing against the old instance.
+#   After=tailscaled.service     start only once tailscaled is READY. READY
+#       comes before the jump exists, which is why the script waits for it.
+Description=Re-assert the DNS-console fence after tailscaled (re)starts
+Documentation=file:///opt/homehub/stack/dns-console/dns-console-fence.sh
+After=tailscaled.service
+PartOf=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/homehub/stack/dns-console/dns-console-fence.sh after-tailscaled
+# The script waits up to 90 s for the jump, then settles for 10 s.
+TimeoutStartSec=180
+
+[Install]
+WantedBy=tailscaled.service

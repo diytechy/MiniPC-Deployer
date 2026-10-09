@@ -913,6 +913,19 @@ autoinstall:
     - curtin in-target --target=/target -- chmod 0755 /opt/homehub/stack/game-isolation/gunmaster3-relay.sh
     - curtin in-target --target=/target -- systemctl enable homehub-game-isolation.service
     - curtin in-target --target=/target -- systemctl enable homehub-gunmaster3-relay.service
+    # ---- 5b. THE DNS-CONSOLE FENCE, FROM THE VERY FIRST BOOT (2026-09-25) ------
+    # The admin portal's host fence for Technitium's console (tcp/5380). Same
+    # reasoning as 5a: the fence unit is `Before=docker.service`, so enabling it
+    # here is what makes the REJECT exist on boot 1 before Technitium ever
+    # answers; firstboot.sh step 4-pre-a3 re-applies it idempotently for a stack
+    # updated in place. Nothing here Requires= it - Technitium is the household
+    # resolver and must never wait on a firewall rule (plan decision D-A5).
+    - install -m 0644 /target/opt/homehub/stack/dns-console/homehub-dns-console.service /target/etc/systemd/system/homehub-dns-console.service
+    - install -m 0644 /target/opt/homehub/stack/dns-console/homehub-dns-console-tailscaled.service /target/etc/systemd/system/homehub-dns-console-tailscaled.service
+    - install -m 0644 /target/opt/homehub/stack/dns-console/homehub-dns-console-check.service /target/etc/systemd/system/homehub-dns-console-check.service
+    - install -m 0644 /target/opt/homehub/stack/dns-console/homehub-dns-console-check.timer /target/etc/systemd/system/homehub-dns-console-check.timer
+    - curtin in-target --target=/target -- chmod 0755 /opt/homehub/stack/dns-console/dns-console-fence.sh
+    - curtin in-target --target=/target -- systemctl enable homehub-dns-console.service homehub-dns-console-tailscaled.service homehub-dns-console-check.timer
     # Low-power tune unit (per-boot powertop auto-tune + USB-storage guard).
     - install -m 0644 /target/opt/homehub/stack/autoinstall/powertune.service /target/etc/systemd/system/powertune.service
     - cp /target/opt/homehub/stack/autoinstall/powertune.sh /target/usr/local/sbin/powertune.sh

@@ -16,18 +16,6 @@
 #     auth model: no interactive login at all, identity injected by source IP.
 #     Read the block's own banner before touching it — it is security-critical.
 #
-# Sure uses its own household logins, scoped to LAN (FA DEC-21).
-{$SURE_HOST} {
-    import acme_cloudflare
-    @sure_lan remote_ip {$LAN_CIDR}
-    handle @sure_lan {
-        reverse_proxy sure-web:3000
-    }
-    handle {
-        respond "Forbidden" 403
-    }
-}
-
 # Env vars (set in docker-compose.yml from .env):
 #   {$DOMAIN} {$LAN_IP} {$TRACKER_HOST} {$ACTUAL_HOST} {$ACME_EMAIL} {$MAIN_BOX_IP}
 #   {$ACTUAL_BASICAUTH_USER} {$ACTUAL_BASICAUTH_HASH}
@@ -388,6 +376,19 @@
 }
 
 # ── actual.<domain> — Actual Budget (single-user; KEEP basic_auth) ─────────────
+# Sure uses its own household logins, scoped to LAN (FA DEC-21).
+# Implements: SR-062, LLR-1042. Keep global options before all site blocks.
+{$SURE_HOST} {
+    import acme_cloudflare
+    @sure_lan remote_ip {$LAN_CIDR}
+    handle @sure_lan {
+        reverse_proxy sure-web:3000
+    }
+    handle {
+        respond "Forbidden" 403
+    }
+}
+
 {$ACTUAL_HOST} {
     import acme_cloudflare
     import access_log

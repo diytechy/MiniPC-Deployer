@@ -188,17 +188,19 @@ compression_decision() {
 #   //host/share            cifs pull over the LAN (the original form)
 #   volume:VOL              docker named volume on THIS box, copied live
 #   volume:VOL@CONTAINER    stop CONTAINER first, copy, restart right after
+#   postgres:CONTAINER      logical dump with image-shipped pg_dump/pg_restore
 #   path:/abs/dir           a local directory on this box
 # Lines starting with # are skipped by backup.sh, so the table can carry
 # commented-out entries. One table drives one execution sequence — every set,
 # whatever its source kind, flows through the same archive/hash/manifest/
-# retention/offsite/report pipeline.
+# retention/report pipeline (offsite staging is removed).
 
-# source_kind SPEC : echoes cifs|volume|path|bad. Pure — no I/O, unit-greppable.
+# source_kind SPEC : echoes cifs|volume|postgres|path|bad. Pure — no I/O.
 source_kind() {
     case "$1" in
         //*)      echo cifs ;;
         volume:*) echo volume ;;
+        postgres:*) echo postgres ;;
         path:/*)  echo path ;;
         *)        echo bad ;;
     esac
@@ -214,6 +216,8 @@ source_kind() {
 # Implements: SR-065, LLR-1045.
 postgres_dump() {
     local container="$1" destination="$2" partial="$2.partial"
+    # Container names are identifiers, not Docker options or source paths.
+    [[ "$container" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || return 1
     [ "${PLAN_ONLY:-0}" != 1 ] || return 0
     # The caller supplies a private staging directory; restrictive mode keeps
     # raw finance data away from other local users even while the dump is made.
@@ -231,7 +235,10 @@ postgres_dump() {
             rm -f -- "$partial"
             return 1
         fi
-        mv -f -- "$partial" "$destination"
+        if ! mv -f -- "$partial" "$destination"; then
+            rm -f -- "$partial"
+            return 1
+        fi
     )
 }
 

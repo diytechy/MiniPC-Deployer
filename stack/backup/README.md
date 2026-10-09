@@ -29,6 +29,13 @@ The rest of this document is the bash service; the container's half is
 
 # AWOW bash backup service (WI-10.10)
 
+Sure adds a `postgres:CONTAINER` logical source (SR-065, LLR-1045) to this
+pipeline. It uses the running database image's pg_dump and pg_restore tools;
+no raw PGDATA copy. See [Sure's backup contract](../sure/README.md#secrets-and-acceptance)
+for LAN-only storage, profile activation, failure handling and unproven restore
+acceptance. The timer, mount preflight, archive/hash/manifest and retention are
+the existing machinery; no separate cron or backup container is introduced.
+
 The homelab's main backup, running on the hub box as **pure bash + systemd**.
 This service has no `.bat`/`.ps1` in it and is not going to grow any — but note
 the rule it was written under **changed on 2026-08-09**: HOMELAB_TOPOLOGY.md

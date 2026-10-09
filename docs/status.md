@@ -12,37 +12,53 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
-**2026-10-09 — Sure phase-1 preparation in progress, active gate G1 unchanged.**
-Owner brief authorizes local implementation on `sure-stack`; Claude review and
-all runtime acceptance remain pending. No gate advanced. Hats: System/Software
-Engineer and Test Engineer. Read-only Sure source is release e336a285.
+**2026-10-09 — Sure phase-1 preparation authored; active gate G1 unchanged.**
+Four dormant services, immutable registry pins, LAN own-login proxy/DNS,
+Actual-default bridge knobs, T3 handoff, reporting controls and scheduled logical
+backup are built. [Sure source audit and enablement](../stack/sure/README.md)
+records the contracts and limits. Hats: System/Software/Test Engineer.
+Spine: SR-060..066, LLR-1040..1046, TC-1100..1114, IF-030..034 (Draft).
+Next: Claude code review; Owner activation and restore acceptance remain pending.
+No gate advanced, deployment or push performed.
 
-Built the logical-dump collector using the existing backup common library:
-custom pg_dump, signature and pg_restore TOC checks, restrictive file mode,
-atomic promotion, and no execution during a plan run. Six mock-Docker boundary
-tests passed (failure, empty, invalid, TOC failure, success, plan); this does not
-prove a database restore. Authored four profile-gated services with named volumes
-and shipped-tool health probes, internal FA access with Actual defaults retained,
-LAN-only Caddy own-login site, DNS knob, immutable registry pins, reporting
-controls and AI-off comments. GitHub has no env off switch; loopback host override
-blocks its release-note API path. Eleven Sure static/mock tests passed;
-validate_config.py reports ALL CONFIG CHECKS PASSED.
+Real checks: validate_config.py ALL CONFIG CHECKS PASSED; full pytest **2424
+passed, 30 skipped in 217.86s** (baseline 2411/30); Sure checks 13 passed; new
+mock-Docker Fibonacci backup shell suite **6 PASS 0 FAIL**; check.py --tier smoke
+**RESULT: PASS**, 214 passed / 4 skipped / 2236 deselected. Every touched shell
+file passed bash -n; seven touched shell/Python files verified LF. Trace: 25
+pre-existing orphans, 0 integrity findings, no new orphan. Docs: 0 broken links.
+Standalone flow check still rejects the pre-existing first flow (now diagram2).
+The generic code-map generator scans no src here and has no module-map markers;
+no generated block was hand-edited.
 
-Findings: upstream Redis example is `latest`, not a numeric version; preserve
-that tag with its verified immutable digest (config version 8.10.2).
-Storage-map.md still describes library Configs while backup.sh
-and backup.env.example use backup-drive/config-history with Fibonacci history.
-Permission requested for the minimum HomeHub generator contract correction.
-HomeHub measured baseline is 183 discovered / 171 passed / 11 failed / 1 skipped,
-not the brief's 173 passed / 9 failed. Deployer baseline: 2411 passed, 30 skipped
-in 221.57s; validate_config.py: ALL CONFIG CHECKS PASSED.
+HomeHub commits `91db01e`, `041ba2f`: Pester before **183 discovered / 171
+passed / 11 failed / 1 skipped** (110.07s), after **188 / 176 / 11 / 1**
+(118.67s), same failures. The brief's baseline was wrong by two existing
+failures (admin template mismatch and stale homepage rollback exception).
+Analyzer unchanged: 1 warning + 2 informational; PowerShell parsing and privacy
+gates passed. Other concurrent HomeHub changes and its scratchpad were preserved.
 
-**NOT proven:** nothing ran on a box; no hub/panel contact, deployment, image
-pull, bank sync, Sure login/API request, telemetry capture, backup restore or
-real Postgres dump. No secret was read, minted, printed or written.
+Additional WSL hermetic-runner attempts were NOT green: first attempt had an
+invalid temporary HOME and reported 519 PASS / 61 FAIL across13 suites; corrected
+temporary HOME attempt still had failures in unchanged library/IceDrive/AI/wall
+suites and hit its 240s bound before a final aggregate. Their causes were not
+investigated. These are not passing evidence; Windows pytest skips the POSIX
+aggregate. The new Sure suite was separately executed successfully with mocks.
 
-Next: resolve the two findings, finish the scheduled backup and HomeHub contract,
-record reserved spine rows, run checks and leave local commits for review.
+Judgments: upstream actually names Redis latest; retain that tag immutably
+(config version8.10.2). GitHub has no env off switch; loopback hostname override
+blocks the release-note API, unmeasured at runtime. The brief's explicit minimum
+backup-contract authorization was used for the HomeHub postgres/profile helper
+and affected storage docs, correcting the stale library Configs destination to
+backup-drive/config-history. Profile activation must regenerate/incorporate the
+active backup source fragment; it cannot alter installed backup.env by itself.
+Attachments are copied live, without a transaction-aligned snapshot guarantee.
+
+**NOT proven:** nothing ran on a hub/panel; no contact, deploy, image pull, real
+Postgres dump, database restore, bank sync, login/invite/API/read-scope test,
+image probe execution, Caddy adaptation/TLS test or telemetry capture. Full
+HomeHub generator/materialisation was not run. No deployment secret was read,
+minted, printed or written. Finance-Auditor remained read-only.
 
 **2026-09-19 — Draft, nine review rounds complete, Owner ratification pending: two LLM lanes, one of which cannot reach a cloud provider (SN-043/SN-044/SR-047 and SR-044's last piece; LLR-985..991; TC-1023..1041).** One OpenAI-compatible proxy with exactly one deployment, no cloud credential and no database, plus a hold hook that waits while the dev PC wakes. Nine rounds with codex gpt-5.6-terra (medium) produced 31 findings; 30 were accepted and one was rejected with the rejection confirmed in a later round.
 

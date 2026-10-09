@@ -59,6 +59,8 @@ def test_sure_registry_pins_sr061():
 
 def test_sure_own_login_lan_tls_sr062():
     caddy = (ROOT / "stack/caddy/Caddyfile").read_text(encoding="utf-8")
+    first = next(line.strip() for line in caddy.splitlines() if line.strip() and not line.lstrip().startswith("#"))
+    assert first == "{", "Caddy global options must precede all site blocks"
     site = caddy.split("{$SURE_HOST} {")[1].split("\n}", 1)[0]
     assert "remote_ip {$LAN_CIDR}" in site
     assert 'respond "Forbidden" 403' in site
@@ -93,3 +95,14 @@ def test_sure_reporting_and_ai_off_sr064():
         assert "api.github.com:127.0.0.1" in stack()["services"][name]["extra_hosts"]
         for key in ("POSTHOG_KEY", "SENTRY_DSN", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LOGTAIL_API_KEY", "LOGTAIL_INGESTING_HOST", "SKYLIGHT_AUTHENTICATION"):
             assert settings[key] == ""
+
+
+def test_sure_scheduled_backup_hook_sr065():
+    backup = (ROOT / "stack/backup/backup.sh").read_text(encoding="utf-8")
+    common = (ROOT / "stack/backup/common.sh").read_text(encoding="utf-8")
+    timer = (ROOT / "stack/backup/systemd/homehub-backup.timer").read_text(encoding="utf-8")
+    assert "postgres:*) echo postgres" in common
+    assert 'postgres_dump "${src#postgres:}" "$stage/ledger.dump"' in backup
+    assert "OnCalendar=" in timer
+    assert "OFFSITE_ENABLED=true" in backup and "offsite step was REMOVED" in backup
+    assert "sure-ledger=postgres:sure-postgres" in (ROOT / "stack/backup/backup.env.example").read_text(encoding="utf-8")

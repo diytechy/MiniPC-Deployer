@@ -63,6 +63,34 @@ on a fresh database does not override credentials later stored through Sure UI
 
 ## Secrets and acceptance
 
+The existing `homehub-backup.timer` (03:00 box-local, persistent) collects
+`sure-ledger=postgres:sure-postgres` through `backup.sh`. This new source type
+uses pg_dump from the database container, then verifies custom-dump signature
+and pg_restore table-of-contents parsing before atomic staging promotion.
+It reuses archive/compression, per-file and archive hashes, MANIFEST, Fibonacci
+retention and failure reporting. A plan invokes neither dump nor Docker.
+HomeHub emits the Sure backup rows only when the `sure` profile is selected.
+At enablement, regenerate and incorporate those active source rows into the
+hand-carried backup configuration; its existing `-Verify` comparison must agree.
+Profile selection alone does not update an already installed backup.env.
+The existing drive/mount preflight and run lock still apply. A failed dump
+fails the run before rotation; the previous good archive remains.
+
+The SSOT target is `/mnt/backup-drive/config-history`, on the LAN backup drive,
+with `daily/` and `fib/` history. This corrects the older storage-map description
+of library `Configs`. Ledger and `sure_storage` attachments are NEVER-OFFSITE;
+never select them, their archives or any finance snapshot in IceDrive's GUI.
+The backup script refuses offsite configuration; GUI selection remains operator
+discipline. Attachments are copied live like existing unquiesced volume sets;
+no transaction-aligned dump/attachment snapshot is claimed. Redis is a job/cache
+store, and PGDATA is not copied as a substitute for a logical backup.
+
+Recovery is a later Owner acceptance: use the existing archive verifier to
+extract the chosen set, then pg_restore into a **new empty** matching Postgres
+database, recover attachments, and reconcile accounts before any cutover. This
+work neither runs recovery nor automatically replaces a database on reimage.
+TOC parsing and tar/hash checks do not establish restorability.
+
 HomeHub T3 optional store keys `SureSecretKeyBase`, `SureDbPassword` and
 `FinanceSureApiKey` map to `SURE_SECRET_KEY_BASE`, `SURE_DB_PASSWORD` and
 `FINANCE_SURE_API_KEY`. Optional during preparation avoids demanding new

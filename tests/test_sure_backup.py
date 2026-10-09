@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 pytestmark = [pytest.mark.full, pytest.mark.smoke]
 
 
-@pytest.mark.parametrize("mode", ["good", "failed", "empty", "invalid", "toc-failed", "plan"])
+@pytest.mark.parametrize("mode", ["good", "failed", "empty", "invalid", "toc-failed", "plan", "bad-name"])
 def test_logical_dump_boundary_sr065(tmp_path, mode):
     """A failed or empty dump cannot replace the last good file; plan never execs."""
     bash = shutil.which("bash")
@@ -47,7 +47,9 @@ docker() {
 }
 PLAN_ONLY=0
 [ "$MODE" != plan ] || PLAN_ONLY=1
-postgres_dump sure-postgres "$DESTINATION"
+container=sure-postgres
+[ "$MODE" != bad-name ] || container=--privileged
+postgres_dump "$container" "$DESTINATION"
 '''
     result = subprocess.run([bash, "-c", script], env={**os.environ, "COMMON": common, "DESTINATION": destination, "MODE": mode}, capture_output=True, text=True)
     actual = (tmp_path / "ledger.dump").read_bytes()

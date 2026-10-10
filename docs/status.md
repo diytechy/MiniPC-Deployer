@@ -12,6 +12,18 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-10 — `wall-line-in` skips cleanly outside trigger mode (FOLLOWUPS B3), branch `fix-b3-line-in-bus-mode`.**
+A second `ExecCondition=` (the visualizer's form, same `trigger` default) means a udev start
+in bus mode is a skip, not an `Unknown PCM speaker_shared` failure. `wall-audio-mode` already
+disables the unit in bus mode (`apply_bus`), so no capability is removed: analog line-in is
+retired by design (S/PDIF, `asound-bus-mode.conf`). `start_if_enabled` would restart a unit that
+was active before the switch even after `apply_bus` disabled it, but the unit's enablement
+ExecCondition already turns that start into a skip, so no script change was made.
+Evidence: `tests/test_wall_audio_reenumeration.py` asserts both conditions; each removed in turn
+turned its assertion red. BUILT, NOT DEPLOYED: reaches the panel only by a system release.
+NOT PROVEN: never run on the panel; FOLLOWUPS B3's "enabled" claim is unverified against the
+live panel (`systemctl is-enabled wall-line-in` is the next read).
+
 **2026-10-09 — boot copies of firstboot now refresh themselves (FOLLOWUPS A7 bullet 1).**
 `firstboot.sh` step 1a installs `homehub-firstboot.sh` and `powertune.sh` from the
 `/opt` tree on every run; `deploy_stack.py` reports (read-only, never fails the run)

@@ -907,8 +907,13 @@ class Supervisor:
             # The cgroup.kill still happens so relief does not wait on Docker;
             # what quarantine changes is that the service STAYS down and the
             # kill budget is not spent on it again.
+            # project + service let a later boot find the service's CURRENT
+            # container without matching another project's same-named one
+            # (homehub-recovery _quarantine_targets); the full id is the
+            # fallback, and the only handle for a non-compose victim.
             self.quarantined[key] = {"container": victim.container_id, "since": self.clock.utc(),
-                                     "restart": info.restart}
+                                     "restart": info.restart, "project": info.project,
+                                     "service": info.service}
             self.event("quarantined", kmsg=True, cgroup_kill=written, **details)
             self._enqueue("quarantine", key, {"key": key, "container": victim.container_id,
                                               "restart": info.restart})

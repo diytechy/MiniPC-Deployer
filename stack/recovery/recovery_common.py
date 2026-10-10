@@ -781,6 +781,9 @@ class ContainerInfo:
     service: str
     restart: str
     auto_remove: bool
+    # The compose PROJECT, so a quarantine can name its service unambiguously:
+    # the service label alone matches a same-named service of any project.
+    project: str = ""
 
     @property
     def key(self) -> str:
@@ -828,6 +831,7 @@ def read_inventory(containers_dir: str) -> Dict[str, ContainerInfo]:
             service=str(labels.get("com.docker.compose.service") or ""),
             restart=str(policy),
             auto_remove=bool(host.get("AutoRemove")),
+            project=str(labels.get("com.docker.compose.project") or ""),
         )
     return out
 

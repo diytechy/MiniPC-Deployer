@@ -260,19 +260,26 @@ def cmd_reset_brake(paths: rc.Paths, _args) -> int:
     return 0
 
 
-def _quarantine_targets(key: str, record: dict) -> list:
+def _quarantine_targets(record: dict) -> list:
     """The container(s) a quarantine record means NOW, not when it was written.
 
     The record stores the container id of the victim, but a boot that loads a
     new image makes `docker compose up -d` RECREATE the service under a new id,
-    with compose's restart policy. So the compose service label is asked first
-    (the key is the compose service, else the container name, which the label
-    simply does not match); the stored id is the fallback.
+    with compose's restart policy. So a COMPOSE victim is looked up by its
+    project AND service labels - the service label alone also matches a
+    same-named service of another project, which must never be touched - with
+    the stored full id as the fallback. A victim with no recorded project (not
+    started by compose) is its recorded full id and nothing else.
     """
+    recorded = [c for c in [record.get("container", "")] if c]
+    project, service = record.get("project") or "", record.get("service") or ""
+    if not (project and service):
+        return recorded
     code, out, _ = _run(["docker", "ps", "-a", "-q", "--no-trunc",
-                         "--filter", "label=com.docker.compose.service={}".format(key)], 20)
+                         "--filter", "label=com.docker.compose.project={}".format(project),
+                         "--filter", "label=com.docker.compose.service={}".format(service)], 20)
     found = out.split() if code == 0 else []
-    return found or [c for c in [record.get("container", "")] if c]
+    return found or recorded
 
 
 def cmd_enforce_quarantine(paths: rc.Paths, _args) -> int:
@@ -292,7 +299,7 @@ def cmd_enforce_quarantine(paths: rc.Paths, _args) -> int:
     quarantined = (rc.read_json(paths.quarantine_file) or {}).get("quarantined") or {}
     failed = []
     for key in sorted(quarantined):
-        for container in _quarantine_targets(key, quarantined[key]):
+        for container in _quarantine_targets(quarantined[key]):
             code1, _, err1 = _run(["docker", "update", "--restart=no", container], 20)
             code2, _, err2 = _run(["docker", "stop", "-t", "10", container], 35)
             if code1 != 0 or code2 != 0:
@@ -318,7 +325,7 @@ def cmd_release(paths: rc.Paths, args) -> int:
         restart = "unless-stopped"
     code1 = code2 = 1
     err1 = err2 = "no container found for {}".format(args.service)
-    for container in _quarantine_targets(args.service, record):
+    for container in _quarantine_targets(record):
         code1, _, err1 = _run(["docker", "update", "--restart={}".format(restart), container], 60)
         code2, _, err2 = _run(["docker", "start", container], 120)
         if code1 != 0 or code2 != 0:

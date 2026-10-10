@@ -174,7 +174,7 @@ class Tree:
                    "full avg10={0:.2f} avg60=0.00 avg300=0.00 total=1\n".format(full))
 
     def container(self, n: int, name: str, current: int, service: str = "", restart: str = "unless-stopped",
-                  slice_rel: str = "system.slice", identified: bool = True) -> str:
+                  slice_rel: str = "system.slice", identified: bool = True, project: str = "stack") -> str:
         """Create a container scope (and, if identified, its Docker metadata)."""
         scope = os.path.join(self.paths.cgroup_root, slice_rel, "docker-{}.scope".format(cid(n)))
         os.makedirs(scope, exist_ok=True)
@@ -183,7 +183,8 @@ class Tree:
         if identified:
             meta = os.path.join(self.paths.docker_containers_dir, cid(n))
             self.write(os.path.join(meta, "config.v2.json"), json.dumps(
-                {"Name": "/" + name, "Config": {"Labels": {"com.docker.compose.service": service or name}}}))
+                {"Name": "/" + name, "Config": {"Labels": {"com.docker.compose.service": service or name,
+                                                           "com.docker.compose.project": project}}}))
             self.write(os.path.join(meta, "hostconfig.json"), json.dumps(
                 {"RestartPolicy": {"Name": restart}, "AutoRemove": False}))
         return scope

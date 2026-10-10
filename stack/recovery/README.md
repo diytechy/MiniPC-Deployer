@@ -46,9 +46,12 @@ on every boot, which converges the opt-in half **on or off** from `.env`.
   goes red until you release it. **It stays down across a reboot** because
   firstboot runs `homehub-recovery enforce-quarantine` right after its
   `docker compose up -d` (which would otherwise start it again), from the
-  quarantine file alone, so it holds whether or not the supervisor is on.
-  The container is found by its compose service label, so a service the
-  boot recreated under a new id is still the one stopped (and released).
+  quarantine file alone, so it holds whether or not the supervisor is on,
+  and it runs even when that `up` failed partway (the failure is still
+  reported after it). The container is found by its compose project AND
+  service labels, so a service the boot recreated under a new id is still the
+  one stopped (and released), and another project's same-named service is
+  never touched; a victim compose did not start is its recorded id.
 - **L2 — sshd.** Three failed banner probes 60 s apart, while memory is
   normal, restart `ssh`.
 - **Reboots are only recorded** (`would-have-rebooted`).

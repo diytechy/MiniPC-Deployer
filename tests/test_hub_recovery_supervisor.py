@@ -280,6 +280,12 @@ def test_a_second_kill_of_one_service_within_an_hour_quarantines_it_tc1049(tmp_p
     budget = sup.sm.budget_left(clock.mono)
     assert _pressure_until_kill(sup, clock, tree)
     assert "immich-machine-learning" in sup.quarantined
+    # The record names the compose project as well as the service, so a later
+    # boot can find its current container without matching another project's
+    # same-named service (TC-1084).
+    record = sup.quarantined["immich-machine-learning"]
+    assert (record["project"], record["service"], record["container"]) == (
+        "stack", "immich-machine-learning", cid(1))
     assert sup.sm.budget_left(clock.mono) == budget, "quarantine spent kill budget"
     queued = list(sup.workers.actions["quarantine"])
     assert queued and queued[0]["container"] == cid(1)

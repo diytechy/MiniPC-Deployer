@@ -1592,7 +1592,12 @@ if [ -n "$__gm3_rp" ] && [ "$__gm3_rp" != no ]; then
 fi
 
 log "docker compose up -d…"
-docker compose up -d
+# The up's status is CAPTURED, not left to `set -e`: a partial failure (one
+# service's pull or health check) has still started the others, quarantined
+# ones included, so the enforcement below must run either way. The failure is
+# then propagated exactly as `set -e` would have (end of 4a-quarantine).
+_compose_rc=0
+docker compose up -d || _compose_rc=$?
 
 # ── 4a-quarantine. A QUARANTINED SERVICE STAYS DOWN ACROSS A REBOOT (LLR-1016)
 # The recovery supervisor (6g) quarantines a service it had to kill twice in an
@@ -1604,9 +1609,21 @@ docker compose up -d
 # off). The Owner's way out is unchanged: `homehub-recovery release <service>`.
 # Called through python3 by path: the /usr/local/sbin symlink is made in 6g, and
 # ISO9660 drops the exec bit. Never fatal; a failure is named.
+#
+# WHY QUARANTINED SERVICES ARE NOT SIMPLY LEFT OUT OF THE `up`: the stack is
+# started as a bare `up -d`, whose service set is whatever the active profiles
+# and .env make it. An explicit list would have to re-derive that set (and stay
+# in step with every future profile), and it still would not hold: a service
+# that `depends_on` the quarantined one makes compose start it anyway. Stopping
+# it straight after is one place with no such coupling; the cost is the few
+# seconds it runs, recorded in stack/recovery/README.md.
 if [ -f /var/lib/homehub-recovery/quarantine.json ] && [ -f "$STACK_DIR/recovery/homehub-recovery" ]; then
     python3 "$STACK_DIR/recovery/homehub-recovery" enforce-quarantine 2>&1 | sed 's/^/  /' \
         || log "WARN: a quarantined service could not be kept stopped - see the lines above"
+fi
+if [ "$_compose_rc" -ne 0 ]; then
+    log "FATAL: 'docker compose up -d' exited $_compose_rc (quarantine was still enforced)"
+    exit "$_compose_rc"
 fi
 
 # ── 4a-post. DID THEY ACTUALLY STAY UP? ──────────────────────────────────────

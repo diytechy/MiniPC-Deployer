@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 
 import pytest
 
@@ -214,69 +216,168 @@ def test_release_restores_the_policy_starts_it_and_tells_the_supervisor_tc1063(t
     assert open(tree.paths.released_file).read() == "immich-machine-learning\n"
 
 
-def _compose_ps(service, ids):
-    return (["docker", "ps", "-a", "-q", "--no-trunc",
-             "--filter", "label=com.docker.compose.service={}".format(service)],
-            (0, "\n".join(ids), ""))
+def _fake_docker(monkeypatch, containers, fail=()):
+    """A Docker daemon that answers `ps --filter label=...` from `containers`
+    ({id: {label: value}}), ANDing the filters the way docker does. Every other
+    call succeeds unless its first two words are in `fail`. Returns the calls."""
+    calls = []
+
+    def run(argv, timeout=60):
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            wanted = [argv[i + 1][len("label="):].split("=", 1)
+                      for i, a in enumerate(argv) if a == "--filter"]
+            hits = [c for c, labels in sorted(containers.items())
+                    if all(labels.get(k) == v for k, v in wanted)]
+            return 0, "\n".join(hits), ""
+        if tuple(argv[:2]) in fail:
+            return 1, "", "daemon not answering"
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_run", run)
+    return calls
+
+
+def _labels(project, service):
+    return {"com.docker.compose.project": project, "com.docker.compose.service": service}
+
+
+def _record(container, service, project="stack", restart="unless-stopped"):
+    return {"container": container, "restart": restart, "project": project, "service": service}
+
+
+def _stopped(calls):
+    return [c[-1] for c in calls if c[:2] == ["docker", "stop"]]
 
 
 def test_a_boot_keeps_a_quarantined_service_stopped_after_compose_up_tc1084(tmp_path, monkeypatch):
     """Review 2026-10-10: firstboot's `docker compose up -d` started it again.
 
     The service was recreated under a new id by that `up` (a new image), so the
-    stop must find it by its compose label, not by the id the record holds.
-    A service with no current container falls back to the recorded id."""
+    stop must find it by its compose labels, not by the id the record holds.
+    A compose service with no current container falls back to the recorded id."""
     tree = Tree(tmp_path)
     tree.write(tree.paths.quarantine_file, json.dumps({"quarantined": {
-        "immich-machine-learning": {"container": cid(1), "restart": "unless-stopped"},
-        "old-hog": {"container": cid(3), "restart": "always"}}}))
-    calls = _fake_run(monkeypatch, [_compose_ps("immich-machine-learning", [cid(2)])])
+        "immich-machine-learning": _record(cid(1), "immich-machine-learning"),
+        "old-hog": _record(cid(3), "old-hog", restart="always")}}))
+    calls = _fake_docker(monkeypatch, {cid(2): _labels("stack", "immich-machine-learning")})
     assert cli.main(["--root", str(tmp_path), "enforce-quarantine"]) == 0
     assert ["docker", "update", "--restart=no", cid(2)] in calls
-    assert ["docker", "stop", "-t", "10", cid(2)] in calls
-    assert ["docker", "stop", "-t", "10", cid(3)] in calls
-    assert ["docker", "stop", "-t", "10", cid(1)] not in calls, "stopped a stale id, not the running one"
+    assert sorted(_stopped(calls)) == sorted([cid(2), cid(3)]), "stopped a stale id, not the running one"
     # Nothing is released by enforcing: the record still names both.
     assert set(json.load(open(tree.paths.quarantine_file))["quarantined"]) == {"immich-machine-learning",
                                                                                 "old-hog"}
 
 
-def test_enforcing_quarantine_names_a_stop_that_failed_tc1084(tmp_path, monkeypatch):
+def test_a_same_named_service_in_another_project_is_never_touched_tc1084(tmp_path, monkeypatch):
+    """Third review: the service label alone matched other projects' containers,
+    and any match skipped the recorded-id fallback."""
     tree = Tree(tmp_path)
     tree.write(tree.paths.quarantine_file, json.dumps(
-        {"quarantined": {"hog": {"container": cid(1), "restart": "unless-stopped"}}}))
-    _fake_run(monkeypatch, [(["docker", "stop"], (1, "", "daemon not answering"))])
+        {"quarantined": {"web": _record(cid(1), "web")}}))
+    containers = {cid(1): _labels("stack", "web"), cid(9): _labels("sim", "web")}
+    calls = _fake_docker(monkeypatch, containers)
+    assert cli.main(["--root", str(tmp_path), "enforce-quarantine"]) == 0
+    assert _stopped(calls) == [cid(1)]
+    calls = _fake_docker(monkeypatch, containers)
+    assert cli.main(["--root", str(tmp_path), "release", "web"]) == 0
+    assert [c[-1] for c in calls if c[:2] == ["docker", "start"]] == [cid(1)]
+
+
+def test_a_non_compose_victim_is_its_recorded_id_and_nothing_else_tc1084(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    tree.write(tree.paths.quarantine_file, json.dumps(
+        {"quarantined": {"loose": {"container": cid(4), "restart": "always"}}}))
+    calls = _fake_docker(monkeypatch, {cid(5): _labels("stack", "loose")})
+    assert cli.main(["--root", str(tmp_path), "enforce-quarantine"]) == 0
+    assert _stopped(calls) == [cid(4)]
+    assert not [c for c in calls if c[:2] == ["docker", "ps"]]
+
+
+def test_enforcing_quarantine_names_a_stop_that_failed_tc1084(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    tree.write(tree.paths.quarantine_file, json.dumps({"quarantined": {"hog": _record(cid(1), "hog")}}))
+    _fake_docker(monkeypatch, {}, fail={("docker", "stop")})
     assert cli.main(["--root", str(tmp_path), "enforce-quarantine"]) == 1
 
 
 def test_a_released_service_is_not_stopped_again_at_the_next_boot_tc1084(tmp_path, monkeypatch):
     """The Owner's way out: release removes the entry, so enforcement leaves it."""
     tree = Tree(tmp_path)
-    tree.write(tree.paths.quarantine_file, json.dumps(
-        {"quarantined": {"hog": {"container": cid(1), "restart": "unless-stopped"}}}))
-    _fake_run(monkeypatch, [_compose_ps("hog", [cid(2)])])
+    tree.write(tree.paths.quarantine_file, json.dumps({"quarantined": {"hog": _record(cid(1), "hog")}}))
+    containers = {cid(2): _labels("stack", "hog")}
+    _fake_docker(monkeypatch, containers)
     assert cli.main(["--root", str(tmp_path), "release", "hog"]) == 0
-    calls = _fake_run(monkeypatch, [_compose_ps("hog", [cid(2)])])
+    calls = _fake_docker(monkeypatch, containers)
     assert cli.main(["--root", str(tmp_path), "enforce-quarantine"]) == 0
     assert not [c for c in calls if c[:2] in (["docker", "stop"], ["docker", "update"])]
 
 
 def test_release_starts_the_recreated_container_not_the_recorded_id_tc1084(tmp_path, monkeypatch):
     tree = Tree(tmp_path)
-    tree.write(tree.paths.quarantine_file, json.dumps(
-        {"quarantined": {"hog": {"container": cid(1), "restart": "unless-stopped"}}}))
-    calls = _fake_run(monkeypatch, [_compose_ps("hog", [cid(2)])])
+    tree.write(tree.paths.quarantine_file, json.dumps({"quarantined": {"hog": _record(cid(1), "hog")}}))
+    calls = _fake_docker(monkeypatch, {cid(2): _labels("stack", "hog")})
     assert cli.main(["--root", str(tmp_path), "release", "hog"]) == 0
     assert ["docker", "update", "--restart=unless-stopped", cid(2)] in calls
     assert ["docker", "start", cid(2)] in calls
 
 
+FIRSTBOOT = REPO / "stack" / "autoinstall" / "firstboot.sh"
+_PROPAGATE = '    exit "$_compose_rc"\nfi\n'
+
+
+def _firstboot_compose_block() -> str:
+    """firstboot.sh from the bulk `up` through 4a-quarantine's failure propagation."""
+    text = FIRSTBOOT.read_text(encoding="utf-8")
+    start = text.index("_compose_rc=0\n")
+    return text[start:text.index(_PROPAGATE, start) + len(_PROPAGATE)]
+
+
+_HARNESS = r"""set -euo pipefail
+STACK_DIR="$1"; TRACE="$2"; RC="$3"
+log() { printf 'log %s\n' "$*" >>"$TRACE"; }
+docker() { printf 'docker %s\n' "$*" >>"$TRACE"; return "$RC"; }
+python3() { printf 'python3 %s\n' "$*" >>"$TRACE"; }
+"""
+
+
+@pytest.mark.parametrize("compose_rc", [0, 1])
+def test_firstboot_enforces_quarantine_even_when_compose_up_fails_tc1084(tmp_path, compose_rc):
+    """Third review: under `set -e` a failed `up` exited before the enforcement,
+    leaving a quarantined hog up. The block is RUN, with docker and python3 as
+    shell functions: enforcement must happen either way, and the up's own exit
+    status must still end the script exactly as `set -e` would have."""
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not installed")
+    stack = tmp_path / "stack"
+    (stack / "recovery").mkdir(parents=True)
+    (stack / "recovery" / "homehub-recovery").write_text("# stand-in\n", encoding="utf-8")
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "quarantine.json").write_text('{"quarantined": {}}', encoding="utf-8")
+    trace = tmp_path / "trace"
+    block = _firstboot_compose_block().replace("/var/lib/homehub-recovery", state.as_posix())
+    script = tmp_path / "block.sh"
+    script.write_bytes((_HARNESS + block + "printf 'after\\n' >>\"$TRACE\"\n").encode("utf-8"))
+    done = subprocess.run([bash, script.as_posix(), stack.as_posix(), trace.as_posix(), str(compose_rc)],
+                          capture_output=True, text=True)
+    lines = trace.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "docker compose up -d", (lines, done.stderr)
+    assert any(ln.startswith("python3 ") and ln.endswith("homehub-recovery enforce-quarantine")
+               for ln in lines), lines
+    if compose_rc:
+        assert done.returncode == compose_rc and "after" not in lines, (done.returncode, lines)
+    else:
+        assert done.returncode == 0 and lines[-1] == "after", (done.returncode, lines)
+
+
 def test_firstboot_enforces_quarantine_right_after_the_bulk_compose_up_tc1084():
     """STATIC ORDER: the enforcement is the next command after `docker compose up -d`
     and comes before anything else starts or judges containers."""
-    lines = [ln for ln in (REPO / "stack" / "autoinstall" / "firstboot.sh").read_text(
-        encoding="utf-8").splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-    up = lines.index("docker compose up -d")
+    lines = [ln for ln in FIRSTBOOT.read_text(encoding="utf-8").splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    up = lines.index("docker compose up -d || _compose_rc=$?")
     assert "quarantine.json" in lines[up + 1] and lines[up + 1].startswith("if ")
     assert 'homehub-recovery" enforce-quarantine' in lines[up + 2]
     assert "|| log" in lines[up + 3], "a failed enforcement must be logged, never fail the boot"

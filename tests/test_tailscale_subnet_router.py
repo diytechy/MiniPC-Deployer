@@ -339,7 +339,9 @@ class _FakeHub:
         }
         for name, body in shims.items():
             shim = self.bin / name
-            shim.write_text("#!/bin/sh\n" + body, encoding="utf-8", newline="\n")
+            # Path.write_text(newline=) is Python 3.10+; open() takes it on 3.8.
+            with open(shim, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("#!/bin/sh\n" + body)
             shim.chmod(0o755)
 
         self.state = tmp_path / "state.json"
@@ -356,10 +358,12 @@ class _FakeHub:
         if knob is not None:
             lines.append("TAILSCALE_ADVERTISE_EXIT_NODE=%s" % knob)
         self.env_file = tmp_path / "stack.env"
-        self.env_file.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        with open(self.env_file, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
         # Present and correct, so step 1 never tries to write /etc/sysctl.d.
         self.sysctl = tmp_path / "99-tailscale.conf"
-        self.sysctl.write_text("net.ipv4.ip_forward = 1\n", encoding="utf-8", newline="\n")
+        with open(self.sysctl, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("net.ipv4.ip_forward = 1\n")
 
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("TAILSCALE_", "TS_"))}

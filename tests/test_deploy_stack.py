@@ -334,3 +334,146 @@ def test_placement_refuses_to_write_through_a_symlink_sr047(tmp_path):
     assert b"symlink" in r.stderr.lower(), r.stderr.decode()
     assert env.read_bytes() == b"SECRET=keepme\n", \
         "THE PROTECTED .env WAS OVERWRITTEN THROUGH A SYMLINK"
+
+
+# ── boot copies: firstboot installs them, the lane only reports them (LLR-992) ─
+
+FIRSTBOOT_SH = ROOT / "stack" / "autoinstall" / "firstboot.sh"
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_firstboot_installs_both_boot_copies_before_any_exit_a_normal_run_takes():
+    """A STATIC ORDERING CHECK, NOT A RUN. Comment lines are excluded first.
+
+    The two boot-copy installs must be unconditional, at column 0, and placed
+    before step 1b (`setup_docker_lv`). Every `exit` above them must be one of
+    the `.env`/tree guards, which both say FATAL, since those are the only exits a
+    normal run can take before the install. An install placed after a step that
+    can exit would let a failing run skip the refresh, which is the defect.
+    """
+    text = FIRSTBOOT_SH.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    installs = [
+        'install -m 0755 "$STACK_DIR/autoinstall/firstboot.sh" /usr/local/sbin/homehub-firstboot.sh',
+        'install -m 0755 "$STACK_DIR/autoinstall/powertune.sh" /usr/local/sbin/powertune.sh',
+    ]
+    positions = []
+    for want in installs:
+        assert want in lines, "firstboot.sh must install the boot copy: %s" % want
+        positions.append(lines.index(want))
+    first_install = min(positions)
+    assert lines.index("setup_docker_lv") > max(positions), \
+        "the boot-copy installs must come before step 1b"
+    for i, line in enumerate(lines[:first_install]):
+        s = line.strip()
+        if s.startswith("#") or not s:
+            continue
+        if "exit" in s.split():
+            assert "FATAL" in s, \
+                "an exit before the boot-copy install is not a tree guard: %r" % line
+    source = pathlib.Path(ROOT / "stack" / "autoinstall" / "powertune.sh")
+    assert source.exists(), "the powertune install has no source in the tree"
+
+
+def test_the_boot_copy_gate_runs_when_nothing_was_delivered_sr047():
+    """`verified` is None when there was nothing to deliver - the incident state.
+
+    `is True` would skip the report exactly then. Only a KNOWN failed delivery
+    may suppress it.
+    """
+    assert ds.boot_copies_due({"verified": None}) is True
+    assert ds.boot_copies_due({"verified": True}) is True
+    assert ds.boot_copies_due({"verified": False}) is False
+
+
+def test_boot_copy_state_is_exact_and_never_accepts_crlf_as_current_sr047():
+    lf = b"#!/usr/bin/env bash\necho hi\n"
+    crlf = lf.replace(b"\n", b"\r\n")
+    e, e_lf = _sha(lf), _sha(lf.replace(b"\r\n", b"\n"))
+    assert ds.boot_copy_state(e, e_lf, _sha(lf), _sha(lf)) == "current"
+    assert ds.boot_copy_state(e, e_lf, None, None) == "missing"
+    other = b"#!/usr/bin/env bash\necho old\n"
+    assert ds.boot_copy_state(e, e_lf, _sha(other), _sha(other)) == "stale"
+    # The CRLF copy's CR-stripped bytes equal the payload, so it is labelled
+    # stale-line-endings - and it is NOT current, because the kernel cannot run
+    # a CRLF shebang.
+    got = ds.boot_copy_state(e, e_lf, _sha(crlf), _sha(crlf.replace(b"\r\n", b"\n")))
+    assert got == "stale-line-endings", got
+    assert got != "current"
+
+
+def test_boot_copy_report_classifies_each_copy_from_the_box_sr047(monkeypatch):
+    """The read-only report end to end, with ssh replaced by what the box says."""
+    fb = b"#!/usr/bin/env bash\necho firstboot\n"
+    pt = b"#!/bin/bash\necho powertune\n"
+    payload = {
+        "autoinstall/firstboot.sh": (_sha(fb), fb, True),
+        "autoinstall/powertune.sh": (_sha(pt), pt, True),
+    }
+    box = {
+        "/usr/local/sbin/homehub-firstboot.sh": fb.replace(b"\n", b"\r\n"),
+        "/usr/local/sbin/powertune.sh": None,
+    }
+
+    def fake_run(argv, **kw):
+        out = []
+        for dest, data in box.items():
+            if data is None:
+                out.append("%s\tMISSING" % dest)
+            else:
+                out.append("\t".join([dest, _sha(data),
+                                      _sha(data.replace(b"\r\n", b"\n")), "755"]))
+        return subprocess.CompletedProcess(argv, 0, "\n".join(out) + "\n", "")
+
+    monkeypatch.setattr(ds.subprocess, "run", fake_run)
+    by = {r["path"]: r for r in ds.boot_copy_report("hub@example", payload)}
+    assert by["/usr/local/sbin/homehub-firstboot.sh"]["state"] == "stale-line-endings"
+    assert by["/usr/local/sbin/powertune.sh"]["state"] == "missing"
+    assert by["/usr/local/sbin/powertune.sh"]["actual_sha256"] is None
+
+
+def test_boot_copy_report_never_dies_when_the_box_cannot_be_read(monkeypatch):
+    """A diagnostic must not fail the run it reports on: None, not SystemExit."""
+    payload = {"autoinstall/firstboot.sh": ("a", b"x", True),
+               "autoinstall/powertune.sh": ("b", b"y", True)}
+    monkeypatch.setattr(ds.subprocess, "run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 255, "", "denied"))
+    assert ds.boot_copy_report("hub@example", payload) is None
+
+
+def test_boot_copy_report_survives_a_payload_without_the_source(monkeypatch):
+    """A revision that predates powertune.sh reports no-source, it does not raise."""
+    fb = b"#!/usr/bin/env bash\necho firstboot\n"
+    payload = {"autoinstall/firstboot.sh": (_sha(fb), fb, True)}
+    lines = ["/usr/local/sbin/homehub-firstboot.sh\t%s\t%s\t755" % (_sha(fb), _sha(fb)),
+             "/usr/local/sbin/powertune.sh\tMISSING"]
+    monkeypatch.setattr(ds.subprocess, "run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 0, "\n".join(lines) + "\n", ""))
+    by = {r["path"]: r for r in ds.boot_copy_report("hub@example", payload)}
+    assert by["/usr/local/sbin/homehub-firstboot.sh"]["state"] == "current"
+    assert by["/usr/local/sbin/powertune.sh"]["state"] == "no-source"
+
+
+def test_boot_copy_report_shows_before_and_after_a_firstboot_refresh_sr047():
+    """The review finding: the report kept the pre-firstboot 'stale' after a refresh."""
+    before = [{"path": "/p", "expected_sha256": "n", "actual_sha256": "o",
+               "mode": "755", "state": "stale"}]
+    after = [{"path": "/p", "expected_sha256": "n", "actual_sha256": "n",
+              "mode": "755", "state": "current"}]
+    result = {"boot_copies": before}
+    ds.record_boot_copies_after_firstboot(result, before, after)
+    assert result["boot_copies_before"][0]["state"] == "stale"
+    assert result["boot_copies_after"][0]["state"] == "current"
+    assert result["boot_copies"][0]["state"] == "current"
+    # A failed re-read must not be reported as current.
+    result = {"boot_copies": before}
+    ds.record_boot_copies_after_firstboot(result, before, None)
+    assert result["boot_copies"][0]["state"] == "stale"
+    assert "boot_copies_after_error" in result
+    # Firstboot not run (no snapshot): the report is untouched.
+    result = {}
+    ds.record_boot_copies_after_firstboot(result, None, after)
+    assert result == {}

@@ -12,6 +12,18 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-09 — boot copies of firstboot now refresh themselves (FOLLOWUPS A7 bullet 1).**
+`firstboot.sh` step 1a installs `homehub-firstboot.sh` and `powertune.sh` from the
+`/opt` tree on every run; `deploy_stack.py` reports (read-only, never fails the run)
+whether each boot copy is `current`, `stale`, `stale-line-endings` or `missing`,
+using an exact sha256. Design: `docs/design/firstboot-boot-copy-refresh-2026-10-09.md`
+(revised after review). Evidence: `tests/test_deploy_stack.py` 24 passed, mutations
+on the ordering, gate and CRLF checks each turned their test red. Under LLR-992;
+no new TC id added.
+NOT PROVEN: not run on the hub. The first `--run-firstboot` after delivery is what
+converges the boot copies; the hub's current sbin copies are unmeasured until then.
+The `/etc` unit file refresh is deferred (needs daemon-reload).
+
 **2026-10-09 — Owner authorized Sure integration and default profile enablement.**
 Merged `sure-stack` into `IceDrive-DesktopDirection`; `sure` is selected by
 default in the deployer template and HomeHub materialization configuration.

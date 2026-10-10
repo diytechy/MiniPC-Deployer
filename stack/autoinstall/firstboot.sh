@@ -41,6 +41,22 @@ cd "$STACK_DIR" || { log "FATAL: $STACK_DIR missing"; exit 1; }
 if [ ! -f .env ]; then
     log "FATAL: $STACK_DIR/.env missing (autoinstall should have seeded it)"; exit 1
 fi
+
+# ── 1a. refresh the BOOT COPIES of this script and powertune.sh ──────────────
+#
+# WHY THIS IS HERE, AND WHY IT IS EARLY. The unit runs /usr/local/sbin/
+# homehub-firstboot.sh, a copy that user-data made once at reimage time and
+# nothing refreshed afterwards. So after a deploy the box converged once and the
+# next boot ran old code (docs/design/firstboot-boot-copy-refresh-2026-10-09.md).
+# --run-firstboot runs the /opt copy, which IS current, so the new code installs
+# its own boot copy. Placed after the .env guard above (the only exits a normal
+# run can take before this point, both guards against a missing tree) and before
+# anything that can fail, so a run that later fails still refreshes the boot
+# copies. `install` replaces the inode, so a bash already executing the old boot
+# copy keeps reading its unlinked original and is not disturbed.
+install -m 0755 "$STACK_DIR/autoinstall/firstboot.sh" /usr/local/sbin/homehub-firstboot.sh
+install -m 0755 "$STACK_DIR/autoinstall/powertune.sh" /usr/local/sbin/powertune.sh
+
 if grep -q "REPLACE_WITH" .env; then
     log "WARNING: .env still contains REPLACE_WITH placeholders."
     log "The stack will start but TLS/auth/DNS may be wrong until you edit .env"

@@ -337,6 +337,25 @@ def boot_copy_report(target: str, payload: dict):
     return records
 
 
+def record_boot_copies_after_firstboot(result: dict, before, after) -> None:
+    """Label the boot copies' state before and after a firstboot run.
+
+    `boot_copies` is the state as the box stands when the run ends, so it
+    follows the re-read; the pre-firstboot snapshot is kept as
+    `boot_copies_before`. If the re-read fails, `boot_copies` keeps the stale
+    snapshot (the last thing actually seen) and the failure is named, never
+    silently reported as current.
+    """
+    if before is None:
+        return
+    result["boot_copies_before"] = before
+    if after is None:
+        result["boot_copies_after_error"] = "unreadable over ssh after firstboot"
+        return
+    result["boot_copies_after"] = after
+    result["boot_copies"] = after
+
+
 def boot_copies_due(result: dict) -> bool:
     """Report the boot copies unless the delivery is KNOWN to have failed.
 
@@ -791,8 +810,10 @@ def main() -> int:
     # BOOT COPIES: VERIFY-ONLY. Read-only, runs even when there was nothing to
     # deliver (the incident state), and in a dry run. Staleness does not fail the
     # run: firstboot is the writer, and --run-firstboot below converges them.
+    boot_copies_before = None
     if boot_copies_due(result):
         recs = boot_copy_report(args.target, payload)
+        boot_copies_before = recs
         if recs is None:
             print("deploy-stack: WARNING could not read the boot copies on %s; "
                   "not reported (informational, does not fail the run)." % args.target)
@@ -824,6 +845,17 @@ def main() -> int:
     if args.run_firstboot and args.apply and result.get("verified") is not False:
         rc = run_firstboot(args.target, args.force_firstboot)
         result["firstboot_rc"] = rc
+        # Firstboot is the writer of the boot copies, so the snapshot taken
+        # above is stale by now. Re-read and label before/after.
+        if boot_copies_before is not None:
+            after = boot_copy_report(args.target, payload)
+            record_boot_copies_after_firstboot(result, boot_copies_before, after)
+            if after is None:
+                print("deploy-stack: WARNING could not re-read the boot copies "
+                      "after firstboot; the report keeps the pre-firstboot state.")
+            else:
+                for b, a in zip(boot_copies_before, after):
+                    print("  boot copy %s -> %s : %s" % (b["state"], a["state"], a["path"]))
         if rc != 0:
             _write_report(args.report, result)
             die("firstboot exited %d. The files are delivered and verified, "

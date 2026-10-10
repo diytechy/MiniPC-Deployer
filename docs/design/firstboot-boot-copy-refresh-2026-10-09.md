@@ -78,6 +78,7 @@ Both sources are in the same tree this run is executing from, and the `.env` gua
 - `boot_copy_state(expected_sha, expected_lf_sha, actual_sha, actual_lf_sha) -> str` returns `missing` when the box has no file, `current` on exact equality, `stale-line-endings` when the box's CR-stripped bytes equal the payload's LF form, and `stale` otherwise.
 - One `ssh` call, `sudo -n sha256sum` and `sudo -n stat -c %a`, using the same pattern as `remote_hashes`.
 - The result is `result["boot_copies"] = [{path, expected_sha256, actual_sha256, mode, state}]`.
+- When `--run-firstboot` runs, the boot copies are re-read afterwards: `boot_copies_before` holds the pre-firstboot snapshot, `boot_copies_after` the re-read, and `boot_copies` follows the after state (or keeps the stale snapshot plus `boot_copies_after_error` if the re-read fails). Without firstboot only `boot_copies` is written.
 - An ssh failure is a warning, not a `die()`. A diagnostic must not fail the thing it reports on.
 
 ## Deferred (not in this change)

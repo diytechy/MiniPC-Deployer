@@ -455,3 +455,25 @@ def test_boot_copy_report_survives_a_payload_without_the_source(monkeypatch):
     by = {r["path"]: r for r in ds.boot_copy_report("hub@example", payload)}
     assert by["/usr/local/sbin/homehub-firstboot.sh"]["state"] == "current"
     assert by["/usr/local/sbin/powertune.sh"]["state"] == "no-source"
+
+
+def test_boot_copy_report_shows_before_and_after_a_firstboot_refresh_sr047():
+    """The review finding: the report kept the pre-firstboot 'stale' after a refresh."""
+    before = [{"path": "/p", "expected_sha256": "n", "actual_sha256": "o",
+               "mode": "755", "state": "stale"}]
+    after = [{"path": "/p", "expected_sha256": "n", "actual_sha256": "n",
+              "mode": "755", "state": "current"}]
+    result = {"boot_copies": before}
+    ds.record_boot_copies_after_firstboot(result, before, after)
+    assert result["boot_copies_before"][0]["state"] == "stale"
+    assert result["boot_copies_after"][0]["state"] == "current"
+    assert result["boot_copies"][0]["state"] == "current"
+    # A failed re-read must not be reported as current.
+    result = {"boot_copies": before}
+    ds.record_boot_copies_after_firstboot(result, before, None)
+    assert result["boot_copies"][0]["state"] == "stale"
+    assert "boot_copies_after_error" in result
+    # Firstboot not run (no snapshot): the report is untouched.
+    result = {}
+    ds.record_boot_copies_after_firstboot(result, None, after)
+    assert result == {}

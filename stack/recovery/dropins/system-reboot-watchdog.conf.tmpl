@@ -1,0 +1,8 @@
+# Installed by setup-recovery.sh to /etc/systemd/system.conf.d/ ONLY when
+# HUB_WATCHDOG_ENABLED=true and HUB_WD_TIERS=full with a reset device (§3.4).
+# systemd-shutdown reopens the watchdog in LATE shutdown whatever
+# RuntimeWatchdogSec says (RebootWatchdogSec defaults to 10 min); this makes that
+# hand-off explicit and gives both shutdown phases the supervisor's bound.
+[Manager]
+RebootWatchdogSec=@SHUTDOWN_SECONDS@s
+WatchdogDevice=@DEVICE@

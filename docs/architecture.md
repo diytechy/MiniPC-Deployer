@@ -719,3 +719,45 @@ sequenceDiagram
         end
     end
 ```
+
+### One memory episode on the hub: kill, reboot, hand-off (SR-050, SR-051, LLR-999, LLR-1000, LLR-1002)
+
+The supervisor's main thread never waits on a disk, journald or D-Bus; it only
+appends to queues. The action thread may hang in a subprocess and the two
+telemetry threads may hang for ever, and neither stops the petting or the
+120 s escalation. Design: HomeHub `HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md`.
+
+```mermaid
+sequenceDiagram
+    %% Renders SR-050, SR-051, LLR-998, LLR-999, LLR-1000, LLR-1002, LLR-1008
+    participant K as kernel (PSI, cgroupfs, /dev/watchdog0, /dev/kmsg)
+    participant M as main thread (SCHED_RR 1)
+    participant A as action thread
+    participant T as telemetry x2 (drop-oldest)
+    participant S as systemd / Docker
+    loop every 5 s (CLOCK_MONOTONIC)
+        M->>K: read memory PSI full avg10, meminfo
+        M->>K: WDIOC_KEEPALIVE (full tier, unless escalated)
+        M-->>T: append journal line (never waits)
+    end
+    Note over M: 120 s open, >= 75 % of MEASURED samples pressured,<br/>budget left (gaps are never measured pressure)
+    M->>K: write 1 to docker-<id>.scope/cgroup.kill
+    M->>K: /dev/kmsg "kill target=..." (non-blocking)
+    M-->>T: evidence file (samples already in memory)
+    M->>K: cgroup.events: populated 0 within 10 s?
+    M-->>A: append reconcile (deduplicated)
+    A->>S: docker inspect (20 s) - ghost? rm -f / restart
+    A-->>M: result (Docker silent: retried in 60 s, nothing waits)
+    Note over M: episode still open 600 s after t0 (kills never reset t0)
+    M->>K: write /run/homehub-recovery/intent (tmpfs)
+    M-->>A: append reboot (once, never re-queued)
+    A->>S: systemctl reboot (30 s)
+    alt SIGTERM arrives (normal reboot)
+        S->>M: SIGTERM (no disarm file for this boot+invocation)
+        M->>K: SETTIMEOUT 300, keepalive, close WITHOUT magic close
+        Note over S,K: services stop under the 300 s timer; the stamp unit writes<br/>the intent to disk after Docker; systemd-shutdown takes the<br/>device with RebootWatchdogSec=300s
+    else no SIGTERM within 120 s (action thread hung, or reboot refused)
+        M->>M: stop petting
+        K->>K: board reset within 60 s (L4); next boot counts it
+    end
+```

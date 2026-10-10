@@ -102,6 +102,12 @@ cat >"$TMP/mountinfo" <<EOF
 24 22 0:31 / $TMP/src rw,relatime - tmpfs tmpfs rw
 25 22 0:32 / $TMP/backup rw,relatime - tmpfs tmpfs rw
 EOF
+# The guard also asks the kernel whether each mounted device still EXISTS
+# (e32a1b4: a vanished device is a stale mount). 0:31 and 0:32 are fictional, so
+# model them as present; without this every run refused as "stale" and the
+# suite asserted nothing past the preflight.
+mkdir -p "$TMP/sys-dev-block"
+: >"$TMP/sys-dev-block/0:31"; : >"$TMP/sys-dev-block/0:32"
 
 write_config() {
     local target="$1"
@@ -143,7 +149,7 @@ EOF
 run_wrapper() {
     local name="$1" config="$2" verify="$3" backup_rc="$4" verify_rc="$5" http_code="$6"
     : >"$TMP/$name.capture"; : >"$TMP/$name.events"
-    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
+    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
         MOCK_BACKUP_RC="$backup_rc" MOCK_VERIFY_RC="$verify_rc" MOCK_HTTP_CODE="$http_code" \
         LIBRARY_ROOT="$TMP/src" \
         LIBRARY_BACKUP_LOCK="$TMP/$name.lock" \
@@ -164,7 +170,7 @@ phases() { grep -o '"runState":"[a-z-]*"' "$1" 2>/dev/null | sed 's/.*:"//;s/"//
 run_reconcile() {
     local name="$1" lock="$2"
     : >"$TMP/$name.capture"; : >"$TMP/$name.events"
-    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
+    PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/$name.capture" EVENTS="$TMP/$name.events" \
         MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src" LIBRARY_BACKUP_LOCK="$lock" \
         MOCK_FB_RUNNING="${MOCK_FB_RUNNING:-}" MOCK_DOCKER_PS_RC="${MOCK_DOCKER_PS_RC:-0}" \
         bash "$WRAPPER" --config "$TMP/good.env" --reconcile-run-state >"$TMP/$name.out" 2>&1
@@ -301,7 +307,7 @@ fi
 # or a SUCCESSFUL preflight strands `starting` on the wall with nothing to
 # withdraw it.
 : >"$TMP/preflight-only.capture"; : >"$TMP/preflight-only.events"
-PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/preflight-only.capture"     EVENTS="$TMP/preflight-only.events" MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/preflight-only.lock"     bash "$WRAPPER" --config "$TMP/good.env" --preflight-only >"$TMP/preflight-only.out" 2>&1
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/preflight-only.capture"     EVENTS="$TMP/preflight-only.events" MOCK_HTTP_CODE=200 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/preflight-only.lock"     bash "$WRAPPER" --config "$TMP/good.env" --preflight-only >"$TMP/preflight-only.out" 2>&1
 PF_RC=$?
 if [ "$PF_RC" = 0 ] && [ "$(post_count "$TMP/preflight-only.capture")" = 0 ]; then
     pass "F5 a successful preflight-only run claims no phase and strands nothing"
@@ -330,13 +336,63 @@ esac
 CURLEOF
 chmod +x "$TMP/bin/curl"
 : >"$TMP/split.capture"; : >"$TMP/split.events"
-PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" CAPTURE="$TMP/split.capture"     EVENTS="$TMP/split.events" MOCK_BACKUP_RC=0 MOCK_VERIFY_RC=0     MOCK_HTTP_CODE=200 MOCK_SUCCESS_CODE=500 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/split.lock"     bash "$WRAPPER" --config "$TMP/good.env" --verify shallow >"$TMP/split.out" 2>&1
+PATH="$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" SYS_DEV_BLOCK_DIR="$TMP/sys-dev-block" CAPTURE="$TMP/split.capture"     EVENTS="$TMP/split.events" MOCK_BACKUP_RC=0 MOCK_VERIFY_RC=0     MOCK_HTTP_CODE=200 MOCK_SUCCESS_CODE=500 LIBRARY_ROOT="$TMP/src"     LIBRARY_BACKUP_LOCK="$TMP/split.lock"     bash "$WRAPPER" --config "$TMP/good.env" --verify shallow >"$TMP/split.out" 2>&1
 SPLIT_RC=$?
 if [ "$SPLIT_RC" != 0 ] && grep -q FATAL "$TMP/split.out"; then
     pass "F2 a failed lastSuccess still fails the unit even when the later idle post succeeds"
 else
     fail "F2 a failed lastSuccess was masked by the following idle post (rc=$SPLIT_RC)"
 fi
+
+# ── hub recovery C4: the backup slice's exact peak (SR-049) ──────────────────
+# Logged after the backup AND after the verify, from the slice that outlives
+# each --rm container. A diagnostic: an unreadable slice never fails the run.
+mkdir -p "$TMP/slice"
+printf '3221225472\n' >"$TMP/slice/memory.peak"
+FILEBACKUP_SLICE_CGROUP="$TMP/slice" run_wrapper peak "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" = 0 ] \
+   && grep -qF 'filebackup slice memory.peak: 3221225472 bytes (3072 MiB) after backup (exit 0)' "$TMP/peak.out" \
+   && grep -qF 'memory.peak: 3221225472 bytes (3072 MiB) after shallow verify (exit 0)' "$TMP/peak.out"; then
+    pass "TC-1064 the slice's memory.peak is logged after the backup and after the verify"
+else
+    fail "TC-1064 slice peak not logged (rc=$RUN_RC): $(grep 'memory.peak' "$TMP/peak.out" | tr '\n' '|')"
+fi
+FILEBACKUP_SLICE_CGROUP="$TMP/no-such-slice" run_wrapper nopeak "$TMP/good.env" none 0 0 200
+if [ "$RUN_RC" = 0 ] && grep -qF 'filebackup slice memory.peak: unavailable' "$TMP/nopeak.out"; then
+    pass "TC-1064 an unreadable slice is reported and does not fail the run"
+else
+    fail "TC-1064 an unreadable slice changed the run (rc=$RUN_RC)"
+fi
+
+# ── hub recovery §8: staging left by an interrupted run refuses, NAMED ────────
+# Temp predates two recovery events; the one that names the backup is chosen
+# over the later one that does not, and an event older than Temp is ignored by
+# its MTIME even though its name sorts last.
+mkdir -p "$TMP/changes/Temp" "$TMP/events"
+printf 'staged\n' >"$TMP/changes/Temp/only-copy"
+touch -d '2026-10-01 00:00:00' "$TMP/changes/Temp"
+printf '{"action": "kill", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261005T010203Z-bbbbbbbb-kill.json"
+printf '{"action": "restart-ssh", "details": {}}\n' >"$TMP/events/20261005T020000Z-bbbbbbbb-restart-ssh.json"
+printf '{"action": "reboot", "details": {"interrupts_backup": true}}\n' >"$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
+touch -d '2026-09-01 00:00:00' "$TMP/events/20261009T000000Z-aaaaaaaa-reboot.json"
+RECOVERY_EVENTS_DIR="$TMP/events" run_wrapper staging "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" != 0 ] \
+   && grep -qF 'LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event 20261005T010203Z-bbbbbbbb-kill)' "$TMP/staging.out" \
+   && ! grep -q '^docker:' "$TMP/staging.events" \
+   && [ "$(success_count "$TMP/staging.capture")" = 0 ] \
+   && [ "$(cat "$TMP/changes/Temp/only-copy")" = staged ]; then
+    pass "TC-1065 staging left by an interrupted run refuses with the recovery event that named the backup, and Temp is untouched"
+else
+    fail "TC-1065 staging refusal rc=$RUN_RC events=$(tr '\n' ' ' <"$TMP/staging.events"): $(grep 'REFUSED' "$TMP/staging.out" | head -2 | tr '\n' '|')"
+fi
+RECOVERY_EVENTS_DIR="$TMP/no-events" run_wrapper staging2 "$TMP/good.env" shallow 0 0 200
+if [ "$RUN_RC" != 0 ] \
+   && grep -qF 'LIBRARY BACKUP REFUSED: staging needs recovery (interrupted by recovery event none recorded)' "$TMP/staging2.out"; then
+    pass "TC-1065 with no recovery event recorded the refusal says so rather than inventing one"
+else
+    fail "TC-1065 no-event refusal rc=$RUN_RC: $(grep 'REFUSED' "$TMP/staging2.out" | head -1)"
+fi
+rm -rf "$TMP/changes/Temp"
 
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

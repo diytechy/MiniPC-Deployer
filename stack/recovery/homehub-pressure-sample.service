@@ -1,0 +1,16 @@
+# homehub-pressure-sample - C1, one memory-pressure sample as one journal line
+# tagged `hub-pressure`. ALWAYS ON (Owner D1), record-only. Read it with:
+#   journalctl -t hub-pressure --since today -o cat
+[Unit]
+Description=HomeHub pressure sample (PSI, memory, containers, protected items, D-state)
+Documentation=file:///opt/homehub/stack/recovery/README.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/homehub-recovery/recovery.env
+ExecStart=/usr/bin/python3 /opt/homehub/stack/recovery/homehub-pressure-sample.py
+SyslogIdentifier=hub-pressure
+# Bounded so a sample stuck behind a stalled /proc read cannot pile up behind
+# the timer; it is evidence, and a missed sample is itself information.
+TimeoutStartSec=25
+MemoryMax=64M

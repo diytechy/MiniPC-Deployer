@@ -1,0 +1,9 @@
+# /etc/default/earlyoom - written by stack/recovery/setup-recovery.sh (C3, §7).
+# DO NOT EDIT ON THE BOX: change HUB_OOM_MEM_PCT / HUB_OOM_SWAP_PCT in .env.
+#
+# earlyoom 1.7: SIGTERM when BOTH available memory and free swap are below the
+# first percent of each pair, SIGKILL below the second. The victim is the
+# highest oom_score. No --avoid/--prefer: protection comes from
+# OOMScoreAdjust=-1000 on sshd (OpenSSH sets its own listener), tailscaled and
+# homehub-recoveryd.
+EARLYOOM_ARGS="-m @MEM_PCT@ -s @SWAP_PCT@ -r 3600"

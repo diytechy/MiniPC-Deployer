@@ -1,0 +1,18 @@
+# homehub-filebackup.slice - the library backup's own cgroup (C4, §7).
+# docker-compose.yml gives the filebackup service `cgroup_parent:` this slice,
+# so every `compose run --rm` container lands under it. The SLICE outlives each
+# container, so library-backup.sh can read its memory.peak after the run: the
+# peak since boot across runs, an UPPER bound for any one run, exactly.
+# systemd nests a dashed slice under its prefix, so the cgroup is
+#   /sys/fs/cgroup/homehub.slice/homehub-filebackup.slice
+# Enabled (and so kept active) by firstboot step 6g.
+[Unit]
+Description=HomeHub library backup containers
+Documentation=file:///opt/homehub/stack/recovery/README.md
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes
+
+[Install]
+WantedBy=multi-user.target

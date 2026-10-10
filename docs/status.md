@@ -12,6 +12,18 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-10 — sim oauth2-proxy pin v7.6.0 -> v7.15.2; `SIM_ADMIN_AUTH_IMAGE_TAG` retired (FOLLOWUPS A7 bullet 3), branch `fix-sim-oauth2-proxy-pin`.**
+SIM ONLY: `sim/.env.sim` `OAUTH2_PROXY_IMAGE_TAG` now v7.15.2 (tag, not digest: the repo pins tags) so
+tracker oauth2-proxy and admin-auth share one image, as in `stack/`; the admin-auth image override and
+the knob are gone (compose, env, README). Production pin (`stack/.env.example`) unchanged. Exercised
+with the real `sim/validate-sim.sh` on WSL Ubuntu Docker, before and after: 25 PASS / 5 FAIL both
+times, the identical set; check 4 (full headless Dex login to the tracker) and the admin-portal
+checks pass on v7.15.2. The 5 FAILs are pre-existing and not oauth2-proxy (check 5 isolation x2,
+check 6 unified state, check 8 non-panel 403 x2); left alone. v7.15.2 logs one new startup warning
+on the tracker proxy: `--reverse-proxy` without `--trusted-proxy-ip` trusts all X-Forwarded-*
+(stack/docker-compose.yml, base file, not changed here). NOT PROVEN: real Google provider, a
+re-export of the offline image bundle.
+
 **2026-10-10 — `wall-line-in` skips in BUS mode only (FOLLOWUPS B3), branch `fix-b3-line-in-bus-mode`.**
 A second `ExecCondition=` (`!= bus`, the visualizer's mode file and `trigger` default) makes a udev
 start in bus mode a skip, not an `Unknown PCM speaker_shared` failure. Trigger and panel modes keep

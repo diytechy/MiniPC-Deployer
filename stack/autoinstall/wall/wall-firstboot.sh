@@ -659,6 +659,13 @@ KIOSK_ENV=/etc/wall-panel/kiosk.env
         *) echo "WALL_CAMERA_ENABLED=false" ;;
     esac
     echo "WALL_CAMERA_DEVICE=${WALL_CAMERA_DEVICE:-/dev/video0}"
+    # Touch-filter adaptive trial opt-in (FOLLOWUPS B8). Non-secret, and durable
+    # across boots. Emitted ONLY for exactly 1, so absent means off, matching
+    # the app's `=== '1'`. The default stays off; whether adaptive becomes the
+    # default is a separate decision, made elsewhere.
+    case "${PANEL_TOUCH_ADAPTIVE_TRIAL:-}" in
+        1) echo "PANEL_TOUCH_ADAPTIVE_TRIAL=1" ;;
+    esac
     echo "WALL_HOST_CONFIG=$WALL_HOST_CONFIG"
 } > "$KIOSK_ENV"
 chmod 0644 "$KIOSK_ENV"

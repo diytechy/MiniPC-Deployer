@@ -24,6 +24,17 @@ NOT PROVEN: not run on the hub. The first `--run-firstboot` after delivery is wh
 converges the boot copies; the hub's current sbin copies are unmeasured until then.
 The `/etc` unit file refresh is deferred (needs daemon-reload).
 
+**2026-10-09 — Record: the private LLM lane IS deployed and running (supersedes the "Not deployed" line in the 2026-09-19 entry below).** Established by a read-only SSH session to the hub on 2026-10-09 ~21:30 UTC (`docker ps`/`docker inspect`/`systemctl`/`sha256sum`; no secret, env value or key was printed, env names only). Gate unchanged (G1); nothing was changed on the hub or deployed by this entry.
+
+* **litellm** container running, healthy, 0 restarts, started 2026-09-19 17:58 UTC. Image `ghcr.io/berriai/litellm@sha256:d295634e…b044b` (pin file says `v1.101.0`, pinned 2026-09-19; the digest matches `stack/litellm/litellm-image.pin`). Attached to the `stack_llmprivate` network only.
+* **llm-gateway** (the separate FreeLLMAPI gateway) running, healthy, 0 restarts, started 2026-09-19 17:58 UTC. Image `ghcr.io/tashfeenahmed/freellmapi@sha256:04ce170a…870fe`; networks `stack_default` and `stack_llmprivate`.
+* **homehub-litellm.service** and **homehub-llm-isolation.service**: both enabled and `active (exited)` (RemainAfterExit oneshots, as designed).
+* **Deployed files match the repo byte for byte** (sha256 equal on the hub and in this tree): `stack/litellm/config.yaml`, `devpc_hold_hook.py`, `litellm-image.pin`, `stack/llm-isolation/llm-isolation.sh`.
+* **The dev-PC hold is OFF as designed**: `DEVPC_WAKE_URL` is present in the container but empty (`DEVPC_HOLD_CAP_SECONDS` is set). So a cold dev PC fails fast rather than waiting.
+* **Spine unchanged:** SR-047 is still `Draft`; deployment is not ratification. The "Next action" in the 2026-09-19 entry (Owner ratification of the SR-047 rows) has not been shown to be done by anything here.
+
+NOT established: whether the isolation fence rules are *correct* (six iptables lines mention the lane; their content was not audited, nor was the `TC-1023..1041` set re-run against the live box); whether a request actually round-trips to the dev PC model; the value of `LITELLM_ENABLED` in `/opt/homehub/stack/.env` (that file is unreadable to the `hub` account without printing secrets, so the running state, not the knob, is the evidence); `llm-gateway`'s configuration, which is in a directory the `hub` account cannot list; when and by whom the lane was deployed beyond the container start time.
+
 **2026-10-09 — Owner authorized Sure integration and default profile enablement.**
 Merged `sure-stack` into `IceDrive-DesktopDirection`; `sure` is selected by
 default in the deployer template and HomeHub materialization configuration.

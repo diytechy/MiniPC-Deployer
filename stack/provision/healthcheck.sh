@@ -61,6 +61,13 @@ fails=0
 ok()   { echo "PASS $1"; }
 bad()  { echo "FAIL $1"; fails=$((fails+1)); }
 
+# 0. baked-image verification (firstboot step 3). A line here means a loaded
+# local/pinned image did not match the bake and its tag was removed.
+_img_state="${IMAGE_LOAD_STATE:-/var/lib/homehub/image-load.state}"
+if [ -s "$_img_state" ]; then
+    while IFS= read -r _l; do bad "baked image failed verification: $_l"; done < "$_img_state"
+else ok "baked images verified (no failures recorded by firstboot)"; fi
+
 # 1. Technitium API
 TOKEN=""; [ -f "${SCRIPT_DIR}/.token" ] && TOKEN="$(cat "${SCRIPT_DIR}/.token")"
 if curl -fsS -o /dev/null "${API}/api/dashboard/stats/get?token=${TOKEN}" 2>/dev/null \

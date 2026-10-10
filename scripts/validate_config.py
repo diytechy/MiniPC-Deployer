@@ -289,6 +289,24 @@ def main():
         "compose vars missing from .env.example: " + ", ".join(missing),
     )
 
+    # 1b. SURE IMAGE KNOBS (2026-10-10). The fork image and its source ref must be
+    # non-empty (an empty SURE_IMAGE makes compose reference the default silently),
+    # and each digest knob is the bake-time pin export-images.sh verifies - a
+    # malformed one would only be noticed at bake, so catch it here.
+    env_vals = dict(re.findall(r"^([A-Z][A-Z0-9_]*)=(.*)$", env_example, re.M))
+    for knob in ("SURE_IMAGE", "SURE_SOURCE_REF"):
+        check(env_vals.get(knob, "").strip() != "",
+              "{} is set in .env.example".format(knob),
+              "{} is missing or empty in .env.example".format(knob))
+    for knob in ("SURE_POSTGRES_IMAGE_DIGEST", "SURE_REDIS_IMAGE_DIGEST"):
+        check(re.fullmatch(r"sha256:[0-9a-f]{64}", env_vals.get(knob, "").strip()) is not None,
+              "{} is a sha256:<64 hex> digest".format(knob),
+              "{} is not sha256:<64 hex> in .env.example".format(knob))
+    for knob in ("SURE_POSTGRES_IMAGE_TAG", "SURE_REDIS_IMAGE_TAG"):
+        check(re.fullmatch(r"[^@\s]+", env_vals.get(knob, "").strip()) is not None,
+              "{} is a plain tag (no @digest)".format(knob),
+              "{} is empty or contains @ in .env.example".format(knob))
+
     # 2. Caddy {$VAR} passed by caddy service env
     passed = caddy_env_passed(compose)
     caddy_missing = sorted(caddy_var_refs(caddy) - passed)

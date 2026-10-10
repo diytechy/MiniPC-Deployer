@@ -24,6 +24,22 @@
 # pull it and FAILS LOUDLY if it is absent — that is the one image the AWOW can
 # never fetch from anywhere, so it MUST be in the payload.
 #
+# sure-auroleap:local is the same kind of image: the Owner's FORK of Sure, built
+# from the sibling ../sure checkout by scripts/build-sure-image.sh (WSL, real
+# Docker). Same rules: never pulled, re-saved every run, freshness-checked.
+#
+# DIGEST-PINNED REGISTRY IMAGES (SURE_POSTGRES_* / SURE_REDIS_*). The pin is a
+# PLAIN tag knob (what compose references) plus a *_IMAGE_DIGEST knob that is
+# verified HERE, at bake time: `docker pull repo@digest` (the daemon verifies the
+# content against the digest), then the result is tagged `repo:tag` and saved under
+# that plain tag. WHY NOT KEEP `tag@sha256:` IN COMPOSE: `docker save` carries
+# RepoTags only; RepoDigests are pull metadata that `docker load` does not restore,
+# so on the hub `repo:tag@sha256:...` need not resolve locally - compose would try
+# to pull (fails offline) and firstboot's "already present" check never matches.
+# The integrity guarantee is kept (bake refuses a mismatch) and offline
+# `docker compose up --pull never` resolves `repo:tag`. Any other ref in the
+# resolved set that still contains '@' is a REFUSED BUILD for the same reason.
+#
 # COMPRESSION — plain .tar, no zstd (measured, justified): `docker save` under
 # Docker's containerd/OCI image store already writes COMPRESSED layer blobs into
 # the tar (e.g. actual-server: a 526MB image saves to a ~105MB tar). A second
@@ -45,7 +61,10 @@
 #
 # Output (gitignored, see ../.gitignore vmtest/.out/):
 #   $IMAGES_OUT/<sanitized-ref>.tar          one docker-save tar per image
-#   $IMAGES_OUT/images.manifest.tsv          ref / id / repo-digest / file / bytes
+#   $IMAGES_OUT/images.manifest.tsv          ref / id / repo-digest / file / bytes / kind / rootfs_sha256
+#     kind = local | pinned | registry. rootfs_sha256 = sha256 of the image's diff-id
+#     list (store-independent; .Id is not). firstboot compares it after loading local
+#     and pinned rows and, on a mismatch, removes the tag and records a failure.
 #
 # NOTE ON PATHS: the default $IMAGES_OUT lives under vmtest/.out, i.e. on the
 # Windows C: drive via the WSL 9p mount — writing there does NOT grow WSL2's
@@ -245,7 +264,7 @@ log "recorded the bake's provenance: $IMAGES_OUT/profiles.stamp"
 
 mkdir -p "$IMAGES_OUT"
 MANIFEST="$IMAGES_OUT/images.manifest.tsv"
-printf 'repo_tag\timage_id\trepo_digest\tsaved_file\tbytes\n' > "$MANIFEST"
+printf 'repo_tag\timage_id\trepo_digest\tsaved_file\tbytes\tkind\trootfs_sha256\n' > "$MANIFEST"
 
 # sanitize an image ref into a filename: registry/repo:tag -> registry_repo_tag
 sanitize() { echo "$1" | tr '/:@' '___'; }
@@ -270,6 +289,8 @@ sibling_repo_for() {
         # comparison for the one image nobody else is watching (adversarial
         # review finding 3, 2026-08-29).
         gunmaster3-relay) echo "FinnsGame" ;;
+        # The Owner's Sure fork. Built by scripts/build-sure-image.sh.
+        sure-auroleap)   echo "sure" ;;
         *)               echo "" ;;
     esac
 }
@@ -313,6 +334,15 @@ assert_local_image_fresh() {
     local stamped head
     stamped="$(docker image inspect "$ref" --format '{{index .Config.Labels "homehub.source.revision"}}' 2>/dev/null)"
     head="$(repo_git "$dir" rev-parse HEAD 2>/dev/null || echo '')"
+    # An image built from a NAMED ref (scripts/build-sure-image.sh stamps
+    # homehub.source.ref) is compared against that ref's current tip, not the
+    # checkout's HEAD - the Sure checkout is routinely on another branch.
+    local built_ref
+    built_ref="$(docker image inspect "$ref" --format '{{index .Config.Labels "homehub.source.ref"}}' 2>/dev/null || true)"
+    if [ -n "$built_ref" ] && [ "$built_ref" != "<no value>" ]; then
+        head="$(repo_git "$dir" rev-parse --verify --quiet "$built_ref^{commit}" 2>/dev/null || echo '')"
+        [ -n "$head" ] || log "  WARNING: ref '$built_ref' (stamped on $ref) no longer resolves in $repo"
+    fi
 
     if [ -z "$stamped" ] || [ "$stamped" = "<no value>" ]; then
         log "  WARNING: $ref carries no homehub.source.revision label — cannot prove it matches $repo."
@@ -374,14 +404,83 @@ assert_local_image_fresh() {
 # place as "can this ref be pulled?", because they are the same question.
 is_local_only() {
     case "$1" in
-        caddy-cloudflare:*|naglight:*|*:local) return 0 ;;
+        caddy-cloudflare:*|naglight:*|sure-auroleap:*|*:local) return 0 ;;
         *) return 1 ;;
     esac
 }
 
+# ── 1b. digest-pinned registry images: verify at bake time, retag plain ───────
+# See the header. PIN_SPECS rows: <repo> <tag knob> <digest knob>.
 for ref in "${IMAGES[@]}"; do
-    if docker image inspect "$ref" >/dev/null 2>&1; then
+    case "$ref" in
+        *@*) die "image '$ref' is a tag@digest reference. docker save/load does not restore" \
+                 "RepoDigests, so it would not resolve offline on the hub. Split the knob:" \
+                 "a plain tag in compose + a *_IMAGE_DIGEST knob verified by this script" \
+                 "(PIN_SPECS in vmtest/export-images.sh)." ;;
+    esac
+done
+declare -A PINNED=()
+PIN_SPECS=(
+    "postgres SURE_POSTGRES_IMAGE_TAG SURE_POSTGRES_IMAGE_DIGEST"
+    "redis    SURE_REDIS_IMAGE_TAG    SURE_REDIS_IMAGE_DIGEST"
+)
+for spec in "${PIN_SPECS[@]}"; do
+    read -r _repo _tk _dk <<< "$spec"
+    _tag="$(env_file_value "$ENV_FILE" "$_tk" | tr -d '[:space:]')"
+    _dig="$(env_file_value "$ENV_FILE" "$_dk" | tr -d '[:space:]')"
+    _ref="$_repo:$_tag"
+    if [ -z "$_tag" ] && [ -n "$_dig" ]; then
+        die "$_tk is empty in ${ENV_FILE##*/} but $_dk is set - compose would reference '$_repo:' (no tag)."
+    fi
+    case " ${IMAGES[*]} " in *" $_ref "*) ;; *) continue ;; esac
+    [[ "$_dig" =~ ^sha256:[0-9a-f]{64}$ ]] \
+        || die "$_dk in ${ENV_FILE##*/} is not a sha256:<64 hex> digest ('$_dig') - $_ref would bake UNVERIFIED."
+    PINNED["$_ref"]="$_dig"
+done
+verify_and_retag_pinned() {
+    local ref="$1" dig="$2" repo="${1%%:*}" by_digest have got
+    by_digest="$repo@$dig"
+    # Pull BY DIGEST every time, even when $ref exists: the plain tag is mutable,
+    # so a stale or substituted local $ref must be overwritten, not trusted. The
+    # daemon verifies the downloaded manifest against the digest; a mismatch fails.
+    log "verifying pin: docker pull $by_digest"
+    docker pull "$by_digest" >/dev/null 2>&1 \
+        || die "docker pull FAILED for '$by_digest' - the registry no longer serves that digest" \
+               "(or no network). Refusing to bake an unverified $ref."
+    got="$(docker image inspect "$by_digest" --format '{{.Id}}' 2>/dev/null || true)"
+    [ -n "$got" ] || die "pulled $by_digest but cannot inspect it - refusing to bake $ref."
+    docker tag "$by_digest" "$ref"
+    have="$(docker image inspect "$ref" --format '{{.Id}}' 2>/dev/null || true)"
+    [ "$have" = "$got" ] || die "after tagging, $ref ($have) is not the image pulled by digest ($got)."
+    log "  pin OK: $ref = $by_digest (${got:0:19})"
+}
+for ref in "${!PINNED[@]}"; do verify_and_retag_pinned "$ref" "${PINNED[$ref]}"; done
+
+# assert_sure_ref REF - the fork image must have been built from SURE_SOURCE_REF.
+# NOT the staleness check (ALLOW_STALE_LOCAL does not waive it): an image built
+# from the wrong branch is current and WRONG, and with no registry or version in
+# its tag nothing else would ever say so. The fork must carry both
+# auroleap-bank-stale-capability and auroleap-transaction-flags, which is what
+# the integration branch named by the knob is for.
+assert_sure_ref() {
+    local ref="$1" want got
+    case "$ref" in sure-auroleap:*) ;; *) return 0 ;; esac
+    want="$(env_file_value "$ENV_FILE" SURE_SOURCE_REF | tr -d '[:space:]')"
+    [ -n "$want" ] || die "SURE_SOURCE_REF is empty in ${ENV_FILE##*/} - cannot say which branch '$ref' must come from."
+    got="$(docker image inspect "$ref" --format '{{index .Config.Labels "homehub.source.ref"}}' 2>/dev/null || true)"
+    if [ "$got" != "$want" ]; then
+        die "WRONG-BRANCH image '$ref': homehub.source.ref is '${got:-<none>}' but SURE_SOURCE_REF is '$want'." \
+            "Rebuild:  bash scripts/build-sure-image.sh --ref $want   (WSL, real Docker)"
+    fi
+    log "  source-ref OK: $ref was built from $want"
+}
+
+for ref in "${IMAGES[@]}"; do
+    if [ -n "${PINNED[$ref]:-}" ]; then
+        pulled_count=$((pulled_count + 1))   # verified and retagged above; never pulled by tag
+    elif docker image inspect "$ref" >/dev/null 2>&1; then
         log "present locally: $ref"
+        assert_sure_ref "$ref"
         [ "${ALLOW_STALE_LOCAL:-0}" = "1" ] || assert_local_image_fresh "$ref"
     elif is_local_only "$ref"; then
         case "$ref" in
@@ -400,6 +499,11 @@ for ref in "${IMAGES[@]}"; do
                     "Without it Caddy cannot answer a dns-01 challenge, and with no inbound" \
                     ":80 that means no certificate at all — every HTTPS site down, including" \
                     "the LAN-only kiosk site the wall panel displays."
+                ;;
+            sure-auroleap:*)
+                die "MISSING locally-built image '$ref' - the Owner's Sure fork has no registry." \
+                    "Build it (WSL, real Docker):  bash scripts/build-sure-image.sh" \
+                    "then re-run this script."
                 ;;
             naglight:*|*:local)
                 die "MISSING local-only image '$ref' — it has no registry home (Q10.2)." \
@@ -472,7 +576,17 @@ for ref in "${IMAGES[@]}"; do
     img_id="$(docker image inspect "$ref" --format '{{.Id}}' 2>/dev/null || echo '?')"
     repo_digest="$(docker image inspect "$ref" --format '{{range .RepoDigests}}{{.}} {{end}}' 2>/dev/null | awk '{print $1}')"
     [ -n "$repo_digest" ] || repo_digest='(local-build, no registry digest)'
-    printf '%s\t%s\t%s\t%s\t%s\n' "$ref" "$img_id" "$repo_digest" "$(basename "$out")" "$bytes" >> "$MANIFEST"
+    kind=registry
+    [ "$local_only" -eq 1 ] && kind=local
+    [ -n "${PINNED[$ref]:-}" ] && kind=pinned
+    # STORE-INDEPENDENT IDENTITY. `.Id` is the config digest on the classic store
+    # but the manifest/index digest on the containerd store, so it can legitimately
+    # differ between this machine and the hub; it is kept for display only. The
+    # diff-ids (RootFS.Layers) are the same on both, and firstboot compares THAT.
+    layers="$(docker image inspect "$ref" --format '{{json .RootFS.Layers}}' 2>/dev/null)" && [ -n "$layers" ] && [ "$layers" != "null" ] \
+        || die "cannot read the layer list of '$ref' - refusing to record an empty rootfs hash (firstboot would false-fail it)."
+    rootfs="$(printf '%s\n' "$layers" | sha256sum | cut -d' ' -f1)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ref" "$img_id" "$repo_digest" "$(basename "$out")" "$bytes" "$kind" "$rootfs" >> "$MANIFEST"
 done
 
 # ── 4. report ─────────────────────────────────────────────────────────────────
@@ -480,6 +594,6 @@ total_mb=$((total_bytes / 1024 / 1024))
 log "───────────────────────────────────────────────────────────────────"
 log "DONE — ${#IMAGES[@]} images in the payload (${pulled_count} pulled, ${saved_count} saved this run)"
 log "total payload size: ${total_mb} MB (${total_bytes} bytes) in $IMAGES_OUT"
-log "manifest (ref/id/digest/file/bytes): $MANIFEST"
+log "manifest (ref/id/digest/file/bytes/kind/rootfs): $MANIFEST"
 log "Next: build-seed.sh / build-repacked-iso.sh copy these into deploy-payload/images/;"
 log "      firstboot.sh docker-loads them before 'docker compose up -d'."

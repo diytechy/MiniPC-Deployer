@@ -479,9 +479,74 @@ tar_repo_tags() {
     printf '%s\n' "$tags" | sed '/^$/d'
 }
 
+# ── VERIFY WHAT WAS JUST LOADED IS THE IMAGE THE BAKE RECORDED ───────────────
+# For the manifest rows whose tag PINS NO CONTENT (kind=local: naglight:local,
+# sure-auroleap:local, ...) or whose pin was verified at bake time (kind=pinned:
+# the digest-pinned postgres/redis), a wrong image under the right tag must not
+# start silently.
+#
+# WHAT IS COMPARED. Not `.Id`: that is the config digest on Docker's classic
+# image store but the manifest/index digest on the containerd store, so the dev PC
+# that baked and the hub that loads can legitimately disagree, and an `.Id` check
+# would false-fail every image. The manifest's rootfs_sha256 column is the sha256
+# of the diff-id list (`{{json .RootFS.Layers}}`), which is the same on both.
+# A row without that column (a payload baked before 2026-10-10) is not checked.
+#
+# WHAT HAPPENS ON A MISMATCH - and why it is not `exit 1`. This step runs before
+# the mounts, compose, DNS and Samba, so aborting the unit here would take the
+# whole box down for one bad image. And merely logging would be worse: the tag
+# now points at the wrong image, the next boot's SKIP-if-present rule above would
+# keep it, and it would start silently. So instead:
+#   1. `docker rmi` the tag -> the next boot finds it absent and RETRIES the load
+#      rather than skipping;
+#   2. log loudly, and append a line to $IMAGE_LOAD_STATE (default
+#      /var/lib/homehub/image-load.state, rewritten every boot), which
+#      stack/provision/healthcheck.sh reports as a FAIL;
+#   3. return 0 so the boot continues. Compose then cannot find the image
+#      (the Sure services carry `pull_policy: never`, so it is not fetched from a
+#      registry either) and that service fails to start. `docker compose up -d`
+#      is all-or-nothing about its exit status, so it exits non-zero; step 4a
+#      sees the FAILED lines in $IMAGE_LOAD_STATE, logs an ERROR naming the
+#      image(s), DEFERS that exit code and carries on, so the mounts, DNS, Caddy,
+#      Samba and the recovery supervisor still get installed. Step 7 then exits
+#      with the deferred code and the unit ends red. A compose failure with NO
+#      image-load failure is still an immediate FATAL, exactly as before.
+# Only called after a real load - the SKIP path above deliberately keeps an
+# operator's newer image, whose layers legitimately differ.
+IMAGE_LOAD_STATE="${IMAGE_LOAD_STATE:-/var/lib/homehub/image-load.state}"
+verify_loaded_image() {
+    local name="$1" ref want_rootfs kind got
+    [ -f "$IMAGES_DIR/images.manifest.tsv" ] || return 0
+    while IFS=$'\t' read -r ref _ _ _ _ kind want_rootfs; do
+        case "$kind" in local|pinned) ;; *) continue ;; esac
+        if [ -z "$want_rootfs" ]; then
+            log "  (no rootfs hash recorded for $ref - not verified)"
+            continue
+        fi
+        got=""
+        if docker image inspect "$ref" >/dev/null 2>&1; then
+            got="$(docker image inspect "$ref" --format '{{json .RootFS.Layers}}' 2>/dev/null | sha256sum | cut -d' ' -f1)" || got=""
+        fi
+        if [ -n "$got" ] && [ "$got" = "$want_rootfs" ]; then
+            log "  verified $ref (rootfs ${want_rootfs:0:12}, $kind)"
+        else
+            log "ERROR: loaded image $ref does NOT match the bake ($name): rootfs '${got:-<absent>}' != recorded '$want_rootfs'."
+            log "  Removing the tag so the next boot retries the load instead of skipping it;"
+            log "  the service using it will not start. Recorded in $IMAGE_LOAD_STATE."
+            docker rmi "$ref" >/dev/null 2>&1 || docker rmi -f "$ref" >/dev/null 2>&1 || log "  WARN: could not remove $ref"
+            mkdir -p "$(dirname "$IMAGE_LOAD_STATE")" 2>/dev/null || true
+            printf 'FAILED ref=%s tar=%s want_rootfs=%s got_rootfs=%s\n' \
+                "$ref" "$name" "$want_rootfs" "${got:-absent}" >> "$IMAGE_LOAD_STATE" 2>/dev/null \
+                || log "  WARN: could not write $IMAGE_LOAD_STATE"
+        fi
+    done < <(awk -F'\t' -v f="$name" '$4 == f' "$IMAGES_DIR/images.manifest.tsv")
+    return 0
+}
+
 if [ -n "$IMAGES_DIR" ]; then
     tars=("$IMAGES_DIR"/*.tar "$IMAGES_DIR"/*.tar.zst)
     log "loading ${#tars[@]} baked image tar(s) from $IMAGES_DIR (Q10.9 B+ — zero-registry first boot)"
+    rm -f "$IMAGE_LOAD_STATE" 2>/dev/null || true   # a fresh verdict every boot
     loaded=0
     skipped=0
     for tar in "${tars[@]}"; do
@@ -551,6 +616,7 @@ if [ -n "$IMAGES_DIR" ]; then
                 if command -v zstd >/dev/null 2>&1; then
                     if zstd -dc "$tar" | docker load 2>&1 | sed 's/^/[firstboot]   /'; then
                         loaded=$((loaded + 1))
+                        verify_loaded_image "$name"
                     else
                         log "WARNING: docker load failed for $name — compose will try to PULL this image instead"
                     fi
@@ -561,6 +627,7 @@ if [ -n "$IMAGES_DIR" ]; then
             *)
                 if docker load -i "$tar" 2>&1 | sed 's/^/[firstboot]   /'; then
                     loaded=$((loaded + 1))
+                    verify_loaded_image "$name"
                 else
                     log "WARNING: docker load failed for $name — compose will try to PULL this image instead"
                 fi
@@ -1621,9 +1688,21 @@ if [ -f /var/lib/homehub-recovery/quarantine.json ] && [ -f "$STACK_DIR/recovery
     python3 "$STACK_DIR/recovery/homehub-recovery" enforce-quarantine 2>&1 | sed 's/^/  /' \
         || log "WARN: a quarantined service could not be kept stopped - see the lines above"
 fi
+_deferred_rc=0
 if [ "$_compose_rc" -ne 0 ]; then
-    log "FATAL: 'docker compose up -d' exited $_compose_rc (quarantine was still enforced)"
-    exit "$_compose_rc"
+    if [ -s "$IMAGE_LOAD_STATE" ]; then
+        # The only deferral: a baked image failed verification in step 3 and its
+        # tag was removed, so the up could not have succeeded. Everything after
+        # this point does not depend on that image; stopping here would skip the
+        # recovery supervisor and DNS on every boot until the image is fixed.
+        log "ERROR: 'docker compose up -d' exited $_compose_rc, and step 3 removed image(s) that failed verification:"
+        sed 's/^/[firstboot]   /' "$IMAGE_LOAD_STATE"
+        log "  Continuing so the rest of the box is provisioned; exiting $_compose_rc at step 7."
+        _deferred_rc="$_compose_rc"
+    else
+        log "FATAL: 'docker compose up -d' exited $_compose_rc (quarantine was still enforced)"
+        exit "$_compose_rc"
+    fi
 fi
 
 # ── 4a-post. DID THEY ACTUALLY STAY UP? ──────────────────────────────────────
@@ -2472,6 +2551,11 @@ date > "$MARKER"
 # fenced" (failed), and it stops one optional service's problem from colouring
 # the whole first boot red. Step 4a-relay logs its state so the journal still
 # names it in one line.
+if [ "$_deferred_rc" -ne 0 ]; then
+    log "FATAL: bring-up finished, but 'docker compose up -d' failed ($_deferred_rc) after a baked image"
+    log "  failed verification (see the step 4a ERROR). Exiting non-zero so this unit reports FAILED."
+    exit "$_deferred_rc"
+fi
 if [ "$KIOSK_CONFIG_UNREADABLE" -ne 0 ]; then
     log "FATAL: bring-up finished, but the wall panel WILL run on js/config.js defaults"
     log "  (see the step 4b ERROR above). Exiting non-zero so this unit reports FAILED"

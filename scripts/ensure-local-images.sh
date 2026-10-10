@@ -188,6 +188,31 @@ ensure_image "finance-auditor:${FINANCE_AUDITOR_IMAGE_TAG:-local}" "Finance-Audi
 #     check in export-images.sh only WARNS on an unstamped image.
 ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" ""
 
+# Sure - the Owner's FORK (SURE_IMAGE, default sure-auroleap:local), built from the
+# sibling ../sure by its own script because it builds a NAMED ref via `git archive`
+# rather than the working tree (the checkout is often detached or on a feature
+# branch). Guarded on the `sure` profile, like the relay is on its knob: a clone
+# without ../sure must not die on a service it does not run. No public fallback.
+case ",$(env_get COMPOSE_PROFILES | tr -d '[:space:]')," in
+    *,sure,*)
+        SURE_IMAGE="$(env_get SURE_IMAGE)"; SURE_IMAGE="${SURE_IMAGE:-sure-auroleap:local}"
+        # Omit --ref when the knob is empty so build-sure-image.sh's own clear
+        # "no source ref" error fires rather than a bare argument-parse failure.
+        SURE_REF_ARGS=(); SURE_REF="$(env_get SURE_SOURCE_REF | tr -d '[:space:]')"
+        [ -z "$SURE_REF" ] || SURE_REF_ARGS=(--ref "$SURE_REF")
+        if [ "$REBUILD" -eq 0 ] && docker image inspect "$SURE_IMAGE" >/dev/null 2>&1; then
+            log "present: $SURE_IMAGE (skip; --rebuild to force)"
+        elif [ "$DRY_RUN" -eq 1 ]; then
+            log "would build: $SURE_IMAGE via scripts/build-sure-image.sh"
+        else
+            bash "$SCRIPT_DIR/build-sure-image.sh" --tag "$SURE_IMAGE" ${SURE_REF_ARGS[@]+"${SURE_REF_ARGS[@]}"} || die "Sure fork build failed ($SURE_IMAGE)"
+        fi
+        ;;
+    *)
+        log "skip: $(env_get SURE_IMAGE) (the sure profile is not in COMPOSE_PROFILES of ${ENV_FILE##*/})"
+        ;;
+esac
+
 # ── gunmaster3-relay: the family crossplay relay (GAME_RELAY_ENABLED) ────────
 # GUARDED ON THE KNOB, and that guard is the whole point of this block.
 #

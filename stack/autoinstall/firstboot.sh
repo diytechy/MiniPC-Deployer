@@ -479,6 +479,32 @@ tar_repo_tags() {
     printf '%s\n' "$tags" | sed '/^$/d'
 }
 
+# ── VERIFY WHAT WAS JUST LOADED IS THE IMAGE THE BAKE RECORDED ───────────────
+# For the manifest rows whose tag PINS NO CONTENT (kind=local: naglight:local,
+# sure-auroleap:local, ...) or whose pin was verified at bake time (kind=pinned:
+# the digest-pinned postgres/redis), a wrong image under the right tag would start
+# silently. After a load, compare the id docker now reports for the tag with the
+# id the exporter recorded. A mismatch is FATAL: a wrong image must not start.
+# Rows without a kind column (a payload built before 2026-10-10) are not checked.
+# Only called after a real load - the SKIP path above deliberately keeps an
+# operator's newer image, whose id legitimately differs.
+verify_loaded_image() {
+    local name="$1" ref want kind got bad=0
+    [ -f "$IMAGES_DIR/images.manifest.tsv" ] || return 0
+    while IFS=$'\t' read -r ref want _ _ _ kind; do
+        case "$kind" in local|pinned) ;; *) continue ;; esac
+        got="$(docker image inspect "$ref" --format '{{.Id}}' 2>/dev/null || true)"
+        if [ "$got" = "$want" ]; then
+            log "  verified $ref = $got ($kind)"
+        else
+            log "FATAL: loaded image $ref has id '${got:-<absent>}' but the bake recorded '$want' ($name)."
+            log "  Refusing to continue: a different image under this tag must not start silently."
+            bad=1
+        fi
+    done < <(awk -F'\t' -v f="$name" '$4 == f' "$IMAGES_DIR/images.manifest.tsv")
+    [ "$bad" -eq 0 ] || exit 1
+}
+
 if [ -n "$IMAGES_DIR" ]; then
     tars=("$IMAGES_DIR"/*.tar "$IMAGES_DIR"/*.tar.zst)
     log "loading ${#tars[@]} baked image tar(s) from $IMAGES_DIR (Q10.9 B+ — zero-registry first boot)"
@@ -551,6 +577,7 @@ if [ -n "$IMAGES_DIR" ]; then
                 if command -v zstd >/dev/null 2>&1; then
                     if zstd -dc "$tar" | docker load 2>&1 | sed 's/^/[firstboot]   /'; then
                         loaded=$((loaded + 1))
+                        verify_loaded_image "$name"
                     else
                         log "WARNING: docker load failed for $name — compose will try to PULL this image instead"
                     fi
@@ -561,6 +588,7 @@ if [ -n "$IMAGES_DIR" ]; then
             *)
                 if docker load -i "$tar" 2>&1 | sed 's/^/[firstboot]   /'; then
                     loaded=$((loaded + 1))
+                    verify_loaded_image "$name"
                 else
                     log "WARNING: docker load failed for $name — compose will try to PULL this image instead"
                 fi

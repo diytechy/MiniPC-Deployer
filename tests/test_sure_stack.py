@@ -42,20 +42,28 @@ def test_sure_profile_and_storage_sr060():
 
 def test_sure_registry_pins_sr061():
     knobs = env()
-    for key in ("SURE_IMAGE_TAG", "SURE_POSTGRES_IMAGE_TAG", "SURE_REDIS_IMAGE_TAG"):
-        assert re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", knobs[key])
-    assert knobs["SURE_IMAGE_TAG"] == "0.7.5-hotfix.2@sha256:aa46be2d8e3f8b2182261dc05933a64b4a12543dd5f44ad12f08868caac1f997"
-    assert knobs["SURE_POSTGRES_IMAGE_TAG"].startswith("16.15@")
-    assert knobs["SURE_REDIS_IMAGE_TAG"].startswith("8.10.2@")
+    # The fork is a local-only image (naglight:local shape): a plain `name:local` ref,
+    # never a registry or digest form that `docker load` could not restore.
+    assert knobs["SURE_IMAGE"] == "sure-auroleap:local"
+    assert "@" not in knobs["SURE_IMAGE"] and "ghcr.io" not in knobs["SURE_IMAGE"]
+    assert "SURE_IMAGE_TAG" not in knobs  # retired 2026-10-10
+    # Postgres/Redis: plain tag in compose, digest in a separate bake-time-verified knob.
+    for tag, digest, prefix in (("SURE_POSTGRES_IMAGE_TAG", "SURE_POSTGRES_IMAGE_DIGEST", "16.15"),
+                                ("SURE_REDIS_IMAGE_TAG", "SURE_REDIS_IMAGE_DIGEST", "8.10.2")):
+        assert knobs[tag] == prefix
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", knobs[digest])
     services = stack()["services"]
-    assert services["sure-web"]["image"] == services["sure-worker"]["image"] == "ghcr.io/we-promise/sure:${SURE_IMAGE_TAG}"
+    assert services["sure-web"]["image"] == services["sure-worker"]["image"] == "${SURE_IMAGE:-sure-auroleap:local}"
     assert services["sure-postgres"]["image"] == "postgres:${SURE_POSTGRES_IMAGE_TAG}"
     assert services["sure-redis"]["image"] == "redis:${SURE_REDIS_IMAGE_TAG}"
-    # Exporter derives its image set from Compose and operator-selected profiles.
+    # The local fork has no registry to watch, like naglight:local.
+    for name in ("sure-web", "sure-worker"):
+        assert "diun.enable=false" in services[name]["labels"]
+    for name in ("sure-postgres", "sure-redis"):
+        assert "diun.enable=true" in services[name]["labels"]
     exporter = (ROOT / "vmtest/export-images.sh").read_text(encoding="utf-8")
     assert "${EXTRA_PROFILES:-}" in exporter and "config --images" in exporter
-    for name in ("sure-web", "sure-worker", "sure-postgres", "sure-redis"):
-        assert "diun.enable=true" in services[name]["labels"]
+    assert "sure-auroleap:*" in exporter and "SURE_POSTGRES_IMAGE_DIGEST" in exporter
 
 
 def test_sure_own_login_lan_tls_sr062():

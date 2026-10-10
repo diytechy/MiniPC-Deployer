@@ -47,10 +47,34 @@ The LAN gate does not itself restrict household account creation.
 
 ## Registry evidence and payload
 
-Pins use `tag@sha256:index`. On 2026-10-09, anonymous HTTPS registry manifest
-responses were independently SHA-256 hashed and matched `Docker-Content-Digest`.
-No image layers were fetched. Sure's amd64 config OCI revision matches source
-`e336a285d96582253debd57396b33e18b4e2c66c`.
+**The Sure image is the Owner's fork, built locally (2026-10-10).** `SURE_IMAGE`
+(default `sure-auroleap:local`) replaces the stock `ghcr.io/we-promise/sure`
+reference and the retired `SURE_IMAGE_TAG`. It has no registry home, so it travels
+exactly like `naglight:local`: `scripts/build-sure-image.sh` builds a NAMED branch
+or commit of `../sure` (via `git archive`, so uncommitted edits cannot leak in) and
+stamps `homehub.source.revision`, `homehub.source.ref` and `BUILD_COMMIT_SHA`;
+`vmtest/export-images.sh` treats it as local-only (never pulled, re-saved every run,
+freshness-checked against the ref it was built from); `firstboot.sh` verifies the
+loaded image id equals the id the manifest recorded and refuses to continue on a
+mismatch. Build it in WSL with real Docker, never the default (Podman) distro:
+
+    wsl -d Ubuntu -- bash /mnt/c/Projects/MiniPC-Deployer/scripts/build-sure-image.sh --ref auroleap-bank-stale-capability
+
+**Postgres and Redis keep their digest pin, enforced at bake time.** The knobs are
+now a plain tag (`SURE_POSTGRES_IMAGE_TAG=16.15`, `SURE_REDIS_IMAGE_TAG=8.10.2`,
+what compose references) plus `SURE_*_IMAGE_DIGEST=sha256:<index>`. The exporter
+runs `docker pull repo@digest` (the daemon verifies content against the digest),
+tags the result `repo:tag`, saves that, and records kind `pinned` and the image id
+in `images.manifest.tsv`. Reason: `docker save` carries RepoTags only; RepoDigests
+are pull metadata that `docker load` does not restore, so a `tag@sha256:` reference
+need not resolve on the hub - compose would try to pull (fails offline) and
+firstboot's already-present check would never match, reloading every boot. Any
+`@` reference left in the resolved image set is a refused bake. Trade-off: a hub
+with NO baked payload (online fallback) pulls the plain tag, whose digest is not
+re-checked on the box; the digest is only guaranteed for the baked path.
+
+The table below is the 2026-10-09 registry evidence for the digest knobs. The first
+row (stock Sure) is historical: that image is no longer deployed.
 
 | Tag | Index SHA-256 | Linux amd64 manifest SHA-256 |
 |---|---|---|
@@ -64,8 +88,14 @@ tags `8.10.2` and `16.15` resolve to the same index digests above; these explici
 tags follow this repo's plain-version convention. The exporter derives its list from Compose and selected
 profiles, including `EXTRA_PROFILES`; a future bake must select `sure` even if
 runtime activation follows later. No duplicate image list is needed. Diun
-watches Docker containers by default; all four explicitly opt in. These public
-images do not belong in the private-app `ensure-local-images.sh` resolver.
+watches Docker containers by default; postgres and redis opt in, the local fork opts
+out (no registry to watch). Postgres/redis do not belong in the `ensure-local-images.sh`
+resolver; the fork does, behind the `sure` profile.
+
+**Not proven:** the lab sequence (load the Sure tar on a lab VM, `docker compose
+config --images`, `docker compose up --pull never`) has not run, the hub's Docker
+image store (classic vs containerd) is not recorded, and the stub-docker tests prove
+the scripts' decisions, not a real daemon's behaviour.
 
 ## Reporting and AI audit
 

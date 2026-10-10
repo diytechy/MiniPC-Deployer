@@ -2772,3 +2772,24 @@ provider sync, real ledger dump/restore, offline image digest loading, or
 Finance-Auditor runtime compatibility. Normal secret preparation, protected
 SureSecretKeyBase escrow, and the FA empty-as-absent image fix precede deployment.
 No push, live machine contact, secret generation, or gate advancement.
+
+## 2026-10-10 - Sure fork image knob and bake-verified digest pins
+
+Branch `sure-local-image-and-pins` (not pushed, nothing deployed). Sure now runs
+the Owner's fork, built locally: compose references `${SURE_IMAGE:-sure-auroleap:local}`
+(`SURE_IMAGE_TAG` retired), `scripts/build-sure-image.sh` builds a named ref of
+`../sure` in WSL stamping `homehub.source.revision/ref`, `export-images.sh` handles
+it as local-only (and `ensure-local-images.sh` builds it behind the `sure` profile).
+Review item 5.12: `tag@sha256` knobs for postgres/redis were replaced by a plain tag
+plus `*_IMAGE_DIGEST` verified at bake time and retagged, because `docker load`
+does not restore RepoDigests. `images.manifest.tsv` gained a `kind` column and
+`firstboot.sh` fails if a loaded local or pinned image's id differs from the manifest
+(naglight and every other local-only image gained this check too).
+
+Validation: tests/test_sure_image_bake.py drives the real exporter against a stub
+docker (7 cases); test_sure_stack updated. check.py --tier smoke: 229 -> 236 passed (4 skipped); validate_config passes.
+
+Not proven: the lab run (load tar, `docker compose config --images`, `up --pull
+never`), a real image build of the fork, the hub's Docker image store, and that
+`docker save`/`load` preserves the image id on the hub's store (the firstboot check
+assumes it; a false FATAL would show on the first lab boot).

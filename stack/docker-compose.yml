@@ -644,8 +644,11 @@ services:
   # Sure household ledger: opt-in preparation beside unchanged Actual.
   # Implements: SR-060, SR-061, SR-062, LLR-1040..LLR-1042.
   # All raw ledger/storage/dumps are NEVER-OFFSITE, like finance_snapshots.
+  # IMAGE: the Owner's FORK of Sure, built locally (scripts/build-sure-image.sh),
+  # NOT ghcr.io/we-promise/sure. Same shape as naglight:local - no registry home,
+  # so export-images.sh re-saves it every bake and firstboot ID-checks the load.
   sure-web:
-    image: ghcr.io/we-promise/sure:${SURE_IMAGE_TAG}
+    image: ${SURE_IMAGE:-sure-auroleap:local}
     container_name: sure-web
     profiles: ["sure"]
     environment: *sure-environment
@@ -666,11 +669,12 @@ services:
       timeout: 10s
       retries: 5
       start_period: 120s
-    labels: ["diun.enable=true"]
+    # Locally built fork: no registry home to watch (same as naglight:local).
+    labels: ["diun.enable=false"]
     restart: unless-stopped
 
   sure-worker:
-    image: ghcr.io/we-promise/sure:${SURE_IMAGE_TAG}
+    image: ${SURE_IMAGE:-sure-auroleap:local}
     container_name: sure-worker
     profiles: ["sure"]
     command: bundle exec sidekiq
@@ -696,7 +700,7 @@ services:
       timeout: 15s
       retries: 5
       start_period: 120s
-    labels: ["diun.enable=true"]
+    labels: ["diun.enable=false"]
     restart: unless-stopped
 
   sure-postgres:

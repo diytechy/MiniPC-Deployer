@@ -126,17 +126,38 @@ def test_line_in_refuses_a_udev_start_when_it_is_disabled():
     assert "multi-user.target.wants/wall-line-in.service" in condition[0]
 
 
-def test_line_in_refuses_to_start_outside_trigger_mode():
-    """linein_shared/speaker_shared exist only in the trigger graph (FOLLOWUPS B3)."""
-    text = read("wall-line-in.service")
-    condition = [ln for ln in text.splitlines() if ln.startswith("ExecCondition=")]
-    guard = ("ExecCondition=/bin/sh -c '[ \"$(cat /etc/wall-panel/audio-mode "
-             "2>/dev/null || echo trigger)\" = trigger ]'")
-    assert guard in condition
-    # The same mode file and the same absent-file default as the bus-only units.
-    visualizer = read("wall-bus-visualizer.service")
-    assert "cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger" in visualizer
-    assert guard.replace("= trigger ]", "= bus ]") in         [ln for ln in visualizer.splitlines() if ln.startswith("ExecCondition=")]
+LINE_IN_MODE_GUARD = (
+    "ExecCondition=/bin/sh -c '[ \"$(cat /etc/wall-panel/audio-mode "
+    "2>/dev/null || echo trigger)\" != bus ]'")
+VISUALIZER_MODE_GUARD = LINE_IN_MODE_GUARD.replace("!= bus", "= bus")
+
+
+def _exec_conditions(unit):
+    return [ln for ln in read(unit).splitlines() if ln.startswith("ExecCondition=")]
+
+
+def test_line_in_refuses_to_start_in_bus_mode_only():
+    """No linein_shared/speaker_shared pair in bus mode; panel mode keeps line-in."""
+    assert LINE_IN_MODE_GUARD in _exec_conditions("wall-line-in.service")
+    # The visualizer's line: same mode file, same absent-file default.
+    assert VISUALIZER_MODE_GUARD in _exec_conditions("wall-bus-visualizer.service")
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX sh on PATH")
+@pytest.mark.parametrize("mode,exit_code", [
+    ("bus", 1), ("trigger", 0), ("panel", 0), (None, 0)])
+def test_line_in_mode_guard_exit_status(tmp_path, mode, exit_code):
+    """Run the guard's own sh body: only bus skips; an absent file means trigger."""
+    line = _exec_conditions("wall-line-in.service")[-1]
+    assert line == LINE_IN_MODE_GUARD
+    body = line[len("ExecCondition=/bin/sh -c "):].strip("'")
+    mode_file = tmp_path / "audio-mode"
+    if mode is not None:
+        mode_file.write_text(mode + "\n")
+    body = body.replace("/etc/wall-panel/audio-mode", str(mode_file).replace("\\", "/"))
+    assert str(mode_file).replace("\\", "/") in body
+    done = subprocess.run(["sh", "-c", body], capture_output=True, text=True)
+    assert done.returncode == exit_code, done.stderr
 
 
 def test_kiosk_loop_refuses_to_run_in_panel_mode():

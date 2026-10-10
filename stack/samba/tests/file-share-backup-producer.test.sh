@@ -208,5 +208,40 @@ printf '%s' "$DEAD" | grep -q 'CODE 000' || {
     echo "FAIL: only an unanswered request may report 000 — got: $DEAD" >&2; exit 1; }
 echo "PASS: F2 a refused state post is reported as a refusal, with the tracker's reason"
 
+# ── F3: A DEAD TRACKER IS HTTP 000, NOT 000000 ───────────────────────────────
+# The curl branch of library-guard.sh used `curl -w '%{http_code}' ... || echo
+# 000`. On connection refused curl prints its own 000 AND exits 7, so the
+# fallback appended and the journal said "HTTP 000000". Drive the real --report
+# path with a curl that is refused, and one that times out, and record argv to
+# prove the transport deadline is passed.
+mkdir -p "$TMP/curl-failing"
+cat >"$TMP/curl-failing/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CURL_ARGV_CAPTURE"
+case "$CURL_MODE" in
+    refused) printf '000'; exit 7 ;;
+    timeout) exit 28 ;;
+esac
+EOF
+chmod +x "$TMP/curl-failing/curl"
+guard_report_with_failing_curl() { # MODE -> guard stdout; argv in $TMP/curl-argv
+    : >"$TMP/curl-argv"
+    PATH="$TMP/curl-failing:$TMP/bin:$PATH" MOUNTINFO_FILE="$TMP/mountinfo" ENV_FILE="$TMP/env" \
+        SMBCLIENT_BIN="$TMP/bin/smbclient" SMBCLIENT_EXIT=0 CURL_MODE="$1" \
+        CURL_ARGV_CAPTURE="$TMP/curl-argv" TIMEOUT_CAPTURE="$TMP/timeout-seconds" \
+        GUARD_REATTACH=0 "$GUARD" --report 2>&1 || true
+}
+REFUSED_OUT="$(guard_report_with_failing_curl refused)"
+grep -q -- '--connect-timeout 5' "$TMP/curl-argv" && grep -q -- '--max-time 15' "$TMP/curl-argv" || {
+    echo "FAIL: guard report curl must pass --connect-timeout 5 and --max-time 15 — argv: $(cat "$TMP/curl-argv")" >&2; exit 1; }
+printf '%s\n' "$REFUSED_OUT" | grep -q 'report got HTTP 000$' || {
+    echo "FAIL: a refused tracker must log 'HTTP 000' — got: $REFUSED_OUT" >&2; exit 1; }
+printf '%s\n' "$REFUSED_OUT" | grep -q '000000' && {
+    echo "FAIL: a refused tracker must not log 000000 — got: $REFUSED_OUT" >&2; exit 1; }
+TIMED_OUT_OUT="$(guard_report_with_failing_curl timeout)"
+printf '%s\n' "$TIMED_OUT_OUT" | grep -q 'report got HTTP 000$' || {
+    echo "FAIL: a timed-out tracker must log 'HTTP 000' — got: $TIMED_OUT_OUT" >&2; exit 1; }
+echo "PASS: F3 an unanswered state post logs HTTP 000 (refused and timed out), with the transport deadline"
+
 echo "PASS: TC-001 SR-018 producer payload separation and upgrade retirement"
-echo "2 PASS  0 FAIL"
+echo "3 PASS  0 FAIL"

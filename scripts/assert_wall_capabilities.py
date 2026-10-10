@@ -22,7 +22,7 @@ REQUIRED = {
     "virtual-input-v1": {"app": ["index.html", "js/main.js", "js/pin-keypad.js", "js/text-keyboard.js", "js/views/settings.js", "js/views/pandora.js", "css/access.css", "css/shell.css", "electron/pandora-keyboard-bridge.cjs", "electron/main.cjs", "electron/preload.cjs"], "site": ["index.html", "js/main.js", "js/pin-keypad.js", "js/views/settings.js", "css/access.css"], "gateway": []},
     "tracker-corrections-v2": {"app": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "gateway": ["gateway/server.mjs", "gateway/state.mjs"]},
     "panel-tabs-v1": {"app": ["index.html", "js/main.js", "js/state-machine.js", "js/views/nag.js", "js/views/music.js", "js/views/pandora.js", "css/shell.css", "css/access.css"], "site": ["index.html", "js/main.js", "js/state-machine.js", "js/views/nag.js", "js/views/music.js", "js/views/pandora.js", "css/shell.css", "css/access.css"], "gateway": []},
-    "progress-gauges-v1": {"app": ["index.html", "js/main.js", "js/views/gauges.js", "css/shell.css", "vendor/brand/OAI_OpenAI-Blossom_White.svg", "vendor/brand/opencode-favicon.svg", "vendor/brand/claude-favicon.svg"], "site": ["index.html", "js/main.js", "js/views/gauges.js", "css/shell.css", "vendor/brand/OAI_OpenAI-Blossom_White.svg", "vendor/brand/opencode-favicon.svg", "vendor/brand/claude-favicon.svg"], "gateway": []},
+    "progress-gauges-v1": {"app": ["index.html", "js/main.js", "js/views/gauges.js", "css/shell.css", "vendor/brand/OAI_OpenAI-Blossom_White.svg", "vendor/brand/opencode-favicon.svg", "vendor/brand/claude-favicon.svg", "vendor/brand/Grok_Logomark_Light.svg"], "site": ["index.html", "js/main.js", "js/views/gauges.js", "css/shell.css", "vendor/brand/OAI_OpenAI-Blossom_White.svg", "vendor/brand/opencode-favicon.svg", "vendor/brand/claude-favicon.svg", "vendor/brand/Grok_Logomark_Light.svg"], "gateway": []},
     "local-visualizer-v1": {"app": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "gateway": []},
     "door-stream-v1": {"app": ["index.html", "js/main.js", "js/state-machine.js", "js/views/door.js", "css/shell.css", "electron/main.cjs", "electron/preload.cjs", "electron/door-bridge.cjs", "electron/display-lit.cjs", "doorstream/service.py", "doorstream/motion.py"], "site": [], "gateway": []},
     "panel-audio-v1": {"app": ["index.html", "js/main.js", "js/views/bluetooth.js", "js/views/visualizer.js", "js/visualizer-core.js", "css/shell.css", "css/access.css", "electron/main.cjs", "electron/preload.cjs", "electron/audio-bridge.cjs", "electron/audio-ipc.cjs"], "site": ["index.html", "js/main.js", "js/views/bluetooth.js", "js/views/visualizer.js", "js/visualizer-core.js", "css/shell.css", "css/access.css"], "gateway": []},
@@ -71,6 +71,9 @@ ALLOWED_SITE_FILES = {
     "js/views/visualizer.js",
     "js/visualizer-core.js",
     "js/visualizer-preference.js",
+    # xAI's Grok logomark for the AI usage ring (OfficeWallNaglight WSN-076,
+    # 2026-10-09): a static, script-free SVG, its provenance in PROVENANCE.md.
+    "vendor/brand/Grok_Logomark_Light.svg",
     "vendor/brand/OAI_OpenAI-Blossom_White.svg",
     "vendor/brand/PROVENANCE.md",
     "vendor/brand/claude-favicon.svg",

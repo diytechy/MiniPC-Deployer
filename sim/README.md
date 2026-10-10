@@ -86,7 +86,6 @@ vantage — that stays a hardware/V3 remainder.
 | OIDC | `provider=google` | `provider=oidc`, issuer = Dex (`sim/dex/`) | no Google client needed to exercise the whole login path |
 | TLS | public ACME | Caddy `local_certs` internal CA (`sim/caddy/Caddyfile.sim`) | a local box can't ACME a real public domain |
 | admin login credential | `admin-auth/htpasswd`, written by firstboot from `ADMIN_AUTH_USER`/`_HASH` | committed fixture `sim/admin-auth/htpasswd.sim` (`simadmin` / `simpass`) | no firstboot in the sim; the credential is a sim fixture |
-| admin-auth image | `OAUTH2_PROXY_IMAGE_TAG` (v7.15.2) | `SIM_ADMIN_AUTH_IMAGE_TAG` (v7.15.2) | the sim still pins the tracker's oauth2-proxy at v7.6.0, which rejects `--trusted-proxy-ip` |
 | admin sites | five, each `@lan`-gated, throttled sign-in | `admin.`, `actual.admin.`, `dns.admin.`; no `@lan` gate, no throttle | the sim has never carried the LAN gates; both are proven by HomeHub's admin-portal harness |
 | ddns | Cloudflare updater | disabled (`profile: sim-disabled`) | zero real Cloudflare calls |
 | aux (Kuma/Dozzle) | loopback-bound, reached via `kuma.admin.` / `logs.admin.` | disabled | out of the V1 gate scope |

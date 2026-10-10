@@ -19,7 +19,9 @@ contracts; matching IF-IDs should be recorded there too:
 - **IF-002** — the trusted-header identity contract: oauth2-proxy →
   `X-Forwarded-Email`/`-User` → NagLight multi-user mode (D3/WI-10.5, SR-003).
 - **IF-003** — `POST /api/feed` `{check,ok,note}` + Bearer token — the backup
-  service's never-silent-green report and Uptime-Kuma pushes (SR-013).
+  service's step 6 report. That step is now a no-op: `feed_naglight` in
+  `stack/backup/common.sh` logs that the legacy config-backup feed is suppressed
+  and returns 0 without posting (SR-013).
 
 **This repo ↔ Finance-Auditor** (`Provides` — FA numbered its registry first,
 so ids are repo-local; each Contract cites the counterpart's id):
@@ -83,10 +85,13 @@ panel; that repo owns the app):
 **This repo → NagLight** (`Consumes` — the AI-usage gauges):
 
 - **IF-013** — `Implemented` 2026-09-09 (SR-021; SN-016). `POST
-  {$AI_USAGE_FEED_URL}` with `kind:"gauge"` — five ids
+  {$AI_USAGE_FEED_URL}` with `kind:"gauge"` — six ids
   (`ai-usage-codex`, `ai-usage-claude-session`, `ai-usage-claude-weekly`,
+  `ai-usage-claude-weekly-fable` (optional, posted once the vendor reports it),
   `ai-usage-opencode-weekly`, `ai-usage-opencode-monthly`), each carrying
-  `unit:"%"`, `min:0`, `max:100`, `target:0`, `direction:"up"` and a `window`.
+  `unit:"%"`, `min:0`, `max:100`, `target:0`, `direction:"down"` and a `window`.
+  `value` is percent remaining (100 minus the consumed percent), so the pace line
+  falls from a full bar to zero at the reset.
   **Numbers only — never a severity, a `css` or a colour:** NagLight owns
   severity and the panel renders it, and a feeder that computed a hue would make
   that authority ambiguous. `value` and `target` are always present and `min`/
@@ -97,11 +102,27 @@ panel; that repo owns the app):
   "unavailable" is said without inventing a number: a source that fails reposts
   its last real reading at its *original* stamp and goes stale on NagLight's
   horizon, and one that has never succeeded posts a gauge with no `observed_at`
-  at all, stale on arrival. The timer runs every 10 minutes because two of the
-  five gauges are `weekly`, whose horizon is 24 h. **Not provided:** a Gemini
+  at all, stale on arrival. The timer runs every 10 minutes because four of the
+  six gauges are `weekly`, whose horizon is 24 h. **Not provided:** a Gemini
   gauge (deferred as E11) and OpenCode's `rolling` bucket, which publishes no
   window length — a window this repo would have had to invent. Details in
   `stack/ai-usage/README.md`.
+
+**This repo → NagLight tracker** (`Consumes` — the check-feed producers that
+post to `/api/feed` from this box or the stack; each row cites its code):
+
+- **IF-035** — `Implemented`. The frame-freshness lane,
+  `stack/tracker/frame-freshness.sh`: colour `green` or `yellow` only, posted by
+  `docker exec` of the tracker container; `--check` posts nothing; exit is 0/2 (green/yellow) by band in both
+  modes, and 1 only when `--report` fails to deliver, so the unit shows it.
+- **IF-036** — `Implemented`. The tracker-definitions guard,
+  `stack/tracker/tracker-defs-guard.sh`: colour `green`, `yellow` or `red`; a
+  failed post changes the exit status only through the unknown-check escalation.
+- **IF-037** — `Draft`. The Finance-Auditor colour lane, posted by the
+  `finance-auditor` service that `stack/docker-compose.yml` runs; the wire contract
+  is Finance-Auditor's IF-001. `reason` is 1-80 characters and `color` is from
+  Finance-Auditor's colour order; the same URL and headers also carry its separate
+  gauge POST. Failure is logged and not turned into a nonzero exit.
 
 ---
 

@@ -374,3 +374,59 @@ def test_build_script_has_no_hardcoded_fallback_branch():
     text = BUILD.read_text(encoding="utf-8")
     assert "auroleap-bank-stale-capability" not in text and "\r" not in text
     assert re.search(r"wsl -d Ubuntu", text)
+
+
+# ── firstboot: compose failure after an image-verification failure ───────────
+
+def _compose_harness(tmp_path, compose_rc, state_text):
+    text = FIRSTBOOT.read_text(encoding="utf-8")
+    a = text.index("_deferred_rc=0\nif [ \"$_compose_rc\" -ne 0 ]; then")
+    marker = '        exit "$_compose_rc"\n    fi\nfi\n'
+    step4a = text[a:text.index(marker, a) + len(marker)]
+    b = text.index('if [ "$_deferred_rc" -ne 0 ]; then')
+    end_marker = 'exit "$_deferred_rc"\nfi\n'
+    step7 = text[b:text.index(end_marker, b) + len(end_marker)]
+    state = tmp_path / "image-load.state"
+    if state_text is not None:
+        _w(state, state_text)
+    harness = tmp_path / "fb.sh"
+    _w(harness, "log() { echo \"[fb] $*\"; }\n"
+                f"IMAGE_LOAD_STATE={_px(state)}\n_compose_rc={compose_rc}\n"
+                + step4a + "echo LATER-STEPS-REACHED\n" + step7 + "echo CLEAN-END\n")
+    return subprocess.run([_bash(), _px(harness)], capture_output=True, text=True)
+
+
+def test_compose_failure_after_image_failure_defers_and_still_ends_red(tmp_path):
+    proc = _compose_harness(tmp_path, 3, "FAILED ref=sure-auroleap:local tar=s.tar want_rootfs=a got_rootfs=b\n")
+    assert "ERROR" in proc.stdout and "sure-auroleap:local" in proc.stdout  # names the image
+    assert "LATER-STEPS-REACHED" in proc.stdout  # DNS/Samba/recovery steps still run
+    assert proc.returncode == 3 and "CLEAN-END" not in proc.stdout  # and the unit still ends red
+
+
+def test_compose_failure_without_image_failure_is_still_immediately_fatal(tmp_path):
+    for state in (None, ""):
+        sub = tmp_path / f"s{state is None}"
+        sub.mkdir()
+        proc = _compose_harness(sub, 3, state)
+        assert proc.returncode == 3 and "FATAL: 'docker compose up -d' exited 3" in proc.stdout
+        assert "LATER-STEPS-REACHED" not in proc.stdout
+
+
+def test_compose_success_with_a_stale_state_file_is_clean(tmp_path):
+    proc = _compose_harness(tmp_path, 0, "FAILED ref=x\n")
+    assert proc.returncode == 0 and "CLEAN-END" in proc.stdout
+
+
+# ── exporter: never record the empty-string rootfs hash ──────────────────────
+
+def test_unreadable_layer_list_refuses_instead_of_recording_the_empty_hash(tmp_path):
+    bash = _bash()
+    stub, env = _stub(tmp_path, present=[("sure-auroleap:local", "sha256:fork")],
+                      labels=[("sure-auroleap:local", REF)], rootfs=[("sure-auroleap:local", "")],
+                      images=["sure-auroleap:local"])
+    envfile = tmp_path / "env"
+    _w(envfile, ENV_TEXT)
+    env.update(IMAGES_OUT=_px(tmp_path / "out"), ALLOW_STALE_LOCAL="1")
+    proc = subprocess.run([bash, _px(EXPORT), "--env-file", _px(envfile)], env=env, capture_output=True, text=True)
+    assert proc.returncode != 0 and "empty rootfs hash" in _text(proc)
+    assert "e3b0c44298fc1c14" not in (tmp_path / "out" / "images.manifest.tsv").read_text()

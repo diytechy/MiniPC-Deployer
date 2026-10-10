@@ -65,7 +65,10 @@ mismatch it removes the tag (so the next boot retries the load rather than skipp
 writes `/var/lib/homehub/image-load.state` (reported FAIL by `healthcheck.sh`) and
 lets the boot continue; the Sure services carry `pull_policy: never`, so the service
 fails to start instead of pulling from a registry. `docker compose up -d` is
-all-or-nothing about its exit status, so the unit still ends red afterwards. Build it in WSL with real Docker, never the default (Podman) distro:
+all-or-nothing about its exit status; when `image-load.state` lists failures firstboot
+logs an ERROR naming them, defers compose's exit code, finishes provisioning (DNS,
+Caddy, Samba, the recovery supervisor) and exits with that code at step 7, so the unit
+still ends red. A compose failure with no image failure stays an immediate FATAL. Build it in WSL with real Docker, never the default (Podman) distro:
 
     wsl -d Ubuntu -- bash /mnt/c/Projects/MiniPC-Deployer/scripts/build-sure-image.sh --ref auroleap-integration
 

@@ -196,12 +196,16 @@ ensure_image "filebackup:${FILEBACKUP_IMAGE_TAG:-local}" "FileBackup" ""
 case ",$(env_get COMPOSE_PROFILES | tr -d '[:space:]')," in
     *,sure,*)
         SURE_IMAGE="$(env_get SURE_IMAGE)"; SURE_IMAGE="${SURE_IMAGE:-sure-auroleap:local}"
+        # Omit --ref when the knob is empty so build-sure-image.sh's own clear
+        # "no source ref" error fires rather than a bare argument-parse failure.
+        SURE_REF_ARGS=(); SURE_REF="$(env_get SURE_SOURCE_REF | tr -d '[:space:]')"
+        [ -z "$SURE_REF" ] || SURE_REF_ARGS=(--ref "$SURE_REF")
         if [ "$REBUILD" -eq 0 ] && docker image inspect "$SURE_IMAGE" >/dev/null 2>&1; then
             log "present: $SURE_IMAGE (skip; --rebuild to force)"
         elif [ "$DRY_RUN" -eq 1 ]; then
             log "would build: $SURE_IMAGE via scripts/build-sure-image.sh"
         else
-            bash "$SCRIPT_DIR/build-sure-image.sh" --tag "$SURE_IMAGE" --ref "$(env_get SURE_SOURCE_REF)" || die "Sure fork build failed ($SURE_IMAGE)"
+            bash "$SCRIPT_DIR/build-sure-image.sh" --tag "$SURE_IMAGE" ${SURE_REF_ARGS[@]+"${SURE_REF_ARGS[@]}"} || die "Sure fork build failed ($SURE_IMAGE)"
         fi
         ;;
     *)

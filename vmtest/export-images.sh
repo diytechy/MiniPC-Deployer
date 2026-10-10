@@ -583,7 +583,9 @@ for ref in "${IMAGES[@]}"; do
     # but the manifest/index digest on the containerd store, so it can legitimately
     # differ between this machine and the hub; it is kept for display only. The
     # diff-ids (RootFS.Layers) are the same on both, and firstboot compares THAT.
-    rootfs="$(docker image inspect "$ref" --format '{{json .RootFS.Layers}}' 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    layers="$(docker image inspect "$ref" --format '{{json .RootFS.Layers}}' 2>/dev/null)" && [ -n "$layers" ] && [ "$layers" != "null" ] \
+        || die "cannot read the layer list of '$ref' - refusing to record an empty rootfs hash (firstboot would false-fail it)."
+    rootfs="$(printf '%s\n' "$layers" | sha256sum | cut -d' ' -f1)"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ref" "$img_id" "$repo_digest" "$(basename "$out")" "$bytes" "$kind" "$rootfs" >> "$MANIFEST"
 done
 

@@ -504,10 +504,13 @@ tar_repo_tags() {
 #      stack/provision/healthcheck.sh reports as a FAIL;
 #   3. return 0 so the boot continues. Compose then cannot find the image
 #      (the Sure services carry `pull_policy: never`, so it is not fetched from a
-#      registry either) and that service fails to start. NOTE: `docker compose up
-#      -d` is all-or-nothing about its exit status, so the existing FATAL at the
-#      end of the up still fires on that failure - the unit goes red, but only
-#      after the mounts, DNS and every other service have had their turn.
+#      registry either) and that service fails to start. `docker compose up -d`
+#      is all-or-nothing about its exit status, so it exits non-zero; step 4a
+#      sees the FAILED lines in $IMAGE_LOAD_STATE, logs an ERROR naming the
+#      image(s), DEFERS that exit code and carries on, so the mounts, DNS, Caddy,
+#      Samba and the recovery supervisor still get installed. Step 7 then exits
+#      with the deferred code and the unit ends red. A compose failure with NO
+#      image-load failure is still an immediate FATAL, exactly as before.
 # Only called after a real load - the SKIP path above deliberately keeps an
 # operator's newer image, whose layers legitimately differ.
 IMAGE_LOAD_STATE="${IMAGE_LOAD_STATE:-/var/lib/homehub/image-load.state}"
@@ -530,7 +533,7 @@ verify_loaded_image() {
             log "ERROR: loaded image $ref does NOT match the bake ($name): rootfs '${got:-<absent>}' != recorded '$want_rootfs'."
             log "  Removing the tag so the next boot retries the load instead of skipping it;"
             log "  the service using it will not start. Recorded in $IMAGE_LOAD_STATE."
-            docker rmi "$ref" >/dev/null 2>&1 || log "  WARN: could not remove $ref"
+            docker rmi "$ref" >/dev/null 2>&1 || docker rmi -f "$ref" >/dev/null 2>&1 || log "  WARN: could not remove $ref"
             mkdir -p "$(dirname "$IMAGE_LOAD_STATE")" 2>/dev/null || true
             printf 'FAILED ref=%s tar=%s want_rootfs=%s got_rootfs=%s\n' \
                 "$ref" "$name" "$want_rootfs" "${got:-absent}" >> "$IMAGE_LOAD_STATE" 2>/dev/null \
@@ -1685,9 +1688,21 @@ if [ -f /var/lib/homehub-recovery/quarantine.json ] && [ -f "$STACK_DIR/recovery
     python3 "$STACK_DIR/recovery/homehub-recovery" enforce-quarantine 2>&1 | sed 's/^/  /' \
         || log "WARN: a quarantined service could not be kept stopped - see the lines above"
 fi
+_deferred_rc=0
 if [ "$_compose_rc" -ne 0 ]; then
-    log "FATAL: 'docker compose up -d' exited $_compose_rc (quarantine was still enforced)"
-    exit "$_compose_rc"
+    if [ -s "$IMAGE_LOAD_STATE" ]; then
+        # The only deferral: a baked image failed verification in step 3 and its
+        # tag was removed, so the up could not have succeeded. Everything after
+        # this point does not depend on that image; stopping here would skip the
+        # recovery supervisor and DNS on every boot until the image is fixed.
+        log "ERROR: 'docker compose up -d' exited $_compose_rc, and step 3 removed image(s) that failed verification:"
+        sed 's/^/[firstboot]   /' "$IMAGE_LOAD_STATE"
+        log "  Continuing so the rest of the box is provisioned; exiting $_compose_rc at step 7."
+        _deferred_rc="$_compose_rc"
+    else
+        log "FATAL: 'docker compose up -d' exited $_compose_rc (quarantine was still enforced)"
+        exit "$_compose_rc"
+    fi
 fi
 
 # ── 4a-post. DID THEY ACTUALLY STAY UP? ──────────────────────────────────────
@@ -2536,6 +2551,11 @@ date > "$MARKER"
 # fenced" (failed), and it stops one optional service's problem from colouring
 # the whole first boot red. Step 4a-relay logs its state so the journal still
 # names it in one line.
+if [ "$_deferred_rc" -ne 0 ]; then
+    log "FATAL: bring-up finished, but 'docker compose up -d' failed ($_deferred_rc) after a baked image"
+    log "  failed verification (see the step 4a ERROR). Exiting non-zero so this unit reports FAILED."
+    exit "$_deferred_rc"
+fi
 if [ "$KIOSK_CONFIG_UNREADABLE" -ne 0 ]; then
     log "FATAL: bring-up finished, but the wall panel WILL run on js/config.js defaults"
     log "  (see the step 4b ERROR above). Exiting non-zero so this unit reports FAILED"

@@ -457,14 +457,15 @@ def test_boot_copy_report_survives_a_payload_without_the_source(monkeypatch):
     assert by["/usr/local/sbin/powertune.sh"]["state"] == "no-source"
 
 
-def _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, first_read_fails):
+def _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, failing_reads=()):
     """Drive the real main() through --apply --run-firstboot against a fake box.
 
     Only the box is faked. The boot-copy reads go through the real
     boot_copy_report(), with ssh answered from `box`; the fake firstboot
     rewrites `box` the way the real one installs the copies. Returns the JSON
-    report main() wrote. `first_read_fails` makes the PRE-firstboot ssh read
-    fail, the transient case the second review named.
+    report main() wrote. `failing_reads` names the boot-copy ssh reads (1 = the
+    pre-firstboot one, 2 = the re-read) that fail, the transient cases the
+    reviews named.
     """
     import json
     fb = b"#!/usr/bin/env bash\necho firstboot new\n"
@@ -483,7 +484,7 @@ def _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, first_read_
             return subprocess.CompletedProcess(argv, 0, "", "")
         assert argv[0] == "ssh" and "/usr/local/sbin/powertune.sh" in argv[-1], argv
         boot_reads.append(argv)
-        if first_read_fails and len(boot_reads) == 1:
+        if len(boot_reads) in failing_reads:
             return subprocess.CompletedProcess(argv, 255, "", "connection reset")
         out = ["\t".join([dest, _sha(data), _sha(data.replace(b"\r\n", b"\n")), "755"])
                for dest, data in box.items()]
@@ -510,7 +511,7 @@ def _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, first_read_
 
 def test_main_reports_the_boot_copies_as_firstboot_left_them_sr047(monkeypatch, tmp_path):
     """The first review finding: the report kept the pre-firstboot 'stale' after a refresh."""
-    got = _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, first_read_fails=False)
+    got = _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path)
     assert [r["state"] for r in got["boot_copies"]] == ["current", "current"]
     assert [r["state"] for r in got["boot_copies_before"]] == ["stale", "stale"]
     assert [r["state"] for r in got["boot_copies_after"]] == ["current", "current"]
@@ -519,11 +520,21 @@ def test_main_reports_the_boot_copies_as_firstboot_left_them_sr047(monkeypatch, 
 def test_main_records_the_final_boot_copies_when_the_first_read_failed_sr047(monkeypatch, tmp_path):
     """The second review finding: a transient ssh failure BEFORE firstboot must
     not stop the final state being recorded."""
-    got = _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, first_read_fails=True)
+    got = _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, failing_reads={1})
     assert [r["state"] for r in got["boot_copies"]] == ["current", "current"]
     assert "boot_copies_before" not in got
     assert got.get("boot_copies_before_error") == "unreadable over ssh"
     assert "boot_copies_error" not in got, "boot_copies_error must describe the FINAL state"
+
+
+def test_main_names_both_failures_when_neither_read_succeeded_sr047(monkeypatch, tmp_path):
+    """Third review: with BOTH reads failed, the initial failure must move to
+    `boot_copies_before_error` and `boot_copies_error` must name the final one."""
+    got = _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, failing_reads={1, 2})
+    assert "boot_copies" not in got and "boot_copies_before" not in got
+    assert got.get("boot_copies_before_error") == "unreadable over ssh"
+    assert got.get("boot_copies_error") == "unreadable over ssh after firstboot"
+    assert got.get("boot_copies_after_error") == "unreadable over ssh after firstboot"
 
 
 def test_a_failed_re_read_is_never_reported_as_current_sr047():

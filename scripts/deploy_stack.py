@@ -349,15 +349,18 @@ def record_boot_copies_after_firstboot(result: dict, before, after) -> None:
     The two reads are INDEPENDENT. `before` is None when the pre-firstboot read
     failed (a transient ssh failure); the final state is still recorded, and the
     earlier failure moves to `boot_copies_before_error` so that
-    `boot_copies`/`boot_copies_error` always describe the final state.
+    `boot_copies`/`boot_copies_error` always describe the final state - which
+    includes both reads failing: the first failure is the `_before_` one and
+    `boot_copies_error` names the final read's.
     """
     if before is not None:
         result["boot_copies_before"] = before
-    if after is None:
-        result["boot_copies_after_error"] = "unreadable over ssh after firstboot"
-        return
     if "boot_copies_error" in result:
         result["boot_copies_before_error"] = result.pop("boot_copies_error")
+    if after is None:
+        result["boot_copies_after_error"] = "unreadable over ssh after firstboot"
+        result["boot_copies_error"] = result["boot_copies_after_error"]
+        return
     result["boot_copies_after"] = after
     result["boot_copies"] = after
 

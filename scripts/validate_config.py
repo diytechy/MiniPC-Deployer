@@ -912,6 +912,36 @@ def main():
             ),
         )
 
+    # 6c. AN OPT-IN DAEMON IN packages.list SHIPS DISABLED (review 2026-10-10).
+    #
+    #     A package's postinst enables its own unit, so an opt-in daemon baked
+    #     into the image runs from the FIRST boot - before any knob is read -
+    #     unless a late-command disables it after the baked install. earlyoom
+    #     did exactly that: it could kill firstboot's image load or a big pull
+    #     on a fresh box with HUB_WATCHDOG_ENABLED=false. The disable must come
+    #     AFTER the install (a postinst run later would re-enable it), and the
+    #     only thing that may enable it is the knob's setup script.
+    opt_in_units = {"earlyoom": ("earlyoom.service", "recovery/setup-recovery.sh")}
+    hub_pkgs = image_packages(load(stack / "autoinstall" / "packages.list"))
+    hub_ud = load(stack / "autoinstall" / "user-data")
+    install_at = hub_ud.find('xargs -a "$R/apt/packages.baked.list" apt-get')
+    for pkg, (unit, enabler) in sorted(opt_in_units.items()):
+        if pkg not in hub_pkgs:
+            continue
+        disable_at = hub_ud.find("systemctl disable {}".format(unit))
+        check(
+            install_at >= 0 and disable_at > install_at,
+            "autoinstall/user-data: opt-in {} is disabled after the baked install".format(unit),
+            "autoinstall/user-data: {} is in packages.list but no late-command "
+            "AFTER the baked install runs `systemctl disable {}` - its postinst "
+            "enables it, so it runs from the first boot before any opt-in".format(pkg, unit),
+        )
+        check(
+            "systemctl enable {}".format(unit) in load(stack / enabler),
+            "{} is enabled by {}, the opt-in path".format(unit, enabler),
+            "{} names no `systemctl enable {}` - the opt-in can never start it".format(enabler, unit),
+        )
+
     # 5. YAML parse (optional — needs PyYAML; SKIP cleanly if absent so this stays
     # runnable on a stdlib-only box). cloud-init user-data is valid YAML under its
     # `#cloud-config` first line.

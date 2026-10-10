@@ -25,7 +25,7 @@ tier) and whether anything acts on the brake.
 Exit: 0 committed (or stamp written); 1 accounting could not be committed (the
 boot.json still says so); 2 bad arguments.
 
-Implements: SR-049, SR-051, LLR-994, LLR-995, LLR-996, LLR-997
+Implements: SR-049, SR-051, LLR-994, LLR-995, LLR-996, LLR-997, LLR-1017
 """
 
 from __future__ import annotations
@@ -100,6 +100,28 @@ def read_bootstatus(paths: rc.Paths) -> Optional[int]:
     out = 0
     for v in values:
         out |= v
+    return out
+
+
+def cardreset_identities(paths: rc.Paths) -> List[str]:
+    """Identities of every watchdog whose bootstatus carries WDIOF_CARDRESET.
+
+    What D10's proof is bound to (rc.bootstatus_proven): a device reporting a
+    reset proves THAT device can, not whichever one is selected later. A
+    reporting device with no readable identity proves nothing.
+    Implements: SR-051, LLR-1017
+    """
+    out: List[str] = []
+    for path in sorted(glob.glob(os.path.join(paths.watchdog_class_dir, "watchdog*", "bootstatus"))):
+        try:
+            with open(path, encoding="ascii") as handle:
+                value = int(handle.read().strip() or "0")
+        except (OSError, ValueError):
+            continue
+        if value & rc.WDIOF_CARDRESET:
+            identity = rc.watchdog_identity(paths, os.path.basename(os.path.dirname(path)))
+            if identity and identity not in out:
+                out.append(identity)
     return out
 
 
@@ -192,7 +214,8 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
     except rc.AccountingError as exc:
         entries, log_ok = [], False
         committed, error = False, "boot accounting unreadable: {}".format(exc)
-    proven = os.path.exists(paths.bootstatus_proven_file)
+    known = rc.proven_identities(paths)
+    newly: List[str] = []
 
     if already:
         mine = [e for e in entries if e.get("boot_id") == boot_id and "class" in e]
@@ -208,8 +231,7 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
         records = list_pstore_records(paths)
         fresh = [r for r in records if r not in seen]
         cls, reason = rc.classify_previous_boot(stamp, previous, bootstatus, fresh)
-        if bootstatus is not None and bootstatus & rc.WDIOF_CARDRESET:
-            proven = True
+        newly = [i for i in cardreset_identities(paths) if i not in known]
         record.update({"class": cls, "reason": reason, "previous_boot_id": previous,
                        "bootstatus": bootstatus})
         try:
@@ -219,12 +241,15 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
                 raise OSError(error)
             os.makedirs(paths.state_dir, exist_ok=True)
             os.makedirs(paths.events_dir, exist_ok=True)
-            if proven and not os.path.exists(paths.bootstatus_proven_file):
-                # D10's switch, latched the first time the firmware proves it can
-                # report a watchdog reset. It only ever moves TOWARDS not counting
-                # power cuts, and only on evidence.
-                rc.atomic_write(paths.bootstatus_proven_file,
-                                "first CARDRESET seen {}\n".format(_utc_iso(now)).encode("ascii"))
+            if newly:
+                # D10's proof, latched PER DEVICE IDENTITY the first time that
+                # device reports a watchdog reset. It applies only while the
+                # selected device is one of these (rc.bootstatus_proven), so a
+                # fall-back to a device that cannot report counts power cuts
+                # again.
+                rc.atomic_write(paths.bootstatus_proven_file, json.dumps(
+                    {"identities": known + newly, "utc": _utc_iso(now)},
+                    sort_keys=True).encode("utf-8"))
             entry = {"t": now, "utc": record["utc"], "boot_id": boot_id,
                      "previous_boot_id": previous, "class": cls, "reason": reason}
             rc.append_boots_log(paths.boots_log, entry)
@@ -238,6 +263,7 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
             if committed:
                 committed, error = False, "accounting could not be committed: {}".format(exc)
 
+    proven = rc.bootstatus_proven(paths, extra=newly)
     brake = rc.brake_state(entries, now, cfg.max_recovery_boots, proven)
     if not log_ok:
         brake = rc.BrakeState(braked=True, counted_recent=-1, last_counted_utc=None,
@@ -251,6 +277,8 @@ def classify(paths: rc.Paths, cfg: rc.Config, now: Optional[float] = None,
         "counted_recent": brake.counted_recent,
         "brake_detail": brake.detail,
         "bootstatus_proven": proven,
+        "watchdog_identity": rc.selected_watchdog_identity(paths),
+        "proven_identities": known + newly,
         "counting_unexplained": rc.CLASS_UNEXPLAINED in rc.counted_classes(proven),
         "enabled": cfg.enabled,
         "tiers": cfg.tiers,

@@ -321,13 +321,13 @@ libpam-systemd
 # HUB_OOM_* knobs and enables it, and on every other boot it DISABLES it, so
 # the feature ships off.
 #
-# THE ONE WINDOW, said rather than hidden: the package's postinst enables its
-# unit, so the FIRST boot of a fresh image runs earlyoom with Debian's defaults
-# for the minutes until firstboot step 6g converges it off. That is a
-# conservative killer (it only acts below 10 % available memory AND 10 % free
-# swap), and it is preferable to the alternative of a package that is missing
-# on the day the knob is turned on - which is what keeping it in
-# packages.optional.list (baked only when HomeHub asks) would mean.
+# IT SHIPS DISABLED. The package's postinst enables its unit, which used to
+# leave the first boot of a fresh image running earlyoom with Debian's defaults
+# through firstboot's image load and Docker pulls, until step 6g converged it
+# off - before any opt-in (review 2026-10-10). user-data now disables the unit
+# right after the baked install (validate_config.py check 6c), so earlyoom
+# first runs when setup-recovery.sh converges ON. Installed rather than kept in
+# packages.optional.list so it is not missing on the day the knob is turned on.
 # A re-export of the baked apt repo is owed with this line (see the header).
 earlyoom
 

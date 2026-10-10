@@ -5,7 +5,7 @@ last-boot, pstore records, the watchdog's bootstatus, kernel.panic and
 /run/homehub-recovery/boot.json are all real files. Only the boot id and the
 clock are chosen by the test.
 
-Implements: TC-1056..TC-1060, TC-1075 (see docs/test/test-cases.csv)
+Implements: TC-1056..TC-1060, TC-1075, TC-1085 (see docs/test/test-cases.csv)
 """
 
 from __future__ import annotations
@@ -233,8 +233,16 @@ def test_d10_unexplained_counts_until_bootstatus_is_proven_tc1059():
     assert rc.brake_state(watchdog, 200, 3, bootstatus_proven=True).braked
 
 
+def _select(tree, identity):
+    """The reset device setup-recovery.sh selected, as the classifier sees it:
+    recovery.env names /dev/watchdog0, and sysfs gives that device's identity."""
+    tree.write(tree.paths.conf_file, "HUB_WD_DEVICE=/dev/watchdog0\n")
+    tree.write(os.path.join(tree.paths.watchdog_class_dir, "watchdog0", "identity"), identity + "\n")
+
+
 def test_d10_the_first_cardreset_latches_the_policy_switch_tc1059(tmp_path):
     tree = _tree(tmp_path)
+    _select(tree, "wdat_wdt")
     _bootstatus(tree, 0x20)
     record, _ = _classify(tree)
     assert record["bootstatus_proven"] and not record["counting_unexplained"]
@@ -245,6 +253,44 @@ def test_d10_the_first_cardreset_latches_the_policy_switch_tc1059(tmp_path):
     record, _ = _classify(tree, now=NOW + 60)
     assert record["class"] == "unexplained" and not record["counting_unexplained"]
     assert record["counted_recent"] == 1, "the power cut was charged to the brake"
+
+
+def test_d10_proof_is_bound_to_the_device_and_a_fallback_counts_again_tc1085(tmp_path):
+    """Review 2026-10-10: WDAT's proof must not exempt softdog's resets.
+
+    WDAT reports CARDRESET once; the box later falls back to softdog, which
+    can never report one, so its resets are 'unexplained'. Those MUST count,
+    and three of them in 24 h must brake. Back on WDAT, the proof applies again.
+    """
+    tree = _tree(tmp_path)
+    _select(tree, "wdat_wdt")
+    _bootstatus(tree, 0x20)
+    assert _classify(tree)[0]["bootstatus_proven"]
+    _select(tree, "Software Watchdog")
+    _bootstatus(tree, 0)
+    record = None
+    for i in range(1, 4):
+        tree.write(tree.paths.last_boot_file, PREV + "\n")
+        record, _ = _classify(tree, now=NOW + i * 60)
+        assert record["class"] == "unexplained"
+    assert not record["bootstatus_proven"] and record["counting_unexplained"]
+    assert record["braked"], "softdog's unexplained resets were exempted by WDAT's proof"
+    # The proof is kept, per device: back on WDAT it applies again.
+    _select(tree, "wdat_wdt")
+    tree.write(tree.paths.last_boot_file, PREV + "\n")
+    record, _ = _classify(tree, now=NOW + 300)
+    assert record["bootstatus_proven"] and not record["counting_unexplained"]
+    # And the supervisor's periodic re-evaluation (C9) reads the same binding.
+    _select(tree, "Software Watchdog")
+    assert rc.evaluate_brake(tree.paths, config(), NOW + 360).braked
+
+
+def test_d10_an_unbound_latch_proves_nothing_tc1085(tmp_path):
+    """The old plain-text latch cannot say which device it was for."""
+    tree = _tree(tmp_path)
+    _select(tree, "wdat_wdt")
+    tree.write(tree.paths.bootstatus_proven_file, "first CARDRESET seen 2026-10-05T00:00:00Z\n")
+    assert not rc.bootstatus_proven(tree.paths)
 
 
 def test_d10_without_a_latch_unexplained_boots_are_counted_tc1059(tmp_path):

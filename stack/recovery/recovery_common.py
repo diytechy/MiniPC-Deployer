@@ -489,11 +489,12 @@ def classify_previous_boot(
 def counted_classes(bootstatus_proven: bool) -> Tuple[str, ...]:
     """D10: which classes cost brake budget.
 
-    If this board has ever reported WDIOF_CARDRESET, watchdog resets are
-    identifiable, so an unexplained boot is a power cut or a hang the firmware
-    never saw, and it costs nothing. Until then a watchdog reset and a power cut
-    look identical and unexplained boots MUST be counted.
-    Implements: SR-051, LLR-997
+    If the SELECTED reset device has ever reported WDIOF_CARDRESET (see
+    bootstatus_proven()), watchdog resets are identifiable, so an unexplained
+    boot is a power cut or a hang the firmware never saw, and it costs nothing.
+    Until then a watchdog reset and a power cut look identical and unexplained
+    boots MUST be counted.
+    Implements: SR-051, LLR-997, LLR-1017
     """
     base = (CLASS_RECOVERY, CLASS_WATCHDOG, CLASS_PANIC)
     return base if bootstatus_proven else base + (CLASS_UNEXPLAINED,)
@@ -596,8 +597,58 @@ def evaluate_brake(paths: "Paths", cfg: "Config", now_utc: float) -> "BrakeState
     Implements: SR-051, LLR-997, LLR-1009
     """
     entries = read_boots_log_strict(paths.boots_log)
-    proven = os.path.exists(paths.bootstatus_proven_file)
-    return brake_state(entries, now_utc, cfg.max_recovery_boots, proven)
+    return brake_state(entries, now_utc, cfg.max_recovery_boots, bootstatus_proven(paths))
+
+
+# ── D10's proof, bound to the device that gave it (review 2026-10-10) ───────
+#
+# The proof used to be one global latch: once WDAT had reported CARDRESET, the
+# file existed for ever, so a later fall-back to softdog (HUB_WD_RESET_DEVICE,
+# or wdat_wdt failing to load) - which can NEVER report CARDRESET - had every
+# one of its resets read as an uncounted "unexplained" boot, and the brake could
+# not engage. The proof is now the set of watchdog IDENTITIES (the kernel's
+# /sys/class/watchdog/<dev>/identity, e.g. "wdat_wdt", "Software Watchdog")
+# that have reported CARDRESET, and it applies only while the device the
+# supervisor is configured to use has one of them. Change the device and
+# unexplained boots count again - retroactively within the 24 h window, since
+# the brake is recomputed from boots.log every time.
+
+
+def watchdog_identity(paths: "Paths", name: str) -> Optional[str]:
+    """The kernel's identity string for /sys/class/watchdog/<name>, or None."""
+    try:
+        with open(os.path.join(paths.watchdog_class_dir, name, "identity"), encoding="ascii",
+                  errors="replace") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def selected_watchdog_identity(paths: "Paths") -> Optional[str]:
+    """Identity of the reset device recovery.env selects, or None if none is selected.
+
+    HUB_WD_DEVICE is written by setup-recovery.sh: empty for the contain tier,
+    for no device, and when the capability is off - all "nothing to prove"."""
+    device = read_env_file(paths.conf_file).get("HUB_WD_DEVICE", "")
+    return watchdog_identity(paths, os.path.basename(device)) if device else None
+
+
+def proven_identities(paths: "Paths") -> List[str]:
+    """Identities that have reported CARDRESET. An unbound (pre-2026-10-10,
+    plain-text) latch proves nothing: it cannot say which device it was."""
+    data = read_json(paths.bootstatus_proven_file) or {}
+    ids = data.get("identities")
+    return [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
+
+
+def bootstatus_proven(paths: "Paths", extra: Iterable[str] = ()) -> bool:
+    """D10's switch: has the SELECTED reset device ever reported CARDRESET?
+
+    `extra` adds identities seen this boot that may not be committed yet.
+    Implements: SR-051, LLR-997, LLR-1017
+    """
+    selected = selected_watchdog_identity(paths)
+    return selected is not None and selected in set(proven_identities(paths)) | set(extra)
 
 
 def parse_boots_log(text: str) -> List[dict]:

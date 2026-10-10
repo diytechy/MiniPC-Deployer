@@ -42,8 +42,13 @@ on every boot, which converges the opt-in half **on or off** from `.env`.
   empty (the 10-04 "ghost") is removed or restarted.
 - **Quarantine.** A compose service that is the victim twice within an hour
   is, the next time, **stopped and left stopped** (`docker update
-  --restart=no` + `docker stop`, which survives a reboot) instead of being
-  killed again. The status goes red until you release it.
+  --restart=no` + `docker stop`) instead of being killed again. The status
+  goes red until you release it. **It stays down across a reboot** because
+  firstboot runs `homehub-recovery enforce-quarantine` right after its
+  `docker compose up -d` (which would otherwise start it again), from the
+  quarantine file alone, so it holds whether or not the supervisor is on.
+  The container is found by its compose service label, so a service the
+  boot recreated under a new id is still the one stopped (and released).
 - **L2 — sshd.** Three failed banner probes 60 s apart, while memory is
   normal, restart `ssh`.
 - **Reboots are only recorded** (`would-have-rebooted`).
@@ -163,12 +168,18 @@ It depends on what the board can report, and the code decides from evidence:
 - A hardware watchdog reset is known **only if the firmware implements WDAT's
   status action**, in which case `/sys/class/watchdog/watchdog0/bootstatus`
   reports `WDIOF_CARDRESET` after the reset.
-- **Until the board has once reported `WDIOF_CARDRESET`**, a watchdog reset and
-  a power cut look the same, so **unexplained boots are counted** — power cuts
-  cost brake budget, which is the price of not being able to tell.
-- **The first time it does**, the classifier latches
-  `/var/lib/homehub-recovery/bootstatus-proven` and unexplained boots stop
-  counting: they are power cuts or hangs the firmware never saw.
+- **Until the SELECTED reset device has once reported `WDIOF_CARDRESET`**, a
+  watchdog reset and a power cut look the same, so **unexplained boots are
+  counted** — power cuts cost brake budget, which is the price of not being
+  able to tell.
+- **The first time a device does**, the classifier records that device's
+  kernel identity (`/sys/class/watchdog/<dev>/identity`, e.g. `wdat_wdt`) in
+  `/var/lib/homehub-recovery/bootstatus-proven`, and unexplained boots stop
+  counting **while the device `recovery.env` selects is one of those**.
+- **The proof is per device.** A fall-back to softdog (which can never report
+  a reset), the contain tier or the capability off all select a device with
+  no proof, so unexplained boots count again — retroactively within the 24 h
+  window, because the brake is recomputed from `boots.log` every time.
 
 The P4 expiry test is what answers this: after the test reset, run
 `homehub-recovery status` and read the D10 line.
@@ -207,8 +218,8 @@ The NagLight backup lane cannot show this yet (P5).
 - **A brake costs automatic recovery** for up to 24 h.
 - **A recovery can interrupt the library backup**, which then needs a person
   until FileBackup self-recovers its staging.
-- **The first boot of a fresh image** runs earlyoom with Debian's defaults for
-  the few minutes before firstboot converges it off (packages.list says why).
+- **A quarantined service starts for a few seconds on every boot**, between
+  firstboot's `docker compose up -d` and the enforcement right after it.
 - sshd's log gains one `[preauth]` connection every 60 s from the banner probe
   while the supervisor runs.
 
@@ -221,6 +232,7 @@ The NagLight backup lane cannot show this yet (P5).
 | `homehub-recovery disarm` | stop it with the watchdog verified closed |
 | `homehub-recovery reset-brake` | forget the counted boots so far |
 | `homehub-recovery release <service>` | undo a quarantine |
+| `homehub-recovery enforce-quarantine` | stop every quarantined service again (firstboot runs it each boot) |
 | `journalctl -t hub-pressure -o cat` | the pressure record |
 | `journalctl -t homehub-recoveryd` / `-t homehub-recovery-boot` | the supervisor / the classifier |
 

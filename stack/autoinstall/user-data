@@ -575,6 +575,20 @@ autoinstall:
     # Cockpit web console on :9090 — LAN-only (do NOT proxy it through Caddy to
     # the public internet). See ../../REMOTE_MANAGEMENT.md.
     - curtin in-target --target=/target -- systemctl enable cockpit.socket
+    # ---- 3c-oom. THE OPPOSITE FOR earlyoom: it SHIPS DISABLED (LLR-1018) ------
+    # Its postinst enables the
+    # unit, and an enabled earlyoom runs from the first boot with Debian's
+    # defaults - through firstboot's image load and Docker pulls, the heaviest
+    # minutes the box ever has - until step 6g converges it off, whatever
+    # HUB_WATCHDOG_ENABLED says. It is the hub recovery capability's backstop
+    # (C3, SR-050) and is opt-in like the rest: setup-recovery.sh enables and
+    # starts it only after converging ON. Guarded so an image baked before
+    # earlyoom joined packages.list still installs. validate_config.py check 6c.
+    - >-
+      curtin in-target --target=/target -- bash -c 'if [ -e /usr/lib/systemd/system/earlyoom.service ]; then
+      systemctl disable earlyoom.service || echo "homehub: WARN - could not disable earlyoom; it runs until firstboot 6g converges it off";
+      echo "homehub: earlyoom is opt-in - setup-recovery.sh enables it only when HUB_WATCHDOG_ENABLED=true";
+      else echo "homehub: earlyoom not in this image - nothing to disable"; fi'
 
     # ---- 3c-bis. THE PIECE THE LOCKED PASSWORD REQUIRES ----------------------
     # WITHOUT THIS THE BOX IS UNMAINTAINABLE OVER SSH, and that was true from the

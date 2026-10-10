@@ -4,7 +4,7 @@ The sampler runs against a fake procfs/cgroupfs/Docker tree; the CLI's
 systemctl and docker calls are substituted at its single `_run` seam so a
 test can see exactly what disarm and release ask the system to do.
 
-Implements: TC-1061..TC-1063, TC-1080, TC-1083 (see docs/test/test-cases.csv)
+Implements: TC-1061..TC-1063, TC-1080, TC-1083, TC-1084 (see docs/test/test-cases.csv)
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from recovery_harness import GiB, Tree, cid, load_script, rc
+from recovery_harness import REPO, GiB, Tree, cid, load_script, rc
 
 sampler = load_script("homehub_pressure_sample", "homehub-pressure-sample.py")
 cli = load_script("homehub_recovery_cli", "homehub-recovery")
@@ -212,6 +212,74 @@ def test_release_restores_the_policy_starts_it_and_tells_the_supervisor_tc1063(t
     assert ["docker", "start", cid(1)] in calls
     assert json.load(open(tree.paths.quarantine_file)) == {"quarantined": {}}
     assert open(tree.paths.released_file).read() == "immich-machine-learning\n"
+
+
+def _compose_ps(service, ids):
+    return (["docker", "ps", "-a", "-q", "--no-trunc",
+             "--filter", "label=com.docker.compose.service={}".format(service)],
+            (0, "\n".join(ids), ""))
+
+
+def test_a_boot_keeps_a_quarantined_service_stopped_after_compose_up_tc1084(tmp_path, monkeypatch):
+    """Review 2026-10-10: firstboot's `docker compose up -d` started it again.
+
+    The service was recreated under a new id by that `up` (a new image), so the
+    stop must find it by its compose label, not by the id the record holds.
+    A service with no current container falls back to the recorded id."""
+    tree = Tree(tmp_path)
+    tree.write(tree.paths.quarantine_file, json.dumps({"quarantined": {
+        "immich-machine-learning": {"container": cid(1), "restart": "unless-stopped"},
+        "old-hog": {"container": cid(3), "restart": "always"}}}))
+    calls = _fake_run(monkeypatch, [_compose_ps("immich-machine-learning", [cid(2)])])
+    assert cli.main(["--root", str(tmp_path), "enforce-quarantine"]) == 0
+    assert ["docker", "update", "--restart=no", cid(2)] in calls
+    assert ["docker", "stop", "-t", "10", cid(2)] in calls
+    assert ["docker", "stop", "-t", "10", cid(3)] in calls
+    assert ["docker", "stop", "-t", "10", cid(1)] not in calls, "stopped a stale id, not the running one"
+    # Nothing is released by enforcing: the record still names both.
+    assert set(json.load(open(tree.paths.quarantine_file))["quarantined"]) == {"immich-machine-learning",
+                                                                                "old-hog"}
+
+
+def test_enforcing_quarantine_names_a_stop_that_failed_tc1084(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    tree.write(tree.paths.quarantine_file, json.dumps(
+        {"quarantined": {"hog": {"container": cid(1), "restart": "unless-stopped"}}}))
+    _fake_run(monkeypatch, [(["docker", "stop"], (1, "", "daemon not answering"))])
+    assert cli.main(["--root", str(tmp_path), "enforce-quarantine"]) == 1
+
+
+def test_a_released_service_is_not_stopped_again_at_the_next_boot_tc1084(tmp_path, monkeypatch):
+    """The Owner's way out: release removes the entry, so enforcement leaves it."""
+    tree = Tree(tmp_path)
+    tree.write(tree.paths.quarantine_file, json.dumps(
+        {"quarantined": {"hog": {"container": cid(1), "restart": "unless-stopped"}}}))
+    _fake_run(monkeypatch, [_compose_ps("hog", [cid(2)])])
+    assert cli.main(["--root", str(tmp_path), "release", "hog"]) == 0
+    calls = _fake_run(monkeypatch, [_compose_ps("hog", [cid(2)])])
+    assert cli.main(["--root", str(tmp_path), "enforce-quarantine"]) == 0
+    assert not [c for c in calls if c[:2] in (["docker", "stop"], ["docker", "update"])]
+
+
+def test_release_starts_the_recreated_container_not_the_recorded_id_tc1084(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    tree.write(tree.paths.quarantine_file, json.dumps(
+        {"quarantined": {"hog": {"container": cid(1), "restart": "unless-stopped"}}}))
+    calls = _fake_run(monkeypatch, [_compose_ps("hog", [cid(2)])])
+    assert cli.main(["--root", str(tmp_path), "release", "hog"]) == 0
+    assert ["docker", "update", "--restart=unless-stopped", cid(2)] in calls
+    assert ["docker", "start", cid(2)] in calls
+
+
+def test_firstboot_enforces_quarantine_right_after_the_bulk_compose_up_tc1084():
+    """STATIC ORDER: the enforcement is the next command after `docker compose up -d`
+    and comes before anything else starts or judges containers."""
+    lines = [ln for ln in (REPO / "stack" / "autoinstall" / "firstboot.sh").read_text(
+        encoding="utf-8").splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    up = lines.index("docker compose up -d")
+    assert "quarantine.json" in lines[up + 1] and lines[up + 1].startswith("if ")
+    assert 'homehub-recovery" enforce-quarantine' in lines[up + 2]
+    assert "|| log" in lines[up + 3], "a failed enforcement must be logged, never fail the boot"
 
 
 def test_reset_brake_records_a_reset_the_brake_honours_tc1063(tmp_path, monkeypatch):

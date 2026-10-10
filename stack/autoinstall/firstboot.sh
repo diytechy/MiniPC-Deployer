@@ -1578,6 +1578,21 @@ fi
 log "docker compose up -d…"
 docker compose up -d
 
+# ── 4a-quarantine. A QUARANTINED SERVICE STAYS DOWN ACROSS A REBOOT (LLR-1016)
+# The recovery supervisor (6g) quarantines a service it had to kill twice in an
+# hour: `docker update --restart=no` + `docker stop`. That holds against dockerd,
+# but NOT against the line above - `compose up -d` starts every stopped service
+# whatever its restart policy - so on every boot the hog came back and ran while
+# `homehub-recovery status` still called it quarantined. Stop it again HERE,
+# immediately after the up, from the quarantine file alone (the supervisor may be
+# off). The Owner's way out is unchanged: `homehub-recovery release <service>`.
+# Called through python3 by path: the /usr/local/sbin symlink is made in 6g, and
+# ISO9660 drops the exec bit. Never fatal; a failure is named.
+if [ -f /var/lib/homehub-recovery/quarantine.json ] && [ -f "$STACK_DIR/recovery/homehub-recovery" ]; then
+    python3 "$STACK_DIR/recovery/homehub-recovery" enforce-quarantine 2>&1 | sed 's/^/  /' \
+        || log "WARN: a quarantined service could not be kept stopped - see the lines above"
+fi
+
 # ── 4a-post. DID THEY ACTUALLY STAY UP? ──────────────────────────────────────
 # `docker compose up -d` returns 0 once containers are STARTED. A container that
 # starts and then dies on its own configuration exits 0 here and restart-loops

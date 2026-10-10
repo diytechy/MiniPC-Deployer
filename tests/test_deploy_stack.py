@@ -457,23 +457,80 @@ def test_boot_copy_report_survives_a_payload_without_the_source(monkeypatch):
     assert by["/usr/local/sbin/powertune.sh"]["state"] == "no-source"
 
 
-def test_boot_copy_report_shows_before_and_after_a_firstboot_refresh_sr047():
-    """The review finding: the report kept the pre-firstboot 'stale' after a refresh."""
+def _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, first_read_fails):
+    """Drive the real main() through --apply --run-firstboot against a fake box.
+
+    Only the box is faked. The boot-copy reads go through the real
+    boot_copy_report(), with ssh answered from `box`; the fake firstboot
+    rewrites `box` the way the real one installs the copies. Returns the JSON
+    report main() wrote. `first_read_fails` makes the PRE-firstboot ssh read
+    fail, the transient case the second review named.
+    """
+    import json
+    fb = b"#!/usr/bin/env bash\necho firstboot new\n"
+    pt = b"#!/bin/bash\necho powertune new\n"
+    payload = {
+        "autoinstall/firstboot.sh": (_sha(fb), fb, True),
+        "autoinstall/powertune.sh": (_sha(pt), pt, True),
+    }
+    old = b"#!/bin/bash\necho old\n"
+    box = {"/usr/local/sbin/homehub-firstboot.sh": old,
+           "/usr/local/sbin/powertune.sh": old}
+    boot_reads = []
+
+    def fake_run(argv, **kw):
+        if argv[0] == "git":                      # the dirty-tree check
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        assert argv[0] == "ssh" and "/usr/local/sbin/powertune.sh" in argv[-1], argv
+        boot_reads.append(argv)
+        if first_read_fails and len(boot_reads) == 1:
+            return subprocess.CompletedProcess(argv, 255, "", "connection reset")
+        out = ["\t".join([dest, _sha(data), _sha(data.replace(b"\r\n", b"\n")), "755"])
+               for dest, data in box.items()]
+        return subprocess.CompletedProcess(argv, 0, "\n".join(out) + "\n", "")
+
+    def fake_firstboot(target, force):
+        box["/usr/local/sbin/homehub-firstboot.sh"] = fb
+        box["/usr/local/sbin/powertune.sh"] = pt
+        return 0
+
+    monkeypatch.setattr(ds.subprocess, "run", fake_run)
+    monkeypatch.setattr(ds, "build_payload", lambda rev, panel: (payload, []))
+    monkeypatch.setattr(ds, "remote_hashes", lambda t: {r: v[0] for r, v in payload.items()})
+    monkeypatch.setattr(ds, "classify_stale", lambda t, s, p: {})
+    monkeypatch.setattr(ds, "env_gap", lambda t, p: {"declared": 0})
+    monkeypatch.setattr(ds, "run_firstboot", fake_firstboot)
+    report = tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", ["deploy_stack.py", "--target", "hub@example",
+                                      "--apply", "--run-firstboot",
+                                      "--report", str(report)])
+    assert ds.main() == 0
+    return json.loads(report.read_text(encoding="utf-8"))
+
+
+def test_main_reports_the_boot_copies_as_firstboot_left_them_sr047(monkeypatch, tmp_path):
+    """The first review finding: the report kept the pre-firstboot 'stale' after a refresh."""
+    got = _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, first_read_fails=False)
+    assert [r["state"] for r in got["boot_copies"]] == ["current", "current"]
+    assert [r["state"] for r in got["boot_copies_before"]] == ["stale", "stale"]
+    assert [r["state"] for r in got["boot_copies_after"]] == ["current", "current"]
+
+
+def test_main_records_the_final_boot_copies_when_the_first_read_failed_sr047(monkeypatch, tmp_path):
+    """The second review finding: a transient ssh failure BEFORE firstboot must
+    not stop the final state being recorded."""
+    got = _run_main_with_a_firstboot_that_refreshes(monkeypatch, tmp_path, first_read_fails=True)
+    assert [r["state"] for r in got["boot_copies"]] == ["current", "current"]
+    assert "boot_copies_before" not in got
+    assert got.get("boot_copies_before_error") == "unreadable over ssh"
+    assert "boot_copies_error" not in got, "boot_copies_error must describe the FINAL state"
+
+
+def test_a_failed_re_read_is_never_reported_as_current_sr047():
+    """If the post-firstboot read fails, the report keeps the stale snapshot and names it."""
     before = [{"path": "/p", "expected_sha256": "n", "actual_sha256": "o",
                "mode": "755", "state": "stale"}]
-    after = [{"path": "/p", "expected_sha256": "n", "actual_sha256": "n",
-              "mode": "755", "state": "current"}]
-    result = {"boot_copies": before}
-    ds.record_boot_copies_after_firstboot(result, before, after)
-    assert result["boot_copies_before"][0]["state"] == "stale"
-    assert result["boot_copies_after"][0]["state"] == "current"
-    assert result["boot_copies"][0]["state"] == "current"
-    # A failed re-read must not be reported as current.
     result = {"boot_copies": before}
     ds.record_boot_copies_after_firstboot(result, before, None)
     assert result["boot_copies"][0]["state"] == "stale"
     assert "boot_copies_after_error" in result
-    # Firstboot not run (no snapshot): the report is untouched.
-    result = {}
-    ds.record_boot_copies_after_firstboot(result, None, after)
-    assert result == {}

@@ -35,6 +35,26 @@ The `/etc` unit file refresh is deferred (needs daemon-reload).
 
 NOT established: whether the isolation fence rules are *correct* (six iptables lines mention the lane; their content was not audited, nor was the `TC-1023..1041` set re-run against the live box); whether a request actually round-trips to the dev PC model; the value of `LITELLM_ENABLED` in `/opt/homehub/stack/.env` (that file is unreadable to the `hub` account without printing secrets, so the running state, not the knob, is the evidence); `llm-gateway`'s configuration, which is in a directory the `hub` account cannot list; when and by whom the lane was deployed beyond the container start time.
 
+**2026-10-09 — Wall capability contract: the Grok mark (branch
+`feat-ring-gauge-rail-capabilities`); gate G1 unchanged; nothing deployed.**
+OfficeWallNaglight's ring gauge rail (its WSN-076) bundles xAI's
+`vendor/brand/Grok_Logomark_Light.svg` and declares it under
+`progress-gauges-v1`, so `scripts/assert_wall_capabilities.py` now declares it
+in that capability (app and site) and admits it to the public-site inventory.
+**FINDING, pre-existing and NOT fixed here:** this contract was already out of
+step with OfficeWallNaglight `CameraOpt` before this change — seven
+capabilities absent (`audio-switch-v1`, `bus-pcm-bridge-v1`,
+`local-capabilities-v1`, `locked-gauges-v1`, `mutation-identity-v1`,
+`projectm-trial-v1`, `tracker-event-log-v1`), four declared differently
+(`panel-audio-v1`, `panel-tabs-v1`, `private-access-v1`, `sensors-v1`) and 27
+site files outside `ALLOWED_SITE_FILES` — so the image path that calls it
+(`vmtest/lib/common.sh` `assert_wall_artifact_contract` /
+`assert_coherent_wall_release`) refuses any current wall artifact with or
+without this change. Re-syncing it widens the public-site allow-list and is an
+Owner/reviewer decision, not a side effect of this one. HomeHub's paired panel
+release (`panel_release.py`) does not call this script. Tests: the four
+capability/release suites 355 passed, 3 skipped; `check.py --tier smoke` PASS.
+
 **2026-10-09 — Owner authorized Sure integration and default profile enablement.**
 Merged `sure-stack` into `IceDrive-DesktopDirection`; `sure` is selected by
 default in the deployer template and HomeHub materialization configuration.

@@ -515,7 +515,15 @@ if [ -n "${FILE_SHARE_BACKUP_STATE_URL:-}" ]; then
         hdr=(-H "Content-Type: application/json")
         [ -n "${NAGLIGHT_TOKEN:-}" ] && hdr+=(-H "Authorization: Bearer ${NAGLIGHT_TOKEN}")
         [ -n "${NAGLIGHT_USER:-}" ]  && hdr+=(-H "X-Forwarded-User: ${NAGLIGHT_USER}")
-        code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${hdr[@]}" -d "$body" "$FILE_SHARE_BACKUP_STATE_URL" 2>/dev/null || echo 000)"
+        # `|| echo 000` was WRONG and printed `000000`: on a connection failure
+        # curl writes its own `000` from -w AND exits non-zero, so the fallback
+        # APPENDED to it. Take curl's status separately; an empty capture and
+        # curl's `000` both mean "nothing answered". The timeouts bound a
+        # stalled tracker so it cannot hang the caller.
+        if ! code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 -X POST "${hdr[@]}" -d "$body" "$FILE_SHARE_BACKUP_STATE_URL" 2>/dev/null)"; then
+            code=""
+        fi
+        [ -n "$code" ] || code=000
         [ "$code" = "200" ] && log "file-share/backup state: reported shareHealth=$health" || log "file-share/backup state: report got HTTP $code"
     fi
 else

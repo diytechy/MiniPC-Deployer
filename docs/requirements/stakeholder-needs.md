@@ -114,7 +114,7 @@ Delete-only rows that genuinely cannot apply; others are marked n/a explicitly.
 | SN-001 | Startup→Runtime | Unattended run must never block on a prompt | Autoinstall is fully non-interactive; provisioning + first-boot are idempotent and non-interactive; failures exit nonzero and land in the journal. |
 | SN-001 | Runtime | Power loss / crash mid-operation | `restart: unless-stopped` + the idempotent first-boot unit reconverge on the next boot; Docker volumes persist state. |
 | SN-003 | Runtime | A non-allow-listed Google account tries to sign in | oauth2-proxy rejects it; the tracker never receives the request. |
-| SN-003 | Runtime | The tracker port is probed directly (bypass attempt) | The port is `expose`-only (bridge), never host-published; trusted headers are only honoured from oauth2-proxy. |
+| SN-003 | Runtime | The tracker port is probed directly (bypass attempt) | The port is network-reachable only through Caddy: `expose` (bridge) plus a single loopback-only host publish (`127.0.0.1:8787`), never on `LAN_IP`/`0.0.0.0`; trusted headers are only honoured from oauth2-proxy. |
 | SN-005 | Runtime | The Owner needs to fix a broken box remotely | SSH + Cockpit for live ops; the reimage ladder memo (`REMOTE_MANAGEMENT.md`) covers the worst case — nothing destructive is enabled without the Owner's checkbox. |
 | SN-002 | Runtime | The hub box goes down | Burn-in checklist requires picking a secondary/failover DNS so an outage degrades gracefully rather than killing LAN resolution. |
 | SN-005 | Runtime | Reimage-over-LAN is inherently destructive on an ambiguous target | HIGH-RISK: the memo presents options with checkboxes; no GRUB-reinstall/PXE/wipe path is implemented until the Owner ratifies one. |

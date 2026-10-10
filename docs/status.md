@@ -48,6 +48,164 @@ Evidence at the first build: 82 recovery pytest cases pass on Windows (Python 3.
 
 Next action: Owner review of the deviations above (D11 is accepted), then lab L-13 before P1 ships; the lab must also exercise the verified disarm on softdog (L-11, L-12, and full -> contain on a running VM). Active gate remains G1.
 
+**2026-10-09 — boot copies of firstboot now refresh themselves (FOLLOWUPS A7 bullet 1).**
+`firstboot.sh` step 1a installs `homehub-firstboot.sh` and `powertune.sh` from the
+`/opt` tree on every run; `deploy_stack.py` reports (read-only, never fails the run)
+whether each boot copy is `current`, `stale`, `stale-line-endings` or `missing`,
+using an exact sha256. Design: `docs/design/firstboot-boot-copy-refresh-2026-10-09.md`
+(revised after review). Evidence: `tests/test_deploy_stack.py` 24 passed, mutations
+on the ordering, gate and CRLF checks each turned their test red. Under LLR-992;
+no new TC id added.
+NOT PROVEN: not run on the hub. The first `--run-firstboot` after delivery is what
+converges the boot copies; the hub's current sbin copies are unmeasured until then.
+The `/etc` unit file refresh is deferred (needs daemon-reload).
+
+**2026-10-09 — Record: the private LLM lane IS deployed and running (supersedes the "Not deployed" line in the 2026-09-19 entry below).** Established by a read-only SSH session to the hub on 2026-10-09 ~21:30 UTC (`docker ps`/`docker inspect`/`systemctl`/`sha256sum`; no secret, env value or key was printed, env names only). Gate unchanged (G1); nothing was changed on the hub or deployed by this entry.
+
+* **litellm** container running, healthy, 0 restarts, started 2026-09-19 17:58 UTC. Image `ghcr.io/berriai/litellm@sha256:d295634e…b044b` (pin file says `v1.101.0`, pinned 2026-09-19; the digest matches `stack/litellm/litellm-image.pin`). Attached to the `stack_llmprivate` network only.
+* **llm-gateway** (the separate FreeLLMAPI gateway) running, healthy, 0 restarts, started 2026-09-19 17:58 UTC. Image `ghcr.io/tashfeenahmed/freellmapi@sha256:04ce170a…870fe`; networks `stack_default` and `stack_llmprivate`.
+* **homehub-litellm.service** and **homehub-llm-isolation.service**: both enabled and `active (exited)` (RemainAfterExit oneshots, as designed).
+* **Deployed files match the repo byte for byte** (sha256 equal on the hub and in this tree): `stack/litellm/config.yaml`, `devpc_hold_hook.py`, `litellm-image.pin`, `stack/llm-isolation/llm-isolation.sh`.
+* **The dev-PC hold is OFF as designed**: `DEVPC_WAKE_URL` is present in the container but empty (`DEVPC_HOLD_CAP_SECONDS` is set). So a cold dev PC fails fast rather than waiting.
+* **Spine unchanged:** SR-047 is still `Draft`; deployment is not ratification. The "Next action" in the 2026-09-19 entry (Owner ratification of the SR-047 rows) has not been shown to be done by anything here.
+
+NOT established: whether the isolation fence rules are *correct* (six iptables lines mention the lane; their content was not audited, nor was the `TC-1023..1041` set re-run against the live box); whether a request actually round-trips to the dev PC model; the value of `LITELLM_ENABLED` in `/opt/homehub/stack/.env` (that file is unreadable to the `hub` account without printing secrets, so the running state, not the knob, is the evidence); `llm-gateway`'s configuration, which is in a directory the `hub` account cannot list; when and by whom the lane was deployed beyond the container start time.
+
+**2026-10-09 — Wall capability contract: the Grok mark (branch
+`feat-ring-gauge-rail-capabilities`); gate G1 unchanged; nothing deployed.**
+OfficeWallNaglight's ring gauge rail (its WSN-076) bundles xAI's
+`vendor/brand/Grok_Logomark_Light.svg` and declares it under
+`progress-gauges-v1`, so `scripts/assert_wall_capabilities.py` now declares it
+in that capability (app and site) and admits it to the public-site inventory.
+**FINDING, pre-existing and NOT fixed here:** this contract was already out of
+step with OfficeWallNaglight `CameraOpt` before this change — seven
+capabilities absent (`audio-switch-v1`, `bus-pcm-bridge-v1`,
+`local-capabilities-v1`, `locked-gauges-v1`, `mutation-identity-v1`,
+`projectm-trial-v1`, `tracker-event-log-v1`), four declared differently
+(`panel-audio-v1`, `panel-tabs-v1`, `private-access-v1`, `sensors-v1`) and 27
+site files outside `ALLOWED_SITE_FILES` — so the image path that calls it
+(`vmtest/lib/common.sh` `assert_wall_artifact_contract` /
+`assert_coherent_wall_release`) refuses any current wall artifact with or
+without this change. Re-syncing it widens the public-site allow-list and is an
+Owner/reviewer decision, not a side effect of this one. HomeHub's paired panel
+release (`panel_release.py`) does not call this script. Tests: the four
+capability/release suites 355 passed, 3 skipped; `check.py --tier smoke` PASS.
+
+**2026-10-09 — Owner authorized Sure integration and default profile enablement.**
+Merged `sure-stack` into `IceDrive-DesktopDirection`; `sure` is selected by
+default in the deployer template and HomeHub materialization configuration.
+Actual remains running and Finance-Auditor retains `DATA_SOURCE=actual`.
+Gate remains G1; this is local configuration, not deployment or runtime acceptance.
+Normal Sure secret preparation and the Finance-Auditor empty-as-absent image fix
+must precede delivery. Validation results follow in the session audit entry.
+
+
+**2026-10-09 — Sure phase-1 review round 1; active gate G1 unchanged.**
+Right-base merge `91cd3a2` retains the admin portal and Tailscale exit-node
+changes. Review fixes add loud optional-container skips, explicit version pins,
+consistent default hostnames/Caddy logging, and corrected cross-repo and recovery
+contracts. [Sure enablement and source evidence](../stack/sure/README.md) is the
+review artifact. No gate advanced; nothing deployed or pushed. Next: Claude
+re-review, then Owner activation and restore/key-escrow acceptance; FA image dependency blocks rollout.
+
+**Merge-order blocker:** these FA Compose env mappings must not reach the hub
+until FA's empty-as-absent fix for TRACKER_FEED_USER, SURE_API_KEY, SURE_URL and
+DATA_SOURCE is in the FA image the hub builds. Current FA rejects the blank
+feed user even on Actual. Static wiring/default checks do not prove runtime
+compatibility. No Finance-Auditor file was edited.
+
+Review commits: MiniPC merge `91cd3a2`, optional backup skip `faa6f34`, final
+wiring/pins/contracts `9dad6e8`;
+HomeHub `48f6e66` corrects minting/restore dependencies and case-sensitive profile
+handling. The working-copy ending fix produced no content change: requested
+HomeHub files match committed LF/BOM conventions. ExpectedOptionalAbsent keeps
+the generated keys listed because Prep has not run since schema addition;
+reasons now explicitly require removal once Prep has minted them. Optional does
+not suppress that unattended minting. No Prep/mint/export was performed here.
+
+Final checks: config validation ALL CONFIG CHECKS PASSED; full Python3.12 pytest
+2487 passed / 30 skipped / 8 warnings in210.05s; smoke RESULT: PASS, 229 passed /
+4 skipped / 2284 deselected in7.94s. Targeted Sure pytest 16 passed; mock-Docker
+full backup pipeline 8 PASS 0 FAIL. HomeHub before:
+188 discovered / 178 passed / 9 failed / 1 skipped in107.59s; after identical
+counts in108.44s; final committed-stack after-check again 178/9/1 in108.3s.
+The earlier two extra failures were caused by the old local
+MiniPC base, not by a wrong brief: corrected by this merge. Same nine known
+failures (AdminAuthCookieSecret; LitellmMasterKey; two LabRunner; five switch
+matrix). ScriptAnalyzer unchanged 1 warning + 2 informational; edited PowerShell
+parses and privacy gates pass. All three touched shells pass bash -n; edited
+shell/Python files are LF. Trace:25 pre-existing orphans / integrity0; docs:
+0 broken links with6 existing orphan-doc warnings. Python3.12 emits8 existing
+Pandora tar extraction deprecation warnings; no test failures.
+
+Owner acceptance items (one decision each; source paths are at pinned Sure):
+
+- Accept `api.github.com` loopback: only the What's new/release-highlight UI loses fetching; no env off switch (pages_controller.rb:90; release_highlights_controller.rb:7; provider/github.rb:18,27,66).
+- Bootstrap first household account then enable invite-only, leaving default-family ID blank to require codes; open is the env default and saved settings win (app/models/setting.rb:201-207,226-236; app/controllers/concerns/invitable.rb:9-17).
+- NEVER ROTATE SECRET_KEY_BASE; preserve exact key through canonical DPAPI store, protected install .env/ISO and existing encrypted-vault export before ledger use; encrypted-column restores require it (config/initializers/active_record_encryption.rb:23-36; HomeHub SECRET_HANDOFF.md).
+- Accept live attachment copies without alignment to the SQL dump; no quiesce is configured (stack/docker-compose.yml sure_storage; existing backup volume source; HomeHub storage-map.md).
+
+Judgments/limits: current household Caddy sites are live from day one; no
+profile-to-site gate exists. Sure's site requests a real certificate while its
+profile is off and returns LAN 502; WAN remains 403. Optional missing/stopped
+Postgres skips are explicitly nonfatal, unlike required path/volume missing
+sources: other backups and retention finish. No fresh ledger is claimed. This
+also means history is not frozen; same-day daily replacement/ordinary retention
+can remove prior ledger archives. Preserve a verified archive/key before long
+term disablement. Running dump or Docker query failures remain fatal.
+
+Spine stays Draft: SR-060..066, LLR-1040..1046, TC-1100..1117, IF-030..034;
+review adds TC-1115..1117 for missing/stopped/query-failure boundaries. CSV
+prose corrected line by line; TC-1114 placed in order and edited rows re-read.
+Original full WSL hermetic attempts were NOT green (unrelated unchanged suites; corrected attempt hit240s). That
+aggregate was not proven; the Sure mock pipeline ran independently in Ubuntu.
+Python3.8 cannot run imported upstream Tailscale tests using Path.write_text's
+newline parameter. Python3.12 with existing Python3.8 site-packages runs those
+checks (20 passed / 1 skipped); no dependency install or source workaround.
+
+**NOT proven:** hub/panel startup, any actual image executable/probe, TLS/Caddy
+adaptation, own login/invites, bank sync, FA blank handling/API/read scope,
+runtime telemetry absence, real pg_dump or restore, SQL/attachment consistency,
+key escrow/export, or full HomeHub materialisation. Nothing deployed, pulled,
+run in Docker, contacted on a box, pushed, or secret-minted/printed. Classic
+Docker image-store save/load of tag@digest drops RepoDigests; if sure is baked,
+payload loading and digest-reference resolution still require Owner acceptance.
+
+**2026-10-09 - `/sleep-verdict` binding fixed in source (SR-044 / LLR-978).**
+On `fix-sleep-verdict-binding`, cut from `IceDrive-DesktopDirection` as requested;
+`sure-stack` is unchanged. `main()` now calls `bind_session_reader(cfg)`, which
+wraps the configured zero-argument session probe in `staticmethod`. The prior
+explanatory comment is retained with an added descriptor-binding explanation.
+Real Handler loopback GET tests cover a fresh detached reading (200 JSON permit)
+and None (200 JSON deny, fail-closed to attached), using the production helper.
+
+Evidence (actual output):
+
+```text
+python -m pytest -q tests/test_devpc_wake.py
+28 passed in 1.09s
+python scripts/validate_config.py
+ALL CONFIG CHECKS PASSED
+mutation: restore the plain lambda assignment, run the two HTTP cases
+2 failed, 26 deselected in 1.21s
+MUTATION CHECK PASS: both HTTP cases reject the original binding TypeError
+python scripts/check.py
+2413 passed, 30 skipped in 218.48s (0:03:38)
+Traceability: SN=33 SR=47 LLR=94 TC=148 orphans=25 integrity=0
+check_docs: OK - 20 doc(s), 66 intra-repo link(s), 0 broken (6 orphan warning(s)).
+RESULT: PASS
+```
+
+The fixed source was restored after mutation. Both changed Python files are LF;
+`git diff --check` passed. README Known defects now records the source fix dated
+2026-10-09. HomeHub is unchanged: FOLLOWUPS A6's Phase 0 TypeError item should
+be marked source-fixed / live verification pending, and A2's earlier wiring
+note should acknowledge the binding correction. No Owner policy decision was
+made. No push or deployment. Active gate remains G1; no gate advanced.
+Next action awaiting Owner authorization: deploy this source fix and verify the
+live endpoint. NOT PROVEN: live hub response, real session-agent integration,
+and physical dev-PC sleep/wake behavior.
+
 **2026-09-19 — Draft, nine review rounds complete, Owner ratification pending: two LLM lanes, one of which cannot reach a cloud provider (SN-043/SN-044/SR-047 and SR-044's last piece; LLR-985..991; TC-1023..1041).** One OpenAI-compatible proxy with exactly one deployment, no cloud credential and no database, plus a hold hook that waits while the dev PC wakes. Nine rounds with codex gpt-5.6-terra (medium) produced 31 findings; 30 were accepted and one was rejected with the rejection confirmed in a later round.
 
 * **The property this lane exists for was CLAIMED AND WAS FALSE, and that is the finding the whole design turns on.** The first version argued the container could not reach a cloud provider because it holds no cloud credential and names no cloud endpoint. Measured against the pinned digest rather than inferred: the proxy serves 618 routes of which 32 are provider pass-throughs registered independently of `model_list`, and the Vertex handler FORWARDS CALLER-SUPPLIED CREDENTIALS when the proxy has none of its own — its own log line says so. A probe carrying an `x-goog-api-key` made the container open a connection to `aiplatform.l.rep.googleapis.com:443`. **The credential can arrive in the request**, so its absence from the config was never a boundary. The boundary is now `stack/llm-isolation/`, below the application, and `allowed_routes` is documented as defence-in-depth rather than the control.
@@ -2542,3 +2700,28 @@ new; **IF-015** amended; **TC-013**, **TC-014** extended.
 packages. Largely UNTESTED against real hardware — everything needing a Bluetooth
 headset in the room waits on HomeHub open-items **C75**. Standing document:
 HomeHub `docs/FOLLOWUP_BLUETOOTH_ACCEPTANCE_2026-09-19d.md`.
+
+## 2026-10-09 — Sure merge and default enablement verification
+
+Owner authorized merging sure-stack and selecting its profile by default.
+The merge was conflict-free. The default remains reversible by removing sure
+from COMPOSE_PROFILES in both the template and HomeHub materialization config.
+Finance-Auditor retains actual; no runtime cutover or deployment occurred.
+
+Validation: revised default-profile test failed before the config edit, then
+all 16 focused Sure stack/backup pytest cases passed using Git Bash.
+python scripts/validate_config.py passed; python scripts/check.py --tier smoke
+passed at G1 (229 passed, 4 skipped, 2284 deselected; registry integrity=0,
+existing orphan baseline=25; no broken doc links, 6 orphan doc warnings).
+All five merged shell files passed bash -n. The standalone postgres-source shell
+suite could not run in Git Bash because rsync is missing; no pass is claimed.
+HomeHub Pester: 183 passed, 4 failed, 1 skipped. Sure cross-repo contracts pass;
+remaining failures are the absent LitellmMasterKey omission record and three
+launcher checks blocked by stale panel build artifacts. ScriptAnalyzer retains
+one warning and two informational findings in unchanged lab code.
+
+Not proven: running Sure startup, database migrations, household accounts,
+provider sync, real ledger dump/restore, offline image digest loading, or
+Finance-Auditor runtime compatibility. Normal secret preparation, protected
+SureSecretKeyBase escrow, and the FA empty-as-absent image fix precede deployment.
+No push, live machine contact, secret generation, or gate advancement.

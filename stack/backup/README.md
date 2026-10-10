@@ -29,6 +29,13 @@ The rest of this document is the bash service; the container's half is
 
 # AWOW bash backup service (WI-10.10)
 
+Sure adds a `postgres:CONTAINER` logical source (SR-065, LLR-1045) to this
+pipeline. It uses the running database image's pg_dump and pg_restore tools;
+no raw PGDATA copy. See [Sure's backup contract](../sure/README.md#secrets-and-acceptance)
+for LAN-only storage, profile activation, failure handling and unproven restore
+acceptance. The timer, mount preflight, archive/hash/manifest and retention are
+the existing machinery; no separate cron or backup container is introduced.
+
 The homelab's main backup, running on the hub box as **pure bash + systemd**.
 This service has no `.bat`/`.ps1` in it and is not going to grow any — but note
 the rule it was written under **changed on 2026-08-09**: HOMELAB_TOPOLOGY.md
@@ -64,7 +71,7 @@ leg added 2026-08-09 covers what only exists across runs.
 | 4 | **target** — `BACKUP_LAYOUT=flat`: the archives land in `BACKUP_TARGET` itself, one current copy, no retention (a `--plan` run gets one `plan_latest` slot). `BACKUP_LAYOUT=dated`: a `run_<UTC>` snapshot with `BACKUP_KEEP` retention, and `plan_<UTC>` on its own `BACKUP_PLAN_KEEP` budget. See [Layout](#layout--dated-vs-flat-2026-09-01) | `backup.sh` |
 | ~~5~~ | **offsite — DELETED 2026-08-09.** The service stages nothing offsite; the IceDrive client syncs library paths directly. `OFFSITE_PATH` / `OFFSITE_UNC` / `OFFSITE_SETS` are still recognised and now **refuse the run** rather than being ignored | — |
 | 0 | **target preflight** — refuse to run unless a real mount *carries* `BACKUP_TARGET` (and is not `ro`); posts `ok=false` and exits 1 if not. The target may be the mountpoint itself or a folder on it, so the check walks up; landing on `/` means no data drive is there. Zero disk I/O, so it never wakes a parked drive | `backup.sh` + `common.sh` `enclosing_mountpoint` |
-| 6 | **report** — POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9) | `common.sh` `feed_naglight` |
+| 6 | **report** — ~~POST NagLight `/api/feed`; **never-silent-green** (failure → `ok=false` + nonzero exit) — the ERR trap **and** every `die` path (OI-9)~~ **Now a no-op (corrected 2026-10-09):** `feed_naglight` only logs "legacy config-backup feed suppressed" and returns 0; this config-archive service now posts nothing to the panel. File-share/backup state (IF-006, `/api/backup-state`) is posted by `library-backup.sh`, not by this service | `common.sh` `feed_naglight` |
 
 ## Layout — `dated` vs `flat` (2026-09-01)
 

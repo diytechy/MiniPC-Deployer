@@ -191,6 +191,59 @@ The honest ledger of what has and has not been exercised is
 
 ## Runtime flows
 
+### Sure beside Actual and the nightly logical ledger dump (SR-060, SR-065, LLR-1040, LLR-1045)
+
+The `sure` profile is selected by default per Owner direction 2026-10-09;
+removing it opts out. Database/cache have only the
+internal network; Rails retains provider egress. FA still chooses Actual.
+Backup-source generation includes Sure only with the selected profile; logical
+dump tooling remains inside the matching database image. No gate or deployment
+is implied by this authored flow.
+
+```mermaid
+sequenceDiagram
+    participant Owner
+    participant Caddy
+    participant Web as sure-web
+    participant Worker as sure-worker
+    participant DB as sure-postgres
+    participant Redis as sure-redis
+    participant FA as finance-auditor
+    participant Backup as homehub-backup.timer / backup.sh
+    participant Drive as LAN backup-drive/config-history
+    Note over Web,Drive: SR-060, SR-065, LLR-1040, LLR-1045
+    Note over Web,Redis: All four services profile sure; no host ports
+    Owner->>Caddy: TLS household app request
+    alt source outside LAN_CIDR
+        Caddy-->>Owner: 403
+    else LAN source
+        Caddy->>Web: HTTP request, no trusted identity injection
+        Web->>DB: Own-login ledger operation
+        Web->>Redis: Enqueue background job
+        Worker->>Redis: Read job
+        Worker->>DB: Provider sync result
+        Web-->>Owner: Sure household session
+    end
+    Note over FA,Web: DATA_SOURCE remains actual; future read-only Sure URL internal
+    Backup->>DB: Query exact container name and state
+    alt missing or stopped optional container
+        Backup-->>Backup: Loud SOURCE MISSING, SET SKIPPED; no fresh ledger
+        Backup->>Drive: Continue other sets and ordinary retention (history not frozen)
+    else Docker query failure
+        Backup-->>Backup: Fail run; no rotation of previous good copy
+    else running container
+        Backup->>DB: pg_dump custom format through container exec
+        DB-->>Backup: Logical dump stream
+    alt failed, empty or invalid dump / TOC
+        Backup-->>Backup: Fail run; no rotation of previous good copy
+    else validated structure
+        Backup->>Drive: Existing archive + checksums + manifest
+        Backup->>Drive: Existing daily/Fibonacci retention
+    end
+    end
+    Note over Backup,Drive: NEVER-OFFSITE; structural checks are not a restore
+```
+
 Hand-authored sequence diagrams of the behaviour that is easiest to misread
 from registry rows (process.md §3). Each cites the ids it renders.
 

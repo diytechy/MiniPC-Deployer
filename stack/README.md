@@ -1,5 +1,8 @@
 # AWOW AK41 always-on core — deploy stack
 
+Sure's dormant household-finance profile and source audit are documented in
+[sure/README.md](sure/README.md). Actual stays running until a later cutover.
+
 Zero-manual-config, always-on box image for the **AWOW AK41** (Celeron J4125,
 8 GB, x86). Flash a USB → boot the hub → the whole stack comes up on its own.
 Migrated from `life-tracker/deploy/` (WI-10.1); NagLight is now the source of the
@@ -688,3 +691,8 @@ is never involved in validation.** Checked against Caddy's docs and source
   (`scripts/validate_config.py`); every `{$VAR}` in the Caddyfile is passed by
   the caddy service's environment; all files referenced by compose/autoinstall
   exist. See `../docs/status.md` for the full validation ledger.
+
+Sure is selected in the default template by Owner direction 2026-10-09.
+HomeHub also selects it during materialization. Prepare its secrets before
+build/deploy; Actual and the bridge Actual data source remain available.
+See [Sure deployment prerequisites](sure/README.md).

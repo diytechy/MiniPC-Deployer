@@ -217,6 +217,9 @@ main() {
     ensure_zone "$TOKEN"
     add_a "$TOKEN" "${TRACKER_SUBDOMAIN}.${DOMAIN}" "$LAN_IP"
     add_a "$TOKEN" "${ACTUAL_SUBDOMAIN}.${DOMAIN}"  "$LAN_IP"
+    # Dormant Sure site still needs the LAN answer when the Owner enables it.
+    # Implements: SR-062, LLR-1042.
+    add_a "$TOKEN" "${SURE_SUBDOMAIN:-sure}.${DOMAIN}" "$LAN_IP"
     add_a "$TOKEN" "dns.${DOMAIN}"                   "$LAN_IP"
     # Apex → LAN IP too, so the bare domain works on-LAN.
     add_a "$TOKEN" "${DOMAIN}"                       "$LAN_IP"

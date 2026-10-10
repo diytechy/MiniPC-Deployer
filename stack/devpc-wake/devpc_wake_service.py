@@ -182,6 +182,28 @@ def read_session(url, timeout):
     return doc if isinstance(doc, dict) else None
 
 
+def bind_session_reader(cfg):
+    """Bind the configured session probe for HTTP handler instances.
+
+    Contract:
+      Inputs: cfg: Config, providing session_url (str) and probe_timeout (seconds).
+      Outputs: None; assigns Handler.session_reader for subsequent requests.
+      Config: DEVPC_SESSION_URL and DEVPC_PROBE_TIMEOUT_SECONDS (Config).
+      Raises: AttributeError if cfg lacks either required field.
+    Implements: SR-044, LLR-978
+    """
+    # WITHOUT THIS BINDING the reader stayed None forever and every sleep verdict
+    # was "session signal unavailable - treated as attached". That fails closed,
+    # so nothing broke and nothing complained - the dev PC simply never slept,
+    # and the reason was invisible because the fail-closed message is also what
+    # a genuinely-unreachable agent produces. cfg.session_url was being read
+    # from the environment and then discarded.
+    # A plain function on the class binds self when called through a handler.
+    # Keep this zero-argument probe static so GET /sleep-verdict can call it.
+    Handler.session_reader = staticmethod(
+        lambda: read_session(cfg.session_url, cfg.probe_timeout))
+
+
 def main():
     cfg = Config()
     if not cfg.host:
@@ -191,13 +213,7 @@ def main():
 
     Handler.service = svc
     Handler.publisher = pub
-    # WITHOUT THIS LINE the reader stayed None forever and every sleep verdict
-    # was "session signal unavailable - treated as attached". That fails closed,
-    # so nothing broke and nothing complained - the dev PC simply never slept,
-    # and the reason was invisible because the fail-closed message is also what
-    # a genuinely-unreachable agent produces. cfg.session_url was being read
-    # from the environment and then discarded.
-    Handler.session_reader = lambda: read_session(cfg.session_url, cfg.probe_timeout)
+    bind_session_reader(cfg)
     if not cfg.session_url:
         print("devpc-wake: DEVPC_SESSION_URL is empty - sleep will NEVER be "
               "permitted (fail-closed to attached). This is correct until the "

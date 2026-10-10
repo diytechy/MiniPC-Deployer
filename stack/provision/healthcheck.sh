@@ -83,10 +83,12 @@ else echo "SKIP dig not installed"; fi
 # a PASS:
 #
 #   http://LAN_IP:8787/api/today
-#       :8787 is bridge-only and deliberately NOT published on the host (D2).
-#       verify-hub.sh asserts exactly that: "tracker :8787 is not published on
-#       the host (bridge-only, as D2 requires)". Connection refused is the
-#       CORRECT result, so this probe can never succeed.
+#       :8787 is bridge-only on the network and deliberately NOT published on
+#       the LAN_IP (D2); the only host publish is 127.0.0.1:8787 (SR-004).
+#       HomeHub's scripts/verify/verify-hub.sh asserts that, as the pass
+#       "tracker :8787 is not published beyond loopback (bridge and 127.0.0.1
+#       only, as D2 requires)". Connection refused on LAN_IP is the CORRECT
+#       result, so this probe can never succeed.
 #
 #   https://tracker.DOMAIN/api/today
 #       goes through Caddy to oauth2-proxy, which answers an unauthenticated

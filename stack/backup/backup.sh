@@ -987,6 +987,28 @@ for line in "${SOURCE_LINES[@]}"; do
     stage="$STAGING/$name"
     rm -rf "$stage"; mkdir -p "$stage"
     case "$(source_kind "$src")" in
+        postgres)
+            # Logical dump, not a live PGDATA filesystem copy. The matching
+            # image supplies the tools. Normal archive/hash/manifest/retention
+            # and failure reporting below remain the single backup pipeline.
+            # Implements: SR-065, LLR-1045.
+            chmod 0700 "$stage"
+            log "[$name] logical Postgres dump from ${src#postgres:} (LAN-only)"
+            dump_rc=0
+            postgres_dump "${src#postgres:}" "$stage/ledger.dump" || dump_rc=$?
+            case "$dump_rc" in
+                0) ;;
+                2)
+                    # This source is optional when its Compose profile is off.
+                    # Unlike required path/volume sources, do not mark the night
+                    # red: other sets and their normal retention must finish.
+                    warn "[$name] SOURCE MISSING, SET SKIPPED: Postgres container ${src#postgres:} absent or stopped; NO fresh ledger backup"
+                    rm -rf "$stage"
+                    continue
+                    ;;
+                *) FAIL_NOTE="logical Postgres dump failed for $name"; false ;;
+            esac
+            ;;
         cifs)
             mp="$(mktemp -d)"
             mount_cifs "$src" "$mp" ro
@@ -1080,7 +1102,7 @@ for line in "${SOURCE_LINES[@]}"; do
             rsync_pull "$dir/" "$stage/" || { FAIL_NOTE="rsync pull failed for $name"; false; }
             ;;
         *)
-            die "bad BACKUP_SOURCES spec for '$name': '$src' (want //host/share | volume:VOL[@CONTAINER] | path:/abs/dir)"
+            die "bad BACKUP_SOURCES spec for '$name': '$src' (want //host/share | volume:VOL[@CONTAINER] | postgres:CONTAINER | path:/abs/dir)"
             ;;
     esac
 

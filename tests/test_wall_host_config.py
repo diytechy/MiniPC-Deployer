@@ -1,7 +1,12 @@
 """SR-017: renderer secrets originate only in the panel's private host file."""
 import importlib.util
+import os
+import shutil
 import stat
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "stack/autoinstall/wall/render-wall-host-config.py"
@@ -203,3 +208,44 @@ def test_firstboot_creates_the_panel_owned_local_state_directory():
     # on every boot and the panel sits masked and unavailable.
     firstboot = (SCRIPT.parent / "wall-firstboot.sh").read_text(encoding="utf-8")
     assert "install -d -o panel -g panel -m 0700 /var/lib/wall-panel" in firstboot
+
+
+# ── FOLLOWUPS B8 item 2: the touch-filter adaptive trial survives a boot ────
+# kiosk.env is regenerated from a whitelist on every firstboot, so a hand-added
+# line is dropped. These run the real kiosk.env block through bash, which is the
+# only check that would notice the emitted line going missing or going
+# unconditional.
+_KIOSK_BLOCK_CASES = [
+    ("1", True),
+    (None, False),
+    ("0", False),
+    ("true", False),
+    ("yes", False),
+]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required to render kiosk.env")
+@pytest.mark.parametrize("value,expected", _KIOSK_BLOCK_CASES)
+def test_touch_trial_reaches_kiosk_env_only_when_wall_env_is_exactly_one(tmp_path, value, expected):
+    lines = (SCRIPT.parent / "wall-firstboot.sh").read_text(encoding="utf-8").split("\n")
+    start = lines.index("KIOSK_ENV=/etc/wall-panel/kiosk.env") + 1
+    assert lines[start] == "{"
+    end = lines.index('} > "$KIOSK_ENV"', start)
+    block = "\n".join(lines[start:end + 1]).replace('"$KIOSK_ENV"', '"kiosk.env"')
+    env = dict(os.environ)
+    env.pop("PANEL_TOUCH_ADAPTIVE_TRIAL", None)
+    if value is not None:
+        env["PANEL_TOUCH_ADAPTIVE_TRIAL"] = value
+    done = subprocess.run(["bash", "-c", "WALL_HOST_CONFIG=/x\n" + block + "\n"],
+                          capture_output=True, text=True, cwd=str(tmp_path), env=env)
+    assert done.returncode == 0, done.stderr
+    rendered = (tmp_path / "kiosk.env").read_text(encoding="utf-8").split("\n")
+    assert ("PANEL_TOUCH_ADAPTIVE_TRIAL=1" in rendered) is expected
+    assert not any(line.startswith("PANEL_TOUCH_ADAPTIVE_TRIAL=") and line != "PANEL_TOUCH_ADAPTIVE_TRIAL=1"
+                   for line in rendered)
+
+
+def test_touch_trial_is_commented_out_in_the_example_so_it_is_off_by_default():
+    env_lines = (SCRIPT.parent / "wall.env.example").read_text(encoding="utf-8").split("\n")
+    assert "# PANEL_TOUCH_ADAPTIVE_TRIAL=1" in env_lines
+    assert not any(line.startswith("PANEL_TOUCH_ADAPTIVE_TRIAL=") for line in env_lines)

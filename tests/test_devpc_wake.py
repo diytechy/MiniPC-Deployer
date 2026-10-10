@@ -9,9 +9,11 @@ wrong, and each one is named after the distinction rather than the function, so
 a failure says what broke rather than where.
 """
 import importlib.util
+import json
 import sys
 import threading
 import time
+from http.client import HTTPConnection
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,11 @@ def _load():
 
 
 dw = _load()
+
+_service_spec = importlib.util.spec_from_file_location(
+    "devpc_wake_service", _SRC.with_name("devpc_wake_service.py"))
+dws = importlib.util.module_from_spec(_service_spec)
+_service_spec.loader.exec_module(dws)
 
 
 class _Cfg:
@@ -484,3 +491,99 @@ def test_a_verified_residency_expires_so_an_evicted_model_is_noticed_sr044(
     svc._test_clock["now"] += 121        # past ready_ttl_seconds
     assert svc.state()["state"] == "up", \
         "a stale verification must not keep claiming ready"
+
+
+# --- TC-995 + TC-1014 + TC-1016: production HTTP binding -------------------
+@pytest.mark.parametrize("session, permit, reason", [
+    ({"attached": False, "observed_at": 1000.0}, True,
+     "idle elapsed and no session attached"),
+    (None, False, "session signal unavailable - treated as attached"),
+])
+def test_sleep_verdict_http_uses_the_production_session_binding_sr044(
+        svc, monkeypatch, session, permit, reason):
+    """Drive IF-026 through Handler, including descriptor binding and JSON I/O."""
+    cfg = dws.Config({"DEVPC_SESSION_URL": "http://session.invalid/session",
+                      "DEVPC_PROBE_TIMEOUT_SECONDS": "0.25"})
+    calls = []
+
+    def read_session(url, timeout):
+        calls.append((url, timeout))
+        return session
+
+    monkeypatch.setattr(dws, "read_session", read_session)
+    monkeypatch.setattr(dws.Handler, "service", svc)
+    monkeypatch.setattr(dws.Handler, "last_request", [
+        svc._test_clock["now"] - _Cfg.idle_sleep_seconds - 1])
+    # Register restoration before the production helper mutates the class.
+    monkeypatch.setattr(dws.Handler, "session_reader", None)
+    dws.bind_session_reader(cfg)
+    with dws.ThreadingHTTPServer(("127.0.0.1", 0), dws.Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = HTTPConnection(*server.server_address, timeout=5)
+        try:
+            connection.request("GET", "/sleep-verdict")
+            response = connection.getresponse()
+            assert response.status == 200
+            assert response.getheader("Content-Type") == "application/json"
+            assert json.loads(response.read()) == {
+                "permit": permit, "reason": reason, "observed_at": 1000.0}
+            assert calls == [(cfg.session_url, cfg.probe_timeout)]
+        finally:
+            connection.close()
+            server.shutdown()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "HTTP server failed to stop"
+
+
+# --- SR-044: main() wires the session reader; the helper test cannot see it -
+def test_main_wires_the_session_reader_into_the_handler_sr044(monkeypatch):
+    """The HTTP tests above call bind_session_reader themselves, so deleting
+    the call from main() leaves them green. Run main() with its collaborators
+    stubbed and check that the reader it leaves on Handler is the production
+    probe, bound to the configured URL and timeout."""
+    monkeypatch.setenv("DEVPC_HOST", "dev-pc.invalid")
+    monkeypatch.setenv("DEVPC_SESSION_URL", "http://session.invalid/session")
+    monkeypatch.setenv("DEVPC_PROBE_TIMEOUT_SECONDS", "0.25")
+    calls = []
+
+    def read_session(url, timeout):
+        calls.append((url, timeout))
+        return {"attached": False, "observed_at": 1000.0}
+
+    class _Stub:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def publish(self, doc):
+            pass
+
+        def serve_forever(self):
+            # main() must return here, so the test never blocks on a socket.
+            return None
+
+    class _Threading:
+        @staticmethod
+        def Thread(*args, **kwargs):
+            return type("_NoThread", (), {"start": lambda self: None})()
+
+    # Register restoration before main() mutates the class.
+    monkeypatch.setattr(dws.Handler, "session_reader", None)
+    monkeypatch.setattr(dws.Handler, "service", None)
+    monkeypatch.setattr(dws.Handler, "publisher", None)
+    monkeypatch.setattr(dws, "read_session", read_session)
+    monkeypatch.setattr(dws, "build_provider", lambda cfg: object())
+    monkeypatch.setattr(dws, "WakeService", _Stub)
+    monkeypatch.setattr(dws, "Publisher", _Stub)
+    monkeypatch.setattr(dws, "threading", _Threading)
+    monkeypatch.setattr(dws, "ThreadingHTTPServer", _Stub)
+
+    dws.main()
+
+    reader = dws.Handler.__dict__["session_reader"]
+    assert isinstance(reader, staticmethod), "reader must be static to bind"
+    # Called through an instance, as GET /sleep-verdict does, it must take no
+    # self argument and must reach the probe with the configured values.
+    assert object.__new__(dws.Handler).session_reader() == {
+        "attached": False, "observed_at": 1000.0}
+    assert calls == [("http://session.invalid/session", 0.25)]

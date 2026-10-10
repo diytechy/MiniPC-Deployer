@@ -201,7 +201,7 @@ case ",$(env_get COMPOSE_PROFILES | tr -d '[:space:]')," in
         elif [ "$DRY_RUN" -eq 1 ]; then
             log "would build: $SURE_IMAGE via scripts/build-sure-image.sh"
         else
-            bash "$SCRIPT_DIR/build-sure-image.sh" --tag "$SURE_IMAGE" || die "Sure fork build failed ($SURE_IMAGE)"
+            bash "$SCRIPT_DIR/build-sure-image.sh" --tag "$SURE_IMAGE" --ref "$(env_get SURE_SOURCE_REF)" || die "Sure fork build failed ($SURE_IMAGE)"
         fi
         ;;
     *)

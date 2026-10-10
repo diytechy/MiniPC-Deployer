@@ -649,6 +649,10 @@ services:
   # so export-images.sh re-saves it every bake and firstboot ID-checks the load.
   sure-web:
     image: ${SURE_IMAGE:-sure-auroleap:local}
+    # Never pull: the name has no registry home, and a missing image (for example one
+    # firstboot removed after an id mismatch) must fail here, not be fetched from
+    # docker.io under a namespace-less name.
+    pull_policy: never
     container_name: sure-web
     profiles: ["sure"]
     environment: *sure-environment
@@ -675,6 +679,10 @@ services:
 
   sure-worker:
     image: ${SURE_IMAGE:-sure-auroleap:local}
+    # Never pull: the name has no registry home, and a missing image (for example one
+    # firstboot removed after an id mismatch) must fail here, not be fetched from
+    # docker.io under a namespace-less name.
+    pull_policy: never
     container_name: sure-worker
     profiles: ["sure"]
     command: bundle exec sidekiq

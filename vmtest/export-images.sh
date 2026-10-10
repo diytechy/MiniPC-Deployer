@@ -61,9 +61,10 @@
 #
 # Output (gitignored, see ../.gitignore vmtest/.out/):
 #   $IMAGES_OUT/<sanitized-ref>.tar          one docker-save tar per image
-#   $IMAGES_OUT/images.manifest.tsv          ref / id / repo-digest / file / bytes / kind
-#     kind = local | pinned | registry; firstboot verifies the loaded image ID for
-#     local and pinned rows and refuses to continue on a mismatch.
+#   $IMAGES_OUT/images.manifest.tsv          ref / id / repo-digest / file / bytes / kind / rootfs_sha256
+#     kind = local | pinned | registry. rootfs_sha256 = sha256 of the image's diff-id
+#     list (store-independent; .Id is not). firstboot compares it after loading local
+#     and pinned rows and, on a mismatch, removes the tag and records a failure.
 #
 # NOTE ON PATHS: the default $IMAGES_OUT lives under vmtest/.out, i.e. on the
 # Windows C: drive via the WSL 9p mount — writing there does NOT grow WSL2's
@@ -263,7 +264,7 @@ log "recorded the bake's provenance: $IMAGES_OUT/profiles.stamp"
 
 mkdir -p "$IMAGES_OUT"
 MANIFEST="$IMAGES_OUT/images.manifest.tsv"
-printf 'repo_tag\timage_id\trepo_digest\tsaved_file\tbytes\tkind\n' > "$MANIFEST"
+printf 'repo_tag\timage_id\trepo_digest\tsaved_file\tbytes\tkind\trootfs_sha256\n' > "$MANIFEST"
 
 # sanitize an image ref into a filename: registry/repo:tag -> registry_repo_tag
 sanitize() { echo "$1" | tr '/:@' '___'; }
@@ -428,6 +429,9 @@ for spec in "${PIN_SPECS[@]}"; do
     _tag="$(env_file_value "$ENV_FILE" "$_tk" | tr -d '[:space:]')"
     _dig="$(env_file_value "$ENV_FILE" "$_dk" | tr -d '[:space:]')"
     _ref="$_repo:$_tag"
+    if [ -z "$_tag" ] && [ -n "$_dig" ]; then
+        die "$_tk is empty in ${ENV_FILE##*/} but $_dk is set - compose would reference '$_repo:' (no tag)."
+    fi
     case " ${IMAGES[*]} " in *" $_ref "*) ;; *) continue ;; esac
     [[ "$_dig" =~ ^sha256:[0-9a-f]{64}$ ]] \
         || die "$_dk in ${ENV_FILE##*/} is not a sha256:<64 hex> digest ('$_dig') - $_ref would bake UNVERIFIED."
@@ -452,11 +456,31 @@ verify_and_retag_pinned() {
 }
 for ref in "${!PINNED[@]}"; do verify_and_retag_pinned "$ref" "${PINNED[$ref]}"; done
 
+# assert_sure_ref REF - the fork image must have been built from SURE_SOURCE_REF.
+# NOT the staleness check (ALLOW_STALE_LOCAL does not waive it): an image built
+# from the wrong branch is current and WRONG, and with no registry or version in
+# its tag nothing else would ever say so. The fork must carry both
+# auroleap-bank-stale-capability and auroleap-transaction-flags, which is what
+# the integration branch named by the knob is for.
+assert_sure_ref() {
+    local ref="$1" want got
+    case "$ref" in sure-auroleap:*) ;; *) return 0 ;; esac
+    want="$(env_file_value "$ENV_FILE" SURE_SOURCE_REF | tr -d '[:space:]')"
+    [ -n "$want" ] || die "SURE_SOURCE_REF is empty in ${ENV_FILE##*/} - cannot say which branch '$ref' must come from."
+    got="$(docker image inspect "$ref" --format '{{index .Config.Labels "homehub.source.ref"}}' 2>/dev/null || true)"
+    if [ "$got" != "$want" ]; then
+        die "WRONG-BRANCH image '$ref': homehub.source.ref is '${got:-<none>}' but SURE_SOURCE_REF is '$want'." \
+            "Rebuild:  bash scripts/build-sure-image.sh --ref $want   (WSL, real Docker)"
+    fi
+    log "  source-ref OK: $ref was built from $want"
+}
+
 for ref in "${IMAGES[@]}"; do
     if [ -n "${PINNED[$ref]:-}" ]; then
         pulled_count=$((pulled_count + 1))   # verified and retagged above; never pulled by tag
     elif docker image inspect "$ref" >/dev/null 2>&1; then
         log "present locally: $ref"
+        assert_sure_ref "$ref"
         [ "${ALLOW_STALE_LOCAL:-0}" = "1" ] || assert_local_image_fresh "$ref"
     elif is_local_only "$ref"; then
         case "$ref" in
@@ -555,7 +579,12 @@ for ref in "${IMAGES[@]}"; do
     kind=registry
     [ "$local_only" -eq 1 ] && kind=local
     [ -n "${PINNED[$ref]:-}" ] && kind=pinned
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ref" "$img_id" "$repo_digest" "$(basename "$out")" "$bytes" "$kind" >> "$MANIFEST"
+    # STORE-INDEPENDENT IDENTITY. `.Id` is the config digest on the classic store
+    # but the manifest/index digest on the containerd store, so it can legitimately
+    # differ between this machine and the hub; it is kept for display only. The
+    # diff-ids (RootFS.Layers) are the same on both, and firstboot compares THAT.
+    rootfs="$(docker image inspect "$ref" --format '{{json .RootFS.Layers}}' 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ref" "$img_id" "$repo_digest" "$(basename "$out")" "$bytes" "$kind" "$rootfs" >> "$MANIFEST"
 done
 
 # ── 4. report ─────────────────────────────────────────────────────────────────
@@ -563,6 +592,6 @@ total_mb=$((total_bytes / 1024 / 1024))
 log "───────────────────────────────────────────────────────────────────"
 log "DONE — ${#IMAGES[@]} images in the payload (${pulled_count} pulled, ${saved_count} saved this run)"
 log "total payload size: ${total_mb} MB (${total_bytes} bytes) in $IMAGES_OUT"
-log "manifest (ref/id/digest/file/bytes/kind): $MANIFEST"
+log "manifest (ref/id/digest/file/bytes/kind/rootfs): $MANIFEST"
 log "Next: build-seed.sh / build-repacked-iso.sh copy these into deploy-payload/images/;"
 log "      firstboot.sh docker-loads them before 'docker compose up -d'."

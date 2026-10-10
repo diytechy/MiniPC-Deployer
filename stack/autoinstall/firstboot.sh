@@ -482,32 +482,68 @@ tar_repo_tags() {
 # ── VERIFY WHAT WAS JUST LOADED IS THE IMAGE THE BAKE RECORDED ───────────────
 # For the manifest rows whose tag PINS NO CONTENT (kind=local: naglight:local,
 # sure-auroleap:local, ...) or whose pin was verified at bake time (kind=pinned:
-# the digest-pinned postgres/redis), a wrong image under the right tag would start
-# silently. After a load, compare the id docker now reports for the tag with the
-# id the exporter recorded. A mismatch is FATAL: a wrong image must not start.
-# Rows without a kind column (a payload built before 2026-10-10) are not checked.
+# the digest-pinned postgres/redis), a wrong image under the right tag must not
+# start silently.
+#
+# WHAT IS COMPARED. Not `.Id`: that is the config digest on Docker's classic
+# image store but the manifest/index digest on the containerd store, so the dev PC
+# that baked and the hub that loads can legitimately disagree, and an `.Id` check
+# would false-fail every image. The manifest's rootfs_sha256 column is the sha256
+# of the diff-id list (`{{json .RootFS.Layers}}`), which is the same on both.
+# A row without that column (a payload baked before 2026-10-10) is not checked.
+#
+# WHAT HAPPENS ON A MISMATCH - and why it is not `exit 1`. This step runs before
+# the mounts, compose, DNS and Samba, so aborting the unit here would take the
+# whole box down for one bad image. And merely logging would be worse: the tag
+# now points at the wrong image, the next boot's SKIP-if-present rule above would
+# keep it, and it would start silently. So instead:
+#   1. `docker rmi` the tag -> the next boot finds it absent and RETRIES the load
+#      rather than skipping;
+#   2. log loudly, and append a line to $IMAGE_LOAD_STATE (default
+#      /var/lib/homehub/image-load.state, rewritten every boot), which
+#      stack/provision/healthcheck.sh reports as a FAIL;
+#   3. return 0 so the boot continues. Compose then cannot find the image
+#      (the Sure services carry `pull_policy: never`, so it is not fetched from a
+#      registry either) and that service fails to start. NOTE: `docker compose up
+#      -d` is all-or-nothing about its exit status, so the existing FATAL at the
+#      end of the up still fires on that failure - the unit goes red, but only
+#      after the mounts, DNS and every other service have had their turn.
 # Only called after a real load - the SKIP path above deliberately keeps an
-# operator's newer image, whose id legitimately differs.
+# operator's newer image, whose layers legitimately differ.
+IMAGE_LOAD_STATE="${IMAGE_LOAD_STATE:-/var/lib/homehub/image-load.state}"
 verify_loaded_image() {
-    local name="$1" ref want kind got bad=0
+    local name="$1" ref want_rootfs kind got
     [ -f "$IMAGES_DIR/images.manifest.tsv" ] || return 0
-    while IFS=$'\t' read -r ref want _ _ _ kind; do
+    while IFS=$'\t' read -r ref _ _ _ _ kind want_rootfs; do
         case "$kind" in local|pinned) ;; *) continue ;; esac
-        got="$(docker image inspect "$ref" --format '{{.Id}}' 2>/dev/null || true)"
-        if [ "$got" = "$want" ]; then
-            log "  verified $ref = $got ($kind)"
+        if [ -z "$want_rootfs" ]; then
+            log "  (no rootfs hash recorded for $ref - not verified)"
+            continue
+        fi
+        got=""
+        if docker image inspect "$ref" >/dev/null 2>&1; then
+            got="$(docker image inspect "$ref" --format '{{json .RootFS.Layers}}' 2>/dev/null | sha256sum | cut -d' ' -f1)" || got=""
+        fi
+        if [ -n "$got" ] && [ "$got" = "$want_rootfs" ]; then
+            log "  verified $ref (rootfs ${want_rootfs:0:12}, $kind)"
         else
-            log "FATAL: loaded image $ref has id '${got:-<absent>}' but the bake recorded '$want' ($name)."
-            log "  Refusing to continue: a different image under this tag must not start silently."
-            bad=1
+            log "ERROR: loaded image $ref does NOT match the bake ($name): rootfs '${got:-<absent>}' != recorded '$want_rootfs'."
+            log "  Removing the tag so the next boot retries the load instead of skipping it;"
+            log "  the service using it will not start. Recorded in $IMAGE_LOAD_STATE."
+            docker rmi "$ref" >/dev/null 2>&1 || log "  WARN: could not remove $ref"
+            mkdir -p "$(dirname "$IMAGE_LOAD_STATE")" 2>/dev/null || true
+            printf 'FAILED ref=%s tar=%s want_rootfs=%s got_rootfs=%s\n' \
+                "$ref" "$name" "$want_rootfs" "${got:-absent}" >> "$IMAGE_LOAD_STATE" 2>/dev/null \
+                || log "  WARN: could not write $IMAGE_LOAD_STATE"
         fi
     done < <(awk -F'\t' -v f="$name" '$4 == f' "$IMAGES_DIR/images.manifest.tsv")
-    [ "$bad" -eq 0 ] || exit 1
+    return 0
 }
 
 if [ -n "$IMAGES_DIR" ]; then
     tars=("$IMAGES_DIR"/*.tar "$IMAGES_DIR"/*.tar.zst)
     log "loading ${#tars[@]} baked image tar(s) from $IMAGES_DIR (Q10.9 B+ — zero-registry first boot)"
+    rm -f "$IMAGE_LOAD_STATE" 2>/dev/null || true   # a fresh verdict every boot
     loaded=0
     skipped=0
     for tar in "${tars[@]}"; do

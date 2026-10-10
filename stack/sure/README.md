@@ -47,7 +47,11 @@ The LAN gate does not itself restrict household account creation.
 
 ## Registry evidence and payload
 
-**The Sure image is the Owner's fork, built locally (2026-10-10).** `SURE_IMAGE`
+**The Sure image is the Owner's fork, built locally (2026-10-10).** The fork must carry BOTH
+`auroleap-bank-stale-capability` and `auroleap-transaction-flags`, so it is built from
+the integration branch named by `SURE_SOURCE_REF` (`auroleap-integration`, created in
+`../sure` by the coordinator, not by this repo); the exporter refuses an image whose
+`homehub.source.ref` label differs. `SURE_IMAGE`
 (default `sure-auroleap:local`) replaces the stock `ghcr.io/we-promise/sure`
 reference and the retired `SURE_IMAGE_TAG`. It has no registry home, so it travels
 exactly like `naglight:local`: `scripts/build-sure-image.sh` builds a NAMED branch
@@ -55,10 +59,15 @@ or commit of `../sure` (via `git archive`, so uncommitted edits cannot leak in) 
 stamps `homehub.source.revision`, `homehub.source.ref` and `BUILD_COMMIT_SHA`;
 `vmtest/export-images.sh` treats it as local-only (never pulled, re-saved every run,
 freshness-checked against the ref it was built from); `firstboot.sh` verifies the
-loaded image id equals the id the manifest recorded and refuses to continue on a
-mismatch. Build it in WSL with real Docker, never the default (Podman) distro:
+loaded image's rootfs hash (sha256 of the diff-id list; `.Id` differs between Docker's classic and
+containerd stores so it is display-only) equals the one the manifest recorded. On a
+mismatch it removes the tag (so the next boot retries the load rather than skipping),
+writes `/var/lib/homehub/image-load.state` (reported FAIL by `healthcheck.sh`) and
+lets the boot continue; the Sure services carry `pull_policy: never`, so the service
+fails to start instead of pulling from a registry. `docker compose up -d` is
+all-or-nothing about its exit status, so the unit still ends red afterwards. Build it in WSL with real Docker, never the default (Podman) distro:
 
-    wsl -d Ubuntu -- bash /mnt/c/Projects/MiniPC-Deployer/scripts/build-sure-image.sh --ref auroleap-bank-stale-capability
+    wsl -d Ubuntu -- bash /mnt/c/Projects/MiniPC-Deployer/scripts/build-sure-image.sh --ref auroleap-integration
 
 **Postgres and Redis keep their digest pin, enforced at bake time.** The knobs are
 now a plain tag (`SURE_POSTGRES_IMAGE_TAG=16.15`, `SURE_REDIS_IMAGE_TAG=8.10.2`,

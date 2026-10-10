@@ -45,6 +45,7 @@ def test_sure_registry_pins_sr061():
     # The fork is a local-only image (naglight:local shape): a plain `name:local` ref,
     # never a registry or digest form that `docker load` could not restore.
     assert knobs["SURE_IMAGE"] == "sure-auroleap:local"
+    assert knobs["SURE_SOURCE_REF"] == "auroleap-integration"
     assert "@" not in knobs["SURE_IMAGE"] and "ghcr.io" not in knobs["SURE_IMAGE"]
     assert "SURE_IMAGE_TAG" not in knobs  # retired 2026-10-10
     # Postgres/Redis: plain tag in compose, digest in a separate bake-time-verified knob.

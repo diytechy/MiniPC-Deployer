@@ -121,8 +121,22 @@ def test_line_in_refuses_a_udev_start_when_it_is_disabled():
     """Enablement is the operator's off switch, and SYSTEMD_WANTS ignores it."""
     text = read("wall-line-in.service")
     condition = [ln for ln in text.splitlines() if ln.startswith("ExecCondition=")]
-    assert len(condition) == 1
+    assert len(condition) == 2
+    # Order matters only for the reader: the enablement test is the first.
     assert "multi-user.target.wants/wall-line-in.service" in condition[0]
+
+
+def test_line_in_refuses_to_start_outside_trigger_mode():
+    """linein_shared/speaker_shared exist only in the trigger graph (FOLLOWUPS B3)."""
+    text = read("wall-line-in.service")
+    condition = [ln for ln in text.splitlines() if ln.startswith("ExecCondition=")]
+    guard = ("ExecCondition=/bin/sh -c '[ \"$(cat /etc/wall-panel/audio-mode "
+             "2>/dev/null || echo trigger)\" = trigger ]'")
+    assert guard in condition
+    # The same mode file and the same absent-file default as the bus-only units.
+    visualizer = read("wall-bus-visualizer.service")
+    assert "cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger" in visualizer
+    assert guard.replace("= trigger ]", "= bus ]") in         [ln for ln in visualizer.splitlines() if ln.startswith("ExecCondition=")]
 
 
 def test_kiosk_loop_refuses_to_run_in_panel_mode():

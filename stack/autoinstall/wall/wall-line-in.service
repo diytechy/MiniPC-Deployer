@@ -69,6 +69,16 @@ Type=simple
 # because a dbus round trip from inside this unit's own start job is a deadlock
 # waiting to be discovered on a bad day.
 ExecCondition=/bin/sh -c '[ -e /etc/systemd/system/multi-user.target.wants/wall-line-in.service ] || { echo "wall-line-in is disabled; not starting for a udev event" >&2; exit 1; }'
+# TRIGGER MODE ONLY (FOLLOWUPS B3). The capture and playback PCMs below,
+# `linein_shared` and `speaker_shared`, are declared in the trigger-mode graph
+# and in no other: bus mode retires the 3.5 mm line-in by construction (one
+# capture stream, selector on IEC958 In -- see asound-bus-mode.conf), so there
+# alsaloop dies on `Unknown PCM speaker_shared`. wall-audio-mode disables this
+# unit in bus mode, but a udev SYSTEMD_WANTS ignores the mode and enablement
+# can drift (firstboot enables it before the mode is applied), so the mode is
+# checked again here, in the visualizer's exact form and with the same default.
+# Exit 1 SKIPS the unit cleanly: it neither fails nor triggers Restart=.
+ExecCondition=/bin/sh -c '[ "$(cat /etc/wall-panel/audio-mode 2>/dev/null || echo trigger)" = trigger ]'
 # Card ids come from the generated map, with a default here so a panel whose
 # file predates it still starts. EnvironmentFile wins over Environment.
 Environment=WALL_AUDIO_ADAPTER_CARD=ICUSBAUDIO7D

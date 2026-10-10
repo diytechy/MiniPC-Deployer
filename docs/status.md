@@ -2802,5 +2802,11 @@ firstboot compares a store-independent rootfs hash (new manifest column) instead
 (`auroleap-integration`) names the build ref and the exporter refuses a wrong-ref
 image; build-sure-image.sh refuses Podman and archives through `repo_git`;
 validate_config.py checks the Sure knobs; tests are behavioural (21 cases).
-Not proven: `auroleap-integration` does not exist yet in `../sure`; compose behaviour
-with a removed image (`pull_policy: never`) is stub-reasoned, not run; the lab sequence.
+Not proven: compose behaviour with a removed image (`pull_policy: never`) is
+stub-reasoned, not run - in particular whether `docker compose up -d` still creates the
+OTHER services when one image is missing, or aborts before creating any (then 4a-post
+warns about many services and Caddy/Technitium may be down for the later steps); the lab
+sequence. (`auroleap-integration` now exists in `../sure` at 87b606048: the coordinator
+merged both fork branches; the merged tree passes Sure's full suite, 10397 runs, 0
+failures, 1 known environment error.) Reviewed: Sonnet medium, REQUEST CHANGES, then
+APPROVE after two fix rounds (c0cf2cc, db44672).

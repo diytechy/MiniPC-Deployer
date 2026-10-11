@@ -797,16 +797,28 @@ def test_main_does_nothing_at_all_when_the_knob_is_off_sr021(monkeypatch, capsys
 
 def test_unknown_source_names_are_refused_not_ignored_sr021():
     with pytest.raises(SystemExit):
-        feeder.enabled_sources({"AI_USAGE_SOURCES": "codex,gemini"})
+        feeder.enabled_sources({"AI_USAGE_SOURCES": "codex,grok"})
+    # claude2 and gemini are KNOWN now, but OPT-IN: an absent knob must not start
+    # posting a gauge for a login nobody has made.
     assert feeder.enabled_sources({}) == ["codex", "claude", "opencode"]
+    assert feeder.enabled_sources(
+        {"AI_USAGE_SOURCES": "claude,claude2,codex,gemini,opencode"}
+    ) == ["claude", "claude2", "codex", "gemini", "opencode"]
 
 
-def test_gemini_is_absent_from_the_feeder_sr021():
-    """Deferred as E11. A source nobody could verify with a real call must not
-    appear as a parser — that is the failure mode the gate exists to prevent."""
-    source = MODULE_PATH.read_text(encoding="utf-8").lower()
-    assert "def parse_gemini" not in source
-    assert "generativelanguage" not in source
+def test_gemini_is_built_from_source_and_says_so_sr067():
+    """Gemini was DEFERRED (E11) because the rule is that a parser is written
+    after a real call. It is now built (plan R2, ruled by the Owner) but could
+    not be called live, so the rule is kept in a different form: the module
+    states in so many words that its shape comes from the CLI's source, and the
+    README lists what a first live run must confirm. A Gemini reader that
+    claimed to be observed would be exactly the fiction the gate exists to stop.
+    Still absent: the API-key endpoint, which is a different product."""
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert "NOT from an observed response" in source
+    assert "generativelanguage" not in source.lower()
+    readme = (REPO / "stack" / "ai-usage" / "README.md").read_text(encoding="utf-8")
+    assert "Not proven (the first live run must confirm each)" in readme
 
 
 def test_every_http_source_sends_a_named_user_agent_sr021(monkeypatch, tmp_path):
@@ -1232,11 +1244,11 @@ CLAUDE_ACCESS_TOKEN_LIFE_SECONDS = 8 * 3600   # measured twice on 2026-09-12
 
 
 def _refresh_timer():
-    return (REPO / "stack" / "ai-usage" / "homehub-claude-refresh.timer").read_text(encoding="utf-8")
+    return (REPO / "stack" / "ai-usage" / "homehub-claude-refresh@.timer").read_text(encoding="utf-8")
 
 
 def _refresh_service():
-    return (REPO / "stack" / "ai-usage" / "homehub-claude-refresh.service").read_text(encoding="utf-8")
+    return (REPO / "stack" / "ai-usage" / "homehub-claude-refresh@.service").read_text(encoding="utf-8")
 
 
 def test_the_refresh_interval_must_beat_the_eight_hour_token_life():
@@ -1311,11 +1323,12 @@ def test_the_refresher_discards_its_output():
 
 def test_setup_installs_and_enables_the_refresher():
     setup = (REPO / "stack" / "ai-usage" / "setup-ai-usage.sh").read_text(encoding="utf-8")
-    assert "homehub-claude-refresh.service" in setup
-    assert "homehub-claude-refresh.timer" in setup
-    assert "systemctl enable --now homehub-claude-refresh.timer" in setup
+    assert "homehub-claude-refresh@.service" in setup
+    assert "homehub-claude-refresh@.timer" in setup
+    # Account 1 is enabled unconditionally, exactly as the un-templated unit was.
+    assert "systemctl enable --now homehub-claude-refresh@claude.timer" in setup
     # It runs as the same account as the feeder, from the same single knob.
-    assert "homehub-claude-refresh.service.d" in setup
+    assert "homehub-claude-refresh@claude.service.d" in setup
 
 
 # ── IF-012 v1.1: remaining, and the scoped per-model gauge ─────────────────

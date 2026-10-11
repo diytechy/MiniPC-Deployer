@@ -1,0 +1,69 @@
+[Unit]
+# KEEP GEMINI CLI'S OWN TOKEN ALIVE, and do nothing else (plan 3.3, "Gemini").
+#
+# THE PROBLEM. The feeder reads the access token Gemini CLI keeps in
+# ~/.gemini/oauth_creds.json. That token lives about an hour (Google's standard
+# access-token life; the file's `expiry_date` carries the real figure) and only
+# the CLI renews it -- the feeder must never mint or refresh a Google token
+# (SR-021). On a hub where nobody types `gemini`, nothing would, and the Gemini
+# ring would read unavailable for all but the first hour after a sign-in.
+#
+# WHAT RUNS. gemini_auth_refresh.py, which starts `gemini --acp` and sends it
+# `initialize` and `authenticate`. Its header explains why that and not
+# `gemini -p "/stats"` (which sends the text to the model: one billed request per
+# run). It is a source-read approach. Its dead-login half HAS been observed
+# against the real CLI (0.63.0, a fake credential: the CLI prints a sign-in
+# prompt, the script exits 4); its renewing half has NOT been run on a real
+# credential -- README.md ("Gemini") gives the one command that proves it, and
+# what to expect if it does not hold.
+#
+# IT IS INSTALLED ONLY WHEN `gemini` IS IN AI_USAGE_SOURCES, by
+# setup-ai-usage.sh. A box that never opted in has no such unit.
+Description=HomeHub: keep the Gemini CLI token fresh (SR-021)
+Documentation=file:///opt/homehub/stack/ai-usage/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User=/Group= and ReadWritePaths=<home>/.gemini arrive in a drop-in written by
+# setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT -- not `%h`, which in a system
+# unit is /root (see homehub-claude-refresh@.service for the 226/NAMESPACE this
+# caused once).
+NoNewPrivileges=yes
+
+# THE ONE UNIT ALLOWED TO WRITE THE GEMINI CREDENTIAL, for the reason the Claude
+# refresher is: the feeder keeps ProtectHome=read-only and its one-path write
+# allow-list. ~/.gemini is the whole of what is re-opened -- the CLI keeps its
+# settings, logs and temp state there too, so a narrower grant would break it.
+ProtectHome=read-only
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# A credential that cannot be renewed must fail this unit, not open a browser.
+Environment=NO_BROWSER=true
+
+# Output is one status line and nothing the CLI said (see the script). HOME is
+# derived by systemd from User=, so the account is named in exactly one place;
+# the CLI reads project settings from its cwd, hence the cd.
+ExecStart=/bin/sh -c 'cd "$HOME" && exec /usr/bin/python3 /opt/homehub/stack/ai-usage/gemini_auth_refresh.py'
+
+# A refresh that fails is not an emergency (the token is valid until its expiry
+# and the next run is four minutes away), and it must never become a restart
+# storm against a Google endpoint.
+Restart=no
+# Far under the 4-minute timer interval, and above the keeper's own 60 s bound:
+# systemd will not start a oneshot unit that is still activating, so runs cannot
+# stack, and a wedged CLI is killed with the unit's whole control group.
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

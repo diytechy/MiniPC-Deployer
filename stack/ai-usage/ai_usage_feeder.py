@@ -60,7 +60,19 @@ fiction). The calls were made on 2026-09-09 from the dev PC:
             field is exactly the fabricated reading the feed contract was
             tightened to stop.
 
-Gemini is deliberately absent: deferred as E11.
+Two readers were added 2026-10-11 (plan R2, docs/GAUGE_RINGS_AND_SLEEP_PLAN):
+
+  claude2   the same endpoint as `claude`, for a SECOND account whose CLI
+            config lives in its own CLAUDE_CONFIG_DIR. Ids `ai-usage-claude2-*`.
+  gemini    POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota,
+            the call behind Gemini CLI's own `/stats` (gemini-cli
+            packages/core/src/code_assist/server.ts and config/config.ts
+            `refreshUserQuota`, HEAD 9b6e026), after one `loadCodeAssist` call
+            for the project id. The body shape comes from that SOURCE, not from
+            an observed response: no live call was possible when it was written,
+            so the parser is pinned to `types.ts` and README.md lists what is
+            still unproven. Unlike the three observed sources above it fails
+            closed on anything it does not recognise.
 
 THE FOUR ACCEPTANCE PROPERTIES, each with the symbol that enforces it:
   1. never writes a vendor credential file  -> `open_for_write`
@@ -78,6 +90,7 @@ import http.client
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -192,6 +205,35 @@ class SourceFailure(Exception):
     a second exception type is a second chance to accidentally post a fresh
     reading for a source that failed.
     """
+
+
+class AuthFailure(SourceFailure):
+    """A SourceFailure that is KNOWN to be an authentication failure.
+
+    Plan 3.6 (G2): a dead login must go grey, not keep showing its last number
+    in colour until NagLight's staleness horizon passes. To do that the cycle
+    has to tell "the login is dead" from "the network blinked", and
+    `http_json` used to flatten a 401 and a 500 into the same string. This is
+    the typed alternative. It IS a SourceFailure, so every existing handler
+    still works, but the per-source loop in `run_cycle` catches it FIRST.
+
+    NO READER MAY CATCH ONE AND RE-RAISE IT AS A PLAIN SourceFailure -- that
+    would silently turn a dead login back into "a network blip" and the gauge
+    would never grey. The conversion only ever goes the other way (see
+    `read_claude`, which promotes "carries no usable key" because only the
+    Claude reader may read that text as authentication).
+
+    `status` is the HTTP status and `code` the vendor's own error word
+    (`token_expired`) -- whichever the raiser knew. Neither is a secret and
+    neither is the remote's free text.
+
+    Implements: SR-068, LLR-1053
+    """
+
+    def __init__(self, message, status=None, code=None):
+        SourceFailure.__init__(self, message)
+        self.status = status
+        self.code = code
 
 
 class EgressRefused(Exception):
@@ -478,13 +520,30 @@ CLAUDE_SCOPED_MODELS = (
 # know; either way it is not a scoped model reading.
 CLAUDE_SCOPED_KIND = "weekly_scoped"
 
+# THE SECOND ACCOUNT (plan 3.3, "Claude 2"). Same endpoint, same payload, its own
+# gauge ids -- `ai-usage-claude2-*`, because the panel groups rings by the
+# provider id it reads out of the id (`/^ai-usage-([a-z0-9]+)(?:-|$)/`), and two
+# accounts sharing `claude` would merge into one ring. The labels carry the "2"
+# for the same reason a person reading the tracker needs it.
+CLAUDE2_BUCKETS = (
+    ("five_hour", "ai-usage-claude2-session", "Claude 2 session", 5 * 3600),
+    ("seven_day", "ai-usage-claude2-weekly", "Claude 2 weekly", 7 * 24 * 3600),
+)
+CLAUDE2_SCOPED_MODELS = (
+    ("Fable", "ai-usage-claude2-weekly-fable", "Claude 2 F5", 7 * 24 * 3600),
+)
 
-def parse_claude(payload, now):
+
+def parse_claude(payload, now, buckets=CLAUDE_BUCKETS,
+                 scoped_models=CLAUDE_SCOPED_MODELS, name="claude"):
     """Turn one OAuth usage body into {gauge key: Reading}.
 
     Contract:
       Inputs:  payload: the decoded JSON body, exactly as observed;
-               now: this cycle's clock, against which each window is checked.
+               now: this cycle's clock, against which each window is checked;
+               buckets / scoped_models / name: which account's gauge table to
+               read into. The defaults are account 1, so every pre-existing
+               caller is unchanged; `read_claude2` passes the CLAUDE2_* tables.
       Outputs: dict of gauge key -> Reading, one per CLAUDE_BUCKETS entry that
                is present and usable.
       Raises:  SourceFailure on a non-object or when NO bucket is usable. A
@@ -504,32 +563,34 @@ def parse_claude(payload, now):
     Implements: LLR-005
     """
     if not isinstance(payload, dict):
-        raise SourceFailure("claude: body is not an object")
+        raise SourceFailure("%s: body is not an object" % name)
     out = {}
     problems = []
-    for field, key, _label, window_seconds in CLAUDE_BUCKETS:
+    for field, key, _label, window_seconds in buckets:
         bucket = payload.get(field)
         if not isinstance(bucket, dict):
             problems.append("%s absent or null" % field)
             continue
         try:
-            percent = check_percent(bucket.get("utilization"), "claude " + field)
+            where = "%s %s" % (name, field)
+            percent = check_percent(bucket.get("utilization"), where)
             resets_at = bucket.get("resets_at")
             window_end, window_seconds = check_window(
                 None if resets_at is None
-                else parse_iso8601_utc(resets_at, "claude " + field),
-                window_seconds, now, "claude " + field)
+                else parse_iso8601_utc(resets_at, where),
+                window_seconds, now, where)
         except SourceFailure as exc:
             problems.append(str(exc))
             continue
         out[key] = Reading(percent, window_end, window_seconds)
-    out.update(parse_claude_scoped(payload, now, problems))
+    out.update(parse_claude_scoped(payload, now, problems, scoped_models, name))
     if not out:
-        raise SourceFailure("claude: no usable bucket (%s)" % "; ".join(problems))
+        raise SourceFailure("%s: no usable bucket (%s)" % (name, "; ".join(problems)))
     return out
 
 
-def parse_claude_scoped(payload, now, problems):
+def parse_claude_scoped(payload, now, problems, scoped_models=CLAUDE_SCOPED_MODELS,
+                        source_name="claude"):
     """Per-model weekly readings out of `limits[]`, keyed on the model's name.
 
     Contract:
@@ -555,7 +616,7 @@ def parse_claude_scoped(payload, now, problems):
     if not isinstance(limits, list):
         return {}
     out = {}
-    for name, key, _label, window_seconds in CLAUDE_SCOPED_MODELS:
+    for name, key, _label, window_seconds in scoped_models:
         matches = []
         for candidate in limits:
             if not isinstance(candidate, dict):
@@ -573,7 +634,7 @@ def parse_claude_scoped(payload, now, problems):
         # per model, and "first one wins" threw away a perfectly good second
         # reading whenever the first was malformed -- turning a recoverable
         # payload into a missing gauge. Found by adversarial review 2026-09-12.
-        where = "claude scoped " + name
+        where = "%s scoped %s" % (source_name, name)
         for entry in matches:
             try:
                 percent = check_percent(entry.get("percent"), where)
@@ -685,6 +746,171 @@ def parse_opencode(payload, now):
     return out
 
 
+# ── Gemini: the quota call Gemini CLI's own `/stats` makes ──────────────────
+#
+# SOURCE OF TRUTH, AND ITS LIMIT. Written from gemini-cli HEAD 9b6e026
+# (2026-10-09) -- `packages/core/src/code_assist/types.ts` (RetrieveUserQuota*,
+# BucketInfo, LoadCodeAssist*), `server.ts` (the two POSTs) and `config.ts`
+# (`refreshUserQuota`, the only caller) -- and NOT from an observed response.
+# Every other parser in this file was written after a real call; this one could
+# not be, so it is deliberately stricter than they are: it accepts only the
+# fields `types.ts` declares, refuses a window it cannot stand behind, and any
+# surprise is "unavailable". README.md ("Gemini") lists what a first live run
+# must confirm.
+#
+#   POST {base}:loadCodeAssist  {"metadata":{ideType,platform,pluginType:"GEMINI"}}
+#        -> {"currentTier":{...},"cloudaicompanionProject":"<id>", ...}
+#   POST {base}:retrieveUserQuota  {"project":"<id>"}
+#        -> {"buckets":[{"modelId","remainingFraction","resetTime",
+#                        "remainingAmount","tokenType"}, ...]}
+#
+# `remainingFraction` is REMAINING, 0..1. This file's Reading holds CONSUMED
+# percent (the vendors' own convention elsewhere), so it is inverted here, once.
+GEMINI_GAUGE_KEY = "ai-usage-gemini-daily"
+GEMINI_LABEL_BASE = "Gemini daily"
+# The plan's call ("Buckets are per model and probably daily"): a Gemini quota
+# bucket is treated as a 24-hour window ending at its `resetTime`. That is an
+# assumption, and `check_window` is what keeps it honest: a bucket whose reset
+# is more than a day away (a weekly or monthly bucket) puts `now` outside the
+# window it claims, and the whole reading is refused rather than mis-sized.
+GEMINI_WINDOW_SECONDS = 24 * 3600
+GEMINI_DEFAULT_BASE_URL = "https://cloudcode-pa.googleapis.com/v1internal"
+_GEMINI_MODEL_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_GEMINI_PROJECT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def parse_gemini_models(raw):
+    """The configured model list, as a de-duplicated list of ids ([] = all).
+
+    Raises SourceFailure on a malformed id: a typo that silently narrowed the
+    gauge to nothing would be a gauge that never moves.
+    """
+    out = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if not _GEMINI_MODEL_ID.match(item):
+            raise SourceFailure(
+                "gemini: AI_USAGE_GEMINI_MODELS has an entry that is not a model "
+                "id (letters, digits, . _ - only, 64 max)")
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def gemini_label(models):
+    """The gauge label, which SAYS which bucket the number is.
+
+    The plan's rule: one bucket stands for the whole provider (the lowest
+    remaining fraction among the models in use), so the label has to name the
+    set it is the minimum of. An overlong list falls back to a count -- never a
+    silently truncated list, which would name fewer models than the number
+    covers.
+    """
+    if not models:
+        return "%s (all models)" % GEMINI_LABEL_BASE
+    label = "%s (%s)" % (GEMINI_LABEL_BASE, ", ".join(models))
+    if len(label) > RUNE_LIMIT:
+        label = "%s (lowest of %d models)" % (GEMINI_LABEL_BASE, len(models))
+    return label
+
+
+def parse_gemini_project(payload, configured=None):
+    """The project id out of a `loadCodeAssist` answer, or SourceFailure.
+
+    The CLI's own rule (`setup.ts` `_doSetupUser`): an onboarded account carries
+    `currentTier`, and the project is `cloudaicompanionProject` if the server
+    names one, else the operator's own GOOGLE_CLOUD_PROJECT. An account with no
+    `currentTier` is one the CLI would ONBOARD (`onboardUser`, a mutating call),
+    and this feeder never makes one -- it refuses and says why.
+    """
+    if not isinstance(payload, dict):
+        raise SourceFailure("gemini: loadCodeAssist answer is not an object")
+    if not isinstance(payload.get("currentTier"), dict):
+        raise SourceFailure(
+            "gemini: loadCodeAssist returned no currentTier - this account has "
+            "not been onboarded; run `gemini` once, signed in, as the feeder's "
+            "account. The feeder never onboards an account itself.")
+    project = payload.get("cloudaicompanionProject")
+    if isinstance(project, str) and _GEMINI_PROJECT_ID.match(project):
+        return project
+    if project not in (None, ""):
+        raise SourceFailure("gemini: loadCodeAssist named a project id of an "
+                            "unexpected shape")
+    if configured and _GEMINI_PROJECT_ID.match(configured):
+        return configured
+    raise SourceFailure(
+        "gemini: no project id - loadCodeAssist named none and "
+        "AI_USAGE_GEMINI_PROJECT is unset (the CLI needs GOOGLE_CLOUD_PROJECT "
+        "for this account type too)")
+
+
+def parse_gemini_quota(payload, now, models=()):
+    """Turn one `retrieveUserQuota` answer into {gauge key: Reading}.
+
+    Contract:
+      Inputs:  payload: the decoded JSON body; now: this cycle's clock;
+               models: the configured model ids, or () for every bucket.
+      Outputs: {GEMINI_GAUGE_KEY: Reading} for the bucket with the LOWEST
+               remainingFraction (the most-consumed one), window = the 24 h
+               ending at that bucket's own `resetTime`.
+      Raises:  SourceFailure on a non-object, no `buckets`, no usable bucket, a
+               configured model with no bucket, and a bucket whose window
+               `check_window` refuses.
+
+    A bucket with no `modelId` or no numeric `remainingFraction` is skipped, as
+    the CLI itself skips it (`config.ts` refreshUserQuota). Every OTHER fault
+    is fatal to the reading, and that is deliberate: the answer is a minimum, so
+    quietly dropping a malformed bucket could drop the very one that was lowest
+    and report headroom that is not there.
+
+    Implements: LLR-1049
+    """
+    if not isinstance(payload, dict):
+        raise SourceFailure("gemini: quota answer is not an object")
+    buckets = payload.get("buckets")
+    if not isinstance(buckets, list):
+        raise SourceFailure("gemini: quota answer has no buckets list")
+    pool = []
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        model = bucket.get("modelId")
+        fraction = bucket.get("remainingFraction")
+        if not isinstance(model, str) or not model:
+            continue
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+            continue
+        if not _GEMINI_MODEL_ID.match(model):
+            raise SourceFailure("gemini: a bucket names a model id of an "
+                                "unexpected shape")
+        if not math.isfinite(fraction) or fraction < 0.0 or fraction > 1.0:
+            raise SourceFailure("gemini: %s remainingFraction outside 0..1" % model)
+        pool.append((model, float(fraction), bucket.get("resetTime")))
+    if not pool:
+        raise SourceFailure("gemini: quota answer carries no usable bucket")
+    returned = sorted(set(m for m, _f, _r in pool))
+    if models:
+        missing = [m for m in models if m not in returned]
+        if missing:
+            raise SourceFailure(
+                "gemini: no quota bucket for configured model(s) %s; the vendor "
+                "returned: %s" % (", ".join(missing), ", ".join(returned[:12])))
+        pool = [entry for entry in pool if entry[0] in models]
+    # Validate EVERY candidate's window before choosing (see the docstring).
+    checked = []
+    for model, fraction, reset in pool:
+        where = "gemini " + model
+        end, length = check_window(
+            None if reset is None else parse_iso8601_utc(reset, where),
+            GEMINI_WINDOW_SECONDS, now, where)
+        checked.append((fraction, end, model, length))
+    fraction, end, _model, length = min(checked)
+    consumed = min(max((1.0 - fraction) * 100.0, 0.0), 100.0)
+    return {GEMINI_GAUGE_KEY: Reading(check_percent(consumed, "gemini"), end, length)}
+
+
 GAUGE_SPECS = (
     GaugeSpec("ai-usage-codex", "Codex weekly", "🤖", "codex"),
     GaugeSpec("ai-usage-claude-session", "Claude session", "🧠", "claude"),
@@ -700,7 +926,35 @@ GAUGE_SPECS = (
               optional=True),
     GaugeSpec("ai-usage-opencode-weekly", "OpenCode weekly", "🧩", "opencode"),
     GaugeSpec("ai-usage-opencode-monthly", "OpenCode monthly", "🧩", "opencode"),
+    # Account 2 shares account 1's icon on purpose: the panel groups by the
+    # provider id in the gauge id (`claude2`), not by icon, so the icon only
+    # selects the brand mark. The id order is the same load-bearing one as
+    # account 1's: `-weekly-fable` sorts immediately after `-weekly`.
+    GaugeSpec("ai-usage-claude2-session", "Claude 2 session", "🧠", "claude2"),
+    GaugeSpec("ai-usage-claude2-weekly", "Claude 2 weekly", "🧠", "claude2"),
+    GaugeSpec("ai-usage-claude2-weekly-fable", "Claude 2 F5", "🧠", "claude2",
+              optional=True),
+    # The sparkle is the nearest emoji to Gemini's mark; the panel keys its
+    # brand marks on the provider id in the gauge id (`gemini`) or on this
+    # emoji, whichever the panel builder bundles.
+    GaugeSpec(GEMINI_GAUGE_KEY, gemini_label(()), "✨", "gemini"),
 )
+
+
+def gauge_specs(env):
+    """GAUGE_SPECS with the Gemini label naming the configured models.
+
+    Never raises: a malformed model list leaves the default label, and the
+    reader reports the malformed list as the failure it is.
+    """
+    try:
+        label = gemini_label(parse_gemini_models(env.get("AI_USAGE_GEMINI_MODELS")))
+    except SourceFailure:
+        return GAUGE_SPECS
+    return tuple(
+        GaugeSpec(spec.key, label, spec.icon, spec.source, spec.optional)
+        if spec.key == GEMINI_GAUGE_KEY else spec
+        for spec in GAUGE_SPECS)
 
 
 def build_gauge(spec, value, observed_at, window_end, window_seconds):
@@ -873,7 +1127,73 @@ def validate_stored_reading(entry, now):
             "window_end": end, "window_seconds": length}
 
 
-def build_post(spec, reading, last, now):
+# ── Authentication failures: counted across cycles, then remembered ─────────
+#
+# PLAN 3.6 (G2). Both feeders are ONE-SHOT timer units, so the only memory that
+# survives from one cycle to the next is the state file -- and `load_state`
+# silently drops every key that is not a reading. Two entries therefore have
+# their own validators and are carried by `save_state` like any other:
+#
+#   AUTH_COUNTS_KEY   one reserved key: {source: consecutive auth-failed cycles}.
+#                     "Reserved" because no gauge id can start with an
+#                     underscore (they are all `ai-usage-...`).
+#   an AUTH MARKER    under a GAUGE's own key, REPLACING its stored reading once
+#                     the failure is confirmed: {"auth_failed": true, "at": <epoch>}.
+#
+# THE MARKER REPLACES THE READING AND DOES NOT DELETE THE KEY, and that is the
+# whole point of its shape. `state_keys` answers "have we ever seen this gauge",
+# and an OPTIONAL gauge (Claude's Fable band) is skipped when its key is absent.
+# Deleting the key would make the band VANISH instead of going grey -- the very
+# defect `state_keys`'s docstring records from the 2026-09 review.
+#
+# Both hold counts and timestamps only: never a credential, a header or a body.
+AUTH_COUNTS_KEY = "__auth_failures__"
+AUTH_CONFIRM_CYCLES = 2         # consecutive auth-failed cycles before a gauge greys.
+_AUTH_COUNT_CEILING = 100       # a stored count above this is corruption, not history.
+
+
+def validate_auth_counts(entry, sources):
+    """The per-source consecutive-failure counter, or {} if it is not credible.
+
+    Contract:
+      Inputs:  entry: whatever the state file holds under AUTH_COUNTS_KEY;
+               sources: the source names that exist (SOURCE_READERS).
+      Outputs: {source: int in 1..100} -- an unknown source, a zero, a bool, a
+               float or a string is dropped, never repaired.
+
+    Implements: SR-068, LLR-1054
+    """
+    if not isinstance(entry, dict):
+        return {}
+    out = {}
+    for source, count in entry.items():
+        if source not in sources:
+            continue
+        if isinstance(count, bool) or not isinstance(count, int):
+            continue
+        if 1 <= count <= _AUTH_COUNT_CEILING:
+            out[source] = count
+    return out
+
+
+def validate_auth_marker(entry, now):
+    """An "auth failed" marker, or None. Its own shape; see AUTH_COUNTS_KEY.
+
+    Implements: SR-068, LLR-1055
+    """
+    if not isinstance(entry, dict) or entry.get("auth_failed") is not True:
+        return None
+    stamp = entry.get("at")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) \
+            or not math.isfinite(stamp):
+        return None
+    stamp = int(stamp)
+    if stamp < EPOCH_FLOOR or stamp > now + MAX_CLOCK_SKEW_SECONDS:
+        return None
+    return {"auth_failed": True, "at": stamp}
+
+
+def build_post(spec, reading, last, now, auth_confirmed=False):
     """Decide what to POST for one gauge this cycle - the "never green" rule.
 
     Contract:
@@ -887,7 +1207,12 @@ def build_post(spec, reading, last, now):
                         validated it, because the guard has to hold at the
                         point of use as well as at the point of load - the two
                         are separated by every source read in the cycle;
-               now:     epoch seconds.
+               now:     epoch seconds;
+               auth_confirmed: True when this gauge's source has failed
+                        authentication on enough consecutive cycles to be
+                        CONFIRMED dead (plan 3.6, G2). The stored reading is
+                        then not history any more: it is skipped and the
+                        stale-on-arrival body goes out.
       Outputs: (body: dict, fresh: bool). `fresh` is True only when the body
                carries THIS cycle's timestamp.
       Raises:  ValueError only for a body this repo should never build.
@@ -905,14 +1230,20 @@ def build_post(spec, reading, last, now):
         gauge EXISTS so the panel can say "unavailable" rather than showing
         nothing, and the 0 is never rendered as a live reading. This is the one
         number in the file we did not measure, and it is unreachable as a
-        displayed value by construction.
+        displayed value by construction;
+      * source failed AUTHENTICATION on enough consecutive cycles (`auth_confirmed`)
+        -> the never-measured body even though a previous reading exists. A
+        dead login must not keep its last number in colour until the horizon.
+        A stored AUTH MARKER (`validate_auth_marker`) is not a reading, so it
+        falls through `validate_stored_reading` to the same body -- which is
+        what keeps the result sticky when a later cycle fails some other way.
 
-    Implements: SR-021, LLR-005
+    Implements: SR-021, LLR-005, LLR-1055
     """
     if reading is not None:
         return build_gauge(spec, reading.percent, now,
                            reading.window_end, reading.window_seconds), True
-    checked = validate_stored_reading(last, now)
+    checked = None if auth_confirmed else validate_stored_reading(last, now)
     if checked is not None:
         return build_gauge(spec, checked["value"], checked["observed_at"],
                            checked["window_end"], checked["window_seconds"]), False
@@ -1282,6 +1613,13 @@ def load_state(state_path, now):
     the door rather than at the point of use means the rest of the file still
     works: one corrupted gauge goes "unavailable" and its four neighbours keep
     their real history.
+
+    TWO KINDS OF ENTRY BESIDE A READING ARE RECOGNISED, each by its own
+    validator and never by an exemption from validation: the reserved
+    AUTH_COUNTS_KEY (the consecutive-auth-failure counter) and an auth marker
+    under a gauge's key. Without that, the loader would silently drop them and
+    the next `save_state` would erase the count and the marker with them --
+    which is exactly how a one-shot unit would forget it had ever failed.
     """
     try:
         with open(state_path, encoding="utf-8") as handle:
@@ -1292,7 +1630,14 @@ def load_state(state_path, now):
         return {}
     out = {}
     for key, entry in data.items():
+        if key == AUTH_COUNTS_KEY:
+            counts = validate_auth_counts(entry, SOURCE_READERS)
+            if counts:
+                out[key] = counts
+            continue
         checked = validate_stored_reading(entry, now)
+        if checked is None:
+            checked = validate_auth_marker(entry, now)
         if checked is not None:
             out[key] = checked
     return out
@@ -1352,8 +1697,20 @@ def read_secret_file(path, extractor):
         raise SourceFailure("credential %s unreadable: %s" % (path, type(exc).__name__))
     value = extractor(data)
     if not value:
-        raise SourceFailure("credential %s carries no usable key" % path)
+        raise NoUsableKey("credential %s carries no usable key" % path)
     return value
+
+
+class NoUsableKey(SourceFailure):
+    """The credential file parsed but held nothing the extractor could use.
+
+    A PLAIN SourceFailure to every caller except one. The same text once came
+    from a renamed OpenCode schema (`_opencode_key`) -- a perfectly good
+    credential read wrongly -- so it must never be classified as authentication
+    by its words. `read_claude` alone promotes it to an AuthFailure, because
+    for Claude a file that parses but carries no access token IS what an
+    expired or half-rewritten login looks like.
+    """
 
 
 def _claude_token(data):
@@ -1532,30 +1889,45 @@ def vendor_opener():
         urllib.request.ProxyHandler({}), _RefuseRedirects())
 
 
-def http_json(url, headers, timeout):
-    """One GET, decoded. Every failure class becomes SourceFailure.
+def http_json(url, headers, timeout, data=None):
+    """One GET (or, with `data`, one JSON POST), decoded.
 
-    Transport error, timeout, non-200 and an undecodable body are ONE outcome
-    on purpose - see SourceFailure. The response body is NOT echoed into the
-    exception on an auth failure, because a 401 body can carry request context.
+    Every failure class becomes SourceFailure. Transport error, timeout,
+    non-200 and an undecodable body are ONE outcome on purpose - see
+    SourceFailure - with ONE exception: an HTTP 401 is an `AuthFailure`
+    (carrying `status`), because it is the vendor saying the login is no good,
+    and `run_cycle` must be able to tell that from a 500. The response body is
+    NOT echoed into the exception on an auth failure, because a 401 body can
+    carry request context.
 
     The URL must be https. These headers carry a vendor bearer token, and the
     URL is a knob (AI_USAGE_CLAUDE_URL / AI_USAGE_OPENCODE_URL); an http one
     would put the household's token on the wire in clear. The refusal is here
     rather than at the knob because this is the one function that attaches the
     token to a request.
+
+    `data` (a JSON-encodable object) turns the call into a POST with
+    `Content-Type: application/json`. Gemini's two calls are POSTs; nothing
+    else about the opener changes -- same redirect refusal, same no-proxy rule.
     """
     if not url.lower().startswith("https://"):
         raise SourceFailure(
             "%s: refused - a vendor URL carrying a bearer token must be https"
             % url)
-    request = urllib.request.Request(url, headers=headers)
+    if data is None:
+        request = urllib.request.Request(url, headers=headers)
+    else:
+        request = urllib.request.Request(
+            url, data=json.dumps(data).encode("utf-8"), method="POST",
+            headers=dict(headers, **{"Content-Type": "application/json"}))
     try:
         with vendor_opener().open(request, timeout=timeout) as response:
             if response.status != 200:
                 raise SourceFailure("%s: HTTP %s" % (url, response.status))
             raw = response.read()
     except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise AuthFailure("%s: HTTP 401" % url, status=401)
         raise SourceFailure("%s: HTTP %s" % (url, exc.code))
     except (SourceFailure, EgressRefused):
         raise
@@ -1565,6 +1937,81 @@ def http_json(url, headers, timeout):
         return json.loads(raw.decode("utf-8", "replace"))
     except ValueError:
         raise SourceFailure("%s: body is not JSON" % url)
+
+
+# What a REMOTE-chosen string may look like after redaction. Order matters: the
+# specific shapes first, so a JWT is named as one before the generic rule eats
+# part of it.
+_REDACTIONS = (
+    (re.compile(r"(?i)\bbearer\s+\S+"), "Bearer [redacted]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-.]{8,}"), "[redacted]"),          # JWT
+    (re.compile(r"(?i)\b(?:sk|pk|rk|ghp|gho|ghs|ya29|xox[a-z])[-_.][A-Za-z0-9_\-.]{8,}"),
+     "[redacted]"),                                                    # vendor key prefixes
+    (re.compile(r"[A-Za-z0-9_\-+=]{24,}"), "[redacted]"),             # any long opaque run
+)
+_REMOTE_TEXT_LIMIT = 200
+
+
+def redact_remote_text(text, limit=_REMOTE_TEXT_LIMIT):
+    """A vendor's free text made safe to put in the journal: redacted, then cut.
+
+    REDACT FIRST, THEN TRUNCATE. Cutting first could slice a token in half and
+    leave a prefix that no pattern recognises. A run of 24+ characters from the
+    base64/base64url/hex alphabet is replaced whatever it looks like: a message
+    has no legitimate reason to contain one, and a false positive costs a word
+    of diagnostic where a miss costs a credential. Control characters are
+    flattened so a hostile server cannot forge a journal line.
+
+    This is the ONE place a remote's own words reach a message, and it exists
+    for one reason (plan 3.5 / RR2-14): Codex rejected the login server-side
+    for six days and the feeder said only "JSON-RPC error -32603".
+
+    Implements: SR-069, LLR-1052
+    """
+    text = "" if text is None else str(text)
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[:limit - 3] + "..."
+    return text
+
+
+# What makes a Codex error frame an AUTHENTICATION failure: the vendor's own
+# `token_expired` word, or a 401 stated as such. Deliberately narrow -- a bare
+# "401" in a message (a byte count, a port) is not a login.
+_CODEX_AUTH = re.compile(r"(?i)token_expired|\b401\s+unauthorized\b|\"status\"\s*:\s*401\b")
+
+
+def codex_error_frame(frame):
+    """Turn a JSON-RPC error frame into the right SourceFailure.
+
+    The SERVER'S MESSAGE is included -- truncated and redacted (see
+    `redact_remote_text`) -- and the failure is an `AuthFailure(code=
+    "token_expired")` when the frame says the login is dead. `data`, when the
+    server sends one, is read for CLASSIFICATION and for the message alike,
+    because a `token_expired` can arrive in either.
+    """
+    error = frame.get("error")
+    if not isinstance(error, dict):
+        return SourceFailure("codex: JSON-RPC error (no detail)")
+    code = error.get("code")
+    code_text = str(code) if isinstance(code, int) and not isinstance(code, bool) else "?"
+    parts = []
+    for field in ("message", "data"):
+        value = error.get(field)
+        if value is None:
+            continue
+        parts.append(value if isinstance(value, str) else json.dumps(value, default=str))
+    raw = " ".join(parts)
+    text = "codex: JSON-RPC error %s" % code_text
+    detail = redact_remote_text(raw)
+    if detail:
+        text += ": " + detail
+    if _CODEX_AUTH.search(raw):
+        return AuthFailure(text, code="token_expired")
+    return SourceFailure(text)
 
 
 def read_codex(env):
@@ -1626,16 +2073,27 @@ def read_codex(env):
     if frame is None:
         raise SourceFailure("codex: no rateLimits answer within %ss" % timeout)
     if "error" in frame:
-        raise SourceFailure("codex: JSON-RPC error %s" % frame["error"].get("code"))
+        raise codex_error_frame(frame)
     return parse_codex(frame.get("result"), cycle_now(env))
 
 
-def read_claude(env):
-    """Source 2: the OAuth usage endpoint, with its beta header and UA."""
-    path = env.get("AI_USAGE_CLAUDE_CREDENTIALS")
+def _read_claude_account(env, name, credentials_knob, buckets, scoped_models):
+    """One Claude account's usage, read with that account's own credential file.
+
+    THE ONLY PLACE "carries no usable key" BECOMES AUTHENTICATION. `NoUsableKey`
+    is a plain SourceFailure everywhere else (OpenCode's renamed schema produced
+    the same words from a good credential), but a Claude credentials file that
+    parses and holds no access token is what a lapsed or half-rewritten login
+    looks like. Confirming it over two cycles (`run_cycle`) is what absorbs the
+    refresh unit rewriting the file mid-read.
+    """
+    path = env.get(credentials_knob)
     if not path:
-        raise SourceFailure("claude: AI_USAGE_CLAUDE_CREDENTIALS unset")
-    token = read_secret_file(path, _claude_token)
+        raise SourceFailure("%s: %s unset" % (name, credentials_knob))
+    try:
+        token = read_secret_file(path, _claude_token)
+    except NoUsableKey as exc:
+        raise AuthFailure(str(exc), code="no_usable_key")
     version = env.get("AI_USAGE_CLAUDE_VERSION") or "2.0.0"
     url = env.get("AI_USAGE_CLAUDE_URL") or "https://api.anthropic.com/api/oauth/usage"
     body = http_json(url, {
@@ -1644,7 +2102,96 @@ def read_claude(env):
         "User-Agent": "claude-code/" + version,
         "Accept": "application/json",
     }, int(env.get("AI_USAGE_TIMEOUT_SECONDS") or 30))
-    return parse_claude(body, cycle_now(env))
+    return parse_claude(body, cycle_now(env), buckets, scoped_models, name)
+
+
+def read_claude(env):
+    """Source 2: the OAuth usage endpoint, with its beta header and UA."""
+    return _read_claude_account(env, "claude", "AI_USAGE_CLAUDE_CREDENTIALS",
+                                CLAUDE_BUCKETS, CLAUDE_SCOPED_MODELS)
+
+
+def read_claude2(env):
+    """Source 2b: the SAME endpoint for the second account.
+
+    Its credential is a different file, written by the CLI run with its own
+    `CLAUDE_CONFIG_DIR` (`homehub-claude-refresh@claude2` keeps it alive). The
+    two accounts never share a file, and neither unit ever touches the other's:
+    a refresh token is single-use and rotating, so a copy refreshed anywhere
+    else would retire the live one.
+    """
+    return _read_claude_account(env, "claude2", "AI_USAGE_CLAUDE2_CREDENTIALS",
+                                CLAUDE2_BUCKETS, CLAUDE2_SCOPED_MODELS)
+
+
+def _gemini_token(data):
+    """(access_token, expiry_date in ms or None) from the CLI's oauth_creds.json.
+
+    The file is google-auth-library's `Credentials` as `oauth2.ts`
+    `cacheCredentials` writes it: `access_token`, `refresh_token`, `expiry_date`
+    (epoch MILLISECONDS), `scope`, `token_type`, `id_token`. Only the first and
+    the third are read -- never the refresh token. This feeder does not refresh
+    a Google token and so has no use for one.
+    """
+    if not isinstance(data, dict):
+        return None
+    token = data.get("access_token")
+    if not isinstance(token, str) or not token:
+        return None
+    expiry = data.get("expiry_date")
+    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)) \
+            or not math.isfinite(expiry):
+        expiry = None
+    return token, expiry
+
+
+def read_gemini(env):
+    """Source 4: Gemini CLI's quota call, using the token the CLI itself keeps.
+
+    THE FEEDER NEVER MINTS OR REFRESHES A GOOGLE TOKEN (SR-021). It reads
+    `access_token` out of the file Gemini CLI maintains and spends it on two
+    calls the CLI makes itself. If the token has expired it says so and stops --
+    renewing it is `homehub-gemini-refresh`'s job, running the CLI, in a
+    process that is allowed to write that file. A token expired by its own
+    `expiry_date` is an AuthFailure: left alone it means the CLI's refresh is
+    not happening, which is a dead login as far as the wall is concerned, and
+    the two-cycle confirmation absorbs the moments between expiry and renewal.
+
+    It also never ONBOARDS: no `currentTier` in the `loadCodeAssist` answer is a
+    refusal (see `parse_gemini_project`), not a trigger for `onboardUser`.
+
+    Implements: SR-021, SR-067, LLR-1050
+    """
+    path = env.get("AI_USAGE_GEMINI_CREDENTIALS")
+    if not path:
+        raise SourceFailure("gemini: AI_USAGE_GEMINI_CREDENTIALS unset")
+    models = parse_gemini_models(env.get("AI_USAGE_GEMINI_MODELS"))
+    now = cycle_now(env)
+    token, expiry_ms = read_secret_file(path, _gemini_token)
+    if expiry_ms is not None and expiry_ms / 1000.0 <= now:
+        raise AuthFailure(
+            "gemini: the CLI's access token has expired and has not been renewed "
+            "(homehub-gemini-refresh keeps it alive)", code="access_token_expired")
+    base = (env.get("AI_USAGE_GEMINI_URL") or GEMINI_DEFAULT_BASE_URL).rstrip("/")
+    timeout = int(env.get("AI_USAGE_TIMEOUT_SECONDS") or 30)
+    headers = {
+        "Authorization": "Bearer " + token,
+        "User-Agent": env.get("AI_USAGE_AGENT") or "homehub-ai-usage/1",
+        "Accept": "application/json",
+    }
+    configured = (env.get("AI_USAGE_GEMINI_PROJECT") or "").strip() or None
+    metadata = {"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED",
+                "pluginType": "GEMINI"}
+    load_request = {"metadata": metadata}
+    if configured and _GEMINI_PROJECT_ID.match(configured):
+        load_request["cloudaicompanionProject"] = configured
+        metadata["duetProject"] = configured
+    project = parse_gemini_project(
+        http_json(base + ":loadCodeAssist", headers, timeout, data=load_request),
+        configured)
+    quota = http_json(base + ":retrieveUserQuota", headers, timeout,
+                      data={"project": project})
+    return parse_gemini_quota(quota, now, models)
 
 
 def read_opencode(env):
@@ -1672,12 +2219,18 @@ def read_opencode(env):
 SOURCE_READERS = {
     "codex": read_codex,
     "claude": read_claude,
+    "claude2": read_claude2,
+    "gemini": read_gemini,
     "opencode": read_opencode,
 }
 
 
 def enabled_sources(env):
-    """Which of the three to read. Absent knob = all three; each is optional.
+    """Which sources to read. Absent knob = the original three; each is optional.
+
+    `claude2` and `gemini` are OPT-IN: they need a second sign-in and a second
+    credential file, so an absent knob must not start posting a gauge for a
+    login nobody has made.
 
     A source whose credential the Owner has not supplied is switched OFF here
     rather than left to fail every cycle - a permanently unavailable gauge on
@@ -1747,7 +2300,15 @@ def run_cycle(env, now=None, readers=None, poster=None):
     built falls back to the never-measured sentinel - value 0, no stamp - so
     the failure still shows up as "unavailable" rather than as a hole.
 
-    Implements: SR-021, LLR-005
+    A SOURCE THAT FAILS AUTHENTICATION IS COUNTED, AND TWO IN A ROW GREY IT
+    (plan 3.6, G2). `AuthFailure` is caught before `SourceFailure`; the count of
+    consecutive auth-failed cycles per source rides in the state file under
+    AUTH_COUNTS_KEY (this is a one-shot unit); and on the confirming cycle each
+    stored reading of that source is replaced by an auth marker, key kept, so a
+    later failure of any other kind cannot restore the old colour and an
+    optional gauge still posts. Any other outcome for the source resets its count.
+
+    Implements: SR-021, SR-068, LLR-005, LLR-1053, LLR-1054, LLR-1055
     """
     now = int(now if now is not None else time.time())
     readers = readers or SOURCE_READERS
@@ -1761,9 +2322,17 @@ def run_cycle(env, now=None, readers=None, poster=None):
     env["_now"] = now
 
     readings, failures = {}, []
+    auth_failed = set()
     for name in active:
         try:
             readings.update(readers[name](env))
+        # AuthFailure FIRST, and the order is the feature: it is a subclass of
+        # SourceFailure, so listed second it would be swallowed by the plain
+        # handler below and a dead login would be indistinguishable from a
+        # network blip -- the defect plan 3.6 (G2) exists to fix.
+        except AuthFailure as exc:
+            auth_failed.add(name)
+            failures.append("%s: %s" % (name, exc))
         except SourceFailure as exc:
             failures.append("%s: %s" % (name, exc))
         except Exception as exc:               # a reader bug is a source failure
@@ -1773,8 +2342,42 @@ def run_cycle(env, now=None, readers=None, poster=None):
     # Presence, not content -- see state_keys. A corrupt stored entry must not
     # look like a gauge we have never seen.
     ever_seen = state_keys(state_path)
+    specs = gauge_specs(env)
+
+    # CONSECUTIVE auth-failed cycles per source, from the state file and back
+    # into it. A source that succeeded, failed some OTHER way, or is no longer
+    # enabled has no entry here, which IS the reset. Capped at the threshold:
+    # the number is "confirmed or not", not a tally of how long it has been dead.
+    previous = state.get(AUTH_COUNTS_KEY) or {}
+    counts = {}
+    for name in active:
+        if name in auth_failed:
+            counts[name] = min(previous.get(name, 0) + 1, AUTH_CONFIRM_CYCLES)
+            failures.append(
+                "%s: authentication failure %d of %d%s" % (
+                    name, counts[name], AUTH_CONFIRM_CYCLES,
+                    " - CONFIRMED, its gauges are posted unavailable"
+                    if counts[name] >= AUTH_CONFIRM_CYCLES
+                    else " - last reading kept until confirmed"))
+    confirmed = set(name for name, count in counts.items()
+                    if count >= AUTH_CONFIRM_CYCLES)
+    if counts:
+        state[AUTH_COUNTS_KEY] = counts
+    else:
+        state.pop(AUTH_COUNTS_KEY, None)
+    # MARK, NEVER DELETE: replace each stored reading with an auth marker, key
+    # kept, so a later failure of any other kind cannot bring the old colour
+    # back (the sticky rule) and an optional gauge still posts. A gauge this
+    # box has never seen is left alone -- marking it would conjure a gauge
+    # that never existed.
+    for spec in specs:
+        if spec.source in confirmed and (spec.key in state or spec.key in ever_seen):
+            current = state.get(spec.key)
+            if not (isinstance(current, dict) and current.get("auth_failed") is True):
+                state[spec.key] = {"auth_failed": True, "at": now}
+
     posted = []
-    for spec in GAUGE_SPECS:
+    for spec in specs:
         if spec.source not in active:
             continue
         reading = readings.get(spec.key)
@@ -1785,7 +2388,8 @@ def run_cycle(env, now=None, readers=None, poster=None):
         if spec.optional and reading is None and spec.key not in ever_seen:
             continue
         try:
-            body, fresh = build_post(spec, reading, stored, now)
+            body, fresh = build_post(spec, reading, stored, now,
+                                     auth_confirmed=spec.source in confirmed)
         except (ValueError, SourceFailure) as exc:
             failures.append("gauge %s: %s" % (spec.key, exc))
             body, fresh = build_gauge(spec, UNAVAILABLE_CONSUMED, None, None, None), False

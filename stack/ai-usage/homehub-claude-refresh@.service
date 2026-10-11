@@ -1,5 +1,34 @@
 [Unit]
-# KEEP THE CLAUDE CREDENTIAL ALIVE, and do nothing else.
+# KEEP A CLAUDE CREDENTIAL ALIVE, and do nothing else.
+#
+# THIS IS A TEMPLATE (plan 3.3, "Claude 2"). One instance per Claude account,
+# named after the feeder reader it keeps alive:
+#
+#   homehub-claude-refresh@claude.service    account 1: the CLI's default config
+#                                            (~/.claude and ~/.claude.json), so
+#                                            the unit that always existed keeps
+#                                            exactly the paths it always had.
+#   homehub-claude-refresh@claude2.service   account 2: CLAUDE_CONFIG_DIR=
+#                                            ~/.claude-2, signed in once by hand.
+#
+# What differs per instance -- User=, Group=, ReadWritePaths= and, for account 2,
+# CLAUDE_CONFIG_DIR -- arrives in a per-instance drop-in that setup-ai-usage.sh
+# writes from the account's real home. Everything else, and every hardening
+# line, is here ONCE, so the two accounts cannot drift apart.
+#
+# WHY EACH INSTANCE NAMES ITS OWN WRITABLE PATH AND NOTHING ELSE. The instance
+# for account 2 is not allowed to write account 1's files and the reverse. The
+# rotation rule below is per credential, and two units each able to write both
+# files would be one bad `claude` invocation away from the cross-contamination
+# that rule exists to prevent.
+#
+# MEASURED ON WINDOWS ONLY, 2026-10-11 (Claude Code 2.1.296 on the dev PC): with
+# CLAUDE_CONFIG_DIR set, the CLI creates `.claude.json` -- machineID and all --
+# INSIDE that directory and leaves ~/.claude.json untouched. UNVERIFIED on the
+# hub's Linux build. If account 2's whole state is that one directory, which is
+# what its ReadWritePaths= grants, nothing more is needed; and if the Linux build
+# disagrees, the instance is deliberately NOT given account 1's ~/.claude.json to
+# paper over it -- the first live sign-in should check (see README.md).
 #
 # THE PROBLEM THIS EXISTS FOR. The Claude access token lives EIGHT HOURS
 # (`expiresAt` in ~/.claude/.credentials.json). Claude Code renews it out of the
@@ -35,16 +64,16 @@
 # single-use with rotation -- a copy that refreshes retires the live token and
 # throws the replacement away, and the Owner has to sign in again. One copy,
 # always, which is why this unit works on the real file in place.
-Description=HomeHub: keep the Claude Code credential fresh (SR-021)
+Description=HomeHub: keep the Claude Code credential fresh, account %i (SR-021)
 Documentation=file:///opt/homehub/stack/ai-usage/README.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-# User=/Group= arrive in a drop-in written by setup-ai-usage.sh from
-# AI_USAGE_USER_ACCOUNT, the same way the feeder's do, so the account that owns
-# the credential and the account that runs are one value.
+# User=/Group= arrive in a PER-INSTANCE drop-in written by setup-ai-usage.sh
+# from AI_USAGE_USER_ACCOUNT, the same way the feeder's do, so the account that
+# owns the credential and the account that runs are one value.
 NoNewPrivileges=yes
 
 # THIS UNIT IS THE ONE THING ALLOWED TO WRITE THE CREDENTIAL, and that is the
@@ -52,8 +81,9 @@ NoNewPrivileges=yes
 # feeder keeps ProtectHome=read-only and its one-path write allow-list, exactly
 # as SR-021 requires; the renewing happens here, in a process whose entire job
 # is one command, which talks to one vendor and never to the tracker.
-# `ReadWritePaths=` for the two credential paths arrives in the SAME drop-in
-# that carries User=, written by setup-ai-usage.sh from the account's real home.
+# `ReadWritePaths=` for the instance's credential paths (account 1: ~/.claude and
+# ~/.claude.json; account 2: ~/.claude-2) arrives in the SAME drop-in that
+# carries User=, written by setup-ai-usage.sh from the account's real home.
 # It is not written here with `%h`, and that is not a style choice: in a SYSTEM
 # unit `%h` expands to the MANAGER's home -- /root -- not to User='s. The first
 # cut used it and systemd refused the unit outright with
@@ -62,7 +92,7 @@ NoNewPrivileges=yes
 # one. The account name already comes from one knob; so does its home.
 #
 # ProtectHome=read-only, not tmpfs: the same posture as the feeder, with exactly
-# two paths re-opened for writing. Verified as the TIGHTEST set that works --
+# the instance's own paths re-opened for writing. Verified as the TIGHTEST set that works --
 # `claude -p "/usage"` needs no writable ~/.cache, tested against a home that
 # offered one and a home that did not.
 ProtectHome=read-only

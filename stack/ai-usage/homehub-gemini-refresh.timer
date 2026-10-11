@@ -1,0 +1,44 @@
+[Unit]
+Description=Refresh the Gemini CLI token before it expires (SR-021)
+Documentation=file:///opt/homehub/stack/ai-usage/README.md
+
+[Timer]
+# FOUR MINUTES, BECAUSE THE LIBRARY ONLY RENEWS INSIDE A FIVE-MINUTE WINDOW.
+#
+# Gemini CLI renews through google-auth-library's OAuth2Client, and
+# `getAccessTokenAsync()` refreshes only when there is no access token or
+# `isTokenExpiring()` is true:
+#     expiry_date <= now + eagerRefreshThresholdMillis
+# The default threshold is DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS = 5 * 60 * 1000,
+# and the CLI constructs its client without overriding it (gemini-cli
+# code_assist/oauth2.ts `createBaseOAuth2Client`). Read from the library the CLI
+# pins (google-auth-library 10.9.0, gemini-cli packages/core/package.json),
+# as bundled in @google/gemini-cli 0.63.0.
+#
+# So a run of the CLI does NOTHING to a token that has more than five minutes
+# left. With a roughly one-hour token, a run at +30 minutes renews nothing and the
+# next one lands after expiry -- one slow or failed run and the ring goes grey
+# for half an hour. The keeper must therefore run MORE OFTEN than the window is
+# wide, so that some run always lands inside the last five minutes before expiry:
+#
+#     interval + AccuracySec + RandomizedDelaySec  <  eager window (5 min)
+#
+# 4 min + 15 s + 0 = 4 min 15 s. That leaves one run inside the window and, if it
+# is missed, a second one still before expiry; two missed runs in a row is what
+# it takes to lose the token. tests/test_ai_usage_sources_and_auth.py reads these
+# three lines and fails if the sum ever reaches the window.
+#
+# Each run is a process start with no model call (see gemini_auth_refresh.py). It
+# bounds itself at 60 s and the unit at 90 s, far under the interval, and systemd
+# never starts a oneshot unit that is still activating, so runs cannot stack.
+OnBootSec=2min
+OnUnitActiveSec=4min
+# NO randomised delay: it would be added to the interval and eat the margin above.
+RandomizedDelaySec=0
+AccuracySec=15s
+# Persistent, like the Claude refresher and unlike the feeder: a missed feeder
+# run is one stale reading, a missed refresh is a grey ring until the next one.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

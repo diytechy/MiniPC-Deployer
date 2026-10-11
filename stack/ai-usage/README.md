@@ -4,7 +4,7 @@ Reads how much of each AI subscription has been consumed and posts it to
 NagLight as gauges. A plain hub service on a systemd timer — **no container**,
 **off by default**, and it **never writes a vendor credential file**.
 
-## The three sources, and the one real call each was built from
+## The first three sources, and the one real call each was built from
 
 The build plan made this a gate rather than a preference: **a parser written
 from documentation posts fiction, and fiction looks exactly like a healthy
@@ -93,13 +93,164 @@ green one), so nothing about the behaviour looked wrong. Claude's
 `claude-code/<version>` agent and its `anthropic-beta` header are asserted by
 the same test.
 
-**Gemini is out** — deferred as E11.
+## Two more sources (2026-10-11, plan R2) — both opt-in
+
+`AI_USAGE_SOURCES` defaults to `codex,claude,opencode`. `claude2` and `gemini`
+need their own sign-ins, so neither switches itself on. The full set is
+`claude,claude2,codex,gemini,opencode`; `docs/config-reference.md` has the knobs
+and the exact edit-and-reload steps.
+
+### Claude account 2 — `claude2`
+
+The same endpoint and parser as account 1 (`parse_claude` takes the gauge table
+as a parameter), with its own credential file (`AI_USAGE_CLAUDE2_CREDENTIALS`)
+and its own ids: `ai-usage-claude2-session`, `-weekly` and `-weekly-fable`. The
+panel groups rings by the provider id inside the gauge id, which is why the ids
+are `claude2` and not `claude-2`: the panel's regex is
+`/^ai-usage-([a-z0-9]+)(?:-|$)/`, and `claude-2-…` would parse as provider
+`claude` and merge into account 1's ring.
+
+**The refresher is a template** (`homehub-claude-refresh@.service` and
+`@.timer`), one instance per account, named after the reader: `@claude` and
+`@claude2`. What differs per instance is a drop-in `setup-ai-usage.sh` writes
+from the account's real home:
+
+| Instance | `ReadWritePaths=` | Extra |
+|---|---|---|
+| `@claude` | `~/.claude` and `~/.claude.json` — the paths the un-templated unit always had | none (the CLI's default config) |
+| `@claude2` | `~/.claude-2` | `Environment=CLAUDE_CONFIG_DIR=~/.claude-2` |
+
+**Does `.claude.json` move under `CLAUDE_CONFIG_DIR`? On Windows, yes —
+measured; on the hub's Linux build, unverified.** On 2026-10-11, with Claude
+Code 2.1.296 on the Windows dev PC, running
+`claude auth status` with `CLAUDE_CONFIG_DIR` pointed at an empty directory
+created `.claude.json` (holding `machineID`, `firstStartTime` and so on) **inside
+that directory**, and left the real `~/.claude.json` byte-for-byte untouched
+(mtime unchanged). So account 2's entire state is one directory, and its unit is
+granted that directory and not a byte of account 1's. That was measured on
+Windows only; the hub's CLI is a different build on Linux, so the first live
+sign-in should confirm `ls -a ~/.claude-2` shows `.claude.json` and that
+`~/.claude.json`'s mtime did not move.
+
+**Migration of a box that has the old units.** `setup-ai-usage.sh` installs the
+template and the `@claude` drop-in first, then — only if
+`homehub-claude-refresh.{timer,service}` or its `.service.d` exist — stops and
+disables the old timer, deletes the old files and drop-in, and only then runs
+`daemon-reload` and enables `homehub-claude-refresh@claude.timer`. The two
+timers are never both enabled (two processes refreshing one rotating credential
+is the thing that must not happen). Account 1's user, command and writable paths
+are unchanged; only the unit name differs. On a box that never had the old pair
+every migration line is a no-op. The new timer's `OnBootSec=3min` is already
+elapsed on a long-running hub, so the first renewal runs as soon as the timer is
+enabled — harmless, `/usage` costs nothing.
+
+### Gemini — `gemini`
+
+    POST https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
+         {"metadata":{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}
+      -> {"currentTier":{...},"cloudaicompanionProject":"<project id>",...}
+    POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota
+         {"project":"<project id>"}
+      -> {"buckets":[{"modelId","remainingFraction","resetTime","remainingAmount","tokenType"},...]}
+
+Authorization is `Bearer <access_token>` read from the CLI's
+`~/.gemini/oauth_creds.json`. Everything above is **read from the Gemini CLI
+source** (HEAD `9b6e026`, 2026-10-09: `code_assist/server.ts`, `types.ts`,
+`setup.ts`, `oauth2.ts`, `config/config.ts` `refreshUserQuota`), **not from an
+observed response** — no live call was possible when it was written. That is
+the opposite of this README's rule for the other three sources, so the parser is
+stricter than they are (below) and the list of what a first live run must
+confirm is at the end of this section.
+
+The plan's four open questions, answered from that source:
+
+1. **Where the project id comes from.** `loadCodeAssist` (`setup.ts`
+   `_doSetupUser`): an onboarded account's answer carries `currentTier` and
+   `cloudaicompanionProject`, and that is the id the CLI passes to
+   `retrieveUserQuota`. If the answer names none, the CLI falls back to the
+   operator's `GOOGLE_CLOUD_PROJECT`; the feeder's equivalent is
+   `AI_USAGE_GEMINI_PROJECT`. An answer with **no `currentTier`** is an account
+   the CLI would *onboard* (`onboardUser`, a mutating call); the feeder never
+   makes one and reports "not onboarded" instead.
+2. **Which bucket.** Buckets are per model. The gauge is the **lowest
+   `remainingFraction`** (the most-consumed one) among the models named in
+   `AI_USAGE_GEMINI_MODELS` — every bucket when it is blank — and **the label
+   says which** (`Gemini daily (all models)`, or the list). A named model with no
+   bucket refuses the whole reading, because the answer is a minimum and a quietly
+   missing bucket could be the lowest. The window is the 24 hours ending at that
+   bucket's own `resetTime`, kind `daily`; `check_window` refuses a bucket whose
+   reset is more than a day out, so a weekly bucket cannot be mis-sized as daily.
+3. **A refresh that costs no quota.** There is **no free CLI command**, unlike
+   Claude's `/usage`: in headless mode a slash command whose action returns
+   nothing falls through and **the literal text `/stats` is sent to the model**
+   (`nonInteractiveCli.ts`), one billed request per run against the very quota
+   being reported. What does renew the token without a model call is the Agent
+   Client Protocol: `gemini --acp`. With `selectedType` = `oauth-personal` and
+   the browser suppressed (`NO_BROWSER=true`), the CLI loads the cached
+   credential and **renews an expired access token at startup, before the
+   protocol loop begins** (`gemini.tsx`: "Do oauth before app renders" →
+   `getOauthClient`, whose google-auth-library `tokens` hook rewrites
+   `oauth_creds.json`); `authenticate` (`acp/acpRpcDispatcher.ts`) runs
+   `config.refreshAuth` once more. `gemini_auth_refresh.py` starts it, sends
+   `initialize` (the reply proves startup finished) then `authenticate`, and
+   stops, under `homehub-gemini-refresh.{service,timer}` (every 4 minutes,
+   because google-auth-library only renews inside a 5-minute window before
+   expiry: `DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS = 5 * 60 * 1000`,
+   `isTokenExpiring()` is `expiry_date <= now + threshold`, and the CLI does not
+   override it — read from google-auth-library 10.9.0 as bundled in
+   `@google/gemini-cli` 0.63.0; a 30-minute interval would renew nothing at +30
+   and land after expiry at about +62). It refuses to run unless
+   `security.auth.selectedType` is `oauth-personal` (because `authenticate`
+   *clears* the cached credentials to switch method) and unless a cached
+   credential exists, and prints one status line and nothing the CLI said.
+   **Observed against the real CLI** (`@google/gemini-cli` 0.63.0 from npm, dev
+   PC, an isolated `GEMINI_CLI_HOME` holding a *fake* credential): `--acp` is a
+   real flag, and a credential the CLI cannot renew does **not** produce an ACP
+   session at all — the CLI prints "Please visit the following URL to authorize
+   the application" on stdout and waits on stdin for a code, before the protocol
+   loop. The keeper recognises that prompt and exits **4** within seconds
+   (`gemini-refresh: DEAD LOGIN`), which is the Gemini dead-login journal
+   signature. **The happy path — a real, renewable credential — was not run**
+   (it needs the Owner's account): see below.
+4. **The feeder never mints or refreshes a Google token (SR-021).** It reads
+   `access_token` and `expiry_date` and spends the token on the two calls above.
+   It never reads `refresh_token`, never writes the file, and an access token
+   past its own `expiry_date` is reported (`gemini: the CLI's access token has
+   expired and has not been renewed`) rather than renewed. Using the CLI's
+   OAuth client from a second program is a grey area; the mitigation is that the
+   *CLI* is the only thing that ever uses it, from the account the CLI already
+   uses, and the feeder only borrows the resulting bearer token for the same
+   two calls the CLI makes.
+
+**Not proven (the first live run must confirm each):**
+
+* the two response shapes above against a real answer — particularly that
+  `remainingFraction` is *remaining* (it is named so in `types.ts`, and the CLI
+  multiplies it into "remaining"), that `resetTime` is RFC 3339, and that every
+  bucket for the models in use is daily;
+* what `tokenType` distinguishes, and whether buckets of two token types for one
+  model should be minimised together (they are today);
+* that `gemini --acp` renews the token on a **real** credential **without a model
+  call** and without opening a browser, on the hub's CLI build (the dead-login
+  half is observed, above; this is the live half). The proof is one
+  command: note `expiry_date` (the number only), run
+  `sudo systemctl start homehub-gemini-refresh.service`, and expect the journal
+  line `… the token's expiry moved forward`, and no new request in the quota.
+  If it does not hold the ring reads unavailable (fail closed), and the fallback
+  is signing in by hand every hour — i.e. Gemini is then not deployable
+  unattended, and the plan should be told;
+* that `ProtectHome=read-only` plus `ReadWritePaths=~/.gemini` is enough for the
+  CLI to run (it may want another path; a 226/NAMESPACE or a read-only error in
+  the journal would say which);
+* account risk from using an unofficial endpoint.
 
 ## What it posts (IF-012, amended by v1.1 on 2026-09-12)
 
-Six gauges, upserted by id: `ai-usage-codex`, `ai-usage-claude-session`,
+Up to ten gauges, upserted by id: `ai-usage-codex`, `ai-usage-claude-session`,
 `ai-usage-claude-weekly`, `ai-usage-claude-weekly-fable`,
-`ai-usage-opencode-weekly`, `ai-usage-opencode-monthly`. Each body is
+`ai-usage-opencode-weekly`, `ai-usage-opencode-monthly`, and — only for the
+opt-in sources — `ai-usage-claude2-session`, `ai-usage-claude2-weekly`,
+`ai-usage-claude2-weekly-fable` and `ai-usage-gemini-daily`. Each body is
 `kind:"gauge"` with `unit:"%"`, `min:0`, `max:100`, `target:0`,
 `direction:"down"` and a `window`.
 
@@ -201,6 +352,63 @@ stale 24 h after `observed_at`, and three of the six are weekly. The timer runs
 every 10 minutes — 1/144th of the tightest horizon — and
 `tests/test_ai_usage_feeder.py` reads the shipped timer file and fails if that
 interval is ever loosened past a quarter of it.
+
+## A dead login goes grey, and stays grey (plan 3.6, G2)
+
+Until 2026-10-11 a source that failed re-posted its last real reading at its
+original `observed_at`, so the wall showed that number **in colour** until
+NagLight's horizon passed (24 h weekly, 36 h daily, 48 h monthly). Codex was
+rejected server-side for six days and Claude's refresh token lapsed for a day;
+both looked healthy. Now a failure **classified as authentication** greys the
+gauge, while every other failure keeps exactly the old behaviour.
+
+**Typed.** `AuthFailure(SourceFailure)` carries `status` and `code`. It is still
+a `SourceFailure`, so every old handler works, but `run_cycle` catches it
+*first* — listed second it would be swallowed by the plain handler. No reader
+may catch an `AuthFailure` and re-raise a plain one. What counts:
+
+| Source | Authentication |
+|---|---|
+| any HTTP source | an HTTP **401** (`http_json`) |
+| `codex` | the server's `token_expired` (or a 401 stated as such) in the JSON-RPC error frame |
+| `claude`, `claude2` | the credential file parsed but carries **no usable key** — *Claude readers only*; the same words once came from a renamed OpenCode schema (`NoUsableKey` is a plain failure everywhere else) |
+| `gemini` | a 401, or the cached access token past its own `expiry_date` |
+
+**Confirmed over two consecutive cycles** (`AUTH_CONFIRM_CYCLES`), because the
+Claude refresh unit rewrites the credential file and a read in the middle of
+that can look like "no usable key". The first failed cycle behaves as today;
+the second greys the source's gauges (up to about 20 minutes after the login
+died, on the 10-minute timer — a refinement of the Owner's "at once"). Any cycle
+in which the source succeeds, or fails some *other* way, resets the count.
+
+**The count lives in the state file.** This is a one-shot unit, so memory does
+not survive; but `load_state` drops every key that is not a reading. So the count
+is one **reserved key** (`__auth_failures__`, `{source: n}`), with its own
+validator in `load_state` (never an exemption from validation), carried by
+`save_state`, counts only.
+
+**Marked, never deleted.** On the confirming cycle each stored reading of that
+source is *replaced* by `{"auth_failed": true, "at": <epoch>}` — the key stays.
+`state_keys` answers "have we ever seen this gauge", and an optional gauge
+(Fable) is skipped when its key is absent: deleting would make the Fable band
+*vanish* instead of going grey. The marker has its own validator in `load_state`
+(otherwise the next load would drop it, key and all). `build_post` treats it as
+no usable reading, so it posts the never-measured body (value 0, no
+`observed_at`, stale on arrival) — and, being stored, it keeps doing so after a
+later network failure (**sticky**). A real reading overwrites it when the source
+recovers. A gauge the box has never posted is not marked (that would conjure it).
+
+## The Codex reader says why it failed (plan 3.5, RR2-14)
+
+`codex app-server` answered a revoked login with a bare JSON-RPC error code and
+the feeder printed only `codex: JSON-RPC error -32603`; the server's `token_expired`
+was invisible for six days. The failure now carries the server's **message**
+(and `data`) — redacted, then cut to 200 characters. Redaction runs *first*
+(cutting first could leave a prefix of a token that no pattern recognises) and
+replaces `Bearer …`, JWTs, `sk-`/`ghp_`/`ya29.`-style keys and any run of 24+
+base64/hex characters, and flattens control characters so a hostile server cannot
+forge a journal line. This is the only place a remote's own words reach a
+message; `post_gauge` still never logs a response body.
 
 ## Never writes a vendor credential file
 
@@ -319,7 +527,10 @@ touching a vendor or the tracker.
 
 ## Known gaps
 
-* **Gemini** — deferred as E11; no source, no parser.
+* **Gemini** — built from the CLI's source, not an observed response; see "Not
+  proven" under Gemini above.
+* **Claude 2's `.claude.json` placement** is measured on Windows (Claude Code
+  2.1.296), not yet on the hub's Linux build.
 * **OpenCode `rolling`** — no window length is published, see above.
 * **`stack/run-hermetic-tests.sh` cannot run on the dev PC** (`missing tool(s):
   zstd rsync`), so this feeder's shell-level carriage has never been exercised

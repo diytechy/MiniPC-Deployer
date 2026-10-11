@@ -120,14 +120,15 @@ from the account's real home:
 | `@claude` | `~/.claude` and `~/.claude.json` — the paths the un-templated unit always had | none (the CLI's default config) |
 | `@claude2` | `~/.claude-2` | `Environment=CLAUDE_CONFIG_DIR=~/.claude-2` |
 
-**Does `.claude.json` move under `CLAUDE_CONFIG_DIR`? Yes — measured, not
-assumed.** On 2026-10-11, with Claude Code 2.1.296 on the dev PC, running
+**Does `.claude.json` move under `CLAUDE_CONFIG_DIR`? On Windows, yes —
+measured; on the hub's Linux build, unverified.** On 2026-10-11, with Claude
+Code 2.1.296 on the Windows dev PC, running
 `claude auth status` with `CLAUDE_CONFIG_DIR` pointed at an empty directory
 created `.claude.json` (holding `machineID`, `firstStartTime` and so on) **inside
 that directory**, and left the real `~/.claude.json` byte-for-byte untouched
 (mtime unchanged). So account 2's entire state is one directory, and its unit is
 granted that directory and not a byte of account 1's. That was measured on
-Windows; the hub's CLI is a different build on Linux, so the first live
+Windows only; the hub's CLI is a different build on Linux, so the first live
 sign-in should confirm `ls -a ~/.claude-2` shows `.claude.json` and that
 `~/.claude.json`'s mtime did not move.
 
@@ -192,8 +193,13 @@ The plan's four open questions, answered from that source:
    `oauth_creds.json`); `authenticate` (`acp/acpRpcDispatcher.ts`) runs
    `config.refreshAuth` once more. `gemini_auth_refresh.py` starts it, sends
    `initialize` (the reply proves startup finished) then `authenticate`, and
-   stops, under `homehub-gemini-refresh.{service,timer}` (every 30 minutes
-   against an hour-long token). It refuses to run unless
+   stops, under `homehub-gemini-refresh.{service,timer}` (every 4 minutes,
+   because google-auth-library only renews inside a 5-minute window before
+   expiry: `DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS = 5 * 60 * 1000`,
+   `isTokenExpiring()` is `expiry_date <= now + threshold`, and the CLI does not
+   override it — read from google-auth-library 10.9.0 as bundled in
+   `@google/gemini-cli` 0.63.0; a 30-minute interval would renew nothing at +30
+   and land after expiry at about +62). It refuses to run unless
    `security.auth.selectedType` is `oauth-personal` (because `authenticate`
    *clears* the cached credentials to switch method) and unless a cached
    credential exists, and prints one status line and nothing the CLI said.

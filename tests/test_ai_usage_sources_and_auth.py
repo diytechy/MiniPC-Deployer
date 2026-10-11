@@ -228,7 +228,18 @@ def _bash_can_see(path):
 STUBS = {
     "id": '#!/usr/bin/env bash\nexit 0\n',
     "getent": '#!/usr/bin/env bash\necho "homehub-ai:x:1001:1001::/home/homehub-ai:/bin/bash"\n',
-    "systemctl": '#!/usr/bin/env bash\necho "$*" >> "$SANDBOX/systemctl.log"\nexit 0\n',
+    # `is-active` answers "activating" for the first STUB_ACTIVE_CALLS calls (a
+    # refresher run still in progress) and "inactive" after, like the real one
+    # (which also exits non-zero for anything but "active").
+    "systemctl": """#!/usr/bin/env bash
+echo "$*" >> "$SANDBOX/systemctl.log"
+if [ "$1" = "is-active" ]; then
+  n=$(cat "$SANDBOX/active.count" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$SANDBOX/active.count"
+  if [ "$n" -le "${STUB_ACTIVE_CALLS:-0}" ]; then echo activating; exit 3; fi
+  echo inactive; exit 3
+fi
+exit 0
+""",
     # Only paths under the sandbox are made; everything else (/var/lib/..., the
     # account's real home) is a no-op so the test can run unprivileged anywhere.
     "install": """#!/usr/bin/env bash
@@ -251,7 +262,7 @@ fi
 }
 
 
-def run_setup(tmp_path, sources, legacy=False):
+def run_setup(tmp_path, sources, legacy=False, extra_env=None):
     """Run the REAL setup-ai-usage.sh with stubbed id/getent/install/systemctl."""
     bash = _bash_can_see(tmp_path)
     if not bash:
@@ -284,6 +295,10 @@ def run_setup(tmp_path, sources, legacy=False):
                 "AI_USAGE_UNIT_DIR": units.as_posix()})
     for key in ("AI_USAGE_SOURCES", "AI_USAGE_USER_ACCOUNT"):
         env.pop(key, None)
+    env.update(extra_env or {})
+    counter = sandbox / "active.count"
+    if counter.exists():
+        counter.unlink()
     done = subprocess.run([bash, (AI_DIR / "setup-ai-usage.sh").as_posix()],
                           env=env, capture_output=True, text=True)
     log = sandbox / "systemctl.log"
@@ -319,6 +334,39 @@ def test_setup_migrates_the_old_unit_and_never_has_both_timers_enabled_sr067(tmp
     assert "daemon-reload" in calls[old_off:new_on]
 
 
+def test_migration_waits_for_a_running_refresh_instead_of_killing_it_sr067(tmp_path):
+    """A `claude -p /usage` killed mid-rotation can lose the single-use refresh
+    token. The old timer is disabled (no new run), the running one is WAITED for,
+    the service is never `stop`ped, and only then are the files removed."""
+    done, units, calls = run_setup(
+        tmp_path, "codex,claude,opencode", legacy=True,
+        extra_env={"STUB_ACTIVE_CALLS": "3", "AI_USAGE_MIGRATION_POLL_SECONDS": "0.05",
+                   "AI_USAGE_MIGRATION_WAIT_SECONDS": "30"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    polls = [i for i, c in enumerate(calls) if c == "is-active homehub-claude-refresh.service"]
+    assert len(polls) == 4, "three 'activating' answers, then 'inactive'"
+    timer_off = calls.index("disable --now homehub-claude-refresh.timer")
+    assert timer_off < polls[0]
+    assert polls[-1] < calls.index("daemon-reload") < calls.index(
+        "enable --now homehub-claude-refresh@claude.timer")
+    assert not [c for c in calls if c.startswith("stop ") and "claude-refresh" in c], \
+        "the running service must never be stopped"
+    assert "WARNING" not in done.stdout
+    assert not (units / "homehub-claude-refresh.service").exists()
+
+
+def test_migration_gives_up_waiting_with_a_warning_and_still_never_kills_it_sr067(tmp_path):
+    done, units, calls = run_setup(
+        tmp_path, "codex,claude,opencode", legacy=True,
+        extra_env={"STUB_ACTIVE_CALLS": "100000", "AI_USAGE_MIGRATION_POLL_SECONDS": "0.2",
+                   "AI_USAGE_MIGRATION_WAIT_SECONDS": "1"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "WARNING: homehub-claude-refresh.service was still activating" in done.stdout
+    assert not [c for c in calls if c.startswith("stop ") and "claude-refresh" in c]
+    assert not (units / "homehub-claude-refresh.service").exists()
+    assert "enable --now homehub-claude-refresh@claude.timer" in calls
+
+
 def test_setup_is_idempotent_on_a_migrated_box_sr067(tmp_path):
     first, units, _ = run_setup(tmp_path, "codex,claude,opencode", legacy=True)
     before = {p.relative_to(units).as_posix(): p.read_text(encoding="utf-8")
@@ -338,6 +386,9 @@ def test_setup_gives_account_two_only_its_own_directory_sr067(tmp_path):
     assert "Environment=CLAUDE_CONFIG_DIR=/home/homehub-ai/.claude-2" in two
     rw = [l for l in two.splitlines() if l.startswith("ReadWritePaths=")]
     assert rw == ["ReadWritePaths=/home/homehub-ai/.claude-2"], rw
+    # Whatever the hub's CLI build does with .claude.json, account 2's instance is
+    # NEVER granted account 1's copy (the placement was measured on Windows only).
+    assert "/.claude.json" not in two
     one = (units / "homehub-claude-refresh@claude.service.d" / "10-account.conf").read_text(encoding="utf-8")
     assert ".claude-2" not in one, "account 1's instance must not be able to write account 2's"
     assert "enable --now homehub-claude-refresh@claude2.timer" in calls
@@ -687,17 +738,51 @@ def test_http_json_posts_json_with_the_bearer_and_refuses_http_sr067(monkeypatch
 # TC-1122 — the Gemini token keeper (LLR-1051)
 # ═══════════════════════════════════════════════════════════════════════════
 
-GEMINI_ACCESS_TOKEN_LIFE_SECONDS = 3600     # Google's standard access-token life
+# google-auth-library `DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS = 5 * 60 * 1000`
+# (v10.9.0, the version gemini-cli pins in packages/core/package.json; read in the
+# bundle of @google/gemini-cli 0.63.0). `getAccessTokenAsync()` renews ONLY when
+# `isTokenExpiring()` -- `expiry_date <= now + threshold` -- and the CLI builds its
+# OAuth2Client without overriding the threshold. A run of the CLI therefore does
+# nothing to a token with more than five minutes left.
+GEMINI_EAGER_REFRESH_WINDOW_SECONDS = 5 * 60
 
 
-def test_the_gemini_refresh_interval_beats_the_token_life_with_a_missed_run_of_margin_sr067():
-    timer = (AI_DIR / "homehub-gemini-refresh.timer").read_text(encoding="utf-8")
-    line = [l for l in timer.splitlines() if l.startswith("OnUnitActiveSec=")][0]
+def _timer_seconds(text, key):
+    line = [l for l in text.splitlines() if l.startswith(key + "=")][0]
     value = line.split("=", 1)[1].strip()
-    assert value.endswith("min"), value
-    seconds = int(value[:-3]) * 60
-    assert seconds * 2 <= GEMINI_ACCESS_TOKEN_LIFE_SECONDS
+    units = {"min": 60, "s": 1, "h": 3600}
+    for suffix in ("min", "h", "s"):
+        if value.endswith(suffix):
+            return int(value[:-len(suffix)]) * units[suffix]
+    return int(value)
+
+
+def test_the_gemini_keeper_runs_often_enough_to_land_inside_the_eager_window_sr067():
+    """The margin is against the LIBRARY'S window, not against the token's life.
+    At 30 minutes the run at +30 renews nothing and the next lands after expiry."""
+    timer = (AI_DIR / "homehub-gemini-refresh.timer").read_text(encoding="utf-8")
+    interval = _timer_seconds(timer, "OnUnitActiveSec")
+    accuracy = _timer_seconds(timer, "AccuracySec")
+    randomised = _timer_seconds(timer, "RandomizedDelaySec")
+    worst_gap = interval + accuracy + randomised
+    assert worst_gap < GEMINI_EAGER_REFRESH_WINDOW_SECONDS, (
+        "the longest gap between runs (%d s) must be shorter than the window "
+        "(%d s) or some token will expire between two runs that each found it "
+        "'not expiring yet'" % (worst_gap, GEMINI_EAGER_REFRESH_WINDOW_SECONDS))
     assert "Persistent=true" in timer
+
+
+def test_the_gemini_keeper_cannot_stack_runs_sr067():
+    """Its own bound is far under the interval, the unit's bound is above its own
+    and still far under the interval, and systemd does not start a oneshot unit
+    that is still activating."""
+    timer = (AI_DIR / "homehub-gemini-refresh.timer").read_text(encoding="utf-8")
+    service = (AI_DIR / "homehub-gemini-refresh.service").read_text(encoding="utf-8")
+    interval = _timer_seconds(timer, "OnUnitActiveSec")
+    unit_bound = _timer_seconds(service, "TimeoutStartSec")
+    assert "Type=oneshot" in service
+    assert keeper.DEFAULT_TIMEOUT_SECONDS < unit_bound <= interval // 2
+    assert unit_bound + _timer_seconds(timer, "AccuracySec") < interval
 
 
 def test_the_gemini_keeper_unit_costs_no_quota_and_keeps_the_posture_sr067():

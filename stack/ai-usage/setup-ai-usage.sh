@@ -168,8 +168,9 @@ chmod 0644 "$CLAUDE1_DROPIN_DIR/10-account.conf"
 
 # Account 2, only when named in AI_USAGE_SOURCES. Its whole state is ONE
 # directory, because with CLAUDE_CONFIG_DIR set the CLI keeps `.claude.json` in
-# it (measured 2026-10-11, Claude Code 2.1.296) -- so the grant is that
-# directory and not a byte of account 1's. The directory is created empty (0700)
+# it (measured on WINDOWS only, 2026-10-11, Claude Code 2.1.296; unverified
+# on the hub's Linux build) -- so the grant is that directory and not a byte of
+# account 1's, and it stays that way even if the Linux build disagrees. The directory is created empty (0700)
 # because ReadWritePaths= on a missing path fails the unit with 226/NAMESPACE;
 # the sign-in that fills it is a human's, printed below.
 CLAUDE2_DROPIN_DIR="$UNIT_DIR/homehub-claude-refresh@claude2.service.d"
@@ -235,8 +236,32 @@ LEGACY_REFRESH="homehub-claude-refresh"
 if [ -e "$UNIT_DIR/$LEGACY_REFRESH.timer" ] || [ -e "$UNIT_DIR/$LEGACY_REFRESH.service" ] \
         || [ -d "$UNIT_DIR/$LEGACY_REFRESH.service.d" ]; then
     if command -v systemctl >/dev/null 2>&1; then
+        # Stop the TIMER first, so no new run can begin, then WAIT for a run that
+        # is already going. The service is deliberately never `stop`ped: a
+        # `claude -p /usage` killed in the middle of a token rotation can lose
+        # the single-use refresh token, and the Owner would have to sign in
+        # again. The wait is bounded (longer than the unit's own
+        # TimeoutStartSec=180, so a healthy run has finished or been timed out by
+        # systemd itself); if it still has not finished we say so and carry on.
         systemctl disable --now "$LEGACY_REFRESH.timer" >/dev/null 2>&1 || true
-        systemctl stop "$LEGACY_REFRESH.service" >/dev/null 2>&1 || true
+        wait_seconds="${AI_USAGE_MIGRATION_WAIT_SECONDS:-200}"
+        poll_seconds="${AI_USAGE_MIGRATION_POLL_SECONDS:-2}"
+        deadline=$((SECONDS + wait_seconds))
+        while :; do
+            state="$(systemctl is-active "$LEGACY_REFRESH.service" 2>/dev/null || true)"
+            case "$state" in
+                active|activating|deactivating|reloading) ;;
+                *) break ;;
+            esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                say "WARNING: $LEGACY_REFRESH.service was still $state after ${wait_seconds}s."
+                say "  Continuing the migration WITHOUT stopping it (killing it mid-rotation"
+                say "  could lose the single-use Claude refresh token). If the Claude ring"
+                say "  goes unavailable afterwards, sign account 1 in again."
+                break
+            fi
+            sleep "$poll_seconds"
+        done
     fi
     rm -f "$UNIT_DIR/$LEGACY_REFRESH.timer" "$UNIT_DIR/$LEGACY_REFRESH.service"
     rm -rf "$UNIT_DIR/$LEGACY_REFRESH.service.d"

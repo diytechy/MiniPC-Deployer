@@ -52,7 +52,7 @@ TWO REFUSALS BEFORE ANYTHING STARTS, both because `authenticate` can do harm:
     box with no oauth_creds.json is refused instead.
 
 Output is one status line. Nothing the CLI said is printed: its frames can carry
-account details, and this unit runs every half hour forever.
+account details, and this unit runs every four minutes forever.
 """
 
 import json
@@ -67,7 +67,7 @@ ACP_PROTOCOL_VERSION = 1
 DEAD_LOGIN = ("the CLI asked for an interactive sign-in, so the stored login "
               "cannot be renewed - sign in again")
 AUTH_METHOD = "oauth-personal"          # AuthType.LOGIN_WITH_GOOGLE in gemini-cli
-DEFAULT_TIMEOUT_SECONDS = 90
+DEFAULT_TIMEOUT_SECONDS = 60      # far under the 4-minute timer interval
 
 
 def _read_json(path):

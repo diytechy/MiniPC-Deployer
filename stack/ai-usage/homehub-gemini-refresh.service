@@ -57,10 +57,13 @@ Environment=NO_BROWSER=true
 ExecStart=/bin/sh -c 'cd "$HOME" && exec /usr/bin/python3 /opt/homehub/stack/ai-usage/gemini_auth_refresh.py'
 
 # A refresh that fails is not an emergency (the token is valid until its expiry
-# and the next run is half an hour away), and it must never become a restart
+# and the next run is four minutes away), and it must never become a restart
 # storm against a Google endpoint.
 Restart=no
-TimeoutStartSec=150
+# Far under the 4-minute timer interval, and above the keeper's own 60 s bound:
+# systemd will not start a oneshot unit that is still activating, so runs cannot
+# stack, and a wedged CLI is killed with the unit's whole control group.
+TimeoutStartSec=90
 
 [Install]
 WantedBy=multi-user.target

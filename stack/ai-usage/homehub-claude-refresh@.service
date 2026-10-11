@@ -22,10 +22,13 @@
 # files would be one bad `claude` invocation away from the cross-contamination
 # that rule exists to prevent.
 #
-# MEASURED 2026-10-11 (Claude Code 2.1.296): with CLAUDE_CONFIG_DIR set, the
-# CLI creates `.claude.json` -- machineID and all -- INSIDE that directory and
-# leaves ~/.claude.json untouched. So account 2's whole state is one directory,
-# which is what its ReadWritePaths= grants.
+# MEASURED ON WINDOWS ONLY, 2026-10-11 (Claude Code 2.1.296 on the dev PC): with
+# CLAUDE_CONFIG_DIR set, the CLI creates `.claude.json` -- machineID and all --
+# INSIDE that directory and leaves ~/.claude.json untouched. UNVERIFIED on the
+# hub's Linux build. If account 2's whole state is that one directory, which is
+# what its ReadWritePaths= grants, nothing more is needed; and if the Linux build
+# disagrees, the instance is deliberately NOT given account 1's ~/.claude.json to
+# paper over it -- the first live sign-in should check (see README.md).
 #
 # THE PROBLEM THIS EXISTS FOR. The Claude access token lives EIGHT HOURS
 # (`expiresAt` in ~/.claude/.credentials.json). Claude Code renews it out of the

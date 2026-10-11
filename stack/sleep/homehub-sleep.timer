@@ -1,0 +1,28 @@
+[Unit]
+Description=Run the HomeHub sleep feeder (SR-070)
+Documentation=file:///opt/homehub/stack/sleep/README.md
+
+[Timer]
+# EVERY 30 MINUTES (plan 4.3). The cadence is set against NagLight's staleness
+# horizon, not by taste: the gauge's window kind is `daily`, so NagLight calls
+# it stale 36 h after `observed_at`. myAir publishes one score a night, usually
+# by about 10:00 local, and revises a night after a late upload, so the feeder
+# must see a new or corrected score within the hour and must never be one missed
+# run from the 14:00 "unavailable" rule.
+#
+# DO NOT TIGHTEN THIS. Every run is a full sign-in to a health vendor (there is
+# no refresh token), and each is one more chance for the account to be
+# rate-limited or locked out.
+#
+# tests/test_sleep_feeder.py reads THIS LINE and fails if the interval is ever
+# loosened past a quarter of the daily horizon, so the relationship is enforced
+# rather than remembered.
+OnBootSec=5min
+OnUnitActiveSec=30min
+# Do not stampede the vendor from every box at the same second.
+RandomizedDelaySec=120
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

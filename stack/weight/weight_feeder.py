@@ -6,6 +6,12 @@ goal THEY declared in their own definitions, as the `weight` gauge NagLight
 already serves (SN-040, SR-067). It decides nothing about colour, invents no
 goal, and holds no credential of its own.
 
+(H1, 2026-10-11: the same connection also carries an OPT-IN, OFF-by-default
+`heart` gauge - the daily resting heart rate, SR-073 - run as its own cycle
+AFTER this one by `run_heart_cycle`, so neither can change the other. Its
+parser is written from the discovery document and has never seen a real body.
+See "THE GOOGLE HEALTH v4 DAILY RESTING HEART RATE PARSER" below.)
+
 WHY A PLAIN HUB SERVICE AND NOT A CONTAINER - the same reasoning A40 applied to
 the AI CLI service (SR-019) and B7 applied to the usage feeder (SR-021): the
 vendor half is an OAuth refresh token a human minted interactively through a
@@ -345,6 +351,83 @@ AUTH_CONFIRM_CYCLES = 2
 AUTH_ERROR_ALLOWLIST = frozenset({"invalid_grant"})
 # How much of a token-endpoint error body is read to find its `error` field.
 MAX_OAUTH_ERROR_BYTES = 4096
+
+# ── The THIRD gauge: daily RESTING HEART RATE (H1, plan 2026-10-11) ──────────
+# One number per day, in beats per minute, LOWER IS BETTER. It rides this
+# feeder because this feeder already holds the Google Health connection, and
+# because the scope that connection holds ALREADY ADMITS the data type: the
+# public data-types table (developers.google.com/health/data-types, last
+# updated 2026-10-06) lists `daily-resting-heart-rate` under
+# `.health_metrics_and_measurements.readonly` and nothing else, the same scope
+# as `weight` and `height`. So reading it asks the household for NO new consent
+# and needs no re-mint. The discovery document (revision 20261007) maps no data
+# type to a scope itself - its `list` method simply names every Health scope as
+# acceptable - which is why the scope claim rests on the public table and
+# not on the document.
+#
+# IT IS OPT-IN AND OFF. Today the Owner's watch cannot reach Google Health, so
+# the data type is empty and the gauge is the stale-on-arrival "unavailable"
+# body (a dash on the wall). A Fitbit-family device writing into Google Health
+# later is what lights it up, with no new code and no new consent.
+HEART_GAUGE_ID = "heart"
+HEART_GAUGE_LABEL = "Heart"
+HEART_GAUGE_ICON = "heart"
+# `bpm` is not `%` (that would land it in the panel's AI row) and not in
+# NagLight's `unitRangeSpan`, so min and max are REQUIRED and are sent.
+HEART_GAUGE_UNIT = "bpm"
+# At or below the target is flat green at any distance; above it climbs to red.
+HEART_GAUGE_FAVOURABLE = "low"
+# `window: {"kind": "daily"}` and NOTHING else - no start, end or direction. A
+# kind-only window is valid (NagLight refuses only a window with exactly one of
+# start/end), `Window.Empty()` ignores the kind so a direction is neither
+# required nor allowed, and `Stale()` reads the 36 h horizon for it, which is
+# the right life for a number computed once a day (the sleep gauge's shape,
+# plan 4.5).
+HEART_WINDOW_KIND = "daily"
+DEFAULT_HEART_MIN_BPM = 40
+DEFAULT_HEART_MAX_BPM = 100
+DEFAULT_HEART_TARGET_BPM = 60
+# The three knobs must fall inside the Google Health API's own heart-rate range,
+# `HeartRate.beatsPerMinute` "Must be in the range [1, 300]" (discovery document
+# revision 20261007).
+HEART_KNOB_BOUNDS = (1, 300)
+# A RESTING heart rate outside this is not one. The API admits 1..300 for any
+# sample, but a resting rate under 25 or over 200 is a units error or
+# corruption, not a person - the same job PLAUSIBLE_LB does for a weight. A
+# reading outside it is REFUSED (a SourceFailure: the gauge keeps its last real
+# reading or goes unavailable) and never clamped. A plausible reading outside
+# the gauge's own min..max (an athlete at 38, a fever at 104) is posted as it
+# is: NagLight does not require a value inside min..max, the bar simply pins to
+# its end, and clamping would print a number nobody measured.
+PLAUSIBLE_RESTING_BPM = (25, 200)
+# The state file's key for the stored reading. NOT a weight, so `load_state`
+# gives it its own validator (the generic one would judge 58 bpm against the
+# 40..1000 LB band and accept it as a body weight).
+HEART_STATE_KEY = HEART_GAUGE_ID
+# The heart source's sign-in-failure count lives in the SAME reserved dict as
+# the weight source's (AUTH_STATE_KEY) under its own name, and counts its OWN
+# cycles. One token serves both, so both fail together and both confirm on the
+# same second cycle; a SHARED counter would be bumped twice per cycle and
+# confirm on the first, which is the very thing the two-cycle rule exists to
+# prevent. See `heart_count_key`.
+HEART_COUNT_SUFFIX = ":heart"
+# The Google Health `date` of a daily data point is a bare civil date in the
+# user's timezone; the point carries NO instant. The gauge's `observed_at` is
+# that DATE pinned to this UTC hour - a pure function of the date, so a later
+# correction of the same day never moves it and the fetch time never enters.
+# The stamp must not be AHEAD of the moment the value first exists, or it is
+# held back; 06:00 UTC is 01:00 US Central and 23:00 the evening before in US
+# Pacific, earlier than any value for that date can exist (it is computed from
+# that day's data, normally the morning's sync). And 36 h (the daily horizon)
+# later it is 13:00 US Central the NEXT day, long after the next morning's
+# value has normally arrived. It is an approximation and is stated as one: a
+# household far east of UTC would see a fresh day held back for some hours
+# (the previous day carries the gauge meanwhile), never a stale one shown fresh.
+HEART_STAMP_UTC_HOUR = 6
+# A point whose stamp is up to this far ahead of the clock is a day that has
+# started somewhere but not here yet: it is held back (not a failure), and an
+# older day carries the gauge meanwhile. Further ahead than this is corruption.
+HEART_DEFER_SECONDS = 2 * 86400
 
 # NagLight's staleness horizons by window kind, kept here because the cadence
 # has to be chosen against them. This gauge has NO window, so it takes the
@@ -1460,6 +1543,274 @@ def parse_height_datapoint(payload, now, where="google-health(height)"):
     return tied[0]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# THE GOOGLE HEALTH v4 DAILY RESTING HEART RATE PARSER (H1).
+#
+# NOT OBSERVED. READ OFF THE DISCOVERY DOCUMENT AND NEVER AGAINST A REAL BODY.
+# This is the opposite of the weight and height parsers above, which were
+# written against captured bodies and say so. No resting-heart-rate body has
+# ever been captured: the Owner's watch does not reach Google Health, and the
+# OAuth token is dead (an app in "Testing" gives 7-day refresh tokens). Every
+# fact below is from the discovery document, revision 20261007, fetched
+# 2026-10-11, and the first real body must be captured with
+# `weight_oauth.py capture --data-type heart` and compared with this before
+# anyone trusts the gauge. The rule this repo learned on `heightMeters` applies
+# in full: a refusal costs a dash on the wall; a wrong guess costs a confident
+# wrong number about a body.
+#
+#   data type (path segment)  daily-resting-heart-rate     (kebab case, unlike
+#                             the member below)
+#   route                     GET /v4/users/me/dataTypes/daily-resting-heart-rate/dataPoints
+#   DataPoint member          dailyRestingHeartRate         (camelCase)
+#   DailyRestingHeartRate     {beatsPerMinute: string/int64, REQUIRED,
+#                              date: Date, REQUIRED "(in the user's timezone)",
+#                              dailyRestingHeartRateMetadata: optional
+#                                {calculationMethod: WITH_SLEEP | ONLY_WITH_AWAKE_DATA}}
+#   Date                      {year, month, day} integers
+#   scope                     .health_metrics_and_measurements.readonly
+#
+# TWO SHAPES DIFFER FROM WEIGHT AND HEIGHT, AND BOTH MATTER:
+#   * THERE IS NO `sampleTime`. A daily point carries only a civil `date`, so
+#     there is no `physicalTime`, no `utcOffset` and no instant at all. The
+#     gauge's `observed_at` is therefore that date pinned to HEART_STAMP_UTC_HOUR
+#     (see its comment) - never the clock.
+#   * `beatsPerMinute` IS A DECIMAL STRING, like `heightMillimeters`: proto3
+#     encodes int64 as a string, and the document says `"type": "string",
+#     "format": "int64"`. A bare JSON number is a shape nobody has seen on this
+#     field and is refused, as the height parser refuses it.
+#
+# THE REQUEST CARRIES NO `filter` AND NO `pageSize`, on purpose. The document
+# does describe `daily_resting_heart_rate.date >= "YYYY-MM-DD"`, but it is
+# unexercised, and a wrong filter would make the one source this gauge is for
+# fail with a 400 forever, after a watch has been bought, with the journal as
+# the only clue. The plain call is the request shape the weight route was
+# observed to answer; the cost is a longer body (default page: up to 1440 days)
+# every fifteen minutes. Add the filter once a real call has proved it.
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEART_DATA_SEGMENT = "daily-resting-heart-rate"
+HEART_MEMBER = "dailyRestingHeartRate"
+HEART_BPM_KEY = "beatsPerMinute"
+HEART_DATE_KEY = "date"
+# DIGITS and nothing else, no sign, no fraction, no exponent, no leading zero,
+# at most four of them: the whole of the int64 string shape a resting rate can
+# take. `int()` alone would accept "+5", " 5 " and "5_0". Used with FULLMATCH,
+# not `^...$`: in Python `$` also matches before a trailing newline, and `\d`
+# matches non-ASCII digits, so the digits are spelled [0-9].
+HEART_BPM_RE = re.compile(r"(?:0|[1-9][0-9]{0,3})")
+
+
+class HeartReading(object):
+    """ONE day's resting heart rate: whole bpm, and the stamp of its DATE."""
+
+    __slots__ = ("bpm", "observed_at")
+
+    def __init__(self, bpm, observed_at):
+        self.bpm = bpm
+        self.observed_at = observed_at
+
+    def __repr__(self):
+        # Health data about one person; a repr reaches tracebacks and journals.
+        return "HeartReading(<not logged: health data>)"
+
+
+class HeartPointNotYet(SourceFailure):
+    """A data point whose date has started elsewhere but not yet here.
+
+    Internal to the page parser, which HOLDS such a point back rather than
+    failing on it: it is not corruption and not an outage, and an older day
+    carries the gauge until the stamp comes round. Never escapes
+    `parse_heart_datapoint`.
+    """
+
+
+def check_plausible_resting_bpm(value, where):
+    """Return `value` as a whole-number resting rate, or raise SourceFailure.
+
+    The band is PLAUSIBLE_RESTING_BPM. The message names the band and never the
+    value: a stored or fetched resting rate is health data about a person.
+
+    Implements: LLR-1092
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SourceFailure("%s: resting rate is not a whole number (it is a %s)"
+                            % (where, type(value).__name__))
+    low, high = PLAUSIBLE_RESTING_BPM
+    if value < low or value > high:
+        raise SourceFailure(
+            "%s: the resting rate is outside the plausible band %d..%d bpm, so "
+            "it is a units error or corruption rather than a resting heart "
+            "rate. The value is not logged: it is health data."
+            % (where, low, high))
+    return value
+
+
+def check_vendor_bpm(raw, where):
+    """`beatsPerMinute` -> plausible whole bpm, or SourceFailure naming no VALUE.
+
+    IT REQUIRES THE DECIMAL STRING the discovery document states (int64 is a
+    string in proto3 JSON) and refuses everything else - a bare number, a
+    float, a bool, whitespace, a sign - rather than reading latitude into a
+    vendor's bytes. OUT OF BAND IS REFUSED, NEVER CLAMPED: a clamped 250 would
+    be a plausible 200 nobody measured.
+
+    Implements: SR-073, LLR-1092
+    """
+    if not isinstance(raw, str) or not HEART_BPM_RE.fullmatch(raw):
+        raise SourceFailure(
+            "%s: %s is not the plain decimal string the discovery document "
+            "states for an int64 (it is a %s). The value is not logged."
+            % (where, HEART_BPM_KEY, type(raw).__name__))
+    return check_plausible_resting_bpm(int(raw), where)
+
+
+def heart_stamp_of_date(date, now, where):
+    """The epoch second a daily point's `date` is stamped with, or raise.
+
+    Contract:
+      Inputs:  date: the `date` member exactly as decoded; now: this cycle's
+               clock.
+      Outputs: int epoch seconds - the date at HEART_STAMP_UTC_HOUR UTC.
+      Raises:  HeartPointNotYet when the stamp is ahead of the clock by more
+               than the skew allowance but within HEART_DEFER_SECONDS;
+               SourceFailure for a missing or malformed date, a date before
+               EPOCH_FLOOR, or one further ahead than HEART_DEFER_SECONDS.
+
+    NEVER THE CLOCK, AND NEVER GUESSED: a date with a zero month or day (the
+    API's "partial date" forms) is refused, not rounded to a day nobody named.
+
+    Implements: SR-073, LLR-1093
+    """
+    if not isinstance(date, dict):
+        raise SourceFailure(
+            "%s: `%s` is missing or is not an object (it is a %s), so this "
+            "resting rate has no day and `observed_at` may not be invented "
+            "from the clock." % (where, HEART_DATE_KEY, type(date).__name__))
+    parts = [date.get("year"), date.get("month"), date.get("day")]
+    if not all(isinstance(part, int) and not isinstance(part, bool)
+               for part in parts):
+        raise SourceFailure("%s: `%s` does not carry integer year, month and day"
+                            % (where, HEART_DATE_KEY))
+    try:
+        stamp = int(datetime(parts[0], parts[1], parts[2], HEART_STAMP_UTC_HOUR,
+                             tzinfo=timezone.utc).timestamp())
+    except (ValueError, OverflowError):
+        raise SourceFailure("%s: `%s` is not a real calendar date"
+                            % (where, HEART_DATE_KEY))
+    if stamp < EPOCH_FLOOR:
+        raise SourceFailure(
+            "%s: the date predates this feeder, so it is corruption rather "
+            "than a resting rate" % where)
+    if stamp > now + MAX_CLOCK_SKEW_SECONDS:
+        if stamp > now + HEART_DEFER_SECONDS:
+            raise SourceFailure(
+                "%s: the date is more than %d hours ahead of the clock, so it "
+                "is corruption rather than a day that has begun elsewhere"
+                % (where, HEART_DEFER_SECONDS // 3600))
+        raise HeartPointNotYet(
+            "%s: the date has not reached its stamp here yet" % where)
+    return stamp
+
+
+def heart_from_data_point(point, now, where):
+    """ONE element of `dataPoints` -> a HeartReading, or SourceFailure.
+
+    A point with no `dailyRestingHeartRate` member is not this data type (the
+    DataPoint union has dozens of members) and raises so the page parser can
+    skip it. `name` and `dataSource` are never read: `name` holds the Owner's
+    Google user id, and a field that is never read cannot be logged.
+
+    Implements: SR-073, LLR-1092, LLR-1093
+    """
+    if not isinstance(point, dict):
+        raise SourceFailure("%s: data point is not an object (it is a %s)"
+                            % (where, type(point).__name__))
+    if HEART_MEMBER not in point:
+        raise SourceFailure("%s: data point carries no `%s` member, so it is "
+                            "not a daily resting heart rate"
+                            % (where, HEART_MEMBER))
+    member = point.get(HEART_MEMBER)
+    if not isinstance(member, dict):
+        raise SourceFailure("%s: `%s` is not an object (it is a %s)"
+                            % (where, HEART_MEMBER, type(member).__name__))
+    if HEART_BPM_KEY not in member:
+        raise SourceFailure(
+            "%s: `%s` carries no `%s`. The discovery document marks it "
+            "required, so a point without one is a shape this parser does not "
+            "understand." % (where, HEART_MEMBER, HEART_BPM_KEY))
+    bpm = check_vendor_bpm(member.get(HEART_BPM_KEY), where)
+    stamp = heart_stamp_of_date(member.get(HEART_DATE_KEY), now, where)
+    return HeartReading(bpm=bpm, observed_at=stamp)
+
+
+def parse_heart_datapoint(payload, now, where="google-health(heart)"):
+    """ONE `ListDataPointsResponse` page -> the LATEST usable HeartReading.
+
+    Every rule is `parse_height_datapoint`'s, applied to the other member: the
+    latest is chosen by DATE and not by array position; an EMPTY list is
+    NoWeightYet (the source works and has nothing - the normal state today)
+    while an ABSENT `dataPoints` key is a refusal; one bad point costs itself.
+    Two differences:
+
+      * A point dated ahead of the clock is HELD BACK, not failed
+        (HeartPointNotYet). If every point on the page is held back and none
+        was bad, the page is an empty one: NoWeightYet.
+      * Two points for the newest DATE that disagree are REFUSED, as two
+        weights at one instant are. This list "returns records from all
+        available data sources, which might contain overlapping intervals"
+        (Google's own wording), so a household with two writers could land
+        here; the refusal is a dash with a journal line, not a guess. The
+        remedy, if it ever bites, is the `reconcile` method or a
+        `dataSourceFamily` - both unexercised, so neither is used blind.
+
+    Implements: SR-073, LLR-1092, LLR-1093
+    """
+    if not isinstance(payload, dict):
+        raise SourceFailure("%s: the response body is not an object (it is a %s)"
+                            % (where, type(payload).__name__))
+    if DATA_POINTS_KEY not in payload:
+        raise SourceFailure(
+            "%s: the response body carries no `%s` key at all, so it is not "
+            "the envelope this route returns and is refused instead of read as "
+            "'no resting heart rate logged'." % (where, DATA_POINTS_KEY))
+    points = payload.get(DATA_POINTS_KEY)
+    if points is None or (isinstance(points, list) and not points):
+        raise NoWeightYet(
+            "%s: HTTP 200 with no data points, so this account has no resting "
+            "heart rate in Google Health yet. That is not a broken source and "
+            "not a reading of 0 - it is the unavailable gauge. A Fitbit-family "
+            "device writing to Google Health is what fills it." % where)
+    if not isinstance(points, list):
+        raise SourceFailure("%s: `%s` is not a list (it is a %s)"
+                            % (where, DATA_POINTS_KEY, type(points).__name__))
+    readings, problems, held = [], [], 0
+    for index, point in enumerate(points):
+        try:
+            readings.append(heart_from_data_point(
+                point, now, "%s %s[%d]" % (where, DATA_POINTS_KEY, index)))
+        except HeartPointNotYet:
+            held += 1
+        except SourceFailure as exc:
+            problems.append(str(exc))
+    if not readings:
+        if held and not problems:
+            raise NoWeightYet(
+                "%s: every data point is dated ahead of the clock, so none is "
+                "usable yet - the unavailable gauge, not a failure." % where)
+        raise SourceFailure(
+            "%s: %d data point(s) and not one usable resting rate among them (%s)"
+            % (where, len(points), "; ".join(problems)))
+    newest = max(reading.observed_at for reading in readings)
+    tied = [reading for reading in readings if reading.observed_at == newest]
+    if len({reading.bpm for reading in tied}) > 1:
+        raise SourceFailure(
+            "%s: %d data points share the newest date and disagree about the "
+            "resting rate. Which one is the household's is not guessable, and "
+            "picking one would put a number on the wall the other contradicts."
+            % (where, len(tied)))
+    return tied[0]
+
+
 def clean_scalar(text):
     """Strip the quoting and the trailing `# comment` a hand-edited YAML scalar
     may carry, and return what the person meant.
@@ -2358,6 +2709,172 @@ def build_post(reading, last, goal_lb, now, auth_failed=False):
     return gauge_body(0.0, goal_lb, None), False
 
 
+# ── The heart gauge: config, body, stored reading, post decision (H1) ────────
+
+def resolve_heart_enabled(env):
+    """True only for a literal `1` or `true`. The heart gauge ships OFF.
+
+    `HEART_ENABLED=0` (the default, and every typo, blank, `yes` and `True`) is
+    OFF: nothing is fetched and nothing is posted, so today's live weight
+    behaviour is unchanged. It acts only inside a cycle where WEIGHT_ENABLED
+    already lets the feeder run - it needs that identity, destination and token.
+
+    Implements: SR-073, LLR-1091
+    """
+    return (env.get("HEART_ENABLED") or "0").strip() in ("1", "true")
+
+
+def resolve_heart_config(env):
+    """(min, max, target) in whole bpm from the three knobs, or ValueError.
+
+    Contract:
+      Config:  HEART_MIN_BPM (40), HEART_MAX_BPM (100), HEART_TARGET_BPM (60).
+      Raises:  ValueError naming the knob when one is not a plain whole number
+               inside HEART_KNOB_BOUNDS, or when min < target <= max does not
+               hold (NagLight refuses a target outside min..max, and a bar
+               needs max > min).
+
+    A bad heart knob is REFUSED, never defaulted past: a bar drawn around a
+    number nobody chose is the lie the weight goal rules already forbid. The
+    caller reports it and carries on with the weight gauge, which must not
+    depend on a heart knob being right.
+
+    Implements: SR-073, LLR-1091
+    """
+    low_bound, high_bound = HEART_KNOB_BOUNDS
+    values = {}
+    for name, default in (("HEART_MIN_BPM", DEFAULT_HEART_MIN_BPM),
+                          ("HEART_MAX_BPM", DEFAULT_HEART_MAX_BPM),
+                          ("HEART_TARGET_BPM", DEFAULT_HEART_TARGET_BPM)):
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            values[name] = default
+            continue
+        if not re.fullmatch(r"[0-9]{1,3}", raw):
+            raise ValueError("%s=%r is not a plain whole number of beats per "
+                             "minute" % (name, raw))
+        number = int(raw)
+        if number < low_bound or number > high_bound:
+            raise ValueError("%s=%d is outside the Google Health API's heart "
+                             "rate range %d..%d" % (name, number, low_bound,
+                                                    high_bound))
+        values[name] = number
+    low, high, target = (values["HEART_MIN_BPM"], values["HEART_MAX_BPM"],
+                         values["HEART_TARGET_BPM"])
+    if not low < high:
+        raise ValueError("HEART_MAX_BPM (%d) must exceed HEART_MIN_BPM (%d)"
+                         % (high, low))
+    if not low <= target <= high:
+        raise ValueError("HEART_TARGET_BPM (%d) must lie inside HEART_MIN_BPM.."
+                         "HEART_MAX_BPM (%d..%d)" % (target, low, high))
+    return low, high, target
+
+
+def heart_count_key(source):
+    """The AUTH_STATE_KEY member the heart source counts its own failures under."""
+    return source + HEART_COUNT_SUFFIX
+
+
+def heart_gauge_body(bpm, observed_at, config):
+    """Assemble the heart POST body in the exact shape /api/feed accepts.
+
+    Contract:
+      Inputs:  bpm: whole resting rate, or 0 for the never-measured body;
+               observed_at: epoch seconds the DAY was true (the date's stamp),
+               or None; config: (min, max, target) from `resolve_heart_config`.
+      Outputs: {kind, id, label, icon, unit, value, min, max, target,
+               favourable, window: {kind: "daily"}[, observed_at]} - no start,
+               end or direction, and no colour: NagLight derives those.
+      Raises:  ValueError if this repo would emit a body the server must 400.
+
+    THE SENTINEL 0 EXISTS TOGETHER WITH A MISSING STAMP AND NEVER WITHOUT ONE:
+    a body that carries `observed_at` must carry a plausible resting rate, so
+    0, -5 and 4000 cannot be posted as a measurement. The 0 itself is outside
+    min..max, which NagLight accepts (only the target is held to the range).
+
+    Implements: SR-073, LLR-1091
+    """
+    low, high, target = config
+    for name, number in (("value", bpm), ("min", low), ("max", high),
+                         ("target", target)):
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ValueError("gauge %s: %s is not a whole number: %r"
+                             % (HEART_GAUGE_ID, name, number))
+    if not low < high or not low <= target <= high:
+        raise ValueError("gauge %s: min %d, target %d, max %d is not a bar"
+                         % (HEART_GAUGE_ID, low, target, high))
+    if observed_at is not None:
+        try:
+            check_plausible_resting_bpm(bpm, "gauge value")
+        except SourceFailure as exc:
+            raise ValueError("gauge %s: %s" % (HEART_GAUGE_ID, exc))
+    body = {
+        "kind": "gauge",
+        "id": HEART_GAUGE_ID,
+        "label": HEART_GAUGE_LABEL,
+        "icon": HEART_GAUGE_ICON,
+        "unit": HEART_GAUGE_UNIT,
+        "value": bpm,
+        "min": low,
+        "max": high,
+        "target": target,
+        "favourable": HEART_GAUGE_FAVOURABLE,
+        "window": {"kind": HEART_WINDOW_KIND},
+    }
+    if observed_at is not None:
+        body["observed_at"] = iso8601_utc(int(observed_at))
+    return body
+
+
+def validate_stored_heart(entry, now):
+    """The stored heart reading, VALIDATED: {"value": int bpm, "observed_at": int}.
+
+    The state file is input, not memory, so a stored rate is held to the
+    resting-rate band and a stored stamp to `check_observed_at` (nothing before
+    the feeder existed, nothing in the future). Anything else is None - the
+    answer a source that never succeeded gets. The generic reading validator
+    cannot do this job: it judges in pounds.
+
+    Implements: SR-073, LLR-1093
+    """
+    if not isinstance(entry, dict):
+        return None
+    try:
+        value = check_plausible_resting_bpm(entry.get("value"), "stored value")
+        stamp = check_observed_at(entry.get("observed_at"), now,
+                                  "stored heart reading")
+    except SourceFailure:
+        return None
+    return {"value": value, "observed_at": stamp}
+
+
+def build_heart_post(reading, last, config, now, auth_failed=False):
+    """Decide what the heart gauge POSTs this cycle -> (body, fresh).
+
+    `build_post`'s rule, for the other gauge:
+      * read this cycle  -> the day's rate at the day's own stamp (fresh);
+      * failed, a stored reading exists -> that reading at its ORIGINAL stamp
+        (never re-stamped), which the 36 h daily horizon then ages out;
+      * failed and never read, or the sign-in is CONFIRMED dead (`auth_failed`)
+        -> value 0 with no `observed_at`: stale on arrival, a dash on the wall.
+    `fresh` is True only for a body carrying this cycle's read.
+
+    Implements: SR-073, LLR-1091, LLR-1093
+    """
+    if reading is not None:
+        return heart_gauge_body(
+            check_plausible_resting_bpm(reading.bpm, "reading"),
+            check_observed_at(reading.observed_at, now, "reading"),
+            config), True
+    if auth_failed:
+        return heart_gauge_body(0, None, config), False
+    checked = validate_stored_heart(last, now)
+    if checked is not None:
+        return heart_gauge_body(checked["value"], checked["observed_at"],
+                                config), False
+    return heart_gauge_body(0, None, config), False
+
+
 def is_fresh(body, now):
     """True if NagLight would still consider this body's reading current.
 
@@ -3027,7 +3544,11 @@ def validate_auth_counts(entry):
         return {}
     out = {}
     for source, count in entry.items():
-        if source not in SOURCE_READERS:
+        # The weight sources, and the heart source's own members (H1): a member
+        # for a source this feeder cannot read is stale clutter either way.
+        if source not in SOURCE_READERS and not (
+                isinstance(source, str) and source.endswith(HEART_COUNT_SUFFIX)
+                and source[:-len(HEART_COUNT_SUFFIX)] in SOURCE_READERS):
             continue
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             continue
@@ -3075,6 +3596,14 @@ def load_state(state_path, now):
             counts = validate_auth_counts(entry)
             if counts:
                 out[key] = counts
+            continue
+        # THE HEART READING is beats per minute, not pounds: the generic
+        # validator below would judge it against the 40..1000 lb band (and ACCEPT
+        # 58 bpm as a body weight), so it gets its own band, not an exemption.
+        if key == HEART_STATE_KEY:
+            stored = validate_stored_heart(entry, now)
+            if stored is not None:
+                out[key] = stored
             continue
         if key in (HEIGHT_STATE_KEY, WAIST_STATE_KEY):
             cached = validate_stored_inches(
@@ -3478,6 +4007,15 @@ GOOGLE_HEALTH_LIST_URL = (
 # segment, so neither can drift onto a host or a version the other has not seen.
 GOOGLE_HEALTH_HEIGHT_LIST_URL = (
     "https://health.googleapis.com/v4/users/me/dataTypes/height/dataPoints")
+# THE THIRD DATA TYPE ON THE SAME ROUTE, AND THE SAME SCOPE (H1). Note the
+# segment is kebab-case (`daily-resting-heart-rate`) while the DataPoint member
+# is camelCase (`dailyRestingHeartRate`); the discovery document (revision
+# 20261007) names both. NOT YET CALLED: no resting-heart-rate body has been
+# captured, so the parser is written against the document alone (see the banner
+# above `HEART_DATA_SEGMENT`).
+GOOGLE_HEALTH_HEART_LIST_URL = (
+    "https://health.googleapis.com/v4/users/me/dataTypes/"
+    + HEART_DATA_SEGMENT + "/dataPoints")
 GOOGLE_HEALTH_SCOPE = (
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly")
 GOOGLE_HEALTH_FILTER = 'weight.sample_time.physical_time >= "%s"'
@@ -3913,12 +4451,58 @@ def read_google_health_height(env, list_url=None, token_endpoint=None):
                             "height")
 
 
+def read_google_health_heart(env, list_url=None, token_endpoint=None):
+    """Source: Google Health API v4, Daily Resting Heart Rate data type.
+
+    Contract:
+      Inputs:  env: the process environment plus `_now`; the two endpoints are
+               injected ONLY by tests (no knob: a knob on the URL that carries
+               this token is a way to send it somewhere else).
+      Outputs: HeartReading - the newest day.
+      Raises:  AuthFailure for a dead refresh token (the weight feeder's rule,
+               unchanged), SourceFailure for every other failure class, and
+               NoWeightYet (a subclass) when the account has no resting heart
+               rate at all - TODAY'S NORMAL STATE. The caller takes that as
+               "unavailable", not as an error.
+
+    IT DOES ITS OWN TOKEN REFRESH, like the height read, so the heart gauge
+    cannot hold the weight gauge's token or its latency, and a heart failure
+    cannot touch the weight read. One dead token fails all three reads
+    together, which is correct: it is one credential.
+
+    Implements: SR-073, LLR-1092
+    """
+    token_file = (env.get("WEIGHT_TOKEN_FILE") or "").strip()
+    if not token_file:
+        raise SourceFailure(
+            "google-health(heart): WEIGHT_TOKEN_FILE is unset, so there is no "
+            "refresh token to read and no resting heart rate was taken.")
+    refresh_token = read_refresh_token(os.path.expanduser(token_file))
+    client_id, client_secret = resolve_oauth_client(env)
+    try:
+        timeout = int(env.get("WEIGHT_TIMEOUT_SECONDS") or 30)
+    except ValueError:
+        raise SourceFailure(
+            "google-health(heart): WEIGHT_TIMEOUT_SECONDS is not a whole "
+            "number of seconds.")
+    access_token = google_access_token(client_id, client_secret, refresh_token,
+                                       timeout, token_endpoint)
+    return walk_data_points(access_token, cycle_now(env), timeout,
+                            list_url or GOOGLE_HEALTH_HEART_LIST_URL,
+                            parse_heart_datapoint, "resting heart rate",
+                            "resting heart rate")
+
+
 SOURCE_READERS = {
     "google-health": read_google_health,
 }
 
 HEIGHT_READERS = {
     "google-health": read_google_health_height,
+}
+
+HEART_READERS = {
+    "google-health": read_google_health_heart,
 }
 
 
@@ -4515,6 +5099,136 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,
     return posted, failures, goal_file
 
 
+def run_heart_cycle(env, now=None, reader=None, poster=None):
+    """One heart cycle: read the resting rate, post the heart gauge.
+
+    Contract:
+      Inputs:  env: the process environment plus `_identity` and `_feed_url`;
+               `reader` and `poster` are injectable for the tests.
+      Outputs: (posted, failures): `posted` is [] when HEART_ENABLED is off
+               (and NOTHING is fetched or posted), else
+               [(HEART_GAUGE_ID, fresh, ok)]; `failures` are journal lines
+               carrying no health value.
+      Raises:  ValueError for a bad heart knob (nothing is posted). Nothing
+               else: every read failure becomes a line, and the worst outcome
+               is a dash.
+
+    IT IS A SEPARATE CYCLE, NOT A STEP INSIDE `run_cycle`, AND THAT IS THE
+    ISOLATION. It loads and saves the state file on its own, touches only the
+    heart reading and the heart's own sign-in count, never reads the goal, never
+    posts the weight gauge or the check-off, and runs AFTER the weight cycle
+    whether that cycle succeeded, failed or was refused (a missing weight goal
+    must not take the heart gauge down, nor a bad heart knob the weight gauge).
+    `run_cycle` itself is unchanged by it.
+
+    NO DATA IS NORMAL, NOT A FAILURE. An account with no resting heart rate (the
+    Owner's, today) takes the same path as a failed read: the stored reading
+    at its original stamp, or - with none - the stale-on-arrival body, and NO
+    failure line, so the unit does not report failed every fifteen minutes for
+    a device that does not exist yet.
+
+    THE SIGN-IN COUNT IS THE HEART'S OWN (`heart_count_key`) and follows the
+    weight rules: two consecutive sign-in failures confirm, any other outcome
+    resets, and on the confirming cycle the stored reading is CLEARED so the
+    grey sticks. The same dead token therefore greys both gauges on the same
+    second cycle - right, because it is one credential - without either
+    gauge's count being bumped by the other's.
+
+    Implements: SR-073, LLR-1091, LLR-1092, LLR-1093, LLR-1094, LLR-1095
+    """
+    if not resolve_heart_enabled(env):
+        return [], []
+    config = resolve_heart_config(env)
+    now = int(now if now is not None else time.time())
+    state_path = env.get("WEIGHT_STATE_FILE") or "/var/lib/homehub-weight/weight-state.json"
+    state_root = resolve_state_root(env)
+    feed_url = env["_feed_url"]
+    timeout = int(env.get("WEIGHT_TIMEOUT_SECONDS") or 30)
+    source = enabled_source(env)
+    env["_now"] = now
+
+    reading, failures, auth_failed = None, [], False
+    try:
+        reading = (reader or HEART_READERS[source])(env)
+    except NoWeightYet:
+        pass                                 # no data yet: normal, no line
+    except AuthFailure as exc:
+        auth_failed = True
+        failures.append("%s: %s" % (source, exc))
+    except SourceFailure as exc:
+        failures.append("%s: %s" % (source, exc))
+    except Exception as exc:
+        # TYPE ONLY, never the message - `run_cycle`'s rule.
+        failures.append("%s: unexpected %s" % (source, type(exc).__name__))
+
+    state = load_state(state_path, now)
+    before = {key: dict(value) if isinstance(value, dict) else value
+              for key, value in state.items()}
+    count_key = heart_count_key(source)
+    counts = dict(state.get(AUTH_STATE_KEY) or {})
+    confirmed = False
+    if auth_failed:
+        counts[count_key] = min(counts.get(count_key, 0) + 1, AUTH_CONFIRM_CYCLES)
+        confirmed = counts[count_key] >= AUTH_CONFIRM_CYCLES
+        failures.append(
+            "%s: sign-in failure %d of %d%s" % (
+                source, counts[count_key], AUTH_CONFIRM_CYCLES,
+                " - confirmed, the gauge is grey until the login is renewed"
+                if confirmed else
+                " - not yet confirmed, the last reading is kept"))
+    else:
+        counts.pop(count_key, None)
+    if counts:
+        state[AUTH_STATE_KEY] = counts
+    else:
+        state.pop(AUTH_STATE_KEY, None)
+    if confirmed:
+        state.pop(HEART_STATE_KEY, None)     # CLEARED: the grey sticks
+
+    try:
+        body, fresh = build_heart_post(reading, state.get(HEART_STATE_KEY),
+                                       config, now, auth_failed=confirmed)
+    except (ValueError, SourceFailure) as exc:
+        failures.append("gauge %s: %s" % (HEART_GAUGE_ID, exc))
+        body, fresh, reading = heart_gauge_body(0, None, config), False, None
+    try:
+        ok, detail = (poster or post_gauge)(body, feed_url, env, timeout)
+    except Exception as exc:                 # a poster bug is a failed post
+        ok, detail = False, type(exc).__name__
+    if not ok:
+        failures.append("post %s: %s" % (HEART_GAUGE_ID, detail))
+
+    if reading is not None:
+        state[HEART_STATE_KEY] = {"value": reading.bpm,
+                                  "observed_at": reading.observed_at}
+    if state != before:
+        try:
+            save_state(state, state_path, state_root)
+        except OSError as exc:
+            failures.append("state %s: %s" % (state_path, type(exc).__name__))
+    return [(HEART_GAUGE_ID, fresh, ok)], failures
+
+
+def report_heart(env):
+    """Run the heart cycle and print its lines; returns True when it failed.
+
+    A refused heart knob prints and counts as a failure, but is contained here:
+    it never reaches the caller as an exception, so it cannot change what the
+    weight half did or returned.
+    """
+    try:
+        posted, failures = run_heart_cycle(env)
+    except ValueError as exc:
+        print("heart: REFUSED, nothing posted - %s" % exc, file=sys.stderr)
+        return True
+    for key, fresh, ok in posted:
+        print("heart: %-10s %-12s %s" % (key, "live" if fresh else "UNAVAILABLE",
+                                         "posted" if ok else "POST FAILED"))
+    for line in failures:
+        print("heart: %s" % line, file=sys.stderr)
+    return bool(failures)
+
+
 def main(argv=None):
     """Entry point: gate, resolve, one cycle, report. It does not compute.
 
@@ -4528,16 +5242,31 @@ def main(argv=None):
     env["_identity"] = resolve_identity(env)
     env["_feed_url"] = resolve_feed_url(env)
     enabled_source(env)
+    heart_on = resolve_heart_enabled(env)
     if "--check" in argv:
         print("weight: configuration accepted (identity set, destination local).")
+        if heart_on:
+            try:
+                resolve_heart_config(env)
+            except ValueError as exc:
+                print("heart: REFUSED - %s" % exc, file=sys.stderr)
+                return 2
+            print("heart: configuration accepted (HEART_ENABLED, range valid).")
         return 0
+    # THE HEART HALF RUNS AFTER THE WEIGHT HALF ON EVERY PATH, INCLUDING THE
+    # REFUSED ONES, and only when HEART_ENABLED is on (a heart cycle with it off
+    # would return at once anyway). Neither can change the other's result.
     try:
         posted, failures, goal_file = run_cycle(env)
     except GoalMissing as exc:
         print("weight: REFUSED, nothing posted - %s" % exc, file=sys.stderr)
+        if heart_on:
+            report_heart(env)
         return 2
     except ValueError as exc:
         print("weight: REFUSED, nothing posted - %s" % exc, file=sys.stderr)
+        if heart_on:
+            report_heart(env)
         return 2
     print("weight: goal read from %s" % goal_file)
     for key, fresh, ok in posted:
@@ -4549,7 +5278,8 @@ def main(argv=None):
                                           "posted" if ok else "POST FAILED"))
     for line in failures:
         print("weight: %s" % line, file=sys.stderr)
-    return 1 if failures else 0
+    heart_failed = report_heart(env) if heart_on else False
+    return 1 if (failures or heart_failed) else 0
 
 
 if __name__ == "__main__":

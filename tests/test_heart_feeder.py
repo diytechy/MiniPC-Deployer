@@ -37,7 +37,7 @@ import math
 import re
 import socket
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
@@ -56,14 +56,70 @@ _spec.loader.exec_module(feeder)
 NOW = int(datetime(2026, 10, 12, 14, 0, 0, tzinfo=timezone.utc).timestamp())
 STEP = 900                                   # the 15-minute timer
 DAY = (2026, 10, 11)                         # "yesterday" at NOW
-DAY_STAMP = calendar.timegm((2026, 10, 11, 6, 0, 0))   # independent of the feeder
-DAY_ISO = "2026-10-11T06:00:00Z"
+DAY_STAMP = calendar.timegm((2026, 10, 11, 17, 0, 0))  # noon CDT, from literals
+DAY_ISO = "2026-10-11T17:00:00Z"
 CONFIG = (40, 100, 60)
 GOAL = 180.0
 WEIGHT_STORED = {"value": 191.4, "observed_at": NOW - 3 * 3600}
 HEART_STORED = {"value": 58, "observed_at": DAY_STAMP}
 SENTINEL = "REMOTE-CHOSE-THESE-BYTES-4417"
 USER_ID_SENTINEL = "users/777000111222/dataTypes/daily-resting-heart-rate/dataPoints/PT1"
+
+
+# ── the hub's zone ──────────────────────────────────────────────────────────
+# US Central, written out so the tests do not depend on a tz database (the dev PC
+# runs Python 3.8, which has no `zoneinfo`). Rules since 2007: DST from 02:00 on
+# the second Sunday of March to 02:00 (DST) on the first Sunday of November.
+# The real `zoneinfo` is also exercised where it exists (see the DST tests).
+
+def nth_sunday(year, month, nth):
+    first = datetime(year, month, 1)
+    return 1 + (6 - first.weekday()) % 7 + 7 * (nth - 1)
+
+
+class CentralTime(tzinfo):
+    def _is_dst(self, naive):
+        start = datetime(naive.year, 3, nth_sunday(naive.year, 3, 2), 2)
+        end = datetime(naive.year, 11, nth_sunday(naive.year, 11, 1), 1)
+        return start <= naive < end
+
+    def utcoffset(self, dt):
+        return timedelta(hours=-5 if self._is_dst(dt.replace(tzinfo=None)) else -6)
+
+    def dst(self, dt):
+        return timedelta(hours=1 if self._is_dst(dt.replace(tzinfo=None)) else 0)
+
+    def tzname(self, dt):
+        return "CDT" if self._is_dst(dt.replace(tzinfo=None)) else "CST"
+
+
+CT = CentralTime()
+
+
+class FakeZoneinfo(object):
+    """Stands in for the `zoneinfo` module: knows exactly one zone."""
+
+    @staticmethod
+    def ZoneInfo(name):
+        if name == "America/Chicago":
+            return CT
+        raise KeyError(name)
+
+
+@pytest.fixture(autouse=True)
+def hub_has_a_zone(monkeypatch):
+    monkeypatch.setattr(feeder, "_load_zoneinfo", lambda: FakeZoneinfo)
+
+
+def parse(payload, now=NOW, **kwargs):
+    """The page parser with the hub's zone supplied, as `run_heart_cycle` does."""
+    kwargs.setdefault("zone", CT)
+    return feeder.parse_heart_datapoint(payload, now, **kwargs)
+
+
+def tracking_day(epoch, zone=CT):
+    """NagLight's tracking day for an instant: days start at 02:00 LOCAL."""
+    return (datetime.fromtimestamp(epoch, zone) - timedelta(hours=2)).date()
 
 
 # ── the discovery document, as the fake's contract ──────────────────────────
@@ -189,6 +245,7 @@ def make_env(tmp_path, heart="1", **extra):
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     env = {"_identity": "u", "_feed_url": "http://127.0.0.1:1/api/feed",
+           "TIMEZONE": "America/Chicago",
            "WEIGHT_STATE_FILE": str(state_dir / "weight-state.json"),
            "STATE_DIRECTORY": str(state_dir)}
     if heart is not None:
@@ -210,8 +267,8 @@ def read_state(env):
 
 
 def reading(bpm=58, date=DAY):
-    return feeder.HeartReading(bpm, calendar.timegm(
-        (date[0], date[1], date[2], 6, 0, 0)))
+    return feeder.HeartReading(bpm, int(datetime(
+        date[0], date[1], date[2], 12, tzinfo=CT).timestamp()))
 
 
 def heart_alive(_env):
@@ -366,7 +423,7 @@ class FrozenTime(object):
     """The `time` module the feeder sees, with the clock held at NOW.
 
     `main` takes the real clock, and the fakes' dates are fixed, so without this
-    a run before 2026-10-11 06:00 UTC would find the fixture day "in the future".
+    a run before 2026-10-11 17:00 UTC would find the fixture day "in the future".
     """
 
     def time(self):
@@ -455,7 +512,7 @@ def test_the_fakes_conform_to_the_discovery_document_schema():
 
 
 def test_data_present_parses_to_the_rate_at_the_dates_own_stamp():
-    result = feeder.parse_heart_datapoint(page(point(58)), NOW)
+    result = parse(page(point(58)), NOW)
     assert result.bpm == 58
     assert result.observed_at == DAY_STAMP
     assert result.observed_at != NOW                 # never the fetch time
@@ -470,12 +527,12 @@ def test_the_latest_day_wins_by_date_not_by_position():
              point(60, (2026, 10, 9))),
     ]
     for payload in pages:
-        assert feeder.parse_heart_datapoint(payload, NOW).bpm == 58
+        assert parse(payload, NOW).bpm == 58
 
 
 def test_the_wire_body_is_exactly_the_sleep_shape_with_bpm():
     body, fresh = feeder.build_heart_post(
-        feeder.parse_heart_datapoint(page(point(58)), NOW), None, CONFIG, NOW)
+        parse(page(point(58)), NOW), None, CONFIG, NOW)
     assert fresh is True
     assert body == {
         "kind": "gauge", "id": "heart", "label": "Heart", "icon": "heart",
@@ -521,55 +578,189 @@ def test_a_days_value_is_fresh_until_the_next_mornings_value_normally_arrives():
 
 
 def test_a_correction_to_the_same_day_does_not_move_the_stamp():
-    first = feeder.parse_heart_datapoint(page(point(58)), NOW)
-    corrected = feeder.parse_heart_datapoint(page(point(61)), NOW + 5 * 3600)
+    first = parse(page(point(58)), NOW)
+    corrected = parse(page(point(61)), NOW + 5 * 3600)
     assert corrected.bpm == 61
     assert corrected.observed_at == first.observed_at == DAY_STAMP
 
 
 def test_a_day_that_has_begun_elsewhere_is_held_back_not_failed():
     tomorrow = (2026, 10, 13)          # stamp +16 h ahead of NOW
-    result = feeder.parse_heart_datapoint(
+    result = parse(
         page(point(61, tomorrow), point(58)), NOW)
     assert result.bpm == 58            # the older day carries the gauge
     with pytest.raises(feeder.NoWeightYet):
-        feeder.parse_heart_datapoint(page(point(61, tomorrow)), NOW)
+        parse(page(point(61, tomorrow)), NOW)
 
 
 def test_a_date_far_ahead_of_the_clock_is_corruption_and_fails():
     with pytest.raises(feeder.SourceFailure) as err:
-        feeder.parse_heart_datapoint(page(point(58, (2030, 1, 1))), NOW)
+        parse(page(point(58, (2030, 1, 1))), NOW)
     assert not isinstance(err.value, feeder.NoWeightYet)
 
 
 def test_a_date_before_the_feeder_existed_is_corruption():
     with pytest.raises(feeder.SourceFailure):
-        feeder.parse_heart_datapoint(page(point(58, (2019, 5, 5))), NOW)
+        parse(page(point(58, (2019, 5, 5))), NOW)
 
 
 def test_a_point_of_another_data_type_is_skipped_not_fatal():
     other = {"name": USER_ID_SENTINEL, "weight": {"weightGrams": 80000}}
-    assert feeder.parse_heart_datapoint(page(other, point(58)), NOW).bpm == 58
+    assert parse(page(other, point(58)), NOW).bpm == 58
     with pytest.raises(feeder.SourceFailure) as err:
-        feeder.parse_heart_datapoint(page(other), NOW)
+        parse(page(other), NOW)
     assert not isinstance(err.value, feeder.NoWeightYet)
 
 
 def test_two_points_for_the_newest_day_that_disagree_are_refused():
     with pytest.raises(feeder.SourceFailure) as err:
-        feeder.parse_heart_datapoint(page(point(58), point(63)), NOW)
+        parse(page(point(58), point(63)), NOW)
     assert "58" not in str(err.value) and "63" not in str(err.value)
 
 
 def test_two_identical_points_for_the_newest_day_are_a_duplicate_not_a_clash():
-    assert feeder.parse_heart_datapoint(page(point(58), point(58)), NOW).bpm == 58
+    assert parse(page(point(58), point(58)), NOW).bpm == 58
 
 
 def test_the_google_user_id_and_the_source_are_never_read():
-    result = feeder.parse_heart_datapoint(page(point(58)), NOW)
+    result = parse(page(point(58)), NOW)
     for text in (repr(result), str(result)):
         assert "777000111222" not in text and "58" not in text
     assert not hasattr(result, "name")
+
+
+# ── TC-1178 (continued): the stamp is 12:00 LOCAL, inside tracking day D ─────
+# NagLight's tracking day starts at 02:00 local (eventlog.DayStartHour). Every
+# expectation below is a hand-written UTC literal, not computed by the feeder.
+
+LATE = calendar.timegm((2027, 1, 15, 0, 0, 0))     # well after every fixture day
+
+STAMP_CASES = [
+    # (date, expected UTC instant, why)
+    ((2026, 10, 11), (2026, 10, 11, 17, 0), "CDT, ordinary autumn day"),
+    ((2026, 12, 15), (2026, 12, 15, 18, 0), "CST, ordinary winter day"),
+    ((2026, 3, 7), (2026, 3, 7, 18, 0), "CST, the day BEFORE spring forward"),
+    ((2026, 3, 8), (2026, 3, 8, 17, 0), "CDT, spring-forward day itself"),
+    ((2026, 3, 9), (2026, 3, 9, 17, 0), "CDT, the day after"),
+    ((2026, 10, 31), (2026, 10, 31, 17, 0), "CDT, the day BEFORE fall back"),
+    ((2026, 11, 1), (2026, 11, 1, 18, 0), "CST, fall-back day itself"),
+    ((2026, 11, 2), (2026, 11, 2, 18, 0), "CST, the day after"),
+]
+
+
+@pytest.mark.parametrize("date,utc,why", STAMP_CASES, ids=[c[2] for c in STAMP_CASES])
+def test_each_date_is_stamped_at_noon_local_and_lands_in_that_tracking_day(
+        date, utc, why):
+    result = parse(page(point(58, date)), LATE)
+    assert result.observed_at == calendar.timegm(utc + (0,)), why
+    day = tracking_day(result.observed_at)
+    assert (day.year, day.month, day.day) == date, why
+    # And it is exactly 12:00 on the local wall clock.
+    local = datetime.fromtimestamp(result.observed_at, CT)
+    assert (local.hour, local.minute) == (12, 0)
+
+
+@pytest.mark.parametrize("date,utc,why", STAMP_CASES, ids=[c[2] for c in STAMP_CASES])
+def test_the_old_06_utc_stamp_would_have_been_the_previous_tracking_day(
+        date, utc, why):
+    # The defect the review found, pinned: 06:00Z is 00:00/01:00 local.
+    old = calendar.timegm((date[0], date[1], date[2], 6, 0, 0))
+    assert tracking_day(old).day != date[2]
+
+
+@pytest.mark.parametrize("date,utc,why", STAMP_CASES, ids=[c[2] for c in STAMP_CASES])
+def test_the_real_zoneinfo_agrees_on_every_dst_boundary_case(date, utc, why):
+    zoneinfo = pytest.importorskip("zoneinfo")
+    zone = zoneinfo.ZoneInfo("America/Chicago")
+    result = feeder.parse_heart_datapoint(page(point(58, date)), LATE, zone=zone)
+    assert result.observed_at == calendar.timegm(utc + (0,)), why
+    day = tracking_day(result.observed_at, zone)
+    assert (day.year, day.month, day.day) == date, why
+
+
+def test_the_stamp_follows_the_zone_it_is_given_not_a_utc_constant():
+    plus_nine = timezone(timedelta(hours=9))
+    result = feeder.parse_heart_datapoint(page(point(58)), LATE, zone=plus_nine)
+    assert result.observed_at == calendar.timegm((2026, 10, 11, 3, 0, 0))
+    utc = feeder.parse_heart_datapoint(page(point(58)), LATE, zone=timezone.utc)
+    assert utc.observed_at == calendar.timegm((2026, 10, 11, 12, 0, 0))
+
+
+def test_a_parse_with_no_zone_refuses_rather_than_assuming_utc():
+    with pytest.raises(feeder.SourceFailure) as err:
+        feeder.parse_heart_datapoint(page(point(58)), NOW, zone=None)
+    assert not isinstance(err.value, feeder.NoWeightYet)
+
+
+def test_todays_date_is_held_back_until_noon_local_then_posted_at_noon_exactly():
+    today = (2026, 10, 12)                       # NOW is 09:00 CDT that day
+    noon = calendar.timegm((2026, 10, 12, 17, 0, 0))
+    # Before noon: held back; yesterday carries the gauge.
+    got = parse(page(point(61, today), point(58)), NOW)
+    assert got.bpm == 58 and got.observed_at == DAY_STAMP
+    with pytest.raises(feeder.NoWeightYet):
+        parse(page(point(61, today)), NOW)
+    # After noon (even a minute after): the stamp is noon, never the fetch time.
+    got = parse(page(point(61, today)), noon + 60)
+    assert got.bpm == 61 and got.observed_at == noon != noon + 60
+
+
+def test_the_zone_is_required_and_a_missing_one_skips_the_gauge_before_any_read(
+        tmp_path):
+    env = make_env(tmp_path)
+    del env["TIMEZONE"]
+    with pytest.raises(ValueError) as err:
+        feeder.run_heart_cycle(env, now=NOW, reader=boom, poster=boom)
+    assert "TIMEZONE" in str(err.value) and "unset" in str(err.value)
+    assert not state_file(env).exists()
+
+
+@pytest.mark.parametrize("name", ["", "   ", "Mars/Olympus"])
+def test_an_unset_or_unknown_timezone_is_refused_never_guessed_as_utc(name):
+    with pytest.raises(ValueError) as err:
+        feeder.resolve_heart_zone({"TIMEZONE": name})
+    assert "TIMEZONE" in str(err.value)
+    if name.strip():
+        assert "Mars/Olympus" in str(err.value) and "not a zone" in str(err.value)
+
+
+def test_a_box_without_zoneinfo_refuses_a_named_zone(monkeypatch):
+    def missing():
+        raise ImportError("no zoneinfo")
+
+    monkeypatch.setattr(feeder, "_load_zoneinfo", missing)
+    with pytest.raises(ValueError) as err:
+        feeder.resolve_heart_zone({"TIMEZONE": "America/Chicago"})
+    assert "zoneinfo" in str(err.value)
+    # UTC needs no database.
+    assert feeder.resolve_heart_zone({"TIMEZONE": "Etc/UTC"}) is timezone.utc
+
+
+def test_a_known_zone_resolves_to_the_tzinfo():
+    assert feeder.resolve_heart_zone({"TIMEZONE": "America/Chicago"}) is CT
+
+
+def test_main_with_no_timezone_skips_heart_names_it_and_leaves_weight_alone(
+        monkeypatch, tmp_path):
+    rc, posts, out, err, calls = run_main(
+        monkeypatch, tmp_path, {"HEART_ENABLED": "1", "TIMEZONE": ""},
+        heart_reader=boom)
+    assert calls["weight"] == 1 and posts == []
+    assert out.splitlines()[0] == "weight: goal read from health.md"
+    assert "heart: REFUSED" in err and "TIMEZONE" in err
+    assert rc == 1                                   # visible, never silent
+
+
+def test_check_mode_refuses_a_missing_timezone_only_when_heart_is_on(
+        monkeypatch, tmp_path):
+    rc, _p, _o, err, calls = run_main(
+        monkeypatch, tmp_path, {"HEART_ENABLED": "1", "TIMEZONE": ""},
+        argv=["--check"])
+    assert rc == 2 and "TIMEZONE" in err and calls["weight"] == 0
+    rc, _p, out, err, _c = run_main(
+        monkeypatch, tmp_path, {"HEART_ENABLED": "0", "TIMEZONE": ""},
+        argv=["--check"])
+    assert rc == 0 and "heart" not in out + err
 
 
 # ── TC-1179: no data ────────────────────────────────────────────────────────
@@ -577,14 +768,14 @@ def test_the_google_user_id_and_the_source_are_never_read():
 @pytest.mark.parametrize("payload", [{"dataPoints": []}, {"dataPoints": None}])
 def test_an_empty_history_is_no_data_not_a_failure(payload):
     with pytest.raises(feeder.NoWeightYet):
-        feeder.parse_heart_datapoint(payload, NOW)
+        parse(payload, NOW)
 
 
 @pytest.mark.parametrize("payload", [{}, {"other": []}, [], "x", None,
                                      {"dataPoints": {}}, {"dataPoints": "x"}])
 def test_a_body_that_is_not_the_envelope_is_a_failure_not_no_data(payload):
     with pytest.raises(feeder.SourceFailure) as err:
-        feeder.parse_heart_datapoint(payload, NOW)
+        parse(payload, NOW)
     assert not isinstance(err.value, feeder.NoWeightYet)
 
 
@@ -622,9 +813,9 @@ def test_no_data_after_a_good_day_reposts_it_at_its_original_stamp(tmp_path):
 def test_a_stored_day_older_than_36_hours_is_posted_but_stale(tmp_path):
     env = make_env(tmp_path)
     seed(env, {"heart": {"value": 58,
-                         "observed_at": calendar.timegm((2026, 10, 9, 6, 0, 0))}})
+                         "observed_at": calendar.timegm((2026, 10, 9, 17, 0, 0))}})
     _p, _f, bodies = heart_cycle(env, heart_empty)
-    assert bodies[0]["observed_at"] == "2026-10-09T06:00:00Z"
+    assert bodies[0]["observed_at"] == "2026-10-09T17:00:00Z"
     assert naglight_stale(bodies[0], NOW) is True
 
 
@@ -662,13 +853,13 @@ def test_a_malformed_beats_per_minute_is_refused_naming_no_value(raw):
 def test_a_malformed_value_in_a_page_costs_the_page_not_a_number(raw):
     bad = point(58, beatsPerMinute=raw)
     with pytest.raises(feeder.SourceFailure) as err:
-        feeder.parse_heart_datapoint(page(bad), NOW)
+        parse(page(bad), NOW)
     assert not isinstance(err.value, feeder.NoWeightYet)
     assert "58" not in str(err.value).replace("[58]", "")
 
 
 def test_one_bad_point_among_good_ones_costs_only_itself():
-    result = feeder.parse_heart_datapoint(
+    result = parse(
         page(point(58, beatsPerMinute="abc"), point(57, (2026, 10, 10))), NOW)
     assert result.bpm == 57
 
@@ -685,7 +876,7 @@ def test_a_missing_or_malformed_date_is_refused_never_replaced_by_the_clock(date
     bad = point(58)
     bad["dailyRestingHeartRate"]["date"] = date
     with pytest.raises(feeder.SourceFailure):
-        feeder.parse_heart_datapoint(page(bad), NOW)
+        parse(page(bad), NOW)
 
 
 def test_a_missing_date_or_missing_rate_key_is_refused():
@@ -695,7 +886,7 @@ def test_a_missing_date_or_missing_rate_key_is_refused():
     del no_bpm["dailyRestingHeartRate"]["beatsPerMinute"]
     for bad in (no_date, no_bpm):
         with pytest.raises(feeder.SourceFailure):
-            feeder.parse_heart_datapoint(page(bad), NOW)
+            parse(page(bad), NOW)
 
 
 @pytest.mark.parametrize("bad", [
@@ -703,14 +894,14 @@ def test_a_missing_date_or_missing_rate_key_is_refused():
     {"dailyRestingHeartRate": "58"}, {"dailyRestingHeartRate": []}])
 def test_a_point_that_is_not_an_object_or_has_no_member_is_refused(bad):
     with pytest.raises(feeder.SourceFailure):
-        feeder.parse_heart_datapoint(page(bad), NOW)
+        parse(page(bad), NOW)
 
 
 def test_a_malformed_read_posts_the_unavailable_body_and_a_numberless_line(tmp_path):
     env = make_env(tmp_path)
 
     def reader(e):
-        return feeder.parse_heart_datapoint(
+        return parse(
             page(point(187, beatsPerMinute="187.5")), NOW)
 
     _p, failures, bodies = heart_cycle(env, reader)
@@ -735,7 +926,7 @@ def test_the_edges_of_the_plausible_band_are_accepted(bpm):
 def test_a_refused_value_is_never_clamped_to_the_band_edge(tmp_path):
     env = make_env(tmp_path)
     for raw in ("250", "9999", "3", "0"):
-        bodies = heart_cycle(env, lambda e, raw=raw: feeder.parse_heart_datapoint(
+        bodies = heart_cycle(env, lambda e, raw=raw: parse(
             page(point(raw)), NOW), STEP)[2]
         body = bodies[0]
         assert is_stale_on_arrival(body)
@@ -746,7 +937,7 @@ def test_a_refused_value_leaves_the_previous_day_standing(tmp_path):
     env = make_env(tmp_path)
     seed(env, {"heart": HEART_STORED})
     _p, failures, bodies = heart_cycle(
-        env, lambda e: feeder.parse_heart_datapoint(page(point(250)), NOW))
+        env, lambda e: parse(page(point(250)), NOW))
     assert bodies[0]["value"] == 58 and bodies[0]["observed_at"] == DAY_ISO
     assert failures and "250" not in "".join(failures)
     assert read_state(env)["heart"] == HEART_STORED
@@ -983,7 +1174,7 @@ def weight_snapshot(env):
 @pytest.mark.parametrize("heart_reader", [
     heart_alive, heart_empty, heart_auth_dead, heart_net_dead,
     lambda e: 1 / 0,
-    lambda e: feeder.parse_heart_datapoint(page(point(999)), NOW)],
+    lambda e: parse(page(point(999)), NOW)],
     ids=["alive", "no-data", "auth", "network", "bug", "implausible"])
 def test_whatever_heart_does_the_weight_gauge_posts_the_same_thing(
         tmp_path, heart_reader):
@@ -1228,10 +1419,14 @@ def test_the_real_reader_asks_the_heart_route_by_default_and_parses_its_page(
     with loopback_server(fake_google({})) as (base, _seen):
         got = feeder.read_google_health_heart(env, token_endpoint=base + "/token")
     assert got.bpm == 58
-    assert asked == [(
-        "https://health.googleapis.com/v4/users/me/dataTypes/"
-        "daily-resting-heart-rate/dataPoints",
-        feeder.parse_heart_datapoint, "ACCESS-TOKEN-XYZ")]
+    assert len(asked) == 1
+    url, parser, token = asked[0]
+    assert url == ("https://health.googleapis.com/v4/users/me/dataTypes/"
+                   "daily-resting-heart-rate/dataPoints")
+    assert token == "ACCESS-TOKEN-XYZ"
+    # The parser the reader hands the walk is the heart parser WITH the hub's
+    # zone from TIMEZONE: it stamps noon local (CDT), not a UTC hour.
+    assert parser(page(point(58)), NOW).observed_at == DAY_STAMP
     assert feeder.HEART_READERS["google-health"] is feeder.read_google_health_heart
 
 
@@ -1313,7 +1508,7 @@ def test_the_journal_and_stdout_of_a_whole_cycle_carry_no_health_value(
     env = make_env(tmp_path)
 
     def reader(e):
-        return feeder.parse_heart_datapoint(
+        return parse(
             page(point(187, (2026, 10, 11))), NOW)
 
     posts = []

@@ -1268,7 +1268,7 @@ already holds the Google Health connection. It ships **OFF**.
 ```
 {"kind":"gauge","id":"heart","label":"Heart","icon":"heart","unit":"bpm",
  "value":58,"min":40,"max":100,"target":60,"favourable":"low",
- "window":{"kind":"daily"},"observed_at":"2026-10-11T06:00:00Z"}
+ "window":{"kind":"daily"},"observed_at":"2026-10-11T17:00:00Z"}
 ```
 
 No `start`, `end` or `direction` (a kind-only window is valid and earns the 36 h
@@ -1314,18 +1314,32 @@ a different consent.
 Each must be a plain whole number from 1 to 300 (the API's own heart-rate range)
 with `MIN < MAX` and `MIN <= TARGET <= MAX`. A bad value is **refused** with the
 knob named (`heart: REFUSED`), the heart gauge is skipped, **the weight gauge
-runs normally**, and the unit exits non-zero so it is not silent.
+runs normally**, and the unit exits non-zero so it is not silent. It also needs
+`TIMEZONE` in the same `.env` (see below); `--check` validates both.
+
+**Exit status.** With `HEART_ENABLED=1`, any heart failure - a refused knob or
+zone, a network error, a sign-in failure, a failed post - makes the unit exit
+**1**, exactly as a weight failure does, so `systemctl` shows it failed. *No data
+from Google is not a failure* and exits 0. Weight's own result is never changed
+by it, but the unit's single exit code is the OR of both halves.
 
 ### Choices worth knowing
 
 * **`observed_at` is the data point's own day, never the fetch time.** A daily
   point carries only a civil `date` (no instant, no offset), so the stamp is that
-  date at **06:00 UTC** - a pure function of the date, so a later correction of
-  the same day never moves it. It is an approximation: in the Americas it is
-  after the day began and the value stays fresh for 36 h, past the next morning's
-  arrival. A day stamped ahead of the clock (a date that has begun elsewhere) is
-  *held back*, not failed, and the previous day carries the gauge; a date more
-  than 48 h ahead is corruption and fails.
+  date at a fixed **12:00 local** in the hub's `TIMEZONE` (the example above is
+  noon CDT) - a pure function of the date, so a later correction of the same day
+  never moves it. Noon, not a UTC hour, because NagLight's tracking day starts at
+  02:00 *local*: a 06:00 UTC stamp is 01:00 CDT or 00:00 CST, the previous
+  tracking day, and filed every reading under the wrong day. Noon is inside the
+  right day in CDT, CST and on both DST-change dates, and stays fresh for 36 h
+  (to 00:00 two days on). **`TIMEZONE` must be set to a zone this box knows**
+  (Python 3.9+ `zoneinfo`, as the sleep feeder reads it); if it is unset or
+  unknown the heart gauge is **refused** - `heart: REFUSED - TIMEZONE ...`,
+  nothing posted, weight unaffected - and a guessed UTC is never used. A day
+  stamped ahead of the clock (not yet noon here) is *held back*, not failed, and
+  the previous day carries the gauge; it is never clamped to the fetch time. A
+  date more than 48 h ahead is corruption and fails.
 * **Out of range is refused, never clamped.** A resting rate outside 25-200 bpm
   is a units error or corruption; it fails like any bad reading (the last good
   day stays, or the gauge goes unavailable) and the journal names the band and

@@ -413,17 +413,28 @@ HEART_STATE_KEY = HEART_GAUGE_ID
 HEART_COUNT_SUFFIX = ":heart"
 # The Google Health `date` of a daily data point is a bare civil date in the
 # user's timezone; the point carries NO instant. The gauge's `observed_at` is
-# that DATE pinned to this UTC hour - a pure function of the date, so a later
+# that DATE at a FIXED 12:00 LOCAL in the hub's zone (the TIMEZONE knob, the
+# way the sleep feeder reads it) - a pure function of the date, so a later
 # correction of the same day never moves it and the fetch time never enters.
-# The stamp must not be AHEAD of the moment the value first exists, or it is
-# held back; 06:00 UTC is 01:00 US Central and 23:00 the evening before in US
-# Pacific, earlier than any value for that date can exist (it is computed from
-# that day's data, normally the morning's sync). And 36 h (the daily horizon)
-# later it is 13:00 US Central the NEXT day, long after the next morning's
-# value has normally arrived. It is an approximation and is stated as one: a
-# household far east of UTC would see a fresh day held back for some hours
-# (the previous day carries the gauge meanwhile), never a stale one shown fresh.
-HEART_STAMP_UTC_HOUR = 6
+#
+# WHY LOCAL NOON AND NOT A UTC HOUR (H1 review, 2026-10-11): NagLight's
+# tracking day starts at 02:00 LOCAL (eventlog.DayStartHour = 2; trackingDay
+# converts into the location first). A UTC hour such as 06:00 is 01:00 CDT or
+# 00:00 CST, which is the PREVIOUS tracking day, so every reading for date D
+# was filed under D-1, shifting `previous_observed_at`, and the gauge greyed at
+# 13:00 on D+1 if the next value was late. Noon local is inside tracking day D
+# in every zone and across both DST changes (they happen at 02:00), and 36 h
+# (the daily horizon) later is 00:00 on D+2.
+#
+# THE ZONE IS REQUIRED. With TIMEZONE unset, or a name this box does not know,
+# the heart gauge is REFUSED (a status line, nothing posted, weight untouched):
+# a guessed UTC would silently put the stamp on the wrong tracking day again.
+# The sleep feeder's `min(noon, now)` rule is deliberately NOT copied: a stamp
+# ahead of the clock is held back (HeartPointNotYet), never clamped to now,
+# because a clamp would let the fetch time into `observed_at`.
+HEART_STAMP_LOCAL_HOUR = 12
+# The zone names that need no tz database (so they work on any Python).
+UTC_ZONE_NAMES = ("UTC", "Etc/UTC", "Etc/Universal", "Zulu")
 # A point whose stamp is up to this far ahead of the clock is a day that has
 # started somewhere but not here yet: it is held back (not a failure), and an
 # older day carries the gauge meanwhile. Further ahead than this is corruption.
@@ -1572,8 +1583,8 @@ def parse_height_datapoint(payload, now, where="google-health(height)"):
 # TWO SHAPES DIFFER FROM WEIGHT AND HEIGHT, AND BOTH MATTER:
 #   * THERE IS NO `sampleTime`. A daily point carries only a civil `date`, so
 #     there is no `physicalTime`, no `utcOffset` and no instant at all. The
-#     gauge's `observed_at` is therefore that date pinned to HEART_STAMP_UTC_HOUR
-#     (see its comment) - never the clock.
+#     gauge's `observed_at` is therefore that date at HEART_STAMP_LOCAL_HOUR
+#     (12:00) in the hub's TIMEZONE (see its comment) - never the clock.
 #   * `beatsPerMinute` IS A DECIMAL STRING, like `heightMillimeters`: proto3
 #     encodes int64 as a string, and the document says `"type": "string",
 #     "format": "int64"`. A bare JSON number is a shape nobody has seen on this
@@ -1664,13 +1675,16 @@ def check_vendor_bpm(raw, where):
     return check_plausible_resting_bpm(int(raw), where)
 
 
-def heart_stamp_of_date(date, now, where):
+def heart_stamp_of_date(date, now, where, zone=None):
     """The epoch second a daily point's `date` is stamped with, or raise.
 
     Contract:
       Inputs:  date: the `date` member exactly as decoded; now: this cycle's
-               clock.
-      Outputs: int epoch seconds - the date at HEART_STAMP_UTC_HOUR UTC.
+               clock; zone: the hub's tzinfo (`resolve_heart_zone`).
+      Outputs: int epoch seconds - 12:00 LOCAL on that date, built as
+               datetime(y, m, d, 12, tzinfo=zone). That is inside NagLight's
+               tracking day for the date (which starts 02:00 local) in both
+               CDT and CST and on both DST-change dates.
       Raises:  HeartPointNotYet when the stamp is ahead of the clock by more
                than the skew allowance but within HEART_DEFER_SECONDS;
                SourceFailure for a missing or malformed date, a date before
@@ -1686,15 +1700,19 @@ def heart_stamp_of_date(date, now, where):
             "%s: `%s` is missing or is not an object (it is a %s), so this "
             "resting rate has no day and `observed_at` may not be invented "
             "from the clock." % (where, HEART_DATE_KEY, type(date).__name__))
+    if zone is None:
+        raise SourceFailure(
+            "%s: no timezone was resolved, so the day cannot be placed; the "
+            "heart gauge refuses rather than guess UTC" % where)
     parts = [date.get("year"), date.get("month"), date.get("day")]
     if not all(isinstance(part, int) and not isinstance(part, bool)
                for part in parts):
         raise SourceFailure("%s: `%s` does not carry integer year, month and day"
                             % (where, HEART_DATE_KEY))
     try:
-        stamp = int(datetime(parts[0], parts[1], parts[2], HEART_STAMP_UTC_HOUR,
-                             tzinfo=timezone.utc).timestamp())
-    except (ValueError, OverflowError):
+        stamp = int(datetime(parts[0], parts[1], parts[2], HEART_STAMP_LOCAL_HOUR,
+                             tzinfo=zone).timestamp())
+    except (ValueError, OverflowError, OSError):
         raise SourceFailure("%s: `%s` is not a real calendar date"
                             % (where, HEART_DATE_KEY))
     if stamp < EPOCH_FLOOR:
@@ -1712,7 +1730,7 @@ def heart_stamp_of_date(date, now, where):
     return stamp
 
 
-def heart_from_data_point(point, now, where):
+def heart_from_data_point(point, now, where, zone=None):
     """ONE element of `dataPoints` -> a HeartReading, or SourceFailure.
 
     A point with no `dailyRestingHeartRate` member is not this data type (the
@@ -1739,11 +1757,12 @@ def heart_from_data_point(point, now, where):
             "required, so a point without one is a shape this parser does not "
             "understand." % (where, HEART_MEMBER, HEART_BPM_KEY))
     bpm = check_vendor_bpm(member.get(HEART_BPM_KEY), where)
-    stamp = heart_stamp_of_date(member.get(HEART_DATE_KEY), now, where)
+    stamp = heart_stamp_of_date(member.get(HEART_DATE_KEY), now, where, zone)
     return HeartReading(bpm=bpm, observed_at=stamp)
 
 
-def parse_heart_datapoint(payload, now, where="google-health(heart)"):
+def parse_heart_datapoint(payload, now, where="google-health(heart)",
+                          zone=None):
     """ONE `ListDataPointsResponse` page -> the LATEST usable HeartReading.
 
     Every rule is `parse_height_datapoint`'s, applied to the other member: the
@@ -1787,7 +1806,8 @@ def parse_heart_datapoint(payload, now, where="google-health(heart)"):
     for index, point in enumerate(points):
         try:
             readings.append(heart_from_data_point(
-                point, now, "%s %s[%d]" % (where, DATA_POINTS_KEY, index)))
+                point, now, "%s %s[%d]" % (where, DATA_POINTS_KEY, index),
+                zone))
         except HeartPointNotYet:
             held += 1
         except SourceFailure as exc:
@@ -2768,6 +2788,50 @@ def resolve_heart_config(env):
         raise ValueError("HEART_TARGET_BPM (%d) must lie inside HEART_MIN_BPM.."
                          "HEART_MAX_BPM (%d..%d)" % (target, low, high))
     return low, high, target
+
+
+def _load_zoneinfo():
+    """The stdlib `zoneinfo` module (Python 3.9+, the hub's). A seam for tests."""
+    import zoneinfo
+    return zoneinfo
+
+
+def resolve_heart_zone(env, zoneinfo_module=None):
+    """The hub's zone from the TIMEZONE knob as a tzinfo, or ValueError.
+
+    Contract:
+      Config:  TIMEZONE (the same knob the sleep feeder reads; the unit's
+               EnvironmentFile carries it).
+      Outputs: a tzinfo. UTC and its aliases need no tz database; any other
+               name needs `zoneinfo` (Python 3.9+) and the system tz data.
+      Raises:  ValueError when TIMEZONE is unset, when `zoneinfo` is missing,
+               or when the name is not a zone this box knows. NEVER a guess:
+               the stamp is a LOCAL noon, and a guessed UTC would put it on
+               the previous tracking day (see HEART_STAMP_LOCAL_HOUR). The
+               caller skips the heart gauge with a status line and leaves
+               weight alone. Only the zone NAME (our own configuration) is
+               ever put in a message.
+
+    Implements: SR-073, LLR-1093
+    """
+    name = (env.get("TIMEZONE") or "").strip()
+    if not name:
+        raise ValueError(
+            "TIMEZONE is unset. The heart gauge stamps each day at 12:00 LOCAL "
+            "so it lands in NagLight's tracking day, and will not guess the "
+            "hub's zone")
+    if name in UTC_ZONE_NAMES:
+        return timezone.utc
+    module = zoneinfo_module
+    if module is None:
+        try:
+            module = _load_zoneinfo()
+        except ImportError:
+            raise ValueError("TIMEZONE=%s needs Python 3.9+ (zoneinfo)" % name)
+    try:
+        return module.ZoneInfo(name)
+    except Exception:
+        raise ValueError("TIMEZONE=%s is not a zone this box knows" % name)
 
 
 def heart_count_key(source):
@@ -4485,12 +4549,21 @@ def read_google_health_heart(env, list_url=None, token_endpoint=None):
         raise SourceFailure(
             "google-health(heart): WEIGHT_TIMEOUT_SECONDS is not a whole "
             "number of seconds.")
+    # The zone is resolved by `run_heart_cycle` BEFORE any read; a direct call
+    # resolves it here and a missing one is an ordinary (non-sign-in) failure.
+    zone = env.get("_heart_zone")
+    if zone is None:
+        try:
+            zone = resolve_heart_zone(env)
+        except ValueError as exc:
+            raise SourceFailure("google-health(heart): %s" % exc)
     access_token = google_access_token(client_id, client_secret, refresh_token,
                                        timeout, token_endpoint)
-    return walk_data_points(access_token, cycle_now(env), timeout,
-                            list_url or GOOGLE_HEALTH_HEART_LIST_URL,
-                            parse_heart_datapoint, "resting heart rate",
-                            "resting heart rate")
+    return walk_data_points(
+        access_token, cycle_now(env), timeout,
+        list_url or GOOGLE_HEALTH_HEART_LIST_URL,
+        lambda payload, now: parse_heart_datapoint(payload, now, zone=zone),
+        "resting heart rate", "resting heart rate")
 
 
 SOURCE_READERS = {
@@ -5109,7 +5182,8 @@ def run_heart_cycle(env, now=None, reader=None, poster=None):
                (and NOTHING is fetched or posted), else
                [(HEART_GAUGE_ID, fresh, ok)]; `failures` are journal lines
                carrying no health value.
-      Raises:  ValueError for a bad heart knob (nothing is posted). Nothing
+      Raises:  ValueError for a bad heart knob or an unusable TIMEZONE (nothing
+               is posted). Nothing
                else: every read failure becomes a line, and the worst outcome
                is a dash.
 
@@ -5139,6 +5213,9 @@ def run_heart_cycle(env, now=None, reader=None, poster=None):
     if not resolve_heart_enabled(env):
         return [], []
     config = resolve_heart_config(env)
+    # BOTH refusals happen before any read or post: a missing zone must skip
+    # the gauge, not guess UTC (HEART_STAMP_LOCAL_HOUR).
+    env["_heart_zone"] = resolve_heart_zone(env)
     now = int(now if now is not None else time.time())
     state_path = env.get("WEIGHT_STATE_FILE") or "/var/lib/homehub-weight/weight-state.json"
     state_root = resolve_state_root(env)
@@ -5248,10 +5325,11 @@ def main(argv=None):
         if heart_on:
             try:
                 resolve_heart_config(env)
+                resolve_heart_zone(env)
             except ValueError as exc:
                 print("heart: REFUSED - %s" % exc, file=sys.stderr)
                 return 2
-            print("heart: configuration accepted (HEART_ENABLED, range valid).")
+            print("heart: configuration accepted (HEART_ENABLED, range valid, zone known).")
         return 0
     # THE HEART HALF RUNS AFTER THE WEIGHT HALF ON EVERY PATH, INCLUDING THE
     # REFUSED ONES, and only when HEART_ENABLED is on (a heart cycle with it off

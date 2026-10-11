@@ -1256,12 +1256,167 @@ been entered.
 
 ---
 
+## Heart (resting heart rate)
+
+*(H1, 2026-10-11. SR-073, LLR-1091..LLR-1096. Built ahead of a data source: it
+posts "unavailable" until a device feeds it.)*
+
+A third gauge, `heart`: **one number per day, the daily resting heart rate in
+beats per minute, lower is better.** It rides this feeder because the feeder
+already holds the Google Health connection. It ships **OFF**.
+
+```
+{"kind":"gauge","id":"heart","label":"Heart","icon":"heart","unit":"bpm",
+ "value":58,"min":40,"max":100,"target":60,"favourable":"low",
+ "window":{"kind":"daily"},"observed_at":"2026-10-11T17:00:00Z"}
+```
+
+No `start`, `end` or `direction` (a kind-only window is valid and earns the 36 h
+`daily` staleness horizon), no `previous_value` (NagLight derives the baseline),
+no colour.
+
+### What lights it up
+
+A **Fitbit-family device writing into Google Health** - the data-types table
+(developers.google.com/health/data-types, last updated 2026-10-06) lists Fitbit
+Air, Charge 2-6, Inspire, Luxe, Sense, Versa, Pixel Watch and Pixel Watch 2-4
+as able to record `daily-resting-heart-rate`. The point must be a
+`dailyRestingHeartRate` data point: `beatsPerMinute` (an int64 sent as a decimal
+**string**) and a civil `date`. Today the Owner's watch cannot reach Google
+Health, so the data type is empty and the gauge posts the **stale-on-arrival
+body** (value 0, no `observed_at`: a dash on the wall). That is the normal state,
+not a fault: it writes no failure line and the unit does not fail.
+
+### Needs no new consent
+
+The scope this feeder already holds,
+`googlehealth.health_metrics_and_measurements.readonly`, is the one the
+data-types table lists for `daily-resting-heart-rate`; `weight` and `height`
+are listed under the same one. So when a device appears there is **no new
+consent, no re-mint and no change to the OAuth consent screen** - provided the
+refresh token is alive (the app must be "In production", see "The 7-day cliff").
+*How that was checked:* the scope claim rests on the **public data-types table**
+- the discovery document (revision **20261007**, read 2026-10-11) maps no data
+type to a scope itself; its `dataPoints.list` simply accepts every Health scope.
+If that table is ever wrong, the symptom is HTTP 403 on the heart list call (not
+counted as a sign-in failure) and the answer is the Owner's, because it would be
+a different consent.
+
+### The knobs (`stack/.env`)
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HEART_ENABLED` | `0` | Only a literal `1` or `true` turns it on. Off = nothing fetched, nothing posted, the state file untouched. It acts only while `WEIGHT_ENABLED=true` (same identity, destination and token). |
+| `HEART_MIN_BPM` | `40` | The bottom of the bar. |
+| `HEART_MAX_BPM` | `100` | The top of the bar. |
+| `HEART_TARGET_BPM` | `60` | The standing line. At or below it is flat green; above it climbs to red. |
+
+Each must be a plain whole number from 1 to 300 (the API's own heart-rate range)
+with `MIN < MAX` and `MIN <= TARGET <= MAX`. A bad value is **refused** with the
+knob named (`heart: REFUSED`), the heart gauge is skipped, **the weight gauge
+runs normally**, and the unit exits non-zero so it is not silent. It also needs
+`TIMEZONE` in the same `.env` (see below); `--check` validates both.
+
+**Exit status.** With `HEART_ENABLED=1`, any heart failure - a refused knob or
+zone, a network error, a sign-in failure, a failed post - makes the unit exit
+**1**, exactly as a weight failure does, so `systemctl` shows it failed. *No data
+from Google is not a failure* and exits 0. Weight's own result is never changed
+by it, but the unit's single exit code is the OR of both halves.
+
+### Choices worth knowing
+
+* **`observed_at` is the data point's own day, never the fetch time.** A daily
+  point carries only a civil `date` (no instant, no offset), so the stamp is that
+  date at a fixed **12:00 local** in the hub's `TIMEZONE` (the example above is
+  noon CDT) - a pure function of the date, so a later correction of the same day
+  never moves it. Noon, not a UTC hour, because NagLight's tracking day starts at
+  02:00 *local*: a 06:00 UTC stamp is 01:00 CDT or 00:00 CST, the previous
+  tracking day, and filed every reading under the wrong day. Noon is inside the
+  right day in CDT, CST and on both DST-change dates, and stays fresh for 36 h
+  (to 00:00 two days on). **`TIMEZONE` must be set to a zone this box knows**
+  (Python 3.9+ `zoneinfo`, as the sleep feeder reads it); if it is unset or
+  unknown the heart gauge is **refused** - `heart: REFUSED - TIMEZONE ...`,
+  nothing posted, weight unaffected - and a guessed UTC is never used. A day
+  stamped ahead of the clock (not yet noon here) is *held back*, not failed, and
+  the previous day carries the gauge; it is never clamped to the fetch time. A
+  date more than 48 h ahead is corruption and fails.
+* **Out of range is refused, never clamped.** A resting rate outside 25-200 bpm
+  is a units error or corruption; it fails like any bad reading (the last good
+  day stays, or the gauge goes unavailable) and the journal names the band and
+  **never the value**. A plausible rate outside the *bar* (an athlete at 38, a
+  fever at 104) is posted as measured: NagLight does not require `value` inside
+  `min..max`, the bar pins to its end, and clamping would print a number nobody
+  measured.
+* **Malformed values are refused.** `beatsPerMinute` must be the plain decimal
+  string; a bare number, a float, whitespace or a sign is a shape nobody has seen
+  and is refused, as `heightMillimeters` is.
+* **Two disagreeing points for the newest day are refused.** `dataPoints.list`
+  "might contain overlapping" data from several sources. A household with two
+  writers could hit this: it shows a dash with a journal line, not a guess. The
+  remedy (`dataPoints:reconcile`, or a `dataSourceFamily`) is unexercised, so it
+  is not used blind.
+* **No `filter`, no `pageSize`.** The plain call is the request shape the weight
+  route was observed to answer; the cost is a longer response (up to 1440 days)
+  every 15 minutes. Add `daily_resting_heart_rate.date >= "YYYY-MM-DD"` once a
+  real call has proved it.
+
+### One token, two gauges - how a dead login is counted
+
+Weight and heart share the one refresh token but **each makes its own refresh and
+keeps its own count** in the state file's `auth-failed-cycles` dict
+(`google-health` for weight, `google-health:heart` for heart). The same dead
+token therefore greys **both** on the **same second cycle**, which is right: it
+is one credential. A *shared* counter would be bumped twice per cycle and confirm
+a dead login after one, defeating the two-cycle rule, so they are not shared. The
+other rules are weight's (any non-sign-in outcome resets; the confirming cycle
+clears the stored reading so the grey sticks). **No data is not a failure and
+resets the count.** The heart gauge is greyed by a dead login exactly as the
+weight bar is; the weight-waist limit above does not apply to it.
+
+### Isolation from weight
+
+`run_heart_cycle` is its own cycle, run after the weight cycle on every path
+(including a refused one: a missing weight goal does not stop it). It never reads
+the goal, never posts the weight gauge or the check-off, and touches only the
+`heart` reading and its own count in the state file. `run_cycle` is unchanged.
+Neither half can change the other's posted body or state; the tests assert it in
+both directions.
+
+### Not proven
+
+**No resting-heart-rate body has ever been captured.** The parser is written from
+the discovery document alone (revision 20261007) - the opposite of the weight and
+height parsers, which were written against real bodies. It has **not been
+observed** against Google, and neither has the stamp rule, the dual-source case
+or the unfiltered call. The first real body must be compared with it.
+
+### Operator path
+
+1. Leave `HEART_ENABLED=0` today; nothing changes.
+2. When a Fitbit-family device is syncing to Google Health, confirm the token is
+   alive (`journalctl -u homehub-weight`; if it says `invalid_grant`, run
+   `weight_oauth.py mint --force`).
+3. Capture ONE real body and compare it with the parser, exactly as Step 4
+   above does for weight, with the data type swapped:
+   `sudo /usr/bin/python3 /opt/homehub/stack/weight/weight_oauth.py capture
+   --data-type heart --out /home/hub/heart-datapoints.json` (the file is
+   created new; it prints a status line, a byte count and a hash, never the
+   body). On the empty-account case it is HTTP 200 and a few bytes.
+4. Set `HEART_ENABLED=1` (and the three knobs if the defaults are wrong) in
+   `/opt/homehub/stack/.env`, then `sudo systemctl start homehub-weight` and read
+   `journalctl -u homehub-weight`: `heart: heart live posted` means it works;
+   `UNAVAILABLE` with no failure line means Google still has no data.
+5. The panel half (an empty Heart slot and glyph) is a separate item and waits
+   for the Owner's layout decision.
+
+---
+
 ## Files
 
 | File | What it is |
 |---|---|
 | `weight_feeder.py` | the feeder: pure core above the SHELL banner, thin I/O below |
-| `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk; `--data-type height` for NI_A2). No parser, and no writing door the feeder shares |
+| `weight_oauth.py` | the two Owner-run tools: `mint` (browser consent -> refresh token) and `capture` (ONE dataPoints.list call -> a body on disk; `--data-type height` for NI_A2, `--data-type heart` for H1). No parser, and no writing door the feeder shares |
 | `homehub-weight.service` | oneshot unit, hardened, `ProtectHome=read-only` |
 | `homehub-weight.timer` | 15 min, justified against the `static` horizon |
 | `setup-weight.sh` | idempotent install; resolves the ONE category file by frontmatter and generates the drop-in; refuses rather than guessing |

@@ -116,7 +116,7 @@ TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 # from the feeder rather than restated, so the capture cannot drift from the
 # constants the feeder's tests pin.
 LIST_URL = weight_feeder.GOOGLE_HEALTH_LIST_URL
-# THE ROUTES `capture` MAY BE POINTED AT, AS AN ALLOW-LIST OF TWO RATHER THAN A
+# THE ROUTES `capture` MAY BE POINTED AT, AS AN ALLOW-LIST OF THREE RATHER THAN A
 # URL ARGUMENT. `--data-type height` exists because NI_A2's height parser was
 # written against the discovery document rather than against a body anybody has
 # seen, and this repo's standard is that a parser is settled by ONE real call.
@@ -129,6 +129,10 @@ LIST_URL = weight_feeder.GOOGLE_HEALTH_LIST_URL
 LIST_URLS = {
     "weight": weight_feeder.GOOGLE_HEALTH_LIST_URL,
     "height": weight_feeder.GOOGLE_HEALTH_HEIGHT_LIST_URL,
+    # H1: daily resting heart rate. Its parser is written against the discovery
+    # document alone; `capture --data-type heart` is how the first real body is
+    # looked at once a Fitbit-family device writes to Google Health.
+    "heart": weight_feeder.GOOGLE_HEALTH_HEART_LIST_URL,
 }
 SCOPE = weight_feeder.GOOGLE_HEALTH_SCOPE
 
@@ -1179,7 +1183,9 @@ def build_parser():
         "--data-type", choices=sorted(LIST_URLS), default="weight",
         help="which Google Health data type to capture ONE body of. `height` "
              "is for NI_A2: the height parser was written against the "
-             "discovery document, and this settles it against a real body.")
+             "discovery document, and this settles it against a real body. "
+             "`heart` is for H1: the daily resting heart rate parser has never "
+             "seen a real body.")
     capturer.add_argument("--out", required=True,
                           help="where to save the raw body; must not exist")
     capturer.add_argument("--page-size", type=int, default=None,

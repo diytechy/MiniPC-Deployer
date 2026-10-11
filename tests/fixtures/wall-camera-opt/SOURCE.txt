@@ -1,0 +1,16 @@
+Fixture for tests/test_wall_capability_contract.py (LLR-1069..1072).
+
+Taken READ-ONLY from OfficeWallNaglight branch CameraOpt, commit
+de85047632c03167b549ab16f931c258637948c4 (2026-10-11):
+
+  capabilities.json  git show CameraOpt:capabilities.json, byte for byte
+  site-files.txt     every regular file of the site payload that
+                     tools/build-artifact.mjs stages from SITE_SOURCES
+                     (index.html css js vendor config.example.json
+                     capabilities.json) plus the VERSION and build-info.json
+                     stamps it writes; 74 lines, sorted.
+
+This is the OTHER side of the contract: it is the panel's own statement of
+what it ships, so the test that feeds it to scripts/assert_wall_capabilities.py
+can fail. Re-baseline it only when the panel line moves on and you want the
+suite to track the new head; a panel change does NOT require touching it.

@@ -138,16 +138,22 @@ def test_each_payload_rejects_missing_manifest_or_required_implementation(tmp_pa
 
 
 @pytest.mark.parametrize(
-    "malformed",
+    ("malformed", "message"),
     [
-        {"schemaVersion": 1, "capabilities": contract.REQUIRED},
-        {"schemaVersion": 2, "capabilities": {"local-visualizer-v1": []}},
-        {"schemaVersion": 2, "capabilities": {**contract.REQUIRED, "unexpected": {"app": [], "site": [], "gateway": []}}},
+        ({"schemaVersion": 1, "capabilities": contract.REQUIRED}, "declaration mismatch"),
+        ({"schemaVersion": 2, "capabilities": {"local-visualizer-v1": []}}, "malformed payload declaration"),
+        # An unknown capability is no longer a mismatch (the manifest may grow
+        # past the floor - tests/test_wall_capability_contract.py), but a
+        # malformed one still is.
+        ({"schemaVersion": 2, "capabilities": {**contract.REQUIRED, "unexpected": {"app": []}}}, "malformed payload declaration"),
     ],
 )
-def test_each_payload_rejects_malformed_or_mismatched_declaration(tmp_path, malformed):
-    with pytest.raises(ValueError, match="declaration mismatch"):
+def test_each_payload_rejects_malformed_or_mismatched_declaration(tmp_path, malformed, message):
+    with pytest.raises(ValueError, match=message):
         contract.inspect(artifact(tmp_path, "site", manifest=malformed), "site")
+
+
+def test_a_floor_capability_that_loses_a_file_is_a_declaration_mismatch(tmp_path):
     mismatch = {"schemaVersion": 2, "capabilities": dict(contract.REQUIRED)}
     mismatch["capabilities"]["local-visualizer-v1"] = dict(mismatch["capabilities"]["local-visualizer-v1"])
     mismatch["capabilities"]["local-visualizer-v1"]["site"] = ["js/views/visualizer.js"]

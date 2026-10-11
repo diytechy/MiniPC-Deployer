@@ -88,7 +88,11 @@ panel; that repo owns the app):
   {$AI_USAGE_FEED_URL}` with `kind:"gauge"` — six ids
   (`ai-usage-codex`, `ai-usage-claude-session`, `ai-usage-claude-weekly`,
   `ai-usage-claude-weekly-fable` (optional, posted once the vendor reports it),
-  `ai-usage-opencode-weekly`, `ai-usage-opencode-monthly`), each carrying
+  `ai-usage-opencode-weekly`, `ai-usage-opencode-monthly`) plus four more only
+  when the opt-in source is enabled (SR-067): `ai-usage-claude2-session`,
+  `ai-usage-claude2-weekly`, `ai-usage-claude2-weekly-fable` (optional, as
+  account 1's) and `ai-usage-gemini-daily` (kind `daily`; its label names the
+  model set it is the lowest remaining fraction of), each carrying
   `unit:"%"`, `min:0`, `max:100`, `target:0`, `direction:"down"` and a `window`.
   `value` is percent remaining (100 minus the consumed percent), so the pace line
   falls from a full bar to zero at the reset.
@@ -101,11 +105,14 @@ panel; that repo owns the app):
   `window` is. **`observed_at` is when the value was TRUE**, which is how
   "unavailable" is said without inventing a number: a source that fails reposts
   its last real reading at its *original* stamp and goes stale on NagLight's
-  horizon, and one that has never succeeded posts a gauge with no `observed_at`
-  at all, stale on arrival. The timer runs every 10 minutes because four of the
-  six gauges are `weekly`, whose horizon is 24 h. **Not provided:** a Gemini
-  gauge (deferred as E11) and OpenCode's `rolling` bucket, which publishes no
-  window length — a window this repo would have had to invent. Details in
+  horizon — except a source whose login is confirmed dead over two consecutive
+  cycles (SR-068), which posts the stale-on-arrival body for every one of its ids
+  and keeps doing so — and one that has never succeeded posts a gauge with no `observed_at`
+  at all, stale on arrival. The timer runs every 10 minutes because most of the
+  gauges are `weekly`, whose horizon is 24 h. **Not provided:** OpenCode's
+  `rolling` bucket, which publishes no window length — a window this repo would
+  have had to invent. **Not proven:** the Gemini response shapes against a live
+  call (the parser is written from the CLI's source). Details in
   `stack/ai-usage/README.md`.
 
 **This repo → NagLight tracker** (`Consumes` — the check-feed producers that

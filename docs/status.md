@@ -124,6 +124,11 @@ OfficeWallNaglight's ring gauge rail (its WSN-076) bundles xAI's
 `vendor/brand/Grok_Logomark_Light.svg` and declares it under
 `progress-gauges-v1`, so `scripts/assert_wall_capabilities.py` now declares it
 in that capability (app and site) and admits it to the public-site inventory.
+**RESOLVED 2026-10-11 by `94f5a12`** (merged as `0997367`; Sonnet medium review:
+APPROVE). The contract now treats the panel's own manifest as authoritative
+above a floor of 22 CameraOpt capabilities, and keeps the public-site inventory
+exact. Not proven: the vmtest image path, which needs the lab. The finding as
+written on 2026-10-09:
 **FINDING, pre-existing and NOT fixed here:** this contract was already out of
 step with OfficeWallNaglight `CameraOpt` before this change — seven
 capabilities absent (`audio-switch-v1`, `bus-pcm-bridge-v1`,

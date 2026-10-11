@@ -1,0 +1,77 @@
+[Unit]
+# The hub's sleep feeder (SR-070..SR-072; plan 4.3). A plain service, no
+# container - the same reasoning A40 applied to the AI CLI service and B11 to
+# the weight feeder. It signs in to ResMed's myAir cloud and posts ONE gauge
+# (the CPAP's own sleep score) to NagLight.
+#
+# ONESHOT, DRIVEN BY A TIMER. There is nothing to keep alive between reads, and
+# a long-lived process holding a health-data session open is a bigger surface
+# than a process that exists for a few seconds every half hour. myAir gives no
+# refresh token, so every run signs in from scratch and holds nothing afterwards.
+Description=HomeHub sleep feeder (SR-070, posts the sleep gauge to NagLight)
+Documentation=file:///opt/homehub/stack/sleep/README.md
+# time-sync.target: night keys, the 12:00 stamp and the 14:00 rule are LOCAL dates read
+# off the host clock, so the first run after a boot waits for it to be set.
+After=network-online.target time-sync.target homehub-firstboot.service
+Wants=network-online.target time-sync.target
+ConditionPathExists=/opt/homehub/stack/.env
+
+[Service]
+Type=oneshot
+
+# A DEDICATED UNPRIVILEGED ACCOUNT, and never `hub` (which carries (ALL)
+# NOPASSWD: ALL) and never root. setup-sleep.sh writes User=/Group= into a
+# drop-in from SLEEP_USER_ACCOUNT so the account certified is the account that
+# runs. The account has NO home: it holds no credential file, because the myAir
+# password arrives through EnvironmentFile= and the tokens live in memory for
+# one cycle.
+User=homehub-sleep
+Group=homehub-sleep
+NoNewPrivileges=yes
+
+# NOTHING IS READABLE OR WRITABLE EXCEPT THE ONE STATE DIRECTORY. The state file
+# holds the nightly score (a health value), so the directory is mode 0700 and the
+# file 0600 (open_no_follow creates it 0600). `open_for_write` refuses any path
+# but the state file; this is the second, independent line.
+ProtectHome=yes
+StateDirectory=homehub-sleep
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/homehub-sleep
+WorkingDirectory=/var/lib/homehub-sleep
+
+# The identity, the loopback tracker port, the tracker token, the TIMEZONE the
+# night keys are read in, and the myAir sign-in (MYAIR_EMAIL from the identity
+# table, MYAIR_PASSWORD from the secret store). The materialiser DOUBLES every
+# `$` in a value and systemd does not undo it; the feeder collapses `$$` itself.
+EnvironmentFile=/opt/homehub/stack/.env
+# --check re-runs the identity, destination, zone and sign-in-configured
+# refusals as their own process, under this unit's User=, so a box configured to
+# guess an identity, post off-box or sign in with nothing fails BEFORE the run.
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/sleep/sleep_feeder.py --check
+ExecStart=/usr/bin/python3 /opt/homehub/stack/sleep/sleep_feeder.py
+
+# Five HTTPS calls and the post at SLEEP_TIMEOUT_SECONDS (30) each is the worst case. A wedged
+# source must become an "unavailable" gauge rather than a stuck unit.
+TimeoutStartSec=240
+
+ProtectSystem=strict
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# NO Restart=. A failed cycle must NOT be retried into a hot loop against a
+# health vendor's sign-in (a rejected password counts toward a lockout); the
+# timer brings the next one round soon enough.
+
+[Install]
+WantedBy=multi-user.target

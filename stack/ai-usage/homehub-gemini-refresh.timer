@@ -1,0 +1,23 @@
+[Unit]
+Description=Refresh the Gemini CLI token before it expires (SR-021)
+Documentation=file:///opt/homehub/stack/ai-usage/README.md
+
+[Timer]
+# THIRTY MINUTES, AGAINST AN HOUR-LONG TOKEN: one whole missed run of margin,
+# the same rule homehub-claude-refresh's four hours keeps against an eight-hour
+# token. tests/test_ai_usage_feeder.py reads this line and fails if the interval
+# is ever loosened past half of GEMINI_ACCESS_TOKEN_LIFE_SECONDS.
+#
+# The feeder (every ten minutes) refuses an expired token and says so, and the
+# gauge goes grey after two such cycles -- so the margin here is what stands
+# between a healthy login and a grey ring, not a nicety.
+OnBootSec=2min
+OnUnitActiveSec=30min
+# Persistent, like the Claude refresher and unlike the feeder: a missed feeder
+# run is one stale reading, a missed refresh is a grey ring until the next one.
+Persistent=true
+RandomizedDelaySec=120
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

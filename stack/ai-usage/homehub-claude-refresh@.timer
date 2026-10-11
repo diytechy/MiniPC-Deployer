@@ -1,8 +1,12 @@
 [Unit]
-Description=Refresh the Claude Code credential before it expires (SR-021)
+Description=Refresh the Claude Code credential before it expires, account %i (SR-021)
 Documentation=file:///opt/homehub/stack/ai-usage/README.md
 
 [Timer]
+# A timer template starts the service instance of the SAME name, so
+# homehub-claude-refresh@claude2.timer runs homehub-claude-refresh@claude2.service
+# and no `Unit=` line is needed.
+#
 # FOUR HOURS, AGAINST AN EIGHT-HOUR TOKEN. The access token's life is 8 h
 # (`expiresAt`, measured 2026-09-12 and again after a real refresh: 8.00 h
 # exactly), so every renewal has to land inside that window or the gauges go

@@ -61,6 +61,8 @@ vendor/brand/Grok_Logomark_Light.svg
 vendor/brand/OAI_OpenAI-Blossom_White.svg
 vendor/brand/PROVENANCE.md
 vendor/brand/claude-favicon.svg
+vendor/brand/freellmapi-favicon.svg
+vendor/brand/gemini-sparkle.svg
 vendor/brand/opencode-favicon.svg
 vendor/icons/cash.svg
 vendor/icons/clock.svg

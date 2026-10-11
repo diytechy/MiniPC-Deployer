@@ -1544,6 +1544,46 @@ def test_a_non_200_from_the_list_call_never_logs_the_remotes_body(tmp_path):
     assert "body is not logged" in message
 
 
+def test_the_token_refresh_logs_only_the_allow_listed_error_word_never_the_body(
+        tmp_path):
+    """THE NARROW AMENDMENT of the rule above (plan 3.6 G2, LLR-1064).
+
+    The token refresh is the one place a word of the remote's body may reach a
+    message, and only a word that EQUALS an allow-list entry, as our own
+    constant. A 400 `invalid_grant` whose other members quote a header, and a
+    400 whose `error` is something the allow-list does not name, must both leave
+    ERROR_BODY_SENTINEL out of the message. The fuller matrix is in
+    tests/test_weight_auth_expiry.py."""
+    def refuse(error_member):
+        def respond(handler):
+            if handler.path.startswith("/token"):
+                raw = json.dumps({
+                    "error": error_member,
+                    "error_description": "Authorization: Bearer "
+                                         + ERROR_BODY_SENTINEL}).encode()
+                handler.send_response(400)
+                handler.send_header("Content-Length", str(len(raw)))
+                handler.end_headers()
+                handler.wfile.write(raw)
+                return
+            _json_200(handler, CAPTURED_SHAPE)
+        return respond
+
+    for member, expect_auth in (("invalid_grant", True),
+                                (ERROR_BODY_SENTINEL, False)):
+        with loopback_server(refuse(member)) as (base, _s):
+            with pytest.raises(feeder.SourceFailure) as err:
+                feeder.read_google_health(google_env(tmp_path),
+                                          list_url=base + "/points",
+                                          token_endpoint=base + "/token")
+        message = str(err.value)
+        assert ERROR_BODY_SENTINEL not in message
+        assert "Authorization" not in message and "Bearer" not in message
+        assert isinstance(err.value, feeder.AuthFailure) is expect_auth
+        if expect_auth:
+            assert "invalid_grant" in message
+
+
 def test_the_vendor_read_refuses_by_name_when_there_is_no_token(tmp_path):
     """Each missing piece has a DIFFERENT errand, so each gets its own sentence.
 

@@ -131,6 +131,7 @@ class Harness(object):
             "STATE_DIRECTORY": str(state_dir),
         }
         self.posts = []
+        self.calls = 0
 
     def poster(self, body, url, env, timeout):
         self.posts.append(body)
@@ -140,18 +141,26 @@ class Harness(object):
         self.posts.append(body)
         return False, "HTTP 500 (body not logged)"
 
-    def cycle(self, now, records=None, error=None, poster=None):
-        """Run one cycle. `records` is [(startDate, sleepScore)], `error` an exception."""
+    def cycle(self, now, records=None, error=None, poster=None, gated=False, clock=None,
+              retry_now=False):
+        """Run one cycle. `records` is [(startDate, sleepScore)], `error` an exception.
+
+        By default the fetch windows are IGNORED (`force_fetch`), so the data-contract
+        tests can run a cycle at any hour; `gated=True` runs the real schedule and
+        back-off. `self.calls` counts how many times myAir was actually asked.
+        `clock` is the injected "time after the fetch" (default: `now`).
+        """
         f = self.f
 
         def reader(env, now_, tz_):
+            self.calls += 1
             if error is not None:
                 raise error
             return [f.Record(f.parse_night_date(start), score) for start, score in records], 0
 
-        result = f.run_cycle(dict(self.env), now=now, tz=self.tz, reader=reader,
-                             poster=poster or self.poster)
-        return result
+        return f.run_cycle(dict(self.env), now=now, tz=self.tz, reader=reader,
+                           poster=poster or self.poster, clock=clock,
+                           force_fetch=not gated, retry_now=retry_now)
 
     def last(self):
         return self.posts[-1]

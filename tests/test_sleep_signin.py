@@ -411,7 +411,8 @@ def test_auth_auth_then_a_network_failure_stays_grey_and_a_success_recovers():
             h.cycle(after(step), error=h.f.SourceFailure("net"))
             assert "observed_at" not in h.last(), step
         assert h.state()["__auth_failed__"]["auth_failed"] is True
-        h.cycle(after(150), [("2026-10-11", 82)])            # the login works again
+        assert h.calls == 3                                  # the morning, then two refused sign-ins; the blips never reached myAir: back-off
+        h.cycle(after(400), [("2026-10-11", 82)])            # the back-off is over; the login works again
         assert h.last()["value"] == 82 and "observed_at" in h.last()
         assert "__auth_failed__" not in h.state()
         assert h.state()["__auth_failures__"] == {}

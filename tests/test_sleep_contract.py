@@ -334,7 +334,8 @@ def test_an_old_night_is_never_shown_as_last_night(tz, tmp_path):
 
 def test_before_the_grace_hour_only_the_previous_night_may_stand_in(tz, tmp_path):
     h = Harness(tmp_path, tz)
-    h.cycle(at(tz, 10, 12, 8, 0), [(PREV_START, 79)])                  # night key 2026-10-11
+    h.cycle(at(tz, 10, 11, 9, 0), [(PREV_START, 79)])                  # night key 2026-10-11, PUBLISHED
+    h.cycle(at(tz, 10, 12, 8, 0), [(PREV_START, 79)])
     assert h.last()["value"] == 79
     h2 = sub(tmp_path, "old", tz)
     h2.cycle(at(tz, 10, 12, 8, 0), [("2026-10-09", 79)])               # night key 2026-10-10
@@ -375,7 +376,8 @@ def test_state_file_is_private_and_holds_no_credential(tz, tmp_path):
                   reader=lambda e, n, t: ([h.f.Record(h.f.parse_night_date(TODAY_START), 82)], 0))
     text = h.state_path.read_text(encoding="utf-8")
     assert "SENTINEL" not in text and "Authorization" not in text
-    assert set(json.loads(text)) <= {"nights", "__auth_failures__", "__auth_failed__"}
+    assert set(json.loads(text)) <= {"nights", "published", "schedule", "__auth_failures__",
+                                     "__auth_failed__"}
     if os.name == "posix":
         assert (h.state_path.stat().st_mode & 0o777) == 0o600
     assert not Path(str(h.state_path) + ".tmp").exists()

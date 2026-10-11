@@ -112,11 +112,45 @@ MAX_BODY_BYTES = 4 * 1024 * 1024        # a month of nightly records is a few KB
 # "__auth_failed__": {...}}. Each part has its OWN validator in `load_state` -
 # never an exemption from validation - because this is a one-shot unit and
 # whatever the loader does not recognise is erased by the next `save_state`.
+#
+# "nights" holds what was FETCHED or staged (score + frozen stamp); "published"
+# holds the night keys the feeder actually POSTED as a score (first-publication
+# epoch). They are separate on purpose: "before 14:00 the previous night's score
+# stays" means a night that was really on the wall, not one that merely sits in
+# the cache after an outage (Sol #1). "schedule" remembers when myAir was last
+# asked, so a one-shot unit can keep to the fetch windows below.
 NIGHTS_KEY = "nights"
+PUBLISHED_KEY = "published"
+SCHEDULE_KEY = "schedule"
 AUTH_COUNTS_KEY = "__auth_failures__"
 AUTH_MARKER_KEY = "__auth_failed__"
 AUTH_CONFIRM_CYCLES = 2         # consecutive auth-failed cycles before the gauge greys.
 _AUTH_COUNT_CEILING = 100       # a stored count above this is corruption, not history.
+
+# ── When myAir is asked (the timer ticks every 30 min; the NETWORK does not) ──
+# Every tick posts from stored state. A sign-in is a full login to a health
+# vendor with no refresh token, so it happens only:
+#   * while the expected night is not yet stored, between 06:00 and 16:00 local,
+#     at most once per MISSING_RETRY_SECONDS;
+#   * once the night IS stored, for a correction re-fetch from 14:30 local and
+#     another from 20:00 local (each at most once per local day);
+#   * one more time, on the very next tick, after a FIRST authentication failure
+#     (so the two-cycle confirmation takes ~30 minutes, not hours);
+#   * after a CONFIRMED authentication failure, only once the back-off below has
+#     elapsed (a wrong password at 48 tries a day can lock the account, the app
+#     included) - or on `--retry-now`.
+# A normal day is therefore roughly 4-6 sign-ins, not 48.
+FETCH_OPEN_HOUR_LOCAL = 6
+FETCH_CLOSE_HOUR_LOCAL = 16
+MISSING_RETRY_SECONDS = 120 * 60
+# The timer is 30 min plus up to 120 s of RandomizedDelay: a spacing check that
+# demanded the full interval would round up to the next tick every time.
+SPACING_SLACK_SECONDS = 5 * 60
+CORRECTION_SLOTS = (("pm", 14, 30), ("eve", 20, 0))
+AUTH_BACKOFF_SECONDS = 6 * 3600
+AUTH_BACKOFF_LOCKED_SECONDS = 24 * 3600
+LOCKED_OUT = "LOCKED_OUT"
+_CODE_SHAPE = re.compile(r"^[A-Za-z_]{1,24}$")
 
 MFA_MESSAGE = ("myAir now asks for an emailed code - a person must sign in "
                "(see refresh-gauge-logins)")
@@ -374,14 +408,17 @@ def upsert_nights(nights, records, now, tz):
     return changed
 
 
-def decide_night(nights, now, tz):
+def decide_night(nights, published, now, tz):
     """Which stored night, if any, is the one to show. Returns a night key or None.
 
     THE UNAVAILABLE RULES (plan 4.4), in one place:
       * The EXPECTED night (today's local date) wins whenever it is there.
       * BEFORE 14:00 local, with no record for the expected night, the PREVIOUS
-        night's score stays and ages normally. Anything older than the previous
-        night is never shown.
+        night's score stays and ages normally - but only a night the feeder
+        actually PUBLISHED (`published`), not one that merely sits in the cache
+        because a fetch after an outage or a dead-login period returned it. A
+        never-published previous night is not "the score that stays": it was
+        never on the wall. Anything older than the previous night is never shown.
       * FROM 14:00 local, with no record for the expected night, the answer is
         None: UNAVAILABLE. This is also the rule "a newest record that is not
         for the expected night posts unavailable rather than a score" - an old
@@ -396,7 +433,7 @@ def decide_night(nights, now, tz):
         return today.isoformat()
     if not past_grace(now, tz):
         previous = (today - dt.timedelta(days=1)).isoformat()
-        if previous in nights:
+        if previous in nights and previous in published:
             return previous
     return None
 
@@ -486,20 +523,131 @@ def validate_auth_marker(entry, now):
     stamp = int(stamp)
     if stamp < EPOCH_FLOOR or stamp > int(now) + MAX_CLOCK_SKEW_SECONDS:
         return None
-    return {"auth_failed": True, "at": stamp}
+    marker = {"auth_failed": True, "at": stamp}
+    code = entry.get("code")
+    if isinstance(code, str) and _CODE_SHAPE.match(code):
+        marker["code"] = code            # an allow-listed status word; LOCKED_OUT lengthens the back-off
+    return marker
+
+
+def validate_published(entry, now):
+    """{night key: first-publication epoch}, dropping every entry not credible.
+    (`now` is accepted for symmetry with the other validators and unused: see below.)
+
+    Implements: SR-071, LLR-1083
+    """
+    out = {}
+    if not isinstance(entry, dict):
+        return out
+    for key, stamp in entry.items():
+        if parse_night_date(key) is None or isinstance(stamp, bool) \
+                or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+            continue
+        stamp = int(stamp)
+        # NO CEILING against `now`, deliberately: if the host clock has gone
+        # BACKWARDS, every honest publication stamp is "in the future", and
+        # dropping them here would erase the very evidence `clock_went_backwards`
+        # needs. Only a stamp from before the block existed is corruption.
+        if stamp >= EPOCH_FLOOR:
+            out[key] = stamp
+    return out
+
+
+def validate_schedule(entry, now):
+    """{"day", "attempt_at", "done"} or None. The memory of the fetch windows.
+
+    Implements: SR-072, LLR-1086
+    """
+    if not isinstance(entry, dict) or parse_night_date(entry.get("day")) is None:
+        return None
+    stamp = entry.get("attempt_at")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+        return None
+    stamp = int(stamp)
+    if not EPOCH_FLOOR <= stamp <= int(now) + MAX_CLOCK_SKEW_SECONDS:
+        return None
+    done = entry.get("done")
+    names = [name for name, _h, _m in CORRECTION_SLOTS]
+    if not isinstance(done, list) or any(d not in names for d in done):
+        return None
+    return {"day": entry["day"], "attempt_at": stamp, "done": sorted(set(done))}
 
 
 def empty_state():
-    return {NIGHTS_KEY: {}, AUTH_COUNTS_KEY: {}, AUTH_MARKER_KEY: None}
+    return {NIGHTS_KEY: {}, PUBLISHED_KEY: {}, SCHEDULE_KEY: None,
+            AUTH_COUNTS_KEY: {}, AUTH_MARKER_KEY: None}
 
 
-def prune_nights(nights, now, tz):
-    """Drop nights older than KEEP_NIGHTS_BACK_DAYS. Nothing older can be shown."""
+def prune_nights(state, now, tz):
+    """Drop nights and publications older than KEEP_NIGHTS_BACK_DAYS. Nothing older can be shown."""
     oldest = expected_night(now, tz) - dt.timedelta(days=KEEP_NIGHTS_BACK_DAYS)
-    for key in list(nights):
-        day = parse_night_date(key)
-        if day is None or day < oldest:
-            del nights[key]
+    for part in (NIGHTS_KEY, PUBLISHED_KEY):
+        for key in list(state[part]):
+            day = parse_night_date(key)
+            if day is None or day < oldest:
+                del state[part][key]
+
+
+def clock_went_backwards(state, now, tz):
+    """True when the local date is EARLIER than the newest night already published.
+
+    A night key is a local date and a published one cannot be in the future, so
+    this only happens if the host clock has gone backwards (a bad RTC, an NTP
+    step). Selecting or publishing then could stamp a "first publication" in the
+    past or show the wrong night, so the cycle does neither (Sol #4). The feeder
+    and NagLight share one host clock; skew BETWEEN clocks is out of scope.
+
+    Implements: SR-071, LLR-1084
+    """
+    newest = max((parse_night_date(key) for key in state[PUBLISHED_KEY]), default=None)
+    return newest is not None and expected_night(now, tz) < newest
+
+
+def backoff_seconds(marker):
+    """How long a confirmed authentication failure keeps the feeder off Okta.
+
+    6 h, or 24 h when the failing authn status was LOCKED_OUT. Hammering a wrong
+    or expired password at every tick (48 a day) is what locks a real account,
+    app included.
+
+    Implements: SR-072, LLR-1090
+    """
+    return AUTH_BACKOFF_LOCKED_SECONDS if marker.get("code") == LOCKED_OUT else AUTH_BACKOFF_SECONDS
+
+
+def fetch_due(state, now, tz):
+    """Decide whether this tick may call myAir. Returns (due, why, slots_to_mark).
+
+    PURE: reads the state and the clock, touches nothing. See the block comment
+    above FETCH_OPEN_HOUR_LOCAL for the schedule; the order below is its priority.
+    `why` is a status word for the journal.
+
+    Implements: SR-072, LLR-1086, LLR-1090
+    """
+    marker = state[AUTH_MARKER_KEY]
+    if marker is not None:
+        # CONFIRMED dead login: nothing else matters until the back-off is over.
+        if now >= marker["at"] + backoff_seconds(marker):
+            return True, "back-off elapsed", []
+        return False, "back-off in force after a confirmed sign-in failure", []
+    if state[AUTH_COUNTS_KEY].get(SOURCE, 0) >= 1:
+        return True, "confirming a sign-in failure", []
+    local = local_now(now, tz)
+    expected = local.date()
+    schedule = state[SCHEDULE_KEY]
+    today = schedule if schedule is not None and schedule["day"] == expected.isoformat() else None
+    if expected.isoformat() not in state[NIGHTS_KEY]:
+        if not FETCH_OPEN_HOUR_LOCAL <= local.hour < FETCH_CLOSE_HOUR_LOCAL:
+            return False, "outside the 06:00-16:00 window", []
+        if today is not None and now - today["attempt_at"] < MISSING_RETRY_SECONDS - SPACING_SLACK_SECONDS:
+            return False, "asked recently", []
+        return True, "expected night not stored yet", []
+    done = set(today["done"]) if today is not None else set()
+    slots = [name for name, hour, minute in CORRECTION_SLOTS
+             if (local.hour, local.minute) >= (hour, minute) and name not in done]
+    if slots:
+        return True, "correction re-fetch", slots
+    return False, "expected night stored, no correction due", []
 
 
 # ── Configuration (pure: reads the env dict it is given) ────────────────────
@@ -769,8 +917,9 @@ def open_no_follow(path):
 def load_state(state_path, now, tz):
     """The state file, each part VALIDATED. A missing or unreadable file is empty.
 
-    Three parts, each by its own validator (never an exemption): the nights, the
-    consecutive-auth-failure counter, and the sticky auth marker. Whatever the
+    Five parts, each by its own validator (never an exemption): the nights, the
+    published night keys, the fetch schedule, the consecutive-auth-failure
+    counter, and the sticky auth marker. Whatever the
     loader does not vouch for is dropped here - and the next `save_state` would
     erase it - which is why each recognised part needs a validator at all.
 
@@ -790,6 +939,8 @@ def load_state(state_path, now, tz):
             checked = validate_night_entry(key, entry, now, tz)
             if checked is not None:
                 state[NIGHTS_KEY][key] = checked
+    state[PUBLISHED_KEY] = validate_published(data.get(PUBLISHED_KEY), now)
+    state[SCHEDULE_KEY] = validate_schedule(data.get(SCHEDULE_KEY), now)
     state[AUTH_COUNTS_KEY] = validate_auth_counts(data.get(AUTH_COUNTS_KEY))
     state[AUTH_MARKER_KEY] = validate_auth_marker(data.get(AUTH_MARKER_KEY), now)
     return state
@@ -806,7 +957,10 @@ def save_state(state, state_path, state_root):
     Implements: SR-070, LLR-1085
     """
     tmp = state_path + ".tmp"
-    out = {NIGHTS_KEY: state[NIGHTS_KEY], AUTH_COUNTS_KEY: state[AUTH_COUNTS_KEY]}
+    out = {NIGHTS_KEY: state[NIGHTS_KEY], PUBLISHED_KEY: state[PUBLISHED_KEY],
+           AUTH_COUNTS_KEY: state[AUTH_COUNTS_KEY]}
+    if state[SCHEDULE_KEY] is not None:
+        out[SCHEDULE_KEY] = state[SCHEDULE_KEY]
     if state[AUTH_MARKER_KEY] is not None:
         out[AUTH_MARKER_KEY] = state[AUTH_MARKER_KEY]
     with open_for_write(tmp, state_path, state_root) as handle:
@@ -1236,32 +1390,51 @@ def read_myair(env, now, tz, endpoints=NA_ENDPOINTS):
 
 # ── The cycle ───────────────────────────────────────────────────────────────
 
-def run_cycle(env, now=None, tz=None, reader=None, poster=None):
-    """One feeder cycle: read, fold into the nights, decide, post one gauge.
+def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
+              force_fetch=False, retry_now=False):
+    """One feeder cycle: maybe read, fold into the nights, decide, post one gauge.
 
     Contract:
       Inputs:  env: the process environment (plus `_identity`, `_feed_url`);
                `reader(env, now, tz)` and `poster(body, url, env, timeout)` are
-               injectable so the tests can exercise every failure class.
+               injectable so the tests can exercise every failure class;
+               `clock()` returns the current epoch seconds and is read AGAIN
+               after the fetch (default: `time.time`, or the injected `now`);
+               `force_fetch` ignores the fetch windows (never the back-off);
+               `retry_now` clears a confirmed sign-in failure first and then
+               forces a fetch (the operator re-signed; see README).
       Outputs: (posted, notes, failures):
-                 posted   - [(night_key_or_None, ok)], always exactly one entry;
+                 posted   - [(night_key_or_None, ok)]: exactly one entry, or none
+                            when the clock went backwards and nothing was posted;
                  notes    - status lines for stdout (sources, night key, "published
                             night <key>"): NEVER a score or any health value;
                  failures - lines for stderr; non-empty makes the unit exit 1.
 
     THE ORDER IS THE CONTRACT:
-      1. read myAir (a failure is a source failure, not a dead cycle);
-      2. count authentication failures in the state file (one-shot unit, so the
-         state file is the only memory) and set / clear the sticky marker;
-      3. on a SUCCESSFUL read only, fold the records into the stored nights;
-      4. decide which stored night, if any, is shown (`decide_night`), or none
+      0. refuse to do anything if the local date is earlier than the newest
+         published night (the clock went backwards);
+      1. decide whether myAir may be asked THIS tick (`fetch_due`): the timer
+         ticks every 30 min, the network does not;
+      2. read myAir if so (a failure is a source failure, not a dead cycle);
+      3. RE-READ THE CLOCK. A cycle that began at 13:59 and finished at 14:01
+         applies the 14:00 rule at 14:01, and a stamp is never older than the
+         moment it was decided;
+      4. count authentication failures in the state file and set / refresh /
+         clear the sticky marker - only if myAir was actually asked (a skipped
+         tick is not an outcome and resets nothing);
+      5. on a SUCCESSFUL read only, fold the records into the stored nights;
+      6. decide which stored night, if any, is shown (`decide_night`), or none
          while the login is confirmed dead;
-      5. post exactly one gauge, then save the state EVEN IF THE POST FAILED so
-         the frozen `observed_at` is never lost.
+      7. post exactly one gauge; if it carried a score and was accepted, record
+         the night as PUBLISHED; save the state EVEN IF THE POST FAILED so the
+         frozen `observed_at` is never lost.
 
-    Implements: SR-070, SR-071, SR-072, LLR-1076, LLR-1082, LLR-1089, LLR-1090
+    Implements: SR-070, SR-071, SR-072, LLR-1076, LLR-1082, LLR-1083, LLR-1084,
+                LLR-1086, LLR-1089, LLR-1090
     """
-    now = int(now if now is not None else time.time())
+    if clock is None:
+        clock = time.time if now is None else (lambda: now)
+    start = int(now if now is not None else clock())
     tz = tz or env["_tz"]
     reader = reader or read_myair
     state_path = resolve_state_path(env)
@@ -1269,45 +1442,76 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None):
     feed_url = env["_feed_url"]
     notes, failures = [], []
 
-    state = load_state(state_path, now, tz)
+    state = load_state(state_path, start, tz)
+    backwards = ("the clock appears to have gone backwards (the local date is earlier than "
+                 "the newest published night) - nothing selected, nothing posted")
+    if clock_went_backwards(state, start, tz):
+        return [], notes, [backwards]
+
+    if retry_now and state[AUTH_MARKER_KEY] is not None:
+        notes.append("retry-now: the confirmed sign-in failure marker was cleared")
+    if retry_now:
+        state[AUTH_MARKER_KEY] = None
+        state[AUTH_COUNTS_KEY] = {}
+    due, why, slots = (True, "forced", []) if (force_fetch or retry_now) and \
+        state[AUTH_MARKER_KEY] is None else fetch_due(state, start, tz)
+    if not due:
+        notes.append("not asked: %s" % why)
+
+    records, auth_error, unreadable = None, None, 0
+    if due:
+        schedule = state[SCHEDULE_KEY]
+        day = expected_night(start, tz).isoformat()
+        done = set(schedule["done"]) if schedule is not None and schedule["day"] == day else set()
+        state[SCHEDULE_KEY] = {"day": day, "attempt_at": start, "done": sorted(done | set(slots))}
+        try:
+            records, unreadable = reader(env, start, tz)
+        except MfaRequired as exc:
+            auth_error = exc
+            failures.append("%s: %s" % (SOURCE, MFA_MESSAGE))
+        except AuthFailure as exc:
+            auth_error = exc
+            failures.append("%s: %s" % (SOURCE, exc))
+        except SourceFailure as exc:
+            failures.append("%s: %s" % (SOURCE, exc))
+        except Exception as exc:                     # a reader bug is a source failure
+            failures.append("%s: unexpected %s" % (SOURCE, type(exc).__name__))
+
+    # ── The clock, read AGAIN: everything from here on uses the fresh time ───
+    now = int(clock())
+    if clock_went_backwards(state, now, tz):
+        return [], notes, failures + [backwards]
     expected = expected_night(now, tz).isoformat()
 
-    records, auth_error = None, None
-    try:
-        records, unreadable = reader(env, now, tz)
-    except MfaRequired as exc:
-        auth_error = exc
-        failures.append("%s: %s" % (SOURCE, MFA_MESSAGE))
-    except AuthFailure as exc:
-        auth_error = exc
-        failures.append("%s: %s" % (SOURCE, exc))
-    except SourceFailure as exc:
-        failures.append("%s: %s" % (SOURCE, exc))
-    except Exception as exc:                     # a reader bug is a source failure
-        failures.append("%s: unexpected %s" % (SOURCE, type(exc).__name__))
-
-    # ── Authentication bookkeeping (plan 3.6 G2) ─────────────────────────────
-    previous = state[AUTH_COUNTS_KEY].get(SOURCE, 0)
-    if auth_error is not None:
-        count = min(previous + 1, AUTH_CONFIRM_CYCLES)
-        state[AUTH_COUNTS_KEY] = {SOURCE: count}
-        if count >= AUTH_CONFIRM_CYCLES:
-            if state[AUTH_MARKER_KEY] is None:
-                state[AUTH_MARKER_KEY] = {"auth_failed": True, "at": now}
-            failures.append("%s: authentication failure %d of %d - CONFIRMED, the gauge is "
-                            "posted unavailable until a sign-in succeeds"
-                            % (SOURCE, count, AUTH_CONFIRM_CYCLES))
+    # ── Authentication bookkeeping (plan 3.6 G2), only if myAir was asked ────
+    if due:
+        previous = state[AUTH_COUNTS_KEY].get(SOURCE, 0)
+        if auth_error is not None:
+            count = min(previous + 1, AUTH_CONFIRM_CYCLES)
+            state[AUTH_COUNTS_KEY] = {SOURCE: count}
+            if count >= AUTH_CONFIRM_CYCLES or state[AUTH_MARKER_KEY] is not None:
+                # Created on confirmation, REFRESHED by every later refused
+                # attempt: the back-off runs from the last refusal, not the first.
+                marker = {"auth_failed": True, "at": now}
+                if isinstance(auth_error.code, str) and _CODE_SHAPE.match(auth_error.code):
+                    marker["code"] = auth_error.code
+                state[AUTH_MARKER_KEY] = marker
+                failures.append("%s: authentication failure %d of %d - CONFIRMED, the gauge is "
+                                "posted unavailable and myAir is not asked again for %d h "
+                                "(or until --retry-now)"
+                                % (SOURCE, count, AUTH_CONFIRM_CYCLES,
+                                   backoff_seconds(marker) // 3600))
+            else:
+                failures.append("%s: authentication failure %d of %d - last score kept until "
+                                "confirmed" % (SOURCE, count, AUTH_CONFIRM_CYCLES))
         else:
-            failures.append("%s: authentication failure %d of %d - last score kept until "
-                            "confirmed" % (SOURCE, count, AUTH_CONFIRM_CYCLES))
-    else:
-        # A success OR a failure of another kind: the count is CONSECUTIVE
-        # authentication failures, so either resets it. Only a success clears
-        # the marker: a network blip after a confirmed login death must not
-        # bring the old colour back (the sticky rule).
-        state[AUTH_COUNTS_KEY] = {}
-        if records is not None:
-            state[AUTH_MARKER_KEY] = None
+            # A success OR a failure of another kind: the count is CONSECUTIVE
+            # authentication failures, so either resets it. Only a success clears
+            # the marker: a network blip after a confirmed login death must not
+            # bring the old colour back (the sticky rule).
+            state[AUTH_COUNTS_KEY] = {}
+            if records is not None:
+                state[AUTH_MARKER_KEY] = None
 
     # ── Fold, decide, post ───────────────────────────────────────────────────
     if records is not None:
@@ -1317,10 +1521,10 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None):
         changed = upsert_nights(state[NIGHTS_KEY], records, now, tz)
         if changed:
             notes.append("night key(s) updated: %s" % ", ".join(sorted(changed)))
-    prune_nights(state[NIGHTS_KEY], now, tz)
+    prune_nights(state, now, tz)
 
     dead = state[AUTH_MARKER_KEY] is not None
-    night = None if dead else decide_night(state[NIGHTS_KEY], now, tz)
+    night = None if dead else decide_night(state[NIGHTS_KEY], state[PUBLISHED_KEY], now, tz)
     if night is None:
         body = build_gauge(None, None)
     else:
@@ -1334,6 +1538,8 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None):
     if not ok:
         failures.append("post %s: %s" % (GAUGE_ID, detail))
     if night is not None:
+        if ok:
+            state[PUBLISHED_KEY].setdefault(night, now)
         notes.append("published night %s" % night if ok else "night %s not published" % night)
     elif dead:
         notes.append("expected night %s: login confirmed dead - posted unavailable" % expected)
@@ -1350,7 +1556,12 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None):
 
 
 def main(argv=None):
-    """Entry point: gate, resolve, one cycle, report. It does not compute."""
+    """Entry point: gate, resolve, one cycle, report. It does not compute.
+
+    `--check` validates the configuration and exits. `--retry-now` is for the
+    operator who has just re-signed the myAir account: it clears a confirmed
+    sign-in failure and asks myAir at once, outside the fetch windows.
+    """
     argv = list(sys.argv[1:] if argv is None else argv)
     env = dict(os.environ)
     if not resolve_enabled(env):
@@ -1367,7 +1578,7 @@ def main(argv=None):
     if not resolve_publish(env):
         print("sleep: SLEEP_PUBLISH is off - nothing read, nothing posted.")
         return 0
-    _posted, notes, failures = run_cycle(env)
+    _posted, notes, failures = run_cycle(env, retry_now="--retry-now" in argv)
     for line in notes:
         print("sleep: %s" % line)
     for line in failures:

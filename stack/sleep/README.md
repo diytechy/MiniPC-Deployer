@@ -40,8 +40,10 @@ IF-012 (the feed contract) and the 36-hour `daily` staleness horizon.
 | **`observed_at` = the EARLIER of 12:00 local on the night-key date and the first publication**, then **frozen**. A record arriving at 07:00 is stamped 07:00 (NagLight treats a *future* stamp as stale); one arriving at 16:45 is stamped 12:00 — **never the later fetch time** | `upsert_nights` |
 | A **correction** changes the value and never `observed_at`; a later null or missing record never erases a published night | `upsert_nights` |
 | The **expected night** is **today's local date** (`TIMEZONE`) | `expected_night` |
-| **Before 14:00** local, with no record for the expected night, the **previous night's** score stays and ages normally. Anything older is never shown | `decide_night` |
+| **Before 14:00** local, with no record for the expected night, the **previous night's** score stays and ages normally — **but only a night the feeder actually PUBLISHED** (the state file's `published` set, recorded when a score was accepted by the tracker). A night a late fetch merely staged after an outage or a dead-login period was never on the wall and is not "the score that stays". Anything older is never shown | `decide_night` |
 | **From 14:00** local, with no record for the expected night, the gauge posts **unavailable**. This also covers "the newest record is not for the expected night": an old night is never shown as last night | `decide_night` |
+| The clock is **read again after the fetch**, before selecting and posting, so a cycle that starts at 13:59 and ends at 14:01 applies the 14:00 rule | `run_cycle` |
+| If the local date is **earlier than the newest published night** the clock went backwards: nothing is selected or posted and the journal says so (status only) | `clock_went_backwards` |
 | All time arithmetic goes through the zone's own offset **for the instant in question** — never `+ 24 h` — so the 23- and 25-hour days are right | `noon_epoch`, `past_grace` |
 
 Choices where the plan left a point open (the smallest consistent one):
@@ -59,6 +61,28 @@ Choices where the plan left a point open (the smallest consistent one):
 - `totalUsage` and the sub-scores are **not requested at all**. The plan's
   "derived night end from `startDate` + `totalUsage`" alternative was not proven
   meaningful by S0b, so it is not used.
+
+## When myAir is asked
+
+The timer ticks every 30 minutes and **every tick posts from stored state** (so the
+14:00 rule and the frozen stamp keep working). The **network** is used far less:
+every sign-in is a full login to a health vendor with no refresh token, so myAir is
+asked **only**
+
+- while the expected night is **not yet stored**, between **06:00 and 16:00** local,
+  at most once per two hours;
+- once it **is** stored, for a **correction re-fetch** from **14:30** and another
+  from **20:00** local (each at most once per local day; a missed slot is made up
+  with one fetch);
+- on the very next tick after a **first** authentication failure (so the two-cycle
+  confirmation takes about 30 minutes);
+- after a **confirmed** dead login, only when the back-off below has elapsed.
+
+A normal day is therefore about five sign-ins (06:00, 08:00, 10:00 when the night
+arrives around then, 14:30, 20:00), not 48. A night that uploads after 16:00 is not
+fetched that day (see Known limits). The windows are local wall-clock times, so
+they hold on the 23- and 25-hour days; skipped ticks are *not* an outcome and never
+reset the failure count.
 
 ## Knobs (`stack/.env`)
 
@@ -151,10 +175,10 @@ cross the wire and sit in memory).
 - **How often sign-in needs a person** (an emailed code). A probe cannot prove
   long-term frequency; the journal says when it happens (below) and it is watched
   after deployment (plan S5).
-- **48 sign-ins a day.** There is no refresh token, so every 30-minute cycle is a
-  full sign-in to a health vendor. Nothing in the probe showed a rate limit or a
-  "new device" email, but one sign-in per cycle for months is not something a short
-  probe can rule out. Do not tighten the timer.
+- **Months of daily sign-ins.** There is no refresh token, so every fetch is a full
+  sign-in to a health vendor. The schedule keeps that to about five a day, but
+  nothing in the probe showed whether myAir rate-limits, sends a "new device" email
+  or locks an account after months of it, and a short probe cannot rule it out.
 - **The upstream's EU region** is not supported (the Owner is NA).
 - **Whether a night's score is revised after upload** — the contract handles it
   (a correction changes the value, not the stamp); no revision has been observed.
@@ -189,15 +213,22 @@ every message is this file's own words, with at most an allow-listed status word
   `MFA_REQUIRED`); a GraphQL 401 or `unauthorized` after a good sign-in. A 5xx, a
   429, a timeout and a malformed body are **not** — those keep the last score until
   its horizon.
-- **Confirmed over two consecutive cycles** (up to ~60 minutes with the 30-minute
-  timer). The first failed cycle behaves as today (the last score is re-posted at
-  its original stamp); the second posts the unavailable body.
+- **Confirmed over two consecutive sign-in attempts** (about 30 minutes: the first
+  refusal makes the next tick ask again). The first failed attempt behaves as today
+  (the last score is re-posted at its original stamp); the second posts the
+  unavailable body.
 - The count lives **in the state file** under the reserved key `__auth_failures__`
   with its own validator (a one-shot unit has no memory); any non-authentication
   outcome resets it.
 - **Sticky:** the confirmation sets `__auth_failed__`. While it is set, **every**
   cycle posts unavailable, including after a later network failure, until a
   sign-in **succeeds**.
+- **Back-off:** while the marker is set myAir is **not asked at all** — zero Okta
+  calls, the wall stays grey from stored state — for **6 h** after the last refusal,
+  or **24 h** when the authn status was `LOCKED_OUT`. A wrong or expired password
+  retried at every tick would be 48 failed attempts a day, enough to lock the
+  account, the phone app included. After the back-off one attempt is made; if it is
+  refused the back-off restarts from that refusal, if it succeeds the marker clears.
 - **`MFA_REQUIRED` never triggers anything.** This feeder has no mail code at all
   (asserted by test). It posts unavailable and logs the line above.
 
@@ -215,8 +246,23 @@ every message is this file's own words, with at most an allow-listed status word
    code; if myAir keeps asking, the account's "remember this device" is not holding
    for the hub's address and **this feeder cannot supply a code** — by design, it
    reads nobody's mailbox.
-3. After the `.env` changes, `sudo systemctl start homehub-sleep.service` (or wait
-   for the timer). The next **successful** sign-in clears the grey.
+3. After the `.env` changes, run the feeder with **`--retry-now`**, which clears
+   the marker and asks myAir at once, outside the windows and the back-off. Under
+   the unit's account and environment:
+
+   ```
+   sudo systemd-run --wait --pipe --collect -p User=homehub-sleep \
+       -p EnvironmentFile=/opt/homehub/stack/.env -p StateDirectory=homehub-sleep \
+       -p StateDirectoryMode=0700 \
+       /usr/bin/python3 /opt/homehub/stack/sleep/sleep_feeder.py --retry-now
+   ```
+
+   (`systemctl start homehub-sleep.service` alone does **not** do this: inside the
+   back-off it asks nothing. The `systemd-run` line has not been run on a real hub —
+   see Known limits.) One refused `--retry-now` starts the count again at one and
+   the next tick confirms it, so a still-wrong password costs two attempts, not
+   a stream. If the sign-in is simply fixed and there is no hurry, do nothing: the
+   back-off ends by itself.
 
 ## Install
 
@@ -244,6 +290,8 @@ toward a lockout).
 python -m pytest tests -q -k sleep
 ```
 
+`tests/test_sleep_schedule.py` (the fetch windows incl. the DST days, the back-off
+and `--retry-now`, publication tracking, the fresh-clock and backwards-clock rules),
 `tests/test_sleep_contract.py` (the data contract, DST days, 13:59 vs 14:00,
 restart), `tests/test_sleep_signin.py` (the stdlib flow against loopback Okta and
 AppSync fakes that check PKCE, the cookie and the bearer token; the dead-login
@@ -251,6 +299,42 @@ rules), `tests/test_sleep_deploy.py` (unit, timer, setup script, knobs, egress,
 logging). The time tests run under a hand-written US Central zone and, when the
 Python has `zoneinfo` and tz data, `America/Chicago` as well; every DST expectation
 is a literal UTC instant.
+
+## Known limits
+
+Each is accepted, with the reason.
+
+- **(a) If the feeder itself is down, nothing enforces the 14:00 cutoff.** The
+  "unavailable from 14:00" rule is applied by the feeder when it posts; with the
+  feeder dead, NagLight keeps showing the last score, coloured, until its own
+  36 h `daily` horizon passes. NagLight cannot know that 14:00 passed. This is a
+  limit of the design (the horizon is NagLight's), not of the code; the unit's
+  journal and the 30-minute timer are the only watch on it.
+- **(b) Losing the state file can re-stamp a night later, by up to 5 h.** The frozen
+  `observed_at` and the `published` set live only in the state file. If it is lost
+  (a reimage, a corrupt file) the next fetch re-stamps a night with the *earlier of
+  12:00 local and now*, so a night first published at 07:00 can come back stamped
+  as late as 12:00. That is the cost of having no per-record upload time in myAir's
+  nightly query; it never makes a night fresher than noon on its own date.
+- **(c) systemd's `EnvironmentFile=` mangles a myAir password containing `\` or
+  `"`.** systemd unescapes a backslash and strips double quotes in `.env` values, so
+  such a password reaches the feeder altered, and the sign-in is refused exactly as
+  an expired login would be. Choose a myAir password without those two characters.
+  The current password has none (verified). A `$` is safe: the feeder collapses the
+  materialiser's `$$`.
+- **(d) The unused-night shape is unproven.** Every probed night had usage, so it is
+  unknown whether myAir returns an unused night as a record or as no record. Both
+  are handled (a record with a score publishes it; no record is unavailable from
+  14:00), but if myAir omits unused nights the wall goes grey on them.
+- **A night that uploads after 16:00 is not fetched that day**, and a previous
+  night that was never published is not shown the next morning either. The windows
+  trade that against a day of sign-ins; the night is still staged if a later fetch
+  returns it.
+- **Not run on a real hub:** the `systemd-run` `--retry-now` line, `time-sync.target`
+  ordering, and the setup script's `useradd`/`systemctl` paths.
+- **Cross-clock skew is out of scope.** The feeder and NagLight share one host
+  clock; the only clock rule is that a local date earlier than the newest published
+  night refuses to select or publish.
 
 ## Limits, said plainly
 

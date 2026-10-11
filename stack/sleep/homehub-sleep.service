@@ -10,8 +10,10 @@
 # refresh token, so every run signs in from scratch and holds nothing afterwards.
 Description=HomeHub sleep feeder (SR-070, posts the sleep gauge to NagLight)
 Documentation=file:///opt/homehub/stack/sleep/README.md
-After=network-online.target homehub-firstboot.service
-Wants=network-online.target
+# time-sync.target: night keys, the 12:00 stamp and the 14:00 rule are LOCAL dates read
+# off the host clock, so the first run after a boot waits for it to be set.
+After=network-online.target time-sync.target homehub-firstboot.service
+Wants=network-online.target time-sync.target
 ConditionPathExists=/opt/homehub/stack/.env
 
 [Service]

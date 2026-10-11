@@ -41,7 +41,7 @@ SLEEP_USER_ACCOUNT="${SLEEP_USER_ACCOUNT:-homehub-sleep}"
 SLEEP_FEED_URL="${SLEEP_FEED_URL:-}"
 
 # MUST STAY EQUAL TO THE UNIT'S StateDirectory=. The account-name knob cannot
-# move it, so it is a constant, and tests/test_sleep_feeder.py asserts this
+# move it, so it is a constant, and tests/test_sleep_deploy.py asserts this
 # string and the unit's StateDirectory= still agree.
 SLEEP_STATE_DIR=/var/lib/homehub-sleep
 

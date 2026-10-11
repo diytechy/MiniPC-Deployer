@@ -319,6 +319,33 @@ PLAUSIBLE_WAIST_IN = (15.0, 80.0)
 HEIGHT_STATE_KEY = "height-in"
 WAIST_STATE_KEY = "waist-in"
 
+# THE CONSECUTIVE-SIGN-IN-FAILURE COUNTER'S HOME IN THE STATE FILE (G2, plan
+# 3.6). Both feeders are one-shot timer units, so memory does not survive from
+# one cycle to the next and the count can live nowhere but here. It is a
+# RESERVED key - a name no gauge or check id is ever given - and it gets its own
+# validator in `load_state`, the way the three keys above do, because the
+# generic reading validator would silently drop it (a dict of small integers is
+# not a weight). Its value is {source name: int}: counts only, never a
+# credential, a token or any part of a response body.
+AUTH_STATE_KEY = "auth-failed-cycles"
+# How many CONSECUTIVE authentication-failed cycles confirm a dead sign-in. One
+# is not enough: a read made while the credential is being rotated can look
+# like a dead login. A refinement of the Owner's "grey at once" (plan 3.6), the
+# cost being up to two 15-minute timer intervals instead of one.
+AUTH_CONFIRM_CYCLES = 2
+
+# THE ONLY WORDS FROM A TOKEN-ENDPOINT ERROR BODY THAT MAY REACH A MESSAGE.
+# `invalid_grant` is what Google answers (HTTP 400) when a refresh token has
+# expired or been revoked - for an OAuth app left in "Testing", every 7 days.
+# Deliberately a single entry: `invalid_client` and `unauthorized_client` mean
+# the OAuth CLIENT is wrong, which is a configuration fault that re-signing in
+# does not cure, so they must stay ordinary failures and not grey the gauge.
+# Compared by EQUALITY, and the matched constant - never the remote's string -
+# is what is returned and logged. See `allow_listed_oauth_error`.
+AUTH_ERROR_ALLOWLIST = frozenset({"invalid_grant"})
+# How much of a token-endpoint error body is read to find its `error` field.
+MAX_OAUTH_ERROR_BYTES = 4096
+
 # NagLight's staleness horizons by window kind, kept here because the cadence
 # has to be chosen against them. This gauge has NO window, so it takes the
 # `static` horizon: 7 days. That is a long time for a wall panel to keep
@@ -464,6 +491,31 @@ class SourceFailure(Exception):
     identically, and a second exception type is a second chance to accidentally
     post a fresh reading for a source that failed.
     """
+
+
+class AuthFailure(SourceFailure):
+    """The source refused our SIGN-IN, as opposed to failing for any other reason.
+
+    Raised by the Google token refresh when it answers HTTP 401, or HTTP 400
+    whose OAuth `error` is on AUTH_ERROR_ALLOWLIST (`invalid_grant`): the
+    refresh token has expired or been revoked, and no amount of retrying will
+    fix it - only `weight_oauth.py mint --force` does.
+
+    A SUBCLASS OF SourceFailure, so every handler that exists keeps working and
+    a caller that does not care sees an ordinary failure. `run_cycle` is the one
+    caller that does: it catches this class FIRST and counts consecutive
+    occurrences, because two in a row (AUTH_CONFIRM_CYCLES) are what turn the
+    gauge grey. NO READER MAY CATCH ONE AND RE-RAISE A PLAIN SourceFailure.
+
+    `code` is the HTTP status (an int) or the allow-listed OAuth word; it is
+    never any other part of the remote's reply.
+
+    Implements: SR-022, LLR-1063
+    """
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 class NoWeightYet(SourceFailure):
@@ -2221,7 +2273,7 @@ def build_ratio_post(waist, height, target, now):
         observed_at, now, "ratio"))
 
 
-def build_post(reading, last, goal_lb, now):
+def build_post(reading, last, goal_lb, now, auth_failed=False):
     """Decide what to POST this cycle - the "stale, never green" rule.
 
     Contract:
@@ -2231,7 +2283,13 @@ def build_post(reading, last, goal_lb, now):
                last:    the stored {"value", "observed_at"} from a previous
                         successful cycle, or None if there has never been one;
                goal_lb: the target line from the user's definitions;
-               now:     epoch seconds.
+               now:     epoch seconds;
+               auth_failed: True only on a cycle where the sign-in failure has
+                        been CONFIRMED (AUTH_CONFIRM_CYCLES in a row). It makes
+                        the stored reading unusable for this post, so the body
+                        is the never-measured one - value 0, no `observed_at`,
+                        stale on arrival - instead of the old number at its old
+                        stamp. Ignored when `reading` is not None.
       Outputs: (body: dict, fresh: bool). `fresh` is True only when the body
                carries a stamp from THIS cycle's read.
       Raises:  ValueError for a body this repo should never build, and
@@ -2266,7 +2324,13 @@ def build_post(reading, last, goal_lb, now):
     would be the exact fabrication this design forbids, and it is the mistake
     that is easiest to make while "fixing" a gauge that says unavailable.
 
-    Implements: SR-022, LLR-006
+    THE ONE DELIBERATE EXCEPTION TO "REPOST THE LAST READING" is `auth_failed`:
+    a sign-in failure confirmed over two cycles means the source will not
+    answer until a human renews the login, so the old number is not merely
+    stale, it is unfixable by waiting - and it would stay in colour for the 7
+    days of the static horizon. Grey it at once instead.
+
+    Implements: SR-022, LLR-006, LLR-1066
     """
     if reading is not None:
         # Either a WeightReading (what the vendor reader returns now, because
@@ -2279,6 +2343,13 @@ def build_post(reading, last, goal_lb, now):
         return gauge_body(check_plausible_weight_lb(value_lb, "reading"),
                           goal_lb,
                           check_observed_at(observed_at, now, "reading")), True
+    if auth_failed:
+        # A CONFIRMED DEAD SIGN-IN. The stored reading is skipped, not merely
+        # old: re-posting it would keep the bar coloured for the 7 days of
+        # NagLight's static horizon, which is how the weight bar stayed
+        # coloured for a week in 2026-09. `run_cycle` also clears it from the
+        # state file, so a later network failure cannot bring it back.
+        return gauge_body(0.0, goal_lb, None), False
     # Re-validated at the point of USE as well as at the point of load: the two
     # are separated by the whole source read, and the guard has to hold at both.
     checked = validate_stored_reading(last, now)
@@ -2930,6 +3001,40 @@ def validate_checked_marks(entry, now):
     return out
 
 
+def validate_auth_counts(entry):
+    """The consecutive-sign-in-failure counter, VALIDATED. Anything else drops.
+
+    Contract:
+      Inputs:  entry: whatever sat under AUTH_STATE_KEY - any JSON value.
+      Outputs: {source name: int 1..AUTH_CONFIRM_CYCLES}, possibly empty.
+      Raises:  nothing.
+
+    THE FILE IS INPUT, NOT MEMORY, so each member is checked on its own: the key
+    must be a source this feeder can read (an unknown name is stale clutter that
+    would grow the file for ever), and the value a real integer - not a bool,
+    which is an int in Python, not a float, not zero or negative - clamped to
+    AUTH_CONFIRM_CYCLES, because a count above the confirming one buys nothing
+    and an edited `10**9` should not be remembered as one. A member that fails
+    is dropped alone and the rest survive. DROPPING IS SAFE: it only means one
+    more failed cycle is needed before the gauge greys - the conservative
+    direction. The reverse (a corrupt file greying a healthy gauge) cannot
+    happen, because a success resets the count and a count alone never greys
+    anything without a failure in the same cycle.
+
+    Implements: SR-022, LLR-1065
+    """
+    if not isinstance(entry, dict):
+        return {}
+    out = {}
+    for source, count in entry.items():
+        if source not in SOURCE_READERS:
+            continue
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            continue
+        out[source] = min(count, AUTH_CONFIRM_CYCLES)
+    return out
+
+
 def load_state(state_path, now):
     """Last successful reading, VALIDATED. Anything else is {}.
 
@@ -2964,6 +3069,13 @@ def load_state(state_path, now):
         # outside the 40..1000 lb band. They get their own bands rather than an
         # exemption, for the reason CHECK_STATE_KEY does: an exemption would
         # mean the one key in this file that is never checked at all.
+        # THE SIGN-IN FAILURE COUNTER is the fourth key that is not a reading.
+        # Same reason, same shape: a dedicated validator, never an exemption.
+        if key == AUTH_STATE_KEY:
+            counts = validate_auth_counts(entry)
+            if counts:
+                out[key] = counts
+            continue
         if key in (HEIGHT_STATE_KEY, WAIST_STATE_KEY):
             cached = validate_stored_inches(
                 entry, now,
@@ -2983,9 +3095,10 @@ def save_state(state, state_path, state_root):
     """Write the state file through `open_for_write`, atomically.
 
     The state holds A WEIGHT, A TIMESTAMP, AND THE CHECK IDS ALREADY TICKED
-    WITH THE SAMPLE TIME EACH WAS TICKED FOR - never a token, never a header,
-    never a response body. That is asserted by test, because a state file that
-    quietly grew a `refresh_token` would turn this feeder into the
+    WITH THE SAMPLE TIME EACH WAS TICKED FOR, AND A SMALL INTEGER PER SOURCE
+    COUNTING CONSECUTIVE SIGN-IN FAILURES (AUTH_STATE_KEY) - never a token,
+    never a header, never a response body. That is asserted by test, because a
+    state file that quietly grew a `refresh_token` would turn this feeder into the
     credential-writing thing it promises not to be.
 
     THE TICK MARKS SHARE THIS FILE RATHER THAN GETTING ONE OF THEIR OWN, and
@@ -3466,16 +3579,67 @@ def read_refresh_token(path):
     return token
 
 
-def vendor_json(request, timeout, what):
+def allow_listed_oauth_error(error):
+    """The ONE word of a token-endpoint error body that may be logged, or None.
+
+    Contract:
+      Inputs:  error: the `urllib.error.HTTPError` of a token refresh.
+      Outputs: a member of AUTH_ERROR_ALLOWLIST, or None.
+      Raises:  nothing - an unreadable, oversized, non-JSON or differently
+               shaped body is simply None.
+
+    THIS IS THE NARROW AMENDMENT TO `vendor_json`'s RULE THAT NOTHING THE REMOTE
+    WROTE EVER REACHES A MESSAGE, and it is as narrow as it can be made:
+      * only the top-level `error` member is looked at - the body is parsed, and
+        everything else in it (`error_description`, which Google fills with free
+        text, and any quoted request) is dropped on the floor;
+      * a value that is not a plain string, or not EQUAL to an allow-list entry,
+        is None, so Google's other shape - `{"error": {"message": ...}}` - is
+        never touched;
+      * what is RETURNED IS OUR OWN CONSTANT, found by comparing, never the
+        string the remote sent. A loop over the allow-list is deliberate: it
+        makes "return the remote's value" the harder thing to write.
+
+    Implements: SR-022, LLR-1064
+    """
+    try:
+        raw = error.read(MAX_OAUTH_ERROR_BYTES)
+        body = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    word = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(word, str):
+        return None
+    for allowed in sorted(AUTH_ERROR_ALLOWLIST):
+        if word == allowed:
+            return allowed
+    return None
+
+
+REFRESH_HINT = (
+    "The refresh token is no longer valid - run `weight_oauth.py mint "
+    "--force`. If it keeps dying after 7 days, the Google OAuth app is still "
+    "in Testing; publish it to In production (stack/weight/README.md).")
+
+
+def vendor_json(request, timeout, what, classify_auth=False):
     """Send `request` through `vendor_opener()` and decode the JSON. One door.
 
     Contract:
       Outputs: the decoded body.
       Raises:  SourceFailure for EVERY failure class - transport, timeout,
-               refused redirect, non-200 and an undecodable body.
+               refused redirect, non-200 and an undecodable body. With
+               `classify_auth` (the token refresh, and only that), the subclass
+               AuthFailure for an HTTP 401 or an HTTP 400 whose OAuth `error` is
+               on AUTH_ERROR_ALLOWLIST.
 
     NOTHING THE REMOTE WROTE EVER REACHES THE MESSAGE. Not the body, not on a
-    401, not on a 500. `run_cycle` prints a SourceFailure's message and systemd
+    401, not on a 500. (ONE NARROW EXCEPTION, for `classify_auth` only: the
+    matched allow-listed `error` word - see `allow_listed_oauth_error`, which
+    returns our own constant rather than the remote's string. Everything else in
+    the body is still never read into a message.)
+
+    The reason: `run_cycle` prints a SourceFailure's message and systemd
     writes it to the journal, and a Google error body has been observed
     quoting the offending request back - which on this path carries an
     `Authorization` header that is the whole health-metrics scope. The status
@@ -3483,7 +3647,7 @@ def vendor_json(request, timeout, what):
     get a journal. `EgressRefused` is converted here, deliberately and by name,
     because its message is OURS.
 
-    Implements: SR-022, LLR-006
+    Implements: SR-022, LLR-006, LLR-1063, LLR-1064, LLR-1067
     """
     try:
         with vendor_opener().open(request, timeout=timeout) as response:
@@ -3496,11 +3660,24 @@ def vendor_json(request, timeout, what):
     except EgressRefused as exc:
         raise SourceFailure("google-health: %s was refused: %s" % (what, exc))
     except urllib.error.HTTPError as exc:
+        if classify_auth and exc.code == 401:
+            raise AuthFailure(
+                "google-health: %s failed: HTTP 401 (the body is not logged). "
+                "%s" % (what, REFRESH_HINT), code=401)
+        if classify_auth and exc.code == 400:
+            word = allow_listed_oauth_error(exc)
+            if word is not None:
+                raise AuthFailure(
+                    "google-health: %s failed: HTTP 400 %s (nothing else from "
+                    "the body is logged). %s" % (what, word, REFRESH_HINT),
+                    code=word)
         raise SourceFailure(
-            "google-health: %s failed: HTTP %s (the body is not logged). 401 "
-            "means the refresh token is no longer valid - run `weight_oauth.py "
-            "mint --force`; 403 usually means the scope is no longer on the "
-            "consent screen." % (what, exc.code))
+            "google-health: %s failed: HTTP %s (the body is not logged). On "
+            "the token refresh, HTTP 400 invalid_grant or 401 means the "
+            "refresh token is no longer valid - run `weight_oauth.py mint "
+            "--force` (an OAuth app left in Testing expires it every 7 days); "
+            "403 usually means the scope is no longer on the consent screen."
+            % (what, exc.code))
     except Exception as exc:
         raise SourceFailure("google-health: %s failed: %s"
                             % (what, type(exc).__name__))
@@ -3520,7 +3697,7 @@ def google_access_token(client_id, client_secret, refresh_token, timeout,
     the feeder. If it is wrong the outcome is a named SourceFailure and an
     unavailable gauge, never a reading.
 
-    Implements: SR-022, LLR-006
+    Implements: SR-022, LLR-006, LLR-1063
     """
     fields = {"client_id": client_id, "client_secret": client_secret,
               "refresh_token": refresh_token, "grant_type": "refresh_token"}
@@ -3530,7 +3707,8 @@ def google_access_token(client_id, client_secret, refresh_token, timeout,
         headers={"Content-Type": "application/x-www-form-urlencoded",
                  "Accept": "application/json"},
         method="POST")
-    payload = vendor_json(request, timeout, "the token refresh")
+    payload = vendor_json(request, timeout, "the token refresh",
+                          classify_auth=True)
     token = payload.get("access_token") if isinstance(payload, dict) else None
     if not isinstance(token, str) or not token:
         raise SourceFailure(
@@ -4177,7 +4355,7 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,
     put it in, so the failure is legible in `systemctl status` rather than
     silent.
 
-    Implements: SR-022, LLR-006
+    Implements: SR-022, LLR-006, LLR-1065, LLR-1066
     """
     now = int(now if now is not None else time.time())
     readers = readers or SOURCE_READERS
@@ -4196,8 +4374,16 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,
         defs_dir, category, item_id)
 
     reading, failures = None, []
+    # Did THIS cycle's read fail as a SIGN-IN failure? Kept as a bool because
+    # `build_post` is told only that the reading is None - every failure class
+    # collapses to that - so the class must be remembered here or it is lost.
+    auth_failed = False
     try:
         reading = readers[source](env)
+    except AuthFailure as exc:
+        # BEFORE the SourceFailure clause, which would otherwise swallow it.
+        auth_failed = True
+        failures.append("%s: %s" % (source, exc))
     except SourceFailure as exc:
         failures.append("%s: %s" % (source, exc))
     except Exception as exc:
@@ -4216,8 +4402,37 @@ def run_cycle(env, now=None, readers=None, poster=None, goal_loader=None,
     # rewriting (and so refreshing the mtime of) history it did not improve.
     before = {key: dict(value) if isinstance(value, dict) else value
               for key, value in state.items()}
+    # ── THE SIGN-IN FAILURE COUNT. One per source, in the state file, reset by
+    # ANY cycle that did not fail as a sign-in failure (a success, or a failure
+    # of another kind - a network blip proves nothing about the credential). The
+    # gauge greys only on the AUTH_CONFIRM_CYCLES-th consecutive one. ──────────
+    counts = dict(state.get(AUTH_STATE_KEY) or {})
+    confirmed = False
+    if auth_failed:
+        counts[source] = min(counts.get(source, 0) + 1, AUTH_CONFIRM_CYCLES)
+        confirmed = counts[source] >= AUTH_CONFIRM_CYCLES
+        failures.append(
+            "%s: sign-in failure %d of %d%s" % (
+                source, counts[source], AUTH_CONFIRM_CYCLES,
+                " - confirmed, the gauge is grey until the login is renewed"
+                if confirmed else
+                " - not yet confirmed, the last reading is kept"))
+    else:
+        counts.pop(source, None)
+    if counts:
+        state[AUTH_STATE_KEY] = counts
+    else:
+        state.pop(AUTH_STATE_KEY, None)
+    if confirmed:
+        # CLEARED, NOT MARKED. The weight gauge is always posted (it is not an
+        # optional gauge), so with nothing stored `build_post` falls through to
+        # the never-measured body - and goes on doing so after any later failure
+        # of any kind, which is what makes the grey STICK. A real reading
+        # rewrites the entry when the login is renewed.
+        state.pop(GAUGE_ID, None)
     try:
-        body, fresh = build_post(reading, state.get(GAUGE_ID), goal_lb, now)
+        body, fresh = build_post(reading, state.get(GAUGE_ID), goal_lb, now,
+                                 auth_failed=confirmed)
     except (ValueError, SourceFailure) as exc:
         # A gauge this repo refuses to build must cost the READING, not the
         # post: the panel must still say "we do not know what you weigh"

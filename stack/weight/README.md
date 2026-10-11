@@ -284,6 +284,25 @@ When it prints something else:
 | `NOTE - --token-file overrides WEIGHT_TOKEN_FILE` | not an error: you passed `--token-file` naming something other than the configured token. It is allowed and it is printed. The feeder reads `WEIGHT_TOKEN_FILE`, so a token written elsewhere is a copy the service will not use. |
 | `REFUSED: ... outside the service's own state directory` | `WEIGHT_TOKEN_FILE` points somewhere that is not under `/var/lib/homehub-weight`. The guard refuses; fix the knob. |
 
+### The 7-day cliff: a refresh token minted for an app in Testing dies after a week (found 2026-10-11)
+
+The weight bar was dead from 2026-09-19 until it was noticed on 2026-10-11. The
+cause is not a bug in the feeder: **while the Google OAuth app's consent screen
+is in "Testing", Google expires every refresh token it issues after 7 days.**
+Minting a new one buys another week and nothing more.
+
+* **What Google answers.** The refresh grant is refused with **HTTP 400** and the
+  OAuth error `invalid_grant` (an older guess in this repo said "401"; a 401 is
+  classified the same way, but 400 `invalid_grant` is what Google sent).
+* **The permanent fix is the Owner's, outside this repo:** open the Google Cloud
+  console for the project that owns the household's OAuth client, go to the
+  consent screen, and publish the app to **"In production"**. Then run
+  `mint --force` once more. A published app's refresh tokens do not carry the
+  7-day limit. Until that is done, **re-run `mint --force` at least weekly.**
+* **What the feeder does about it.** It does not retry a dead token, and it no
+  longer keeps showing the last weight in colour. See "A dead login greys the
+  gauge" below.
+
 ### What the paste is checked against (changed 2026-09-09)
 
 A cross-review found that `mint` **claimed** a PKCE + `state` check it did not
@@ -346,6 +365,20 @@ it is a separate call to Google's *token* endpoint, not to the health API.)
 | `HTTP 200` but only a handful of bytes (`{}` or an empty `dataPoints` list) | the call worked and the account simply has no weight data in Google Health. The feeder handles this as `NoWeightYet` and the panel reads "unavailable"; weigh in on a scale that feeds Fitbit/Pixel. (The key is `dataPoints`, **plural** — an earlier version of this table said `dataPoint`, and the captured body corrected it.) |
 | `the list call was refused: refused an HTTP 302 redirect` | something answered for `health.googleapis.com` that is not Google. Do **not** retry with redirects allowed: urllib carries `Authorization` across a cross-host redirect, and that header is this whole scope. |
 | `could not read the token file ... Run mint first.` | step 3 has not been done on this box, or `WEIGHT_TOKEN_FILE` disagrees with where it was written. |
+
+### When the FEEDER's journal says the login died
+
+These lines come from the running service (`journalctl -u homehub-weight`), not
+from `mint` or `capture`:
+
+| what it says | what it means, what to do |
+|---|---|
+| `the token refresh failed: HTTP 400 invalid_grant` | **The refresh token is no longer valid** (expired or revoked). Run `weight_oauth.py mint --force`. If this recurs about every 7 days, the OAuth app is still in "Testing": publish it to "In production" (see "The 7-day cliff" above). |
+| `the token refresh failed: HTTP 401` | Treated the same way: the refresh token is no longer valid. `mint --force`. |
+| `sign-in failure 1 of 2 - not yet confirmed, the last reading is kept` | The first failed cycle. Nothing is greyed yet, because a read made while a credential is being rewritten can look like a dead login. Wait one more cycle (15 minutes). |
+| `sign-in failure 2 of 2 - confirmed, the gauge is grey until the login is renewed` | Two cycles in a row. The weight bar is now posted as unavailable and the old reading is forgotten. `mint --force`; the next cycle that reads a weight restores the bar. |
+| `the token refresh failed: HTTP 403` | Not a dead login: the scope is no longer on the consent screen. Fix the console, then `mint --force`. This is **not** counted as a sign-in failure. |
+| `HTTP 400 invalid_client`, or any other 400 | The OAuth **client** id/secret is wrong. Re-signing in does not cure it, so it is **not** counted as a sign-in failure and does not grey the bar. |
 
 ### Step 5, now done
 
@@ -806,6 +839,10 @@ rule that `observed_at` is when the value was TRUE:
   arrival. The gauge exists so the panel can say "unavailable"; the `0` is
   unreachable as a *displayed* reading by construction.
 
+* **the Google login is confirmed dead** (see below) → the same never-measured
+  body as "no history": value `0`, no `observed_at`. This is the one case where
+  a stored reading is *deliberately not re-posted*.
+
 Note that **a real but old reading is still stale**, and must be. Someone who
 last weighed themselves a fortnight ago has an honest reading that the panel must
 render stale. Re-stamping it to `now` to "fix" an unavailable gauge is the single
@@ -816,6 +853,48 @@ easiest mistake to make here, and there is a test for it.
 panel green on Monday's number until the following Monday. The timer is
 therefore 15 minutes — 1/672nd of the horizon — and a test reads the shipped
 timer file and fails if it is ever loosened past a quarter of it.
+
+## A dead login greys the gauge (G2, 2026-10-11)
+
+Re-posting the last reading at its original stamp is right for a network blip
+and wrong for a dead login: a refresh token that has expired will not answer
+again until a person renews it, yet the old number stays **in colour** until the
+7-day static horizon passes. The weight bar sat coloured for a week that way.
+
+* **Classified, not guessed.** `AuthFailure` (a `SourceFailure` subclass) is
+  raised by the *token refresh only*, for HTTP 401 or for HTTP 400 whose OAuth
+  `error` is exactly `invalid_grant`. A network error, a 5xx, a 403, any other
+  400 and a 401 from the *list* call are ordinary failures and behave as before.
+* **Confirmed over two cycles.** The count of consecutive sign-in failures is
+  kept in the state file under the reserved key `auth-failed-cycles`
+  (`{"google-health": N}`), because the service is a one-shot timer and has no
+  memory between runs. It has its own validator in `load_state` and is carried
+  by `save_state`. **Any cycle that is not a sign-in failure resets it** - a
+  success, but also a network failure, which says nothing about the credential.
+  Two cycles is a refinement of "grey at once": a read made while a credential
+  is being rewritten can look dead, and it costs at most one more 15-minute
+  interval (so up to about 30 minutes after the login actually dies).
+* **On the confirming cycle** the stored reading is **cleared** from the state
+  file and `build_post(..., auth_failed=True)` posts the never-measured body
+  (value `0`, no `observed_at`). Clearing is what makes it stick: a later
+  network failure finds nothing to re-post and stays grey. The weight gauge is
+  not optional, so clearing (rather than marking) is correct here. A real reading
+  rewrites the entry when the login is renewed.
+* **Side effect.** The stale-on-arrival post overwrites the tracker's stored
+  weight with `0` and no stamp. A read-only search found nothing else that reads
+  the stored weight gauge except the panel and the trend baseline.
+* **The logging rule, amended narrowly.** Nothing the remote wrote reaches a
+  message - with one exception. For the token refresh only, the `error` member of
+  the JSON body is compared to an allow-list (`invalid_grant`), and only the
+  matched **constant** is logged. `error_description`, anything quoted back, and
+  any non-allow-listed `error` value are never read into a message.
+
+**Known limit: the waist-to-height sister gauge (`weight-waist`) is not greyed.**
+It has no unavailable body (see "When nothing is posted at all"), so when the
+weight login is confirmed dead it keeps its cached halves at their original
+stamps and stays coloured until NagLight's 7-day static horizon passes. This is
+a documented limit, not an oversight; a future change could stop the ratio's post
+once the weight login is confirmed dead.
 
 ## "Never writes a credential" is an allow-list, not a deny-list
 

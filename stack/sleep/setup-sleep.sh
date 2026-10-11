@@ -122,8 +122,37 @@ env_present MYAIR_PASSWORD || refuse \
     "MYAIR_PASSWORD is blank in $ENV_FILE. It comes from the secret store (key
     MyAirPassword) through the materialiser; import the key, then re-materialise."
 
+# ── IS THERE A CLOCK-SYNCHRONISATION SIGNAL? ────────────────────────────────
+# The feeder refuses to publish a timestamped score unless the host clock is shown
+# synchronised: systemd-timesyncd's flag file, else `timedatectl show -p
+# NTPSynchronized`. On a hub with NEITHER it publishes the grey (unavailable) gauge
+# for ever - correct, but not what anyone wants - so say so now, at install time.
+# One line, never fatal. SLEEP_SYNC_FLAG and SLEEP_TIMEDATECTL exist so a test can
+# point them elsewhere.
+probe_clock_sync() {
+    local flag="${SLEEP_SYNC_FLAG:-/run/systemd/timesync/synchronized}" answer=""
+    local td="${SLEEP_TIMEDATECTL:-timedatectl}"
+    if [ -e "$flag" ]; then
+        say "clock sync: $flag is present - systemd-timesyncd reports the clock synchronised."
+        return 0
+    fi
+    if command -v "$td" >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            answer="$(timeout 5 "$td" show -p NTPSynchronized --value 2>/dev/null || true)"
+        else
+            answer="$("$td" show -p NTPSynchronized --value 2>/dev/null || true)"
+        fi
+        case "$answer" in
+            yes) say "clock sync: timedatectl reports NTPSynchronized=yes (the flag file $flag is absent)."; return 0 ;;
+            no)  say "clock sync: timedatectl reports NTPSynchronized=no - the sleep gauge will show grey until the clock synchronises; check systemd-timesyncd."; return 0 ;;
+        esac
+    fi
+    say "WARNING clock sync: neither $flag nor 'timedatectl show -p NTPSynchronized' is available - the feeder cannot tell the clock is set and will publish only the grey (unavailable) gauge. Install or enable systemd-timesyncd."
+}
+
 if [ "$MODE" = "--check-only" ]; then
     say "check-only: identity set, destination set, myAir sign-in configured."
+    probe_clock_sync
     exit 0
 fi
 
@@ -135,6 +164,8 @@ if [ "$MODE" = "--emit-dropin" ]; then
     emit_dropin "$2"
     exit 0
 fi
+
+probe_clock_sync
 
 if ! id -u "$SLEEP_USER_ACCOUNT" >/dev/null 2>&1; then
     # --system, no shell, no password, NO HOME: it owns nothing but its state.

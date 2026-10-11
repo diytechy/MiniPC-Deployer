@@ -172,6 +172,58 @@ def test_the_setup_script_refuses_when_something_it_needs_is_blank(tmp_path, dro
     assert "PASSWORD-SENTINEL" not in proc.stdout + proc.stderr
 
 
+def stub_timedatectl(tmp_path, answer):
+    stub = tmp_path / "timedatectl-stub"
+    stub.write_bytes(("#!/bin/sh\necho %s\n" % answer).encode("ascii"))
+    os.chmod(str(stub), 0o755)
+    return str(stub).replace("\\", "/")
+
+
+def sync_lines(proc):
+    return [line for line in proc.stdout.splitlines() if "clock sync" in line]
+
+
+@needs_bash
+def test_install_time_probe_reports_the_timesyncd_flag_file(tmp_path):
+    flag = tmp_path / "synchronized"
+    flag.write_bytes(b"")
+    proc = run_setup(tmp_path, ["--check-only"], GOOD_ENV, SLEEP_SYNC_FLAG=str(flag).replace("\\", "/"),
+                     SLEEP_TIMEDATECTL="/nonexistent/timedatectl")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = sync_lines(proc)
+    assert len(lines) == 1 and "is present" in lines[0] and "WARNING" not in lines[0]
+
+
+@needs_bash
+@pytest.mark.parametrize("answer,needle", [("yes", "NTPSynchronized=yes"), ("no", "NTPSynchronized=no")])
+def test_install_time_probe_falls_back_to_timedatectl(tmp_path, answer, needle):
+    proc = run_setup(tmp_path, ["--check-only"], GOOD_ENV,
+                     SLEEP_SYNC_FLAG=str(tmp_path / "absent").replace("\\", "/"),
+                     SLEEP_TIMEDATECTL=stub_timedatectl(tmp_path, answer))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = sync_lines(proc)
+    assert len(lines) == 1 and needle in lines[0] and "WARNING" not in lines[0]
+    if answer == "no":
+        assert "grey" in lines[0] and "systemd-timesyncd" in lines[0]
+
+
+@needs_bash
+def test_install_time_probe_warns_when_there_is_no_signal_at_all_and_is_not_fatal(tmp_path):
+    proc = run_setup(tmp_path, ["--check-only"], GOOD_ENV,
+                     SLEEP_SYNC_FLAG=str(tmp_path / "absent").replace("\\", "/"),
+                     SLEEP_TIMEDATECTL="/nonexistent/timedatectl")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    lines = sync_lines(proc)
+    assert len(lines) == 1 and lines[0].startswith("WARNING clock sync:")
+    assert "grey" in lines[0] and "systemd-timesyncd" in lines[0]
+
+
+def test_the_install_path_probes_before_it_installs_anything():
+    script = SETUP.read_text(encoding="utf-8")
+    assert "\nprobe_clock_sync\n\nif ! id -u" in script           # before the account, the units, anything
+    assert script.count("probe_clock_sync") >= 3                    # defined, check-only, install
+
+
 @needs_bash
 def test_a_blank_quoted_password_is_blank(tmp_path):
     text = GOOD_ENV.replace("MYAIR_PASSWORD=PASSWORD-SENTINEL-6120", 'MYAIR_PASSWORD=""')

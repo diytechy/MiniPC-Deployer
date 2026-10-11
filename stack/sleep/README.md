@@ -101,8 +101,15 @@ reset the failure count.
 Night keys, the 06:00 floor, the noon stamp and the 14:00 rule are *local dates read
 off the host clock*, and `After=time-sync.target` does not by itself mean the clock
 is set. Before anything else a cycle checks that it is synchronised, and if it
-cannot show that it **fetches nothing and posts nothing new** (a status line in the
-journal, exit non-zero):
+cannot show that it **asks myAir nothing and publishes no timestamped score** — but it
+**still posts the unavailable (grey) body on every unsynchronised tick, at any hour**.
+That body has no `observed_at`, so it needs no trusted time, and it is what keeps the
+14:00 cutoff true after a reboot with NTP down (yesterday's green score must not sit
+on the wall past 14:00 because the clock cannot be trusted). A hub with no
+synchronisation signal at all therefore shows a grey gauge, not none. The journal says
+so (exit non-zero) and names what to check: `systemd-timesyncd` and `timedatectl`.
+`setup-sleep.sh` probes for a signal at install time and prints one `clock sync:` line
+(a `WARNING` if neither exists). State is neither read nor written on those ticks.
 
 1. systemd-timesyncd's flag file `/run/systemd/timesync/synchronized` — present
    once it has synchronised. **This is the method that applies on the hub** (Ubuntu

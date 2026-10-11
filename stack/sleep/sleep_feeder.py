@@ -648,13 +648,25 @@ def empty_state():
 
 
 def prune_nights(state, now, tz):
-    """Drop nights and publications older than KEEP_NIGHTS_BACK_DAYS. Nothing older can be shown."""
-    oldest = expected_night(now, tz) - dt.timedelta(days=KEEP_NIGHTS_BACK_DAYS)
+    """Drop nights and publications older than KEEP_NIGHTS_BACK_DAYS, and any dated
+    later than tomorrow. Nothing older can be shown; a far-future key is corruption
+    or a forward clock jump (the published set drops those on load too).
+
+    Returns how many far-future NIGHT keys were dropped, for a status line.
+    """
+    today = expected_night(now, tz)
+    oldest = today - dt.timedelta(days=KEEP_NIGHTS_BACK_DAYS)
+    newest = today + dt.timedelta(days=PUBLISHED_AHEAD_DAYS)
+    future = 0
     for part in (NIGHTS_KEY, PUBLISHED_KEY):
         for key in list(state[part]):
             day = parse_night_date(key)
             if day is None or day < oldest:
                 del state[part][key]
+            elif day > newest:
+                del state[part][key]
+                future += part == NIGHTS_KEY
+    return future
 
 
 def clock_went_backwards(state, now, tz):
@@ -1611,8 +1623,25 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
 
     synced, method = (sync_check or clock_synchronized)()
     if synced is not True:
-        return [], notes, ["the host clock is not known to be synchronised (%s) - nothing "
-                           "fetched, nothing posted" % method]
+        # NOT SYNCHRONISED: skip myAir and every TIMESTAMPED publication, but still
+        # POST THE UNAVAILABLE BODY. It carries no `observed_at`, so it needs no
+        # trusted time - and posting it is what makes the 14:00 cutoff hold after
+        # a reboot with NTP down: yesterday's green score must not sit on the wall
+        # past 14:00 just because the clock cannot be trusted. Every unsynced tick,
+        # any hour. (A hub with no synchronisation signal at all shows grey, not
+        # nothing.) State is neither read nor written.
+        try:
+            ok, detail = (poster or post_gauge)(build_gauge(None, None), feed_url, env,
+                                                resolve_timeout(env))
+        except Exception as exc:                   # a poster bug is a failed post
+            ok, detail = False, type(exc).__name__
+        problems = ["the host clock is not known to be synchronised (%s) - publishing the "
+                    "unavailable (grey) gauge and fetching nothing until it is; check "
+                    "systemd-timesyncd (systemctl status systemd-timesyncd) and "
+                    "`timedatectl show -p NTPSynchronized`" % method]
+        if not ok:
+            problems.append("post %s: %s" % (GAUGE_ID, detail))
+        return [(None, ok)], notes, problems
 
     state = load_state(state_path, start, tz)
     notes.extend(state.pop("_notes"))
@@ -1718,7 +1747,9 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
         changed = upsert_nights(state[NIGHTS_KEY], records, now, tz)
         if changed:
             notes.append("night key(s) updated: %s" % ", ".join(sorted(changed)))
-    prune_nights(state, now, tz)
+    pruned_future = prune_nights(state, now, tz)
+    if pruned_future:
+        notes.append("pruned %d night key(s) dated later than tomorrow" % pruned_future)
 
     dead = state[AUTH_MARKER_KEY] is not None
     night = None if dead else decide_night(state[NIGHTS_KEY], state[PUBLISHED_KEY], now, tz)

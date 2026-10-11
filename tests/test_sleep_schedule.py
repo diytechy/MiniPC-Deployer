@@ -511,7 +511,8 @@ def test_the_readme_documents_the_back_off_the_retry_and_the_known_limits():
                  "36 h", "5 h", "EnvironmentFile", "06:00", "14:30", "20:00", "published",
                  "time-sync.target", "unproven", "NTPSynchronized", "/run/systemd/timesync/synchronized",
                  "systemd-timesyncd", "refuses to run as root", "trend arrow", "must not contain",
-                 "06:00 and 22:00", "never first published before 06:00", "quarantined"):
+                 "06:00 and 22:00", "never first published before 06:00", "quarantined",
+                 "unavailable (grey) body", "clock sync:"):
         assert must.lower() in text.lower(), must
 
 
@@ -833,12 +834,40 @@ def test_when_neither_signal_is_available_the_answer_is_unknown(run):
 
 
 @pytest.mark.parametrize("signal", [False, None])
-def test_an_unsynchronised_clock_fetches_nothing_and_posts_nothing(tmp_path, signal):
+def test_an_unsynchronised_clock_fetches_nothing_and_posts_only_the_grey_body(tmp_path, signal):
     h = Harness(tmp_path)
     posted, notes, failures = h.cycle(at(9, 0), [TODAY], sync=lambda: (signal, "mocked"))
-    assert posted == [] and h.posts == [] and h.calls == 0
-    assert any("not known to be synchronised" in line and "mocked" in line for line in failures)
-    assert not h.state_path.exists()                             # and no state was written
+    assert posted == [(None, True)] and h.calls == 0             # myAir never asked
+    assert len(h.posts) == 1 and "observed_at" not in h.posts[0]   # the unavailable body, no stamp
+    assert h.posts[0]["value"] == 0 and h.posts[0]["id"] == "sleep"
+    joined = " ".join(failures)
+    assert "not known to be synchronised" in joined and "mocked" in joined
+    assert "grey" in joined and "systemd-timesyncd" in joined and "timedatectl" in joined
+    assert not h.state_path.exists()                             # no state read or written
+
+
+def test_an_unsynchronised_clock_still_reports_a_failed_grey_post(tmp_path):
+    h = Harness(tmp_path)
+    posted, _n, failures = h.cycle(at(9, 0), [TODAY], sync=lambda: (None, "mocked"),
+                                   poster=h.failing_poster)
+    assert posted == [(None, False)] and any(line.startswith("post sleep:") for line in failures)
+
+
+def test_a_reboot_with_ntp_down_cannot_leave_yesterdays_green_score_past_1400(tmp_path):
+    """The regression: green gauge persisted, reboot, no synchronisation, 14:00 passes."""
+    h = Harness(tmp_path)
+    h.cycle(at(10, 0), [TODAY])                                  # the morning: 82 on the wall
+    assert h.last()["value"] == 82 and "observed_at" in h.last()
+    on_disk = h.state_path.read_bytes()
+    h.restart()                                                  # the reboot: a fresh process
+    unsynced = lambda: (None, "no synchronisation signal available")  # noqa: E731
+    for tick in (at(13, 0), at(13, 59), at(14, 0), at(14, 30), at(20, 0)):
+        h.cycle(tick, [TODAY], sync=unsynced, gated=True)
+        assert "observed_at" not in h.last(), tick               # grey at EVERY unsynced tick
+    assert h.calls == 1                                          # and myAir was never asked again
+    assert h.state_path.read_bytes() == on_disk                  # the persisted state is untouched
+    h.cycle(at(20, 30), [TODAY], gated=True)                     # the clock is trusted again
+    assert h.last()["value"] == 82 and "observed_at" in h.last() # the persisted stamp comes back
 
 
 def test_the_default_check_is_the_real_one(monkeypatch, tmp_path):
@@ -846,11 +875,26 @@ def test_the_default_check_is_the_real_one(monkeypatch, tmp_path):
     monkeypatch.setattr(feeder, "clock_synchronized", lambda: (False, "mocked"))
     posted, _n, failures = feeder.run_cycle(dict(h.env), now=at(9, 0), tz=TZ, poster=h.poster,
                                             reader=lambda e, n, t: ([], 0), force_fetch=True)
-    assert posted == [] and h.posts == [] and failures
+    assert posted == [(None, True)] and "observed_at" not in h.posts[0] and failures
+    assert not h.state_path.exists()
     monkeypatch.setattr(feeder, "clock_synchronized", lambda: (True, "mocked"))
     posted, _n, failures = feeder.run_cycle(dict(h.env), now=at(9, 0), tz=TZ, poster=h.poster,
-                                            reader=lambda e, n, t: ([], 0), force_fetch=True)
-    assert posted and h.posts
+                                            reader=lambda e, n, t: ([feeder.Record(feeder.parse_night_date("2026-10-11"), 82)], 0),
+                                            force_fetch=True)
+    assert posted and h.posts[-1]["value"] == 82 and "observed_at" in h.posts[-1]
+
+
+def test_far_future_night_keys_are_pruned_and_tomorrows_is_kept(tmp_path):
+    h = Harness(tmp_path)
+    noon = lambda day: at(12, 0, day=day)  # noqa: E731
+    h.state_path.write_text(json.dumps({"nights": {
+        "2099-01-01": {"score": 50, "observed_at": utc(2099, 1, 1, 17, 0)},
+        "2026-10-14": {"score": 51, "observed_at": noon(14)},       # day after tomorrow
+        "2026-10-13": {"score": 52, "observed_at": noon(13)}}}),    # tomorrow
+        encoding="utf-8")
+    _p, notes, _f = h.cycle(at(9, 0), [TODAY])
+    assert set(h.state()["nights"]) == {"2026-10-12", "2026-10-13"}
+    assert any("pruned 2 night key" in line for line in notes)
 
 
 def test_the_synchronisation_flag_path_is_timesyncds():

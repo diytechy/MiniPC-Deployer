@@ -234,18 +234,55 @@ def test_the_windows_hold_with_the_timers_jitter(tmp_path):
     assert [(t - at(0, 0)) // 60 for t in asked] == [6 * 60, 8 * 60, 10 * 60, 14 * 60 + 30, 20 * 60]
 
 
-def test_a_night_that_never_arrives_is_asked_for_until_four_pm_then_left_alone(tmp_path):
+def test_a_night_that_never_arrives_is_asked_for_until_four_pm_then_once_more_at_eight(tmp_path):
     h, asked = run_day(tmp_path, at(0, 0), at(23, 30), record_from=at(23, 59))
-    assert [(t - at(0, 0)) // 60 for t in asked] == [6 * 60, 8 * 60, 10 * 60, 12 * 60, 14 * 60]
-    assert all(t < at(16, 0) for t in asked)
+    minutes = [(t - at(0, 0)) // 60 for t in asked]
+    assert minutes == [6 * 60, 8 * 60, 10 * 60, 12 * 60, 14 * 60, 20 * 60]   # the 20:00 catch-up is the one extra
+    assert not any(at(16, 0) <= t < at(20, 0) for t in asked)
+    assert not any(t > at(20, 0) for t in asked)                  # and only once, not every tick after it
     assert "observed_at" not in h.last()                         # and the 14:00 rule held all evening
 
 
-def test_nothing_before_six_and_nothing_after_sixteen_without_a_night(tmp_path):
+def test_nothing_before_six_and_nothing_between_four_and_eight(tmp_path):
     h = Harness(tmp_path)
-    for tick in (at(0, 0), at(3, 30), at(5, 59), at(16, 0), at(18, 30), at(23, 59)):
+    for tick in (at(0, 0), at(3, 30), at(5, 59), at(16, 0), at(18, 30), at(19, 59)):
         h.cycle(tick, [TODAY], gated=True)
     assert h.calls == 0
+    h.cycle(at(20, 0), [TODAY], gated=True)                      # the catch-up slot
+    assert h.calls == 1
+    h.cycle(at(20, 30), [TODAY], gated=True)
+    h.cycle(at(23, 59), [TODAY], gated=True)
+    assert h.calls == 1                                          # stored now, both slots made up
+
+
+def test_an_upload_at_1730_is_fetched_and_published_by_the_2000_slot(tmp_path):
+    h, asked = run_day(tmp_path, at(0, 0), at(23, 30), record_from=at(17, 30))
+    assert at(20, 0) in asked and not any(at(16, 0) <= t < at(20, 0) for t in asked)
+    assert asked.count(at(20, 0)) == 1 and at(20, 30) not in asked   # one fetch covers both slots
+    assert h.last()["value"] == 82 and "observed_at" in h.last()
+    assert "2026-10-12" in h.state()["published"]
+    # Stamped noon on its night-key date (it arrived after noon), never the evening fetch.
+    assert h.state()["nights"]["2026-10-12"]["observed_at"] == at(12, 0)
+
+
+def test_an_upload_at_2100_is_not_fetched_that_night_and_shows_unavailable_next_morning(tmp_path):
+    """The remaining limit (README): the night is staged by the next morning's fetch but
+    was never on the wall, so the outage rule holds until the NEW night arrives."""
+    h = Harness(tmp_path)
+    for tick in half_hour_ticks(at(0, 0), at(23, 30)):
+        h.cycle(tick, [TODAY] if tick >= at(21, 0) else [], gated=True)
+    evening_calls = h.calls
+    assert "observed_at" not in h.last()                         # nothing was published that day
+    assert "2026-10-12" not in h.state()["nights"]               # 21:00 upload never fetched
+    calls_before_morning = h.calls
+    for tick in half_hour_ticks(at(0, 0, day=13), at(9, 30, day=13)):
+        h.cycle(tick, [TODAY], gated=True)                       # only last night's record exists
+        assert "observed_at" not in h.last(), tick               # unavailable, every tick
+    assert h.calls > calls_before_morning                        # it WAS fetched (staged) in the morning
+    assert "2026-10-12" in h.state()["nights"] and h.state()["published"] == {}
+    h.cycle(at(10, 0, day=13), [TODAY, ("2026-10-12", 70)], gated=True)
+    assert h.last()["value"] == 70 and "observed_at" in h.last()   # the new night arrives
+    assert evening_calls >= 1
 
 
 def test_a_stored_night_is_corrected_once_in_the_afternoon_and_once_in_the_evening(tmp_path):

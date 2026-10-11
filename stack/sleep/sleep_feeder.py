@@ -638,6 +638,18 @@ def fetch_due(state, now, tz):
     today = schedule if schedule is not None and schedule["day"] == expected.isoformat() else None
     if expected.isoformat() not in state[NIGHTS_KEY]:
         if not FETCH_OPEN_HOUR_LOCAL <= local.hour < FETCH_CLOSE_HOUR_LOCAL:
+            # LATE-UPLOAD CATCH-UP: the 20:00 slot runs even when the night is still
+            # missing - one attempt a day, one extra sign-in on a late day - so a
+            # night uploaded between 16:00 and 20:00 is fetched and published that
+            # evening. After it (done) or before it, nothing is asked.
+            name, hour, minute = CORRECTION_SLOTS[-1]
+            done = set(today["done"]) if today is not None else set()
+            if (local.hour, local.minute) >= (hour, minute) and name not in done:
+                # Mark EVERY slot whose time has passed, as the stored branch does:
+                # one fetch covers the afternoon correction too, so the next tick
+                # (night now stored) does not ask again.
+                reached = [n for n, h, m in CORRECTION_SLOTS if (local.hour, local.minute) >= (h, m)]
+                return True, "late-upload catch-up (evening slot)", reached
             return False, "outside the 06:00-16:00 window", []
         if today is not None and now - today["attempt_at"] < MISSING_RETRY_SECONDS - SPACING_SLACK_SECONDS:
             return False, "asked recently", []

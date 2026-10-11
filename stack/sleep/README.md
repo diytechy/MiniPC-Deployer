@@ -74,13 +74,16 @@ asked **only**
 - once it **is** stored, for a **correction re-fetch** from **14:30** and another
   from **20:00** local (each at most once per local day; a missed slot is made up
   with one fetch);
+- at **20:00** local **even if the night is still missing** — one catch-up attempt a
+  day (one extra sign-in on a late day), so a night uploaded between 16:00 and
+  20:00 is fetched and published that evening;
 - on the very next tick after a **first** authentication failure (so the two-cycle
   confirmation takes about 30 minutes);
 - after a **confirmed** dead login, only when the back-off below has elapsed.
 
 A normal day is therefore about five sign-ins (06:00, 08:00, 10:00 when the night
-arrives around then, 14:30, 20:00), not 48. A night that uploads after 16:00 is not
-fetched that day (see Known limits). The windows are local wall-clock times, so
+arrives around then, 14:30, 20:00), not 48. A night that uploads after 20:00 is not
+fetched that night (see Known limits). The windows are local wall-clock times, so
 they hold on the 23- and 25-hour days; skipped ticks are *not* an outcome and never
 reset the failure count.
 
@@ -326,10 +329,13 @@ Each is accepted, with the reason.
   unknown whether myAir returns an unused night as a record or as no record. Both
   are handled (a record with a score publishes it; no record is unavailable from
   14:00), but if myAir omits unused nights the wall goes grey on them.
-- **A night that uploads after 16:00 is not fetched that day**, and a previous
-  night that was never published is not shown the next morning either. The windows
-  trade that against a day of sign-ins; the night is still staged if a later fetch
-  returns it.
+- **A night that uploads after 20:00 is not fetched that night**, so the wall is grey
+  from 14:00 until the new night arrives the next morning. The next morning's fetch
+  does stage the late night, but it was never on the wall, so the rule "before
+  14:00 only a PUBLISHED previous night stays" keeps the gauge **unavailable** until
+  today's night arrives. That rule is the outage rule and stays; the 20:00 catch-up
+  is what makes this the exception (a night uploaded 16:00–20:00 is published that
+  evening).
 - **Not run on a real hub:** the `systemd-run` `--retry-now` line, `time-sync.target`
   ordering, and the setup script's `useradd`/`systemctl` paths.
 - **Cross-clock skew is out of scope.** The feeder and NagLight share one host

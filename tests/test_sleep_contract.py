@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from test_sleep_support import Harness, feeder, local, sub, timezones, utc
+from test_sleep_support import SYNCED, Harness, feeder, local, sub, timezones, utc
 
 ZONES = timezones()
 ZONE_IDS = [name for name, _ in ZONES]
@@ -372,7 +372,7 @@ def test_restart_republishes_the_same_stamp_and_nothing_as_fresh(tz, tmp_path):
 def test_state_file_is_private_and_holds_no_credential(tz, tmp_path):
     h = Harness(tmp_path, tz)
     env = dict(h.env, MYAIR_PASSWORD="PASSWORD-SENTINEL-9913", MYAIR_EMAIL="SENTINEL-EMAIL-1")
-    h.f.run_cycle(env, now=at(tz, 10, 12, 10, 0), tz=tz, poster=h.poster,
+    h.f.run_cycle(env, now=at(tz, 10, 12, 10, 0), tz=tz, poster=h.poster, sync_check=SYNCED,
                   reader=lambda e, n, t: ([h.f.Record(h.f.parse_night_date(TODAY_START), 82)], 0))
     text = h.state_path.read_text(encoding="utf-8")
     assert "SENTINEL" not in text and "Authorization" not in text

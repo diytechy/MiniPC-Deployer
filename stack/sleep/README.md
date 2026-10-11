@@ -42,6 +42,8 @@ IF-012 (the feed contract) and the 36-hour `daily` staleness horizon.
 | The **expected night** is **today's local date** (`TIMEZONE`) | `expected_night` |
 | **Before 14:00** local, with no record for the expected night, the **previous night's** score stays and ages normally — **but only a night the feeder actually PUBLISHED** (the state file's `published` set, recorded when a score was accepted by the tracker). A night a late fetch merely staged after an outage or a dead-login period was never on the wall and is not "the score that stays". Anything older is never shown | `decide_night` |
 | **From 14:00** local, with no record for the expected night, the gauge posts **unavailable**. This also covers "the newest record is not for the expected night": an old night is never shown as last night | `decide_night` |
+| The expected night is **never first published before 06:00** local: a record found earlier is *staged* with its frozen stamp floored at 06:00 (a stamp in the future is *quarantined*, never displayed, until the clock reaches it), so the stamp lands in the right NagLight tracking day (which starts at 02:00) | `upsert_nights`, `decide_night` |
+| **Once today's night has been published, no earlier night is ever selected for display that day.** If today's record is unavailable (a same-day backwards clock step quarantined it) the gauge posts unavailable, not yesterday's score. Future-stamped observations are kept, not destroyed, and shown again when the clock passes them | `decide_night`, `validate_night_entry` |
 | The clock is **read again after the fetch**, before selecting and posting, so a cycle that starts at 13:59 and ends at 14:01 applies the 14:00 rule | `run_cycle` |
 | If the local date is **earlier than the newest published night** the clock went backwards: nothing is selected or posted and the journal says so (status only) | `clock_went_backwards` |
 | All time arithmetic goes through the zone's own offset **for the instant in question** — never `+ 24 h` — so the 23- and 25-hour days are right | `noon_epoch`, `past_grace` |
@@ -79,13 +81,40 @@ asked **only**
   20:00 is fetched and published that evening;
 - on the very next tick after a **first** authentication failure (so the two-cycle
   confirmation takes about 30 minutes);
-- after a **confirmed** dead login, only when the back-off below has elapsed.
+- after a **confirmed** dead login, only when the back-off below has elapsed, and
+  then only between **06:00 and 22:00** local (a recovery never lands at 00:30).
+
+A correction or catch-up slot is marked **done only after a read that did not
+fail**, so a transient failure at 20:00 does not consume the evening catch-up. A
+failed (non-authentication) read of a slot is retried: at most three attempts in
+all, 30 minutes apart, none started at or after 22:00. The authentication back-off
+overrides all of it. Every attempt records when myAir was last asked.
 
 A normal day is therefore about five sign-ins (06:00, 08:00, 10:00 when the night
 arrives around then, 14:30, 20:00), not 48. A night that uploads after 20:00 is not
 fetched that night (see Known limits). The windows are local wall-clock times, so
 they hold on the 23- and 25-hour days; skipped ticks are *not* an outcome and never
 reset the failure count.
+
+## Clock synchronisation
+
+Night keys, the 06:00 floor, the noon stamp and the 14:00 rule are *local dates read
+off the host clock*, and `After=time-sync.target` does not by itself mean the clock
+is set. Before anything else a cycle checks that it is synchronised, and if it
+cannot show that it **fetches nothing and posts nothing new** (a status line in the
+journal, exit non-zero):
+
+1. systemd-timesyncd's flag file `/run/systemd/timesync/synchronized` — present
+   once it has synchronised. **This is the method that applies on the hub** (Ubuntu
+   with `systemd-timesyncd`, per the image).
+2. otherwise `timedatectl show -p NTPSynchronized --value` (5 s timeout): `yes` is
+   synchronised, `no` is not.
+3. if neither is available the answer is *unknown*, which counts as not synchronised.
+
+**Not verified:** that the flag file is present on the real hub; that `timedatectl`
+works inside the unit's sandbox (it needs the system bus — it is only the fallback);
+nothing here was run on the hub. The feeder and NagLight share one host clock, so
+skew *between* clocks is out of scope.
 
 ## Knobs (`stack/.env`)
 
@@ -102,6 +131,9 @@ reset the failure count.
 | `SLEEP_STATE_FILE` | `/var/lib/homehub-sleep/sleep-state.json` | Must stay inside `StateDirectory=`. |
 | `SLEEP_TIMEOUT_SECONDS` | `30` | Per request (a cycle is five). |
 | `TIMEZONE` | `Etc/UTC` in the example | **Must be the hub's real zone** — night keys are local dates. Blank/unknown is refused. |
+
+**`MYAIR_PASSWORD` must not contain `\` or `"`** (systemd's `EnvironmentFile=` unescapes
+a backslash and strips double quotes; see Known limits (c)).
 
 `$` handling: the materialiser writes every `$` in a `.env` value as `$$`
 (compose interpolates), and systemd's `EnvironmentFile=` does **not** undo it. The
@@ -250,8 +282,11 @@ every message is this file's own words, with at most an allow-listed status word
    for the hub's address and **this feeder cannot supply a code** — by design, it
    reads nobody's mailbox.
 3. After the `.env` changes, run the feeder with **`--retry-now`**, which clears
-   the marker and asks myAir at once, outside the windows and the back-off. Under
-   the unit's account and environment:
+   the marker (and any published night key dated later than today) and asks myAir at
+   once, outside the windows and the back-off. **It refuses to run as root** (or on a
+   state file owned by another user) with a one-line reason and exit status 2, because
+   a root-owned state file could never be replaced by the unit. Under the unit's
+   account and environment:
 
    ```
    sudo systemd-run --wait --pipe --collect -p User=homehub-sleep \
@@ -336,6 +371,11 @@ Each is accepted, with the reason.
   today's night arrives. That rule is the outage rule and stays; the 20:00 catch-up
   is what makes this the exception (a night uploaded 16:00–20:00 is published that
   evening).
+- **After a multi-day outage that recovers two nights at once, the trend arrow
+  compares against the last *published* night, which may be days old, not
+  yesterday.** NagLight derives the baseline from what was last posted, and a night
+  that was never published is not a reading. This is by design and matches the
+  weight gauge's "vs last reading" behaviour.
 - **Not run on a real hub:** the `systemd-run` `--retry-now` line, `time-sync.target`
   ordering, and the setup script's `useradd`/`systemctl` paths.
 - **Cross-clock skew is out of scope.** The feeder and NagLight share one host

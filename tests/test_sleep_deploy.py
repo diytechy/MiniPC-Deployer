@@ -430,6 +430,7 @@ def test_a_full_cycle_prints_no_score_and_no_credential(monkeypatch, tmp_path, c
     monkeypatch.setenv("TIMEZONE", "Etc/UTC")
     now = int(local(feeder.dt.timezone.utc, 2026, 10, 12, 8, 0))
     monkeypatch.setattr(feeder.time, "time", lambda: now)
+    monkeypatch.setattr(feeder, "clock_synchronized", lambda: (True, "test"))
     monkeypatch.setattr(feeder, "post_gauge", lambda body, url, env, timeout: (True, "HTTP 200"))
     monkeypatch.setattr(
         feeder, "read_myair",

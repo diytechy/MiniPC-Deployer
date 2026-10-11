@@ -114,6 +114,11 @@ def local(tz, year, month, day, hour=0, minute=0):
 
 # ── One feeder cycle at a time ───────────────────────────────────────────────
 
+def SYNCED():
+    """The default `sync_check` for tests: the host clock is synchronised."""
+    return True, "test"
+
+
 class Harness(object):
     """A temp state directory, a fake poster and a scripted reader."""
 
@@ -142,7 +147,7 @@ class Harness(object):
         return False, "HTTP 500 (body not logged)"
 
     def cycle(self, now, records=None, error=None, poster=None, gated=False, clock=None,
-              retry_now=False):
+              retry_now=False, sync=None):
         """Run one cycle. `records` is [(startDate, sleepScore)], `error` an exception.
 
         By default the fetch windows are IGNORED (`force_fetch`), so the data-contract
@@ -160,7 +165,8 @@ class Harness(object):
 
         return f.run_cycle(dict(self.env), now=now, tz=self.tz, reader=reader,
                            poster=poster or self.poster, clock=clock,
-                           force_fetch=not gated, retry_now=retry_now)
+                           force_fetch=not gated, retry_now=retry_now,
+                           sync_check=sync or SYNCED)
 
     def last(self):
         return self.posts[-1]

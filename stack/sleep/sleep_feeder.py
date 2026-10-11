@@ -147,6 +147,26 @@ MISSING_RETRY_SECONDS = 120 * 60
 # demanded the full interval would round up to the next tick every time.
 SPACING_SLACK_SECONDS = 5 * 60
 CORRECTION_SLOTS = (("pm", 14, 30), ("eve", 20, 0))
+# A slot (the 14:30 / 20:00 fetches) is marked DONE only after a read that did not
+# fail. A transient (non-auth) failure may be retried: up to SLOT_MAX_ATTEMPTS
+# attempts in all (the first plus two more), SLOT_RETRY_SPACING_SECONDS apart,
+# none started at or after SLOT_RETRY_END_HOUR_LOCAL. The auth back-off overrides all.
+SLOT_MAX_ATTEMPTS = 3
+SLOT_RETRY_SPACING_SECONDS = 30 * 60
+SLOT_RETRY_END_HOUR_LOCAL = 22
+# A back-off recovery attempt (an automatic one, not --retry-now) is made only in
+# this local window, so a recovery never lands at 00:30 and never keeps a person up.
+RECOVERY_OPEN_HOUR_LOCAL = 6
+RECOVERY_CLOSE_HOUR_LOCAL = 22
+# The expected night is never FIRST published before this local hour. NagLight's
+# tracking day starts at 02:00, so a stamp frozen at 00:30 would land in
+# yesterday's tracking day. The record is staged and its stamp floored here.
+FIRST_PUBLISH_HOUR_LOCAL = 6
+# A published night key later than today + this many days is corruption or a
+# forward clock jump, and is dropped on load with a status line.
+PUBLISHED_AHEAD_DAYS = 1
+# systemd-timesyncd touches this file once the clock has been synchronised.
+SYNC_FLAG_PATH = "/run/systemd/timesync/synchronized"
 AUTH_BACKOFF_SECONDS = 6 * 3600
 AUTH_BACKOFF_LOCKED_SECONDS = 24 * 3600
 LOCKED_OUT = "LOCKED_OUT"
@@ -318,6 +338,15 @@ def rfc3339_local(epoch_seconds, tz):
     return dt.datetime.fromtimestamp(int(epoch_seconds), tz).isoformat(timespec="seconds")
 
 
+def first_publish_epoch(day, tz):
+    """Epoch seconds of FIRST_PUBLISH_HOUR_LOCAL (06:00) local on the date `day`.
+
+    Implements: SR-071, LLR-1081
+    """
+    return int(dt.datetime(day.year, day.month, day.day, FIRST_PUBLISH_HOUR_LOCAL, 0, 0,
+                           tzinfo=tz).timestamp())
+
+
 Record = namedtuple("Record", ("start_date", "score"))
 
 
@@ -399,8 +428,16 @@ def upsert_nights(nights, records, now, tz):
         name = key.isoformat()
         entry = nights.get(name)
         if entry is None:
-            nights[name] = {"score": score,
-                            "observed_at": min(noon_epoch(key, tz), int(now))}
+            stamp = min(noon_epoch(key, tz), int(now))
+            if key == today:
+                # NO FIRST PUBLICATION OF THE EXPECTED NIGHT BEFORE 06:00 local. The
+                # record is staged now, but its frozen stamp is floored at 06:00 on
+                # its own date: a stamp in the future is QUARANTINED (never
+                # displayed) until the clock reaches it, so the night is first
+                # published at 06:00 and its stamp lands in the right NagLight
+                # tracking day (which starts at 02:00).
+                stamp = max(stamp, first_publish_epoch(key, tz))
+            nights[name] = {"score": score, "observed_at": stamp}
             changed.append(name)
         elif entry["score"] != score:
             entry["score"] = score            # a correction: value only, stamp frozen
@@ -429,11 +466,21 @@ def decide_night(nights, published, now, tz):
     Implements: SR-071, LLR-1082, LLR-1083
     """
     today = expected_night(now, tz)
-    if today.isoformat() in nights:
-        return today.isoformat()
+    key = today.isoformat()
+    entry = nights.get(key)
+    if entry is not None and entry["observed_at"] <= int(now):
+        return key
+    # QUARANTINE: an entry stamped in the future is not displayed (NagLight would
+    # paint it stale). And ONCE TODAY'S NIGHT HAS BEEN PUBLISHED, NO EARLIER NIGHT
+    # IS EVER SELECTED FOR DISPLAY THAT DAY: if today's record is unavailable (a
+    # same-day backward clock step quarantined it) the answer is unavailable, not
+    # yesterday's score under today's date.
+    if key in published:
+        return None
     if not past_grace(now, tz):
         previous = (today - dt.timedelta(days=1)).isoformat()
-        if previous in nights and previous in published:
+        entry = nights.get(previous)
+        if entry is not None and previous in published and entry["observed_at"] <= int(now):
             return previous
     return None
 
@@ -473,8 +520,12 @@ def validate_night_entry(key, entry, now, tz):
     """A stored night, or None if it is not credible. Its own validator.
 
     A stamp later than 12:00 local on the night-key date would be a night that
-    looks fresher than it can be; a stamp in the future would paint grey; a
-    stamp before the block was written is corruption.
+    looks fresher than it can be; a stamp before the block was written is
+    corruption. A stamp in the FUTURE is NOT dropped: it is a real observation
+    (the host clock stepped back, or the night was staged for 06:00) and
+    destroying it could make an earlier night display in its place. It is
+    quarantined by `decide_night` - never displayed - until the clock passes it.
+    (`now` is kept in the signature for the other validators' sake.)
     """
     day = parse_night_date(key)
     if day is None or not isinstance(entry, dict):
@@ -486,7 +537,7 @@ def validate_night_entry(key, entry, now, tz):
     if isinstance(stamp, float) and not math.isfinite(stamp):
         return None
     stamp = int(stamp)
-    if stamp < EPOCH_FLOOR or stamp > int(now) + MAX_CLOCK_SKEW_SECONDS:
+    if stamp < EPOCH_FLOOR:
         return None
     if stamp > noon_epoch(day, tz):
         return None
@@ -530,18 +581,28 @@ def validate_auth_marker(entry, now):
     return marker
 
 
-def validate_published(entry, now):
-    """{night key: first-publication epoch}, dropping every entry not credible.
-    (`now` is accepted for symmetry with the other validators and unused: see below.)
+def validate_published(entry, now, tz):
+    """({night key: first-publication epoch}, dropped_future_keys).
+
+    Drops every entry not credible. A KEY later than today + PUBLISHED_AHEAD_DAYS
+    is corruption or a forward clock jump: left in, `clock_went_backwards` would
+    refuse every cycle until the calendar caught up, so it is dropped (and
+    counted, for a status line). A key of tomorrow is kept: one day back is a
+    real backwards step and must be seen.
 
     Implements: SR-071, LLR-1083
     """
-    out = {}
+    out, dropped = {}, 0
     if not isinstance(entry, dict):
-        return out
+        return out, dropped
+    ceiling = expected_night(now, tz) + dt.timedelta(days=PUBLISHED_AHEAD_DAYS)
     for key, stamp in entry.items():
-        if parse_night_date(key) is None or isinstance(stamp, bool) \
+        day = parse_night_date(key)
+        if day is None or isinstance(stamp, bool) \
                 or not isinstance(stamp, (int, float)) or not math.isfinite(stamp):
+            continue
+        if day > ceiling:
+            dropped += 1
             continue
         stamp = int(stamp)
         # NO CEILING against `now`, deliberately: if the host clock has gone
@@ -550,7 +611,7 @@ def validate_published(entry, now):
         # needs. Only a stamp from before the block existed is corruption.
         if stamp >= EPOCH_FLOOR:
             out[key] = stamp
-    return out
+    return out, dropped
 
 
 def validate_schedule(entry, now):
@@ -570,12 +631,20 @@ def validate_schedule(entry, now):
     names = [name for name, _h, _m in CORRECTION_SLOTS]
     if not isinstance(done, list) or any(d not in names for d in done):
         return None
-    return {"day": entry["day"], "attempt_at": stamp, "done": sorted(set(done))}
+    fails = {}
+    raw = entry.get("fails", {})
+    if isinstance(raw, dict):
+        for name, count in raw.items():
+            if name in names and not isinstance(count, bool) and isinstance(count, int) \
+                    and 1 <= count <= 20:
+                fails[name] = count
+    return {"day": entry["day"], "attempt_at": stamp, "done": sorted(set(done)), "fails": fails}
 
 
 def empty_state():
+    # "_notes" is transient: status lines the loader wants journalled. Never saved.
     return {NIGHTS_KEY: {}, PUBLISHED_KEY: {}, SCHEDULE_KEY: None,
-            AUTH_COUNTS_KEY: {}, AUTH_MARKER_KEY: None}
+            AUTH_COUNTS_KEY: {}, AUTH_MARKER_KEY: None, "_notes": []}
 
 
 def prune_nights(state, now, tz):
@@ -624,42 +693,120 @@ def fetch_due(state, now, tz):
 
     Implements: SR-072, LLR-1086, LLR-1090
     """
+    local = local_now(now, tz)
     marker = state[AUTH_MARKER_KEY]
     if marker is not None:
-        # CONFIRMED dead login: nothing else matters until the back-off is over.
-        if now >= marker["at"] + backoff_seconds(marker):
-            return True, "back-off elapsed", []
-        return False, "back-off in force after a confirmed sign-in failure", []
+        # CONFIRMED dead login: nothing else matters until the back-off is over,
+        # and then a recovery attempt is made only between 06:00 and 22:00 local.
+        if now < marker["at"] + backoff_seconds(marker):
+            return False, "back-off in force after a confirmed sign-in failure", []
+        if not RECOVERY_OPEN_HOUR_LOCAL <= local.hour < RECOVERY_CLOSE_HOUR_LOCAL:
+            return False, "back-off elapsed, waiting for the 06:00-22:00 recovery window", []
+        return True, "back-off elapsed", []
     if state[AUTH_COUNTS_KEY].get(SOURCE, 0) >= 1:
         return True, "confirming a sign-in failure", []
-    local = local_now(now, tz)
     expected = local.date()
     schedule = state[SCHEDULE_KEY]
     today = schedule if schedule is not None and schedule["day"] == expected.isoformat() else None
-    if expected.isoformat() not in state[NIGHTS_KEY]:
-        if not FETCH_OPEN_HOUR_LOCAL <= local.hour < FETCH_CLOSE_HOUR_LOCAL:
-            # LATE-UPLOAD CATCH-UP: the 20:00 slot runs even when the night is still
-            # missing - one attempt a day, one extra sign-in on a late day - so a
-            # night uploaded between 16:00 and 20:00 is fetched and published that
-            # evening. After it (done) or before it, nothing is asked.
-            name, hour, minute = CORRECTION_SLOTS[-1]
-            done = set(today["done"]) if today is not None else set()
-            if (local.hour, local.minute) >= (hour, minute) and name not in done:
-                # Mark EVERY slot whose time has passed, as the stored branch does:
-                # one fetch covers the afternoon correction too, so the next tick
-                # (night now stored) does not ask again.
-                reached = [n for n, h, m in CORRECTION_SLOTS if (local.hour, local.minute) >= (h, m)]
-                return True, "late-upload catch-up (evening slot)", reached
-            return False, "outside the 06:00-16:00 window", []
-        if today is not None and now - today["attempt_at"] < MISSING_RETRY_SECONDS - SPACING_SLACK_SECONDS:
-            return False, "asked recently", []
-        return True, "expected night not stored yet", []
     done = set(today["done"]) if today is not None else set()
-    slots = [name for name, hour, minute in CORRECTION_SLOTS
-             if (local.hour, local.minute) >= (hour, minute) and name not in done]
-    if slots:
-        return True, "correction re-fetch", slots
-    return False, "expected night stored, no correction due", []
+    fails = today["fails"] if today is not None else {}
+    stored = expected.isoformat() in state[NIGHTS_KEY]
+    reached = [name for name, hour, minute in CORRECTION_SLOTS
+               if (local.hour, local.minute) >= (hour, minute)]
+    if not stored:
+        if FETCH_OPEN_HOUR_LOCAL <= local.hour < FETCH_CLOSE_HOUR_LOCAL:
+            if today is not None and now - today["attempt_at"] < MISSING_RETRY_SECONDS - SPACING_SLACK_SECONDS:
+                return False, "asked recently", []
+            return True, "expected night not stored yet", []
+        # LATE-UPLOAD CATCH-UP: only the evening slot runs with the night missing -
+        # one attempt a day, one extra sign-in on a late day - so a night uploaded
+        # between 16:00 and 20:00 is fetched and published that evening. One read
+        # covers (marks) every slot already reached.
+        evening = CORRECTION_SLOTS[-1][0]
+        if evening not in reached or evening in done:
+            return False, "outside the 06:00-16:00 window", []
+        pending, marks = [evening], reached
+        reason = "late-upload catch-up (evening slot)"
+    else:
+        pending = [name for name in reached if name not in done]
+        if not pending:
+            return False, "expected night stored, no correction due", []
+        marks, reason = pending, "correction re-fetch"
+    # A slot is DONE only after a read that did not fail, so a transient failure
+    # does not consume it; it may be retried, bounded in number, spacing and hour.
+    failed = fails.get(pending[-1], 0)
+    if failed == 0:
+        return True, reason, marks
+    if failed >= SLOT_MAX_ATTEMPTS:
+        return False, "slot retries exhausted", []
+    if local.hour >= SLOT_RETRY_END_HOUR_LOCAL:
+        return False, "slot retry window (22:00) is over", []
+    if now - today["attempt_at"] < SLOT_RETRY_SPACING_SECONDS - SPACING_SLACK_SECONDS:
+        return False, "retrying a failed slot shortly", []
+    return True, "retrying a failed read", marks
+
+
+def clock_synchronized(exists=None, runner=None):
+    """(True|False|None, method): has the host clock been synchronised?
+
+    Night keys, the noon stamp and the 14:00 rule are LOCAL dates read off the
+    host clock, and `After=time-sync.target` alone does not mean the clock is set.
+    Two signals, stdlib only:
+      1. systemd-timesyncd's flag file (`SYNC_FLAG_PATH`) - present once it has
+         synchronised. This is what the hub (Ubuntu, systemd-timesyncd) provides.
+      2. otherwise `timedatectl show -p NTPSynchronized --value` (5 s timeout):
+         `yes` is synchronised, `no` is not.
+    If neither is available the answer is None ("unknown"), which the cycle treats
+    as NOT synchronised: it fetches nothing and posts nothing new.
+    `exists` and `runner` are injectable for the tests.
+
+    Implements: SR-071, LLR-1084
+    """
+    exists = exists or os.path.exists
+    runner = runner or subprocess.run
+    if exists(SYNC_FLAG_PATH):
+        return True, "systemd-timesyncd flag file"
+    try:
+        out = runner(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                     capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None, "no synchronisation signal available"
+    if out.returncode != 0:
+        return None, "timedatectl could not answer"
+    answer = (out.stdout or "").strip().lower()
+    if answer == "yes":
+        return True, "timedatectl NTPSynchronized=yes"
+    if answer == "no":
+        return False, "timedatectl NTPSynchronized=no"
+    return None, "timedatectl gave an unreadable answer"
+
+
+def retry_now_refusal(state_path, uid=None, owner_of=None):
+    """A one-line reason `--retry-now` must not run, or None.
+
+    It must run as the SERVICE account: as root it would write a root-owned state
+    file the unit (User=homehub-sleep) can then never replace. Refused when the
+    effective uid is 0, or when the state file exists and belongs to someone else.
+    (No geteuid on Windows: the dev PC has no such account to protect.)
+    """
+    if uid is None:
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is None:
+            return None
+        uid = geteuid()
+    if uid == 0:
+        return ("--retry-now must not run as root: it would leave a root-owned state file "
+                "the service account cannot replace; run it as the service account "
+                "(see the README systemd-run line)")
+    owner_of = owner_of or (lambda path: os.stat(path).st_uid)
+    try:
+        owner = owner_of(state_path)
+    except OSError:
+        return None
+    if owner != uid:
+        return ("--retry-now refused: the state file is owned by another user; run it as "
+                "the account that owns it (see the README systemd-run line)")
+    return None
 
 
 # ── Configuration (pure: reads the env dict it is given) ────────────────────
@@ -951,7 +1098,10 @@ def load_state(state_path, now, tz):
             checked = validate_night_entry(key, entry, now, tz)
             if checked is not None:
                 state[NIGHTS_KEY][key] = checked
-    state[PUBLISHED_KEY] = validate_published(data.get(PUBLISHED_KEY), now)
+    state[PUBLISHED_KEY], dropped = validate_published(data.get(PUBLISHED_KEY), now, tz)
+    if dropped:
+        state["_notes"].append("ignored %d published night key(s) dated later than tomorrow "
+                               "(corrupt state or a forward clock jump)" % dropped)
     state[SCHEDULE_KEY] = validate_schedule(data.get(SCHEDULE_KEY), now)
     state[AUTH_COUNTS_KEY] = validate_auth_counts(data.get(AUTH_COUNTS_KEY))
     state[AUTH_MARKER_KEY] = validate_auth_marker(data.get(AUTH_MARKER_KEY), now)
@@ -1403,7 +1553,7 @@ def read_myair(env, now, tz, endpoints=NA_ENDPOINTS):
 # ── The cycle ───────────────────────────────────────────────────────────────
 
 def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
-              force_fetch=False, retry_now=False):
+              force_fetch=False, retry_now=False, sync_check=None):
     """One feeder cycle: maybe read, fold into the nights, decide, post one gauge.
 
     Contract:
@@ -1413,8 +1563,11 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
                `clock()` returns the current epoch seconds and is read AGAIN
                after the fetch (default: `time.time`, or the injected `now`);
                `force_fetch` ignores the fetch windows (never the back-off);
-               `retry_now` clears a confirmed sign-in failure first and then
-               forces a fetch (the operator re-signed; see README).
+               `retry_now` clears a confirmed sign-in failure (and any published
+               key dated later than today) first and then forces a fetch (the
+               operator re-signed; see README);
+               `sync_check()` returns (True|False|None, method) for "is the host
+               clock synchronised" (default: `clock_synchronized`).
       Outputs: (posted, notes, failures):
                  posted   - [(night_key_or_None, ok)]: exactly one entry, or none
                             when the clock went backwards and nothing was posted;
@@ -1423,6 +1576,8 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
                  failures - lines for stderr; non-empty makes the unit exit 1.
 
     THE ORDER IS THE CONTRACT:
+      00. refuse to do anything unless the host clock is synchronised (fetch
+         nothing, post nothing new, log status);
       0. refuse to do anything if the local date is earlier than the newest
          published night (the clock went backwards);
       1. decide whether myAir may be asked THIS tick (`fetch_due`): the timer
@@ -1454,7 +1609,24 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
     feed_url = env["_feed_url"]
     notes, failures = [], []
 
+    synced, method = (sync_check or clock_synchronized)()
+    if synced is not True:
+        return [], notes, ["the host clock is not known to be synchronised (%s) - nothing "
+                           "fetched, nothing posted" % method]
+
     state = load_state(state_path, start, tz)
+    notes.extend(state.pop("_notes"))
+    if retry_now:
+        # An operator's way out of a wedge: a published key dated later than today
+        # (a forward clock jump that was later corrected) would make
+        # `clock_went_backwards` refuse every cycle until the calendar caught up.
+        today_date = expected_night(start, tz)
+        stale = [k for k in state[PUBLISHED_KEY] if parse_night_date(k) > today_date]
+        for key in stale:
+            del state[PUBLISHED_KEY][key]
+        if stale:
+            notes.append("retry-now: cleared %d published night key(s) dated later than today"
+                         % len(stale))
     backwards = ("the clock appears to have gone backwards (the local date is earlier than "
                  "the newest published night) - nothing selected, nothing posted")
     if clock_went_backwards(state, start, tz):
@@ -1474,8 +1646,13 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
     if due:
         schedule = state[SCHEDULE_KEY]
         day = expected_night(start, tz).isoformat()
-        done = set(schedule["done"]) if schedule is not None and schedule["day"] == day else set()
-        state[SCHEDULE_KEY] = {"day": day, "attempt_at": start, "done": sorted(done | set(slots))}
+        prior = schedule if schedule is not None and schedule["day"] == day else None
+        # `attempt_at` is recorded for EVERY attempt; the slots are marked done
+        # only after a read that did not fail (below), so a transient failure at
+        # 20:00 does not consume the evening catch-up.
+        state[SCHEDULE_KEY] = {"day": day, "attempt_at": start,
+                               "done": list(prior["done"]) if prior else [],
+                               "fails": dict(prior["fails"]) if prior else {}}
         try:
             records, unreadable = reader(env, start, tz)
         except MfaRequired as exc:
@@ -1494,6 +1671,14 @@ def run_cycle(env, now=None, tz=None, reader=None, poster=None, clock=None,
     if clock_went_backwards(state, now, tz):
         return [], notes, failures + [backwards]
     expected = expected_night(now, tz).isoformat()
+
+    if due and slots:
+        schedule = state[SCHEDULE_KEY]
+        if records is not None:
+            schedule["done"] = sorted(set(schedule["done"]) | set(slots))
+            schedule["fails"] = {}
+        elif auth_error is None:
+            schedule["fails"][slots[-1]] = schedule["fails"].get(slots[-1], 0) + 1
 
     # ── Authentication bookkeeping (plan 3.6 G2), only if myAir was asked ────
     if due:
@@ -1590,6 +1775,11 @@ def main(argv=None):
     if not resolve_publish(env):
         print("sleep: SLEEP_PUBLISH is off - nothing read, nothing posted.")
         return 0
+    if "--retry-now" in argv:
+        reason = retry_now_refusal(resolve_state_path(env))
+        if reason:
+            print("sleep: REFUSED: %s" % reason, file=sys.stderr)
+            return 2
     _posted, notes, failures = run_cycle(env, retry_now="--retry-now" in argv)
     for line in notes:
         print("sleep: %s" % line)

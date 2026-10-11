@@ -34,7 +34,7 @@ import pytest
 
 from conftest import loopback_server
 from test_sleep_support import (
-    ACCESS_TOKEN, CENTRAL, DEVICE_COOKIE, FakeMyAir, Harness, feeder, local, serve_myair, utc)
+    ACCESS_TOKEN, SYNCED, CENTRAL, DEVICE_COOKIE, FakeMyAir, Harness, feeder, local, serve_myair, utc)
 
 TZ = CENTRAL
 NOW = local(TZ, 2026, 10, 12, 10, 30)
@@ -507,7 +507,7 @@ def test_the_remotes_own_words_never_reach_the_journal(capsys):
             h = Harness(Path(tmp))
             env = dict(h.env, MYAIR_EMAIL="a@example.invalid", MYAIR_PASSWORD="PASSWORD-SENTINEL")  # privacy-ok: placeholder
             _p, notes, failures = h.f.run_cycle(
-                env, now=NOW, tz=TZ, poster=h.poster,
+                env, now=NOW, tz=TZ, poster=h.poster, sync_check=SYNCED,
                 reader=lambda e, n, t: h.f.read_myair(e, n, t, endpoints=fake.endpoints(base)))
         text = "\n".join(notes + failures)
         assert SENTINEL not in text and "PASSWORD-SENTINEL" not in text
@@ -536,7 +536,7 @@ def test_a_real_run_against_loopback_okta_and_a_loopback_tracker_posts_the_right
                "STATE_DIRECTORY": str(state), "_identity": "household-member-1", "_feed_url": feed + "/api/feed",
                "_tz": feeder.dt.timezone.utc}
         posted, notes, failures = feeder.run_cycle(
-            env, now=utc(2026, 10, 12, 10, 30), tz=env["_tz"],
+            env, now=utc(2026, 10, 12, 10, 30), tz=env["_tz"], sync_check=SYNCED,
             reader=lambda e, n, t: feeder.read_myair(e, n, t, endpoints=fake.endpoints(base)))
     assert failures == [] and fake.problems == []
     assert posted == [("2026-10-12", True)]

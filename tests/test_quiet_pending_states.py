@@ -694,3 +694,87 @@ def test_real_symlinks_in_wsl_dangling_ancestor_fails_missing_parent_is_pending(
     assert "DANGLING-PARENT absent=False" in out, out
     assert "MISSING-PARENT absent=True" in out, out
     assert "MISSING-FILE absent=True" in out, out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 4 - the gate runs UNSANDBOXED (`+`): a sandbox fault must stay loud
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_every_gate_is_prefixed_with_plus():
+    for unit, _ in KEEPERS:
+        for gate in _exec_conditions((ti.USAGE_DIR / unit).read_text(encoding="utf-8")):
+            assert gate.startswith("+/bin/sh -c "), gate
+    setup = ti.SETUP_USAGE.read_text(encoding="utf-8")
+    assert "KEEPER_GATE='ExecCondition=+/bin/sh -c " in setup
+
+
+SANDBOX_MATRIX = r"""set -u
+U=w7keeper
+useradd -m -s /bin/bash $U 2>/dev/null || true
+H=$(getent passwd $U | cut -d: -f6)
+SD=/run/systemd/system
+M=$(mktemp -d -p /srv); chown $U:$U $M; chmod 755 $M      # NOT /tmp: the unit has PrivateTmp=yes
+mkdir -p $M/bin; printf '#!/bin/sh\n' > $M/bin/claude; chmod 755 $M/bin/claude
+cleanup() {
+  for i in $(seq 1 10); do systemctl stop w7case-$i.service >/dev/null 2>&1; rm -rf $SD/w7case-$i.service $SD/w7case-$i.service.d; done
+  systemctl daemon-reload; userdel -r $U >/dev/null 2>&1; rm -rf "$M"
+}
+trap cleanup EXIT
+reset() {
+  rm -rf $H/.claude $H/.claude.json $M/ran
+  mkdir $H/.claude; echo '{}' > $H/.claude/.credentials.json; echo '{}' > $H/.claude.json
+  chown -R $U:$U $H/.claude $H/.claude.json; chmod 700 $H/.claude
+}
+n=0
+case_run() {   # name cli
+  n=$((n+1))
+  sed -e "s|@@CLI@@|$2|g" -e "s|@@HOME@@|$H|g" -e "s|@@MARK@@|$M|g" @@DIR@@/w7-unit.txt > $SD/w7case-$n.service
+  mkdir -p $SD/w7case-$n.service.d
+  sed -e "s|@@HOME@@|$H|g" -e "s|@@MARK@@|$M|g" @@DIR@@/w7-drop.txt > $SD/w7case-$n.service.d/10-account.conf
+  systemctl daemon-reload
+  systemctl start w7case-$n.service >/dev/null 2>&1
+  ran=0; [ -e $M/ran ] && ran=1
+  echo "CASE $1 ran=$ran state=$(systemctl is-failed w7case-$n.service 2>/dev/null)"
+}
+reset;                                              case_run both          $M/bin/claude
+reset;                                              case_run cli_absent    $M/bin/not-installed
+reset; rm $H/.claude/.credentials.json;             case_run cred_absent   $M/bin/claude
+reset; rm $H/.claude.json;                          case_run json_missing  $M/bin/claude
+reset; chown root:root $H/.claude;                  case_run dir_unreadable $M/bin/claude
+"""
+
+
+def test_real_systemd_with_the_shipped_sandbox_a_real_user_and_the_real_read_write_paths(tmp_path):
+    """The shipped claude unit (User=, ProtectSystem=strict, ReadWritePaths=, ...) as a
+    real unit on the real PID 1: only a genuinely absent CLI or login is skipped; a
+    sandbox fault or an unreadable credential directory RUNS and FAILS LOUDLY."""
+    unit = (ti.USAGE_DIR / "homehub-claude-refresh@.service").read_text(encoding="utf-8")
+    lines = unit.splitlines()
+    exec_start = [i for i, l in enumerate(lines) if l.startswith("ExecStart=")]
+    assert len(exec_start) == 1
+    lines[exec_start[0]] = ("ExecStart=/bin/sh -c 'cat @@HOME@@/.claude/.credentials.json >/dev/null "
+                            "&& echo ran > @@MARK@@/ran'")
+    unit = "\n".join(lines).replace("/usr/local/bin/claude", "@@CLI@@") + "\n"
+    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude", "AI_USAGE_USER_ACCOUNT=alice"])
+    assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
+    drop = (box.units / "homehub-claude-refresh@claude.service.d" / "10-account.conf").read_text(encoding="utf-8")
+    drop = drop.replace("/home/alice", "@@HOME@@").replace("User=alice", "User=w7keeper") \
+               .replace("Group=alice", "Group=w7keeper").rstrip("\n") + "\nReadWritePaths=@@MARK@@\n"
+    with open(str(tmp_path / "w7-unit.txt"), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(unit)
+    with open(str(tmp_path / "w7-drop.txt"), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(drop)
+    done = ti._wsl_root(SANDBOX_MATRIX, tmp_path)
+    if "Failed to connect to bus" in done.stderr or "System has not been booted" in done.stderr:
+        pytest.skip("WSL has no running systemd")
+    rows = {m[0]: (m[1], m[2]) for m in re.findall(r"CASE (\w+) ran=(\d) state=(\w+)", done.stdout)}
+    assert set(rows) == {"both", "cli_absent", "cred_absent", "json_missing", "dir_unreadable"}, (done.stdout, done.stderr)
+    assert rows["both"][0] == "1" and rows["both"][1] != "failed", rows
+    for skipped in ("cli_absent", "cred_absent"):                      # genuinely absent: quiet
+        assert rows[skipped][0] == "0" and rows[skipped][1] != "failed", (skipped, rows)
+    # A missing ~/.claude.json (a ReadWritePaths= target) must NOT turn into a quiet skip:
+    # the target is `-`-prefixed, so the gate passes and the keeper RUNS.
+    assert rows["json_missing"][0] == "1", rows
+    # A credential behind a directory the service user cannot enter reads as "there" (the
+    # gate is `+`, i.e. root): the keeper runs as the user and FAILS loudly.
+    assert rows["dir_unreadable"] == ("0", "failed"), rows

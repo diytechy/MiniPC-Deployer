@@ -365,11 +365,11 @@ def test_both_enabled_with_different_names_use_one_account_everywhere_llr1113(tm
     assert users == {"alice"}
     home = "/home/alice"
     claude = (box.units / "homehub-claude-refresh@claude.service.d" / "10-account.conf").read_text(encoding="utf-8")
-    assert "ReadWritePaths=%s/.claude %s/.claude.json" % (home, home) in claude
+    assert "ReadWritePaths=-%s/.claude -%s/.claude.json" % (home, home) in claude
     claude2 = (box.units / "homehub-claude-refresh@claude2.service.d" / "10-account.conf").read_text(encoding="utf-8")
     assert "CLAUDE_CONFIG_DIR=%s/.claude-2" % home in claude2
     gemini = (box.units / "homehub-gemini-refresh.service.d" / "10-account.conf").read_text(encoding="utf-8")
-    assert "ReadWritePaths=%s/.gemini" % home in gemini
+    assert "ReadWritePaths=-%s/.gemini" % home in gemini
     # Ownership of the always-created Codex home goes to the effective account.
     owners = [c for c in box.calls if c.startswith("install ") and "homehub-ai-codex" in c]
     assert owners and all("-o alice -g alice" in c for c in owners), owners

@@ -219,10 +219,20 @@ REFRESH_HOME="$(getent passwd "$ACCOUNT" | cut -d: -f6)"
 [ -n "$REFRESH_HOME" ] || refuse     "cannot resolve the home directory of $ACCOUNT, so the
     credential refresher has no path to re-open for writing."
 
+# THE `-` ON EVERY ReadWritePaths= HERE IS LOAD-BEARING (measured on systemd 255): the
+# unit's sandbox is also built for ExecCondition=, and a ReadWritePaths= target that does
+# not exist fails that setup with 226/NAMESPACE, which systemd then reports as a clean
+# SKIP of the whole run - a real fault gone quiet. `-` makes a missing target ignorable,
+# so only the gate itself decides to skip. (The `+` prefix on the gate does NOT lift the
+# sandbox for it - it only lifts User=, which is what lets the gate see a credential
+# behind a directory the service user cannot enter.) Setup therefore creates none of
+# these paths for account 1, and never an empty ~/.claude.json: the CLI's own sign-in
+# makes ~/.claude and ~/.claude.json, and an empty/invalid config could be treated as
+# corrupt by the CLI. A credential file is never created or overwritten here.
 # The credential gate each keeper's drop-in ADDS (see the unit files): an ExecCondition
 # that exits 1 when nothing at all is at the path. `$$1` is systemd's escape for a
 # literal `$1`. Stored in a variable so no heredoc re-expands it.
-KEEPER_GATE='ExecCondition=/bin/sh -c '\''[ -e "$$1" ] || [ -L "$$1" ]'\'' gate'
+KEEPER_GATE='ExecCondition=+/bin/sh -c '\''[ -e "$$1" ] || [ -L "$$1" ]'\'' gate'
 
 # Account 1: the CLI's DEFAULT config, exactly the two paths the un-templated
 # unit always granted. `claude` is the instance name AND the reader name.
@@ -237,7 +247,7 @@ cat > "$CLAUDE1_DROPIN_DIR/10-account.conf" <<EOF
 [Service]
 User=$ACCOUNT
 Group=$ACCOUNT
-ReadWritePaths=$REFRESH_HOME/.claude $REFRESH_HOME/.claude.json
+ReadWritePaths=-$REFRESH_HOME/.claude -$REFRESH_HOME/.claude.json
 $KEEPER_GATE $REFRESH_HOME/.claude/.credentials.json
 EOF
 chmod 0644 "$CLAUDE1_DROPIN_DIR/10-account.conf"
@@ -260,7 +270,7 @@ if source_enabled claude2; then
 User=$ACCOUNT
 Group=$ACCOUNT
 Environment=CLAUDE_CONFIG_DIR=$CLAUDE2_CONFIG_DIR
-ReadWritePaths=$CLAUDE2_CONFIG_DIR
+ReadWritePaths=-$CLAUDE2_CONFIG_DIR
 $KEEPER_GATE $CLAUDE2_CONFIG_DIR/.credentials.json
 EOF
     chmod 0644 "$CLAUDE2_DROPIN_DIR/10-account.conf"
@@ -277,7 +287,7 @@ if source_enabled gemini; then
 [Service]
 User=$ACCOUNT
 Group=$ACCOUNT
-ReadWritePaths=$REFRESH_HOME/.gemini
+ReadWritePaths=-$REFRESH_HOME/.gemini
 $KEEPER_GATE $REFRESH_HOME/.gemini/oauth_creds.json
 EOF
     chmod 0644 "$GEMINI_DROPIN_DIR/10-account.conf"

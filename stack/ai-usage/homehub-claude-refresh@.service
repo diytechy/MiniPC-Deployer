@@ -76,6 +76,12 @@ After=network-online.target
 # from ExecCondition= SKIPS the run and the unit is not marked failed. A dangling link
 # or a non-executable file is "there", so the gate passes and the start fails loudly.
 # The per-account drop-in adds the same gate for the credential - "login owed".
+# The `+` prefix (systemd.service(5), "Command lines": full privileges, User= not applied)
+# lets the gate, running as root, see a credential behind a directory the service user
+# cannot enter: that reads "there", so the keeper runs and fails loudly instead of
+# skipping. It does NOT lift the sandbox for the gate (measured on systemd 255): the
+# drop-in's ReadWritePaths= entries are therefore all `-`-prefixed, so a missing target
+# can never turn into a quiet skip (226/NAMESPACE from ExecCondition= counts as a skip).
 Wants=network-online.target
 
 [Service]
@@ -126,7 +132,7 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # the journal would write a usage history nobody asked for into the system log.
 # The gauges are where those numbers belong. Failures still surface: a non-zero
 # exit is recorded by systemd, and `systemctl status` names it.
-ExecCondition=/bin/sh -c '[ -e "$$1" ] || [ -L "$$1" ]' gate /usr/local/bin/claude
+ExecCondition=+/bin/sh -c '[ -e "$$1" ] || [ -L "$$1" ]' gate /usr/local/bin/claude
 ExecStart=/bin/sh -c 'cd "$HOME" && exec claude -p "/usage" >/dev/null 2>&1'
 
 # A refresh that fails is not an emergency: the token is still valid until its

@@ -330,7 +330,7 @@ def test_setup_installs_account_one_exactly_as_the_old_unit_did_sr067(tmp_path):
     dropin = (units / "homehub-claude-refresh@claude.service.d" / "10-account.conf").read_text(encoding="utf-8")
     assert "User=homehub-ai" in dropin and "Group=homehub-ai" in dropin
     # THE SAME TWO PATHS the un-templated unit granted, from the account's real home.
-    assert "ReadWritePaths=/home/homehub-ai/.claude /home/homehub-ai/.claude.json" in dropin
+    assert "ReadWritePaths=-/home/homehub-ai/.claude -/home/homehub-ai/.claude.json" in dropin
     assert "CLAUDE_CONFIG_DIR" not in dropin, "account 1 uses the CLI's default config"
     assert "enable --now homehub-claude-refresh@claude.timer" in calls
     # Nothing opt-in leaks onto a box that did not ask for it.
@@ -423,7 +423,7 @@ def test_setup_gives_account_two_only_its_own_directory_sr067(tmp_path):
     two = (units / "homehub-claude-refresh@claude2.service.d" / "10-account.conf").read_text(encoding="utf-8")
     assert "Environment=CLAUDE_CONFIG_DIR=/home/homehub-ai/.claude-2" in two
     rw = [l for l in two.splitlines() if l.startswith("ReadWritePaths=")]
-    assert rw == ["ReadWritePaths=/home/homehub-ai/.claude-2"], rw
+    assert rw == ["ReadWritePaths=-/home/homehub-ai/.claude-2"], rw
     # Whatever the hub's CLI build does with .claude.json, account 2's instance is
     # NEVER granted account 1's copy (the placement was measured on Windows only).
     assert "/.claude.json" not in two
@@ -432,7 +432,7 @@ def test_setup_gives_account_two_only_its_own_directory_sr067(tmp_path):
     assert "enable --now homehub-claude-refresh@claude2.timer" in calls
     assert "enable --now homehub-gemini-refresh.timer" in calls
     gem = (units / "homehub-gemini-refresh.service.d" / "10-account.conf").read_text(encoding="utf-8")
-    assert "ReadWritePaths=/home/homehub-ai/.gemini" in gem
+    assert "ReadWritePaths=-/home/homehub-ai/.gemini" in gem
     # The operator is told the right sign-in command for every source.
     assert "claude auth login" in done.stdout
     assert "CLAUDE_CONFIG_DIR=/home/homehub-ai/.claude-2" in done.stdout

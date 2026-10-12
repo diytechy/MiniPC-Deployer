@@ -139,9 +139,11 @@ skew *between* clocks is out of scope.
 | `SLEEP_TIMEOUT_SECONDS` | `30` | Per request (a cycle is five). |
 | `TIMEZONE` | `Etc/UTC` in the example | **Must be the hub's real zone** — night keys are local dates. Blank/unknown is refused. |
 
-**`MYAIR_PASSWORD` must not contain `\` or `"`, and must not START with `'` or `"`**
-(systemd's `EnvironmentFile=` unescapes a backslash, strips double quotes and drops a
-leading quote; an apostrophe *inside* or at the *end* is fine - see Known limits (c)).
+**`MYAIR_PASSWORD` must not contain `\` or `"`, and a password that is not
+whitespace-containing must not START with `'`** (systemd's `EnvironmentFile=`
+unescapes a backslash, strips double quotes and drops a bare leading quote; an
+apostrophe inside, at the end, or anywhere in a password that contains spaces - which
+the materialiser wraps in double quotes - is fine; see Known limits (c)).
 
 `$` handling: the materialiser writes every `$` in a `.env` value as `$$`
 (compose interpolates), and systemd's `EnvironmentFile=` does **not** undo it. The
@@ -408,10 +410,15 @@ Nothing here restarts a container; the feeder is a host systemd unit.
 
    `SLEEP_FEED_URL` is the loopback tracker URL, the same value the weight and AI
    feeders use (the tracker publishes `127.0.0.1:8787:8787`). The password must not
-   contain `\` or `"` or start with `'` or `"`; the helper refuses such a value, and
-   refuses any value that starts with a quote with no matching closing quote. An
-   apostrophe inside the password or at its end is allowed (measured, see Known
-   limits (c)). All three parsers - the helper, `setup-sleep.sh` and first boot -
+   contain `\` or `"`. The materialiser wraps a password that contains whitespace in
+   double quotes (`MYAIR_PASSWORD="two words"`); that is normal and the helper
+   accepts it, because it parses the surrounding quotes first (as systemd does) and
+   applies these rules to the **decoded** value. It refuses a decoded value with a
+   backslash or double quote, any value starting with a quote that has no matching
+   closing quote, and any other wrapped form (single-quoted, or double-quoted
+   without whitespace), which the materialiser never emits and systemd would alter
+   or which is ambiguous. An apostrophe anywhere in the decoded value is allowed
+   (measured, see Known limits (c)). All three parsers - the helper, `setup-sleep.sh` and first boot -
    strip exactly one matching pair of surrounding quotes and nothing else.
 5. **Hub: verify the effective values before installing.**
    `sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --report` prints, for
@@ -510,7 +517,12 @@ Each is accepted, with the reason.
   `pa'ss'word` arrive unchanged; a value that **starts** with `'` loses that quote
   even with no closing one (`'pass` becomes `pass`), and `'pass'` becomes `pass`;
   `''` is empty. So an apostrophe is safe anywhere except as the first character,
-  which the helper refuses. Other systemd versions were not measured.
+  which the helper refuses. **Double-quoted with whitespace** (what the materialiser
+  emits for a password containing spaces), same method: `"a b"`, `"  a b  "`,
+  `"a b'c"`, `"'a b"`, `"a b'"`, `"a#b c"`, `"a;b c"`, `"a=b c"` and `"a b$$c"` all
+  arrive as the text inside the quotes, intact; `"a "b" c"` and `"a b"c` are altered;
+  `'a'b'` becomes `ab'`; `\"` is an escape. `#`, `$`, `=` and `;` inside a value are
+  literal. Other systemd versions were not measured.
   The current password has none of these (verified). A `$` is safe: the feeder collapses the
   materialiser's `$$`.
 - **(d) The unused-night shape is unproven.** Every probed night had usage, so it is

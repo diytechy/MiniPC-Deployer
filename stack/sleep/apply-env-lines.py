@@ -86,6 +86,39 @@ def unquote(value):
     return value
 
 
+def credential_problem(raw):
+    """Why systemd's EnvironmentFile would NOT deliver this credential intact, or None.
+
+    The RAW env value is parsed first, the way systemd does: one matched pair of
+    surrounding quotes is syntax (the materialiser wraps a password containing
+    whitespace in double quotes, so `"two words"` is normal and arrives as
+    `two words`). The credential rules then apply to the DECODED value:
+      * no backslash (systemd unescapes it: `\\"` becomes `"`);
+      * no double quote inside the decoded value (it ends or garbles a quoted value);
+      * no inner copy of the wrapping quote (`'a'b'` arrives as `ab'`).
+    A leading quote in the DECODED value is fine when the raw value is wrapped
+    (`"'a b"` arrives intact on systemd 255); an UNWRAPPED value starting with a
+    quote is the unmatched case, refused before this is called.
+    """
+    wrapped = len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'"
+    decoded = raw[1:-1] if wrapped else raw
+    if not wrapped and raw[:1] in ("'", '"'):
+        return "starts with a quote that has no matching closing quote (systemd drops it)"
+    if "\\" in decoded:
+        return "the decoded value contains a backslash (systemd would unescape it)"
+    if '"' in decoded:
+        return "the decoded value contains a double quote (systemd would alter it)"
+    if wrapped and raw[0] in decoded:
+        return "the decoded value contains its own wrapping quote"
+    if wrapped and not (raw[0] == '"' and any(c.isspace() for c in decoded)):
+        # The materialiser wraps in DOUBLE quotes, and only when the plaintext has
+        # whitespace. Any other wrapped form is either not its output or a plaintext
+        # that merely starts and ends with a quote, which systemd would silently strip.
+        return "a quoted value is only accepted as the materialiser's double-quoted " \
+               "whitespace form; this one would be altered or is ambiguous"
+    return None
+
+
 def parse_incoming(raw):
     """[(key, line)] from stdin BYTES; refuses anything unexpected, echoing no value."""
     if raw.startswith(b"\xef\xbb\xbf"):
@@ -108,10 +141,11 @@ def parse_incoming(raw):
             # systemd drops a LEADING quote even with no closing one, setup-sleep.sh and
             # firstboot require a matching pair: refuse the ambiguity rather than store it.
             refuse("%s starts with a quote that has no matching closing quote" % key)
-        if key == "MYAIR_PASSWORD" and (stripped[:1] in ("'", '"') or "\\" in value or '"' in value):
-            refuse("MYAIR_PASSWORD must not start with a quote or contain a backslash or a "
-                   "double quote (systemd's EnvironmentFile would alter it)")
-        if key in REQUIRED and not unquote(value):
+        if key == "MYAIR_PASSWORD":
+            problem = credential_problem(stripped)
+            if problem:
+                refuse("MYAIR_PASSWORD: " + problem)
+        if key in REQUIRED and not unquote(value).strip():
             refuse("%s has a blank value; applying it would replace a good hub value "
                    "(import the missing secret and re-materialise first)" % key)
         if key.endswith("_ENABLED") or key == "SLEEP_PUBLISH":

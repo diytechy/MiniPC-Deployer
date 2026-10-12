@@ -636,3 +636,102 @@ def test_password_characters_systemd_would_alter_are_refused(tmp_path, monkeypat
     assert (rc == 0) is ok
     assert (("MYAIR_PASSWORD=" + password + "\n") in text) is ok
     assert password not in out
+
+
+# ── Round 5 : the materialiser's own quoting must be accepted ────────────────────
+
+MATERIALIZER = REPO.parent / "HomeHub" / "scripts" / "deploy" / "Materialize-Deploy.ps1"
+QUOTING_LINE = "if ($plain -match '\\s') { $plain = '\"' + $plain + '\"' }"
+
+
+def materialiser_emit(plaintext):
+    """The materialiser's QUOTING RULE for a store value: wrap in double quotes when
+    the plaintext contains whitespace; otherwise emit it raw. Pinned to the real source
+    by test_the_quoting_rule_modelled_here_is_the_materialisers."""
+    return '"' + plaintext + '"' if re.search(r"\s", plaintext) else plaintext
+
+
+def test_the_quoting_rule_modelled_here_is_the_materialisers():
+    if not MATERIALIZER.exists():
+        pytest.skip("no sibling HomeHub checkout")
+    source = MATERIALIZER.read_text(encoding="utf-8-sig")
+    assert QUOTING_LINE in source, "the materialiser's quoting rule changed: update materialiser_emit"
+
+
+# What systemd 255 delivers intact, measured with fake values (see the README, Known limits (c)).
+def systemd_delivers_intact(plaintext):
+    if "\\" in plaintext or '"' in plaintext:
+        return False
+    if re.search(r"\s", plaintext):
+        return True                            # emitted double-quoted: inner apostrophes survive
+    return plaintext[:1] not in ("'",) and plaintext != ""    # raw: a leading quote is dropped
+
+
+CORPUS = [
+    "synthetic passphrase", "two  spaces  here", " leading space", "trailing space ", "tab\tinside",
+    "it's a pass phrase", "'quoted start with space", "ends with a quote' x'", "has # hash and spaces",
+    "has#hash", "pa'ss", "pass'", "pa'ss'word", "pa$$word", "semi;colon and space", "eq=ual and space",
+    "p@ss w0rd!", "unicode café € word", "'leading", "'both'", "pa\"ss", "with \"quote\" and space",
+    "back\\slash", "back\\slash and space", "plain", "a'b c'd",
+]
+
+
+@pytest.mark.parametrize("plaintext", CORPUS)
+def test_whatever_the_materialiser_emits_for_a_deliverable_password_is_accepted(
+        tmp_path, monkeypatch, capsys, plaintext):
+    emitted = materialiser_emit(plaintext)
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS,
+                                  ("MYAIR_PASSWORD=" + emitted + "\n").encode("utf-8"))
+    deliverable = systemd_delivers_intact(plaintext)
+    assert (rc == 0) is deliverable, (plaintext, out)
+    assert (("MYAIR_PASSWORD=" + emitted + "\n") in text) is deliverable      # written exactly as emitted
+    assert plaintext not in out
+
+
+def test_the_documented_example_with_spaces_applies_and_reports_set(tmp_path, monkeypatch, capsys):
+    line = "MYAIR_PASSWORD=" + materialiser_emit("synthetic passphrase") + "\n"
+    assert line == 'MYAIR_PASSWORD="synthetic passphrase"\n'
+    rc, _o, text, _e = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, line)
+    assert rc == 0 and line in text
+    rc, out, _t, _e = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD.replace(
+        "MYAIR_PASSWORD=" + SECRET, line.strip()) + "HEART_ENABLED=0\n")
+    assert rc == 0 and re.search(r"(?m)^MYAIR_PASSWORD\s+set$", out) and "passphrase" not in out
+
+
+@pytest.mark.parametrize("raw", ["'a b'", "'a'b'", "\"a'b\"", "'abc'", '"abc"', '"a "b" c"', "\"a b\\c\""])
+def test_quoted_forms_the_materialiser_never_emits_or_systemd_would_alter_are_refused(
+        tmp_path, monkeypatch, capsys, raw):
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS,
+                                  "MYAIR_PASSWORD=" + raw + "\n")
+    if raw == "\"a'b\"":
+        assert rc == 2        # double-wrapped without whitespace is ambiguous with a mangled plaintext
+    assert rc == 2 and text == TEMPLATE_DEFAULTS
+
+
+def _real_systemd_available():
+    return (os.name != "nt" and shutil.which("systemd-run") is not None
+            and os.path.isdir("/run/systemd/system") and os.geteuid() == 0)
+
+
+@pytest.mark.skipif(not _real_systemd_available(), reason="needs root and a running systemd (WSL with systemd, as root)")
+@pytest.mark.parametrize("plaintext", CORPUS)
+def test_against_real_systemd_the_accept_decision_matches_what_it_delivers(tmp_path, plaintext):
+    """The helper accepts a password exactly when systemd's EnvironmentFile hands the
+    feeder the original plaintext. FAKE values only."""
+    os.chmod(str(tmp_path), 0o755)
+    env = tmp_path / "e"
+    env.write_bytes(("X=" + materialiser_emit(plaintext) + "\n").encode("utf-8"))
+    os.chmod(str(env), 0o644)
+    proc = _sp.run(["systemd-run", "-q", "--wait", "--pipe", "-p", "EnvironmentFile=" + str(env),
+                    "/usr/bin/env", "-0"], capture_output=True)
+    delivered = None
+    for item in proc.stdout.split(b"\0"):
+        if item.startswith(b"X="):
+            delivered = item[2:].decode("utf-8")
+    helper = load_helper()
+    accepted = helper.credential_problem(materialiser_emit(plaintext).strip()) is None
+    intact = (delivered == plaintext)
+    # accepted must imply intact. (The converse is deliberately not required: a plaintext
+    # with an unbalanced quote is refused as ambiguous even where one version might cope.)
+    assert (not accepted) or intact, (plaintext, delivered)
+    assert accepted == systemd_delivers_intact(plaintext)

@@ -32,7 +32,8 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export AI_CLI_STATUS_HERE="$HERE"
+# A native path for python (Git Bash on a Windows dev PC gives /c/...; cygpath fixes it).
+export AI_CLI_STATUS_HERE="$(cygpath -m "$HERE" 2>/dev/null || printf '%s' "$HERE")"
 exec python3 - "$@" <<'PY'
 import csv
 import json
@@ -203,7 +204,35 @@ else:
 # --- the feeder's last cycle (level 2) ---------------------------------------
 
 
+def required_gauges():
+    """{source: [required gauge ids]} from the FEEDER's own GAUGE_SPECS (the other
+    side of the contract), or None when the feeder cannot be loaded here."""
+    import importlib.util
+    path = os.path.join(HERE, "..", "ai-usage", "ai_usage_feeder.py")
+    try:
+        spec = importlib.util.spec_from_file_location("ai_usage_feeder_status", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["ai_usage_feeder_status"] = module
+        spec.loader.exec_module(module)
+        out = {}
+        for gauge in module.GAUGE_SPECS:
+            if not gauge.optional:
+                out.setdefault(gauge.source, []).append(gauge.key)
+        return out
+    except Exception:
+        return None
+
+
 def feeder_live_sources():
+    """Sources whose REQUIRED gauges were all `live` in the feeder's LATEST cycle.
+
+    The journal is a stream of cycles; a cycle is the trailing run of gauge lines
+    up to the first repeated gauge id walking backwards. An older cycle, or an
+    optional gauge (Claude's Fable band) that happened to be live, proves nothing.
+    """
+    required = required_gauges()
+    if not required:
+        return set()
     log_file = os.environ.get("AI_CLI_FEEDER_LOG")
     if log_file:
         try:
@@ -214,12 +243,18 @@ def feeder_live_sources():
     else:
         rc, text = run(["journalctl", "-u", "homehub-ai-usage.service", "-n", "400",
                         "--no-pager", "-o", "cat"], timeout=20)
-    last = {}
+    entries = []
     for line in text.splitlines():
-        m = re.search(r"ai-usage:\s+(ai-usage-([a-z0-9]+)-\S+)\s+(live|UNAVAILABLE)", line)
+        m = re.search(r"ai-usage:\s+(ai-usage-[a-z0-9-]+)\s+(live|UNAVAILABLE)\b", line)
         if m:
-            last[m.group(1)] = (m.group(2), m.group(3))
-    return {src for (src, state) in last.values() if state == "live"}
+            entries.append((m.group(1), m.group(2)))
+    latest = {}
+    for key, state in reversed(entries):
+        if key in latest:
+            break
+        latest[key] = state
+    return {src for src, keys in required.items()
+            if all(latest.get(k) == "live" for k in keys)}
 
 
 LIVE = feeder_live_sources()
@@ -264,21 +299,33 @@ def gemini_auth_type():
 
 
 results = []      # (label, state, detail lines, owed?)
+# Can the account be acted as at all? rc 127 (no runuser) or any failure to run
+# `true` as it (absent account) means every check below would be a guess.
+CAN_CHECK = as_account("true")[0] == 0
 for c in checks:
     label, path = c["label"], c["path"]
     if c["knob"] is not None and path != c["default"]:
         results.append((label, "unsupported-path",
                         ["set %s=%s" % (c["knob"], c["default"])], True))
         continue
-    present = as_account("test", "-s", path)[0] == 0 and as_account("test", "-r", path)[0] == 0
-    if not present:
+    if not CAN_CHECK:
+        results.append((label, "cannot check",
+                        ["could not act as %s (the account or runuser is not usable yet); "
+                         "re-run this after the account exists" % ACCOUNT], False))
+        continue
+    if as_account("test", "-r", path)[0] != 0:
         if os.path.exists(path):
+            # Present for us, unreadable for the account: a PERMISSION problem.
             owner, mode = owner_mode(path)
             fix = ["owner/mode now %s %s; the account %s cannot read it" % (owner or "?", mode or "?", ACCOUNT),
                    "sudo chown %s:%s %s && sudo chmod 600 %s" % (ACCOUNT, ACCOUNT, path, path)]
             results.append((label, "permissions wrong", fix, True))
         else:
             results.append((label, "login owed", [recipe(c, "owed")], True))
+        continue
+    if as_account("test", "-s", path)[0] != 0:
+        # Readable but empty: the login never completed.
+        results.append((label, "login owed", [recipe(c, "owed")], True))
         continue
     if c["kind"] == "gemini":
         selected = gemini_auth_type()
@@ -319,12 +366,19 @@ for label, state, lines, owed in results:
     print("  login %s: %s" % (label, state))
 
 owed = [(l, s, d) for (l, s, d, o) in results if o]
+unchecked = [(l, d) for (l, s, d, o) in results if s == "cannot check"]
 if owed:
     print("LOGINS OWED: " + ", ".join("%s (%s)" % (l, s) for l, s, d in owed))
     for l, s, d in owed:
         print("  %s - %s" % (l, s))
         for line in d:
             print("    " + line)
-else:
+if unchecked:
+    # Distinct from "owed": no recipe, because nothing could be checked.
+    print("LOGINS OWED: unknown for %s - could not act as %s yet" % (
+        ", ".join(l for l, d in unchecked), ACCOUNT))
+    for line in unchecked[0][1]:
+        print("    " + line)
+elif not owed:
     print("LOGINS OWED: none")
 PY

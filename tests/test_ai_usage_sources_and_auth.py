@@ -355,16 +355,23 @@ def test_migration_waits_for_a_running_refresh_instead_of_killing_it_sr067(tmp_p
     assert not (units / "homehub-claude-refresh.service").exists()
 
 
-def test_migration_gives_up_waiting_with_a_warning_and_still_never_kills_it_sr067(tmp_path):
+def test_migration_defers_when_the_old_refresher_is_still_busy_and_never_races_it_sr067(tmp_path):
+    """Two refreshers rotating account 1's single-use token lose the live login, so
+    a legacy service still running at the deadline DEFERS the migration: the old
+    unit stays, the new @claude timer is NOT enabled, nothing is stopped, and the
+    script exits 3 (everything else converged) for the runbook to act on."""
     done, units, calls = run_setup(
         tmp_path, "codex,claude,opencode", legacy=True,
         extra_env={"STUB_ACTIVE_CALLS": "100000", "AI_USAGE_MIGRATION_POLL_SECONDS": "0.2",
                    "AI_USAGE_MIGRATION_WAIT_SECONDS": "1"})
-    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.returncode == 3, done.stdout + done.stderr
     assert "WARNING: homehub-claude-refresh.service was still activating" in done.stdout
+    assert "DEFERRED" in done.stdout
     assert not [c for c in calls if c.startswith("stop ") and "claude-refresh" in c]
-    assert not (units / "homehub-claude-refresh.service").exists()
-    assert "enable --now homehub-claude-refresh@claude.timer" in calls
+    assert (units / "homehub-claude-refresh.service").exists()
+    assert (units / "homehub-claude-refresh.timer").exists()
+    assert "enable --now homehub-claude-refresh@claude.timer" not in calls
+    assert "enable --now homehub-ai-usage.timer" in calls
 
 
 def test_setup_is_idempotent_on_a_migrated_box_sr067(tmp_path):
@@ -389,7 +396,9 @@ def test_setup_gives_account_two_only_its_own_directory_sr067(tmp_path):
     done, units, calls = run_setup(tmp_path, "claude,claude2,codex,gemini,opencode",
                                    extra_env=dict(knobs, AI_USAGE_USER_ACCOUNT="homehub-ai",
                                                   # Git Bash would rewrite these POSIX paths for the status step's python
-                                                  MSYS2_ENV_CONV_EXCL=";".join(knobs)))
+                                                  MSYS2_ENV_CONV_EXCL=";".join(knobs),
+                                                  # no runuser here: act as the caller, so the logins are checkable
+                                                  AI_CLI_RUNAS="env"))
     assert done.returncode == 0, done.stdout + done.stderr
     two = (units / "homehub-claude-refresh@claude2.service.d" / "10-account.conf").read_text(encoding="utf-8")
     assert "Environment=CLAUDE_CONFIG_DIR=/home/homehub-ai/.claude-2" in two

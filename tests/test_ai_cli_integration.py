@@ -86,8 +86,12 @@ if [ "$1" = "test" ] && [ -f "$SANDBOX/deny" ] && grep -qxF -- "$3" "$SANDBOX/de
 if [ "$1" = "env" ]; then exit 0; fi
 exec "$@"
 """,
+    # STUB_SYSTEMCTL_FAIL=<substring>: any call whose arguments contain it fails.
+    # STUB_ACTIVE=<state>: `is-active` answers that state (and exits 3) forever.
     "systemctl": r"""#!/usr/bin/env bash
 echo "systemctl $*" >> "$SANDBOX/calls.log"
+if [ "$1" = "is-active" ] && [ -n "${STUB_ACTIVE:-}" ]; then echo "$STUB_ACTIVE"; exit 3; fi
+case "$*" in *"${STUB_SYSTEMCTL_FAIL:-@@none@@}"*) exit 1 ;; esac
 exit 0
 """,
     "install": r"""#!/usr/bin/env bash
@@ -108,7 +112,10 @@ else
   case "${args[1]}" in "$SANDBOX"*) cp "${args[0]}" "${args[1]}" ;; esac
 fi
 """,
+    # `stat -c %U path` -> STUB_STAT_OWNER (else the first account created); the
+    # status step's `-c "%U:%G %a"` form answers a root-owned 0600 file.
     "stat": r"""#!/usr/bin/env bash
+if [ "$2" = "%U" ]; then echo "${STUB_STAT_OWNER:-$(head -1 "$SANDBOX/accounts")}"; exit 0; fi
 echo "root:root 600"
 """,
 }
@@ -188,6 +195,8 @@ class Box(object):
             # Git Bash rewrites "/home" into a Windows path when it crosses into a
             # native process; the stub getent must see the literal value.
             "MSYS2_ENV_CONV_EXCL": "STUB_HOME_BASE",
+            "AI_USAGE_MIGRATION_POLL_SECONDS": "0.05",
+            "AI_USAGE_MIGRATION_WAIT_SECONDS": "1",
         })
         env.update(extra)
         return env
@@ -206,6 +215,12 @@ class Box(object):
     def calls(self):
         path = self.root / "calls.log"
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def feeder_log(self, *gauges):
+        """Write the feeder's journal lines: each argument is (gauge id, state).
+        A cycle boundary is a repeated gauge id, as in the real stream."""
+        lines = ["ai-usage: %-32s %-12s %s" % (k, st, "posted") for k, st in gauges]
+        (self.root / "feeder.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def cred(self, account, relative, content=CANARY):
         path = self.home / account / relative
@@ -501,16 +516,51 @@ def test_present_credential_is_not_verified_until_the_feeder_logged_live_llr1117
     assert "login claude: credential present (not verified)" in out
     assert "installed, operation not yet verified" in out and "LOGINS OWED: none" in out
     assert "auth login" not in out
-    (box.root / "feeder.log").write_text(
-        "ai-usage: ai-usage-claude-session        live         12\n"
-        "ai-usage: ai-usage-claude2-session       UNAVAILABLE  x\n", encoding="utf-8")
+    required = [g.key for g in feeder.GAUGE_SPECS if g.source == "claude" and not g.optional]
+    optional = [g.key for g in feeder.GAUGE_SPECS if g.source == "claude" and g.optional]
+    assert required and optional, "the feeder defines required and optional claude gauges"
+    box.feeder_log(*[(k, "live") for k in required])
     out = _status(box)
     assert "login claude: verified" in out and "consumer operation verified" in out
-    # A later UNAVAILABLE for the same gauge cancels the earlier live.
-    (box.root / "feeder.log").write_text(
-        "ai-usage: ai-usage-claude-session        live         12\n"
-        "ai-usage: ai-usage-claude-session        UNAVAILABLE  x\n", encoding="utf-8")
+    # One REQUIRED gauge UNAVAILABLE in the latest cycle: not verified.
+    box.feeder_log(*([(required[0], "UNAVAILABLE")] + [(k, "live") for k in required[1:]]))
     assert "login claude: credential present (not verified)" in _status(box)
+    # An older all-live cycle followed by a newer cycle that lost a gauge.
+    box.feeder_log(*([(k, "live") for k in required] + [(required[0], "UNAVAILABLE")]))
+    assert "login claude: credential present (not verified)" in _status(box)
+    # A stale OPTIONAL gauge live, then the required ones UNAVAILABLE: not proof.
+    box.feeder_log(*([(optional[0], "live")] + [(k, "UNAVAILABLE") for k in required]))
+    assert "login claude: credential present (not verified)" in _status(box)
+
+
+def test_codex_verifies_through_its_bare_gauge_id_llr1117(tmp_path):
+    codex_ids = [g.key for g in feeder.GAUGE_SPECS if g.source == "codex" and not g.optional]
+    assert codex_ids == ["ai-usage-codex"]      # the BARE id the feeder posts
+    box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=codex", "AI_USAGE_USER_ACCOUNT=alice"])
+    path = box.codex_home / "auth.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(CANARY, encoding="utf-8")
+    assert "login codex (usage): credential present (not verified)" in _status(box)
+    box.feeder_log(*[(k, "live") for k in codex_ids])
+    assert "login codex (usage): verified" in _status(box)
+
+
+def test_account_that_cannot_be_acted_as_is_cannot_check_not_login_owed_llr1117(tmp_path):
+    box, _ = _claude_box(tmp_path)
+    out = _status(box, AI_CLI_RUNAS="no-such-runuser-command")       # rc 127
+    assert "login claude: cannot check" in out
+    assert "LOGINS OWED: unknown" in out
+    assert "auth login" not in out and "login owed" not in out
+
+
+def test_empty_credential_is_login_owed_unreadable_is_permissions_llr1117(tmp_path):
+    box, cred = _claude_box(tmp_path)
+    box.cred("alice", ".claude/.credentials.json", "")
+    out = _status(box)
+    assert "login claude: login owed" in out and "auth login" in out
+    box.cred("alice", ".claude/.credentials.json", CANARY)
+    (box.root / "deny").write_text(cred + "\n", encoding="utf-8")
+    assert "login claude: permissions wrong" in _status(box)
 
 
 def test_root_owned_0600_for_a_non_root_account_is_permissions_wrong_llr1117(tmp_path):
@@ -591,9 +641,10 @@ def _hook_text():
 def test_firstboot_hook_only_schedules_and_runs_before_6d_llr1119():
     text, start, hook = _hook_text()
     assert "--schedule" in hook
-    assert "--run" not in hook, "firstboot must never wait on a download"
-    assert hook.index("ensure-ai-account.sh\" \"$acct\"") < hook.index("provision-ai-clis.sh\" --schedule")
-    call = text.index("\nai_cli_provision_hook\n")
+    code = "\n".join(l for l in hook.splitlines() if not l.lstrip().startswith("#"))
+    assert "--run" not in code, "firstboot must never wait on a download"
+    assert hook.index("ensure-ai-account.sh\" \"$AI_EFFECTIVE_ACCOUNT\"") < hook.index("provision-ai-clis.sh\" --schedule")
+    call = text.index("\nai_cli_provision_hook ||")
     assert call > start
     assert call < text.index("# ── 6d. the AI CLI service")
     assert call < text.index("# ── 6e. the AI-usage feeder")
@@ -617,6 +668,7 @@ def _run_hook(box, tmp_path, env_lines):
         "STACK_DIR=%s\n"
         "log() { echo \"[firstboot] $*\"; }\n"
         "_env_val() { sed -n \"s/^$1=//p\" \"$STACK_DIR/.env\" 2>/dev/null | head -1 | tr -d '\\r'; }\n"
+        "AI_EFFECTIVE_ACCOUNT=\"\"\n"
         "%s\nai_cli_provision_hook\n" % (stack.as_posix(), hook), encoding="utf-8")
     return subprocess.run([box.bash, script.as_posix()],
                           env=box.env(AI_CLI_UNIT_DIR=box.units.as_posix()),
@@ -632,8 +684,8 @@ def test_extracted_hook_creates_the_account_then_schedules_never_runs_llr1119(tm
     assert box.accounts == ["alice"]
     assert "provisioner --schedule" in calls and "provisioner --run" not in calls
     assert calls.index("useradd alice") < calls.index("provisioner --schedule")
-    assert (box.units / "homehub-ai-clis-provision.timer").exists()
-    assert (box.units / "homehub-ai-clis-provision.service").exists()
+    # --schedule installs the provisioning units itself; the hook must not.
+    assert not list(box.units.iterdir())
     assert "bob" not in done.stdout
 
 
@@ -772,3 +824,243 @@ def test_real_provisioner_contract(tmp_path):
     assert set(shape["clis"]) >= {"claude", "codex", "opencode", "gemini", "node"}
     out = _status(box, AI_CLI_PROVISIONER=provisioner.as_posix(), AI_CLI_PREFIX=prefix.as_posix())
     assert out.startswith("PROVISIONING:"), out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 1 - the legacy refresher can never race the new one (BLOCKER)
+# ═══════════════════════════════════════════════════════════════════════════
+
+LEGACY = "homehub-claude-refresh"
+
+
+def _legacy_box(tmp_path, sources="claude"):
+    box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=" + sources, "AI_USAGE_USER_ACCOUNT=alice"],
+              accounts=["alice"])
+    (box.units / (LEGACY + ".service")).write_text("[Service]\n# OLD\n", encoding="utf-8")
+    (box.units / (LEGACY + ".timer")).write_text("[Timer]\n# OLD\n", encoding="utf-8")
+    return box
+
+
+def test_failed_legacy_disable_keeps_the_old_refresher_and_never_enables_the_new_one_sr067(tmp_path):
+    box = _legacy_box(tmp_path)
+    done = box.run(SETUP_USAGE, STUB_SYSTEMCTL_FAIL="disable --now %s.timer" % LEGACY)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "WARNING: could not disable %s.timer" % LEGACY in done.stdout
+    assert "systemctl enable --now homehub-claude-refresh@claude.timer" not in box.calls
+    # The old pair is still the refresher; nothing was removed or stopped.
+    assert (box.units / (LEGACY + ".timer")).exists() and (box.units / (LEGACY + ".service")).exists()
+    assert not [c for c in box.calls if c.startswith("systemctl stop")]
+    # The rest of the install still converged (the other timers are not held back).
+    assert "systemctl enable --now homehub-ai-usage.timer" in box.calls
+
+
+def test_busy_legacy_service_at_the_deadline_defers_the_migration_sr067(tmp_path):
+    box = _legacy_box(tmp_path)
+    done = box.run(SETUP_USAGE, STUB_ACTIVE="activating")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "was still activating" in done.stdout and "DEFERRED" in done.stdout
+    assert "systemctl enable --now homehub-claude-refresh@claude.timer" not in box.calls
+    assert (box.units / (LEGACY + ".service")).exists()
+    assert not [c for c in box.calls if c.startswith("systemctl stop")]
+
+
+def test_an_idle_legacy_service_still_migrates_and_exits_0_sr067(tmp_path):
+    box = _legacy_box(tmp_path)
+    done = box.run(SETUP_USAGE)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not (box.units / (LEGACY + ".service")).exists()
+    assert "systemctl enable --now homehub-claude-refresh@claude.timer" in box.calls
+
+
+def test_firstboot_keeps_going_when_the_usage_setup_exits_3_sr067():
+    text = FIRSTBOOT.read_text(encoding="utf-8")
+    block = text[text.index("# ── 6e."):text.index("# ── 6f.")]
+    assert 'if bash "$STACK_DIR/ai-usage/setup-ai-usage.sh"' in block and "else" in block, \
+        "a non-zero exit takes the WARNING branch, never aborts firstboot"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 1 - existing state directories are never chowned (MAJOR)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_existing_state_directories_of_another_account_are_left_alone_and_reported_llr1114(tmp_path):
+    box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=claude2,gemini", "AI_USAGE_USER_ACCOUNT=alice"],
+              accounts=["alice"])
+    kept = {}
+    for rel in (".claude-2", ".gemini"):
+        d = box.home / "alice" / rel
+        d.mkdir(parents=True)
+        (d / "credential").write_text(CANARY, encoding="utf-8")
+        kept[rel] = d
+    # An msys-style home (no drive colon) so the script's own `cut -d:` can split it.
+    base = box.home.as_posix()
+    base = "/%s%s" % (base[0].lower(), base[2:]) if base[1:2] == ":" else base
+    done = box.run(SETUP_USAGE, STUB_STAT_OWNER="bob", STUB_HOME_BASE=base)
+    assert done.returncode == 0, done.stdout + done.stderr
+    for rel, d in kept.items():
+        mutating = [c for c in box.calls if c.startswith("install ") and c.endswith("/home/alice/" + rel)]
+        assert not mutating, "an existing %s must not be install -d'd: %r" % (rel, mutating)
+        assert "/home/alice/%s already exists and belongs to bob" % rel in done.stdout
+        assert (d / "credential").read_text(encoding="utf-8") == CANARY
+
+
+def test_a_rerun_leaves_credentials_and_state_byte_identical_and_a_fresh_dir_is_created_llr1114(tmp_path):
+    box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini", "AI_USAGE_USER_ACCOUNT=alice"])
+    first = box.run(SETUP_USAGE)
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert [c for c in box.calls if c.startswith("install -d -m 0700 -o alice -g alice")
+            and c.endswith("/.gemini")], "an ABSENT directory is created for the account"
+    files = {}
+    for rel, body in ((".claude/.credentials.json", CANARY), (".claude-2/.credentials.json", CANARY + "2"),
+                      (".gemini/oauth_creds.json", CANARY + "3"), (".gemini/settings.json", "{}")):
+        files[box.cred("alice", rel, body)] = body.encode("utf-8")
+    box.codex_home.mkdir(parents=True)
+    codex = box.codex_home / "auth.json"
+    codex.write_text(CANARY + "4", encoding="utf-8")
+    files[codex] = (CANARY + "4").encode("utf-8")
+    stamps = {p: p.stat().st_mtime_ns for p in files}
+    second = box.run(SETUP_USAGE)
+    assert second.returncode == 0, second.stdout + second.stderr
+    for path, body in files.items():
+        assert path.read_bytes() == body and path.stat().st_mtime_ns == stamps[path], path
+
+
+@pytest.mark.parametrize("script", [SETUP_USAGE, SETUP_CLI], ids=["usage", "cli"])
+def test_both_setups_keep_the_other_keys_of_an_existing_updater_file_llr1120(tmp_path, script):
+    box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=claude", "AI_USAGE_USER_ACCOUNT=alice",
+                                     "AI_CLI_ENABLED=true", "AI_CLI_USER=alice"], accounts=["alice"])
+    target = tmp_path / "claude-code" / "managed-settings.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps({"env": {"KEEP": "1"}, "permissions": {"deny": ["x"]}}), encoding="utf-8")
+    done = box.run(script)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "env": {"KEEP": "1", "DISABLE_AUTOUPDATER": "1"}, "permissions": {"deny": ["x"]}}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 1 - the updater merge never destroys or broadens (MAJOR)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("seed,gemini", [
+    ({"env": ["owner-setting"]}, False),
+    ({"env": "a string"}, False),
+    ({"general": ["x"]}, True),
+])
+def test_a_non_object_branch_is_left_untouched_with_a_warning_llr1120(tmp_path, seed, gemini):
+    etc = tmp_path / "etc"
+    name = "gemini-cli/settings.json" if gemini else "claude-code/managed-settings.json"
+    path = etc / name
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(seed), encoding="utf-8")
+    before = path.read_bytes()
+    args = ["--gemini"] if gemini else []
+    done = subprocess.run([_bash(tmp_path), UPDATER.as_posix()] + args,
+                          env=dict(os.environ, AI_CLI_ETC_DIR=etc.as_posix()), capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert path.read_bytes() == before
+    assert "left as it is" in done.stdout
+    assert not [p for p in path.parent.iterdir() if p.name.startswith(".updater-")]
+
+
+UPDATER_MODE = r"""set -eu
+D=$(mktemp -d)/etc    # a real Linux filesystem: drvfs ignores chmod/chown
+trap 'rm -rf "$(dirname $D)"' EXIT
+mkdir -p $D/claude-code
+printf '{"env":{"SECRET":"s"}}' > $D/claude-code/managed-settings.json
+chown 12345:12345 $D/claude-code/managed-settings.json
+chmod 0640 $D/claude-code/managed-settings.json
+AI_CLI_ETC_DIR=$D bash @@REPO@@/stack/ai-cli/install-updater-controls.sh
+stat -c '%a %u %g' $D/claude-code/managed-settings.json
+ls -A $D/claude-code
+cat $D/claude-code/managed-settings.json
+"""
+
+
+def test_updater_keeps_the_mode_and_owner_of_an_existing_file_llr1120(tmp_path):
+    done = _wsl_root(UPDATER_MODE, tmp_path)
+    assert done.returncode == 0, done.stdout + done.stderr
+    lines = done.stdout.splitlines()
+    assert "640 12345 12345" in lines, done.stdout
+    assert ".updater-" not in done.stdout
+    assert '"SECRET":"s"' in done.stdout and "DISABLE_AUTOUPDATER" in done.stdout
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 1 - firstboot warns, never aborts (MAJOR)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_hook_survives_every_failing_step_under_set_e_llr1119(tmp_path):
+    box = Box(tmp_path, [])
+    _, _, hook = _hook_text()
+    stack = tmp_path / "stack-dir"
+    (stack / "ai-cli").mkdir(parents=True)
+    (stack / ".env").write_text("AI_CLI_ENABLED=true\nAI_CLI_USER=alice\n", encoding="utf-8")
+    script = tmp_path / "hook2.sh"
+    script.write_text(
+        "set -euo pipefail\nSTACK_DIR=%s\nlog() { echo \"[firstboot] $*\"; }\n"
+        "_env_val() { sed -n \"s/^$1=//p\" \"$STACK_DIR/.env\" | head -1; }\n"
+        "AI_EFFECTIVE_ACCOUNT=\"\"\n%s\nai_cli_provision_hook\necho AFTER\n" % (stack.as_posix(), hook),
+        encoding="utf-8")
+    # No ensure script, no provisioner on the payload at all.
+    done = subprocess.run([box.bash, script.as_posix()], env=box.env(), capture_output=True, text=True)
+    assert done.returncode == 0 and "AFTER" in done.stdout and "WARNING" in done.stdout, done.stdout + done.stderr
+    # The ensure script is present but cannot resolve (exits non-zero): still a warning.
+    (stack / "ai-cli" / "ensure-ai-account.sh").write_text("exit 9\n", encoding="utf-8")
+    done = subprocess.run([box.bash, script.as_posix()], env=box.env(), capture_output=True, text=True)
+    assert done.returncode == 0 and "AFTER" in done.stdout and "WARNING" in done.stdout, done.stdout + done.stderr
+
+
+def test_firstboot_leftover_instructions_follow_the_effective_account_llr1119():
+    text = FIRSTBOOT.read_text(encoding="utf-8")
+    six_d = text[text.index("# ── 6d."):text.index("# ── mesh VPN")]
+    six_e = text[text.index("# ── 6e."):text.index("# ── 6f.")]
+    assert "setup-token" not in six_d and "setup-token" not in six_e
+    assert "AI_EFFECTIVE_ACCOUNT" in six_e
+    assert "${AI_USAGE_USER_ACCOUNT:-homehub-ai}'s home" not in six_e
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 1 - REAL Linux, real root, real second user, no stubs (WSL only)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _wsl_root(script_text, tmp_path):
+    wsl = shutil.which("wsl")
+    if not wsl:
+        pytest.skip("no WSL on this machine")
+    probe = subprocess.run([wsl, "-d", "Ubuntu", "-u", "root", "--", "id", "-u"], capture_output=True, text=True)
+    if probe.returncode != 0 or probe.stdout.strip() != "0":
+        pytest.skip("WSL Ubuntu is not available as root")
+
+    def mnt(path):
+        path = Path(path)
+        return "/mnt/%s/%s" % (path.drive.rstrip(":").lower(), path.as_posix()[len(path.drive):].lstrip("/"))
+
+    script = tmp_path / "real.sh"
+    with open(str(script), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(script_text.replace("@@DIR@@", mnt(tmp_path)).replace("@@REPO@@", mnt(REPO)))
+    return subprocess.run([wsl, "-d", "Ubuntu", "-u", "root", "--", "bash", mnt(script)],
+                          capture_output=True, text=True)
+
+
+REAL_STATUS = r"""set -u
+U=w2realtest
+useradd -m -s /bin/bash $U 2>/dev/null || true
+trap 'userdel -r $U >/dev/null 2>&1' EXIT
+H=$(getent passwd $U | cut -d: -f6)
+chmod 755 $H; mkdir -p $H/.claude; chmod 755 $H/.claude
+printf '{"token":"CANARY-REAL"}' > $H/.claude/.credentials.json
+chown root:root $H/.claude/.credentials.json; chmod 600 $H/.claude/.credentials.json
+printf 'AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=claude\nAI_USAGE_USER_ACCOUNT=%s\nAI_USAGE_CLAUDE_CREDENTIALS=%s/.claude/.credentials.json\n' $U $H > @@DIR@@/real.env
+AI_CLI_ENV_FILE=@@DIR@@/real.env AI_CLI_PROVISIONER=/nonexistent bash @@REPO@@/stack/ai-cli/ai-cli-status.sh
+"""
+
+
+def test_real_root_owned_credential_for_a_real_second_user_is_permissions_wrong_llr1117(tmp_path):
+    done = _wsl_root(REAL_STATUS, tmp_path)
+    out = done.stdout
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "login claude: permissions wrong" in out, out
+    assert "sudo chown w2realtest:w2realtest" in out
+    assert "auth login" not in out, "a permissions problem must not offer a login recipe"
+    assert "CANARY-REAL" not in out

@@ -334,7 +334,7 @@ Written down, **not run**. `/opt/homehub` is **not a git checkout** (it is a cop
 tree), so never sync the whole repo over it: diff and copy only `stack/sleep/`.
 Nothing here restarts a container; the feeder is a host systemd unit.
 
-1. **Dev PC: materialise the hub config** as usual. The generated `out\homehub\.env`
+1. **Dev PC: materialise the hub config** as usual. The generated `scripts\deploy\out\homehub\.env`
    must carry the keys below (check **names only**; never print the file or a
    value): `SLEEP_ENABLED=true`, `SLEEP_USER`, `SLEEP_USER_ACCOUNT`, `SLEEP_FEED_URL`,
    `SLEEP_FEED_TOKEN`, `SLEEP_PUBLISH`, `SLEEP_STATE_FILE`, `SLEEP_TIMEOUT_SECONDS`,
@@ -353,21 +353,43 @@ Nothing here restarts a container; the feeder is a host systemd unit.
    of `README.md`, `apply-env-lines.py`, `homehub-sleep.service`,
    `homehub-sleep.timer`, `setup-sleep.sh`, `sleep_feeder.py` into it, and remove the
    scratch directory. Copy nothing else.
-4. **Hub: set the keys in place, with the helper from step 3.** Do **not** "append
+4. **Hub: set the keys with the helper from step 3.** Do **not** "append
    what is missing": a hub `.env` that already carries the template defaults
    (`SLEEP_ENABLED=false`, a blank `SLEEP_USER`, blank myAir values) would keep them,
    and `setup-sleep.sh` would then exit "disabled" having installed nothing. A second
    copy of a key is no better: systemd and `setup-sleep.sh` take the **last** line,
    firstboot's `_env_val` the **first**. The helper replaces the first line of each
-   key, drops any further copies, appends keys that are absent, and rewrites the file
-   **in place** (same inode, so no bind mount is detached). It prints only key names
-   and `replaced` / `added` / `unchanged`, never a value. From the dev PC, in
-   PowerShell, send only the wanted lines on stdin (the values never reach a
-   terminal, a command line or `tee`):
+   key, drops any further copies (including `export KEY=` and indented ones),
+   appends keys that are absent, and writes the result **atomically**: a temp file in
+   the same directory with the original's mode and owner, `fsync`, `os.replace`, then
+   an `fsync` of the directory, all under an exclusive `flock`. A failure at any
+   point removes the temp file and leaves the original untouched; the file is *not*
+   rewritten in place, because a half-written `.env` would corrupt every hub secret
+   and nothing bind-mounts it (compose reads it for interpolation only, systemd as an
+   `EnvironmentFile`), so keeping its inode buys nothing. It accepts only the exact
+   sleep, myAir, heart and `TIMEZONE` key names (a typo is refused), **refuses a blank
+   value for a required key** (so a store key that was never imported cannot blank a
+   good hub value), and prints only key names and `replaced` / `added` / `unchanged`,
+   never a value.
+
+   **Transport: the bytes, not the pipeline.** PowerShell 5.1 re-encodes anything
+   piped to a native program (ASCII by default, with `?` for what it cannot encode),
+   so a non-ASCII password would arrive corrupted *and look valid*. Do not pipe. Write
+   the wanted lines to a file as UTF-8 **without a BOM** and let `cmd.exe` redirect
+   the file's bytes into ssh; this behaves the same on PowerShell 5.1 and 7. The
+   helper then rejects a BOM or anything that is not valid UTF-8. From the dev PC, in
+   the HomeHub repo (the file holds secrets: it lives in the already-restricted
+   `out\` directory and is deleted at once):
 
    ```
-   Get-Content out\homehub\.env | Where-Object { $_ -match '^(SLEEP_|MYAIR_|HEART_)[A-Z_]*=' } |
-       ssh <hub> "sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --apply"
+   $utf8 = New-Object System.Text.UTF8Encoding($false)
+   $src  = "scripts\deploy\out\homehub\.env"
+   $tmp  = "scripts\deploy\out\homehub\sleep-lines.env"
+   $keep = [IO.File]::ReadAllLines((Resolve-Path $src), $utf8) |
+       Where-Object { $_ -match '^(SLEEP_|MYAIR_|HEART_)[A-Z_]*=' }
+   [IO.File]::WriteAllText("$PWD\$tmp", (($keep -join "`n") + "`n"), $utf8)
+   cmd /c "ssh <hub> sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --apply < $tmp"
+   Remove-Item $tmp
    ```
 
    `SLEEP_FEED_URL` is the loopback tracker URL, the same value the weight and AI
@@ -376,9 +398,11 @@ Nothing here restarts a container; the feeder is a host systemd unit.
 5. **Hub: verify the effective values before installing.**
    `sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --report` prints, for
    each key, only `set` / `empty` / `absent`, plus the literal value of the two
-   `*_ENABLED` flags (it must say `SLEEP_ENABLED true` and `HEART_ENABLED 0`). It
-   exits non-zero and says why if a required key is empty, a key is duplicated, or
-   `SLEEP_ENABLED` is not the literal `true`.
+   `*_ENABLED` flags. It reads the file the way systemd does (last line wins, one pair
+   of single or double quotes stripped, so `MYAIR_PASSWORD=''` is *empty*). It exits
+   non-zero and says why if a required key is empty, a key is duplicated or written
+   as `export` / indented, `SLEEP_ENABLED` is not the literal `true`, or
+   `HEART_ENABLED` is not the literal `0` (the heart gauge stays off in this rollout).
 6. **Hub: check, then install.**
    `sudo bash /opt/homehub/stack/sleep/setup-sleep.sh --check-only` (refuses on a
    blank identity, destination or sign-in, and prints one `clock sync:` line), then
@@ -400,15 +424,20 @@ Nothing here restarts a container; the feeder is a host systemd unit.
 8. **Roll back.** Stop **both** units - a oneshot that is already mid-run can still
    publish after its timer is gone:
    `sudo systemctl disable --now homehub-sleep.timer && sudo systemctl stop homehub-sleep.service`.
-   Then restore the `.env` **in place**:
-   `sudo sh -c 'cat /opt/homehub/stack/.env.bak-<stamp> > /opt/homehub/stack/.env'`.
-   `cp` and `cat >` open the existing file and truncate it, which keeps the inode
-   (checked); `mv`, `cp --remove-destination` and `sed -i` write a new file and can
-   detach a bind mount. The account and state directory are inert and may stay.
+   Then restore the `.env` from the step 2 backup with the helper:
+   `sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --restore /opt/homehub/stack/.env.bak-<stamp>`.
+   It checks that the backup exists, is a regular file, is readable, is non-empty
+   and is valid UTF-8 **before** it touches `.env`, then restores with the same
+   atomic writer. Do **not** use `sh -c 'cat backup > .env'`: the shell empties
+   `.env` before it opens the backup, so a mistyped backup name destroys the config.
+   (`mv`, `cp --remove-destination` and `sed -i` are not atomic-with-validation
+   either: use the helper.) The account and state directory are inert and may stay.
 
 Not proven: every step above, on a real hub (see "Known limits"). The helper itself
-is covered by `tests/test_sleep_wiring.py` (in-place rewrite and inode, duplicates,
-no value printed, refusals), not by a run against the hub's `.env`.
+is covered by `tests/test_sleep_wiring.py` (exact bytes, atomicity under simulated
+failure, mode and owner calls, no value printed, refusals, restore validation), not
+by a run against the hub's `.env`; `flock` and `fchown` are not exercised there (the
+tests run on Windows).
 
 The unit: `User=homehub-sleep`, `StateDirectory=homehub-sleep` mode `0700`, the
 state file `0600`, `ProtectHome=yes`, `ProtectSystem=strict`, `NoNewPrivileges`,

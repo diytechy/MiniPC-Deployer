@@ -163,19 +163,24 @@ def test_the_readme_carries_the_running_hub_procedure_and_no_stale_claim():
                  "journalctl -u homehub-sleep", "setup-sleep.sh --check-only",
                  "apply-env-lines.py --apply", "apply-env-lines.py --report", "diff -r",
                  "Copy nothing else", "systemctl stop homehub-sleep.service",
-                 "cat /opt/homehub/stack/.env.bak-<stamp> > /opt/homehub/stack/.env"):
+                 "apply-env-lines.py --restore", "UTF-8 **without a BOM**", r"scripts\deploy\out\homehub\.env"):
         assert must in text, must
     section = text[text.index("Installing on the RUNNING hub"):text.index("## Tests")]
     assert "tee -a" not in section                 # tee echoes stdin: it would print the password
     assert "not guaranteed" not in section         # compose publishes 127.0.0.1:8787:8787
-    assert "--remove-destination" in section and "sed -i" in section   # named as the WRONG forms
+    assert "sh -c 'cat backup > .env'" in section              # named as the WRONG rollback
+    assert "atomic" in section.lower() and "inode buys nothing" in " ".join(section.split())
+    assert "cmd /c" in section and "Do not pipe" in section
     assert re.search(r'Do \*\*not\*\* "append\s+what is missing"', section)
 
 
-# ── TC-1193 : the in-place .env helper (SR-075, LLR-1103) ────────────────────
+
+
+# ── TC-1193 : the atomic .env helper (SR-075, LLR-1103) ──────────────────────
 
 import importlib.util
 import io
+import stat
 
 HELPER = SLEEP / "apply-env-lines.py"
 SECRET = "PASSWORD-SENTINEL-7731"
@@ -188,18 +193,25 @@ def load_helper():
     return module
 
 
-def run_helper(tmp_path, monkeypatch, capsys, mode, env_text, stdin_text=""):
+class Stdin:
+    """sys.stdin stand-in with a .buffer, since the helper reads BYTES."""
+    def __init__(self, data):
+        self.buffer = io.BytesIO(data)
+
+
+def run_helper(tmp_path, monkeypatch, capsys, argv, env_text, stdin=b"", extra=None):
     env = tmp_path / ".env"
-    env.write_bytes(env_text.encode("utf-8"))
-    before = os.stat(str(env)).st_ino
-    monkeypatch.setattr("sys.stdin", io.StringIO(stdin_text))
+    env.write_bytes(env_text.encode("utf-8") if isinstance(env_text, str) else env_text)
+    for name, content in (extra or {}).items():
+        (tmp_path / name).write_bytes(content)
+    monkeypatch.setattr("sys.stdin", Stdin(stdin if isinstance(stdin, bytes) else stdin.encode("utf-8")))
     helper = load_helper()
     try:
-        rc = helper.main([mode, "--env", str(env)])
+        rc = helper.main(argv + ["--env", str(env)])
     except SystemExit as exc:
         rc = exc.code
     out = capsys.readouterr()
-    return rc, out.out + out.err, env.read_bytes().decode("utf-8"), before == os.stat(str(env)).st_ino
+    return rc, out.out + out.err, env.read_bytes().decode("utf-8"), env
 
 
 TEMPLATE_DEFAULTS = ("TIMEZONE=America/Chicago\nSLEEP_ENABLED=false\nSLEEP_USER=\n"
@@ -207,67 +219,215 @@ TEMPLATE_DEFAULTS = ("TIMEZONE=America/Chicago\nSLEEP_ENABLED=false\nSLEEP_USER=
                      "HEART_ENABLED=0\nOTHER=keep\n")
 WANTED = ("SLEEP_ENABLED=true\nSLEEP_USER=sub-123\nMYAIR_EMAIL=a@example.invalid\n"  # privacy-ok: placeholder
           "MYAIR_PASSWORD=" + SECRET + "\n")
+FULL_GOOD = WANTED + "TIMEZONE=America/Chicago\nSLEEP_FEED_URL=http://127.0.0.1:1/x\n"
 
 
-def test_template_defaults_are_replaced_in_place_not_left_standing(tmp_path, monkeypatch, capsys):
-    rc, out, text, same_inode = run_helper(tmp_path, monkeypatch, capsys, "--apply",
-                                           TEMPLATE_DEFAULTS, WANTED)
-    assert rc == 0 and same_inode is True
-    assert "SLEEP_ENABLED=true\n" in text and "SLEEP_ENABLED=false" not in text
-    assert "MYAIR_PASSWORD=" + SECRET + "\n" in text
-    assert text.count("SLEEP_ENABLED=") == 1 and "OTHER=keep\n" in text
-    assert "SLEEP_FEED_URL=http://127.0.0.1:8787/api/feed\n" in text      # untouched key kept
-    assert text.index("SLEEP_ENABLED=true") < text.index("SLEEP_USER=")   # replaced where it was
+def no_temp_left(tmp_path):
+    return [p.name for p in tmp_path.iterdir() if p.name.startswith(".env.tmp-")] == []
+
+
+def test_template_defaults_are_replaced_where_they_stand_and_other_lines_survive(
+        tmp_path, monkeypatch, capsys):
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, WANTED)
+    assert rc == 0 and no_temp_left(tmp_path)
+    assert text == ("TIMEZONE=America/Chicago\nSLEEP_ENABLED=true\nSLEEP_USER=sub-123\n"
+                    "SLEEP_FEED_URL=http://127.0.0.1:8787/api/feed\nMYAIR_EMAIL=a@example.invalid\n"  # privacy-ok: placeholder
+                    "MYAIR_PASSWORD=" + SECRET + "\nHEART_ENABLED=0\nOTHER=keep\n")        # EXACT bytes
+
+
+def test_shorter_content_leaves_no_stale_tail(tmp_path, monkeypatch, capsys):
+    old = ("SLEEP_ENABLED=false\n# " + "x" * 400 + "\nSLEEP_USER=" + "y" * 300 + "\n"
+           "SLEEP_USER=" + "z" * 300 + "\nOTHER=1\n")
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], old,
+                                  "SLEEP_ENABLED=true\nSLEEP_USER=s\n")
+    assert rc == 0 and len(text) < len(old) // 2
+    assert text == "SLEEP_ENABLED=true\n# " + "x" * 400 + "\nSLEEP_USER=s\nOTHER=1\n"
 
 
 def test_absent_keys_are_appended_and_duplicates_collapse_to_one(tmp_path, monkeypatch, capsys):
-    rc, out, text, same_inode = run_helper(
-        tmp_path, monkeypatch, capsys, "--apply",
-        "SLEEP_ENABLED=false\nOTHER=1\nSLEEP_ENABLED=false\n", WANTED)
-    assert rc == 0 and same_inode is True
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"],
+                                  "SLEEP_ENABLED=false\nOTHER=1\nSLEEP_ENABLED=false\n", WANTED)
+    assert rc == 0
     for key in ("SLEEP_ENABLED", "SLEEP_USER", "MYAIR_EMAIL", "MYAIR_PASSWORD"):
         assert len(re.findall(r"(?m)^%s=" % key, text)) == 1, key
     assert "added" in out and "replaced" in out
 
 
+def test_export_and_indented_copies_of_a_target_key_are_collapsed(tmp_path, monkeypatch, capsys):
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"],
+                                  "export SLEEP_ENABLED=false\n  SLEEP_USER=old\nOTHER=1\n", WANTED)
+    assert rc == 0 and "export" not in text and "  SLEEP_USER" not in text
+    assert text.count("SLEEP_ENABLED=") == 1 and text.count("SLEEP_USER=") == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
+def test_the_mode_of_the_original_is_preserved(tmp_path, monkeypatch, capsys):
+    env = tmp_path / ".env"
+    env.write_bytes(TEMPLATE_DEFAULTS.encode("utf-8"))
+    os.chmod(str(env), 0o640)
+    monkeypatch.setattr("sys.stdin", Stdin(b"SLEEP_USER=another\n"))
+    load_helper().main(["--apply", "--env", str(env)])
+    assert stat.S_IMODE(os.stat(str(env)).st_mode) == 0o640 and "another" in env.read_text()
+
+
+@pytest.mark.parametrize("breaker", ["replace", "write", "fsync"])
+def test_a_failure_part_way_leaves_the_original_untouched_and_no_temp_file(
+        tmp_path, monkeypatch, capsys, breaker):
+    helper = load_helper()
+
+    def boom(*_a, **_k):
+        raise OSError("simulated failure")
+    if breaker == "replace":
+        monkeypatch.setattr(helper.os, "replace", boom)
+    elif breaker == "write":
+        monkeypatch.setattr(helper, "_write_all", boom)
+    else:
+        monkeypatch.setattr(helper.os, "fsync", boom)
+    env = tmp_path / ".env"
+    env.write_bytes(TEMPLATE_DEFAULTS.encode("utf-8"))
+    monkeypatch.setattr("sys.stdin", Stdin(WANTED.encode("utf-8")))
+    with pytest.raises(OSError):
+        helper.main(["--apply", "--env", str(env)])
+    assert env.read_bytes() == TEMPLATE_DEFAULTS.encode("utf-8")
+    assert no_temp_left(tmp_path)
+
+
 def test_no_value_is_ever_printed_by_apply_or_report(tmp_path, monkeypatch, capsys):
-    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, "--apply", TEMPLATE_DEFAULTS, WANTED)
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, WANTED)
     assert SECRET not in out and "sub-123" not in out and "example.invalid" not in out
-    rc, out, _text, _ = run_helper(tmp_path, monkeypatch, capsys, "--report", text)
+    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], text)
     assert SECRET not in out and "sub-123" not in out and "example.invalid" not in out
-    assert re.search(r"(?m)^SLEEP_ENABLED\s+true$", out)            # the flag's literal value
-    assert re.search(r"(?m)^HEART_ENABLED\s+0$", out)
+    assert re.search(r"(?m)^SLEEP_ENABLED\s+true$", out) and re.search(r"(?m)^HEART_ENABLED\s+0$", out)
     assert re.search(r"(?m)^MYAIR_PASSWORD\s+set$", out) and rc == 0
 
 
 def test_report_flags_the_states_that_make_setup_install_nothing(tmp_path, monkeypatch, capsys):
-    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, "--report", TEMPLATE_DEFAULTS)
-    assert rc == 1
+    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], TEMPLATE_DEFAULTS)
+    assert rc == 1 and "not the literal true" in out
     assert re.search(r"(?m)^SLEEP_USER\s+empty$", out) and re.search(r"(?m)^MYAIR_PASSWORD\s+empty$", out)
-    assert "not the literal true" in out
-    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, "--report",
+    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"],
                                 "SLEEP_ENABLED=true\nSLEEP_ENABLED=false\n")
     assert "DUPLICATE KEYS" in out and re.search(r"(?m)^SLEEP_ENABLED\s+false$", out)  # last wins
 
 
-@pytest.mark.parametrize("bad", ["SLEEP_MODE=x\n", "SLEEP_START=1\n", "PATH=/x\n",
-                                 "NOEQUALS-" + SECRET + "\n", "SLEEP_ENABLED\n"])
-def test_a_bad_line_is_refused_with_the_file_untouched_and_nothing_echoed(
+@pytest.mark.parametrize("quoted", ["''", '""'])
+def test_a_quoted_empty_value_is_empty(tmp_path, monkeypatch, capsys, quoted):
+    text = FULL_GOOD.replace("MYAIR_PASSWORD=" + SECRET, "MYAIR_PASSWORD=" + quoted) + "HEART_ENABLED=0\n"
+    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], text)
+    assert rc == 1 and re.search(r"(?m)^MYAIR_PASSWORD\s+empty$", out)
+
+
+@pytest.mark.parametrize("heart", ["HEART_ENABLED=1\n", "HEART_ENABLED=true\n", ""])
+def test_report_fails_unless_heart_is_literally_zero(tmp_path, monkeypatch, capsys, heart):
+    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD + heart)
+    assert rc == 1 and "HEART_ENABLED must be the literal 0" in out
+    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"], FULL_GOOD + "HEART_ENABLED=0\n")
+    assert rc == 0
+
+
+def test_report_flags_export_and_indented_forms(tmp_path, monkeypatch, capsys):
+    rc, out, _t, _ = run_helper(tmp_path, monkeypatch, capsys, ["--report"],
+                                "export SLEEP_ENABLED=true\n  MYAIR_EMAIL=x\n")
+    assert rc == 1 and "UNSUPPORTED FORM" in out and "SLEEP_ENABLED" in out
+
+
+@pytest.mark.parametrize("bad", ["SLEEP_MODE=x\n", "SLEEP_START=1\n", "SLEEP_USR=1\n", "PATH=/x\n",
+                                 "NOEQUALS-" + SECRET + "\n", "SLEEP_ENABLED\n",
+                                 "MYAIR_PASSWORD=\n", "MYAIR_PASSWORD=''\n", 'SLEEP_USER=""\n',
+                                 "SLEEP_ENABLED=\n"])
+def test_a_bad_or_blanking_line_is_refused_with_the_file_untouched_and_nothing_echoed(
         tmp_path, monkeypatch, capsys, bad):
-    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, "--apply", TEMPLATE_DEFAULTS,
-                                  "SLEEP_ENABLED=true\n" + bad)
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS,
+                                  "SLEEP_FEED_URL=http://127.0.0.1:1/y\n" + bad)
     assert rc == 2 and text == TEMPLATE_DEFAULTS and "REFUSED" in out
-    assert SECRET not in out
+    assert SECRET not in out and no_temp_left(tmp_path)
+
+
+def test_a_blank_optional_value_is_allowed(tmp_path, monkeypatch, capsys):
+    rc, _o, text, _e = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS,
+                                  "SLEEP_FEED_TOKEN=\n")
+    assert rc == 0 and "SLEEP_FEED_TOKEN=\n" in text
+
+
+def test_non_utf8_and_a_bom_on_stdin_are_refused(tmp_path, monkeypatch, capsys):
+    for payload in (b"\xef\xbb\xbfSLEEP_USER=a\n", b"SLEEP_USER=caf\xe9\n"):
+        rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, payload)
+        assert rc == 2 and text == TEMPLATE_DEFAULTS
+
+
+def test_utf8_bytes_round_trip_exactly(tmp_path, monkeypatch, capsys):
+    password = "päss€wörd"
+    line = ("MYAIR_PASSWORD=" + password + "\n").encode("utf-8")
+    rc, _o, _text, env = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, line)
+    assert rc == 0 and line in env.read_bytes()
 
 
 def test_a_missing_env_is_refused_rather_than_created(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("sys.stdin", io.StringIO(WANTED))
-    helper = load_helper()
+    monkeypatch.setattr("sys.stdin", Stdin(WANTED.encode("utf-8")))
     with pytest.raises(SystemExit) as caught:
-        helper.main(["--apply", "--env", str(tmp_path / "nope")])
+        load_helper().main(["--apply", "--env", str(tmp_path / "nope")])
     assert caught.value.code == 2 and not (tmp_path / "nope").exists()
 
 
-def test_the_helper_is_lf_with_a_shebang_and_tracked():
+# restore: validated first, then the same atomic writer
+
+def test_restore_replaces_the_env_with_the_backup_exactly(tmp_path, monkeypatch, capsys):
+    backup = "A=1\nSLEEP_ENABLED=false\n"
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys,
+                                  ["--restore", str(tmp_path / ".env.bak-1")],
+                                  TEMPLATE_DEFAULTS + "MORE=" + "q" * 500 + "\n",
+                                  extra={".env.bak-1": backup.encode("utf-8")})
+    assert rc == 0 and text == backup and no_temp_left(tmp_path)
+
+
+@pytest.mark.parametrize("case", ["missing", "empty", "blank", "directory", "same", "binary"])
+def test_restore_validates_the_backup_before_touching_the_env(tmp_path, monkeypatch, capsys, case):
+    extra, name = {}, ".env.bak-x"
+    if case == "empty":
+        extra[name] = b""
+    elif case == "blank":
+        extra[name] = b"\n  \n"
+    elif case == "binary":
+        extra[name] = b"\xff\xfe\x00bad"
+    elif case == "directory":
+        (tmp_path / name).mkdir()
+    elif case == "same":
+        name = ".env"
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--restore", str(tmp_path / name)],
+                                  TEMPLATE_DEFAULTS, extra=extra)
+    assert rc == 2 and "REFUSED" in out
+    assert text == TEMPLATE_DEFAULTS and no_temp_left(tmp_path)
+
+
+def test_a_failed_restore_leaves_the_env_alone(tmp_path, monkeypatch, capsys):
+    helper = load_helper()
+
+    def boom(*_a, **_k):
+        raise OSError("simulated failure")
+    monkeypatch.setattr(helper.os, "replace", boom)
+    env = tmp_path / ".env"
+    env.write_bytes(TEMPLATE_DEFAULTS.encode("utf-8"))
+    (tmp_path / "b").write_bytes(b"K=1\n")
+    with pytest.raises(OSError):
+        helper.main(["--restore", str(tmp_path / "b"), "--env", str(env)])
+    assert env.read_bytes() == TEMPLATE_DEFAULTS.encode("utf-8") and no_temp_left(tmp_path)
+
+
+def test_the_helper_is_lf_with_a_shebang():
     raw = HELPER.read_bytes()
     assert raw.startswith(b"#!/usr/bin/env python3\n") and b"\r" not in raw
+
+
+def test_mode_and_owner_of_the_original_are_applied_to_the_replacement(tmp_path, monkeypatch, capsys):
+    # Portable: record the calls (Windows has no fchmod/fchown), assert the ORIGINAL's values.
+    helper = load_helper()
+    calls = []
+    monkeypatch.setattr(helper.os, "fchmod", lambda fd, mode: calls.append(("mode", mode)), raising=False)
+    monkeypatch.setattr(helper.os, "fchown", lambda fd, uid, gid: calls.append(("owner", uid, gid)), raising=False)
+    env = tmp_path / ".env"
+    env.write_bytes(TEMPLATE_DEFAULTS.encode("utf-8"))
+    before = os.stat(str(env))
+    monkeypatch.setattr("sys.stdin", Stdin(b"SLEEP_USER=another\n"))
+    assert helper.main(["--apply", "--env", str(env)]) == 0
+    assert ("mode", before.st_mode & 0o7777) in calls
+    assert ("owner", before.st_uid, before.st_gid) in calls

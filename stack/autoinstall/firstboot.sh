@@ -2260,19 +2260,24 @@ fi
 #      supervised download unit with --no-block. NEVER --run here: a download
 #      inside firstboot is exactly the wait this unit exists to avoid.
 # A failure is a WARNING, never fatal - the same posture as 6d/6e.
+# ONE unquote rule for every AI gate in this file (and in the setup scripts,
+# ensure-ai-account.sh and the provisioner): strip ONE matched pair of quotes,
+# then compare exactly. `tr -d '"'` removed only double quotes, so 'true' was
+# enabled in the hook and silently OFF in 6d/6e.
+ai_unq() {
+    local v="${1%$'\r'}"
+    case "$v" in
+        \"*\") v="${v#\"}"; v="${v%\"}" ;;
+        \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    printf '%s' "$v"
+}
+
 AI_EFFECTIVE_ACCOUNT=""
 ai_cli_provision_hook() {
     local cli_en usage_en cli_user usage_acct src_dir cli_en_raw cli_user_raw usage_acct_raw
     # ONE unquote: ensure-ai-account.sh strips a pair of quotes itself, so it gets the
     # RAW values; the comparisons here use a normalised copy (one pair stripped).
-    ai_unq() {
-        local v="${1%$'\r'}"
-        case "$v" in
-            \"*\") v="${v#\"}"; v="${v%\"}" ;;
-            \'*\') v="${v#\'}"; v="${v%\'}" ;;
-        esac
-        printf '%s' "$v"
-    }
     cli_en_raw="$(_env_val AI_CLI_ENABLED)" || cli_en_raw=""
     cli_en="$(ai_unq "$cli_en_raw")"
     usage_en="$(ai_unq "$(_env_val AI_USAGE_ENABLED)")" || usage_en=""
@@ -2343,13 +2348,13 @@ ai_cli_provision_hook || log "  WARNING: AI provisioning hook failed; continuing
 # 2026-09-18: AI_CLI_ENABLED is assigned nowhere in this script, so this read an
 # unset shell variable and was false on every run. A reimaged hub would put
 # AI_CLI_ENABLED=true in .env and then never provision the AI CLI.
-AI_CLI_ENABLED="$(_env_val AI_CLI_ENABLED | tr -d '"')"
+AI_CLI_ENABLED="$(ai_unq "$(_env_val AI_CLI_ENABLED)")"
 # Read for the LOG LINES below too: they state the bind, port and account,
 # and an unset read made them print defaults regardless of what .env said -
 # a headless box reporting a configuration it does not have.
-AI_CLI_BIND="$(_env_val AI_CLI_BIND | tr -d '"')"
-AI_CLI_PORT="$(_env_val AI_CLI_PORT | tr -d '"')"
-AI_CLI_USER="$(_env_val AI_CLI_USER | tr -d '"')"
+AI_CLI_BIND="$(ai_unq "$(_env_val AI_CLI_BIND)")"
+AI_CLI_PORT="$(ai_unq "$(_env_val AI_CLI_PORT)")"
+AI_CLI_USER="$(ai_unq "$(_env_val AI_CLI_USER)")"
 if [ "${AI_CLI_ENABLED:-false}" = "true" ]; then
     log "provisioning the AI CLI service (activated by .env)…"
     if [ -f "$STACK_DIR/ai-cli/setup-ai-cli.sh" ]; then
@@ -2453,8 +2458,8 @@ fi
 # refusal and not a default, because guessing which household member's board
 # these gauges land on puts one person's usage on another person's panel.
 # Same unset-variable defect as AI_CLI_ENABLED and the mesh tunnel.
-AI_USAGE_ENABLED="$(_env_val AI_USAGE_ENABLED | tr -d '"')"
-AI_USAGE_USER_ACCOUNT="$(_env_val AI_USAGE_USER_ACCOUNT | tr -d '"')"
+AI_USAGE_ENABLED="$(ai_unq "$(_env_val AI_USAGE_ENABLED)")"
+AI_USAGE_USER_ACCOUNT="$(ai_unq "$(_env_val AI_USAGE_USER_ACCOUNT)")"
 if [ "${AI_USAGE_ENABLED:-false}" = "true" ]; then
     log "provisioning the AI-usage feeder (activated by .env)…"
     if [ -f "$STACK_DIR/ai-usage/setup-ai-usage.sh" ]; then

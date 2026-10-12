@@ -91,6 +91,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -230,10 +231,31 @@ def path_absent(path):
     try:
         os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
-        return True
+        pass
     except OSError:
         return False
-    return False
+    else:
+        return False
+    # lstat only vouches for the last component: with a DANGLING ANCESTOR symlink
+    # (~/.claude -> a missing target) every descendant also says ENOENT, yet that is a
+    # broken install, not a login that is owed. Walk up to the first ancestor that
+    # exists; if it is a link whose target is gone, the path is not "absent".
+    parent = os.path.dirname(path)
+    while parent and parent != os.path.dirname(parent):
+        try:
+            st = os.lstat(parent)
+        except (FileNotFoundError, NotADirectoryError):
+            parent = os.path.dirname(parent)
+            continue
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                os.stat(parent)
+            except OSError:
+                return False          # a dangling (or unreadable) link above the path
+        break
+    return True
 
 
 def binary_absent(binary, env):

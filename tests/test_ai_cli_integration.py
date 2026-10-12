@@ -727,7 +727,10 @@ def _hook_text():
     text = FIRSTBOOT.read_text(encoding="utf-8")
     start = text.index("ai_cli_provision_hook() {")
     end = text.index("\n}\n", start) + 3
-    return text, start, text[start:end]
+    # the shared unquote helper the hook (and 6d/6e) call is a top-level function
+    u0 = text.index("ai_unq() {")
+    unq = text[u0:text.index("\n}\n", u0) + 3]
+    return text, start, unq + text[start:end]
 
 
 def test_firstboot_hook_only_schedules_and_runs_before_6d_llr1119():

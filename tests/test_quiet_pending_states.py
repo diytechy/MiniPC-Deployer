@@ -284,7 +284,7 @@ def test_the_credential_conditions_sit_under_unit_where_systemd_reads_them(tmp_p
               "homehub-gemini-refresh.service.d": ".gemini/oauth_creds.json"}
     for dropin, rel in expect.items():
         cp = _ini((box.units / dropin / "10-account.conf").read_text(encoding="utf-8"))
-        assert cp.get("Unit", "ConditionPathExists") == "/home/alice/" + rel, dropin
+        assert cp.get("Unit", "ConditionPathExists") == "|/home/alice/" + rel, dropin
         assert not any(k.startswith("Condition") for k in cp["Service"]), "ignored under [Service]"
         assert cp.get("Service", "User") == "alice"
 
@@ -497,3 +497,175 @@ def test_a_dangling_credential_link_is_present_and_fails_loudly(tmp_path, monkey
     env, _, _, failures = _run(tmp_path, "claude", AI_USAGE_CLAUDE_CREDENTIALS=str(cred))
     assert any("unreadable: FileNotFoundError" in f for f in failures), failures
     assert not env.get("_notes")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 2
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ---- every firstboot gate uses the ONE unquote rule ------------------------------------------
+
+def _gate_value(tmp_path, key, raw):
+    """Run firstboot.sh's OWN assignment line for `key` (6d / 6e), against an .env."""
+    text = ti.FIRSTBOOT.read_text(encoding="utf-8")
+    line = [l for l in text.splitlines() if re.match(r"^%s=\"" % key, l)]
+    assert len(line) == 1, (key, line)
+    u0 = text.index("ai_unq() {")
+    unq = text[u0:text.index("\n}\n", u0) + 3]
+    stack = tmp_path / "gate-stack"
+    stack.mkdir(exist_ok=True)
+    (stack / ".env").write_text("%s=%s\n" % (key, raw), encoding="utf-8")
+    script = tmp_path / "gate.sh"
+    script.write_text(
+        "set -euo pipefail\nSTACK_DIR=%s\n"
+        "_env_val() { sed -n \"s/^$1=//p\" \"$STACK_DIR/.env\" 2>/dev/null | head -1 | tr -d '\\r'; }\n%s\n%s\n"
+        "[ \"${%s:-false}\" = \"true\" ] && echo ON || echo OFF\n" % (stack.as_posix(), unq, line[0], key),
+        encoding="utf-8")
+    box = ti.Box(tmp_path, [])
+    out = subprocess.run([box.bash, script.as_posix()], env=box.env(), capture_output=True, text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout.strip()
+
+
+@pytest.mark.parametrize("key", ["AI_CLI_ENABLED", "AI_USAGE_ENABLED"])
+@pytest.mark.parametrize("raw,expect", [("true", "ON"), ('"true"', "ON"), ("'true'", "ON"),
+                                        ("True", "OFF"), ("\"'true'\"", "OFF"), ("false", "OFF")],
+                         ids=["plain", "dq", "sq", "Title", "dq-sq", "false"])
+def test_6d_and_6e_gates_agree_with_the_hook_on_every_form(tmp_path, key, raw, expect):
+    assert _gate_value(tmp_path, key, raw) == expect
+
+
+def test_no_ai_gate_in_firstboot_still_strips_only_double_quotes():
+    text = ti.FIRSTBOOT.read_text(encoding="utf-8")
+    offenders = [l for l in text.splitlines()
+                 if re.search(r"(AI_CLI|AI_USAGE)_[A-Z_]+\"?\)?.*tr -d '\"'", l) and "ai_unq" not in l]
+    assert offenders == [], offenders
+
+
+# ---- a dangling ANCESTOR is a failure; a really missing parent is "login owed" ---------------------
+
+class FakeFs(object):
+    """A tiny virtual filesystem behind os.lstat / os.stat: path -> 'dir' | 'file' | 'dangling'."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def _st(self, path, follow):
+        kind = self.nodes.get(path.replace("\\", "/"))
+        if kind is None:
+            raise FileNotFoundError(2, "No such file or directory", path)
+        if kind == "dangling":
+            if follow:
+                raise FileNotFoundError(2, "No such file or directory", path)
+            return os.stat_result((0o120777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return os.stat_result((0o040755 if kind == "dir" else 0o100644, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+    def lstat(self, path, *a, **k):
+        return self._st(str(path), False)
+
+    def stat(self, path, *a, **k):
+        return self._st(str(path), True)
+
+
+def _fake(monkeypatch, nodes):
+    fs = FakeFs(nodes)
+    monkeypatch.setattr(feeder.os, "lstat", fs.lstat)
+    monkeypatch.setattr(feeder.os, "stat", fs.stat)
+
+
+def test_dangling_ancestor_symlink_is_not_absent(monkeypatch):
+    _fake(monkeypatch, {"/home": "dir", "/home/alice": "dir", "/home/alice/.claude": "dangling"})
+    assert feeder.path_absent("/home/alice/.claude/.credentials.json") is False
+    # a dangling link two levels up is found too
+    _fake(monkeypatch, {"/home": "dir", "/home/alice": "dangling"})
+    assert feeder.path_absent("/home/alice/.claude/.credentials.json") is False
+
+
+def test_really_missing_parent_directory_is_absent(monkeypatch):
+    _fake(monkeypatch, {"/home": "dir", "/home/alice": "dir"})                 # no .claude at all
+    assert feeder.path_absent("/home/alice/.claude/.credentials.json") is True
+    assert feeder.path_absent("/home/alice/.claude/deeper/x.json") is True
+
+
+def test_a_valid_symlinked_ancestor_with_nothing_inside_is_still_absent(monkeypatch):
+    class Fs(FakeFs):
+        def _st(self, path, follow):
+            if path == "/home/alice/.claude":                # a link whose target exists
+                return os.stat_result((0o120777 if not follow else 0o040755, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            return FakeFs._st(self, path, follow)
+    fs = Fs({"/home": "dir", "/home/alice": "dir"})
+    monkeypatch.setattr(feeder.os, "lstat", fs.lstat)
+    monkeypatch.setattr(feeder.os, "stat", fs.stat)
+    assert feeder.path_absent("/home/alice/.claude/.credentials.json") is True
+
+
+def test_the_dangling_ancestor_makes_the_claude_reader_fail_loudly(tmp_path, monkeypatch):
+    cred = "/home/alice/.claude/.credentials.json"
+    _fake(monkeypatch, {"/home": "dir", "/home/alice": "dir", "/home/alice/.claude": "dangling"})
+    real_open = open
+    monkeypatch.setattr("builtins.open", lambda p, *a, **k: (_ for _ in ()).throw(FileNotFoundError(2, "x"))
+                        if str(p) == cred else real_open(p, *a, **k))
+    env, _, _, failures = _run(tmp_path, "claude", AI_USAGE_CLAUDE_CREDENTIALS=cred)
+    assert any("unreadable: FileNotFoundError" in f for f in failures), failures
+    assert not env.get("_notes")
+
+
+ANCESTORS = r"""set -u
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+mkdir -p $W/home/a $W/home/b
+ln -s $W/nowhere $W/home/a/.claude          # dangling ancestor
+mkdir -p $W/home/b/.other                   # b has NO .claude at all
+python3 - "$W" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("f", "@@REPO@@/stack/ai-usage/ai_usage_feeder.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+w = sys.argv[1]
+print("DANGLING-PARENT absent=%s" % m.path_absent(w + "/home/a/.claude/.credentials.json"))
+print("MISSING-PARENT absent=%s" % m.path_absent(w + "/home/b/.claude/.credentials.json"))
+print("MISSING-FILE absent=%s" % m.path_absent(w + "/home/b/.other/.credentials.json"))
+PY
+"""
+
+
+def test_real_symlinks_in_wsl_dangling_ancestor_fails_missing_parent_is_pending(tmp_path):
+    done = ti._wsl_root(ANCESTORS, tmp_path)
+    out = done.stdout
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "DANGLING-PARENT absent=False" in out, out
+    assert "MISSING-PARENT absent=True" in out, out
+    assert "MISSING-FILE absent=True" in out, out
+
+
+# ---- credential gates: the same OR group as the CLI gate ---------------------------------------
+
+CRED_CASES = r"""set -u
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+touch $T/plain
+ln -s $T/nowhere $T/dangling
+for n in absent plain dangling; do
+  systemd-analyze condition @@CONDITIONS@@ >/dev/null 2>&1
+  echo "CASE $n rc=$?"
+done
+"""
+
+
+@pytest.mark.parametrize("dropin,rel", [("homehub-claude-refresh@claude.service.d", ".claude/.credentials.json"),
+                                        ("homehub-claude-refresh@claude2.service.d", ".claude-2/.credentials.json"),
+                                        ("homehub-gemini-refresh.service.d", ".gemini/oauth_creds.json")],
+                         ids=["claude", "claude2", "gemini"])
+def test_credential_gate_skips_only_an_empty_path_under_real_systemd(tmp_path, dropin, rel):
+    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
+                                          "AI_USAGE_USER_ACCOUNT=alice"])
+    assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
+    cp = _ini((box.units / dropin / "10-account.conf").read_text(encoding="utf-8"))
+    path = "/home/alice/" + rel
+    assert cp.get("Unit", "ConditionPathExists") == "|" + path
+    assert cp.get("Unit", "ConditionPathIsSymbolicLink") == "|" + path
+    lines = ["ConditionPathExists=" + cp.get("Unit", "ConditionPathExists"),
+             "ConditionPathIsSymbolicLink=" + cp.get("Unit", "ConditionPathIsSymbolicLink")]
+    cond = " ".join('"%s"' % l.replace(path, "$T/$n") for l in lines)
+    done = ti._wsl_root(CRED_CASES.replace("@@CONDITIONS@@", cond), tmp_path)
+    if "systemd-analyze" in done.stderr and "not found" in done.stderr:
+        pytest.skip("no systemd-analyze in WSL")
+    rcs = dict(re.findall(r"CASE (\w+) rc=(\d+)", done.stdout))
+    assert rcs == {"absent": "1", "plain": "0", "dangling": "0"}, (done.stdout, done.stderr)

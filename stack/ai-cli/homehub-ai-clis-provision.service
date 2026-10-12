@@ -1,0 +1,14 @@
+[Unit]
+Description=Provision the AI CLIs the enabled services need (SR-076, SR-078)
+Documentation=file:///opt/homehub/stack/ai-cli/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Its own supervised unit so that first boot never waits on a download: firstboot
+# only runs "provision-ai-clis.sh --schedule", which starts this with --no-block.
+# Exit 0 = converged (the run disables its own timer). Exit 3 = INCOMPLETE; the
+# timer retries. Exit 2 = configuration refused.
+Type=oneshot
+TimeoutStartSec=3600
+ExecStart=/opt/homehub/stack/ai-cli/provision-ai-clis.sh --run

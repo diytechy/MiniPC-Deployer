@@ -239,6 +239,8 @@ capped at `AI_CLI_MAX_CONNECTIONS` and idle ones time out after
 | `routes-enabled` | the consent half — which routes a caller may name |
 | `homehub-ai-cli.service` | the systemd unit (dedicated account, 0700 state tree) |
 | `setup-ai-cli.sh` | idempotent account creation + install; refuses `hub`, sudo, a LAN bind |
+| `provision-ai-clis.sh`, `ai-clis.manifest.tsv`, `wrapper.template` | the CLI provisioner, its pins and the per-identity launcher (SR-076..SR-078) |
+| `homehub-ai-clis-provision.{service,timer}` | the provisioning unit and its retry timer |
 | `tests/ai-cli-guards.test.sh` | the hermetic guards suite (21 checks), in `run-hermetic-tests.sh` |
 
 Python unit tests live at `tests/test_ai_cli_service.py` (120 cases).
@@ -249,7 +251,8 @@ Python unit tests live at `tests/test_ai_cli_service.py` (120 cases).
    `stack/.env`. All of them are declared in `stack/.env.example` and in
    HomeHub's `FieldSchema.psd1`.
 2. Re-run firstboot, or `sudo bash /opt/homehub/stack/ai-cli/setup-ai-cli.sh`.
-3. **A human still has to sign the CLIs in.** RDP to the box as
+3. **The CLIs install themselves** (first boot or a deploy schedules
+   `provision-ai-clis.sh`; see below). **A human still has to sign them in.** RDP to the box as
    `AI_CLI_USER` and run `claude setup-token`. It falls back to pasting a code,
    which is documented to work when the link is opened on a different computer,
    so copying the URL to the dev PC is fine and no SSH tunnel is needed — the
@@ -259,6 +262,56 @@ Python unit tests live at `tests/test_ai_cli_service.py` (120 cases).
    reimage checklist names the re-login step.
 
 **Adds no apt package.** The service is Python 3 stdlib only and `python3` is
-already in `packages.list`; the CLIs are not apt packages at all (SN-016) and
-are installed over SSH by the Owner, deliberately outside the offline closure.
-So no apt export re-run is owed by this change.
+already in `packages.list`. The CLIs are not apt packages either (SN-016), but
+they are no longer installed by hand: see the next section. So no apt export
+re-run is owed by this change.
+
+## The CLIs are provisioned, not hand-installed
+
+**Spine:** SN-047 (amends SN-016), SR-076..SR-078, LLR-1104..LLR-1112,
+TC-1193..TC-1204, IF-038. Owner ruling 2026-10-11: the deployers package or pull
+what the configuration needs, and the operator is told only which **logins**
+remain.
+
+`provision-ai-clis.sh` installs exactly the CLIs the enabled consumers need
+(`AI_USAGE_SOURCES` when `AI_USAGE_ENABLED=true`; Claude for the `ai-cli`
+service, plus Codex only when an enabled route is an OPENAI-family row of the
+registry at `AI_CLI_REGISTRY`) from the pins in `ai-clis.manifest.tsv`: version,
+https URL, sha256, size, archive kind, whole-tree inventory. Each install is
+staged under `/opt/homehub/ai-clis/.staging`, checked as the effective service
+account, published under an identity directory
+(`<version>-<sha12>-w<wrapper rev>`, plus the Node pin for Gemini), and linked
+from `/usr/local/bin/<name>` by a recorded, reversible activation. Gemini's
+private Node runtime lives in the same root-owned prefix and is never linked
+into `/usr/local/bin`.
+
+```
+provision-ai-clis.sh --schedule        # what first boot / a deploy calls: no network, returns at once
+provision-ai-clis.sh --run             # converge (what the unit runs); exit 0 done, 3 retry owed, 2 refused
+provision-ai-clis.sh --status [--json] # PROVISIONING: complete | INCOMPLETE - <key>: <reason>; retrying every N min
+provision-ai-clis.sh --check           # read-only
+provision-ai-clis.sh --rollback KEY    # back to what the link pointed at before
+```
+
+* **Failure is a state, not an error.** No network, a bad checksum or a full disk
+  leaves `PROVISIONING: INCOMPLETE` with the reason, and
+  `homehub-ai-clis-provision.timer` retries every `AI_CLI_PROVISION_RETRY_MINUTES`
+  (default 15, clamped 5..1440) until it converges, then disables itself.
+  `AI_CLI_PROVISION=off` turns the whole thing off.
+* **Hand-installed CLIs keep working** until a managed activation of the same CLI
+  succeeds, and the old `/opt/node` trees are left on disk. A failed first
+  download changes nothing.
+* **A converged re-run does nothing**: no network call, no write, `state.json`
+  included.
+* **Updaters are suppressed** by the per-identity wrapper (`wrapper.template`);
+  the `/etc` settings files that complete that are installed by the setup scripts.
+* **Logins stay human** and credentials are never read or written here.
+* Not proven by the tests: the online path against the real vendor hosts from the
+  dev PC, a real `runuser` to a real account, and systemd re-arming the timer
+  after a run that exited 3. The hub run is the evidence.
+
+Everything the script reads from `.env` is `AI_USAGE_ENABLED`, `AI_USAGE_SOURCES`,
+`AI_CLI_ENABLED`, `AI_CLI_USER`, `AI_USAGE_USER_ACCOUNT`, `AI_CLI_REGISTRY`,
+`AI_CLI_ENABLED_ROUTES`, `AI_CLI_PROVISION` and `AI_CLI_PROVISION_RETRY_MINUTES`;
+it never sources the file. Tests: `tests/test_provision_ai_clis.py` (needs Linux;
+run it under `wsl -d Ubuntu`).

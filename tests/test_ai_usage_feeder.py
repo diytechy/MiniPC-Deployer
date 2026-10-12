@@ -1311,7 +1311,10 @@ def test_the_refresher_never_names_the_home_with_percent_h():
     offenders = [l for l in directives if "%h" in l]
     assert not offenders, "%%h resolves to /root in a system unit: %r" % offenders
     setup = (REPO / "stack" / "ai-usage" / "setup-ai-usage.sh").read_text(encoding="utf-8")
-    assert 'getent passwd "$AI_USAGE_USER_ACCOUNT"' in setup
+    # The home is resolved for the EFFECTIVE account (AI_CLI_USER when the CLI
+    # service is enabled, else AI_USAGE_USER_ACCOUNT), never for the raw knob.
+    assert 'getent passwd "$ACCOUNT"' in setup
+    assert 'getent passwd "$AI_USAGE_USER_ACCOUNT"' not in setup
 
 
 def test_the_refresher_discards_its_output():

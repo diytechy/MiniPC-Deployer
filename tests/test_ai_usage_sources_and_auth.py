@@ -380,7 +380,16 @@ def test_setup_is_idempotent_on_a_migrated_box_sr067(tmp_path):
 
 
 def test_setup_gives_account_two_only_its_own_directory_sr067(tmp_path):
-    done, units, calls = run_setup(tmp_path, "claude,claude2,codex,gemini,opencode")
+    # The shipped credential defaults, so every login is OWED (the status step
+    # prints a sign-in recipe only for a login that is actually owed).
+    knobs = {"AI_USAGE_CLAUDE_CREDENTIALS": "/home/homehub-ai/.claude/.credentials.json",
+             "AI_USAGE_CLAUDE2_CREDENTIALS": "/home/homehub-ai/.claude-2/.credentials.json",
+             "AI_USAGE_GEMINI_CREDENTIALS": "/home/homehub-ai/.gemini/oauth_creds.json",
+             "AI_USAGE_OPENCODE_AUTH": "/home/homehub-ai/.local/share/opencode/auth.json"}
+    done, units, calls = run_setup(tmp_path, "claude,claude2,codex,gemini,opencode",
+                                   extra_env=dict(knobs, AI_USAGE_USER_ACCOUNT="homehub-ai",
+                                                  # Git Bash would rewrite these POSIX paths for the status step's python
+                                                  MSYS2_ENV_CONV_EXCL=";".join(knobs)))
     assert done.returncode == 0, done.stdout + done.stderr
     two = (units / "homehub-claude-refresh@claude2.service.d" / "10-account.conf").read_text(encoding="utf-8")
     assert "Environment=CLAUDE_CONFIG_DIR=/home/homehub-ai/.claude-2" in two

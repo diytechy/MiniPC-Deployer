@@ -771,6 +771,37 @@ def test_schedule_makes_no_network_call_and_enables_the_timer_before_starting_th
     assert not (lab.prefix / ".staging").exists()
 
 
+def test_install_units_copies_the_files_reloads_and_enables_nothing(lab):
+    cp = lab.run("--install-units", AI_CLI_UNIT_DIR=str(lab.units / "fresh"))
+    assert cp.returncode == 0, out(cp)
+    for n in ("homehub-ai-clis-provision.service", "homehub-ai-clis-provision.timer"):
+        f = lab.units / "fresh" / n
+        assert f.read_bytes() == (CLI_DIR / n).read_bytes() and stat.S_IMODE(f.stat().st_mode) == 0o644
+    assert lab.log("systemctl.log") == ["daemon-reload"]        # nothing enabled, nothing started
+    assert lab.curl_urls() == []
+
+
+def test_install_units_rerun_writes_nothing(lab):
+    assert lab.run("--install-units").returncode == 0
+    (lab.logs / "systemctl.log").unlink()
+    before = lab.snapshot(lab.units)
+    time.sleep(0.05)
+    cp = lab.run("--install-units")
+    assert cp.returncode == 0 and "already current" in out(cp)
+    assert lab.snapshot(lab.units) == before and lab.log("systemctl.log") == []
+
+
+def test_schedule_on_a_box_without_units_installs_them_then_enables_the_timer(lab):
+    lab.claude()
+    lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="claude")
+    assert list(lab.units.iterdir()) == []
+    assert lab.run("--schedule").returncode == 0
+    assert (lab.units / "homehub-ai-clis-provision.service").exists() and (lab.units / "homehub-ai-clis-provision.timer").exists()
+    calls = lab.log("systemctl.log")
+    assert calls.index("daemon-reload") < calls.index("enable --now homehub-ai-clis-provision.timer") < calls.index(
+        "start --no-block homehub-ai-clis-provision.service")
+
+
 def test_exit_three_keeps_the_timer_enabled_and_exit_zero_disables_it(lab):
     lab.claude()
     lab.urlmap.clear(); lab.write_manifest()

@@ -9,7 +9,10 @@
 # told only which LOGINS remain. Logins stay human. Credentials are never read,
 # written or moved by this script.
 #
-# Usage: provision-ai-clis.sh [--schedule | --run | --check | --status [--json] | --rollback KEY]
+# Usage: provision-ai-clis.sh [--install-units | --schedule | --run | --check | --status [--json] | --rollback KEY]
+#   --install-units  Copy the two unit files from this directory into the unit directory
+#               (mode 0644), daemon-reload when anything changed; enables and starts nothing.
+#               Idempotent: identical files are not rewritten. --schedule does this first.
 #   --schedule  No network. Install the units, render the retry interval, enable
 #               the retry timer, then start the provisioning unit with
 #               --no-block. Never waits on the artifact lock (a retry may hold
@@ -47,7 +50,7 @@ ENV_FILE="${AI_CLIS_ENV_FILE:-$HERE/../.env}"
 CURL="${AI_CLIS_CURL:-curl}"
 RUNUSER="${AI_CLIS_RUNUSER:-runuser}"
 SYSTEMCTL="${AI_CLIS_SYSTEMCTL:-systemctl}"
-UNIT_DIR="${AI_CLIS_UNIT_DIR:-/etc/systemd/system}"
+UNIT_DIR="${AI_CLI_UNIT_DIR:-${AI_CLIS_UNIT_DIR:-/etc/systemd/system}}"
 VAR_TMP="${AI_CLIS_VAR_TMP:-/var/tmp}"
 CHOWN="${AI_CLIS_CHOWN:-chown}"
 OWNER="${AI_CLIS_OWNER:-root:root}"
@@ -923,9 +926,14 @@ mode_rollback() {
 # -------------------------------------------------------------------------- main
 MODE="${1:-}"
 case "$MODE" in
-    --schedule|--run|--check|--status|--rollback) ;;
-    *) refuse "usage: provision-ai-clis.sh [--schedule | --run | --check | --status [--json] | --rollback KEY]" ;;
+    --install-units|--schedule|--run|--check|--status|--rollback) ;;
+    *) refuse "usage: provision-ai-clis.sh [--install-units | --schedule | --run | --check | --status [--json] | --rollback KEY]" ;;
 esac
+if [ "$MODE" = "--install-units" ]; then    # needs neither the manifest nor the .env
+    RELOAD=0; install_units
+    if [ "$RELOAD" = 1 ]; then "$SYSTEMCTL" daemon-reload || exit 3; say "units installed in $UNIT_DIR"; else say "units already current in $UNIT_DIR"; fi
+    exit 0
+fi
 load_manifest
 load_config
 case "$ACCOUNT" in

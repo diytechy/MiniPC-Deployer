@@ -286,7 +286,8 @@ private Node runtime lives in the same root-owned prefix and is never linked
 into `/usr/local/bin`.
 
 ```
-provision-ai-clis.sh --schedule        # what first boot / a deploy calls: no network, returns at once
+provision-ai-clis.sh --install-units    # copy the two unit files (0644) + daemon-reload; enables nothing
+provision-ai-clis.sh --schedule        # installs the units first, then: what first boot / a deploy calls: no network, returns at once
 provision-ai-clis.sh --run             # converge (what the unit runs); exit 0 done, 3 retry owed, 2 refused
 provision-ai-clis.sh --status [--json] # PROVISIONING: complete | INCOMPLETE - <key>: <reason>; retrying every N min
 provision-ai-clis.sh --check           # read-only

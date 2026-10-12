@@ -2016,3 +2016,22 @@ def test_recognising_a_managed_link_takes_the_predecessor_of_that_exact_target(l
     assert lab.run("--run").returncode == 0
     rec = lab.state()["clis"]["claude"]["activation"]
     assert rec["to"] == c_link and rec["from"] == b_link != a_link
+
+
+def test_a_rollback_of_one_cli_does_not_disarm_retries_while_another_cli_has_an_open_transaction(lab):
+    lab.claude("1.0.0"); lab.codex()
+    lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="claude")
+    assert lab.run("--run").returncode == 0
+    a_link = lab.link("claude")
+    lab.claude("2.0.0")
+    assert lab.run("--run").returncode == 0                                   # claude: A -> B, committed
+    lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="claude,codex")
+    assert lab.run("--run", AI_CLIS_DIE_AT="swap").returncode == -9            # codex: first install, killed after the swap
+    assert lab.state()["clis"]["codex"]["activation"]["state"] == "pending"
+    lab.set_deny(lab.bin / "codex")                                            # its check fails ...
+    (lab.logs / "systemctl.log").unlink(missing_ok=True)
+    cp = lab.run("--rollback", "claude", AI_CLIS_FAIL_REMOVE="1")               # ... and its restore (a removal) fails, so it stays open
+    assert cp.returncode == 0, out(cp)
+    assert lab.link("claude") == a_link                                         # claude was rolled back
+    assert lab.state()["clis"]["codex"]["activation"]["state"] == "pending"     # codex is still open
+    assert not any(c.startswith("disable") for c in lab.log("systemctl.log"))   # so the timer was NOT disabled

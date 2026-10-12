@@ -28,12 +28,24 @@ log() { printf 'ensure-ai-account: %s\n' "$*"; }
 die() { printf 'ensure-ai-account: FAILED: %s\n' "$*" >&2; exit 1; }
 refuse() { printf 'ensure-ai-account: REFUSED: %s\n' "$*" >&2; exit 2; }
 
+# One truthiness rule for the whole stack: strip ONE matched pair of quotes, then
+# compare EXACTLY (`true`; `True` is not true). Callers may pass raw .env values.
+unquote() {
+    local v="${1%$'\r'}"
+    case "$v" in
+        \"*\") v="${v#\"}"; v="${v%\"}" ;;
+        \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    printf '%s' "$v"
+}
+
 if [ "${1:-}" = "--effective" ]; then
-    if [ "${2:-}" = "true" ]; then
-        printf '%s\n' "${3:-$DEFAULT_ACCOUNT}"
+    if [ "$(unquote "${2:-}")" = "true" ]; then
+        name="$(unquote "${3:-}")"
     else
-        printf '%s\n' "${4:-$DEFAULT_ACCOUNT}"
+        name="$(unquote "${4:-}")"
     fi
+    printf '%s\n' "${name:-$DEFAULT_ACCOUNT}"
     exit 0
 fi
 

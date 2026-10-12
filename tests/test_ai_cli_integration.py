@@ -1048,7 +1048,7 @@ def test_an_idle_legacy_service_still_migrates_and_exits_0_sr067(tmp_path):
 def test_firstboot_keeps_going_when_the_usage_setup_exits_3_sr067():
     text = FIRSTBOOT.read_text(encoding="utf-8")
     block = text[text.index("# ── 6e."):text.index("# ── 6f.")]
-    assert 'if bash "$STACK_DIR/ai-usage/setup-ai-usage.sh"' in block and "else" in block, \
+    assert 'bash "$STACK_DIR/ai-usage/setup-ai-usage.sh"' in block and "if AI_CLI_SKIP_STATUS=1 bash" in block         and "else" in block, \
         "a non-zero exit takes the WARNING branch, never aborts firstboot"
 
 

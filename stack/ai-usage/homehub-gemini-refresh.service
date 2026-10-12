@@ -22,6 +22,11 @@
 Description=HomeHub: keep the Gemini CLI token fresh (SR-021)
 Documentation=file:///opt/homehub/stack/ai-usage/README.md
 After=network-online.target
+# "NOT INSTALLED YET" IS A QUIET STATE, not a failure (Owner 2026-10-11): until
+# provision-ai-clis.sh has linked the CLI, systemd SKIPS this unit (a condition
+# is not an error and the unit never enters `failed`). The per-account drop-in
+# adds the same kind of condition for the credential - "login owed".
+ConditionFileIsExecutable=/usr/local/bin/gemini
 Wants=network-online.target
 
 [Service]

@@ -207,6 +207,31 @@ class SourceFailure(Exception):
     """
 
 
+class PendingState(SourceFailure):
+    """An EXPECTED, quiet state - not a failure (Owner 2026-10-11).
+
+    Two of them exist: the source's CLI is "not installed yet" (provisioning will
+    install it) and "login owed" (the vendor sign-in has not happened, so there is
+    no credential). Both post UNAVAILABLE exactly as a failed source does, because
+    it IS a SourceFailure to every reader and to `build_post`; but `run_cycle`
+    records it as a NOTE, not a failure, so it logs one INFO line and does not
+    make the unit exit 1. A genuine error (a credential that exists and is
+    unreadable, a non-200, a crash) is still a failure.
+    """
+
+
+def provisioning_hint(env, key):
+    """' (provisioning: <reason>)' when the provisioner has recorded why `key` is
+    pending, else ''. Best effort: a missing or odd state file is just no hint."""
+    state_dir = env.get("AI_CLIS_STATE_DIR") or "/var/lib/homehub-ai-clis"
+    try:
+        with open(os.path.join(state_dir, "state.json"), encoding="utf-8") as handle:
+            reason = json.load(handle)["clis"][key]["pending"]["reason"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return ""
+    return " (provisioning: %s)" % reason if isinstance(reason, str) and reason else ""
+
+
 class AuthFailure(SourceFailure):
     """A SourceFailure that is KNOWN to be an authentication failure.
 
@@ -1693,6 +1718,8 @@ def read_secret_file(path, extractor):
     try:
         with open(os.path.expanduser(path), encoding="utf-8") as handle:
             data = json.load(handle)
+    except FileNotFoundError:
+        raise PendingState("login owed: no credential at %s yet" % path)
     except (OSError, ValueError) as exc:
         raise SourceFailure("credential %s unreadable: %s" % (path, type(exc).__name__))
     value = extractor(data)
@@ -2024,11 +2051,18 @@ def read_codex(env):
     """
     binary = env.get("AI_USAGE_CODEX_BIN") or "codex"
     timeout = int(env.get("AI_USAGE_TIMEOUT_SECONDS") or 30)
+    # The unit names the Codex home it signs in under; no auth.json there is
+    # "login owed", not a launch worth making (and not an error).
+    codex_home = env.get("CODEX_HOME")
+    if codex_home and not os.path.exists(os.path.join(codex_home, "auth.json")):
+        raise PendingState("login owed: no codex sign-in at %s yet" % os.path.join(codex_home, "auth.json"))
     try:
         child = subprocess.Popen(
             [binary, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    except FileNotFoundError:
+        raise PendingState("codex: not installed yet%s" % provisioning_hint(env, "codex"))
     except OSError as exc:
         raise SourceFailure("codex: cannot launch %s (%s)" % (binary, type(exc).__name__))
 
@@ -2089,7 +2123,7 @@ def _read_claude_account(env, name, credentials_knob, buckets, scoped_models):
     """
     path = env.get(credentials_knob)
     if not path:
-        raise SourceFailure("%s: %s unset" % (name, credentials_knob))
+        raise PendingState("%s: login owed (%s is not set)" % (name, credentials_knob))
     try:
         token = read_secret_file(path, _claude_token)
     except NoUsableKey as exc:
@@ -2164,7 +2198,7 @@ def read_gemini(env):
     """
     path = env.get("AI_USAGE_GEMINI_CREDENTIALS")
     if not path:
-        raise SourceFailure("gemini: AI_USAGE_GEMINI_CREDENTIALS unset")
+        raise PendingState("gemini: login owed (AI_USAGE_GEMINI_CREDENTIALS is not set)")
     models = parse_gemini_models(env.get("AI_USAGE_GEMINI_MODELS"))
     now = cycle_now(env)
     token, expiry_ms = read_secret_file(path, _gemini_token)
@@ -2198,7 +2232,7 @@ def read_opencode(env):
     """Source 3: the Zen usage endpoint, with the workspace bearer key."""
     path = env.get("AI_USAGE_OPENCODE_AUTH")
     if not path:
-        raise SourceFailure("opencode: AI_USAGE_OPENCODE_AUTH unset")
+        raise PendingState("opencode: login owed (AI_USAGE_OPENCODE_AUTH is not set)")
     key = read_secret_file(path, _opencode_key)
     url = env.get("AI_USAGE_OPENCODE_URL") or "https://opencode.ai/zen/go/v1/usage"
     # THE USER AGENT IS LOAD-BEARING AND WAS FOUND BY RUNNING THIS, NOT BY
@@ -2330,6 +2364,10 @@ def run_cycle(env, now=None, readers=None, poster=None):
         # SourceFailure, so listed second it would be swallowed by the plain
         # handler below and a dead login would be indistinguishable from a
         # network blip -- the defect plan 3.6 (G2) exists to fix.
+        except PendingState as exc:
+            # Quiet and expected: one INFO line (main prints the notes), the gauges
+            # go down the unavailable path, and it is NOT a failure.
+            env.setdefault("_notes", []).append("%s: %s" % (name, exc) if not str(exc).startswith(name) else str(exc))
         except AuthFailure as exc:
             auth_failed.add(name)
             failures.append("%s: %s" % (name, exc))
@@ -2435,6 +2473,8 @@ def main(argv=None):
                                             "posted" if ok else "POST FAILED"))
     for line in failures:
         print("ai-usage: %s" % line, file=sys.stderr)
+    for note in env.get("_notes", []):
+        print("ai-usage: INFO %s" % note)
     # ONE line that says this invocation reached its end. ai-cli-status.sh reads
     # it (with the journal's invocation id) to tell a completed cycle from one
     # that died part-way; without it a half-printed cycle looks like evidence.

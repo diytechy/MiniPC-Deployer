@@ -445,6 +445,9 @@ for key in needed:
         tail = "consumer operation verified" if key in verified_clis \
             else "installed, operation not yet verified"
         print("  %s %s: %s" % (key, version, tail) if version else "  %s: %s" % (key, tail))
+    elif status is not None and status.get("provisioning") == "off":
+        # Nobody is going to install it: say so plainly rather than promising it.
+        print("  %s: not installed - provisioning is off (AI_CLI_PROVISION=off)" % key)
     elif status is not None:
         reason = info.get("pending_reason")
         print("  %s: being provisioned%s" % (key, " (%s)" % reason if reason else ""))

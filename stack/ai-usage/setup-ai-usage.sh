@@ -53,16 +53,28 @@ ENSURE_ACCOUNT="${AI_CLI_ENSURE_ACCOUNT:-$HERE/../ai-cli/ensure-ai-account.sh}"
 # only so a test can point setup at a sandbox.
 CODEX_HOME_DIR="${AI_USAGE_CODEX_HOME:-/var/lib/homehub-ai-codex}"
 
+# One truthiness rule for the whole stack (systemd's EnvironmentFile semantics):
+# strip ONE matched pair of quotes, then compare EXACTLY (`true`, not `True`).
+unquote() {
+    local v="${1%$'\r'}"
+    case "$v" in
+        \"*\") v="${v#\"}"; v="${v%\"}" ;;
+        \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    printf '%s' "$v"
+}
+
 if [ -f "$ENV_FILE" ]; then
     # Read only the keys we own, and never `source` a file that may hold
     # secrets into this shell's environment wholesale.
     for key in AI_USAGE_ENABLED AI_USAGE_USER AI_USAGE_USER_ACCOUNT AI_USAGE_FEED_URL AI_USAGE_SOURCES AI_CLI_ENABLED AI_CLI_USER; do
-        value="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+        value="$(unquote "$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)")"
         [ -n "$value" ] && printf -v "$key" '%s' "$value"
     done
 fi
 
 say() { printf '%s\n' "$*"; }
+
 refuse() { say "REFUSED: $*"; exit 2; }
 
 # Is NAME one of the comma-separated AI_USAGE_SOURCES? Whitespace is ignored, as
@@ -210,6 +222,9 @@ cat > "$CLAUDE1_DROPIN_DIR/10-account.conf" <<EOF
 User=$ACCOUNT
 Group=$ACCOUNT
 ReadWritePaths=$REFRESH_HOME/.claude $REFRESH_HOME/.claude.json
+# No sign-in yet = "login owed": skipped quietly, not failed. The timer stays
+# enabled, so the first run after the sign-in needs no re-run of this script.
+ConditionPathExists=$REFRESH_HOME/.claude/.credentials.json
 EOF
 chmod 0644 "$CLAUDE1_DROPIN_DIR/10-account.conf"
 
@@ -232,6 +247,7 @@ User=$ACCOUNT
 Group=$ACCOUNT
 Environment=CLAUDE_CONFIG_DIR=$CLAUDE2_CONFIG_DIR
 ReadWritePaths=$CLAUDE2_CONFIG_DIR
+ConditionPathExists=$CLAUDE2_CONFIG_DIR/.credentials.json
 EOF
     chmod 0644 "$CLAUDE2_DROPIN_DIR/10-account.conf"
 fi
@@ -248,6 +264,7 @@ if source_enabled gemini; then
 User=$ACCOUNT
 Group=$ACCOUNT
 ReadWritePaths=$REFRESH_HOME/.gemini
+ConditionPathExists=$REFRESH_HOME/.gemini/oauth_creds.json
 EOF
     chmod 0644 "$GEMINI_DROPIN_DIR/10-account.conf"
 fi
@@ -541,7 +558,9 @@ AI_CLI_ETC_DIR="${AI_CLI_ETC_DIR:-$(dirname "$(dirname "$UNIT_DIR")")}" \
 # `claude auth login` for the account, CLAUDE_CONFIG_DIR for the second one,
 # CODEX_HOME for the usage Codex home - live there now; `claude setup-token` is
 # still the wrong command.) It never fails this script.
-AI_CLI_ENV_FILE="$ENV_FILE" bash "${AI_CLI_STATUS:-$HERE/../ai-cli/ai-cli-status.sh}" || true
+if [ "${AI_CLI_SKIP_STATUS:-0}" != 1 ]; then
+    AI_CLI_ENV_FILE="$ENV_FILE" bash "${AI_CLI_STATUS:-$HERE/../ai-cli/ai-cli-status.sh}" || true
+fi
 if [ "$LEGACY_BLOCKED" != 0 ]; then
     say "EXIT 3: everything else is installed, but the Claude refresher migration did"
     say "  not complete (see the WARNING / ERROR above). Exactly ONE of $OLD_TIMER and"

@@ -188,7 +188,7 @@ def test_claude2_reads_its_own_credential_file_and_never_account_ones_sr067(monk
     assert set(out) == {"ai-usage-claude2-session", "ai-usage-claude2-weekly",
                         "ai-usage-claude2-weekly-fable"}
     # With only account one's knob set, claude2 must not fall back to it.
-    with pytest.raises(feeder.SourceFailure, match="AI_USAGE_CLAUDE2_CREDENTIALS unset"):
+    with pytest.raises(feeder.PendingState, match="login owed.*AI_USAGE_CLAUDE2_CREDENTIALS"):
         feeder.read_claude2({"AI_USAGE_CLAUDE_CREDENTIALS": str(one), "_now": NOW})
 
 

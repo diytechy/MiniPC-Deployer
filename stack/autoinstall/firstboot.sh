@@ -2284,6 +2284,16 @@ ai_cli_provision_hook() {
         return 0
     fi
     log "AI consumers enabled - service account is $AI_EFFECTIVE_ACCOUNT"
+    # A usage-only box whose identity or destination is blank cannot start anyway
+    # (setup-ai-usage.sh refuses it): do not schedule downloads for it. --check-only
+    # makes no change; it runs the same refusals setup would.
+    if [ "$cli_en" != "true" ] && [ -f "$STACK_DIR/ai-usage/setup-ai-usage.sh" ]; then
+        if ! bash "$STACK_DIR/ai-usage/setup-ai-usage.sh" --check-only >/dev/null 2>&1; then
+            log "  WARNING: the AI-usage settings are incomplete (see AI_USAGE_USER / AI_USAGE_FEED_URL);"
+            log "    nothing was scheduled for download. Fix .env and re-run firstboot."
+            return 0
+        fi
+    fi
     if bash "$src_dir/ensure-ai-account.sh" "$AI_EFFECTIVE_ACCOUNT" 2>&1 | sed 's/^/  /'; then
         :
     else
@@ -2332,7 +2342,8 @@ AI_CLI_USER="$(_env_val AI_CLI_USER | tr -d '"')"
 if [ "${AI_CLI_ENABLED:-false}" = "true" ]; then
     log "provisioning the AI CLI service (activated by .env)…"
     if [ -f "$STACK_DIR/ai-cli/setup-ai-cli.sh" ]; then
-        if bash "$STACK_DIR/ai-cli/setup-ai-cli.sh" 2>&1 | sed 's/^/  /'; then
+        # AI_CLI_SKIP_STATUS: the one status summary is printed at the end of 6e.
+        if AI_CLI_SKIP_STATUS=1 bash "$STACK_DIR/ai-cli/setup-ai-cli.sh" 2>&1 | sed 's/^/  /'; then
             log "  AI CLI service installed and enabled on ${AI_CLI_BIND:-127.0.0.1}:${AI_CLI_PORT:-8791}"
             log "  Any sign-in still owed is listed in the AI status summary below"
             log "    (PROVISIONING / LOGINS OWED). Credentials do not survive a"
@@ -2436,7 +2447,7 @@ AI_USAGE_USER_ACCOUNT="$(_env_val AI_USAGE_USER_ACCOUNT | tr -d '"')"
 if [ "${AI_USAGE_ENABLED:-false}" = "true" ]; then
     log "provisioning the AI-usage feeder (activated by .env)…"
     if [ -f "$STACK_DIR/ai-usage/setup-ai-usage.sh" ]; then
-        if bash "$STACK_DIR/ai-usage/setup-ai-usage.sh" 2>&1 | sed 's/^/  /'; then
+        if AI_CLI_SKIP_STATUS=1 bash "$STACK_DIR/ai-usage/setup-ai-usage.sh" 2>&1 | sed 's/^/  /'; then
             log "  AI-usage feeder installed; timer runs every 10 minutes"
             log "  STILL OWED BY A HUMAN: the vendor sign-ins live in"
             log "    ${AI_EFFECTIVE_ACCOUNT:-${AI_USAGE_USER_ACCOUNT:-homehub-ai}}'s home (the account the units run as)"

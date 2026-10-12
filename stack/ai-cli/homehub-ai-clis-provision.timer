@@ -1,0 +1,15 @@
+[Unit]
+Description=Retry AI CLI provisioning until it converges (SR-078)
+Documentation=file:///opt/homehub/stack/ai-cli/README.md
+
+[Timer]
+# Installed DISABLED; "provision-ai-clis.sh --schedule" enables it and a converged
+# "--run" disables it again. The retry interval (AI_CLI_PROVISION_RETRY_MINUTES,
+# default 15, clamped 5..1440) is written as OnUnitInactiveSec= into the drop-in
+# homehub-ai-clis-provision.timer.d/interval.conf by the script, not here.
+OnBootSec=5min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

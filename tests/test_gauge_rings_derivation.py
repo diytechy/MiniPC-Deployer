@@ -548,3 +548,40 @@ def test_tc1218_file_without_ai_usage_is_not_checked(tmp_path):
     env, source, dest = make_raw(tmp_path, "OTHER=\"a\\\"b\nPANEL_ACCESS_ENABLED=false\n")
     MODULE.install(env, source, dest)
     assert dest.read_bytes() == source.read_bytes()
+
+
+# ---- fix round 6: the keys the derivation reads must be plain ASCII ----
+
+NBSP = chr(0xA0)
+
+
+@pytest.mark.parametrize("value", [
+    NBSP, "codex" + NBSP, chr(0xE9) + "codex", "co" + chr(1) + "dex", "codex" + chr(11), "codex" + chr(0x2003),
+    "\"" + NBSP + "\"",
+])
+@pytest.mark.parametrize("key", ["AI_USAGE_SOURCES", "AI_USAGE_ENABLED"])
+def test_tc1218_non_ascii_or_control_in_a_read_key_fails_safe(tmp_path, capsys, key, value):
+    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    lines = {"AI_USAGE_ENABLED": "true", "AI_USAGE_SOURCES": "gemini"}
+    lines[key] = value if key == "AI_USAGE_SOURCES" else value
+    text = "".join("%s=%s\n" % (k, v) for k, v in lines.items()).replace(chr(13), chr(13))
+    env, source, dest = make_raw(tmp_path, text, json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    out = capsys.readouterr().out
+    assert len([l for l in out.splitlines() if "WARNING" in l]) == 1 and key in out
+
+
+def test_tc1218_non_ascii_in_other_keys_is_still_fine(tmp_path):
+    text = "NOTE=caf" + chr(0xE9) + " " + NBSP + "\n" + ENABLED + "AI_USAGE_SOURCES=codex\n"
+    env, source, dest = make_raw(tmp_path, text)
+    MODULE.install(env, source, dest)
+    assert providers(dest) == ["codex"]
+
+
+def test_tc1218_tabs_and_spaces_are_trimmed_from_a_bare_value_like_systemd(tmp_path):
+    tab = chr(9)
+    text = "AI_USAGE_ENABLED=" + tab + "true " + tab + "\nAI_USAGE_SOURCES=" + tab + " codex," + tab + "claude " + tab + "\n"
+    env, source, dest = make_raw(tmp_path, text)
+    MODULE.install(env, source, dest)
+    assert providers(dest) == ["claude", "codex"]

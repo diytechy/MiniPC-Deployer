@@ -38,6 +38,10 @@ _LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 # VALUE is exactly one of: bare (no quotes, no backslash), one double-quoted
 # string, one single-quoted string, with nothing outside the quotes.
 _VALUE = re.compile(r"""^(?:[^"'\\]*|"[^"\\]*"|'[^'\\]*')$""")
+# The keys the derivation reads must be printable ASCII (plus space and tab, which
+# are trimmed): Python and systemd disagree about what other whitespace is.
+_PLAIN = re.compile("^[" + chr(32) + "-" + chr(126) + chr(9) + "]*$")
+TRIM = chr(32) + chr(9) + chr(13)  # exactly what systemd trims from an unquoted value
 _LOOSE_KEY = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 READ_KEYS = ("AI_USAGE_ENABLED", "AI_USAGE_SOURCES")
 
@@ -56,7 +60,8 @@ def whitelist_failure(env_text: str):
         if not line.strip() or line.lstrip()[:1] in ("#", ";"):
             continue
         match = _LINE.match(line)
-        if match and _VALUE.match(match.group(2)):
+        if match and _VALUE.match(match.group(2)) and (
+                match.group(1) not in READ_KEYS or _PLAIN.match(match.group(2))):
             continue
         loose = _LOOSE_KEY.match(line)
         return number, (loose.group(1) if loose else None)
@@ -72,7 +77,7 @@ def read_env(env_text: str, names):
         match = _LINE.match(line)
         if not match or match.group(1) not in names:
             continue
-        value = match.group(2).strip()
+        value = match.group(2).strip(TRIM)
         if value[:1] in ("'", '"'):
             value = value[1:-1]
         result[match.group(1)] = value

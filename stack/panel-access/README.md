@@ -77,7 +77,10 @@ change reaches the wall only after the kiosk shell restarts.
   quotes. This is a positive whitelist: it is what the materialiser and
   `stack/sleep/apply-env-lines.py` write, and `stack/.env.example` passes it (a
   test asserts that). Of the lines that pass, only the FINAL assignment of each key
-  counts (an unquoted value is trimmed, as systemd delivers it). Unless
+  counts. An unquoted value is trimmed of space, tab and CR only (what systemd trims,
+  not Python's Unicode whitespace), and the values of `AI_USAGE_ENABLED` and
+  `AI_USAGE_SOURCES` must be printable ASCII (plus tab and space) or the file is
+  treated as ambiguous; other keys may hold any text. Unless
   `AI_USAGE_ENABLED` is exactly `true` the destination is byte-identical to the
   source (a value other than `true`/`false` logs a line).
 - **Source list.** The renderer calls the feeder's own `enabled_sources()`

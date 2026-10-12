@@ -223,16 +223,19 @@ def required_gauges():
         return None
 
 
-def feeder_live_sources():
-    """Sources whose REQUIRED gauges were all `live` in the feeder's LATEST cycle.
+# Evidence older than this is not evidence: 2x the usage timer's 10-minute cadence.
+EVIDENCE_MAX_AGE_SECONDS = int(os.environ.get("AI_CLI_EVIDENCE_MAX_AGE", "1200"))
+CYCLE_END = re.compile(r"ai-usage:\s+cycle complete\b")
+GAUGE_LINE = re.compile(r"ai-usage:\s+(ai-usage-[a-z0-9-]+)\s+(live|UNAVAILABLE)\b")
 
-    The journal is a stream of cycles; a cycle is the trailing run of gauge lines
-    up to the first repeated gauge id walking backwards. An older cycle, or an
-    optional gauge (Claude's Fable band) that happened to be live, proves nothing.
-    """
-    required = required_gauges()
-    if not required:
-        return set()
+
+def usage_invocations():
+    """The feeder's journal grouped by systemd INVOCATION (one per run of the
+    oneshot), oldest first. Each: {gauges: {id: state}, complete: ts|None}.
+
+    The journal is read as JSON so every line carries _SYSTEMD_INVOCATION_ID and a
+    timestamp; the feeder's own `cycle complete` line says an invocation reached
+    its end (a run that died part-way prints no such line)."""
     log_file = os.environ.get("AI_CLI_FEEDER_LOG")
     if log_file:
         try:
@@ -241,20 +244,73 @@ def feeder_live_sources():
         except OSError:
             text = ""
     else:
-        rc, text = run(["journalctl", "-u", "homehub-ai-usage.service", "-n", "400",
-                        "--no-pager", "-o", "cat"], timeout=20)
-    entries = []
+        rc, text = run(["journalctl", "-u", "homehub-ai-usage.service", "-n", "2000",
+                        "--no-pager", "-o", "json"], timeout=30)
+    order, by_id = [], {}
     for line in text.splitlines():
-        m = re.search(r"ai-usage:\s+(ai-usage-[a-z0-9-]+)\s+(live|UNAVAILABLE)\b", line)
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        inv = entry.get("_SYSTEMD_INVOCATION_ID") if isinstance(entry, dict) else None
+        if not inv:
+            continue
+        if inv not in by_id:
+            by_id[inv] = {"gauges": {}, "complete": None}
+            order.append(inv)
+        message = entry.get("MESSAGE")
+        if not isinstance(message, str):
+            continue
+        try:
+            ts = int(entry.get("__REALTIME_TIMESTAMP", 0)) / 1e6
+        except (TypeError, ValueError):
+            ts = 0
+        rec = by_id[inv]
+        if CYCLE_END.search(message):
+            rec["complete"] = ts
+        m = GAUGE_LINE.search(message)
         if m:
-            entries.append((m.group(1), m.group(2)))
-    latest = {}
-    for key, state in reversed(entries):
-        if key in latest:
-            break
-        latest[key] = state
+            rec["gauges"][m.group(1)] = m.group(2)
+    return [by_id[i] for i in order]
+
+
+def usage_service_state():
+    forced = os.environ.get("AI_CLI_USAGE_SERVICE_STATE")
+    if forced:
+        return forced
+    rc, out = run(["systemctl", "is-active", "homehub-ai-usage.service"], timeout=10)
+    return out.strip()
+
+
+def feeder_live_sources():
+    """Sources whose REQUIRED gauges were all `live` in the most recent COMPLETED
+    feeder invocation, and recent enough to mean something.
+
+    - The newest invocation decides. If it never printed its `cycle complete` line
+      it died part-way (or never printed): NOT verified - an older good run does
+      not cover for it. The one exception is a run that is still going right now,
+      when the previous completed invocation is the latest finished evidence.
+    - Optional gauges (Claude's Fable band) are never proof.
+    - Evidence older than EVIDENCE_MAX_AGE_SECONDS is dropped.
+    """
+    required = required_gauges()
+    if not required:
+        return set()
+    runs = usage_invocations()
+    if not runs:
+        return set()
+    latest = runs[-1]
+    if latest["complete"] is None and len(runs) > 1 \
+            and usage_service_state() in ("active", "activating"):
+        latest = runs[-2]
+    if latest["complete"] is None:
+        return set()
+    now = float(os.environ.get("AI_CLI_NOW") or __import__("time").time())
+    age = now - latest["complete"]
+    if age > EVIDENCE_MAX_AGE_SECONDS or age < -60:
+        return set()
     return {src for src, keys in required.items()
-            if all(latest.get(k) == "live" for k in keys)}
+            if all(latest["gauges"].get(k) == "live" for k in keys)}
 
 
 LIVE = feeder_live_sources()

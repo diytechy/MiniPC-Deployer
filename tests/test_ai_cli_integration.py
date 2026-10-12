@@ -88,10 +88,28 @@ exec "$@"
 """,
     # STUB_SYSTEMCTL_FAIL=<substring>: any call whose arguments contain it fails.
     # STUB_ACTIVE=<state>: `is-active` answers that state (and exits 3) forever.
+    # It also MODELS which timers are enabled-and-active ($SANDBOX/enabled, one unit
+    # per line): `enable [--now] U` adds U, `disable [--now] U` removes it.
+    # STUB_DISABLE_HALF=1: a failing `disable` has already removed the unit (it is
+    # two steps in real systemd, so a failure can leave it half done).
     "systemctl": r"""#!/usr/bin/env bash
 echo "systemctl $*" >> "$SANDBOX/calls.log"
-if [ "$1" = "is-active" ] && [ -n "${STUB_ACTIVE:-}" ]; then echo "$STUB_ACTIVE"; exit 3; fi
-case "$*" in *"${STUB_SYSTEMCTL_FAIL:-@@none@@}"*) exit 1 ;; esac
+if [ "$1" = "is-active" ]; then
+  case "$*" in *"${STUB_SYSTEMCTL_FAIL:-@@none@@}"*) exit 1 ;; esac
+  echo "${STUB_ACTIVE:-inactive}"; exit 3
+fi
+unit="${@: -1}"
+fail=0
+case "$*" in *"${STUB_SYSTEMCTL_FAIL:-@@none@@}"*) fail=1 ;; esac
+touch "$SANDBOX/enabled"
+case "$1" in
+  enable) [ "$fail" = 1 ] && exit 1; grep -qx -- "$unit" "$SANDBOX/enabled" || echo "$unit" >> "$SANDBOX/enabled" ;;
+  disable)
+    if [ "$fail" = 1 ] && [ -z "${STUB_DISABLE_HALF:-}" ]; then exit 1; fi
+    grep -vx -- "$unit" "$SANDBOX/enabled" > "$SANDBOX/enabled.tmp"; mv "$SANDBOX/enabled.tmp" "$SANDBOX/enabled"
+    [ "$fail" = 1 ] && exit 1 ;;
+  *) [ "$fail" = 1 ] && exit 1 ;;
+esac
 exit 0
 """,
     "install": r"""#!/usr/bin/env bash
@@ -192,6 +210,8 @@ class Box(object):
             "AI_CLI_PROVISIONER": (self.root / "provision-ai-clis.sh").as_posix(),
             "AI_CLI_FEEDER_LOG": (self.root / "feeder.log").as_posix(),
             "AI_CLI_CODEX_USAGE_HOME": self.codex_home.as_posix(),
+            "AI_CLI_NOW": str(NOW),
+            "AI_CLI_USAGE_SERVICE_STATE": "inactive",
             # Git Bash rewrites "/home" into a Windows path when it crosses into a
             # native process; the stub getent must see the literal value.
             "MSYS2_ENV_CONV_EXCL": "STUB_HOME_BASE",
@@ -216,11 +236,22 @@ class Box(object):
         path = self.root / "calls.log"
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
-    def feeder_log(self, *gauges):
-        """Write the feeder's journal lines: each argument is (gauge id, state).
-        A cycle boundary is a repeated gauge id, as in the real stream."""
-        lines = ["ai-usage: %-32s %-12s %s" % (k, st, "posted") for k, st in gauges]
-        (self.root / "feeder.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    def journal(self, *invocations):
+        """Write the feeder's journal as `journalctl -o json` lines. Each argument
+        is a dict: gauges=[(id, state)...], age=seconds before NOW the invocation
+        ended, complete=bool (did it print its `cycle complete` line), extra=[msg]."""
+        rows = []
+        for n, inv in enumerate(invocations):
+            iid = "inv%02d" % n
+            ts = NOW - inv.get("age", 60)
+            lines = ["ai-usage: %-32s %-12s %s" % (k, st, "posted") for k, st in inv.get("gauges", [])]
+            lines += inv.get("extra", [])
+            if inv.get("complete", True):
+                lines.append("ai-usage: cycle complete gauges=%d failures=0" % len(inv.get("gauges", [])))
+            for k, text in enumerate(lines):
+                rows.append(json.dumps({"MESSAGE": text, "_SYSTEMD_INVOCATION_ID": iid,
+                                        "__REALTIME_TIMESTAMP": str(int((ts - len(lines) + k) * 1e6))}))
+        (self.root / "feeder.log").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
     def cred(self, account, relative, content=CANARY):
         path = self.home / account / relative
@@ -229,6 +260,7 @@ class Box(object):
         return path
 
 
+NOW = 1_800_000_000
 USAGE_ENV = ["AI_USAGE_ENABLED=true", "AI_USAGE_USER=108000000000000000001",
              "AI_USAGE_FEED_URL=http://127.0.0.1:8787/api/feed"]
 
@@ -519,18 +551,38 @@ def test_present_credential_is_not_verified_until_the_feeder_logged_live_llr1117
     required = [g.key for g in feeder.GAUGE_SPECS if g.source == "claude" and not g.optional]
     optional = [g.key for g in feeder.GAUGE_SPECS if g.source == "claude" and g.optional]
     assert required and optional, "the feeder defines required and optional claude gauges"
-    box.feeder_log(*[(k, "live") for k in required])
+    live = [(k, "live") for k in required]
+    box.journal({"gauges": live})
     out = _status(box)
     assert "login claude: verified" in out and "consumer operation verified" in out
-    # One REQUIRED gauge UNAVAILABLE in the latest cycle: not verified.
-    box.feeder_log(*([(required[0], "UNAVAILABLE")] + [(k, "live") for k in required[1:]]))
-    assert "login claude: credential present (not verified)" in _status(box)
-    # An older all-live cycle followed by a newer cycle that lost a gauge.
-    box.feeder_log(*([(k, "live") for k in required] + [(required[0], "UNAVAILABLE")]))
-    assert "login claude: credential present (not verified)" in _status(box)
+    NOT = "login claude: credential present (not verified)"
+    # One REQUIRED gauge UNAVAILABLE in the latest completed run.
+    box.journal({"gauges": [(required[0], "UNAVAILABLE")] + live[1:]})
+    assert NOT in _status(box)
+    # SOL: an old good run followed by a PARTIAL new one (a required gauge never printed).
+    box.journal({"gauges": live, "age": 600}, {"gauges": live[:1], "age": 60})
+    assert NOT in _status(box)
+    # SOL: a new invocation that FAILS EARLY (no cycle-end line, nothing useful) does not
+    # borrow the older good run's success.
+    box.journal({"gauges": live, "age": 600},
+                {"gauges": [], "complete": False, "extra": ["Traceback (most recent call last):"], "age": 60})
+    assert NOT in _status(box)
+    # ...but a run that is still going right now leaves the previous completed run as
+    # the latest finished evidence.
+    box.journal({"gauges": live, "age": 600}, {"gauges": live[:1], "complete": False, "age": 5})
+    assert NOT in _status(box)                                   # service not running: it died
+    assert "login claude: verified" in _status(box, AI_CLI_USAGE_SERVICE_STATE="activating")
     # A stale OPTIONAL gauge live, then the required ones UNAVAILABLE: not proof.
-    box.feeder_log(*([(optional[0], "live")] + [(k, "UNAVAILABLE") for k in required]))
-    assert "login claude: credential present (not verified)" in _status(box)
+    box.journal({"gauges": [(optional[0], "live")] + [(k, "UNAVAILABLE") for k in required]})
+    assert NOT in _status(box)
+    # Evidence past the age cap is dropped (default 20 minutes).
+    box.journal({"gauges": live, "age": 3600})
+    assert NOT in _status(box)
+    box.journal({"gauges": live, "age": 600})
+    assert "login claude: verified" in _status(box)
+    # A journal with no cycle-end line (an older feeder) is never "verified".
+    box.journal({"gauges": live, "complete": False})
+    assert NOT in _status(box)
 
 
 def test_codex_verifies_through_its_bare_gauge_id_llr1117(tmp_path):
@@ -541,7 +593,7 @@ def test_codex_verifies_through_its_bare_gauge_id_llr1117(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text(CANARY, encoding="utf-8")
     assert "login codex (usage): credential present (not verified)" in _status(box)
-    box.feeder_log(*[(k, "live") for k in codex_ids])
+    box.journal({"gauges": [(k, "live") for k in codex_ids]})
     assert "login codex (usage): verified" in _status(box)
 
 
@@ -838,7 +890,20 @@ def _legacy_box(tmp_path, sources="claude"):
               accounts=["alice"])
     (box.units / (LEGACY + ".service")).write_text("[Service]\n# OLD\n", encoding="utf-8")
     (box.units / (LEGACY + ".timer")).write_text("[Timer]\n# OLD\n", encoding="utf-8")
+    (box.root / "enabled").write_text(LEGACY + ".timer\n", encoding="utf-8")
     return box
+
+
+OLD_TIMER = LEGACY + ".timer"
+NEW_TIMER = LEGACY + "@claude.timer"
+
+
+def _enabled(box):
+    return (box.root / "enabled").read_text(encoding="utf-8").split()
+
+
+def _refreshers(box):
+    return [u for u in _enabled(box) if u in (OLD_TIMER, NEW_TIMER)]
 
 
 def test_failed_legacy_disable_keeps_the_old_refresher_and_never_enables_the_new_one_sr067(tmp_path):
@@ -1064,3 +1129,84 @@ def test_real_root_owned_credential_for_a_real_second_user_is_permissions_wrong_
     assert "sudo chown w2realtest:w2realtest" in out
     assert "auth login" not in out, "a permissions problem must not offer a login recipe"
     assert "CANARY-REAL" not in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 2 - the INVARIANT: on every way out, exactly ONE account-1 refresh
+# timer is enabled. (Round 1 left ZERO on a deferral.)
+# ═══════════════════════════════════════════════════════════════════════════
+
+BRANCHES = [
+    # id, extra env, expected exit, expected surviving refresher
+    ("idle", {}, 0, NEW_TIMER),
+    ("busy-at-deadline", {"STUB_ACTIVE": "activating"}, 3, OLD_TIMER),
+    ("disable-fails", {"STUB_SYSTEMCTL_FAIL": "disable --now " + OLD_TIMER}, 3, OLD_TIMER),
+    ("stop-half-fails", {"STUB_SYSTEMCTL_FAIL": "disable --now " + OLD_TIMER,
+                         "STUB_DISABLE_HALF": "1"}, 3, OLD_TIMER),
+    ("new-timer-enable-fails", {"STUB_SYSTEMCTL_FAIL": "enable --now " + NEW_TIMER}, 3, OLD_TIMER),
+    ("is-active-query-fails", {"STUB_SYSTEMCTL_FAIL": "is-active"}, 3, OLD_TIMER),
+    ("is-active-unrecognised", {"STUB_ACTIVE": "mystery"}, 3, OLD_TIMER),
+    ("error-mid-migration", {"STUB_SYSTEMCTL_FAIL": "daemon-reload"}, None, OLD_TIMER),
+]
+
+
+@pytest.mark.parametrize("name,extra,code,survivor", BRANCHES, ids=[b[0] for b in BRANCHES])
+def test_exactly_one_account_one_refresh_timer_survives_every_branch_sr067(tmp_path, name, extra, code, survivor):
+    box = _legacy_box(tmp_path)
+    done = box.run(SETUP_USAGE, **extra)
+    if code is None:
+        assert done.returncode not in (0, 3), "the injected error must surface: " + done.stdout
+    else:
+        assert done.returncode == code, done.stdout + done.stderr
+    assert _refreshers(box) == [survivor], (_enabled(box), done.stdout)
+    assert not [c for c in box.calls if c.startswith("systemctl stop")]
+    if survivor == OLD_TIMER:
+        # The deferral is honest: it says the OLD timer is the refresher.
+        assert (box.units / (LEGACY + ".timer")).exists()
+    else:
+        assert not (box.units / (LEGACY + ".timer")).exists()
+
+
+def test_a_failed_restore_is_a_loud_error_naming_the_manual_command_sr067(tmp_path):
+    box = _legacy_box(tmp_path)
+    # Busy at the deadline, AND the old timer cannot be re-enabled.
+    done = box.run(SETUP_USAGE, STUB_ACTIVE="activating", STUB_SYSTEMCTL_FAIL="enable --now " + OLD_TIMER)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "ERROR: could NOT re-enable %s" % OLD_TIMER in done.stdout
+    assert "systemctl enable --now %s" % OLD_TIMER in done.stdout
+    assert _refreshers(box) == []          # the state the error message is about
+
+
+def test_the_warning_never_claims_a_refresher_that_is_not_running_sr067(tmp_path):
+    box = _legacy_box(tmp_path)
+    done = box.run(SETUP_USAGE, STUB_ACTIVE="activating")
+    assert "is enabled again" in done.stdout and OLD_TIMER in _enabled(box)
+
+
+def test_existing_codex_home_of_another_account_is_left_alone_llr1114(tmp_path):
+    box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=codex", "AI_USAGE_USER_ACCOUNT=alice"], accounts=["alice"])
+    box.codex_home.mkdir(parents=True)
+    auth = box.codex_home / "auth.json"
+    auth.write_text(CANARY, encoding="utf-8")
+    before = auth.stat().st_mtime_ns
+    # AI_USAGE_CODEX_HOME is the path setup-ai-usage.sh itself creates/owns.
+    done = box.run(SETUP_USAGE, STUB_STAT_OWNER="bob", AI_USAGE_CODEX_HOME=box.codex_home.as_posix())
+    assert done.returncode == 0, done.stdout + done.stderr
+    codex = [c for c in box.calls if c.startswith("install ") and c.endswith(box.codex_home.as_posix())]
+    assert not codex, "an existing Codex home must not be install -d'd: %r" % codex
+    assert "already exists and belongs to bob" in done.stdout
+    assert auth.read_bytes() == CANARY.encode("utf-8") and auth.stat().st_mtime_ns == before
+
+
+def test_the_feeders_cycle_end_line_is_the_one_the_status_step_looks_for_llr1117():
+    """The OTHER side of the contract: what the feeder really prints."""
+    feeder_src = (USAGE_DIR / "ai_usage_feeder.py").read_text(encoding="utf-8")
+    printed = re.search(r'print\("(ai-usage: cycle complete[^"]*)" % ', feeder_src)
+    assert printed, "the feeder prints no cycle-end line"
+    line = printed.group(1).replace("%d", "3")
+    status_src = STATUS.read_text(encoding="utf-8")
+    pattern = re.search(r'CYCLE_END = re\.compile\(r"([^"]+)"\)', status_src).group(1)
+    assert re.search(pattern, line), (pattern, line)
+    # ...and it is not mistaken for a gauge line.
+    gauge = re.search(r'GAUGE_LINE = re\.compile\(r"([^"]+)"\)', status_src).group(1)
+    assert not re.search(gauge, line)

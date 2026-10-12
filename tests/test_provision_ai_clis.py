@@ -1574,7 +1574,7 @@ def test_the_baseline_is_permanent(lab):
 def test_a_managed_predecessor_is_remembered_as_the_previous_identity(lab):
     a_link, b_link = _a_then_b(lab)
     st = lab.state()["clis"]["claude"]
-    assert st["previous"]["target"] == a_link and st["previous"]["version"] == "1.0.0"
+    assert st["history"][b_link]["target"] == a_link and st["history"][b_link]["version"] == "1.0.0"
     assert "baseline" not in st                                              # nothing unowned was ever displaced
     # lose the record the way a crash can; the rebuilt one still points at A, not at nothing
     d = json.loads((lab.state_dir / "state.json").read_text())
@@ -1872,3 +1872,147 @@ def test_the_activated_wrapper_is_fsynced_before_the_last_state_write(lab):
     assert wrapper in log
     last_state = max(i for i, l in enumerate(log) if l.startswith("state "))
     assert log.index(wrapper) < last_state                                  # ... and the commit is that last write
+
+
+# ======================= fix round 3: arm..pending is atomic w.r.t. shutdown, history per target, durable restore
+def _armed_marker(lab):
+    return Path(str(lab.lock) + ".timer.armed")
+
+
+def test_an_off_schedule_cannot_disarm_retries_between_the_arm_and_the_pending_record(lab):
+    lab.claude()
+    hand = _hand_link(lab)
+    bg = lab.popen("--run", AI_CLIS_HOLD_AFTER_ARM="3", AI_CLIS_DIE_AT="swap")
+    try:
+        deadline = time.time() + 15
+        while not _armed_marker(lab).exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert _armed_marker(lab).exists(), "the activation never reached its arm"
+        lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="claude", AI_CLI_PROVISION="off")   # the run already read its config
+        cp = lab.run("--schedule")                       # arrives between the arm and the pending write
+        bg.communicate(timeout=30)
+    finally:
+        if bg.poll() is None:
+            os.killpg(bg.pid, 9)
+    assert bg.returncode == -9
+    assert cp.returncode in (0, 3), out(cp)
+    calls = lab.log("systemctl.log")
+    assert "enable --now homehub-ai-clis-provision.timer" in calls
+    assert not any(c.startswith("disable") for c in calls)                    # the timer is still enabled at the end
+    assert lab.state()["clis"]["claude"]["activation"]["state"] == "pending"   # ... and the open transaction is recorded
+    assert lab.link("claude") != str(hand)
+
+
+def test_a_shutdown_while_the_main_lock_is_held_is_deferred_not_performed(lab):
+    lab.claude()
+    lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="claude", AI_CLI_PROVISION="off")
+    holder = subprocess.Popen(["flock", str(lab.lock), "sleep", "20"], start_new_session=True)
+    try:
+        for _ in range(50):
+            if lab.lock.exists():
+                break
+            time.sleep(0.1)
+        time.sleep(0.3)
+        cp = lab.run("--schedule")
+        assert cp.returncode == 0 and "deferred" in out(cp)
+        assert not any(c.startswith("disable") for c in lab.log("systemctl.log"))
+    finally:
+        os.killpg(holder.pid, 9); holder.wait()
+    assert lab.run("--schedule").returncode == 0                              # lock free: now it shuts down
+    assert lab.log("systemctl.log")[-1] == "disable --now homehub-ai-clis-provision.timer"
+
+
+# --- history belongs to the target it is the predecessor of
+def test_history_is_recorded_per_target_and_a_rollback_never_rewrites_it(lab):
+    a_link, b_link = _a_then_b(lab)
+    st = lab.state()["clis"]["claude"]
+    assert st["history"][b_link]["target"] == a_link and st["history"][b_link]["version"] == "1.0.0"
+    assert lab.run("--rollback", "claude").returncode == 0
+    assert lab.state()["clis"]["claude"]["history"] == st["history"]
+
+
+def test_adopt_rollback_roll_forward_then_an_interrupted_rollback_still_ends_on_the_original(lab):
+    """Sol's sequence: A hand-installed adopted as B; back to A; forward to B; crash a rollback after pending; recover; converge; roll back."""
+    lab.claude("2.0.0")
+    hand = _hand_link(lab)
+    assert lab.run("--run").returncode == 0
+    b_link = lab.link("claude")
+    assert lab.run("--rollback", "claude").returncode == 0 and lab.link("claude") == str(hand)
+    assert lab.run("--rollback", "claude").returncode == 0 and lab.link("claude") == b_link       # forward again
+    assert lab.run("--rollback", "claude", AI_CLIS_DIE_AT="pending").returncode == -9
+    assert lab.run("--run").returncode == 0
+    rec = lab.state()["clis"]["claude"]["activation"]
+    assert rec["from"] == str(hand) and rec["to"] == b_link                                       # never B -> B
+    assert lab.run("--rollback", "claude").returncode == 0
+    assert lab.link("claude") == str(hand)
+
+
+def test_a_history_entry_that_names_the_target_itself_is_ignored(lab):
+    lab.claude("2.0.0")
+    hand = _hand_link(lab)
+    assert lab.run("--run").returncode == 0
+    b_link = lab.link("claude")
+    d = json.loads((lab.state_dir / "state.json").read_text())
+    d["clis"]["claude"]["history"][b_link] = {"target": b_link, "version": "2.0.0"}              # a corrupted self-predecessor
+    del d["clis"]["claude"]["activation"]
+    (lab.state_dir / "state.json").write_text(json.dumps(d))
+    assert lab.run("--run").returncode == 0
+    assert lab.state()["clis"]["claude"]["activation"]["from"] == str(hand)                      # the baseline, not B
+
+
+# --- a restore is accepted only when it is durable
+def test_a_restore_whose_directory_fsync_fails_keeps_the_record_and_the_timer(lab):
+    lab.claude()
+    hand = _hand_link(lab)
+    lab.set_deny(lab.bin / "claude")
+    cp = lab.run("--run", AI_CLIS_FAIL_FSYNC_BIN_AT="2")        # the swap's fsync passes, the restore's fails
+    assert cp.returncode == 3, out(cp)
+    assert lab.link("claude") == str(hand)                      # visibly restored ...
+    assert lab.state()["clis"]["claude"]["activation"]["state"] == "pending"        # ... but the record is NOT closed
+    assert "restoring the previous link FAILED" in out(cp)
+    assert not any(c.startswith("disable") for c in lab.log("systemctl.log"))
+    (lab.logs / "deny.txt").unlink()
+    cp = lab.run("--run")
+    assert cp.returncode == 0, out(cp)
+
+
+def test_recovery_does_not_close_a_record_after_a_restore_that_could_not_be_made_durable(lab):
+    lab.claude()
+    hand = _hand_link(lab)
+    assert lab.run("--run", AI_CLIS_DIE_AT="swap").returncode == -9
+    lab.set_deny(lab.bin / "claude")
+    cp = lab.run("--run", AI_CLIS_FAIL_FSYNC_BIN_AT="1")
+    assert cp.returncode == 3, out(cp)
+    assert lab.state()["clis"]["claude"]["activation"]["state"] == "pending"
+    assert not any(c.startswith("disable") for c in lab.log("systemctl.log"))
+    (lab.logs / "deny.txt").unlink()
+    assert lab.run("--run").returncode == 0
+
+
+def test_recovery_of_a_swap_that_never_happened_waits_for_the_directory_fsync(lab):
+    lab.claude()
+    hand = _hand_link(lab)
+    assert lab.run("--run", AI_CLIS_DIE_AT="pending").returncode == -9
+    cp = lab.run("--run", AI_CLIS_FAIL_FSYNC_BIN_AT="1")
+    assert cp.returncode == 3, out(cp)
+    assert lab.state()["clis"]["claude"]["activation"]["state"] == "pending"
+    assert lab.link("claude") == str(hand)
+    assert lab.run("--run").returncode == 0
+
+
+def test_recognising_a_managed_link_takes_the_predecessor_of_that_exact_target(lab):
+    lab.claude("1.0.0")
+    assert lab.run("--run").returncode == 0
+    a_link = lab.link("claude")
+    lab.claude("2.0.0")
+    assert lab.run("--run").returncode == 0
+    b_link = lab.link("claude")
+    lab.claude("3.0.0")
+    assert lab.run("--run").returncode == 0
+    c_link = lab.link("claude")
+    d = json.loads((lab.state_dir / "state.json").read_text())
+    del d["clis"]["claude"]["activation"]
+    (lab.state_dir / "state.json").write_text(json.dumps(d))
+    assert lab.run("--run").returncode == 0
+    rec = lab.state()["clis"]["claude"]["activation"]
+    assert rec["to"] == c_link and rec["from"] == b_link != a_link

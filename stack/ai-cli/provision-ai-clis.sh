@@ -36,7 +36,8 @@
 # (pending|checked|committed: that state write fails), AI_CLIS_FAIL_RESTORE=<target>
 # (restoring the link to that target fails), AI_CLIS_FAIL_REMOVE=1 (removing a link fails),
 # (ALL of the following hooks need AI_CLIS_TEST=1 and are otherwise ignored.)
-# AI_CLIS_HOLD_IN_LOCK=<seconds> (sleep inside the timer lock, to test the interleaving),
+# AI_CLIS_HOLD_AFTER_ARM=<seconds> (sleep between the arm and the pending write), AI_CLIS_FAIL_FSYNC_BIN_AT=<n>
+# (only the n-th bin-directory fsync fails), AI_CLIS_HOLD_IN_LOCK=<seconds> (sleep inside the timer lock, to test the interleaving),
 # AI_CLIS_FSYNC_LOG=<file> (append every path that is fsynced).
 set -u -o pipefail
 umask 022
@@ -45,7 +46,7 @@ umask 022
 # environment) unless AI_CLIS_TEST=1, which no unit ever sets, so a stray variable cannot
 # break a removal or restore, or kill a run.
 if [ "${AI_CLIS_TEST:-}" != 1 ]; then
-    unset AI_CLIS_DIE_AT AI_CLIS_FAIL_SAVE_AT AI_CLIS_FAIL_RESTORE AI_CLIS_FAIL_REMOVE AI_CLIS_HOLD_IN_LOCK AI_CLIS_FSYNC_LOG
+    unset AI_CLIS_DIE_AT AI_CLIS_FAIL_SAVE_AT AI_CLIS_FAIL_RESTORE AI_CLIS_FAIL_REMOVE AI_CLIS_HOLD_IN_LOCK AI_CLIS_HOLD_AFTER_ARM AI_CLIS_FAIL_FSYNC_BIN_AT AI_CLIS_FSYNC_LOG
 fi
 
 # Bump on ANY change to wrapper.template: it is part of every install identity,
@@ -136,6 +137,17 @@ if op == "get":
     elif v is not None:
         print(v)
     sys.exit(0)
+if op == "histget":        # key target field
+    h = (s["clis"].get(a[0]) or {}).get("history") or {}
+    v = (h.get(a[1]) or {}).get(a[2])
+    if v is not None:
+        print(v)
+    sys.exit(0)
+if op == "histlist":       # every predecessor target recorded for a key
+    h = (s["clis"].get(a[0]) or {}).get("history") or {}
+    for v in h.values():
+        print(v.get("target", ""))
+    sys.exit(0)
 if op == "set":
     n, k = walk(a[0], True)
     n[k] = json.loads(a[1])
@@ -152,8 +164,9 @@ elif op == "baseline":
     c = s["clis"].setdefault(a[0], {})
     if not c.get("baseline"):                  # permanent: written once, never replaced
         c["baseline"] = {"target": a[1], "version": nul(a[2])}
-elif op == "previous":
-    s["clis"].setdefault(a[0], {})["previous"] = {"target": a[1], "version": nul(a[2])}
+elif op == "histset":      # history[<target>] = the predecessor of THAT target
+    c = s["clis"].setdefault(a[0], {})
+    c.setdefault("history", {})[a[1]] = {"target": a[2], "version": nul(a[3])}
 elif op == "health":
     s["clis"].setdefault(a[0], {})["health"] = {"target": a[1], "ok": a[2] == "true"}
 elif op == "pend":
@@ -390,7 +403,14 @@ print(json.dumps(out, sort_keys=True))
 PY
 
 pyj() { python3 -I -c "$PYJ" "$@"; }
-fsync_paths() { python3 -I -c "$PYSYNC" paths "$@" 2>/dev/null; }
+FS_BIN_N=0
+fsync_paths() {
+    if [ -n "${AI_CLIS_FAIL_FSYNC_BIN_AT:-}" ] && [ "$1" = "$BIN_DIR" ]; then
+        FS_BIN_N=$((FS_BIN_N + 1))
+        [ "$FS_BIN_N" -eq "$AI_CLIS_FAIL_FSYNC_BIN_AT" ] && return 1
+    fi
+    python3 -I -c "$PYSYNC" paths "$@" 2>/dev/null
+}
 fsync_tree() { python3 -I -c "$PYSYNC" tree "$@" 2>/dev/null; }
 pyarc() { python3 -I -c "$PYARC" "$@"; }
 
@@ -719,10 +739,11 @@ referenced_dir() {
             t="$(sget "clis.$k.activation.$f")"
             [ -n "$t" ] && inside "$t" && return 0
         done
-        for f in baseline previous; do
-            t="$(sget "clis.$k.$f.target")"
+        t="$(sget "clis.$k.baseline.target")"
+        [ -n "$t" ] && inside "$t" && return 0
+        while IFS= read -r t; do
             [ -n "$t" ] && inside "$t" && return 0
-        done
+        done < <(printf '%s' "$STATE" | pyj histlist "$k")
     done
     for w in "$PREFIX"/*/*/wrapper/*; do
         [ -f "$w" ] || continue
@@ -856,19 +877,25 @@ any_open_txn() { # is ANY CLI's transaction pending or checked (needed or not)?
 arm_retries() { "$SYSTEMCTL" enable --now "$TIMER"; }
 timer_lock() { { exec 7>>"$LOCK2"; } 2>/dev/null && flock -w 30 7; }
 timer_unlock() { { exec 7>&-; } 2>/dev/null; return 0; }
-# history_from KEY -> HF HFV: where a rollback of a freshly recognised managed link must go
+# history_from KEY TARGET -> HF HFV: the predecessor recorded for exactly that target, else the baseline;
+# never the target itself (a self-predecessor would turn a rollback into a no-op)
 HF=""; HFV=""
 history_from() {
-    local key="$1" t
-    t="$(sget "clis.$key.previous.target")"
-    if [ -n "$t" ]; then HF="$t"; HFV="$(sget "clis.$key.previous.version")"; return; fi
-    HF="$(sget "clis.$key.baseline.target")"; HFV="$(sget "clis.$key.baseline.version")"
-}
-# note_displaced KEY FROM FROM_VERSION: a managed install that was displaced becomes the "previous" one
-note_displaced() {
-    if [ -n "$2" ] && is_managed "$2"; then
-        STATE="$(printf '%s' "$STATE" | pyj previous "$1" "$2" "${3:--}")"
+    local key="$1" target="$2"
+    HF="$(printf '%s' "$STATE" | pyj histget "$key" "$target" target)"
+    HFV="$(printf '%s' "$STATE" | pyj histget "$key" "$target" version)"
+    if [ -z "$HF" ] || [ "$(norm_path "$HF")" = "$(norm_path "$target")" ]; then
+        HF="$(sget "clis.$key.baseline.target")"; HFV="$(sget "clis.$key.baseline.version")"
     fi
+    if [ -n "$HF" ] && [ "$(norm_path "$HF")" = "$(norm_path "$target")" ]; then HF=""; HFV=""; fi
+}
+# note_history KEY KIND FROM FROM_VERSION TO: an ACTIVATION makes FROM the predecessor of TO
+# (a rollback does not rewrite anyone's history)
+note_history() {
+    [ "$2" = activate ] || return 0
+    [ -n "$3" ] && [ -n "$5" ] || return 0
+    [ "$(norm_path "$3")" != "$(norm_path "$5")" ] || return 0
+    STATE="$(printf '%s' "$STATE" | pyj histset "$1" "$5" "$3" "${4:--}")"
 }
 
 # -------------------------------------------------------------- link transactions
@@ -883,8 +910,7 @@ rec_set() { # KEY STATE FROM FROM_VERSION TO TO_VERSION KIND ; 1 and STATE uncha
 }
 txn_revert() { # KEY FROM PREV_RECORD -> 1 reverted cleanly, 2 restoring failed (the record is KEPT)
     local key="$1" from="$2" prev="$3"
-    swap_to "$key" "$from"
-    if ! link_is "$key" "$from"; then
+    if ! swap_to "$key" "$from" || ! link_is "$key" "$from"; then
         REASON="$REASON; restoring the previous link FAILED, so the transaction record is kept and the next run retries"
         return 2
     fi
@@ -896,10 +922,15 @@ txn_revert() { # KEY FROM PREV_RECORD -> 1 reverted cleanly, 2 restoring failed 
 # FROM is the link as it is now, TO what it will become ('' removes it). 0 committed, 1 reverted, 2 revert failed.
 link_txn() {
     local key="$1" kind="$2" from="$3" fv="$4" to="$5" tv="$6" expect="$7" prev="$8" rc keep
-    # 1. retries exist BEFORE anything can displace the link
-    if ! arm_retries; then
-        REASON="the retry timer could not be armed; the link was not touched"; return 1
+    # 1. retries exist BEFORE anything can displace the link, and no shutdown can slip in between
+    #    the arm and the durable pending record: the (short) timer lock covers both
+    if ! timer_lock; then
+        REASON="the timer lock was busy; the link was not touched"; return 1
     fi
+    if ! arm_retries; then
+        timer_unlock; REASON="the retry timer could not be armed; the link was not touched"; return 1
+    fi
+    if [ -n "${AI_CLIS_HOLD_AFTER_ARM:-}" ]; then : >"$LOCK2.armed"; sleep "$AI_CLIS_HOLD_AFTER_ARM"; fi
     # 2. the first time an UNOWNED link is displaced its target and observed version become a
     #    permanent baseline, written in the same durable write as the pending record
     keep="$STATE"
@@ -908,9 +939,11 @@ link_txn() {
     fi
     if ! rec_set "$key" pending "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind"; then
         STATE="$keep"
+        timer_unlock
         REASON="the transaction could not be recorded durably in $STATE_DIR; the link was not touched"
         return 1
     fi
+    timer_unlock
     die_at pending
     if ! swap_to "$key" "$to" || ! link_is "$key" "$to"; then
         REASON="cannot swap the link"
@@ -932,7 +965,7 @@ link_txn() {
         REASON="the activated install could not be made durable; the previous link was restored"
         txn_revert "$key" "$from" "$prev"; return $?
     fi
-    note_displaced "$key" "$from" "$fv"
+    note_history "$key" "$kind" "$from" "$fv" "$to"
     if ! rec_set "$key" committed "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind"; then
         REASON="the commit could not be recorded; the previous link was restored"
         txn_revert "$key" "$from" "$prev"; return $?
@@ -959,7 +992,7 @@ activate() {
             if [ -n "$act_state" ]; then
                 pf="$(sget "clis.$key.activation.from")"; pv="$(sget "clis.$key.activation.from_version")"
             else
-                history_from "$key"; pf="$HF"; pv="$HFV"          # never from=null when a baseline exists
+                history_from "$key" "$wrapper"; pf="$HF"; pv="$HFV"          # the predecessor of this very target, else the baseline
             fi
             rec_set "$key" committed "${pf:--}" "${pv:--}" "$wrapper" "$tv" activate \
                 || { REASON="the verified state could not be recorded"; return 1; }
@@ -1007,8 +1040,7 @@ recover() {
             if [ -n "$to" ] && ! consumer_check "$BIN_DIR/$key" "$(expect_of "$tv")" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
                 REASON="an interrupted change failed its check ($CHECK_DETAIL)"
                 arm_retries || say "WARNING: could not arm the retry timer before restoring $key"
-                swap_to "$key" "$from"
-                if link_is "$key" "$from"; then
+                if swap_to "$key" "$from" && link_is "$key" "$from"; then
                     sdel "clis.$key.activation"
                     note_pending "$key" "$REASON; the previous link was restored"
                 else
@@ -1017,7 +1049,7 @@ recover() {
                 fi
             else
                 local before="$STATE"
-                note_displaced "$key" "$from" "$fv"
+                note_history "$key" "$kind" "$from" "$fv" "$to"
                 STATE="$(printf '%s' "$STATE" | pyj act "$key" committed "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind")"
                 if save_state; then say "recovered $key: committed"; else
                     STATE="$before"; UNRESOLVED+=("$key")
@@ -1025,7 +1057,13 @@ recover() {
                 fi
             fi
         elif [ "$cur" = "$from" ]; then
-            sdel "clis.$key.activation"; say "recovered $key: the swap never happened"
+            # the link is visibly back where it was; make that durable before the record is closed
+            if fsync_paths "$BIN_DIR"; then
+                sdel "clis.$key.activation"; say "recovered $key: the swap never happened"
+            else
+                UNRESOLVED+=("$key")
+                note_pending "$key" "the previous link is back but could not be made durable; the record is kept and the next run retries"
+            fi
         else
             sdel "clis.$key.activation"; say "recovered $key: the link was changed outside the provisioner; left alone"
         fi
@@ -1111,24 +1149,26 @@ timer_finish() {
 mode_schedule() {
     if [ "$PROVISION_OFF" = 1 ] || [ "${#NEEDED[@]}" -eq 0 ]; then
         timer_lock || { say "cannot take the timer lock"; return 3; }
+        # Never disable while somebody else holds the main lock: a run or rollback may be between
+        # its arm and its pending record. Probe it without waiting; if busy, DEFER (exit 0) and
+        # leave the timer alone - that run decides at its own end whether it can be disabled.
+        if ! { exec 9>>"$LOCK"; } 2>/dev/null || ! flock -n 9; then
+            timer_unlock
+            say "provisioning: shutdown deferred - a provisioning run holds the lock, so the retry timer was left alone"
+            return 0
+        fi
         load_state
         if any_open_txn; then
             # an interrupted link change must be reconciled by a run: never disable under it
-            timer_unlock
+            { exec 9>&-; } 2>/dev/null; timer_unlock
             prepare_units || say "WARNING: could not install the provisioning units"
             "$SYSTEMCTL" start --no-block "$SERVICE" || { say "cannot start $SERVICE"; return 3; }
             say "provisioning: an interrupted link change is recorded; recovery was started and the retry timer was left alone"
             return 3
         fi
         "$SYSTEMCTL" disable --now "$TIMER" || true
-        timer_unlock
-        # Clearing pending needs the main lock. Never wait for it: a retry may
-        # hold it for a whole download. If it is busy the next --run clears it.
-        if exec 9>>"$LOCK" && flock -n 9; then
-            load_state; STATE="$(printf '%s' "$STATE" | pyj clearpending)"; save_state
-        else
-            say "pending-state cleanup deferred: a provisioning run holds the lock"
-        fi
+        STATE="$(printf '%s' "$STATE" | pyj clearpending)"; save_state
+        { exec 9>&-; } 2>/dev/null; timer_unlock
         say "provisioning: nothing to do (off or no enabled consumer needs a CLI)"
         return 0
     fi
@@ -1323,7 +1363,7 @@ mode_rollback() {
         refuse "the previous install of $key was never observed, so a rollback cannot verify it; rerun with --force-unverified to accept that"
     fi
     if [ -z "$from" ]; then   # durable history: never remove a CLI that had an unowned predecessor
-        history_from "$key"
+        history_from "$key" "$cur"
         if [ -n "$HF" ]; then from="$HF"; fv="$HFV"; fi
     fi
     if [ -n "$from" ] && { [ -z "$fv" ] || [ "$fv" = unobserved ]; } && [ "$force" != --force-unverified ]; then

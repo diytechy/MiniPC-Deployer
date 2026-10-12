@@ -102,6 +102,12 @@ change reaches the wall only after the kiosk shell restarts.
   does not try to follow it there. Consequence: a materialised secret containing a
   quote or backslash makes the whole `.env` fail the whitelist on a hub that uses
   AI usage, and the rings then show unfiltered.
+- **What disables derivation.** A backslash (comment lines included, because
+  systemd continues a comment that ends in one onto the next line), a quote, or
+  any other non-canonical line anywhere in a `.env` that mentions `AI_USAGE_`
+  disables derivation on EVERY boot. A `WARNING` is logged, and the wall then shows
+  every served ring (the unmarked append default). Fix the offending line, then
+  re-run the converge command below.
 - **Output.** `"gaugeRings": {"slots": [...], "unlisted": "hide", "derivedFrom":
   "AI_USAGE_SOURCES"}`. Slot order is claude, claude2, codex, grok, gemini,
   opencode, freellmapi, filtered to the sources the feeder runs (names the feeder

@@ -58,8 +58,13 @@ def whitelist_failure(env_text: str):
     (indent, export, space before =, backslash, multiline or stray quotes) can
     hide where an assignment really starts, so it is not parsed at all."""
     for number, line in enumerate(_lines(env_text), 1):
-        if not line.strip(WS) or line.lstrip(WS)[:1] in ("#", ";"):
+        if not line.strip(WS):
             continue
+        if line.lstrip(WS)[:1] in ("#", ";"):
+            # systemd continues a comment that ends in a backslash onto the next line.
+            if chr(92) not in line:
+                continue
+            return number, None
         match = _LINE.match(line)
         if match and _VALUE.match(match.group(2)) and (
                 match.group(1) not in READ_KEYS or _PLAIN.match(match.group(2))):

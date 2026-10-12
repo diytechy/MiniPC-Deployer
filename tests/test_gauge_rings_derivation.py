@@ -495,8 +495,8 @@ def test_tc1218_the_shipped_env_template_passes_the_whitelist():
 
 
 @pytest.mark.parametrize("text", [
-    "", "\n\n", "  \n", "# note\n", "  ; note " + BS + "\n", "A=b\n", "A_1=\n", "A=\"two words\"\n", "A='x y'\n",
-    "A=has # inline and = signs\n", "A=b\r\nC=d\r\n", "# it's \"quoted\" " + BS + " text\nA=1\n",
+    "", "\n\n", "  \n", "# note\n", "  ; note\n","A=b\n", "A_1=\n", "A=\"two words\"\n", "A='x y'\n",
+    "A=has # inline and = signs\n", "A=b\r\nC=d\r\n", "# it's \"quoted\" text\nA=1\n",
 ])
 def test_tc1218_whitelist_passes_blank_comment_and_canonical_lines(text):
     assert MODULE.whitelist_failure(text) is None
@@ -618,3 +618,18 @@ def test_tc1218_ascii_blank_and_comment_lines_with_tabs_and_cr_still_pass():
 
 def test_tc1218_a_carriage_return_inside_blank_space_is_ascii_whitespace():
     assert MODULE.whitelist_failure("A=1\n " + chr(13) + " \n") is None
+
+
+def test_tc1218_a_backslash_comment_swallows_the_next_line_in_systemd_so_it_fails_safe(tmp_path, capsys):
+    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    text = "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=gemini\n# note " + BS + "\nAI_USAGE_SOURCES=codex\n"
+    env, source, dest = make_raw(tmp_path, text, json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    out = capsys.readouterr().out
+    assert "line 3 (non-assignment line)" in out
+
+
+@pytest.mark.parametrize("lead", ["#", ";", "  #"])
+def test_tc1218_backslash_anywhere_in_a_comment_fails_the_whitelist(lead):
+    assert MODULE.whitelist_failure("A=1\n" + lead + " a" + BS + "b c\n") == (2, None)

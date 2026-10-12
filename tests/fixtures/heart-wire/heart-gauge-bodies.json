@@ -1,0 +1,33 @@
+{
+  "live": {
+    "kind": "gauge",
+    "id": "heart",
+    "label": "Heart",
+    "icon": "heart",
+    "unit": "bpm",
+    "value": 58,
+    "min": 40,
+    "max": 100,
+    "target": 60,
+    "favourable": "low",
+    "window": {
+      "kind": "daily"
+    },
+    "observed_at": "2026-10-11T17:00:00Z"
+  },
+  "unavailable": {
+    "kind": "gauge",
+    "id": "heart",
+    "label": "Heart",
+    "icon": "heart",
+    "unit": "bpm",
+    "value": 0,
+    "min": 40,
+    "max": 100,
+    "target": 60,
+    "favourable": "low",
+    "window": {
+      "kind": "daily"
+    }
+  }
+}

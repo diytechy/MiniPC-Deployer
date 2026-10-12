@@ -66,6 +66,7 @@ vendor/brand/gemini-sparkle.svg
 vendor/brand/opencode-favicon.svg
 vendor/icons/cash.svg
 vendor/icons/clock.svg
+vendor/icons/heart.svg
 vendor/icons/sleep.svg
 vendor/icons/weight.svg
 vendor/projectm/PROVENANCE.md

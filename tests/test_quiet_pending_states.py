@@ -133,7 +133,7 @@ def test_a_genuine_failure_still_exits_1(tmp_path, monkeypatch, capsys):
 # The keepers: skipped quietly until there is something to keep alive
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# Chosen: systemd Condition*= lines, not "enable the timer only once the file exists"
+# Chosen: ExecCondition= gates (NOT Condition*=|, which systemd merges into one OR group), not "enable the timer only once the file exists"
 # and not SuccessExitStatus=. A failed condition SKIPS the start (no `failed` state,
 # no exit code, nothing to special-case), the timer stays enabled so the first run
 # after the sign-in needs no re-run of setup, and it needs no shell exit-code
@@ -274,56 +274,119 @@ def _ini(text):
     return parser
 
 
-def test_the_credential_conditions_sit_under_unit_where_systemd_reads_them(tmp_path):
-    """Parsed as INI, not grepped: a Condition under [Service] is silently ignored."""
-    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
-                                          "AI_USAGE_USER_ACCOUNT=alice"])
-    assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
-    expect = {"homehub-claude-refresh@claude.service.d": ".claude/.credentials.json",
-              "homehub-claude-refresh@claude2.service.d": ".claude-2/.credentials.json",
-              "homehub-gemini-refresh.service.d": ".gemini/oauth_creds.json"}
-    for dropin, rel in expect.items():
-        cp = _ini((box.units / dropin / "10-account.conf").read_text(encoding="utf-8"))
-        assert cp.get("Unit", "ConditionPathExists") == "|/home/alice/" + rel, dropin
-        assert not any(k.startswith("Condition") for k in cp["Service"]), "ignored under [Service]"
-        assert cp.get("Service", "User") == "alice"
+def _exec_conditions(text):
+    """The ExecCondition= values in a unit/drop-in text (a list setting: repeated keys)."""
+    return [l.split("=", 1)[1] for l in text.splitlines() if l.startswith("ExecCondition=")]
+
+
+def _sections(text):
+    """{section: [raw 'Key=value' lines]} - keeps repeated keys, which configparser cannot."""
+    out, cur = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            cur = line[1:-1]
+            out.setdefault(cur, [])
+        elif cur is not None:
+            out[cur].append(line)
+    return out
 
 
 KEEPERS = [("homehub-claude-refresh@.service", "claude"), ("homehub-gemini-refresh.service", "gemini")]
+DROPINS = [("homehub-claude-refresh@claude.service.d", ".claude/.credentials.json"),
+           ("homehub-claude-refresh@claude2.service.d", ".claude-2/.credentials.json"),
+           ("homehub-gemini-refresh.service.d", ".gemini/oauth_creds.json")]
 
 
 @pytest.mark.parametrize("unit,binary", KEEPERS, ids=["claude", "gemini"])
-def test_keeper_cli_gate_is_an_or_group_that_skips_only_an_empty_path(unit, binary):
-    cp = _ini((ti.USAGE_DIR / unit).read_text(encoding="utf-8"))
-    assert cp.get("Unit", "ConditionPathExists") == "|/usr/local/bin/" + binary
-    assert cp.get("Unit", "ConditionPathIsSymbolicLink") == "|/usr/local/bin/" + binary
-    assert not cp.has_option("Unit", "ConditionFileIsExecutable"), "a non-executable file must not be skipped"
+def test_keeper_cli_gate_is_one_execcondition_not_a_condition_or_group(unit, binary):
+    secs = _sections((ti.USAGE_DIR / unit).read_text(encoding="utf-8"))
+    # systemd merges every `Condition*=|` of a unit AND its drop-ins into ONE OR group
+    # ("CLI present OR credential present"), so no Condition*= line may carry a gate.
+    assert not [l for sec in secs.values() for l in sec if l.startswith("Condition")], secs
+    gates = [l for l in secs["Service"] if l.startswith("ExecCondition=")]
+    assert len(gates) == 1 and gates[0].endswith(" gate /usr/local/bin/" + binary), gates
+    assert not [l for l in secs.get("Unit", []) if l.startswith("ExecCondition")]
 
 
-SYSTEMD_CASES = r"""set -u
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-touch $T/plain; chmod 644 $T/plain
-ln -s $T/nowhere $T/dangling
-for n in absent plain dangling; do
-  systemd-analyze condition @@CONDITIONS@@ >/dev/null 2>&1
-  echo "CASE $n rc=$?"
+def test_credential_gates_are_execconditions_in_service_added_by_each_drop_in(tmp_path):
+    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
+                                          "AI_USAGE_USER_ACCOUNT=alice"])
+    assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
+    mapping = {v[1] for v in ti.MAPPINGS.values()}
+    base = {u: _exec_conditions((ti.USAGE_DIR / u).read_text(encoding="utf-8")) for u, _ in KEEPERS}
+    for dropin, rel in DROPINS:
+        assert rel in mapping
+        secs = _sections((box.units / dropin / "10-account.conf").read_text(encoding="utf-8"))
+        assert not [l for sec in secs.values() for l in sec if l.startswith("Condition")], dropin
+        gates = [l for l in secs["Service"] if l.startswith("ExecCondition=")]
+        assert len(gates) == 1 and gates[0].endswith(" gate /home/alice/" + rel), (dropin, gates)
+        assert not [l for l in secs.get("Unit", []) if l.startswith("ExecCondition")]
+        # it ADDS to the base unit's list (never an empty reset assignment that would drop it)
+        assert not [l for l in secs["Service"] if l == "ExecCondition="], dropin
+    assert all(len(v) == 1 for v in base.values())
+
+
+def _shq(text):
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+GATE_MATRIX = r"""set -u
+W=$(mktemp -d); U=/run/systemd/system
+cleanup() { for i in $(seq 1 12); do systemctl stop w7gate-$i.service >/dev/null 2>&1; rm -rf $U/w7gate-$i.service $U/w7gate-$i.service.d; done; systemctl daemon-reload; rm -rf "$W"; }
+trap cleanup EXIT
+BASE=@@BASE@@
+DROP=@@DROP@@
+mkdir -p $W/bin
+touch $W/cred-present; ln -s $W/nowhere $W/cred-dangling
+printf '#!/bin/sh\n' > $W/bin/exec; chmod 755 $W/bin/exec
+printf 'not executable\n' > $W/bin/plain; chmod 644 $W/bin/plain
+ln -s $W/nowhere $W/bin/dangling
+i=0
+for cli in absent exec plain dangling; do
+  for cred in absent present dangling; do
+    i=$((i+1))
+    c="$W/bin/$cli"; k="$W/cred-$cred"
+    [ "$cred" = absent ] && k="$W/cred-absent"
+    mkdir -p $U/w7gate-$i.service.d
+    printf '[Unit]\nDescription=w7 gate test\n[Service]\nType=oneshot\nExecCondition=%s\nExecStart=/bin/touch %s\n' "${BASE//@@CLI@@/$c}" "$W/ran-$i" > $U/w7gate-$i.service
+    printf '[Service]\nExecCondition=%s\n' "${DROP//@@CRED@@/$k}" > $U/w7gate-$i.service.d/10-cred.conf
+    CASES[$i]="$cli $cred"
+  done
+done
+systemctl daemon-reload
+for n in $(seq 1 $i); do
+  systemctl start w7gate-$n.service >/dev/null 2>&1
+  ran=0; [ -e $W/ran-$n ] && ran=1
+  failed=$(systemctl is-failed w7gate-$n.service 2>/dev/null)
+  echo "CASE ${CASES[$n]} ran=$ran state=$failed"
 done
 """
 
 
-@pytest.mark.parametrize("unit,binary", KEEPERS, ids=["claude", "gemini"])
-def test_real_systemd_skips_only_when_nothing_is_at_the_path(tmp_path, unit, binary):
-    """systemd's own evaluation of the condition lines each keeper SHIPS: absent is
-    skipped; a dangling link and a non-executable file still start (and fail loudly)."""
-    cp = _ini((ti.USAGE_DIR / unit).read_text(encoding="utf-8"))
-    lines = ["ConditionPathExists=" + cp.get("Unit", "ConditionPathExists"),
-             "ConditionPathIsSymbolicLink=" + cp.get("Unit", "ConditionPathIsSymbolicLink")]
-    cond = " ".join('"%s"' % l.replace("/usr/local/bin/" + binary, "$T/$n") for l in lines)
-    done = ti._wsl_root(SYSTEMD_CASES.replace("@@CONDITIONS@@", cond), tmp_path)
-    if "systemd-analyze" in done.stderr and "not found" in done.stderr:
-        pytest.skip("no systemd-analyze in WSL")
-    rcs = dict(re.findall(r"CASE (\w+) rc=(\d+)", done.stdout))
-    assert rcs == {"absent": "1", "plain": "0", "dangling": "0"}, (done.stdout, done.stderr)
+def test_real_systemd_runs_a_keeper_only_when_BOTH_the_cli_and_the_login_are_there(tmp_path):
+    """The merged base unit + drop-in, on the real PID 1 systemd (WSL): ExecCondition
+    lines accumulate and must ALL pass. Absent = nothing at the path (no file, no
+    link); a dangling link or a non-executable file is 'there' and starts."""
+    unit = (ti.USAGE_DIR / "homehub-claude-refresh@.service").read_text(encoding="utf-8")
+    base = _exec_conditions(unit)[0].replace("/usr/local/bin/claude", "@@CLI@@")
+    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude", "AI_USAGE_USER_ACCOUNT=alice"])
+    assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
+    drop = _exec_conditions((box.units / "homehub-claude-refresh@claude.service.d" / "10-account.conf")
+                            .read_text(encoding="utf-8"))[0].replace("/home/alice/.claude/.credentials.json", "@@CRED@@")
+    script = GATE_MATRIX.replace("@@BASE@@", _shq(base)).replace("@@DROP@@", _shq(drop))
+    done = ti._wsl_root(script, tmp_path)
+    if "Failed to connect to bus" in done.stderr or "System has not been booted" in done.stderr:
+        pytest.skip("WSL has no running systemd")
+    rows = re.findall(r"CASE (\w+) (\w+) ran=(\d) state=(\w+)", done.stdout)
+    assert len(rows) == 12, (done.stdout, done.stderr)
+    for cli, cred, ran, state in rows:
+        expect = "1" if (cli != "absent" and cred != "absent") else "0"
+        assert ran == expect, (cli, cred, ran)
+        # a gate that skips is NOT a failure of the unit
+        assert state != "failed", (cli, cred, state)
 
 
 VERIFY = r"""set -u
@@ -333,16 +396,14 @@ chmod -R a-x $W; find $W -type d -exec chmod 755 {} +
 for u in homehub-claude-refresh@claude.service homehub-claude-refresh@claude2.service homehub-gemini-refresh.service; do
   SYSTEMD_UNIT_PATH=$W: systemd-analyze verify --man=no $W/$u 2>&1 | sed "s/^/VERIFY $u: /"
 done
-# positive control: the same condition under [Service] IS flagged by systemd itself
+# positive control: an ExecCondition under [Unit] IS flagged by systemd itself
 mkdir -p $W/homehub-gemini-refresh.service.d
-printf '[Service]
-ConditionPathExists=/x
-' > $W/homehub-gemini-refresh.service.d/99-bad.conf
+printf '[Unit]\nExecCondition=/bin/true\n' > $W/homehub-gemini-refresh.service.d/99-bad.conf
 SYSTEMD_UNIT_PATH=$W: systemd-analyze verify --man=no $W/homehub-gemini-refresh.service 2>&1 | sed 's/^/CONTROL: /'
 """
 
 
-def test_systemd_itself_accepts_the_generated_drop_ins_and_flags_a_misplaced_condition(tmp_path):
+def test_systemd_itself_accepts_the_generated_drop_ins_and_flags_a_misplaced_gate(tmp_path):
     box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
                                           "AI_USAGE_USER_ACCOUNT=alice"])
     assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
@@ -350,11 +411,10 @@ def test_systemd_itself_accepts_the_generated_drop_ins_and_flags_a_misplaced_con
     if "systemd-analyze" in done.stderr and "not found" in done.stderr:
         pytest.skip("no systemd-analyze in WSL")
     out = done.stdout
-    assert "VERIFY homehub-gemini-refresh.service" in out or "CONTROL:" in out, (out, done.stderr)
     verify_lines = [l for l in out.splitlines() if l.startswith("VERIFY ")]
-    assert not [l for l in verify_lines if "Unknown key" in l or "Condition" in l], verify_lines
+    assert not [l for l in verify_lines if "Unknown key" in l or "ExecCondition" in l or "Condition" in l], verify_lines
     control = [l for l in out.splitlines() if l.startswith("CONTROL:")]
-    assert any("Unknown key name 'ConditionPathExists' in section 'Service'" in l for l in control), control
+    assert any("Unknown key name 'ExecCondition' in section 'Unit'" in l for l in control), (control, done.stderr)
 
 
 # ---- the feeder: only ENOENT/ENOTDIR is "absent" -------------------------------------------
@@ -634,38 +694,3 @@ def test_real_symlinks_in_wsl_dangling_ancestor_fails_missing_parent_is_pending(
     assert "DANGLING-PARENT absent=False" in out, out
     assert "MISSING-PARENT absent=True" in out, out
     assert "MISSING-FILE absent=True" in out, out
-
-
-# ---- credential gates: the same OR group as the CLI gate ---------------------------------------
-
-CRED_CASES = r"""set -u
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-touch $T/plain
-ln -s $T/nowhere $T/dangling
-for n in absent plain dangling; do
-  systemd-analyze condition @@CONDITIONS@@ >/dev/null 2>&1
-  echo "CASE $n rc=$?"
-done
-"""
-
-
-@pytest.mark.parametrize("dropin,rel", [("homehub-claude-refresh@claude.service.d", ".claude/.credentials.json"),
-                                        ("homehub-claude-refresh@claude2.service.d", ".claude-2/.credentials.json"),
-                                        ("homehub-gemini-refresh.service.d", ".gemini/oauth_creds.json")],
-                         ids=["claude", "claude2", "gemini"])
-def test_credential_gate_skips_only_an_empty_path_under_real_systemd(tmp_path, dropin, rel):
-    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
-                                          "AI_USAGE_USER_ACCOUNT=alice"])
-    assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
-    cp = _ini((box.units / dropin / "10-account.conf").read_text(encoding="utf-8"))
-    path = "/home/alice/" + rel
-    assert cp.get("Unit", "ConditionPathExists") == "|" + path
-    assert cp.get("Unit", "ConditionPathIsSymbolicLink") == "|" + path
-    lines = ["ConditionPathExists=" + cp.get("Unit", "ConditionPathExists"),
-             "ConditionPathIsSymbolicLink=" + cp.get("Unit", "ConditionPathIsSymbolicLink")]
-    cond = " ".join('"%s"' % l.replace(path, "$T/$n") for l in lines)
-    done = ti._wsl_root(CRED_CASES.replace("@@CONDITIONS@@", cond), tmp_path)
-    if "systemd-analyze" in done.stderr and "not found" in done.stderr:
-        pytest.skip("no systemd-analyze in WSL")
-    rcs = dict(re.findall(r"CASE (\w+) rc=(\d+)", done.stdout))
-    assert rcs == {"absent": "1", "plain": "0", "dangling": "0"}, (done.stdout, done.stderr)

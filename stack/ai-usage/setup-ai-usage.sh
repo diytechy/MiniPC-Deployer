@@ -8,17 +8,24 @@
 # that is not a container: there is no compose profile to join, so the knob is
 # the gate, exactly as it is for AI_CLI_ENABLED and REMOTE_UI_ENABLED.
 #
-# IT CREATES NO ACCOUNT. The feeder deliberately runs as the account the AI
-# CLIs are signed into (AI_USAGE_USER_ACCOUNT, normally the same as
-# AI_CLI_USER) because the credentials it READS live in that account's home.
-# Creating and certifying an account is setup-ai-cli.sh's job and duplicating
-# it here would give the box two places that decide what "unprivileged" means.
-# This script therefore REFUSES a missing account rather than making one.
+# ONE EFFECTIVE ACCOUNT, created when absent (plan 3.4, Owner 2026-10-11). The
+# feeder runs as the account the AI CLIs are signed into, because the
+# credentials it READS live in that account's home. That account is
+# AI_CLI_USER when AI_CLI_ENABLED=true, else AI_USAGE_USER_ACCOUNT. Both
+# consumers share StateDirectory=homehub-ai, so two differently named accounts
+# would fight over its ownership: when the names differ this script does NOT
+# refuse - it uses the effective account EVERYWHERE (unit User=, Codex-home
+# ownership, REFRESH_HOME, every refresher drop-in) and logs one line. Creating
+# and certifying the account is ensure-ai-account.sh's job, shared with
+# setup-ai-cli.sh and firstboot, so there is still one place that decides what
+# "unprivileged" means. hub and root are still refused. Credentials owned by a
+# previous account are never migrated; ai-cli-status.sh reports them.
 #
 # THE ACCOUNT THIS SCRIPT CHECKS IS THE ACCOUNT SYSTEMD RUNS. Same construction
 # as setup-ai-cli.sh after the 2026-09-09 cross-review: the unit ships a
 # default name and this script writes User=/Group= into a drop-in from the
-# knob, so a knob nobody read cannot diverge from a unit nobody edited.
+# effective account, so a knob nobody read cannot diverge from a unit nobody
+# edited.
 #
 # Adds NO apt package: python3 stdlib only, and python3 is already in
 # packages.list. No apt export is owed.
@@ -38,11 +45,14 @@ AI_USAGE_USER="${AI_USAGE_USER:-}"
 AI_USAGE_USER_ACCOUNT="${AI_USAGE_USER_ACCOUNT:-homehub-ai}"
 AI_USAGE_FEED_URL="${AI_USAGE_FEED_URL:-}"
 AI_USAGE_SOURCES="${AI_USAGE_SOURCES:-codex,claude,opencode}"
+AI_CLI_ENABLED="${AI_CLI_ENABLED:-false}"
+AI_CLI_USER="${AI_CLI_USER:-}"
+ENSURE_ACCOUNT="${AI_CLI_ENSURE_ACCOUNT:-$HERE/../ai-cli/ensure-ai-account.sh}"
 
 if [ -f "$ENV_FILE" ]; then
     # Read only the keys we own, and never `source` a file that may hold
     # secrets into this shell's environment wholesale.
-    for key in AI_USAGE_ENABLED AI_USAGE_USER AI_USAGE_USER_ACCOUNT AI_USAGE_FEED_URL AI_USAGE_SOURCES; do
+    for key in AI_USAGE_ENABLED AI_USAGE_USER AI_USAGE_USER_ACCOUNT AI_USAGE_FEED_URL AI_USAGE_SOURCES AI_CLI_ENABLED AI_CLI_USER; do
         value="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
         [ -n "$value" ] && printf -v "$key" '%s' "$value"
     done
@@ -82,22 +92,32 @@ fi
     "AI_USAGE_FEED_URL is blank. There is no default - the tracker is
     bridge-only, so the right value depends on this box."
 
-case "$AI_USAGE_USER_ACCOUNT" in
-    hub|root) refuse "AI_USAGE_USER_ACCOUNT=$AI_USAGE_USER_ACCOUNT. \`hub\` carries
+# The effective account (see the header). Everything below uses ACCOUNT; the
+# raw AI_USAGE_USER_ACCOUNT is read once, here, and never again.
+ACCOUNT="$(bash "$ENSURE_ACCOUNT" --effective "$AI_CLI_ENABLED" "$AI_CLI_USER" "$AI_USAGE_USER_ACCOUNT")"
+if [ "$AI_CLI_ENABLED" = "true" ] && [ "$ACCOUNT" != "$AI_USAGE_USER_ACCOUNT" ]; then
+    say "usage feeder and AI CLI service share one account: $ACCOUNT (AI_CLI_USER)."
+fi
+
+case "$ACCOUNT" in
+    hub|root) refuse "the service account is $ACCOUNT. \`hub\` carries
         (ALL) NOPASSWD: ALL and root needs no explanation; the feeder runs as the
         dedicated unprivileged account the CLIs are signed into." ;;
 esac
 
-if ! id -u "$AI_USAGE_USER_ACCOUNT" >/dev/null 2>&1; then
-    refuse "no account \`$AI_USAGE_USER_ACCOUNT\` on this box. It is created and
-    certified by setup-ai-cli.sh (AI_CLI_ENABLED=true); this script will not
-    make a second place that decides what unprivileged means."
-fi
-
 if [ "$MODE" = "--check-only" ]; then
-    say "check-only: identity set, destination set, account $AI_USAGE_USER_ACCOUNT exists."
+    say "check-only: identity set, destination set, account $ACCOUNT (created at install if absent)."
     exit 0
 fi
+
+# Create and certify the account instead of refusing its absence.
+ensure_rc=0
+bash "$ENSURE_ACCOUNT" "$ACCOUNT" || ensure_rc=$?
+case "$ensure_rc" in
+    0) ;;
+    2) refuse "$ACCOUNT was not certified as an unprivileged account (reason above)." ;;
+    *) say "FAILED: could not create or certify $ACCOUNT"; exit 1 ;;
+esac
 
 # CODEX'S WRITABLE HOME, owned by the account and holding nothing else.
 # `codex app-server` cannot run with nowhere to write -- it opens SQLite
@@ -107,7 +127,10 @@ fi
 # child: the feeder's write guard bounds writes to inside StateDirectory, and
 # that bound is only meaningful while nothing in there is a credential.
 # See the note in homehub-ai-usage.service.
-install -d -m 0700 -o "$AI_USAGE_USER_ACCOUNT" -g "$AI_USAGE_USER_ACCOUNT"     /var/lib/homehub-ai-codex
+# CREATED ALWAYS, whatever AI_USAGE_SOURCES says: homehub-ai-usage.service lists
+# it in ReadWritePaths= unconditionally, and a missing path there fails the
+# unit's namespace setup before the feeder runs (e.g. sources=claude,gemini).
+install -d -m 0700 -o "$ACCOUNT" -g "$ACCOUNT" /var/lib/homehub-ai-codex
 
 install -d -m 0755 "$UNIT_DIR"
 install -m 0644 "$HERE/homehub-ai-usage.service" "$UNIT_DIR/homehub-ai-usage.service"
@@ -132,11 +155,11 @@ fi
 # The drop-in is what makes the knob and the unit the same fact.
 install -d -m 0755 "$DROPIN_DIR"
 cat > "$DROPIN_DIR/10-account.conf" <<EOF
-# GENERATED by setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT. Do not hand-edit:
+# GENERATED by setup-ai-usage.sh from the effective account. Do not hand-edit:
 # the account certified and the account systemd runs must be one value.
 [Service]
-User=$AI_USAGE_USER_ACCOUNT
-Group=$AI_USAGE_USER_ACCOUNT
+User=$ACCOUNT
+Group=$ACCOUNT
 EOF
 chmod 0644 "$DROPIN_DIR/10-account.conf"
 
@@ -149,8 +172,8 @@ chmod 0644 "$DROPIN_DIR/10-account.conf"
 # expands to the manager's home (/root), and systemd then refuses to start at
 # all with 226/NAMESPACE. One knob decides the account; the same knob decides
 # where its credential lives.
-REFRESH_HOME="$(getent passwd "$AI_USAGE_USER_ACCOUNT" | cut -d: -f6)"
-[ -n "$REFRESH_HOME" ] || refuse     "cannot resolve the home directory of $AI_USAGE_USER_ACCOUNT, so the
+REFRESH_HOME="$(getent passwd "$ACCOUNT" | cut -d: -f6)"
+[ -n "$REFRESH_HOME" ] || refuse     "cannot resolve the home directory of $ACCOUNT, so the
     credential refresher has no path to re-open for writing."
 
 # Account 1: the CLI's DEFAULT config, exactly the two paths the un-templated
@@ -158,10 +181,10 @@ REFRESH_HOME="$(getent passwd "$AI_USAGE_USER_ACCOUNT" | cut -d: -f6)"
 CLAUDE1_DROPIN_DIR="$UNIT_DIR/homehub-claude-refresh@claude.service.d"
 install -d -m 0755 "$CLAUDE1_DROPIN_DIR"
 cat > "$CLAUDE1_DROPIN_DIR/10-account.conf" <<EOF
-# GENERATED by setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT. Do not hand-edit.
+# GENERATED by setup-ai-usage.sh from the effective account. Do not hand-edit.
 [Service]
-User=$AI_USAGE_USER_ACCOUNT
-Group=$AI_USAGE_USER_ACCOUNT
+User=$ACCOUNT
+Group=$ACCOUNT
 ReadWritePaths=$REFRESH_HOME/.claude $REFRESH_HOME/.claude.json
 EOF
 chmod 0644 "$CLAUDE1_DROPIN_DIR/10-account.conf"
@@ -176,13 +199,13 @@ chmod 0644 "$CLAUDE1_DROPIN_DIR/10-account.conf"
 CLAUDE2_DROPIN_DIR="$UNIT_DIR/homehub-claude-refresh@claude2.service.d"
 CLAUDE2_CONFIG_DIR="$REFRESH_HOME/.claude-2"
 if source_enabled claude2; then
-    install -d -m 0700 -o "$AI_USAGE_USER_ACCOUNT" -g "$AI_USAGE_USER_ACCOUNT" "$CLAUDE2_CONFIG_DIR"
+    install -d -m 0700 -o "$ACCOUNT" -g "$ACCOUNT" "$CLAUDE2_CONFIG_DIR"
     install -d -m 0755 "$CLAUDE2_DROPIN_DIR"
     cat > "$CLAUDE2_DROPIN_DIR/10-account.conf" <<EOF
-# GENERATED by setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT. Do not hand-edit.
+# GENERATED by setup-ai-usage.sh from the effective account. Do not hand-edit.
 [Service]
-User=$AI_USAGE_USER_ACCOUNT
-Group=$AI_USAGE_USER_ACCOUNT
+User=$ACCOUNT
+Group=$ACCOUNT
 Environment=CLAUDE_CONFIG_DIR=$CLAUDE2_CONFIG_DIR
 ReadWritePaths=$CLAUDE2_CONFIG_DIR
 EOF
@@ -193,13 +216,13 @@ fi
 # which is therefore the one directory its keeper may write.
 GEMINI_DROPIN_DIR="$UNIT_DIR/homehub-gemini-refresh.service.d"
 if source_enabled gemini; then
-    install -d -m 0700 -o "$AI_USAGE_USER_ACCOUNT" -g "$AI_USAGE_USER_ACCOUNT" "$REFRESH_HOME/.gemini"
+    install -d -m 0700 -o "$ACCOUNT" -g "$ACCOUNT" "$REFRESH_HOME/.gemini"
     install -d -m 0755 "$GEMINI_DROPIN_DIR"
     cat > "$GEMINI_DROPIN_DIR/10-account.conf" <<EOF
-# GENERATED by setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT. Do not hand-edit.
+# GENERATED by setup-ai-usage.sh from the effective account. Do not hand-edit.
 [Service]
-User=$AI_USAGE_USER_ACCOUNT
-Group=$AI_USAGE_USER_ACCOUNT
+User=$ACCOUNT
+Group=$ACCOUNT
 ReadWritePaths=$REFRESH_HOME/.gemini
 EOF
     chmod 0644 "$GEMINI_DROPIN_DIR/10-account.conf"
@@ -283,45 +306,24 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
 fi
 
-say "AI-usage feeder installed; runs as $AI_USAGE_USER_ACCOUNT on the timer."
-say "STILL OWED BY A HUMAN: the vendor sign-ins do not survive a reimage, and a"
-say "  source with no credential posts 'unavailable' - correct, not a bug."
-say ""
-say "  SIGN CODEX IN WITH CODEX_HOME SET, or the unit will not find the token:"
-say "    sudo -u $AI_USAGE_USER_ACCOUNT env CODEX_HOME=/var/lib/homehub-ai-codex \\"
-say "        PATH=/usr/local/bin:/usr/bin:/bin codex login --device-auth"
-say "  The unit keeps ProtectHome=read-only, so codex writes to that directory"
-say "  and never to the account home. A sign-in done WITHOUT it lands in"
-say "  ~/.codex, which the service cannot read - the gauge then stays"
-say "  'unavailable' with the CLI insisting it is logged in."
-say ""
-say "  Claude (account 1) signs in normally. THE COMMAND IS \`claude auth login\`,"
-say "  NOT \`claude setup-token\`: that mints an automation token without the"
-say "  user:profile scope the usage endpoint needs, so the gauge would read"
-say "  'unavailable' with a good-looking login:"
-say "    sudo -u $AI_USAGE_USER_ACCOUNT env HOME=$REFRESH_HOME \\"
-say "        PATH=/usr/local/bin:/usr/bin:/bin sh -c 'cd ~ && claude auth login --claudeai'"
-say "  It needs a terminal to paste the returned code into (tmux works)."
-say ""
-say "  OpenCode signs in normally too (\`opencode auth login\`, same wrapper,"
-say "  from the account's home directory)."
-if source_enabled claude2; then
-    say ""
-    say "  Claude account 2 is a SEPARATE login in its own config directory. Sign in"
-    say "  as the second account, with CLAUDE_CONFIG_DIR set, once:"
-    say "    sudo -u $AI_USAGE_USER_ACCOUNT env HOME=$REFRESH_HOME \\"
-    say "        CLAUDE_CONFIG_DIR=$CLAUDE2_CONFIG_DIR \\"
-    say "        PATH=/usr/local/bin:/usr/bin:/bin sh -c 'cd ~ && claude auth login --claudeai'"
-    say "  Never copy account 1's files into it: the refresh token is single-use."
-    say "  Set AI_USAGE_CLAUDE2_CREDENTIALS=$CLAUDE2_CONFIG_DIR/.credentials.json."
-fi
-if source_enabled gemini; then
-    say ""
-    say "  Gemini signs in through the CLI itself, as the same account, once"
-    say "  (choose 'Login with Google'; NO_BROWSER prints a link and asks for a code):"
-    say "    sudo -u $AI_USAGE_USER_ACCOUNT env HOME=$REFRESH_HOME NO_BROWSER=true \\"
-    say "        PATH=/usr/local/bin:/usr/bin:/bin sh -c 'cd ~ && gemini'"
-    say "  It must be an account the CLI has onboarded (run one prompt). The feeder"
-    say "  reads $REFRESH_HOME/.gemini/oauth_creds.json and never writes it."
-fi
+say "AI-usage feeder installed; runs as $ACCOUNT on the timer."
+
+# The vendor updaters are switched off system-wide (plan 3.5): claude always (its
+# refresher is always installed), gemini only when it is a source.
+# /etc is derived from the unit dir (/etc/systemd/system -> /etc), so a run
+# against a sandboxed unit dir writes its updater files into the sandbox too.
+UPDATER_ARGS=()
+source_enabled gemini && UPDATER_ARGS=(--gemini)
+AI_CLI_ETC_DIR="${AI_CLI_ETC_DIR:-$(dirname "$(dirname "$UNIT_DIR")")}" \
+    bash "${AI_CLI_UPDATER_CONTROLS:-$HERE/../ai-cli/install-updater-controls.sh}" ${UPDATER_ARGS[@]+"${UPDATER_ARGS[@]}"} \
+    || say "WARNING: could not write the vendor updater settings; the wrappers still export the controls."
+
+# WHAT IS STILL OWED is a sign-in, and only the ones this box actually lacks:
+# ai-cli-status.sh reads the provisioner's status and checks each credential AS
+# THE ACCOUNT, then prints the exact recipe for the unverified sources and
+# nothing else. (The recipes that used to be printed here unconditionally -
+# `claude auth login` for the account, CLAUDE_CONFIG_DIR for the second one,
+# CODEX_HOME for the usage Codex home - live there now; `claude setup-token` is
+# still the wrong command.) It never fails this script.
+AI_CLI_ENV_FILE="$ENV_FILE" bash "${AI_CLI_STATUS:-$HERE/../ai-cli/ai-cli-status.sh}" || true
 exit 0

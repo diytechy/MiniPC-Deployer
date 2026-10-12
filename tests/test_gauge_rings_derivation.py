@@ -88,9 +88,6 @@ CASES = [
      [("claude", "claude", "1"), ("claude2", "claude", "2"), ("codex", None, None),
       ("gemini", None, None), ("opencode", None, None)]),
     ("claude2", [("claude2", "claude", None)]),
-    ("opencode, Mystery ,codex,mystery",
-     [("codex", None, None), ("opencode", None, None), ("mystery", None, None)]),
-    ("codex,bad_name,x y,,opencode", [("codex", None, None), ("opencode", None, None)]),
 ]
 
 
@@ -232,67 +229,136 @@ def providers(dest):
     return [s["provider"] for s in json.loads(dest.read_text(encoding="utf-8"))["gaugeRings"]["slots"]]
 
 
-def test_tc1215_default_sources_match_the_feeder_source():
-    text = FEEDER.read_text(encoding="utf-8")
-    found = re.search(r'env\.get\("AI_USAGE_SOURCES"\)\s+or\s+"([^"]+)"', text)
-    assert found, "feeder default no longer has the shape this test reads"
-    assert MODULE.DEFAULT_SOURCES == found.group(1)
+def block_of(dest):
+    return json.loads(dest.read_text(encoding="utf-8"))["gaugeRings"]
 
 
-@pytest.mark.parametrize("line", ["", "AI_USAGE_SOURCES=\n", "AI_USAGE_SOURCES=  \n",
-                                  "AI_USAGE_SOURCES=,\n", "AI_USAGE_SOURCES= , ,\n",
-                                  "AI_USAGE_SOURCES=\"\"\n"])
-def test_tc1215_unset_or_empty_sources_use_the_feeders_default(tmp_path, line):
-    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\n" + line)
+ENABLED = "AI_USAGE_ENABLED=true\n"
+FAIL_SAFE = {"slots": [], "unlisted": "append"}
+
+
+def feeder_expected(value):
+    """The REAL feeder's answer for a delivered value (None = unset)."""
+    spec = importlib.util.spec_from_file_location("feeder_other_side", ROOT / "stack/ai-usage/ai_usage_feeder.py")
+    feeder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(feeder)
+    return feeder.enabled_sources({} if value is None else {"AI_USAGE_SOURCES": value})
+
+
+TABLE = [
+    ("", ["claude", "codex", "opencode"]),                       # unset
+    ("AI_USAGE_SOURCES=\n", ["claude", "codex", "opencode"]),     # empty
+    ("AI_USAGE_SOURCES=\"\"\n", ["claude", "codex", "opencode"]),  # empty, quoted
+    ("AI_USAGE_SOURCES=   \n", ["claude", "codex", "opencode"]),  # unquoted whitespace: systemd trims
+    ("AI_USAGE_SOURCES=\"   \"\n", []),                          # quoted whitespace
+    ("AI_USAGE_SOURCES=,\n", []),                                # commas only
+    ("AI_USAGE_SOURCES= , ,\n", []),
+    ("AI_USAGE_SOURCES=codex,claude\n", ["claude", "codex"]),
+    ("AI_USAGE_SOURCES='gemini'\n", ["gemini"]),
+]
+
+
+@pytest.mark.parametrize("line,expected", TABLE)
+@pytest.mark.parametrize("start", ["absent", "default", "marked"])
+def test_tc1215_every_derivable_block_follows_the_real_feeders_source_list(tmp_path, line, expected, start):
+    block = {"absent": "absent", "default": dict(FAIL_SAFE),
+             "marked": {"slots": [{"provider": "grok"}], "unlisted": "hide",
+                        "derivedFrom": "AI_USAGE_SOURCES"}}[start]
+    doc = json.dumps({"ACCESS_ENABLED": False} if block == "absent" else {"ACCESS_ENABLED": False, "gaugeRings": block})
+    env, source, dest = make_raw(tmp_path, ENABLED + line, doc)
     MODULE.install(env, source, dest)
-    assert providers(dest) == DEFAULT_PROVIDERS
-
-
-def test_tc1216_marked_block_with_no_usable_source_is_regenerated_empty(tmp_path):
-    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
-    doc = json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale})
-    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=bad_name\n", doc)
-    MODULE.install(env, source, dest)
-    block = json.loads(dest.read_text(encoding="utf-8"))["gaugeRings"]
-    assert block["slots"] == [] and block["derivedFrom"] == "AI_USAGE_SOURCES"
-
-
-def test_tc1215_continuation_line_is_joined_like_systemd(tmp_path):
-    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex,\\\nclaude\n")
-    MODULE.install(env, source, dest)
-    assert providers(dest) == ["claude", "codex"]
+    assert providers(dest) == expected
+    assert block_of(dest)["unlisted"] == "hide" and block_of(dest)["derivedFrom"] == "AI_USAGE_SOURCES"
+    value = None
+    if line:
+        value = line.split("=", 1)[1].rstrip("\n")
+        value = value[1:-1] if value[:1] in "\"'" and value[:1] else value.strip()
+    assert sorted(providers(dest)) == sorted(feeder_expected(value)), "renderer disagrees with the feeder"
 
 
 def test_tc1215_comment_lines_are_not_assignments_and_last_assignment_wins(tmp_path):
-    text = ("# AI_USAGE_SOURCES=grok\n; AI_USAGE_SOURCES=grok\nAI_USAGE_ENABLED=true\n"
+    text = ("# AI_USAGE_SOURCES=grok\n; AI_USAGE_SOURCES=grok\n" + ENABLED +
             "AI_USAGE_SOURCES=gemini\nAI_USAGE_SOURCES=\"codex\"\n")
     env, source, dest = make_raw(tmp_path, text)
     MODULE.install(env, source, dest)
     assert providers(dest) == ["codex"]
 
 
-def test_tc1215_inline_hash_is_part_of_the_value_as_systemd_reads_it(tmp_path):
-    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex,claude # note\n")
+UNSUPPORTED = [
+    ("indent", ENABLED + " AI_USAGE_SOURCES=codex\n"),
+    ("space before =", ENABLED + "AI_USAGE_SOURCES =codex\n"),
+    ("export", ENABLED + "export AI_USAGE_SOURCES=codex\n"),
+    ("backslash", ENABLED + "AI_USAGE_SOURCES=codex,\\\nclaude\n"),
+    ("backslash inside", ENABLED + "AI_USAGE_SOURCES=co\\dex\n"),
+    ("multiline quote", ENABLED + "AI_USAGE_SOURCES=\"codex,\nclaude\"\n"),
+    ("unmatched quote", ENABLED + "AI_USAGE_SOURCES=\"codex\n"),
+    ("enabled indent", " AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n"),
+    ("enabled export", "export AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n"),
+    ("enabled space", "AI_USAGE_ENABLED =true\nAI_USAGE_SOURCES=codex\n"),
+]
+
+
+@pytest.mark.parametrize("label,text", UNSUPPORTED, ids=[u[0] for u in UNSUPPORTED])
+@pytest.mark.parametrize("start", ["absent", "marked"])
+def test_tc1218_unsupported_final_assignment_installs_the_unmarked_append_default(tmp_path, capsys, label, text, start):
+    base = {"ACCESS_ENABLED": False}
+    if start == "marked":
+        base["gaugeRings"] = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    env, source, dest = make_raw(tmp_path, text, json.dumps(base))
     MODULE.install(env, source, dest)
-    assert providers(dest) == ["codex"], "'claude # note' is not a source name; only codex survives"
+    assert block_of(dest) == FAIL_SAFE, "stale or marked block retained"
+    out = capsys.readouterr().out
+    assert len([l for l in out.splitlines() if "WARNING" in l]) == 1
+    assert "AI_USAGE_" in out
+
+
+def test_tc1218_unsupported_form_leaves_an_owner_written_block_alone(tmp_path):
+    owner = {"slots": [{"provider": "grok"}], "unlisted": "hide"}
+    env, source, dest = make_raw(tmp_path, ENABLED + "export AI_USAGE_SOURCES=codex\n",
+                                 json.dumps({"ACCESS_ENABLED": False, "gaugeRings": owner}))
+    MODULE.install(env, source, dest)
+    assert dest.read_bytes() == source.read_bytes()
+
+
+def test_tc1218_unsupported_EARLIER_assignment_does_not_block_a_supported_final_one(tmp_path):
+    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    text = ENABLED + "export AI_USAGE_SOURCES=gemini\n AI_USAGE_SOURCES=gemini\nAI_USAGE_SOURCES=co\\dex\nAI_USAGE_SOURCES=codex\n"
+    env, source, dest = make_raw(tmp_path, text, json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
+    MODULE.install(env, source, dest)
+    assert providers(dest) == ["codex"] and "derivedFrom" in block_of(dest)
 
 
 @pytest.mark.parametrize("text", [
     "AI_USAGE_SOURCES=codex\n",                           # key missing
     "AI_USAGE_ENABLED=\nAI_USAGE_SOURCES=codex\n",        # empty value
-    "AI_USAGE_ENABLED=true # on\nAI_USAGE_SOURCES=codex\n",  # inline hash makes it not 'true'
-    "export AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n",
+    "AI_USAGE_ENABLED=false\nAI_USAGE_SOURCES=codex\n",
     "AI_USAGE_ENABLED=True\nAI_USAGE_SOURCES=codex\n",
-    "  AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n",
-    "AI_USAGE_ENABLED=true\nexport AI_USAGE_SOURCES=codex\n",
+    "AI_USAGE_ENABLED=true # on\nAI_USAGE_SOURCES=codex\n",
 ])
-def test_tc1218_unreadable_or_non_true_enable_fails_closed(tmp_path, capsys, text):
+def test_tc1218_not_exactly_true_is_not_derived(tmp_path, capsys, text):
     env, source, dest = make_raw(tmp_path, text)
     MODULE.install(env, source, dest)
     assert dest.read_bytes() == source.read_bytes()
-    out = capsys.readouterr().out
-    if "ENABLED=\n" not in text and "AI_USAGE_ENABLED" in text:
-        assert "gaugeRings:" in out, "a fail-closed refusal must say so"
+    if "True" in text or "# on" in text:
+        assert "gaugeRings:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["codex,claude # note", "codex,mystery", "Codex"])
+def test_tc1218_a_list_the_feeder_refuses_installs_the_append_default(tmp_path, capsys, value):
+    env, source, dest = make_raw(tmp_path, ENABLED + "AI_USAGE_SOURCES=" + value + "\n")
+    with pytest.raises(SystemExit):
+        feeder_expected(value)  # the other side really does refuse it
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_tc1218_feeder_module_unavailable_installs_the_append_default(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(MODULE, "FEEDER_PATH", tmp_path / "absent.py")
+    env, source, dest = make_raw(tmp_path, ENABLED + "AI_USAGE_SOURCES=codex\n")
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    assert "WARNING" in capsys.readouterr().out
 
 
 def test_tc1217_unpaired_surrogate_in_source_does_not_abort(tmp_path):

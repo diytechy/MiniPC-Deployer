@@ -69,25 +69,35 @@ copy leaves neither.
 panel reads `gaugeRings` from the hub-served `config.json` once at boot, so a
 change reaches the wall only after the kiosk shell restarts.
 
-- **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`, read the way
-  systemd's `EnvironmentFile` (and so the feeder) reads them: a comment is `#` or
-  `;` at the start of a line only, so an inline ` # note` is part of the value;
-  trailing-backslash lines continue; one pair of matching quotes is stripped; the
-  last assignment wins. `export NAME=...`, indented `NAME=...` and values with a
-  backslash are not read by systemd as written, so they fail closed with a
-  `gaugeRings:` log line and no derivation. Unless `AI_USAGE_ENABLED` is exactly
-  `true` the destination is byte-identical to the source. An unset, empty or
-  commas-only `AI_USAGE_SOURCES` means the feeder's default,
-  `codex,claude,opencode`. A previously derived block whose list now has no usable
-  name is regenerated empty.
+- **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`. Only the
+  canonical form is supported, the one the materialiser and
+  `stack/sleep/apply-env-lines.py` write: `NAME=VALUE` at column 0, no space before
+  `=`, one line, the value optionally wrapped in ONE matching pair of `"` or `'`
+  (an unquoted value is trimmed, as systemd delivers it). Only the FINAL
+  assignment of each key counts; earlier ones never block. Unless
+  `AI_USAGE_ENABLED` is exactly `true` the destination is byte-identical to the
+  source (a value other than `true`/`false` logs a line).
+- **Source list.** The renderer calls the feeder's own `enabled_sources()`
+  (`stack/ai-usage/ai_usage_feeder.py`, loaded by path), so it cannot disagree
+  with what runs: unset, empty or unquoted-whitespace gives the feeder's default
+  list; quoted whitespace or commas-only gives an empty list, and every derivable
+  block then becomes `{"slots": [], "unlisted": "hide", "derivedFrom": ...}`.
+- **Fail-safe.** If the final assignment is in any other form (indented, space
+  before `=`, `export`, any backslash, an unmatched or multiline quote), or the
+  feeder refuses the list (an unknown or mis-cased name) or cannot be loaded, a
+  derivable block (absent, marked, or the shipped default) is replaced by the
+  shipped default `{"slots": [], "unlisted": "append"}` WITHOUT the marker, so
+  the wall shows every served ring and no stale derived block survives. One
+  `WARNING` line names the reason. An Owner-written block is left alone. systemd
+  itself accepts some of these forms (indentation, a space before `=`, quoted
+  multiline values); the renderer deliberately does not try to follow it there.
 - **Output.** `"gaugeRings": {"slots": [...], "unlisted": "hide", "derivedFrom":
   "AI_USAGE_SOURCES"}`. Slot order is claude, claude2, codex, grok, gemini,
-  opencode, freellmapi, filtered to the listed sources; unknown listed names follow
-  in listed order. Names are lower-cased and de-duplicated; a name that is not
-  letters and digits is dropped (the renderer would drop it anyway). `claude` and
-  `claude2` carry `mark: "claude"`, and badges `"1"`/`"2"` only when both are
-  listed. `"hide"` makes the rings follow the sources exactly. An empty source
-  list derives nothing. FreeLLMAPI gets no special handling here.
+  opencode, freellmapi, filtered to the sources the feeder runs (names the feeder
+  refuses never get this far; see Fail-safe). Names are de-duplicated. `claude`
+  and `claude2` carry `mark: "claude"`, and badges `"1"`/`"2"` only when both are
+  listed. `"hide"` makes the rings follow the sources exactly. FreeLLMAPI gets no
+  special handling here.
 - **Authority.** The SOURCE file (`/opt/homehub/site/config.json`) is never
   modified. The destination is regenerated from source plus `.env` on every run
   (firstboot runs it on every boot). Everything else in the document is

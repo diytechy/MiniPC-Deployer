@@ -27,62 +27,64 @@ SPEC.loader.exec_module(MODULE)
 # Mirrors USAGE_PROVIDER_ORDER in OfficeWallNaglight js/views/gauges.js; the
 # tests read that file and compare, so drift fails there rather than here.
 PROVIDER_ORDER = ("claude", "claude2", "codex", "grok", "gemini", "opencode", "freellmapi")
-PROVIDER_KEY = re.compile(r"^[a-z0-9]+$")  # same rule normalizeGaugeRings applies
 SHIPPED_DEFAULT = {"slots": [], "unlisted": "append"}
 MARKER = "derivedFrom"
 
 
-DEFAULT_SOURCES = "codex,claude,opencode"  # the feeder's own default; a test reads it from the feeder
-_ASSIGN = re.compile(r"^\s*(export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
-
-
-def logical_lines(env_text: str):
-    """Physical lines joined across a trailing backslash, as systemd does."""
-    pending = ""
-    for line in env_text.replace("\r\n", "\n").split("\n"):
-        stripped = line.rstrip()
-        trailing = len(stripped) - len(stripped.rstrip("\\"))
-        if trailing % 2 == 1:
-            pending += stripped[:-1]
-            continue
-        yield pending + line
-        pending = ""
-    if pending:
-        yield pending
+# The feeder is the authority on which sources run. Its enabled_sources() is
+# loaded by path so the renderer cannot drift from it.
+FEEDER_PATH = Path(__file__).resolve().parent.parent / "ai-usage" / "ai_usage_feeder.py"
+_ASSIGN = re.compile(r"^(\s*)(export\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*)=(.*)$")
+READ_KEYS = ("AI_USAGE_ENABLED", "AI_USAGE_SOURCES")
 
 
 def read_env(env_text: str, names):
-    """({name: value}, unsupported) for the NAMES asked for, the way systemd's
-    EnvironmentFile reads them: a comment is '#' or ';' at line start only (an
-    inline ' # note' is part of the value), the LAST assignment wins, one pair of
-    matching quotes is stripped. `export NAME=` and indented `NAME=` are not read
-    by systemd as written, so they are reported in `unsupported` (fail closed)."""
-    values = {}
-    unsupported = set()
-    for line in logical_lines(env_text):
+    """{name: (value, problem)} from the FINAL assignment of each NAME.
+
+    Supported form: `NAME=VALUE` at column 0, one line, no space before `=`, the
+    value optionally wrapped in ONE matching pair of quotes (what the materialiser
+    and apply-env-lines.py write). Anything else on the final assignment gives
+    (None, reason). Earlier assignments are ignored, supported or not. An unquoted
+    value is trimmed (as systemd delivers it); a quoted one is kept as written."""
+    final = {}
+    for line in env_text.replace("\r\n", "\n").split("\n"):
         match = _ASSIGN.match(line)
-        if not match or match.group(2) not in names:
-            continue
-        name = match.group(2)
-        if match.group(1) or line != line.lstrip():
-            unsupported.add(name)
-            continue
-        value = line.partition("=")[2].strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if "\\" in value:
-            unsupported.add(name)
-            continue
-        values[name] = value
-    return values, unsupported
+        if match and match.group(3) in names:
+            final[match.group(3)] = match
+    result = {}
+    for name, match in final.items():
+        indent, export, _, space, rest = match.groups()
+        value = rest.strip()
+        problem = None
+        if indent:
+            problem = "the assignment is indented"
+        elif export:
+            problem = "the assignment starts with export"
+        elif space:
+            problem = "there is a space before ="
+        elif "\\" in rest:
+            problem = "the value contains a backslash"
+        elif value[:1] in ("'", '"'):
+            quote = value[0]
+            if len(value) < 2 or value[-1] != quote or quote in value[1:-1]:
+                problem = "the value has an unmatched or multiline quote"
+            else:
+                value = value[1:-1]
+        elif "'" in value or '"' in value:
+            problem = "the value has a stray quote"
+        result[name] = (None, problem) if problem else (value, None)
+    return result
 
 
-def listed_sources(sources_text: str):
-    """Usable provider ids from a comma list (lower-cased, de-duplicated)."""
+def feeder_sources(sources_value):
+    """The feeder's own enabled_sources() for the value (None = knob unset)."""
+    spec = importlib.util.spec_from_file_location("ai_usage_feeder_for_rings", FEEDER_PATH)
+    feeder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(feeder)
+    names = feeder.enabled_sources({} if sources_value is None else {"AI_USAGE_SOURCES": sources_value})
     listed = []
-    for raw in sources_text.split(","):
-        name = raw.strip().lower()
-        if PROVIDER_KEY.match(name) and name not in listed:
+    for name in names:
+        if name not in listed:
             listed.append(name)
     return listed
 
@@ -120,35 +122,42 @@ def serialise(source_text: str, document) -> bytes:
 
 
 def derive(env_text: str, source_bytes: bytes, document) -> bytes:
-    values, unsupported = read_env(env_text, ("AI_USAGE_ENABLED", "AI_USAGE_SOURCES"))
-    if unsupported:
-        print("gaugeRings: %s is written in a form systemd does not read; not derived"
-              % ", ".join(sorted(unsupported)))
-        return source_bytes
-    enabled = values.get("AI_USAGE_ENABLED", "")
+    existing = document.get("gaugeRings")
+    marked = isinstance(existing, dict) and MARKER in existing
+    owned = "gaugeRings" not in document or marked or existing == SHIPPED_DEFAULT
+
+    def put(block):
+        if not owned:
+            print("gaugeRings: Owner-written block in the source left as is; not derived")
+            return source_bytes
+        changed = dict(document)
+        changed["gaugeRings"] = block
+        out = serialise(source_bytes.decode("utf-8-sig"), changed)
+        MODULE.validate(env_text, json.loads(out.decode("ascii"), parse_constant=_no_constant))
+        return out
+
+    def fail_safe(reason):
+        # Never keep a stale derived block, never hide anything we cannot account for.
+        print("gaugeRings: WARNING %s; installing the append default so every served ring shows"
+              % reason)
+        return put(dict(SHIPPED_DEFAULT))
+
+    values = read_env(env_text, READ_KEYS)
+    enabled, problem = values.get("AI_USAGE_ENABLED", ("", None))
+    if problem:
+        return fail_safe("AI_USAGE_ENABLED is unsupported (%s)" % problem)
     if enabled != "true":
         if enabled not in ("", "false"):
             print("gaugeRings: AI_USAGE_ENABLED is not exactly true or false; not derived")
         return source_bytes
-    raw = values.get("AI_USAGE_SOURCES", "")
-    if not raw.replace(",", "").strip():
-        raw = DEFAULT_SOURCES  # the feeder's default for an unset or empty list
-    listed = listed_sources(raw)
-    existing = document.get("gaugeRings")
-    marked = isinstance(existing, dict) and MARKER in existing
-    if not listed and not marked:
-        print("gaugeRings: AI_USAGE_SOURCES lists no usable source; nothing derived")
-        return source_bytes
-    owned = "gaugeRings" not in document or marked or existing == SHIPPED_DEFAULT
-    if not owned:
-        print("gaugeRings: Owner-written block in the source left as is; not derived")
-        return source_bytes
-    document = dict(document)
-    document["gaugeRings"] = derive_rings(listed)
-    out = serialise(source_bytes.decode("utf-8-sig"), document)
-    checked = json.loads(out.decode("ascii"), parse_constant=_no_constant)
-    MODULE.validate(env_text, checked)
-    return out
+    raw, problem = values.get("AI_USAGE_SOURCES", (None, None))
+    if problem:
+        return fail_safe("AI_USAGE_SOURCES is unsupported (%s)" % problem)
+    try:
+        listed = feeder_sources(raw)
+    except (SystemExit, Exception) as error:  # noqa: BLE001 - the feeder refuses or is absent
+        return fail_safe("the feeder's source list could not be resolved (%s)" % type(error).__name__)
+    return put(derive_rings(listed))
 
 
 def render(env_text: str, source_bytes: bytes, document) -> bytes:

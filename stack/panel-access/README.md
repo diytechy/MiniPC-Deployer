@@ -62,6 +62,85 @@ Manual unpacking into `app/gateway` is superseded by it: the release script
 keeps the retention and the markers that make a rollback possible, and a hand
 copy leaves neither.
 
+## Derived AI rings (`gaugeRings`)
+
+`install-renderer-config.py` also derives the panel's AI ring list from the hub
+`.env`, so adding a usage source is the only edit (SR-081, LLR-1121..1125). The
+panel reads `gaugeRings` from the hub-served `config.json` once at boot, so a
+change reaches the wall only after the kiosk shell restarts.
+
+- **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`. When the
+  file mentions `AI_USAGE_`, EVERY line must be one of: blank; a comment (first
+  non-space character `#` or `;`, where "space" is only space, tab and CR, so a
+  Unicode space makes the line an ordinary non-canonical line); or a canonical assignment `NAME=VALUE` at
+  column 0 whose VALUE is exactly one of: bare (no quote or backslash anywhere),
+  one double-quoted string, or one single-quoted string, with nothing outside the
+  quotes. This is a positive whitelist: it is what the materialiser and
+  `stack/sleep/apply-env-lines.py` write, and `stack/.env.example` passes it (a
+  test asserts that). Of the lines that pass, only the FINAL assignment of each key
+  counts. An unquoted value is trimmed of space, tab and CR only (what systemd trims,
+  not Python's Unicode whitespace), and the values of `AI_USAGE_ENABLED` and
+  `AI_USAGE_SOURCES` must be printable ASCII (plus tab and space) or the file is
+  treated as ambiguous; other keys may hold any text. Unless
+  `AI_USAGE_ENABLED` is exactly `true` the destination is byte-identical to the
+  source (a value other than `true`/`false` logs a line).
+- **Source list.** The renderer calls the feeder's own `enabled_sources()`
+  (`stack/ai-usage/ai_usage_feeder.py`, loaded by path), so it cannot disagree
+  with what runs: unset, empty or unquoted-whitespace gives the feeder's default
+  list; quoted whitespace or commas-only gives an empty list, and every derivable
+  block then becomes `{"slots": [], "unlisted": "hide", "derivedFrom": ...}`.
+- **Fail-safe.** If any line fails the whitelist (indentation, `export`, a space
+  before `=`, any backslash, a stray, unmatched or multiline quote, a line that is
+  not an assignment), assignment boundaries are ambiguous and nothing is parsed.
+  The same fail-safe applies when the feeder refuses the list (an unknown or
+  mis-cased name) or cannot be loaded: a derivable block (absent, marked, or the
+  shipped default) is replaced by the shipped default `{"slots": [], "unlisted":
+  "append"}` WITHOUT the marker, so the wall shows every served ring and no stale
+  derived block survives. One `WARNING` line names the first failing line number
+  and its key (or "non-assignment line"), never a value. An Owner-written block
+  is left alone. systemd accepts some of these forms; the renderer deliberately
+  does not try to follow it there. Consequence: a materialised secret containing a
+  quote or backslash makes the whole `.env` fail the whitelist on a hub that uses
+  AI usage, and the rings then show unfiltered.
+- **What disables derivation.** A backslash (comment lines included, because
+  systemd continues a comment that ends in one onto the next line), a quote, or
+  any other non-canonical line anywhere in a `.env` that mentions `AI_USAGE_`
+  disables derivation on EVERY boot. A `WARNING` is logged, and the wall then shows
+  every served ring (the unmarked append default). Fix the offending line, then
+  re-run the converge command below.
+- **Output.** `"gaugeRings": {"slots": [...], "unlisted": "hide", "derivedFrom":
+  "AI_USAGE_SOURCES"}`. Slot order is claude, claude2, codex, grok, gemini,
+  opencode, freellmapi, filtered to the sources the feeder runs (names the feeder
+  refuses never get this far; see Fail-safe). Names are de-duplicated. `claude`
+  and `claude2` carry `mark: "claude"`, and badges `"1"`/`"2"` only when both are
+  listed. `"hide"` makes the rings follow the sources exactly. FreeLLMAPI gets no
+  special handling here.
+- **Authority.** The SOURCE file (`/opt/homehub/site/config.json`) is never
+  modified. The destination is regenerated from source plus `.env` on every run
+  (firstboot runs it on every boot). Everything else in the document is
+  preserved in order; the output uses the source's indentation.
+- **Ownership.** A source `gaugeRings` block is derived over only when it is
+  absent, carries `derivedFrom`, or equals the shipped default
+  `{"slots": [], "unlisted": "append"}`. Any other block, including
+  `{"slots": [], "unlisted": "hide"}`, is Owner-written: it is installed exactly
+  as written and one `gaugeRings:` line is logged.
+- **Faithfulness.** When a block is derived, the result is value-faithful, not
+  byte-faithful: JSON is re-serialised with ASCII `\u` escapes for non-ASCII
+  text, LF line endings, no BOM, and the source's indentation. The output is
+  re-validated; if the derivation or that validation fails for any reason the
+  source is installed unchanged with a `WARNING` line, so firstboot never aborts
+  on it.
+- **Hand-authoring rings.** Put your own `gaugeRings` block in the source copy,
+  without `derivedFrom`. Slot fields are `provider`, optional `mark`, optional
+  `badge`; see OfficeWallNaglight `docs/config-reference.md`.
+- **Converge in place:**
+
+      sudo python3 install-renderer-config.py --env /opt/homehub/stack/.env \
+          --source /opt/homehub/site/config.json \
+          --destination /opt/homehub/stack/wall-shell/config.json
+
+  then restart the kiosk shell to see it.
+
 ## Hub preparation and coordinated cutover
 
 1. Build the matching OfficeWallNaglight site, app and gateway payloads. Stage

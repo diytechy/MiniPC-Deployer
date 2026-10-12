@@ -82,7 +82,10 @@ change reaches the wall only after the kiosk shell restarts.
   with what runs: unset, empty or unquoted-whitespace gives the feeder's default
   list; quoted whitespace or commas-only gives an empty list, and every derivable
   block then becomes `{"slots": [], "unlisted": "hide", "derivedFrom": ...}`.
-- **Fail-safe.** If the final assignment is in any other form (indented, space
+- **Fail-safe.** If ANY assignment in the file has a multiline value (an unclosed
+  opening quote or a trailing backslash), assignment boundaries are ambiguous and
+  the same fail-safe applies; the WARNING names the line number and key, never the
+  value, and multiline values are not parsed. Likewise if the final assignment is in any other form (indented, space
   before `=`, `export`, any backslash, an unmatched or multiline quote), or the
   feeder refuses the list (an unknown or mis-cased name) or cannot be loaded, a
   derivable block (absent, marked, or the shipped default) is replaced by the

@@ -76,6 +76,25 @@ def read_env(env_text: str, names):
     return result
 
 
+CRLF, LF, BACKSLASH = chr(13) + chr(10), chr(10), chr(92)
+
+
+def multiline_value_line(env_text: str):
+    """(line number, key) of the first assignment whose value runs onto the next
+    line (an unclosed opening quote, or a trailing backslash), else None. Inside
+    such a value text can look like an assignment, so boundaries are ambiguous
+    and multiline values are deliberately not parsed."""
+    for number, line in enumerate(env_text.replace(CRLF, LF).split(LF), 1):
+        match = _ASSIGN.match(line)
+        if not match:
+            continue
+        value = match.group(5).strip()
+        unclosed = value[:1] in ("'", '"') and value.find(value[0], 1) < 0
+        if unclosed or value.endswith(BACKSLASH):
+            return number, match.group(3)
+    return None
+
+
 def feeder_sources(sources_value):
     """The feeder's own enabled_sources() for the value (None = knob unset)."""
     spec = importlib.util.spec_from_file_location("ai_usage_feeder_for_rings", FEEDER_PATH)
@@ -142,6 +161,11 @@ def derive(env_text: str, source_bytes: bytes, document) -> bytes:
               % reason)
         return put(dict(SHIPPED_DEFAULT))
 
+    if "AI_USAGE_" in env_text:
+        ambiguous = multiline_value_line(env_text)
+        if ambiguous:
+            return fail_safe("line %d (%s) has a multiline value, so assignment boundaries are "
+                             "ambiguous" % ambiguous)
     values = read_env(env_text, READ_KEYS)
     enabled, problem = values.get("AI_USAGE_ENABLED", ("", None))
     if problem:

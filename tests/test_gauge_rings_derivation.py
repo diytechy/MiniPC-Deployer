@@ -428,3 +428,42 @@ def test_tc1217_unicode_is_written_as_ascii_escapes_with_the_same_value(tmp_path
     out.decode("ascii")
     assert b"\\u00e9" in out
     assert json.loads(out.decode("ascii"))["label"] == "caf\u00e9 \u2603"
+
+
+# ---- fix round 3: a multiline value makes assignment boundaries ambiguous ----
+
+MULTILINE_ENVS = {
+    "other key's quoted value hides a fake assignment":
+        'AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=gemini\nOTHER="text SECRETVALUE\nAI_USAGE_SOURCES=codex\n"\n',
+    "AI_USAGE_SOURCES itself is multiline with a fake assignment":
+        'AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES="gemini\nAI_USAGE_SOURCES=codex"\n',
+    "other key continues with a backslash":
+        'AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=gemini\nOTHER=a SECRETVALUE\\\nAI_USAGE_SOURCES=codex\n',
+}
+
+
+@pytest.mark.parametrize("label", list(MULTILINE_ENVS))
+def test_tc1218_multiline_value_anywhere_installs_the_unmarked_append_default(tmp_path, capsys, label):
+    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    env, source, dest = make_raw(tmp_path, MULTILINE_ENVS[label],
+                                 json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    out = capsys.readouterr().out
+    warnings = [l for l in out.splitlines() if "WARNING" in l]
+    assert len(warnings) == 1 and re.search(r"line \d+", warnings[0])
+    assert "SECRETVALUE" not in out, "a value was printed"
+
+
+def test_tc1218_multiline_value_leaves_an_owner_block_alone(tmp_path):
+    owner = {"slots": [{"provider": "grok"}], "unlisted": "hide"}
+    env, source, dest = make_raw(tmp_path, MULTILINE_ENVS["other key's quoted value hides a fake assignment"],
+                                 json.dumps({"ACCESS_ENABLED": False, "gaugeRings": owner}))
+    MODULE.install(env, source, dest)
+    assert dest.read_bytes() == source.read_bytes()
+
+
+def test_tc1218_closed_quotes_on_other_keys_do_not_trigger_the_guard(tmp_path):
+    env, source, dest = make_raw(tmp_path, 'OTHER="two words"\nAI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n')
+    MODULE.install(env, source, dest)
+    assert providers(dest) == ["codex"]

@@ -291,7 +291,7 @@ provision-ai-clis.sh --schedule        # installs the units first, then: what fi
 provision-ai-clis.sh --run             # converge (what the unit runs); exit 0 done, 3 retry owed, 2 refused
 provision-ai-clis.sh --status [--json] # PROVISIONING: complete | INCOMPLETE - <key>: <reason>; retrying every N min
 provision-ai-clis.sh --check           # read-only
-provision-ai-clis.sh --rollback KEY    # back to what the link pointed at before
+provision-ai-clis.sh --rollback KEY [--force-unverified]   # back to what the link pointed at before (the flag is only for a predecessor that could not be run)
 ```
 
 * **Failure is a state, not an error.** No network, a bad checksum or a full disk

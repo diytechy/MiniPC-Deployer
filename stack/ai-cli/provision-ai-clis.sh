@@ -31,8 +31,10 @@
 # AI_CLIS_BIN_DIR, AI_CLIS_LOCK, AI_CLIS_MANIFEST, AI_CLIS_ENV_FILE, AI_CLIS_CURL,
 # AI_CLIS_RUNUSER, AI_CLIS_SYSTEMCTL, AI_CLIS_UNIT_DIR, AI_CLIS_VAR_TMP,
 # AI_CLIS_CHOWN, AI_CLIS_OWNER, AI_CLIS_RESERVE_MB, AI_CLIS_DEADLINE_SECONDS,
-# AI_CLIS_CHECK_TIMEOUT, AI_CLIS_DIE_AT (pending|swap|check|checked: SIGKILL self
-# at that point of an activation, to prove recovery).
+# AI_CLIS_CHECK_TIMEOUT, AI_CLIS_ID, AI_CLIS_DIE_AT (pending|swap|check|checked: SIGKILL
+# self at that point of a link transaction, to prove recovery), AI_CLIS_FAIL_SAVE_AT
+# (pending|checked|committed: that state write fails), AI_CLIS_FAIL_RESTORE=<target>
+# (restoring the link to that target fails), AI_CLIS_FAIL_REMOVE=1 (removing a link fails).
 set -u -o pipefail
 umask 022
 
@@ -55,14 +57,20 @@ VAR_TMP="${AI_CLIS_VAR_TMP:-/var/tmp}"
 CHOWN="${AI_CLIS_CHOWN:-chown}"
 OWNER="${AI_CLIS_OWNER:-root:root}"
 RESERVE_MB="${AI_CLIS_RESERVE_MB:-4096}"
-DEADLINE_SECONDS="${AI_CLIS_DEADLINE_SECONDS:-3300}"
+# 2400 s + one 900 s download + staging/check margin stays inside the unit's TimeoutStartSec=3600.
+DEADLINE_SECONDS="${AI_CLIS_DEADLINE_SECONDS:-2400}"
 CHECK_TIMEOUT="${AI_CLIS_CHECK_TIMEOUT:-20}"
+IDCMD="${AI_CLIS_ID:-id}"
 
 STATE_FILE="$STATE_DIR/state.json"
 STAGING="$PREFIX/.staging"
 DLDIR="$VAR_TMP/homehub-ai-clis"
 SERVICE="homehub-ai-clis-provision.service"
 TIMER="homehub-ai-clis-provision.timer"
+GEN_FILE="$STATE_DIR/schedule-request"
+# The scheduling generation this process started with, read before anything else
+# so a --schedule that lands while we run is never mistaken for the one we saw.
+GEN_AT_START="$(cat "$GEN_FILE" 2>/dev/null || true)"
 RUN_START=$SECONDS
 
 say() { printf '%s\n' "$*"; }
@@ -123,10 +131,10 @@ elif op == "del":
     if isinstance(n, dict):
         n.pop(k, None)
 elif op == "act":
-    key, st, fr, fv, to, tv = a
+    key, st, fr, fv, to, tv = a[:6]
     s["clis"].setdefault(key, {})["activation"] = {
         "state": st, "from": nul(fr), "from_version": nul(fv),
-        "to": nul(to), "to_version": nul(tv)}
+        "to": nul(to), "to_version": nul(tv), "kind": a[6] if len(a) > 6 else "activate"}
 elif op == "pend":
     key, reason, since = a
     c = s["clis"].setdefault(key, {})
@@ -141,6 +149,31 @@ prune()
 sys.stdout.write(json.dumps(s, indent=2, sort_keys=True))
 PY
 
+read -r -d '' PYWRITE <<'PY'
+import sys, os
+path = sys.argv[1]
+data = sys.stdin.buffer.read()
+d = os.path.dirname(path) or "."
+tmp = os.path.join(d, ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+try:
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.exit(1)
+PY
+
 read -r -d '' PYARC <<'PY'
 import sys, os, re, tarfile, zipfile, posixpath, stat
 def bad(n):
@@ -148,7 +181,32 @@ def bad(n):
 def strip(n, k):
     parts = [p for p in n.split("/") if p not in ("", ".")]
     return "/".join(parts[k:]) if len(parts) > k else None
+def resolve(path, links, depth=0):
+    """Normalise PATH inside the tree, following archive symlinks met on the way.
+    Returns None when it would leave the tree (or loops)."""
+    if depth > 40:
+        return None
+    parts = path.split("/")
+    stack = []
+    for i, p in enumerate(parts):
+        if p in ("", "."):
+            continue
+        if p == "..":
+            if not stack:
+                return None
+            stack.pop()
+            continue
+        stack.append(p)
+        cur = "/".join(stack)
+        rest = [q for q in parts[i + 1:] if q not in ("", ".")]
+        if cur in links and rest:
+            tgt = links[cur]
+            if tgt.startswith("/"):
+                return None
+            return resolve("/".join(stack[:-1] + [tgt] + rest), links, depth + 1)
+    return "/".join(stack)
 def check_tar(path, k):
+    links, members = {}, []
     with tarfile.open(path) as t:
         for m in t:
             n = m.name
@@ -159,19 +217,21 @@ def check_tar(path, k):
             sn = strip(n, k)
             if sn is None:
                 continue
+            members.append((sn, m))
             if m.issym():
-                ln = m.linkname
-                if ln.startswith("/") or "\0" in ln or not ln:
+                if m.linkname.startswith("/") or "\0" in m.linkname or not m.linkname:
                     return "symlink %r points outside the tree" % n
-                dest = posixpath.normpath(posixpath.join(posixpath.dirname(sn), ln))
-                if dest == ".." or dest.startswith("../"):
-                    return "symlink %r escapes the tree" % n
+                links[sn] = m.linkname
             elif m.islnk():
-                ln = m.linkname
-                if bad(ln):
+                if bad(m.linkname) or strip(m.linkname, k) is None:
                     return "hardlink %r points outside the tree" % n
-                if strip(ln, k) is None:
-                    return "hardlink %r targets outside the stripped tree" % n
+    for sn, m in members:
+        if m.issym():
+            if resolve(posixpath.join(posixpath.dirname(sn), m.linkname), links) is None:
+                return "symlink %r escapes the tree" % m.name
+        elif m.islnk():
+            if resolve(strip(m.linkname, k), links) is None:
+                return "hardlink %r escapes the tree" % m.name
     return None
 def check_zip(path):
     with zipfile.ZipFile(path) as z:
@@ -204,6 +264,14 @@ def extract_zip(path, dest):
     return None
 IMP = re.compile(r"""^[ 	]*(?:import\s*(?:[^"'\n]*?\bfrom\s*)?|export\s*\*\s*from\s*|\}\s*from\s*)["'](\.{1,2}/[^"'\s]+)["']""", re.M)
 def inventory(root, entry, items):
+    base = os.path.realpath(root)
+    for dp, dns, fns in os.walk(root):
+        for nme in dns + fns:
+            fp = os.path.join(dp, nme)
+            if os.path.islink(fp):
+                rp = os.path.realpath(fp)
+                if rp != base and not rp.startswith(base + os.sep):
+                    return "link %s resolves outside the tree" % os.path.relpath(fp, root)
     for it in items:
         if not os.path.exists(os.path.join(root, it)):
             return "expected %s is absent from the archive" % it
@@ -291,11 +359,14 @@ save_state() {
         [ "$STATE" = "$(printf '{}' | pyj dump)" ] && return 0
     fi
     [ "$STATE" = "$STATE_ONDISK" ] && return 0
-    mkdir -p "$STATE_DIR" || return 1
-    local tmp="$STATE_DIR/.state.json.$$"
-    printf '%s\n' "$STATE" >"$tmp" || return 1
-    mv -T "$tmp" "$STATE_FILE"
-    STATE_ONDISK="$(cat "$STATE_FILE")"
+    if [ -n "${AI_CLIS_FAIL_SAVE_AT:-}" ] && printf '%s' "$STATE" | grep -q "\"state\": \"$AI_CLIS_FAIL_SAVE_AT\""; then
+        return 1
+    fi
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+    # temp file, fsync, rename, fsync the directory: a state write is either
+    # durably there or it failed (and the caller must not go on to swap a link)
+    printf '%s\n' "$STATE" | python3 -I -c "$PYWRITE" "$STATE_FILE" 2>/dev/null || return 1
+    STATE_ONDISK="$STATE"
 }
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -429,13 +500,16 @@ CHECK_DETAIL=""
 consumer_observe() {
     local path="$1" vcmd="$2" regex="$3" home out rc
     OBSERVED=""; CHECK_DETAIL=""
+    if ! "$IDCMD" -u "$ACCOUNT" >/dev/null 2>&1; then
+        CHECK_DETAIL="the service account '$ACCOUNT' does not exist"; return 1
+    fi
     home="$(mktemp -d "$VAR_TMP/ai-clis-home.XXXXXX")" || { CHECK_DETAIL="no scratch home"; return 1; }
     chmod 0700 "$home"
     if ! "$CHOWN" "$ACCOUNT" "$home" 2>/dev/null; then
         rm -rf "$home"; CHECK_DETAIL="cannot hand a scratch home to $ACCOUNT"; return 1
     fi
     # shellcheck disable=SC2086
-    out="$(timeout "$CHECK_TIMEOUT" "$RUNUSER" -u "$ACCOUNT" -- env -i HOME="$home" \
+    out="$(timeout --kill-after=5 "$CHECK_TIMEOUT" "$RUNUSER" -u "$ACCOUNT" -- env -i HOME="$home" \
         PATH=/usr/local/bin:/usr/bin:/bin "$path" $vcmd 2>&1)"; rc=$?
     rm -rf "$home"
     if [ "$rc" -ne 0 ]; then
@@ -460,15 +534,26 @@ die_at() { [ "${AI_CLIS_DIE_AT:-}" = "$1" ] && kill -KILL $$; return 0; }
 link_now() { readlink "$BIN_DIR/$1" 2>/dev/null || true; }
 swap_to() { # NAME TARGET ('' removes the link)
     local link="$BIN_DIR/$1" t="$2" tmp
-    if [ -z "$t" ]; then rm -f "$link"; return 0; fi
+    if [ -z "$t" ]; then
+        [ -n "${AI_CLIS_FAIL_REMOVE:-}" ] && return 1
+        rm -f "$link"; return $?
+    fi
+    [ -n "${AI_CLIS_FAIL_RESTORE:-}" ] && [ "$t" = "$AI_CLIS_FAIL_RESTORE" ] && return 1
     tmp="$BIN_DIR/.$1.new.$$"
     rm -f "$tmp"
     ln -s "$t" "$tmp" && mv -T "$tmp" "$link" || { rm -f "$tmp"; return 1; }
+}
+link_is() { # NAME TARGET ('' = there is no link and no file at all)
+    local l="$BIN_DIR/$1"
+    if [ -z "$2" ]; then [ ! -e "$l" ] && [ ! -L "$l" ]; else [ "$(readlink "$l" 2>/dev/null)" = "$2" ]; fi
 }
 link_is_plain() { # a non-link at the bin path is somebody else's file
     local l="$BIN_DIR/$1"
     [ ! -e "$l" ] && [ ! -L "$l" ] && return 0
     [ -L "$l" ]
+}
+abs_of() { # a link's target as the kernel resolves it: relative to the bin directory
+    case "$1" in /*) printf '%s' "$1";; *) printf '%s/%s' "$BIN_DIR" "$1";; esac
 }
 version_of_target() { # a managed wrapper path -> its pinned version, or ''
     case "$1" in
@@ -505,7 +590,8 @@ admit() { # KEY -> 0 or sets REASON
     for d in "$VAR_TMP" "$PREFIX"; do
         f="$(free_mb "$d")"
         if [ -z "$f" ] || [ "$f" -lt "$need" ]; then
-            REASON="low disk: ${f:-?} MB free under $d, need $need MB; nothing was downloaded"
+            say "free space under $d: ${f:-?} MB"
+            REASON="low disk: a download here needs $need MB free (3 x the artifact + ${RESERVE_MB} MB reserve); nothing was downloaded"
             return 1
         fi
     done
@@ -553,6 +639,26 @@ render_wrapper() { # KEY ROOT OUT
     [ "$has_exec" = 1 ]
 }
 
+# referenced_dir DIR: is anything live pointing into DIR? A link, a recorded transaction, or
+# another install's wrapper (Node is reached only through the Gemini wrapper).
+referenced_dir() {
+    local d="$1" k t f w
+    for k in "${ORDER[@]}"; do
+        t="$(link_now "$k")"
+        case "$t" in "$d"|"$d"/*) return 0;; esac
+        for f in from to; do
+            t="$(sget "clis.$k.activation.$f")"
+            case "$t" in "$d"|"$d"/*) return 0;; esac
+        done
+    done
+    for w in "$PREFIX"/*/*/wrapper/*; do
+        [ -f "$w" ] || continue
+        case "$w" in "$d"/*) continue;; esac
+        grep -qsF -- "$d/" "$w" && return 0
+    done
+    return 1
+}
+
 # ensure_artifact KEY: the identity directory exists, complete, root-owned.
 ensure_artifact() {
     local key="$1" final identity kind k=0 member="" dep
@@ -569,6 +675,10 @@ ensure_artifact() {
     # A final-named directory without a matching .complete is never reused or
     # extracted into: it is moved aside and deleted.
     if [ -e "$final" ]; then
+        if referenced_dir "$final"; then
+            REASON="the installed $key directory has no valid completion marker but is in use; it was left in place"
+            return 1
+        fi
         mkdir -p "$STAGING" || { REASON="cannot create $STAGING"; return 1; }
         mv -T "$final" "$STAGING/stale.$key.$$" 2>/dev/null || rm -rf "$final"
         rm -rf "$STAGING/stale.$key.$$"
@@ -583,9 +693,11 @@ ensure_artifact() {
     rm -rf "$STAGE"; mkdir -p "$STAGE" || { REASON="cannot create $STAGE"; return 1; }
 
     say "fetching $key ${M_VERSION[$key]}"
-    if ! "$CURL" --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --connect-timeout 20 --max-time 900 --output "$DL" "${M_URL[$key]}" 2>/dev/null; then
-        fail_stage "download failed"; return 1
+    local cerr
+    if ! cerr="$("$CURL" --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 20 --max-time 900 --output "$DL" "${M_URL[$key]}" 2>&1)"; then
+        cerr="$(printf '%s' "$cerr" | tr '\r\n' '  ' | sed -E 's/[0-9]{4,}/N/g' | cut -c1-160)"
+        fail_stage "download failed${cerr:+: $cerr}"; return 1
     fi
     local sz sum
     sz="$(wc -c <"$DL" | tr -d ' ')"
@@ -639,7 +751,7 @@ ensure_artifact() {
         probe="$STAGE/wrapper/$key"
     fi
     if ! consumer_check "$probe" "${M_VERSION[$key]}" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
-        fail_stage "$CHECK_DETAIL before install"; return 1
+        fail_stage "$CHECK_DETAIL (checked before install)"; return 1
     fi
     if ! is_dep_only "$key"; then
         render_wrapper "$key" "$final" "$STAGE/wrapper/$key" || { fail_stage "wrapper could not be rendered"; return 1; }
@@ -656,8 +768,59 @@ ensure_artifact() {
 }
 clear_pending_if_artifact() { is_dep_only "$1" && clear_pending "$1"; return 0; }
 
-# ------------------------------------------------------------------- activation
-# activate KEY: the owned transaction. Sets REASON on failure (link restored).
+# -------------------------------------------------------------- link transactions
+# ONE primitive for activation, rollback and recovery: record pending (durably), swap,
+# run the consumer check, record checked, record committed. If a state write fails the
+# operation aborts BEFORE the swap (or, after it, puts the link back); the previous link
+# is never given up without a record that names it.
+rec_set() { # KEY STATE FROM FROM_VERSION TO TO_VERSION KIND ; 1 and STATE unchanged when the write fails
+    local before="$STATE"
+    STATE="$(printf '%s' "$STATE" | pyj act "$@")"
+    save_state || { STATE="$before"; return 1; }
+}
+txn_revert() { # KEY FROM PREV_RECORD -> 1 reverted cleanly, 2 restoring failed (the record is KEPT)
+    local key="$1" from="$2" prev="$3"
+    swap_to "$key" "$from"
+    if ! link_is "$key" "$from"; then
+        REASON="$REASON; restoring the previous link FAILED, so the transaction record is kept and the next run retries"
+        return 2
+    fi
+    if [ -n "$prev" ]; then sset "clis.$key.activation" "$prev"; else sdel "clis.$key.activation"; fi
+    save_state || true   # if this write fails the on-disk pending/checked record plus link==from is recovered next run
+    return 1
+}
+# link_txn KEY KIND FROM FROM_VERSION TO TO_VERSION EXPECT PREV_RECORD
+# FROM is the link as it is now, TO what it will become ('' removes it). 0 committed, 1 reverted, 2 revert failed.
+link_txn() {
+    local key="$1" kind="$2" from="$3" fv="$4" to="$5" tv="$6" expect="$7" prev="$8" rc
+    if ! rec_set "$key" pending "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind"; then
+        REASON="the transaction could not be recorded durably in $STATE_DIR; the link was not touched"
+        return 1
+    fi
+    die_at pending
+    if ! swap_to "$key" "$to" || ! link_is "$key" "$to"; then
+        REASON="cannot swap the link"
+        txn_revert "$key" "$from" "$prev"; return $?
+    fi
+    die_at swap
+    if [ -n "$to" ] && ! consumer_check "$BIN_DIR/$key" "$expect" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
+        REASON="$CHECK_DETAIL through $BIN_DIR/$key; the previous link was restored"
+        txn_revert "$key" "$from" "$prev"; return $?
+    fi
+    die_at check
+    if ! rec_set "$key" checked "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind"; then
+        REASON="the check could not be recorded; the previous link was restored"
+        txn_revert "$key" "$from" "$prev"; return $?
+    fi
+    die_at checked
+    if ! rec_set "$key" committed "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind"; then
+        REASON="the commit could not be recorded; the previous link was restored"
+        txn_revert "$key" "$from" "$prev"; return $?
+    fi
+    return 0
+}
+
+# activate KEY: bring the link to the pinned install. Sets REASON on failure.
 activate() {
     local key="$1" wrapper cur prev from_v tv act_state act_to
     wrapper="$(wrapper_of "$key")"; tv="${M_VERSION[$key]}"
@@ -674,7 +837,8 @@ activate() {
         if consumer_check "$BIN_DIR/$key" "$tv" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
             local pf pv
             pf="$(sget "clis.$key.activation.from")"; pv="$(sget "clis.$key.activation.from_version")"
-            STATE="$(printf '%s' "$STATE" | pyj act "$key" committed "${pf:--}" "${pv:--}" "$wrapper" "$tv")"
+            rec_set "$key" committed "${pf:--}" "${pv:--}" "$wrapper" "$tv" activate \
+                || { REASON="the verified state could not be recorded"; return 1; }
             return 0
         fi
         REASON="$CHECK_DETAIL through $BIN_DIR/$key"; return 1
@@ -685,90 +849,113 @@ activate() {
     if [ -n "$cur" ]; then
         from_v="$(version_of_target "$cur")"
         if [ -z "$from_v" ]; then
-            # a hand-installed predecessor: observe its version once, as the account
-            if consumer_observe "$cur" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then from_v="$OBSERVED"; fi
+            # a hand-installed predecessor: observe its version once, as the account.
+            # A relative link target resolves against the bin directory, not our cwd.
+            if consumer_observe "$(abs_of "$cur")" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
+                from_v="$OBSERVED"
+            else
+                from_v="unobserved"
+            fi
         fi
     fi
-    STATE="$(printf '%s' "$STATE" | pyj act "$key" pending "${cur:--}" "${from_v:--}" "$wrapper" "$tv")"
-    save_state
-    die_at pending
-    if ! swap_to "$key" "$wrapper"; then
-        revert_activation "$key" "$cur" "$prev"; REASON="cannot swap the link"; return 1
-    fi
-    die_at swap
-    if ! consumer_check "$BIN_DIR/$key" "$tv" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
-        revert_activation "$key" "$cur" "$prev"
-        REASON="$CHECK_DETAIL through $BIN_DIR/$key; the previous link was restored"
-        return 1
-    fi
-    die_at check
-    STATE="$(printf '%s' "$STATE" | pyj act "$key" checked "${cur:--}" "${from_v:--}" "$wrapper" "$tv")"
-    save_state
-    die_at checked
-    STATE="$(printf '%s' "$STATE" | pyj act "$key" committed "${cur:--}" "${from_v:--}" "$wrapper" "$tv")"
-    save_state
+    link_txn "$key" activate "$cur" "$from_v" "$wrapper" "$tv" "$tv" "$prev" || return $?
     say "activated $key $tv"
     return 0
 }
-revert_activation() { # KEY FROM PREV_RECORD
-    swap_to "$1" "$2"
-    if [ -n "$3" ]; then sset "clis.$1.activation" "$3"; else sdel "clis.$1.activation"; fi
-}
 
-# recover: reconcile records left in pending/checked by an interrupted run.
+# expect_of VERSION: the token a check must see; "unobserved"/empty means any (only reachable via --force-unverified)
+expect_of() { if [ -z "$1" ] || [ "$1" = unobserved ]; then printf '*'; else printf '%s' "$1"; fi; }
+
+UNRESOLVED=()
+# recover: reconcile records left in pending/checked by an interrupted run. Never throws a
+# record away unless the link verifiably is where the record says it should be.
 recover() {
-    local key st cur to from tv vc vr
+    local key st cur to from tv fv kind
+    UNRESOLVED=()
     for key in "${ORDER[@]}"; do
         st="$(sget "clis.$key.activation.state")"
         case "$st" in pending|checked) ;; *) continue;; esac
         cur="$(link_now "$key")"; to="$(sget "clis.$key.activation.to")"
         from="$(sget "clis.$key.activation.from")"; tv="$(sget "clis.$key.activation.to_version")"
-        vc="${M_VCMD[$key]}"; vr="${M_VREGEX[$key]}"
+        fv="$(sget "clis.$key.activation.from_version")"; kind="$(sget "clis.$key.activation.kind")"
+        [ -n "$kind" ] || kind=activate
         if [ "$cur" = "$to" ]; then
-            if consumer_check "$BIN_DIR/$key" "$tv" "$vc" "$vr"; then
-                STATE="$(printf '%s' "$STATE" | pyj set "clis.$key.activation.state" '"committed"')"
-                say "recovered $key: check passed, committed"
+            if [ -n "$to" ] && ! consumer_check "$BIN_DIR/$key" "$(expect_of "$tv")" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
+                REASON="an interrupted change failed its check ($CHECK_DETAIL)"
+                swap_to "$key" "$from"
+                if link_is "$key" "$from"; then
+                    sdel "clis.$key.activation"
+                    note_pending "$key" "$REASON; the previous link was restored"
+                else
+                    note_pending "$key" "$REASON; restoring the previous link FAILED, the record is kept and the next run retries"
+                    UNRESOLVED+=("$key")
+                fi
             else
-                swap_to "$key" "$from"; sdel "clis.$key.activation"
-                note_pending "$key" "an interrupted activation failed its check ($CHECK_DETAIL); the previous link was restored"
+                local before="$STATE"
+                STATE="$(printf '%s' "$STATE" | pyj act "$key" committed "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind")"
+                if save_state; then say "recovered $key: committed"; else
+                    STATE="$before"; UNRESOLVED+=("$key")
+                    note_pending "$key" "an interrupted change passed its check but the commit could not be recorded"
+                fi
             fi
         elif [ "$cur" = "$from" ]; then
             sdel "clis.$key.activation"; say "recovered $key: the swap never happened"
         else
             sdel "clis.$key.activation"; say "recovered $key: the link was changed outside the provisioner; left alone"
         fi
-        save_state
+        save_state || UNRESOLVED+=("$key")
     done
 }
+is_unresolved() { local k; for k in "${UNRESOLVED[@]}"; do [ "$k" = "$1" ] && return 0; done; return 1; }
 
 # --------------------------------------------------------------------- timer unit
-install_units() { # -> RELOAD=1 when anything changed
-    local u d
+atomic_install() { # SRC DEST MODE: temp file in the destination directory, then rename
+    local tmp
+    tmp="$(dirname "$2")/.$(basename "$2").$$"
+    cp "$1" "$tmp" && chmod "$3" "$tmp" && mv -T "$tmp" "$2" || { rm -f "$tmp"; return 1; }
+}
+install_units() { # -> RELOAD=1 when anything changed; non-zero when a unit could not be installed
+    local u d rc=0
     for u in "$SERVICE" "$TIMER"; do
         d="$UNIT_DIR/$u"
-        [ -f "$HERE/$u" ] || continue
+        if [ ! -f "$HERE/$u" ]; then say "unit source $HERE/$u is absent"; rc=1; continue; fi
         if ! cmp -s "$HERE/$u" "$d" 2>/dev/null; then
-            mkdir -p "$UNIT_DIR" && cp "$HERE/$u" "$d" && chmod 0644 "$d" && RELOAD=1
+            if mkdir -p "$UNIT_DIR" 2>/dev/null && atomic_install "$HERE/$u" "$d" 0644; then RELOAD=1
+            else say "cannot install $u into $UNIT_DIR"; rc=1; fi
         fi
     done
+    return $rc
 }
 render_dropin() {
-    local dir="$UNIT_DIR/$TIMER.d" f body
+    local dir="$UNIT_DIR/$TIMER.d" f body tmp
     f="$dir/interval.conf"
     body=$'[Timer]\nOnUnitInactiveSec=\nOnUnitInactiveSec='"${CFG_RETRY}min"
     if [ "$(cat "$f" 2>/dev/null)" != "$body" ]; then
-        mkdir -p "$dir" && printf '%s\n' "$body" >"$f" && RELOAD=1
+        tmp="$dir/.interval.conf.$$"
+        if mkdir -p "$dir" 2>/dev/null && printf '%s\n' "$body" >"$tmp" && chmod 0644 "$tmp" && mv -T "$tmp" "$f"; then
+            RELOAD=1
+        else
+            rm -f "$tmp"; say "cannot write the retry interval into $dir"; return 1
+        fi
     fi
 }
 RELOAD=0
 prepare_units() {
+    local rc=0
     RELOAD=0
-    install_units; render_dropin
-    if [ "$RELOAD" = 1 ]; then "$SYSTEMCTL" daemon-reload || return 1; fi
+    install_units || rc=1
+    render_dropin || rc=1
+    if [ "$RELOAD" = 1 ]; then "$SYSTEMCTL" daemon-reload || rc=1; fi
+    return $rc
 }
 
 # ------------------------------------------------------------------------ modes
 lock_or_busy() { exec 9>>"$LOCK" || refuse "cannot open the lock $LOCK"; flock -n 9; }
+
+bump_request() { # a durable, unique stamp: a run that started before it knows it missed a request
+    mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s\n' "$(date +%s%N)-$$" | python3 -I -c "$PYWRITE" "$GEN_FILE" 2>/dev/null \
+        || say "WARNING: could not record the scheduling request"
+}
 
 mode_schedule() {
     if [ "$PROVISION_OFF" = 1 ] || [ "${#NEEDED[@]}" -eq 0 ]; then
@@ -783,34 +970,57 @@ mode_schedule() {
         say "provisioning: nothing to do (off or no enabled consumer needs a CLI)"
         return 0
     fi
+    # unit files first, so they exist before the timer is enabled; no lock is taken
     prepare_units || { say "cannot install the provisioning units"; return 3; }
+    bump_request
     "$SYSTEMCTL" enable --now "$TIMER" || { say "cannot enable $TIMER"; return 3; }
     "$SYSTEMCTL" start --no-block "$SERVICE" || { say "cannot start $SERVICE"; return 3; }
     say "provisioning scheduled: ${NEEDED[*]} (retrying every $CFG_RETRY min until it converges)"
 }
 
 mode_run() {
-    if [ "$PROVISION_OFF" = 1 ] || [ "${#NEEDED[@]}" -eq 0 ]; then
-        "$SYSTEMCTL" disable --now "$TIMER" || true
-        if lock_or_busy; then load_state; STATE="$(printf '%s' "$STATE" | pyj clearpending)"; save_state; fi
-        say "provisioning: nothing to do (off or no enabled consumer needs a CLI)"
-        return 0
+    local off=0 key bad=0
+    if [ "$PROVISION_OFF" = 1 ] || [ "${#NEEDED[@]}" -eq 0 ]; then off=1; fi
+    if ! lock_or_busy; then
+        if [ "$off" = 1 ]; then
+            "$SYSTEMCTL" disable --now "$TIMER" || true
+            say "provisioning: nothing to do (off or no enabled consumer needs a CLI)"
+            return 0
+        fi
+        say "another provisioning run holds the lock"; return 3
     fi
-    lock_or_busy || { say "another provisioning run holds the lock"; return 3; }
-    prepare_units || say "WARNING: could not refresh the provisioning units"
+    if [ "$off" = 0 ]; then prepare_units || say "WARNING: could not refresh the provisioning units"; fi
     # a stale staging tree or download can belong to no live run: we hold the lock
     if [ -d "$STAGING" ]; then find "$STAGING" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; fi
     if [ -d "$DLDIR" ]; then rm -rf "$DLDIR"; fi
     load_state
+    # an interrupted link change is reconciled FIRST, even when provisioning is off or nothing is needed
     recover
-    local key bad=0 held
-    for key in "${NEEDED[@]}"; do
-        held="$(sget "clis.$key.held_identity")"
-        if [ -n "$held" ] && [ "$held" = "$(identity_of "$key")" ]; then
-            say "$key is held at the previous version by --rollback; change the pin to release it"
-            continue
+    if [ "$off" = 1 ]; then
+        if [ "${#UNRESOLVED[@]}" -gt 0 ]; then
+            "$SYSTEMCTL" enable --now "$TIMER" || true
+            say "PROVISIONING: INCOMPLETE; an interrupted link change is not yet reconciled; retrying every $CFG_RETRY min"
+            return 3
         fi
-        [ -n "$held" ] && sdel "clis.$key.held_identity"
+        "$SYSTEMCTL" disable --now "$TIMER" || true
+        STATE="$(printf '%s' "$STATE" | pyj clearpending)"; save_state
+        say "provisioning: nothing to do (off or no enabled consumer needs a CLI)"
+        return 0
+    fi
+    local tv
+    for key in "${NEEDED[@]}"; do
+        if is_unresolved "$key"; then bad=1; continue; fi
+        if held_of "$key"; then
+            tv="$(sget "clis.$key.activation.to_version")"
+            if held_ok_static "$key" && { [ -z "$(sget "clis.$key.activation.to")" ] \
+                    || consumer_check "$BIN_DIR/$key" "$(expect_of "$tv")" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; }; then
+                say "$key is held at the previous version by --rollback; change the pin to release it"
+                clear_pending "$key"
+            else
+                note_pending "$key" "the rolled-back install is no longer usable; it is held by --rollback and was not replaced"; bad=1
+            fi
+            save_state; continue
+        fi
         if ensure_artifact "$key" && activate "$key"; then
             clear_pending "$key"
         else
@@ -818,8 +1028,14 @@ mode_run() {
         fi
         save_state
     done
-    save_state
+    save_state || bad=1
     if [ "$bad" = 0 ]; then
+        if [ "$(cat "$GEN_FILE" 2>/dev/null || true)" != "$GEN_AT_START" ]; then
+            # a --schedule landed while this run was working from the older picture
+            "$SYSTEMCTL" enable --now "$TIMER" || true
+            say "PROVISIONING: INCOMPLETE; a newer request arrived during this run, so the retry timer stays enabled"
+            return 3
+        fi
         "$SYSTEMCTL" disable --now "$TIMER" || say "WARNING: could not disable $TIMER"
         say "PROVISIONING: complete"
         return 0
@@ -836,10 +1052,21 @@ row_installed() { # KEY -> 0 when linked at its managed wrapper and committed
         && [ "$(sget "clis.$key.activation.state")" = committed ] \
         && [ "$(sget "clis.$key.activation.to")" = "$w" ]
 }
-row_ok() { # installed, or deliberately held by --rollback
+# An explicit --rollback holds a key away from the pinned install: the committed record is a
+# rollback and what it rolled away from is the install the manifest pins now.
+held_of() {
+    [ "$(sget "clis.$1.activation.state")" = committed ] && [ "$(sget "clis.$1.activation.kind")" = rollback ] \
+        && [ "$(sget "clis.$1.activation.from")" = "$(wrapper_of "$1")" ]
+}
+held_ok_static() { # the link is still where the rollback put it, and what it points at exists and is executable
+    local key="$1" to
+    to="$(sget "clis.$key.activation.to")"
+    link_is "$key" "$to" || return 1
+    [ -z "$to" ] || [ -x "$BIN_DIR/$key" ]
+}
+row_ok() { # installed, or held by --rollback AND still healthy
     row_installed "$1" && return 0
-    local held; held="$(sget "clis.$1.held_identity")"
-    [ -n "$held" ] && [ "$held" = "$(identity_of "$1")" ]
+    held_of "$1" && held_ok_static "$1"
 }
 
 mode_check() {
@@ -873,9 +1100,8 @@ mode_status() {
         fi
     done
     [ -n "$bad" ] && prov="incomplete"
-    if [ "${#NEEDED[@]}" -gt 0 ]; then
-        if exec 8>>"$LOCK" 2>/dev/null && ! flock -n 8; then prov="running"; fi
-    fi
+    # status never writes: the lock is opened read-only, and only if it already exists
+    if [ "${#NEEDED[@]}" -gt 0 ] && [ -e "$LOCK" ] && { exec 8<"$LOCK"; } 2>/dev/null && ! flock -n 8; then prov="running"; fi
     [ "$PROVISION_OFF" = 1 ] && prov="off"
     if [ "$json" = 1 ]; then
         printf '%s' "$facts" | python3 -I -c "$PYSTATUS" "$prov"
@@ -890,36 +1116,33 @@ mode_status() {
     fi
 }
 
+# --rollback KEY [--force-unverified]: the same transaction as an activation, aimed at what the
+# link pointed at before. A previous version that was never observed needs the explicit flag.
 mode_rollback() {
-    local key="$1" to from fv tv cur st
+    local key="$1" force="${2:-}" to from fv tv cur st prev rc
     [ -n "${M_VERSION[$key]:-}" ] || refuse "unknown CLI '$key'"
     is_dep_only "$key" && refuse "$key has no link to roll back"
+    case "$force" in ''|--force-unverified) ;; *) refuse "unknown option '$force'";; esac
     lock_or_busy || { say "another provisioning run holds the lock"; return 3; }
     load_state
+    recover
+    is_unresolved "$key" && { say "an interrupted link change for $key is not yet reconciled; try again after the next run"; return 3; }
     st="$(sget "clis.$key.activation.state")"
     [ "$st" = committed ] || refuse "no committed activation record for $key; nothing to roll back"
     to="$(sget "clis.$key.activation.to")"; from="$(sget "clis.$key.activation.from")"
     fv="$(sget "clis.$key.activation.from_version")"; tv="$(sget "clis.$key.activation.to_version")"
     cur="$(link_now "$key")"
     [ "$cur" = "$to" ] || refuse "$BIN_DIR/$key no longer points at the recorded install; not touching it"
-    local held; held="$(basename "$(dirname "$(dirname "$to")")")"
-    if [ -z "$from" ]; then
-        swap_to "$key" ""
-        sdel "clis.$key.activation"; sset "clis.$key.held_identity" "\"$held\""
-        save_state
-        say "rolled back $key: the managed link was removed"
+    if [ -n "$from" ] && { [ -z "$fv" ] || [ "$fv" = unobserved ]; } && [ "$force" != --force-unverified ]; then
+        refuse "the previous install of $key was never observed, so a rollback cannot verify it; rerun with --force-unverified to accept that"
+    fi
+    prev="$(sget "clis.$key.activation")"
+    link_txn "$key" rollback "$cur" "$tv" "$from" "${fv:--}" "$(expect_of "$fv")" "$prev"; rc=$?
+    if [ "$rc" = 0 ]; then
+        if [ -z "$from" ]; then say "rolled back $key: the managed link was removed"; else say "rolled back $key to ${fv:-the previous install}"; fi
         return 0
     fi
-    swap_to "$key" "$from"
-    if consumer_check "$BIN_DIR/$key" "${fv:-*}" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
-        STATE="$(printf '%s' "$STATE" | pyj act "$key" committed "$to" "$tv" "$from" "${fv:--}")"
-        sset "clis.$key.held_identity" "\"$held\""
-        save_state
-        say "rolled back $key to ${fv:-the previous install}"
-        return 0
-    fi
-    swap_to "$key" "$to"
-    say "rollback of $key failed its check ($CHECK_DETAIL); the current install was restored"
+    say "rollback of $key did not complete: $REASON"
     return 3
 }
 
@@ -927,11 +1150,13 @@ mode_rollback() {
 MODE="${1:-}"
 case "$MODE" in
     --install-units|--schedule|--run|--check|--status|--rollback) ;;
-    *) refuse "usage: provision-ai-clis.sh [--install-units | --schedule | --run | --check | --status [--json] | --rollback KEY]" ;;
+    *) refuse "usage: provision-ai-clis.sh [--install-units | --schedule | --run | --check | --status [--json] | --rollback KEY [--force-unverified]]" ;;
 esac
 if [ "$MODE" = "--install-units" ]; then    # needs neither the manifest nor the .env
-    RELOAD=0; install_units
-    if [ "$RELOAD" = 1 ]; then "$SYSTEMCTL" daemon-reload || exit 3; say "units installed in $UNIT_DIR"; else say "units already current in $UNIT_DIR"; fi
+    RELOAD=0; rc=0; install_units || rc=1
+    if [ "$RELOAD" = 1 ]; then "$SYSTEMCTL" daemon-reload || rc=1; fi
+    [ "$rc" = 0 ] || { say "the provisioning units could not be installed in $UNIT_DIR"; exit 3; }
+    if [ "$RELOAD" = 1 ]; then say "units installed in $UNIT_DIR"; else say "units already current in $UNIT_DIR"; fi
     exit 0
 fi
 load_manifest
@@ -952,5 +1177,5 @@ case "$MODE" in
         exit 0 ;;
     --rollback)
         [ -n "${2:-}" ] || refuse "--rollback needs a CLI key"
-        mode_rollback "$2"; exit $? ;;
+        mode_rollback "$2" "${3:-}"; exit $? ;;
 esac

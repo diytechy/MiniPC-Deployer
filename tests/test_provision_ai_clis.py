@@ -154,6 +154,7 @@ exec "$@"
 ''')
         w("systemctl", 'echo "$*" >> "$FAKE_LOG_DIR/systemctl.log"\n')
         w("chown", 'echo "$*" >> "$FAKE_LOG_DIR/chown.log"\nexit 0\n')
+        w("id", "exit 0\n")          # every account exists unless a test says otherwise
 
     # ---- configuration
     def set_env(self, **kv):
@@ -228,7 +229,7 @@ exec "$@"
             AI_CLIS_BIN_DIR=str(self.bin), AI_CLIS_LOCK=str(self.lock), AI_CLIS_MANIFEST=str(self.manifest),
             AI_CLIS_ENV_FILE=str(self.env_file), AI_CLIS_CURL=str(self.fakes / "curl"),
             AI_CLIS_RUNUSER=str(self.fakes / "runuser"), AI_CLIS_SYSTEMCTL=str(self.fakes / "systemctl"),
-            AI_CLIS_CHOWN=str(self.fakes / "chown"), AI_CLIS_UNIT_DIR=str(self.units),
+            AI_CLIS_CHOWN=str(self.fakes / "chown"), AI_CLIS_ID=str(self.fakes / "id"), AI_CLIS_UNIT_DIR=str(self.units),
             AI_CLIS_VAR_TMP=str(self.vt), FAKE_LOG_DIR=str(self.logs))
         e.update(self.extra_env)
         e.update(extra)
@@ -533,6 +534,10 @@ def test_killed_at_every_point_the_next_run_completes_the_check_and_commits(lab,
     assert cp.returncode == -9, out(cp)
     rec = lab.state()["clis"]["claude"]["activation"]
     assert rec["state"] in ("pending", "checked") and rec["from"] == str(hand) and rec["from_version"] == "0.9.0"
+    if point == "pending":
+        assert lab.link("claude") == str(hand)      # the record is on disk BEFORE the link moves
+    else:
+        assert lab.link("claude") != str(hand)
     cp = lab.run("--run")
     assert cp.returncode == 0, out(cp)
     rec = lab.state()["clis"]["claude"]["activation"]
@@ -1131,3 +1136,375 @@ def test_unknown_arguments_and_a_bad_manifest_are_refused_with_exit_two(lab):
     lab.write_manifest()
     cp = lab.run("--check")
     assert cp.returncode == 2 and "https" in out(cp)
+
+
+# ================================ fix round 1: the transaction primitive (SR-077, LLR-1107, LLR-1109)
+def _bad_state_dir(lab):
+    """A state directory that cannot be created (its parent is a regular file) - as root, too."""
+    blocker = lab.root / "not-a-dir"
+    blocker.write_text("x")
+    lab.state_dir = blocker / "state"
+
+
+def test_an_unwritable_state_directory_aborts_before_any_swap_and_the_hand_link_survives(lab):
+    lab.claude()
+    hand = _hand_link(lab)                        # stands for the hub's /opt/node link
+    _bad_state_dir(lab)
+    cp = lab.run("--run")
+    assert cp.returncode == 3, out(cp)
+    assert lab.link("claude") == str(hand)
+    assert "could not be recorded durably" in out(cp)
+    # nothing was ever probed through the bin link: there was no swap to probe
+    assert str(lab.bin / "claude") not in [l.split(" ", 1)[1] for l in lab.log("runuser.log")]
+    assert lab.leftovers() == []
+
+
+@pytest.mark.parametrize("fail_at", ["pending", "checked", "committed"])
+def test_a_failed_state_write_never_leaves_the_replacement_active(lab, fail_at):
+    lab.claude()
+    hand = _hand_link(lab)
+    cp = lab.run("--run", AI_CLIS_FAIL_SAVE_AT=fail_at)
+    assert cp.returncode == 3, out(cp)
+    assert lab.link("claude") == str(hand)        # put back (or never moved)
+    cp = lab.run("--run")                          # the disk recovers: the next run completes cleanly
+    assert cp.returncode == 0, out(cp)
+    assert lab.state()["clis"]["claude"]["activation"]["state"] == "committed"
+    assert "/prefix/claude/" in lab.link("claude")
+
+
+def test_state_writes_go_through_a_temp_file_fsync_rename_and_a_directory_fsync():
+    src = SCRIPT.read_text()
+    body = src[src.index("read -r -d '' PYWRITE"):]
+    body = body[:body.index("\nPY\n")]
+    assert body.index("os.fsync(f.fileno())") < body.index("os.replace(tmp, path)") < body.index("os.fsync(dfd)")
+    assert "PYWRITE" in src[src.index("save_state() {"):src.index("now() {")]
+
+
+# --- rollback is the same recorded transaction
+def _a_then_b(lab):
+    lab.claude("1.0.0")
+    assert lab.run("--run").returncode == 0
+    a_link = lab.link("claude")
+    lab.claude("2.0.0")
+    assert lab.run("--run").returncode == 0
+    return a_link, lab.link("claude")
+
+
+@pytest.mark.parametrize("point", ["pending", "swap", "check", "checked"])
+def test_a_rollback_killed_at_any_point_is_reconciled_by_the_next_run(lab, point):
+    a_link, b_link = _a_then_b(lab)
+    assert lab.run("--rollback", "claude", AI_CLIS_DIE_AT=point).returncode == -9
+    rec = lab.state()["clis"]["claude"]["activation"]
+    assert rec["state"] in ("pending", "checked") and rec["kind"] == "rollback"
+    assert rec["from"] == b_link and rec["to"] == a_link and rec["to_version"] == "1.0.0"
+    cp = lab.run("--run")
+    assert cp.returncode == 0, out(cp)
+    if point == "pending":                         # killed before the swap: the link never moved, the record is dropped
+        assert lab.link("claude") == b_link
+    else:
+        assert lab.link("claude") == a_link and lab.state()["clis"]["claude"]["activation"]["state"] == "committed"
+        # and the pinned B is NOT re-activated over the rollback
+        assert lab.run("--run").returncode == 0 and lab.link("claude") == a_link
+
+
+def test_a_rollback_killed_after_the_swap_restores_the_working_install_when_the_old_one_is_broken(lab):
+    a_link, b_link = _a_then_b(lab)
+    assert lab.run("--rollback", "claude", AI_CLIS_DIE_AT="swap").returncode == -9
+    assert lab.link("claude") == a_link           # swapped to the unchecked old install
+    lab.set_deny(a_link)                           # ... which turns out to be unusable (the check goes via A's wrapper)
+    lab.set_deny(lab.bin / "claude")
+    lab.run("--run")
+    assert lab.link("claude") == b_link           # the working B is back, never left displaced
+
+
+@pytest.mark.parametrize("point", ["pending", "swap", "check", "checked"])
+def test_a_first_install_rollback_killed_at_any_point_is_reconciled(lab, point):
+    lab.claude()
+    assert lab.run("--run").returncode == 0
+    b_link = lab.link("claude")
+    assert lab.run("--rollback", "claude", AI_CLIS_DIE_AT=point).returncode == -9
+    rec = lab.state()["clis"]["claude"]["activation"]
+    assert rec["kind"] == "rollback" and rec["to"] is None and rec["from"] == b_link
+    cp = lab.run("--run")
+    assert cp.returncode == 0, out(cp)
+    if point == "pending":
+        assert lab.link("claude") == b_link       # the swap never happened
+    else:
+        assert lab.link("claude") is None         # the removal is committed and held
+        assert lab.state()["clis"]["claude"]["activation"]["state"] == "committed"
+
+
+def test_a_second_rollback_rolls_forward_and_releases_the_hold(lab):
+    a_link, b_link = _a_then_b(lab)
+    assert lab.run("--rollback", "claude").returncode == 0
+    assert lab.link("claude") == a_link
+    assert lab.run("--run").returncode == 0 and lab.link("claude") == a_link      # held at A
+    assert lab.run("--rollback", "claude").returncode == 0                         # A -> B again
+    assert lab.link("claude") == b_link
+    (lab.logs / "curl.log").unlink(missing_ok=True)
+    before = lab.snapshot()
+    cp = lab.run("--run")
+    assert cp.returncode == 0 and lab.link("claude") == b_link
+    assert lab.curl_urls() == [] and lab.snapshot() == before                      # converged, not held, nothing to do
+
+
+def test_a_held_rollback_must_stay_healthy_to_count_as_converged(lab):
+    a_link, b_link = _a_then_b(lab)
+    assert lab.run("--rollback", "claude").returncode == 0
+    assert lab.run("--check").returncode == 0
+    os.unlink(lab.bin / "claude")                  # the restored link is deleted
+    assert lab.run("--check").returncode == 3
+    other = lab.root / "other-cli"                  # a working CLI, but not where the rollback put the link
+    other.write_text(_script('echo "9.9.9 (Claude Code)"').decode()); other.chmod(0o755)
+    os.symlink(other, lab.bin / "claude")
+    assert lab.run("--check").returncode == 3
+    os.unlink(lab.bin / "claude")
+    d = json.loads(lab.run("--status", "--json").stdout)
+    assert d["provisioning"] == "incomplete" and d["clis"]["claude"]["installed"] is False
+    (lab.logs / "systemctl.log").unlink()
+    cp = lab.run("--run")
+    assert cp.returncode == 3 and lab.link("claude") is None                       # reported, not silently "fixed"
+    assert not any(c.startswith("disable") for c in lab.log("systemctl.log"))
+
+
+# --- a restore that fails never throws the record away
+def test_a_failed_restore_keeps_the_record_and_the_next_run_retries_it(lab):
+    lab.claude()
+    hand = _hand_link(lab)
+    lab.set_deny(lab.bin / "claude")
+    cp = lab.run("--run", AI_CLIS_FAIL_RESTORE=str(hand))
+    assert cp.returncode == 3, out(cp)
+    assert "restoring the previous link FAILED" in out(cp)
+    assert lab.link("claude") != str(hand)         # the unchecked candidate is still active
+    rec = lab.state()["clis"]["claude"]["activation"]
+    assert rec["state"] == "pending" and rec["from"] == str(hand)       # ... and the record that can undo it survives
+    cp = lab.run("--run")                           # the fault is gone, the check still fails: now it is undone
+    assert lab.link("claude") == str(hand), out(cp)
+
+
+def test_a_failed_link_removal_is_not_reported_as_a_restore(lab):
+    lab.claude()
+    lab.set_deny(lab.bin / "claude")
+    cp = lab.run("--run", AI_CLIS_FAIL_REMOVE="1")
+    assert cp.returncode == 3 and "restoring the previous link FAILED" in out(cp)
+    assert lab.state()["clis"]["claude"]["activation"]["state"] == "pending"
+    assert lab.link("claude")                       # still there, and still recorded
+    lab.run("--run")
+    assert lab.link("claude") is None
+
+
+# --- recovery happens even when nothing is needed any more
+def test_recovery_runs_before_the_off_or_empty_set_early_return(lab):
+    lab.claude()
+    hand = _hand_link(lab)
+    assert lab.run("--run", AI_CLIS_DIE_AT="swap").returncode == -9
+    lab.set_deny(lab.bin / "claude")                # the unchecked replacement is unusable
+    lab.set_env(AI_USAGE_ENABLED="false")           # and nothing is needed any more
+    cp = lab.run("--run")
+    assert cp.returncode == 0, out(cp)
+    assert lab.link("claude") == str(hand)
+    assert lab.log("systemctl.log")[-1] == "disable --now homehub-ai-clis-provision.timer"
+
+
+def test_an_unreconciled_transaction_keeps_the_timer_even_when_provisioning_is_off(lab):
+    lab.claude()
+    hand = _hand_link(lab)
+    assert lab.run("--run", AI_CLIS_DIE_AT="swap").returncode == -9
+    lab.set_deny(lab.bin / "claude")
+    lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="claude", AI_CLI_PROVISION="off")
+    cp = lab.run("--run", AI_CLIS_FAIL_RESTORE=str(hand))
+    assert cp.returncode == 3, out(cp)
+    assert "enable --now homehub-ai-clis-provision.timer" in lab.log("systemctl.log")
+    assert not any(c.startswith("disable") for c in lab.log("systemctl.log"))
+
+
+# --- a --schedule that lands during a run is not lost
+def test_a_schedule_that_arrives_during_a_run_keeps_the_timer_after_the_run_finishes(lab):
+    lab.claude()
+    lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="claude")
+    bg = lab.popen("--run", FAKE_CURL_SLEEP="4")
+    try:
+        deadline = time.time() + 15
+        while not lab.log("curl.log") and time.time() < deadline:
+            time.sleep(0.1)
+        assert lab.log("curl.log")
+        assert lab.run("--schedule").returncode == 0
+        text, _ = bg.communicate(timeout=60)
+    finally:
+        if bg.poll() is None:
+            os.killpg(bg.pid, 9)
+    assert bg.returncode == 3, text
+    assert "a newer request arrived" in text
+    assert not any(c.startswith("disable") for c in lab.log("systemctl.log"))
+    assert lab.link("claude")                      # it did converge for the picture it had
+    cp = lab.run("--run")                           # the retry now sees the newest request and finishes
+    assert cp.returncode == 0 and lab.log("systemctl.log")[-1] == "disable --now homehub-ai-clis-provision.timer"
+
+
+# --- never quarantine what is live
+def test_an_active_identity_without_its_marker_is_never_deleted(lab):
+    lab.claude()
+    assert lab.run("--run").returncode == 0
+    ident = lab.wrapper("claude")[0]
+    (ident / ".complete").unlink()
+    lab.urlmap.clear(); lab.write_manifest()        # a forced download failure
+    cp = lab.run("--run")
+    assert cp.returncode == 3, out(cp)
+    assert ident.is_dir() and (ident / "wrapper" / "claude").exists()
+    r = subprocess.run([str(lab.bin / "claude"), "--version"], capture_output=True, text=True)
+    assert r.stdout.strip() == "1.0.0 (Claude Code)"          # the link still works
+    assert "in use" in lab.state()["clis"]["claude"]["pending"]["reason"]
+
+
+def test_a_node_directory_that_a_wrapper_uses_is_never_deleted(lab):
+    lab.standard()
+    assert lab.run("--run").returncode == 0
+    node = next((lab.prefix / "node").iterdir())
+    (node / ".complete").unlink()
+    cp = lab.run("--run")
+    assert cp.returncode == 3 and node.is_dir() and (node / "bin" / "node").exists()
+
+
+# --- archive symlink chains
+def test_a_symlink_chain_through_another_link_that_escapes_is_refused(lab):
+    lab.codex(extra={"a": ("symlink", "."), "bin/evil": ("symlink", "../a/../outside")})
+    lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="codex")
+    cp = lab.run("--run")
+    assert cp.returncode == 3, out(cp)
+    assert lab.state()["clis"]["codex"]["pending"]["reason"].startswith("archive refused:")
+    assert lab.leftovers() == []
+
+
+def test_a_legitimate_chain_inside_the_tree_is_accepted_and_one_that_climbs_out_is_not(lab):
+    lab.codex(extra={"share": ("symlink", "sub"), "sub/real": b"x", "alias": ("symlink", "share/real")})
+    lab.set_env(AI_USAGE_ENABLED="true", AI_USAGE_SOURCES="codex")
+    cp = lab.run("--run")
+    assert cp.returncode == 0, out(cp)
+    lab.codex(extra={"share": ("symlink", "sub"), "sub/real": b"x", "up": ("symlink", "share/../../x")})
+    shutil.rmtree(lab.prefix); (lab.bin / "codex").unlink(); (lab.state_dir / "state.json").unlink()
+    cp = lab.run("--run")
+    assert cp.returncode == 3 and "escapes the tree" in lab.state()["clis"]["codex"]["pending"]["reason"]
+
+
+# --- the predecessor's version
+def test_a_relative_hand_installed_link_is_observed_against_the_bin_directory(lab):
+    lab.claude()
+    hand = lab.root / "hand" / "claude"
+    hand.parent.mkdir()
+    hand.write_text(_script('echo "0.9.0 (Claude Code)"').decode()); hand.chmod(0o755)
+    os.symlink("../hand/claude", lab.bin / "claude")           # relative, resolved from the bin directory
+    cwd = lab.root / "elsewhere" / "deeper"; cwd.mkdir(parents=True)       # "../hand/claude" is wrong from here
+    cp = subprocess.run(["bash", str(lab.script), "--run"], env=lab.env(), cwd=cwd, capture_output=True, text=True)
+    assert cp.returncode == 0, out(cp)
+    assert lab.state()["clis"]["claude"]["activation"]["from_version"] == "0.9.0"
+    assert lab.run("--rollback", "claude").returncode == 0 and lab.link("claude") == "../hand/claude"
+
+
+def test_an_unobserved_predecessor_needs_force_unverified_to_roll_back(lab):
+    lab.claude()
+    hand = _hand_link(lab)
+    lab.set_deny(hand)                              # the account cannot run the old CLI while we observe it
+    assert lab.run("--run").returncode == 0
+    rec = lab.state()["clis"]["claude"]["activation"]
+    assert rec["from"] == str(hand) and rec["from_version"] == "unobserved"
+    (lab.logs / "deny.txt").unlink()
+    cp = lab.run("--rollback", "claude")
+    assert cp.returncode == 2 and "--force-unverified" in out(cp)
+    assert lab.link("claude") != str(hand)
+    cp = lab.run("--rollback", "claude", "--force-unverified")
+    assert cp.returncode == 0, out(cp)
+    assert lab.link("claude") == str(hand)
+
+
+# --- units
+def test_install_units_fails_loudly_when_the_unit_directory_cannot_be_written(lab):
+    blocker = lab.root / "units-blocker"
+    blocker.write_text("x")
+    cp = lab.run("--install-units", AI_CLI_UNIT_DIR=str(blocker / "units"))
+    assert cp.returncode == 3 and "already current" not in out(cp), out(cp)
+    lab.claude()
+    cp = lab.run("--schedule", AI_CLI_UNIT_DIR=str(blocker / "units"))
+    assert cp.returncode == 3
+    assert "enable --now homehub-ai-clis-provision.timer" not in lab.log("systemctl.log")
+
+
+def test_install_units_fails_when_a_source_unit_is_absent_and_leaves_no_temp_files(lab):
+    (lab.ai / "homehub-ai-clis-provision.timer").unlink()
+    cp = lab.run("--install-units")
+    assert cp.returncode == 3 and "absent" in out(cp)
+    assert [p.name for p in lab.units.iterdir()] == ["homehub-ai-clis-provision.service"]    # no half-written files
+    assert lab.run("--install-units").returncode == 3
+
+
+# --- status never writes
+def test_status_does_not_create_the_lock_file(lab):
+    lab.claude()
+    assert not lab.lock.exists()
+    cp = lab.run("--status", "--json")
+    assert cp.returncode == 0 and json.loads(cp.stdout)["provisioning"] == "incomplete"
+    assert not lab.lock.exists()
+    assert lab.run("--status").returncode == 0 and not lab.lock.exists()
+
+
+# --- the smaller findings
+def test_the_aggregate_deadline_plus_one_download_fits_the_units_start_timeout():
+    m = re.search(r'DEADLINE_SECONDS="\$\{AI_CLIS_DEADLINE_SECONDS:-(\d+)\}"', SCRIPT.read_text())
+    timeout = int(re.search(r"TimeoutStartSec=(\d+)", (CLI_DIR / "homehub-ai-clis-provision.service").read_text()).group(1))
+    assert int(m.group(1)) + 900 + 300 <= timeout
+
+
+def test_persisted_pending_reasons_carry_no_live_numbers(lab):
+    lab.claude()
+    first = lab.run("--run", AI_CLIS_RESERVE_MB="999999999")
+    second = lab.run("--run", AI_CLIS_RESERVE_MB="999999999")
+    assert "PENDING claude: low disk" in out(first) and "PENDING claude" not in out(second)
+    assert "MB free under" not in lab.state()["clis"]["claude"]["pending"]["reason"]      # the measured figure is logged, not persisted
+
+
+def test_a_missing_account_is_named(lab):
+    lab.claude()
+    nope = lab.fakes / "no-such-id"
+    nope.write_text("#!/bin/bash\nexit 1\n"); nope.chmod(0o755)
+    cp = lab.run("--run", AI_CLIS_ID=str(nope))
+    assert cp.returncode == 3
+    assert "service account 'homehub-ai' does not exist" in lab.state()["clis"]["claude"]["pending"]["reason"]
+
+
+def test_curls_error_text_is_kept_on_one_line_without_live_numbers(lab):
+    lab.claude()
+    noisy = lab.fakes / "noisy-curl"
+    noisy.write_text('#!/bin/bash\necho "curl: (28) Operation timed out after 900001 milliseconds" >&2\necho "second line" >&2\nexit 28\n')
+    noisy.chmod(0o755)
+    cp = lab.run("--run", AI_CLIS_CURL=str(noisy))
+    reason = lab.state()["clis"]["claude"]["pending"]["reason"]
+    assert cp.returncode == 3 and reason.startswith("download failed: curl: (28) Operation timed out after N")
+    assert "\n" not in reason and "900001" not in reason
+
+
+def test_a_check_that_ignores_sigterm_is_killed_after_the_grace_period(lab):
+    lab.claude()
+    stubborn = lab.fakes / "stubborn-runuser"
+    stubborn.write_text("#!/bin/bash\ntrap '' TERM\nsleep 40\n"); stubborn.chmod(0o755)
+    t0 = time.time()
+    cp = lab.run("--run", AI_CLIS_RUNUSER=str(stubborn), AI_CLIS_CHECK_TIMEOUT="1")
+    assert cp.returncode == 3 and time.time() - t0 < 25
+
+
+def _embedded(name):
+    src = SCRIPT.read_text()
+    head = "read -r -d '' %s <<'PY'\n" % name
+    start = src.index(head) + len(head)
+    return src[start:src.index("\nPY\n", start)]
+
+
+def test_the_post_extraction_scan_refuses_a_link_that_resolves_outside_the_tree(tmp_path):
+    arc = _embedded("PYARC")
+    tree = tmp_path / "tree"
+    (tree / "bin").mkdir(parents=True)
+    (tree / "bin" / "tool").write_text("x")
+    run = lambda: subprocess.run([sys.executable, "-I", "-c", arc, "inventory", str(tree), "bin/tool", "bin/tool"],
+                                 capture_output=True, text=True)
+    assert run().returncode == 0
+    os.symlink(tmp_path, tree / "bin" / "outside")           # a link to the parent of the tree
+    cp = run()
+    assert cp.returncode == 1 and "resolves outside the tree" in cp.stdout

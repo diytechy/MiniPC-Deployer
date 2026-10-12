@@ -140,32 +140,6 @@ def test_a_genuine_failure_still_exits_1(tmp_path, monkeypatch, capsys):
 # convention shared between three programs. SuccessExitStatus= would also hide a
 # real exit 3 ("REFUSED") from the Gemini keeper's other causes.
 
-def test_keeper_units_skip_until_the_cli_is_linked_and_the_login_exists(tmp_path):
-    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
-                                          "AI_USAGE_USER_ACCOUNT=alice"])
-    done = box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home")
-    assert done.returncode == 0, done.stdout + done.stderr
-    # The CLI binary condition lives in the shipped unit files, and names the binary
-    # the unit really executes (the other side: its ExecStart).
-    for unit, binary in (("homehub-claude-refresh@.service", "claude"),
-                         ("homehub-gemini-refresh.service", "gemini")):
-        text = (ti.USAGE_DIR / unit).read_text(encoding="utf-8")
-        directives = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
-        assert "ConditionFileIsExecutable=/usr/local/bin/%s" % binary in directives, unit
-    claude_exec = (ti.USAGE_DIR / "homehub-claude-refresh@.service").read_text(encoding="utf-8")
-    assert "exec claude " in claude_exec
-    # The credential condition is per-account (drop-in) and equals what sign-in writes:
-    # the same mapping the status step checks.
-    expect = {"homehub-claude-refresh@claude.service.d": ".claude/.credentials.json",
-              "homehub-claude-refresh@claude2.service.d": ".claude-2/.credentials.json",
-              "homehub-gemini-refresh.service.d": ".gemini/oauth_creds.json"}
-    mapping = {v[1] for v in ti.MAPPINGS.values()}
-    for dropin, rel in expect.items():
-        assert rel in mapping, rel
-        text = (box.units / dropin / "10-account.conf").read_text(encoding="utf-8")
-        assert "ConditionPathExists=/home/alice/%s" % rel in text.splitlines(), (dropin, text)
-
-
 def test_keeper_timers_stay_enabled_so_the_first_run_after_signin_needs_no_rerun(tmp_path):
     box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
                                           "AI_USAGE_USER_ACCOUNT=alice"])
@@ -276,7 +250,250 @@ def test_a_blank_usage_identity_schedules_no_downloads(tmp_path):
     assert "settings are incomplete" in done.stdout
     assert "provisioner --schedule" not in box.calls and box.accounts == []
     # A complete configuration still schedules.
+    (tmp_path / "ok").mkdir()
     box2 = ti.Box(tmp_path / "ok", [])
     done = _hook_with_usage(box2, tmp_path / "ok", ti.USAGE_ENV + ["AI_USAGE_USER_ACCOUNT=alice"])
     assert done.returncode == 0, done.stdout + done.stderr
     assert "provisioner --schedule" in box2.calls
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 1: quiet means GENUINELY ABSENT - present-but-unusable stays loud
+# ═══════════════════════════════════════════════════════════════════════════
+
+import configparser  # noqa: E402
+import shutil  # noqa: E402
+
+import test_ai_usage_sources_and_auth as ts  # noqa: E402  (CLAUDE_BODY, NOW)
+
+
+def _ini(text):
+    parser = configparser.ConfigParser(strict=False, allow_no_value=True, interpolation=None)
+    parser.optionxform = str
+    parser.read_string(text)
+    return parser
+
+
+def test_the_credential_conditions_sit_under_unit_where_systemd_reads_them(tmp_path):
+    """Parsed as INI, not grepped: a Condition under [Service] is silently ignored."""
+    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
+                                          "AI_USAGE_USER_ACCOUNT=alice"])
+    assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
+    expect = {"homehub-claude-refresh@claude.service.d": ".claude/.credentials.json",
+              "homehub-claude-refresh@claude2.service.d": ".claude-2/.credentials.json",
+              "homehub-gemini-refresh.service.d": ".gemini/oauth_creds.json"}
+    for dropin, rel in expect.items():
+        cp = _ini((box.units / dropin / "10-account.conf").read_text(encoding="utf-8"))
+        assert cp.get("Unit", "ConditionPathExists") == "/home/alice/" + rel, dropin
+        assert not any(k.startswith("Condition") for k in cp["Service"]), "ignored under [Service]"
+        assert cp.get("Service", "User") == "alice"
+
+
+KEEPERS = [("homehub-claude-refresh@.service", "claude"), ("homehub-gemini-refresh.service", "gemini")]
+
+
+@pytest.mark.parametrize("unit,binary", KEEPERS, ids=["claude", "gemini"])
+def test_keeper_cli_gate_is_an_or_group_that_skips_only_an_empty_path(unit, binary):
+    cp = _ini((ti.USAGE_DIR / unit).read_text(encoding="utf-8"))
+    assert cp.get("Unit", "ConditionPathExists") == "|/usr/local/bin/" + binary
+    assert cp.get("Unit", "ConditionPathIsSymbolicLink") == "|/usr/local/bin/" + binary
+    assert not cp.has_option("Unit", "ConditionFileIsExecutable"), "a non-executable file must not be skipped"
+
+
+SYSTEMD_CASES = r"""set -u
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+touch $T/plain; chmod 644 $T/plain
+ln -s $T/nowhere $T/dangling
+for n in absent plain dangling; do
+  systemd-analyze condition @@CONDITIONS@@ >/dev/null 2>&1
+  echo "CASE $n rc=$?"
+done
+"""
+
+
+@pytest.mark.parametrize("unit,binary", KEEPERS, ids=["claude", "gemini"])
+def test_real_systemd_skips_only_when_nothing_is_at_the_path(tmp_path, unit, binary):
+    """systemd's own evaluation of the condition lines each keeper SHIPS: absent is
+    skipped; a dangling link and a non-executable file still start (and fail loudly)."""
+    cp = _ini((ti.USAGE_DIR / unit).read_text(encoding="utf-8"))
+    lines = ["ConditionPathExists=" + cp.get("Unit", "ConditionPathExists"),
+             "ConditionPathIsSymbolicLink=" + cp.get("Unit", "ConditionPathIsSymbolicLink")]
+    cond = " ".join('"%s"' % l.replace("/usr/local/bin/" + binary, "$T/$n") for l in lines)
+    done = ti._wsl_root(SYSTEMD_CASES.replace("@@CONDITIONS@@", cond), tmp_path)
+    if "systemd-analyze" in done.stderr and "not found" in done.stderr:
+        pytest.skip("no systemd-analyze in WSL")
+    rcs = dict(re.findall(r"CASE (\w+) rc=(\d+)", done.stdout))
+    assert rcs == {"absent": "1", "plain": "0", "dangling": "0"}, (done.stdout, done.stderr)
+
+
+VERIFY = r"""set -u
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+cp -r @@DIR@@/sandbox/units/. $W/
+chmod -R a-x $W; find $W -type d -exec chmod 755 {} +
+for u in homehub-claude-refresh@claude.service homehub-claude-refresh@claude2.service homehub-gemini-refresh.service; do
+  SYSTEMD_UNIT_PATH=$W: systemd-analyze verify --man=no $W/$u 2>&1 | sed "s/^/VERIFY $u: /"
+done
+# positive control: the same condition under [Service] IS flagged by systemd itself
+mkdir -p $W/homehub-gemini-refresh.service.d
+printf '[Service]
+ConditionPathExists=/x
+' > $W/homehub-gemini-refresh.service.d/99-bad.conf
+SYSTEMD_UNIT_PATH=$W: systemd-analyze verify --man=no $W/homehub-gemini-refresh.service 2>&1 | sed 's/^/CONTROL: /'
+"""
+
+
+def test_systemd_itself_accepts_the_generated_drop_ins_and_flags_a_misplaced_condition(tmp_path):
+    box = ti.Box(tmp_path, ti.USAGE_ENV + ["AI_USAGE_SOURCES=claude,claude2,gemini",
+                                          "AI_USAGE_USER_ACCOUNT=alice"])
+    assert box.run(ti.SETUP_USAGE, STUB_HOME_BASE="/home").returncode == 0
+    done = ti._wsl_root(VERIFY, tmp_path)
+    if "systemd-analyze" in done.stderr and "not found" in done.stderr:
+        pytest.skip("no systemd-analyze in WSL")
+    out = done.stdout
+    assert "VERIFY homehub-gemini-refresh.service" in out or "CONTROL:" in out, (out, done.stderr)
+    verify_lines = [l for l in out.splitlines() if l.startswith("VERIFY ")]
+    assert not [l for l in verify_lines if "Unknown key" in l or "Condition" in l], verify_lines
+    control = [l for l in out.splitlines() if l.startswith("CONTROL:")]
+    assert any("Unknown key name 'ConditionPathExists' in section 'Service'" in l for l in control), control
+
+
+# ---- the feeder: only ENOENT/ENOTDIR is "absent" -------------------------------------------
+
+def test_path_absent_is_true_only_for_enoent_and_enotdir(monkeypatch):
+    import errno
+    for exc, expect in ((FileNotFoundError(errno.ENOENT, "x"), True), (NotADirectoryError(errno.ENOTDIR, "x"), True),
+                        (PermissionError(errno.EACCES, "x"), False), (OSError(errno.EIO, "x"), False)):
+        def boom(path, _exc=exc):
+            raise _exc
+        monkeypatch.setattr(feeder.os, "lstat", boom)
+        assert feeder.path_absent("/anything") is expect, exc
+    monkeypatch.undo()
+    assert feeder.path_absent(__file__) is False             # present
+
+
+def test_a_credential_behind_a_directory_we_may_not_enter_is_a_failure_not_login_owed(tmp_path, monkeypatch):
+    """The 0700 home of another user: opening the credential raises PermissionError."""
+    cred = tmp_path / "home" / ".claude" / ".credentials.json"
+    real_open = open
+
+    def deny(path, *a, **k):
+        if str(path) == str(cred):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", deny)
+    env, _, _, failures = _run(tmp_path, "claude", AI_USAGE_CLAUDE_CREDENTIALS=str(cred))
+    assert any("unreadable: PermissionError" in f for f in failures), failures
+    assert "_notes" not in env or not env["_notes"]
+
+
+def test_a_denied_lstat_on_the_codex_home_does_not_pretend_the_login_is_owed(tmp_path, monkeypatch):
+    home = tmp_path / "codex-home"
+    real_lstat = os.lstat
+
+    def lstat(path, *a, **k):
+        if str(path).startswith(str(home)):
+            raise PermissionError(13, "Permission denied")
+        return real_lstat(path, *a, **k)
+
+    monkeypatch.setattr(feeder.os, "lstat", lstat)
+    env, _, _, failures = _run(tmp_path, "codex", CODEX_HOME=str(home), AI_USAGE_CODEX_BIN=str(tmp_path / "no-such"))
+    # not "login owed": it went on to launch codex, which is itself absent here -> pending install
+    assert not any("login owed" in n for n in env.get("_notes", []))
+
+
+def test_launch_enoent_with_the_binary_present_is_a_failure(tmp_path, monkeypatch):
+    present = tmp_path / "codex"
+    present.write_text("#!/nonexistent-interpreter\n", encoding="utf-8")
+    present.chmod(0o755)
+
+    def popen(*a, **k):
+        raise FileNotFoundError(2, "No such file or directory")       # e.g. a missing interpreter
+
+    monkeypatch.setattr(feeder.subprocess, "Popen", popen)
+    env, _, _, failures = _run(tmp_path, "codex", AI_USAGE_CODEX_BIN=str(present))
+    assert any("codex: cannot launch" in f for f in failures), failures
+    assert not env.get("_notes")
+    # ...and with nothing at the path the same launch error IS "not installed yet".
+    env2, _, _, failures2 = _run(tmp_path, "codex", AI_USAGE_CODEX_BIN=str(tmp_path / "gone"))
+    assert failures2 == [] and "not installed yet" in env2["_notes"][0]
+
+
+def test_a_dangling_link_is_present_so_its_launch_failure_stays_loud(tmp_path):
+    link = tmp_path / "codex"
+    try:
+        os.symlink(str(tmp_path / "nowhere"), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create symlinks here")
+    assert feeder.binary_absent(str(link), {}) is False
+    assert feeder.binary_absent(str(tmp_path / "gone"), {}) is True
+    assert feeder.binary_absent("codex-nowhere-xyz", {"PATH": str(tmp_path)}) is True
+
+
+def test_pending_source_posts_unavailable_never_the_cached_reading(tmp_path, monkeypatch):
+    cred = tmp_path / "cred.json"
+    cred.write_text(json.dumps({"claudeAiOauth": {"accessToken": "tok-xyz"}}), encoding="utf-8")
+    monkeypatch.setattr(feeder, "http_json", lambda *a, **k: ts.CLAUDE_BODY)
+    env = _cycle_env(tmp_path, "claude", AI_USAGE_CLAUDE_CREDENTIALS=str(cred))
+    rec1 = Rec()
+    feeder.run_cycle(env, now=ts.NOW, poster=rec1)
+    assert any("observed_at" in b for b in rec1.bodies), "the first cycle posted live readings"
+    # Ten minutes later the login is gone. The cached reading is still within every horizon.
+    cred.unlink()
+    env2 = _cycle_env(tmp_path, "claude", AI_USAGE_CLAUDE_CREDENTIALS=str(cred))
+    rec2 = Rec()
+    posted, failures = feeder.run_cycle(env2, now=ts.NOW + 600, poster=rec2)
+    assert failures == [] and "login owed" in env2["_notes"][0]
+    claude_bodies = [b for b in rec2.bodies if "claude" in b["id"]]
+    assert claude_bodies and all("observed_at" not in b for b in claude_bodies), claude_bodies
+    assert all(fresh is False for _, fresh, _ok in posted)
+
+
+# ---- ONE unquote ------------------------------------------------------------------------------
+
+def test_single_quoted_true_inside_double_quotes_is_off_everywhere_and_picks_one_account(tmp_path):
+    """AI_CLI_ENABLED="'true'": one pair is stripped, leaving 'true' - not true. Every
+    component must agree it is DISABLED and use the same (usage) account."""
+    box = ti.Box(tmp_path, ["AI_CLI_ENABLED=\"'true'\"", "AI_CLI_USER=alice", "AI_USAGE_ENABLED=true",
+                            "AI_USAGE_USER=108000000000000000001",
+                            "AI_USAGE_FEED_URL=http://127.0.0.1:8787/api/feed",
+                            "AI_USAGE_SOURCES=claude", "AI_USAGE_USER_ACCOUNT=bob"])
+    box.env_file.write_text(box.env_file.read_text(encoding="utf-8") + "AI_USAGE_CLAUDE_CREDENTIALS=%s\n"
+                            % (box.home / "bob" / ".claude" / ".credentials.json").as_posix(), encoding="utf-8")
+    eff = subprocess.run([box.bash, "-c", 'bash "$1" --effective "$V" alice bob', "_", ti.ENSURE.as_posix()],
+                         env=box.env(V="\"'true'\""), capture_output=True, text=True).stdout.strip()
+    assert eff == "bob"
+    done = box.run(ti.SETUP_USAGE)
+    assert done.returncode == 0, done.stdout + done.stderr
+    dropin = (box.units / "homehub-ai-usage.service.d" / "10-account.conf").read_text(encoding="utf-8")
+    assert "User=bob" in dropin and "alice" not in dropin
+    assert box.accounts == ["bob"]
+    status = ti._status(box)
+    assert "sudo -u bob" in status and "alice" not in status
+    # firstboot's hook agrees: it creates BOB, never alice.
+    (tmp_path / "fb").mkdir()
+    box2 = ti.Box(tmp_path / "fb", [])
+    done = _hook_with_usage(box2, tmp_path / "fb", [
+        "AI_CLI_ENABLED=\"'true'\"", "AI_CLI_USER=alice", "AI_USAGE_ENABLED=true",
+        "AI_USAGE_USER=108000000000000000001", "AI_USAGE_FEED_URL=http://127.0.0.1:8787/api/feed",
+        "AI_USAGE_USER_ACCOUNT=bob"])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert box2.accounts == ["bob"], box2.accounts
+
+
+def test_a_dangling_credential_link_is_present_and_fails_loudly(tmp_path, monkeypatch):
+    """open() says ENOENT for a dangling link, but lstat finds the link: not absent."""
+    cred = tmp_path / "cred.json"
+    real_open = open
+
+    def enoent(path, *a, **k):
+        if str(path) == str(cred):
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", enoent)
+    real_lstat = os.lstat
+    monkeypatch.setattr(feeder.os, "lstat", lambda p, *a, **k: real_lstat(__file__) if str(p) == str(cred) else real_lstat(p, *a, **k))
+    env, _, _, failures = _run(tmp_path, "claude", AI_USAGE_CLAUDE_CREDENTIALS=str(cred))
+    assert any("unreadable: FileNotFoundError" in f for f in failures), failures
+    assert not env.get("_notes")

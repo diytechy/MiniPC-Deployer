@@ -220,6 +220,37 @@ class PendingState(SourceFailure):
     """
 
 
+def path_absent(path):
+    """True ONLY when nothing at all is at `path`: lstat says ENOENT or ENOTDIR.
+
+    Quiet means GENUINELY ABSENT. A path that is there but cannot be used - a
+    dangling symlink, a directory we may not enter (EACCES), an I/O error - is NOT
+    absent, so `os.path.exists` (which answers False for all of those) is the wrong
+    test and this is the only one used to decide that something is "owed"."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def binary_absent(binary, env):
+    """True only when nothing named `binary` exists anywhere it would be found.
+
+    A launch FileNotFoundError does not prove that: a missing interpreter or
+    loader raises it for a binary that is very much installed. Existence is judged
+    with lstat, so a dangling link or a non-executable file counts as PRESENT (and
+    its launch failure stays loud). This is the SAME rule as the keeper units' gate
+    (ConditionPathExists=| plus ConditionPathIsSymbolicLink=|: skipped only when
+    nothing at all is at the path), so both sides agree on what "absent" means."""
+    if os.sep in binary:
+        return path_absent(os.path.expanduser(binary))
+    search = env.get("PATH") or os.environ.get("PATH") or os.defpath
+    return all(path_absent(os.path.join(d or ".", binary)) for d in search.split(os.pathsep))
+
+
 def provisioning_hint(env, key):
     """' (provisioning: <reason>)' when the provisioner has recorded why `key` is
     pending, else ''. Best effort: a missing or odd state file is just no hint."""
@@ -1718,8 +1749,10 @@ def read_secret_file(path, extractor):
     try:
         with open(os.path.expanduser(path), encoding="utf-8") as handle:
             data = json.load(handle)
-    except FileNotFoundError:
-        raise PendingState("login owed: no credential at %s yet" % path)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if path_absent(os.path.expanduser(path)):
+            raise PendingState("login owed: no credential at %s yet" % path)
+        raise SourceFailure("credential %s unreadable: %s" % (path, type(exc).__name__))
     except (OSError, ValueError) as exc:
         raise SourceFailure("credential %s unreadable: %s" % (path, type(exc).__name__))
     value = extractor(data)
@@ -2054,15 +2087,17 @@ def read_codex(env):
     # The unit names the Codex home it signs in under; no auth.json there is
     # "login owed", not a launch worth making (and not an error).
     codex_home = env.get("CODEX_HOME")
-    if codex_home and not os.path.exists(os.path.join(codex_home, "auth.json")):
+    if codex_home and path_absent(os.path.join(codex_home, "auth.json")):
         raise PendingState("login owed: no codex sign-in at %s yet" % os.path.join(codex_home, "auth.json"))
     try:
         child = subprocess.Popen(
             [binary, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1)
-    except FileNotFoundError:
-        raise PendingState("codex: not installed yet%s" % provisioning_hint(env, "codex"))
+    except FileNotFoundError as exc:
+        if binary_absent(binary, env):
+            raise PendingState("codex: not installed yet%s" % provisioning_hint(env, "codex"))
+        raise SourceFailure("codex: cannot launch %s (%s)" % (binary, type(exc).__name__))
     except OSError as exc:
         raise SourceFailure("codex: cannot launch %s (%s)" % (binary, type(exc).__name__))
 
@@ -2357,6 +2392,7 @@ def run_cycle(env, now=None, readers=None, poster=None):
 
     readings, failures = {}, []
     auth_failed = set()
+    pending = set()        # sources in a quiet expected state: not installed yet / login owed
     for name in active:
         try:
             readings.update(readers[name](env))
@@ -2367,6 +2403,7 @@ def run_cycle(env, now=None, readers=None, poster=None):
         except PendingState as exc:
             # Quiet and expected: one INFO line (main prints the notes), the gauges
             # go down the unavailable path, and it is NOT a failure.
+            pending.add(name)
             env.setdefault("_notes", []).append("%s: %s" % (name, exc) if not str(exc).startswith(name) else str(exc))
         except AuthFailure as exc:
             auth_failed.add(name)
@@ -2426,8 +2463,14 @@ def run_cycle(env, now=None, readers=None, poster=None):
         if spec.optional and reading is None and spec.key not in ever_seen:
             continue
         try:
-            body, fresh = build_post(spec, reading, stored, now,
-                                     auth_confirmed=spec.source in confirmed)
+            if spec.source in pending:
+                # Nothing to read, and the cached value is NOT history worth showing:
+                # the CLI or the login is gone, so post the explicit UNAVAILABLE body
+                # (no observed_at), never an old reading that is still "fresh".
+                body, fresh = build_gauge(spec, UNAVAILABLE_CONSUMED, None, None, None), False
+            else:
+                body, fresh = build_post(spec, reading, stored, now,
+                                         auth_confirmed=spec.source in confirmed)
         except (ValueError, SourceFailure) as exc:
             failures.append("gauge %s: %s" % (spec.key, exc))
             body, fresh = build_gauge(spec, UNAVAILABLE_CONSUMED, None, None, None), False

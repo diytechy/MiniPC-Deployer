@@ -2262,22 +2262,33 @@ fi
 # A failure is a WARNING, never fatal - the same posture as 6d/6e.
 AI_EFFECTIVE_ACCOUNT=""
 ai_cli_provision_hook() {
-    local cli_en usage_en cli_user usage_acct src_dir
-    cli_en="$(_env_val AI_CLI_ENABLED | tr -d '"')" || cli_en=""
-    usage_en="$(_env_val AI_USAGE_ENABLED | tr -d '"')" || usage_en=""
+    local cli_en usage_en cli_user usage_acct src_dir cli_en_raw cli_user_raw usage_acct_raw
+    # ONE unquote: ensure-ai-account.sh strips a pair of quotes itself, so it gets the
+    # RAW values; the comparisons here use a normalised copy (one pair stripped).
+    ai_unq() {
+        local v="${1%$'\r'}"
+        case "$v" in
+            \"*\") v="${v#\"}"; v="${v%\"}" ;;
+            \'*\') v="${v#\'}"; v="${v%\'}" ;;
+        esac
+        printf '%s' "$v"
+    }
+    cli_en_raw="$(_env_val AI_CLI_ENABLED)" || cli_en_raw=""
+    cli_en="$(ai_unq "$cli_en_raw")"
+    usage_en="$(ai_unq "$(_env_val AI_USAGE_ENABLED)")" || usage_en=""
     if [ "$cli_en" != "true" ] && [ "$usage_en" != "true" ]; then
         return 0
     fi
     src_dir="$STACK_DIR/ai-cli"
-    cli_user="$(_env_val AI_CLI_USER | tr -d '"')" || cli_user=""
-    usage_acct="$(_env_val AI_USAGE_USER_ACCOUNT | tr -d '"')" || usage_acct=""
+    cli_user_raw="$(_env_val AI_CLI_USER)" || cli_user_raw=""
+    usage_acct_raw="$(_env_val AI_USAGE_USER_ACCOUNT)" || usage_acct_raw=""
     # Every step below can fail without taking firstboot with it (set -e).
     if [ ! -f "$src_dir/ensure-ai-account.sh" ]; then
         log "  WARNING: no $src_dir/ensure-ai-account.sh on the payload - carriage"
         log "    missing for an activated feature."
         return 0
     fi
-    AI_EFFECTIVE_ACCOUNT="$(bash "$src_dir/ensure-ai-account.sh" --effective "$cli_en" "$cli_user" "$usage_acct" 2>/dev/null)" \
+    AI_EFFECTIVE_ACCOUNT="$(bash "$src_dir/ensure-ai-account.sh" --effective "$cli_en_raw" "$cli_user_raw" "$usage_acct_raw" 2>/dev/null)" \
         || AI_EFFECTIVE_ACCOUNT=""
     if [ -z "$AI_EFFECTIVE_ACCOUNT" ]; then
         log "  WARNING: could not work out the AI service account; skipping provisioning."

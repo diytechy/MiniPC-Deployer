@@ -157,6 +157,11 @@ fi
 """,
     # `stat -c %U path` -> STUB_STAT_OWNER (else the first account created); the
     # status step's `-c "%U:%G %a"` form answers a root-owned 0600 file.
+    # Git Bash has no flock; W1's --schedule only needs the lock to be takeable here
+    # (the real locking is W1's own test suite, run under WSL).
+    "flock": r"""#!/usr/bin/env bash
+exit 0
+""",
     "stat": r"""#!/usr/bin/env bash
 if [ "$2" = "%U" ]; then echo "${STUB_STAT_OWNER:-$(head -1 "$SANDBOX/accounts")}"; exit 0; fi
 echo "root:root 600"
@@ -897,20 +902,88 @@ def test_happy_path_output_has_no_missing_not_found_or_refus_llr1118(tmp_path):
 # The real contract (needs W1's provisioner in the tree)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _real_seams(box, tmp_path):
+    """Point W1's real provisioner at a throwaway prefix/state, never the box."""
+    (tmp_path / "prefix").mkdir(exist_ok=True)
+    return {"AI_CLIS_PREFIX": (tmp_path / "prefix").as_posix(),
+            "AI_CLIS_STATE_DIR": (tmp_path / "state").as_posix(),
+            "AI_CLIS_BIN_DIR": (tmp_path / "bin").as_posix(),
+            "AI_CLIS_LOCK": (tmp_path / "lock").as_posix(),
+            "AI_CLIS_ENV_FILE": box.env_file.as_posix()}
+
+
 def test_real_provisioner_contract(tmp_path):
+    """W1's real `--status --json` against this repo's status step. MUST RUN."""
     provisioner = CLI_DIR / "provision-ai-clis.sh"
-    if not provisioner.exists():
-        pytest.skip("NOT RUN: provision-ai-clis.sh is not in this tree yet (W1 has not merged)")
+    assert provisioner.exists(), "W1's provisioner is in the tree after the rebase"
     box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=claude", "AI_USAGE_USER_ACCOUNT=alice"])
-    prefix = tmp_path / "prefix"
-    prefix.mkdir()
+    seams = _real_seams(box, tmp_path)
     done = subprocess.run([box.bash, provisioner.as_posix(), "--status", "--json"],
-                          env=box.env(AI_CLI_PREFIX=prefix.as_posix()), capture_output=True, text=True)
+                          env=box.env(**seams), capture_output=True, text=True)
     shape = json.loads(done.stdout)
-    assert shape["provisioning"] in ("complete", "incomplete", "running", "off")
+    assert shape["provisioning"] == "incomplete", shape       # claude is needed and not installed
     assert set(shape["clis"]) >= {"claude", "codex", "opencode", "gemini", "node"}
-    out = _status(box, AI_CLI_PROVISIONER=provisioner.as_posix(), AI_CLI_PREFIX=prefix.as_posix())
-    assert out.startswith("PROVISIONING:"), out
+    one = shape["clis"]["claude"]
+    assert set(one) == {"installed", "identity", "version", "link_target", "activation_state", "pending_reason"}
+    assert one["installed"] is False
+    out = _status(box, AI_CLI_PROVISIONER=provisioner.as_posix(), **seams)
+    lines = out.splitlines()
+    assert lines[0].startswith("PROVISIONING: INCOMPLETE"), out
+    assert "claude: being provisioned" in out, out
+    assert not UNHAPPY.search(out.split("claude: being provisioned")[0]), out
+    # With provisioning switched off the real tool says so and the step relays it.
+    box.env_file.write_text(box.env_file.read_text(encoding="utf-8") + "AI_CLI_PROVISION=off\n", encoding="utf-8")
+    off = _status(box, AI_CLI_PROVISIONER=provisioner.as_posix(), **seams)
+    assert off.startswith("PROVISIONING: off"), off
+
+
+REAL_HOOK = r"""set -u
+U=w2hooktest
+W=$(mktemp -d)
+cleanup() { userdel -r $U >/dev/null 2>&1; rm -rf "$W"; }
+trap cleanup EXIT
+mkdir -p $W/stack/ai-cli $W/units $W/state $W/prefix $W/bin
+cp -r @@REPO@@/stack/ai-cli/. $W/stack/ai-cli/
+rm -rf $W/stack/ai-cli/tests $W/stack/ai-cli/__pycache__
+printf 'AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=claude\nAI_USAGE_USER_ACCOUNT=%s\nAI_CLI_ENABLED=false\n' $U > $W/stack/.env
+cat > $W/systemctl <<'EOS'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$SYSLOG"
+exit 0
+EOS
+chmod +x $W/systemctl
+export SYSLOG=$W/calls.log AI_CLIS_SYSTEMCTL=$W/systemctl AI_CLI_UNIT_DIR=$W/units AI_CLIS_UNIT_DIR=$W/units
+export AI_CLIS_PREFIX=$W/prefix AI_CLIS_STATE_DIR=$W/state AI_CLIS_BIN_DIR=$W/bin AI_CLIS_LOCK=$W/lock AI_CLIS_ENV_FILE=$W/stack/.env
+set -e
+STACK_DIR=$W/stack
+log() { echo "[firstboot] $*"; }
+_env_val() { sed -n "s/^$1=//p" "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d '\r'; }
+AI_EFFECTIVE_ACCOUNT=""
+. @@DIR@@/hook-fn.sh
+ai_cli_provision_hook
+echo "HOOK-RC=$?"
+ls $W/units
+cat $W/calls.log
+"""
+
+
+def test_firstboot_hook_with_the_real_provisioner_schedules_and_installs_the_units_llr1119(tmp_path):
+    """Real Linux, real root, W1's real --schedule: it installs the units itself,
+    enables the timer BEFORE starting the service with --no-block, and the hook
+    never calls --run."""
+    _, _, hook = _hook_text()
+    with open(str(tmp_path / "hook-fn.sh"), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(hook)
+    done = _wsl_root(REAL_HOOK, tmp_path)
+    out = done.stdout
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "HOOK-RC=0" in out and "AI CLI provisioning scheduled" in out, out
+    assert "homehub-ai-clis-provision.service" in out and "homehub-ai-clis-provision.timer" in out
+    calls = [l for l in out.splitlines() if l.startswith("systemctl ")]
+    enable = [i for i, c in enumerate(calls) if " enable" in c and "provision.timer" in c]
+    start = [i for i, c in enumerate(calls) if " start" in c and "--no-block" in c]
+    assert enable and start and enable[0] < start[0], calls
+    assert not [c for c in calls if " --run" in c]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

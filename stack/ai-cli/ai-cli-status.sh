@@ -67,13 +67,13 @@ def load_env():
     return env
 
 
-def run(cmd, timeout=30):
+def run(cmd, timeout=30, env=None):
     # Only a Windows dev PC (the tests, under Git Bash) needs this: a Windows
     # python does not resolve extensionless shell commands, bash does.
     if os.name == "nt":
         cmd = ["bash", "-c", 'exec "$@"', "_"] + list(cmd)
     try:
-        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         return done.returncode, done.stdout
     except (OSError, subprocess.SubprocessError):
         return 127, ""
@@ -180,7 +180,12 @@ if CLI_ENABLED:
 provisioner = os.environ.get("AI_CLI_PROVISIONER") or os.path.join(HERE, "provision-ai-clis.sh")
 status = None
 if os.path.exists(provisioner):
-    rc, out = run(["bash", provisioner, "--status", "--json"], timeout=60)
+    # The provisioner reads the same .env this step does (its own default is
+    # $HERE/../.env, which is the same file on the box).
+    penv = dict(os.environ)
+    penv.setdefault("AI_CLIS_ENV_FILE", os.environ.get("AI_CLI_ENV_FILE")
+                    or os.path.join(HERE, "..", ".env"))
+    rc, out = run(["bash", provisioner, "--status", "--json"], timeout=60, env=penv)
     try:
         status = json.loads(out)
         if not isinstance(status, dict):

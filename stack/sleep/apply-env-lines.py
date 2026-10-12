@@ -17,8 +17,12 @@ ways of doing this are each wrong:
 
 So the new content is written to a temp file in the SAME directory with the
 original's mode and owner, fsynced, os.replace()d over the original, and the
-directory fsynced. On any failure the temp file is removed and the original is
-untouched. An exclusive flock on the original is held for the whole of it, and
+directory fsynced. On any failure up to and including the replace, the temp file is
+removed and the original is untouched. The directory fsync comes AFTER the replace,
+when the change is already committed: if only THAT fails, the helper prints a
+WARNING that durability is uncertain and still exits 0 (the new file is in place).
+At the start of every apply/restore, under the lock, it also deletes stale
+.env.tmp-* files left beside .env by a hard-killed run (they hold secrets). An exclusive flock on the original is held for the whole of it, and
 the inode is re-checked after the lock is taken (a second helper that waited
 re-reads the file the first one produced instead of overwriting it).
 
@@ -38,7 +42,10 @@ Usage:
   sudo -n python3 apply-env-lines.py --apply   [--env PATH] < lines
   sudo -n python3 apply-env-lines.py --report  [--env PATH]
   sudo -n python3 apply-env-lines.py --restore BACKUP [--env PATH]
-Exit 0 ok, 1 --report found a problem, 2 refused (the file is untouched).
+Flag keys (*_ENABLED, SLEEP_PUBLISH) are written UNQUOTED: setup-sleep.sh and
+firstboot compare the literal value, so 'true' / "true" are canonicalised to true.
+Exit 0 ok (possibly with a durability WARNING on stderr), 1 --report found a
+problem, 2 refused (the file is untouched).
 """
 import argparse
 import os
@@ -98,6 +105,8 @@ def parse_incoming(raw):
         if key in REQUIRED and not unquote(value):
             refuse("%s has a blank value; applying it would replace a good hub value "
                    "(import the missing secret and re-materialise first)" % key)
+        if key.endswith("_ENABLED") or key == "SLEEP_PUBLISH":
+            line = key + "=" + unquote(value)       # canonical: unquoted
         out.append((key, line))
     if not out:
         refuse("no KEY=VALUE lines on stdin")
@@ -198,13 +207,38 @@ def atomic_write(path, data):
         finally:
             os.close(handle)
         os.replace(temp, path)
-        _fsync_dir(directory)
     except BaseException:
         try:
             os.unlink(temp)
         except OSError:
             pass
         raise
+    # COMMITTED from here on. A failure to fsync the directory means the rename may
+    # not survive a power cut, not that the file is unchanged: warn, do not raise.
+    try:
+        _fsync_dir(directory)
+    except OSError as exc:
+        print("WARNING: %s was replaced but the directory fsync failed (%s); durability "
+              "is uncertain until the next sync" % (os.path.basename(path), type(exc).__name__),
+              file=sys.stderr)
+
+
+def sweep_stale_temps(path):
+    """Delete .env.tmp-* files beside `path` owned by the same user. Caller holds the lock."""
+    directory = os.path.dirname(os.path.abspath(path))
+    owner = os.stat(path).st_uid
+    removed = 0
+    for name in os.listdir(directory):
+        full = os.path.join(directory, name)
+        if name.startswith(".env.tmp-") and os.path.isfile(full) and os.stat(full).st_uid == owner:
+            try:
+                os.unlink(full)
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print("removed %d stale .env.tmp-* file(s) beside %s" % (removed, os.path.basename(path)),
+              file=sys.stderr)
 
 
 def locked_update(path, transform):
@@ -217,6 +251,7 @@ def locked_update(path, transform):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             if os.name != "nt" and os.fstat(handle.fileno()).st_ino != os.stat(path).st_ino:
                 continue                    # another helper replaced it while we waited
+            sweep_stale_temps(path)
             data = handle.read()
             new_bytes, result = transform(data)
             if new_bytes != data:

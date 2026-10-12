@@ -70,7 +70,7 @@ def test_the_hook_sits_after_weight_before_recovery_and_names_the_script():
     text = FIRSTBOOT.read_text(encoding="utf-8")
     assert text.index("# ── 6f. the weight feeder") < text.index(START)
     assert "$STACK_DIR/sleep/setup-sleep.sh" in block
-    assert 'SLEEP_ENABLED="$(_env_val SLEEP_ENABLED | tr -d \'"\')"' in block
+    assert 'SLEEP_ENABLED="$(_env_val SLEEP_ENABLED | tr -d "\\"\'")"' in block   # both quote kinds
     assert '[ "${SLEEP_ENABLED:-false}" = "true" ]' in block
 
 
@@ -106,6 +106,7 @@ def test_anything_but_a_literal_true_installs_nothing(tmp_path, env_lines):
 
 @needs_bash
 @pytest.mark.parametrize("env_lines", ["SLEEP_ENABLED=true\n", 'SLEEP_ENABLED="true"\n',
+                                       "SLEEP_ENABLED='true'\n",
                                        "SLEEP_ENABLED=true\r\n"])
 def test_a_true_gate_runs_the_setup_script_and_says_so(tmp_path, env_lines):
     proc, called = run_block(tmp_path, env_lines, stub_body="echo stub-installed; exit 0")
@@ -163,7 +164,8 @@ def test_the_readme_carries_the_running_hub_procedure_and_no_stale_claim():
                  "journalctl -u homehub-sleep", "setup-sleep.sh --check-only",
                  "apply-env-lines.py --apply", "apply-env-lines.py --report", "diff -r",
                  "Copy nothing else", "systemctl stop homehub-sleep.service",
-                 "apply-env-lines.py --restore", "UTF-8 **without a BOM**", r"scripts\deploy\out\homehub\.env"):
+                 "apply-env-lines.py --restore", "UTF-8 **without a BOM**", "$LASTEXITCODE", "} finally {",
+                 "-name '.env.tmp-*'", "unquoted", r"scripts\deploy\out\homehub\.env"):
         assert must in text, must
     section = text[text.index("Installing on the RUNNING hub"):text.index("## Tests")]
     assert "tee -a" not in section                 # tee echoes stdin: it would print the password
@@ -431,3 +433,149 @@ def test_mode_and_owner_of_the_original_are_applied_to_the_replacement(tmp_path,
     assert helper.main(["--apply", "--env", str(env)]) == 0
     assert ("mode", before.st_mode & 0o7777) in calls
     assert ("owner", before.st_uid, before.st_gid) in calls
+
+
+# ── Round 3 : quoting vs the REAL gate, durability warning, stale temps, locking ──
+
+import subprocess as _sp
+import sys
+import time
+
+from test_sleep_deploy import GOOD_ENV, run_setup
+
+
+@needs_bash
+@pytest.mark.parametrize("raw,installs", [
+    ("true", True), ("'true'", True), ('"true"', True),
+    ("false", False), ("'false'", False), ("'True'", False), ("'1'", False), ("''", False)])
+def test_the_real_setup_gate_reads_single_double_and_bare_values_alike(tmp_path, raw, installs):
+    env_text = GOOD_ENV.replace("SLEEP_ENABLED=true", "SLEEP_ENABLED=" + raw)
+    proc = run_setup(tmp_path, ["--check-only"], env_text)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    if installs:
+        assert "check-only: identity set" in out
+    else:
+        assert "SLEEP_ENABLED is not true" in out
+
+
+@needs_bash
+def test_single_quoted_empty_sign_in_is_blank_to_the_real_script(tmp_path):
+    env_text = GOOD_ENV.replace("MYAIR_PASSWORD=PASSWORD-SENTINEL-6120", "MYAIR_PASSWORD=''")
+    proc = run_setup(tmp_path, ["--check-only"], env_text)
+    assert proc.returncode == 2 and "MYAIR_PASSWORD is blank" in proc.stdout + proc.stderr
+
+
+@needs_bash
+@pytest.mark.parametrize("quoted", ["'true'", '"true"'])
+def test_what_apply_writes_passes_the_real_gate_even_from_quoted_input(
+        tmp_path, monkeypatch, capsys, quoted):
+    incoming = ("SLEEP_ENABLED=" + quoted + "\nSLEEP_USER=sub-1\nMYAIR_EMAIL=a@example.invalid\n"  # privacy-ok: placeholder
+                "MYAIR_PASSWORD=" + SECRET + "\nSLEEP_FEED_URL=http://127.0.0.1:8787/api/feed\n"
+                "TIMEZONE=America/Chicago\nHEART_ENABLED='0'\n")
+    rc, _o, text, _e = run_helper(tmp_path, monkeypatch, capsys, ["--apply"],
+                                  "SLEEP_ENABLED=false\n", incoming)
+    assert rc == 0 and "SLEEP_ENABLED=true\n" in text and "HEART_ENABLED=0\n" in text
+    assert "'" not in text.replace(SECRET, "")
+    proc = run_setup(tmp_path, ["--check-only"], text)
+    assert proc.returncode == 0 and "check-only: identity set" in proc.stdout
+
+
+@pytest.mark.parametrize("raw,canonical", [("'true'", "true"), ('"false"', "false"),
+                                           ("'1'", "1"), ('"0"', "0"), ("true", "true")])
+def test_flag_keys_are_written_unquoted(tmp_path, monkeypatch, capsys, raw, canonical):
+    rc, _o, text, _e = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], "OTHER=1\n",
+                                  "SLEEP_ENABLED=%s\nHEART_ENABLED=%s\nSLEEP_PUBLISH=%s\n" % (raw, raw, raw))
+    assert rc == 0
+    for key in ("SLEEP_ENABLED", "HEART_ENABLED", "SLEEP_PUBLISH"):
+        assert "%s=%s\n" % (key, canonical) in text
+
+
+def test_a_directory_fsync_failure_after_the_replace_is_a_warning_not_a_failure(
+        tmp_path, monkeypatch, capsys):
+    helper = load_helper()
+
+    def boom(_directory):
+        raise OSError("simulated directory fsync failure")
+    monkeypatch.setattr(helper, "_fsync_dir", boom)
+    env = tmp_path / ".env"
+    env.write_bytes(TEMPLATE_DEFAULTS.encode("utf-8"))
+    monkeypatch.setattr("sys.stdin", Stdin(WANTED.encode("utf-8")))
+    rc = helper.main(["--apply", "--env", str(env)])
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "SLEEP_USER=sub-123\n" in env.read_text(encoding="utf-8")        # the change IS in place
+    assert "WARNING" in out.err and "durability is uncertain" in out.err
+    assert SECRET not in out.out + out.err and no_temp_left(tmp_path)
+
+
+def test_stale_temp_files_from_a_killed_run_are_swept_under_the_lock(tmp_path, monkeypatch, capsys):
+    (tmp_path / ".env.tmp-abc123").write_bytes(b"MYAIR_PASSWORD=" + SECRET.encode("utf-8") + b"\n")
+    (tmp_path / "unrelated.txt").write_bytes(b"keep")
+    rc, out, _text, _e = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, WANTED)
+    assert rc == 0 and no_temp_left(tmp_path) and (tmp_path / "unrelated.txt").exists()
+    assert "removed 1 stale .env.tmp-* file" in out and SECRET not in out
+
+
+def test_report_does_not_touch_the_directory(tmp_path, monkeypatch, capsys):
+    (tmp_path / ".env.tmp-abc123").write_bytes(b"x")
+    run_helper(tmp_path, monkeypatch, capsys, ["--report"], TEMPLATE_DEFAULTS)
+    assert (tmp_path / ".env.tmp-abc123").exists()
+
+
+# Locking. Linux only: flock does not exist on Windows. These fail if the lock or the
+# inode re-check is removed (mutation-checked).
+
+linux_only = pytest.mark.skipif(os.name == "nt", reason="flock is POSIX")
+
+
+def _spawn(env, stdin_text):
+    proc = _sp.Popen([sys.executable, str(HELPER), "--apply", "--env", str(env)],
+                     stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE)
+    proc.stdin.write(stdin_text.encode("utf-8"))
+    proc.stdin.close()
+    return proc
+
+
+@linux_only
+def test_two_helpers_wait_for_the_lock_and_neither_update_is_lost(tmp_path):
+    import fcntl
+    env = tmp_path / ".env"
+    env.write_bytes(b"OTHER=1\n")
+    holder = open(str(env), "rb")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+    try:
+        first = _spawn(env, "SLEEP_USER=from-first\n")
+        second = _spawn(env, "MYAIR_EMAIL=from-second\n")
+        time.sleep(1.0)
+        assert first.poll() is None and second.poll() is None     # both BLOCKED on the lock
+        assert env.read_bytes() == b"OTHER=1\n"
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+    for proc in (first, second):
+        assert proc.wait(timeout=30) == 0, proc.stderr.read()
+    text = env.read_text(encoding="utf-8")
+    assert "SLEEP_USER=from-first\n" in text and "MYAIR_EMAIL=from-second\n" in text
+    assert text.startswith("OTHER=1\n") and no_temp_left(tmp_path)
+
+
+@linux_only
+def test_a_waiter_re_reads_a_file_replaced_while_it_waited(tmp_path):
+    import fcntl
+    helper = load_helper()
+    env = tmp_path / ".env"
+    env.write_bytes(b"OTHER=1\n")
+    holder = open(str(env), "rb")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX)      # the "first helper"
+    waiter = _spawn(env, "SLEEP_USER=from-waiter\n")
+    try:
+        time.sleep(1.0)
+        assert waiter.poll() is None
+        helper.atomic_write(str(env), b"OTHER=1\nWRITTEN_BY_FIRST=1\n")   # new inode under the waiter
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+    assert waiter.wait(timeout=30) == 0, waiter.stderr.read()
+    text = env.read_text(encoding="utf-8")
+    assert "WRITTEN_BY_FIRST=1\n" in text and "SLEEP_USER=from-waiter\n" in text   # nothing lost

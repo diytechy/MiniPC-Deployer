@@ -2454,7 +2454,7 @@ fi
 # complete and the sleep gauge simply is not installed. Re-run by hand once the
 # value exists (the secret-store import of MyAirPassword is the usual one).
 # Same unset-variable defect as AI_CLI_ENABLED and the mesh tunnel above.
-SLEEP_ENABLED="$(_env_val SLEEP_ENABLED | tr -d '"')"
+SLEEP_ENABLED="$(_env_val SLEEP_ENABLED | tr -d "\"'")"
 if [ "${SLEEP_ENABLED:-false}" = "true" ]; then
     log "provisioning the sleep feeder (activated by .env)…"
     if [ -f "$STACK_DIR/sleep/setup-sleep.sh" ]; then

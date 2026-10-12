@@ -387,10 +387,21 @@ Nothing here restarts a container; the feeder is a host systemd unit.
    $tmp  = "scripts\deploy\out\homehub\sleep-lines.env"
    $keep = [IO.File]::ReadAllLines((Resolve-Path $src), $utf8) |
        Where-Object { $_ -match '^(SLEEP_|MYAIR_|HEART_)[A-Z_]*=' }
-   [IO.File]::WriteAllText("$PWD\$tmp", (($keep -join "`n") + "`n"), $utf8)
-   cmd /c "ssh <hub> sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --apply < $tmp"
-   Remove-Item $tmp
+   try {
+       [IO.File]::WriteAllText("$PWD\$tmp", (($keep -join "`n") + "`n"), $utf8)
+       cmd /c "ssh <hub> sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --apply < $tmp"
+       if ($LASTEXITCODE -ne 0) { throw "apply failed with exit code $LASTEXITCODE - do NOT continue" }
+   } finally {
+       Remove-Item $tmp -ErrorAction SilentlyContinue      # the file holds secrets: always delete it
+   }
    ```
+
+   The helper writes the flag keys (`*_ENABLED`, `SLEEP_PUBLISH`) **unquoted**
+   whatever the input had, because the setup script and first boot compare the
+   literal value. If only the final directory `fsync` fails after the replace, the
+   file *is* changed: the helper prints a WARNING that durability is uncertain and
+   exits 0. At the start of every apply or restore, under the lock, it also deletes
+   any stale `.env.tmp-*` file a hard-killed earlier run left beside `.env`.
 
    `SLEEP_FEED_URL` is the loopback tracker URL, the same value the weight and AI
    feeders use (the tracker publishes `127.0.0.1:8787:8787`). The password must not
@@ -421,6 +432,10 @@ Nothing here restarts a container; the feeder is a host systemd unit.
      trail; the `sleep` bar then appears in the life row on the panel. The unavailable
      body is also a post (a grey, empty bar), so a grey bar proves delivery too.
    - `sudo systemctl is-enabled homehub-sleep.timer` prints `enabled`.
+   - No stale temp file holds secrets next to the config:
+     `sudo find /opt/homehub/stack -maxdepth 1 -name '.env.tmp-*'` must print
+     nothing. A hard-killed run can leave one; `sudo rm` it (the next apply or
+     restore would also sweep it).
 8. **Roll back.** Stop **both** units - a oneshot that is already mid-run can still
    publish after its timer is gone:
    `sudo systemctl disable --now homehub-sleep.timer && sudo systemctl stop homehub-sleep.service`.
@@ -431,13 +446,15 @@ Nothing here restarts a container; the feeder is a host systemd unit.
    atomic writer. Do **not** use `sh -c 'cat backup > .env'`: the shell empties
    `.env` before it opens the backup, so a mistyped backup name destroys the config.
    (`mv`, `cp --remove-destination` and `sed -i` are not atomic-with-validation
-   either: use the helper.) The account and state directory are inert and may stay.
+   either: use the helper.) Afterwards re-run the `find` for `.env.tmp-*` from step 7.
+   The account and state directory are inert and may stay.
 
 Not proven: every step above, on a real hub (see "Known limits"). The helper itself
 is covered by `tests/test_sleep_wiring.py` (exact bytes, atomicity under simulated
-failure, mode and owner calls, no value printed, refusals, restore validation), not
-by a run against the hub's `.env`; `flock` and `fchown` are not exercised there (the
-tests run on Windows).
+failure, mode and owner calls, no value printed, refusals, restore validation, flag
+canonicalisation, stale-temp sweep, and - on Linux only - two helpers blocked on the
+`flock` and a waiter re-reading a file replaced under it), not by a run against the
+hub's own `.env`. `fchown` with a real different owner has not been exercised.
 
 The unit: `User=homehub-sleep`, `StateDirectory=homehub-sleep` mode `0700`, the
 state file `0600`, `ProtectHome=yes`, `ProtectSystem=strict`, `NoNewPrivileges`,

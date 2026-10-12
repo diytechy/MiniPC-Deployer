@@ -51,6 +51,7 @@ env_get() {
     local value
     value="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
     value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"   # single quotes too: systemd and compose accept them
     printf '%s' "$value"
 }
 
@@ -58,7 +59,7 @@ env_get() {
 env_present() {
     [ -f "$ENV_FILE" ] || return 1
     local value
-    value="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"[:space:]' || true)"
+    value="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]" || true)"
     [ -n "$value" ]
 }
 

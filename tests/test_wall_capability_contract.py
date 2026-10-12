@@ -2,7 +2,7 @@
 
 The fixture under tests/fixtures/wall-camera-opt is the OTHER side of the
 contract - OfficeWallNaglight's own manifest and site inventory at
-feat-stacked-life-row e5064b5, based on CameraOpt 5008311 (see its SOURCE.txt). Nothing in this file invents the values it checks
+feat-stacked-life-row 49cddf0, based on CameraOpt 5008311 (see its SOURCE.txt). Nothing in this file invents the values it checks
 against: the script's REQUIRED / ALLOWED_SITE_FILES are compared with what the
 panel says it ships, and each mutation below must be REJECTED by the script.
 """
@@ -20,7 +20,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/wall-camera-opt"
-REVISION = "e5064b531afabbb1b585e1be7375815a1e6f8275"
+REVISION = "49cddf0a30b71199ce85dbd65501ea16d1549492"
 
 spec = importlib.util.spec_from_file_location(
     "wall_capability_contract", ROOT / "scripts/assert_wall_capabilities.py"
@@ -192,6 +192,22 @@ def test_the_gauge_glyphs_cannot_be_dropped_from_the_declaration(tmp_path, paylo
     for glyph in ("vendor/icons/heart.svg", "vendor/icons/sleep.svg"):
         manifest = mutated(lambda caps: caps["progress-gauges-v1"][payload].remove(glyph))
         reject(tmp_path, kind, "progress-gauges-v1", manifest=manifest)
+
+
+@pytest.mark.parametrize("glyph", ["cash", "clock", "weight"])
+def test_the_life_row_glyphs_are_floor_and_cannot_be_dropped(tmp_path, glyph):
+    # The life row draws these as well as sleep and heart; an artifact (or a
+    # manifest) missing one would draw a hole where the mark belongs.
+    path = "vendor/icons/%s.svg" % glyph
+    for payload, kind in (("app", "shell"), ("site", "site")):
+        assert path in PANEL_MANIFEST["capabilities"]["progress-gauges-v1"][payload]
+        assert path in contract.REQUIRED["progress-gauges-v1"][payload]
+        manifest = mutated(lambda caps: caps["progress-gauges-v1"][payload].remove(path))
+        reject(tmp_path, kind, "progress-gauges-v1", manifest=manifest)
+    reject(tmp_path, "site", "missing capability file: .*%s.svg" % glyph,
+           drop=["site/" + path])
+    reject(tmp_path, "shell", "missing capability file: .*%s.svg" % glyph,
+           drop=[PREFIX["shell"] + path])
 
 
 def test_a_site_archive_missing_the_declared_heart_glyph_is_rejected(tmp_path):

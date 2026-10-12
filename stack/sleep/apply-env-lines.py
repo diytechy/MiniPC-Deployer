@@ -22,7 +22,8 @@ removed and the original is untouched. The directory fsync comes AFTER the repla
 when the change is already committed: if only THAT fails, the helper prints a
 WARNING that durability is uncertain and still exits 0 (the new file is in place).
 At the start of every apply/restore, under the lock, it also deletes stale
-.env.tmp-* files left beside .env by a hard-killed run (they hold secrets). An exclusive flock on the original is held for the whole of it, and
+.tmp-<name>-* files left beside the target by a hard-killed run (they hold secrets;
+the prefix is scoped to the target's name, so a different env file is never touched). An exclusive flock on the original is held for the whole of it, and
 the inode is re-checked after the lock is taken (a second helper that waited
 re-reads the file the first one produced instead of overwriting it).
 
@@ -102,6 +103,14 @@ def parse_incoming(raw):
         if not sep or key not in ALLOWED:
             # Neither the line nor the unknown name is echoed: it may be a secret.
             refuse("an input line is not KEY=VALUE for an allowed key")
+        stripped = value.strip()
+        if stripped[:1] in ("'", '"') and not (len(stripped) >= 2 and stripped[-1] == stripped[0]):
+            # systemd drops a LEADING quote even with no closing one, setup-sleep.sh and
+            # firstboot require a matching pair: refuse the ambiguity rather than store it.
+            refuse("%s starts with a quote that has no matching closing quote" % key)
+        if key == "MYAIR_PASSWORD" and (stripped[:1] in ("'", '"') or "\\" in value or '"' in value):
+            refuse("MYAIR_PASSWORD must not start with a quote or contain a backslash or a "
+                   "double quote (systemd's EnvironmentFile would alter it)")
         if key in REQUIRED and not unquote(value):
             refuse("%s has a blank value; applying it would replace a good hub value "
                    "(import the missing secret and re-materialise first)" % key)
@@ -191,11 +200,20 @@ def _fsync_dir(directory):
         os.close(fd)
 
 
+TEMP_SUFFIX = re.compile(r"^[A-Za-z0-9_]{8}$")      # what tempfile.mkstemp appends
+
+
+def temp_prefix(path):
+    """Temp names are scoped to the TARGET's name, so two helpers updating different
+    env files in one directory (each under its own lock) never sweep each other."""
+    return ".tmp-%s-" % os.path.basename(path)
+
+
 def atomic_write(path, data):
     """Replace `path` with `data` or change nothing. Caller holds the lock."""
     directory = os.path.dirname(os.path.abspath(path))
     original = os.stat(path)
-    handle, temp = tempfile.mkstemp(prefix=".env.tmp-", dir=directory)
+    handle, temp = tempfile.mkstemp(prefix=temp_prefix(path), dir=directory)
     try:
         try:
             if hasattr(os, "fchmod"):
@@ -224,20 +242,23 @@ def atomic_write(path, data):
 
 
 def sweep_stale_temps(path):
-    """Delete .env.tmp-* files beside `path` owned by the same user. Caller holds the lock."""
+    """Delete this target's own stale temp files (and only those) beside `path`, owned by
+    the same user. Caller holds the lock on `path`."""
+    prefix = temp_prefix(path)
     directory = os.path.dirname(os.path.abspath(path))
     owner = os.stat(path).st_uid
     removed = 0
     for name in os.listdir(directory):
         full = os.path.join(directory, name)
-        if name.startswith(".env.tmp-") and os.path.isfile(full) and os.stat(full).st_uid == owner:
+        if (name.startswith(prefix) and TEMP_SUFFIX.match(name[len(prefix):])
+                and os.path.isfile(full) and os.stat(full).st_uid == owner):
             try:
                 os.unlink(full)
                 removed += 1
             except OSError:
                 pass
     if removed:
-        print("removed %d stale .env.tmp-* file(s) beside %s" % (removed, os.path.basename(path)),
+        print("removed %d stale %s* file(s) beside %s" % (removed, prefix, os.path.basename(path)),
               file=sys.stderr)
 
 

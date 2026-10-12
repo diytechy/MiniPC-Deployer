@@ -70,7 +70,8 @@ def test_the_hook_sits_after_weight_before_recovery_and_names_the_script():
     text = FIRSTBOOT.read_text(encoding="utf-8")
     assert text.index("# ── 6f. the weight feeder") < text.index(START)
     assert "$STACK_DIR/sleep/setup-sleep.sh" in block
-    assert 'SLEEP_ENABLED="$(_env_val SLEEP_ENABLED | tr -d "\\"\'")"' in block   # both quote kinds
+    assert 'SLEEP_ENABLED="$(_env_val SLEEP_ENABLED)"' in block
+    assert "tr -d" not in block        # a matching pair only: tr -d would turn tr'ue into true
     assert '[ "${SLEEP_ENABLED:-false}" = "true" ]' in block
 
 
@@ -97,7 +98,9 @@ def run_block(tmp_path, env_lines, stub_body=None):
 @needs_bash
 @pytest.mark.parametrize("env_lines", ["", "SLEEP_ENABLED=false\n", "SLEEP_ENABLED=\n",
                                        "SLEEP_ENABLED=True\n", "SLEEP_ENABLED=1\n",
-                                       "SLEEP_ENABLED=yes\n"])
+                                       "SLEEP_ENABLED=yes\n", "SLEEP_ENABLED=tr'ue\n",
+                                       "SLEEP_ENABLED='true\n", "SLEEP_ENABLED=true'\n",
+                                       'SLEEP_ENABLED=tr"ue\n'])
 def test_anything_but_a_literal_true_installs_nothing(tmp_path, env_lines):
     proc, called = run_block(tmp_path, env_lines, stub_body="exit 0")
     assert proc.returncode == 0 and "BLOCK-DONE" in proc.stdout
@@ -165,7 +168,7 @@ def test_the_readme_carries_the_running_hub_procedure_and_no_stale_claim():
                  "apply-env-lines.py --apply", "apply-env-lines.py --report", "diff -r",
                  "Copy nothing else", "systemctl stop homehub-sleep.service",
                  "apply-env-lines.py --restore", "UTF-8 **without a BOM**", "$LASTEXITCODE", "} finally {",
-                 "-name '.env.tmp-*'", "unquoted", r"scripts\deploy\out\homehub\.env"):
+                 "-name '.tmp-.env-*'", "unquoted", "apostrophe", r"scripts\deploy\out\homehub\.env"):
         assert must in text, must
     section = text[text.index("Installing on the RUNNING hub"):text.index("## Tests")]
     assert "tee -a" not in section                 # tee echoes stdin: it would print the password
@@ -225,7 +228,7 @@ FULL_GOOD = WANTED + "TIMEZONE=America/Chicago\nSLEEP_FEED_URL=http://127.0.0.1:
 
 
 def no_temp_left(tmp_path):
-    return [p.name for p in tmp_path.iterdir() if p.name.startswith(".env.tmp-")] == []
+    return [p.name for p in tmp_path.iterdir() if p.name.startswith(".tmp-")] == []
 
 
 def test_template_defaults_are_replaced_where_they_stand_and_other_lines_survive(
@@ -447,7 +450,8 @@ from test_sleep_deploy import GOOD_ENV, run_setup
 @needs_bash
 @pytest.mark.parametrize("raw,installs", [
     ("true", True), ("'true'", True), ('"true"', True),
-    ("false", False), ("'false'", False), ("'True'", False), ("'1'", False), ("''", False)])
+    ("false", False), ("'false'", False), ("'True'", False), ("'1'", False), ("''", False),
+    ("tr'ue", False), ("'true", False), ("true'", False), ('tr"ue', False), ("\"true'", False)])
 def test_the_real_setup_gate_reads_single_double_and_bare_values_alike(tmp_path, raw, installs):
     env_text = GOOD_ENV.replace("SLEEP_ENABLED=true", "SLEEP_ENABLED=" + raw)
     proc = run_setup(tmp_path, ["--check-only"], env_text)
@@ -510,17 +514,17 @@ def test_a_directory_fsync_failure_after_the_replace_is_a_warning_not_a_failure(
 
 
 def test_stale_temp_files_from_a_killed_run_are_swept_under_the_lock(tmp_path, monkeypatch, capsys):
-    (tmp_path / ".env.tmp-abc123").write_bytes(b"MYAIR_PASSWORD=" + SECRET.encode("utf-8") + b"\n")
+    (tmp_path / ".tmp-.env-abc12345").write_bytes(b"MYAIR_PASSWORD=" + SECRET.encode("utf-8") + b"\n")
     (tmp_path / "unrelated.txt").write_bytes(b"keep")
     rc, out, _text, _e = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, WANTED)
     assert rc == 0 and no_temp_left(tmp_path) and (tmp_path / "unrelated.txt").exists()
-    assert "removed 1 stale .env.tmp-* file" in out and SECRET not in out
+    assert "removed 1 stale .tmp-.env-* file" in out and SECRET not in out
 
 
 def test_report_does_not_touch_the_directory(tmp_path, monkeypatch, capsys):
-    (tmp_path / ".env.tmp-abc123").write_bytes(b"x")
+    (tmp_path / ".tmp-.env-abc12345").write_bytes(b"x")
     run_helper(tmp_path, monkeypatch, capsys, ["--report"], TEMPLATE_DEFAULTS)
-    assert (tmp_path / ".env.tmp-abc123").exists()
+    assert (tmp_path / ".tmp-.env-abc12345").exists()
 
 
 # Locking. Linux only: flock does not exist on Windows. These fail if the lock or the
@@ -579,3 +583,56 @@ def test_a_waiter_re_reads_a_file_replaced_while_it_waited(tmp_path):
     assert waiter.wait(timeout=30) == 0, waiter.stderr.read()
     text = env.read_text(encoding="utf-8")
     assert "WRITTEN_BY_FIRST=1\n" in text and "SLEEP_USER=from-waiter\n" in text   # nothing lost
+
+
+# ── Round 4 : temp names scoped to the target; one quote rule; password characters ──
+
+def test_one_helpers_sweep_never_touches_another_env_files_live_temp(tmp_path, monkeypatch, capsys):
+    other_live = tmp_path / ".tmp-other.env-q1w2e3r4"          # a different target's in-flight temp
+    other_live.write_bytes(b"IN-FLIGHT")
+    ours_stale = tmp_path / ".tmp-.env-a1b2c3d4"
+    ours_stale.write_bytes(b"STALE")
+    lookalike = tmp_path / ".tmp-.env-a-b-q1w2e3r4"             # another target whose name starts like ours
+    lookalike.write_bytes(b"OTHER")
+    rc, out, _t, _e = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, WANTED)
+    assert rc == 0 and not ours_stale.exists()
+    assert other_live.read_bytes() == b"IN-FLIGHT" and lookalike.read_bytes() == b"OTHER"
+
+
+def test_the_temp_prefix_is_a_function_of_the_target_name():
+    helper = load_helper()
+    assert helper.temp_prefix("/x/.env") != helper.temp_prefix("/x/other.env")
+    assert helper.temp_prefix("/x/.env") == helper.temp_prefix("/y/.env")
+
+
+def test_a_live_temp_of_another_target_survives_a_real_apply_on_this_one(tmp_path, monkeypatch, capsys):
+    helper = load_helper()
+    seen = []
+    real = helper.os.replace
+
+    def spy(src, dst):
+        seen.append(os.path.basename(src))
+        return real(src, dst)
+    monkeypatch.setattr(helper.os, "replace", spy)
+    env = tmp_path / "other.env"
+    env.write_bytes(b"OTHER=1\n")
+    monkeypatch.setattr("sys.stdin", Stdin(b"SLEEP_USER=a\n"))
+    assert helper.main(["--apply", "--env", str(env)]) == 0
+    assert seen and seen[0].startswith(".tmp-other.env-")
+
+
+@pytest.mark.parametrize("line", ["SLEEP_ENABLED='true\n", 'SLEEP_USER="abc\n', "SLEEP_USER='abc\n"])
+def test_a_value_with_an_unmatched_leading_quote_is_refused(tmp_path, monkeypatch, capsys, line):
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS, line)
+    assert rc == 2 and text == TEMPLATE_DEFAULTS and "no matching closing quote" in out
+
+
+@pytest.mark.parametrize("password,ok", [
+    ("pa'ss", True), ("pass'", True), ("pa'ss'word", True), ("pa$$word", True),
+    ("'pass", False), ("'pass'", False), ('"pass"', False), ('pa"ss', False), ("pa\\ss", False)])
+def test_password_characters_systemd_would_alter_are_refused(tmp_path, monkeypatch, capsys, password, ok):
+    rc, out, text, _ = run_helper(tmp_path, monkeypatch, capsys, ["--apply"], TEMPLATE_DEFAULTS,
+                                  "MYAIR_PASSWORD=" + password + "\n")
+    assert (rc == 0) is ok
+    assert (("MYAIR_PASSWORD=" + password + "\n") in text) is ok
+    assert password not in out

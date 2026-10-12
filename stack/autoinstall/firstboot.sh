@@ -2454,7 +2454,14 @@ fi
 # complete and the sleep gauge simply is not installed. Re-run by hand once the
 # value exists (the secret-store import of MyAirPassword is the usual one).
 # Same unset-variable defect as AI_CLI_ENABLED and the mesh tunnel above.
-SLEEP_ENABLED="$(_env_val SLEEP_ENABLED | tr -d "\"'")"
+# ONE quote rule, shared with setup-sleep.sh and apply-env-lines.py: strip a single
+# MATCHING pair of surrounding quotes and nothing else (deleting every quote would turn
+# tr'ue into true, which setup-sleep.sh then refuses).
+SLEEP_ENABLED="$(_env_val SLEEP_ENABLED)"
+case "$SLEEP_ENABLED" in
+    \"?*\") SLEEP_ENABLED="${SLEEP_ENABLED#\"}"; SLEEP_ENABLED="${SLEEP_ENABLED%\"}" ;;
+    \'?*\') SLEEP_ENABLED="${SLEEP_ENABLED#\'}"; SLEEP_ENABLED="${SLEEP_ENABLED%\'}" ;;
+esac
 if [ "${SLEEP_ENABLED:-false}" = "true" ]; then
     log "provisioning the sleep feeder (activated by .env)…"
     if [ -f "$STACK_DIR/sleep/setup-sleep.sh" ]; then

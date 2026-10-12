@@ -50,8 +50,15 @@ SLEEP_STATE_DIR=/var/lib/homehub-sleep
 env_get() {
     local value
     value="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
-    value="${value%\"}"; value="${value#\"}"
-    value="${value%\'}"; value="${value#\'}"   # single quotes too: systemd and compose accept them
+    # ONE rule, shared with firstboot.sh and apply-env-lines.py: strip a single
+    # MATCHING pair of surrounding quotes (double or single) and nothing else. A lone
+    # leading or trailing quote, or a quote inside the value, is left in place, so
+    # 'true and tr'ue are not "true" here, exactly as in the other two parsers.
+    case "$value" in
+        \"?*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'?*\') value="${value#\'}"; value="${value%\'}" ;;
+        \"\"|\'\') value="" ;;
+    esac
     printf '%s' "$value"
 }
 
@@ -59,8 +66,13 @@ env_get() {
 env_present() {
     [ -f "$ENV_FILE" ] || return 1
     local value
-    value="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]" || true)"
-    [ -n "$value" ]
+    value="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+    case "$value" in      # the same single-matching-pair rule as env_get
+        \"?*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'?*\') value="${value#\'}"; value="${value%\'}" ;;
+        \"\"|\'\') value="" ;;
+    esac
+    [ -n "$(printf '%s' "$value" | tr -d '[:space:]')" ]
 }
 
 if [ -f "$ENV_FILE" ]; then

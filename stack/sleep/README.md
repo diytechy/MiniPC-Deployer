@@ -139,8 +139,9 @@ skew *between* clocks is out of scope.
 | `SLEEP_TIMEOUT_SECONDS` | `30` | Per request (a cycle is five). |
 | `TIMEZONE` | `Etc/UTC` in the example | **Must be the hub's real zone** — night keys are local dates. Blank/unknown is refused. |
 
-**`MYAIR_PASSWORD` must not contain `\` or `"`** (systemd's `EnvironmentFile=` unescapes
-a backslash and strips double quotes; see Known limits (c)).
+**`MYAIR_PASSWORD` must not contain `\` or `"`, and must not START with `'` or `"`**
+(systemd's `EnvironmentFile=` unescapes a backslash, strips double quotes and drops a
+leading quote; an apostrophe *inside* or at the *end* is fine - see Known limits (c)).
 
 `$` handling: the materialiser writes every `$` in a `.env` value as `$$`
 (compose interpolates), and systemd's `EnvironmentFile=` does **not** undo it. The
@@ -401,11 +402,17 @@ Nothing here restarts a container; the feeder is a host systemd unit.
    literal value. If only the final directory `fsync` fails after the replace, the
    file *is* changed: the helper prints a WARNING that durability is uncertain and
    exits 0. At the start of every apply or restore, under the lock, it also deletes
-   any stale `.env.tmp-*` file a hard-killed earlier run left beside `.env`.
+   any stale `.tmp-.env-*` file a hard-killed earlier run left beside `.env` (temp
+   names are scoped to the target's own name, so a different env file in the same
+   directory is never swept).
 
    `SLEEP_FEED_URL` is the loopback tracker URL, the same value the weight and AI
    feeders use (the tracker publishes `127.0.0.1:8787:8787`). The password must not
-   contain `\` or `"`.
+   contain `\` or `"` or start with `'` or `"`; the helper refuses such a value, and
+   refuses any value that starts with a quote with no matching closing quote. An
+   apostrophe inside the password or at its end is allowed (measured, see Known
+   limits (c)). All three parsers - the helper, `setup-sleep.sh` and first boot -
+   strip exactly one matching pair of surrounding quotes and nothing else.
 5. **Hub: verify the effective values before installing.**
    `sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --report` prints, for
    each key, only `set` / `empty` / `absent`, plus the literal value of the two
@@ -433,7 +440,7 @@ Nothing here restarts a container; the feeder is a host systemd unit.
      body is also a post (a grey, empty bar), so a grey bar proves delivery too.
    - `sudo systemctl is-enabled homehub-sleep.timer` prints `enabled`.
    - No stale temp file holds secrets next to the config:
-     `sudo find /opt/homehub/stack -maxdepth 1 -name '.env.tmp-*'` must print
+     `sudo find /opt/homehub/stack -maxdepth 1 -name '.tmp-.env-*'` must print
      nothing. A hard-killed run can leave one; `sudo rm` it (the next apply or
      restore would also sweep it).
 8. **Roll back.** Stop **both** units - a oneshot that is already mid-run can still
@@ -446,7 +453,7 @@ Nothing here restarts a container; the feeder is a host systemd unit.
    atomic writer. Do **not** use `sh -c 'cat backup > .env'`: the shell empties
    `.env` before it opens the backup, so a mistyped backup name destroys the config.
    (`mv`, `cp --remove-destination` and `sed -i` are not atomic-with-validation
-   either: use the helper.) Afterwards re-run the `find` for `.env.tmp-*` from step 7.
+   either: use the helper.) Afterwards re-run the `find` for `.tmp-.env-*` from step 7.
    The account and state directory are inert and may stay.
 
 Not proven: every step above, on a real hub (see "Known limits"). The helper itself
@@ -498,7 +505,13 @@ Each is accepted, with the reason.
   `"`.** systemd unescapes a backslash and strips double quotes in `.env` values, so
   such a password reaches the feeder altered, and the sign-in is refused exactly as
   an expired login would be. Choose a myAir password without those two characters.
-  The current password has none (verified). A `$` is safe: the feeder collapses the
+  **Apostrophes, measured 2026-10-11** on systemd 255.4 (WSL Ubuntu) with fake
+  values through `systemd-run -p EnvironmentFile=`: `pa'ss`, `pass'` and
+  `pa'ss'word` arrive unchanged; a value that **starts** with `'` loses that quote
+  even with no closing one (`'pass` becomes `pass`), and `'pass'` becomes `pass`;
+  `''` is empty. So an apostrophe is safe anywhere except as the first character,
+  which the helper refuses. Other systemd versions were not measured.
+  The current password has none of these (verified). A `$` is safe: the feeder collapses the
   materialiser's `$$`.
 - **(d) The unused-night shape is unproven.** Every probed night had usage, so it is
   unknown whether myAir returns an unused night as a record or as no record. Both

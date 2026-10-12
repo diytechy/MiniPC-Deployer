@@ -62,6 +62,43 @@ Manual unpacking into `app/gateway` is superseded by it: the release script
 keeps the retention and the markers that make a rollback possible, and a hand
 copy leaves neither.
 
+## Derived AI rings (`gaugeRings`)
+
+`install-renderer-config.py` also derives the panel's AI ring list from the hub
+`.env`, so adding a usage source is the only edit (SR-081, LLR-1121..1125). The
+panel reads `gaugeRings` from the hub-served `config.json` once at boot, so a
+change reaches the wall only after the kiosk shell restarts.
+
+- **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`. Unless
+  `AI_USAGE_ENABLED` is `true` the destination is byte-identical to the source.
+- **Output.** `"gaugeRings": {"slots": [...], "unlisted": "hide", "derivedFrom":
+  "AI_USAGE_SOURCES"}`. Slot order is claude, claude2, codex, grok, gemini,
+  opencode, freellmapi, filtered to the listed sources; unknown listed names follow
+  in listed order. Names are lower-cased and de-duplicated; a name that is not
+  letters and digits is dropped (the renderer would drop it anyway). `claude` and
+  `claude2` carry `mark: "claude"`, and badges `"1"`/`"2"` only when both are
+  listed. `"hide"` makes the rings follow the sources exactly. An empty source
+  list derives nothing. FreeLLMAPI gets no special handling here.
+- **Authority.** The SOURCE file (`/opt/homehub/site/config.json`) is never
+  modified. The destination is regenerated from source plus `.env` on every run
+  (firstboot runs it on every boot). Everything else in the document is
+  preserved in order; the output uses the source's indentation.
+- **Ownership.** A source `gaugeRings` block is derived over only when it is
+  absent, carries `derivedFrom`, or equals the shipped default
+  `{"slots": [], "unlisted": "append"}`. Any other block, including
+  `{"slots": [], "unlisted": "hide"}`, is Owner-written: it is installed exactly
+  as written and one `gaugeRings:` line is logged.
+- **Hand-authoring rings.** Put your own `gaugeRings` block in the source copy,
+  without `derivedFrom`. Slot fields are `provider`, optional `mark`, optional
+  `badge`; see OfficeWallNaglight `docs/config-reference.md`.
+- **Converge in place:**
+
+      sudo python3 install-renderer-config.py --env /opt/homehub/stack/.env \
+          --source /opt/homehub/site/config.json \
+          --destination /opt/homehub/stack/wall-shell/config.json
+
+  then restart the kiosk shell to see it.
+
 ## Hub preparation and coordinated cutover
 
 1. Build the matching OfficeWallNaglight site, app and gateway payloads. Stage

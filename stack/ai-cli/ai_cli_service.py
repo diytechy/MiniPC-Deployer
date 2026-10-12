@@ -125,11 +125,11 @@ FORBIDDEN_ACCOUNTS = frozenset({"hub", "root"})
 PRIVILEGED_GROUPS = frozenset({"sudo", "admin", "wheel", "root", "docker", "adm"})
 
 #: The default search path for the pinned CLI binaries. Overridable with
-#: AI_CLI_BIN_PATH because the Owner installs the CLIs by hand over SSH
-#: (SN-016, deliberately outside the offline closure) and may put them
-#: somewhere else - but NEVER from a registry row's `Env=`, which is the
-#: injection surface the review found: a template that can set PATH can point
-#: the pinned name at a planted binary.
+#: AI_CLI_BIN_PATH because the CLIs are provisioned by provision-ai-clis.sh
+#: (which links them from /usr/local/bin; supersedes SN-016's hand install)
+#: and an Owner may still put them somewhere else - but NEVER from a registry
+#: row's `Env=`, which is the injection surface the review found: a template
+#: that can set PATH can point the pinned name at a planted binary.
 DEFAULT_BIN_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 #: Environment variables a registry row's `Env=` cell may set, and the values

@@ -440,6 +440,29 @@ def main():
             "autoinstall file missing: stack/{}".format(ref),
         )
 
+    # 4a. AI CLI integration (SR-079/080): the account/status/updater scripts exist,
+    # .env.example carries the provisioning knobs exactly once plus a default
+    # credential path for every source it lists, and firstboot only ever
+    # SCHEDULES provisioning (a --run there would wait on a download).
+    for ref in ("ai-cli/ensure-ai-account.sh", "ai-cli/ai-cli-status.sh",
+                "ai-cli/install-updater-controls.sh"):
+        check((stack / ref).exists(),
+              "AI CLI integration file present: stack/{}".format(ref),
+              "AI CLI integration file missing: stack/{}".format(ref))
+    env_lines = env_example.splitlines()
+    for knob in ("AI_CLI_PROVISION", "AI_CLI_PROVISION_RETRY_MINUTES",
+                 "AI_USAGE_CLAUDE_CREDENTIALS", "AI_USAGE_CLAUDE2_CREDENTIALS",
+                 "AI_USAGE_GEMINI_CREDENTIALS", "AI_USAGE_OPENCODE_AUTH"):
+        n = sum(1 for l in env_lines if re.match(r"{}=.+".format(knob), l))
+        check(n == 1, ".env.example sets {} exactly once".format(knob),
+              ".env.example sets {} {} times (want 1, with a value)".format(knob, n))
+    firstboot_text = load(stack / "autoinstall" / "firstboot.sh")
+    check("provision-ai-clis.sh\" --schedule" in firstboot_text
+          and "provision-ai-clis.sh --run" not in firstboot_text
+          and "provision-ai-clis.sh\" --run" not in firstboot_text,
+          "firstboot schedules AI CLI provisioning and never runs it inline",
+          "firstboot must call provision-ai-clis.sh --schedule and never --run")
+
     # 4b. EVERY SHIPPED SYSTEMD UNIT IS ACTUALLY INSTALLED BY SOMETHING.
     #
     # Check 4 asks "does the file this list names exist?", which is the wrong

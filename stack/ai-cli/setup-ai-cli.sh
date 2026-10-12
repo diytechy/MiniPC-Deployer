@@ -30,17 +30,20 @@
 # none. The script REFUSES to proceed if the account has picked one up.
 #
 # Adds NO apt package: the service is Python 3 stdlib only and python3 is
-# already in packages.list. The CLIs themselves are not apt packages either
-# (SN-016) and are installed over SSH by the Owner, deliberately outside the
-# offline closure.
+# already in packages.list. The CLIs themselves are not apt packages either:
+# provision-ai-clis.sh installs the pinned vendor artifacts (supersedes SN-016's
+# hand install, Owner 2026-10-11) and this script no longer refuses for a CLI
+# that has not arrived yet - the status step reports it as provisioning.
 #
 # Usage: setup-ai-cli.sh [--check-only | --emit-dropin DIR]
 # Exit 0 = converged (or disabled). 1 = failed. 2 = refused (privilege found).
+# The account itself is created and certified by ensure-ai-account.sh.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${AI_CLI_ENV_FILE:-$HERE/../.env}"
-DROPIN_DIR_DEFAULT=/etc/systemd/system/homehub-ai-cli.service.d
+UNIT_DIR="${AI_CLI_UNIT_DIR:-/etc/systemd/system}"   # seam: a test runs unprivileged
+DROPIN_DIR_DEFAULT="$UNIT_DIR/homehub-ai-cli.service.d"
 MODE="${1:-}"
 
 # Defaults mirror stack/.env.example; the .env wins where it sets a key.
@@ -118,42 +121,19 @@ fi
 
 [ "$(id -u)" = 0 ] || die "must run as root to create the service account"
 
-# ── Create the account, idempotently. ──────────────────────────────────────
-if id -u "$AI_CLI_USER" >/dev/null 2>&1; then
-    log "account $AI_CLI_USER already exists"
-else
-    # A real shell (RDP sign-in needs one) and its own home, where the CLI
-    # credential will land at 0600 after `claude setup-token`. NOT in sudo,
-    # NOT in docker, NOT in adm.
-    useradd --create-home --shell /bin/bash --comment "HomeHub AI CLI service" \
-        "$AI_CLI_USER" || die "useradd $AI_CLI_USER"
-    log "created $AI_CLI_USER (no sudo, no docker)"
-fi
-chmod 0700 "/home/$AI_CLI_USER" 2>/dev/null || true
-
-# ── Refusal 3: the account must still be unprivileged. Re-checked EVERY run,
-# because an account created without sudo can be given it later, and this is
-# the thing the block is about.
-groups_now="$(id -nG "$AI_CLI_USER" 2>/dev/null || true)"
-for bad in sudo admin wheel root docker adm; do
-    case " $groups_now " in
-        *" $bad "*) refuse "$AI_CLI_USER is in group '$bad' — a dedicated \
-account that was then given sudo (or docker) is not a containment" ;;
-    esac
-done
-# The sudoers search is the service's, not a second grep: it FOLLOWS #include /
-# #includedir / @include, which the reviewed shell grep did not, so a NOPASSWD
-# grant one file away was invisible to it.
-AI_CLI_HERE="$HERE" python3 - "$AI_CLI_USER" <<'PY' || refuse "$AI_CLI_USER is named in (or reachable from) a sudoers rule"
-import sys, os
-sys.path.insert(0, os.environ["AI_CLI_HERE"])
-import ai_cli_service as svc
-try:
-    svc.assert_service_account(sys.argv[1], sudoers_lines=svc.collect_sudoers_lines())
-except svc.ConfigError as exc:
-    sys.stderr.write("setup-ai-cli: %s\n" % exc)
-    sys.exit(1)
-PY
+# ── The account: created if absent, and certified unprivileged EVERY run. This
+# is ensure-ai-account.sh's job now (shared with firstboot and setup-ai-usage.sh,
+# so the box has one place that decides what "unprivileged" means). Its refusals
+# - sudo/docker group membership, a sudoers rule, hub/root - are this script's
+# refusals: exit 2 passes straight through.
+ENSURE_ACCOUNT="${AI_CLI_ENSURE_ACCOUNT:-$HERE/ensure-ai-account.sh}"
+ensure_rc=0
+bash "$ENSURE_ACCOUNT" "$AI_CLI_USER" || ensure_rc=$?
+case "$ensure_rc" in
+    0) ;;
+    2) refuse "$AI_CLI_USER was not certified as an unprivileged account (reason above)" ;;
+    *) die "ensure-ai-account.sh $AI_CLI_USER" ;;
+esac
 
 # ── The scratch root: 0700, owned by the account, and empty at install. ────
 install -d -m 0700 -o "$AI_CLI_USER" -g "$AI_CLI_USER" "$AI_CLI_SCRATCH_ROOT"
@@ -162,7 +142,8 @@ log "scratch root $AI_CLI_SCRATCH_ROOT is 0700 $AI_CLI_USER"
 # ── The unit, plus the account drop-in generated from AI_CLI_USER. Installed
 # and enabled, and NOT started here: starting it is a deployment step the Owner
 # runs, and this script also runs on every boot.
-install -m 0644 "$HERE/homehub-ai-cli.service" /etc/systemd/system/homehub-ai-cli.service
+install -d -m 0755 "$UNIT_DIR"
+install -m 0644 "$HERE/homehub-ai-cli.service" "$UNIT_DIR/homehub-ai-cli.service"
 emit_dropin "$DROPIN_DIR_DEFAULT"
 chmod 0644 "$DROPIN_DIR_DEFAULT/10-account.conf"
 systemctl daemon-reload
@@ -179,5 +160,13 @@ runuser -u "$AI_CLI_USER" -- env \
     python3 "$HERE/ai_cli_service.py" --check \
     || die "ai_cli_service.py --check refused as $AI_CLI_USER"
 
-log "converged. The Owner still has to sign the CLIs in as $AI_CLI_USER over RDP"
-log "(claude setup-token; the credential lands in ~$AI_CLI_USER/.claude at 0600)"
+# The vendor updaters are switched off system-wide (plan 3.5); the provisioner's
+# wrappers export the matching environment variables as well.
+AI_CLI_ETC_DIR="${AI_CLI_ETC_DIR:-$(dirname "$(dirname "$UNIT_DIR")")}" \
+    bash "${AI_CLI_UPDATER_CONTROLS:-$HERE/install-updater-controls.sh}" \
+    || log "WARNING: could not write the vendor updater settings; the wrappers still export the controls."
+
+log "converged."
+# What is still owed is a SIGN-IN, never a package: the CLIs are provisioned by
+# provision-ai-clis.sh. The status step names exactly the logins that remain.
+AI_CLI_ENV_FILE="$ENV_FILE" bash "${AI_CLI_STATUS:-$HERE/ai-cli-status.sh}" || true

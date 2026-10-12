@@ -1311,7 +1311,10 @@ def test_the_refresher_never_names_the_home_with_percent_h():
     offenders = [l for l in directives if "%h" in l]
     assert not offenders, "%%h resolves to /root in a system unit: %r" % offenders
     setup = (REPO / "stack" / "ai-usage" / "setup-ai-usage.sh").read_text(encoding="utf-8")
-    assert 'getent passwd "$AI_USAGE_USER_ACCOUNT"' in setup
+    # The home is resolved for the EFFECTIVE account (AI_CLI_USER when the CLI
+    # service is enabled, else AI_USAGE_USER_ACCOUNT), never for the raw knob.
+    assert 'getent passwd "$ACCOUNT"' in setup
+    assert 'getent passwd "$AI_USAGE_USER_ACCOUNT"' not in setup
 
 
 def test_the_refresher_discards_its_output():
@@ -1326,7 +1329,8 @@ def test_setup_installs_and_enables_the_refresher():
     assert "homehub-claude-refresh@.service" in setup
     assert "homehub-claude-refresh@.timer" in setup
     # Account 1 is enabled unconditionally, exactly as the un-templated unit was.
-    assert "systemctl enable --now homehub-claude-refresh@claude.timer" in setup
+    assert 'NEW_TIMER="homehub-claude-refresh@claude.timer"' in setup
+    assert 'systemctl enable --now "$NEW_TIMER"' in setup
     # It runs as the same account as the feeder, from the same single knob.
     assert "homehub-claude-refresh@claude.service.d" in setup
 

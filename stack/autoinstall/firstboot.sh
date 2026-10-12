@@ -2249,6 +2249,64 @@ elif [ "$ICEDRIVE_MODE" = "off" ]; then
     log "ICEDRIVE_MODE=off - no IceDrive client of either kind on this box."
 fi
 
+# ── 6c-ai. provision what the enabled AI consumers need (SR-079, SR-080) ─────
+# Owner 2026-10-11: the box provisions what its configuration needs instead of
+# erroring on a missing account or CLI; only the vendor sign-ins stay human.
+# Two steps, both cheap and neither able to wait on a download:
+#   1. the ONE effective account (AI_CLI_USER when AI_CLI_ENABLED, else
+#      AI_USAGE_USER_ACCOUNT) is created and certified BEFORE 6d/6e, which would
+#      otherwise have refused its absence;
+#   2. provision-ai-clis.sh --schedule enables the retry timer and starts the
+#      supervised download unit with --no-block. NEVER --run here: a download
+#      inside firstboot is exactly the wait this unit exists to avoid.
+# A failure is a WARNING, never fatal - the same posture as 6d/6e.
+AI_EFFECTIVE_ACCOUNT=""
+ai_cli_provision_hook() {
+    local cli_en usage_en cli_user usage_acct src_dir
+    cli_en="$(_env_val AI_CLI_ENABLED | tr -d '"')" || cli_en=""
+    usage_en="$(_env_val AI_USAGE_ENABLED | tr -d '"')" || usage_en=""
+    if [ "$cli_en" != "true" ] && [ "$usage_en" != "true" ]; then
+        return 0
+    fi
+    src_dir="$STACK_DIR/ai-cli"
+    cli_user="$(_env_val AI_CLI_USER | tr -d '"')" || cli_user=""
+    usage_acct="$(_env_val AI_USAGE_USER_ACCOUNT | tr -d '"')" || usage_acct=""
+    # Every step below can fail without taking firstboot with it (set -e).
+    if [ ! -f "$src_dir/ensure-ai-account.sh" ]; then
+        log "  WARNING: no $src_dir/ensure-ai-account.sh on the payload - carriage"
+        log "    missing for an activated feature."
+        return 0
+    fi
+    AI_EFFECTIVE_ACCOUNT="$(bash "$src_dir/ensure-ai-account.sh" --effective "$cli_en" "$cli_user" "$usage_acct" 2>/dev/null)" \
+        || AI_EFFECTIVE_ACCOUNT=""
+    if [ -z "$AI_EFFECTIVE_ACCOUNT" ]; then
+        log "  WARNING: could not work out the AI service account; skipping provisioning."
+        return 0
+    fi
+    log "AI consumers enabled - service account is $AI_EFFECTIVE_ACCOUNT"
+    if bash "$src_dir/ensure-ai-account.sh" "$AI_EFFECTIVE_ACCOUNT" 2>&1 | sed 's/^/  /'; then
+        :
+    else
+        log "  WARNING: could not create or certify $AI_EFFECTIVE_ACCOUNT - the reason is above."
+        return 0
+    fi
+    # --schedule installs the provisioning units itself, enables the retry timer
+    # and starts the supervised run with --no-block. NEVER --run here.
+    if [ -f "$src_dir/provision-ai-clis.sh" ]; then
+        if bash "$src_dir/provision-ai-clis.sh" --schedule 2>&1 | sed 's/^/  /'; then
+            log "  AI CLI provisioning scheduled (runs in its own unit; retries until done)"
+        else
+            log "  WARNING: provisioning could not be scheduled; re-run by hand:"
+            log "      sudo bash $src_dir/provision-ai-clis.sh --schedule"
+        fi
+    else
+        log "  WARNING: no $src_dir/provision-ai-clis.sh on the payload - carriage"
+        log "    missing for an activated feature."
+    fi
+    return 0
+}
+ai_cli_provision_hook || log "  WARNING: AI provisioning hook failed; continuing."
+
 # ── 6d. the AI CLI service (SR-019, A40 ratified 2026-09-09) ─────────────────
 # A plain service, no container. Gated exactly like REMOTE_UI_ENABLED, and OFF
 # by default: with the knob false the account is not created, the unit is not
@@ -2276,8 +2334,8 @@ if [ "${AI_CLI_ENABLED:-false}" = "true" ]; then
     if [ -f "$STACK_DIR/ai-cli/setup-ai-cli.sh" ]; then
         if bash "$STACK_DIR/ai-cli/setup-ai-cli.sh" 2>&1 | sed 's/^/  /'; then
             log "  AI CLI service installed and enabled on ${AI_CLI_BIND:-127.0.0.1}:${AI_CLI_PORT:-8791}"
-            log "  STILL OWED BY A HUMAN: sign the CLIs in as ${AI_CLI_USER:-homehub-ai}"
-            log "    over RDP (claude setup-token). The credential does not survive a"
+            log "  Any sign-in still owed is listed in the AI status summary below"
+            log "    (PROVISIONING / LOGINS OWED). Credentials do not survive a"
             log "    reimage - the same posture as IceDrive."
         else
             log "  WARNING: setup-ai-cli.sh refused or failed - this box has NO AI CLI"
@@ -2381,7 +2439,8 @@ if [ "${AI_USAGE_ENABLED:-false}" = "true" ]; then
         if bash "$STACK_DIR/ai-usage/setup-ai-usage.sh" 2>&1 | sed 's/^/  /'; then
             log "  AI-usage feeder installed; timer runs every 10 minutes"
             log "  STILL OWED BY A HUMAN: the vendor sign-ins live in"
-            log "    ${AI_USAGE_USER_ACCOUNT:-homehub-ai}'s home and do not survive a"
+            log "    ${AI_EFFECTIVE_ACCOUNT:-${AI_USAGE_USER_ACCOUNT:-homehub-ai}}'s home (the account the units run as)"
+            log "    and do not survive a"
             log "    reimage. A source with no credential posts 'unavailable', which"
             log "    is correct behaviour and not a fault to chase."
         else
@@ -2393,6 +2452,14 @@ if [ "${AI_USAGE_ENABLED:-false}" = "true" ]; then
     else
         log "  WARNING: AI_USAGE_ENABLED=true but no $STACK_DIR/ai-usage/setup-ai-usage.sh"
         log "    on the payload - carriage missing for an activated feature."
+    fi
+fi
+
+# What provisioning and the sign-ins look like right now (PROVISIONING / LOGINS
+# OWED lines). Informational only; it never fails firstboot.
+if [ "${AI_CLI_ENABLED:-false}" = "true" ] || [ "${AI_USAGE_ENABLED:-false}" = "true" ]; then
+    if [ -f "$STACK_DIR/ai-cli/ai-cli-status.sh" ]; then
+        bash "$STACK_DIR/ai-cli/ai-cli-status.sh" 2>&1 | sed 's/^/  /' || true
     fi
 fi
 

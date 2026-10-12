@@ -2435,6 +2435,10 @@ def main(argv=None):
                                             "posted" if ok else "POST FAILED"))
     for line in failures:
         print("ai-usage: %s" % line, file=sys.stderr)
+    # ONE line that says this invocation reached its end. ai-cli-status.sh reads
+    # it (with the journal's invocation id) to tell a completed cycle from one
+    # that died part-way; without it a half-printed cycle looks like evidence.
+    print("ai-usage: cycle complete gauges=%d failures=%d" % (len(posted), len(failures)))
     return 1 if failures else 0
 
 

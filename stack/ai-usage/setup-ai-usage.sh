@@ -8,23 +8,31 @@
 # that is not a container: there is no compose profile to join, so the knob is
 # the gate, exactly as it is for AI_CLI_ENABLED and REMOTE_UI_ENABLED.
 #
-# IT CREATES NO ACCOUNT. The feeder deliberately runs as the account the AI
-# CLIs are signed into (AI_USAGE_USER_ACCOUNT, normally the same as
-# AI_CLI_USER) because the credentials it READS live in that account's home.
-# Creating and certifying an account is setup-ai-cli.sh's job and duplicating
-# it here would give the box two places that decide what "unprivileged" means.
-# This script therefore REFUSES a missing account rather than making one.
+# ONE EFFECTIVE ACCOUNT, created when absent (plan 3.4, Owner 2026-10-11). The
+# feeder runs as the account the AI CLIs are signed into, because the
+# credentials it READS live in that account's home. That account is
+# AI_CLI_USER when AI_CLI_ENABLED=true, else AI_USAGE_USER_ACCOUNT. Both
+# consumers share StateDirectory=homehub-ai, so two differently named accounts
+# would fight over its ownership: when the names differ this script does NOT
+# refuse - it uses the effective account EVERYWHERE (unit User=, Codex-home
+# ownership, REFRESH_HOME, every refresher drop-in) and logs one line. Creating
+# and certifying the account is ensure-ai-account.sh's job, shared with
+# setup-ai-cli.sh and firstboot, so there is still one place that decides what
+# "unprivileged" means. hub and root are still refused. Credentials owned by a
+# previous account are never migrated; ai-cli-status.sh reports them.
 #
 # THE ACCOUNT THIS SCRIPT CHECKS IS THE ACCOUNT SYSTEMD RUNS. Same construction
 # as setup-ai-cli.sh after the 2026-09-09 cross-review: the unit ships a
 # default name and this script writes User=/Group= into a drop-in from the
-# knob, so a knob nobody read cannot diverge from a unit nobody edited.
+# effective account, so a knob nobody read cannot diverge from a unit nobody
+# edited.
 #
 # Adds NO apt package: python3 stdlib only, and python3 is already in
 # packages.list. No apt export is owed.
 #
 # Usage: setup-ai-usage.sh [--check-only]
-# Exit 0 = converged (or disabled). 1 = failed. 2 = refused.
+# Exit 0 = converged (or disabled). 1 = failed. 2 = refused. 3 = converged EXCEPT the
+# legacy Claude refresher could not be retired yet (migration deferred, old unit kept).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,11 +46,17 @@ AI_USAGE_USER="${AI_USAGE_USER:-}"
 AI_USAGE_USER_ACCOUNT="${AI_USAGE_USER_ACCOUNT:-homehub-ai}"
 AI_USAGE_FEED_URL="${AI_USAGE_FEED_URL:-}"
 AI_USAGE_SOURCES="${AI_USAGE_SOURCES:-codex,claude,opencode}"
+AI_CLI_ENABLED="${AI_CLI_ENABLED:-false}"
+AI_CLI_USER="${AI_CLI_USER:-}"
+ENSURE_ACCOUNT="${AI_CLI_ENSURE_ACCOUNT:-$HERE/../ai-cli/ensure-ai-account.sh}"
+# The unit hard-codes this path (CODEX_HOME + ReadWritePaths); the override exists
+# only so a test can point setup at a sandbox.
+CODEX_HOME_DIR="${AI_USAGE_CODEX_HOME:-/var/lib/homehub-ai-codex}"
 
 if [ -f "$ENV_FILE" ]; then
     # Read only the keys we own, and never `source` a file that may hold
     # secrets into this shell's environment wholesale.
-    for key in AI_USAGE_ENABLED AI_USAGE_USER AI_USAGE_USER_ACCOUNT AI_USAGE_FEED_URL AI_USAGE_SOURCES; do
+    for key in AI_USAGE_ENABLED AI_USAGE_USER AI_USAGE_USER_ACCOUNT AI_USAGE_FEED_URL AI_USAGE_SOURCES AI_CLI_ENABLED AI_CLI_USER; do
         value="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
         [ -n "$value" ] && printf -v "$key" '%s' "$value"
     done
@@ -60,6 +74,26 @@ source_enabled() {
         *",$1,"*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# A state directory the account will write: created (0700, the account's) only
+# when ABSENT. One that already exists is left exactly as it is - never chowned
+# or chmodded - because it may hold the previous account's credentials, which are
+# never migrated (a chown would hand the directory to an account that cannot
+# read the 0600 files inside it, and lock the previous owner out).
+own_dir() {
+    local owner
+    if [ ! -e "$1" ]; then
+        install -d -m 0700 -o "$ACCOUNT" -g "$ACCOUNT" "$1"
+        return 0
+    fi
+    owner="$(stat -c %U "$1" 2>/dev/null || true)"
+    if [ -n "$owner" ] && [ "$owner" != "$ACCOUNT" ]; then
+        say "NOTE: $1 already exists and belongs to $owner, not $ACCOUNT. It is left"
+        say "  as it is: credentials are never moved between accounts. The status"
+        say "  step below reports what that means for the sign-ins."
+    fi
+    return 0
 }
 
 if [ "$AI_USAGE_ENABLED" != "true" ]; then
@@ -82,22 +116,32 @@ fi
     "AI_USAGE_FEED_URL is blank. There is no default - the tracker is
     bridge-only, so the right value depends on this box."
 
-case "$AI_USAGE_USER_ACCOUNT" in
-    hub|root) refuse "AI_USAGE_USER_ACCOUNT=$AI_USAGE_USER_ACCOUNT. \`hub\` carries
+# The effective account (see the header). Everything below uses ACCOUNT; the
+# raw AI_USAGE_USER_ACCOUNT is read once, here, and never again.
+ACCOUNT="$(bash "$ENSURE_ACCOUNT" --effective "$AI_CLI_ENABLED" "$AI_CLI_USER" "$AI_USAGE_USER_ACCOUNT")"
+if [ "$AI_CLI_ENABLED" = "true" ] && [ "$ACCOUNT" != "$AI_USAGE_USER_ACCOUNT" ]; then
+    say "usage feeder and AI CLI service share one account: $ACCOUNT (AI_CLI_USER)."
+fi
+
+case "$ACCOUNT" in
+    hub|root) refuse "the service account is $ACCOUNT. \`hub\` carries
         (ALL) NOPASSWD: ALL and root needs no explanation; the feeder runs as the
         dedicated unprivileged account the CLIs are signed into." ;;
 esac
 
-if ! id -u "$AI_USAGE_USER_ACCOUNT" >/dev/null 2>&1; then
-    refuse "no account \`$AI_USAGE_USER_ACCOUNT\` on this box. It is created and
-    certified by setup-ai-cli.sh (AI_CLI_ENABLED=true); this script will not
-    make a second place that decides what unprivileged means."
-fi
-
 if [ "$MODE" = "--check-only" ]; then
-    say "check-only: identity set, destination set, account $AI_USAGE_USER_ACCOUNT exists."
+    say "check-only: identity set, destination set, account $ACCOUNT (created at install if absent)."
     exit 0
 fi
+
+# Create and certify the account instead of refusing its absence.
+ensure_rc=0
+bash "$ENSURE_ACCOUNT" "$ACCOUNT" || ensure_rc=$?
+case "$ensure_rc" in
+    0) ;;
+    2) refuse "$ACCOUNT was not certified as an unprivileged account (reason above)." ;;
+    *) say "FAILED: could not create or certify $ACCOUNT"; exit 1 ;;
+esac
 
 # CODEX'S WRITABLE HOME, owned by the account and holding nothing else.
 # `codex app-server` cannot run with nowhere to write -- it opens SQLite
@@ -107,7 +151,10 @@ fi
 # child: the feeder's write guard bounds writes to inside StateDirectory, and
 # that bound is only meaningful while nothing in there is a credential.
 # See the note in homehub-ai-usage.service.
-install -d -m 0700 -o "$AI_USAGE_USER_ACCOUNT" -g "$AI_USAGE_USER_ACCOUNT"     /var/lib/homehub-ai-codex
+# CREATED ALWAYS, whatever AI_USAGE_SOURCES says: homehub-ai-usage.service lists
+# it in ReadWritePaths= unconditionally, and a missing path there fails the
+# unit's namespace setup before the feeder runs (e.g. sources=claude,gemini).
+own_dir "$CODEX_HOME_DIR"
 
 install -d -m 0755 "$UNIT_DIR"
 install -m 0644 "$HERE/homehub-ai-usage.service" "$UNIT_DIR/homehub-ai-usage.service"
@@ -132,11 +179,11 @@ fi
 # The drop-in is what makes the knob and the unit the same fact.
 install -d -m 0755 "$DROPIN_DIR"
 cat > "$DROPIN_DIR/10-account.conf" <<EOF
-# GENERATED by setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT. Do not hand-edit:
+# GENERATED by setup-ai-usage.sh from the effective account. Do not hand-edit:
 # the account certified and the account systemd runs must be one value.
 [Service]
-User=$AI_USAGE_USER_ACCOUNT
-Group=$AI_USAGE_USER_ACCOUNT
+User=$ACCOUNT
+Group=$ACCOUNT
 EOF
 chmod 0644 "$DROPIN_DIR/10-account.conf"
 
@@ -149,8 +196,8 @@ chmod 0644 "$DROPIN_DIR/10-account.conf"
 # expands to the manager's home (/root), and systemd then refuses to start at
 # all with 226/NAMESPACE. One knob decides the account; the same knob decides
 # where its credential lives.
-REFRESH_HOME="$(getent passwd "$AI_USAGE_USER_ACCOUNT" | cut -d: -f6)"
-[ -n "$REFRESH_HOME" ] || refuse     "cannot resolve the home directory of $AI_USAGE_USER_ACCOUNT, so the
+REFRESH_HOME="$(getent passwd "$ACCOUNT" | cut -d: -f6)"
+[ -n "$REFRESH_HOME" ] || refuse     "cannot resolve the home directory of $ACCOUNT, so the
     credential refresher has no path to re-open for writing."
 
 # Account 1: the CLI's DEFAULT config, exactly the two paths the un-templated
@@ -158,10 +205,10 @@ REFRESH_HOME="$(getent passwd "$AI_USAGE_USER_ACCOUNT" | cut -d: -f6)"
 CLAUDE1_DROPIN_DIR="$UNIT_DIR/homehub-claude-refresh@claude.service.d"
 install -d -m 0755 "$CLAUDE1_DROPIN_DIR"
 cat > "$CLAUDE1_DROPIN_DIR/10-account.conf" <<EOF
-# GENERATED by setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT. Do not hand-edit.
+# GENERATED by setup-ai-usage.sh from the effective account. Do not hand-edit.
 [Service]
-User=$AI_USAGE_USER_ACCOUNT
-Group=$AI_USAGE_USER_ACCOUNT
+User=$ACCOUNT
+Group=$ACCOUNT
 ReadWritePaths=$REFRESH_HOME/.claude $REFRESH_HOME/.claude.json
 EOF
 chmod 0644 "$CLAUDE1_DROPIN_DIR/10-account.conf"
@@ -176,13 +223,13 @@ chmod 0644 "$CLAUDE1_DROPIN_DIR/10-account.conf"
 CLAUDE2_DROPIN_DIR="$UNIT_DIR/homehub-claude-refresh@claude2.service.d"
 CLAUDE2_CONFIG_DIR="$REFRESH_HOME/.claude-2"
 if source_enabled claude2; then
-    install -d -m 0700 -o "$AI_USAGE_USER_ACCOUNT" -g "$AI_USAGE_USER_ACCOUNT" "$CLAUDE2_CONFIG_DIR"
+    own_dir "$CLAUDE2_CONFIG_DIR"
     install -d -m 0755 "$CLAUDE2_DROPIN_DIR"
     cat > "$CLAUDE2_DROPIN_DIR/10-account.conf" <<EOF
-# GENERATED by setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT. Do not hand-edit.
+# GENERATED by setup-ai-usage.sh from the effective account. Do not hand-edit.
 [Service]
-User=$AI_USAGE_USER_ACCOUNT
-Group=$AI_USAGE_USER_ACCOUNT
+User=$ACCOUNT
+Group=$ACCOUNT
 Environment=CLAUDE_CONFIG_DIR=$CLAUDE2_CONFIG_DIR
 ReadWritePaths=$CLAUDE2_CONFIG_DIR
 EOF
@@ -193,13 +240,13 @@ fi
 # which is therefore the one directory its keeper may write.
 GEMINI_DROPIN_DIR="$UNIT_DIR/homehub-gemini-refresh.service.d"
 if source_enabled gemini; then
-    install -d -m 0700 -o "$AI_USAGE_USER_ACCOUNT" -g "$AI_USAGE_USER_ACCOUNT" "$REFRESH_HOME/.gemini"
+    own_dir "$REFRESH_HOME/.gemini"
     install -d -m 0755 "$GEMINI_DROPIN_DIR"
     cat > "$GEMINI_DROPIN_DIR/10-account.conf" <<EOF
-# GENERATED by setup-ai-usage.sh from AI_USAGE_USER_ACCOUNT. Do not hand-edit.
+# GENERATED by setup-ai-usage.sh from the effective account. Do not hand-edit.
 [Service]
-User=$AI_USAGE_USER_ACCOUNT
-Group=$AI_USAGE_USER_ACCOUNT
+User=$ACCOUNT
+Group=$ACCOUNT
 ReadWritePaths=$REFRESH_HOME/.gemini
 EOF
     chmod 0644 "$GEMINI_DROPIN_DIR/10-account.conf"
@@ -233,95 +280,275 @@ fi
 # Disabling is best-effort and idempotent: on a box that never had the old pair
 # every line here is a no-op.
 LEGACY_REFRESH="homehub-claude-refresh"
-if [ -e "$UNIT_DIR/$LEGACY_REFRESH.timer" ] || [ -e "$UNIT_DIR/$LEGACY_REFRESH.service" ] \
-        || [ -d "$UNIT_DIR/$LEGACY_REFRESH.service.d" ]; then
-    if command -v systemctl >/dev/null 2>&1; then
-        # Stop the TIMER first, so no new run can begin, then WAIT for a run that
-        # is already going. The service is deliberately never `stop`ped: a
-        # `claude -p /usage` killed in the middle of a token rotation can lose
-        # the single-use refresh token, and the Owner would have to sign in
-        # again. The wait is bounded (longer than the unit's own
-        # TimeoutStartSec=180, so a healthy run has finished or been timed out by
-        # systemd itself); if it still has not finished we say so and carry on.
-        systemctl disable --now "$LEGACY_REFRESH.timer" >/dev/null 2>&1 || true
-        wait_seconds="${AI_USAGE_MIGRATION_WAIT_SECONDS:-200}"
-        poll_seconds="${AI_USAGE_MIGRATION_POLL_SECONDS:-2}"
-        deadline=$((SECONDS + wait_seconds))
-        while :; do
-            state="$(systemctl is-active "$LEGACY_REFRESH.service" 2>/dev/null || true)"
-            case "$state" in
-                active|activating|deactivating|reloading) ;;
-                *) break ;;
-            esac
-            if [ "$SECONDS" -ge "$deadline" ]; then
-                say "WARNING: $LEGACY_REFRESH.service was still $state after ${wait_seconds}s."
-                say "  Continuing the migration WITHOUT stopping it (killing it mid-rotation"
-                say "  could lose the single-use Claude refresh token). If the Claude ring"
-                say "  goes unavailable afterwards, sign account 1 in again."
-                break
-            fi
-            sleep "$poll_seconds"
-        done
+OLD_TIMER="$LEGACY_REFRESH.timer"
+NEW_TIMER="homehub-claude-refresh@claude.timer"
+
+# INVARIANT, on every way out of this script (0, 3, or an error part-way):
+# EXACTLY ONE account-1 refresh timer is enabled and active - the old one or the
+# new one, never both and never neither. Every decision below is made from the
+# REAL state of both timers (never from what a previous run was "supposed" to
+# have done): a rerun after a half-finished run must not re-enable the old timer
+# beside an active new one.
+#
+#   timer_state UNIT -> on      (enabled AND active)
+#                       off     (not enabled AND not active)
+#                       partial (CONFIRMED half-applied: enabled but not active, or
+#                                active but not enabled)
+#                       unknown (a query failed or said something unrecognised)
+#
+# THE RULE: `unknown` never leads to a disable or an enable. Only a CONFIRMED
+# state moves a timer; an unknown one is left exactly as it is, with an ERROR that
+# names the check commands, and the script exits 3. (Callers, all audited:
+# restore_legacy_timer x2, the start-of-migration reads x2, the old-timer verify
+# in the already-migrated branch, and the new-timer check after its enable.)
+timer_state() {
+    local en ac
+    en="$(systemctl is-enabled "$1" 2>/dev/null || true)"
+    ac="$(systemctl is-active "$1" 2>/dev/null || true)"
+    case "$en" in
+        enabled)
+            case "$ac" in
+                active) echo on; return 0 ;;
+                inactive|failed|dead) echo partial; return 0 ;;
+            esac ;;
+        disabled|not-found|static|indirect|linked|masked|generated)
+            case "$ac" in
+                inactive|failed|dead) echo off; return 0 ;;
+                active) echo partial; return 0 ;;
+            esac ;;
+    esac
+    echo unknown
+}
+
+# LEGACY_BLOCKED=1: the migration is deferred and the old timer (if it is allowed
+# to be) is the refresher. LEGACY_ARMED=1: between disabling the old timer and the
+# new one being confirmed on, any exit puts the old timer back - but ONLY when the
+# new timer is confirmed off.
+LEGACY_BLOCKED=0
+LEGACY_PRESENT=0
+LEGACY_ARMED=0
+NEW_ENABLE_ATTEMPTED=0
+restore_legacy_timer() {
+    [ "$LEGACY_ARMED" = 1 ] || return 0
+    LEGACY_ARMED=0
+    new_now="$(timer_state "$NEW_TIMER")"
+    # We read the new timer as OFF before touching anything. If we have not tried to
+    # enable it since, a failing query does not change that.
+    if [ "$new_now" = unknown ] && [ "$NEW_ENABLE_ATTEMPTED" = 0 ]; then
+        new_now=off
     fi
-    rm -f "$UNIT_DIR/$LEGACY_REFRESH.timer" "$UNIT_DIR/$LEGACY_REFRESH.service"
-    rm -rf "$UNIT_DIR/$LEGACY_REFRESH.service.d"
-    say "Migrated the un-templated $LEGACY_REFRESH unit to $LEGACY_REFRESH@claude (same account, same paths)."
+    case "$new_now" in
+        on)
+            say "The new $NEW_TIMER is running and stays the Claude account-1 refresher;"
+            say "  the old timer is NOT re-enabled (two would race on one single-use token)."
+            return 0 ;;
+        off) ;;
+        *)
+            say "ERROR: cannot tell whether $NEW_TIMER is running, so nothing was changed."
+            say "  Claude account 1 must have exactly ONE refresher. Check, as root:"
+            say "    systemctl is-active $NEW_TIMER $OLD_TIMER"
+            say "  then enable the one that is not running, and disable the other:"
+            say "    systemctl enable --now $OLD_TIMER ; systemctl disable --now $NEW_TIMER"
+            return 0 ;;
+    esac
+    if systemctl enable --now "$OLD_TIMER" >/dev/null 2>&1; then
+        if [ "$(timer_state "$OLD_TIMER")" = on ]; then
+            say "The old $OLD_TIMER is enabled again and is the Claude account-1 refresher."
+        else
+            say "WARNING: $OLD_TIMER was enabled but its state cannot be confirmed. Check, as root:"
+            say "    systemctl is-active $OLD_TIMER"
+        fi
+    else
+        say "ERROR: could NOT re-enable $OLD_TIMER. Claude account 1 has NO"
+        say "  refresher right now and its token will lapse. Run, as root:"
+        say "    systemctl enable --now $OLD_TIMER"
+    fi
+}
+trap restore_legacy_timer EXIT
+
+LEGACY_COMPLETE=0
+if [ -e "$UNIT_DIR/$OLD_TIMER" ] || [ -e "$UNIT_DIR/$LEGACY_REFRESH.service" ] \
+        || [ -d "$UNIT_DIR/$LEGACY_REFRESH.service.d" ]; then
+    LEGACY_PRESENT=1
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true      # so the instance's state can be read
+        new_state="$(timer_state "$NEW_TIMER")"
+        old_state=absent
+        [ -e "$UNIT_DIR/$OLD_TIMER" ] && old_state="$(timer_state "$OLD_TIMER")"
+        case "$new_state" in
+            on)
+                # A previous run already activated the replacement. Only the
+                # cleanup is left, and the old timer must NEVER come back.
+                LEGACY_COMPLETE=1
+                if [ "$old_state" != off ] && [ "$old_state" != absent ]; then
+                    systemctl disable --now "$OLD_TIMER" >/dev/null 2>&1 || true
+                    if [ "$(timer_state "$OLD_TIMER")" != off ]; then
+                        LEGACY_BLOCKED=1
+                        say "ERROR: $NEW_TIMER is running but $OLD_TIMER could not be turned off."
+                        say "  Two Claude refreshers would race on one single-use token. Run, as root:"
+                        say "    systemctl disable --now $OLD_TIMER"
+                    fi
+                fi
+                ;;
+            off)
+                if [ -e "$UNIT_DIR/$OLD_TIMER" ]; then
+                    LEGACY_ARMED=1      # from here, any exit restores the old timer
+                    if ! systemctl disable --now "$OLD_TIMER" >/dev/null 2>&1; then
+                        LEGACY_BLOCKED=1
+                        say "WARNING: could not disable $OLD_TIMER. The old refresher stays"
+                        say "  the ONLY refresher and the new one is not enabled (two would race on"
+                        say "  one single-use token). Fix the timer, then re-run this script."
+                    fi
+                fi
+                wait_seconds="${AI_USAGE_MIGRATION_WAIT_SECONDS:-200}"
+                poll_seconds="${AI_USAGE_MIGRATION_POLL_SECONDS:-2}"
+                deadline=$((SECONDS + wait_seconds))
+                # The service is deliberately never `stop`ped: a `claude -p /usage`
+                # killed in the middle of a token rotation can lose the single-use
+                # refresh token. The wait is bounded (longer than the unit's own
+                # TimeoutStartSec=180).
+                while [ "$LEGACY_BLOCKED" = 0 ]; do
+                    state="$(systemctl is-active "$LEGACY_REFRESH.service" 2>/dev/null || true)"
+                    # Only a CONFIRMED idle state lets the swap proceed. A failed
+                    # query or an answer we do not recognise is "unknown": wait,
+                    # then DEFER - never a guess that it is idle.
+                    case "$state" in
+                        inactive|failed|dead) break ;;
+                        active|activating|deactivating|reloading) ;;
+                        *) state="in an unknown state (${state:-no answer})" ;;
+                    esac
+                    if [ "$SECONDS" -ge "$deadline" ]; then
+                        LEGACY_BLOCKED=1
+                        say "WARNING: $LEGACY_REFRESH.service was still $state after ${wait_seconds}s."
+                        say "  The migration is DEFERRED: killing it mid-rotation could lose the"
+                        say "  single-use Claude refresh token, and enabling the new refresher beside"
+                        say "  it would race it. The old timer is put back as the only refresher;"
+                        say "  re-run this script when the service has finished."
+                        break
+                    fi
+                    sleep "$poll_seconds"
+                done
+                ;;
+            *)
+                # Neither timer's state can be established: change NOTHING.
+                LEGACY_BLOCKED=1
+                say "ERROR: cannot read the state of $NEW_TIMER, so the Claude refresher"
+                say "  migration was not attempted and nothing was changed. Check, as root:"
+                say "    systemctl is-enabled $NEW_TIMER $OLD_TIMER ; systemctl is-active $NEW_TIMER $OLD_TIMER"
+                say "  and leave exactly ONE of the two enabled."
+                ;;
+        esac
+    fi
+    # Deferred: the old timer goes straight back, before anything else can fail.
+    if [ "$LEGACY_BLOCKED" != 0 ]; then
+        restore_legacy_timer
+    fi
 fi
 
+ENABLE_FAILED=0
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     # The TIMER is enabled, never the service: enabling a oneshot service means
     # one run at boot and none after it, which is the classic way a feeder ends
     # up posting a single reading and then going quietly stale forever.
     systemctl enable --now homehub-ai-usage.timer
-    systemctl enable --now homehub-claude-refresh@claude.timer
-    if source_enabled claude2; then
-        systemctl enable --now homehub-claude-refresh@claude2.timer
-    fi
-    if source_enabled gemini; then
-        systemctl enable --now homehub-gemini-refresh.timer
+    if [ "$LEGACY_BLOCKED" = 0 ] && [ "$LEGACY_COMPLETE" = 0 ]; then
+        # `enable --now` can change state and then report failure: judge by the
+        # state it left, not by its exit status.
+        NEW_ENABLE_ATTEMPTED=1
+        systemctl enable --now "$NEW_TIMER" >/dev/null 2>&1 || true
+        new_after="$(timer_state "$NEW_TIMER")"
+        case "$new_after" in
+            on) ;;
+            off)
+                # Nothing was left half-applied: put the old timer back, if there is one.
+                LEGACY_BLOCKED=1
+                say "WARNING: $NEW_TIMER did not start."
+                if [ "$LEGACY_ARMED" = 1 ]; then
+                    restore_legacy_timer
+                else
+                    say "ERROR: Claude account 1 has NO refresher (there is no old timer to fall back on)."
+                    say "  Fix the cause, then run, as root:  systemctl enable --now $NEW_TIMER"
+                fi ;;
+            partial)
+                # CONFIRMED half-applied (enabled but not started, or the reverse).
+                LEGACY_BLOCKED=1
+                say "WARNING: $NEW_TIMER is only half enabled."
+                if [ "$LEGACY_ARMED" = 1 ]; then
+                    # A confirmed-good fallback exists, so turn the new one fully off
+                    # first: restoring the old timer must never leave two enabled.
+                    systemctl disable --now "$NEW_TIMER" >/dev/null 2>&1 || true
+                    restore_legacy_timer
+                else
+                    say "ERROR: there is no old timer to fall back on, so it was left as it is."
+                    say "  Finish it, as root:  systemctl enable --now $NEW_TIMER"
+                fi ;;
+            *)
+                # UNKNOWN: a query failed. Change nothing at all.
+                LEGACY_BLOCKED=1
+                say "ERROR: cannot confirm the state of $NEW_TIMER, so NO timer was changed."
+                say "  Check, as root:  systemctl is-enabled $NEW_TIMER $OLD_TIMER ;"
+                say "                   systemctl is-active  $NEW_TIMER $OLD_TIMER"
+                say "  and leave exactly ONE of the two running."
+                LEGACY_ARMED=0 ;;
+        esac
     fi
 fi
 
-say "AI-usage feeder installed; runs as $AI_USAGE_USER_ACCOUNT on the timer."
-say "STILL OWED BY A HUMAN: the vendor sign-ins do not survive a reimage, and a"
-say "  source with no credential posts 'unavailable' - correct, not a bug."
-say ""
-say "  SIGN CODEX IN WITH CODEX_HOME SET, or the unit will not find the token:"
-say "    sudo -u $AI_USAGE_USER_ACCOUNT env CODEX_HOME=/var/lib/homehub-ai-codex \\"
-say "        PATH=/usr/local/bin:/usr/bin:/bin codex login --device-auth"
-say "  The unit keeps ProtectHome=read-only, so codex writes to that directory"
-say "  and never to the account home. A sign-in done WITHOUT it lands in"
-say "  ~/.codex, which the service cannot read - the gauge then stays"
-say "  'unavailable' with the CLI insisting it is logged in."
-say ""
-say "  Claude (account 1) signs in normally. THE COMMAND IS \`claude auth login\`,"
-say "  NOT \`claude setup-token\`: that mints an automation token without the"
-say "  user:profile scope the usage endpoint needs, so the gauge would read"
-say "  'unavailable' with a good-looking login:"
-say "    sudo -u $AI_USAGE_USER_ACCOUNT env HOME=$REFRESH_HOME \\"
-say "        PATH=/usr/local/bin:/usr/bin:/bin sh -c 'cd ~ && claude auth login --claudeai'"
-say "  It needs a terminal to paste the returned code into (tmux works)."
-say ""
-say "  OpenCode signs in normally too (\`opencode auth login\`, same wrapper,"
-say "  from the account's home directory)."
-if source_enabled claude2; then
-    say ""
-    say "  Claude account 2 is a SEPARATE login in its own config directory. Sign in"
-    say "  as the second account, with CLAUDE_CONFIG_DIR set, once:"
-    say "    sudo -u $AI_USAGE_USER_ACCOUNT env HOME=$REFRESH_HOME \\"
-    say "        CLAUDE_CONFIG_DIR=$CLAUDE2_CONFIG_DIR \\"
-    say "        PATH=/usr/local/bin:/usr/bin:/bin sh -c 'cd ~ && claude auth login --claudeai'"
-    say "  Never copy account 1's files into it: the refresh token is single-use."
-    say "  Set AI_USAGE_CLAUDE2_CREDENTIALS=$CLAUDE2_CONFIG_DIR/.credentials.json."
+# COMMIT the migration the moment the new timer is confirmed on, BEFORE anything
+# unrelated can fail: disarm the restore, then remove the old files. A later
+# failure (the Gemini timer, say) can then never leave it half-recorded.
+if [ "$LEGACY_BLOCKED" = 0 ]; then
+    LEGACY_ARMED=0
+    if [ "$LEGACY_PRESENT" = 1 ]; then
+        rm -f "$UNIT_DIR/$OLD_TIMER" "$UNIT_DIR/$LEGACY_REFRESH.service"
+        rm -rf "$UNIT_DIR/$LEGACY_REFRESH.service.d"
+        if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
+        say "Migrated the un-templated $LEGACY_REFRESH unit to $LEGACY_REFRESH@claude (same account, same paths)."
+    fi
 fi
-if source_enabled gemini; then
-    say ""
-    say "  Gemini signs in through the CLI itself, as the same account, once"
-    say "  (choose 'Login with Google'; NO_BROWSER prints a link and asks for a code):"
-    say "    sudo -u $AI_USAGE_USER_ACCOUNT env HOME=$REFRESH_HOME NO_BROWSER=true \\"
-    say "        PATH=/usr/local/bin:/usr/bin:/bin sh -c 'cd ~ && gemini'"
-    say "  It must be an account the CLI has onboarded (run one prompt). The feeder"
-    say "  reads $REFRESH_HOME/.gemini/oauth_creds.json and never writes it."
+
+# The remaining timers are unrelated to the migration: a failure here is reported
+# and makes the script exit non-zero at the end, but never aborts mid-way.
+if command -v systemctl >/dev/null 2>&1; then
+    if source_enabled claude2; then
+        systemctl enable --now homehub-claude-refresh@claude2.timer || ENABLE_FAILED=1
+    fi
+    if source_enabled gemini; then
+        systemctl enable --now homehub-gemini-refresh.timer || ENABLE_FAILED=1
+    fi
+    if [ "$ENABLE_FAILED" != 0 ]; then
+        say "WARNING: a refresher timer could not be enabled (see above); re-run once fixed."
+    fi
+fi
+
+say "AI-usage feeder installed; runs as $ACCOUNT on the timer."
+
+# The vendor updaters are switched off system-wide (plan 3.5): claude always (its
+# refresher is always installed), gemini only when it is a source.
+# /etc is derived from the unit dir (/etc/systemd/system -> /etc), so a run
+# against a sandboxed unit dir writes its updater files into the sandbox too.
+UPDATER_ARGS=()
+source_enabled gemini && UPDATER_ARGS=(--gemini)
+AI_CLI_ETC_DIR="${AI_CLI_ETC_DIR:-$(dirname "$(dirname "$UNIT_DIR")")}" \
+    bash "${AI_CLI_UPDATER_CONTROLS:-$HERE/../ai-cli/install-updater-controls.sh}" ${UPDATER_ARGS[@]+"${UPDATER_ARGS[@]}"} \
+    || say "WARNING: could not write the vendor updater settings; the wrappers still export the controls."
+
+# WHAT IS STILL OWED is a sign-in, and only the ones this box actually lacks:
+# ai-cli-status.sh reads the provisioner's status and checks each credential AS
+# THE ACCOUNT, then prints the exact recipe for the unverified sources and
+# nothing else. (The recipes that used to be printed here unconditionally -
+# `claude auth login` for the account, CLAUDE_CONFIG_DIR for the second one,
+# CODEX_HOME for the usage Codex home - live there now; `claude setup-token` is
+# still the wrong command.) It never fails this script.
+AI_CLI_ENV_FILE="$ENV_FILE" bash "${AI_CLI_STATUS:-$HERE/../ai-cli/ai-cli-status.sh}" || true
+if [ "$LEGACY_BLOCKED" != 0 ]; then
+    say "EXIT 3: everything else is installed, but the Claude refresher migration did"
+    say "  not complete (see the WARNING / ERROR above). Exactly ONE of $OLD_TIMER and"
+    say "  $NEW_TIMER must be running: check with systemctl is-active, then re-run this script."
+    exit 3
+fi
+if [ "$ENABLE_FAILED" != 0 ]; then
+    exit 1
 fi
 exit 0

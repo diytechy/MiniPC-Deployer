@@ -34,9 +34,19 @@
 # AI_CLIS_CHECK_TIMEOUT, AI_CLIS_ID, AI_CLIS_DIE_AT (pending|swap|check|checked: SIGKILL
 # self at that point of a link transaction, to prove recovery), AI_CLIS_FAIL_SAVE_AT
 # (pending|checked|committed: that state write fails), AI_CLIS_FAIL_RESTORE=<target>
-# (restoring the link to that target fails), AI_CLIS_FAIL_REMOVE=1 (removing a link fails).
+# (restoring the link to that target fails), AI_CLIS_FAIL_REMOVE=1 (removing a link fails),
+# (ALL of the following hooks need AI_CLIS_TEST=1 and are otherwise ignored.)
+# AI_CLIS_HOLD_IN_LOCK=<seconds> (sleep inside the timer lock, to test the interleaving),
+# AI_CLIS_FSYNC_LOG=<file> (append every path that is fsynced).
 set -u -o pipefail
 umask 022
+
+# The fault-injection hooks are for the test suite only. They are ignored (removed from the
+# environment) unless AI_CLIS_TEST=1, which no unit ever sets, so a stray variable cannot
+# break a removal or restore, or kill a run.
+if [ "${AI_CLIS_TEST:-}" != 1 ]; then
+    unset AI_CLIS_DIE_AT AI_CLIS_FAIL_SAVE_AT AI_CLIS_FAIL_RESTORE AI_CLIS_FAIL_REMOVE AI_CLIS_HOLD_IN_LOCK AI_CLIS_FSYNC_LOG
+fi
 
 # Bump on ANY change to wrapper.template: it is part of every install identity,
 # so a changed wrapper is a new install and an old directory is never trusted.
@@ -68,6 +78,9 @@ DLDIR="$VAR_TMP/homehub-ai-clis"
 SERVICE="homehub-ai-clis-provision.service"
 TIMER="homehub-ai-clis-provision.timer"
 GEN_FILE="$STATE_DIR/schedule-request"
+# A SHORT second lock guards the request stamp and the timer state (never held across a download).
+LOCK2="${LOCK}.timer"
+PREFIX_N="$(realpath -m -- "$PREFIX" 2>/dev/null || printf '%s' "$PREFIX")"
 # The scheduling generation this process started with, read before anything else
 # so a --schedule that lands while we run is never mistaken for the one we saw.
 GEN_AT_START="$(cat "$GEN_FILE" 2>/dev/null || true)"
@@ -135,6 +148,14 @@ elif op == "act":
     s["clis"].setdefault(key, {})["activation"] = {
         "state": st, "from": nul(fr), "from_version": nul(fv),
         "to": nul(to), "to_version": nul(tv), "kind": a[6] if len(a) > 6 else "activate"}
+elif op == "baseline":
+    c = s["clis"].setdefault(a[0], {})
+    if not c.get("baseline"):                  # permanent: written once, never replaced
+        c["baseline"] = {"target": a[1], "version": nul(a[2])}
+elif op == "previous":
+    s["clis"].setdefault(a[0], {})["previous"] = {"target": a[1], "version": nul(a[2])}
+elif op == "health":
+    s["clis"].setdefault(a[0], {})["health"] = {"target": a[1], "ok": a[2] == "true"}
 elif op == "pend":
     key, reason, since = a
     c = s["clis"].setdefault(key, {})
@@ -166,11 +187,42 @@ try:
         os.fsync(dfd)
     finally:
         os.close(dfd)
+    if os.environ.get("AI_CLIS_FSYNC_LOG"):
+        with open(os.environ["AI_CLIS_FSYNC_LOG"], "a") as f:
+            f.write("state " + path + chr(10))
 except OSError:
     try:
         os.unlink(tmp)
     except OSError:
         pass
+    sys.exit(1)
+PY
+
+read -r -d '' PYSYNC <<'PY'
+import sys, os
+log = os.environ.get("AI_CLIS_FSYNC_LOG")
+def sync(p):
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if log:
+        with open(log, "a") as f:
+            f.write(p + "\n")
+mode = sys.argv[1]
+try:
+    for p in sys.argv[2:]:
+        if mode == "tree" and os.path.isdir(p):
+            for dp, dns, fns in os.walk(p):
+                for n in fns:
+                    fp = os.path.join(dp, n)
+                    if not os.path.islink(fp):
+                        sync(fp)
+                sync(dp)
+        else:
+            sync(p)
+except OSError:
     sys.exit(1)
 PY
 
@@ -338,6 +390,8 @@ print(json.dumps(out, sort_keys=True))
 PY
 
 pyj() { python3 -I -c "$PYJ" "$@"; }
+fsync_paths() { python3 -I -c "$PYSYNC" paths "$@" 2>/dev/null; }
+fsync_tree() { python3 -I -c "$PYSYNC" tree "$@" 2>/dev/null; }
 pyarc() { python3 -I -c "$PYARC" "$@"; }
 
 # ------------------------------------------------------------------- state.json
@@ -532,16 +586,28 @@ die_at() { [ "${AI_CLIS_DIE_AT:-}" = "$1" ] && kill -KILL $$; return 0; }
 
 # ---------------------------------------------------------------------- the link
 link_now() { readlink "$BIN_DIR/$1" 2>/dev/null || true; }
-swap_to() { # NAME TARGET ('' removes the link)
+norm_path() { # TARGET -> an absolute, normalised path (a relative link target is relative to the bin directory)
+    local t="$1"
+    case "$t" in /*) ;; *) t="$BIN_DIR/$t";; esac
+    realpath -m -- "$t" 2>/dev/null || printf '%s' "$t"
+}
+is_managed() { # is this link target one of our wrappers?
+    local n; n="$(norm_path "$1")"
+    case "$n" in "$PREFIX_N"/*/*/wrapper/*) return 0;; esac
+    return 1
+}
+swap_to() { # NAME TARGET ('' removes the link); the bin directory is fsynced after the change
     local link="$BIN_DIR/$1" t="$2" tmp
     if [ -z "$t" ]; then
         [ -n "${AI_CLIS_FAIL_REMOVE:-}" ] && return 1
-        rm -f "$link"; return $?
+        rm -f "$link" || return 1
+        fsync_paths "$BIN_DIR"; return $?
     fi
     [ -n "${AI_CLIS_FAIL_RESTORE:-}" ] && [ "$t" = "$AI_CLIS_FAIL_RESTORE" ] && return 1
     tmp="$BIN_DIR/.$1.new.$$"
     rm -f "$tmp"
     ln -s "$t" "$tmp" && mv -T "$tmp" "$link" || { rm -f "$tmp"; return 1; }
+    fsync_paths "$BIN_DIR"
 }
 link_is() { # NAME TARGET ('' = there is no link and no file at all)
     local l="$BIN_DIR/$1"
@@ -556,8 +622,9 @@ abs_of() { # a link's target as the kernel resolves it: relative to the bin dire
     case "$1" in /*) printf '%s' "$1";; *) printf '%s/%s' "$BIN_DIR" "$1";; esac
 }
 version_of_target() { # a managed wrapper path -> its pinned version, or ''
-    case "$1" in
-        "$PREFIX"/*/*/wrapper/*) local id; id="$(basename "$(dirname "$(dirname "$1")")")"; printf '%s' "${id%%-*}";;
+    local n; n="$(norm_path "$1")"
+    case "$n" in
+        "$PREFIX_N"/*/*/wrapper/*) local id; id="$(basename "$(dirname "$(dirname "$n")")")"; printf '%s' "${id%%-*}";;
     esac
 }
 
@@ -642,18 +709,25 @@ render_wrapper() { # KEY ROOT OUT
 # referenced_dir DIR: is anything live pointing into DIR? A link, a recorded transaction, or
 # another install's wrapper (Node is reached only through the Gemini wrapper).
 referenced_dir() {
-    local d="$1" k t f w
+    local d dn k t f w
+    d="$1"; dn="$(realpath -m -- "$d" 2>/dev/null || printf '%s' "$d")"
+    inside() { local n; n="$(norm_path "$1")"; case "$n" in "$dn"|"$dn"/*) return 0;; esac; return 1; }
     for k in "${ORDER[@]}"; do
         t="$(link_now "$k")"
-        case "$t" in "$d"|"$d"/*) return 0;; esac
+        [ -n "$t" ] && inside "$t" && return 0
         for f in from to; do
             t="$(sget "clis.$k.activation.$f")"
-            case "$t" in "$d"|"$d"/*) return 0;; esac
+            [ -n "$t" ] && inside "$t" && return 0
+        done
+        for f in baseline previous; do
+            t="$(sget "clis.$k.$f.target")"
+            [ -n "$t" ] && inside "$t" && return 0
         done
     done
     for w in "$PREFIX"/*/*/wrapper/*; do
         [ -f "$w" ] || continue
-        case "$w" in "$d"/*) continue;; esac
+        case "$w" in "$d"/*|"$dn"/*) continue;; esac
+        grep -qsF -- "$dn/" "$w" && return 0
         grep -qsF -- "$d/" "$w" && return 0
     done
     return 1
@@ -760,13 +834,42 @@ ensure_artifact() {
     "$CHOWN" -R "$OWNER" "$STAGE" 2>/dev/null; chmod -R go-w "$STAGE"
     mkdir -p "$(dirname "$final")" || { fail_stage "cannot create $(dirname "$final")"; return 1; }
     chmod 0755 "$(dirname "$final")" 2>/dev/null
+    if ! fsync_tree "$STAGE"; then fail_stage "cannot make the staged install durable"; return 1; fi
     if ! mv -T "$STAGE" "$final" 2>/dev/null; then fail_stage "cannot publish the install"; return 1; fi
     STAGE=""
+    if ! fsync_paths "$(dirname "$final")" "$PREFIX"; then REASON="the published install could not be made durable"; return 1; fi
     say "installed $key $identity"
     clear_pending_if_artifact "$key"
     return 0
 }
 clear_pending_if_artifact() { is_dep_only "$1" && clear_pending "$1"; return 0; }
+
+# ------------------------------------------------------------ retries, locks, history
+any_open_txn() { # is ANY CLI's transaction pending or checked (needed or not)?
+    local k st
+    for k in "${ORDER[@]}"; do
+        st="$(sget "clis.$k.activation.state")"
+        case "$st" in pending|checked) return 0;; esac
+    done
+    return 1
+}
+arm_retries() { "$SYSTEMCTL" enable --now "$TIMER"; }
+timer_lock() { { exec 7>>"$LOCK2"; } 2>/dev/null && flock -w 30 7; }
+timer_unlock() { { exec 7>&-; } 2>/dev/null; return 0; }
+# history_from KEY -> HF HFV: where a rollback of a freshly recognised managed link must go
+HF=""; HFV=""
+history_from() {
+    local key="$1" t
+    t="$(sget "clis.$key.previous.target")"
+    if [ -n "$t" ]; then HF="$t"; HFV="$(sget "clis.$key.previous.version")"; return; fi
+    HF="$(sget "clis.$key.baseline.target")"; HFV="$(sget "clis.$key.baseline.version")"
+}
+# note_displaced KEY FROM FROM_VERSION: a managed install that was displaced becomes the "previous" one
+note_displaced() {
+    if [ -n "$2" ] && is_managed "$2"; then
+        STATE="$(printf '%s' "$STATE" | pyj previous "$1" "$2" "${3:--}")"
+    fi
+}
 
 # -------------------------------------------------------------- link transactions
 # ONE primitive for activation, rollback and recovery: record pending (durably), swap,
@@ -792,8 +895,19 @@ txn_revert() { # KEY FROM PREV_RECORD -> 1 reverted cleanly, 2 restoring failed 
 # link_txn KEY KIND FROM FROM_VERSION TO TO_VERSION EXPECT PREV_RECORD
 # FROM is the link as it is now, TO what it will become ('' removes it). 0 committed, 1 reverted, 2 revert failed.
 link_txn() {
-    local key="$1" kind="$2" from="$3" fv="$4" to="$5" tv="$6" expect="$7" prev="$8" rc
+    local key="$1" kind="$2" from="$3" fv="$4" to="$5" tv="$6" expect="$7" prev="$8" rc keep
+    # 1. retries exist BEFORE anything can displace the link
+    if ! arm_retries; then
+        REASON="the retry timer could not be armed; the link was not touched"; return 1
+    fi
+    # 2. the first time an UNOWNED link is displaced its target and observed version become a
+    #    permanent baseline, written in the same durable write as the pending record
+    keep="$STATE"
+    if [ -n "$from" ] && ! is_managed "$from"; then
+        STATE="$(printf '%s' "$STATE" | pyj baseline "$key" "$from" "${fv:--}")"
+    fi
     if ! rec_set "$key" pending "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind"; then
+        STATE="$keep"
         REASON="the transaction could not be recorded durably in $STATE_DIR; the link was not touched"
         return 1
     fi
@@ -813,6 +927,12 @@ link_txn() {
         txn_revert "$key" "$from" "$prev"; return $?
     fi
     die_at checked
+    # everything the commit depends on is on disk before the commit is
+    if [ -n "$to" ] && ! fsync_paths "$(norm_path "$to")" "$(dirname "$(norm_path "$to")")"; then
+        REASON="the activated install could not be made durable; the previous link was restored"
+        txn_revert "$key" "$from" "$prev"; return $?
+    fi
+    note_displaced "$key" "$from" "$fv"
     if ! rec_set "$key" committed "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind"; then
         REASON="the commit could not be recorded; the previous link was restored"
         txn_revert "$key" "$from" "$prev"; return $?
@@ -836,7 +956,11 @@ activate() {
         # our wrapper is linked but no committed record says so: verify, then record
         if consumer_check "$BIN_DIR/$key" "$tv" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
             local pf pv
-            pf="$(sget "clis.$key.activation.from")"; pv="$(sget "clis.$key.activation.from_version")"
+            if [ -n "$act_state" ]; then
+                pf="$(sget "clis.$key.activation.from")"; pv="$(sget "clis.$key.activation.from_version")"
+            else
+                history_from "$key"; pf="$HF"; pv="$HFV"          # never from=null when a baseline exists
+            fi
             rec_set "$key" committed "${pf:--}" "${pv:--}" "$wrapper" "$tv" activate \
                 || { REASON="the verified state could not be recorded"; return 1; }
             return 0
@@ -882,6 +1006,7 @@ recover() {
         if [ "$cur" = "$to" ]; then
             if [ -n "$to" ] && ! consumer_check "$BIN_DIR/$key" "$(expect_of "$tv")" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; then
                 REASON="an interrupted change failed its check ($CHECK_DETAIL)"
+                arm_retries || say "WARNING: could not arm the retry timer before restoring $key"
                 swap_to "$key" "$from"
                 if link_is "$key" "$from"; then
                     sdel "clis.$key.activation"
@@ -892,6 +1017,7 @@ recover() {
                 fi
             else
                 local before="$STATE"
+                note_displaced "$key" "$from" "$fv"
                 STATE="$(printf '%s' "$STATE" | pyj act "$key" committed "${from:--}" "${fv:--}" "${to:--}" "${tv:--}" "$kind")"
                 if save_state; then say "recovered $key: committed"; else
                     STATE="$before"; UNRESOLVED+=("$key")
@@ -953,13 +1079,49 @@ prepare_units() {
 lock_or_busy() { exec 9>>"$LOCK" || refuse "cannot open the lock $LOCK"; flock -n 9; }
 
 bump_request() { # a durable, unique stamp: a run that started before it knows it missed a request
-    mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s\n' "$(date +%s%N)-$$" | python3 -I -c "$PYWRITE" "$GEN_FILE" 2>/dev/null \
-        || say "WARNING: could not record the scheduling request"
+    mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s\n' "$(date +%s%N)-$$" | python3 -I -c "$PYWRITE" "$GEN_FILE" 2>/dev/null
+}
+
+# timer_finish [quiet]: the ONLY place a run may disable the timer. Under the short timer lock it
+# compares the request stamp and checks that no transaction anywhere is open; both must be clean.
+timer_finish() {
+    local quiet="${1:-}"
+    if ! timer_lock; then
+        arm_retries || true
+        [ -n "$quiet" ] || say "PROVISIONING: INCOMPLETE; the timer lock was busy, so the retry timer stays enabled"
+        return 3
+    fi
+    local newer=0
+    [ "$(cat "$GEN_FILE" 2>/dev/null || true)" != "$GEN_AT_START" ] && newer=1
+    if [ "$newer" = 1 ] || any_open_txn; then
+        arm_retries || true
+        timer_unlock
+        if [ -z "$quiet" ]; then
+            if [ "$newer" = 1 ]; then say "PROVISIONING: INCOMPLETE; a newer request arrived during this run, so the retry timer stays enabled"
+            else say "PROVISIONING: INCOMPLETE; a link change is still open, so the retry timer stays enabled"; fi
+        fi
+        return 3
+    fi
+    if [ -n "${AI_CLIS_HOLD_IN_LOCK:-}" ]; then : >"$LOCK2.held"; sleep "$AI_CLIS_HOLD_IN_LOCK"; fi
+    "$SYSTEMCTL" disable --now "$TIMER" || say "WARNING: could not disable $TIMER"
+    timer_unlock
+    return 0
 }
 
 mode_schedule() {
     if [ "$PROVISION_OFF" = 1 ] || [ "${#NEEDED[@]}" -eq 0 ]; then
+        timer_lock || { say "cannot take the timer lock"; return 3; }
+        load_state
+        if any_open_txn; then
+            # an interrupted link change must be reconciled by a run: never disable under it
+            timer_unlock
+            prepare_units || say "WARNING: could not install the provisioning units"
+            "$SYSTEMCTL" start --no-block "$SERVICE" || { say "cannot start $SERVICE"; return 3; }
+            say "provisioning: an interrupted link change is recorded; recovery was started and the retry timer was left alone"
+            return 3
+        fi
         "$SYSTEMCTL" disable --now "$TIMER" || true
+        timer_unlock
         # Clearing pending needs the main lock. Never wait for it: a retry may
         # hold it for a whole download. If it is busy the next --run clears it.
         if exec 9>>"$LOCK" && flock -n 9; then
@@ -970,21 +1132,24 @@ mode_schedule() {
         say "provisioning: nothing to do (off or no enabled consumer needs a CLI)"
         return 0
     fi
-    # unit files first, so they exist before the timer is enabled; no lock is taken
+    # unit files first, so they exist before the timer is enabled; the main lock is never taken
     prepare_units || { say "cannot install the provisioning units"; return 3; }
-    bump_request
-    "$SYSTEMCTL" enable --now "$TIMER" || { say "cannot enable $TIMER"; return 3; }
+    timer_lock || { say "cannot take the timer lock"; return 3; }
+    if ! bump_request; then
+        timer_unlock; say "cannot record the scheduling request in $STATE_DIR"; return 3
+    fi
+    if ! "$SYSTEMCTL" enable --now "$TIMER"; then timer_unlock; say "cannot enable $TIMER"; return 3; fi
+    timer_unlock
     "$SYSTEMCTL" start --no-block "$SERVICE" || { say "cannot start $SERVICE"; return 3; }
     say "provisioning scheduled: ${NEEDED[*]} (retrying every $CFG_RETRY min until it converges)"
 }
 
 mode_run() {
-    local off=0 key bad=0
+    local off=0 key bad=0 tv
     if [ "$PROVISION_OFF" = 1 ] || [ "${#NEEDED[@]}" -eq 0 ]; then off=1; fi
     if ! lock_or_busy; then
         if [ "$off" = 1 ]; then
-            "$SYSTEMCTL" disable --now "$TIMER" || true
-            say "provisioning: nothing to do (off or no enabled consumer needs a CLI)"
+            say "another provisioning run holds the lock; it will finish the shutdown"
             return 0
         fi
         say "another provisioning run holds the lock"; return 3
@@ -997,17 +1162,16 @@ mode_run() {
     # an interrupted link change is reconciled FIRST, even when provisioning is off or nothing is needed
     recover
     if [ "$off" = 1 ]; then
-        if [ "${#UNRESOLVED[@]}" -gt 0 ]; then
-            "$SYSTEMCTL" enable --now "$TIMER" || true
+        if any_open_txn; then
+            arm_retries || true
             say "PROVISIONING: INCOMPLETE; an interrupted link change is not yet reconciled; retrying every $CFG_RETRY min"
             return 3
         fi
-        "$SYSTEMCTL" disable --now "$TIMER" || true
+        timer_finish || return 3
         STATE="$(printf '%s' "$STATE" | pyj clearpending)"; save_state
         say "provisioning: nothing to do (off or no enabled consumer needs a CLI)"
         return 0
     fi
-    local tv
     for key in "${NEEDED[@]}"; do
         if is_unresolved "$key"; then bad=1; continue; fi
         if held_of "$key"; then
@@ -1015,8 +1179,10 @@ mode_run() {
             if held_ok_static "$key" && { [ -z "$(sget "clis.$key.activation.to")" ] \
                     || consumer_check "$BIN_DIR/$key" "$(expect_of "$tv")" "${M_VCMD[$key]}" "${M_VREGEX[$key]}"; }; then
                 say "$key is held at the previous version by --rollback; change the pin to release it"
+                STATE="$(printf '%s' "$STATE" | pyj health "$key" "$(sget "clis.$key.activation.to")" true)"
                 clear_pending "$key"
             else
+                STATE="$(printf '%s' "$STATE" | pyj health "$key" "$(sget "clis.$key.activation.to")" false)"
                 note_pending "$key" "the rolled-back install is no longer usable; it is held by --rollback and was not replaced"; bad=1
             fi
             save_state; continue
@@ -1029,18 +1195,16 @@ mode_run() {
         save_state
     done
     save_state || bad=1
+    # a transaction for ANY CLI that is still open (needed or not) keeps the run incomplete
+    if any_open_txn; then bad=1; fi
     if [ "$bad" = 0 ]; then
-        if [ "$(cat "$GEN_FILE" 2>/dev/null || true)" != "$GEN_AT_START" ]; then
-            # a --schedule landed while this run was working from the older picture
-            "$SYSTEMCTL" enable --now "$TIMER" || true
-            say "PROVISIONING: INCOMPLETE; a newer request arrived during this run, so the retry timer stays enabled"
-            return 3
+        if timer_finish; then
+            say "PROVISIONING: complete"
+            return 0
         fi
-        "$SYSTEMCTL" disable --now "$TIMER" || say "WARNING: could not disable $TIMER"
-        say "PROVISIONING: complete"
-        return 0
+        return 3
     fi
-    "$SYSTEMCTL" enable --now "$TIMER" || true
+    arm_retries || true
     say "PROVISIONING: INCOMPLETE; retrying every $CFG_RETRY min"
     return 3
 }
@@ -1064,9 +1228,30 @@ held_ok_static() { # the link is still where the rollback put it, and what it po
     link_is "$key" "$to" || return 1
     [ -z "$to" ] || [ -x "$BIN_DIR/$key" ]
 }
-row_ok() { # installed, or held by --rollback AND still healthy
+# cheap_run KEY: the binary exists and its version runs (as root, in a scratch home)
+cheap_run() {
+    local key="$1" tv home out rc tok
+    tv="$(sget "clis.$key.activation.to_version")"
+    [ -x "$BIN_DIR/$key" ] || return 1
+    home="$(mktemp -d "$VAR_TMP/ai-clis-chk.XXXXXX")" || return 1
+    # shellcheck disable=SC2086
+    out="$(env -i HOME="$home" PATH=/usr/local/bin:/usr/bin:/bin timeout --kill-after=5 "$CHECK_TIMEOUT" "$BIN_DIR/$key" ${M_VCMD[$key]} 2>&1)"; rc=$?
+    rm -rf "$home"
+    [ "$rc" -eq 0 ] || return 1
+    tok="$(printf '%s\n' "$out" | grep -oE -- "${M_VREGEX[$key]}" | head -1)"
+    [ -n "$tok" ] || return 1
+    [ "$(expect_of "$tv")" = "*" ] || [ "$tok" = "$tv" ]
+}
+held_verified() { # the most recent --run checked THIS link target and it passed, and it still runs
+    local key="$1" to
+    to="$(sget "clis.$key.activation.to")"
+    [ -z "$to" ] && return 0
+    [ "$(sget "clis.$key.health.target")" = "$to" ] && [ "$(sget "clis.$key.health.ok")" = true ] || return 1
+    cheap_run "$key"
+}
+row_ok() { # installed, or held by --rollback AND verified healthy
     row_installed "$1" && return 0
-    held_of "$1" && held_ok_static "$1"
+    held_of "$1" && held_ok_static "$1" && held_verified "$1"
 }
 
 mode_check() {
@@ -1096,6 +1281,7 @@ mode_status() {
     for key in "${NEEDED[@]}"; do
         if ! row_ok "$key"; then
             local why; why="$(sget "clis.$key.pending.reason")"; [ -n "$why" ] || why="not yet installed"
+            if held_of "$key"; then [ -n "$(sget "clis.$key.pending.reason")" ] || why="the held install is unverified (no passing --run check of the current link)"; fi
             bad+="${bad:+; }$key: $why"
         fi
     done
@@ -1136,10 +1322,21 @@ mode_rollback() {
     if [ -n "$from" ] && { [ -z "$fv" ] || [ "$fv" = unobserved ]; } && [ "$force" != --force-unverified ]; then
         refuse "the previous install of $key was never observed, so a rollback cannot verify it; rerun with --force-unverified to accept that"
     fi
+    if [ -z "$from" ]; then   # durable history: never remove a CLI that had an unowned predecessor
+        history_from "$key"
+        if [ -n "$HF" ]; then from="$HF"; fv="$HFV"; fi
+    fi
+    if [ -n "$from" ] && { [ -z "$fv" ] || [ "$fv" = unobserved ]; } && [ "$force" != --force-unverified ]; then
+        refuse "the previous install of $key was never observed, so a rollback cannot verify it; rerun with --force-unverified to accept that"
+    fi
     prev="$(sget "clis.$key.activation")"
     link_txn "$key" rollback "$cur" "$tv" "$from" "${fv:--}" "$(expect_of "$fv")" "$prev"; rc=$?
     if [ "$rc" = 0 ]; then
         if [ -z "$from" ]; then say "rolled back $key: the managed link was removed"; else say "rolled back $key to ${fv:-the previous install}"; fi
+        if [ -n "$from" ]; then
+            STATE="$(printf '%s' "$STATE" | pyj health "$key" "$from" true)"; save_state || true   # the rollback just checked it
+        fi
+        timer_finish quiet || true
         return 0
     fi
     say "rollback of $key did not complete: $REASON"

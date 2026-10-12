@@ -42,7 +42,8 @@ _VALUE = re.compile(r"""^(?:[^"'\\]*|"[^"\\]*"|'[^'\\]*')$""")
 # are trimmed): Python and systemd disagree about what other whitespace is.
 _PLAIN = re.compile("^[" + chr(32) + "-" + chr(126) + chr(9) + "]*$")
 TRIM = chr(32) + chr(9) + chr(13)  # exactly what systemd trims from an unquoted value
-_LOOSE_KEY = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+WS = TRIM + chr(10)  # ASCII whitespace only: blank/comment detection never uses str.strip()
+_LOOSE_KEY = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=")
 READ_KEYS = ("AI_USAGE_ENABLED", "AI_USAGE_SOURCES")
 
 
@@ -57,7 +58,7 @@ def whitelist_failure(env_text: str):
     (indent, export, space before =, backslash, multiline or stray quotes) can
     hide where an assignment really starts, so it is not parsed at all."""
     for number, line in enumerate(_lines(env_text), 1):
-        if not line.strip() or line.lstrip()[:1] in ("#", ";"):
+        if not line.strip(WS) or line.lstrip(WS)[:1] in ("#", ";"):
             continue
         match = _LINE.match(line)
         if match and _VALUE.match(match.group(2)) and (

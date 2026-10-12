@@ -71,7 +71,8 @@ change reaches the wall only after the kiosk shell restarts.
 
 - **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`. When the
   file mentions `AI_USAGE_`, EVERY line must be one of: blank; a comment (first
-  non-space character `#` or `;`); or a canonical assignment `NAME=VALUE` at
+  non-space character `#` or `;`, where "space" is only space, tab and CR, so a
+  Unicode space makes the line an ordinary non-canonical line); or a canonical assignment `NAME=VALUE` at
   column 0 whose VALUE is exactly one of: bare (no quote or backslash anywhere),
   one double-quoted string, or one single-quoted string, with nothing outside the
   quotes. This is a positive whitelist: it is what the materialiser and

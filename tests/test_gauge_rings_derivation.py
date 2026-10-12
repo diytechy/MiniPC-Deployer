@@ -585,3 +585,36 @@ def test_tc1218_tabs_and_spaces_are_trimmed_from_a_bare_value_like_systemd(tmp_p
     env, source, dest = make_raw(tmp_path, text)
     MODULE.install(env, source, dest)
     assert providers(dest) == ["claude", "codex"]
+
+
+
+# ---- fix round 7: blank / comment / indent use systemd's ASCII whitespace only ----
+
+@pytest.mark.parametrize("space", [chr(0xA0), chr(0x2003), chr(0x3000), chr(0x0B), chr(0x0C)],
+                         ids=["nbsp", "em space", "ideographic", "vt", "ff"])
+@pytest.mark.parametrize("lead", ["#", ";", ""])
+def test_tc1218_a_unicode_space_line_is_not_blank_not_a_comment_and_fails_safe(tmp_path, capsys, space, lead):
+    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    # Sol's repro: the first line looks like a comment to Python's str.lstrip() only.
+    text = ("AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=gemini\n" + space + lead + "OTHER=\"open\n"
+            "AI_USAGE_SOURCES=codex\n#\"\n")
+    env, source, dest = make_raw(tmp_path, text, json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    out = capsys.readouterr().out
+    assert len([l for l in out.splitlines() if "WARNING" in l]) == 1 and "line 3" in out
+
+
+def test_tc1218_a_unicode_space_only_line_is_not_blank(tmp_path):
+    assert MODULE.whitelist_failure("A=1\n" + chr(0xA0) + "\n") == (2, None)
+    assert MODULE.whitelist_failure("A=1\n" + chr(0x2003) + "\n") == (2, None)
+
+
+def test_tc1218_ascii_blank_and_comment_lines_with_tabs_and_cr_still_pass():
+    tab = chr(9)
+    text = tab + " " + tab + "\r\n" + " " + tab + "# note\r\n" + tab + "; note\nA=1\r\n"
+    assert MODULE.whitelist_failure(text) is None
+
+
+def test_tc1218_a_carriage_return_inside_blank_space_is_ascii_whitespace():
+    assert MODULE.whitelist_failure("A=1\n " + chr(13) + " \n") is None

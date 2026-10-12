@@ -290,15 +290,32 @@ NEW_TIMER="homehub-claude-refresh@claude.timer"
 # have done): a rerun after a half-finished run must not re-enable the old timer
 # beside an active new one.
 #
-#   timer_state UNIT -> on (enabled AND active) | off (neither) | unknown
+#   timer_state UNIT -> on      (enabled AND active)
+#                       off     (not enabled AND not active)
+#                       partial (CONFIRMED half-applied: enabled but not active, or
+#                                active but not enabled)
+#                       unknown (a query failed or said something unrecognised)
+#
+# THE RULE: `unknown` never leads to a disable or an enable. Only a CONFIRMED
+# state moves a timer; an unknown one is left exactly as it is, with an ERROR that
+# names the check commands, and the script exits 3. (Callers, all audited:
+# restore_legacy_timer x2, the start-of-migration reads x2, the old-timer verify
+# in the already-migrated branch, and the new-timer check after its enable.)
 timer_state() {
     local en ac
     en="$(systemctl is-enabled "$1" 2>/dev/null || true)"
     ac="$(systemctl is-active "$1" 2>/dev/null || true)"
     case "$en" in
-        enabled) [ "$ac" = active ] && { echo on; return 0; } ;;
+        enabled)
+            case "$ac" in
+                active) echo on; return 0 ;;
+                inactive|failed|dead) echo partial; return 0 ;;
+            esac ;;
         disabled|not-found|static|indirect|linked|masked|generated)
-            case "$ac" in inactive|failed|dead) echo off; return 0 ;; esac ;;
+            case "$ac" in
+                inactive|failed|dead) echo off; return 0 ;;
+                active) echo partial; return 0 ;;
+            esac ;;
     esac
     echo unknown
 }
@@ -310,10 +327,17 @@ timer_state() {
 LEGACY_BLOCKED=0
 LEGACY_PRESENT=0
 LEGACY_ARMED=0
+NEW_ENABLE_ATTEMPTED=0
 restore_legacy_timer() {
     [ "$LEGACY_ARMED" = 1 ] || return 0
     LEGACY_ARMED=0
-    case "$(timer_state "$NEW_TIMER")" in
+    new_now="$(timer_state "$NEW_TIMER")"
+    # We read the new timer as OFF before touching anything. If we have not tried to
+    # enable it since, a failing query does not change that.
+    if [ "$new_now" = unknown ] && [ "$NEW_ENABLE_ATTEMPTED" = 0 ]; then
+        new_now=off
+    fi
+    case "$new_now" in
         on)
             say "The new $NEW_TIMER is running and stays the Claude account-1 refresher;"
             say "  the old timer is NOT re-enabled (two would race on one single-use token)."
@@ -327,9 +351,13 @@ restore_legacy_timer() {
             say "    systemctl enable --now $OLD_TIMER ; systemctl disable --now $NEW_TIMER"
             return 0 ;;
     esac
-    if systemctl enable --now "$OLD_TIMER" >/dev/null 2>&1 \
-            && [ "$(timer_state "$OLD_TIMER")" = on ]; then
-        say "The old $OLD_TIMER is enabled again and is the Claude account-1 refresher."
+    if systemctl enable --now "$OLD_TIMER" >/dev/null 2>&1; then
+        if [ "$(timer_state "$OLD_TIMER")" = on ]; then
+            say "The old $OLD_TIMER is enabled again and is the Claude account-1 refresher."
+        else
+            say "WARNING: $OLD_TIMER was enabled but its state cannot be confirmed. Check, as root:"
+            say "    systemctl is-active $OLD_TIMER"
+        fi
     else
         say "ERROR: could NOT re-enable $OLD_TIMER. Claude account 1 has NO"
         say "  refresher right now and its token will lapse. Run, as root:"
@@ -427,15 +455,43 @@ if command -v systemctl >/dev/null 2>&1; then
     if [ "$LEGACY_BLOCKED" = 0 ] && [ "$LEGACY_COMPLETE" = 0 ]; then
         # `enable --now` can change state and then report failure: judge by the
         # state it left, not by its exit status.
+        NEW_ENABLE_ATTEMPTED=1
         systemctl enable --now "$NEW_TIMER" >/dev/null 2>&1 || true
-        if [ "$(timer_state "$NEW_TIMER")" != on ]; then
-            LEGACY_BLOCKED=1
-            say "WARNING: $NEW_TIMER is not confirmed running."
-            # It may be half-applied (enabled but not started): turn it fully off
-            # first, so restoring the old timer can never leave two enabled.
-            systemctl disable --now "$NEW_TIMER" >/dev/null 2>&1 || true
-            restore_legacy_timer
-        fi
+        new_after="$(timer_state "$NEW_TIMER")"
+        case "$new_after" in
+            on) ;;
+            off)
+                # Nothing was left half-applied: put the old timer back, if there is one.
+                LEGACY_BLOCKED=1
+                say "WARNING: $NEW_TIMER did not start."
+                if [ "$LEGACY_ARMED" = 1 ]; then
+                    restore_legacy_timer
+                else
+                    say "ERROR: Claude account 1 has NO refresher (there is no old timer to fall back on)."
+                    say "  Fix the cause, then run, as root:  systemctl enable --now $NEW_TIMER"
+                fi ;;
+            partial)
+                # CONFIRMED half-applied (enabled but not started, or the reverse).
+                LEGACY_BLOCKED=1
+                say "WARNING: $NEW_TIMER is only half enabled."
+                if [ "$LEGACY_ARMED" = 1 ]; then
+                    # A confirmed-good fallback exists, so turn the new one fully off
+                    # first: restoring the old timer must never leave two enabled.
+                    systemctl disable --now "$NEW_TIMER" >/dev/null 2>&1 || true
+                    restore_legacy_timer
+                else
+                    say "ERROR: there is no old timer to fall back on, so it was left as it is."
+                    say "  Finish it, as root:  systemctl enable --now $NEW_TIMER"
+                fi ;;
+            *)
+                # UNKNOWN: a query failed. Change nothing at all.
+                LEGACY_BLOCKED=1
+                say "ERROR: cannot confirm the state of $NEW_TIMER, so NO timer was changed."
+                say "  Check, as root:  systemctl is-enabled $NEW_TIMER $OLD_TIMER ;"
+                say "                   systemctl is-active  $NEW_TIMER $OLD_TIMER"
+                say "  and leave exactly ONE of the two running."
+                LEGACY_ARMED=0 ;;
+        esac
     fi
 fi
 

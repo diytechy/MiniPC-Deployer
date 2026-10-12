@@ -99,6 +99,8 @@ failmatch=0
 case "$*" in *"${STUB_SYSTEMCTL_FAIL:-@@none@@}"*) failmatch=1 ;; esac
 if [ "$1" = "is-active" ] || [ "$1" = "is-enabled" ]; then
   [ "$failmatch" = 1 ] && exit 1
+  # STUB_QFAIL_AFTER=<call>: once that call has happened, every state query fails.
+  if [ -n "${STUB_QFAIL_AFTER:-}" ] && grep -qF -- "systemctl $STUB_QFAIL_AFTER" "$SANDBOX/calls.log"; then exit 1; fi
   unit="$2"
   case "$unit" in
     *.service)
@@ -1364,3 +1366,61 @@ def test_half_applied_new_timer_that_cannot_be_turned_off_is_never_joined_by_the
     assert "systemctl enable --now %s" % OLD_TIMER in done.stdout        # the instruction, not an action
     assert "systemctl enable --now " + OLD_TIMER not in box.calls         # ...never executed
     assert OLD_TIMER not in _enabled(box)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 4 - an UNKNOWN timer state never leads to a disable (or an enable)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _timer_mutations(box):
+    return [c for c in box.calls if c.startswith(("systemctl disable", "systemctl enable"))
+            and c.split()[-1] in (OLD_TIMER, NEW_TIMER)]
+
+
+def test_solrepro_migrated_hub_query_failing_after_the_enable_keeps_the_new_timer_sr067(tmp_path):
+    """No legacy files, @claude already on; on the rerun `enable --now` succeeds and
+    then the state queries fail. Round 3 disabled the replacement and left ZERO."""
+    box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=claude", "AI_USAGE_USER_ACCOUNT=alice"],
+              accounts=["alice"])
+    (box.root / "enabled").write_text(NEW_TIMER + "\n", encoding="utf-8")
+    done = box.run(SETUP_USAGE, STUB_QFAIL_AFTER="enable --now " + NEW_TIMER)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert NEW_TIMER in _enabled(box), "the replacement must NOT have been disabled"
+    assert not [c for c in _timer_mutations(box) if c.startswith("systemctl disable")]
+    assert "ERROR: cannot confirm the state of " + NEW_TIMER in done.stdout
+    assert "systemctl is-active" in done.stdout
+
+
+QUERY_FAILURES = [
+    # id, legacy present?, extra env, expected exit, surviving refresher (file-based)
+    ("unknown-after-enable-with-legacy", True, {"STUB_QFAIL_AFTER": "enable --now " + NEW_TIMER}, 3, NEW_TIMER),
+    ("unknown-after-enable-no-legacy", False, {"STUB_QFAIL_AFTER": "enable --now " + NEW_TIMER}, 3, NEW_TIMER),
+    ("unknown-at-start-with-legacy", True, {"STUB_SYSTEMCTL_FAIL": "is-enabled"}, 3, OLD_TIMER),
+    ("unknown-at-restore-after-old-disabled", True,
+     {"STUB_ACTIVE": "activating", "STUB_QFAIL_AFTER": "disable --now " + OLD_TIMER}, 3, OLD_TIMER),
+]
+
+
+@pytest.mark.parametrize("name,legacy,extra,code,survivor", QUERY_FAILURES, ids=[q[0] for q in QUERY_FAILURES])
+def test_query_failures_never_disable_a_timer_and_never_leave_zero_sr067(tmp_path, name, legacy, extra, code, survivor):
+    if legacy:
+        box = _legacy_box(tmp_path)
+    else:
+        box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=claude", "AI_USAGE_USER_ACCOUNT=alice"],
+                  accounts=["alice"])
+        (box.root / "enabled").write_text("", encoding="utf-8")
+    done = box.run(SETUP_USAGE, **extra)
+    assert done.returncode == code, done.stdout + done.stderr
+    assert _refreshers(box) == [survivor], (_enabled(box), done.stdout)
+    # A timer that was enabled before the run is only ever disabled on a CONFIRMED
+    # state: with the queries failing, the only disable allowed is the old timer's,
+    # which happens before the failure begins.
+    assert not [c for c in _timer_mutations(box) if c == "systemctl disable --now " + NEW_TIMER]
+
+
+def test_the_no_legacy_enable_that_fails_outright_says_how_to_start_the_refresher_sr067(tmp_path):
+    box = Box(tmp_path, USAGE_ENV + ["AI_USAGE_SOURCES=claude", "AI_USAGE_USER_ACCOUNT=alice"], accounts=["alice"])
+    done = box.run(SETUP_USAGE, STUB_SYSTEMCTL_FAIL="enable --now " + NEW_TIMER)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "ERROR: Claude account 1 has NO refresher" in done.stdout
+    assert "systemctl enable --now " + NEW_TIMER in done.stdout

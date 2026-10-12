@@ -31,8 +31,8 @@ from pathlib import PurePosixPath
 import re
 import tarfile
 
-# The floor: OfficeWallNaglight CameraOpt 5008311 (2026-10-11). Hand-copied from
-# its capabilities.json; see the module docstring for what may and may not grow.
+# The floor: OfficeWallNaglight feat-stacked-life-row 3f7de0d (2026-10-12, based on
+# CameraOpt 5008311). Hand-copied from its capabilities.json; see the module docstring for what may and may not grow.
 REQUIRED = {
     "tracker-coordination-v1": {"app": ["js/main.js", "js/tracker-coordinator.js", "js/tracker.js"], "site": ["js/main.js", "js/tracker-coordinator.js", "js/tracker.js"], "gateway": []},
     "touch-feedback-v1": {"app": ["index.html", "js/main.js", "js/touch-feedback.js", "css/touch-feedback.css", "vendor/waves/waves.js"], "site": ["index.html", "js/main.js", "js/touch-feedback.js", "css/touch-feedback.css", "vendor/waves/waves.js"], "gateway": []},
@@ -45,7 +45,7 @@ REQUIRED = {
     "virtual-input-v1": {"app": ["index.html", "js/main.js", "js/pin-keypad.js", "js/text-keyboard.js", "js/views/settings.js", "js/views/pandora.js", "css/access.css", "css/shell.css", "electron/pandora-keyboard-bridge.cjs", "electron/main.cjs", "electron/preload.cjs"], "site": ["index.html", "js/main.js", "js/pin-keypad.js", "js/views/settings.js", "css/access.css"], "gateway": []},
     "tracker-corrections-v2": {"app": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "site": ["index.html", "js/main.js", "js/access.js", "js/tracker.js", "js/tracker-coordinator.js", "js/views/nag.js", "css/shell.css"], "gateway": ["gateway/server.mjs", "gateway/state.mjs"]},
     "panel-tabs-v1": {"app": ["index.html", "js/main.js", "js/state-machine.js", "js/tab-preference.js", "js/views/nag.js", "js/views/music.js", "js/views/pandora.js", "css/shell.css", "css/access.css"], "site": ["index.html", "js/main.js", "js/state-machine.js", "js/tab-preference.js", "js/views/nag.js", "js/views/music.js", "js/views/pandora.js", "css/shell.css", "css/access.css"], "gateway": []},
-    "progress-gauges-v1": {"app": ["index.html", "js/main.js", "js/config.js", "js/views/gauges.js", "css/shell.css", "vendor/brand/OAI_OpenAI-Blossom_White.svg", "vendor/brand/opencode-favicon.svg", "vendor/brand/claude-favicon.svg", "vendor/brand/Grok_Logomark_Light.svg", "vendor/brand/gemini-sparkle.svg", "vendor/brand/freellmapi-favicon.svg", "vendor/icons/sleep.svg"], "site": ["index.html", "js/main.js", "js/config.js", "js/views/gauges.js", "css/shell.css", "vendor/brand/OAI_OpenAI-Blossom_White.svg", "vendor/brand/opencode-favicon.svg", "vendor/brand/claude-favicon.svg", "vendor/brand/Grok_Logomark_Light.svg", "vendor/brand/gemini-sparkle.svg", "vendor/brand/freellmapi-favicon.svg", "vendor/icons/sleep.svg"], "gateway": []},
+    "progress-gauges-v1": {"app": ["index.html", "js/main.js", "js/config.js", "js/views/gauges.js", "css/shell.css", "vendor/brand/OAI_OpenAI-Blossom_White.svg", "vendor/brand/opencode-favicon.svg", "vendor/brand/claude-favicon.svg", "vendor/brand/Grok_Logomark_Light.svg", "vendor/brand/gemini-sparkle.svg", "vendor/brand/freellmapi-favicon.svg", "vendor/icons/sleep.svg", "vendor/icons/heart.svg"], "site": ["index.html", "js/main.js", "js/config.js", "js/views/gauges.js", "css/shell.css", "vendor/brand/OAI_OpenAI-Blossom_White.svg", "vendor/brand/opencode-favicon.svg", "vendor/brand/claude-favicon.svg", "vendor/brand/Grok_Logomark_Light.svg", "vendor/brand/gemini-sparkle.svg", "vendor/brand/freellmapi-favicon.svg", "vendor/icons/sleep.svg", "vendor/icons/heart.svg"], "gateway": []},
     "local-visualizer-v1": {"app": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "site": ["index.html", "js/main.js", "js/views/settings.js", "js/views/visualizer.js", "js/visualizer-core.js", "js/visualizer-preference.js", "css/access.css", "css/shell.css"], "gateway": []},
     "door-stream-v1": {"app": ["index.html", "js/main.js", "js/state-machine.js", "js/views/door.js", "css/shell.css", "electron/main.cjs", "electron/preload.cjs", "electron/door-bridge.cjs", "electron/display-lit.cjs", "doorstream/service.py", "doorstream/motion.py"], "site": [], "gateway": []},
     "panel-audio-v1": {"app": ["index.html", "js/main.js", "js/views/bluetooth.js", "js/views/visualizer.js", "js/visualizer-core.js", "css/shell.css", "css/access.css", "electron/main.cjs", "electron/preload.cjs", "electron/audio-bridge.cjs", "electron/audio-ipc.cjs", "electron/bluetooth-sources.cjs"], "site": ["index.html", "js/main.js", "js/views/bluetooth.js", "js/views/visualizer.js", "js/visualizer-core.js", "css/shell.css", "css/access.css"], "gateway": []},
@@ -135,6 +135,7 @@ ALLOWED_SITE_FILES = {
     "vendor/brand/opencode-favicon.svg",
     "vendor/icons/cash.svg",
     "vendor/icons/clock.svg",
+    "vendor/icons/heart.svg",
     "vendor/icons/sleep.svg",
     "vendor/icons/weight.svg",
     "vendor/projectm/PROVENANCE.md",

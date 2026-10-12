@@ -1,8 +1,8 @@
 """SR-017: the wall capability contract tracks the panel's own capabilities.json.
 
 The fixture under tests/fixtures/wall-camera-opt is the OTHER side of the
-contract - OfficeWallNaglight's own manifest and site inventory at CameraOpt
-5008311 (see its SOURCE.txt). Nothing in this file invents the values it checks
+contract - OfficeWallNaglight's own manifest and site inventory at
+feat-stacked-life-row 3f7de0d, based on CameraOpt 5008311 (see its SOURCE.txt). Nothing in this file invents the values it checks
 against: the script's REQUIRED / ALLOWED_SITE_FILES are compared with what the
 panel says it ships, and each mutation below must be REJECTED by the script.
 """
@@ -20,7 +20,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/wall-camera-opt"
-REVISION = "50083113dc1a9d6f9763a8b07f5d3bf53f5e19ec"
+REVISION = "3f7de0d86fda9a8456361b790f7145903b284551"
 
 spec = importlib.util.spec_from_file_location(
     "wall_capability_contract", ROOT / "scripts/assert_wall_capabilities.py"
@@ -127,7 +127,7 @@ def test_cli_accepts_the_three_camera_opt_payloads_together(tmp_path):
 def test_every_public_site_file_the_panel_ships_is_in_the_inventory():
     # The 27-file regression: the inventory is the exposure list, so it must
     # name every file the panel's own build puts in the document root.
-    assert len(PANEL_SITE_FILES) == len(set(PANEL_SITE_FILES)) == 77
+    assert len(PANEL_SITE_FILES) == len(set(PANEL_SITE_FILES)) == 78
     assert sorted(set(PANEL_SITE_FILES) - contract.ALLOWED_SITE_FILES) == []
 
 
@@ -173,6 +173,30 @@ def test_the_ring_rail_brand_marks_cannot_be_dropped_silently(tmp_path):
             lambda caps: [caps["progress-gauges-v1"][payload].remove(m) for m in marks]
         )
         reject(tmp_path, kind, "progress-gauges-v1", manifest=manifest)
+
+
+def test_the_heart_glyph_is_declared_floor_and_in_the_site_inventory():
+    # Owner ruling 2026-10-11 (round 3): vendor/icons/heart.svg ships with the
+    # gauge view on BOTH payloads, exactly as the sleep glyph does. The values
+    # are the panel's own (the fixture), not restated here.
+    glyph = "vendor/icons/heart.svg"
+    for payload in ("app", "site"):
+        assert glyph in PANEL_MANIFEST["capabilities"]["progress-gauges-v1"][payload]
+        assert glyph in contract.REQUIRED["progress-gauges-v1"][payload]
+    assert glyph in PANEL_SITE_FILES
+    assert glyph in contract.ALLOWED_SITE_FILES
+
+
+@pytest.mark.parametrize("payload,kind", [("app", "shell"), ("site", "site")])
+def test_the_gauge_glyphs_cannot_be_dropped_from_the_declaration(tmp_path, payload, kind):
+    for glyph in ("vendor/icons/heart.svg", "vendor/icons/sleep.svg"):
+        manifest = mutated(lambda caps: caps["progress-gauges-v1"][payload].remove(glyph))
+        reject(tmp_path, kind, "progress-gauges-v1", manifest=manifest)
+
+
+def test_a_site_archive_missing_the_declared_heart_glyph_is_rejected(tmp_path):
+    reject(tmp_path, "site", "missing capability file: .*heart.svg",
+           drop=["site/vendor/icons/heart.svg"])
 
 
 @pytest.mark.parametrize(

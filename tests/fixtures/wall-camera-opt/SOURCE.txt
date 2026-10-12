@@ -1,15 +1,16 @@
 Fixture for tests/test_wall_capability_contract.py (LLR-1069..1072).
 
-Taken READ-ONLY from OfficeWallNaglight branch CameraOpt, commit
-50083113dc1a9d6f9763a8b07f5d3bf53f5e19ec (2026-10-11; a merge, re-baselined
-from bdaa4d69e8a2f616cde753dbc93a66bfc51cc042):
+Taken READ-ONLY from OfficeWallNaglight branch feat-stacked-life-row, commit
+3f7de0d86fda9a8456361b790f7145903b284551 (2026-10-12; two commits on CameraOpt
+50083113dc1a9d6f9763a8b07f5d3bf53f5e19ec, adding the Heart glyph), re-baselined
+from CameraOpt 5008311:
 
-  capabilities.json  git show CameraOpt:capabilities.json, byte for byte
+  capabilities.json  git show <that commit>:capabilities.json, byte for byte
   site-files.txt     every regular file of the site payload that
                      tools/build-artifact.mjs stages from SITE_SOURCES
                      (index.html css js vendor config.example.json
                      capabilities.json) plus the VERSION and build-info.json
-                     stamps it writes; 77 lines, sorted.
+                     stamps it writes; 78 lines, sorted.
 
 This is the OTHER side of the contract: it is the panel's own statement of
 what it ships, so the test that feeds it to scripts/assert_wall_capabilities.py

@@ -83,7 +83,7 @@ change reaches the wall only after the kiosk shell restarts.
   list; quoted whitespace or commas-only gives an empty list, and every derivable
   block then becomes `{"slots": [], "unlisted": "hide", "derivedFrom": ...}`.
 - **Fail-safe.** If ANY assignment in the file has a multiline value (an unclosed
-  opening quote or a trailing backslash), assignment boundaries are ambiguous and
+  opening quote, or ANY backslash in a value), assignment boundaries are ambiguous and
   the same fail-safe applies; the WARNING names the line number and key, never the
   value, and multiline values are not parsed. Likewise if the final assignment is in any other form (indented, space
   before `=`, `export`, any backslash, an unmatched or multiline quote), or the

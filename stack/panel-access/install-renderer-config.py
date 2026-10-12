@@ -81,7 +81,8 @@ CRLF, LF, BACKSLASH = chr(13) + chr(10), chr(10), chr(92)
 
 def multiline_value_line(env_text: str):
     """(line number, key) of the first assignment whose value runs onto the next
-    line (an unclosed opening quote, or a trailing backslash), else None. Inside
+    line (an unclosed opening quote) or carries ANY backslash (an escaped quote or a
+    continuation can hide the true end of the value), else None. Inside
     such a value text can look like an assignment, so boundaries are ambiguous
     and multiline values are deliberately not parsed."""
     for number, line in enumerate(env_text.replace(CRLF, LF).split(LF), 1):
@@ -90,7 +91,7 @@ def multiline_value_line(env_text: str):
             continue
         value = match.group(5).strip()
         unclosed = value[:1] in ("'", '"') and value.find(value[0], 1) < 0
-        if unclosed or value.endswith(BACKSLASH):
+        if unclosed or BACKSLASH in value:
             return number, match.group(3)
     return None
 

@@ -322,7 +322,7 @@ def test_tc1218_unsupported_form_leaves_an_owner_written_block_alone(tmp_path):
 
 def test_tc1218_unsupported_EARLIER_assignment_does_not_block_a_supported_final_one(tmp_path):
     stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
-    text = ENABLED + "export AI_USAGE_SOURCES=gemini\n AI_USAGE_SOURCES=gemini\nAI_USAGE_SOURCES=co\\dex\nAI_USAGE_SOURCES=codex\n"
+    text = ENABLED + "export AI_USAGE_SOURCES=gemini\n AI_USAGE_SOURCES=gemini\nAI_USAGE_SOURCES =gemini\nAI_USAGE_SOURCES=codex\n"
     env, source, dest = make_raw(tmp_path, text, json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
     MODULE.install(env, source, dest)
     assert providers(dest) == ["codex"] and "derivedFrom" in block_of(dest)
@@ -467,3 +467,17 @@ def test_tc1218_closed_quotes_on_other_keys_do_not_trigger_the_guard(tmp_path):
     env, source, dest = make_raw(tmp_path, 'OTHER="two words"\nAI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n')
     MODULE.install(env, source, dest)
     assert providers(dest) == ["codex"]
+
+
+# ---- fix round 4: ANY backslash in a value makes the file ambiguous ----
+
+def test_tc1218_escaped_quote_cannot_hide_a_fake_assignment(tmp_path, capsys):
+    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    text = ('AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=gemini\n'
+            'OTHER="text SECRETVALUE \\"still open\nAI_USAGE_SOURCES=codex\n"\n')
+    assert '\\"' in text
+    env, source, dest = make_raw(tmp_path, text, json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    out = capsys.readouterr().out
+    assert re.search(r"line \d+ \(OTHER\)", out) and "SECRETVALUE" not in out

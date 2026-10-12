@@ -2439,6 +2439,49 @@ if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
     fi
 fi
 
+# ── 6f-2. the sleep feeder (SR-070..SR-072, SR-074) ────────────────────────
+# The CPAP's myAir sleep score as the NagLight `sleep` gauge. A plain service on
+# a 30-minute timer, no container, OFF by default - the same shape as 6e and 6f,
+# and like 6f it CREATES its own account (`homehub-sleep`, no home).
+#
+# THE HEART GAUGE NEEDS NO BLOCK OF ITS OWN: it rides the weight feeder (6f), so
+# HEART_* reach it through that unit's EnvironmentFile=, and it only acts while
+# WEIGHT_ENABLED=true as well.
+#
+# THE SCRIPT DOES THE REFUSING, NOT THIS BLOCK: a blank SLEEP_USER,
+# SLEEP_FEED_URL, MYAIR_EMAIL or MYAIR_PASSWORD is a refusal (exit 2), and a
+# refusal here is a WARNING, never a failed first boot - the box is otherwise
+# complete and the sleep gauge simply is not installed. Re-run by hand once the
+# value exists (the secret-store import of MyAirPassword is the usual one).
+# Same unset-variable defect as AI_CLI_ENABLED and the mesh tunnel above.
+# ONE quote rule, shared with setup-sleep.sh and apply-env-lines.py: strip a single
+# MATCHING pair of surrounding quotes and nothing else (deleting every quote would turn
+# tr'ue into true, which setup-sleep.sh then refuses).
+SLEEP_ENABLED="$(_env_val SLEEP_ENABLED)"
+case "$SLEEP_ENABLED" in
+    \"?*\") SLEEP_ENABLED="${SLEEP_ENABLED#\"}"; SLEEP_ENABLED="${SLEEP_ENABLED%\"}" ;;
+    \'?*\') SLEEP_ENABLED="${SLEEP_ENABLED#\'}"; SLEEP_ENABLED="${SLEEP_ENABLED%\'}" ;;
+esac
+if [ "${SLEEP_ENABLED:-false}" = "true" ]; then
+    log "provisioning the sleep feeder (activated by .env)…"
+    if [ -f "$STACK_DIR/sleep/setup-sleep.sh" ]; then
+        if bash "$STACK_DIR/sleep/setup-sleep.sh" 2>&1 | sed 's/^/  /'; then
+            log "  sleep feeder installed; timer runs every 30 minutes"
+            log "  STILL OWED BY A HUMAN IF THE GAUGE STAYS GREY: myAir may refuse the"
+            log "  sign-in or ask for an emailed code. The reason is in:"
+            log "    journalctl -u homehub-sleep"
+        else
+            log "  WARNING: setup-sleep.sh refused or failed - this box posts NO"
+            log "    sleep gauge. Everything else is unaffected. The reason is in the"
+            log "    lines above; re-run by hand once fixed:"
+            log "      sudo bash $STACK_DIR/sleep/setup-sleep.sh"
+        fi
+    else
+        log "  WARNING: SLEEP_ENABLED=true but no $STACK_DIR/sleep/setup-sleep.sh"
+        log "    on the payload - carriage missing for an activated feature."
+    fi
+fi
+
 
 # ── 6g. hub recovery: the always-on record, and the opt-in supervisor ───────
 # (SR-049..SR-051; HomeHub HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md)

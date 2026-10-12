@@ -139,8 +139,11 @@ skew *between* clocks is out of scope.
 | `SLEEP_TIMEOUT_SECONDS` | `30` | Per request (a cycle is five). |
 | `TIMEZONE` | `Etc/UTC` in the example | **Must be the hub's real zone** — night keys are local dates. Blank/unknown is refused. |
 
-**`MYAIR_PASSWORD` must not contain `\` or `"`** (systemd's `EnvironmentFile=` unescapes
-a backslash and strips double quotes; see Known limits (c)).
+**`MYAIR_PASSWORD` must not contain `\` or `"`, and a password that is not
+whitespace-containing must not START with `'`** (systemd's `EnvironmentFile=`
+unescapes a backslash, strips double quotes and drops a bare leading quote; an
+apostrophe inside, at the end, or anywhere in a password that contains spaces - which
+the materialiser wraps in double quotes - is fine; see Known limits (c)).
 
 `$` handling: the materialiser writes every `$` in a `.env` value as `$$`
 (compose interpolates), and systemd's `EnvironmentFile=` does **not** undo it. The
@@ -321,7 +324,151 @@ home**), installs the unit and timer, writes a drop-in so the unit's `User=` is 
 `SLEEP_USER_ACCOUNT` knob, and enables **the timer** (never the oneshot service).
 It refuses on a blank `SLEEP_USER`, `SLEEP_FEED_URL`, `MYAIR_EMAIL` or
 `MYAIR_PASSWORD` (it asks only *whether* the last two are non-blank; it never reads
-or prints them). `firstboot.sh` does **not** yet call it — see the report.
+or prints them). `stack/autoinstall/firstboot.sh` (step 6f-2) calls it on a fresh
+install whenever `.env` says `SLEEP_ENABLED=true`, modelled on the weight block: a
+refusal there is a logged WARNING, never a failed first boot. The whole `stack/` tree
+rides the ISO payload (it is a `git archive` of tracked files), so `stack/sleep/` is
+carried without being named anywhere; `tests/test_sleep_wiring.py` asserts all six
+files are tracked.
+
+## Installing on the RUNNING hub (no reimage)
+
+Written down, **not run**. `/opt/homehub` is **not a git checkout** (it is a copied
+tree), so never sync the whole repo over it: diff and copy only `stack/sleep/`.
+Nothing here restarts a container; the feeder is a host systemd unit.
+
+1. **Dev PC: materialise the hub config** as usual. The generated `scripts\deploy\out\homehub\.env`
+   must carry the keys below (check **names only**; never print the file or a
+   value): `SLEEP_ENABLED=true`, `SLEEP_USER`, `SLEEP_USER_ACCOUNT`, `SLEEP_FEED_URL`,
+   `SLEEP_FEED_TOKEN`, `SLEEP_PUBLISH`, `SLEEP_STATE_FILE`, `SLEEP_TIMEOUT_SECONDS`,
+   `MYAIR_EMAIL`, `MYAIR_PASSWORD`, `HEART_*`. `SLEEP_ENABLED` and `SLEEP_USER` come
+   from HomeHub `config.homehub.psd1`; `MYAIR_EMAIL` from the identity row
+   `household.MyAirEmail`; `MYAIR_PASSWORD` from the store key `MyAirPassword`.
+   `HEART_ENABLED` stays `0` (no heart device exists yet).
+2. **Hub: back the `.env` up.**
+   `sudo cp -p /opt/homehub/stack/.env /opt/homehub/stack/.env.bak-$(date +%Y%m%d-%H%M%S)`
+3. **Hub: copy only the sleep tree, after diffing it.** Stage the six files from the
+   release commit (`git archive <commit> stack/sleep` on the dev PC, piped over ssh
+   on stdin into a scratch directory such as `/tmp/sleep-stage`), then
+   `diff -r /tmp/sleep-stage/stack/sleep /opt/homehub/stack/sleep` - on a first
+   install the destination does not exist and every file is new. Then
+   `sudo install -d -m 0755 /opt/homehub/stack/sleep` and `sudo install -m 0644` each
+   of `README.md`, `apply-env-lines.py`, `homehub-sleep.service`,
+   `homehub-sleep.timer`, `setup-sleep.sh`, `sleep_feeder.py` into it, and remove the
+   scratch directory. Copy nothing else.
+4. **Hub: set the keys with the helper from step 3.** Do **not** "append
+   what is missing": a hub `.env` that already carries the template defaults
+   (`SLEEP_ENABLED=false`, a blank `SLEEP_USER`, blank myAir values) would keep them,
+   and `setup-sleep.sh` would then exit "disabled" having installed nothing. A second
+   copy of a key is no better: systemd and `setup-sleep.sh` take the **last** line,
+   firstboot's `_env_val` the **first**. The helper replaces the first line of each
+   key, drops any further copies (including `export KEY=` and indented ones),
+   appends keys that are absent, and writes the result **atomically**: a temp file in
+   the same directory with the original's mode and owner, `fsync`, `os.replace`, then
+   an `fsync` of the directory, all under an exclusive `flock`. A failure at any
+   point removes the temp file and leaves the original untouched; the file is *not*
+   rewritten in place, because a half-written `.env` would corrupt every hub secret
+   and nothing bind-mounts it (compose reads it for interpolation only, systemd as an
+   `EnvironmentFile`), so keeping its inode buys nothing. It accepts only the exact
+   sleep, myAir, heart and `TIMEZONE` key names (a typo is refused), **refuses a blank
+   value for a required key** (so a store key that was never imported cannot blank a
+   good hub value), and prints only key names and `replaced` / `added` / `unchanged`,
+   never a value.
+
+   **Transport: the bytes, not the pipeline.** PowerShell 5.1 re-encodes anything
+   piped to a native program (ASCII by default, with `?` for what it cannot encode),
+   so a non-ASCII password would arrive corrupted *and look valid*. Do not pipe. Write
+   the wanted lines to a file as UTF-8 **without a BOM** and let `cmd.exe` redirect
+   the file's bytes into ssh; this behaves the same on PowerShell 5.1 and 7. The
+   helper then rejects a BOM or anything that is not valid UTF-8. From the dev PC, in
+   the HomeHub repo (the file holds secrets: it lives in the already-restricted
+   `out\` directory and is deleted at once):
+
+   ```
+   $utf8 = New-Object System.Text.UTF8Encoding($false)
+   $src  = "scripts\deploy\out\homehub\.env"
+   $tmp  = "scripts\deploy\out\homehub\sleep-lines.env"
+   $keep = [IO.File]::ReadAllLines((Resolve-Path $src), $utf8) |
+       Where-Object { $_ -match '^(SLEEP_|MYAIR_|HEART_)[A-Z_]*=' }
+   try {
+       [IO.File]::WriteAllText("$PWD\$tmp", (($keep -join "`n") + "`n"), $utf8)
+       cmd /c "ssh <hub> sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --apply < $tmp"
+       if ($LASTEXITCODE -ne 0) { throw "apply failed with exit code $LASTEXITCODE - do NOT continue" }
+   } finally {
+       Remove-Item $tmp -ErrorAction SilentlyContinue      # the file holds secrets: always delete it
+   }
+   ```
+
+   The helper writes the flag keys (`*_ENABLED`, `SLEEP_PUBLISH`) **unquoted**
+   whatever the input had, because the setup script and first boot compare the
+   literal value. If only the final directory `fsync` fails after the replace, the
+   file *is* changed: the helper prints a WARNING that durability is uncertain and
+   exits 0. At the start of every apply or restore, under the lock, it also deletes
+   any stale `.tmp-.env-*` file a hard-killed earlier run left beside `.env` (temp
+   names are scoped to the target's own name, so a different env file in the same
+   directory is never swept).
+
+   `SLEEP_FEED_URL` is the loopback tracker URL, the same value the weight and AI
+   feeders use (the tracker publishes `127.0.0.1:8787:8787`). The password must not
+   contain `\` or `"`. The materialiser wraps a password that contains whitespace in
+   double quotes (`MYAIR_PASSWORD="two words"`); that is normal and the helper
+   accepts it, because it parses the surrounding quotes first (as systemd does) and
+   applies these rules to the **decoded** value. It refuses a decoded value with a
+   backslash or double quote, any value starting with a quote that has no matching
+   closing quote, and any other wrapped form (single-quoted, or double-quoted
+   without whitespace), which the materialiser never emits and systemd would alter
+   or which is ambiguous. An apostrophe anywhere in the decoded value is allowed
+   (measured, see Known limits (c)). All three parsers - the helper, `setup-sleep.sh` and first boot -
+   strip exactly one matching pair of surrounding quotes and nothing else.
+5. **Hub: verify the effective values before installing.**
+   `sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --report` prints, for
+   each key, only `set` / `empty` / `absent`, plus the literal value of the two
+   `*_ENABLED` flags. It reads the file the way systemd does (last line wins, one pair
+   of single or double quotes stripped, so `MYAIR_PASSWORD=''` is *empty*). It exits
+   non-zero and says why if a required key is empty, a key is duplicated or written
+   as `export` / indented, `SLEEP_ENABLED` is not the literal `true`, or
+   `HEART_ENABLED` is not the literal `0` (the heart gauge stays off in this rollout).
+6. **Hub: check, then install.**
+   `sudo bash /opt/homehub/stack/sleep/setup-sleep.sh --check-only` (refuses on a
+   blank identity, destination or sign-in, and prints one `clock sync:` line), then
+   `sudo bash /opt/homehub/stack/sleep/setup-sleep.sh`.
+7. **Hub: verify.**
+   - `systemctl list-timers homehub-sleep.timer` shows a next and a last run.
+   - `sudo systemctl start homehub-sleep.service` runs one cycle now (it makes a
+     real myAir sign-in, one of the day's five); then
+     `journalctl -u homehub-sleep -n 40 --no-pager`. A healthy first cycle prints
+     `sleep: source cpap-myair answered` and either `sleep: published night <date>`
+     or `sleep: expected night <date>: no score yet - posted unavailable` (before the
+     night has uploaded, or after 14:00 with none). An `authentication failure` or
+     `asks for an emailed code` line is the sign-in, not the install: see "When
+     sign-in needs a person".
+   - A post landed in NagLight: the journal's `published night` line is the audit
+     trail; the `sleep` bar then appears in the life row on the panel. The unavailable
+     body is also a post (a grey, empty bar), so a grey bar proves delivery too.
+   - `sudo systemctl is-enabled homehub-sleep.timer` prints `enabled`.
+   - No stale temp file holds secrets next to the config:
+     `sudo find /opt/homehub/stack -maxdepth 1 -name '.tmp-.env-*'` must print
+     nothing. A hard-killed run can leave one; `sudo rm` it (the next apply or
+     restore would also sweep it).
+8. **Roll back.** Stop **both** units - a oneshot that is already mid-run can still
+   publish after its timer is gone:
+   `sudo systemctl disable --now homehub-sleep.timer && sudo systemctl stop homehub-sleep.service`.
+   Then restore the `.env` from the step 2 backup with the helper:
+   `sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --restore /opt/homehub/stack/.env.bak-<stamp>`.
+   It checks that the backup exists, is a regular file, is readable, is non-empty
+   and is valid UTF-8 **before** it touches `.env`, then restores with the same
+   atomic writer. Do **not** use `sh -c 'cat backup > .env'`: the shell empties
+   `.env` before it opens the backup, so a mistyped backup name destroys the config.
+   (`mv`, `cp --remove-destination` and `sed -i` are not atomic-with-validation
+   either: use the helper.) Afterwards re-run the `find` for `.tmp-.env-*` from step 7.
+   The account and state directory are inert and may stay.
+
+Not proven: every step above, on a real hub (see "Known limits"). The helper itself
+is covered by `tests/test_sleep_wiring.py` (exact bytes, atomicity under simulated
+failure, mode and owner calls, no value printed, refusals, restore validation, flag
+canonicalisation, stale-temp sweep, and - on Linux only - two helpers blocked on the
+`flock` and a waiter re-reading a file replaced under it), not by a run against the
+hub's own `.env`. `fchown` with a real different owner has not been exercised.
 
 The unit: `User=homehub-sleep`, `StateDirectory=homehub-sleep` mode `0700`, the
 state file `0600`, `ProtectHome=yes`, `ProtectSystem=strict`, `NoNewPrivileges`,
@@ -365,7 +512,18 @@ Each is accepted, with the reason.
   `"`.** systemd unescapes a backslash and strips double quotes in `.env` values, so
   such a password reaches the feeder altered, and the sign-in is refused exactly as
   an expired login would be. Choose a myAir password without those two characters.
-  The current password has none (verified). A `$` is safe: the feeder collapses the
+  **Apostrophes, measured 2026-10-11** on systemd 255.4 (WSL Ubuntu) with fake
+  values through `systemd-run -p EnvironmentFile=`: `pa'ss`, `pass'` and
+  `pa'ss'word` arrive unchanged; a value that **starts** with `'` loses that quote
+  even with no closing one (`'pass` becomes `pass`), and `'pass'` becomes `pass`;
+  `''` is empty. So an apostrophe is safe anywhere except as the first character,
+  which the helper refuses. **Double-quoted with whitespace** (what the materialiser
+  emits for a password containing spaces), same method: `"a b"`, `"  a b  "`,
+  `"a b'c"`, `"'a b"`, `"a b'"`, `"a#b c"`, `"a;b c"`, `"a=b c"` and `"a b$$c"` all
+  arrive as the text inside the quotes, intact; `"a "b" c"` and `"a b"c` are altered;
+  `'a'b'` becomes `ab'`; `\"` is an escape. `#`, `$`, `=` and `;` inside a value are
+  literal. Other systemd versions were not measured.
+  The current password has none of these (verified). A `$` is safe: the feeder collapses the
   materialiser's `$$`.
 - **(d) The unused-night shape is unproven.** Every probed night had usage, so it is
   unknown whether myAir returns an unused night as a record or as no record. Both

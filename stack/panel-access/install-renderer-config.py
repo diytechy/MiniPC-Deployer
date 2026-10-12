@@ -34,66 +34,49 @@ MARKER = "derivedFrom"
 # The feeder is the authority on which sources run. Its enabled_sources() is
 # loaded by path so the renderer cannot drift from it.
 FEEDER_PATH = Path(__file__).resolve().parent.parent / "ai-usage" / "ai_usage_feeder.py"
-_ASSIGN = re.compile(r"^(\s*)(export\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*)=(.*)$")
+_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+# VALUE is exactly one of: bare (no quotes, no backslash), one double-quoted
+# string, one single-quoted string, with nothing outside the quotes.
+_VALUE = re.compile(r"""^(?:[^"'\\]*|"[^"\\]*"|'[^'\\]*')$""")
+_LOOSE_KEY = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 READ_KEYS = ("AI_USAGE_ENABLED", "AI_USAGE_SOURCES")
 
 
-def read_env(env_text: str, names):
-    """{name: (value, problem)} from the FINAL assignment of each NAME.
-
-    Supported form: `NAME=VALUE` at column 0, one line, no space before `=`, the
-    value optionally wrapped in ONE matching pair of quotes (what the materialiser
-    and apply-env-lines.py write). Anything else on the final assignment gives
-    (None, reason). Earlier assignments are ignored, supported or not. An unquoted
-    value is trimmed (as systemd delivers it); a quoted one is kept as written."""
-    final = {}
-    for line in env_text.replace("\r\n", "\n").split("\n"):
-        match = _ASSIGN.match(line)
-        if match and match.group(3) in names:
-            final[match.group(3)] = match
-    result = {}
-    for name, match in final.items():
-        indent, export, _, space, rest = match.groups()
-        value = rest.strip()
-        problem = None
-        if indent:
-            problem = "the assignment is indented"
-        elif export:
-            problem = "the assignment starts with export"
-        elif space:
-            problem = "there is a space before ="
-        elif "\\" in rest:
-            problem = "the value contains a backslash"
-        elif value[:1] in ("'", '"'):
-            quote = value[0]
-            if len(value) < 2 or value[-1] != quote or quote in value[1:-1]:
-                problem = "the value has an unmatched or multiline quote"
-            else:
-                value = value[1:-1]
-        elif "'" in value or '"' in value:
-            problem = "the value has a stray quote"
-        result[name] = (None, problem) if problem else (value, None)
-    return result
+def _lines(env_text: str):
+    return env_text.replace("\r\n", "\n").split("\n")
 
 
-CRLF, LF, BACKSLASH = chr(13) + chr(10), chr(10), chr(92)
-
-
-def multiline_value_line(env_text: str):
-    """(line number, key) of the first assignment whose value runs onto the next
-    line (an unclosed opening quote) or carries ANY backslash (an escaped quote or a
-    continuation can hide the true end of the value), else None. Inside
-    such a value text can look like an assignment, so boundaries are ambiguous
-    and multiline values are deliberately not parsed."""
-    for number, line in enumerate(env_text.replace(CRLF, LF).split(LF), 1):
-        match = _ASSIGN.match(line)
-        if not match:
+def whitelist_failure(env_text: str):
+    """(line number, key or None) of the first line that is not blank, a comment
+    (first non-space character # or ;) or a canonical column-0 NAME=VALUE with a
+    VALUE of the three forms above; None when every line passes. Anything else
+    (indent, export, space before =, backslash, multiline or stray quotes) can
+    hide where an assignment really starts, so it is not parsed at all."""
+    for number, line in enumerate(_lines(env_text), 1):
+        if not line.strip() or line.lstrip()[:1] in ("#", ";"):
             continue
-        value = match.group(5).strip()
-        unclosed = value[:1] in ("'", '"') and value.find(value[0], 1) < 0
-        if unclosed or BACKSLASH in value:
-            return number, match.group(3)
+        match = _LINE.match(line)
+        if match and _VALUE.match(match.group(2)):
+            continue
+        loose = _LOOSE_KEY.match(line)
+        return number, (loose.group(1) if loose else None)
     return None
+
+
+def read_env(env_text: str, names):
+    """{name: value} from the FINAL assignment of each NAME. Call only on text that
+    passed whitelist_failure. An unquoted value is trimmed (as systemd delivers
+    it); a quoted one is kept as written."""
+    result = {}
+    for line in _lines(env_text):
+        match = _LINE.match(line)
+        if not match or match.group(1) not in names:
+            continue
+        value = match.group(2).strip()
+        if value[:1] in ("'", '"'):
+            value = value[1:-1]
+        result[match.group(1)] = value
+    return result
 
 
 def feeder_sources(sources_value):
@@ -163,21 +146,17 @@ def derive(env_text: str, source_bytes: bytes, document) -> bytes:
         return put(dict(SHIPPED_DEFAULT))
 
     if "AI_USAGE_" in env_text:
-        ambiguous = multiline_value_line(env_text)
-        if ambiguous:
-            return fail_safe("line %d (%s) has a multiline value, so assignment boundaries are "
-                             "ambiguous" % ambiguous)
+        failure = whitelist_failure(env_text)
+        if failure:
+            return fail_safe("line %d (%s) is not in the canonical form, so assignment "
+                             "boundaries are ambiguous" % (failure[0], failure[1] or "non-assignment line"))
     values = read_env(env_text, READ_KEYS)
-    enabled, problem = values.get("AI_USAGE_ENABLED", ("", None))
-    if problem:
-        return fail_safe("AI_USAGE_ENABLED is unsupported (%s)" % problem)
+    enabled = values.get("AI_USAGE_ENABLED", "")
     if enabled != "true":
         if enabled not in ("", "false"):
             print("gaugeRings: AI_USAGE_ENABLED is not exactly true or false; not derived")
         return source_bytes
-    raw, problem = values.get("AI_USAGE_SOURCES", (None, None))
-    if problem:
-        return fail_safe("AI_USAGE_SOURCES is unsupported (%s)" % problem)
+    raw = values.get("AI_USAGE_SOURCES")
     try:
         listed = feeder_sources(raw)
     except (SystemExit, Exception) as error:  # noqa: BLE001 - the feeder refuses or is absent

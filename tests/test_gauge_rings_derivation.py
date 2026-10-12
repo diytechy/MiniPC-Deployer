@@ -233,6 +233,7 @@ def block_of(dest):
     return json.loads(dest.read_text(encoding="utf-8"))["gaugeRings"]
 
 
+BS = chr(92)  # a backslash, without fighting source-level escaping
 ENABLED = "AI_USAGE_ENABLED=true\n"
 FAIL_SAFE = {"slots": [], "unlisted": "append"}
 
@@ -320,9 +321,9 @@ def test_tc1218_unsupported_form_leaves_an_owner_written_block_alone(tmp_path):
     assert dest.read_bytes() == source.read_bytes()
 
 
-def test_tc1218_unsupported_EARLIER_assignment_does_not_block_a_supported_final_one(tmp_path):
+def test_tc1218_final_canonical_assignment_wins_over_earlier_canonical_ones(tmp_path):
     stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
-    text = ENABLED + "export AI_USAGE_SOURCES=gemini\n AI_USAGE_SOURCES=gemini\nAI_USAGE_SOURCES =gemini\nAI_USAGE_SOURCES=codex\n"
+    text = ENABLED + "AI_USAGE_SOURCES=gemini\nAI_USAGE_SOURCES='claude'\nAI_USAGE_SOURCES=codex\n"
     env, source, dest = make_raw(tmp_path, text, json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
     MODULE.install(env, source, dest)
     assert providers(dest) == ["codex"] and "derivedFrom" in block_of(dest)
@@ -481,3 +482,69 @@ def test_tc1218_escaped_quote_cannot_hide_a_fake_assignment(tmp_path, capsys):
     assert block_of(dest) == FAIL_SAFE
     out = capsys.readouterr().out
     assert re.search(r"line \d+ \(OTHER\)", out) and "SECRETVALUE" not in out
+
+
+# ---- fix round 5: a positive whitelist for every line of the .env ----
+
+TEMPLATE = ROOT / "stack/.env.example"
+
+
+def test_tc1218_the_shipped_env_template_passes_the_whitelist():
+    """If this fails the whitelist would disable derivation on every hub."""
+    assert MODULE.whitelist_failure(TEMPLATE.read_text(encoding="utf-8")) is None
+
+
+@pytest.mark.parametrize("text", [
+    "", "\n\n", "  \n", "# note\n", "  ; note " + BS + "\n", "A=b\n", "A_1=\n", "A=\"two words\"\n", "A='x y'\n",
+    "A=has # inline and = signs\n", "A=b\r\nC=d\r\n", "# it's \"quoted\" " + BS + " text\nA=1\n",
+])
+def test_tc1218_whitelist_passes_blank_comment_and_canonical_lines(text):
+    assert MODULE.whitelist_failure(text) is None
+
+
+@pytest.mark.parametrize("text,key", [
+    (" A=b\n", "A"), ("export A=b\n", "A"), ("A =b\n", "A"), ("A=1\nB=\"x\" y\n", "B"),
+    ("A=b" + BS + "\n", "A"), ("A=\"b" + BS + "\"c\"\n", "A"), ("A=\"b\n", "A"), ("A=b\"c\n", "A"),
+    ("A=b'c\n", "A"), ("A=\"\" \"x\n", "A"), ("A=\"x\"\"y\"\n", "A"), ("A='x\"y\n", "A"),
+    ("just words\n", None), ("1A=b\n", None), ("A=\"x\" \n", "A"),
+    ("A=\"x" + BS + "y\"\n", "A"), ("A='x" + BS + "y'\n", "A"), ("A='x' y\n", "A"), ("A='x'y'\n", "A"),
+    ("A='x''y'\n", "A"), ("A='x\n", "A"),
+])
+def test_tc1218_whitelist_rejects_everything_else_naming_the_line_and_key(text, key):
+    number, found = MODULE.whitelist_failure(text)
+    assert found == key
+    assert number == (2 if text.startswith("A=1\n") else 1)
+
+
+SOL_REPROS = {
+    "round 3: another key's multiline value": 'OTHER="text\nAI_USAGE_SOURCES=codex\n"\n',
+    "round 3: AI_USAGE_SOURCES itself multiline": 'AI_USAGE_SOURCES="gemini\nAI_USAGE_SOURCES=codex"\n',
+    "round 4: escaped quote": 'OTHER="text ' + BS + '"still open\nAI_USAGE_SOURCES=codex\n"\n',
+    "round 5: closed pair then open quote": 'OTHER="" "still open\nAI_USAGE_SOURCES=codex\n"\n',
+    "round 5: stray text after a quoted value": 'OTHER="a" b"\nAI_USAGE_SOURCES=codex\n"\n',
+}
+
+
+@pytest.mark.parametrize("label", list(SOL_REPROS))
+def test_tc1218_every_reviewer_repro_fails_safe_with_gemini_active(tmp_path, capsys, label):
+    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    text = "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=gemini\n" + SOL_REPROS[label]
+    env, source, dest = make_raw(tmp_path, text, json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale}))
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    out = capsys.readouterr().out
+    assert len([l for l in out.splitlines() if "WARNING" in l]) == 1 and re.search(r"line \d+ \(", out)
+
+
+def test_tc1218_non_assignment_line_is_named_as_such(tmp_path, capsys):
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nSECRETWORDS here\n")
+    MODULE.install(env, source, dest)
+    assert block_of(dest) == FAIL_SAFE
+    out = capsys.readouterr().out
+    assert "line 2 (non-assignment line)" in out and "SECRETWORDS" not in out
+
+
+def test_tc1218_file_without_ai_usage_is_not_checked(tmp_path):
+    env, source, dest = make_raw(tmp_path, "OTHER=\"a\\\"b\nPANEL_ACCESS_ENABLED=false\n")
+    MODULE.install(env, source, dest)
+    assert dest.read_bytes() == source.read_bytes()

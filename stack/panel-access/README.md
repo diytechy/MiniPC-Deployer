@@ -69,12 +69,15 @@ copy leaves neither.
 panel reads `gaugeRings` from the hub-served `config.json` once at boot, so a
 change reaches the wall only after the kiosk shell restarts.
 
-- **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`. Only the
-  canonical form is supported, the one the materialiser and
-  `stack/sleep/apply-env-lines.py` write: `NAME=VALUE` at column 0, no space before
-  `=`, one line, the value optionally wrapped in ONE matching pair of `"` or `'`
-  (an unquoted value is trimmed, as systemd delivers it). Only the FINAL
-  assignment of each key counts; earlier ones never block. Unless
+- **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`. When the
+  file mentions `AI_USAGE_`, EVERY line must be one of: blank; a comment (first
+  non-space character `#` or `;`); or a canonical assignment `NAME=VALUE` at
+  column 0 whose VALUE is exactly one of: bare (no quote or backslash anywhere),
+  one double-quoted string, or one single-quoted string, with nothing outside the
+  quotes. This is a positive whitelist: it is what the materialiser and
+  `stack/sleep/apply-env-lines.py` write, and `stack/.env.example` passes it (a
+  test asserts that). Of the lines that pass, only the FINAL assignment of each key
+  counts (an unquoted value is trimmed, as systemd delivers it). Unless
   `AI_USAGE_ENABLED` is exactly `true` the destination is byte-identical to the
   source (a value other than `true`/`false` logs a line).
 - **Source list.** The renderer calls the feeder's own `enabled_sources()`
@@ -82,18 +85,19 @@ change reaches the wall only after the kiosk shell restarts.
   with what runs: unset, empty or unquoted-whitespace gives the feeder's default
   list; quoted whitespace or commas-only gives an empty list, and every derivable
   block then becomes `{"slots": [], "unlisted": "hide", "derivedFrom": ...}`.
-- **Fail-safe.** If ANY assignment in the file has a multiline value (an unclosed
-  opening quote, or ANY backslash in a value), assignment boundaries are ambiguous and
-  the same fail-safe applies; the WARNING names the line number and key, never the
-  value, and multiline values are not parsed. Likewise if the final assignment is in any other form (indented, space
-  before `=`, `export`, any backslash, an unmatched or multiline quote), or the
-  feeder refuses the list (an unknown or mis-cased name) or cannot be loaded, a
-  derivable block (absent, marked, or the shipped default) is replaced by the
-  shipped default `{"slots": [], "unlisted": "append"}` WITHOUT the marker, so
-  the wall shows every served ring and no stale derived block survives. One
-  `WARNING` line names the reason. An Owner-written block is left alone. systemd
-  itself accepts some of these forms (indentation, a space before `=`, quoted
-  multiline values); the renderer deliberately does not try to follow it there.
+- **Fail-safe.** If any line fails the whitelist (indentation, `export`, a space
+  before `=`, any backslash, a stray, unmatched or multiline quote, a line that is
+  not an assignment), assignment boundaries are ambiguous and nothing is parsed.
+  The same fail-safe applies when the feeder refuses the list (an unknown or
+  mis-cased name) or cannot be loaded: a derivable block (absent, marked, or the
+  shipped default) is replaced by the shipped default `{"slots": [], "unlisted":
+  "append"}` WITHOUT the marker, so the wall shows every served ring and no stale
+  derived block survives. One `WARNING` line names the first failing line number
+  and its key (or "non-assignment line"), never a value. An Owner-written block
+  is left alone. systemd accepts some of these forms; the renderer deliberately
+  does not try to follow it there. Consequence: a materialised secret containing a
+  quote or backslash makes the whole `.env` fail the whitelist on a hub that uses
+  AI usage, and the rings then show unfiltered.
 - **Output.** `"gaugeRings": {"slots": [...], "unlisted": "hide", "derivedFrom":
   "AI_USAGE_SOURCES"}`. Slot order is claude, claude2, codex, grok, gemini,
   opencode, freellmapi, filtered to the sources the feeder runs (names the feeder

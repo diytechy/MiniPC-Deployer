@@ -31,7 +31,7 @@ from pathlib import PurePosixPath
 import re
 import tarfile
 
-# The floor: OfficeWallNaglight feat-stacked-life-row 3f7de0d (2026-10-12, based on
+# The floor: OfficeWallNaglight feat-stacked-life-row e5064b5 (2026-10-12, based on
 # CameraOpt 5008311). Hand-copied from its capabilities.json; see the module docstring for what may and may not grow.
 REQUIRED = {
     "tracker-coordination-v1": {"app": ["js/main.js", "js/tracker-coordinator.js", "js/tracker.js"], "site": ["js/main.js", "js/tracker-coordinator.js", "js/tracker.js"], "gateway": []},

@@ -1,7 +1,7 @@
 Fixture for tests/test_wall_capability_contract.py (LLR-1069..1072).
 
 Taken READ-ONLY from OfficeWallNaglight branch feat-stacked-life-row, commit
-3f7de0d86fda9a8456361b790f7145903b284551 (2026-10-12; two commits on CameraOpt
+e5064b531afabbb1b585e1be7375815a1e6f8275 (2026-10-12; four commits on CameraOpt
 50083113dc1a9d6f9763a8b07f5d3bf53f5e19ec, adding the Heart glyph), re-baselined
 from CameraOpt 5008311:
 

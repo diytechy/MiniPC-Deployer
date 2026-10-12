@@ -2,7 +2,7 @@
 
 The fixture under tests/fixtures/wall-camera-opt is the OTHER side of the
 contract - OfficeWallNaglight's own manifest and site inventory at
-feat-stacked-life-row 3f7de0d, based on CameraOpt 5008311 (see its SOURCE.txt). Nothing in this file invents the values it checks
+feat-stacked-life-row e5064b5, based on CameraOpt 5008311 (see its SOURCE.txt). Nothing in this file invents the values it checks
 against: the script's REQUIRED / ALLOWED_SITE_FILES are compared with what the
 panel says it ships, and each mutation below must be REJECTED by the script.
 """
@@ -20,7 +20,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/wall-camera-opt"
-REVISION = "3f7de0d86fda9a8456361b790f7145903b284551"
+REVISION = "e5064b531afabbb1b585e1be7375815a1e6f8275"
 
 spec = importlib.util.spec_from_file_location(
     "wall_capability_contract", ROOT / "scripts/assert_wall_capabilities.py"

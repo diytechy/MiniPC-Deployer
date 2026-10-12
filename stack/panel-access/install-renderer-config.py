@@ -32,27 +32,65 @@ SHIPPED_DEFAULT = {"slots": [], "unlisted": "append"}
 MARKER = "derivedFrom"
 
 
-def env_value(env_text: str, name: str) -> str:
-    """Last assignment wins; strips whitespace, a trailing ' #' comment and quotes."""
-    found = ""
-    for line in env_text.splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.strip() == name:
-            found = value.split(" #", 1)[0].strip().strip("\"'")
-    return found
+DEFAULT_SOURCES = "codex,claude,opencode"  # the feeder's own default; a test reads it from the feeder
+_ASSIGN = re.compile(r"^\s*(export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
 
 
-def derive_rings(sources_text: str):
-    """Build the gaugeRings block for a comma list of usage sources, or None if empty."""
+def logical_lines(env_text: str):
+    """Physical lines joined across a trailing backslash, as systemd does."""
+    pending = ""
+    for line in env_text.replace("\r\n", "\n").split("\n"):
+        stripped = line.rstrip()
+        trailing = len(stripped) - len(stripped.rstrip("\\"))
+        if trailing % 2 == 1:
+            pending += stripped[:-1]
+            continue
+        yield pending + line
+        pending = ""
+    if pending:
+        yield pending
+
+
+def read_env(env_text: str, names):
+    """({name: value}, unsupported) for the NAMES asked for, the way systemd's
+    EnvironmentFile reads them: a comment is '#' or ';' at line start only (an
+    inline ' # note' is part of the value), the LAST assignment wins, one pair of
+    matching quotes is stripped. `export NAME=` and indented `NAME=` are not read
+    by systemd as written, so they are reported in `unsupported` (fail closed)."""
+    values = {}
+    unsupported = set()
+    for line in logical_lines(env_text):
+        match = _ASSIGN.match(line)
+        if not match or match.group(2) not in names:
+            continue
+        name = match.group(2)
+        if match.group(1) or line != line.lstrip():
+            unsupported.add(name)
+            continue
+        value = line.partition("=")[2].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if "\\" in value:
+            unsupported.add(name)
+            continue
+        values[name] = value
+    return values, unsupported
+
+
+def listed_sources(sources_text: str):
+    """Usable provider ids from a comma list (lower-cased, de-duplicated)."""
     listed = []
     for raw in sources_text.split(","):
         name = raw.strip().lower()
         if PROVIDER_KEY.match(name) and name not in listed:
             listed.append(name)
+    return listed
+
+
+def derive_rings(listed):
+    """Build the gaugeRings block for usable source names (maybe an empty block)."""
     ordered = [n for n in PROVIDER_ORDER if n in listed]
     ordered += [n for n in listed if n not in PROVIDER_ORDER]
-    if not ordered:
-        return None
     paired = "claude" in ordered and "claude2" in ordered
     slots = []
     for name in ordered:
@@ -65,35 +103,63 @@ def derive_rings(sources_text: str):
     return {"slots": slots, "unlisted": "hide", MARKER: "AI_USAGE_SOURCES"}
 
 
+def _no_constant(token):
+    raise ValueError("non-finite number")
+
+
 def serialise(source_text: str, document) -> bytes:
-    """Re-serialise with the indentation the source uses (and its final newline)."""
+    """Re-serialise with the source's indentation and final newline. The result is
+    value-faithful, not byte-faithful: non-ASCII is written as \\u escapes, line
+    endings become LF and a BOM is dropped."""
     match = re.search(r"\n([ \t]+)\S", source_text)
     indent = match.group(1) if match else None
-    text = json.dumps(document, indent=indent, ensure_ascii=False)
-    if source_text.endswith("\n"):
+    text = json.dumps(document, indent=indent, ensure_ascii=True, allow_nan=False)
+    if source_text.rstrip(" \t").endswith("\n"):
         text += "\n"
-    return text.encode("utf-8")
+    return text.encode("ascii")
 
 
-def render(env_text: str, source_bytes: bytes, document) -> bytes:
-    """The bytes to install: the source itself unless a derivation applies."""
-    if env_value(env_text, "AI_USAGE_ENABLED") != "true":
+def derive(env_text: str, source_bytes: bytes, document) -> bytes:
+    values, unsupported = read_env(env_text, ("AI_USAGE_ENABLED", "AI_USAGE_SOURCES"))
+    if unsupported:
+        print("gaugeRings: %s is written in a form systemd does not read; not derived"
+              % ", ".join(sorted(unsupported)))
         return source_bytes
-    block = derive_rings(env_value(env_text, "AI_USAGE_SOURCES"))
-    if block is None:
+    enabled = values.get("AI_USAGE_ENABLED", "")
+    if enabled != "true":
+        if enabled not in ("", "false"):
+            print("gaugeRings: AI_USAGE_ENABLED is not exactly true or false; not derived")
+        return source_bytes
+    raw = values.get("AI_USAGE_SOURCES", "")
+    if not raw.replace(",", "").strip():
+        raw = DEFAULT_SOURCES  # the feeder's default for an unset or empty list
+    listed = listed_sources(raw)
+    existing = document.get("gaugeRings")
+    marked = isinstance(existing, dict) and MARKER in existing
+    if not listed and not marked:
         print("gaugeRings: AI_USAGE_SOURCES lists no usable source; nothing derived")
         return source_bytes
-    existing = document.get("gaugeRings") if isinstance(document, dict) else None
-    owned = (
-        "gaugeRings" not in document
-        or (isinstance(existing, dict) and MARKER in existing)
-        or existing == SHIPPED_DEFAULT
-    )
+    owned = "gaugeRings" not in document or marked or existing == SHIPPED_DEFAULT
     if not owned:
         print("gaugeRings: Owner-written block in the source left as is; not derived")
         return source_bytes
-    document["gaugeRings"] = block
-    return serialise(source_bytes.decode("utf-8-sig"), document)
+    document = dict(document)
+    document["gaugeRings"] = derive_rings(listed)
+    out = serialise(source_bytes.decode("utf-8-sig"), document)
+    checked = json.loads(out.decode("ascii"), parse_constant=_no_constant)
+    MODULE.validate(env_text, checked)
+    return out
+
+
+def render(env_text: str, source_bytes: bytes, document) -> bytes:
+    """The bytes to install: the source itself unless a derivation applies, and
+    the source itself again if the derivation fails for ANY reason (a derivation
+    problem must never abort firstboot)."""
+    try:
+        return derive(env_text, source_bytes, document)
+    except Exception:  # noqa: BLE001 - deliberate: fall back, never abort
+        print("gaugeRings: WARNING derivation failed; installing the source config unchanged")
+        return source_bytes
 
 
 def install(env_path: Path, source: Path, destination: Path) -> None:

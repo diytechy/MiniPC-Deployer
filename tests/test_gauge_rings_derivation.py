@@ -37,7 +37,7 @@ def need_gauges():
 def make(tmp_path, sources, enabled="true", block="absent", extra=None, indent=2):
     env = tmp_path / "hub.env"
     env.write_text(
-        "PANEL_ACCESS_ENABLED=false\nAI_USAGE_ENABLED=%s\nAI_USAGE_SOURCES=%s # note\n" % (enabled, sources),
+        "PANEL_ACCESS_ENABLED=false\nAI_USAGE_ENABLED=%s\nAI_USAGE_SOURCES=%s\n" % (enabled, sources),
         encoding="utf-8")
     doc = {"ACCESS_ENABLED": False, "POLL_SECONDS": 60, "zeta": 1, "alpha": {"b": 2, "a": 1}}
     doc.update(extra or {})
@@ -210,3 +210,155 @@ def test_tc1219_empty_secret_keys_derive_and_are_preserved(tmp_path):
     got = run(env, source, dest)
     assert got["FEED_TOKEN"] == "" and got["HEARTBEAT_URL"] == "" and got["SUBSONIC"] == {}
     assert got["gaugeRings"]["slots"] == [{"provider": "codex"}]
+
+
+# ---- fix round 1: the renderer must see the environment the feeder sees ----
+
+FEEDER = ROOT / "stack/ai-usage/ai_usage_feeder.py"
+DEFAULT_PROVIDERS = ["claude", "codex", "opencode"]
+
+
+def make_raw(tmp_path, env_text, document='{"ACCESS_ENABLED": false, "POLL_SECONDS": 60}\n'):
+    env = tmp_path / "hub.env"
+    env.write_bytes(env_text.encode("utf-8"))
+    source = tmp_path / "site-config.json"
+    source.write_bytes(document.encode("utf-8") if isinstance(document, str) else document)
+    dest = tmp_path / "wall-shell"
+    dest.mkdir(exist_ok=True)
+    return env, source, dest / "config.json"
+
+
+def providers(dest):
+    return [s["provider"] for s in json.loads(dest.read_text(encoding="utf-8"))["gaugeRings"]["slots"]]
+
+
+def test_tc1215_default_sources_match_the_feeder_source():
+    text = FEEDER.read_text(encoding="utf-8")
+    found = re.search(r'env\.get\("AI_USAGE_SOURCES"\)\s+or\s+"([^"]+)"', text)
+    assert found, "feeder default no longer has the shape this test reads"
+    assert MODULE.DEFAULT_SOURCES == found.group(1)
+
+
+@pytest.mark.parametrize("line", ["", "AI_USAGE_SOURCES=\n", "AI_USAGE_SOURCES=  \n",
+                                  "AI_USAGE_SOURCES=,\n", "AI_USAGE_SOURCES= , ,\n",
+                                  "AI_USAGE_SOURCES=\"\"\n"])
+def test_tc1215_unset_or_empty_sources_use_the_feeders_default(tmp_path, line):
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\n" + line)
+    MODULE.install(env, source, dest)
+    assert providers(dest) == DEFAULT_PROVIDERS
+
+
+def test_tc1216_marked_block_with_no_usable_source_is_regenerated_empty(tmp_path):
+    stale = {"slots": [{"provider": "gemini"}], "unlisted": "hide", "derivedFrom": "AI_USAGE_SOURCES"}
+    doc = json.dumps({"ACCESS_ENABLED": False, "gaugeRings": stale})
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=bad_name\n", doc)
+    MODULE.install(env, source, dest)
+    block = json.loads(dest.read_text(encoding="utf-8"))["gaugeRings"]
+    assert block["slots"] == [] and block["derivedFrom"] == "AI_USAGE_SOURCES"
+
+
+def test_tc1215_continuation_line_is_joined_like_systemd(tmp_path):
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex,\\\nclaude\n")
+    MODULE.install(env, source, dest)
+    assert providers(dest) == ["claude", "codex"]
+
+
+def test_tc1215_comment_lines_are_not_assignments_and_last_assignment_wins(tmp_path):
+    text = ("# AI_USAGE_SOURCES=grok\n; AI_USAGE_SOURCES=grok\nAI_USAGE_ENABLED=true\n"
+            "AI_USAGE_SOURCES=gemini\nAI_USAGE_SOURCES=\"codex\"\n")
+    env, source, dest = make_raw(tmp_path, text)
+    MODULE.install(env, source, dest)
+    assert providers(dest) == ["codex"]
+
+
+def test_tc1215_inline_hash_is_part_of_the_value_as_systemd_reads_it(tmp_path):
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex,claude # note\n")
+    MODULE.install(env, source, dest)
+    assert providers(dest) == ["codex"], "'claude # note' is not a source name; only codex survives"
+
+
+@pytest.mark.parametrize("text", [
+    "AI_USAGE_SOURCES=codex\n",                           # key missing
+    "AI_USAGE_ENABLED=\nAI_USAGE_SOURCES=codex\n",        # empty value
+    "AI_USAGE_ENABLED=true # on\nAI_USAGE_SOURCES=codex\n",  # inline hash makes it not 'true'
+    "export AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n",
+    "AI_USAGE_ENABLED=True\nAI_USAGE_SOURCES=codex\n",
+    "  AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n",
+    "AI_USAGE_ENABLED=true\nexport AI_USAGE_SOURCES=codex\n",
+])
+def test_tc1218_unreadable_or_non_true_enable_fails_closed(tmp_path, capsys, text):
+    env, source, dest = make_raw(tmp_path, text)
+    MODULE.install(env, source, dest)
+    assert dest.read_bytes() == source.read_bytes()
+    out = capsys.readouterr().out
+    if "ENABLED=\n" not in text and "AI_USAGE_ENABLED" in text:
+        assert "gaugeRings:" in out, "a fail-closed refusal must say so"
+
+
+def test_tc1217_unpaired_surrogate_in_source_does_not_abort(tmp_path):
+    doc = '{"ACCESS_ENABLED": false, "note": "\\ud800"}\n'
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n", doc)
+    MODULE.install(env, source, dest)
+    out = dest.read_bytes()
+    out.decode("ascii")
+    assert providers(dest) == ["codex"]
+    assert json.loads(out.decode("ascii"))["note"] == "\ud800"
+
+
+def test_tc1217_any_derivation_failure_installs_the_source_unchanged(tmp_path, monkeypatch, capsys):
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n")
+
+    def boom(*args):
+        raise UnicodeEncodeError("ascii", "x", 0, 1, "boom")
+
+    monkeypatch.setattr(MODULE, "serialise", boom)
+    MODULE.install(env, source, dest)
+    assert dest.read_bytes() == source.read_bytes()
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_tc1217_output_is_validated_and_non_finite_numbers_fall_back(tmp_path, capsys):
+    doc = '{"ACCESS_ENABLED": false, "n": Infinity}\n'
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n", doc)
+    MODULE.install(env, source, dest)
+    assert dest.read_bytes() == source.read_bytes()
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_tc1217_output_is_policy_validated(tmp_path, monkeypatch, capsys):
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n")
+    real = MODULE.MODULE.validate
+    seen = []
+
+    def spy(env_text, document):
+        seen.append(document)
+        if "gaugeRings" in document:
+            raise ValueError("rejected")
+        return real(env_text, document)
+
+    monkeypatch.setattr(MODULE.MODULE, "validate", spy)
+    MODULE.install(env, source, dest)
+    assert any("gaugeRings" in d for d in seen), "the derived output was never validated"
+    assert dest.read_bytes() == source.read_bytes()
+
+
+def test_tc1217_crlf_bom_and_tab_indent_are_normalised_value_faithfully(tmp_path):
+    body = '{\r\n\t"ACCESS_ENABLED": false,\r\n\t"POLL_SECONDS": 60\r\n}\r\n'
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n",
+                                 b"\xef\xbb\xbf" + body.encode("utf-8"))
+    MODULE.install(env, source, dest)
+    out = dest.read_bytes()
+    assert not out.startswith(b"\xef\xbb\xbf") and b"\r" not in out
+    assert b'\n\t"POLL_SECONDS": 60' in out and out.endswith(b"}\n")
+    got = json.loads(out.decode("ascii"))
+    assert got["POLL_SECONDS"] == 60 and providers(dest) == ["codex"]
+
+
+def test_tc1217_unicode_is_written_as_ascii_escapes_with_the_same_value(tmp_path):
+    doc = '{"ACCESS_ENABLED": false, "label": "caf\u00e9 \u2603"}\n'
+    env, source, dest = make_raw(tmp_path, "AI_USAGE_ENABLED=true\nAI_USAGE_SOURCES=codex\n", doc)
+    MODULE.install(env, source, dest)
+    out = dest.read_bytes()
+    out.decode("ascii")
+    assert b"\\u00e9" in out
+    assert json.loads(out.decode("ascii"))["label"] == "caf\u00e9 \u2603"

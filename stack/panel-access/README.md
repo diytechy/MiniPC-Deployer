@@ -69,8 +69,17 @@ copy leaves neither.
 panel reads `gaugeRings` from the hub-served `config.json` once at boot, so a
 change reaches the wall only after the kiosk shell restarts.
 
-- **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`. Unless
-  `AI_USAGE_ENABLED` is `true` the destination is byte-identical to the source.
+- **Input.** `AI_USAGE_ENABLED` and `AI_USAGE_SOURCES` from `--env`, read the way
+  systemd's `EnvironmentFile` (and so the feeder) reads them: a comment is `#` or
+  `;` at the start of a line only, so an inline ` # note` is part of the value;
+  trailing-backslash lines continue; one pair of matching quotes is stripped; the
+  last assignment wins. `export NAME=...`, indented `NAME=...` and values with a
+  backslash are not read by systemd as written, so they fail closed with a
+  `gaugeRings:` log line and no derivation. Unless `AI_USAGE_ENABLED` is exactly
+  `true` the destination is byte-identical to the source. An unset, empty or
+  commas-only `AI_USAGE_SOURCES` means the feeder's default,
+  `codex,claude,opencode`. A previously derived block whose list now has no usable
+  name is regenerated empty.
 - **Output.** `"gaugeRings": {"slots": [...], "unlisted": "hide", "derivedFrom":
   "AI_USAGE_SOURCES"}`. Slot order is claude, claude2, codex, grok, gemini,
   opencode, freellmapi, filtered to the listed sources; unknown listed names follow
@@ -88,6 +97,12 @@ change reaches the wall only after the kiosk shell restarts.
   `{"slots": [], "unlisted": "append"}`. Any other block, including
   `{"slots": [], "unlisted": "hide"}`, is Owner-written: it is installed exactly
   as written and one `gaugeRings:` line is logged.
+- **Faithfulness.** When a block is derived, the result is value-faithful, not
+  byte-faithful: JSON is re-serialised with ASCII `\u` escapes for non-ASCII
+  text, LF line endings, no BOM, and the source's indentation. The output is
+  re-validated; if the derivation or that validation fails for any reason the
+  source is installed unchanged with a `WARNING` line, so firstboot never aborts
+  on it.
 - **Hand-authoring rings.** Put your own `gaugeRings` block in the source copy,
   without `derivedFrom`. Slot fields are `provider`, optional `mark`, optional
   `badge`; see OfficeWallNaglight `docs/config-reference.md`.

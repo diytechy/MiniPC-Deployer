@@ -325,7 +325,7 @@ or prints them). `stack/autoinstall/firstboot.sh` (step 6f-2) calls it on a fres
 install whenever `.env` says `SLEEP_ENABLED=true`, modelled on the weight block: a
 refusal there is a logged WARNING, never a failed first boot. The whole `stack/` tree
 rides the ISO payload (it is a `git archive` of tracked files), so `stack/sleep/` is
-carried without being named anywhere; `tests/test_sleep_wiring.py` asserts all five
+carried without being named anywhere; `tests/test_sleep_wiring.py` asserts all six
 files are tracked.
 
 ## Installing on the RUNNING hub (no reimage)
@@ -334,40 +334,56 @@ Written down, **not run**. `/opt/homehub` is **not a git checkout** (it is a cop
 tree), so never sync the whole repo over it: diff and copy only `stack/sleep/`.
 Nothing here restarts a container; the feeder is a host systemd unit.
 
-1. **Dev PC: produce the config.** Materialise the hub image as usual. The
-   generated `.env` must carry these keys (check **names only**, never print the
-   file or a value):
-   `SLEEP_ENABLED=true`, `SLEEP_USER`, `SLEEP_USER_ACCOUNT`, `SLEEP_FEED_URL`,
+1. **Dev PC: materialise the hub config** as usual. The generated `out\homehub\.env`
+   must carry the keys below (check **names only**; never print the file or a
+   value): `SLEEP_ENABLED=true`, `SLEEP_USER`, `SLEEP_USER_ACCOUNT`, `SLEEP_FEED_URL`,
    `SLEEP_FEED_TOKEN`, `SLEEP_PUBLISH`, `SLEEP_STATE_FILE`, `SLEEP_TIMEOUT_SECONDS`,
-   `MYAIR_EMAIL`, `MYAIR_PASSWORD`, `TIMEZONE`. `SLEEP_ENABLED` and `SLEEP_USER`
-   come from HomeHub `config.homehub.psd1`; `MYAIR_EMAIL` from the identity row
+   `MYAIR_EMAIL`, `MYAIR_PASSWORD`, `HEART_*`. `SLEEP_ENABLED` and `SLEEP_USER` come
+   from HomeHub `config.homehub.psd1`; `MYAIR_EMAIL` from the identity row
    `household.MyAirEmail`; `MYAIR_PASSWORD` from the store key `MyAirPassword`.
-   Leave `HEART_ENABLED=0` (no heart device exists yet).
+   `HEART_ENABLED` stays `0` (no heart device exists yet).
 2. **Hub: back the `.env` up.**
    `sudo cp -p /opt/homehub/stack/.env /opt/homehub/stack/.env.bak-$(date +%Y%m%d-%H%M%S)`
-3. **Hub: add only the missing `.env` lines, in place.** Append (`sudo tee -a`) or
-   edit the one line; do **not** replace the file with a new one, because a new
-   inode can detach a bind mount that something else holds on it. Copy the lines
-   verbatim from the materialised file (the materialiser has already doubled any
-   `$`, which the feeder collapses). Send them on **stdin**, not as an ssh argument,
-   and never echo them. **`SLEEP_FEED_URL` must be the value the hub's existing
-   `WEIGHT_FEED_URL` line already holds** - that one is known to reach the tracker
-   from the host, and the tracker is bridge-only, so the template's loopback
-   default is not guaranteed on this box. The password must not contain `\` or `"`.
-4. **Hub: copy only the sleep tree, after diffing it.** Stage the five files from
-   the release commit (`git archive <commit> stack/sleep` on the dev PC, piped over
-   ssh on stdin into a scratch directory such as `/tmp/sleep-stage`), then
+3. **Hub: copy only the sleep tree, after diffing it.** Stage the six files from the
+   release commit (`git archive <commit> stack/sleep` on the dev PC, piped over ssh
+   on stdin into a scratch directory such as `/tmp/sleep-stage`), then
    `diff -r /tmp/sleep-stage/stack/sleep /opt/homehub/stack/sleep` - on a first
    install the destination does not exist and every file is new. Then
-   `sudo install -d -m 0755 /opt/homehub/stack/sleep` and
-   `sudo install -m 0644` each of `README.md`, `homehub-sleep.service`,
-   `homehub-sleep.timer`, `setup-sleep.sh`, `sleep_feeder.py` into it, and remove
-   the scratch directory. Copy nothing else.
-5. **Hub: check, then install.**
+   `sudo install -d -m 0755 /opt/homehub/stack/sleep` and `sudo install -m 0644` each
+   of `README.md`, `apply-env-lines.py`, `homehub-sleep.service`,
+   `homehub-sleep.timer`, `setup-sleep.sh`, `sleep_feeder.py` into it, and remove the
+   scratch directory. Copy nothing else.
+4. **Hub: set the keys in place, with the helper from step 3.** Do **not** "append
+   what is missing": a hub `.env` that already carries the template defaults
+   (`SLEEP_ENABLED=false`, a blank `SLEEP_USER`, blank myAir values) would keep them,
+   and `setup-sleep.sh` would then exit "disabled" having installed nothing. A second
+   copy of a key is no better: systemd and `setup-sleep.sh` take the **last** line,
+   firstboot's `_env_val` the **first**. The helper replaces the first line of each
+   key, drops any further copies, appends keys that are absent, and rewrites the file
+   **in place** (same inode, so no bind mount is detached). It prints only key names
+   and `replaced` / `added` / `unchanged`, never a value. From the dev PC, in
+   PowerShell, send only the wanted lines on stdin (the values never reach a
+   terminal, a command line or `tee`):
+
+   ```
+   Get-Content out\homehub\.env | Where-Object { $_ -match '^(SLEEP_|MYAIR_|HEART_)[A-Z_]*=' } |
+       ssh <hub> "sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --apply"
+   ```
+
+   `SLEEP_FEED_URL` is the loopback tracker URL, the same value the weight and AI
+   feeders use (the tracker publishes `127.0.0.1:8787:8787`). The password must not
+   contain `\` or `"`.
+5. **Hub: verify the effective values before installing.**
+   `sudo -n python3 /opt/homehub/stack/sleep/apply-env-lines.py --report` prints, for
+   each key, only `set` / `empty` / `absent`, plus the literal value of the two
+   `*_ENABLED` flags (it must say `SLEEP_ENABLED true` and `HEART_ENABLED 0`). It
+   exits non-zero and says why if a required key is empty, a key is duplicated, or
+   `SLEEP_ENABLED` is not the literal `true`.
+6. **Hub: check, then install.**
    `sudo bash /opt/homehub/stack/sleep/setup-sleep.sh --check-only` (refuses on a
    blank identity, destination or sign-in, and prints one `clock sync:` line), then
    `sudo bash /opt/homehub/stack/sleep/setup-sleep.sh`.
-6. **Hub: verify.**
+7. **Hub: verify.**
    - `systemctl list-timers homehub-sleep.timer` shows a next and a last run.
    - `sudo systemctl start homehub-sleep.service` runs one cycle now (it makes a
      real myAir sign-in, one of the day's five); then
@@ -381,11 +397,18 @@ Nothing here restarts a container; the feeder is a host systemd unit.
      trail; the `sleep` bar then appears in the life row on the panel. The unavailable
      body is also a post (a grey, empty bar), so a grey bar proves delivery too.
    - `sudo systemctl is-enabled homehub-sleep.timer` prints `enabled`.
-7. **Roll back.** `sudo systemctl disable --now homehub-sleep.timer`, then restore
-   the `.env` backup from step 2; the account and state directory are inert and
-   may stay.
+8. **Roll back.** Stop **both** units - a oneshot that is already mid-run can still
+   publish after its timer is gone:
+   `sudo systemctl disable --now homehub-sleep.timer && sudo systemctl stop homehub-sleep.service`.
+   Then restore the `.env` **in place**:
+   `sudo sh -c 'cat /opt/homehub/stack/.env.bak-<stamp> > /opt/homehub/stack/.env'`.
+   `cp` and `cat >` open the existing file and truncate it, which keeps the inode
+   (checked); `mv`, `cp --remove-destination` and `sed -i` write a new file and can
+   detach a bind mount. The account and state directory are inert and may stay.
 
-Not proven: every step above, on a real hub (see "Known limits").
+Not proven: every step above, on a real hub (see "Known limits"). The helper itself
+is covered by `tests/test_sleep_wiring.py` (in-place rewrite and inode, duplicates,
+no value printed, refusals), not by a run against the hub's `.env`.
 
 The unit: `User=homehub-sleep`, `StateDirectory=homehub-sleep` mode `0700`, the
 state file `0600`, `ProtectHome=yes`, `ProtectSystem=strict`, `NoNewPrivileges`,

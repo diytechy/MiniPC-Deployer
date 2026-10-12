@@ -1329,7 +1329,8 @@ def test_setup_installs_and_enables_the_refresher():
     assert "homehub-claude-refresh@.service" in setup
     assert "homehub-claude-refresh@.timer" in setup
     # Account 1 is enabled unconditionally, exactly as the un-templated unit was.
-    assert "systemctl enable --now homehub-claude-refresh@claude.timer" in setup
+    assert 'NEW_TIMER="homehub-claude-refresh@claude.timer"' in setup
+    assert 'systemctl enable --now "$NEW_TIMER"' in setup
     # It runs as the same account as the feeder, from the same single knob.
     assert "homehub-claude-refresh@claude.service.d" in setup
 

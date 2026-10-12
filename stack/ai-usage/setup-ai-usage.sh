@@ -280,74 +280,136 @@ fi
 # Disabling is best-effort and idempotent: on a box that never had the old pair
 # every line here is a no-op.
 LEGACY_REFRESH="homehub-claude-refresh"
-# LEGACY_BLOCKED=1 means the old refresher could NOT be confirmed retired: the
-# new @claude timer is then NOT enabled and the old unit stays the one refresher
-# (two refreshers rotating account 1's single-use token lose the live login).
-LEGACY_BLOCKED=0
+OLD_TIMER="$LEGACY_REFRESH.timer"
+NEW_TIMER="homehub-claude-refresh@claude.timer"
+
 # INVARIANT, on every way out of this script (0, 3, or an error part-way):
 # EXACTLY ONE account-1 refresh timer is enabled and active - the old one or the
-# new one, never both and never neither. `disable --now` is two steps and the
-# new timer is enabled much later, so from the first disable attempt until the
-# new timer is confirmed enabled, any exit puts the OLD timer back.
+# new one, never both and never neither. Every decision below is made from the
+# REAL state of both timers (never from what a previous run was "supposed" to
+# have done): a rerun after a half-finished run must not re-enable the old timer
+# beside an active new one.
+#
+#   timer_state UNIT -> on (enabled AND active) | off (neither) | unknown
+timer_state() {
+    local en ac
+    en="$(systemctl is-enabled "$1" 2>/dev/null || true)"
+    ac="$(systemctl is-active "$1" 2>/dev/null || true)"
+    case "$en" in
+        enabled) [ "$ac" = active ] && { echo on; return 0; } ;;
+        disabled|not-found|static|indirect|linked|masked|generated)
+            case "$ac" in inactive|failed|dead) echo off; return 0 ;; esac ;;
+    esac
+    echo unknown
+}
+
+# LEGACY_BLOCKED=1: the migration is deferred and the old timer (if it is allowed
+# to be) is the refresher. LEGACY_ARMED=1: between disabling the old timer and the
+# new one being confirmed on, any exit puts the old timer back - but ONLY when the
+# new timer is confirmed off.
+LEGACY_BLOCKED=0
 LEGACY_PRESENT=0
 LEGACY_ARMED=0
 restore_legacy_timer() {
     [ "$LEGACY_ARMED" = 1 ] || return 0
     LEGACY_ARMED=0
-    if systemctl enable --now "$LEGACY_REFRESH.timer" >/dev/null 2>&1; then
-        say "The old $LEGACY_REFRESH.timer is enabled again and is the Claude account-1 refresher."
+    case "$(timer_state "$NEW_TIMER")" in
+        on)
+            say "The new $NEW_TIMER is running and stays the Claude account-1 refresher;"
+            say "  the old timer is NOT re-enabled (two would race on one single-use token)."
+            return 0 ;;
+        off) ;;
+        *)
+            say "ERROR: cannot tell whether $NEW_TIMER is running, so nothing was changed."
+            say "  Claude account 1 must have exactly ONE refresher. Check, as root:"
+            say "    systemctl is-active $NEW_TIMER $OLD_TIMER"
+            say "  then enable the one that is not running, and disable the other:"
+            say "    systemctl enable --now $OLD_TIMER ; systemctl disable --now $NEW_TIMER"
+            return 0 ;;
+    esac
+    if systemctl enable --now "$OLD_TIMER" >/dev/null 2>&1 \
+            && [ "$(timer_state "$OLD_TIMER")" = on ]; then
+        say "The old $OLD_TIMER is enabled again and is the Claude account-1 refresher."
     else
-        say "ERROR: could NOT re-enable $LEGACY_REFRESH.timer. Claude account 1 has NO"
+        say "ERROR: could NOT re-enable $OLD_TIMER. Claude account 1 has NO"
         say "  refresher right now and its token will lapse. Run, as root:"
-        say "    systemctl enable --now $LEGACY_REFRESH.timer"
+        say "    systemctl enable --now $OLD_TIMER"
     fi
 }
 trap restore_legacy_timer EXIT
-if [ -e "$UNIT_DIR/$LEGACY_REFRESH.timer" ] || [ -e "$UNIT_DIR/$LEGACY_REFRESH.service" ] \
+
+LEGACY_COMPLETE=0
+if [ -e "$UNIT_DIR/$OLD_TIMER" ] || [ -e "$UNIT_DIR/$LEGACY_REFRESH.service" ] \
         || [ -d "$UNIT_DIR/$LEGACY_REFRESH.service.d" ]; then
     LEGACY_PRESENT=1
     if command -v systemctl >/dev/null 2>&1; then
-        # Stop the TIMER first, so no new run can begin, then WAIT for a run that
-        # is already going. The service is deliberately never `stop`ped: a
-        # `claude -p /usage` killed in the middle of a token rotation can lose
-        # the single-use refresh token, and the Owner would have to sign in
-        # again. The wait is bounded (longer than the unit's own
-        # TimeoutStartSec=180, so a healthy run has finished or been timed out by
-        # systemd itself). If the timer cannot be disabled, or the service is
-        # still running at the deadline, the migration is DEFERRED, not forced.
-        if [ -e "$UNIT_DIR/$LEGACY_REFRESH.timer" ]; then
-            LEGACY_ARMED=1      # from here, any exit restores the old timer
-            if ! systemctl disable --now "$LEGACY_REFRESH.timer" >/dev/null 2>&1; then
+        systemctl daemon-reload || true      # so the instance's state can be read
+        new_state="$(timer_state "$NEW_TIMER")"
+        old_state=absent
+        [ -e "$UNIT_DIR/$OLD_TIMER" ] && old_state="$(timer_state "$OLD_TIMER")"
+        case "$new_state" in
+            on)
+                # A previous run already activated the replacement. Only the
+                # cleanup is left, and the old timer must NEVER come back.
+                LEGACY_COMPLETE=1
+                if [ "$old_state" != off ] && [ "$old_state" != absent ]; then
+                    systemctl disable --now "$OLD_TIMER" >/dev/null 2>&1 || true
+                    if [ "$(timer_state "$OLD_TIMER")" != off ]; then
+                        LEGACY_BLOCKED=1
+                        say "ERROR: $NEW_TIMER is running but $OLD_TIMER could not be turned off."
+                        say "  Two Claude refreshers would race on one single-use token. Run, as root:"
+                        say "    systemctl disable --now $OLD_TIMER"
+                    fi
+                fi
+                ;;
+            off)
+                if [ -e "$UNIT_DIR/$OLD_TIMER" ]; then
+                    LEGACY_ARMED=1      # from here, any exit restores the old timer
+                    if ! systemctl disable --now "$OLD_TIMER" >/dev/null 2>&1; then
+                        LEGACY_BLOCKED=1
+                        say "WARNING: could not disable $OLD_TIMER. The old refresher stays"
+                        say "  the ONLY refresher and the new one is not enabled (two would race on"
+                        say "  one single-use token). Fix the timer, then re-run this script."
+                    fi
+                fi
+                wait_seconds="${AI_USAGE_MIGRATION_WAIT_SECONDS:-200}"
+                poll_seconds="${AI_USAGE_MIGRATION_POLL_SECONDS:-2}"
+                deadline=$((SECONDS + wait_seconds))
+                # The service is deliberately never `stop`ped: a `claude -p /usage`
+                # killed in the middle of a token rotation can lose the single-use
+                # refresh token. The wait is bounded (longer than the unit's own
+                # TimeoutStartSec=180).
+                while [ "$LEGACY_BLOCKED" = 0 ]; do
+                    state="$(systemctl is-active "$LEGACY_REFRESH.service" 2>/dev/null || true)"
+                    # Only a CONFIRMED idle state lets the swap proceed. A failed
+                    # query or an answer we do not recognise is "unknown": wait,
+                    # then DEFER - never a guess that it is idle.
+                    case "$state" in
+                        inactive|failed|dead) break ;;
+                        active|activating|deactivating|reloading) ;;
+                        *) state="in an unknown state (${state:-no answer})" ;;
+                    esac
+                    if [ "$SECONDS" -ge "$deadline" ]; then
+                        LEGACY_BLOCKED=1
+                        say "WARNING: $LEGACY_REFRESH.service was still $state after ${wait_seconds}s."
+                        say "  The migration is DEFERRED: killing it mid-rotation could lose the"
+                        say "  single-use Claude refresh token, and enabling the new refresher beside"
+                        say "  it would race it. The old timer is put back as the only refresher;"
+                        say "  re-run this script when the service has finished."
+                        break
+                    fi
+                    sleep "$poll_seconds"
+                done
+                ;;
+            *)
+                # Neither timer's state can be established: change NOTHING.
                 LEGACY_BLOCKED=1
-                say "WARNING: could not disable $LEGACY_REFRESH.timer. The old refresher stays"
-                say "  the ONLY refresher and the new one is not enabled (two would race on"
-                say "  one single-use token). Fix the timer, then re-run this script."
-            fi
-        fi
-        wait_seconds="${AI_USAGE_MIGRATION_WAIT_SECONDS:-200}"
-        poll_seconds="${AI_USAGE_MIGRATION_POLL_SECONDS:-2}"
-        deadline=$((SECONDS + wait_seconds))
-        while [ "$LEGACY_BLOCKED" = 0 ]; do
-            state="$(systemctl is-active "$LEGACY_REFRESH.service" 2>/dev/null || true)"
-            # Only a CONFIRMED idle state lets the swap proceed. A failed query or
-            # an answer we do not recognise is "unknown", and unknown means wait,
-            # then DEFER - never a guess that it is idle.
-            case "$state" in
-                inactive|failed|dead) break ;;
-                active|activating|deactivating|reloading) ;;
-                *) state="in an unknown state (${state:-no answer})" ;;
-            esac
-            if [ "$SECONDS" -ge "$deadline" ]; then
-                LEGACY_BLOCKED=1
-                say "WARNING: $LEGACY_REFRESH.service was still $state after ${wait_seconds}s."
-                say "  The migration is DEFERRED: killing it mid-rotation could lose the"
-                say "  single-use Claude refresh token, and enabling the new refresher beside"
-                say "  it would race it. The old timer is put back as the only refresher;"
-                say "  re-run this script when the service has finished."
-                break
-            fi
-            sleep "$poll_seconds"
-        done
+                say "ERROR: cannot read the state of $NEW_TIMER, so the Claude refresher"
+                say "  migration was not attempted and nothing was changed. Check, as root:"
+                say "    systemctl is-enabled $NEW_TIMER $OLD_TIMER ; systemctl is-active $NEW_TIMER $OLD_TIMER"
+                say "  and leave exactly ONE of the two enabled."
+                ;;
+        esac
     fi
     # Deferred: the old timer goes straight back, before anything else can fail.
     if [ "$LEGACY_BLOCKED" != 0 ]; then
@@ -355,35 +417,53 @@ if [ -e "$UNIT_DIR/$LEGACY_REFRESH.timer" ] || [ -e "$UNIT_DIR/$LEGACY_REFRESH.s
     fi
 fi
 
+ENABLE_FAILED=0
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     # The TIMER is enabled, never the service: enabling a oneshot service means
     # one run at boot and none after it, which is the classic way a feeder ends
     # up posting a single reading and then going quietly stale forever.
     systemctl enable --now homehub-ai-usage.timer
-    if [ "$LEGACY_BLOCKED" = 0 ]; then
-        if systemctl enable --now homehub-claude-refresh@claude.timer; then
-            LEGACY_ARMED=0      # the new timer is up; the old one may now go
-        else
+    if [ "$LEGACY_BLOCKED" = 0 ] && [ "$LEGACY_COMPLETE" = 0 ]; then
+        # `enable --now` can change state and then report failure: judge by the
+        # state it left, not by its exit status.
+        systemctl enable --now "$NEW_TIMER" >/dev/null 2>&1 || true
+        if [ "$(timer_state "$NEW_TIMER")" != on ]; then
             LEGACY_BLOCKED=1
-            say "WARNING: could not enable homehub-claude-refresh@claude.timer."
+            say "WARNING: $NEW_TIMER is not confirmed running."
+            # It may be half-applied (enabled but not started): turn it fully off
+            # first, so restoring the old timer can never leave two enabled.
+            systemctl disable --now "$NEW_TIMER" >/dev/null 2>&1 || true
             restore_legacy_timer
         fi
     fi
-    if source_enabled claude2; then
-        systemctl enable --now homehub-claude-refresh@claude2.timer
-    fi
-    if source_enabled gemini; then
-        systemctl enable --now homehub-gemini-refresh.timer
+fi
+
+# COMMIT the migration the moment the new timer is confirmed on, BEFORE anything
+# unrelated can fail: disarm the restore, then remove the old files. A later
+# failure (the Gemini timer, say) can then never leave it half-recorded.
+if [ "$LEGACY_BLOCKED" = 0 ]; then
+    LEGACY_ARMED=0
+    if [ "$LEGACY_PRESENT" = 1 ]; then
+        rm -f "$UNIT_DIR/$OLD_TIMER" "$UNIT_DIR/$LEGACY_REFRESH.service"
+        rm -rf "$UNIT_DIR/$LEGACY_REFRESH.service.d"
+        if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
+        say "Migrated the un-templated $LEGACY_REFRESH unit to $LEGACY_REFRESH@claude (same account, same paths)."
     fi
 fi
 
-# Only now, with the new timer confirmed enabled, are the old files removed.
-if [ "$LEGACY_PRESENT" = 1 ] && [ "$LEGACY_BLOCKED" = 0 ]; then
-    rm -f "$UNIT_DIR/$LEGACY_REFRESH.timer" "$UNIT_DIR/$LEGACY_REFRESH.service"
-    rm -rf "$UNIT_DIR/$LEGACY_REFRESH.service.d"
-    if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
-    say "Migrated the un-templated $LEGACY_REFRESH unit to $LEGACY_REFRESH@claude (same account, same paths)."
+# The remaining timers are unrelated to the migration: a failure here is reported
+# and makes the script exit non-zero at the end, but never aborts mid-way.
+if command -v systemctl >/dev/null 2>&1; then
+    if source_enabled claude2; then
+        systemctl enable --now homehub-claude-refresh@claude2.timer || ENABLE_FAILED=1
+    fi
+    if source_enabled gemini; then
+        systemctl enable --now homehub-gemini-refresh.timer || ENABLE_FAILED=1
+    fi
+    if [ "$ENABLE_FAILED" != 0 ]; then
+        say "WARNING: a refresher timer could not be enabled (see above); re-run once fixed."
+    fi
 fi
 
 say "AI-usage feeder installed; runs as $ACCOUNT on the timer."
@@ -407,9 +487,12 @@ AI_CLI_ETC_DIR="${AI_CLI_ETC_DIR:-$(dirname "$(dirname "$UNIT_DIR")")}" \
 # still the wrong command.) It never fails this script.
 AI_CLI_ENV_FILE="$ENV_FILE" bash "${AI_CLI_STATUS:-$HERE/../ai-cli/ai-cli-status.sh}" || true
 if [ "$LEGACY_BLOCKED" != 0 ]; then
-    say "EXIT 3: everything else is installed, but the Claude refresher migration is"
-    say "  deferred (see the WARNING above). The old timer is the one refresher; re-run"
-    say "  this script once the old service is idle."
+    say "EXIT 3: everything else is installed, but the Claude refresher migration did"
+    say "  not complete (see the WARNING / ERROR above). Exactly ONE of $OLD_TIMER and"
+    say "  $NEW_TIMER must be running: check with systemctl is-active, then re-run this script."
     exit 3
+fi
+if [ "$ENABLE_FAILED" != 0 ]; then
+    exit 1
 fi
 exit 0

@@ -226,12 +226,15 @@ def required_gauges():
 # Evidence older than this is not evidence: 2x the usage timer's 10-minute cadence.
 EVIDENCE_MAX_AGE_SECONDS = int(os.environ.get("AI_CLI_EVIDENCE_MAX_AGE", "1200"))
 CYCLE_END = re.compile(r"ai-usage:\s+cycle complete\b")
-GAUGE_LINE = re.compile(r"ai-usage:\s+(ai-usage-[a-z0-9-]+)\s+(live|UNAVAILABLE)\b")
+GAUGE_LINE = re.compile(r"ai-usage:\s+(ai-usage-[a-z0-9-]+)\s+(live|UNAVAILABLE)\s+(posted|POST FAILED)")
 
 
 def usage_invocations():
     """The feeder's journal grouped by systemd INVOCATION (one per run of the
-    oneshot), oldest first. Each: {gauges: {id: state}, complete: ts|None}.
+    oneshot), oldest first. Each: {id, gauges: {gauge id: (state, posted?)},
+    complete: ts|None}. An invocation is kept even when ONLY the manager's lines
+    (INVOCATION_ID: start, failure, stop) mention it - a run that died before it
+    printed anything must count as the newest, failed, invocation.
 
     The journal is read as JSON so every line carries _SYSTEMD_INVOCATION_ID and a
     timestamp; the feeder's own `cycle complete` line says an invocation reached
@@ -252,11 +255,13 @@ def usage_invocations():
             entry = json.loads(line)
         except ValueError:
             continue
-        inv = entry.get("_SYSTEMD_INVOCATION_ID") if isinstance(entry, dict) else None
+        if not isinstance(entry, dict):
+            continue
+        inv = entry.get("_SYSTEMD_INVOCATION_ID") or entry.get("INVOCATION_ID")
         if not inv:
             continue
         if inv not in by_id:
-            by_id[inv] = {"gauges": {}, "complete": None}
+            by_id[inv] = {"id": inv, "gauges": {}, "complete": None}
             order.append(inv)
         message = entry.get("MESSAGE")
         if not isinstance(message, str):
@@ -270,7 +275,7 @@ def usage_invocations():
             rec["complete"] = ts
         m = GAUGE_LINE.search(message)
         if m:
-            rec["gauges"][m.group(1)] = m.group(2)
+            rec["gauges"][m.group(1)] = (m.group(2), m.group(3) == "posted")
     return [by_id[i] for i in order]
 
 
@@ -282,38 +287,57 @@ def usage_service_state():
     return out.strip()
 
 
-def feeder_live_sources():
-    """Sources whose REQUIRED gauges were all `live` in the most recent COMPLETED
-    feeder invocation, and recent enough to mean something.
+def usage_service_invocation():
+    """The invocation id of the run that is going RIGHT NOW, or None."""
+    if "AI_CLI_USAGE_INVOCATION_ID" in os.environ:
+        return os.environ["AI_CLI_USAGE_INVOCATION_ID"] or None
+    rc, out = run(["systemctl", "show", "-p", "InvocationID", "--value",
+                   "homehub-ai-usage.service"], timeout=10)
+    return out.strip() or None
+
+
+def feeder_evidence():
+    """(verified, posting_failing): sets of sources.
+
+    verified = every REQUIRED gauge of the source is `live` AND `posted` in the
+    most recent COMPLETED feeder invocation, recent enough to mean something.
+    posting_failing = every required gauge is `live` but at least one POST FAILED:
+    the credentials work, the delivery does not - never called verified.
 
     - The newest invocation decides. If it never printed its `cycle complete` line
       it died part-way (or never printed): NOT verified - an older good run does
-      not cover for it. The one exception is a run that is still going right now,
-      when the previous completed invocation is the latest finished evidence.
+      not cover for it. The one exception is a run that is going right now AND is
+      that same newest journal invocation: then the previous completed run is the
+      latest finished evidence.
     - Optional gauges (Claude's Fable band) are never proof.
     - Evidence older than EVIDENCE_MAX_AGE_SECONDS is dropped.
     """
     required = required_gauges()
     if not required:
-        return set()
+        return set(), set()
     runs = usage_invocations()
     if not runs:
-        return set()
+        return set(), set()
     latest = runs[-1]
     if latest["complete"] is None and len(runs) > 1 \
-            and usage_service_state() in ("active", "activating"):
+            and usage_service_state() in ("active", "activating") \
+            and usage_service_invocation() == latest["id"]:
         latest = runs[-2]
     if latest["complete"] is None:
-        return set()
+        return set(), set()
     now = float(os.environ.get("AI_CLI_NOW") or __import__("time").time())
     age = now - latest["complete"]
     if age > EVIDENCE_MAX_AGE_SECONDS or age < -60:
-        return set()
-    return {src for src, keys in required.items()
-            if all(latest["gauges"].get(k) == "live" for k in keys)}
+        return set(), set()
+    verified, failing = set(), set()
+    for src, keys in required.items():
+        got = [latest["gauges"].get(k) for k in keys]
+        if all(g is not None and g[0] == "live" for g in got):
+            (verified if all(g[1] for g in got) else failing).add(src)
+    return verified, failing
 
 
-LIVE = feeder_live_sources()
+LIVE, POST_FAILING = feeder_evidence()
 
 # --- the logins ---------------------------------------------------------------
 
@@ -393,7 +417,11 @@ for c in checks:
             results.append((label, "wrong auth type %s" % selected,
                             ['sign in with "Login with Google"', recipe(c, "type")], True))
             continue
-    if c["source"] and c["source"] in LIVE:
+    if c["source"] and c["source"] in POST_FAILING:
+        results.append((label, "credentials OK, posting failing",
+                        ["the feeder reads this login fine but its POST to the tracker failed "
+                         "in the latest cycle: see journalctl -u homehub-ai-usage"], False))
+    elif c["source"] and c["source"] in LIVE:
         results.append((label, "verified", [], False))
     else:
         results.append((label, "credential present (not verified)", [], False))

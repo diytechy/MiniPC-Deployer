@@ -231,13 +231,31 @@ STUBS = {
     # `is-active` answers "activating" for the first STUB_ACTIVE_CALLS calls (a
     # refresher run still in progress) and "inactive" after, like the real one
     # (which also exits non-zero for anything but "active").
+    # Models which timers are enabled-and-active ($SANDBOX/enabled): the migration
+    # reads the REAL state of both timers before it changes anything.
     "systemctl": """#!/usr/bin/env bash
 echo "$*" >> "$SANDBOX/systemctl.log"
-if [ "$1" = "is-active" ]; then
-  n=$(cat "$SANDBOX/active.count" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$SANDBOX/active.count"
-  if [ "$n" -le "${STUB_ACTIVE_CALLS:-0}" ]; then echo activating; exit 3; fi
-  echo inactive; exit 3
-fi
+touch "$SANDBOX/enabled"
+unit="${@: -1}"
+case "$1" in
+  is-active|is-enabled)
+    case "$2" in
+      *.service)
+        if [ "$1" = "is-active" ]; then
+          n=$(cat "$SANDBOX/active.count" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$SANDBOX/active.count"
+          if [ "$n" -le "${STUB_ACTIVE_CALLS:-0}" ]; then echo activating; exit 3; fi
+          echo inactive; exit 3
+        fi
+        echo disabled; exit 1 ;;
+      *)
+        if grep -qx -- "$2" "$SANDBOX/enabled"; then
+          [ "$1" = "is-active" ] && echo active || echo enabled; exit 0
+        fi
+        [ "$1" = "is-active" ] && { echo inactive; exit 3; } || { echo disabled; exit 1; } ;;
+    esac ;;
+  enable) grep -qx -- "$unit" "$SANDBOX/enabled" || echo "$unit" >> "$SANDBOX/enabled" ;;
+  disable) grep -vx -- "$unit" "$SANDBOX/enabled" > "$SANDBOX/enabled.tmp"; mv "$SANDBOX/enabled.tmp" "$SANDBOX/enabled" ;;
+esac
 exit 0
 """,
     # Only paths under the sandbox are made; everything else (/var/lib/..., the
@@ -347,7 +365,9 @@ def test_migration_waits_for_a_running_refresh_instead_of_killing_it_sr067(tmp_p
     assert len(polls) == 4, "three 'activating' answers, then 'inactive'"
     timer_off = calls.index("disable --now homehub-claude-refresh.timer")
     assert timer_off < polls[0]
-    assert polls[-1] < calls.index("daemon-reload") < calls.index(
+    # (an early daemon-reload now precedes the wait, so the one that matters is
+    # the one AFTER the last poll)
+    assert polls[-1] < calls.index("daemon-reload", polls[-1]) < calls.index(
         "enable --now homehub-claude-refresh@claude.timer")
     assert not [c for c in calls if c.startswith("stop ") and "claude-refresh" in c], \
         "the running service must never be stopped"

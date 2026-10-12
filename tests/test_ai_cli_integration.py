@@ -94,21 +94,44 @@ exec "$@"
     # two steps in real systemd, so a failure can leave it half done).
     "systemctl": r"""#!/usr/bin/env bash
 echo "systemctl $*" >> "$SANDBOX/calls.log"
-if [ "$1" = "is-active" ]; then
-  case "$*" in *"${STUB_SYSTEMCTL_FAIL:-@@none@@}"*) exit 1 ;; esac
-  echo "${STUB_ACTIVE:-inactive}"; exit 3
+touch "$SANDBOX/enabled" "$SANDBOX/enabledonly"
+failmatch=0
+case "$*" in *"${STUB_SYSTEMCTL_FAIL:-@@none@@}"*) failmatch=1 ;; esac
+if [ "$1" = "is-active" ] || [ "$1" = "is-enabled" ]; then
+  [ "$failmatch" = 1 ] && exit 1
+  unit="$2"
+  case "$unit" in
+    *.service)
+      if [ "$1" = "is-active" ]; then echo "${STUB_ACTIVE:-inactive}"; exit 3; fi
+      echo disabled; exit 1 ;;
+  esac
+  on=0; grep -qx -- "$unit" "$SANDBOX/enabled" && on=1
+  eo=0; grep -qx -- "$unit" "$SANDBOX/enabledonly" && eo=1
+  if [ "$1" = "is-active" ]; then
+    if [ "$on" = 1 ]; then echo active; exit 0; fi
+    echo inactive; exit 3
+  fi
+  if [ "$on" = 1 ] || [ "$eo" = 1 ]; then echo enabled; exit 0; fi
+  echo disabled; exit 1
 fi
 unit="${@: -1}"
-fail=0
-case "$*" in *"${STUB_SYSTEMCTL_FAIL:-@@none@@}"*) fail=1 ;; esac
-touch "$SANDBOX/enabled"
 case "$1" in
-  enable) [ "$fail" = 1 ] && exit 1; grep -qx -- "$unit" "$SANDBOX/enabled" || echo "$unit" >> "$SANDBOX/enabled" ;;
+  enable)
+    if [ "$failmatch" = 1 ]; then
+      # STUB_ENABLE_HALF: the unit ends up enabled AND running, yet the call fails.
+      # STUB_ENABLE_NOSTART: it ends up enabled but NOT started (enable ok, start failed).
+      [ -n "${STUB_ENABLE_HALF:-}" ] && echo "$unit" >> "$SANDBOX/enabled"
+      [ -n "${STUB_ENABLE_NOSTART:-}" ] && echo "$unit" >> "$SANDBOX/enabledonly"
+      exit 1
+    fi
+    grep -qx -- "$unit" "$SANDBOX/enabled" || echo "$unit" >> "$SANDBOX/enabled" ;;
   disable)
-    if [ "$fail" = 1 ] && [ -z "${STUB_DISABLE_HALF:-}" ]; then exit 1; fi
-    grep -vx -- "$unit" "$SANDBOX/enabled" > "$SANDBOX/enabled.tmp"; mv "$SANDBOX/enabled.tmp" "$SANDBOX/enabled"
-    [ "$fail" = 1 ] && exit 1 ;;
-  *) [ "$fail" = 1 ] && exit 1 ;;
+    if [ "$failmatch" = 1 ] && [ -z "${STUB_DISABLE_HALF:-}" ]; then exit 1; fi
+    for f in enabled enabledonly; do
+      grep -vx -- "$unit" "$SANDBOX/$f" > "$SANDBOX/$f.tmp"; mv "$SANDBOX/$f.tmp" "$SANDBOX/$f"
+    done
+    [ "$failmatch" = 1 ] && exit 1 ;;
+  *) [ "$failmatch" = 1 ] && exit 1 ;;
 esac
 exit 0
 """,
@@ -238,13 +261,22 @@ class Box(object):
 
     def journal(self, *invocations):
         """Write the feeder's journal as `journalctl -o json` lines. Each argument
-        is a dict: gauges=[(id, state)...], age=seconds before NOW the invocation
-        ended, complete=bool (did it print its `cycle complete` line), extra=[msg]."""
+        is a dict: gauges=[(id, state[, "POST FAILED"])...], age=seconds before NOW
+        the invocation ended, complete=bool (did it print its `cycle complete` line),
+        extra=[msg], id=<invocation id>, manager_only=True (only the manager's
+        INVOCATION_ID lines exist: it died before the feeder printed anything)."""
         rows = []
         for n, inv in enumerate(invocations):
-            iid = "inv%02d" % n
+            iid = inv.get("id", "inv%02d" % n)
             ts = NOW - inv.get("age", 60)
-            lines = ["ai-usage: %-32s %-12s %s" % (k, st, "posted") for k, st in inv.get("gauges", [])]
+            if inv.get("manager_only"):
+                rows.append(json.dumps({"MESSAGE": "homehub-ai-usage.service: Failed with result 'exit-code'.",
+                                        "INVOCATION_ID": iid,
+                                        "__REALTIME_TIMESTAMP": str(int(ts * 1e6))}))
+                continue
+            lines = []
+            for g in inv.get("gauges", []):
+                lines.append("ai-usage: %-32s %-12s %s" % (g[0], g[1], g[2] if len(g) > 2 else "posted"))
             lines += inv.get("extra", [])
             if inv.get("complete", True):
                 lines.append("ai-usage: cycle complete gauges=%d failures=0" % len(inv.get("gauges", [])))
@@ -569,9 +601,10 @@ def test_present_credential_is_not_verified_until_the_feeder_logged_live_llr1117
     assert NOT in _status(box)
     # ...but a run that is still going right now leaves the previous completed run as
     # the latest finished evidence.
-    box.journal({"gauges": live, "age": 600}, {"gauges": live[:1], "complete": False, "age": 5})
+    box.journal({"gauges": live, "age": 600}, {"gauges": live[:1], "complete": False, "age": 5, "id": "runC"})
     assert NOT in _status(box)                                   # service not running: it died
-    assert "login claude: verified" in _status(box, AI_CLI_USAGE_SERVICE_STATE="activating")
+    assert "login claude: verified" in _status(
+        box, AI_CLI_USAGE_SERVICE_STATE="activating", AI_CLI_USAGE_INVOCATION_ID="runC")
     # A stale OPTIONAL gauge live, then the required ones UNAVAILABLE: not proof.
     box.journal({"gauges": [(optional[0], "live")] + [(k, "UNAVAILABLE") for k in required]})
     assert NOT in _status(box)
@@ -1146,6 +1179,10 @@ BRANCHES = [
     ("new-timer-enable-fails", {"STUB_SYSTEMCTL_FAIL": "enable --now " + NEW_TIMER}, 3, OLD_TIMER),
     ("is-active-query-fails", {"STUB_SYSTEMCTL_FAIL": "is-active"}, 3, OLD_TIMER),
     ("is-active-unrecognised", {"STUB_ACTIVE": "mystery"}, 3, OLD_TIMER),
+    ("enable-half-applied-but-running",
+     {"STUB_SYSTEMCTL_FAIL": "enable --now " + NEW_TIMER, "STUB_ENABLE_HALF": "1"}, 0, NEW_TIMER),
+    ("enable-ok-start-failed",
+     {"STUB_SYSTEMCTL_FAIL": "enable --now " + NEW_TIMER, "STUB_ENABLE_NOSTART": "1"}, 3, OLD_TIMER),
     ("error-mid-migration", {"STUB_SYSTEMCTL_FAIL": "daemon-reload"}, None, OLD_TIMER),
 ]
 
@@ -1159,6 +1196,9 @@ def test_exactly_one_account_one_refresh_timer_survives_every_branch_sr067(tmp_p
     else:
         assert done.returncode == code, done.stdout + done.stderr
     assert _refreshers(box) == [survivor], (_enabled(box), done.stdout)
+    # No timer may be left "enabled but not started": at the next boot it would run.
+    leftover = (box.root / "enabledonly").read_text(encoding="utf-8").split()
+    assert not [u for u in leftover if u in (OLD_TIMER, NEW_TIMER)], leftover
     assert not [c for c in box.calls if c.startswith("systemctl stop")]
     if survivor == OLD_TIMER:
         # The deferral is honest: it says the OLD timer is the refresher.
@@ -1210,3 +1250,117 @@ def test_the_feeders_cycle_end_line_is_the_one_the_status_step_looks_for_llr1117
     # ...and it is not mistaken for a gauge line.
     gauge = re.search(r'GAUGE_LINE = re\.compile\(r"([^"]+)"\)', status_src).group(1)
     assert not re.search(gauge, line)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 3 - the migration reads the REAL state of both timers, so a rerun
+# can never put the old timer beside an active new one
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_gemini_enable_failure_never_leaves_the_migration_half_recorded_sr067(tmp_path):
+    box = _legacy_box(tmp_path, "claude,gemini")
+    first = box.run(SETUP_USAGE, STUB_SYSTEMCTL_FAIL="enable --now homehub-gemini-refresh.timer")
+    assert first.returncode == 1, first.stdout + first.stderr          # reported, not aborted
+    assert _refreshers(box) == [NEW_TIMER]
+    assert not (box.units / OLD_TIMER).exists(), "the migration was committed before the failing step"
+    second = box.run(SETUP_USAGE)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _refreshers(box) == [NEW_TIMER]
+
+
+def test_solrepro_new_timer_already_running_and_old_disable_failing_is_cleanup_not_restore_sr067(tmp_path):
+    """Sol's two-run repro: the first run activated @claude and died before removing
+    the old files. On the rerun the old timer must NEVER be re-enabled."""
+    box = _legacy_box(tmp_path)
+    (box.root / "enabled").write_text(NEW_TIMER + "\n", encoding="utf-8")        # old already off
+    done = box.run(SETUP_USAGE, STUB_SYSTEMCTL_FAIL="disable --now " + OLD_TIMER)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _refreshers(box) == [NEW_TIMER]
+    assert "systemctl enable --now " + OLD_TIMER not in box.calls
+    assert not (box.units / OLD_TIMER).exists()
+    assert "Migrated" in done.stdout
+
+
+def test_both_timers_on_and_the_old_one_will_not_turn_off_is_a_loud_error_sr067(tmp_path):
+    box = _legacy_box(tmp_path)
+    (box.root / "enabled").write_text(OLD_TIMER + "\n" + NEW_TIMER + "\n", encoding="utf-8")
+    done = box.run(SETUP_USAGE, STUB_SYSTEMCTL_FAIL="disable --now " + OLD_TIMER)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "ERROR" in done.stdout and "systemctl disable --now " + OLD_TIMER in done.stdout
+    assert "systemctl enable --now " + OLD_TIMER not in box.calls
+
+
+def test_unreadable_timer_state_changes_nothing_and_says_how_to_check_sr067(tmp_path):
+    box = _legacy_box(tmp_path)
+    done = box.run(SETUP_USAGE, STUB_SYSTEMCTL_FAIL="is-enabled")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "ERROR: cannot read the state of " + NEW_TIMER in done.stdout
+    assert "systemctl is-enabled" in done.stdout
+    assert _refreshers(box) == [OLD_TIMER]
+    touched = [c for c in box.calls if c.startswith(("systemctl disable", "systemctl enable"))
+               and c.split()[-1] in (OLD_TIMER, NEW_TIMER)]
+    assert not touched, touched
+    assert (box.units / OLD_TIMER).exists()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix round 3 - the in-progress exception follows the CURRENT invocation, and a
+# completed run whose POST failed is not "verified"
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _claude_live_box(tmp_path):
+    box, _ = _claude_box(tmp_path)
+    box.cred("alice", ".claude/.credentials.json")
+    required = [g.key for g in feeder.GAUGE_SPECS if g.source == "claude" and not g.optional]
+    return box, [(k, "live") for k in required]
+
+
+def test_a_good_b_failed_c_running_is_not_verified_llr1117(tmp_path):
+    """Sol: A succeeded; B died without a cycle-end line; C is running but has not
+    written anything yet. The newest journal invocation is B, not the running C."""
+    box, live = _claude_live_box(tmp_path)
+    box.journal({"gauges": live, "age": 900, "id": "A"},
+                {"gauges": [], "complete": False, "extra": ["Traceback (most recent call last):"],
+                 "age": 300, "id": "B"})
+    out = _status(box, AI_CLI_USAGE_SERVICE_STATE="activating", AI_CLI_USAGE_INVOCATION_ID="C")
+    assert "login claude: credential present (not verified)" in out
+    # Had C been the newest journal invocation (B absent), borrowing A would be right.
+    box.journal({"gauges": live, "age": 900, "id": "A"}, {"gauges": live[:1], "complete": False, "age": 5, "id": "C"})
+    out = _status(box, AI_CLI_USAGE_SERVICE_STATE="activating", AI_CLI_USAGE_INVOCATION_ID="C")
+    assert "login claude: verified" in out
+
+
+def test_a_run_that_died_before_printing_anything_counts_as_the_newest_failed_run_llr1117(tmp_path):
+    box, live = _claude_live_box(tmp_path)
+    box.journal({"gauges": live, "age": 900, "id": "A"}, {"manager_only": True, "age": 60, "id": "B"})
+    out = _status(box)
+    assert "login claude: credential present (not verified)" in out
+
+
+def test_live_but_post_failed_is_credentials_ok_not_verified_llr1117(tmp_path):
+    box, live = _claude_live_box(tmp_path)
+    failed = [(k, st, "POST FAILED") for k, st in live]
+    box.journal({"gauges": failed})
+    out = _status(box)
+    assert "login claude: credentials OK, posting failing" in out
+    assert "login claude: verified" not in out and "consumer operation verified" not in out
+    assert "LOGINS OWED: none" in out
+    # One required gauge posted, one not: still not verified.
+    box.journal({"gauges": [live[0] + ("posted",), failed[1]]})
+    assert "login claude: credentials OK, posting failing" in _status(box)
+    box.journal({"gauges": live})
+    assert "login claude: verified" in _status(box)
+
+
+def test_half_applied_new_timer_that_cannot_be_turned_off_is_never_joined_by_the_old_one_sr067(tmp_path):
+    """The new timer ends up enabled-but-not-started and `disable` fails too: the
+    state cannot be established, so NOTHING more is changed (the old timer stays
+    off) and the ERROR names the commands. Restoring blindly would leave both
+    enabled at the next boot."""
+    box = _legacy_box(tmp_path)
+    done = box.run(SETUP_USAGE, STUB_SYSTEMCTL_FAIL="--now " + NEW_TIMER, STUB_ENABLE_NOSTART="1")
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "ERROR: cannot tell whether %s is running" % NEW_TIMER in done.stdout
+    assert "systemctl enable --now %s" % OLD_TIMER in done.stdout        # the instruction, not an action
+    assert "systemctl enable --now " + OLD_TIMER not in box.calls         # ...never executed
+    assert OLD_TIMER not in _enabled(box)

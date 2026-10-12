@@ -365,11 +365,11 @@ def test_both_enabled_with_different_names_use_one_account_everywhere_llr1113(tm
     assert users == {"alice"}
     home = "/home/alice"
     claude = (box.units / "homehub-claude-refresh@claude.service.d" / "10-account.conf").read_text(encoding="utf-8")
-    assert "ReadWritePaths=%s/.claude %s/.claude.json" % (home, home) in claude
+    assert "ReadWritePaths=-%s/.claude -%s/.claude.json" % (home, home) in claude
     claude2 = (box.units / "homehub-claude-refresh@claude2.service.d" / "10-account.conf").read_text(encoding="utf-8")
     assert "CLAUDE_CONFIG_DIR=%s/.claude-2" % home in claude2
     gemini = (box.units / "homehub-gemini-refresh.service.d" / "10-account.conf").read_text(encoding="utf-8")
-    assert "ReadWritePaths=%s/.gemini" % home in gemini
+    assert "ReadWritePaths=-%s/.gemini" % home in gemini
     # Ownership of the always-created Codex home goes to the effective account.
     owners = [c for c in box.calls if c.startswith("install ") and "homehub-ai-codex" in c]
     assert owners and all("-o alice -g alice" in c for c in owners), owners
@@ -727,7 +727,10 @@ def _hook_text():
     text = FIRSTBOOT.read_text(encoding="utf-8")
     start = text.index("ai_cli_provision_hook() {")
     end = text.index("\n}\n", start) + 3
-    return text, start, text[start:end]
+    # the shared unquote helper the hook (and 6d/6e) call is a top-level function
+    u0 = text.index("ai_unq() {")
+    unq = text[u0:text.index("\n}\n", u0) + 3]
+    return text, start, unq + text[start:end]
 
 
 def test_firstboot_hook_only_schedules_and_runs_before_6d_llr1119():
@@ -1048,7 +1051,7 @@ def test_an_idle_legacy_service_still_migrates_and_exits_0_sr067(tmp_path):
 def test_firstboot_keeps_going_when_the_usage_setup_exits_3_sr067():
     text = FIRSTBOOT.read_text(encoding="utf-8")
     block = text[text.index("# ── 6e."):text.index("# ── 6f.")]
-    assert 'if bash "$STACK_DIR/ai-usage/setup-ai-usage.sh"' in block and "else" in block, \
+    assert 'bash "$STACK_DIR/ai-usage/setup-ai-usage.sh"' in block and "if AI_CLI_SKIP_STATUS=1 bash" in block         and "else" in block, \
         "a non-zero exit takes the WARNING branch, never aborts firstboot"
 
 

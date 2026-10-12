@@ -67,6 +67,21 @@
 Description=HomeHub: keep the Claude Code credential fresh, account %i (SR-021)
 Documentation=file:///opt/homehub/stack/ai-usage/README.md
 After=network-online.target
+# "NOT INSTALLED YET" IS A QUIET STATE, not a failure (Owner 2026-10-11) - but ONLY
+# when nothing at all is at the CLI's path. That is an ExecCondition= below, NOT a
+# Condition*= group: systemd merges every `Condition*=|` line of a unit AND its
+# drop-ins into ONE OR group, which would read "CLI present OR credential present".
+# ExecCondition= lines accumulate and must ALL pass (AND). A gate exits 1 when its
+# path is absent (nothing there: no file, no link) - systemd.service(5): exit 1-254
+# from ExecCondition= SKIPS the run and the unit is not marked failed. A dangling link
+# or a non-executable file is "there", so the gate passes and the start fails loudly.
+# The per-account drop-in adds the same gate for the credential - "login owed".
+# The `+` prefix (systemd.service(5), "Command lines": full privileges, User= not applied)
+# lets the gate, running as root, see a credential behind a directory the service user
+# cannot enter: that reads "there", so the keeper runs and fails loudly instead of
+# skipping. It does NOT lift the sandbox for the gate (measured on systemd 255): the
+# drop-in's ReadWritePaths= entries are therefore all `-`-prefixed, so a missing target
+# can never turn into a quiet skip (226/NAMESPACE from ExecCondition= counts as a skip).
 Wants=network-online.target
 
 [Service]
@@ -117,6 +132,7 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # the journal would write a usage history nobody asked for into the system log.
 # The gauges are where those numbers belong. Failures still surface: a non-zero
 # exit is recorded by systemd, and `systemctl status` names it.
+ExecCondition=+/bin/sh -c '[ -e "$$1" ] || [ -L "$$1" ]' gate /usr/local/bin/claude
 ExecStart=/bin/sh -c 'cd "$HOME" && exec claude -p "/usage" >/dev/null 2>&1'
 
 # A refresh that fails is not an emergency: the token is still valid until its

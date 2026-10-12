@@ -48,6 +48,9 @@ PATH_ENV = "/usr/local/bin:/usr/bin:/bin"
 CODEX_USAGE_HOME = os.environ.get("AI_CLI_CODEX_USAGE_HOME", "/var/lib/homehub-ai-codex")
 
 
+RAW_ENV = {}      # the values exactly as written, for the ONE unquote in ensure-ai-account.sh
+
+
 def load_env():
     env = dict(os.environ)
     path = os.environ.get("AI_CLI_ENV_FILE") or os.path.join(HERE, "..", ".env")
@@ -59,6 +62,7 @@ def load_env():
                     continue
                 key, _, value = line.partition("=")
                 value = value.strip()
+                RAW_ENV[key.strip()] = value
                 if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                     value = value[1:-1]
                 env[key.strip()] = value
@@ -85,8 +89,9 @@ USAGE_ENABLED = ENV.get("AI_USAGE_ENABLED", "false") == "true"
 
 # ONE effective account: the rule lives in ensure-ai-account.sh --effective.
 rc, out = run(["bash", os.path.join(HERE, "ensure-ai-account.sh"), "--effective",
-               "true" if CLI_ENABLED else "false", ENV.get("AI_CLI_USER", ""),
-               ENV.get("AI_USAGE_USER_ACCOUNT", "")])
+               "true" if CLI_ENABLED else "false",
+               RAW_ENV.get("AI_CLI_USER", ENV.get("AI_CLI_USER", "")),
+               RAW_ENV.get("AI_USAGE_USER_ACCOUNT", ENV.get("AI_USAGE_USER_ACCOUNT", ""))])
 ACCOUNT = out.strip() or "homehub-ai"
 
 rc, out = run(["getent", "passwd", ACCOUNT])
@@ -445,6 +450,9 @@ for key in needed:
         tail = "consumer operation verified" if key in verified_clis \
             else "installed, operation not yet verified"
         print("  %s %s: %s" % (key, version, tail) if version else "  %s: %s" % (key, tail))
+    elif status is not None and status.get("provisioning") == "off":
+        # Nobody is going to install it: say so plainly rather than promising it.
+        print("  %s: not installed - provisioning is off (AI_CLI_PROVISION=off)" % key)
     elif status is not None:
         reason = info.get("pending_reason")
         print("  %s: being provisioned%s" % (key, " (%s)" % reason if reason else ""))

@@ -22,6 +22,21 @@
 Description=HomeHub: keep the Gemini CLI token fresh (SR-021)
 Documentation=file:///opt/homehub/stack/ai-usage/README.md
 After=network-online.target
+# "NOT INSTALLED YET" IS A QUIET STATE, not a failure (Owner 2026-10-11) - but ONLY
+# when nothing at all is at the CLI's path. That is an ExecCondition= below, NOT a
+# Condition*= group: systemd merges every `Condition*=|` line of a unit AND its
+# drop-ins into ONE OR group, which would read "CLI present OR credential present".
+# ExecCondition= lines accumulate and must ALL pass (AND). A gate exits 1 when its
+# path is absent (nothing there: no file, no link) - systemd.service(5): exit 1-254
+# from ExecCondition= SKIPS the run and the unit is not marked failed. A dangling link
+# or a non-executable file is "there", so the gate passes and the start fails loudly.
+# The per-account drop-in adds the same gate for the credential - "login owed".
+# The `+` prefix (systemd.service(5), "Command lines": full privileges, User= not applied)
+# lets the gate, running as root, see a credential behind a directory the service user
+# cannot enter: that reads "there", so the keeper runs and fails loudly instead of
+# skipping. It does NOT lift the sandbox for the gate (measured on systemd 255): the
+# drop-in's ReadWritePaths= entries are therefore all `-`-prefixed, so a missing target
+# can never turn into a quiet skip (226/NAMESPACE from ExecCondition= counts as a skip).
 Wants=network-online.target
 
 [Service]
@@ -54,6 +69,7 @@ Environment=NO_BROWSER=true
 # Output is one status line and nothing the CLI said (see the script). HOME is
 # derived by systemd from User=, so the account is named in exactly one place;
 # the CLI reads project settings from its cwd, hence the cd.
+ExecCondition=+/bin/sh -c '[ -e "$$1" ] || [ -L "$$1" ]' gate /usr/local/bin/gemini
 ExecStart=/bin/sh -c 'cd "$HOME" && exec /usr/bin/python3 /opt/homehub/stack/ai-usage/gemini_auth_refresh.py'
 
 # A refresh that fails is not an emergency (the token is valid until its expiry

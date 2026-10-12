@@ -1287,7 +1287,7 @@ def test_only_the_refresher_may_write_the_credential_not_the_feeder():
     svc = _refresh_service()
     assert "ProtectHome=read-only" in svc, "the refresher is not a hole in the posture"
     setup = (REPO / "stack" / "ai-usage" / "setup-ai-usage.sh").read_text(encoding="utf-8")
-    assert "ReadWritePaths=$REFRESH_HOME/.claude $REFRESH_HOME/.claude.json" in setup, (
+    assert "ReadWritePaths=-$REFRESH_HOME/.claude -$REFRESH_HOME/.claude.json" in setup, (
         "the two credential paths must be re-opened for writing, from the "
         "account's real home")
     feeder_unit = (REPO / "stack" / "ai-usage" / "homehub-ai-usage.service").read_text(encoding="utf-8")

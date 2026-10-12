@@ -52,16 +52,28 @@ AI_CLI_USER="${AI_CLI_USER:-homehub-ai}"
 AI_CLI_BIND="${AI_CLI_BIND:-127.0.0.1}"
 AI_CLI_SCRATCH_ROOT="${AI_CLI_SCRATCH_ROOT:-/var/lib/homehub-ai/scratch}"
 
+# One truthiness rule for the whole stack: strip ONE matched pair of quotes, then
+# compare exactly (see setup-ai-usage.sh).
+unquote() {
+    local v="${1%$'\r'}"
+    case "$v" in
+        \"*\") v="${v#\"}"; v="${v%\"}" ;;
+        \'*\') v="${v#\'}"; v="${v%\'}" ;;
+    esac
+    printf '%s' "$v"
+}
+
 if [ -f "$ENV_FILE" ]; then
     # Read only the keys we own, and never `source` a file that may hold
     # secrets into this shell's environment wholesale.
     for key in AI_CLI_ENABLED AI_CLI_USER AI_CLI_BIND AI_CLI_SCRATCH_ROOT; do
-        value="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+        value="$(unquote "$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)")"
         [ -n "$value" ] && printf -v "$key" '%s' "$value"
     done
 fi
 
 log() { printf 'setup-ai-cli: %s\n' "$*"; }
+
 die() { printf 'setup-ai-cli: FAILED: %s\n' "$*" >&2; exit 1; }
 refuse() { printf 'setup-ai-cli: REFUSED: %s\n' "$*" >&2; exit 2; }
 
@@ -169,4 +181,6 @@ AI_CLI_ETC_DIR="${AI_CLI_ETC_DIR:-$(dirname "$(dirname "$UNIT_DIR")")}" \
 log "converged."
 # What is still owed is a SIGN-IN, never a package: the CLIs are provisioned by
 # provision-ai-clis.sh. The status step names exactly the logins that remain.
-AI_CLI_ENV_FILE="$ENV_FILE" bash "${AI_CLI_STATUS:-$HERE/ai-cli-status.sh}" || true
+if [ "${AI_CLI_SKIP_STATUS:-0}" != 1 ]; then
+    AI_CLI_ENV_FILE="$ENV_FILE" bash "${AI_CLI_STATUS:-$HERE/ai-cli-status.sh}" || true
+fi

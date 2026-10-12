@@ -91,6 +91,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -205,6 +206,83 @@ class SourceFailure(Exception):
     a second exception type is a second chance to accidentally post a fresh
     reading for a source that failed.
     """
+
+
+class PendingState(SourceFailure):
+    """An EXPECTED, quiet state - not a failure (Owner 2026-10-11).
+
+    Two of them exist: the source's CLI is "not installed yet" (provisioning will
+    install it) and "login owed" (the vendor sign-in has not happened, so there is
+    no credential). Both post UNAVAILABLE exactly as a failed source does, because
+    it IS a SourceFailure to every reader and to `build_post`; but `run_cycle`
+    records it as a NOTE, not a failure, so it logs one INFO line and does not
+    make the unit exit 1. A genuine error (a credential that exists and is
+    unreadable, a non-200, a crash) is still a failure.
+    """
+
+
+def path_absent(path):
+    """True ONLY when nothing at all is at `path`: lstat says ENOENT or ENOTDIR.
+
+    Quiet means GENUINELY ABSENT. A path that is there but cannot be used - a
+    dangling symlink, a directory we may not enter (EACCES), an I/O error - is NOT
+    absent, so `os.path.exists` (which answers False for all of those) is the wrong
+    test and this is the only one used to decide that something is "owed"."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError:
+        return False
+    else:
+        return False
+    # lstat only vouches for the last component: with a DANGLING ANCESTOR symlink
+    # (~/.claude -> a missing target) every descendant also says ENOENT, yet that is a
+    # broken install, not a login that is owed. Walk up to the first ancestor that
+    # exists; if it is a link whose target is gone, the path is not "absent".
+    parent = os.path.dirname(path)
+    while parent and parent != os.path.dirname(parent):
+        try:
+            st = os.lstat(parent)
+        except (FileNotFoundError, NotADirectoryError):
+            parent = os.path.dirname(parent)
+            continue
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                os.stat(parent)
+            except OSError:
+                return False          # a dangling (or unreadable) link above the path
+        break
+    return True
+
+
+def binary_absent(binary, env):
+    """True only when nothing named `binary` exists anywhere it would be found.
+
+    A launch FileNotFoundError does not prove that: a missing interpreter or
+    loader raises it for a binary that is very much installed. Existence is judged
+    with lstat, so a dangling link or a non-executable file counts as PRESENT (and
+    its launch failure stays loud). This is the SAME rule as the keeper units' gate
+    (ConditionPathExists=| plus ConditionPathIsSymbolicLink=|: skipped only when
+    nothing at all is at the path), so both sides agree on what "absent" means."""
+    if os.sep in binary:
+        return path_absent(os.path.expanduser(binary))
+    search = env.get("PATH") or os.environ.get("PATH") or os.defpath
+    return all(path_absent(os.path.join(d or ".", binary)) for d in search.split(os.pathsep))
+
+
+def provisioning_hint(env, key):
+    """' (provisioning: <reason>)' when the provisioner has recorded why `key` is
+    pending, else ''. Best effort: a missing or odd state file is just no hint."""
+    state_dir = env.get("AI_CLIS_STATE_DIR") or "/var/lib/homehub-ai-clis"
+    try:
+        with open(os.path.join(state_dir, "state.json"), encoding="utf-8") as handle:
+            reason = json.load(handle)["clis"][key]["pending"]["reason"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return ""
+    return " (provisioning: %s)" % reason if isinstance(reason, str) and reason else ""
 
 
 class AuthFailure(SourceFailure):
@@ -1693,6 +1771,10 @@ def read_secret_file(path, extractor):
     try:
         with open(os.path.expanduser(path), encoding="utf-8") as handle:
             data = json.load(handle)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if path_absent(os.path.expanduser(path)):
+            raise PendingState("login owed: no credential at %s yet" % path)
+        raise SourceFailure("credential %s unreadable: %s" % (path, type(exc).__name__))
     except (OSError, ValueError) as exc:
         raise SourceFailure("credential %s unreadable: %s" % (path, type(exc).__name__))
     value = extractor(data)
@@ -2024,11 +2106,20 @@ def read_codex(env):
     """
     binary = env.get("AI_USAGE_CODEX_BIN") or "codex"
     timeout = int(env.get("AI_USAGE_TIMEOUT_SECONDS") or 30)
+    # The unit names the Codex home it signs in under; no auth.json there is
+    # "login owed", not a launch worth making (and not an error).
+    codex_home = env.get("CODEX_HOME")
+    if codex_home and path_absent(os.path.join(codex_home, "auth.json")):
+        raise PendingState("login owed: no codex sign-in at %s yet" % os.path.join(codex_home, "auth.json"))
     try:
         child = subprocess.Popen(
             [binary, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    except FileNotFoundError as exc:
+        if binary_absent(binary, env):
+            raise PendingState("codex: not installed yet%s" % provisioning_hint(env, "codex"))
+        raise SourceFailure("codex: cannot launch %s (%s)" % (binary, type(exc).__name__))
     except OSError as exc:
         raise SourceFailure("codex: cannot launch %s (%s)" % (binary, type(exc).__name__))
 
@@ -2089,7 +2180,7 @@ def _read_claude_account(env, name, credentials_knob, buckets, scoped_models):
     """
     path = env.get(credentials_knob)
     if not path:
-        raise SourceFailure("%s: %s unset" % (name, credentials_knob))
+        raise PendingState("%s: login owed (%s is not set)" % (name, credentials_knob))
     try:
         token = read_secret_file(path, _claude_token)
     except NoUsableKey as exc:
@@ -2164,7 +2255,7 @@ def read_gemini(env):
     """
     path = env.get("AI_USAGE_GEMINI_CREDENTIALS")
     if not path:
-        raise SourceFailure("gemini: AI_USAGE_GEMINI_CREDENTIALS unset")
+        raise PendingState("gemini: login owed (AI_USAGE_GEMINI_CREDENTIALS is not set)")
     models = parse_gemini_models(env.get("AI_USAGE_GEMINI_MODELS"))
     now = cycle_now(env)
     token, expiry_ms = read_secret_file(path, _gemini_token)
@@ -2198,7 +2289,7 @@ def read_opencode(env):
     """Source 3: the Zen usage endpoint, with the workspace bearer key."""
     path = env.get("AI_USAGE_OPENCODE_AUTH")
     if not path:
-        raise SourceFailure("opencode: AI_USAGE_OPENCODE_AUTH unset")
+        raise PendingState("opencode: login owed (AI_USAGE_OPENCODE_AUTH is not set)")
     key = read_secret_file(path, _opencode_key)
     url = env.get("AI_USAGE_OPENCODE_URL") or "https://opencode.ai/zen/go/v1/usage"
     # THE USER AGENT IS LOAD-BEARING AND WAS FOUND BY RUNNING THIS, NOT BY
@@ -2323,6 +2414,7 @@ def run_cycle(env, now=None, readers=None, poster=None):
 
     readings, failures = {}, []
     auth_failed = set()
+    pending = set()        # sources in a quiet expected state: not installed yet / login owed
     for name in active:
         try:
             readings.update(readers[name](env))
@@ -2330,6 +2422,11 @@ def run_cycle(env, now=None, readers=None, poster=None):
         # SourceFailure, so listed second it would be swallowed by the plain
         # handler below and a dead login would be indistinguishable from a
         # network blip -- the defect plan 3.6 (G2) exists to fix.
+        except PendingState as exc:
+            # Quiet and expected: one INFO line (main prints the notes), the gauges
+            # go down the unavailable path, and it is NOT a failure.
+            pending.add(name)
+            env.setdefault("_notes", []).append("%s: %s" % (name, exc) if not str(exc).startswith(name) else str(exc))
         except AuthFailure as exc:
             auth_failed.add(name)
             failures.append("%s: %s" % (name, exc))
@@ -2388,8 +2485,14 @@ def run_cycle(env, now=None, readers=None, poster=None):
         if spec.optional and reading is None and spec.key not in ever_seen:
             continue
         try:
-            body, fresh = build_post(spec, reading, stored, now,
-                                     auth_confirmed=spec.source in confirmed)
+            if spec.source in pending:
+                # Nothing to read, and the cached value is NOT history worth showing:
+                # the CLI or the login is gone, so post the explicit UNAVAILABLE body
+                # (no observed_at), never an old reading that is still "fresh".
+                body, fresh = build_gauge(spec, UNAVAILABLE_CONSUMED, None, None, None), False
+            else:
+                body, fresh = build_post(spec, reading, stored, now,
+                                         auth_confirmed=spec.source in confirmed)
         except (ValueError, SourceFailure) as exc:
             failures.append("gauge %s: %s" % (spec.key, exc))
             body, fresh = build_gauge(spec, UNAVAILABLE_CONSUMED, None, None, None), False
@@ -2435,6 +2538,8 @@ def main(argv=None):
                                             "posted" if ok else "POST FAILED"))
     for line in failures:
         print("ai-usage: %s" % line, file=sys.stderr)
+    for note in env.get("_notes", []):
+        print("ai-usage: INFO %s" % note)
     # ONE line that says this invocation reached its end. ai-cli-status.sh reads
     # it (with the journal's invocation id) to tell a completed cycle from one
     # that died part-way; without it a half-printed cycle looks like evidence.

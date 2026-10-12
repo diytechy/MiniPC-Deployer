@@ -456,7 +456,9 @@ envval() { # KEY DEFAULT -> process env, overridden by the .env file (never sour
     fi
     printf '%s' "$v"
 }
-is_true() { [ "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" = "true" ]; }
+# One truthiness rule for the whole stack: envval already stripped one matched pair
+# of quotes; the value must then be EXACTLY `true` (`True` is not true anywhere).
+is_true() { [ "$1" = "true" ]; }
 
 load_config() {
     CFG_USAGE_ENABLED="$(envval AI_USAGE_ENABLED false)"

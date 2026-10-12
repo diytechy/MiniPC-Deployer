@@ -321,7 +321,71 @@ home**), installs the unit and timer, writes a drop-in so the unit's `User=` is 
 `SLEEP_USER_ACCOUNT` knob, and enables **the timer** (never the oneshot service).
 It refuses on a blank `SLEEP_USER`, `SLEEP_FEED_URL`, `MYAIR_EMAIL` or
 `MYAIR_PASSWORD` (it asks only *whether* the last two are non-blank; it never reads
-or prints them). `firstboot.sh` does **not** yet call it — see the report.
+or prints them). `stack/autoinstall/firstboot.sh` (step 6f-2) calls it on a fresh
+install whenever `.env` says `SLEEP_ENABLED=true`, modelled on the weight block: a
+refusal there is a logged WARNING, never a failed first boot. The whole `stack/` tree
+rides the ISO payload (it is a `git archive` of tracked files), so `stack/sleep/` is
+carried without being named anywhere; `tests/test_sleep_wiring.py` asserts all five
+files are tracked.
+
+## Installing on the RUNNING hub (no reimage)
+
+Written down, **not run**. `/opt/homehub` is **not a git checkout** (it is a copied
+tree), so never sync the whole repo over it: diff and copy only `stack/sleep/`.
+Nothing here restarts a container; the feeder is a host systemd unit.
+
+1. **Dev PC: produce the config.** Materialise the hub image as usual. The
+   generated `.env` must carry these keys (check **names only**, never print the
+   file or a value):
+   `SLEEP_ENABLED=true`, `SLEEP_USER`, `SLEEP_USER_ACCOUNT`, `SLEEP_FEED_URL`,
+   `SLEEP_FEED_TOKEN`, `SLEEP_PUBLISH`, `SLEEP_STATE_FILE`, `SLEEP_TIMEOUT_SECONDS`,
+   `MYAIR_EMAIL`, `MYAIR_PASSWORD`, `TIMEZONE`. `SLEEP_ENABLED` and `SLEEP_USER`
+   come from HomeHub `config.homehub.psd1`; `MYAIR_EMAIL` from the identity row
+   `household.MyAirEmail`; `MYAIR_PASSWORD` from the store key `MyAirPassword`.
+   Leave `HEART_ENABLED=0` (no heart device exists yet).
+2. **Hub: back the `.env` up.**
+   `sudo cp -p /opt/homehub/stack/.env /opt/homehub/stack/.env.bak-$(date +%Y%m%d-%H%M%S)`
+3. **Hub: add only the missing `.env` lines, in place.** Append (`sudo tee -a`) or
+   edit the one line; do **not** replace the file with a new one, because a new
+   inode can detach a bind mount that something else holds on it. Copy the lines
+   verbatim from the materialised file (the materialiser has already doubled any
+   `$`, which the feeder collapses). Send them on **stdin**, not as an ssh argument,
+   and never echo them. **`SLEEP_FEED_URL` must be the value the hub's existing
+   `WEIGHT_FEED_URL` line already holds** - that one is known to reach the tracker
+   from the host, and the tracker is bridge-only, so the template's loopback
+   default is not guaranteed on this box. The password must not contain `\` or `"`.
+4. **Hub: copy only the sleep tree, after diffing it.** Stage the five files from
+   the release commit (`git archive <commit> stack/sleep` on the dev PC, piped over
+   ssh on stdin into a scratch directory such as `/tmp/sleep-stage`), then
+   `diff -r /tmp/sleep-stage/stack/sleep /opt/homehub/stack/sleep` - on a first
+   install the destination does not exist and every file is new. Then
+   `sudo install -d -m 0755 /opt/homehub/stack/sleep` and
+   `sudo install -m 0644` each of `README.md`, `homehub-sleep.service`,
+   `homehub-sleep.timer`, `setup-sleep.sh`, `sleep_feeder.py` into it, and remove
+   the scratch directory. Copy nothing else.
+5. **Hub: check, then install.**
+   `sudo bash /opt/homehub/stack/sleep/setup-sleep.sh --check-only` (refuses on a
+   blank identity, destination or sign-in, and prints one `clock sync:` line), then
+   `sudo bash /opt/homehub/stack/sleep/setup-sleep.sh`.
+6. **Hub: verify.**
+   - `systemctl list-timers homehub-sleep.timer` shows a next and a last run.
+   - `sudo systemctl start homehub-sleep.service` runs one cycle now (it makes a
+     real myAir sign-in, one of the day's five); then
+     `journalctl -u homehub-sleep -n 40 --no-pager`. A healthy first cycle prints
+     `sleep: source cpap-myair answered` and either `sleep: published night <date>`
+     or `sleep: expected night <date>: no score yet - posted unavailable` (before the
+     night has uploaded, or after 14:00 with none). An `authentication failure` or
+     `asks for an emailed code` line is the sign-in, not the install: see "When
+     sign-in needs a person".
+   - A post landed in NagLight: the journal's `published night` line is the audit
+     trail; the `sleep` bar then appears in the life row on the panel. The unavailable
+     body is also a post (a grey, empty bar), so a grey bar proves delivery too.
+   - `sudo systemctl is-enabled homehub-sleep.timer` prints `enabled`.
+7. **Roll back.** `sudo systemctl disable --now homehub-sleep.timer`, then restore
+   the `.env` backup from step 2; the account and state directory are inert and
+   may stay.
+
+Not proven: every step above, on a real hub (see "Known limits").
 
 The unit: `User=homehub-sleep`, `StateDirectory=homehub-sleep` mode `0700`, the
 state file `0600`, `ProtectHome=yes`, `ProtectSystem=strict`, `NoNewPrivileges`,

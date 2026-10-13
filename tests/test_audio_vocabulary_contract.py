@@ -23,7 +23,9 @@ WALL = ROOT / "stack/autoinstall/wall"
 sys.path.insert(0, str(ROOT / "stack/panel-audio"))
 sys.path.insert(0, str(WALL))
 
+import audio_router
 import bluetooth_state
+import routed_backend
 import routing
 import switch_backend
 import wall_audio_state
@@ -60,6 +62,8 @@ def test_bluetooth_capabilities_agree_tc1226():
     expected = sorted(FIXTURE["capabilities"])
     assert sorted(routing.CAPABILITIES) == expected
     assert sorted(bluetooth_state.CAPABILITIES) == expected
+    assert sorted(audio_router.DEVICE_CAPABILITIES) == expected
+    assert sorted(routed_backend._CAPABILITIES) == expected
 
 
 def test_volume_gesture_vocabulary_and_documents_agree_tc1226(tmp_path):

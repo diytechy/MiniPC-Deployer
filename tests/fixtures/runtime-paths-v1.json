@@ -1,0 +1,324 @@
+{
+  "_comment": "Runtime paths both repos name. Byte-identical in OfficeWallNaglight and MiniPC-Deployer (tests/fixtures/runtime-paths-v1.json). Each row: role, path, own[] and mpd[] source files (repo-relative) that must each contain the path (or the 'contains' literals when a file composes it from parts). 'import' names an exported constant on the panel side that must equal the path.",
+  "version": 1,
+  "paths": [
+    {
+      "role": "door-stream-socket",
+      "path": "/run/wall-door-stream/service.sock",
+      "own": [
+        {
+          "file": "doorstream/service.py"
+        },
+        {
+          "file": "electron/door-bridge.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-door-stream.service"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-firstboot.sh"
+        }
+      ]
+    },
+    {
+      "role": "audio-router-socket",
+      "path": "/run/wall-audio-router/service.sock",
+      "own": [
+        {
+          "file": "electron/audio-bridge.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall.env.example"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-firstboot.sh"
+        }
+      ],
+      "import": {
+        "module": "electron/audio-bridge.cjs",
+        "name": "AUDIO_SOCKET"
+      }
+    },
+    {
+      "role": "audio-state-file",
+      "path": "/etc/wall-panel/audio-state.json",
+      "own": [
+        {
+          "file": "electron/audio-state.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall_audio_state.py"
+        },
+        {
+          "file": "stack/autoinstall/wall/panel-volume-keys.py"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-audio-output"
+        }
+      ],
+      "import": {
+        "module": "electron/audio-state.cjs",
+        "name": "AUDIO_STATE_FILE"
+      }
+    },
+    {
+      "role": "volume-gesture-file",
+      "path": "/run/wall-volume-gesture/volume-gesture.json",
+      "own": [
+        {
+          "file": "electron/audio-state.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/panel-volume-keys.py",
+          "contains": [
+            "/run/wall-volume-gesture",
+            "/volume-gesture.json"
+          ]
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-volume-keys.service",
+          "contains": [
+            "RuntimeDirectory=wall-volume-gesture"
+          ]
+        }
+      ],
+      "import": {
+        "module": "electron/audio-state.cjs",
+        "name": "VOLUME_GESTURE_FILE"
+      }
+    },
+    {
+      "role": "call-state-file",
+      "path": "/run/wall-panel/call-state.json",
+      "own": [
+        {
+          "file": "electron/audio-state.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-bt-call.py"
+        },
+        {
+          "file": "stack/panel-audio/routed_backend.py"
+        }
+      ],
+      "import": {
+        "module": "electron/audio-state.cjs",
+        "name": "CALL_STATE_FILE"
+      }
+    },
+    {
+      "role": "bus-visualizer-pcm-socket",
+      "path": "/run/wall-bus-visualizer/pcm.sock",
+      "own": [
+        {
+          "file": "electron/pcm-bridge.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/panel-bus-visualizer.py",
+          "contains": [
+            "/run/wall-bus-visualizer",
+            "/pcm.sock"
+          ]
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-bus-visualizer.service"
+        }
+      ],
+      "import": {
+        "module": "electron/pcm-bridge.cjs",
+        "name": "PCM_SOCKET"
+      }
+    },
+    {
+      "role": "sensors-socket",
+      "path": "/run/wall-sensors/service.sock",
+      "own": [
+        {
+          "file": "sensors/service.py"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/render-wall-host-config.py"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-sensors.service"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-local-setup.py"
+        }
+      ]
+    },
+    {
+      "role": "touch-filter-input-socket",
+      "path": "/run/wall-touch-filter/input.sock",
+      "own": [
+        {
+          "file": "touchfilter/bridge.py"
+        },
+        {
+          "file": "electron/touch-bridge.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/render-touch-filter.py"
+        }
+      ]
+    },
+    {
+      "role": "touch-filter-config",
+      "path": "/etc/wall-panel/touch-filter.json",
+      "own": [
+        {
+          "file": "touchfilter/daemon.py"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-touch-filter.service"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-local-setup.py"
+        }
+      ]
+    },
+    {
+      "role": "touch-filter-status",
+      "path": "/run/wall-touch-filter/status.json",
+      "own": [
+        {
+          "file": "touchfilter/daemon.py"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/configure-touch-filter.sh"
+        }
+      ]
+    },
+    {
+      "role": "local-access-state",
+      "path": "/var/lib/wall-panel/access-state.json",
+      "own": [
+        {
+          "file": "electron/local-access.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-local-setup.py"
+        }
+      ]
+    },
+    {
+      "role": "local-access-key",
+      "path": "/var/lib/wall-panel/access-state.key",
+      "own": [
+        {
+          "file": "electron/local-access.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-local-setup.py"
+        }
+      ]
+    },
+    {
+      "role": "projectm-preset-root",
+      "path": "/opt/wall-panel/projectm-presets",
+      "own": [
+        {
+          "file": "electron/projectm-presets.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-firstboot.sh"
+        }
+      ],
+      "import": {
+        "module": "electron/projectm-presets.cjs",
+        "name": "PRESET_ROOT"
+      }
+    },
+    {
+      "role": "media-cache-dir",
+      "path": "/var/cache/wall-media",
+      "own": [
+        {
+          "file": "electron/main.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-sync.sh"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-firstboot.sh"
+        }
+      ]
+    },
+    {
+      "role": "sensor-models-dir",
+      "path": "/opt/wall-sensors/models",
+      "own": [
+        {
+          "file": "sensors/config.py"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/render-wall-host-config.py"
+        },
+        {
+          "file": "stack/autoinstall/wall/install-wall-capabilities.sh"
+        }
+      ]
+    },
+    {
+      "role": "presentation-snapshot",
+      "path": "/run/wall-panel-renderer/presentation-snapshot.json",
+      "own": [
+        {
+          "file": "electron/main.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/panel-telemetry.py"
+        }
+      ]
+    },
+    {
+      "role": "sensors-state-dir",
+      "path": "/var/lib/wall-sensors",
+      "own": [
+        {
+          "file": "sensors/service.py"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-sensors.service"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-sleep.sh"
+        }
+      ]
+    }
+  ]
+}

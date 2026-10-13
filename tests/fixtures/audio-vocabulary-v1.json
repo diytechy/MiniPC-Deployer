@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "note": "Byte-identical in OfficeWallNaglight and MiniPC-Deployer (tests/fixtures/audio-vocabulary-v1.json). Each repo asserts its own real constants against this file; change it in both or neither.",
+  "outputs": ["mute", "headset", "speaker"],
+  "levelled": ["headset", "speaker"],
+  "capabilities": ["ag", "hf", "sink", "source"],
+  "gesture": {
+    "version": 2,
+    "activeKeys": ["gestureId", "output", "phase", "pulseSeq", "stateRevision", "targetLevel", "updatedAtMs", "version"],
+    "refuse": ["state-changed", "apply-failed", "unavailable", "ambiguous"],
+    "cancel": ["device-removed", "mode-changed", "daemon-stopping", "timeout"]
+  }
+}

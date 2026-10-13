@@ -4,7 +4,7 @@
 Contract:
   Input: sensor config JSON path.
   Output: exactly KEEP_AWAKE=true|false|unknown.
-Implements: SR-020, LLR-020
+Implements: SR-020, LLR-1127
 """
 from __future__ import annotations
 
@@ -14,14 +14,20 @@ from pathlib import Path
 
 
 def keep_awake(value: object) -> bool:
-    """Return true when a configured software wake source needs the CPU."""
+    """Return true when a configured software wake source needs the CPU.
+
+    The settings tree (Panel_Kiosk_State.md) makes a child inert while its
+    parent is off, so only a camera wake source IN EFFECT counts: camera on and
+    consented, and motion or face-shaped presence. Face unlock is not a wake
+    source (it does not wake a dark panel) and sits under presenceFace.
+    """
     if not isinstance(value, dict) or value.get("schemaVersion") != 2:
         raise ValueError("unsupported sensor config")
     booleans = ("cameraEnabled", "presenceFace", "presenceMotion", "faceLoginEnabled", "bluetoothEnabled")
     if any(type(value.get(key)) is not bool for key in booleans) or value.get("cameraConsentVersion") not in (0, 1):
         raise ValueError("invalid sensor config")
     camera = value["cameraEnabled"] and value["cameraConsentVersion"] == 1 and any(
-        value[key] for key in ("presenceFace", "presenceMotion", "faceLoginEnabled")
+        value[key] for key in ("presenceFace", "presenceMotion")
     )
     return camera or value["bluetoothEnabled"]
 

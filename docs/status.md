@@ -2815,3 +2815,14 @@ sequence. (`auroleap-integration` now exists in `../sure` at 87b606048: the coor
 merged both fork branches; the merged tree passes Sure's full suite, 10397 runs, 0
 failures, 1 known environment error.) Reviewed: Sonnet medium, REQUEST CHANGES, then
 APPROVE after two fix rounds (c0cf2cc, db44672).
+
+## 2026-10-13 — refactor programme: WI-06 to WI-10 and WI-24 (deploy held)
+
+Refactor programme steps 2 and 6, on the MiniPC-Deployer side. Nothing here is deployed; the deploy is held until the Owner's go-ahead.
+
+- Shared fixtures, byte-identical with the panel repository (OfficeWallNaglight): presentation snapshot (LLR-1126, TC-1220/1221), camera hierarchy (LLR-1127, TC-1222/1223), runtime paths (LLR-1128, TC-1224/1225), audio vocabulary (LLR-1129, TC-1226/1227) and Door configuration (LLR-1130, TC-1228/1229).
+- Door configuration: the image's defaults, firstboot shell validators and credential list are checked against one fixture, including boundary values run in bash.
+- WI-24, the public-site inventory: `ALLOWED_SITE_FILES` equals the panel's real site file set (85 files, LLR-1132, TC-1232), and the `REQUIRED` floor is a subset of the panel's capabilities manifest (LLR-1133, TC-1233).
+- Full suite: 4209 passed. Two failures remain, both pre-existing tc1084 failures that this work did not touch.
+- Not proven: nothing ran on the panel, and the image was not rebuilt or booted for these changes.
+- Two tests named in the plan were not found in `tests/` and are not in the registry: TC-1234 (provider order) and TC-1235. They are listed as open in the report, not claimed here.

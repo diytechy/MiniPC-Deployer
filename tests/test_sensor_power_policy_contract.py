@@ -9,13 +9,12 @@ OfficeWallNaglight, whose own tests (tests/settings-sensing-hierarchy.test.mjs
 and tests/sensors/test_sensing_hierarchy_fixture.py) assert that repo's
 renderer and sensor service against the same file.
 
-KNOWN DIFFERENCE (open question Q5, unanswered): keep_awake reads the STORED
-ticks and ignores the hierarchy, so a panel with only face unlock ticked
-(camera on and consented, face-shape presence and motion off) is kept awake for
-a face unlock that cannot run, because face unlock sits under attention under
-face-shape presence. Those rows are xfail(strict) with reason 'Q5'. When the
-policy is fixed they XPASS, strict turns that into a failure, and the marker is
-removed on purpose rather than the difference disappearing unseen.
+RULED (open question Q5, answered by the Owner on 2026-10-13: "This also should
+follow Panel_Kiosk_State.md"): the power policy follows the settings hierarchy.
+A panel with only face unlock ticked (camera on and consented, face-shape
+presence and motion off) is no longer kept awake, because face unlock sits under
+attention under face-shape presence and is not a wake source. The two rows that
+were xfail(strict, 'Q5') are ordinary passing rows.
 """
 
 import hashlib
@@ -48,7 +47,7 @@ POLICY = load_script("wall_sensor_power_policy_contract", "wall-sensor-power-pol
 
 
 def only_face_unlock_ticked(inputs):
-    """The Q5 rows: a consented camera whose only wake tick is face unlock."""
+    """The former Q5 rows: a consented camera whose only wake tick is face unlock."""
     return (inputs["cameraEnabled"] and inputs["cameraConsentVersion"] == 1
             and inputs["faceLoginEnabled"]
             and not inputs["presenceFace"] and not inputs["presenceMotion"])
@@ -61,19 +60,12 @@ def row_id(row):
                               "presenceFace", "attentionEnabled", "faceLoginEnabled")))
 
 
-def row_param(row):
-    marks = []
-    if only_face_unlock_ticked(row["inputs"]):
-        marks.append(pytest.mark.xfail(strict=True, reason="Q5"))
-    return pytest.param(row, marks=marks, id=row_id(row))
-
-
 def stored_config(inputs):
     # `bluetoothEnabled` is held false by the fixture: it is not part of the hierarchy.
     return {"schemaVersion": 2, **inputs, **FIXTURE["held"]}
 
 
-@pytest.mark.parametrize("row", [row_param(row) for row in FIXTURE["rows"]])
+@pytest.mark.parametrize("row", [pytest.param(row, id=row_id(row)) for row in FIXTURE["rows"]])
 def test_keep_awake_matches_fixture_tc1222(row):
     assert POLICY.keep_awake(stored_config(row["inputs"])) is row["keepAwake"]
 
@@ -82,9 +74,21 @@ def test_fixture_is_the_full_table_tc1222():
     assert len(FIXTURE["rows"]) == 64
     assert FIXTURE["held"] == {"bluetoothEnabled": False}
     assert all(type(row["keepAwake"]) is bool for row in FIXTURE["rows"])
-    # The known difference is real and bounded: 2 rows (attention is free, and
-    # the camera and consent are both on, and motion and face-shape are off).
-    assert sum(only_face_unlock_ticked(row["inputs"]) for row in FIXTURE["rows"]) == 2
+    # The former Q5 rows (attention is free; camera and consent on; motion and
+    # face-shape off): all expect false now.
+    q5 = [row for row in FIXTURE["rows"] if only_face_unlock_ticked(row["inputs"])]
+    assert len(q5) == 2 and all(row["keepAwake"] is False for row in q5)
+
+
+def test_cli_face_unlock_alone_is_not_kept_awake_tc1222(tmp_path, capsys):
+    """The path wall-sleep.sh uses: main() on a config file."""
+    cfg = tmp_path / "sensor.json"
+    cfg.write_text(json.dumps({
+        "schemaVersion": 2, "cameraEnabled": True, "cameraConsentVersion": 1,
+        "presenceFace": False, "presenceMotion": False, "faceLoginEnabled": True,
+        "bluetoothEnabled": False}), encoding="utf-8")
+    assert POLICY.main(["policy", str(cfg)]) == 0
+    assert capsys.readouterr().out == "KEEP_AWAKE=false\n"
 
 
 def test_fixture_byte_identical_tc1223():

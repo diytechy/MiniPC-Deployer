@@ -1,0 +1,1162 @@
+{
+ "version": 1,
+ "generator": "tools/gen-sensing-hierarchy.py",
+ "source": "sensors.config.effective",
+ "held": {
+  "bluetoothEnabled": false
+ },
+ "rows": [
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": false,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 0,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": false,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": false,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": false
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": false,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": true,
+    "presenceFace": false,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": false,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": false
+   },
+   "keepAwake": true
+  },
+  {
+   "inputs": {
+    "cameraEnabled": true,
+    "cameraConsentVersion": 1,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "effective": {
+    "cameraEnabled": true,
+    "presenceMotion": true,
+    "presenceFace": true,
+    "attentionEnabled": true,
+    "faceLoginEnabled": true
+   },
+   "keepAwake": true
+  }
+ ]
+}

@@ -30,6 +30,7 @@ does not open a video node. Saved schema-v2 sensor configuration with
 block explicit local opt-in, and migration does not turn capture on.
 
 Software camera/Bluetooth wake keeps the CPU running and uses display-off.
+[2026-10-13: the camera wake source is presence, motion or face-shaped; face unlock alone does not keep the CPU awake.]
 `wall-sleep.sh` derives this from `/var/lib/wall-sensors/config.json`; missing or
 invalid config conservatively selects display-off because suspend would make an
 intended software wake impossible. A `wake` helper request is checked against a

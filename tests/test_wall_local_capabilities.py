@@ -135,7 +135,8 @@ def test_durable_state_replays_host_after_interrupted_rename(tmp_path, monkeypat
 @pytest.mark.parametrize("patch", [
     {"cameraEnabled": True, "cameraConsentVersion": 1, "presenceMotion": True},
     {"cameraEnabled": True, "cameraConsentVersion": 1, "presenceFace": True},
-    {"cameraEnabled": True, "cameraConsentVersion": 1, "faceLoginEnabled": True},
+    {"cameraEnabled": True, "cameraConsentVersion": 1, "presenceFace": True,
+     "faceLoginEnabled": True},
     {"bluetoothEnabled": True},
 ])
 def test_saved_software_wake_policy_keeps_cpu_awake(patch):
@@ -143,6 +144,15 @@ def test_saved_software_wake_policy_keeps_cpu_awake(patch):
               "presenceFace": False, "presenceMotion": False, "faceLoginEnabled": False,
               "bluetoothEnabled": False, **patch}
     assert POWER.keep_awake(config) is True
+
+
+def test_face_unlock_alone_does_not_keep_cpu_awake():
+    # Owner Q5 (2026-10-13): face unlock is not a wake source and sits under
+    # face-shaped presence, so with presence off it is inert.
+    config = {"schemaVersion": 2, "cameraConsentVersion": 1, "cameraEnabled": True,
+              "presenceFace": False, "presenceMotion": False, "faceLoginEnabled": True,
+              "bluetoothEnabled": False}
+    assert POWER.keep_awake(config) is False
 
 
 def test_camera_without_fresh_consent_does_not_override_suspend():

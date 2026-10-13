@@ -1,0 +1,847 @@
+{
+  "schema": "presentation-v1",
+  "note": "Byte-identical in OfficeWallNaglight and MiniPC-Deployer. {\"$number\":\"NaN\"} stands for a non-finite number JSON cannot carry; {\"$repeat\":[s,n]} is s repeated n times. Cases: every validator must give expectedOk, and the error text must contain expectedErrorSubstring. derive: the deriveSnapshot inputs that produce the payload (panel only).",
+  "owners": [
+    "DOOR",
+    "MEDIA_SCREENSAVER",
+    "NAGLIGHT",
+    "PROJECTM",
+    "VISUALIZER"
+  ],
+  "cases": [
+    {
+      "name": "tabbed-baseline",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "SPLIT",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5
+      }
+    },
+    {
+      "name": "tabbed-music-active",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": true,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "SPLIT",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": true,
+        "revision": 1,
+        "monotonicMs": 1000.5
+      }
+    },
+    {
+      "name": "tabbed-with-preferences",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "DOOR",
+        "fullscreenOwner": null,
+        "mediaPreference": "frame",
+        "visualizerStatus": "running",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "SPLIT",
+        "tab": "DOOR",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "mediaPreference": "frame",
+        "visualizerStatus": "running"
+      }
+    },
+    {
+      "name": "revision-zero",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 0,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "SPLIT",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 0,
+        "monotonicMs": 1000.5
+      }
+    },
+    {
+      "name": "string-at-64-chars",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "SPLIT",
+        "tab": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5
+      }
+    },
+    {
+      "name": "full-owner-DOOR",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "DOOR",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "FULL",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "ambientOwner": "DOOR"
+      }
+    },
+    {
+      "name": "full-owner-MEDIA_SCREENSAVER",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "MEDIA_SCREENSAVER",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "FULL",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "ambientOwner": "FRAME"
+      }
+    },
+    {
+      "name": "full-owner-NAGLIGHT",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "NAGLIGHT",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "FULL",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "ambientOwner": "NAG"
+      }
+    },
+    {
+      "name": "full-owner-PROJECTM",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "PROJECTM",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "FULL",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "ambientOwner": "FRAME",
+        "presentationOwner": "PROJECTM"
+      }
+    },
+    {
+      "name": "full-owner-VISUALIZER",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "VISUALIZER",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "FULL",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "ambientOwner": "VISUALIZER"
+      }
+    },
+    {
+      "name": "projectm-preset-present",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "PROJECTM",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": "Geiss - Spiral Artifact"
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "FULL",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "ambientOwner": "FRAME",
+        "presentationOwner": "PROJECTM",
+        "projectmPreset": "Geiss - Spiral Artifact"
+      }
+    },
+    {
+      "name": "projectm-preset-null",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "SPLIT",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5
+      }
+    },
+    {
+      "name": "projectm-preset-at-200-chars",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "PROJECTM",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": {
+          "$repeat": [
+            "p",
+            200
+          ]
+        }
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": {
+        "display": "FULL",
+        "tab": "MUSIC",
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "ambientOwner": "FRAME",
+        "presentationOwner": "PROJECTM",
+        "projectmPreset": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      }
+    },
+    {
+      "name": "projectm-preset-absent-legacy-renderer",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5
+      },
+      "expectedOk": true,
+      "expectedErrorSubstring": "",
+      "derive": null,
+      "notProducibleBecause": "deriveSnapshot always emits projectmPreset; accepted for a renderer that predates it"
+    },
+    {
+      "name": "incoherent-tabbed-with-owner",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "DOOR",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "fullscreenOwner must be null while displayMode is TABBED"
+    },
+    {
+      "name": "incoherent-full-with-null-owner",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "fullscreenOwner must not be null while displayMode is FULL"
+    },
+    {
+      "name": "incoherent-full-owner-key-absent",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "missing field: fullscreenOwner"
+    },
+    {
+      "name": "unknown-owner-name",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "SCREENSAVER",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "fullscreenOwner not"
+    },
+    {
+      "name": "retired-owner-name-ambient-frame",
+      "payload": {
+        "displayMode": "FULL",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": "FRAME",
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "fullscreenOwner not"
+    },
+    {
+      "name": "display-mode-split",
+      "payload": {
+        "displayMode": "SPLIT",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "displayMode not one of"
+    },
+    {
+      "name": "nan-monotonic",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": {
+          "$number": "NaN"
+        },
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "monotonicMs"
+    },
+    {
+      "name": "infinity-monotonic",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": {
+          "$number": "Infinity"
+        },
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "monotonicMs"
+    },
+    {
+      "name": "bool-for-int-revision",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": true,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field revision"
+    },
+    {
+      "name": "bool-for-number-monotonic",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": true,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field monotonicMs"
+    },
+    {
+      "name": "negative-revision",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": -1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "revision"
+    },
+    {
+      "name": "fractional-revision",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1.5,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "revision"
+    },
+    {
+      "name": "string-for-bool",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": "true",
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field musicActive has wrong type"
+    },
+    {
+      "name": "int-for-bool",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": 1,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field musicActive has wrong type"
+    },
+    {
+      "name": "null-for-required-string",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": null,
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field displayPower has wrong type"
+    },
+    {
+      "name": "over-length-required-string",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": {
+          "$repeat": [
+            "x",
+            65
+          ]
+        },
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field displayPower exceeds 64 characters"
+    },
+    {
+      "name": "over-length-nullable-string",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": {
+          "$repeat": [
+            "x",
+            65
+          ]
+        },
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field selectedTab exceeds 64 characters"
+    },
+    {
+      "name": "over-length-preset",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": {
+          "$repeat": [
+            "p",
+            201
+          ]
+        }
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field projectmPreset exceeds 200 characters"
+    },
+    {
+      "name": "preset-wrong-type",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": 7
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "field projectmPreset has wrong type"
+    },
+    {
+      "name": "unknown-field",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null,
+        "extra": 1
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "unexpected field"
+    },
+    {
+      "name": "wrapped-file-shape",
+      "payload": {
+        "current": {
+          "displayMode": "TABBED",
+          "selectedTab": "MUSIC",
+          "fullscreenOwner": null,
+          "mediaPreference": null,
+          "visualizerStatus": null,
+          "displayPower": "on",
+          "musicActive": false,
+          "revision": 1,
+          "monotonicMs": 1000.5,
+          "projectmPreset": null
+        },
+        "transitions": []
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "unexpected field"
+    },
+    {
+      "name": "missing-required-field",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "missing field: musicActive"
+    },
+    {
+      "name": "missing-revision",
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "expectedOk": false,
+      "expectedErrorSubstring": "missing field: revision"
+    },
+    {
+      "name": "payload-array",
+      "payload": [],
+      "expectedOk": false,
+      "expectedErrorSubstring": "payload is not an object"
+    },
+    {
+      "name": "payload-null",
+      "payload": null,
+      "expectedOk": false,
+      "expectedErrorSubstring": "payload is not an object"
+    },
+    {
+      "name": "payload-string",
+      "payload": "FULL",
+      "expectedOk": false,
+      "expectedErrorSubstring": "payload is not an object"
+    }
+  ],
+  "knownDifferences": [
+    {
+      "name": "revision-written-as-1.0",
+      "ownOk": true,
+      "mpdOk": false,
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": "on",
+        "musicActive": false,
+        "revision": 1.0,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "note": "JSON 1.0 is the integer 1 to JavaScript and a float to Python."
+    },
+    {
+      "name": "astral-characters-33-emoji-in-required-string",
+      "ownOk": false,
+      "mpdOk": true,
+      "payload": {
+        "displayMode": "TABBED",
+        "selectedTab": "MUSIC",
+        "fullscreenOwner": null,
+        "mediaPreference": null,
+        "visualizerStatus": null,
+        "displayPower": {
+          "$repeat": [
+            "\ud83d\ude00",
+            33
+          ]
+        },
+        "musicActive": false,
+        "revision": 1,
+        "monotonicMs": 1000.5,
+        "projectmPreset": null
+      },
+      "note": "33 emoji is 66 UTF-16 units (JavaScript length) but 33 code points (Python len); the 64-char bound counts differently."
+    }
+  ]
+}

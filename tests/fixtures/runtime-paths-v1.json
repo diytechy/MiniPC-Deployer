@@ -288,6 +288,37 @@
           "file": "stack/autoinstall/wall/install-wall-capabilities.sh"
         }
       ]
+    },
+    {
+      "role": "presentation-snapshot",
+      "path": "/run/wall-panel-renderer/presentation-snapshot.json",
+      "own": [
+        {
+          "file": "electron/main.cjs"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/panel-telemetry.py"
+        }
+      ]
+    },
+    {
+      "role": "sensors-state-dir",
+      "path": "/var/lib/wall-sensors",
+      "own": [
+        {
+          "file": "sensors/service.py"
+        }
+      ],
+      "mpd": [
+        {
+          "file": "stack/autoinstall/wall/wall-sensors.service"
+        },
+        {
+          "file": "stack/autoinstall/wall/wall-sleep.sh"
+        }
+      ]
     }
   ]
 }

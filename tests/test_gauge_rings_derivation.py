@@ -24,7 +24,10 @@ SPEC = importlib.util.spec_from_file_location("install_renderer_config_w3", SCRI
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
-GAUGES = ROOT.parent / "OfficeWallNaglight/js/views/gauges.js"
+# Sibling resolution honours OWN_REPO so a worktree can point at its own panel
+# checkout (precedent: TOUCH_APP_REPO in test_touch_filter_release.py).
+OWN_REPO = Path(os.environ.get("OWN_REPO") or ROOT.parent / "OfficeWallNaglight")
+GAUGES = OWN_REPO / "js/views/gauges.js"
 NODE = shutil.which("node")
 DEFAULT_BLOCK = {"slots": [], "unlisted": "append"}
 
@@ -104,9 +107,20 @@ def test_tc1215_order_marks_badges_and_non_lossy_round_trip(tmp_path, sources, e
 
 def test_tc1215_order_table_matches_the_renderer_source():
     need_gauges()
-    text = GAUGES.read_text(encoding="utf-8")
-    body = re.search(r"USAGE_PROVIDER_ORDER\s*=\s*\[(.*?)\]", text, re.S).group(1)
-    assert list(MODULE.PROVIDER_ORDER) == re.findall(r'"([a-z0-9]+)"', body)
+    # Import the renderer under node and read the live export. The order moved
+    # to js/gauge-order.js (re-exported by gauges.js), so a regex over
+    # gauges.js's text finds nothing.
+    if not NODE:
+        pytest.skip("node not on PATH: USAGE_PROVIDER_ORDER not imported")
+    program = ("import(process.argv[1]).then(m=>console.log(JSON.stringify("
+               "m.USAGE_PROVIDER_ORDER)))")
+    env = {k: v for k, v in os.environ.items() if k != "ELECTRON_RUN_AS_NODE"}
+    done = subprocess.run([NODE, "-e", program, GAUGES.as_uri()],
+                          capture_output=True, text=True, env=env, timeout=60)
+    assert done.returncode == 0, done.stderr[-400:]
+    order = json.loads(done.stdout)
+    assert order and all(isinstance(x, str) for x in order)
+    assert list(MODULE.PROVIDER_ORDER) == order
 
 
 def test_tc1216_absent_marker_and_shipped_default_are_derived(tmp_path):

@@ -172,6 +172,28 @@ else
     log "GPU: NO /dev/dri/renderD* — allowing wlroots' software renderer (WLR_RENDERER_ALLOW_SOFTWARE=1)."
     log "GPU: expected in a VM; on the PANEL it means the iGPU is not bound and video will be CPU-decoded."
 fi
+# ── legacy KMS: the compositor drives the GPU without atomic modesetting ─────
+# WALL_DRM_LEGACY_KMS=true exports WLR_DRM_NO_ATOMIC=1, which makes wlroots (cage)
+# use the legacy KMS interface on the same i915 driver instead of ATOMIC
+# modesetting. It began as a one-day A/B test for the 2026-09-15 frame-callback
+# wedges and has stayed on: no wedge of that kind since. Anything other than
+# true leaves the variable UNSET (atomic), never exported as 0 — wlroots treats
+# any set value as "on". Going back is wall.env: WALL_DRM_LEGACY_KMS=false, then
+# `sudo /usr/local/sbin/wall-firstboot.sh` and restart the kiosk.
+# firstboot refuses an invalid value; here an invalid one is only logged.
+# BEGIN wlr-legacy-kms
+case "${WALL_DRM_LEGACY_KMS:-}" in
+    true)
+        export WLR_DRM_NO_ATOMIC=1
+        log "drm: WALL_DRM_LEGACY_KMS=true — legacy KMS (WLR_DRM_NO_ATOMIC=1)" ;;
+    ''|false)
+        unset WLR_DRM_NO_ATOMIC
+        log "drm: atomic KMS (WALL_DRM_LEGACY_KMS='${WALL_DRM_LEGACY_KMS:-}')" ;;
+    *)
+        unset WLR_DRM_NO_ATOMIC
+        log "drm: WARNING WALL_DRM_LEGACY_KMS='${WALL_DRM_LEGACY_KMS}' is not true/false — using atomic KMS" ;;
+esac
+# END wlr-legacy-kms
 [ "$HAVE_LOGGER" -eq 1 ] || echo "[wall-kiosk] WARNING: no logger(1) — journalctl -t wall-kiosk will be EMPTY"
 
 # ── the pointer image: nothing at all ───────────────────────────────────────

@@ -335,7 +335,7 @@ def validate_wake(params: dict, status: dict, now_ms: int | None = None, *,
     if not isinstance(config, dict) or config.get("schemaVersion") != 2:
         raise Refused("wake-not-observed")
     candidates = [("bluetooth", "bluetoothEnabled")] if params["source"] == "bluetooth" else [
-        ("cameraFace", "presenceFace"), ("motion", "presenceMotion")]
+        ("faceCount", "presenceFace"), ("motion", "presenceMotion")]
     if params["source"] == "camera" and not (config.get("cameraEnabled") is True and config.get("cameraConsentVersion") == 1):
         raise Refused("wake-not-observed")
     now = int(time.time() * 1000) if now_ms is None else now_ms
@@ -344,6 +344,10 @@ def validate_wake(params: dict, status: dict, now_ms: int | None = None, *,
     matches = [status.get(name) for name, setting in candidates if config.get(setting) is True]
     for reading in matches:
         if not isinstance(reading, dict) or reading.get("state") != "positive":
+            continue
+        # Protocol v4 carries face evidence as a count; a positive reading
+        # whose count is present must be above zero (motion has no value).
+        if "value" in reading and (type(reading["value"]) is not int or reading["value"] <= 0):
             continue
         actual_at, actual_ttl = reading.get("observedAt"), reading.get("ttlMs")
         if (type(actual_at) in (int, float) and type(actual_ttl) in (int, float)

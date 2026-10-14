@@ -176,22 +176,25 @@ fi
 # WALL_DRM_LEGACY_KMS=true exports WLR_DRM_NO_ATOMIC=1, which makes wlroots (cage)
 # use the legacy KMS interface on the same i915 driver instead of ATOMIC
 # modesetting. It began as a one-day A/B test for the 2026-09-15 frame-callback
-# wedges and has stayed on: no wedge of that kind since. Anything other than
-# true leaves the variable UNSET (atomic), never exported as 0 — wlroots treats
-# any set value as "on". Going back is wall.env: WALL_DRM_LEGACY_KMS=false, then
-# `sudo /usr/local/sbin/wall-firstboot.sh` and restart the kiosk.
-# firstboot refuses an invalid value; here an invalid one is only logged.
+# wedges and has stayed on: no wedge of that kind since. The knob's default is
+# true, so a missing or empty value (a kiosk.env older than this script) means
+# legacy too; only an explicit false unsets the variable (atomic), and it is
+# never exported as 0 — wlroots treats any set value as "on". Going back is
+# wall.env: WALL_DRM_LEGACY_KMS=false, then `sudo /usr/local/sbin/wall-firstboot.sh`
+# and restart the kiosk. firstboot refuses an invalid value and falls back to
+# the default; here an invalid one is logged and falls back the same way.
 # BEGIN wlr-legacy-kms
-case "${WALL_DRM_LEGACY_KMS:-}" in
-    true)
+case "${WALL_DRM_LEGACY_KMS:-true}" in
+    false)
+        unset WLR_DRM_NO_ATOMIC
+        log "drm: WALL_DRM_LEGACY_KMS=false — atomic KMS" ;;
+    true|*)
+        case "${WALL_DRM_LEGACY_KMS:-true}" in
+            true) ;;
+            *) log "drm: WARNING WALL_DRM_LEGACY_KMS='${WALL_DRM_LEGACY_KMS}' is not true/false — using the default, true" ;;
+        esac
         export WLR_DRM_NO_ATOMIC=1
-        log "drm: WALL_DRM_LEGACY_KMS=true — legacy KMS (WLR_DRM_NO_ATOMIC=1)" ;;
-    ''|false)
-        unset WLR_DRM_NO_ATOMIC
-        log "drm: atomic KMS (WALL_DRM_LEGACY_KMS='${WALL_DRM_LEGACY_KMS:-}')" ;;
-    *)
-        unset WLR_DRM_NO_ATOMIC
-        log "drm: WARNING WALL_DRM_LEGACY_KMS='${WALL_DRM_LEGACY_KMS}' is not true/false — using atomic KMS" ;;
+        log "drm: legacy KMS (WLR_DRM_NO_ATOMIC=1)" ;;
 esac
 # END wlr-legacy-kms
 [ "$HAVE_LOGGER" -eq 1 ] || echo "[wall-kiosk] WARNING: no logger(1) — journalctl -t wall-kiosk will be EMPTY"

@@ -7,6 +7,7 @@ out of the real scripts), not read as text. Needs bash.
 Implements tests: TC-1238 (kiosk export), TC-1239 (firstboot validation and
 kiosk.env). Does not prove the compositor honours the variable on the panel's GPU.
 """
+import os
 import re
 import shutil
 import subprocess
@@ -26,19 +27,26 @@ def block(script: str) -> str:
     return found.group(1)
 
 
-def run(script: str) -> str:
+def run(script: str, inherit: str = "") -> str:
+    """Run on stdin with WLR_DRM_NO_ATOMIC cleared from the parent's environment
+    (or set to `inherit`), so only the script under test can put it there."""
+    env = {k: v for k, v in os.environ.items() if k != "WLR_DRM_NO_ATOMIC"}
+    if inherit:
+        env["WLR_DRM_NO_ATOMIC"] = inherit
     done = subprocess.run([BASH, "-s"], input=script.encode("utf-8"),
-                          capture_output=True, timeout=60)
+                          capture_output=True, timeout=60, env=env)
     assert done.returncode == 0, done.stderr.decode("utf-8", "replace")[-800:]
     return done.stdout.decode("utf-8")
 
 
-def kiosk(setup: str) -> str:
-    """What the kiosk's block leaves in WLR_DRM_NO_ATOMIC, or the word UNSET."""
-    return run(
+def kiosk(setup: str, inherit: str = "") -> str:
+    """What a CHILD PROCESS (as cage is) sees of WLR_DRM_NO_ATOMIC after the
+    kiosk's block: the exact `WLR_DRM_NO_ATOMIC=<v>` line, or UNSET. A child,
+    not a shell variable, so a missing `export` fails."""
+    out = run(
         "log() { :; }\n" + setup + "\n" + block("wall-kiosk.sh")
-        + '\nif [ "${WLR_DRM_NO_ATOMIC+set}" = set ]; then'
-        ' echo "SET:$WLR_DRM_NO_ATOMIC"; else echo UNSET; fi\n').strip()
+        + "\nenv | grep '^WLR_DRM_NO_ATOMIC=' || echo UNSET\n", inherit)
+    return out.strip()
 
 
 def firstboot(setup: str):
@@ -50,29 +58,43 @@ def firstboot(setup: str):
 
 
 @needs_bash
-def test_tc1238_true_exports_the_variable_as_one():
-    assert kiosk("export WALL_DRM_LEGACY_KMS=true") == "SET:1"
-
-
-@needs_bash
 @pytest.mark.parametrize("setup", [
-    "export WALL_DRM_LEGACY_KMS=false",
+    "export WALL_DRM_LEGACY_KMS=true",
     "unset WALL_DRM_LEGACY_KMS",
     'export WALL_DRM_LEGACY_KMS=""',
     "export WALL_DRM_LEGACY_KMS=maybe",
 ])
-def test_tc1238_false_unset_or_invalid_leaves_it_unset_never_zero(setup):
-    assert kiosk(setup) == "UNSET"
+def test_tc1238_true_unset_empty_or_invalid_child_sees_exactly_one(setup):
+    # The knob's default is true: only an explicit false means atomic.
+    assert kiosk(setup) == "WLR_DRM_NO_ATOMIC=1"
 
 
 @needs_bash
-def test_tc1238_false_removes_a_value_inherited_from_the_shell():
-    assert kiosk("export WLR_DRM_NO_ATOMIC=1 WALL_DRM_LEGACY_KMS=false") == "UNSET"
+def test_tc1238_false_child_does_not_see_it_never_zero():
+    assert kiosk("export WALL_DRM_LEGACY_KMS=false") == "UNSET"
+
+
+@needs_bash
+def test_tc1238_false_removes_a_value_inherited_from_the_parent():
+    assert kiosk("export WALL_DRM_LEGACY_KMS=false", inherit="1") == "UNSET"
+
+
+def test_tc1238_block_precedes_the_cage_launch_and_is_the_only_code_using_it():
+    text = (WALL / "wall-kiosk.sh").read_text(encoding="utf-8")
+    start = text.index("# BEGIN wlr-legacy-kms")
+    end = text.index("# END wlr-legacy-kms")
+    launch = re.search(r"^\s*cage -d -- ", text, re.M)
+    assert launch and end < launch.start()
+    outside = text[:start] + text[end:]
+    code = [ln for ln in outside.splitlines()
+            if "WLR_DRM_NO_ATOMIC" in ln and not ln.lstrip().startswith("#")]
+    assert code == []
 
 
 @needs_bash
 @pytest.mark.parametrize("setup,value", [
     ("unset WALL_DRM_LEGACY_KMS", "true"),
+    ('WALL_DRM_LEGACY_KMS=""', "true"),
     ("WALL_DRM_LEGACY_KMS=true", "true"),
     ("WALL_DRM_LEGACY_KMS=false", "false"),
 ])
@@ -81,11 +103,15 @@ def test_tc1239_firstboot_accepts_true_false_and_defaults_to_true(setup, value):
 
 
 @needs_bash
-@pytest.mark.parametrize("bad", ["TRUE", "yes", "1", "0", "maybe", ""])
+@pytest.mark.parametrize("bad", ["TRUE", "yes", "1", "0", "maybe"])
 def test_tc1239_firstboot_refuses_anything_else_loudly(bad):
-    value, failed = firstboot(f'WALL_DRM_LEGACY_KMS="{bad}"')
-    # An empty value takes the default; every other non-boolean is refused.
-    assert (value, failed) == (("true", False) if bad == "" else ("true", True))
+    assert firstboot(f'WALL_DRM_LEGACY_KMS="{bad}"') == ("true", True)
+
+
+def test_tc1239_firstboot_block_precedes_kiosk_env_being_written():
+    text = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    assert text.index("# END wlr-legacy-kms") < text.index("KIOSK_ENV=/etc/wall-panel/kiosk.env")
+    assert text.index("# END wlr-legacy-kms") < text.index('echo "WALL_DRM_LEGACY_KMS=$WALL_DRM_LEGACY_KMS"')
 
 
 def test_tc1239_firstboot_carries_the_knob_into_kiosk_env_and_the_example_declares_it():

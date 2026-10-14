@@ -2826,3 +2826,11 @@ Refactor programme steps 2 and 6, on the MiniPC-Deployer side. Nothing here is d
 - Full suite: 4209 passed. Two failures remain, both pre-existing tc1084 failures that this work did not touch.
 - Not proven: nothing ran on the panel, and the image was not rebuilt or booted for these changes.
 - Two tests named in the plan were not found in `tests/` and are not in the registry: TC-1234 (provider order) and TC-1235. They are listed as open in the report, not claimed here.
+
+## 2026-10-13 — refactor programme WI-25 (final records)
+
+Records only, MiniPC-Deployer side. No code or test logic changed; nothing here is deployed.
+
+- Test-case rows added to `docs/test/test-cases.csv` for the seven LLRs that had tests but no row, so the trace can see them: TC-1220 and TC-1221 (LLR-1126), TC-1222 and TC-1223 (LLR-1127), TC-1224 and TC-1225 (LLR-1128), TC-1226 and TC-1227 (LLR-1129), TC-1228 and TC-1229 (LLR-1130), TC-1232 (LLR-1132) and TC-1233 (LLR-1133). TC-1230 and TC-1231 stay unassigned (held item); TC-1234 and TC-1235 have no rows.
+- `scripts/trace.py`: orphans back to 25 (from 32), integrity 0. `scripts/check.py --tier smoke`: PASS.
+- The Q5 power-policy change landed (merge `c7b83b7`): face unlock alone no longer keeps the panel's CPU awake, matching the settings hierarchy. LLR-1127 text is updated to match.

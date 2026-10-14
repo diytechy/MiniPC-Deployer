@@ -134,3 +134,60 @@ def test_tc1230_the_live_panels_legacy_lines_render_to_the_same_effective_policy
     assert asdict(after) == asdict(before) == asdict(Policy())
     for name, value in PANEL_PROVEN.items():
         assert getattr(after, name) == value
+
+
+# --- whole-output comparison against the previous renderer, run for real -----
+#
+# tests/fixtures/render-touch-filter.68443af.py is that renderer verbatim
+# (git show 68443af:stack/autoinstall/wall/render-touch-filter.py). Comparing
+# only the policy cannot see a clobbered device name or a udev rule that never
+# matches, which is exactly the defect a loop variable once caused here.
+
+LEGACY_POLICY = {"min_tap_ms", "startup_ms", "max_gesture_ms", "max_points"}
+
+
+@pytest.fixture(scope="module")
+def old_renderer(app):
+    spec = importlib.util.spec_from_file_location(
+        "renderer_68443af", ROOT / "tests" / "fixtures" / "render-touch-filter.68443af.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CASES = {
+    "example": {},
+    "example-legacy-lines": dict(LEGACY_LINES),
+    "custom-name": {"TOUCH_FILTER_NAME": "Other Panel 2", "TOUCH_FILTER_VENDOR": "1a2b", "TOUCH_FILTER_PRODUCT": "3C4D"},
+}
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "filter", "adaptive"])
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_tc1230_everything_but_the_policy_matches_the_previous_renderer(
+    renderer, old_renderer, mode, case
+):
+    env = {**example_env(), **CASES[case], "TOUCH_FILTER_MODE": mode}
+    if mode == "filter":
+        env["TOUCH_FILTER_ISOLATE"] = "true"
+    new, new_rules = renderer.render(dict(env))
+    old, old_rules = old_renderer.render(dict(env))
+    expected_name = env.get("TOUCH_FILTER_NAME", "ELAN Touchscreen")
+    assert new["name"] == old["name"] == expected_name
+    assert f'ATTRS{{name}}=="{expected_name}"' in new_rules
+    assert new_rules == old_rules
+    assert (new["vendor"], new["product"]) == (old["vendor"], old["product"])
+    assert {k: v for k, v in new.items() if k != "policy"} == {
+        k: v for k, v in old.items() if k != "policy"
+    }
+    # The policy differs only by keys that equal the application default.
+    assert set(old["policy"]) - set(new["policy"]) >= LEGACY_POLICY
+    for key, value in new["policy"].items():
+        assert old["policy"][key] == value
+
+
+def test_tc1230_name_in_rules_survives_a_policy_override(renderer):
+    config, rules = renderer.render({"TOUCH_MIN_TAP_MS": "55"})
+    assert config["name"] == "ELAN Touchscreen"
+    assert 'ATTRS{name}=="ELAN Touchscreen"' in rules

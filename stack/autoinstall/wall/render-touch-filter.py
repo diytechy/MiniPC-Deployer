@@ -96,19 +96,19 @@ def render(env):
     }
     defaults = {field.name: field.default for field in fields(Policy)}
     policy = {}
-    for name, key in options.items():
+    for field_name, key in options.items():
         if key not in env:
             continue
-        value = (int if name in ("band_min_contacts", "max_points") else float)(env[key])
+        value = (int if field_name in ("band_min_contacts", "max_points") else float)(env[key])
         # Mirrors touchfilter.daemon.load_config, which migrates each EXACT
         # legacy value to the current default on every load. An older
         # wall.env still carries these four, so treat them as unset: a panel
         # that predates this renders the same as a fresh one.
-        if name in LEGACY_DEFAULTS and value == LEGACY_DEFAULTS[name]:
+        if field_name in LEGACY_DEFAULTS and value == LEGACY_DEFAULTS[field_name]:
             continue
         # Only a real difference from Policy is emitted; the daemon fills the rest.
-        if value != defaults[name]:
-            policy[name] = value
+        if value != defaults[field_name]:
+            policy[field_name] = value
     Policy(**policy)
     replay = int(env.get("TOUCH_REPLAY_MAX_MS", 800))
     if not 100 <= replay <= 2000:

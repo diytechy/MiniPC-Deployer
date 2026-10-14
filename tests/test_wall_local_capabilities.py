@@ -1,6 +1,7 @@
 """SR-017/SR-020: local bootstrap, authority preservation and wake policy."""
 import importlib.util
 import json
+import os
 import stat
 import subprocess
 from pathlib import Path
@@ -186,6 +187,91 @@ def test_wake_accepts_a_newer_independently_fresh_observation():
     status["motion"] = {"state": "positive", "observedAt": now - 1200, "ttlMs": 1000}
     with pytest.raises(SETUP.Refused, match="wake-not-observed"):
         SETUP.validate_wake({"source": "camera", "observedAt": now - 200, "ttlMs": 1000}, status, now)
+
+
+def _face_status(now, *, presence_face=True, state="positive", value=1, age=10, ttl=3000):
+    return {"protocolVersion": 4,
+            "config": {"schemaVersion": 2, "cameraConsentVersion": 1, "cameraEnabled": True,
+                       "presenceFace": presence_face, "presenceMotion": False,
+                       "bluetoothEnabled": False},
+            "faceCount": {"source": "faceCount", "state": state, "observedAt": now - age,
+                          "ttlMs": ttl, "reason": None, "value": value, "generation": 1}}
+
+
+def test_tc1255_face_count_without_a_value_is_refused():
+    now = 2_000_000
+    status = _face_status(now)
+    del status["faceCount"]["value"]
+    with pytest.raises(SETUP.Refused, match="wake-not-observed"):
+        SETUP.validate_wake(_claim(now), status, now)
+
+
+@pytest.mark.parametrize("extra", [{}, {"value": True}, {"value": 0}, {"value": "x"}])
+@pytest.mark.parametrize("source,key,setting", [("camera", "motion", "presenceMotion"),
+                                                ("bluetooth", "bluetooth", "bluetoothEnabled")])
+def test_tc1255_motion_and_bluetooth_ignore_a_stray_value(source, key, setting, extra):
+    """Only faceCount is held to a value; the other candidates behave as before."""
+    now = 2_000_000
+    config = {"schemaVersion": 2, "cameraConsentVersion": 1, "cameraEnabled": True,
+              "presenceFace": False, "presenceMotion": False, "bluetoothEnabled": False, setting: True}
+    status = {"protocolVersion": 4, "config": config,
+              key: {"state": "positive", "observedAt": now - 10, "ttlMs": 3000, **extra}}
+    SETUP.validate_wake({"source": source, "observedAt": now - 10, "ttlMs": 3000}, status, now)
+
+
+def _claim(now):
+    return {"source": "camera", "observedAt": now - 10, "ttlMs": 3000}
+
+
+def test_tc1255_face_count_wakes_a_dark_screen():
+    """TC-1255: protocol v4 face evidence is the faceCount reading (LLR-912)."""
+    now = 2_000_000
+    SETUP.validate_wake(_claim(now), _face_status(now), now)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"presence_face": False},
+    {"state": "negative"},
+    {"state": "unknown"},
+    {"value": 0},
+    {"value": True},
+    {"value": None},
+    {"value": 1.0},
+    {"age": 4000},
+])
+def test_tc1255_face_count_refused_unless_fresh_positive_and_ticked(kwargs):
+    now = 2_000_000
+    status = _face_status(now, **kwargs)
+    claim = _claim(now)
+    with pytest.raises(SETUP.Refused, match="wake-not-observed"):
+        SETUP.validate_wake(claim, status, now)
+
+
+OWN_REPO = Path(os.environ.get("OWN_REPO") or Path(__file__).resolve().parents[2] / "OfficeWallNaglight")
+
+
+def test_tc1255_accepts_the_status_the_sibling_actually_projects():
+    """TC-1255: build the reading with OfficeWallNaglight's own projection."""
+    source = OWN_REPO / "sensors/status.py"
+    if not source.is_file():
+        pytest.skip("OfficeWallNaglight sibling not present")
+    spec = importlib.util.spec_from_file_location("own_sensors_status", source)
+    status_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(status_module)
+    now_monotonic, epoch = 100.0, 2_000_000.0
+    states = {"faceCount": {"source": "faceCount", "state": "positive", "observedAt": 99.99,
+                            "expiresAt": 102.0, "reason": None, "value": 1, "generation": 3}}
+    readings = status_module.project_readings(states, now_monotonic, epoch)
+    assert "cameraFace" not in readings
+    assert readings["faceCount"]["value"] == 1
+    now = int(epoch)
+    status = {**_face_status(now), **readings}
+    assert "cameraFace" not in status
+    # Forwarded exactly as the host's wake() does (sensor-observations.cjs):
+    # the reading's own observedAt and ttlMs.
+    reading = readings["faceCount"]
+    SETUP.validate_wake({"source": "camera", "observedAt": reading["observedAt"],
+                         "ttlMs": reading["ttlMs"]}, status, now)
 
 
 def test_image_contract_installs_helper_and_sensor_without_host_flag():

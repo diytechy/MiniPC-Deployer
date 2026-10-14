@@ -7,10 +7,15 @@ Does not grab devices or enable services. The application owns policy validation
 
 import json
 import os
+from dataclasses import fields
 from pathlib import Path
 import re
 import sys
 from touchfilter.core import Policy
+
+# The image's pre-protocol-2 settings, exactly as the daemon's migration names
+# them (touchfilter/daemon.py, load_config). Each means "the default" now.
+LEGACY_DEFAULTS = {"min_tap_ms": 60, "startup_ms": 1500, "max_gesture_ms": 10000, "max_points": 2048}
 
 
 def adaptive(env, policy):
@@ -71,28 +76,39 @@ def render(env):
     ]
     if any(not re.fullmatch(r"[a-fA-F0-9]{4}", value) for value in ids):
         raise ValueError("invalid-touchscreen-id")
+    # Every default comes from touchfilter.core.Policy, the single source:
+    # nothing is repeated here to drift from it.
     options = {
-        "min_tap_ms": ("TOUCH_MIN_TAP_MS", 60),
-        "band_hold_ms": ("TOUCH_BAND_HOLD_MS", 250),
-        "stable_radius": ("TOUCH_STABLE_RADIUS", 0.015),
-        "band_window_ms": ("TOUCH_BAND_WINDOW_MS", 2000),
-        "band_min_contacts": ("TOUCH_BAND_MIN_CONTACTS", 12),
-        "band_min_rate": ("TOUCH_BAND_MIN_RATE", 6),
-        "band_max_height": ("TOUCH_BAND_MAX_HEIGHT", 0.025),
-        "band_min_width": ("TOUCH_BAND_MIN_WIDTH", 0.20),
-        "band_fraction": ("TOUCH_BAND_FRACTION", 0.8),
-        "band_padding": ("TOUCH_BAND_PADDING", 0.006),
-        "band_ttl_ms": ("TOUCH_BAND_TTL_MS", 60000),
-        "startup_ms": ("TOUCH_STARTUP_MS", 1500),
-        "max_gesture_ms": ("TOUCH_MAX_GESTURE_MS", 10000),
-        "max_points": ("TOUCH_MAX_POINTS", 2048),
+        "min_tap_ms": "TOUCH_MIN_TAP_MS",
+        "band_hold_ms": "TOUCH_BAND_HOLD_MS",
+        "stable_radius": "TOUCH_STABLE_RADIUS",
+        "band_window_ms": "TOUCH_BAND_WINDOW_MS",
+        "band_min_contacts": "TOUCH_BAND_MIN_CONTACTS",
+        "band_min_rate": "TOUCH_BAND_MIN_RATE",
+        "band_max_height": "TOUCH_BAND_MAX_HEIGHT",
+        "band_min_width": "TOUCH_BAND_MIN_WIDTH",
+        "band_fraction": "TOUCH_BAND_FRACTION",
+        "band_padding": "TOUCH_BAND_PADDING",
+        "band_ttl_ms": "TOUCH_BAND_TTL_MS",
+        "startup_ms": "TOUCH_STARTUP_MS",
+        "max_gesture_ms": "TOUCH_MAX_GESTURE_MS",
+        "max_points": "TOUCH_MAX_POINTS",
     }
-    policy = {
-        name: (int if name in ("band_min_contacts", "max_points") else float)(
-            env.get(key, default)
-        )
-        for name, (key, default) in options.items()
-    }
+    defaults = {field.name: field.default for field in fields(Policy)}
+    policy = {}
+    for field_name, key in options.items():
+        if key not in env:
+            continue
+        value = (int if field_name in ("band_min_contacts", "max_points") else float)(env[key])
+        # Mirrors touchfilter.daemon.load_config, which migrates each EXACT
+        # legacy value to the current default on every load. An older
+        # wall.env still carries these four, so treat them as unset: a panel
+        # that predates this renders the same as a fresh one.
+        if field_name in LEGACY_DEFAULTS and value == LEGACY_DEFAULTS[field_name]:
+            continue
+        # Only a real difference from Policy is emitted; the daemon fills the rest.
+        if value != defaults[field_name]:
+            policy[field_name] = value
     Policy(**policy)
     replay = int(env.get("TOUCH_REPLAY_MAX_MS", 800))
     if not 100 <= replay <= 2000:

@@ -10,7 +10,7 @@ does not grant the panel user access to all input devices.
 On subsequent boots systemd orders filter readiness before `getty@tty1.service`.
 The sleep hook stops it before suspend and restarts it after resume. Watchdog,
 disconnect and stream-desynchronization failures destroy virtual input and
-release the physical grab. The 1,500 ms startup suppression relearns the band.
+release the physical grab. There is no startup blackout: `Policy.startup_ms` is 0.
 
 Validation order: replay saved negatives and labeled human touches; run passive
 `shadow`; then bench `filter` with `TOUCH_FILTER_ISOLATE=false`; only after

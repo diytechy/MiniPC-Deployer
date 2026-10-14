@@ -284,7 +284,17 @@ def test_renderer_applies_isolation_and_rejects_injection():
     sys.path.insert(0, os.environ["TOUCH_APP_REPO"])
     renderer = load("stack/autoinstall/wall/render-touch-filter.py", "renderer")
     default, rules = renderer.render({})
-    assert default["mode"] == "off" and default["policy"]["startup_ms"] == 1500
+    # The default is whatever the daemon loads from Policy, not a number the
+    # image repeats (LLR-1131); the full load-through proof is in
+    # tests/test_touch_defaults_contract.py.
+    from dataclasses import asdict
+    from touchfilter.core import Policy
+    from touchfilter.daemon import load_config
+
+    path = Path(tempfile.mkdtemp()) / "touch-filter.json"
+    path.write_text(json.dumps(default), encoding="utf-8")
+    assert default["mode"] == "off"
+    assert asdict(load_config(path)["policy"]) == asdict(Policy())
     active, rules = renderer.render(
         {"TOUCH_FILTER_MODE": "filter", "TOUCH_FILTER_ISOLATE": "true"}
     )

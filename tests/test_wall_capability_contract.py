@@ -2,7 +2,7 @@
 
 The fixture under tests/fixtures/wall-camera-opt is the OTHER side of the
 contract - OfficeWallNaglight's own manifest and site inventory at
-CameraOpt 77ed164 (see its SOURCE.txt). Nothing in this file invents the values it checks
+CameraOpt c149439 (see its SOURCE.txt). Nothing in this file invents the values it checks
 against: the script's REQUIRED / ALLOWED_SITE_FILES are compared with what the
 panel says it ships, and each mutation below must be REJECTED by the script.
 """
@@ -20,7 +20,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/wall-camera-opt"
-REVISION = "77ed1641cc0dbeba426d6b4ffe959dbcacc5b1fe"
+REVISION = "c1494392c64168bc3c347fa2ffbb703f54d049db"
 
 spec = importlib.util.spec_from_file_location(
     "wall_capability_contract", ROOT / "scripts/assert_wall_capabilities.py"
@@ -127,7 +127,7 @@ def test_cli_accepts_the_three_camera_opt_payloads_together(tmp_path):
 def test_every_public_site_file_the_panel_ships_is_in_the_inventory():
     # The 27-file regression: the inventory is the exposure list, so it must
     # name every file the panel's own build puts in the document root.
-    assert len(PANEL_SITE_FILES) == len(set(PANEL_SITE_FILES)) == 85
+    assert len(PANEL_SITE_FILES) == len(set(PANEL_SITE_FILES)) == 87
     assert sorted(set(PANEL_SITE_FILES) - contract.ALLOWED_SITE_FILES) == []
 
 

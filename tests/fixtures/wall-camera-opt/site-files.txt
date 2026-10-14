@@ -11,10 +11,10 @@ js/access-messages.js
 js/access.js
 js/ambient-priority.js
 js/attention-exclusions.js
-js/attention-lease.js
 js/audio-switch.js
 js/checklist-watermark.js
 js/config.js
+js/contact-verdict.js
 js/event-id.js
 js/feed-contact.js
 js/gauge-brand.js
@@ -33,6 +33,7 @@ js/music/md5.js
 js/music/provider.js
 js/music/subsonic.js
 js/nag-summary.js
+js/paint-batch.js
 js/paint-heartbeat.js
 js/panel-state.js
 js/pcm-source.js
@@ -43,6 +44,7 @@ js/presentation.js
 js/projectm-lifecycle.js
 js/projectm-rotation.js
 js/projectm-worker.js
+js/published-state.js
 js/state-machine.js
 js/tab-preference.js
 js/text-keyboard.js

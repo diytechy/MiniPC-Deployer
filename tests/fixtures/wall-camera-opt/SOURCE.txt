@@ -1,19 +1,22 @@
 Fixture for tests/test_wall_capability_contract.py (LLR-1069..1072).
 
 Taken READ-ONLY from OfficeWallNaglight branch CameraOpt, commit
-77ed1641cc0dbeba426d6b4ffe959dbcacc5b1fe (2026-10-13; includes WI-22's four
-js/gauge-*.js modules and WI-23's css/audio-chrome.css), re-baselined from
-feat-stacked-life-row 49cddf0:
+c1494392c64168bc3c347fa2ffbb703f54d049db (2026-10-14; the WI-05L merge, on top
+of the WI-05Q v2 merge 9363338: js/published-state.js, js/contact-verdict.js and
+js/paint-batch.js added, js/attention-lease.js removed, capability
+attention-lease-v1 added), re-baselined from 77ed164:
 
-  capabilities.json  git show 77ed164:capabilities.json, byte for byte
+  capabilities.json  git show c149439:capabilities.json, byte for byte
   site-files.txt     every regular file of the site payload that
                      tools/build-artifact.mjs stages from SITE_SOURCES
                      (index.html css js vendor config.example.json
                      capabilities.json), taken as `git ls-tree -r` of that
                      commit, plus the VERSION and build-info.json stamps it
-                     writes; 85 lines, sorted.
+                     writes; 87 lines, sorted.
 
 This is the OTHER side of the contract: it is the panel's own statement of
 what it ships, so the test that feeds it to scripts/assert_wall_capabilities.py
 can fail. Re-baseline it only when the panel line moves on and you want the
-suite to track the new head; a panel change does NOT require touching it.
+suite to track the new head; a panel change does NOT require touching it,
+except when it REMOVES a site file (as c149439 does), because the exact
+inventory must then drop it and this fixture would still name it.

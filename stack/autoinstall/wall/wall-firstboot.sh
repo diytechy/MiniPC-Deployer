@@ -13,6 +13,8 @@
 #      the panel just looks dead on the wall.
 #   3. Quirk 2 — mask iio-sensor-proxy and pin the orientation. A convertible
 #      will rotate its own display (and its touch coordinates with it).
+#  3b. Quirk 7 — mask systemd-backlight@. Its boot-time restore of the level saved
+#      at shutdown races wall-wake, and wall-sleep.sh owns the backlight.
 #   4. Quirk 3 — disable the internal keyboard/touchpad, which face the mount.
 #      Needs THIS machine's device names; skipped loudly if not configured.
 #   5. Quirk 5 — Wi-Fi powersave OFF, MAC randomization OFF, netplan rendered.
@@ -268,6 +270,22 @@ if systemctl list-unit-files | grep -q '^iio-sensor-proxy'; then
 else
     log "quirk 2: iio-sensor-proxy not installed — nothing to mask (orientation is native landscape)"
 fi
+
+# ── 3b. quirk 7 — Ubuntu's backlight save/restore is masked ──────────────────
+# wall-sleep.sh owns the backlight (LLR-003, LLR-923). systemd-backlight@ saves
+# the level at shutdown and restores it at boot, so a panel powered off inside
+# the sleep window saves 0. Measured 2026-10-14: at boot wall-wake set 187 and in
+# the same second systemd-backlight "restored" 0, raised to its floor of 9, and
+# won - the panel came up dim. Ordering wall-wake after it would need the
+# instance name, which depends on the hardware; the TEMPLATE is masked instead,
+# so every instance is, whatever this machine calls its backlight.
+# BEGIN backlight-restore-mask
+if systemctl mask systemd-backlight@.service >/dev/null 2>&1; then
+    log "quirk 7: systemd-backlight@ masked (wall-sleep.sh owns the backlight)"
+else
+    warn "quirk 7: could not mask systemd-backlight@.service - a power-off inside the sleep window will bring the panel up dim"
+fi
+# END backlight-restore-mask
 
 # ── 4. quirk 3 — internal keyboard + touchpad disabled ───────────────────────
 # Folded flat, the keys press against the mount: one held key is an input storm,

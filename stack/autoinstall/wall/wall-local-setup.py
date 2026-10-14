@@ -341,13 +341,13 @@ def validate_wake(params: dict, status: dict, now_ms: int | None = None, *,
     now = int(time.time() * 1000) if now_ms is None else now_ms
     if observed > now or now - observed >= ttl:
         raise Refused("wake-observation-stale")
-    matches = [status.get(name) for name, setting in candidates if config.get(setting) is True]
-    for reading in matches:
+    matches = [(name, status.get(name)) for name, setting in candidates if config.get(setting) is True]
+    for name, reading in matches:
         if not isinstance(reading, dict) or reading.get("state") != "positive":
             continue
-        # Protocol v4 carries face evidence as a count; a positive reading
-        # whose count is present must be above zero (motion has no value).
-        if "value" in reading and (type(reading["value"]) is not int or reading["value"] <= 0):
+        # Protocol v4 carries face evidence as a count: the faceCount reading
+        # must state one above zero. No other candidate is held to a value.
+        if name == "faceCount" and (type(reading.get("value")) is not int or reading["value"] <= 0):
             continue
         actual_at, actual_ttl = reading.get("observedAt"), reading.get("ttlMs")
         if (type(actual_at) in (int, float) and type(actual_ttl) in (int, float)

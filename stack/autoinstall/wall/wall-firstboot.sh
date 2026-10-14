@@ -976,6 +976,19 @@ case "${WALL_HOST:-}" in
         warn "will render nothing. Set it in $ENV_FILE and re-run this script." ;;
 esac
 
+# THE KIOSK SCRIPT ITSELF, from the payload, every boot. `user-data` copies it
+# for the first boot, but until 2026-10-14 nothing else did: the paired release
+# lane carries what this script installs, so a changed wall-kiosk.sh reached the
+# payload folder and never the copy the kiosk runs. A58's legacy-KMS export was
+# the casualty - deployed, verified in tests, and absent from the running cage.
+# `install` writes a new inode and renames it into place, so a kiosk loop that is
+# running the old copy keeps reading the old inode undisturbed.
+if [ -f "$PAYLOAD/wall-kiosk.sh" ]; then
+    install -m 0755 "$PAYLOAD/wall-kiosk.sh" /usr/local/bin/wall-kiosk.sh
+else
+    fail_step "kiosk: wall-kiosk.sh is missing from the image payload"
+fi
+
 install -d -m 0755 /etc/profile.d
 cat > /etc/profile.d/zz-wall-kiosk.sh <<'EOF'
 # WALL PANEL — start the kiosk session on tty1 only, and only once. An SSH login

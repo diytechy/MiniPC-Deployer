@@ -110,6 +110,7 @@ ALLOWED_SITE_FILES = {
     "js/projectm-lifecycle.js",
     "js/projectm-rotation.js",
     "js/projectm-worker.js",
+    "js/published-state.js",
     "js/state-machine.js",
     "js/tab-preference.js",
     "js/text-keyboard.js",

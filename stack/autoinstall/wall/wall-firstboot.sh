@@ -981,8 +981,12 @@ esac
 # lane carries what this script installs, so a changed wall-kiosk.sh reached the
 # payload folder and never the copy the kiosk runs. A58's legacy-KMS export was
 # the casualty - deployed, verified in tests, and absent from the running cage.
-# `install` writes a new inode and renames it into place, so a kiosk loop that is
-# running the old copy keeps reading the old inode undisturbed.
+# GNU `install` unlinks the old file and writes a new one (0600 while copying,
+# then 0755), so a kiosk loop already running the old copy keeps its old inode
+# undisturbed. A tty1 login racing this exact moment could find the script
+# absent or not yet executable; the getty restart further down retries it once
+# the install is done. `install` and not a temp-file rename, because the release
+# lane's manifest generator reads this line to know the destination.
 if [ -f "$PAYLOAD/wall-kiosk.sh" ]; then
     install -m 0755 "$PAYLOAD/wall-kiosk.sh" /usr/local/bin/wall-kiosk.sh
 else

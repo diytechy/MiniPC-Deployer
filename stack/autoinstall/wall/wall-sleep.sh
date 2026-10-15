@@ -364,13 +364,22 @@ backlight_set() {   # backlight_set off|on
             log "WARNING: Door stream broker could not be stopped — refusing to turn the display off."
             return 1
         fi
-        # Remember the level so `on` restores what the user actually had.
-        cur="$(cat "$d/brightness" 2>/dev/null || echo "$max")"
-        printf '%s' "$cur" > "$BACKLIGHT_PREV" 2>/dev/null || true
+        # Remember the level so `on` restores what the user actually had —
+        # but NOT when the panel is already dark. A second `off` reads the 0
+        # the first one wrote, and remembering it makes every later `on` write
+        # 0, read 0 back and report success to a dark panel. That ran all of
+        # the night of 2026-10-14: the 06:45 wake and every tap "lit" it at 0.
+        cur="$(cat "$d/brightness" 2>/dev/null | tr -d '[:space:]')"
+        [ -n "$cur" ] || cur="$max"
+        if [ "$cur" != "0" ]; then
+            printf '%s' "$cur" > "$BACKLIGHT_PREV" 2>/dev/null || true
+        fi
         want=0
     else
-        cur="$(cat "$BACKLIGHT_PREV" 2>/dev/null || echo "$max")"
-        [ -n "$cur" ] || cur="$max"
+        cur="$(cat "$BACKLIGHT_PREV" 2>/dev/null | tr -d '[:space:]')"
+        # 0 is off, never a level to restore. A remembered 0 (written before
+        # the guard above existed) falls back to max like a missing file.
+        case "$cur" in ''|0) cur="$max" ;; esac
         want="$cur"
     fi
     if ! echo "$want" > "$d/brightness" 2>/dev/null; then

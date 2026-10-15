@@ -1168,6 +1168,34 @@ grep -q 'panel concluded FULLSCREEN absence' "$ROOT/out.log" \
 run panel-display-off
 eq "0" "$?" "A25 an already-dark panel display-off remains success"
 
+# A26: a repeated "off" must not overwrite the remembered level with the 0 the
+# first "off" wrote. On 2026-10-14 the panel's absence display-off ran twice on
+# a dark screen, the second run saved 0, and every wake after it — the 06:45
+# schedule, the presence wake and nine taps — "restored" 0, read 0 back, matched
+# the 0 it asked for and reported success to a dark panel all night. The start
+# level is 60, not max (100), so a restore of the remembered level and the
+# fall-back-to-max below are told apart.
+scenario a26-repeat-off-keeps-level
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=false"
+printf '60' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+run panel-display-off
+run panel-display-off
+run start
+eq "0" "$(brightness)" "A26 off, off and the scheduled start leave the panel dark"
+run touch-wake
+eq "0" "$?" "A26 the wake after a repeated off exits 0"
+eq "60" "$(brightness)" "A26 ...and restores the level the user had, not the 0 a second off saw"
+
+# A26b: a remembered 0 already on disk (written by an earlier script) must never
+# be "restored" — 0 is off, and an "on" that writes it lights nothing.
+scenario a26-remembered-zero
+write_env "SLEEP_MODE=backlight"
+printf '0' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+printf '0' > "$ROOT/run/wall-backlight.prev"
+run touch-wake
+eq "0" "$?" "A26 a wake over a remembered 0 exits 0"
+eq "100" "$(brightness)" "A26 ...and lights the panel at max instead of restoring 0"
+
 printf '\n%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

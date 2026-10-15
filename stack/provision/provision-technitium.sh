@@ -9,9 +9,10 @@
 #      first container start via DNS_SERVER_ADMIN_PASSWORD; we log in with it).
 #   2. Create a non-expiring API token for headless health/config, saved to
 #      provision/.token (gitignored) so later `curl` health checks need no login.
-#   3. Create the local (authoritative) zone for $DOMAIN and add split-horizon
-#      A records for each subdomain → $LAN_IP (DESIGN.md §10.1: home devices
-#      resolve to the LAN IP and connect directly; away, public DNS answers).
+#   3. Create a conditional forwarder zone for $DOMAIN and add split-horizon
+#      A records for each hub subdomain → $LAN_IP. Those answer locally; the
+#      apex and every other name resolve publicly (the external website). The
+#      hub names have NO public record since 2026-10-15 - LAN/tunnel only.
 #   4. Set upstream forwarders (Quad9 DoH by default) for recursion fallback.
 #   5. Enable/refresh ad-blocking blocklists (same public lists as Pi-hole).
 #
@@ -159,19 +160,40 @@ get_token() {
 }
 
 # ── 2. zone + split-horizon records ──────────────────────────────────────────
+#
+# A CONDITIONAL FORWARDER ZONE, NOT A PRIMARY ONE (changed 2026-10-15). The
+# apex and every name this script does not add belong to the EXTERNAL website,
+# and the hub must hand those out exactly as public DNS does. A Primary zone is
+# authoritative for the whole domain: it answered the apex with this box and
+# `www` with NXDOMAIN, so nothing on the LAN or the tailnet could reach the
+# real site. A Forwarder zone (forwarder=this-server, i.e. normal recursion
+# through the global forwarders) answers the records added below locally and
+# resolves everything else publicly - measured on Technitium 15.2 against a
+# scratch zone before the live zone was converted.
+#
+# CONVERSION IS DESTRUCTIVE, so it is guarded: an existing Primary zone is
+# exported to provision/ first, then deleted and recreated. The records are
+# re-added by main() below, so nothing has to be carried across.
+zone_type() {
+    curl -fsS "${API}/api/zones/list?token=$1" 2>/dev/null \
+        | grep -o "\"name\":\"${DOMAIN}\",\"type\":\"[A-Za-z]*\"" | sed 's/.*"type":"\([A-Za-z]*\)"/\1/' | head -n1
+}
 ensure_zone() {
-    local tok="$1"
-    # Create as a Primary (authoritative) zone. If it already exists Technitium
-    # returns an error; treat "already exists" as success (idempotent).
-    local resp
-    resp="$(curl -fsS "${API}/api/zones/create?token=${tok}&zone=$(url "$DOMAIN")&type=Primary")" || true
-    if printf '%s' "$resp" | grep -q '"status":"ok"'; then
-        echo "  zone $DOMAIN created"
-    elif printf '%s' "$resp" | grep -qi 'already exists'; then
-        echo "  zone $DOMAIN already exists (ok)"
-    else
-        echo "zone create failed: $resp" >&2; exit 1
+    local tok="$1" have
+    have="$(zone_type "$tok")"
+    if [ "$have" = Forwarder ]; then
+        echo "  zone $DOMAIN already a forwarder zone (ok)"; return 0
     fi
+    if [ -n "$have" ]; then
+        local bak; bak="${SCRIPT_DIR}/zone-${DOMAIN}-${have}-$(date +%Y%m%d%H%M%S).bak"
+        curl -fsS "${API}/api/zones/export?token=${tok}&zone=$(url "$DOMAIN")" > "$bak" \
+            || { echo "zone export failed - refusing to convert $DOMAIN" >&2; exit 1; }
+        chmod 600 "$bak"
+        api "/api/zones/delete?token=${tok}&zone=$(url "$DOMAIN")" >/dev/null
+        echo "  zone $DOMAIN was ${have}; exported to $bak and removed for conversion"
+    fi
+    api "/api/zones/create?token=${tok}&zone=$(url "$DOMAIN")&type=Forwarder&protocol=Udp&forwarder=this-server" >/dev/null
+    echo "  zone $DOMAIN created as a forwarder zone"
 }
 
 # add_a NAME → ensure an A record NAME.$DOMAIN → $LAN_IP exists exactly once.
@@ -221,8 +243,9 @@ main() {
     # Implements: SR-062, LLR-1042.
     add_a "$TOKEN" "${SURE_SUBDOMAIN:-sure}.${DOMAIN}" "$LAN_IP"
     add_a "$TOKEN" "dns.${DOMAIN}"                   "$LAN_IP"
-    # Apex → LAN IP too, so the bare domain works on-LAN.
-    add_a "$TOKEN" "${DOMAIN}"                       "$LAN_IP"
+    # NO APEX RECORD (removed 2026-10-15): the bare domain is the external
+    # website, and the forwarder zone resolves it publicly. An apex record here
+    # would send every LAN and tailnet visitor to this box instead.
     # Optional: BlueMap / map on the MAIN box (only if MAIN_BOX_IP is set).
     if [ -n "${MAIN_BOX_IP:-}" ]; then
         add_a "$TOKEN" "map.${DOMAIN}" "$LAN_IP"   # served by Caddy on THIS box, proxied to main

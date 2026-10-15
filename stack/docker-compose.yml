@@ -9,8 +9,8 @@
 #                 (ADMIN_PORTAL_PLAN, P1-P4; replaced per-site basic_auth)
 #   tracker     — the NagLight web container (image naglight:local, WI-10.1/10.4)
 #   actual      — Actual Budget (finances)
-#   ddns        — Cloudflare dynamic-DNS updater (apex + wildcard A records
-#                 follow the home IP; AWOW owns DDNS per WI-9 Q4)
+#   (ddns was retired 2026-10-15: the hub publishes no public record; the
+#    apex is served externally. See the note where the service used to be.)
 #
 # Every knob is in .env (copy .env.example -> .env). No secret or site-specific
 # value is baked into this file; it is safe to commit.
@@ -115,8 +115,8 @@ services:
       ACTUAL_HOST: ${ACTUAL_SUBDOMAIN}.${DOMAIN}
       SURE_HOST: ${SURE_SUBDOMAIN:-sure}.${DOMAIN}
       # The LLM gateway site (SR-043). Joined here from a bare subdomain label,
-      # exactly as TRACKER_HOST and ACTUAL_HOST above are, so the wildcard DDNS
-      # record already resolves it and no new public name is created.
+      # exactly as TRACKER_HOST and ACTUAL_HOST above are. LAN/tunnel only: it
+      # resolves through Technitium's split-horizon record, never publicly.
       LLM_GATEWAY_HOST: ${LLM_GATEWAY_SUBDOMAIN}.${DOMAIN}
       # Office-wall kiosk site (SR-016). WALL_HOST is a T1 private name in the
       # real .env; PANEL_IP is the panel's DHCP-reserved address (/32 allow-list)
@@ -145,9 +145,8 @@ services:
       ACME_EMAIL: ${ACME_EMAIL}
       # THE dns-01 CREDENTIAL. The Caddyfile's global `acme_dns cloudflare`
       # reads it; without it every issuance falls back to http-01 and needs a
-      # router forward. Same token the ddns service uses (Zone:DNS:Edit), so
-      # this adds no secret — but it does put it in a second container's
-      # environment, which is worth knowing rather than discovering.
+      # router forward. Zone:DNS:Edit; since the ddns updater was retired
+      # (2026-10-15) Caddy is its only consumer on this box.
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
       MAIN_BOX_IP: ${MAIN_BOX_IP}
       # ── Gun Master 3 relay (GAME_RELAY_ENABLED) ──────────────────────────
@@ -841,53 +840,16 @@ services:
       # needs one. noexec/nosuid/nodev so it cannot become a foothold.
       - /tmp:rw,noexec,nosuid,nodev
 
-  # ── ddns — keep the public A records pointed at the home connection ──────────
-  # Gap the Owner caught 2026-07-04: DDNS previously ran on Mini-serv as the legacy
-  # DDNS-Cloudflare-PowerShell scripts; per WI-9 Q4 the AWOW owns it now, and the
-  # stack had no updater at all. Without this, a home-IP change strands the whole
-  # external path (Caddy/ACME included).
-  # Updates the apex AND the wildcard record so every subdomain follows along.
-  # Healthcheck: inherited from the image (distroless; it ships its own
-  # HEALTHCHECK binary — do not add a CMD-SHELL probe, there is no shell).
-  # Web UI is deliberately NOT published; logs via `docker logs ddns` / Dozzle.
-  ddns:
-    image: qmcgaw/ddns-updater:${DDNS_IMAGE_TAG}
-    container_name: ddns
-    environment:
-      PERIOD: ${DDNS_PERIOD}
-      UPDATE_COOLDOWN_PERIOD: 5m
-      PUBLICIP_FETCHERS: all
-      LISTENING_ADDRESS: ":8000"
-      CONFIG: >-
-        {"settings":[
-        {"provider":"cloudflare","zone_identifier":"${CLOUDFLARE_ZONE_ID}","domain":"${DOMAIN}","ttl":300,"token":"${CLOUDFLARE_API_TOKEN}","ip_version":"ipv4"},
-        {"provider":"cloudflare","zone_identifier":"${CLOUDFLARE_ZONE_ID}","domain":"*.${DOMAIN}","ttl":300,"token":"${CLOUDFLARE_API_TOKEN}","ip_version":"ipv4"}
-        ]}
-    # RESOLVE THROUGH A PUBLIC RESOLVER, NOT THIS BOX'S. Added 2026-08-08 after
-    # the container sat `unhealthy` with a FailingStreak of 37 while doing its
-    # job perfectly.
-    #
-    # ddns-updater's healthcheck resolves ${DOMAIN} and compares the answer with
-    # the public IP it just pushed. By default that lookup goes through the
-    # host's resolver — which is Technitium, which is SPLIT-HORIZON and answers
-    # with the LAN address by design. So the check compared the LAN IP against
-    # the WAN IP, found them different, and reported unhealthy forever:
-    #     lookup IP addresses do not match: <lan ip> instead of <wan ip>
-    # The updates themselves were landing at Cloudflare every ten minutes
-    # throughout. The split-horizon design and the healthcheck's assumption are
-    # each correct and cannot both be satisfied from the same resolver.
-    #
-    # Pointing it outward makes the check MEAN something instead of merely
-    # passing: it becomes "the public record matches this connection's public
-    # IP", which is TC-H-I02 in docs/LAB_TEST_PLAN.md, asserted continuously by
-    # the container itself. A stale public record is exactly the failure a DDNS
-    # updater exists to prevent and the only one it could not previously see.
-    dns:
-      - 1.1.1.1
-      - 1.0.0.1
-    volumes:
-      - ddns_data:/updater/data
-    restart: unless-stopped
+  # ── ddns — RETIRED 2026-10-15 (the Owner) ─────────────────────────────────────
+  # The hub is LAN/tunnel-only now: the ISP port forward is gone and the apex
+  # is served by an EXTERNAL host, so this box must NOT publish any public
+  # record. The updater it replaced kept the apex AND a `*.<domain>` wildcard
+  # pointed at the home IP; left running, it overwrote the external host's apex
+  # and re-created the wildcard within one period of its deletion (measured
+  # 2026-10-15). A wildcard to a home IP that later changes hands is a dangling
+  # record: whoever inherits the address can obtain a valid http-01 cert for
+  # every hub name. Do not reinstate a DDNS updater without revisiting that.
+  # Certificates are unaffected - Caddy's dns-01 needs no public A record.
 
   # ── Management UIs: the admin portal (WI-10.11; ADMIN_PORTAL_PLAN P1-P4) ─────
   # THE RULE (P1, 2026-09-25): a browser-only management UI publishes on
@@ -1951,7 +1913,6 @@ volumes:
   # llm-gateway (SR-043): SQLite + encrypted provider keys. LOCAL backup only,
   # never offsite - it holds credentials and is not reproducible from the repo.
   llm_gateway_data:
-  ddns_data:
   technitium_config:
   caddy_data:
   caddy_config:

@@ -30,6 +30,8 @@ docs/test/stub-report.md
 # *.example templates are tracked.
 stack/.env
 stack/provision/.token
+# Zone exports provision-technitium.sh writes before converting a zone.
+stack/provision/zone-*.bak
 # The LLM gateway env: every provider credential the household holds PLUS the
 # key that decrypts them at rest. The densest secret file in this stack, and it
 # sits in a subdirectory rather than under the stack/.env rule above - only the

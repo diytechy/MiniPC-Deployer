@@ -1380,8 +1380,15 @@ def test_the_boot_minute_is_answered_by_a_bigger_ring_on_one_half_sr028():
     """
     assert "--tlatency 50000" in read(WALL / "wall-speaker-out.service")
     assert "--tlatency 30000" in read(WALL / "wall-bus-speaker.service")
-    for name in ("wall-spdif-in.service", "wall-bus-headset.service"):
-        assert "--tlatency 30000" in read(WALL / name),             "%s is not on the speaker path and was not part of this" % name
+    assert "--tlatency 30000" in read(WALL / "wall-bus-headset.service"), \
+        "wall-bus-headset.service is not on the speaker path and was not part of this"
+
+
+def test_the_desktop_spdif_leg_has_three_periods_of_slack():
+    """2026-10-15: at 30 ms (under 1.5 of its 21 ms periods) this leg underran
+    in floods under panel load and died 12 times in a morning, each death
+    followed by up to two minutes of backoff silence. 66 ms ran clean."""
+    assert "--tlatency 66000" in read(WALL / "wall-spdif-in.service")
 
 
 def test_the_trim_takes_the_same_lock_every_other_writer_takes_sr028():

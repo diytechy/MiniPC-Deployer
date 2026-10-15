@@ -53,7 +53,14 @@ ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
     --cdevice spdif_in \
     --pdevice bus \
     --format S16_LE --rate 48000 --channels 2 \
-    --tlatency 30000 --sync 5
+    --tlatency 66000 --sync 5
+# 66 ms, not 30 (measured 2026-10-15). spdif_in and bus_mix both move 1024-frame
+# periods (21.3 ms), so a 30 ms target left under one and a half periods of
+# slack: under panel load the bus side underran in floods, alsaloop's recovery
+# died with `Poll FD initialization failed`, and the backoff below turned each
+# death into up to two minutes of silence -- 12 deaths in one morning while the
+# S/PDIF carrier itself never stalled. At 66 ms (about three periods) the same
+# load produced no underruns at all.
 Restart=always
 # ── THE BACKOFF IS THE FIX, NOT THE OPEN ──────────────────────────────────────
 # MEASURED 2026-09-15: this leg ran healthily for hours (12m31s of CPU) and then

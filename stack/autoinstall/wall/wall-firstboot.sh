@@ -2222,6 +2222,15 @@ if ! id -u wall-door-stream >/dev/null 2>&1; then
     useradd --system --gid wall-door-stream --home-dir /nonexistent \
         --shell /usr/sbin/nologin wall-door-stream
 fi
+# Refresh the broker's unit from the payload. user-data placed it once, at
+# install, and nothing else did -- so a release could change the credential
+# list while the panel kept the old unit, and the broker then died with
+# 243/CREDENTIALS on every start (2026-10-16). A component firstboot installs
+# is one the release lane carries; this line is what makes the unit one.
+if [ -f "$PAYLOAD/wall-door-stream.service" ]; then
+    install -m 0644 "$PAYLOAD/wall-door-stream.service" /etc/systemd/system/wall-door-stream.service
+    systemctl daemon-reload
+fi
 if [ -f /etc/systemd/system/wall-door-stream.service ] && \
    [ -r /opt/wall-panel/app/runtime/resources/app/doorstream/service.py ] && \
    [ -r /opt/wall-panel/app/runtime/resources/app/doorstream/motion.py ]; then

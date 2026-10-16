@@ -369,9 +369,10 @@ and after the item 14 fix the Settings block says "not configured" rather than
 `wall-firstboot.sh` writes every `motion-*` credential into
 `/run/wall-door-credentials/` on every boot from `DOORBELL_MOTION_*` in
 `wall.env`, validates each one before writing (bools exactly `true`/`false`;
-sample fps 1–10; min area ratio >0 and ≤1; persistence and dwell 0.1–30 s;
-stationary ratio 0–1; zones as four normalized numbers that stay inside the
-frame; at most 32 masks and 4096 bytes), and falls back to the documented
+sample fps 1–10; min area ratio 0.0001–0.1; persistence 0.2–5 s; dwell
+1–30 s; stationary ratio 0.001–0.05; approach and road zones as polygons of 3 to
+16 normalized points (the road polygon may be empty) enclosing an area of at least 0.0001; at most 8 ignore
+polygons and 4096 bytes), and falls back to the documented
 defaults if any value is malformed so a latent bad value cannot spring to life
 on a later one-line enable.
 
@@ -385,21 +386,31 @@ There are two switches, and **both** must be `true` or firstboot writes
 
 ### What each value means
 
-From `OfficeWallNaglight/doorstream/motion.py`. The policy runs on a
-320×180-capped occupancy plane, so every zone is normalized `x,y,w,h` in 0..1
-of the **corrected** (de-warped) frame, not the fisheye source.
+From `OfficeWallNaglight/doorstream/motion.py`. The detector runs on the raw
+fisheye scaled to 256×256 grey, decoded beside (not from) the Door view. Every
+zone is a polygon written
+`x,y;x,y;...` (3 to 16 points, each coordinate 0..1) on the **raw fisheye
+picture**, the whole camera frame, not the de-warped Door view. Ignore polygons
+are joined with `|`.
 
 | Value | Meaning | Firing rule |
 |---|---|---|
-| `TRIGGER_ZONE` | the approach to the door | a track that **crosses into** it, having existed for the persistence time, fires |
-| `ROAD_ZONE` | the street / driveway | a track that **moved and then stopped** inside it for the dwell time fires |
-| `MASKS` | up to 32 rectangles that are ignored entirely | a component whose centre is inside any mask is dropped before tracking |
+| `APPROACH_POLYGON` | the walkway and porch | a region that really moves there and persists for `PERSISTENCE_SECONDS` fires once per presence episode |
+| `ROAD_POLYGON` | the road band | a region that travelled and then stayed within `STATIONARY_RATIO` for `DWELL_SECONDS`, with vertical structure, fires once |
+| `IGNORE_POLYGONS` | up to 8 nuisance areas, joined with `\|` | a component inside any of them is dropped before tracking |
 | `MIN_AREA_RATIO` | smallest blob, as a fraction of the plane | below it, not a candidate |
-| `PERSISTENCE_SECONDS` | how long a track must survive | converted to consecutive *sampled* frames; a missed sample resets it |
-| `DWELL_SECONDS` | how long stationary counts as loitering | road-zone rule only |
+| `PERSISTENCE_SECONDS` | the approach confirmation time | converted to consecutive *sampled* frames; a missed sample resets it |
+| `DWELL_SECONDS` | how long stationary counts as loitering | road-polygon rule only |
 | `STATIONARY_RATIO` | per-sample centre movement below which a track counts as still | also what sets `moved` |
 | `SAMPLE_FPS` | 1–10; the sampling rate the two times above are measured in | |
 | `DIAGNOSTICS` | emits a once-a-second `diagnostic` message on the door socket | |
+
+The public defaults contain no real-property geometry: the approach polygon is
+the whole image and `ROAD_POLYGON` is empty, which turns road-stop observation
+off (only `ROAD_POLYGON` may be empty). The calibrated polygons are private
+configuration supplied by the Owner's deploy config and must be narrowed on the
+real camera before `DOORBELL_MOTION_CALIBRATED=true`; a moved or re-aimed camera
+invalidates them.
 
 A whole-frame change (`global_change`) discards the sample and resets the
 policy, which is what keeps a light switch or an IR cut-over from firing it.
@@ -411,22 +422,25 @@ This is physical work; a session can do none of it.
 1. Set `DOORBELL_MOTION_DIAGNOSTICS=true`, leave `DOORBELL_MOTION_ENABLED=false`,
    re-run `wall-firstboot.sh`. Diagnostics are cheap and, with motion disabled,
    nothing can take the screen while you work.
-2. Capture a corrected frame from the Door tab and mark on it, in normalized
-   coordinates: the doormat/approach rectangle (`TRIGGER_ZONE`), the street
-   (`ROAD_ZONE`), and everything that moves and is not a person — the road
-   itself if it is outside the road zone, a flag, a tree, a reflective window
-   (`MASKS`).
+2. Check the zone overlay against the current camera position. Run HomeHub
+   `scripts/door/analyze_recordings.py` on fresh footage and open its
+   `*-zones.jpg`: the approach polygon (`APPROACH_POLYGON`) must sit on the
+   walkway and porch, the road polygon (`ROAD_POLYGON`) on the road band, and
+   everything that moves and is not a person — a flag, a tree, a reflective
+   window — should be covered by an ignore polygon (`IGNORE_POLYGONS`). All
+   coordinates are on the raw fisheye picture. If the camera has moved, redraw
+   the polygons before going further.
 3. **Baseline, empty scene, 10 minutes.** Watch `foregroundPermille` and
    `components` in the diagnostic stream. An empty scene should sit near zero
    components. Raise `MIN_AREA_RATIO` until wind-driven foliage stops producing
-   components, or mask it.
+   components, or cover it with an ignore polygon.
 4. **Walk-ups, five each.** Approach the door at normal pace, slowly, and at an
    angle. Each must produce `decision:1` once. If it does not, lower
    `PERSISTENCE_SECONDS` or `MIN_AREA_RATIO`; if a single approach produces
    several, the persistence is too low.
 5. **Pass-bys, five.** Walk past on the street without approaching. None may
-   fire. If they do, the trigger zone reaches too far out; shrink it.
-6. **Loiter, two.** Stand still in the road zone past the dwell time. Each must
+   fire. If they do, the approach polygon reaches too far out; shrink it.
+6. **Loiter, two.** Stand still in the road polygon past the dwell time. Each must
    fire once.
 7. **Night.** Repeat 3–5 after dark, with the camera's IR on. The IR cut-over
    itself is a global change and is discarded; what matters is the noise floor

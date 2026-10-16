@@ -25,6 +25,25 @@ if the daemon crashes. The helper installs that rule only after fresh daemon
 readiness, then reloads/triggers udev. Restart the kiosk session to apply changed
 device-discovery policy; firstboot naturally does this before kiosk startup.
 
+## Adaptive mode (the real panel's mode since 2026-10-16)
+
+`TOUCH_FILTER_MODE=adaptive`, `TOUCH_FILTER_ISOLATE=false`. Native touch while the
+fault is quiet. When the detector confirms a phantom row it waits for an empty
+frame, grabs the physical device, and writes each admitted contact to a uinput
+type-B device ("OfficeWall Protected Touchscreen") 40 ms late, holds and
+multi-touch intact; touches starting inside the fault row, within ~16 px of the
+top edge, or shorter than 40 ms are dropped. It releases the grab 30 minutes
+after the last fault. Design and evidence: HomeHub
+`docs/TOUCH_PER_CONTACT_PLAN_2026-10-15.md` and OfficeWallNaglight
+`touchfilter/README.md`. Needs `/dev/uinput` (loaded above); the panel image does
+NOT need `PANEL_TOUCH_ADAPTIVE_TRIAL` or `PANEL_TOUCH_PANDORA_MOUSE_TRIAL`.
+
+Health stays `protecting-fail-open` while ungrabbed (the gate below accepts it);
+`status.json` adds `compositor` (`open` once cage holds the virtual device) and a
+`protection` block (admitted / rejected by reason). `systemctl stop
+wall-touch-filter` gives native touch back at once. **Every stop or restart is a
+window of native phantoms until it re-arms (about 2 s once the fault is live).**
+
 SSH or a service keyboard is the recovery route for isolated input. Set
 `TOUCH_FILTER_MODE=off` in `/etc/wall-panel/wall.env`, then run:
 

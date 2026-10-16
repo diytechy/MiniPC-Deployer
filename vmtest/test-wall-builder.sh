@@ -344,8 +344,8 @@ assert_file_matches "wall.env.example no longer offers the bench overrides as kn
     "$WALL_DIR/wall.env.example" '^# *MEDIA_(MUSIC|FRAME)_SOURCE_OVERRIDE=' --absent
 assert_file_matches "Door motion OpenCV is named in the offline package SSOT" \
     "$WALL_DIR/packages.list" '^python3-opencv([[:space:]]|$)'
-assert_file_matches "Door service consumes the normalized trigger-zone credential" \
-    "$WALL_DIR/wall-door-stream.service" '^LoadCredential=motion-trigger-zone:'
+assert_file_matches "Door service consumes the normalized approach-polygon credential" \
+    "$WALL_DIR/wall-door-stream.service" '^LoadCredential=motion-approach-polygon:'
 assert_file_matches "Door service has a bounded memory ceiling" \
     "$WALL_DIR/wall-door-stream.service" '^MemoryMax=384M$'
 assert_file_matches "firstboot requires the packaged pure motion core" \
@@ -536,10 +536,10 @@ if env APT_OUT="$FAKE_APT" "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1 OUT_DI
         '^DOORBELL_MOTION_CALIBRATED=false$'
     assert_file_matches "SIM Door motion cadence is explicitly bounded" "$SIM_ENV" \
         '^DOORBELL_MOTION_SAMPLE_FPS=2$'
-    assert_file_matches "SIM Door trigger zone is normalized and topology-free" "$SIM_ENV" \
-        '^DOORBELL_MOTION_TRIGGER_ZONE=0,0,1,1$'
-    assert_file_matches "SIM Door road zone is disabled rather than property-shaped" "$SIM_ENV" \
-        '^DOORBELL_MOTION_ROAD_ZONE=0,0,0,0$'
+    assert_file_matches "SIM Door approach polygon is normalized and topology-free" "$SIM_ENV" \
+        '^DOORBELL_MOTION_APPROACH_POLYGON=0,0;1,0;1,1;0,1$'
+    assert_file_matches "SIM Door road polygon is a neutral corner rather than property-shaped" "$SIM_ENV" \
+        '^DOORBELL_MOTION_ROAD_POLYGON=0,0;0.1,0;0.1,0.1;0,0.1$'
     assert_file_matches "SIM Door numeric diagnostics remain disabled" "$SIM_ENV" \
         '^DOORBELL_MOTION_DIAGNOSTICS=false$'
 else
@@ -668,8 +668,8 @@ for knob in MEDIA_MUSIC_SHARE_UNC MEDIA_FRAME_SHARE_UNC \
     DOORBELL_MOTION_ENABLED DOORBELL_MOTION_CALIBRATED \
     DOORBELL_MOTION_SAMPLE_FPS DOORBELL_MOTION_MIN_AREA_RATIO \
     DOORBELL_MOTION_PERSISTENCE_SECONDS DOORBELL_MOTION_DWELL_SECONDS \
-    DOORBELL_MOTION_STATIONARY_RATIO DOORBELL_MOTION_TRIGGER_ZONE \
-    DOORBELL_MOTION_ROAD_ZONE DOORBELL_MOTION_MASKS DOORBELL_MOTION_DIAGNOSTICS; do
+    DOORBELL_MOTION_STATIONARY_RATIO DOORBELL_MOTION_APPROACH_POLYGON \
+    DOORBELL_MOTION_ROAD_POLYGON DOORBELL_MOTION_IGNORE_POLYGONS DOORBELL_MOTION_DIAGNOSTICS; do
     grep -v "^${knob}=" "$WORK/wallenv.bak" > "$WEX"
     expect_refusal "a sim build refuses if wall.env.example loses $knob" \
         "'$knob' is not a key" -- "WALL_SHELL_DIST=$EMPTY" ALLOW_MISSING_SHELL=1

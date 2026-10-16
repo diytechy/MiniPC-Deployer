@@ -363,14 +363,15 @@ def test_firstboot_readiness_gate_matches_the_protocols_that_exist():
     assert "state.get('protocolVersion')==1" not in helper
 
 
-def test_firstboot_accepts_adaptive_without_loading_uinput_for_it():
-    # Adaptive's accepted taps leave over the AF_UNIX bridge, not a virtual
-    # device, so uinput stays scoped to filter mode.
+def test_firstboot_accepts_adaptive_and_loads_uinput_for_it():
+    # Since 2026-10-16 adaptive's protected output is a uinput touchscreen
+    # (OfficeWallNaglight touch-release-436bc63), so it needs uinput exactly as
+    # filter does; shadow and off still load nothing.
     helper = (ROOT / "stack/autoinstall/wall/configure-touch-filter.sh").read_text(
         encoding="utf-8"
     )
     assert "off|shadow|filter|adaptive)" in helper
-    assert 'if [ "$mode" = filter ]; then\n    modprobe uinput' in helper
+    assert 'if [ "$mode" = filter ] || [ "$mode" = adaptive ]; then\n    modprobe uinput' in helper
 
 
 @pytest.mark.skipif(

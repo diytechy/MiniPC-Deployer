@@ -826,7 +826,9 @@ set_env_key() {
     # it.  Preserve ordinary values verbatim; quote whitespace/empty values so
     # both readers see a single assignment.
     rendered="$val"
-    case "$val" in ''|*[[:space:]]*) rendered="\"$val\"" ;; esac
+    # `;` `|` `&` `<` `>` `(` `)` are command syntax to a sourcing helper (a
+    # Door polygon is `x,y;x,y;...`), so they are quoted too.
+    case "$val" in ''|*[[:space:]\;\|\&\<\>\(\)]*) rendered="\"$val\"" ;; esac
     delim="$(sed_delim "$rendered$key")"
     # In a sed REPLACEMENT, '&' means "the whole match" and '\' escapes; both
     # would silently corrupt the value.
@@ -2722,9 +2724,9 @@ render_sim_wall_env() {
     # guarantees the VM cannot contact a household camera.
     set_env_key "$env_out" DOORBELL_RTSP_HOST "vmtest-no-camera.invalid"
     set_env_key "$env_out" DOORBELL_RTSP_PASSWORD "vmtest-not-a-real-camera-secret"
-    # MOTION: explicit conservative SIM values. The all-frame trigger keeps the
-    # syntax exercisable without encoding a real property's layout; a zero-area
-    # road zone and empty masks make the fixture topology-free. The .invalid
+    # MOTION: explicit conservative SIM values. The all-frame approach polygon keeps the
+    # syntax exercisable without encoding a real property's layout; a tiny corner
+    # road polygon and no ignore polygons make the fixture topology-free. The .invalid
     # host above means these values still cannot start a real capture.
     set_env_key "$env_out" DOORBELL_MOTION_ENABLED "false"
     set_env_key "$env_out" DOORBELL_MOTION_CALIBRATED "false"
@@ -2733,9 +2735,9 @@ render_sim_wall_env() {
     set_env_key "$env_out" DOORBELL_MOTION_PERSISTENCE_SECONDS "2"
     set_env_key "$env_out" DOORBELL_MOTION_DWELL_SECONDS "3"
     set_env_key "$env_out" DOORBELL_MOTION_STATIONARY_RATIO "0.02"
-    set_env_key "$env_out" DOORBELL_MOTION_TRIGGER_ZONE "0,0,1,1"
-    set_env_key "$env_out" DOORBELL_MOTION_ROAD_ZONE "0,0,0,0"
-    set_env_key "$env_out" DOORBELL_MOTION_MASKS ""
+    set_env_key "$env_out" DOORBELL_MOTION_APPROACH_POLYGON "0,0;1,0;1,1;0,1"
+    set_env_key "$env_out" DOORBELL_MOTION_ROAD_POLYGON "0,0;0.1,0;0.1,0.1;0,0.1"
+    set_env_key "$env_out" DOORBELL_MOTION_IGNORE_POLYGONS ""
     set_env_key "$env_out" DOORBELL_MOTION_DIAGNOSTICS "false"
 
     # SLEEP: `backlight`, not the production `suspend`. A gate VM that suspends

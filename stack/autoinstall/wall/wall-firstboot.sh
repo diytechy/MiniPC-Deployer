@@ -2081,7 +2081,7 @@ fi
 # application may declare the FULL sampler eligible and may separately request
 # public visible Door frames.
 _door_cred_dir=/run/wall-door-credentials
-_door_credential_names="host password port path username width height input-fov horizontal-fov vertical-fov yaw pitch stale-seconds start-seconds motion-enabled motion-calibrated motion-sample-fps motion-min-area-ratio motion-persistence-seconds motion-dwell-seconds motion-stationary-ratio motion-trigger-zone motion-road-zone motion-masks motion-diagnostics"
+_door_credential_names="host password port path username width height input-fov horizontal-fov vertical-fov yaw pitch stale-seconds start-seconds motion-enabled motion-calibrated motion-sample-fps motion-min-area-ratio motion-persistence-seconds motion-dwell-seconds motion-stationary-ratio motion-approach-polygon motion-road-polygon motion-ignore-polygons motion-diagnostics"
 
 # Stop before removing the volatile inputs. A rerun with an incomplete payload
 # must not leave the previous process or socket alive on stale credentials.
@@ -2140,7 +2140,10 @@ purge_door_runtime() {
     if ! timeout 5 systemctl disable wall-door-stream.service >/dev/null 2>&1; then
         fail_step "Door broker disable operation failed after verified process teardown"
     fi
-    for _door_cred_name in $_door_credential_names; do
+    # The three names after the live list were written by images that predate
+    # the polygon knobs. They are no longer in the allowlist, so remove them
+    # explicitly or an upgrade would leave a stale credential on disk.
+    for _door_cred_name in $_door_credential_names motion-trigger-zone motion-road-zone motion-masks; do
         rm -f -- "$_door_cred_dir/$_door_cred_name"
     done
     rm -f -- /run/wall-door-stream/service.sock
@@ -2161,48 +2164,55 @@ door_motion_number_between() { # VALUE MIN MAX
     } NR != 1 { exit 1 }'
 }
 
-door_motion_zone_valid() { # X,Y,WIDTH,HEIGHT ALLOW_DISABLED
+# Shared awk helper for the polygon validators. A polygon is "x,y;x,y;..." in
+# normalised raw-fisheye coordinates: 3 to 16 points, plain decimals in [0,1],
+# and an enclosed area (shoelace) of at least 0.0001.
+_door_polygon_awk='function polygon_ok(raw,    n, i, f, c, px, py, area, j) {
+    n = split(raw, pt, ";")
+    if (n < 3 || n > 16) return 0
+    for (i = 1; i <= n; i++) {
+        c = split(pt[i], f, ",")
+        if (c != 2) return 0
+        for (j = 1; j <= 2; j++) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", f[j])
+            if (f[j] !~ /^([0-9]+([.][0-9]+)?|[.][0-9]+)$/) return 0
+            if (f[j] + 0 < 0 || f[j] + 0 > 1) return 0
+        }
+        px[i] = f[1] + 0
+        py[i] = f[2] + 0
+    }
+    area = 0
+    for (i = 1; i <= n; i++) {
+        j = (i % n) + 1
+        area += px[i] * py[j] - px[j] * py[i]
+    }
+    if (area < 0) area = -area
+    return (area / 2 >= 0.0001)
+}'
+
+door_motion_polygon_valid() { # X,Y;X,Y;... (3 to 16 points) [ALLOW_EMPTY=1]
+    [ -z "$1" ] && [ "${2:-0}" = "1" ] && return 0
     case "$1" in *'
 '*) return 1 ;; esac
-    printf '%s\n' "$1" | LC_ALL=C awk -v allow_disabled="$2" 'NR == 1 {
-        raw = $0
-        count = split(raw, field, ",")
-        if (count != 4) exit 1
-        for (i = 1; i <= 4; i++) {
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", field[i])
-            if (field[i] !~ /^([0-9]+([.][0-9]+)?|[.][0-9]+)$/) exit 1
-            value[i] = field[i] + 0
-            if (value[i] < 0 || value[i] > 1) exit 1
-        }
-        if (allow_disabled && value[3] == 0 && value[4] == 0) exit 0
-        if (value[3] <= 0 || value[4] <= 0) exit 1
-        exit !((value[1] + value[3] <= 1) && (value[2] + value[4] <= 1))
-    } NR != 1 { exit 1 }'
+    printf '%s\n' "$1" | LC_ALL=C awk "$_door_polygon_awk"'
+    NR == 1 { exit !polygon_ok($0) }
+    NR != 1 { exit 1 }'
 }
 
-door_motion_masks_valid() {
+door_motion_polygons_valid() { # POLYGON|POLYGON|... (empty = none, at most 8)
     [ -z "$1" ] && return 0
     case "$1" in *'
 '*) return 1 ;; esac
-    printf '%s\n' "$1" | LC_ALL=C awk 'NR == 1 {
+    printf '%s\n' "$1" | LC_ALL=C awk "$_door_polygon_awk"'
+    NR == 1 {
         raw = $0
         if (length(raw) > 4096) exit 1
-        zones = split(raw, zone, ";")
-        if (zones > 32) exit 1
-        for (z = 1; z <= zones; z++) {
-            count = split(zone[z], field, ",")
-            if (count != 4) exit 1
-            for (i = 1; i <= 4; i++) {
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", field[i])
-                if (field[i] !~ /^([0-9]+([.][0-9]+)?|[.][0-9]+)$/) exit 1
-                value[i] = field[i] + 0
-                if (value[i] < 0 || value[i] > 1) exit 1
-            }
-            if (value[3] <= 0 || value[4] <= 0 ||
-                value[1] + value[3] > 1 || value[2] + value[4] > 1) exit 1
-        }
+        zones = split(raw, zone, "|")
+        if (zones > 8) exit 1
+        for (z = 1; z <= zones; z++) if (!polygon_ok(zone[z])) exit 1
         exit 0
-    } NR != 1 { exit 1 }'
+    }
+    NR != 1 { exit 1 }'
 }
 
 if ! getent group wall-door-stream >/dev/null 2>&1; then
@@ -2230,13 +2240,13 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
     : "${DOORBELL_MOTION_ENABLED:=false}"
     : "${DOORBELL_MOTION_CALIBRATED:=false}"
     : "${DOORBELL_MOTION_SAMPLE_FPS:=5}"
-    : "${DOORBELL_MOTION_MIN_AREA_RATIO:=0.002}"
-    : "${DOORBELL_MOTION_PERSISTENCE_SECONDS:=2}"
+    : "${DOORBELL_MOTION_MIN_AREA_RATIO:=0.0015}"
+    : "${DOORBELL_MOTION_PERSISTENCE_SECONDS:=0.4}"
     : "${DOORBELL_MOTION_DWELL_SECONDS:=3}"
-    : "${DOORBELL_MOTION_STATIONARY_RATIO:=0.02}"
-    : "${DOORBELL_MOTION_TRIGGER_ZONE:=0,0,1,1}"
-    : "${DOORBELL_MOTION_ROAD_ZONE:=0,0,0,0}"
-    : "${DOORBELL_MOTION_MASKS:=}"
+    : "${DOORBELL_MOTION_STATIONARY_RATIO:=0.008}"
+    : "${DOORBELL_MOTION_APPROACH_POLYGON:=0,0;1,0;1,1;0,1}"
+    : "${DOORBELL_MOTION_ROAD_POLYGON:=}"
+    : "${DOORBELL_MOTION_IGNORE_POLYGONS:=}"
     : "${DOORBELL_MOTION_DIAGNOSTICS:=false}"
     _door_credentials_ready=0
     install -d -m 0700 -o root -g root "$_door_cred_dir"
@@ -2253,17 +2263,22 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
         fi
     done
     door_motion_number_between "$DOORBELL_MOTION_SAMPLE_FPS" 1 10 || { fail_step "Door motion sample FPS must be between 1 and 10"; _door_motion_valid=0; }
-    door_motion_number_between "$DOORBELL_MOTION_MIN_AREA_RATIO" 0.000001 1 || { fail_step "Door motion minimum area ratio must be greater than 0 and at most 1"; _door_motion_valid=0; }
-    door_motion_number_between "$DOORBELL_MOTION_PERSISTENCE_SECONDS" 0.1 30 || { fail_step "Door motion persistence must be between 0.1 and 30 seconds"; _door_motion_valid=0; }
-    door_motion_number_between "$DOORBELL_MOTION_DWELL_SECONDS" 0.1 30 || { fail_step "Door motion dwell must be between 0.1 and 30 seconds"; _door_motion_valid=0; }
-    door_motion_number_between "$DOORBELL_MOTION_STATIONARY_RATIO" 0 1 || { fail_step "Door motion stationary ratio must be between 0 and 1"; _door_motion_valid=0; }
-    door_motion_zone_valid "$DOORBELL_MOTION_TRIGGER_ZONE" 0 || { fail_step "Door motion trigger zone must be one nonempty normalized rectangle"; _door_motion_valid=0; }
-    door_motion_zone_valid "$DOORBELL_MOTION_ROAD_ZONE" 1 || { fail_step "Door motion road zone must be disabled or one normalized rectangle"; _door_motion_valid=0; }
-    door_motion_masks_valid "$DOORBELL_MOTION_MASKS" || { fail_step "Door motion masks must be empty or normalized rectangles separated by semicolons"; _door_motion_valid=0; }
+    door_motion_number_between "$DOORBELL_MOTION_MIN_AREA_RATIO" 0.0001 0.1 || { fail_step "Door motion minimum area ratio must be between 0.0001 and 0.1"; _door_motion_valid=0; }
+    door_motion_number_between "$DOORBELL_MOTION_PERSISTENCE_SECONDS" 0.2 5 || { fail_step "Door motion persistence must be between 0.2 and 5 seconds"; _door_motion_valid=0; }
+    door_motion_number_between "$DOORBELL_MOTION_DWELL_SECONDS" 1 30 || { fail_step "Door motion dwell must be between 1 and 30 seconds"; _door_motion_valid=0; }
+    door_motion_number_between "$DOORBELL_MOTION_STATIONARY_RATIO" 0.001 0.05 || { fail_step "Door motion stationary ratio must be between 0.001 and 0.05"; _door_motion_valid=0; }
+    door_motion_polygon_valid "$DOORBELL_MOTION_APPROACH_POLYGON" || { fail_step "Door motion approach polygon must be 3 to 16 normalized x,y points enclosing a real area"; _door_motion_valid=0; }
+    door_motion_polygon_valid "$DOORBELL_MOTION_ROAD_POLYGON" 1 || { fail_step "Door motion road polygon must be empty (road-stop observation off) or 3 to 16 normalized x,y points enclosing a real area"; _door_motion_valid=0; }
+    door_motion_polygons_valid "$DOORBELL_MOTION_IGNORE_POLYGONS" || { fail_step "Door motion ignore polygons must be empty or at most 8 valid polygons separated by |"; _door_motion_valid=0; }
 
     _door_motion_effective=false
     if [ "$_door_motion_valid" -eq 1 ] && [ "$DOORBELL_MOTION_ENABLED" = "true" ]; then
-        if [ "$DOORBELL_MOTION_CALIBRATED" = "true" ]; then
+        if [ "$DOORBELL_MOTION_CALIBRATED" = "true" ] && \
+           [ "$(printf '%s' "$DOORBELL_MOTION_APPROACH_POLYGON" | tr -d '[:space:]')" = "0,0;1,0;1,1;0,1" ]; then
+            # The broker refuses this placeholder too (MotionConfig.eligible);
+            # saying so here keeps firstboot's verdict truthful.
+            fail_step "Door motion is enabled and calibrated over the whole-image placeholder approach polygon; set the calibrated DOORBELL_MOTION_APPROACH_POLYGON. Motion remains disabled"
+        elif [ "$DOORBELL_MOTION_CALIBRATED" = "true" ]; then
             _door_motion_effective=true
         else
             fail_step "Door motion was enabled without the explicit physical-calibration gate; motion remains disabled"
@@ -2272,13 +2287,13 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
     if [ "$_door_motion_valid" -eq 0 ]; then
         # Do not hand malformed latent values to a future service version.
         DOORBELL_MOTION_SAMPLE_FPS=5
-        DOORBELL_MOTION_MIN_AREA_RATIO=0.002
-        DOORBELL_MOTION_PERSISTENCE_SECONDS=2
+        DOORBELL_MOTION_MIN_AREA_RATIO=0.0015
+        DOORBELL_MOTION_PERSISTENCE_SECONDS=0.4
         DOORBELL_MOTION_DWELL_SECONDS=3
-        DOORBELL_MOTION_STATIONARY_RATIO=0.02
-        DOORBELL_MOTION_TRIGGER_ZONE=0,0,1,1
-        DOORBELL_MOTION_ROAD_ZONE=0,0,0,0
-        DOORBELL_MOTION_MASKS=
+        DOORBELL_MOTION_STATIONARY_RATIO=0.008
+        DOORBELL_MOTION_APPROACH_POLYGON="0,0;1,0;1,1;0,1"
+        DOORBELL_MOTION_ROAD_POLYGON=
+        DOORBELL_MOTION_IGNORE_POLYGONS=
         DOORBELL_MOTION_DIAGNOSTICS=false
         DOORBELL_MOTION_CALIBRATED=false
     fi
@@ -2306,9 +2321,9 @@ if [ -f /etc/systemd/system/wall-door-stream.service ] && \
         printf '%s' "$DOORBELL_MOTION_PERSISTENCE_SECONDS" > "$_door_cred_dir/motion-persistence-seconds"
         printf '%s' "$DOORBELL_MOTION_DWELL_SECONDS" > "$_door_cred_dir/motion-dwell-seconds"
         printf '%s' "$DOORBELL_MOTION_STATIONARY_RATIO" > "$_door_cred_dir/motion-stationary-ratio"
-        printf '%s' "$DOORBELL_MOTION_TRIGGER_ZONE" > "$_door_cred_dir/motion-trigger-zone"
-        printf '%s' "$DOORBELL_MOTION_ROAD_ZONE" > "$_door_cred_dir/motion-road-zone"
-        printf '%s' "$DOORBELL_MOTION_MASKS" > "$_door_cred_dir/motion-masks"
+        printf '%s' "$DOORBELL_MOTION_APPROACH_POLYGON" > "$_door_cred_dir/motion-approach-polygon"
+        printf '%s' "$DOORBELL_MOTION_ROAD_POLYGON" > "$_door_cred_dir/motion-road-polygon"
+        printf '%s' "$DOORBELL_MOTION_IGNORE_POLYGONS" > "$_door_cred_dir/motion-ignore-polygons"
         printf '%s' "$DOORBELL_MOTION_DIAGNOSTICS" > "$_door_cred_dir/motion-diagnostics"
         chmod 0600 "$_door_cred_dir"/*
         _door_credentials_ready=1

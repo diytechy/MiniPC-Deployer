@@ -16,8 +16,8 @@ DOOR_CREDENTIAL_FILES = {
     "stale-seconds", "start-seconds", "motion-enabled", "motion-calibrated",
     "motion-sample-fps",
     "motion-min-area-ratio", "motion-persistence-seconds",
-    "motion-dwell-seconds", "motion-stationary-ratio", "motion-trigger-zone",
-    "motion-road-zone", "motion-masks", "motion-diagnostics",
+    "motion-dwell-seconds", "motion-stationary-ratio", "motion-approach-polygon",
+    "motion-road-polygon", "motion-ignore-polygons", "motion-diagnostics",
 }
 
 
@@ -63,8 +63,11 @@ def test_door_broker_is_installed_and_enabled_by_firstboot():
     assert 'DOORBELL_MOTION_CALIBRATED:=false' in firstboot
     assert 'DOORBELL_MOTION_SAMPLE_FPS:=5' in firstboot
     assert 'DOORBELL_MOTION_DIAGNOSTICS:=false' in firstboot
-    assert "motion-sample-fps" in unit and "motion-trigger-zone" in unit
-    assert "motion-road-zone" in unit and "motion-masks" in unit
+    assert "motion-sample-fps" in unit and "motion-approach-polygon" in unit
+    assert "motion-road-polygon" in unit and "motion-ignore-polygons" in unit
+    for retired in ("motion-trigger-zone", "motion-road-zone", "motion-masks"):
+        assert "LoadCredential=" + retired not in unit
+        assert retired in firstboot, "the purge must still remove the legacy credential"
 
 
 def test_door_credential_allowlist_is_exact_and_never_mounts_wall_env():
@@ -96,13 +99,13 @@ def test_door_configuration_contract_is_complete_without_committed_credentials()
         "DOORBELL_MOTION_ENABLED=false",
         "DOORBELL_MOTION_CALIBRATED=false",
         "DOORBELL_MOTION_SAMPLE_FPS=5",
-        "DOORBELL_MOTION_MIN_AREA_RATIO=0.002",
-        "DOORBELL_MOTION_PERSISTENCE_SECONDS=2",
+        "DOORBELL_MOTION_MIN_AREA_RATIO=0.0015",
+        "DOORBELL_MOTION_PERSISTENCE_SECONDS=0.4",
         "DOORBELL_MOTION_DWELL_SECONDS=3",
-        "DOORBELL_MOTION_STATIONARY_RATIO=0.02",
-        "DOORBELL_MOTION_TRIGGER_ZONE=0,0,1,1",
-        "DOORBELL_MOTION_ROAD_ZONE=0,0,0,0",
-        "DOORBELL_MOTION_MASKS=",
+        "DOORBELL_MOTION_STATIONARY_RATIO=0.008",
+        "DOORBELL_MOTION_APPROACH_POLYGON=0,0;1,0;1,1;0,1",
+        "DOORBELL_MOTION_ROAD_POLYGON=",
+        "DOORBELL_MOTION_IGNORE_POLYGONS=",
         "DOORBELL_MOTION_DIAGNOSTICS=false",
     }
     assert expected_public <= set(env.splitlines())
@@ -119,13 +122,13 @@ def test_motion_is_fail_closed_and_every_public_knob_is_validated():
         "DOORBELL_MOTION_ENABLED", "DOORBELL_MOTION_CALIBRATED",
         "DOORBELL_MOTION_SAMPLE_FPS", "DOORBELL_MOTION_MIN_AREA_RATIO",
         "DOORBELL_MOTION_PERSISTENCE_SECONDS", "DOORBELL_MOTION_DWELL_SECONDS",
-        "DOORBELL_MOTION_STATIONARY_RATIO", "DOORBELL_MOTION_TRIGGER_ZONE",
-        "DOORBELL_MOTION_ROAD_ZONE", "DOORBELL_MOTION_MASKS",
+        "DOORBELL_MOTION_STATIONARY_RATIO", "DOORBELL_MOTION_APPROACH_POLYGON",
+        "DOORBELL_MOTION_ROAD_POLYGON", "DOORBELL_MOTION_IGNORE_POLYGONS",
         "DOORBELL_MOTION_DIAGNOSTICS",
     ):
         assert key in firstboot[firstboot.index("_door_motion_valid=1"):]
-    assert "door_motion_zone_valid" in firstboot
-    assert "door_motion_masks_valid" in firstboot
+    assert "door_motion_polygon_valid" in firstboot
+    assert "door_motion_polygons_valid" in firstboot
 
 
 @pytest.mark.parametrize(("function", "value", "extra", "accepted"), [
@@ -135,19 +138,30 @@ def test_motion_is_fail_closed_and_every_public_knob_is_validated():
     ("door_motion_number_between", "10.1", "1 10", False),
     ("door_motion_number_between", "nan", "0 1", False),
     ("door_motion_number_between", r"5\0560", "1 10", False),
-    ("door_motion_zone_valid", "0,0,1,1", "0", True),
-    ("door_motion_zone_valid", "0.8,0,0.3,1", "0", False),
-    ("door_motion_zone_valid", "0,0,0,0", "0", False),
-    ("door_motion_zone_valid", "0,0,0,0", "1", True),
-    ("door_motion_zone_valid", r"0\0540\0541\0541", "0", False),
-    ("door_motion_masks_valid", "", "", True),
-    ("door_motion_masks_valid", "0,0,0.5,1;0.5,0,0.5,1", "", True),
-    ("door_motion_masks_valid", ";".join(["0,0,0.01,0.01"] * 32), "", True),
-    ("door_motion_masks_valid", ";".join(["0,0,0.01,0.01"] * 33), "", False),
-    ("door_motion_masks_valid", "0,0,1,1" + " " * (4096 - len("0,0,1,1")), "", True),
-    ("door_motion_masks_valid", "0,0,1,1" + " " * (4097 - len("0,0,1,1")), "", False),
-    ("door_motion_masks_valid", "0,0,1.1,1", "", False),
-    ("door_motion_masks_valid", r"0\0540\0541\0541", "", False),
+    ("door_motion_polygon_valid", "0,0;1,0;1,1", "", True),
+    ("door_motion_polygon_valid", " 0 , 0 ; 1 , 0 ; 1 , 1 ", "", True),
+    ("door_motion_polygon_valid", "", "", False),
+    ("door_motion_polygon_valid", "", "1", True),
+    ("door_motion_polygon_valid", "0,0;1,1", "1", False),
+    ("door_motion_polygon_valid", "0,0;1,1", "", False),
+    ("door_motion_polygon_valid", "0,0;0.5,0.5;1,1", "", False),
+    ("door_motion_polygon_valid", "0,0;1,0;1,1;", "", False),
+    ("door_motion_polygon_valid", "0,0;1.1,0;1,1", "", False),
+    ("door_motion_polygon_valid", "-0.1,0;1,0;1,1", "", False),
+    ("door_motion_polygon_valid", "0,0;0.01,0;0.01,0.01", "", False),
+    ("door_motion_polygon_valid", "0,0;0.02,0;0.02,0.01", "", True),
+    ("door_motion_polygon_valid", ";".join(["0,0", "1,0"] + ["1,1"] * 14), "", True),
+    ("door_motion_polygon_valid", ";".join(["0,0", "1,0"] + ["1,1"] * 15), "", False),
+    ("door_motion_polygon_valid", r"0\0540;1,0;1,1", "", False),
+    ("door_motion_polygons_valid", "", "", True),
+    ("door_motion_polygons_valid", "0,0;0.1,0;0.1,0.1|0.5,0.5;1,0.5;1,1", "", True),
+    ("door_motion_polygons_valid", "|".join(["0,0;0.1,0;0.1,0.1"] * 8), "", True),
+    ("door_motion_polygons_valid", "|".join(["0,0;0.1,0;0.1,0.1"] * 9), "", False),
+    ("door_motion_polygons_valid", "0,0;0.1,0;0.1,0.1|", "", False),
+    ("door_motion_polygons_valid", "0,0;1,0;1,1" + " " * (4096 - len("0,0;1,0;1,1")), "", True),
+    ("door_motion_polygons_valid", "0,0;1,0;1,1" + " " * (4097 - len("0,0;1,0;1,1")), "", False),
+    ("door_motion_polygons_valid", "0,0;1.1,0;1,1", "", False),
+    ("door_motion_polygons_valid", r"0\0540;1,0;1,1", "", False),
 ])
 def test_motion_config_validators_execute_boundaries(function, value, extra, accepted):
     """Run the shipped validators; a source substring is not range evidence."""
@@ -176,6 +190,31 @@ def test_motion_config_validators_execute_boundaries(function, value, extra, acc
         check=False,
     )
     assert (result.returncode == 0) is accepted, result.stderr
+
+
+@pytest.mark.parametrize(("enabled", "calibrated", "approach", "effective"), [
+    ("true", "true", "0.3,0.6;0.8,0.6;0.8,0.9", "true"),
+    ("true", "true", "0,0;1,0;1,1;0,1", "false"),     # the public placeholder
+    ("true", "true", " 0,0; 1,0; 1,1; 0,1 ", "false"),
+    ("true", "false", "0.3,0.6;0.8,0.6;0.8,0.9", "false"),
+    ("false", "true", "0.3,0.6;0.8,0.6;0.8,0.9", "false"),
+])
+def test_motion_enables_only_with_both_gates_and_a_calibrated_approach(enabled, calibrated, approach, effective):
+    """Execute firstboot's enable decision. The broker also refuses the
+    whole-image placeholder (MotionConfig.eligible); firstboot must agree."""
+    bash = shutil.which("bash") or next((str(p) for p in (Path("C:/Program Files/Git/bin/bash.exe"),)
+                                         if p.is_file()), None)
+    if not bash:
+        pytest.skip("bash is required to execute the firstboot enable decision")
+    firstboot = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    block = firstboot[firstboot.index("    _door_motion_effective=false"):
+                      firstboot.index('    if [ "$_door_motion_valid" -eq 0 ]; then')]
+    script = 'fail_step() { :; }\n_door_motion_valid=1\n' + block + '\nprintf %s "$_door_motion_effective"'
+    result = subprocess.run([bash, "-c", script], capture_output=True, text=True, check=False,
+                            env={**os.environ, "DOORBELL_MOTION_ENABLED": enabled,
+                                 "DOORBELL_MOTION_CALIBRATED": calibrated,
+                                 "DOORBELL_MOTION_APPROACH_POLYGON": approach})
+    assert result.stdout == effective, result.stderr
 
 
 def test_incomplete_door_payload_stops_disables_and_purges_runtime():

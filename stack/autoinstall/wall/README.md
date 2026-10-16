@@ -184,8 +184,9 @@ unprivileged service's RAM-backed credential directory. The unit never mounts
 `wall.env`, and its stdout/stderr remain suppressed so a decoder cannot leak an
 authenticated URL. Detector configuration is public but travels through the
 same exact allowlist: effective enable/calibration gates, sample cadence, normalized minimum area, persistence,
-dwell/stationary threshold, normalized trigger/road zones and masks (at most 32
-rectangles and 4096 ASCII bytes), plus an
+dwell/stationary threshold, normalized approach and road polygons and ignore
+polygons on the raw fisheye picture (3 to 16 points each, at most 8 ignore
+polygons and 4096 ASCII bytes), plus an
 explicit diagnostics boolean. Tracked defaults contain no real-property shape
 and leave both motion gates false. Firstboot validates every value even while
 disabled; only explicit enabled+calibrated state publishes effective enable.
@@ -204,11 +205,13 @@ task and stop-time ceilings. The application owns the detector and sanitized
 generation/sequence event; the renderer owns the renewable five-second preview
 lease. No normal path writes a camera frame.
 
-Before relying on motion, the Owner must calibrate the normalized zones/masks,
+Before relying on motion, the Owner must calibrate the normalized polygons,
 component area, persistence, dwell and stationary threshold using day and night
 samples, set both motion gates true, then measure CPU/thermal load and coexistence on the real panel. The
-tracked full-frame trigger and disabled road zone are syntax-safe starting
-points, not tuned detection policy and not hardware acceptance.
+tracked defaults (whole-image approach polygon, road-stop observation off)
+contain no real-property geometry; they are syntax-safe starting points, not
+tuned detection policy and not hardware acceptance. The calibrated polygons are
+private deploy configuration.
 
 ## The media pull (OI-15, ruled by the Owner 2026-07-29; TWO sources since OI-18, ruled 2026-08-03)
 

@@ -92,31 +92,36 @@ def from_text(kind: str, text: str):
         return int(text)
     if kind == "float":
         return float(text)
-    if kind == "rect":
-        return [float(n) for n in text.split(",")]
-    if kind == "rects":
-        return [[float(n) for n in zone.split(",")] for zone in text.split(";")] if text else []
+    if kind == "polygon":
+        return [[float(n) for n in point.split(",")] for point in text.split(";")] if text else []
+    if kind == "polygons":
+        return [[[float(n) for n in point.split(",")] for point in polygon.split(";")]
+                for polygon in text.split("|")] if text else []
     return text
 
 
 def to_text(entry: dict, value) -> str:
     if entry["kind"] == "bool":
         return "true" if value else "false"
-    if entry["kind"] == "rect":
-        return ",".join(repr(n) for n in value)
-    if entry["kind"] == "rects":
-        return ";".join(",".join(repr(n) for n in rect) for rect in value)
+    if entry["kind"] == "polygon":
+        return ";".join(",".join(repr(n) for n in point) for point in value)
+    if entry["kind"] == "polygons":
+        return "|".join(";".join(",".join(repr(n) for n in point) for point in polygon)
+                        for polygon in value)
     return str(value) if entry["kind"] in ("int", "string") else repr(value)
 
 
 FIRSTBOOT_TEXT = FIRSTBOOT.read_text(encoding="utf-8")
 FUNCTIONS = ("door_motion_bool_valid", "door_motion_number_between",
-             "door_motion_zone_valid", "door_motion_masks_valid")
+             "door_motion_polygon_valid", "door_motion_polygons_valid")
 
 
 def lift_functions() -> str:
-    """The four validator definitions, verbatim, and nothing else from firstboot."""
-    out = []
+    """The validator definitions and the awk helper they share, verbatim, and
+    nothing else from firstboot."""
+    helper = re.search(r"^_door_polygon_awk='.*?^\}'$", FIRSTBOOT_TEXT, re.M | re.S)
+    assert helper, "firstboot no longer defines _door_polygon_awk"
+    out = [helper.group(0)]
     for name in FUNCTIONS:
         found = re.search(r"^%s\(\) \{.*?^\}$" % name, FIRSTBOOT_TEXT, re.M | re.S)
         assert found, "firstboot no longer defines %s" % name
@@ -303,14 +308,14 @@ def test_tc1229_shell_fallback_defaults_equal_the_fixture_defaults():
     fallback literals are a third copy of the defaults."""
     names = ["DOORBELL_MOTION_SAMPLE_FPS", "DOORBELL_MOTION_MIN_AREA_RATIO",
              "DOORBELL_MOTION_PERSISTENCE_SECONDS", "DOORBELL_MOTION_DWELL_SECONDS",
-             "DOORBELL_MOTION_STATIONARY_RATIO", "DOORBELL_MOTION_TRIGGER_ZONE",
-             "DOORBELL_MOTION_ROAD_ZONE", "DOORBELL_MOTION_MASKS",
+             "DOORBELL_MOTION_STATIONARY_RATIO", "DOORBELL_MOTION_APPROACH_POLYGON",
+             "DOORBELL_MOTION_ROAD_POLYGON", "DOORBELL_MOTION_IGNORE_POLYGONS",
              "DOORBELL_MOTION_DIAGNOSTICS", "DOORBELL_MOTION_CALIBRATED"]
     baseline = "".join("%s=%s\n" % (e["env"], shlex.quote(to_text(e, e["default"])))
                        for e in KEYS if not e["required"])
     script = ("fail_step() { :; }\n" + lift_functions() + baseline +
               "DOORBELL_MOTION_SAMPLE_FPS=999\nDOORBELL_MOTION_DIAGNOSTICS=true\n"
-              "DOORBELL_MOTION_MASKS='0,0,0.5,0.5'\nDOORBELL_MOTION_CALIBRATED=true\n" +
+              "DOORBELL_MOTION_IGNORE_POLYGONS='0,0;0.5,0;0.5,0.5'\nDOORBELL_MOTION_CALIBRATED=true\n" +
               lift_validation_block() +
               "".join('printf "%%s=%%s\\n" %s "${%s}"\n' % (n, n) for n in names) +
               'echo "VALID=$_door_motion_valid"\n')

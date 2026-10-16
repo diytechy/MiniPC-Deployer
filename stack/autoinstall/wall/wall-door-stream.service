@@ -54,9 +54,9 @@ LoadCredential=motion-min-area-ratio:/run/wall-door-credentials/motion-min-area-
 LoadCredential=motion-persistence-seconds:/run/wall-door-credentials/motion-persistence-seconds
 LoadCredential=motion-dwell-seconds:/run/wall-door-credentials/motion-dwell-seconds
 LoadCredential=motion-stationary-ratio:/run/wall-door-credentials/motion-stationary-ratio
-LoadCredential=motion-trigger-zone:/run/wall-door-credentials/motion-trigger-zone
-LoadCredential=motion-road-zone:/run/wall-door-credentials/motion-road-zone
-LoadCredential=motion-masks:/run/wall-door-credentials/motion-masks
+LoadCredential=motion-approach-polygon:/run/wall-door-credentials/motion-approach-polygon
+LoadCredential=motion-road-polygon:/run/wall-door-credentials/motion-road-polygon
+LoadCredential=motion-ignore-polygons:/run/wall-door-credentials/motion-ignore-polygons
 LoadCredential=motion-diagnostics:/run/wall-door-credentials/motion-diagnostics
 # NO ExecStartPre chgrp here. It looked like it granted the kiosk access and it
 # did nothing at all -- see RuntimeDirectoryMode above. A privileged pre-command

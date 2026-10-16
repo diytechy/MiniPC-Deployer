@@ -34,10 +34,12 @@ install -m 0644 "$scratch/config.json" "$config_dir/touch-filter.json"
 install -m 0644 "$payload/wall-touch-filter.service" /etc/systemd/system/wall-touch-filter.service
 install -m 0755 "$payload/wall-touch-filter-sleep" /usr/lib/systemd/system-sleep/wall-touch-filter
 touch "$config_dir/touch-filter.enabled"
-# ADAPTIVE DOES NOT TAKE uinput. Its accepted taps leave over the AF_UNIX
-# bridge to the kiosk, not through a virtual device, so loading uinput for it
-# would install a module nothing opens.
-if [ "$mode" = filter ]; then
+# BOTH filter AND adaptive TAKE uinput (2026-10-16). Adaptive's protected output
+# is now native: admitted contacts leave through a virtual type-B touchscreen
+# ("OfficeWall Protected Touchscreen"), not the old AF_UNIX bridge. The panel's
+# kernel has CONFIG_INPUT_UINPUT=y, so this is a no-op there; it keeps a modular
+# kernel working. Without /dev/uinput the daemon never grabs (fail-open).
+if [ "$mode" = filter ] || [ "$mode" = adaptive ]; then
     modprobe uinput
     printf 'uinput\n' > /etc/modules-load.d/wall-touch-filter.conf
 fi

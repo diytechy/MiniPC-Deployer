@@ -103,7 +103,7 @@ def test_door_configuration_contract_is_complete_without_committed_credentials()
         "DOORBELL_MOTION_PERSISTENCE_SECONDS=0.4",
         "DOORBELL_MOTION_DWELL_SECONDS=3",
         "DOORBELL_MOTION_STATIONARY_RATIO=0.008",
-        "DOORBELL_MOTION_APPROACH_POLYGON=0,0;1,0;1,1;0,1",
+        'DOORBELL_MOTION_APPROACH_POLYGON="0,0;1,0;1,1;0,1"',
         "DOORBELL_MOTION_ROAD_POLYGON=",
         "DOORBELL_MOTION_IGNORE_POLYGONS=",
         "DOORBELL_MOTION_DIAGNOSTICS=false",
@@ -190,6 +190,21 @@ def test_motion_config_validators_execute_boundaries(function, value, extra, acc
         check=False,
     )
     assert (result.returncode == 0) is accepted, result.stderr
+
+
+def test_wall_env_example_survives_being_sourced_like_the_configure_helpers():
+    """configure-bluetooth.sh and configure-touch-filter.sh `source` wall.env.
+    An unquoted `;` in a polygon ran its tail as a command and failed firstboot
+    on the real panel (2026-10-16). Source the shipped example the same way."""
+    bash = shutil.which("bash") or next((str(p) for p in (Path("C:/Program Files/Git/bin/bash.exe"),)
+                                         if p.is_file()), None)
+    if not bash:
+        pytest.skip("bash is required to source wall.env.example")
+    example = (WALL / "wall.env.example").as_posix()
+    result = subprocess.run([bash, "-c", 'set -a; source "$1"; printf %s "$DOORBELL_MOTION_APPROACH_POLYGON"', "_",
+                             example], capture_output=True, text=True, check=False)
+    assert result.returncode == 0 and result.stderr == "", result.stderr
+    assert result.stdout == "0,0;1,0;1,1;0,1"
 
 
 @pytest.mark.parametrize(("enabled", "calibrated", "approach", "effective"), [

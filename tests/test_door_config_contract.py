@@ -156,7 +156,12 @@ def env_example_values() -> dict:
         found = re.match(r"^(DOORBELL_[A-Z0-9_]+)=(.*)$", line)
         if found:
             assert found.group(1) not in values, "duplicate %s" % found.group(1)
-            values[found.group(1)] = found.group(2)
+            text = found.group(2)
+            # As firstboot's load_env_file reads it: one matching outer quote
+            # pair is syntax (polygons MUST be quoted for the sourcing helpers).
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+                text = text[1:-1]
+            values[found.group(1)] = text
     return values
 
 

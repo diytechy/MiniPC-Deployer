@@ -45,6 +45,10 @@ def test_door_broker_is_installed_and_enabled_by_firstboot():
         "wall-door-stream.service /target/etc/systemd/system/wall-door-stream.service"
         in user_data
     )
+    # ...and firstboot refreshes it, so the release lane carries unit changes
+    # (the credential list moves with the knobs) -- before the block reads it.
+    refresh = firstboot.index('install -m 0644 "$PAYLOAD/wall-door-stream.service" /etc/systemd/system/wall-door-stream.service')
+    assert refresh < firstboot.index("if [ -f /etc/systemd/system/wall-door-stream.service ]")
     assert "useradd --system" in firstboot and "wall-door-stream" in firstboot
     assert "timeout 7 systemctl stop wall-door-stream.service" in firstboot
     assert "timeout 2 pkill -KILL -u wall-door-stream" in firstboot

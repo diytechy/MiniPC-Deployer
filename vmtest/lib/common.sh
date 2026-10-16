@@ -826,7 +826,9 @@ set_env_key() {
     # it.  Preserve ordinary values verbatim; quote whitespace/empty values so
     # both readers see a single assignment.
     rendered="$val"
-    case "$val" in ''|*[[:space:]]*) rendered="\"$val\"" ;; esac
+    # `;` `|` `&` `<` `>` `(` `)` are command syntax to a sourcing helper (a
+    # Door polygon is `x,y;x,y;...`), so they are quoted too.
+    case "$val" in ''|*[[:space:]\;\|\&\<\>\(\)]*) rendered="\"$val\"" ;; esac
     delim="$(sed_delim "$rendered$key")"
     # In a sed REPLACEMENT, '&' means "the whole match" and '\' escapes; both
     # would silently corrupt the value.

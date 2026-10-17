@@ -59,6 +59,27 @@ Inspect aggregate health at `/run/wall-touch-filter/status.json` and service
 state with `systemctl status wall-touch-filter.service`. No live deployment or
 hardware proof was performed by this implementation.
 
+## Single path (`TOUCH_FILTER_SINGLE_PATH`, adaptive only, default false)
+
+Adaptive mode hands the physical digitizer back and forth: the compositor reads
+it natively until a fault is confirmed, then the daemon grabs it and protects.
+A contact that begins on one path and lifts after a switch strands "down" in
+Chromium, after which every tap is a second finger and nothing clicks (measured
+2026-10-16 after a kiosk restart during a phantom flood: the ripple showed, no
+tap acted). With `TOUCH_FILTER_SINGLE_PATH=true` the daemon keeps the grab and
+passes touches through its virtual device whenever no fault is active, adopts a
+restarted kiosk instead of failing open, and fails open only if no kiosk holds
+the virtual device for 15 s. A daemon crash still returns native touch: the
+kernel drops the grab and the compositor's own handle resumes. No isolation rule
+is involved.
+
+The rendered config carries `"single_path": true` only when the knob is true,
+because a daemon that predates the key refuses the whole config. Deliver the
+application release that knows it BEFORE turning the knob on. Apply as any
+touch-filter change: run `configure-touch-filter.sh`, then restart
+`getty@tty1.service`. Status shows `singlePath: true` and `state: PASSTHROUGH`.
+Detail and the residual cases: `touchfilter/README.md` in the application repo.
+
 Release builders now require all six capability IDs and their actual files
 inside the shell tar. Shell/site/private-gateway payloads must carry the same
 full clean source revision. Hub builds stage the gateway separately and firstboot

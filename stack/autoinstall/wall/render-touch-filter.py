@@ -45,7 +45,7 @@ def adaptive(env, policy):
     # daemon.load_config pops it before constructing one. Added after the
     # Policy(**policy) validation above for exactly that reason.
     policy["protection_quiet_ms"] = quiet
-    return {
+    extra = {
         "bridge": {
             "socket": "/run/wall-touch-filter/input.sock",
             "kiosk_uid": uid,
@@ -54,6 +54,22 @@ def adaptive(env, policy):
         },
         "bench_force_protection": False,
     }
+    # SINGLE PATH: the daemon keeps the grab and passes touches through when no
+    # fault is active, so a contact can never begin on one path and lift on the
+    # other (a stuck phantom finger that left every tap unclickable, measured
+    # 2026-10-16). Emitted ONLY when true: a daemon that predates the key
+    # refuses a config carrying it, so an unset knob must render exactly as
+    # before.
+    if single_path(env):
+        extra["single_path"] = True
+    return extra
+
+
+def single_path(env):
+    value = env.get("TOUCH_FILTER_SINGLE_PATH", "false")
+    if value not in ("true", "false"):
+        raise ValueError("invalid-touch-filter-single-path")
+    return value == "true"
 
 
 def render(env):
@@ -64,6 +80,8 @@ def render(env):
         raise ValueError("invalid-touch-filter-mode")
     if isolate == "true" and mode != "filter":
         raise ValueError("isolation-requires-filter")
+    if single_path(env) and mode != "adaptive":
+        raise ValueError("single-path-requires-adaptive")
     name = env.get("TOUCH_FILTER_NAME", "ELAN Touchscreen")
     if not re.fullmatch(r"[A-Za-z0-9 _.-]{1,80}", name):
         raise ValueError("invalid-touchscreen-name")

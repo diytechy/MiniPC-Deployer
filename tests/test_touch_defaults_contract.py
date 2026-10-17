@@ -191,3 +191,41 @@ def test_tc1230_name_in_rules_survives_a_policy_override(renderer):
     config, rules = renderer.render({"TOUCH_MIN_TAP_MS": "55"})
     assert config["name"] == "ELAN Touchscreen"
     assert 'ATTRS{name}=="ELAN Touchscreen"' in rules
+
+
+# --- single path (TOUCH_FILTER_SINGLE_PATH), 2026-10-16 ------------------------
+#
+# The daemon refuses a config key it does not know, so the knob must render
+# NOTHING while false: an image with the knob off has to keep working with an
+# app that predates it.
+
+
+def test_single_path_off_renders_exactly_as_before(renderer):
+    for mode in ("off", "shadow", "filter", "adaptive"):
+        env = {**example_env(), "TOUCH_FILTER_MODE": mode}
+        assert env["TOUCH_FILTER_SINGLE_PATH"] == "false"
+        config, _ = renderer.render(env)
+        assert "single_path" not in config
+
+
+def test_single_path_on_reaches_the_daemon(app, renderer, tmp_path):
+    _, load_config = app
+    if "single_path" not in json.dumps(load_config.__code__.co_consts, default=str):
+        pytest.skip("the application checkout predates single_path; set TOUCH_APP_REPO")
+    config, _ = renderer.render({**example_env(), "TOUCH_FILTER_MODE": "adaptive",
+                                 "TOUCH_FILTER_SINGLE_PATH": "true"})
+    assert config["single_path"] is True
+    path = tmp_path / "touch-filter.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    assert load_config(path)["single_path"] is True
+
+
+@pytest.mark.parametrize("env", [
+    {"TOUCH_FILTER_MODE": "adaptive", "TOUCH_FILTER_SINGLE_PATH": "yes"},
+    {"TOUCH_FILTER_MODE": "adaptive", "TOUCH_FILTER_SINGLE_PATH": "1"},
+    {"TOUCH_FILTER_MODE": "filter", "TOUCH_FILTER_SINGLE_PATH": "true"},
+    {"TOUCH_FILTER_MODE": "off", "TOUCH_FILTER_SINGLE_PATH": "true"},
+])
+def test_single_path_is_refused_when_invalid_or_outside_adaptive(renderer, env):
+    with pytest.raises(ValueError):
+        renderer.render(env)

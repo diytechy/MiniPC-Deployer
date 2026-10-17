@@ -357,3 +357,208 @@ def test_guard_reports_a_command_it_cannot_run():
     guard_module = load_guard()
     missing = str(Path(tempfile.gettempdir()) / "no-such-alsaloop-xyzzy")
     assert guard_module.main(["--", missing]) == 1
+
+
+# --- respawn mode: the guard's own restart schedule (SR-082, 2026-10-16) ----
+#
+# Measured on the panel 2026-10-16: systemd's restart counter is never reset by
+# a healthy run, so wall-spdif-in's RestartSteps ramp climbed during one bad
+# patch and then charged every later glitch its 120 s ceiling (a crash after
+# seventeen clean minutes: 104 s of silence). These pin the schedule that
+# replaces it and the unit's use of it.
+
+SPDIF_UNIT = "wall-spdif-in.service"
+
+
+def _exec_start_argv(unit):
+    """The unit's ExecStart as argv, continuation lines joined."""
+    import shlex
+    text = read(unit)
+    joined = re.sub(r"\\\n[ \t]*", " ", text)
+    line = [ln for ln in joined.splitlines() if ln.startswith("ExecStart=")]
+    assert len(line) == 1, unit
+    return shlex.split(line[0][len("ExecStart="):])
+
+
+def test_backoff_ramps_on_fast_failures_and_holds_its_last_step_sr082():
+    guard = load_guard()
+    backoff = guard.Backoff((1, 2, 4), healthy_after=20)
+    assert [backoff.next_delay(0.5) for _ in range(6)] == [1, 2, 4, 4, 4, 4]
+
+
+def test_backoff_resets_after_a_healthy_run_however_high_it_climbed_sr082():
+    """The defect itself: after a bad patch, a clean run must buy back delays[0]."""
+    guard = load_guard()
+    backoff = guard.Backoff((1, 2, 4, 8, 16, 30), healthy_after=20)
+    for _ in range(10):
+        backoff.next_delay(0.5)
+    assert backoff.next_delay(0.5) == 30
+    # Seventeen clean minutes, then the crash: back in a second, not at the cap.
+    assert backoff.next_delay(17 * 60) == 1
+    assert backoff.next_delay(0.5) == 2
+
+
+def test_backoff_refuses_a_schedule_it_cannot_follow_sr082():
+    guard = load_guard()
+    for delays, healthy in (((), 20), ((1, -1), 20), ((1,), 0)):
+        with pytest.raises(ValueError):
+            guard.Backoff(delays, healthy)
+
+
+class _FakeStop:
+    """A stop event whose wait() records the delay and advances a fake clock."""
+
+    def __init__(self, clock, stop_after_waits):
+        self.clock = clock
+        self.waits = []
+        self._left = stop_after_waits
+        self._set = False
+
+    def is_set(self):
+        return self._set
+
+    def set(self):
+        self._set = True
+
+    def wait(self, delay):
+        self.waits.append(delay)
+        self.clock[0] += delay
+        self._left -= 1
+        if self._left <= 0:
+            self._set = True
+        return self._set
+
+
+def test_supervise_follows_the_schedule_between_child_runs_sr082():
+    guard = load_guard()
+    clock = [0.0]
+    # Two fast failures, one long healthy run that then crashes, one fast failure.
+    durations = iter([0.5, 0.5, 600.0, 0.5])
+
+    def run_once():
+        clock[0] += next(durations)
+        return 1
+
+    stop = _FakeStop(clock, stop_after_waits=4)
+    code = guard.supervise(run_once, guard.Backoff((1, 2, 4, 8, 16, 30), 20),
+                           stop, monotonic=lambda: clock[0])
+    assert code == 0
+    assert stop.waits == [1, 2, 1, 2]
+
+
+def test_supervise_does_not_relaunch_after_a_stop_during_a_run_sr082():
+    guard = load_guard()
+    clock = [0.0]
+    stop = _FakeStop(clock, stop_after_waits=99)
+    runs = []
+
+    def run_once():
+        runs.append(1)
+        stop.set()          # systemctl stop arrived while the child ran
+        return 143
+
+    assert guard.supervise(run_once, guard.Backoff(), stop,
+                           monotonic=lambda: clock[0]) == 0
+    assert runs == [1] and stop.waits == []
+
+
+def test_a_stop_during_a_long_backoff_ends_supervise_at_once_sr082():
+    """`systemctl stop` must not wait out a 30 s step (a plain sleep would)."""
+    import threading
+    import time
+    guard = load_guard()
+    stop = threading.Event()
+    timer = threading.Timer(0.2, stop.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        assert guard.supervise(lambda: 1, guard.Backoff((30,), 20), stop) == 0
+    finally:
+        timer.cancel()
+    assert time.monotonic() - started < 5
+
+
+def test_respawn_relaunches_a_real_child_until_stopped_sr082(tmp_path):
+    """Real processes, real Popen: each exit is followed by a relaunch."""
+    import threading
+    guard = load_guard()
+    marker = tmp_path / "runs"
+    child = ("import sys\n"
+             "open(sys.argv[1], 'a').write('x')\n"
+             "sys.stderr.write('Poll FD initialization failed.\\n')\n"
+             "sys.exit(1)\n")
+    command = [sys.executable, "-c", child, str(marker)]
+    stop = threading.Event()
+    holder = [None]
+    codes = []
+
+    def run_once():
+        code = guard.run_child(command, guard.ErrorWindow(), holder, stop)
+        codes.append(code)
+        if len(codes) == 3:
+            stop.set()
+        return code
+
+    assert guard.supervise(run_once, guard.Backoff((0.01,), 100), stop) == 0
+    assert codes == [1, 1, 1]
+    assert marker.read_text() == "xxx"
+    assert holder == [None]
+
+
+def test_respawn_mode_reports_a_command_it_cannot_run_sr082():
+    """An unexecutable child is a broken install, not a stream fault: exit to systemd."""
+    guard_module = load_guard()
+    missing = str(Path(tempfile.gettempdir()) / "no-such-alsaloop-xyzzy")
+    assert guard_module.main(["--respawn", "--respawn-delays", "0.01",
+                              "--", missing]) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX SIGTERM delivery")
+def test_sigterm_ends_the_respawn_loop_and_its_child_sr082(tmp_path):
+    import signal
+    import time
+    pidfile = tmp_path / "child.pid"
+    child = ("import os,sys,time\n"
+             "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+             "time.sleep(60)\n")
+    proc = subprocess.Popen([sys.executable, str(GUARD), "--respawn",
+                             "--respawn-delays", "0.01", "--",
+                             sys.executable, "-c", child, str(pidfile)])
+    deadline = time.time() + 10
+    while not pidfile.exists() or not pidfile.read_text():
+        assert time.time() < deadline, "child never started"
+        time.sleep(0.05)
+    child_pid = int(pidfile.read_text())
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=10) == 0
+    with pytest.raises(OSError):
+        os.kill(child_pid, 0)
+
+
+def test_the_spdif_unit_argv_is_one_the_guard_accepts_sr082():
+    """Parse the unit's real ExecStart with the guard's real parser."""
+    guard = load_guard()
+    argv = _exec_start_argv(SPDIF_UNIT)
+    assert argv[0] == "/usr/local/lib/wall-panel/wall-alsaloop-guard.py"
+    args = guard.build_parser().parse_args(argv[1:])
+    assert args.respawn is True
+    backoff = guard.Backoff(args.respawn_delays, args.healthy_after)
+    # The requirement's policy, not the constants: a glitch after a healthy run
+    # is relaunched within 2 s, and a source that stays absent is retried at
+    # least every 30 s, so a waking desktop is heard within half a minute.
+    assert backoff.delays[0] <= 2
+    assert max(backoff.delays) <= 30
+    assert list(backoff.delays) == sorted(backoff.delays)
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    assert command[0] == "/usr/bin/alsaloop"
+    assert "--cdevice" in command and "spdif_in" in command
+
+
+def test_only_the_external_source_leg_respawns_inside_the_guard_sr082():
+    """Scope: panel-internal legs keep exiting to systemd (SR-037's boundary)."""
+    users = sorted(p.name for p in WALL.glob("*.service")
+                   if "wall-alsaloop-guard.py" in p.read_text(encoding="utf-8"))
+    assert SPDIF_UNIT in users and len(users) > 1
+    for name in users:
+        if name != SPDIF_UNIT:
+            assert "--respawn" not in _exec_start_argv(name), name

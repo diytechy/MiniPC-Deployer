@@ -47,8 +47,20 @@ ExecStartPre=/usr/bin/amixer -c ${WALL_AUDIO_ADAPTER_CARD} sset 'PCM Capture Sou
 # the +4.4 dB of unsheddable analog gain that forced the line input to 0% does
 # not apply. The capture volume is left where alsactl has it; if the desktop
 # ever sends something hotter than 0 dBFS it is the desktop that is wrong.
+#
+# --respawn: THE GUARD RELAUNCHES ALSALOOP ITSELF (2026-10-16). Measured that
+# evening: systemd's restart counter is never reset by a healthy run, so the
+# RestartSteps ramp below climbed during one bad patch and then charged every
+# later glitch its 120 s ceiling -- a crash after seventeen clean minutes sat
+# silent for 104 s. The guard's own schedule resets after --healthy-after
+# seconds of running: a glitch after a clean stretch is back in about a second,
+# and only relaunches that keep failing fast (desktop asleep, input still bad)
+# walk up to the 30 s step. systemd's ramp stays as the backstop for a guard
+# that cannot exec alsaloop at all, and SR-037's start-limit arithmetic still
+# holds because the guard's internal relaunches are not unit starts.
 ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
-    --max-errors 20 --window 10 -- \
+    --max-errors 20 --window 10 \
+    --respawn --respawn-delays 1,2,4,8,16,30 --healthy-after 20 -- \
     /usr/bin/alsaloop \
     --cdevice spdif_in \
     --pdevice bus \
@@ -58,7 +70,8 @@ ExecStart=/usr/local/lib/wall-panel/wall-alsaloop-guard.py \
 # periods (21.3 ms), so a 30 ms target left under one and a half periods of
 # slack: under panel load the bus side underran in floods, alsaloop's recovery
 # died with `Poll FD initialization failed`, and the backoff below turned each
-# death into up to two minutes of silence -- 12 deaths in one morning while the
+# death into up to two minutes of silence (now the guard's job; see --respawn
+# above) -- 12 deaths in one morning while the
 # S/PDIF carrier itself never stalled. At 66 ms (about three periods) the same
 # load produced no underruns at all.
 Restart=always

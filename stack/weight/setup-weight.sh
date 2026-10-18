@@ -279,6 +279,9 @@ if [ "$MODE" = "--retry" ]; then
            exit 4 ;;
         75) say "weight setup retry: another setup run holds the lock - nothing changed, retry timer untouched."
            exit 4 ;;
+        76) printf '%s\n' "$attempt_out"
+           say "weight setup retry: could not take the setup lock (error above) - nothing changed, retry timer untouched."
+           exit 76 ;;
         *) printf '%s\n' "$attempt_out"
            say "weight setup retry: exit $rc is a refusal or failure, not a wait - retry timer disabled."
            say "  The reason is in the lines above; fix it and re-run firstboot or:"
@@ -310,7 +313,8 @@ LOCK_FILE="${WEIGHT_LOCK_FILE:-/run/homehub-weight-setup.lock}"
 # (a test enforces the margin), or systemd would kill a waiting retry and report a
 # timeout that is really "somebody else is mid-run".
 LOCK_WAIT="${WEIGHT_LOCK_WAIT:-120}"
-LOCK_BUSY_RC=75     # EX_TEMPFAIL: never reached the decision; the timer is untouched.
+LOCK_BUSY_RC=75     # EX_TEMPFAIL: contention only. Never reached the decision; timer untouched.
+LOCK_ERR_RC=76      # the lock could not be opened/taken for a reason that is NOT contention.
 
 # ROOT-WRITTEN STATE LIVES IN ITS OWN ROOT-OWNED DIRECTORY, NOT IN
 # /var/lib/homehub-weight: that one is the feeder account's StateDirectory, and an
@@ -322,24 +326,39 @@ WAIT_FILE="${WEIGHT_WAIT_STATE_FILE:-$STATE_DIR/setup-wait}"
 WAIT_WARN_AFTER="${WEIGHT_WAIT_WARN_AFTER:-12}"      # consecutive not-yet runs (12 x 15 min = 3 h)
 
 take_lock() {
-    exec 9>>"$LOCK_FILE" || { say "cannot open $LOCK_FILE"; exit "$LOCK_BUSY_RC"; }
-    if ! "$FLOCK" -w "$LOCK_WAIT" 9; then
-        say "another weight setup run held $LOCK_FILE for ${LOCK_WAIT}s; this run did not start,"
+    local rc=0
+    if ! exec 9>>"$LOCK_FILE" 2>/dev/null; then
+        say "ERROR: cannot open the lock file $LOCK_FILE; this run did not start,"
         say "  made no changes and did NOT touch the retry timer."
-        exit "$LOCK_BUSY_RC"
+        exit "$LOCK_ERR_RC"
     fi
+    # -E: ONLY a timeout on a held lock exits LOCK_BUSY_RC; any other flock failure
+    # keeps its own (non-75) status and is reported as an error, not as contention.
+    "$FLOCK" -E "$LOCK_BUSY_RC" -w "$LOCK_WAIT" 9 || rc=$?
+    case "$rc" in
+        0) ;;
+        "$LOCK_BUSY_RC")
+            say "another weight setup run held $LOCK_FILE for ${LOCK_WAIT}s; this run did not start,"
+            say "  made no changes and did NOT touch the retry timer."
+            exit "$LOCK_BUSY_RC" ;;
+        *)
+            say "ERROR: flock on $LOCK_FILE failed (exit $rc), which is not contention; this run did"
+            say "  not start, made no changes and did NOT touch the retry timer."
+            exit "$LOCK_ERR_RC" ;;
+    esac
 }
 
 # Writes the counter without ever following a symlink at its path: a temp file in
 # the same root-owned directory, renamed over the target (rename replaces a
-# symlink, it does not write through it).
+# symlink, it does not write through it; -T so a symlink to a DIRECTORY is replaced
+# too instead of receiving the temp file inside it).
 write_wait_state() {
     local dir tmp
     dir="$(dirname "$WAIT_FILE")"
     [ ! -L "$dir" ] || return 0
     mkdir -p "$dir" 2>/dev/null && chmod 0700 "$dir" 2>/dev/null || return 0
     tmp="$(mktemp "$dir/.setup-wait.XXXXXX" 2>/dev/null)" || return 0
-    printf '%s %s\n' "$1" "$2" > "$tmp" && mv -f "$tmp" "$WAIT_FILE" || rm -f "$tmp"
+    printf '%s %s\n' "$1" "$2" > "$tmp" && mv -fT "$tmp" "$WAIT_FILE" || rm -f "$tmp"
 }
 
 # Called with the run's exit status, under the lock: complete or broken disarms

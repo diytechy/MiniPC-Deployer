@@ -2538,6 +2538,10 @@ if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
             log "  weight setup was busy (another setup run held its lock); this run changed"
             log "    nothing. The retry timer, if armed, keeps going; otherwise re-run:"
             log "      sudo bash $STACK_DIR/weight/setup-weight.sh"
+        elif [ "$_weight_rc" = 76 ]; then
+            log "  weight setup could not take its lock (an error, not contention - see above);"
+            log "    it changed nothing and left the retry timer as it was. Re-run once fixed:"
+            log "      sudo bash $STACK_DIR/weight/setup-weight.sh"
         elif [ "$_weight_rc" = 0 ]; then
             log "  weight feeder installed; timer runs every 15 minutes"
             log "  STILL OWED BY A HUMAN ON THIS BOX - the parser is written and"

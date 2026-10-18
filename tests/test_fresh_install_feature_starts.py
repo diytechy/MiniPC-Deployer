@@ -187,11 +187,12 @@ STUB_FLOCK = r'''#!/usr/bin/env bash
 # TEST STUB for `flock -w SECS FD` (no util-linux flock on a Windows dev PC): mutual
 # exclusion by mkdir keyed on the lock file, owned by the CALLER (our parent) and
 # free once that process is gone - the lifetime a real fd lock has.
-lock="$WEIGHT_LOCK_FILE.stub.d"; end=$((SECONDS + ${2%.*}))
+# args: -E CODE -w SECS FD
+lock="$WEIGHT_LOCK_FILE.stub.d"; E="$2"; end=$((SECONDS + ${4%.*}))
 while ! mkdir "$lock" 2>/dev/null; do
   o="$(cat "$lock/pid" 2>/dev/null)"
   if [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null; then rm -rf "$lock"; continue; fi
-  [ "$SECONDS" -ge "$end" ] && exit 1
+  [ "$SECONDS" -ge "$end" ] && exit "$E"
   sleep 0.1
 done
 echo "$PPID" > "$lock/pid"
@@ -521,13 +522,49 @@ def test_tc1260_the_wait_counter_never_writes_through_a_symlink(box):
     assert not link.is_symlink() and link.read_text().split()[0] == "1"
 
 
+@needs_bash
+def test_tc1260_the_wait_counter_never_follows_a_directory_symlink(box):
+    state = box.tmp / "state"
+    state.mkdir()
+    target = box.tmp / "elsewhere"
+    target.mkdir()
+    link = state / "setup-wait"
+    try:
+        os.symlink(str(target), str(link), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create symlinks here")
+    box.put("chores.md", OTHER)
+    p = box.run(WEIGHT_WAIT_STATE_FILE=link.as_posix())
+    assert p.returncode == 4, p.stdout
+    assert list(target.iterdir()) == [], "the temp file was moved INTO the linked directory"
+    assert not link.is_symlink() and link.is_file()
+
+
+@needs_bash
+def test_tc1260_lock_errors_are_errors_not_contention(box):
+    box.put("tracker.md", HEALTH)
+    # cannot open the lock file at all
+    bad = (box.tmp / "no-such-dir" / "lock").as_posix()
+    p = box.run(WEIGHT_LOCK_FILE=bad)
+    assert p.returncode == 76 and "cannot open the lock file" in p.stdout, p.stdout
+    assert "did NOT touch the retry timer" in p.stdout and box.systemctl() == []
+    r = box.run("--retry", WEIGHT_LOCK_FILE=bad)
+    assert r.returncode == 76, r.stdout
+    assert "could not take the setup lock" in r.stdout and "holds the lock" not in r.stdout
+    assert "disabled" not in r.stdout.replace("untouched", "") and box.systemctl() == []
+    # flock itself fails for a reason that is not a timeout
+    q = box.run(WEIGHT_FLOCK="false")
+    assert q.returncode == 76 and "not contention" in q.stdout, q.stdout
+    assert box.systemctl() == [] and not box.units.exists()
+
+
 def test_tc1260_root_state_is_outside_the_feeders_state_directory():
     setup = SETUP.read_text(encoding="utf-8")
     m = re.search(r'STATE_DIR="\$\{WEIGHT_SETUP_STATE_DIR:-([^}]*)\}"', setup)
     assert m and m.group(1) == "/var/lib/homehub-weight-setup"
     assert not m.group(1).startswith("/var/lib/homehub-weight/")
     assert 'WAIT_FILE="${WEIGHT_WAIT_STATE_FILE:-$STATE_DIR/setup-wait}"' in setup
-    assert 'mv -f "$tmp" "$WAIT_FILE"' in setup           # rename, never write-through
+    assert 'mv -fT "$tmp" "$WAIT_FILE"' in setup           # rename, never write-through
 
 
 def test_tc1260_the_real_flock_invocation_and_its_wait_margin():
@@ -535,7 +572,8 @@ def test_tc1260_the_real_flock_invocation_and_its_wait_margin():
     assert 'FLOCK="${WEIGHT_FLOCK:-flock}"' in setup
     assert 'LOCK_FILE="${WEIGHT_LOCK_FILE:-/run/homehub-weight-setup.lock}"' in setup
     assert 'exec 9>>"$LOCK_FILE"' in setup
-    assert '"$FLOCK" -w "$LOCK_WAIT" 9' in setup
+    assert '"$FLOCK" -E "$LOCK_BUSY_RC" -w "$LOCK_WAIT" 9' in setup
+    assert "LOCK_BUSY_RC=75" in setup and "LOCK_ERR_RC=76" in setup
     # never unlinked, and no pid-file recovery machinery left behind
     assert not re.search(r'rm\s[^\n]*LOCK_FILE', setup)
     assert "kill -0" not in setup and "LOCK_DIR" not in setup
@@ -565,7 +603,7 @@ def _weight_stub(rc):
 
 @needs_bash
 @pytest.mark.parametrize("rc,word", [(4, "INCOMPLETE"), (0, "weight feeder installed;"),
-                                     (2, "refused or failed"), (75, "was busy")])
+                                     (2, "refused or failed"), (75, "was busy"), (76, "could not take its lock")])
 def test_tc1261_firstboot_reports_but_never_decides_the_retry_timer(tmp_path, rc, word):
     """setup-weight.sh settles the timer under its lock; firstboot touching it
     would reopen the race."""

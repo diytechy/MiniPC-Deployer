@@ -270,6 +270,7 @@ class _Rig:
         self._stub("ss", 'echo "ss $*" >>"$CALLS"\n'
                          '[ -e "$RIG/ss.fail" ] && exit 1\n'
                          'n=$(cat "$RIG/ss.n" 2>/dev/null || echo 0); echo $((n+1)) >"$RIG/ss.n"\n'
+                         'if [ -e "$RIG/ss.call$n" ] && [ ! -e "$RIG/recreated" ]; then cat "$RIG/ss.call$n"; exit 0; fi\n'
                          'if [ -e "$RIG/ss.flap" ] && [ -e "$RIG/recreated" ] && [ "$n" -ge "$(cat "$RIG/ss.flap")" ]; then cat "$RIG/ss.dead"; exit 0; fi\n'
                          'cat "$RIG/ss.now"\n')
         # systemctl: `owner.flip` = N means the owner reads active for N queries, then inactive.
@@ -284,7 +285,7 @@ class _Rig:
         self._stub("docker", 'echo "docker $*" >>"$CALLS"\n'
                              'case "$*" in *force-recreate*) cp "$RIG/ss.after" "$RIG/ss.now"; echo 0 >"$RIG/ss.n"; : >"$RIG/recreated";; esac\nexit 0\n')
         self._stub("curl", 'echo "curl $*" | tr "\\n" " " >>"$CALLS"; echo >>"$CALLS"\n[ -e "$RIG/curl.fail" ] && exit 22\nexit 0\n')
-        self._stub("flock", 'echo "flock $*" >>"$CALLS"\n[ -e "$RIG/flock.fail" ] && exit 1\nexit 0\n')
+        self._stub("flock", 'echo "flock $*" >>"$CALLS"\n[ -e "$RIG/flock.fail8" ] && [ "${@: -1}" = 8 ] && exit 1\nexit 0\n')
         self._stub("iptables", 'echo "iptables $*" >>"$CALLS"\ncat "$RIG/ipt4"\n')
         self._stub("ip6tables", 'echo "ip6tables $*" >>"$CALLS"\ncat "$RIG/ipt6"\n')
 
@@ -497,9 +498,12 @@ def test_check_does_not_recreate_when_the_owner_is_stopped_during_the_check_sr04
 @needs_bash
 def test_check_does_nothing_when_it_cannot_take_the_owner_lock_sr045(rig):
     _w(rig.ss_now, SS_NO_HBBS)
-    _w(rig.d / "flock.fail", "")
+    _w(rig.d / "flock.fail8", "")  # only the owner-lock (fd 8) acquisition fails
     r, calls = rig.run()
-    assert not _has(calls, "docker")
+    assert _has(calls, "flock -n 9"), "the run lock must have been taken first"
+    assert [c for c in calls if c.startswith("flock -w") and c.endswith(" 8")], "the owner lock was never attempted"
+    assert not _has(calls, "docker") and not _has(calls, "iptables")
+    assert r.returncode == 0
 
 
 @needs_bash
@@ -621,3 +625,103 @@ def test_owner_unit_and_checker_share_one_lock_file_sr045():
     for verb in ("ExecStart", "ExecStop"):
         line = [l for l in owner.splitlines() if l.startswith(verb + "=")]
         assert len(line) == 1 and line[0].startswith(verb + "=/usr/bin/flock " + lock + " /usr/bin/docker compose"), line
+
+
+def _no_lines(text, *needles):
+    return "\n".join(l for l in text.splitlines() if not all(n in l for n in needles)) + "\n"
+
+
+@needs_bash
+def test_check_refuses_a_fence_that_does_not_cover_the_relay_port_sr045(rig):
+    """RUSTDESK_TCP_PORTS can be narrowed: a block over 21115,21116 leaves hbbr's
+    tcp 21117 unfenced even though every rule is present and ordered."""
+    narrow = FENCE_V4.replace("21115,21116,21117,21118,21119", "21115,21116")
+    _fence_down_case(rig, narrow, FENCE_V6)
+
+
+@needs_bash
+def test_check_refuses_a_fence_with_the_wrong_udp_port_sr045(rig):
+    _fence_down_case(rig, FENCE_V4.replace("--dports 21116 ", "--dports 21117 "), FENCE_V6)
+
+
+@needs_bash
+def test_check_refuses_a_source_restricted_reject_sr045(rig):
+    """A REJECT for one source is not the catch-all."""
+    restricted = FENCE_V6.replace("-A INPUT -p tcp -m multiport", "-A INPUT -s 2001:db8::/32 -p tcp -m multiport")
+    assert restricted != FENCE_V6
+    _fence_down_case(rig, FENCE_V4, restricted)
+
+
+@needs_bash
+def test_check_refuses_an_interface_restricted_reject_sr045(rig):
+    iface = FENCE_V4.replace("-A INPUT -p udp -m multiport", "-A INPUT -i eth0 -p udp -m multiport")
+    assert iface != FENCE_V4
+    _fence_down_case(rig, iface, FENCE_V6)
+
+
+@needs_bash
+def test_check_accepts_a_port_range_and_both_marker_spellings_sr045(rig):
+    """`iptables -S` prints the comment bare or quoted, and a range as a:b. A
+    legitimate listing must not be refused or recovery never happens."""
+    quoted = FENCE_V4.replace("--comment homehub-rustdesk-isolation", '--comment "homehub-rustdesk-isolation"')
+    ranged = FENCE_V6.replace("21115,21116,21117,21118,21119", "21115:21119")
+    assert quoted != FENCE_V4 and ranged != FENCE_V6
+    _w(rig.ss_now, SS_NO_HBBS)
+    _w(rig.d / "ipt4", quoted)
+    _w(rig.d / "ipt6", ranged)
+    r, calls = rig.run()
+    assert r.returncode == 0, r.stdout
+    assert len(_has(calls, "docker")) == 1
+
+
+@needs_bash
+def test_check_accepts_a_fully_quoted_listing_in_both_families_sr045(rig):
+    q = lambda t: t.replace("--comment homehub-rustdesk-isolation", '--comment "homehub-rustdesk-isolation"')
+    _w(rig.ss_now, SS_NO_HBBS)
+    _w(rig.d / "ipt4", q(FENCE_V4))
+    _w(rig.d / "ipt6", q(FENCE_V6))
+    r, calls = rig.run()
+    assert r.returncode == 0 and len(_has(calls, "docker")) == 1
+
+
+@needs_bash
+def test_check_recreates_only_what_is_missing_under_the_lock_sr045(rig):
+    """hbbr came back between the first listing and the one taken under the
+    lock: only hbbs is recreated."""
+    _w(rig.ss_now, "")
+    _w(rig.d / "ss.call1", SS_ALL.replace("tcp LISTEN 0 1024 0.0.0.0:21115 0.0.0.0:*\n", "")
+                                  .replace("tcp LISTEN 0 1024 0.0.0.0:21116 0.0.0.0:*\n", "")
+                                  .replace("udp UNCONN 0 0 0.0.0.0:21116 0.0.0.0:*\n", ""))
+    r, calls = rig.run()
+    docker = _has(calls, "docker")
+    assert len(docker) == 1 and docker[0].split()[-1] == "hbbs", docker
+
+
+@needs_bash
+def test_check_releases_the_lock_when_the_owner_starts_stopping_during_settle_sr045(rig):
+    """An operator stop queued behind our lock must not wait out the settle
+    window: the checker sees the owner stopping and lets go, no alert."""
+    _w(rig.ss_now, SS_NO_HBBS)
+    _w(rig.d / "owner.flip", "2")  # main, recover: active; first settle iteration: stopping
+    r, calls = rig.run()
+    assert r.returncode == 0, r.stdout
+    assert "aborting recovery" in r.stdout
+    assert len(_has(calls, "docker")) == 1 and not _has(calls, "curl")
+
+
+def test_owner_unit_timeouts_cover_the_checkers_lock_hold_sr045():
+    """The owner's ExecStop waits on the lock the checker holds. Default
+    TimeoutStopSec (90 s) would kill that wait and leave the containers up."""
+    script = CHECK.read_text(encoding="utf-8")
+    budget = int(re.search(r"^LOCK_HOLD_BUDGET_SEC=(\d+)$", script, re.M).group(1))
+    recreate = int(re.search(r'RECREATE_TIMEOUT="\$\(_int "\$\{RUSTDESK_CHECK_RECREATE_TIMEOUT:-\}" (\d+)\)"', script).group(1))
+    wait = int(re.search(r'WAIT_SEC="\$\(_int "\$\{RUSTDESK_CHECK_WAIT_SEC:-\}" (\d+)\)"', script).group(1))
+    settle = int(re.search(r'SETTLE_SEC="\$\(_int "\$\{RUSTDESK_CHECK_SETTLE_SEC:-\}" (\d+)\)"', script).group(1))
+    assert budget >= recreate + wait + settle + 60 + 30, "budget must cover recreate + appear + settle + checks"
+    owner = _live(OWNER_UNIT.read_text(encoding="utf-8"))
+    stop = int(re.search(r"^TimeoutStopSec=(\d+)$", owner, re.M).group(1))
+    start = int(re.search(r"^TimeoutStartSec=(\d+)$", owner, re.M).group(1))
+    assert stop >= budget + 90 and start >= budget + 90, (stop, start, budget)
+    chk = int(re.search(r"^TimeoutStartSec=(\d+)$", _live(CHECK_UNIT.read_text(encoding="utf-8")), re.M).group(1))
+    lock_wait = int(re.search(r'LOCK_WAIT_SEC="\$\(_int "\$\{RUSTDESK_CHECK_LOCK_WAIT_SEC:-\}" (\d+)\)"', script).group(1))
+    assert chk >= lock_wait + budget, "the checker's own timeout must outlast its lock wait + hold"

@@ -66,6 +66,15 @@ OWNER_LOCK="${RUSTDESK_CHECK_OWNER_LOCK:-/run/homehub-rustdesk.lock}"
 OWNER_UNIT="homehub-rustdesk.service"
 FENCE_UNIT="homehub-rustdesk-isolation.service"
 FENCE_MARK="homehub-rustdesk-isolation"
+FENCE_TCP_PORTS="21115,21116,21117"
+FENCE_UDP_PORTS="21116"
+# The most this script can hold the owner lock, in seconds: owner and fence checks
+# (~60) + recreate (RECREATE_TIMEOUT 90) + appear and settle windows (30 + 45)
+# + a snapshot of overshoot and the alert, with headroom. homehub-rustdesk.service
+# sets TimeoutStartSec/TimeoutStopSec to this plus a bounded compose stop; a test
+# asserts the relationship. In practice recovery lets go far sooner: it aborts as
+# soon as the owner is seen stopping.
+LOCK_HOLD_BUDGET_SEC=270
 
 log() { printf '%s [rustdesk-check] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 _int() { case "$1" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
@@ -145,13 +154,38 @@ check_listeners() {
 # listing is "not verified". Sets FENCE_WHY.
 FENCE_WHY=""
 fence_family_ok() {
-    local bin="$1" proto rules; shift
+    local bin="$1" proto ports rules; shift
     rules="$(timeout 10 "$bin" -S INPUT 2>/dev/null)" || { FENCE_WHY="$bin -S INPUT failed"; return 1; }
     for proto in tcp udp; do
-        if ! printf '%s\n' "$rules" | awk -v mark="$FENCE_MARK" -v p="$proto" -v cidrs="$*" '
-              BEGIN { n = split(cidrs, want, " ") }
-              index($0, "--comment " mark) && index($0, "-p " p " ") {
+        # The ports the checker is about to (re)start listeners on. A marked
+        # rule that does not cover ALL of them leaves some listener unfenced.
+        if [ "$proto" = tcp ]; then ports="$FENCE_TCP_PORTS"; else ports="$FENCE_UDP_PORTS"; fi
+        # Rules are matched on their SPEC, not just their marker: the marker may
+        # print quoted or bare; the dports must cover the ports above; and the
+        # closing REJECT must carry no -s/-d/-i/-o/! restriction, else it is not
+        # the catch-all and a source-restricted one would pass for it.
+        if ! printf '%s\n' "$rules" | awk -v mark="$FENCE_MARK" -v p="$proto" -v cidrs="$*" -v ports="$ports" '
+              function covers(spec,   k, m, parts, r, lohi, hit) {
+                  m = split(spec, parts, ",")
+                  for (r = 1; r <= np; r++) {
+                      hit = 0
+                      for (k = 1; k <= m; k++) {
+                          if (index(parts[k], ":")) {
+                              split(parts[k], lohi, ":")
+                              if (need[r] + 0 >= lohi[1] + 0 && need[r] + 0 <= lohi[2] + 0) hit = 1
+                          } else if (parts[k] + 0 == need[r] + 0) hit = 1
+                      }
+                      if (!hit) return 0
+                  }
+                  return 1
+              }
+              BEGIN { n = split(cidrs, want, " "); np = split(ports, need, ","); re = "--comment \"?" mark "\"?( |$)" }
+              $0 ~ re && index($0, "-p " p " ") {
+                  spec = ""
+                  for (i = 1; i < NF; i++) if ($i == "--dports" || $i == "--dport") spec = $(i + 1)
+                  if (spec == "" || !covers(spec)) next
                   if ($0 ~ /-j REJECT/) {
+                      if ($0 ~ / (-s|-d|-i|-o) / || $0 ~ / ! /) next
                       if (!done) { ok = lo; for (i = 1; i <= n; i++) if (!seen[i]) ok = 0; done = 1 }
                   } else if ($0 ~ /-j ACCEPT/ && !done) {
                       if (index($0, "-i lo ")) lo = 1
@@ -159,7 +193,7 @@ fence_family_ok() {
                   }
               }
               END { exit (done && ok) ? 0 : 1 }'; then
-            FENCE_WHY="$bin: $proto fence (lo ACCEPT, admitted ACCEPTs, REJECT) not in place"
+            FENCE_WHY="$bin: $proto fence (lo ACCEPT, admitted ACCEPTs, unrestricted REJECT, all of dports $ports) not in place"
             return 1
         fi
     done
@@ -183,11 +217,6 @@ attempts_reset() { rm -f "$ATTEMPTS_FILE" 2>/dev/null || true; }
 
 recover() {
     local s m services=() text now stable_since deadline t
-    text="${MISSING_LIST[*]}"
-    for m in "${MISSING_LIST[@]}"; do
-        s="${m%%:*}"
-        case " ${services[*]:-} " in *" $s "*) ;; *) services+=("$s") ;; esac
-    done
 
     # Everything below runs under the owner lock (taken by main).
     if ! timeout 20 systemctl is-active --quiet "$OWNER_UNIT"; then
@@ -197,6 +226,12 @@ recover() {
     if check_listeners; then log "listeners are back on their own (owner start in flight) - nothing to do"; return 0; fi
     if [ "$SS_FAILED" = 1 ]; then log "ss failed - taking no action"; return 1; fi
     text="${MISSING_LIST[*]}"
+    # Derived from the listing that is true NOW, under the lock - not the one
+    # taken before the lock was won.
+    for m in "${MISSING_LIST[@]}"; do
+        s="${m%%:*}"
+        case " ${services[*]:-} " in *" $s "*) ;; *) services+=("$s") ;; esac
+    done
 
     if ! fence_ok; then
         log "FENCE NOT VERIFIED ($FENCE_WHY) - refusing to start unfenced listeners"
@@ -226,6 +261,12 @@ $(attempts_count) recreates did not produce a stable recovery. Look at: docker l
     # Grace to appear (WAIT_SEC), then present on EVERY snapshot for SETTLE_SEC.
     t="$(date +%s)"; deadline=$(( t + WAIT_SEC + SETTLE_SEC )); stable_since=""
     while :; do
+        # An operator stop is queued behind our lock: let go at once rather than
+        # hold it (and make the stop time out) while the containers stay up.
+        if ! timeout 20 systemctl is-active --quiet "$OWNER_UNIT"; then
+            log "$OWNER_UNIT is stopping - aborting recovery and releasing the owner lock"
+            return 0
+        fi
         if check_listeners; then
             [ -n "$stable_since" ] || stable_since="$(date +%s)"
             if [ $(( $(date +%s) - stable_since )) -ge "$SETTLE_SEC" ]; then

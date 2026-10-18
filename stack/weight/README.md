@@ -562,10 +562,13 @@ it. The same exit **4** covers a definitions directory that does not exist yet
 installed, timer enabled, and the drop-in binding the one category file. Exit
 **4** = installed but the data is not there yet; exit **2** = a broken
 configuration, which waiting cannot fix. `homehub-weight-setup.timer` (15 min,
-armed by firstboot only when `WEIGHT_ENABLED=true` and setup exited 4) runs
-`setup-weight.sh --retry`: 0 disables the timer, 4 leaves it armed with one log
-line (`journalctl -u homehub-weight-setup`), anything else prints the reason,
-disables the timer and leaves the unit failed. Tests:
+armed by `setup-weight.sh` itself whenever a run ends 4) runs
+`setup-weight.sh --retry`. Every full run (firstboot's, the retry's, a hand run)
+holds one lock and settles the timer from its own result: 0 or a refusal
+disarms it, 4 arms it, so they cannot race. The retry logs one line per attempt
+(`journalctl -u homehub-weight-setup`); a refusal prints the reason and leaves
+the unit failed. After 12 consecutive waits a warning naming
+`WEIGHT_DEFINITIONS_DIR` is logged, at most once a day, never a cutoff. Tests:
 `tests/test_fresh_install_feature_starts.py`.
 
 **`EnvironmentFile=`, not `Environment=` — and that ordering was measured, not

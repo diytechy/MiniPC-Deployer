@@ -2516,30 +2516,25 @@ WEIGHT_ENABLED="$(_env_val WEIGHT_ENABLED | tr -d '"')"
 if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
     log "provisioning the weight feeder (activated by .env)…"
     if [ -f "$STACK_DIR/weight/setup-weight.sh" ]; then
-        # The retry units are installed whenever the feeder is enabled (static files, nothing
-        # runs until the timer is). WEIGHT_ENABLED!=true never reaches this block; the else
-        # below disables a retry timer left over from an earlier enabled configuration.
-        for _wu in homehub-weight-setup.service homehub-weight-setup.timer; do
-            install -m 0644 "$STACK_DIR/weight/$_wu" "/etc/systemd/system/$_wu" 2>/dev/null \
-                || log "  WARNING: could not install $_wu"
-        done
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        # setup-weight.sh installs the retry units itself and settles homehub-weight-setup.timer
+        # (0 or a refusal/failure disarms it, 4 arms it) under the lock it shares with the
+        # retry service. firstboot is run directly by deploy_stack.py, so After= orders nothing
+        # and the two CAN overlap: the timer decision must not be made out here. WEIGHT_ENABLED
+        # !=true never reaches this block; the else below disarms a timer left from an earlier
+        # enabled configuration.
         # The exit code is captured, not the pipeline's: setup-weight.sh exits 4 ("NOT YET -
         # the tracker's per-user definitions do not exist on a fresh install") and that must
-        # arm the retry rather than read as the failure it is not (and, under pipefail,
+        # leave the retry armed (setup did that) rather than read as the failure it is not (and, under pipefail,
         # must not abort firstboot).
         _weight_rc=0
         _weight_out="$(bash "$STACK_DIR/weight/setup-weight.sh" 2>&1)" || _weight_rc=$?
         printf '%s\n' "$_weight_out" | sed 's/^/  /'
         if [ "$_weight_rc" = 4 ]; then
-            systemctl enable --now homehub-weight-setup.timer >/dev/null 2>&1 \
-                || log "  WARNING: could not enable homehub-weight-setup.timer"
             log "  weight feeder installed but INCOMPLETE: the tracker's definitions (or the"
             log "    Health category file) are not on this box yet. homehub-weight-setup.timer"
             log "    re-runs setup-weight.sh every 15 minutes and disables itself when it is"
             log "    complete; no action needed. Progress: journalctl -u homehub-weight-setup"
         elif [ "$_weight_rc" = 0 ]; then
-            systemctl disable --now homehub-weight-setup.timer >/dev/null 2>&1 || true
             log "  weight feeder installed; timer runs every 15 minutes"
             log "  STILL OWED BY A HUMAN ON THIS BOX - the parser is written and"
             log "  tested, but a hub with no refresh token reads 'unavailable':"

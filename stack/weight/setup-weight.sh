@@ -24,8 +24,27 @@
 # Adds NO apt package: python3 stdlib only, and python3 is already in
 # packages.list. No apt export is owed.
 #
-# Usage: setup-weight.sh [--check-only | --emit-dropin DIR]
-# Exit 0 = converged (or disabled). 1 = failed. 2 = refused.
+# Usage: setup-weight.sh [--check-only | --emit-dropin DIR | --retry]
+# Exit 0 = converged COMPLETELY (or disabled). 1 = failed. 2 = refused.
+#      4 = NOT YET: everything that can be installed is installed, but the
+#          tracker's data this feature needs has not appeared on this box.
+#
+# "COMPLETE" IS ONE CHECKABLE CONDITION, AND EXIT 0 IS IT: the unit and timer
+# are installed and the timer is enabled, AND the drop-in carries the
+# BindReadOnlyPaths= line for the ONE definitions file that declares
+# WEIGHT_ITEM_CATEGORY (so that file existed when this run resolved it). The
+# two ways it can be incomplete both come from a fresh install, where the
+# tracker has not run yet and its per-user definitions do not exist: the
+# definitions DIRECTORY is absent, or it exists and the category file has not
+# synced into it. Both exit 4. Exit 2 is only ever a broken CONFIGURATION (a
+# blank knob, an ambiguous category, a forbidden account, a path that exists
+# and is not a directory) - something waiting will not fix, so nothing retries it.
+#
+# --retry is what homehub-weight-setup.service runs every 15 minutes: one more
+# full setup, reported in one log line. EVERY full run (firstboot's, a hand run,
+# the retry's) holds one lock for its whole life and ends by settling the retry
+# timer from its own result - 0 or a refusal/failure disarms it, 4 arms it - so
+# two overlapping runs cannot leave "data present, no bind, nothing retrying".
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -227,9 +246,161 @@ EOF
     chmod 0644 "$dir/10-account.conf"
 }
 
+RETRY_TIMER="homehub-weight-setup.timer"
+retry_timer_off() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "$RETRY_TIMER" >/dev/null 2>&1 || say "WARNING: could not disable $RETRY_TIMER"
+    fi
+}
+
 if [ "$WEIGHT_ENABLED" != "true" ] && [ "$MODE" != "--emit-dropin" ]; then
     say "WEIGHT_ENABLED is not true - the weight feeder is not installed."
+    if [ "$MODE" = "--retry" ]; then retry_timer_off; fi
     exit 0
+fi
+
+# ── --retry: one more full attempt, then report it ──────────────────────────
+# The attempt is a child run of this same script with no mode, so the retry
+# exercises exactly the code a hand run or firstboot does, not a lookalike. The
+# child owns the lock AND the decision about the retry timer (see below); this
+# wrapper only reports, so it must not touch the timer itself.
+if [ "$MODE" = "--retry" ]; then
+    # Quiet by design: the attempt's own chatter (the human-owed list is a dozen
+    # lines) is held back, so a healthy wait costs ONE journal line per attempt.
+    # A refusal or failure prints everything, because there it is the diagnosis.
+    rc=0
+    attempt_out="$(bash "${BASH_SOURCE[0]}" 2>&1)" || rc=$?
+    case "$rc" in
+        0) say "weight setup retry: COMPLETE - retry timer disabled."
+           exit 0 ;;
+        4) say "weight setup retry: not yet (tracker definitions or the category file are not present) - will try again."
+           # The once-a-day persistent-wait warning is the one line worth keeping.
+           printf '%s\n' "$attempt_out" | grep -A2 '^WARNING: still waiting' || true
+           exit 4 ;;
+        75) say "weight setup retry: another setup run holds the lock - nothing changed, retry timer untouched."
+           exit 4 ;;
+        76) printf '%s\n' "$attempt_out"
+           say "weight setup retry: could not take the setup lock (error above) - nothing changed, retry timer untouched."
+           exit 76 ;;
+        *) printf '%s\n' "$attempt_out"
+           say "weight setup retry: exit $rc is a refusal or failure, not a wait - retry timer disabled."
+           say "  The reason is in the lines above; fix it and re-run firstboot or:"
+           say "    sudo bash ${BASH_SOURCE[0]}"
+           exit "$rc" ;;
+    esac
+fi
+
+# ── ONE LOCK FOR THE WHOLE RUN, INCLUDING THE TIMER DECISION ─────────────────
+# firstboot (run directly by deploy_stack.py, so After=homehub-firstboot.service
+# orders nothing) and the retry timer can run this script at the same time. Each
+# run resolves the category file, writes the drop-in, THEN decides whether the
+# retry timer stays armed. Interleaved, a run holding an older "no Health file
+# yet" answer could overwrite a newer bind, or disarm the timer under a run that
+# had just armed it: definitions present, no bind, nothing retrying. So the lock
+# covers resolve + write + decide, and the decision is made HERE, by whichever
+# run holds the lock last, from that run's own result - never by the caller.
+#
+# flock(1) on a ROOT-OWNED lock file in /run (util-linux, always on the hub), fd 9
+# held until this process exits - through the setup AND the timer decision in
+# on_exit - and released by the kernel even if we are killed, so there is no stale
+# lock to recover and no recovery code to get wrong. The lock FILE IS NEVER
+# UNLINKED: removing it would let one run lock the old inode while another
+# creates and locks a new one. `>>` so opening it never truncates anything.
+# FLOCK is overridable ONLY so a test on a machine without flock can supply a stub.
+FLOCK="${WEIGHT_FLOCK:-flock}"
+LOCK_FILE="${WEIGHT_LOCK_FILE:-/run/homehub-weight-setup.lock}"
+# The wait MUST stay well under homehub-weight-setup.service's TimeoutStartSec=300
+# (a test enforces the margin), or systemd would kill a waiting retry and report a
+# timeout that is really "somebody else is mid-run".
+LOCK_WAIT="${WEIGHT_LOCK_WAIT:-120}"
+LOCK_BUSY_RC=75     # EX_TEMPFAIL: contention only. Never reached the decision; timer untouched.
+LOCK_ERR_RC=76      # the lock could not be opened/taken for a reason that is NOT contention.
+
+# ROOT-WRITTEN STATE LIVES IN ITS OWN ROOT-OWNED DIRECTORY, NOT IN
+# /var/lib/homehub-weight: that one is the feeder account's StateDirectory, and an
+# account that can replace `setup-wait` with a symlink would have root truncate
+# the symlink's target on the next "not yet". /var/lib (not /run) because the
+# once-a-day throttle should survive a reboot, or every boot would re-warn.
+STATE_DIR="${WEIGHT_SETUP_STATE_DIR:-/var/lib/homehub-weight-setup}"
+WAIT_FILE="${WEIGHT_WAIT_STATE_FILE:-$STATE_DIR/setup-wait}"
+WAIT_WARN_AFTER="${WEIGHT_WAIT_WARN_AFTER:-12}"      # consecutive not-yet runs (12 x 15 min = 3 h)
+
+take_lock() {
+    local rc=0
+    # The 2>/dev/null belongs to the GROUP only. On a bare `exec`, redirections persist for
+    # the rest of the shell, which would silence every later install/systemctl error.
+    if ! { exec 9>>"$LOCK_FILE"; } 2>/dev/null; then
+        say "ERROR: cannot open the lock file $LOCK_FILE; this run did not start,"
+        say "  made no changes and did NOT touch the retry timer."
+        exit "$LOCK_ERR_RC"
+    fi
+    # -E: ONLY a timeout on a held lock exits LOCK_BUSY_RC; any other flock failure
+    # keeps its own (non-75) status and is reported as an error, not as contention.
+    "$FLOCK" -E "$LOCK_BUSY_RC" -w "$LOCK_WAIT" 9 || rc=$?
+    case "$rc" in
+        0) ;;
+        "$LOCK_BUSY_RC")
+            say "another weight setup run held $LOCK_FILE for ${LOCK_WAIT}s; this run did not start,"
+            say "  made no changes and did NOT touch the retry timer."
+            exit "$LOCK_BUSY_RC" ;;
+        *)
+            say "ERROR: flock on $LOCK_FILE failed (exit $rc), which is not contention; this run did"
+            say "  not start, made no changes and did NOT touch the retry timer."
+            exit "$LOCK_ERR_RC" ;;
+    esac
+}
+
+# Writes the counter without ever following a symlink at its path: a temp file in
+# the same root-owned directory, renamed over the target (rename replaces a
+# symlink, it does not write through it; -T so a symlink to a DIRECTORY is replaced
+# too instead of receiving the temp file inside it).
+write_wait_state() {
+    local dir tmp
+    dir="$(dirname "$WAIT_FILE")"
+    [ ! -L "$dir" ] || return 0
+    mkdir -p "$dir" 2>/dev/null && chmod 0700 "$dir" 2>/dev/null || return 0
+    tmp="$(mktemp "$dir/.setup-wait.XXXXXX" 2>/dev/null)" || return 0
+    printf '%s %s\n' "$1" "$2" > "$tmp" && mv -fT "$tmp" "$WAIT_FILE" || rm -f "$tmp"
+}
+
+# Called with the run's exit status, under the lock: complete or broken disarms
+# the retry, "not yet" arms it. Also keeps the consecutive-wait count that
+# drives the once-a-day warning naming the configured path (a typo'd
+# WEIGHT_DEFINITIONS_DIR is otherwise a quiet, endless, bounded-only-by-interval wait).
+settle_retry_timer() {
+    local rc="$1" count=0 last=0 now
+    if [ "$rc" = 4 ]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl enable --now "$RETRY_TIMER" >/dev/null 2>&1 || say "WARNING: could not enable $RETRY_TIMER"
+        fi
+        if [ -f "$WAIT_FILE" ] && [ ! -L "$WAIT_FILE" ]; then read -r count last < "$WAIT_FILE" || true; fi
+        case "$count" in ''|*[!0-9]*) count=0 ;; esac
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        count=$((count + 1))
+        now="$(date +%s)"
+        if [ "$count" -ge "$WAIT_WARN_AFTER" ] && [ $((now - last)) -ge 86400 ]; then
+            say "WARNING: still waiting after $count consecutive attempts for the tracker's definitions"
+            say "  at WEIGHT_DEFINITIONS_DIR=$WEIGHT_DEFINITIONS_DIR (category \`$WEIGHT_ITEM_CATEGORY\`)."
+            say "  If the tracker has run and synced, that path is wrong (check WEIGHT_USER / the data root)."
+            last="$now"
+        fi
+        write_wait_state "$count" "$last"
+    else
+        rm -f "$WAIT_FILE" 2>/dev/null || true
+        retry_timer_off
+    fi
+}
+
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    settle_retry_timer "$rc"
+    exit "$rc"      # fd 9 closes here and the lock is released
+}
+
+if [ -z "$MODE" ]; then
+    take_lock
+    trap on_exit EXIT
 fi
 
 # ── REFUSING TO GUESS THE IDENTITY, in the manner of TRACKER_DRIVE_USER ──────
@@ -258,9 +429,15 @@ fi
     fall back on ON PURPOSE: a goal on the hub would be a second home for the
     household's intent that never syncs anywhere."
 
-[ -d "$WEIGHT_DEFINITIONS_DIR" ] || refuse \
-    "WEIGHT_DEFINITIONS_DIR=$WEIGHT_DEFINITIONS_DIR is not a directory on this
-    box. In multi-user mode it is <tracker data root>/<the Google sub>/definitions."
+# ABSENT is a wait; PRESENT-BUT-NOT-A-DIRECTORY is a broken config. On a fresh
+# install the directory appears only after the tracker has run and synced the
+# user's definitions (or after a restore), so absence must not stop the install
+# of everything else - it is carried to the end as exit 4.
+DEFS_ABSENT=0
+if [ -e "$WEIGHT_DEFINITIONS_DIR" ] && [ ! -d "$WEIGHT_DEFINITIONS_DIR" ]; then
+    refuse "WEIGHT_DEFINITIONS_DIR=$WEIGHT_DEFINITIONS_DIR exists and is not a directory."
+fi
+[ -d "$WEIGHT_DEFINITIONS_DIR" ] || DEFS_ABSENT=1
 
 case "$WEIGHT_USER_ACCOUNT" in
     hub|root) refuse "WEIGHT_USER_ACCOUNT=$WEIGHT_USER_ACCOUNT. \`hub\` carries
@@ -273,8 +450,15 @@ esac
 # account cannot (it is 0700 hub:hub under root-only ancestors). So the "which
 # file" question is answered here, once, by reading frontmatter, and the answer
 # is baked into the bind. It may legitimately come back empty.
-resolve_category_file "$WEIGHT_DEFINITIONS_DIR" "$WEIGHT_ITEM_CATEGORY"
-if [ -n "$CATEGORY_FILE" ]; then
+if [ "$DEFS_ABSENT" != 1 ]; then
+    resolve_category_file "$WEIGHT_DEFINITIONS_DIR" "$WEIGHT_ITEM_CATEGORY"
+fi
+if [ "$DEFS_ABSENT" = 1 ]; then
+    say "NOT YET: $WEIGHT_DEFINITIONS_DIR does not exist on this box."
+    say "  The tracker creates it when it first syncs the user's definitions (or a"
+    say "  restore puts it back). Nothing is bound; the feeder is installed anyway"
+    say "  and exit 4 tells the retry to run this script again."
+elif [ -n "$CATEGORY_FILE" ]; then
     say "category \`$WEIGHT_ITEM_CATEGORY\` is declared by $CATEGORY_FILE; that ONE file is what the service will see."
 else
     say "WARNING: no *.md under $WEIGHT_DEFINITIONS_DIR declares category"
@@ -284,6 +468,14 @@ else
 fi
 
 if [ "$MODE" = "--check-only" ]; then
+    if [ "$DEFS_ABSENT" = 1 ]; then
+        say "check-only: identity set, destination set, definitions dir NOT YET present."
+        exit 4
+    fi
+    if [ -z "$CATEGORY_FILE" ]; then
+        say "check-only: definitions dir present, but no file declares category $WEIGHT_ITEM_CATEGORY yet (NOT YET)."
+        exit 4
+    fi
     say "check-only: identity set, destination set, definitions dir present."
     exit 0
 fi
@@ -308,6 +500,10 @@ fi
 install -d -m 0755 "$UNIT_DIR"
 install -m 0644 "$HERE/homehub-weight.service" "$UNIT_DIR/homehub-weight.service"
 install -m 0644 "$HERE/homehub-weight.timer"   "$UNIT_DIR/homehub-weight.timer"
+# The retry units ship with the feeder: whichever run ends "not yet" arms the timer
+# (settle_retry_timer), so the units must exist by then. Installed here, under the lock.
+install -m 0644 "$HERE/homehub-weight-setup.service" "$UNIT_DIR/homehub-weight-setup.service"
+install -m 0644 "$HERE/homehub-weight-setup.timer"   "$UNIT_DIR/homehub-weight-setup.timer"
 
 # ── THE MOUNT TARGET IS ROOT-OWNED, AND STALE STUBS ARE SWEPT ───────────────
 # systemd CREATES a missing bind-mount destination and LEAVES IT BEHIND as an
@@ -348,4 +544,10 @@ say "     to that client's consent screen, and the Owner to its Test users;"
 say "  3. consent in a browser and mint a refresh token into WEIGHT_TOKEN_FILE."
 say "  Until then the gauge reads 'unavailable' - which is correct, and is not"
 say "  a bug to chase."
+if [ -z "$CATEGORY_FILE" ]; then
+    say "INCOMPLETE (exit 4): no file declaring category $WEIGHT_ITEM_CATEGORY is in"
+    say "  $WEIGHT_DEFINITIONS_DIR yet, so the drop-in has no bind line. The retry"
+    say "  (homehub-weight-setup.timer) re-runs this script until it appears."
+    exit 4
+fi
 exit 0

@@ -553,8 +553,23 @@ that path still is: `GoalMissing` exits **2**, so the unit is still recorded as
 failed — but it is a *diagnosed* failure from the feeder's own mouth, on its
 existing tested "no goal ⇒ nothing posted" path, not an undiagnosed namespace
 error. If no file declares the category at provisioning time, no bind line is
-written at all, `setup-weight.sh` says so loudly and exits **0**: a tracker that
-has not synced yet is a normal state at firstboot and must not stop it.
+written at all, `setup-weight.sh` says so loudly and exits **4** ("not yet"): a
+tracker that has not synced yet is a normal state at firstboot and must not stop
+it. The same exit **4** covers a definitions directory that does not exist yet
+(a fresh install, before the tracker has ever run); both are retried, see below.
+
+**The retry (LLR-1139).** `setup-weight.sh` exits **0 only when complete**: units
+installed, timer enabled, and the drop-in binding the one category file. Exit
+**4** = installed but the data is not there yet; exit **2** = a broken
+configuration, which waiting cannot fix. `homehub-weight-setup.timer` (15 min,
+armed by `setup-weight.sh` itself whenever a run ends 4) runs
+`setup-weight.sh --retry`. Every full run (firstboot's, the retry's, a hand run)
+holds one flock(1) lock (`/run/homehub-weight-setup.lock`; a run that cannot get it in 120 s exits 75 and changes nothing) and settles the timer from its own result: 0 or a refusal
+disarms it, 4 arms it, so they cannot race. The retry logs one line per attempt
+(`journalctl -u homehub-weight-setup`); a refusal prints the reason and leaves
+the unit failed. After 12 consecutive waits a warning naming
+`WEIGHT_DEFINITIONS_DIR` is logged, at most once a day, never a cutoff. Tests:
+`tests/test_fresh_install_feature_starts.py`.
 
 **`EnvironmentFile=`, not `Environment=` — and that ordering was measured, not
 assumed.** The obvious construction does not work. On systemd 255,

@@ -1,0 +1,22 @@
+[Unit]
+# The retry for setup-weight.sh (SR-022). A FRESH hub has no per-user tracker
+# data when firstboot runs: the definitions directory appears only after the
+# tracker has run and synced, and the category file inside it a little later
+# still. setup-weight.sh exits 4 ("not yet") in both cases; this unit, driven
+# by homehub-weight-setup.timer, runs it again until it exits 0, then disables
+# that timer. No human has to remember to re-run anything.
+#
+# Exit 0 = complete (the run disabled the timer). Exit 4 = not yet; that is a
+# normal wait, so SuccessExitStatus keeps the unit green and the timer armed.
+# Anything else is a refusal or a failure: the run disables the timer and the
+# unit stays FAILED, so the reason is in `systemctl --failed`, not in a loop.
+Description=Retry the weight feeder's setup until the tracker data exists (SR-022)
+Documentation=file:///opt/homehub/stack/weight/README.md
+After=homehub-firstboot.service
+ConditionPathExists=/opt/homehub/stack/.env
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/homehub/stack/weight/setup-weight.sh --retry
+SuccessExitStatus=4
+TimeoutStartSec=300

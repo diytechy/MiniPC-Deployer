@@ -183,6 +183,19 @@ for a in "$@"; do
 done
 exec "$REAL_RM" "${out[@]}"
 '''
+STUB_FLOCK = r'''#!/usr/bin/env bash
+# TEST STUB for `flock -w SECS FD` (no util-linux flock on a Windows dev PC): mutual
+# exclusion by mkdir keyed on the lock file, owned by the CALLER (our parent) and
+# free once that process is gone - the lifetime a real fd lock has.
+lock="$WEIGHT_LOCK_FILE.stub.d"; end=$((SECONDS + ${2%.*}))
+while ! mkdir "$lock" 2>/dev/null; do
+  o="$(cat "$lock/pid" 2>/dev/null)"
+  if [ -n "$o" ] && ! kill -0 "$o" 2>/dev/null; then rm -rf "$lock"; continue; fi
+  [ "$SECONDS" -ge "$end" ] && exit 1
+  sleep 0.1
+done
+echo "$PPID" > "$lock/pid"
+'''
 STUB_SYSTEMCTL = r'''#!/usr/bin/env bash
 if [ "$1 $2 $3" = "disable --now homehub-weight-setup.timer" ] && [ -n "${GATE_DISARM:-}" ]; then
   touch "$GATE_DISARM.reached"; while [ -e "$GATE_DISARM" ]; do sleep 0.1; done
@@ -206,7 +219,7 @@ class Box:
         self.calls = tmp_path / "calls.txt"
         self.calls.write_text("", encoding="utf-8")
         for name, body in (("install", STUB_INSTALL), ("rm", STUB_RM),
-                           ("systemctl", STUB_SYSTEMCTL),
+                           ("systemctl", STUB_SYSTEMCTL), ("flock-stub", STUB_FLOCK),
                            ("useradd", "#!/usr/bin/env bash\nexit 0\n"),
                            ("id", "#!/usr/bin/env bash\nexit 0\n")):
             p = self.bin / name
@@ -220,7 +233,7 @@ class Box:
             PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
             REAL_RM=Path(self.real_rm).as_posix(),
             STUB_ROOT=self.root.as_posix(), CALLS=self.calls.as_posix(),
-            WEIGHT_LOCK_DIR=(self.tmp / "lock").as_posix(),
+            WEIGHT_LOCK_FILE=(self.tmp / "lock.file").as_posix(), WEIGHT_FLOCK="flock-stub",
             WEIGHT_WAIT_STATE_FILE=(self.tmp / "wait").as_posix(),
             WEIGHT_ENV_FILE="/nonexistent", WEIGHT_ENABLED="true",
             WEIGHT_USER="sub-not-a-real-google-id",
@@ -454,13 +467,94 @@ def test_tc1260_persistent_wait_warns_once_a_day_naming_the_path(box):
 
 
 @needs_bash
-def test_tc1260_the_lock_is_released_and_a_dead_holders_lock_is_broken(box):
+def test_tc1260_the_lock_file_is_never_unlinked(box):
     box.put("tracker.md", HEALTH)
     assert box.run().returncode == 0
-    assert not (box.tmp / "lock").exists()
-    (box.tmp / "lock").mkdir()
-    (box.tmp / "lock" / "pid").write_text("999999")       # no such process
+    assert (box.tmp / "lock.file").exists(), "the lock file must persist between runs"
     assert box.run().returncode == 0
+
+
+@needs_bash
+def test_tc1260_a_busy_lock_is_reported_truthfully_and_touches_nothing(box):
+    import time
+    box.put("tracker.md", HEALTH)
+    pidfile = box.tmp / "holder.pid"
+    holder = subprocess.Popen([_bash(), "-c", 'echo $$ > "$0"; exec sleep 60', pidfile.as_posix()])
+    try:
+        end = time.time() + 10
+        while time.time() < end and not (pidfile.exists() and pidfile.read_text().strip()):
+            time.sleep(0.05)
+        stub_dir = box.tmp / "lock.file.stub.d"      # what the test flock stub uses as "held"
+        stub_dir.mkdir()
+        _w(stub_dir / "pid", pidfile.read_text().strip())
+        direct = box.run(WEIGHT_LOCK_WAIT="1")
+        assert direct.returncode == 75, direct.stdout
+        assert "did NOT touch the retry timer" in direct.stdout
+        assert box.systemctl() == [], box.systemctl()
+        assert not box.units.exists()
+        retry = box.run("--retry", WEIGHT_LOCK_WAIT="1")
+        assert retry.returncode == 4, retry.stdout
+        assert "holds the lock" in retry.stdout and "disabled" not in retry.stdout
+        assert box.systemctl() == []
+    finally:
+        holder.kill()
+
+
+@needs_bash
+def test_tc1260_the_wait_counter_never_writes_through_a_symlink(box):
+    """The feeder account owns /var/lib/homehub-weight; root-written state must not
+    live where it can plant a link. Even if a link IS at the counter's path, the
+    write replaces the link rather than following it."""
+    state = box.tmp / "state"
+    state.mkdir()
+    victim = box.tmp / "victim.txt"
+    victim.write_text("KEEP")
+    link = state / "setup-wait"
+    try:
+        os.symlink(str(victim), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot create symlinks here")
+    box.put("chores.md", OTHER)
+    p = box.run(WEIGHT_WAIT_STATE_FILE=link.as_posix())
+    assert p.returncode == 4, p.stdout
+    assert victim.read_text() == "KEEP", "root wrote through the symlink"
+    assert not link.is_symlink() and link.read_text().split()[0] == "1"
+
+
+def test_tc1260_root_state_is_outside_the_feeders_state_directory():
+    setup = SETUP.read_text(encoding="utf-8")
+    m = re.search(r'STATE_DIR="\$\{WEIGHT_SETUP_STATE_DIR:-([^}]*)\}"', setup)
+    assert m and m.group(1) == "/var/lib/homehub-weight-setup"
+    assert not m.group(1).startswith("/var/lib/homehub-weight/")
+    assert 'WAIT_FILE="${WEIGHT_WAIT_STATE_FILE:-$STATE_DIR/setup-wait}"' in setup
+    assert 'mv -f "$tmp" "$WAIT_FILE"' in setup           # rename, never write-through
+
+
+def test_tc1260_the_real_flock_invocation_and_its_wait_margin():
+    setup = SETUP.read_text(encoding="utf-8")
+    assert 'FLOCK="${WEIGHT_FLOCK:-flock}"' in setup
+    assert 'LOCK_FILE="${WEIGHT_LOCK_FILE:-/run/homehub-weight-setup.lock}"' in setup
+    assert 'exec 9>>"$LOCK_FILE"' in setup
+    assert '"$FLOCK" -w "$LOCK_WAIT" 9' in setup
+    # never unlinked, and no pid-file recovery machinery left behind
+    assert not re.search(r'rm\s[^\n]*LOCK_FILE', setup)
+    assert "kill -0" not in setup and "LOCK_DIR" not in setup
+    wait = int(re.search(r'LOCK_WAIT="\$\{WEIGHT_LOCK_WAIT:-(\d+)\}"', setup).group(1))
+    timeout = int(re.search(r"^TimeoutStartSec=(\d+)", RETRY_SVC.read_text(encoding="utf-8"),
+                            re.M).group(1))
+    assert wait <= timeout - 60, "lock wait %d leaves no margin under TimeoutStartSec=%d" % (
+        wait, timeout)
+
+
+@pytest.mark.skipif(not shutil.which("flock"), reason="needs util-linux flock")
+def test_tc1260_real_flock_serialises_two_holders(tmp_path):
+    lock = tmp_path / "l"
+    first = subprocess.Popen(["flock", "-w", "5", str(lock), "sleep", "2"])
+    import time
+    time.sleep(0.5)
+    late = subprocess.run(["flock", "-w", "0.5", str(lock), "true"])
+    assert late.returncode != 0
+    first.wait()
 
 
 # ───────────────────── Fix 2: firstboot wiring, executed ──────────────────────
@@ -471,7 +565,7 @@ def _weight_stub(rc):
 
 @needs_bash
 @pytest.mark.parametrize("rc,word", [(4, "INCOMPLETE"), (0, "weight feeder installed;"),
-                                     (2, "refused or failed")])
+                                     (2, "refused or failed"), (75, "was busy")])
 def test_tc1261_firstboot_reports_but_never_decides_the_retry_timer(tmp_path, rc, word):
     """setup-weight.sh settles the timer under its lock; firstboot touching it
     would reopen the race."""

@@ -277,6 +277,8 @@ if [ "$MODE" = "--retry" ]; then
            # The once-a-day persistent-wait warning is the one line worth keeping.
            printf '%s\n' "$attempt_out" | grep -A2 '^WARNING: still waiting' || true
            exit 4 ;;
+        75) say "weight setup retry: another setup run holds the lock - nothing changed, retry timer untouched."
+           exit 4 ;;
         *) printf '%s\n' "$attempt_out"
            say "weight setup retry: exit $rc is a refusal or failure, not a wait - retry timer disabled."
            say "  The reason is in the lines above; fix it and re-run firstboot or:"
@@ -295,28 +297,49 @@ fi
 # covers resolve + write + decide, and the decision is made HERE, by whichever
 # run holds the lock last, from that run's own result - never by the caller.
 #
-# A mkdir lock with a recorded pid rather than flock(1): no dependency, and a
-# crashed holder is detected (kill -0) instead of wedging every later run.
-LOCK_DIR="${WEIGHT_LOCK_DIR:-/run/homehub-weight-setup.lock}"
-WAIT_FILE="${WEIGHT_WAIT_STATE_FILE:-/var/lib/homehub-weight/setup-wait}"
+# flock(1) on a ROOT-OWNED lock file in /run (util-linux, always on the hub), fd 9
+# held until this process exits - through the setup AND the timer decision in
+# on_exit - and released by the kernel even if we are killed, so there is no stale
+# lock to recover and no recovery code to get wrong. The lock FILE IS NEVER
+# UNLINKED: removing it would let one run lock the old inode while another
+# creates and locks a new one. `>>` so opening it never truncates anything.
+# FLOCK is overridable ONLY so a test on a machine without flock can supply a stub.
+FLOCK="${WEIGHT_FLOCK:-flock}"
+LOCK_FILE="${WEIGHT_LOCK_FILE:-/run/homehub-weight-setup.lock}"
+# The wait MUST stay well under homehub-weight-setup.service's TimeoutStartSec=300
+# (a test enforces the margin), or systemd would kill a waiting retry and report a
+# timeout that is really "somebody else is mid-run".
+LOCK_WAIT="${WEIGHT_LOCK_WAIT:-120}"
+LOCK_BUSY_RC=75     # EX_TEMPFAIL: never reached the decision; the timer is untouched.
+
+# ROOT-WRITTEN STATE LIVES IN ITS OWN ROOT-OWNED DIRECTORY, NOT IN
+# /var/lib/homehub-weight: that one is the feeder account's StateDirectory, and an
+# account that can replace `setup-wait` with a symlink would have root truncate
+# the symlink's target on the next "not yet". /var/lib (not /run) because the
+# once-a-day throttle should survive a reboot, or every boot would re-warn.
+STATE_DIR="${WEIGHT_SETUP_STATE_DIR:-/var/lib/homehub-weight-setup}"
+WAIT_FILE="${WEIGHT_WAIT_STATE_FILE:-$STATE_DIR/setup-wait}"
 WAIT_WARN_AFTER="${WEIGHT_WAIT_WARN_AFTER:-12}"      # consecutive not-yet runs (12 x 15 min = 3 h)
 
 take_lock() {
-    local waited=0 owner
-    until mkdir "$LOCK_DIR" 2>/dev/null; do
-        owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-            rm -rf "$LOCK_DIR"      # its holder is gone
-            continue
-        fi
-        if [ "$waited" -ge "${WEIGHT_LOCK_WAIT:-900}" ]; then
-            say "could not take $LOCK_DIR in ${WEIGHT_LOCK_WAIT:-900}s (held by pid ${owner:-?})."
-            exit 1
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
-    printf '%s' "$$" > "$LOCK_DIR/pid"
+    exec 9>>"$LOCK_FILE" || { say "cannot open $LOCK_FILE"; exit "$LOCK_BUSY_RC"; }
+    if ! "$FLOCK" -w "$LOCK_WAIT" 9; then
+        say "another weight setup run held $LOCK_FILE for ${LOCK_WAIT}s; this run did not start,"
+        say "  made no changes and did NOT touch the retry timer."
+        exit "$LOCK_BUSY_RC"
+    fi
+}
+
+# Writes the counter without ever following a symlink at its path: a temp file in
+# the same root-owned directory, renamed over the target (rename replaces a
+# symlink, it does not write through it).
+write_wait_state() {
+    local dir tmp
+    dir="$(dirname "$WAIT_FILE")"
+    [ ! -L "$dir" ] || return 0
+    mkdir -p "$dir" 2>/dev/null && chmod 0700 "$dir" 2>/dev/null || return 0
+    tmp="$(mktemp "$dir/.setup-wait.XXXXXX" 2>/dev/null)" || return 0
+    printf '%s %s\n' "$1" "$2" > "$tmp" && mv -f "$tmp" "$WAIT_FILE" || rm -f "$tmp"
 }
 
 # Called with the run's exit status, under the lock: complete or broken disarms
@@ -329,7 +352,7 @@ settle_retry_timer() {
         if command -v systemctl >/dev/null 2>&1; then
             systemctl enable --now "$RETRY_TIMER" >/dev/null 2>&1 || say "WARNING: could not enable $RETRY_TIMER"
         fi
-        if [ -f "$WAIT_FILE" ]; then read -r count last < "$WAIT_FILE" || true; fi
+        if [ -f "$WAIT_FILE" ] && [ ! -L "$WAIT_FILE" ]; then read -r count last < "$WAIT_FILE" || true; fi
         case "$count" in ''|*[!0-9]*) count=0 ;; esac
         case "$last" in ''|*[!0-9]*) last=0 ;; esac
         count=$((count + 1))
@@ -340,7 +363,7 @@ settle_retry_timer() {
             say "  If the tracker has run and synced, that path is wrong (check WEIGHT_USER / the data root)."
             last="$now"
         fi
-        { mkdir -p "$(dirname "$WAIT_FILE")" && printf '%s %s\n' "$count" "$last" > "$WAIT_FILE"; } 2>/dev/null || true
+        write_wait_state "$count" "$last"
     else
         rm -f "$WAIT_FILE" 2>/dev/null || true
         retry_timer_off
@@ -351,8 +374,7 @@ on_exit() {
     local rc=$?
     trap - EXIT
     settle_retry_timer "$rc"
-    rm -rf "$LOCK_DIR"
-    exit "$rc"
+    exit "$rc"      # fd 9 closes here and the lock is released
 }
 
 if [ -z "$MODE" ]; then

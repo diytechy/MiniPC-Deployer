@@ -564,7 +564,7 @@ installed, timer enabled, and the drop-in binding the one category file. Exit
 configuration, which waiting cannot fix. `homehub-weight-setup.timer` (15 min,
 armed by `setup-weight.sh` itself whenever a run ends 4) runs
 `setup-weight.sh --retry`. Every full run (firstboot's, the retry's, a hand run)
-holds one lock and settles the timer from its own result: 0 or a refusal
+holds one flock(1) lock (`/run/homehub-weight-setup.lock`; a run that cannot get it in 120 s exits 75 and changes nothing) and settles the timer from its own result: 0 or a refusal
 disarms it, 4 arms it, so they cannot race. The retry logs one line per attempt
 (`journalctl -u homehub-weight-setup`); a refusal prints the reason and leaves
 the unit failed. After 12 consecutive waits a warning naming

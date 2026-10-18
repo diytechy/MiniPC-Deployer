@@ -2534,6 +2534,10 @@ if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
             log "    Health category file) are not on this box yet. homehub-weight-setup.timer"
             log "    re-runs setup-weight.sh every 15 minutes and disables itself when it is"
             log "    complete; no action needed. Progress: journalctl -u homehub-weight-setup"
+        elif [ "$_weight_rc" = 75 ]; then
+            log "  weight setup was busy (another setup run held its lock); this run changed"
+            log "    nothing. The retry timer, if armed, keeps going; otherwise re-run:"
+            log "      sudo bash $STACK_DIR/weight/setup-weight.sh"
         elif [ "$_weight_rc" = 0 ]; then
             log "  weight feeder installed; timer runs every 15 minutes"
             log "  STILL OWED BY A HUMAN ON THIS BOX - the parser is written and"

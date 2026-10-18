@@ -473,7 +473,9 @@ def test_check_reads_the_rules_of_both_families_before_recreating_sr045(rig):
 @needs_bash
 def test_check_takes_the_owner_lock_and_revalidates_the_owner_under_it_sr045(rig):
     _w(rig.ss_now, SS_NO_HBBS)
-    r, calls = rig.run()
+    # This test is about lock ORDER, not settling: a zero settle window keeps
+    # wall-clock load from turning a correct run into "still down".
+    r, calls = rig.run(RUSTDESK_CHECK_SETTLE_SEC="0")
     assert r.returncode == 0, r.stdout
     flock_i = next(i for i, c in enumerate(calls) if c.startswith("flock -w") and c.endswith(" 8"))
     docker_i = next(i for i, c in enumerate(calls) if c.startswith("docker"))

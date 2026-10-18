@@ -327,7 +327,9 @@ WAIT_WARN_AFTER="${WEIGHT_WAIT_WARN_AFTER:-12}"      # consecutive not-yet runs 
 
 take_lock() {
     local rc=0
-    if ! exec 9>>"$LOCK_FILE" 2>/dev/null; then
+    # The 2>/dev/null belongs to the GROUP only. On a bare `exec`, redirections persist for
+    # the rest of the shell, which would silence every later install/systemctl error.
+    if ! { exec 9>>"$LOCK_FILE"; } 2>/dev/null; then
         say "ERROR: cannot open the lock file $LOCK_FILE; this run did not start,"
         say "  made no changes and did NOT touch the retry timer."
         exit "$LOCK_ERR_RC"

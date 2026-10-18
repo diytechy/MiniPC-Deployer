@@ -165,6 +165,7 @@ while [ $# -gt 0 ]; do
   case "$1" in -d) d=1 ;; -m|-o|-g) shift ;; *) args+=("$1") ;; esac
   shift
 done
+if [ "$d" = 0 ] && [ -n "${STUB_INSTALL_FAIL:-}" ]; then echo "install: STUB-BOOM" >&2; exit 1; fi
 if [ "$d" = 0 ] && [ -n "${GATE_INSTALL:-}" ]; then
   touch "$GATE_INSTALL.reached"; while [ -e "$GATE_INSTALL" ]; do sleep 0.1; done
 fi
@@ -556,6 +557,23 @@ def test_tc1260_lock_errors_are_errors_not_contention(box):
     q = box.run(WEIGHT_FLOCK="false")
     assert q.returncode == 76 and "not contention" in q.stdout, q.stdout
     assert box.systemctl() == [] and not box.units.exists()
+
+
+@needs_bash
+def test_tc1260_stderr_after_the_lock_is_not_silenced(box):
+    """A bare `exec 9>>f 2>/dev/null` would persist the 2> for the whole run and a
+    failing setup would disable the retry with no diagnosis."""
+    box.put("tracker.md", HEALTH)
+    p = box.run(STUB_INSTALL_FAIL="1")
+    assert p.returncode != 0
+    assert "STUB-BOOM" in p.stdout + p.stderr, (p.stdout, p.stderr)
+    r = box.run("--retry", STUB_INSTALL_FAIL="1")
+    assert "STUB-BOOM" in r.stdout + r.stderr and r.returncode != 0
+
+
+def test_tc1260_no_bare_exec_redirect_of_stderr_in_setup():
+    setup = SETUP.read_text(encoding="utf-8")
+    assert not re.search(r"^\s*(?:if !\s+)?exec\s[^\n{]*2>", setup, re.M)
 
 
 def test_tc1260_root_state_is_outside_the_feeders_state_directory():

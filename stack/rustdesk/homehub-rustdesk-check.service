@@ -12,6 +12,7 @@ After=homehub-rustdesk-isolation.service homehub-rustdesk.service docker.service
 [Service]
 Type=oneshot
 ExecStart=/opt/homehub/stack/rustdesk/rustdesk-check.sh
-# Bounded: recreate (<=120 s) + re-check wait (30 s) + alert, with headroom.
-TimeoutStartSec=240
+# Bounded: owner-lock wait (30 s) + fence checks + recreate (<=90 s) + start grace
+# and settle window (30 s + 45 s) + alerts, with headroom.
+TimeoutStartSec=360
 StateDirectory=homehub-rustdesk-check

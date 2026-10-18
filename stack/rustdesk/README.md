@@ -129,5 +129,12 @@ service (`docker compose --profile rustdesk up -d --no-build --force-recreate
 alerts through the hub's own ntfy: recovered, or still down (high priority and a
 failed unit, so `systemctl --failed` shows it).
 
+Safety properties: the fence is verified by reading the iptables/ip6tables
+rules (the isolation unit is a oneshot that stays "active" after a flush);
+recovery runs under a lock shared with `homehub-rustdesk.service` so it cannot
+undo an operator stop; recovery needs the listeners present continuously for
+45 s (hbbs listens briefly before its self-test can kill it); and after 3
+unstable recreates it pauses (one more attempt per hour) while alerting.
+
 Run it by hand: `sudo /opt/homehub/stack/rustdesk/rustdesk-check.sh`
 (`journalctl -u homehub-rustdesk-check` for the timer's runs).

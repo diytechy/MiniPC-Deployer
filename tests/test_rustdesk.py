@@ -225,16 +225,28 @@ def _w(path, text):
     path.write_bytes(text.encode("utf-8"))
 
 
-def _w(path, text):
-    path.write_bytes(text.encode("utf-8"))
-
-
-def _w(path, text):
-    path.write_bytes(text.encode("utf-8"))
+FENCE_V4 = """-P INPUT ACCEPT
+-A INPUT -i lo -p tcp -m multiport --dports 21115,21116,21117,21118,21119 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -s 192.168.1.0/24 -p tcp -m multiport --dports 21115,21116,21117,21118,21119 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -s 100.64.0.0/10 -p tcp -m multiport --dports 21115,21116,21117,21118,21119 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -p tcp -m multiport --dports 21115,21116,21117,21118,21119 -m comment --comment homehub-rustdesk-isolation -j REJECT --reject-with icmp-port-unreachable
+-A INPUT -i lo -p udp -m multiport --dports 21116 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -s 192.168.1.0/24 -p udp -m multiport --dports 21116 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -s 100.64.0.0/10 -p udp -m multiport --dports 21116 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -p udp -m multiport --dports 21116 -m comment --comment homehub-rustdesk-isolation -j REJECT --reject-with icmp-port-unreachable
+"""
+FENCE_V6 = """-P INPUT ACCEPT
+-A INPUT -i lo -p tcp -m multiport --dports 21115,21116,21117,21118,21119 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -s fd7a:115c:a1e0::/48 -p tcp -m multiport --dports 21115,21116,21117,21118,21119 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -p tcp -m multiport --dports 21115,21116,21117,21118,21119 -m comment --comment homehub-rustdesk-isolation -j REJECT --reject-with icmp6-port-unreachable
+-A INPUT -i lo -p udp -m multiport --dports 21116 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -s fd7a:115c:a1e0::/48 -p udp -m multiport --dports 21116 -m comment --comment homehub-rustdesk-isolation -j ACCEPT
+-A INPUT -p udp -m multiport --dports 21116 -m comment --comment homehub-rustdesk-isolation -j REJECT --reject-with icmp6-port-unreachable
+"""
 
 
 class _Rig:
-    """Fake ss/systemctl/docker/curl on PATH, each recording its argv."""
+    """Fake ss/systemctl/docker/curl/flock/iptables on PATH, each recording its argv."""
 
     def __init__(self, tmp_path):
         self.d = tmp_path
@@ -245,18 +257,36 @@ class _Rig:
         self.ss_now = tmp_path / "ss.now"
         self.ss_after = tmp_path / "ss.after"
         self.calls = tmp_path / "calls.log"
-        _w(self.env_file, "RUSTDESK_ENABLED=true\nLAN_IP=192.0.2.10\nNTFY_PORT=8081\n")
+        _w(self.env_file, "RUSTDESK_ENABLED=true\nLAN_IP=192.0.2.10\nNTFY_PORT=8081\n"
+                          "RUSTDESK_LAN_CIDR=192.168.1.0/24\nRUSTDESK_TUNNEL_CIDR=100.64.0.0/10\n"
+                          "RUSTDESK_TUNNEL_CIDR6=fd7a:115c:a1e0::/48\n")
         _w(self.ss_now, SS_ALL)
         _w(self.ss_after, SS_ALL)
+        _w(tmp_path / "ipt4", FENCE_V4)
+        _w(tmp_path / "ipt6", FENCE_V6)
         self.active = {"homehub-rustdesk.service": True, "homehub-rustdesk-isolation.service": True}
         self.ss_fails = False
+        # ss: after a recreate, `ss.flap` = N means the Nth following call onward sees `ss.dead`.
         self._stub("ss", 'echo "ss $*" >>"$CALLS"\n'
-                         '[ -e "$RIG/ss.fail" ] && exit 1\ncat "$RIG/ss.now"\n')
+                         '[ -e "$RIG/ss.fail" ] && exit 1\n'
+                         'n=$(cat "$RIG/ss.n" 2>/dev/null || echo 0); echo $((n+1)) >"$RIG/ss.n"\n'
+                         'if [ -e "$RIG/ss.flap" ] && [ -e "$RIG/recreated" ] && [ "$n" -ge "$(cat "$RIG/ss.flap")" ]; then cat "$RIG/ss.dead"; exit 0; fi\n'
+                         'cat "$RIG/ss.now"\n')
+        # systemctl: `owner.flip` = N means the owner reads active for N queries, then inactive.
         self._stub("systemctl", 'echo "systemctl $*" >>"$CALLS"\n'
-                                'if [ "$1" = is-active ]; then [ -e "$RIG/active.${@: -1}" ]; exit $?; fi\nexit 0\n')
+                                'if [ "$1" = is-active ]; then\n'
+                                '  if [ "${@: -1}" = homehub-rustdesk.service ] && [ -e "$RIG/owner.flip" ]; then\n'
+                                '    q=$(cat "$RIG/owner.q" 2>/dev/null || echo 0); echo $((q+1)) >"$RIG/owner.q"\n'
+                                '    [ "$q" -lt "$(cat "$RIG/owner.flip")" ]; exit $?\n'
+                                '  fi\n'
+                                '  [ -e "$RIG/active.${@: -1}" ]; exit $?\n'
+                                'fi\nexit 0\n')
         self._stub("docker", 'echo "docker $*" >>"$CALLS"\n'
-                             'case "$*" in *force-recreate*) cp "$RIG/ss.after" "$RIG/ss.now";; esac\nexit 0\n')
+                             'case "$*" in *force-recreate*) cp "$RIG/ss.after" "$RIG/ss.now"; echo 0 >"$RIG/ss.n"; : >"$RIG/recreated";; esac\nexit 0\n')
         self._stub("curl", 'echo "curl $*" | tr "\\n" " " >>"$CALLS"; echo >>"$CALLS"\n[ -e "$RIG/curl.fail" ] && exit 22\nexit 0\n')
+        self._stub("flock", 'echo "flock $*" >>"$CALLS"\n[ -e "$RIG/flock.fail" ] && exit 1\nexit 0\n')
+        self._stub("iptables", 'echo "iptables $*" >>"$CALLS"\ncat "$RIG/ipt4"\n')
+        self._stub("ip6tables", 'echo "ip6tables $*" >>"$CALLS"\ncat "$RIG/ipt6"\n')
 
     def _stub(self, name, body):
         p = self.bin / name
@@ -283,6 +313,8 @@ class _Rig:
             "RUSTDESK_CHECK_STACK_DIR": str(self.d),
             "RUSTDESK_CHECK_STATE_DIR": str(self.state),
             "RUSTDESK_CHECK_WAIT_SEC": "1", "RUSTDESK_CHECK_POLL_SEC": "1",
+            "RUSTDESK_CHECK_SETTLE_SEC": "2",
+            "RUSTDESK_CHECK_OWNER_LOCK": str(self.d / "owner.lock"),
         })
         env.update(extra)
         self.calls.write_text("", encoding="utf-8")
@@ -331,6 +363,7 @@ def test_check_is_quiet_when_every_listener_is_present_sr045(rig):
 @pytest.mark.parametrize("drop,svc", [
     ("udp UNCONN 0 0 0.0.0.0:21116 0.0.0.0:*\n", "hbbs"),
     ("tcp LISTEN 0 1024 0.0.0.0:21115 0.0.0.0:*\n", "hbbs"),
+    ("tcp LISTEN 0 1024 0.0.0.0:21116 0.0.0.0:*\n", "hbbs"),
     ("tcp LISTEN 0 1024 0.0.0.0:21117 0.0.0.0:*\n", "hbbr"),
 ])
 def test_check_detects_each_required_listener_sr045(rig, drop, svc):
@@ -366,16 +399,152 @@ def test_check_still_down_alerts_high_and_fails_sr045(rig):
     assert len(curl) == 1 and "Priority: high" in curl[0] and "STILL down" in curl[0]
 
 
-@needs_bash
-def test_check_never_starts_listeners_when_the_fence_is_not_active_sr045(rig):
-    """The fence invariant: no isolation unit, no listeners."""
-    rig.active["homehub-rustdesk-isolation.service"] = False
+def _fence_down_case(rig, v4, v6):
     _w(rig.ss_now, SS_NO_HBBS)
+    _w(rig.d / "ipt4", v4)
+    _w(rig.d / "ipt6", v6)
     r, calls = rig.run()
-    assert r.returncode == 1
-    assert not _has(calls, "docker"), "started a listener with the fence down"
+    assert r.returncode == 1, r.stdout
+    assert not _has(calls, "docker"), "started a listener with the fence not in place"
     assert not _has(calls, "systemctl restart") and not _has(calls, "systemctl start")
     assert "Priority: high" in " ".join(_has(calls, "curl"))
+    return r
+
+
+@needs_bash
+def test_check_refuses_when_both_families_have_no_fence_rules_sr045(rig):
+    """The isolation unit is a oneshot RemainAfterExit: it stays 'active' after a
+    flush removed the rules, so 'unit active' proves nothing."""
+    assert rig.active["homehub-rustdesk-isolation.service"] is True
+    _fence_down_case(rig, "-P INPUT ACCEPT\n", "-P INPUT ACCEPT\n")
+
+
+@needs_bash
+def test_check_refuses_when_only_the_v6_fence_is_missing_sr045(rig):
+    r = _fence_down_case(rig, FENCE_V4, "-P INPUT ACCEPT\n")
+    assert "ip6tables" in r.stdout
+
+
+@needs_bash
+def test_check_refuses_when_only_the_v4_fence_is_missing_sr045(rig):
+    r = _fence_down_case(rig, "-P INPUT ACCEPT\n", FENCE_V6)
+    assert "iptables" in r.stdout
+
+
+@needs_bash
+def test_check_refuses_when_one_protocol_or_the_reject_is_missing_sr045(rig):
+    only_tcp = "\n".join(l for l in FENCE_V4.splitlines() if "-p udp" not in l) + "\n"
+    _fence_down_case(rig, only_tcp, FENCE_V6)
+
+
+@needs_bash
+def test_check_refuses_a_misordered_fence_sr045(rig):
+    """A REJECT ahead of the loopback ACCEPT kills hbbs's own self-test."""
+    lines = FENCE_V4.splitlines()
+    rej = [i for i, l in enumerate(lines) if "tcp" in l and "REJECT" in l][0]
+    lo = [i for i, l in enumerate(lines) if "tcp" in l and "-i lo" in l][0]
+    lines[rej], lines[lo] = lines[lo], lines[rej]
+    _fence_down_case(rig, "\n".join(lines) + "\n", FENCE_V6)
+
+
+@needs_bash
+def test_check_refuses_a_fence_without_the_loopback_accept_sr045(rig):
+    """Without it hbbs's own startup self-test is rejected and it exits."""
+    no_lo = "\n".join(l for l in FENCE_V6.splitlines() if "-i lo" not in l) + "\n"
+    _fence_down_case(rig, FENCE_V4, no_lo)
+
+
+@needs_bash
+def test_check_refuses_a_fence_missing_the_configured_lan_accept_sr045(rig):
+    no_lan = "\n".join(l for l in FENCE_V4.splitlines() if "-s 192.168.1.0/24" not in l) + "\n"
+    _fence_down_case(rig, no_lan, FENCE_V6)
+
+
+@needs_bash
+def test_check_reads_the_rules_of_both_families_before_recreating_sr045(rig):
+    _w(rig.ss_now, SS_NO_HBBS)
+    r, calls = rig.run()
+    assert r.returncode == 0, r.stdout
+    kinds = [c.split()[0] for c in calls if c.split()[0] in ("iptables", "ip6tables", "docker")]
+    assert kinds.index("docker") > kinds.index("iptables") and kinds.index("docker") > kinds.index("ip6tables")
+
+
+@needs_bash
+def test_check_takes_the_owner_lock_and_revalidates_the_owner_under_it_sr045(rig):
+    _w(rig.ss_now, SS_NO_HBBS)
+    r, calls = rig.run()
+    assert r.returncode == 0, r.stdout
+    flock_i = next(i for i, c in enumerate(calls) if c.startswith("flock -w") and c.endswith(" 8"))
+    docker_i = next(i for i, c in enumerate(calls) if c.startswith("docker"))
+    owner_after = [i for i, c in enumerate(calls) if c == "systemctl is-active --quiet homehub-rustdesk.service" and i > flock_i]
+    assert flock_i < docker_i and owner_after and owner_after[0] < docker_i, calls
+
+
+@needs_bash
+def test_check_does_not_recreate_when_the_owner_is_stopped_during_the_check_sr045(rig):
+    """Deterministic stop-during-check: the owner reads active for the first
+    query (before the lock) and inactive when re-validated under the lock - an
+    operator stop that landed in between. Recovery must not undo it."""
+    _w(rig.ss_now, SS_NO_HBBS)
+    _w(rig.d / "owner.flip", "1")
+    r, calls = rig.run()
+    assert r.returncode == 0, r.stdout
+    assert not _has(calls, "docker"), "recreated listeners with their owner stopped"
+    assert not _has(calls, "curl")
+    assert not _has(calls, "iptables"), "re-validation must precede any work"
+
+
+@needs_bash
+def test_check_does_nothing_when_it_cannot_take_the_owner_lock_sr045(rig):
+    _w(rig.ss_now, SS_NO_HBBS)
+    _w(rig.d / "flock.fail", "")
+    r, calls = rig.run()
+    assert not _has(calls, "docker")
+
+
+@needs_bash
+def test_check_requires_listeners_to_stay_up_not_just_appear_sr045(rig):
+    """hbbs listens, then its startup self-test times out and it exits. One good
+    snapshot is not recovery."""
+    _w(rig.ss_now, SS_NO_HBBS)
+    _w(rig.d / "ss.dead", SS_NO_HBBS)
+    _w(rig.d / "ss.flap", "1")
+    r, calls = rig.run()
+    assert r.returncode == 1, r.stdout
+    curl = " ".join(_has(calls, "curl"))
+    assert "STILL down" in curl and "Priority: high" in curl and "back" not in curl
+
+
+@needs_bash
+def test_check_bounds_repeated_recreates_sr045(rig):
+    _w(rig.ss_now, SS_NO_HBBS)
+    rig.state.mkdir()
+    import time as _t
+    _w(rig.state / "recreate-attempts", "3 %d\n" % int(_t.time()))
+    r, calls = rig.run()
+    assert r.returncode == 1
+    assert not _has(calls, "docker"), "a persistent fault must not loop"
+    assert "Priority: high" in " ".join(_has(calls, "curl"))
+
+
+@needs_bash
+def test_check_retries_after_the_backoff_and_resets_on_stable_recovery_sr045(rig):
+    _w(rig.ss_now, SS_NO_HBBS)
+    rig.state.mkdir()
+    _w(rig.state / "recreate-attempts", "3 1000\n")  # long ago
+    r, calls = rig.run()
+    assert r.returncode == 0, r.stdout
+    assert len(_has(calls, "docker")) == 1
+    assert not (rig.state / "recreate-attempts").exists()
+
+
+@needs_bash
+def test_check_counts_each_unstable_attempt_sr045(rig):
+    _w(rig.ss_now, SS_NO_HBBS)
+    _w(rig.d / "ss.dead", SS_NO_HBBS)
+    _w(rig.d / "ss.flap", "1")
+    rig.run()
+    assert (rig.state / "recreate-attempts").read_text().split()[0] == "1"
 
 
 @needs_bash
@@ -424,6 +593,7 @@ def test_check_script_bounds_its_calls_and_checks_the_fence_sr045():
     for call in ("ss -H -ltnu", "systemctl is-active", "docker compose", "curl "):
         assert re.search(r"timeout[^\n]*" + re.escape(call), live), "%s is not bounded" % call
     assert "homehub-rustdesk-isolation.service" in live
+    assert "iptables" in live and "ip6tables" in live and "flock" in live
 
 
 def test_firstboot_installs_the_check_and_enables_the_timer_only_when_enabled_sr045():
@@ -443,3 +613,11 @@ def test_firstboot_installs_the_check_and_enables_the_timer_only_when_enabled_sr
 def test_readme_documents_the_listener_check_sr045():
     text = README.read_text(encoding="utf-8")
     assert "rustdesk-check.sh" in text and "2026-09-28" in text
+
+
+def test_owner_unit_and_checker_share_one_lock_file_sr045():
+    owner = _live(OWNER_UNIT.read_text(encoding="utf-8"))
+    lock = re.search(r"RUSTDESK_CHECK_OWNER_LOCK:-([^}]+)\}", CHECK.read_text(encoding="utf-8")).group(1)
+    for verb in ("ExecStart", "ExecStop"):
+        line = [l for l in owner.splitlines() if l.startswith(verb + "=")]
+        assert len(line) == 1 and line[0].startswith(verb + "=/usr/bin/flock " + lock + " /usr/bin/docker compose"), line

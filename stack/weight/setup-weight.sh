@@ -24,8 +24,26 @@
 # Adds NO apt package: python3 stdlib only, and python3 is already in
 # packages.list. No apt export is owed.
 #
-# Usage: setup-weight.sh [--check-only | --emit-dropin DIR]
-# Exit 0 = converged (or disabled). 1 = failed. 2 = refused.
+# Usage: setup-weight.sh [--check-only | --emit-dropin DIR | --retry]
+# Exit 0 = converged COMPLETELY (or disabled). 1 = failed. 2 = refused.
+#      4 = NOT YET: everything that can be installed is installed, but the
+#          tracker's data this feature needs has not appeared on this box.
+#
+# "COMPLETE" IS ONE CHECKABLE CONDITION, AND EXIT 0 IS IT: the unit and timer
+# are installed and the timer is enabled, AND the drop-in carries the
+# BindReadOnlyPaths= line for the ONE definitions file that declares
+# WEIGHT_ITEM_CATEGORY (so that file existed when this run resolved it). The
+# two ways it can be incomplete both come from a fresh install, where the
+# tracker has not run yet and its per-user definitions do not exist: the
+# definitions DIRECTORY is absent, or it exists and the category file has not
+# synced into it. Both exit 4. Exit 2 is only ever a broken CONFIGURATION (a
+# blank knob, an ambiguous category, a forbidden account, a path that exists
+# and is not a directory) - something waiting will not fix, so nothing retries it.
+#
+# --retry is what homehub-weight-setup.service runs every 15 minutes. It runs
+# the whole setup once more and then decides about its own timer: complete
+# (0) disables it, not-yet (4) leaves it armed with one log line, anything else
+# disables it and fails the unit so the refusal is visible rather than looping.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -227,9 +245,41 @@ EOF
     chmod 0644 "$dir/10-account.conf"
 }
 
+RETRY_TIMER="homehub-weight-setup.timer"
+retry_timer_off() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "$RETRY_TIMER" >/dev/null 2>&1 || say "WARNING: could not disable $RETRY_TIMER"
+    fi
+}
+
 if [ "$WEIGHT_ENABLED" != "true" ] && [ "$MODE" != "--emit-dropin" ]; then
     say "WEIGHT_ENABLED is not true - the weight feeder is not installed."
+    if [ "$MODE" = "--retry" ]; then retry_timer_off; fi
     exit 0
+fi
+
+# ── --retry: one more full attempt, then the verdict on the retry timer ──────
+# The attempt is a child run of this same script with no mode, so the retry
+# exercises exactly the code a hand run or firstboot does, not a lookalike.
+if [ "$MODE" = "--retry" ]; then
+    # Quiet by design: the attempt's own chatter (the human-owed list is a dozen
+    # lines) is held back, so a healthy wait costs ONE journal line per attempt.
+    # A refusal or failure prints everything, because there it is the diagnosis.
+    rc=0
+    attempt_out="$(bash "${BASH_SOURCE[0]}" 2>&1)" || rc=$?
+    case "$rc" in
+        0) say "weight setup retry: COMPLETE - retry timer disabled."
+           retry_timer_off
+           exit 0 ;;
+        4) say "weight setup retry: not yet (tracker definitions or the category file are not present) - will try again."
+           exit 4 ;;
+        *) printf '%s\n' "$attempt_out"
+           say "weight setup retry: exit $rc is a refusal or failure, not a wait - retry timer disabled."
+           say "  The reason is in the lines above; fix it and re-run firstboot or:"
+           say "    sudo bash ${BASH_SOURCE[0]}"
+           retry_timer_off
+           exit "$rc" ;;
+    esac
 fi
 
 # ── REFUSING TO GUESS THE IDENTITY, in the manner of TRACKER_DRIVE_USER ──────
@@ -258,9 +308,15 @@ fi
     fall back on ON PURPOSE: a goal on the hub would be a second home for the
     household's intent that never syncs anywhere."
 
-[ -d "$WEIGHT_DEFINITIONS_DIR" ] || refuse \
-    "WEIGHT_DEFINITIONS_DIR=$WEIGHT_DEFINITIONS_DIR is not a directory on this
-    box. In multi-user mode it is <tracker data root>/<the Google sub>/definitions."
+# ABSENT is a wait; PRESENT-BUT-NOT-A-DIRECTORY is a broken config. On a fresh
+# install the directory appears only after the tracker has run and synced the
+# user's definitions (or after a restore), so absence must not stop the install
+# of everything else - it is carried to the end as exit 4.
+DEFS_ABSENT=0
+if [ -e "$WEIGHT_DEFINITIONS_DIR" ] && [ ! -d "$WEIGHT_DEFINITIONS_DIR" ]; then
+    refuse "WEIGHT_DEFINITIONS_DIR=$WEIGHT_DEFINITIONS_DIR exists and is not a directory."
+fi
+[ -d "$WEIGHT_DEFINITIONS_DIR" ] || DEFS_ABSENT=1
 
 case "$WEIGHT_USER_ACCOUNT" in
     hub|root) refuse "WEIGHT_USER_ACCOUNT=$WEIGHT_USER_ACCOUNT. \`hub\` carries
@@ -273,8 +329,15 @@ esac
 # account cannot (it is 0700 hub:hub under root-only ancestors). So the "which
 # file" question is answered here, once, by reading frontmatter, and the answer
 # is baked into the bind. It may legitimately come back empty.
-resolve_category_file "$WEIGHT_DEFINITIONS_DIR" "$WEIGHT_ITEM_CATEGORY"
-if [ -n "$CATEGORY_FILE" ]; then
+if [ "$DEFS_ABSENT" != 1 ]; then
+    resolve_category_file "$WEIGHT_DEFINITIONS_DIR" "$WEIGHT_ITEM_CATEGORY"
+fi
+if [ "$DEFS_ABSENT" = 1 ]; then
+    say "NOT YET: $WEIGHT_DEFINITIONS_DIR does not exist on this box."
+    say "  The tracker creates it when it first syncs the user's definitions (or a"
+    say "  restore puts it back). Nothing is bound; the feeder is installed anyway"
+    say "  and exit 4 tells the retry to run this script again."
+elif [ -n "$CATEGORY_FILE" ]; then
     say "category \`$WEIGHT_ITEM_CATEGORY\` is declared by $CATEGORY_FILE; that ONE file is what the service will see."
 else
     say "WARNING: no *.md under $WEIGHT_DEFINITIONS_DIR declares category"
@@ -284,6 +347,10 @@ else
 fi
 
 if [ "$MODE" = "--check-only" ]; then
+    if [ "$DEFS_ABSENT" = 1 ]; then
+        say "check-only: identity set, destination set, definitions dir NOT YET present."
+        exit 4
+    fi
     say "check-only: identity set, destination set, definitions dir present."
     exit 0
 fi
@@ -348,4 +415,10 @@ say "     to that client's consent screen, and the Owner to its Test users;"
 say "  3. consent in a browser and mint a refresh token into WEIGHT_TOKEN_FILE."
 say "  Until then the gauge reads 'unavailable' - which is correct, and is not"
 say "  a bug to chase."
+if [ -z "$CATEGORY_FILE" ]; then
+    say "INCOMPLETE (exit 4): no file declaring category $WEIGHT_ITEM_CATEGORY is in"
+    say "  $WEIGHT_DEFINITIONS_DIR yet, so the drop-in has no bind line. The retry"
+    say "  (homehub-weight-setup.timer) re-runs this script until it appears."
+    exit 4
+fi
 exit 0

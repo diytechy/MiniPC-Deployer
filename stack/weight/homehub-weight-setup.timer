@@ -1,0 +1,15 @@
+[Unit]
+Description=Retry the weight feeder's setup every 15 minutes until complete (SR-022)
+Documentation=file:///opt/homehub/stack/weight/README.md
+
+[Timer]
+# Installed by firstboot only when WEIGHT_ENABLED=true, enabled only while
+# setup-weight.sh reports "not yet" (exit 4), and disabled by the --retry run
+# that finally exits 0. One log line per attempt (the script's own).
+OnBootSec=5min
+OnUnitInactiveSec=15min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

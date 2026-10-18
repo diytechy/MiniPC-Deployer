@@ -2361,6 +2361,16 @@ if [ "${AI_CLI_ENABLED:-false}" = "true" ]; then
         # AI_CLI_SKIP_STATUS: the one status summary is printed at the end of 6e.
         if AI_CLI_SKIP_STATUS=1 bash "$STACK_DIR/ai-cli/setup-ai-cli.sh" 2>&1 | sed 's/^/  /'; then
             log "  AI CLI service installed and enabled on ${AI_CLI_BIND:-127.0.0.1}:${AI_CLI_PORT:-8791}"
+            # START IT NOW, NOT AT THE NEXT BOOT. setup-ai-cli.sh only enables (it also runs on
+            # every boot), and nothing else starts the unit, so a fresh install had the API
+            # down until a reboot or a hand start. --no-block is not optional: the unit is
+            # After=homehub-firstboot.service, so a blocking start from inside firstboot would
+            # wait on this very script. Only on the success branch: a refused or failed setup
+            # must not start a service whose checks did not pass. It is safe BEFORE the CLIs
+            # are provisioned (startup_checks does not resolve executables; the binary is
+            # resolved per launch), and Restart=on-failure covers a transient start failure.
+            systemctl start --no-block homehub-ai-cli.service \
+                || log "  WARNING: could not queue the start of homehub-ai-cli.service; it starts at the next boot"
             log "  Any sign-in still owed is listed in the AI status summary below"
             log "    (PROVISIONING / LOGINS OWED). Credentials do not survive a"
             log "    reimage - the same posture as IceDrive."
@@ -2506,7 +2516,30 @@ WEIGHT_ENABLED="$(_env_val WEIGHT_ENABLED | tr -d '"')"
 if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
     log "provisioning the weight feeder (activated by .env)…"
     if [ -f "$STACK_DIR/weight/setup-weight.sh" ]; then
-        if bash "$STACK_DIR/weight/setup-weight.sh" 2>&1 | sed 's/^/  /'; then
+        # The retry units are installed whenever the feeder is enabled (static files, nothing
+        # runs until the timer is). WEIGHT_ENABLED!=true never reaches this block; the else
+        # below disables a retry timer left over from an earlier enabled configuration.
+        for _wu in homehub-weight-setup.service homehub-weight-setup.timer; do
+            install -m 0644 "$STACK_DIR/weight/$_wu" "/etc/systemd/system/$_wu" 2>/dev/null \
+                || log "  WARNING: could not install $_wu"
+        done
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # The exit code is captured, not the pipeline's: setup-weight.sh exits 4 ("NOT YET -
+        # the tracker's per-user definitions do not exist on a fresh install") and that must
+        # arm the retry rather than read as the failure it is not (and, under pipefail,
+        # must not abort firstboot).
+        _weight_rc=0
+        _weight_out="$(bash "$STACK_DIR/weight/setup-weight.sh" 2>&1)" || _weight_rc=$?
+        printf '%s\n' "$_weight_out" | sed 's/^/  /'
+        if [ "$_weight_rc" = 4 ]; then
+            systemctl enable --now homehub-weight-setup.timer >/dev/null 2>&1 \
+                || log "  WARNING: could not enable homehub-weight-setup.timer"
+            log "  weight feeder installed but INCOMPLETE: the tracker's definitions (or the"
+            log "    Health category file) are not on this box yet. homehub-weight-setup.timer"
+            log "    re-runs setup-weight.sh every 15 minutes and disables itself when it is"
+            log "    complete; no action needed. Progress: journalctl -u homehub-weight-setup"
+        elif [ "$_weight_rc" = 0 ]; then
+            systemctl disable --now homehub-weight-setup.timer >/dev/null 2>&1 || true
             log "  weight feeder installed; timer runs every 15 minutes"
             log "  STILL OWED BY A HUMAN ON THIS BOX - the parser is written and"
             log "  tested, but a hub with no refresh token reads 'unavailable':"
@@ -2531,6 +2564,9 @@ if [ "${WEIGHT_ENABLED:-false}" = "true" ]; then
         log "  WARNING: WEIGHT_ENABLED=true but no $STACK_DIR/weight/setup-weight.sh"
         log "    on the payload - carriage missing for an activated feature."
     fi
+else
+    # Knob off: no retry either. A timer left from an earlier enabled config is switched off.
+    systemctl disable --now homehub-weight-setup.timer >/dev/null 2>&1 || true
 fi
 
 # ── 6f-2. the sleep feeder (SR-070..SR-072, SR-074) ────────────────────────

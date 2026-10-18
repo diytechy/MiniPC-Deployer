@@ -103,3 +103,31 @@ existing hub SSH path in mind for that case.
 5. Retest the whole path over the tunnel from cellular.
 6. Only then wire it to the wake path: cold box → magic packet → sign-in screen
    → PIN → desktop, end to end.
+
+
+## A listener that dies while docker says "Up" (2026-09-28)
+
+`hbbs` runs a periodic self-test against its own `0.0.0.0:21116` and **exits on
+a single failed test**. On 2026-09-28 21:55 local the hub hit a memory-pressure
+episode (journald "Under memory pressure", containerd/dockerd "context deadline
+exceeded"); `hbbs` logged `Failed to run hbbs test with 0.0.0.0:21116: Timeout
+of test_hbbs` and exited. Docker **lost the exit event**: `docker ps` kept
+saying "Up 4 weeks", `docker top hbbs` listed no process, and nothing listened
+on tcp 21115/21116 or udp 21116 for three weeks. `hbbr` kept running. Because
+the restart policy is deliberately `no` (see "What starts these containers"),
+nothing brought `hbbs` back. It was recreated by hand on 2026-10-18.
+
+`homehub-rustdesk-check.timer` (every 5 minutes) now runs `rustdesk-check.sh`,
+which asks the **listening table** (`ss -H -ltnu`) rather than docker, because
+docker state is exactly what lied. Required: `hbbs` tcp 21115, tcp 21116, udp
+21116; `hbbr` tcp 21117 (the 21118/21119 websocket pair is not required). It
+does nothing unless `RUSTDESK_ENABLED=true` and `homehub-rustdesk.service` is
+active. On a missing listener it confirms `homehub-rustdesk-isolation.service`
+is active (if not: alert, start nothing), force-recreates only the affected
+service (`docker compose --profile rustdesk up -d --no-build --force-recreate
+--no-deps`; the keys live in the named volume, so this is safe), re-checks, and
+alerts through the hub's own ntfy: recovered, or still down (high priority and a
+failed unit, so `systemctl --failed` shows it).
+
+Run it by hand: `sudo /opt/homehub/stack/rustdesk/rustdesk-check.sh`
+(`journalctl -u homehub-rustdesk-check` for the timer's runs).

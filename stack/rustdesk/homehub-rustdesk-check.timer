@@ -1,0 +1,13 @@
+[Unit]
+# The only thing that notices hbbs exiting while docker still reports it Up. The
+# containers have restart: "no" by design, so without this a dead listener stays
+# dead until someone looks. Worst case: remote desktop is down for one period.
+Description=Re-check the RustDesk listeners every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

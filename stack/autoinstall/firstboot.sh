@@ -1362,6 +1362,12 @@ if [ -d "$STACK_DIR/rustdesk" ]; then
     chmod 0755 "$STACK_DIR/rustdesk/rustdesk-isolation.sh" 2>/dev/null || log "WARN: could not chmod rustdesk-isolation.sh"
     install -m 0644 "$STACK_DIR/rustdesk/homehub-rustdesk-isolation.service" /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-rustdesk-isolation.service"
     install -m 0644 "$STACK_DIR/rustdesk/homehub-rustdesk.service"           /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-rustdesk.service"
+    # The listener check (LLR-1137): hbbs can exit while docker still says "Up",
+    # and restart: "no" means nothing else brings it back. Same non-executable
+    # -mode trap as the fence script above.
+    chmod 0755 "$STACK_DIR/rustdesk/rustdesk-check.sh" 2>/dev/null || log "WARN: could not chmod rustdesk-check.sh"
+    install -m 0644 "$STACK_DIR/rustdesk/homehub-rustdesk-check.service"     /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-rustdesk-check.service"
+    install -m 0644 "$STACK_DIR/rustdesk/homehub-rustdesk-check.timer"       /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-rustdesk-check.timer"
     systemctl daemon-reload 2>/dev/null || log "WARN: systemctl daemon-reload failed"
     # ENABLE THE FENCE UNCONDITIONALLY, THE LISTENERS ONLY IF ALREADY WANTED.
     # A fence with no listeners is harmless - it programs REJECT rules for ports
@@ -1382,7 +1388,8 @@ if [ -d "$STACK_DIR/rustdesk" ]; then
     _rustdesk_enabled="$(sed -n 's/^RUSTDESK_ENABLED=//p' "$STACK_DIR/.env" 2>/dev/null | head -1 | tr -d '\015' | tr -d '"')"
     if [ "$_rustdesk_enabled" = "true" ]; then
         systemctl enable homehub-rustdesk.service >/dev/null 2>&1 || log "WARN: could not enable homehub-rustdesk.service"
-        log "rustdesk: fence + listeners enabled (RUSTDESK_ENABLED=true)"
+        systemctl enable --now homehub-rustdesk-check.timer >/dev/null 2>&1 || log "WARN: could not enable homehub-rustdesk-check.timer"
+        log "rustdesk: fence + listeners + listener check enabled (RUSTDESK_ENABLED=true)"
     else
         # DISABLE, DO NOT MERELY DECLINE TO ENABLE. firstboot re-runs, so a box
         # whose knob was true and is now false would otherwise keep the listener
@@ -1390,6 +1397,9 @@ if [ -d "$STACK_DIR/rustdesk" ]; then
         # would not. Stop it too: `disable` alone leaves a running service up
         # until the next boot, which is exactly the window someone flipping this
         # to false is trying to close.
+        # The check goes first and unconditionally: with the knob off it would
+        # only log and exit, but a timer for a feature that is off is clutter.
+        systemctl disable --now homehub-rustdesk-check.timer >/dev/null 2>&1 || true
         if systemctl is-enabled homehub-rustdesk.service >/dev/null 2>&1; then
             systemctl disable homehub-rustdesk.service >/dev/null 2>&1 || log "WARN: could not disable homehub-rustdesk.service"
             systemctl stop    homehub-rustdesk.service >/dev/null 2>&1 || true

@@ -1,0 +1,17 @@
+[Unit]
+# Driven by homehub-rustdesk-check.timer. Asks the kernel whether hbbs/hbbr are
+# actually LISTENING (not what docker says: on 2026-09-28 docker reported hbbs
+# "Up" for three weeks after it had exited). On a missing listener it recreates
+# the dead service through compose, only while the fence unit is active, and
+# alerts through ntfy; when it cannot recover it alerts and FAILS, so
+# `systemctl --failed` shows it too. See rustdesk-check.sh.
+Description=Check the RustDesk listeners exist; recreate and alert if not
+Documentation=file:///opt/homehub/stack/rustdesk/README.md
+After=homehub-rustdesk-isolation.service homehub-rustdesk.service docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/homehub/stack/rustdesk/rustdesk-check.sh
+# Bounded: recreate (<=120 s) + re-check wait (30 s) + alert, with headroom.
+TimeoutStartSec=240
+StateDirectory=homehub-rustdesk-check

@@ -640,6 +640,27 @@ def test_check_refuses_a_fence_that_does_not_cover_the_relay_port_sr045(rig):
 
 
 @needs_bash
+@pytest.mark.parametrize("family", ["v4", "v6"])
+@pytest.mark.parametrize("omit", ["21118", "21119"])
+def test_check_refuses_a_fence_missing_a_websocket_port_sr045(rig, family, omit):
+    """Recreating hbbs/hbbr also opens tcp 21118/21119: the fence must cover all
+    five tcp ports in both families, though they are not required to LISTEN."""
+    ports = [x for x in "21115,21116,21117,21118,21119".split(",") if x != omit]
+    narrow = lambda t: t.replace("21115,21116,21117,21118,21119", ",".join(ports))
+    if family == "v4":
+        _fence_down_case(rig, narrow(FENCE_V4), FENCE_V6)
+    else:
+        _fence_down_case(rig, FENCE_V4, narrow(FENCE_V6))
+
+
+@needs_bash
+def test_check_does_not_require_the_websocket_ports_to_listen_sr045(rig):
+    _w(rig.ss_now, SS_ALL)  # SS_ALL has no 21118/21119 listener
+    r, calls = rig.run()
+    assert r.returncode == 0 and not _has(calls, "docker")
+
+
+@needs_bash
 def test_check_refuses_a_fence_with_the_wrong_udp_port_sr045(rig):
     _fence_down_case(rig, FENCE_V4.replace("--dports 21116 ", "--dports 21117 "), FENCE_V6)
 

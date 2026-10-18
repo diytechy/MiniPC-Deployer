@@ -66,7 +66,10 @@ OWNER_LOCK="${RUSTDESK_CHECK_OWNER_LOCK:-/run/homehub-rustdesk.lock}"
 OWNER_UNIT="homehub-rustdesk.service"
 FENCE_UNIT="homehub-rustdesk-isolation.service"
 FENCE_MARK="homehub-rustdesk-isolation"
-FENCE_TCP_PORTS="21115,21116,21117"
+# All FIVE tcp ports: recreating hbbs/hbbr also opens the websocket pair
+# 21118/21119, so the fence must cover them even though the listener health
+# check above does not require them to be listening.
+FENCE_TCP_PORTS="21115,21116,21117,21118,21119"
 FENCE_UDP_PORTS="21116"
 # The most this script can hold the owner lock, in seconds: owner and fence checks
 # (~60) + recreate (RECREATE_TIMEOUT 90) + appear and settle windows (30 + 45)

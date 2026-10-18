@@ -150,6 +150,11 @@ Both the knob and `systemctl enable` were required — `firstboot.sh` **disables
 the unit whenever the knob is not `true`, so a hand-start alone would not have
 survived a reboot.
 
-**The physical S3/S5 wake is still unproven**, and §"The wake path is unverified"
-above still governs. `DEVPC_WAKE_URL` is deliberately still empty, so the hold
-hook does not yet consult this service.
+**Updated 2026-10-18: a remote start of the dev PC is proven** (the Owner: "a
+remote start of the Dev-PC was already proven"), so on this site §"The wake path
+is unverified" no longer blocks the hold. Which sleep state and which wake
+mechanism were exercised is not recorded here. `DEVPC_WAKE_URL` is still empty
+on the hub, so the hold hook does not yet consult this service. The next step is
+to set it to `http://172.28.91.1:8799` and prove a cold request end to end: the
+model answers after the hook holds, and the hold releases on readiness. That
+work is in HomeHub's 2026-10-18 handoff.

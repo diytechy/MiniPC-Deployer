@@ -12,6 +12,30 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-18 — DEPLOYED to the live hub: `6d11843` (this branch) via `deploy_stack.py --apply --run-firstboot`.**
+The Owner approved the full lane. Its run-sheet, pre-deploy script and rollback script are in HomeHub
+`docs/deploy-runs/2026-10-18/`, reviewed by Codex gpt-6.1-sol to GO. This deploy ships:
+- the admin portal (admin-auth + homepage);
+- the DNS-console fence;
+- the always-on, record-only half of hub recovery. That half is now deployed. The supervisor stays OFF
+  (`HUB_WATCHDOG_ENABLED` unset), so the HELD status below still covers it, as does the lab rehearsal;
+- the RustDesk listener check (merged `785e153`, Sol APPROVE);
+- the weight-setup retry and the AI CLI start on its install boot (merged `e4f09d7`, Sol APPROVE);
+- the FileBackup slice and memory limit (the library-backup timer stays disabled).
+
+The exit node is advertised and waiting for the Owner's console approval. Sure is NOT started. Its run-sheet
+(HomeHub `docs/deploy-runs/sure/`, Sol GO) starts it explicitly and never through `COMPOSE_PROFILES`. A
+profiled Sure would make firstboot's every-boot bulk `up -d` wait on its databases.
+
+Verified after the deploy:
+- all 79 files were verified by hash;
+- `healthcheck.sh` passed every check;
+- `admin-portal-live.sh` gave 65/0;
+- the DNS-console fence re-asserted after a `tailscaled` restart.
+
+The dev PC's remote start is proven, by the Owner's statement 2026-10-18. `DEVPC_WAKE_URL` is still unset.
+Details are in HomeHub FOLLOWUPS 2026-10-18.
+
 **2026-10-10 — Owner accepted the nine hub-recovery deviations; branch `hub-recovery-watchdog` merged into the working line; NOT deployed.**
 Owner ruling 2026-10-10: deviations 1-3 and 5-8 as built, 4 and 9 in their corrected form, plus the
 quarantine-survives-reboot fix (commits 81046b3, b8e57f5). Deployment is HELD. NOT RUN: the lab rehearsal

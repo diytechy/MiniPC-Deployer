@@ -22,10 +22,25 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/homehub/stack
 
+# The flock below can wait for a recovery in flight (rustdesk-check.sh holds this
+# lock for at most its LOCK_HOLD_BUDGET_SEC, 270 s, and lets go earlier when it
+# sees this unit stopping). The default 90 s would have systemd kill a waiting
+# stop, leaving the containers up. Budget = 270 + 90 for the compose call itself,
+# rounded up. A test asserts this stays >= the script's budget + 90.
+TimeoutStartSec=420
+TimeoutStopSec=420
+
 # `up` with no `-d` would block this oneshot forever; `--no-build` because the
 # image is pinned and this unit must never become a build step on a live box.
-ExecStart=/usr/bin/docker compose --profile rustdesk up -d --no-build hbbs hbbr
-ExecStop=/usr/bin/docker compose --profile rustdesk stop hbbs hbbr
+ExecStart=/usr/bin/flock /run/homehub-rustdesk.lock /usr/bin/docker compose --profile rustdesk up -d --no-build hbbs hbbr
+ExecStop=/usr/bin/flock /run/homehub-rustdesk.lock /usr/bin/docker compose --profile rustdesk stop hbbs hbbr
+
+# BOTH ARE TAKEN UNDER flock ON THE SAME FILE homehub-rustdesk-check.service
+# holds while it recreates a dead listener (rustdesk-check.sh). Without that, an
+# operator `systemctl stop` landing between the checker reading this unit as
+# active and its recreate would be undone: listeners running with the owner
+# stopped. With it, the stop waits for a recovery in flight, or runs first and
+# the checker sees the unit inactive when it re-validates under the lock.
 
 # Deliberately NOT ExecStopPost-removing the fence: a stopped service must never
 # take the INPUT rules with it. If these containers are ever started by some

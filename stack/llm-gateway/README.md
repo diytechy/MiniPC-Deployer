@@ -125,9 +125,10 @@ Caddy serving `llm.<domain>` is not enough: Technitium holds the split-horizon
 zone and has **no wildcard**, so the name needs an explicit A record or no LAN
 client can reach it. `provision-technitium.sh` now adds one, guarded on
 `LLM_GATEWAY_SUBDOMAIN`. This is the `wall.<domain>` bug of 2026-08-08 exactly —
-read the long note in that script. The Cloudflare wildcard is precisely what
-hides the failure, because it makes the name work from everywhere except the one
-network where it is used.
+read the long note in that script. (Until 2026-10-15 a Cloudflare wildcard hid
+the failure, making the name work from everywhere except the one network where
+it is used; that wildcard is gone and must not be recreated - the name now
+resolves only here, on the LAN and tailnet.)
 
 ## Operating notes
 

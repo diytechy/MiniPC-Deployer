@@ -351,18 +351,19 @@
 #      address; never switch it to `client_ip`, which trusts X-Forwarded-For and
 #      would hand the allow-list to any client willing to forge a header.
 #   3. A LAN-ONLY PORT THE ROUTER NEVER FORWARDS ({$WALL_PORT}). The name
-#      resolves publicly (the DDNS wildcard), so structural unreachability is
-#      worth more than a rule: the router forwards :80/:443 only, and compose
-#      publishes this port bound to {$LAN_IP} — not 0.0.0.0. Two independent
+#      does not resolve off the LAN/tailnet (no public record since 2026-10-15),
+#      but structural unreachability is worth more than a rule, and holds even
+#      if a public record ever reappears: the router forwards :80/:443 only,
+#      and compose publishes this port bound to {$LAN_IP} — not 0.0.0.0. Two independent
 #      reasons a WAN packet cannot arrive. **Do NOT add a port-forward for
 #      {$WALL_PORT} on the router.**
 #   4. THE 403 DEFAULT. Anything that is not the panel — LAN or WAN — gets 403
 #      before it can reach a handler. The distinct body makes the sim able to
 #      tell Caddy's 403 apart from the tracker's own no-identity 403.
 #
-# CERTIFICATE: see stack/README.md §10 — the name is publicly resolvable via the
-# DDNS wildcard, and Caddy solves the ACME challenge over the EXISTING :80/:443
-# listeners, not over {$WALL_PORT}.
+# CERTIFICATE: see stack/README.md §10 — the name has no public record (it
+# resolves only via Technitium), and Caddy solves the ACME challenge via dns-01
+# TXT records, never over {$WALL_PORT}.
 {$WALL_HOST}:{$WALL_PORT} {
     import acme_cloudflare
     encode zstd gzip
@@ -438,9 +439,10 @@
 #                            it to attack. remote_ip, NEVER client_ip — the rule
 #                            the wall block states at length: client_ip trusts
 #                            X-Forwarded-For and would hand the allow-list to
-#                            anyone willing to forge a header. The names DO
-#                            resolve publicly (the DDNS wildcard answers any
-#                            label), so this gate is the protection, not DNS.
+#                            anyone willing to forge a header. The names do
+#                            not resolve off the LAN/tailnet (no public record
+#                            since 2026-10-15), but this gate is the protection,
+#                            not DNS: it must hold if a public record reappears.
 #   import hsts              see the snippet.
 #   import protect_admin     the one login, on everything except the sign-in
 #                            route itself and Kuma's push path.

@@ -174,9 +174,11 @@ get_token() {
 # CONVERSION IS DESTRUCTIVE, so it is guarded: an existing Primary zone is
 # exported to provision/ first, then deleted and recreated. The records are
 # re-added by main() below, so nothing has to be carried across.
+# zone_type TOKEN [ZONE] → the zone's type (Primary, Forwarder, ...), or empty
+# when no such zone exists. ZONE defaults to $DOMAIN.
 zone_type() {
     curl -fsS "${API}/api/zones/list?token=$1" 2>/dev/null \
-        | grep -o "\"name\":\"${DOMAIN}\",\"type\":\"[A-Za-z]*\"" | sed 's/.*"type":"\([A-Za-z]*\)"/\1/' | head -n1
+        | grep -o "\"name\":\"${2:-$DOMAIN}\",\"type\":\"[A-Za-z]*\"" | sed 's/.*"type":"\([A-Za-z]*\)"/\1/' | head -n1
 }
 ensure_zone() {
     local tok="$1" have
@@ -196,12 +198,43 @@ ensure_zone() {
     echo "  zone $DOMAIN created as a forwarder zone"
 }
 
-# add_a NAME → ensure an A record NAME.$DOMAIN → $LAN_IP exists exactly once.
-# Delete-then-add makes it declarative and idempotent.
+# add_a TOKEN FQDN IP → FQDN answers A IP from a PINPOINT zone of its own.
+#
+# ONE PRIMARY ZONE PER NAME (changed 2026-10-19). Until then the A record sat in
+# the $DOMAIN forwarder zone, and Technitium answers a forwarder zone's records
+# only for the TYPE they hold: AAAA and HTTPS queries for a hub name went on to
+# public DNS. With no public record they came back NXDOMAIN - "this name does
+# not exist" - beside an A answer saying it does, and an RFC 8020 resolver may
+# cache that for the whole name. While a public `*` wildcard existed
+# (2026-10-15..19) the same leak handed LAN clients Cloudflare's IPv6 addresses
+# and an HTTPS record pointing at Cloudflare, so an IPv6-capable client got
+# Cloudflare's 521 page instead of the hub.
+#
+# A Primary zone holding just this name is authoritative for it: A answers
+# locally and every other type is NOERROR/NODATA. Names this script does not
+# add - the apex, www - have no zone of their own and still fall through to the
+# forwarder zone, which resolves them publicly. Nested names (kuma.admin.<domain>
+# beside admin.<domain>) are separate zones; the longest match wins. Measured
+# on Technitium 15.2 with a scratch zone before the live run.
+#
+# The name's old record in the forwarder zone is removed, whatever address it
+# held, so each name has exactly one source. Overwrite-add keeps it idempotent.
 add_a() {
-    local tok="$1" fqdn="$2" ip="$3"
-    curl -fsS "${API}/api/zones/records/delete?token=${tok}&domain=$(url "$fqdn")&zone=$(url "$DOMAIN")&type=A&value=${ip}" >/dev/null 2>&1 || true
-    api "/api/zones/records/add?token=${tok}&domain=$(url "$fqdn")&zone=$(url "$DOMAIN")&type=A&ipAddress=${ip}&ttl=300&overwrite=true" >/dev/null
+    local tok="$1" fqdn="$2" ip="$3" old
+    if [ "$fqdn" = "$DOMAIN" ]; then
+        # A Primary zone named $DOMAIN would REPLACE the forwarder zone and
+        # claim the external website (the 2026-10-15 defect, TC-H-I02).
+        echo "  WARN: refusing a record for the apex ${DOMAIN} - it is the external website"
+        return 0
+    fi
+    if [ -z "$(zone_type "$tok" "$fqdn")" ]; then
+        api "/api/zones/create?token=${tok}&zone=$(url "$fqdn")&type=Primary" >/dev/null
+    fi
+    for old in $(curl -fsS "${API}/api/zones/records/get?token=${tok}&domain=$(url "$fqdn")&zone=$(url "$DOMAIN")" 2>/dev/null \
+                   | grep -o '"ipAddress":"[^"]*"' | sed 's/.*:"\(.*\)"/\1/'); do
+        curl -fsS "${API}/api/zones/records/delete?token=${tok}&domain=$(url "$fqdn")&zone=$(url "$DOMAIN")&type=A&value=${old}" >/dev/null 2>&1 || true
+    done
+    api "/api/zones/records/add?token=${tok}&domain=$(url "$fqdn")&zone=$(url "$fqdn")&type=A&ipAddress=${ip}&ttl=300&overwrite=true" >/dev/null
     echo "  A  ${fqdn} → ${ip}"
 }
 
@@ -254,8 +287,9 @@ main() {
     # a record here and WALL_HOST did not, so `dig wall.<domain>` returned
     # NXDOMAIN on a box that was otherwise a correct split-horizon resolver.
     #
-    # WHY NOBODY NOTICED: the DDNS updater keeps a wildcard `*.<domain>` at
-    # Cloudflare, so the name resolves perfectly from anywhere that is NOT using
+    # WHY NOBODY NOTICED: the DDNS updater then kept a wildcard `*.<domain>` at
+    # Cloudflare (retired 2026-10-15; a public wildcard is now a defect,
+    # TC-H-I01), so the name resolved from anywhere that was NOT using
     # this resolver — including the workstation anyone would test from. It fails
     # in exactly one place: on the LAN, through the hub, which is the only place
     # it is ever used. The panel points at this box for DNS (TC-P-C05) and the
@@ -335,9 +369,9 @@ main() {
     #
     # It was nearly missed the same way, and by the same reasoning: the compose
     # file said the wildcard DDNS record "already resolves it, so no new public
-    # name is created". That is true at Cloudflare and IRRELEVANT here. The
-    # wildcard is why the failure is invisible from anywhere NOT using this
-    # resolver — and this resolver is the only place the name is ever used. Read
+    # name is created". That was true at Cloudflare and IRRELEVANT here; since
+    # 2026-10-15 there is no wildcard, and this record is the ONLY answer the
+    # name has anywhere. This resolver is the only place the name is used. Read
     # the WALL_HOST note above; this is the second instance of it.
     #
     # Guarded on the label being set, so a hub without the profile gets no

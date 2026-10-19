@@ -25,9 +25,10 @@ Services (all health-checked, all `restart: unless-stopped`):
   trusted headers (D3).
 - **Actual Budget** — finances, at `actual.admin.<domain>` behind the admin
   login (and its own server password).
-- **ddns** — Cloudflare dynamic-DNS updater (qmcgaw/ddns-updater): keeps the
-  apex + wildcard A records pointed at the home IP, checked every
-  `DDNS_PERIOD` (default 5m). Replaces the legacy DDNS-Cloudflare-PowerShell
+- **ddns** — RETIRED 2026-10-15 (the hub publishes no public record; a
+  `*.<domain>` wildcard at Cloudflare is a defect, verify-hub TC-H-I01). It
+  was qmcgaw/ddns-updater, keeping the apex + wildcard A records pointed at the
+  home IP every `DDNS_PERIOD`. It replaced the legacy DDNS-Cloudflare-PowerShell
   scripts on Mini-serv (WI-9 Q4). Needs a NEW scoped Cloudflare token — the
   old share token is rotation-flagged (see `.env.example`).
 - **Uptime-Kuma · Dozzle · Homepage** — the admin portal's tools,
@@ -178,7 +179,7 @@ Fill in at minimum:
 | `OAUTH2_PROXY_COOKIE_SECRET` | `openssl rand -base64 32 \| tr -- '+/' '-_'` |
 | `OAUTH2_PROXY_ALLOWED_EMAILS` | comma-separated Google accounts permitted into the tracker |
 | `TRACKER_DATA_REMOTE` | git remote of your private **data** repo (single-user); blank for multi-user |
-| `CLOUDFLARE_ZONE_ID` / `CLOUDFLARE_API_TOKEN` | dynamic DNS (`ddns` service) — a **new** scoped token (Zone→DNS→Edit, this zone only); never reuse the old plaintext token that sat on the legacy Windows box's setup share |
+| `CLOUDFLARE_ZONE_ID` / `CLOUDFLARE_API_TOKEN` | Caddy's dns-01 certificate challenge (the `ddns` service that also read it was retired 2026-10-15) — a **new** scoped token (Zone→DNS→Edit, this zone only); never reuse the old plaintext token that sat on the legacy Windows box's setup share |
 | `BACKUP_DRIVE_DEVICES` / `BACKUP_DRIVE_STANDBY` | backup-drive spin-down (WI-10.10) — space-separated `/dev/disk/by-id/...` paths (never `sdX`, it renumbers); empty = no-op |
 
 > **This table lists the knobs that need YOUR values filled in.** For the full
@@ -606,9 +607,10 @@ load-bearing:
 | The port is published bound to `{$LAN_IP}` **and the router never forwards it** | `docker-compose.yml` `ports:` + your router | the site is on the internet |
 | `respond 403` default | Caddyfile | a miss becomes a fall-through instead of a refusal |
 
-**Do NOT add a router forward for `WALL_PORT`.** The hostname resolves publicly
-the day it exists (the DDNS updater maintains a wildcard record), so structural
-unreachability is doing real work here.
+**Do NOT add a router forward for `WALL_PORT`.** The hostname does not resolve
+off the LAN/tailnet (no public record since 2026-10-15; Technitium alone answers
+it), but structural unreachability is doing real work here: it is what still
+protects the site if a public record ever reappears.
 
 Enabling it: fill `WALL_HOST`, `WALL_PORT`, `PANEL_IP`, `PANEL_USER_SUB` in
 `.env`, add the host's bare label to `EXTRA_SUBDOMAINS` (so provisioning creates

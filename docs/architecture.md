@@ -110,9 +110,11 @@ graph LR
   chain (`scripts/ensure-local-images.sh`: present → sibling build → declared
   public image). The migrated `stack/tracker/*.deprecated` files are
   reference-only. Cross-repo contracts: `docs/requirements/interfaces.csv`.
-- **DDNS (WI-9 Q4):** the `ddns` container keeps the apex + wildcard Cloudflare
-  A records pointed at the home IP, so the whole external path survives an IP
-  change.
+- **DDNS (WI-9 Q4) - RETIRED 2026-10-15:** the `ddns` container is gone. The hub
+  is LAN/tailnet-only: no public DNS record exists for any hub name and there is
+  no `*.<domain>` wildcard at Cloudflare (the apex and `www` are an external
+  website). Hub names resolve only through Technitium (split-horizon); a new
+  one needs a record there. The Cloudflare token remains for Caddy's dns-01 only.
 - **Observability (WI-10.11):** Uptime-Kuma and Dozzle, behind the admin
   portal (above); optional ntfy as a household app.
 - **Backup (WI-10.10/SR-013):** the bash backup service (systemd timer, not a

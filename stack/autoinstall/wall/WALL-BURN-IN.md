@@ -192,7 +192,8 @@ hardware?". Until a dated entry exists, the S3 claim above is inherited belief.
       curl -sv https://$WALL_HOST:$WALL_PORT/            # must NOT connect at all
       curl -s  https://$WALL_HOST/                       # :443 — must be the normal 404/403 path
       ```
-      The name resolves publicly (the DDNS wildcard), so this is load-bearing: it
+      The name has no public record (since 2026-10-15), but this stays
+      load-bearing in case one reappears: it
       must fail to connect because the router does not forward the port, and the
       `/32` + LAN-bound publish are the second and third layers behind that.
 - [ ] Confirm the **certificate** for `WALL_HOST` issued. It is validated over the

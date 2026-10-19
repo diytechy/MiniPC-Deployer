@@ -193,11 +193,15 @@ def _opencode_monthly(resets_at):
     ("2028-03-01T00:00:00Z", "2028-02-01T00:30:00Z", 29),   # leap February
     ("2027-03-31T12:00:00Z", "2027-03-01T00:00:00Z", 31),   # Feb 28 start, clamped
     ("2026-12-01T00:00:00Z", "2026-11-30T23:00:00Z", 30),   # last hour of the month
+    ("2027-01-15T06:00:00Z", "2026-12-16T00:00:00Z", 31),   # January: December start, year rollover
+    ("2026-10-31T00:00:00Z", "2026-10-01T00:00:00Z", 31),   # 31st: 30 September start (clamped)
+    ("2028-03-31T00:00:00Z", "2028-03-01T00:00:00Z", 31),   # leap: 29 February start (clamped)
+    ("2026-11-19T00:11:14.999Z", "2026-10-19T03:58:24Z", 31),  # fractional seconds, as the vendor sends
 ])
 def test_opencode_monthly_window_is_the_calendar_month_ending_at_the_reset_sr021(resets_at, now, days):
     out = feeder.parse_opencode(_opencode_monthly(resets_at), _epoch(now))
     reading = out["ai-usage-opencode-monthly"]
-    assert reading.window_end == _epoch(resets_at)
+    assert reading.window_end == _epoch(resets_at.replace(".999Z", "Z"))
     assert reading.window_seconds == days * 24 * 3600
     assert feeder.window_kind_for(reading.window_seconds) == "monthly"
 

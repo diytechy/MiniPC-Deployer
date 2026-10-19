@@ -750,10 +750,31 @@ def parse_claude_scoped(payload, now, problems, scoped_models=CLAUDE_SCOPED_MODE
 #                   thing this gauge can show.
 OPENCODE_TRUSTED_STATUSES = frozenset({"ok", "rate-limited"})
 
+# The monthly bucket is a CALENDAR month ending at `resetsAt`, so its length is
+# derived from the reset (28-31 days) rather than fixed. A fixed 30 days put the
+# start of every 31-day month in the future, and check_window refused the
+# reading as "the window has not begun" for its first day - measured 2026-10-19
+# on a fresh key whose month reset 2026-11-19T00:11:14Z. Every derived length is
+# still "monthly" to window_kind_for (<= 32 days).
+CALENDAR_MONTH = "calendar-month"
+
 OPENCODE_BUCKETS = (
     ("weekly", "ai-usage-opencode-weekly", "OpenCode weekly", 7 * 24 * 3600),
-    ("monthly", "ai-usage-opencode-monthly", "OpenCode monthly", 30 * 24 * 3600),
+    ("monthly", "ai-usage-opencode-monthly", "OpenCode monthly", CALENDAR_MONTH),
 )
+
+
+def calendar_month_seconds(window_end):
+    """Length of the calendar month that ends at epoch second `window_end`.
+
+    The start is the same UTC wall-clock instant one month earlier, its day
+    clamped to that month's length (a month ending on 31 March starts on 28 or
+    29 February). Nothing is assumed beyond the vendor's own reset instant.
+    """
+    end = datetime.fromtimestamp(int(window_end), timezone.utc)
+    year, month = (end.year, end.month - 1) if end.month > 1 else (end.year - 1, 12)
+    start = end.replace(year=year, month=month, day=min(end.day, calendar.monthrange(year, month)[1]))
+    return int(window_end) - int(start.timestamp())
 
 
 def parse_opencode(payload, now):
@@ -811,10 +832,10 @@ def parse_opencode(payload, now):
         try:
             percent = check_percent(bucket.get("percent"), "opencode " + field)
             resets_at = bucket.get("resetsAt")
-            window_end, window_seconds = check_window(
-                None if resets_at is None
-                else parse_iso8601_utc(resets_at, "opencode " + field),
-                window_seconds, now, "opencode " + field)
+            end = None if resets_at is None else parse_iso8601_utc(resets_at, "opencode " + field)
+            if window_seconds == CALENDAR_MONTH:
+                window_seconds = None if end is None else calendar_month_seconds(end)
+            window_end, window_seconds = check_window(end, window_seconds, now, "opencode " + field)
         except SourceFailure as exc:
             problems.append(str(exc))
             continue

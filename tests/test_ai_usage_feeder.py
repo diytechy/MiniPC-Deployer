@@ -170,6 +170,44 @@ def test_parse_opencode_reads_named_windows_and_skips_rolling_sr021():
     assert out["ai-usage-opencode-monthly"].percent == 89.0
 
 
+def _epoch(text):
+    from datetime import datetime, timezone
+    return int(datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+
+
+def _opencode_monthly(resets_at):
+    body = json.loads(json.dumps(OPENCODE_BODY))
+    body["usage"]["monthly"]["resetsAt"] = resets_at
+    del body["usage"]["weekly"]
+    return body
+
+
+# OpenCode's month is a CALENDAR month ending at `resetsAt`. A fixed 30-day
+# window put the start of a 31-day month in the future, and check_window then
+# refused the reading as "the window has not begun" - measured 2026-10-19 on the
+# Owner's new key: resetsAt 2026-11-19T00:11:14Z, seen at 03:58 that day, and
+# the monthly gauge stayed UNAVAILABLE for its first day.
+@pytest.mark.parametrize("resets_at,now,days", [
+    ("2026-11-19T00:11:14Z", "2026-10-19T03:58:24Z", 31),   # the observed case
+    ("2027-03-01T00:00:00Z", "2027-02-01T00:30:00Z", 28),   # February
+    ("2028-03-01T00:00:00Z", "2028-02-01T00:30:00Z", 29),   # leap February
+    ("2027-03-31T12:00:00Z", "2027-03-01T00:00:00Z", 31),   # Feb 28 start, clamped
+    ("2026-12-01T00:00:00Z", "2026-11-30T23:00:00Z", 30),   # last hour of the month
+])
+def test_opencode_monthly_window_is_the_calendar_month_ending_at_the_reset_sr021(resets_at, now, days):
+    out = feeder.parse_opencode(_opencode_monthly(resets_at), _epoch(now))
+    reading = out["ai-usage-opencode-monthly"]
+    assert reading.window_end == _epoch(resets_at)
+    assert reading.window_seconds == days * 24 * 3600
+    assert feeder.window_kind_for(reading.window_seconds) == "monthly"
+
+
+def test_an_opencode_month_that_has_not_begun_is_still_refused_sr021():
+    # Two months out: even a calendar month ending there starts a month from now.
+    with pytest.raises(feeder.SourceFailure, match="has not begun"):
+        feeder.parse_opencode(_opencode_monthly("2026-12-19T00:11:14Z"), _epoch("2026-10-19T03:58:24Z"))
+
+
 def test_parse_opencode_skips_a_bucket_the_vendor_flagged_sr021():
     body = json.loads(json.dumps(OPENCODE_BODY))
     body["usage"]["weekly"]["status"] = "degraded"

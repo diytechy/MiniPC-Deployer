@@ -40,7 +40,6 @@ graph LR
     caddy -->|"*.admin sites: forward_auth"| aauth["admin-auth<br/>one admin login"]
     caddy -->|"actual.admin (signed in)"| actual["Actual Budget"]
     caddy -->|"dns.admin via the admin bridge gateway"| tech
-    ddns["ddns<br/>(Cloudflare A records)"] -.->|follows home IP| net
     backup["bash backup service<br/>(systemd timer)"] -.->|"wake (WoL) then cifs INGEST + volume: sources"| net
     backup -.->|"mirror network shares into"| lib[("library tree<br/>(on-box)")]
     lib -.->|"the client is pointed at chosen paths"| ice["IceDrive client<br/>(on-box, SR-015 session)"]
@@ -59,8 +58,13 @@ graph LR
     end
 ```
 
-- **Ingress:** the router forwards :80/:443 to Caddy, which terminates TLS
-  (public cert, valid on-LAN via split-horizon) and routes per host.
+- **Ingress:** LAN and tailnet clients reach Caddy on :80/:443 through
+  Technitium's split-horizon answers; Caddy terminates TLS (a publicly trusted
+  cert from dns-01) and routes per host. *(Corrected 2026-10-19: this line said
+  "the router forwards :80/:443 to Caddy". The ISP port forward stopped working
+  and the public path was retired on 2026-10-15, `f59f796`; HomeHub FOLLOWUPS
+  "2026-10-15 — The hub went LAN/tunnel-only". The ddns node is gone from the
+  diagram above for the same reason; see "DDNS" below.)*
 - **Auth split (D1/D2):** the tracker host goes through **oauth2-proxy** (Google
   sign-in, allow-list). The tracker container is bridge-only (`expose`, plus a
   loopback publish for the host feeders) so its only network ingress is a Caddy
@@ -84,7 +88,10 @@ graph LR
   household-app sites and the LLM gateway answer only `LAN_CIDR` (LAN + tunnel)
   and give everyone else 403 before any login — so none of it depends on the
   router forward. The tracker and the game relay are the two sites that answer
-  the internet.
+  the internet. *(2026-10-19: since 2026-10-15 there is no router forward, so
+  no site is reachable from the internet; whether the game relay, public by
+  ruling, is disabled, moved or made tailnet-only is an Owner decision still
+  owed per HomeHub FOLLOWUPS 2026-10-15.)*
 - **Household apps with their own clients (Phase B):** Immich, Jellyfin,
   Navidrome and ntfy get `photos.`, `jellyfin.`, `music.` and `ntfy.` sites
   outside the admin namespace, with **no** admin login (their apps cannot do a
@@ -99,7 +106,8 @@ graph LR
   one (a delete of that field would be applied *after* the set and erase it —
   see the Caddyfile banner); the source must match `{$PANEL_IP}/32`, not the LAN
   CIDR; the port is published bound to `LAN_IP` and the router forwards only
-  :80/:443, so a WAN packet cannot arrive; and everything else gets `403` at the
+  :80/:443 (nothing at all since 2026-10-15), so a WAN packet cannot arrive;
+  and everything else gets `403` at the
   edge. The same site serves the shell's static build, because NagLight sends no
   CORS headers and the app's `/api/*` calls must be same-origin.
 - **DNS:** Technitium owns :53 on the host network and serves split-horizon

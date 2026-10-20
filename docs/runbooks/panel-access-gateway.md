@@ -6,9 +6,21 @@ every legacy `/api/*` request on the wall site and proxies `/v1/*` to this
 service, which checks a device credential and a PIN session before it puts the
 Owner's identity on an upstream tracker call.
 
-**Nothing in this document has been executed on the hub.** Every command is for
-the coordinator or the Owner. Steps marked **[Owner present]** type a secret and
-cannot be delegated to a session at all.
+> **Status 2026-10-19.** Part of this runbook has been executed. On 2026-09-13
+> the gateway (`ab22b9d`) was staged on the hub, the feed token installed, the
+> PIN bootstrapped with `setup.mjs` and the panel credential issued (HomeHub
+> `docs/PANEL_CURRENT_2026-09-13.md`, the "C0a done and merged" entry). The
+> cutover (`PANEL_ACCESS_ENABLED=true`, recreate `panel-access` and Caddy) was
+> held for the Owner, and the trackers record no cutover since: from
+> 2026-09-14 the panel runs `accessMode` `local` (PANEL_CURRENT row 13), and
+> the staged gateway stays optional (PANEL_CURRENT "Cutover" row). The live
+> hub's flag was not checked for this note. The next paragraph is the original
+> 2026-09-13 banner.
+
+*(As written 2026-09-13, before any step ran:)* **Nothing in this document has
+been executed on the hub.** Every command is for the coordinator or the Owner.
+Steps marked **[Owner present]** type a secret and cannot be delegated to a
+session at all.
 
 Read alongside `stack/panel-access/README.md` (the cutover and its safety
 argument), `stack/panel-access/PROVISIONING.md` (the panel half) and the

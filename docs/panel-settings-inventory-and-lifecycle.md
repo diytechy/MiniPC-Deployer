@@ -1,5 +1,14 @@
 # Panel settings inventory, lifecycle acceptance, and the motion takeover plan
 
+> **Status 2026-10-19:** the procedures below are now registered test cases in the
+> HomeHub repo's `docs/LAB_TEST_PLAN.md`. Item 21's tests 21.1–21.9 are
+> TC-P-H01..H09, and item 16's acceptance A–C is TC-P-I01..I03. Run them from
+> there. Door motion went live 2026-10-16, so item 21 is runnable, though 21.8/21.9
+> assume a yellow lease that WSN-059 later removed (the new rows say so). This
+> document stays as the home of the item-16 settings-store inventory. That
+> inventory is a 2026-09-13 snapshot, so check a store against current code before
+> relying on it.
+
 Group C deliverables for Owner items **16** (inventory + sleep/power-cycle
 acceptance) and **21** (door motion takeover test plan), 2026-09-13.
 

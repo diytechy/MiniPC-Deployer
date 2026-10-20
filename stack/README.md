@@ -75,9 +75,11 @@ stack/
   mosquitto/
     mosquitto.conf              MQTT broker config (tier-2 homeassistant/mosquitto profiles, §9)
   tracker/
+    tracker-defs-guard.sh     LIVE lane: deleted-definitions alarm (IF-036; firstboot installs it + its timer)
+    frame-freshness.sh        LIVE lane: picture-frame video freshness (IF-035; firstboot installs it + its timer)
     Dockerfile.deprecated     REFERENCE ONLY — NagLight owns the canonical build (WI-10.4)
     entrypoint.sh.deprecated  REFERENCE ONLY
-    README.md                 why these are deprecated + the local build step
+    README.md                 the two lanes, why the .deprecated files stay, the local build step
   provision/
     provision-technitium.sh   ZERO-TOUCH DNS: token + zone + split-horizon records + forwarders + blocklists (idempotent)
     healthcheck.sh            one-shot PASS/FAIL box check (Technitium API, dig, tracker, actual)

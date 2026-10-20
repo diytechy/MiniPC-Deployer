@@ -12,8 +12,9 @@
 # --refresh fetches the upstream pack at PRESET_REPO/PRESET_COMMIT, copies the
 # files named in presets.select, and REWRITES presets.lock. That is the only
 # mode that can change what a panel installs, and its output must be reviewed --
-# including its licence position, which is an Owner ruling and is NOT settled
-# (see projectm-presets/README.md).
+# including its licence position. The Owner ruled on 2026-09-18: the whole pack,
+# installed on the one private panel, with no preset committed to any repository.
+# A refresh must stay inside that ruling (see projectm-presets/README.md).
 set -euo pipefail
 
 fail() { echo "[projectm-presets] $*" >&2; exit 1; }

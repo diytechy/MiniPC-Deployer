@@ -250,6 +250,18 @@ def steps(coverage, tier, gate, phase=None):
             {"G1", "G2", "G3"},
             "process",
         ),
+        # Interface index freshness (added 2026-10-19, local to this repo): the
+        # index block in docs/interfaces.md is generated from
+        # docs/requirements/interfaces.csv by gen_if_index.py, because the
+        # hand-kept list had drifted to 12 of the CSV's 31 rows. Stdlib-only;
+        # runs from G1 like doc-navigability, since the page exists from G1.
+        (
+            "if-index",
+            (),
+            [sys.executable, str(_SCRIPTS / "gen_if_index.py"), "--check"],
+            {"G1", "G2", "G3"},
+            "process",
+        ),
         # Performance budgets (process.md §9): the kit-owned *comparator* (stdlib,
         # metric-agnostic) checks the project's measured perf-metrics.json against
         # the budgets registry + committed baseline. Tier-threaded so size-class

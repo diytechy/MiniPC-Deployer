@@ -190,6 +190,21 @@ Fill in at minimum:
 > knobs (`COMPOSE_PROFILES`, `MEDIA_ROOT`, `EXTRA_SUBDOMAINS`, per-service
 > pins/ports/passwords) live in the same file — see §9.
 
+> **Giving someone else tracker access, or taking it away.** The tracker is
+> multi-user (per-user data keyed by Google `sub`), so access is only the
+> allow-list:
+>
+> - **Grant:** append the address to `stack/oauth2-proxy/authenticated-emails.txt`.
+>   oauth2-proxy watches that file, so no restart is needed. Add it to
+>   `OAUTH2_PROXY_ALLOWED_EMAILS` as well, or a reimage drops it — the file is
+>   materialized from that key at first boot.
+> - **Edit the file in place** (`cat new > file`). It is a single-file bind mount,
+>   so replacing the inode leaves the container reading the old one.
+> - **Revoke:** the allow-list is checked at sign-in, not per request, and the
+>   cookie lasts 168 h with refresh disabled. Removing an address does not end a
+>   session already issued; rotating `OAUTH2_PROXY_COOKIE_SECRET` does, and signs
+>   everyone out.
+
 **Filling these in today is a manual step.** The automated secret-handoff
 design in the sibling `Personal` repo's `SECRET_HANDOFF.md` was **ratified
 2026-07-25** but is **not built yet**, so hand-fill `.env` until it exists.

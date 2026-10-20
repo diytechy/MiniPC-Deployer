@@ -268,9 +268,12 @@ with the adapter genuinely absent will reset the hub, which is the point.
 The measurement record behind all of it, including the trigger circuit that is
 still to be built, is `PANEL_AMP_AUTOPOWER.md` in the HomeHub repo.
 The LCUS-2 alternative changes only the final actuator. The detector still
-watches the same line-in and kiosk/Bluetooth monitor sources. Its CH340 serial
-path, selected channel and physical limitations are recorded in the application
-repo's `docs/lcus2-amplifier-trigger-plan.md`.
+watches the same line-in and kiosk/Bluetooth monitor sources. The actuator's
+current contract is SN-020 / SR-026 / LLR-010 / LLR-938 and the LCUS-2 section of
+[`docs/architecture.md`](../../docs/architecture.md). The application repo's
+original plan (CH340 serial path, selected channel, physical limitations) is
+archived at OfficeWallNaglight
+`docs/archive/2026-10-19/docs/lcus2-amplifier-trigger-plan.md`.
 
 A mute method (`set_mute`) is planned for THIS broker and will be the first
 mutation it actually performs; the design and the open journal-class question

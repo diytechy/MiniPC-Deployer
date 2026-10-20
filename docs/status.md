@@ -476,7 +476,7 @@ repair and force input mute. Cross-implementation regression cases cover
 negative, boolean and unsafe-integer counters. WSL targeted audio suite:
 366 passed. Active gate remains G1; no live deployment or gate advancement.
 The coordinator's final validation and hardware limitations are recorded in
-HomeHub `docs/PANEL_FOLLOWUP_2026-09-14.md`.
+HomeHub `docs/archive/2026-10-19/PANEL_FOLLOWUP_2026-09-14.md`.
 
 **2026-09-13 — the AI-usage feeder is DEPLOYED.** The gauge-rail redesign's
 feeder half (`stack/ai-usage/ai_usage_feeder.py`, plus its README and timer)
@@ -1549,7 +1549,7 @@ opt-in deploy configuration, protected Caddy routing, offline sensor installatio
 private host config and camera-off verification changes. Defaults remain disabled;
 no live deploy or ISO build occurred. Active gate stays G1. Nine targeted tests,
 config validation, Bash parsing and G1 smoke pass; hardware/Linux/Caddy runtime
-proof remains open. [Implementation and operator handoff](panel-capabilities-implementation-2026-09-06.md).
+proof remains open. [Implementation and operator handoff](archive/2026-09-13/docs/panel-capabilities-implementation-2026-09-06.md).
 
 The older cold-session block below is historical; HomeHub's current operating
 brief supersedes its dated live-box state.

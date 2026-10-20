@@ -1,10 +1,16 @@
+> **ARCHIVED 2026-10-19 — may be out of date.** Historical session evidence;
+> not current deployment state, and not instructions to repeat old actions.
+> What was still open when this was archived is carried in
+> [FOLLOWUPS.md](../../../../../HomeHub/FOLLOWUPS.md) or [open-items.md](../../../../../HomeHub/open-items.md); what ships is in the
+> requirement spines.
+
 # Plan — finish Option E, and write the burn-in that never existed
 
 Two items were left open when the hub was reimaged on 2026-08-28. Both are
 self-contained and can start cold. Read the Current State header of
-[status.md](status.md) first for the machine state; read
-[../REMOTE_MANAGEMENT.md](../REMOTE_MANAGEMENT.md) Part 2 Option E and
-[../remote-reimage/README.md](../remote-reimage/README.md) for how the reimage
+[status.md](../../../status.md) first for the machine state; read
+[../REMOTE_MANAGEMENT.md](../../../../REMOTE_MANAGEMENT.md) Part 2 Option E and
+[../remote-reimage/README.md](../../../../remote-reimage/README.md) for how the reimage
 path works.
 
 ---

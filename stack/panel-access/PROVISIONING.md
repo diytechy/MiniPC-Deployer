@@ -1,18 +1,33 @@
 # Panel provisioning: protected access, camera, sensors, door motion
 
-> **2026-09-14 local-capability update:** the image now installs the sensor
-> runtime and `/run/wall-local-setup/service.sock` independently of gateway
-> registration. `WALL_CAMERA_ENABLED` is legacy migration input and does not
-> blacklist hardware. The current contract and rollback procedure are in
-> `docs/panel-local-capabilities-implementation-2026-09-14.md`; older camera and
-> manual sensor-install steps below are historical and must not guide a new image.
+> **2026-09-14 local-capability update (pointer updated 2026-10-19):** the image
+> now installs the sensor runtime and `/run/wall-local-setup/service.sock`
+> independently of gateway registration. `WALL_CAMERA_ENABLED` is legacy
+> migration input and does not blacklist hardware. The current contract and
+> rollback procedure are the section
+> [Current contract: local capabilities](#current-contract-local-capabilities-deployed-2026-09-14)
+> below, merged in on 2026-10-19 from
+> `docs/panel-local-capabilities-implementation-2026-09-14.md`, now archived as
+> [docs/archive/2026-10-19/docs/panel-local-capabilities-implementation-2026-09-14.md](../../docs/archive/2026-10-19/docs/panel-local-capabilities-implementation-2026-09-14.md).
+> Older camera and manual sensor-install
+> steps below (§1e "Face unlock in local mode", §2, §3, §5) are historical
+> where they disagree with it and must not guide a new image.
 
 Group C deliverable C1, 2026-09-13. This is the procedure for turning the four
 unprovisioned capabilities on, written so that a re-image reproduces it.
 
-**Nothing in this document has been executed.** Every step is for the Owner or
-the coordinator to run. Steps marked **[Owner present]** cannot be delegated to
-a session at all: they either type a secret or look at the physical world.
+> **Status 2026-10-19:** much of this has since been run. §1a's gateway
+> bootstrap and §3's installer ran on 2026-09-13 (HomeHub
+> `docs/PANEL_CURRENT_2026-09-13.md`, the "C0a done and merged" entry); local
+> mode (§1e) has been the panel's mode since 2026-09-14 (PANEL_CURRENT row 13);
+> door motion (§4) went live on 2026-10-16 (HomeHub `FOLLOWUPS.md`, "Carried by
+> the documentation clean-up"). No §1b cutover is recorded. The next paragraph
+> is the original 2026-09-13 banner.
+
+*(As written 2026-09-13:)* **Nothing in this document has been executed.**
+Every step is for the Owner or the coordinator to run. Steps marked
+**[Owner present]** cannot be delegated to a session at all: they either type a
+secret or look at the physical world.
 
 Every step is reversible, and the reversal is stated with it.
 
@@ -22,6 +37,84 @@ Read alongside:
   panel-preparation section this document extends.
 * `OfficeWallNaglight/gateway/README.md` — the gateway's own runbook.
 * `stack/autoinstall/wall/wall.env.example` — every knob named below.
+
+---
+
+## Current contract: local capabilities (deployed 2026-09-14)
+
+*Merged 2026-10-19 from `docs/panel-local-capabilities-implementation-2026-09-14.md`
+(now `docs/archive/2026-10-19/docs/`). The text is that document's, unchanged,
+except its status lines and the Rollback heading's level. It said "implemented and independently reviewed …;
+not deployed". It was deployed on 2026-09-14: app/site `566495a` and panel
+system updates through MiniPC-Deployer `c82fe9b`, which contains the
+provisioning commit `1638cba` (HomeHub `docs/PANEL_CURRENT_2026-09-13.md`, the
+local-capabilities paragraph after the item table). At that deployment camera
+capture was off, the pinned face models were absent, and physical sensing,
+wake and reboot acceptance remained open; later camera and face state is
+tracked in PANEL_CURRENT, not here.*
+
+The wall image stages the hash-locked sensor wheelhouse and installs
+`wall-sensors.service` on first boot even when no gateway registration exists.
+The app artifact must declare `local-capabilities-v1` and carry
+`electron/panel-access.cjs`, `electron/sensor-observations.cjs`, and
+`sensors/config.py`. A private model bundle is optional. When supplied, its
+manifest must name exactly `det_10g.onnx` and `w600k_r50.onnx` with lowercase
+SHA-256 digests; verified bytes and the canonical raw mapping land at
+`/opt/wall-sensors/models/manifest.json` atomically. Missing models leave face
+unready without blocking motion, Bluetooth or PIN.
+
+`wall-local-setup.service` owns `/run/wall-local-setup/service.sock` and accepts
+one bounded JSON request from the `panel` UID. `status` returns only revision,
+bootstrapAllowed, localConfigured, and remoteConfigured. `configure` accepts
+`expectedRevision`, `accessMode:"local"`, and, for a protected gateway panel,
+the current session and PIN. The helper repeats that authorization directly to
+the root-read gateway registration and never logs or stores either value. It
+then atomically merges the local fields into `host.json`, preserves all gateway,
+renderer, PIN and enrollment state, and persists the choice in root-owned
+`local-capabilities.json`. Firstboot reapplies that source of truth.
+
+Camera discovery is separate from capture. Firstboot removes only the retired
+product-owned `/etc/modprobe.d/wall-camera-off.conf` and may load `uvcvideo`; it
+does not open a video node. Saved schema-v2 sensor configuration with
+`cameraConsentVersion:1` is the authority. An absent or false legacy flag cannot
+block explicit local opt-in, and migration does not turn capture on.
+
+Software camera/Bluetooth wake keeps the CPU running and uses display-off.
+[2026-10-13: the camera wake source is presence, motion or face-shaped; face unlock alone does not keep the CPU awake.]
+`wall-sleep.sh` derives this from `/var/lib/wall-sensors/config.json`; missing or
+invalid config conservatively selects display-off because suspend would make an
+intended software wake impossible. A `wake` helper request is checked against a
+fresh positive protocol-v2 sensor status before the helper invokes
+`wall-sleep.sh sensor-wake`. That operation raises the backlight and clears the
+absence clock; it does not unlock the UI.
+
+### Rollback (local capabilities)
+
+Stop and disable `wall-local-setup.service`, then remove its unit, executable and
+runtime socket. Keep `/etc/wall-panel/host.pre-local-capabilities.json` private;
+it is the pre-change backup and may contain gateway credentials. Prefer removing
+only `localAccessEnabled`, `localCapabilitiesVersion`, `localFacePolicyVersion`,
+`localSetupSocket`, and `sensorModelManifest` from the current host JSON so newer
+renderer or gateway values survive. Restore the backup only when the whole host
+file must return to its exact earlier state. Install it as `root:panel` mode
+0640 for this app contract. If the app is also rolled back to the legacy reader,
+install it as `panel:panel` mode 0600, which is that reader's known private-file
+contract. Never print either file.
+
+To restore the prior driver policy, use the one-time private record firstboot
+created. If `/etc/wall-panel/wall-camera-off.pre-local-capabilities.conf`
+exists, stop the sensor service and install that exact file back at
+`/etc/modprobe.d/wall-camera-off.conf` as `root:root` mode 0644. If the mutually
+exclusive `.absent` marker exists, leave the policy absent. Never invent a
+blacklist when the recorded prior state was absent. Reboot after restoring the
+recorded policy. To roll back sensor provisioning, stop and disable
+`wall-sensors.service` and restore the earlier app and image together. Preserve
+`/var/lib/wall-panel` and `/var/lib/wall-sensors` unless the Owner explicitly
+intends to delete PIN, keys, enrollment and saved sensor choices. Removing those
+directories is credential recovery, not ordinary rollback.
+
+As written on 2026-09-14: camera LED/capture, physical wake, model inference
+and reboot behavior remained real-panel acceptance.
 
 ---
 
@@ -239,6 +332,10 @@ masked. It never degrades to "no PIN set".
 
 Face is **optional** and adds two hardware prerequisites to the PIN:
 
+> *2026-10-19: the first bullet is superseded. `WALL_CAMERA_ENABLED` no longer
+> blacklists anything; saved sensor configuration with `cameraConsentVersion:1`
+> is the authority. See "Camera discovery" in the current contract above.*
+
 * `WALL_CAMERA_ENABLED=true` in `wall.env` (section 2). This gate is
   **authoritative**: `false` blacklists `uvcvideo`, so no software setting can
   turn the camera on, and face simply never becomes available.
@@ -268,6 +365,11 @@ a supported configuration, and the one the panel ships in.
 ---
 
 ## 2. The camera
+
+> *2026-10-19: historical (2026-09-13). Since 2026-09-14 firstboot removes the
+> legacy blacklist rather than writing it, and `WALL_CAMERA_ENABLED` is
+> migration input only (`stack/autoinstall/wall/wall-firstboot.sh`, the
+> `CAM_BLACKLIST` block). See "Camera discovery" in the current contract above.*
 
 `WALL_CAMERA_ENABLED=false` in `wall.env` is the single source. Firstboot
 renders the canonical boolean into `kiosk.env` **and** enforces it at the
@@ -312,6 +414,11 @@ real on this panel: there is no sensor unit, and `host.json` has no
 fixed separately in OfficeWallNaglight; this section is the host half.
 
 ### The unit exists. Nothing installs it.
+
+> *2026-10-19: historical (2026-09-13). `wall-firstboot.sh` now runs
+> `install-wall-capabilities.sh` itself, from the payload's sensor wheelhouse,
+> with or without a gateway registration (the `SENSOR_WHEELHOUSE` block). See
+> the current contract above.*
 
 `stack/autoinstall/wall/wall-sensors.service` is tracked, and
 `stack/autoinstall/wall/install-wall-capabilities.sh` performs every install

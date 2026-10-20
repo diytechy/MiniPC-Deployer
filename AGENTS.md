@@ -2,23 +2,33 @@
 
 > **Current follow-up:** the panel item ledger is [panel findings](../HomeHub/docs/PANEL_CURRENT_2026-09-13.md),
 > and what is still unfinished out of the archived handoffs is [FOLLOWUPS.md](../HomeHub/FOLLOWUPS.md).
-> Read both first. The round-2 coordinator handoff this line used to point at was archived by the
-> 2026-09-18 documentation cleanup and now lives at
-> [docs/archive/2026-09-18/](../HomeHub/docs/archive/2026-09-18/HANDOFF-panel-round2-coordinator-2026-09-14.md);
-> it is history, so the live pointer is FOLLOWUPS.md rather than the archived copy.
-> Dated build plans now redirect to historical records. All standing
-> operating rules below remain in force.
+> Read both first. Archived handoffs and dated plans are evidence, not
+> instructions. All standing operating rules below remain in force.
 
 
 **What this file does:** the standing brief for any agent or human working in
 this repo — *how we build here*, so quality doesn't depend on who (or which
 model) shows up. It is loaded every session: keep it short and current.
-Project facts live in `docs/`; this file points at them.
+Project facts live in `docs/`; this file points at them. `CLAUDE.md` and
+`GEMINI.md` are pointer stubs back here; keep content out of them.
 
-> Copy this into a new repo as `AGENTS.md` (the cross-tool standard). Thin
-> `CLAUDE.md`/`GEMINI.md` stubs point back here. Fill the **Project** section
-> and delete guidance that doesn't apply. Everything below the line is
-> durable — change it deliberately, not per-task.
+---
+
+## Repo rules (read before your first commit)
+
+- **Integration branch: `IceDrive-DesktopDirection`.** `main` is hundreds of
+  commits behind; never build from it. Cut a feature branch from the
+  integration branch, merge it back `--no-ff` before any image build, and
+  build only from the integration branch.
+- **Agents commit locally; the Owner pushes.** Never push.
+- **This repo is PUBLIC.** No household value may enter it: no IPs, MACs,
+  emails, names, PINs, serials or secrets. Real values live in the private
+  HomeHub repo's deploy config and are materialised at build time. The
+  identity-scanning privacy gate exists only in HomeHub; this repo's
+  `.githooks/pre-commit` is the kit floor with no privacy scan, so the check
+  is yours.
+- **Shared operating rules** (line endings, verify the artifact not the exit
+  code, the paired release lane) are owned by `../HomeHub/AGENTS.md`.
 
 ---
 
@@ -37,11 +47,12 @@ Project facts live in `docs/`; this file points at them.
   `sim/validate-sim.sh` for the virtual stack; `python scripts/check.py` is the
   gate bar; real deploy per `stack/README.md`.
 - **Non-goals (explicitly out of scope):** app code (NagLight/Finance-Auditor);
-  a container registry / CI publishing (Q10.2); the secret-handoff script
-  (WI-10.3, unratified).
+  a container registry / CI publishing (Q10.2); the secret-handoff tooling
+  (WI-10.3, ratified 2026-07-25, built in HomeHub `scripts/deploy/`).
 - **Sibling/linked projects:** NagLight, Finance-Auditor (both private),
-  Personal — contracts in [docs/interfaces.md](docs/interfaces.md) +
-  `docs/requirements/interfaces.csv`.
+  OfficeWallNaglight (the panel app), HomeHub (deploy config, secret
+  materialisation, the pathing SSOT, the cross-repo trackers) — contracts in
+  [docs/interfaces.md](docs/interfaces.md) + `docs/requirements/interfaces.csv`.
 
 ---
 
@@ -64,8 +75,8 @@ gates, and the ID scheme. The short version an agent needs every session:
 - **Gates G1→G2→G3→(G-Release)→G-Final each pause for human approval.** Never
   advance a gate yourself; record it in [docs/status.md](docs/status.md).
 - **The check harness is the bar:** `python scripts/check.py` (launchers:
-  `scripts/check.{sh,ps1}`) runs format, lint, tests, coverage, traceability,
-  flow checks, and map freshness at the repo's active gate (`docs/gate`);
+  `scripts/check.{sh,ps1}`) runs format, lint, tests, coverage, traceability
+  and flow checks at the repo's active gate (`docs/gate`);
   `--tier smoke` is the fast subset. Never report a result you didn't run —
   paste the real output.
 - **Behavior is reviewed as diagrams, not rows:** runtime flows (especially
@@ -75,11 +86,17 @@ gates, and the ID scheme. The short version an agent needs every session:
   process.md §3).
 - **Releases (if this project ships versioned):** G-Release runs the `release`
   tier plus the generated human checklist (`scripts/gen_release_checklist.py`).
-- **The code map is generated** (`scripts/gen_arch_map.py`): per-module
-  summary, internal dependencies, and public symbols with `Implements:`
-  back-links, in [docs/architecture.md](docs/architecture.md). **Read it to
-  find where a capability lives before searching the tree**; the harness keeps
-  it (and the Mermaid dependency diagram) fresh — never hand-edit it.
+- **No generated code map here.** This is a config repo, so the kit's
+  arch-map step is dropped (note in `scripts/check.py`; header of
+  [docs/architecture.md](docs/architecture.md)) and `scripts/gen_arch_map.py`
+  is only the kit copy. architecture.md is hand-written: **read it to find
+  where a capability lives before searching the tree**, and keep it current.
+- **The process docs are a pinned kit copy.** [docs/process.md](docs/process.md)
+  and `docs/process-options.md` are the ai-template kit's at the commit in
+  `docs/kit-version` (`605252d`; process.md differs only by bootstrap's two
+  template-line strips). Change them upstream and re-sync (`downstream-resync`
+  skill), or record a deliberate local delta in this bullet (none today);
+  never let them drift silently.
 - **Diagrams are Mermaid fenced blocks in the docs.** Never edit between
   `GENERATED` markers; never commit exported diagram images.
 - **Start each session** with the *Current State* header of
@@ -119,8 +136,9 @@ Code a newcomer — human or model — can navigate without re-deriving the desi
 ### Comment for humans — and the map
 
 Comment **generously and deliberately** — the bar is that a reader never has to
-reverse-engineer *intent*. The generated code map **harvests module and
-public-symbol docstrings** into the index agents read first:
+reverse-engineer *intent*. Module and public-symbol docstrings (script headers,
+here) are the index agents read first; in a kit repo with source, the
+generated code map harvests them:
 
 - **Every module: a header docstring** — its single responsibility plus any
   invariant it upholds ("pure core — no I/O").
@@ -159,18 +177,6 @@ Implements: SR-014, LLR-014
 
 Keep the tag names consistent so the block is greppable; update the contract in
 the same edit as the signature — a wrong contract is worse than none.
-
-## For analytics / data code specifically
-
-- **Reproducibility is a requirement:** pin random seeds; record data source +
-  version/snapshot.
-- **Notebooks explore; modules ship.** Promote anything reused or tested into
-  `src/` so it can be imported and unit-tested.
-- **Separate data I/O from transforms:** pure transforms unit-tested on small
-  fixtures; validate schema/shape at the boundary and fail loudly on surprises.
-- **Test the math on hand-checked cases**, and **exercise the input space** —
-  `scripts/gen_cases.py` derives boundary + combination cases from the SR's
-  `Permutations` (process.md "Dimensional coverage").
 
 ## Working agreement
 

@@ -81,12 +81,15 @@ deploy image:
    services come up at first boot, stack/README §9) and the commented
    `volume:` lines in the backup config (`stack/backup/backup.env.example`) so
    the box's own state — the finances — joins the backup (SR-013).
-2. Filling `.env` today is still a **manual** step. The automated
-   secret-handoff design in `Personal\SECRET_HANDOFF.md` (a sibling repo;
-   extends the Owner's existing DPAPI credential pattern) was **ratified
-   2026-07-25**, but the tooling is not written yet — so hand-fill for now.
-   Once built it materializes `.env` from Personal's credential store, and
-   pathing values come from `Personal\deploy\storage-map.md`.
+2. For the Owner's own box `.env` is **materialized, not hand-filled**. The
+   secret-handoff design is `SECRET_HANDOFF.md` in the private HomeHub repo
+   (extends the Owner's existing DPAPI credential pattern; **ratified
+   2026-07-25**, implemented 2026-07-29). Its emitter, HomeHub
+   `scripts/deploy/Materialize-Deploy.ps1`, walks this repo's `*.example`
+   templates and fills every knob from HomeHub's config and the Owner's
+   credential store; pathing values come from HomeHub
+   `scripts/deploy/storage-map.md`, the pathing SSOT. Without that tooling,
+   hand-fill `.env` as in step 1.
 3. Run `vmtest/export-images.sh` (it reads the real pinned tags in
    `.env.example`, not sim values) so the real USB carries every container image
    baked in (Q10.9 B+) — see stack/README.md §3. That means the **core** set

@@ -124,7 +124,7 @@ IceDrive runs here and is pointed at chosen library paths in its own GUI; the
 backup service performs **no offsite staging at all** (`OFFSITE_ENABLED=false`,
 and `true` is refused). That is also why the backup *ingests* network shares
 into the library: there is one current copy, and the client syncs it. Choose
-those paths from `Personal\deploy\storage-map.md` §4e, and never point one at a
+those paths from HomeHub `scripts/deploy/storage-map.md` §4e, and never point one at a
 library path holding raw finance data.
 
 The price is unchanged and is written down in

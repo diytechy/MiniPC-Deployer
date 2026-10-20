@@ -363,8 +363,9 @@ Both scripts:
 - Are **idempotent**: re-running reuses the existing SSH key + SIM secrets
   (pass `CLEAN=1` in the environment, or `--clean`, to force fresh ones).
 - **Never** touch a real secret. Real materialization for the physical AWOW
-  happens later via **SECRET_HANDOFF** (WI-10.3, **RATIFIED 2026-07-25**;
-  the tooling itself is not written yet) — these scripts say so in their own
+  happens via **SECRET_HANDOFF** (WI-10.3, **RATIFIED 2026-07-25**,
+  implemented 2026-07-29 in the private HomeHub repo as
+  `scripts/deploy/Materialize-Deploy.ps1`) — these scripts say so in their own
   header comments.
 
 If `C:` is tight (see §2), point the output elsewhere:

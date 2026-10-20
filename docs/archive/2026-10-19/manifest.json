@@ -3,5 +3,10 @@
     "source": "docs/plan-post-reimage.md",
     "archive": "docs/archive/2026-10-19/docs/plan-post-reimage.md",
     "note": "Task 2 is open-items C2 (outline kept here); Task 1 (Complete-RemoteReimage.ps1) carried to HomeHub FOLLOWUPS 2026-10-19"
+  },
+  {
+    "source": "docs/panel-local-capabilities-implementation-2026-09-14.md",
+    "archive": "docs/archive/2026-10-19/docs/panel-local-capabilities-implementation-2026-09-14.md",
+    "note": "Contract and rollback merged verbatim into stack/panel-access/PROVISIONING.md section 'Current contract: local capabilities'; its 'not deployed' status was stale (deployed 2026-09-14, MiniPC c82fe9b contains 1638cba; HomeHub PANEL_CURRENT)"
   }
 ]

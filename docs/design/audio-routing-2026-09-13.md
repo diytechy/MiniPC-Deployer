@@ -1,6 +1,19 @@
 # Panel audio routing redesign — item 23, 2026-09-13
 
-**Status:** steps 1, 2 and 3 are on the wall (installed live 2026-09-13/14).
+> **Status 2026-10-19 (supersedes the status line below; this file's path is
+> load-bearing, 14 wall units cite it in `Documentation=`, so it stays put).**
+> Steps 1-5 are merged and live since 2026-09-14: steps 1-3 merged `40ca126`,
+> step 4 (the mic legs and the input mute) merged `28d0bc4` and installed,
+> step 5 (the broker's switch backend) merged `ba26a0e` and installed with the
+> broker enabled. The Bluetooth half of the item was finished 2026-09-20. All
+> three merges are ancestors of `f9bbabc`, the 2026-09-20 panel deploy. Still
+> owed, per HomeHub `docs/PANEL_CURRENT_2026-09-13.md` row 23 (the authority;
+> the closing section "What steps 4–6 still owe" here is the 2026-09-13 view):
+> the Owner's glass test of the three switch positions (now needing a
+> Bluetooth headset for one), the sleep/wake check on the timers, step 6 (amp
+> re-proof per mode, the SpeexDSP canceller) and the renderer `echoSeq` half.
+
+**Status (as written 2026-09-13/14):** steps 1, 2 and 3 are on the wall (installed live 2026-09-13/14).
 Step **4**, the mic legs, is designed and implemented on branch
 `audio-routing-2026-09-13` and is NOT deployed. Steps 4–6 are owed and listed at the
 end. **Authority:** item 23 revision 2, the nine review findings, and the Owner's

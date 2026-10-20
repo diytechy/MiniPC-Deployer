@@ -42,7 +42,13 @@ docker compose -p homehub-sim \
    distroless services (oauth2-proxy, Dex) are probed functionally (/ping,
    OIDC discovery).
 2. **split-horizon DNS** — `dig @technitium` returns the sim LAN IP for the
-   tracker/actual/apex names.
+   tracker/actual/apex names. *(2026-10-19: the apex half is stale. Since
+   2026-10-15 (`f59f796`) the provisioner adds no apex record, and the apex
+   resolves publicly to an external website (since `43057f9`, 2026-10-19,
+   each hub name is its own zone). The
+   gate's loop in `validate-sim.sh` still digs `$DOMAIN`, so that one check no
+   longer mirrors the real deploy and should be dropped there. Not verified by
+   a sim run.)*
 3. **Caddy + auth** — through Caddy's **internal CA**: tracker → 302 to Dex.
    The admin portal: the old `actual.` name → 302 into `actual.admin.`;
    `actual.admin.` without a cookie → 302 to the admin sign-in with the original
@@ -87,7 +93,7 @@ vantage — that stays a hardware/V3 remainder.
 | TLS | public ACME | Caddy `local_certs` internal CA (`sim/caddy/Caddyfile.sim`) | a local box can't ACME a real public domain |
 | admin login credential | `admin-auth/htpasswd`, written by firstboot from `ADMIN_AUTH_USER`/`_HASH` | committed fixture `sim/admin-auth/htpasswd.sim` (`simadmin` / `simpass`) | no firstboot in the sim; the credential is a sim fixture |
 | admin sites | five, each `@lan`-gated, throttled sign-in | `admin.`, `actual.admin.`, `dns.admin.`; no `@lan` gate, no throttle | the sim has never carried the LAN gates; both are proven by HomeHub's admin-portal harness |
-| ddns | Cloudflare updater | disabled (`profile: sim-disabled`) | zero real Cloudflare calls |
+| ddns | none: the updater was retired 2026-10-15 (`f59f796`); the hub publishes no public record | none (the sim's disabled stub went with it) | nothing left to neutralise; Caddy's dns-01 token stays a fictional placeholder in `.env.sim` |
 | aux (Kuma/Dozzle) | loopback-bound, reached via `kuma.admin.` / `logs.admin.` | disabled | out of the V1 gate scope |
 | tracker data perms | (needs NagLight Dockerfile chown — see status.md) | `init-perms` one-shot chowns the volume to uid 1000 | surfaced a real NagLight bug; the sim reproduces the fixed end-state |
 | wall kiosk port | published bound to `LAN_IP` (the router never forwards it) | not host-published at all; probes reach it over the compose network | `LAN_IP` is fictional here and unbindable on the WSL host |

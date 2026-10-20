@@ -1,15 +1,44 @@
 # Panel audio broker — feasibility-gated image boundary
 
-This directory implements SR-023's narrow local protocol and pure policy. It is
-not a working Bluetooth/PipeWire router yet, deliberately.
+> **Status 2026-10-19. Where the body below disagrees, this header wins.** The
+> body was last revised 2026-09-18 and still describes a broker with no working
+> backend. That stopped being true in three steps:
+>
+> - **2026-09-14, the switch backend went live.** `switch_backend.py` (item 23
+>   step 5, `ba26a0e`) was installed and the broker enabled on the panel.
+>   Evidence: HomeHub `docs/PANEL_CURRENT_2026-09-13.md` row 23. The image
+>   default is still `WALL_AUDIO_ENABLED=false` (`wall.env.example`); the panel
+>   was switched on by hand at that install, so a reimage needs the deploy
+>   config to carry `true`.
+> - **2026-09-19, Bluetooth device management (WSN-024, `d319815`).**
+>   `routed_backend.py` wraps the switch backend whenever the Bluetooth applier
+>   `wall-bluetooth-device` is installed (`configure-bluetooth.sh`), and the
+>   broker then authorizes the device verbs too (`routing.device_authorization`;
+>   the authority is the renderer's session check, `audio-ipc.cjs` in
+>   OfficeWallNaglight). A panel without that applier keeps the switch-only
+>   floor the body describes. Bluetooth audio still goes through bluez-alsa, not
+>   PipeWire.
+> - **2026-09-19, mutations fixed (`55b2b81`).** The routed backend could not be
+>   pickled into the broker's spawned child, so every mutation failed, the
+>   panel's own switch included. Proven on the panel the same day (two
+>   `set_discoverable` calls accepted and consumed: HomeHub
+>   `docs/archive/2026-09-20/FOLLOWUP_BLUETOOTH_ACCEPTANCE_2026-09-19b.md`
+>   §1 A0). Both commits are in `f9bbabc`, the system manifest of the
+>   2026-09-20 panel deploy (HomeHub `docs/FOLLOWUP_BLUETOOTH_ACCEPTANCE_2026-09-19d.md`),
+>   and PANEL_CURRENT row 12 ("Bluetooth physical routing disabled") closed on
+>   2026-09-20.
+
+This directory implements SR-023's narrow local protocol and pure policy. It
+was written as a deliberately non-routing boundary; see the status header for
+what it routes now.
 
 The real-panel read-only probe on 2026-09-10 found four ALSA playback devices,
 one ALSA capture device and a Bluetooth controller with no paired devices.
 `wpctl` and `pactl` were unavailable, so it did **not** establish a PipeWire
 session, any sink/source/monitor, an A2DP role, or acceptable latency/coexistence.
 (The A2DP SINK that landed on 2026-09-12 is bluez-alsa, not PipeWire, and is
-described in the wall README. It says nothing about this broker's backend, which
-still reports unavailable.)
+described in the wall README. It says nothing about this broker's backend,
+which reported unavailable until 2026-09-14; see the status header.)
 
 A codec pin dump on 2026-09-12 settled the two hardware questions that probe
 left open. The panel's codec is a Realtek **ALC255**, and **the built-in 3.5 mm
@@ -70,7 +99,9 @@ accepts only method-specific response schemas. Production backend operations
 run in bounded spawned child processes. A two-second deadline terminates and
 reaps a stuck child before returning its slot, so repeated uncooperative calls
 cannot permanently exhaust the broker. The backend object must therefore be
-serializable; the deliberately unavailable image backend satisfies that seam.
+serializable. The switch backend pickles as is; the routed backend drops and
+re-creates its lock in `__getstate__`/`__setstate__` (`55b2b81`), because
+before that it did not, and no mutation worked.
 
 Production uses `/var/lib/wall-audio-router/state.json`, in systemd's private
 `StateDirectory`. The broker atomically records a mutation intent before device
@@ -123,9 +154,10 @@ to `wall.env`.
 
 ## The rest of the panel's audio lives next door
 
-This directory is the SR-023 Bluetooth/routing broker, which is still
-disabled-by-default and still reports `backend_unavailable`. The panel's working
-audio path is not here — it is a set of units and ALSA configuration under
+This directory is the SR-023 Bluetooth/routing broker: disabled by default in
+the image, enabled on the panel since 2026-09-14, with the switch and
+Bluetooth device backends described in the status header. The panel's audio
+path itself is not here — it is a set of units and ALSA configuration under
 `../autoinstall/wall/`:
 
 | File | Does |

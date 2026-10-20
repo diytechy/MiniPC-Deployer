@@ -16,7 +16,7 @@
 #   caddy       ACME public certs -> local_certs internal CA (Caddyfile.sim);
 #                                 gains network aliases so the client resolves
 #                                 the vhost names to Caddy
-#   ddns        real Cloudflare -> DISABLED (profile sim-disabled): zero calls
+#   ddns        retired 2026-10-15 in the real stack, so nothing to disable
 #   aux (kuma/dozzle) -> DISABLED (out of V1 gate scope)
 #   admin-auth  htpasswd materialised by firstboot -> the committed fixture
 #                 sim/admin-auth/htpasswd.sim (simadmin / simpass)

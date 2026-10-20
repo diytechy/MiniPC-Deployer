@@ -1,3 +1,14 @@
+> **ARCHIVED 2026-10-19 — may be out of date.** Historical session evidence;
+> not current deployment state, and not instructions to repeat old actions.
+> What was still open when this was archived is carried in
+> [FOLLOWUPS.md](../../../../../HomeHub/FOLLOWUPS.md) or [open-items.md](../../../../../HomeHub/open-items.md); what ships is in the
+> requirement spines.
+>
+> Its live contract and rollback procedure were merged into
+> [stack/panel-access/PROVISIONING.md](../../../../stack/panel-access/PROVISIONING.md),
+> section "Current contract: local capabilities". The "not deployed" status
+> below is stale: it was deployed on 2026-09-14.
+
 # Panel local-capability image contract
 
 Status: implemented and independently reviewed in the isolated provisioning

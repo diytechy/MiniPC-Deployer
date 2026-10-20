@@ -376,7 +376,7 @@ not silently receive a backup that has none — a config quietly ignored is the
 same family of fault as a green run that wrote nothing.
 
 Two consequences to keep in mind: *which* folders reach the cloud is configured
-in the client (authoritative list: `Personal\deploy\storage-map.md` §4e), and
+in the client (authoritative list: HomeHub `scripts/deploy/storage-map.md` §4e), and
 this service's NagLight report cannot see that copy's staleness at all.
 
 > **The second half of this used to say the client is a GUI app and "sync is

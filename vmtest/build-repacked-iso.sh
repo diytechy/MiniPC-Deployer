@@ -30,8 +30,8 @@
 #
 # SECRETS: same policy as build-seed.sh — everything materialized is a
 # throwaway SIM placeholder for this local VM, never a real secret. Real
-# materialization happens later via SECRET_HANDOFF (WI-10.3, RATIFIED
-# open).
+# materialization happens via SECRET_HANDOFF (WI-10.3, RATIFIED 2026-07-25;
+# tooling in HomeHub).
 #
 # Usage:
 #   bash vmtest/build-repacked-iso.sh --src-iso /path/to/ubuntu-24.04.x-live-server-amd64.iso

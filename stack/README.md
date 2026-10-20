@@ -205,12 +205,14 @@ Fill in at minimum:
 >   session already issued; rotating `OAUTH2_PROXY_COOKIE_SECRET` does, and signs
 >   everyone out.
 
-**Filling these in today is a manual step.** The automated secret-handoff
-design in the sibling `Personal` repo's `SECRET_HANDOFF.md` was **ratified
-2026-07-25** but is **not built yet**, so hand-fill `.env` until it exists.
-Once built it extends the Owner's DPAPI credential pattern to materialize this
-file; path-shaped values (`MEDIA_ROOT`, the backup source/target table) come
-from `Personal\deploy\storage-map.md`, which is the pathing SSOT.
+**For the Owner's box these are materialized, not hand-filled.** The
+secret-handoff design is `SECRET_HANDOFF.md` in the private HomeHub repo
+(**ratified 2026-07-25**, implemented 2026-07-29). It extends the Owner's DPAPI
+credential pattern: HomeHub `scripts/deploy/Materialize-Deploy.ps1` walks this
+repo's `*.example` templates and writes the filled file. Path-shaped values
+(`MEDIA_ROOT`, the backup source/target table) come from HomeHub
+`scripts/deploy/storage-map.md`, which is the pathing SSOT. Without that
+tooling, hand-fill `.env` from `.env.example`.
 
 ### OWNER MANUAL STEP — Google OAuth client (required for the tracker)
 

@@ -12,6 +12,24 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-19 — Correction (records only; nothing deployed by this entry).**
+- **Sure is live.** The 2026-10-18 entry below says "Sure is NOT started". That was true when written and is
+  superseded: Sure went live on the hub later on 2026-10-18, started by HomeHub's run-sheet script
+  (`docs/deploy-runs/sure/sure-start.sh`), not through `COMPOSE_PROFILES`. Evidence: HomeHub `open-items.md`,
+  the "Recounted mechanically 2026-10-18 (night)" note ("Sure went live (A49 stays open for the bridge
+  decisions)"); HomeHub `FOLLOWUPS.md`, "2026-10-18 (late night)" ("Sure: Running") and "2026-10-19 —
+  Carried by the documentation clean-up" (Sure has no owning unit yet; a `homehub-sure.service` with a
+  `SURE_ENABLED` switch is owed, and reboot behaviour without the profile is unproven).
+- **Pathing pointers.** `Personal\deploy\storage-map.md` (OI-11 and OI-14 below) and the
+  `Personal\homelab\…` paths in the open-items register below no longer exist. The pathing SSOT is
+  HomeHub `scripts/deploy/storage-map.md`; the secret-handoff design and tooling are HomeHub
+  `SECRET_HANDOFF.md` and `scripts/deploy/` (`FieldSchema.psd1` included); `OFFICEWALL_BOOTSTRAP.md` is
+  archived at HomeHub `docs/archive/2026-09-18/`. Live docs were repointed on branch
+  `docs-cleanup-2026-10-19b`; the register below is left as written.
+- **Docs clean-up on `docs-cleanup-2026-10-19b`** (not yet merged): AGENTS.md refresh, the stale stack
+  READMEs, a generated IF index in `docs/interfaces.md` (`scripts/gen_if_index.py`, harness step
+  `if-index`), dated status lines on the gateway runbook, the audio-routing design and `architecture.md`.
+
 **2026-10-18 — DEPLOYED to the live hub: `6d11843` (this branch) via `deploy_stack.py --apply --run-firstboot`.**
 The Owner approved the full lane. Its run-sheet, pre-deploy script and rollback script are in HomeHub
 `docs/deploy-runs/2026-10-18/`, reviewed by Codex gpt-6.1-sol to GO. This deploy ships:

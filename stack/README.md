@@ -462,7 +462,7 @@ explicitly enabled.
 | `photoprism` | PhotoPrism (+MariaDB) | `http://<LAN_IP>:2342` | photo library indexed in place (run at most ONE photo stack) |
 | `jellyfin` | Jellyfin | `https://jellyfin.<domain>`; `http://<LAN_IP>:8096` until `JELLYFIN_BIND_IP=127.0.0.1` | movies/TV; library path via `JELLYFIN_LIBRARY_DIR`; QSV `/dev/dri` wired up by firstboot when an iGPU is present |
 | `navidrome` | Navidrome | `https://music.<domain>`; `http://<LAN_IP>:4533` until `NAVIDROME_BIND_IP=127.0.0.1` | music, Subsonic API |
-| `ntfy` | ntfy | `https://ntfy.<domain>`; `http://<LAN_IP>:8090` until `NTFY_BIND_IP=127.0.0.1` | self-hosted push; also where host-side alerts go (`HOMEHUB_ALERT_TOPIC`) |
+| `ntfy` | ntfy | `https://ntfy.<domain>`; `http://<LAN_IP>:8090` until `NTFY_BIND_IP=127.0.0.1` | self-hosted push; also where host-side alerts go (`HOMEHUB_ALERT_TOPIC`, through [`monitoring/homehub-alert.sh`](monitoring/README.md)) |
 | `audiobookshelf` | Audiobookshelf | `http://<LAN_IP>:13378` | podcasts + audiobooks |
 | `vaultwarden` | Vaultwarden | **Caddy site only** (HTTPS required) | Bitwarden-compatible passwords |
 | `homeassistant` | Home Assistant | `http://<LAN_IP>:8123` (host net) | home automation (container flavor — no add-on store) |

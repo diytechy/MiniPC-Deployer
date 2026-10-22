@@ -12,6 +12,14 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-22 — SN-048 specified and built on `w3a-hub-monitoring` (HomeHub plan W3a); NOT deployed.**
+SR-085..SR-091: the shared alert helper (`stack/monitoring/homehub-alert.sh`, now also rustdesk-check's
+transport), the 30 s telemetry record with thermal/throttle/frequency alarms, the 15 min NVMe-only
+low-disk alarm, the 5 min watch table, the 60 s liveness probe with one evidence bundle per incident,
+firstboot step 6h with one knob per component (unset = on), and the panel's freeze watchdog taken into
+the wall image byte-identical (wall-firstboot 8g, SR-090). Record and alert only. Deploy, the live drills
+and the panel system release are the coordinator's (HomeHub FOLLOWUPS).
+
 **2026-10-19 — Correction (records only; nothing deployed by this entry).**
 - **Sure is live.** The 2026-10-18 entry below says "Sure is NOT started". That was true when written and is
   superseded: Sure went live on the hub later on 2026-10-18, started by HomeHub's run-sheet script

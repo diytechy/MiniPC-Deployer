@@ -1,0 +1,28 @@
+# homehub-telemetry - one sample of the hub's thermal/frequency/load record (SN-048,
+# SR-086), and the thermal/throttle/frequency alarms evaluated on it. Record and
+# alert only. Read it with: python3 /opt/homehub/stack/monitoring/homehub-telemetry.py summary
+[Unit]
+Description=HomeHub telemetry sample (thermal zones, hwmon, CPU frequency, throttle counters, load, PSI, NVMe usage)
+Documentation=file:///opt/homehub/stack/monitoring/README.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/homehub/stack/monitoring/homehub-telemetry.py sample
+SyslogIdentifier=homehub-telemetry
+StateDirectory=homehub-telemetry homehub-monitor
+StateDirectoryMode=0700
+UMask=0077
+# Bounded like the panel's recorder: a monitor must never be the reason the hub
+# is slow, and a run stuck behind a stalled read cannot pile up behind its timer.
+TimeoutStartSec=25
+Nice=10
+CPUAccounting=true
+CPUQuota=20%
+MemoryAccounting=true
+MemoryMax=64M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

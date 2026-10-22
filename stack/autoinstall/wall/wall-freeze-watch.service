@@ -1,0 +1,25 @@
+[Unit]
+Description=Wall panel: watch for a wedged compositor and capture forensics
+Documentation=file:///opt/wall-panel/docs/
+# Nothing to watch until a seat exists; but do NOT bind to it, because the
+# watchdog must survive and keep logging across kiosk restarts.
+After=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/wall-freeze-watch.sh
+Restart=always
+RestartSec=10
+# Runs as root: reads /proc/<pid>/stack, debugfs DRM state and the full journal,
+# and drops to the seat user itself to take the probe.
+User=root
+# It is a sampler, not a workload; never let it be the reason the panel is slow.
+Nice=10
+CPUWeight=20
+IOWeight=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wall-freeze-watch
+
+[Install]
+WantedBy=multi-user.target

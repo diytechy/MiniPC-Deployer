@@ -55,12 +55,17 @@
 # neither, and failing a check on them would recreate a healthy relay.
 #
 # Alerts are best-effort (bounded, never change the exit status) and repeat-
-# suppressed by a stamp. Exit: 0 healthy/recovered/not applicable, 1 still down.
+# suppressed by a stamp, both through the shared hub alert helper
+# (stack/monitoring/homehub-alert.sh, SR-085). Exit: 0 healthy/recovered/not
+# applicable, 1 still down.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STACK_DIR="${RUSTDESK_CHECK_STACK_DIR:-$HERE/..}"
 ENV_FILE="${RUSTDESK_CHECK_ENV_FILE:-$STACK_DIR/.env}"
+# Resolved from THIS script's own location, not STACK_DIR: the helper ships in the
+# same tree as this script, whatever stack the check is pointed at.
+ALERT_HELPER="${RUSTDESK_CHECK_ALERT_HELPER:-$HERE/../monitoring/homehub-alert.sh}"
 STATE_DIR="${RUSTDESK_CHECK_STATE_DIR:-/var/lib/homehub-rustdesk-check}"
 OWNER_LOCK="${RUSTDESK_CHECK_OWNER_LOCK:-/run/homehub-rustdesk.lock}"
 OWNER_UNIT="homehub-rustdesk.service"
@@ -102,33 +107,22 @@ _env() {
               -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/"
 }
 
+# The transport, the rate limit and the journal line live in the shared hub
+# alert helper (SR-085, stack/monitoring/homehub-alert.sh), which every SN-048
+# monitor uses too. Its stamps stay in THIS script's state dir under the same
+# names (alerted-<kind>), so a deploy does not reset the repeat window. Best
+# effort: whatever the helper reports, the check's own verdict is unchanged. It
+# is bounded twice: its own curl timeout, and this outer one.
 alert() {
-    local kind="$1" prio="$2" title="$3" body="$4" host port topic url now last=0 stamp
-    host="$(_env NTFY_BIND_IP)"; [ -n "$host" ] || host="$(_env LAN_IP)"
-    port="$(_env NTFY_PORT)"
-    topic="$(_env HOMEHUB_ALERT_TOPIC)"; topic="${topic:-homehub-alerts}"
-    if ! [[ "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || ! [[ "$port" =~ ^[0-9]{1,5}$ ]] \
-       || ! [[ "$topic" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
-        log "ALERT NOT SENT (no usable NTFY_BIND_IP/LAN_IP, NTFY_PORT or topic in $ENV_FILE): $title"
+    local kind="$1" prio="$2" title="$3" body="$4"
+    if [ ! -r "$ALERT_HELPER" ]; then
+        log "ALERT NOT SENT (the alert helper $ALERT_HELPER is missing): $title"
         return 0
     fi
-    url="http://$host:$port/$topic"
-    stamp="$STATE_DIR/alerted-$kind"
-    now="$(date +%s)"
-    if [ -r "$stamp" ]; then last="$(_int "$(cat "$stamp" 2>/dev/null)" 0)"; fi
-    if [ $((now - last)) -lt "$ALERT_REPEAT_SEC" ]; then
-        log "alert suppressed (a '$kind' alert was delivered $((now - last))s ago): $title"
-        return 0
-    fi
-    if ! command -v curl >/dev/null 2>&1; then log "ALERT NOT SENT (no curl): $title"; return 0; fi
-    if timeout "$((ALERT_TIMEOUT + 2))" curl -fsS -o /dev/null --connect-timeout 3 --max-time "$ALERT_TIMEOUT" \
-            -H "Title: $title" -H "Priority: $prio" -H "Tags: shield" \
-            --data-binary "$body" "$url" >/dev/null 2>&1; then
-        log "alert delivered to $url: $title"
-        { mkdir -p "$STATE_DIR" && printf '%s\n' "$now" >"$stamp"; } 2>/dev/null || true
-    else
-        log "ALERT NOT DELIVERED to $url (ntfy down or unreachable; this journal line is the record): $title"
-    fi
+    timeout "$((ALERT_TIMEOUT + 10))" bash "$ALERT_HELPER" --key "$kind" --priority "$prio" \
+        --title "$title" --body "$body" --env-file "$ENV_FILE" --state-dir "$STATE_DIR" \
+        --repeat-sec "$ALERT_REPEAT_SEC" --timeout "$ALERT_TIMEOUT" --tags shield \
+        --log-tag rustdesk-check </dev/null || true
     return 0
 }
 

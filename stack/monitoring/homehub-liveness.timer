@@ -1,0 +1,12 @@
+# Every 60 s: three failed runs (the default) is three minutes of a hub that
+# does not answer, which is when a person would start to notice.
+[Unit]
+Description=HomeHub liveness probe, every 60 s
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

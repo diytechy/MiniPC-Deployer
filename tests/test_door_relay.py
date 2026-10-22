@@ -730,7 +730,7 @@ def run_gate(monkeypatch, tmp_path, capsys, probe_result=None, counters=None, fr
             readers.append(self)
     monkeypatch.setattr(dr, "ProgressReader", Reader)
     monkeypatch.setattr(dr.subprocess, "Popen", popen)
-    monkeypatch.setattr(dr.subprocess, "run", docker.run if docker else (lambda *a, **k: None))
+    monkeypatch.setattr(dr.subprocess, "run", docker.run if docker else (lambda *a, **k: dr.subprocess.CompletedProcess(a[0], 0, None, b"")))
     script = iter(RECEIVING if frames is None else frames)
     written = [0]
 
@@ -997,7 +997,15 @@ with open(os.path.join(state, "calls.log"), "a") as log:
     log.write(json.dumps(argv) + "\n")
 def box(name):
     return os.path.join(state, "c-" + name)
+def event(what):
+    with open(os.path.join(state, "rm-events.log"), "a") as log:
+        log.write(what + " " + " ".join(argv[2:]) + "\n")
 if argv[:2] == ["rm", "-f"]:
+    # FAKE_DOCKER_RM_SLOW: a removal that takes that long (a loaded daemon),
+    # so a signal can be sent while it is under way. The events say whether it
+    # started and whether it ran to its end.
+    event("start")
+    time.sleep(float(os.environ.get("FAKE_DOCKER_RM_SLOW") or 0))
     for name in argv[2:]:
         try:
             pid = int(open(box(name)).read())
@@ -1008,6 +1016,7 @@ if argv[:2] == ["rm", "-f"]:
             os.unlink(box(name))
         except OSError:
             pass
+    event("finish")
     sys.exit(0)
 if argv[:1] == ["inspect"]:
     sys.exit(1)
@@ -1104,16 +1113,25 @@ def cli_rig(tmp_path):
     env_file = write_env(tmp_path, LAN_IP="127.0.0.1", DOOR_RELAY_RTSP_PORT=str(relay.port))
     procs = []
 
-    def run(args, wait_for, sig, finish=()):
+    def run(args, wait_for, sig, finish=(), rm_slow=0, in_removal=False, grace=None):
+        """`in_removal`: signal once a `docker rm -f` has STARTED (and is held
+        for `rm_slow` s), not when the consumers run. `grace`: the probe's
+        PROBE_GRACE_SEC, so its timeout path is reached in seconds."""
         env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""),
                    FAKE_DOCKER_STATE=str(state), FAKE_DOCKER_FINISH=",".join(finish),
+                   FAKE_DOCKER_RM_SLOW=str(rm_slow),
                    HOMEHUB_MONITOR_OVERRIDE_FILE=str(tmp_path / "no-override"))
-        proc = sp.Popen([sys.executable, str(STACK / "door" / "door_relay.py"), "--env-file", env_file] + list(args),
+        cli = [str(STACK / "door" / "door_relay.py")]
+        if grace is not None:  # the same main(), one constant shortened
+            cli = ["-c", "import sys; sys.path.insert(0, %r); import door_relay as d; d.PROBE_GRACE_SEC = %d; "
+                         "sys.exit(d.main(sys.argv[1:]))" % (str(STACK / "door"), grace)]
+        proc = sp.Popen([sys.executable] + cli + ["--env-file", env_file] + list(args),
                         stdout=sp.PIPE, stderr=sp.STDOUT, env=env)
         procs.append(proc)
         if sig is not None:
-            deadline = tm.monotonic() + 30
-            while not all((state / ("c-" + n)).exists() for n in wait_for):
+            deadline = tm.monotonic() + 60
+            while not (rm_events("start") if in_removal else
+                       all((state / ("c-" + n)).exists() for n in wait_for)):
                 assert proc.poll() is None, proc.stdout.read().decode()
                 assert tm.monotonic() < deadline, "the consumers never started"
                 tm.sleep(0.05)
@@ -1121,6 +1139,12 @@ def cli_rig(tmp_path):
             proc.send_signal(sig)
         out = proc.communicate(timeout=90)[0].decode()
         return proc.returncode, out
+
+    def rm_events(kind):
+        log = state / "rm-events.log"
+        if not log.exists():
+            return []
+        return [line for line in log.read_text().splitlines() if line.startswith(kind + " ")]
 
     def calls():
         log = state / "calls.log"
@@ -1135,6 +1159,7 @@ def cli_rig(tmp_path):
     run.calls = calls
     run.containers = lambda: sorted(p.name[2:] for p in state.glob("c-*") if not p.name.endswith(".tmp"))
     run.sessions_closed = sessions_closed
+    run.rm_events = rm_events
     try:
         yield run, relay, sg
     finally:
@@ -1224,3 +1249,142 @@ def test_tc1399_the_verbs_restore_the_signal_handlers_they_found(monkeypatch, tm
     finally:
         for sig, handler in before.items():
             sg.signal(sig, handler)
+
+
+# ── TC-1399 the FIRST signal landing in a removal does not abandon it (round 5 F8)
+#
+# Round 4 raised Stopped on the first signal wherever it landed, including
+# inside the `docker rm -f` of a cleanup entered on a timeout or a normal
+# finish: the removal was killed, the container kept its session and its name,
+# and main() still logged "its consumers were removed". Sol: `normal cost
+# cleanup SIGTERM: rc=143 holder_still_running=True / stop line claims removed:
+# True / fixture sessions still open: 1`. The stub's `rm -f` is held for 3 s
+# and the signal is sent once it has started.
+
+
+@posix_signals
+def test_tc1399_a_signal_during_the_cost_runs_final_removal_waits_for_it(cli_rig):
+    run, relay, sg = cli_rig
+    rc, out = run(["cost", "--seconds", "1", "--decode-grey-fps", "5"], [], sg.SIGTERM,
+                  rm_slow=3, in_removal=True)
+    assert rc == 143, out
+    assert run.rm_events("finish") == ["finish " + dr.GREY_DECODER], (run.rm_events("start"), out)
+    assert run.containers() == [] and relay.accepted and run.sessions_closed()
+    assert '"seconds"' in out  # the measurement itself had finished and was printed
+    assert "stopped by signal 15; its consumers were removed (%s)" % dr.GREY_DECODER in out, out
+
+
+@posix_signals
+def test_tc1399_a_signal_during_the_probe_timeouts_removal_waits_for_it_and_still_stops(cli_rig):
+    run, relay, sg = cli_rig
+    rc, out = run(["probe", "--seconds", "1"], [], sg.SIGTERM, rm_slow=3, in_removal=True, grace=2)
+    assert rc == 143, out  # the deferred signal is raised, not lost by the timeout branch's return
+    assert run.rm_events("finish") == ["finish homehub-door-probe"], (run.rm_events("start"), out)
+    assert run.containers() == [] and relay.accepted and run.sessions_closed()
+    assert '"pass"' not in out  # stopped: no verdict printed
+    assert "stopped by signal 15; its consumers were removed (homehub-door-probe)" in out, out
+
+
+@posix_signals
+def test_tc1399_cleanup_defers_a_signal_until_the_outermost_block_ends(monkeypatch):
+    import signal as sg
+    ran = []
+    with dr.stop_signals_raise():
+        with pytest.raises(dr.Stopped) as stopped:
+            with dr.defer_stop():
+                with dr.defer_stop():
+                    os.kill(os.getpid(), sg.SIGHUP)
+                    ran.append("inner")  # not cut short
+                ran.append("outer")      # the inner block's end does not raise
+                os.kill(os.getpid(), sg.SIGTERM)  # a later signal is swallowed
+                ran.append("end")
+        assert stopped.value.signum == sg.SIGHUP and stopped.value.code == 129
+        os.kill(os.getpid(), sg.SIGTERM)  # the stop is under way: swallowed
+    assert ran == ["inner", "outer", "end"]
+    with dr.defer_stop():  # outside the verbs it is inert
+        pass
+
+
+@posix_signals
+@pytest.mark.parametrize("rm_outcome", ["timeout", "daemon-error"])
+def test_tc1399_the_stop_line_says_when_a_removal_was_not_confirmed(monkeypatch, tmp_path, capsys, rm_outcome):
+    import signal as sg
+    calls = []
+
+    def run(argv, input=None, stdout=None, stderr=None, timeout=None, **_kw):
+        argv = list(argv)
+        calls.append(argv)
+        if argv[:3] == ["docker", "rm", "-f"]:
+            if rm_outcome == "timeout":
+                raise dr.subprocess.TimeoutExpired(argv, timeout)
+            return dr.subprocess.CompletedProcess(argv, 1, None, b"Error response from daemon: busy\n")
+        os.kill(os.getpid(), sg.SIGTERM)  # the signal lands while the probe runs
+        raise AssertionError("not reached: the handler raises")
+    monkeypatch.setattr(dr.subprocess, "run", run)
+    monkeypatch.setattr(dr, "image_ref", lambda: "example/go2rtc:1@sha256:0")
+    assert dr.main(["--env-file", write_env(tmp_path), "probe", "--seconds", "1"]) == 143
+    out = capsys.readouterr().out
+    assert ["docker", "rm", "-f", "homehub-door-probe"] in calls
+    assert "removal NOT confirmed for homehub-door-probe" in out, out
+    assert "were removed" not in out
+
+
+def test_tc1399_a_removal_confirms_only_what_docker_finished(monkeypatch):
+    dr.CONSUMERS.reset()
+    for name in ("homehub-door-gate-1", "homehub-door-gate-2"):
+        dr.CONSUMERS.start(name)
+    outcomes = iter([dr.subprocess.CompletedProcess([], 0, None, b"Error response from daemon: No such container: "
+                                                                  b"homehub-door-gate-1\n"),
+                     dr.subprocess.CompletedProcess([], 1, None, b"Error response from daemon: No such container: "
+                                                                  b"homehub-door-gate-1\n")])
+    monkeypatch.setattr(dr.subprocess, "run", lambda *a, **k: next(outcomes))
+    assert dr.remove_containers("homehub-door-gate-1") is True  # already gone counts as removed
+    assert dr.remove_containers("homehub-door-gate-1") is True  # older docker: rc 1, only "No such container"
+    assert dr.CONSUMERS.unconfirmed() == ["homehub-door-gate-2"]
+    assert "removal NOT confirmed for homehub-door-gate-2" in dr.stop_line("gate", 15)
+    monkeypatch.setattr(dr.subprocess, "run", lambda *a, **k: dr.subprocess.CompletedProcess([], 0, None, b""))
+    assert dr.remove_containers("homehub-door-gate-2") is True
+    assert dr.stop_line("gate", 15).endswith("its consumers were removed (homehub-door-gate-1 homehub-door-gate-2)")
+    dr.CONSUMERS.reset()
+    assert dr.stop_line("cost", 1).endswith("it had started no consumer")
+
+
+@posix_signals
+def test_tc1399_a_signal_in_the_gates_cleanup_waits_for_every_consumer(monkeypatch, tmp_path):
+    """gate()'s whole finally is one defer_stop() block: a signal landing in
+    its first wait still lets the second consumer be waited for (killed on
+    its deadline), and Stopped comes after."""
+    import signal as sg
+    s = dr.RelaySettings(write_env(tmp_path))
+    waited, calls = [], []
+
+    class Consumer:
+        def __init__(self, name):
+            self.name, self.stdout = name, io.BytesIO(b"")
+
+        def wait(self, timeout=None):
+            waited.append(self.name)
+            if len(waited) == 1:
+                os.kill(os.getpid(), sg.SIGTERM)  # lands in the cleanup
+            return 0
+
+        def kill(self):
+            pass
+
+    def start(argv, payload, stdout=None, stderr=None):
+        return Consumer(argv[argv.index("--name") + 1])
+
+    def boom(_seconds):
+        raise RuntimeError("the gate failed while both consumers ran")
+    monkeypatch.setattr(dr, "probe", lambda *a, **k: dict(HEALTHY))
+    monkeypatch.setattr(dr, "start_consumer", start)
+    monkeypatch.setattr(dr, "image_ref", lambda: "example/go2rtc:1@sha256:0")
+    monkeypatch.setattr(dr.time, "sleep", boom)
+    monkeypatch.setattr(dr.subprocess, "run",
+                        lambda argv, **k: calls.append(list(argv)) or dr.subprocess.CompletedProcess(argv, 0, None, b""))
+    with dr.stop_signals_raise():
+        with pytest.raises(dr.Stopped) as stopped:
+            dr.gate(s, 1)
+    assert stopped.value.code == 143
+    assert waited == ["homehub-door-gate-2", "homehub-door-gate-3"]
+    assert ["docker", "rm", "-f", "homehub-door-gate-1", "homehub-door-gate-2", "homehub-door-gate-3"] in calls

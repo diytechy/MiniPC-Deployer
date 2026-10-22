@@ -407,20 +407,28 @@ def stop_signals_raise():
     killing the docker client leaves the container holding a relay or camera
     session under its fixed name, refusing every retry. The README runs these
     verbs by hand over ssh, where a dropped session is SIGHUP and an
-    operator's `timeout` is SIGTERM. The first signal raises; any later one
-    is swallowed, so the cleanup it started (bounded: every removal and wait
-    has its own timeout) is not cut short. The previous handlers are restored
-    on the way out. redact_run's forwarding handlers are its own and are not
+    operator's `timeout` is SIGTERM.
+
+    A signal raises at once only OUTSIDE cleanup. Inside a defer_stop() block
+    (every removal, gate's whole finally, cost's finally) it is only
+    recorded, and Stopped is raised when the outermost block ends - so the
+    first signal, landing while a removal is under way, cannot abandon that
+    removal. Once a Stopped is raised or recorded, any later signal is
+    swallowed, so the cleanup it started (bounded: every removal and wait has
+    its own timeout) is not cut short. The previous handlers are restored on
+    the way out. redact_run's forwarding handlers are its own and are not
     involved. Implements: LLR-1226.
     """
     previous = {}
-
-    def swallow(_sig, _frame):
-        pass
+    _STOP.reset()
 
     def stop(signum, _frame):
-        for sig in previous:
-            signal.signal(sig, swallow)
+        if _STOP.fired or _STOP.pending is not None:
+            return  # a later signal: the stop is already under way
+        if _STOP.shield:
+            _STOP.pending = signum  # raised when the cleanup block ends
+            return
+        _STOP.fired = True
         raise Stopped(signum)
     for name in ("SIGTERM", "SIGHUP"):
         sig = getattr(signal, name, None)
@@ -435,6 +443,79 @@ def stop_signals_raise():
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        _STOP.reset()
+
+
+class _StopState:
+    """stop_signals_raise's handler state: `shield` counts the defer_stop()
+    blocks entered, `pending` is a signal recorded inside one, `fired` that a
+    Stopped has been raised."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.shield = 0
+        self.pending: Optional[int] = None
+        self.fired = False
+
+
+_STOP = _StopState()
+
+
+@contextlib.contextmanager
+def defer_stop():
+    """A cleanup block that a SIGTERM or SIGHUP cannot cut short: a signal
+    arriving inside it is recorded, and Stopped is raised as the OUTERMOST
+    block ends (nested blocks defer to it), after the cleanup has run. Outside
+    stop_signals_raise() nothing is ever recorded, so it is inert there.
+    Implements: LLR-1226."""
+    _STOP.shield += 1
+    try:
+        yield
+    finally:
+        _STOP.shield -= 1
+        if not _STOP.shield and _STOP.pending is not None:
+            signum, _STOP.pending = _STOP.pending, None
+            _STOP.fired = True
+            raise Stopped(signum)
+
+
+class _Consumers:
+    """The named consumers a verb started, and which of them a `docker rm -f`
+    has been seen to remove - so a stopped verb's last line says what is
+    actually true rather than what was intended."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.started: List[str] = []
+        self.removed: set = set()
+
+    def start(self, name: str) -> None:
+        if name not in self.started:
+            self.started.append(name)
+        self.removed.discard(name)
+
+    def unconfirmed(self) -> List[str]:
+        return [n for n in self.started if n not in self.removed]
+
+
+CONSUMERS = _Consumers()
+
+
+def stop_line(verb: str, signum: int) -> str:
+    """The one line a signalled probe/gate/cost logs: which of its consumers
+    were removed, or which removal was NOT confirmed and how to look."""
+    head = "door: %s stopped by signal %d; " % (verb, signum)
+    left = CONSUMERS.unconfirmed()
+    if left:
+        return head + ("removal NOT confirmed for %s - check `docker ps -a --filter name=homehub-door-` "
+                       "and `docker rm -f` what is left" % " ".join(left))
+    if CONSUMERS.started:
+        return head + "its consumers were removed (%s)" % " ".join(CONSUMERS.started)
+    return head + "it had started no consumer"
 
 
 def api_stream(s: RelaySettings) -> Dict[str, object]:
@@ -567,7 +648,10 @@ def start_consumer(argv: Sequence[str], payload: bytes, stdout=subprocess.DEVNUL
     """Start a relay consumer and hand it its input document on stdin, then close
     stdin. A consumer that died before reading it is the caller's to see (poll,
     EOF): a broken pipe here is not raised."""
-    proc = subprocess.Popen(list(argv), stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
+    argv = list(argv)
+    if "--name" in argv:
+        CONSUMERS.start(argv[argv.index("--name") + 1])
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
     try:
         proc.stdin.write(payload)
         proc.stdin.close()
@@ -576,33 +660,54 @@ def start_consumer(argv: Sequence[str], payload: bytes, stdout=subprocess.DEVNUL
     return proc
 
 
-def remove_containers(*names: str) -> None:
+REMOVE_TIMEOUT_SEC = 30
+
+
+def remove_containers(*names: str, timeout: int = REMOVE_TIMEOUT_SEC) -> bool:
     """`docker rm -f` the named consumers, bounded, output discarded. Never
-    raises: it runs on cleanup paths, where its own failure must not replace
-    the error being cleaned up after."""
-    try:
-        subprocess.run(["docker", "rm", "-f"] + list(names), stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        pass
+    raises a failure of its own: it runs on cleanup paths, where that must not
+    replace the error being cleaned up after. It runs under defer_stop(), so a
+    SIGTERM or SIGHUP arriving while it runs does not abandon the removal: the
+    Stopped is raised once it has finished. Returns True, and records the
+    names as removed (CONSUMERS), only when docker ran to completion and
+    reported nothing but removals or names already gone."""
+    with defer_stop():
+        try:
+            done = subprocess.run(["docker", "rm", "-f"] + list(names), stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE, timeout=timeout)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        errors = [line for line in (done.stderr or b"").decode("utf-8", "replace").splitlines()
+                  if line.strip() and "No such container" not in line]
+        if done.returncode and errors:
+            return False
+        CONSUMERS.removed.update(names)
+        return True
+
+
+PROBE_GRACE_SEC = 60  # how long past its --seconds the probe's docker client may take
 
 
 def probe(s: RelaySettings, seconds: int = 10, name: str = "homehub-door-probe") -> Dict[str, object]:
     """One authenticated test consumer: what it decoded and in what geometry.
 
     Killing the docker client (on the deadline, on Ctrl-C, or on the SIGTERM
-    or SIGHUP that main() turns into Stopped) does NOT stop the container: --rm removes it only once ffprobe exits, and against a
-    camera that accepts TCP but never answers RTSP that is never. So on any
-    way out but a normal return the named container is removed here, or it
-    would keep a camera session and refuse every retry under its fixed name.
-    A timeout is a result (rc -1, timeout true: probe_verdict fails it);
-    anything else is re-raised after the removal.
+    or SIGHUP that main() turns into Stopped) does NOT stop the container:
+    --rm removes it only once ffprobe exits, and against a camera that
+    accepts TCP but never answers RTSP that is never. So on any way out but a
+    normal return the named container is removed here, or it would keep a
+    camera session and refuse every retry under its fixed name. A timeout is
+    a result (rc -1, timeout true: probe_verdict fails it); anything else is
+    re-raised after the removal. The removal runs under defer_stop() (inside
+    remove_containers), so a signal landing during it is raised as Stopped
+    once it is done - out of the timeout branch too, before its return.
     """
     argv, payload = relay_consumer(
         s, name, "ffprobe", ["-v", "error"],
         ["-select_streams", "v:0", "-count_packets", "-read_intervals", "%%+%d" % seconds,
          "-show_entries", "stream=codec_name,width,height,nb_read_packets,avg_frame_rate", "-of", "json"])
-    deadline = seconds + 60
+    deadline = seconds + PROBE_GRACE_SEC
+    CONSUMERS.start(name)
     try:
         raw = subprocess.run(argv, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              timeout=deadline)
@@ -886,14 +991,17 @@ def gate(s: RelaySettings, seconds: int, progress_sec: int = 5) -> int:
         emit(after)
         ok &= after["upstream_connections"] == 1 and after["survivor_running"] and after["survivor_progressing"]
     finally:
-        remove_containers(GATE_CONSUMER % 1, GATE_CONSUMER % 2, GATE_CONSUMER % 3)
-        for proc in (leaver, survivor):
-            if proc is None:
-                continue
-            try:
-                proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        # The whole cleanup, waits included, is one defer_stop() block: a
+        # signal arriving in it is raised once every consumer is removed.
+        with defer_stop():
+            remove_containers(GATE_CONSUMER % 1, GATE_CONSUMER % 2, GATE_CONSUMER % 3)
+            for proc in (leaver, survivor):
+                if proc is None:
+                    continue
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
     emit({"check": "gate-hub-half", "pass": bool(ok)})
     return 0 if ok else 1
 
@@ -961,8 +1069,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             with stop_signals_raise():
                 return measure(s, args)
         except Stopped as exc:
-            mc.log("door: %s stopped by signal %d; its consumers were removed" % (args.verb, exc.signum),
-                   warning=True)
+            # Says what the removals actually confirmed, not what was intended.
+            mc.log(stop_line(args.verb, exc.signum), warning=True)
             return exc.code
     p.print_help()
     return 2
@@ -970,7 +1078,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 def measure(s: RelaySettings, args) -> int:
     """The probe, gate and cost verbs: each starts named consumer containers,
-    so main() runs them under stop_signals_raise()."""
+    so main() runs them under stop_signals_raise(). CONSUMERS records which
+    were started and which a removal confirmed, for main()'s stop line."""
+    CONSUMERS.reset()
     if args.verb == "probe":
         result = probe(s, args.seconds)
         reasons = probe_verdict(result, s)
@@ -995,9 +1105,11 @@ def measure(s: RelaySettings, args) -> int:
                 result["decoder_still_running"] = decoder.poll() is None
             emit(result)
         finally:
+            # remove_containers: never raises a failure of its own (a timeout
+            # here cannot replace the error being cleaned up after) and defers
+            # a signal that lands during it until the removal has finished.
             if args.decode_grey_fps:
-                subprocess.run(["docker", "rm", "-f", GREY_DECODER], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=60)
+                remove_containers(GREY_DECODER, timeout=60)
         return 0
     raise ValueError(args.verb)
 

@@ -680,7 +680,16 @@ def test_tc1317_a_suspend_inside_the_window_ends_it_and_the_next_press_only_warn
     assert m.seq == 102, "the press after the suspend is a NEW warning"
 
 
-def test_tc1325_each_device_is_asked_for_boot_clock_timestamps(tmp_path, monkeypatch):
+@pytest.fixture
+def posix_open_flags(monkeypatch):
+    """open_devices() names os.O_NONBLOCK, which Windows Python does not
+    define. Supply it (the real value where it exists) so these tests reach
+    their assertions on the Windows gate too; production keeps the direct
+    reference so Linux never loses nonblocking reads."""
+    monkeypatch.setattr(pb.os, "O_NONBLOCK", getattr(os, "O_NONBLOCK", 0), raising=False)
+
+
+def test_tc1325_each_device_is_asked_for_boot_clock_timestamps(tmp_path, monkeypatch, posix_open_flags):
     calls = []
 
     class FakeFcntl:
@@ -702,7 +711,7 @@ def test_tc1325_each_device_is_asked_for_boot_clock_timestamps(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("failing", [A, B])
-def test_tc1325_a_device_that_will_not_open_stops_the_guard_before_it_starts(monkeypatch, capsys, failing):
+def test_tc1325_a_device_that_will_not_open_stops_the_guard_before_it_starts(monkeypatch, capsys, failing, posix_open_flags):
     # Sol review 2 (F2): event0 opens and event4 does not (or the other way
     # round). Guarding the subset would hold the inhibitor over a button that
     # reports on the missing node, so main exits non-zero for the restart,

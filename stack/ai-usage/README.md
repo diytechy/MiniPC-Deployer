@@ -396,7 +396,7 @@ the vendor's rate-limit headers last seen. A cycle:
 |---|---|---|---|
 | read fine | + interval | cleared | **cleared** |
 | authentication failure | + interval | cleared | first attempt kept, attempts + 1 |
-| 429 or any 5xx (`Throttled`) | the vendor's `Retry-After` if it sent one (seconds or HTTP date, honoured to the second and past ten minutes, clamped only at 24 h); else interval x 2^level, ceiling 10 min | + 1 | untouched |
+| 429 or any 5xx (`Throttled`) | the vendor's `Retry-After` if it sent one (seconds or HTTP date, counted from when the answer ARRIVED, honoured to the second and past ten minutes, clamped only at 24 h); else interval x 2^level, ceiling 10 min | + 1 | untouched |
 | any other failure, or "login owed" | + interval | cleared | untouched |
 
 A healthy source is due 15 s early (`DUE_SLACK_SECONDS`), because cycles land
@@ -516,7 +516,7 @@ may catch an `AuthFailure` and re-raise a plain one. What counts:
 **Confirmed over attempts and time** (`AUTH_CONFIRM_ATTEMPTS` = 2,
 `AUTH_CONFIRM_SECONDS` = 600; revised 2026-10-22 for the minute timer). A
 source's gauges grey only after failed authentication **attempts** that number
-at least two and span at least ten minutes, from the first of the run to the
+at least two and span at least ten minutes, from the first failed-authentication attempt of the run to the
 latest. That absorbs the Claude refresh unit rewriting the credential mid-read
 ("no usable key" once) and an access token that lapses a few minutes before its
 renewal (measured: section above). Only attempts count: a skipped cycle adds

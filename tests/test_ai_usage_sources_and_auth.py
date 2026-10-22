@@ -1325,7 +1325,11 @@ GOOD_ENTRY = {"last_attempt": NOW, "next_due": NOW + 60, "hold": False, "backoff
 
 @pytest.mark.parametrize("change,kept", [
     ({}, True),
-    ({"auth_since": NOW - 600, "auth_attempts": 3, "last_outcome": "auth"}, True),
+    ({"auth_since": NOW - 600, "auth_last": NOW, "auth_attempts": 3, "last_outcome": "auth"}, True),
+    ({"auth_since": NOW - 600, "auth_last": NOW - 600, "auth_attempts": 1}, True),
+    ({"auth_since": NOW - 60, "auth_last": NOW - 600, "auth_attempts": 2}, False),   # last before first
+    ({"auth_since": NOW - 60, "auth_last": NOW + 60, "auth_attempts": 2}, False),    # after the attempt
+    ({"auth_since": NOW - 60, "auth_attempts": 2}, False),                           # no auth_last
     ({"ratelimit": {"retry-after": "120"}}, True),
     ({"last_attempt": True}, False), ({"last_attempt": "x"}, False),
     ({"last_attempt": 5}, False),                                   # before the epoch floor
@@ -1334,9 +1338,9 @@ GOOD_ENTRY = {"last_attempt": NOW, "next_due": NOW + 60, "hold": False, "backoff
     ({"next_due": NOW + 2 * 86400}, False),                          # past the Retry-After bound
     ({"hold": 1}, False), ({"backoff": -1}, False), ({"backoff": 31}, False),
     ({"backoff": True}, False), ({"last_outcome": "skipped"}, False),
-    ({"auth_since": NOW + 1, "auth_attempts": 1}, False),            # after the last attempt
+    ({"auth_since": NOW + 1, "auth_last": NOW + 1, "auth_attempts": 1}, False),  # after the last attempt
     ({"auth_since": NOW - 60}, False),                               # half an auth run
-    ({"auth_since": NOW - 60, "auth_attempts": 0}, False),
+    ({"auth_since": NOW - 60, "auth_last": NOW, "auth_attempts": 0}, False),
     ({"ratelimit": {"set-cookie": "a=b"}}, False),                   # not a rate-limit header
     ({"ratelimit": {"retry-after": "x" * 65}}, False),
     ({"ratelimit": "120"}, False),

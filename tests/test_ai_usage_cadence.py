@@ -287,11 +287,12 @@ def test_an_http_date_retry_after_reaches_the_schedule_tc1332(monkeypatch, tmp_p
     auth = tmp_path / "auth.json"
     auth.write_text('{"opencode":{"type":"api","key":"K"}}', encoding="utf-8")
     env["AI_USAGE_OPENCODE_AUTH"] = str(auth)
-    date = email.utils.formatdate(time.time() + 900, usegmt=True)
+    date = email.utils.formatdate(NOW + 900, usegmt=True)
     monkeypatch.setattr(feeder, "vendor_opener", lambda: _Opener(429, {"Retry-After": date}))
+    monkeypatch.setattr(feeder.time, "time", lambda: float(NOW))     # the answer arrives at once
     _rec, failures, _n = cycle(env, {"opencode": feeder.read_opencode}, NOW)
     entry = schedule_of(env, "opencode")
-    assert entry["hold"] is True and 880 <= entry["next_due"] - NOW <= 900
+    assert entry["hold"] is True and entry["next_due"] - NOW == 900
     assert any("backing off" in f and "Retry-After" in f for f in failures)
 
 
@@ -305,6 +306,29 @@ def test_a_retry_delay_longer_than_ten_minutes_is_honoured_as_given_tc1332(tmp_p
     assert re.match(r"claude: skipped - backing off, \d+s left \(level 1, Retry-After\)", notes[0])
     cycle(env, {"claude": reader}, NOW + 3600)
     assert reader.calls == [NOW, NOW + 3600]
+
+
+@pytest.mark.parametrize("form", ["seconds", "http-date"])
+def test_retry_after_is_anchored_at_the_answer_not_the_cycle_start_tc1332(monkeypatch, tmp_path, form):
+    """Sol round 1: an earlier source took 30 s, then this one answered 429 with
+    Retry-After 300. The vendor's deadline is receipt + 300, not cycle start +
+    300 -- a skip-less cycle at start + 300 would be early."""
+    env = base_env(tmp_path, AI_USAGE_SOURCES="opencode")
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"opencode":{"type":"api","key":"K"}}', encoding="utf-8")
+    env["AI_USAGE_OPENCODE_AUTH"] = str(auth)
+    received = NOW + 30
+    value = "300" if form == "seconds" else email.utils.formatdate(received + 300, usegmt=True)
+    monkeypatch.setattr(feeder, "vendor_opener", lambda: _Opener(429, {"Retry-After": value}))
+    monkeypatch.setattr(feeder.time, "time", lambda: float(received))
+    cycle(env, {"opencode": feeder.read_opencode}, NOW)
+    entry = schedule_of(env, "opencode")
+    assert (entry["next_due"], entry["hold"]) == (NOW + 330, True)
+    reader = Counting(opencode_ok)
+    cycle(env, {"opencode": reader}, NOW + 329)
+    assert reader.calls == []
+    cycle(env, {"opencode": reader}, NOW + 330)
+    assert reader.calls == [NOW + 330]
 
 
 def test_a_retry_after_shorter_than_the_cadence_keeps_the_cadence_tc1332(tmp_path):
@@ -562,10 +586,11 @@ def test_a_backwards_step_restarts_the_auth_run_rather_than_confirming_it_tc1337
 
 def test_next_schedule_never_mutates_its_input_tc1338():
     entry = {"last_attempt": NOW, "next_due": NOW + 60, "hold": False, "backoff": 2,
-             "last_outcome": "throttled", "auth_since": NOW - 60, "auth_attempts": 2}
+             "last_outcome": "throttled", "auth_since": NOW - 60, "auth_last": NOW,
+             "auth_attempts": 2}
     frozen = json.dumps(entry, sort_keys=True)
     for outcome in feeder.OUTCOMES:
-        feeder.next_schedule(entry, outcome, NOW + 60, 60, retry_after=None)
+        feeder.next_schedule(entry, outcome, NOW + 60, 60, retry_at=None)
     assert json.dumps(entry, sort_keys=True) == frozen
 
 
@@ -578,8 +603,32 @@ def test_an_unknown_outcome_is_a_programming_error_tc1338():
     (1, 0, False), (1, 900, False), (2, 599, False), (2, 600, True), (11, 600, True), (30, 300, False),
 ])
 def test_confirmation_needs_both_the_attempts_and_the_span_tc1338(attempts, span, confirmed):
-    entry = {"last_attempt": NOW, "auth_since": NOW - span, "auth_attempts": attempts}
+    entry = {"last_attempt": NOW, "auth_since": NOW - span, "auth_last": NOW,
+             "auth_attempts": attempts}
     assert feeder.auth_failure_confirmed(entry) is confirmed
+
+
+def test_a_later_non_auth_attempt_cannot_lend_its_stamp_to_the_span_tc1338(tmp_path):
+    """Sol round 1: two 401s a minute apart and a timeout ten minutes later are
+    not ten minutes of dead login. The span is first-to-LATEST AUTH attempt."""
+    env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
+
+    def dead(e):
+        raise feeder.AuthFailure("claude: HTTP 401", status=401)
+
+    def network(e):
+        raise feeder.SourceFailure("claude: URLError")
+
+    cycle(env, {"claude": lambda e: feeder.parse_claude(CLAUDE_BODY, e["_now"])}, NOW - 60)
+    cycle(env, {"claude": dead}, NOW)
+    cycle(env, {"claude": dead}, NOW + 60)
+    _rec, failures, _n = cycle(env, {"claude": network}, NOW + 600)
+    entry = schedule_of(env, "claude")
+    assert (entry["auth_since"], entry["auth_last"], entry["auth_attempts"]) == (NOW, NOW + 60, 2)
+    assert not feeder.auth_failure_confirmed(entry)
+    assert "auth_failed" not in state_of(env)["ai-usage-claude-session"], "never marked"
+    _rec, failures, _n = cycle(env, {"claude": dead}, NOW + 660)
+    assert any("attempt 3 over 660s - CONFIRMED" in f for f in failures), "a real span still confirms"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

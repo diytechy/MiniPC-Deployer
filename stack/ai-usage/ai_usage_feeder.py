@@ -325,8 +325,9 @@ class Throttled(SourceFailure):
     Like AuthFailure it IS a SourceFailure, so the gauge path is unchanged (the
     last reading is re-posted at its true `observed_at`); what differs is the
     SCHEDULE. `run_cycle` catches it before the plain handler and backs the
-    source off: `retry_after` (seconds, already parsed from either form of the
-    header by `parse_retry_after`) is honoured when the vendor sent one, and an
+    source off: `retry_at` -- the ABSOLUTE instant the vendor named, anchored
+    at the moment its answer arrived, not at the cycle's start (an earlier
+    source may have taken 30 s) -- is honoured when the vendor sent one, and an
     exponential delay to BACKOFF_CEILING_SECONDS is used when it did not.
 
     `status` is the HTTP status. Neither field is the remote's free text.
@@ -334,10 +335,11 @@ class Throttled(SourceFailure):
     Implements: SR-095, LLR-1192
     """
 
-    def __init__(self, message, status=None, retry_after=None):
+    def __init__(self, message, status=None, retry_after=None, retry_at=None):
         SourceFailure.__init__(self, message)
         self.status = status
-        self.retry_after = retry_after
+        self.retry_after = retry_after      # seconds, as the vendor said them
+        self.retry_at = retry_at            # epoch seconds; None = "cycle start + retry_after"
 
 
 class EgressRefused(Exception):
@@ -1277,6 +1279,7 @@ def validate_stored_reading(entry, now):
 #                  honoured to the second, with no DUE_SLACK_SECONDS
 #   backoff        consecutive throttled attempts (429 / 5xx); 0 when healthy
 #   auth_since     the first failed-authentication attempt of the current run
+#   auth_last      the latest failed-authentication attempt of that run
 #   auth_attempts  how many failed-authentication attempts that run holds
 #   last_outcome   one of OUTCOMES
 #   ratelimit      the vendor's rate-limit response headers, last seen (optional)
@@ -1329,6 +1332,7 @@ _BACKOFF_LEVEL_CEILING = 30
 # vendor knows its own limit -- up to this sanity bound, past which the value is
 # clamped to it rather than parked for a year by one malformed header.
 RETRY_AFTER_MAX_SECONDS = 24 * 3600
+_RETRY_ANCHOR_SLACK_SECONDS = 3600
 
 # A source's gauges go grey only after failed-AUTHENTICATION attempts that number
 # at least AUTH_CONFIRM_ATTEMPTS and span at least AUTH_CONFIRM_SECONDS. The rule
@@ -1463,7 +1467,9 @@ def _validate_schedule_entry(item, now):
         return None
     if last < EPOCH_FLOOR or last > now + MAX_CLOCK_SKEW_SECONDS:
         return None
-    if not (last <= due <= last + RETRY_AFTER_MAX_SECONDS + MAX_CLOCK_SKEW_SECONDS):
+    # The bound allows a Retry-After of the full 24 h anchored at an answer that
+    # arrived late in a long cycle (the unit's TimeoutStartSec is 180 s).
+    if not (last <= due <= last + RETRY_AFTER_MAX_SECONDS + _RETRY_ANCHOR_SLACK_SECONDS):
         return None
     hold = item.get("hold")
     backoff = item.get("backoff")
@@ -1475,15 +1481,17 @@ def _validate_schedule_entry(item, now):
         return None
     out = {"last_attempt": last, "next_due": due, "hold": hold,
            "backoff": backoff, "last_outcome": outcome}
-    since, attempts = item.get("auth_since"), item.get("auth_attempts")
-    if since is not None or attempts is not None:
-        since = _epoch_int(since)
-        if since is None or not EPOCH_FLOOR <= since <= last:
+    since, latest = item.get("auth_since"), item.get("auth_last")
+    attempts = item.get("auth_attempts")
+    if since is not None or latest is not None or attempts is not None:
+        since, latest = _epoch_int(since), _epoch_int(latest)
+        if since is None or latest is None \
+                or not EPOCH_FLOOR <= since <= latest <= last:
             return None
         if isinstance(attempts, bool) or not isinstance(attempts, int) \
                 or not 1 <= attempts <= _AUTH_ATTEMPT_CEILING:
             return None
-        out["auth_since"], out["auth_attempts"] = since, attempts
+        out["auth_since"], out["auth_last"], out["auth_attempts"] = since, latest, attempts
     if "ratelimit" in item:
         headers = item["ratelimit"]
         if not isinstance(headers, dict):
@@ -1541,14 +1549,15 @@ def schedule_wait(entry, now):
     return max(0, entry["next_due"] - slack - now)
 
 
-def next_schedule(entry, outcome, now, interval, retry_after=None, ratelimit=None):
+def next_schedule(entry, outcome, now, interval, retry_at=None, ratelimit=None):
     """The schedule entry after ONE ATTEMPT that ended in `outcome`. Pure.
 
     Contract:
       Inputs:  entry: the validated previous entry, or None;
                outcome: one of OUTCOMES; now: this cycle's clock;
                interval: the source's healthy cadence in seconds;
-               retry_after: seconds from `parse_retry_after`, for "throttled";
+               retry_at: for "throttled", the epoch second the vendor's
+                         Retry-After names (anchored at the answer's receipt);
                ratelimit: sanitized rate-limit headers seen on this attempt.
       Outputs: a new entry; `entry` is never mutated.
 
@@ -1577,17 +1586,18 @@ def next_schedule(entry, outcome, now, interval, retry_after=None, ratelimit=Non
     if outcome == "throttled":
         level = min(previous.get("backoff", 0) + 1, _BACKOFF_LEVEL_CEILING)
         out["backoff"] = level
-        if retry_after is not None:
-            out["next_due"] = now + max(retry_after, interval)
-            out["hold"] = retry_after > interval - DUE_SLACK_SECONDS
+        if retry_at is not None:
+            out["next_due"] = max(int(math.ceil(retry_at)), now + interval)
+            out["hold"] = retry_at > now + interval - DUE_SLACK_SECONDS
         else:
             ceiling = max(BACKOFF_CEILING_SECONDS, interval)
             out["next_due"] = now + min(interval * (2 ** level), ceiling)
     if outcome != "ok" and "auth_since" in previous:
-        out["auth_since"] = previous["auth_since"]
-        out["auth_attempts"] = previous["auth_attempts"]
+        for key in ("auth_since", "auth_last", "auth_attempts"):
+            out[key] = previous[key]
     if outcome == "auth":
         out.setdefault("auth_since", now)
+        out["auth_last"] = now
         out["auth_attempts"] = min(out.get("auth_attempts", 0) + 1, _AUTH_ATTEMPT_CEILING)
     headers = ratelimit or previous.get("ratelimit")
     if headers:
@@ -1599,16 +1609,18 @@ def auth_failure_confirmed(entry):
     """True once the source's failed-authentication attempts are CONFIRMED.
 
     At least AUTH_CONFIRM_ATTEMPTS attempts, spanning at least
-    AUTH_CONFIRM_SECONDS from the first to the latest. Only attempts count: a
-    skipped cycle adds neither an attempt nor any span. The entry is the one
-    `next_schedule` just wrote, so its last_attempt IS the latest attempt.
+    AUTH_CONFIRM_SECONDS from the first FAILED-AUTHENTICATION attempt to the
+    latest one (`auth_last`) -- never to `last_attempt`, which a later network
+    failure also moves: two 401s a minute apart and a timeout ten minutes on
+    are not ten minutes of dead login. A skipped cycle adds neither an attempt
+    nor any span.
 
     Implements: SR-068, LLR-1054
     """
     if not entry or "auth_since" not in entry:
         return False
     return (entry["auth_attempts"] >= AUTH_CONFIRM_ATTEMPTS
-            and entry["last_attempt"] - entry["auth_since"] >= AUTH_CONFIRM_SECONDS)
+            and entry["auth_last"] - entry["auth_since"] >= AUTH_CONFIRM_SECONDS)
 
 
 # ── The journal's words for the schedule. Kept stable: the 24-hour verification
@@ -1645,7 +1657,7 @@ def auth_line(name, entry):
 
     Implements: SR-068, LLR-1054
     """
-    span = entry["last_attempt"] - entry["auth_since"]
+    span = entry["auth_last"] - entry["auth_since"]
     if auth_failure_confirmed(entry):
         tail = " - CONFIRMED, its gauges are posted unavailable"
     else:
@@ -2420,7 +2432,11 @@ def throttled_failure(message, status, seen, now):
     if seen:
         message += " (rate-limit headers: %s)" % ", ".join(
             "%s=%s" % pair for pair in sorted(seen.items()))
-    return Throttled(message, status=status, retry_after=retry_after)
+    # `now` is the moment the answer ARRIVED, so the deadline is the vendor's,
+    # not "cycle start + seconds" -- which would come back early after a slow
+    # source earlier in the same cycle.
+    return Throttled(message, status=status, retry_after=retry_after,
+                     retry_at=None if retry_after is None else now + retry_after)
 
 
 def http_json(url, headers, timeout, data=None):
@@ -2955,7 +2971,7 @@ def run_cycle(env, now=None, readers=None, poster=None):
             env.setdefault("_notes", []).append(skip_note(name, entry, wait, intervals[name]))
             continue
         attempted.add(name)
-        outcome, retry_after = "ok", None
+        outcome, retry_after, retry_at = "ok", None, None
         sink = []
         token = _RATE_LIMIT_SINK.set(sink)
         try:
@@ -2975,6 +2991,9 @@ def run_cycle(env, now=None, readers=None, poster=None):
             failures.append("%s: %s" % (name, exc))
         except Throttled as exc:
             outcome, retry_after = "throttled", exc.retry_after
+            retry_at = exc.retry_at
+            if retry_at is None and retry_after is not None:
+                retry_at = now + retry_after      # a reader that gave only seconds
             failures.append("%s: %s" % (name, exc))
         except SourceFailure as exc:
             outcome = "failure"
@@ -2988,7 +3007,7 @@ def run_cycle(env, now=None, readers=None, poster=None):
         for seen in sink:
             headers.update(seen)
         schedule[name] = next_schedule(entry, outcome, now, intervals[name],
-                                       retry_after=retry_after, ratelimit=headers)
+                                       retry_at=retry_at, ratelimit=headers)
         if outcome == "throttled":
             failures.append(backoff_line(name, schedule[name], now, retry_after))
         if outcome == "auth":

@@ -216,6 +216,28 @@ else
     log "SURE_ENABLED is not true in ${ENV_FILE##*/} — the Sure images are NOT baked"
 fi
 
+# ── THE DOOR RELAY: THE SAME SHAPE AS THE CROSSPLAY RELAY (SR-105) ──────────
+# `door-relay` is a compose profile only to keep the service out of firstboot's
+# bulk `up -d`; homehub-door-relay.service owns it and DOOR_RELAY_ENABLED is its
+# switch. So the bake follows the knob. The image is pinned by digest
+# (stack/door/door-relay-image.pin) and also supplies the recorder's ffmpeg, so
+# a hub with the relay on and this image unbaked has neither until it can pull.
+case " $ENV_PROFILES " in
+    *" door-relay "*)
+        die "COMPOSE_PROFILES in $ENV_FILE contains 'door-relay'. That is a DEFECT, not an enable switch: the relay's lifecycle belongs to homehub-door-relay.service, which renders its config first. Remove door-relay from COMPOSE_PROFILES and set DOOR_RELAY_ENABLED=true instead."
+        ;;
+esac
+DOOR_RELAY_ENABLED="$(env_file_value "$ENV_FILE" DOOR_RELAY_ENABLED | tr -d '[:space:]')"
+case "$DOOR_RELAY_ENABLED" in
+    true)
+        PROFILE_ARGS+=(--profile door-relay)
+        log "DOOR_RELAY_ENABLED=true in ${ENV_FILE##*/} — baking the door relay image (--profile door-relay)"
+        ;;
+    *)
+        log "DOOR_RELAY_ENABLED is not true in ${ENV_FILE##*/} — the door relay image is NOT baked"
+        ;;
+esac
+
 for p in $ENV_PROFILES ${EXTRA_PROFILES:-}; do
     case " ${PROFILE_ARGS[*]} " in *" $p "*) continue ;; esac
     PROFILE_ARGS+=(--profile "$p")

@@ -193,6 +193,41 @@ setup_docker_lv() {
 }
 setup_docker_lv
 
+# ── 1b-scratch. THE NVMe SCRATCH VOLUME (SN-050, SR-102; stack/scratch) ──────
+#
+# 18 GiB of the VG for recording and staging, OFF THE ROOT FILESYSTEM, with a
+# hard project quota per writer (door/ meetings/ ottertube/). AFTER 1b ON
+# PURPOSE: the docker LV takes its 60% of the free space first, exactly as it
+# always has, and the scratch LV comes out of what is left.
+#
+# A REIMAGE RECREATES IT, DELIBERATELY (plan W4a.4). The tracked config
+# describes a hub that has the volume, and its writers refuse to start without
+# it, so a reflash that left it out would come up with the door recorder down
+# and no one told. The DATA does not survive a reimage and is not meant to:
+# scratch is not backed up (storage-map section 3c). The IDENTITY does: when
+# HOMEHUB_SCRATCH_UUID is set, the filesystem is made with that UUID, so the
+# writers' guard knob stays true across the reflash.
+#
+# NON-DESTRUCTIVE, END-STATE, NON-FATAL. homehub_scratch.py ensure asks each
+# step's end state first and resumes a half-done run; it never touches an LV
+# but its own, never formats a device with any signature on it, never edits an
+# fstab line it did not write, and STOPS (changing nothing) when the VG would
+# keep less than HOMEHUB_SCRATCH_VG_RESERVE_MIB free - the lab's small disks
+# land there. Every outcome is a log line; none fails this unit.
+__scratch_on="$(sed -n 's/^HOMEHUB_SCRATCH_ENABLED=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 \
+        | tr -d "\"'" | tr -d '[:space:]')"
+if [ "$__scratch_on" = true ] && [ -f "$STACK_DIR/scratch/homehub_scratch.py" ]; then
+    if python3 "$STACK_DIR/scratch/homehub_scratch.py" --env-file "$STACK_DIR/.env" ensure; then
+        log "1b-scratch: the scratch volume is in place at /srv/scratch"
+    else
+        log "WARN: 1b-scratch: the scratch volume was NOT ensured (see the lines above); its writers stay down"
+    fi
+elif [ "$__scratch_on" = true ]; then
+    log "WARN: 1b-scratch: HOMEHUB_SCRATCH_ENABLED=true but $STACK_DIR/scratch is missing from the payload"
+else
+    log "1b-scratch: HOMEHUB_SCRATCH_ENABLED is not true - no scratch volume"
+fi
+
 # ── 1c. THE BOX'S TIMEZONE, WHICH NOTHING USED TO SET ────────────────────────
 #
 # Found 2026-08-30 (open-items C39). The installer left the OS on UTC because
@@ -2973,6 +3008,27 @@ else
     log "WARN: no $STACK_DIR/monitoring on the payload - no telemetry, disk alarm, watches or liveness probe."
 fi
 # END hub-monitoring
+
+# ── 6i. door relay and recorder (SN-050, SR-105..SR-107; stack/door) ─────────
+# Unit copying and enabling only, no branches: each unit's ExecCondition reads
+# its own knob (DOOR_RELAY_ENABLED, DOOR_RECORDER_ENABLED), so a box with them
+# off has both enabled, inert and green. The recorder is also WantedBy the
+# scratch mount, so it comes back with the volume. Both are ordered After= this
+# unit, so they are started with --no-block (the 2026-08-27 deadlock).
+# The relay's image is baked by vmtest/export-images.sh when DOOR_RELAY_ENABLED
+# is true; nothing to provision on the host (python3 and docker are present).
+if [ -d "$STACK_DIR/door" ]; then
+    install -m 0644 "$STACK_DIR/door/homehub-door-relay.service"    /etc/systemd/system/homehub-door-relay.service    || log "WARN: could not install homehub-door-relay.service"
+    install -m 0644 "$STACK_DIR/door/homehub-door-recorder.service" /etc/systemd/system/homehub-door-recorder.service || log "WARN: could not install homehub-door-recorder.service"
+    systemctl daemon-reload || log "WARN: systemctl daemon-reload failed"
+    systemctl enable homehub-door-relay.service    >/dev/null 2>&1 || log "WARN: could not enable homehub-door-relay.service"
+    systemctl enable homehub-door-recorder.service >/dev/null 2>&1 || log "WARN: could not enable homehub-door-recorder.service"
+    systemctl start --no-block homehub-door-relay.service homehub-door-recorder.service >/dev/null 2>&1 \
+        || log "WARN: could not queue the door relay/recorder start"
+    log "door relay + recorder units installed (DOOR_RELAY_ENABLED=$(_env_val DOOR_RELAY_ENABLED), DOOR_RECORDER_ENABLED=$(_env_val DOOR_RECORDER_ENABLED))"
+else
+    log "WARN: no $STACK_DIR/door on the payload - no door relay or recorder"
+fi
 
 # ── 7. done ──────────────────────────────────────────────────────────────────
 date > "$MARKER"

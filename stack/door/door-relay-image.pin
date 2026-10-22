@@ -1,0 +1,34 @@
+# door-relay-image.pin - the door relay's image, by version AND digest.
+#
+# Implements: SR-105, LLR-1223
+#
+# go2rtc (https://github.com/AlexxIT/go2rtc), the official image. The same image
+# serves the relay (compose service door-relay) and supplies ffmpeg/ffprobe to
+# the recorder and the measurement commands, so ONE pin covers every binary that
+# touches the door stream. docker-compose.yml references ${DOOR_RELAY_IMAGE},
+# whose value in stack/.env.example is IMAGE:VERSION@DIGEST built from the three
+# lines below; tests/test_door_relay.py fails if the two ever differ.
+#
+# PROVENANCE, 2026-10-22:
+#   * GitHub release v1.9.14, published 2026-01-19T09:16:56Z, not a pre-release
+#     (api.github.com/repos/AlexxIT/go2rtc/releases) - the newest release.
+#   * The registry itself, not the Hub web API: HEAD
+#     registry-1.docker.io/v2/alexxit/go2rtc/manifests/1.9.14 answered
+#     docker-content-digest sha256:675c318b...bae, an OCI image INDEX
+#     (application/vnd.oci.image.index.v1+json) whose linux/amd64 manifest is
+#     sha256:1120820fa7405c7655c71928c1f919feaa031fbb34fdc13ebe716006179fe346.
+#   * `docker pull alexxit/go2rtc:1.9.14@<DIGEST>` verified the same digest, and
+#     the image reports "go2rtc version 1.9.14 (b5948cf) linux/amd64",
+#     ffmpeg 8.0.1, Alpine.
+#   * `latest` resolved to the same index digest on that date; `master` did not
+#     (sha256:fb246466...). Tags move; this file is the record.
+#
+# TO ROTATE: pick the release, resolve its index digest against the registry,
+# update VERSION, DIGEST and PINNED together with the .env.example line, re-run
+# stack/door/tests/door-relay-lab.sh, and commit them in one change.
+
+IMAGE=alexxit/go2rtc
+VERSION=1.9.14
+DIGEST=sha256:675c318b23c06fd862a61d262240c9a63436b4050d177ffc68a32710d9e05bae
+AMD64_MANIFEST=sha256:1120820fa7405c7655c71928c1f919feaa031fbb34fdc13ebe716006179fe346
+PINNED=2026-10-22

@@ -175,6 +175,8 @@ graph LR
 | `stack/icedrive/` | the headless IceDrive CLI: pinned binary, one-time non-interactive sign-in, FUSE mount unit |
 | `stack/tracker/` | deprecated reference copies (NagLight owns the build) |
 | `stack/monitoring/` | SN-048: the hub's record-and-alert monitors (telemetry, low-disk alarm, watched jobs, liveness with evidence) and the one alert helper (SR-085..SR-091) |
+| [`stack/scratch/`](../stack/scratch/README.md) | SN-050: the NVMe scratch volume (18 GiB ext4 LV with one hard project quota per writer), its non-destructive provisioner and the mount guard every writer runs before each new file (SR-102..SR-104, IF-071) |
+| [`stack/door/`](../stack/door/README.md) | SN-050: the door relay (go2rtc pinned by digest; the doorbell's one RTSP session re-served on the LAN), the copy-only recorder onto `/srv/scratch/door`, and the gate/cutover/cost tooling (SR-105..SR-107, IF-070) |
 | `sim/` | V1 homehub-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
 | `vmtest/` | V3 — the real autoinstall ISO booted in Hyper-V (SIM secrets only) |
 | `scripts/validate_config.py` | config-coverage validation (the product-layer check here) |

@@ -1,0 +1,45 @@
+[Unit]
+# The door recorder (SN-050, SR-107): copy-only 10-minute segments of the relay
+# onto the NVMe scratch volume, /srv/scratch/door/YYYY-MM-DD/. A SCRATCH WRITER,
+# so it carries the writer pattern (SR-103, stack/scratch/README.md):
+#   * RequiresMountsFor= and BindsTo=srv-scratch.mount: it does not start without
+#     the volume and is stopped the moment the mount goes away;
+#   * ExecStartPre runs the mount guard (mount point, filesystem UUID from
+#     HOMEHUB_SCRATCH_UUID, prjquota, writable, door/ in its quota project), and
+#     the recorder runs it again before EVERY new segment;
+#   * it drops CAP_SYS_RESOURCE, without which the kernel ignores quota hard
+#     limits for it (the guard refuses a process that still holds it).
+Description=Door recorder: copy-only segments of the door relay on /srv/scratch
+Documentation=file:///opt/homehub/stack/door/README.md
+RequiresMountsFor=/srv/scratch
+BindsTo=srv-scratch.mount
+After=srv-scratch.mount homehub-door-relay.service docker.service network-online.target homehub-firstboot.service
+Wants=homehub-door-relay.service docker.service network-online.target
+AssertPathExists=/opt/homehub/stack/door/door_recorder.py
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py condition DOOR_RECORDER_ENABLED
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/scratch/homehub_scratch.py guard --writer door
+ExecStart=/usr/bin/python3 /opt/homehub/stack/door/door_recorder.py run
+ExecStopPost=-/usr/bin/docker rm -f homehub-door-recorder
+# 75 = EDQUOT/ENOSPC (door/ is full), 76 = the guard refused before a new
+# segment: both stop the recorder with an alert and must NOT be retried in a
+# loop. Anything else (the relay restarted, the stream stalled) is retried.
+Restart=on-failure
+RestartSec=15
+RestartPreventExitStatus=75 76
+# THE QUOTA IS ONLY A WALL WITHOUT THIS (fs/quota/dquot.c ignore_hardlimit).
+CapabilityBoundingSet=~CAP_SYS_RESOURCE
+NoNewPrivileges=true
+CPUAccounting=true
+CPUQuota=25%
+MemoryAccounting=true
+MemoryMax=192M
+TasksMax=64
+TimeoutStopSec=30
+
+[Install]
+# srv-scratch.mount as well: when the volume comes back, so does the recorder.
+WantedBy=multi-user.target srv-scratch.mount

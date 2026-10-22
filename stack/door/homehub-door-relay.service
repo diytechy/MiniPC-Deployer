@@ -1,0 +1,49 @@
+[Unit]
+# The door relay (SN-050, SR-105): go2rtc holds the doorbell's ONE RTSP session
+# and re-serves it on the LAN address. SYSTEMD OWNS ITS LIFECYCLE, NOT DOCKER:
+# the compose service is `restart: "no"` and sits behind `profiles:
+# ["door-relay"]`, which keeps firstboot's bulk `docker compose up -d` from
+# starting it; this unit is the only thing that passes `--profile door-relay`.
+# The knob is DOOR_RELAY_ENABLED in the stack .env, read by ExecCondition - a
+# box with it off has this unit enabled, inert and green (a clean skip).
+#
+# NEVER put `door-relay` in COMPOSE_PROFILES: the container would then start
+# outside this unit, with no rendered config and nobody restarting it.
+Description=Door relay (go2rtc): the doorbell's one RTSP session, re-served on the LAN
+Documentation=file:///opt/homehub/stack/door/README.md
+# Wants=+After=, deliberately NOT Requires=docker.service: firstboot step 1b
+# stops docker to move /var/lib/docker, and Requires= would carry that stop
+# here (validate_config check 5b; the 2026-08-09 lesson).
+Wants=docker.service network-online.target
+After=docker.service network-online.target homehub-firstboot.service
+AssertPathExists=/opt/homehub/stack/door/door_relay.py
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/homehub/stack
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py condition DOOR_RELAY_ENABLED
+# The config holds the doorbell credential: rendered fresh on every start into
+# this unit's RuntimeDirectory (0700, root, RAM, removed when the unit stops),
+# 0600, and bound read-only into the container. A missing or malformed field
+# fails the start and names the key, never the value.
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py --env-file /opt/homehub/stack/.env render
+ExecStartPre=-/usr/bin/docker rm -f homehub-door-relay
+# Attached, so the container's life IS this unit's life: the container ending
+# (or the daemon going away) ends `up`, and Restart= below brings it back.
+# THROUGH redact-run, ALWAYS: go2rtc logs the credentialed camera URL when the
+# camera drops, and this is the only path its output has (the compose service
+# has no log driver). redact-run merges stdout and stderr, strips every
+# spelling of the credential and the camera's address line by line, forwards
+# signals and exits with compose's status.
+ExecStart=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py --env-file /opt/homehub/stack/.env redact-run -- /usr/bin/docker compose --profile door-relay up --no-deps --no-log-prefix --exit-code-from door-relay door-relay
+ExecStop=/usr/bin/docker compose --profile door-relay stop --timeout 10 door-relay
+ExecStopPost=-/usr/bin/docker rm -f homehub-door-relay
+RuntimeDirectory=homehub-door-relay
+RuntimeDirectoryMode=0700
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1551,6 +1551,61 @@ services:
       start_period: 10s
 
 
+  # ── door-relay — the doorbell's one RTSP session, re-served (SR-105) ─────────
+  #
+  # The RemoBell S accepts ONE video connection. go2rtc takes it and re-serves
+  # it on the hub's LAN address, so the panel's door view and the recorder
+  # (stack/door/) watch at once while the camera still sees one client.
+  #
+  # LIFECYCLE: homehub-door-relay.service, the gunmaster3 pattern. The profile
+  # is NOT an enable switch - it keeps this service out of firstboot's bulk
+  # `up -d`; the unit is the only caller of `--profile door-relay`, and its
+  # knob is DOOR_RELAY_ENABLED. `restart: "no"` because two owners is none.
+  # NEVER add `door-relay` to COMPOSE_PROFILES.
+  #
+  # EVERY LISTENER IS NAMED in the config the unit renders at each start
+  # (stack/door/door_relay.py relay_config): RTSP on ${LAN_IP} with the
+  # doorbell's own credential, the API on 127.0.0.1 behind the same credential,
+  # WebRTC/SRTP/RTMP off. Host networking so those binds ARE the host's binds -
+  # no published port, no docker-proxy, nothing on 0.0.0.0. No Caddy route, no
+  # DNS name: LAN-only, reached by address.
+  #
+  # PINNED BY VERSION AND DIGEST (stack/door/door-relay-image.pin).
+  door-relay:
+    image: ${DOOR_RELAY_IMAGE}
+    container_name: homehub-door-relay
+    profiles: ["door-relay"]
+    network_mode: host
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    volumes:
+      # Long syntax with create_host_path: false - a missing config (the unit's
+      # render did not run) fails the start instead of docker creating an empty
+      # directory in its place.
+      - type: bind
+        source: /run/homehub-door-relay/go2rtc.yaml
+        target: /config/go2rtc.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    # NO LOG DRIVER. go2rtc's producer warns with the whole camera URL,
+    # credential included, whenever the camera drops; a driver would keep a
+    # second, unredacted copy under /var/lib/docker/containers. The unit's
+    # attached `up` still receives the output (attach does not need a driver)
+    # and passes it through `door_relay.py redact-run` into the journal.
+    logging:
+      driver: none
+    labels:
+      # Pinned by digest; a digest pin has nothing for diun to watch.
+      - "diun.enable=false"
+
   # ── centralised LLM gateway: FreeLLMAPI (SR-043, SN-043) ─────────────────────
   #
   # ONE endpoint every LLM consumer points at — hub services, the Owner over the

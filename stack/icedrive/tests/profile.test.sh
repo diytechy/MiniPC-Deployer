@@ -38,6 +38,7 @@
 #       IceDrive off must never look like a broken recovery
 #   I18 under systemd the restarted client leaves the unit's cgroup, and one
 #       that did not is a FAILED capture (found on the hub 2026-10-19)
+#   I19 a restarted client that survives does not keep the capture lock
 #
 # Usage: bash profile.test.sh [--keep-tmp]
 set -uo pipefail
@@ -475,6 +476,51 @@ else
 fi
 pkill -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' 2>/dev/null || true
 kill "$FAKE_SESSION3" 2>/dev/null || true
+echo
+
+# ── I19: a client that SURVIVES must not keep the capture lock ──────────────
+# Found by review of the I18 fix: the script holds an flock on fd 9 for the whole
+# run, and the restarted client inherited it. While the client died with the
+# unit the lock died too; once it survives (the point of I18) it would hold the
+# lock for ever, every later capture would exit 3 ("another run holds the
+# lock"), the unit counts 3 as success, and the archive would stop updating
+# with nothing red anywhere. So: a capture whose client comes back WORKING and
+# stays up, then a lock attempt while that client is still alive.
+echo "== I19: a surviving client does not hold the capture lock =="
+make_profile
+
+cp /bin/sleep "$TMP/xfce4-session"
+env DISPLAY=:99 "$TMP/xfce4-session" 180 &
+FAKE_SESSION4=$!
+sleep 1
+
+cat >"$TMP/healthy-client.sh" <<'EOS'
+#!/bin/bash
+mkdir -p "$HOME/.local/share/Icedrive"
+echo '[test] start watch on "/srv/library/permtest" id: 99999' >> "$HOME/.local/share/Icedrive/logdata.txt"
+exec -a "/opt/icedrive/Icedrive.AppImage" sleep 90
+EOS
+chmod +x "$TMP/healthy-client.sh"
+printf '[Desktop Entry]\nType=Application\nExec=env HOME=%s %s\n' "$REALHOME" "$TMP/healthy-client.sh" \
+    >"$REALHOME/.config/autostart/icedrive.desktop"
+
+setsid bash -c 'exec -a "/opt/icedrive/Icedrive.AppImage" sleep 120' &
+sleep 1
+
+rc="$(ICEDRIVE_PROFILE_LOCK="$TMP/i19.lock" sut --capture)"
+if [ "$rc" = 0 ] && pgrep -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' >/dev/null 2>&1; then
+    pass "I19 setup: the capture succeeded and the restarted client is still running"
+else
+    fail "I19 setup: exit=$rc or no surviving client - the lock check below proves nothing"
+    sed -n '1,40p' "$TMP/out.txt"
+fi
+if flock -n "$TMP/i19.lock" true; then
+    pass "I19 the lock is free while the restarted client lives on"
+else
+    fail "I19 the surviving client still holds the capture lock - every later capture would exit 3"
+fi
+pkill -u "$ME" -f '/opt/icedrive/Icedrive\.AppImage' 2>/dev/null || true
+kill "$FAKE_SESSION4" 2>/dev/null || true
 echo "──────────────────────────────────────────────────────────────"
 printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 if [ "$FAIL" -eq 0 ]; then exit 0; fi

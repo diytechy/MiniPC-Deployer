@@ -306,6 +306,47 @@ _pids_matching() {
 client_pids() { _pids_matching "$CLIENT_RE"; }
 app_pids()    { _pids_matching "$APP_RE"; }
 
+# _icd_unit_cg PID — the process's path in systemd's own cgroup hierarchy: the
+# `0::` line on a unified (v2) box, the `name=systemd` line on v1/hybrid. Other
+# v1 controller lines say nothing about which unit owns the process, which is
+# why the whole file is not compared. Non-zero if unreadable.
+_icd_unit_cg() {
+    local line path=''
+    [ -r "/proc/$1/cgroup" ] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            *:name=systemd:*) path="${line#*:name=systemd:}"; break ;;
+            0::*)             path="${line#0::}" ;;
+        esac
+    done <"/proc/$1/cgroup"
+    [ -n "$path" ] || return 1
+    printf '%s\n' "$path"
+}
+
+# _icd_outside_unit — 0 when every live client pid is OUTSIDE this unit's cgroup
+# (and its descendants: a child cgroup is torn down with the unit too). FAILS
+# CLOSED: a cgroup that cannot be read is not proof of escape. Only under a unit
+# (INVOCATION_ID); from a shell there is no unit teardown to escape.
+_icd_outside_unit() {
+    [ -n "${INVOCATION_ID:-}" ] || return 0
+    local own cg p
+    own="$(_icd_unit_cg $$)" || { warn "cannot read this unit's own cgroup, so the client cannot be shown to outlive it"; return 1; }
+    for p in $(app_pids); do
+        if ! cg="$(_icd_unit_cg "$p")"; then
+            [ -d "/proc/$p" ] || continue          # exited between listing and reading
+            warn "cannot read the cgroup of client pid $p, so it cannot be shown to outlive this unit"
+            return 1
+        fi
+        case "$cg" in
+            "$own"|"$own"/*)
+                warn "the restarted client (pid $p) is still in this unit's cgroup"
+                warn "  ($own): systemd will kill it the moment this capture exits."
+                return 1 ;;
+        esac
+    done
+    return 0
+}
+
 stop_client() {
     local pids w=0; pids="$(client_pids)"
     [ -n "$pids" ] || { log "the client is not running — nothing to quiesce"; return 0; }
@@ -314,6 +355,11 @@ stop_client() {
     # notices.
     if ! session_env_load; then
         die "IceDrive is running but no desktop session with a DISPLAY was found for '$PROF_USER', so this capture could stop the client and not be able to restart it. Refusing. Nothing was touched."
+    fi
+    # Same rule for the launcher: under a unit, a restart without systemd-run
+    # dies with the unit (see start_client), so do not stop what that would lose.
+    if [ -n "${INVOCATION_ID:-}" ] && ! command -v systemd-run >/dev/null 2>&1; then
+        die "running as a systemd unit without systemd-run, so a restarted client would be killed when this unit exits. Refusing. Nothing was touched."
     fi
     log "quiescing: TERM to IceDrive pid(s) $(printf '%s' "$pids" | tr '\n' ' ')"
     # shellcheck disable=SC2086
@@ -504,7 +550,12 @@ start_client() {
     fi
 
     log "restarting the client into the live session ($(printf '%s\n' ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} | grep '^DISPLAY=' || echo 'DISPLAY=?'))"
-    setsid ${launcher[@]+"${launcher[@]}"} runuser -u "$PROF_USER" -- env ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} nohup sh -c "$exec_line" </dev/null >/dev/null 2>&1 &
+    # `9>&-` CLOSES THE CAPTURE LOCK IN THE CHILD. fd 9 holds the flock taken at
+    # the top of this script; a client that now outlives the unit (the point of
+    # the scope) would otherwise hold it forever, and every later capture would
+    # see "another run holds the lock", exit 3 - which the unit counts as success
+    # - and the archive would silently stop updating.
+    setsid ${launcher[@]+"${launcher[@]}"} runuser -u "$PROF_USER" -- env ${SESSION_ENV[@]+"${SESSION_ENV[@]}"} nohup sh -c "$exec_line" </dev/null >/dev/null 2>&1 9>&- &
     disown 2>/dev/null || true
 
     # Phase 1 — a process appears at all.
@@ -514,22 +565,12 @@ start_client() {
         return 1
     fi
 
-    # Phase 1b — it is NOT in our cgroup. This is the check that would have
+    # Phase 1b — it is NOT inside our unit. This is the check that would have
     # caught 2026-10-19: it asks where the client lives, not whether it is up,
-    # and a client still sharing this unit's cgroup is a client that dies with
-    # it. Under a unit only, for the same reason as the launcher.
-    if [ -n "${INVOCATION_ID:-}" ]; then
-        local own_cg pid_cg p
-        own_cg="$(cat "/proc/$$/cgroup" 2>/dev/null || true)"
-        for p in $(app_pids); do
-            pid_cg="$(cat "/proc/$p/cgroup" 2>/dev/null || true)"
-            if [ -n "$own_cg" ] && [ "$pid_cg" = "$own_cg" ]; then
-                warn "the restarted client (pid $p) is still in this unit's cgroup"
-                warn "  ($own_cg): systemd will kill it the moment this capture exits."
-                return 1
-            fi
-        done
-    fi
+    # and a client inside this unit's cgroup is a client that dies with it.
+    # Under a unit only, for the same reason as the launcher. Repeated before
+    # success is reported, below, so a replacement pid is checked too.
+    _icd_outside_unit || return 1
 
     # Phase 2 — it stays up AND reaches a working state, and then KEEPS being up.
     #
@@ -567,6 +608,7 @@ start_client() {
             log "client reached a working state after ${ready_at}s — watching ${STABILISE_S}s more before calling it good"
         fi
         if [ "$ready_at" -ge 0 ] && [ "$((waited - ready_at))" -ge "$STABILISE_S" ]; then
+            _icd_outside_unit || return 1
             log "client is back and WORKING (up $((w + waited))s, stable ${STABILISE_S}s past readiness)"
             return 0
         fi

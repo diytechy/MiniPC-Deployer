@@ -88,6 +88,9 @@ REQUEST_FILE = RENDERER_DIR / "meeting-request.json"
 ACK_FILE = RENDERER_DIR / "meeting-indicator-ack.json"
 CALL_STATE_FILE = Path("/run/wall-panel/call-state.json")
 MIC_SOURCE_ENV = Path("/run/wall-panel/audio-mic-source.env")
+# The headset card's id, which `mic_headset` needs (wall-bt-call.service reads
+# the same file; Sol review 1, F4).
+HEADSET_ENV = Path("/run/wall-panel/audio-headset.env")
 INPUT_MUTE_ENV = Path("/run/wall-panel/audio-input-mute.env")
 AUDIO_MODE_FILE = Path("/etc/wall-panel/audio-mode")
 CONFIG_FILE = Path("/etc/wall-panel/meeting-recorder.env")
@@ -97,11 +100,14 @@ MAX_DOC_BYTES = 4096
 SCHEMA_VERSION = 1
 
 # ── the timings (LLR-1242) ───────────────────────────────────────────────────
-# The kiosk beats every 500 ms. A beat older than ACK_FRESH_S is a lost
-# indicator; the poll finds it at most POLL_S later, and a capture asked to
-# stop with SIGINT is killed STOP_GRACE_S after that: 1.25 + 0.25 + 0.4 < 2 s.
+# The kiosk beats every 500 ms. The daemon sees a beat up to POLL_S after it
+# was written; a beat older than ACK_FRESH_S is a lost indicator; the poll
+# finds that up to POLL_S later; and a capture asked to stop with SIGINT is
+# killed STOP_GRACE_S after that. From the kiosk's last write:
+# 0.25 + 1.0 + 0.25 + 0.4 = 1.9 s < 2 s (Sol review 1, F5). Two beats fit in
+# the freshness window, so one late frame does not end a recording.
 POLL_S = 0.25
-ACK_FRESH_S = 1.25
+ACK_FRESH_S = 1.0
 STOP_GRACE_S = 0.4
 # A manual start that never sees the indicator gives up (the kiosk asked, so a
 # kiosk that cannot paint has failed); a call keeps waiting without capturing.
@@ -667,12 +673,14 @@ class Recorder:
                  request_file: Path = REQUEST_FILE, ack_file: Path = ACK_FILE,
                  call_file: Path = CALL_STATE_FILE, mode_file: Path = AUDIO_MODE_FILE,
                  mic_env: Path = MIC_SOURCE_ENV, mute_env: Path = INPUT_MUTE_ENV,
+                 headset_env: Path = HEADSET_ENV,
                  capture: Optional[Capture] = None, argv_for=capture_argv,
                  clock=time.monotonic, wall=time.time, alert_fn=alert):
         self.settings = settings
         self.spool = spool
         self.state_file, self.request_file, self.ack_file = state_file, request_file, ack_file
         self.call_file, self.mode_file, self.mic_env, self.mute_env = call_file, mode_file, mic_env, mute_env
+        self.headset_env = headset_env
         self.capture = capture or Capture()
         self.argv_for = argv_for
         self.clock, self.wall, self.alert = clock, wall, alert_fn
@@ -687,6 +695,13 @@ class Recorder:
         self.last_request_id: Optional[int] = None
         self.ack_seen: Optional[Tuple[int, int]] = None
         self.beat_at: Optional[float] = None
+        # The seq the newest beat was for: a beat counts only for that
+        # recording, never for the next one (Sol review 1, F1).
+        self.beat_seq: Optional[int] = None
+        # What the running capture was started for: its seq and the near
+        # side's environment (which microphone mic_selected resolves to).
+        self.capture_seq: Optional[int] = None
+        self.capture_near: Optional[Dict[str, str]] = None
         self.last_document = None
         self.last_written_second: Optional[int] = None
 
@@ -717,6 +732,14 @@ class Recorder:
         if ack != self.ack_seen:
             self.ack_seen = ack
             self.beat_at = now
+            self.beat_seq = ack[0]
+
+    def _near_env(self) -> Dict[str, str]:
+        """The environment mic_selected resolves through, as the call legs get
+        it: the published microphone choice and the headset card."""
+        env = read_env_text(read_small(self.mic_env) or "")
+        env.update(read_env_text(read_small(self.headset_env) or ""))
+        return env
 
     def _read_call(self) -> Tuple[Optional[str], Optional[str]]:
         try:
@@ -752,12 +775,14 @@ class Recorder:
     # the capture
     def _start_capture(self, now: float, room: int) -> None:
         path = self.spool.new_path(self.wall())
+        near = self._near_env()
         env = dict(os.environ)
-        env.update(read_env_text(read_small(self.mic_env) or ""))
+        env.update(near)
         max_seconds = int(self.settings["WALL_MEETING_MAX_MINUTES"]) * 60
         limit = room - FS_MARGIN
         argv = self.argv_for(str(path), limit, max_seconds, int(self.settings["WALL_MEETING_BITRATE_KBPS"]))
         if self.capture.start(argv, path, limit, max_seconds, env=env):
+            self.capture_seq, self.capture_near = self.machine.seq, near
             self.phase = PHASE_RECORDING
             self.started_at_ms = int(self.wall() * 1000)
             self.refusal = None
@@ -773,6 +798,7 @@ class Recorder:
         if path is not None:
             self.spool.finalise(path)
         self.started_at_ms = None
+        self.capture_seq = self.capture_near = None
 
     def _capture_failed(self, now: float, reason: str) -> None:
         self._refuse(reason, now)
@@ -807,12 +833,26 @@ class Recorder:
         return self._publish()
 
     def _drive(self, now: float, available: bool) -> None:
-        fresh = indicator_fresh(self.beat_at, now)
+        fresh = self.beat_seq == self.machine.seq and indicator_fresh(self.beat_at, now)
         if self.capture.running:
             code = self.capture.exited()
             if not self.machine.wanted:
                 self._stop_capture("intent %s" % self.machine.intent)
                 self.phase = PHASE_OFF
+            elif self.capture_seq != self.machine.seq:
+                # Stopped and started again between two polls: that is a new
+                # recording, and it waits for its own indicator.
+                self._stop_capture("a new recording replaced it")
+                self.phase, self.waiting_since = PHASE_WAITING, now
+            elif code is None and self._near_env() != self.capture_near:
+                # The switch moved (Speaker <-> Headset) and mic_selected now
+                # names another microphone; an open PCM would keep the old
+                # one, so the recording continues in a new file (Sol review 1,
+                # F3). The intent and the indicator are unchanged.
+                self._stop_capture("the selected microphone changed; continuing in a new file")
+                self.phase, self.waiting_since = PHASE_WAITING, now
+                if fresh:
+                    self._restart_after_switch(now)
             elif code is not None:
                 bound = self.capture.ended_on_bound() if code == 0 else None
                 path = self.capture.path
@@ -820,6 +860,7 @@ class Recorder:
                 if path is not None:
                     self.spool.finalise(path)
                 self.started_at_ms = None
+                self.capture_seq = self.capture_near = None
                 log("the capture ended by itself (exit %s%s)" % (code, ", %s" % bound if bound else ""))
                 if bound == "spool-full":
                     self._refuse("spool-full", now)
@@ -856,6 +897,14 @@ class Recorder:
         elif self.machine.intent == MANUAL and now - (self.waiting_since or now) > INDICATOR_START_TIMEOUT_S:
             log("the kiosk never confirmed the indicator; manual recording not started")
             self._capture_failed(now, "indicator-unavailable")
+
+    def _restart_after_switch(self, now: float) -> None:
+        room, refusal = spool_room(self.spool.used_bytes(), self._cap(), self._free(), self._floor())
+        if refusal is None:
+            self._start_capture(now, room)
+        else:
+            self._refuse(refusal, now)
+            self.phase = PHASE_BLOCKED
 
     def _cap(self) -> int:
         return int(self.settings["WALL_MEETING_SPOOL_MAX_MB"]) * 1024 * 1024

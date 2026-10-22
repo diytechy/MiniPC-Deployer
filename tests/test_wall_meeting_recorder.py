@@ -367,6 +367,54 @@ def test_tc1401_a_call_resumes_into_a_new_file_when_the_indicator_returns(tmp_pa
     assert len(rig.processes) == 2 and rig.started[0] != rig.started[1]
 
 
+def test_tc1401_a_beat_for_the_last_recording_never_starts_the_next(tmp_path):
+    """Sol review 1, F1: stop, then start again inside the freshness window,
+    with the kiosk's last beat (for the old seq) still in the file."""
+    rig = Rig(tmp_path)
+    rig.request("start")
+    rig.run_beating(2.0)
+    old_seq = rig.rec.machine.seq
+    rig.request("stop")
+    rig.tick()
+    assert rig.processes[0].returncode is not None
+    rig.advance(0.25)
+    rig.request("start")
+    for _ in range(3):
+        doc = rig.tick()
+        rig.advance(0.25)
+    assert rig.rec.machine.seq == old_seq + 1
+    assert len(rig.processes) == 1 and doc["phase"] == "waiting", "no capture before a beat for the new seq"
+    rig.ack()
+    rig.tick()
+    assert len(rig.processes) == 2
+
+
+def test_tc1401_stop_and_start_inside_one_poll_is_a_new_recording(tmp_path):
+    rig = Rig(tmp_path)
+    rig.request("start")
+    rig.run_beating(2.0)
+    rig.request("stop")
+    rig.rec._read_request() and None
+    rig.rec.machine.manual_stop()
+    rig.request("start")
+    doc = rig.tick()
+    assert rig.processes[0].returncode is not None and len(rig.processes) == 1
+    assert doc["intent"] == "manual" and doc["phase"] == "waiting" and doc["refusal"] is None
+
+
+def test_tc1401_a_microphone_switch_continues_in_a_new_file(tmp_path):
+    """Sol review 1, F3: Speaker -> Headset during a recording."""
+    rig = Rig(tmp_path)
+    rig.call()
+    rig.run_beating(2.0)
+    (tmp_path / "mic.env").write_text("WALL_AUDIO_MIC_SOURCE=mic_headset\n")
+    doc = rig.run_beating(1.0)
+    assert len(rig.processes) == 2 and rig.processes[0].returncode is not None
+    assert rig.processes[1].returncode is None and doc["intent"] == "call" and doc["phase"] == "recording"
+    assert rig.started[0] != rig.started[1]
+    assert len([n for n in rig.ready() if n.endswith(".opus")]) == 1, "the first file is finalised"
+
+
 def test_tc1401_a_manual_start_with_no_indicator_gives_up_after_10_s(tmp_path):
     rig = Rig(tmp_path)
     rig.request("start")
@@ -648,6 +696,8 @@ def test_tc1404_settings_are_bounded(env, key, value):
 def test_tc1404_the_mic_source_and_mute_reach_the_capture_and_the_document(tmp_path):
     rig = Rig(tmp_path)
     (tmp_path / "mute.env").write_text("WALL_AUDIO_INPUT_MUTED=1\n")
+    (tmp_path / "headset.env").write_text("WALL_AUDIO_HEADSET_CARD=Headset2\n")
+    rig.rec.headset_env = tmp_path / "headset.env"
     seen = {}
 
     def popen(argv, env=None, **kwargs):
@@ -660,6 +710,7 @@ def test_tc1404_the_mic_source_and_mute_reach_the_capture_and_the_document(tmp_p
     rig.request("start")
     doc = rig.run_beating(1.0)
     assert seen["env"]["WALL_AUDIO_MIC_SOURCE"] == "mic_clean"
+    assert seen["env"]["WALL_AUDIO_HEADSET_CARD"] == "Headset2", "mic_headset needs the card (Sol review 1, F4)"
     assert doc["nearMuted"] is True
 
 
@@ -698,7 +749,31 @@ def test_tc1405_a_capture_that_ignores_sigint_is_killed_within_the_grace(tmp_pat
 
 
 def test_tc1405_the_timings_add_up_to_under_2_s():
-    assert mr.ACK_FRESH_S + mr.POLL_S + mr.STOP_GRACE_S < 2.0
+    # From the kiosk's last write: seen up to a poll later, stale after the
+    # freshness window, found up to a poll later, killed after the grace.
+    assert mr.POLL_S + mr.ACK_FRESH_S + mr.POLL_S + mr.STOP_GRACE_S < 2.0
+
+
+def test_tc1405_worst_case_beat_written_just_after_a_poll_and_sigint_ignored(tmp_path):
+    """Sol review 1, F5: measured from the kiosk's WRITE, not from when the
+    daemon read it, with a capture that needs the whole SIGINT grace."""
+    rig = Rig(tmp_path)
+    rig.ignore_sigint = True
+    rig.request("start")
+    rig.run_beating(2.0)
+    assert len(rig.processes) == 1 and rig.processes[0].returncode is None
+    rig.advance(0.01)
+    rig.ack()                      # written 10 ms after a poll, read on the next
+    written = rig.now
+    stopped = None
+    for _ in range(40):
+        rig.advance(0.24 if stopped is None and rig.now - written < 0.25 else 0.25)
+        rig.tick()
+        if rig.processes[0].returncode is not None:
+            stopped = rig.now
+            break
+    assert stopped is not None and stopped - written <= 2.0, stopped and stopped - written
+    assert rig.processes[0].signals == [mr.signal.SIGINT, "KILL"]
 
 
 def test_tc1405_recording_names_are_utc_and_unique():

@@ -73,6 +73,9 @@ SCRATCH = "/srv/scratch"
 MEETINGS = os.path.join(SCRATCH, "meetings")
 STATE_DIR = "/var/lib/homehub-meetings"
 GUARD = ["/usr/bin/python3", "/opt/homehub/stack/scratch/homehub_scratch.py", "guard", "--writer", "meetings"]
+# W4's read-only status: each writer's project quota (used, limit) read back
+# through quotactl, which is the authority on the quota (Sol review 1, F2).
+SCRATCH_STATUS = ["/usr/bin/python3", "/opt/homehub/stack/scratch/homehub_scratch.py", "status"]
 NAME = re.compile(r"^meeting-([0-9]{8})T([0-9]{6})Z(-[0-9]{1,3})?\.opus$")
 SHA = re.compile(r"^[0-9a-f]{64}$")
 EXIT_OK, EXIT_TRANSFER, EXIT_USAGE, EXIT_QUOTA, EXIT_GUARD = 0, 1, 2, 75, 76
@@ -369,15 +372,37 @@ def _unlink(path: str) -> None:
         pass
 
 
-def statvfs_room(path: str) -> int:
-    """Free bytes as the writer sees them: on an ext4 project directory with
-    prjquota this is what is left of the project's quota."""
-    return shutil.disk_usage(path).free
+def scratch_quota(argv: List[str] = None) -> Optional[Tuple[int, int]]:
+    """(used, limit) bytes of the `meetings` project quota from W4's status,
+    or None when it cannot be read (the caller then uses statfs alone)."""
+    try:
+        done = subprocess.run(argv or SCRATCH_STATUS, capture_output=True, text=True, timeout=30, check=False)
+        writer = json.loads(done.stdout)["writers"]["meetings"]
+        used, limit = int(writer["used_mib"]) * 1024 * 1024, int(writer["limit_mib"]) * 1024 * 1024
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return None
+    return (used, limit) if limit > 0 else None
 
 
-def quota_limit(path: str) -> int:
-    """The project quota's size, by the same statfs view (f_blocks)."""
-    return shutil.disk_usage(path).total
+def statvfs_room(path: str, quota: Callable[[], Optional[Tuple[int, int]]] = None) -> int:
+    """Bytes the pull may still write: the smaller of the filesystem's free
+    space and what is left of the project quota. On ext4 with prjquota a
+    statfs on an inheriting project directory already reports the project's
+    limits, but that is the kernel's convenience, so the quota itself (W4's
+    quotactl reading) is asked as well and the smaller answer wins. used_mib is
+    rounded down, so one more MiB is held back."""
+    free = shutil.disk_usage(path).free
+    reading = (quota or scratch_quota)()
+    if reading is None:
+        return free
+    used, limit = reading
+    return max(0, min(free, limit - used - 1024 * 1024))
+
+
+def quota_limit(path: str, quota: Callable[[], Optional[Tuple[int, int]]] = None) -> int:
+    """The quota's size: W4's quotactl reading, else statfs's f_blocks."""
+    reading = (quota or scratch_quota)()
+    return reading[1] if reading is not None else shutil.disk_usage(path).total
 
 
 def run_guard(argv: List[str] = None) -> Tuple[bool, str]:

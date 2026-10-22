@@ -398,6 +398,28 @@ def test_tc1412_edquot_while_writing_is_quota_full(pull, monkeypatch):
     assert pull.hub_state() == "full"
 
 
+def test_tc1412_room_is_the_smaller_of_free_space_and_the_quota_reading(tmp_path):
+    """Sol review 1, F2: the quotactl reading (W4 status) bounds the room even
+    when statfs reports the whole filesystem."""
+    mib = 1024 * 1024
+    assert hm.statvfs_room(str(tmp_path), quota=lambda: (2040 * mib, 2048 * mib)) == 7 * mib
+    assert hm.statvfs_room(str(tmp_path), quota=lambda: (2048 * mib, 2048 * mib)) == 0
+    free = shutil.disk_usage(str(tmp_path)).free
+    assert hm.statvfs_room(str(tmp_path), quota=lambda: None) == free
+    assert hm.quota_limit(str(tmp_path), quota=lambda: (1, 2048 * mib)) == 2048 * mib
+
+
+def test_tc1412_the_quota_reading_comes_from_w4_status_and_fails_soft(tmp_path):
+    script = tmp_path / "status.py"
+    script.write_text('import json; print(json.dumps({"writers": {"meetings": {"used_mib": 5, "limit_mib": 2048}}}))')
+    assert hm.scratch_quota([sys.executable, str(script)]) == (5 * 1024 * 1024, 2048 * 1024 * 1024)
+    script.write_text('print("not json")')
+    assert hm.scratch_quota([sys.executable, str(script)]) is None
+    script.write_text('import json; print(json.dumps({"writers": {"meetings": {"error": "No such process"}}}))')
+    assert hm.scratch_quota([sys.executable, str(script)]) is None
+    assert hm.scratch_quota([sys.executable, str(tmp_path / "absent.py")]) is None
+
+
 def test_tc1412_the_real_guard_command_refuses_when_it_is_missing(tmp_path):
     ok, reason = hm.run_guard([sys.executable, str(tmp_path / "no-such-guard.py")])
     assert ok is False and reason

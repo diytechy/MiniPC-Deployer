@@ -276,9 +276,11 @@ def test_tc1393_the_packetiser_realigns_after_junk_and_torn_reads():
 
 
 def test_tc1393_segments_start_on_a_keyframe_with_pat_pmt_and_cut_on_the_clock():
-    split = rec.Splitter(segment_sec=10)
+    # 7 s, so the boundary (packet 70) falls mid-GOP, two packets after a
+    # NON-key PES: a cut on any PES would land there, a correct one waits.
+    split = rec.Splitter(segment_sec=7)
     actions = []
-    t = 1000.0
+    t = 994.0  # a multiple of 7: boundaries are on the clock, so the next is t + 7
     pkts = [body(), body()] + stream(40)  # junk before the first PAT is dropped
     for n, pkt in enumerate(pkts):
         now = t + n * 0.1
@@ -290,8 +292,9 @@ def test_tc1393_segments_start_on_a_keyframe_with_pat_pmt_and_cut_on_the_clock()
     starts = [i for i, a in enumerate(actions) if a == "start"]
     assert actions[0] == actions[1] == "drop"
     assert len(starts) >= 2
-    # the second cut is the first keyframe at/after the next 10 s boundary
-    assert t + starts[1] * 0.1 >= 1010.0
+    # the second cut is the first keyframe at/after the t + 7 boundary: GOP 3
+    assert t + starts[1] * 0.1 >= t + 7
+    assert starts[1] == 2 + 3 * 32 + 2  # 2 junk, three 32-packet GOPs, then PAT+PMT
 
 
 def test_tc1394_pruning_removes_whole_oldest_segments_only(tmp_path):

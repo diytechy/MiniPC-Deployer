@@ -471,7 +471,9 @@ def judge_scratch(
     bad, counted on the monotonic clock from the FIRST bad run of this boot
     (PERIOD_SLACK_SEC early still counts), so the default 5m fires on the
     second bad run in a row and one slow status does not page anyone; 0m fires
-    on the first. One good run clears. Pure.
+    on the first. Once firing it stays firing until a good run - a reboot with
+    the volume still wrong restarts the count but not the incident, so it never
+    sends a false "mounted again" (Sol W3b review 1). One good run clears. Pure.
     Implements: LLR-1291
     """
     st = dict(st)
@@ -482,8 +484,9 @@ def judge_scratch(
         st.update(boot_id=boot, bad_since_mono=mono)
         since = mono
     lasted = mono - since
-    return (lasted >= max(0, row["threshold_s"] - PERIOD_SLACK_SEC), st,
-            "%s (bad for %ds)" % (what, int(lasted)))  # fmt: skip
+    bad = bool(st.get("firing")) or lasted >= max(0, row["threshold_s"] - PERIOD_SLACK_SEC)
+    st["firing"] = bad
+    return bad, st, "%s (bad for %ds)" % (what, int(lasted))
 
 
 # ── the shell ────────────────────────────────────────────────────────────────

@@ -1192,6 +1192,45 @@ def test_tc1464_scratch_identity_reads_the_tools_own_verdict_and_fires_after_two
     assert watch.judge_scratch(row, st, True, "x", "b", 1000.0)[0] is False, "200 s of bad is not 300"
     assert watch.judge_scratch(row, st, True, "x", "b2", 5.0)[0] is False, "a new boot restarts the count"
     assert watch.judge_scratch(dict(row, threshold_s=0), {}, True, "x", "b", 1.0)[0] is True, "0m: the drill"
+    # an incident that fired survives a reboot while the volume is still wrong
+    bad, st, _ = watch.judge_scratch(row, {}, True, "x", "b", 0.0)
+    bad, st, _ = watch.judge_scratch(row, st, True, "x", "b", 300.0)
+    assert bad is True
+    bad, st, _ = watch.judge_scratch(row, json.loads(json.dumps(st)), True, "x", "b3", 40.0)
+    assert bad is True, "still bad after the reboot: no false clear"
+    assert watch.judge_scratch(row, st, False, "ok", "b3", 340.0)[:2] == (False, {})
+
+
+def test_tc1464_a_reboot_with_the_volume_still_missing_sends_no_false_clear_llr1291(tmp_path, monkeypatch):
+    """main(): outage delivered -> reboot -> still missing -> healthy: one fire, one clear, in that order."""
+    sent = []
+    monkeypatch.setattr(watch.mc, "send_alert", lambda key, prio, title, *a, **k: sent.append(key)
+                        or mc.ALERT_DELIVERED)  # fmt: skip
+    clock = {"mono": 100.0}
+    monkeypatch.setattr(watch.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(watch.time, "time", lambda: T0)
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    good = _tool(tmp_path, "good.py", "print(json.dumps({'mounted': True, 'identity_ok': True, 'prjquota': True}))\n")
+    gone = _tool(tmp_path, "gone.py", "print(json.dumps({'mountpoint': '/srv/scratch', 'mounted': False}))\n")
+    row = [line for line in TABLE.splitlines() if line.startswith("scratch-mount ")]
+    table = _w(tmp_path / "watch.table", "\n".join(row) + "\n")
+    args = ["--table", str(table), "--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"),
+            "--proc-root", str(tmp_path / "proc")]  # fmt: skip
+
+    def tick(boot, mono, tool):
+        clock["mono"] = mono
+        _w(tmp_path / "proc/sys/kernel/random/boot_id", boot + "\n")
+        _w(tmp_path / "env", "HOMEHUB_SCRATCH_ENABLED=true\nHOMEHUB_WATCH_SCRATCH_TOOL=%s\n" % tool)
+        assert watch.main(args) == 0
+
+    tick("b1", 100.0, gone)
+    tick("b1", 400.0, gone)
+    assert sent == ["watch-scratch-mount"]
+    tick("b2", 200.0, gone)  # rebooted, the volume is still missing
+    tick("b2", 500.0, gone)
+    assert sent == ["watch-scratch-mount"], "no false 'mounted again', no second fire"
+    tick("b2", 800.0, good)
+    assert sent == ["watch-scratch-mount", "watch-scratch-mount.clear"]
 
 
 def _tool(tmp_path, name, body):

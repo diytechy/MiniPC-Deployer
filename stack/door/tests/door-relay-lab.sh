@@ -52,7 +52,12 @@
 #     consumers are running against the relay (an operator's `timeout`, a
 #     dropped ssh session), removes every consumer container it started and
 #     says so (review round 4: they used to die without unwinding and leave
-#     the container holding its relay session under its fixed name).
+#     the container holding its relay session under its fixed name);
+#  12d ...and the FIRST signal landing while a removal is already under way
+#     (cost's final `docker rm -f`, held 3 s by a PATH shim in front of the
+#     real docker) lets that removal finish before the verb stops (review
+#     round 5: the signal used to abandon it while the stop line still
+#     claimed the consumers were removed).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DOOR="$(cd "$HERE/.." && pwd)"
@@ -318,13 +323,52 @@ signal_run() {  # LABEL SIGNAL WANT_RC WAIT_FOR "NAMES" VERB ARGS...
     kill -"$sig" "$pid" 2>/dev/null
     wait "$pid"; rc=$?
     for n in $names; do docker inspect "$n" >/dev/null 2>&1 && left="$left $n"; done
-    if [ -n "$seen" ] && [ "$rc" = "$want" ] && [ -z "$left" ] && grep -q "stopped by signal" "$out"; then
+    if [ -n "$seen" ] && [ "$rc" = "$want" ] && [ -z "$left" ] && grep -q "stopped by signal.*its consumers were removed" "$out"; then
         ok "12$label $1 SIG$sig with $waitc running: exit $rc, '$(grep -o 'stopped by signal.*' "$out")', none of [$names] left"
     else bad "12$label $1 SIG$sig seen=${seen:-no} rc=$rc (want $want) left:${left:- none}: $(tail -2 "$out" | tr '\n' ' ')"; fi
 }
 signal_run a TERM 143 homehub-door-probe homehub-door-probe probe --seconds 60
 signal_run b HUP 129 homehub-door-gate-3 "homehub-door-gate-1 homehub-door-gate-2 homehub-door-gate-3" gate --seconds 8
 signal_run c TERM 143 homehub-door-costprobe homehub-door-costprobe cost --seconds 60 --decode-grey-fps 5
+
+# 12d the FIRST signal lands while the final removal is under way. A shim in
+# front of the real docker holds `rm` for 3 s and logs its start and its end;
+# SIGTERM goes to the verb once the removal has started. The removal must run
+# to its end, the costprobe must be gone, the verb must still exit 143, and
+# its stop line must say the consumer was removed.
+SHIM="$WORK/slow-rm-bin"; mkdir -p "$SHIM"; : >"$WORK/slow-rm.log"
+REAL_DOCKER="$(command -v docker)"
+cat >"$SHIM/docker" <<SH
+#!/bin/sh
+if [ "\$1" = rm ]; then
+    echo "start \$*" >>"$WORK/slow-rm.log"
+    sleep 3
+    "$REAL_DOCKER" "\$@"; rc=\$?
+    echo "finish \$* rc=\$rc" >>"$WORK/slow-rm.log"
+    exit \$rc
+fi
+exec "$REAL_DOCKER" "\$@"
+SH
+chmod 755 "$SHIM/docker"
+out="$WORK/sig-d.log"
+PATH="$SHIM:$PATH" python3 "$DOOR/door_relay.py" --env-file "$WORK/env" cost --seconds 3 --decode-grey-fps 5 \
+    >"$out" 2>&1 & pid=$!
+for _ in $(seq 1 600); do
+    grep -q '^start rm' "$WORK/slow-rm.log" && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+done
+sleep 0.5
+kill -TERM "$pid" 2>/dev/null
+wait "$pid"; rc=$?
+if grep -q '^start rm' "$WORK/slow-rm.log" && grep -qx 'finish rm -f homehub-door-costprobe rc=0' "$WORK/slow-rm.log" \
+   && [ "$rc" = 143 ] && ! docker inspect homehub-door-costprobe >/dev/null 2>&1 \
+   && grep -q 'stopped by signal 15; its consumers were removed (homehub-door-costprobe)' "$out"; then
+    ok "12d SIGTERM during cost's final removal: the removal finished ($(tr '\n' ';' <"$WORK/slow-rm.log")), exit 143, no costprobe left, '$(grep -o 'stopped by signal.*' "$out")'"
+else
+    bad "12d rc=$rc rm-log: $(tr '\n' ';' <"$WORK/slow-rm.log") left: $(docker inspect -f '{{.State.Running}}' homehub-door-costprobe 2>&1 | head -1) out: $(tail -2 "$out" | tr '\n' ' ')"
+fi
+docker rm -f homehub-door-costprobe >/dev/null 2>&1
 
 # 11 the verdict of the sampling started before check 3
 rm -f "$WORK/watch.on"; wait "$WATCH_PID" 2>/dev/null

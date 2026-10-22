@@ -430,7 +430,9 @@ class TestPinnedCommand:
         self, tmp_path, pinned_binaries
     ):
         with svc.request_scratch(str(tmp_path / "s")) as scratch:
-            argv, _ = svc.build_argv(_registry()["ANALYSIS-QUICK"], scratch)
+            argv, _ = svc.build_argv(
+                _registry()["ANALYSIS-QUICK"], scratch, schema={"type": "object"}
+            )
         assert argv[0] == "/usr/local/bin/claude", argv[0]
 
 
@@ -890,8 +892,12 @@ class TestRequestContract:
         assert payload["result"] == {"category": "rock"}
         argv = self.last["argv"]
         assert "--json-schema" in argv, argv
-        schema_path = argv[argv.index("--json-schema") + 1]
-        assert schema_path.endswith("response-schema.json")
+        # TC-1364: claude parses this value AS JSON. Until 2026-10-22 it was the
+        # schema file's path, and every request died "--json-schema is not
+        # valid JSON" (this assertion used to check for exactly that path).
+        assert json.loads(argv[argv.index("--json-schema") + 1]) == {
+            "type": "object", "properties": {"category": {"type": "string"}}
+        }
 
     def test_codex_is_actually_handed_the_schema_sr019(self, tmp_path, pinned_binaries):
         """The review: `build_argv` wrote the schema file and never passed it to
@@ -901,6 +907,55 @@ class TestRequestContract:
             argv, _ = svc.build_argv(_registry()["ANALYSIS-CODEX"], scratch)
         assert "--output-schema" in argv, argv
         assert argv[argv.index("--output-schema") + 1] == scratch["schema_path"]
+
+    def test_tc1364_each_family_gets_the_schema_the_way_its_cli_reads_it_llr1213(
+        self, tmp_path, pinned_binaries
+    ):
+        """claude: the schema itself (inline JSON); codex: the schema FILE."""
+        schema = {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
+        with svc.request_scratch(str(tmp_path / "s")) as scratch:
+            claude, _ = svc.build_argv(_registry()["ANALYSIS-QUICK"], scratch, schema=schema)
+            codex, _ = svc.build_argv(_registry()["ANALYSIS-CODEX"], scratch, schema=schema)
+        value = claude[claude.index("--json-schema") + 1]
+        assert json.loads(value) == schema and not value.endswith(".json")
+        assert codex[codex.index("--output-schema") + 1] == scratch["schema_path"]
+        for family, contract in svc.FAMILY_CONTRACTS.items():
+            assert contract.schema_value in ("inline", "file"), family
+        assert svc.FAMILY_CONTRACTS["ANTHROPIC"].schema_value == "inline"
+        assert svc.FAMILY_CONTRACTS["OPENAI"].schema_value == "file"
+
+    def test_tc1364_an_inline_family_without_a_schema_is_refused_llr1213(
+        self, tmp_path, pinned_binaries
+    ):
+        with svc.request_scratch(str(tmp_path / "s")) as scratch:
+            with pytest.raises(ValueError):
+                svc.build_argv(_registry()["ANALYSIS-QUICK"], scratch)
+
+    def test_tc1364_a_schema_too_large_for_the_command_line_is_413_llr1213(
+        self, tmp_path, pinned_binaries
+    ):
+        big = {"type": "object", "description": "x" * (svc.MAX_INLINE_SCHEMA_BYTES + 1)}
+        status, payload = self._run(
+            {"route": "ANALYSIS-QUICK", "schema": big,
+             "messages": [{"role": "user", "content": "hi"}]},
+            tmp_path,
+        )
+        assert status == 413 and "command line" in payload["error"]
+
+    def test_tc1364_the_structured_output_is_the_answer_when_present_llr1213(
+        self, tmp_path, pinned_binaries
+    ):
+        def runner(argv, cwd, timeout, env, stdin_input):
+            return 0, json.dumps({"type": "result", "result": "prose about rock",
+                                  "structured_output": {"category": "rock"}}), False
+
+        status, payload = self._run(
+            {"route": "ANALYSIS-QUICK", "schema": {"type": "object"},
+             "messages": [{"role": "user", "content": "x"}]},
+            tmp_path, runner=runner,
+        )
+        assert status == 200 and payload["result"] == {"category": "rock"}
+        assert svc.typed_answer({"type": "result", "result": {"a": 1}}) == {"a": 1}
 
     def test_every_family_can_be_handed_a_schema_sr019(self):
         """A family with no way to receive the schema cannot honour the output

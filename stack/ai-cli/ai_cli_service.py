@@ -422,6 +422,12 @@ class FamilyContract(object):
       schema_flag: how this family is handed the caller's JSON schema. A family
         with none cannot honour the output contract and is refused outright -
         the review found codex was written a schema file that was never passed.
+      schema_value: what follows schema_flag - "inline" (the schema itself, as
+        compact JSON) or "file" (the path of the per-request schema file). It
+        is the CLI's contract, not a choice: `claude --json-schema` parses its
+        value as JSON, so the path it was handed until 2026-10-22 failed every
+        request with "--json-schema is not valid JSON" (LLR-1213), while
+        `codex exec --output-schema` reads a file.
       result: "stdout-json" | "last-message-file".
     """
 
@@ -434,6 +440,7 @@ class FamilyContract(object):
         "required",
         "service_flags",
         "schema_flag",
+        "schema_value",
         "result",
     )
 
@@ -447,6 +454,7 @@ class FamilyContract(object):
         required,
         service_flags,
         schema_flag,
+        schema_value,
         result,
     ):
         self.executables = frozenset(executables)
@@ -457,6 +465,9 @@ class FamilyContract(object):
         self.required = tuple(required)
         self.service_flags = frozenset(service_flags)
         self.schema_flag = schema_flag
+        if schema_value not in ("inline", "file"):
+            raise ValueError("schema_value must be inline or file, not %r" % (schema_value,))
+        self.schema_value = schema_value
         self.result = result
 
 
@@ -491,6 +502,7 @@ FAMILY_CONTRACTS = {
         ),
         service_flags=("--json-schema",),
         schema_flag="--json-schema",
+        schema_value="inline",
         result="stdout-json",
     ),
     # codex: read-only is one of three sandbox values; the approval policy has
@@ -515,6 +527,7 @@ FAMILY_CONTRACTS = {
         ),
         service_flags=("--output-schema", "--output-last-message"),
         schema_flag="--output-schema",
+        schema_value="file",
         result="last-message-file",
     ),
 }
@@ -1453,7 +1466,49 @@ def render_messages(messages):
     return "\n\n".join(parts)
 
 
-def build_argv(route, scratch, tokens=None, bin_path=None):
+# The largest schema handed to a CLI ON ITS COMMAND LINE. Linux refuses any
+# single argv string over MAX_ARG_STRLEN (32 pages, 128 KiB) with E2BIG; half of
+# that keeps clear of it with room for the rest of the argv. A schema is a few
+# hundred bytes in practice, so this binds only a caller that is not one.
+MAX_INLINE_SCHEMA_BYTES = 65536
+
+
+class SchemaTooLargeError(ValueError):
+    """The schema cannot ride the command line of an inline-schema family."""
+
+
+def schema_argument(contract, scratch, schema):
+    """The value that follows ``contract.schema_flag``.
+
+    "inline": the schema as compact JSON - `claude --json-schema` parses its
+    value as JSON, and handing it the schema FILE PATH (as this service did from
+    937cc9d, 2026-09-09, until 2026-10-22) failed every request with
+    `--json-schema is not valid JSON` before a model was ever called, which is
+    why the only enabled route had never once answered. "file": the per-request
+    schema file, which `codex exec --output-schema` reads.
+
+    Contract:
+      Inputs:  contract: FamilyContract; scratch: the `request_scratch` dict;
+               schema: the caller's JSON-schema object (required for inline).
+      Outputs: str
+      Raises:  ValueError when an inline family is given no schema;
+               SchemaTooLargeError over MAX_INLINE_SCHEMA_BYTES.
+    Implements: SR-019, LLR-1213
+    """
+    if contract.schema_value == "file":
+        return scratch["schema_path"]
+    if not isinstance(schema, dict):
+        raise ValueError("an inline-schema family must be handed the schema itself")
+    text = json.dumps(schema, separators=(",", ":"), ensure_ascii=False)
+    if len(text.encode("utf-8")) > MAX_INLINE_SCHEMA_BYTES:
+        raise SchemaTooLargeError(
+            "schema is {} bytes as JSON; the CLI takes it on its command line, "
+            "which carries at most {}".format(len(text.encode("utf-8")), MAX_INLINE_SCHEMA_BYTES)
+        )
+    return text
+
+
+def build_argv(route, scratch, tokens=None, bin_path=None, schema=None):
     """Build ``(argv, env_overrides)`` for one session.
 
     argv[0] is replaced with the ABSOLUTE path the pinned name resolves to on
@@ -1473,10 +1528,12 @@ def build_argv(route, scratch, tokens=None, bin_path=None):
     Contract:
       Inputs:  route: Route; scratch: the dict from `request_scratch`;
                tokens: the already-checked token list, or None to check now;
-               bin_path: the executable search path (AI_CLI_BIN_PATH).
+               bin_path: the executable search path (AI_CLI_BIN_PATH);
+               schema: the caller's JSON schema (see `schema_argument`).
       Outputs: (argv: list[str], env_overrides: dict[str,str])
-      Raises:  UnsafeRouteError, via `assert_safe_template`/`resolve_executable`.
-    Implements: SR-019, LLR-002
+      Raises:  UnsafeRouteError, via `assert_safe_template`/`resolve_executable`;
+               ValueError/SchemaTooLargeError, via `schema_argument`.
+    Implements: SR-019, LLR-002, LLR-1213
     """
     tokens = assert_safe_template(route) if tokens is None else tokens
     contract = FAMILY_CONTRACTS[route.family]
@@ -1489,7 +1546,7 @@ def build_argv(route, scratch, tokens=None, bin_path=None):
         )
     argv = [t.replace("{model}", route.model) for t in tokens]
     argv[0] = resolve_executable(argv[0], search_path=bin_path)
-    argv += [contract.schema_flag, scratch["schema_path"]]
+    argv += [contract.schema_flag, schema_argument(contract, scratch, schema)]
     if contract.result == "last-message-file":
         argv += ["--output-last-message", last_message_path(scratch)]
     return argv, assert_safe_env(route)
@@ -1855,9 +1912,13 @@ def _run_one(config, route, schema, prompt, runner):
     route_id = route.id
     with request_scratch(config.scratch_root) as scratch:
         try:
-            argv, env_overrides = build_argv(route, scratch, bin_path=config.bin_path)
+            argv, env_overrides = build_argv(
+                route, scratch, bin_path=config.bin_path, schema=schema
+            )
         except UnsafeRouteError as exc:
             return 500, {"error": str(exc)}, False
+        except SchemaTooLargeError as exc:
+            return 413, {"error": str(exc)}, False
         with open(scratch["schema_path"], "w", encoding="utf-8") as fh:
             json.dump(schema, fh)
         code, output, timed_out = runner(
@@ -1888,7 +1949,25 @@ def _run_one(config, route, schema, prompt, runner):
             },
             False,
         )
-    return 200, {"route": route_id, "result": result.get("result"), "raw": result}, True
+    return 200, {"route": route_id, "result": typed_answer(result), "raw": result}, True
+
+
+def typed_answer(envelope):
+    """The answer the caller's schema constrained, out of a result envelope.
+
+    claude with --json-schema returns the validated object as
+    ``structured_output`` beside its prose ``result``; prefer it when it is
+    present. codex's envelope (built by `extract_result` from the last-message
+    file) carries the parsed object as ``result`` and has no other field.
+    NOT PROVEN against a live signed-in claude (2026-10-22): the field name is
+    read from the CLI's documented result shape, and the fallback keeps the old
+    behaviour if it is absent.
+    Implements: SR-019, LLR-1213
+    """
+    structured = envelope.get("structured_output")
+    if structured is not None:
+        return structured
+    return envelope.get("result")
 
 
 def make_handler(config, routes, gate):

@@ -1,0 +1,74 @@
+# wall-meeting-recorder.service - record a meeting's audio, both directions
+# (OfficeWallNaglight WSN-097; SR-108, SR-109; HomeHub open-items A69).
+#
+# Starts and stops from the kiosk's control and, for the gateways listed in
+# WALL_MEETING_CALL_GATEWAYS, automatically while the panel carries their
+# Bluetooth call. NO INDICATOR, NO CAPTURE: ffmpeg runs only while the kiosk
+# keeps confirming that the "recording" indicator is on the glass, and is
+# stopped within 2 s of it leaving the glass. A restart finalises the
+# partial file and does not re-record the call it was recording
+# (/var/spool/wall-meeting/call-memory.json). Audio only, into the spool;
+# the hub collects it through the wall-meeting account's forced command
+# (wall-meeting-spool) and nothing here opens a network socket.
+#
+# ITS OWN ACCOUNT. `wall-meeting` owns the spool and is the account the hub's
+# key reaches, so the files never need a second owner. The `audio` group is
+# what the dsnoop readers it opens (mic_selected's slave and bus_monitor,
+# ipc_gid 29) require; reading them does not disturb the consumers already
+# attached. It never opens a raw device and never writes the audio bus.
+[Unit]
+Description=Wall panel: meeting recording, both directions (WSN-097)
+Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
+After=sound.target wall-audio-aec.service wall-bt-call.service
+Wants=sound.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=wall-meeting
+Group=wall-meeting
+SupplementaryGroups=audio
+ExecStart=/usr/bin/python3 /usr/local/lib/wall-panel/wall-meeting-recorder.py
+Restart=always
+RestartSec=3
+# SIGTERM to the daemon only: it stops ffmpeg with SIGINT (the file gets its
+# trailer) and finalises it; whatever is left after TimeoutStopSec is killed.
+KillMode=mixed
+TimeoutStopSec=10
+# The state document the kiosk reads; removed on stop, so a stopped recorder
+# shows nothing and is never mistaken for an idle one that is listening.
+RuntimeDirectory=wall-meeting-recorder
+RuntimeDirectoryMode=0755
+ReadWritePaths=/var/spool/wall-meeting
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+# AF_UNIX only: ALSA and the journal. A sample has no address family here
+# that could carry it off the panel; the hub fetches finished files over ssh.
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+SystemCallArchitectures=native
+UMask=0077
+# Measured 2026-10-22: 4.9-5.5 % of one core while recording.
+CPUAccounting=true
+CPUQuota=30%
+MemoryAccounting=true
+MemoryMax=256M
+TasksMax=32
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

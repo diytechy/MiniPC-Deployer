@@ -2946,3 +2946,46 @@ Records and inventory only; nothing is deployed and nothing ran on the panel.
 - Tests (contract, sibling inventory TC-1232/1233, sensor-power-policy, local-capability): 204 passed, 1 skipped by design (the "not in the floor" case for the new capability).
 - LLR-1132 no longer pins a literal file count; it says the inventory equals the panel's real set (87 at `c149439`).
 - Deploy window: the site files and `ALLOWED_SITE_FILES` move with the OfficeWallNaglight app and site as one pair (HomeHub `scripts/deploy/PANEL_RELEASE.md`).
+
+## 2026-10-22 — W6: meeting recording, both directions (OfficeWallNaglight WSN-097; SR-108..SR-111)
+
+Branch `w6-meeting-recording`, NOT merged, NOT deployed. Owner ruling A69 (2026-10-22): a panel control and a
+Bluetooth call for the dev PC both start a recording; an on-screen indicator whenever capture runs; audio only;
+the hub's NVMe scratch volume holds the files.
+
+- Feasibility measured on the panel with test tones (every capture deleted, the mixer restored, the Bluetooth link
+  returned to its at-rest state): `mic_selected` and `bus_monitor` read together as two more dsnoop consumers,
+  during a live HFP call from the dev PC too, at 4.9-5.5 % of one core.
+- Panel: `wall-meeting-recorder.{py,service}` (own account `wall-meeting`, audio group, AF_UNIX only), one stereo
+  Opus file per recording (left near, right far), capture only while the kiosk's indicator beats are under 1.0 s
+  old (stop within 2 s of the indicator leaving the glass), spool cap and disk floor, firstboot step 8i, knob
+  `WALL_MEETING_RECORDING` (default false). Forced command `wall-meeting-spool` for the hub's one key.
+- Hub: `stack/meetings/` pull (publish by rename after a hash check, ack by hash) and retention (14 days proposed,
+  then the 90 % high-water), scratch writers per W4's IF-071, firstboot step 6g-meetings, knob
+  `MEETING_PULL_ENABLED` (default false).
+- `scripts/assert_wall_capabilities.py` names `js/meeting-recording.js`: this branch and OfficeWallNaglight
+  `w6-meeting-recording` merge together.
+- Review: Codex gpt-6.1-sol medium, two rounds, APPROVE. Round 1: one BLOCKER (a beat for the previous recording
+  could start the next) and four SHOULD-FIX, all fixed and mutation-checked; its quota finding was withdrawn by
+  the reviewer in round 2 (the fix stays, defensive).
+- No IF row: none was reserved for W6; the kiosk contract is stated in SR-108/LLR-1245 and an IF id is for the
+  coordinator to assign.
+- Lane review round 1 (two findings, both fixed):
+  - F1 (BLOCKER): the 1.9 s budget ran from the kiosk's last beat, but the kiosk's beat handler trusted a display
+    value up to 500 ms old, so the stop could land about 2.4 s after the screen went dark. The kiosk now samples
+    the display for every beat (OfficeWallNaglight `indicatorBeatHandler`); SR-108/LLR-1242 state the bound from
+    the indicator leaving the glass. New TC-1405 rig test sweeps 81 dark/poll phases with a capture that ignores
+    SIGINT (worst 1.909 s) and shows that a modelled 500 ms display lag overruns 2 s.
+  - F2 (SHOULD-FIX): a lost indicator kept a call's intent, so the capture resumed into a new file, and a
+    restarted recorder took the call still up for a new automatic trigger; plan W6 task 3 says a recorder or kiosk
+    crash finalises the partial and returns to idle. `indicator_lost` is now `capture_failed` (idle, that call
+    suppressed until it ends), and the recorder remembers the call it was recording or had suppressed in
+    `/var/spool/wall-meeting/call-memory.json` (0600, keyed to the boot id; not the RuntimeDirectory, which is
+    removed on every stop so a stopped recorder shows the kiosk nothing). The resume test is replaced by a kiosk
+    outage mid-call (one file, idle, no second capture, a manual start still records) and four restart tests (a
+    new Recorder on the same files: the partial finalised, idle for the same `since` across two restarts, the
+    memory cleared at the call's end, a new `since` records; a call that changed during the restart records; a
+    reboot forgets; a stopped call stays stopped).
+- NOT PROVEN: a real call's far end heard in a recording; the indicator on the real panel; the hub half on the real
+  scratch volume (W4a); a real `systemctl restart` of the recorder mid-call on the panel (the rig builds a new
+  Recorder on the same files, which is what a restart does, but no unit was restarted).

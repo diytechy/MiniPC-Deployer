@@ -511,8 +511,10 @@ def main():
     # slice nothing installs would leave the backup's peak unmeasured silently.
     # stack/monitoring joined 2026-10-22 (SN-048, SR-085..SR-089): eight units,
     # all installed by firstboot step 6h; each timer is only ENABLED by its knob.
+    # stack/meetings joined 2026-10-22 (WSN-097, SR-110/SR-111): four units,
+    # installed by firstboot step 6g-meetings; the timers only ENABLED by the knob.
     for unit_dir in (stack / "backup" / "systemd", stack / "samba", stack / "autoinstall",
-                     stack / "recovery", stack / "monitoring"):
+                     stack / "recovery", stack / "monitoring", stack / "meetings"):
         if not unit_dir.is_dir():
             continue
         for unit in (sorted(unit_dir.glob("*.service")) + sorted(unit_dir.glob("*.timer"))

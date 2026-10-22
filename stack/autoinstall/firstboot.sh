@@ -2870,6 +2870,53 @@ else
 fi
 
 
+# ── 6g-meetings. meeting recordings from the wall panel (WSN-097, SR-110/111) ──
+# (stack/meetings/README.md)
+#
+# The hub COLLECTS the panel's finished recordings over ssh, with a key of its
+# own that the panel's wall-meeting account accepts for one forced command, and
+# publishes each onto /srv/scratch/meetings by rename after its hash matches;
+# retention ages them out of the 2 GiB quota. Both units are scratch writers
+# (BindsTo=srv-scratch.mount, the mount guard, no CAP_SYS_RESOURCE).
+#
+# OFF unless MEETING_PULL_ENABLED=true; the units' ExecCondition reads the same
+# knob, so a stale enablement is still inert. When on, `init-key` makes the pull
+# key once (kept in /var/lib/homehub-meetings, root 0700) and logs its PUBLIC
+# half, which the panel's wall.env needs as WALL_MEETING_PULL_PUBKEY. A reimage
+# makes a new key, so that one line has to follow it (stack/meetings/README.md).
+# BEGIN meeting-pull
+if [ -d "$STACK_DIR/meetings" ]; then
+    _mtg="$STACK_DIR/meetings"
+    install -m 0644 "$_mtg/homehub-meeting-pull.service"      /etc/systemd/system/homehub-meeting-pull.service      || log "WARN: could not install homehub-meeting-pull.service"
+    install -m 0644 "$_mtg/homehub-meeting-pull.timer"        /etc/systemd/system/homehub-meeting-pull.timer        || log "WARN: could not install homehub-meeting-pull.timer"
+    install -m 0644 "$_mtg/homehub-meeting-retention.service" /etc/systemd/system/homehub-meeting-retention.service || log "WARN: could not install homehub-meeting-retention.service"
+    install -m 0644 "$_mtg/homehub-meeting-retention.timer"   /etc/systemd/system/homehub-meeting-retention.timer   || log "WARN: could not install homehub-meeting-retention.timer"
+    systemctl daemon-reload || log "WARN: systemctl daemon-reload failed"
+    _mtg_on="$(_env_val MEETING_PULL_ENABLED | tr -d '"')"
+    case "${_mtg_on:-false}" in
+        true)
+            if _mtg_pub="$(python3 "$_mtg/homehub_meetings.py" --env-file "$STACK_DIR/.env" init-key 2>/dev/null | tail -n1)"; then
+                log "meeting pull key (PUBLIC; the panel's WALL_MEETING_PULL_PUBKEY): $_mtg_pub"
+            else
+                log "WARN: could not make the meeting pull key - nothing can be collected from the panel"
+            fi
+            if systemctl enable --now homehub-meeting-pull.timer homehub-meeting-retention.timer >/dev/null 2>&1; then
+                log "meeting recordings: collected every 2 min, retention hourly (MEETING_PULL_ENABLED=true)"
+            else
+                log "WARN: could not enable the meeting pull/retention timers"
+            fi
+            unset _mtg_pub ;;
+        false)
+            systemctl disable --now homehub-meeting-pull.timer homehub-meeting-retention.timer >/dev/null 2>&1 || true
+            log "meeting recordings: not collected (MEETING_PULL_ENABLED=${_mtg_on:-unset})" ;;
+        *)  log "WARN: MEETING_PULL_ENABLED='$_mtg_on' is not true or false - the meeting timers are left as they were" ;;
+    esac
+    unset _mtg _mtg_on
+else
+    log "WARN: no $STACK_DIR/meetings on the payload - meeting recordings are not collected"
+fi
+# END meeting-pull
+
 # ── 6h. hub continuous monitoring (SN-048, SR-085..SR-089) ─────────────────
 # (stack/monitoring/README.md)
 #

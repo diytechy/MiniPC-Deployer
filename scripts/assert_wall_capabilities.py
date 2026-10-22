@@ -99,6 +99,9 @@ ALLOWED_SITE_FILES = {
     "js/library-volume-preference.js",
     "js/locked-gauges.js",
     "js/main.js",
+    # The meeting-recording indicator and control (OfficeWallNaglight WSN-097,
+    # meeting-recording-v1), imported by js/main.js.
+    "js/meeting-recording.js",
     "js/music/local.js",
     "js/music/md5.js",
     "js/music/provider.js",

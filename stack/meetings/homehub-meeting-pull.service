@@ -1,0 +1,42 @@
+# homehub-meeting-pull - collect finished meeting recordings from the wall
+# panel onto /srv/scratch/meetings (WSN-097; SR-110). A SCRATCH WRITER, so it
+# carries the writer pattern (SR-103, IF-071, stack/scratch/README.md):
+#   * RequiresMountsFor= and BindsTo=srv-scratch.mount: it does not start
+#     without the volume and is stopped the moment the mount goes away;
+#   * ExecStartPre runs the mount guard for `meetings`, and the pull runs it
+#     again before EVERY new file;
+#   * it drops CAP_SYS_RESOURCE, without which the kernel ignores the quota's
+#     hard limit for it (the guard refuses a process that still holds it).
+# Off unless MEETING_PULL_ENABLED=true (the ExecCondition); driven by its timer.
+[Unit]
+Description=Meeting recordings: collect finished files from the wall panel
+Documentation=file:///opt/homehub/stack/meetings/README.md
+RequiresMountsFor=/srv/scratch
+BindsTo=srv-scratch.mount
+After=srv-scratch.mount network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/python3 /opt/homehub/stack/meetings/homehub_meetings.py condition
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/scratch/homehub_scratch.py guard --writer meetings
+ExecStart=/usr/bin/python3 /opt/homehub/stack/meetings/homehub_meetings.py pull
+SyslogIdentifier=homehub-meetings
+StateDirectory=homehub-meetings
+StateDirectoryMode=0700
+UMask=0077
+# THE QUOTA IS ONLY A WALL WITHOUT THIS (fs/quota/dquot.c ignore_hardlimit).
+CapabilityBoundingSet=~CAP_SYS_RESOURCE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+# Each file is bounded on its own (60 s plus 4 s per MiB); the run as a whole
+# cannot hold the timer for longer than this.
+TimeoutStartSec=30min
+Nice=10
+CPUAccounting=true
+CPUQuota=25%
+MemoryAccounting=true
+MemoryMax=128M
+TasksMax=32

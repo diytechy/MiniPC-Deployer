@@ -152,8 +152,11 @@ sudo python3 /opt/homehub/stack/door/door_relay.py probe --seconds 10
 #   the raw fisheye, unchanged). A camera that really sends hevc: set DOOR_RELAY_EXPECT_CODEC=hevc first.
 #   A relay that accepts the connection but never delivers: after SECONDS + 60 s
 #   {"rc": -1, "timeout": true, "removed": "homehub-door-probe", "pass": false}, exit 1. The probe
-#   (and the gate's gate-1..3) `docker rm -f` their own containers on a timeout or Ctrl-C, so a
-#   rerun is never refused with a name conflict and no consumer is left holding a session.
+#   (and the gate's gate-1..3, and cost's grey decoder) `docker rm -f` their own containers on a
+#   timeout, Ctrl-C, SIGTERM (an operator's `timeout`) or SIGHUP (a dropped ssh session), so a
+#   rerun is never refused with a name conflict and no consumer is left holding a session. A
+#   signalled verb logs `door: <verb> stopped by signal N; its consumers were removed` and exits
+#   128+N (143, 129).
 sudo python3 /opt/homehub/stack/door/door_relay.py gate --seconds 15
 #   readiness+geometry {"pass": true}; two-consumers {upstream_connections: 1, producers: 1, consumers >= 2};
 #   one-consumer-left {upstream_connections: 1, survivor_running: true, survivor_progressing: true,

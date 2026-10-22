@@ -526,10 +526,15 @@ def run_bounded(argv: List[str], timeout: float, max_bytes: int, env=None) -> Bo
         except subprocess.TimeoutExpired:
             rc = None
     thread.join(2)
-    try:
-        proc.stdout.close()
-    except OSError:
-        pass
+    # A descendant that left the process group can still hold the pipe open, and
+    # closing a buffered reader another thread is blocked in would wait for that
+    # thread for ever. So the pipe is closed only once the reader has finished;
+    # otherwise the daemon reader is abandoned and dies with this process.
+    if not thread.is_alive():
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
     return Bounded(rc, b"".join(kept["chunks"]), kept["truncated"], timed_out, None)
 
 

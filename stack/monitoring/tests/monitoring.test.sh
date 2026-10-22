@@ -9,7 +9,7 @@
 #   * the alert helper bounded against a curl that hangs (TC-1308);
 #   * a docker that blocks for ever, and a journalctl that floods, killed with
 #     their whole process group at the evidence item's timeout and cap
-#     (TC-1309, TC-1310).
+#     (TC-1309, TC-1310), and a descendant that escapes the group (TC-1312).
 # Nothing here needs root, a network, docker or a real disk.
 #
 # Run by stack/run-hermetic-tests.sh.
@@ -23,7 +23,10 @@ fail() { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
 
 command -v python3 >/dev/null 2>&1 || { echo "SKIP: no python3"; printf '0 PASS  0 FAIL\n'; exit 0; }
 TMP="$(mktemp -d)"
-trap 'pkill -f "sleep 6173" 2>/dev/null; rm -rf "$TMP"' EXIT
+# A sleep length unique to THIS run, so a leftover-process check can never see
+# another suite's (or a concurrent run's) sleeper.
+NAP=$((7000000 + $$))
+trap 'pkill -f "sleep $NAP" 2>/dev/null; rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 export HOMEHUB_MONITOR_OVERRIDE_FILE="$TMP/no-override"
 
@@ -96,10 +99,7 @@ else
 fi
 
 # ── the alert helper against a curl that never returns ─────────────────────
-cat >"$TMP/bin/curl" <<'EOF'
-#!/usr/bin/env bash
-sleep 6173
-EOF
+printf '#!/usr/bin/env bash\nsleep %s\n' "$NAP" >"$TMP/bin/curl"
 chmod +x "$TMP/bin/curl"
 printf 'LAN_IP=192.0.2.10\nNTFY_PORT=8081\n' >"$TMP/ntfy.env"
 start=$(date +%s)
@@ -111,14 +111,10 @@ if [ "$rc" = 4 ] && [ "$took" -le 8 ] && printf '%s' "$out" | grep -q 'ALERT NOT
 else
     fail "TC-1308 rc=$rc took=${took}s out=$out"
 fi
-pkill -f "sleep 6173" 2>/dev/null
+pkill -f "sleep $NAP" 2>/dev/null
 
 # ── evidence: a docker that blocks for ever, a journal that floods ─────────
-cat >"$TMP/bin/docker" <<'EOF'
-#!/usr/bin/env bash
-sleep 6173 &
-wait
-EOF
+printf '#!/usr/bin/env bash\nsleep %s &\nwait\n' "$NAP" >"$TMP/bin/docker"
 cat >"$TMP/bin/journalctl" <<'EOF'
 #!/usr/bin/env bash
 yes "Oct 22 flood[1]: a line that repeats for ever ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
@@ -141,7 +137,7 @@ print(json.dumps({"took": round(time.monotonic() - t0, 1),
                   "red": {i["name"]: i["redactions"] for i in m["items"]}, "path": m["path"]}))
 EOF
 )"
-leftover="$(pgrep -f 'sleep 6173' | wc -l)"
+leftover="$(pgrep -f "sleep $NAP" | wc -l)"
 check() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if ($2) else 1)" "$out"; }
 if check x 'd["status"]["docker-ps.txt"].startswith("timeout") and d["status"]["docker-stats.txt"].startswith("timeout") and d["took"] < 30' \
    && [ "$leftover" = 0 ]; then
@@ -155,6 +151,28 @@ if check x 'd["status"]["journal-units.txt"] == "truncated" and d["bytes"]["jour
 else
     fail "TC-1310 out=$out"
 fi
+# ── a descendant that escapes the process group cannot hang the runner ─────
+# It keeps the pipe open after the group is killed; the runner must still
+# return at its timeout rather than wait on the pipe for ever.
+if command -v setsid >/dev/null 2>&1; then
+    printf '#!/usr/bin/env bash\nsetsid sleep %s &\nexec sleep %s\n' "$NAP" "$NAP" >"$TMP/escapee.sh"
+    start=$(date +%s)
+    got="$(cd "$MON" && timeout 60 python3 -c '
+import sys, monitor_common as mc
+r = mc.run_bounded(["bash", sys.argv[1]], 1.0, 4096)
+print("timed_out=%s" % r.timed_out)
+' "$TMP/escapee.sh" 2>&1)"; rc=$?
+    took=$(( $(date +%s) - start ))
+    pkill -f "sleep $NAP" 2>/dev/null
+    if [ "$rc" = 0 ] && [ "$got" = "timed_out=True" ] && [ "$took" -le 10 ]; then
+        pass "TC-1312 a setsid'd descendant holding the pipe does not hang the runner (${took}s)"
+    else
+        fail "TC-1312 rc=$rc took=${took}s got=$got"
+    fi
+else
+    echo "SKIP  TC-1312 (no setsid)"
+fi
+
 mode="$(stat -c %a "$TMP/ev")"
 if [ "$mode" = 700 ]; then pass "TC-1310 the evidence root is 0700"; else fail "TC-1310 evidence root mode $mode"; fi
 

@@ -41,7 +41,7 @@
 #   | manifest       | index.json                | playlist.json                |
 #   | credential     | NONE — anonymous guest    | the MINI-SERV `share`        |
 #   |                | mount (Q-S7, 2026-08-05)  | account (A11(v)/A10(v))      |
-#   | cadence        | boot / resume / on demand | EVERY MINUTE                 |
+#   | cadence        | boot / resume / on demand | EVERY 30 MINUTES             |
 #   | source sleeps? | NO — the AWOW is always-on| YES, by design               |
 #   | mount refused  | an ALERT (failed unit)    | see the failure policy below |
 #
@@ -126,9 +126,10 @@
 #     with SLEEP_MODE=suspend the panel resumes every morning WITHOUT booting,
 #     so a resume triggers the same unit, detached (`systemctl start --no-block`)
 #     so the wake is never delayed;
-#   * EVERY MINUTE      — wall-sync-frame.timer -> wall-sync-frame.service, which
-#     is THIS script with `--only frame`. Storage-map §4d sets that cadence for
-#     the frame flow and ONLY the frame flow; re-mirroring the whole music
+#   * EVERY 30 MINUTES  — wall-sync-frame.timer -> wall-sync-frame.service, which
+#     is THIS script with `--only frame` (the Owner's cadence, 2026-09-15;
+#     storage-map §4d said every minute). A cadence for the frame flow and ONLY
+#     the frame flow; re-mirroring the whole music
 #     library over 802.11 every minute would be absurd, and OI-15's "no periodic
 #     timer" ruling is about the music pull it was written for.
 #   * ON DEMAND         — `sudo systemctl start wall-sync.service`. That IS the
@@ -456,7 +457,7 @@ case "$MEDIA_CIFS_VERS" in
     *) die "MEDIA_CIFS_VERS='$MEDIA_CIFS_VERS' is not one of the supported SMB dialects: 3.1.1, 3.0, 2.1. (SMB1 is deliberately not offered.)" ;;
 esac
 
-# flock: the frame timer fires every minute and a boot/resume run mirrors both
+# flock: the frame timer fires every 30 minutes and a boot/resume run mirrors both
 # flows, so two processes CAN reach the same destination directory. util-linux is
 # in the wall image's package list for rtcwake already.
 for tool in rsync python3 flock timeout stat find; do

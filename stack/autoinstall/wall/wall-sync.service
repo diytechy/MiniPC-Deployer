@@ -4,7 +4,7 @@
 # THIS UNIT SYNCS BOTH FLOWS — music (from HOMEHUB) and frame video (from
 # Mini-serv). The bare script with no `--only` is the "everything, now" run, so
 # the dedicated on-demand command below means exactly what it always meant.
-# The frame flow ALSO has its own every-minute cadence, which is a separate unit
+# The frame flow ALSO has its own 30-minute cadence, which is a separate unit
 # and timer (wall-sync-frame.{service,timer}) because storage-map §4d gives the
 # two flows different cadences and this one's timeout is sized for a full music
 # library over Wi-Fi. See that service file for the decision in full.

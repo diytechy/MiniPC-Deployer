@@ -113,7 +113,7 @@ set through `busctl` on org.bluez.Adapter1 instead.
 | `panel-alert.sh` + `homehub-alert.sh` + firstboot step 8h | **SR-094, the panel's alert route to the hub** — installed as `/usr/local/lib/wall-panel/panel-alert` (the power button's alert hook) and, beside it, a byte-identical copy of the hub's `stack/monitoring/homehub-alert.sh` (SR-085: ntfy, rate-limited per key). Where the hub is: `/etc/wall-panel/panel-alert.env`, rendered from wall.env's `HUB_IP`, `WALL_ALERT_NTFY_PORT`, `WALL_ALERT_TOPIC`; with `HUB_IP` empty (a wall.env older than the knob, which the paired release keeps byte-identical) the hub address is read, read-only, from the one IPv4 nameserver in the installed `/etc/netplan/50-cloud-init.yaml` (the same deploy value), and with neither every alert is journal-only and says so |
 | `wall-sync.{sh,service}` | **the media pull (OI-15; TWO sources since OI-18)** — mirror the HOMEHUB music share and the Mini-serv frame-video share into the panel's cache. Boot-once + every resume + on-demand; **no timer on this unit** |
 | `wall-sync-resume.service` | **the resume hook (OI-16a)** — `WantedBy=suspend.target`, fires on every wake from the nightly suspend and `--no-block`-starts `wall-sync.service`, detached, so the wake is never delayed |
-| `wall-sync-frame.{service,timer}` | **the frame flow's own cadence (OI-18)** — `wall-sync.sh --only frame`, every minute, per storage-map §4d. Same script, same guards; a different address, credential, shape and failure policy |
+| `wall-sync-frame.{service,timer}` | **the frame flow's own cadence (OI-18)** — `wall-sync.sh --only frame`, every 30 minutes (the Owner's cadence, 2026-09-15; storage-map §4d said every minute), first run 3 min after the timer starts. Same script, same guards; a different address, credential, shape and failure policy |
 | `wall-media-manifest.py` | the sync's post-step: emits the shell's `music/index.json` and `frame/playlist.json` into that cache (`--only <flow>` so one flow cannot rewrite the other's manifest) |
 | `netplan-wifi.yaml.template` | rendered to `/etc/netplan/60-wall-wifi.yaml` (0600) |
 | `wall-efi-fallback-sync.sh` + `wall-efi-fallback.service` | **the Insyde firmware workaround (2026-09-03)** — this panel's firmware discards the NVRAM boot entry `grub-install` creates, so it boots the spec's removable-media path, where shim has no `grubx64.efi` beside it. Installed by a **late-command**, not by firstboot, because firstboot waits on `network-online.target` and a panel that cannot boot has no network. Re-asserted from an apt hook after every upgrade and from the unit at every boot: `grub-install` restores `fbx64.efi` (the reset-loop trigger) on each grub/shim update and never maintains the fallback GRUB, so a one-shot repair would leave an unpatchable GRUB on the boot path |
@@ -237,7 +237,7 @@ private deploy configuration.
 | cache leaf | `music` | `frame` |
 | manifest | `index.json` | `playlist.json` |
 | credential file | **none** — anonymous `guest` mount (storage-map Q-S7, 2026-08-05) | `/etc/wall-panel/cifs-frame.creds` |
-| cadence | boot / resume / on demand | **every minute** (`wall-sync-frame.timer`) |
+| cadence | boot / resume / on demand | **every 30 minutes** (`wall-sync-frame.timer`) |
 | may the source sleep? | **no** — always-on | **yes**, by design |
 | mount refused | **fails the unit** — a real alert | 445 probed first: **no answer = silent skip**; answered-and-refused = **fails** |
 
@@ -261,7 +261,7 @@ made "the panel has no playlists" look like an argument for streaming.
 
 ```bash
 sudo systemctl start wall-sync.service      # BOTH flows; journalctl -u wall-sync
-journalctl -u wall-sync-frame               # the every-minute frame flow
+journalctl -u wall-sync-frame               # the 30-minute frame flow
 ```
 
 Things worth knowing before trusting it:

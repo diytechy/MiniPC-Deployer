@@ -49,7 +49,7 @@ DefaultDependencies=no
 [Service]
 Type=oneshot
 # The timer is stopped too, not just the running units: without that, the
-# every-minute frame cadence can start a NEW mirror in the seconds between this
+# frame cadence can start a NEW mirror in the seconds between this
 # hook finishing and the freeze starting. wall-sync-resume.service restarts it
 # on the way out.
 ExecStart=/usr/bin/systemctl stop wall-sync-frame.timer wall-sync-frame.service wall-sync.service

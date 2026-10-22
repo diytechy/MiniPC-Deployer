@@ -313,7 +313,16 @@ class _Rig:
             "RUSTDESK_CHECK_ENV_FILE": str(self.env_file),
             "RUSTDESK_CHECK_STACK_DIR": str(self.d),
             "RUSTDESK_CHECK_STATE_DIR": str(self.state),
-            "RUSTDESK_CHECK_WAIT_SEC": "1", "RUSTDESK_CHECK_POLL_SEC": "1",
+            # WAIT_SEC is the grace for the listeners to APPEAR, and the
+            # recovery loop gives up at WAIT_SEC + SETTLE_SEC after the
+            # recreate. At 1 s a loaded host failed the success path: one loop
+            # pass (a timeout'd systemctl stub, the ss stub, four awks) took
+            # over a second, so the listeners were seen but could not be
+            # stable for 2 s before the deadline ("STILL DOWN ... (ss failed)",
+            # check.py 2026-10-22; 5 of 5 alone passed). Success returns as
+            # soon as the window is met, so only the deliberate failure cases
+            # pay the extra seconds.
+            "RUSTDESK_CHECK_WAIT_SEC": "6", "RUSTDESK_CHECK_POLL_SEC": "1",
             "RUSTDESK_CHECK_SETTLE_SEC": "2",
             # The stubs are bash scripts; on a loaded Windows host one once took
             # >10 s (the hub's bound) to answer and the check, correctly, called

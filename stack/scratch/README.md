@@ -25,6 +25,10 @@ reimage recreates it empty.
 | `guard --writer NAME` | the mount guard. Exit 0 = write, 1 = refuse, one journal line naming why. |
 
 **What `ensure` will never do**: touch an LV other than its own, resize its own,
+format an LV it did not create in the same run (an existing `hub-scratch` on
+which `blkid -p` finds no signature is refused: inspect it, and if it holds
+nothing worth keeping, `lvremove ubuntu-vg/hub-scratch` and run `ensure` again -
+which is also the recovery from a run killed between `lvcreate` and `mkfs`),
 format a device on which `blkid -p` finds any signature (other than its own
 labelled ext4), accept its own label with a UUID other than
 `HOMEHUB_SCRATCH_UUID`, edit an fstab line it did not write, or mount over a

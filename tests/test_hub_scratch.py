@@ -234,6 +234,29 @@ def test_tc1372_a_device_with_a_foreign_signature_is_never_formatted(host):
     assert not [c for c in fake.ran if c[0] == "mkfs.ext4"]
 
 
+def test_tc1372_an_existing_lv_with_no_signature_is_refused_not_formatted(host):
+    # blkid -p exits 2 on it: a damaged primary superblock, or an earlier run
+    # killed between lvcreate and mkfs. Only an LV this run created is formatted.
+    fake, paths = host
+    fake.lv_exists = True
+    fake.signature = None
+    p = provisioner(paths, apply=True, HOMEHUB_SCRATCH_UUID=UUID)
+    with pytest.raises(hs.Refused, match="already existed.*lvremove"):
+        p.step_filesystem("/dev/ubuntu-vg/hub-scratch", existed=True)
+    with pytest.raises(hs.Refused, match="formats only an LV it has just created"):
+        provisioner(paths, apply=True, HOMEHUB_SCRATCH_UUID=UUID).walk()
+    with pytest.raises(hs.Refused):  # plan says so too, before anyone runs ensure
+        provisioner(paths, HOMEHUB_SCRATCH_UUID=UUID).walk()
+    assert not [c for c in fake.ran if c[0] in ("mkfs.ext4", "lvcreate", "lvremove", "wipefs")]
+
+
+def test_tc1372_an_lv_created_in_this_run_is_formatted(host):
+    fake, paths = host
+    p = provisioner(paths, apply=True, HOMEHUB_SCRATCH_UUID=UUID)
+    p.step_filesystem("/dev/ubuntu-vg/hub-scratch", existed=False)
+    assert [c for c in fake.ran if c[0] == "mkfs.ext4"]
+
+
 def test_tc1372_our_label_with_another_uuid_is_refused(host):
     fake, paths = host
     fake.lv_exists = True

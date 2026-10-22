@@ -13,10 +13,13 @@ provisioner created would guard nothing.
              machine holds something this script did not make).
     ensure   do it, non-destructively and idempotently. Every step asks its END
              STATE first (firstboot's rule: never ask "did I already do this?"
-             of your own output), so a run killed half-way resumes. It NEVER
-             touches an existing LV other than its own, NEVER formats a device
-             on which blkid finds any signature, and NEVER edits an fstab line it
-             did not write. Anything unexpected is exit 4 with the reason.
+             of your own output), so a run killed half-way resumes - except
+             between creating the LV and formatting it: it NEVER touches an
+             existing LV other than its own, NEVER formats an LV it did not
+             create in the same run (an existing one with no signature is
+             refused, not formatted), NEVER formats a device on which blkid
+             finds any signature, and NEVER edits an fstab line it did not
+             write. Anything unexpected is exit 4 with the reason.
     status   read-only: identity, mount state, per-writer usage against quota.
     guard    the mount guard (SR-103). `guard --writer door` exits 0 only when
              /srv/scratch is mounted, is the filesystem whose UUID is the
@@ -512,8 +515,9 @@ def lv_path(vg: str) -> Optional[str]:
 def probe_signature(device: str) -> Dict[str, str]:
     """blkid's LOW-LEVEL probe (-p: no cache) of a device: {} when it finds nothing.
 
-    blkid exits 2 when no signature is found; that is the one state in which
-    `ensure` may format. Anything else it reports (ext4 or not) is kept.
+    blkid exits 2 when no signature is found; that, on an LV created in the
+    same run, is the one state in which `ensure` may format. Anything else it
+    reports (ext4 or not) is kept.
     """
     done = run(["blkid", "-p", "-o", "export", device], check=False)
     if done.returncode == 2:
@@ -623,7 +627,16 @@ class Provisioner:
             mc.log("scratch: %s already holds the scratch filesystem (UUID %s) - not reformatted" % (device, uuid))
             self.report["uuid"] = uuid
             return uuid
-        argv = ["mkfs.ext4"] + MKFS_ARGS + (["-U", self.s.uuid] if self.s.uuid else []) + [device]
+        if existed:
+            # Only an LV this same run created is ever formatted. An existing
+            # one with no signature blkid can read may be a filesystem whose
+            # primary superblock is damaged, or an interrupted earlier run: the
+            # script cannot tell, so it never decides.
+            raise Refused("%s already existed and blkid -p finds no signature on it; this script formats "
+                          "only an LV it has just created. Inspect it (e.g. dumpe2fs -o superblock=32768 "
+                          "-h %s for a backup superblock); if it holds nothing worth keeping, "
+                          "`lvremove %s` and run `ensure` again" % (device, device, device))
+        argv =["mkfs.ext4"] + MKFS_ARGS + (["-U", self.s.uuid] if self.s.uuid else []) + [device]
         self.act("make ext4 (quota,project; -m 0; label %s%s) on %s, which has no signature"
                  % (LABEL, "; UUID " + self.s.uuid if self.s.uuid else "", device), argv)
         uuid = probe_signature(device).get("UUID", "").lower() if self.apply else (self.s.uuid or "<new>")

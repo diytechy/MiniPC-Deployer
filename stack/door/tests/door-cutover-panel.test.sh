@@ -69,5 +69,5 @@ run compare "$dir" >/dev/null && ok "compare: identical credentials pass" || bad
 printf '%s' 192.0.2.10 >"$T/run/wall-door-credentials/host"
 run compare "$dir" >/dev/null 2>&1 && bad "compare missed a changed credential" || ok "compare detects a changed credential"
 
-echo "door-cutover-panel.test: $PASS passed, $FAIL failed"
+printf '%s PASS  %s FAIL\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

@@ -52,6 +52,8 @@ SUITES=(
     # SN-048 hub monitoring: real sysfs links for the NVMe test, a real ENOSPC
     # from /dev/full, a hung curl, a blocked docker and a flooding journal.
     "monitoring/tests/monitoring.test.sh"
+    # SN-050 door relay cutover: the panel script's file verbs on a fake tree.
+    "door/tests/door-cutover-panel.test.sh"
 )
 
 if [ "${1:-}" = "--list" ]; then

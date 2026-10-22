@@ -15,7 +15,7 @@
 # bridge network with one published port - so `ss` on this host sees exactly
 # the relay's connection to it and nothing else.
 #
-# What it proves, each a numbered check (TC-1385..TC-1393):
+# What it proves, each a numbered check (TC-1385..TC-1392, and 9: the cost tool):
 #   1 the rendered config is 0600 and the relay holds exactly two listeners:
 #     RTSP on the LAN address and the API on loopback;
 #   2 no credential / a wrong credential -> 401 at RTSP; the API -> 401;
@@ -184,6 +184,14 @@ echo "$cont" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 i
 logs="$(docker logs door-lab-relay 2>&1; cat "$WORK"/rec*.log)"
 if printf '%s' "$logs" | grep -qF -e 'p$ss' -e 'p%24ss'; then bad "8 a log line carries the password"
 else ok "8 no relay or recorder log line carries the password"; fi
+
+# 9 the cost sampler (task 11's tool): the relay and a 5 fps grey decoder, measured
+c="$(relay cost --seconds 20 --container door-lab-relay --decode-grey-fps 5)"
+echo "$c" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+ok = all("cpu_pct_one_core" in d[k] for k in ("door-lab-relay", "homehub-door-costprobe")) and d["decoder_still_running"]
+sys.exit(0 if ok else 1)  # PSI is reported when the kernel has it' \
+    && ok "9 cost: per-cgroup CPU for the relay and the grey decoder, PSI sampled: $c" || bad "9 cost: $c"
 
 echo "door-relay-lab: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

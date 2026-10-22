@@ -374,14 +374,20 @@ def probe(s: RelaySettings, seconds: int = 10, name: str = "homehub-door-probe")
 
 
 def cgroup_usage_usec(path: str) -> Optional[int]:
+    """CPU time used by a cgroup, in microseconds: cgroup v2 cpu.stat usage_usec
+    (the hub), else v1 cpuacct.usage in ns (hybrid hosts such as WSL2)."""
     try:
         with open(os.path.join(path, "cpu.stat"), encoding="ascii") as handle:
             for line in handle:
                 if line.startswith("usage_usec "):
                     return int(line.split()[1])
     except OSError:
+        pass
+    try:
+        with open(os.path.join(path, "cpuacct.usage"), encoding="ascii") as handle:
+            return int(handle.read().strip()) // 1000
+    except (OSError, ValueError):
         return None
-    return None
 
 
 def psi_some_avg60(path: str = "/proc/pressure/cpu") -> Optional[float]:
@@ -428,17 +434,48 @@ def cost(cgroups: Dict[str, str], seconds: int, interval: int = 10) -> Dict[str,
 
 
 def container_cgroup(name: str) -> Optional[str]:
-    """The cgroup v2 directory of a running container, from docker inspect."""
-    done = subprocess.run(["docker", "inspect", "-f", "{{.Id}}", name], stdout=subprocess.PIPE,
+    """The cgroup directory accounting a running container's CPU, found from its
+    main process's /proc/<pid>/cgroup, so the cgroup driver does not matter:
+    the v2 line (0::/system.slice/docker-<id>.scope on the hub) when that
+    directory has cpu.stat, else the v1 cpuacct line."""
+    done = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", name], stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=20)
-    cid = done.stdout.strip()
-    if done.returncode != 0 or not cid:
+    pid = done.stdout.strip()
+    if done.returncode != 0 or not pid.isdigit() or pid == "0":
         return None
-    for candidate in ("/sys/fs/cgroup/system.slice/docker-%s.scope" % cid,
-                      "/sys/fs/cgroup/docker/%s" % cid):
-        if os.path.isdir(candidate):
-            return candidate
+    try:
+        with open("/proc/%s/cgroup" % pid, encoding="ascii") as handle:
+            lines = [l.strip().split(":", 2) for l in handle if l.count(":") >= 2]
+    except OSError:
+        return None
+    for _hid, controllers, rel in lines:
+        if controllers == "" and os.path.exists("/sys/fs/cgroup%s/cpu.stat" % rel):
+            return "/sys/fs/cgroup" + rel
+    for _hid, controllers, rel in lines:
+        if "cpuacct" in controllers.split(","):
+            for mount in ("/sys/fs/cgroup/cpuacct", "/sys/fs/cgroup/cpu,cpuacct"):
+                if os.path.exists(mount + rel + "/cpuacct.usage"):
+                    return mount + rel
     return None
+
+
+GREY_DECODER = "homehub-door-costprobe"
+
+
+def start_grey_decoder(s: RelaySettings, fps: int):
+    """Plan W4b task 11: what a hub-side detector would cost - decode the relay
+    and keep `fps` small grey frames a second (256x256, the panel motion
+    engine's raster), discarding them. Returns (process, env file path)."""
+    fd, envfile = tempfile.mkstemp(prefix="door-cost-", suffix=".env")
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write("DOOR_URL=%s\n" % s.consumer_url())
+    argv = ["docker", "run", "--rm", "--name", GREY_DECODER, "--network", "host", "--read-only",
+            "--cap-drop", "ALL", "--log-driver", "none", "--env-file", envfile, "--entrypoint", "/bin/sh",
+            image_ref(), "-c",
+            'exec ffmpeg -nostdin -v error -rtsp_transport tcp -i "$DOOR_URL" -map 0:v:0 -an '
+            '-vf "fps=%d,scale=256:256,format=gray" -f null -' % fps]
+    return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), envfile
 
 
 def emit(record: Dict[str, object]) -> None:
@@ -519,6 +556,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     co.add_argument("--seconds", type=int, default=1800)
     co.add_argument("--cgroup", action="append", default=[], help="LABEL=/sys/fs/cgroup/... (repeatable)")
     co.add_argument("--container", action="append", default=[], help="a container name to measure (repeatable)")
+    co.add_argument("--decode-grey-fps", type=int, default=0,
+                    help="also run a test decoder: the relay at N fps, scaled to 256x256 grey (task 11)")
     args = p.parse_args(argv)
     if args.verb == "condition":
         on = mc.knob_bool(mc.read_knobs(args.env_file), args.knob, False)
@@ -552,10 +591,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.verb == "gate":
         return gate(s, args.seconds)
     if args.verb == "cost":
-        groups = dict(item.split("=", 1) for item in args.cgroup)
-        for name in args.container:
-            groups[name] = container_cgroup(name) or "/nonexistent/%s" % name
-        emit(cost(groups, args.seconds))
+        decoder = start_grey_decoder(s, args.decode_grey_fps) if args.decode_grey_fps else None
+        try:
+            if decoder:
+                time.sleep(5)
+                args.container.append(GREY_DECODER)
+            groups = dict(item.split("=", 1) for item in args.cgroup)
+            for name in args.container:
+                groups[name] = container_cgroup(name) or "/nonexistent/%s" % name
+            result = cost(groups, args.seconds)
+            if decoder:
+                result["decoder_still_running"] = decoder[0].poll() is None
+            emit(result)
+        finally:
+            if decoder:
+                subprocess.run(["docker", "rm", "-f", GREY_DECODER], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=60)
+                os.unlink(decoder[1])
         return 0
     p.print_help()
     return 2

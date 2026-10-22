@@ -55,6 +55,8 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-066** | Consumes | ntfy (stack compose service) | Implemented | v1 | SR-085 | v1 host-side alert post. POST http://&lt;NTFY_BIND_IP or LAN_IP>:&lt;NTFY_PORT>/&lt;HOMEHUB_ALERT_TOPIC, default … |
 | **IF-068** | Provides | Finance-Auditor | Draft | v1 | SR-098 | v1 accrual-gauge inputs (counterpart FA SR-035/SR-051): a host directory mounted read-only at /config holding … |
 | **IF-069** | Consumes | NagLight | Draft | v1 | SR-097 | v1 tracker bearer contract (NagLight SR-030/LLR-020, internal/web/auth.go): with TRACKER_API_TOKEN set every … |
+| **IF-070** | Provides | OfficeWallNaglight (the door broker) | Implemented | v1 | SR-105, SR-106 | v1 door relay RTSP endpoint (SR-105). rtsp://&lt;hub LAN_IP>:&lt;DOOR_RELAY_RTSP_PORT, default … |
+| **IF-071** | Provides | scratch-volume writers (the door recorder; meetings, plan W6; OtterTube, plan W8) | Implemented | v1 | SR-103, SR-104 | v1 scratch writer contract (SR-103, SR-104). A writer owns /srv/scratch/&lt;name>/ (door, meetings or … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

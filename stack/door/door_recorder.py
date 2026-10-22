@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import collections
 import errno
 import json
 import os
@@ -68,7 +69,7 @@ VIDEO_STREAM_TYPES = {0x01, 0x02, 0x10, 0x1B, 0x24}  # MPEG-1/2, MPEG-4, H.264, 
 CONTAINER = "homehub-door-recorder"
 EXIT_QUOTA, EXIT_GUARD = 75, 76
 MIB = 1024 * 1024
-SEGMENT_RE = re.compile(r"door-(\d{8}T\d{6})Z\.ts$")
+SEGMENT_RE = re.compile(r"door-(\d{8}T\d{6})Z(?:-\d+)?\.ts$")
 
 
 # ── pure core: MPEG-TS packets ───────────────────────────────────────────────
@@ -334,9 +335,13 @@ class Recorder:
         self.clock = clock
         self.handle = None
         self.part = None  # type: Optional[str]
+        self.dir_fd = None  # type: Optional[int]
         self.written = 0
         self.first_frame_start = 0  # offset of the segment's first video PES
         self.last_frame_start = 0   # offset of the latest video PES start
+        # Recent video PES start offsets (about 100 s at 10 fps): the truncation
+        # point is the latest one the disk actually holds.
+        self.frame_starts = collections.deque(maxlen=1024)
         self.last_size = 64 * MIB
         self.stopping = False
 
@@ -353,31 +358,53 @@ class Recorder:
         keyframe, so its last frame is whole. Any OTHER end - the stream
         stopping, a stop request, a full quota - can leave a frame cut short,
         which `ffmpeg -v error` reports; so the file is truncated back to the
-        start of its last video PES (the frame that never finished). A file
-        left with no whole frame is removed rather than kept as noise.
+        last video PES start that is actually on disk (the frame that never
+        finished goes). A file left with no whole frame is removed. The file is
+        unbuffered, so what `written` counts is exactly what the disk holds.
         Implements: LLR-1232.
         """
         if self.handle is None:
             return
+        fd = self.handle.fileno()
+        if not at_keyframe:
+            cut = max((o for o in self.frame_starts if o <= self.written), default=0)
+            try:
+                os.ftruncate(fd, cut)
+                self.written = cut
+            except OSError:
+                pass
         try:
-            self.handle.flush()
-            if not at_keyframe:
-                self.handle.truncate(self.last_frame_start)
-                self.written = self.last_frame_start
-            os.fsync(self.handle.fileno())
+            os.fsync(fd)
         except OSError:
             pass
         self.handle.close()
         self.handle = None
         final = self.part[:-len(".part")]
-        if not at_keyframe and self.written <= self.first_frame_start:
-            os.unlink(self.part)
-            mc.log("door recorder: dropped %s (no whole frame before the stream ended)" % final)
-        else:
-            os.replace(self.part, final)
-            self.last_size = max(self.written, 1)
-            mc.log("door recorder: closed %s (%.1f MiB)" % (final, self.written / MIB))
-        self.part = None
+        # Renamed through the directory's own fd, opened with the file: after a
+        # lazy unmount the PATH names the bare mount point on /, but the fd
+        # still names the scratch filesystem, so the segment is closed where it
+        # was written and nothing is ever created on / (LLR-1232). os.rename,
+        # not os.replace: only rename takes dir fds (both overwrite on POSIX).
+        part_name, final_name = os.path.basename(self.part), os.path.basename(final)
+        dfd, self.dir_fd = self.dir_fd, None
+        try:
+            if not at_keyframe and self.written <= self.first_frame_start:
+                if dfd is not None:
+                    os.unlink(part_name, dir_fd=dfd)
+                else:
+                    os.unlink(self.part)
+                mc.log("door recorder: dropped %s (no whole frame before the stream ended)" % final)
+            else:
+                if dfd is not None:
+                    os.rename(part_name, final_name, src_dir_fd=dfd, dst_dir_fd=dfd)
+                else:
+                    os.replace(self.part, final)
+                self.last_size = max(self.written, 1)
+                mc.log("door recorder: closed %s (%.1f MiB)" % (final, self.written / MIB))
+        finally:
+            if dfd is not None:
+                os.close(dfd)
+            self.part = None
 
     def recover_parts(self) -> None:
         """A `.part` from a killed run is a valid shorter recording: finalise it."""
@@ -402,27 +429,53 @@ class Recorder:
             mc.log("door recorder: pruned %s (cap %d MiB)" % (path, self.s.cap_mib))
         day, name = segment_name(now)
         ddir = os.path.join(self.root, day)
-        os.makedirs(ddir, mode=0o750, exist_ok=True)
-        self.part = os.path.join(ddir, name + ".part")
-        self.handle = open(self.part, "xb", buffering=1 << 20)
+        try:
+            os.makedirs(ddir, mode=0o750, exist_ok=True)
+            # Two runs starting in the same second (a fast restart) must not
+            # overwrite each other's segment: the second gets a -N suffix.
+            n = 0
+            while True:
+                stem = name[:-3] + ("" if n == 0 else "-%d" % n)
+                self.part = os.path.join(ddir, stem + ".ts.part")
+                if not os.path.exists(self.part) and not os.path.exists(self.part[:-5]):
+                    break
+                n += 1
+            # Unbuffered: no hidden buffer can be flushed after a truncation.
+            self.handle = open(self.part, "xb", buffering=0)
+            if os.name == "posix":
+                self.dir_fd = os.open(ddir, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as exc:
+            self.quota_stop(exc, ddir)
+            raise
         self.written = self.first_frame_start = self.last_frame_start = 0
+        self.frame_starts.clear()
+
+    def quota_stop(self, exc: OSError, where: str) -> None:
+        """EDQUOT/ENOSPC anywhere (a write, a new file, a new day directory):
+        close what is open, alert, exit 75. Never a retry, never another path.
+        Any other error returns, for the caller to raise. Implements: LLR-1234."""
+        if exc.errno not in (getattr(errno, "EDQUOT", -1), errno.ENOSPC):
+            return
+        what = errno.errorcode.get(exc.errno)
+        mc.log("door recorder: STOPPING - %s at %s; nothing is written anywhere else" % (what, where), warning=True)
+        try:
+            self.finalise()
+        except OSError:
+            pass
+        self.alert("door-recorder-quota", "HomeHub: door recorder stopped (%s)" % what,
+                   "door/ on the scratch volume is full; the recorder will not restart by itself.")
+        raise SystemExit(EXIT_QUOTA)
 
     def write(self, data: bytes) -> None:
+        """Write all of `data` (an unbuffered file may take it in parts)."""
+        view = memoryview(data)
         try:
-            self.handle.write(data)
-            self.written += len(data)
+            while view:
+                n = self.handle.write(view)
+                self.written += n
+                view = view[n:]
         except OSError as exc:
-            if exc.errno in (errno.EDQUOT, errno.ENOSPC):
-                what = errno.errorcode.get(exc.errno)
-                mc.log("door recorder: STOPPING - %s writing %s; nothing is written anywhere else"
-                       % (what, self.part), warning=True)
-                try:
-                    self.finalise()
-                except OSError:
-                    pass
-                self.alert("door-recorder-quota", "HomeHub: door recorder stopped (%s)" % what,
-                           "door/ on the scratch volume is full; the recorder will not restart by itself.")
-                raise SystemExit(EXIT_QUOTA)
+            self.quota_stop(exc, self.part or self.root)
             raise
 
     def consume(self, stream, stall_sec: Optional[int] = None) -> int:
@@ -455,11 +508,13 @@ class Recorder:
                     self.open_segment(now)
                     out.extend(header)
                     self.first_frame_start = self.last_frame_start = len(header)
+                    self.frame_starts.append(len(header))
                     out.extend(pkt)
                 elif action == "write":
                     pid, pusi, _rai = packet_fields(pkt)
                     if pusi and pid == split.video_pid:
                         self.last_frame_start = self.written + len(out)
+                        self.frame_starts.append(self.last_frame_start)
                     out.extend(pkt)
             if out and self.handle is not None:
                 self.write(bytes(out))

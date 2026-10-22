@@ -44,9 +44,13 @@
 #                     decoder's diagnostic counts. Needs the broker suppressed.
 set -euo pipefail
 
-ENV_FILE=/etc/wall-panel/wall.env
-CRED=/run/wall-door-credentials
-BASE=/var/lib/wall-door-cutover
+# DOOR_CUTOVER_TEST_ROOT (tests only) prefixes the three file paths, so the
+# file-handling verbs run as an ordinary user against a fake tree
+# (stack/door/tests/door-cutover-panel.test.sh). The systemctl verbs ignore it.
+T="${DOOR_CUTOVER_TEST_ROOT:-}"
+ENV_FILE=$T/etc/wall-panel/wall.env
+CRED=$T/run/wall-door-credentials
+BASE=$T/var/lib/wall-door-cutover
 UNIT=wall-door-stream.service
 SOCK=/run/wall-door-stream/service.sock
 APP=/opt/wall-panel/app/runtime/resources/app
@@ -54,7 +58,8 @@ FIRSTBOOT=/usr/local/sbin/wall-firstboot.sh
 FIELDS="host port path username password"
 
 die() { echo "door-cutover-panel: $*" >&2; exit 1; }
-[ "$(id -u)" = 0 ] || die "run as root"
+[ -n "$T" ] || [ "$(id -u)" = 0 ] || die "run as root"
+OWNER=(-o root -g root); [ -z "$T" ] || OWNER=()
 need_dir() { [ -d "${1:-}" ] && [ -f "$1/wall.env.door-lines" ] && [ -d "$1/credentials" ] || die "'${1:-}' is not a prepared cutover directory"; }
 
 # The value wall.env gives KEY, as wall-firstboot sees it (the file is sourced).
@@ -83,7 +88,7 @@ export-upstream)
 prepare)
     [ -r "$ENV_FILE" ] || die "no $ENV_FILE"
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"; dir="$BASE/$stamp"
-    install -d -m 0700 -o root -g root "$BASE" "$dir" "$dir/credentials"
+    install -d -m 0700 "${OWNER[@]}" "$BASE" "$dir" "$dir/credentials"
     grep '^DOORBELL_RTSP_' "$ENV_FILE" >"$dir/wall.env.door-lines" || die "wall.env has no DOORBELL_RTSP_ lines"
     chmod 0600 "$dir/wall.env.door-lines"
     cp -a "$CRED/." "$dir/credentials/"

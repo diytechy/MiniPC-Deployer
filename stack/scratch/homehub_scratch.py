@@ -175,8 +175,8 @@ def size_quotas(usable_bytes: int, requested_mib: Dict[str, int], floor_mib: int
     leaves `floor_mib` of the usable space free (SR-104).
 
     Contract:
-      Inputs:  usable_bytes: the MOUNTED filesystem's statvfs f_blocks*f_frsize
-               (after metadata and the journal; -m 0 so no reserve).
+      Inputs:  usable_bytes: usable_bytes() of the MOUNTED filesystem (after
+               metadata, the journal and ext4's reserved clusters).
                requested_mib: {writer: wanted MiB}, the knob values.
       Outputs: {writer: granted MiB}. Writers are reduced in REVERSE WRITERS
                order (ottertube first), each no lower than min_mib, until the
@@ -387,6 +387,30 @@ def set_project_quota(device: str, project_id: int, hard_mib: int) -> None:
 # ── the guard (I/O shell around judge_guard) ────────────────────────────────
 
 
+def write_probe(directory: str) -> Optional[str]:
+    """None when one block can be written and synced in `directory`, else the
+    errno name. A whole block, not an empty file: an empty file needs no block,
+    so it is created happily in a writer whose quota is already full (measured
+    on the hub's kernel), and the guard would pass a writer that cannot write."""
+    probe = os.path.join(directory, ".scratch-guard-%d" % os.getpid())
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, str(exc.errno))
+    try:
+        os.write(fd, b"\0" * 4096)
+        os.fsync(fd)
+        return None
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, str(exc.errno))
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+
+
 class Paths:
     """Every host path the module reads or writes; tests point them elsewhere."""
 
@@ -436,14 +460,7 @@ def gather_guard_facts(writer: str, settings: Settings, paths: Paths) -> Dict[st
         maj, mnr = (int(x) for x in entry["majmin"].split(":"))
         facts["dir_dev_ok"] = lst.st_dev == os.makedev(maj, mnr)
         facts["project_id"], facts["project_inherit"] = get_project(wdir)
-        probe = os.path.join(wdir, ".scratch-guard-%d" % os.getpid())
-        try:
-            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.close(fd)
-            os.unlink(probe)
-            facts["probe_error"] = None
-        except OSError as exc:
-            facts["probe_error"] = errno.errorcode.get(exc.errno, str(exc.errno))
+        facts["probe_error"] = write_probe(wdir)
     return facts
 
 
@@ -521,8 +538,14 @@ def fstab_state(text: str, uuid: str, mountpoint: str = MOUNTPOINT) -> str:
 
 
 def usable_bytes(path: str) -> int:
+    """What writers can ever have: the filesystem's blocks less what ext4 keeps
+    back from every writer whatever the usage (f_bfree - f_bavail: its reserved
+    clusters, the smaller of 2 % and 4096 clusters, plus any -m reserve).
+    Measured on the hub's kernel: f_blocks alone over-counted by 16 MiB, so
+    three full writers left 51 MiB of a 64 MiB floor. Independent of current
+    usage, so a re-run of `ensure` on a filled volume sizes the same budgets."""
     st = os.statvfs(path)
-    return st.f_blocks * st.f_frsize
+    return (st.f_blocks - (st.f_bfree - st.f_bavail)) * st.f_frsize
 
 
 class Provisioner:

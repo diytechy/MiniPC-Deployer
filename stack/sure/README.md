@@ -17,6 +17,14 @@ switch is `SURE_ENABLED`, not `COMPOSE_PROFILES`** (SR-100):
   docker.service restart brings them back without the unit; the unit's stop
   marks them stopped, so after a reboot it is the unit that starts them, and a
   disabled unit keeps them off.
+- A start that fails half way (Postgres and Redis up, a health dependency never
+  ready) is cleaned up by the unit's `ExecStopPost=` (`sure-unit.sh
+  stop-after-failure`), because systemd never runs `ExecStop=` after a failed
+  start. With the knob then off, firstboot stops a failed or inactive unit's
+  containers with `sure-unit.sh stop` itself.
+- The knob is read the same way by the unit, firstboot and the bake (the rules of
+  `scripts/lib/envfile.sh`): `SURE_ENABLED='true'`, `"true"`, an indented line
+  or ` = ` around the key all mean on.
 - An `.env` with no `SURE_ENABLED` line (the live hub on 2026-10-22) leaves the
   unit disabled and touches no running Sure container.
 

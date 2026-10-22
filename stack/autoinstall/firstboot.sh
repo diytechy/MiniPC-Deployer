@@ -1435,10 +1435,33 @@ fi
 if [ -f "$STACK_DIR/sure/homehub-sure.service" ]; then
     install -m 0644 "$STACK_DIR/sure/homehub-sure.service" /etc/systemd/system/ 2>/dev/null || log "WARN: could not install homehub-sure.service"
     systemctl daemon-reload 2>/dev/null || log "WARN: systemctl daemon-reload failed"
-    # Same .env reading as the RustDesk knob above, for the same reason: this
-    # script never sources .env, so the knob must be read out of the file.
-    _sure_enabled="$(sed -n 's/^SURE_ENABLED=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 | tr -d '\015' | tr -d '"')" || _sure_enabled=""
-    _sure_profiles="$(sed -n 's/^COMPOSE_PROFILES=//p' "$STACK_DIR/.env" 2>/dev/null | tail -n1 | tr -d '\015' | tr -d '"' | tr -d '[:space:]')" || _sure_profiles=""
+    # THE KNOB IS READ EXACTLY AS THE UNIT AND THE BAKE READ IT. This script
+    # never sources .env, so the value is read out of the file - by the body of
+    # scripts/lib/envfile.sh env_file_value, which the bake and the image
+    # resolver use and stack/sure/sure-unit.sh copies: whitespace around the key
+    # and the `=`, the last assignment, a trailing CR dropped, one pair of
+    # surrounding ' or " removed, an unquoted ` # comment` dropped. The RustDesk
+    # idiom above (`^KEY=`, double quotes only) read SURE_ENABLED='true' or an
+    # indented line as not-true while the unit read it as true, and on an
+    # enabled box this branch then disabled and stopped Sure (Sol, W10-sA review
+    # F2). TC-1361 runs the three readers on the same lines.
+    _sure_env() {
+        local v
+        [ -f "$STACK_DIR/.env" ] || return 0
+        v="$(sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" "$STACK_DIR/.env" 2>/dev/null | tail -n1)"
+        v="${v%$'\r'}"
+        v="${v#"${v%%[![:space:]]*}"}"
+        case "$v" in
+            \"*\") v="${v#\"}"; v="${v%\"}" ;;
+            \'*\') v="${v#\'}"; v="${v%\'}" ;;
+            *) v="${v%%[[:space:]]#*}"
+               v="${v%"${v##*[![:space:]]}"}" ;;
+        esac
+        v="${v//\$\$/\$}"
+        printf '%s' "$v"
+    }
+    _sure_enabled="$(_sure_env SURE_ENABLED)" || _sure_enabled=""
+    _sure_profiles="$(_sure_env COMPOSE_PROFILES | tr -d '[:space:]')" || _sure_profiles=""
     case ",$_sure_profiles," in
         *,sure,*) log "WARN: COMPOSE_PROFILES names 'sure'. Remove it: the bulk 'docker compose up -d' now waits on Sure's database and cache, and homehub-sure.service (SURE_ENABLED) is what starts Sure." ;;
     esac
@@ -1451,8 +1474,25 @@ if [ -f "$STACK_DIR/sure/homehub-sure.service" ]; then
         fi
     elif systemctl is-enabled homehub-sure.service >/dev/null 2>&1; then
         systemctl disable homehub-sure.service >/dev/null 2>&1 || log "WARN: could not disable homehub-sure.service"
-        systemctl stop --no-block homehub-sure.service >/dev/null 2>&1 || log "WARN: could not queue the stop of homehub-sure.service"
-        log "sure: homehub-sure.service DISABLED and its stop queued (SURE_ENABLED='$_sure_enabled')"
+        # AN ACTIVE UNIT IS STOPPED THROUGH SYSTEMD (its ExecStop= stops the
+        # containers); ANY OTHER STATE GETS THE STOP SCRIPT DIRECTLY. `systemctl
+        # stop` of a failed or inactive unit runs nothing, and a start that
+        # failed half way leaves Postgres and Redis up under `restart:
+        # unless-stopped` - they come back every boot with the knob off (Sol,
+        # W10-sA review F1; the unit's ExecStopPost= now cleans up at the
+        # failure, and this covers a failure from before it or one whose
+        # clean-up failed). Direct, not via systemctl: the unit is
+        # After=homehub-firstboot.service, so no job of it can run from in here.
+        # The script stops each container in 60 s at most; on an already
+        # stopped Sure it returns in seconds.
+        if systemctl is-active --quiet homehub-sure.service; then
+            systemctl stop --no-block homehub-sure.service >/dev/null 2>&1 || log "WARN: could not queue the stop of homehub-sure.service"
+            log "sure: homehub-sure.service DISABLED and its stop queued (SURE_ENABLED='$_sure_enabled')"
+        elif STACK_DIR="$STACK_DIR" bash "$STACK_DIR/sure/sure-unit.sh" stop; then
+            log "sure: homehub-sure.service DISABLED; it was not active, so its stop script ran directly (SURE_ENABLED='$_sure_enabled')"
+        else
+            log "WARN: homehub-sure.service DISABLED, but its stop script failed - check: docker compose --profile sure ps"
+        fi
     else
         log "sure: homehub-sure.service left disabled; no Sure container was touched (SURE_ENABLED='$_sure_enabled')"
     fi

@@ -21,7 +21,7 @@
 # policy cannot: a start after a stop (ExecStop marks the containers stopped, so
 # the next boot is this unit's job) and an off switch that a reboot honours.
 #
-# Usage: sure-unit.sh condition|start|stop
+# Usage: sure-unit.sh condition|start|stop|stop-after-failure
 #   condition  exit 0 when SURE_ENABLED is exactly `true` in the stack .env,
 #              1 otherwise (systemd reads 1 from ExecCondition= as a clean SKIP,
 #              never a failure, so a box with Sure off shows nothing red).
@@ -29,6 +29,15 @@
 #              no build and no pull: the fork has no registry home and a missing
 #              image must fail here rather than be fetched from docker.io.
 #   stop       stop the four, web and worker before their database and cache.
+#   stop-after-failure
+#              ExecStopPost=: `stop` when systemd reports the unit's run did NOT
+#              succeed ($SERVICE_RESULT not `success`), so a start that brought
+#              up Postgres and Redis and then failed cannot leave them running
+#              under `restart: unless-stopped` - systemd never runs ExecStop=
+#              after a failed ExecStart=. A skipped run (`exec-condition`, the
+#              knob is off) and a run with no SERVICE_RESULT touch nothing:
+#              this unit did not start anything then, and a box whose Sure
+#              predates the unit must keep it (W10-sA review F1).
 #
 # Config: STACK_DIR (default /opt/homehub/stack), ENV_FILE (default
 #         $STACK_DIR/.env), DOCKER (default: docker on PATH). Test seams only.
@@ -48,19 +57,28 @@ log() { printf '[homehub-sure] %s\n' "$*"; }
 DOCKER="${DOCKER:-$(command -v docker 2>/dev/null || true)}"
 [ -n "$DOCKER" ] || DOCKER=/usr/bin/docker
 
-# env_value KEY: KEY's value in $ENV_FILE as compose reads it for a simple
-# line - the last assignment wins, one pair of surrounding quotes is removed, a
-# trailing CR from a Windows-saved file is dropped. The same reading the relay
-# unit uses (game-isolation/gunmaster3-relay.sh); not shared code because this
-# runs on the box from stack/, where scripts/lib is not guaranteed.
+# env_value KEY: KEY's value in $ENV_FILE as compose reads it, by the SAME rules
+# as scripts/lib/envfile.sh env_file_value, which the bake and the image
+# resolver read this knob with (copied, not sourced: this runs on the box from
+# stack/, where scripts/lib is not guaranteed). Whitespace around the key and
+# the `=` is allowed, the last assignment wins, a trailing CR is dropped, one
+# pair of surrounding ' or " is removed, an unquoted trailing ` # comment` is
+# dropped. firstboot's 4-pre-a2b block carries the same body, and
+# tests/test_sure_unit.py (TC-1361) runs all three readers on the same lines:
+# a reader that disagrees can stop an enabled Sure (Sol, W10-sA review F2).
 env_value() {
     local v
+    [ -f "$ENV_FILE" ] || return 0
     v="$(sed -n "s/^[[:space:]]*$1[[:space:]]*=//p" "$ENV_FILE" 2>/dev/null | tail -n1)"
     v="${v%$'\r'}"
+    v="${v#"${v%%[![:space:]]*}"}"
     case "$v" in
         \"*\") v="${v#\"}"; v="${v%\"}" ;;
         \'*\') v="${v#\'}"; v="${v%\'}" ;;
+        *) v="${v%%[[:space:]]#*}"
+           v="${v%"${v##*[![:space:]]}"}" ;;
     esac
+    v="${v//\$\$/\$}"
     printf '%s' "$v"
 }
 
@@ -98,9 +116,31 @@ cmd_stop() {
     log "the four Sure services are stopped"
 }
 
+# systemd hands ExecStopPost= the run's outcome in $SERVICE_RESULT (systemd.exec
+# "Environment variables in spawned processes"). Measured on systemd 255, the
+# hub's, with a transient unit of this shape: a skipped ExecCondition= gives
+# `exec-condition`, a failed ExecStart= `exit-code`, TimeoutStartSec= running
+# out `timeout`, and a clean start then stop `success`. ExecStopPost= runs in
+# all four, which is why the first two cases below must do nothing.
+cmd_stop_after_failure() {
+    case "${SERVICE_RESULT:-}" in
+        success) return 0 ;;
+        exec-condition)
+            log "the start was skipped (SURE_ENABLED off): nothing was started, nothing to clean up"
+            return 0 ;;
+        "")
+            log "no SERVICE_RESULT: stop-after-failure is the unit's ExecStopPost=, nothing done"
+            return 0 ;;
+    esac
+    log "the run did not succeed (SERVICE_RESULT=$SERVICE_RESULT): stopping whatever compose had started,"
+    log "  so a Postgres or Redis it left running cannot come back on every boot under unless-stopped"
+    cmd_stop
+}
+
 case "${1:-}" in
     condition) cmd_condition ;;
     start) cmd_start ;;
     stop) cmd_stop ;;
-    *) echo "usage: $0 condition|start|stop" >&2; exit 2 ;;
+    stop-after-failure) cmd_stop_after_failure ;;
+    *) echo "usage: $0 condition|start|stop|stop-after-failure" >&2; exit 2 ;;
 esac

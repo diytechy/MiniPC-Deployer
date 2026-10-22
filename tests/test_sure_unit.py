@@ -80,16 +80,19 @@ exit 0
 """
 
 
-def _run_script(tmp_path, verb, env_text="SURE_ENABLED=true\n", fail=False):
+def _run_script(tmp_path, verb, env_text="SURE_ENABLED=true\n", fail=False,
+                docker_stub=DOCKER_STUB, extra_env=None):
     stack = tmp_path / "stack"
     stack.mkdir(exist_ok=True)
     _w(stack / ".env", env_text)
     docker = tmp_path / "docker"
-    _w(docker, DOCKER_STUB)
+    _w(docker, docker_stub)
     docker.chmod(0o755)
     calls = tmp_path / "calls.txt"
     _w(calls, "")
     env = dict(os.environ, STACK_DIR=_px(stack), DOCKER=_px(docker), CALLS=_px(calls))
+    env.pop("SERVICE_RESULT", None)
+    env.update(extra_env or {})
     if fail:
         env["DOCKER_FAIL"] = "1"
     proc = subprocess.run([_bash(), _px(SCRIPT), verb], env=env, capture_output=True, text=True)
@@ -154,6 +157,9 @@ def test_tc1360_unit_shape_sr100():
     assert _unit_values("ExecCondition") == ["/bin/bash %s condition" % script]
     assert _unit_values("ExecStart") == ["/bin/bash %s start" % script]
     assert _unit_values("ExecStop") == ["/bin/bash %s stop" % script]
+    # systemd never runs ExecStop= after a failed ExecStart=: the clean-up of a
+    # half-started Sure is ExecStopPost= (W10-sA review F1).
+    assert _unit_values("ExecStopPost") == ["/bin/bash %s stop-after-failure" % script]
     assert _unit_values("WantedBy") == ["multi-user.target"]
     # four 60 s stops in dependency order must fit the stop budget
     assert int(_unit_values("TimeoutStopSec")[0]) >= 4 * 60
@@ -187,6 +193,7 @@ log() { echo "[firstboot] $*"; }
 systemctl() {
     echo "systemctl $*" >> "$CALLS"
     if [ "$1" = is-enabled ]; then [ -n "${STUB_ENABLED:-}" ]; return; fi
+    if [ "$1" = is-active ]; then [ -n "${STUB_ACTIVE:-}" ]; return; fi
     if [ "${STUB_SYSTEMCTL_FAIL:-}" = "$1" ]; then return 1; fi
     return 0
 }
@@ -194,19 +201,29 @@ install() { echo "install $*" >> "$CALLS"; return 0; }
 '''
 
 
-def _run_block(tmp_path, env_text, enabled=False, fail=None, payload=True):
+def _run_block(tmp_path, env_text, enabled=False, fail=None, payload=True, active=False,
+               docker_stub=DOCKER_STUB, extra_env=None):
+    """Run firstboot's real 4-pre-a2b block. The payload is the real unit AND
+    the real sure-unit.sh, because the off branch runs that script directly;
+    its docker is a stub that logs `compose ...` into the same call log."""
     stack = tmp_path / "stack"
     (stack / "sure").mkdir(parents=True, exist_ok=True)
     if payload:
         shutil.copy(UNIT, stack / "sure" / UNIT.name)
+        shutil.copy(SCRIPT, stack / "sure" / SCRIPT.name)
     _w(stack / ".env", env_text)
     calls = tmp_path / "calls.txt"
     _w(calls, "")
+    docker = tmp_path / "docker"
+    _w(docker, docker_stub)
+    docker.chmod(0o755)
     script = tmp_path / "block.sh"
     _w(script, _PREAMBLE + 'STACK_DIR="%s"\n' % _px(stack) + _sure_block() + "\necho BLOCK-DONE\n")
-    env = dict(os.environ, CALLS=_px(calls))
+    env = dict(os.environ, CALLS=_px(calls), DOCKER=_px(docker), **(extra_env or {}))
     if enabled:
         env["STUB_ENABLED"] = "1"
+    if active:
+        env["STUB_ACTIVE"] = "1"
     if fail:
         env["STUB_SYSTEMCTL_FAIL"] = fail
     proc = subprocess.run([_bash(), _px(script)], env=env, capture_output=True, text=True)
@@ -237,16 +254,34 @@ def test_tc1361_knob_absent_touches_no_running_sure_sr100(tmp_path):
     first start. An upgrade of this script must not stop the finance database."""
     proc, calls = _run_block(tmp_path, "COMPOSE_PROFILES=ntfy\n")
     assert _install_and_reload(calls), calls
+    # nothing after is-enabled: no disable, no stop, and no docker call at all
     assert calls[2:] == ["systemctl is-enabled homehub-sure.service"], calls
     assert "no Sure container was touched" in proc.stdout
 
 
 def test_tc1361_knob_false_after_the_unit_owned_sure_disables_and_queues_the_stop_sr100(tmp_path):
-    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True)
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, active=True)
     assert calls[2:] == ["systemctl is-enabled homehub-sure.service",
                          "systemctl disable homehub-sure.service",
+                         "systemctl is-active --quiet homehub-sure.service",
                          "systemctl stop --no-block homehub-sure.service"], calls
     assert "DISABLED" in proc.stdout
+
+
+def test_tc1361_knob_false_with_a_failed_unit_runs_the_stop_script_directly_sr100(tmp_path):
+    """`systemctl stop` of a failed unit runs nothing (W10-sA review F1): the
+    off branch must stop the containers itself, through the real script."""
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, active=False)
+    assert calls[2:] == ["systemctl is-enabled homehub-sure.service",
+                         "systemctl disable homehub-sure.service",
+                         "systemctl is-active --quiet homehub-sure.service",
+                         "compose --profile sure stop -t 60 sure-web sure-worker sure-redis sure-postgres"], calls
+    assert "its stop script ran directly" in proc.stdout
+
+
+def test_tc1361_a_failed_direct_stop_is_a_warning_not_an_abort_sr100(tmp_path):
+    proc, _ = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, extra_env={"DOCKER_FAIL": "1"})
+    assert "WARN: homehub-sure.service DISABLED, but its stop script failed" in proc.stdout
 
 
 def test_tc1361_a_failed_start_queue_is_a_warning_not_an_abort_sr100(tmp_path):
@@ -280,3 +315,185 @@ def test_tc1361_the_template_ships_sure_on_by_knob_not_profile_sr100():
     profiles = [l.split("=", 1)[1] for l in lines if l.startswith("COMPOSE_PROFILES=")]
     assert profiles and "sure" not in profiles[-1].split(","), profiles
     assert [l for l in lines if l.startswith("SURE_ENABLED=")] == ["SURE_ENABLED=true"]
+
+
+# ── TC-1360: a failed start is cleaned up (W10-sA review F1) ─────────────────
+#
+# systemd runs ExecStop= only for a unit whose start succeeded. `up -d` can
+# start Postgres and Redis and then fail on a health dependency; those two keep
+# `restart: unless-stopped`, so without a clean-up they come back on every boot
+# even after the knob goes off. ExecStopPost= runs after every run and gets
+# $SERVICE_RESULT; measured on systemd 255 (the hub's) with transient units:
+# exec-condition (a skipped ExecCondition=), exit-code (a failed ExecStart=),
+# timeout (TimeoutStartSec=), success (a clean start, then stop).
+
+@pytest.mark.parametrize("result", ["exit-code", "timeout", "signal", "core-dump"])
+def test_tc1360_stop_after_failure_stops_the_four_after_a_failed_run_sr100(tmp_path, result):
+    proc, calls = _run_script(tmp_path, "stop-after-failure", extra_env={"SERVICE_RESULT": result})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert calls == ["compose --profile sure stop -t 60 sure-web sure-worker sure-redis sure-postgres"]
+    assert "SERVICE_RESULT=%s" % result in proc.stdout
+
+
+@pytest.mark.parametrize("extra", [{"SERVICE_RESULT": "success"},
+                                   {"SERVICE_RESULT": "exec-condition"},
+                                   {}])
+def test_tc1360_stop_after_failure_touches_nothing_after_success_or_a_skip_sr100(tmp_path, extra):
+    """`exec-condition` is the knob-off skip: this unit started nothing, and on a
+    box whose Sure predates the unit nothing may be stopped."""
+    proc, calls = _run_script(tmp_path, "stop-after-failure", extra_env=extra)
+    assert proc.returncode == 0 and calls == [], (proc.stdout, calls)
+
+
+# Postgres and Redis come up, then compose fails (a health dependency that
+# never becomes ready) when DOCKER_UP_FAILS is set; `stop` stops what it names.
+STATEFUL_DOCKER = r"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CALLS"
+case " $* " in
+    *" up "*)
+        printf 'sure-postgres\nsure-redis\n' > "$RUNNING"
+        [ -n "${DOCKER_UP_FAILS:-}" ] && exit 1
+        printf 'sure-postgres\nsure-redis\nsure-web\nsure-worker\n' > "$RUNNING" ;;
+    *" stop "*)
+        for c in "$@"; do grep -vx -- "$c" "$RUNNING" > "$RUNNING.new"; mv "$RUNNING.new" "$RUNNING"; done ;;
+esac
+exit 0
+"""
+
+
+def _running(path):
+    return sorted(l for l in path.read_text(encoding="utf-8").splitlines() if l)
+
+
+def test_tc1360_a_failed_start_then_the_knob_off_leaves_no_sure_container_running_sr100(tmp_path):
+    """The sequence the review expected: Sure breaks, so the Owner switches it off.
+    1. ExecStart: compose starts Postgres and Redis and fails.
+    2. ExecStopPost with the SERVICE_RESULT systemd 255 gives a failed ExecStart=
+       stops them - ExecStop= never runs after a failed start.
+    3. Even had that clean-up not happened (a failure from before it), the next
+       firstboot with SURE_ENABLED=false stops them through the script, because
+       `systemctl stop` of the failed unit would run nothing."""
+    running = tmp_path / "running.txt"
+    _w(running, "")
+    env = {"RUNNING": _px(running), "DOCKER_UP_FAILS": "1"}
+
+    proc, _ = _run_script(tmp_path, "start", docker_stub=STATEFUL_DOCKER, extra_env=env)
+    assert proc.returncode == 1
+    assert _running(running) == ["sure-postgres", "sure-redis"]   # the defect's starting point
+
+    proc, calls = _run_script(tmp_path, "stop-after-failure", docker_stub=STATEFUL_DOCKER,
+                              extra_env=dict(env, SERVICE_RESULT="exit-code"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _running(running) == [], calls
+
+    # the same failure with no ExecStopPost clean-up, then the knob goes off
+    (tmp_path / "again").mkdir()
+    _run_script(tmp_path / "again", "start", docker_stub=STATEFUL_DOCKER, extra_env=env)
+    assert _running(running) == ["sure-postgres", "sure-redis"]
+    proc, calls = _run_block(tmp_path / "again", "SURE_ENABLED=false\n", enabled=True, active=False,
+                             docker_stub=STATEFUL_DOCKER, extra_env={"RUNNING": _px(running)})
+    assert _running(running) == [], (proc.stdout, calls)
+    assert "systemctl disable homehub-sure.service" in calls
+
+
+def test_tc1361_a_never_enabled_unit_stops_nothing_even_with_sure_running_sr100(tmp_path):
+    """The legacy exception, with containers really up: no knob, unit never
+    enabled - the live hub on 2026-10-22."""
+    running = tmp_path / "running.txt"
+    _w(running, "sure-postgres\nsure-redis\nsure-web\nsure-worker\n")
+    for env_text in ("COMPOSE_PROFILES=ntfy\n", "SURE_ENABLED=false\n"):
+        proc, calls = _run_block(tmp_path, env_text, enabled=False,
+                                 docker_stub=STATEFUL_DOCKER, extra_env={"RUNNING": _px(running)})
+        assert not [c for c in calls if c.startswith("compose")], calls
+        assert len(_running(running)) == 4
+
+
+# ── TC-1361: the three readers of the knob agree (W10-sA review F2) ──────────
+#
+# firstboot read `^SURE_ENABLED=` and stripped double quotes only, while the
+# unit allowed indentation and stripped either quote: on SURE_ENABLED='true' the
+# unit said on and firstboot took its off branch, disabling and stopping an
+# enabled Sure. Each reader is run for real on the same line.
+
+ENVFILE_LIB = ROOT / "scripts" / "lib" / "envfile.sh"
+EXPORT_IMAGES = ROOT / "vmtest" / "export-images.sh"
+ENSURE_IMAGES = ROOT / "scripts" / "ensure-local-images.sh"
+
+KNOB_LINES = [
+    ("SURE_ENABLED=true\n", True),
+    ("SURE_ENABLED='true'\n", True),
+    ('SURE_ENABLED="true"\n', True),
+    ("  SURE_ENABLED=true\n", True),
+    ("\tSURE_ENABLED='true'\n", True),
+    ("SURE_ENABLED = true\n", True),
+    ("SURE_ENABLED= true\n", True),
+    ("SURE_ENABLED='true'\r\n", True),
+    ('  SURE_ENABLED="true"\r\n', True),
+    ("SURE_ENABLED=true   # the finance ledger\n", True),
+    ("SURE_ENABLED=true\n  SURE_ENABLED='false'\n", False),   # the last assignment wins
+    ("SURE_ENABLED=false\nSURE_ENABLED='true'\n", True),
+    ("SURE_ENABLED='false'\n", False),
+    ("SURE_ENABLED=True\n", False),
+    ("SURE_ENABLED=\n", False),
+    ("# SURE_ENABLED=true\n", False),
+    ("XSURE_ENABLED=true\n", False),
+    ("COMPOSE_PROFILES=sure\n", False),
+]
+
+
+def _bake_reads(tmp_path, key, env_text):
+    """The bake's reading: scripts/lib/envfile.sh env_file_value, then the
+    whitespace strip both callers apply (asserted below)."""
+    env_file = tmp_path / "bake.env"
+    _w(env_file, env_text)
+    proc = subprocess.run(
+        [_bash(), "-c", '. "$1"; env_file_value "$2" "$3" | tr -d "[:space:]"', "bake",
+         _px(ENVFILE_LIB), _px(env_file), key],
+        capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def test_tc1361_the_bake_callers_read_the_knob_through_env_file_value_sr100():
+    assert "env_file_value \"$ENV_FILE\" SURE_ENABLED | tr -d '[:space:]'" in \
+        EXPORT_IMAGES.read_text(encoding="utf-8")
+    ensure = ENSURE_IMAGES.read_text(encoding="utf-8")
+    assert 'env_get() { env_file_value "$ENV_FILE" "$1"; }' in ensure
+    assert "env_get SURE_ENABLED | tr -d '[:space:]'" in ensure
+    assert "env_get COMPOSE_PROFILES | tr -d '[:space:]'" in ensure
+
+
+@pytest.mark.parametrize("env_text,expected", KNOB_LINES)
+def test_tc1361_unit_firstboot_and_bake_read_sure_enabled_alike_sr100(tmp_path, env_text, expected):
+    (tmp_path / "unit").mkdir()
+    unit_proc, _ = _run_script(tmp_path / "unit", "condition", env_text)
+    unit_on = unit_proc.returncode == 0
+
+    # an enabled, active unit: a not-true reading disables and stops it
+    (tmp_path / "fb").mkdir()
+    _, calls = _run_block(tmp_path / "fb", env_text, enabled=True, active=True)
+    firstboot_on = "systemctl enable homehub-sure.service" in calls
+    firstboot_off = "systemctl disable homehub-sure.service" in calls
+    assert firstboot_on != firstboot_off, calls
+
+    bake_on = _bake_reads(tmp_path, "SURE_ENABLED", env_text) == "true"
+
+    assert (unit_on, firstboot_on, bake_on) == (expected, expected, expected), \
+        "unit=%s firstboot=%s bake=%s for %r" % (unit_on, firstboot_on, bake_on, env_text)
+
+
+@pytest.mark.parametrize("env_text,named", [
+    ("COMPOSE_PROFILES=ntfy,sure\n", True),
+    ("COMPOSE_PROFILES='ntfy,sure'\n", True),
+    ('COMPOSE_PROFILES="ntfy,sure"\r\n', True),
+    ("  COMPOSE_PROFILES = ntfy, sure\n", True),
+    ("COMPOSE_PROFILES=ntfy,surely\n", False),
+    ("COMPOSE_PROFILES=ntfy   # sure is a knob now\n", False),
+    ("COMPOSE_PROFILES=sure\nCOMPOSE_PROFILES=ntfy\n", False),
+])
+def test_tc1361_firstboot_warns_on_a_sure_profile_exactly_when_the_resolver_refuses_it_sr100(
+        tmp_path, env_text, named):
+    proc, _ = _run_block(tmp_path, env_text + "SURE_ENABLED=true\n")
+    firstboot_warns = "WARN: COMPOSE_PROFILES names 'sure'" in proc.stdout
+    resolver_refuses = "sure" in _bake_reads(tmp_path, "COMPOSE_PROFILES", env_text).split(",")
+    assert (firstboot_warns, resolver_refuses) == (named, named), proc.stdout

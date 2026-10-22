@@ -278,10 +278,16 @@ sequenceDiagram
         SD->>Unit: start (After=homehub-firstboot)
         Unit->>Unit: ExecCondition: SURE_ENABLED=true
         Unit->>DC: --profile sure up -d --no-build --pull never (4 services)
-    else knob off and the unit was enabled
+        opt up -d failed (SERVICE_RESULT not success)
+            Unit->>DC: ExecStopPost stop-after-failure: --profile sure stop
+        end
+    else knob off, the unit was enabled and is active
         FB->>SD: disable; stop --no-block
         SD->>Unit: stop
         Unit->>DC: --profile sure stop (web, worker, then redis, postgres)
+    else knob off, the unit was enabled and is failed or inactive
+        FB->>SD: disable
+        FB->>DC: sure-unit.sh stop, directly (systemctl stop of a failed unit runs nothing)
     else knob off or absent, unit never enabled
         FB->>FB: log only: no Sure container is touched
     end

@@ -28,6 +28,13 @@ WorkingDirectory=/opt/homehub/stack
 ExecCondition=/bin/bash /opt/homehub/stack/sure/sure-unit.sh condition
 ExecStart=/bin/bash /opt/homehub/stack/sure/sure-unit.sh start
 ExecStop=/bin/bash /opt/homehub/stack/sure/sure-unit.sh stop
+# A FAILED START IS CLEANED UP HERE, because systemd never runs ExecStop= after a
+# failed ExecStart=. `up -d` can start Postgres and Redis and then fail (a
+# health dependency that never becomes ready, TimeoutStartSec=): without this,
+# those two keep `restart: unless-stopped` and come back on every boot even
+# after the Owner switches SURE_ENABLED off. The verb reads $SERVICE_RESULT and
+# does nothing for `success` or a skipped run (`exec-condition`, knob off).
+ExecStopPost=/bin/bash /opt/homehub/stack/sure/sure-unit.sh stop-after-failure
 # `up -d` waits for Postgres and Redis to report healthy before it starts web
 # and worker (depends_on: service_healthy); Postgres's probe runs every 5 s.
 # The first start after an image change also runs Rails migrations inside
@@ -35,7 +42,8 @@ ExecStop=/bin/bash /opt/homehub/stack/sure/sure-unit.sh stop
 # ready, so this does not need to cover them.
 TimeoutStartSec=300
 # The script gives each container 60 s to stop (Postgres flushing); four in
-# order, plus compose's own overhead.
+# order, plus compose's own overhead. The same timeout bounds ExecStopPost=,
+# which returns at once after a clean ExecStop=.
 TimeoutStopSec=300
 
 [Install]

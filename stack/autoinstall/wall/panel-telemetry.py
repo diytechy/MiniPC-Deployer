@@ -300,9 +300,40 @@ def read_kiosk_processes(names, prev_ticks, prev_wall_s, cur_wall_s):
 
 
 def read_presentation(path, now_mono_ms):
-    """Read and validate the host-written presentation snapshot. Returns a
-    dict always: {"status": "ok"|"stale"|"unknown"|"invalid", "payload": ... or None}
+    """The current presentation only; see `read_snapshot` for the contract.
+    Kept for callers that want no transition ring."""
+    return read_snapshot(path, now_mono_ms)[0]
+
+
+def _valid_transitions(wrapper):
+    """The ring's records that pass the same validator as `current`, in ring
+    order, or None when the file carries no ring (a flat record, or a writer
+    that predates it). An invalid entry is dropped, never recorded: the ring is
+    history, and one bad report must not cost the rest."""
+    if not isinstance(wrapper, dict) or not isinstance(wrapper.get("transitions"), list):
+        return None
+    kept = []
+    for item in wrapper["transitions"]:
+        ok, _ = core.validate_presentation(item)
+        if ok:
+            kept.append(item)
+    return kept
+
+
+def read_snapshot(path, now_mono_ms):
+    """Read and validate the host-written presentation snapshot.
+
+    Returns (presentation, transitions). `presentation` is a dict always:
+    {"status": "ok"|"stale"|"unknown"|"invalid", "payload": ... or None}.
+    `transitions` is the validated ring (`_valid_transitions`) or None.
     Never raises.
+
+    now_mono_ms MUST be on the host's clock: CLOCK_BOOTTIME, suspend included
+    (`_boottime_s`), because that is what the host stamps monotonicMs with
+    (os.uptime()). Judged against time.monotonic(), which stops in suspend,
+    every record after the first suspend looked like it came from the future
+    and was reported stale (HomeHub FOLLOWUPS "Finding 2", fixed 2026-10-22,
+    LLR-1214).
 
     `payload` is populated ONLY when status is "ok". A stale, invalid or
     missing snapshot's mode must never be retained as if it were current (S:
@@ -315,11 +346,12 @@ def read_presentation(path, now_mono_ms):
         with open(path, "r") as fh:
             raw = fh.read()
     except OSError:
-        return {"status": "unknown", "payload": None, "last_seen": None, "errors": ["snapshot file not present"]}
+        return {"status": "unknown", "payload": None, "last_seen": None, "errors": ["snapshot file not present"]}, None
     try:
         payload = json.loads(raw)
     except ValueError as exc:
-        return {"status": "invalid", "payload": None, "last_seen": None, "errors": ["json parse error: %s" % exc]}
+        return {"status": "invalid", "payload": None, "last_seen": None, "errors": ["json parse error: %s" % exc]}, None
+    transitions = _valid_transitions(payload)
     # THE SNAPSHOT IS A WRAPPER, AND THIS HAD NEVER UNWRAPPED IT.
     #
     # Found 2026-09-18 while adding `projectmPreset`: EVERY sample on the panel
@@ -342,11 +374,11 @@ def read_presentation(path, now_mono_ms):
         payload = payload["current"]
     ok, errors = core.validate_presentation(payload)
     if not ok:
-        return {"status": "invalid", "payload": None, "last_seen": None, "errors": errors}
+        return {"status": "invalid", "payload": None, "last_seen": None, "errors": errors}, transitions
     record_mono = payload.get("monotonicMs")
     if core.is_stale(record_mono, now_mono_ms, STALE_THRESHOLD_S):
-        return {"status": "stale", "payload": None, "last_seen": payload, "errors": []}
-    return {"status": "ok", "payload": payload, "last_seen": None, "errors": []}
+        return {"status": "stale", "payload": None, "last_seen": payload, "errors": []}, transitions
+    return {"status": "ok", "payload": payload, "last_seen": None, "errors": []}, transitions
 
 
 def _state_path_for_day(state_dir, day_str):
@@ -433,6 +465,25 @@ def _write_mode_change_record(state_dir, boot_id, session_id, mono_s, presentati
     _append_record(state_dir, record)
 
 
+def _write_transition_record(state_dir, boot_id, session_id, mono_s, transition, prev_revision, cursor_lost):
+    """One drained ring entry. Its own monotonicMs (the host's stamp) dates
+    it; `cursor_lost` says transitions before it may be missing (the ring
+    overflowed between polls, or the host restarted)."""
+    record = {
+        "v": core.SCHEMA_VERSION,
+        "ts_utc": core.now_utc_iso(),
+        "mono_s": mono_s,
+        "boot_id": boot_id,
+        "session_id": session_id,
+        "event": "mode_change",
+        "source": "transition-ring",
+        "transition": transition,
+        "prev_revision": prev_revision,
+        "cursor_lost": cursor_lost,
+    }
+    _append_record(state_dir, record)
+
+
 def _boottime_s():
     """A clock that keeps advancing through suspend, unlike time.monotonic()
     (CLOCK_MONOTONIC excludes suspended time on Linux -- see clock_gettime(2)
@@ -456,6 +507,7 @@ def cmd_run(args):
     prev_stat = None
     prev_boottime = None
     last_revision = None
+    ring_cursor = None
     sensor_targets = _resolve_sensors()
     last_sensor_resolve = time.monotonic()
     gpu_card = _resolve_gpu_card()
@@ -465,13 +517,29 @@ def cmd_run(args):
     while True:
         tick_start = time.monotonic()
         try:
-            now_mono_ms = time.monotonic() * 1000.0
-            presentation = read_presentation(args.presentation_path, now_mono_ms)
+            # The HOST's clock, not this loop's: see read_snapshot.
+            now_host_ms = _boottime_s() * 1000.0
+            presentation, transitions = read_snapshot(args.presentation_path, now_host_ms)
             revision = (presentation.get("payload") or {}).get("revision")
-            if revision is not None and last_revision is not None and revision != last_revision:
-                _write_mode_change_record(state_dir, boot_id, session_id, tick_start, presentation, last_revision)
-            if revision is not None:
-                last_revision = revision
+            if transitions is not None:
+                # DRAIN THE RING (LLR-1214): every report since the last one
+                # recorded, so a mode shorter than this 1 s poll is still a
+                # record. The ring includes `current`, so this replaces the
+                # revision comparison below rather than adding to it.
+                drained, ring_cursor, cursor_lost = core.drain_transitions(transitions, ring_cursor)
+                for item in drained:
+                    _write_transition_record(state_dir, boot_id, session_id, tick_start,
+                                             item, last_revision, cursor_lost)
+                    cursor_lost = False
+                    last_revision = item.get("revision")
+                if transitions:
+                    # First sight records nothing but still knows where it is.
+                    last_revision = transitions[-1].get("revision")
+            else:
+                if revision is not None and last_revision is not None and revision != last_revision:
+                    _write_mode_change_record(state_dir, boot_id, session_id, tick_start, presentation, last_revision)
+                if revision is not None:
+                    last_revision = revision
 
             if tick_start >= next_full_sample:
                 stat = read_stat_line()

@@ -234,6 +234,51 @@ def validate_presentation(payload):
     return (len(errors) == 0), errors
 
 
+# ── the renderer's transition ring ───────────────────────────────────────────
+
+def drain_transitions(transitions, cursor):
+    """Which transitions in the host's ring this collector has not yet recorded.
+
+    OfficeWallNaglight's electron/presentation-ipc.cjs keeps the last 20
+    validated reports, oldest first, beside the current one, and never clears
+    them: the collector decides what it has consumed. Until 2026-10-22 the
+    collector read only `current`, so a mode that lived less than its ~1 s poll
+    was never recorded (HomeHub FOLLOWUPS, "Finding 2, panel telemetry").
+
+    The CURSOR is the (monotonicMs, revision) pair of the last transition
+    recorded. monotonicMs is the HOST's stamp (boot-relative, suspend included),
+    so it only grows within a boot even when the renderer reloads and restarts
+    its revision count; the revision breaks a tie between two reports inside one
+    clock tick (the host clock reads /proc/uptime, 10 ms).
+
+    Contract:
+      Inputs:  transitions: list of validated presentation records in ring order;
+               cursor: (monotonicMs, revision) of the last one recorded, or None
+               when this collector has recorded none yet.
+      Outputs: (new: list of records to record, in order,
+                cursor: the new cursor (unchanged when the ring is empty),
+                cursor_lost: True when the cursor is no longer in the ring - the
+                ring overflowed between polls or the host restarted - so some
+                transitions may be missing and the first new record says so).
+    First sight (cursor None) records NOTHING and only sets the cursor: the
+    ring's history predates this collector, and replaying it would invent mode
+    changes at every collector restart. Pure: no I/O.
+    Implements: SR-030, LLR-1214
+    """
+    if not transitions:
+        return [], cursor, False
+    last = transitions[-1]
+    newest = (last.get("monotonicMs"), last.get("revision"))
+    if cursor is None:
+        return [], newest, False
+    for index in range(len(transitions) - 1, -1, -1):
+        item = transitions[index]
+        if (item.get("monotonicMs"), item.get("revision")) == tuple(cursor):
+            return list(transitions[index + 1:]), newest, False
+    after = [t for t in transitions if _is_finite_number(t.get("monotonicMs")) and t["monotonicMs"] > cursor[0]]
+    return after, (newest if after else cursor), bool(after)
+
+
 # ── retention / rotation arithmetic ──────────────────────────────────────────
 
 def files_to_delete_for_retention(files, now_epoch_s, retention_days=7):

@@ -955,21 +955,46 @@ def route_block():
     return found.group(1)
 
 
-def run_route_block(tmp_path, env, *, fail_install=""):
+NETPLAN_PATH = "/etc/netplan/50-cloud-init.yaml"
+
+
+def load_env_function():
+    """firstboot's own load_env_file, cut out, so a wall.env fixture is read
+    exactly as the panel reads it."""
+    text = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    found = re.search(r"^load_env_file\(\) \{\n.*?^\}\n", text, re.S | re.M)
+    assert found, "wall-firstboot.sh lost load_env_file"
+    return found.group(0)
+
+
+def run_route_block(tmp_path, env, *, fail_install="", netplan=None, wall_env=None):
     """The block, cut out and run in bash under set -euo pipefail. install and
-    fail_step record; the env file is redirected into tmp_path (the one path
-    rewritten), so what it writes is the block's own output."""
+    fail_step record; the env file and the netplan file it may fall back to are
+    redirected into tmp_path (the two paths rewritten), so what it writes is the
+    block's own output and the dev box's own /etc/netplan is never read.
+    netplan: the text of the installed 50-cloud-init.yaml, or None for no file.
+    wall_env: a wall.env file loaded with firstboot's own load_env_file first."""
     calls = tmp_path / "route-calls"
     target = tmp_path / "etc" / "panel-alert.env"
     target.parent.mkdir(parents=True, exist_ok=True)
+    netplan_file = tmp_path / "netplan" / "50-cloud-init.yaml"
+    if netplan is not None:
+        netplan_file.parent.mkdir(parents=True, exist_ok=True)
+        netplan_file.write_bytes(netplan.encode("utf-8"))
     rec = 'printf "%s\\n" "{kind} $*" >> "' + calls.as_posix() + '"'
     body = route_block()
     assert body.count("/etc/wall-panel/panel-alert.env") == 1
+    assert body.count(NETPLAN_PATH) == 1
     body = body.replace("/etc/wall-panel/panel-alert.env", target.as_posix())
+    body = body.replace(NETPLAN_PATH, netplan_file.as_posix())
     assigns = ["{}='{}'".format(k, v) for k, v in env.items()]
+    loads = [] if wall_env is None else [load_env_function(),
+                                         'load_env_file "{}"'.format(Path(wall_env).as_posix())]
     script = "\n".join([
         "set -euo pipefail",
+        "unset HUB_IP WALL_ALERT_NTFY_PORT WALL_ALERT_TOPIC",
         'PAYLOAD="{}"'.format(WALL.as_posix()),
+        *loads,
         *assigns,
         'log() { echo "[wall-firstboot] $*"; }',
         'warn() { echo "[wall-firstboot] WARNING: $*" >&2; }',
@@ -1168,7 +1193,111 @@ def test_tc1329_no_or_bad_hub_address_leaves_the_route_journal_only(tmp_path, en
         assert any("is malformed; panel alerts are journal-only" in c for c in _fails(calls))
     else:
         assert _fails(calls) == []
-        assert "HUB_IP is not set in wall.env; panel alerts are journal-only" in done.stderr
+        assert ("HUB_IP is not set in wall.env and {} names no single IPv4 nameserver; "
+                "panel alerts are journal-only").format(
+                    (tmp_path / "netplan" / "50-cloud-init.yaml").as_posix()) in done.stderr
+
+
+# ── TC-1329: an existing panel upgraded by the paired release (Sol W5 r2 F3) ─
+#
+# The live panel's wall.env predates HUB_IP, and the paired release keeps
+# wall.env byte-identical, so the release cannot add it. The block falls back,
+# read-only, to the hub address the panel already holds: the one nameserver in
+# the installed 50-cloud-init.yaml (user-data fills it from the same deploy
+# knob). Both YAML forms are exercised: the flow list user-data writes, and the
+# block list cloud-init re-serialises it to (the shape measured on the panel).
+
+NETPLAN_BLOCK = """network:
+  version: 2
+  wifis:
+    wlp1s0:
+      addresses:
+      - "192.0.2.17/24"
+      nameservers:
+        addresses:
+        - {ns}
+      macaddress: "permanent"
+      routes:
+      - to: "default"
+        via: "192.0.2.1"
+"""
+NETPLAN_FLOW = """network:
+  version: 2
+  wifis:
+    wlp1s0:
+      addresses: [192.0.2.17/24]
+      routes:
+        - to: default
+          via: 192.0.2.1
+      nameservers:
+        addresses: [{ns}]   # the hub
+      macaddress: permanent
+"""
+
+
+def pre_w5_wall_env(tmp_path):
+    """wall.env.example as it stood before SR-094: no HUB_IP and no alert knobs."""
+    text = (WALL / "wall.env.example").read_text(encoding="utf-8")
+    knobs = ("HUB_IP=", "WALL_ALERT_NTFY_PORT=", "WALL_ALERT_TOPIC=")
+    kept = [l for l in text.splitlines(keepends=True) if not l.startswith(knobs)]
+    assert len(kept) == len(text.splitlines(keepends=True)) - 3, "the three SR-094 knobs moved"
+    path = tmp_path / "wall.env"
+    path.write_bytes("".join(kept).encode("utf-8"))
+    return path
+
+
+@needs_bash
+@pytest.mark.parametrize("form", [NETPLAN_BLOCK, NETPLAN_FLOW], ids=["cloud-init-block", "user-data-flow"])
+def test_tc1329_a_pre_w5_wall_env_takes_the_hub_from_the_installed_netplan(tmp_path, form):
+    wall_env = pre_w5_wall_env(tmp_path)
+    before = wall_env.read_bytes()
+    netplan = form.format(ns=TEST_HUB)
+    done, calls, target = run_route_block(tmp_path, {}, netplan=netplan, wall_env=wall_env)
+    _ok(done)
+    assert _fails(calls) == []
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert [l for l in lines if not l.startswith("#")] == [
+        "LAN_IP=" + TEST_HUB, "NTFY_PORT=8090", "HOMEHUB_ALERT_TOPIC=homehub-alerts"]
+    source = "the single nameserver in {}".format((tmp_path / "netplan" / "50-cloud-init.yaml").as_posix())
+    assert any(l.startswith("# Hub address from: " + source) for l in lines), lines
+    assert "hub address from " + source in done.stdout, done.stdout
+    assert wall_env.read_bytes() == before, "wall.env must stay byte-identical"
+    assert (tmp_path / "netplan" / "50-cloud-init.yaml").read_bytes() == netplan.encode("utf-8")
+
+
+@needs_bash
+@pytest.mark.parametrize("netplan", [
+    NETPLAN_BLOCK.format(ns=TEST_HUB + "\n        - 198.51.100.53"),         # two nameservers
+    NETPLAN_FLOW.format(ns=TEST_HUB + ", 198.51.100.53"),
+    NETPLAN_FLOW.format(ns="REPLACE_WITH_HUB_IP"),                           # an unfilled image
+    NETPLAN_BLOCK.format(ns="2001:db8::53"),                                 # not IPv4
+    NETPLAN_FLOW.format(ns=""),                                              # an empty list
+    NETPLAN_BLOCK.replace("      nameservers:\n        addresses:\n        - {ns}\n", ""),
+    "network:\n  wifis:\n    wlp1s0:\n      nameservers: {addresses: [192.0.2.10]}\n",  # unparsed shape
+], ids=["two-block", "two-flow", "placeholder", "ipv6", "empty", "none", "flow-map"])
+def test_tc1329_the_netplan_fallback_takes_only_one_ipv4_nameserver(tmp_path, netplan):
+    wall_env = pre_w5_wall_env(tmp_path)
+    before = wall_env.read_bytes()
+    done, calls, target = run_route_block(tmp_path, {}, netplan=netplan, wall_env=wall_env)
+    _ok(done)
+    assert _fails(calls) == []
+    assert not target.exists()
+    assert "names no single IPv4 nameserver; panel alerts are journal-only" in done.stderr
+    assert wall_env.read_bytes() == before
+
+
+@needs_bash
+def test_tc1329_hub_ip_in_wall_env_wins_over_the_netplan(tmp_path):
+    netplan = NETPLAN_BLOCK.format(ns="198.51.100.53")
+    done, calls, target = run_route_block(tmp_path, {"HUB_IP": TEST_HUB}, netplan=netplan)
+    _ok(done)
+    assert "LAN_IP=" + TEST_HUB in target.read_text(encoding="utf-8").splitlines()
+    assert "hub address from wall.env HUB_IP" in done.stdout
+    # A HUB_IP that is set but malformed is still a failed step: no fallback.
+    done, calls, target = run_route_block(tmp_path, {"HUB_IP": "homehub.lan"}, netplan=netplan)
+    _ok(done)
+    assert not target.exists()
+    assert any("is malformed; panel alerts are journal-only" in c for c in _fails(calls))
 
 
 @needs_bash

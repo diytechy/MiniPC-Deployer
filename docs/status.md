@@ -20,7 +20,8 @@ shuts down. Branch `w5-power-button`, NOT merged, NOT deployed.**
   `systemctl poweroff`; presses are de-duplicated across the two `Power Button` devices only. No kiosk
   acknowledgement within 2 s raises a journal ALERT and, off the press path, posts it to the hub's ntfy through
   `/usr/local/lib/wall-panel/panel-alert` and a byte-identical copy of W3a's `homehub-alert.sh` (SR-094,
-  LLR-1188/1189; the hub's address from the new wall.env knob `HUB_IP`, journal-only while it is empty).
+  LLR-1188/1189; the hub's address from the new wall.env knob `HUB_IP` or, for a wall.env that predates it,
+  read-only from the single IPv4 nameserver in the installed netplan; journal-only with neither).
   The window runs on CLOCK_BOOTTIME, so a suspend ends it; a device that will not open stops the guard.
   firstboot step 8h, knob `WALL_POWER_BUTTON_GUARD` (default true), checks the inhibitor in
   `systemd-inhibit --list`.

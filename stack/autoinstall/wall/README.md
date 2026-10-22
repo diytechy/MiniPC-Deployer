@@ -114,7 +114,7 @@ set through `busctl` on org.bluez.Adapter1 instead.
 | `wall-meeting-recorder.{py,service}` + `wall-meeting-spool.py` + firstboot step 8i | **SR-108..SR-110, meeting recording both directions (OfficeWallNaglight WSN-097, ruled 2026-10-22, HomeHub open-items A69)** — the panel control and, for `WALL_MEETING_CALL_GATEWAYS`, a Bluetooth call start a recording of `mic_selected` (left) and `bus_monitor` (right) into one Opus file in `/var/spool/wall-meeting/`; capture runs only while the kiosk keeps confirming the indicator (`/run/wall-meeting-recorder/state.json` out, `/run/wall-panel-renderer/meeting-indicator-ack.json` in) and stops within 2 s of the indicator leaving the glass; a lost indicator or a recorder restart ends the recording, finalised, and the call it was recording is not re-recorded automatically. Own account `wall-meeting` (audio group, AF_UNIX only), whose authorized_keys holds only the hub's key restricted to the forced command `wall-meeting-spool` (list, get, ack-by-hash, report). Spool cap `WALL_MEETING_SPOOL_MAX_MB`, disk floor `WALL_MEETING_MIN_FREE_MB`. `journalctl -u wall-meeting-recorder` has every start, stop and refusal. Knob `WALL_MEETING_RECORDING` (default **false**); the hub half is `stack/meetings/` |
 | `wall-sync.{sh,service}` | **the media pull (OI-15; TWO sources since OI-18)** — mirror the HOMEHUB music share and the Mini-serv frame-video share into the panel's cache. Boot-once + every resume + on-demand; **no timer on this unit** |
 | `wall-sync-resume.service` | **the resume hook (OI-16a)** — `WantedBy=suspend.target`, fires on every wake from the nightly suspend and `--no-block`-starts `wall-sync.service`, detached, so the wake is never delayed |
-| `wall-sync-frame.{service,timer}` | **the frame flow's own cadence (OI-18)** — `wall-sync.sh --only frame`, every minute, per storage-map §4d. Same script, same guards; a different address, credential, shape and failure policy |
+| `wall-sync-frame.{service,timer}` | **the frame flow's own cadence (OI-18)** — `wall-sync.sh --only frame`, every 30 minutes (the Owner's cadence, 2026-09-15; storage-map §4d said every minute), first run 3 min after the timer starts. Same script, same guards; a different address, credential, shape and failure policy |
 | `wall-media-manifest.py` | the sync's post-step: emits the shell's `music/index.json` and `frame/playlist.json` into that cache (`--only <flow>` so one flow cannot rewrite the other's manifest) |
 | `netplan-wifi.yaml.template` | rendered to `/etc/netplan/60-wall-wifi.yaml` (0600) |
 | `wall-efi-fallback-sync.sh` + `wall-efi-fallback.service` | **the Insyde firmware workaround (2026-09-03)** — this panel's firmware discards the NVRAM boot entry `grub-install` creates, so it boots the spec's removable-media path, where shim has no `grubx64.efi` beside it. Installed by a **late-command**, not by firstboot, because firstboot waits on `network-online.target` and a panel that cannot boot has no network. Re-asserted from an apt hook after every upgrade and from the unit at every boot: `grub-install` restores `fbx64.efi` (the reset-loop trigger) on each grub/shim update and never maintains the fallback GRUB, so a one-shot repair would leave an unpatchable GRUB on the boot path |
@@ -238,7 +238,7 @@ private deploy configuration.
 | cache leaf | `music` | `frame` |
 | manifest | `index.json` | `playlist.json` |
 | credential file | **none** — anonymous `guest` mount (storage-map Q-S7, 2026-08-05) | `/etc/wall-panel/cifs-frame.creds` |
-| cadence | boot / resume / on demand | **every minute** (`wall-sync-frame.timer`) |
+| cadence | boot / resume / on demand | **every 30 minutes** (`wall-sync-frame.timer`) |
 | may the source sleep? | **no** — always-on | **yes**, by design |
 | mount refused | **fails the unit** — a real alert | 445 probed first: **no answer = silent skip**; answered-and-refused = **fails** |
 
@@ -262,7 +262,7 @@ made "the panel has no playlists" look like an argument for streaming.
 
 ```bash
 sudo systemctl start wall-sync.service      # BOTH flows; journalctl -u wall-sync
-journalctl -u wall-sync-frame               # the every-minute frame flow
+journalctl -u wall-sync-frame               # the 30-minute frame flow
 ```
 
 Things worth knowing before trusting it:

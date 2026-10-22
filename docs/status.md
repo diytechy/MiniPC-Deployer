@@ -12,6 +12,23 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-22 — HomeHub plan W10, lane W10-timer, on `w10-frame-timer-cadence` (not merged, not deployed).**
+- **SR-112 / LLR-1255:** `wall-sync-frame.timer` carries the Owner's 30-minute cadence itself
+  (`OnUnitInactiveSec=30min`) plus `OnActiveSec=3min`, which arms from the timer's own start. The panel's
+  drop-in `10-cadence.conf` (2026-09-15) reset the whole trigger list with its empty `OnUnitInactiveSec=`,
+  deleting `OnBootSec=3min`; the inactive trigger alone never arms for a service that has never run, so the
+  timer sat `elapsed`, `NextElapseUSecMonotonic=infinity`, and never fired (C47). Reproduced on systemd 255.
+  TC-1420, TC-1423.
+- **LLR-1256:** firstboot 5c retires that drop-in only by its sha256 (to `/var/backups/wall-panel/...`),
+  leaves and names anything else in the directory, then reloads. TC-1421 (TC-1363 updated).
+  **Depends on a HomeHub change to ship safely:** the paired release's rollback set must hold each
+  declared unit's `.d` directory (HomeHub `panel_release_remote.system_targets`), or a release that fails
+  after firstboot restores the old one-minute unit without the drop-in (review finding F1, reproduced on
+  systemd 255 with HomeHub's real backup and rollback phases). Merge that HomeHub change before releasing this.
+- **LLR-1257:** firstboot 8 restarts the timer when it is elapsed (a daemon-reload does not re-arm one,
+  measured) and starts it when inactive. TC-1422.
+- Not proven: any of it on the panel (needs the paired release; coordinator's steps in HomeHub FOLLOWUPS).
+
 **2026-10-22 — HomeHub plan W10 shortlist, lane W10-sA, on `w10a-shortlist` (not merged, not deployed).**
 - **SR-100 / LLR-1210:** Sure has its own owner, `stack/sure/homehub-sure.service` + `sure-unit.sh`,
   switched by `SURE_ENABLED` (exactly `true`); firstboot 4-pre-a2b installs it, enables it and queues its

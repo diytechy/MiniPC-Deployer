@@ -1,37 +1,69 @@
-# The frame flow's one-minute cadence (storage-map §4d `sync-frame-videos`:
-# "The panel checks EVERY MINUTE: share reachable? new content? -> fetch/mirror;
-# unreachable (box asleep) = skip silently, never wake").
+# The frame flow's cadence: THIRTY MINUTES after the last run finished, and a
+# first run three minutes after the timer starts (boot, every resume, a release).
 #
-# THE FIRST TIMER THIS PANEL HAS EVER SHIPPED, and that is a deliberate exception
-# rather than a reversal: OI-15's "there is deliberately NO periodic timer" is
-# about the MUSIC pull it was written for, whose source is always-on and whose
-# first sync is the whole library. It does not describe the frame flow, which the
-# storage map had already put on a one-minute clock before OI-18 made two mounts
-# possible at all.
+# THE CADENCE IS THE OWNER'S (2026-09-15). It shipped as one minute (storage-map
+# §4d `sync-frame-videos`: "the panel checks EVERY MINUTE"), and on 2026-09-15
+# the Owner overrode that on the panel with a drop-in, now retired and carried
+# here instead (SR-112): the frame set is a handful of rendered videos that change
+# rarely, and a run is not cheap - measured that boot, 92 s of work per 152 s of
+# wall clock, so the panel spent ~60% of its life mounting CIFS and walking an
+# rsync tree while it was also drawing a UI and playing audio. Thirty minutes
+# makes the same run ~5%. It was a DUTY-CYCLE change, not a pile-up fix: runs
+# were never overlapping (journal, that day: Failed 14:01:40 -> Starting
+# 14:02:41, exactly 61 s idle).
 #
-# OnUnitInactiveSec, not OnCalendar and NOT OnUnitActiveSec: the period is "a
-# minute after the last run FINISHED". OnUnitActiveSec was wrong for that claim
-# and the comment here used to assert it anyway — it measures from ACTIVATION, so
-# a run that takes longer than a minute re-fires the moment it exits, and a run
-# that consistently takes 90 s would have this timer permanently at zero delay.
-# OnUnitInactiveSec measures from DEACTIVATION, which is what the storage map's
-# "check every minute" means for a job whose duration is not fixed. (The per-flow
-# lock in wall-sync.sh is the belt to this braces — systemd will not run two
-# instances of one unit, but wall-sync.service mirrors the frame flow too.)
+# OnUnitInactiveSec, not OnCalendar and NOT OnUnitActiveSec: the period runs from
+# the moment the last run FINISHED (DEACTIVATION), so a run that overruns only
+# postpones the next one; systemd never starts a second instance of one unit and
+# there is no queue to drain. OnUnitActiveSec measures from ACTIVATION, so a run
+# longer than the period would re-fire the moment it exited. (The per-flow lock in
+# wall-sync.sh is the belt to these braces: wall-sync.service mirrors the frame
+# flow too.)
 #
-# Persistent= is deliberately ABSENT. It would fire a catch-up run at boot for
-# every minute the panel spent suspended overnight — systemd coalesces that into
-# ONE run, so it is not a storm, but it is also pointless: wall-sync.service
-# already mirrors both flows at boot and wall-sync-resume.service does it again
-# on every wake. OnBootSec below is the only start-up trigger this needs, and it
-# is late enough not to race the boot sync for the lock.
+# OnActiveSec IS WHAT MAKES IT FIRE AT ALL. OnUnitInactiveSec has nothing to
+# measure from until the service has run once: systemd bases it on the service's
+# last deactivation (or this timer's last trigger), and a service that has never
+# run has neither, so on its own it NEVER arms - the timer sits `elapsed` with
+# NextElapseUSecMonotonic=infinity. That is exactly what the panel showed from
+# 2026-09-15 to 2026-10-22: no frame-sync run on any boot and no journal entry
+# at all (open-items C47). OnActiveSec=3min is measured from THIS TIMER'S OWN
+# START, which happens at every boot (timers.target), on every wake
+# (wall-sync-resume.service restarts the timer wall-sync-suspend.service stopped)
+# and when firstboot restarts it, so it cannot be missed; once it fires, the
+# trigger time is the base OnUnitInactiveSec needs. Three minutes keeps the first
+# run clear of the boot or resume sync that wall-sync.service is running for the
+# same lock. Not OnBootSec: started more than three minutes after boot (every
+# resume) it fires at once and races that sync.
+#
+# ONE COST, MEASURED (systemd 255, 2026-10-22): a `systemctl daemon-reload`
+# re-arms OnActiveSec from the moment of the reload, so a burst of reloads (a
+# firstboot pass, a release, a package upgrade) is followed by one extra run three
+# minutes after the last of them. One run per burst, never a loop; accepted.
+# The reverse does NOT happen: a reload never re-arms a timer that is already
+# `elapsed` - only a stop/start does, which is why firstboot restarts this timer
+# when it finds it elapsed.
+#
+# THE EMPTY-ASSIGNMENT LESSON, KEPT, AND CORRECTED. The Owner's drop-in said
+# `OnUnitInactiveSec=` then `OnUnitInactiveSec=30min`, because these settings are
+# LISTS: a drop-in that only sets 30min ADDS a trigger beside the base 1min one,
+# the earliest wins, and the cadence does not change (measured: NEXT still 47 s
+# away). But the empty assignment resets the WHOLE trigger list - every On*Sec=
+# and OnCalendar= alike (systemd.timer(5)) - so it also deleted the base unit's
+# OnBootSec=3min, and with it the only trigger that could arm before the first
+# run. Reproduced on systemd 255 with both files: TimersMonotonic lists
+# OnUnitInactiveUSec=30min alone. Any future drop-in that resets this list must
+# restate OnActiveSec; better, change this file, which the release carries.
+#
+# Persistent= is deliberately ABSENT: it applies to OnCalendar= only, and a
+# catch-up run at boot is pointless anyway - wall-sync.service mirrors both flows
+# at boot and again on every wake.
 [Unit]
-Description=Wall panel: check the frame-video share every minute (OI-18 / storage-map 4d)
+Description=Wall panel: check the frame-video share every 30 minutes (OI-18; the Owner's cadence, 2026-09-15)
 Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
 
 [Timer]
-OnBootSec=3min
-OnUnitInactiveSec=1min
+OnActiveSec=3min
+OnUnitInactiveSec=30min
 AccuracySec=10s
 Unit=wall-sync-frame.service
 

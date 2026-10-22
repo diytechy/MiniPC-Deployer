@@ -270,8 +270,11 @@ assert_file_matches "wall-sync-frame.service runs the sync with EXACTLY --only f
     "$WALL_DIR/wall-sync-frame.service" '^ExecStart=/usr/local/sbin/wall-sync\.sh --only frame$'
 assert_file_matches "wall-sync-frame.service is bounded (TimeoutStartSec)" \
     "$WALL_DIR/wall-sync-frame.service" '^TimeoutStartSec=[0-9]+$'
-assert_file_matches "wall-sync-frame.timer fires a minute after the run FINISHES" \
-    "$WALL_DIR/wall-sync-frame.timer" '^OnUnitInactiveSec=1min$'
+assert_file_matches "wall-sync-frame.timer fires 30 minutes after the run FINISHES" \
+    "$WALL_DIR/wall-sync-frame.timer" '^OnUnitInactiveSec=30min$'
+# ...and arms before the service has ever run (SR-112: without it, never).
+assert_file_matches "wall-sync-frame.timer arms from its own start (OnActiveSec)" \
+    "$WALL_DIR/wall-sync-frame.timer" '^OnActiveSec=3min$'
 # OnUnitActiveSec measures from ACTIVATION, so a run longer than the period
 # re-fires immediately — and the file used to claim, in a comment, that it meant
 # "after the last run finished".

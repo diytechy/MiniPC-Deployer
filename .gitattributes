@@ -26,6 +26,11 @@
 *.dat binary
 *.lock binary
 
+# The panel's 2026-09-15 drop-in, byte for byte (it is CRLF on the panel). Its
+# sha256 is the identity firstboot retires it by (SR-112), so a line-ending
+# rewrite here would make the fixture stop being the file the test is about.
+tests/fixtures/wall-sync-frame.timer.d-10-cadence.conf -text
+
 # The frozen IF-020 PCM frame fixture. Byte-identical in OfficeWallNaglight, so
 # a line-ending rewrite here would be a silent, cross-repository contract change.
 *.bin binary

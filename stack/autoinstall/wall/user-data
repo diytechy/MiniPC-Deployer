@@ -566,9 +566,9 @@ autoinstall:
     #                    wall-sync-resume.service (OI-16a): the panel suspends
     #                    nightly and a resume is not a boot, so boot-only would go
     #                    weeks stale.
-    # wall-sync-frame  — EVERY MINUTE (a .timer): the frame flow only, because
-    #                    storage-map §4d gives it that cadence and the music flow
-    #                    a different one. Same script, `--only frame`.
+    # wall-sync-frame  — EVERY 30 MINUTES (a .timer): the frame flow only, because
+    #                    it has its own cadence (the Owner's, 2026-09-15) and the
+    #                    music flow a different one. Same script, `--only frame`.
     # `install -m 0644`, NOT `cp`, for every unit below - same defect the hub's
     # user-data carried, found the same day (2026-08-28) by TC-H-R07. The payload
     # is staged from a Windows checkout through a DrvFs mount that hands every
@@ -629,8 +629,8 @@ autoinstall:
     - cp /target/opt/wall-panel/stack/autoinstall/wall/wall-media-manifest.py /target/usr/local/sbin/wall-media-manifest.py
     - curtin in-target --target=/target -- chmod +x /usr/local/sbin/wall-sync.sh /usr/local/sbin/wall-media-manifest.py
     - curtin in-target --target=/target -- systemctl enable wall-sync.service
-    # wall-sync-frame — the frame flow's every-minute cadence (OI-18 exit (b),
-    # storage-map §4d). Only the TIMER is enabled: nothing should start the
+    # wall-sync-frame — the frame flow's 30-minute cadence (OI-18 exit (b); the
+    # Owner's cadence, 2026-09-15). Only the TIMER is enabled: nothing should start the
     # service at boot, because wall-sync.service already mirrors both flows there.
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-frame.service /target/etc/systemd/system/wall-sync-frame.service
     - install -m 0644 /target/opt/wall-panel/stack/autoinstall/wall/wall-sync-frame.timer /target/etc/systemd/system/wall-sync-frame.timer

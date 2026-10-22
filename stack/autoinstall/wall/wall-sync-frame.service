@@ -27,7 +27,7 @@
 # this unit exits 0. What it does NOT do is go quiet: every skip logs the AGE of
 # the cached content, and a mount that is REFUSED BY AN AWAKE BOX still fails.
 [Unit]
-Description=Wall panel: mirror the Mini-serv frame-video share into the local media cache (every minute)
+Description=Wall panel: mirror the Mini-serv frame-video share into the local media cache (every 30 minutes)
 Documentation=file:///opt/wall-panel/stack/autoinstall/wall/README.md
 After=network-online.target
 Wants=network-online.target
@@ -54,7 +54,7 @@ ExecStart=/usr/local/sbin/wall-sync.sh --only frame
 # so 43 GB is about 2 h 12 m -- and a budget exists to bound a WEDGED mount, not
 # to forbid a large transfer.
 #
-# THE ONE-MINUTE TIMER DOES NOT STACK BEHIND THIS. wall-sync-frame.timer uses
+# THE TIMER DOES NOT STACK BEHIND THIS. wall-sync-frame.timer uses
 # OnUnitInactiveSec, which measures from the moment the service goes INACTIVE, so
 # a run still going simply postpones the next trigger; there is no queue of fifty
 # jobs to grow. That was the real protection all along, not the short timeout.

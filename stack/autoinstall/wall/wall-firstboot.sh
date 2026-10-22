@@ -2504,42 +2504,92 @@ fi
 # manifest is derived from these lines. Always on -- there is no knob, because
 # an unbounded log on the root filesystem is not a preference.
 #
-# * /etc/logrotate.d/rsyslog is REPLACED, not joined: logrotate skips a log two
-#   stanzas name. Same files and postrotate as Ubuntu's; daily + maxsize 100M +
-#   rotate 7.
+# EVERY OPERATION BELOW IS GUARDED. This script runs under `set -e`, and an
+# unguarded failure here (a full disk is the very case this block exists for)
+# would abort every later step and the failure report with it. Each one
+# records a failed step through logcap_failed and the block carries on, so
+# the unit goes RED and the marker is withheld, but nothing after this block
+# is skipped. The install lines keep the plain payload-install form (mode,
+# quoted payload source, destination) with the guard AFTER it, because the
+# release manifest generator reads exactly that form and ignores any line that
+# says fail_step. (No example path here: the payload scanners read comments.)
+#
+# * /etc/logrotate.d/rsyslog belongs to the rsyslog package as a conffile.
+#   It is DIVERTED, not overwritten: `dpkg-divert --local --rename` moves the
+#   package's copy to /etc/logrotate.rsyslog.distrib -- OUTSIDE the
+#   logrotate.d include directory, so it is never read -- and every later
+#   package upgrade writes there, with no conffile prompt and nothing held
+#   back by unattended-upgrades. Our stanza is then installed in its place.
+#   The divert is idempotent: an existing diversion to that path is left
+#   alone. If the diversion is missing and cannot be made, our stanza is NOT
+#   installed (that would be the in-place conffile edit this avoids).
+#   TO UNDO, as root: rm /etc/logrotate.d/rsyslog &&
+#   dpkg-divert --rename --remove /etc/logrotate.d/rsyslog
+#   (the package's file moves back), and remove this block first or the next
+#   boot puts it back. Upstream changes to the stock stanza land in the
+#   .distrib file; compare it with wall-logrotate-rsyslog when rsyslog updates.
 # * logrotate.timer gets a drop-in making it hourly, so maxsize bites within
-#   the day. try-restart re-arms it on the new schedule now; it is enabled
-#   through the helper so the release manifest requires it enabled.
+#   the day. It is enabled through the helper (so the release manifest
+#   requires it enabled), RESTARTED so the new schedule is armed now, and
+#   checked active. A daemon-reload alone left it with no next elapse under
+#   systemd 255.
 # * journald's cap becomes tracked: the same path and values as the drop-in
 #   written on the panel by hand on 2026-09-19, so this takes it over in
 #   place. journald is restarted only when the drop-in actually changed, so
 #   an ordinary boot does not bounce it.
 # * wall-disk-check.timer writes `wall-disk: LOW ...` to the journal and
-#   /run/wall-disk/status.json. The panel has no alert route to the hub (the
-#   telemetry collector has no network by design), so the journal line and the
-#   status file are the whole of the alarm for now.
+#   /run/wall-disk/status.json, for / and for the media cache AT THE PATH
+#   THIS SCRIPT RESOLVED (WALL_MEDIA_CACHE), handed over in the generated
+#   /etc/wall-panel/wall-disk.env. The panel has no alert route to the hub
+#   (the telemetry collector has no network by design), so the journal line
+#   and the status file are the whole of the alarm for now.
 # BEGIN log-cap-and-disk-alarm
+logcap_failed() { fail_step "SR-083: $*"; }
+logcap_divert_rsyslog() {   # idempotent; 0 when the stock stanza is diverted to the .distrib path
+    local truename
+    truename="$(dpkg-divert --truename /etc/logrotate.d/rsyslog 2>/dev/null)" || return 1
+    [ "$truename" = /etc/logrotate.rsyslog.distrib ] && return 0
+    [ "$truename" = /etc/logrotate.d/rsyslog ] || return 1   # diverted somewhere else: not ours to move
+    dpkg-divert --local --rename --divert /etc/logrotate.rsyslog.distrib --add /etc/logrotate.d/rsyslog >/dev/null
+}
+logcap_timer_live() {   # UNIT -- restart it on the current definition and prove it is active
+    systemctl restart "$1" >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$1"
+}
 _journald_changed=0
 cmp -s "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf || _journald_changed=1
-install -d -m 0755 /etc/logrotate.d /etc/systemd/system/logrotate.timer.d /etc/systemd/journald.conf.d
-for _logcap in wall-logrotate-rsyslog wall-logrotate-hourly.conf wall-journald.conf wall-disk-check.py wall-disk-check.service wall-disk-check.timer; do
-    [ -f "$PAYLOAD/$_logcap" ] || fail_step "SR-083: $_logcap is missing from the image payload; the syslog cap and the low-disk alarm are NOT fully in place"
-done
-unset _logcap
-[ -f "$PAYLOAD/wall-logrotate-rsyslog" ] &&
-    install -m 0644 "$PAYLOAD/wall-logrotate-rsyslog" /etc/logrotate.d/rsyslog
-[ -f "$PAYLOAD/wall-logrotate-hourly.conf" ] &&
-    install -m 0644 "$PAYLOAD/wall-logrotate-hourly.conf" /etc/systemd/system/logrotate.timer.d/60-wall-hourly.conf
-[ -f "$PAYLOAD/wall-journald.conf" ] &&
-    install -m 0644 "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf
-[ -f "$PAYLOAD/wall-disk-check.py" ] &&
-    install -m 0755 "$PAYLOAD/wall-disk-check.py" /usr/local/sbin/wall-disk-check.py
-[ -f "$PAYLOAD/wall-disk-check.service" ] &&
-    install -m 0644 "$PAYLOAD/wall-disk-check.service" /etc/systemd/system/wall-disk-check.service
-[ -f "$PAYLOAD/wall-disk-check.timer" ] &&
-    install -m 0644 "$PAYLOAD/wall-disk-check.timer" /etc/systemd/system/wall-disk-check.timer
+install -d -m 0755 /etc/logrotate.d /etc/systemd/system/logrotate.timer.d /etc/systemd/journald.conf.d ||
+    logcap_failed "could not create the logrotate/journald drop-in directories"
+if logcap_divert_rsyslog; then
+    install -m 0644 "$PAYLOAD/wall-logrotate-rsyslog" /etc/logrotate.d/rsyslog || logcap_failed "could not install /etc/logrotate.d/rsyslog; the stock stanza is diverted, so syslog is NOT rotated until this is fixed"
+else
+    logcap_failed "could not divert the rsyslog package's /etc/logrotate.d/rsyslog to /etc/logrotate.rsyslog.distrib; the syslog cap is NOT in place"
+fi
+install -m 0644 "$PAYLOAD/wall-logrotate-hourly.conf" /etc/systemd/system/logrotate.timer.d/60-wall-hourly.conf || logcap_failed "could not install the hourly logrotate.timer drop-in"
+install -m 0644 "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf || logcap_failed "could not install the journald drop-in"
+install -m 0755 "$PAYLOAD/wall-disk-check.py" /usr/local/sbin/wall-disk-check.py || logcap_failed "could not install wall-disk-check.py"
+install -m 0644 "$PAYLOAD/wall-disk-check.service" /etc/systemd/system/wall-disk-check.service || logcap_failed "could not install wall-disk-check.service"
+install -m 0644 "$PAYLOAD/wall-disk-check.timer" /etc/systemd/system/wall-disk-check.timer || logcap_failed "could not install wall-disk-check.timer"
+# The media cache path the checker measures is the one THIS script resolved
+# (wall.env's WALL_MEDIA_CACHE, defaulted in step 8), never a second copy of
+# the default. Refused rather than written when it is not a plain absolute
+# path, because systemd's EnvironmentFile parser would read it differently.
+case "$WALL_MEDIA_CACHE" in
+    /*[[:space:]]*|*[\"\'\\]*|'') logcap_failed "WALL_MEDIA_CACHE=$WALL_MEDIA_CACHE is not a plain absolute path; the disk check measures / only" ;;
+    /*)
+{
+cat > /etc/wall-panel/wall-disk.env <<EOF
+# GENERATED by wall-firstboot.sh from WALL_MEDIA_CACHE (SR-083). Read by
+# wall-disk-check.service; edit wall.env and re-run firstboot instead.
+WALL_DISK_MEDIA_PATH=$WALL_MEDIA_CACHE
+EOF
+} || logcap_failed "could not write /etc/wall-panel/wall-disk.env; the disk check falls back to /var/cache/wall-media"
+chmod 0644 /etc/wall-panel/wall-disk.env || logcap_failed "could not chmod /etc/wall-panel/wall-disk.env"
+        ;;
+    *) logcap_failed "WALL_MEDIA_CACHE=$WALL_MEDIA_CACHE is not absolute; the disk check measures / only" ;;
+esac
 systemctl daemon-reload >/dev/null 2>&1 ||
-    warn "SR-083: daemon-reload failed; the hourly logrotate schedule and the disk check apply from the next boot"
+    logcap_failed "daemon-reload failed; the hourly logrotate schedule and the disk check are not loaded"
 if [ "$_journald_changed" = 1 ]; then
     if systemctl restart systemd-journald >/dev/null 2>&1; then
         log "SR-083: journald cap applied (SystemMaxUse=500M, SystemKeepFree=2G)"
@@ -2548,10 +2598,18 @@ if [ "$_journald_changed" = 1 ]; then
     fi
 fi
 unset _journald_changed
-enable_unit "SR-083: syslog capped (daily, maxsize 100M, 7 kept) and logrotate.timer runs hourly" logrotate.timer
-systemctl try-restart logrotate.timer >/dev/null 2>&1 ||
-    warn "SR-083: logrotate.timer did not restart; its hourly schedule applies from the next boot"
-enable_unit_now "SR-083: low-disk alarm enabled (every 15 min; journal 'wall-disk: LOW', /run/wall-disk/status.json)" wall-disk-check.timer
+enable_unit "SR-083: syslog capped (daily, maxsize 100M, 7 kept) and logrotate.timer enabled" logrotate.timer || :
+if logcap_timer_live logrotate.timer; then
+    log "SR-083: logrotate.timer active on its hourly schedule"
+else
+    logcap_failed "logrotate.timer is not active after a restart; maxsize is not being checked hourly"
+fi
+enable_unit "SR-083: low-disk alarm enabled (every 15 min; journal 'wall-disk: LOW', /run/wall-disk/status.json)" wall-disk-check.timer || :
+if logcap_timer_live wall-disk-check.timer; then
+    log "SR-083: wall-disk-check.timer active"
+else
+    logcap_failed "wall-disk-check.timer is not active after a restart; the low-disk alarm is not running"
+fi
 # END log-cap-and-disk-alarm
 
 # ── 9. done — but only if it IS done ─────────────────────────────────────────

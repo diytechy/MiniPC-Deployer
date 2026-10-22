@@ -21,6 +21,10 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
+# WALL_DISK_MEDIA_PATH: the media cache path firstboot resolved from
+# WALL_MEDIA_CACHE. Optional (`-`): without it the script measures the image
+# default, /var/cache/wall-media.
+EnvironmentFile=-/etc/wall-panel/wall-disk.env
 ExecStart=/usr/bin/python3 /usr/local/sbin/wall-disk-check.py
 RuntimeDirectory=wall-disk
 RuntimeDirectoryMode=0755

@@ -241,6 +241,51 @@ def test_tc1397_the_image_bake_follows_the_relay_knob():
 # ── TC-1384 measurement helpers carry no secret ──────────────────────────────
 
 
+def test_tc1384_redact_with_the_settings_removes_every_spelling_and_the_camera(tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    # go2rtc 1.9.14's producer warning on a camera dropout, as the lab showed it
+    line = ('WRN [streams] error="dial tcp 192.0.2.20:554: connect: connection refused" '
+            'url=%s#media=video' % s.upstream_url())
+    out = dr.redact(line, s)
+    for leak in (PASSWORD, "c%40m%20p%24ss%3A1%20%23x", "192.0.2.20"):
+        assert leak not in out, leak
+    assert "<camera>:554" in out and "rtsp://***@" in out
+    token = __import__("base64").b64encode(("admin:" + PASSWORD).encode()).decode()
+    for raw in (PASSWORD, "c%40m%20p%24ss%3A1%20%23x", token):
+        assert dr.redact("a %s b" % raw, s) == "a *** b", raw
+    assert dr.redact("peer 192.0.2.20 closed", s) == "peer <camera> closed"
+    # a longer address that merely starts with the camera's is left alone
+    assert dr.redact("192.0.2.201:554", s) == "192.0.2.201:554"
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX child process and exit status")
+def test_tc1384_redact_run_passes_nothing_secret_and_keeps_the_exit_status(tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    child = ("import sys; print('WRN url=%s'); sys.stdout.flush(); "
+             "sys.stderr.write('ERR pw=%s at 192.0.2.20:554\\n'); sys.exit(3)" % (s.upstream_url(), PASSWORD))
+    out = io.StringIO()
+    assert dr.redact_run(s, [sys.executable, "-c", child], out) == 3
+    text = out.getvalue()
+    assert PASSWORD not in text and "%24ss" not in text and "192.0.2.20" not in text
+    assert "WRN url=rtsp://***@<camera>:554/H.264" in text and "ERR pw=*** at <camera>:554" in text  # both streams
+
+
+def test_tc1384_the_relay_output_has_no_path_but_redact_run():
+    # The unit's ExecStart is the redacting wrapper around the attached `up`...
+    live = [l for l in unit("homehub-door-relay.service").splitlines() if l.startswith("ExecStart=")]
+    assert live == ["ExecStart=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py --env-file "
+                    "/opt/homehub/stack/.env redact-run -- /usr/bin/docker compose --profile door-relay up "
+                    "--no-deps --no-log-prefix --exit-code-from door-relay door-relay"]
+    # ...the container keeps no copy of its own (no json-file / local driver)...
+    assert "logging:\n      driver: none" in compose_block("door-relay")
+
+
+@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="POSIX file modes")
+def test_tc1384_the_render_line_names_no_camera_address(tmp_path, capsys):
+    dr.main(["--env-file", write_env(tmp_path), "render", "--out", str(tmp_path / "run" / "go2rtc.yaml")])
+    assert "192.0.2.20" not in capsys.readouterr().out
+
+
 def test_tc1384_redact_and_the_upstream_count():
     assert dr.redact("x rtsp://admin:p%40ss@192.0.2.20:554/H.264 y") == "x rtsp://***@192.0.2.20:554/H.264 y"
     ss = ("0 0 192.0.2.10:40000 192.0.2.20:554\n"
@@ -400,13 +445,63 @@ def test_tc1395_an_interrupted_segment_is_cut_back_to_its_last_whole_frame(tmp_p
 
 def test_tc1396_continuity_counts_gaps_over_tolerance():
     seg = [(0.0, 600.0), (600.5, 600.0), (1230.0, 570.0), (1800.0, 600.0)]
-    c = rec.continuity(seg)
+    c = rec.continuity(seg, 0.0, 2400.0)
     assert c["gaps"] == 1 and c["downtime_seconds"] == 29.5 and c["pass"]
     many = [(i * 700.0, 600.0) for i in range(6)]  # five 100 s gaps
-    c = rec.continuity(many)
+    c = rec.continuity(many, 0.0, 4100.0)
     assert c["gaps"] == 5 and not c["pass"]
     long_gap = [(0.0, 600.0), (1000.0, 600.0)]
-    assert not rec.continuity(long_gap)["pass"]  # 400 s > 5 min
+    assert not rec.continuity(long_gap, 0.0, 1600.0)["pass"]  # 400 s > 5 min
+
+
+DAY = 86400.0
+
+
+def test_tc1396_no_recording_or_a_short_one_never_passes_a_window():
+    c = rec.continuity([], 0.0, DAY)
+    assert not c["pass"] and c["segments"] == 0 and c["gap_list"][0]["kind"] == "empty"
+    # even a window shorter than the downtime allowance: no segment is no pass
+    assert not rec.continuity([], 0.0, 60.0)["pass"]
+    # one ten-second segment at the end of a 24 h window: the rest is downtime
+    c = rec.continuity([(DAY - 10.0, 10.0)], 0.0, DAY)
+    assert not c["pass"] and c["gap_list"][0]["kind"] == "leading" and c["downtime_seconds"] == DAY - 10.0
+
+
+def test_tc1396_both_edges_of_the_window_count():
+    full = [(i * 600.0, 600.0) for i in range(144)]  # 24 h, back to back
+    assert rec.continuity(full, 0.0, DAY)["pass"]
+    # the recorder stopped 301 s before the check: a trailing gap over 300 s
+    c = rec.continuity(full, 0.0, DAY + 301.0)
+    assert not c["pass"] and c["gap_list"] == [{"kind": "trailing", "after": DAY, "seconds": 301.0}]
+    # a late start likewise
+    assert not rec.continuity(full[1:], 0.0, DAY)["pass"]  # 600 s before the first segment
+    # the edge allowance (first keyframe, the open segment's last frame) is not downtime
+    assert rec.continuity(full, -10.0, DAY + 10.0)["gaps"] == 0
+    # a segment that began before the window covers its start (clipped, not a gap)
+    assert rec.continuity(full, 300.0, DAY)["pass"]
+
+
+def test_tc1396_the_verb_reads_the_window_and_the_open_part(tmp_path, capsys):
+    t0 = 1792667254.0
+    day, name = rec.segment_name(t0)
+    ddir = tmp_path / day
+    ddir.mkdir()
+    (ddir / name).write_bytes(b"".join(stream(101)))  # 10.0 s
+    part = ddir / (rec.segment_name(t0 + 10.0)[1] + ".part")
+    part.write_bytes(b"".join(stream(101)))           # the segment being written, 10.0 s so far
+
+    def verdict(*extra):
+        code = rec.main(["continuity", "--root", str(tmp_path)] + list(extra))
+        return code, json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    code, c = verdict("--since", "%d" % t0, "--until", "2026-10-22T11:07:54Z")  # t0 + 20 s
+    assert code == 0 and c["segments"] == 2 and c["gaps"] == 0
+    part.unlink()
+    code, c = verdict("--since", "%d" % t0, "--until", "%d" % (t0 + 40))
+    assert c["gaps"] == 1 and c["downtime_seconds"] == 30.0  # 30 s uncovered at the end: counted
+    assert c["gap_list"][-1]["kind"] == "trailing"
+    code, c = verdict("--hours", "1", "--until", "%d" % (t0 + 10))  # 59m50s before the first segment
+    assert code == 1 and c["gap_list"][0]["kind"] == "leading"
 
 
 def test_tc1396_segment_names_are_utc_and_parse_back():
@@ -420,3 +515,106 @@ def test_tc1396_ts_duration_from_pts(tmp_path):
     f = tmp_path / "s.ts"
     f.write_bytes(b"".join(stream(101)))  # 10 fps, frames 0..100 -> 10 s
     assert rec.ts_duration(str(f)) == pytest.approx(10.0)
+
+
+# ── TC-1399 the gate's verdicts: probe success, geometry, survivor progress ──
+
+
+HEALTHY = {"rc": 0, "codec": "h264", "width": 1536, "height": 1536, "packets": 50, "rate": "10/1"}
+PROGRESS = [{"consumers": 1, "sent_bytes": 1000}, {"consumers": 1, "sent_bytes": 9000}]
+
+
+class FakeConsumer:
+    def poll(self):
+        return None  # always "running": liveness alone must not be enough
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def run_gate(monkeypatch, tmp_path, capsys, probe_result=None, counters=None, **env):
+    s = dr.RelaySettings(write_env(tmp_path, **env))
+    monkeypatch.setattr(dr, "probe", lambda *a, **k: dict(probe_result or HEALTHY))
+    monkeypatch.setattr(dr, "upstream_count", lambda _s: 1)
+    monkeypatch.setattr(dr, "streams", lambda _s: {"producers": 1, "consumers": 2})
+    seq = iter(PROGRESS if counters is None else counters)
+    monkeypatch.setattr(dr, "consumer_bytes", lambda _s: next(seq))
+    monkeypatch.setattr(dr, "image_ref", lambda: "example/go2rtc:1@sha256:0")
+    monkeypatch.setattr(dr.subprocess, "Popen", lambda *a, **k: FakeConsumer())
+    monkeypatch.setattr(dr.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(dr.time, "sleep", lambda _x: None)
+    code = dr.gate(s, 1)
+    lines = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith("{")]
+    assert lines[-1]["check"] == "gate-hub-half" and lines[-1]["pass"] is (code == 0)
+    return code, {l["check"]: l for l in lines}
+
+
+needs_fchmod = pytest.mark.skipif(not hasattr(os, "fchmod"), reason="POSIX file modes (the gate's env files)")
+
+
+@needs_fchmod
+def test_tc1399_a_healthy_relay_passes_the_hub_half(monkeypatch, tmp_path, capsys):
+    code, checks = run_gate(monkeypatch, tmp_path, capsys)
+    assert code == 0 and checks["one-consumer-left"]["survivor_progressing"]
+    assert checks["readiness+geometry"]["reasons"] == []
+
+
+@needs_fchmod
+@pytest.mark.parametrize("bad, words", [
+    ({"rc": 1}, "probe exited 1"),
+    ({"rc": 1, "packets": 1, "width": 320, "height": 240}, "geometry 320x240"),  # the review's own case
+    ({"width": 1280, "height": 720}, "expected 1536x1536"),
+    ({"codec": "hevc"}, "codec 'hevc'"),
+    ({"packets": 0}, "no packets"),
+])
+def test_tc1399_a_failed_probe_or_altered_stream_fails_the_gate(monkeypatch, tmp_path, capsys, bad, words):
+    code, checks = run_gate(monkeypatch, tmp_path, capsys, probe_result=dict(HEALTHY, **bad))
+    assert code == 1
+    assert any(words in r for r in checks["readiness+geometry"]["reasons"]), checks["readiness+geometry"]
+
+
+@needs_fchmod
+def test_tc1399_the_expected_stream_is_a_knob(monkeypatch, tmp_path, capsys):
+    code, _ = run_gate(monkeypatch, tmp_path, capsys, probe_result=dict(HEALTHY, codec="hevc", width=960, height=960),
+                       DOOR_RELAY_EXPECT_CODEC="hevc", DOOR_RELAY_EXPECT_SIZE="960x960")
+    assert code == 0
+    with pytest.raises(dr.Invalid, match="DOOR_RELAY_EXPECT_SIZE"):
+        dr.RelaySettings(write_env(tmp_path, DOOR_RELAY_EXPECT_SIZE="big"))
+
+
+@needs_fchmod
+@pytest.mark.parametrize("counters", [
+    [{"consumers": 1, "sent_bytes": 5000}, {"consumers": 1, "sent_bytes": 5000}],  # frozen
+    [None, None],                                                                    # API silent
+    [{"consumers": 1, "sent_bytes": 5000}, {"consumers": 0, "sent_bytes": 9000}],  # survivor gone
+])
+def test_tc1399_a_survivor_that_is_running_but_not_being_sent_video_fails(monkeypatch, tmp_path, capsys, counters):
+    code, checks = run_gate(monkeypatch, tmp_path, capsys, counters=counters)
+    assert code == 1 and checks["one-consumer-left"]["survivor_running"] is True
+    assert checks["one-consumer-left"]["survivor_progressing"] is False
+
+
+def test_tc1399_the_probe_verb_uses_the_same_verdict(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(dr, "probe", lambda *a, **k: dict(HEALTHY, width=320, height=240))
+    assert dr.main(["--env-file", write_env(tmp_path), "probe", "--seconds", "1"]) == 1
+    monkeypatch.setattr(dr, "probe", lambda *a, **k: dict(HEALTHY))
+    assert dr.main(["--env-file", write_env(tmp_path), "probe", "--seconds", "1"]) == 0
+
+
+def test_tc1399_consumer_bytes_reads_the_senders_counters_of_the_pinned_api(monkeypatch, tmp_path):
+    # The shape go2rtc 1.9.14 returned in the lab for one RTSP consumer (trimmed):
+    # no connection-level counter; each sender carries its own bytes/packets.
+    s = dr.RelaySettings(write_env(tmp_path))
+    entry = {"producers": [{"bytes_recv": 287315}],
+             "consumers": [{"format_name": "rtsp", "senders": [{"id": 4, "parent": 3, "bytes": 284579, "packets": 228}]},
+                           {"format_name": "rtsp", "senders": [{"id": 6, "bytes": 1000}, {"id": 7}]}]}
+    monkeypatch.setattr(dr, "api_stream", lambda _s: entry)
+    assert dr.consumer_bytes(s) == {"consumers": 2, "sent_bytes": 285579}
+
+    def down(_s):
+        raise OSError("connection refused")
+    monkeypatch.setattr(dr, "api_stream", down)
+    assert dr.consumer_bytes(s) is None

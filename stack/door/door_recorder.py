@@ -12,8 +12,10 @@ quota. ffmpeg's own segment muxer would open the next file itself, between two
 guard checks.
 
     run          the service (homehub-door-recorder.service).
-    continuity   gaps between consecutive segments, computed from the segments
-                 themselves (file start time + PTS duration), for the 24 h check.
+    continuity   downtime in a window (--hours back from now, or --since /
+                 --until), computed from the segments themselves (file start
+                 time + PTS duration, the open .part included): every gap
+                 between segments and both uncovered edges of the window.
     verify       decode a set of segments with ffmpeg -v error (via the image).
 
 Layout: /srv/scratch/door/YYYY-MM-DD/door-YYYYmmddTHHMMSSZ.ts (UTC, so a DST
@@ -206,8 +208,9 @@ def segment_name(now: float) -> Tuple[str, str]:
 
 
 def segment_start(name: str) -> Optional[float]:
-    """The UTC epoch second a segment's file name says it started, or None."""
-    m = SEGMENT_RE.search(name)
+    """The UTC epoch second a segment's file name says it started, or None.
+    A `.ts.part` (the segment being written) parses as its final name."""
+    m = SEGMENT_RE.search(name[:-len(".part")] if name.endswith(".ts.part") else name)
     if not m:
         return None
     return float(calendar.timegm(time.strptime(m.group(1), "%Y%m%dT%H%M%S")))
@@ -292,22 +295,64 @@ def ts_duration(path: str, max_bytes: int = 64 * MIB) -> Optional[float]:
     return ((last - first) % (1 << 33)) / 90000.0
 
 
-def continuity(segments: List[Tuple[float, float]], tolerance: float = 2.0) -> Dict[str, object]:
-    """Gaps between consecutive segments [(start, duration)], sorted by start.
+EDGE_TOLERANCE = 15.0
 
-    A gap over `tolerance` seconds is downtime (a relay or recorder restart);
-    the rule for the 24 h acceptance is at most 3 such gaps and 5 minutes total.
+
+def continuity(segments: List[Tuple[float, float]], window_start: float, window_end: float,
+               tolerance: float = 2.0, edge_tolerance: float = EDGE_TOLERANCE) -> Dict[str, object]:
+    """Downtime in [window_start, window_end] from segments [(start, duration)].
+
+    The segments are clipped to the window. Downtime is every stretch they do
+    not cover: between consecutive segments over `tolerance` (a relay or
+    recorder restart), and at either EDGE over `edge_tolerance` - before the
+    first segment (the recorder was not yet recording) and after the last (it
+    stopped, or nothing has been written since). The edge allowance is wider
+    because a run's first keyframe and the open segment's last frame trail the
+    wall clock by the source's latency and up to a GOP. No segment in the
+    window is the whole window down. The rule for the 24 h acceptance: at most
+    3 gaps and 5 minutes in total.
+    Implements: LLR-1235.
     """
-    gaps = []
-    for (s0, d0), (s1, _d1) in zip(segments, segments[1:]):
-        gap = s1 - (s0 + d0)
-        if gap > tolerance:
-            gaps.append({"after": s0 + d0, "seconds": round(gap, 1)})
+    rows = sorted((s, d) for s, d in segments if s < window_end and s + d > window_start)
+    gaps: List[Dict[str, object]] = []
+    cursor = window_start
+    for i, (s0, d0) in enumerate(rows):
+        gap = s0 - cursor
+        if gap > (edge_tolerance if i == 0 else tolerance):
+            gaps.append({"kind": "leading" if i == 0 else "between", "after": cursor, "seconds": round(gap, 1)})
+        cursor = max(cursor, s0 + d0)
+    tail = window_end - cursor
+    if tail > edge_tolerance:
+        gaps.append({"kind": "trailing" if rows else "empty", "after": cursor, "seconds": round(tail, 1)})
     total = sum(g["seconds"] for g in gaps)
-    span = (segments[-1][0] + segments[-1][1] - segments[0][0]) if segments else 0.0
-    return {"segments": len(segments), "span_hours": round(span / 3600.0, 2), "gaps": len(gaps),
+    covered = sum(max(0.0, min(s0 + d0, window_end) - max(s0, window_start)) for s0, d0 in rows)
+    return {"segments": len(rows), "window_hours": round((window_end - window_start) / 3600.0, 2),
+            "covered_hours": round(covered / 3600.0, 2), "gaps": len(gaps),
             "downtime_seconds": round(total, 1), "gap_list": gaps,
-            "pass": len(gaps) <= 3 and total <= 300}
+            "pass": bool(rows) and len(gaps) <= 3 and total <= 300}
+
+
+def list_parts(root: str) -> List[str]:
+    """Paths of the `.ts.part` files under root (the segment being written)."""
+    out = []
+    try:
+        days = sorted(d for d in os.listdir(root) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d))
+    except OSError:
+        return out
+    for day in days:
+        try:
+            out += [os.path.join(root, day, n) for n in sorted(os.listdir(os.path.join(root, day)))
+                    if n.endswith(".ts.part") and segment_start(n) is not None]
+        except OSError:
+            pass
+    return out
+
+
+def parse_when(text: str) -> float:
+    """An epoch second, or UTC ISO 8601 YYYY-mm-ddTHH:MM:SSZ, as an epoch second."""
+    if re.fullmatch(r"[0-9]+(\.[0-9]+)?", text):
+        return float(text)
+    return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
 
 
 # ── the service ──────────────────────────────────────────────────────────────
@@ -565,7 +610,7 @@ def run_service(env_file: str) -> int:
 
     def relay_stderr():
         for line in proc.stderr:
-            mc.log("door recorder: ffmpeg: " + door_relay.redact(line.decode("utf-8", "replace").rstrip()))
+            mc.log("door recorder: ffmpeg: " + door_relay.redact(line.decode("utf-8", "replace").rstrip(), relay))
     threading.Thread(target=relay_stderr, daemon=True).start()
     mc.log("door recorder: reading /%s from the relay at %s:%d; %ds segments into %s, cap %d MiB"
            % (relay.stream, relay.lan_ip, relay.rtsp_port, rs.segment_sec, root, rs.cap_mib))
@@ -594,7 +639,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub.add_parser("run")
     c = sub.add_parser("continuity")
     c.add_argument("--root", default=os.path.join(scratch.MOUNTPOINT, "door"))
-    c.add_argument("--hours", type=float, default=24.0)
+    c.add_argument("--hours", type=float, default=24.0, help="the window: this many hours back from --until")
+    c.add_argument("--since", help="window start instead (epoch or UTC YYYY-mm-ddTHH:MM:SSZ), e.g. the "
+                                   "moment the recorder was started for a test")
+    c.add_argument("--until", help="window end (default now)")
     v = sub.add_parser("verify")
     v.add_argument("paths", nargs="+")
     args = p.parse_args(argv)
@@ -605,15 +653,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             mc.log("door recorder: REFUSED - %s" % exc, warning=True)
             return 2
     if args.verb == "continuity":
-        cutoff = time.time() - args.hours * 3600
+        try:
+            window_end = parse_when(args.until) if args.until else time.time()
+            window_start = parse_when(args.since) if args.since else window_end - args.hours * 3600
+        except ValueError:
+            mc.log("door recorder: --since/--until must be an epoch second or YYYY-mm-ddTHH:MM:SSZ", warning=True)
+            return 2
         rows = []
-        for path, _size in list_segments(args.root):
+        # Every finished segment that can overlap the window (one that started
+        # up to an hour before it may still cover its first minutes), and the
+        # open .part, which is the recording in progress.
+        paths = [p for p, _size in list_segments(args.root)] + list_parts(args.root)
+        for path in paths:
             start = segment_start(os.path.basename(path))
-            if start is None or start < cutoff:
+            if start is None or start < window_start - 3600 or start >= window_end:
                 continue
             duration = ts_duration(path)
             rows.append((start, duration or 0.0))
-        result = continuity(sorted(rows))
+        result = continuity(rows, window_start, window_end)
         print(json.dumps(result, sort_keys=True))
         return 0 if result["pass"] else 1
     if args.verb == "verify":

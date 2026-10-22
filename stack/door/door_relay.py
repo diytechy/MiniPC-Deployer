@@ -18,6 +18,12 @@ Verbs:
                       `door-cutover-panel.sh export-upstream` prints), and write
                       them into the stack .env as DOOR_RELAY_UPSTREAM_*. Prints
                       key names only, never a value; the value never sees argv.
+    redact-run -- CMD the relay unit's ExecStart wrapper: runs CMD (the attached
+                      `docker compose up`) with its stdout and stderr merged
+                      through redact(), line by line, so nothing go2rtc prints
+                      - its producer warns with the whole camera URL when the
+                      camera drops - reaches the journal with the credential or
+                      the camera's address in it. Exits with CMD's status.
     streams           the relay API's producer/consumer counts, URLs redacted.
     upstream-count    established TCP connections from this host to the camera.
     probe             read SECONDS of the relay with the doorbell's credential (a
@@ -45,6 +51,7 @@ import base64
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -111,7 +118,9 @@ class RelaySettings:
       Config:  LAN_IP; DOOR_RELAY_RTSP_PORT (8554), DOOR_RELAY_API_PORT (1984),
                DOOR_RELAY_STREAM (door); DOOR_RELAY_UPSTREAM_HOST (an IPv4
                address), _PORT (554), _PATH (/H.264), _USERNAME (admin) and
-               _PASSWORD (required; from the deploy store).  [stack/.env]
+               _PASSWORD (required; from the deploy store);
+               DOOR_RELAY_EXPECT_CODEC (h264) and DOOR_RELAY_EXPECT_SIZE
+               (1536x1536): what the readiness gate requires.  [stack/.env]
       Raises:  Invalid naming the key, never its value.
     """
 
@@ -144,6 +153,15 @@ class RelaySettings:
         for key, value in (("USERNAME", self.username), ("PASSWORD", self.password)):
             if not value or re.search(r"[\r\n\0]", value):
                 raise Invalid("DOOR_RELAY_UPSTREAM_%s is missing or holds a control character" % key)
+        # What the readiness gate requires the relay to deliver: the camera's
+        # own stream, unchanged (raw fisheye, measured on the panel 2026-10-22).
+        self.expect_codec = plain("DOOR_RELAY_EXPECT_CODEC", "h264")
+        if not re.fullmatch(r"[a-z0-9_]{1,32}", self.expect_codec):
+            raise Invalid("DOOR_RELAY_EXPECT_CODEC must be an ffprobe codec name such as h264")
+        size = re.fullmatch(r"([0-9]{2,5})x([0-9]{2,5})", plain("DOOR_RELAY_EXPECT_SIZE", "1536x1536"))
+        if not size:
+            raise Invalid("DOOR_RELAY_EXPECT_SIZE must be WIDTHxHEIGHT")
+        self.expect_width, self.expect_height = int(size.group(1)), int(size.group(2))
 
     @staticmethod
     def _port(text: str, key: str) -> int:
@@ -183,6 +201,10 @@ def relay_config(s: RelaySettings) -> Dict[str, object]:
         "webrtc": {"listen": ""},
         "srtp": {"listen": ""},
         "rtmp": {"listen": ""},
+        # info, deliberately: the producer's reconnect warnings are the only
+        # record of a camera dropout. They carry the credentialed URL, so the
+        # relay's output reaches the journal ONLY through `redact-run`, and the
+        # compose service logs to no driver at all (LLR-1225).
         "log": {"level": "info", "format": "text"},
         "streams": {s.stream: s.upstream_url() + "#media=video"},
     }
@@ -292,24 +314,106 @@ def import_upstream(env_file: str, blob: bytes) -> List[str]:
 # ── measurement ──────────────────────────────────────────────────────────────
 
 
-def redact(text: str) -> str:
-    """Credentials in any rtsp:// URL become ***; applied to every relayed line."""
-    return SECRET_URL_RE.sub(r"\1***@", text)
+def secret_forms(s: RelaySettings) -> List[str]:
+    """Every spelling of the credential a log line could carry, longest first:
+    the password raw and percent-encoded (both quote() variants), and the
+    HTTP Basic token the API is reached with."""
+    forms = {s.password, urllib.parse.quote(s.password, safe=""), urllib.parse.quote(s.password),
+             base64.b64encode(("%s:%s" % (s.username, s.password)).encode()).decode()}
+    return sorted((f for f in forms if f), key=len, reverse=True)
 
 
-def streams(s: RelaySettings) -> Dict[str, object]:
-    """The relay API's view of our stream: producer and consumer counts."""
+def redact(text: str, s: Optional[RelaySettings] = None) -> str:
+    """Credentials in any rtsp:// URL become ***; applied to every relayed line.
+
+    With the settings it also removes every other spelling of the password
+    (secret_forms) and the camera's address: `host:port` always, and the bare
+    host unless it is a loopback address (a lab camera on 127.x would otherwise
+    blank the API's own listen line). The camera's address is a household value
+    the journal does not need: the port is kept, the host becomes <camera>.
+    Implements: LLR-1226.
+    """
+    text = SECRET_URL_RE.sub(r"\1***@", text)
+    if s is None:
+        return text
+    for form in secret_forms(s):
+        text = text.replace(form, "***")
+    text = text.replace("%s:%d" % (s.host, s.port), "<camera>:%d" % s.port)
+    if not s.host.startswith("127."):
+        text = re.sub(r"(?<![0-9.])%s(?![0-9])" % re.escape(s.host), "<camera>", text)
+    return text
+
+
+def redact_run(s: RelaySettings, argv: Sequence[str], out=None) -> int:
+    """Run argv with stdout+stderr merged through redact(), one line at a time
+    (the relay unit's ExecStart). SIGTERM/SIGINT/SIGHUP are passed to the child;
+    the child's exit status is returned (128+N for a signal). Nothing is
+    buffered past a line, so the journal keeps go2rtc's timing.
+    Implements: LLR-1225, LLR-1226.
+    """
+    out = out or sys.stdout
+    proc = subprocess.Popen(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
+
+    def forward(sig, _frame):
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
+    previous = {}
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:  # SIGHUP does not exist on the dev PC's Windows Python
+            continue
+        try:
+            previous[sig] = signal.signal(sig, forward)
+        except ValueError:  # not the main thread: nothing to forward
+            pass
+    try:
+        for raw in iter(proc.stdout.readline, b""):
+            out.write(redact(raw.decode("utf-8", "replace").rstrip("\r\n"), s) + "\n")
+            out.flush()
+        rc = proc.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return rc if rc >= 0 else 128 - rc
+
+
+def api_stream(s: RelaySettings) -> Dict[str, object]:
+    """The relay API's entry for our stream (GET /api/streams, Basic auth)."""
     req = urllib.request.Request("http://127.0.0.1:%d/api/streams" % s.api_port)
     token = base64.b64encode(("%s:%s" % (s.username, s.password)).encode()).decode()
     req.add_header("Authorization", "Basic " + token)
     with urllib.request.urlopen(req, timeout=5) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    entry = data.get(s.stream) or {}
+    return data.get(s.stream) or {}
+
+
+def streams(s: RelaySettings) -> Dict[str, object]:
+    """The relay API's view of our stream: producer and consumer counts."""
+    entry = api_stream(s)
     producers = entry.get("producers") or []
     consumers = entry.get("consumers") or []
     return {"stream": s.stream, "producers": len(producers), "consumers": len(consumers),
-            "producer_states": [redact(json.dumps({k: v for k, v in p.items() if k in ("url", "remote_addr", "state")}))
+            "producer_states": [redact(json.dumps({k: v for k, v in p.items() if k in ("url", "remote_addr", "state")}), s)
                                 for p in producers]}
+
+
+def consumer_bytes(s: RelaySettings) -> Optional[Dict[str, int]]:
+    """{consumers, sent_bytes}: how many consumers the relay is serving and the
+    bytes it has sent them in total. Measured on the pinned 1.9.14 (lab,
+    2026-10-22): an RTSP consumer carries no connection-level counter; each of
+    its `senders` carries its own `bytes` (and `packets`), which is what is
+    summed. A missing field counts 0, so a renamed one can only ever read as
+    no progress. None when the API cannot answer, which a caller must read as
+    "no evidence", never as progress."""
+    try:
+        consumers = api_stream(s).get("consumers") or []
+    except (OSError, ValueError):
+        return None
+    total = sum(int(sender.get("bytes") or 0) for c in consumers for sender in (c.get("senders") or []))
+    return {"consumers": len(consumers), "sent_bytes": total}
 
 
 def count_established(text: str, host: str, port: int) -> int:
@@ -363,7 +467,7 @@ def probe(s: RelaySettings, seconds: int = 10, name: str = "homehub-door-probe")
         ['exec ffprobe -v error -rtsp_transport tcp -select_streams v:0 -count_packets',
          '-read_intervals "%%+%d" -show_entries stream=codec_name,width,height,nb_read_packets,avg_frame_rate'
          % seconds, '-of json "$DOOR_URL"'], s.consumer_url(), seconds, name)
-    out: Dict[str, object] = {"rc": done.returncode, "stderr": redact(done.stderr.strip())[-400:]}
+    out: Dict[str, object] = {"rc": done.returncode, "stderr": redact(done.stderr.strip(), s)[-400:]}
     try:
         stream = (json.loads(done.stdout).get("streams") or [{}])[0]
         out.update(codec=stream.get("codec_name"), width=stream.get("width"), height=stream.get("height"),
@@ -482,23 +586,50 @@ def emit(record: Dict[str, object]) -> None:
     print(json.dumps(record, sort_keys=True), flush=True)
 
 
-def gate(s: RelaySettings, seconds: int) -> int:
+def probe_verdict(result: Dict[str, object], s: RelaySettings) -> List[str]:
+    """Why a probe result is NOT a readiness pass ([] = it is): the probe must
+    exit 0, parse, count packets, and see exactly the expected codec and size.
+    Used by `probe` and by the gate, so the two cannot disagree.
+    Implements: LLR-1226."""
+    reasons = []
+    if result.get("rc") != 0:
+        reasons.append("probe exited %r" % result.get("rc"))
+    if result.get("parse_error"):
+        reasons.append("probe output did not parse")
+    if not isinstance(result.get("packets"), int) or result["packets"] <= 0:
+        reasons.append("no packets read")
+    if result.get("codec") != s.expect_codec:
+        reasons.append("codec %r, expected %r" % (result.get("codec"), s.expect_codec))
+    if (result.get("width"), result.get("height")) != (s.expect_width, s.expect_height):
+        reasons.append("geometry %sx%s, expected %dx%d" % (result.get("width"), result.get("height"),
+                                                          s.expect_width, s.expect_height))
+    return reasons
+
+
+def gate(s: RelaySettings, seconds: int, progress_sec: int = 5) -> int:
     """The hub half of the compatibility gate (plan W4b task 8). The panel's
     broker must already be suppressed; the relay running. Prints JSON lines and
     returns 0 only when every measured property holds.
 
-    1. readiness: a test consumer with the doorbell's credential decodes video;
-    2. geometry: the codec and size the camera sends (1536x1536 expected);
+    1. readiness: a test consumer with the doorbell's credential reads video:
+       the probe exits 0 and counts packets (probe_verdict);
+    2. geometry: exactly the codec and size the camera sends
+       (DOOR_RELAY_EXPECT_CODEC, DOOR_RELAY_EXPECT_SIZE: h264, 1536x1536);
     3. two simultaneous consumers, exactly one upstream session (ss) and one
        producer (the relay's API);
-    4. one consumer ends, the other keeps receiving and the upstream stays.
+    4. one consumer ends, the upstream stays, and the other is still being
+       SENT video: the relay's byte counter for its consumers grows over
+       `progress_sec` - a live process alone is not progress, since a
+       `-c copy -f null` consumer with no input timeout survives a stall.
     The relay restart, camera dropout and segment decode checks are separate
     commands in the README's gate procedure because they act on units.
+    Implements: LLR-1226.
     """
     ok = True
     first = probe(s, seconds, "homehub-door-gate-1")
-    emit({"check": "readiness+geometry", **first})
-    ok &= first.get("packets", 0) > 0
+    reasons = probe_verdict(first, s)
+    emit({"check": "readiness+geometry", "pass": not reasons, "reasons": reasons, **first})
+    ok &= not reasons
     procs = []
     for n in (2, 3):
         fd, envfile = tempfile.mkstemp(prefix="door-gate-", suffix=".env")
@@ -521,10 +652,18 @@ def gate(s: RelaySettings, seconds: int) -> int:
     subprocess.run(["docker", "rm", "-f", "homehub-door-gate-2"], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=30)
     time.sleep(5)
+    before = consumer_bytes(s)
+    time.sleep(progress_sec)
+    later = consumer_bytes(s)
     after = {"check": "one-consumer-left", "upstream_connections": upstream_count(s),
-             "survivor_running": procs[1][0].poll() is None}
+             "survivor_running": procs[1][0].poll() is None,
+             "consumers": later["consumers"] if later else None,
+             "survivor_sent_bytes": [b["sent_bytes"] if b else None for b in (before, later)],
+             "progress_sec": progress_sec}
+    after["survivor_progressing"] = bool(before and later and later["consumers"] >= 1
+                                         and later["sent_bytes"] > before["sent_bytes"])
     emit(after)
-    ok &= after["upstream_connections"] == 1 and after["survivor_running"]
+    ok &= after["upstream_connections"] == 1 and after["survivor_running"] and after["survivor_progressing"]
     for proc, envfile in procs:
         subprocess.run(["docker", "rm", "-f", "homehub-door-gate-2", "homehub-door-gate-3"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
@@ -546,12 +685,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     r = sub.add_parser("render")
     r.add_argument("--out", default=CONFIG_PATH)
     sub.add_parser("import-upstream")
+    rr = sub.add_parser("redact-run")
+    rr.add_argument("cmd", nargs=argparse.REMAINDER, help="-- CMD ARGS...: the command to run redacted")
     sub.add_parser("streams")
     sub.add_parser("upstream-count")
     pr = sub.add_parser("probe")
     pr.add_argument("--seconds", type=int, default=10)
     g = sub.add_parser("gate")
     g.add_argument("--seconds", type=int, default=10)
+    g.add_argument("--progress-seconds", type=int, default=5,
+                   help="how long the survivor's byte counter is watched for growth")
     co = sub.add_parser("cost")
     co.add_argument("--seconds", type=int, default=1800)
     co.add_argument("--cgroup", action="append", default=[], help="LABEL=/sys/fs/cgroup/... (repeatable)")
@@ -574,10 +717,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if args.verb == "render":
         write_private(args.out, (json.dumps(relay_config(s), indent=1) + "\n").encode("utf-8"))
+        # The camera's address is not logged: the journal has no need of it.
         mc.log("door: relay config written to %s (0600): rtsp %s:%d (auth), api 127.0.0.1:%d (auth), "
-               "webrtc/srtp/rtmp off, stream /%s from %s:%d (video only)"
-               % (args.out, s.lan_ip, s.rtsp_port, s.api_port, s.stream, s.host, s.port))
+               "webrtc/srtp/rtmp off, stream /%s from the camera on port %d (video only)"
+               % (args.out, s.lan_ip, s.rtsp_port, s.api_port, s.stream, s.port))
         return 0
+    if args.verb == "redact-run":
+        cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
+        if not cmd:
+            mc.log("door: redact-run needs -- CMD", warning=True)
+            return 2
+        return redact_run(s, cmd)
     if args.verb == "streams":
         emit(streams(s))
         return 0
@@ -586,10 +736,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     if args.verb == "probe":
         result = probe(s, args.seconds)
-        emit(result)
-        return 0 if result.get("packets", 0) > 0 else 1
+        reasons = probe_verdict(result, s)
+        emit(dict(result, **{"pass": not reasons, "reasons": reasons}))
+        return 0 if not reasons else 1
     if args.verb == "gate":
-        return gate(s, args.seconds)
+        return gate(s, args.seconds, args.progress_seconds)
     if args.verb == "cost":
         decoder = start_grey_decoder(s, args.decode_grey_fps) if args.decode_grey_fps else None
         try:

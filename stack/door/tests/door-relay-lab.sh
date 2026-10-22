@@ -28,7 +28,15 @@
 #     with `ffmpeg -v error` and carry no audio stream;
 #   7 a relay restart mid-recording ends the run; the next run resumes, and
 #     continuity reports exactly that one gap;
-#   8 nothing in the relay's or the recorder's logs carries the password.
+#   8 nothing in the relay's or the recorder's logs carries the password;
+#   9 the cost sampler measures the relay and a 5 fps grey decoder;
+#  10 the relay run EXACTLY as its unit runs it (the unit file's own
+#     ExecStartPre/ExecStart/ExecStop/ExecStopPost, /opt/homehub/stack moved to
+#     a lab stack holding the real docker-compose.yml) with the CAMERA killed
+#     under a live consumer - go2rtc's producer then warns with its whole
+#     upstream URL: the unit's output (what the journal gets) shows that warning
+#     redacted, and neither it nor docker holds the password or the camera's
+#     host:port (the container has no log driver to hold anything).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DOOR="$(cd "$HERE/.." && pwd)"
@@ -38,9 +46,12 @@ WORK="$(mktemp -d /tmp/door-lab.XXXXXX)"
 PASS=0 FAIL=0
 ok()   { PASS=$((PASS + 1)); echo "PASS $*"; }
 bad()  { FAIL=$((FAIL + 1)); echo "FAIL $*"; }
+RELAY_RUN=/run/homehub-door-relay   # the unit's RuntimeDirectory; check 10 renders into it
+RELAY_RUN_OURS=""
 cleanup() {
     docker rm -f door-lab-cam door-lab-relay homehub-door-recorder homehub-door-probe \
-        homehub-door-gate-1 homehub-door-gate-2 homehub-door-gate-3 >/dev/null 2>&1
+        homehub-door-gate-1 homehub-door-gate-2 homehub-door-gate-3 homehub-door-relay >/dev/null 2>&1
+    [ -z "$RELAY_RUN_OURS" ] || rm -rf "$RELAY_RUN"
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -157,10 +168,12 @@ subprocess.run(["docker", "rm", "-f", dr.CONTAINER], stdout=subprocess.DEVNULL, 
 print("consume returned", code)
 PY
 }
+T_SINCE="$(date +%s)"
 record 50 "$WORK/rec1.log"
 ( sleep 15; docker restart door-lab-relay >/dev/null ) &
 record 45 "$WORK/rec2.log"; wait
 record 30 "$WORK/rec3.log"
+T_UNTIL="$(date +%s)"
 segs="$(find "$WORK/door" -name 'door-*.ts' | sort)"
 nseg="$(printf '%s\n' "$segs" | grep -c . || true)"
 # Decode every segment, and count audio streams in each (there must be none).
@@ -176,9 +189,14 @@ if [ "$nseg" -ge 5 ] && [ "$badseg" = 0 ] && [ "$audio" = 0 ]; then
 else bad "6 recorder: segments=$nseg undecodable=$badseg audio-streams=$audio"; fi
 grep -q "consume returned 1" "$WORK/rec2.log" && ok "7a the relay restart ended the second run (systemd restarts it)" \
     || bad "7a run 2 did not end on the relay restart: $(tail -3 "$WORK/rec2.log")"
-cont="$(python3 "$DOOR/door_recorder.py" continuity --root "$WORK/door" --hours 1)"
-echo "$cont" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if 1 <= d["gaps"] <= 3 else 1)' \
-    && ok "7b continuity sees the restarts as gaps: $cont" || bad "7b continuity: $cont"
+# The window is the three runs' own (--since/--until): the gaps BETWEEN segments
+# are the restarts; the edges are the first keyframe wait and the last stop.
+cont="$(python3 "$DOOR/door_recorder.py" continuity --root "$WORK/door" --since "$T_SINCE" --until "$T_UNTIL")"
+echo "$cont" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+between = [g for g in d["gap_list"] if g["kind"] == "between"]
+sys.exit(0 if 1 <= len(between) <= 3 and d["segments"] >= 5 else 1)' \
+    && ok "7b continuity sees the restarts as gaps between segments: $cont" || bad "7b continuity: $cont"
 
 # 8 no secret in any log
 logs="$(docker logs door-lab-relay 2>&1; cat "$WORK"/rec*.log)"
@@ -192,6 +210,54 @@ import json,sys; d=json.load(sys.stdin)
 ok = all("cpu_pct_one_core" in d[k] for k in ("door-lab-relay", "homehub-door-costprobe")) and d["decoder_still_running"]
 sys.exit(0 if ok else 1)  # PSI is reported when the kernel has it' \
     && ok "9 cost: per-cgroup CPU for the relay and the grey decoder, PSI sampled: $c" || bad "9 cost: $c"
+
+# 10 the relay exactly as its UNIT runs it, the camera killed under a consumer
+if [ -e "$RELAY_RUN" ]; then
+    echo "SKIP 10 ($RELAY_RUN already exists on this host: not ours to render into)"
+else
+    RELAY_RUN_OURS=1
+    docker rm -f door-lab-relay >/dev/null 2>&1   # checks 1-9's relay holds the same ports
+    docker start door-lab-cam >/dev/null 2>&1
+    UNIT_FILE="$DOOR/homehub-door-relay.service"
+    LS="$WORK/stack"                              # /opt/homehub/stack, for the lab
+    mkdir -p "$LS/llm-gateway"; : >"$LS/llm-gateway/llm-gateway.env"
+    ln -s "$DOOR" "$LS/door"
+    cp "$DOOR/../docker-compose.yml" "$LS/docker-compose.yml"
+    { cat "$DOOR/../.env.example"; cat "$WORK/env"
+      echo "DOOR_RELAY_IMAGE=$IMAGE"; echo "COMPOSE_PROJECT_NAME=doorlab"; } >"$LS/.env"
+    unit_lines() { sed -n "s/^$1=//p" "$UNIT_FILE" | sed "s#/opt/homehub/stack#$LS#g"; }
+    run_unit_line() {  # one Exec line as systemd would run it: no shell; a leading '-' ignores failure
+        local line="$1" ignore=""; local -a argv
+        [ "${line#-}" != "$line" ] && { ignore=1; line="${line#-}"; }
+        read -ra argv <<<"$line"
+        ( cd "$LS" && exec "${argv[@]}" ) || [ -n "$ignore" ]
+    }
+    JOURNAL="$WORK/journal.log"; : >"$JOURNAL"; pre_ok=1
+    while IFS= read -r l; do run_unit_line "$l" >>"$JOURNAL" 2>&1 || pre_ok=0; done < <(unit_lines ExecStartPre)
+    run_unit_line "$(unit_lines ExecStart)" >>"$JOURNAL" 2>&1 & upid=$!
+    for _ in $(seq 1 60); do ss -Hltn | grep -q " $LAN:18554 " && break; sleep 0.5; done
+    # A live consumer, so the relay is holding the camera when it dies.
+    lsenv="$WORK/env.unit"; cp "$LS/.env" "$lsenv"
+    python3 "$DOOR/door_relay.py" --env-file "$lsenv" probe --seconds 30 >"$WORK/probe10.json" 2>&1 & ppid=$!
+    sleep 8
+    docker kill door-lab-cam >/dev/null           # the camera drops
+    sleep 15                                       # go2rtc's producer warns and retries
+    docker rm -f homehub-door-probe >/dev/null 2>&1; wait "$ppid" 2>/dev/null
+    while IFS= read -r l; do run_unit_line "$l" >>"$JOURNAL" 2>&1; done < <(unit_lines ExecStop)
+    wait "$upid"; urc=$?
+    driver="$(docker inspect -f '{{.HostConfig.LogConfig.Type}}' homehub-door-relay 2>&1)"
+    dlogs="$(docker logs homehub-door-relay 2>&1)"
+    while IFS= read -r l; do run_unit_line "$l" >>"$JOURNAL" 2>&1; done < <(unit_lines ExecStopPost)
+    token="$(printf '%s' "admin:$PW" | base64 -w0)"
+    leaks="$(printf '%s\n%s\n' "$(cat "$JOURNAL")" "$dlogs" | grep -cF -e 'p$ss' -e 'p%24ss' -e "$token" -e '127.0.0.1:8654' || true)"
+    warned="$(grep -c 'url=rtsp://' "$JOURNAL" || true)"
+    if [ "$pre_ok" = 1 ] && [ "$warned" -ge 1 ] && [ "$leaks" = 0 ] && [ "$driver" = none ]; then
+        ok "10 the unit's relay, camera killed: $warned producer warning(s) in its output, redacted; no password or camera host:port in it or in docker (log driver: $driver; up exited $urc)"
+    else
+        bad "10 pre_ok=$pre_ok warned=$warned leaking-lines=$leaks driver=$driver up-rc=$urc"
+        grep -n 'url=\|WRN\|ERR' "$JOURNAL" | head -5 | sed -e 's/p\$ss/<PW>/g' -e 's/p%24ss/<PW>/g' -e 's/^/    /'
+    fi
+fi
 
 echo "door-relay-lab: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

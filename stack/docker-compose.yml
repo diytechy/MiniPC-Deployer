@@ -1549,6 +1549,13 @@ services:
         read_only: true
         bind:
           create_host_path: false
+    # NO LOG DRIVER. go2rtc's producer warns with the whole camera URL,
+    # credential included, whenever the camera drops; a driver would keep a
+    # second, unredacted copy under /var/lib/docker/containers. The unit's
+    # attached `up` still receives the output (attach does not need a driver)
+    # and passes it through `door_relay.py redact-run` into the journal.
+    logging:
+      driver: none
     labels:
       # Pinned by digest; a digest pin has nothing for diun to watch.
       - "diun.enable=false"

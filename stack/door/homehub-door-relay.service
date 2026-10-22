@@ -26,11 +26,16 @@ ExecCondition=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py condition D
 # this unit's RuntimeDirectory (0700, root, RAM, removed when the unit stops),
 # 0600, and bound read-only into the container. A missing or malformed field
 # fails the start and names the key, never the value.
-ExecStartPre=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py render
+ExecStartPre=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py --env-file /opt/homehub/stack/.env render
 ExecStartPre=-/usr/bin/docker rm -f homehub-door-relay
 # Attached, so the container's life IS this unit's life: the container ending
 # (or the daemon going away) ends `up`, and Restart= below brings it back.
-ExecStart=/usr/bin/docker compose --profile door-relay up --no-deps --no-log-prefix --exit-code-from door-relay door-relay
+# THROUGH redact-run, ALWAYS: go2rtc logs the credentialed camera URL when the
+# camera drops, and this is the only path its output has (the compose service
+# has no log driver). redact-run merges stdout and stderr, strips every
+# spelling of the credential and the camera's address line by line, forwards
+# signals and exits with compose's status.
+ExecStart=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py --env-file /opt/homehub/stack/.env redact-run -- /usr/bin/docker compose --profile door-relay up --no-deps --no-log-prefix --exit-code-from door-relay door-relay
 ExecStop=/usr/bin/docker compose --profile door-relay stop --timeout 10 door-relay
 ExecStopPost=-/usr/bin/docker rm -f homehub-door-relay
 RuntimeDirectory=homehub-door-relay

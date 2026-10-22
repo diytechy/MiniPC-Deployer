@@ -282,13 +282,20 @@ sequenceDiagram
             Unit->>DC: ExecStopPost stop-after-failure: --profile sure stop
         end
     else knob off, the unit was enabled and is active
-        FB->>SD: disable; stop --no-block
+        FB->>SD: disable; timeout 330 systemctl stop (waits until stopped)
         SD->>Unit: stop
-        Unit->>DC: --profile sure stop (web, worker, then redis, postgres)
+        Unit->>DC: ExecStop: --profile sure stop (web, worker, then redis, postgres)
+        FB->>DC: sure-unit.sh stop, directly (idempotent, seconds on a stopped Sure)
     else knob off, the unit is activating, deactivating or has a job
-        FB->>SD: disable; stop --no-block (is-active read as text, show -p Job)
-        SD->>Unit: cancel the queued start, or SIGTERM the running up -d
-        Unit->>DC: ExecStopPost stop-after-failure (SERVICE_RESULT=signal): --profile sure stop
+        FB->>SD: disable; timeout 330 systemctl stop (is-active read as text, show -p Job)
+        SD->>Unit: cancel the queued start (no hook runs), or SIGTERM the running up -d
+        opt the start was running
+            Unit->>DC: ExecStopPost stop-after-failure (SERVICE_RESULT=signal): --profile sure stop
+        end
+        FB->>DC: sure-unit.sh stop, directly (what docker restarted itself while the start waited)
+        opt the unit is failed with Result signal and the script succeeded
+            FB->>SD: reset-failed (the cancellation firstboot caused, so verify-hub stays green)
+        end
     else knob off, the unit was enabled and is failed or inactive, no job
         FB->>SD: disable
         FB->>DC: sure-unit.sh stop, directly (systemctl stop of a failed unit runs nothing; no start to race)

@@ -21,11 +21,19 @@ switch is `SURE_ENABLED`, not `COMPOSE_PROFILES`** (SR-100):
   ready) is cleaned up by the unit's `ExecStopPost=` (`sure-unit.sh
   stop-after-failure`), because systemd never runs `ExecStop=` after a failed
   start. With the knob then off, firstboot stops a failed or inactive unit
-  with no job through `sure-unit.sh stop` itself; a unit that is activating,
-  deactivating or has a queued job goes through `systemctl stop`, which cancels
-  the start (or SIGTERMs a running `up -d`, then `ExecStopPost=` stops what it
-  had started) - a direct stop there would finish first and the start would
-  bring all four up after it.
+  with no job through `sure-unit.sh stop` itself. A unit that is active,
+  activating, deactivating or has a queued job first goes through a blocking
+  `timeout 330 systemctl stop`, which cancels the start (or SIGTERMs a running
+  `up -d`, then `ExecStopPost=` stops what it had started) - a direct stop
+  before it would finish first and the start would bring all four up after it.
+  Then `sure-unit.sh stop` runs directly anyway: cancelling a start that was
+  only waiting behind firstboot (every boot) runs no hook at all, while docker
+  has already brought the four back under `restart: unless-stopped`. The stop
+  job cannot wait on firstboot: systemd orders a stop before a start whatever
+  the `After=` direction (measured on systemd 255). A cancelled running start
+  leaves the unit `failed` with Result `signal`; firstboot resets that, and only
+  that, once its stop script has succeeded, so `verify-hub.sh` does not report
+  an off switch that worked as a failed unit.
 - The knob is read the same way by the unit, firstboot and the bake (the rules of
   `scripts/lib/envfile.sh`): `SURE_ENABLED='true'`, `"true"`, an indented line
   or ` = ` around the key all mean on.

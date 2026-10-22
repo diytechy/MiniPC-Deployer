@@ -190,27 +190,70 @@ def _sure_block():
 _PREAMBLE = r'''
 set -euo pipefail
 log() { echo "[firstboot] $*"; }
+# A STATEFUL systemctl, modelled on what systemd 255 was measured to do (W10-sA
+# review rounds 2 and 3): the unit's state, job and Result live in $STUB_DIR.
+#  - is-active prints the state (unless --quiet), exit 0 only for active,
+#    reloading and refreshing - nonzero for `activating`;
+#  - stop of a unit with only a WAITING start job cancels the job and runs no
+#    hook at all (measured: no ExecStart, ExecStop or ExecStopPost);
+#  - stop of an activating oneshot SIGTERMs ExecStart and runs ExecStopPost with
+#    SERVICE_RESULT=signal, leaving the unit failed/signal;
+#  - stop of an active unit runs ExecStop, then ExecStopPost with success;
+#  - reset-failed turns failed into inactive, and fails on anything else.
+# The hooks are the REAL sure-unit.sh; their compose calls go to a separate log
+# so the main call log holds only what firstboot itself ran.
+_sget() { cat "$STUB_DIR/$1" 2>/dev/null || true; }
+_sset() { printf '%s' "$2" > "$STUB_DIR/$1"; }
+_hook() {
+    echo "[unit] $1 SERVICE_RESULT=${2:-}" >> "$CALLS"
+    CALLS="$STUB_DIR/hook-calls" SERVICE_RESULT="${2:-}" STACK_DIR="$STACK_DIR" \
+        bash "$STACK_DIR/sure/sure-unit.sh" "$1" >/dev/null 2>&1
+}
 systemctl() {
     echo "systemctl $*" >> "$CALLS"
     if [ "$1" = is-enabled ]; then [ -n "${STUB_ENABLED:-}" ]; return; fi
     if [ "$1" = is-active ]; then
-        # as systemd 255 does: print the state (unless --quiet), exit 0 only for
-        # active, reloading and refreshing - nonzero for `activating`
-        local s="${STUB_STATE:-}"
-        [ -n "$s" ] || { [ -n "${STUB_ACTIVE:-}" ] && s=active || s=inactive; }
+        local s; s="$(_sget state)"
         [ "${2:-}" = --quiet ] || echo "$s"
         case "$s" in active|reloading|refreshing) return 0 ;; *) return 3 ;; esac
     fi
-    if [ "$1" = show ]; then echo "${STUB_JOB:-}"; return 0; fi
+    if [ "$1" = show ]; then
+        case "$*" in *"-p Job "*) _sget job ;; *"-p Result "*) _sget result ;; esac
+        echo; return 0
+    fi
     if [ "${STUB_SYSTEMCTL_FAIL:-}" = "$1" ]; then return 1; fi
+    case "$1" in
+        stop)
+            case "$(_sget state)" in
+                activating) _hook stop-after-failure signal || true
+                            _sset state failed; _sset result signal ;;
+                active|reloading|refreshing)
+                    if _hook stop "" && _hook stop-after-failure success; then
+                        _sset state inactive; _sset result success
+                    else
+                        _sset state failed; _sset result exit-code
+                    fi ;;
+                deactivating) _sset state inactive ;;
+            esac
+            _sset job "" ;;
+        reset-failed)
+            [ "$(_sget state)" = failed ] || return 1
+            _sset state inactive; _sset result success ;;
+    esac
     return 0
+}
+# the bounded blocking stop: the stub runs the command unless told it ran out
+timeout() {
+    echo "timeout $1" >> "$CALLS"; shift
+    [ -z "${STUB_TIMEOUT_EXPIRES:-}" ] || return 124
+    "$@"
 }
 install() { echo "install $*" >> "$CALLS"; return 0; }
 '''
 
 
 def _run_block(tmp_path, env_text, enabled=False, fail=None, payload=True, active=False,
-               docker_stub=DOCKER_STUB, extra_env=None, state=None, job=None):
+               docker_stub=DOCKER_STUB, extra_env=None, state=None, job=None, result="success"):
     """Run firstboot's real 4-pre-a2b block. The payload is the real unit AND
     the real sure-unit.sh, because the off branch runs that script directly;
     its docker is a stub that logs `compose ...` into the same call log."""
@@ -227,15 +270,15 @@ def _run_block(tmp_path, env_text, enabled=False, fail=None, payload=True, activ
     docker.chmod(0o755)
     script = tmp_path / "block.sh"
     _w(script, _PREAMBLE + 'STACK_DIR="%s"\n' % _px(stack) + _sure_block() + "\necho BLOCK-DONE\n")
-    env = dict(os.environ, CALLS=_px(calls), DOCKER=_px(docker), **(extra_env or {}))
+    stub = tmp_path / "stub"
+    stub.mkdir(exist_ok=True)
+    _w(stub / "state", state or ("active" if active else "inactive"))
+    _w(stub / "job", job or "")
+    _w(stub / "result", result)
+    env = dict(os.environ, CALLS=_px(calls), DOCKER=_px(docker), STUB_DIR=_px(stub), **(extra_env or {}))
+    env.pop("SERVICE_RESULT", None)
     if enabled:
         env["STUB_ENABLED"] = "1"
-    if active:
-        env["STUB_ACTIVE"] = "1"
-    if state:
-        env["STUB_STATE"] = state
-    if job:
-        env["STUB_JOB"] = job
     if fail:
         env["STUB_SYSTEMCTL_FAIL"] = fail
     proc = subprocess.run([_bash(), _px(script)], env=env, capture_output=True, text=True)
@@ -271,14 +314,28 @@ def test_tc1361_knob_absent_touches_no_running_sure_sr100(tmp_path):
     assert "no Sure container was touched" in proc.stdout
 
 
-def test_tc1361_knob_false_after_the_unit_owned_sure_disables_and_queues_the_stop_sr100(tmp_path):
+COMPOSE_STOP = "compose --profile sure stop -t 60 sure-web sure-worker sure-redis sure-postgres"
+_THROUGH_SYSTEMD = ["timeout 330", "systemctl stop homehub-sure.service"]
+_RESULT_CHECK = ["systemctl is-active homehub-sure.service",
+                 "systemctl show -p Result --value homehub-sure.service"]
+
+
+def _state(tmp_path):
+    return (tmp_path / "stub" / "state").read_text(encoding="utf-8")
+
+
+def test_tc1361_knob_false_after_the_unit_owned_sure_disables_stops_it_then_runs_the_script_sr100(tmp_path):
     proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, active=True)
     assert calls[2:] == ["systemctl is-enabled homehub-sure.service",
                          "systemctl disable homehub-sure.service",
                          "systemctl is-active homehub-sure.service",
                          "systemctl show -p Job --value homehub-sure.service",
-                         "systemctl stop --no-block homehub-sure.service"], calls
-    assert "DISABLED" in proc.stdout
+                         "timeout 330",
+                         "systemctl stop homehub-sure.service",
+                         "[unit] stop SERVICE_RESULT=",
+                         "[unit] stop-after-failure SERVICE_RESULT=success",
+                         COMPOSE_STOP] + _RESULT_CHECK, calls
+    assert "DISABLED" in proc.stdout and _state(tmp_path) == "inactive"
 
 
 def test_tc1361_knob_false_with_a_failed_unit_runs_the_stop_script_directly_sr100(tmp_path):
@@ -289,8 +346,8 @@ def test_tc1361_knob_false_with_a_failed_unit_runs_the_stop_script_directly_sr10
                          "systemctl disable homehub-sure.service",
                          "systemctl is-active homehub-sure.service",
                          "systemctl show -p Job --value homehub-sure.service",
-                         "compose --profile sure stop -t 60 sure-web sure-worker sure-redis sure-postgres"], calls
-    assert "its stop script ran directly" in proc.stdout
+                         COMPOSE_STOP], calls
+    assert "and its stop script ran directly" in proc.stdout
 
 
 _OFF_PREFIX = ["systemctl is-enabled homehub-sure.service",
@@ -299,34 +356,109 @@ _OFF_PREFIX = ["systemctl is-enabled homehub-sure.service",
                "systemctl show -p Job --value homehub-sure.service"]
 
 
-@pytest.mark.parametrize("state,job", [
-    ("activating", "4711"),     # the review's case: a queued start still in ExecStart
-    ("activating", ""),
-    ("reloading", ""),
-    ("deactivating", "4712"),
-    ("inactive", "4711"),       # a start job queued but waiting (After=firstboot)
-    ("failed", "4711"),
+@pytest.mark.parametrize("state,job,result,hooks,reset", [
+    # the round-2 case: a queued start still in ExecStart - SIGTERM, ExecStopPost,
+    # failed/signal, cleared once the script has succeeded (round 3 F2)
+    ("activating", "4711", "success", ["[unit] stop-after-failure SERVICE_RESULT=signal"], True),
+    ("activating", "", "success", ["[unit] stop-after-failure SERVICE_RESULT=signal"], True),
+    ("reloading", "", "success", ["[unit] stop SERVICE_RESULT=",
+                                  "[unit] stop-after-failure SERVICE_RESULT=success"], False),
+    ("deactivating", "4712", "success", [], False),
+    # the every-boot case: a start job WAITING behind firstboot (After=) - the
+    # cancel runs no hook at all (round 3 F1)
+    ("inactive", "4711", "success", [], False),
+    # a genuine earlier failure with a queued start: cancelled, never cleared
+    ("failed", "4711", "exit-code", [], False),
 ])
-def test_tc1361_knob_false_with_a_start_in_flight_stops_through_systemd_sr100(tmp_path, state, job):
-    """W10-sA review round 2 F1. `systemctl is-active` is nonzero for
-    `activating`, so the round-1 branch ran the stop script directly while the
-    start firstboot had queued was still inside `up -d`: compose stop finished
-    first, then the start brought all four up under unless-stopped. Anything
-    running or with a job must go through `systemctl stop`, which cancels the
-    job or SIGTERMs ExecStart= (then ExecStopPost= stop-after-failure cleans up),
-    and the script must not race it."""
-    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state=state, job=job)
-    assert calls[2:] == _OFF_PREFIX + ["systemctl stop --no-block homehub-sure.service"], calls
-    assert not [c for c in calls if c.startswith("compose")], calls
-    assert "its stop queued; it was '%s'" % state in proc.stdout
+def test_tc1361_knob_false_with_a_start_in_flight_stops_through_systemd_then_the_script_sr100(
+        tmp_path, state, job, result, hooks, reset):
+    """W10-sA review round 2 F1: `systemctl is-active` is nonzero for
+    `activating`, so a direct stop raced the start firstboot had queued. Round 3
+    F1: stopping ONLY through systemd left Docker's own restart of the four
+    running when the cancelled start was merely waiting. So: a bounded,
+    blocking `systemctl stop` first, then the script, never the other way round."""
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True,
+                             state=state, job=job, result=result)
+    tail = calls[2 + len(_OFF_PREFIX):]
+    assert calls[2:2 + len(_OFF_PREFIX)] == _OFF_PREFIX, calls
+    assert tail == _THROUGH_SYSTEMD + hooks + [COMPOSE_STOP] + _RESULT_CHECK + (
+        ["systemctl reset-failed homehub-sure.service"] if reset else []), calls
+    assert "so it was stopped through systemd and then its stop script ran directly" in proc.stdout
+    assert ("it was '%s' with job %s" % (state, job) if job else "it was '%s' with no job" % state) \
+        in proc.stdout
+    assert "systemctl stop --no-block" not in "\n".join(calls)
+    assert _state(tmp_path) == ("failed" if state == "failed" else "inactive")
 
 
 @pytest.mark.parametrize("state,job", [("inactive", ""), ("failed", ""), ("failed", "0"), ("unknown", "")])
 def test_tc1361_knob_false_with_an_idle_unit_runs_the_script_and_no_systemctl_stop_sr100(tmp_path, state, job):
-    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state=state, job=job)
-    assert calls[2:] == _OFF_PREFIX + [
-        "compose --profile sure stop -t 60 sure-web sure-worker sure-redis sure-postgres"], calls
-    assert "it was '%s' with no job, so its stop script ran directly" % state in proc.stdout
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state=state, job=job,
+                             result="signal" if state == "failed" else "success")
+    assert calls[2:] == _OFF_PREFIX + [COMPOSE_STOP], calls
+    assert "it was '%s' with no job, and its stop script ran directly" % state in proc.stdout
+    # an idle failed unit is a failure from before this run: it stays red
+    assert _state(tmp_path) == state
+
+
+# -- TC-1361: the off switch, stateful (W10-sA review round 3 F1, F2) ----------
+
+def test_tc1361_knob_off_with_a_waiting_start_stops_the_containers_docker_restarted_sr100(tmp_path):
+    """Round 3 F1, the every-boot sequence. The unit is enabled, WantedBy=
+    multi-user.target and After=homehub-firstboot.service, so its start job
+    waits while firstboot runs; Docker has meanwhile brought all four back under
+    `restart: unless-stopped`. The Owner set SURE_ENABLED=false and rebooted.
+    Cancelling the waiting job runs no hook (measured on systemd 255), so only
+    the direct script can stop them - and the disabled unit never takes this
+    branch again."""
+    running = tmp_path / "running.txt"
+    _w(running, "sure-postgres\nsure-redis\nsure-web\nsure-worker\n")
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state="inactive",
+                             job="4711", docker_stub=STATEFUL_DOCKER,
+                             extra_env={"RUNNING": _px(running)})
+    assert not [c for c in calls if c.startswith("[unit]")], calls      # no hook ran
+    assert COMPOSE_STOP in calls, calls                                   # Docker stop called
+    assert _running(running) == [], (proc.stdout, calls)                  # no container left
+    assert "systemctl disable homehub-sure.service" in calls
+    assert (tmp_path / "stub" / "job").read_text(encoding="utf-8") == ""  # the start is cancelled
+
+
+def test_tc1361_an_intentional_cancel_of_a_running_start_leaves_the_unit_not_failed_sr100(tmp_path):
+    """Round 3 F2. SIGTERM of the activating oneshot leaves it failed/signal
+    even after ExecStopPost cleaned up, and verify-hub.sh reports DEGRADED and
+    `unit FAILED: homehub-sure.service` for an off switch that worked."""
+    running = tmp_path / "running.txt"
+    _w(running, "sure-postgres\nsure-redis\n")       # `up -d` waiting on their health
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state="activating",
+                             job="4711", docker_stub=STATEFUL_DOCKER,
+                             extra_env={"RUNNING": _px(running)})
+    assert "[unit] stop-after-failure SERVICE_RESULT=signal" in calls
+    assert _running(running) == []
+    assert calls[-1] == "systemctl reset-failed homehub-sure.service", calls
+    assert _state(tmp_path) == "inactive"
+    assert "it was reset-failed" in proc.stdout
+
+
+def test_tc1361_a_cancel_whose_clean_up_failed_stays_failed_sr100(tmp_path):
+    running = tmp_path / "running.txt"
+    _w(running, "sure-postgres\nsure-redis\n")
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state="activating",
+                             job="4711", docker_stub=STATEFUL_DOCKER,
+                             extra_env={"RUNNING": _px(running), "DOCKER_STOP_FAILS": "1"})
+    assert "systemctl reset-failed homehub-sure.service" not in calls, calls
+    assert _state(tmp_path) == "failed"
+    assert _running(running) == ["sure-postgres", "sure-redis"]
+    assert "WARN: homehub-sure.service DISABLED, but its stop script failed" in proc.stdout
+
+
+def test_tc1361_a_stop_that_ran_out_of_time_still_runs_the_script_and_clears_nothing_sr100(tmp_path):
+    running = tmp_path / "running.txt"
+    _w(running, "sure-postgres\nsure-redis\n")
+    proc, calls = _run_block(tmp_path, "SURE_ENABLED=false\n", enabled=True, state="activating",
+                             job="4711", docker_stub=STATEFUL_DOCKER,
+                             extra_env={"RUNNING": _px(running), "STUB_TIMEOUT_EXPIRES": "1"})
+    assert calls[2 + len(_OFF_PREFIX):] == ["timeout 330", COMPOSE_STOP], calls
+    assert _running(running) == []
+    assert "did not finish in 330 s" in proc.stdout
 
 
 def test_tc1361_a_failed_direct_stop_is_a_warning_not_an_abort_sr100(tmp_path):
@@ -355,8 +487,16 @@ def test_tc1361_no_blocking_sure_start_anywhere_in_firstboot_sr100():
     """A blocking start from inside firstboot waits on firstboot itself (the
     unit is After=homehub-firstboot.service)."""
     text = _live(FIRSTBOOT.read_text(encoding="utf-8"))
-    for m in re.finditer(r"systemctl\s+[^\n|;&]*\b(?:start|restart|stop)\b[^\n|;&]*homehub-sure\.service", text):
-        assert "--no-block" in m.group(0), m.group(0)
+    bounded = 0
+    for m in re.finditer(r"systemctl\s+[^\n|;&]*\b(start|restart|stop)\b[^\n|;&]*homehub-sure\.service", text):
+        if "--no-block" in m.group(0):
+            continue
+        # The one blocking call allowed is the off branch's STOP, bounded: a stop
+        # job is ordered before a start job whatever the After= direction, so it
+        # cannot wait on firstboot (measured on systemd 255, round 3 F1).
+        assert m.group(1) == "stop" and re.search(r"\btimeout \d+ $", text[:m.start()]), m.group(0)
+        bounded += 1
+    assert bounded == 1
     assert "enable --now homehub-sure" not in text
 
 
@@ -405,6 +545,7 @@ case " $* " in
         [ -n "${DOCKER_UP_FAILS:-}" ] && exit 1
         printf 'sure-postgres\nsure-redis\nsure-web\nsure-worker\n' > "$RUNNING" ;;
     *" stop "*)
+        [ -n "${DOCKER_STOP_FAILS:-}" ] && exit 1
         for c in "$@"; do grep -vx -- "$c" "$RUNNING" > "$RUNNING.new"; mv "$RUNNING.new" "$RUNNING"; done ;;
 esac
 exit 0

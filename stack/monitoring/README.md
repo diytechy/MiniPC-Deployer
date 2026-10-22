@@ -87,7 +87,10 @@ panel's rule, SR-083). Add `/srv/scratch` here when the scratch volume exists.
 [`watch.table`](watch.table) is the one table: the IceDrive client
 (`ICEDRIVE_MODE=appimage`, absent 15 min), the library backup and the IceDrive
 profile capture (no success for 26 h), any container `unhealthy` for 10 min,
-and the drill-only synthetic watch. `HOMEHUB_WATCH_DISABLE="row ..."` switches
+any container restarted 3 or more times within 30 min (`restart-loops`,
+LLR-1211: a crash loop reads `starting`, never `unhealthy`, and `docker ps`
+still says Up - open-items C58 ran to 2,327 restarts that way), and the
+drill-only synthetic watch. `HOMEHUB_WATCH_DISABLE="row ..."` switches
 rows off without editing the table.
 
 ### Liveness and evidence (SR-089)

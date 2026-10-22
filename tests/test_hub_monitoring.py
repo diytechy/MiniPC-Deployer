@@ -679,7 +679,7 @@ TABLE = (MON / "watch.table").read_text(encoding="utf-8")
 def test_the_shipped_table_parses_and_honours_its_conditions_tc1289():
     rows, problems = watch.parse_table(TABLE, {})
     assert problems == []
-    assert [r["name"] for r in rows] == ["library-backup", "containers"]
+    assert [r["name"] for r in rows] == ["library-backup", "containers", "restart-loops"]
     env = {"ICEDRIVE_MODE": "appimage", "REMOTE_UI_ENABLED": "true", "HOMEHUB_WATCH_SYNTHETIC_PROCESS": "hh-drill",
            "HOMEHUB_WATCH_SYNTHETIC_ABSENT_MIN": "5", "HOMEHUB_WATCH_DISABLE": "library-backup"}  # fmt: skip
     rows, problems = watch.parse_table(TABLE, env)
@@ -688,6 +688,7 @@ def test_the_shipped_table_parses_and_honours_its_conditions_tc1289():
         "icedrive-client",
         "icedrive-profile",
         "containers",
+        "restart-loops",
         "synthetic",
     }
     assert (
@@ -806,6 +807,76 @@ def test_container_watch_is_per_container_and_unknown_when_docker_hangs_tc1292()
     assert v is None and st2 == st
     v, st, _ = watch.judge_containers(row, st, ["sure-web"], 1300.0, "b")
     assert v == {"sure-web": True, "immich": False}
+
+
+def test_tc1368_a_restart_loop_fires_per_container_and_clears_after_a_quiet_window_llr1211():
+    """C58: Immich died every ~14 s while `docker ps` said Up and its health
+    said starting - so docker-health never fired. Only RestartCount told."""
+    row = {"name": "r", "kind": "docker-restarts", "target": "*", "threshold_s": 1800}
+    v, st, _ = watch.judge_restarts(row, {}, {"immich-server": 10, "caddy": 0}, 0.0, "b")
+    assert v == {"immich-server": False, "caddy": False}, "first sight is a baseline, never an alert"
+    v, st, what = watch.judge_restarts(row, st, {"immich-server": 31, "caddy": 0}, 300.0, "b")
+    assert v == {"immich-server": True, "caddy": False} and "immich-server +21" in what
+    v, st, _ = watch.judge_restarts(row, st, {"immich-server": 31, "caddy": 2}, 600.0, "b")
+    assert v == {"immich-server": True, "caddy": False}, "two restarts is not a loop"
+    # Thirty quiet minutes later the old samples have aged out: cleared.
+    v, st, _ = watch.judge_restarts(row, st, {"immich-server": 31, "caddy": 2}, 2500.0, "b")
+    assert v == {"immich-server": False, "caddy": False}
+
+
+def test_tc1368_a_recreated_container_a_new_boot_and_a_hung_docker_llr1211():
+    row = {"name": "r", "kind": "docker-restarts", "target": "*", "threshold_s": 1800}
+    _, st, _ = watch.judge_restarts(row, {}, {"x": 50}, 0.0, "b")
+    v, st, _ = watch.judge_restarts(row, st, {"x": 0}, 300.0, "b")
+    assert v == {"x": False}, "a count that went down is a fresh container, not -50"
+    v, st, _ = watch.judge_restarts(row, st, {"x": 4}, 600.0, "b")
+    assert v == {"x": True}
+    v, st2, _ = watch.judge_restarts(row, st, None, 700.0, "b")
+    assert v is None and st2 == st, "docker not answering changes nothing"
+    v, st, _ = watch.judge_restarts(row, st, {"x": 9}, 5.0, "b2")
+    assert v == {"x": False}, "a new boot restarts every history"
+    v, st, _ = watch.judge_restarts(row, st, {}, 10.0, "b2")
+    assert v == {"x": False} and st["samples"] == {}, "a container that is gone is cleared"
+
+
+def test_tc1369_the_watch_alerts_a_loop_once_and_clears_it_once_llr1211(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(watch.mc, "send_alert", lambda key, prio, title, *a, **k: sent.append((key, title))
+                        or mc.ALERT_DELIVERED)  # fmt: skip
+    monkeypatch.setattr(watch, "systemctl_show", lambda unit: _show(exit_ts=2_000_000_000))
+    monkeypatch.setattr(watch, "docker_unhealthy", lambda: [])
+    counts = {"immich-server": 0}
+    monkeypatch.setattr(watch, "docker_restart_counts", lambda: dict(counts))
+    clock = {"mono": 100.0}
+    monkeypatch.setattr(watch.time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(watch.time, "time", lambda: 2_000_000_100.0)
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    _w(tmp_path / "env", "")
+    _w(tmp_path / "proc/sys/kernel/random/boot_id", "b1\n")
+    args = ["--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"), "--proc-root",
+            str(tmp_path / "proc")]  # fmt: skip
+    for mono, count in ((100.0, 0), (400.0, 21), (700.0, 42), (2900.0, 42), (3200.0, 42)):
+        clock["mono"], counts["immich-server"] = mono, count
+        assert watch.main(args) == 0
+    loops = [t for k, t in sent if k.startswith("watch-restart-loops-immich-server")]
+    assert len(loops) == 2, sent
+    assert "restarting in a loop" in loops[0] and "stopped restarting" in loops[1]
+    status = json.loads((tmp_path / "st" / "watch-status.json").read_text(encoding="utf-8"))
+    assert {r["name"]: r["verdict"] for r in status["rows"]}["restart-loops"] == "ok"
+
+
+def test_tc1369_the_restart_counts_reader_parses_docker_and_refuses_garbage_llr1211(monkeypatch):
+    outputs = iter([mc_done(b"aaaaaaaaaaaa\nbbbbbbbbbbbb\n"),
+                    mc_done(b"/immich-server 2327\n/caddy 0\nnot a line\n")])
+    monkeypatch.setattr(watch.mc, "run_bounded", lambda *a, **k: next(outputs))
+    assert watch.docker_restart_counts() == {"immich-server": 2327, "caddy": 0}
+    monkeypatch.setattr(watch.mc, "run_bounded", lambda *a, **k: mc_done(b"", ok=False))
+    assert watch.docker_restart_counts() is None
+
+
+def mc_done(output, ok=True):
+    import types as _types
+    return _types.SimpleNamespace(ok=ok, output=output)
 
 
 def test_watch_main_drill_fires_and_clears_the_synthetic_watch_tc1293(
@@ -1159,7 +1230,8 @@ def test_no_monitor_acts_on_the_box_tc1302():
             ):
                 head = node.elts[0].value
                 if head in ("systemctl", "docker") and len(node.elts) > 1:
-                    assert node.elts[1].value in ("show", "ps", "stats"), (
+                    # `inspect` is a query too (homehub-watch's restart counts).
+                    assert node.elts[1].value in ("show", "ps", "stats", "inspect"), (
                         f,
                         head,
                         node.elts[1].value,

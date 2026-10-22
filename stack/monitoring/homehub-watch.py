@@ -22,6 +22,13 @@ THE KINDS (watch.table header has the row syntax):
                  `docker ps` runs under a timeout; when docker cannot answer the
                  row is "unknown" and nothing changes (the liveness probe owns
                  "docker is not answering").
+  docker-restarts each container whose RestartCount rose by RESTART_LOOP_MIN or
+                 more within THRESHOLD, one alert each; clear once a whole
+                 THRESHOLD passes with fewer. A crash-looping container is
+                 INVISIBLE to docker-health: between deaths it is "starting",
+                 never "unhealthy", and `docker ps` says "Up". Immich ran like
+                 that for 2,327 restarts in 2026-08 (open-items C58) and only
+                 the counter told the truth (LLR-1211).
 
 NEVER ACTS. It reads /proc, asks systemd and docker, and alerts. It starts and
 stops nothing, including the synthetic drill process.
@@ -32,7 +39,7 @@ like, with `ts`): /var/lib/homehub-monitor/watch-status.json.
 Exit: 0 when the table was read and every row judged (fired or not); 1 when the
 table is missing or unreadable.
 
-Implements: SR-088, LLR-1156, LLR-1157, LLR-1158
+Implements: SR-088, LLR-1156, LLR-1157, LLR-1158, LLR-1211
 """
 
 from __future__ import annotations
@@ -49,7 +56,11 @@ import monitor_common as mc  # noqa: E402
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_TABLE = os.path.join(HERE, "watch.table")
-KINDS = ("process", "unit-success", "docker-health")
+KINDS = ("process", "unit-success", "docker-health", "docker-restarts")
+# docker-restarts: this many restarts inside the row's window is a loop. Three,
+# because one restart is a crash that recovered and two can be a deploy; the
+# loop C58 recorded added ~20 every five minutes.
+RESTART_LOOP_MIN = 3
 # Every alert of one run must have finished this long after the run started;
 # with monitor_common.SAVE_RESERVE_SEC it fits the unit's TimeoutStartSec=120,
 # however many containers turn unhealthy at once while ntfy (itself a
@@ -244,6 +255,51 @@ def judge_containers(
     )
 
 
+def judge_restarts(
+    row: dict, st: dict, counts: Optional[Dict[str, int]], mono: float, boot: str
+) -> Tuple[Optional[Dict[str, bool]], dict, str]:
+    """Per-container verdicts {name: looping}; None when docker could not answer.
+
+    `counts` is {container: RestartCount} for the containers docker lists now.
+    Each container keeps the (monotonic time, count) samples of the last window;
+    it is looping when the count rose by RESTART_LOOP_MIN or more since the
+    oldest sample in that window. A count that went DOWN is a recreated
+    container (a fresh container starts at 0), so its history restarts; a new
+    boot restarts every history. A container no longer listed is cleared.
+    Pure: no I/O.
+    Implements: SR-088, LLR-1211
+    """
+    st = dict(st)
+    if counts is None:
+        return None, st, "docker did not answer"
+    if st.get("boot_id") != boot:
+        st = {"boot_id": boot, "samples": {}}
+    window = row["threshold_s"]
+    samples = {k: [list(x) for x in v] for k, v in st.get("samples", {}).items()}
+    verdicts, rising = {}, []
+    for name, count in counts.items():
+        history = [x for x in samples.get(name, []) if 0 <= mono - x[0] <= window]
+        if history and count < history[-1][1]:
+            history = []
+        history.append([mono, count])
+        samples[name] = history
+        rise = count - history[0][1]
+        verdicts[name] = rise >= RESTART_LOOP_MIN
+        if rise > 0:
+            rising.append("%s +%d" % (name, rise))
+    for name in list(samples):
+        if name not in counts:
+            del samples[name]
+            verdicts[name] = False
+    st["samples"] = samples
+    return (
+        verdicts,
+        st,
+        ("restarts in the last %dm: %s" % (window // 60, ", ".join(sorted(rising))))
+        if rising else "no restarts",
+    )
+
+
 # ── the shell ────────────────────────────────────────────────────────────────
 
 
@@ -270,6 +326,30 @@ def docker_unhealthy() -> Optional[List[str]]:
         for n in done.output.decode("utf-8", "replace").split()
         if re.fullmatch(r"[A-Za-z0-9_.-]+", n)
     ]
+
+
+def docker_restart_counts() -> Optional[Dict[str, int]]:
+    """{name: RestartCount} for every container, stopped ones included (`-a`):
+    one caught between a death and its restart must not drop out of the
+    history and clear; a stopped one's count simply stops rising. None when
+    docker cannot answer within its bound."""
+    ids = mc.run_bounded(["docker", "ps", "-a", "-q", "--no-trunc"], 20, 65536)
+    if not ids.ok:
+        return None
+    wanted = [i for i in ids.output.decode("utf-8", "replace").split() if re.fullmatch(r"[0-9a-f]{12,64}", i)]
+    if not wanted:
+        return {}
+    done = mc.run_bounded(
+        ["docker", "inspect", "--format", "{{.Name}} {{.RestartCount}}"] + wanted, 20, 262144
+    )
+    if not done.ok:
+        return None
+    counts = {}
+    for line in done.output.decode("utf-8", "replace").splitlines():
+        m = re.fullmatch(r"/?([A-Za-z0-9_.-]+) ([0-9]+)", line.strip())
+        if m:
+            counts[m.group(1)] = int(m.group(2))
+    return counts
 
 
 def main(argv=None) -> int:
@@ -319,10 +399,14 @@ def main(argv=None) -> int:
     status, live_keys, pending = [], set(), []
     for row in rows:
         name, st = row["name"], rows_state.get(row["name"], {})
-        if row["kind"] == "docker-health":
-            verdicts, st, what = judge_containers(
-                row, st, docker_unhealthy(), mono, boot
-            )
+        if row["kind"] in ("docker-health", "docker-restarts"):
+            looping = row["kind"] == "docker-restarts"
+            if looping:
+                verdicts, st, what = judge_restarts(row, st, docker_restart_counts(), mono, boot)
+            else:
+                verdicts, st, what = judge_containers(
+                    row, st, docker_unhealthy(), mono, boot
+                )
             if verdicts is not None:
                 # A container that recovered (or vanished) while its clear could
                 # not be delivered still owes that clear: keep stepping it.
@@ -333,11 +417,20 @@ def main(argv=None) -> int:
             for cname, bad in (verdicts or {}).items():
                 key = "watch-%s-%s" % (name, cname)
                 live_keys.add(key)
-                pending.append(mc.plan_episode(episodes, key, bad,
-                               ("high", "HomeHub: container %s unhealthy for %dm" % (cname, row["threshold_s"] // 60),
-                                "docker reports %s unhealthy. Look at: docker inspect --format '{{json .State.Health}}' %s"
-                                % (cname, cname)),
-                               ("HomeHub: container %s is healthy again" % cname, "%s is no longer unhealthy." % cname)))  # fmt: skip
+                if looping:
+                    fire = ("high", "HomeHub: container %s is restarting in a loop (%d+ restarts in %dm)"
+                            % (cname, RESTART_LOOP_MIN, row["threshold_s"] // 60),
+                            "%s was restarted at least %d times in %dm while `docker ps` can still say Up. Look at: "
+                            "docker inspect -f '{{.RestartCount}}' %s; docker logs --tail 50 %s"
+                            % (cname, RESTART_LOOP_MIN, row["threshold_s"] // 60, cname, cname))
+                    clear = ("HomeHub: container %s stopped restarting" % cname,
+                             "%s has not restarted %d times in the last %dm." % (cname, RESTART_LOOP_MIN, row["threshold_s"] // 60))
+                else:
+                    fire = ("high", "HomeHub: container %s unhealthy for %dm" % (cname, row["threshold_s"] // 60),
+                            "docker reports %s unhealthy. Look at: docker inspect --format '{{json .State.Health}}' %s"
+                            % (cname, cname))
+                    clear = ("HomeHub: container %s is healthy again" % cname, "%s is no longer unhealthy." % cname)
+                pending.append(mc.plan_episode(episodes, key, bad, fire, clear))  # fmt: skip
             bad = None if verdicts is None else any(verdicts.values())
         else:
             if row["kind"] == "process":

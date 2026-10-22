@@ -730,34 +730,35 @@ sequenceDiagram
     end
 ```
 
-### The panel's log cap and low-disk alarm (SR-083, LLR-1140, LLR-1141)
+### The panel's single log store and low-disk alarm (SR-083, LLR-1140, LLR-1141)
 
-Two independent timers, neither of which can affect the kiosk. The point of
-drawing it is the second lane: the alarm READS and REPORTS, it never deletes
-anything, and when it cannot measure it says so and lets the status file go
-stale rather than writing a reassuring one.
+Firstboot leaves one log store, journald, under an explicit cap; rsyslog and
+syslog.socket are masked, so nothing writes the uncapped /var/log/syslog. The
+alarm on the timer lane READS and REPORTS, it never deletes anything, and when
+it cannot measure it says so and lets the status file go stale rather than
+writing a reassuring one.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant LT as logrotate.timer (stock, hourly via drop-in)
-    participant LR as logrotate.service
-    participant RS as /var/log/syslog et al.
+    participant FB as wall-firstboot.sh step 8f
+    participant RS as rsyslog.service + syslog.socket
+    participant JD as systemd-journald (10-wall-cap.conf)
     participant DT as wall-disk-check.timer (15 min)
     participant DC as wall-disk-check.py
-    participant J as journal (tag wall-disk)
     participant S as /run/wall-disk/status.json
 
-    LT->>LR: start (SR-083, LLR-1140)
-    LR->>RS: daily, or now if > 100M: rotate, keep 7, gzip the one before
-    LR->>RS: postrotate: rsyslog-rotate (rsyslog reopens its files)
-    DT->>DC: ExecStart (SR-083, LLR-1141)
+    FB->>RS: disable rsyslog (unless already masked), mask --now both (SR-083, LLR-1140)
+    FB->>RS: is-active? either still active is a failed step, firstboot continues
+    FB->>JD: install the cap; restart only if the drop-in changed
+    FB->>DT: enable_unit, restart, is-active (LLR-1141)
+    DT->>DC: ExecStart, WALL_DISK_MEDIA_PATH from /etc/wall-panel/wall-disk.env
     DC->>DC: df on / and the media cache; drop a path whose mount was already seen
     alt df failed or its output did not parse
-        DC->>J: <4> wall-disk: ERROR ...
+        DC->>JD: <4> wall-disk: ERROR ...
         Note over DC,S: exit 1, previous file untouched, it goes stale after ttlMs
     else measured
-        DC->>J: <4> LOW or <6> ok, one line per mount<br/>(LOW = Avail below min(10 % of size, 5 GB))
+        DC->>JD: <4> LOW or <6> ok, one line per mount<br/>(LOW = Avail below min(10 % of size, 5 GB))
         DC->>S: replace atomically {observedAt, ttlMs 30 min, low, mounts[]}
     end
 ```

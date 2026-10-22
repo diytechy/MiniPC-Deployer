@@ -6,7 +6,7 @@ about two minutes while the weekly logrotate gzipped a /var/log/syslog that had
 grown to tens of gigabytes. Chromium's cookie store hit FILE_ERROR_NO_SPACE and
 silently stopped persisting for the rest of that kiosk run, so the next restart
 lost the Pandora sign-in. Nothing on the panel said the disk was nearly full,
-before or after. The log cap (wall-logrotate-rsyslog, wall-journald.conf) closes
+before or after. Masking rsyslog (journald, capped, keeps everything) closes
 that one cause; this is the alarm for the next one, whatever it is.
 
 WHAT IT DOES, once per invocation (wall-disk-check.timer runs it every 15 min):

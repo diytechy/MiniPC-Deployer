@@ -1,23 +1,23 @@
-"""SR-083: the panel's classic syslog is capped, journald's cap is explicit, and
-a low-disk alarm reports root and the media cache.
+"""SR-083: rsyslog is masked on the panel, journald's cap is explicit, and a
+low-disk alarm reports root and the media cache.
 
 Three layers, each against the real artefact rather than a description of it:
 
 * TC-1262 -- wall-disk-check.py's pure core (parse_df / threshold_bytes /
   evaluate / journal_line) against FAKE df OUTPUT, and main() end to end with
   df replaced in-process, asserting the status file it actually wrote.
-* TC-1263 -- the shipped config files themselves: the logrotate stanza, the
-  logrotate.timer drop-in (list reset before the new value), the journald
-  drop-in and the two units.
+* TC-1263 -- the shipped config files themselves: the journald drop-in and
+  the two units.
 * TC-1264 -- the firstboot block, cut out of wall-firstboot.sh between its
-  BEGIN/END markers and EXECUTED in bash with install/cmp/systemctl and the
-  enable helpers replaced by recording shell functions. Needs bash.
+  BEGIN/END markers and EXECUTED in bash under set -euo pipefail with
+  install/cmp/dpkg-divert/systemctl and the enable helper replaced by
+  recording shell functions (systemctl keeps per-unit state, so masking is
+  checked for idempotency across two runs), plus failure injection. Needs bash.
 
-WHAT THIS DOES NOT PROVE. Nothing here runs logrotate, journald or systemd.
-That the drop-in really makes logrotate.timer hourly, and that the units load,
-was checked by hand under WSL systemd 255 when this was written
-(`systemd-analyze verify`, `logrotate -d`); on the panel it is proven by the
-paired release's own verification and `systemctl list-timers`.
+WHAT THIS DOES NOT PROVE. Nothing here runs journald or systemd. That the
+units load was checked by hand under WSL systemd 255 (`systemd-analyze
+verify`); on the panel it is proven by the paired release's own verification,
+`systemctl is-enabled rsyslog.service` (masked) and `systemctl list-timers`.
 
 Implements tests: TC-1262, TC-1263, TC-1264.
 """
@@ -192,30 +192,6 @@ def _directives(path):
             if line.strip() and not line.strip().startswith("#")]
 
 
-def test_tc1263_logrotate_caps_syslog_daily_at_100m_keeping_seven():
-    lines = _directives(WALL / "wall-logrotate-rsyslog")
-    body = lines[lines.index("{") + 1:lines.index("}")]
-    for directive in ("daily", "maxsize 100M", "rotate 7", "compress", "delaycompress",
-                      "missingok", "notifempty", "sharedscripts"):
-        assert directive in body, directive
-    assert "weekly" not in body and not any(d.startswith("size ") for d in body)
-    # The stock postrotate, unchanged.
-    assert body[body.index("postrotate") + 1] == "/usr/lib/rsyslog/rsyslog-rotate"
-    # The stock file list: replacing the stock file must not drop any log it rotated.
-    assert lines[:lines.index("{")] == ["/var/log/syslog", "/var/log/mail.log", "/var/log/kern.log",
-                                        "/var/log/auth.log", "/var/log/user.log", "/var/log/cron.log"]
-
-
-def test_tc1263_the_logrotate_timer_drop_in_resets_the_list_before_going_hourly():
-    lines = _directives(WALL / "wall-logrotate-hourly.conf")
-    timer = lines[lines.index("[Timer]") + 1:]
-    # OnCalendar is a list: without the empty assignment the stock `daily`
-    # stays armed beside `hourly` (systemd-dropin-directives-accumulate).
-    assert timer.index("OnCalendar=") < timer.index("OnCalendar=hourly")
-    assert [d for d in timer if d.startswith("OnCalendar")] == ["OnCalendar=", "OnCalendar=hourly"]
-    assert not any(d.startswith(("Persistent", "WantedBy")) for d in lines)
-
-
 def test_tc1263_journald_cap_is_explicit():
     lines = _directives(WALL / "wall-journald.conf")
     assert lines[0] == "[Journal]"
@@ -242,7 +218,7 @@ def test_tc1263_disk_check_units():
 
 def test_tc1263_new_files_are_lf_and_the_script_is_executable_in_git():
     for name in ("wall-disk-check.py", "wall-disk-check.service", "wall-disk-check.timer",
-                 "wall-logrotate-rsyslog", "wall-logrotate-hourly.conf", "wall-journald.conf"):
+                 "wall-journald.conf"):
         assert b"\r" not in (WALL / name).read_bytes(), name
     out = subprocess.run(["git", "-C", str(WALL), "ls-files", "-s", "wall-disk-check.py"],
                          capture_output=True, text=True, check=True).stdout
@@ -252,6 +228,7 @@ def test_tc1263_new_files_are_lf_and_the_script_is_executable_in_git():
 # ── TC-1264: the firstboot block, executed ───────────────────────────────────
 
 ENV_FILE = "/etc/wall-panel/wall-disk.env"
+SYSLOG_UNITS = ("rsyslog.service", "syslog.socket")
 
 
 def block():
@@ -261,23 +238,79 @@ def block():
     return found.group(1)
 
 
+SYSTEMCTL_STUB = r'''
+systemctl() {
+    RECORD
+    case "$1" in
+        show)   # show -p LoadState --value UNIT
+            u="${@: -1}"
+            if [ -f "STATE/$u.masked" ]; then echo masked
+            elif [ -f "STATE/$u.absent" ]; then echo not-found
+            else echo loaded; fi
+            return 0 ;;
+        mask)
+            [ -f "STATE/fail-mask" ] && return 1
+            shift; [ "$1" = --now ] && shift
+            for u in "$@"; do : > "STATE/$u.masked"; rm -f "STATE/$u.active"; done
+            return 0 ;;
+        disable)
+            [ -f "STATE/$2.masked" ] && return 1   # systemctl refuses a masked unit
+            return 0 ;;
+        is-active)
+            [ -f "STATE/$3.active" ] && return 0
+            [ -f "STATE/active-$3" ] && return 0
+            return 3 ;;
+    esac
+    return 0
+}
+'''
+
+
 def run_block(tmp_path, *, journald_same=False, fail_install="", enable_status=0,
-              inactive="", divert_state=None, divert_fails=False, media="/var/cache/wall-media"):
+              inactive="", media="/var/cache/wall-media", masked=(), absent=(), stuck_active=(),
+              fail_mask=False, diverted=False, old_dropin=False):
     """Run the real block under `set -euo pipefail` with every external command
     replaced by a recording shell function (a function outranks any binary).
 
-    fail_install: substring of an install's arguments that makes it fail.
-    inactive:     a unit name `systemctl is-active` reports inactive.
-    divert_state: what `dpkg-divert --truename` answers, persisted in a file so
-                  two runs share it (None = not diverted yet).
-    The generated env file is redirected into tmp_path; `cat`/`chmod` are real.
+    systemctl keeps per-unit state in files under tmp_path/state, so a second
+    run sees what the first did: `masked`, `absent` (LoadState not-found),
+    `stuck_active` (still active whatever happens), `fail_mask`.
+    `inactive` names a timer `is-active` reports down after its restart.
+    The generated env file, the logrotate stanza and the old drop-in paths are
+    redirected into tmp_path; `cat`, `chmod`, `rm` and `[ -e ]` are real.
     """
     calls = tmp_path / "calls"
-    state = tmp_path / "divert-state"
-    if divert_state is not None:
-        state.write_text(divert_state + "\n", encoding="utf-8")
-    env_file = (tmp_path / "wall-disk.env").as_posix()
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    for unit in SYSLOG_UNITS:
+        if unit not in masked and unit not in absent and not (state / (unit + ".masked")).exists():
+            (state / (unit + ".active")).touch()
+    for unit in masked:
+        (state / (unit + ".masked")).touch()
+    for unit in absent:
+        (state / (unit + ".absent")).touch()
+    for unit in stuck_active:
+        (state / ("active-" + unit)).touch()
+    if fail_mask:
+        (state / "fail-mask").touch()
+    for timer in ("wall-disk-check.timer",):
+        if timer != inactive:
+            (state / ("active-" + timer)).touch()
+        else:
+            (state / ("active-" + timer)).unlink(missing_ok=True)
+    etc = tmp_path / "etc"
+    (etc / "logrotate.d").mkdir(parents=True, exist_ok=True)
+    (etc / "dropin").mkdir(exist_ok=True)
+    stanza = etc / "logrotate.d" / "rsyslog"
+    dropin = etc / "dropin" / "60-wall-hourly.conf"
+    if diverted:
+        stanza.write_text("ours\n", encoding="utf-8")
+    if old_dropin:
+        dropin.write_text("[Timer]\n", encoding="utf-8")
     rec = 'printf "%s\\n" "{kind} $*" >> "' + calls.as_posix() + '"'
+    env_file = (tmp_path / "wall-disk.env").as_posix()
+    divert_list = ("local diversion of /etc/logrotate.d/rsyslog to /etc/logrotate.rsyslog.distrib"
+                   if diverted else "")
     script = "\n".join([
         "set -euo pipefail",
         'PAYLOAD="{}"'.format(WALL.as_posix()),
@@ -288,21 +321,14 @@ def run_block(tmp_path, *, journald_same=False, fail_install="", enable_status=0
         'install() { %s; case "$*" in *"%s"*) [ -n "%s" ] && return 1 ;; esac; return 0; }'
         % (rec.format(kind="install"), fail_install or "\x01", fail_install),
         'cmp() { return %d; }' % (0 if journald_same else 1),
-        ('dpkg-divert() {\n'
-         '    if [ "$1" = --truename ]; then\n'
-         '        if [ -f "STATE" ]; then cat "STATE"; else echo "$2"; fi; return 0\n'
-         '    fi\n'
-         '    RECORD\n'
-         '    FAIL\n'
-         '    echo /etc/logrotate.rsyslog.distrib > "STATE"\n'
-         '}').replace("STATE", state.as_posix()).replace("RECORD", rec.format(kind="dpkg-divert"))
-        .replace("FAIL", "return 1" if divert_fails else ":"),
-        'systemctl() { %s; [ "$1" = is-active ] && [ "$3" = "%s" ] && return 3; return 0; }'
-        % (rec.format(kind="systemctl"), inactive or "\x01"),
+        'dpkg-divert() { %s; [ "$1" = --list ] && { printf "%%s\\n" "%s"; return 0; }; return 0; }'
+        % (rec.format(kind="dpkg-divert"), divert_list),
+        SYSTEMCTL_STUB.replace("RECORD", rec.format(kind="systemctl")).replace("STATE", state.as_posix()),
         'enable_unit() { shift; %s; [ %d = 0 ] || { fail_step "systemctl enable FAILED for: $*"; return 1; }; }'
         % (rec.format(kind="enable_unit"), enable_status),
-        'enable_unit_now() { shift; %s; return 0; }' % rec.format(kind="enable_unit_now"),
-        block().replace(ENV_FILE, env_file),
+        block().replace(ENV_FILE, env_file)
+               .replace("rm -f /etc/logrotate.d/rsyslog", "rm -f " + stanza.as_posix())
+               .replace("/etc/systemd/system/logrotate.timer.d/60-wall-hourly.conf", dropin.as_posix()),
         "echo BLOCK-DONE",
     ]) + "\n"
     done = subprocess.run([BASH, "-s"], input=script, capture_output=True, timeout=60,
@@ -310,25 +336,24 @@ def run_block(tmp_path, *, journald_same=False, fail_install="", enable_status=0
     lines = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
     env_path = tmp_path / "wall-disk.env"
     env_text = env_path.read_text(encoding="utf-8") if env_path.exists() else None
-    return done, lines, env_text
+    return done, lines, env_text, state
 
 
 INSTALLS = [
-    "install -m 0644 {p}/wall-logrotate-rsyslog /etc/logrotate.d/rsyslog",
-    "install -m 0644 {p}/wall-logrotate-hourly.conf /etc/systemd/system/logrotate.timer.d/60-wall-hourly.conf",
     "install -m 0644 {p}/wall-journald.conf /etc/systemd/journald.conf.d/10-wall-cap.conf",
     "install -m 0755 {p}/wall-disk-check.py /usr/local/sbin/wall-disk-check.py",
     "install -m 0644 {p}/wall-disk-check.service /etc/systemd/system/wall-disk-check.service",
     "install -m 0644 {p}/wall-disk-check.timer /etc/systemd/system/wall-disk-check.timer",
 ]
-DIVERT_ADD = ("--local --rename --divert /etc/logrotate.rsyslog.distrib "
-              "--add /etc/logrotate.d/rsyslog")
+SYSLOG_OFF = [
+    "systemctl disable rsyslog.service",
+    "systemctl mask --now rsyslog.service syslog.socket",
+    "systemctl is-active --quiet rsyslog.service",
+    "systemctl is-active --quiet syslog.socket",
+]
 TAIL = [
     "systemctl daemon-reload",
     "systemctl restart systemd-journald",
-    "enable_unit logrotate.timer",
-    "systemctl restart logrotate.timer",
-    "systemctl is-active --quiet logrotate.timer",
     "enable_unit wall-disk-check.timer",
     "systemctl restart wall-disk-check.timer",
     "systemctl is-active --quiet wall-disk-check.timer",
@@ -345,73 +370,114 @@ def _fails(calls):
     return [c for c in calls if c.startswith("fail_step")]
 
 
+def _actions(calls):
+    """systemctl/enable calls other than the LoadState probes."""
+    return [c for c in calls if c.startswith(("systemctl", "enable_unit"))
+            and not c.startswith("systemctl show")]
+
+
 @needs_bash
-def test_tc1264_firstboot_diverts_installs_and_starts_both_timers(tmp_path):
-    done, calls, env_text = run_block(tmp_path)
+def test_tc1264_firstboot_masks_rsyslog_installs_and_starts_the_disk_timer(tmp_path):
+    done, calls, env_text, state = run_block(tmp_path)
     _ok(done)
     p = WALL.as_posix()
-    # The stock stanza is diverted BEFORE ours takes its name.
-    assert calls.index("dpkg-divert " + DIVERT_ADD) < calls.index(INSTALLS[0].format(p=p))
     assert [c for c in calls if c.startswith("install -m")] == [i.format(p=p) for i in INSTALLS]
     assert _fails(calls) == []
-    assert [c for c in calls if c.startswith(("systemctl", "enable_unit"))] == TAIL
+    assert _actions(calls) == SYSLOG_OFF + TAIL
+    assert all((state / (u + ".masked")).exists() for u in SYSLOG_UNITS)
+    assert "classic syslog off (masked: rsyslog.service syslog.socket)" in done.stdout
     assert "WALL_DISK_MEDIA_PATH=/var/cache/wall-media" in env_text.splitlines()
+    # The stock logrotate configuration is not touched in any way.
+    assert not any("logrotate" in c for c in calls if not c.startswith("dpkg-divert --list"))
 
 
 @needs_bash
-def test_tc1264_the_divert_is_idempotent_across_runs(tmp_path):
-    first, calls1, _ = run_block(tmp_path)
+def test_tc1264_masking_is_idempotent_across_runs(tmp_path):
+    first, calls1, _, _ = run_block(tmp_path)
     _ok(first)
     (tmp_path / "calls").unlink()
-    second, calls2, _ = run_block(tmp_path)
+    second, calls2, _, _ = run_block(tmp_path)
     _ok(second)
-    assert calls1.count("dpkg-divert " + DIVERT_ADD) == 1
-    # The second run finds the diversion in place and adds nothing.
-    assert not any(c.startswith("dpkg-divert") for c in calls2), calls2
-    assert INSTALLS[0].format(p=WALL.as_posix()) in calls2 and _fails(calls2) == []
+    # Already masked: no disable (it errors on a masked unit), mask re-asserted.
+    assert "systemctl disable rsyslog.service" not in calls2
+    assert "systemctl mask --now rsyslog.service syslog.socket" in calls2
+    assert _fails(calls2) == []
 
 
 @needs_bash
-@pytest.mark.parametrize("kwargs", [{"divert_state": "/etc/somewhere-else"}, {"divert_fails": True}])
-def test_tc1264_no_diversion_means_the_conffile_is_not_overwritten(tmp_path, kwargs):
-    done, calls, _ = run_block(tmp_path, **kwargs)
+def test_tc1264_a_missing_syslog_unit_is_skipped(tmp_path):
+    done, calls, _, _ = run_block(tmp_path, absent=("rsyslog.service",))
     _ok(done)
-    assert not any(c.endswith(" /etc/logrotate.d/rsyslog") and c.startswith("install") for c in calls)
-    assert len(_fails(calls)) == 1 and "could not divert" in _fails(calls)[0]
-    # Everything after it still happened.
-    assert [c for c in calls if c.startswith(("systemctl", "enable_unit"))] == TAIL
+    assert "systemctl disable rsyslog.service" not in calls
+    assert "systemctl mask --now syslog.socket" in calls and _fails(calls) == []
+
+
+@needs_bash
+def test_tc1264_a_failing_mask_is_reported_and_later_steps_still_run(tmp_path):
+    done, calls, _, _ = run_block(tmp_path, fail_mask=True)
+    _ok(done)
+    fails = _fails(calls)
+    assert any("could not mask and stop rsyslog.service syslog.socket" in f for f in fails), fails
+    # The units it could not stop are reported as still active, too.
+    assert any("rsyslog.service is still active" in f for f in fails), fails
+    assert "classic syslog off" not in done.stdout
+    assert _actions(calls)[-len(TAIL):] == TAIL
+
+
+@needs_bash
+def test_tc1264_a_unit_still_active_after_mask_is_a_failed_step(tmp_path):
+    done, calls, _, _ = run_block(tmp_path, stuck_active=("syslog.socket",))
+    _ok(done)
+    assert [f for f in _fails(calls)] == ["fail_step SR-083: syslog.socket is still active after mask --now"]
+    assert _actions(calls)[-len(TAIL):] == TAIL
+
+
+@needs_bash
+def test_tc1264_an_old_diversion_and_drop_in_from_the_earlier_design_are_undone(tmp_path):
+    done, calls, _, _ = run_block(tmp_path, diverted=True, old_dropin=True)
+    _ok(done)
+    assert "dpkg-divert --rename --remove /etc/logrotate.d/rsyslog" in calls
+    assert not (tmp_path / "etc" / "logrotate.d" / "rsyslog").exists()
+    assert not (tmp_path / "etc" / "dropin" / "60-wall-hourly.conf").exists()
+    assert _fails(calls) == []
+
+
+@needs_bash
+def test_tc1264_no_diversion_means_nothing_is_removed(tmp_path):
+    done, calls, _, _ = run_block(tmp_path)
+    _ok(done)
+    assert [c for c in calls if c.startswith("dpkg-divert")] == [
+        "dpkg-divert --list /etc/logrotate.d/rsyslog"]
 
 
 @needs_bash
 def test_tc1264_a_failing_install_is_reported_and_later_steps_still_run(tmp_path):
-    done, calls, _ = run_block(tmp_path, fail_install="wall-disk-check.py")
+    done, calls, _, _ = run_block(tmp_path, fail_install="wall-disk-check.py")
     _ok(done)
     assert len(_fails(calls)) == 1 and "could not install wall-disk-check.py" in _fails(calls)[0]
     p = WALL.as_posix()
     assert [c for c in calls if c.startswith("install -m")] == [i.format(p=p) for i in INSTALLS]
-    assert [c for c in calls if c.startswith(("systemctl", "enable_unit"))] == TAIL
+    assert _actions(calls) == SYSLOG_OFF + TAIL
 
 
 @needs_bash
 def test_tc1264_a_failing_enable_is_reported_and_later_steps_still_run(tmp_path):
-    done, calls, _ = run_block(tmp_path, enable_status=1)
+    done, calls, _, _ = run_block(tmp_path, enable_status=1)
     _ok(done)
-    assert [c for c in _fails(calls)] == ["fail_step systemctl enable FAILED for: logrotate.timer",
-                                          "fail_step systemctl enable FAILED for: wall-disk-check.timer"]
-    assert [c for c in calls if c.startswith(("systemctl", "enable_unit"))] == TAIL
+    assert _fails(calls) == ["fail_step systemctl enable FAILED for: wall-disk-check.timer"]
+    assert _actions(calls) == SYSLOG_OFF + TAIL
 
 
 @needs_bash
-@pytest.mark.parametrize("unit", ["logrotate.timer", "wall-disk-check.timer"])
-def test_tc1264_a_timer_that_is_not_active_after_restart_is_a_failed_step(tmp_path, unit):
-    done, calls, _ = run_block(tmp_path, inactive=unit)
+def test_tc1264_a_disk_timer_not_active_after_restart_is_a_failed_step(tmp_path):
+    done, calls, _, _ = run_block(tmp_path, inactive="wall-disk-check.timer")
     _ok(done)
-    assert len(_fails(calls)) == 1 and unit + " is not active" in _fails(calls)[0]
+    assert len(_fails(calls)) == 1 and "wall-disk-check.timer is not active" in _fails(calls)[0]
 
 
 @needs_bash
 def test_tc1264_the_checker_measures_the_cache_path_firstboot_resolved(tmp_path):
-    done, calls, env_text = run_block(tmp_path, media="/srv/wall-cache")
+    done, calls, env_text, _ = run_block(tmp_path, media="/srv/wall-cache")
     _ok(done)
     assert "WALL_DISK_MEDIA_PATH=/srv/wall-cache" in env_text.splitlines()
     assert _fails(calls) == []
@@ -420,7 +486,7 @@ def test_tc1264_the_checker_measures_the_cache_path_firstboot_resolved(tmp_path)
 @needs_bash
 @pytest.mark.parametrize("media", ["/srv/wall cache", "relative/cache"])
 def test_tc1264_an_unusable_cache_path_is_refused_not_written(tmp_path, media):
-    done, calls, env_text = run_block(tmp_path, media=media)
+    done, calls, env_text, _ = run_block(tmp_path, media=media)
     _ok(done)
     assert env_text is None
     assert len(_fails(calls)) == 1 and "WALL_MEDIA_CACHE" in _fails(calls)[0]
@@ -428,7 +494,7 @@ def test_tc1264_an_unusable_cache_path_is_refused_not_written(tmp_path, media):
 
 @needs_bash
 def test_tc1264_journald_is_not_restarted_when_its_drop_in_is_unchanged(tmp_path):
-    done, calls, _ = run_block(tmp_path, journald_same=True)
+    done, calls, _, _ = run_block(tmp_path, journald_same=True)
     _ok(done)
     assert "systemctl restart systemd-journald" not in calls
 
@@ -437,10 +503,22 @@ def test_tc1264_every_install_line_keeps_the_form_the_release_manifest_reads():
     """The manifest generator reads `install -m MODE "$PAYLOAD/x" DEST` and skips
     any line that says fail_step, so a guard written as `|| fail_step` on the
     install line would drop the file from the release in silence."""
-    for line in block().splitlines():
-        if re.search(r"\binstall\s+-m\s", line):
-            assert "fail_step" not in line, line
-            assert re.search(r'install -m [0-7]{4} "\$PAYLOAD/[^"]+" /\S+ \|\| logcap_failed ', line), line
+    lines = [line for line in block().splitlines() if re.search(r"\binstall\s+-m\s", line)]
+    assert len(lines) == len(INSTALLS)
+    for line in lines:
+        assert "fail_step" not in line, line
+        assert re.search(r'install -m [0-7]{4} "\$PAYLOAD/[^"]+" /\S+ \|\| logcap_failed ', line), line
+
+
+def test_tc1264_the_stock_logrotate_configuration_is_not_shipped_or_changed():
+    assert not (WALL / "wall-logrotate-rsyslog").exists()
+    assert not (WALL / "wall-logrotate-hourly.conf").exists()
+    code = "\n".join(l for l in block().splitlines() if not l.lstrip().startswith("#"))
+    # The only dpkg-divert verbs are --list and --remove (undoing the old design),
+    # and no systemctl verb names logrotate.timer.
+    assert set(re.findall(r"dpkg-divert (--\S+)", code)) == {"--list", "--rename"}
+    assert "--add" not in code
+    assert not re.search(r"systemctl [^\n]*logrotate\.timer", code)
 
 
 # ── TC-1262 (cont.): the media cache path comes from firstboot ───────────────

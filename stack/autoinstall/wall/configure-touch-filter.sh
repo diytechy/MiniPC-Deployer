@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Firstboot-only configuration and readiness assertion. Implements: SR-017.
+# Firstboot-only configuration and readiness assertion. Implements: SR-017, SR-084.
 set -euo pipefail
 payload=$(cd -- "$(dirname -- "$0")" && pwd)
 app_dir=/opt/wall-panel/app/runtime/resources/app
 config_dir=/etc/wall-panel
+# The unit's StateDirectory (LLR-1142); overridable only so a test can run OFF.
+state_dir=${WALL_TOUCH_STATE_DIR:-/var/lib/wall-touch-filter}
 rules=/etc/udev/rules.d/99-wall-touch-filter.rules
 env_file=${WALL_ENV_FILE:-/etc/wall-panel/wall.env}
 [ -r "$env_file" ] || { echo 'Touch filter: wall.env unavailable' >&2; exit 1; }
@@ -19,6 +21,9 @@ if [ "$mode" = off ]; then
         systemctl disable --now wall-touch-filter.service
     fi
     rm -f -- "$config_dir/touch-filter.enabled" "$rules" /etc/modules-load.d/wall-touch-filter.conf /usr/lib/systemd/system-sleep/wall-touch-filter
+    # OFF invalidates persisted protection (LLR-1143): turning adaptive back on
+    # later starts observing instead of resurrecting a band from before.
+    rm -f -- "$state_dir/protection.json"
     udevadm control --reload
     udevadm trigger --subsystem-match=input
     echo 'Touch filter OFF. Restart the kiosk session if it previously ignored the raw digitizer.'

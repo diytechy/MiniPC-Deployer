@@ -59,6 +59,30 @@ Inspect aggregate health at `/run/wall-touch-filter/status.json` and service
 state with `systemctl status wall-touch-filter.service`. No live deployment or
 hardware proof was performed by this implementation.
 
+## Protection survives a reboot (SR-084)
+
+The unit has `StateDirectory=wall-touch-filter` (`/var/lib/wall-touch-filter`,
+root, `0700`); nothing else became writable. The daemon (OfficeWallNaglight
+`touchfilter/persist.py`) writes its last qualifying fault renewal there as
+`protection.json` (device identity, configuration digest, axis and band, the
+wall-clock renewal and the expiry the 30-minute rule implies) and restores it
+at start only while that expiry is still ahead by wall clock. Restoring never
+renews. An orderly stop, a crash or a reboot keeps the file; expiry, OFF (this
+script deletes it), a configuration change, a different device and an operator
+reset (`sudo python3 -m touchfilter.persist reset`, run from the app directory)
+delete it. `status.json` reports `persistence.lastOutcome` and the restored
+expiry, never the band.
+
+The unit reaches the panel only through `configure-touch-filter.sh`, which
+`wall-firstboot.sh` runs on every boot (user-data does not install it), so a
+system-lane paired release carries this change.
+
+A soak can record raw input and decisions from inside the daemon (it grabs the
+device once armed, so an outside reader sees nothing): `sudo touch
+/run/wall-touch-filter/record.request`; output in
+`/run/wall-touch-filter/record/`, bounded, off by default; details in the
+application's `touchfilter/README.md`.
+
 ## Single path (`TOUCH_FILTER_SINGLE_PATH`, adaptive only, default false)
 
 Adaptive mode hands the physical digitizer back and forth: the compositor reads

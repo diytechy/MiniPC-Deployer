@@ -19,6 +19,7 @@ visible in its registry.
 | SR-022, LLR-006, TC-006, IF-014 | B11 — the weight feeder (SN-016; NagLight's weight-goal need) | 2026-09-09 |
 | SN-046, SR-049..SR-051, LLR-994.., TC-1048.. | the hub hang watchdog / recovery capability (HomeHub `HUB_HANG_WATCHDOG_DESIGN_2026-10-05.md` §12) | 2026-10-05 |
 | SN-047, SR-076..SR-081, LLR-1104..LLR-1125, TC-1193..TC-1219, IF-038 | AI CLI provisioning (SN-016 amended 2026-10-11): the provisioner, account and status wiring, panel rings derived from the usage sources (HomeHub `AI_CLI_PROVISIONING_PLAN_2026-10-11.md`) | 2026-10-11 |
+| SR-084, LLR-1142..LLR-1146, TC-1265..TC-1274 | W2: touch-filter protection survives a reboot (SN-013; HomeHub `IMPLEMENTATION_PLAN_2026-10-22.md` W2). Used: SR-084, LLR-1142..1144, TC-1265..1268 | 2026-10-22 |
 | SN-048, SR-085..SR-092, LLR-1147..LLR-1179, TC-1275..TC-1314, IF-065..IF-066 | hub continuous monitoring (HomeHub `IMPLEMENTATION_PLAN_2026-10-22.md` W3a); used so far: SR-085..SR-091, LLR-1147..LLR-1168, TC-1275..TC-1314, IF-065, IF-066 | 2026-10-22 |
 | SR-095..SR-096, LLR-1190..LLR-1199, TC-1330..TC-1344 | W11 — AI-usage gauges every minute: per-source cadence and backoff, the minute timer, the Claude refresher's expiry gate (HomeHub `docs/IMPLEMENTATION_PLAN_2026-10-22.md` W11) | 2026-10-22 |
 

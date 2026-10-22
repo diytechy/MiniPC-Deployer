@@ -32,8 +32,11 @@
 #
 # THE PROBLEM THIS EXISTS FOR. The Claude access token lives EIGHT HOURS
 # (`expiresAt` in ~/.claude/.credentials.json). Claude Code renews it out of the
-# refresh token whenever the CLI runs -- which is why an ordinary laptop signs in
-# once and works for weeks -- but the feeder never runs the CLI. It reads the
+# refresh token when the CLI runs NEAR ITS EXPIRY -- not on every run: measured
+# 2026-10-12..21, a refresher running every 4 h left the token lapsed for
+# minutes at a time before the run that renewed it (claude_refresh_due.py) -- which is why
+# an ordinary laptop, running the CLI all day, signs in once and works for
+# weeks. The feeder never runs the CLI. It reads the
 # credential file and calls api.anthropic.com directly, and it does not so much
 # as look at `expiresAt` (grep the module: zero references). So on a hub where
 # nobody types `claude`, the token simply runs out overnight and both Claude
@@ -128,15 +131,23 @@ CapabilityBoundingSet=
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 
 # The OUTPUT IS DISCARDED ON PURPOSE. `/usage` prints the household's live
-# consumption, and this unit runs six times a day forever; persisting that to
+# consumption, and this unit runs several times a day forever; persisting that to
 # the journal would write a usage history nobody asked for into the system log.
 # The gauges are where those numbers belong. Failures still surface: a non-zero
 # exit is recorded by systemd, and `systemctl status` names it.
 ExecCondition=+/bin/sh -c '[ -e "$$1" ] || [ -L "$$1" ]' gate /usr/local/bin/claude
+# ONLY NEAR EXPIRY (W11). The timer checks every 4 minutes; the CLI runs only when
+# the access token has under 20 minutes left, has expired, or its expiry cannot be
+# read. The helper exits 3 for "not due" and the shell turns exactly that into the
+# skip (exit 1); EVERY other result -- a run, a crash (1), a missing helper (2), a
+# missing python (127) -- passes the gate, so this line can only ever add a run,
+# never take away the last one. It runs as User= (no `+`): it reads the same file
+# the CLI will, and an unreadable one is "run", which then fails loudly.
+ExecCondition=/bin/sh -c '/usr/bin/python3 "$$1"; [ "$$?" -ne 3 ]' due /opt/homehub/stack/ai-usage/claude_refresh_due.py
 ExecStart=/bin/sh -c 'cd "$HOME" && exec claude -p "/usage" >/dev/null 2>&1'
 
 # A refresh that fails is not an emergency: the token is still valid until its
-# own expiry and the next run is four hours away, well inside the window. What
+# own expiry and the gate lets the next check, four minutes on, try again. What
 # must NOT happen is a restart storm against a vendor endpoint.
 Restart=no
 TimeoutStartSec=180

@@ -1408,6 +1408,35 @@ def test_a_good_b_failed_c_running_is_not_verified_llr1117(tmp_path):
     assert "login claude: verified" in out
 
 
+SKIP_CLAUDE = ["ai-usage: INFO claude: skipped - not due for 40s (reads every 60s)"]
+
+
+def test_a_run_that_skipped_the_source_defers_to_the_run_that_read_it_tc1342(tmp_path):
+    """SR-095: the feeder reads each source on its own schedule, so the newest
+    minute's run may not have read Claude at all. It printed no gauge line for
+    it, and the run that DID read it decides -- both ways."""
+    box, live = _claude_live_box(tmp_path)
+    box.journal({"gauges": live, "age": 120, "id": "A"},
+                {"gauges": [], "extra": SKIP_CLAUDE, "age": 60, "id": "B"})
+    assert "login claude: verified" in _status(box)
+    dead = [(k, "UNAVAILABLE") for k, _st in live]
+    box.journal({"gauges": live, "age": 180, "id": "A"},
+                {"gauges": dead, "age": 120, "id": "B"},
+                {"gauges": [], "extra": SKIP_CLAUDE, "age": 60, "id": "C"})
+    assert "login claude: credential present (not verified)" in _status(box)
+
+
+def test_the_walk_back_stops_at_a_run_that_died_and_at_the_age_limit_tc1342(tmp_path):
+    box, live = _claude_live_box(tmp_path)
+    box.journal({"gauges": live, "age": 180, "id": "A"},
+                {"manager_only": True, "age": 120, "id": "B"},
+                {"gauges": [], "extra": SKIP_CLAUDE, "age": 60, "id": "C"})
+    assert "login claude: credential present (not verified)" in _status(box)
+    box.journal({"gauges": live, "age": 1300, "id": "A"},
+                {"gauges": [], "extra": SKIP_CLAUDE, "age": 60, "id": "B"})
+    assert "login claude: credential present (not verified)" in _status(box)
+
+
 def test_a_run_that_died_before_printing_anything_counts_as_the_newest_failed_run_llr1117(tmp_path):
     box, live = _claude_live_box(tmp_path)
     box.journal({"gauges": live, "age": 900, "id": "A"}, {"manager_only": True, "age": 60, "id": "B"})

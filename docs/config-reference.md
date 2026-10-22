@@ -64,6 +64,26 @@ panel builder's and is not described here.
 | `AI_USAGE_CODEX_BIN` | `codex` | The binary the Codex reader launches. |
 | `AI_USAGE_TIMEOUT_SECONDS` | `30` | Per-source timeout, whole seconds. |
 | `AI_USAGE_STATE_FILE` | `/var/lib/homehub-ai/usage-state.json` | The one file the feeder writes. Must stay inside `/var/lib/homehub-ai`. |
+| `AI_USAGE_CLAUDE_INTERVAL`, `AI_USAGE_CLAUDE2_INTERVAL`, `AI_USAGE_GEMINI_INTERVAL`, `AI_USAGE_OPENCODE_INTERVAL` | blank = `60` | Seconds between reads of that source (SR-095), a whole number from 60 to 600. The timer runs every minute; a source whose interval has not passed is skipped. Anything else is **refused** by name at the unit's `--check`. |
+| `AI_USAGE_CODEX_INTERVAL` | blank = `120` | The same for Codex. Longer by default because each read spawns `codex app-server` (~1.5 s of CPU on the hub, measured 2026-10-22); `60` makes it every minute at that cost. |
+
+### How often, and what happens when a vendor objects (SR-095)
+
+The timer fires every minute. Each source keeps, in the state file, when it was
+last read, when it is next due, how far it has backed off and its
+authentication history, so the next cycle -- a new process -- carries on where
+it left off.
+
+* **429 or 5xx**: the source backs off. A `Retry-After` header (seconds or an
+  HTTP date) is honoured to the second, even past ten minutes (up to 24 h);
+  without one the source's interval doubles per throttled attempt up to 10
+  minutes. The last reading stays on the wall at its true `observed_at`.
+* **A dead login** greys the source's gauges only after failed authentication
+  **attempts** numbering at least two and spanning at least 10 minutes. Skipped
+  cycles do not count, a success resets, a network failure counts neither way.
+* **Changing an interval**: edit the knob in `/opt/homehub/stack/.env`; the next
+  cycle reads it (no restart needed). Run `sudo -u homehub-ai python3
+  /opt/homehub/stack/ai-usage/ai_usage_feeder.py --check` to see a refusal.
 
 ### What a failure looks like in the journal
 
@@ -72,8 +92,10 @@ the source name.
 
 | Line | Meaning |
 |---|---|
-| `claude: credential … carries no usable key` followed by `claude: authentication failure 1 of 2 - last reading kept until confirmed` | An authentication-class failure. The gauge keeps its last reading for one cycle. |
-| `… authentication failure 2 of 2 - CONFIRMED, its gauges are posted unavailable` | The second consecutive one: the source's gauges go grey (posted with no `observed_at`) and **stay grey** until a real reading arrives. |
+| `claude: credential … carries no usable key` followed by `claude: authentication failure, attempt 1 over 0s - last reading kept until confirmed (2 attempts over 600s)` | An authentication-class failure. The gauge keeps its last reading until the failure is confirmed. |
+| `… authentication failure, attempt 11 over 600s - CONFIRMED, its gauges are posted unavailable` | Failed attempts have now spanned 10 minutes: the source's gauges go grey (posted with no `observed_at`) and **stay grey** until a real reading arrives. |
+| `opencode: https://…: HTTP 429 (rate-limit headers: retry-after=120, …)` then `opencode: backing off 120s (level 1, Retry-After 120s honoured)` | The vendor throttled the source. Its gauges keep their last reading; the next lines for it are `INFO opencode: skipped - backing off, Ns left (level 1, Retry-After)` until it is due. |
+| `INFO codex: skipped - not due for 45s (reads every 120s)` | Normal: that source's own interval has not passed. Not a failure. |
 | `codex: JSON-RPC error -32603: … token_expired …` | Codex rejected the login server-side. The message is truncated to 200 characters and long opaque strings are replaced by `[redacted]`. |
 | `gemini: the CLI's access token has expired and has not been renewed …` | The token keeper is not renewing it. Check `systemctl status homehub-gemini-refresh.service`. |
 | `gemini-refresh: DEAD LOGIN - the CLI asked for an interactive sign-in …` (from `homehub-gemini-refresh.service`, exit 4) | Gemini CLI's stored login cannot be renewed. Sign in again; the ring is grey (or about to be) until then. |

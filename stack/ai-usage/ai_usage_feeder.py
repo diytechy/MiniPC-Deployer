@@ -86,11 +86,14 @@ Implements: SR-021, LLR-005
 """
 
 import calendar
+import contextvars
+import email.utils
 import http.client
 import json
 import math
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -154,7 +157,8 @@ RUNE_LIMIT = 120            # id/label/icon/unit are capped in RUNES, not bytes.
 # NagLight's staleness horizons, by window kind. Kept here because the feeder's
 # cadence has to be chosen against them: a WEEKLY gauge goes stale after 24h, so
 # a weekly feeder that runs daily is permanently on the edge of "unavailable".
-# AI_USAGE_INTERVAL defaults far below the tightest horizon for that reason.
+# The timer (one minute) and every per-source interval (SOURCE_INTERVAL_MAX_SECONDS)
+# sit far below the tightest horizon for that reason.
 STALE_HORIZON_SECONDS = {
     "daily": 36 * 3600,
     "weekly": 24 * 3600,
@@ -312,6 +316,30 @@ class AuthFailure(SourceFailure):
         SourceFailure.__init__(self, message)
         self.status = status
         self.code = code
+
+
+class Throttled(SourceFailure):
+    """A SourceFailure in which the vendor asked us to come back LATER: an HTTP
+    429 or any 5xx (W11, 2026-10-22).
+
+    Like AuthFailure it IS a SourceFailure, so the gauge path is unchanged (the
+    last reading is re-posted at its true `observed_at`); what differs is the
+    SCHEDULE. `run_cycle` catches it before the plain handler and backs the
+    source off: `retry_at` -- the ABSOLUTE instant the vendor named, anchored
+    at the moment its answer arrived, not at the cycle's start (an earlier
+    source may have taken 30 s) -- is honoured when the vendor sent one, and an
+    exponential delay to BACKOFF_CEILING_SECONDS is used when it did not.
+
+    `status` is the HTTP status. Neither field is the remote's free text.
+
+    Implements: SR-095, LLR-1192
+    """
+
+    def __init__(self, message, status=None, retry_after=None, retry_at=None):
+        SourceFailure.__init__(self, message)
+        self.status = status
+        self.retry_after = retry_after      # seconds, as the vendor said them
+        self.retry_at = retry_at            # epoch seconds; None = "cycle start + retry_after"
 
 
 class EgressRefused(Exception):
@@ -1226,18 +1254,35 @@ def validate_stored_reading(entry, now):
             "window_end": end, "window_seconds": length}
 
 
-# ── Authentication failures: counted across cycles, then remembered ─────────
+# ── Per-source cadence, backoff and authentication history (W11) ─────────────
 #
-# PLAN 3.6 (G2). Both feeders are ONE-SHOT timer units, so the only memory that
-# survives from one cycle to the next is the state file -- and `load_state`
-# silently drops every key that is not a reading. Two entries therefore have
-# their own validators and are carried by `save_state` like any other:
+# THE TIMER RUNS EVERY MINUTE (Owner 2026-10-22: "update the AI usage gauges
+# every minute; they fall behind"), but that does not mean every source is read
+# every minute. Each source -- and each Claude ACCOUNT, because `claude` and
+# `claude2` are separate sources -- carries its own schedule, and a cycle SKIPS a
+# source that is not due or is backing off. This is a one-shot unit, so nothing
+# in memory survives a cycle: the schedule lives in the state file under one
+# reserved key, SCHEDULE_KEY, with its own validator in `load_state` (never an
+# exemption from validation), exactly as the auth marker does.
 #
-#   AUTH_COUNTS_KEY   one reserved key: {source: consecutive auth-failed cycles}.
-#                     "Reserved" because no gauge id can start with an
-#                     underscore (they are all `ai-usage-...`).
+#   SCHEDULE_KEY      {source: entry}. "Reserved" because no gauge id can start
+#                     with an underscore (they are all `ai-usage-...`).
 #   an AUTH MARKER    under a GAUGE's own key, REPLACING its stored reading once
-#                     the failure is confirmed: {"auth_failed": true, "at": <epoch>}.
+#                     an authentication failure is confirmed:
+#                     {"auth_failed": true, "at": <epoch>}.
+#
+# One schedule entry, every field a number, a flag or a word from a fixed list:
+#
+#   last_attempt   when the source was last actually READ (a skip is not one)
+#   next_due       when it may be read again
+#   hold           True when next_due is the VENDOR's Retry-After: then it is
+#                  honoured to the second, with no DUE_SLACK_SECONDS
+#   backoff        consecutive throttled attempts (429 / 5xx); 0 when healthy
+#   auth_since     the first failed-authentication attempt of the current run
+#   auth_last      the latest failed-authentication attempt of that run
+#   auth_attempts  how many failed-authentication attempts that run holds
+#   last_outcome   one of OUTCOMES
+#   ratelimit      the vendor's rate-limit response headers, last seen (optional)
 #
 # THE MARKER REPLACES THE READING AND DOES NOT DELETE THE KEY, and that is the
 # whole point of its shape. `state_keys` answers "have we ever seen this gauge",
@@ -1245,38 +1290,385 @@ def validate_stored_reading(entry, now):
 # Deleting the key would make the band VANISH instead of going grey -- the very
 # defect `state_keys`'s docstring records from the 2026-09 review.
 #
-# Both hold counts and timestamps only: never a credential, a header or a body.
-AUTH_COUNTS_KEY = "__auth_failures__"
-AUTH_CONFIRM_CYCLES = 2         # consecutive auth-failed cycles before a gauge greys.
-_AUTH_COUNT_CEILING = 100       # a stored count above this is corruption, not history.
+# Both hold numbers, flags and the vendor's rate-limit header values only: never
+# a credential, a request header or a body.
+SCHEDULE_KEY = "__schedule__"
+
+# The words an attempt can end in. A SKIP is deliberately not one of them: a
+# skipped source was not attempted, so its entry is left exactly as it was.
+OUTCOMES = ("ok", "auth", "throttled", "failure", "pending")
+
+# How often each source is read when it is healthy. 60 s for the HTTP sources
+# (the Owner's minute). Codex is the exception, chosen by measurement: one read
+# spawns `codex app-server`, which cost 2.4-2.9 s of CPU per read on the hub
+# (2026-10-22, per-process accounting of the unit's cgroup) against ~0.5 s for
+# the whole rest of the cycle, so reading it every minute would be ~4 % of one
+# core for a WEEKLY gauge. Every second cycle halves that and still meets the
+# 3-minute freshness target (README "Cadence"). A long-lived app-server was the
+# alternative; see README for why it was not chosen.
+DEFAULT_SOURCE_INTERVAL_SECONDS = 60
+SOURCE_INTERVAL_DEFAULTS = {"codex": 120}
+# A knob outside these bounds is refused. Below 60 s the timer cannot honour it;
+# above 600 s is slower than the cadence this feeder had before 2026-10-22, and
+# the status step's evidence window (ai-cli-status.sh) is twice that.
+SOURCE_INTERVAL_MIN_SECONDS = 60
+SOURCE_INTERVAL_MAX_SECONDS = 600
+
+# A healthy source is due this much BEFORE its next_due, because the timer is
+# not a metronome: OnUnitActiveSec=1min plus up to RandomizedDelaySec=10s and
+# AccuracySec=5s puts consecutive cycles 60-75 s apart, and without slack a
+# source due at +60 s that the next cycle reaches at +59 s would wait a whole
+# extra cycle. It must exceed the timer's own jitter and stay well under the
+# shortest interval; tests/test_ai_usage_feeder.py asserts both against the
+# shipped timer. It never applies to a vendor's Retry-After (`hold`).
+DUE_SLACK_SECONDS = 15
+
+# Exponential backoff after a 429 or 5xx that named no Retry-After: the
+# source's interval doubled per consecutive throttled attempt, to this ceiling.
+BACKOFF_CEILING_SECONDS = 600
+_BACKOFF_LEVEL_CEILING = 30
+
+# A Retry-After LONGER than the backoff ceiling is honoured as given -- the
+# vendor knows its own limit -- up to this sanity bound, past which the value is
+# clamped to it rather than parked for a year by one malformed header.
+RETRY_AFTER_MAX_SECONDS = 24 * 3600
+_RETRY_ANCHOR_SLACK_SECONDS = 3600
+
+# A source's gauges go grey only after failed-AUTHENTICATION attempts that number
+# at least AUTH_CONFIRM_ATTEMPTS and span at least AUTH_CONFIRM_SECONDS. The rule
+# used to be "two consecutive cycles", written for a 10-minute timer; on a
+# 1-minute timer that would grey a gauge two minutes into any blip. Measured on
+# the hub (journal 2026-10-12..21): every Claude 401 since the 10-11 re-sign-in
+# was the access token lapsing shortly before homehub-claude-refresh@ renewed it,
+# and each cleared on the next refresher run. The span is what absorbs that
+# window; the refresher's cadence is what keeps it short (its timer's comment).
+AUTH_CONFIRM_ATTEMPTS = 2
+AUTH_CONFIRM_SECONDS = 600
+_AUTH_ATTEMPT_CEILING = 100000
+
+# What a rate-limit response header may be called, and look like, to be recorded.
+_RATE_LIMIT_HEADER = re.compile(
+    r"(?i)^(retry-after|x-ratelimit-[a-z0-9-]{1,48}|x-rate-limit-[a-z0-9-]{1,48}"
+    r"|ratelimit(-[a-z0-9-]{1,48})?|anthropic-ratelimit-[a-z0-9-]{1,48})$")
+_RATE_LIMIT_VALUE = re.compile(r"^[A-Za-z0-9 ,.:;=_+/-]{0,64}$")
+_RATE_LIMIT_MAX_HEADERS = 16
 
 
-def validate_auth_counts(entry, sources):
-    """The per-source consecutive-failure counter, or {} if it is not credible.
+def _epoch_int(raw):
+    """An integer epoch from a JSON number, or None (bools, NaN and strings are not)."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        return None
+    return int(raw)
+
+
+def sanitize_rate_limit_headers(pairs):
+    """{name: value} of the rate-limit headers among `pairs`, made safe to store.
 
     Contract:
-      Inputs:  entry: whatever the state file holds under AUTH_COUNTS_KEY;
-               sources: the source names that exist (SOURCE_READERS).
-      Outputs: {source: int in 1..100} -- an unknown source, a zero, a bool, a
-               float or a string is dropped, never repaired.
+      Inputs:  pairs: an iterable of (name, value) -- an HTTP response's headers.
+      Outputs: at most _RATE_LIMIT_MAX_HEADERS entries, names lower-cased and
+               matching _RATE_LIMIT_HEADER, values matching _RATE_LIMIT_VALUE.
+               Anything else is dropped, never repaired.
 
-    Implements: SR-068, LLR-1054
+    These are the vendor's numbers about its own limits (W11 task 2: "record each
+    source's rate-limit response headers when present"). The allow-list of NAMES
+    keeps every other header -- a cookie, a request id -- out of the state file;
+    the value pattern keeps anything token-shaped out even under an allowed name.
+
+    Implements: SR-095, LLR-1192
+    """
+    out = {}
+    for name, value in pairs or ():
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        name = name.strip().lower()
+        value = value.strip()
+        # fullmatch, not match: `$` would let one trailing newline through.
+        if _RATE_LIMIT_HEADER.fullmatch(name) and _RATE_LIMIT_VALUE.fullmatch(value):
+            out[name] = value
+            if len(out) >= _RATE_LIMIT_MAX_HEADERS:
+                break
+    return out
+
+
+def parse_retry_after(value, now):
+    """A Retry-After header -> whole seconds to wait from `now`, or None.
+
+    Contract:
+      Inputs:  value: the header's text, or None; now: epoch seconds.
+      Outputs: int in 0..RETRY_AFTER_MAX_SECONDS, or None when the value is
+               absent or is neither form (the caller then backs off
+               exponentially).
+
+    BOTH FORMS (RFC 9110 10.2.3): delay-seconds (`120`) and an HTTP-date
+    (`Wed, 21 Oct 2026 07:28:00 GMT`). A date already past is 0 -- come back
+    now -- not a refusal. A value longer than BACKOFF_CEILING_SECONDS is
+    honoured as given; only one past RETRY_AFTER_MAX_SECONDS is clamped.
+
+    Implements: SR-095, LLR-1192
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        seconds = int(text)
+    else:
+        try:
+            when = email.utils.parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = int(math.ceil(when.timestamp() - now))
+    return max(0, min(seconds, RETRY_AFTER_MAX_SECONDS))
+
+
+def validate_schedule(entry, sources, now):
+    """The per-source schedule, or {} for anything that is not credible.
+
+    Contract:
+      Inputs:  entry: whatever the state file holds under SCHEDULE_KEY;
+               sources: the source names that exist (SOURCE_READERS);
+               now: this cycle's clock.
+      Outputs: {source: entry} holding only entries whose every field passes;
+               an entry with one bad field is dropped WHOLE, never repaired.
+               A dropped entry means "due now, no history", which is the safe
+               reading of a schedule nobody can vouch for.
+
+    A STAMP FROM THE FUTURE IS A CLOCK THAT WENT BACKWARDS, not a schedule. An
+    entry whose last_attempt lies past `now` (plus MAX_CLOCK_SKEW_SECONDS) is
+    dropped, so a hub whose clock steps back a day reads the source at once
+    instead of skipping it for a day. A clock that steps FORWARD needs no rule:
+    every next_due is simply in the past, and the source is due.
+
+    Implements: SR-095, LLR-1190
     """
     if not isinstance(entry, dict):
         return {}
     out = {}
-    for source, count in entry.items():
-        if source not in sources:
-            continue
-        if isinstance(count, bool) or not isinstance(count, int):
-            continue
-        if 1 <= count <= _AUTH_COUNT_CEILING:
-            out[source] = count
+    for source, item in entry.items():
+        if source in sources:
+            checked = _validate_schedule_entry(item, now)
+            if checked is not None:
+                out[source] = checked
     return out
 
 
+def _validate_schedule_entry(item, now):
+    if not isinstance(item, dict):
+        return None
+    last = _epoch_int(item.get("last_attempt"))
+    due = _epoch_int(item.get("next_due"))
+    if last is None or due is None:
+        return None
+    if last < EPOCH_FLOOR or last > now + MAX_CLOCK_SKEW_SECONDS:
+        return None
+    # The bound allows a Retry-After of the full 24 h anchored at an answer that
+    # arrived late in a long cycle (the unit's TimeoutStartSec is 180 s).
+    if not (last <= due <= last + RETRY_AFTER_MAX_SECONDS + _RETRY_ANCHOR_SLACK_SECONDS):
+        return None
+    hold = item.get("hold")
+    backoff = item.get("backoff")
+    outcome = item.get("last_outcome")
+    if not isinstance(hold, bool) or outcome not in OUTCOMES:
+        return None
+    if isinstance(backoff, bool) or not isinstance(backoff, int) \
+            or not 0 <= backoff <= _BACKOFF_LEVEL_CEILING:
+        return None
+    out = {"last_attempt": last, "next_due": due, "hold": hold,
+           "backoff": backoff, "last_outcome": outcome}
+    since, latest = item.get("auth_since"), item.get("auth_last")
+    attempts = item.get("auth_attempts")
+    if since is not None or latest is not None or attempts is not None:
+        since, latest = _epoch_int(since), _epoch_int(latest)
+        if since is None or latest is None \
+                or not EPOCH_FLOOR <= since <= latest <= last:
+            return None
+        if isinstance(attempts, bool) or not isinstance(attempts, int) \
+                or not 1 <= attempts <= _AUTH_ATTEMPT_CEILING:
+            return None
+        out["auth_since"], out["auth_last"], out["auth_attempts"] = since, latest, attempts
+    if "ratelimit" in item:
+        headers = item["ratelimit"]
+        if not isinstance(headers, dict):
+            return None
+        clean = sanitize_rate_limit_headers(headers.items())
+        if len(clean) != len(headers):
+            return None
+        if clean:
+            out["ratelimit"] = clean
+    return out
+
+
+def source_intervals(env, names):
+    """{source: seconds between reads} for `names`, from the per-source knobs.
+
+    Contract:
+      Config:  AI_USAGE_<SOURCE>_INTERVAL (seconds, an integer), e.g.
+               AI_USAGE_CODEX_INTERVAL. Blank or absent is the default
+               (SOURCE_INTERVAL_DEFAULTS, else DEFAULT_SOURCE_INTERVAL_SECONDS).
+      Raises:  SystemExit naming the knob when a value is not an integer in
+               SOURCE_INTERVAL_MIN_SECONDS..SOURCE_INTERVAL_MAX_SECONDS. A
+               malformed knob is a refusal, the same as an unknown source in
+               AI_USAGE_SOURCES; `--check` (the unit's ExecStartPre) runs it.
+
+    Implements: SR-095, LLR-1190
+    """
+    out = {}
+    for name in names:
+        knob = "AI_USAGE_%s_INTERVAL" % name.upper()
+        raw = (env.get(knob) or "").strip()
+        if not raw:
+            out[name] = SOURCE_INTERVAL_DEFAULTS.get(name, DEFAULT_SOURCE_INTERVAL_SECONDS)
+            continue
+        if not raw.isdigit() or not (SOURCE_INTERVAL_MIN_SECONDS <= int(raw)
+                                     <= SOURCE_INTERVAL_MAX_SECONDS):
+            raise SystemExit(
+                "REFUSED: %s=%r must be a whole number of seconds from %d to %d"
+                % (knob, raw, SOURCE_INTERVAL_MIN_SECONDS, SOURCE_INTERVAL_MAX_SECONDS))
+        out[name] = int(raw)
+    return out
+
+
+def schedule_wait(entry, now):
+    """Seconds until this source may be read again; 0 means read it this cycle.
+
+    A source with no (credible) entry is due. A healthy source is due
+    DUE_SLACK_SECONDS early (the timer's jitter); a vendor's Retry-After
+    (`hold`) is honoured to the second.
+
+    Implements: SR-095, LLR-1190
+    """
+    if not entry:
+        return 0
+    slack = 0 if entry["hold"] else DUE_SLACK_SECONDS
+    return max(0, entry["next_due"] - slack - now)
+
+
+def next_schedule(entry, outcome, now, interval, retry_at=None, ratelimit=None):
+    """The schedule entry after ONE ATTEMPT that ended in `outcome`. Pure.
+
+    Contract:
+      Inputs:  entry: the validated previous entry, or None;
+               outcome: one of OUTCOMES; now: this cycle's clock;
+               interval: the source's healthy cadence in seconds;
+               retry_at: for "throttled", the epoch second the vendor's
+                         Retry-After names (anchored at the answer's receipt);
+               ratelimit: sanitized rate-limit headers seen on this attempt.
+      Outputs: a new entry; `entry` is never mutated.
+
+    The rules, each one a line of W11 task 2 or 4:
+      ok         due again after `interval`; backoff and auth history cleared
+                 (A SUCCESS RESETS).
+      auth       due again after `interval` (a dead login is not throttling);
+                 the auth run's first attempt is kept and its count advanced.
+      throttled  the vendor's Retry-After when it sent one (strict, `hold`, when
+                 it asks for longer than our own cadence would wait anyway), else
+                 `interval` doubled per consecutive throttled attempt up to
+                 BACKOFF_CEILING_SECONDS. Auth history untouched.
+      failure /  due again after `interval`; backoff cleared; auth history
+      pending    untouched -- the vendor never answered about the login, so the
+                 attempt is evidence neither way.
+    A SKIPPED cycle never reaches here, which is why a skip neither resets nor
+    advances anything.
+
+    Implements: SR-095, SR-096, LLR-1191, LLR-1192, LLR-1193
+    """
+    if outcome not in OUTCOMES:
+        raise ValueError("unknown outcome %r" % (outcome,))
+    previous = entry or {}
+    out = {"last_attempt": now, "next_due": now + interval, "hold": False,
+           "backoff": 0, "last_outcome": outcome}
+    if outcome == "throttled":
+        level = min(previous.get("backoff", 0) + 1, _BACKOFF_LEVEL_CEILING)
+        out["backoff"] = level
+        if retry_at is not None:
+            out["next_due"] = max(int(math.ceil(retry_at)), now + interval)
+            out["hold"] = retry_at > now + interval - DUE_SLACK_SECONDS
+        else:
+            ceiling = max(BACKOFF_CEILING_SECONDS, interval)
+            out["next_due"] = now + min(interval * (2 ** level), ceiling)
+    if outcome != "ok" and "auth_since" in previous:
+        for key in ("auth_since", "auth_last", "auth_attempts"):
+            out[key] = previous[key]
+    if outcome == "auth":
+        out.setdefault("auth_since", now)
+        out["auth_last"] = now
+        out["auth_attempts"] = min(out.get("auth_attempts", 0) + 1, _AUTH_ATTEMPT_CEILING)
+    headers = ratelimit or previous.get("ratelimit")
+    if headers:
+        out["ratelimit"] = dict(headers)
+    return out
+
+
+def auth_failure_confirmed(entry):
+    """True once the source's failed-authentication attempts are CONFIRMED.
+
+    At least AUTH_CONFIRM_ATTEMPTS attempts, spanning at least
+    AUTH_CONFIRM_SECONDS from the first FAILED-AUTHENTICATION attempt to the
+    latest one (`auth_last`) -- never to `last_attempt`, which a later network
+    failure also moves: two 401s a minute apart and a timeout ten minutes on
+    are not ten minutes of dead login. A skipped cycle adds neither an attempt
+    nor any span.
+
+    Implements: SR-068, LLR-1054
+    """
+    if not entry or "auth_since" not in entry:
+        return False
+    return (entry["auth_attempts"] >= AUTH_CONFIRM_ATTEMPTS
+            and entry["auth_last"] - entry["auth_since"] >= AUTH_CONFIRM_SECONDS)
+
+
+# ── The journal's words for the schedule. Kept stable: the 24-hour verification
+# (README "Verifying the cadence") greps for them.
+
+def skip_note(name, entry, wait, interval):
+    """The INFO line for a skipped source: why, and for how long.
+
+    Implements: SR-095, LLR-1190
+    """
+    if entry and entry.get("last_outcome") == "throttled":
+        return "%s: skipped - backing off, %ds left (level %d%s)" % (
+            name, wait, entry["backoff"], ", Retry-After" if entry["hold"] else "")
+    return "%s: skipped - not due for %ds (reads every %ds)" % (name, wait, interval)
+
+
+def backoff_line(name, entry, now, retry_after):
+    """The failure line that says a source has just started (or extended) a backoff.
+
+    Implements: SR-095, LLR-1192
+    """
+    delay = entry["next_due"] - now
+    reason = ("Retry-After %ds honoured" % retry_after if retry_after is not None
+              else "no Retry-After, exponential to %ds" % max(BACKOFF_CEILING_SECONDS, delay))
+    return "%s: backing off %ds (level %d, %s)" % (name, delay, entry["backoff"], reason)
+
+
+def auth_line(name, entry):
+    """The failure line for a failed-authentication attempt: confirmed or not.
+
+    "authentication failure" and "CONFIRMED" are the words the refresh-gauge-logins
+    skill and the old two-cycle rule's journal both used, so a grep written for
+    either still finds these.
+
+    Implements: SR-068, LLR-1054
+    """
+    span = entry["auth_last"] - entry["auth_since"]
+    if auth_failure_confirmed(entry):
+        tail = " - CONFIRMED, its gauges are posted unavailable"
+    else:
+        tail = " - last reading kept until confirmed (%d attempts over %ds)" % (
+            AUTH_CONFIRM_ATTEMPTS, AUTH_CONFIRM_SECONDS)
+    return "%s: authentication failure, attempt %d over %ds%s" % (
+        name, entry["auth_attempts"], span, tail)
+
+
 def validate_auth_marker(entry, now):
-    """An "auth failed" marker, or None. Its own shape; see AUTH_COUNTS_KEY.
+    """An "auth failed" marker, or None. Its own shape; see SCHEDULE_KEY.
 
     Implements: SR-068, LLR-1055
     """
@@ -1308,9 +1700,10 @@ def build_post(spec, reading, last, now, auth_confirmed=False):
                         are separated by every source read in the cycle;
                now:     epoch seconds;
                auth_confirmed: True when this gauge's source has failed
-                        authentication on enough consecutive cycles to be
-                        CONFIRMED dead (plan 3.6, G2). The stored reading is
-                        then not history any more: it is skipped and the
+                        authentication on enough attempts over enough time to
+                        be CONFIRMED dead (plan 3.6, G2; W11
+                        `auth_failure_confirmed`). The stored reading is then
+                        not history any more: it is skipped and the
                         stale-on-arrival body goes out.
       Outputs: (body: dict, fresh: bool). `fresh` is True only when the body
                carries THIS cycle's timestamp.
@@ -1330,7 +1723,7 @@ def build_post(spec, reading, last, now, auth_confirmed=False):
         nothing, and the 0 is never rendered as a live reading. This is the one
         number in the file we did not measure, and it is unreachable as a
         displayed value by construction;
-      * source failed AUTHENTICATION on enough consecutive cycles (`auth_confirmed`)
+      * source failed AUTHENTICATION, confirmed over attempts and time (`auth_confirmed`)
         -> the never-measured body even though a previous reading exists. A
         dead login must not keep its last number in colour until the horizon.
         A stored AUTH MARKER (`validate_auth_marker`) is not a reading, so it
@@ -1715,10 +2108,16 @@ def load_state(state_path, now):
 
     TWO KINDS OF ENTRY BESIDE A READING ARE RECOGNISED, each by its own
     validator and never by an exemption from validation: the reserved
-    AUTH_COUNTS_KEY (the consecutive-auth-failure counter) and an auth marker
-    under a gauge's key. Without that, the loader would silently drop them and
-    the next `save_state` would erase the count and the marker with them --
-    which is exactly how a one-shot unit would forget it had ever failed.
+    SCHEDULE_KEY (each source's next due time, backoff level and
+    authentication history) and an auth marker under a gauge's key. Without
+    that, the loader would silently drop them and the next `save_state` would
+    erase the schedule and the marker with them -- which is exactly how a
+    one-shot unit would forget it had ever failed, or been told to back off.
+
+    A state file written before 2026-10-22 may hold `__auth_failures__`, the old
+    consecutive-cycle counter. It is not a reading and has no validator, so it
+    is dropped like any other junk: the authentication history restarts, and a
+    gauge already marked stays marked.
     """
     try:
         with open(state_path, encoding="utf-8") as handle:
@@ -1729,10 +2128,10 @@ def load_state(state_path, now):
         return {}
     out = {}
     for key, entry in data.items():
-        if key == AUTH_COUNTS_KEY:
-            counts = validate_auth_counts(entry, SOURCE_READERS)
-            if counts:
-                out[key] = counts
+        if key == SCHEDULE_KEY:
+            schedule = validate_schedule(entry, SOURCE_READERS, now)
+            if schedule:
+                out[key] = schedule
             continue
         checked = validate_stored_reading(entry, now)
         if checked is None:
@@ -1992,6 +2391,54 @@ def vendor_opener():
         urllib.request.ProxyHandler({}), _RefuseRedirects())
 
 
+# Where `http_json` puts the rate-limit headers it sees, for the source being
+# read right now. `run_cycle` sets a fresh list around each reader and resets it
+# after; outside a cycle (a test, a hand call) it is None and nothing is kept.
+# A context variable rather than a parameter so that no reader signature and no
+# test double of `http_json` had to change to carry it.
+_RATE_LIMIT_SINK = contextvars.ContextVar("ai_usage_rate_limit_sink", default=None)
+
+
+def record_rate_limit_headers(headers):
+    """Sanitize a response's rate-limit headers and hand them to the cycle's sink.
+
+    Returns the sanitized dict (possibly empty) so a caller can also use it.
+    `headers` is an http.client message or anything with `.items()`; None and
+    an unreadable object are no headers, never an exception.
+
+    Implements: SR-095, LLR-1192
+    """
+    try:
+        pairs = list(headers.items()) if headers is not None else []
+    except Exception:
+        pairs = []
+    seen = sanitize_rate_limit_headers(pairs)
+    sink = _RATE_LIMIT_SINK.get()
+    if seen and sink is not None:
+        sink.append(seen)
+    return seen
+
+
+def throttled_failure(message, status, seen, now):
+    """A `Throttled` for a 429/5xx whose sanitized headers are `seen`.
+
+    The message names the Retry-After as parsed and every recorded rate-limit
+    header, so the journal says WHY the source is backing off with the vendor's
+    own numbers -- and nothing else the vendor sent.
+
+    Implements: SR-095, LLR-1192
+    """
+    retry_after = parse_retry_after(seen.get("retry-after"), now)
+    if seen:
+        message += " (rate-limit headers: %s)" % ", ".join(
+            "%s=%s" % pair for pair in sorted(seen.items()))
+    # `now` is the moment the answer ARRIVED, so the deadline is the vendor's,
+    # not "cycle start + seconds" -- which would come back early after a slow
+    # source earlier in the same cycle.
+    return Throttled(message, status=status, retry_after=retry_after,
+                     retry_at=None if retry_after is None else now + retry_after)
+
+
 def http_json(url, headers, timeout, data=None):
     """One GET (or, with `data`, one JSON POST), decoded.
 
@@ -2012,6 +2459,12 @@ def http_json(url, headers, timeout, data=None):
     `data` (a JSON-encodable object) turns the call into a POST with
     `Content-Type: application/json`. Gemini's two calls are POSTs; nothing
     else about the opener changes -- same redirect refusal, same no-proxy rule.
+
+    A 429 or a 5xx is a `Throttled` failure carrying the parsed Retry-After
+    (W11), so `run_cycle` backs the source off instead of asking again next
+    minute. The vendor's rate-limit headers, on any answer, go to the cycle's
+    sink (`record_rate_limit_headers`); the signature is unchanged on purpose,
+    so every reader and every test double keeps working.
     """
     if not url.lower().startswith("https://"):
         raise SourceFailure(
@@ -2025,12 +2478,17 @@ def http_json(url, headers, timeout, data=None):
             headers=dict(headers, **{"Content-Type": "application/json"}))
     try:
         with vendor_opener().open(request, timeout=timeout) as response:
+            record_rate_limit_headers(response.headers)
             if response.status != 200:
                 raise SourceFailure("%s: HTTP %s" % (url, response.status))
             raw = response.read()
     except urllib.error.HTTPError as exc:
+        seen = record_rate_limit_headers(exc.headers)
         if exc.code == 401:
             raise AuthFailure("%s: HTTP 401" % url, status=401)
+        if exc.code == 429 or 500 <= exc.code <= 599:
+            raise throttled_failure("%s: HTTP %s" % (url, exc.code), exc.code, seen,
+                                    int(time.time()))
         raise SourceFailure("%s: HTTP %s" % (url, exc.code))
     except (SourceFailure, EgressRefused):
         raise
@@ -2085,6 +2543,10 @@ def redact_remote_text(text, limit=_REMOTE_TEXT_LIMIT):
 # `token_expired` word, or a 401 stated as such. Deliberately narrow -- a bare
 # "401" in a message (a byte count, a port) is not a login.
 _CODEX_AUTH = re.compile(r"(?i)token_expired|\b401\s+unauthorized\b|\"status\"\s*:\s*401\b")
+# ... and what makes one THROTTLING (W11): the upstream's own 429, stated as such.
+# As narrow as the auth rule and for the same reason -- `account/rateLimits/read`
+# is literally about rate limits, so the bare words "rate limit" prove nothing.
+_CODEX_THROTTLE = re.compile(r"(?i)\b429\s+too\s+many\s+requests\b|\"status\"\s*:\s*429\b")
 
 
 def codex_error_frame(frame):
@@ -2114,7 +2576,45 @@ def codex_error_frame(frame):
         text += ": " + detail
     if _CODEX_AUTH.search(raw):
         return AuthFailure(text, code="token_expired")
+    if _CODEX_THROTTLE.search(raw):
+        return Throttled(text, status=429)
     return SourceFailure(text)
+
+
+def end_child(child, reap_seconds=5):
+    """Kill `child` AND everything it started, then reap it. Never raises.
+
+    THE ONESHOT MUST NEVER LEAVE A CHILD RUNNING (W11 task 3; the class of
+    fault W1 fixed). `read_codex` starts the app-server as a session leader, so
+    its process-group id is its pid and one `killpg` reaches every descendant
+    that did not deliberately leave the group. Where there is no process group
+    to kill (a test double, a non-POSIX host) the child alone is killed, as
+    before. The wait is bounded: a child that will not die after SIGKILL is the
+    kernel's problem, not a reason to hang the cycle.
+
+    Implements: SR-095, LLR-1194
+    """
+    pid = getattr(child, "pid", None)
+    killed = False
+    if isinstance(pid, int) and pid > 0 and hasattr(os, "killpg"):
+        try:
+            # Only a group the child LEADS: never this feeder's own group.
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, signal.SIGKILL)
+                killed = True
+        except OSError:
+            pass
+    if not killed:
+        try:
+            child.kill()
+        except OSError:
+            pass
+    wait = getattr(child, "wait", None)
+    if wait is not None:
+        try:
+            wait(timeout=reap_seconds)
+        except Exception:
+            pass
 
 
 def read_codex(env):
@@ -2133,10 +2633,17 @@ def read_codex(env):
     if codex_home and path_absent(os.path.join(codex_home, "auth.json")):
         raise PendingState("login owed: no codex sign-in at %s yet" % os.path.join(codex_home, "auth.json"))
     try:
+        # ITS OWN PROCESS GROUP, so `end_child` can take the whole tree down.
+        # The app-server is not one process: measured on the hub 2026-10-22, a
+        # read that timed out had spawned over a hundred `lsb_release` shells
+        # beneath it, and killing only the app-server leaves those to whoever
+        # cleans up next (systemd does, at the end of the unit -- a hand run has
+        # no such janitor).
         child = subprocess.Popen(
             [binary, "app-server", "--stdio"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            start_new_session=(os.name == "posix"))
     except FileNotFoundError as exc:
         if binary_absent(binary, env):
             raise PendingState("codex: not installed yet%s" % provisioning_hint(env, "codex"))
@@ -2176,10 +2683,7 @@ def read_codex(env):
     except OSError as exc:
         raise SourceFailure("codex: app-server stdin closed (%s)" % type(exc).__name__)
     finally:
-        try:
-            child.kill()
-        except OSError:
-            pass
+        end_child(child)
 
     frame = result.get("frame")
     if frame is None:
@@ -2196,8 +2700,9 @@ def _read_claude_account(env, name, credentials_knob, buckets, scoped_models):
     is a plain SourceFailure everywhere else (OpenCode's renamed schema produced
     the same words from a good credential), but a Claude credentials file that
     parses and holds no access token is what a lapsed or half-rewritten login
-    looks like. Confirming it over two cycles (`run_cycle`) is what absorbs the
-    refresh unit rewriting the file mid-read.
+    looks like. Confirming it over attempts spanning ten minutes (`run_cycle`,
+    `auth_failure_confirmed`) is what absorbs the refresh unit rewriting the
+    file mid-read.
     """
     path = env.get(credentials_knob)
     if not path:
@@ -2267,7 +2772,7 @@ def read_gemini(env):
     process that is allowed to write that file. A token expired by its own
     `expiry_date` is an AuthFailure: left alone it means the CLI's refresh is
     not happening, which is a dead login as far as the wall is concerned, and
-    the two-cycle confirmation absorbs the moments between expiry and renewal.
+    the ten-minute confirmation absorbs the moments between expiry and renewal.
 
     It also never ONBOARDS: no `currentTier` in the `loadCodeAssist` answer is a
     refusal (see `parse_gemini_project`), not a trigger for `onboardUser`.
@@ -2391,13 +2896,14 @@ def post_gauge(body, url, env, timeout):
 
 
 def run_cycle(env, now=None, readers=None, poster=None):
-    """One feeder cycle: read every enabled source, post every gauge.
+    """One feeder cycle: read every DUE source, post the gauges of what was read.
 
     Contract:
       Inputs:  env: the process environment (plus `_identity`); `readers` and
                `poster` are injectable so the tests can exercise every failure
                class without the network.
       Outputs: (posted: list of (key, fresh, ok), failures: list of str).
+               Skipped sources are named in env["_notes"], not in either list.
 
     A SOURCE FAILING IS NOT A CYCLE FAILING, AND NEITHER IS A GAUGE FAILING.
     Each source is read inside its own try, and the gauges belonging to a
@@ -2412,15 +2918,23 @@ def run_cycle(env, now=None, readers=None, poster=None):
     built falls back to the never-measured sentinel - value 0, no stamp - so
     the failure still shows up as "unavailable" rather than as a hole.
 
-    A SOURCE THAT FAILS AUTHENTICATION IS COUNTED, AND TWO IN A ROW GREY IT
-    (plan 3.6, G2). `AuthFailure` is caught before `SourceFailure`; the count of
-    consecutive auth-failed cycles per source rides in the state file under
-    AUTH_COUNTS_KEY (this is a one-shot unit); and on the confirming cycle each
-    stored reading of that source is replaced by an auth marker, key kept, so a
-    later failure of any other kind cannot restore the old colour and an
-    optional gauge still posts. Any other outcome for the source resets its count.
+    EACH SOURCE HAS ITS OWN SCHEDULE (W11). The timer runs every minute; a
+    source that is not due, or is backing off after a 429/5xx, is SKIPPED: it is
+    not read and its gauges are not posted, so NagLight keeps the body it was
+    last sent -- the true reading at its true `observed_at`, or the unavailable
+    body if that is what the source last earned. A skip is its own outcome: it
+    neither resets nor advances the source's backoff or authentication history.
 
-    Implements: SR-021, SR-068, LLR-005, LLR-1053, LLR-1054, LLR-1055
+    A SOURCE THAT FAILS AUTHENTICATION IS CONFIRMED OVER ATTEMPTS AND TIME
+    (plan 3.6 G2, revised by W11): `AuthFailure` is caught before
+    `SourceFailure`; the failed attempts ride in the schedule entry; and once
+    `auth_failure_confirmed` holds, each stored reading of that source is
+    replaced by an auth marker, key kept, so a later failure of any other kind
+    cannot restore the old colour and an optional gauge still posts. A success
+    resets the history; any other failure leaves it as it is.
+
+    Implements: SR-021, SR-068, SR-095, LLR-005, LLR-1053, LLR-1054, LLR-1055,
+                LLR-1190, LLR-1191, LLR-1192, LLR-1193
     """
     now = int(now if now is not None else time.time())
     readers = readers or SOURCE_READERS
@@ -2429,60 +2943,82 @@ def run_cycle(env, now=None, readers=None, poster=None):
     feed_url = env["_feed_url"]
     timeout = int(env.get("AI_USAGE_TIMEOUT_SECONDS") or 30)
     active = enabled_sources(env)
+    intervals = source_intervals(env, active)
     # One clock for the whole cycle: the parsers check each vendor window
     # against the same `now` the gauge will be stamped with (see `cycle_now`).
     env["_now"] = now
 
-    readings, failures = {}, []
-    auth_failed = set()
-    pending = set()        # sources in a quiet expected state: not installed yet / login owed
-    for name in active:
-        try:
-            readings.update(readers[name](env))
-        # AuthFailure FIRST, and the order is the feature: it is a subclass of
-        # SourceFailure, so listed second it would be swallowed by the plain
-        # handler below and a dead login would be indistinguishable from a
-        # network blip -- the defect plan 3.6 (G2) exists to fix.
-        except PendingState as exc:
-            # Quiet and expected: one INFO line (main prints the notes), the gauges
-            # go down the unavailable path, and it is NOT a failure.
-            pending.add(name)
-            env.setdefault("_notes", []).append("%s: %s" % (name, exc) if not str(exc).startswith(name) else str(exc))
-        except AuthFailure as exc:
-            auth_failed.add(name)
-            failures.append("%s: %s" % (name, exc))
-        except SourceFailure as exc:
-            failures.append("%s: %s" % (name, exc))
-        except Exception as exc:               # a reader bug is a source failure
-            failures.append("%s: unexpected %s" % (name, type(exc).__name__))
-
+    # The state comes FIRST now: the schedule in it decides which sources are
+    # read at all.
     state = load_state(state_path, now)
     # Presence, not content -- see state_keys. A corrupt stored entry must not
     # look like a gauge we have never seen.
     ever_seen = state_keys(state_path)
     specs = gauge_specs(env)
+    previous_schedule = state.get(SCHEDULE_KEY) or {}
+    # Only enabled sources keep an entry: a source switched off forgets its
+    # schedule and its authentication history, as it used to forget its count.
+    schedule = dict((n, previous_schedule[n]) for n in active if n in previous_schedule)
 
-    # CONSECUTIVE auth-failed cycles per source, from the state file and back
-    # into it. A source that succeeded, failed some OTHER way, or is no longer
-    # enabled has no entry here, which IS the reset. Capped at the threshold:
-    # the number is "confirmed or not", not a tally of how long it has been dead.
-    previous = state.get(AUTH_COUNTS_KEY) or {}
-    counts = {}
+    readings, failures = {}, []
+    attempted, skipped = set(), set()
+    pending = set()        # sources in a quiet expected state: not installed yet / login owed
     for name in active:
-        if name in auth_failed:
-            counts[name] = min(previous.get(name, 0) + 1, AUTH_CONFIRM_CYCLES)
-            failures.append(
-                "%s: authentication failure %d of %d%s" % (
-                    name, counts[name], AUTH_CONFIRM_CYCLES,
-                    " - CONFIRMED, its gauges are posted unavailable"
-                    if counts[name] >= AUTH_CONFIRM_CYCLES
-                    else " - last reading kept until confirmed"))
-    confirmed = set(name for name, count in counts.items()
-                    if count >= AUTH_CONFIRM_CYCLES)
-    if counts:
-        state[AUTH_COUNTS_KEY] = counts
+        entry = schedule.get(name)
+        wait = schedule_wait(entry, now)
+        if wait > 0:
+            skipped.add(name)
+            env.setdefault("_notes", []).append(skip_note(name, entry, wait, intervals[name]))
+            continue
+        attempted.add(name)
+        outcome, retry_after, retry_at = "ok", None, None
+        sink = []
+        token = _RATE_LIMIT_SINK.set(sink)
+        try:
+            readings.update(readers[name](env))
+        # AuthFailure and Throttled BEFORE SourceFailure, and the order is the
+        # feature: both are subclasses of it, so listed after it they would be
+        # swallowed by the plain handler and a dead login (plan 3.6, G2) or a
+        # vendor asking us to slow down (W11) would look like a network blip.
+        except PendingState as exc:
+            # Quiet and expected: one INFO line (main prints the notes), the gauges
+            # go down the unavailable path, and it is NOT a failure.
+            outcome = "pending"
+            pending.add(name)
+            env.setdefault("_notes", []).append("%s: %s" % (name, exc) if not str(exc).startswith(name) else str(exc))
+        except AuthFailure as exc:
+            outcome = "auth"
+            failures.append("%s: %s" % (name, exc))
+        except Throttled as exc:
+            outcome, retry_after = "throttled", exc.retry_after
+            retry_at = exc.retry_at
+            if retry_at is None and retry_after is not None:
+                retry_at = now + retry_after      # a reader that gave only seconds
+            failures.append("%s: %s" % (name, exc))
+        except SourceFailure as exc:
+            outcome = "failure"
+            failures.append("%s: %s" % (name, exc))
+        except Exception as exc:               # a reader bug is a source failure
+            outcome = "failure"
+            failures.append("%s: unexpected %s" % (name, type(exc).__name__))
+        finally:
+            _RATE_LIMIT_SINK.reset(token)
+        headers = {}
+        for seen in sink:
+            headers.update(seen)
+        schedule[name] = next_schedule(entry, outcome, now, intervals[name],
+                                       retry_at=retry_at, ratelimit=headers)
+        if outcome == "throttled":
+            failures.append(backoff_line(name, schedule[name], now, retry_after))
+        if outcome == "auth":
+            failures.append(auth_line(name, schedule[name]))
+
+    confirmed = set(name for name in attempted
+                    if auth_failure_confirmed(schedule.get(name)))
+    if schedule:
+        state[SCHEDULE_KEY] = schedule
     else:
-        state.pop(AUTH_COUNTS_KEY, None)
+        state.pop(SCHEDULE_KEY, None)
     # MARK, NEVER DELETE: replace each stored reading with an auth marker, key
     # kept, so a later failure of any other kind cannot bring the old colour
     # back (the sticky rule) and an optional gauge still posts. A gauge this
@@ -2496,7 +3032,7 @@ def run_cycle(env, now=None, readers=None, poster=None):
 
     posted = []
     for spec in specs:
-        if spec.source not in active:
+        if spec.source not in active or spec.source in skipped:
             continue
         reading = readings.get(spec.key)
         stored = state.get(spec.key)
@@ -2550,6 +3086,9 @@ def main(argv=None):
         return 0
     env["_identity"] = resolve_identity(env)
     env["_feed_url"] = resolve_feed_url(env)
+    # The per-source interval knobs refuse here too, so a malformed one stops
+    # the unit at its ExecStartPre instead of at the first cycle.
+    source_intervals(env, enabled_sources(env))
     if "--check" in argv:
         print("ai-usage: configuration accepted (identity set, destination local).")
         return 0

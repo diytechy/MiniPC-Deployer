@@ -347,11 +347,150 @@ answered, with only staleness standing between it and the wall. Naming it in
 consumed terms keeps the intent where the flip happens: an unmeasured gauge is
 an empty bar, and it fails safe if staleness ever stops protecting it.
 
-**The cadence follows from the horizons, not from taste.** A `weekly` gauge goes
-stale 24 h after `observed_at`, and three of the six are weekly. The timer runs
-every 10 minutes — 1/144th of the tightest horizon — and
-`tests/test_ai_usage_feeder.py` reads the shipped timer file and fails if that
-interval is ever loosened past a quarter of it.
+**The horizons still bound the cadence.** A `weekly` gauge goes stale 24 h
+after `observed_at`, and three of the six are weekly. The timer now runs every
+minute (next section), and `tests/test_ai_usage_feeder.py` still reads the
+shipped timer file and fails if that interval is ever loosened past a quarter of
+the tightest horizon.
+
+## Cadence: every minute, each source on its own schedule (SR-095, SR-096)
+
+The Owner asked on 2026-10-22 for the usage gauges to update every minute,
+because they fell behind.
+
+### What the lag was, measured before the change
+
+The lag on the wall is the sum of two halves, measured separately on
+2026-10-22:
+
+| Half | How it was measured | Before |
+|---|---|---|
+| Feeder: how old `observed_at` is in what NagLight serves | 24 h of the unit's journal (each live post's run start), sampled every second; cross-checked by reading `/api/today` on the hub's loopback every 20 s for 15 min | timer runs 610-702 s apart (median 652 s). Served age p50 **330 s**, p95 **~630 s**, max 1328 s (a Claude 401 cycle and two Codex timeouts re-posted older stamps) |
+| Panel: how long after NagLight has a new value the wall draws it | OfficeWallNaglight `js/main.js`: unlocked, `/api/events` fires on every feed POST (NagLight bumps its revision in `handleFeedGauge`) and the shell re-polls within a second; locked (the usual state: the panel's journal showed `authed=false`), it polls `/v1/gauges` every `POLL_SECONDS` = **60** (hub-served `config.json`, measured) | unlocked ~0 s (read from the code, not timed); locked +30 s p50, +31 s p95 (modelled from the poll period) |
+| On the wall (locked) | the two combined | p50 **363 s**, p95 **667 s** |
+
+So the feeder's half was over 95 % of the lag, and the panel needed no change:
+its 60-second locked poll is inside the 3-minute target below with the feeder
+at a minute.
+
+### What a cycle does now
+
+The timer (`homehub-ai-usage.timer`) fires every minute, up to 10 s late.
+Each source -- each Claude **account** too, since `claude` and `claude2` are
+separate sources -- has its own entry in the state file under the reserved key
+`__schedule__` (`SCHEDULE_KEY`), validated by its own validator in `load_state`:
+when it was last **attempted**, when it is next due, whether that due time is a
+vendor's Retry-After (`hold`), its backoff level, its authentication history and
+the vendor's rate-limit headers last seen. A cycle:
+
+1. **skips** a source that is not due. A skip is its own outcome: nothing in the
+   entry changes, nothing is posted for its gauges (NagLight keeps the body it
+   was last sent, so the wall keeps the true reading at its true
+   `observed_at`), and one line says why --
+   `INFO codex: skipped - not due for 45s (reads every 120s)` or
+   `INFO claude: skipped - backing off, 240s left (level 2, Retry-After)`;
+2. reads every due source, exactly as before, and posts its gauges;
+3. writes the source's next entry (`next_schedule`, a pure function):
+
+| Outcome | Next due | Backoff | Auth history |
+|---|---|---|---|
+| read fine | + interval | cleared | **cleared** |
+| authentication failure | + interval | cleared | first attempt kept, attempts + 1 |
+| 429 or any 5xx (`Throttled`) | the vendor's `Retry-After` if it sent one (seconds or HTTP date, counted from when the answer ARRIVED, honoured to the second and past ten minutes, clamped only at 24 h); else interval x 2^level, ceiling 10 min | + 1 | untouched |
+| any other failure, or "login owed" | + interval | cleared | untouched |
+
+A healthy source is due 15 s early (`DUE_SLACK_SECONDS`), because cycles land
+60-75 s apart and a source due at +60 s that the next cycle reaches at +59 s
+would otherwise wait a whole extra minute. A vendor's Retry-After gets no slack.
+Each throttled attempt prints `<source>: HTTP 429 (rate-limit headers: …)` and
+`<source>: backing off Ns (level n, …)`. Only rate-limit header **names** are
+recorded (`retry-after`, `x-ratelimit-*`, `ratelimit*`, `anthropic-ratelimit-*`),
+and only values that look like numbers or dates.
+
+**Clock changes.** A schedule entry whose last attempt is in the future (past the
+5-minute skew allowance) is a clock that stepped back; it is dropped, so the
+source is read at once instead of being skipped for as long as the clock went
+back. A clock that steps forward needs no rule: every due time is in the past.
+
+### Per-source intervals, and why Codex is every other cycle
+
+`AI_USAGE_<SOURCE>_INTERVAL` (seconds, 60..600, refused by name otherwise) sets
+each one; blank is the default. The HTTP sources default to **60 s**. Codex
+defaults to **120 s**, chosen by measurement: per-process accounting of the
+unit's cgroup on 2026-10-22 put one normal cycle at 3.1 s of CPU, of which the
+`codex app-server` tree was 1.5 s, the cycle's Python 1.1 s and the unit's
+`--check` pre-start 0.45 s; a Codex read that timed out cost 4.2 s, and spawned
+over a hundred `lsb_release` shells. Reading Codex every minute would be ~2.5 %
+of one core for a weekly gauge; every second cycle halves it and still meets the
+freshness target. The alternative -- a long-lived, separately supervised
+`app-server` -- was not chosen: its idle cost could not be measured without
+running it against the vendor, it would need its own credential-reload logic,
+and the oneshot already bounds every child (below). Setting
+`AI_USAGE_CODEX_INTERVAL=60` reads it every minute at that cost.
+
+**The read never leaves a process behind.** `read_codex` starts the app-server
+in its own session and `end_child` kills the whole process group, then reaps it
+(the class of fault W1 fixed). Before, only the app-server itself was killed,
+and its helpers waited for systemd to clean the unit up.
+
+### The freshness target
+
+**At steady state the panel shows each usage gauge with an `observed_at` no more
+than 3 minutes old at the 95th percentile.** Modelled from the shipped timer
+(60 s + up to 10 s + up to 5 s), the due slack and a locked panel's 60-second
+poll: the per-minute sources p50 ~66 s, p95 **~110 s**; Codex at 120 s p50 ~100 s,
+p95 **~170 s**. The live check below measures it.
+
+### A dead login, confirmed over attempts and time
+
+See the next section for the marker. What changed with the minute timer is the
+confirmation rule, because "two consecutive cycles" would have greyed a gauge
+two minutes into any blip.
+
+### Verifying the cadence on the hub (the 24-hour check)
+
+Run after deploying, against the W3a CPU baseline:
+
+1. **Cycles every ~60 s**: `journalctl -u homehub-ai-usage.service --since -24h
+   -o short-unix | grep 'Starting homehub-ai-usage'` -- the gaps between starts
+   should be 60-75 s.
+2. **Freshness p95**: sample what the panel reads. On the hub, every 20 s for
+   24 h, GET `http://127.0.0.1:8787/api/today` with `X-Forwarded-User` set to the
+   tracker identity (read from `/opt/homehub/stack/.env`, never printed), and
+   record `now - observed_at` per `ai-usage-*` gauge; add the panel's poll
+   (uniform 0..60 s while locked). The p95 per gauge must be <= 180 s. The same
+   numbers can be derived from the journal alone: each `live posted` line's run
+   start is its `observed_at`.
+3. **429s and backoff**: `journalctl -u homehub-ai-usage.service --since -24h |
+   grep -E 'HTTP (429|5[0-9][0-9])|backing off|skipped - backing off'` -- zero
+   lines, or each names its source and the delay it honoured. A source that
+   backed off has its default raised (its `AI_USAGE_<SOURCE>_INTERVAL`) and the
+   change is recorded.
+4. **Feeder CPU**: `journalctl -u homehub-ai-usage.service --since -24h | grep
+   -c Consumed` and the sum of the `Consumed …s CPU time` values, against the W3a
+   baseline.
+5. **No spurious authentication classification**: `grep 'authentication
+   failure'` -- any `CONFIRMED` line must match a login that really is dead
+   (see the refresh-gauge-logins skill); an unavailable or stale gauge must
+   carry its reason in the same cycle's lines.
+
+### The Claude refresher now renews before the token lapses
+
+Measured on the hub between 2026-10-12 and 10-21: all 14 Claude 401s the feeder
+logged came 237-242 minutes after the previous `homehub-claude-refresh@claude`
+run and cleared at the next one. The CLI renews the 8-hour access token only
+when a run lands near its expiry, not on every run, so a refresher every 4 h left
+the token lapsed for minutes at a time, about twice a day -- once for at least 11
+minutes (two consecutive 401 samples on 10-12). On a minute timer that is enough
+to confirm an authentication failure that is not one.
+
+`homehub-claude-refresh@.timer` now checks every 4 minutes, and the service's new
+`ExecCondition` (`claude_refresh_due.py`) lets the CLI run only once the token
+has under 20 minutes left, has expired, or its expiry cannot be read. The helper
+exits 3 for "not due" and the unit maps exactly that to the skip; a crash, a
+missing helper or a missing python all **run** the CLI, so the gate can only add
+runs, never take the last one away. It reads one number (`expiresAt`), never
+writes, and prints nothing about the credential.
 
 ## A dead login goes grey, and stays grey (plan 3.6, G2)
 
@@ -374,18 +513,27 @@ may catch an `AuthFailure` and re-raise a plain one. What counts:
 | `claude`, `claude2` | the credential file parsed but carries **no usable key** — *Claude readers only*; the same words once came from a renamed OpenCode schema (`NoUsableKey` is a plain failure everywhere else) |
 | `gemini` | a 401, or the cached access token past its own `expiry_date` |
 
-**Confirmed over two consecutive cycles** (`AUTH_CONFIRM_CYCLES`), because the
-Claude refresh unit rewrites the credential file and a read in the middle of
-that can look like "no usable key". The first failed cycle behaves as today;
-the second greys the source's gauges (up to about 20 minutes after the login
-died, on the 10-minute timer — a refinement of the Owner's "at once"). Any cycle
-in which the source succeeds, or fails some *other* way, resets the count.
+**Confirmed over attempts and time** (`AUTH_CONFIRM_ATTEMPTS` = 2,
+`AUTH_CONFIRM_SECONDS` = 600; revised 2026-10-22 for the minute timer). A
+source's gauges grey only after failed authentication **attempts** that number
+at least two and span at least ten minutes, from the first failed-authentication attempt of the run to the
+latest. That absorbs the Claude refresh unit rewriting the credential mid-read
+("no usable key" once) and an access token that lapses a few minutes before its
+renewal (measured: section above). Only attempts count: a skipped cycle adds
+neither an attempt nor any span. A success resets the history; a failure of
+any other kind -- a network error, a 5xx, "login owed" -- is evidence neither way
+and leaves it as it is. Until confirmation the gauge keeps its last reading; the
+journal says `authentication failure, attempt N over Ns - last reading kept
+until confirmed (2 attempts over 600s)`, then `… - CONFIRMED, its gauges are
+posted unavailable`. On the minute timer a dead login greys about 10 minutes
+after its first failed read (on the old 10-minute timer the two-cycle rule took
+up to about 20).
 
-**The count lives in the state file.** This is a one-shot unit, so memory does
-not survive; but `load_state` drops every key that is not a reading. So the count
-is one **reserved key** (`__auth_failures__`, `{source: n}`), with its own
-validator in `load_state` (never an exemption from validation), carried by
-`save_state`, counts only.
+**The history lives in the state file**, in the source's schedule entry
+(`auth_since`, `auth_attempts`; previous section). A state file written before
+2026-10-22 holds the old counter under `__auth_failures__`; it has no validator
+any more, so the first new cycle drops it and the history restarts, while every
+reading and every marker survives.
 
 **Marked, never deleted.** On the confirming cycle each stored reading of that
 source is *replaced* by `{"auth_failed": true, "at": <epoch>}` — the key stays.
@@ -532,6 +680,9 @@ touching a vendor or the tracker.
 * **Claude 2's `.claude.json` placement** is measured on Windows (Claude Code
   2.1.296), not yet on the hub's Linux build.
 * **OpenCode `rolling`** — no window length is published, see above.
+* **The minute cadence's vendor-side cost is unmeasured** until the 24-hour
+  check: none of these endpoints publishes a rate limit, and 10x the requests is
+  a risk designed against (backoff, Retry-After), not one disproved.
 * **`stack/run-hermetic-tests.sh` cannot run on the dev PC** (`missing tool(s):
   zstd rsync`), so this feeder's shell-level carriage has never been exercised
   there. The Python suite is the bar that does run.

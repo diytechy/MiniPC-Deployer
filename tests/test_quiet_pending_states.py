@@ -279,6 +279,14 @@ def _exec_conditions(text):
     return [l.split("=", 1)[1] for l in text.splitlines() if l.startswith("ExecCondition=")]
 
 
+def _is_expiry_gate(line):
+    """The Claude refresher's EXPIRY gate (SR-096, 2026-10-22) is not a presence
+    gate: it asks "is the token near expiry?", can only add runs (every doubt
+    passes it), and so needs no `+`. It is pinned in tests/test_ai_usage_cadence.py
+    TC-1341; the presence-gate rules below are about the other gates."""
+    return "claude_refresh_due.py" in line
+
+
 def _sections(text):
     """{section: [raw 'Key=value' lines]} - keeps repeated keys, which configparser cannot."""
     out, cur = {}, None
@@ -306,7 +314,7 @@ def test_keeper_cli_gate_is_one_execcondition_not_a_condition_or_group(unit, bin
     # systemd merges every `Condition*=|` of a unit AND its drop-ins into ONE OR group
     # ("CLI present OR credential present"), so no Condition*= line may carry a gate.
     assert not [l for sec in secs.values() for l in sec if l.startswith("Condition")], secs
-    gates = [l for l in secs["Service"] if l.startswith("ExecCondition=")]
+    gates = [l for l in secs["Service"] if l.startswith("ExecCondition=") and not _is_expiry_gate(l)]
     assert len(gates) == 1 and gates[0].endswith(" gate /usr/local/bin/" + binary), gates
     assert not [l for l in secs.get("Unit", []) if l.startswith("ExecCondition")]
 
@@ -326,7 +334,7 @@ def test_credential_gates_are_execconditions_in_service_added_by_each_drop_in(tm
         assert not [l for l in secs.get("Unit", []) if l.startswith("ExecCondition")]
         # it ADDS to the base unit's list (never an empty reset assignment that would drop it)
         assert not [l for l in secs["Service"] if l == "ExecCondition="], dropin
-    assert all(len(v) == 1 for v in base.values())
+    assert all(len([g for g in v if not _is_expiry_gate(g)]) == 1 for v in base.values())
 
 
 def _shq(text):
@@ -475,7 +483,10 @@ def test_launch_enoent_with_the_binary_present_is_a_failure(tmp_path, monkeypatc
     assert any("codex: cannot launch" in f for f in failures), failures
     assert not env.get("_notes")
     # ...and with nothing at the path the same launch error IS "not installed yet".
-    env2, _, _, failures2 = _run(tmp_path, "codex", AI_USAGE_CODEX_BIN=str(tmp_path / "gone"))
+    # A box of its own: on the same state at the same instant the source is, by
+    # its schedule (SR-095), not due -- a skip, not a launch.
+    (tmp_path / "second").mkdir()
+    env2, _, _, failures2 = _run(tmp_path / "second", "codex", AI_USAGE_CODEX_BIN=str(tmp_path / "gone"))
     assert failures2 == [] and "not installed yet" in env2["_notes"][0]
 
 
@@ -701,9 +712,14 @@ def test_real_symlinks_in_wsl_dangling_ancestor_fails_missing_parent_is_pending(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_every_gate_is_prefixed_with_plus():
+    expiry = []
     for unit, _ in KEEPERS:
         for gate in _exec_conditions((ti.USAGE_DIR / unit).read_text(encoding="utf-8")):
+            if _is_expiry_gate(gate):
+                expiry.append(unit)
+                continue
             assert gate.startswith("+/bin/sh -c "), gate
+    assert expiry == ["homehub-claude-refresh@.service"], "the one exception, and only there"
     setup = ti.SETUP_USAGE.read_text(encoding="utf-8")
     assert "KEEPER_GATE='ExecCondition=+/bin/sh -c " in setup
 

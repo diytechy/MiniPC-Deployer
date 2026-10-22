@@ -26,6 +26,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -755,6 +756,13 @@ def test_a_whole_cycle_writes_exactly_one_file_and_no_credential_sr021(tmp_path)
     for secret in ("CLAUDE-SECRET", "CODEX-SECRET", "OPENCODE-SECRET", "Bearer"):
         assert secret not in written
     stored = json.loads(written)
+    # The per-source schedule (SR-095) rides beside the readings under its one
+    # reserved key, and holds numbers, flags and an outcome word -- nothing else.
+    schedule = stored.pop(feeder.SCHEDULE_KEY)
+    assert set(schedule) == {"codex", "claude", "opencode"}
+    for entry in schedule.values():
+        assert set(entry) <= {"last_attempt", "next_due", "hold", "backoff", "last_outcome",
+                              "auth_since", "auth_attempts", "ratelimit"}
     for entry in stored.values():
         assert set(entry) <= {"value", "observed_at", "window_end", "window_seconds"}
 
@@ -1298,11 +1306,18 @@ def test_the_refresh_interval_must_beat_the_eight_hour_token_life():
     dark until a human types `claude`. Asserted, not remembered."""
     line = [l for l in _refresh_timer().splitlines() if l.startswith("OnUnitActiveSec=")][0]
     value = line.split("=", 1)[1].strip()
-    assert value.endswith("h"), value
-    seconds = int(value.rstrip("h")) * 3600
+    m = re.fullmatch(r"(\d+)(min|h)", value)
+    assert m, value
+    seconds = int(m.group(1)) * (3600 if m.group(2) == "h" else 60)
     assert seconds < CLAUDE_ACCESS_TOKEN_LIFE_SECONDS, "a renewal after expiry is not a renewal"
     # One whole missed run of margin: the hub can sleep through a cycle.
     assert seconds * 2 <= CLAUDE_ACCESS_TOKEN_LIFE_SECONDS, "no margin for a missed run"
+    # Since W11 the timer only CHECKS, and the CLI runs inside the gate's lead
+    # time before expiry (claude_refresh_due.py, tests/test_ai_usage_cadence.py
+    # TC-1340/TC-1341): the check must come round several times inside it.
+    gate_src = (REPO / "stack" / "ai-usage" / "claude_refresh_due.py").read_text(encoding="utf-8")
+    lead = int(re.search(r"^LEAD_SECONDS = (\d+) \* 60$", gate_src, re.M).group(1)) * 60
+    assert seconds * 3 <= lead, "fewer than three checks before the token lapses"
 
 
 def test_the_refresher_uses_the_free_slash_command_not_a_prompt():
@@ -1400,6 +1415,13 @@ def _claude_with_scoped(display_name="Fable", percent=0, **over):
 
 
 def _claude_cycle(tmp_path, body, now=NOW):
+    """ONE isolated cycle with this body, on its own empty state directory.
+    Since the per-source schedule (SR-095) a second cycle on the same state at
+    the same instant is, correctly, a skip -- so a caller that loops gets a
+    fresh box each time, which is what it always meant."""
+    _claude_cycle.n = getattr(_claude_cycle, "n", 0) + 1
+    tmp_path = tmp_path / ("cycle%d" % _claude_cycle.n)
+    tmp_path.mkdir()
     env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
     rec = Recorder()
     feeder.run_cycle(env, now=now, poster=rec,
@@ -1584,11 +1606,12 @@ def test_a_seen_optional_gauge_survives_a_CORRUPT_stored_entry_sr075(tmp_path):
         json.dump(stored, handle)
 
     rec = Recorder()
-    feeder.run_cycle(env, now=NOW, poster=rec,
-                     readers={"claude": lambda e: feeder.parse_claude(CLAUDE_BODY, NOW)})
+    # A minute on: the source is due again (SR-095), and the windows are open.
+    feeder.run_cycle(env, now=NOW + 60, poster=rec,
+                     readers={"claude": lambda e: feeder.parse_claude(CLAUDE_BODY, NOW + 60)})
     bodies = {b["id"]: b for b in rec.bodies}
     assert "ai-usage-claude-weekly-fable" in bodies, \
         "a gauge that HAS been seen vanished when its stored reading went bad"
     g = bodies["ai-usage-claude-weekly-fable"]
-    assert not feeder.is_fresh(g, NOW), "and it must say unavailable, not a number"
+    assert not feeder.is_fresh(g, NOW + 60), "and it must say unavailable, not a number"
     assert "observed_at" not in g

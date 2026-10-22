@@ -24,8 +24,6 @@ ExecCondition=/usr/bin/python3 /opt/homehub/stack/door/door_relay.py condition D
 ExecStartPre=/usr/bin/python3 /opt/homehub/stack/scratch/homehub_scratch.py guard --writer door
 ExecStart=/usr/bin/python3 /opt/homehub/stack/door/door_recorder.py run
 ExecStopPost=-/usr/bin/docker rm -f homehub-door-recorder
-RuntimeDirectory=homehub-door-recorder
-RuntimeDirectoryMode=0700
 # 75 = EDQUOT/ENOSPC (door/ is full), 76 = the guard refused before a new
 # segment: both stop the recorder with an alert and must NOT be retried in a
 # loop. Anything else (the relay restarted, the stream stalled) is retried.

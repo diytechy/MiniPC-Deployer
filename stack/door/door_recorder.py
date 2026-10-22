@@ -53,7 +53,6 @@ import select
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -566,15 +565,20 @@ class Recorder:
         return 0
 
 
-def ffmpeg_argv(env_file_path: str) -> List[str]:
-    """The copy-only reader, in the relay's pinned image. The source URL is in an
-    env file (0600) and expanded inside the container: never in argv."""
-    script = ('exec ffmpeg -nostdin -hide_banner -loglevel warning -rtsp_transport tcp '
-              '-timeout 15000000 -i "$DOOR_URL" -map 0:v:0 -c copy -an -f mpegts pipe:1')
-    return ["docker", "run", "--rm", "--name", CONTAINER, "--network", "host", "--read-only",
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "64",
-            "--memory", "256m", "--log-driver", "none", "--env-file", env_file_path,
-            "--entrypoint", "/bin/sh", door_relay.image_ref(), "-c", script]
+def ffmpeg_command(relay: "door_relay.RelaySettings") -> Tuple[List[str], bytes]:
+    """(argv, stdin payload) of the copy-only reader, in the relay's pinned image.
+
+    Built by door_relay.relay_consumer, like every other consumer: the relay's
+    authenticated URL is in the payload - a one-entry ffconcat document the
+    caller writes to ffmpeg's STDIN and then closes - and never in argv, in the
+    container's environment or in a file. ffmpeg's stdout is the MPEG-TS this
+    process cuts; its stdin carries only that document, so the two never meet.
+    The rtsp socket timeout (15 s) rides in the document with the transport.
+    """
+    return door_relay.relay_consumer(
+        relay, CONTAINER, "ffmpeg", ["-nostdin", "-hide_banner", "-loglevel", "warning"],
+        ["-map", "0:v:0", "-c", "copy", "-an", "-f", "mpegts", "pipe:1"],
+        docker_extra=["--pids-limit", "64", "--memory", "256m"], timeout_us=15000000)
 
 
 def run_service(env_file: str) -> int:
@@ -591,15 +595,10 @@ def run_service(env_file: str) -> int:
         rec.alert("door-recorder-guard", "HomeHub: door recorder refused to start (scratch volume)", reason)
         return EXIT_GUARD
     rec.recover_parts()
-    run_dir = os.environ.get("RUNTIME_DIRECTORY", "/run/homehub-door-recorder")
-    os.makedirs(run_dir, mode=0o700, exist_ok=True)
-    fd, envpath = tempfile.mkstemp(dir=run_dir, prefix="source-", suffix=".env")
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write("DOOR_URL=%s\n" % relay.consumer_url())
     subprocess.run(["docker", "rm", "-f", CONTAINER], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=60)
-    proc = subprocess.Popen(ffmpeg_argv(envpath), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    argv, payload = ffmpeg_command(relay)
+    proc = door_relay.start_consumer(argv, payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def stop(_sig, _frm):
         rec.stopping = True
@@ -628,7 +627,6 @@ def run_service(env_file: str) -> int:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
-        os.unlink(envpath)
     return code
 
 

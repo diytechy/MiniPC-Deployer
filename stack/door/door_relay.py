@@ -40,6 +40,12 @@ SRTP and RTMP disabled by an empty listen address. Video only: the source is
 `#media=video` and the default consumer query is `video`. No Caddy route and no
 DNS name: the relay is reached by address from the LAN alone.
 
+EVERY CONSUMER (the recorder, probe, the gate's consumers, the cost decoder)
+is built by relay_consumer(): ffmpeg/ffprobe as the container's entrypoint,
+reading `-f concat -i pipe:0`, and the authenticated URL in a one-entry
+ffconcat document written to its stdin - never in an argument, an environment
+variable or a file (see the block above relay_consumer).
+
 Python 3.8-compatible (the dev PC's test runner imports this module).
 Implements: SR-105, SR-106, LLR-1223..LLR-1229.
 """
@@ -55,6 +61,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -443,30 +450,92 @@ def image_ref() -> str:
     return "%s:%s@%s" % (pin["IMAGE"], pin["VERSION"], pin["DIGEST"])
 
 
-def docker_ffmpeg(args: Sequence[str], env_url: str, seconds: float, name: str) -> subprocess.CompletedProcess:
-    """Run ffmpeg/ffprobe from the pinned image with the source URL in an env
-    file (0600, removed after) - never in argv, never printed."""
-    fd, envfile = tempfile.mkstemp(prefix="door-probe-", suffix=".env")
+# ── every consumer of the relay: the URL on stdin, never in argv or env ─────
+#
+# The relay's consumer URL carries the doorbell's credential. A value in argv is
+# readable by every local user from /proc/<pid>/cmdline - a container's
+# processes included, since they are host processes - and a value in a
+# container's environment is kept in `docker inspect` (Config.Env) and in
+# /proc/<pid>/environ. So, exactly as the panel's door broker does
+# (OfficeWallNaglight doorstream/service.py ffconcat_input), the URL reaches
+# ffmpeg/ffprobe as a one-entry ffconcat document on its STDIN: the tool reads
+# `-f concat -i pipe:0`, the docker client runs with -i, the document is
+# written and stdin is closed (`docker run -i` closes the container's stdin at
+# that EOF, which is what ends the concat demuxer's playlist read). The rtsp
+# options ride in the document (`option`, ffmpeg >= 5; the pinned image has
+# 8.0.1), because an input option on the command line would apply to the
+# concat demuxer, not to the rtsp input it opens. The entrypoint is the tool
+# itself: no shell, so nothing can expand a variable into an argument.
+#
+# Measured 2026-10-22 against the pinned image: ffprobe through this input
+# reports the same codec, size and packet count; a `-c copy -f mpegts` copy
+# through it is the same stream, with the same two mpegts warnings, as the
+# direct rtsp input's.
+
+FFCONCAT_INPUT = ("-f", "concat", "-safe", "0",
+                  "-protocol_whitelist", "file,pipe,tcp,udp,rtp,rtsp,crypto", "-i", "pipe:0")
+CONSUMER_TOOLS = ("ffmpeg", "ffprobe")
+
+
+def relay_input_document(s: RelaySettings, timeout_us: Optional[int] = None) -> bytes:
+    """The ffconcat document naming the relay's authenticated URL, for stdin.
+
+    The credential is percent-encoded and the stream name is [a-z0-9_-], so the
+    URL can hold no quote, backslash or whitespace; that is re-checked rather
+    than assumed, because one would end the document's quoted string early.
+    """
+    url = s.consumer_url()
+    if re.search(r"['\\\s]", url):
+        raise Invalid("the relay URL holds a quote, backslash or space (DOOR_RELAY_STREAM / LAN_IP)")
+    lines = ["ffconcat version 1.0", "file '%s'" % url, "option rtsp_transport tcp"]
+    if timeout_us:
+        lines.append("option timeout %d" % int(timeout_us))
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def relay_consumer(s: RelaySettings, name: str, tool: str, before_input: Sequence[str],
+                   after_input: Sequence[str], docker_extra: Sequence[str] = (),
+                   timeout_us: Optional[int] = None):
+    """(argv, stdin payload) for one consumer of the relay in the pinned image.
+
+    The ONE builder for every call site - the recorder, the probe, the gate's
+    consumers and the cost decoder - so none can drift back to a URL in argv.
+    `before_input` are the tool's global options, `after_input` everything
+    after the input (maps, codecs, the output). Implements: LLR-1226, LLR-1236.
+    """
+    if tool not in CONSUMER_TOOLS:
+        raise ValueError("a relay consumer runs ffmpeg or ffprobe, not %r" % tool)
+    argv = ["docker", "run", "--rm", "-i", "--name", name, "--network", "host", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--log-driver", "none"]
+    argv += list(docker_extra) + ["--entrypoint", tool, image_ref()]
+    argv += list(before_input) + list(FFCONCAT_INPUT) + list(after_input)
+    return argv, relay_input_document(s, timeout_us)
+
+
+def start_consumer(argv: Sequence[str], payload: bytes, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL) -> subprocess.Popen:
+    """Start a relay consumer and hand it its input document on stdin, then close
+    stdin. A consumer that died before reading it is the caller's to see (poll,
+    EOF): a broken pipe here is not raised."""
+    proc = subprocess.Popen(list(argv), stdin=subprocess.PIPE, stdout=stdout, stderr=stderr)
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write("DOOR_URL=%s\n" % env_url)
-        script = " ".join(args)
-        argv = ["docker", "run", "--rm", "--name", name, "--network", "host", "--read-only",
-                "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--log-driver", "none",
-                "--env-file", envfile, "--entrypoint", "/bin/sh", image_ref(), "-c", script]
-        return subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              universal_newlines=True, timeout=seconds + 60)
-    finally:
-        os.unlink(envfile)
+        proc.stdin.write(payload)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    return proc
 
 
 def probe(s: RelaySettings, seconds: int = 10, name: str = "homehub-door-probe") -> Dict[str, object]:
     """One authenticated test consumer: what it decoded and in what geometry."""
-    done = docker_ffmpeg(
-        ['exec ffprobe -v error -rtsp_transport tcp -select_streams v:0 -count_packets',
-         '-read_intervals "%%+%d" -show_entries stream=codec_name,width,height,nb_read_packets,avg_frame_rate'
-         % seconds, '-of json "$DOOR_URL"'], s.consumer_url(), seconds, name)
+    argv, payload = relay_consumer(
+        s, name, "ffprobe", ["-v", "error"],
+        ["-select_streams", "v:0", "-count_packets", "-read_intervals", "%%+%d" % seconds,
+         "-show_entries", "stream=codec_name,width,height,nb_read_packets,avg_frame_rate", "-of", "json"])
+    raw = subprocess.run(argv, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         timeout=seconds + 60)
+    done = subprocess.CompletedProcess(argv, raw.returncode, raw.stdout.decode("utf-8", "replace"),
+                                       raw.stderr.decode("utf-8", "replace"))
     out: Dict[str, object] = {"rc": done.returncode, "stderr": redact(done.stderr.strip(), s)[-400:]}
     try:
         stream = (json.loads(done.stdout).get("streams") or [{}])[0]
@@ -569,17 +638,11 @@ GREY_DECODER = "homehub-door-costprobe"
 def start_grey_decoder(s: RelaySettings, fps: int):
     """Plan W4b task 11: what a hub-side detector would cost - decode the relay
     and keep `fps` small grey frames a second (256x256, the panel motion
-    engine's raster), discarding them. Returns (process, env file path)."""
-    fd, envfile = tempfile.mkstemp(prefix="door-cost-", suffix=".env")
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write("DOOR_URL=%s\n" % s.consumer_url())
-    argv = ["docker", "run", "--rm", "--name", GREY_DECODER, "--network", "host", "--read-only",
-            "--cap-drop", "ALL", "--log-driver", "none", "--env-file", envfile, "--entrypoint", "/bin/sh",
-            image_ref(), "-c",
-            'exec ffmpeg -nostdin -v error -rtsp_transport tcp -i "$DOOR_URL" -map 0:v:0 -an '
-            '-vf "fps=%d,scale=256:256,format=gray" -f null -' % fps]
-    return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), envfile
+    engine's raster), discarding them. Returns the process."""
+    argv, payload = relay_consumer(
+        s, GREY_DECODER, "ffmpeg", ["-nostdin", "-v", "error"],
+        ["-map", "0:v:0", "-an", "-vf", "fps=%d,scale=256:256,format=gray" % fps, "-f", "null", "-"])
+    return start_consumer(argv, payload)
 
 
 def emit(record: Dict[str, object]) -> None:
@@ -606,6 +669,75 @@ def probe_verdict(result: Dict[str, object], s: RelaySettings) -> List[str]:
     return reasons
 
 
+class ProgressReader:
+    """A consumer's own account of what it received: ffmpeg `-progress pipe:1`.
+
+    ffmpeg writes a block of key=value lines every -stats_period, ending in
+    `progress=continue` (or `=end`). `frame=` in a block is the frames the
+    consumer has taken from its input so far (for `-c copy`, the packets it
+    wrote); `frames` is that count from the latest COMPLETE block, None until
+    one arrives. A reader thread drains the pipe, so ffmpeg can never block on
+    it. A consumer that is stopped, wedged or starved writes no new block or
+    the same count - which is the point: the relay's own sender counters rise
+    when go2rtc ENQUEUES a packet for a consumer, before its socket writer
+    runs, so they keep rising for a consumer that reads nothing.
+    `advanced_at` is when (on `clock`) the count last ROSE: a consumer that
+    took frames early in a window and then stopped has a rising count but a
+    stale `advanced_at`.
+    Implements: LLR-1226.
+    """
+
+    def __init__(self, stream, clock=time.monotonic):
+        self.frames = None  # type: Optional[int]
+        self.advanced_at = None  # type: Optional[float]
+        self.blocks = 0
+        self.lines = 0
+        self.clock = clock
+        self._pending = None  # type: Optional[int]
+        self.thread = threading.Thread(target=self._run, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def feed(self, line: str) -> None:
+        key, sep, value = line.strip().partition("=")
+        if not sep:
+            return
+        if key == "frame" and value.strip().isdigit():
+            self._pending = int(value.strip())
+        elif key == "progress":
+            if self._pending is not None:
+                if self.frames is None or self._pending > self.frames:
+                    self.advanced_at = self.clock()
+                self.frames = self._pending
+            self.blocks += 1
+
+    def stalled_for(self) -> Optional[float]:
+        """Seconds since the count last rose; None before it ever has."""
+        return None if self.advanced_at is None else self.clock() - self.advanced_at
+
+    def _run(self, stream) -> None:
+        try:
+            for raw in iter(stream.readline, b""):
+                self.feed(raw.decode("ascii", "replace"))
+                self.lines += 1
+        except (OSError, ValueError):
+            pass
+
+
+GATE_CONSUMER = "homehub-door-gate-%d"
+# The survivor reports every second (-stats_period 1); at the end of the window
+# its count must have risen within this long - one missed block plus jitter.
+PROGRESS_FRESH_SEC = 2.5
+
+
+def gate_consumer(s: RelaySettings, n: int, progress: bool):
+    """(argv, payload) of a gate consumer: copy-only to the null muxer, and with
+    `progress` its own frame counter on stdout every second."""
+    out = ["-map", "0:v:0", "-c", "copy"]
+    if progress:
+        out += ["-stats_period", "1", "-progress", "pipe:1"]
+    return relay_consumer(s, GATE_CONSUMER % n, "ffmpeg", ["-nostdin", "-v", "error"], out + ["-f", "null", "-"])
+
+
 def gate(s: RelaySettings, seconds: int, progress_sec: int = 5) -> int:
     """The hub half of the compatibility gate (plan W4b task 8). The panel's
     broker must already be suppressed; the relay running. Prints JSON lines and
@@ -617,61 +749,63 @@ def gate(s: RelaySettings, seconds: int, progress_sec: int = 5) -> int:
        (DOOR_RELAY_EXPECT_CODEC, DOOR_RELAY_EXPECT_SIZE: h264, 1536x1536);
     3. two simultaneous consumers, exactly one upstream session (ss) and one
        producer (the relay's API);
-    4. one consumer ends, the upstream stays, and the other is still being
-       SENT video: the relay's byte counter for its consumers grows over
-       `progress_sec` - a live process alone is not progress, since a
-       `-c copy -f null` consumer with no input timeout survives a stall.
+    4. one consumer ends, the upstream stays, and the other is still RECEIVING
+       video, measured AT THAT CONSUMER: its own `-progress` frame count
+       (ProgressReader) rises over `progress_sec`, and its last rise is at
+       most PROGRESS_FRESH_SEC old when the window ends (one that took a few
+       frames and then stopped fails too). A live process is not
+       progress, and neither is the relay's per-consumer byte counter
+       (consumer_bytes), which rises as go2rtc queues packets whether or not
+       the consumer reads them; it is reported, as `relay_sent_bytes`, and
+       decides nothing.
     The relay restart, camera dropout and segment decode checks are separate
     commands in the README's gate procedure because they act on units.
     Implements: LLR-1226.
     """
     ok = True
-    first = probe(s, seconds, "homehub-door-gate-1")
+    first = probe(s, seconds, GATE_CONSUMER % 1)
     reasons = probe_verdict(first, s)
     emit({"check": "readiness+geometry", "pass": not reasons, "reasons": reasons, **first})
     ok &= not reasons
-    procs = []
-    for n in (2, 3):
-        fd, envfile = tempfile.mkstemp(prefix="door-gate-", suffix=".env")
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write("DOOR_URL=%s\n" % s.consumer_url())
-        argv = ["docker", "run", "--rm", "--name", "homehub-door-gate-%d" % n, "--network", "host",
-                "--read-only", "--cap-drop", "ALL", "--log-driver", "none", "--env-file", envfile,
-                "--entrypoint", "/bin/sh", image_ref(), "-c",
-                'exec ffmpeg -nostdin -v error -rtsp_transport tcp -i "$DOOR_URL" -map 0:v:0 -c copy -f null -']
-        procs.append((subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE), envfile))
-    time.sleep(max(8, seconds))
-    both = {"check": "two-consumers", "upstream_connections": upstream_count(s)}
+    # gate-2 leaves; gate-3 is the survivor and reports its own progress.
+    leaver = start_consumer(*gate_consumer(s, 2, progress=False))
+    survivor = start_consumer(*gate_consumer(s, 3, progress=True), stdout=subprocess.PIPE)
+    reader = ProgressReader(survivor.stdout)
     try:
-        both.update(streams(s))
-    except OSError as exc:
-        both["api_error"] = str(exc)
-    emit(both)
-    ok &= both["upstream_connections"] == 1 and both.get("producers") == 1 and both.get("consumers", 0) >= 2
-    subprocess.run(["docker", "rm", "-f", "homehub-door-gate-2"], stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=30)
-    time.sleep(5)
-    before = consumer_bytes(s)
-    time.sleep(progress_sec)
-    later = consumer_bytes(s)
-    after = {"check": "one-consumer-left", "upstream_connections": upstream_count(s),
-             "survivor_running": procs[1][0].poll() is None,
-             "consumers": later["consumers"] if later else None,
-             "survivor_sent_bytes": [b["sent_bytes"] if b else None for b in (before, later)],
-             "progress_sec": progress_sec}
-    after["survivor_progressing"] = bool(before and later and later["consumers"] >= 1
-                                         and later["sent_bytes"] > before["sent_bytes"])
-    emit(after)
-    ok &= after["upstream_connections"] == 1 and after["survivor_running"] and after["survivor_progressing"]
-    for proc, envfile in procs:
-        subprocess.run(["docker", "rm", "-f", "homehub-door-gate-2", "homehub-door-gate-3"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        time.sleep(max(8, seconds))
+        both = {"check": "two-consumers", "upstream_connections": upstream_count(s)}
         try:
-            proc.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        os.unlink(envfile)
+            both.update(streams(s))
+        except OSError as exc:
+            both["api_error"] = str(exc)
+        emit(both)
+        ok &= both["upstream_connections"] == 1 and both.get("producers") == 1 and both.get("consumers", 0) >= 2
+        subprocess.run(["docker", "rm", "-f", GATE_CONSUMER % 2], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30)
+        time.sleep(5)
+        frames_before, bytes_before = reader.frames, consumer_bytes(s)
+        time.sleep(progress_sec)
+        frames_later, stalled_for, bytes_later = reader.frames, reader.stalled_for(), consumer_bytes(s)
+        after = {"check": "one-consumer-left", "upstream_connections": upstream_count(s),
+                 "survivor_running": survivor.poll() is None,
+                 "survivor_frames": [frames_before, frames_later],
+                 "survivor_last_frame_age": None if stalled_for is None else round(stalled_for, 1),
+                 "consumers": bytes_later["consumers"] if bytes_later else None,
+                 "relay_sent_bytes": [b["sent_bytes"] if b else None for b in (bytes_before, bytes_later)],
+                 "progress_sec": progress_sec}
+        after["survivor_progressing"] = (frames_before is not None and frames_later is not None
+                                         and frames_later > frames_before
+                                         and stalled_for is not None and stalled_for <= PROGRESS_FRESH_SEC)
+        emit(after)
+        ok &= after["upstream_connections"] == 1 and after["survivor_running"] and after["survivor_progressing"]
+    finally:
+        subprocess.run(["docker", "rm", "-f", GATE_CONSUMER % 2, GATE_CONSUMER % 3],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        for proc in (leaver, survivor):
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
     emit({"check": "gate-hub-half", "pass": bool(ok)})
     return 0 if ok else 1
 
@@ -694,7 +828,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     g = sub.add_parser("gate")
     g.add_argument("--seconds", type=int, default=10)
     g.add_argument("--progress-seconds", type=int, default=5,
-                   help="how long the survivor's byte counter is watched for growth")
+                   help="how long the survivor's own frame count is watched for growth")
     co = sub.add_parser("cost")
     co.add_argument("--seconds", type=int, default=1800)
     co.add_argument("--cgroup", action="append", default=[], help="LABEL=/sys/fs/cgroup/... (repeatable)")
@@ -752,13 +886,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 groups[name] = container_cgroup(name) or "/nonexistent/%s" % name
             result = cost(groups, args.seconds)
             if decoder:
-                result["decoder_still_running"] = decoder[0].poll() is None
+                result["decoder_still_running"] = decoder.poll() is None
             emit(result)
         finally:
             if decoder:
                 subprocess.run(["docker", "rm", "-f", GREY_DECODER], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=60)
-                os.unlink(decoder[1])
         return 0
     p.print_help()
     return 2

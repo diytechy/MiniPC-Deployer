@@ -200,7 +200,7 @@ def unit(name):
     return (STACK / "door" / name).read_text(encoding="utf-8")
 
 
-def test_tc1377_the_recorder_cannot_start_ahead_of_the_mount_or_outlive_it():
+def test_tc1377_the_recorder_cannot_start_ahead_of_the_mount_or_outlive_it(tmp_path):
     u = unit("homehub-door-recorder.service")
     for line in ("RequiresMountsFor=/srv/scratch", "BindsTo=srv-scratch.mount",
                  "CapabilityBoundingSet=~CAP_SYS_RESOURCE", "RestartPreventExitStatus=75 76",
@@ -209,10 +209,11 @@ def test_tc1377_the_recorder_cannot_start_ahead_of_the_mount_or_outlive_it():
         assert line in u.splitlines(), line
     assert "After=srv-scratch.mount" in u
     # The recorder's container has no restart policy of its own and mounts nothing.
-    argv = rec.ffmpeg_argv("/run/x.env")
+    argv, _payload = rec.ffmpeg_command(dr.RelaySettings(write_env(tmp_path)))
     assert "--restart" not in argv and "-v" not in argv and "--volume" not in argv
     assert "--rm" in argv and "--read-only" in argv and "ALL" in argv
-    assert not any("rtsp://" in a for a in argv)  # the URL is in the env file, not argv
+    # No secret in it: the full check, for every consumer, is TC-1384's.
+    assert_consumer_argv_carries_no_secret(argv, dr.RelaySettings(write_env(tmp_path)))
 
 
 def test_tc1377_neither_unit_requires_docker_and_both_have_their_knob_condition():
@@ -293,6 +294,147 @@ def test_tc1384_redact_and_the_upstream_count():
           "0 0 192.0.2.10:8554 192.0.2.17:51000\n")
     assert dr.count_established(ss, "192.0.2.20", 554) == 1
     assert dr.count_established(ss, "192.0.2.20", 8554) == 0
+
+
+# ── TC-1384 every consumer: the URL on stdin, never in argv or env ───────────
+#
+# A value in argv is in /proc/<pid>/cmdline for any local user, and a
+# container's processes are host processes; an env var is in `docker inspect`.
+# So the checks are on the WHOLE argv - the docker client's, which is also the
+# container's command - and on what a shell inside it could expand. The real
+# running process is checked by door-relay-lab.sh check 11.
+
+
+def assert_consumer_argv_carries_no_secret(argv, s):
+    joined = "\n".join(argv)
+    assert "rtsp://" not in joined
+    for form in dr.secret_forms(s) + [s.consumer_url()]:
+        assert form not in joined, "a spelling of the credential is in argv"
+    # Nothing a shell could expand into an argument: no shell, and no `$`.
+    entry = argv.index("--entrypoint")
+    assert argv[entry + 1] in ("ffmpeg", "ffprobe")
+    assert not any(a in ("sh", "bash", "/bin/sh", "/bin/bash") or a.endswith("/sh") for a in argv)
+    assert not any("$" in a for a in argv)
+    # No environment or env file handed to the container at all.
+    assert not {"-e", "--env", "--env-file"} & set(argv[:entry])
+    # The docker client attaches stdin (-i), and the tool reads its input there,
+    # as an ffconcat document.
+    assert "-i" in argv[:entry]
+    tool = argv[entry + 2:]
+    at = tool.index("-i")
+    assert tool[at + 1] == "pipe:0" and tool[at - 6:at] == list(dr.FFCONCAT_INPUT[:-2])
+
+
+def assert_payload_carries_the_url(payload, s):
+    text = payload.decode("utf-8")
+    assert text.startswith("ffconcat version 1.0\n")
+    assert "\nfile '%s'\n" % s.consumer_url() in text
+    assert "\noption rtsp_transport tcp\n" in text
+
+
+class FakeStdin:
+    def __init__(self):
+        self.data, self.closed = b"", False
+
+    def write(self, data):
+        assert not self.closed
+        self.data += data
+        return len(data)
+
+    def close(self):
+        self.closed = True
+
+
+class RecordingPopen:
+    """A started consumer: what it was given on stdin, and whether it was closed."""
+    started = []
+
+    def __init__(self, argv, stdin=None, stdout=None, stderr=None, **_kw):
+        self.argv = list(argv)
+        self.stdin = FakeStdin() if stdin == dr.subprocess.PIPE else None
+        self.stdout = rec_empty_stream() if stdout == dr.subprocess.PIPE else None
+        self.stderr = io.BytesIO(b"") if stderr == dr.subprocess.PIPE else None
+        RecordingPopen.started.append(self)
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def rec_empty_stream():
+    import tempfile
+    return tempfile.TemporaryFile()  # select() ready, os.read() -> b"": the stream ended
+
+
+def assert_consumer_started_by_stdin(proc, s):
+    assert_consumer_argv_carries_no_secret(proc.argv, s)
+    assert proc.stdin is not None and proc.stdin.closed, "the document must be written and stdin closed"
+    assert_payload_carries_the_url(proc.stdin.data, s)
+
+
+def test_tc1384_the_input_document_and_its_one_builder(tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    argv, payload = dr.relay_consumer(s, "x", "ffmpeg", ["-nostdin"], ["-f", "null", "-"], timeout_us=15000000)
+    assert_consumer_argv_carries_no_secret(argv, s)
+    assert_payload_carries_the_url(payload, s)
+    assert payload.decode().endswith("option timeout 15000000\n")
+    with pytest.raises(ValueError):
+        dr.relay_consumer(s, "x", "/bin/sh", ["-c"], ["exec ffmpeg"])
+
+
+def test_tc1384_the_recorders_reader_carries_the_url_only_in_its_payload(tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    argv, payload = rec.ffmpeg_command(s)
+    assert_consumer_argv_carries_no_secret(argv, s)
+    assert_payload_carries_the_url(payload, s)
+    assert argv[-4:] == ["-an", "-f", "mpegts", "pipe:1"]  # stdout is the TS; stdin only the document
+    assert "option timeout 15000000" in payload.decode()
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="select() on the reader's stdout is POSIX")
+def test_tc1384_the_recorder_service_hands_the_document_to_ffmpegs_stdin(monkeypatch, tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    RecordingPopen.started = []
+    monkeypatch.setattr(dr.subprocess, "Popen", RecordingPopen)
+    monkeypatch.setattr(rec.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(rec.Recorder, "guard", lambda self: (True, "ok"))
+    monkeypatch.setattr(rec.signal, "signal", lambda *a: None)
+    assert rec.run_service(write_env(tmp_path)) == 1  # the fake stream ends at once
+    (proc,) = RecordingPopen.started
+    assert proc.argv[proc.argv.index("--name") + 1] == rec.CONTAINER
+    assert_consumer_started_by_stdin(proc, s)
+
+
+def test_tc1384_the_probe_hands_the_document_to_stdin(monkeypatch, tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    seen = {}
+
+    def run(argv, input=None, **_kw):
+        seen.update(argv=list(argv), input=input)
+        out = json.dumps({"streams": [{"codec_name": "h264", "width": 1536, "height": 1536,
+                                       "nb_read_packets": "51", "avg_frame_rate": "10/1"}]})
+        return dr.subprocess.CompletedProcess(argv, 0, out.encode(), b"")
+    monkeypatch.setattr(dr.subprocess, "run", run)
+    result = dr.probe(s, 7)
+    assert dr.probe_verdict(result, s) == [] and result["packets"] == 51
+    assert_consumer_argv_carries_no_secret(seen["argv"], s)
+    assert_payload_carries_the_url(seen["input"], s)
+    assert seen["argv"][seen["argv"].index("-read_intervals") + 1] == "%+7"
+
+
+def test_tc1384_the_cost_decoder_hands_the_document_to_stdin(monkeypatch, tmp_path):
+    s = dr.RelaySettings(write_env(tmp_path))
+    RecordingPopen.started = []
+    monkeypatch.setattr(dr.subprocess, "Popen", RecordingPopen)
+    proc = dr.start_grey_decoder(s, 5)
+    assert proc is RecordingPopen.started[0]
+    assert_consumer_started_by_stdin(proc, s)
+    assert "fps=5,scale=256:256,format=gray" in proc.argv
 
 
 # ── the recorder: synthetic MPEG-TS ──────────────────────────────────────────
@@ -521,21 +663,46 @@ def test_tc1396_ts_duration_from_pts(tmp_path):
 
 
 HEALTHY = {"rc": 0, "codec": "h264", "width": 1536, "height": 1536, "packets": 50, "rate": "10/1"}
+# The relay's own sender counters RISE in every case below: go2rtc counts a
+# packet when it is queued for a consumer, so they are no evidence of delivery.
 PROGRESS = [{"consumers": 1, "sent_bytes": 1000}, {"consumers": 1, "sent_bytes": 9000}]
+# The survivor's own -progress frame count, one entry per gate sleep (the two
+# consumers' run, gate-2's departure, the progress window); None = no block.
+RECEIVING = [10, 20, 30]
 
 
 class FakeConsumer:
+    """A gate consumer. The survivor's stdout is a real pipe the test writes
+    ffmpeg `-progress` blocks into, exactly as ffmpeg would."""
+
+    def __init__(self, argv, stdin=None, stdout=None, stderr=None, **_kw):
+        self.argv = list(argv)
+        self.name = self.argv[self.argv.index("--name") + 1]
+        self.stdin = FakeStdin() if stdin == dr.subprocess.PIPE else None
+        self.stdout = self.writer = None
+        if stdout == dr.subprocess.PIPE:
+            r, w = os.pipe()
+            self.stdout, self.writer = os.fdopen(r, "rb"), os.fdopen(w, "wb", buffering=0)
+
+    def progress(self, frames):
+        self.writer.write(("frame=%d\nfps=10.00\ntotal_size=N/A\nout_time_us=%d\nprogress=continue\n"
+                           % (frames, frames * 100000)).encode())
+
     def poll(self):
         return None  # always "running": liveness alone must not be enough
 
     def wait(self, timeout=None):
+        if self.writer is not None and not self.writer.closed:
+            self.writer.close()
         return 0
 
     def kill(self):
-        pass
+        self.wait()
 
 
-def run_gate(monkeypatch, tmp_path, capsys, probe_result=None, counters=None, **env):
+def run_gate(monkeypatch, tmp_path, capsys, probe_result=None, counters=None, frames=None, **env):
+    import time as real_time
+    real_sleep = real_time.sleep
     s = dr.RelaySettings(write_env(tmp_path, **env))
     monkeypatch.setattr(dr, "probe", lambda *a, **k: dict(probe_result or HEALTHY))
     monkeypatch.setattr(dr, "upstream_count", lambda _s: 1)
@@ -543,26 +710,105 @@ def run_gate(monkeypatch, tmp_path, capsys, probe_result=None, counters=None, **
     seq = iter(PROGRESS if counters is None else counters)
     monkeypatch.setattr(dr, "consumer_bytes", lambda _s: next(seq))
     monkeypatch.setattr(dr, "image_ref", lambda: "example/go2rtc:1@sha256:0")
-    monkeypatch.setattr(dr.subprocess, "Popen", lambda *a, **k: FakeConsumer())
+    consumers, readers = [], []
+
+    def popen(*a, **k):
+        consumers.append(FakeConsumer(*a, **k))
+        return consumers[-1]
+
+    now = [1000.0]  # the gate's clock: advanced only by its own (fake) sleeps
+
+    class Reader(dr.ProgressReader):
+        def __init__(self, stream):
+            super().__init__(stream, clock=lambda: now[0])
+            readers.append(self)
+    monkeypatch.setattr(dr, "ProgressReader", Reader)
+    monkeypatch.setattr(dr.subprocess, "Popen", popen)
     monkeypatch.setattr(dr.subprocess, "run", lambda *a, **k: None)
-    monkeypatch.setattr(dr.time, "sleep", lambda _x: None)
+    script = iter(RECEIVING if frames is None else frames)
+    written = [0]
+
+    def report(count):
+        (survivor,) = [c for c in consumers if c.writer is not None]
+        survivor.progress(count)
+        written[0] += 5
+        deadline = real_time.monotonic() + 5  # let the reader thread catch up: deterministic
+        while readers[0].lines < written[0] and real_time.monotonic() < deadline:
+            real_sleep(0.005)
+
+    def sleep(seconds):
+        # Each gate sleep is a stretch in which the survivor reports (or not).
+        # An int is a block at the END of the stretch (it kept receiving); an
+        # ("early", n) a block at its START and nothing after (it stopped).
+        step = next(script, None)
+        if isinstance(step, tuple):
+            report(step[1])
+        now[0] += seconds
+        if isinstance(step, int):
+            report(step)
+    monkeypatch.setattr(dr.time, "sleep", sleep)
     code = dr.gate(s, 1)
     lines = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.startswith("{")]
     assert lines[-1]["check"] == "gate-hub-half" and lines[-1]["pass"] is (code == 0)
-    return code, {l["check"]: l for l in lines}
+    checks = {l["check"]: l for l in lines}
+    checks["_consumers"] = consumers
+    return code, checks
 
 
-needs_fchmod = pytest.mark.skipif(not hasattr(os, "fchmod"), reason="POSIX file modes (the gate's env files)")
-
-
-@needs_fchmod
 def test_tc1399_a_healthy_relay_passes_the_hub_half(monkeypatch, tmp_path, capsys):
     code, checks = run_gate(monkeypatch, tmp_path, capsys)
-    assert code == 0 and checks["one-consumer-left"]["survivor_progressing"]
+    left = checks["one-consumer-left"]
+    assert code == 0 and left["survivor_progressing"] and left["survivor_frames"] == [20, 30]
+    assert left["survivor_last_frame_age"] == 0.0
+    assert left["relay_sent_bytes"] == [1000, 9000]  # reported, not the verdict
     assert checks["readiness+geometry"]["reasons"] == []
 
 
-@needs_fchmod
+def test_tc1399_the_gate_consumers_report_progress_and_carry_no_secret(monkeypatch, tmp_path, capsys):
+    s = dr.RelaySettings(write_env(tmp_path))
+    _code, checks = run_gate(monkeypatch, tmp_path, capsys)
+    by_name = {c.name: c for c in checks["_consumers"]}
+    assert set(by_name) == {"homehub-door-gate-2", "homehub-door-gate-3"}
+    for c in by_name.values():
+        assert_consumer_started_by_stdin(c, s)
+    survivor = by_name["homehub-door-gate-3"].argv
+    assert survivor[survivor.index("-progress") + 1] == "pipe:1"
+    assert "-progress" not in by_name["homehub-door-gate-2"].argv
+
+
+@pytest.mark.parametrize("frames", [
+    [10, 20, 20],      # ffmpeg alive and reporting, but its frame count flat: nothing received
+    [10, 20, None],    # no block at all in the window: the consumer is stopped (SIGSTOP) or wedged
+    [None, None, None],  # never reported
+    [10, 20, ("early", 25)],  # a few frames just after the first sample, then stopped (the review's timing)
+])
+def test_tc1399_relay_counters_rising_while_the_survivor_receives_nothing_fails(monkeypatch, tmp_path, capsys, frames):
+    # Sol's reproduction: gate-3 SIGSTOPped after the first sample; the relay's
+    # sender bytes kept rising (PROGRESS) and the old gate passed.
+    code, checks = run_gate(monkeypatch, tmp_path, capsys, frames=frames)
+    left = checks["one-consumer-left"]
+    assert left["relay_sent_bytes"][1] > left["relay_sent_bytes"][0]
+    assert left["survivor_running"] is True
+    assert code == 1 and left["survivor_progressing"] is False
+
+
+def test_tc1399_the_progress_reader_counts_only_complete_blocks():
+    t = [50.0]
+    r = dr.ProgressReader(io.BytesIO(b""), clock=lambda: t[0])
+    r.thread.join(5)
+    assert r.stalled_for() is None
+    for line in ("frame=5", "fps=10", "progress=continue", "frame=9"):
+        r.feed(line + "\n")
+    assert r.frames == 5 and r.blocks == 1  # frame=9 has no progress= line yet
+    t[0] = 51.0
+    r.feed("progress=end\n")
+    assert r.frames == 9 and r.advanced_at == 51.0
+    t[0] = 54.0
+    for line in ("frame=9", "progress=continue", "frame=N/A", "progress=continue"):
+        r.feed(line + "\n")
+    assert r.frames == 9 and r.stalled_for() == 3.0  # a repeated count is not a rise
+
+
 @pytest.mark.parametrize("bad, words", [
     ({"rc": 1}, "probe exited 1"),
     ({"rc": 1, "packets": 1, "width": 320, "height": 240}, "geometry 320x240"),  # the review's own case
@@ -576,7 +822,6 @@ def test_tc1399_a_failed_probe_or_altered_stream_fails_the_gate(monkeypatch, tmp
     assert any(words in r for r in checks["readiness+geometry"]["reasons"]), checks["readiness+geometry"]
 
 
-@needs_fchmod
 def test_tc1399_the_expected_stream_is_a_knob(monkeypatch, tmp_path, capsys):
     code, _ = run_gate(monkeypatch, tmp_path, capsys, probe_result=dict(HEALTHY, codec="hevc", width=960, height=960),
                        DOOR_RELAY_EXPECT_CODEC="hevc", DOOR_RELAY_EXPECT_SIZE="960x960")
@@ -585,16 +830,15 @@ def test_tc1399_the_expected_stream_is_a_knob(monkeypatch, tmp_path, capsys):
         dr.RelaySettings(write_env(tmp_path, DOOR_RELAY_EXPECT_SIZE="big"))
 
 
-@needs_fchmod
 @pytest.mark.parametrize("counters", [
     [{"consumers": 1, "sent_bytes": 5000}, {"consumers": 1, "sent_bytes": 5000}],  # frozen
     [None, None],                                                                    # API silent
-    [{"consumers": 1, "sent_bytes": 5000}, {"consumers": 0, "sent_bytes": 9000}],  # survivor gone
 ])
-def test_tc1399_a_survivor_that_is_running_but_not_being_sent_video_fails(monkeypatch, tmp_path, capsys, counters):
+def test_tc1399_the_relays_counters_decide_nothing_the_consumers_frames_do(monkeypatch, tmp_path, capsys, counters):
+    # The secondary field may be flat or missing; a survivor whose own frame
+    # count rises is receiving video, and that is the verdict.
     code, checks = run_gate(monkeypatch, tmp_path, capsys, counters=counters)
-    assert code == 1 and checks["one-consumer-left"]["survivor_running"] is True
-    assert checks["one-consumer-left"]["survivor_progressing"] is False
+    assert code == 0 and checks["one-consumer-left"]["survivor_progressing"] is True
 
 
 def test_tc1399_the_probe_verb_uses_the_same_verdict(monkeypatch, tmp_path, capsys):

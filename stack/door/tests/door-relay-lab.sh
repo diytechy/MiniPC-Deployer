@@ -21,7 +21,12 @@
 #   2 no credential / a wrong credential -> 401 at RTSP; the API -> 401;
 #   3 the probe decodes h264 at 1536x1536 with the doorbell's credential;
 #   4 the hub half of the compatibility gate passes: two consumers, ONE
-#     upstream session, one producer; a consumer leaving keeps the upstream;
+#     upstream session, one producer; a consumer leaving keeps the upstream,
+#     and the survivor's OWN -progress frame count rises;
+#  4b/4c ...and FAILS when the survivor is SIGSTOPped once the other has left,
+#     before the gate's first sample (4b) or just after it (4c)
+#     (the review's reproduction: the relay's sender counters kept rising for
+#     a consumer that read nothing, and the old gate passed);
 #   5 the panel's own broker input path (OfficeWallNaglight doorstream
 #     ffconcat + ffmpeg_args, raw mode) produces JPEG frames from the relay;
 #   6 the recorder cuts copy-only, video-only segments at keyframes that decode
@@ -36,7 +41,13 @@
 #     under a live consumer - go2rtc's producer then warns with its whole
 #     upstream URL: the unit's output (what the journal gets) shows that warning
 #     redacted, and neither it nor docker holds the password or the camera's
-#     host:port (the container has no log driver to hold anything).
+#     host:port (the container has no log driver to hold anything);
+#  11 every consumer the hub runs - checks 3, 4, 4b, 6/7 and 9 cover the probe,
+#     the gate's three, the recorder and the cost decoder - was sampled while
+#     RUNNING: the credential is in no process's /proc/<pid>/cmdline or
+#     /proc/<pid>/environ on this host, no consumer's argv holds an rtsp://
+#     URL, and `docker inspect` (Config.Env, Cmd, Args, Path) of each holds
+#     neither; each one was seen reading its input from pipe:0.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DOOR="$(cd "$HERE/.." && pwd)"
@@ -48,8 +59,10 @@ ok()   { PASS=$((PASS + 1)); echo "PASS $*"; }
 bad()  { FAIL=$((FAIL + 1)); echo "FAIL $*"; }
 RELAY_RUN=/run/homehub-door-relay   # the unit's RuntimeDirectory; check 10 renders into it
 RELAY_RUN_OURS=""
+WATCH_PID=""
 cleanup() {
-    docker rm -f door-lab-cam door-lab-relay homehub-door-recorder homehub-door-probe \
+    [ -z "$WATCH_PID" ] || kill "$WATCH_PID" 2>/dev/null
+    docker rm -f door-lab-cam door-lab-relay door-lab-broker homehub-door-recorder homehub-door-probe homehub-door-costprobe \
         homehub-door-gate-1 homehub-door-gate-2 homehub-door-gate-3 homehub-door-relay >/dev/null 2>&1
     [ -z "$RELAY_RUN_OURS" ] || rm -rf "$RELAY_RUN"
     rm -rf "$WORK"
@@ -64,6 +77,10 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull -q "$IMAGE" >/dev/n
 export HOMEHUB_MONITOR_OVERRIDE_FILE=/nonexistent
 
 PW='c@m p$ss:1'
+# Every spelling of the credential, in a FILE: a `grep -e <secret>` would put
+# the secret in grep's own argv, which check 11 scans.
+PAT="$WORK/secret.pat"
+printf '%s\n' 'p$ss' 'p%24ss' "$(printf '%s' "admin:$PW" | base64 -w0)" >"$PAT"
 cat >"$WORK/cam.json" <<'JSON'
 {"api": {"listen": ""}, "rtsp": {"listen": ":8654", "username": "admin", "password": "c@m p$ss:1"},
  "webrtc": {"listen": ""}, "srtp": {"listen": ""}, "log": {"level": "info"},
@@ -106,14 +123,84 @@ wrong="$(docker run --rm --network host --entrypoint ffprobe "$IMAGE" -v error -
 api="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19840/api/streams)"
 case "$noauth$wrong" in *401*401*) [ "$api" = 401 ] && ok "2 no/wrong credential -> 401 (rtsp), api -> 401" || bad "2 api=$api";; *) bad "2 rtsp without the credential was not refused";; esac
 
+# 11 (sampling): from here to check 9, every running consumer is inspected
+# twice a second. The fake camera's own processes are excluded: its config,
+# not the hub's code, holds the credential.
+watch_consumers() {
+    while [ -e "$WORK/watch.on" ]; do
+        cam=" $(docker top door-lab-cam -eo pid 2>/dev/null | tail -n +2 | tr -s ' \n' '  ') "
+        for f in $(grep -laF -f "$PAT" /proc/[0-9]*/cmdline /proc/[0-9]*/environ 2>/dev/null); do
+            pid="${f#/proc/}"; pid="${pid%%/*}"
+            case "$cam" in *" $pid "*) continue;; esac
+            echo "LEAK ${f##*/} pid=$pid comm=$(cat "/proc/$pid/comm" 2>/dev/null)"
+        done
+        for c in $(docker ps --format '{{.Names}}' | grep '^homehub-door-'); do
+            pid="$(docker inspect -f '{{.State.Pid}}' "$c" 2>/dev/null)"
+            [ -n "$pid" ] && [ "$pid" != 0 ] || continue
+            cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+            [ -n "$cmd" ] || continue
+            case "$cmd" in *rtsp://*) echo "LEAK url-in-argv $c";; esac
+            case "$cmd" in *" -i pipe:0 "*) echo "SEEN $c pipe:0";; *) echo "SEEN $c other-input";; esac
+            insp="$(docker inspect -f '{{json .Config.Env}} {{json .Config.Cmd}} {{json .Args}} {{.Path}}' "$c" 2>/dev/null)"
+            if printf '%s\n' "$insp" | grep -qF -f "$PAT"; then echo "LEAK inspect $c"; fi
+            case "$insp" in *rtsp://*|*DOOR_URL*) echo "LEAK inspect-url $c";; esac
+        done
+        sleep 0.5
+    done
+}
+: >"$WORK/watch.on"
+watch_consumers >"$WORK/watch.log" 2>/dev/null & WATCH_PID=$!
+
 # 3 probe
 p="$(relay probe --seconds 5)"
 echo "$p" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if (d.get("codec"),d.get("width"),d.get("height"))==("h264",1536,1536) and d["packets"]>0 else 1)' \
     && ok "3 probe: h264 1536x1536, packets > 0" || bad "3 probe: $p"
 
 # 4 gate (hub half)
-if relay gate --seconds 6 >"$WORK/gate.jsonl"; then ok "4 gate: two consumers, one upstream, one producer; one leaves, upstream kept"
+frames_rose() {  # the one-consumer-left line's survivor_frames [a, b] with b > a
+    python3 -c '
+import json,sys
+d=[json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+left=[x for x in d if x.get("check")=="one-consumer-left"][0]
+a,b=left["survivor_frames"]
+sys.exit(0 if a is not None and b is not None and b > a else 1)' "$1"
+}
+if relay gate --seconds 6 >"$WORK/gate.jsonl" && frames_rose "$WORK/gate.jsonl"; then
+    ok "4 gate: two consumers, one upstream, one producer; one leaves, upstream kept, survivor's own frames rise: $(grep -o '"survivor_frames": \[[^]]*\]' "$WORK/gate.jsonl")"
 else bad "4 gate: $(cat "$WORK/gate.jsonl")"; fi
+
+# 4b/4c the review's reproduction: gate-3 (the survivor) SIGSTOPped. It stays
+# alive and connected and reads nothing; the gate must fail. 4b stops it as
+# soon as gate-2 has gone (before the first sample: a flat count); 4c DELAY
+# seconds after the two-consumers line, aiming just past the first sample (the
+# gate samples 5 s after gate-2's removal, which follows that line), so the
+# count rises a little and then goes stale.
+stop_survivor_run() {  # LABEL DELAY_AFTER_TWO_CONSUMERS (or "gone")
+    local label="$1" when="$2" out="$WORK/gate-stop-$1.jsonl" stopped="" gpid grc left
+    relay gate --seconds 6 >"$out" & gpid=$!
+    for _ in $(seq 1 480); do
+        if grep -q '"two-consumers"' "$out" 2>/dev/null; then
+            if [ "$when" = gone ]; then
+                docker ps --format '{{.Names}}' | grep -qx homehub-door-gate-2 && { sleep 0.1; continue; }
+            else
+                sleep "$when"
+            fi
+            spid="$(docker inspect -f '{{.State.Pid}}' homehub-door-gate-3 2>/dev/null)"
+            [ -n "$spid" ] && [ "$spid" != 0 ] && kill -STOP "$spid" && stopped="$spid"
+            break
+        fi
+        sleep 0.1
+    done
+    wait "$gpid"; grc=$?
+    [ -z "$stopped" ] || kill -CONT "$stopped" 2>/dev/null
+    left="$(grep '"one-consumer-left"' "$out")"
+    if [ -n "$stopped" ] && [ "$grc" = 1 ] && printf '%s' "$left" | grep -q '"survivor_progressing": false' \
+        && printf '%s' "$left" | grep -q '"survivor_running": true'; then
+        ok "$label survivor SIGSTOPped ($when): the gate fails (exit 1) on its own consumer's count: $(printf '%s' "$left" | grep -o '"survivor_frames": \[[^]]*\]\|"survivor_last_frame_age": [^,}]*\|"relay_sent_bytes": \[[^]]*\]' | tr '\n' ' ')"
+    else bad "$label stopped=${stopped:-never} gate-rc=$grc: $left"; fi
+}
+stop_survivor_run 4b gone
+stop_survivor_run 4c 6.5
 
 # 5 the panel's own input path
 if [ -r "$OWN_REPO/doorstream/service.py" ]; then
@@ -123,7 +210,7 @@ sys.path.insert(0, os.environ["OWN_REPO"])
 from doorstream.service import Config, ffconcat_input, ffmpeg_args, JpegFramer
 cfg = Config(host=os.environ["LAN"], password="c@m p$ss:1", port=18554, path="/door", username="admin")
 argv = ffmpeg_args(cfg, "raw")
-proc = subprocess.Popen(["docker", "run", "--rm", "-i", "--network", "host", "--name", "homehub-door-probe",
+proc = subprocess.Popen(["docker", "run", "--rm", "-i", "--network", "host", "--name", "door-lab-broker",
                          "--entrypoint", argv[0], os.environ["IMAGE"]] + argv[1:],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 proc.stdin.write(ffconcat_input(cfg)); proc.stdin.close()
@@ -132,7 +219,7 @@ while time.time() - t0 < 8:
     chunk = os.read(proc.stdout.fileno(), 65536)
     if not chunk: break
     n += len(framer.feed(chunk))
-subprocess.run(["docker", "rm", "-f", "homehub-door-probe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.run(["docker", "rm", "-f", "door-lab-broker"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 print(n)
 PY
 )"
@@ -156,10 +243,8 @@ rec = dr.Recorder("/nonexistent", os.path.join(os.environ["WORK"], "door"),
                   None, alert=lambda *a: print("ALERT", a))
 rec.guard = lambda: (True, "ok (lab stub)")
 rec.recover_parts()
-envp = os.path.join(os.environ["WORK"], "source.env")
-with open(envp, "w") as h:
-    h.write("DOOR_URL=%s\n" % relay.consumer_url())
-proc = subprocess.Popen(dr.ffmpeg_argv(envp), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+argv, payload = dr.ffmpeg_command(relay)   # exactly the service's reader and input path
+proc = door_relay.start_consumer(argv, payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 threading.Thread(target=lambda: [print("ffmpeg:", door_relay.redact(l.decode().rstrip())) for l in proc.stderr], daemon=True).start()
 threading.Timer(float(os.environ["SECS"]), lambda: setattr(rec, "stopping", True)).start()
 code = rec.consume(proc.stdout)
@@ -170,8 +255,8 @@ PY
 }
 T_SINCE="$(date +%s)"
 record 50 "$WORK/rec1.log"
-( sleep 15; docker restart door-lab-relay >/dev/null ) &
-record 45 "$WORK/rec2.log"; wait
+( sleep 15; docker restart door-lab-relay >/dev/null ) & restarter=$!
+record 45 "$WORK/rec2.log"; wait "$restarter"   # that job only: check 11's sampler is a job too
 record 30 "$WORK/rec3.log"
 T_UNTIL="$(date +%s)"
 segs="$(find "$WORK/door" -name 'door-*.ts' | sort)"
@@ -200,7 +285,7 @@ sys.exit(0 if 1 <= len(between) <= 3 and d["segments"] >= 5 else 1)' \
 
 # 8 no secret in any log
 logs="$(docker logs door-lab-relay 2>&1; cat "$WORK"/rec*.log)"
-if printf '%s' "$logs" | grep -qF -e 'p$ss' -e 'p%24ss'; then bad "8 a log line carries the password"
+if printf '%s' "$logs" | grep -qF -f "$PAT"; then bad "8 a log line carries the password"
 else ok "8 no relay or recorder log line carries the password"; fi
 
 # 9 the cost sampler (task 11's tool): the relay and a 5 fps grey decoder, measured
@@ -210,6 +295,21 @@ import json,sys; d=json.load(sys.stdin)
 ok = all("cpu_pct_one_core" in d[k] for k in ("door-lab-relay", "homehub-door-costprobe")) and d["decoder_still_running"]
 sys.exit(0 if ok else 1)  # PSI is reported when the kernel has it' \
     && ok "9 cost: per-cgroup CPU for the relay and the grey decoder, PSI sampled: $c" || bad "9 cost: $c"
+
+# 11 the verdict of the sampling started before check 3
+rm -f "$WORK/watch.on"; wait "$WATCH_PID" 2>/dev/null
+leaks="$(grep -c '^LEAK' "$WORK/watch.log" || true)"
+missing=""
+for c in homehub-door-probe homehub-door-gate-1 homehub-door-gate-2 homehub-door-gate-3 \
+         homehub-door-recorder homehub-door-costprobe; do
+    grep -qx "SEEN $c pipe:0" "$WORK/watch.log" || missing="$missing $c"
+done
+other="$(grep -c 'other-input$' "$WORK/watch.log" || true)"
+if [ "$leaks" = 0 ] && [ -z "$missing" ] && [ "$other" = 0 ]; then
+    ok "11 six consumers sampled running ($(grep -c '^SEEN' "$WORK/watch.log") samples): none has the credential in cmdline, environ or docker inspect, none an rtsp:// argv; each read pipe:0"
+else
+    bad "11 leaks=$leaks (by kind: $(grep '^LEAK' "$WORK/watch.log" | awk '{print $2}' | sort | uniq -c | tr -s ' \n' ' ')) not-seen-on-pipe:0:${missing:- none} other-input=$other"
+fi
 
 # 10 the relay exactly as its UNIT runs it, the camera killed under a consumer
 if [ -e "$RELAY_RUN" ]; then
@@ -248,8 +348,7 @@ else
     driver="$(docker inspect -f '{{.HostConfig.LogConfig.Type}}' homehub-door-relay 2>&1)"
     dlogs="$(docker logs homehub-door-relay 2>&1)"
     while IFS= read -r l; do run_unit_line "$l" >>"$JOURNAL" 2>&1; done < <(unit_lines ExecStopPost)
-    token="$(printf '%s' "admin:$PW" | base64 -w0)"
-    leaks="$(printf '%s\n%s\n' "$(cat "$JOURNAL")" "$dlogs" | grep -cF -e 'p$ss' -e 'p%24ss' -e "$token" -e '127.0.0.1:8654' || true)"
+    leaks="$(printf '%s\n%s\n' "$(cat "$JOURNAL")" "$dlogs" | grep -cF -f "$PAT" -e '127.0.0.1:8654' || true)"
     warned="$(grep -c 'url=rtsp://' "$JOURNAL" || true)"
     if [ "$pre_ok" = 1 ] && [ "$warned" -ge 1 ] && [ "$leaks" = 0 ] && [ "$driver" = none ]; then
         ok "10 the unit's relay, camera killed: $warned producer warning(s) in its output, redacted; no password or camera host:port in it or in docker (log driver: $driver; up exited $urc)"

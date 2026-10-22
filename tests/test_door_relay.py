@@ -1113,20 +1113,30 @@ def cli_rig(tmp_path):
     env_file = write_env(tmp_path, LAN_IP="127.0.0.1", DOOR_RELAY_RTSP_PORT=str(relay.port))
     procs = []
 
-    def run(args, wait_for, sig, finish=(), rm_slow=0, in_removal=False, grace=None):
+    def run(args, wait_for, sig, finish=(), rm_slow=0, in_removal=False, grace=None, via=None):
         """`in_removal`: signal once a `docker rm -f` has STARTED (and is held
         for `rm_slow` s), not when the consumers run. `grace`: the probe's
-        PROBE_GRACE_SEC, so its timeout path is reached in seconds."""
+        PROBE_GRACE_SEC, so its timeout path is reached in seconds. `via`:
+        None sends `sig` to the CLI alone; "group" starts the CLI as a process
+        group leader and sends it to the whole group (os.killpg - Ctrl-C at
+        a terminal); "timeout" runs the CLI under GNU `timeout` and sends it
+        to timeout, which passes it to the CLI AND to its process group."""
         env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ.get("PATH", ""),
                    FAKE_DOCKER_STATE=str(state), FAKE_DOCKER_FINISH=",".join(finish),
                    FAKE_DOCKER_RM_SLOW=str(rm_slow),
                    HOMEHUB_MONITOR_OVERRIDE_FILE=str(tmp_path / "no-override"))
         cli = [str(STACK / "door" / "door_relay.py")]
-        if grace is not None:  # the same main(), one constant shortened
-            cli = ["-c", "import sys; sys.path.insert(0, %r); import door_relay as d; d.PROBE_GRACE_SEC = %d; "
-                         "sys.exit(d.main(sys.argv[1:]))" % (str(STACK / "door"), grace)]
-        proc = sp.Popen([sys.executable] + cli + ["--env-file", env_file] + list(args),
-                        stdout=sp.PIPE, stderr=sp.STDOUT, env=env)
+        if grace is not None or via:
+            # The same main(). A grace shortens one constant. For a group
+            # signal, Ctrl-C is armed as an interactive Python has it, even
+            # when this test runs with SIGINT ignored (a background job).
+            cli = ["-c", "import signal, sys; sys.path.insert(0, %r); import door_relay as d; "
+                         "signal.signal(signal.SIGINT, signal.default_int_handler); %s"
+                         "sys.exit(d.main(sys.argv[1:]))"
+                         % (str(STACK / "door"), "" if grace is None else "d.PROBE_GRACE_SEC = %d; " % grace)]
+        prefix = ["timeout", "600"] if via == "timeout" else []
+        proc = sp.Popen(prefix + [sys.executable] + cli + ["--env-file", env_file] + list(args),
+                        stdout=sp.PIPE, stderr=sp.STDOUT, env=env, start_new_session=(via == "group"))
         procs.append(proc)
         if sig is not None:
             deadline = tm.monotonic() + 60
@@ -1136,7 +1146,10 @@ def cli_rig(tmp_path):
                 assert tm.monotonic() < deadline, "the consumers never started"
                 tm.sleep(0.05)
             tm.sleep(0.3)  # into the wait the verb is making, not the instant of the start
-            proc.send_signal(sig)
+            if via == "group":
+                os.killpg(proc.pid, sig)
+            else:
+                proc.send_signal(sig)
         out = proc.communicate(timeout=90)[0].decode()
         return proc.returncode, out
 
@@ -1347,6 +1360,94 @@ def test_tc1399_a_removal_confirms_only_what_docker_finished(monkeypatch):
     assert dr.stop_line("gate", 15).endswith("its consumers were removed (homehub-door-gate-1 homehub-door-gate-2)")
     dr.CONSUMERS.reset()
     assert dr.stop_line("cost", 1).endswith("it had started no consumer")
+
+
+# ── TC-1399 a removal killed with the caller's process group (round 6 F8)
+#
+# defer_stop() shields the Python process only. `docker rm -f` ran in the
+# caller's process group, so a group-wide signal - Ctrl-C at an ssh/sudo
+# terminal, GNU `timeout` without --foreground - killed the removal too, and
+# `if done.returncode and errors` then CONFIRMED it: a signalled rm has a
+# nonzero rc and an empty stderr. Sol: `real Docker / GNU timeout: rc=143
+# container_running=true / rm events: start / stop line: ... its consumers
+# were removed`.
+
+
+@pytest.mark.parametrize("rc,stderr", [
+    (-15, b""),                                # killed by SIGTERM
+    (-2, b""),                                 # killed by SIGINT
+    (143, b""),                                # 128+15 through a wrapper (sh, timeout)
+    (130, b""),                                # 128+2 through a wrapper
+    (1, b""),                                  # failed, said nothing
+    (1, b"Error response from daemon: No such container: x\nError response from daemon: busy\n"),
+    (0, b"Error response from daemon: busy\n"),  # rc 0 with an error beside it
+])
+def test_tc1399_a_removal_that_did_not_finish_cleanly_is_not_confirmed(monkeypatch, rc, stderr):
+    dr.CONSUMERS.reset()
+    dr.CONSUMERS.start("homehub-door-probe")
+    seen = {}
+
+    def run(argv, **kw):
+        seen.update(kw)
+        return dr.subprocess.CompletedProcess(argv, rc, None, stderr)
+    monkeypatch.setattr(dr.subprocess, "run", run)
+    assert dr.remove_containers("homehub-door-probe") is False
+    assert "homehub-door-probe" not in dr.CONSUMERS.removed
+    assert "removal NOT confirmed for homehub-door-probe" in dr.stop_line("probe", 15)
+    assert seen.get("start_new_session") is True  # out of the caller's process group
+    dr.CONSUMERS.reset()
+
+
+@posix_signals
+def test_tc1399_ctrl_c_is_deferred_like_sigterm_and_an_ignored_sigint_is_left_alone():
+    """SIGINT with Python's own handler becomes Stopped(130), which a cleanup
+    block defers - a KeyboardInterrupt could not be deferred, and inside
+    subprocess.run it kills the removal. An ignored SIGINT stays ignored."""
+    import signal as sg
+    before = sg.signal(sg.SIGINT, sg.default_int_handler)
+    try:
+        ran = []
+        with dr.stop_signals_raise():
+            assert sg.getsignal(sg.SIGINT) is not sg.default_int_handler
+            with pytest.raises(dr.Stopped) as stopped:
+                with dr.defer_stop():
+                    os.kill(os.getpid(), sg.SIGINT)
+                    ran.append("cleanup")  # not cut short by a KeyboardInterrupt
+            assert stopped.value.signum == sg.SIGINT and stopped.value.code == 130
+        assert ran == ["cleanup"]
+        assert sg.getsignal(sg.SIGINT) is sg.default_int_handler
+        sg.signal(sg.SIGINT, sg.SIG_IGN)
+        with dr.stop_signals_raise():
+            assert sg.getsignal(sg.SIGINT) is sg.SIG_IGN
+        assert sg.getsignal(sg.SIGINT) is sg.SIG_IGN
+    finally:
+        sg.signal(sg.SIGINT, before)
+
+
+@posix_signals
+@pytest.mark.parametrize("via", ["group", "timeout"])
+@pytest.mark.parametrize("signame,code", [("SIGTERM", 143), ("SIGINT", 130)])
+@pytest.mark.parametrize("verb", ["cost", "probe-timeout"])
+def test_tc1399_a_signal_to_the_whole_process_group_cannot_kill_the_removal(cli_rig, verb, signame, code, via):
+    """The removal is held 3 s by the stub; the signal goes to the CLI's
+    whole process group once it has started. The rm must run to its end and
+    the stop line must report what it confirmed."""
+    import shutil
+    if via == "timeout" and not shutil.which("timeout"):
+        pytest.skip("GNU timeout is not on PATH")
+    run, relay, sg = cli_rig
+    sig = getattr(sg, signame)
+    if verb == "cost":
+        args, kw, name = ["cost", "--seconds", "1", "--decode-grey-fps", "5"], {}, dr.GREY_DECODER
+    else:
+        args, kw, name = ["probe", "--seconds", "1"], {"grace": 2}, "homehub-door-probe"
+    rc, out = run(args, [], sig, rm_slow=3, in_removal=True, via=via, **kw)
+    assert run.rm_events("finish") == ["finish " + name], (run.rm_events("start"), out)
+    assert rc == code, out
+    assert run.containers() == [] and relay.accepted and run.sessions_closed()
+    assert "stopped by signal %d; its consumers were removed (%s)" % (sig, name) in out, out
+    if verb == "probe-timeout":
+        assert '"pass"' not in out  # stopped: no verdict printed
 
 
 @posix_signals

@@ -389,8 +389,8 @@ def redact_run(s: RelaySettings, argv: Sequence[str], out=None) -> int:
 
 
 class Stopped(SystemExit):
-    """A SIGTERM or SIGHUP turned into an exception (code 128+N), so a verb's
-    except/finally cleanup runs before the process ends."""
+    """A SIGTERM, SIGHUP or SIGINT turned into an exception (code 128+N), so
+    a verb's except/finally cleanup runs before the process ends."""
 
     def __init__(self, signum: int):
         super().__init__(128 + signum)
@@ -400,7 +400,10 @@ class Stopped(SystemExit):
 @contextlib.contextmanager
 def stop_signals_raise():
     """While the probe, gate and cost verbs run: SIGTERM and SIGHUP raise
-    Stopped, as Ctrl-C already raises KeyboardInterrupt.
+    Stopped, and so does SIGINT (Ctrl-C) while it has Python's own default
+    handler - a KeyboardInterrupt could not be deferred by defer_stop(), and
+    inside subprocess.run it kills the removal under way. An inherited
+    SIG_IGN or someone else's SIGINT handler is left alone.
 
     Python's default action for both is to die WITHOUT unwinding, and those
     verbs start named consumer containers that their except/finally remove:
@@ -430,10 +433,12 @@ def stop_signals_raise():
             return
         _STOP.fired = True
         raise Stopped(signum)
-    for name in ("SIGTERM", "SIGHUP"):
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
         sig = getattr(signal, name, None)
         if sig is None:  # SIGHUP does not exist on the dev PC's Windows Python
             continue
+        if name == "SIGINT" and signal.getsignal(sig) is not signal.default_int_handler:
+            continue  # ignored (a background job) or owned by the caller: not ours to change
         try:
             previous[sig] = signal.signal(sig, stop)
         except ValueError:  # not the main thread: the caller owns signals
@@ -465,7 +470,7 @@ _STOP = _StopState()
 
 @contextlib.contextmanager
 def defer_stop():
-    """A cleanup block that a SIGTERM or SIGHUP cannot cut short: a signal
+    """A cleanup block that a SIGTERM, SIGHUP or SIGINT cannot cut short: a signal
     arriving inside it is recorded, and Stopped is raised as the OUTERMOST
     block ends (nested blocks defer to it), after the cleanup has run. Outside
     stop_signals_raise() nothing is ever recorded, so it is inert there.
@@ -666,23 +671,39 @@ REMOVE_TIMEOUT_SEC = 30
 def remove_containers(*names: str, timeout: int = REMOVE_TIMEOUT_SEC) -> bool:
     """`docker rm -f` the named consumers, bounded, output discarded. Never
     raises a failure of its own: it runs on cleanup paths, where that must not
-    replace the error being cleaned up after. It runs under defer_stop(), so a
-    SIGTERM or SIGHUP arriving while it runs does not abandon the removal: the
-    Stopped is raised once it has finished. Returns True, and records the
-    names as removed (CONSUMERS), only when docker ran to completion and
-    reported nothing but removals or names already gone."""
+    replace the error being cleaned up after.
+
+    Two shields, because a stop reaches two processes. defer_stop() keeps a
+    SIGTERM, SIGHUP or SIGINT arriving at THIS process from abandoning the
+    removal: the Stopped is raised once it has finished. And the `docker rm`
+    runs in its own session (start_new_session), so a signal sent to the
+    caller's whole process group - Ctrl-C at an ssh/sudo terminal, GNU
+    `timeout` without --foreground - cannot kill the removal itself.
+
+    Returns True, and records the names as removed (CONSUMERS), only when
+    docker exited 0, or exited 1 saying nothing but "No such container" (the
+    names were already gone). Anything else - killed by a signal (negative
+    rc, or 128+N through a wrapper) with an empty stderr included, any other
+    rc, any other stderr, a timeout - is NOT a confirmed removal."""
     with defer_stop():
         try:
             done = subprocess.run(["docker", "rm", "-f"] + list(names), stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE, timeout=timeout)
+                                  stderr=subprocess.PIPE, timeout=timeout, start_new_session=True)
         except (OSError, subprocess.SubprocessError):
             return False
-        errors = [line for line in (done.stderr or b"").decode("utf-8", "replace").splitlines()
-                  if line.strip() and "No such container" not in line]
-        if done.returncode and errors:
+        lines = [line for line in (done.stderr or b"").decode("utf-8", "replace").splitlines() if line.strip()]
+        if not removal_confirmed(done.returncode, lines):
             return False
         CONSUMERS.removed.update(names)
         return True
+
+
+def removal_confirmed(returncode: int, stderr_lines: List[str]) -> bool:
+    """rc 0, or rc 1 with every stderr line a "No such container", and no
+    other stderr. Implements: LLR-1226."""
+    if any("No such container" not in line for line in stderr_lines):
+        return False
+    return returncode == 0 or (returncode == 1 and bool(stderr_lines))
 
 
 PROBE_GRACE_SEC = 60  # how long past its --seconds the probe's docker client may take
@@ -691,7 +712,7 @@ PROBE_GRACE_SEC = 60  # how long past its --seconds the probe's docker client ma
 def probe(s: RelaySettings, seconds: int = 10, name: str = "homehub-door-probe") -> Dict[str, object]:
     """One authenticated test consumer: what it decoded and in what geometry.
 
-    Killing the docker client (on the deadline, on Ctrl-C, or on the SIGTERM
+    Killing the docker client (on the deadline, or on the Ctrl-C, SIGTERM
     or SIGHUP that main() turns into Stopped) does NOT stop the container:
     --rm removes it only once ffprobe exits, and against a camera that
     accepts TCP but never answers RTSP that is never. So on any way out but a

@@ -2531,6 +2531,9 @@ fi
 #   written on the panel by hand on 2026-09-19, so this takes it over in
 #   place. journald is restarted only when the drop-in actually changed, so
 #   an ordinary boot does not bounce it.
+#   A second drop-in turns ForwardToSyslog off (there is no syslog daemon to
+#   forward to); it is named zz-... because systemd's own syslog.conf turns
+#   it on and drop-ins merge in file-name order.
 # * wall-disk-check.timer writes `wall-disk: LOW ...` to the journal and
 #   /run/wall-disk/status.json, for / and for the media cache AT THE PATH
 #   THIS SCRIPT RESOLVED (WALL_MEDIA_CACHE), handed over in the generated
@@ -2590,9 +2593,11 @@ fi
 unset _syslog_units
 _journald_changed=0
 cmp -s "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf || _journald_changed=1
+cmp -s "$PAYLOAD/wall-journald-no-syslog.conf" /etc/systemd/journald.conf.d/zz-wall-no-syslog-forward.conf || _journald_changed=1
 install -d -m 0755 /etc/systemd/journald.conf.d ||
     logcap_failed "could not create /etc/systemd/journald.conf.d"
 install -m 0644 "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf || logcap_failed "could not install the journald drop-in"
+install -m 0644 "$PAYLOAD/wall-journald-no-syslog.conf" /etc/systemd/journald.conf.d/zz-wall-no-syslog-forward.conf || logcap_failed "could not install the journald no-forwarding drop-in"
 install -m 0755 "$PAYLOAD/wall-disk-check.py" /usr/local/sbin/wall-disk-check.py || logcap_failed "could not install wall-disk-check.py"
 install -m 0644 "$PAYLOAD/wall-disk-check.service" /etc/systemd/system/wall-disk-check.service || logcap_failed "could not install wall-disk-check.service"
 install -m 0644 "$PAYLOAD/wall-disk-check.timer" /etc/systemd/system/wall-disk-check.timer || logcap_failed "could not install wall-disk-check.timer"

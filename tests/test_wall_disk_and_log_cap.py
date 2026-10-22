@@ -198,6 +198,16 @@ def test_tc1263_journald_cap_is_explicit():
     assert "SystemMaxUse=500M" in lines and "SystemKeepFree=2G" in lines
 
 
+def test_tc1263_journald_forwarding_off_sorts_after_systemds_syslog_conf():
+    # systemd's /usr/lib/systemd/journald.conf.d/syslog.conf sets
+    # ForwardToSyslog=yes; drop-ins merge in file-name order, last wins.
+    assert "ForwardToSyslog=no" in _directives(WALL / "wall-journald-no-syslog.conf")
+    assert not any(d.startswith("ForwardToSyslog") for d in _directives(WALL / "wall-journald.conf"))
+    fb = (WALL / "wall-firstboot.sh").read_text(encoding="utf-8")
+    name = re.search(r'wall-journald-no-syslog\.conf" /etc/systemd/journald\.conf\.d/(\S+) ', fb).group(1)
+    assert name > "syslog.conf" and "10-wall-cap.conf" < "syslog.conf"
+
+
 def test_tc1263_disk_check_units():
     service = _directives(WALL / "wall-disk-check.service")
     for directive in ("Type=oneshot", "ExecStart=/usr/bin/python3 /usr/local/sbin/wall-disk-check.py",
@@ -218,7 +228,7 @@ def test_tc1263_disk_check_units():
 
 def test_tc1263_new_files_are_lf_and_the_script_is_executable_in_git():
     for name in ("wall-disk-check.py", "wall-disk-check.service", "wall-disk-check.timer",
-                 "wall-journald.conf"):
+                 "wall-journald.conf", "wall-journald-no-syslog.conf"):
         assert b"\r" not in (WALL / name).read_bytes(), name
     out = subprocess.run(["git", "-C", str(WALL), "ls-files", "-s", "wall-disk-check.py"],
                          capture_output=True, text=True, check=True).stdout
@@ -341,6 +351,7 @@ def run_block(tmp_path, *, journald_same=False, fail_install="", enable_status=0
 
 INSTALLS = [
     "install -m 0644 {p}/wall-journald.conf /etc/systemd/journald.conf.d/10-wall-cap.conf",
+    "install -m 0644 {p}/wall-journald-no-syslog.conf /etc/systemd/journald.conf.d/zz-wall-no-syslog-forward.conf",
     "install -m 0755 {p}/wall-disk-check.py /usr/local/sbin/wall-disk-check.py",
     "install -m 0644 {p}/wall-disk-check.service /etc/systemd/system/wall-disk-check.service",
     "install -m 0644 {p}/wall-disk-check.timer /etc/systemd/system/wall-disk-check.timer",

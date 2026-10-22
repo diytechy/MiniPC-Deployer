@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from git_retry import run_git  # transient shared-.git faults: see tests/git_retry.py
+
 REPO = Path(__file__).resolve().parents[1]
 FIRSTBOOT = REPO / "stack" / "autoinstall" / "firstboot.sh"
 SLEEP = REPO / "stack" / "sleep"
@@ -47,8 +49,7 @@ def sleep_block():
 def test_every_file_the_unit_needs_is_tracked_so_the_payload_archive_carries_it():
     if shutil.which("git") is None or not (REPO / ".git").exists():
         pytest.skip("no git checkout to ask")
-    out = subprocess.run(["git", "-C", str(REPO), "ls-files", "stack/sleep"],
-                         capture_output=True, text=True, check=True).stdout.split()
+    out = run_git(["git", "-C", str(REPO), "ls-files", "stack/sleep"]).stdout.split()
     wanted = {"stack/sleep/" + n for n in (
         "README.md", "homehub-sleep.service", "homehub-sleep.timer",
         "setup-sleep.sh", "sleep_feeder.py", "apply-env-lines.py")}

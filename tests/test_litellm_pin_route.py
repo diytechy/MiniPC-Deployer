@@ -1638,6 +1638,10 @@ def _stack_copy():
     below pass for the wrong reason. `build/` is gitignored and the copy is
     removed whatever happens.
     """
+    # build/ is gitignored, so a fresh clone or a new worktree does not have
+    # it, and mkdtemp would raise FileNotFoundError before the check under
+    # test ran (2026-10-22, check.py in a fresh worktree).
+    (ROOT / "build").mkdir(exist_ok=True)
     holder = tempfile.mkdtemp(dir=str(ROOT / "build"), prefix="vc-stack-")
     dest = pathlib.Path(holder) / "stack"
     try:

@@ -323,18 +323,32 @@ def test_release_starts_the_recreated_container_not_the_recorded_id_tc1084(tmp_p
 
 
 FIRSTBOOT = REPO / "stack" / "autoinstall" / "firstboot.sh"
-_PROPAGATE = '    exit "$_compose_rc"\nfi\n'
+_GATE = '\nif [ "$_compose_rc" -ne 0 ]; then\n'
 
 
 def _firstboot_compose_block() -> str:
-    """firstboot.sh from the bulk `up` through 4a-quarantine's failure propagation."""
+    """firstboot.sh from the bulk `up` through 4a-quarantine's failure propagation.
+
+    The block ends at the column-0 `fi` that closes the top-level
+    `if [ "$_compose_rc" -ne 0 ]` gate. It used to end at a literal
+    `    exit "$_compose_rc"` + `fi`, which stopped matching when that exit moved
+    one level down into the gate's no-deferral branch (the baked-image
+    deferral, tested in test_sure_image_bake.py), so the extraction raised
+    before anything was asserted. Locating the gate by its own line keeps the
+    extraction independent of how its body is indented."""
     text = FIRSTBOOT.read_text(encoding="utf-8")
     start = text.index("_compose_rc=0\n")
-    return text[start:text.index(_PROPAGATE, start) + len(_PROPAGATE)]
+    gate = text.index(_GATE, start)
+    end = text.index("\nfi\n", gate) + len("\nfi\n")
+    block = text[start:end]
+    assert 'exit "$_compose_rc"' in block, "the up's failure must still end the script inside this block"
+    return block
 
 
 _HARNESS = r"""set -euo pipefail
 STACK_DIR="$1"; TRACE="$2"; RC="$3"
+# No baked image failed verification, so a failed `up` is not deferred.
+IMAGE_LOAD_STATE="$4"
 log() { printf 'log %s\n' "$*" >>"$TRACE"; }
 docker() { printf 'docker %s\n' "$*" >>"$TRACE"; return "$RC"; }
 python3() { printf 'python3 %s\n' "$*" >>"$TRACE"; }
@@ -360,7 +374,8 @@ def test_firstboot_enforces_quarantine_even_when_compose_up_fails_tc1084(tmp_pat
     block = _firstboot_compose_block().replace("/var/lib/homehub-recovery", state.as_posix())
     script = tmp_path / "block.sh"
     script.write_bytes((_HARNESS + block + "printf 'after\\n' >>\"$TRACE\"\n").encode("utf-8"))
-    done = subprocess.run([bash, script.as_posix(), stack.as_posix(), trace.as_posix(), str(compose_rc)],
+    done = subprocess.run([bash, script.as_posix(), stack.as_posix(), trace.as_posix(), str(compose_rc),
+                           (tmp_path / "no-image-load.state").as_posix()],
                           capture_output=True, text=True)
     lines = trace.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "docker compose up -d", (lines, done.stderr)
@@ -368,6 +383,7 @@ def test_firstboot_enforces_quarantine_even_when_compose_up_fails_tc1084(tmp_pat
                for ln in lines), lines
     if compose_rc:
         assert done.returncode == compose_rc and "after" not in lines, (done.returncode, lines)
+        assert any(ln.startswith("log FATAL: 'docker compose up -d' exited") for ln in lines), lines
     else:
         assert done.returncode == 0 and lines[-1] == "after", (done.returncode, lines)
 

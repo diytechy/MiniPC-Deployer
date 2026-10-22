@@ -206,7 +206,8 @@ The honest ledger of what has and has not been exercised is
 
 The `sure` profile is selected by default per Owner direction 2026-10-09;
 removing it opts out. Database/cache have only the
-internal network; Rails retains provider egress. FA still chooses Actual.
+internal network; Rails retains provider egress. FA's template default is
+Actual; the hub's config selects Sure (cutover 2026-10-22, SR-099).
 Backup-source generation includes Sure only with the selected profile; logical
 dump tooling remains inside the matching database image. No gate or deployment
 is implied by this authored flow.
@@ -235,7 +236,7 @@ sequenceDiagram
         Worker->>DB: Provider sync result
         Web-->>Owner: Sure household session
     end
-    Note over FA,Web: DATA_SOURCE remains actual; future read-only Sure URL internal
+    Note over FA,Web: FA reads sure-web:3000 internally when DATA_SOURCE=sure (start order: SR-099 flow below)
     Backup->>DB: Query exact container name and state
     alt missing or stopped optional container
         Backup-->>Backup: Loud SOURCE MISSING, SET SKIPPED; no fresh ledger
@@ -253,6 +254,54 @@ sequenceDiagram
     end
     end
     Note over Backup,Drive: NEVER-OFFSITE; structural checks are not a restore
+```
+
+### What Finance-Auditor waits for at start (SR-099, LLR-1204)
+
+Compose cannot key a dependency on `DATA_SOURCE`, so both ledgers are optional
+`service_healthy` dependencies and only the tracker is required. The behaviour
+below was measured on a toy project (Compose v5.3.0; the hub's v5.5.1 parses
+it the same way). On the hub `sure` is not in `COMPOSE_PROFILES`, so the
+`sure-web` branch is the profile-off one; that costs nothing, because FA's
+first request to Sure is at `RUN_AT`, not at start.
+
+```mermaid
+sequenceDiagram
+    participant Up as docker compose up -d
+    participant Tracker as tracker
+    participant Actual as actual
+    participant Web as sure-web
+    participant FA as finance-auditor
+    Note over Up,FA: SR-099, LLR-1204; --no-deps skips every step below
+    Up->>Tracker: start, wait for healthy (required)
+    alt tracker unhealthy
+        Up-->>Up: FA stays Created; up exits 1
+    end
+    Up->>Actual: start if needed (optional)
+    alt Actual starting
+        Up->>Actual: wait until healthy or unhealthy
+    end
+    opt Actual unhealthy
+        Up-->>Up: warning only; continue
+    end
+    alt sure profile off (the hub)
+        Up-->>Up: sure-web drops out of the project; no wait, no error
+    else sure profile on
+        Up->>Web: start if needed, wait until healthy (it waits for postgres and redis)
+        opt sure-web unhealthy
+            Up-->>Up: warning only; continue
+        end
+    end
+    Up->>FA: start
+    alt DATA_SOURCE=sure
+        FA->>FA: build the Sure client, no request; schedule RUN_AT
+        FA->>Web: first GET at RUN_AT
+    else DATA_SOURCE=actual (rollback)
+        FA->>Actual: connect and download the budget now
+        alt Actual unreachable
+            FA-->>FA: exit nonzero; restart policy retries
+        end
+    end
 ```
 
 Hand-authored sequence diagrams of the behaviour that is easiest to misread

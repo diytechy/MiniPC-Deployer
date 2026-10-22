@@ -96,7 +96,9 @@ def test_finance_defaults_and_separate_user_sr063():
     assert settings["SURE_API_KEY"] == "${FINANCE_SURE_API_KEY:-}"
     assert settings["TRACKER_FEED_USER"] == "${FINANCE_TRACKER_FEED_USER:-}"
     assert "sure" in service["networks"] and "default" in service["networks"]
-    assert "sure-web" not in service["depends_on"]
+    # Sure may only ever be an OPTIONAL startup dependency (SR-099): a required
+    # one invalidates every project with the sure profile off (the hub's case).
+    assert service["depends_on"]["sure-web"] == {"condition": "service_healthy", "required": False}
     assert settings["ACTUAL_URL"] == "http://actual:5006"
 
 

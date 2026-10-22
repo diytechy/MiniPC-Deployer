@@ -748,6 +748,11 @@ def main():
         # stops tailscaled, so the pair passes - enrolling it keeps it that way.
         ("dns-console/homehub-dns-console.service", "autoinstall/firstboot.sh"),
         ("dns-console/homehub-dns-console-tailscaled.service", "autoinstall/firstboot.sh"),
+        # Enrolled 2026-10-22 with the door relay and recorder (SR-105, SR-107).
+        # Both are Wants=+After= docker; the recorder's one hard binding is
+        # BindsTo=srv-scratch.mount, which firstboot never stops.
+        ("door/homehub-door-relay.service", "autoinstall/firstboot.sh"),
+        ("door/homehub-door-recorder.service", "autoinstall/firstboot.sh"),
     ):
         unit_text, script_text = load(stack / unit_rel), load(stack / script_rel)
         if not unit_text or not script_text:

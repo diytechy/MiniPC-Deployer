@@ -32,6 +32,28 @@ THE KINDS (watch.table header has the row syntax):
                  never "unhealthy", and `docker ps` says "Up". Immich ran like
                  that for 2,327 restarts in 2026-08 (open-items C58) and only
                  the counter told the truth (LLR-1211).
+  newest-file    the newest regular file matching TARGET (an absolute glob, one
+                 path component per level, no `**`) has an mtime THRESHOLD old
+                 or older, or no file has matched for THRESHOLD since the watch
+                 first saw the tree empty (kept in the state file, wall clock).
+                 Read-only and bounded: the walk never follows a symlink (not
+                 the root, not a directory, not a file), looks at no more than
+                 NEWEST_FILE_MAX_ENTRIES entries and gives up after
+                 NEWEST_FILE_SCAN_SEC; either limit is a firing verdict, never
+                 a guess from part of the tree. The door recorder's open
+                 `.ts.part` is the recording in progress and counts (LLR-1290).
+  scratch-identity
+                 the scratch volume is not mounted as the one its guard expects
+                 for THRESHOLD. The judgement is homehub_scratch.py's own:
+                 TARGET is that script, run as `TARGET --env-file ENV status`
+                 under a timeout, and the row is bad unless its JSON says
+                 mounted, identity_ok and prjquota are all true. A status that
+                 does not run, times out or prints no JSON is bad too - it must
+                 alert, never crash the watch or go quiet (LLR-1291).
+
+THRESHOLD 0m is allowed and means "fires at the first run that sees the
+condition": a drill sets it through the override file on a healthy job and
+restores it (README "Drills").
 
 NEVER ACTS. It reads /proc, asks systemd and docker, and alerts. It starts and
 stops nothing, including the synthetic drill process.
@@ -42,15 +64,20 @@ like, with `ts`): /var/lib/homehub-monitor/watch-status.json.
 Exit: 0 when the table was read and every row judged (fired or not); 1 when the
 table is missing or unreadable.
 
-Implements: SR-088, LLR-1156, LLR-1157, LLR-1158, LLR-1211
+Implements: SR-088, LLR-1156, LLR-1157, LLR-1158, LLR-1211, LLR-1290, LLR-1291
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
+import fnmatch
+import json
 import os
 import re
+import stat
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -59,7 +86,8 @@ import monitor_common as mc  # noqa: E402
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_TABLE = os.path.join(HERE, "watch.table")
-KINDS = ("process", "unit-success", "docker-health", "docker-restarts")
+KINDS = ("process", "unit-success", "docker-health", "docker-restarts",
+         "newest-file", "scratch-identity")
 # docker-restarts: this many restarts inside the row's window is a loop. Three,
 # because one restart is a crash that recovered and two can be a deploy; the
 # loop C58 recorded added ~20 every five minutes.
@@ -69,6 +97,21 @@ RESTART_LOOP_MIN = 3
 # however many containers turn unhealthy at once while ntfy (itself a
 # container) hangs.
 ALERT_DEADLINE_SEC = 100
+# newest-file: the most directory entries one run looks at, and how long the
+# walk may take. The door tree holds about 150 segments at its cap (10-minute
+# segments under DOOR_RECORDER_CAP_MIB); a tree past either limit is reported,
+# never judged from the part that was read.
+NEWEST_FILE_MAX_ENTRIES = 10000
+NEWEST_FILE_SCAN_SEC = 10.0
+# scratch-identity: the status command's bound. It reads mountinfo, one by-uuid
+# link, statvfs and three quotactl calls; well under a second when healthy.
+SCRATCH_STATUS_SEC = 10
+# scratch-identity counts "bad for THRESHOLD" from the first bad run. Runs are
+# OnUnitActiveSec=5min apart, measured from each activation, so two consecutive
+# runs can sample the monotonic clock a fraction of a second less than 300 s
+# apart; this much early still counts the period (the timer's AccuracySec).
+PERIOD_SLACK_SEC = 30
+GLOB_CHARS = re.compile(r"[*?\[]")
 SUBST = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
@@ -76,11 +119,36 @@ SUBST = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
 def parse_threshold(text: str) -> Optional[int]:
-    """`Nm` / `Nh` -> seconds; None when malformed or zero."""
+    """`Nm` / `Nh` -> seconds; None when malformed. `0m` is 0: the drill value,
+    which fires at the first run that sees the condition."""
     m = re.fullmatch(r"([0-9]{1,5})([mh])", text)
-    if not m or int(m.group(1)) == 0:
+    if not m:
         return None
     return int(m.group(1)) * (60 if m.group(2) == "m" else 3600)
+
+
+def split_glob(pattern: str) -> Optional[Tuple[str, List[str]]]:
+    """An absolute glob -> (root, [one fnmatch pattern per level below it]).
+
+    The root is every leading component with no wildcard; at least one must
+    exist, so no row ever walks from `/`. With no wildcard at all the last
+    component is the (literal) name. None when the pattern is relative, has
+    an empty, `.` or `..` component, or uses `**` (no recursion: the work is
+    bounded by the pattern's depth). On Windows (the gate's test runner) a
+    drive-letter path is accepted with either slash.
+    Implements: LLR-1290
+    """
+    norm = pattern.replace("\\", "/") if os.sep == "\\" else pattern
+    if not os.path.isabs(norm):
+        return None
+    head, _, rest = norm.partition("/")
+    parts = rest.rstrip("/").split("/")
+    if not rest or any(p in ("", ".", "..") or "**" in p for p in parts):
+        return None
+    first = next((i for i, p in enumerate(parts) if GLOB_CHARS.search(p)), len(parts) - 1)
+    if first == 0:
+        return None
+    return head + "/" + "/".join(parts[:first]), parts[first:]
 
 
 def _subst(text: str, env: Dict[str, str]) -> str:
@@ -144,6 +212,14 @@ def parse_table(text: str, env: Dict[str, str]) -> Tuple[List[dict], List[str]]:
                 "line %d (%s): empty target or bad threshold %r"
                 % (number, name, threshold)
             )
+            continue
+        if kind == "newest-file" and split_glob(target) is None:
+            problems.append("line %d (%s): newest-file target %r is not an absolute glob with a fixed root"
+                            % (number, name, target))  # fmt: skip
+            continue
+        if kind == "scratch-identity" and not os.path.isabs(target):
+            problems.append("line %d (%s): scratch-identity target %r is not an absolute path"
+                            % (number, name, target))  # fmt: skip
             continue
         rows.append(
             {"name": name, "kind": kind, "target": target, "threshold_s": seconds}
@@ -327,7 +403,189 @@ def judge_restarts(
     )
 
 
+def _span(seconds: int) -> str:
+    """A threshold for a title: whole hours as `Nh`, anything else as `Nm`."""
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return "%dh" % (seconds // 3600)
+    return "%dm" % (seconds // 60)
+
+
+def judge_newest_file(row: dict, st: dict, found: dict, now: float) -> Tuple[bool, dict, str]:
+    """(bad, new state, description) from one walk (newest_match's result).
+
+    Bad when the newest matching file's mtime is THRESHOLD old or older; when
+    nothing matched, bad once the tree has been empty for THRESHOLD since this
+    watch first saw it so (`empty_since`, wall clock, kept across reboots - a
+    recorder that has not written since before a reboot is still not writing);
+    and at once when the walk hit a limit, because a partial walk cannot vouch
+    for the newest file. `now` must be read AFTER the walk, or the segment being
+    written can carry an mtime later than `now`. Never unknown: a tree that
+    cannot be read is a recorder that is not recording there. Pure.
+    Implements: LLR-1290
+    """
+    st = dict(st)
+    limit = row["threshold_s"]
+    problem = ("; " + found["problem"]) if found.get("problem") else ""
+    if found.get("limit"):
+        return True, st, "%s: %s - not judged from part of the tree" % (row["target"], found["limit"])
+    newest = found.get("newest")
+    if newest is not None:
+        st.pop("empty_since", None)
+        return (now - newest[0] >= limit, st, "newest %s written %ds ago (%d matching)%s"
+                % (newest[1], int(now - newest[0]), found.get("files", 0), problem))  # fmt: skip
+    since = st.get("empty_since")
+    if not isinstance(since, (int, float)) or since > now + 60:  # unset, or the clock went back past it
+        since = now
+    st["empty_since"] = since
+    return (now - since >= limit, st,
+            "no file matches %s (seen empty for %ds)%s" % (row["target"], int(now - since), problem))  # fmt: skip
+
+
+def scratch_verdict(status: Optional[dict], error: str) -> Tuple[bool, str]:
+    """(bad, description) from homehub_scratch.py status's JSON - ITS judgement
+    of mounted / identity_ok / prjquota, read back, never re-derived. None (the
+    status did not run or printed no JSON) is bad, with `error` as the reason.
+    Pure.
+    Implements: LLR-1291
+    """
+    if status is None:
+        return True, "scratch status did not run: %s" % error
+    where = str(status.get("mountpoint") or "/srv/scratch")
+    if status.get("mounted") is not True:
+        return True, "%s is not mounted" % where
+    failed = []
+    if status.get("identity_ok") is not True:
+        failed.append("is not the filesystem HOMEHUB_SCRATCH_UUID names (expected %s, mounted from %s)"
+                      % (status.get("expected_uuid") or "unset", status.get("source", "?")))  # fmt: skip
+    if status.get("prjquota") is not True:
+        failed.append("is mounted without prjquota (quotas not enforced)")
+    if failed:
+        return True, "%s %s" % (where, " and ".join(failed))
+    return False, "%s mounted from %s, identity and prjquota ok" % (where, status.get("source", "?"))
+
+
+def judge_scratch(
+    row: dict, st: dict, bad_now: bool, what: str, boot: str, mono: float
+) -> Tuple[bool, dict, str]:
+    """(bad, new state, description). Bad once every run for THRESHOLD has been
+    bad, counted on the monotonic clock from the FIRST bad run of this boot
+    (PERIOD_SLACK_SEC early still counts), so the default 5m fires on the
+    second bad run in a row and one slow status does not page anyone; 0m fires
+    on the first. One good run clears. Pure.
+    Implements: LLR-1291
+    """
+    st = dict(st)
+    if not bad_now:
+        return False, {}, what
+    since = st.get("bad_since_mono")
+    if st.get("boot_id") != boot or not isinstance(since, (int, float)) or mono < since:
+        st.update(boot_id=boot, bad_since_mono=mono)
+        since = mono
+    lasted = mono - since
+    return (lasted >= max(0, row["threshold_s"] - PERIOD_SLACK_SEC), st,
+            "%s (bad for %ds)" % (what, int(lasted)))  # fmt: skip
+
+
 # ── the shell ────────────────────────────────────────────────────────────────
+
+
+def _errname(exc: OSError) -> str:
+    return errno.errorcode.get(exc.errno or 0, str(exc.errno))
+
+
+def _walk_newest(root: str, levels: List[str], max_entries: int) -> dict:
+    """Walk root/levels without following any symlink; see newest_match."""
+    out = {"newest": None, "files": 0, "problem": None, "limit": None}
+    try:
+        top = os.lstat(root)
+    except OSError as exc:
+        out["problem"] = "%s: %s" % (root, _errname(exc))
+        return out
+    if not stat.S_ISDIR(top.st_mode):
+        out["problem"] = "%s is %s (not followed)" % (
+            root, "a symlink" if stat.S_ISLNK(top.st_mode) else "not a directory")
+        return out
+    here, seen, problems = [root], 0, []
+    for depth, pattern in enumerate(levels):
+        last, below = depth == len(levels) - 1, []
+        for directory in here:
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        seen += 1
+                        if seen > max_entries:
+                            out["limit"] = "more than %d entries under %s" % (max_entries, root)
+                            return out
+                        if not fnmatch.fnmatchcase(entry.name, pattern):
+                            continue
+                        try:
+                            if not last:
+                                if entry.is_dir(follow_symlinks=False):
+                                    below.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                mtime = entry.stat(follow_symlinks=False).st_mtime
+                                out["files"] += 1
+                                if out["newest"] is None or mtime > out["newest"][0]:
+                                    out["newest"] = (mtime, entry.name)
+                        except OSError:
+                            continue  # gone between the listing and the stat (a segment closing)
+            except OSError as exc:
+                problems.append("%s: %s" % (directory, _errname(exc)))
+        here = below
+    out["problem"] = "; ".join(problems[:3]) or None
+    return out
+
+
+def newest_match(pattern: str, max_entries: int = NEWEST_FILE_MAX_ENTRIES,
+                 timeout: float = NEWEST_FILE_SCAN_SEC) -> dict:  # fmt: skip
+    """The newest regular file matching `pattern`, read-only and bounded.
+
+    Returns {"newest": (mtime, name) or None, "files": N, "problem": str|None,
+    "limit": str|None}. The walk runs in a daemon thread joined for `timeout`
+    seconds, so a filesystem stuck in I/O costs this row its verdict ("limit"),
+    never the run its record. Symlinks are never followed: a symlinked root,
+    directory or file is not part of the tree.
+    Implements: LLR-1290
+    """
+    split = split_glob(pattern)
+    if split is None:
+        return {"newest": None, "files": 0, "problem": "not an absolute glob", "limit": None}
+    box = {}
+
+    def _run():
+        box["out"] = _walk_newest(split[0], split[1], max_entries)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if "out" not in box:
+        return {"newest": None, "files": 0, "problem": None,
+                "limit": "the walk of %s did not finish in %gs" % (split[0], timeout)}  # fmt: skip
+    return box["out"]
+
+
+def scratch_status(tool: str, env_file: str) -> Tuple[Optional[dict], str]:
+    """Run `python3 TOOL --env-file ENV status`, bounded: (its JSON, "") or
+    (None, why). The tool's own exit code and output decide; a crash, a
+    timeout, a non-zero exit or a last line that is not a JSON object is None.
+    Implements: LLR-1291
+    """
+    done = mc.run_bounded([sys.executable, tool, "--env-file", env_file, "status"], SCRATCH_STATUS_SEC, 65536)
+    text = done.output.decode("utf-8", "replace").strip()
+    tail = (text.splitlines() or [""])[-1][-200:]
+    if done.error is not None:
+        return None, "cannot run %s (%s)" % (tool, done.error)
+    if done.timed_out:
+        return None, "%s status timed out after %ds" % (tool, SCRATCH_STATUS_SEC)
+    if done.rc != 0:
+        return None, "%s status exited %s: %s" % (tool, done.rc, tail)
+    try:
+        status = json.loads((text.splitlines() or [""])[-1])
+    except ValueError:
+        return None, "%s status printed no JSON: %s" % (tool, tail)
+    if not isinstance(status, dict):
+        return None, "%s status printed no JSON object" % tool
+    return status, ""
 
 
 def systemctl_show(unit: str) -> Optional[Dict[str, str]]:
@@ -460,7 +718,22 @@ def main(argv=None) -> int:
                 pending.append(mc.plan_episode(episodes, key, bad, fire, clear))  # fmt: skip
             bad = None if verdicts is None else any(verdicts.values())
         else:
-            if row["kind"] == "process":
+            look = "journalctl -u homehub-watch; the watch table is stack/monitoring/watch.table"
+            if row["kind"] == "newest-file":
+                found = newest_match(row["target"])
+                # read after the walk: the file being written may be newer than `now`
+                bad, st, what = judge_newest_file(row, st, found, time.time())
+                fire_title = "HomeHub: nothing new matching %s in %s (watch %s)" % (
+                    row["target"], _span(row["threshold_s"]), name)
+                clear_title = "HomeHub: %s is being written again (watch %s)" % (row["target"], name)
+                look = "ls -lt %s; journalctl -u homehub-watch" % split_glob(row["target"])[0]
+            elif row["kind"] == "scratch-identity":
+                bad_now, what = scratch_verdict(*scratch_status(row["target"], args.env_file))
+                bad, st, what = judge_scratch(row, st, bad_now, what, boot, mono)
+                fire_title = "HomeHub: the scratch volume is not mounted as expected (watch %s)" % name
+                clear_title = "HomeHub: the scratch volume is mounted as expected again (watch %s)" % name
+                look = "python3 %s status; journalctl -u homehub-watch" % row["target"]
+            elif row["kind"] == "process":
                 bad, st, what = judge_process(row, st, comms, boot, mono)
                 fire_title = "HomeHub: %s is not running (watch %s)" % (
                     row["target"],
@@ -485,8 +758,7 @@ def main(argv=None) -> int:
             live_keys.add(key)
             if bad is not None:
                 pending.append(mc.plan_episode(episodes, key, bad,
-                               ("high", fire_title, "%s: %s. Look at: journalctl -u homehub-watch; the watch table "
-                                "is stack/monitoring/watch.table" % (row["target"], what)),
+                               ("high", fire_title, "%s: %s. Look at: %s" % (row["target"], what, look)),
                                (clear_title, "%s: %s." % (row["target"], what))))  # fmt: skip
         rows_state[name] = st
         verdict = "unknown" if bad is None else ("FIRING" if bad else "ok")

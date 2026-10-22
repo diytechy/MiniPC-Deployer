@@ -3,8 +3,9 @@ episode machine, the telemetry record and its alarms, the low-disk alarm, the
 watched jobs, and the liveness probe with its evidence bundle.
 
 Verifies: SR-085, SR-086, SR-087, SR-088, SR-089
-          LLR-1147 .. LLR-1166, LLR-1168
-Cases:    TC-1275 .. TC-1305, TC-1313
+          LLR-1147 .. LLR-1166, LLR-1168, LLR-1290 .. LLR-1292
+Cases:    TC-1275 .. TC-1305, TC-1313, TC-1460 .. TC-1465 (TC-1466 is in
+          stack/monitoring/tests/monitoring.test.sh)
 
 Everything here is hermetic: fake sysfs/procfs trees in tmp_path, a stub alert
 helper or a stub curl, injected statfs/runner/writer seams. The Linux-only
@@ -1001,6 +1002,315 @@ def test_watch_main_drill_fires_and_clears_the_synthetic_watch_tc1293(
         (tmp_path / "st" / "watch-status.json").read_text(encoding="utf-8")
     )
     assert {r["name"]: r["verdict"] for r in status["rows"]}["synthetic"] == "ok"
+
+
+# ── plan W3b: door segments, scratch identity, meeting pull (LLR-1290..LLR-1292) ──
+
+W3B_ON = {"DOOR_RECORDER_ENABLED": "true", "HOMEHUB_SCRATCH_ENABLED": "true", "MEETING_PULL_ENABLED": "true"}
+T0 = 2_000_000_000.0
+# A synthetic filesystem UUID: this repo is public, so never a real deployment value.
+SCRATCH_UUID = "00000000-0000-4000-8000-000000000001"
+
+
+def _w3b_rows(env):
+    rows, problems = watch.parse_table(TABLE, env)
+    assert problems == []
+    return {r["name"]: r for r in rows if r["name"] in ("door-segments", "scratch-mount", "meeting-pull")}
+
+
+def test_tc1460_the_w3b_rows_are_gated_by_their_knobs_and_take_drill_overrides_llr1292():
+    assert _w3b_rows({}) == {}, "nothing W3b watches on a hub without the components"
+    assert _w3b_rows({k: "false" for k in W3B_ON}) == {}
+    by = _w3b_rows(W3B_ON)
+    assert by == {
+        "door-segments": {"name": "door-segments", "kind": "newest-file",
+                          "target": "/srv/scratch/door/*/door-*.ts*", "threshold_s": 900},
+        "scratch-mount": {"name": "scratch-mount", "kind": "scratch-identity",
+                          "target": "/opt/homehub/stack/scratch/homehub_scratch.py", "threshold_s": 300},
+        "meeting-pull": {"name": "meeting-pull", "kind": "unit-success",
+                         "target": "homehub-meeting-pull.service", "threshold_s": 1800},
+    }  # fmt: skip
+    for name, knob in (("door-segments", "DOOR_RECORDER_ENABLED"), ("scratch-mount", "HOMEHUB_SCRATCH_ENABLED"),
+                       ("meeting-pull", "MEETING_PULL_ENABLED")):  # fmt: skip
+        assert set(_w3b_rows(dict(W3B_ON, **{knob: "false"}))) == set(by) - {name}, knob
+    drill = _w3b_rows(dict(W3B_ON, HOMEHUB_WATCH_DOOR_FRESH_MIN="0", HOMEHUB_WATCH_SCRATCH_MIN="0",
+                           HOMEHUB_WATCH_MEETING_PULL_MIN="0", HOMEHUB_WATCH_SCRATCH_TOOL="/nonexistent/x.py"))  # fmt: skip
+    assert {n: r["threshold_s"] for n, r in drill.items()} == {"door-segments": 0, "scratch-mount": 0,
+                                                               "meeting-pull": 0}  # fmt: skip
+    assert drill["scratch-mount"]["target"] == "/nonexistent/x.py"
+    assert "door-segments" not in _w3b_rows(dict(W3B_ON, HOMEHUB_WATCH_DISABLE="door-segments"))
+    # the default tool is the one the deploy installs, the path every scratch writer's guard runs
+    assert (ROOT / "stack" / "scratch" / "homehub_scratch.py").is_file()
+    assert "/opt/homehub/stack/scratch/homehub_scratch.py" in (
+        ROOT / "stack" / "door" / "homehub-door-recorder.service").read_text(encoding="utf-8")
+
+
+def test_tc1460_newest_file_and_scratch_targets_are_validated_llr1290_llr1291():
+    assert watch.split_glob("/srv/scratch/door/*/door-*.ts*") == ("/srv/scratch/door", ["*", "door-*.ts*"])
+    assert watch.split_glob("/srv/scratch/door/x.ts") == ("/srv/scratch/door", ["x.ts"])
+    for bad in ("srv/door/*", "/srv/../etc/*", "/srv/**/x", "/*/x", "/srv//door/*", "/srv/./door/*"):
+        assert watch.split_glob(bad) is None, bad
+    rows, problems = watch.parse_table(
+        "d newest-file relative/*.ts 15m\ne newest-file /srv/**/x 15m\ns scratch-identity tool.py 5m\n"
+        "ok newest-file /srv/scratch/door/*/door-*.ts* 0m\n", {})  # fmt: skip
+    assert [r["name"] for r in rows] == ["ok"] and rows[0]["threshold_s"] == 0 and len(problems) == 3
+    assert watch.parse_threshold("0m") == 0 and watch.parse_threshold("m") is None
+
+
+def _seg(path, mtime):
+    path = _w(path, "x")
+    os.utime(str(path), (mtime, mtime))
+    return path
+
+
+def _door_row(tmp_path, threshold=900):
+    """The SHIPPED door-segments row, its tree moved into tmp_path."""
+    row = dict(_w3b_rows(W3B_ON)["door-segments"], threshold_s=threshold)
+    row["target"] = row["target"].replace("/srv/scratch/door", (tmp_path / "door").as_posix(), 1)
+    return row
+
+
+def _judge_door(row, st, now):
+    return watch.judge_newest_file(row, st, watch.newest_match(row["target"]), now)
+
+
+def test_tc1461_door_segment_freshness_fires_on_a_stale_tree_and_counts_the_open_part_llr1290(tmp_path):
+    row, day = _door_row(tmp_path), tmp_path / "door" / "2026-10-22"
+    closed = _seg(day / "door-20261022T230000Z.ts", T0 - 1200)
+    part = _seg(day / "door-20261022T231000Z.ts.part", T0 - 30)
+    _seg(day / "notes.txt", T0)  # not a segment: never counts
+    _seg(tmp_path / "door" / "door-20261022T231000Z.ts", T0)  # not one level down: never counts
+    bad, st, what = _judge_door(row, {}, T0)
+    assert bad is False and "door-20261022T231000Z.ts.part written 30s ago (2 matching)" in what
+    part.unlink()  # the recorder stopped: the newest is the closed segment, 1200 s old
+    bad, st, what = _judge_door(row, st, T0)
+    assert bad is True and "door-20261022T230000Z.ts written 1200s ago" in what
+    os.utime(str(closed), (T0 - 899, T0 - 899))
+    assert _judge_door(row, st, T0)[0] is False, "899 s of a 900 s threshold"
+    _seg(day / "door-20261022T232000Z.ts.part", T0 - 1)
+    bad, st, _ = _judge_door(row, st, T0)
+    assert bad is False, "a new segment clears it"
+    # the drill: 0m fires on the healthy tree, the normal threshold clears it
+    assert _judge_door(_door_row(tmp_path, 0), st, T0)[0] is True
+    assert _judge_door(row, st, T0)[0] is False
+
+
+def test_tc1461_no_file_or_no_tree_fires_after_the_threshold_from_first_sight_llr1290(tmp_path):
+    row = _door_row(tmp_path)
+    bad, st, what = _judge_door(row, {}, T0)  # the root does not even exist
+    assert bad is False and st["empty_since"] == T0 and "no file matches" in what and "ENOENT" in what
+    (tmp_path / "door" / "2026-10-22").mkdir(parents=True)  # an empty tree
+    bad, st, what = _judge_door(row, st, T0 + 899)
+    assert bad is False and "seen empty for 899s" in what
+    bad, st, _ = _judge_door(row, st, T0 + 900)
+    assert bad is True
+    # wall clock, kept in the state file: a reboot does not restart the count
+    st = json.loads(json.dumps(st))
+    assert _judge_door(row, st, T0 + 2000)[0] is True
+    # a clock that went back past the stamp restarts it rather than wedging it
+    bad, st2, _ = _judge_door(row, st, T0 - 5000)
+    assert bad is False and st2["empty_since"] == T0 - 5000
+    _seg(tmp_path / "door" / "2026-10-22" / "door-20261022T000000Z.ts.part", T0 + 1990)
+    bad, st, _ = _judge_door(row, st, T0 + 2000)
+    assert bad is False and "empty_since" not in st
+
+
+def _can_symlink(tmp_path):
+    try:
+        os.symlink(str(tmp_path), str(tmp_path / "probe-link"))
+    except (OSError, NotImplementedError):
+        return False
+    os.unlink(str(tmp_path / "probe-link"))
+    return True
+
+
+def test_tc1462_a_symlink_out_of_the_tree_is_never_followed_llr1290(tmp_path):
+    if not _can_symlink(tmp_path):
+        pytest.skip("this OS account cannot create symlinks (monitoring.test.sh runs the same case on Linux)")
+    row, outside = _door_row(tmp_path), tmp_path / "elsewhere"
+    fresh = _seg(outside / "door-20261022T235900Z.ts", T0)
+    _seg(tmp_path / "door" / "2026-10-22" / "door-20261022T200000Z.ts", T0 - 3600)
+    os.symlink(str(outside), str(tmp_path / "door" / "2026-10-23"))  # a "day" that is a link out
+    os.symlink(str(fresh), str(tmp_path / "door" / "2026-10-22" / "door-20261022T235959Z.ts"))  # a file link out
+    bad, _, what = _judge_door(row, {}, T0)
+    assert bad is True and "door-20261022T200000Z.ts written 3600s ago (1 matching)" in what
+    linked_root = tmp_path / "linked"
+    os.symlink(str(outside), str(linked_root))
+    row = {"name": "x", "kind": "newest-file", "threshold_s": 900, "target": linked_root.as_posix() + "/door-*.ts"}
+    bad, _, what = _judge_door(row, {}, T0)
+    assert bad is False and "is a symlink (not followed)" in what and "no file matches" in what
+
+
+def test_tc1463_the_walk_is_bounded_in_entries_and_time_and_a_limit_fires_llr1290(tmp_path, monkeypatch):
+    row, day = _door_row(tmp_path), tmp_path / "door" / "2026-10-22"
+    for i in range(12):
+        _seg(day / ("door-20261022T23%02d00Z.ts" % i), T0 - 10)
+    assert watch.newest_match(row["target"], max_entries=13)["limit"] is None
+    found = watch.newest_match(row["target"], max_entries=12)
+    assert found["limit"] == "more than 12 entries under %s" % (tmp_path / "door").as_posix()
+    bad, _, what = watch.judge_newest_file(row, {}, found, T0)
+    assert bad is True and "not judged from part of the tree" in what, "fresh files, but the walk was cut"
+    import threading
+
+    gate = threading.Event()
+    monkeypatch.setattr(watch, "_walk_newest", lambda *a: gate.wait(30) and {})
+    t = __import__("time").monotonic()
+    found = watch.newest_match(row["target"], timeout=0.3)
+    took = __import__("time").monotonic() - t
+    gate.set()
+    assert took < 5 and "did not finish in 0.3s" in found["limit"]
+    assert watch.judge_newest_file(row, {}, found, T0)[0] is True
+
+
+def _status(**over):
+    d = {"mountpoint": "/srv/scratch", "expected_uuid": SCRATCH_UUID, "mounted": True,
+         "source": "/dev/mapper/vg-hub--scratch", "identity_ok": True, "prjquota": True}  # fmt: skip
+    d.update(over)
+    return d
+
+
+def test_tc1464_scratch_identity_reads_the_tools_own_verdict_and_fires_after_two_bad_runs_llr1291():
+    assert watch.scratch_verdict(_status(), "") == (False, "/srv/scratch mounted from /dev/mapper/vg-hub--scratch, "
+                                                         "identity and prjquota ok")  # fmt: skip
+    for status, says in ((_status(mounted=False), "is not mounted"),
+                         ({"mountpoint": "/srv/scratch", "mounted": False}, "is not mounted"),
+                         (_status(identity_ok=False), "is not the filesystem HOMEHUB_SCRATCH_UUID names"),
+                         (_status(identity_ok=False, expected_uuid=""), "expected unset"),
+                         (_status(prjquota=False), "without prjquota"),
+                         (_status(identity_ok=None), "is not the filesystem"),
+                         (None, "scratch status did not run: boom")):  # fmt: skip
+        bad, what = watch.scratch_verdict(status, "boom")
+        assert bad is True and says in what, (status, what)
+    row = {"name": "scratch-mount", "kind": "scratch-identity", "target": "/x.py", "threshold_s": 300}
+    bad, st, what = watch.judge_scratch(row, {}, True, "not mounted", "b", 100.0)
+    assert bad is False and "bad for 0s" in what, "one bad run is not five minutes"
+    bad, st, _ = watch.judge_scratch(row, st, True, "not mounted", "b", 399.7)
+    assert bad is True, "the next timer run, a fraction of a second under 300 s later, fires"
+    bad, st, _ = watch.judge_scratch(row, st, False, "ok", "b", 700.0)
+    assert bad is False and st == {}
+    _, st, _ = watch.judge_scratch(row, st, True, "x", "b", 800.0)
+    assert watch.judge_scratch(row, st, True, "x", "b", 1000.0)[0] is False, "200 s of bad is not 300"
+    assert watch.judge_scratch(row, st, True, "x", "b2", 5.0)[0] is False, "a new boot restarts the count"
+    assert watch.judge_scratch(dict(row, threshold_s=0), {}, True, "x", "b", 1.0)[0] is True, "0m: the drill"
+
+
+def _tool(tmp_path, name, body):
+    return str(_w(tmp_path / name, "import sys, time, json\n" + body))
+
+
+def test_tc1464_a_status_that_cannot_run_is_bad_never_a_crash_llr1291(tmp_path, monkeypatch):
+    env = str(_w(tmp_path / "env", ""))
+    ok = _tool(tmp_path, "ok.py", "assert sys.argv[1:] == ['--env-file', %r, 'status']\n"
+               "print(json.dumps({'mounted': True, 'identity_ok': True, 'prjquota': True}))\n" % env)  # fmt: skip
+    assert watch.scratch_status(ok, env) == ({"mounted": True, "identity_ok": True, "prjquota": True}, "")
+    cases = [
+        (_tool(tmp_path, "crash.py", "open('/proc/self/mountinfo-nope')\n"), "status exited 1: FileNotFoundError"),
+        (_tool(tmp_path, "garbage.py", "print('not json')\n"), "printed no JSON: not json"),
+        (_tool(tmp_path, "list.py", "print('[1, 2]')\n"), "printed no JSON object"),
+        (str(tmp_path / "missing.py"), "status exited 2"),
+    ]
+    for tool, says in cases:
+        status, why = watch.scratch_status(tool, env)
+        assert status is None and says in why, (tool, why)
+        assert watch.scratch_verdict(status, why)[0] is True
+    monkeypatch.setattr(watch, "SCRATCH_STATUS_SEC", 1)
+    status, why = watch.scratch_status(_tool(tmp_path, "hang.py", "time.sleep(60)\n"), env)
+    assert status is None and "timed out after 1s" in why
+    monkeypatch.setattr(watch.sys, "executable", str(tmp_path / "no-python"))
+    status, why = watch.scratch_status(ok, env)
+    assert status is None and why.startswith("cannot run")
+
+
+def test_tc1464_the_watch_reads_the_keys_homehub_scratch_status_really_writes_llr1291(tmp_path, monkeypatch):
+    """The other side of the contract: homehub_scratch.status() itself, over a
+    fake mountinfo, judged by the watch. Not a hand-written dict."""
+    spec = importlib.util.spec_from_file_location("homehub_scratch_w3b", str(ROOT / "stack" / "scratch" /
+                                                                              "homehub_scratch.py"))  # fmt: skip
+    hs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hs)
+    uuid = SCRATCH_UUID
+    paths = hs.Paths()
+    paths.mountinfo = str(tmp_path / "mountinfo")
+    monkeypatch.setattr(hs, "majmin_of_rdev", lambda p: "253:7" if p.endswith(uuid) else None)
+    monkeypatch.setattr(hs, "usable_bytes", lambda p: 18 * 1024 ** 3)
+    monkeypatch.setattr(hs, "get_project_quota", lambda dev, pid: (0, 512 * 1024 ** 2))
+    monkeypatch.setattr(hs.os, "statvfs", lambda p: __import__("types").SimpleNamespace(f_bavail=1, f_frsize=4096),
+                        raising=False)  # fmt: skip
+    settings = hs.Settings({"HOMEHUB_SCRATCH_UUID": uuid})
+
+    def judged(majmin, opts):
+        _w(paths.mountinfo, "40 29 %s / /srv/scratch rw,noatime - ext4 /dev/mapper/vg-hub--scratch %s\n" % (majmin, opts))
+        return watch.scratch_verdict(json.loads(json.dumps(hs.status(settings, paths))), "")
+
+    assert judged("253:7", "rw,prjquota")[0] is False
+    bad, what = judged("253:9", "rw,prjquota")
+    assert bad is True and "is not the filesystem HOMEHUB_SCRATCH_UUID names" in what
+    bad, what = judged("253:7", "rw")
+    assert bad is True and "without prjquota" in what
+    _w(paths.mountinfo, "29 1 253:0 / / rw - ext4 /dev/mapper/vg-root rw\n")
+    assert watch.scratch_verdict(hs.status(settings, paths), "") == (True, "/srv/scratch is not mounted")
+    assert watch.scratch_verdict(hs.status(hs.Settings({}), paths), "")[0] is True
+
+
+def test_tc1465_the_w3b_drills_fire_once_and_clear_once_through_main_llr1292(tmp_path, monkeypatch):
+    """The live drill procedure (README "Drills" d-f), run against the real main():
+    knobs from the override file only, nothing stopped, one alert and one clear."""
+    sent = []
+    monkeypatch.setattr(watch.mc, "send_alert", lambda key, prio, title, *a, **k: sent.append((key, title))
+                        or mc.ALERT_DELIVERED)  # fmt: skip
+    monkeypatch.setattr(watch, "systemctl_show", lambda unit: _show(exit_ts=int(T0) - 60))
+    monkeypatch.setattr(watch, "docker_unhealthy", lambda: [])
+    monkeypatch.setattr(watch, "docker_restart_counts", lambda: {})
+    monkeypatch.setattr(watch.time, "monotonic", lambda: 500.0)
+    monkeypatch.setattr(watch.time, "time", lambda: T0)
+    override = tmp_path / "override"
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(override))
+    door = (tmp_path / "door").as_posix()
+    rows = [line for line in TABLE.splitlines() if line.split()[:1] in (["door-segments"], ["scratch-mount"], ["meeting-pull"])]
+    assert len(rows) == 3
+    table = _w(tmp_path / "watch.table", "\n".join(rows).replace("/srv/scratch/door", door) + "\n")
+    ok_tool = _tool(tmp_path, "ok.py", "print(json.dumps({'mounted': True, 'identity_ok': True, 'prjquota': True}))\n")
+    _w(tmp_path / "env", "".join("%s=true\n" % k for k in W3B_ON) + "HOMEHUB_WATCH_SCRATCH_TOOL=%s\n" % ok_tool)
+    _w(tmp_path / "proc/sys/kernel/random/boot_id", "b1\n")
+    _seg(tmp_path / "door" / "2026-10-22" / "door-20261022T231000Z.ts.part", T0 - 20)
+    args = ["--table", str(table), "--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"),
+            "--proc-root", str(tmp_path / "proc")]  # fmt: skip
+
+    def run(override_text=None):
+        if override_text is None:
+            if override.exists():
+                override.unlink()
+        else:
+            _w(override, override_text)
+        del sent[:]
+        assert watch.main(args) == 0
+        status = json.loads((tmp_path / "st" / "watch-status.json").read_text(encoding="utf-8"))
+        return [k for k, _ in sent], [t for _, t in sent], {r["name"]: r for r in status["rows"]}
+
+    keys, _, rows = run()
+    assert keys == [] and {n: r["verdict"] for n, r in rows.items()} == {
+        "door-segments": "ok", "scratch-mount": "ok", "meeting-pull": "ok"}  # fmt: skip
+    # (d) door freshness at 0m on a healthy recorder, then restored
+    keys, titles, rows = run("HOMEHUB_WATCH_DOOR_FRESH_MIN=0\n")
+    assert keys == ["watch-door-segments"] and rows["door-segments"]["verdict"] == "FIRING"
+    assert titles[0] == "HomeHub: nothing new matching %s/*/door-*.ts* in 0m (watch door-segments)" % door
+    keys, titles, _ = run()
+    assert keys == ["watch-door-segments.clear"] and "is being written again" in titles[0]
+    # (e) the scratch status pointed at a tool that does not exist, at 0m
+    keys, titles, rows = run("HOMEHUB_WATCH_SCRATCH_TOOL=%s\nHOMEHUB_WATCH_SCRATCH_MIN=0\n" % (tmp_path / "nope.py"))
+    assert keys == ["watch-scratch-mount"] and "not mounted as expected" in titles[0]
+    assert rows["scratch-mount"]["verdict"] == "FIRING" and "scratch status did not run" in rows["scratch-mount"]["detail"]
+    keys, titles, _ = run()
+    assert keys == ["watch-scratch-mount.clear"] and "mounted as expected again" in titles[0]
+    # (f) the meeting pull at 0m: its last success (60 s ago) is older than 0
+    keys, titles, _ = run("HOMEHUB_WATCH_MEETING_PULL_MIN=0\n")
+    assert keys == ["watch-meeting-pull"] and "homehub-meeting-pull.service has not succeeded in 0m" in titles[0]
+    keys, _, rows = run()
+    assert keys == ["watch-meeting-pull.clear"] and rows["meeting-pull"]["verdict"] == "ok"
+    # a component switched off takes its row with it
+    _w(tmp_path / "env", "DOOR_RECORDER_ENABLED=false\n")
+    keys, _, rows = run()
+    assert keys == [] and rows == {}
 
 
 # ── liveness and evidence (SR-089, LLR-1159..LLR-1166) ───────────────────────

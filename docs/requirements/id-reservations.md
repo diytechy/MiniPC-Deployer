@@ -16,5 +16,6 @@ truth for what each id means.
 | 2026-10-22 | Plan W10, lane W10-timer (the frame-sync timer; W10's first range was full) | SR-112; LLR-1255..1259; TC-1420..1429 (used: SR-112, LLR-1255..1257, TC-1420..1423) |
 | 2026-10-22 | Plan W4 (scratch volume, door relay, recorder) | SN-050; SR-102..107; LLR-1215..1239; TC-1370..1399; IF-070..071 |
 | 2026-10-22 | Plan W6 (meeting recording, system half) | SR-108..111; LLR-1240..1254; TC-1400..1419 (used: SR-108..111, LLR-1240..1252, TC-1400..1415) |
+| 2026-10-22 | Plan W3b (watches: door recorder segments, scratch identity, meeting pull) | SR-119..120; LLR-1290..1299; TC-1460..1469 (used: LLR-1290..1292, TC-1460..1466; SR-088 amended, no new SR) |
 
 The plan is HomeHub `docs/IMPLEMENTATION_PLAN_2026-10-22.md`.

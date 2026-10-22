@@ -105,6 +105,11 @@ ACK_TIMEOUT_S = 2.0
 # after a minute did not happen. The button is handed back to the ruling (warn,
 # then press again) rather than left ignoring presses for the rest of the run.
 SHUTDOWN_STALL_S = 60.0
+# A press stamped inside the window can be READ a little after it ends (the
+# loop woke for the deadline in the same instant, or the reader was busy). The
+# window is judged on the press's own kernel timestamp; this grace only delays
+# the expiry so a late-read in-window press still counts (Sol review 1).
+EXPIRY_GRACE_S = 0.25
 
 IDLE = "idle"
 ARMED = "armed"
@@ -263,7 +268,7 @@ class PowerButtonMachine:
                                 "button is still guarded and a second press within %g s of the "
                                 "first still shuts the panel down" % (self.seq, self.ack_timeout_s,
                                                                     self.window_s)))
-        if self.state == ARMED and now > self.deadline:
+        if self.state == ARMED and now > self.deadline + EXPIRY_GRACE_S:
             self.state, self.deadline, self.ack_due = IDLE, None, None
             actions += [self._publish(now), ("journal", "no second press: warning %d cleared" % self.seq)]
         if self.state == SHUTTING_DOWN and now >= self.stall_at:
@@ -290,7 +295,7 @@ class PowerButtonMachine:
             return self.stall_at
         if self.state != ARMED:
             return None
-        candidates = [self.deadline + 0.001]
+        candidates = [self.deadline + EXPIRY_GRACE_S + 0.001]
         if self.ack_due is not None:
             candidates.append(self.ack_due)
         return min(candidates)
@@ -387,10 +392,14 @@ class Shell:
         self.spawn = spawn or (lambda target: threading.Thread(target=target, daemon=True).start())
 
     def _command(self, argv, timeout) -> str | None:
-        """Run one command; None on success, else a short reason."""
+        """Run one command; None on success, else a short reason.
+
+        Its output is NOT discarded: it goes to this unit's journal, so
+        wall-sleep.sh's own account of the wake (or of why it declined) sits
+        beside the press that asked for it.
+        """
         try:
-            result = self.run(list(argv), timeout=timeout, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            result = self.run(list(argv), timeout=timeout, stdin=subprocess.DEVNULL, check=False)
         except (OSError, subprocess.SubprocessError) as error:
             return type(error).__name__
         return None if result.returncode == 0 else "exit %d" % result.returncode
@@ -500,29 +509,39 @@ def run(handles: dict, machine: PowerButtonMachine, shell: Shell, *,
         clock=time.monotonic, wait=select.select, ack=read_ack, stop=lambda: False) -> int:
     """The event loop: wait for input or the next due instant, then act.
 
-    Returns 1 when every device has gone (the unit restarts it; the inhibitor
-    goes with the process, so logind holds the button meanwhile).
+    INPUT FIRST, THEN THE CLOCKS. Events that are waiting are judged on their
+    own timestamps before the window is allowed to expire, so a second press
+    made inside the window is never turned into a new warning because it was
+    read late (Sol review 1).
+
+    Returns 1 as soon as ANY device goes away, rather than carrying on with
+    the rest: on this panel only event4 has ever reported a press, so a guard
+    left reading event0 alone would hold the inhibitor over a dead button. The
+    exit drops the inhibitor (logind's one-press default holds the button) and
+    the restart rediscovers the devices. Returns 0 only when `stop()` says so.
     Implements: LLR-1183
     """
     shell.execute(machine.start(clock()), clock())
-    while handles and not stop():
+    while not stop():
         due = machine.next_due()
         timeout = None if due is None else max(0.0, due - clock())
         ready, _, _ = wait(list(handles), [], [], timeout)
-        now = clock()
-        shell.execute(machine.tick(now, ack), now)
         for fd in ready:
             path, monotonic = handles[fd]
             data = drain(fd)
             if data is None:
-                shell.log("%s went away; %d power-button device(s) left" % (path, len(handles) - 1), 4)
-                os.close(fd)
-                del handles[fd]
-                continue
+                shell.log("%s went away; exiting so the restart finds the power-button devices "
+                          "again (logind's default holds the button until then)" % path, 4)
+                for other in list(handles):
+                    os.close(other)
+                handles.clear()
+                return 1
             for etype, code, value, stamp in parse_events(data):
                 when = stamp if monotonic else clock()
                 shell.execute(machine.key_event(path, etype, code, value, when), clock())
-    return 0 if handles else 1
+        now = clock()
+        shell.execute(machine.tick(now, ack), now)
+    return 0
 
 
 def main() -> int:

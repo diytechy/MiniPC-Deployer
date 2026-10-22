@@ -99,7 +99,8 @@ def test_tc1315_one_press_then_timeout_warns_and_never_shuts_down():
     assert first[0][1] == {"state": "armed", "seq": 101, "remainingS": 5.0}
     assert poweroffs(first) == 0
     assert m.tick(14.9, lambda: 101) == []            # still inside the window
-    cleared = m.tick(15.01, lambda: 101)
+    assert m.tick(15.2, lambda: 101) == []            # the expiry grace for a late-read press
+    cleared = m.tick(15.26, lambda: 101)
     assert published(cleared) == ["idle"] and poweroffs(cleared) == 0
     assert m.state == pb.IDLE and m.next_due() is None
 
@@ -109,7 +110,7 @@ def test_tc1315_the_loop_is_woken_for_the_ack_check_and_the_window_end():
     press(m, 10.0)
     assert m.next_due() == pytest.approx(12.0)        # the acknowledgement check first
     m.tick(12.0, lambda: 101)
-    assert m.next_due() == pytest.approx(15.001)      # then just past the window
+    assert m.next_due() == pytest.approx(15.251)      # then just past the window and its grace
 
 
 # ── TC-1316: two presses inside 5 s ──────────────────────────────────────────
@@ -122,6 +123,15 @@ def test_tc1316_a_second_press_inside_5_s_requests_shutdown(gap):
     assert poweroffs(second) == 1
     assert published(second) == ["shutting-down"]
     assert m.state == pb.SHUTTING_DOWN
+
+
+def test_tc1316_a_late_read_press_is_judged_on_its_own_timestamp():
+    # Sol review 1: the window used to expire at the processing instant before
+    # waiting input was read, turning an in-window second press into a warning.
+    m = machine()
+    press(m, 10.0)
+    assert m.tick(15.1, lambda: 101) == []             # the loop woke just past the deadline
+    assert poweroffs(press(m, 14.99)) == 1             # the press it then reads was in time
 
 
 def test_tc1316_presses_after_the_shutdown_request_do_nothing():
@@ -541,20 +551,77 @@ def test_tc1325_the_loop_turns_the_measured_bytes_into_a_warning_then_a_shutdown
     assert result == 1 and handles == {}                         # every device gone: exit 1
 
 
-def test_tc1325_a_vanished_device_is_dropped_and_the_other_keeps_guarding():
-    handles, wait, clock = loop_rig({B: [None], A: [encode(MEASURED[:4])]})
+def test_tc1325_losing_any_device_exits_for_a_restart_instead_of_guarding_a_dead_button():
+    # Sol review 1: event4 is the only node that has ever reported a press, so
+    # carrying on with event0 alone would hold the inhibitor over a dead button.
+    handles, wait, clock = loop_rig({A: [None], B: [encode(MEASURED[:4])]})
     m = machine()
     shell = Recorder(m)
-    calls = {"n": 0}
+    assert pb.run(handles, m, shell, clock=clock, wait=wait, ack=no_ack) == 1
+    assert handles == {}
+    assert any("went away; exiting so the restart finds the power-button devices" in line
+               for line, _ in shell.lines)
+
+
+def test_tc1325_with_no_further_input_the_loop_itself_checks_the_ack_and_ends_the_window():
+    # The timer half of the loop: one press, then every wait times out at the
+    # instant the loop asked for. The ack check and the window's end must come
+    # from the loop's own tick, not from a later press.
+    read_fd, write_fd = os.pipe()
+    handles = {read_fd: (A, False)}
+    state = {"now": 0.0, "pressed": False, "timeouts": []}
+
+    def wait(fds, _w, _x, timeout):
+        if not state["pressed"]:
+            state["pressed"] = True
+            state["now"] = 10.0
+            os.write(write_fd, encode(MEASURED[:4]))
+            return list(fds), [], []
+        state["timeouts"].append(timeout)
+        state["now"] += timeout or 0.0
+        return [], [], []
+
+    m = machine()
+    shell = Recorder(m)
+    stops = {"n": 0}
 
     def stop():
-        calls["n"] += 1
-        return calls["n"] > 1
+        stops["n"] += 1
+        return stops["n"] > 4
 
-    assert pb.run(handles, m, shell, clock=clock, wait=wait, ack=no_ack, stop=stop) == 0
-    assert [path for path, _ in handles.values()] == [A]
-    assert any("went away; 1 power-button device(s) left" in line for line, _ in shell.lines)
-    assert m.state == pb.ARMED
+    pb.run(handles, m, shell, clock=lambda: state["now"], wait=wait, ack=no_ack, stop=stop)
+    shell.run_spawned()
+    os.close(read_fd); os.close(write_fd)
+    assert [doc["state"] for doc in shell.written] == ["idle", "armed", "idle"]
+    assert state["timeouts"][:2] == [pytest.approx(2.0), pytest.approx(3.251)]
+    assert any("ALERT power-button-kiosk-unavailable" in line for line, _ in shell.lines)
+    assert state["timeouts"][2] is None, "nothing to wait for once idle"
+
+
+def test_tc1325_input_waiting_at_the_deadline_is_read_before_the_window_expires():
+    # Kernel-stamped (monotonic) events: the second press is stamped 14.99 s but
+    # the loop only wakes at 15.5 s, past the deadline and its grace.
+    def stamped(seconds):
+        whole, frac = int(seconds), round((seconds % 1) * 1_000_000)
+        return encode([(whole, frac, 1, 116, 1), (whole, frac, 0, 0, 0), (whole, frac, 1, 116, 0)])
+
+    read_fd, write_fd = os.pipe()
+    handles = {read_fd: (A, True)}
+    script = [(10.0, stamped(10.0)), (15.5, stamped(14.99)), (16.0, None)]
+    state = {"now": 0.0}
+
+    def wait(fds, _w, _x, _timeout):
+        state["now"], chunk = script.pop(0)
+        if chunk is None:
+            os.close(write_fd)
+        else:
+            os.write(write_fd, chunk)
+        return list(fds), [], []
+
+    m = machine()
+    shell = Recorder(m)
+    assert pb.run(handles, m, shell, clock=lambda: state["now"], wait=wait, ack=lambda: 101) == 1
+    assert [doc["state"] for doc in shell.written] == ["idle", "armed", "shutting-down"]
 
 
 # ── TC-1326: the unit, the knob, logind ──────────────────────────────────────

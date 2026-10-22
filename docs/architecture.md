@@ -790,10 +790,10 @@ sequenceDiagram
     D->>S: idle (start document, LLR-1183)
     K->>L: KEY_POWER press
     L->>L: inhibited, so no power-off
-    K->>D: KEY_POWER 1 then 0 (same instant); echo on the other node within 150 ms is dropped (LLR-1182)
+    K->>D: KEY_POWER 1 then 0 (same instant); echo on the other node within 150 ms is dropped (LLR-1182);<br/>waiting input is read before the window is allowed to expire
     D->>S: armed {seq, deadline = now + 5 s} (LLR-1181, IF-067)
     par off the press path
-        D->>P: power-button-wake (thread; lock, stamp, light only if dark, LLR-1185)
+        D->>P: power-button-wake (thread; lock, stamp, 6 s hold on every backlight-off, light only if dark, LLR-1185)
     and
         E->>S: watch / poll
         E->>E: full-screen flashing warning + countdown

@@ -1244,6 +1244,31 @@ run panel-display-off
 eq "75" "$?" "A27 a display-off just after the press declines (exit 75)"
 eq "40" "$(brightness)" "A27 ...and the warning's screen stays lit"
 
+# A27e: THE HOLD (Sol review 1). The occupancy decider is a second backlight
+# writer when WALL_ABSENCE_ENABLED=true; the wake stamp does not stop it, so the
+# arm's hold must: an absent-room tick right after the press leaves the warning
+# lit and does not suspend, and once the hold has expired the same tick darkens.
+scenario a27-hold
+write_env "SLEEP_MODE=suspend" "WALL_ABSENCE_ENABLED=true" "SLEEP_END=00:01" "SLEEP_START=23:59" \
+          "WALL_ABSENCE_TIMEOUT_MIN=60"
+presence absent
+absent_for 600
+run power-button-wake
+eq "100" "$(brightness)" "A27 the press leaves the lit warning lit"
+run occupancy
+eq "100" "$(brightness)" "A27 an absent-room occupancy tick inside the hold cannot blank the warning"
+eq "no" "$(suspended)" "A27 ...and nothing suspends under the warning"
+grep -q 'backlight off DECLINED: the power-button warning is on screen' "$ROOT/out.log" \
+    && pass "A27 the declined off says why" \
+    || fail "A27 the declined off is not attributed to the warning"
+printf '%s' "$(( $(awk '{print int($1)}' /proc/uptime) - 1 ))" > "$ROOT/run/wall-occupancy/power-button-hold"
+run occupancy
+eq "0" "$(brightness)" "A27 once the hold has expired the same tick darkens the panel"
+printf '%s' "999999999" > "$ROOT/run/wall-occupancy/power-button-hold"
+printf '100' > "$ROOT/sys/class/backlight/intel_backlight/brightness"
+run occupancy
+eq "0" "$(brightness)" "A27 a hold stamp from before a reboot (far future) is no hold"
+
 # A27c: the lock. A power decision in flight makes the arm decline (75) rather
 # than queue; the daemon journals that and the second press still counts.
 if command -v flock >/dev/null 2>&1; then

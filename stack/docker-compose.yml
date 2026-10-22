@@ -458,6 +458,23 @@ services:
       # .env.example. Set by the A19 gate so the single combined file-share /
       # backup lane exists before the panel ever asks for it.
       TRACKER_SEED_DIR: ${TRACKER_SEED_DIR}
+      # ── Bearer token on every /api/* POST (NagLight SR-030; SR-097) ─────────
+      # Without it the tracker logs `auth=false` and the trusted header is the
+      # ONLY check: anything on stack_default that knows the (public, stable)
+      # Google sub could post as that user. The value is the hub's ONE minted
+      # feed token, the same value every poster already sends (FINANCE_ /
+      # SLEEP_ / AI_USAGE_ / WEIGHT_FEED_TOKEN in this file, NAGLIGHT_TOKEN in
+      # backup.env, WALL_SHELL_FEED_TOKEN on the panel), so setting it turns an
+      # ignored header into a checked one without minting anything new.
+      #
+      # BLANK = OFF (the tracker's dev mode), which is what a bare template
+      # ships; HomeHub's materialiser fills it from the store. A POST without
+      # the bearer is then 401, before any handler runs. NOTE the one caller
+      # that cannot carry it: NagLight's own browser drill view (its app.js
+      # posts check-offs with no Authorization header), so with this set a
+      # check-off made in a browser on the tracker site is refused 401. The
+      # panel is unaffected: it sends the bearer itself.
+      TRACKER_API_TOKEN: ${TRACKER_API_TOKEN:-}
       # ── One-way traceability mirror (NagLight SN-024, the Owner 2026-08-09) ──
       # Commits ONE identity's data dir hourly and pushes it to a private repo,
       # so there is a record of how items changed. It is one-way BY
@@ -617,22 +634,39 @@ services:
       ACTUAL_URL: http://actual:5006
       ACTUAL_SYNC_ID: ${FINANCE_ACTUAL_SYNC_ID}
       ACTUAL_PASSWORD: ${FINANCE_ACTUAL_PASSWORD}
-      # Preparation only: keep Actual until the later Owner cutover.
+      # The template default stays actual; the hub's own config selects sure
+      # (the Owner's cutover ruling, 2026-10-22). Actual stays installed.
       DATA_SOURCE: ${FINANCE_DATA_SOURCE:-actual}
       SURE_URL: ${FINANCE_SURE_URL:-http://sure-web:3000}
       SURE_API_KEY: ${FINANCE_SURE_API_KEY:-}
-      # Header work is dispatched in Finance-Auditor docs/status.md,
-      # "Dispatched from HomeHub" / "Hub side, when this lands"; not merged yet.
-      # The non-secret Google sub is separate from the shared feed token.
+      # X-Forwarded-User for the feed post (the tracker runs multi-user, so a
+      # post without it is 403). The non-secret Google sub, kept separate
+      # from the shared feed token; blank = FA omits the header.
       TRACKER_FEED_USER: ${FINANCE_TRACKER_FEED_USER:-}
       TRACKER_FEED_URL: http://tracker:8787/api/feed
       TRACKER_FEED_TOKEN: ${FINANCE_TRACKER_FEED_TOKEN}
+      # ── The accrual gauge's inputs (FA SR-035/SR-051; SR-098) ──────────────
+      # The container path of the read-only periods directory mounted below.
+      # FA's own default is the same /config; it is stated so the mount and
+      # the path it is read from are visible in one place.
+      PERIODS_CONFIG_DIR: /config
+      # Expected weekly net in integer cents: the white line of the gauge.
+      # 10000 is the Owner's starting $100/week (FA design note 2026-10-10).
+      EXPECTED_WEEKLY_NET_CENTS: ${FINANCE_EXPECTED_WEEKLY_NET_CENTS:-10000}
     networks:
       - default
       - sure
     volumes:
       - finance_snapshots:/snapshots          # LAN-only audit artifacts (FA SR-005/006)
       - finance_actual_data:/data/actual      # @actual-app/api cache — persist across restarts
+      # The serving-periods DIRECTORY (holds serving-periods.json), read-only.
+      # A DIRECTORY, never the file: replacing a bind-mounted file swaps its
+      # inode and detaches the mount, so the container would keep reading the
+      # old copy (FA SR-051). The file names the household's own categories and
+      # merchants, so it is never in this repo: it comes from the Owner's
+      # private repo and is placed on the box by hand. Absent file = FA posts
+      # no finance gauge (it says so in its log), never a made-up table.
+      - ${FINANCE_PERIODS_CONFIG_DIR:-/etc/homehub-finance}:/config:ro
     depends_on:
       actual:
         condition: service_healthy

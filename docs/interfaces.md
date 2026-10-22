@@ -51,6 +51,8 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-036** | Consumes | NagLight | Implemented | v1 | — | v1 tracker-definitions guard producer (stack/tracker/tracker-defs-guard.sh; the timer runs --report). … |
 | **IF-037** | Consumes | NagLight | Draft | v1 | — | v1 Finance-Auditor colour lane. Producer is the finance-auditor service in stack/docker-compose.yml, whose … |
 | **IF-038** | Provides | HomeHub | Draft | v1 | SR-076, SR-077, SR-078 | v1 AI CLI provisioning contract (stack/ai-cli). (1) Manifest stack/ai-cli/ai-clis.manifest.tsv … |
+| **IF-068** | Provides | Finance-Auditor | Draft | v1 | SR-098 | v1 accrual-gauge inputs (counterpart FA SR-035/SR-051): a host directory mounted read-only at /config holding … |
+| **IF-069** | Consumes | NagLight | Draft | v1 | SR-097 | v1 tracker bearer contract (NagLight SR-030/LLR-020, internal/web/auth.go): with TRACKER_API_TOKEN set every … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

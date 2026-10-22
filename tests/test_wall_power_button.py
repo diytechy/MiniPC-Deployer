@@ -5,7 +5,7 @@ down, otherwise nothing happens.
 Layers, each against the real artefact:
 
 * TC-1315..TC-1322 -- the pure state machine in wall-power-button.py, driven
-  with explicit monotonic instants, for every case the plan's Done-when names:
+  with explicit boot-clock instants, for every case the plan's Done-when names:
   one press then timeout, two presses inside 5 s, two presses 6 s apart, one
   press reported on two devices, two quick presses on one device, autorepeat,
   a press at service start, and the kiosk unavailable.
@@ -599,7 +599,7 @@ def test_tc1325_with_no_further_input_the_loop_itself_checks_the_ack_and_ends_th
 
 
 def test_tc1325_input_waiting_at_the_deadline_is_read_before_the_window_expires():
-    # Kernel-stamped (monotonic) events: the second press is stamped 14.99 s but
+    # Kernel-stamped (boot-clock) events: the second press is stamped 14.99 s but
     # the loop only wakes at 15.5 s, past the deadline and its grace.
     def stamped(seconds):
         whole, frac = int(seconds), round((seconds % 1) * 1_000_000)
@@ -622,6 +622,71 @@ def test_tc1325_input_waiting_at_the_deadline_is_read_before_the_window_expires(
     shell = Recorder(m)
     assert pb.run(handles, m, shell, clock=lambda: state["now"], wait=wait, ack=lambda: 101) == 1
     assert [doc["state"] for doc in shell.written] == ["idle", "armed", "shutting-down"]
+
+
+def test_tc1317_a_suspend_inside_the_window_ends_it_and_the_next_press_only_warns(monkeypatch):
+    # Sol review 2 (F1): the scheduled suspend can catch a warning. Across it the
+    # boot clock gains the hours slept while the monotonic clock gains almost
+    # nothing. The loop runs on its DEFAULT clock, with a device that refused
+    # the kernel clock (stamped at read time), so the clock the daemon itself
+    # reads decides: on CLOCK_MONOTONIC this press would shut the panel down.
+    clocks = {"boot": 10.0, "mono": 10.0}
+
+    def clock_gettime(clock_id):
+        assert clock_id == 7, "the loop must read CLOCK_BOOTTIME"
+        return clocks["boot"]
+
+    monkeypatch.setattr(pb, "_BOOTTIME_CLOCK_ID", 7)
+    monkeypatch.setattr(pb.time, "clock_gettime", clock_gettime, raising=False)
+    monkeypatch.setattr(pb.time, "monotonic", lambda: clocks["mono"])
+    read_fd, write_fd = os.pipe()
+    handles = {read_fd: (A, False)}
+    steps = ["press", "suspend-then-press", "gone"]
+
+    def wait(fds, _w, _x, _timeout):
+        step = steps.pop(0)
+        if step == "gone":
+            os.close(write_fd)
+        else:
+            if step == "suspend-then-press":           # 21:59:59 to 06:45, then a press
+                clocks["boot"] += 8 * 3600 + 46 * 60
+                clocks["mono"] += 1.0
+            os.write(write_fd, encode(MEASURED[:4]))
+        return list(fds), [], []
+
+    m = machine()
+    shell = Recorder(m)
+    assert pb.run(handles, m, shell, wait=wait, ack=lambda: m.seq) == 1
+    assert [doc["state"] for doc in shell.written] == ["idle", "armed", "idle", "armed"]
+    assert pb.POWEROFF_COMMAND not in [argv for argv, _ in shell.commands]
+    assert m.seq == 102, "the press after the suspend is a NEW warning"
+
+
+def test_tc1325_each_device_is_asked_for_boot_clock_timestamps(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeFcntl:
+        @staticmethod
+        def ioctl(fd, request, argument):
+            calls.append((request, argument))
+
+    node = tmp_path / "event4"
+    node.write_bytes(b"")
+    monkeypatch.setattr(pb, "fcntl", FakeFcntl)
+    handles = pb.open_devices([str(node)])
+    try:
+        assert list(handles.values()) == [(str(node), True)]
+        assert calls == [(pb.EVIOCSCLOCKID, struct.pack("i", 7))], "EVIOCSCLOCKID with CLOCK_BOOTTIME"
+        assert pb.CLOCK_BOOTTIME == 7
+    finally:
+        for fd in handles:
+            os.close(fd)
+
+
+def test_tc1325_the_default_clock_is_the_boot_clock():
+    assert pb.run.__kwdefaults__["clock"] is pb.boot_clock
+    if hasattr(pb.time, "CLOCK_BOOTTIME"):
+        assert pb.boot_clock() == pytest.approx(pb.time.clock_gettime(pb.time.CLOCK_BOOTTIME), abs=1.0)
 
 
 # ── TC-1326: the unit, the knob, logind ──────────────────────────────────────

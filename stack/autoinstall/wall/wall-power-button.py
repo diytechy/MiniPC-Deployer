@@ -45,6 +45,15 @@ HOOK IS THE MARKED INTEGRATION POINT for the shared alert helper being built
 under HomeHub plan W3a; until it is installed the panel has no alert route to
 the hub (the same position as SR-083's low-disk alarm), and each alert says so.
 
+ONE CLOCK, AND IT COUNTS SUSPENDED TIME (Sol review 2). Every instant here is
+CLOCK_BOOTTIME: the kernel stamps each device's events on it (EVIOCSCLOCKID)
+and the loop reads it for "now". CLOCK_MONOTONIC stops while the panel is
+suspended, so on it a warning armed just before the scheduled 22:00 suspend
+(wall-sleep.sh suspends directly, past the backlight hold) would wake the next
+morning with seconds still left on its window, and a press soon after resume
+would shut the panel down on what is, to the person pressing, one press. On
+the boot clock those hours have passed, and the press is a new warning.
+
 NO NEW DEPENDENCIES: struct input_event is parsed here (the wheelhouse is
 offline and hash-locked), as panel-volume-keys.py does.
 
@@ -87,10 +96,13 @@ KEY_POWER = 116
 KEY_PRESS = 1
 # value 2 is autorepeat and value 0 is the release; neither is a press.
 DEVICE_NAME = "Power Button"
-# _IOW('E', 0xa0, int): timestamp this fd's events on CLOCK_MONOTONIC, so they
-# compare with time.monotonic() (the same constant panel-volume-keys.py uses).
+# _IOW('E', 0xa0, int): timestamp this fd's events on CLOCK_BOOTTIME, so they
+# compare with boot_clock() (the ioctl panel-volume-keys.py uses, with a clock
+# that keeps counting through a suspend; evdev accepts it since Linux 4.x).
 EVIOCSCLOCKID = 0x400445A0
-CLOCK_MONOTONIC = 1
+CLOCK_BOOTTIME = 7
+# Python's name for the same clock; absent off Linux (the dev box's tests).
+_BOOTTIME_CLOCK_ID = getattr(time, "CLOCK_BOOTTIME", None)
 
 # ── the ruling's numbers (LLR-1181) ──────────────────────────────────────────
 # The 5 s window is the Owner's. The de-duplication window is sized to "one
@@ -137,6 +149,18 @@ POWEROFF_TIMEOUT_S = 30
 ALERT_TIMEOUT_S = 10
 
 
+def boot_clock() -> float:
+    """Seconds on CLOCK_BOOTTIME: monotonic, and it counts time suspended.
+
+    The monotonic fallback exists only for a platform without the boot clock
+    (the dev box that imports this module for its tests); Linux always has it.
+    Implements: LLR-1181
+    """
+    if _BOOTTIME_CLOCK_ID is not None:
+        return time.clock_gettime(_BOOTTIME_CLOCK_ID)
+    return time.monotonic()
+
+
 def parse_events(data: bytes) -> list[tuple[int, int, int, float]]:
     """Decode whole input_event records.
 
@@ -165,7 +189,8 @@ class PowerButtonMachine:
     """The press-twice state machine. Pure: no I/O, no clock of its own.
 
     Contract:
-      Inputs:  every call takes `now`, monotonic seconds; `device` is any
+      Inputs:  every call takes `now`, boot-clock seconds (CLOCK_BOOTTIME,
+               which counts suspended time); `device` is any
                hashable identity of the node a press came from.
       Outputs: a list of actions, each a tuple:
                  ("publish", {"state", "seq", "remainingS"})   IF-067 document
@@ -290,7 +315,7 @@ class PowerButtonMachine:
                                      "poweroff failed (%s); the panel is still running" % detail)]
 
     def next_due(self):
-        """The earliest monotonic instant a tick has work to do, or None."""
+        """The earliest boot-clock instant a tick has work to do, or None."""
         if self.state == SHUTTING_DOWN:
             return self.stall_at
         if self.state != ARMED:
@@ -306,7 +331,7 @@ def state_document(fields: dict, wall_ms: int) -> dict:
 
     `deadline` is wall-clock epoch milliseconds because the reader is another
     process on the same machine; it is only ever displayed, never used to
-    decide (the decision is this daemon's, on the monotonic clock).
+    decide (the decision is this daemon's, on the boot clock).
     Implements: LLR-1184
     """
     remaining = fields.get("remainingS")
@@ -465,25 +490,32 @@ def find_devices(sys_root: Path = Path("/sys/class/input")) -> list[str]:
     return found
 
 
-def _monotonic_timestamps(fd: int) -> bool:
+def _boottime_timestamps(fd: int) -> bool:
+    """Ask evdev to stamp this fd's events on CLOCK_BOOTTIME; True if it did."""
     if fcntl is None:
         return False
     try:
-        fcntl.ioctl(fd, EVIOCSCLOCKID, struct.pack("i", CLOCK_MONOTONIC))
+        fcntl.ioctl(fd, EVIOCSCLOCKID, struct.pack("i", CLOCK_BOOTTIME))
         return True
     except OSError:
         return False
 
 
 def open_devices(paths: list[str]) -> dict:
-    """{fd: (path, kernel_clock_is_monotonic)} for every node that opened."""
+    """{fd: (path, kernel_stamps_on_boot_clock)} for every node that opened.
+
+    A node that refuses the clock is still read, stamped at read time on the
+    same boot clock (run's `clock`). A node that does not open is left out;
+    main() refuses to guard with fewer nodes than it found.
+    Implements: LLR-1180
+    """
     handles = {}
     for path in paths:
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         except OSError:
             continue
-        handles[fd] = (path, _monotonic_timestamps(fd))
+        handles[fd] = (path, _boottime_timestamps(fd))
     return handles
 
 
@@ -506,8 +538,12 @@ def drain(fd: int) -> bytes | None:
 
 
 def run(handles: dict, machine: PowerButtonMachine, shell: Shell, *,
-        clock=time.monotonic, wait=select.select, ack=read_ack, stop=lambda: False) -> int:
+        clock=boot_clock, wait=select.select, ack=read_ack, stop=lambda: False) -> int:
     """The event loop: wait for input or the next due instant, then act.
+
+    Every instant is the boot clock's: kernel stamps where the device took
+    the clock, `clock()` at read time where it did not. A suspend therefore
+    ages an armed warning by the hours the panel slept.
 
     INPUT FIRST, THEN THE CLOCKS. Events that are waiting are judged on their
     own timestamps before the window is allowed to expire, so a second press
@@ -527,7 +563,7 @@ def run(handles: dict, machine: PowerButtonMachine, shell: Shell, *,
         timeout = None if due is None else max(0.0, due - clock())
         ready, _, _ = wait(list(handles), [], [], timeout)
         for fd in ready:
-            path, monotonic = handles[fd]
+            path, kernel_stamped = handles[fd]
             data = drain(fd)
             if data is None:
                 shell.log("%s went away; exiting so the restart finds the power-button devices "
@@ -537,7 +573,7 @@ def run(handles: dict, machine: PowerButtonMachine, shell: Shell, *,
                 handles.clear()
                 return 1
             for etype, code, value, stamp in parse_events(data):
-                when = stamp if monotonic else clock()
+                when = stamp if kernel_stamped else clock()
                 shell.execute(machine.key_event(path, etype, code, value, when), clock())
         now = clock()
         shell.execute(machine.tick(now, ack), now)

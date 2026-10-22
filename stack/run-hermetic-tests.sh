@@ -49,6 +49,9 @@ SUITES=(
     # firstboot step 2b: the admin sign-in file, including the `$$` that
     # Materialize writes and the containers never see.
     "autoinstall/tests/admin-htpasswd.test.sh"
+    # SN-048 hub monitoring: real sysfs links for the NVMe test, a real ENOSPC
+    # from /dev/full, a hung curl, a blocked docker and a flooding journal.
+    "monitoring/tests/monitoring.test.sh"
 )
 
 if [ "${1:-}" = "--list" ]; then

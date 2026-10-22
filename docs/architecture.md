@@ -174,6 +174,7 @@ graph LR
 | `stack/remote-ui/` | OPT-IN light RDP layer for GUI-only vendor apps (SR-015). **Nothing installs or calls it since 2026-08-27** — its only tenant moved to `stack/icedrive/` |
 | `stack/icedrive/` | the headless IceDrive CLI: pinned binary, one-time non-interactive sign-in, FUSE mount unit |
 | `stack/tracker/` | deprecated reference copies (NagLight owns the build) |
+| `stack/monitoring/` | SN-048: the hub's record-and-alert monitors (telemetry, low-disk alarm, watched jobs, liveness with evidence) and the one alert helper (SR-085..SR-091) |
 | `sim/` | V1 homehub-sim — the full stack vs fictional stand-ins (Dex, Samba, mock shims) |
 | `vmtest/` | V3 — the real autoinstall ISO booted in Hyper-V (SIM secrets only) |
 | `scripts/validate_config.py` | config-coverage validation (the product-layer check here) |
@@ -803,4 +804,40 @@ sequenceDiagram
         M->>M: stop petting
         K->>K: board reset within 60 s (L4); next boot counts it
     end
+```
+
+### A liveness incident on the hub: one bundle, then one alert (SR-089, SR-085, LLR-1160, LLR-1161, LLR-1163, LLR-1148)
+
+The probe and the bundle never act: nothing here restarts, stops or kills. The
+bundle is written BEFORE the alert, so the evidence exists even if ntfy is the
+thing that is down, and an alert ntfy did not take is retried by the next run.
+
+```mermaid
+sequenceDiagram
+    %% Renders SR-089, SR-085, LLR-1159, LLR-1160, LLR-1161, LLR-1163, LLR-1148, LLR-1147
+    participant T as homehub-liveness.timer (60 s)
+    participant L as homehub-liveness.py
+    participant X as Technitium / Caddy / docker
+    participant E as homehub_evidence.capture
+    participant H as homehub-alert.sh
+    participant N as ntfy
+    loop every 60 s
+        T->>L: start (oneshot, bounded)
+        L->>X: DNS (3 s), HTTPS HEAD (5 s), docker ps (15 s)
+        X-->>L: answers or timeouts
+        L->>L: advance(): failures += 1 or reset
+    end
+    Note over L: third consecutive failed run: event "open"
+    L->>E: capture(seq, plan, checks)
+    E->>E: per-command timeout + process-group kill, 90 s deadline,<br/>file and bundle byte caps, redact every line
+    E-->>L: manifest (complete or the items that failed)
+    L->>H: fire "liveness" (urgent, failing checks, bundle path)
+    H->>N: POST /homehub-alerts (bounded)
+    alt delivered
+        H-->>L: 0 (stamp written)
+    else ntfy down
+        H-->>L: 4 (journal ALERT NOT DELIVERED; next run retries)
+    end
+    Note over L: first fully passing run: event "close"
+    L->>H: clear "liveness.clear" (default)
 ```

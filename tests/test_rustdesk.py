@@ -596,8 +596,12 @@ def test_check_files_are_lf_and_the_units_are_wired_sr045():
 def test_check_script_bounds_its_calls_and_checks_the_fence_sr045():
     live = _live(CHECK.read_text(encoding="utf-8"))
     assert "set -u" in live
-    for call in ("ss -H -ltnu", "systemctl is-active", "docker compose", "curl "):
+    for call in ("ss -H -ltnu", "systemctl is-active", "docker compose", 'bash "$ALERT_HELPER"'):
         assert re.search(r"timeout[^\n]*" + re.escape(call), live), "%s is not bounded" % call
+    # The ntfy post moved into the shared helper (SR-085) with the rate limit; the
+    # curl it makes must still be bounded there.
+    helper = _live((ROOT / "stack" / "monitoring" / "homehub-alert.sh").read_text(encoding="utf-8"))
+    assert re.search(r"timeout[^\n]*curl ", helper), "the helper's curl is not bounded"
     assert "homehub-rustdesk-isolation.service" in live
     assert "iptables" in live and "ip6tables" in live and "flock" in live
 

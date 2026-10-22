@@ -1,0 +1,12 @@
+# Fifteen minutes, like the panel's (SR-083): a disk fills over hours, and one
+# statfs per filesystem is cheap enough to run for ever.
+[Unit]
+Description=HomeHub low-disk alarm, every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

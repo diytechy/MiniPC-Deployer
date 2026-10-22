@@ -51,6 +51,8 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-036** | Consumes | NagLight | Implemented | v1 | — | v1 tracker-definitions guard producer (stack/tracker/tracker-defs-guard.sh; the timer runs --report). … |
 | **IF-037** | Consumes | NagLight | Draft | v1 | — | v1 Finance-Auditor colour lane. Producer is the finance-auditor service in stack/docker-compose.yml, whose … |
 | **IF-038** | Provides | HomeHub | Draft | v1 | SR-076, SR-077, SR-078 | v1 AI CLI provisioning contract (stack/ai-cli). (1) Manifest stack/ai-cli/ai-clis.manifest.tsv … |
+| **IF-065** | Provides | HomeHub | Implemented | v1 | SR-086, SR-087, SR-088, SR-089, SR-091 | v1 hub monitoring artefacts (stack/monitoring, SN-048). Status files under /var/lib/homehub-monitor (root … |
+| **IF-066** | Consumes | ntfy (stack compose service) | Implemented | v1 | SR-085 | v1 host-side alert post. POST http://&lt;NTFY_BIND_IP or LAN_IP>:&lt;NTFY_PORT>/&lt;HOMEHUB_ALERT_TOPIC, default … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

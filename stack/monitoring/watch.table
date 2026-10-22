@@ -1,0 +1,30 @@
+# watch.table - the jobs homehub-watch.py keeps an eye on (SN-048, SR-088).
+#
+# ONE ROW PER WATCH, whitespace-separated:
+#   name  kind  target  threshold  [when]
+#
+# kind:
+#   process        a process whose comm is TARGET (first 15 characters, as the
+#                  kernel keeps it) has been absent for THRESHOLD.
+#   unit-success   the systemd unit TARGET has not finished successfully for
+#                  THRESHOLD (systemd's own record, kept across reboots in the
+#                  watch's state file).
+#   docker-health  any container docker reports `unhealthy` for THRESHOLD
+#                  (TARGET is `*`; one alert per container).
+# threshold: Nm (minutes) or Nh (hours).
+# when: comma-separated conditions on stack .env knobs, ALL of which must hold:
+#   KEY=VALUE, KEY!=VALUE, or KEY (set and not empty). Omitted or `-` = always.
+# ${KEY:-default} in target or threshold is replaced from the stack .env.
+#
+# A row is switched off without editing this file by naming it in
+# HOMEHUB_WATCH_DISABLE (space-separated). Rows here are data, not code: adding
+# a watch is a line in this file.
+#
+# name             kind           target                                      threshold                                   when
+icedrive-client    process        Icedrive.AppImage                           15m                                         ICEDRIVE_MODE=appimage,REMOTE_UI_ENABLED=true
+library-backup     unit-success   homehub-library-backup.service              26h                                         -
+icedrive-profile   unit-success   homehub-icedrive-profile.service            26h                                         ICEDRIVE_MODE,ICEDRIVE_MODE!=off
+containers         docker-health  *                                           10m                                         -
+# The drill target. Off unless HOMEHUB_WATCH_SYNTHETIC_PROCESS names a process;
+# used only to prove the alert path end to end (stack/monitoring/README.md).
+synthetic          process        ${HOMEHUB_WATCH_SYNTHETIC_PROCESS:-}        ${HOMEHUB_WATCH_SYNTHETIC_ABSENT_MIN:-10}m  HOMEHUB_WATCH_SYNTHETIC_PROCESS

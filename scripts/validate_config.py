@@ -509,8 +509,10 @@ def main():
     # knob - the install line is unconditional, so the check holds. `*.slice`
     # joined with it: homehub-filebackup.slice is a unit like any other, and a
     # slice nothing installs would leave the backup's peak unmeasured silently.
+    # stack/monitoring joined 2026-10-22 (SN-048, SR-085..SR-089): eight units,
+    # all installed by firstboot step 6h; each timer is only ENABLED by its knob.
     for unit_dir in (stack / "backup" / "systemd", stack / "samba", stack / "autoinstall",
-                     stack / "recovery"):
+                     stack / "recovery", stack / "monitoring"):
         if not unit_dir.is_dir():
             continue
         for unit in (sorted(unit_dir.glob("*.service")) + sorted(unit_dir.glob("*.timer"))

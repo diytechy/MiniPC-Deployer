@@ -1,0 +1,12 @@
+# Five minutes: the shortest threshold in the table is 10 minutes, so a watch
+# fires at most one period late.
+[Unit]
+Description=HomeHub watched jobs, every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

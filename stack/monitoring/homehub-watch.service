@@ -1,0 +1,28 @@
+# homehub-watch - the jobs that must stay up (SN-048, SR-088): each row of
+# watch.table judged every 5 minutes, one alert when a watch fires and one when
+# it clears. Reads /proc, systemd and docker; starts and stops nothing.
+[Unit]
+Description=HomeHub watched jobs (stack/monitoring/watch.table)
+Documentation=file:///opt/homehub/stack/monitoring/README.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/homehub/stack/monitoring/homehub-watch.py
+SyslogIdentifier=homehub-watch
+StateDirectory=homehub-monitor
+StateDirectoryMode=0700
+UMask=0077
+# Bounded like the panel's recorder: a monitor must never be the reason the hub
+# is slow, and a run stuck behind a stalled read cannot pile up behind its timer.
+TimeoutStartSec=120
+Nice=10
+CPUAccounting=true
+CPUQuota=20%
+MemoryAccounting=true
+MemoryMax=64M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

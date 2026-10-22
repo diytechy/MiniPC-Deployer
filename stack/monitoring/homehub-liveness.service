@@ -1,0 +1,30 @@
+# homehub-liveness - DNS from Technitium, HTTPS from Caddy, docker ps (SN-048,
+# SR-089). After HOMEHUB_LIVENESS_FAILURES failed runs it writes ONE evidence
+# bundle to /var/lib/homehub-evidence and alerts. It never acts: it is not on the
+# recovery path, and homehub-recoveryd stays opt-in and off.
+[Unit]
+Description=HomeHub liveness probe (DNS, HTTPS, docker) with an evidence bundle per incident
+Documentation=file:///opt/homehub/stack/monitoring/README.md
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/homehub/stack/monitoring/homehub-liveness.py
+SyslogIdentifier=homehub-liveness
+StateDirectory=homehub-monitor homehub-evidence
+StateDirectoryMode=0700
+UMask=0077
+# Bounded like the panel's recorder: a monitor must never be the reason the hub
+# is slow, and a run stuck behind a stalled read cannot pile up behind its timer.
+TimeoutStartSec=180
+# Not niced: the probe must still run when the box is busy, which is when it matters.
+Nice=0
+CPUAccounting=true
+CPUQuota=50%
+MemoryAccounting=true
+MemoryMax=256M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only

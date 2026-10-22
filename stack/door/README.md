@@ -156,11 +156,15 @@ sudo python3 /opt/homehub/stack/door/door_relay.py probe --seconds 10
 #   timeout, Ctrl-C, SIGTERM (an operator's `timeout`) or SIGHUP (a dropped ssh session), so a
 #   rerun is never refused with a name conflict and no consumer is left holding a session. A
 #   signal that lands while a removal (or the gate's cleanup) is already under way waits for it
-#   to finish, then stops the verb. A signalled verb exits 128+N (143, 129) and logs ONE of:
+#   to finish, then stops the verb. The `docker rm -f` runs in its own session, so a signal sent
+#   to the whole process group - Ctrl-C at the terminal, or GNU `timeout` (which signals its
+#   child's group too) - cannot kill the removal itself. A signalled verb exits 128+N (143
+#   SIGTERM, 129 SIGHUP, 130 Ctrl-C) and logs ONE of:
 #     door: <verb> stopped by signal N; its consumers were removed (<names>)
 #     door: <verb> stopped by signal N; removal NOT confirmed for <names> - check `docker ps -a ...`
 #     door: <verb> stopped by signal N; it had started no consumer
-#   The second means `docker rm -f` timed out, failed or never ran for those names: run
+#   A removal counts only when docker exited 0, or 1 saying nothing but "No such container".
+#   The second line means `docker rm -f` timed out, was killed, failed or never ran for those names: run
 #   `sudo docker ps -a --filter name=homehub-door-` and `sudo docker rm -f` what is listed.
 sudo python3 /opt/homehub/stack/door/door_relay.py gate --seconds 15
 #   readiness+geometry {"pass": true}; two-consumers {upstream_connections: 1, producers: 1, consumers >= 2};

@@ -35,13 +35,21 @@
 #                     the broker live on HOST:PORT? Starts the broker if it is
 #                     inactive, asks it for a raw view on its socket as root, and
 #                     waits for `state: live`; reports the panel's established
-#                     TCP peers on port 554 and on PORT (addresses only).
+#                     TCP peers on port 554 and on PORT (addresses only). Exit 0
+#                     ONLY when the broker said live AND HOST:PORT is a peer
+#                     while it is live (a peer seen before the view was asked
+#                     for proves nothing about the view).
 #   compat HOST PORT PATH [SECONDS]
 #                     the compatibility-gate replay: the INSTALLED broker's own
 #                     ffconcat input and ffmpeg arguments (doorstream.service),
 #                     pointed at HOST:PORT PATH with the broker's username and
 #                     password, run for SECONDS; reports JPEG frames and the
 #                     decoder's diagnostic counts. Needs the broker suppressed.
+#                     SECONDS always holds (select() with the deadline, never a
+#                     blocking read) and the decoder is always killed on the way
+#                     out. Exit 0 only when frames arrived and the stream did
+#                     not stall (a frame within the last 5 s, or a third of the
+#                     window if shorter) or end early.
 set -euo pipefail
 
 # DOOR_CUTOVER_TEST_ROOT (tests only) prefixes the three file paths, so the
@@ -205,9 +213,12 @@ except socket.timeout:
 result["peers_while_live"] = peers()
 s.close()
 result["peers_before"] = before
-result["on_target"] = ("%s:%d" % (host, port)) in result["peers_while_live"] + before
+# Only a peer seen WHILE the broker reports live counts: one already there
+# before the view was asked for (or a connection with a dead decoder behind
+# it) proves nothing about the view.
+result["on_target"] = ("%s:%d" % (host, port)) in result["peers_while_live"]
 print(json.dumps(result, sort_keys=True))
-raise SystemExit(0 if result["on_target"] else 1)
+raise SystemExit(0 if result["live"] and result["on_target"] else 1)
 PY
     ;;
 compat)
@@ -215,39 +226,70 @@ compat)
     [ -n "$path" ] || die "compat HOST PORT PATH [SECONDS]"
     systemctl is-active --quiet "$UNIT" && die "suppress the broker first (the camera takes one connection)"
     HOST="$host" PORT="$port" RPATH="$path" SECS="$secs" CRED="$CRED" APP="$APP" python3 - <<'PY'
-import json, os, subprocess, sys, time
+import json, os, select, signal, subprocess, sys, time
 sys.path.insert(0, os.environ["APP"])
 from doorstream.service import (load_credentials, ffconcat_input, ffmpeg_args, JpegFramer,
                                 DecoderDiagnostics)
 import dataclasses
+secs = float(os.environ["SECS"])
+stall_window = min(5.0, secs / 3.0)
 cfg = dataclasses.replace(load_credentials(os.environ["CRED"]), host=os.environ["HOST"],
                           port=int(os.environ["PORT"]), path=os.environ["RPATH"])
+# A SIGTERM (the operator's timeout, a closed session) must still reach the
+# finally below, which is what kills the decoder.
+def on_term(_sig, _frame):
+    raise SystemExit(143)
+signal.signal(signal.SIGTERM, on_term)
+framer, diag, frames = JpegFramer(), DecoderDiagnostics(), 0
+t0 = time.monotonic()
+last_frame, loop_end, ended_early = t0, t0, False
 proc = subprocess.Popen(ffmpeg_args(cfg, "raw"), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE)
-proc.stdin.write(ffconcat_input(cfg)); proc.stdin.close()
-os.set_blocking(proc.stderr.fileno(), False)
-framer, diag, frames, sizes, t0 = JpegFramer(), DecoderDiagnostics(), 0, set(), time.time()
-while time.time() - t0 < float(os.environ["SECS"]):
-    chunk = os.read(proc.stdout.fileno(), 65536)
-    if not chunk:
-        break
-    for frame in framer.feed(chunk):
-        frames += 1
-    try:
-        noise = os.read(proc.stderr.fileno(), 65536)
-        if noise:
-            diag.feed(noise)
-    except BlockingIOError:
-        pass
-proc.terminate()
 try:
-    proc.wait(timeout=5)
-except subprocess.TimeoutExpired:
-    proc.kill()
+    proc.stdin.write(ffconcat_input(cfg)); proc.stdin.close()
+    out_fd, err_fd = proc.stdout.fileno(), proc.stderr.fileno()
+    os.set_blocking(out_fd, False)
+    os.set_blocking(err_fd, False)
+    watching = [out_fd, err_fd]
+    deadline = t0 + secs
+    # The deadline is enforced by select(), never by a read: a relay that
+    # keeps the session open and sends nothing cannot hold this loop.
+    while out_fd in watching:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select(watching, [], [], remaining)
+        for fd in ready:
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                watching.remove(fd)
+                continue
+            if fd == out_fd:
+                got = len(framer.feed(chunk))
+                if got:
+                    frames += got
+                    last_frame = time.monotonic()
+            else:
+                diag.feed(chunk)
+    loop_end = time.monotonic()
+    ended_early = out_fd not in watching and loop_end < deadline
+finally:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+stalled = frames == 0 or ended_early or (loop_end - last_frame) > stall_window
 print(json.dumps({"target": "%s:%s%s" % (os.environ["HOST"], os.environ["PORT"], os.environ["RPATH"]),
-                  "frames": frames, "seconds": round(time.time() - t0, 1),
+                  "frames": frames, "seconds": round(loop_end - t0, 1), "stalled": stalled,
+                  "ended_early": ended_early,
+                  "seconds_since_last_frame": round(loop_end - last_frame, 1) if frames else None,
                   "decoder": diag.snapshot()["counts"]}, sort_keys=True))
-raise SystemExit(0 if frames > 0 else 1)
+raise SystemExit(0 if frames > 0 and not stalled else 1)
 PY
     ;;
 *)

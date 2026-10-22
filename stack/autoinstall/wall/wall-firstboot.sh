@@ -40,6 +40,9 @@
 #      secret file exists and the broker never receives unrelated wall secrets.
 #  8e. Item S — enable the read-only DynamicUser thermal/CPU/presentation-mode
 #      telemetry collector (WALL_TELEMETRY_ENABLED, default true).
+#  8f. SR-083 — cap the classic syslog files (daily, 100 MB, 7 kept, checked
+#      hourly), make journald's own cap explicit, and run the low-disk alarm
+#      (wall-disk-check.timer, every 15 min). Always on.
 #   9. Stamp the marker.
 #
 # What this script deliberately does NOT do: guess. Where a fix needs a value only
@@ -2489,6 +2492,67 @@ else
     systemctl disable --now wall-panel-telemetry.service >/dev/null 2>&1 || true
     log "SN-S: panel telemetry collector disabled"
 fi
+
+# ── 8f. SR-083 — bounded logs and the low-disk alarm ────────────────────────
+# 2026-10-18 00:02: the weekly logrotate gzipped a /var/log/syslog that had
+# grown to tens of GB and filled the root for two minutes; the kiosk's cookie
+# store stopped persisting and the next restart lost the Pandora sign-in.
+# Nothing capped rsyslog's file and nothing said the disk was filling.
+#
+# Installed HERE, on every boot, rather than by a late-command, because the
+# paired release lane can only carry what this script installs: its system
+# manifest is derived from these lines. Always on -- there is no knob, because
+# an unbounded log on the root filesystem is not a preference.
+#
+# * /etc/logrotate.d/rsyslog is REPLACED, not joined: logrotate skips a log two
+#   stanzas name. Same files and postrotate as Ubuntu's; daily + maxsize 100M +
+#   rotate 7.
+# * logrotate.timer gets a drop-in making it hourly, so maxsize bites within
+#   the day. try-restart re-arms it on the new schedule now; it is enabled
+#   through the helper so the release manifest requires it enabled.
+# * journald's cap becomes tracked: the same path and values as the drop-in
+#   written on the panel by hand on 2026-09-19, so this takes it over in
+#   place. journald is restarted only when the drop-in actually changed, so
+#   an ordinary boot does not bounce it.
+# * wall-disk-check.timer writes `wall-disk: LOW ...` to the journal and
+#   /run/wall-disk/status.json. The panel has no alert route to the hub (the
+#   telemetry collector has no network by design), so the journal line and the
+#   status file are the whole of the alarm for now.
+# BEGIN log-cap-and-disk-alarm
+_journald_changed=0
+cmp -s "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf || _journald_changed=1
+install -d -m 0755 /etc/logrotate.d /etc/systemd/system/logrotate.timer.d /etc/systemd/journald.conf.d
+for _logcap in wall-logrotate-rsyslog wall-logrotate-hourly.conf wall-journald.conf wall-disk-check.py wall-disk-check.service wall-disk-check.timer; do
+    [ -f "$PAYLOAD/$_logcap" ] || fail_step "SR-083: $_logcap is missing from the image payload; the syslog cap and the low-disk alarm are NOT fully in place"
+done
+unset _logcap
+[ -f "$PAYLOAD/wall-logrotate-rsyslog" ] &&
+    install -m 0644 "$PAYLOAD/wall-logrotate-rsyslog" /etc/logrotate.d/rsyslog
+[ -f "$PAYLOAD/wall-logrotate-hourly.conf" ] &&
+    install -m 0644 "$PAYLOAD/wall-logrotate-hourly.conf" /etc/systemd/system/logrotate.timer.d/60-wall-hourly.conf
+[ -f "$PAYLOAD/wall-journald.conf" ] &&
+    install -m 0644 "$PAYLOAD/wall-journald.conf" /etc/systemd/journald.conf.d/10-wall-cap.conf
+[ -f "$PAYLOAD/wall-disk-check.py" ] &&
+    install -m 0755 "$PAYLOAD/wall-disk-check.py" /usr/local/sbin/wall-disk-check.py
+[ -f "$PAYLOAD/wall-disk-check.service" ] &&
+    install -m 0644 "$PAYLOAD/wall-disk-check.service" /etc/systemd/system/wall-disk-check.service
+[ -f "$PAYLOAD/wall-disk-check.timer" ] &&
+    install -m 0644 "$PAYLOAD/wall-disk-check.timer" /etc/systemd/system/wall-disk-check.timer
+systemctl daemon-reload >/dev/null 2>&1 ||
+    warn "SR-083: daemon-reload failed; the hourly logrotate schedule and the disk check apply from the next boot"
+if [ "$_journald_changed" = 1 ]; then
+    if systemctl restart systemd-journald >/dev/null 2>&1; then
+        log "SR-083: journald cap applied (SystemMaxUse=500M, SystemKeepFree=2G)"
+    else
+        warn "SR-083: journald did not restart; its cap applies from the next boot"
+    fi
+fi
+unset _journald_changed
+enable_unit "SR-083: syslog capped (daily, maxsize 100M, 7 kept) and logrotate.timer runs hourly" logrotate.timer
+systemctl try-restart logrotate.timer >/dev/null 2>&1 ||
+    warn "SR-083: logrotate.timer did not restart; its hourly schedule applies from the next boot"
+enable_unit_now "SR-083: low-disk alarm enabled (every 15 min; journal 'wall-disk: LOW', /run/wall-disk/status.json)" wall-disk-check.timer
+# END log-cap-and-disk-alarm
 
 # ── 9. done — but only if it IS done ─────────────────────────────────────────
 # The marker means "this panel is provisioned", and units, scripts and humans all

@@ -1,0 +1,21 @@
+# wall-disk-check.timer — the low-disk alarm's cadence (SR-083).
+#
+# Fifteen minutes: the 2026-10-18 fill came from a log that grew for days, so a
+# quarter-hour is early enough to see the next one coming and cheap enough
+# (one df, one small file) to run for ever. A fixed cadence, so this file is
+# TRACKED rather than rendered; firstboot installs and enables it every boot.
+#
+# Persistent is absent on purpose: a missed measurement is not worth replaying,
+# the next one is at most fifteen minutes away. The status file's ttlMs is two
+# periods, so a reader can tell "nobody is measuring" from "the disk is fine".
+[Unit]
+Description=Wall panel: low-disk check every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Unit=wall-disk-check.service
+
+[Install]
+WantedBy=timers.target

@@ -12,6 +12,14 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-22 — SR-084 built on `w2-touch-filter-statedir` (not merged, not deployed).**
+- `wall-touch-filter.service` gains `StateDirectory=wall-touch-filter` (`StateDirectoryMode=0700`) and nothing
+  wider (LLR-1142); `configure-touch-filter.sh` OFF deletes `protection.json` from it (LLR-1143); the unit still
+  reaches the panel only through firstboot, so the system lane carries it (LLR-1144). TC-1265..1268 in
+  `tests/test_touch_filter_persistence.py`. The application half is OfficeWallNaglight WSN-099
+  (`touchfilter/persist.py`); both ship in one paired release (HomeHub plan 2026-10-22, W2).
+- Not proven: anything on the panel (installed unit, restored protection after a reboot).
+
 **2026-10-19 — Correction (records only; nothing deployed by this entry).**
 - **Sure is live.** The 2026-10-18 entry below says "Sure is NOT started". That was true when written and is
   superseded: Sure went live on the hub later on 2026-10-18, started by HomeHub's run-sheet script

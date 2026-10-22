@@ -629,13 +629,21 @@ services:
     environment:
       TZ: ${TIMEZONE}                  # RUN_AT is read as BOX-LOCAL time (FA SR-001)
       RUN_AT: ${FINANCE_RUN_AT}
-      # Actual over the compose-internal bridge ONLY (FA IF-002/SR-003) — never
-      # the actual.admin.<domain> route, which sits behind a browser login.
+      # ROLLBACK ONLY since the 2026-10-22 cutover (SR-099, LLR-1205): FA reads
+      # these three only with DATA_SOURCE=actual, or as an image older than the
+      # Sure bridge. They stay passed so a rollback is one knob and a recreate,
+      # never a compose edit. Actual over the compose-internal bridge ONLY (FA
+      # IF-002/SR-003) — never the actual.admin.<domain> route, which sits
+      # behind a browser login.
       ACTUAL_URL: http://actual:5006
-      ACTUAL_SYNC_ID: ${FINANCE_ACTUAL_SYNC_ID}
-      ACTUAL_PASSWORD: ${FINANCE_ACTUAL_PASSWORD}
-      # The template default stays actual; the hub's own config selects sure
-      # (the Owner's cutover ruling, 2026-10-22). Actual stays installed.
+      ACTUAL_SYNC_ID: ${FINANCE_ACTUAL_SYNC_ID}        # ROLLBACK only
+      ACTUAL_PASSWORD: ${FINANCE_ACTUAL_PASSWORD}      # ROLLBACK only
+      # actual | sure. The template default stays actual (SR-099, LLR-1206):
+      # it is the one source a bare template satisfies unattended (firstboot's
+      # provision-actual.sh sets Actual's password), while sure also needs
+      # FINANCE_SURE_API_KEY, minted by hand in Sure, and fails FA's startup
+      # config check without it. The hub's own config selects sure (the
+      # Owner's cutover ruling, 2026-10-22). Actual stays installed.
       DATA_SOURCE: ${FINANCE_DATA_SOURCE:-actual}
       SURE_URL: ${FINANCE_SURE_URL:-http://sure-web:3000}
       SURE_API_KEY: ${FINANCE_SURE_API_KEY:-}
@@ -658,7 +666,7 @@ services:
       - sure
     volumes:
       - finance_snapshots:/snapshots          # LAN-only audit artifacts (FA SR-005/006)
-      - finance_actual_data:/data/actual      # @actual-app/api cache — persist across restarts
+      - finance_actual_data:/data/actual      # ROLLBACK only: the @actual-app/api cache (DATA_SOURCE=actual)
       # The serving-periods DIRECTORY (holds serving-periods.json), read-only.
       # A DIRECTORY, never the file: replacing a bind-mounted file swaps its
       # inode and detaches the mount, so the container would keep reading the
@@ -667,9 +675,47 @@ services:
       # private repo and is placed on the box by hand. Absent file = FA posts
       # no finance gauge (it says so in its log), never a made-up table.
       - ${FINANCE_PERIODS_CONFIG_DIR:-/etc/homehub-finance}:/config:ro
+    # WHAT THE AUDITOR WAITS FOR AT START (SR-099, LLR-1204). Both ledgers are
+    # OPTIONAL `service_healthy` dependencies; the tracker, which every source
+    # posts to, stays required. Compose cannot key a dependency on DATA_SOURCE,
+    # and `required: false` (Compose >= 2.20; the hub runs v5.5.1) behaves the
+    # way each source needs. Measured on a toy project, Compose v5.3.0, with
+    # the hub's v5.5.1 parsing it the same way (2026-10-22):
+    #  - a ledger STARTING in the same `up` is waited for until it is healthy.
+    #    sure-web is the one Sure dependency: it is what answers the API, and it
+    #    already needs its postgres and redis healthy first. The worker only
+    #    runs syncs, which FA reads afterwards;
+    #  - a ledger that goes UNHEALTHY is a warning and the auditor starts.
+    #    Required, an unhealthy Actual left the auditor Created-never-started
+    #    and the whole `up -d` exiting 1, in sure mode too (the 2026-10-22
+    #    defect); firstboot treats a failed bulk `up -d` as fatal;
+    #  - a ledger whose PROFILE IS OFF drops out of the project. Required,
+    #    sure-web makes the project invalid ("depends on undefined service")
+    #    whenever `sure` is not in COMPOSE_PROFILES, which is the hub's case by
+    #    design (HomeHub config: Sure is started explicitly with `--profile
+    #    sure up -d`).
+    # THE COST, NOT SOLVED HERE: with the profile off (the hub), and after any
+    # daemon restart (a reboot: the daemon restarts containers without reading
+    # depends_on at all), nothing waits for sure-web. In sure mode FA starts
+    # without asking Sure anything and first calls it at RUN_AT, so this is
+    # harmless only while Sure answers by then. If RUN_AT arrives before Sure
+    # answers (say, a reboot a minute before 05:00), that one run fails
+    # ("Sure request failed"; FA retries HTTP 429 only), the auditor stays up,
+    # so its restart policy never fires, and the next fire (the next day's
+    # RUN_AT) tries again: that day's finance gauge is lost. Compose cannot
+    # close this; a bounded retry of connection failures belongs in
+    # Finance-Auditor. In actual mode FA connects at
+    # start; if Actual is down it exits and its restart policy retries, rather
+    # than sitting Created until the next `up`. A changed depends_on does not
+    # change the container's config hash, so this edit recreates nothing.
+    # `up -d --no-deps finance-auditor` ignores all of it, as always.
     depends_on:
       actual:
         condition: service_healthy
+        required: false
+      sure-web:
+        condition: service_healthy
+        required: false
       tracker:
         condition: service_healthy
     restart: unless-stopped

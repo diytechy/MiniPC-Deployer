@@ -47,7 +47,12 @@ identity. Technitium provisions `SURE_SUBDOMAIN`. No service publishes a port.
 
 Web and worker share `/rails/storage`. Database/cache are on internal network
 `sure`; Rails also joins `default` for bank/price-provider egress. Finance-Auditor
-joins both, retains `DATA_SOURCE=actual` and has no Sure startup dependency.
+joins both. Its template default is `DATA_SOURCE=actual`; the hub's config selects
+`sure` (the 2026-10-22 cutover). It depends on `sure-web` only optionally (SR-099):
+it waits for Sure when Sure starts in the same `up`, and a disabled or unhealthy
+Sure never holds it (nor does Actual). On the hub the `sure` profile is off, so
+nothing waits for Sure: if Sure is not answering at `FINANCE_RUN_AT` (a reboot
+just before it), that day's run fails and the next try is the next day's run.
 The future read-only API URL is `http://sure-web:3000`.
 `FINANCE_TRACKER_FEED_USER` is a separate non-secret Google sub. The header fix
 is dispatched in Finance-Auditor `docs/status.md`, "Dispatched from HomeHub";

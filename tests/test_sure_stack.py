@@ -99,8 +99,16 @@ def test_finance_defaults_and_separate_user_sr063():
     assert settings["SURE_API_KEY"] == "${FINANCE_SURE_API_KEY:-}"
     assert settings["TRACKER_FEED_USER"] == "${FINANCE_TRACKER_FEED_USER:-}"
     assert "sure" in service["networks"] and "default" in service["networks"]
-    assert "sure-web" not in service["depends_on"]
+    # Sure may only ever be an OPTIONAL startup dependency (SR-099): a required
+    # one invalidates every project with the sure profile off (the hub's case).
+    assert service["depends_on"]["sure-web"] == {"condition": "service_healthy", "required": False}
     assert settings["ACTUAL_URL"] == "http://actual:5006"
+    # SR-063 must not still promise unchanged Actual dependencies: SR-099 made
+    # Actual optional, and no template can satisfy both rows.
+    row = next(line for line in (ROOT / "docs/requirements/system-requirements.csv")
+               .read_text(encoding="utf-8").splitlines() if line.startswith("SR-063,"))
+    assert "dependencies unchanged" not in row
+    assert "set by SR-099" in row
 
 
 def test_sure_reporting_and_ai_off_sr064():

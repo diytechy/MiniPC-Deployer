@@ -888,9 +888,9 @@ sequenceDiagram
     R->>F: start: -fs = room - 256 KiB, -t = max minutes (LLR-1242, LLR-1243)
     F->>S: recording/meeting-UTC.opus (left near, right far; every packet flushed)
     alt beats stop (kiosk gone, dark, frozen)
-        R->>F: SIGINT within 2 s of the last beat; SIGKILL after 0.4 s
+        R->>F: SIGINT within 2 s of the indicator leaving the glass; SIGKILL after 0.4 s
         R->>S: finalise into ready/ + .sha256 (LLR-1244)
-        Note over R: manual ends; a call waits and resumes into a new file when beats return
+        Note over R: idle; the call is not re-triggered until it ends (a restart remembers it)
     else stop, the call ends, -fs or -t reached, or ffmpeg dies
         R->>F: stop (or it has ended)
         R->>S: finalise into ready/ + .sha256

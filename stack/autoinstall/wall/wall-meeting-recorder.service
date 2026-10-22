@@ -5,7 +5,9 @@
 # WALL_MEETING_CALL_GATEWAYS, automatically while the panel carries their
 # Bluetooth call. NO INDICATOR, NO CAPTURE: ffmpeg runs only while the kiosk
 # keeps confirming that the "recording" indicator is on the glass, and is
-# stopped within 2 s of the last confirmation. Audio only, into the spool;
+# stopped within 2 s of it leaving the glass. A restart finalises the
+# partial file and does not re-record the call it was recording
+# (/var/spool/wall-meeting/call-memory.json). Audio only, into the spool;
 # the hub collects it through the wall-meeting account's forced command
 # (wall-meeting-spool) and nothing here opens a network socket.
 #

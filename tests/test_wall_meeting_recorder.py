@@ -6,20 +6,23 @@ Layers, each against the real artefact:
 * TC-1400 -- the pure RecordingMachine: every transition the plan names
   (manual, call, manual-during-call, a stop during a call suppressing the
   automatic trigger until that call ends, repeated call notifications, a
-  failed capture, a lost indicator).
+  failed capture, a lost indicator, the call a restart remembers).
 * TC-1401 -- the loop (Recorder.tick) with an injected clock and a fake
   capture: no indicator no capture, a beat for an older recording does not
-  count, capture stops within 2 s of the last beat, a call resumes into a new
-  file when the indicator comes back, a manual start without an indicator
-  gives up.
-* TC-1402 -- a capture that crashes mid-recording, and a daemon that crashed:
-  the partial file is finalised with its hash, the state returns to idle and
-  the call is not re-triggered in a loop.
+  count, capture stops within 2 s of the last beat, a kiosk outage mid-call
+  finalises one file and returns to idle with no second capture while that
+  call continues, a manual start without an indicator gives up.
+* TC-1402 -- a capture that crashes mid-recording, and a recorder that
+  restarts mid-call (a new Recorder on the same files): the partial file is
+  finalised with its hash, the state returns to idle and the call is not
+  re-triggered, while a new call records automatically.
 * TC-1403 -- the bounds: the spool's cap and the disk floor refuse a start and
   say which; a capture is started with -fs set to the room left and one that
   stops on it is "spool-full"; both budgets full is visible in the document.
 * TC-1404 -- the inputs: call-state, request and acknowledgement parsing.
-* TC-1405 -- the state document, its atomic write, and a bounded stop.
+* TC-1405 -- the state document, its atomic write, and a bounded stop,
+  measured from the moment the screen goes dark (the kiosk samples the
+  display for each beat; Sol W6 review 1, F1).
 * TC-1406 -- TONES through the real ffmpeg (skipped without ffmpeg/libopus):
   the near input lands on the left channel and the far input on the right,
   and the Recorder end to end with tone inputs records, stops on a lost
@@ -164,14 +167,53 @@ def test_tc1400_a_failed_capture_returns_to_idle_and_does_not_retrigger_the_call
     assert m.call_up("t2", "desktop-office")
 
 
-def test_tc1400_a_lost_indicator_ends_a_manual_recording_and_keeps_a_calls_intent():
+def test_tc1400_a_lost_indicator_returns_to_idle_and_suppresses_the_call():
+    """Plan W6 task 3: a kiosk crash finalises the partial file and returns to
+    idle (Sol W6 review 1, F2) -- for every intent, a call's included."""
     m = mr.RecordingMachine(seq=0)
     m.manual_start()
     assert m.indicator_lost() and m.intent == mr.IDLE
     m.call_up("t1", "desktop-office")
-    assert not m.indicator_lost() and m.intent == mr.CALL
+    assert m.intent == mr.CALL
+    assert m.indicator_lost() and m.intent == mr.IDLE
+    for _ in range(3):
+        assert not m.call_up("t1", "desktop-office") and m.intent == mr.IDLE, "the same call does not resume"
+    assert m.manual_start() and m.intent == mr.MANUAL, "the person can record it by hand"
+    assert m.call_up("t1", "desktop-office") and m.intent == mr.MANUAL_CALL
+    assert m.indicator_lost() and m.intent == mr.IDLE, "a joined recording ends too"
+    assert not m.call_up("t1", "desktop-office")
+    assert not m.indicator_lost(), "idle stays idle"
+    m.call_down()
+    assert m.call_up("t2", "desktop-office") and m.intent == mr.CALL, "the next call records again"
+
+
+def test_tc1400_the_call_a_restart_remembers():
+    m = mr.RecordingMachine(seq=0)
+    assert m.remembered_key is None
+    m.call_up("t1", "pixel-10-pro", auto=False)
+    assert m.remembered_key is None, "a call nobody is recording is not remembered"
+    m.call_down()
+    m.call_up("t1", "desktop-office")
+    assert m.remembered_key == "t1", "a call being recorded"
+    m.manual_stop()
+    assert m.remembered_key == "t1", "a call the person stopped stays stopped"
+    m.call_down()
+    assert m.remembered_key is None, "the call ended"
     m.manual_start()
-    assert m.indicator_lost() and m.intent == mr.CALL
+    m.call_up("t2", "pixel-10-pro", auto=False)
+    assert m.intent == mr.MANUAL_CALL and m.remembered_key == "t2"
+    fresh = mr.RecordingMachine(seq=100)
+    fresh.restore("t2")
+    assert fresh.intent == mr.IDLE and fresh.remembered_key == "t2"
+    assert not fresh.call_up("t2", "desktop-office") and fresh.intent == mr.IDLE
+    assert fresh.manual_start() and fresh.intent == mr.MANUAL, "a manual start still records it"
+    assert fresh.call_up("t2", "desktop-office") and fresh.intent == mr.MANUAL_CALL
+    other = mr.RecordingMachine(seq=100)
+    other.restore("t2")
+    assert other.call_up("t3", "desktop-office") and other.intent == mr.CALL, "another call records"
+    nothing = mr.RecordingMachine(seq=100)
+    nothing.restore(None)
+    assert nothing.call_up("t2", "desktop-office"), "nothing remembered, nothing suppressed"
 
 
 # ── the rig for TC-1401..TC-1405 ─────────────────────────────────────────────
@@ -221,13 +263,22 @@ class Rig:
         (tmp_path / "mic.env").write_text("WALL_AUDIO_MIC_SOURCE=mic_clean\n")
         (tmp_path / "mute.env").write_text("WALL_AUDIO_INPUT_MUTED=0\n")
         self.call_file = tmp_path / "call-state.json"
+        self.boot_id = tmp_path / "boot_id"
+        self.boot_id.write_text("boot-1\n")
         self.spool = mr.Spool(tmp_path / "spool")
         if free is not None:
             self.spool.free_bytes = lambda: free
-        settings = mr.settings_from({"WALL_MEETING_SPOOL_MAX_MB": str(spool_mb),
-                                     "WALL_MEETING_MIN_FREE_MB": str(floor_mb),
-                                     "WALL_MEETING_CALL_GATEWAYS": gateways})
-        rig = self
+        self.settings = mr.settings_from({"WALL_MEETING_SPOOL_MAX_MB": str(spool_mb),
+                                          "WALL_MEETING_MIN_FREE_MB": str(floor_mb),
+                                          "WALL_MEETING_CALL_GATEWAYS": gateways})
+        self.rec = self._recorder()
+        self.capture = self.rec.capture
+        self.rec.prime()
+        self.request_id = 0
+        self.beat = 0
+
+    def _recorder(self):
+        rig, tmp_path = self, self.tmp
 
         def popen(argv, **kwargs):
             proc = FakeProcess(argv, rig)
@@ -235,18 +286,33 @@ class Rig:
             rig.argvs.append(argv)
             return proc
 
-        self.capture = mr.Capture(popen=popen, clock=lambda: rig.now, sleep=self._sleep)
-        self.rec = mr.Recorder(
-            settings, spool=self.spool, state_file=tmp_path / "state" / "state.json",
+        return mr.Recorder(
+            self.settings, spool=self.spool, state_file=tmp_path / "state" / "state.json",
             request_file=self.renderer / "meeting-request.json",
             ack_file=self.renderer / "meeting-indicator-ack.json",
             call_file=self.call_file, mode_file=tmp_path / "audio-mode",
             mic_env=tmp_path / "mic.env", mute_env=tmp_path / "mute.env",
-            capture=self.capture, clock=lambda: rig.now, wall=lambda: rig.wall_offset + rig.now,
+            memory_file=self.spool.root / "call-memory.json", boot_id_file=self.boot_id,
+            capture=mr.Capture(popen=popen, clock=lambda: rig.now, sleep=self._sleep),
+            clock=lambda: rig.now, wall=lambda: rig.wall_offset + rig.now,
             alert_fn=lambda key, message: rig.alerts.append(key))
+
+    def restart(self, *, reboot=False):
+        """The recorder process dies; systemd's KillMode=mixed takes its ffmpeg
+        child with it, the partial stays in recording/, and Restart=always
+        starts a NEW process on the same files. A reboot also gives a new boot
+        id. Nothing of the old Recorder object survives."""
+        for proc in self.processes:
+            if proc.returncode is None:
+                proc.returncode = -9
+        if reboot:
+            self.boot_id.write_text("boot-2\n")
+        self.rec = self._recorder()
+        self.capture = self.rec.capture
         self.rec.prime()
-        self.request_id = 0
-        self.beat = 0
+
+    def memory(self):
+        return json.loads((self.spool.root / "call-memory.json").read_text())
 
     def _sleep(self, seconds):
         self.now += seconds
@@ -351,20 +417,43 @@ def test_tc1401_capture_stops_within_2_s_of_the_last_beat(tmp_path):
     assert doc["intent"] == "idle" and doc["refusal"]["reason"] == "indicator-lost"
 
 
-def test_tc1401_a_call_resumes_into_a_new_file_when_the_indicator_returns(tmp_path):
+def test_tc1401_a_kiosk_outage_mid_call_finalises_one_file_and_ends_idle(tmp_path):
+    """Plan W6 task 3, Sol W6 review 1 F2: the kiosk crashes, freezes, reloads
+    or goes dark during a call. One file, finalised; idle; and no second
+    capture while the same call continues, though the person may start one."""
     rig = Rig(tmp_path)
     rig.call()
     rig.run_beating(2.0)
     assert len(rig.processes) == 1
-    for _ in range(12):  # the kiosk stops beating for 3 s (a renderer restart)
+    for _ in range(12):  # the kiosk stops beating for 3 s; the call goes on
         rig.call()
-        rig.tick()
+        doc = rig.tick()
         rig.advance(0.25)
     assert rig.processes[0].returncode is not None
-    assert rig.rec.machine.intent == mr.CALL, "the call's intent survives"
-    rig.advance(1.0)
+    assert doc["intent"] == "idle" and doc["phase"] == "off" and doc["indicator"] is False
+    assert doc["refusal"]["reason"] == "indicator-lost"
+    assert rig.ready() == [rig.started[0].name, rig.started[0].name + ".sha256"], "one file, finalised"
+    doc = rig.run_beating(6.0)  # the kiosk is back; the same call is still up
+    assert len(rig.processes) == 1, "no second capture while the same call continues"
+    assert doc["intent"] == "idle" and doc["indicator"] is False
+    assert rig.memory()["callKey"] == "2026-10-22T16:07:52Z", "remembered for a restart too"
+    rig.request("start")
+    doc = rig.run_beating(1.0)
+    assert len(rig.processes) == 2 and doc["intent"] == "manual-call", "a manual start records it"
+
+
+def test_tc1401_a_microphone_switch_as_the_indicator_goes_is_lost_not_resumed(tmp_path):
+    rig = Rig(tmp_path)
+    rig.call()
     rig.run_beating(2.0)
-    assert len(rig.processes) == 2 and rig.started[0] != rig.started[1]
+    (tmp_path / "mic.env").write_text("WALL_AUDIO_MIC_SOURCE=mic_headset\n")
+    rig.advance(1.5)            # no beat since: the indicator went with the switch
+    rig.call()
+    doc = rig.tick()
+    assert rig.processes[0].returncode is not None and len(rig.processes) == 1
+    assert doc["intent"] == "idle" and doc["refusal"]["reason"] == "indicator-lost"
+    rig.run_beating(3.0)
+    assert len(rig.processes) == 1
 
 
 def test_tc1401_a_beat_for_the_last_recording_never_starts_the_next(tmp_path):
@@ -504,6 +593,69 @@ def test_tc1402_a_daemon_crash_leaves_a_partial_that_the_next_start_finalises(tm
                      "meeting-20261022T160752Z.opus", "meeting-20261022T160752Z.opus.sha256"]
     assert sorted(done) == ["meeting-20261022T150000Z.opus", "meeting-20261022T160752Z.opus"]
     assert os.listdir(spool.recording) == [], "a file with no audio is discarded"
+
+
+def test_tc1402_a_recorder_restarted_mid_call_finalises_and_does_not_record_that_call_again(tmp_path):
+    """Plan W6 task 3, Sol W6 review 1 F2: the recorder itself dies during a
+    call that goes on. A new process, the same files, the same call-state."""
+    rig = Rig(tmp_path)
+    rig.call()
+    rig.run_beating(2.0)
+    partial = rig.started[0]
+    assert partial.parent == rig.spool.recording and partial.exists()
+    assert rig.memory() == {"schemaVersion": 1, "callKey": "2026-10-22T16:07:52Z", "bootId": "boot-1"}
+    if os.name == "posix":
+        assert (rig.spool.root / "call-memory.json").stat().st_mode & 0o777 == 0o600
+    rig.advance(3.0)            # RestartSec
+    rig.restart()
+    assert rig.ready() == [partial.name, partial.name + ".sha256"], "the partial is finalised at start"
+    assert os.listdir(rig.spool.recording) == []
+    rig.call()
+    doc = rig.tick()
+    assert doc["intent"] == "idle" and len(rig.processes) == 1, "the first tick stays idle for the same since"
+    doc = rig.run_beating(5.0)
+    assert doc["intent"] == "idle" and len(rig.processes) == 1, "and stays so while that call continues"
+    rig.restart()               # a second restart still knows it
+    rig.call()
+    assert rig.tick()["intent"] == "idle" and len(rig.processes) == 1
+    rig.hang_up()
+    rig.tick()
+    assert rig.memory()["callKey"] is None, "the call ended: nothing is remembered"
+    rig.call(since="2026-10-22T17:00:00Z")
+    doc = rig.run_beating(2.0)
+    assert len(rig.processes) == 2 and doc["intent"] == "call" and doc["phase"] == "recording", "a new since records"
+
+
+def test_tc1402_a_restart_during_a_call_with_another_since_records_it(tmp_path):
+    rig = Rig(tmp_path)
+    rig.call()
+    rig.run_beating(2.0)
+    rig.restart()
+    rig.call(since="2026-10-22T17:00:00Z")   # the call changed while the recorder was down
+    doc = rig.run_beating(2.0)
+    assert len(rig.processes) == 2 and doc["intent"] == "call" and doc["phase"] == "recording"
+
+
+def test_tc1402_a_reboot_forgets_the_call(tmp_path):
+    """The memory is keyed to the boot: after a reboot it says nothing."""
+    rig = Rig(tmp_path)
+    rig.call()
+    rig.run_beating(2.0)
+    rig.restart(reboot=True)
+    rig.call()                  # (a real reboot ends the call; the key is what matters)
+    doc = rig.run_beating(2.0)
+    assert len(rig.processes) == 2 and doc["intent"] == "call"
+
+
+def test_tc1402_a_call_the_person_stopped_stays_stopped_across_a_restart(tmp_path):
+    rig = Rig(tmp_path)
+    rig.call()
+    rig.run_beating(2.0)
+    rig.request("stop")
+    rig.run_beating(1.0)
+    rig.restart()
+    doc = rig.run_beating(3.0)
+    assert len(rig.processes) == 1 and doc["intent"] == "idle"
 
 
 def test_tc1402_the_service_stopping_finalises_the_recording(tmp_path):
@@ -651,6 +803,22 @@ def test_tc1404_ack(text, expected):
     assert mr.parse_ack(text) == expected
 
 
+@pytest.mark.parametrize("text,boot,expected", [
+    ('{"schemaVersion":1,"callKey":"S","bootId":"b1"}', "b1", "S"),
+    ('{"schemaVersion":1,"callKey":"S","bootId":"b1"}', "b2", None),
+    ('{"schemaVersion":1,"callKey":"S","bootId":null}', None, "S"),
+    ('{"schemaVersion":1,"callKey":null,"bootId":"b1"}', "b1", None),
+    ('{"schemaVersion":1,"callKey":"","bootId":"b1"}', "b1", None),
+    ('{"schemaVersion":1,"callKey":7,"bootId":"b1"}', "b1", None),
+    ('{"schemaVersion":1,"callKey":"%s","bootId":"b1"}' % ("x" * 65), "b1", None),
+    ('{"schemaVersion":2,"callKey":"S","bootId":"b1"}', "b1", None),
+    ("not json", "b1", None),
+    (None, "b1", None),
+])
+def test_tc1404_call_memory(text, boot, expected):
+    assert mr.parse_call_memory(text, boot) == expected
+
+
 def test_tc1404_a_request_from_before_a_restart_is_not_replayed(tmp_path):
     rig = Rig(tmp_path)
     rig.request("start")
@@ -774,6 +942,61 @@ def test_tc1405_worst_case_beat_written_just_after_a_poll_and_sigint_ignored(tmp
             break
     assert stopped is not None and stopped - written <= 2.0, stopped and stopped - written
     assert rig.processes[0].signals == [mr.signal.SIGINT, "KILL"]
+
+
+def _stop_after_dark(tmp_path, dark_after_beat, poll_phase, display_lag):
+    """Seconds from the screen going dark to the capture being killed.
+
+    Event-driven, on the rig's clock: the kiosk writes a beat every 0.5 s and
+    refuses one when the display it samples is dark, sampling `display_lag`
+    seconds late (0 is OfficeWallNaglight's indicatorBeatHandler, which reads
+    the backlight for each beat; 0.5 is the cached 500 ms value it replaced).
+    The recorder polls POLL_S after each poll ends, its first poll
+    `poll_phase` after the first beat; the screen goes dark `dark_after_beat`
+    after a beat; the capture ignores SIGINT, so it needs the whole grace.
+    """
+    tmp_path.mkdir()
+    rig = Rig(tmp_path)
+    rig.ignore_sigint = True
+    rig.request("start")
+    rig.tick()
+    first = rig.now
+    dark_at = first + 2.0 + dark_after_beat
+    next_beat, next_poll = first, first + poll_phase
+    while rig.now < dark_at + 5.0:
+        if next_beat <= next_poll:
+            rig.now = next_beat
+            if rig.now - display_lag < dark_at:
+                rig.ack()
+            next_beat += 0.5
+        else:
+            rig.now = next_poll
+            rig.tick()
+            if rig.processes and rig.processes[0].returncode is not None:
+                assert rig.processes[0].signals == [mr.signal.SIGINT, "KILL"]
+                return rig.now - dark_at
+            next_poll = rig.now + mr.POLL_S
+    raise AssertionError("never stopped")
+
+
+def test_tc1405_capture_stops_within_2_s_of_the_screen_going_dark(tmp_path):
+    """Sol W6 review 1, F1: the 2 s bound is measured from the moment the
+    indicator leaves the glass, here the backlight going dark, over every
+    phase of the beat and the poll."""
+    worst = 0.0
+    n = 0
+    for dark_after_beat in (0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.49, 0.499):
+        for poll_phase in (0.0, 0.001, 0.01, 0.05, 0.1, 0.15, 0.2, 0.24, 0.249):
+            n += 1
+            took = _stop_after_dark(tmp_path / ("a%d" % n), dark_after_beat, poll_phase, display_lag=0.0)
+            assert took <= 2.0, (dark_after_beat, poll_phase, took)
+            worst = max(worst, took)
+    assert worst > 1.8, "the sweep reached the worst case (%.3f s)" % worst
+    # The rig sees the defect it guards: a kiosk that trusted a display value
+    # up to 500 ms old let beats through after dark and overran the bound.
+    late = max(_stop_after_dark(tmp_path / ("b%d" % i), 0.01, phase, display_lag=0.5)
+               for i, phase in enumerate((0.0, 0.1, 0.24)))
+    assert late > 2.0, late
 
 
 def test_tc1405_recording_names_are_utc_and_unique():

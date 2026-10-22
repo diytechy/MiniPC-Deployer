@@ -29,15 +29,25 @@ manual-call. A manual start during a call joins the call's recording (one
 file); a manual stop during a call stops it and suppresses the automatic
 trigger until that call ends; repeated call notifications are idempotent; a
 capture that fails returns to idle (and suppresses the call that was
-recording, so a broken capture cannot loop).
+recording, so a broken capture cannot loop). A LOST INDICATOR -- a kiosk that
+crashes, freezes, reloads or goes dark -- is the same: the partial file is
+finalised and the intent returns to idle, the call suppressed until it ends
+(plan W6 task 3; Sol W6 review 1, F2). A RECORDER RESTART is the same again:
+the partial is finalised at start, and the call that was being recorded is
+remembered across the restart (CALL_MEMORY, keyed to the boot) so the first
+poll does not take the call that is still up for a new automatic trigger. A
+manual start records that call again; a call with another `since` records
+automatically.
 
 NO INDICATOR, NO CAPTURE. Whenever an intent is not idle this daemon asks the
 kiosk for the indicator (state document, `indicator: true`). The kiosk beats an
 acknowledgement every 500 ms while the indicator is painted on a lit screen;
 capture STARTS only after a beat for the current sequence number has been seen
-within ACK_FRESH_S and STOPS within 2 s of the last one (poll POLL_S, freshness
-ACK_FRESH_S, SIGINT then SIGKILL after STOP_GRACE_S). A kiosk that crashes,
-blanks or freezes simply stops beating.
+within ACK_FRESH_S and STOPS within 2 s of the indicator leaving the glass
+(poll POLL_S, freshness ACK_FRESH_S, SIGINT then SIGKILL after STOP_GRACE_S).
+A kiosk that crashes, blanks or freezes simply stops beating, and the kiosk
+samples the display for every beat, so no beat is written after the screen
+went dark: the last beat is written at or before the indicator disappears.
 
 BOUNDS. The panel spool has a hard cap (WALL_MEETING_SPOOL_MAX_MB) and a free
 space floor on the root filesystem (WALL_MEETING_MIN_FREE_MB); every capture
@@ -51,9 +61,11 @@ Contract:
            /run/wall-panel-renderer/meeting-request.json and
            meeting-indicator-ack.json (the kiosk); /etc/wall-panel/audio-mode;
            /run/wall-panel/audio-mic-source.env, audio-input-mute.env;
-           /var/spool/wall-meeting/hub-state.json (wall-meeting-spool report).
+           /var/spool/wall-meeting/hub-state.json (wall-meeting-spool report);
+           /proc/sys/kernel/random/boot_id.
   Outputs: /run/wall-meeting-recorder/state.json (0644, atomic);
-           /var/spool/wall-meeting/ready/meeting-<UTC>.opus + .sha256.
+           /var/spool/wall-meeting/ready/meeting-<UTC>.opus + .sha256;
+           /var/spool/wall-meeting/call-memory.json (0600, atomic).
   Config:  /etc/wall-panel/meeting-recorder.env (rendered by firstboot from
            wall.env): WALL_MEETING_SPOOL_MAX_MB, WALL_MEETING_MIN_FREE_MB,
            WALL_MEETING_MAX_MINUTES, WALL_MEETING_BITRATE_KBPS,
@@ -95,17 +107,26 @@ INPUT_MUTE_ENV = Path("/run/wall-panel/audio-input-mute.env")
 AUDIO_MODE_FILE = Path("/etc/wall-panel/audio-mode")
 CONFIG_FILE = Path("/etc/wall-panel/meeting-recorder.env")
 SPOOL = Path("/var/spool/wall-meeting")
+# The call a restarted recorder must not take for a new automatic trigger
+# (Sol W6 review 1, F2). Not in the RuntimeDirectory: that is removed on every
+# stop, deliberately, so a stopped recorder shows the kiosk nothing. It carries
+# the boot id, so it outlives any restart of the unit and never a reboot.
+CALL_MEMORY = SPOOL / "call-memory.json"
+BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 FFMPEG = "/usr/bin/ffmpeg"
 MAX_DOC_BYTES = 4096
 SCHEMA_VERSION = 1
 
 # ── the timings (LLR-1242) ───────────────────────────────────────────────────
-# The kiosk beats every 500 ms. The daemon sees a beat up to POLL_S after it
-# was written; a beat older than ACK_FRESH_S is a lost indicator; the poll
-# finds that up to POLL_S later; and a capture asked to stop with SIGINT is
-# killed STOP_GRACE_S after that. From the kiosk's last write:
-# 0.25 + 1.0 + 0.25 + 0.4 = 1.9 s < 2 s (Sol review 1, F5). Two beats fit in
-# the freshness window, so one late frame does not end a recording.
+# The kiosk beats every 500 ms, and samples the display for each beat, so its
+# last beat is written at or before the moment the indicator leaves the glass
+# (the screen goes dark, the kiosk goes away, or a beat simply is not written;
+# Sol W6 review 1, F1). The daemon sees a beat up to POLL_S after it was
+# written; a beat older than ACK_FRESH_S is a lost indicator; the poll finds
+# that up to POLL_S later; and a capture asked to stop with SIGINT is killed
+# STOP_GRACE_S after that. From the indicator leaving the glass:
+# 0.25 + 1.0 + 0.25 + 0.4 = 1.9 s < 2 s. Two beats fit in the freshness
+# window, so one late frame does not end a recording.
 POLL_S = 0.25
 ACK_FRESH_S = 1.0
 STOP_GRACE_S = 0.4
@@ -249,16 +270,30 @@ class RecordingMachine:
         return True
 
     def indicator_lost(self) -> bool:
-        """The kiosk stopped confirming the indicator. A manual recording ends
-        (idle); a call's intent stays, so capture resumes -- into a new file --
-        only once the indicator is confirmed again."""
-        if self.intent == MANUAL:
-            self.intent = IDLE
-            return True
-        if self.intent == MANUAL_CALL:
-            self.intent = CALL
-            return True
-        return False
+        """The kiosk stopped confirming the indicator (it crashed, froze,
+        reloaded or went dark): back to idle, exactly as a failed capture, and
+        the current call is not re-triggered when the beats come back (plan W6
+        task 3: a kiosk crash finalises the partial file and returns to idle;
+        Sol W6 review 1, F2). The person can start it again by hand."""
+        return self.capture_failed()
+
+    @property
+    def remembered_key(self) -> Optional[str]:
+        """The call a restart must not take for a new automatic trigger: the
+        current call while a recording of it is wanted or it is suppressed."""
+        if self.call_key is None:
+            return None
+        if self.intent in (CALL, MANUAL_CALL) or self.suppressed_key == self.call_key:
+            return self.call_key
+        return None
+
+    def restore(self, key: Optional[str]) -> None:
+        """A restarted recorder: `key` (the remembered call) is the current
+        call and is suppressed, so its next call_up starts nothing while a
+        call with another key still records."""
+        if key is not None:
+            self.call_key = key
+            self.suppressed_key = key
 
 
 def indicator_fresh(beat_at: Optional[float], now: float) -> bool:
@@ -422,6 +457,25 @@ def state_document(machine: RecordingMachine, phase: str, *, started_at_ms: Opti
     }
 
 
+def parse_call_memory(text: Optional[str], boot_id: Optional[str]) -> Optional[str]:
+    """The remembered call key, when the memory was written in this boot.
+
+    Contract:
+      Inputs:  text: call-memory.json's contents or None; boot_id: this boot's
+               id or None (unreadable).
+      Outputs: the key (a non-empty string of at most 64 characters) when the
+               document is schemaVersion 1 and its bootId equals boot_id, else
+               None.
+    """
+    value = _small_json(text)
+    if not isinstance(value, dict) or value.get("schemaVersion") != SCHEMA_VERSION:
+        return None
+    if value.get("bootId") != boot_id:
+        return None
+    key = value.get("callKey")
+    return key if isinstance(key, str) and 0 < len(key) <= 64 else None
+
+
 def recording_name(now_s: float, taken) -> str:
     """meeting-<UTC second>.opus, with a -N suffix when that name is taken."""
     base = time.strftime("meeting-%Y%m%dT%H%M%SZ", time.gmtime(now_s))
@@ -450,14 +504,14 @@ def read_small(path: Path) -> Optional[str]:
         os.close(fd)
 
 
-def write_json_atomic(path: Path, document) -> bool:
-    """Replace `path` through a temporary in its directory, 0644."""
+def write_json_atomic(path: Path, document, mode: int = 0o644) -> bool:
+    """Replace `path` through a temporary in its directory, 0644 by default."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(document, sort_keys=True) + "\n")
-        os.chmod(temporary, 0o644)
+        os.chmod(temporary, mode)
         os.replace(temporary, str(path))
         return True
     except OSError as exc:
@@ -673,7 +727,8 @@ class Recorder:
                  request_file: Path = REQUEST_FILE, ack_file: Path = ACK_FILE,
                  call_file: Path = CALL_STATE_FILE, mode_file: Path = AUDIO_MODE_FILE,
                  mic_env: Path = MIC_SOURCE_ENV, mute_env: Path = INPUT_MUTE_ENV,
-                 headset_env: Path = HEADSET_ENV,
+                 headset_env: Path = HEADSET_ENV, memory_file: Path = CALL_MEMORY,
+                 boot_id_file: Path = BOOT_ID,
                  capture: Optional[Capture] = None, argv_for=capture_argv,
                  clock=time.monotonic, wall=time.time, alert_fn=alert):
         self.settings = settings
@@ -681,6 +736,9 @@ class Recorder:
         self.state_file, self.request_file, self.ack_file = state_file, request_file, ack_file
         self.call_file, self.mode_file, self.mic_env, self.mute_env = call_file, mode_file, mic_env, mute_env
         self.headset_env = headset_env
+        self.memory_file, self.boot_id_file = memory_file, boot_id_file
+        # What call-memory.json says now; written only when this changes.
+        self.memory_written: Optional[str] = None
         self.capture = capture or Capture()
         self.argv_for = argv_for
         self.clock, self.wall, self.alert = clock, wall, alert_fn
@@ -713,6 +771,29 @@ class Recorder:
             log("recovered %s from a previous run" % name)
         request = parse_request(read_small(self.request_file))
         self.last_request_id = request[0] if request else None
+        remembered = parse_call_memory(read_small(self.memory_file), self._boot_id())
+        if remembered is not None:
+            # The previous run was recording this call (or had it suppressed)
+            # when it stopped; its partial was finalised just above. Not again
+            # automatically (Sol W6 review 1, F2).
+            self.machine.restore(remembered)
+            self.memory_written = remembered
+            log("a recording of call %s ended with the previous run; that call is not "
+                "recorded again automatically" % remembered)
+
+    def _boot_id(self) -> Optional[str]:
+        text = read_small(self.boot_id_file)
+        value = text.strip() if text else ""
+        return value or None
+
+    def _remember(self) -> None:
+        """Keep call-memory.json in step with the machine's remembered call."""
+        key = self.machine.remembered_key
+        if key == self.memory_written:
+            return
+        if write_json_atomic(self.memory_file, {"schemaVersion": SCHEMA_VERSION, "callKey": key,
+                                                "bootId": self._boot_id()}, mode=0o600):
+            self.memory_written = key
 
     def _read_request(self) -> Optional[str]:
         request = parse_request(read_small(self.request_file))
@@ -827,6 +908,9 @@ class Recorder:
             else:
                 self._refuse("unavailable", now)
         self._read_ack(now)
+        # Remembered before the capture can start. The drive cannot change it:
+        # a lost indicator or a failed capture suppresses the same call.
+        self._remember()
         self._drive(now, available)
         if self.refusal is not None and not self.machine.wanted and now - self.refusal_at > REFUSAL_SHOW_S:
             self.refusal = None
@@ -853,6 +937,9 @@ class Recorder:
                 self.phase, self.waiting_since = PHASE_WAITING, now
                 if fresh:
                     self._restart_after_switch(now)
+                else:
+                    # The indicator went at the same moment: lost, not resumed.
+                    self._indicator_lost(now)
             elif code is not None:
                 bound = self.capture.ended_on_bound() if code == 0 else None
                 path = self.capture.path
@@ -869,10 +956,7 @@ class Recorder:
                     self._capture_failed(now, bound or "recorder-failed")
             elif not fresh:
                 self._stop_capture("the indicator is no longer confirmed")
-                self.machine.indicator_lost()
-                self._refuse("indicator-lost", now)
-                self.phase = PHASE_WAITING if self.machine.wanted else PHASE_OFF
-                self.waiting_since = now
+                self._indicator_lost(now)
             return
         if not self.machine.wanted:
             self.phase, self.waiting_since = PHASE_OFF, None
@@ -897,6 +981,13 @@ class Recorder:
         elif self.machine.intent == MANUAL and now - (self.waiting_since or now) > INDICATOR_START_TIMEOUT_S:
             log("the kiosk never confirmed the indicator; manual recording not started")
             self._capture_failed(now, "indicator-unavailable")
+
+    def _indicator_lost(self, now: float) -> None:
+        """The capture has been stopped and finalised: idle, the call (if any)
+        suppressed until it ends, and the refusal on the glass."""
+        self.machine.indicator_lost()
+        self._refuse("indicator-lost", now)
+        self.phase, self.waiting_since = PHASE_OFF, None
 
     def _restart_after_switch(self, now: float) -> None:
         room, refusal = spool_room(self.spool.used_bytes(), self._cap(), self._free(), self._floor())

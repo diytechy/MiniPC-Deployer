@@ -106,6 +106,7 @@ ALLOWED_SITE_FILES = {
     "js/pcm-source.js",
     "js/pin-keypad.js",
     "js/pin-policy.js",
+    "js/power-warning.js",
     "js/presentation-report.js",
     "js/presentation.js",
     "js/projectm-lifecycle.js",

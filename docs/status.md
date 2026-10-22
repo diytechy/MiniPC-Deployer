@@ -12,6 +12,20 @@ last) — it is the record, not required reading for every pass.
 
 ## Current State
 
+**2026-10-22 — SR-093/SR-094 (SN-049, OfficeWallNaglight WSN-098): the panel's power button asks before it
+shuts down. Branch `w5-power-button`, NOT merged, NOT deployed.**
+- `wall-power-button.service` runs `wall-power-button.py` inside `systemd-inhibit --what=handle-power-key
+  --mode=block`; one press publishes `armed` in `/run/wall-power-button/state.json` (IF-067) for the kiosk and
+  asks the new `wall-sleep.sh power-button-wake` arm to light a dark display; a second press within 5 s runs
+  `systemctl poweroff`; presses are de-duplicated across the two `Power Button` devices only. No kiosk
+  acknowledgement within 2 s raises a journal ALERT (hook point `/usr/local/lib/wall-panel/panel-alert` for the
+  W3a alert helper; absent today, so journal-only). firstboot step 8g, knob `WALL_POWER_BUTTON_GUARD`
+  (default true), checks the inhibitor in `systemd-inhibit --list`.
+- `scripts/assert_wall_capabilities.py` names the panel's new site file `js/power-warning.js`, so this branch
+  and OfficeWallNaglight `w5-power-warning` must merge together (TC-1232 compares the two).
+- Not proven: nothing ran on the panel; that logind honours a sessionless service's inhibitor, the warning on a
+  dark screen and a real press are the installed checks and the Owner's acceptance.
+
 **2026-10-19 — Correction (records only; nothing deployed by this entry).**
 - **Sure is live.** The 2026-10-18 entry below says "Sure is NOT started". That was true when written and is
   superseded: Sure went live on the hub later on 2026-10-18, started by HomeHub's run-sheet script

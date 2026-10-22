@@ -51,6 +51,7 @@ only the Contract cell's opening words; the CSV holds the contract.
 | **IF-036** | Consumes | NagLight | Implemented | v1 | — | v1 tracker-definitions guard producer (stack/tracker/tracker-defs-guard.sh; the timer runs --report). … |
 | **IF-037** | Consumes | NagLight | Draft | v1 | — | v1 Finance-Auditor colour lane. Producer is the finance-auditor service in stack/docker-compose.yml, whose … |
 | **IF-038** | Provides | HomeHub | Draft | v1 | SR-076, SR-077, SR-078 | v1 AI CLI provisioning contract (stack/ai-cli). (1) Manifest stack/ai-cli/ai-clis.manifest.tsv … |
+| **IF-067** | Provides | OfficeWallNaglight | Implemented | v1 | SR-093, SR-094 | v1 power-button warning state (WSN-098). Producer: wall-power-button.service (root). … |
 <!-- END GENERATED IF INDEX -->
 
 ## Notes on selected interfaces (hand-written)

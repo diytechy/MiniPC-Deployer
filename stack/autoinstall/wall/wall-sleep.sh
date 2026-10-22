@@ -901,8 +901,48 @@ case "${1:-}" in
             exit "$panel_display_off_status"
         fi
         ;;
+    power-button-wake)
+        # WSN-098 (SR-094, LLR-1185). wall-power-button.service counted a first
+        # press of the power button and is about to show the full-screen "press
+        # again within 5 s" warning, which must be readable on a dark panel.
+        # Root counted the press from a kernel input node, so like touch-wake
+        # this is witnessed evidence, not a peer's claim, and it is the same
+        # serialized restore: same lock, same stamp, same read-back.
+        #
+        # TWO DIFFERENCES FROM touch-wake, both deliberate:
+        #  * A LIT PANEL IS LEFT EXACTLY AS IT IS. The daemon calls this on
+        #    every first press, lit or dark, and `backlight_set on` on a lit
+        #    panel would write the remembered level over whatever the panel is
+        #    showing now. The stamp is still written, so a display-off that
+        #    was already queued behind the lock declines rather than blanking
+        #    the warning (wake_is_recent).
+        #  * The absence clock is cleared only when the screen was dark, like
+        #    the other wake arms; pressing a button is not a presence claim
+        #    beyond that.
+        if ! power_lock_acquire "the power-button wake"; then
+            log "power-button wake DECLINED: a power decision is in flight; the warning"
+            log "is shown on whatever the display is doing, and a second press still counts."
+            exit 75
+        fi
+        mark_wake
+        if backlight_lit; then
+            log "power button pressed on a lit panel — display left as it is"
+            power_lock_release
+            exit 0
+        fi
+        log "power button pressed on the dark panel — restoring the backlight for the shutdown warning"
+        rm -f "$ABSENT_SINCE_FILE" 2>/dev/null || true
+        backlight_set on
+        power_button_wake_status=$?
+        power_lock_release
+        if [ "$power_button_wake_status" -ne 0 ]; then
+            log "power-button wake FAILED: the backlight did not come on (backlight_set exited"
+            log "$power_button_wake_status). The warning is not readable; a second press still shuts down."
+            exit "$power_button_wake_status"
+        fi
+        ;;
     *)
-        echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake|panel-display-off" >&2
+        echo "usage: $0 start|end|occupancy|sensor-wake|touch-wake|panel-display-off|power-button-wake" >&2
         exit 2
         ;;
 esac

@@ -1107,12 +1107,43 @@ def test_tc1461_no_file_or_no_tree_fires_after_the_threshold_from_first_sight_ll
     # wall clock, kept in the state file: a reboot does not restart the count
     st = json.loads(json.dumps(st))
     assert _judge_door(row, st, T0 + 2000)[0] is True
-    # a clock that went back past the stamp restarts it rather than wedging it
-    bad, st2, _ = _judge_door(row, st, T0 - 5000)
+    # a clock that went back past the stamp restarts the count (of an incident not yet firing)
+    bad, st2, _ = _judge_door(row, {"empty_since": T0}, T0 - 5000)
     assert bad is False and st2["empty_since"] == T0 - 5000
+    assert _judge_door(row, st, T0 - 5000)[0] is True, "a firing incident is not cleared by a clock jump"
     _seg(tmp_path / "door" / "2026-10-22" / "door-20261022T000000Z.ts.part", T0 + 1990)
     bad, st, _ = _judge_door(row, st, T0 + 2000)
-    assert bad is False and "empty_since" not in st
+    assert bad is False and "empty_since" not in st and st["firing"] is False
+
+
+def test_tc1461_stale_segments_deleted_while_firing_send_no_false_clear_llr1290(tmp_path, monkeypatch):
+    """main(): stale alert delivered -> the stale files are deleted -> still empty -> a fresh
+    segment: exactly one fire and one clear, the clear only when recording resumes."""
+    sent = []
+    monkeypatch.setattr(watch.mc, "send_alert", lambda key, prio, title, *a, **k: sent.append(key)
+                        or mc.ALERT_DELIVERED)  # fmt: skip
+    clock = {"t": T0}
+    monkeypatch.setattr(watch.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(watch.time, "time", lambda: clock["t"])
+    monkeypatch.setenv("HOMEHUB_MONITOR_OVERRIDE_FILE", str(tmp_path / "no-override"))
+    row = [line for line in TABLE.splitlines() if line.startswith("door-segments ")]
+    door = (tmp_path / "door").as_posix()
+    table = _w(tmp_path / "watch.table", "\n".join(row).replace("/srv/scratch/door", door) + "\n")
+    _w(tmp_path / "env", "DOOR_RECORDER_ENABLED=true\n")
+    _w(tmp_path / "proc/sys/kernel/random/boot_id", "b1\n")
+    args = ["--table", str(table), "--state-dir", str(tmp_path / "st"), "--env-file", str(tmp_path / "env"),
+            "--proc-root", str(tmp_path / "proc")]  # fmt: skip
+    day = tmp_path / "door" / "2026-10-22"
+    stale = _seg(day / "door-20261022T200000Z.ts", T0 - 3600)
+    assert watch.main(args) == 0 and sent == ["watch-door-segments"]
+    stale.unlink()  # the operator frees space; the recorder is still stopped
+    for step in (300, 600, 900, 1200):
+        clock["t"] = T0 + step
+        assert watch.main(args) == 0
+    assert sent == ["watch-door-segments"], "no 'being written again' while nothing is written"
+    _seg(day / "door-20261022T232000Z.ts.part", T0 + 1490)
+    clock["t"] = T0 + 1500
+    assert watch.main(args) == 0 and sent == ["watch-door-segments", "watch-door-segments.clear"]
 
 
 def _can_symlink(tmp_path):

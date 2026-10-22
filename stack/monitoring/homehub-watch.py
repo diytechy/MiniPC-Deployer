@@ -427,17 +427,22 @@ def judge_newest_file(row: dict, st: dict, found: dict, now: float) -> Tuple[boo
     limit = row["threshold_s"]
     problem = ("; " + found["problem"]) if found.get("problem") else ""
     if found.get("limit"):
+        st["firing"] = True
         return True, st, "%s: %s - not judged from part of the tree" % (row["target"], found["limit"])
     newest = found.get("newest")
     if newest is not None:
         st.pop("empty_since", None)
-        return (now - newest[0] >= limit, st, "newest %s written %ds ago (%d matching)%s"
+        st["firing"] = now - newest[0] >= limit
+        return (st["firing"], st, "newest %s written %ds ago (%d matching)%s"
                 % (newest[1], int(now - newest[0]), found.get("files", 0), problem))  # fmt: skip
     since = st.get("empty_since")
     if not isinstance(since, (int, float)) or since > now + 60:  # unset, or the clock went back past it
         since = now
     st["empty_since"] = since
-    return (now - since >= limit, st,
+    # A firing incident whose stale files were deleted is still an incident:
+    # only a fresh matching file clears it (Sol W3b review 2).
+    st["firing"] = bool(st.get("firing")) or now - since >= limit
+    return (st["firing"], st,
             "no file matches %s (seen empty for %ds)%s" % (row["target"], int(now - since), problem))  # fmt: skip
 
 

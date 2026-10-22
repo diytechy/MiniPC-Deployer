@@ -47,7 +47,12 @@
 #     RUNNING: the credential is in no process's /proc/<pid>/cmdline or
 #     /proc/<pid>/environ on this host, no consumer's argv holds an rtsp://
 #     URL, and `docker inspect` (Config.Env, Cmd, Args, Path) of each holds
-#     neither; each one was seen reading its input from pipe:0.
+#     neither; each one was seen reading its input from pipe:0;
+#  12 the real probe, gate and cost CLI, sent SIGTERM or SIGHUP once its
+#     consumers are running against the relay (an operator's `timeout`, a
+#     dropped ssh session), removes every consumer container it started and
+#     says so (review round 4: they used to die without unwinding and leave
+#     the container holding its relay session under its fixed name).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DOOR="$(cd "$HERE/.." && pwd)"
@@ -295,6 +300,31 @@ import json,sys; d=json.load(sys.stdin)
 ok = all("cpu_pct_one_core" in d[k] for k in ("door-lab-relay", "homehub-door-costprobe")) and d["decoder_still_running"]
 sys.exit(0 if ok else 1)  # PSI is reported when the kernel has it' \
     && ok "9 cost: per-cgroup CPU for the relay and the grey decoder, PSI sampled: $c" || bad "9 cost: $c"
+
+# 12 a signalled probe, gate or cost run removes its consumers. `wait` gives
+# 128+N both for a process the signal killed and for one that exited 128+N, so
+# the verdict is the artifact: no container left, and the verb's own
+# "stopped by signal" line (a process killed outright prints nothing).
+signal_run() {  # LABEL SIGNAL WANT_RC WAIT_FOR "NAMES" VERB ARGS...
+    local label="$1" sig="$2" want="$3" waitc="$4" names="$5" out pid rc seen="" left=""
+    shift 5; out="$WORK/sig-$label.log"
+    python3 "$DOOR/door_relay.py" --env-file "$WORK/env" "$@" >"$out" 2>&1 & pid=$!
+    for _ in $(seq 1 600); do
+        [ "$(docker inspect -f '{{.State.Running}}' "$waitc" 2>/dev/null)" = true ] && { seen=1; break; }
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    sleep 2
+    kill -"$sig" "$pid" 2>/dev/null
+    wait "$pid"; rc=$?
+    for n in $names; do docker inspect "$n" >/dev/null 2>&1 && left="$left $n"; done
+    if [ -n "$seen" ] && [ "$rc" = "$want" ] && [ -z "$left" ] && grep -q "stopped by signal" "$out"; then
+        ok "12$label $1 SIG$sig with $waitc running: exit $rc, '$(grep -o 'stopped by signal.*' "$out")', none of [$names] left"
+    else bad "12$label $1 SIG$sig seen=${seen:-no} rc=$rc (want $want) left:${left:- none}: $(tail -2 "$out" | tr '\n' ' ')"; fi
+}
+signal_run a TERM 143 homehub-door-probe homehub-door-probe probe --seconds 60
+signal_run b HUP 129 homehub-door-gate-3 "homehub-door-gate-1 homehub-door-gate-2 homehub-door-gate-3" gate --seconds 8
+signal_run c TERM 143 homehub-door-costprobe homehub-door-costprobe cost --seconds 60 --decode-grey-fps 5
 
 # 11 the verdict of the sampling started before check 3
 rm -f "$WORK/watch.on"; wait "$WATCH_PID" 2>/dev/null

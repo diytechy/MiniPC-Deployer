@@ -57,7 +57,13 @@
 #     (cost's final `docker rm -f`, held 3 s by a PATH shim in front of the
 #     real docker) lets that removal finish before the verb stops (review
 #     round 5: the signal used to abandon it while the stop line still
-#     claimed the consumers were removed).
+#     claimed the consumers were removed);
+#  12e ...and a signal sent to the verb's whole PROCESS GROUP during that
+#     removal - real GNU `timeout` passing SIGTERM on (12e), and a group
+#     SIGINT, which is Ctrl-C at an ssh/sudo terminal (12f) - cannot kill the
+#     `docker rm` (it runs in its own session), so the removal finishes and
+#     is confirmed (review round 6: the rm died with the group, rc -15 and an
+#     empty stderr, and that counted as removed).
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DOOR="$(cd "$HERE/.." && pwd)"
@@ -369,6 +375,44 @@ else
     bad "12d rc=$rc rm-log: $(tr '\n' ';' <"$WORK/slow-rm.log") left: $(docker inspect -f '{{.State.Running}}' homehub-door-costprobe 2>&1 | head -1) out: $(tail -2 "$out" | tr '\n' ' ')"
 fi
 docker rm -f homehub-door-costprobe >/dev/null 2>&1
+
+# 12e/12f the signal reaches the verb's whole process group while the final
+# removal is under way. 12e: real GNU `timeout` (no --foreground) is sent
+# SIGTERM and passes it to its child AND its process group, as it does on
+# expiry. 12f: the verb leads its own group and the group gets SIGINT, as a
+# terminal's Ctrl-C does (Python's own SIGINT handler is restored first: a
+# background job inherits SIGINT ignored). The slow-rm shim is the same.
+group_run() {  # LABEL SIG WANT_RC SIGNUM
+    local label="$1" sig="$2" want="$3" signum="$4" out pid rc
+    out="$WORK/sig-$label.log"; : >"$WORK/slow-rm.log"
+    if [ "$label" = e ]; then
+        PATH="$SHIM:$PATH" timeout 600 python3 "$DOOR/door_relay.py" --env-file "$WORK/env" \
+            cost --seconds 3 --decode-grey-fps 5 >"$out" 2>&1 & pid=$!
+    else
+        PATH="$SHIM:$PATH" python3 -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+            python3 "$DOOR/door_relay.py" --env-file "$WORK/env" cost --seconds 3 --decode-grey-fps 5 \
+            >"$out" 2>&1 & pid=$!
+    fi
+    for _ in $(seq 1 600); do
+        grep -q '^start rm' "$WORK/slow-rm.log" && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    sleep 0.5
+    if [ "$label" = e ]; then kill -"$sig" "$pid" 2>/dev/null; else kill -"$sig" -- "-$pid" 2>/dev/null; fi
+    wait "$pid"; rc=$?
+    if grep -q '^start rm' "$WORK/slow-rm.log" && grep -qx 'finish rm -f homehub-door-costprobe rc=0' "$WORK/slow-rm.log" \
+       && [ "$rc" = "$want" ] && ! docker inspect homehub-door-costprobe >/dev/null 2>&1 \
+       && grep -q "stopped by signal $signum; its consumers were removed (homehub-door-costprobe)" "$out"; then
+        ok "12$label group SIG$sig during cost's final removal: the removal finished ($(tr '\n' ';' <"$WORK/slow-rm.log")), exit $rc, no costprobe left, '$(grep -o 'stopped by signal.*' "$out")'"
+    else
+        bad "12$label group SIG$sig rc=$rc (want $want) rm-log: $(tr '\n' ';' <"$WORK/slow-rm.log") left: $(docker inspect -f '{{.State.Running}}' homehub-door-costprobe 2>&1 | head -1) out: $(tail -2 "$out" | tr '\n' ' ')"
+    fi
+    docker rm -f homehub-door-costprobe >/dev/null 2>&1
+}
+group_run e TERM 143 15
+group_run f INT 130 2
 
 # 11 the verdict of the sampling started before check 3
 rm -f "$WORK/watch.on"; wait "$WATCH_PID" 2>/dev/null

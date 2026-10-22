@@ -204,19 +204,12 @@ The honest ledger of what has and has not been exercised is
 
 ### Sure beside Actual and the nightly logical ledger dump (SR-060, SR-065, LLR-1040, LLR-1045)
 
-<<<<<<< HEAD
 Sure is on by default per Owner direction 2026-10-09, switched by
 `SURE_ENABLED` and started by `homehub-sure.service` (the next flow), never by
 naming its profile in `COMPOSE_PROFILES`. Database/cache have only the
-internal network; Rails retains provider egress. FA still chooses Actual.
-Backup-source generation includes Sure only when SURE_ENABLED is true; logical
-=======
-The `sure` profile is selected by default per Owner direction 2026-10-09;
-removing it opts out. Database/cache have only the
 internal network; Rails retains provider egress. FA's template default is
 Actual; the hub's config selects Sure (cutover 2026-10-22, SR-099).
-Backup-source generation includes Sure only with the selected profile; logical
->>>>>>> w12-auditor-depends-on-sure
+Backup-source generation includes Sure only when SURE_ENABLED is true; logical
 dump tooling remains inside the matching database image. No gate or deployment
 is implied by this authored flow.
 
@@ -264,7 +257,6 @@ sequenceDiagram
     Note over Backup,Drive: NEVER-OFFSITE; structural checks are not a restore
 ```
 
-<<<<<<< HEAD
 ### Sure at boot: its own unit, never the bulk `up` (SR-100, LLR-1210, LLR-1211)
 
 What blocks on what is the point of this flow: firstboot's bulk `up -d` names
@@ -312,7 +304,7 @@ sequenceDiagram
         FB->>FB: log only: no Sure container is touched
     end
     Note over Unit,DC: restart: unless-stopped stays, so a crash or a docker restart recovers without the unit
-=======
+
 ### What Finance-Auditor waits for at start (SR-099, LLR-1204)
 
 Compose cannot key a dependency on `DATA_SOURCE`, so both ledgers are optional
@@ -369,7 +361,6 @@ sequenceDiagram
             FA-->>FA: exit nonzero; restart policy retries
         end
     end
->>>>>>> w12-auditor-depends-on-sure
 ```
 
 Hand-authored sequence diagrams of the behaviour that is easiest to misread

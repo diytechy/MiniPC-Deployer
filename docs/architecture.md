@@ -504,7 +504,7 @@ rows, and both are the acceptance criteria.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant T as systemd timer (10 min)
+    participant T as systemd timer (1 min; per-source schedule below)
     participant F as ai_usage_feeder (SR-021)
     participant X as codex app-server
     participant A as api.anthropic.com
@@ -534,6 +534,48 @@ sequenceDiagram
     Note over F: each gauge is built and posted in its own try -<br/>one refusable body must not end the cycle
     F->>S: write ONLY the sources that succeeded
     Note over S: open_for_write resolves symlinks, requires the path to sit<br/>inside StateDirectory=, and opens O_EXCL|O_NOFOLLOW -<br/>so no credential file can be written or truncated
+```
+
+### Which sources a minute's cycle reads, and how a vendor slows one down (SR-095, SR-096, LLR-1190, LLR-1191, LLR-1192, LLR-1193)
+
+The timer fires every minute, but a cycle is not a read of every source: each
+source's schedule rides in the state file, because the unit is a one-shot and
+nothing in memory survives. The behaviour worth reading here is what a skip
+does NOT do (read, post, or touch the schedule) and where a vendor's
+Retry-After lands.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as systemd timer (1 min, +0..10 s)
+    participant F as ai_usage_feeder run_cycle (SR-095, LLR-1190)
+    participant S as state file __schedule__
+    participant V as vendor (one source)
+    participant N as NagLight /api/feed
+
+    T->>F: start (oneshot)
+    F->>S: load_state: schedule validated at the door
+    Note over S: an entry stamped in the FUTURE is a clock that<br/>stepped back - dropped, so the source is due now
+    alt schedule_wait > 0 (not due, or backing off)
+        F->>F: INFO "<source>: skipped - ..."
+        Note over F,N: no read, NO POST (NagLight keeps the last body,<br/>true reading at its true observed_at), entry unchanged
+    else due
+        F->>V: read (rate-limit headers -> the cycle's sink)
+        alt 200
+            V-->>F: reading
+            F->>N: gauges, observed_at = now
+            F->>S: next_due = now + interval; backoff and auth history cleared
+        else 429 / 5xx (Throttled)
+            V-->>F: Retry-After? + rate-limit headers
+            F->>N: last reading at its ORIGINAL observed_at
+            F->>S: next_due = Retry-After (hold, to the second)<br/>or interval x 2^level (to 10 min); backoff + 1
+        else 401 / token_expired (AuthFailure)
+            F->>S: auth_since kept, auth_attempts + 1
+            Note over F: CONFIRMED only at >= 2 attempts spanning >= 600 s:<br/>then markers replace the stored readings
+            F->>N: last reading, or the stale-on-arrival body once confirmed
+        end
+    end
+    F->>S: save_state (the one writable path)
 ```
 
 ### One weight cycle: where the goal comes from, and the two different refusals (SR-022, LLR-006, IF-014)

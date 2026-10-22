@@ -156,11 +156,12 @@ panel; that repo owns the app):
   `window` is. **`observed_at` is when the value was TRUE**, which is how
   "unavailable" is said without inventing a number: a source that fails reposts
   its last real reading at its *original* stamp and goes stale on NagLight's
-  horizon — except a source whose login is confirmed dead over two consecutive
-  cycles (SR-068), which posts the stale-on-arrival body for every one of its ids
+  horizon — except a source whose login is confirmed dead by failed attempts
+  spanning ten minutes (SR-068), which posts the stale-on-arrival body for every one of its ids
   and keeps doing so — and one that has never succeeded posts a gauge with no `observed_at`
-  at all, stale on arrival. The timer runs every 10 minutes because most of the
-  gauges are `weekly`, whose horizon is 24 h. **Not provided:** OpenCode's
+  at all, stale on arrival. The timer runs every minute and each source is read on
+  its own interval, 60 s by default (Codex 120 s), backing off on 429/5xx
+  (SR-095); a source that is skipped is not posted, so NagLight keeps its last body. **Not provided:** OpenCode's
   `rolling` bucket, which publishes no window length — a window this repo would
   have had to invent. **Not proven:** the Gemini response shapes against a live
   call (the parser is written from the CLI's source). Details in

@@ -7,27 +7,34 @@ Documentation=file:///opt/homehub/stack/ai-usage/README.md
 # homehub-claude-refresh@claude2.timer runs homehub-claude-refresh@claude2.service
 # and no `Unit=` line is needed.
 #
-# FOUR HOURS, AGAINST AN EIGHT-HOUR TOKEN. The access token's life is 8 h
-# (`expiresAt`, measured 2026-09-12 and again after a real refresh: 8.00 h
-# exactly), so every renewal has to land inside that window or the gauges go
-# "unavailable" until a human types `claude`. Four hours is one missed run of
-# margin: the box can sleep through a cycle, or a vendor can be briefly
-# unreachable, and the token is still live when the next one fires.
+# CHECK EVERY FOUR MINUTES, RENEW NEAR EXPIRY (W11, 2026-10-22). The access
+# token's life is 8 h (`expiresAt`, measured 2026-09-12 and again after a real
+# refresh: 8.00 h exactly), and the CLI renews it only when a run lands near that
+# expiry. This used to run every 4 h on the belief that any run renews; the
+# feeder's journal disproved it -- 14 Claude 401s between 2026-10-12 and 10-21,
+# each 237-242 min after the previous run and each cleared by the next, so the
+# token lapsed for minutes at a time, about twice a day (once for at least 11
+# min: two consecutive 401 samples on 10-12). Now the timer only CHECKS: the
+# service's ExecCondition (claude_refresh_due.py) runs the CLI once the token has
+# under 20 minutes left, which is five checks of margin before it lapses.
+#
+# The feeder's 10-minute authentication confirmation (AUTH_CONFIRM_SECONDS) is
+# what absorbs a renewal that still lands a little late; this interval plus its
+# delay must stay well under it, and tests/test_ai_usage_feeder.py asserts so.
 #
 # It is NOT cheaper to run this rarely. The call costs nothing -- `/usage` is a
 # slash command handled by the CLI, and neither the request count nor the
-# utilisation percentage moved across repeated runs on the Owner's own account.
-# The only cost of a shorter interval is a process start, and the only cost of
-# a longer one is the gauge going dark overnight.
+# utilisation percentage moved across repeated runs on the Owner's own account --
+# and a check that does not run the CLI costs one python start.
 OnBootSec=3min
-OnUnitActiveSec=4h
+OnUnitActiveSec=4min
 # Persistent, unlike the feeder's timer: a missed feeder run is one stale
 # reading, but a missed refresh is an expired credential that nothing on this
 # box can recover without the Owner. If the hub was asleep across a scheduled
 # renewal, run it on resume rather than waiting for the next slot.
 Persistent=true
-RandomizedDelaySec=300
-AccuracySec=1min
+RandomizedDelaySec=30s
+AccuracySec=10s
 
 [Install]
 WantedBy=timers.target

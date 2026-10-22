@@ -1,24 +1,32 @@
 [Unit]
-Description=Run the HomeHub AI-usage feeder (SR-021)
+Description=Run the HomeHub AI-usage feeder (SR-021, SR-095)
 Documentation=file:///opt/homehub/stack/ai-usage/README.md
 
 [Timer]
-# THE CADENCE IS SET BY NAGLIGHT'S STALENESS HORIZON, NOT BY TASTE. A gauge
-# whose window kind is "weekly" goes stale 24h after `observed_at`, and the
-# codex and Claude weekly gauges are exactly that. A daily feeder would sit
-# permanently one missed run away from the whole panel reading "unavailable",
-# so the interval is a small fraction of the tightest horizon: 10 minutes is
-# 1/144th of it, which means the panel survives a long outage of any single
-# source and still tells the truth about it within the day.
+# EVERY MINUTE (Owner 2026-10-22: "update the AI usage gauges every minute;
+# they currently fall behind"). Measured before the change: the timer ran every
+# 10 min plus up to 90 s, and the gauge the wall showed was ~11 min old at the
+# 95th percentile; the panel's own refresh added at most its 60 s poll.
 #
-# tests/test_ai_usage_feeder.py reads THIS LINE and fails if the interval is
-# ever loosened past a quarter of the weekly horizon, so the relationship is
-# enforced rather than remembered.
+# A CYCLE IS NOT A READ OF EVERY SOURCE. Each source carries its own interval
+# and backoff in the state file (ai_usage_feeder.py SCHEDULE_KEY): the HTTP
+# sources default to 60 s, Codex to 120 s (its app-server costs ~1.5 s of CPU
+# per read), and a source a vendor has throttled is skipped until it is due.
+# This timer is only the heartbeat that gives each schedule a chance to run.
+#
+# THE STALENESS HORIZONS STILL BOUND IT. A weekly gauge goes stale 24 h after
+# its `observed_at`, and tests/test_ai_usage_feeder.py reads THESE lines and
+# fails if the interval is ever loosened past a quarter of that horizon, if the
+# randomised delay or the accuracy grow past what the 3-minute freshness target
+# leaves room for (README "Cadence"), or if the feeder's DUE_SLACK_SECONDS stops
+# covering their jitter.
 OnBootSec=5min
-OnUnitActiveSec=10min
-# Do not stampede three vendor APIs from every box at the same second.
-RandomizedDelaySec=90
-AccuracySec=1min
+OnUnitActiveSec=1min
+# A little spread, so the hub does not hit four vendor APIs on the same second
+# as every other box running this; small, because the delay is added to every
+# gauge's age.
+RandomizedDelaySec=10s
+AccuracySec=5s
 Persistent=false
 
 [Install]

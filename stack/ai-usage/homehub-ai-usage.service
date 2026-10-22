@@ -6,7 +6,9 @@
 #
 # ONESHOT, DRIVEN BY A TIMER. There is nothing to keep alive between reads,
 # and a long-lived process holding three vendor sessions open is a bigger
-# surface than a process that exists for two seconds every ten minutes.
+# surface than a process that exists for a few seconds every minute. Which
+# sources a cycle reads is decided by each source's own schedule in the state
+# file (SR-095), so nothing needs to survive in memory.
 Description=HomeHub AI-usage feeder (SR-021, posts usage gauges to NagLight)
 Documentation=file:///opt/homehub/stack/ai-usage/README.md
 After=network-online.target homehub-firstboot.service

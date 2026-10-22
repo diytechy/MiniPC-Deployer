@@ -1169,7 +1169,10 @@ def test_run_cycle_catches_authfailure_before_sourcefailure_sr068():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TC-1125 — the two-cycle count lives in the state file (LLR-1054)
+# TC-1125 — the authentication history lives in the state file (LLR-1054).
+# REVISED 2026-10-22 (W11): "two consecutive cycles" became "at least two failed
+# ATTEMPTS spanning at least AUTH_CONFIRM_SECONDS", because the timer now runs
+# every minute. Every test that pinned the old rule is rewritten here.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def auth_dead(e):
@@ -1184,92 +1187,170 @@ def good_codex(e):
     return feeder.parse_codex(CODEX_RESULT, e["_now"])
 
 
+def codex_env(tmp_path, **extra):
+    """Codex read every minute, so a test can step one cycle per 60 s. Its
+    shipped default is 120 s (SR-095); the cadence tests cover that."""
+    extra.setdefault("AI_USAGE_SOURCES", "codex")
+    extra.setdefault("AI_USAGE_CODEX_INTERVAL", "60")
+    return base_env(tmp_path, **extra)
+
+
+def schedule_of(env, source):
+    return saved_state(env)[feeder.SCHEDULE_KEY][source]
+
+
+def fail_until_confirmed(env, readers, start):
+    """Failed attempts every 60 s from `start` until the span reaches the
+    confirmation threshold. Returns (rec, failures, time of the last attempt)."""
+    t = start
+    while True:
+        rec, _p, failures = cycle(env, readers, t)
+        if t - start >= feeder.AUTH_CONFIRM_SECONDS:
+            return rec, failures, t
+        t += 60
+
+
 def test_one_auth_failure_still_reposts_the_last_reading_sr068(tmp_path):
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
     rec, _p, failures = cycle(env, {"codex": auth_dead}, NOW + 60)
     assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW), "not confirmed yet"
     assert rec.bodies[0]["value"] == 66.0
-    assert saved_state(env)[feeder.AUTH_COUNTS_KEY] == {"codex": 1}
-    assert any("authentication failure 1 of 2" in line for line in failures)
+    entry = schedule_of(env, "codex")
+    assert (entry["auth_since"], entry["auth_attempts"]) == (NOW + 60, 1)
+    assert any("authentication failure, attempt 1 over 0s - last reading kept" in line
+               for line in failures)
 
 
-def test_two_consecutive_auth_failures_post_no_observed_at_and_mark_the_entry_sr068(tmp_path):
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+def test_attempts_inside_ten_minutes_never_grey_however_many_there_are_sr068(tmp_path):
+    """The rule the minute timer forced: two failed reads two minutes apart are
+    a blip, not a dead login (the old two-cycle rule would grey here)."""
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
-    cycle(env, {"codex": auth_dead}, NOW + 60)
-    rec, _p, failures = cycle(env, {"codex": auth_dead}, NOW + 120)
-    assert stale_on_arrival(rec.bodies[0]) and not feeder.is_fresh(rec.bodies[0], NOW + 120)
+    for step in range(60, feeder.AUTH_CONFIRM_SECONDS + 1, 60):      # ten attempts, 540 s
+        rec, _p, failures = cycle(env, {"codex": auth_dead}, NOW + step)
+        assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW), step
+    assert schedule_of(env, "codex")["auth_attempts"] == 10
+    assert not any("CONFIRMED" in line for line in failures)
+
+
+def test_failed_attempts_spanning_ten_minutes_post_no_observed_at_and_mark_the_entry_sr068(tmp_path):
+    env = codex_env(tmp_path)
+    cycle(env, {"codex": good_codex}, NOW)
+    rec, failures, last = fail_until_confirmed(env, {"codex": auth_dead}, NOW + 60)
+    assert last - (NOW + 60) == feeder.AUTH_CONFIRM_SECONDS
+    assert stale_on_arrival(rec.bodies[0]) and not feeder.is_fresh(rec.bodies[0], last)
     state = saved_state(env)
-    assert state["ai-usage-codex"] == {"auth_failed": True, "at": NOW + 120}, \
+    assert state["ai-usage-codex"] == {"auth_failed": True, "at": last}, \
         "marked, and the KEY is kept"
-    assert state[feeder.AUTH_COUNTS_KEY] == {"codex": 2}
     assert any("CONFIRMED" in line for line in failures)
 
 
-def test_the_count_survives_a_restart_sr068(tmp_path):
-    """Save, load_state in a fresh process-equivalent, increment, reach 2."""
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+def test_two_attempts_ten_minutes_apart_are_enough_sr068(tmp_path):
+    """At least two attempts AND at least the span: a source read every 10 min
+    confirms on its second failed read, exactly as the old 10-minute timer did."""
+    env = codex_env(tmp_path, AI_USAGE_CODEX_INTERVAL="600")
+    cycle(env, {"codex": good_codex}, NOW)
+    rec, _p, _f = cycle(env, {"codex": auth_dead}, NOW + 600)
+    assert not stale_on_arrival(rec.bodies[0])
+    rec, _p, failures = cycle(env, {"codex": auth_dead}, NOW + 1200)
+    assert stale_on_arrival(rec.bodies[0])
+    assert any("attempt 2 over 600s - CONFIRMED" in line for line in failures)
+
+
+def test_the_history_survives_a_restart_sr068(tmp_path):
+    """Save, load_state in a fresh process-equivalent, keep counting, confirm."""
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
     cycle(env, {"codex": auth_dead}, NOW + 60)
     reloaded = feeder.load_state(env["AI_USAGE_STATE_FILE"], NOW + 90)
-    assert reloaded[feeder.AUTH_COUNTS_KEY] == {"codex": 1}
-    rec, _p, _f = cycle(env, {"codex": auth_dead}, NOW + 120)
+    assert reloaded[feeder.SCHEDULE_KEY]["codex"]["auth_attempts"] == 1
+    rec, _f, last = fail_until_confirmed(env, {"codex": auth_dead}, NOW + 120)
     assert stale_on_arrival(rec.bodies[0])
-    assert feeder.load_state(env["AI_USAGE_STATE_FILE"], NOW + 150)[feeder.AUTH_COUNTS_KEY] == {"codex": 2}
+    assert feeder.load_state(env["AI_USAGE_STATE_FILE"], last + 30)[
+        feeder.SCHEDULE_KEY]["codex"]["auth_since"] == NOW + 60, "the run began at the FIRST failure"
 
 
-def test_a_success_resets_the_count_sr068(tmp_path):
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+def test_a_success_resets_the_history_sr068(tmp_path):
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
-    cycle(env, {"codex": auth_dead}, NOW + 60)
-    cycle(env, {"codex": good_codex}, NOW + 120)
-    assert feeder.AUTH_COUNTS_KEY not in saved_state(env)
-    rec, _p, _f = cycle(env, {"codex": auth_dead}, NOW + 180)
-    assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW + 120), \
-        "auth, success, auth is ONE failure, not two"
+    for step in range(60, 600, 60):
+        cycle(env, {"codex": auth_dead}, NOW + step)
+    cycle(env, {"codex": good_codex}, NOW + 600)
+    assert "auth_since" not in schedule_of(env, "codex")
+    rec, _p, _f = cycle(env, {"codex": auth_dead}, NOW + 660)
+    assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW + 600), \
+        "auth, success, auth starts a NEW run: one attempt, not ten"
+    assert schedule_of(env, "codex")["auth_attempts"] == 1
 
 
-def test_a_non_auth_failure_between_two_auth_failures_resets_the_count_sr068(tmp_path):
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+def test_a_non_auth_failure_between_auth_failures_neither_resets_nor_counts_sr068(tmp_path):
+    """REVISED (W11). A network blip says nothing about the login, so it is
+    evidence neither way: the run keeps its start and its count. (The old
+    two-cycle rule reset here, which let a flaky link hold a dead login green.)"""
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
     cycle(env, {"codex": auth_dead}, NOW + 60)
     cycle(env, {"codex": blip}, NOW + 120)
-    assert feeder.AUTH_COUNTS_KEY not in saved_state(env)
-    rec, _p, _f = cycle(env, {"codex": auth_dead}, NOW + 180)
-    assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW), "count restarted at one"
+    entry = schedule_of(env, "codex")
+    assert (entry["auth_since"], entry["auth_attempts"]) == (NOW + 60, 1)
+    rec, _p, failures = cycle(env, {"codex": auth_dead}, NOW + 60 + feeder.AUTH_CONFIRM_SECONDS)
+    assert stale_on_arrival(rec.bodies[0]), "attempts at +60 and +660: confirmed"
+    assert schedule_of(env, "codex")["auth_attempts"] == 2
 
 
-def test_the_count_is_per_source_not_global_sr068(tmp_path):
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex,opencode")
+def test_the_history_is_per_source_not_global_sr068(tmp_path):
+    env = codex_env(tmp_path, AI_USAGE_SOURCES="codex,opencode")
     ok_open = {"opencode": lambda e: feeder.parse_opencode(OPENCODE_BODY, e["_now"])}
     cycle(env, {"codex": good_codex, **ok_open}, NOW)
-    cycle(env, {"codex": auth_dead, **ok_open}, NOW + 60)
-    rec, _p, _f = cycle(env, {"codex": auth_dead, **ok_open}, NOW + 120)
+    rec, _f, _last = fail_until_confirmed(env, {"codex": auth_dead, **ok_open}, NOW + 60)
     by_id = rec.by_id()
     assert stale_on_arrival(by_id["ai-usage-codex"])
     assert not stale_on_arrival(by_id["ai-usage-opencode-weekly"]), "opencode is healthy"
-    assert saved_state(env)[feeder.AUTH_COUNTS_KEY] == {"codex": 2}
+    assert "auth_since" not in schedule_of(env, "opencode")
 
 
-def test_a_source_that_is_switched_off_forgets_its_count_sr068(tmp_path):
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+def test_a_source_that_is_switched_off_forgets_its_history_sr068(tmp_path):
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
     cycle(env, {"codex": auth_dead}, NOW + 60)
-    off = base_env(tmp_path, AI_USAGE_SOURCES="opencode")
+    off = codex_env(tmp_path, AI_USAGE_SOURCES="opencode")
     cycle(off, {"opencode": lambda e: feeder.parse_opencode(OPENCODE_BODY, e["_now"])}, NOW + 120)
-    assert feeder.AUTH_COUNTS_KEY not in saved_state(off)
+    assert "codex" not in saved_state(off)[feeder.SCHEDULE_KEY]
 
 
-@pytest.mark.parametrize("entry,expected", [
-    ({"codex": 1}, {"codex": 1}),
-    ({"codex": 2, "gemini": 1}, {"codex": 2, "gemini": 1}),
-    ({"codex": 0}, {}), ({"codex": -1}, {}), ({"codex": 101}, {}),
-    ({"codex": True}, {}), ({"codex": 1.5}, {}), ({"codex": "2"}, {}),
-    ({"not-a-source": 1}, {}), ({}, {}), ([], {}), ("x", {}), (None, {}), (7, {}),
+GOOD_ENTRY = {"last_attempt": NOW, "next_due": NOW + 60, "hold": False, "backoff": 0,
+              "last_outcome": "ok"}
+
+
+@pytest.mark.parametrize("change,kept", [
+    ({}, True),
+    ({"auth_since": NOW - 600, "auth_attempts": 3, "last_outcome": "auth"}, True),
+    ({"ratelimit": {"retry-after": "120"}}, True),
+    ({"last_attempt": True}, False), ({"last_attempt": "x"}, False),
+    ({"last_attempt": 5}, False),                                   # before the epoch floor
+    ({"last_attempt": NOW + 3600, "next_due": NOW + 3660}, False),   # the clock went back
+    ({"next_due": NOW - 1}, False),                                  # due before it was tried
+    ({"next_due": NOW + 2 * 86400}, False),                          # past the Retry-After bound
+    ({"hold": 1}, False), ({"backoff": -1}, False), ({"backoff": 31}, False),
+    ({"backoff": True}, False), ({"last_outcome": "skipped"}, False),
+    ({"auth_since": NOW + 1, "auth_attempts": 1}, False),            # after the last attempt
+    ({"auth_since": NOW - 60}, False),                               # half an auth run
+    ({"auth_since": NOW - 60, "auth_attempts": 0}, False),
+    ({"ratelimit": {"set-cookie": "a=b"}}, False),                   # not a rate-limit header
+    ({"ratelimit": {"retry-after": "x" * 65}}, False),
+    ({"ratelimit": "120"}, False),
 ])
-def test_the_count_has_its_own_validator_sr068(entry, expected):
-    assert feeder.validate_auth_counts(entry, feeder.SOURCE_READERS) == expected
+def test_the_schedule_has_its_own_validator_sr068(change, kept):
+    entry = dict(GOOD_ENTRY, **change)
+    got = feeder.validate_schedule({"codex": entry, "not-a-source": GOOD_ENTRY}, feeder.SOURCE_READERS, NOW)
+    assert ("codex" in got) is kept
+    assert "not-a-source" not in got
+
+
+@pytest.mark.parametrize("entry", [[], "x", None, 7])
+def test_a_schedule_that_is_not_an_object_is_empty_sr068(entry):
+    assert feeder.validate_schedule(entry, feeder.SOURCE_READERS, NOW) == {}
 
 
 @pytest.mark.parametrize("entry,ok", [
@@ -1290,23 +1371,39 @@ def test_the_marker_has_its_own_validator_sr068(entry, ok):
     assert (got is not None) is ok
 
 
-def test_load_state_keeps_counts_and_markers_and_drops_junk_sr068(tmp_path):
+def test_load_state_keeps_the_schedule_and_markers_and_drops_junk_sr068(tmp_path):
     path = tmp_path / "usage-state.json"
     path.write_text(json.dumps({
-        feeder.AUTH_COUNTS_KEY: {"codex": 2, "bogus": 1, "claude": "x"},
+        feeder.SCHEDULE_KEY: {"codex": GOOD_ENTRY, "bogus": GOOD_ENTRY,
+                              "claude": dict(GOOD_ENTRY, backoff="x")},
         "ai-usage-codex": {"auth_failed": True, "at": NOW},
         "ai-usage-claude-session": {"value": 12.0, "observed_at": NOW, "window_end": NOW + 3600,
                                     "window_seconds": 18000},
         "ai-usage-claude-weekly": {"auth_failed": "yes", "at": NOW},
         "junk": 5}), encoding="utf-8")
     state = feeder.load_state(str(path), NOW + 5)
-    assert state[feeder.AUTH_COUNTS_KEY] == {"codex": 2}
+    assert state[feeder.SCHEDULE_KEY] == {"codex": GOOD_ENTRY}
     assert state["ai-usage-codex"] == {"auth_failed": True, "at": NOW}
     assert "ai-usage-claude-session" in state
     assert "ai-usage-claude-weekly" not in state and "junk" not in state
 
 
-def test_the_state_file_holds_counts_and_stamps_only_sr068(tmp_path):
+def test_a_state_file_from_before_w11_loads_and_its_old_counter_is_dropped_sr068(tmp_path):
+    """The deployed hub's state file carries `__auth_failures__`. The upgrade
+    must keep every reading and marker, drop the counter, and post as usual."""
+    env = codex_env(tmp_path)
+    (tmp_path / "usage-state.json").write_text(json.dumps({
+        "__auth_failures__": {"codex": 1},
+        "ai-usage-codex": {"value": 34.0, "observed_at": NOW - 60, "window_end": 1789435411,
+                           "window_seconds": 7 * 24 * 3600}}), encoding="utf-8")
+    rec, _p, failures = cycle(env, {"codex": blip}, NOW)
+    assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW - 60), "the reading survived"
+    state = saved_state(env)
+    assert "__auth_failures__" not in state
+    assert "auth_since" not in state[feeder.SCHEDULE_KEY]["codex"], "history restarts"
+
+
+def test_the_state_file_holds_numbers_and_flags_only_sr068(tmp_path):
     env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
     creds = tmp_path / ".credentials.json"
     creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": SENTINEL}}), encoding="utf-8")
@@ -1319,7 +1416,7 @@ def test_the_state_file_holds_counts_and_stamps_only_sr068(tmp_path):
         cycle(env, readers, NOW + 60)
     text = (tmp_path / "usage-state.json").read_text(encoding="utf-8")
     assert SENTINEL not in text and "Bearer" not in text
-    assert json.loads(text)[feeder.AUTH_COUNTS_KEY] == {"claude": 2}
+    assert json.loads(text)[feeder.SCHEDULE_KEY]["claude"]["auth_attempts"] == 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1338,8 +1435,7 @@ def test_after_a_confirmed_auth_failure_the_optional_fable_gauge_still_posts_sta
     env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
     rec0, _p, _f = cycle(env, {"claude": claude_ok}, NOW)
     assert "ai-usage-claude-weekly-fable" in rec0.by_id()
-    cycle(env, {"claude": claude_dead}, NOW + 60)
-    rec, _p, _f = cycle(env, {"claude": claude_dead}, NOW + 120)
+    rec, _f, _last = fail_until_confirmed(env, {"claude": claude_dead}, NOW + 60)
     by_id = rec.by_id()
     assert set(by_id) == {"ai-usage-claude-session", "ai-usage-claude-weekly",
                           "ai-usage-claude-weekly-fable"}, "the Fable band must not vanish"
@@ -1356,55 +1452,51 @@ def test_the_fable_gauge_still_posts_after_a_following_network_failure_sr068(tmp
         raise feeder.SourceFailure("claude: URLError")
 
     cycle(env, {"claude": claude_ok}, NOW)
-    cycle(env, {"claude": claude_dead}, NOW + 60)
-    cycle(env, {"claude": claude_dead}, NOW + 120)
-    rec, _p, _f = cycle(env, {"claude": network}, NOW + 180)
+    _rec, _f, last = fail_until_confirmed(env, {"claude": claude_dead}, NOW + 60)
+    rec, _p, _f = cycle(env, {"claude": network}, last + 60)
     by_id = rec.by_id()
     assert "ai-usage-claude-weekly-fable" in by_id
     for body in by_id.values():
         assert stale_on_arrival(body)
 
 
-def test_auth_then_auth_then_network_stays_stale_on_arrival_sr068(tmp_path):
+def test_confirmed_then_network_stays_stale_on_arrival_sr068(tmp_path):
     """THE STICKY RULE: build_post re-posts a stored reading on ANY later failure,
     so without the marker a network blip would bring the old colour back."""
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
-    cycle(env, {"codex": auth_dead}, NOW + 60)
-    cycle(env, {"codex": auth_dead}, NOW + 120)
-    rec, _p, _f = cycle(env, {"codex": blip}, NOW + 180)
+    _rec, _f, last = fail_until_confirmed(env, {"codex": auth_dead}, NOW + 60)
+    rec, _p, _f = cycle(env, {"codex": blip}, last + 60)
     assert stale_on_arrival(rec.bodies[0])
-    rec2, _p, _f = cycle(env, {"codex": blip}, NOW + 240)
+    rec2, _p, _f = cycle(env, {"codex": blip}, last + 120)
     assert stale_on_arrival(rec2.bodies[0]), "and it stays that way"
 
 
 def test_a_network_failure_with_no_auth_failure_keeps_todays_ageing_sr068(tmp_path):
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
     for step in (60, 120, 180):
         rec, _p, _f = cycle(env, {"codex": blip}, NOW + step)
         assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW)
         assert rec.bodies[0]["value"] == 66.0
-    assert feeder.AUTH_COUNTS_KEY not in saved_state(env)
+    assert "auth_since" not in schedule_of(env, "codex")
 
 
 def test_a_real_reading_recovers_a_confirmed_gauge_sr068(tmp_path):
-    env = base_env(tmp_path, AI_USAGE_SOURCES="codex")
+    env = codex_env(tmp_path)
     cycle(env, {"codex": good_codex}, NOW)
-    cycle(env, {"codex": auth_dead}, NOW + 60)
-    cycle(env, {"codex": auth_dead}, NOW + 120)
-    rec, _p, _f = cycle(env, {"codex": good_codex}, NOW + 180)
-    assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(NOW + 180)
+    _rec, _f, last = fail_until_confirmed(env, {"codex": auth_dead}, NOW + 60)
+    rec, _p, _f = cycle(env, {"codex": good_codex}, last + 60)
+    assert rec.bodies[0]["observed_at"] == feeder.rfc3339_utc(last + 60)
     assert saved_state(env)["ai-usage-codex"]["value"] == 34.0
-    assert feeder.AUTH_COUNTS_KEY not in saved_state(env)
+    assert "auth_since" not in schedule_of(env, "codex")
 
 
 def test_a_gauge_never_seen_is_not_conjured_by_a_confirmed_failure_sr068(tmp_path):
     """Marking an optional gauge nobody has ever posted would make an
     'unavailable' Fable band appear out of nothing."""
     env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
-    cycle(env, {"claude": claude_dead}, NOW)
-    rec, _p, _f = cycle(env, {"claude": claude_dead}, NOW + 60)
+    rec, _f, _last = fail_until_confirmed(env, {"claude": claude_dead}, NOW)
     assert "ai-usage-claude-weekly-fable" not in rec.by_id()
     assert "ai-usage-claude-weekly-fable" not in saved_state(env)
 
@@ -1426,8 +1518,8 @@ def test_a_marker_is_not_a_reading_so_build_post_gives_the_stale_body_sr068():
 
 
 def test_claude_mid_rotation_blip_does_not_grey_the_gauge_sr068(monkeypatch, tmp_path):
-    """The reason for the two-cycle rule: the refresh unit rewrites the credential
-    file, and a read in the middle can find a file with no key in it."""
+    """The reason for the confirmation span: the refresh unit rewrites the
+    credential file, and a read in the middle can find a file with no key in it."""
     env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
     creds = tmp_path / ".credentials.json"
     env["AI_USAGE_CLAUDE_CREDENTIALS"] = str(creds)
@@ -1443,7 +1535,23 @@ def test_claude_mid_rotation_blip_does_not_grey_the_gauge_sr068(monkeypatch, tmp
     creds.write_text('{"claudeAiOauth":{"accessToken":"T2"}}', encoding="utf-8")   # rotation finished
     rec, _p, _f = cycle(env, readers, NOW + 120)
     assert rec.by_id()["ai-usage-claude-session"]["observed_at"] == feeder.rfc3339_utc(NOW + 120)
-    assert feeder.AUTH_COUNTS_KEY not in saved_state(env)
+    assert "auth_since" not in schedule_of(env, "claude")
+
+
+def test_a_lapsed_token_renewed_within_ten_minutes_never_greys_sr068(tmp_path):
+    """The window measured on the hub (2026-10-12..21): the access token lapses,
+    the feeder reads 401 every minute, the refresher renews it some minutes
+    later. Nine minutes of 401s and then a success must leave the gauge in
+    colour the whole time."""
+    env = base_env(tmp_path, AI_USAGE_SOURCES="claude")
+    cycle(env, {"claude": claude_ok}, NOW)
+    for step in range(60, 600, 60):
+        rec, _p, _f = cycle(env, {"claude": claude_dead}, NOW + step)
+        assert rec.by_id()["ai-usage-claude-session"]["observed_at"] == feeder.rfc3339_utc(NOW)
+    rec, _p, _f = cycle(env, {"claude": claude_ok}, NOW + 600)
+    assert rec.by_id()["ai-usage-claude-session"]["observed_at"] == feeder.rfc3339_utc(NOW + 600)
+    assert "ai-usage-claude-session" in saved_state(env) and \
+        "auth_failed" not in saved_state(env)["ai-usage-claude-session"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

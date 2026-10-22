@@ -184,8 +184,13 @@ enable_unit_optional() {
 # made redundant, identified by hash rather than by name. Anything else is left
 # where it is and named in the journal: a different 10-cadence.conf is somebody's
 # newer decision, and the release will (correctly) go on refusing it until that
-# decision is folded into the unit. Moved rather than deleted so a rollback to a
-# payload that predates the folding can be undone by hand with one `mv`.
+# decision is folded into the unit. A paired release that fails after this ran
+# puts the original back by itself: its rollback set holds every declared unit's
+# .d directory (HomeHub panel_release_remote.system_targets), so the old unit and
+# this drop-in are restored together. Before that, a failed release restored the
+# old unit alone and the panel ran its one-minute cadence. Moved rather than
+# deleted so any other route back to an older payload (a hand rollback, a
+# reimage from an older tree) is repaired with one `mv` from KEEP_DIR.
 # Removes DIR if that leaves it empty. The caller reloads systemd.
 retire_obsolete_dropin() {
     local dir="$1" name="$2" want="$3" keep="$4" path actual entry

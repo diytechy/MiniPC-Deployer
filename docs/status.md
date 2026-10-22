@@ -21,6 +21,10 @@ last) — it is the record, not required reading for every pass.
   TC-1420, TC-1423.
 - **LLR-1256:** firstboot 5c retires that drop-in only by its sha256 (to `/var/backups/wall-panel/...`),
   leaves and names anything else in the directory, then reloads. TC-1421 (TC-1363 updated).
+  **Depends on a HomeHub change to ship safely:** the paired release's rollback set must hold each
+  declared unit's `.d` directory (HomeHub `panel_release_remote.system_targets`), or a release that fails
+  after firstboot restores the old one-minute unit without the drop-in (review finding F1, reproduced on
+  systemd 255 with HomeHub's real backup and rollback phases). Merge that HomeHub change before releasing this.
 - **LLR-1257:** firstboot 8 restarts the timer when it is elapsed (a daemon-reload does not re-arm one,
   measured) and starts it when inactive. TC-1422.
 - Not proven: any of it on the panel (needs the paired release; coordinator's steps in HomeHub FOLLOWUPS).

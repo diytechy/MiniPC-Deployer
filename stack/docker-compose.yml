@@ -693,10 +693,18 @@ services:
     #    sure-web makes the project invalid ("depends on undefined service")
     #    whenever `sure` is not in COMPOSE_PROFILES, which is the hub's case by
     #    design (HomeHub config: Sure is started explicitly with `--profile
-    #    sure up -d`). The cost: with the profile off, compose does not wait for
-    #    sure-web even while it is starting.
-    # That cost is nothing in sure mode: FA builds its Sure client without a
-    # request and first calls Sure at RUN_AT. In actual mode FA connects at
+    #    sure up -d`).
+    # THE COST, NOT SOLVED HERE: with the profile off (the hub), and after any
+    # daemon restart (a reboot: the daemon restarts containers without reading
+    # depends_on at all), nothing waits for sure-web. In sure mode FA starts
+    # without asking Sure anything and first calls it at RUN_AT, so this is
+    # harmless only while Sure answers by then. If RUN_AT arrives before Sure
+    # answers (say, a reboot a minute before 05:00), that one run fails
+    # ("Sure request failed"; FA retries HTTP 429 only), the auditor stays up,
+    # so its restart policy never fires, and the next fire (the next day's
+    # RUN_AT) tries again: that day's finance gauge is lost. Compose cannot
+    # close this; a bounded retry of connection failures belongs in
+    # Finance-Auditor. In actual mode FA connects at
     # start; if Actual is down it exits and its restart policy retries, rather
     # than sitting Created until the next `up`. A changed depends_on does not
     # change the container's config hash, so this edit recreates nothing.

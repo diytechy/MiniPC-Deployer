@@ -262,8 +262,15 @@ Compose cannot key a dependency on `DATA_SOURCE`, so both ledgers are optional
 `service_healthy` dependencies and only the tracker is required. The behaviour
 below was measured on a toy project (Compose v5.3.0; the hub's v5.5.1 parses
 it the same way). On the hub `sure` is not in `COMPOSE_PROFILES`, so the
-`sure-web` branch is the profile-off one; that costs nothing, because FA's
-first request to Sure is at `RUN_AT`, not at start.
+`sure-web` branch is the profile-off one, and after a daemon restart (a
+reboot) nothing reads `depends_on` at all. So nothing waits for Sure on the
+hub. FA's first request to Sure is at `RUN_AT`, not at start, so this is
+harmless only while Sure answers by then: if `RUN_AT` arrives first (a reboot
+just before 05:00), that one run fails with "Sure request failed" (FA retries
+HTTP 429 only), the auditor stays up, so its restart policy never fires, and
+the next fire, the next day's `RUN_AT`, tries again. That day's finance gauge
+is lost. Compose cannot close this; a bounded retry of connection failures
+belongs in Finance-Auditor.
 
 ```mermaid
 sequenceDiagram
@@ -296,6 +303,9 @@ sequenceDiagram
     alt DATA_SOURCE=sure
         FA->>FA: build the Sure client, no request; schedule RUN_AT
         FA->>Web: first GET at RUN_AT
+        alt Sure not answering yet (e.g. a reboot just before RUN_AT)
+            FA-->>FA: run fails, FA stays up; next try is the next RUN_AT (gauge lost that day)
+        end
     else DATA_SOURCE=actual (rollback)
         FA->>Actual: connect and download the budget now
         alt Actual unreachable

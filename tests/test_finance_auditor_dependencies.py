@@ -78,6 +78,32 @@ def test_both_ledgers_are_optional_healthy_dependencies_tc1349():
     assert "sure" in auditor()["networks"]
 
 
+def test_the_unsolved_sure_residual_is_stated_not_waved_away_tc1349():
+    """LLR-1204: the comment and the runtime flow state what the optional dependency leaves open.
+
+    On the hub the `sure` profile is off, and after a reboot the daemon restarts
+    containers without reading depends_on, so nothing waits for sure-web. A
+    RUN_AT that arrives before Sure answers loses that day's run (FA retries
+    HTTP 429 only, and stays up, so its restart policy never fires). An earlier
+    draft called that cost "nothing"; this pins the honest statement.
+    """
+    comment = " ".join(line.strip().lstrip("#").strip() for line in auditor_block()
+                       if line.lstrip().startswith("#"))
+    for claim in ("cost is nothing", "costs nothing"):
+        assert claim not in comment
+    for fact in ("restarts containers without reading depends_on", "RUN_AT arrives before Sure answers", "next day's",
+                 "belongs in Finance-Auditor"):
+        assert fact in comment, "compose comment no longer states: %s" % fact
+    doc = (ROOT / "docs/architecture.md").read_text(encoding="utf-8")
+    start = doc.index("### What Finance-Auditor waits for at start")
+    section = doc[start:doc.index("\n### ", start + 1)]
+    flat = " ".join(section.split())
+    assert "costs nothing" not in flat
+    for fact in ("nothing reads `depends_on`", "next day's `RUN_AT`", "belongs in Finance-Auditor",
+                 "Sure not answering yet"):
+        assert fact in flat, "architecture SR-099 section no longer states: %s" % fact
+
+
 def test_actual_settings_are_marked_rollback_only_and_still_passed_tc1350():
     """LLR-1205: Actual's lines stay wired (rollback is a one-knob flip) and say so."""
     service = auditor()

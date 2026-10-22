@@ -191,11 +191,19 @@ def main(argv=None) -> int:
     }
     all_ok = all(ok for ok, _ in results.values())
     failing: List[str] = [k for k, (ok, _) in results.items() if not ok]
-    for key, (ok, detail) in results.items():
+    # One line a minute while healthy (it runs 1440 times a day); every check
+    # gets its own line, at warning priority for a failure, once anything fails.
+    if all_ok:
         mc.log(
-            "liveness: %-6s %s %s" % (key, "ok  " if ok else "FAIL", detail),
-            warning=not ok,
+            "liveness: ok - "
+            + "; ".join("%s: %s" % (k, d) for k, (_, d) in results.items())
         )
+    else:
+        for key, (ok, detail) in results.items():
+            mc.log(
+                "liveness: %-6s %s %s" % (key, "ok  " if ok else "FAIL", detail),
+                warning=not ok,
+            )
 
     state_path = os.path.join(args.state_dir, "liveness-state.json")
     state = mc.load_json(state_path, {})
